@@ -22,17 +22,17 @@ import (
 
 // Job states (stack plan "Job states").
 const (
-	StateQueued       = "queued"
-	StateResolving    = "resolving"
-	StateFetching     = "fetching"
-	StateValidating   = "validating"
-	StateReady        = "ready"
+	StateQueued        = "queued"
+	StateResolving     = "resolving"
+	StateFetching      = "fetching"
+	StateValidating    = "validating"
+	StateReady         = "ready"
 	StateAwaitingHuman = "awaiting_human"
-	StateRetryWait    = "retry_wait"
-	StateNeedsReview  = "needs_review"
-	StateUnavailable  = "unavailable"
-	StateFailed       = "failed"
-	StateCancelled    = "cancelled"
+	StateRetryWait     = "retry_wait"
+	StateNeedsReview   = "needs_review"
+	StateUnavailable   = "unavailable"
+	StateFailed        = "failed"
+	StateCancelled     = "cancelled"
 )
 
 // Terminal reports whether a state ends the acquisition attempt. ready is the
@@ -51,7 +51,7 @@ func Terminal(state string) bool {
 var allowed = map[string]map[string]bool{
 	StateQueued: {StateResolving: true, StateCancelled: true},
 	StateResolving: {
-		StateFetching: true, StateAwaitingHuman: true, StateRetryWait: true,
+		StateFetching: true, StateReady: true, StateAwaitingHuman: true, StateRetryWait: true,
 		StateNeedsReview: true, StateUnavailable: true, StateFailed: true, StateCancelled: true,
 	},
 	StateFetching: {
@@ -71,6 +71,18 @@ var allowed = map[string]map[string]bool{
 // ErrConflict is returned when a CAS transition loses (state changed or the
 // transition is not allowed).
 var ErrConflict = errors.New("job state conflict")
+
+// ErrCostExceeded means reserving a paid attempt would cross the job's
+// explicit maximum. The reservation is atomic across daemon workers/restarts.
+type ErrCostExceeded struct {
+	JobID, Source    string
+	Spent, Cost, Max float64
+}
+
+func (e *ErrCostExceeded) Error() string {
+	return fmt.Sprintf("job %s cost limit exceeded for %s: $%.2f + $%.2f > $%.2f",
+		e.JobID, e.Source, e.Spent, e.Cost, e.Max)
+}
 
 // Policy is the per-job policy snapshot stored in jobs.policy_json.
 type Policy struct {
@@ -102,38 +114,40 @@ func (p Policy) SourceAllowed(name string) bool {
 
 // Row is one job with its request context.
 type Row struct {
-	ID             string
-	WorkRequestID  string
-	State          string
-	Policy         Policy
-	ArtifactSHA256 string
-	TerminalReason string
-	RetryAt        string
-	CreatedAt      string
-	UpdatedAt      string
-	Work           work.Work
-	ZotioItemKey   string
+	ID                  string    `json:"id"`
+	WorkRequestID       string    `json:"work_request_id"`
+	State               string    `json:"state"`
+	Policy              Policy    `json:"policy"`
+	ArtifactSHA256      string    `json:"artifact_sha256,omitempty"`
+	SelectedCandidateID int64     `json:"selected_candidate_id,omitempty"`
+	SpentUSD            float64   `json:"spent_usd"`
+	TerminalReason      string    `json:"terminal_reason,omitempty"`
+	RetryAt             string    `json:"retry_at,omitempty"`
+	CreatedAt           string    `json:"created_at"`
+	UpdatedAt           string    `json:"updated_at"`
+	Work                work.Work `json:"work"`
+	ZotioItemKey        string    `json:"zotio_item_key,omitempty"`
 }
 
 // Candidate is one ranked acquisition option. URL is never stored; only the
 // redacted form persists, so a crash discards bearer URLs by construction.
 type Candidate struct {
-	ID                 int64
-	JobID              string
-	Source             string
-	URLRedacted        string
-	URLKey             string
-	LandingRedacted    string
-	Version            string
-	AccessBasis        string
-	ReuseLicense       string
-	ExpectedMIME       string
-	CostUSD            float64
-	Direct             bool
-	IdentityConfidence float64
-	RankEvidence       string
-	Rank               int
-	Status             string
+	ID                 int64   `json:"id"`
+	JobID              string  `json:"job_id"`
+	Source             string  `json:"source"`
+	URLRedacted        string  `json:"url_redacted"`
+	URLKey             string  `json:"url_key"`
+	LandingRedacted    string  `json:"landing_redacted,omitempty"`
+	Version            string  `json:"version"`
+	AccessBasis        string  `json:"access_basis"`
+	ReuseLicense       string  `json:"reuse_license"`
+	ExpectedMIME       string  `json:"expected_mime,omitempty"`
+	CostUSD            float64 `json:"cost_usd"`
+	Direct             bool    `json:"direct"`
+	IdentityConfidence float64 `json:"identity_confidence"`
+	RankEvidence       string  `json:"rank_evidence,omitempty"`
+	Rank               int     `json:"rank"`
+	Status             string  `json:"status"`
 }
 
 // Store layers job semantics over the shared SQLite store.
@@ -181,7 +195,7 @@ func (js *Store) CreateRequest(ctx context.Context, requestID string, w work.Wor
 	if err != nil {
 		return "", err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	if _, err := tx.ExecContext(ctx,
 		`INSERT OR IGNORE INTO work_requests (id, created_at, requester, zotio_item_key, collection_key, title, authors_json, year, desired_version, max_cost_usd)
@@ -217,6 +231,155 @@ func (js *Store) CreateRequest(ctx context.Context, requestID string, w work.Wor
 		return "", err
 	}
 	return jobID, nil
+}
+
+// FillWorkMetadata fills fields absent from the original request using
+// resolver-observed metadata. Request values remain authoritative; conflicting
+// identifiers fail closed rather than silently changing the requested work.
+func (js *Store) FillWorkMetadata(ctx context.Context, jobID string, discovered work.Work) (*Row, error) {
+	tx, err := js.S.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var requestID string
+	var title, authorsJSON sql.NullString
+	var year sql.NullInt64
+	if err := tx.QueryRowContext(ctx, `
+		SELECT w.id, w.title, w.authors_json, w.year
+		FROM jobs j JOIN work_requests w ON w.id = j.work_request_id
+		WHERE j.id = ?`, jobID).Scan(&requestID, &title, &authorsJSON, &year); err != nil {
+		return nil, err
+	}
+	var authors []string
+	if authorsJSON.Valid && authorsJSON.String != "" {
+		if err := json.Unmarshal([]byte(authorsJSON.String), &authors); err != nil {
+			return nil, fmt.Errorf("request %s authors: %w", requestID, err)
+		}
+	}
+	if !title.Valid || title.String == "" {
+		title.String, title.Valid = discovered.Title, discovered.Title != ""
+	}
+	if len(authors) == 0 && len(discovered.Authors) > 0 {
+		authors = append([]string(nil), discovered.Authors...)
+	}
+	if !year.Valid || year.Int64 == 0 {
+		year.Int64, year.Valid = int64(discovered.Year), discovered.Year != 0
+	}
+	encodedAuthors, err := json.Marshal(authors)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE work_requests SET title = ?, authors_json = ?, year = ? WHERE id = ?`,
+		nullable(title.String), string(encodedAuthors), nullableInt(int(year.Int64)), requestID); err != nil {
+		return nil, err
+	}
+
+	observed := map[string]string{
+		"doi": discovered.DOI, "pmid": discovered.PMID, "arxiv": discovered.ArXiv,
+		"isbn": discovered.ISBN, "openalex": discovered.OpenAlex,
+	}
+	for kind, value := range observed {
+		if value == "" {
+			continue
+		}
+		var existing string
+		err := tx.QueryRowContext(ctx,
+			`SELECT value FROM identifiers WHERE work_request_id = ? AND kind = ?`, requestID, kind).Scan(&existing)
+		switch {
+		case err == nil && existing != value:
+			return nil, fmt.Errorf("resolver metadata conflicts with requested %s: %q != %q", kind, value, existing)
+		case err == nil:
+			continue
+		case !errors.Is(err, sql.ErrNoRows):
+			return nil, err
+		}
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO identifiers(work_request_id, kind, value, raw) VALUES(?, ?, ?, ?)`,
+			requestID, kind, value, value); err != nil {
+			return nil, err
+		}
+	}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO events(job_id, at, kind, detail_json) VALUES(?, ?, 'job.metadata_enriched', ?)`,
+		jobID, store.Now(), `{"source":"resolver","policy":"fill_missing_only"}`); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return js.Get(ctx, jobID)
+}
+
+// ReserveCost atomically charges one paid source attempt to a job. A nil limit
+// tracks spend without imposing a ceiling. Zero-cost calls are not recorded.
+func (js *Store) ReserveCost(ctx context.Context, jobID, source string, cost float64, limit *float64) error {
+	if cost < 0 {
+		return fmt.Errorf("negative job cost %.4f", cost)
+	}
+	if cost == 0 {
+		return nil
+	}
+	tx, err := js.S.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var spent float64
+	if err := tx.QueryRowContext(ctx, `SELECT spent_usd FROM jobs WHERE id = ?`, jobID).Scan(&spent); err != nil {
+		return err
+	}
+	if limit != nil && spent+cost > *limit+1e-9 {
+		return &ErrCostExceeded{JobID: jobID, Source: source, Spent: spent, Cost: cost, Max: *limit}
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE jobs SET spent_usd = spent_usd + ?, updated_at = ? WHERE id = ?`,
+		cost, store.Now(), jobID); err != nil {
+		return err
+	}
+	detail, _ := json.Marshal(map[string]any{"source": source, "cost_usd": cost})
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO events(job_id, at, kind, detail_json) VALUES(?, ?, 'job.cost_reserved', ?)`,
+		jobID, store.Now(), string(detail)); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// ReleaseReservedCost reverses a reservation when the paid source call did not
+// start (for example, its durable monthly budget closed between checks).
+func (js *Store) ReleaseReservedCost(ctx context.Context, jobID, source string, cost float64) error {
+	if cost <= 0 {
+		return nil
+	}
+	tx, err := js.S.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	result, err := tx.ExecContext(ctx,
+		`UPDATE jobs SET spent_usd = spent_usd - ?, updated_at = ?
+		 WHERE id = ? AND spent_usd + 1e-9 >= ?`,
+		cost, store.Now(), jobID, cost)
+	if err != nil {
+		return err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed != 1 {
+		return fmt.Errorf("cannot release unreserved job cost %.4f for %s", cost, jobID)
+	}
+	detail, _ := json.Marshal(map[string]any{"source": source, "cost_usd": cost})
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO events(job_id, at, kind, detail_json) VALUES(?, ?, 'job.cost_released', ?)`,
+		jobID, store.Now(), string(detail)); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func nullable(s string) any {
@@ -261,7 +424,7 @@ func (js *Store) Transition(ctx context.Context, jobID, from, to string, detail 
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	res, err := tx.ExecContext(ctx,
 		`UPDATE jobs SET state = ?, updated_at = ?,
@@ -320,8 +483,8 @@ func WithCandidate(id int64) TransitionOpt {
 }
 
 // ClaimNext leases the oldest runnable job: queued always; retry_wait when
-// due. Stages mid-flight (resolving/fetching/validating) are only claimable
-// when their lease has expired (crash recovery path).
+// due. Mid-flight stages are claimable when unowned (the durable result of
+// RecoverStale) or when their prior lease expired.
 func (js *Store) ClaimNext(ctx context.Context, owner string, lease time.Duration) (*Row, error) {
 	now := store.Now()
 	expires := time.Now().UTC().Add(lease).Format(time.RFC3339Nano)
@@ -333,7 +496,7 @@ func (js *Store) ClaimNext(ctx context.Context, owner string, lease time.Duratio
 		WHERE (
 		        (state = 'queued' AND (lease_owner IS NULL OR lease_expires_at < ?))
 		     OR (state = 'retry_wait' AND retry_at <= ? AND (lease_owner IS NULL OR lease_expires_at < ?))
-		     OR (state IN ('resolving','fetching','validating') AND lease_expires_at IS NOT NULL AND lease_expires_at < ?)
+		     OR (state IN ('resolving','fetching','validating') AND (lease_owner IS NULL OR lease_expires_at < ?))
 		      )
 		ORDER BY created_at ASC LIMIT 1`, now, now, now, now).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -375,6 +538,70 @@ func (js *Store) Release(ctx context.Context, jobID, owner string) error {
 	return err
 }
 
+// Cancel moves a nonterminal job to cancelled. Repeated cancellation and
+// cancellation after any terminal result are idempotent no-ops.
+func (js *Store) Cancel(ctx context.Context, jobID, reason string) error {
+	for {
+		row, err := js.Get(ctx, jobID)
+		if err != nil {
+			return err
+		}
+		if Terminal(row.State) {
+			return nil
+		}
+		err = js.Transition(ctx, jobID, row.State, StateCancelled,
+			map[string]any{"reason": reason}, WithTerminalReason(reason))
+		if errors.Is(err, ErrConflict) {
+			continue
+		}
+		return err
+	}
+}
+
+// Retry explicitly reopens a retry-wait, failed, or unavailable job at the
+// durable resolving boundary. Ready, cancelled, active, and human-parked jobs
+// require their dedicated command instead of silently changing meaning.
+func (js *Store) Retry(ctx context.Context, jobID string) error {
+	tx, err := js.S.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var from string
+	if err := tx.QueryRowContext(ctx, `SELECT state FROM jobs WHERE id = ?`, jobID).Scan(&from); err != nil {
+		return err
+	}
+	switch from {
+	case StateRetryWait, StateFailed, StateUnavailable:
+	default:
+		return fmt.Errorf("%w: %s cannot be retried", ErrConflict, from)
+	}
+	now := store.Now()
+	result, err := tx.ExecContext(ctx,
+		`UPDATE jobs SET state = 'resolving', updated_at = ?, lease_owner = NULL,
+		        lease_expires_at = NULL, retry_at = NULL, terminal_reason = NULL,
+		        selected_candidate_id = NULL, artifact_sha256 = NULL
+		  WHERE id = ? AND state = ?`, now, jobID, from)
+	if err != nil {
+		return err
+	}
+	if changed, _ := result.RowsAffected(); changed != 1 {
+		return ErrConflict
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE candidates SET status = 'pending'
+		  WHERE job_id = ? AND status IN ('fetching','retryable')`, jobID); err != nil {
+		return err
+	}
+	detail, _ := json.Marshal(map[string]any{"from": from, "to": StateResolving, "reason": "explicit_retry"})
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO events(job_id, at, kind, detail_json) VALUES(?, ?, 'job.retry_requested', ?)`,
+		jobID, now, string(detail)); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 // RecoverStale rewinds expired mid-flight jobs to resolving: bearer URLs and
 // quarantine temp files are per-attempt, so the durable boundary is the
 // candidate set, which re-ranks deterministically. Content addressing makes
@@ -391,26 +618,31 @@ func (js *Store) RecoverStale(ctx context.Context) ([]string, error) {
 	for rows.Next() {
 		var s stale
 		if err := rows.Scan(&s.id, &s.state); err != nil {
-			rows.Close()
+			_ = rows.Close()
 			return nil, err
 		}
 		found = append(found, s)
 	}
-	rows.Close()
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 	var recovered []string
 	for _, s := range found {
 		if s.state == StateResolving {
-			// Already at the durable boundary; just clear the lease.
-			if err := js.Release(ctx, s.id, ""); err == nil {
-				if _, err := js.S.DB().ExecContext(ctx,
-					`UPDATE jobs SET lease_owner = NULL, lease_expires_at = NULL WHERE id = ?`, s.id); err != nil {
-					return recovered, err
-				}
+			// Already at the durable boundary; clear only a still-stale lease.
+			result, err := js.S.DB().ExecContext(ctx,
+				`UPDATE jobs SET lease_owner = NULL, lease_expires_at = NULL
+				 WHERE id = ? AND state = 'resolving'
+				   AND (lease_expires_at IS NULL OR lease_expires_at < ?)`, s.id, now)
+			if err != nil {
+				return recovered, err
 			}
-			recovered = append(recovered, s.id)
+			if changed, _ := result.RowsAffected(); changed == 1 {
+				recovered = append(recovered, s.id)
+			}
 			continue
 		}
 		if err := js.Transition(ctx, s.id, s.state, StateResolving, map[string]any{"reason": "crash_recovery"}); err != nil && !errors.Is(err, ErrConflict) {
@@ -427,17 +659,19 @@ func (js *Store) Get(ctx context.Context, jobID string) (*Row, error) {
 	var r Row
 	var polJSON string
 	var artifact, terminal, retryAt sql.NullString
+	var selected sql.NullInt64
 	err := db.QueryRowContext(ctx, `
-		SELECT j.id, j.work_request_id, j.state, j.policy_json, j.artifact_sha256, j.terminal_reason, j.retry_at, j.created_at, j.updated_at,
+		SELECT j.id, j.work_request_id, j.state, j.policy_json, j.artifact_sha256, j.selected_candidate_id,
+		       j.spent_usd, j.terminal_reason, j.retry_at, j.created_at, j.updated_at,
 		       COALESCE(w.title,''), COALESCE(w.authors_json,'[]'), COALESCE(w.year,0), COALESCE(w.zotio_item_key,'')
 		FROM jobs j JOIN work_requests w ON w.id = j.work_request_id
 		WHERE j.id = ?`, jobID).Scan(
-		&r.ID, &r.WorkRequestID, &r.State, &polJSON, &artifact, &terminal, &retryAt, &r.CreatedAt, &r.UpdatedAt,
+		&r.ID, &r.WorkRequestID, &r.State, &polJSON, &artifact, &selected, &r.SpentUSD, &terminal, &retryAt, &r.CreatedAt, &r.UpdatedAt,
 		&r.Work.Title, &jsonScanner{&r.Work.Authors}, &r.Work.Year, &r.ZotioItemKey)
 	if err != nil {
 		return nil, err
 	}
-	r.ArtifactSHA256, r.TerminalReason, r.RetryAt = artifact.String, terminal.String, retryAt.String
+	r.ArtifactSHA256, r.SelectedCandidateID, r.TerminalReason, r.RetryAt = artifact.String, selected.Int64, terminal.String, retryAt.String
 	if err := json.Unmarshal([]byte(polJSON), &r.Policy); err != nil {
 		return nil, fmt.Errorf("job %s policy: %w", jobID, err)
 	}
@@ -445,10 +679,10 @@ func (js *Store) Get(ctx context.Context, jobID string) (*Row, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer ids.Close()
 	for ids.Next() {
 		var kind, value string
 		if err := ids.Scan(&kind, &value); err != nil {
+			_ = ids.Close()
 			return nil, err
 		}
 		switch kind {
@@ -464,7 +698,13 @@ func (js *Store) Get(ctx context.Context, jobID string) (*Row, error) {
 			r.Work.OpenAlex = value
 		}
 	}
-	return &r, ids.Err()
+	if err := ids.Close(); err != nil {
+		return nil, err
+	}
+	if err := ids.Err(); err != nil {
+		return nil, err
+	}
+	return &r, nil
 }
 
 // jsonScanner scans a JSON array column into a []string.
@@ -500,15 +740,18 @@ func (js *Store) List(ctx context.Context, state string, limit int) ([]Row, erro
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 	var out []Row
 	var idList []string
 	for rows.Next() {
 		var id string
 		if err := rows.Scan(&id); err != nil {
+			_ = rows.Close()
 			return nil, err
 		}
 		idList = append(idList, id)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -530,7 +773,7 @@ func (js *Store) InsertCandidates(ctx context.Context, jobID string, cands []Can
 	if err != nil {
 		return 0, err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	now := store.Now()
 	inserted := 0
 	for _, c := range cands {
@@ -587,11 +830,29 @@ func (js *Store) MarkCandidate(ctx context.Context, id int64, status string) err
 	return err
 }
 
-// ResetCandidates returns all candidates of a job to pending (used when a
-// recovered job re-enters fetching with a fresh resolution pass).
+// GetCandidate loads one candidate by its durable ID.
+func (js *Store) GetCandidate(ctx context.Context, id int64) (*Candidate, error) {
+	row := js.S.DB().QueryRowContext(ctx, `
+		SELECT id, job_id, source, url_redacted, url_key, COALESCE(landing_redacted,''), version, access_basis,
+		       reuse_license, COALESCE(expected_mime,''), cost_usd, direct, identity_confidence,
+		       COALESCE(rank_evidence,''), COALESCE(rank,0), status
+		FROM candidates WHERE id = ?`, id)
+	var c Candidate
+	var direct int
+	if err := row.Scan(&c.ID, &c.JobID, &c.Source, &c.URLRedacted, &c.URLKey, &c.LandingRedacted, &c.Version,
+		&c.AccessBasis, &c.ReuseLicense, &c.ExpectedMIME, &c.CostUSD, &direct, &c.IdentityConfidence,
+		&c.RankEvidence, &c.Rank, &c.Status); err != nil {
+		return nil, err
+	}
+	c.Direct = direct == 1
+	return &c, nil
+}
+
+// ResetCandidates makes interrupted and retryable candidates runnable for a
+// fresh resolution pass. Invalid/skipped candidates stay exhausted.
 func (js *Store) ResetCandidates(ctx context.Context, jobID string) error {
 	_, err := js.S.DB().ExecContext(ctx,
-		`UPDATE candidates SET status = 'pending' WHERE job_id = ? AND status IN ('fetching')`, jobID)
+		`UPDATE candidates SET status = 'pending' WHERE job_id = ? AND status IN ('fetching','retryable')`, jobID)
 	return err
 }
 
@@ -624,16 +885,17 @@ func (js *Store) FinishAttempt(ctx context.Context, attemptID int64, outcome str
 
 // UpsertArtifact records a validated artifact (content-addressed; idempotent).
 type Artifact struct {
-	SHA256           string
-	SizeBytes        int64
-	MIME             string
-	PageCount        int
-	TextChars        int64
-	OCRUsed          bool
-	Encrypted        bool
-	HasActiveContent bool
-	IdentityResult   string
-	Path             string
+	SHA256           string `json:"sha256"`
+	SizeBytes        int64  `json:"size_bytes"`
+	MIME             string `json:"mime"`
+	PageCount        int    `json:"page_count"`
+	TextChars        int64  `json:"text_chars"`
+	OCRUsed          bool   `json:"ocr_used"`
+	Encrypted        bool   `json:"encrypted"`
+	HasActiveContent bool   `json:"has_active_content"`
+	IdentityResult   string `json:"identity_result,omitempty"`
+	Path             string `json:"path"`
+	CreatedAt        string `json:"created_at"`
 }
 
 // UpsertArtifact inserts the artifact row if new.
@@ -653,9 +915,10 @@ func (js *Store) GetArtifact(ctx context.Context, sha string) (*Artifact, error)
 	var ocr, enc, active int
 	var identity sql.NullString
 	err := js.S.DB().QueryRowContext(ctx, `
-		SELECT sha256, size_bytes, mime, COALESCE(page_count,0), COALESCE(text_chars,0), ocr_used, encrypted, has_active_content, identity_result, path
+		SELECT sha256, size_bytes, mime, COALESCE(page_count,0), COALESCE(text_chars,0), ocr_used, encrypted,
+		       has_active_content, identity_result, path, created_at
 		FROM artifacts WHERE sha256 = ?`, sha).Scan(
-		&a.SHA256, &a.SizeBytes, &a.MIME, &a.PageCount, &a.TextChars, &ocr, &enc, &active, &identity, &a.Path)
+		&a.SHA256, &a.SizeBytes, &a.MIME, &a.PageCount, &a.TextChars, &ocr, &enc, &active, &identity, &a.Path, &a.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -665,6 +928,23 @@ func (js *Store) GetArtifact(ctx context.Context, sha string) (*Artifact, error)
 	a.OCRUsed, a.Encrypted, a.HasActiveContent = ocr == 1, enc == 1, active == 1
 	a.IdentityResult = identity.String
 	return &a, nil
+}
+
+// FindCandidateByArtifact returns the original accepted candidate provenance
+// for an artifact, including when the current job completed from local cache.
+func (js *Store) FindCandidateByArtifact(ctx context.Context, sha string) (*Candidate, error) {
+	var id sql.NullInt64
+	err := js.S.DB().QueryRowContext(ctx, `
+		SELECT selected_candidate_id FROM jobs
+		WHERE artifact_sha256 = ? AND state = 'ready' AND selected_candidate_id IS NOT NULL
+		ORDER BY updated_at ASC LIMIT 1`, sha).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return js.GetCandidate(ctx, id.Int64)
 }
 
 // FindArtifactByDOI returns a prior validated artifact for the same DOI, if
@@ -698,12 +978,12 @@ func (js *Store) OpenHumanAction(ctx context.Context, jobID, kind, detail string
 
 // HumanAction is one pending or resolved human step.
 type HumanAction struct {
-	ID        int64
-	JobID     string
-	Kind      string
-	Status    string
-	Detail    string
-	CreatedAt string
+	ID        int64  `json:"id"`
+	JobID     string `json:"job_id"`
+	Kind      string `json:"kind"`
+	Status    string `json:"status"`
+	Detail    string `json:"detail,omitempty"`
+	CreatedAt string `json:"created_at"`
 }
 
 // ListHumanActions returns actions, optionally only open ones.
@@ -717,14 +997,17 @@ func (js *Store) ListHumanActions(ctx context.Context, openOnly bool) ([]HumanAc
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 	var out []HumanAction
 	for rows.Next() {
 		var h HumanAction
 		if err := rows.Scan(&h.ID, &h.JobID, &h.Kind, &h.Status, &h.Detail, &h.CreatedAt); err != nil {
+			_ = rows.Close()
 			return nil, err
 		}
 		out = append(out, h)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
 	}
 	return out, rows.Err()
 }
@@ -736,17 +1019,20 @@ func (js *Store) Events(ctx context.Context, jobID string) ([]map[string]any, er
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 	var out []map[string]any
 	for rows.Next() {
 		var seq int64
 		var at, kind, detail string
 		if err := rows.Scan(&seq, &at, &kind, &detail); err != nil {
+			_ = rows.Close()
 			return nil, err
 		}
 		var d map[string]any
 		_ = json.Unmarshal([]byte(detail), &d)
 		out = append(out, map[string]any{"seq": seq, "at": at, "kind": kind, "detail": d})
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
 	}
 	return out, rows.Err()
 }

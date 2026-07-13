@@ -16,6 +16,8 @@ type Policy struct {
 	MaxBytes          int64
 	Timeout           time.Duration
 	ConnectTimeout    time.Duration
+	HeaderTimeout     time.Duration
+	BodyTimeout       time.Duration
 	MaxRedirects      int
 	AllowHTTPLoopback bool // tests/dev only; production is HTTPS-only
 	UserAgent         string
@@ -27,6 +29,8 @@ func DefaultPolicy() Policy {
 		MaxBytes:       100 << 20,
 		Timeout:        120 * time.Second,
 		ConnectTimeout: 15 * time.Second,
+		HeaderTimeout:  30 * time.Second,
+		BodyTimeout:    90 * time.Second,
 		MaxRedirects:   5,
 		UserAgent:      "papio/0.1 (legitimate research acquisition; mailto:unset)",
 	}

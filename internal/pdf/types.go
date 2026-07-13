@@ -7,8 +7,7 @@
 package pdf
 
 // PayloadReport is the cheap pre-parse gate on downloaded bytes, following the
-// instsci behavioral reference: minimum plausible size, %PDF- header (with a
-// small scan window for BOM/garbage prefixes), and an %%EOF marker searched
+// instsci behavioral reference: minimum plausible size, a %PDF- header at byte zero, and an %%EOF marker searched
 // within a bounded tail window (some real PDFs append data after %%EOF).
 type PayloadReport struct {
 	OK          bool
@@ -31,9 +30,11 @@ type StructuralReport struct {
 
 // TextReport is the semantic extraction result (pdftotext, or OCR fallback).
 type TextReport struct {
-	Chars   int64
-	Excerpt string // bounded head of extracted text for identity matching
-	OCRUsed bool
+	Chars       int64
+	Excerpt     string // bounded head of extracted text for identity matching
+	OCRUsed     bool
+	NeedsReview bool     // missing tools, failed converter, or sparse OCR output
+	Evidence    []string // capability and extraction evidence; never implies success
 }
 
 // Capability reports which external tools are available (doctor surface).

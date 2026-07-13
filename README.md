@@ -10,14 +10,34 @@ never touches credentials/MFA/CAPTCHA, and never crawls subscription content.
 
 ## Status
 
-Phase 0 scaffold. Contracts are draft `0.x`; nothing here is stable yet.
+Phase 1 acquisition core is implemented. Contracts remain draft `0.x`.
 
-- `protocol/` — draft JSON Schema contracts (work request, acquisition bundle,
-  browser bridge). The shared fixture corpus in `testdata/protocol/` is
-  validated by both the Go core and the extension TypeScript.
-- `internal/protocol/` — Go structs with strict, fail-closed decoding.
-- `extension/` — Manifest V3 extension workspace (TypeScript; Bun for package
-  management/scripts only). Built out in Phase 2.
+- Durable SQLite jobs, leases, cancellation/retry, source budgets, redacted
+  events, quarantine, and immutable SHA-256 artifact storage.
+- arXiv, Europe PMC, Unpaywall, OpenAlex, CORE, and explicitly configured
+  Crossref TDM resolvers with deterministic ranking and bounded secure HTTP.
+- Isolated structural PDF parsing, Poppler text/page cross-checks, deterministic
+  identity matching, and bounded Tesseract OCR fallback.
+- Strict Unix-socket daemon IPC/autostart, structured CLI output, readiness
+  diagnostics, and idempotent acquisition-bundle export.
+- `extension/` remains the Phase 2 ordinary-Chrome institutional handoff.
+
+## Use
+
+```sh
+papio config init --access-mode maximal --email you@example.org
+papio doctor
+papio acquire 10.1371/journal.pone.0262026 --wait
+papio jobs list --json
+papio artifacts get <job-id>
+papio bundle export <job-id> --output ./export
+papio daemon stop
+```
+
+`config init` deliberately requires an explicit access mode. Credentialed
+sources are disabled until configured and enabled in
+`~/.config/papio/config.toml`. The daemon autostarts on the first client command;
+`papio daemon` runs it in the foreground.
 
 ## Fixed identifiers
 

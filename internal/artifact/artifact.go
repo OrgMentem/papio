@@ -113,12 +113,16 @@ func (s *Store) Verify(sha string) error {
 }
 
 // HashFile returns the SHA-256 hex digest and size of a file.
-func HashFile(path string) (string, int64, error) {
+func HashFile(path string) (digest string, size int64, err error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return "", 0, err
 	}
-	defer f.Close()
+	defer func() {
+		if closeErr := f.Close(); err == nil && closeErr != nil {
+			digest, size, err = "", 0, closeErr
+		}
+	}()
 	h := sha256.New()
 	n, err := io.Copy(h, f)
 	if err != nil {

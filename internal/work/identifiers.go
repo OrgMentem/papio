@@ -12,14 +12,14 @@ import (
 
 // Work is the normalized identity a resolver receives.
 type Work struct {
-	DOI      string
-	PMID     string
-	ArXiv    string
-	ISBN     string
-	OpenAlex string
-	Title    string
-	Authors  []string
-	Year     int
+	DOI      string   `json:"doi,omitempty"`
+	PMID     string   `json:"pmid,omitempty"`
+	ArXiv    string   `json:"arxiv,omitempty"`
+	ISBN     string   `json:"isbn,omitempty"`
+	OpenAlex string   `json:"openalex,omitempty"`
+	Title    string   `json:"title,omitempty"`
+	Authors  []string `json:"authors,omitempty"`
+	Year     int      `json:"year,omitempty"`
 }
 
 // HasIdentifier reports whether any strong identifier is present.
@@ -80,7 +80,6 @@ func NormalizeDOI(raw string) (string, error) {
 	for _, prefix := range []string{"https://doi.org/", "http://doi.org/", "https://dx.doi.org/", "http://dx.doi.org/", "doi.org/", "doi:", "doi "} {
 		if strings.HasPrefix(lower, prefix) {
 			s = s[len(prefix):]
-			lower = lower[len(prefix):]
 			break
 		}
 	}

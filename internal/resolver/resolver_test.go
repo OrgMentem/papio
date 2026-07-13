@@ -60,11 +60,11 @@ func TestValidateCandidateFailsClosed(t *testing.T) {
 		t.Fatalf("good candidate rejected: %v", err)
 	}
 	bad := []Candidate{
-		{URL: "https://x", Version: VersionPublished, AccessBasis: AccessOpen, ReuseLicense: "unknown"},              // no source
-		{Source: "s", URL: "ftp://x", Version: VersionPublished, AccessBasis: AccessOpen, ReuseLicense: "unknown"},   // scheme
-		{Source: "s", URL: "https://x", Version: "final", AccessBasis: AccessOpen, ReuseLicense: "unknown"},          // version enum
-		{Source: "s", URL: "https://x", Version: VersionPublished, AccessBasis: "free", ReuseLicense: "unknown"},     // access enum
-		{Source: "s", URL: "https://x", Version: VersionPublished, AccessBasis: AccessOpen},                          // license required
+		{URL: "https://x", Version: VersionPublished, AccessBasis: AccessOpen, ReuseLicense: "unknown"},            // no source
+		{Source: "s", URL: "ftp://x", Version: VersionPublished, AccessBasis: AccessOpen, ReuseLicense: "unknown"}, // scheme
+		{Source: "s", URL: "https://x", Version: "final", AccessBasis: AccessOpen, ReuseLicense: "unknown"},        // version enum
+		{Source: "s", URL: "https://x", Version: VersionPublished, AccessBasis: "free", ReuseLicense: "unknown"},   // access enum
+		{Source: "s", URL: "https://x", Version: VersionPublished, AccessBasis: AccessOpen},                        // license required
 		{Source: "s", URL: "https://x", Version: VersionPublished, AccessBasis: AccessOpen, ReuseLicense: "unknown", IdentityConfidence: 1.5},
 	}
 	for i, c := range bad {

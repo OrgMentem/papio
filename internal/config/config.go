@@ -94,7 +94,7 @@ func Default() Config {
 			SourceArXiv:           {Enabled: true, RatePerSec: 1, Burst: 1},
 			SourceEuropePMC:       {Enabled: true, RatePerSec: 2, Burst: 2},
 			SourceUnpaywall:       {Enabled: true, RatePerSec: 1, Burst: 1},
-			SourceOpenAlex:        {Enabled: true, RatePerSec: 2, Burst: 2},
+			SourceOpenAlex:        {Enabled: false, RatePerSec: 2, Burst: 2},
 			SourceOpenAlexContent: {Enabled: false},
 			SourceCORE:            {Enabled: false, RatePerSec: 0.4, Burst: 1},
 			SourceCrossrefTDM:     {Enabled: false, RatePerSec: 1, Burst: 1},
@@ -184,4 +184,56 @@ func (c *Config) FetchTimeout() time.Duration {
 // SourcePolicy returns the effective source policy (zero value when absent).
 func (c *Config) SourcePolicy(name string) Source {
 	return c.Sources[name]
+}
+
+// Save validates and atomically writes cfg as a user-only TOML file. An empty
+// path uses the default config location. API keys may be present, so neither
+// temporary nor final files are group/world-readable.
+func Save(cfg Config, path string) error {
+	if path == "" {
+		path = filepath.Join(Dir(), "config.toml")
+	}
+	if _, err := cfg.RequireAccessMode(); err != nil {
+		return err
+	}
+	if err := cfg.validate(); err != nil {
+		return err
+	}
+	data, err := toml.Marshal(cfg)
+	if err != nil {
+		return fmt.Errorf("encoding config: %w", err)
+	}
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, ".config-*.tmp")
+	if err != nil {
+		return err
+	}
+	name := tmp.Name()
+	defer func() { _ = os.Remove(name) }()
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(name, path); err != nil {
+		return err
+	}
+	cfg.Path = path
+	return nil
 }

@@ -36,13 +36,19 @@ const (
 // Candidate is one acquisition option for a work. URL may be bearer-signed and
 // MUST NOT be persisted or logged; use Redacted()/Key() for durable forms.
 type Candidate struct {
-	Source             string
-	URL                string
-	Landing            string
-	Version            string
-	AccessBasis        string
-	ReuseLicense       string // "unknown" when the source does not state one
-	ExpectedMIME       string
+	Source       string
+	URL          string
+	Landing      string
+	Version      string
+	AccessBasis  string
+	ReuseLicense string // "unknown" when the source does not state one
+	ExpectedMIME string
+	// RequestHeaders are ephemeral source credentials or content negotiation.
+	// They follow the live URL in memory only and are never persisted/events.
+	RequestHeaders map[string]string
+	// ResolvedWork carries source metadata discovered while resolving. The app
+	// may fill fields missing from the request after identity-consistency checks.
+	ResolvedWork       work.Work
 	CostUSD            float64
 	Direct             bool    // a direct file URL rather than a landing page
 	IdentityConfidence float64 // 0..1 resolver-side confidence
@@ -217,6 +223,11 @@ func ValidateCandidate(c Candidate) error {
 	}
 	if !strings.HasPrefix(c.URL, "https://") && !strings.HasPrefix(c.URL, "http://") {
 		return fmt.Errorf("candidate %s: URL must be absolute http(s)", c.Source)
+	}
+	for name, value := range c.RequestHeaders {
+		if strings.TrimSpace(name) == "" || strings.ContainsAny(name+value, "\r\n") {
+			return fmt.Errorf("candidate %s: invalid request header", c.Source)
+		}
 	}
 	switch c.Version {
 	case VersionPublished, VersionAccepted, VersionPreprint, VersionUnknown:

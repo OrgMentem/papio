@@ -47,12 +47,12 @@ func Open(ctx context.Context, dir string) (*Store, error) {
 	db.SetMaxOpenConns(1)
 	s := &Store{db: db, path: path}
 	if err := s.migrate(ctx); err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, err
 	}
 	var integrity string
 	if err := db.QueryRowContext(ctx, "PRAGMA integrity_check").Scan(&integrity); err != nil || integrity != "ok" {
-		db.Close()
+		_ = db.Close()
 		return nil, fmt.Errorf("integrity check on %s: %q %v", path, integrity, err)
 	}
 	return s, nil
@@ -66,6 +66,19 @@ func (s *Store) DB() *sql.DB { return s.db }
 
 // Path returns the database file path (for doctor/backup).
 func (s *Store) Path() string { return s.path }
+
+// IntegrityCheck verifies the live database. Open already runs it once; doctor
+// uses this method for an explicit readiness report.
+func (s *Store) IntegrityCheck(ctx context.Context) error {
+	var result string
+	if err := s.db.QueryRowContext(ctx, "PRAGMA integrity_check").Scan(&result); err != nil {
+		return err
+	}
+	if result != "ok" {
+		return fmt.Errorf("integrity_check: %s", result)
+	}
+	return nil
+}
 
 // migrate applies numbered migrations above the current user_version, each in
 // its own transaction, then bumps user_version inside that transaction.
@@ -106,11 +119,11 @@ func (s *Store) migrate(ctx context.Context) error {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, string(body)); err != nil {
-			tx.Rollback()
+			_ = tx.Rollback()
 			return fmt.Errorf("applying %s: %w", name, err)
 		}
 		if _, err := tx.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", num)); err != nil {
-			tx.Rollback()
+			_ = tx.Rollback()
 			return fmt.Errorf("bumping user_version for %s: %w", name, err)
 		}
 		if err := tx.Commit(); err != nil {

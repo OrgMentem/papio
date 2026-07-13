@@ -20,7 +20,11 @@ func testStore(t *testing.T) *Store {
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	t.Cleanup(func() { s.Close() })
+	t.Cleanup(func() {
+		if err := s.Close(); err != nil {
+			t.Errorf("close store: %v", err)
+		}
+	})
 	return &Store{S: s}
 }
 
@@ -68,8 +72,8 @@ func TestTransitionCASRejectsWrongFromState(t *testing.T) {
 		t.Fatalf("replay err = %v, want ErrConflict", err)
 	}
 	// Disallowed edges fail closed.
-	if err := js.Transition(ctx, id, StateResolving, StateReady, nil); !errors.Is(err, ErrConflict) {
-		t.Fatalf("resolving->ready err = %v, want ErrConflict (not an allowed edge)", err)
+	if err := js.Transition(ctx, id, StateResolving, StateValidating, nil); !errors.Is(err, ErrConflict) {
+		t.Fatalf("resolving->validating err = %v, want ErrConflict (not an allowed edge)", err)
 	}
 }
 
@@ -162,6 +166,53 @@ func TestRecoverStaleRewindsMidflightToResolving(t *testing.T) {
 	}
 }
 
+func TestRecoveredResolvingJobIsImmediatelyClaimable(t *testing.T) {
+	js := testStore(t)
+	ctx := context.Background()
+	id, _ := js.CreateRequest(ctx, "wr_test_reclaim", testWork(), "", "", testPolicy(), nil)
+	if _, err := js.ClaimNext(ctx, "dead-daemon", -time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if err := js.Transition(ctx, id, StateQueued, StateResolving, nil); err != nil {
+		t.Fatal(err)
+	}
+	if recovered, err := js.RecoverStale(ctx); err != nil || len(recovered) != 1 {
+		t.Fatalf("recover = %v, %v", recovered, err)
+	}
+	claimed, err := js.ClaimNext(ctx, "replacement-daemon", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed == nil || claimed.ID != id {
+		t.Fatalf("claim after recovery = %+v", claimed)
+	}
+}
+
+func TestRetryReopensFailedJobOnlyByExplicitCommand(t *testing.T) {
+	js := testStore(t)
+	ctx := context.Background()
+	id, _ := js.CreateRequest(ctx, "wr_test_retry", testWork(), "", "", testPolicy(), nil)
+	if err := js.Transition(ctx, id, StateQueued, StateResolving, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := js.Transition(ctx, id, StateResolving, StateFailed, nil, WithTerminalReason("network exhausted")); err != nil {
+		t.Fatal(err)
+	}
+	if err := js.Retry(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	row, err := js.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.State != StateResolving || row.TerminalReason != "" {
+		t.Fatalf("retried row = %+v", row)
+	}
+	if err := js.Retry(ctx, id); !errors.Is(err, ErrConflict) {
+		t.Fatalf("second retry err = %v, want ErrConflict", err)
+	}
+}
+
 func TestCandidatesDedupeAndOrder(t *testing.T) {
 	js := testStore(t)
 	ctx := context.Background()
@@ -230,5 +281,84 @@ func TestArtifactCacheByDOI(t *testing.T) {
 	miss, err := js.FindArtifactByDOI(ctx, "10.9999/other")
 	if err != nil || miss != nil {
 		t.Fatalf("cache miss lookup = %+v, %v; want nil", miss, err)
+	}
+}
+
+func TestFillWorkMetadataOnlyFillsMissingAndRejectsIdentifierConflict(t *testing.T) {
+	js := testStore(t)
+	ctx := context.Background()
+	id, err := js.CreateRequest(ctx, "wr_metadata_01",
+		work.Work{DOI: "10.1002/example", Title: "Requested Title"}, "", "", testPolicy(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, err := js.FillWorkMetadata(ctx, id, work.Work{
+		DOI: "10.1002/example", Title: "Resolver Title", Authors: []string{"Ada Lovelace"}, Year: 2024,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.Work.Title != "Requested Title" || len(row.Work.Authors) != 1 || row.Work.Year != 2024 {
+		t.Fatalf("fill result = %+v; request title should win, missing fields should fill", row.Work)
+	}
+	if _, err := js.FillWorkMetadata(ctx, id, work.Work{DOI: "10.9999/wrong"}); err == nil {
+		t.Fatal("conflicting resolver DOI was accepted")
+	}
+	got, _ := js.Get(ctx, id)
+	if got.Work.DOI != "10.1002/example" {
+		t.Fatalf("conflict mutated DOI to %q", got.Work.DOI)
+	}
+}
+
+func TestReserveCostIsDurableAndAtomic(t *testing.T) {
+	js := testStore(t)
+	ctx := context.Background()
+	id, _ := js.CreateRequest(ctx, "wr_cost_0001", testWork(), "", "", testPolicy(), nil)
+	limit := 1.0
+	if err := js.ReserveCost(ctx, id, "paid", 0.6, &limit); err != nil {
+		t.Fatal(err)
+	}
+	err := js.ReserveCost(ctx, id, "paid", 0.41, &limit)
+	var exceeded *ErrCostExceeded
+	if !errors.As(err, &exceeded) {
+		t.Fatalf("second reservation = %v, want ErrCostExceeded", err)
+	}
+	row, _ := js.Get(ctx, id)
+	if row.SpentUSD != 0.6 {
+		t.Fatalf("spent = %.2f, rejected reservation changed it", row.SpentUSD)
+	}
+	if err := js.ReserveCost(ctx, id, "free", 0, &limit); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCancelIsIdempotentAndNeverOverwritesTerminalResult(t *testing.T) {
+	js := testStore(t)
+	ctx := context.Background()
+	id, _ := js.CreateRequest(ctx, "wr_cancel_001", testWork(), "", "", testPolicy(), nil)
+	if err := js.Cancel(ctx, id, "user request"); err != nil {
+		t.Fatal(err)
+	}
+	if err := js.Cancel(ctx, id, "again"); err != nil {
+		t.Fatalf("repeat cancel: %v", err)
+	}
+	row, _ := js.Get(ctx, id)
+	if row.State != StateCancelled || row.TerminalReason != "user request" {
+		t.Fatalf("cancelled row = %+v", row)
+	}
+
+	readyID, _ := js.CreateRequest(ctx, "wr_ready_term", testWork(), "", "", testPolicy(), nil)
+	if err := js.Transition(ctx, readyID, StateQueued, StateResolving, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := js.Transition(ctx, readyID, StateResolving, StateReady, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := js.Cancel(ctx, readyID, "too late"); err != nil {
+		t.Fatal(err)
+	}
+	ready, _ := js.Get(ctx, readyID)
+	if ready.State != StateReady {
+		t.Fatalf("cancel overwrote ready terminal state: %s", ready.State)
 	}
 }

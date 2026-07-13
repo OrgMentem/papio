@@ -13,19 +13,19 @@ func TestNormalizeDOI(t *testing.T) {
 		want string // "" means error expected
 	}{
 		{" 10.1002/example  ", "10.1002/example"},
-		{"10.1002/Example", "10.1002/example"},                            // canonical lowercase
-		{"10.1002/example.", "10.1002/example"},                           // trailing period
-		{"https://doi.org/10.1002/example).", "10.1002/example"},          // prose glue
+		{"10.1002/Example", "10.1002/example"},                   // canonical lowercase
+		{"10.1002/example.", "10.1002/example"},                  // trailing period
+		{"https://doi.org/10.1002/example).", "10.1002/example"}, // prose glue
 		{"https://doi.org/10.1002/example", "10.1002/example"},
 		{"http://dx.doi.org/10.1002/example", "10.1002/example"},
 		{"doi:10.1021/acs.est.6c00693", "10.1021/acs.est.6c00693"},
 		{"10.1016/j.watres.2024.121507", "10.1016/j.watres.2024.121507"},
 		{"10.1103/PhysRevLett.128.161102", "10.1103/physrevlett.128.161102"},
-		{"10.1037%2F0022-3514.57.5.830", "10.1037/0022-3514.57.5.830"},    // URL-encoded slash
-		{"10.1002", ""},           // no suffix
-		{"11.1002/example", ""},   // wrong directory indicator
-		{"10.12/example", ""},     // registrant too short
-		{"10.1002/", ""},          // empty suffix
+		{"10.1037%2F0022-3514.57.5.830", "10.1037/0022-3514.57.5.830"}, // URL-encoded slash
+		{"10.1002", ""},         // no suffix
+		{"11.1002/example", ""}, // wrong directory indicator
+		{"10.12/example", ""},   // registrant too short
+		{"10.1002/", ""},        // empty suffix
 		{"", ""},
 		{"not-a-doi", ""},
 	}
@@ -58,16 +58,16 @@ func TestNormalizeArXiv(t *testing.T) {
 		want string
 	}{
 		{"2301.08745", "2301.08745"},
-		{"2301.08745v2", "2301.08745v2"},                                  // explicit version preserved
+		{"2301.08745v2", "2301.08745v2"}, // explicit version preserved
 		{"https://arxiv.org/abs/2301.08745v2", "2301.08745v2"},
 		{"https://arxiv.org/pdf/2301.08745.pdf", "2301.08745"},
 		{"arXiv:2301.08745", "2301.08745"},
 		{"hep-ph/0601001", "hep-ph/0601001"},
 		{"hep-ph/0601001v3", "hep-ph/0601001v3"},
-		{"math.GT/0309136", "math.GT/0309136"},                            // dotted old-style category
-		{"2301.123", ""},     // too few digits
-		{"2301.1234567", ""}, // too many digits
-		{"HEP-PH/0601001", ""}, // old style is lowercase
+		{"math.GT/0309136", "math.GT/0309136"}, // dotted old-style category
+		{"2301.123", ""},                       // too few digits
+		{"2301.1234567", ""},                   // too many digits
+		{"HEP-PH/0601001", ""},                 // old style is lowercase
 		{"", ""},
 	}
 	for _, c := range cases {

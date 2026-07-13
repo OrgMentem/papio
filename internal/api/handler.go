@@ -1,0 +1,303 @@
+// Copyright 2026 OrgMentem. Licensed under MIT. See LICENSE.
+
+// Package api exposes the acquisition core through strict local IPC methods.
+package api
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"strings"
+	"time"
+
+	"papio/internal/bootstrap"
+	"papio/internal/config"
+	"papio/internal/ipc"
+	"papio/internal/job"
+	"papio/internal/protocol"
+)
+
+const Version = "0.1.0-dev"
+
+type SubmitResult struct {
+	JobID string `json:"job_id"`
+}
+
+type JobDetail struct {
+	Job     *job.Row          `json:"job"`
+	Events  []map[string]any  `json:"events"`
+	Actions []job.HumanAction `json:"actions"`
+}
+
+type ArtifactResult struct {
+	Artifact *job.Artifact `json:"artifact"`
+}
+
+type BundleResult struct {
+	Path   string                      `json:"path"`
+	Bundle *protocol.AcquisitionBundle `json:"bundle"`
+}
+
+// Router returns the complete Phase 1 local RPC surface.
+func Router(system *bootstrap.System) ipc.Router {
+	return RouterWithShutdown(system, nil)
+}
+
+// RouterWithShutdown adds the process-lifecycle method used by `daemon stop`.
+// The delayed callback lets the successful response flush before cancellation.
+func RouterWithShutdown(system *bootstrap.System, shutdown context.CancelFunc) ipc.Router {
+	methods := map[string]ipc.MethodHandler{
+		"ping": ping,
+		"acquire.submit": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return submit(ctx, raw, system)
+		},
+		"jobs.list": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return listJobs(ctx, raw, system)
+		},
+		"jobs.get": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return getJob(ctx, raw, system)
+		},
+		"jobs.cancel": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return cancelJob(ctx, raw, system)
+		},
+		"jobs.retry": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return retryJob(ctx, raw, system)
+		},
+		"actions.list": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return listActions(ctx, raw, system)
+		},
+		"artifacts.get": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return getArtifact(ctx, raw, system)
+		},
+		"bundle.export": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return exportBundle(ctx, raw, system)
+		},
+		"doctor.run": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return runDoctor(ctx, raw, system)
+		},
+	}
+	if shutdown != nil {
+		methods["daemon.shutdown"] = func(_ context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			var params struct{}
+			if err := ipc.DecodeParams(raw, &params); err != nil {
+				return badParams(err)
+			}
+			time.AfterFunc(25*time.Millisecond, shutdown)
+			return marshal(map[string]bool{"stopping": true})
+		}
+	}
+	return ipc.Router{Methods: methods}
+}
+
+func ping(_ context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+	var params struct{}
+	if err := ipc.DecodeParams(raw, &params); err != nil {
+		return badParams(err)
+	}
+	return marshal(map[string]string{"status": "ok", "version": Version})
+}
+
+func submit(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
+	var request protocol.WorkRequest
+	if err := ipc.DecodeParams(raw, &request); err != nil {
+		return badParams(err)
+	}
+	id, err := system.App.Submit(ctx, request)
+	if err != nil {
+		var unset *config.ErrAccessModeUnset
+		if errors.As(err, &unset) {
+			return nil, &ipc.RPCError{Code: "configuration_required", Message: unset.Error()}
+		}
+		return nil, &ipc.RPCError{Code: "invalid_argument", Message: "invalid acquisition request"}
+	}
+	return marshal(SubmitResult{JobID: id})
+}
+
+func listJobs(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
+	var params struct {
+		State string `json:"state,omitempty"`
+		Limit int    `json:"limit,omitempty"`
+	}
+	if err := ipc.DecodeParams(raw, &params); err != nil {
+		return badParams(err)
+	}
+	rows, err := system.Jobs.List(ctx, params.State, params.Limit)
+	if err != nil {
+		return failure(err)
+	}
+	return marshal(rows)
+}
+
+func getJob(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
+	var params struct {
+		JobID string `json:"job_id"`
+	}
+	if err := ipc.DecodeParams(raw, &params); err != nil || strings.TrimSpace(params.JobID) == "" {
+		if err == nil {
+			err = errors.New("job_id is required")
+		}
+		return badParams(err)
+	}
+	row, err := system.Jobs.Get(ctx, params.JobID)
+	if err != nil {
+		return failure(err)
+	}
+	events, err := system.Jobs.Events(ctx, params.JobID)
+	if err != nil {
+		return failure(err)
+	}
+	actions, err := system.Jobs.ListHumanActions(ctx, false)
+	if err != nil {
+		return failure(err)
+	}
+	jobActions := actions[:0]
+	for _, action := range actions {
+		if action.JobID == params.JobID {
+			jobActions = append(jobActions, action)
+		}
+	}
+	return marshal(JobDetail{Job: row, Events: events, Actions: jobActions})
+}
+
+func cancelJob(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
+	var params struct {
+		JobID string `json:"job_id"`
+	}
+	if err := ipc.DecodeParams(raw, &params); err != nil || strings.TrimSpace(params.JobID) == "" {
+		if err == nil {
+			err = errors.New("job_id is required")
+		}
+		return badParams(err)
+	}
+	if err := system.Jobs.Cancel(ctx, params.JobID, "cancelled by user"); err != nil {
+		return failure(err)
+	}
+	return marshal(map[string]any{"job_id": params.JobID, "cancelled": true})
+}
+
+func retryJob(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
+	var params struct {
+		JobID string `json:"job_id"`
+	}
+	if err := ipc.DecodeParams(raw, &params); err != nil || strings.TrimSpace(params.JobID) == "" {
+		if err == nil {
+			err = errors.New("job_id is required")
+		}
+		return badParams(err)
+	}
+	if err := system.Jobs.Retry(ctx, params.JobID); err != nil {
+		return failure(err)
+	}
+	return marshal(map[string]any{"job_id": params.JobID, "state": job.StateResolving})
+}
+
+func listActions(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
+	var params struct {
+		OpenOnly *bool `json:"open_only,omitempty"`
+	}
+	if err := ipc.DecodeParams(raw, &params); err != nil {
+		return badParams(err)
+	}
+	openOnly := true
+	if params.OpenOnly != nil {
+		openOnly = *params.OpenOnly
+	}
+	actions, err := system.Jobs.ListHumanActions(ctx, openOnly)
+	if err != nil {
+		return failure(err)
+	}
+	return marshal(actions)
+}
+
+func getArtifact(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
+	var params struct {
+		JobID  string `json:"job_id,omitempty"`
+		SHA256 string `json:"sha256,omitempty"`
+	}
+	if err := ipc.DecodeParams(raw, &params); err != nil {
+		return badParams(err)
+	}
+	if (params.JobID == "") == (params.SHA256 == "") {
+		return badParams(errors.New("exactly one of job_id or sha256 is required"))
+	}
+	sha := params.SHA256
+	if params.JobID != "" {
+		row, err := system.Jobs.Get(ctx, params.JobID)
+		if err != nil {
+			return failure(err)
+		}
+		sha = row.ArtifactSHA256
+		if sha == "" {
+			return nil, &ipc.RPCError{Code: "not_found", Message: "job has no validated artifact"}
+		}
+	}
+	artifact, err := system.Jobs.GetArtifact(ctx, sha)
+	if err != nil {
+		return failure(err)
+	}
+	if artifact == nil {
+		return nil, &ipc.RPCError{Code: "not_found", Message: "artifact not found"}
+	}
+	return marshal(ArtifactResult{Artifact: artifact})
+}
+
+func exportBundle(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
+	var params struct {
+		JobID     string `json:"job_id"`
+		OutputDir string `json:"output_dir"`
+	}
+	if err := ipc.DecodeParams(raw, &params); err != nil || params.JobID == "" || params.OutputDir == "" {
+		if err == nil {
+			err = errors.New("job_id and output_dir are required")
+		}
+		return badParams(err)
+	}
+	path, result, err := system.Bundle.Export(ctx, params.JobID, params.OutputDir)
+	if err != nil {
+		return failure(err)
+	}
+	return marshal(BundleResult{Path: path, Bundle: result})
+}
+
+func runDoctor(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
+	var params struct{}
+	if err := ipc.DecodeParams(raw, &params); err != nil {
+		return badParams(err)
+	}
+	return marshal(system.DoctorReport(ctx))
+}
+
+func marshal(value any) ([]byte, *ipc.RPCError) {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return nil, &ipc.RPCError{Code: "internal", Message: "unable to encode daemon response"}
+	}
+	return data, nil
+}
+
+func badParams(err error) ([]byte, *ipc.RPCError) {
+	return nil, &ipc.RPCError{Code: "invalid_argument", Message: safeMessage(err, "invalid parameters")}
+}
+
+func failure(err error) ([]byte, *ipc.RPCError) {
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return nil, &ipc.RPCError{Code: "not_found", Message: "record not found"}
+	case errors.Is(err, job.ErrConflict):
+		return nil, &ipc.RPCError{Code: "conflict", Message: safeMessage(err, "state conflict")}
+	default:
+		return nil, &ipc.RPCError{Code: "internal", Message: "operation failed"}
+	}
+}
+
+func safeMessage(err error, fallback string) string {
+	if err == nil {
+		return fallback
+	}
+	message := strings.TrimSpace(err.Error())
+	if message == "" || len(message) > 500 || strings.ContainsAny(message, "\r\n") {
+		return fallback
+	}
+	return message
+}
