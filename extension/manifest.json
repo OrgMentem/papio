@@ -21,7 +21,9 @@
     "https://www.proquest.com/*",
     "https://research.ebsco.com/*"
   ],
+  "options_page": "dist/options.html",
   "action": {
-    "default_title": "Papio"
+    "default_title": "Papio",
+    "default_popup": "dist/popup.html"
   }
 }

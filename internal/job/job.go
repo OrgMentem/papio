@@ -63,9 +63,16 @@ var allowed = map[string]map[string]bool{
 		StateReady: true, StateFetching: true, StateResolving: true,
 		StateNeedsReview: true, StateFailed: true, StateCancelled: true,
 	},
-	StateAwaitingHuman: {StateResolving: true, StateFetching: true, StateCancelled: true, StateFailed: true},
-	StateRetryWait:     {StateResolving: true, StateFetching: true, StateCancelled: true, StateFailed: true},
-	StateNeedsReview:   {StateResolving: true, StateFetching: true, StateCancelled: true},
+	StateAwaitingHuman: {
+		StateResolving: true, StateFetching: true, StateCancelled: true, StateFailed: true,
+		// Phase 2 browser bridge resumes a parked handoff directly: the extension's
+		// terminal observations map to unavailable/needs_review/retry_wait, and an
+		// adopted download re-enters validation. The adopting caller holds a lease so
+		// the scheduler and RecoverStale cannot rewind the job mid-adoption.
+		StateValidating: true, StateUnavailable: true, StateNeedsReview: true, StateRetryWait: true,
+	},
+	StateRetryWait:   {StateResolving: true, StateFetching: true, StateCancelled: true, StateFailed: true},
+	StateNeedsReview: {StateResolving: true, StateFetching: true, StateCancelled: true},
 }
 
 // ErrConflict is returned when a CAS transition loses (state changed or the

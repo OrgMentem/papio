@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"papio/internal/bootstrap"
+	"papio/internal/browser"
 	"papio/internal/config"
 	"papio/internal/ipc"
 	"papio/internal/job"
@@ -75,6 +76,9 @@ func RouterWithShutdown(system *bootstrap.System, shutdown context.CancelFunc) i
 		},
 		"doctor.run": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return runDoctor(ctx, raw, system)
+		},
+		"browser.sync": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return browserSync(ctx, raw, system)
 		},
 	}
 	if shutdown != nil {
@@ -266,6 +270,27 @@ func runDoctor(ctx context.Context, raw json.RawMessage, system *bootstrap.Syste
 		return badParams(err)
 	}
 	return marshal(system.DoctorReport(ctx))
+}
+
+func browserSync(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
+	var params struct {
+		Messages []json.RawMessage `json:"messages,omitempty"`
+	}
+	if err := ipc.DecodeParams(raw, &params); err != nil {
+		return badParams(err)
+	}
+	outbound, err := system.Browser.Sync(ctx, params.Messages)
+	if err != nil {
+		if errors.Is(err, browser.ErrInvalidFrame) {
+			// A fail-closed protocol violation is a client error.
+			return nil, &ipc.RPCError{Code: "invalid_argument", Message: safeMessage(err, "invalid browser frame")}
+		}
+		return failure(err)
+	}
+	if outbound == nil {
+		outbound = []json.RawMessage{}
+	}
+	return marshal(map[string]any{"outbound": outbound})
 }
 
 func marshal(value any) ([]byte, *ipc.RPCError) {

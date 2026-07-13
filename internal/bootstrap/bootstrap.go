@@ -13,6 +13,7 @@ import (
 
 	"papio/internal/app"
 	"papio/internal/artifact"
+	"papio/internal/browser"
 	"papio/internal/budget"
 	"papio/internal/bundle"
 	"papio/internal/config"
@@ -43,6 +44,7 @@ type System struct {
 	App           *app.Service
 	Scheduler     *daemon.Scheduler
 	Bundle        *bundle.Exporter
+	Browser       *browser.Bridge
 	PDFCapability pdf.Capability
 	WorkerBinary  string
 }
@@ -129,6 +131,7 @@ func New(ctx context.Context, cfg config.Config) (*System, error) {
 		Config: cfg, Store: db, Jobs: jobs, Artifacts: artifacts, Budgets: budgets,
 		App: service, Scheduler: scheduler,
 		Bundle:        &bundle.Exporter{Jobs: jobs, Artifacts: artifacts},
+		Browser:       browser.NewBridge(jobs, service, cfg),
 		PDFCapability: capability, WorkerBinary: executable,
 	}
 	failed = false

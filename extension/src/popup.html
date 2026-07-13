@@ -1,0 +1,60 @@
+<!doctype html>
+<!-- Copyright 2026 OrgMentem. Licensed under MIT. See LICENSE. -->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Papio</title>
+    <style>
+      body {
+        font: 13px/1.5 system-ui, sans-serif;
+        margin: 0;
+        padding: 14px;
+        width: 300px;
+        color: #1a1a1a;
+      }
+      h1 {
+        font-size: 15px;
+        margin: 0 0 10px;
+      }
+      .empty {
+        color: #777;
+      }
+      ul {
+        list-style: none;
+        margin: 0;
+        padding: 0;
+      }
+      li {
+        padding: 10px 0;
+        border-top: 1px solid #e3e3e3;
+      }
+      .job-id {
+        font-family: ui-monospace, monospace;
+        font-size: 12px;
+        word-break: break-all;
+      }
+      .job-status {
+        color: #555;
+        font-size: 12px;
+        margin: 2px 0 8px;
+      }
+      button {
+        font: inherit;
+        padding: 5px 12px;
+        border-radius: 6px;
+        border: 1px solid #bbb;
+        background: #fff;
+        cursor: pointer;
+      }
+      button:hover {
+        background: #f5f5f5;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Active handoffs</h1>
+    <div id="empty" class="empty" hidden>No active jobs.</div>
+    <ul id="jobs"></ul>
+    <script src="./popup.js" type="module"></script>
+  </body>
+</html>

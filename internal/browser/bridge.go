@@ -1,0 +1,391 @@
+// Copyright 2026 OrgMentem. Licensed under MIT. See LICENSE.
+// Package browser implements the daemon side of the Phase 2 ordinary-Chrome
+// institutional handoff. The bridge speaks the papio-browser/0.1 protocol as a
+// pull loop over daemon-owned local IPC: the extension delivers observation
+// frames and the bridge returns command frames. Browser messages are strictly
+// re-validated here (fail closed) and treated as observations only — they never
+// authorize a job transition the core policy would forbid. PDF bytes and secrets
+// never cross this boundary; only metadata, timing, and local paths do.
+package browser
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	"papio/internal/app"
+	"papio/internal/config"
+	"papio/internal/job"
+	"papio/internal/protocol"
+	"papio/internal/store"
+)
+
+const handoffActionKind = "openurl_handoff"
+
+// ErrInvalidFrame marks a client-side protocol violation (a frame that fails
+// strict decode, arrives before hello, or is not a legal inbound type). The RPC
+// layer maps it to invalid_argument; other Sync errors are internal.
+var ErrInvalidFrame = errors.New("invalid browser frame")
+
+// Bridge is the per-daemon-run browser session. hello is tracked in memory: a
+// fresh hello resets the offered/cancelled bookkeeping, which is exactly the
+// recovery an MV3 service-worker restart needs (the extension reconnects, says
+// hello again, and re-receives outstanding offers).
+type Bridge struct {
+	jobs *job.Store
+	svc  *app.Service
+	cfg  config.Config
+
+	mu         sync.Mutex
+	seq        int64
+	helloSeen  bool
+	offered    map[string]bool // handoff jobs offered this hello-session
+	cancelSent map[string]bool // jobs a daemon-side cancel was already announced for
+	now        func() time.Time
+}
+
+// NewBridge constructs the bridge. It is cheap and always constructed; whether
+// any job is ever offered depends on config (extension_id / openurl base).
+func NewBridge(jobs *job.Store, svc *app.Service, cfg config.Config) *Bridge {
+	return &Bridge{
+		jobs: jobs, svc: svc, cfg: cfg,
+		offered: map[string]bool{}, cancelSent: map[string]bool{},
+		now: time.Now,
+	}
+}
+
+// Sync processes a batch of inbound frames (possibly empty for a poll) and
+// returns the outbound command frames. Every inbound frame is re-validated with
+// protocol.DecodeBrowserMessage; an invalid frame fails the whole call closed.
+// Every outbound frame is self-validated by the same decoder before it leaves.
+func (b *Bridge) Sync(ctx context.Context, frames []json.RawMessage) ([]json.RawMessage, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	var out []json.RawMessage
+	for _, raw := range frames {
+		msg, err := protocol.DecodeBrowserMessage(raw)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %w", ErrInvalidFrame, err)
+		}
+		replies, err := b.handle(ctx, msg)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, replies...)
+	}
+	if b.helloSeen {
+		polled, err := b.poll(ctx)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, polled...)
+	}
+	return out, nil
+}
+
+// handle dispatches one decoded inbound frame.
+func (b *Bridge) handle(ctx context.Context, msg *protocol.BrowserMessage) ([]json.RawMessage, error) {
+	if msg.Type == protocol.MsgHello {
+		b.helloSeen = true
+		b.offered = map[string]bool{}
+		b.cancelSent = map[string]bool{}
+		ack, err := b.frame(protocol.MsgHelloAck, "", protocol.EmptyPayload{})
+		if err != nil {
+			return nil, err
+		}
+		return []json.RawMessage{ack}, nil
+	}
+	if !b.helloSeen {
+		// Frames before hello are a protocol error: the connection is bad.
+		return nil, fmt.Errorf("%w: frame %q received before hello", ErrInvalidFrame, msg.Type)
+	}
+
+	switch msg.Type {
+	case protocol.MsgJobAccept:
+		return nil, b.jobs.S.AppendEvent(ctx, msg.JobID, "browser.job_accept", nil)
+
+	case protocol.MsgJobReject:
+		if err := b.jobs.S.AppendEvent(ctx, msg.JobID, "browser.job_reject", nil); err != nil {
+			return nil, err
+		}
+		if err := b.resolveHandoff(ctx, msg.JobID, "cancelled"); err != nil {
+			return nil, err
+		}
+		return nil, b.leaveHandoff(ctx, msg.JobID, job.StateUnavailable, "browser_rejected")
+
+	case protocol.MsgAuthPending, protocol.MsgAuthReturned:
+		return nil, b.recordAuth(ctx, msg)
+
+	case protocol.MsgDownloadStarted:
+		return nil, b.jobs.S.AppendEvent(ctx, msg.JobID, "browser.download_started", nil)
+
+	case protocol.MsgDownloadComplete:
+		p := msg.Payload.(*protocol.DownloadCompletePayload)
+		if err := b.adopt(ctx, msg.JobID, p.Filename); err != nil {
+			return nil, err
+		}
+		ack, err := b.frame(protocol.MsgAck, msg.JobID, protocol.EmptyPayload{})
+		if err != nil {
+			return nil, err
+		}
+		return []json.RawMessage{ack}, nil
+
+	case protocol.MsgProviderOutcome:
+		return nil, b.outcome(ctx, msg.JobID, msg.Payload.(*protocol.ProviderOutcomePayload))
+
+	case protocol.MsgCancel:
+		// Extension -> daemon: the user closed the broker-owned tab. Treat as a
+		// cancelled outcome.
+		if err := b.resolveHandoff(ctx, msg.JobID, "cancelled"); err != nil {
+			return nil, err
+		}
+		b.cancelSent[msg.JobID] = true // we initiated nothing to echo back
+		return nil, b.jobs.Cancel(ctx, msg.JobID, "browser_cancelled")
+
+	case protocol.MsgError:
+		// Only the normalized code is durable; the free-text message is
+		// extension-supplied and never persisted.
+		return nil, b.jobs.S.AppendEvent(ctx, msg.JobID, "browser.error",
+			map[string]any{"code": msg.Payload.(*protocol.ErrorPayload).Code})
+
+	default:
+		return nil, fmt.Errorf("%w: unexpected inbound frame type %q", ErrInvalidFrame, msg.Type)
+	}
+}
+
+// recordAuth appends a timing-only auth event. The AuthPayload structurally
+// cannot carry a URL, host, title, query, or fragment, so an identity-provider
+// address cannot enter the event stream through this path.
+func (b *Bridge) recordAuth(ctx context.Context, msg *protocol.BrowserMessage) error {
+	kind := "browser.auth_pending"
+	if msg.Type == protocol.MsgAuthReturned {
+		kind = "browser.auth_returned"
+	}
+	detail := map[string]any{}
+	if p := msg.Payload.(*protocol.AuthPayload); p.ElapsedMS != nil {
+		detail["elapsed_ms"] = *p.ElapsedMS
+	}
+	return b.jobs.S.AppendEvent(ctx, msg.JobID, kind, detail)
+}
+
+// outcome maps a terminal provider observation onto a policy-legal transition.
+func (b *Bridge) outcome(ctx context.Context, jobID string, p *protocol.ProviderOutcomePayload) error {
+	switch p.Outcome {
+	case "cancelled":
+		if err := b.resolveHandoff(ctx, jobID, "cancelled"); err != nil {
+			return err
+		}
+		b.cancelSent[jobID] = true
+		return b.jobs.Cancel(ctx, jobID, "browser_cancelled")
+
+	case "no_entitlement", "document_delivery_available":
+		if err := b.resolveHandoff(ctx, jobID, "resolved"); err != nil {
+			return err
+		}
+		return b.leaveHandoff(ctx, jobID, job.StateUnavailable, p.Outcome)
+
+	case "wrong_work", "ui_changed":
+		if err := b.resolveHandoff(ctx, jobID, "resolved"); err != nil {
+			return err
+		}
+		return b.leaveHandoff(ctx, jobID, job.StateNeedsReview, p.Outcome)
+
+	case "rate_limited":
+		if err := b.resolveHandoff(ctx, jobID, "resolved"); err != nil {
+			return err
+		}
+		return b.leaveHandoff(ctx, jobID, job.StateRetryWait, p.Outcome)
+
+	case "human_auth_required", "terms_acceptance_required":
+		// Still legitimately in progress: keep the job parked and add the
+		// specific human action the extension observed.
+		_, err := b.jobs.OpenHumanAction(ctx, jobID, p.Outcome,
+			"the provider requires a human step before the download can proceed")
+		return err
+
+	default:
+		return fmt.Errorf("unknown provider outcome %q", p.Outcome)
+	}
+}
+
+// leaveHandoff transitions a parked handoff job out of awaiting_human. It is
+// idempotent: if the job already left awaiting_human, it does nothing.
+func (b *Bridge) leaveHandoff(ctx context.Context, jobID, to, reason string) error {
+	row, err := b.jobs.Get(ctx, jobID)
+	if err != nil {
+		return err
+	}
+	if row.State != job.StateAwaitingHuman {
+		return nil
+	}
+	detail := map[string]any{"reason": reason}
+	var opts []job.TransitionOpt
+	switch to {
+	case job.StateUnavailable:
+		opts = append(opts, job.WithTerminalReason(reason))
+	case job.StateRetryWait:
+		opts = append(opts, job.WithRetryAt(b.now().Add(b.actionExpiry())))
+	}
+	return b.jobs.Transition(ctx, jobID, job.StateAwaitingHuman, to, detail, opts...)
+}
+
+// adopt resolves the reported download strictly under the job's adoption
+// directory and hands it to the app for validation. The filename has already
+// passed protocol validation (no path separators); this adds IsLocal and a
+// symlink-resolved prefix guard before app-side confinement.
+func (b *Bridge) adopt(ctx context.Context, jobID, filename string) error {
+	if !filepath.IsLocal(filename) {
+		return fmt.Errorf("adoption filename %q is not a local name", filename)
+	}
+	root := filepath.Join(b.cfg.EffectiveAdoptionRoot(), jobID)
+	realRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return fmt.Errorf("adoption root unavailable: %w", err)
+	}
+	full := filepath.Join(realRoot, filename)
+	rel, err := filepath.Rel(realRoot, full)
+	if err != nil || rel != filename || strings.Contains(rel, "..") {
+		return fmt.Errorf("adoption path escapes %s", realRoot)
+	}
+	return b.svc.AdoptDownload(ctx, jobID, full)
+}
+
+// poll offers outstanding handoff jobs (once per hello-session) and announces a
+// daemon-side cancel for any offered job the user has since cancelled.
+func (b *Bridge) poll(ctx context.Context) ([]json.RawMessage, error) {
+	awaiting, err := b.jobs.List(ctx, job.StateAwaitingHuman, 200)
+	if err != nil {
+		return nil, err
+	}
+	actions, err := b.jobs.ListHumanActions(ctx, true)
+	if err != nil {
+		return nil, err
+	}
+	handoff := map[string]bool{}
+	for _, a := range actions {
+		if a.Kind == handoffActionKind {
+			handoff[a.JobID] = true
+		}
+	}
+	present := map[string]bool{}
+	var out []json.RawMessage
+	for i := range awaiting {
+		row := awaiting[i]
+		present[row.ID] = true
+		if !handoff[row.ID] || b.offered[row.ID] {
+			continue
+		}
+		offer, err := b.offer(row)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, offer)
+		b.offered[row.ID] = true
+	}
+	// Announce a cancel for any offered job that left awaiting_human because it
+	// was cancelled daemon-side (e.g. `papio jobs cancel`).
+	for id := range b.offered {
+		if present[id] || b.cancelSent[id] {
+			continue
+		}
+		row, err := b.jobs.Get(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		if row.State != job.StateCancelled {
+			continue
+		}
+		frame, err := b.frame(protocol.MsgCancel, id, protocol.EmptyPayload{})
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, frame)
+		b.cancelSent[id] = true
+	}
+	return out, nil
+}
+
+// offer builds a job_offer for one parked handoff job.
+func (b *Bridge) offer(row job.Row) (json.RawMessage, error) {
+	hosts := []string{}
+	if h := resolverHost(b.cfg.Browser.OpenURLBase); h != "" {
+		hosts = append(hosts, h)
+	}
+	expected := &protocol.JobOfferExpected{DOI: row.Work.DOI, Title: truncate(row.Work.Title, 500)}
+	if expected.DOI == "" && expected.Title == "" {
+		expected = nil
+	}
+	payload := protocol.JobOfferPayload{
+		OpenURL:       OpenURL(b.cfg.Browser.OpenURLBase, row.Work),
+		ProviderHosts: hosts,
+		Expected:      expected,
+		AccessMode:    b.cfg.AccessMode,
+		ExpiresAt:     b.now().Add(b.actionExpiry()).UTC().Format(time.RFC3339),
+	}
+	return b.frame(protocol.MsgJobOffer, row.ID, payload)
+}
+
+// resolveHandoff closes the open openurl_handoff action for a job with the given
+// terminal status ("resolved" or "cancelled").
+func (b *Bridge) resolveHandoff(ctx context.Context, jobID, status string) error {
+	_, err := b.jobs.S.DB().ExecContext(ctx,
+		`UPDATE human_actions SET status = ?, resolved_at = ?
+		 WHERE job_id = ? AND kind = ? AND status = 'open'`,
+		status, store.Now(), jobID, handoffActionKind)
+	return err
+}
+
+// frame encodes one outbound envelope with a fresh msg_id and a monotonic seq,
+// then self-validates it through the strict decoder so a malformed command can
+// never leave the daemon.
+func (b *Bridge) frame(msgType, jobID string, payload any) (json.RawMessage, error) {
+	b.seq++
+	env := map[string]any{
+		"protocol": protocol.BrowserProtocolVersion,
+		"type":     msgType,
+		"msg_id":   newMsgID(),
+		"seq":      b.seq,
+		"payload":  payload,
+	}
+	if jobID != "" {
+		env["job_id"] = jobID
+	}
+	raw, err := json.Marshal(env)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := protocol.DecodeBrowserMessage(raw); err != nil {
+		return nil, fmt.Errorf("outbound %s failed self-validation: %w", msgType, err)
+	}
+	return raw, nil
+}
+
+func (b *Bridge) actionExpiry() time.Duration {
+	secs := b.cfg.Browser.ActionExpirySeconds
+	if secs <= 0 {
+		secs = 1800
+	}
+	return time.Duration(secs) * time.Second
+}
+
+// newMsgID returns a random identifier matching ^[A-Za-z0-9_-]{8,64}$.
+func newMsgID() string {
+	var buf [16]byte
+	_, _ = rand.Read(buf[:])
+	return base64.RawURLEncoding.EncodeToString(buf[:])
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n]
+}

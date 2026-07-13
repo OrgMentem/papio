@@ -362,3 +362,30 @@ func TestCancelIsIdempotentAndNeverOverwritesTerminalResult(t *testing.T) {
 		t.Fatalf("cancel overwrote ready terminal state: %s", ready.State)
 	}
 }
+
+func TestAwaitingHumanResumeEdgesForBrowserBridge(t *testing.T) {
+	// The Phase 2 bridge parks handoffs in awaiting_human and then resumes them
+	// directly: to validating (adopting a download, under a held lease) or to a
+	// terminal/review/retry state driven by the extension's provider outcome.
+	for _, to := range []string{StateValidating, StateUnavailable, StateNeedsReview, StateRetryWait} {
+		if !allowed[StateAwaitingHuman][to] {
+			t.Fatalf("awaiting_human->%s must be an allowed resume edge", to)
+		}
+	}
+	js := testStore(t)
+	ctx := context.Background()
+	id, _ := js.CreateRequest(ctx, "wr_awaiting_edges", testWork(), "", "", testPolicy(), nil)
+	if err := js.Transition(ctx, id, StateQueued, StateResolving, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := js.Transition(ctx, id, StateResolving, StateAwaitingHuman, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := js.Transition(ctx, id, StateAwaitingHuman, StateUnavailable, nil, WithTerminalReason("browser_rejected")); err != nil {
+		t.Fatalf("awaiting_human->unavailable: %v", err)
+	}
+	row, _ := js.Get(ctx, id)
+	if row.State != StateUnavailable || row.TerminalReason != "browser_rejected" {
+		t.Fatalf("row = %+v", row)
+	}
+}

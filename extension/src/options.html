@@ -1,0 +1,80 @@
+<!doctype html>
+<!-- Copyright 2026 OrgMentem. Licensed under MIT. See LICENSE. -->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Papio — provider access</title>
+    <style>
+      body {
+        font: 14px/1.5 system-ui, sans-serif;
+        margin: 0;
+        padding: 20px;
+        max-width: 560px;
+        color: #1a1a1a;
+      }
+      h1 {
+        font-size: 18px;
+        margin: 0 0 4px;
+      }
+      p.lede {
+        color: #555;
+        margin: 0 0 20px;
+      }
+      ul {
+        list-style: none;
+        margin: 0;
+        padding: 0;
+      }
+      li {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 12px 0;
+        border-top: 1px solid #e3e3e3;
+      }
+      .source-label {
+        font-weight: 600;
+      }
+      .source-host {
+        color: #777;
+        font-size: 12px;
+      }
+      .status {
+        font-size: 12px;
+        padding: 2px 8px;
+        border-radius: 999px;
+      }
+      .status.granted {
+        background: #e4f5e9;
+        color: #1a7f3c;
+      }
+      .status.revoked {
+        background: #f1f1f1;
+        color: #777;
+      }
+      button {
+        font: inherit;
+        padding: 6px 14px;
+        border-radius: 6px;
+        border: 1px solid #bbb;
+        background: #fff;
+        cursor: pointer;
+      }
+      button:hover {
+        background: #f5f5f5;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Papio provider access</h1>
+    <p class="lede">
+      Grant access per source. Access is only used to complete one explicitly requested download after
+      you have signed in yourself. Login, MFA, and CAPTCHAs always stay with you. Revoking returns the
+      source to assisted behaviour immediately.
+    </p>
+    <ul id="sources"></ul>
+    <script src="./options.js" type="module"></script>
+  </body>
+</html>

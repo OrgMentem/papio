@@ -51,6 +51,7 @@ func NewRoot(out, errOut io.Writer) *cobra.Command {
 		newBundleCommand(opt),
 		newDoctorCommand(opt),
 		newDaemonCommand(opt),
+		newNativeHostCommand(opt),
 		newVersionCommand(opt),
 	)
 	return root

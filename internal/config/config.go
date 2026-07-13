@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -57,6 +58,24 @@ type PDF struct {
 	TitleMatchThreshold float64 `toml:"title_match_threshold"`
 }
 
+// Browser configures the Phase 2 ordinary-Chrome institutional handoff.
+// Zero values disable the browser path entirely: no extension ID means the
+// native host rejects every origin, and no OpenURL base means jobs never
+// route to institutional access.
+type Browser struct {
+	// ExtensionID is the fixed Chrome extension ID allowed to talk to the
+	// native host (32 chars, a-p). Empty disables the bridge.
+	ExtensionID string `toml:"extension_id,omitempty"`
+	// OpenURLBase is the institution's OpenURL resolver base (https).
+	OpenURLBase string `toml:"openurl_base_url,omitempty"`
+	// AdoptionRoot is the directory Chrome downloads into for adoption;
+	// the daemon rejects reported paths outside <root>/<job_id>/.
+	// Default: <data_dir>/adoptions.
+	AdoptionRoot string `toml:"download_adoption_root,omitempty"`
+	// ActionExpirySeconds bounds how long one browser handoff stays open.
+	ActionExpirySeconds int `toml:"action_expiry_seconds,omitempty"`
+}
+
 // Config is the loaded, validated configuration.
 type Config struct {
 	AccessMode string            `toml:"access_mode"`
@@ -64,6 +83,7 @@ type Config struct {
 	DataDir    string            `toml:"data_dir"`
 	Fetch      Fetch             `toml:"fetch"`
 	PDF        PDF               `toml:"pdf"`
+	Browser    Browser           `toml:"browser"`
 	Sources    map[string]Source `toml:"sources"`
 
 	// Path this config was loaded from ("" for defaults).
@@ -90,6 +110,7 @@ func Default() Config {
 		DataDir: filepath.Join(home, ".local", "share", "papio"),
 		Fetch:   Fetch{MaxBytes: 100 << 20, TimeoutSeconds: 120},
 		PDF:     PDF{OCREnabled: true, MinTextChars: 400, MaxOCRPages: 4, TitleMatchThreshold: 0.6},
+		Browser: Browser{ActionExpirySeconds: 1800},
 		Sources: map[string]Source{
 			SourceArXiv:           {Enabled: true, RatePerSec: 1, Burst: 1},
 			SourceEuropePMC:       {Enabled: true, RatePerSec: 2, Burst: 2},
@@ -133,6 +154,7 @@ func Load(path string) (Config, error) {
 		return cfg, fmt.Errorf("config %s: %w", path, err)
 	}
 	cfg.DataDir = expandHome(cfg.DataDir)
+	cfg.Browser.AdoptionRoot = expandHome(cfg.Browser.AdoptionRoot)
 	return cfg, nil
 }
 
@@ -160,12 +182,32 @@ func (c *Config) validate() error {
 	if c.PDF.TitleMatchThreshold <= 0 || c.PDF.TitleMatchThreshold > 1 {
 		return fmt.Errorf("pdf.title_match_threshold must be in (0,1]")
 	}
+	if c.Browser.ExtensionID != "" && !extensionIDRE.MatchString(c.Browser.ExtensionID) {
+		return fmt.Errorf("browser.extension_id must be 32 chars a-p")
+	}
+	if c.Browser.OpenURLBase != "" && !strings.HasPrefix(c.Browser.OpenURLBase, "https://") {
+		return fmt.Errorf("browser.openurl_base_url must be https")
+	}
+	if c.Browser.ActionExpirySeconds < 0 {
+		return fmt.Errorf("browser.action_expiry_seconds must be >= 0")
+	}
 	for name, s := range c.Sources {
 		if s.BaseURLForDev != "" && !strings.HasPrefix(s.BaseURLForDev, "http://127.0.0.1") && !strings.HasPrefix(s.BaseURLForDev, "http://localhost") {
 			return fmt.Errorf("sources.%s.base_url_for_dev must be loopback", name)
 		}
 	}
 	return nil
+}
+
+// extensionIDRE matches Chrome's a-p base16 extension ID alphabet.
+var extensionIDRE = regexp.MustCompile(`^[a-p]{32}$`)
+
+// EffectiveAdoptionRoot returns the configured adoption root or its default.
+func (c *Config) EffectiveAdoptionRoot() string {
+	if c.Browser.AdoptionRoot != "" {
+		return c.Browser.AdoptionRoot
+	}
+	return filepath.Join(c.DataDir, "adoptions")
 }
 
 // RequireAccessMode returns the mode or ErrAccessModeUnset.

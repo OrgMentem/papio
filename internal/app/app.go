@@ -406,6 +406,34 @@ func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[st
 		return s.Jobs.Transition(ctx, row.ID, job.StateFetching, job.StateRetryWait,
 			map[string]any{"reason": "candidate_temporarily_unavailable"}, job.WithRetryAt(retryAt))
 	}
+	return s.exhaustedCandidates(ctx, row)
+}
+
+// exhaustedCandidates handles the terminal "candidates_exhausted" boundary when
+// no legitimate direct candidate produced an artifact. With an OpenURL base
+// configured, assisted/maximal jobs route to the visible institutional handoff
+// (parked in awaiting_human with an open openurl_handoff action) instead of
+// failing; conservative mode records that the institutional option exists but
+// deliberately does not open it, then ends the job unavailable as before. The
+// handoff detail is a static, redacted note: no signed query ever appears here.
+func (s *Service) exhaustedCandidates(ctx context.Context, row *job.Row) error {
+	mode := s.Config.AccessMode
+	if s.Config.Browser.OpenURLBase != "" {
+		switch mode {
+		case config.ModeAssisted, config.ModeMaximal:
+			if _, err := s.Jobs.OpenHumanAction(ctx, row.ID, "openurl_handoff",
+				"open-access candidates exhausted; institutional OpenURL handoff available in your browser"); err != nil {
+				return err
+			}
+			return s.Jobs.Transition(ctx, row.ID, job.StateFetching, job.StateAwaitingHuman,
+				map[string]any{"reason": "institutional_handoff"})
+		case config.ModeConservative:
+			if _, err := s.Jobs.OpenHumanAction(ctx, row.ID, "openurl_available",
+				"open-access candidates exhausted; institutional OpenURL available but not opened in conservative mode"); err != nil {
+				return err
+			}
+		}
+	}
 	return s.Jobs.Transition(ctx, row.ID, job.StateFetching, job.StateUnavailable,
 		map[string]any{"reason": "candidates_exhausted"}, job.WithTerminalReason("all candidates exhausted"))
 }

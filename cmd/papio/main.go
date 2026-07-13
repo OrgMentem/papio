@@ -11,16 +11,21 @@ import (
 	"syscall"
 
 	"papio/internal/cli"
+	"papio/internal/nativehost"
 	"papio/internal/pdf"
-	"papio/internal/protocol"
 )
 
 func main() {
 	if filepath.Base(os.Args[0]) == "papio-native-host" {
-		// Chrome invokes the native host with the extension origin as the first
-		// argument. The bridge lands in Phase 2; stdout remains frame-only.
-		fmt.Fprintln(os.Stderr, "papio-native-host: bridge not implemented yet (Phase 2); protocol "+protocol.BrowserProtocolVersion)
-		os.Exit(1)
+		// Chrome invokes the native host with the extension origin as an
+		// untrusted argument. Stdout is frame-only; diagnostics go to stderr.
+		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer cancel()
+		if err := nativehost.Run(ctx, os.Args[1:], os.Stdin, os.Stdout, os.Stderr); err != nil {
+			fmt.Fprintln(os.Stderr, "papio-native-host:", err)
+			os.Exit(1)
+		}
+		return
 	}
 	if len(os.Args) == 2 && os.Args[1] == pdf.WorkerArgument {
 		if err := pdf.WorkerMain(os.Stdin, os.Stdout); err != nil {

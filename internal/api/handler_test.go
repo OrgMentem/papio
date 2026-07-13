@@ -140,3 +140,38 @@ func TestRouterShutdownRespondsThenCancels(t *testing.T) {
 		t.Fatal("shutdown callback was not invoked")
 	}
 }
+
+func TestRouterBrowserSyncHandshakeAndInvalidFrame(t *testing.T) {
+	system := testSystem(t)
+	router := Router(system)
+
+	hello := json.RawMessage(`{"protocol":"papio-browser/0.1","type":"hello","msg_id":"client-hello-1","seq":0,"payload":{"extension_version":"1.0.0"}}`)
+	var result struct {
+		Outbound []json.RawMessage `json:"outbound"`
+	}
+	if rpcErr := callMethod(t, router, "browser.sync", map[string]any{"messages": []json.RawMessage{hello}}, &result); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	if len(result.Outbound) != 1 {
+		t.Fatalf("outbound = %d frames, want 1 (hello_ack)", len(result.Outbound))
+	}
+	msg, err := protocol.DecodeBrowserMessage(result.Outbound[0])
+	if err != nil || msg.Type != protocol.MsgHelloAck {
+		t.Fatalf("outbound[0] = %+v, %v", msg, err)
+	}
+
+	// An empty poll is valid and returns no frames.
+	var empty struct {
+		Outbound []json.RawMessage `json:"outbound"`
+	}
+	if rpcErr := callMethod(t, router, "browser.sync", map[string]any{}, &empty); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+
+	// A structurally invalid frame fails closed as invalid_argument.
+	bad := json.RawMessage(`{"protocol":"papio-browser/0.1","type":"hello","msg_id":"x","seq":0,"payload":{"extension_version":"1.0.0"}}`)
+	rpcErr := callMethod(t, router, "browser.sync", map[string]any{"messages": []json.RawMessage{bad}}, nil)
+	if rpcErr == nil || rpcErr.Code != "invalid_argument" {
+		t.Fatalf("invalid frame error = %+v, want invalid_argument", rpcErr)
+	}
+}
