@@ -1,0 +1,45 @@
+{
+  "schema_version": "acquisition-bundle/0.1",
+  "job_id": "job_0002_tyler",
+  "request_id": "wr_tyler_1989_pj",
+  "identity": {
+    "doi": "10.1037/0022-3514.57.5.830",
+    "title": "The Psychology of Procedural Justice: A Test of the Group-Value Model",
+    "authors": [
+      "Tyler, Tom R."
+    ],
+    "year": 1989,
+    "evidence": [
+      "doi found in page-1 text",
+      "title match 0.98 against Crossref"
+    ]
+  },
+  "candidate": {
+    "source": "openurl:proquest",
+    "version": "published",
+    "access_basis": "institutional",
+    "reuse_license": "unknown",
+    "landing_url": "https://www.proquest.com/docview/example",
+    "source_record_id": "docview-example"
+  },
+  "retrieved_at": "2026-07-13T10:05:00Z",
+  "adapter_version": "proquest/0.1.0",
+  "artifact": {
+    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "size_bytes": 1593007,
+    "mime": "application/pdf",
+    "page_count": 19,
+    "text_chars": 42310,
+    "ocr_used": false,
+    "path": "artifacts/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.pdf"
+  },
+  "validation": {
+    "structural": "pass",
+    "identity": "pass",
+    "notes": [
+      "pdfinfo page count matches pdfcpu"
+    ]
+  },
+  "provenance_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "zotio_item_key": "D5QEF3AD"
+}

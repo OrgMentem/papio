@@ -1,0 +1,12 @@
+{
+  "protocol": "papio-browser/0.1",
+  "type": "provider_outcome",
+  "msg_id": "m_out_00001",
+  "job_id": "job_0003_leventhal",
+  "seq": 5,
+  "payload": {
+    "outcome": "no_entitlement",
+    "adapter_version": "springer/0.1.0",
+    "detail": "record shows chapter-level access only via document delivery"
+  }
+}

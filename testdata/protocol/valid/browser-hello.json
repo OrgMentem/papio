@@ -1,0 +1,13 @@
+{
+  "protocol": "papio-browser/0.1",
+  "type": "hello",
+  "msg_id": "m_hello_001",
+  "seq": 0,
+  "payload": {
+    "extension_version": "0.1.0",
+    "adapter_versions": {
+      "jstor": "0.1.0",
+      "proquest": "0.1.0"
+    }
+  }
+}

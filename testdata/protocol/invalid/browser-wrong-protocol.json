@@ -1,0 +1,7 @@
+{
+  "protocol": "papio-browser/9.9",
+  "type": "ack",
+  "msg_id": "m_ack_wrong",
+  "seq": 0,
+  "payload": {}
+}

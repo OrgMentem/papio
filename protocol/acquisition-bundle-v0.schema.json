@@ -1,0 +1,96 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://papio.dev/protocol/acquisition-bundle-v0.schema.json",
+  "title": "papio AcquisitionBundle (draft 0.x)",
+  "description": "bundle.json for one ready job: a validated, provenance-tracked artifact plus the evidence zotio needs. DRAFT: schema_version acquisition-bundle/0.1 until the Phase 4 v1 lock. Never contains API keys, cookies, signed query values, or identity-provider URLs; unknown fields are rejected (fail closed).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "job_id",
+    "request_id",
+    "identity",
+    "candidate",
+    "retrieved_at",
+    "artifact",
+    "validation",
+    "provenance_digest"
+  ],
+  "properties": {
+    "schema_version": { "const": "acquisition-bundle/0.1" },
+    "job_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,128}$" },
+    "request_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,128}$" },
+    "identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["title", "authors"],
+      "properties": {
+        "doi": { "type": "string", "pattern": "^10\\.[0-9]{4,9}/\\S{1,200}$" },
+        "title": { "type": "string", "minLength": 3, "maxLength": 500 },
+        "authors": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 100,
+          "items": { "type": "string", "minLength": 1, "maxLength": 200 }
+        },
+        "year": { "type": "integer", "minimum": 1000, "maximum": 2100 },
+        "evidence": {
+          "type": "array",
+          "maxItems": 20,
+          "items": { "type": "string", "maxLength": 300 },
+          "description": "Human-readable identity evidence, e.g. 'doi 10.x found on page 1 text'."
+        }
+      }
+    },
+    "candidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "version", "access_basis", "reuse_license"],
+      "properties": {
+        "source": { "type": "string", "minLength": 1, "maxLength": 100 },
+        "version": { "enum": ["published", "accepted", "preprint", "unknown"] },
+        "access_basis": { "enum": ["open_access", "licensed_api", "institutional", "manual"] },
+        "reuse_license": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100,
+          "description": "SPDX-ish license or 'unknown'. Distinct from access_basis: downloadable never implies redistributable."
+        },
+        "landing_url": { "type": "string", "format": "uri", "maxLength": 2000 },
+        "source_record_id": { "type": "string", "maxLength": 200 }
+      }
+    },
+    "retrieved_at": { "type": "string", "format": "date-time" },
+    "adapter_version": { "type": "string", "maxLength": 100 },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sha256", "size_bytes", "mime", "page_count", "ocr_used", "path"],
+      "properties": {
+        "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "size_bytes": { "type": "integer", "minimum": 1 },
+        "mime": { "type": "string", "maxLength": 100 },
+        "page_count": { "type": "integer", "minimum": 1 },
+        "text_chars": { "type": "integer", "minimum": 0 },
+        "ocr_used": { "type": "boolean" },
+        "path": {
+          "type": "string",
+          "pattern": "^artifacts/[a-f0-9]{64}\\.pdf$",
+          "description": "Bundle-relative, content-addressed, immutable."
+        }
+      }
+    },
+    "validation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["structural", "identity"],
+      "properties": {
+        "structural": { "const": "pass" },
+        "identity": { "enum": ["pass", "user_confirmed"] },
+        "notes": { "type": "array", "maxItems": 20, "items": { "type": "string", "maxLength": 300 } }
+      }
+    },
+    "provenance_digest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+    "zotio_item_key": { "type": "string", "pattern": "^[A-Za-z0-9]{1,32}$" }
+  }
+}

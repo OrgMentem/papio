@@ -1,0 +1,11 @@
+{
+  "protocol": "papio-browser/0.1",
+  "type": "download_complete",
+  "msg_id": "m_dlc_nojob",
+  "seq": 9,
+  "payload": {
+    "download_id": 41,
+    "filename": "paper.pdf",
+    "size_bytes": 100
+  }
+}

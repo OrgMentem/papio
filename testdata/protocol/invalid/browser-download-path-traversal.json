@@ -1,0 +1,12 @@
+{
+  "protocol": "papio-browser/0.1",
+  "type": "download_complete",
+  "msg_id": "m_dlc_00bad",
+  "job_id": "job_0002_tyler",
+  "seq": 9,
+  "payload": {
+    "download_id": 41,
+    "filename": "../../etc/passwd",
+    "size_bytes": 100
+  }
+}

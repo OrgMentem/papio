@@ -1,0 +1,31 @@
+{
+  "schema_version": "acquisition-bundle/0.1",
+  "job_id": "job_bad_sha_1",
+  "request_id": "wr_bad_sha_01",
+  "identity": {
+    "title": "A Paper",
+    "authors": [
+      "Author, A."
+    ]
+  },
+  "candidate": {
+    "source": "unpaywall",
+    "version": "published",
+    "access_basis": "open_access",
+    "reuse_license": "unknown"
+  },
+  "retrieved_at": "2026-07-13T10:00:00Z",
+  "artifact": {
+    "sha256": "ZZZZ",
+    "size_bytes": 10,
+    "mime": "application/pdf",
+    "page_count": 1,
+    "ocr_used": false,
+    "path": "artifacts/ZZZZ.pdf"
+  },
+  "validation": {
+    "structural": "pass",
+    "identity": "pass"
+  },
+  "provenance_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+}

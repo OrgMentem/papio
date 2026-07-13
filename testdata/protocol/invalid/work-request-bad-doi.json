@@ -1,0 +1,7 @@
+{
+  "schema_version": "work-request/0.1",
+  "request_id": "wr_bad_doi_001",
+  "identifiers": {
+    "doi": "not-a-doi"
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "protocol": "papio-browser/0.1",
+  "type": "click_anything",
+  "msg_id": "m_bad_00001",
+  "seq": 1,
+  "payload": {}
+}

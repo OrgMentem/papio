@@ -1,0 +1,19 @@
+{
+  "protocol": "papio-browser/0.1",
+  "type": "job_offer",
+  "msg_id": "m_offer_001",
+  "job_id": "job_0002_tyler",
+  "seq": 3,
+  "payload": {
+    "openurl": "https://example.primo.exlibrisgroup.com/discovery/openurl?institution=61EXL_INST&vid=61EXL_INST:61EXL&rft_id=info:doi/10.1037%2F0022-3514.57.5.830",
+    "provider_hosts": [
+      "www.proquest.com"
+    ],
+    "expected": {
+      "doi": "10.1037/0022-3514.57.5.830",
+      "title": "The Psychology of Procedural Justice"
+    },
+    "access_mode": "maximal",
+    "expires_at": "2026-07-13T11:00:00Z"
+  }
+}

@@ -1,0 +1,32 @@
+{
+  "schema_version": "acquisition-bundle/0.1",
+  "job_id": "job_0001_lee_see",
+  "request_id": "wr_lee-see-2004",
+  "identity": {
+    "title": "Trust in Automation: Designing for Appropriate Reliance",
+    "authors": [
+      "Lee, John D.",
+      "See, Katrina A."
+    ]
+  },
+  "candidate": {
+    "source": "unpaywall",
+    "version": "published",
+    "access_basis": "open_access",
+    "reuse_license": "unknown"
+  },
+  "retrieved_at": "2026-07-13T10:00:00Z",
+  "artifact": {
+    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "size_bytes": 123456,
+    "mime": "application/pdf",
+    "page_count": 31,
+    "ocr_used": false,
+    "path": "artifacts/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.pdf"
+  },
+  "validation": {
+    "structural": "pass",
+    "identity": "pass"
+  },
+  "provenance_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+}

@@ -1,0 +1,27 @@
+{
+  "manifest_version": 3,
+  "name": "Papio",
+  "version": "0.1.0",
+  "description": "Ordinary-Chrome institutional handoff for the papio paper-acquisition broker. Human login stays human; one explicitly requested download per job.",
+  "minimum_chrome_version": "120",
+  "background": {
+    "service_worker": "dist/background.js",
+    "type": "module"
+  },
+  "permissions": [
+    "nativeMessaging",
+    "activeTab",
+    "tabs",
+    "downloads",
+    "scripting",
+    "storage"
+  ],
+  "optional_host_permissions": [
+    "https://www.jstor.org/*",
+    "https://www.proquest.com/*",
+    "https://research.ebsco.com/*"
+  ],
+  "action": {
+    "default_title": "Papio"
+  }
+}

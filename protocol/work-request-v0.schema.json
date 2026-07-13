@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://papio.dev/protocol/work-request-v0.schema.json",
+  "title": "papio WorkRequest (draft 0.x)",
+  "description": "One explicitly requested work. DRAFT: schema_version work-request/0.1 until the Phase 4 v1 lock. Unknown fields are rejected by every consumer (fail closed).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "request_id"],
+  "properties": {
+    "schema_version": { "const": "work-request/0.1" },
+    "request_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{8,128}$",
+      "description": "Stable caller-supplied idempotency identity for this request."
+    },
+    "identifiers": {
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "properties": {
+        "doi": { "type": "string", "pattern": "^10\\.[0-9]{4,9}/\\S{1,200}$" },
+        "pmid": { "type": "string", "pattern": "^[0-9]{1,10}$" },
+        "arxiv": { "type": "string", "pattern": "^([0-9]{4}\\.[0-9]{4,5})(v[0-9]+)?$|^[a-z-]+(\\.[A-Z]{2})?/[0-9]{7}$" },
+        "isbn": { "type": "string", "pattern": "^[0-9Xx-]{10,17}$" },
+        "openalex": { "type": "string", "pattern": "^W[0-9]{4,12}$" }
+      }
+    },
+    "title": { "type": "string", "minLength": 3, "maxLength": 500 },
+    "authors": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 100,
+      "items": { "type": "string", "minLength": 1, "maxLength": 200 }
+    },
+    "year": { "type": "integer", "minimum": 1000, "maximum": 2100 },
+    "zotio_item_key": { "type": "string", "pattern": "^[A-Za-z0-9]{1,32}$" },
+    "collection": { "type": "string", "maxLength": 200 },
+    "desired_version": { "enum": ["published", "accepted", "preprint", "any"] },
+    "access_mode_override": { "enum": ["conservative", "assisted", "maximal"] },
+    "max_cost_usd": { "type": "number", "minimum": 0 },
+    "sources_allow": { "type": "array", "items": { "type": "string", "maxLength": 100 }, "maxItems": 50 },
+    "sources_deny": { "type": "array", "items": { "type": "string", "maxLength": 100 }, "maxItems": 50 }
+  },
+  "anyOf": [
+    { "required": ["identifiers"] },
+    { "required": ["title", "authors", "year"] }
+  ]
+}

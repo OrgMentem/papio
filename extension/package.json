@@ -1,0 +1,16 @@
+{
+  "name": "papio-extension",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Papio MV3 extension workspace (browser plane; built out in Phase 2). Bun is package manager/scripts only — the shipped artifact is browser JavaScript.",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.14",
+    "@types/chrome": "^0.1.32",
+    "typescript": "^5.9.2"
+  }
+}
