@@ -64,10 +64,20 @@ func ExtractText(ctx context.Context, path string, cap Capability, opt SemanticO
 	}
 	report := textReport(text, false, opt)
 	report.Evidence = append(report.Evidence, "pdftotext extracted text")
-	if report.Chars >= int64(opt.MinChars) {
+	unique := uniqueTextChars(text)
+	if report.Chars >= int64(opt.MinChars) && unique >= int64(opt.MinChars) {
 		return report, nil
 	}
-	report.Evidence = append(report.Evidence, "text is sparse or image-only")
+	if report.Chars >= int64(opt.MinChars) {
+		// Enough raw characters, but nearly all of them are the same repeated
+		// line(s) — the ProQuest scan case: a per-page "reproduced with
+		// permission" watermark is the only text layer. Character count is
+		// volume, not signal; distinct content is what identity needs.
+		report.Evidence = append(report.Evidence,
+			fmt.Sprintf("text is repeated boilerplate (%d chars, %d distinct)", report.Chars, unique))
+	} else {
+		report.Evidence = append(report.Evidence, "text is sparse or image-only")
+	}
 	if !cap.OCR() {
 		report.NeedsReview = true
 		report.Evidence = append(report.Evidence, "capability: pdftoppm and/or tesseract unavailable")
@@ -157,6 +167,27 @@ func textReport(text string, ocr bool, opt SemanticOptions) TextReport {
 		excerpt = excerpt[:opt.MaxExcerpt]
 	}
 	return TextReport{Chars: int64(utf8.RuneCountInString(text)), Excerpt: excerpt, OCRUsed: ocr}
+}
+
+// uniqueTextChars measures distinct content: rune count over the set of
+// normalized (trimmed, lowercased) unique lines. A per-page watermark repeated
+// thirteen times contributes its length once. Identity matching needs distinct
+// signal, not volume.
+func uniqueTextChars(text string) int64 {
+	seen := map[string]struct{}{}
+	var n int64
+	for _, line := range strings.Split(text, "\n") {
+		l := strings.ToLower(strings.Join(strings.Fields(line), " "))
+		if l == "" {
+			continue
+		}
+		if _, ok := seen[l]; ok {
+			continue
+		}
+		seen[l] = struct{}{}
+		n += int64(utf8.RuneCountInString(l))
+	}
+	return n
 }
 
 func extractOCR(parent context.Context, path string, cap Capability, opt SemanticOptions) (string, error) {
