@@ -1,49 +1,213 @@
 // Copyright 2026 OrgMentem. Licensed under MIT. See LICENSE.
-// Popup: show the active broker-owned handoffs and offer a cancel button. Cancel
-// asks the background service worker to emit provider_outcome{cancelled} and
-// close the tab; the popup never talks to the native host directly.
+// Popup: show the active broker-owned handoffs as an acquisition batch. The
+// popup never talks to the native host directly: cancelling is a message to the
+// service worker, and focusing only activates the broker-owned tab.
 //
-// It also hosts a developer-only "Capture fixture" panel used during Phase 3
-// adapter work: on an explicit click (a user gesture, so `activeTab` is live) it
-// serializes the active tab, sanitizes it here in the popup, and downloads the
-// result as a versioned adapter fixture. Sanitization and the fail-closed
-// residual-secret guard both live in ./capture; the popup only wires the DOM.
+// It also hosts a developer-only "Capture fixture" panel used during adapter
+// work. Sanitization and the fail-closed residual-secret guard live in
+// ./capture; the popup only wires the DOM.
 
 import { captureFixture, type ChromeCaptureApi, type PageCapture, type Provider, type Scenario } from "./capture";
 import { chromeBackend, type ActiveJob } from "./state";
 
-function jobItem(job: ActiveJob): HTMLLIElement {
-  const item = document.createElement("li");
+type JobSection = "needs-you" | "in-flight" | "done" | "failed";
 
-  const id = document.createElement("div");
-  id.className = "job-id";
-  id.textContent = job.job_id;
+export interface PopupActions {
+  cancel(jobID: string): Promise<void>;
+  focus(job: ActiveJob): Promise<void>;
+}
 
-  const status = document.createElement("div");
-  status.className = "job-status";
-  status.textContent = job.status;
+interface ClassifiedJob {
+  job: ActiveJob;
+  section: JobSection;
+  reason?: string;
+  state: string;
+}
 
-  const cancel = document.createElement("button");
-  cancel.textContent = "Cancel";
-  cancel.addEventListener("click", () => {
-    void chrome.runtime.sendMessage({ channel: "papio", action: "cancel", job_id: job.job_id }).then(() => {
-      item.remove();
-      void refresh();
+function classifyJob(job: ActiveJob): ClassifiedJob {
+  // Storage is durable across extension upgrades. Treat future worker states as
+  // display-only rather than making the popup fail to render an older record.
+  const status = job.status as string;
+  switch (status) {
+    case "auth_pending":
+    case "login":
+      return { job, section: "needs-you", reason: "Sign in to continue", state: "Awaiting sign-in" };
+    case "terms":
+      return { job, section: "needs-you", reason: "Accept the provider terms", state: "Terms need approval" };
+    case "awaiting_download":
+    case "manual_download":
+      if (job.download_initiated) return { job, section: "in-flight", state: "Downloading…" };
+      return { job, section: "needs-you", reason: "Download the paper", state: "Manual download needed" };
+    case "downloading":
+      return { job, section: "in-flight", state: "Downloading…" };
+    case "imported":
+    case "completed":
+      return { job, section: "done", state: "Imported" };
+    case "failed":
+    case "cancelled":
+      return { job, section: "failed", state: "Failed" };
+    case "offered":
+      return { job, section: "in-flight", state: "Starting…" };
+    default:
+      return { job, section: "in-flight", state: "Opening provider…" };
+  }
+}
+
+function providerFor(job: ActiveJob): string {
+  if (job.adapter_id) return job.adapter_id;
+  return (job.provider_hosts[0] ?? "Provider").replace(/^www\./, "");
+}
+
+function titleFor(job: ActiveJob): string {
+  const title = job.expected?.title?.trim();
+  if (!title) return job.job_id;
+  return title.length > 68 ? `${title.slice(0, 67)}…` : title;
+}
+
+export async function focusJob(job: ActiveJob): Promise<void> {
+  const tab = await chrome.tabs.update(job.tab_id, { active: true });
+  if (tab?.windowId !== undefined) await chrome.windows.update(tab.windowId, { focused: true });
+}
+export async function cancelJob(jobID: string): Promise<void> {
+  await chrome.runtime.sendMessage({ channel: "papio", action: "cancel", job_id: jobID });
+}
+
+
+function realActions(): PopupActions {
+  return { cancel: cancelJob, focus: focusJob };
+}
+
+function jobItem(doc: Document, classified: ClassifiedJob, actions: PopupActions, onCancelled?: () => void): HTMLLIElement {
+  const { job, section, reason, state } = classified;
+  const item = doc.createElement("li");
+  item.className = "job";
+
+  const provider = doc.createElement("div");
+  provider.className = "job-provider";
+  provider.textContent = providerFor(job);
+
+  const title = doc.createElement("div");
+  title.className = "job-title";
+  title.textContent = titleFor(job);
+  title.title = job.expected?.title ?? job.job_id;
+
+  const stateEl = doc.createElement("div");
+  stateEl.className = "job-state";
+  stateEl.textContent = state;
+
+  const details = doc.createElement("div");
+  details.className = "job-details";
+  details.append(provider, title, stateEl);
+
+  if (reason) {
+    const reasonEl = doc.createElement("div");
+    reasonEl.className = "job-reason";
+    reasonEl.textContent = reason;
+    details.append(reasonEl);
+  }
+
+  const controls = doc.createElement("div");
+  controls.className = "job-controls";
+  if (section === "needs-you") {
+    const focus = doc.createElement("button");
+    focus.className = "primary";
+    focus.type = "button";
+    focus.textContent = "Focus";
+    focus.addEventListener("click", () => {
+      void actions.focus(job).catch(() => {});
     });
-  });
+    controls.append(focus);
+  }
 
-  item.append(id, status, cancel);
+  if (section === "needs-you" || section === "in-flight") {
+    const cancel = doc.createElement("button");
+    cancel.type = "button";
+    cancel.textContent = "Cancel";
+    cancel.addEventListener("click", () => {
+      void actions.cancel(job.job_id).then(
+        () => {
+          item.remove();
+          onCancelled?.();
+        },
+        () => {},
+      );
+    });
+    controls.append(cancel);
+  }
+
+  item.append(details, controls);
   return item;
 }
 
-async function refresh(): Promise<void> {
-  const jobsEl = document.getElementById("jobs");
-  const emptyEl = document.getElementById("empty");
-  if (!(jobsEl instanceof HTMLUListElement) || !emptyEl) return;
+function listFor(doc: Document, id: string): HTMLUListElement | null {
+  const list = doc.getElementById(id);
+  return list instanceof HTMLUListElement ? list : null;
+}
 
+/**
+ * Render a batch snapshot. Exported so the popup can be tested against a
+ * happy-dom document without importing Chrome's real API surface.
+ */
+export function renderJobs(
+  doc: Document,
+  jobs: ActiveJob[],
+  actions: PopupActions = realActions(),
+  onCancelled?: () => void,
+): void {
+  const groups: Record<JobSection, ClassifiedJob[]> = {
+    "needs-you": [],
+    "in-flight": [],
+    done: [],
+    failed: [],
+  };
+  for (const job of jobs) {
+    const classified = classifyJob(job);
+    groups[classified.section].push(classified);
+  }
+
+  const counts = {
+    needs: groups["needs-you"].length,
+    inFlight: groups["in-flight"].length,
+    done: groups.done.length,
+    failed: groups.failed.length,
+  };
+  const summary = doc.getElementById("summary");
+  if (summary) {
+    summary.textContent = `${counts.needs} need you · ${counts.inFlight} downloading · ${counts.done} imported · ${counts.failed} failed`;
+  }
+
+  const sections: Array<[JobSection, string, string]> = [
+    ["needs-you", "needs-you-list", "needs-you-section"],
+    ["in-flight", "in-flight-list", "in-flight-section"],
+    ["done", "done-list", "done-section"],
+    ["failed", "failed-list", "failed-section"],
+  ];
+  for (const [section, listID, sectionID] of sections) {
+    const list = listFor(doc, listID);
+    if (list) list.replaceChildren(...groups[section].map((job) => jobItem(doc, job, actions, onCancelled)));
+    const container = doc.getElementById(sectionID);
+    if (container && (section === "needs-you" || section === "in-flight")) container.hidden = groups[section].length === 0;
+  }
+
+  for (const [id, count] of [
+    ["needs-you-count", counts.needs],
+    ["in-flight-count", counts.inFlight],
+    ["done-count", counts.done],
+    ["failed-count", counts.failed],
+  ] as const) {
+    const countEl = doc.getElementById(id);
+    if (countEl) countEl.textContent = String(count);
+  }
+
+  const emptyEl = doc.getElementById("empty");
+  if (emptyEl) emptyEl.hidden = jobs.length > 0;
+}
+
+export async function refresh(): Promise<void> {
   const { activeJobs } = await chromeBackend(chrome.storage).load();
-  jobsEl.replaceChildren(...activeJobs.map(jobItem));
-  emptyEl.hidden = activeJobs.length > 0;
+  renderJobs(document, activeJobs, realActions(), () => {
+    void refresh();
+  });
 }
 
 // Thin adapter over the real chrome surface so captureFixture stays testable
@@ -59,11 +223,11 @@ const captureApi: ChromeCaptureApi = {
   downloads: { download: (options) => chrome.downloads.download(options) },
 };
 
-function wireCapture(): void {
-  const providerEl = document.getElementById("capture-provider");
-  const scenarioEl = document.getElementById("capture-scenario");
-  const button = document.getElementById("capture-btn");
-  const statusEl = document.getElementById("capture-status");
+export function wireCapture(doc: Document = document): void {
+  const providerEl = doc.getElementById("capture-provider");
+  const scenarioEl = doc.getElementById("capture-scenario");
+  const button = doc.getElementById("capture-btn");
+  const statusEl = doc.getElementById("capture-status");
   if (
     !(providerEl instanceof HTMLSelectElement) ||
     !(scenarioEl instanceof HTMLSelectElement) ||
@@ -85,5 +249,7 @@ function wireCapture(): void {
   });
 }
 
-wireCapture();
-void refresh();
+if (typeof document !== "undefined" && typeof chrome !== "undefined") {
+  wireCapture();
+  void refresh();
+}

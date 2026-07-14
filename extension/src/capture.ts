@@ -16,8 +16,20 @@
 // write a fixture whose sanitized form still contains a residual secret, so a
 // dirty capture fails closed rather than landing on disk.
 
-/** Providers with a live-verified handoff; the fixture tree is keyed by these. */
-export type Provider = "proquest" | "jstor" | "ebsco" | "springer";
+/** Providers the capture tool can record fixtures for. Superset of the enabled
+ * adapter set: a provider appears here as soon as fixture capture is wanted,
+ * and in `adapters/types.ts` only once its fixtures and tests exist. */
+export type Provider =
+  | "proquest"
+  | "jstor"
+  | "ebsco"
+  | "springer"
+  | "elsevier"
+  | "acm"
+  | "wiley"
+  | "tandfonline"
+  | "sage"
+  | "psycnet";
 
 /** Adapter scenarios the capture UI can record; unreachable states stay assisted. */
 export type Scenario =
@@ -28,7 +40,18 @@ export type Scenario =
   | "wrong-work"
   | "drift";
 
-export const PROVIDERS: readonly Provider[] = ["proquest", "jstor", "ebsco", "springer"];
+export const PROVIDERS: readonly Provider[] = [
+  "proquest",
+  "jstor",
+  "ebsco",
+  "springer",
+  "elsevier",
+  "acm",
+  "wiley",
+  "tandfonline",
+  "sage",
+  "psycnet",
+];
 export const SCENARIOS: readonly Scenario[] = [
   "success",
   "login-return",
@@ -46,6 +69,17 @@ export interface FixtureMeta {
   /** ISO-8601 capture timestamp. */
   capturedISO: string;
 }
+
+/** Auto-observation is development material, deliberately outside the
+ * user-selectable adapter `Scenario` union. */
+export interface ObservedFixtureMeta {
+  provider: string;
+  scenario: "observed";
+  originNoQuery: string;
+  capturedISO: string;
+}
+
+type SanitizedFixtureMeta = FixtureMeta | ObservedFixtureMeta;
 
 /** A token-shaped run: 24+ contiguous URL-safe / base64-ish characters. Long
  * enough to catch signed values, session ids, JWT segments, and API keys while
@@ -195,7 +229,7 @@ const TOKEN_STREAM = /<!--[\s\S]*?-->|<[^>]*>/g;
  *     - end tags/etc. → passed through untouched.
  *  3. Prepend the papio-fixture header (added last, so it is never scrubbed).
  */
-export function sanitizeFixture(html: string, meta: FixtureMeta): string {
+export function sanitizeFixture(html: string, meta: SanitizedFixtureMeta): string {
   const emptied = html.replace(EMPTIED_CONTENT, "$1$3");
 
   let out = "";
@@ -228,7 +262,7 @@ export function sanitizeFixture(html: string, meta: FixtureMeta): string {
 /** The first-line provenance comment the adapter harness keys on. Dynamic
  * provider routes can carry session/record identifiers in their path, so mask
  * token-shaped path runs while preserving the stable origin. */
-export function fixtureHeader(meta: FixtureMeta): string {
+export function fixtureHeader(meta: SanitizedFixtureMeta): string {
   const parsed = new URL(meta.originNoQuery);
   const scrubbedPath = scrubTokens(parsed.pathname);
   const safePath = scrubbedPath.startsWith("/") ? scrubbedPath : `/${scrubbedPath}`;
@@ -334,6 +368,23 @@ export interface ChromeCaptureApi {
   };
 }
 
+/** Write already-sanitized fixture HTML through Chrome's download manager. Both
+ * manual captures and auto-observations use this exact final write path. */
+export async function downloadFixture(
+  api: Pick<ChromeCaptureApi, "downloads">,
+  filename: string,
+  sanitized: string,
+): Promise<{ downloadId: number; filename: string }> {
+  const url = `data:text/html;charset=utf-8,${encodeURIComponent(sanitized)}`;
+  const downloadId = await api.downloads.download({
+    url,
+    filename,
+    conflictAction: "uniquify",
+    saveAs: false,
+  });
+  return { downloadId, filename };
+}
+
 export type CaptureResult =
   | { ok: true; downloadId: number; filename: string }
   | { ok: false; error: string };
@@ -377,14 +428,6 @@ export async function captureFixture(
   const leak = residualLeak(sanitized);
   if (leak) return { ok: false, error: `refusing to write a dirty fixture: ${leak}` };
 
-  const filename = `papio-fixtures/${provider}/${scenario}.html`;
-  const url = `data:text/html;charset=utf-8,${encodeURIComponent(sanitized)}`;
-  const downloadId = await api.downloads.download({
-    url,
-    filename,
-    conflictAction: "uniquify",
-    saveAs: false,
-  });
-
-  return { ok: true, downloadId, filename };
+  const written = await downloadFixture(api, `papio-fixtures/${provider}/${scenario}.html`, sanitized);
+  return { ok: true, ...written };
 }

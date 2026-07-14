@@ -40,6 +40,9 @@ import {
   type AdapterSpec,
   type PageVerdict,
 } from "./adapters/types";
+import { observeUnknown } from "./observe";
+// KEEPALIVE INTEGRATION
+import { chromeKeepaliveAPI, initKeepalive } from "./keepalive";
 
 export const NATIVE_HOST = "com.orgmentem.papio";
 
@@ -265,8 +268,18 @@ export class Bridge {
   /** Tabs we are intentionally closing, so onRemoved does not emit a spurious
    * cancelled outcome for a programmatic close. */
   private readonly closingTabs = new Set<number>();
+  /** Latest resolver URL from an offer; intentionally memory-only. */
+  private latestOfferOpenURL: string | undefined;
 
   constructor(private readonly deps: BridgeDeps) {}
+  trackedJobCount(): number {
+    return this.store.activeJobs.length;
+  }
+
+  latestOpenURL(): string | undefined {
+    return this.latestOfferOpenURL;
+  }
+
 
   /** Bind browser listeners (once), open the native connection, send hello, and
    * hydrate persisted job/tab correlation. Safe to call on every SW spin-up.
@@ -488,6 +501,7 @@ export class Bridge {
     const expiresAt = p["expires_at"];
     // Shape is already guaranteed by parseBrowserMessage; these narrow for TS.
     if (typeof openurl !== "string" || !Array.isArray(hostsRaw) || typeof expiresAt !== "string") return;
+    this.latestOfferOpenURL = openurl;
     const providerHosts = hostsRaw.filter((h): h is string => typeof h === "string");
     const expected = parseExpected(p["expected"]);
 
@@ -603,8 +617,11 @@ export class Bridge {
     const job = findByJob(this.store, jobID);
     if (!job) return;
     if (job.status !== "accepted" && job.status !== "awaiting_download") return;
-    const spec = this.deps.adapterSpecs.find((s) => hostMatches(host, s.hosts));
-    if (!spec) return; // no declarative adapter for this host -> stay assisted
+    const spec = this.deps.adapterSpecs.find((candidate) => hostMatches(host, candidate.hosts));
+    if (!spec) {
+      await this.recordUnknown(job, host);
+      return; // no declarative adapter for this verified host
+    }
     let granted = false;
     try {
       granted = await this.deps.permissions.contains({ origins: [`https://${host}/*`] });
@@ -630,7 +647,7 @@ export class Bridge {
       return;
     }
     if (!verdict) return;
-    await this.applyVerdict(jobID, spec, verdict);
+    await this.applyVerdict(jobID, spec, verdict, host);
   }
 
 
@@ -649,10 +666,27 @@ export class Bridge {
     await this.maybeClassify(jobID, host);
   }
 
+  /** Record a development capture for an unknown page without changing the
+   * assisted handoff semantics when this provider has no adapter at all. */
+  private async recordUnknown(job: ActiveJob, host: string, adapterVersion?: string): Promise<void> {
+    if (typeof chrome !== "undefined") await observeUnknown({ scripting: chrome.scripting, downloads: chrome.downloads, storage: chrome.storage }, job, host, () => new Date(this.deps.now()));
+    if (adapterVersion === undefined) return;
+    const now = this.deps.now();
+    const count = job.unknown_count ?? 0;
+    const last = job.last_unknown_ms ?? 0;
+    if (count >= 1 && now - last >= 5000) {
+      // Second unknown, at least 5s after the first: the UI has changed.
+      this.send("provider_outcome", { outcome: "ui_changed", adapter_version: adapterVersion }, job.job_id);
+      await this.update((s) => patchJob(s, job.job_id, { unknown_count: 0 }));
+    } else if (count === 0) {
+      await this.update((s) => patchJob(s, job.job_id, { unknown_count: 1, last_unknown_ms: now }));
+    }
+  }
+
   /** Map a page verdict to a bridge action. See the safety contract: at most one
    * download initiation per job, ever; unknown only escalates after two spaced
    * observations; every other unknown keeps assisted behaviour. */
-  private async applyVerdict(jobID: string, spec: AdapterSpec, verdict: PageVerdict): Promise<void> {
+  private async applyVerdict(jobID: string, spec: AdapterSpec, verdict: PageVerdict, host: string): Promise<void> {
     const job = findByJob(this.store, jobID);
     if (!job) return;
     const av = spec.version;
@@ -736,21 +770,10 @@ export class Bridge {
       case "wrong_work_check":
         this.send("provider_outcome", { outcome: "wrong_work", adapter_version: av }, jobID);
         return;
-      case "unknown": {
-        const now = this.deps.now();
-        const count = job.unknown_count ?? 0;
-        const last = job.last_unknown_ms ?? 0;
-        if (count >= 1 && now - last >= 5000) {
-          // Second unknown, at least 5s after the first: the UI has changed.
-          this.send("provider_outcome", { outcome: "ui_changed", adapter_version: av }, jobID);
-          await this.update((s) => patchJob(s, jobID, { unknown_count: 0 }));
-        } else if (count === 0) {
-          await this.update((s) => patchJob(s, jobID, { unknown_count: 1, last_unknown_ms: now }));
-        }
-        // else: unknown again but <5s after the first -> keep waiting, do nothing.
+      case "unknown":
+        await this.recordUnknown(job, host, av);
         return;
       }
-    }
   }
 
   private async onTabRemoved(tabID: number): Promise<void> {
@@ -933,5 +956,11 @@ if (typeof chrome !== "undefined" && chrome.runtime?.id) {
     }
     return false;
   });
-  void bridge.start();
+  // KEEPALIVE INTEGRATION
+  void bridge.start().then(() =>
+    initKeepalive(chromeKeepaliveAPI(chrome), {
+      trackedJobCount: () => bridge.trackedJobCount(),
+      latestOpenURL: () => bridge.latestOpenURL(),
+    }),
+  );
 }

@@ -15,6 +15,12 @@ const SOURCES: Source[] = [
   { label: "ProQuest", origin: "https://www.proquest.com/*" },
   { label: "EBSCO", origin: "https://research.ebsco.com/*" },
   { label: "Springer Nature Link", origin: "https://link.springer.com/*" },
+  { label: "ScienceDirect (Elsevier)", origin: "https://www.sciencedirect.com/*" },
+  { label: "ACM Digital Library", origin: "https://dl.acm.org/*" },
+  { label: "Wiley Online Library", origin: "https://onlinelibrary.wiley.com/*" },
+  { label: "Taylor & Francis Online", origin: "https://www.tandfonline.com/*" },
+  { label: "SAGE Journals", origin: "https://journals.sagepub.com/*" },
+  { label: "APA PsycNet", origin: "https://psycnet.apa.org/*" },
 ];
 
 function render(list: HTMLUListElement): void {

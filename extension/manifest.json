@@ -20,7 +20,13 @@
     "https://www.jstor.org/*",
     "https://www.proquest.com/*",
     "https://research.ebsco.com/*",
-    "https://link.springer.com/*"
+    "https://link.springer.com/*",
+    "https://www.sciencedirect.com/*",
+    "https://dl.acm.org/*",
+    "https://onlinelibrary.wiley.com/*",
+    "https://www.tandfonline.com/*",
+    "https://journals.sagepub.com/*",
+    "https://psycnet.apa.org/*"
   ],
   "options_page": "dist/options.html",
   "action": {

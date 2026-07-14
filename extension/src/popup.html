@@ -5,87 +5,215 @@
     <meta charset="utf-8" />
     <title>Papio</title>
     <style>
+      :root {
+        color: #182231;
+        font-family:
+          ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+          sans-serif;
+      }
       body {
-        font: 13px/1.5 system-ui, sans-serif;
+        box-sizing: border-box;
+        font-size: 13px;
+        line-height: 1.4;
         margin: 0;
-        padding: 14px;
-        width: 300px;
-        color: #1a1a1a;
+        padding: 16px;
+        width: 360px;
+      }
+      h1,
+      h2 {
+        margin: 0;
       }
       h1 {
-        font-size: 15px;
-        margin: 0 0 10px;
+        font-size: 17px;
+        letter-spacing: -0.01em;
       }
-      h2 {
-        font-size: 12px;
+      h2,
+      summary {
+        color: #516171;
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 0.07em;
         text-transform: uppercase;
-        letter-spacing: 0.04em;
-        color: #777;
-        margin: 0 0 8px;
+      }
+      .summary {
+        color: #607080;
+        font-size: 12px;
+        margin: 4px 0 16px;
       }
       .empty {
-        color: #777;
+        color: #607080;
+        margin: 12px 0;
+      }
+      section {
+        margin-top: 16px;
+      }
+      .section-heading {
+        align-items: baseline;
+        display: flex;
+        justify-content: space-between;
+        margin-bottom: 6px;
+      }
+      .count {
+        background: #edf1f5;
+        border-radius: 999px;
+        color: #435365;
+        font-size: 11px;
+        line-height: 18px;
+        min-width: 18px;
+        text-align: center;
       }
       ul {
         list-style: none;
         margin: 0;
         padding: 0;
       }
-      li {
+      .job {
+        align-items: flex-start;
+        border-top: 1px solid #e6ebf0;
+        display: flex;
+        gap: 10px;
+        justify-content: space-between;
         padding: 10px 0;
-        border-top: 1px solid #e3e3e3;
       }
-      .job-id {
-        font-family: ui-monospace, monospace;
-        font-size: 12px;
-        word-break: break-all;
+      .job-details {
+        min-width: 0;
       }
-      .job-status {
-        color: #555;
+      .job-provider {
+        color: #607080;
+        font-size: 11px;
+        font-weight: 600;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .job-title {
+        font-weight: 600;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .job-state,
+      .job-reason {
         font-size: 12px;
-        margin: 2px 0 8px;
+        margin-top: 2px;
+      }
+      .job-state {
+        color: #426789;
+      }
+      .job-reason {
+        color: #a15c17;
+      }
+      #failed-section .job-state {
+        color: #a33d42;
+      }
+      .job-controls {
+        display: flex;
+        flex: 0 0 auto;
+        gap: 6px;
       }
       button {
-        font: inherit;
-        padding: 5px 12px;
-        border-radius: 6px;
-        border: 1px solid #bbb;
         background: #fff;
+        border: 1px solid #cbd5df;
+        border-radius: 6px;
+        color: #283849;
         cursor: pointer;
+        font: inherit;
+        font-size: 12px;
+        padding: 4px 9px;
       }
       button:hover {
-        background: #f5f5f5;
+        background: #f4f7f9;
+      }
+      button.primary {
+        background: #eaf3ff;
+        border-color: #9fc6f5;
+        color: #12549b;
+      }
+      button.primary:hover {
+        background: #dcecff;
+      }
+      details {
+        border-top: 1px solid #e6ebf0;
+        margin-top: 12px;
+        padding-top: 10px;
+      }
+      summary {
+        cursor: pointer;
+        list-style: none;
+      }
+      summary::-webkit-details-marker {
+        display: none;
+      }
+      summary::after {
+        color: #718194;
+        content: "›";
+        float: right;
+        font-size: 16px;
+        line-height: 12px;
+      }
+      details[open] summary::after {
+        transform: rotate(90deg);
+      }
+      details ul {
+        margin-top: 6px;
       }
       .capture {
-        margin-top: 16px;
-        padding-top: 12px;
-        border-top: 1px solid #e3e3e3;
+        border-top: 1px solid #dce3ea;
+        margin-top: 18px;
+        padding-top: 14px;
       }
       .capture .row {
         display: flex;
         gap: 8px;
-        margin-bottom: 8px;
+        margin: 8px 0;
       }
       .capture select {
-        font: inherit;
-        flex: 1;
-        padding: 4px 6px;
-        border-radius: 6px;
-        border: 1px solid #bbb;
         background: #fff;
+        border: 1px solid #cbd5df;
+        border-radius: 6px;
+        flex: 1;
+        font: inherit;
+        padding: 4px 6px;
       }
       .capture-status {
-        margin-top: 8px;
+        color: #607080;
         font-size: 12px;
-        color: #555;
+        margin-top: 8px;
         word-break: break-all;
       }
     </style>
   </head>
   <body>
-    <h1>Active handoffs</h1>
+    <header>
+      <h1>Acquisition batch</h1>
+      <p id="summary" class="summary">0 need you · 0 downloading · 0 imported · 0 failed</p>
+    </header>
     <div id="empty" class="empty" hidden>No active jobs.</div>
-    <ul id="jobs"></ul>
+
+    <section id="needs-you-section" aria-labelledby="needs-you-heading">
+      <div class="section-heading">
+        <h2 id="needs-you-heading">Needs you</h2>
+        <span id="needs-you-count" class="count">0</span>
+      </div>
+      <ul id="needs-you-list"></ul>
+    </section>
+
+    <section id="in-flight-section" aria-labelledby="in-flight-heading">
+      <div class="section-heading">
+        <h2 id="in-flight-heading">In flight</h2>
+        <span id="in-flight-count" class="count">0</span>
+      </div>
+      <ul id="in-flight-list"></ul>
+    </section>
+
+    <details id="done-section">
+      <summary>Imported <span id="done-count" class="count">0</span></summary>
+      <ul id="done-list"></ul>
+    </details>
+    <details id="failed-section">
+      <summary>Failed <span id="failed-count" class="count">0</span></summary>
+      <ul id="failed-list"></ul>
+    </details>
 
     <section class="capture">
       <h2>Capture fixture (dev)</h2>
@@ -95,6 +223,12 @@
           <option value="jstor">jstor</option>
           <option value="ebsco">ebsco</option>
           <option value="springer">springer</option>
+          <option value="elsevier">elsevier</option>
+          <option value="acm">acm</option>
+          <option value="wiley">wiley</option>
+          <option value="tandfonline">tandfonline</option>
+          <option value="sage">sage</option>
+          <option value="psycnet">psycnet</option>
         </select>
         <select id="capture-scenario" aria-label="Scenario">
           <option value="success">success</option>
