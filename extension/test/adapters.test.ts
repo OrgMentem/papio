@@ -248,6 +248,7 @@ class FakeDownloads {
     [DownloadItemLike, (s: { filename: string; conflictAction: "uniquify" }) => void]
   >();
   readonly items = new Map<number, DownloadItemLike>();
+  determineBeforeReturn = false;
   readonly started: {
     url: string;
     filename: string;
@@ -262,26 +263,25 @@ class FakeDownloads {
   }): Promise<number> {
     this.started.push(options);
     const id = 700 + this.started.length;
-    let finalRelative = "out.pdf"; // provider Content-Disposition suggestion
-    await this.onDeterminingFilename.emit(
-      {
-        id,
-        url: options.url.replace("TOKEN=ephemeral", "TOKEN=normalized"),
-        finalUrl: "https://media.proquest.com/redirected/out.pdf",
-        filename: finalRelative,
-        state: "in_progress",
-      },
-      (s) => {
-        finalRelative = s.filename;
-      },
-    );
     this.items.set(id, {
       id,
-      filename: `/Users/test/Downloads/${finalRelative}`,
+      url: options.url.replace("TOKEN=ephemeral", "TOKEN=normalized"),
+      finalUrl: "https://media.proquest.com/redirected/out.pdf",
+      filename: "/Users/test/Downloads/out.pdf",
       fileSize: 12345,
       state: "in_progress",
     });
+    if (this.determineBeforeReturn) await this.determine(id);
     return id;
+  }
+  async determine(id: number): Promise<void> {
+    const item = this.items.get(id);
+    if (!item) throw new Error(`unknown fake download ${id}`);
+    let relative = (item.filename ?? "").split(/[\\/]/).pop() ?? "";
+    await this.onDeterminingFilename.emit(item, (s) => {
+      relative = s.filename;
+    });
+    this.items.set(id, { ...item, filename: `/Users/test/Downloads/${relative}` });
   }
   async search(query: { id: number }): Promise<DownloadItemLike[]> {
     const item = this.items.get(query.id);
@@ -435,6 +435,8 @@ test("article verdict starts one browser-managed job-scoped download, no signed 
   // A re-classification (another page load) must NOT initiate a second download.
   await landOnProvider(h, "job_article_0001");
   expect(h.downloads.started.length).toBe(1);
+  // Live Chrome returned the download ID before asking for a filename.
+  await h.downloads.determine(701);
   expect(h.downloads.items.get(701)?.filename).toBe(
     "/Users/test/Downloads/papio/job_article_0001/out.pdf",
   );
@@ -445,6 +447,18 @@ test("article verdict starts one browser-managed job-scoped download, no signed 
   expect(complete?.job_id).toBe("job_article_0001");
   expect(complete?.payload["filename"]).toBe("out.pdf");
   expect(complete?.payload["size_bytes"]).toBe(12345);
+});
+
+test("filename steering also handles determination before the download ID returns", async () => {
+  const h = makeMapHarness();
+  h.downloads.determineBeforeReturn = true;
+  h.scripting.verdict = { kind: "article", adapter_id: "proquest", adapter_version: "0.3.1", evidence: [] };
+  await h.bridge.start();
+  await h.port.inbound(offer("job_early_name_0001", { title: EXPECTED_TITLE }));
+  await landOnProvider(h, "job_early_name_0001");
+  expect(h.downloads.items.get(701)?.filename).toBe(
+    "/Users/test/Downloads/papio/job_early_name_0001/out.pdf",
+  );
 });
 
 test("classification is gated on an optional-host-permission grant", async () => {

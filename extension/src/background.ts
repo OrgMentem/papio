@@ -251,6 +251,18 @@ export class Bridge {
     return jobs.size === 1 ? jobs.values().next().value : undefined;
   }
 
+  /** downloads.download may resolve with the ID before Chrome asks extensions
+   * to determine the filename. IDs are exact and contain no provider secret. */
+  private trackedJobFor(downloadID: number): string | undefined {
+    let matched: string | undefined;
+    for (const [jobID, track] of this.downloads) {
+      if (!track.ids.has(downloadID)) continue;
+      if (matched !== undefined && matched !== jobID) return undefined;
+      matched = jobID;
+    }
+    return matched;
+  }
+
   private bindListeners(): void {
     if (this.listenersBound) return;
     this.listenersBound = true;
@@ -267,9 +279,10 @@ export class Bridge {
       return this.onDownloadChanged(delta);
     });
     this.deps.downloads.onDeterminingFilename?.addListener((item, suggest) => {
-      // Exact adapter-started URL wins. Host fallback remains fail-closed when
-      // several active jobs share a provider.
-      const exactJobID = this.pendingJobFor(item);
+      // The event can race on either side of downloads.download resolving:
+      // use its exact returned ID after resolution, or the pending URL before.
+      // Host fallback remains fail-closed when several jobs share a provider.
+      const exactJobID = this.trackedJobFor(item.id) ?? this.pendingJobFor(item);
       const job = exactJobID ? findByJob(this.store, exactJobID) : this.correlate(item);
       if (!job) return;
       const base = (item.filename ?? "").split(/[\\/]/).pop() ?? "";
