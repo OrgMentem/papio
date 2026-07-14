@@ -19,7 +19,7 @@
 /** Providers with a live-verified handoff; the fixture tree is keyed by these. */
 export type Provider = "proquest" | "jstor" | "ebsco" | "springer";
 
-/** Adapter scenarios every provider must be fixture-tested against. */
+/** Adapter scenarios the capture UI can record; unreachable states stay assisted. */
 export type Scenario =
   | "success"
   | "login-return"
@@ -62,10 +62,23 @@ const EMPTIED_CONTENT = /(<(script|noscript|iframe|object|embed|style|textarea)\
 const URL_ATTRS: Record<string, true> = { href: true, src: true, action: true, "data-src": true };
 
 /** Attribute names whose static values are selector-bearing. Semantic CSS/BEM
- * names survive, but opaque token-shaped runs inside them are masked so an
- * adapter can never depend on a per-session UUID/hash. Inline style is excluded
- * entirely; it carries no classifier signal. */
-const STRUCTURAL_ATTRS: Record<string, true> = { class: true, id: true, name: true, rel: true, type: true, role: true };
+ * names and explicit provider test hooks survive, but opaque token-shaped runs
+ * inside them are masked so an adapter can never depend on a per-session
+ * UUID/hash. Inline style is excluded entirely; it carries no classifier
+ * signal. */
+const STRUCTURAL_ATTRS: Record<string, true> = {
+  class: true,
+  id: true,
+  name: true,
+  rel: true,
+  type: true,
+  role: true,
+  "data-auto": true,
+  "data-test": true,
+  "data-testid": true,
+  "data-automation-id": true,
+  "data-qa": true,
+};
 
 /** Replace every token-shaped run with the literal `TOKEN`. */
 function scrubTokens(text: string): string {
@@ -212,11 +225,16 @@ export function sanitizeFixture(html: string, meta: FixtureMeta): string {
   return `${fixtureHeader(meta)}\n${out}`;
 }
 
-/** The first-line provenance comment the adapter harness keys on. */
+/** The first-line provenance comment the adapter harness keys on. Dynamic
+ * provider routes can carry session/record identifiers in their path, so mask
+ * token-shaped path runs while preserving the stable origin. */
 export function fixtureHeader(meta: FixtureMeta): string {
+  const parsed = new URL(meta.originNoQuery);
+  const scrubbedPath = scrubTokens(parsed.pathname);
+  const safePath = scrubbedPath.startsWith("/") ? scrubbedPath : `/${scrubbedPath}`;
   return (
     `<!-- papio-fixture provider="${meta.provider}" scenario="${meta.scenario}"` +
-    ` origin="${meta.originNoQuery}" captured="${meta.capturedISO}" -->`
+    ` origin="${parsed.origin}${safePath}" captured="${meta.capturedISO}" -->`
   );
 }
 
@@ -257,10 +275,7 @@ export function residualLeak(sanitized: string): string | null {
         for (const attr of attrs) {
           if (!attr.hasValue) continue;
           const lname = attr.name.toLowerCase();
-          const attrToken = residual(
-            attr.value,
-            lname === "class" || lname === "id" || lname === "name",
-          );
+          const attrToken = residual(attr.value, STRUCTURAL_ATTRS[lname] === true);
           if (attrToken) return `a token-shaped value survived sanitization (${attrToken.slice(0, 8)}…)`;
         }
       }

@@ -175,7 +175,7 @@ function makeHarness(seed?: StoreShape): Harness {
 
 function jobOffer(jobID: string): unknown {
   return {
-    protocol: "papio-browser/0.1",
+    protocol: "papio-browser/1",
     type: "job_offer",
     msg_id: "offer_00000001",
     job_id: jobID,
@@ -333,7 +333,7 @@ test("a malformed inbound frame fails closed by disconnecting", async () => {
   const h = makeHarness();
   await h.bridge.start();
   expect(h.port.disconnected).toBe(false);
-  await h.port.inbound({ protocol: "papio-browser/0.1", type: "not_a_type", msg_id: "x", seq: 0, payload: {} });
+  await h.port.inbound({ protocol: "papio-browser/1", type: "not_a_type", msg_id: "x", seq: 0, payload: {} });
   expect(h.port.disconnected).toBe(true);
 });
 
@@ -380,7 +380,7 @@ test("unplanned port death reconnects with backoff; deliberate disconnect stays 
   const bad = makeHarness();
   await bad.bridge.start();
   const timersBefore = bad.timers.length;
-  await bad.port.inbound({ protocol: "papio-browser/0.1", type: "not_a_type", msg_id: "x", seq: 0, payload: {} });
+  await bad.port.inbound({ protocol: "papio-browser/1", type: "not_a_type", msg_id: "x", seq: 0, payload: {} });
   expect(bad.port.disconnected).toBe(true);
   expect(bad.timers.length).toBe(timersBefore);
 });

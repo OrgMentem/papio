@@ -290,14 +290,20 @@ class FakeDownloads {
 }
 
 // Fake chrome.scripting: interpret injections (3 args) return queued verdicts;
-// extractDownloadURL (1 arg) returns a signed URL; declared click (2 args)
-// records the exact light/shadow selectors.
+// extractDownloadURL (1 arg) returns a signed URL; declared clicks (5 args)
+// record the exact light/shadow/follow-up selectors.
 class FakeScripting {
   verdict: PageVerdict | undefined;
   readonly verdictQueue: PageVerdict[] = [];
   href = "https://media.proquest.com/media/signed?TOKEN=ephemeral";
   readonly extracted: { tabId: number; selector: string }[] = [];
-  readonly clicked: { tabId: number; selector: string; shadowSelector?: string }[] = [];
+  readonly clicked: {
+    tabId: number;
+    selector: string;
+    shadowSelector?: string;
+    followupSelector?: string;
+  }[] = [];
+  readonly rawClickArgs: unknown[][] = [];
   readonly interpretTabs: number[] = [];
   async executeScript(inj: {
     target: { tabId: number };
@@ -309,11 +315,13 @@ class FakeScripting {
       this.extracted.push({ tabId: inj.target.tabId, selector: String(args[0]) });
       return [{ result: this.href }];
     }
-    if (args.length === 4) {
+    if (args.length === 5) {
+      this.rawClickArgs.push([...args]);
       this.clicked.push({
         tabId: inj.target.tabId,
         selector: String(args[0]),
         ...(typeof args[1] === "string" ? { shadowSelector: args[1] } : {}),
+        ...(typeof args[4] === "string" ? { followupSelector: args[4] } : {}),
       });
       return [{ result: true }];
     }
@@ -381,16 +389,20 @@ function makeMapHarness(specs: AdapterSpec[] = [SPEC]): MapHarness {
   };
 }
 
-function offer(jobID: string, expected?: { title?: string }): unknown {
+function offer(
+  jobID: string,
+  expected?: { title?: string },
+  providerHosts: string[] = [PROVIDER],
+): unknown {
   return {
-    protocol: "papio-browser/0.1",
+    protocol: "papio-browser/1",
     type: "job_offer",
     msg_id: "offer_00000001",
     job_id: jobID,
     seq: 0,
     payload: {
       openurl: OPENURL,
-      provider_hosts: [PROVIDER],
+      provider_hosts: providerHosts,
       access_mode: "maximal",
       expires_at: EXPIRES,
       ...(expected !== undefined ? { expected } : {}),
@@ -398,9 +410,13 @@ function offer(jobID: string, expected?: { title?: string }): unknown {
   };
 }
 
-async function landOnProvider(h: MapHarness, jobID: string): Promise<number> {
+async function landOnProvider(
+  h: MapHarness,
+  jobID: string,
+  host: string = PROVIDER,
+): Promise<number> {
   const tabID = h.backend.store.activeJobs.find((j) => j.job_id === jobID)?.tab_id ?? -1;
-  const url = `https://${PROVIDER}/pqdweb`;
+  const url = `https://${host}/pqdweb`;
   h.tabs.live.set(tabID, { id: tabID, url });
   await h.tabs.onUpdated.emit(tabID, { url, status: "complete" }, { id: tabID, url });
   return tabID;
@@ -495,6 +511,102 @@ test("declared shadow click reclassifies an in-page terms gate", async () => {
   expect(h.scripting.interpretTabs.length).toBe(2);
   expect(h.downloads.started).toHaveLength(0);
 });
+test("declared provider modal follow-up stays inside the one click helper", async () => {
+  const clickSpec: AdapterSpec = {
+    id: "ebsco",
+    version: "0.1.0",
+    hosts: [PROVIDER],
+    classify: [{ kind: "article", all: ["meta[name='citation_title']"] }],
+    download: {
+      selector: "[data-auto='download']",
+      requireKind: "article",
+      method: "click",
+      followupSelector: "[data-auto='confirm-download']",
+      postClickTimeoutMs: 3000,
+    },
+  };
+  const h = makeMapHarness([clickSpec]);
+  h.scripting.verdict = {
+    kind: "article",
+    adapter_id: "ebsco",
+    adapter_version: "0.1.0",
+    evidence: [],
+  };
+  await h.bridge.start();
+  await h.port.inbound(offer("job_ebsco_click_0001"));
+  const tabID = await landOnProvider(h, "job_ebsco_click_0001");
+
+  expect(h.scripting.clicked).toEqual([
+    {
+      tabId: tabID,
+      selector: "[data-auto='download']",
+      followupSelector: "[data-auto='confirm-download']",
+    },
+  ]);
+  expect(h.scripting.rawClickArgs).toEqual([
+    [
+      "[data-auto='download']",
+      null,
+      null,
+      3000,
+      "[data-auto='confirm-download']",
+    ],
+  ]);
+  expect(h.backend.store.activeJobs[0]?.download_initiated).toBe(true);
+  expect(h.downloads.started).toHaveLength(0);
+});
+test("click downloads correlate by adapter when concurrent handoffs share provider hosts", async () => {
+  const jstor: AdapterSpec = {
+    id: "jstor",
+    version: "0.1.0",
+    hosts: ["www.jstor.org"],
+    classify: [{ kind: "article", all: [".download"] }],
+    download: { selector: ".download", requireKind: "article", method: "click" },
+  };
+  const ebsco: AdapterSpec = {
+    id: "ebsco",
+    version: "0.1.0",
+    hosts: ["research.ebsco.com"],
+    classify: [{ kind: "article", all: [".download"] }],
+    download: { selector: ".download", requireKind: "article", method: "click" },
+  };
+  const providerHosts = ["www.jstor.org", "research.ebsco.com"];
+  const h = makeMapHarness([jstor, ebsco]);
+  h.scripting.verdictQueue.push(
+    { kind: "article", adapter_id: "jstor", adapter_version: "0.1.0", evidence: [] },
+    { kind: "article", adapter_id: "ebsco", adapter_version: "0.1.0", evidence: [] },
+  );
+  await h.bridge.start();
+  await h.port.inbound(offer("job_jstor_concurrent_0001", undefined, providerHosts));
+  await landOnProvider(h, "job_jstor_concurrent_0001", "www.jstor.org");
+  await h.port.inbound(offer("job_ebsco_concurrent_0001", undefined, providerHosts));
+  await landOnProvider(h, "job_ebsco_concurrent_0001", "research.ebsco.com");
+
+  const item: DownloadItemLike = {
+    id: 901,
+    url: "blob:https://research.ebsco.com/download",
+    referrer: "https://research.ebsco.com/c/record",
+    filename: "/Users/test/Downloads/EBSCO-FullText.pdf",
+    state: "in_progress",
+  };
+  let suggested: { filename: string; conflictAction: "uniquify" } | undefined;
+  await h.downloads.onDeterminingFilename.emit(item, (value) => {
+    suggested = value;
+  });
+
+  expect(suggested).toEqual({
+    filename: "papio/job_ebsco_concurrent_0001/EBSCO-FullText.pdf",
+    conflictAction: "uniquify",
+  });
+  expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_jstor_concurrent_0001")?.adapter_id).toBe(
+    "jstor",
+  );
+  expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_ebsco_concurrent_0001")?.adapter_id).toBe(
+    "ebsco",
+  );
+});
+
+
 
 test("filename steering also handles determination before the download ID returns", async () => {
   const h = makeMapHarness();

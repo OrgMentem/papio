@@ -193,49 +193,59 @@ function extractDownloadURL(selector: string): string | null {
 }
 
 /** Self-contained declared click, optionally through one explicitly named
- * control in an open shadow root. For in-page gates it waits on one declared
- * selector via MutationObserver; no guessed delay, selector, or fallback. */
+ * control in an open shadow root. It may then wait for one declared in-page
+ * gate or click one declared provider download-modal control. No guessed
+ * delay, selector, fallback, or terms/consent action. */
 async function clickDeclaredDownload(
   selector: string,
-  shadowSelector?: string,
-  waitForSelector?: string,
-  timeoutMs?: number,
+  shadowSelector: string | null,
+  waitForSelector: string | null,
+  timeoutMs: number | null,
+  followupSelector: string | null,
 ): Promise<boolean> {
   const host = document.querySelector(selector);
   let target: Element | null = host;
-  if (shadowSelector !== undefined) {
+  if (shadowSelector !== null) {
     if (!(host instanceof HTMLElement) || host.shadowRoot === null) return false;
     target = host.shadowRoot.querySelector(shadowSelector);
   }
   if (!(target instanceof HTMLElement)) return false;
   target.click();
 
-  if (waitForSelector === undefined) return true;
-  const seen = (): boolean => {
+  const appearanceSelector = followupSelector ?? waitForSelector;
+  if (appearanceSelector === null) return true;
+  const findAppeared = (): Element | null => {
     try {
-      return document.querySelector(waitForSelector) !== null;
+      return document.querySelector(appearanceSelector);
     } catch {
-      return false;
+      return null;
     }
   };
-  if (seen()) return true;
 
-  const boundedMs = Math.max(0, Math.min(timeoutMs ?? 0, 5000));
-  await new Promise<void>((resolve) => {
-    let settled = false;
-    const finish = (): void => {
-      if (settled) return;
-      settled = true;
-      observer.disconnect();
-      clearTimeout(timer);
-      resolve();
-    };
-    const observer = new MutationObserver(() => {
-      if (seen()) finish();
+  let appeared = findAppeared();
+  if (appeared === null) {
+    const boundedMs = Math.max(0, Math.min(timeoutMs ?? 0, 5000));
+    appeared = await new Promise<Element | null>((resolve) => {
+      let observer: MutationObserver | null = null;
+      let timer: number | Timer | undefined;
+      const finish = (element: Element | null): void => {
+        observer?.disconnect();
+        clearTimeout(timer);
+        resolve(element);
+      };
+      observer = new MutationObserver(() => {
+        const element = findAppeared();
+        if (element !== null) finish(element);
+      });
+      observer.observe(document.documentElement, { childList: true, subtree: true, attributes: true });
+      timer = setTimeout(() => finish(findAppeared()), boundedMs);
     });
-    observer.observe(document.documentElement, { childList: true, subtree: true, attributes: true });
-    const timer = setTimeout(finish, boundedMs);
-  });
+  }
+
+  if (followupSelector !== null) {
+    if (!(appeared instanceof HTMLElement)) return false;
+    appeared.click();
+  }
   return true;
 }
 
@@ -637,7 +647,9 @@ export class Bridge {
           // re-classification can ever initiate a second download for this
           // job. Failure falls back to assisted mode; the user can still use
           // the verified page control manually.
-          await this.update((s) => patchJob(s, jobID, { download_initiated: true }));
+          await this.update((s) =>
+            patchJob(s, jobID, { download_initiated: true, adapter_id: spec.id }),
+          );
           try {
             if (dl.method === "click") {
               const results = await this.deps.scripting.executeScript({
@@ -645,9 +657,10 @@ export class Bridge {
                 func: clickDeclaredDownload,
                 args: [
                   dl.selector,
-                  dl.shadowSelector,
-                  dl.postClickWaitFor,
-                  dl.postClickTimeoutMs,
+                  dl.shadowSelector ?? null,
+                  dl.postClickWaitFor ?? null,
+                  dl.postClickTimeoutMs ?? null,
+                  dl.followupSelector ?? null,
                 ],
               });
               const clicked = results[0]?.result === true;
@@ -752,7 +765,14 @@ export class Bridge {
     } catch {
       return undefined;
     }
-    const matches = this.store.activeJobs.filter((j) => hostMatches(host, j.provider_hosts));
+    const initiated = this.store.activeJobs.filter((job) => {
+      if (job.download_initiated !== true || job.adapter_id === undefined) return false;
+      const spec = this.deps.adapterSpecs.find((candidate) => candidate.id === job.adapter_id);
+      return spec !== undefined && hostMatches(host, spec.hosts);
+    });
+    if (initiated.length === 1) return initiated[0];
+    if (initiated.length > 1) return undefined;
+    const matches = this.store.activeJobs.filter((job) => hostMatches(host, job.provider_hosts));
     return matches.length === 1 ? matches[0] : undefined;
   }
 

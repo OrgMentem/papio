@@ -27,8 +27,11 @@ export interface ActiveJob {
    * only — never an IdP value. */
   expected?: { title?: string; doi?: string };
   /** One-download-initiation-per-job latch. Once an adapter has clicked the
-   * declared download target, it can never click again for this job. */
+   * declared download target, it can never click again for this job. The
+   * source-controlled adapter id allows concurrent provider downloads to be
+   * correlated without persisting a page URL, referrer, or live host. */
   download_initiated?: boolean;
+  adapter_id?: string;
   /** Consecutive `unknown` classification streak, and the epoch-ms of the
    * streak's first observation, for the 2×(≥5s apart) ui_changed debounce. */
   unknown_count?: number;

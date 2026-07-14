@@ -14,6 +14,7 @@ const SOURCES: Source[] = [
   { label: "JSTOR", origin: "https://www.jstor.org/*" },
   { label: "ProQuest", origin: "https://www.proquest.com/*" },
   { label: "EBSCO", origin: "https://research.ebsco.com/*" },
+  { label: "Springer Nature Link", origin: "https://link.springer.com/*" },
 ];
 
 function render(list: HTMLUListElement): void {
@@ -34,27 +35,36 @@ function render(list: HTMLUListElement): void {
     const status = document.createElement("span");
     status.className = "status";
     const button = document.createElement("button");
+    button.disabled = true;
     controls.append(status, document.createTextNode(" "), button);
 
     item.append(meta, controls);
     list.append(item);
 
-    const paint = (granted: boolean): void => {
+    let granted = false;
+    const paint = (next: boolean): void => {
+      granted = next;
       status.classList.toggle("granted", granted);
       status.classList.toggle("revoked", !granted);
       status.textContent = granted ? "granted" : "not granted";
       button.textContent = granted ? "Revoke" : "Grant";
+      button.disabled = false;
     };
 
     void chrome.permissions.contains({ origins: [source.origin] }).then(paint);
 
     button.addEventListener("click", () => {
-      void chrome.permissions.contains({ origins: [source.origin] }).then(async (granted) => {
-        const ok = granted
-          ? await chrome.permissions.remove({ origins: [source.origin] })
-          : await chrome.permissions.request({ origins: [source.origin] });
-        if (ok) paint(!granted);
-      });
+      // permissions.request must be invoked directly in the trusted click
+      // callback. Awaiting contains() first loses Chrome's user gesture.
+      const wasGranted = granted;
+      button.disabled = true;
+      const change = wasGranted
+        ? chrome.permissions.remove({ origins: [source.origin] })
+        : chrome.permissions.request({ origins: [source.origin] });
+      void change.then(
+        (ok) => paint(ok ? !wasGranted : wasGranted),
+        () => paint(wasGranted),
+      );
     });
   }
 }

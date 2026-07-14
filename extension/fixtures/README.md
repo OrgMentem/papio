@@ -10,11 +10,15 @@ harness (`test/harness.ts`).
 fixtures/<provider>/<scenario>.html
 ```
 
-- `<provider>` matches an `AdapterSpec.id` (e.g. `proquest`, `jstor`, `ebsco`).
-- `<scenario>` is one of the six required states per provider:
-  `article`, `login`, `terms`, `no_entitlement`, `wrong_work`, `selector_drift`.
+- `<provider>` matches an `AdapterSpec.id` (for example `proquest`, `jstor`,
+  `ebsco`, or `springer`).
+- `<scenario>` is one of the capture registry's six states: `success`,
+  `login-return`, `terms`, `no-entitlement`, `wrong-work`, or `drift`.
 
-Each new provider requires all six before it can be enabled (plan Phase 3).
+An enabled provider requires fixtures for every state observed live plus a
+deliberate selector-drift failure. States that cannot be reached safely or do
+not exist for that provider remain assisted rather than being fabricated as
+automatable.
 
 ## File format
 
@@ -22,7 +26,7 @@ A fixture is one HTML file: line 1 is a `papio-fixture` header comment, then a
 newline, then the full **sanitized** document HTML.
 
 ```html
-<!-- papio-fixture provider="proquest" scenario="article" origin="https://www.proquest.com/pqdweb" captured="2026-07-14T12:34:56Z" -->
+<!-- papio-fixture provider="proquest" scenario="success" origin="https://www.proquest.com/pqdweb" captured="2026-07-14T12:34:56Z" -->
 <!DOCTYPE html>
 <html>…</html>
 ```
@@ -47,19 +51,19 @@ so a stray capture never lands directly in the source tree. To use a capture as
 a test fixture, review it and move it here:
 
 ```
-mv ~/Downloads/papio-fixtures/proquest/article.html \
-   extension/fixtures/proquest/article.html
+mv ~/Downloads/papio-fixtures/proquest/success.html \
+   extension/fixtures/proquest/success.html
 ```
 
 The header / newline / sanitized-HTML shape is unchanged by the move.
 
-## Skip-when-missing
+## Coverage and missing states
 
-No real fixtures are committed yet — they are captured per provider during
-Phase 3. `test/harness.ts#loadFixture` returns `null` when a file is absent, and
-fixture-backed tests gate on it with `test.skipIf(doc === null)(…)`, so the
-suite stays green before any capture exists. A committed fixture immediately
-activates its test.
+Committed live-sanitized fixtures activate their corresponding tests
+immediately. `test/harness.ts#loadFixture` returns `null` when a provider state
+was not safely reachable, and that state remains assisted. Every enabled
+provider also carries a deterministic drift fixture so selector changes fail
+closed instead of initiating a guessed download.
 
 ## Privacy
 

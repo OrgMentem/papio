@@ -79,6 +79,15 @@ test("residual guard ignores framework tag and attribute names", () => {
   expect(residualLeak(clean)).toBeNull();
 
 });
+test("semantic provider test hooks remain usable as selector evidence", () => {
+  const out = sanitizeFixture(
+    `<button data-auto="card-call-to-action-download-button">Download</button>`,
+    META,
+  );
+  expect(out).toContain(`data-auto="card-call-to-action-download-button"`);
+  expect(residualLeak(out)).toBeNull();
+});
+
 
 test("opaque selector identifiers are masked instead of becoming adapter dependencies", () => {
   const out = sanitizeFixture(`<div id="56ec3ea3-966b-4a98-9584-f8f51fe6f1d0">x</div>`, META);
@@ -111,10 +120,14 @@ test("meta tags carrying a token-shaped content are dropped", () => {
   expect(out).toContain("<title>ok</title>");
 });
 
-test("class/id selectors stay verbatim", () => {
-  const out = sanitizeFixture(`<div class="login-form panel" id="main">hi</div>`, META);
-  expect(out).toContain(`class="login-form panel"`);
+test("class/id selectors and explicit provider test hooks stay verbatim", () => {
+  const out = sanitizeFixture(
+    `<a class="download-link" id="main" data-test="pdf-link">Download</a>`,
+    META,
+  );
+  expect(out).toContain(`class="download-link"`);
   expect(out).toContain(`id="main"`);
+  expect(out).toContain(`data-test="pdf-link"`);
 });
 
 test("the papio-fixture header is the first line and exactly formatted", () => {
@@ -185,20 +198,23 @@ test("capture downloads sanitized HTML at the versioned fixture path", async () 
   expect(decoded.startsWith("<!-- papio-fixture ")).toBe(true);
 });
 
-test("capture refuses to write a fixture that still carries a token", async () => {
-  // The header is added after HTML sanitization. A token-shaped path there
-  // must still trip the final fail-closed guard.
-  const dirty: PageCapture = {
-    html: `<div class="${TOKEN}">x</div>`,
+test("capture masks a token-shaped provider path before writing", async () => {
+  const dynamicPath: PageCapture = {
+    html: `<div class="record-details">x</div>`,
     origin: "https://www.jstor.org",
     path: `/stable/${TOKEN}`,
   };
-  const { api, downloads } = fakeChrome(dirty);
+  const { api, downloads } = fakeChrome(dynamicPath);
   const result = await captureFixture(api, "jstor", "drift", FIXED_NOW);
 
-  expect(result.ok).toBe(false);
-  if (!result.ok) expect(result.error).toContain("dirty fixture");
-  expect(downloads).toHaveLength(0);
+  expect(result.ok).toBe(true);
+  expect(downloads).toHaveLength(1);
+  const encoded = downloads[0]?.url.split(",", 2)[1];
+  expect(encoded).toBeDefined();
+  const decoded = decodeURIComponent(encoded ?? "");
+  expect(decoded).not.toContain(TOKEN);
+  expect(decoded).toContain(`origin="https://www.jstor.org/TOKEN"`);
+  expect(residualLeak(decoded)).toBeNull();
 });
 
 test("capture fails closed on a missing active tab", async () => {

@@ -19,7 +19,8 @@
   "optional_host_permissions": [
     "https://www.jstor.org/*",
     "https://www.proquest.com/*",
-    "https://research.ebsco.com/*"
+    "https://research.ebsco.com/*",
+    "https://link.springer.com/*"
   ],
   "options_page": "dist/options.html",
   "action": {

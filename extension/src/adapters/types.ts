@@ -37,9 +37,12 @@ export interface DownloadRule {
    * selected control in its open shadow root). */
   method: "href" | "click";
   shadowSelector?: string;
-  /** For in-page gates, wait until this fixture-backed selector appears (or
-   * the bounded timeout elapses) before the background reclassifies. */
+  /** Wait for this fixture-backed in-page gate before reclassification. */
   postClickWaitFor?: string;
+  /** After the first click, wait for and click this one fixture-backed control
+   * (for provider-owned download modals; never terms/consent controls). */
+  followupSelector?: string;
+  /** Shared bounded wait for post-click gate/follow-up insertion. */
   postClickTimeoutMs?: number;
 }
 
@@ -49,6 +52,9 @@ export interface AdapterSpec {
   hosts: string[];
   /** Ordered rules; first match wins. */
   classify: ClassifyRule[];
+  /** On live SPA pages only, wait this long for a complete rule's declared
+   * selectors to hydrate before classifying. Fixture Documents stay synchronous. */
+  settleTimeoutMs?: number;
   download?: DownloadRule;
 }
 
@@ -66,7 +72,9 @@ export interface PageVerdict {
 
 /**
  * Classify a provider page against a declarative adapter spec. Pure and
- * DOM-only: no chrome.* usage, no network, no mutation.
+ * DOM-only: no chrome.* usage, no network, no mutation. A live SPA invocation
+ * may await declared rule selectors via MutationObserver before classification;
+ * fixture Documents classify synchronously.
  *
  * SERIALIZATION CONTRACT: this function must remain self-contained (no imports,
  * helpers, or closures referenced at runtime) so it survives
@@ -75,90 +83,149 @@ export interface PageVerdict {
  * arrives as `null` and we fall back to the page's global `document`; `spec`
  * and `ctx` are the JSON args. Tests pass a real happy-dom Document as `doc`.
  */
-export function interpret(doc: Document, spec: AdapterSpec, ctx: AdapterContext): PageVerdict {
+export function interpret(doc: Document, spec: AdapterSpec, ctx: AdapterContext): PageVerdict;
+export function interpret(doc: null, spec: AdapterSpec, ctx: AdapterContext): Promise<PageVerdict>;
+export function interpret(
+  doc: Document | null,
+  spec: AdapterSpec,
+  ctx: AdapterContext,
+): PageVerdict | Promise<PageVerdict> {
   const root: Document = doc ?? document;
-  const evidence: string[] = [];
-  const adapter_id = spec.id;
-  const adapter_version = spec.version;
+  const classify = (): PageVerdict => {
+    const evidence: string[] = [];
+    const adapter_id = spec.id;
+    const adapter_version = spec.version;
 
-  for (const rule of spec.classify) {
-    const hasAll = Array.isArray(rule.all) && rule.all.length > 0;
-    const hasAny = Array.isArray(rule.any) && rule.any.length > 0;
-    const hasText = Array.isArray(rule.textAny) && rule.textAny.length > 0;
-    // A rule with no conditions never matches: refuse a blanket fallback.
-    if (!hasAll && !hasAny && !hasText) continue;
+    for (const rule of spec.classify) {
+      const hasAll = Array.isArray(rule.all) && rule.all.length > 0;
+      const hasAny = Array.isArray(rule.any) && rule.any.length > 0;
+      const hasText = Array.isArray(rule.textAny) && rule.textAny.length > 0;
+      // A rule with no conditions never matches: refuse a blanket fallback.
+      if (!hasAll && !hasAny && !hasText) continue;
 
-    if (hasAll) {
-      let ok = true;
-      for (const sel of rule.all as string[]) {
-        if (root.querySelector(sel) === null) {
-          ok = false;
-          break;
+      if (hasAll) {
+        let ok = true;
+        for (const sel of rule.all as string[]) {
+          if (root.querySelector(sel) === null) {
+            ok = false;
+            break;
+          }
+        }
+        if (!ok) continue;
+      }
+      if (hasAny) {
+        let ok = false;
+        for (const sel of rule.any as string[]) {
+          if (root.querySelector(sel) !== null) {
+            ok = true;
+            break;
+          }
+        }
+        if (!ok) continue;
+      }
+      if (hasText) {
+        const body = root.body;
+        const bodyText = (body && body.innerText ? body.innerText : "").toLowerCase();
+        let ok = false;
+        for (const needle of rule.textAny as string[]) {
+          if (bodyText.indexOf(needle) !== -1) {
+            ok = true;
+            break;
+          }
+        }
+        if (!ok) continue;
+      }
+
+      evidence.push("rule:" + rule.kind + " matched");
+      if (rule.kind === "article") {
+        const expectedTitle = ctx.expected.title;
+        if (expectedTitle !== undefined && expectedTitle.length > 0) {
+          const parts: string[] = [];
+          const h1 = root.querySelector("h1");
+          if (h1 && h1.textContent) parts.push(h1.textContent);
+          const meta = root.querySelector('meta[name="citation_title"]');
+          const metaContent = meta ? meta.getAttribute("content") : null;
+          if (metaContent) parts.push(metaContent);
+          if (root.title) parts.push(root.title);
+          const haystack = parts.join(" ").toLowerCase();
+
+          const tokens = expectedTitle
+            .toLowerCase()
+            .split(/[^a-z0-9]+/)
+            .filter((t) => t.length > 3);
+          let present = 0;
+          for (const tok of tokens) {
+            if (haystack.indexOf(tok) !== -1) present++;
+          }
+          const ratio = tokens.length === 0 ? 1 : present / tokens.length;
+          if (ratio < 0.6) {
+            evidence.push("title-token-check failed");
+            return { kind: "wrong_work", adapter_id, adapter_version, evidence };
+          }
+          evidence.push("title-token-check passed");
         }
       }
-      if (!ok) continue;
+
+      return { kind: rule.kind, adapter_id, adapter_version, evidence };
     }
-    if (hasAny) {
-      let ok = false;
-      for (const sel of rule.any as string[]) {
-        if (root.querySelector(sel) !== null) {
-          ok = true;
-          break;
+
+    evidence.push("no rule matched");
+    return { kind: "unknown", adapter_id, adapter_version, evidence };
+  };
+
+  // Fixture interpretation is deterministic and synchronous. Only the
+  // serialized live invocation waits for React/custom-element hydration.
+  if (doc !== null) return classify();
+  const boundedMs = Math.max(0, Math.min(spec.settleTimeoutMs ?? 0, 5000));
+  if (boundedMs === 0 || root.documentElement === null) return Promise.resolve(classify());
+
+  const selectorsReady = (): boolean => {
+    for (const rule of spec.classify) {
+      const hasAll = Array.isArray(rule.all) && rule.all.length > 0;
+      const hasAny = Array.isArray(rule.any) && rule.any.length > 0;
+      if (!hasAll && !hasAny) continue;
+      let allReady = true;
+      if (hasAll) {
+        for (const selector of rule.all as string[]) {
+          if (root.querySelector(selector) === null) {
+            allReady = false;
+            break;
+          }
         }
       }
-      if (!ok) continue;
-    }
-    if (hasText) {
-      const body = root.body;
-      const bodyText = (body && body.innerText ? body.innerText : "").toLowerCase();
-      let ok = false;
-      for (const needle of rule.textAny as string[]) {
-        if (bodyText.indexOf(needle) !== -1) {
-          ok = true;
-          break;
+      let anyReady = true;
+      if (hasAny) {
+        anyReady = false;
+        for (const selector of rule.any as string[]) {
+          if (root.querySelector(selector) !== null) {
+            anyReady = true;
+            break;
+          }
         }
       }
-      if (!ok) continue;
+      if (allReady && anyReady) return true;
     }
+    return false;
+  };
+  if (selectorsReady()) return Promise.resolve(classify());
 
-    // Rule matched.
-    evidence.push("rule:" + rule.kind + " matched");
-
-    if (rule.kind === "article") {
-      const expectedTitle = ctx.expected.title;
-      if (expectedTitle !== undefined && expectedTitle.length > 0) {
-        // Gather the page's own title signal: h1, citation_title meta, <title>.
-        const parts: string[] = [];
-        const h1 = root.querySelector("h1");
-        if (h1 && h1.textContent) parts.push(h1.textContent);
-        const meta = root.querySelector('meta[name="citation_title"]');
-        const metaContent = meta ? meta.getAttribute("content") : null;
-        if (metaContent) parts.push(metaContent);
-        if (root.title) parts.push(root.title);
-        const haystack = parts.join(" ").toLowerCase();
-
-        const tokens = expectedTitle
-          .toLowerCase()
-          .split(/[^a-z0-9]+/)
-          .filter((t) => t.length > 3);
-        let present = 0;
-        for (const tok of tokens) {
-          if (haystack.indexOf(tok) !== -1) present++;
-        }
-        const ratio = tokens.length === 0 ? 1 : present / tokens.length;
-        if (ratio < 0.6) {
-          evidence.push("title-token-check failed");
-          return { kind: "wrong_work", adapter_id, adapter_version, evidence };
-        }
-        evidence.push("title-token-check passed");
-      }
-    }
-
-    return { kind: rule.kind, adapter_id, adapter_version, evidence };
-  }
-
-  evidence.push("no rule matched");
-  return { kind: "unknown", adapter_id, adapter_version, evidence };
+  return new Promise<void>((resolve) => {
+    let settled = false;
+    let observer: MutationObserver | null = null;
+    let timer: number | Timer | undefined;
+    const finish = (): void => {
+      if (settled) return;
+      settled = true;
+      observer?.disconnect();
+      clearTimeout(timer);
+      resolve();
+    };
+    observer = new MutationObserver(() => {
+      if (selectorsReady()) finish();
+    });
+    observer.observe(root.documentElement, { childList: true, subtree: true, attributes: true });
+    timer = setTimeout(finish, boundedMs);
+  }).then(() => classify());
 }
 
 /**
@@ -220,6 +287,66 @@ export const adapters: AdapterSpec[] = [
       shadowSelector: "#button-element",
       postClickWaitFor: "mfe-download-pharos-modal.terms-and-conditions[open]",
       postClickTimeoutMs: 3000,
+    },
+  },
+  {
+    // Verified live 2026-07-14 against a Example University-authenticated EBSCOhost record
+    // and its provider-owned download-format modal (fixtures/ebsco/success.html).
+    id: "ebsco",
+    version: "0.1.0",
+    hosts: ["research.ebsco.com"],
+    settleTimeoutMs: 5000,
+    classify: [
+      {
+        kind: "article",
+        all: [
+          "meta[name='citation_title']",
+          "button[data-auto='card-call-to-action-download-button']",
+        ],
+      },
+      {
+        kind: "no_entitlement",
+        all: [
+          "meta[name='citation_title']",
+          "button[data-auto='card-call-to-action']",
+        ],
+      },
+    ],
+    download: {
+      selector: "button[data-auto='card-call-to-action-download-button']",
+      requireKind: "article",
+      method: "click",
+      followupSelector: "button[data-auto='bulk-download-modal-download-button']",
+      postClickTimeoutMs: 5000,
+    },
+  },
+  {
+    // Verified live 2026-07-14 against entitled and isolated no-entitlement
+    // Springer Nature Link article states (fixtures/springer/*.html).
+    id: "springer",
+    version: "0.1.0",
+    hosts: ["link.springer.com"],
+    settleTimeoutMs: 3000,
+    classify: [
+      {
+        kind: "article",
+        all: [
+          "meta[name='citation_title']",
+          "a[data-test='pdf-link'][href*='/content/pdf/']",
+        ],
+      },
+      {
+        kind: "no_entitlement",
+        all: [
+          "meta[name='citation_title']",
+          "[data-test='access-article']",
+        ],
+      },
+    ],
+    download: {
+      selector: "a[data-test='pdf-link'][href*='/content/pdf/']",
+      requireKind: "article",
+      method: "href",
     },
   },
 ];

@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -201,6 +202,9 @@ func TestHandoffJobOfferedExactlyOncePerHelloSession(t *testing.T) {
 	}
 	if p.AccessMode != cfg.AccessMode {
 		t.Fatalf("access_mode = %q", p.AccessMode)
+	}
+	if !slices.Contains(p.ProviderHosts, "springer.com") {
+		t.Fatalf("provider_hosts = %v, missing springer.com", p.ProviderHosts)
 	}
 	if _, err := time.Parse(time.RFC3339, p.ExpiresAt); err != nil {
 		t.Fatalf("expires_at not RFC3339: %q (%v)", p.ExpiresAt, err)
