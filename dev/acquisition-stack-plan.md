@@ -703,11 +703,16 @@ None of these weaken the first-release access or validation invariants.
 - Fail-closed boundaries preserved: the override never bypasses explicit `IdentityReject` (wrong work still rejects) or encrypted/active-content review; only the semantic/identity-review class is human-acceptable. Override-accepted artifacts persist `IdentityResult: "user_confirmed"` — never a fake machine `pass` — and bundle export propagates exactly `pass` or `user_confirmed` into `validation.identity`, which the locked acquisition-bundle/1 schema already enumerated.
 - Live proof (job `job_085b4e24d359be916f95b859d7`): re-acquired Goodhart parked `needs_review`; the quarantined PDF was human-verified via the action-detail path; `actions resolve --accept` resumed the job to `ready` in ~4 s with `human_identity_override` in the durable transition event; bundle carried `validation.identity: "user_confirmed"`; `zplan_f2d8e33f3d378664128dc1d1df` applied attachment `AEINSTXE` under parent `KFYKPBV9`, which then left the live missing-PDF queue.
 
+## Human-action hygiene and extension signing key (2026-07-14)
+
+- Field-found: `actions list` had accumulated 76 open rows — cancelled jobs kept their open actions forever, and a re-parking job (the JSTOR terms loop) inserted a duplicate open action per outcome frame (38 `manual_download` rows on one historical job). Fixed threefold: `Cancel` now atomically cancels every open action for the job inside the same transaction; `CloseStaleHumanActions` cancels open actions whose job is terminal (ready/unavailable/failed/cancelled) and runs after `RecoverStale` on the scheduler cadence, non-fatal on error; `OpenHumanAction` refreshes and returns an existing open action of the same job+kind instead of inserting a duplicate. Live verification: one daemon restart swept 76 open actions down to exactly the 4 legitimately parked `awaiting_human` handoffs.
+- Extension signing key generated and preserved outside the repo at `~/.config/papio/keys/extension-signing-key.pem` (0600, dir 0700) with `manifest-key.b64` and `extension-id.txt` beside it. The packed/pinned extension ID derives to `kohckgcldfkmpechemfhlbjdidgijiff`. Re-pin procedure (deliberately NOT applied while live handoffs are parked on the unpacked dev ID `ehhfplhmddankkocjpldplaokajlbmah`): add the `manifest-key.b64` value as `"key"` in `extension/manifest.json`, set `[browser] extension_id = "kohckgcldfkmpechemfhlbjdidgijiff"` in the papio config, rerun `papio native-host install`, and reload the extension in Chrome.
+
 ### Open items
 
 - JSTOR, EBSCO Hanlet, and Springer Leventhal supervised live acceptances remain pending (the three shortlisted trust-paper DOIs are queued and parked `awaiting_human` at the institutional handoff: `10.1145/3698061.3726907`, `10.1145/3715070.3749256`, `10.3390/jtaer21050153` — both publishers block non-browser fetch with HTTP 403, so they resume in the user's Chrome).
-- The Web Store signing key and packed extension-ID re-pin remain deferred.
+- The packed extension-ID re-pin (key already generated/preserved) is deferred until the parked handoffs are cleared.
 
 ## Next
 
-Phase 5 hardening/release, complete the JSTOR, EBSCO Hanlet, and Springer Leventhal supervised live acceptances, and generate/preserve the Web Store signing key with packed extension-ID re-pin.
+Phase 5 hardening/release, complete the JSTOR, EBSCO Hanlet, and Springer Leventhal supervised live acceptances, and re-pin the packed extension ID once the parked handoffs are cleared.
