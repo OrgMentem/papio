@@ -724,6 +724,30 @@ None of these weaken the first-release access or validation invariants.
 - JSTOR, EBSCO Hanlet, and Springer Leventhal supervised live acceptances remain pending (the three shortlisted trust-paper DOIs are queued and parked `awaiting_human` at the institutional handoff: `10.1145/3698061.3726907`, `10.1145/3715070.3749256`, `10.3390/jtaer21050153` — both publishers block non-browser fetch with HTTP 403, so they resume in the user's Chrome).
 - The packed extension-ID re-pin (key already generated/preserved) is deferred until the parked handoffs are cleared.
 
+## Discovery and autonomy overhaul (2026-07-14, shipped)
+
+Reframe (user direction): getting a PDF the human already clicked into Zotero was never the bottleneck — the Zotero connector did that. Papio's value is **autonomous acquisition**: an AI agent asks for papers on a topic and papio searches, procures ~20 in parallel, imports them, and keeps the institutional session warm so a whole research session costs one SSO login. Design locked this session:
+
+- **Discovery** (`internal/discovery`): OpenAlex works-search (free, keyless, best topic relevance + OA links + citation counts) behind `papio search` / RPC `discovery.search` / MCP `papio_search`. Returns `DiscoveredWork` = `work.Work` + OpenAlexID/IsOA/OAURL/CitedBy/Abstract. Composable, not monolithic: search output pipes into acquire.
+- **Batch acquisition**: `papio acquire --batch file.jsonl|-` fans out client-side over the existing acquire RPC (WorkRequest v1 stays frozen), accepts bare works or DiscoveredWork envelopes, deterministic per-identifier request-ids for idempotent re-runs, ≤50 per batch.
+- **Auto-import**: internal job-policy flag `auto_import` (+ `[zotio] auto_import` config default): a job reaching `ready` triggers the daemon-side zotio plan+apply automatically — non-fatal on error, duplicate-safe via the existing no-op path, exactly-once via the exports ledger. Agent flow becomes fire-and-forget: OA papers land in Zotero with zero human involvement.
+- **Session keepalive** (extension-local, no protocol change): while non-terminal handoff jobs exist, a pinned muted resolver tab reloads on an interval (default 4 min, Example University-tuned); IdP-redirect detection pauses keepalive, surfaces the tab + badge for exactly one re-login, then resumes. One login per research session.
+- **Adapter flywheel** (`observe.ts`): tracked handoff tabs that land post-SSO on a verified provider host but classify `unknown` are auto-captured through the existing sanitize/fail-closed pipeline into `~/Downloads/papio-fixtures/observed/<host>/`, rate-limited (1/host/hour, 5/day). Every assisted session generates the fixture material for its own future adapter — adapter coverage stops depending on manual captures.
+- **Popup redesign**: batch-first — "needs you" queue with Focus buttons, in-flight, imported/failed sections with counts.
+- Capture registry + optional host permissions + options grants + daemon verified hosts extended ahead of adapters: elsevier/sciencedirect, acm, wiley, tandfonline, sage, psycnet.
+- Elsevier note: the ScienceDirect TDM API (institutional API key from dev.elsevier.com) is the eventual zero-browser path for Elsevier; browser adapter ships first because it needs no key issuance.
+
+### Execution record and live acceptance (2026-07-14)
+
+- Shipped in `4afd83a` (Go core), `6f43e07` (extension UX), `5bad0af` (batch-safety fixes), zotio `5143fc8`.
+- Live end-to-end acceptance: `papio search "trust in AI advice reliance on algorithmic recommendations" --limit 20 --json` returned 20 relevant OA-flagged works in 3.8 s; `papio acquire --batch /tmp/search-results.json --auto-import` created 20 jobs in 70 ms; **11 reached ready and all 11 were imported into Zotero autonomously** (7 clean on the first pass, 4 recovered through the batch-safety fixes below); the rest parked `awaiting_human` for one warm-SSO browser pass, each carrying auto-import so completion is hands-free after the download.
+- The first batch live-surfaced four defects, all fixed with regression tests the same session:
+  1. Concurrent PlanAndApply races on near-simultaneous ready jobs — auto-imports now serialize (concurrency 1, one 2 s context-aware retry).
+  2. Abandoned NULL `zotio_apply` reservations wedged plans forever — now reclaimed atomically.
+  3. Recorded FAILED apply results replayed as terminal — failures are now retryable, successes stay immutable.
+  4. Plan-time manifests were pinned by the ledger, so zotio binary fixes never reached existing plans (live: an `itemType: document` + `publicationTitle` manifest kept failing after the zotio fix shipped) — a failed apply now purges the plan's cached derivation so the next plan re-resolves with current binaries. Companion zotio fix `5143fc8` routes container titles per item type (proceedingsTitle/bookTitle/Extra) instead of failing whole imports.
+- Extension 0.2.0 batch surfaces deployed the same night: keepalive, observe flywheel, batch popup; worker connected and recovered autonomously across every daemon restart involved.
+
 ## Next
 
-Phase 5 hardening/release, complete the JSTOR, EBSCO Hanlet, and Springer Leventhal supervised live acceptances, and re-pin the packed extension ID once the parked handoffs are cleared.
+Build Elsevier + ACM adapters from the observe-flywheel captures (the parked handoff tabs auto-capture on their next post-SSO landing); complete the JSTOR/EBSCO/Springer supervised live acceptances and clear the parked handoff queue in one warm-SSO browser pass; re-pin the packed extension ID; then Phase 5 hardening/release. Elsevier TDM API key (dev.elsevier.com) remains the zero-browser endgame for ScienceDirect.
