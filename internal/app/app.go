@@ -191,8 +191,7 @@ func (s *Service) Process(ctx context.Context, row *job.Row) error {
 			return s.Jobs.Transition(ctx, row.ID, job.StateResolving, job.StateRetryWait,
 				map[string]any{"reason": "resolver_temporarily_unavailable"}, job.WithRetryAt(retryAt))
 		}
-		return s.Jobs.Transition(ctx, row.ID, job.StateResolving, job.StateUnavailable,
-			map[string]any{"reason": "no_legal_candidates"}, job.WithTerminalReason("no legal candidates"))
+		return s.exhaustedCandidates(ctx, row, job.StateResolving, "no_legal_candidates", "no legal candidates")
 	}
 
 	if err := s.Jobs.Transition(ctx, row.ID, job.StateResolving, job.StateFetching,
@@ -406,17 +405,18 @@ func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[st
 		return s.Jobs.Transition(ctx, row.ID, job.StateFetching, job.StateRetryWait,
 			map[string]any{"reason": "candidate_temporarily_unavailable"}, job.WithRetryAt(retryAt))
 	}
-	return s.exhaustedCandidates(ctx, row)
+	return s.exhaustedCandidates(ctx, row, job.StateFetching, "candidates_exhausted", "all candidates exhausted")
 }
 
-// exhaustedCandidates handles the terminal "candidates_exhausted" boundary when
-// no legitimate direct candidate produced an artifact. With an OpenURL base
-// configured, assisted/maximal jobs route to the visible institutional handoff
-// (parked in awaiting_human with an open openurl_handoff action) instead of
-// failing; conservative mode records that the institutional option exists but
-// deliberately does not open it, then ends the job unavailable as before. The
-// handoff detail is a static, redacted note: no signed query ever appears here.
-func (s *Service) exhaustedCandidates(ctx context.Context, row *job.Row) error {
+// exhaustedCandidates handles the terminal "no direct candidate" boundary —
+// either resolving produced zero legal candidates or fetching exhausted them
+// all without an artifact. With an OpenURL base configured, assisted/maximal
+// jobs route to the visible institutional handoff (parked in awaiting_human
+// with an open openurl_handoff action) instead of failing; conservative mode
+// records that the institutional option exists but deliberately does not open
+// it, then ends the job unavailable as before. The handoff detail is a static,
+// redacted note: no signed query ever appears here.
+func (s *Service) exhaustedCandidates(ctx context.Context, row *job.Row, from, reason, terminal string) error {
 	mode := s.Config.AccessMode
 	if s.Config.Browser.OpenURLBase != "" {
 		switch mode {
@@ -425,17 +425,17 @@ func (s *Service) exhaustedCandidates(ctx context.Context, row *job.Row) error {
 				"open-access candidates exhausted; institutional OpenURL handoff available in your browser"); err != nil {
 				return err
 			}
-			return s.Jobs.Transition(ctx, row.ID, job.StateFetching, job.StateAwaitingHuman,
+			return s.Jobs.Transition(ctx, row.ID, from, job.StateAwaitingHuman,
 				map[string]any{"reason": "institutional_handoff"})
 		case config.ModeConservative:
 			if _, err := s.Jobs.OpenHumanAction(ctx, row.ID, "openurl_available",
-				"open-access candidates exhausted; institutional OpenURL available but not opened in conservative mode"); err != nil {
+				"no direct candidates; institutional OpenURL available but not opened in conservative mode"); err != nil {
 				return err
 			}
 		}
 	}
-	return s.Jobs.Transition(ctx, row.ID, job.StateFetching, job.StateUnavailable,
-		map[string]any{"reason": "candidates_exhausted"}, job.WithTerminalReason("all candidates exhausted"))
+	return s.Jobs.Transition(ctx, row.ID, from, job.StateUnavailable,
+		map[string]any{"reason": reason}, job.WithTerminalReason(terminal))
 }
 
 func (s *Service) validateCandidate(ctx context.Context, row *job.Row, stored *job.Candidate, result fetch.Result) (accepted, parked bool, err error) {

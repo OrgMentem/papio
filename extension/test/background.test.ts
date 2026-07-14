@@ -48,6 +48,11 @@ class FakePort implements NativePort {
   async inbound(msg: unknown): Promise<void> {
     await this.onMessage.emit(msg);
   }
+  /** Simulate unplanned port death (daemon restart) — Chrome fires
+   * onDisconnect without the extension calling disconnect(). */
+  async emitDisconnect(): Promise<void> {
+    await this.onDisconnect.emit();
+  }
 }
 
 class FakeBackend implements StateBackend {
@@ -108,6 +113,7 @@ interface Harness {
   tabs: FakeTabs;
   downloads: FakeDownloads;
   clock: { now: number };
+  timers: { fn: () => void; ms: number }[];
   frames(): BrowserMessage[];
   postedStrings(): string[];
 }
@@ -119,11 +125,15 @@ function makeHarness(seed?: StoreShape): Harness {
   const tabs = new FakeTabs();
   const downloads = new FakeDownloads();
   const clock = { now: 1_700_000_000_000 };
+  const timers: { fn: () => void; ms: number }[] = [];
   const deps: BridgeDeps = {
     connectNative: () => port,
     manifestVersion: "0.1.0",
     randomUUID: () => crypto.randomUUID(),
     now: () => clock.now,
+    setTimeout: (fn, ms) => {
+      timers.push({ fn, ms });
+    },
     backend,
     tabs,
     downloads,
@@ -142,6 +152,7 @@ function makeHarness(seed?: StoreShape): Harness {
     tabs,
     downloads,
     clock,
+    timers,
     frames: () => port.posted.map(parseBrowserMessage),
     postedStrings: () => port.posted.map((f) => JSON.stringify(f)),
   };
@@ -336,4 +347,25 @@ test("restart recovery re-hellos and does not duplicate a live tab", async () =>
   expect(h.tabs.created.length).toBe(0);
   const accept = h.frames().find((f) => f.type === "job_accept");
   expect(accept?.job_id).toBe("job_0006_restart");
+});
+
+test("unplanned port death reconnects with backoff; deliberate disconnect stays down", async () => {
+  // Unplanned: daemon restarted -> onDisconnect without a protocol error.
+  const h = makeHarness();
+  await h.bridge.start();
+  const hellosBefore = h.frames().filter((f) => f.type === "hello").length;
+  await h.port.emitDisconnect();
+  expect(h.timers.length).toBe(1);
+  expect(h.timers[0]?.ms).toBe(1000);
+  h.timers[0]?.fn();
+  const hellosAfter = h.frames().filter((f) => f.type === "hello").length;
+  expect(hellosAfter).toBe(hellosBefore + 1); // re-hello on reconnect
+
+  // Deliberate: malformed frame -> fail-closed disconnect, no timer scheduled.
+  const bad = makeHarness();
+  await bad.bridge.start();
+  const timersBefore = bad.timers.length;
+  await bad.port.inbound({ protocol: "papio-browser/0.1", type: "not_a_type", msg_id: "x", seq: 0, payload: {} });
+  expect(bad.port.disconnected).toBe(true);
+  expect(bad.timers.length).toBe(timersBefore);
 });

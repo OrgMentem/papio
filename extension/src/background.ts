@@ -90,6 +90,8 @@ export interface BridgeDeps {
   manifestVersion: string;
   randomUUID(): string;
   now(): number;
+  /** Injectable timer so tests control reconnect backoff. */
+  setTimeout(fn: () => void, ms: number): void;
   backend: StateBackend;
   tabs: {
     create(props: { url: string; active: boolean }): Promise<TabInfo>;
@@ -236,15 +238,34 @@ export class Bridge {
     });
   }
 
+  /** Consecutive unplanned disconnects; resets on a healthy inbound frame. */
+  private reconnectAttempts = 0;
+  /** Set while disconnect() runs so the onDisconnect listener knows the
+   * teardown was deliberate (protocol error / shutdown): deliberate
+   * disconnects must NOT auto-reconnect — fail closed stays failed. */
+  private closingDeliberately = false;
+
   private connect(): void {
     const port = this.deps.connectNative(NATIVE_HOST);
     this.port = port;
     this.seq = 0;
     port.onMessage.addListener((msg) => {
+      this.reconnectAttempts = 0;
       return this.onInbound(msg);
     });
     port.onDisconnect.addListener(() => {
       this.port = null;
+      if (this.closingDeliberately) return;
+      // Unplanned port death (daemon restart, host exit, Chrome nap): the
+      // daemon owns all durable state, so reconnect + re-hello is always
+      // safe. Bounded exponential backoff, capped at 60s, gives up after
+      // 8 attempts until the next user-visible event restarts the cycle.
+      if (this.reconnectAttempts >= 8) return;
+      const delay = Math.min(60_000, 1_000 * 2 ** this.reconnectAttempts);
+      this.reconnectAttempts += 1;
+      this.deps.setTimeout(() => {
+        if (this.port === null && !this.closingDeliberately) this.connect();
+      }, delay);
     });
     // hello is the mandatory first frame after connect (seq 0).
     const adapterVersions: Record<string, string> = {};
@@ -256,6 +277,7 @@ export class Bridge {
   }
 
   private disconnect(): void {
+    this.closingDeliberately = true;
     const port = this.port;
     this.port = null;
     if (!port) return;
@@ -656,6 +678,9 @@ function realDeps(): BridgeDeps {
     manifestVersion: chrome.runtime.getManifest().version,
     randomUUID: () => crypto.randomUUID(),
     now: () => Date.now(),
+    setTimeout: (fn, ms) => {
+      setTimeout(fn, ms);
+    },
     backend: chromeBackend(chrome.storage),
     tabs: {
       create: (props) => chrome.tabs.create(props),

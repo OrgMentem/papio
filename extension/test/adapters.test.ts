@@ -306,6 +306,7 @@ function makeMapHarness(specs: AdapterSpec[] = [SPEC]): MapHarness {
     manifestVersion: "0.1.0",
     randomUUID: () => crypto.randomUUID(),
     now: () => clock.now,
+    setTimeout: () => {},
     backend,
     tabs,
     downloads: new FakeDownloads(),
