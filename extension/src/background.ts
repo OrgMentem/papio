@@ -919,6 +919,13 @@ function realDeps(): BridgeDeps {
 // Wiring runs only inside a real extension service worker, never under bun test.
 if (typeof chrome !== "undefined" && chrome.runtime?.id) {
   const bridge = new Bridge(realDeps());
+  // Top-level registrations give Chrome a reason to start this worker at
+  // browser launch and after install/update. Without them a cold-started
+  // Chrome leaves the worker dead (and the daemon unreachable) until an
+  // unrelated tab or download event happens to fire. bridge.start() already
+  // ran at module top level by then; the callbacks need no body.
+  chrome.runtime.onStartup.addListener(() => {});
+  chrome.runtime.onInstalled.addListener(() => {});
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (isCancelRequest(message)) {
       void bridge.requestCancel(message.job_id).then(() => sendResponse({ ok: true }));
