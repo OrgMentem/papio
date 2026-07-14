@@ -10,6 +10,7 @@ import {
   captureFixture,
   MAX_CAPTURE_BYTES,
   sanitizeFixture,
+  residualLeak,
   type ChromeCaptureApi,
   type FixtureMeta,
   type PageCapture,
@@ -59,11 +60,48 @@ test("input values and value attributes are blanked", () => {
   expect(out).toContain(`name="pw"`); // structural attrs survive
 });
 
+test("inline styles are blanked because they are not selector evidence", () => {
+  const out = sanitizeFixture(
+    `<html style="--viewer-container-height: 1070px"><div style="background:url(${TOKEN})">x</div></html>`,
+    META,
+  );
+  expect(out).toContain(`<html style="">`);
+  expect(out).toContain(`<div style="">x</div>`);
+  expect(out).not.toContain("--viewer-container-height");
+  expect(out).not.toContain(TOKEN);
+});
+
+test("residual guard ignores framework tag and attribute names", () => {
+  const clean = sanitizeFixture(
+    `<mfe-content-details-pharos-button data-sveltekit-preload-data="off" id="mfeSupportChatMountPoint" class="value-propositions__icon">ok</mfe-content-details-pharos-button>`,
+    META,
+  );
+  expect(residualLeak(clean)).toBeNull();
+
+});
+
+test("opaque selector identifiers are masked instead of becoming adapter dependencies", () => {
+  const out = sanitizeFixture(`<div id="56ec3ea3-966b-4a98-9584-f8f51fe6f1d0">x</div>`, META);
+  expect(out).toContain(`id="TOKEN"`);
+  expect(out).not.toContain("56ec3ea3");
+  expect(residualLeak(out)).toBeNull();
+});
+
 test("token-shaped runs are masked in BOTH attributes and text", () => {
   const out = sanitizeFixture(`<span data-token="${TOKEN}">${TOKEN}</span>`, META);
   expect(out).toContain(`data-token="TOKEN"`);
   expect(out).toContain(`<span data-token="TOKEN">TOKEN</span>`);
   expect(out).not.toContain(TOKEN);
+});
+
+test("scrubbing a long comment body preserves its closing delimiter", () => {
+  const out = sanitizeFixture(
+    `<!--eslint-disable-next-line-vue/no-v-html--><mfe-content-details-pharos-button>ok</mfe-content-details-pharos-button><!--eslint-enable-->`,
+    META,
+  );
+  expect(out).toContain(`<!--TOKEN--><mfe-content-details-pharos-button>`);
+  expect(out).toContain(`</mfe-content-details-pharos-button><!--eslint-enable-->`);
+  expect(residualLeak(out)).toBeNull();
 });
 
 test("meta tags carrying a token-shaped content are dropped", () => {
@@ -148,12 +186,12 @@ test("capture downloads sanitized HTML at the versioned fixture path", async () 
 });
 
 test("capture refuses to write a fixture that still carries a token", async () => {
-  // A token-shaped run lodged in a structural class attr is NOT scrubbed, so the
-  // fail-closed residual check must catch it and abort before any download.
+  // The header is added after HTML sanitization. A token-shaped path there
+  // must still trip the final fail-closed guard.
   const dirty: PageCapture = {
     html: `<div class="${TOKEN}">x</div>`,
     origin: "https://www.jstor.org",
-    path: "/stable/1",
+    path: `/stable/${TOKEN}`,
   };
   const { api, downloads } = fakeChrome(dirty);
   const result = await captureFixture(api, "jstor", "drift", FIXED_NOW);

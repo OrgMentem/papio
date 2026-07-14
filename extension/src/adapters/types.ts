@@ -32,6 +32,14 @@ export interface ClassifyRule {
 export interface DownloadRule {
   selector: string;
   requireKind: "article";
+  /** `href` extracts an HTTPS anchor and uses chrome.downloads.download.
+   * `click` activates the explicitly selected element (or an explicitly
+   * selected control in its open shadow root). */
+  method: "href" | "click";
+  shadowSelector?: string;
+  /** Re-run classification after a click so an in-page terms/access modal is
+   * surfaced even though no tab navigation event fires. */
+  reclassifyAfterMs?: number;
 }
 
 export interface AdapterSpec {
@@ -175,6 +183,41 @@ export const adapters: AdapterSpec[] = [
     version: "0.1.0",
     hosts: ["proquest.com"],
     classify: [{ kind: "article", all: ["a[id^='downloadPDFLink_']", "h1"] }],
-    download: { selector: "a[id^='downloadPDFLink_']", requireKind: "article" },
+    download: {
+      selector: "a[id^='downloadPDFLink_']",
+      requireKind: "article",
+      method: "href",
+    },
+  },
+  {
+    // Verified live 2026-07-14 against Example University-authenticated and isolated
+    // logged-out JSTOR pages (fixtures/jstor/*.html). Terms is first because
+    // JSTOR overlays it on the still article-shaped page.
+    id: "jstor",
+    version: "0.1.0",
+    hosts: ["jstor.org"],
+    classify: [
+      {
+        kind: "terms",
+        all: ["mfe-download-pharos-modal.terms-and-conditions[open]"],
+        textAny: ["accept and download"],
+      },
+      {
+        kind: "login",
+        all: [".turnaway-access-option-content__title"],
+        textAny: ["log in through your school or library", "this is a preview. log in through your library"],
+      },
+      {
+        kind: "article",
+        all: ["mfe-download-pharos-button[data-qa='download-pdf'][data-doi]"],
+      },
+    ],
+    download: {
+      selector: "mfe-download-pharos-button[data-qa='download-pdf'][data-doi]",
+      requireKind: "article",
+      method: "click",
+      shadowSelector: "#button-element",
+      reclassifyAfterMs: 500,
+    },
   },
 ];

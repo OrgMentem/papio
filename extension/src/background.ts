@@ -192,6 +192,20 @@ function extractDownloadURL(selector: string): string | null {
   }
 }
 
+/** Self-contained declared click, optionally through one explicitly named
+ * control in an open shadow root. No selector guessing or fallback. */
+function clickDeclaredDownload(selector: string, shadowSelector?: string): boolean {
+  const host = document.querySelector(selector);
+  let target: Element | null = host;
+  if (shadowSelector !== undefined) {
+    if (!(host instanceof HTMLElement) || host.shadowRoot === null) return false;
+    target = host.shadowRoot.querySelector(shadowSelector);
+  }
+  if (!(target instanceof HTMLElement)) return false;
+  target.click();
+  return true;
+}
+
 export class Bridge {
   private port: NativePort | null = null;
   /** Signed provider URL -> job for the narrow interval between calling
@@ -553,6 +567,31 @@ export class Bridge {
     await this.applyVerdict(jobID, spec, verdict);
   }
 
+  private scheduleReclassification(jobID: string, delayMs: number): void {
+    this.deps.setTimeout(async () => {
+      try {
+        await this.reclassifyCurrentProviderPage(jobID);
+      } catch (e) {
+        console.error("papio: post-action adapter classification failed; staying assisted", e);
+      }
+    }, delayMs);
+  }
+
+  private async reclassifyCurrentProviderPage(jobID: string): Promise<void> {
+    const job = findByJob(this.store, jobID);
+    if (!job) return;
+    const tab = await this.deps.tabs.get(job.tab_id);
+    if (tab.url === undefined) return;
+    let host: string;
+    try {
+      host = new URL(tab.url).hostname;
+    } catch {
+      return;
+    }
+    if (!hostMatches(host, job.provider_hosts)) return;
+    await this.maybeClassify(jobID, host);
+  }
+
   /** Map a page verdict to a bridge action. See the safety contract: at most one
    * download initiation per job, ever; unknown only escalates after two spaced
    * observations; every other unknown keeps assisted behaviour. */
@@ -576,27 +615,39 @@ export class Bridge {
           // the verified page control manually.
           await this.update((s) => patchJob(s, jobID, { download_initiated: true }));
           try {
-            const links = await this.deps.scripting.executeScript({
-              target: { tabId: job.tab_id },
-              func: extractDownloadURL,
-              args: [dl.selector],
-            });
-            const href = links[0]?.result;
-            if (typeof href === "string" && href.startsWith("https://")) {
-              this.pendingDownloadURLs.set(href, jobID);
-              try {
-                const id = await this.deps.downloads.download({
-                  url: href,
-                  filename: `papio/${jobID}/paper.pdf`,
-                  conflictAction: "uniquify",
-                  saveAs: false,
-                });
-                // Correlate by Chrome's returned ID, not URL/referrer
-                // heuristics. onChanged can now complete even if onCreated
-                // raced the Promise.
-                this.downloads.set(jobID, { ids: new Set([id]), ambiguous: false });
-              } finally {
-                this.pendingDownloadURLs.delete(href);
+            if (dl.method === "click") {
+              const results = await this.deps.scripting.executeScript({
+                target: { tabId: job.tab_id },
+                func: clickDeclaredDownload,
+                args: [dl.selector, dl.shadowSelector],
+              });
+              const clicked = results[0]?.result === true;
+              if (clicked && dl.reclassifyAfterMs !== undefined) {
+                this.scheduleReclassification(jobID, dl.reclassifyAfterMs);
+              }
+            } else {
+              const links = await this.deps.scripting.executeScript({
+                target: { tabId: job.tab_id },
+                func: extractDownloadURL,
+                args: [dl.selector],
+              });
+              const href = links[0]?.result;
+              if (typeof href === "string" && href.startsWith("https://")) {
+                this.pendingDownloadURLs.set(href, jobID);
+                try {
+                  const id = await this.deps.downloads.download({
+                    url: href,
+                    filename: `papio/${jobID}/paper.pdf`,
+                    conflictAction: "uniquify",
+                    saveAs: false,
+                  });
+                  // Correlate by Chrome's returned ID, not URL/referrer
+                  // heuristics. onChanged can now complete even if onCreated
+                  // raced the Promise.
+                  this.downloads.set(jobID, { ids: new Set([id]), ambiguous: false });
+                } finally {
+                  this.pendingDownloadURLs.delete(href);
+                }
               }
             }
           } catch (e) {

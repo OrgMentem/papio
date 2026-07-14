@@ -38,7 +38,7 @@ const SPEC: AdapterSpec = {
     { kind: "wrong_work_check", all: ["[data-mismatch]"] },
     { kind: "article", all: ["a.download-pdf"] },
   ],
-  download: { selector: "a.download-pdf", requireKind: "article" },
+  download: { selector: "a.download-pdf", requireKind: "article", method: "href" },
 };
 
 const EXPECTED_TITLE = "Trust in Automation: Designing for Appropriate Reliance";
@@ -289,12 +289,15 @@ class FakeDownloads {
   }
 }
 
-// Fake chrome.scripting: interpret injections (3 args) return the queued
-// verdict; extractDownloadURL injection (1 arg) returns a signed provider URL.
+// Fake chrome.scripting: interpret injections (3 args) return queued verdicts;
+// extractDownloadURL (1 arg) returns a signed URL; declared click (2 args)
+// records the exact light/shadow selectors.
 class FakeScripting {
   verdict: PageVerdict | undefined;
+  readonly verdictQueue: PageVerdict[] = [];
   href = "https://media.proquest.com/media/signed?TOKEN=ephemeral";
   readonly extracted: { tabId: number; selector: string }[] = [];
+  readonly clicked: { tabId: number; selector: string; shadowSelector?: string }[] = [];
   readonly interpretTabs: number[] = [];
   async executeScript(inj: {
     target: { tabId: number };
@@ -306,8 +309,16 @@ class FakeScripting {
       this.extracted.push({ tabId: inj.target.tabId, selector: String(args[0]) });
       return [{ result: this.href }];
     }
+    if (args.length === 2) {
+      this.clicked.push({
+        tabId: inj.target.tabId,
+        selector: String(args[0]),
+        ...(typeof args[1] === "string" ? { shadowSelector: args[1] } : {}),
+      });
+      return [{ result: true }];
+    }
     this.interpretTabs.push(inj.target.tabId);
-    return [{ result: this.verdict }];
+    return [{ result: this.verdictQueue.shift() ?? this.verdict }];
   }
 }
 
@@ -333,6 +344,7 @@ interface MapHarness {
   downloads: FakeDownloads;
   permissions: FakePermissions;
   clock: { now: number };
+  runTimers(): Promise<void>;
   frames(): BrowserMessage[];
 }
 
@@ -344,12 +356,15 @@ function makeMapHarness(specs: AdapterSpec[] = [SPEC]): MapHarness {
   const permissions = new FakePermissions();
   const downloads = new FakeDownloads();
   const clock = { now: 1_700_000_000_000 };
+  const timers: (() => unknown)[] = [];
   const deps: BridgeDeps = {
     connectNative: () => port,
     manifestVersion: "0.1.0",
     randomUUID: () => crypto.randomUUID(),
     now: () => clock.now,
-    setTimeout: () => {},
+    setTimeout: (fn) => {
+      timers.push(fn);
+    },
     backend,
     tabs,
     downloads,
@@ -366,6 +381,12 @@ function makeMapHarness(specs: AdapterSpec[] = [SPEC]): MapHarness {
     downloads,
     permissions,
     clock,
+    runTimers: async () => {
+      while (timers.length > 0) {
+        const fn = timers.shift();
+        if (fn) await fn();
+      }
+    },
     frames: () => port.posted.map(parseBrowserMessage),
   };
 }
@@ -447,6 +468,43 @@ test("article verdict starts one browser-managed job-scoped download, no signed 
   expect(complete?.job_id).toBe("job_article_0001");
   expect(complete?.payload["filename"]).toBe("out.pdf");
   expect(complete?.payload["size_bytes"]).toBe(12345);
+});
+
+test("declared shadow click reclassifies an in-page terms gate", async () => {
+  const clickSpec: AdapterSpec = {
+    id: "jstor",
+    version: "0.1.0",
+    hosts: [PROVIDER],
+    classify: [{ kind: "article", all: ["mfe-download"] }],
+    download: {
+      selector: "mfe-download",
+      requireKind: "article",
+      method: "click",
+      shadowSelector: "#button-element",
+      reclassifyAfterMs: 500,
+    },
+  };
+  const h = makeMapHarness([clickSpec]);
+  h.scripting.verdictQueue.push(
+    { kind: "article", adapter_id: "jstor", adapter_version: "0.1.0", evidence: [] },
+    { kind: "terms", adapter_id: "jstor", adapter_version: "0.1.0", evidence: [] },
+  );
+  await h.bridge.start();
+  await h.port.inbound(offer("job_jstor_terms_0001"));
+  const tabID = await landOnProvider(h, "job_jstor_terms_0001");
+
+  expect(h.scripting.clicked).toEqual([
+    { tabId: tabID, selector: "mfe-download", shadowSelector: "#button-element" },
+  ]);
+  expect(h.frames().some((f) => f.type === "provider_outcome")).toBe(false);
+  expect(h.backend.store.activeJobs[0]?.download_initiated).toBe(true);
+
+  await h.runTimers();
+  const outcome = h.frames().find((f) => f.type === "provider_outcome");
+  expect(outcome?.payload["outcome"]).toBe("terms_acceptance_required");
+  expect(outcome?.payload["adapter_version"]).toBe("0.1.0");
+  expect(h.scripting.interpretTabs.length).toBe(2);
+  expect(h.downloads.started).toHaveLength(0);
 });
 
 test("filename steering also handles determination before the download ID returns", async () => {

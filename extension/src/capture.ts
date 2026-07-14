@@ -61,14 +61,25 @@ const EMPTIED_CONTENT = /(<(script|noscript|iframe|object|embed|style|textarea)\
 /** URL-bearing attributes: query string and fragment are removed from each. */
 const URL_ATTRS: Record<string, true> = { href: true, src: true, action: true, "data-src": true };
 
-/** Attribute names whose values are structural and must survive verbatim so
- * adapter selectors keep matching. Everything else is token-scrubbed. `aria-*`
- * is handled separately by prefix. */
-const STRUCTURAL_ATTRS: Record<string, true> = { class: true, id: true, name: true, rel: true, type: true, role: true, style: true };
+/** Attribute names whose static values are selector-bearing. Semantic CSS/BEM
+ * names survive, but opaque token-shaped runs inside them are masked so an
+ * adapter can never depend on a per-session UUID/hash. Inline style is excluded
+ * entirely; it carries no classifier signal. */
+const STRUCTURAL_ATTRS: Record<string, true> = { class: true, id: true, name: true, rel: true, type: true, role: true };
 
 /** Replace every token-shaped run with the literal `TOKEN`. */
 function scrubTokens(text: string): string {
   return text.replace(TOKEN_RE, "TOKEN");
+}
+
+function isSemanticSelectorToken(token: string): boolean {
+  const expanded = token.replace(/([a-z])([A-Z])/g, "$1-$2");
+  const words = expanded.split(/[-_]+/).filter(Boolean);
+  return words.length >= 2 && words.every((word) => /^[A-Za-z]{2,16}$/.test(word));
+}
+
+function scrubSelectorTokens(text: string): string {
+  return text.replace(TOKEN_RE, (token) => (isSemanticSelectorToken(token) ? token : "TOKEN"));
 }
 
 const ATTR_RE = /([-\w:]+)(\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+)))?/g;
@@ -138,15 +149,16 @@ function rewriteStartTag(raw: string): string {
 
     let value = a.value;
 
-    // Blank any form value so a typed credential never survives.
-    if (lname === "value" && isFormValue) {
+    // Blank form and inline-style values: neither can be an adapter selector,
+    // and both can carry user/session-specific content.
+    if ((lname === "value" && isFormValue) || lname === "style") {
       value = "";
     } else {
       if (URL_ATTRS[lname]) {
-              const cut = value.search(/[?#]/);
-              if (cut !== -1) value = value.slice(0, cut);
-            }
-      if (!STRUCTURAL_ATTRS[lname] && !lname.startsWith("aria-")) value = scrubTokens(value);
+        const cut = value.search(/[?#]/);
+        if (cut !== -1) value = value.slice(0, cut);
+      }
+      value = STRUCTURAL_ATTRS[lname] ? scrubSelectorTokens(value) : scrubTokens(value);
     }
 
     rendered.push(`${a.name}="${value}"`);
@@ -182,7 +194,10 @@ export function sanitizeFixture(html: string, meta: FixtureMeta): string {
     if (start > last) out += scrubTokens(emptied.slice(last, start));
 
     if (token.startsWith("<!--")) {
-      out += scrubTokens(token);
+      // Scrub only the comment body. Including the trailing `--` in a
+      // token-shaped match would destroy the `-->` delimiter and merge later
+      // markup into the comment.
+      out += `<!--${scrubTokens(token.slice(4, -3))}-->`;
     } else if (/^<\s*\//.test(token)) {
       out += token; // end tag: no attributes to touch
     } else if (/^<\s*[a-zA-Z]/.test(token)) {
@@ -207,16 +222,53 @@ export function fixtureHeader(meta: FixtureMeta): string {
 
 /**
  * Fail-closed residual-secret detector run on the *sanitized* output before it
- * is written. Returns a human-readable reason when the fixture is still dirty,
- * or `null` when it is safe to persist. Two independent checks:
- *  - a URL-bearing attribute that still carries a `?` query string;
- *  - any token-shaped run anywhere in the document.
+ * is written. Attribute/tag names are syntax, not values: modern provider
+ * frameworks legitimately use names such as `data-sveltekit-preload-data`,
+ * which must not be mistaken for credentials. Values, text, and comments
+ * remain guarded.
  */
 export function residualLeak(sanitized: string): string | null {
   const urlQuery = /(?:href|src|action|data-src)\s*=\s*"[^"]*\?[^"]*"/i.exec(sanitized);
   if (urlQuery) return "a href/src attribute still contains a query string";
-  const token = new RegExp(TOKEN_RE.source).exec(sanitized);
-  if (token) return `a token-shaped value survived sanitization (${token[0].slice(0, 8)}…)`;
+
+  const residual = (value: string, allowSemanticSelector = false): string | undefined => {
+    for (const match of value.matchAll(new RegExp(TOKEN_RE.source, "g"))) {
+      const token = match[0];
+      if (allowSemanticSelector && isSemanticSelectorToken(token)) continue;
+      return token;
+    }
+    return undefined;
+  };
+  let last = 0;
+  for (const m of sanitized.matchAll(TOKEN_STREAM)) {
+    const start = m.index;
+    const syntax = m[0];
+    const textToken = residual(sanitized.slice(last, start));
+    if (textToken) return `a token-shaped value survived sanitization (${textToken.slice(0, 8)}…)`;
+
+    if (syntax.startsWith("<!--")) {
+      const commentToken = residual(syntax.slice(4, -3));
+      if (commentToken) return `a token-shaped value survived sanitization (${commentToken.slice(0, 8)}…)`;
+    } else if (/^<\s*[a-zA-Z]/.test(syntax)) {
+      const head = /^<\s*[a-zA-Z][-\w]*/.exec(syntax);
+      const close = /\s*\/?>$/.exec(syntax);
+      if (head && close) {
+        const attrs = parseAttrs(syntax.slice(head[0].length, syntax.length - close[0].length));
+        for (const attr of attrs) {
+          if (!attr.hasValue) continue;
+          const lname = attr.name.toLowerCase();
+          const attrToken = residual(
+            attr.value,
+            lname === "class" || lname === "id" || lname === "name",
+          );
+          if (attrToken) return `a token-shaped value survived sanitization (${attrToken.slice(0, 8)}…)`;
+        }
+      }
+    }
+    last = start + syntax.length;
+  }
+  const tailToken = residual(sanitized.slice(last));
+  if (tailToken) return `a token-shaped value survived sanitization (${tailToken.slice(0, 8)}…)`;
   return null;
 }
 
