@@ -337,22 +337,80 @@ func TestDownloadForUnrelatedJobDoesNotAdoptAnotherJobsFile(t *testing.T) {
 	b, jobs, cfg, _ := newBridge(t)
 	ctx := context.Background()
 	target := park(t, jobs, "wr_target", handoffWork())
-	writeFixturePDF(t, filepath.Join(cfg.EffectiveAdoptionRoot(), target, "paper.pdf"))
 
 	// A different job, also parked, but with no download of its own.
 	other := park(t, jobs, "wr_other", handoffWork())
 	runSync(t, b, hello())
+	// Place target's file: the poll-time scan may legitimately adopt it for
+	// TARGET (its own directory) — never for `other`.
+	writeFixturePDF(t, filepath.Join(cfg.EffectiveAdoptionRoot(), target, "paper.pdf"))
 
 	// A download_complete correlated to `other` must not adopt target's file: it
-	// only ever looks under adoptions/<other>/, which is empty.
+	// only ever looks under adoptions/<other>/, which is empty. The miss is
+	// non-fatal: the bridge acks, records a deferral, and keeps `other` parked.
 	frame := inFrame(t, protocol.MsgDownloadComplete, other,
 		map[string]any{"download_id": 3, "filename": "paper.pdf", "size_bytes": 533})
-	if _, err := b.Sync(ctx, []json.RawMessage{frame}); err == nil {
-		t.Fatal("expected adoption error for job with no download dir")
+	msgs, _ := runSync(t, b, frame)
+	if firstOfType(msgs, protocol.MsgAck) == nil {
+		t.Fatalf("expected ack after deferred adoption: %v", msgs)
+	}
+	oRow, _ := jobs.Get(ctx, other)
+	if oRow.State != job.StateAwaitingHuman || oRow.ArtifactSHA256 != "" {
+		t.Fatalf("other job must stay parked: %+v", oRow)
+	}
+	events, _ := jobs.Events(ctx, other)
+	deferred := false
+	for _, e := range events {
+		if e["kind"] == "browser.adoption_deferred" {
+			deferred = true
+		}
+	}
+	if !deferred {
+		t.Fatal("missing browser.adoption_deferred event")
 	}
 	tRow, _ := jobs.Get(ctx, target)
-	if tRow.State != job.StateAwaitingHuman || tRow.ArtifactSHA256 != "" {
-		t.Fatalf("target job was disturbed: %+v", tRow)
+	if tRow.State == job.StateReady && tRow.ArtifactSHA256 == "" {
+		t.Fatalf("target adopted without artifact: %+v", tRow)
+	}
+	if tRow.State != job.StateReady && tRow.State != job.StateAwaitingHuman {
+		t.Fatalf("target in unexpected state: %+v", tRow)
+	}
+}
+
+func TestPollScanAdoptsSingleSettledFileAndDefersAmbiguity(t *testing.T) {
+	b, jobs, cfg, _ := newBridge(t)
+	ctx := context.Background()
+	single := park(t, jobs, "wr_scan_single", handoffWork())
+	ambig := park(t, jobs, "wr_scan_ambig", handoffWork())
+	partial := park(t, jobs, "wr_scan_partial", handoffWork())
+	root := cfg.EffectiveAdoptionRoot()
+	writeFixturePDF(t, filepath.Join(root, single, "paper.pdf"))
+	if err := os.WriteFile(filepath.Join(root, single, ".DS_Store"), []byte{0}, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeFixturePDF(t, filepath.Join(root, ambig, "a.pdf"))
+	writeFixturePDF(t, filepath.Join(root, ambig, "b.pdf"))
+	writeFixturePDF(t, filepath.Join(root, partial, "c.pdf"))
+	if err := os.WriteFile(filepath.Join(root, partial, "c.pdf.crdownload"), []byte{0}, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	runSync(t, b, hello())
+	if _, err := b.Sync(ctx, nil); err != nil { // poll triggers the scan
+		t.Fatal(err)
+	}
+
+	sRow, _ := jobs.Get(ctx, single)
+	if sRow.State != job.StateReady || sRow.ArtifactSHA256 == "" {
+		t.Fatalf("single settled file not adopted: %+v", sRow)
+	}
+	aRow, _ := jobs.Get(ctx, ambig)
+	if aRow.State != job.StateAwaitingHuman {
+		t.Fatalf("ambiguous dir must stay with the user: %+v", aRow)
+	}
+	pRow, _ := jobs.Get(ctx, partial)
+	if pRow.State != job.StateAwaitingHuman {
+		t.Fatalf("in-progress .crdownload must defer the scan: %+v", pRow)
 	}
 }
 
@@ -471,5 +529,23 @@ func TestOpenURLPMIDFallbackAndYear(t *testing.T) {
 	}
 	if q.Get("rft.date") != "2020" {
 		t.Fatalf("rft.date = %q", q.Get("rft.date"))
+	}
+}
+
+// SweepAdoptions adopts a settled file WITHOUT any hello/extension connection —
+// the daemon owns completion; the browser plane is only a delivery hint.
+func TestSweepAdoptionsAdoptsWithoutHello(t *testing.T) {
+	b, jobs, cfg, _ := newBridge(t)
+	ctx := context.Background()
+	id := park(t, jobs, "wr_sweep", handoffWork())
+	writeFixturePDF(t, filepath.Join(cfg.EffectiveAdoptionRoot(), id, "paper.pdf"))
+
+	// No hello was ever sent; poll() would offer nothing. The sweeper still adopts.
+	if err := b.SweepAdoptions(ctx); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	row, _ := jobs.Get(ctx, id)
+	if row.State != job.StateReady || row.ArtifactSHA256 == "" {
+		t.Fatalf("sweeper did not adopt: %+v", row)
 	}
 }

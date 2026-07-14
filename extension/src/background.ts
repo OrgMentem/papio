@@ -95,6 +95,12 @@ export interface BridgeDeps {
     search(query: { id: number }): Promise<DownloadItemLike[]>;
     onCreated: Listenable<[DownloadItemLike]>;
     onChanged: Listenable<[DownloadDeltaLike]>;
+    /** chrome.downloads.onDeterminingFilename — Chrome-only; absent elsewhere.
+     * The listener may call suggest() synchronously to relocate a download to
+     * a relative path under the browser's Downloads directory. */
+    onDeterminingFilename?: Listenable<
+      [DownloadItemLike, (s: { filename: string; conflictAction: "uniquify" }) => void]
+    >;
   };
 }
 
@@ -164,6 +170,18 @@ export class Bridge {
     });
     this.deps.downloads.onChanged.addListener((delta) => {
       return this.onDownloadChanged(delta);
+    });
+    this.deps.downloads.onDeterminingFilename?.addListener((item, suggest) => {
+      // Steer the one job-correlated download into the job's adoption
+      // directory under Downloads (papio/<job_id>/<name>) so no manual
+      // Save As or file move is ever needed. Unrelated downloads are
+      // untouched. suggest() must be called synchronously; correlation
+      // uses only already-loaded state.
+      const job = this.correlate(item);
+      if (!job) return;
+      const base = (item.filename ?? "").split(/[\\/]/).pop() ?? "";
+      if (base.length === 0) return;
+      suggest({ filename: `papio/${job.job_id}/${base}`, conflictAction: "uniquify" });
     });
   }
 
@@ -360,6 +378,15 @@ export class Bridge {
     if (this.closingTabs.delete(tabID)) return; // programmatic close, not a user cancel
     const job = findByTab(this.store, tabID);
     if (!job) return;
+    // Once the user is past authentication (awaiting_download), a closed tab is
+    // NOT a cancel: a download may be in flight or already saved into the job's
+    // adoption directory, where the daemon's poll-time scan will adopt it. We
+    // drop our local tab correlation but leave the job parked daemon-side.
+    // Cancelling only stands while the handoff has not yet reached download.
+    if (job.status === "awaiting_download") {
+      await this.update((s) => removeJob(s, job.job_id));
+      return;
+    }
     this.send("provider_outcome", { outcome: "cancelled" }, job.job_id);
     this.downloads.delete(job.job_id);
     await this.update((s) => removeJob(s, job.job_id));
@@ -367,7 +394,11 @@ export class Bridge {
 
   private correlate(item: DownloadItemLike): ActiveJob | undefined {
     if (typeof item.tabId === "number") {
-      return findByTab(this.store, item.tabId);
+      const byTab = findByTab(this.store, item.tabId);
+      if (byTab) return byTab;
+      // Fall through: provider viewers often download from a child tab the
+      // extension did not create; host matching below still requires the
+      // download to originate from an advertised provider host.
     }
     const src = item.referrer ?? item.finalUrl ?? item.url;
     if (src === undefined || src.length === 0) return undefined;
@@ -468,6 +499,18 @@ function realDeps(): BridgeDeps {
       search: (query) => chrome.downloads.search(query),
       onCreated: { addListener: (cb) => chrome.downloads.onCreated.addListener(cb) },
       onChanged: { addListener: (cb) => chrome.downloads.onChanged.addListener(cb) },
+      ...(chrome.downloads.onDeterminingFilename
+        ? {
+            onDeterminingFilename: {
+              addListener: (
+                cb: (
+                  item: DownloadItemLike,
+                  suggest: (s: { filename: string; conflictAction: "uniquify" }) => void,
+                ) => void,
+              ) => chrome.downloads.onDeterminingFilename.addListener(cb),
+            },
+          }
+        : {}),
     },
   };
 }

@@ -41,9 +41,16 @@ func OpenURL(base string, w work.Work) string {
 	return base + sep + v.Encode()
 }
 
-// resolverHost returns the hostname of the OpenURL base, used as the sole
-// provider_hosts entry on an offer: the resolver host is the one tab papio opens
-// (the entitled provider host is unknown until the resolver routes there).
+// verifiedProviderHosts are the registrable domains of the providers the plan
+// has verified live behind the Example University resolver (JSTOR, ProQuest, EBSCO). They ride
+// on every offer so the extension can recognize a post-SSO landing on an
+// entitled provider: the resolver host alone goes blind the moment it routes
+// the tab onward. Matching is exact-or-dot-suffix on the extension side.
+var verifiedProviderHosts = []string{"jstor.org", "proquest.com", "ebscohost.com", "ebsco.com"}
+
+// resolverHost returns the hostname of the OpenURL base; it joins the verified
+// provider hosts on an offer (the resolver host is the tab papio opens; the
+// entitled provider host is where the resolver lands it).
 func resolverHost(base string) string {
 	u, err := url.Parse(base)
 	if err != nil {

@@ -68,18 +68,23 @@ func newDaemonCommand(opt *options) *cobra.Command {
 			}
 			schedulerDone := make(chan error, 1)
 			go func() { schedulerDone <- system.Scheduler.Run(runCtx) }()
+			sweeperDone := make(chan error, 1)
+			go func() { sweeperDone <- system.Browser.RunSweeper(runCtx, 2*time.Second) }()
 			var serverErr, schedulerErr error
 			select {
 			case serverErr = <-serverDone:
 				cancel()
 				schedulerErr = <-schedulerDone
+				<-sweeperDone
 			case schedulerErr = <-schedulerDone:
 				cancel()
 				serverErr = <-serverDone
+				<-sweeperDone
 			case <-cmd.Context().Done():
 				cancel()
 				serverErr = <-serverDone
 				schedulerErr = <-schedulerDone
+				<-sweeperDone
 			}
 			if cmd.Context().Err() != nil {
 				if errors.Is(serverErr, context.Canceled) {

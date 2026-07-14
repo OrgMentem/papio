@@ -90,6 +90,9 @@ class FakeTabs {
 class FakeDownloads {
   readonly onCreated = new FakeEmitter<[DownloadItemLike]>();
   readonly onChanged = new FakeEmitter<[DownloadDeltaLike]>();
+  readonly onDeterminingFilename = new FakeEmitter<
+    [DownloadItemLike, (s: { filename: string; conflictAction: "uniquify" }) => void]
+  >();
   readonly items = new Map<number, DownloadItemLike>();
   async search(query: { id: number }): Promise<DownloadItemLike[]> {
     const item = this.items.get(query.id);
@@ -245,6 +248,54 @@ test("a job-tab download completes to a basename-only frame; unrelated tab ignor
   expect(complete?.payload["size_bytes"]).toBe(482913);
   expect(complete?.payload["download_id"]).toBe(1);
 });
+
+test("a correlated download is steered into papio/<job_id>/; unrelated untouched", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(jobOffer("job_0007_steer"));
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+
+  const suggestions: { filename: string; conflictAction: string }[] = [];
+  await h.downloads.onDeterminingFilename.emit(
+    { id: 5, tabId: tabID, filename: "Trust_in_Automation.pdf", state: "in_progress" },
+    (s) => suggestions.push(s),
+  );
+  expect(suggestions).toEqual([
+    { filename: "papio/job_0007_steer/Trust_in_Automation.pdf", conflictAction: "uniquify" },
+  ]);
+
+  // Unrelated download (different tab, unknown host): never steered.
+  await h.downloads.onDeterminingFilename.emit(
+    { id: 6, tabId: 999, url: "https://example.org/x.pdf", filename: "x.pdf", state: "in_progress" },
+    (s) => suggestions.push(s),
+  );
+  expect(suggestions.length).toBe(1);
+});
+test("closing the tab before auth cancels; after auth (awaiting_download) does not", async () => {
+  // Before auth return: tab close is a genuine user cancel.
+  const pre = makeHarness();
+  await pre.bridge.start();
+  await pre.port.inbound(jobOffer("job_0008_precancel"));
+  const preTab = pre.backend.store.activeJobs[0]?.tab_id ?? -1;
+  await pre.tabs.onRemoved.emit(preTab, { isWindowClosing: false });
+  expect(pre.frames().some((f) => f.type === "provider_outcome")).toBe(true);
+  expect(pre.backend.store.activeJobs.length).toBe(0);
+
+  // After auth return: job is awaiting_download; a closed tab must NOT cancel
+  // (the download may be saved for daemon-side adoption).
+  const post = makeHarness();
+  await post.bridge.start();
+  await post.port.inbound(jobOffer("job_0009_postauth"));
+  const postTab = post.backend.store.activeJobs[0]?.tab_id ?? -1;
+  post.tabs.live.set(postTab, { id: postTab, url: `https://${PROVIDER_HOST}/x` });
+  await post.tabs.onUpdated.emit(postTab, { url: "https://idp.example.edu/sso" }, { id: postTab, url: "https://idp.example.edu/sso" });
+  await post.tabs.onUpdated.emit(postTab, { url: `https://${PROVIDER_HOST}/y` }, { id: postTab, url: `https://${PROVIDER_HOST}/y` });
+  expect(post.backend.store.activeJobs[0]?.status).toBe("awaiting_download");
+  await post.tabs.onRemoved.emit(postTab, { isWindowClosing: false });
+  expect(post.frames().some((f) => f.type === "provider_outcome")).toBe(false);
+  expect(post.backend.store.activeJobs.length).toBe(0);
+});
+
 
 test("a malformed inbound frame fails closed by disconnecting", async () => {
   const h = makeHarness();

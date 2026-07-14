@@ -128,8 +128,15 @@ func (s *Service) AdoptDownload(ctx context.Context, jobID, path string) error {
 		return nil
 	}
 	// Rejected: validateCandidate returned the job to fetching. There is no next
-	// candidate to fetch for an adopted download, so re-park in awaiting_human and
-	// ask the human for a different file.
+	// candidate to fetch for an adopted download, so re-park in awaiting_human
+	// and ask the human for a different file. Move the rejected file out of the
+	// adoption directory (into a sibling rejected/<job_id>/ dir, preserving it
+	// for the user) so the daemon's directory sweep does not re-adopt and
+	// re-reject the same file forever.
+	rejectDir := filepath.Join(s.Config.EffectiveAdoptionRoot(), "rejected", jobID)
+	if mkErr := os.MkdirAll(rejectDir, 0o700); mkErr == nil {
+		_ = os.Rename(path, filepath.Join(rejectDir, filepath.Base(path)))
+	}
 	if _, err := s.Jobs.OpenHumanAction(ctx, jobID, "manual_download",
 		"the adopted download failed validation; please supply a different file"); err != nil {
 		return err

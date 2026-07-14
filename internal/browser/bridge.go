@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -129,8 +130,20 @@ func (b *Bridge) handle(ctx context.Context, msg *protocol.BrowserMessage) ([]js
 
 	case protocol.MsgDownloadComplete:
 		p := msg.Payload.(*protocol.DownloadCompletePayload)
-		if err := b.adopt(ctx, msg.JobID, p.Filename); err != nil {
+		if err := b.jobs.S.AppendEvent(ctx, msg.JobID, "browser.download_complete",
+			map[string]any{"filename": p.Filename, "size_bytes": p.SizeBytes}); err != nil {
 			return nil, err
+		}
+		if err := b.adopt(ctx, msg.JobID, p.Filename); err != nil {
+			// Environmental failure (file not there yet, Chrome rename race,
+			// user saved elsewhere) must not sever the bridge: record it, keep
+			// the job parked, and let the poll-time directory scan pick the
+			// file up when it appears. Confinement violations land here too —
+			// the report is ignored and the job simply stays awaiting_human.
+			if evErr := b.jobs.S.AppendEvent(ctx, msg.JobID, "browser.adoption_deferred",
+				map[string]any{"filename": p.Filename, "reason": truncate(err.Error(), 200)}); evErr != nil {
+				return nil, evErr
+			}
 		}
 		ack, err := b.frame(protocol.MsgAck, msg.JobID, protocol.EmptyPayload{})
 		if err != nil {
@@ -258,6 +271,103 @@ func (b *Bridge) adopt(ctx context.Context, jobID, filename string) error {
 	return b.svc.AdoptDownload(ctx, jobID, full)
 }
 
+// scanAdoptionDir looks for exactly one settled candidate file in a parked
+// job's adoption directory. Dotfiles (.DS_Store) are invisible; any
+// .crdownload/.download marks an in-progress Chrome write and defers the whole
+// scan; more than one visible file is ambiguous and adopts nothing. The
+// returned name feeds adopt(), which re-applies full confinement checks.
+func (b *Bridge) scanAdoptionDir(_ context.Context, jobID string) (string, bool) {
+	dir := filepath.Join(b.cfg.EffectiveAdoptionRoot(), jobID)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return "", false // no directory yet: nothing placed
+	}
+	var name string
+	for _, e := range entries {
+		n := e.Name()
+		if strings.HasPrefix(n, ".") {
+			continue
+		}
+		if strings.HasSuffix(n, ".crdownload") || strings.HasSuffix(n, ".download") {
+			return "", false // Chrome is still writing; wait for the rename
+		}
+		if !e.Type().IsRegular() {
+			continue
+		}
+		if name != "" {
+			return "", false // ambiguous: stays with the user
+		}
+		name = n
+	}
+	return name, name != ""
+}
+
+// SweepAdoptions adopts any settled file sitting in a parked handoff job's
+// adoption directory, independently of whether the extension is connected or
+// has said hello. This makes directory adoption self-driving: the daemon owns
+// completion, the browser plane is only a delivery hint. It never emits frames
+// and never opens offers. Safe to call on a timer.
+func (b *Bridge) SweepAdoptions(ctx context.Context) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	awaiting, err := b.jobs.List(ctx, job.StateAwaitingHuman, 200)
+	if err != nil {
+		return err
+	}
+	actions, err := b.jobs.ListHumanActions(ctx, true)
+	if err != nil {
+		return err
+	}
+	handoff := map[string]bool{}
+	for _, a := range actions {
+		if a.Kind == handoffActionKind {
+			handoff[a.JobID] = true
+		}
+	}
+	for i := range awaiting {
+		row := awaiting[i]
+		if !handoff[row.ID] {
+			continue
+		}
+		name, ok := b.scanAdoptionDir(ctx, row.ID)
+		if !ok {
+			continue
+		}
+		if err := b.adopt(ctx, row.ID, name); err != nil {
+			if evErr := b.jobs.S.AppendEvent(ctx, row.ID, "browser.adoption_deferred",
+				map[string]any{"filename": name, "reason": truncate(err.Error(), 200)}); evErr != nil {
+				return evErr
+			}
+		}
+	}
+	return nil
+}
+
+// RunSweeper calls SweepAdoptions on an interval until ctx is cancelled.
+// Cancellation is a normal shutdown and returns nil. A sweep error is logged as
+// a deferral inside SweepAdoptions where possible; a store-level failure stops
+// the loop and is returned to the supervisor.
+func (b *Bridge) RunSweeper(ctx context.Context, interval time.Duration) error {
+	if interval <= 0 {
+		interval = 2 * time.Second
+	}
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-t.C:
+			if err := b.SweepAdoptions(ctx); err != nil {
+				if ctx.Err() != nil {
+					return nil
+				}
+				return err
+			}
+		}
+	}
+}
+
 // poll offers outstanding handoff jobs (once per hello-session) and announces a
 // daemon-side cancel for any offered job the user has since cancelled.
 func (b *Bridge) poll(ctx context.Context) ([]json.RawMessage, error) {
@@ -280,7 +390,25 @@ func (b *Bridge) poll(ctx context.Context) ([]json.RawMessage, error) {
 	for i := range awaiting {
 		row := awaiting[i]
 		present[row.ID] = true
-		if !handoff[row.ID] || b.offered[row.ID] {
+		if !handoff[row.ID] {
+			continue
+		}
+		// Directory-scan adoption: a file the user (or a steered Chrome
+		// download) placed in the job's adoption directory is the strongest
+		// job-scoped gesture available. Exactly one settled regular file
+		// adopts; zero or several (or an in-progress .crdownload) waits —
+		// ambiguity stays with the user, per the fail-closed rule.
+		if name, ok := b.scanAdoptionDir(ctx, row.ID); ok {
+			if err := b.adopt(ctx, row.ID, name); err != nil {
+				if evErr := b.jobs.S.AppendEvent(ctx, row.ID, "browser.adoption_deferred",
+					map[string]any{"filename": name, "reason": truncate(err.Error(), 200)}); evErr != nil {
+					return nil, evErr
+				}
+			} else {
+				continue // adopted; the job has left awaiting_human
+			}
+		}
+		if b.offered[row.ID] {
 			continue
 		}
 		offer, err := b.offer(row)
@@ -319,6 +447,7 @@ func (b *Bridge) offer(row job.Row) (json.RawMessage, error) {
 	if h := resolverHost(b.cfg.Browser.OpenURLBase); h != "" {
 		hosts = append(hosts, h)
 	}
+	hosts = append(hosts, verifiedProviderHosts...)
 	expected := &protocol.JobOfferExpected{DOI: row.Work.DOI, Title: truncate(row.Work.Title, 500)}
 	if expected.DOI == "" && expected.Title == "" {
 		expected = nil
