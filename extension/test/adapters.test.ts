@@ -244,16 +244,41 @@ class FakeTabs {
 class FakeDownloads {
   readonly onCreated = new FakeEmitter<[DownloadItemLike]>();
   readonly onChanged = new FakeEmitter<[DownloadDeltaLike]>();
-  async search(): Promise<DownloadItemLike[]> {
-    return [];
+  readonly items = new Map<number, DownloadItemLike>();
+  readonly started: {
+    url: string;
+    filename: string;
+    conflictAction: "uniquify";
+    saveAs: false;
+  }[] = [];
+  async download(options: {
+    url: string;
+    filename: string;
+    conflictAction: "uniquify";
+    saveAs: false;
+  }): Promise<number> {
+    this.started.push(options);
+    const id = 700 + this.started.length;
+    this.items.set(id, {
+      id,
+      filename: `/Users/test/Downloads/${options.filename}`,
+      fileSize: 12345,
+      state: "in_progress",
+    });
+    return id;
+  }
+  async search(query: { id: number }): Promise<DownloadItemLike[]> {
+    const item = this.items.get(query.id);
+    return item ? [item] : [];
   }
 }
 
 // Fake chrome.scripting: interpret injections (3 args) return the queued
-// verdict; a clickDownload injection (1 arg) is recorded and returns true.
+// verdict; extractDownloadURL injection (1 arg) returns a signed provider URL.
 class FakeScripting {
   verdict: PageVerdict | undefined;
-  readonly clicks: { tabId: number; selector: string }[] = [];
+  href = "https://media.proquest.com/media/signed?TOKEN=ephemeral";
+  readonly extracted: { tabId: number; selector: string }[] = [];
   readonly interpretTabs: number[] = [];
   async executeScript(inj: {
     target: { tabId: number };
@@ -262,8 +287,8 @@ class FakeScripting {
   }): Promise<{ result?: unknown }[]> {
     const args = inj.args ?? [];
     if (args.length === 1) {
-      this.clicks.push({ tabId: inj.target.tabId, selector: String(args[0]) });
-      return [{ result: true }];
+      this.extracted.push({ tabId: inj.target.tabId, selector: String(args[0]) });
+      return [{ result: this.href }];
     }
     this.interpretTabs.push(inj.target.tabId);
     return [{ result: this.verdict }];
@@ -289,6 +314,7 @@ interface MapHarness {
   backend: FakeBackend;
   tabs: FakeTabs;
   scripting: FakeScripting;
+  downloads: FakeDownloads;
   permissions: FakePermissions;
   clock: { now: number };
   frames(): BrowserMessage[];
@@ -300,6 +326,7 @@ function makeMapHarness(specs: AdapterSpec[] = [SPEC]): MapHarness {
   const tabs = new FakeTabs();
   const scripting = new FakeScripting();
   const permissions = new FakePermissions();
+  const downloads = new FakeDownloads();
   const clock = { now: 1_700_000_000_000 };
   const deps: BridgeDeps = {
     connectNative: () => port,
@@ -309,7 +336,7 @@ function makeMapHarness(specs: AdapterSpec[] = [SPEC]): MapHarness {
     setTimeout: () => {},
     backend,
     tabs,
-    downloads: new FakeDownloads(),
+    downloads,
     adapterSpecs: specs,
     scripting,
     permissions,
@@ -320,6 +347,7 @@ function makeMapHarness(specs: AdapterSpec[] = [SPEC]): MapHarness {
     backend,
     tabs,
     scripting,
+    downloads,
     permissions,
     clock,
     frames: () => port.posted.map(parseBrowserMessage),
@@ -366,23 +394,38 @@ test("empty registry reports an empty adapter_versions map", async () => {
   expect(hello?.payload["adapter_versions"]).toEqual({});
 });
 
-test("article verdict clicks the download target exactly once, no synthesized frames", async () => {
+test("article verdict starts one browser-managed job-scoped download, no signed URL frame", async () => {
   const h = makeMapHarness();
   h.scripting.verdict = { kind: "article", adapter_id: "proquest", adapter_version: "0.3.1", evidence: [] };
   await h.bridge.start();
   await h.port.inbound(offer("job_article_0001", { title: EXPECTED_TITLE }));
   const tabID = await landOnProvider(h, "job_article_0001");
 
-  expect(h.scripting.clicks).toEqual([{ tabId: tabID, selector: "a.download-pdf" }]);
+  expect(h.scripting.extracted).toEqual([{ tabId: tabID, selector: "a.download-pdf" }]);
+  expect(h.downloads.started).toEqual([
+    {
+      url: h.scripting.href,
+      filename: "papio/job_article_0001/paper.pdf",
+      conflictAction: "uniquify",
+      saveAs: false,
+    },
+  ]);
   expect(h.backend.store.activeJobs[0]?.download_initiated).toBe(true);
-  // No frames are synthesized: download_started/complete only flow from real
-  // download listeners.
+  // Signed URL remains extension-memory-only: no frame contains it.
+  expect(h.frames().some((f) => JSON.stringify(f).includes("TOKEN=ephemeral"))).toBe(false);
   expect(h.frames().some((f) => f.type === "download_started")).toBe(false);
   expect(h.frames().some((f) => f.type === "provider_outcome")).toBe(false);
 
-  // A re-classification (another page load) must NOT click a second time.
+  // A re-classification (another page load) must NOT initiate a second download.
   await landOnProvider(h, "job_article_0001");
-  expect(h.scripting.clicks.length).toBe(1);
+  expect(h.downloads.started.length).toBe(1);
+  // Completion is correlated by chrome.downloads.download's returned ID even
+  // if onCreated raced before the Promise resolved.
+  await h.downloads.onChanged.emit({ id: 701, state: { current: "complete" } });
+  const complete = h.frames().find((f) => f.type === "download_complete");
+  expect(complete?.job_id).toBe("job_article_0001");
+  expect(complete?.payload["filename"]).toBe("paper.pdf");
+  expect(complete?.payload["size_bytes"]).toBe(12345);
 });
 
 test("classification is gated on an optional-host-permission grant", async () => {
@@ -393,7 +436,7 @@ test("classification is gated on an optional-host-permission grant", async () =>
   await h.port.inbound(offer("job_nogrant_0001", { title: EXPECTED_TITLE }));
   await landOnProvider(h, "job_nogrant_0001");
   expect(h.scripting.interpretTabs.length).toBe(0);
-  expect(h.scripting.clicks.length).toBe(0);
+  expect(h.downloads.started.length).toBe(0);
   expect(h.permissions.checks).toContainEqual([`https://${PROVIDER}/*`]);
 });
 
@@ -423,7 +466,7 @@ test("terms/no_entitlement/wrong_work map to their provider outcomes", async () 
     const outcome = h.frames().find((f) => f.type === "provider_outcome");
     expect(outcome?.payload["outcome"]).toBe(c.outcome);
     expect(outcome?.payload["adapter_version"]).toBe("0.3.1");
-    expect(h.scripting.clicks.length).toBe(0);
+    expect(h.downloads.started.length).toBe(0);
   }
 });
 
@@ -434,7 +477,7 @@ test("login verdict stays auth_pending — no outcome frame, no click", async ()
   await h.port.inbound(offer("job_login_0001"));
   await landOnProvider(h, "job_login_0001");
   expect(h.frames().some((f) => f.type === "provider_outcome")).toBe(false);
-  expect(h.scripting.clicks.length).toBe(0);
+  expect(h.downloads.started.length).toBe(0);
 });
 
 test("unknown escalates to ui_changed only on the second observation ≥5s later", async () => {

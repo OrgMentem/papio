@@ -99,6 +99,21 @@ class FakeDownloads {
     [DownloadItemLike, (s: { filename: string; conflictAction: "uniquify" }) => void]
   >();
   readonly items = new Map<number, DownloadItemLike>();
+  readonly started: {
+    url: string;
+    filename: string;
+    conflictAction: "uniquify";
+    saveAs: false;
+  }[] = [];
+  async download(options: {
+    url: string;
+    filename: string;
+    conflictAction: "uniquify";
+    saveAs: false;
+  }): Promise<number> {
+    this.started.push(options);
+    return 900 + this.started.length;
+  }
   async search(query: { id: number }): Promise<DownloadItemLike[]> {
     const item = this.items.get(query.id);
     return item ? [item] : [];

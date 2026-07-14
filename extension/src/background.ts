@@ -102,6 +102,15 @@ export interface BridgeDeps {
   };
   downloads: {
     search(query: { id: number }): Promise<DownloadItemLike[]>;
+    /** Start a browser-managed download. The signed provider URL remains
+     * extension-memory-only: it is never put in a native frame or durable
+     * state. The returned ID is the exact job correlation. */
+    download(options: {
+      url: string;
+      filename: string;
+      conflictAction: "uniquify";
+      saveAs: false;
+    }): Promise<number>;
     onCreated: Listenable<[DownloadItemLike]>;
     onChanged: Listenable<[DownloadDeltaLike]>;
     /** chrome.downloads.onDeterminingFilename — Chrome-only; absent elsewhere.
@@ -156,14 +165,19 @@ function parseExpected(raw: unknown): { title?: string; doi?: string } | undefin
   };
 }
 
-/** Self-contained download-initiation click, injected verbatim into the page by
- * chrome.scripting.executeScript. References nothing outside its own parameters
- * and page globals. Returns whether the declared target existed. */
-function clickDownload(selector: string): boolean {
+/** Self-contained provider-link extractor, injected verbatim into the tracked
+ * page. It returns only an HTTPS href from the declared selector. The signed
+ * URL remains in extension memory and is handed directly to
+ * chrome.downloads.download; it never crosses native messaging or storage. */
+function extractDownloadURL(selector: string): string | null {
   const el = document.querySelector(selector);
-  if (el === null) return false;
-  (el as HTMLElement).click();
-  return true;
+  if (!(el instanceof HTMLAnchorElement)) return null;
+  try {
+    const u = new URL(el.href, location.href);
+    return u.protocol === "https:" ? u.href : null;
+  } catch {
+    return null;
+  }
 }
 
 export class Bridge {
@@ -517,20 +531,34 @@ export class Bridge {
       case "article": {
         const dl = spec.download;
         if (dl && job.download_initiated !== true) {
-          // Latch BEFORE clicking (persisted) so no re-classification can ever
-          // initiate a second download for this job.
+          // Latch BEFORE resolving/downloading (persisted) so no
+          // re-classification can ever initiate a second download for this
+          // job. Failure falls back to assisted mode; the user can still use
+          // the verified page control manually.
           await this.update((s) => patchJob(s, jobID, { download_initiated: true }));
           try {
-            await this.deps.scripting.executeScript({
+            const links = await this.deps.scripting.executeScript({
               target: { tabId: job.tab_id },
-              func: clickDownload,
+              func: extractDownloadURL,
               args: [dl.selector],
             });
+            const href = links[0]?.result;
+            if (typeof href === "string" && href.startsWith("https://")) {
+              const id = await this.deps.downloads.download({
+                url: href,
+                filename: `papio/${jobID}/paper.pdf`,
+                conflictAction: "uniquify",
+                saveAs: false,
+              });
+              // Correlate by Chrome's returned ID, not URL/referrer heuristics.
+              // onChanged can now complete even if onCreated raced the Promise.
+              this.downloads.set(jobID, { ids: new Set([id]), ambiguous: false });
+            }
           } catch (e) {
-            console.error("papio: adapter download click failed", e);
+            console.error("papio: adapter download initiation failed; staying assisted", e);
           }
           // No synthesized frames: the real Chrome download flows through the
-          // onCreated/onChanged listeners, which emit download_started/complete.
+          // onChanged listener, which emits download_started/complete.
         }
         return;
       }
@@ -690,6 +718,7 @@ function realDeps(): BridgeDeps {
       onRemoved: { addListener: (cb) => chrome.tabs.onRemoved.addListener(cb) },
     },
     downloads: {
+      download: (options) => chrome.downloads.download(options),
       search: (query) => chrome.downloads.search(query),
       onCreated: { addListener: (cb) => chrome.downloads.onCreated.addListener(cb) },
       onChanged: { addListener: (cb) => chrome.downloads.onChanged.addListener(cb) },
