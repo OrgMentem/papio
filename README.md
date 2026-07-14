@@ -10,7 +10,10 @@ never touches credentials/MFA/CAPTCHA, and never crawls subscription content.
 
 ## Status
 
-Phase 1 acquisition core is implemented. Contracts remain draft `0.x`.
+Acquisition core, ordinary-Chrome institutional handoff, the first provider
+adapter set, and Phase 4 Zotio integration plus MCP surface are implemented.
+All three contracts are v1/locked: `work-request/1`, `acquisition-bundle/1`,
+and `papio-browser/1`.
 
 - Durable SQLite jobs, leases, cancellation/retry, source budgets, redacted
   events, quarantine, and immutable SHA-256 artifact storage.
@@ -20,7 +23,9 @@ Phase 1 acquisition core is implemented. Contracts remain draft `0.x`.
   identity matching, and bounded Tesseract OCR fallback.
 - Strict Unix-socket daemon IPC/autostart, structured CLI output, readiness
   diagnostics, and idempotent acquisition-bundle export.
-- `extension/` remains the Phase 2 ordinary-Chrome institutional handoff.
+- Source-controlled MV3 adapters for JSTOR, ProQuest, EBSCO, and Springer
+  Nature Link, each behind an explicit optional host permission and fail-closed
+  fixture tests.
 
 ## Use
 
