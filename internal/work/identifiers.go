@@ -12,14 +12,15 @@ import (
 
 // Work is the normalized identity a resolver receives.
 type Work struct {
-	DOI      string   `json:"doi,omitempty"`
-	PMID     string   `json:"pmid,omitempty"`
-	ArXiv    string   `json:"arxiv,omitempty"`
-	ISBN     string   `json:"isbn,omitempty"`
-	OpenAlex string   `json:"openalex,omitempty"`
-	Title    string   `json:"title,omitempty"`
-	Authors  []string `json:"authors,omitempty"`
-	Year     int      `json:"year,omitempty"`
+	DOI       string   `json:"doi,omitempty"`
+	PMID      string   `json:"pmid,omitempty"`
+	ArXiv     string   `json:"arxiv,omitempty"`
+	ISBN      string   `json:"isbn,omitempty"`
+	OpenAlex  string   `json:"openalex,omitempty"`
+	Title     string   `json:"title,omitempty"`
+	Authors   []string `json:"authors,omitempty"`
+	Container string   `json:"container,omitempty"`
+	Year      int      `json:"year,omitempty"`
 }
 
 // HasIdentifier reports whether any strong identifier is present.

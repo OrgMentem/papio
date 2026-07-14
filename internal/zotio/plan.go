@@ -284,6 +284,28 @@ func (s *Service) Apply(ctx context.Context, planID, confirmation string) (*Appl
 	return result, nil
 }
 
+// PlanAndApply creates an immutable plan for one ready job and immediately
+// applies that exact plan. Both steps use the exports-ledger idempotency keys,
+// so replays do not issue a second Zotero mutation.
+func (s *Service) PlanAndApply(ctx context.Context, jobID string) (status, parentKey, attachmentKey string, err error) {
+	plans, err := s.PlanJobs(ctx, []string{jobID})
+	if err != nil {
+		return "failed", "", "", err
+	}
+	if len(plans) != 1 || plans[0] == nil {
+		return "failed", "", "", errors.New("planning Zotio auto-import returned no plan")
+	}
+	plan := plans[0]
+	result, err := s.Apply(ctx, plan.ID, plan.ConfirmationSHA256)
+	if result == nil {
+		if err == nil {
+			err = errors.New("applying Zotio auto-import returned no result")
+		}
+		return "failed", plan.ExpectedParentKey, "", err
+	}
+	return result.Status, result.ParentKey, result.AttachmentKey, err
+}
+
 // LoadPlan reads and verifies one private plan file by opaque ID.
 func (s *Service) LoadPlan(planID string) (*Plan, error) {
 	if !planIDRE.MatchString(planID) {

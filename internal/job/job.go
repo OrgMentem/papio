@@ -110,6 +110,7 @@ type Policy struct {
 	SourcesAllow   []string `json:"sources_allow,omitempty"`
 	SourcesDeny    []string `json:"sources_deny,omitempty"`
 	FetchMaxBytes  int64    `json:"fetch_max_bytes"`
+	AutoImport     bool     `json:"auto_import,omitempty"`
 }
 
 // SourceAllowed applies the allow/deny lists (deny wins; empty allow = all).
@@ -1220,6 +1221,27 @@ func (js *Store) ListHumanActions(ctx context.Context, openOnly bool) ([]HumanAc
 		return nil, err
 	}
 	return out, rows.Err()
+}
+
+// RecordEvent appends a durable event to a job's ordered event stream.
+func (js *Store) RecordEvent(ctx context.Context, jobID, kind string, detail map[string]any) error {
+	if jobID == "" || kind == "" {
+		return errors.New("job event requires job ID and kind")
+	}
+	if detail == nil {
+		detail = map[string]any{}
+	}
+	encoded, err := json.Marshal(detail)
+	if err != nil {
+		return fmt.Errorf("marshaling job event: %w", err)
+	}
+	_, err = js.S.DB().ExecContext(ctx,
+		`INSERT INTO events(job_id, at, kind, detail_json) VALUES(?, ?, ?, ?)`,
+		jobID, store.Now(), kind, string(encoded))
+	if err != nil {
+		return fmt.Errorf("recording job event: %w", err)
+	}
+	return nil
 }
 
 // Events returns a job's event stream in order.

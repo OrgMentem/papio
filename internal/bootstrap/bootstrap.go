@@ -18,6 +18,7 @@ import (
 	"papio/internal/bundle"
 	"papio/internal/config"
 	"papio/internal/daemon"
+	"papio/internal/discovery"
 	"papio/internal/doctor"
 	"papio/internal/fetch"
 	"papio/internal/job"
@@ -48,6 +49,7 @@ type System struct {
 	Browser       *browser.Bridge
 	PDFCapability pdf.Capability
 	WorkerBinary  string
+	Discovery     *discovery.Client
 	Zotio         *zotio.Service
 }
 
@@ -134,11 +136,13 @@ func New(ctx context.Context, cfg config.Config) (*System, error) {
 		CLI: zotio.New(cfg.Zotio), Submitter: service,
 		Bundle: bundleExporter, Store: db, DataDir: cfg.DataDir, AttachmentMode: cfg.Zotio.AttachmentMode,
 	}
+	service.AutoImporter = zotioService
 	system := &System{
 		Config: cfg, Store: db, Jobs: jobs, Artifacts: artifacts, Budgets: budgets,
 		App: service, Scheduler: scheduler,
 		Bundle:        bundleExporter,
 		Browser:       browser.NewBridge(jobs, service, cfg),
+		Discovery:     discovery.NewWithOptions(discovery.Options{ContactEmail: cfg.Email, BaseURL: cfg.Sources[config.SourceOpenAlex].BaseURLForDev}),
 		Zotio:         zotioService,
 		PDFCapability: capability, WorkerBinary: executable,
 	}

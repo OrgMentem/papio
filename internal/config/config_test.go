@@ -70,3 +70,20 @@ func TestSaveRejectsInvalidZotioAttachmentMode(t *testing.T) {
 		t.Fatal("invalid Zotio attachment mode accepted")
 	}
 }
+
+func TestZotioAutoImportDefaultsOffAndLoadsTrue(t *testing.T) {
+	if Default().Zotio.AutoImport {
+		t.Fatal("default zotio.auto_import = true, want false")
+	}
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(path, []byte("access_mode='conservative'\n[zotio]\nauto_import=true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Zotio.AutoImport {
+		t.Fatal("loaded zotio.auto_import = false, want true")
+	}
+}

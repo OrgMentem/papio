@@ -14,6 +14,7 @@ import (
 	"papio/internal/bootstrap"
 	"papio/internal/browser"
 	"papio/internal/config"
+	"papio/internal/discovery"
 	"papio/internal/ipc"
 	"papio/internal/job"
 	"papio/internal/protocol"
@@ -53,6 +54,9 @@ func RouterWithShutdown(system *bootstrap.System, shutdown context.CancelFunc) i
 		"ping": ping,
 		"acquire.submit": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return submit(ctx, raw, system)
+		},
+		"discovery.search": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return searchDiscovery(ctx, raw, system)
 		},
 		"jobs.list": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return listJobs(ctx, raw, system)
@@ -118,12 +122,29 @@ func ping(_ context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 	return marshal(map[string]string{"status": "ok", "version": Version})
 }
 
+type acquireSubmitParams struct {
+	Request    protocol.WorkRequest `json:"request"`
+	AutoImport *bool                `json:"auto_import,omitempty"`
+}
+
 func submit(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
-	var request protocol.WorkRequest
-	if err := ipc.DecodeParams(raw, &request); err != nil {
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &envelope); err != nil {
 		return badParams(err)
 	}
-	id, err := system.App.Submit(ctx, request)
+	var request protocol.WorkRequest
+	var autoImport *bool
+	if _, ok := envelope["request"]; ok {
+		var params acquireSubmitParams
+		if err := ipc.DecodeParams(raw, &params); err != nil {
+			return badParams(err)
+		}
+		request = params.Request
+		autoImport = params.AutoImport
+	} else if err := ipc.DecodeParams(raw, &request); err != nil {
+		return badParams(err)
+	}
+	id, err := system.App.SubmitWithAutoImport(ctx, request, autoImport)
 	if err != nil {
 		var unset *config.ErrAccessModeUnset
 		if errors.As(err, &unset) {
@@ -387,6 +408,25 @@ func browserSync(ctx context.Context, raw json.RawMessage, system *bootstrap.Sys
 		outbound = []json.RawMessage{}
 	}
 	return marshal(map[string]any{"outbound": outbound})
+}
+
+// searchDiscovery maps strict RPC input to the single-request OpenAlex client.
+func searchDiscovery(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
+	var params discovery.SearchParams
+	if err := ipc.DecodeParams(raw, &params); err != nil {
+		return badParams(err)
+	}
+	if strings.TrimSpace(params.Query) == "" {
+		return badParams(errors.New("query is required"))
+	}
+	if system == nil || system.Discovery == nil {
+		return nil, &ipc.RPCError{Code: "precondition_failed", Message: "discovery is not configured"}
+	}
+	works, err := system.Discovery.Search(ctx, params)
+	if err != nil {
+		return nil, &ipc.RPCError{Code: "precondition_failed", Message: safeMessage(err, "discovery search failed")}
+	}
+	return marshal(works)
 }
 
 func marshal(value any) ([]byte, *ipc.RPCError) {

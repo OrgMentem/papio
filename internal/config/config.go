@@ -82,6 +82,7 @@ type Zotio struct {
 	Executable     string `toml:"executable"`
 	TimeoutSeconds int    `toml:"timeout_seconds"`
 	AttachmentMode string `toml:"attachment_mode"`
+	AutoImport     bool   `toml:"auto_import"`
 }
 
 // Config is the loaded, validated configuration.
@@ -120,7 +121,7 @@ func Default() Config {
 		Fetch:   Fetch{MaxBytes: 100 << 20, TimeoutSeconds: 120},
 		PDF:     PDF{OCREnabled: true, MinTextChars: 400, MaxOCRPages: 4, TitleMatchThreshold: 0.6},
 		Browser: Browser{ActionExpirySeconds: 1800},
-		Zotio:   Zotio{Executable: "zotio", TimeoutSeconds: 120, AttachmentMode: "stored"},
+		Zotio:   Zotio{Executable: "zotio", TimeoutSeconds: 120, AttachmentMode: "stored", AutoImport: false},
 		Sources: map[string]Source{
 			SourceArXiv:           {Enabled: true, RatePerSec: 1, Burst: 1},
 			SourceEuropePMC:       {Enabled: true, RatePerSec: 2, Burst: 2},

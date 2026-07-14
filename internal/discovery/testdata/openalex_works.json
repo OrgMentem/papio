@@ -1,0 +1,44 @@
+{
+  "meta": {"count": 3, "per_page": 3},
+  "results": [
+    {
+      "id": "https://openalex.org/W2741809807",
+      "doi": "https://doi.org/10.1000/Example.DOI",
+      "title": "A resilient discovery paper",
+      "publication_year": 2023,
+      "authorships": [
+        {"author": {"display_name": "Ada Lovelace"}},
+        {"author": {"display_name": "Grace Hopper"}}
+      ],
+      "primary_location": {"source": {"display_name": "Journal of Useful Results"}},
+      "open_access": {"is_oa": true, "oa_url": "https://repository.example.org/paper.pdf"},
+      "cited_by_count": 42,
+      "abstract_inverted_index": {
+        "A": [0],
+        "resilient": [1],
+        "abstract": [2]
+      }
+    },
+    {
+      "id": "https://openalex.org/W1234567890",
+      "doi": "10.5555/SECOND",
+      "title": "Closed access observations",
+      "publication_year": 2021,
+      "authorships": [{"author": {"display_name": "Katherine Johnson"}}],
+      "primary_location": {"source": {"display_name": "Proceedings of Examples"}},
+      "open_access": {"is_oa": false, "oa_url": null},
+      "cited_by_count": 7,
+      "abstract_inverted_index": null
+    },
+    {
+      "id": "https://openalex.org/W9999999999",
+      "doi": null,
+      "title": "Metadata without a DOI",
+      "publication_year": 2020,
+      "authorships": [],
+      "primary_location": {"source": null},
+      "open_access": {"is_oa": false, "oa_url": ""},
+      "cited_by_count": 0
+    }
+  ]
+}

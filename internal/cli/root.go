@@ -45,6 +45,7 @@ func NewRoot(out, errOut io.Writer) *cobra.Command {
 	root.AddCommand(
 		newConfigCommand(opt),
 		newAcquireCommand(opt),
+		newSearchCommand(opt),
 		newJobsCommand(opt),
 		newActionsCommand(opt),
 		newArtifactsCommand(opt),

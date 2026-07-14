@@ -34,6 +34,12 @@ type FetchFunc func(context.Context, resolver.Candidate, string) (fetch.Result, 
 // ValidateFunc validates one quarantined file against the requested work.
 type ValidateFunc func(context.Context, string, string, work.Work) (pdf.ValidationReport, error)
 
+// AutoImporter plans and applies one ready job through the Zotio service.
+// Implementations must make replays idempotent.
+type AutoImporter interface {
+	PlanAndApply(context.Context, string) (status, parentKey, attachmentKey string, err error)
+}
+
 // ResolverEntry binds an adapter to its policy and estimated metadata-call cost.
 type ResolverEntry struct {
 	Adapter       resolver.Resolver
@@ -43,13 +49,14 @@ type ResolverEntry struct {
 
 // Service is the command-independent acquisition service.
 type Service struct {
-	Config    config.Config
-	Jobs      *job.Store
-	Artifacts *artifact.Store
-	Budgets   *budget.Manager
-	Resolvers []ResolverEntry
-	Fetch     FetchFunc
-	Validate  ValidateFunc
+	Config       config.Config
+	Jobs         *job.Store
+	Artifacts    *artifact.Store
+	Budgets      *budget.Manager
+	Resolvers    []ResolverEntry
+	Fetch        FetchFunc
+	Validate     ValidateFunc
+	AutoImporter AutoImporter
 
 	RetryDelay time.Duration
 	Now        func() time.Time
@@ -67,6 +74,12 @@ func New(cfg config.Config, jobs *job.Store, artifacts *artifact.Store, budgets 
 // durable queued job. Config access_mode is always required; an optional
 // request override is then snapshotted explicitly.
 func (s *Service) Submit(ctx context.Context, wr protocol.WorkRequest) (string, error) {
+	return s.SubmitWithAutoImport(ctx, wr, nil)
+}
+
+// SubmitWithAutoImport behaves like Submit while applying an optional per-job
+// auto-import override. A nil override preserves the config default.
+func (s *Service) SubmitWithAutoImport(ctx context.Context, wr protocol.WorkRequest, autoImport *bool) (string, error) {
 	if err := wr.Validate(); err != nil {
 		return "", err
 	}
@@ -85,11 +98,16 @@ func (s *Service) Submit(ctx context.Context, wr protocol.WorkRequest) (string, 
 	if desired == "" {
 		desired = "any"
 	}
+	auto := s.Config.Zotio.AutoImport
+	if autoImport != nil {
+		auto = *autoImport
+	}
 	pol := job.Policy{
 		AccessMode: mode, DesiredVersion: desired, MaxCostUSD: wr.MaxCostUSD,
 		SourcesAllow:  append([]string(nil), wr.SourcesAllow...),
 		SourcesDeny:   append([]string(nil), wr.SourcesDeny...),
 		FetchMaxBytes: s.Config.Fetch.MaxBytes,
+		AutoImport:    auto,
 	}
 	return s.Jobs.CreateRequest(ctx, wr.RequestID, w, wr.ZotioItemKey, wr.Collection, pol, raw)
 }
@@ -177,8 +195,12 @@ func (s *Service) Process(ctx context.Context, row *job.Row) error {
 			return err
 		}
 		if cached != nil && s.Artifacts.Verify(cached.SHA256) == nil {
-			return s.Jobs.Transition(ctx, row.ID, job.StateResolving, job.StateReady,
-				map[string]any{"source": "cache", "sha256": cached.SHA256}, job.WithArtifact(cached.SHA256))
+			if err := s.Jobs.Transition(ctx, row.ID, job.StateResolving, job.StateReady,
+				map[string]any{"source": "cache", "sha256": cached.SHA256}, job.WithArtifact(cached.SHA256)); err != nil {
+				return err
+			}
+			s.autoImportReady(ctx, row)
+			return nil
 		}
 	}
 
@@ -517,7 +539,33 @@ func (s *Service) validateCandidate(ctx context.Context, row *job.Row, stored *j
 		acceptDetail, job.WithCandidate(stored.ID), job.WithArtifact(result.SHA256)); err != nil {
 		return false, false, err
 	}
+	s.autoImportReady(ctx, row)
 	return true, false, nil
+}
+
+func (s *Service) autoImportReady(ctx context.Context, row *job.Row) {
+	if !row.Policy.AutoImport {
+		return
+	}
+	eventCtx := context.WithoutCancel(ctx)
+	detail := map[string]any{"parent_key": "", "attachment_key": ""}
+	if s.AutoImporter == nil {
+		detail["status"] = "skipped"
+		detail["reason"] = "zotio_not_configured"
+		_ = s.Jobs.RecordEvent(eventCtx, row.ID, "zotio.auto_import", detail)
+		return
+	}
+	status, parentKey, attachmentKey, err := s.AutoImporter.PlanAndApply(ctx, row.ID)
+	detail["parent_key"] = parentKey
+	detail["attachment_key"] = attachmentKey
+	if err != nil {
+		detail["status"] = "error"
+		detail["error_type"] = safeType(err)
+		_ = s.Jobs.RecordEvent(eventCtx, row.ID, "zotio.auto_import", detail)
+		return
+	}
+	detail["status"] = status
+	_ = s.Jobs.RecordEvent(eventCtx, row.ID, "zotio.auto_import", detail)
 }
 
 func fetchFailure(err error) (class string, status int, delay time.Duration) {

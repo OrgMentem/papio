@@ -82,6 +82,33 @@ func TestRouterSubmitListGetAndCancel(t *testing.T) {
 	}
 }
 
+func TestRouterSubmitEnvelopeAutoImportOverride(t *testing.T) {
+	system := testSystem(t)
+	system.App.Config.Zotio.AutoImport = true
+	router := Router(system)
+	disabled := false
+	request := protocol.WorkRequest{
+		SchemaVersion: protocol.WorkRequestSchemaVersion,
+		RequestID:     "request_api_auto_import",
+		Identifiers:   &protocol.Identifiers{DOI: "10.1000/auto-import"},
+	}
+	var submitted SubmitResult
+	params := struct {
+		Request    protocol.WorkRequest `json:"request"`
+		AutoImport *bool                `json:"auto_import"`
+	}{Request: request, AutoImport: &disabled}
+	if rpcErr := callMethod(t, router, "acquire.submit", params, &submitted); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	row, err := system.Jobs.Get(context.Background(), submitted.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.Policy.AutoImport {
+		t.Fatal("explicit auto_import=false did not override config default")
+	}
+}
+
 func TestRouterRetryAndStrictEmptyParams(t *testing.T) {
 	system := testSystem(t)
 	ctx := context.Background()
@@ -220,5 +247,18 @@ func TestRouterResolveIdentityReviewAction(t *testing.T) {
 	}
 	if rpcErr := callMethod(t, router, "actions.resolve", map[string]any{"action_id": wrongID, "verdict": "accept"}, nil); rpcErr == nil || rpcErr.Code != "invalid_argument" {
 		t.Fatalf("wrong action kind error = %+v", rpcErr)
+	}
+}
+
+func TestRouterDiscoverySearchValidatesParams(t *testing.T) {
+	router := Router(testSystem(t))
+	for _, params := range []any{
+		map[string]any{},
+		map[string]any{"query": " \t"},
+		map[string]any{"query": "climate", "unexpected": true},
+	} {
+		if rpcErr := callMethod(t, router, "discovery.search", params, nil); rpcErr == nil || rpcErr.Code != "invalid_argument" {
+			t.Fatalf("params %v: RPC error = %+v, want invalid_argument", params, rpcErr)
+		}
 	}
 }

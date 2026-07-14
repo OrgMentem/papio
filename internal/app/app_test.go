@@ -105,6 +105,19 @@ func passValidation() ValidateFunc {
 	}
 }
 
+type fakeAutoImporter struct {
+	calls         int
+	status        string
+	parentKey     string
+	attachmentKey string
+	err           error
+}
+
+func (f *fakeAutoImporter) PlanAndApply(context.Context, string) (string, string, string, error) {
+	f.calls++
+	return f.status, f.parentKey, f.attachmentKey, f.err
+}
+
 func TestProcessReadyEnrichesMetadataAndNeverPersistsSecrets(t *testing.T) {
 	svc, jobs := newTestService(t)
 	secret := "SENTINEL_DO_NOT_STORE"
@@ -451,7 +464,7 @@ func TestReviewOverrideDoesNotBypassRejectOrUnsafePDF(t *testing.T) {
 				t.Fatal(err)
 			}
 			if _, err := jobs.InsertCandidates(context.Background(), id, []job.Candidate{{
-				JobID: id, Source: "fixture", URLRedacted: "https://example.test/"+name+".pdf", URLKey: name,
+				JobID: id, Source: "fixture", URLRedacted: "https://example.test/" + name + ".pdf", URLKey: name,
 				Version: resolver.VersionPublished, AccessBasis: resolver.AccessOpen, ReuseLicense: "unknown",
 				ReviewOverride: true,
 			}}); err != nil {
@@ -490,5 +503,156 @@ func TestReviewOverrideDoesNotBypassRejectOrUnsafePDF(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func readyPipeline(svc *Service) {
+	svc.Resolvers = []ResolverEntry{{Adapter: &fakeResolver{name: "fixture", cands: []resolver.Candidate{{
+		Source: "fixture", URL: "https://example.test/auto-import.pdf",
+		Version: resolver.VersionPublished, AccessBasis: resolver.AccessOpen, ReuseLicense: "cc-by-4.0",
+		ExpectedMIME: "application/pdf", Direct: true, IdentityConfidence: 1,
+	}}}, Policy: config.Source{Enabled: true}}}
+	fetches := 0
+	svc.Fetch = fakeDownload(&fetches)
+	svc.Validate = passValidation()
+}
+
+func autoImportEvent(t *testing.T, jobs *job.Store, id string) map[string]any {
+	t.Helper()
+	events, err := jobs.Events(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range events {
+		if event["kind"] == "zotio.auto_import" {
+			detail, ok := event["detail"].(map[string]any)
+			if !ok {
+				t.Fatalf("auto-import event detail = %#v", event["detail"])
+			}
+			return detail
+		}
+	}
+	t.Fatalf("no zotio.auto_import event in %#v", events)
+	return nil
+}
+
+func TestProcessReadyAutoImportsOnce(t *testing.T) {
+	svc, jobs := newTestService(t)
+	svc.Config.Zotio.AutoImport = true
+	importer := &fakeAutoImporter{status: "applied", parentKey: "PARENT01", attachmentKey: "ATTACH01"}
+	svc.AutoImporter = importer
+	readyPipeline(svc)
+
+	id, err := svc.Submit(context.Background(), doiRequest("wr_auto_import_01"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, err := jobs.ClaimNext(context.Background(), "worker", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Process(context.Background(), row); err != nil {
+		t.Fatal(err)
+	}
+	ready, err := jobs.Get(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ready.State != job.StateReady {
+		t.Fatalf("job state = %s, want ready", ready.State)
+	}
+	detail := autoImportEvent(t, jobs, id)
+	if detail["status"] != "applied" || detail["parent_key"] != "PARENT01" || detail["attachment_key"] != "ATTACH01" {
+		t.Fatalf("auto-import detail = %#v", detail)
+	}
+	if err := svc.Process(context.Background(), ready); err != nil {
+		t.Fatal(err)
+	}
+	if importer.calls != 1 {
+		t.Fatalf("auto-import calls = %d, want 1", importer.calls)
+	}
+}
+
+func TestProcessReadyAutoImportFailureLeavesJobReady(t *testing.T) {
+	svc, jobs := newTestService(t)
+	svc.Config.Zotio.AutoImport = true
+	importer := &fakeAutoImporter{err: errors.New("zotio unavailable")}
+	svc.AutoImporter = importer
+	readyPipeline(svc)
+
+	id, err := svc.Submit(context.Background(), doiRequest("wr_auto_import_fail"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, err := jobs.ClaimNext(context.Background(), "worker", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Process(context.Background(), row); err != nil {
+		t.Fatalf("auto-import failure should be non-fatal: %v", err)
+	}
+	ready, err := jobs.Get(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ready.State != job.StateReady {
+		t.Fatalf("job state = %s, want ready", ready.State)
+	}
+	detail := autoImportEvent(t, jobs, id)
+	if detail["status"] != "error" || detail["error_type"] == "" {
+		t.Fatalf("auto-import failure detail = %#v", detail)
+	}
+	if importer.calls != 1 {
+		t.Fatalf("auto-import calls = %d, want 1", importer.calls)
+	}
+}
+
+func TestProcessReadyAutoImportWithoutServiceRecordsSkip(t *testing.T) {
+	svc, jobs := newTestService(t)
+	svc.Config.Zotio.AutoImport = true
+	readyPipeline(svc)
+
+	id, err := svc.Submit(context.Background(), doiRequest("wr_auto_import_skip"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, err := jobs.ClaimNext(context.Background(), "worker", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Process(context.Background(), row); err != nil {
+		t.Fatal(err)
+	}
+	detail := autoImportEvent(t, jobs, id)
+	if detail["status"] != "skipped" || detail["reason"] != "zotio_not_configured" {
+		t.Fatalf("auto-import skip detail = %#v", detail)
+	}
+}
+
+func TestSubmitWithAutoImportOverrideBeatsConfigDefault(t *testing.T) {
+	svc, jobs := newTestService(t)
+	svc.Config.Zotio.AutoImport = true
+	disabled := false
+	id, err := svc.SubmitWithAutoImport(context.Background(), doiRequest("wr_auto_import_off"), &disabled)
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, err := jobs.Get(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.Policy.AutoImport {
+		t.Fatal("explicit --auto-import=false did not override config")
+	}
+	id, err = svc.SubmitWithAutoImport(context.Background(), doiRequest("wr_auto_import_cfg"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, err = jobs.Get(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !row.Policy.AutoImport {
+		t.Fatal("config zotio.auto_import did not become new-job default")
 	}
 }

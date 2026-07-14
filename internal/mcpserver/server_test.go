@@ -31,7 +31,7 @@ func TestServerExposesBoundedPlanApplySurface(t *testing.T) {
 		t.Fatal(err)
 	}
 	var names []string
-	var applyTool, exportTool *mcp.Tool
+	var applyTool, exportTool, searchTool *mcp.Tool
 	for _, tool := range listed.Tools {
 		names = append(names, tool.Name)
 		switch tool.Name {
@@ -39,10 +39,12 @@ func TestServerExposesBoundedPlanApplySurface(t *testing.T) {
 			applyTool = tool
 		case "papio_export_bundle":
 			exportTool = tool
+		case "papio_search":
+			searchTool = tool
 		}
 	}
 	sort.Strings(names)
-	want := []string{"papio_acquire", "papio_export_bundle", "papio_zotio_apply", "papio_zotio_plan"}
+	want := []string{"papio_acquire", "papio_export_bundle", "papio_search", "papio_zotio_apply", "papio_zotio_plan"}
 	if strings.Join(names, ",") != strings.Join(want, ",") {
 		t.Fatalf("tools = %v, want %v", names, want)
 	}
@@ -58,6 +60,16 @@ func TestServerExposesBoundedPlanApplySurface(t *testing.T) {
 	}
 	if exportTool == nil || exportTool.Annotations == nil || !exportTool.Annotations.ReadOnlyHint {
 		t.Fatalf("export annotations = %+v", exportTool)
+	}
+	if searchTool == nil || searchTool.Annotations == nil || !searchTool.Annotations.ReadOnlyHint {
+		t.Fatalf("search annotations = %+v", searchTool)
+	}
+	searchSchema, err := json.Marshal(searchTool.InputSchema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(searchSchema), `"query"`) || !strings.Contains(string(searchSchema), `"oa_only"`) {
+		t.Fatalf("search schema = %s", searchSchema)
 	}
 
 	resources, err := clientSession.ListResources(ctx, nil)

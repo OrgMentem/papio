@@ -11,6 +11,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"papio/internal/bootstrap"
+	"papio/internal/discovery"
 	"papio/internal/job"
 	"papio/internal/protocol"
 	"papio/internal/zotio"
@@ -31,6 +32,7 @@ type AcquireInput struct {
 	MaxCostUSD         *float64              `json:"max_cost_usd,omitempty" jsonschema:"maximum permitted acquisition cost"`
 	SourcesAllow       []string              `json:"sources_allow,omitempty" jsonschema:"optional source allowlist, at most 50"`
 	SourcesDeny        []string              `json:"sources_deny,omitempty" jsonschema:"optional source denylist, at most 50"`
+	AutoImport         *bool                 `json:"auto_import,omitempty" jsonschema:"automatically import a ready job into Zotero; omit to use the configured default"`
 }
 
 type AcquireOutput struct {
@@ -60,6 +62,15 @@ type ApplyInput struct {
 	ConfirmationSHA256 string `json:"confirmation_sha256" jsonschema:"exact confirmation SHA-256 returned by papio_zotio_plan"`
 }
 
+// SearchInput selects a bounded, read-only OpenAlex work search.
+type SearchInput struct {
+	Query    string `json:"query" jsonschema:"scholarly search query"`
+	Limit    int    `json:"limit,omitempty" jsonschema:"maximum results, clamped to 1 through 50"`
+	YearFrom int    `json:"year_from,omitempty" jsonschema:"minimum publication year"`
+	YearTo   int    `json:"year_to,omitempty" jsonschema:"maximum publication year"`
+	OAOnly   bool   `json:"oa_only,omitempty" jsonschema:"return only open-access works"`
+}
+
 // New builds one MCP server. Zotero writes are deliberately unreachable from
 // every tool except papio_zotio_apply, which requires an immutable plan ID and
 // its exact confirmation digest.
@@ -80,14 +91,35 @@ func New(system *bootstrap.System) *mcp.Server {
 		if requestID == "" {
 			requestID = job.NewID("request")
 		}
-		jobID, err := system.App.Submit(ctx, protocol.WorkRequest{
+		jobID, err := system.App.SubmitWithAutoImport(ctx, protocol.WorkRequest{
 			SchemaVersion: protocol.WorkRequestSchemaVersion, RequestID: requestID,
 			Identifiers: input.Identifiers, Title: input.Title, Authors: input.Authors, Year: input.Year,
 			ZotioItemKey: input.ZotioItemKey, Collection: input.Collection, DesiredVersion: input.DesiredVersion,
 			AccessModeOverride: input.AccessModeOverride, MaxCostUSD: input.MaxCostUSD,
 			SourcesAllow: input.SourcesAllow, SourcesDeny: input.SourcesDeny,
-		})
+		}, input.AutoImport)
 		return nil, AcquireOutput{JobID: jobID}, err
+	})
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "papio_search", Title: "Search scholarly works",
+		Description: "Run one bounded, read-only OpenAlex search. This produces work metadata and never creates an acquisition job.",
+		Annotations: readAnnotations(),
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, input SearchInput) (*mcp.CallToolResult, any, error) {
+		if system == nil || system.Discovery == nil {
+			return nil, nil, fmt.Errorf("discovery is not configured")
+		}
+		works, err := system.Discovery.Search(ctx, discovery.SearchParams{
+			Query: input.Query, Limit: input.Limit, YearFrom: input.YearFrom, YearTo: input.YearTo, OAOnly: input.OAOnly,
+		})
+		if err != nil {
+			return nil, nil, err
+		}
+		data, err := json.Marshal(works)
+		if err != nil {
+			return nil, nil, err
+		}
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: string(data)}}}, nil, nil
 	})
 
 	mcp.AddTool(server, &mcp.Tool{
