@@ -193,8 +193,14 @@ function extractDownloadURL(selector: string): string | null {
 }
 
 /** Self-contained declared click, optionally through one explicitly named
- * control in an open shadow root. No selector guessing or fallback. */
-function clickDeclaredDownload(selector: string, shadowSelector?: string): boolean {
+ * control in an open shadow root. For in-page gates it waits on one declared
+ * selector via MutationObserver; no guessed delay, selector, or fallback. */
+async function clickDeclaredDownload(
+  selector: string,
+  shadowSelector?: string,
+  waitForSelector?: string,
+  timeoutMs?: number,
+): Promise<boolean> {
   const host = document.querySelector(selector);
   let target: Element | null = host;
   if (shadowSelector !== undefined) {
@@ -203,6 +209,33 @@ function clickDeclaredDownload(selector: string, shadowSelector?: string): boole
   }
   if (!(target instanceof HTMLElement)) return false;
   target.click();
+
+  if (waitForSelector === undefined) return true;
+  const seen = (): boolean => {
+    try {
+      return document.querySelector(waitForSelector) !== null;
+    } catch {
+      return false;
+    }
+  };
+  if (seen()) return true;
+
+  const boundedMs = Math.max(0, Math.min(timeoutMs ?? 0, 5000));
+  await new Promise<void>((resolve) => {
+    let settled = false;
+    const finish = (): void => {
+      if (settled) return;
+      settled = true;
+      observer.disconnect();
+      clearTimeout(timer);
+      resolve();
+    };
+    const observer = new MutationObserver(() => {
+      if (seen()) finish();
+    });
+    observer.observe(document.documentElement, { childList: true, subtree: true, attributes: true });
+    const timer = setTimeout(finish, boundedMs);
+  });
   return true;
 }
 
@@ -567,15 +600,6 @@ export class Bridge {
     await this.applyVerdict(jobID, spec, verdict);
   }
 
-  private scheduleReclassification(jobID: string, delayMs: number): void {
-    this.deps.setTimeout(async () => {
-      try {
-        await this.reclassifyCurrentProviderPage(jobID);
-      } catch (e) {
-        console.error("papio: post-action adapter classification failed; staying assisted", e);
-      }
-    }, delayMs);
-  }
 
   private async reclassifyCurrentProviderPage(jobID: string): Promise<void> {
     const job = findByJob(this.store, jobID);
@@ -619,11 +643,16 @@ export class Bridge {
               const results = await this.deps.scripting.executeScript({
                 target: { tabId: job.tab_id },
                 func: clickDeclaredDownload,
-                args: [dl.selector, dl.shadowSelector],
+                args: [
+                  dl.selector,
+                  dl.shadowSelector,
+                  dl.postClickWaitFor,
+                  dl.postClickTimeoutMs,
+                ],
               });
               const clicked = results[0]?.result === true;
-              if (clicked && dl.reclassifyAfterMs !== undefined) {
-                this.scheduleReclassification(jobID, dl.reclassifyAfterMs);
+              if (clicked && dl.postClickWaitFor !== undefined) {
+                await this.reclassifyCurrentProviderPage(jobID);
               }
             } else {
               const links = await this.deps.scripting.executeScript({

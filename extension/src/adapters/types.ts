@@ -37,9 +37,10 @@ export interface DownloadRule {
    * selected control in its open shadow root). */
   method: "href" | "click";
   shadowSelector?: string;
-  /** Re-run classification after a click so an in-page terms/access modal is
-   * surfaced even though no tab navigation event fires. */
-  reclassifyAfterMs?: number;
+  /** For in-page gates, wait until this fixture-backed selector appears (or
+   * the bounded timeout elapses) before the background reclassifies. */
+  postClickWaitFor?: string;
+  postClickTimeoutMs?: number;
 }
 
 export interface AdapterSpec {
@@ -217,7 +218,8 @@ export const adapters: AdapterSpec[] = [
       requireKind: "article",
       method: "click",
       shadowSelector: "#button-element",
-      reclassifyAfterMs: 500,
+      postClickWaitFor: "mfe-download-pharos-modal.terms-and-conditions[open]",
+      postClickTimeoutMs: 3000,
     },
   },
 ];

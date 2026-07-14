@@ -309,7 +309,7 @@ class FakeScripting {
       this.extracted.push({ tabId: inj.target.tabId, selector: String(args[0]) });
       return [{ result: this.href }];
     }
-    if (args.length === 2) {
+    if (args.length === 4) {
       this.clicked.push({
         tabId: inj.target.tabId,
         selector: String(args[0]),
@@ -344,7 +344,6 @@ interface MapHarness {
   downloads: FakeDownloads;
   permissions: FakePermissions;
   clock: { now: number };
-  runTimers(): Promise<void>;
   frames(): BrowserMessage[];
 }
 
@@ -356,15 +355,12 @@ function makeMapHarness(specs: AdapterSpec[] = [SPEC]): MapHarness {
   const permissions = new FakePermissions();
   const downloads = new FakeDownloads();
   const clock = { now: 1_700_000_000_000 };
-  const timers: (() => unknown)[] = [];
   const deps: BridgeDeps = {
     connectNative: () => port,
     manifestVersion: "0.1.0",
     randomUUID: () => crypto.randomUUID(),
     now: () => clock.now,
-    setTimeout: (fn) => {
-      timers.push(fn);
-    },
+    setTimeout: () => {},
     backend,
     tabs,
     downloads,
@@ -381,12 +377,6 @@ function makeMapHarness(specs: AdapterSpec[] = [SPEC]): MapHarness {
     downloads,
     permissions,
     clock,
-    runTimers: async () => {
-      while (timers.length > 0) {
-        const fn = timers.shift();
-        if (fn) await fn();
-      }
-    },
     frames: () => port.posted.map(parseBrowserMessage),
   };
 }
@@ -481,7 +471,8 @@ test("declared shadow click reclassifies an in-page terms gate", async () => {
       requireKind: "article",
       method: "click",
       shadowSelector: "#button-element",
-      reclassifyAfterMs: 500,
+      postClickWaitFor: ".terms[open]",
+      postClickTimeoutMs: 3000,
     },
   };
   const h = makeMapHarness([clickSpec]);
@@ -496,10 +487,8 @@ test("declared shadow click reclassifies an in-page terms gate", async () => {
   expect(h.scripting.clicked).toEqual([
     { tabId: tabID, selector: "mfe-download", shadowSelector: "#button-element" },
   ]);
-  expect(h.frames().some((f) => f.type === "provider_outcome")).toBe(false);
   expect(h.backend.store.activeJobs[0]?.download_initiated).toBe(true);
 
-  await h.runTimers();
   const outcome = h.frames().find((f) => f.type === "provider_outcome");
   expect(outcome?.payload["outcome"]).toBe("terms_acceptance_required");
   expect(outcome?.payload["adapter_version"]).toBe("0.1.0");
