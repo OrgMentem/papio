@@ -1,13 +1,13 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://papio.dev/protocol/browser-v0.schema.json",
-  "title": "papio browser bridge message (draft 0.x)",
-  "description": "One framed native-messaging envelope between the MV3 extension and the papio native host. DRAFT: protocol papio-browser/0.1 until the Phase 3 v1 lock. Metadata only — PDF bytes and secrets never cross this channel; encoded messages are capped at 262144 bytes; unknown types/fields are rejected (fail closed). auth_pending/auth_returned deliberately have no URL/title fields: identity-provider addresses never leave the browser.",
+  "$id": "https://papio.dev/protocol/browser-v1.schema.json",
+  "title": "papio browser bridge message v1",
+  "description": "One framed native-messaging envelope between the MV3 extension and the papio native host. Locked protocol papio-browser/1. Metadata only — PDF bytes and secrets never cross this channel; encoded messages are capped at 262144 bytes; integers are capped at JavaScript's exact range; unknown types, fields, and null object members are rejected (fail closed). auth_pending/auth_returned deliberately have no URL/title fields: identity-provider addresses never leave the browser.",
   "type": "object",
   "additionalProperties": false,
   "required": ["protocol", "type", "msg_id", "seq", "payload"],
   "properties": {
-    "protocol": { "const": "papio-browser/0.1" },
+    "protocol": { "const": "papio-browser/1" },
     "type": {
       "enum": [
         "hello",
@@ -27,7 +27,7 @@
     },
     "msg_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,64}$" },
     "job_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,128}$" },
-    "seq": { "type": "integer", "minimum": 0 },
+    "seq": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
     "payload": { "type": "object" }
   },
   "allOf": [
@@ -94,7 +94,7 @@
             "type": "object",
             "additionalProperties": false,
             "properties": {
-              "elapsed_ms": { "type": "integer", "minimum": 0 }
+              "elapsed_ms": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
             }
           }
         }
@@ -109,7 +109,7 @@
             "additionalProperties": false,
             "required": ["download_id", "filename"],
             "properties": {
-              "download_id": { "type": "integer", "minimum": 0 },
+              "download_id": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
               "filename": { "type": "string", "pattern": "^[^/\\\\]{1,255}$" }
             }
           }
@@ -125,9 +125,9 @@
             "additionalProperties": false,
             "required": ["download_id", "filename", "size_bytes"],
             "properties": {
-              "download_id": { "type": "integer", "minimum": 0 },
+              "download_id": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
               "filename": { "type": "string", "pattern": "^[^/\\\\]{1,255}$" },
-              "size_bytes": { "type": "integer", "minimum": 1 }
+              "size_bytes": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 }
             }
           }
         }

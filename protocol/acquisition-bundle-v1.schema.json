@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://papio.dev/protocol/acquisition-bundle-v0.schema.json",
-  "title": "papio AcquisitionBundle (draft 0.x)",
-  "description": "bundle.json for one ready job: a validated, provenance-tracked artifact plus the evidence zotio needs. DRAFT: schema_version acquisition-bundle/0.1 until the Phase 4 v1 lock. Never contains API keys, cookies, signed query values, or identity-provider URLs; unknown fields are rejected (fail closed).",
+  "$id": "https://papio.dev/protocol/acquisition-bundle-v1.schema.json",
+  "title": "papio AcquisitionBundle v1",
+  "description": "bundle.json for one ready job: a validated, provenance-tracked artifact plus the evidence Zotio needs. Locked schema_version acquisition-bundle/1. Never contains API keys, cookies, signed query values, or identity-provider URLs; unknown fields are rejected (fail closed).",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -17,7 +17,7 @@
     "provenance_digest"
   ],
   "properties": {
-    "schema_version": { "const": "acquisition-bundle/0.1" },
+    "schema_version": { "const": "acquisition-bundle/1" },
     "job_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,128}$" },
     "request_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,128}$" },
     "identity": {

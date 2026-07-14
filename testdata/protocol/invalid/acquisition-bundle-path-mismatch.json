@@ -1,5 +1,5 @@
 {
-  "schema_version": "acquisition-bundle/0.1",
+  "schema_version": "acquisition-bundle/1",
   "job_id": "job_path_0001",
   "request_id": "wr_path_0001",
   "identity": {

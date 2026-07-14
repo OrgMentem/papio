@@ -1,14 +1,15 @@
 // Copyright 2026 OrgMentem. Licensed under MIT. See LICENSE.
-// papio-browser/0.1 (draft) — the extension side of the native-messaging
-// contract. This parser MUST accept and reject exactly the same corpus as the
+// papio-browser/1 — the locked extension/native-host contract. This parser
+// MUST accept and reject exactly the same corpus as the
 // Go core (testdata/protocol/valid and testdata/protocol/invalid): unknown
 // fields, unknown types, oversized frames, and out-of-bounds values are
 // errors, never warnings. auth_pending/auth_returned payloads structurally
 // cannot carry URLs or titles — identity-provider addresses never leave the
 // browser.
 
-export const BROWSER_PROTOCOL_VERSION = "papio-browser/0.1";
+export const BROWSER_PROTOCOL_VERSION = "papio-browser/1";
 export const MAX_BROWSER_MESSAGE_BYTES = 256 * 1024;
+export const MAX_BROWSER_INTEGER = Number.MAX_SAFE_INTEGER;
 
 export type BrowserMessageType =
   | "hello"
@@ -136,9 +137,9 @@ const MSG_ID_RE = /^[A-Za-z0-9_-]{8,64}$/;
 const JOB_ID_RE = /^[A-Za-z0-9_-]{8,128}$/;
 const HOST_RE = /^[a-z0-9.-]{3,253}$/;
 const ERROR_CODE_RE = /^[a-z0-9_]{2,50}$/;
-const FILENAME_RE = /^[^/\\]{1,255}$/;
-// RFC3339 with mandatory offset (Z or +hh:mm), matching Go's time.RFC3339.
-const RFC3339_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/;
+const FILENAME_RE = /^[^/\\]{1,255}$/u;
+const RFC3339_RE =
+  /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(Z|([+-])(\d{2}):(\d{2}))$/;
 
 function fail(msg: string): never {
   throw new ProtocolError(msg);
@@ -162,7 +163,7 @@ function requireKeys(obj: Record<string, unknown>, what: string, required: strin
 function str(obj: Record<string, unknown>, key: string, what: string, max = 1000): string {
   const v = obj[key];
   if (typeof v !== "string") fail(`${what}.${key} must be a string`);
-  if (v.length > max) fail(`${what}.${key} exceeds ${max} chars`);
+  if (Array.from(v).length > max) fail(`${what}.${key} exceeds ${max} chars`);
   return v;
 }
 
@@ -170,7 +171,29 @@ function int(obj: Record<string, unknown>, key: string, what: string, min: numbe
   const v = obj[key];
   if (typeof v !== "number" || !Number.isInteger(v)) fail(`${what}.${key} must be an integer`);
   if (v < min) fail(`${what}.${key} must be >= ${min}`);
+  if (v > MAX_BROWSER_INTEGER) fail(`${what}.${key} exceeds ${MAX_BROWSER_INTEGER}`);
   return v;
+}
+
+function isRFC3339(value: string): boolean {
+  const match = RFC3339_RE.exec(value);
+  if (match === null) return false;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const hour = Number(match[4]);
+  const minute = Number(match[5]);
+  const second = Number(match[6]);
+  if (month < 1 || month > 12 || hour > 23 || minute > 59 || second > 59) return false;
+  const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const daysInMonth = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  if (day < 1 || day > daysInMonth[month - 1]!) return false;
+  if (match[7] !== "Z") {
+    const offsetHour = Number(match[9]);
+    const offsetMinute = Number(match[10]);
+    if (offsetHour > 23 || offsetMinute > 59) return false;
+  }
+  return true;
 }
 
 /** Parse one decoded JSON value as a bridge message, failing closed. */
@@ -230,7 +253,8 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
         const keys = Object.keys(av);
         if (keys.length > 50) fail("hello.adapter_versions capped at 50");
         for (const k of keys) {
-          if (typeof av[k] !== "string" || (av[k] as string).length > 50) {
+          const value = av[k];
+          if (typeof value !== "string" || Array.from(value).length > 50) {
             fail(`hello.adapter_versions.${k} must be a short string`);
           }
         }
@@ -251,7 +275,7 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
       const mode = str(p, "access_mode", "job_offer", 20);
       if (mode !== "assisted" && mode !== "maximal") fail(`invalid access_mode ${JSON.stringify(mode)}`);
       const expires = str(p, "expires_at", "job_offer", 64);
-      if (!RFC3339_RE.test(expires)) fail("job_offer.expires_at must be RFC3339");
+      if (!isRFC3339(expires)) fail("job_offer.expires_at must be RFC3339");
       if ("expected" in p) {
         const ex = asRecord(p["expected"], "job_offer.expected");
         requireKeys(ex, "job_offer.expected", [], ["doi", "title"]);

@@ -1,9 +1,10 @@
 // Copyright 2026 OrgMentem. Licensed under MIT. See LICENSE.
-// Package protocol implements papio's draft 0.x cross-process contracts with
-// strict, fail-closed decoding: unknown fields, unknown message types, oversized
+// Package protocol implements papio's cross-process contracts with strict,
+// fail-closed decoding: unknown fields, unknown message types, oversized
 // messages, and cross-field inconsistencies are errors, never warnings. The
-// JSON Schema documents in protocol/ are the human/TypeScript source of truth;
-// this package must accept and reject exactly the same corpus
+// browser bridge, work-request, and acquisition-bundle contracts are locked
+// at v1. The JSON Schema documents in protocol/ are the human/TypeScript
+// source of truth; this package must accept and reject exactly the same corpus
 // (testdata/protocol/valid and testdata/protocol/invalid).
 package protocol
 
@@ -14,19 +15,24 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
-// Contract versions. Draft 0.x until the plan's Phase 3 (browser) and
-// Phase 4 (work request / bundle) locks mint v1.
+// Contract versions locked after live browser, acquisition, bundle-export, and
+// Zotio import acceptance.
 const (
-	WorkRequestSchemaVersion       = "work-request/0.1"
-	AcquisitionBundleSchemaVersion = "acquisition-bundle/0.1"
-	BrowserProtocolVersion         = "papio-browser/0.1"
+	WorkRequestSchemaVersion       = "work-request/1"
+	AcquisitionBundleSchemaVersion = "acquisition-bundle/1"
+	BrowserProtocolVersion         = "papio-browser/1"
 )
 
 // MaxBrowserMessageBytes caps one encoded native-messaging frame well below
 // Chrome's documented 1 MiB host-to-extension limit.
 const MaxBrowserMessageBytes = 256 << 10
+
+// MaxBrowserInteger is the largest integer represented exactly by both Go
+// int64 and JavaScript number values.
+const MaxBrowserInteger int64 = 1<<53 - 1
 
 var (
 	requestIDRE  = regexp.MustCompile(`^[A-Za-z0-9_-]{8,128}$`)
@@ -42,6 +48,7 @@ var (
 	hostRE       = regexp.MustCompile(`^[a-z0-9.-]{3,253}$`)
 	errorCodeRE  = regexp.MustCompile(`^[a-z0-9_]{2,50}$`)
 	filenameRE   = regexp.MustCompile(`^[^/\\]{1,255}$`)
+	rfc3339RE    = regexp.MustCompile(`^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$`)
 )
 
 // strictDecode unmarshals data into v, rejecting unknown fields and trailing input.
@@ -57,8 +64,46 @@ func strictDecode(data []byte, v any) error {
 	return nil
 }
 
+func browserObjectFields(data []byte, what string) (map[string]json.RawMessage, error) {
+	var fields map[string]json.RawMessage
+	if err := strictDecode(data, &fields); err != nil {
+		return nil, fmt.Errorf("%s must be an object: %w", what, err)
+	}
+	if fields == nil {
+		return nil, fmt.Errorf("%s must be an object", what)
+	}
+	return fields, nil
+}
+
+func browserFieldIsNull(fields map[string]json.RawMessage, key string) bool {
+	raw, ok := fields[key]
+	return ok && bytes.Equal(bytes.TrimSpace(raw), []byte("null"))
+}
+
+func browserRequireFields(fields map[string]json.RawMessage, keys ...string) error {
+	for _, key := range keys {
+		if _, ok := fields[key]; !ok || browserFieldIsNull(fields, key) {
+			return fmt.Errorf("field %q is required and cannot be null", key)
+		}
+	}
+	return nil
+}
+
+func browserRejectNullFields(fields map[string]json.RawMessage, keys ...string) error {
+	for _, key := range keys {
+		if browserFieldIsNull(fields, key) {
+			return fmt.Errorf("field %q cannot be null", key)
+		}
+	}
+	return nil
+}
+
+func browserTextLen(value string) int {
+	return utf8.RuneCountInString(value)
+}
+
 // ---------------------------------------------------------------------------
-// WorkRequest (draft work-request/0.1)
+// WorkRequest (work-request/1)
 // ---------------------------------------------------------------------------
 
 // Identifiers carries the recognized scholarly identifiers.
@@ -181,7 +226,7 @@ func enumOK(field, value string, allowed ...string) error {
 }
 
 // ---------------------------------------------------------------------------
-// AcquisitionBundle (draft acquisition-bundle/0.1)
+// AcquisitionBundle (acquisition-bundle/1)
 // ---------------------------------------------------------------------------
 
 // BundleIdentity is the resolved bibliographic identity of the acquired work.
@@ -325,7 +370,7 @@ func enumRequired(field, value string, allowed ...string) error {
 }
 
 // ---------------------------------------------------------------------------
-// Browser bridge messages (draft papio-browser/0.1)
+// Browser bridge messages (locked papio-browser/1)
 // ---------------------------------------------------------------------------
 
 // Browser message types.
@@ -442,76 +487,138 @@ func DecodeBrowserMessage(data []byte) (*BrowserMessage, error) {
 	if err := strictDecode(data, &env); err != nil {
 		return nil, fmt.Errorf("browser message: %w", err)
 	}
+	envelopeFields, err := browserObjectFields(data, "browser message")
+	if err != nil {
+		return nil, err
+	}
+	if _, ok := envelopeFields["job_id"]; ok {
+		if browserFieldIsNull(envelopeFields, "job_id") || !requestIDRE.MatchString(env.JobID) {
+			return nil, fmt.Errorf("browser message: invalid job_id %q", env.JobID)
+		}
+	}
 	if env.Protocol != BrowserProtocolVersion {
 		return nil, fmt.Errorf("browser message: protocol %q, want %q", env.Protocol, BrowserProtocolVersion)
 	}
 	if !msgIDRE.MatchString(env.MsgID) {
 		return nil, fmt.Errorf("browser message: invalid msg_id %q", env.MsgID)
 	}
-	if env.Seq == nil || *env.Seq < 0 {
-		return nil, fmt.Errorf("browser message: seq required and non-negative")
+	if env.Seq == nil || *env.Seq < 0 || *env.Seq > MaxBrowserInteger {
+		return nil, fmt.Errorf("browser message: seq required in range 0..%d", MaxBrowserInteger)
 	}
-	if jobScoped[env.Type] {
-		if !requestIDRE.MatchString(env.JobID) {
-			return nil, fmt.Errorf("browser message: type %q requires a valid job_id", env.Type)
-		}
+	if jobScoped[env.Type] && env.JobID == "" {
+		return nil, fmt.Errorf("browser message: type %q requires a valid job_id", env.Type)
 	}
 	if env.Payload == nil {
 		return nil, fmt.Errorf("browser message: payload required")
 	}
+	payloadFields, err := browserObjectFields(env.Payload, "browser message payload")
+	if err != nil {
+		return nil, err
+	}
 
 	msg := &BrowserMessage{Protocol: env.Protocol, Type: env.Type, MsgID: env.MsgID, JobID: env.JobID, Seq: *env.Seq}
-	var err error
 	switch env.Type {
 	case MsgHello:
 		p := &HelloPayload{}
-		if err = strictDecode(env.Payload, p); err == nil {
-			if p.ExtensionVersion == "" || len(p.ExtensionVersion) > 50 {
+		if err = browserRequireFields(payloadFields, "extension_version"); err == nil {
+			err = browserRejectNullFields(payloadFields, "adapter_versions")
+		}
+		var adapterFields map[string]json.RawMessage
+		if raw, ok := payloadFields["adapter_versions"]; ok && err == nil {
+			adapterFields, err = browserObjectFields(raw, "hello.adapter_versions")
+		}
+		if err == nil {
+			err = strictDecode(env.Payload, p)
+		}
+		if err == nil {
+			if p.ExtensionVersion == "" || browserTextLen(p.ExtensionVersion) > 50 {
 				err = fmt.Errorf("hello.extension_version required (max 50)")
-			}
-			if err == nil && len(p.AdapterVersions) > 50 {
+			} else if len(p.AdapterVersions) > 50 {
 				err = fmt.Errorf("hello.adapter_versions capped at 50")
+			}
+		}
+		for key, raw := range adapterFields {
+			if err != nil {
+				break
+			}
+			var value string
+			if browserFieldIsNull(adapterFields, key) {
+				err = fmt.Errorf("hello.adapter_versions.%s cannot be null", key)
+			} else if err = strictDecode(raw, &value); err == nil && browserTextLen(value) > 50 {
+				err = fmt.Errorf("hello.adapter_versions.%s exceeds 50 chars", key)
 			}
 		}
 		msg.Payload = p
 	case MsgJobOffer:
 		p := &JobOfferPayload{}
-		if err = strictDecode(env.Payload, p); err == nil {
+		if err = browserRequireFields(payloadFields, "openurl", "provider_hosts", "access_mode", "expires_at"); err == nil {
+			err = browserRejectNullFields(payloadFields, "expected")
+		}
+		if raw, ok := payloadFields["expected"]; ok && err == nil {
+			var expectedFields map[string]json.RawMessage
+			if expectedFields, err = browserObjectFields(raw, "job_offer.expected"); err == nil {
+				err = browserRejectNullFields(expectedFields, "doi", "title")
+			}
+		}
+		if err == nil {
+			err = strictDecode(env.Payload, p)
+		}
+		if err == nil {
 			err = p.validate()
 		}
 		msg.Payload = p
 	case MsgAuthPending, MsgAuthReturned:
 		p := &AuthPayload{}
-		if err = strictDecode(env.Payload, p); err == nil && p.ElapsedMS != nil && *p.ElapsedMS < 0 {
-			err = fmt.Errorf("elapsed_ms must be >= 0")
+		err = browserRejectNullFields(payloadFields, "elapsed_ms")
+		if err == nil {
+			err = strictDecode(env.Payload, p)
+		}
+		if err == nil && p.ElapsedMS != nil && (*p.ElapsedMS < 0 || *p.ElapsedMS > MaxBrowserInteger) {
+			err = fmt.Errorf("elapsed_ms must be in range 0..%d", MaxBrowserInteger)
 		}
 		msg.Payload = p
 	case MsgDownloadStarted:
 		p := &DownloadStartedPayload{}
-		if err = strictDecode(env.Payload, p); err == nil {
-			err = validateDownload(p.DownloadID, p.Filename, 1)
+		if err = browserRequireFields(payloadFields, "download_id", "filename"); err == nil {
+			err = strictDecode(env.Payload, p)
+		}
+		if err == nil {
+			err = validateDownload(p.DownloadID, p.Filename)
 		}
 		msg.Payload = p
 	case MsgDownloadComplete:
 		p := &DownloadCompletePayload{}
-		if err = strictDecode(env.Payload, p); err == nil {
-			if err = validateDownload(p.DownloadID, p.Filename, p.SizeBytes); err == nil && p.SizeBytes < 1 {
-				err = fmt.Errorf("size_bytes must be >= 1")
-			}
+		if err = browserRequireFields(payloadFields, "download_id", "filename", "size_bytes"); err == nil {
+			err = strictDecode(env.Payload, p)
+		}
+		if err == nil {
+			err = validateDownload(p.DownloadID, p.Filename)
+		}
+		if err == nil && (p.SizeBytes < 1 || p.SizeBytes > MaxBrowserInteger) {
+			err = fmt.Errorf("size_bytes must be in range 1..%d", MaxBrowserInteger)
 		}
 		msg.Payload = p
 	case MsgProviderOutcome:
 		p := &ProviderOutcomePayload{}
-		if err = strictDecode(env.Payload, p); err == nil {
+		if err = browserRequireFields(payloadFields, "outcome"); err == nil {
+			err = browserRejectNullFields(payloadFields, "adapter_version", "detail")
+		}
+		if err == nil {
+			err = strictDecode(env.Payload, p)
+		}
+		if err == nil {
 			err = p.validate()
 		}
 		msg.Payload = p
 	case MsgError:
 		p := &ErrorPayload{}
-		if err = strictDecode(env.Payload, p); err == nil {
+		if err = browserRequireFields(payloadFields, "code", "message"); err == nil {
+			err = strictDecode(env.Payload, p)
+		}
+		if err == nil {
 			if !errorCodeRE.MatchString(p.Code) {
 				err = fmt.Errorf("invalid error code %q", p.Code)
-			} else if p.Message == "" || len(p.Message) > 1000 {
+			} else if p.Message == "" || browserTextLen(p.Message) > 1000 {
 				err = fmt.Errorf("error message required (max 1000)")
 			}
 		}
@@ -530,7 +637,7 @@ func DecodeBrowserMessage(data []byte) (*BrowserMessage, error) {
 }
 
 func (p *JobOfferPayload) validate() error {
-	if p.OpenURL == "" || len(p.OpenURL) > 4000 || !strings.HasPrefix(p.OpenURL, "https://") {
+	if p.OpenURL == "" || browserTextLen(p.OpenURL) > 4000 || !strings.HasPrefix(p.OpenURL, "https://") {
 		return fmt.Errorf("openurl must be a bounded https URL")
 	}
 	if len(p.ProviderHosts) < 1 || len(p.ProviderHosts) > 20 {
@@ -544,11 +651,14 @@ func (p *JobOfferPayload) validate() error {
 	if err := enumRequired("access_mode", p.AccessMode, "assisted", "maximal"); err != nil {
 		return err
 	}
+	if !rfc3339RE.MatchString(p.ExpiresAt) {
+		return fmt.Errorf("expires_at must be RFC3339")
+	}
 	if _, err := time.Parse(time.RFC3339, p.ExpiresAt); err != nil {
 		return fmt.Errorf("expires_at: %w", err)
 	}
 	if p.Expected != nil {
-		if len(p.Expected.DOI) > 300 || len(p.Expected.Title) > 500 {
+		if browserTextLen(p.Expected.DOI) > 300 || browserTextLen(p.Expected.Title) > 500 {
 			return fmt.Errorf("expected hints exceed bounds")
 		}
 	}
@@ -561,20 +671,19 @@ func (p *ProviderOutcomePayload) validate() error {
 		"rate_limited", "terms_acceptance_required", "human_auth_required", "cancelled"); err != nil {
 		return err
 	}
-	if len(p.AdapterVersion) > 50 {
+	if browserTextLen(p.AdapterVersion) > 50 {
 		return fmt.Errorf("adapter_version exceeds 50 chars")
 	}
-	if len(p.Detail) > 500 {
+	if browserTextLen(p.Detail) > 500 {
 		return fmt.Errorf("detail exceeds 500 chars")
 	}
 	return nil
 }
 
-func validateDownload(id int64, filename string, size int64) error {
-	if id < 0 {
-		return fmt.Errorf("download_id must be >= 0")
+func validateDownload(id int64, filename string) error {
+	if id < 0 || id > MaxBrowserInteger {
+		return fmt.Errorf("download_id must be in range 0..%d", MaxBrowserInteger)
 	}
-	_ = size
 	if !filenameRE.MatchString(filename) {
 		return fmt.Errorf("filename must be a bare name without path separators")
 	}

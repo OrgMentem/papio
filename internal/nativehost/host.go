@@ -4,7 +4,7 @@
 //
 // The host is a thin, disposable relay: Chrome launches papio-native-host,
 // hands it the extension origin as an untrusted argument, and speaks the
-// papio-browser/0.1 protocol over stdin/stdout using Chrome's 4-byte
+// locked papio-browser/1 protocol over stdin/stdout using Chrome's 4-byte
 // little-endian length framing. This process owns no durable state. It
 // validates the origin, enforces framing and the fail-closed protocol
 // invariants (bounded frame size, hello-first, strictly increasing seq), and

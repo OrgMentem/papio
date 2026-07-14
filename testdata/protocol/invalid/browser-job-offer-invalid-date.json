@@ -1,0 +1,13 @@
+{
+  "protocol": "papio-browser/1",
+  "type": "job_offer",
+  "msg_id": "m_offer_date1",
+  "job_id": "job_offer_date1",
+  "seq": 1,
+  "payload": {
+    "openurl": "https://resolver.example/openurl",
+    "provider_hosts": ["example.com"],
+    "access_mode": "maximal",
+    "expires_at": "2026-02-30T00:00:00Z"
+  }
+}

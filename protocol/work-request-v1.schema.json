@@ -1,13 +1,13 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://papio.dev/protocol/work-request-v0.schema.json",
-  "title": "papio WorkRequest (draft 0.x)",
-  "description": "One explicitly requested work. DRAFT: schema_version work-request/0.1 until the Phase 4 v1 lock. Unknown fields are rejected by every consumer (fail closed).",
+  "$id": "https://papio.dev/protocol/work-request-v1.schema.json",
+  "title": "papio WorkRequest v1",
+  "description": "One explicitly requested work. Locked schema_version work-request/1. Unknown fields are rejected by every consumer (fail closed).",
   "type": "object",
   "additionalProperties": false,
   "required": ["schema_version", "request_id"],
   "properties": {
-    "schema_version": { "const": "work-request/0.1" },
+    "schema_version": { "const": "work-request/1" },
     "request_id": {
       "type": "string",
       "pattern": "^[A-Za-z0-9_-]{8,128}$",

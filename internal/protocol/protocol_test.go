@@ -77,14 +77,14 @@ func TestInvalidCorpusFailsClosed(t *testing.T) {
 
 // The IdP privacy invariant is structural: auth payloads cannot carry a URL.
 func TestAuthPayloadRejectsURLFields(t *testing.T) {
-	msg := []byte(`{"protocol":"papio-browser/0.1","type":"auth_returned","msg_id":"m_auth_ret1","job_id":"job_0002_tyler","seq":5,"payload":{"url":"https://idp.example.edu/sso?token=SECRET"}}`)
+	msg := []byte(`{"protocol":"papio-browser/1","type":"auth_returned","msg_id":"m_auth_ret1","job_id":"job_0002_tyler","seq":5,"payload":{"url":"https://idp.example.edu/sso?token=SECRET"}}`)
 	if _, err := DecodeBrowserMessage(msg); err == nil {
 		t.Fatal("auth_returned payload with url field was accepted")
 	}
 }
 
 func TestBrowserMessageSizeCap(t *testing.T) {
-	big := append([]byte(`{"protocol":"papio-browser/0.1","type":"ack","msg_id":"m_ack_00001","seq":0,"payload":{}} `), make([]byte, MaxBrowserMessageBytes)...)
+	big := append([]byte(`{"protocol":"papio-browser/1","type":"ack","msg_id":"m_ack_00001","seq":0,"payload":{}} `), make([]byte, MaxBrowserMessageBytes)...)
 	if _, err := DecodeBrowserMessage(big); err == nil || !strings.Contains(err.Error(), "exceeds cap") {
 		t.Fatalf("oversized frame err = %v, want size-cap rejection", err)
 	}

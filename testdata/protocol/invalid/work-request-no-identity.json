@@ -1,5 +1,5 @@
 {
-  "schema_version": "work-request/0.1",
+  "schema_version": "work-request/1",
   "request_id": "wr_no_identity",
   "title": "Some Paper Without Authors Or Year"
 }

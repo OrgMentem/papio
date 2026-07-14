@@ -1,7 +1,7 @@
 {
   "protocol": "papio-browser/1",
   "type": "ack",
-  "msg_id": "m_ack_00001",
-  "seq": 10,
+  "msg_id": "m_ack_unsafe1",
+  "seq": 9007199254740992,
   "payload": {}
 }

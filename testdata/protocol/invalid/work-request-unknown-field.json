@@ -1,5 +1,5 @@
 {
-  "schema_version": "work-request/0.1",
+  "schema_version": "work-request/1",
   "request_id": "wr_unknown_field",
   "identifiers": {
     "doi": "10.1000/xyz123"

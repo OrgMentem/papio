@@ -1,5 +1,5 @@
 {
-  "protocol": "papio-browser/0.1",
+  "protocol": "papio-browser/1",
   "type": "hello",
   "msg_id": "m_hello_001",
   "seq": 0,

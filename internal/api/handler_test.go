@@ -145,7 +145,7 @@ func TestRouterBrowserSyncHandshakeAndInvalidFrame(t *testing.T) {
 	system := testSystem(t)
 	router := Router(system)
 
-	hello := json.RawMessage(`{"protocol":"papio-browser/0.1","type":"hello","msg_id":"client-hello-1","seq":0,"payload":{"extension_version":"1.0.0"}}`)
+	hello := json.RawMessage(`{"protocol":"papio-browser/1","type":"hello","msg_id":"client-hello-1","seq":0,"payload":{"extension_version":"1.0.0"}}`)
 	var result struct {
 		Outbound []json.RawMessage `json:"outbound"`
 	}
@@ -169,7 +169,7 @@ func TestRouterBrowserSyncHandshakeAndInvalidFrame(t *testing.T) {
 	}
 
 	// A structurally invalid frame fails closed as invalid_argument.
-	bad := json.RawMessage(`{"protocol":"papio-browser/0.1","type":"hello","msg_id":"x","seq":0,"payload":{"extension_version":"1.0.0"}}`)
+	bad := json.RawMessage(`{"protocol":"papio-browser/1","type":"hello","msg_id":"x","seq":0,"payload":{"extension_version":"1.0.0"}}`)
 	rpcErr := callMethod(t, router, "browser.sync", map[string]any{"messages": []json.RawMessage{bad}}, nil)
 	if rpcErr == nil || rpcErr.Code != "invalid_argument" {
 		t.Fatalf("invalid frame error = %+v, want invalid_argument", rpcErr)

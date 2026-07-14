@@ -1,0 +1,12 @@
+{
+  "protocol": "papio-browser/1",
+  "type": "hello",
+  "msg_id": "m_hello_long1",
+  "seq": 0,
+  "payload": {
+    "extension_version": "1.0.0",
+    "adapter_versions": {
+      "provider": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }
+  }
+}

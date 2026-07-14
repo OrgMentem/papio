@@ -1,6 +1,6 @@
 // Copyright 2026 OrgMentem. Licensed under MIT. See LICENSE.
 // Package browser implements the daemon side of the Phase 2 ordinary-Chrome
-// institutional handoff. The bridge speaks the papio-browser/0.1 protocol as a
+// institutional handoff. The bridge speaks locked papio-browser/1 as a
 // pull loop over daemon-owned local IPC: the extension delivers observation
 // frames and the bridge returns command frames. Browser messages are strictly
 // re-validated here (fail closed) and treated as observations only — they never

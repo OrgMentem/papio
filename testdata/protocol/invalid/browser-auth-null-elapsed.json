@@ -1,0 +1,10 @@
+{
+  "protocol": "papio-browser/1",
+  "type": "auth_returned",
+  "msg_id": "m_auth_null01",
+  "job_id": "job_auth_null1",
+  "seq": 2,
+  "payload": {
+    "elapsed_ms": null
+  }
+}

@@ -1,7 +1,8 @@
 {
   "protocol": "papio-browser/1",
   "type": "ack",
-  "msg_id": "m_ack_00001",
-  "seq": 10,
+  "msg_id": "m_ack_jobnull",
+  "job_id": null,
+  "seq": 0,
   "payload": {}
 }

@@ -129,7 +129,7 @@ func runSync(t *testing.T, b *Bridge, frames ...json.RawMessage) ([]*protocol.Br
 }
 
 func hello() json.RawMessage {
-	return json.RawMessage(`{"protocol":"papio-browser/0.1","type":"hello","msg_id":"client-hello-1","seq":0,"payload":{"extension_version":"1.2.3"}}`)
+	return json.RawMessage(`{"protocol":"papio-browser/1","type":"hello","msg_id":"client-hello-1","seq":0,"payload":{"extension_version":"1.2.3"}}`)
 }
 
 func firstOfType(msgs []*protocol.BrowserMessage, typ string) *protocol.BrowserMessage {
@@ -231,7 +231,7 @@ func TestSentinelSecretNeverEntersMessagesOrDurableRows(t *testing.T) {
 
 	// A client attempt to smuggle an IdP URL as an extra field on an auth frame
 	// fails the strict decode and stores nothing.
-	bad := json.RawMessage(`{"protocol":"papio-browser/0.1","type":"auth_returned","msg_id":"client-msg-9","seq":9,"job_id":"` + id +
+	bad := json.RawMessage(`{"protocol":"papio-browser/1","type":"auth_returned","msg_id":"client-msg-9","seq":9,"job_id":"` + id +
 		`","payload":{"elapsed_ms":10,"idp_url":"https://idp.example/saml?token=` + sentinel + `"}}`)
 	if _, err := b.Sync(context.Background(), []json.RawMessage{bad}); err == nil {
 		t.Fatal("smuggled idp_url field must be rejected")

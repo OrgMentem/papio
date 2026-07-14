@@ -21,7 +21,7 @@ test("valid browser corpus parses", () => {
   for (const name of fixtures) {
     const text = readFileSync(join(corpusRoot, "valid", name), "utf8");
     const msg = parseBrowserMessageBytes(text);
-    expect(msg.protocol).toBe("papio-browser/0.1");
+    expect(msg.protocol).toBe("papio-browser/1");
   }
 });
 
@@ -36,7 +36,7 @@ test("invalid browser corpus fails closed", () => {
 test("auth payloads structurally reject URLs", () => {
   expect(() =>
     parseBrowserMessage({
-      protocol: "papio-browser/0.1",
+      protocol: "papio-browser/1",
       type: "auth_returned",
       msg_id: "m_auth_ret1",
       job_id: "job_0002_tyler",
@@ -48,13 +48,13 @@ test("auth payloads structurally reject URLs", () => {
 
 test("oversized frames are rejected before parsing", () => {
   const pad = " ".repeat(MAX_BROWSER_MESSAGE_BYTES);
-  expect(() => parseBrowserMessageBytes(`{"protocol":"papio-browser/0.1"}${pad}`)).toThrow(/exceeds cap/);
+  expect(() => parseBrowserMessageBytes(`{"protocol":"papio-browser/1"}${pad}`)).toThrow(/exceeds cap/);
 });
 
 test("unknown envelope fields fail closed", () => {
   expect(() =>
     parseBrowserMessage({
-      protocol: "papio-browser/0.1",
+      protocol: "papio-browser/1",
       type: "ack",
       msg_id: "m_ack_00001",
       seq: 0,

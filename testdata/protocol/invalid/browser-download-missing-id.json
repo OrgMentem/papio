@@ -1,0 +1,10 @@
+{
+  "protocol": "papio-browser/1",
+  "type": "download_started",
+  "msg_id": "m_dls_noid01",
+  "job_id": "job_dls_noid01",
+  "seq": 3,
+  "payload": {
+    "filename": "paper.pdf"
+  }
+}

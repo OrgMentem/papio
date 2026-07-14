@@ -1,0 +1,14 @@
+{
+  "protocol": "papio-browser/1",
+  "type": "job_offer",
+  "msg_id": "m_offer_null1",
+  "job_id": "job_offer_null1",
+  "seq": 1,
+  "payload": {
+    "openurl": "https://resolver.example/openurl",
+    "provider_hosts": ["example.com"],
+    "expected": null,
+    "access_mode": "assisted",
+    "expires_at": "2026-07-14T08:00:00Z"
+  }
+}
