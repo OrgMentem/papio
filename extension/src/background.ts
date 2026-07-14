@@ -246,8 +246,9 @@ export class Bridge {
     this.deps.downloads.onDeterminingFilename?.addListener((item, suggest) => {
       // Exact adapter-started URL wins. Host fallback remains fail-closed when
       // several active jobs share a provider.
-      const src = item.finalUrl ?? item.url;
-      const exactJobID = src ? this.pendingDownloadURLs.get(src) : undefined;
+      const exactJobID =
+        (item.url ? this.pendingDownloadURLs.get(item.url) : undefined) ??
+        (item.finalUrl ? this.pendingDownloadURLs.get(item.finalUrl) : undefined);
       const job = exactJobID ? findByJob(this.store, exactJobID) : this.correlate(item);
       if (!job) return;
       const base = (item.filename ?? "").split(/[\\/]/).pop() ?? "";

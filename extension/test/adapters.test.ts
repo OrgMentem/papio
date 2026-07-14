@@ -264,7 +264,13 @@ class FakeDownloads {
     const id = 700 + this.started.length;
     let finalRelative = "out.pdf"; // provider Content-Disposition suggestion
     await this.onDeterminingFilename.emit(
-      { id, url: options.url, filename: finalRelative, state: "in_progress" },
+      {
+        id,
+        url: options.url,
+        finalUrl: "https://media.proquest.com/redirected/out.pdf",
+        filename: finalRelative,
+        state: "in_progress",
+      },
       (s) => {
         finalRelative = s.filename;
       },
