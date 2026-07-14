@@ -266,7 +266,7 @@ class FakeDownloads {
     await this.onDeterminingFilename.emit(
       {
         id,
-        url: options.url,
+        url: options.url.replace("TOKEN=ephemeral", "TOKEN=normalized"),
         finalUrl: "https://media.proquest.com/redirected/out.pdf",
         filename: finalRelative,
         state: "in_progress",

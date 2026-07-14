@@ -165,6 +165,18 @@ function parseExpected(raw: unknown): { title?: string; doi?: string } | undefin
   };
 }
 
+/** Compare only the stable, non-secret part of a provider download URL.
+ * Chrome may normalize a signed query before onDeterminingFilename fires. */
+function sameDownloadRoute(a: string, b: string): boolean {
+  try {
+    const left = new URL(a);
+    const right = new URL(b);
+    return left.origin === right.origin && left.pathname === right.pathname;
+  } catch {
+    return false;
+  }
+}
+
 /** Self-contained provider-link extractor, injected verbatim into the tracked
  * page. It returns only an HTTPS href from the declared selector. The signed
  * URL remains in extension memory and is handed directly to
@@ -228,6 +240,17 @@ export class Bridge {
     await this.update((s) => removeJob(s, jobID));
   }
 
+  private pendingJobFor(item: DownloadItemLike): string | undefined {
+    const observed = [item.url, item.finalUrl].filter((v): v is string => typeof v === "string");
+    const jobs = new Set<string>();
+    for (const [pendingURL, jobID] of this.pendingDownloadURLs) {
+      if (observed.some((url) => url === pendingURL || sameDownloadRoute(url, pendingURL))) {
+        jobs.add(jobID);
+      }
+    }
+    return jobs.size === 1 ? jobs.values().next().value : undefined;
+  }
+
   private bindListeners(): void {
     if (this.listenersBound) return;
     this.listenersBound = true;
@@ -246,9 +269,7 @@ export class Bridge {
     this.deps.downloads.onDeterminingFilename?.addListener((item, suggest) => {
       // Exact adapter-started URL wins. Host fallback remains fail-closed when
       // several active jobs share a provider.
-      const exactJobID =
-        (item.url ? this.pendingDownloadURLs.get(item.url) : undefined) ??
-        (item.finalUrl ? this.pendingDownloadURLs.get(item.finalUrl) : undefined);
+      const exactJobID = this.pendingJobFor(item);
       const job = exactJobID ? findByJob(this.store, exactJobID) : this.correlate(item);
       if (!job) return;
       const base = (item.filename ?? "").split(/[\\/]/).pop() ?? "";
