@@ -696,12 +696,18 @@ None of these weaken the first-release access or validation invariants.
 - Live existing-item stored route: missing-PDF item `2LSPBIZS` (DOI `10.1186/s12913-020-05129-1`) reached ready in about 8 s with SHA-256 `4069bc5ccb3d54a0287fd0f2a9b773962c8ff5ccd4bff4bd9e1240967d854b62`; `zplan_1005869fab01cb1c6d0d3d8739` selected `existing_item` stored mode with confirmation `sha256:b05f14894bd720c45cb648a315481a9ba63c56673e53de6554f84860aea96fe6`; apply returned attachment key `7WJWP5AH` (stored upload 1,621,182 bytes, MD5 `f4044051`), and replay returned the identical idempotency-ledger result. The item left the live missing-PDF queue; the temporary `attachment_mode = 'stored'` gate setting was restored to linked-file.
 - The WorkRequest v1 and AcquisitionBundle v1 freeze condition is satisfied by both routes and the duplicate case.
 
-### Field-found gaps / open items
+## Identity-review resolution surface (2026-07-14)
 
-- `needs_review` remains a public-surface dead end: `job.Store.Retry` excludes it, while the planned `actions open|resolve` commands do not exist. The live arXiv Goodhart `1803.04585` acquisition parked on year evidence `2018` versus `v4-PDF` and was cancelled; `actions resolve` must be implemented, with the identity-accept path still requiring design.
-- EBSCO Hanlet and Springer Leventhal supervised live acceptances remain pending.
+- Field-found during Phase 4 live replay: `needs_review` was a public-surface dead end — `job.Store.Retry` deliberately excludes human-parked jobs, but the planned `actions resolve` command did not exist. A live arXiv Goodhart `1803.04585` acquisition parked on year evidence (`2018` requested versus the `v4` 2019 PDF) with no resolution path.
+- Implemented `papio actions resolve <action-id> --accept|--reject` over a new `actions.resolve` RPC and transactional `job.Store.ResolveReview`: verdicts apply only to open `verify_identity` actions on `needs_review` jobs; reject cancels with `review_rejected`; accept resolves the action, flips the parked candidate back to `pending` with `review_override=1` (migration `0004_candidate_review_override.sql`, schema version 4), and requeues the job at the durable fetching boundary. The `verify_identity` action detail now names the local quarantine file so the human can inspect the parked PDF.
+- Fail-closed boundaries preserved: the override never bypasses explicit `IdentityReject` (wrong work still rejects) or encrypted/active-content review; only the semantic/identity-review class is human-acceptable. Override-accepted artifacts persist `IdentityResult: "user_confirmed"` — never a fake machine `pass` — and bundle export propagates exactly `pass` or `user_confirmed` into `validation.identity`, which the locked acquisition-bundle/1 schema already enumerated.
+- Live proof (job `job_085b4e24d359be916f95b859d7`): re-acquired Goodhart parked `needs_review`; the quarantined PDF was human-verified via the action-detail path; `actions resolve --accept` resumed the job to `ready` in ~4 s with `human_identity_override` in the durable transition event; bundle carried `validation.identity: "user_confirmed"`; `zplan_f2d8e33f3d378664128dc1d1df` applied attachment `AEINSTXE` under parent `KFYKPBV9`, which then left the live missing-PDF queue.
+
+### Open items
+
+- JSTOR, EBSCO Hanlet, and Springer Leventhal supervised live acceptances remain pending (the three shortlisted trust-paper DOIs are queued and parked `awaiting_human` at the institutional handoff: `10.1145/3698061.3726907`, `10.1145/3715070.3749256`, `10.3390/jtaer21050153` — both publishers block non-browser fetch with HTTP 403, so they resume in the user's Chrome).
 - The Web Store signing key and packed extension-ID re-pin remain deferred.
 
 ## Next
 
-Phase 5 hardening/release, then close the `needs_review` action gap, complete the JSTOR, EBSCO Hanlet, and Springer Leventhal supervised live acceptances, and generate/preserve the Web Store signing key with packed extension-ID re-pin.
+Phase 5 hardening/release, complete the JSTOR, EBSCO Hanlet, and Springer Leventhal supervised live acceptances, and generate/preserve the Web Store signing key with packed extension-ID re-pin.
