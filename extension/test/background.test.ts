@@ -127,6 +127,12 @@ function makeHarness(seed?: StoreShape): Harness {
     backend,
     tabs,
     downloads,
+    // No registered adapters and no granted host: these behavioural tests stay
+    // entirely in assisted mode, so the classifier never fires. Adapter mapping
+    // is covered in adapters.test.ts.
+    adapterSpecs: [],
+    scripting: { executeScript: async () => [] },
+    permissions: { contains: async () => false },
   };
   return {
     bridge: new Bridge(deps),

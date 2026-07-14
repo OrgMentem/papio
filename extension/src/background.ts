@@ -33,6 +33,13 @@ import {
   type StateBackend,
   type StoreShape,
 } from "./state";
+import {
+  adapters,
+  interpret,
+  type AdapterContext,
+  type AdapterSpec,
+  type PageVerdict,
+} from "./adapters/types";
 
 export const NATIVE_HOST = "com.orgmentem.papio";
 
@@ -102,6 +109,26 @@ export interface BridgeDeps {
       [DownloadItemLike, (s: { filename: string; conflictAction: "uniquify" }) => void]
     >;
   };
+  /** Registered declarative provider adapters. Injected so hello's
+   * adapter_versions map and the classifier are unit-testable. */
+  adapterSpecs: AdapterSpec[];
+  /** chrome.scripting seam. Only ever used to inject the single self-contained
+   * `interpret` function (and the one-line download click) on the tracked tab
+   * of a granted provider host. */
+  scripting: {
+    executeScript(injection: {
+      target: { tabId: number };
+      // Loosely typed to mirror chrome.scripting.ScriptInjection.func and to
+      // accept `interpret` (a 3-arg DOM function) as an injectable value.
+      func: (...args: any[]) => unknown;
+      args?: unknown[];
+    }): Promise<{ result?: unknown }[]>;
+  };
+  /** chrome.permissions seam. Adapter execution is gated on an explicit
+   * optional-host-permission grant for the provider origin. */
+  permissions: {
+    contains(perm: { origins: string[] }): Promise<boolean>;
+  };
 }
 
 interface DownloadTrack {
@@ -111,6 +138,30 @@ interface DownloadTrack {
 
 function hostMatches(host: string, providerHosts: string[]): boolean {
   return providerHosts.some((h) => host === h || host.endsWith("." + h));
+}
+
+/** Narrow a job_offer's optional `expected` block to the resolver-declared work
+ * hints we persist for classification. Never carries an IdP value. */
+function parseExpected(raw: unknown): { title?: string; doi?: string } | undefined {
+  if (raw === null || typeof raw !== "object") return undefined;
+  const e = raw as Record<string, unknown>;
+  const title = typeof e["title"] === "string" ? e["title"] : undefined;
+  const doi = typeof e["doi"] === "string" ? e["doi"] : undefined;
+  if (title === undefined && doi === undefined) return undefined;
+  return {
+    ...(title !== undefined ? { title } : {}),
+    ...(doi !== undefined ? { doi } : {}),
+  };
+}
+
+/** Self-contained download-initiation click, injected verbatim into the page by
+ * chrome.scripting.executeScript. References nothing outside its own parameters
+ * and page globals. Returns whether the declared target existed. */
+function clickDownload(selector: string): boolean {
+  const el = document.querySelector(selector);
+  if (el === null) return false;
+  (el as HTMLElement).click();
+  return true;
 }
 
 export class Bridge {
@@ -196,7 +247,12 @@ export class Bridge {
       this.port = null;
     });
     // hello is the mandatory first frame after connect (seq 0).
-    this.send("hello", { extension_version: this.deps.manifestVersion, adapter_versions: {} });
+    const adapterVersions: Record<string, string> = {};
+    for (const spec of this.deps.adapterSpecs) adapterVersions[spec.id] = spec.version;
+    this.send("hello", {
+      extension_version: this.deps.manifestVersion,
+      adapter_versions: adapterVersions,
+    });
   }
 
   private disconnect(): void {
@@ -278,6 +334,7 @@ export class Bridge {
     // Shape is already guaranteed by parseBrowserMessage; these narrow for TS.
     if (typeof openurl !== "string" || !Array.isArray(hostsRaw) || typeof expiresAt !== "string") return;
     const providerHosts = hostsRaw.filter((h): h is string => typeof h === "string");
+    const expected = parseExpected(p["expected"]);
 
     // Restart/re-offer dedup: if we already track this job with a live tab, do
     // not open a second tab — just re-accept using the existing tab.
@@ -320,6 +377,7 @@ export class Bridge {
       expires_at: Number.isNaN(expiresMs) ? now : expiresMs,
       status: "accepted",
       provider_hosts: providerHosts,
+      ...(expected !== undefined ? { expected } : {}),
     };
     await this.update((s) => upsertJob(s, job));
     this.send("job_accept", {}, jobID);
@@ -370,6 +428,117 @@ export class Bridge {
       const elapsed = Math.max(0, this.deps.now() - started);
       await this.update((s) => patchJob(s, job.job_id, { status: "awaiting_download" }));
       this.send("auth_returned", { elapsed_ms: elapsed }, job.job_id);
+    }
+    // Once the provider page has finished loading on the tracked tab (past any
+    // human auth), run the declarative adapter — permission-gated, tracked-tab
+    // only. Re-reads fresh job state; a stale local `job` here is fine.
+    if (change.status === "complete") {
+      await this.maybeClassify(job.job_id, host);
+    }
+  }
+
+  /**
+   * Classify the tracked tab's current provider page with the single injected
+   * `interpret` function, then act on the verdict. No-ops (staying assisted)
+   * when there is no registered adapter for the host or the host is not granted
+   * via optional_host_permissions. Adapter execution never touches a tab we do
+   * not own for this job.
+   */
+  private async maybeClassify(jobID: string, host: string): Promise<void> {
+    const job = findByJob(this.store, jobID);
+    if (!job) return;
+    if (job.status !== "accepted" && job.status !== "awaiting_download") return;
+    const spec = this.deps.adapterSpecs.find((s) => hostMatches(host, s.hosts));
+    if (!spec) return; // no declarative adapter for this host -> stay assisted
+    let granted = false;
+    try {
+      granted = await this.deps.permissions.contains({ origins: [`https://${host}/*`] });
+    } catch {
+      granted = false;
+    }
+    if (!granted) return; // host not granted -> stay assisted
+
+    const ctx: AdapterContext = { expected: { ...(job.expected ?? {}) } };
+    let verdict: PageVerdict | undefined;
+    try {
+      const results = await this.deps.scripting.executeScript({
+        target: { tabId: job.tab_id },
+        func: interpret,
+        // interpret(null, spec, ctx): doc arrives null, falls back to the page's
+        // document; spec + ctx are the JSON args.
+        args: [null, spec, ctx],
+      });
+      const first = results[0];
+      verdict = first ? (first.result as PageVerdict | undefined) : undefined;
+    } catch (e) {
+      console.error("papio: adapter classification failed; staying assisted", e);
+      return;
+    }
+    if (!verdict) return;
+    await this.applyVerdict(jobID, spec, verdict);
+  }
+
+  /** Map a page verdict to a bridge action. See the safety contract: at most one
+   * download initiation per job, ever; unknown only escalates after two spaced
+   * observations; every other unknown keeps assisted behaviour. */
+  private async applyVerdict(jobID: string, spec: AdapterSpec, verdict: PageVerdict): Promise<void> {
+    const job = findByJob(this.store, jobID);
+    if (!job) return;
+    const av = spec.version;
+
+    if (verdict.kind !== "unknown" && (job.unknown_count ?? 0) !== 0) {
+      // Any decisive verdict breaks the unknown streak.
+      await this.update((s) => patchJob(s, jobID, { unknown_count: 0 }));
+    }
+
+    switch (verdict.kind) {
+      case "article": {
+        const dl = spec.download;
+        if (dl && job.download_initiated !== true) {
+          // Latch BEFORE clicking (persisted) so no re-classification can ever
+          // initiate a second download for this job.
+          await this.update((s) => patchJob(s, jobID, { download_initiated: true }));
+          try {
+            await this.deps.scripting.executeScript({
+              target: { tabId: job.tab_id },
+              func: clickDownload,
+              args: [dl.selector],
+            });
+          } catch (e) {
+            console.error("papio: adapter download click failed", e);
+          }
+          // No synthesized frames: the real Chrome download flows through the
+          // onCreated/onChanged listeners, which emit download_started/complete.
+        }
+        return;
+      }
+      case "login":
+        // Human is still authenticating: stay auth_pending, emit nothing.
+        return;
+      case "terms":
+        this.send("provider_outcome", { outcome: "terms_acceptance_required", adapter_version: av }, jobID);
+        return;
+      case "no_entitlement":
+        this.send("provider_outcome", { outcome: "no_entitlement", adapter_version: av }, jobID);
+        return;
+      case "wrong_work":
+      case "wrong_work_check":
+        this.send("provider_outcome", { outcome: "wrong_work", adapter_version: av }, jobID);
+        return;
+      case "unknown": {
+        const now = this.deps.now();
+        const count = job.unknown_count ?? 0;
+        const last = job.last_unknown_ms ?? 0;
+        if (count >= 1 && now - last >= 5000) {
+          // Second unknown, at least 5s after the first: the UI has changed.
+          this.send("provider_outcome", { outcome: "ui_changed", adapter_version: av }, jobID);
+          await this.update((s) => patchJob(s, jobID, { unknown_count: 0 }));
+        } else if (count === 0) {
+          await this.update((s) => patchJob(s, jobID, { unknown_count: 1, last_unknown_ms: now }));
+        }
+        // else: unknown again but <5s after the first -> keep waiting, do nothing.
+        return;
+      }
     }
   }
 
@@ -511,6 +680,16 @@ function realDeps(): BridgeDeps {
             },
           }
         : {}),
+    },
+    adapterSpecs: adapters,
+    scripting: {
+      executeScript: (injection) =>
+        chrome.scripting.executeScript(
+          injection as unknown as chrome.scripting.ScriptInjection<unknown[], unknown>,
+        ),
+    },
+    permissions: {
+      contains: (perm) => chrome.permissions.contains(perm),
     },
   };
 }

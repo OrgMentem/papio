@@ -22,6 +22,17 @@ export interface ActiveJob {
   provider_hosts: string[];
   /** Epoch ms when the tab first left every provider host (auth started). */
   auth_started_ms?: number;
+  /** Expected work identity from the job offer, used to build the adapter
+   * AdapterContext for declarative classification. Resolver-declared hints
+   * only — never an IdP value. */
+  expected?: { title?: string; doi?: string };
+  /** One-download-initiation-per-job latch. Once an adapter has clicked the
+   * declared download target, it can never click again for this job. */
+  download_initiated?: boolean;
+  /** Consecutive `unknown` classification streak, and the epoch-ms of the
+   * streak's first observation, for the 2×(≥5s apart) ui_changed debounce. */
+  unknown_count?: number;
+  last_unknown_ms?: number;
 }
 
 export interface StoreShape {

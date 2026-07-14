@@ -16,6 +16,13 @@
         font-size: 15px;
         margin: 0 0 10px;
       }
+      h2 {
+        font-size: 12px;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        color: #777;
+        margin: 0 0 8px;
+      }
       .empty {
         color: #777;
       }
@@ -49,12 +56,59 @@
       button:hover {
         background: #f5f5f5;
       }
+      .capture {
+        margin-top: 16px;
+        padding-top: 12px;
+        border-top: 1px solid #e3e3e3;
+      }
+      .capture .row {
+        display: flex;
+        gap: 8px;
+        margin-bottom: 8px;
+      }
+      .capture select {
+        font: inherit;
+        flex: 1;
+        padding: 4px 6px;
+        border-radius: 6px;
+        border: 1px solid #bbb;
+        background: #fff;
+      }
+      .capture-status {
+        margin-top: 8px;
+        font-size: 12px;
+        color: #555;
+        word-break: break-all;
+      }
     </style>
   </head>
   <body>
     <h1>Active handoffs</h1>
     <div id="empty" class="empty" hidden>No active jobs.</div>
     <ul id="jobs"></ul>
+
+    <section class="capture">
+      <h2>Capture fixture (dev)</h2>
+      <div class="row">
+        <select id="capture-provider" aria-label="Provider">
+          <option value="proquest">proquest</option>
+          <option value="jstor">jstor</option>
+          <option value="ebsco">ebsco</option>
+          <option value="springer">springer</option>
+        </select>
+        <select id="capture-scenario" aria-label="Scenario">
+          <option value="success">success</option>
+          <option value="login-return">login-return</option>
+          <option value="terms">terms</option>
+          <option value="no-entitlement">no-entitlement</option>
+          <option value="wrong-work">wrong-work</option>
+          <option value="drift">drift</option>
+        </select>
+      </div>
+      <button id="capture-btn" type="button">Capture active tab</button>
+      <div id="capture-status" class="capture-status"></div>
+    </section>
+
     <script src="./popup.js" type="module"></script>
   </body>
 </html>
