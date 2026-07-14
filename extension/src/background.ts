@@ -182,6 +182,11 @@ function extractDownloadURL(selector: string): string | null {
 
 export class Bridge {
   private port: NativePort | null = null;
+  /** Signed provider URL -> job for the narrow interval between calling
+   * chrome.downloads.download and receiving its ID. Memory-only: never stored
+   * or framed. This lets onDeterminingFilename steer the exact adapter-started
+   * download even when stale provider tabs make host correlation ambiguous. */
+  private readonly pendingDownloadURLs = new Map<string, string>();
   private seq = 0;
   private store: StoreShape = emptyStore();
   private ready: Promise<void> = Promise.resolve();
@@ -239,12 +244,11 @@ export class Bridge {
       return this.onDownloadChanged(delta);
     });
     this.deps.downloads.onDeterminingFilename?.addListener((item, suggest) => {
-      // Steer the one job-correlated download into the job's adoption
-      // directory under Downloads (papio/<job_id>/<name>) so no manual
-      // Save As or file move is ever needed. Unrelated downloads are
-      // untouched. suggest() must be called synchronously; correlation
-      // uses only already-loaded state.
-      const job = this.correlate(item);
+      // Exact adapter-started URL wins. Host fallback remains fail-closed when
+      // several active jobs share a provider.
+      const src = item.finalUrl ?? item.url;
+      const exactJobID = src ? this.pendingDownloadURLs.get(src) : undefined;
+      const job = exactJobID ? findByJob(this.store, exactJobID) : this.correlate(item);
       if (!job) return;
       const base = (item.filename ?? "").split(/[\\/]/).pop() ?? "";
       if (base.length === 0) return;
@@ -544,15 +548,21 @@ export class Bridge {
             });
             const href = links[0]?.result;
             if (typeof href === "string" && href.startsWith("https://")) {
-              const id = await this.deps.downloads.download({
-                url: href,
-                filename: `papio/${jobID}/paper.pdf`,
-                conflictAction: "uniquify",
-                saveAs: false,
-              });
-              // Correlate by Chrome's returned ID, not URL/referrer heuristics.
-              // onChanged can now complete even if onCreated raced the Promise.
-              this.downloads.set(jobID, { ids: new Set([id]), ambiguous: false });
+              this.pendingDownloadURLs.set(href, jobID);
+              try {
+                const id = await this.deps.downloads.download({
+                  url: href,
+                  filename: `papio/${jobID}/paper.pdf`,
+                  conflictAction: "uniquify",
+                  saveAs: false,
+                });
+                // Correlate by Chrome's returned ID, not URL/referrer
+                // heuristics. onChanged can now complete even if onCreated
+                // raced the Promise.
+                this.downloads.set(jobID, { ids: new Set([id]), ambiguous: false });
+              } finally {
+                this.pendingDownloadURLs.delete(href);
+              }
             }
           } catch (e) {
             console.error("papio: adapter download initiation failed; staying assisted", e);

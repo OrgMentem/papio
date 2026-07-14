@@ -244,6 +244,9 @@ class FakeTabs {
 class FakeDownloads {
   readonly onCreated = new FakeEmitter<[DownloadItemLike]>();
   readonly onChanged = new FakeEmitter<[DownloadDeltaLike]>();
+  readonly onDeterminingFilename = new FakeEmitter<
+    [DownloadItemLike, (s: { filename: string; conflictAction: "uniquify" }) => void]
+  >();
   readonly items = new Map<number, DownloadItemLike>();
   readonly started: {
     url: string;
@@ -259,9 +262,16 @@ class FakeDownloads {
   }): Promise<number> {
     this.started.push(options);
     const id = 700 + this.started.length;
+    let finalRelative = "out.pdf"; // provider Content-Disposition suggestion
+    await this.onDeterminingFilename.emit(
+      { id, url: options.url, filename: finalRelative, state: "in_progress" },
+      (s) => {
+        finalRelative = s.filename;
+      },
+    );
     this.items.set(id, {
       id,
-      filename: `/Users/test/Downloads/${options.filename}`,
+      filename: `/Users/test/Downloads/${finalRelative}`,
       fileSize: 12345,
       state: "in_progress",
     });
@@ -419,12 +429,15 @@ test("article verdict starts one browser-managed job-scoped download, no signed 
   // A re-classification (another page load) must NOT initiate a second download.
   await landOnProvider(h, "job_article_0001");
   expect(h.downloads.started.length).toBe(1);
+  expect(h.downloads.items.get(701)?.filename).toBe(
+    "/Users/test/Downloads/papio/job_article_0001/out.pdf",
+  );
   // Completion is correlated by chrome.downloads.download's returned ID even
   // if onCreated raced before the Promise resolved.
   await h.downloads.onChanged.emit({ id: 701, state: { current: "complete" } });
   const complete = h.frames().find((f) => f.type === "download_complete");
   expect(complete?.job_id).toBe("job_article_0001");
-  expect(complete?.payload["filename"]).toBe("paper.pdf");
+  expect(complete?.payload["filename"]).toBe("out.pdf");
   expect(complete?.payload["size_bytes"]).toBe(12345);
 });
 
