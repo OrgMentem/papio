@@ -230,22 +230,16 @@ func (s *Service) Apply(ctx context.Context, planID, confirmation string) (*Appl
 
 	out, commandErr := s.CLI.RunJSON(ctx, plan.ApplyArgs...)
 	if commandErr != nil {
+		applyErr := fmt.Errorf("applying Zotio mutation: %w", commandErr)
 		if message, ok := mutationFailure(out); ok {
-			result := &ApplyResult{
-				PlanID: plan.ID, JobID: plan.JobID, Status: "failed",
-				ParentKey: plan.ExpectedParentKey, AppliedAt: s.now().UTC().Format(time.RFC3339),
-				Error: message, Zotio: out,
-			}
-			if err := s.recordApply(ctx, idempotencyKey, result); err != nil {
-				return nil, err
-			}
-			return nil, fmt.Errorf("applying Zotio mutation: %s", message)
+			applyErr = fmt.Errorf("applying Zotio mutation: %s", message)
 		}
-		return nil, fmt.Errorf("applying Zotio mutation: %w", commandErr)
+		return nil, s.recordFailedApplyAndInvalidatePlan(ctx, idempotencyKey, plan, out, applyErr)
 	}
 	envelope, err := decodeApply(out)
 	if err != nil {
-		return nil, err
+		applyErr := fmt.Errorf("decoding Zotio apply result: %w", err)
+		return nil, s.recordFailedApplyAndInvalidatePlan(ctx, idempotencyKey, plan, out, applyErr)
 	}
 	result := &ApplyResult{
 		PlanID:    plan.ID,
@@ -273,10 +267,12 @@ func (s *Service) Apply(ctx context.Context, planID, confirmation string) (*Appl
 		}
 	}
 	if plan.Route != "manifest_duplicate" && result.ParentKey == "" {
-		return nil, fmt.Errorf("Zotio apply succeeded without returning a parent item key")
+		applyErr := errors.New("Zotio apply succeeded without returning a parent item key")
+		return nil, s.recordFailedApplyAndInvalidatePlan(ctx, idempotencyKey, plan, out, applyErr)
 	}
 	if envelope.Result.Summary.Applied > 0 && result.AttachmentKey == "" {
-		return nil, fmt.Errorf("Zotio apply succeeded without returning an attachment key")
+		applyErr := errors.New("Zotio apply succeeded without returning an attachment key")
+		return nil, s.recordFailedApplyAndInvalidatePlan(ctx, idempotencyKey, plan, out, applyErr)
 	}
 	if err := s.recordApply(ctx, idempotencyKey, result); err != nil {
 		return nil, err
@@ -528,6 +524,56 @@ func (s *Service) recordPlan(ctx context.Context, key, path string, plan *Plan) 
 	return err
 }
 
+func (s *Service) recordFailedApplyAndInvalidatePlan(ctx context.Context, key string, plan *Plan, zotio json.RawMessage, applyErr error) error {
+	result := &ApplyResult{
+		PlanID:    plan.ID,
+		JobID:     plan.JobID,
+		Status:    "failed",
+		ParentKey: plan.ExpectedParentKey,
+		AppliedAt: s.now().UTC().Format(time.RFC3339),
+		Error:     applyErr.Error(),
+		Zotio:     zotio,
+	}
+	if err := s.recordApply(ctx, key, result); err != nil {
+		return fmt.Errorf("recording failed Zotio apply: %w", err)
+	}
+	if err := s.invalidatePlan(ctx, plan); err != nil {
+		return fmt.Errorf("%w (invalidating cached Zotio plan: %v)", applyErr, err)
+	}
+	return applyErr
+}
+
+func (s *Service) invalidatePlan(ctx context.Context, plan *Plan) error {
+	planPath := filepath.Join(s.DataDir, "zotio", "plans", plan.ID+".json")
+	manifestPath := plan.ManifestPath
+	if manifestPath != "" && filepath.Dir(manifestPath) != filepath.Join(s.DataDir, "zotio", "manifests") {
+		return fmt.Errorf("Zotio manifest path is outside the private manifest directory")
+	}
+
+	tx, err := s.Store.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM exports WHERE kind = 'zotio_plan' AND path = ?`, planPath); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+
+	for _, path := range []string{planPath, manifestPath} {
+		if path == "" {
+			continue
+		}
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *Service) recordedApply(ctx context.Context, key string) (*ApplyResult, error) {
 	var raw sql.NullString
 	err := s.Store.DB().QueryRowContext(ctx,
@@ -539,24 +585,35 @@ func (s *Service) recordedApply(ctx context.Context, key string) (*ApplyResult, 
 		return nil, err
 	}
 	if !raw.Valid || raw.String == "" {
-		return nil, fmt.Errorf("Zotio apply is reserved but has no recorded outcome; refusing an unsafe retry—inspect Zotero before recovery")
+		// A process can stop after claiming a reservation but before recording
+		// Zotio's result. claimApply replaces that abandoned claim below.
+		return nil, nil
 	}
 	var result ApplyResult
 	if err := json.Unmarshal([]byte(raw.String), &result); err != nil {
 		return nil, fmt.Errorf("decoding recorded Zotio apply: %w", err)
 	}
 	if result.Status == "failed" {
-		if result.Error == "" {
-			result.Error = "Zotio apply previously failed"
-		}
-		return nil, errors.New(result.Error)
+		// A Zotio-side defect may have caused a recorded failure. Let claimApply
+		// replace it so a later replay can apply the same idempotent mutation.
+		return nil, nil
 	}
 	return &result, nil
 }
 
 func (s *Service) claimApply(ctx context.Context, key, jobID string) (bool, error) {
-	result, err := s.Store.DB().ExecContext(ctx,
-		`INSERT OR IGNORE INTO exports (job_id, kind, idempotency_key, created_at) VALUES (?, 'zotio_apply', ?, ?)`,
+	result, err := s.Store.DB().ExecContext(ctx, `
+		INSERT INTO exports (job_id, kind, idempotency_key, created_at)
+		VALUES (?, 'zotio_apply', ?, ?)
+		ON CONFLICT(idempotency_key) DO UPDATE SET
+			job_id = excluded.job_id,
+			kind = excluded.kind,
+			path = NULL,
+			result_json = NULL,
+			created_at = excluded.created_at
+		WHERE exports.kind = 'zotio_apply' AND (
+			exports.result_json IS NULL OR json_extract(exports.result_json, '$.status') = 'failed'
+		)`,
 		jobID, key, store.Now())
 	if err != nil {
 		return false, err

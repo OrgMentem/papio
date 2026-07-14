@@ -9,8 +9,8 @@ import (
 	"context"
 	"net/http"
 	"os"
+	"sync"
 	"time"
-
 	"papio/internal/app"
 	"papio/internal/artifact"
 	"papio/internal/browser"
@@ -51,6 +51,45 @@ type System struct {
 	WorkerBinary  string
 	Discovery     *discovery.Client
 	Zotio         *zotio.Service
+}
+
+const autoImportRetryBackoff = 2 * time.Second
+
+// serialAutoImporter prevents concurrent mutations through a single zotio
+// mirror. The exports ledger makes the one retry safe to replay.
+type serialAutoImporter struct {
+	importer app.AutoImporter
+	mu       sync.Mutex
+	backoff  time.Duration
+}
+
+func newSerialAutoImporter(importer app.AutoImporter) *serialAutoImporter {
+	return &serialAutoImporter{importer: importer, backoff: autoImportRetryBackoff}
+}
+
+func (s *serialAutoImporter) PlanAndApply(ctx context.Context, jobID string) (status, parentKey, attachmentKey string, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	status, parentKey, attachmentKey, err = s.importer.PlanAndApply(ctx, jobID)
+	if err == nil || ctx.Err() != nil {
+		return status, parentKey, attachmentKey, err
+	}
+	if err := waitAutoImportRetry(ctx, s.backoff); err != nil {
+		return "failed", "", "", err
+	}
+	return s.importer.PlanAndApply(ctx, jobID)
+}
+
+func waitAutoImportRetry(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 // New builds one production system without starting background goroutines.
@@ -136,7 +175,7 @@ func New(ctx context.Context, cfg config.Config) (*System, error) {
 		CLI: zotio.New(cfg.Zotio), Submitter: service,
 		Bundle: bundleExporter, Store: db, DataDir: cfg.DataDir, AttachmentMode: cfg.Zotio.AttachmentMode,
 	}
-	service.AutoImporter = zotioService
+	service.AutoImporter = newSerialAutoImporter(zotioService)
 	system := &System{
 		Config: cfg, Store: db, Jobs: jobs, Artifacts: artifacts, Budgets: budgets,
 		App: service, Scheduler: scheduler,

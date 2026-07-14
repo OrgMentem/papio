@@ -190,46 +190,115 @@ func TestExistingItemPlanUsesConfiguredLinkedAttachmentMode(t *testing.T) {
 	}
 }
 
-func TestApplyFailureReservationBlocksUnsafeRetry(t *testing.T) {
+func TestApplyRecoversAbandonedReservation(t *testing.T) {
 	cli := &planCLI{
-		preview:  `{"ok":true,"mode":"preview","plan":{"summary":{"planned":1,"no_op":0,"invalid":0}},"result":null}`,
-		applyErr: fmt.Errorf("transport closed after write may have committed"),
+		preview: `{"ok":true,"mode":"preview","plan":{"summary":{"planned":1,"no_op":0,"invalid":0}},"result":null}`,
+		apply:   `{"ok":true,"mode":"apply","plan":{"summary":{"planned":1}},"result":{"summary":{"applied":1,"no_op":0,"conflicts":0,"failed":0},"items":[{"key":"AB12CD34","status":"applied","reason":{"item_key":"AT56CH90","upload":"uploaded"}}]}}`,
 	}
 	service, jobID := readyPlanService(t, "AB12CD34", cli)
 	plans, err := service.PlanJobs(context.Background(), []string{jobID})
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, firstErr := service.Apply(context.Background(), plans[0].ID, plans[0].ConfirmationSHA256)
-	_, retryErr := service.Apply(context.Background(), plans[0].ID, plans[0].ConfirmationSHA256)
-	if firstErr == nil || retryErr == nil || !strings.Contains(retryErr.Error(), "refusing an unsafe retry") || cli.applyCalls != 1 {
-		t.Fatalf("first=%v retry=%v applyCalls=%d", firstErr, retryErr, cli.applyCalls)
+	plan := plans[0]
+	key := "zotio_apply:" + plan.ID + ":" + plan.ConfirmationSHA256
+	if _, err := service.Store.DB().Exec(
+		`INSERT INTO exports (job_id, kind, idempotency_key, created_at) VALUES (?, 'zotio_apply', ?, ?)`,
+		plan.JobID, key, store.Now()); err != nil {
+		t.Fatalf("reserving apply: %v", err)
+	}
+
+	applied, err := service.Apply(context.Background(), plan.ID, plan.ConfirmationSHA256)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if applied.Status != "applied" || applied.AttachmentKey != "AT56CH90" || cli.applyCalls != 1 {
+		t.Fatalf("applied=%+v applyCalls=%d", applied, cli.applyCalls)
+	}
+	replay, err := service.Apply(context.Background(), plan.ID, plan.ConfirmationSHA256)
+	if err != nil || replay.AttachmentKey != "AT56CH90" || cli.applyCalls != 1 {
+		t.Fatalf("replay=%+v err=%v applyCalls=%d", replay, err, cli.applyCalls)
 	}
 }
 
-func TestStructuredApplyFailureIsRecordedAndReplayedWithoutAnotherWrite(t *testing.T) {
-	quota := "attachment item AT56CH90 created but its file is not registered: the upload exceeds the Zotero storage quota"
+func TestFailedManifestApplyInvalidatesCachedDerivation(t *testing.T) {
+	invalidManifest := `{"schema_version":2,"entries":[{"path":"paper.pdf","classification":"new","action":"create","identifier_type":"doi","identifier":"10.1002/example","status":"resolved","item":{"itemType":"document","title":"Example Paper","publicationTitle":"not allowed for document"}}]}`
+	correctedManifest := `{"schema_version":2,"entries":[{"path":"paper.pdf","classification":"new","action":"create","identifier_type":"doi","identifier":"10.1002/example","status":"resolved","item":{"itemType":"journalArticle","title":"Example Paper","DOI":"10.1002/example"}}]}`
+	validationError := "publicationTitle is not valid for itemType document"
 	cli := &planCLI{
+		manifest: invalidManifest,
 		preview:  `{"ok":true,"mode":"preview","plan":{"summary":{"planned":1,"no_op":0,"invalid":0}},"result":null}`,
-		apply:    `{"ok":false,"mode":"apply","plan":{"summary":{"planned":1}},"result":{"summary":{"applied":0,"no_op":0,"conflicts":0,"failed":1},"items":[{"key":"AB12CD34","status":"failed","reason":"` + quota + `"}]}}`,
+		apply:    `{"ok":false,"mode":"apply","plan":{"summary":{"planned":1}},"result":{"summary":{"applied":0,"no_op":0,"conflicts":0,"failed":1},"items":[{"status":"failed","reason":"` + validationError + `"}]}}`,
 		applyErr: fmt.Errorf("mutation incomplete"),
 	}
-	service, jobID := readyPlanService(t, "AB12CD34", cli)
+	service, jobID := readyPlanService(t, "", cli)
 	plans, err := service.PlanJobs(context.Background(), []string{jobID})
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, firstErr := service.Apply(context.Background(), plans[0].ID, plans[0].ConfirmationSHA256)
-	_, replayErr := service.Apply(context.Background(), plans[0].ID, plans[0].ConfirmationSHA256)
-	if firstErr == nil || replayErr == nil || !strings.Contains(firstErr.Error(), quota) || replayErr.Error() != quota || cli.applyCalls != 1 {
-		t.Fatalf("first=%v replay=%v applyCalls=%d", firstErr, replayErr, cli.applyCalls)
+	failedPlan := plans[0]
+	failedManifestPath := failedPlan.ManifestPath
+	failedPlanPath := filepath.Join(service.DataDir, "zotio", "plans", failedPlan.ID+".json")
+
+	if _, err := service.Apply(context.Background(), failedPlan.ID, failedPlan.ConfirmationSHA256); err == nil || !strings.Contains(err.Error(), validationError) {
+		t.Fatalf("initial apply error = %v", err)
 	}
-	var recorded string
-	if err := service.Store.DB().QueryRow(`SELECT result_json FROM exports WHERE kind='zotio_apply'`).Scan(&recorded); err != nil {
+	if _, err := os.Stat(failedManifestPath); !os.IsNotExist(err) {
+		t.Fatalf("failed manifest still exists: %v", err)
+	}
+	if _, err := os.Stat(failedPlanPath); !os.IsNotExist(err) {
+		t.Fatalf("failed plan still exists: %v", err)
+	}
+	var planCount int
+	if err := service.Store.DB().QueryRow(`SELECT count(*) FROM exports WHERE kind = 'zotio_plan'`).Scan(&planCount); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(recorded, `"status":"failed"`) || !strings.Contains(recorded, "storage quota") {
-		t.Fatalf("recorded result = %s", recorded)
+	if planCount != 0 {
+		t.Fatalf("cached plan rows = %d, want 0", planCount)
+	}
+	var recordedFailure string
+	if err := service.Store.DB().QueryRow(`SELECT result_json FROM exports WHERE kind = 'zotio_apply'`).Scan(&recordedFailure); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(recordedFailure, `"status":"failed"`) || !strings.Contains(recordedFailure, validationError) {
+		t.Fatalf("recorded failure = %s", recordedFailure)
+	}
+
+	cli.manifest = correctedManifest
+	cli.apply = `{"ok":true,"mode":"apply","plan":{"summary":{"planned":1}},"result":{"summary":{"applied":1,"no_op":0,"conflicts":0,"failed":0},"items":[{"status":"applied","reason":{"via":"web","parent_key":"PA12RE34","attachment_key":"AT56CH90"}}]}}`
+	cli.applyErr = nil
+	replanned, err := service.PlanJobs(context.Background(), []string{jobID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(replanned) != 1 || replanned[0].ID == failedPlan.ID || cli.resolveCalls != 2 {
+		t.Fatalf("replanned=%+v failedPlan=%+v resolveCalls=%d", replanned, failedPlan, cli.resolveCalls)
+	}
+	correctedPlan := replanned[0]
+	stagedManifest, err := os.ReadFile(correctedPlan.ManifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(stagedManifest) != correctedManifest+"\n" {
+		t.Fatalf("staged manifest = %s", stagedManifest)
+	}
+	applied, err := service.Apply(context.Background(), correctedPlan.ID, correctedPlan.ConfirmationSHA256)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if applied.Status != "applied" || applied.ParentKey != "PA12RE34" || applied.AttachmentKey != "AT56CH90" {
+		t.Fatalf("applied = %+v", applied)
+	}
+	replay, err := service.Apply(context.Background(), correctedPlan.ID, correctedPlan.ConfirmationSHA256)
+	if err != nil || replay.Status != "applied" || cli.applyCalls != 2 {
+		t.Fatalf("replay=%+v err=%v applyCalls=%d", replay, err, cli.applyCalls)
+	}
+	manifestAfterReplay, err := os.ReadFile(correctedPlan.ManifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(manifestAfterReplay) != string(stagedManifest) {
+		t.Fatalf("successful replay changed manifest: before=%s after=%s", stagedManifest, manifestAfterReplay)
 	}
 }
 
