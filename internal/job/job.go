@@ -419,6 +419,10 @@ func nullableInt(v int) any {
 // transaction. detail must be pre-redacted. retryAt applies to retry_wait;
 // terminalReason applies to terminal states.
 func (js *Store) Transition(ctx context.Context, jobID, from, to string, detail map[string]any, opts ...TransitionOpt) error {
+	return js.transition(ctx, jobID, from, to, detail, false, opts...)
+}
+
+func (js *Store) transition(ctx context.Context, jobID, from, to string, detail map[string]any, closeOpenActions bool, opts ...TransitionOpt) error {
 	if !allowed[from][to] {
 		return fmt.Errorf("%w: %s -> %s not allowed", ErrConflict, from, to)
 	}
@@ -467,6 +471,13 @@ func (js *Store) Transition(ctx context.Context, jobID, from, to string, detail 
 		`INSERT INTO events (job_id, at, kind, detail_json) VALUES (?, ?, 'job.transition', ?)`,
 		jobID, now, string(detailJSON)); err != nil {
 		return err
+	}
+	if closeOpenActions {
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE human_actions SET status = 'cancelled', resolved_at = ?
+			 WHERE job_id = ? AND status = 'open'`, now, jobID); err != nil {
+			return err
+		}
 	}
 	return tx.Commit()
 }
@@ -568,8 +579,8 @@ func (js *Store) Cancel(ctx context.Context, jobID, reason string) error {
 		if Terminal(row.State) {
 			return nil
 		}
-		err = js.Transition(ctx, jobID, row.State, StateCancelled,
-			map[string]any{"reason": reason}, WithTerminalReason(reason))
+		err = js.transition(ctx, jobID, row.State, StateCancelled,
+			map[string]any{"reason": reason}, true, WithTerminalReason(reason))
 		if errors.Is(err, ErrConflict) {
 			continue
 		}
@@ -670,6 +681,20 @@ func (js *Store) RecoverStale(ctx context.Context) ([]string, error) {
 		recovered = append(recovered, s.id)
 	}
 	return recovered, nil
+}
+
+// CloseStaleHumanActions cancels open actions for jobs that have already
+// reached a terminal state. It repairs rows left by older daemon versions.
+func (js *Store) CloseStaleHumanActions(ctx context.Context) error {
+	_, err := js.S.DB().ExecContext(ctx,
+		`UPDATE human_actions SET status = 'cancelled', resolved_at = ?
+		 WHERE status = 'open'
+		   AND EXISTS (
+		       SELECT 1 FROM jobs
+		       WHERE jobs.id = human_actions.job_id
+		         AND jobs.state IN ('ready', 'unavailable', 'failed', 'cancelled')
+		   )`, store.Now())
+	return err
 }
 
 // Get loads one job row with its work-request identity.
@@ -984,15 +1009,45 @@ func (js *Store) FindArtifactByDOI(ctx context.Context, doi string) (*Artifact, 
 	return js.GetArtifact(ctx, sha)
 }
 
-// OpenHumanAction records a required human step for a job.
+// OpenHumanAction records a required human step for a job. Re-parking the
+// same job and action kind refreshes the existing action rather than creating
+// another open prompt.
 func (js *Store) OpenHumanAction(ctx context.Context, jobID, kind, detail string) (int64, error) {
-	res, err := js.S.DB().ExecContext(ctx,
-		`INSERT INTO human_actions (job_id, kind, status, detail, created_at) VALUES (?, ?, 'open', ?, ?)`,
-		jobID, kind, nullable(detail), store.Now())
+	tx, err := js.S.DB().BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err
 	}
-	return res.LastInsertId()
+	defer func() { _ = tx.Rollback() }()
+
+	var actionID int64
+	err = tx.QueryRowContext(ctx,
+		`SELECT id FROM human_actions
+		 WHERE job_id = ? AND kind = ? AND status = 'open'
+		 ORDER BY id ASC LIMIT 1`, jobID, kind).Scan(&actionID)
+	switch {
+	case err == nil:
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE human_actions SET detail = ? WHERE id = ?`, nullable(detail), actionID); err != nil {
+			return 0, err
+		}
+	case errors.Is(err, sql.ErrNoRows):
+		res, err := tx.ExecContext(ctx,
+			`INSERT INTO human_actions (job_id, kind, status, detail, created_at) VALUES (?, ?, 'open', ?, ?)`,
+			jobID, kind, nullable(detail), store.Now())
+		if err != nil {
+			return 0, err
+		}
+		actionID, err = res.LastInsertId()
+		if err != nil {
+			return 0, err
+		}
+	default:
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return actionID, nil
 }
 
 // ResolveHumanAction closes one open action with a compare-and-swap update.

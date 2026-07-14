@@ -18,6 +18,7 @@ type LeaseStore interface {
 	Heartbeat(context.Context, string, string, time.Duration) error
 	Release(context.Context, string, string) error
 	RecoverStale(context.Context) ([]string, error)
+	CloseStaleHumanActions(context.Context) error
 }
 
 // Processor performs the application work for one leased job.
@@ -97,6 +98,9 @@ func (s *Scheduler) Run(ctx context.Context) error {
 		}
 		return fmt.Errorf("recover stale jobs: %w", err)
 	}
+	// This repairs historical terminal actions. It is deliberately best-effort:
+	// queued work recovery remains available if cleanup is temporarily blocked.
+	_ = s.Store.CloseStaleHumanActions(ctx)
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 

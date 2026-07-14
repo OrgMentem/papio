@@ -20,9 +20,11 @@ type fakeLeaseStore struct {
 	next       *job.Row
 	claimed    bool
 	recovered  int
+	swept      int
 	released   int
 	owners     []string
 	heartbeats chan struct{}
+	closeErr   error
 }
 
 func (s *fakeLeaseStore) ClaimNext(_ context.Context, owner string, _ time.Duration) (*job.Row, error) {
@@ -58,10 +60,17 @@ func (s *fakeLeaseStore) RecoverStale(context.Context) ([]string, error) {
 	return nil, nil
 }
 
-func (s *fakeLeaseStore) counts() (recovered, released int) {
+func (s *fakeLeaseStore) CloseStaleHumanActions(context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.recovered, s.released
+	s.swept++
+	return s.closeErr
+}
+
+func (s *fakeLeaseStore) counts() (recovered, swept, released int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.recovered, s.swept, s.released
 }
 
 func TestAutostarterUsesExecutableCommandSeamOnce(t *testing.T) {
@@ -111,7 +120,11 @@ func TestAutostarterUsesExecutableCommandSeamOnce(t *testing.T) {
 }
 
 func TestSchedulerProcessesQueuedJobAndHeartbeats(t *testing.T) {
-	leaseStore := &fakeLeaseStore{next: &job.Row{ID: "job_01"}, heartbeats: make(chan struct{}, 1)}
+	leaseStore := &fakeLeaseStore{
+		next:       &job.Row{ID: "job_01"},
+		heartbeats: make(chan struct{}, 1),
+		closeErr:   errors.New("stale action cleanup unavailable"),
+	}
 	processed := make(chan struct{})
 	ctx, cancel := context.WithCancel(context.Background())
 	scheduler, err := NewScheduler(leaseStore, ProcessorFunc(func(ctx context.Context, row *job.Row) error {
@@ -151,9 +164,12 @@ func TestSchedulerProcessesQueuedJobAndHeartbeats(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("scheduler did not stop after cancellation")
 	}
-	recovered, released := leaseStore.counts()
+	recovered, swept, released := leaseStore.counts()
 	if recovered != 1 {
 		t.Fatalf("RecoverStale calls = %d, want 1", recovered)
+	}
+	if swept != 1 {
+		t.Fatalf("CloseStaleHumanActions calls = %d, want 1", swept)
 	}
 	if released == 0 {
 		t.Fatal("scheduler did not release completed lease")
@@ -292,6 +308,9 @@ func (s *cancellationHeartbeatStore) Heartbeat(ctx context.Context, _ string, _ 
 
 func (s *cancellationHeartbeatStore) Release(context.Context, string, string) error  { return nil }
 func (s *cancellationHeartbeatStore) RecoverStale(context.Context) ([]string, error) { return nil, nil }
+func (s *cancellationHeartbeatStore) CloseStaleHumanActions(context.Context) error {
+	return nil
+}
 
 func TestSchedulerIgnoresHeartbeatCancellationAfterSuccess(t *testing.T) {
 	store := &cancellationHeartbeatStore{row: &job.Row{ID: "job_01"}, heartbeatStarted: make(chan struct{}, 1)}
@@ -338,7 +357,7 @@ func TestSchedulerCancelledBeforeRecoveryReturnsNil(t *testing.T) {
 	if err := scheduler.Run(ctx); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	recovered, _ := store.counts()
+	recovered, _, _ := store.counts()
 	if recovered != 0 {
 		t.Fatalf("RecoverStale calls = %d, want 0", recovered)
 	}
@@ -417,6 +436,7 @@ func (s *heartbeatFailureStore) Heartbeat(context.Context, string, string, time.
 
 func (s *heartbeatFailureStore) Release(context.Context, string, string) error  { return nil }
 func (s *heartbeatFailureStore) RecoverStale(context.Context) ([]string, error) { return nil, nil }
+func (s *heartbeatFailureStore) CloseStaleHumanActions(context.Context) error { return nil }
 
 func TestSchedulerReturnsHeartbeatStorageFailure(t *testing.T) {
 	want := errors.New("lease store unavailable")
@@ -486,6 +506,7 @@ func (s *completionHeartbeatFailureStore) Release(context.Context, string, strin
 func (s *completionHeartbeatFailureStore) RecoverStale(context.Context) ([]string, error) {
 	return nil, nil
 }
+func (s *completionHeartbeatFailureStore) CloseStaleHumanActions(context.Context) error { return nil }
 
 func TestSchedulerReportsHeartbeatFailureAfterProcessorCompletion(t *testing.T) {
 	want := errors.New("heartbeat storage failure")
@@ -518,6 +539,7 @@ func (s claimFailureStore) ClaimNext(context.Context, string, time.Duration) (*j
 func (claimFailureStore) Heartbeat(context.Context, string, string, time.Duration) error { return nil }
 func (claimFailureStore) Release(context.Context, string, string) error                  { return nil }
 func (claimFailureStore) RecoverStale(context.Context) ([]string, error)                 { return nil, nil }
+func (claimFailureStore) CloseStaleHumanActions(context.Context) error                  { return nil }
 
 func TestSchedulerReturnsQueuedWorkerFailure(t *testing.T) {
 	want := errors.New("claim failure")

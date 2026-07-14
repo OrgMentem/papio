@@ -364,6 +364,142 @@ func TestCancelIsIdempotentAndNeverOverwritesTerminalResult(t *testing.T) {
 	}
 }
 
+func TestCancelClosesAllOpenHumanActions(t *testing.T) {
+	js := testStore(t)
+	ctx := context.Background()
+	id, err := js.CreateRequest(ctx, "wr_cancel_actions", testWork(), "", "", testPolicy(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, kind := range []string{"openurl_handoff", "verify_identity"} {
+		if _, err := js.OpenHumanAction(ctx, id, kind, "pending"); err != nil {
+			t.Fatalf("open %s action: %v", kind, err)
+		}
+	}
+
+	if err := js.Cancel(ctx, id, "user request"); err != nil {
+		t.Fatal(err)
+	}
+	actions, err := js.ListHumanActions(ctx, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(actions) != 2 {
+		t.Fatalf("actions = %+v, want two", actions)
+	}
+	for _, action := range actions {
+		if action.Status != "cancelled" {
+			t.Fatalf("action %q status = %q, want cancelled", action.Kind, action.Status)
+		}
+	}
+}
+
+func TestCloseStaleHumanActionsClosesOnlyTerminalJobs(t *testing.T) {
+	js := testStore(t)
+	ctx := context.Background()
+	terminalStates := []string{StateReady, StateUnavailable, StateFailed, StateCancelled}
+	terminalIDs := make(map[string]bool, len(terminalStates))
+	for _, state := range terminalStates {
+		id, err := js.CreateRequest(ctx, "wr_stale_"+state, testWork(), "", "", testPolicy(), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := js.Transition(ctx, id, StateQueued, StateResolving, nil); err != nil {
+			t.Fatal(err)
+		}
+		if err := js.Transition(ctx, id, StateResolving, state, nil); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := js.OpenHumanAction(ctx, id, "stale_"+state, "stale"); err != nil {
+			t.Fatal(err)
+		}
+		terminalIDs[id] = true
+	}
+	awaitingID, err := js.CreateRequest(ctx, "wr_stale_awaiting", testWork(), "", "", testPolicy(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := js.Transition(ctx, awaitingID, StateQueued, StateResolving, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := js.Transition(ctx, awaitingID, StateResolving, StateAwaitingHuman, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := js.OpenHumanAction(ctx, awaitingID, "manual_download", "pending"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := js.CloseStaleHumanActions(ctx); err != nil {
+		t.Fatal(err)
+	}
+	actions, err := js.ListHumanActions(ctx, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(actions) != len(terminalIDs)+1 {
+		t.Fatalf("actions = %+v", actions)
+	}
+	for _, action := range actions {
+		want := "cancelled"
+		if action.JobID == awaitingID {
+			want = "open"
+		} else if !terminalIDs[action.JobID] {
+			t.Fatalf("unexpected action job %q", action.JobID)
+		}
+		if action.Status != want {
+			t.Fatalf("action %+v status = %q, want %q", action, action.Status, want)
+		}
+	}
+}
+
+func TestOpenHumanActionRefreshesExistingOpenKind(t *testing.T) {
+	js := testStore(t)
+	ctx := context.Background()
+	id, err := js.CreateRequest(ctx, "wr_action_dedupe", testWork(), "", "", testPolicy(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstID, err := js.OpenHumanAction(ctx, id, "terms_acceptance_required", "first detail")
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondID, err := js.OpenHumanAction(ctx, id, "terms_acceptance_required", "latest detail")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if secondID != firstID {
+		t.Fatalf("second action ID = %d, want existing ID %d", secondID, firstID)
+	}
+	otherID, err := js.OpenHumanAction(ctx, id, "openurl_handoff", "other detail")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if otherID == firstID {
+		t.Fatalf("different action kind reused ID %d", otherID)
+	}
+	actions, err := js.ListHumanActions(ctx, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(actions) != 2 {
+		t.Fatalf("actions = %+v, want two", actions)
+	}
+	for _, action := range actions {
+		switch action.ID {
+		case firstID:
+			if action.Detail != "latest detail" || action.Status != "open" {
+				t.Fatalf("refreshed action = %+v", action)
+			}
+		case otherID:
+			if action.Kind != "openurl_handoff" || action.Detail != "other detail" {
+				t.Fatalf("other action = %+v", action)
+			}
+		default:
+			t.Fatalf("unexpected action = %+v", action)
+		}
+	}
+}
+
 func TestAwaitingHumanResumeEdgesForBrowserBridge(t *testing.T) {
 	// The Phase 2 bridge parks handoffs in awaiting_human and then resumes them
 	// directly: to validating (adopting a download, under a held lease) or to a
