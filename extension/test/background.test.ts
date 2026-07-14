@@ -124,6 +124,7 @@ interface Harness {
   bridge: Bridge;
   deps: BridgeDeps;
   port: FakePort;
+  ports: FakePort[];
   backend: FakeBackend;
   tabs: FakeTabs;
   downloads: FakeDownloads;
@@ -135,6 +136,8 @@ interface Harness {
 
 function makeHarness(seed?: StoreShape): Harness {
   const port = new FakePort();
+  const ports = [port];
+  let connects = 0;
   const backend = new FakeBackend();
   if (seed) backend.store = seed;
   const tabs = new FakeTabs();
@@ -142,9 +145,14 @@ function makeHarness(seed?: StoreShape): Harness {
   const clock = { now: 1_700_000_000_000 };
   const timers: { fn: () => void; ms: number }[] = [];
   const deps: BridgeDeps = {
-    connectNative: () => port,
-    manifestVersion: "0.1.0",
+    connectNative: () => {
+      if (connects++ === 0) return port;
+      const next = new FakePort();
+      ports.push(next);
+      return next;
+    },
     randomUUID: () => crypto.randomUUID(),
+    manifestVersion: "0.1.0",
     now: () => clock.now,
     setTimeout: (fn, ms) => {
       timers.push({ fn, ms });
@@ -163,13 +171,14 @@ function makeHarness(seed?: StoreShape): Harness {
     bridge: new Bridge(deps),
     deps,
     port,
+    ports,
     backend,
     tabs,
     downloads,
     clock,
     timers,
-    frames: () => port.posted.map(parseBrowserMessage),
-    postedStrings: () => port.posted.map((f) => JSON.stringify(f)),
+    frames: () => ports.flatMap((p) => p.posted.map(parseBrowserMessage)),
+    postedStrings: () => ports.flatMap((p) => p.posted.map((f) => JSON.stringify(f))),
   };
 }
 
@@ -185,6 +194,19 @@ function jobOffer(jobID: string): unknown {
       provider_hosts: [PROVIDER_HOST],
       access_mode: "assisted",
       expires_at: EXPIRES,
+    },
+  };
+}
+
+function helloRequiredError(): unknown {
+  return {
+    protocol: "papio-browser/1",
+    type: "error",
+    msg_id: "error_00000001",
+    seq: 1,
+    payload: {
+      code: "expected_hello",
+      message: "hello required before browser session can resume",
     },
   };
 }
@@ -362,6 +384,36 @@ test("restart recovery re-hellos and does not duplicate a live tab", async () =>
   expect(h.tabs.created.length).toBe(0);
   const accept = h.frames().find((f) => f.type === "job_accept");
   expect(accept?.job_id).toBe("job_0006_restart");
+});
+
+test("hello-required error reconnects once and does not duplicate a live tab", async () => {
+  const seed: StoreShape = {
+    activeJobs: [
+      {
+        job_id: "job_0007_session",
+        tab_id: 100,
+        offered_at: 1,
+        expires_at: 2,
+        status: "accepted",
+        provider_hosts: [PROVIDER_HOST],
+      },
+    ],
+  };
+  const h = makeHarness(seed);
+  h.tabs.live.set(100, { id: 100, url: `https://${PROVIDER_HOST}/x` });
+  await h.bridge.start();
+
+  await h.port.inbound(helloRequiredError());
+
+  expect(h.port.disconnected).toBe(true);
+  expect(h.ports.length).toBe(2);
+  expect(h.timers.length).toBe(0);
+  expect(h.frames().filter((f) => f.type === "hello").length).toBe(2);
+
+  // The fresh daemon re-offers the durable job; the tracked live tab is reused.
+  await h.ports[1]?.inbound(jobOffer("job_0007_session"));
+  expect(h.tabs.created.length).toBe(0);
+  expect(h.frames().filter((f) => f.type === "job_accept" && f.job_id === "job_0007_session").length).toBe(1);
 });
 
 test("unplanned port death reconnects with backoff; deliberate disconnect stays down", async () => {

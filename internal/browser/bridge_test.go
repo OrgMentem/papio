@@ -163,11 +163,31 @@ func TestHelloIsAcknowledged(t *testing.T) {
 	}
 }
 
-func TestFrameBeforeHelloIsProtocolError(t *testing.T) {
-	b, jobs, _, _ := newBridge(t)
-	id := park(t, jobs, "wr_prehello", handoffWork())
-	if _, err := b.Sync(context.Background(), []json.RawMessage{inFrame(t, protocol.MsgJobAccept, id, map[string]any{})}); err == nil {
-		t.Fatal("expected error for frame before hello")
+func TestDaemonRestartReturnsHelloRequired(t *testing.T) {
+	active, jobs, cfg, _ := newBridge(t)
+	id := park(t, jobs, "wr_restart", handoffWork())
+	runSync(t, active, hello())
+
+	// A new daemon has the same durable jobs but no in-memory hello-session.
+	restarted := NewBridge(jobs, active.svc, cfg)
+	msgs, _ := runSync(t, restarted)
+	if len(msgs) != 1 {
+		t.Fatalf("restart poll frames = %d, want 1", len(msgs))
+	}
+	required := firstOfType(msgs, protocol.MsgError)
+	if required == nil {
+		t.Fatalf("restart poll did not return an error frame: %v", msgs)
+	}
+	payload := required.Payload.(*protocol.ErrorPayload)
+	if payload.Code != "expected_hello" {
+		t.Fatalf("restart error code = %q, want expected_hello", payload.Code)
+	}
+
+	// A concurrent relay has the same recoverable result and is never applied.
+	msgs, _ = runSync(t, restarted, inFrame(t, protocol.MsgJobAccept, id, map[string]any{}))
+	required = firstOfType(msgs, protocol.MsgError)
+	if required == nil || required.Payload.(*protocol.ErrorPayload).Code != "expected_hello" {
+		t.Fatalf("pre-hello relay = %v, want expected_hello error", msgs)
 	}
 }
 

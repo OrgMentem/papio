@@ -360,10 +360,13 @@ export class Bridge {
     this.port = port;
     this.seq = 0;
     port.onMessage.addListener((msg) => {
+      if (this.port !== port) return;
       this.reconnectAttempts = 0;
       return this.onInbound(msg);
     });
     port.onDisconnect.addListener(() => {
+      // A stale port may report its close after recovery opened a replacement.
+      if (this.port !== port) return;
       this.port = null;
       if (this.closingDeliberately) return;
       // Unplanned port death (daemon restart, host exit, Chrome nap): the
@@ -396,6 +399,25 @@ export class Bridge {
     } catch {
       // Already torn down.
     }
+  }
+
+  /** Replace a live native port whose daemon forgot this hello-session. */
+  private reconnectForHello(): void {
+    const port = this.port;
+    if (!port) return;
+    // Clear ownership before closing: onDisconnect for this stale port must not
+    // schedule a second recovery after connect() has installed its replacement.
+    this.closingDeliberately = true;
+    this.port = null;
+    try {
+      port.disconnect();
+    } catch {
+      // Chrome can report an already-closed native port.
+    } finally {
+      this.closingDeliberately = false;
+    }
+    this.reconnectAttempts = 0;
+    this.connect();
   }
 
   private async update(fn: (store: StoreShape) => StoreShape): Promise<void> {
@@ -449,6 +471,7 @@ export class Bridge {
         return;
       case "error":
         console.warn("papio: daemon reported error", msg.payload);
+        if (msg.payload.code === "expected_hello") this.reconnectForHello();
         return;
       default:
         // Extension->daemon-only types are ignored if echoed back.

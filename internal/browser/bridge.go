@@ -64,8 +64,11 @@ func NewBridge(jobs *job.Store, svc *app.Service, cfg config.Config) *Bridge {
 
 // Sync processes a batch of inbound frames (possibly empty for a poll) and
 // returns the outbound command frames. Every inbound frame is re-validated with
-// protocol.DecodeBrowserMessage; an invalid frame fails the whole call closed.
-// Every outbound frame is self-validated by the same decoder before it leaves.
+// protocol.DecodeBrowserMessage; malformed frames fail the whole call closed.
+// A valid frame or poll arriving after a daemon restart but before hello gets a
+// protocol error frame so the still-connected extension can reconnect and
+// establish a fresh hello-session. Every outbound frame is self-validated by
+// the same decoder before it leaves.
 func (b *Bridge) Sync(ctx context.Context, frames []json.RawMessage) ([]json.RawMessage, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -76,20 +79,27 @@ func (b *Bridge) Sync(ctx context.Context, frames []json.RawMessage) ([]json.Raw
 		if err != nil {
 			return nil, fmt.Errorf("%w: %w", ErrInvalidFrame, err)
 		}
+		if !b.helloSeen && msg.Type != protocol.MsgHello {
+			return b.helloRequired()
+		}
 		replies, err := b.handle(ctx, msg)
 		if err != nil {
 			return nil, err
 		}
 		out = append(out, replies...)
 	}
-	if b.helloSeen {
-		polled, err := b.poll(ctx)
+	if !b.helloSeen {
+		required, err := b.helloRequired()
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, polled...)
+		return append(out, required...), nil
 	}
-	return out, nil
+	polled, err := b.poll(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return append(out, polled...), nil
 }
 
 // handle dispatches one decoded inbound frame.
@@ -105,8 +115,7 @@ func (b *Bridge) handle(ctx context.Context, msg *protocol.BrowserMessage) ([]js
 		return []json.RawMessage{ack}, nil
 	}
 	if !b.helloSeen {
-		// Frames before hello are a protocol error: the connection is bad.
-		return nil, fmt.Errorf("%w: frame %q received before hello", ErrInvalidFrame, msg.Type)
+		return b.helloRequired()
 	}
 
 	switch msg.Type {
@@ -173,6 +182,21 @@ func (b *Bridge) handle(ctx context.Context, msg *protocol.BrowserMessage) ([]js
 		return nil, fmt.Errorf("%w: unexpected inbound frame type %q", ErrInvalidFrame, msg.Type)
 	}
 }
+// helloRequired tells a still-connected extension that the daemon lost its
+// in-memory browser session (for example, after a daemon restart). The existing
+// error frame keeps papio-browser/1 unchanged while instructing the extension
+// to reconnect and send the mandatory first hello.
+func (b *Bridge) helloRequired() ([]json.RawMessage, error) {
+	frame, err := b.frame(protocol.MsgError, "", protocol.ErrorPayload{
+		Code:    "expected_hello",
+		Message: "hello required before browser session can resume",
+	})
+	if err != nil {
+		return nil, err
+	}
+	return []json.RawMessage{frame}, nil
+}
+
 
 // recordAuth appends a timing-only auth event. The AuthPayload structurally
 // cannot carry a URL, host, title, query, or fragment, so an identity-provider
