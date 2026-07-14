@@ -199,9 +199,10 @@ type response struct {
 }
 
 type author struct {
-	Given  string `json:"given"`
-	Family string `json:"family"`
-	Name   string `json:"name"` // compatibility with historical responses
+	Given   string `json:"given"`
+	Family  string `json:"family"`
+	Name    string `json:"name"` // compatibility with historical responses
+	RawName string `json:"raw_author_name"`
 }
 
 type location struct {
@@ -234,6 +235,9 @@ func resolvedWork(record response) work.Work {
 		name := strings.TrimSpace(strings.Join([]string{author.Given, author.Family}, " "))
 		if name == "" {
 			name = strings.TrimSpace(author.Name)
+		}
+		if name == "" {
+			name = strings.TrimSpace(author.RawName)
 		}
 		if name != "" {
 			resolved.Authors = append(resolved.Authors, name)

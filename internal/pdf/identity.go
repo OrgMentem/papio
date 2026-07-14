@@ -114,11 +114,20 @@ func IdentityMatch(text string, target work.Work) IdentityDecision {
 }
 
 func normalizeDOI(v string) string {
-	n, err := work.NormalizeDOI(v)
-	if err != nil {
-		return ""
-	}
-	return n
+  n, err := work.NormalizeDOI(v)
+  if err != nil {
+    return ""
+  }
+  // Legacy APA PDFs print an extra slash after the registrant
+  // (for example 10.1037//0021-9010.87.4.611), while Crossref and modern
+  // resolvers identify the same work with one. Collapse that leading suffix
+  // slash for identity comparison only; the canonical work identifier remains
+  // untouched elsewhere.
+  prefix, suffix, ok := strings.Cut(n, "/")
+  if !ok {
+    return n
+  }
+  return prefix + "/" + strings.TrimPrefix(suffix, "/")
 }
 
 func documentDOIs(text string) []string {
