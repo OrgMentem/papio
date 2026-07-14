@@ -15,20 +15,46 @@ import (
 	"papio/internal/job"
 	"papio/internal/protocol"
 	"papio/internal/work"
+	"papio/internal/zotio"
 )
 
 func newAcquireCommand(opt *options) *cobra.Command {
 	var doi, pmid, arxivID, isbn, openalex string
 	var title, requestID, zotioKey, collection, desiredVersion, accessMode string
 	var authors, allowSources, denySources []string
-	var year int
+	var year, queueLimit int
 	var maxCost float64
-	var wait bool
+	var wait, fromZotio bool
 	command := &cobra.Command{
 		Use:   "acquire [identifier]",
 		Short: "Submit one paper-acquisition request",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if fromZotio {
+				if len(args) != 0 || doi != "" || pmid != "" || arxivID != "" || isbn != "" || openalex != "" ||
+					title != "" || requestID != "" || zotioKey != "" || len(authors) != 0 || year != 0 {
+					return fmt.Errorf("--from-zotio cannot be combined with one-work identity flags")
+				}
+				if wait {
+					return fmt.Errorf("--wait is not supported with --from-zotio; inspect the returned job IDs")
+				}
+				options := zotio.QueueOptions{
+					Collection:         strings.TrimSpace(collection),
+					Limit:              queueLimit,
+					DesiredVersion:     desiredVersion,
+					AccessModeOverride: accessMode,
+					SourcesAllow:       trimNonempty(allowSources),
+					SourcesDeny:        trimNonempty(denySources),
+				}
+				if cmd.Flags().Changed("max-cost") {
+					options.MaxCostUSD = &maxCost
+				}
+				var queued zotio.QueueResult
+				if err := opt.call(cmd.Context(), "zotio.queue", options, &queued); err != nil {
+					return err
+				}
+				return opt.printResult(queued, "Queued %d Zotio item(s); skipped %d", len(queued.Queued), len(queued.Skipped))
+			}
 			identifiers, err := normalizeIdentifiers(args, doi, pmid, arxivID, isbn, openalex)
 			if err != nil {
 				return err
@@ -85,6 +111,8 @@ func newAcquireCommand(opt *options) *cobra.Command {
 	flags.StringSliceVar(&allowSources, "source", nil, "allow only this source (repeatable)")
 	flags.StringSliceVar(&denySources, "deny-source", nil, "deny this source (repeatable)")
 	flags.BoolVar(&wait, "wait", false, "wait for a terminal or human-action state")
+	flags.BoolVar(&fromZotio, "from-zotio", false, "queue Zotio items missing an attached PDF")
+	flags.IntVar(&queueLimit, "limit", 25, "maximum Zotio queue rows (1-500)")
 	return command
 }
 

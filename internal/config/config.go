@@ -76,6 +76,14 @@ type Browser struct {
 	ActionExpirySeconds int `toml:"action_expiry_seconds,omitempty"`
 }
 
+// Zotio configures the credential-owning Zotero CLI boundary. Papio invokes
+// this executable but never reads or stores Zotero credentials itself.
+type Zotio struct {
+	Executable     string `toml:"executable"`
+	TimeoutSeconds int    `toml:"timeout_seconds"`
+	AttachmentMode string `toml:"attachment_mode"`
+}
+
 // Config is the loaded, validated configuration.
 type Config struct {
 	AccessMode string            `toml:"access_mode"`
@@ -84,6 +92,7 @@ type Config struct {
 	Fetch      Fetch             `toml:"fetch"`
 	PDF        PDF               `toml:"pdf"`
 	Browser    Browser           `toml:"browser"`
+	Zotio      Zotio             `toml:"zotio"`
 	Sources    map[string]Source `toml:"sources"`
 
 	// Path this config was loaded from ("" for defaults).
@@ -111,6 +120,7 @@ func Default() Config {
 		Fetch:   Fetch{MaxBytes: 100 << 20, TimeoutSeconds: 120},
 		PDF:     PDF{OCREnabled: true, MinTextChars: 400, MaxOCRPages: 4, TitleMatchThreshold: 0.6},
 		Browser: Browser{ActionExpirySeconds: 1800},
+		Zotio:   Zotio{Executable: "zotio", TimeoutSeconds: 120, AttachmentMode: "stored"},
 		Sources: map[string]Source{
 			SourceArXiv:           {Enabled: true, RatePerSec: 1, Burst: 1},
 			SourceEuropePMC:       {Enabled: true, RatePerSec: 2, Burst: 2},
@@ -155,6 +165,7 @@ func Load(path string) (Config, error) {
 	}
 	cfg.DataDir = expandHome(cfg.DataDir)
 	cfg.Browser.AdoptionRoot = expandHome(cfg.Browser.AdoptionRoot)
+	cfg.Zotio.Executable = expandHome(cfg.Zotio.Executable)
 	return cfg, nil
 }
 
@@ -190,6 +201,15 @@ func (c *Config) validate() error {
 	}
 	if c.Browser.ActionExpirySeconds < 0 {
 		return fmt.Errorf("browser.action_expiry_seconds must be >= 0")
+	}
+	if strings.TrimSpace(c.Zotio.Executable) == "" {
+		return fmt.Errorf("zotio.executable is required")
+	}
+	if c.Zotio.TimeoutSeconds < 5 || c.Zotio.TimeoutSeconds > 600 {
+		return fmt.Errorf("zotio.timeout_seconds must be in 5..600")
+	}
+	if c.Zotio.AttachmentMode != "stored" && c.Zotio.AttachmentMode != "linked-file" {
+		return fmt.Errorf("zotio.attachment_mode must be stored or linked-file")
 	}
 	for name, s := range c.Sources {
 		if s.BaseURLForDev != "" && !strings.HasPrefix(s.BaseURLForDev, "http://127.0.0.1") && !strings.HasPrefix(s.BaseURLForDev, "http://localhost") {

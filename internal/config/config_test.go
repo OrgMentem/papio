@@ -16,6 +16,8 @@ func TestSaveLoadRoundTripAndPermissions(t *testing.T) {
 	cfg.Email = "researcher@example.test"
 	cfg.DataDir = filepath.Join(t.TempDir(), "data")
 	cfg.Sources[SourceOpenAlex] = Source{Enabled: true, APIKey: "secret", RatePerSec: 2, Burst: 1}
+	cfg.Zotio.Executable = filepath.Join(t.TempDir(), "zotio")
+	cfg.Zotio.AttachmentMode = "linked-file"
 	if err := Save(cfg, path); err != nil {
 		t.Fatal(err)
 	}
@@ -34,7 +36,10 @@ func TestSaveLoadRoundTripAndPermissions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.AccessMode != cfg.AccessMode || got.Email != cfg.Email || got.Sources[SourceOpenAlex].APIKey != "secret" || got.Path != path {
+	if got.AccessMode != cfg.AccessMode || got.Email != cfg.Email ||
+		got.Sources[SourceOpenAlex].APIKey != "secret" ||
+		got.Zotio.Executable != cfg.Zotio.Executable ||
+		got.Zotio.AttachmentMode != "linked-file" || got.Path != path {
 		t.Fatalf("round trip = %+v", got)
 	}
 }
@@ -54,5 +59,14 @@ func TestLoadRejectsUnknownFields(t *testing.T) {
 	}
 	if _, err := Load(path); err == nil {
 		t.Fatal("unknown config field accepted")
+	}
+}
+
+func TestSaveRejectsInvalidZotioAttachmentMode(t *testing.T) {
+	cfg := Default()
+	cfg.AccessMode = ModeConservative
+	cfg.Zotio.AttachmentMode = "copy"
+	if err := Save(cfg, filepath.Join(t.TempDir(), "config.toml")); err == nil {
+		t.Fatal("invalid Zotio attachment mode accepted")
 	}
 }

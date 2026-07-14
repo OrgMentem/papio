@@ -50,8 +50,10 @@ func NewRoot(out, errOut io.Writer) *cobra.Command {
 		newArtifactsCommand(opt),
 		newBundleCommand(opt),
 		newDoctorCommand(opt),
+		newZotioCommand(opt),
 		newDaemonCommand(opt),
 		newNativeHostCommand(opt),
+		newMCPCommand(opt),
 		newVersionCommand(opt),
 	)
 	return root

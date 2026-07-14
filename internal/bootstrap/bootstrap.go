@@ -31,6 +31,7 @@ import (
 	"papio/internal/resolvers/unpaywall"
 	"papio/internal/store"
 	"papio/internal/work"
+	"papio/internal/zotio"
 )
 
 // System owns the process-wide concrete services used by the daemon and RPC
@@ -47,6 +48,7 @@ type System struct {
 	Browser       *browser.Bridge
 	PDFCapability pdf.Capability
 	WorkerBinary  string
+	Zotio         *zotio.Service
 }
 
 // New builds one production system without starting background goroutines.
@@ -127,11 +129,17 @@ func New(ctx context.Context, cfg config.Config) (*System, error) {
 	if err != nil {
 		return nil, err
 	}
+	bundleExporter := &bundle.Exporter{Jobs: jobs, Artifacts: artifacts, DataDir: cfg.DataDir}
+	zotioService := &zotio.Service{
+		CLI: zotio.New(cfg.Zotio), Submitter: service,
+		Bundle: bundleExporter, Store: db, DataDir: cfg.DataDir, AttachmentMode: cfg.Zotio.AttachmentMode,
+	}
 	system := &System{
 		Config: cfg, Store: db, Jobs: jobs, Artifacts: artifacts, Budgets: budgets,
 		App: service, Scheduler: scheduler,
-		Bundle:        &bundle.Exporter{Jobs: jobs, Artifacts: artifacts},
+		Bundle:        bundleExporter,
 		Browser:       browser.NewBridge(jobs, service, cfg),
+		Zotio:         zotioService,
 		PDFCapability: capability, WorkerBinary: executable,
 	}
 	failed = false

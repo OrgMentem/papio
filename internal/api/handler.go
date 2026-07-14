@@ -17,6 +17,7 @@ import (
 	"papio/internal/ipc"
 	"papio/internal/job"
 	"papio/internal/protocol"
+	"papio/internal/zotio"
 )
 
 const Version = "0.1.0-dev"
@@ -77,6 +78,18 @@ func RouterWithShutdown(system *bootstrap.System, shutdown context.CancelFunc) i
 		"doctor.run": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return runDoctor(ctx, raw, system)
 		},
+		"zotio.preflight": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return zotioPreflight(ctx, raw, system)
+		},
+		"zotio.queue": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return zotioQueue(ctx, raw, system)
+		},
+		"zotio.plan": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return zotioPlan(ctx, raw, system)
+		},
+		"zotio.apply": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return zotioApply(ctx, raw, system)
+		},
 		"browser.sync": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return browserSync(ctx, raw, system)
 		},
@@ -116,6 +129,36 @@ func submit(ctx context.Context, raw json.RawMessage, system *bootstrap.System) 
 		return nil, &ipc.RPCError{Code: "invalid_argument", Message: "invalid acquisition request"}
 	}
 	return marshal(SubmitResult{JobID: id})
+}
+
+func zotioPreflight(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
+	var params struct{}
+	if err := ipc.DecodeParams(raw, &params); err != nil {
+		return badParams(err)
+	}
+	if system.Zotio == nil || system.Zotio.CLI == nil {
+		return nil, &ipc.RPCError{Code: "precondition_failed", Message: "Zotio integration is not configured"}
+	}
+	result, err := system.Zotio.CLI.Preflight(ctx)
+	if err != nil {
+		return nil, &ipc.RPCError{Code: "precondition_failed", Message: safeMessage(err, "Zotio preflight failed")}
+	}
+	return marshal(result)
+}
+
+func zotioQueue(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
+	var options zotio.QueueOptions
+	if err := ipc.DecodeParams(raw, &options); err != nil {
+		return badParams(err)
+	}
+	if system.Zotio == nil {
+		return nil, &ipc.RPCError{Code: "precondition_failed", Message: "Zotio integration is not configured"}
+	}
+	result, err := system.Zotio.QueueMissingPDF(ctx, options)
+	if err != nil {
+		return nil, &ipc.RPCError{Code: "precondition_failed", Message: safeMessage(err, "Zotio queue failed")}
+	}
+	return marshal(result)
 }
 
 func listJobs(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
@@ -270,6 +313,38 @@ func runDoctor(ctx context.Context, raw json.RawMessage, system *bootstrap.Syste
 		return badParams(err)
 	}
 	return marshal(system.DoctorReport(ctx))
+}
+
+func zotioPlan(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
+	var params struct {
+		JobIDs []string `json:"job_ids"`
+	}
+	if err := ipc.DecodeParams(raw, &params); err != nil {
+		return badParams(err)
+	}
+	plans, err := system.Zotio.PlanJobs(ctx, params.JobIDs)
+	if err != nil {
+		return failure(err)
+	}
+	return marshal(map[string]any{"plans": plans})
+}
+
+func zotioApply(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
+	var params struct {
+		PlanID             string `json:"plan_id"`
+		ConfirmationSHA256 string `json:"confirmation_sha256"`
+	}
+	if err := ipc.DecodeParams(raw, &params); err != nil {
+		return badParams(err)
+	}
+	if params.PlanID == "" || params.ConfirmationSHA256 == "" {
+		return badParams(errors.New("plan_id and confirmation_sha256 are required"))
+	}
+	result, err := system.Zotio.Apply(ctx, params.PlanID, params.ConfirmationSHA256)
+	if err != nil {
+		return failure(err)
+	}
+	return marshal(result)
 }
 
 func browserSync(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
