@@ -417,12 +417,14 @@ func nullableInt(v int) any {
 
 // Transition CAS-moves a job from -> to, appending an event in the same
 // transaction. detail must be pre-redacted. retryAt applies to retry_wait;
-// terminalReason applies to terminal states.
+// terminalReason applies to terminal states. Reaching any terminal state
+// closes the job's open human actions ('resolved' on ready, 'cancelled'
+// otherwise) so a finished job never strands an open action.
 func (js *Store) Transition(ctx context.Context, jobID, from, to string, detail map[string]any, opts ...TransitionOpt) error {
-	return js.transition(ctx, jobID, from, to, detail, false, opts...)
+	return js.transition(ctx, jobID, from, to, detail, opts...)
 }
 
-func (js *Store) transition(ctx context.Context, jobID, from, to string, detail map[string]any, closeOpenActions bool, opts ...TransitionOpt) error {
+func (js *Store) transition(ctx context.Context, jobID, from, to string, detail map[string]any, opts ...TransitionOpt) error {
 	if !allowed[from][to] {
 		return fmt.Errorf("%w: %s -> %s not allowed", ErrConflict, from, to)
 	}
@@ -472,10 +474,15 @@ func (js *Store) transition(ctx context.Context, jobID, from, to string, detail 
 		jobID, now, string(detailJSON)); err != nil {
 		return err
 	}
-	if closeOpenActions {
+	if Terminal(to) {
+		actionStatus := "cancelled"
+		if to == StateReady {
+			actionStatus = "resolved"
+		}
 		if _, err := tx.ExecContext(ctx,
-			`UPDATE human_actions SET status = 'cancelled', resolved_at = ?
-			 WHERE job_id = ? AND status = 'open'`, now, jobID); err != nil {
+			`UPDATE human_actions SET status = ?, resolved_at = ?
+			 WHERE job_id = ? AND status = 'open' AND kind != ?`,
+			actionStatus, now, jobID, informationalActionKind); err != nil {
 			return err
 		}
 	}
@@ -580,7 +587,7 @@ func (js *Store) Cancel(ctx context.Context, jobID, reason string) error {
 			return nil
 		}
 		err = js.transition(ctx, jobID, row.State, StateCancelled,
-			map[string]any{"reason": reason}, true, WithTerminalReason(reason))
+			map[string]any{"reason": reason}, WithTerminalReason(reason))
 		if errors.Is(err, ErrConflict) {
 			continue
 		}
@@ -683,17 +690,25 @@ func (js *Store) RecoverStale(ctx context.Context) ([]string, error) {
 	return recovered, nil
 }
 
-// CloseStaleHumanActions cancels open actions for jobs that have already
-// reached a terminal state. It repairs rows left by older daemon versions.
+// informationalActionKind marks the one advisory action that legitimately
+// stays open on a terminal job: conservative mode records that an
+// institutional OpenURL exists without opening it, and that trace must
+// survive both the terminal transition and the startup sweep.
+const informationalActionKind = "openurl_available"
+
+// CloseStaleHumanActions cancels open non-advisory actions for jobs that have
+// already reached a terminal state. It repairs rows left by older daemon
+// versions.
 func (js *Store) CloseStaleHumanActions(ctx context.Context) error {
 	_, err := js.S.DB().ExecContext(ctx,
 		`UPDATE human_actions SET status = 'cancelled', resolved_at = ?
 		 WHERE status = 'open'
+		   AND kind != ?
 		   AND EXISTS (
 		       SELECT 1 FROM jobs
 		       WHERE jobs.id = human_actions.job_id
 		         AND jobs.state IN ('ready', 'unavailable', 'failed', 'cancelled')
-		   )`, store.Now())
+		   )`, store.Now(), informationalActionKind)
 	return err
 }
 

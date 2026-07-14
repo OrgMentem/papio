@@ -394,6 +394,38 @@ func TestCancelClosesAllOpenHumanActions(t *testing.T) {
 	}
 }
 
+func TestReadyTransitionResolvesOpenHumanActions(t *testing.T) {
+	js := testStore(t)
+	ctx := context.Background()
+	id, err := js.CreateRequest(ctx, "wr_ready_actions", testWork(), "", "", testPolicy(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := js.Transition(ctx, id, StateQueued, StateResolving, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := js.OpenHumanAction(ctx, id, "openurl_handoff", "pending"); err != nil {
+		t.Fatal(err)
+	}
+	if err := js.Transition(ctx, id, StateResolving, StateReady, nil); err != nil {
+		t.Fatal(err)
+	}
+	actions, err := js.ListHumanActions(ctx, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(actions) != 1 || actions[0].Status != "resolved" {
+		t.Fatalf("actions = %+v, want one resolved", actions)
+	}
+	open, err := js.ListHumanActions(ctx, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(open) != 0 {
+		t.Fatalf("open actions = %+v, want none", open)
+	}
+}
+
 func TestCloseStaleHumanActionsClosesOnlyTerminalJobs(t *testing.T) {
 	js := testStore(t)
 	ctx := context.Background()
@@ -449,6 +481,35 @@ func TestCloseStaleHumanActionsClosesOnlyTerminalJobs(t *testing.T) {
 		if action.Status != want {
 			t.Fatalf("action %+v status = %q, want %q", action, action.Status, want)
 		}
+	}
+}
+
+func TestConservativeAdvisorySurvivesTerminalCloseAndSweep(t *testing.T) {
+	js := testStore(t)
+	ctx := context.Background()
+	id, err := js.CreateRequest(ctx, "wr_advisory", testWork(), "", "", testPolicy(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := js.Transition(ctx, id, StateQueued, StateResolving, nil); err != nil {
+		t.Fatal(err)
+	}
+	// Conservative mode records the advisory, then ends the job unavailable.
+	if _, err := js.OpenHumanAction(ctx, id, "openurl_available", "not opened in conservative mode"); err != nil {
+		t.Fatal(err)
+	}
+	if err := js.Transition(ctx, id, StateResolving, StateUnavailable, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := js.CloseStaleHumanActions(ctx); err != nil {
+		t.Fatal(err)
+	}
+	open, err := js.ListHumanActions(ctx, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(open) != 1 || open[0].Kind != "openurl_available" {
+		t.Fatalf("open actions = %+v, want the surviving advisory", open)
 	}
 }
 
