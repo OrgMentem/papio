@@ -49,8 +49,18 @@ function ctx(title?: string): AdapterContext {
 
 // --- Contract 1/2: interpret --------------------------------------------------
 
-test("registry ships empty until real fixtures are captured", () => {
-  expect(adapters).toEqual([]);
+test("every registered adapter is fixture-backed, versioned, and host-scoped", () => {
+  for (const spec of adapters) {
+    expect(spec.id).toMatch(/^[a-z][a-z0-9_-]*$/);
+    expect(spec.version).toMatch(/^\d+\.\d+\.\d+$/);
+    expect(spec.hosts.length).toBeGreaterThan(0);
+    expect(spec.classify.length).toBeGreaterThan(0);
+    // The plan forbids specs without captured evidence: at least the success
+    // fixture must be committed for every registered provider.
+    expect(fixtureExists(spec.id, "success")).toBe(true);
+    if (spec.download) expect(spec.download.requireKind).toBe("article");
+  }
+  expect(adapters.map((a) => a.id)).toContain("proquest");
 });
 
 test("a rule with no conditions never matches (no blanket fallback)", () => {

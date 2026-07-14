@@ -153,10 +153,28 @@ export function interpret(doc: Document, spec: AdapterSpec, ctx: AdapterContext)
 }
 
 /**
- * Registered provider adapters. Intentionally empty until the first real
- * provider fixtures are captured and a ProQuest spec is authored against them
- * (Phase 3). The hello frame reports `{ [spec.id]: spec.version }` for every
- * entry here, and the background classifier only ever runs a spec drawn from
- * this registry — on a host both advertised here and granted by the user.
+ * Registered provider adapters, in plan order. Every spec is fixture-backed:
+ * a rule may only reference markers proven by a captured fixture under
+ * extension/fixtures/<id>/. States without a fixture (e.g. a real logged-out
+ * ProQuest wall — the header embeds a decorative login form on EVERY page, so
+ * no safe selector exists without a genuine capture) are deliberately absent
+ * and classify as `unknown` -> assisted behaviour. The hello frame reports
+ * `{ [spec.id]: spec.version }` for every entry here, and the background
+ * classifier only ever runs a spec drawn from this registry — on a host both
+ * advertised here and granted by the user.
  */
-export const adapters: AdapterSpec[] = [];
+export const adapters: AdapterSpec[] = [
+  {
+    // Verified live 2026-07-14 against Example University-authenticated ProQuest
+    // (fixtures/proquest/*.html). The PDF link id is document-scoped
+    // (`downloadPDFLink_MSTAR_<docid>`), hence the prefix selector.
+    // A docview page without that link (citation-only, HTML-only, or
+    // unentitled) stays `unknown`: distinguishing those needs fixtures
+    // we do not have yet.
+    id: "proquest",
+    version: "0.1.0",
+    hosts: ["proquest.com"],
+    classify: [{ kind: "article", all: ["a[id^='downloadPDFLink_']", "h1"] }],
+    download: { selector: "a[id^='downloadPDFLink_']", requireKind: "article" },
+  },
+];
