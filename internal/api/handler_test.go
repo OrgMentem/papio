@@ -175,3 +175,50 @@ func TestRouterBrowserSyncHandshakeAndInvalidFrame(t *testing.T) {
 		t.Fatalf("invalid frame error = %+v, want invalid_argument", rpcErr)
 	}
 }
+
+func TestRouterResolveIdentityReviewAction(t *testing.T) {
+	system := testSystem(t)
+	ctx := context.Background()
+	id, err := system.Jobs.CreateRequest(ctx, "request_api_review", work.Work{DOI: "10.1000/review"}, "", "", job.Policy{
+		AccessMode: config.ModeConservative, DesiredVersion: "any",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, edge := range [][2]string{
+		{job.StateQueued, job.StateResolving},
+		{job.StateResolving, job.StateFetching},
+		{job.StateFetching, job.StateValidating},
+		{job.StateValidating, job.StateNeedsReview},
+	} {
+		if err := system.Jobs.Transition(ctx, id, edge[0], edge[1], nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	actionID, err := system.Jobs.OpenHumanAction(ctx, id, "verify_identity", "local quarantine file: /tmp/review.pdf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	router := Router(system)
+	var result struct {
+		JobID string `json:"job_id"`
+		State string `json:"state"`
+	}
+	if rpcErr := callMethod(t, router, "actions.resolve", map[string]any{"action_id": actionID, "verdict": "reject"}, &result); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	if result.JobID != id || result.State != job.StateCancelled {
+		t.Fatalf("resolve result = %+v", result)
+	}
+	if rpcErr := callMethod(t, router, "actions.resolve", map[string]any{"action_id": actionID, "verdict": "maybe"}, nil); rpcErr == nil || rpcErr.Code != "invalid_argument" {
+		t.Fatalf("invalid verdict error = %+v", rpcErr)
+	}
+
+	wrongID, err := system.Jobs.OpenHumanAction(ctx, id, "manual_download", "not an identity review")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rpcErr := callMethod(t, router, "actions.resolve", map[string]any{"action_id": wrongID, "verdict": "accept"}, nil); rpcErr == nil || rpcErr.Code != "invalid_argument" {
+		t.Fatalf("wrong action kind error = %+v", rpcErr)
+	}
+}

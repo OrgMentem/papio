@@ -142,6 +142,10 @@ func TestProcessReadyEnrichesMetadataAndNeverPersistsSecrets(t *testing.T) {
 	if ready.Work.Title != "Example Paper" || len(ready.Work.Authors) != 1 || ready.Work.Year != 2024 {
 		t.Fatalf("resolver metadata not filled: %+v", ready.Work)
 	}
+	artifact, err := jobs.GetArtifact(context.Background(), ready.ArtifactSHA256)
+	if err != nil || artifact == nil || artifact.IdentityResult != pdf.IdentityPass {
+		t.Fatalf("pass artifact = %+v, %v", artifact, err)
+	}
 	if fetches != 1 || adapter.calls != 1 {
 		t.Fatalf("fetch/resolver calls = %d/%d", fetches, adapter.calls)
 	}
@@ -356,5 +360,135 @@ func TestSubmitRequiresExplicitAccessMode(t *testing.T) {
 	var unset *config.ErrAccessModeUnset
 	if !errors.As(err, &unset) {
 		t.Fatalf("submit err = %v, want ErrAccessModeUnset", err)
+	}
+}
+
+func TestAcceptedIdentityReviewResumesAndRecordsOverride(t *testing.T) {
+	svc, jobs := newTestService(t)
+	adapter := &fakeResolver{name: "fixture", cands: []resolver.Candidate{{
+		Source: "fixture", URL: "https://example.test/review.pdf", Version: resolver.VersionPublished,
+		AccessBasis: resolver.AccessOpen, ReuseLicense: "unknown", Direct: true, IdentityConfidence: 1,
+	}}}
+	svc.Resolvers = []ResolverEntry{{Adapter: adapter, Policy: config.Source{Enabled: true}}}
+	fetches := 0
+	svc.Fetch = fakeDownload(&fetches)
+	svc.Validate = func(context.Context, string, string, work.Work) (pdf.ValidationReport, error) {
+		return pdf.ValidationReport{
+			Payload: pdf.PayloadReport{OK: true}, Structural: pdf.StructuralReport{Valid: true, Pages: 2},
+			Text: pdf.TextReport{Chars: 2000}, Identity: pdf.IdentityDecision{Result: pdf.IdentityReview},
+		}, nil
+	}
+	id, err := svc.Submit(context.Background(), doiRequest("wr_review_resume"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, err := jobs.ClaimNext(context.Background(), "first-worker", time.Minute)
+	if err != nil || row == nil {
+		t.Fatalf("first claim = %+v, %v", row, err)
+	}
+	if err := svc.Process(context.Background(), row); err != nil {
+		t.Fatal(err)
+	}
+	parked, _ := jobs.Get(context.Background(), id)
+	if parked.State != job.StateNeedsReview {
+		t.Fatalf("initial review state = %+v", parked)
+	}
+	actions, err := jobs.ListHumanActions(context.Background(), true)
+	if err != nil || len(actions) != 1 || actions[0].Kind != "verify_identity" || !strings.Contains(actions[0].Detail, "local quarantine file:") {
+		t.Fatalf("review action = %+v, %v", actions, err)
+	}
+	if _, state, err := jobs.ResolveReview(context.Background(), actions[0].ID, "accept"); err != nil || state != job.StateFetching {
+		t.Fatalf("accept review = %q, %v", state, err)
+	}
+	row, err = jobs.ClaimNext(context.Background(), "second-worker", time.Minute)
+	if err != nil || row == nil || row.ID != id {
+		t.Fatalf("resumed claim = %+v, %v", row, err)
+	}
+	if err := svc.Process(context.Background(), row); err != nil {
+		t.Fatal(err)
+	}
+	ready, _ := jobs.Get(context.Background(), id)
+	if ready.State != job.StateReady || ready.ArtifactSHA256 == "" || fetches != 2 {
+		t.Fatalf("review-resumed result = %+v; fetches=%d", ready, fetches)
+	}
+	artifact, err := jobs.GetArtifact(context.Background(), ready.ArtifactSHA256)
+	if err != nil || artifact == nil || artifact.IdentityResult != "user_confirmed" {
+		t.Fatalf("accepted review artifact = %+v, %v", artifact, err)
+	}
+	events, _ := jobs.Events(context.Background(), id)
+	foundOverride := false
+	for _, event := range events {
+		detail, _ := event["detail"].(map[string]any)
+		if detail["reason"] == "human_identity_override" {
+			foundOverride = true
+		}
+	}
+	if !foundOverride {
+		t.Fatalf("events missing human_identity_override: %+v", events)
+	}
+}
+
+func TestReviewOverrideDoesNotBypassRejectOrUnsafePDF(t *testing.T) {
+	for name, report := range map[string]pdf.ValidationReport{
+		"identity_reject": {
+			Payload: pdf.PayloadReport{OK: true}, Structural: pdf.StructuralReport{Valid: true},
+			Text: pdf.TextReport{Chars: 2000}, Identity: pdf.IdentityDecision{Result: pdf.IdentityReject},
+		},
+		"unsafe_pdf": {
+			Payload: pdf.PayloadReport{OK: true}, Structural: pdf.StructuralReport{Valid: true, Encrypted: true},
+			Text: pdf.TextReport{Chars: 2000}, Identity: pdf.IdentityDecision{Result: pdf.IdentityReview},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			svc, jobs := newTestService(t)
+			svc.Validate = func(context.Context, string, string, work.Work) (pdf.ValidationReport, error) {
+				return report, nil
+			}
+			id, err := jobs.CreateRequest(context.Background(), "wr_override_"+name, work.Work{DOI: "10.1002/example"}, "", "", job.Policy{
+				AccessMode: config.ModeConservative, DesiredVersion: "any",
+			}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := jobs.InsertCandidates(context.Background(), id, []job.Candidate{{
+				JobID: id, Source: "fixture", URLRedacted: "https://example.test/"+name+".pdf", URLKey: name,
+				Version: resolver.VersionPublished, AccessBasis: resolver.AccessOpen, ReuseLicense: "unknown",
+				ReviewOverride: true,
+			}}); err != nil {
+				t.Fatal(err)
+			}
+			candidate, _ := jobs.NextPendingCandidate(context.Background(), id)
+			for _, edge := range [][2]string{
+				{job.StateQueued, job.StateResolving},
+				{job.StateResolving, job.StateFetching},
+				{job.StateFetching, job.StateValidating},
+			} {
+				if err := jobs.Transition(context.Background(), id, edge[0], edge[1], nil); err != nil {
+					t.Fatal(err)
+				}
+			}
+			row, _ := jobs.Get(context.Background(), id)
+			temp := t.TempDir() + "/candidate.pdf"
+			if err := os.WriteFile(temp, pdfBytes(name), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			accepted, parked, err := svc.validateCandidate(context.Background(), row, candidate, fetch.Result{
+				TempPath: temp, SHA256: strings.Repeat("a", 64), SniffedMIME: "application/pdf",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, _ := jobs.Get(context.Background(), id)
+			switch name {
+			case "identity_reject":
+				if accepted || parked || got.State != job.StateFetching {
+					t.Fatalf("identity reject bypassed by override: accepted=%t parked=%t job=%+v", accepted, parked, got)
+				}
+			case "unsafe_pdf":
+				if accepted || !parked || got.State != job.StateNeedsReview {
+					t.Fatalf("unsafe PDF bypassed by override: accepted=%t parked=%t job=%+v", accepted, parked, got)
+				}
+			}
+		})
 	}
 }

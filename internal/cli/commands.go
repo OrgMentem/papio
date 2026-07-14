@@ -5,6 +5,7 @@ package cli
 import (
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -130,7 +131,35 @@ func newActionsCommand(opt *options) *cobra.Command {
 		},
 	}
 	list.Flags().BoolVar(&all, "all", false, "include resolved actions")
-	command.AddCommand(list)
+
+	var accept, reject bool
+	resolve := &cobra.Command{
+		Use:   "resolve <action-id>",
+		Short: "Accept or reject a parked identity review",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if accept == reject {
+				return errors.New("exactly one of --accept or --reject is required")
+			}
+			actionID, err := strconv.ParseInt(args[0], 10, 64)
+			if err != nil || actionID <= 0 {
+				return errors.New("action-id must be a positive integer")
+			}
+			verdict := "reject"
+			if accept {
+				verdict = "accept"
+			}
+			var result map[string]any
+			if err := opt.call(cmd.Context(), "actions.resolve",
+				map[string]any{"action_id": actionID, "verdict": verdict}, &result); err != nil {
+				return err
+			}
+			return opt.printResult(result, "%s\t%s", result["job_id"], result["state"])
+		},
+	}
+	resolve.Flags().BoolVar(&accept, "accept", false, "accept the identity review")
+	resolve.Flags().BoolVar(&reject, "reject", false, "reject the identity review")
+	command.AddCommand(list, resolve)
 	return command
 }
 

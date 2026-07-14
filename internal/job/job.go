@@ -79,6 +79,17 @@ var allowed = map[string]map[string]bool{
 // transition is not allowed).
 var ErrConflict = errors.New("job state conflict")
 
+// ErrHumanActionKind reports an action that cannot be resolved by the requested
+// human workflow.
+type ErrHumanActionKind struct {
+	ActionID int64
+	Kind     string
+}
+
+func (e *ErrHumanActionKind) Error() string {
+	return fmt.Sprintf("human action %d has unsupported kind %q", e.ActionID, e.Kind)
+}
+
 // ErrCostExceeded means reserving a paid attempt would cross the job's
 // explicit maximum. The reservation is atomic across daemon workers/restarts.
 type ErrCostExceeded struct {
@@ -155,6 +166,7 @@ type Candidate struct {
 	RankEvidence       string  `json:"rank_evidence,omitempty"`
 	Rank               int     `json:"rank"`
 	Status             string  `json:"status"`
+	ReviewOverride     bool    `json:"review_override"`
 }
 
 // Store layers job semantics over the shared SQLite store.
@@ -787,11 +799,11 @@ func (js *Store) InsertCandidates(ctx context.Context, jobID string, cands []Can
 		res, err := tx.ExecContext(ctx, `
 			INSERT OR IGNORE INTO candidates
 			  (job_id, source, url_redacted, url_key, landing_redacted, version, access_basis, reuse_license,
-			   expected_mime, cost_usd, direct, identity_confidence, rank_evidence, rank, status, created_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)`,
+			   expected_mime, cost_usd, direct, identity_confidence, rank_evidence, rank, status, review_override, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
 			jobID, c.Source, c.URLRedacted, c.URLKey, nullable(c.LandingRedacted), c.Version, c.AccessBasis,
 			c.ReuseLicense, nullable(c.ExpectedMIME), c.CostUSD, boolInt(c.Direct), c.IdentityConfidence,
-			nullable(c.RankEvidence), c.Rank, now)
+			nullable(c.RankEvidence), c.Rank, boolInt(c.ReviewOverride), now)
 		if err != nil {
 			return 0, err
 		}
@@ -814,20 +826,20 @@ func (js *Store) NextPendingCandidate(ctx context.Context, jobID string) (*Candi
 	row := js.S.DB().QueryRowContext(ctx, `
 		SELECT id, job_id, source, url_redacted, url_key, COALESCE(landing_redacted,''), version, access_basis,
 		       reuse_license, COALESCE(expected_mime,''), cost_usd, direct, identity_confidence,
-		       COALESCE(rank_evidence,''), COALESCE(rank,0), status
+		       COALESCE(rank_evidence,''), COALESCE(rank,0), status, review_override
 		FROM candidates WHERE job_id = ? AND status = 'pending' ORDER BY rank ASC, id ASC LIMIT 1`, jobID)
 	var c Candidate
-	var direct int
+	var direct, override int
 	err := row.Scan(&c.ID, &c.JobID, &c.Source, &c.URLRedacted, &c.URLKey, &c.LandingRedacted, &c.Version,
 		&c.AccessBasis, &c.ReuseLicense, &c.ExpectedMIME, &c.CostUSD, &direct, &c.IdentityConfidence,
-		&c.RankEvidence, &c.Rank, &c.Status)
+		&c.RankEvidence, &c.Rank, &c.Status, &override)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	c.Direct = direct == 1
+	c.Direct, c.ReviewOverride = direct == 1, override == 1
 	return &c, nil
 }
 
@@ -842,16 +854,16 @@ func (js *Store) GetCandidate(ctx context.Context, id int64) (*Candidate, error)
 	row := js.S.DB().QueryRowContext(ctx, `
 		SELECT id, job_id, source, url_redacted, url_key, COALESCE(landing_redacted,''), version, access_basis,
 		       reuse_license, COALESCE(expected_mime,''), cost_usd, direct, identity_confidence,
-		       COALESCE(rank_evidence,''), COALESCE(rank,0), status
+		       COALESCE(rank_evidence,''), COALESCE(rank,0), status, review_override
 		FROM candidates WHERE id = ?`, id)
 	var c Candidate
-	var direct int
+	var direct, override int
 	if err := row.Scan(&c.ID, &c.JobID, &c.Source, &c.URLRedacted, &c.URLKey, &c.LandingRedacted, &c.Version,
 		&c.AccessBasis, &c.ReuseLicense, &c.ExpectedMIME, &c.CostUSD, &direct, &c.IdentityConfidence,
-		&c.RankEvidence, &c.Rank, &c.Status); err != nil {
+		&c.RankEvidence, &c.Rank, &c.Status, &override); err != nil {
 		return nil, err
 	}
-	c.Direct = direct == 1
+	c.Direct, c.ReviewOverride = direct == 1, override == 1
 	return &c, nil
 }
 
@@ -981,6 +993,127 @@ func (js *Store) OpenHumanAction(ctx context.Context, jobID, kind, detail string
 		return 0, err
 	}
 	return res.LastInsertId()
+}
+
+// ResolveHumanAction closes one open action with a compare-and-swap update.
+func (js *Store) ResolveHumanAction(ctx context.Context, actionID int64, status string) error {
+	if status != "resolved" && status != "cancelled" {
+		return fmt.Errorf("invalid human action status %q", status)
+	}
+	res, err := js.S.DB().ExecContext(ctx,
+		`UPDATE human_actions SET status = ?, resolved_at = ? WHERE id = ? AND status = 'open'`,
+		status, store.Now(), actionID)
+	if err != nil {
+		return err
+	}
+	if changed, _ := res.RowsAffected(); changed != 1 {
+		var exists int
+		if err := js.S.DB().QueryRowContext(ctx, `SELECT 1 FROM human_actions WHERE id = ?`, actionID).Scan(&exists); err != nil {
+			return err
+		}
+		return fmt.Errorf("%w: human action %d is not open", ErrConflict, actionID)
+	}
+	return nil
+}
+
+// ResolveReview applies a human accept or reject verdict to a parked identity
+// review. It atomically closes the action and moves the job to its next durable
+// boundary, leaving no interval in which a closed action still parks a job.
+func (js *Store) ResolveReview(ctx context.Context, actionID int64, verdict string) (string, string, error) {
+	if verdict != "accept" && verdict != "reject" {
+		return "", "", fmt.Errorf("invalid review verdict %q", verdict)
+	}
+	tx, err := js.S.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return "", "", err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var action HumanAction
+	if err := tx.QueryRowContext(ctx,
+		`SELECT id, job_id, kind, status, COALESCE(detail,''), created_at FROM human_actions WHERE id = ?`, actionID).
+		Scan(&action.ID, &action.JobID, &action.Kind, &action.Status, &action.Detail, &action.CreatedAt); err != nil {
+		return "", "", err
+	}
+	if action.Kind != "verify_identity" {
+		return "", "", &ErrHumanActionKind{ActionID: actionID, Kind: action.Kind}
+	}
+	if action.Status != "open" {
+		return "", "", fmt.Errorf("%w: human action %d is not open", ErrConflict, actionID)
+	}
+	var from string
+	if err := tx.QueryRowContext(ctx, `SELECT state FROM jobs WHERE id = ?`, action.JobID).Scan(&from); err != nil {
+		return "", "", err
+	}
+	if from != StateNeedsReview {
+		return "", "", fmt.Errorf("%w: job %s is not awaiting identity review", ErrConflict, action.JobID)
+	}
+
+	now := store.Now()
+	res, err := tx.ExecContext(ctx,
+		`UPDATE human_actions SET status = 'resolved', resolved_at = ? WHERE id = ? AND status = 'open'`, now, actionID)
+	if err != nil {
+		return "", "", err
+	}
+	if changed, _ := res.RowsAffected(); changed != 1 {
+		return "", "", fmt.Errorf("%w: human action %d is not open", ErrConflict, actionID)
+	}
+
+	to, reason := StateCancelled, "review_rejected"
+	terminalReason := "review_rejected"
+	if verdict == "accept" {
+		var candidateID sql.NullInt64
+		err := tx.QueryRowContext(ctx, `
+			SELECT candidate_id FROM attempts
+			WHERE job_id = ? AND stage = 'validate' AND outcome = 'needs_review'
+			ORDER BY id DESC LIMIT 1`, action.JobID).Scan(&candidateID)
+		if errors.Is(err, sql.ErrNoRows) {
+			err = nil
+		}
+		if err != nil {
+			return "", "", err
+		}
+		if candidateID.Valid {
+			res, err := tx.ExecContext(ctx,
+				`UPDATE candidates SET review_override = 1, status = 'pending' WHERE id = ? AND job_id = ?`,
+				candidateID.Int64, action.JobID)
+			if err != nil {
+				return "", "", err
+			}
+			if changed, _ := res.RowsAffected(); changed != 1 {
+				return "", "", fmt.Errorf("%w: candidate %d not found for job %s", ErrConflict, candidateID.Int64, action.JobID)
+			}
+			to = StateFetching
+		} else {
+			to = StateResolving
+		}
+		reason = "review_accepted"
+		terminalReason = ""
+	}
+	detail, err := json.Marshal(map[string]any{"from": from, "to": to, "reason": reason})
+	if err != nil {
+		return "", "", err
+	}
+	res, err = tx.ExecContext(ctx, `
+		UPDATE jobs SET state = ?, updated_at = ?, lease_owner = NULL, lease_expires_at = NULL,
+		        retry_at = NULL, terminal_reason = ?, selected_candidate_id = NULL, artifact_sha256 = NULL
+		WHERE id = ? AND state = ?`,
+		to, now, nullable(terminalReason), action.JobID, from)
+	if err != nil {
+		return "", "", err
+	}
+	if changed, _ := res.RowsAffected(); changed != 1 {
+		return "", "", fmt.Errorf("%w: job %s not in state %s", ErrConflict, action.JobID, from)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO events (job_id, at, kind, detail_json) VALUES (?, ?, 'job.transition', ?)`,
+		action.JobID, now, string(detail)); err != nil {
+		return "", "", err
+	}
+	if err := tx.Commit(); err != nil {
+		return "", "", err
+	}
+	return action.JobID, to, nil
 }
 
 // HumanAction is one pending or resolved human step.

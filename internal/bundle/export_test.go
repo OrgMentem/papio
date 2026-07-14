@@ -124,6 +124,58 @@ func TestExportIsSchemaValidPrivateAndIdempotent(t *testing.T) {
 	}
 }
 
+func TestExportPreservesUserConfirmedIdentity(t *testing.T) {
+	exporter, id, sha := readyFixture(t)
+	ctx := context.Background()
+	art, err := exporter.Jobs.GetArtifact(ctx, sha)
+	if err != nil || art == nil {
+		t.Fatalf("get artifact: %v", err)
+	}
+	art.IdentityResult = "user_confirmed"
+	if err := exporter.Jobs.UpsertArtifact(ctx, *art); err != nil {
+		t.Fatal(err)
+	}
+
+	path, b, err := exporter.Export(ctx, id, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b.Validation.Identity != "user_confirmed" {
+		t.Fatalf("bundle validation identity = %q", b.Validation.Identity)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := protocol.DecodeAcquisitionBundle(data)
+	if err != nil {
+		t.Fatalf("decode exported bundle: %v", err)
+	}
+	if decoded.Validation.Identity != "user_confirmed" {
+		t.Fatalf("bundle.json validation identity = %q", decoded.Validation.Identity)
+	}
+}
+
+func TestExportRefusesUnconfirmedIdentity(t *testing.T) {
+	for _, identity := range []string{"review", "reject"} {
+		t.Run(identity, func(t *testing.T) {
+			exporter, id, sha := readyFixture(t)
+			ctx := context.Background()
+			art, err := exporter.Jobs.GetArtifact(ctx, sha)
+			if err != nil || art == nil {
+				t.Fatalf("get artifact: %v", err)
+			}
+			art.IdentityResult = identity
+			if err := exporter.Jobs.UpsertArtifact(ctx, *art); err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := exporter.Export(ctx, id, ""); err == nil {
+				t.Fatalf("exported %s identity artifact", identity)
+			}
+		})
+	}
+}
+
 func TestCacheReadyJobReusesOriginalCandidateProvenance(t *testing.T) {
 	exporter, _, sha := readyFixture(t)
 	ctx := context.Background()

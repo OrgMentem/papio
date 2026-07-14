@@ -459,6 +459,7 @@ func (s *Service) validateCandidate(ctx context.Context, row *job.Row, stored *j
 			map[string]any{"reason": "validation_error"})
 	}
 	active := report.Structural.HasJavaScript || report.Structural.HasEmbeddedFiles
+	needsIdentityReview := report.Text.NeedsReview || report.Identity.Result == pdf.IdentityReview
 	switch {
 	case !report.Payload.OK || !report.Structural.Valid:
 		_ = s.Jobs.FinishAttempt(ctx, attempt, "invalid", 0, "payload_or_structure_rejected")
@@ -472,13 +473,14 @@ func (s *Service) validateCandidate(ctx context.Context, row *job.Row, stored *j
 		_, _ = s.Jobs.OpenHumanAction(ctx, row.ID, "unsafe_pdf", "PDF is encrypted or contains active/embedded content")
 		return false, true, s.Jobs.Transition(ctx, row.ID, job.StateValidating, job.StateNeedsReview,
 			map[string]any{"reason": "encrypted_or_active_content"})
-	case report.Text.NeedsReview || report.Identity.Result == pdf.IdentityReview:
+	case needsIdentityReview && !stored.ReviewOverride:
 		_ = s.Jobs.FinishAttempt(ctx, attempt, "needs_review", 0, "semantic_or_identity_review")
 		_ = s.Jobs.MarkCandidate(ctx, stored.ID, "skipped")
-		_, _ = s.Jobs.OpenHumanAction(ctx, row.ID, "verify_identity", "PDF text or identity requires human verification")
+		_, _ = s.Jobs.OpenHumanAction(ctx, row.ID, "verify_identity",
+			fmt.Sprintf("PDF text or identity requires human verification; local quarantine file: %s", result.TempPath))
 		return false, true, s.Jobs.Transition(ctx, row.ID, job.StateValidating, job.StateNeedsReview,
 			map[string]any{"reason": "semantic_or_identity_review"})
-	case report.Identity.Result != pdf.IdentityPass:
+	case report.Identity.Result != pdf.IdentityPass && report.Identity.Result != pdf.IdentityReview:
 		_ = s.Jobs.FinishAttempt(ctx, attempt, "invalid", 0, "identity_rejected")
 		_ = s.Jobs.MarkCandidate(ctx, stored.ID, "invalid")
 		_ = os.Remove(result.TempPath)
@@ -490,11 +492,15 @@ func (s *Service) validateCandidate(ctx context.Context, row *job.Row, stored *j
 	if err != nil {
 		return false, false, err
 	}
+	identityResult := report.Identity.Result
+	if stored.ReviewOverride && needsIdentityReview {
+		identityResult = "user_confirmed"
+	}
 	art := job.Artifact{
 		SHA256: result.SHA256, SizeBytes: result.SizeBytes, MIME: result.SniffedMIME,
 		PageCount: report.Structural.Pages, TextChars: report.Text.Chars, OCRUsed: report.Text.OCRUsed,
 		Encrypted: report.Structural.Encrypted, HasActiveContent: active,
-		IdentityResult: report.Identity.Result, Path: dest,
+		IdentityResult: identityResult, Path: dest,
 	}
 	if err := s.Jobs.UpsertArtifact(ctx, art); err != nil {
 		return false, false, err
@@ -502,10 +508,13 @@ func (s *Service) validateCandidate(ctx context.Context, row *job.Row, stored *j
 	if err := s.Jobs.MarkCandidate(ctx, stored.ID, "accepted"); err != nil {
 		return false, false, err
 	}
+	acceptDetail := map[string]any{"candidate_id": stored.ID, "sha256": result.SHA256}
+	if stored.ReviewOverride && needsIdentityReview {
+		acceptDetail["reason"] = "human_identity_override"
+	}
 	_ = s.Jobs.FinishAttempt(ctx, attempt, "accepted", 0, fmt.Sprintf("sha256=%s", result.SHA256))
 	if err := s.Jobs.Transition(ctx, row.ID, job.StateValidating, job.StateReady,
-		map[string]any{"candidate_id": stored.ID, "sha256": result.SHA256},
-		job.WithCandidate(stored.ID), job.WithArtifact(result.SHA256)); err != nil {
+		acceptDetail, job.WithCandidate(stored.ID), job.WithArtifact(result.SHA256)); err != nil {
 		return false, false, err
 	}
 	return true, false, nil

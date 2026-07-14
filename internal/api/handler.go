@@ -69,6 +69,9 @@ func RouterWithShutdown(system *bootstrap.System, shutdown context.CancelFunc) i
 		"actions.list": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return listActions(ctx, raw, system)
 		},
+		"actions.resolve": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return resolveAction(ctx, raw, system)
+		},
 		"artifacts.get": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return getArtifact(ctx, raw, system)
 		},
@@ -239,6 +242,24 @@ func retryJob(ctx context.Context, raw json.RawMessage, system *bootstrap.System
 	return marshal(map[string]any{"job_id": params.JobID, "state": job.StateResolving})
 }
 
+func resolveAction(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
+	var params struct {
+		ActionID int64  `json:"action_id"`
+		Verdict  string `json:"verdict"`
+	}
+	if err := ipc.DecodeParams(raw, &params); err != nil || params.ActionID <= 0 || (params.Verdict != "accept" && params.Verdict != "reject") {
+		if err == nil {
+			err = errors.New("action_id and verdict (accept or reject) are required")
+		}
+		return badParams(err)
+	}
+	jobID, state, err := system.Jobs.ResolveReview(ctx, params.ActionID, params.Verdict)
+	if err != nil {
+		return failure(err)
+	}
+	return marshal(map[string]any{"job_id": jobID, "state": state})
+}
+
 func listActions(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
 	var params struct {
 		OpenOnly *bool `json:"open_only,omitempty"`
@@ -381,11 +402,14 @@ func badParams(err error) ([]byte, *ipc.RPCError) {
 }
 
 func failure(err error) ([]byte, *ipc.RPCError) {
+	var actionKind *job.ErrHumanActionKind
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		return nil, &ipc.RPCError{Code: "not_found", Message: "record not found"}
 	case errors.Is(err, job.ErrConflict):
 		return nil, &ipc.RPCError{Code: "conflict", Message: safeMessage(err, "state conflict")}
+	case errors.As(err, &actionKind):
+		return nil, &ipc.RPCError{Code: "invalid_argument", Message: safeMessage(err, "unsupported human action")}
 	default:
 		return nil, &ipc.RPCError{Code: "internal", Message: "operation failed"}
 	}

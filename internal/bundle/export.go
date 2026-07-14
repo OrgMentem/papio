@@ -60,7 +60,7 @@ func (e *Exporter) Export(ctx context.Context, jobID, destination string) (strin
 	if candidate == nil {
 		return "", nil, fmt.Errorf("artifact %s has no accepted candidate provenance", art.SHA256)
 	}
-	if art.IdentityResult != "pass" {
+	if art.IdentityResult != "pass" && art.IdentityResult != "user_confirmed" {
 		return "", nil, fmt.Errorf("artifact identity is %q, not exportable", art.IdentityResult)
 	}
 
@@ -91,7 +91,7 @@ func (e *Exporter) Export(ctx context.Context, jobID, destination string) (strin
 			SHA256: art.SHA256, SizeBytes: art.SizeBytes, MIME: art.MIME, PageCount: art.PageCount,
 			TextChars: art.TextChars, OCRUsed: art.OCRUsed, Path: filepath.ToSlash(filepath.Join("artifacts", art.SHA256+".pdf")),
 		},
-		Validation:   protocol.BundleValidation{Structural: "pass", Identity: "pass"},
+		Validation:   protocol.BundleValidation{Structural: "pass", Identity: art.IdentityResult},
 		ZotioItemKey: row.ZotioItemKey,
 	}
 	b.ProvenanceDigest, err = digest(b)

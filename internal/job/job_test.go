@@ -6,6 +6,7 @@ package job
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"testing"
 	"time"
@@ -387,5 +388,127 @@ func TestAwaitingHumanResumeEdgesForBrowserBridge(t *testing.T) {
 	row, _ := js.Get(ctx, id)
 	if row.State != StateUnavailable || row.TerminalReason != "browser_rejected" {
 		t.Fatalf("row = %+v", row)
+	}
+}
+
+func parkIdentityReview(t *testing.T, js *Store, requestID string) (string, int64, int64) {
+	t.Helper()
+	ctx := context.Background()
+	id, err := js.CreateRequest(ctx, requestID, testWork(), "", "", testPolicy(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := js.InsertCandidates(ctx, id, []Candidate{{
+		JobID: id, Source: "fixture", URLRedacted: "https://example.test/paper.pdf", URLKey: requestID,
+		Version: "published", AccessBasis: "open_access", ReuseLicense: "unknown", Rank: 0,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	candidate, err := js.NextPendingCandidate(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, edge := range [][2]string{
+		{StateQueued, StateResolving},
+		{StateResolving, StateFetching},
+		{StateFetching, StateValidating},
+		{StateValidating, StateNeedsReview},
+	} {
+		if err := js.Transition(ctx, id, edge[0], edge[1], nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	attempt, err := js.StartAttempt(ctx, id, candidate.ID, "validate", candidate.Source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := js.FinishAttempt(ctx, attempt, "needs_review", 0, "semantic_or_identity_review"); err != nil {
+		t.Fatal(err)
+	}
+	if err := js.MarkCandidate(ctx, candidate.ID, "skipped"); err != nil {
+		t.Fatal(err)
+	}
+	actionID, err := js.OpenHumanAction(ctx, id, "verify_identity", "local quarantine file: /tmp/paper.pdf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return id, candidate.ID, actionID
+}
+
+func TestResolveHumanActionRequiresOpenAction(t *testing.T) {
+	js := testStore(t)
+	ctx := context.Background()
+	if err := js.ResolveHumanAction(ctx, 999, "resolved"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("missing action error = %v, want sql.ErrNoRows", err)
+	}
+	if _, _, err := js.ResolveReview(ctx, 999, "accept"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("missing review action error = %v, want sql.ErrNoRows", err)
+	}
+	id, _, actionID := parkIdentityReview(t, js, "wr_review_closed")
+	if err := js.ResolveHumanAction(ctx, actionID, "resolved"); err != nil {
+		t.Fatal(err)
+	}
+	if err := js.ResolveHumanAction(ctx, actionID, "resolved"); !errors.Is(err, ErrConflict) {
+		t.Fatalf("resolved action error = %v, want ErrConflict", err)
+	}
+	if _, _, err := js.ResolveReview(ctx, actionID, "accept"); !errors.Is(err, ErrConflict) {
+		t.Fatalf("non-open review action error = %v, want ErrConflict", err)
+	}
+	row, _ := js.Get(ctx, id)
+	if row.State != StateNeedsReview {
+		t.Fatalf("generic action resolution changed job state to %s", row.State)
+	}
+}
+
+func TestResolveReviewRejectCancelsJobAndResolvesAction(t *testing.T) {
+	js := testStore(t)
+	ctx := context.Background()
+	id, _, actionID := parkIdentityReview(t, js, "wr_review_reject")
+	jobID, state, err := js.ResolveReview(ctx, actionID, "reject")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jobID != id || state != StateCancelled {
+		t.Fatalf("resolution = %q, %q", jobID, state)
+	}
+	row, _ := js.Get(ctx, id)
+	if row.State != StateCancelled || row.TerminalReason != "review_rejected" {
+		t.Fatalf("rejected row = %+v", row)
+	}
+	actions, _ := js.ListHumanActions(ctx, false)
+	if len(actions) != 1 || actions[0].Status != "resolved" {
+		t.Fatalf("actions = %+v", actions)
+	}
+}
+
+func TestResolveReviewAcceptResumesCandidateAndClearsTerminalFields(t *testing.T) {
+	js := testStore(t)
+	ctx := context.Background()
+	id, candidateID, actionID := parkIdentityReview(t, js, "wr_review_accept")
+	if _, err := js.S.DB().ExecContext(ctx,
+		`UPDATE jobs SET terminal_reason = 'stale', retry_at = '2099-01-01T00:00:00Z',
+		        selected_candidate_id = ?, artifact_sha256 = 'stale' WHERE id = ?`, candidateID, id); err != nil {
+		t.Fatal(err)
+	}
+	_, state, err := js.ResolveReview(ctx, actionID, "accept")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state != StateFetching {
+		t.Fatalf("accept state = %s, want fetching", state)
+	}
+	row, _ := js.Get(ctx, id)
+	if row.TerminalReason != "" || row.RetryAt != "" || row.SelectedCandidateID != 0 || row.ArtifactSHA256 != "" {
+		t.Fatalf("accept left terminal fields behind: %+v", row)
+	}
+	candidate, err := js.GetCandidate(ctx, candidateID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if candidate.Status != "pending" || !candidate.ReviewOverride {
+		t.Fatalf("accepted candidate = %+v", candidate)
+	}
+	if claimed, err := js.ClaimNext(ctx, "review-worker", time.Minute); err != nil || claimed == nil || claimed.ID != id {
+		t.Fatalf("accepted review was not immediately claimable: %+v, %v", claimed, err)
 	}
 }
