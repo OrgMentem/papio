@@ -83,7 +83,7 @@ func (s *Service) AdoptDownload(ctx context.Context, jobID, path string) error {
 		return err
 	}
 
-	// Synthetic provenance: a browser-adopted subscription download of unknown
+	// Synthetic provenance: a browser-adopted institutional download of unknown
 	// reuse license. A per-adoption url_key keeps the candidate row unambiguous.
 	version := resolver.VersionPublished
 	if v := row.Policy.DesiredVersion; v != "" && v != "any" {
@@ -92,7 +92,7 @@ func (s *Service) AdoptDownload(ctx context.Context, jobID, path string) error {
 	key := "browser-adopt:" + job.NewID("dl")
 	if _, err := s.Jobs.InsertCandidates(ctx, jobID, []job.Candidate{{
 		JobID: jobID, Source: "browser", URLRedacted: "browser://adopted-download",
-		URLKey: key, Version: version, AccessBasis: "subscription", ReuseLicense: "unknown",
+		URLKey: key, Version: version, AccessBasis: resolver.AccessInstitutional, ReuseLicense: "unknown",
 		ExpectedMIME: "application/pdf", Direct: true, IdentityConfidence: 0.5, Rank: 0,
 	}}); err != nil {
 		_ = os.Remove(temp)
