@@ -312,6 +312,9 @@ func normalizeCreateInput(input CreateInput) (CreateInput, error) {
 	if input.Label == "" {
 		input.Label = input.Query
 	}
+	if input.Collection == "" {
+		input.Collection = input.Query
+	}
 	if input.CadenceHours <= 0 {
 		return CreateInput{}, errors.New("watch cadence_hours must be positive")
 	}

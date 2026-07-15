@@ -265,3 +265,49 @@ func autoImportErrorEvent(class, hint string) map[string]any {
 		},
 	}
 }
+
+func collectionFilingEvent(status, class string) map[string]any {
+	detail := map[string]any{"status": status, "collection": "Reading"}
+	if class != "" {
+		detail["error_class"] = class
+	}
+	return map[string]any{"kind": "zotio.collection_filing", "detail": detail}
+}
+
+func TestBuildReportSurfacesCollectionFilingOutcome(t *testing.T) {
+	manifest := &Manifest{
+		SchemaVersion: SchemaVersion, ID: "batch-deadbeef", CreatedAt: "2026-07-15T12:00:00Z", Collection: "Reading",
+		Works: []ManifestWork{
+			manifestWork("wr-filed", "job-filed", "submitted", "Filed paper"),
+			manifestWork("wr-unfiled", "job-unfiled", "submitted", "Unfiled paper"),
+		},
+	}
+	jobs := fakeJobs{
+		rows: map[string]*job.Row{
+			"job-filed":   reportRow("job-filed", job.StateReady, ""),
+			"job-unfiled": reportRow("job-unfiled", job.StateReady, ""),
+		},
+		events: map[string][]map[string]any{
+			"job-filed":   {autoImportEvent("PA1", "AT1"), collectionFilingEvent("applied", "")},
+			"job-unfiled": {autoImportEvent("PB2", "AT2"), collectionFilingEvent("error", "zotero_field_validation")},
+		},
+	}
+	report, err := BuildReport(context.Background(), manifest, jobs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	filed, unfiled := report.Works[0], report.Works[1]
+	if filed.Outcome != "imported" || filed.FilingStatus != "filed" || filed.FilingError != "" {
+		t.Fatalf("filed work = %+v", filed)
+	}
+	if unfiled.Outcome != "imported" || unfiled.FilingStatus != "file_failed" || unfiled.FilingError != "zotero_field_validation" {
+		t.Fatalf("unfiled work = %+v", unfiled)
+	}
+	rendered := Markdown(report)
+	if !strings.Contains(rendered, "collection filing failed (zotero_field_validation)") {
+		t.Fatalf("markdown missing filing failure note:\n%s", rendered)
+	}
+	if strings.Count(rendered, "collection filing failed") != 1 {
+		t.Fatalf("filed work must not carry a failure note:\n%s", rendered)
+	}
+}

@@ -482,6 +482,10 @@ func TestPlanAndApplyAutoEnrichesAppliedParentOnce(t *testing.T) {
 	if detail["status"] != "applied" || detail["summary"] == "" {
 		t.Fatalf("enrich event = %#v", detail)
 	}
+	filing := zotioEventDetail(t, service, jobID, "zotio.collection_filing")
+	if filing["status"] != "applied" || filing["collection"] != "Reading" {
+		t.Fatalf("collection filing event = %#v", filing)
+	}
 
 	if _, _, _, err := service.PlanAndApply(context.Background(), jobID); err != nil {
 		t.Fatal(err)

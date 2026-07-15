@@ -301,22 +301,22 @@ func (s *Service) fileCollection(ctx context.Context, plan *Plan, result *ApplyR
 	if plan == nil || result == nil || strings.TrimSpace(plan.Collection) == "" || result.ParentKey == "" {
 		return
 	}
+	detail := map[string]any{"collection": plan.Collection}
 	if _, err := s.CLI.RunJSON(ctx, "--agent", "--yes", "items", "add-to-collection", result.ParentKey, "--collection-name", plan.Collection); err != nil {
 		info := ErrorInfoFrom(err)
-		detail := map[string]any{
-			"collection":  plan.Collection,
-			"status":      "error",
-			"error_type":  fmt.Sprintf("%T", err),
-			"error_class": info.Class,
-		}
+		detail["status"] = "error"
+		detail["error_type"] = fmt.Sprintf("%T", err)
+		detail["error_class"] = info.Class
 		if info.Hint != "" {
 			detail["error_hint"] = info.Hint
 		}
 		if info.HTTPStatus != 0 {
 			detail["error_http_status"] = info.HTTPStatus
 		}
-		_ = s.Bundle.Jobs.RecordEvent(context.WithoutCancel(ctx), plan.JobID, "zotio.collection_filing", detail)
+	} else {
+		detail["status"] = "applied"
 	}
+	_ = s.Bundle.Jobs.RecordEvent(context.WithoutCancel(ctx), plan.JobID, "zotio.collection_filing", detail)
 }
 
 // enrichAutoImportedParent fills only missing DOI and abstract metadata after a
@@ -614,7 +614,7 @@ func (s *Service) recordFailedApplyAndInvalidatePlan(ctx context.Context, key st
 		return WithErrorInfo(fmt.Errorf("recording failed Zotio apply: %w", applyErr), zotio)
 	}
 	if err := s.invalidatePlan(ctx, plan); err != nil {
-		return WithErrorInfo(fmt.Errorf("%w (invalidating cached Zotio plan: %v)", applyErr, err), zotio)
+		return WithErrorInfo(fmt.Errorf("%w (invalidating cached Zotio plan: %w)", applyErr, err), zotio)
 	}
 	return WithErrorInfo(applyErr, zotio)
 }
@@ -630,7 +630,7 @@ func (s *Service) invalidatePlan(ctx context.Context, plan *Plan) error {
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	if _, err := tx.ExecContext(ctx,
 		`DELETE FROM exports WHERE kind = 'zotio_plan' AND path = ?`, planPath); err != nil {
 		return err

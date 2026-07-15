@@ -79,6 +79,15 @@ func printBatchReport(opt *options, report *batch.Report) error {
 			}
 			detail += "collection=" + item.Collection
 		}
+		if item.FilingStatus == "file_failed" {
+			if detail != "" {
+				detail += " "
+			}
+			detail += "collection_filing_failed"
+			if item.FilingError != "" {
+				detail += "=" + item.FilingError
+			}
+		}
 		if _, err := fmt.Fprintf(opt.out, "%s\t%s\t%s\t%s\n", item.Outcome, item.JobID, reportWorkDescription(item.Work), detail); err != nil {
 			return err
 		}

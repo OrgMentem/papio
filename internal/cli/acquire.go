@@ -144,7 +144,7 @@ func newAcquireCommand(opt *options) *cobra.Command {
 	flags.IntVar(&queueLimit, "limit", 25, "maximum Zotio queue rows (1-500)")
 	flags.StringVar(&batchPath, "batch", "", "submit JSONL works from a file or - for standard input")
 	flags.BoolVar(&includeOwned, "include-owned", false, "with --batch, submit works already carrying a PDF in Zotio")
-	flags.StringVar(&label, "label", "", "optional batch query context")
+	flags.StringVar(&label, "label", "", "batch query context; also the default target collection when --collection is unset")
 	flags.BoolVar(&autoImport, "auto-import", false, "plan and apply Zotio import automatically when ready")
 	return command
 }
@@ -330,7 +330,7 @@ func (c socketBatchCaller) Call(ctx context.Context, method string, params, resu
 }
 
 func acquireBatch(ctx context.Context, cmd *cobra.Command, opt *options, path string, autoImport *bool, collection, resolver, label string, includeOwned bool) error {
-	var reader io.Reader = cmd.InOrStdin()
+	reader := cmd.InOrStdin()
 	var file *os.File
 	if path != "-" {
 		var err error

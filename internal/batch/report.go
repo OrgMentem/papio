@@ -75,6 +75,8 @@ type ReportWork struct {
 	ParentKey     string               `json:"parent_key,omitempty"`
 	AttachmentKey string               `json:"attachment_key,omitempty"`
 	Collection    string               `json:"collection,omitempty"`
+	FilingStatus  string               `json:"filing_status,omitempty"`
+	FilingError   string               `json:"filing_error,omitempty"`
 }
 
 // Jobs is the narrow durable state dependency needed to build a report.
@@ -317,6 +319,9 @@ func buildWorkReport(ctx context.Context, manifestWork ManifestWork, jobs Jobs, 
 	if err != nil {
 		return item, err
 	}
+	if filing := latestCollectionFiling(events); filing.Status != "" {
+		item.FilingStatus, item.FilingError = filing.Status, filing.Error
+	}
 	autoImport := latestAutoImport(events)
 	switch row.State {
 	case job.StateReady:
@@ -381,6 +386,35 @@ func latestAutoImport(events []map[string]any) autoImportDetail {
 	}
 	if latest.Status == "error" && latest.ErrorClass == "" {
 		latest.ErrorClass = zotio.ErrorClassUnknown
+	}
+	return latest
+}
+
+type collectionFilingDetail struct {
+	Status string
+	Error  string
+}
+
+// latestCollectionFiling returns the most recent collection-filing outcome.
+// Filing is best-effort and runs after a durable import, so a failure is
+// reported ("file_failed") without altering the work's import outcome.
+func latestCollectionFiling(events []map[string]any) collectionFilingDetail {
+	var latest collectionFilingDetail
+	for _, event := range events {
+		if stringField(event, "kind") != "zotio.collection_filing" {
+			continue
+		}
+		detail, _ := event["detail"].(map[string]any)
+		switch stringField(detail, "status") {
+		case "applied":
+			latest = collectionFilingDetail{Status: "filed"}
+		case "error":
+			class := stringField(detail, "error_class")
+			if !zotio.IsErrorClass(class) {
+				class = zotio.ErrorClassUnknown
+			}
+			latest = collectionFilingDetail{Status: "file_failed", Error: class}
+		}
 	}
 	return latest
 }
@@ -470,7 +504,11 @@ func summaryLine(outcomes map[string]int) string {
 }
 
 func markdownHeading(outcome string) string {
-	return strings.ReplaceAll(strings.Title(strings.ReplaceAll(outcome, "_", " ")), " ", " ")
+	words := strings.Fields(strings.ReplaceAll(outcome, "_", " "))
+	for i, w := range words {
+		words[i] = strings.ToUpper(w[:1]) + w[1:]
+	}
+	return strings.Join(words, " ")
 }
 
 func markdownDetail(item ReportWork) string {
@@ -495,6 +533,13 @@ func markdownDetail(item ReportWork) string {
 	}
 	if item.Collection != "" {
 		parts = append(parts, "collection `"+item.Collection+"`")
+	}
+	if item.FilingStatus == "file_failed" {
+		note := "collection filing failed"
+		if item.FilingError != "" {
+			note += " (" + item.FilingError + ")"
+		}
+		parts = append(parts, note)
 	}
 	return strings.Join(parts, "; ")
 }

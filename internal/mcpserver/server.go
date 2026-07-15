@@ -93,9 +93,9 @@ type BatchReportInput struct {
 type AcquireBatchInput struct {
 	Works        []map[string]any `json:"works" jsonschema:"one to fifty bare work objects or discovered-work envelopes"`
 	AutoImport   *bool            `json:"auto_import,omitempty" jsonschema:"automatically import ready jobs; defaults to true"`
-	Collection   string           `json:"collection,omitempty" jsonschema:"optional Zotero collection key for every submitted work"`
+	Collection   string           `json:"collection,omitempty" jsonschema:"target Zotero collection for every submitted work; defaults to the label (search query) so imported papers are filed under the search that produced them"`
 	Resolver     string           `json:"resolver,omitempty" jsonschema:"named institutional OpenURL resolver profile for every submitted work"`
-	Label        string           `json:"label,omitempty" jsonschema:"optional batch query context"`
+	Label        string           `json:"label,omitempty" jsonschema:"batch query context; also the default target collection when collection is unset"`
 	IncludeOwned bool             `json:"include_owned,omitempty" jsonschema:"submit works already carrying a PDF in Zotio; defaults to false"`
 }
 

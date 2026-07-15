@@ -49,6 +49,14 @@ func testWatchInput(query string) CreateInput {
 	}
 }
 
+func TestCreateDefaultsCollectionToQuery(t *testing.T) {
+	watches := testStore(t)
+	created := createWatch(t, watches, CreateInput{Query: "protein folding", CadenceHours: 24, PerRunCap: 2})
+	if created.Collection != "protein folding" {
+		t.Fatalf("collection = %q, want query default", created.Collection)
+	}
+}
+
 func TestStoreCRUD(t *testing.T) {
 	ctx := context.Background()
 	watches := testStore(t)
