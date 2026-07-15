@@ -25,6 +25,7 @@ import {
   type TabInfo,
 } from "../src/background";
 import { fixtureExists, loadFixture, parseHTML } from "./harness";
+import { Window } from "happy-dom";
 
 // A representative ProQuest-shaped spec. Rules are ordered; first match wins.
 const SPEC: AdapterSpec = {
@@ -61,6 +62,39 @@ test("every registered adapter is fixture-backed, versioned, and host-scoped", (
     if (spec.download) expect(spec.download.requireKind).toBe("article");
   }
   expect(adapters.map((a) => a.id)).toContain("proquest");
+});
+
+test("interpret waits for late-upgraded custom elements when settleTimeoutMs is set", async () => {
+  // JSTOR's tracked tab fires `complete` post-SSO before its `mfe-*` custom
+  // elements upgrade. The live (doc === null) path must observe the DOM until
+  // the download button appears, not classify once and give up.
+  const jstor = adapters.find((a) => a.id === "jstor");
+  expect(jstor?.settleTimeoutMs).toBeGreaterThan(0);
+
+  const win = new Window({ url: "https://www.jstor.org/stable/259290" });
+  win.document.write("<html><body><main>Loading full text</main></body></html>");
+  const prev = {
+    document: globalThis.document,
+    MutationObserver: globalThis.MutationObserver,
+    setTimeout: globalThis.setTimeout,
+    clearTimeout: globalThis.clearTimeout,
+  };
+  Object.assign(globalThis, {
+    document: win.document,
+    MutationObserver: win.MutationObserver,
+    setTimeout: win.setTimeout.bind(win),
+    clearTimeout: win.clearTimeout.bind(win),
+  });
+  try {
+    const verdict = interpret(null, jstor as AdapterSpec, ctx());
+    win.document.body.insertAdjacentHTML(
+      "beforeend",
+      "<mfe-download-pharos-button data-qa=\"download-pdf\" data-doi=\"10.2307/259290\"></mfe-download-pharos-button>",
+    );
+    expect((await verdict).kind).toBe("article");
+  } finally {
+    Object.assign(globalThis, prev);
+  }
 });
 
 test("a rule with no conditions never matches (no blanket fallback)", () => {
@@ -426,6 +460,32 @@ async function landOnProvider(
   await h.tabs.onUpdated.emit(tabID, { url, status: "complete" }, { id: tabID, url });
   return tabID;
 }
+
+test("auth return classifies the provider landing even without a complete event", async () => {
+  // JSTOR-class providers end SSO with a soft-nav landing that carries no
+  // `status: "complete"`, so the complete-gated classify never fires. The
+  // auth-return transition must classify the page itself.
+  const h = makeMapHarness([SPEC]);
+  h.scripting.verdict = { kind: "article", adapter_id: "proquest", adapter_version: "0.3.1", evidence: [] };
+  await h.bridge.start();
+  await h.port.inbound(offer("job_authreturn_0001"));
+  const tabID = h.backend.store.activeJobs.find((j) => j.job_id === "job_authreturn_0001")?.tab_id ?? -1;
+  expect(tabID).toBeGreaterThanOrEqual(0);
+
+  const idpURL = "https://idp.example.edu/sso?SAMLRequest=x";
+  h.tabs.live.set(tabID, { id: tabID, url: idpURL });
+  await h.tabs.onUpdated.emit(tabID, { url: idpURL }, { id: tabID, url: idpURL });
+  expect(h.backend.store.activeJobs[0]?.status).toBe("auth_pending");
+
+  const provURL = `https://${PROVIDER}/pqdweb?doc=1`;
+  h.tabs.live.set(tabID, { id: tabID, url: provURL });
+  // Note: no `status: "complete"` — this is the post-SSO soft landing.
+  await h.tabs.onUpdated.emit(tabID, { url: provURL }, { id: tabID, url: provURL });
+
+  expect(h.frames().some((f) => f.type === "auth_returned")).toBe(true);
+  expect(h.scripting.interpretTabs).toContain(tabID);
+  expect(h.downloads.started.length).toBe(1);
+});
 
 test("hello reports adapter_versions from the registered specs", async () => {
   const jstor: AdapterSpec = { id: "jstor", version: "1.2.0", hosts: ["www.jstor.org"], classify: [] };

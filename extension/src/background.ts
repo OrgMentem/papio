@@ -1021,6 +1021,13 @@ export class Bridge {
         await this.releaseQueuedHandoffs();
         await this.reloadAuthenticationHandoffs();
       }
+      // The provider landing that ends authentication frequently arrives
+      // without a `status: "complete"` (SPA soft-nav, history push, or a
+      // resolver/interstitial hop), so the complete-gated classify below never
+      // runs. Classify now; interpret's settle waits for the provider's
+      // late-upgrading controls, and the download latch keeps this idempotent
+      // with any subsequent complete.
+      await this.maybeClassify(job.job_id, host);
     }
     // Once the provider page has finished loading on the tracked tab (past any
     // human auth), run the declarative adapter — permission-gated, tracked-tab

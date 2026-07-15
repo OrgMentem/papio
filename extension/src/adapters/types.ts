@@ -260,10 +260,15 @@ export const adapters: AdapterSpec[] = [
   {
     // Verified live 2026-07-14 against Example University-authenticated and isolated
     // logged-out JSTOR pages (fixtures/jstor/*.html). Terms is first because
-    // JSTOR overlays it on the still article-shaped page.
+    // JSTOR overlays it on the still article-shaped page. settleTimeoutMs waits
+    // for JSTOR's `mfe-*` custom elements to upgrade: the tracked tab's post-SSO
+    // landing fires `complete` before they render, so a single-shot classify
+    // would see no download button, return unknown, and never retry (SPA: no
+    // second complete).
     id: "jstor",
     version: "0.1.0",
     hosts: ["jstor.org"],
+    settleTimeoutMs: 5000,
     classify: [
       {
         kind: "terms",
