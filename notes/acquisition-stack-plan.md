@@ -788,3 +788,35 @@ Reframe (user direction): getting a PDF the human already clicked into Zotero wa
 ## Next
 
 Build Elsevier + ACM adapters from the observe-flywheel captures (needs one user SSO pass — no captures exist yet); complete the JSTOR/EBSCO/Springer supervised live acceptances and clear the parked handoff queue in the same pass; re-pin the packed extension ID after; signing/notarization and Web Store submission when credentials exist; instsci fork archival on explicit approval.
+
+## Resolver direct-linking + live SSO pass (2026-07-15/16)
+
+- Shipped in `c0cf77f` (named resolver profiles), `3566b26` (`actions open` → Chrome + per-job resolver policy), `6a421ce` (warm-session queue release), `4ee136a` (resolver-menu bypass). Config now carries `[browser.resolvers]` example/institute; Example University base switched to the Alma direct-link endpoint (`example.alma.exlibrisgroup.com/view/uresolver/61EXL_INST/openurl?svc_dat=viewit`), verified `302` straight to the provider for an entitled DOI. Example Institute direct-linking is disabled institution-side; the extension follows the institution-ranked first `resolveService` link on tracked Alma/Primo tabs instead (live: Example Institute OneSearch → JSTOR for McKnight 259290, no menu click).
+- **Live SSO pass (user logged in with Example University):** daemon re-offered 9 parked handoffs; warm-session choreography authenticated cleanly (`auth_pending → auth_returned` with zero re-login prompts) and the direct-link 302s landed tracked tabs on real providers — McKnight→JSTOR (logged in through Example University, terms modal + 7 download controls), Dwivedi→ScienceDirect, Ma→ACM full-text, Labkoff→OUP JAMIA (`login=true`), Mennella→Cell. **Routing and authentication are proven end-to-end.**
+- **Two `import=error` jobs recovered** (`10.1038/s41746-020-0221-y`→6BR6EG3T, `10.1145/3561048`→T436U8V8) via re-plan/purge/apply — confirms the known transient auto-import edge; PlanRefresh clears the stale derivation and re-apply succeeds.
+- **Capture/download did NOT complete post-auth — zero downloads, zero fixtures, zero import events across all 9 authenticated tabs, and zero on a manual provider-tab reload.** Root causes (code-grounded; worker console not captured this pass — logging was off):
+  1. JSTOR (has adapter): tab authenticated, `download_initiated` latches true *before* the click+terms-acceptance followup succeeds (`applyVerdict` case `article`, background.ts ~1219-1226). Observed: terms modal left `[open]`, no `download_started`/`terms_acceptance_required` event. [INFERENCE] the followup terms-accept did not fire and the pre-set latch blocks any retry, stranding the job in silent assisted-fallback. Needs the supervised JSTOR acceptance with logging + latch-on-success (not latch-on-attempt) semantics — carefully, to preserve the at-most-one-download invariant.
+  2. ScienceDirect/ACM (no adapter, hosts granted + in `verifiedProviderHosts`): should hit `recordUnknown`→`observeUnknown` and write a fixture. Zero fixtures written; observe capture is not producing under live conditions — needs console ground-truth (rate-limit vs scripting-access vs classification timing).
+  3. OUP (`academic.oup.com`) and Cell (`www.cell.com`) are absent from `verifiedProviderHosts` (openurl.go) and from granted host permissions, so those tabs are never `onProvider` and never classify — trivial coverage gap, but adds should be paired with adapter/observe proof, not added blind.
+- Net: the resolver/auth half of "browser-mediated acquisition" is live-proven; the adapter/observe *completion* half remains the unbuilt frontier (item 2 below). This pass is the supervised-acceptance prerequisite it called for — captures now depend on fixing the post-auth completion path, not on generating a session.
+
+### Supervised JSTOR acceptance attempt (2026-07-16)
+
+Shipped (post-auth classification hardening, all unit-tested, extension suite 116 pass):
+- `fe0a643`: JSTOR `settleTimeoutMs` (interpret was single-shot before `mfe-*` upgrade) + classify on the `auth_returned` transition (the post-SSO landing carries no `status: "complete"`, which the existing auth test confirms, so the complete-gated classify never ran).
+- `7676b37`: bounded reclassification retry (8×2.5s) when a page classifies `unknown` on an adapter'd host; re-drives the idempotent classify path, download latch preserves at-most-one-download.
+
+**Live result: still blocked.** Across **12 supervised JSTOR jobs**, none progressed past `auth_returned` — zero download/adopt/import events for 259290, ever. The three fixes above did not change this, which localizes the fault **upstream of classification**: `maybeClassify` is not producing a decisive verdict on the tracked tab (either not invoked post-auth, `interpret` throwing before any verdict, or the tracked `tab_id` not matching the JSTOR tab). This supersedes the earlier latch-on-attempt hypothesis.
+
+**Diagnosis is blocked by MV3 service-worker observability**, not by lack of fixes:
+- SW `console` output is NOT captured to `chrome_debug.log` on this Chrome build (2.7 MB log, zero `background.js` lines).
+- CDP (`--remote-debugging-port`) is refused on the default profile (Chrome 136+), even with `--user-data-dir` set explicitly to the default path; a custom profile loses the extension + warm session.
+- `Local Extension Settings` LevelDB is stale (no tonight writes), so `activeJobs`/`tab_id`/`download_initiated` can't be read from disk.
+- Secondary env friction: the MV3 worker goes dormant with no keepalive tab, so cold-start offers aren't delivered until a fresh Chrome launch with pending jobs.
+
+### Next (updated 2026-07-16)
+
+1. **Localize the upstream JSTOR fault with SW observability** — read the service-worker DevTools console (user-accessible via `chrome://extensions` → Inspect service worker) during one job, OR add a dev-gated diagnostic emitted through the native-message pipeline (the one channel that reaches the daemon event log). Determine whether `onTabUpdated` tracks the JSTOR tab, whether `maybeClassify` runs, and whether `interpret` throws.
+2. Diagnose why `observeUnknown` writes no fixture on granted verified hosts (ScienceDirect/ACM); then build Elsevier + ACM adapters from the captures.
+3. Add `oup.com`/`cell.com` (and any others surfaced) to `verifiedProviderHosts` alongside their adapter/observe proof.
+4. Re-pin the packed extension ID after adapters land; signing/notarization + Web Store when credentials exist; instsci fork archival on approval.
