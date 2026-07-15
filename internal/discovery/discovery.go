@@ -66,12 +66,14 @@ func (params SearchParams) HasCitationSnowball() bool {
 // DiscoveredWork is the durable, acquisition-neutral description returned by
 // a discovery search. It intentionally contains no request credentials.
 type DiscoveredWork struct {
-	Work       work.Work `json:"work"`
-	OpenAlexID string    `json:"openalex_id"`
-	IsOA       bool      `json:"is_oa"`
-	OAURL      string    `json:"oa_url"`
-	CitedBy    int       `json:"cited_by"`
-	Abstract   string    `json:"abstract"`
+	Work         work.Work `json:"work"`
+	OpenAlexID   string    `json:"openalex_id"`
+	IsOA         bool      `json:"is_oa"`
+	OAURL        string    `json:"oa_url"`
+	CitedBy      int       `json:"cited_by"`
+	Abstract     string    `json:"abstract"`
+	Owned        bool      `json:"owned"`
+	OwnedItemKey string    `json:"owned_item_key,omitempty"`
 }
 
 // Client searches OpenAlex works.

@@ -8,9 +8,11 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"log"
 	"strings"
 	"time"
 
+	"papio/internal/batch"
 	"papio/internal/bootstrap"
 	"papio/internal/browser"
 	"papio/internal/config"
@@ -25,6 +27,11 @@ const Version = "0.1.0-dev"
 
 type SubmitResult struct {
 	JobID string `json:"job_id"`
+}
+
+// AcquireReportParams names one persisted batch manifest, or "latest".
+type AcquireReportParams struct {
+	BatchID string `json:"batch_id"`
 }
 
 type JobDetail struct {
@@ -54,6 +61,9 @@ func RouterWithShutdown(system *bootstrap.System, shutdown context.CancelFunc) i
 		"ping": ping,
 		"acquire.submit": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return submit(ctx, raw, system)
+		},
+		"acquire.report": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return acquireReport(ctx, raw, system)
 		},
 		"discovery.search": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return searchDiscovery(ctx, raw, system)
@@ -156,6 +166,34 @@ func submit(ctx context.Context, raw json.RawMessage, system *bootstrap.System) 
 		return nil, &ipc.RPCError{Code: "invalid_argument", Message: "invalid acquisition request"}
 	}
 	return marshal(SubmitResult{JobID: id})
+}
+
+// BatchReport joins a persisted CLI batch manifest to the daemon's durable
+// job/event state. It is shared by IPC and the in-process MCP surface.
+func BatchReport(ctx context.Context, system *bootstrap.System, batchID string) (*batch.Report, error) {
+	if system == nil || system.Jobs == nil {
+		return nil, errors.New("batch reports are not configured")
+	}
+	manifest, err := batch.Load(system.Config.DataDir, batchID)
+	if err != nil {
+		return nil, err
+	}
+	return batch.BuildReport(ctx, manifest, system.Jobs)
+}
+
+func acquireReport(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
+	var params AcquireReportParams
+	if err := ipc.DecodeParams(raw, &params); err != nil {
+		return badParams(err)
+	}
+	if strings.TrimSpace(params.BatchID) == "" {
+		return badParams(errors.New("batch_id is required"))
+	}
+	report, err := BatchReport(ctx, system, params.BatchID)
+	if err != nil {
+		return nil, &ipc.RPCError{Code: "not_found", Message: safeMessage(err, "batch report not found")}
+	}
+	return marshal(report)
 }
 
 func zotioPreflight(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
@@ -443,6 +481,13 @@ func searchDiscovery(ctx context.Context, raw json.RawMessage, system *bootstrap
 	works, err := system.Discovery.Search(ctx, params)
 	if err != nil {
 		return nil, &ipc.RPCError{Code: "precondition_failed", Message: safeMessage(err, "discovery search failed")}
+	}
+	var lookup discovery.OwnershipLookup
+	if system.Zotio != nil {
+		lookup = system.Zotio
+	}
+	if warning := discovery.ClassifyOwnership(ctx, works, lookup); warning != "" {
+		log.Printf("warning: %s", warning)
 	}
 	return marshal(works)
 }

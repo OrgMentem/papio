@@ -19,6 +19,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"papio/internal/api"
+	"papio/internal/batch"
 	"papio/internal/daemon"
 	"papio/internal/job"
 	"papio/internal/protocol"
@@ -28,7 +29,7 @@ import (
 
 func newAcquireCommand(opt *options) *cobra.Command {
 	var doi, pmid, arxivID, isbn, openalex string
-	var title, requestID, zotioKey, collection, desiredVersion, accessMode string
+	var title, requestID, zotioKey, collection, desiredVersion, accessMode, label string
 	var authors, allowSources, denySources []string
 	var year, queueLimit int
 	var maxCost float64
@@ -47,7 +48,10 @@ func newAcquireCommand(opt *options) *cobra.Command {
 				if err := validateBatchFlags(cmd, args, fromZotio, wait); err != nil {
 					return err
 				}
-				return acquireBatch(cmd.Context(), cmd, opt, batchPath, autoImportOverride, strings.TrimSpace(collection), includeOwned)
+				return acquireBatch(cmd.Context(), cmd, opt, batchPath, autoImportOverride, strings.TrimSpace(collection), strings.TrimSpace(label), includeOwned)
+			}
+			if cmd.Flags().Changed("label") {
+				return fmt.Errorf("--label is supported only with --batch")
 			}
 			if fromZotio {
 				if len(args) != 0 || doi != "" || pmid != "" || arxivID != "" || isbn != "" || openalex != "" ||
@@ -137,6 +141,7 @@ func newAcquireCommand(opt *options) *cobra.Command {
 	flags.IntVar(&queueLimit, "limit", 25, "maximum Zotio queue rows (1-500)")
 	flags.StringVar(&batchPath, "batch", "", "submit JSONL works from a file or - for standard input")
 	flags.BoolVar(&includeOwned, "include-owned", false, "with --batch, submit works already carrying a PDF in Zotio")
+	flags.StringVar(&label, "label", "", "optional batch query context")
 	flags.BoolVar(&autoImport, "auto-import", false, "plan and apply Zotio import automatically when ready")
 	return command
 }
@@ -238,11 +243,12 @@ type batchSubmission struct {
 }
 
 type batchSubmitResult struct {
-	Jobs      []batchSubmission `json:"jobs"`
-	Submitted int               `json:"submitted"`
-	Skipped   int               `json:"skipped"`
-	StalenessWarning string     `json:"staleness_warning,omitempty"`
-	Failed    int               `json:"failed"`
+	Jobs             []batchSubmission `json:"jobs"`
+	BatchID          string            `json:"batch_id"`
+	Submitted        int               `json:"submitted"`
+	Skipped          int               `json:"skipped"`
+	StalenessWarning string            `json:"staleness_warning,omitempty"`
+	Failed           int               `json:"failed"`
 }
 
 func boolOverride(cmd *cobra.Command, name string, value bool) *bool {
@@ -408,7 +414,7 @@ func submitAcquire(ctx context.Context, opt *options, request protocol.WorkReque
 	return opt.call(ctx, "acquire.submit", params, result)
 }
 
-func acquireBatch(ctx context.Context, cmd *cobra.Command, opt *options, path string, autoImport *bool, collection string, includeOwned bool) error {
+func acquireBatch(ctx context.Context, cmd *cobra.Command, opt *options, path string, autoImport *bool, collection, label string, includeOwned bool) error {
 	var reader io.Reader = cmd.InOrStdin()
 	var file *os.File
 	if path != "-" {
@@ -423,6 +429,14 @@ func acquireBatch(ctx context.Context, cmd *cobra.Command, opt *options, path st
 	requests, err := parseBatch(reader)
 	if err != nil {
 		return err
+	}
+	manifest := batch.NewManifest(requests, label, collection, time.Now())
+	for i := range requests {
+		requests[i].RequestID = manifest.Works[i].RequestID
+	}
+	manifestIndices := make(map[string]int, len(manifest.Works))
+	for i := range manifest.Works {
+		manifestIndices[manifest.Works[i].RequestID] = i
 	}
 	cfg, err := opt.loadConfig()
 	if err != nil {
@@ -448,6 +462,22 @@ func acquireBatch(ctx context.Context, cmd *cobra.Command, opt *options, path st
 	var ownership zotio.LookupWorksResult
 	if err := callSocket(ctx, socket, "zotio.lookup_works", lookupRequest, &ownership); err != nil {
 		return err
+	}
+	if len(ownership.Works) != len(requests) {
+		return fmt.Errorf("Zotio ownership lookup returned %d results for %d works", len(ownership.Works), len(requests))
+	}
+	for i, classification := range ownership.Works {
+		switch classification.Status {
+		case zotio.OwnershipNotOwned:
+		case zotio.OwnershipOwnedWithPDF:
+			if !includeOwned {
+				manifest.Works[i].Status = "skipped_owned"
+			}
+		case zotio.OwnershipOwnedMissingPDF:
+			manifest.Works[i].Status = "existing_item_attached"
+		default:
+			return fmt.Errorf("Zotio ownership result %d has unknown status %q", i+1, classification.Status)
+		}
 	}
 	requests, skipped, err := applyBatchOwnership(requests, ownership, collection, includeOwned)
 	if err != nil {
@@ -493,24 +523,40 @@ func acquireBatch(ctx context.Context, cmd *cobra.Command, opt *options, path st
 	group.Wait()
 
 	output := batchSubmitResult{
-		Jobs:            make([]batchSubmission, 0, len(results)),
-		Skipped:         skipped,
+		Jobs:             make([]batchSubmission, 0, len(results)),
+		Skipped:          skipped,
 		StalenessWarning: ownership.StalenessWarning,
+		BatchID:          manifest.ID,
 	}
 	var firstErr error
 	for index, result := range results {
+		manifestWorkIndex, ok := manifestIndices[requests[index].RequestID]
+		if !ok {
+			return fmt.Errorf("batch manifest is missing request %q", requests[index].RequestID)
+		}
+		manifestWork := &manifest.Works[manifestWorkIndex]
 		if result.JobID == "" {
 			output.Failed++
+			manifestWork.Status = "submission_failed"
+			manifestWork.Error = "submit"
 			if firstErr == nil {
-				firstErr = fmt.Errorf("submitting batch work %d: %w", index+1, errs[index])
+				if errs[index] == nil {
+					firstErr = fmt.Errorf("submitting batch work %d failed without a daemon error", index+1)
+				} else {
+					firstErr = fmt.Errorf("submitting batch work %d: %w", index+1, errs[index])
+				}
 			}
 			continue
 		}
+		manifestWork.JobID = result.JobID
 		output.Jobs = append(output.Jobs, result)
 		output.Submitted++
 		if firstErr == nil && errs[index] != nil {
 			firstErr = errs[index]
 		}
+	}
+	if err := batch.Write(cfg.DataDir, manifest); err != nil {
+		return err
 	}
 	if opt.jsonOutput {
 		if err := opt.printJSON(output); err != nil {
@@ -523,6 +569,9 @@ func acquireBatch(ctx context.Context, cmd *cobra.Command, opt *options, path st
 			}
 		}
 		if _, err := fmt.Fprintf(opt.out, "Submitted %d job(s); skipped %d already in library; %d failed\n", output.Submitted, output.Skipped, output.Failed); err != nil {
+			return err
+		}
+		if _, err := fmt.Fprintf(opt.out, "Batch %s\n", output.BatchID); err != nil {
 			return err
 		}
 	}

@@ -290,6 +290,7 @@ func (s *Service) Apply(ctx context.Context, planID, confirmation string) (*Appl
 		return nil, err
 	}
 	s.fileCollection(ctx, plan, result)
+	s.enrichAutoImportedParent(ctx, plan, result)
 	return result, nil
 }
 
@@ -307,6 +308,34 @@ func (s *Service) fileCollection(ctx context.Context, plan *Plan, result *ApplyR
 			"error_type": fmt.Sprintf("%T", err),
 		})
 	}
+}
+
+// enrichAutoImportedParent fills only missing DOI and abstract metadata after a
+// successful policy-driven auto-import. It deliberately does not request any
+// OA-PDF remediation or validation mode, and its failure cannot undo the import.
+func (s *Service) enrichAutoImportedParent(ctx context.Context, plan *Plan, result *ApplyResult) {
+	if !s.AutoEnrich || plan == nil || result == nil || result.Status != "applied" || result.ParentKey == "" {
+		return
+	}
+	row, err := s.Bundle.Jobs.Get(ctx, plan.JobID)
+	if err != nil || !row.Policy.AutoImport {
+		return
+	}
+	detail := map[string]any{
+		"parent_key": result.ParentKey,
+		"summary":    "filled missing DOI and abstract metadata",
+	}
+	if _, err := s.CLI.RunJSON(ctx,
+		"--agent", "--yes", "items", "enrich",
+		"--missing-doi", "--missing-abstract", "--keys", result.ParentKey,
+	); err != nil {
+		detail["status"] = "error"
+		detail["summary"] = "metadata enrichment failed"
+		detail["error_type"] = fmt.Sprintf("%T", err)
+	} else {
+		detail["status"] = "applied"
+	}
+	_ = s.Bundle.Jobs.RecordEvent(context.WithoutCancel(ctx), plan.JobID, "zotio.enrich", detail)
 }
 
 // PlanAndApply creates an immutable plan for one ready job and immediately

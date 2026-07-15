@@ -7,9 +7,12 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"papio/internal/api"
+	"papio/internal/batch"
 	"papio/internal/bootstrap"
 	"papio/internal/discovery"
 	"papio/internal/job"
@@ -72,6 +75,13 @@ type SearchInput struct {
 	Cites     string `json:"cites,omitempty" jsonschema:"DOI to find papers citing it (forward citations; OpenAlex cites: filter)"`
 	CitedBy   string `json:"cited_by,omitempty" jsonschema:"DOI to find papers it cites (backward references; OpenAlex cited_by: filter)"`
 	RelatedTo string `json:"related_to,omitempty" jsonschema:"DOI to find OpenAlex-related papers (related_to: filter)"`
+	NewOnly   bool   `json:"new_only,omitempty" jsonschema:"omit works already owned in the local Zotio library; filtering happens after the OpenAlex limit, so fewer results may be returned"`
+}
+
+// BatchReportInput selects a persisted batch and one agent-facing format.
+type BatchReportInput struct {
+	BatchID string `json:"batch_id" jsonschema:"batch ID returned by papio acquire --batch, or latest"`
+	Format  string `json:"format,omitempty" jsonschema:"json or markdown; defaults to json"`
 }
 
 // New builds one MCP server. Zotero writes are deliberately unreachable from
@@ -106,7 +116,7 @@ func New(system *bootstrap.System) *mcp.Server {
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "papio_search", Title: "Search scholarly works",
-		Description: "Run bounded, read-only OpenAlex searches, including citation snowballs. This produces work metadata and never creates an acquisition job.",
+		Description: "Run bounded, read-only OpenAlex searches, including citation snowballs. Results include owned and owned_item_key from the local Zotio library when available; new_only filters owned results after the OpenAlex limit, so it may return fewer results. This never creates an acquisition job.",
 		Annotations: readAnnotations(),
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, input SearchInput) (*mcp.CallToolResult, any, error) {
 		if system == nil || system.Discovery == nil {
@@ -119,11 +129,51 @@ func New(system *bootstrap.System) *mcp.Server {
 		if err != nil {
 			return nil, nil, err
 		}
+		var lookup discovery.OwnershipLookup
+		if system.Zotio != nil {
+			lookup = system.Zotio
+		}
+		if warning := discovery.ClassifyOwnership(ctx, works, lookup); warning != "" {
+			log.Printf("warning: %s", warning)
+		}
+		if input.NewOnly {
+			works = newWorksOnly(works)
+		}
 		data, err := json.Marshal(works)
 		if err != nil {
 			return nil, nil, err
 		}
 		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: string(data)}}}, nil, nil
+	})
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "papio_batch_report", Title: "Report batch acquisition outcomes",
+		Description: "Join a persisted batch manifest with live job, event, and human-action state. Returns an agent-ready JSON or Markdown digest.",
+		Annotations: readAnnotations(),
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, input BatchReportInput) (*mcp.CallToolResult, any, error) {
+		if input.BatchID == "" {
+			return nil, nil, fmt.Errorf("batch_id is required")
+		}
+		format := input.Format
+		if format == "" {
+			format = "json"
+		}
+		report, err := api.BatchReport(ctx, system, input.BatchID)
+		if err != nil {
+			return nil, nil, err
+		}
+		switch format {
+		case "json":
+			data, err := json.Marshal(report)
+			if err != nil {
+				return nil, nil, err
+			}
+			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: string(data)}}}, nil, nil
+		case "markdown":
+			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: batch.Markdown(report)}}}, nil, nil
+		default:
+			return nil, nil, fmt.Errorf("format must be json or markdown")
+		}
 	})
 
 	mcp.AddTool(server, &mcp.Tool{
@@ -275,6 +325,16 @@ func exportsResource(ctx context.Context, system *bootstrap.System, kind string)
 		return nil, err
 	}
 	return records, rows.Err()
+}
+
+func newWorksOnly(works []discovery.DiscoveredWork) []discovery.DiscoveredWork {
+	filtered := make([]discovery.DiscoveredWork, 0, len(works))
+	for _, discovered := range works {
+		if !discovered.Owned {
+			filtered = append(filtered, discovered)
+		}
+	}
+	return filtered
 }
 
 func readAnnotations() *mcp.ToolAnnotations {

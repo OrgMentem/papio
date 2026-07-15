@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"papio/internal/batch"
 	"papio/internal/bootstrap"
 	"papio/internal/config"
 	"papio/internal/ipc"
@@ -272,5 +273,44 @@ func TestRouterDiscoverySearchAcceptsCitationSnowballWithoutQuery(t *testing.T) 
 	}
 	if rpcErr := callMethod(t, router, "discovery.search", params, nil); rpcErr == nil || rpcErr.Code != "precondition_failed" {
 		t.Fatalf("citation snowball params RPC error = %+v, want precondition_failed", rpcErr)
+	}
+}
+
+func TestRouterAcquireReportJoinsManifestAgainstLiveJobState(t *testing.T) {
+	system := testSystem(t)
+	ctx := context.Background()
+	id, err := system.Jobs.CreateRequest(ctx, "batch-deadbeef-11111111", work.Work{DOI: "10.1000/report"}, "", "Reading", job.Policy{
+		AccessMode: config.ModeConservative, DesiredVersion: "any", Collection: "Reading",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := system.Jobs.Transition(ctx, id, job.StateQueued, job.StateResolving, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := system.Jobs.Transition(ctx, id, job.StateResolving, job.StateReady, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := system.Jobs.RecordEvent(ctx, id, "zotio.auto_import", map[string]any{
+		"status": "applied", "parent_key": "PA123", "attachment_key": "AT456",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	manifest := &batch.Manifest{
+		SchemaVersion: batch.SchemaVersion, ID: "batch-deadbeef", CreatedAt: "2026-07-15T12:00:00Z", Collection: "Reading",
+		Works: []batch.ManifestWork{{
+			RequestID: "batch-deadbeef-11111111", JobID: id, Status: "submitted",
+			Work: protocol.WorkRequest{SchemaVersion: protocol.WorkRequestSchemaVersion, RequestID: "batch-deadbeef-11111111", Identifiers: &protocol.Identifiers{DOI: "10.1000/report"}, Collection: "Reading"},
+		}},
+	}
+	if err := batch.Write(system.Config.DataDir, manifest); err != nil {
+		t.Fatal(err)
+	}
+	var report batch.Report
+	if rpcErr := callMethod(t, Router(system), "acquire.report", AcquireReportParams{BatchID: manifest.ID}, &report); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	if len(report.Works) != 1 || report.Works[0].Outcome != "imported" || report.Works[0].ParentKey != "PA123" || report.Works[0].AttachmentKey != "AT456" {
+		t.Fatalf("report = %+v", report)
 	}
 }

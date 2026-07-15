@@ -9,8 +9,6 @@ import (
 	"context"
 	"net/http"
 	"os"
-	"sync"
-	"time"
 	"papio/internal/app"
 	"papio/internal/artifact"
 	"papio/internal/browser"
@@ -22,6 +20,7 @@ import (
 	"papio/internal/doctor"
 	"papio/internal/fetch"
 	"papio/internal/job"
+	"papio/internal/notify"
 	"papio/internal/pdf"
 	"papio/internal/resolver"
 	"papio/internal/resolvers/arxiv"
@@ -33,6 +32,8 @@ import (
 	"papio/internal/store"
 	"papio/internal/work"
 	"papio/internal/zotio"
+	"sync"
+	"time"
 )
 
 // System owns the process-wide concrete services used by the daemon and RPC
@@ -130,6 +131,9 @@ func New(ctx context.Context, cfg config.Config) (*System, error) {
 
 	entries := resolverEntries(cfg, metadataClient)
 	service := app.New(cfg, jobs, artifacts, budgets)
+	if cfg.Notify.Enabled {
+		service.Notifier = notify.NewCoalescer(notify.NewMacOS())
+	}
 	service.Resolvers = entries
 	service.Fetch = func(ctx context.Context, candidate resolver.Candidate, path string) (fetch.Result, error) {
 		return downloader.DownloadWithHeaders(ctx, candidate.URL, candidate.RequestHeaders, path)
@@ -173,7 +177,8 @@ func New(ctx context.Context, cfg config.Config) (*System, error) {
 	bundleExporter := &bundle.Exporter{Jobs: jobs, Artifacts: artifacts, DataDir: cfg.DataDir}
 	zotioService := &zotio.Service{
 		CLI: zotio.New(cfg.Zotio), Submitter: service,
-		Bundle: bundleExporter, Store: db, DataDir: cfg.DataDir, AttachmentMode: cfg.Zotio.AttachmentMode,
+		Bundle: bundleExporter, Store: db, DataDir: cfg.DataDir,
+		AttachmentMode: cfg.Zotio.AttachmentMode, AutoEnrich: cfg.Zotio.AutoEnrich,
 	}
 	service.AutoImporter = newSerialAutoImporter(zotioService)
 	system := &System{

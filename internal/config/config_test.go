@@ -87,3 +87,37 @@ func TestZotioAutoImportDefaultsOffAndLoadsTrue(t *testing.T) {
 		t.Fatal("loaded zotio.auto_import = false, want true")
 	}
 }
+
+func TestZotioAutoEnrichDefaultsOnAndLoadsFalse(t *testing.T) {
+	if !Default().Zotio.AutoEnrich {
+		t.Fatal("default zotio.auto_enrich = false, want true")
+	}
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(path, []byte("access_mode='conservative'\n[zotio]\nauto_enrich=false\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Zotio.AutoEnrich {
+		t.Fatal("loaded zotio.auto_enrich = true, want false")
+	}
+}
+
+func TestNotifyDefaultsOnAndLoadsFalse(t *testing.T) {
+	if !Default().Notify.Enabled {
+		t.Fatal("default notify.enabled = false, want true")
+	}
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(path, []byte("access_mode='conservative'\n[notify]\nenabled=false\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Notify.Enabled {
+		t.Fatal("loaded notify.enabled = true, want false")
+	}
+}

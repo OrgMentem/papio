@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"papio/internal/config"
+	"papio/internal/discovery"
 )
 
 func TestNormalizeIdentifiersAcceptsCommonDOIAndArXivForms(t *testing.T) {
@@ -47,7 +48,7 @@ func TestSearchCommandAllowsSnowballWithoutQuery(t *testing.T) {
 	if err := command.Args(command, nil); err == nil {
 		t.Fatal("search without query or a snowball DOI succeeded")
 	}
-	for _, name := range []string{"cites", "cited-by", "related-to"} {
+	for _, name := range []string{"cites", "cited-by", "related-to", "new-only"} {
 		flag := command.Flags().Lookup(name)
 		if flag == nil {
 			t.Fatalf("missing --%s flag", name)
@@ -55,6 +56,24 @@ func TestSearchCommandAllowsSnowballWithoutQuery(t *testing.T) {
 	}
 	if got := command.Flags().Lookup("cited-by").Usage; !strings.Contains(got, "backward references") || !strings.Contains(got, "cited_by:") {
 		t.Fatalf("cited-by help = %q", got)
+	}
+}
+
+func TestNewWorksOnlyFiltersOwnedResultsWithoutRefetching(t *testing.T) {
+	works := []discovery.DiscoveredWork{
+		{OpenAlexID: "one"},
+		{OpenAlexID: "two", Owned: true, OwnedItemKey: "PDF00001"},
+		{OpenAlexID: "three"},
+	}
+	filtered := newWorksOnly(works)
+	if len(filtered) != 2 || filtered[0].OpenAlexID != "one" || filtered[1].OpenAlexID != "three" {
+		t.Fatalf("filtered works = %+v", filtered)
+	}
+	if got := ownedSuffix(true); got != " [in library]" {
+		t.Fatalf("owned suffix = %q", got)
+	}
+	if got := newSearchCommand(&options{}).Flags().Lookup("new-only").Usage; !strings.Contains(got, "after --limit") || !strings.Contains(got, "fewer") {
+		t.Fatalf("new-only help = %q", got)
 	}
 }
 

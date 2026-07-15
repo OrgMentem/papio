@@ -13,7 +13,7 @@ import (
 
 func newSearchCommand(opt *options) *cobra.Command {
 	var limit, yearFrom, yearTo int
-	var oaOnly bool
+	var oaOnly, newOnly bool
 	var cites, citedBy, relatedTo string
 	command := &cobra.Command{
 		Use:   "search [query]",
@@ -42,17 +42,21 @@ func newSearchCommand(opt *options) *cobra.Command {
 			if err := opt.call(cmd.Context(), "discovery.search", params, &works); err != nil {
 				return err
 			}
+			if newOnly {
+				works = newWorksOnly(works)
+			}
 			if opt.jsonOutput {
 				return opt.printJSON(works)
 			}
 			for _, discovered := range works {
-				if _, err := fmt.Fprintf(opt.out, "%d | %s | %s | %s | %s | %d citations\n",
+				if _, err := fmt.Fprintf(opt.out, "%d | %s | %s | %s | %s | %d citations%s\n",
 					discovered.Work.Year,
 					firstAuthor(discovered.Work.Authors),
 					discovered.Work.Title,
 					emptyMarker(discovered.Work.DOI),
 					oaMarker(discovered.IsOA),
 					discovered.CitedBy,
+					ownedSuffix(discovered.Owned),
 				); err != nil {
 					return err
 				}
@@ -65,6 +69,7 @@ func newSearchCommand(opt *options) *cobra.Command {
 	flags.IntVar(&yearFrom, "year-from", 0, "minimum publication year")
 	flags.IntVar(&yearTo, "year-to", 0, "maximum publication year")
 	flags.BoolVar(&oaOnly, "oa-only", false, "return only open-access works")
+	flags.BoolVar(&newOnly, "new-only", false, "omit works already in your library; filters after --limit and may return fewer results")
 	flags.StringVar(&cites, "cites", "", "DOI to find papers citing it (forward citations; OpenAlex cites: filter)")
 	flags.StringVar(&citedBy, "cited-by", "", "DOI to find papers it cites (backward references; OpenAlex cited_by: filter)")
 	flags.StringVar(&relatedTo, "related-to", "", "DOI to find OpenAlex-related papers (related_to: filter)")
@@ -90,4 +95,21 @@ func oaMarker(isOA bool) string {
 		return "OA"
 	}
 	return "—"
+}
+
+func newWorksOnly(works []discovery.DiscoveredWork) []discovery.DiscoveredWork {
+	filtered := make([]discovery.DiscoveredWork, 0, len(works))
+	for _, discovered := range works {
+		if !discovered.Owned {
+			filtered = append(filtered, discovered)
+		}
+	}
+	return filtered
+}
+
+func ownedSuffix(owned bool) string {
+	if owned {
+		return " [in library]"
+	}
+	return ""
 }

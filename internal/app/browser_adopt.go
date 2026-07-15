@@ -141,7 +141,7 @@ func (s *Service) AdoptDownload(ctx context.Context, jobID, path string) error {
 		"the adopted download failed validation; please supply a different file"); err != nil {
 		return err
 	}
-	return s.Jobs.Transition(ctx, jobID, job.StateFetching, job.StateAwaitingHuman,
+	return s.park(ctx, jobID, job.StateFetching, job.StateAwaitingHuman,
 		map[string]any{"reason": "adopted_download_rejected"})
 }
 

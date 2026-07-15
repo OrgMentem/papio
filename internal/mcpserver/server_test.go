@@ -31,7 +31,7 @@ func TestServerExposesBoundedPlanApplySurface(t *testing.T) {
 		t.Fatal(err)
 	}
 	var names []string
-	var applyTool, exportTool, searchTool *mcp.Tool
+	var applyTool, batchReportTool, exportTool, searchTool *mcp.Tool
 	for _, tool := range listed.Tools {
 		names = append(names, tool.Name)
 		switch tool.Name {
@@ -41,10 +41,12 @@ func TestServerExposesBoundedPlanApplySurface(t *testing.T) {
 			exportTool = tool
 		case "papio_search":
 			searchTool = tool
+		case "papio_batch_report":
+			batchReportTool = tool
 		}
 	}
 	sort.Strings(names)
-	want := []string{"papio_acquire", "papio_export_bundle", "papio_search", "papio_zotio_apply", "papio_zotio_plan"}
+	want := []string{"papio_acquire", "papio_batch_report", "papio_export_bundle", "papio_search", "papio_zotio_apply", "papio_zotio_plan"}
 	if strings.Join(names, ",") != strings.Join(want, ",") {
 		t.Fatalf("tools = %v, want %v", names, want)
 	}
@@ -61,6 +63,16 @@ func TestServerExposesBoundedPlanApplySurface(t *testing.T) {
 	if exportTool == nil || exportTool.Annotations == nil || !exportTool.Annotations.ReadOnlyHint {
 		t.Fatalf("export annotations = %+v", exportTool)
 	}
+	if batchReportTool == nil || batchReportTool.Annotations == nil || !batchReportTool.Annotations.ReadOnlyHint {
+		t.Fatalf("batch report annotations = %+v", batchReportTool)
+	}
+	batchSchema, err := json.Marshal(batchReportTool.InputSchema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(batchSchema), `"batch_id"`) || !strings.Contains(string(batchSchema), `"format"`) {
+		t.Fatalf("batch report schema = %s", batchSchema)
+	}
 	if searchTool == nil || searchTool.Annotations == nil || !searchTool.Annotations.ReadOnlyHint {
 		t.Fatalf("search annotations = %+v", searchTool)
 	}
@@ -72,7 +84,10 @@ func TestServerExposesBoundedPlanApplySurface(t *testing.T) {
 		!strings.Contains(string(searchSchema), `"oa_only"`) ||
 		!strings.Contains(string(searchSchema), `"cites"`) ||
 		!strings.Contains(string(searchSchema), `"cited_by"`) ||
-		!strings.Contains(string(searchSchema), `"related_to"`) {
+		!strings.Contains(string(searchSchema), `"related_to"`) ||
+		!strings.Contains(string(searchSchema), `"new_only"`) ||
+		!strings.Contains(searchTool.Description, "owned_item_key") ||
+		!strings.Contains(searchTool.Description, "fewer results") {
 		t.Fatalf("search schema = %s", searchSchema)
 	}
 

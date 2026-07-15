@@ -37,6 +37,7 @@ type Service struct {
 	Store          *store.Store
 	DataDir        string
 	AttachmentMode string
+	AutoEnrich     bool
 	Now            func() time.Time
 }
 

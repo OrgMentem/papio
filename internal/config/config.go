@@ -83,6 +83,12 @@ type Zotio struct {
 	TimeoutSeconds int    `toml:"timeout_seconds"`
 	AttachmentMode string `toml:"attachment_mode"`
 	AutoImport     bool   `toml:"auto_import"`
+	AutoEnrich     bool   `toml:"auto_enrich"`
+}
+
+// Notify configures best-effort local desktop notifications from the daemon.
+type Notify struct {
+	Enabled bool `toml:"enabled"`
 }
 
 // Config is the loaded, validated configuration.
@@ -94,6 +100,7 @@ type Config struct {
 	PDF        PDF               `toml:"pdf"`
 	Browser    Browser           `toml:"browser"`
 	Zotio      Zotio             `toml:"zotio"`
+	Notify     Notify            `toml:"notify"`
 	Sources    map[string]Source `toml:"sources"`
 
 	// Path this config was loaded from ("" for defaults).
@@ -121,7 +128,8 @@ func Default() Config {
 		Fetch:   Fetch{MaxBytes: 100 << 20, TimeoutSeconds: 120},
 		PDF:     PDF{OCREnabled: true, MinTextChars: 400, MaxOCRPages: 4, TitleMatchThreshold: 0.6},
 		Browser: Browser{ActionExpirySeconds: 1800},
-		Zotio:   Zotio{Executable: "zotio", TimeoutSeconds: 120, AttachmentMode: "stored", AutoImport: false},
+		Zotio:   Zotio{Executable: "zotio", TimeoutSeconds: 120, AttachmentMode: "stored", AutoImport: false, AutoEnrich: true},
+		Notify:  Notify{Enabled: true},
 		Sources: map[string]Source{
 			SourceArXiv:           {Enabled: true, RatePerSec: 1, Burst: 1},
 			SourceEuropePMC:       {Enabled: true, RatePerSec: 2, Burst: 2},

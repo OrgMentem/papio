@@ -4,12 +4,17 @@ package discovery
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"strings"
 	"testing"
+
+	"papio/internal/work"
+	"papio/internal/zotio"
 )
 
 func TestSearchMapsRecordedOpenAlexWorks(t *testing.T) {
@@ -76,6 +81,59 @@ func TestSearchMapsRecordedOpenAlexWorks(t *testing.T) {
 	}
 	if works[2].Work.DOI != "" || works[2].Work.Container != "" || len(works[2].Work.Authors) != 0 {
 		t.Fatalf("third discovery result = %+v", works[2])
+	}
+	lookup := &fakeOwnershipLookup{result: &zotio.LookupWorksResult{Works: []zotio.WorkOwnership{
+		{Status: zotio.OwnershipOwnedWithPDF, ItemKey: "PDF00001"},
+		{Status: zotio.OwnershipOwnedMissingPDF, ItemKey: "MISS0001"},
+		{Status: zotio.OwnershipNotOwned},
+	}}}
+	if warning := ClassifyOwnership(context.Background(), works, lookup); warning != "" {
+		t.Fatalf("warning = %q", warning)
+	}
+	if lookup.calls != 1 || len(lookup.request.Works) != len(works) ||
+		lookup.request.Works[0].DOI != "10.1000/example.doi" || lookup.request.Works[2].DOI != "" {
+		t.Fatalf("lookup request = %+v, calls = %d", lookup.request, lookup.calls)
+	}
+	if !works[0].Owned || works[0].OwnedItemKey != "PDF00001" ||
+		!works[1].Owned || works[1].OwnedItemKey != "MISS0001" || works[2].Owned {
+		t.Fatalf("classified works = %+v", works)
+	}
+	encoded, err := json.Marshal(works)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var output []map[string]any
+	if err := json.Unmarshal(encoded, &output); err != nil {
+		t.Fatal(err)
+	}
+	if owned, ok := output[0]["owned"].(bool); !ok || !owned {
+		t.Fatalf("first owned JSON = %#v", output[0]["owned"])
+	}
+	if owned, ok := output[2]["owned"].(bool); !ok || owned {
+		t.Fatalf("third owned JSON = %#v", output[2]["owned"])
+	}
+}
+
+type fakeOwnershipLookup struct {
+	request zotio.LookupWorksRequest
+	result  *zotio.LookupWorksResult
+	err     error
+	calls   int
+}
+
+func (f *fakeOwnershipLookup) LookupWorks(_ context.Context, request zotio.LookupWorksRequest) (*zotio.LookupWorksResult, error) {
+	f.calls++
+	f.request = request
+	return f.result, f.err
+}
+
+func TestClassifyOwnershipDegradesWhenLookupFails(t *testing.T) {
+	works := []DiscoveredWork{{Work: work.Work{DOI: "10.1000/example"}, Owned: true, OwnedItemKey: "STALE000"}}
+	lookup := &fakeOwnershipLookup{err: errors.New("zotio unavailable")}
+
+	warning := ClassifyOwnership(context.Background(), works, lookup)
+	if !strings.Contains(warning, "Zotio ownership lookup failed") || works[0].Owned || works[0].OwnedItemKey != "" {
+		t.Fatalf("warning = %q, work = %+v", warning, works[0])
 	}
 }
 

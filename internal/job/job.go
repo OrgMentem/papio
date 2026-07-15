@@ -1204,7 +1204,7 @@ func (js *Store) ListHumanActions(ctx context.Context, openOnly bool) ([]HumanAc
 	if openOnly {
 		q += ` WHERE status = 'open'`
 	}
-	q += ` ORDER BY id DESC LIMIT 200`
+	q += ` ORDER BY id DESC`
 	rows, err := js.S.DB().QueryContext(ctx, q)
 	if err != nil {
 		return nil, err

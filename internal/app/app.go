@@ -40,6 +40,13 @@ type AutoImporter interface {
 	PlanAndApply(context.Context, string) (status, parentKey, attachmentKey string, err error)
 }
 
+// NotificationSink receives best-effort daemon UX notifications after durable
+// job state transitions.
+type NotificationSink interface {
+	HumanAction(context.Context)
+	Imported(context.Context)
+}
+
 // ResolverEntry binds an adapter to its policy and estimated metadata-call cost.
 type ResolverEntry struct {
 	Adapter       resolver.Resolver
@@ -57,6 +64,7 @@ type Service struct {
 	Fetch        FetchFunc
 	Validate     ValidateFunc
 	AutoImporter AutoImporter
+	Notifier     NotificationSink
 
 	RetryDelay time.Duration
 	Now        func() time.Time
@@ -108,7 +116,7 @@ func (s *Service) SubmitWithAutoImport(ctx context.Context, wr protocol.WorkRequ
 		SourcesDeny:   append([]string(nil), wr.SourcesDeny...),
 		FetchMaxBytes: s.Config.Fetch.MaxBytes,
 		AutoImport:    auto,
-		Collection:     strings.TrimSpace(wr.Collection),
+		Collection:    strings.TrimSpace(wr.Collection),
 	}
 	return s.Jobs.CreateRequest(ctx, wr.RequestID, w, wr.ZotioItemKey, wr.Collection, pol, raw)
 }
@@ -428,7 +436,7 @@ func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[st
 
 	if manual {
 		_, _ = s.Jobs.OpenHumanAction(ctx, row.ID, "manual_download", "a resolver returned a landing page but no verified direct PDF")
-		return s.Jobs.Transition(ctx, row.ID, job.StateFetching, job.StateAwaitingHuman,
+		return s.park(ctx, row.ID, job.StateFetching, job.StateAwaitingHuman,
 			map[string]any{"reason": "landing_page_only"})
 	}
 	if !retryAt.IsZero() {
@@ -436,6 +444,16 @@ func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[st
 			map[string]any{"reason": "candidate_temporarily_unavailable"}, job.WithRetryAt(retryAt))
 	}
 	return s.exhaustedCandidates(ctx, row, job.StateFetching, "candidates_exhausted", "all candidates exhausted", oaBrowserURL)
+}
+
+func (s *Service) park(ctx context.Context, jobID, from, to string, detail map[string]any, opts ...job.TransitionOpt) error {
+	if err := s.Jobs.Transition(ctx, jobID, from, to, detail, opts...); err != nil {
+		return err
+	}
+	if s.Notifier != nil {
+		s.Notifier.HumanAction(context.WithoutCancel(ctx))
+	}
+	return nil
 }
 
 // exhaustedCandidates handles the terminal "no direct candidate" boundary —
@@ -452,14 +470,14 @@ func (s *Service) exhaustedCandidates(ctx context.Context, row *job.Row, from, r
 			if _, err := s.Jobs.OpenHumanAction(ctx, row.ID, "openurl_handoff", OABrowserHandoffActionDetail(oaBrowserURL)); err != nil {
 				return err
 			}
-			return s.Jobs.Transition(ctx, row.ID, from, job.StateAwaitingHuman,
+			return s.park(ctx, row.ID, from, job.StateAwaitingHuman,
 				map[string]any{"reason": "open_access_browser_handoff"})
 		}
 		if s.Config.Browser.OpenURLBase != "" {
 			if _, err := s.Jobs.OpenHumanAction(ctx, row.ID, "openurl_handoff", InstitutionalOpenURLHandoffDetail); err != nil {
 				return err
 			}
-			return s.Jobs.Transition(ctx, row.ID, from, job.StateAwaitingHuman,
+			return s.park(ctx, row.ID, from, job.StateAwaitingHuman,
 				map[string]any{"reason": "institutional_handoff"})
 		}
 	case config.ModeConservative:
@@ -491,7 +509,7 @@ func (s *Service) validateCandidate(ctx context.Context, row *job.Row, stored *j
 		if err := s.Jobs.MarkCandidate(ctx, stored.ID, "skipped"); err != nil {
 			return false, false, err
 		}
-		return false, true, s.Jobs.Transition(ctx, row.ID, job.StateValidating, job.StateNeedsReview,
+		return false, true, s.park(ctx, row.ID, job.StateValidating, job.StateNeedsReview,
 			map[string]any{"reason": "validation_error"})
 	}
 	active := report.Structural.HasJavaScript || report.Structural.HasEmbeddedFiles
@@ -507,14 +525,14 @@ func (s *Service) validateCandidate(ctx context.Context, row *job.Row, stored *j
 		_ = s.Jobs.FinishAttempt(ctx, attempt, "needs_review", 0, "encrypted_or_active_content")
 		_ = s.Jobs.MarkCandidate(ctx, stored.ID, "skipped")
 		_, _ = s.Jobs.OpenHumanAction(ctx, row.ID, "unsafe_pdf", "PDF is encrypted or contains active/embedded content")
-		return false, true, s.Jobs.Transition(ctx, row.ID, job.StateValidating, job.StateNeedsReview,
+		return false, true, s.park(ctx, row.ID, job.StateValidating, job.StateNeedsReview,
 			map[string]any{"reason": "encrypted_or_active_content"})
 	case needsIdentityReview && !stored.ReviewOverride:
 		_ = s.Jobs.FinishAttempt(ctx, attempt, "needs_review", 0, "semantic_or_identity_review")
 		_ = s.Jobs.MarkCandidate(ctx, stored.ID, "skipped")
 		_, _ = s.Jobs.OpenHumanAction(ctx, row.ID, "verify_identity",
 			fmt.Sprintf("PDF text or identity requires human verification; local quarantine file: %s", result.TempPath))
-		return false, true, s.Jobs.Transition(ctx, row.ID, job.StateValidating, job.StateNeedsReview,
+		return false, true, s.park(ctx, row.ID, job.StateValidating, job.StateNeedsReview,
 			map[string]any{"reason": "semantic_or_identity_review"})
 	case report.Identity.Result != pdf.IdentityPass && report.Identity.Result != pdf.IdentityReview:
 		_ = s.Jobs.FinishAttempt(ctx, attempt, "invalid", 0, "identity_rejected")
@@ -580,6 +598,9 @@ func (s *Service) autoImportReady(ctx context.Context, row *job.Row) {
 	}
 	detail["status"] = status
 	_ = s.Jobs.RecordEvent(eventCtx, row.ID, "zotio.auto_import", detail)
+	if status == "applied" && s.Notifier != nil {
+		s.Notifier.Imported(eventCtx)
+	}
 }
 
 // InstitutionalOpenURLHandoffDetail describes the ordinary resolver handoff.

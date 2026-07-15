@@ -3,14 +3,21 @@
 package cli
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net/url"
+	"os/exec"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 
 	"papio/internal/api"
+	"papio/internal/app"
+	"papio/internal/browser"
 	"papio/internal/doctor"
 	"papio/internal/job"
 )
@@ -158,9 +165,119 @@ func newActionsCommand(opt *options) *cobra.Command {
 		},
 	}
 	resolve.Flags().BoolVar(&accept, "accept", false, "accept the identity review")
+
+	var limit int
+	var dryRun bool
+	open := &cobra.Command{
+		Use:   "open",
+		Short: "Open the current browser handoff queue",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if limit < 0 {
+				return errors.New("--limit must be non-negative")
+			}
+			cfg, err := opt.loadConfig()
+			if err != nil {
+				return err
+			}
+			var actions []job.HumanAction
+			if err := opt.call(cmd.Context(), "actions.list", map[string]bool{"open_only": true}, &actions); err != nil {
+				return err
+			}
+			var rows []job.Row
+			if err := opt.call(cmd.Context(), "jobs.list", map[string]any{"limit": 500}, &rows); err != nil {
+				return err
+			}
+			urls := actionURLs(actions, rows, cfg.Browser.OpenURLBase, limit)
+			if dryRun && opt.jsonOutput {
+				return opt.printJSON(urls)
+			}
+			if err := openActionURLs(cmd.Context(), urls, dryRun, opt.out, commandExec); err != nil {
+				return err
+			}
+			if opt.jsonOutput {
+				return opt.printJSON(urls)
+			}
+			return nil
+		},
+	}
+	open.Flags().IntVar(&limit, "limit", 0, "maximum actions to open (default all)")
+	open.Flags().BoolVar(&dryRun, "dry-run", false, "print URLs without opening them")
+
 	resolve.Flags().BoolVar(&reject, "reject", false, "reject the identity review")
-	command.AddCommand(list, resolve)
+	command.AddCommand(list, resolve, open)
 	return command
+}
+
+const openURLTimeout = 5 * time.Second
+
+type commandRunner func(context.Context, string, ...string) error
+
+func actionURLs(actions []job.HumanAction, rows []job.Row, openURLBase string, limit int) []string {
+	jobs := make(map[string]job.Row, len(rows))
+	for _, row := range rows {
+		jobs[row.ID] = row
+	}
+	urls := make([]string, 0, len(actions))
+	for _, action := range actions {
+		row, ok := jobs[action.JobID]
+		if !ok || action.Status != "open" || row.State != job.StateAwaitingHuman {
+			continue
+		}
+		target, ok := actionURL(action, row, openURLBase)
+		if !ok {
+			continue
+		}
+		urls = append(urls, target)
+		if limit > 0 && len(urls) >= limit {
+			break
+		}
+	}
+	return urls
+}
+
+func actionURL(action job.HumanAction, row job.Row, openURLBase string) (string, bool) {
+	if direct, ok := app.OABrowserHandoffURL(action.Detail); ok {
+		return direct, true
+	}
+	if detail := strings.TrimSpace(action.Detail); validOpenURL(detail) {
+		return detail, true
+	}
+	if action.Kind != "openurl_handoff" || openURLBase == "" {
+		return "", false
+	}
+	target := browser.OpenURL(openURLBase, row.Work)
+	return target, validOpenURL(target)
+}
+
+func validOpenURL(value string) bool {
+	if len(value) == 0 || len(value) > 4000 {
+		return false
+	}
+	parsed, err := url.ParseRequestURI(value)
+	return err == nil && parsed.Scheme == "https" && parsed.Host != ""
+}
+
+func openActionURLs(ctx context.Context, urls []string, dryRun bool, out io.Writer, run commandRunner) error {
+	for _, target := range urls {
+		if dryRun {
+			if _, err := fmt.Fprintln(out, target); err != nil {
+				return err
+			}
+			continue
+		}
+		bounded, cancel := context.WithTimeout(ctx, openURLTimeout)
+		err := run(bounded, "open", target)
+		cancel()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func commandExec(ctx context.Context, name string, args ...string) error {
+	return exec.CommandContext(ctx, name, args...).Run()
 }
 
 func newArtifactsCommand(opt *options) *cobra.Command {

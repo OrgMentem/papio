@@ -541,6 +541,8 @@ func TestProcessReadyAutoImportsOnce(t *testing.T) {
 	svc.Config.Zotio.AutoImport = true
 	importer := &fakeAutoImporter{status: "applied", parentKey: "PARENT01", attachmentKey: "ATTACH01"}
 	svc.AutoImporter = importer
+	notifier := &fakeNotificationSink{}
+	svc.Notifier = notifier
 	readyPipeline(svc)
 
 	id, err := svc.Submit(context.Background(), doiRequest("wr_auto_import_01"))
@@ -570,6 +572,9 @@ func TestProcessReadyAutoImportsOnce(t *testing.T) {
 	}
 	if importer.calls != 1 {
 		t.Fatalf("auto-import calls = %d, want 1", importer.calls)
+	}
+	if notifier.imported != 1 {
+		t.Fatalf("import notifications = %d, want 1", notifier.imported)
 	}
 }
 
@@ -671,5 +676,32 @@ func TestSubmitCarriesCollectionIntoJobPolicy(t *testing.T) {
 	}
 	if row.Policy.Collection != "Reading list" {
 		t.Fatalf("policy collection = %q", row.Policy.Collection)
+	}
+}
+
+type fakeNotificationSink struct {
+	human, imported int
+}
+
+func (f *fakeNotificationSink) HumanAction(context.Context) { f.human++ }
+func (f *fakeNotificationSink) Imported(context.Context)    { f.imported++ }
+
+func TestParkNotifiesAfterSuccessfulTransition(t *testing.T) {
+	svc, jobs := newTestService(t)
+	notifier := &fakeNotificationSink{}
+	svc.Notifier = notifier
+	ctx := context.Background()
+	id, err := svc.Submit(ctx, doiRequest("wr_park_notification"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.Transition(ctx, id, job.StateQueued, job.StateResolving, map[string]any{"reason": "test"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.park(ctx, id, job.StateResolving, job.StateAwaitingHuman, map[string]any{"reason": "test"}); err != nil {
+		t.Fatal(err)
+	}
+	if notifier.human != 1 {
+		t.Fatalf("human notifications = %d, want 1", notifier.human)
 	}
 }

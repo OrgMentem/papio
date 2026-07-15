@@ -19,6 +19,7 @@ func TestNewWiresResolverOrderAndCoreServices(t *testing.T) {
 	cfg.AccessMode = config.ModeConservative
 	cfg.DataDir = t.TempDir()
 	cfg.PDF.OCREnabled = false
+	cfg.Zotio.AutoEnrich = false
 	system, err := New(context.Background(), cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -48,6 +49,9 @@ func TestNewWiresResolverOrderAndCoreServices(t *testing.T) {
 	}
 	if system.App.Fetch == nil || system.App.Validate == nil || system.Scheduler == nil || system.Bundle == nil {
 		t.Fatal("bootstrap left a core service unwired")
+	}
+	if system.Zotio.AutoEnrich {
+		t.Fatal("bootstrap ignored zotio.auto_enrich=false")
 	}
 	if system.PDFCapability.PDFToPPM != "" || system.PDFCapability.Tesseract != "" {
 		t.Fatal("OCR helpers remained enabled when pdf.ocr_enabled=false")

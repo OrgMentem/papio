@@ -3,11 +3,12 @@ package zotio
 
 import (
 	"context"
-	"errors"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -21,17 +22,21 @@ import (
 )
 
 type planCLI struct {
-	manifest      string
-	preview       string
-	apply         string
-	applyErr      error
-	resolveCalls  int
-	syncCalls     int
-	previewCalls  int
-	applyCalls    int
-	lastResolveAt string
+	manifest        string
+	preview         string
+	apply           string
+	applyErr        error
+	enrichErr       error
+	resolveCalls    int
+	syncCalls       int
+	previewCalls    int
+	applyCalls      int
+	enrichCalls     int
+	lastResolveAt   string
 	collectionCalls int
 	collectionErr   error
+	enrichArgs      []string
+	callOrder       []string
 }
 
 func (c *planCLI) Preflight(context.Context) (*PreflightResult, error) {
@@ -56,7 +61,13 @@ func (c *planCLI) RunJSON(_ context.Context, args ...string) (json.RawMessage, e
 		return json.RawMessage(c.manifest), nil
 	case strings.Contains(joined, "items add-to-collection"):
 		c.collectionCalls++
+		c.callOrder = append(c.callOrder, "collection")
 		return json.RawMessage(`{"ok":true}`), c.collectionErr
+	case strings.Contains(joined, "items enrich"):
+		c.enrichCalls++
+		c.enrichArgs = append([]string(nil), args...)
+		c.callOrder = append(c.callOrder, "enrich")
+		return json.RawMessage(`{"ok":true}`), c.enrichErr
 	case strings.Contains(joined, "--yes"):
 		c.applyCalls++
 		return json.RawMessage(c.apply), c.applyErr
@@ -361,8 +372,8 @@ func TestManifestDuplicatePlanReturnsNoOpWithoutAttachment(t *testing.T) {
 
 func TestPlanAndApplyFilesPolicyCollectionWithoutRollingBackImport(t *testing.T) {
 	cli := &planCLI{
-		preview: `{"ok":true,"mode":"preview","plan":{"summary":{"planned":1,"no_op":0,"invalid":0}},"result":null}`,
-		apply:   `{"ok":true,"mode":"apply","plan":{"summary":{"planned":1}},"result":{"summary":{"applied":1,"no_op":0,"conflicts":0,"failed":0},"items":[{"key":"AB12CD34","status":"applied","reason":{"item_key":"AT56CH90","upload":"uploaded"}}]}}`,
+		preview:       `{"ok":true,"mode":"preview","plan":{"summary":{"planned":1,"no_op":0,"invalid":0}},"result":null}`,
+		apply:         `{"ok":true,"mode":"apply","plan":{"summary":{"planned":1}},"result":{"summary":{"applied":1,"no_op":0,"conflicts":0,"failed":0},"items":[{"key":"AB12CD34","status":"applied","reason":{"item_key":"AT56CH90","upload":"uploaded"}}]}}`,
 		collectionErr: errors.New("collection service unavailable"),
 	}
 	service, jobID := readyPlanService(t, "AB12CD34", cli)
@@ -402,5 +413,116 @@ func TestPlanAndApplyFilesPolicyCollectionWithoutRollingBackImport(t *testing.T)
 	}
 	if !found {
 		t.Fatalf("collection filing failure was not recorded: %+v", events)
+	}
+}
+
+func enablePlanAutoImport(t *testing.T, service *Service, jobID, collection string) {
+	t.Helper()
+	row, err := service.Bundle.Jobs.Get(context.Background(), jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	row.Policy.AutoImport = true
+	row.Policy.Collection = collection
+	policyJSON, err := json.Marshal(row.Policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Store.DB().Exec(`UPDATE jobs SET policy_json = ? WHERE id = ?`, string(policyJSON), jobID); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func zotioEventDetail(t *testing.T, service *Service, jobID, kind string) map[string]any {
+	t.Helper()
+	events, err := service.Bundle.Jobs.Events(context.Background(), jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range events {
+		if event["kind"] == kind {
+			detail, ok := event["detail"].(map[string]any)
+			if !ok {
+				t.Fatalf("%s detail = %#v", kind, event["detail"])
+			}
+			return detail
+		}
+	}
+	t.Fatalf("no %s event in %#v", kind, events)
+	return nil
+}
+
+func TestPlanAndApplyAutoEnrichesAppliedParentOnce(t *testing.T) {
+	cli := &planCLI{
+		preview: `{"ok":true,"mode":"preview","plan":{"summary":{"planned":1,"no_op":0,"invalid":0}},"result":null}`,
+		apply:   `{"ok":true,"mode":"apply","plan":{"summary":{"planned":1}},"result":{"summary":{"applied":1,"no_op":0,"conflicts":0,"failed":0},"items":[{"key":"AB12CD34","status":"applied","reason":{"item_key":"AT56CH90","upload":"uploaded"}}]}}`,
+	}
+	service, jobID := readyPlanService(t, "AB12CD34", cli)
+	service.AutoEnrich = true
+	enablePlanAutoImport(t, service, jobID, "Reading")
+
+	status, parentKey, attachmentKey, err := service.PlanAndApply(context.Background(), jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != "applied" || parentKey != "AB12CD34" || attachmentKey != "AT56CH90" {
+		t.Fatalf("result = (%q, %q, %q)", status, parentKey, attachmentKey)
+	}
+	wantArgs := []string{"--agent", "--yes", "items", "enrich", "--missing-doi", "--missing-abstract", "--keys", "AB12CD34"}
+	if cli.enrichCalls != 1 || !slices.Equal(cli.enrichArgs, wantArgs) {
+		t.Fatalf("enrich calls=%d args=%q, want %q", cli.enrichCalls, cli.enrichArgs, wantArgs)
+	}
+	if len(cli.callOrder) < 2 || !slices.Equal(cli.callOrder[:2], []string{"collection", "enrich"}) {
+		t.Fatalf("command order = %q, want collection before enrich", cli.callOrder)
+	}
+	detail := zotioEventDetail(t, service, jobID, "zotio.enrich")
+	if detail["status"] != "applied" || detail["summary"] == "" {
+		t.Fatalf("enrich event = %#v", detail)
+	}
+
+	if _, _, _, err := service.PlanAndApply(context.Background(), jobID); err != nil {
+		t.Fatal(err)
+	}
+	if cli.enrichCalls != 1 {
+		t.Fatalf("replayed apply enriched %d times, want 1", cli.enrichCalls)
+	}
+}
+
+func TestPlanAndApplyAutoEnrichFailureLeavesImportApplied(t *testing.T) {
+	cli := &planCLI{
+		preview:   `{"ok":true,"mode":"preview","plan":{"summary":{"planned":1,"no_op":0,"invalid":0}},"result":null}`,
+		apply:     `{"ok":true,"mode":"apply","plan":{"summary":{"planned":1}},"result":{"summary":{"applied":1,"no_op":0,"conflicts":0,"failed":0},"items":[{"key":"AB12CD34","status":"applied","reason":{"item_key":"AT56CH90","upload":"uploaded"}}]}}`,
+		enrichErr: errors.New("enrichment unavailable"),
+	}
+	service, jobID := readyPlanService(t, "AB12CD34", cli)
+	service.AutoEnrich = true
+	enablePlanAutoImport(t, service, jobID, "")
+
+	status, parentKey, attachmentKey, err := service.PlanAndApply(context.Background(), jobID)
+	if err != nil {
+		t.Fatalf("enrichment failure must not fail import: %v", err)
+	}
+	if status != "applied" || parentKey != "AB12CD34" || attachmentKey != "AT56CH90" {
+		t.Fatalf("result = (%q, %q, %q)", status, parentKey, attachmentKey)
+	}
+	detail := zotioEventDetail(t, service, jobID, "zotio.enrich")
+	if detail["status"] != "error" || detail["summary"] == "" || detail["error_type"] == "" {
+		t.Fatalf("enrich failure event = %#v", detail)
+	}
+}
+
+func TestPlanAndApplyAutoEnrichCanBeDisabled(t *testing.T) {
+	cli := &planCLI{
+		preview: `{"ok":true,"mode":"preview","plan":{"summary":{"planned":1,"no_op":0,"invalid":0}},"result":null}`,
+		apply:   `{"ok":true,"mode":"apply","plan":{"summary":{"planned":1}},"result":{"summary":{"applied":1,"no_op":0,"conflicts":0,"failed":0},"items":[{"key":"AB12CD34","status":"applied","reason":{"item_key":"AT56CH90","upload":"uploaded"}}]}}`,
+	}
+	service, jobID := readyPlanService(t, "AB12CD34", cli)
+	enablePlanAutoImport(t, service, jobID, "")
+
+	if status, _, _, err := service.PlanAndApply(context.Background(), jobID); err != nil || status != "applied" {
+		t.Fatalf("result = (%q, %v)", status, err)
+	}
+	if cli.enrichCalls != 0 {
+		t.Fatalf("disabled auto-enrich calls = %d, want 0", cli.enrichCalls)
 	}
 }
