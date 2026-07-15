@@ -758,6 +758,16 @@ Reframe (user direction): getting a PDF the human already clicked into Zotero wa
 - Live-found and fixed in the same pass: the extension's PDF-viewer probe was host-grant-gated and direct ACM PDF URLs lack a `.pdf` suffix (→ download-first redesign, `3c9a91a`); zotio posted collection creates as a bare object where the live API demands a JSON array, and the fake server accepted the wrong shape (→ `3d6fa3a`, fake now enforces the real contract).
 - Batch totals across both nights: 20 searched → **16 in Zotero autonomously**, 0 duplicate imports across three re-runs of the same batch file.
 
+## UX wave: status, reports, owned search, auto-enrich, error taxonomy (2026-07-15, shipped)
+
+- Shipped in papio `409f758` + `4fe698d`, zotio `cdb8bea`.
+- `papio status [--follow]`: grouped live dashboard (needs-you with reason, working, recently imported with import status, failures) derived purely from existing RPCs. `papio actions open [--dry-run]` opens every needs-you handoff URL from the terminal. macOS notifications (config `[notify]`, coalesced 60 s) on park and applied imports.
+- Batch manifests + `papio batch report <id|latest>` (table/JSON/Markdown) + read-only `papio_batch_report` MCP tool: per-work outcomes joined daemon-side (imported / browser-fetched / import_failed with error class / parked-with-reason / needs_review / skipped-owned / existing-item).
+- `papio search` marks `[in library]` per result (`owned`/`owned_item_key` in JSON, `--new-only`, MCP `new_only`) via one lookup_works call with all-unowned degradation.
+- Auto-enrich: after the first applied auto-import, one conservative scoped `zotio items enrich --missing-doi --missing-abstract --keys <parent>` inside the serialized importer; `[zotio] auto_enrich` default true; zotio gains `items enrich --keys`.
+- Error taxonomy: zotio-boundary failures now carry stable privacy-safe classes + sanitized ≤120-char hints in events, the IPC failure envelope, and CLI output — after error opacity ('internal: operation failed', `*fmt.wrapError`) cost its third debugging session, this is load-bearing UX for humans AND agents.
+- Live acceptance ('appropriate reliance' sweep, batch-d4248cb2): search marked 5/12 already-owned; `--new-only` submitted 7; 5 imported autonomously (1 via browser OA fetch), 2 parked honestly (institutional / Elsevier landing). The first honest batch report exposed a live classifier bug (ready+import-error rendered as imported) — fixed same pass with regression tests. Known edge: a job recovered by MANUAL `zotio apply` after an auto-import error still reports import_failed (manual applies emit no auto_import event; classifier could additionally consult the exports ledger) — recorded, not chased, since taxonomy+retry make manual recovery rare.
+
 ## Next
 
 Build Elsevier + ACM adapters from the observe-flywheel captures (the parked handoff tabs auto-capture on their next post-SSO landing); complete the JSTOR/EBSCO/Springer supervised live acceptances and clear the parked handoff queue in one warm-SSO browser pass; re-pin the packed extension ID; then Phase 5 hardening/release.
