@@ -38,12 +38,33 @@ with `~/` are expanded when Papio loads them.
 | Key | Type | Default | Effect and constraints |
 | --- | --- | --- | --- |
 | `extension_id` | string | empty | The Chrome extension ID allowed to use the native host. It must be 32 characters from `a` through `p`; an empty value disables the bridge. |
-| `openurl_base_url` | string URL | empty | Institution OpenURL resolver base. It must use `https://`; an empty value prevents institutional routing. |
+| `openurl_base_url` | string URL | empty | Legacy/default institutional OpenURL resolver base. It must use `https://`; an empty value prevents default-profile institutional routing. Existing query parameters are preserved when Papio adds citation metadata. Prefer the institution's direct-link-enabled endpoint so a single electronic service bypasses the resolver menu. |
 | `download_adoption_root` | path string | empty | Root for browser-download adoption. When empty, the effective value is `<data_dir>/adoptions`; adoption is confined to a job subdirectory beneath this root. |
 | `action_expiry_seconds` | integer seconds | `1800` | Maximum open time for one browser handoff. It must not be negative. |
 
 The browser path uses the user's ordinary Chrome session. It is not configured
 with passwords, MFA, CAPTCHA tokens, or publisher credentials.
+
+### `[browser.resolvers]`
+
+Named resolver profiles map lowercase alphanumeric names to HTTPS OpenURL bases:
+
+```toml
+[browser.resolvers]
+campus = "https://library.example.edu/discovery/openurl?institution=EXAMPLE"
+```
+
+Select one with `papio acquire --resolver campus`, `papio acquire --batch
+works.json --resolver campus`, or the corresponding MCP field. The selected
+name is snapshotted in the job policy, so re-opened actions cannot silently
+fall back to another institution.
+
+On a tracked Alma/Primo resolver page, the extension may follow the first
+same-origin `resolveService` link selected by the institution's Online Services
+order. This emulates resolver direct linking without accepting provider terms
+or initiating physical-item, scan, or interlibrary-loan requests. Script access
+remains constrained by `extension/manifest.json` host permissions; an unlisted
+custom resolver origin stays in assisted mode.
 
 ## `[zotio]`
 

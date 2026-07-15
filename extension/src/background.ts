@@ -42,6 +42,7 @@ import {
 } from "./adapters/types";
 import { observeUnknown } from "./observe";
 import { chromeKeepaliveAPI, initKeepalive, isAuthenticationURL } from "./keepalive";
+import { routeResolverService, type ResolverRoute } from "./resolver";
 
 export const NATIVE_HOST = "com.orgmentem.papio";
 const CHROME_PDF_VIEWER_HOST = "mhjfbmdgcfjbbpaeojofohoefgiehjai";
@@ -139,9 +140,9 @@ export interface BridgeDeps {
   scripting: {
     executeScript(injection: {
       target: { tabId: number };
-      // Loosely typed to mirror chrome.scripting.ScriptInjection.func and to
-      // accept `interpret` (a 3-arg DOM function) as an injectable value.
-      func: (...args: any[]) => unknown;
+      // `never[]` accepts concrete injected signatures without disabling type
+      // checking at this serialization boundary.
+      func: (...args: never[]) => unknown;
       args?: unknown[];
     }): Promise<{ result?: unknown }[]>;
   };
@@ -931,6 +932,7 @@ export class Bridge {
     }
     const successfulLanding = change.status === "complete" && !isAuthenticationURL(url);
     if (successfulLanding) await this.recordUsableSession(this.deps.now());
+    if (change.status === "complete" && (await this.maybeRouteResolver(job, url))) return;
     const onProvider = hostMatches(host, job.provider_hosts);
     if (!onProvider) {
       // Chrome exposes its built-in PDF viewer as an internal extension URL.
@@ -1035,6 +1037,52 @@ export class Bridge {
       console.error("papio: PDF-viewer download initiation failed; staying assisted", e);
     } finally {
       this.pendingDownloadURLs.delete(url);
+    }
+  }
+
+  /**
+   * Route a resolver's first electronic service in the same tracked tab.
+   * The offer origin proves this is the institutional resolver for this job;
+   * the injected function separately accepts only same-origin Alma service
+   * links. Missing host permission or no electronic service stays assisted.
+   */
+  private async maybeRouteResolver(job: ActiveJob, currentURL: string): Promise<boolean> {
+    const offered = this.offerURLs.get(job.job_id);
+    if (offered === undefined) return false;
+    let offerURL: URL;
+    let landingURL: URL;
+    try {
+      offerURL = new URL(offered);
+      landingURL = new URL(currentURL);
+    } catch {
+      return false;
+    }
+    if (
+      offerURL.origin !== landingURL.origin ||
+      !/(?:openurl|uresolver)/i.test(offerURL.pathname)
+    ) {
+      return false;
+    }
+
+    let granted = false;
+    try {
+      granted = await this.deps.permissions.contains({ origins: [`${landingURL.origin}/*`] });
+    } catch {
+      return false;
+    }
+    if (!granted) return false;
+
+    try {
+      const results = await this.deps.scripting.executeScript({
+        target: { tabId: job.tab_id },
+        func: routeResolverService,
+        args: [null],
+      });
+      const result = results[0]?.result as ResolverRoute | undefined;
+      return result?.kind === "routed";
+    } catch (e) {
+      console.error("papio: resolver routing failed; staying assisted", e);
+      return false;
     }
   }
 

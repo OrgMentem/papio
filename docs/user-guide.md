@@ -138,10 +138,20 @@ papio actions open
 ```
 
 The extension popup groups jobs into **needs you**, in-flight, and completed
-sections. Use its Focus control for the relevant handoff, authenticate in your
-ordinary Chrome session, and complete any publisher interaction yourself. Grant
-optional extension host permissions only for publisher sites you use.
+sections. Use its Focus control only when authentication or a provider-owned
+decision is required. `papio actions open` always targets Chrome, where the
+extension and your institutional session live.
 
+For institutional handoffs, Papio first uses the selected resolver profile.
+A direct-link-enabled resolver goes straight to the provider. When Alma/Primo
+instead renders an online-services menu, the extension follows the
+institution-ranked first electronic-service link in the same broker-owned tab;
+you do not need to click **Available Online** or **View full text**. It never
+chooses physical-item, scan, interlibrary-loan, or publisher-terms actions.
+Those remain explicit human decisions. A custom resolver host outside the
+packaged extension permissions remains assisted.
+
+Grant optional extension host permissions only for publisher sites you use.
 While nonterminal handoff jobs exist, the extension maintains one pinned, muted
 resolver tab and periodically reloads it to keep a research session warm. If an
 IdP redirect is detected, it pauses reloads, brings the tab forward, and marks a

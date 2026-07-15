@@ -16,6 +16,11 @@
     "scripting",
     "storage"
   ],
+  "host_permissions": [
+    "https://*.alma.exlibrisgroup.com/*",
+    "https://*.primo.exlibrisgroup.com/*",
+    "https://onesearch.library.example-institute.edu/*"
+  ],
   "optional_host_permissions": [
     "https://www.jstor.org/*",
     "https://www.proquest.com/*",

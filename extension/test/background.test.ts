@@ -16,6 +16,7 @@ import {
   type TabChangeInfo,
   type TabInfo,
 } from "../src/background";
+import { routeResolverService } from "../src/resolver";
 
 const OPENURL = "https://resolver.example.edu/openurl?ctx=abc";
 const PROVIDER_HOST = "www.jstor.org";
@@ -433,6 +434,44 @@ test("a warm resolver landing releases queued handoffs without an auth event", a
   expect(h.backend.store.lastAuthReturnedAt).toBe(h.clock.now);
   expect(h.frames().some((frame) => frame.type === "auth_returned")).toBe(false);
 });
+test("a tracked resolver landing routes its electronic service only with origin permission", async () => {
+  const h = makeHarness();
+  const injections: Parameters<BridgeDeps["scripting"]["executeScript"]>[0][] = [];
+  h.deps.permissions.contains = async ({ origins }) =>
+    origins.length === 1 && origins[0] === "https://resolver.example.edu/*";
+  h.deps.scripting.executeScript = async (injection) => {
+    injections.push(injection);
+    return [{ result: { kind: "routed", service: "JSTOR scholarly archive" } }];
+  };
+
+  await h.bridge.start();
+  await h.port.inbound(jobOffer("job_0001a_resolver_route"));
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  await h.tabs.onUpdated.emit(tabID, { url: OPENURL, status: "complete" }, { id: tabID, url: OPENURL });
+
+  expect(injections).toHaveLength(1);
+  expect(injections[0]?.target).toEqual({ tabId: tabID });
+  expect(injections[0]?.func).toBe(routeResolverService);
+  expect(injections[0]?.args).toEqual([null]);
+  expect(h.frames().some((frame) => frame.type === "auth_pending")).toBe(false);
+
+  const denied = makeHarness();
+  let injectedWithoutPermission = false;
+  denied.deps.scripting.executeScript = async () => {
+    injectedWithoutPermission = true;
+    return [];
+  };
+  await denied.bridge.start();
+  await denied.port.inbound(jobOffer("job_0001a_resolver_denied"));
+  const deniedTabID = denied.backend.store.activeJobs[0]?.tab_id ?? -1;
+  await denied.tabs.onUpdated.emit(
+    deniedTabID,
+    { url: OPENURL, status: "complete" },
+    { id: deniedTabID, url: OPENURL },
+  );
+  expect(injectedWithoutPermission).toBe(false);
+});
+
 
 test("a queued handoff falls back to a background tab after 45 seconds", async () => {
   const h = makeHarness();
