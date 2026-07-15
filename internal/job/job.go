@@ -14,8 +14,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"time"
 
+	"papio/internal/artifact"
 	"papio/internal/store"
 	"papio/internal/work"
 )
@@ -712,6 +714,46 @@ func (js *Store) CloseStaleHumanActions(ctx context.Context) error {
 		         AND jobs.state IN ('ready', 'unavailable', 'failed', 'cancelled')
 		   )`, store.Now(), informationalActionKind)
 	return err
+}
+
+// SweepTerminalQuarantine removes abandoned per-job download files only after
+// their jobs become terminal. Human-review states deliberately retain their
+// quarantine directory because action details point users to those files.
+func (js *Store) SweepTerminalQuarantine(ctx context.Context) error {
+	if js == nil || js.S == nil {
+		return errors.New("job store is not initialized")
+	}
+	artifacts, err := artifact.New(filepath.Dir(js.S.Path()))
+	if err != nil {
+		return fmt.Errorf("open artifact layout: %w", err)
+	}
+	rows, err := js.S.DB().QueryContext(ctx, `
+		SELECT id FROM jobs
+		 WHERE state IN ('ready', 'unavailable', 'failed', 'cancelled')`)
+	if err != nil {
+		return err
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, id := range ids {
+		if err := artifacts.CleanQuarantine(id); err != nil {
+			return fmt.Errorf("clean terminal quarantine for %s: %w", id, err)
+		}
+	}
+	return nil
 }
 
 // Get loads one job row with its work-request identity.

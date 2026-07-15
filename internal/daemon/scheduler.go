@@ -21,6 +21,13 @@ type LeaseStore interface {
 	CloseStaleHumanActions(context.Context) error
 }
 
+// terminalQuarantineSweeper is optional so scheduler unit-test stores and
+// alternate implementations remain focused on leasing. job.Store implements it
+// to remove only terminal jobs' abandoned downloads.
+type terminalQuarantineSweeper interface {
+	SweepTerminalQuarantine(context.Context) error
+}
+
 // Processor performs the application work for one leased job.
 type Processor interface {
 	Process(context.Context, *job.Row) error
@@ -112,6 +119,7 @@ func (s *Scheduler) Run(ctx context.Context) error {
 	// This repairs historical terminal actions. It is deliberately best-effort:
 	// queued work recovery remains available if cleanup is temporarily blocked.
 	_ = s.Store.CloseStaleHumanActions(ctx)
+	s.sweepTerminalQuarantine(ctx)
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	maintenanceDone := make(chan struct{})
@@ -168,10 +176,13 @@ func (s *Scheduler) Run(ctx context.Context) error {
 }
 
 func (s *Scheduler) maintenance(ctx context.Context) {
+	if s.Config.Maintenance != nil {
+		_ = s.Config.Maintenance.RunDue(ctx)
+	}
+	s.sweepTerminalQuarantine(ctx)
 	if s.Config.Maintenance == nil {
 		return
 	}
-	_ = s.Config.Maintenance.RunDue(ctx)
 	ticker := time.NewTicker(s.Config.MaintenanceInterval)
 	defer ticker.Stop()
 	for {
@@ -180,8 +191,19 @@ func (s *Scheduler) maintenance(ctx context.Context) {
 			return
 		case <-ticker.C:
 			_ = s.Config.Maintenance.RunDue(ctx)
+			s.sweepTerminalQuarantine(ctx)
 		}
 	}
+}
+
+// sweepTerminalQuarantine is best-effort maintenance. A cleanup failure must
+// never stop acquisition or conceal a successfully recovered job.
+func (s *Scheduler) sweepTerminalQuarantine(ctx context.Context) {
+	sweeper, ok := s.Store.(terminalQuarantineSweeper)
+	if !ok {
+		return
+	}
+	_ = sweeper.SweepTerminalQuarantine(ctx)
 }
 func (s *Scheduler) worker(ctx context.Context, owner string) error {
 	for {
