@@ -73,6 +73,16 @@ func (s *fakeLeaseStore) counts() (recovered, swept, released int) {
 	return s.recovered, s.swept, s.released
 }
 
+type fakeMaintenance struct{ calls chan struct{} }
+
+func (m *fakeMaintenance) RunDue(context.Context) error {
+	select {
+	case m.calls <- struct{}{}:
+	default:
+	}
+	return nil
+}
+
 func TestAutostarterUsesExecutableCommandSeamOnce(t *testing.T) {
 	var starts int
 	var calls [][]string
@@ -173,6 +183,38 @@ func TestSchedulerProcessesQueuedJobAndHeartbeats(t *testing.T) {
 	}
 	if released == 0 {
 		t.Fatal("scheduler did not release completed lease")
+	}
+}
+
+func TestSchedulerRunsMaintenanceHookWithoutAffectingWorkers(t *testing.T) {
+	maintenance := &fakeMaintenance{calls: make(chan struct{}, 1)}
+	scheduler, err := NewScheduler(
+		&fakeLeaseStore{heartbeats: make(chan struct{}, 1)},
+		ProcessorFunc(func(context.Context, *job.Row) error { return nil }),
+		SchedulerConfig{
+			Owner: "maintenance-worker", LeaseDuration: time.Second, HeartbeatInterval: 100 * time.Millisecond,
+			PollInterval: time.Millisecond, Maintenance: maintenance, MaintenanceInterval: time.Hour,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- scheduler.Run(ctx) }()
+	select {
+	case <-maintenance.calls:
+	case <-time.After(time.Second):
+		t.Fatal("scheduler did not run maintenance")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("scheduler did not stop after cancellation")
 	}
 }
 
@@ -436,7 +478,7 @@ func (s *heartbeatFailureStore) Heartbeat(context.Context, string, string, time.
 
 func (s *heartbeatFailureStore) Release(context.Context, string, string) error  { return nil }
 func (s *heartbeatFailureStore) RecoverStale(context.Context) ([]string, error) { return nil, nil }
-func (s *heartbeatFailureStore) CloseStaleHumanActions(context.Context) error { return nil }
+func (s *heartbeatFailureStore) CloseStaleHumanActions(context.Context) error   { return nil }
 
 func TestSchedulerReturnsHeartbeatStorageFailure(t *testing.T) {
 	want := errors.New("lease store unavailable")
@@ -539,7 +581,7 @@ func (s claimFailureStore) ClaimNext(context.Context, string, time.Duration) (*j
 func (claimFailureStore) Heartbeat(context.Context, string, string, time.Duration) error { return nil }
 func (claimFailureStore) Release(context.Context, string, string) error                  { return nil }
 func (claimFailureStore) RecoverStale(context.Context) ([]string, error)                 { return nil, nil }
-func (claimFailureStore) CloseStaleHumanActions(context.Context) error                  { return nil }
+func (claimFailureStore) CloseStaleHumanActions(context.Context) error                   { return nil }
 
 func TestSchedulerReturnsQueuedWorkerFailure(t *testing.T) {
 	want := errors.New("claim failure")

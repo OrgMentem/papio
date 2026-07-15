@@ -340,17 +340,21 @@ func newDoctorCommand(opt *options) *cobra.Command {
 			if opt.jsonOutput {
 				return opt.printJSON(report)
 			}
-			for _, check := range report.Checks {
-				if _, err := fmt.Fprintf(opt.out, "%-4s  %-24s %s\n", strings.ToUpper(check.Status), check.Name, check.Detail); err != nil {
-					return err
-				}
-				if check.Remediation != "" {
-					if _, err := fmt.Fprintf(opt.out, "      %s\n", check.Remediation); err != nil {
-						return err
-					}
-				}
-			}
-			return nil
+			return renderDoctorReport(opt.out, report)
 		},
 	}
+}
+
+func renderDoctorReport(out io.Writer, report doctor.Report) error {
+	for _, check := range report.Checks {
+		if _, err := fmt.Fprintf(out, "%-4s  %-24s %s\n", strings.ToUpper(check.Status), check.Name, check.Detail); err != nil {
+			return err
+		}
+		if check.Remediation != "" {
+			if _, err := fmt.Fprintf(out, "      %s\n", check.Remediation); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }

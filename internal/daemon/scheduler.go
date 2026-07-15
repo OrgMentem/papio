@@ -32,13 +32,21 @@ type ProcessorFunc func(context.Context, *job.Row) error
 // Process implements Processor.
 func (f ProcessorFunc) Process(ctx context.Context, row *job.Row) error { return f(ctx, row) }
 
-// SchedulerConfig controls worker, lease, and polling behavior.
+// MaintenanceRunner performs one bounded best-effort periodic maintenance
+// pass. Its errors never terminate acquisition workers.
+type MaintenanceRunner interface {
+	RunDue(context.Context) error
+}
+
+// SchedulerConfig controls worker, lease, polling, and periodic maintenance behavior.
 type SchedulerConfig struct {
-	Owner             string
-	Workers           int
-	LeaseDuration     time.Duration
-	HeartbeatInterval time.Duration
-	PollInterval      time.Duration
+	Owner               string
+	Workers             int
+	LeaseDuration       time.Duration
+	HeartbeatInterval   time.Duration
+	PollInterval        time.Duration
+	Maintenance         MaintenanceRunner
+	MaintenanceInterval time.Duration
 }
 
 // Scheduler claims durable jobs and processes them while renewing their lease.
@@ -79,6 +87,9 @@ func NewScheduler(store LeaseStore, processor Processor, cfg SchedulerConfig) (*
 	if cfg.PollInterval <= 0 {
 		cfg.PollInterval = 100 * time.Millisecond
 	}
+	if cfg.Maintenance != nil && cfg.MaintenanceInterval <= 0 {
+		cfg.MaintenanceInterval = time.Minute
+	}
 	return &Scheduler{Store: store, Processor: processor, Config: cfg}, nil
 }
 
@@ -103,6 +114,11 @@ func (s *Scheduler) Run(ctx context.Context) error {
 	_ = s.Store.CloseStaleHumanActions(ctx)
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	maintenanceDone := make(chan struct{})
+	go func() {
+		defer close(maintenanceDone)
+		s.maintenance(runCtx)
+	}()
 
 	errs := make(chan error, s.Config.Workers)
 	var workers sync.WaitGroup
@@ -126,12 +142,16 @@ func (s *Scheduler) Run(ctx context.Context) error {
 	case <-ctx.Done():
 		cancel()
 		<-finished
+		<-maintenanceDone
 		return nil
 	case err := <-errs:
 		cancel()
 		<-finished
+		<-maintenanceDone
 		return err
 	case <-finished:
+		cancel()
+		<-maintenanceDone
 		// A worker sends its error before it terminates, so a closed finished
 		// channel may race with an already queued fatal error. Preserve the
 		// causative failure rather than replacing it with a generic message.
@@ -147,6 +167,22 @@ func (s *Scheduler) Run(ctx context.Context) error {
 	}
 }
 
+func (s *Scheduler) maintenance(ctx context.Context) {
+	if s.Config.Maintenance == nil {
+		return
+	}
+	_ = s.Config.Maintenance.RunDue(ctx)
+	ticker := time.NewTicker(s.Config.MaintenanceInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			_ = s.Config.Maintenance.RunDue(ctx)
+		}
+	}
+}
 func (s *Scheduler) worker(ctx context.Context, owner string) error {
 	for {
 		row, err := s.Store.ClaimNext(ctx, owner, s.Config.LeaseDuration)

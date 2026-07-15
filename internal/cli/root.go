@@ -43,10 +43,12 @@ func NewRoot(out, errOut io.Writer) *cobra.Command {
 	root.PersistentFlags().StringVar(&opt.configPath, "config", "", "config TOML path")
 	root.PersistentFlags().BoolVar(&opt.jsonOutput, "json", false, "emit structured JSON")
 	root.AddCommand(
+		newInitCommand(opt),
 		newConfigCommand(opt),
 		newAcquireCommand(opt),
 		newBatchCommand(opt),
 		newSearchCommand(opt),
+		newWatchCommand(opt),
 		newJobsCommand(opt),
 		newStatusCommand(opt),
 		newActionsCommand(opt),

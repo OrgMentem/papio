@@ -20,6 +20,7 @@ import (
 	"papio/internal/ipc"
 	"papio/internal/job"
 	"papio/internal/protocol"
+	"papio/internal/watch"
 	"papio/internal/zotio"
 )
 
@@ -67,6 +68,18 @@ func RouterWithShutdown(system *bootstrap.System, shutdown context.CancelFunc) i
 		},
 		"discovery.search": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return searchDiscovery(ctx, raw, system)
+		},
+		"watch.add": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return addWatch(ctx, raw, system)
+		},
+		"watch.list": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return listWatches(ctx, raw, system)
+		},
+		"watch.remove": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return removeWatch(ctx, raw, system)
+		},
+		"watch.run": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return runWatch(ctx, raw, system)
 		},
 		"jobs.list": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return listJobs(ctx, raw, system)
@@ -241,6 +254,76 @@ func zotioLookupWorks(ctx context.Context, raw json.RawMessage, system *bootstra
 	return marshal(result)
 }
 
+// WatchRemoveResult confirms removal of one scheduled watch.
+type WatchRemoveResult struct {
+	ID      int64 `json:"id"`
+	Removed bool  `json:"removed"`
+}
+
+func addWatch(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
+	var input watch.CreateInput
+	if err := ipc.DecodeParams(raw, &input); err != nil {
+		return badParams(err)
+	}
+	if system == nil || system.Watches == nil {
+		return nil, &ipc.RPCError{Code: "precondition_failed", Message: "watchlists are not configured"}
+	}
+	created, err := system.Watches.Create(ctx, input)
+	if err != nil {
+		return badParams(err)
+	}
+	return marshal(created)
+}
+
+func listWatches(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
+	var params struct{}
+	if err := ipc.DecodeParams(raw, &params); err != nil {
+		return badParams(err)
+	}
+	if system == nil || system.Watches == nil {
+		return nil, &ipc.RPCError{Code: "precondition_failed", Message: "watchlists are not configured"}
+	}
+	watches, err := system.Watches.List(ctx)
+	if err != nil {
+		return failure(err)
+	}
+	return marshal(watches)
+}
+
+func removeWatch(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
+	var params watch.IDInput
+	if err := ipc.DecodeParams(raw, &params); err != nil || params.ID <= 0 {
+		if err == nil {
+			err = errors.New("watch id is required")
+		}
+		return badParams(err)
+	}
+	if system == nil || system.Watches == nil {
+		return nil, &ipc.RPCError{Code: "precondition_failed", Message: "watchlists are not configured"}
+	}
+	if err := system.Watches.Remove(ctx, params.ID); err != nil {
+		return failure(err)
+	}
+	return marshal(WatchRemoveResult{ID: params.ID, Removed: true})
+}
+
+func runWatch(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
+	var params watch.IDInput
+	if err := ipc.DecodeParams(raw, &params); err != nil || params.ID <= 0 {
+		if err == nil {
+			err = errors.New("watch id is required")
+		}
+		return badParams(err)
+	}
+	if system == nil || system.WatchRunner == nil {
+		return nil, &ipc.RPCError{Code: "precondition_failed", Message: "watchlists are not configured"}
+	}
+	result, err := system.WatchRunner.Run(ctx, params.ID)
+	if err != nil {
+		return failure(err)
+	}
+	return marshal(result)
+}
 func listJobs(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
 	var params struct {
 		State string `json:"state,omitempty"`

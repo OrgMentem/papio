@@ -30,6 +30,7 @@ import (
 	"papio/internal/resolvers/openalex"
 	"papio/internal/resolvers/unpaywall"
 	"papio/internal/store"
+	"papio/internal/watch"
 	"papio/internal/work"
 	"papio/internal/zotio"
 	"sync"
@@ -51,6 +52,8 @@ type System struct {
 	PDFCapability pdf.Capability
 	WorkerBinary  string
 	Discovery     *discovery.Client
+	Watches       *watch.Store
+	WatchRunner   *watch.Runner
 	Zotio         *zotio.Service
 }
 
@@ -135,8 +138,11 @@ func New(ctx context.Context, cfg config.Config) (*System, error) {
 
 	entries := resolverEntries(cfg, metadataClient)
 	service := app.New(cfg, jobs, artifacts, budgets)
+	var watchNotifier notify.Sender
 	if cfg.Notify.Enabled {
-		service.Notifier = notify.NewCoalescer(notify.NewMacOS())
+		desktopNotifier := notify.NewMacOS()
+		service.Notifier = notify.NewCoalescer(desktopNotifier)
+		watchNotifier = desktopNotifier
 	}
 	service.Resolvers = entries
 	service.Fetch = func(ctx context.Context, candidate resolver.Candidate, path string) (fetch.Result, error) {
@@ -168,16 +174,6 @@ func New(ctx context.Context, cfg config.Config) (*System, error) {
 		}, validationOptions)
 	}
 
-	scheduler, err := daemon.NewScheduler(jobs, service, daemon.SchedulerConfig{
-		Owner:             job.NewID("daemon"),
-		Workers:           3,
-		LeaseDuration:     60 * time.Second,
-		HeartbeatInterval: 15 * time.Second,
-		PollInterval:      250 * time.Millisecond,
-	})
-	if err != nil {
-		return nil, err
-	}
 	bundleExporter := &bundle.Exporter{Jobs: jobs, Artifacts: artifacts, DataDir: cfg.DataDir}
 	zotioService := &zotio.Service{
 		CLI: zotio.New(cfg.Zotio), Submitter: service,
@@ -185,12 +181,32 @@ func New(ctx context.Context, cfg config.Config) (*System, error) {
 		AttachmentMode: cfg.Zotio.AttachmentMode, AutoEnrich: cfg.Zotio.AutoEnrich,
 	}
 	service.AutoImporter = newSerialAutoImporter(zotioService)
+	discoveryClient := discovery.NewWithOptions(discovery.Options{
+		ContactEmail: cfg.Email, BaseURL: cfg.Sources[config.SourceOpenAlex].BaseURLForDev,
+	})
+	watches := watch.NewStore(db)
+	watchRunner := &watch.Runner{
+		Store: watches, Discovery: discoveryClient, Lookup: zotioService, Submitter: service,
+		Notifier: watchNotifier, DataDir: cfg.DataDir,
+	}
+	scheduler, err := daemon.NewScheduler(jobs, service, daemon.SchedulerConfig{
+		Owner:               job.NewID("daemon"),
+		Workers:             3,
+		LeaseDuration:       60 * time.Second,
+		HeartbeatInterval:   15 * time.Second,
+		PollInterval:        250 * time.Millisecond,
+		Maintenance:         watchRunner,
+		MaintenanceInterval: time.Minute,
+	})
+	if err != nil {
+		return nil, err
+	}
 	system := &System{
 		Config: cfg, Store: db, Jobs: jobs, Artifacts: artifacts, Budgets: budgets,
-		App: service, Scheduler: scheduler,
+		App: service, Scheduler: scheduler, Watches: watches, WatchRunner: watchRunner,
 		Bundle:        bundleExporter,
 		Browser:       browser.NewBridge(jobs, service, cfg),
-		Discovery:     discovery.NewWithOptions(discovery.Options{ContactEmail: cfg.Email, BaseURL: cfg.Sources[config.SourceOpenAlex].BaseURLForDev}),
+		Discovery:     discoveryClient,
 		Zotio:         zotioService,
 		PDFCapability: capability, WorkerBinary: executable,
 	}

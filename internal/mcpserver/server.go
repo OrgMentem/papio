@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"strings"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -15,6 +17,7 @@ import (
 	"papio/internal/batch"
 	"papio/internal/bootstrap"
 	"papio/internal/discovery"
+	"papio/internal/ipc"
 	"papio/internal/job"
 	"papio/internal/protocol"
 	"papio/internal/zotio"
@@ -84,10 +87,162 @@ type BatchReportInput struct {
 	Format  string `json:"format,omitempty" jsonschema:"json or markdown; defaults to json"`
 }
 
+// StatusSnapshot is the current active and recently completed job view.
+type StatusSnapshot struct {
+	GeneratedAt string        `json:"generated_at"`
+	Groups      []StatusGroup `json:"groups"`
+}
+
+// StatusGroup groups jobs by their user-visible acquisition phase.
+type StatusGroup struct {
+	Phase string      `json:"phase"`
+	Jobs  []StatusJob `json:"jobs"`
+}
+
+// StatusJob is one concise job record in StatusSnapshot.
+type StatusJob struct {
+	ID           string `json:"id"`
+	Title        string `json:"title"`
+	Provider     string `json:"provider"`
+	State        string `json:"state"`
+	Age          string `json:"age"`
+	Reason       string `json:"reason,omitempty"`
+	ImportStatus string `json:"import_status,omitempty"`
+}
+
+// ActionsListOutput exposes open human actions that need local inspection.
+type ActionsListOutput struct {
+	Actions []job.HumanAction `json:"actions"`
+}
+
+// ActionsResolveInput resolves one verify_identity action after inspecting its
+// local quarantine artifact.
+type ActionsResolveInput struct {
+	ActionID int64  `json:"action_id" jsonschema:"open verify_identity action ID"`
+	Verdict  string `json:"verdict" jsonschema:"accept or reject; accept asserts that a human or agent verified the quarantined artifact is the requested work"`
+}
+
+// ActionsResolveOutput is the new job state after resolving one human action.
+type ActionsResolveOutput struct {
+	JobID string `json:"job_id"`
+	State string `json:"state"`
+}
+
+// BatchWaitInput bounds one wait for a persisted acquisition batch.
+type BatchWaitInput struct {
+	BatchID        string `json:"batch_id" jsonschema:"batch ID returned by papio acquire --batch, or latest"`
+	TimeoutSeconds int    `json:"timeout_seconds,omitempty" jsonschema:"maximum wait in seconds, 1 through 600; defaults to 300"`
+	PollSeconds    int    `json:"poll_seconds,omitempty" jsonschema:"seconds between reports; defaults to 5"`
+}
+
+// BatchWaitOutput returns the final daemon report and whether it fully settled.
+type BatchWaitOutput struct {
+	Report  *batch.Report `json:"report"`
+	Settled bool          `json:"settled"`
+}
+
+// WatchFiltersInput narrows discovery results for a scheduled watch.
+type WatchFiltersInput struct {
+	YearFrom int  `json:"year_from,omitempty"`
+	YearTo   int  `json:"year_to,omitempty"`
+	OAOnly   bool `json:"oa_only,omitempty"`
+}
+
+// WatchAddInput creates one scheduled discovery watch.
+type WatchAddInput struct {
+	Label        string             `json:"label,omitempty" jsonschema:"optional display label; defaults to query"`
+	Query        string             `json:"query" jsonschema:"scholarly discovery query"`
+	Filters      *WatchFiltersInput `json:"filters,omitempty" jsonschema:"optional discovery filters"`
+	Collection   string             `json:"collection,omitempty" jsonschema:"optional Zotero collection key for discovered work"`
+	CadenceHours int                `json:"cadence_hours" jsonschema:"positive interval between runs in hours"`
+	PerRunCap    int                `json:"per_run_cap,omitempty" jsonschema:"maximum newly discovered works per run; defaults to 10"`
+}
+
+// WatchOutput is the durable state of one scheduled discovery watch.
+type WatchOutput struct {
+	ID                  int64             `json:"id"`
+	Label               string            `json:"label"`
+	Query               string            `json:"query"`
+	Filters             WatchFiltersInput `json:"filters"`
+	Collection          string            `json:"collection,omitempty"`
+	CadenceHours        int               `json:"cadence_hours"`
+	PerRunCap           int               `json:"per_run_cap"`
+	Enabled             bool              `json:"enabled"`
+	LastRunAt           string            `json:"last_run_at,omitempty"`
+	CreatedAt           string            `json:"created_at"`
+	ConsecutiveFailures int               `json:"consecutive_failures"`
+	LastError           string            `json:"last_error,omitempty"`
+}
+
+// WatchListOutput groups the watch rows under one structured MCP output.
+type WatchListOutput struct {
+	Watches []WatchOutput `json:"watches"`
+}
+
+// WatchRemoveInput identifies one scheduled watch to remove.
+type WatchRemoveInput struct {
+	ID int64 `json:"id" jsonschema:"scheduled watch ID"`
+}
+
+// WatchRemoveOutput confirms removal of one scheduled watch.
+type WatchRemoveOutput struct {
+	ID      int64 `json:"id"`
+	Removed bool  `json:"removed"`
+}
+
+type rpcCaller interface {
+	Call(context.Context, string, any, any) error
+}
+
+// localRPCCaller preserves the local RPC contracts for MCP handlers while the
+// MCP process owns the same configured services as the CLI.
+type localRPCCaller struct {
+	router ipc.Router
+}
+
+func newLocalRPCCaller(system *bootstrap.System) rpcCaller {
+	if system == nil {
+		return localRPCCaller{}
+	}
+	return localRPCCaller{router: api.Router(system)}
+}
+
+func (c localRPCCaller) Call(ctx context.Context, method string, params, result any) error {
+	if c.router.Methods == nil {
+		return fmt.Errorf("Papio RPC is not configured")
+	}
+	raw, err := json.Marshal(params)
+	if err != nil {
+		return err
+	}
+	response, rpcErr := c.router.Handle(ctx, ipc.Request{Method: method, Params: raw})
+	if rpcErr != nil {
+		return rpcErr
+	}
+	if result == nil {
+		return nil
+	}
+	return json.Unmarshal(response, result)
+}
+
+type toolDependencies struct {
+	caller rpcCaller
+	now    func() time.Time
+	wait   func(context.Context, time.Duration) error
+}
+
+func defaultToolDependencies(caller rpcCaller) toolDependencies {
+	return toolDependencies{caller: caller, now: time.Now, wait: waitForPoll}
+}
+
 // New builds one MCP server. Zotero writes are deliberately unreachable from
 // every tool except papio_zotio_apply, which requires an immutable plan ID and
 // its exact confirmation digest.
 func New(system *bootstrap.System) *mcp.Server {
+	return newServer(system, defaultToolDependencies(newLocalRPCCaller(system)))
+}
+
+func newServer(system *bootstrap.System, dependencies toolDependencies) *mcp.Server {
 	server := mcp.NewServer(&mcp.Implementation{
 		Name: "papio", Title: "Papio paper acquisition", Version: Version,
 	}, &mcp.ServerOptions{
@@ -176,6 +331,8 @@ func New(system *bootstrap.System) *mcp.Server {
 		}
 	})
 
+	addLoopClosureTools(server, dependencies)
+
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "papio_export_bundle", Title: "Export an acquisition bundle",
 		Description: "Export or idempotently reuse the validated PDF and provenance bundle for one ready job.",
@@ -229,6 +386,358 @@ func New(system *bootstrap.System) *mcp.Server {
 // Run serves MCP over stdin/stdout until the client disconnects.
 func Run(ctx context.Context, system *bootstrap.System) error {
 	return New(system).Run(ctx, &mcp.StdioTransport{})
+}
+
+type StatusInput struct{}
+
+type ActionsListInput struct{}
+
+func addLoopClosureTools(server *mcp.Server, dependencies toolDependencies) {
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "papio_status", Title: "Summarize Papio jobs",
+		Description: "Return active and recently completed acquisition jobs grouped into the same working, human-review, ready, and failed phases as papio status. Read-only.",
+		Annotations: readAnnotations(),
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, _ StatusInput) (*mcp.CallToolResult, StatusSnapshot, error) {
+		snapshot, err := loadStatusSnapshot(ctx, dependencies.caller, dependencies.now())
+		return nil, snapshot, err
+	})
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "papio_actions_list", Title: "List open human actions",
+		Description: "Return open human actions with their action ID, job ID, kind, and detail. verify_identity detail intentionally includes the local quarantine path so the calling agent can inspect that file.",
+		Annotations: readAnnotations(),
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, _ ActionsListInput) (*mcp.CallToolResult, ActionsListOutput, error) {
+		var actions []job.HumanAction
+		if err := dependencies.call(ctx, "actions.list", map[string]bool{"open_only": true}, &actions); err != nil {
+			return nil, ActionsListOutput{}, err
+		}
+		return nil, ActionsListOutput{Actions: actions}, nil
+	})
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "papio_actions_resolve", Title: "Resolve a verified identity action",
+		Description: "Resolve only an open verify_identity action. accept asserts that a human or calling agent inspected the local quarantine artifact and verified it is the requested work; reject records that it is not.",
+		Annotations: additiveAnnotations(false),
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, input ActionsResolveInput) (*mcp.CallToolResult, ActionsResolveOutput, error) {
+		var output ActionsResolveOutput
+		if err := dependencies.call(ctx, "actions.resolve", map[string]any{"action_id": input.ActionID, "verdict": input.Verdict}, &output); err != nil {
+			return nil, ActionsResolveOutput{}, err
+		}
+		return nil, output, nil
+	})
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "papio_batch_wait", Title: "Wait for batch outcomes",
+		Description: "Poll acquire.report for one batch until every work has a settled outcome, including an explicit human-review outcome, or the bounded timeout expires. Does not submit, import, or resolve work.",
+		Annotations: readAnnotations(),
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, input BatchWaitInput) (*mcp.CallToolResult, BatchWaitOutput, error) {
+		output, err := waitForBatch(ctx, dependencies, input)
+		return nil, output, err
+	})
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "papio_watch_add", Title: "Add a scheduled discovery watch",
+		Description: "Create a bounded scheduled discovery watch. Each run searches for matching work and applies Papio's existing batch, ownership, auto-import, collection, and notification policy.",
+		Annotations: additiveAnnotations(false),
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, input WatchAddInput) (*mcp.CallToolResult, WatchOutput, error) {
+		var output WatchOutput
+		if err := dependencies.call(ctx, "watch.add", input, &output); err != nil {
+			return nil, WatchOutput{}, err
+		}
+		return nil, output, nil
+	})
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "papio_watch_list", Title: "List scheduled discovery watches",
+		Description: "List scheduled discovery watches and their last run state. Read-only.",
+		Annotations: readAnnotations(),
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, WatchListOutput, error) {
+		var watches []WatchOutput
+		if err := dependencies.call(ctx, "watch.list", map[string]any{}, &watches); err != nil {
+			return nil, WatchListOutput{}, err
+		}
+		return nil, WatchListOutput{Watches: watches}, nil
+	})
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "papio_watch_remove", Title: "Remove a scheduled discovery watch",
+		Description: "Permanently remove one scheduled discovery watch. This does not delete any jobs or Zotero items created by prior watch runs.",
+		Annotations: destructiveAnnotations(),
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, input WatchRemoveInput) (*mcp.CallToolResult, WatchRemoveOutput, error) {
+		var output WatchRemoveOutput
+		if err := dependencies.call(ctx, "watch.remove", input, &output); err != nil {
+			return nil, WatchRemoveOutput{}, err
+		}
+		return nil, output, nil
+	})
+}
+
+func (d toolDependencies) call(ctx context.Context, method string, params, result any) error {
+	if d.caller == nil {
+		return fmt.Errorf("Papio RPC is not configured")
+	}
+	return d.caller.Call(ctx, method, params, result)
+}
+
+const (
+	statusRecentWindow             = 24 * time.Hour
+	defaultBatchWaitTimeoutSeconds = 300
+	maxBatchWaitTimeoutSeconds     = 600
+	defaultBatchWaitPollSeconds    = 5
+)
+
+func loadStatusSnapshot(ctx context.Context, caller rpcCaller, now time.Time) (StatusSnapshot, error) {
+	if caller == nil {
+		return StatusSnapshot{}, fmt.Errorf("Papio RPC is not configured")
+	}
+	var rows []job.Row
+	if err := caller.Call(ctx, "jobs.list", map[string]int{"limit": 500}, &rows); err != nil {
+		return StatusSnapshot{}, err
+	}
+
+	details := make(map[string]api.JobDetail, len(rows))
+	for _, row := range rows {
+		if !showStatusRow(row, now) {
+			continue
+		}
+		var detail api.JobDetail
+		if err := caller.Call(ctx, "jobs.get", map[string]string{"job_id": row.ID}, &detail); err != nil {
+			return StatusSnapshot{}, err
+		}
+		details[row.ID] = detail
+	}
+	return buildStatusSnapshot(rows, details, now), nil
+}
+
+func buildStatusSnapshot(rows []job.Row, details map[string]api.JobDetail, now time.Time) StatusSnapshot {
+	groups := map[string][]StatusJob{
+		"working":            nil,
+		"awaiting_human":     nil,
+		"needs_review":       nil,
+		"ready":              nil,
+		"failed_unavailable": nil,
+	}
+	for _, row := range rows {
+		if !showStatusRow(row, now) {
+			continue
+		}
+
+		group := statusPhase(row.State)
+		if group == "" {
+			continue
+		}
+		detail := details[row.ID]
+		item := StatusJob{
+			ID:       row.ID,
+			Title:    shortTitle(row.Work.Describe()),
+			Provider: eventProvider(detail.Events),
+			State:    row.State,
+			Age:      formatStatusAge(row.UpdatedAt, now),
+		}
+		if item.Title == "" {
+			item.Title = "(untitled)"
+		}
+		if group == "awaiting_human" || group == "needs_review" {
+			item.Reason = transitionReason(detail.Events, row.State)
+		}
+		if group == "ready" {
+			item.ImportStatus = autoImportStatus(detail.Events)
+		}
+		groups[group] = append(groups[group], item)
+	}
+
+	ordered := []struct {
+		phase string
+		label string
+	}{
+		{"working", "working"},
+		{"awaiting_human", "awaiting_human"},
+		{"needs_review", "needs_review"},
+		{"ready", "ready (last 24h)"},
+		{"failed_unavailable", "failed / unavailable"},
+	}
+	snapshot := StatusSnapshot{GeneratedAt: now.UTC().Format(time.RFC3339Nano)}
+	for _, group := range ordered {
+		if len(groups[group.phase]) != 0 {
+			snapshot.Groups = append(snapshot.Groups, StatusGroup{Phase: group.label, Jobs: groups[group.phase]})
+		}
+	}
+	return snapshot
+}
+
+func showStatusRow(row job.Row, now time.Time) bool {
+	if !job.Terminal(row.State) {
+		return true
+	}
+	updated, err := time.Parse(time.RFC3339Nano, row.UpdatedAt)
+	return err == nil && !updated.Before(now.Add(-statusRecentWindow))
+}
+
+func statusPhase(state string) string {
+	switch state {
+	case job.StateQueued, job.StateResolving, job.StateFetching, job.StateValidating, job.StateRetryWait:
+		return "working"
+	case job.StateAwaitingHuman:
+		return "awaiting_human"
+	case job.StateNeedsReview:
+		return "needs_review"
+	case job.StateReady:
+		return "ready"
+	case job.StateFailed, job.StateUnavailable, job.StateCancelled:
+		return "failed_unavailable"
+	default:
+		return ""
+	}
+}
+
+func eventProvider(events []map[string]any) string {
+	for i := len(events) - 1; i >= 0; i-- {
+		if value := eventDetailString(events[i], "source"); value != "" {
+			return value
+		}
+	}
+	return "—"
+}
+
+func transitionReason(events []map[string]any, state string) string {
+	for i := len(events) - 1; i >= 0; i-- {
+		if events[i]["kind"] != "job.transition" || eventDetailString(events[i], "to") != state {
+			continue
+		}
+		if reason := eventDetailString(events[i], "reason"); reason != "" {
+			return shortText(reason, 72)
+		}
+	}
+	return "—"
+}
+
+func autoImportStatus(events []map[string]any) string {
+	for i := len(events) - 1; i >= 0; i-- {
+		if events[i]["kind"] == "zotio.auto_import" {
+			if status := eventDetailString(events[i], "status"); status != "" {
+				return status
+			}
+		}
+	}
+	return "—"
+}
+
+func eventDetailString(event map[string]any, key string) string {
+	detail, _ := event["detail"].(map[string]any)
+	value, _ := detail[key].(string)
+	return value
+}
+
+func shortTitle(value string) string { return shortText(value, 50) }
+
+func shortText(value string, limit int) string {
+	value = strings.Join(strings.Fields(value), " ")
+	if limit <= 0 {
+		return ""
+	}
+	runes := []rune(value)
+	if len(runes) <= limit {
+		return value
+	}
+	if limit == 1 {
+		return "…"
+	}
+	return string(runes[:limit-1]) + "…"
+}
+
+func formatStatusAge(timestamp string, now time.Time) string {
+	at, err := time.Parse(time.RFC3339Nano, timestamp)
+	if err != nil {
+		return "—"
+	}
+	age := now.Sub(at)
+	if age <= 0 || age < time.Minute {
+		return "now"
+	}
+	if age < time.Hour {
+		return fmt.Sprintf("%dm", int(age/time.Minute))
+	}
+	if age < 24*time.Hour {
+		return fmt.Sprintf("%dh", int(age/time.Hour))
+	}
+	return fmt.Sprintf("%dd", int(age/(24*time.Hour)))
+}
+
+func waitForBatch(ctx context.Context, dependencies toolDependencies, input BatchWaitInput) (BatchWaitOutput, error) {
+	batchID := strings.TrimSpace(input.BatchID)
+	if batchID == "" {
+		return BatchWaitOutput{}, fmt.Errorf("batch_id is required")
+	}
+	timeoutSeconds := input.TimeoutSeconds
+	if timeoutSeconds == 0 {
+		timeoutSeconds = defaultBatchWaitTimeoutSeconds
+	}
+	if timeoutSeconds < 0 || timeoutSeconds > maxBatchWaitTimeoutSeconds {
+		return BatchWaitOutput{}, fmt.Errorf("timeout_seconds must be between 1 and %d", maxBatchWaitTimeoutSeconds)
+	}
+	pollSeconds := input.PollSeconds
+	if pollSeconds == 0 {
+		pollSeconds = defaultBatchWaitPollSeconds
+	}
+	if pollSeconds < 0 {
+		return BatchWaitOutput{}, fmt.Errorf("poll_seconds must be positive")
+	}
+	if pollSeconds > timeoutSeconds {
+		pollSeconds = timeoutSeconds
+	}
+
+	deadline := dependencies.now().Add(time.Duration(timeoutSeconds) * time.Second)
+	var output BatchWaitOutput
+	for {
+		var report batch.Report
+		if err := dependencies.call(ctx, "acquire.report", api.AcquireReportParams{BatchID: batchID}, &report); err != nil {
+			return BatchWaitOutput{}, err
+		}
+		output.Report = &report
+		output.Settled = batchReportSettled(&report)
+		if output.Settled {
+			return output, nil
+		}
+
+		remaining := deadline.Sub(dependencies.now())
+		if remaining <= 0 {
+			return output, nil
+		}
+		delay := time.Duration(pollSeconds) * time.Second
+		if delay > remaining {
+			delay = remaining
+		}
+		if err := dependencies.wait(ctx, delay); err != nil {
+			return BatchWaitOutput{}, err
+		}
+	}
+}
+
+func batchReportSettled(report *batch.Report) bool {
+	if report == nil {
+		return false
+	}
+	for _, work := range report.Works {
+		switch work.Outcome {
+		case "imported", "browser_imported", "browser-imported", "browser_fetched_then_imported",
+			"import_failed", "awaiting_human", "needs_review", "failed", "skipped", "skipped_owned",
+			"existing_item_attached", "existing-item attached":
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func waitForPoll(ctx context.Context, duration time.Duration) error {
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 type resourceLoader func(context.Context, *bootstrap.System) (any, error)
@@ -345,4 +854,10 @@ func readAnnotations() *mcp.ToolAnnotations {
 func additiveAnnotations(openWorld bool) *mcp.ToolAnnotations {
 	destructive := false
 	return &mcp.ToolAnnotations{ReadOnlyHint: false, DestructiveHint: &destructive, IdempotentHint: true, OpenWorldHint: &openWorld}
+}
+
+func destructiveAnnotations() *mcp.ToolAnnotations {
+	destructive := true
+	closed := false
+	return &mcp.ToolAnnotations{ReadOnlyHint: false, DestructiveHint: &destructive, IdempotentHint: true, OpenWorldHint: &closed}
 }

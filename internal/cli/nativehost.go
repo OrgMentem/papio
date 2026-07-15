@@ -82,57 +82,16 @@ func newNativeHostCommand(opt *options) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			extID := cfg.Browser.ExtensionID
-			if extID == "" {
-				return fmt.Errorf("browser.extension_id is not set in %s: set it before installing the native host (32 chars a-p; the fixed Chrome extension ID)", cfg.Path)
-			}
-
-			exe, err := os.Executable()
+			result, err := installNativeHost(cfg, manifestDir)
 			if err != nil {
-				return err
-			}
-			if resolved, rErr := filepath.EvalSymlinks(exe); rErr == nil {
-				exe = resolved
-			}
-
-			symlinkPath := nativeHostSymlinkPath()
-			if err := os.MkdirAll(filepath.Dir(symlinkPath), 0o755); err != nil {
-				return err
-			}
-			if err := os.Remove(symlinkPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-				return err
-			}
-			if err := os.Symlink(exe, symlinkPath); err != nil {
-				return err
-			}
-
-			dir, err := resolveManifestDir(manifestDir)
-			if err != nil {
-				return err
-			}
-			if err := os.MkdirAll(dir, 0o755); err != nil {
-				return err
-			}
-			manifestPath := filepath.Join(dir, nativeHostManifestName+".json")
-			manifest := nativeHostManifest{
-				Name:           nativeHostManifestName,
-				Description:    nativeHostDescription,
-				Path:           symlinkPath,
-				Type:           "stdio",
-				AllowedOrigins: []string{"chrome-extension://" + extID + "/"},
-			}
-			if err := writeManifestAtomic(manifestPath, manifest); err != nil {
-				return err
-			}
-			if err := verifyNativeHost(manifestPath, symlinkPath); err != nil {
 				return err
 			}
 			return opt.printResult(map[string]any{
-				"manifest_path": manifestPath,
-				"symlink_path":  symlinkPath,
-				"executable":    exe,
-				"extension_id":  extID,
-			}, "Installed native host:\n  manifest: %s\n  symlink:  %s -> %s", manifestPath, symlinkPath, exe)
+				"manifest_path": result.ManifestPath,
+				"symlink_path":  result.SymlinkPath,
+				"executable":    result.Executable,
+				"extension_id":  result.ExtensionID,
+			}, "Installed native host:\n  manifest: %s\n  symlink:  %s -> %s", result.ManifestPath, result.SymlinkPath, result.Executable)
 		},
 	}
 	install.Flags().StringVar(&manifestDir, "manifest-dir", "", "override the Chrome native-messaging manifest directory")
@@ -209,6 +168,69 @@ func newNativeHostCommand(opt *options) *cobra.Command {
 
 	command.AddCommand(install, uninstall, status)
 	return command
+}
+
+type nativeHostInstallResult struct {
+	ManifestPath string
+	SymlinkPath  string
+	Executable   string
+	ExtensionID  string
+}
+
+// installNativeHost is the shared registration implementation used by both the
+// native-host subcommand and first-run setup.
+func installNativeHost(cfg config.Config, manifestDir string) (nativeHostInstallResult, error) {
+	extID := cfg.Browser.ExtensionID
+	if extID == "" {
+		return nativeHostInstallResult{}, fmt.Errorf("browser.extension_id is not set in %s: set it before installing the native host (32 chars a-p; the fixed Chrome extension ID)", cfg.Path)
+	}
+
+	exe, err := os.Executable()
+	if err != nil {
+		return nativeHostInstallResult{}, err
+	}
+	if resolved, rErr := filepath.EvalSymlinks(exe); rErr == nil {
+		exe = resolved
+	}
+
+	symlinkPath := nativeHostSymlinkPath()
+	if err := os.MkdirAll(filepath.Dir(symlinkPath), 0o755); err != nil {
+		return nativeHostInstallResult{}, err
+	}
+	if err := os.Remove(symlinkPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nativeHostInstallResult{}, err
+	}
+	if err := os.Symlink(exe, symlinkPath); err != nil {
+		return nativeHostInstallResult{}, err
+	}
+
+	dir, err := resolveManifestDir(manifestDir)
+	if err != nil {
+		return nativeHostInstallResult{}, err
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nativeHostInstallResult{}, err
+	}
+	manifestPath := filepath.Join(dir, nativeHostManifestName+".json")
+	manifest := nativeHostManifest{
+		Name:           nativeHostManifestName,
+		Description:    nativeHostDescription,
+		Path:           symlinkPath,
+		Type:           "stdio",
+		AllowedOrigins: []string{"chrome-extension://" + extID + "/"},
+	}
+	if err := writeManifestAtomic(manifestPath, manifest); err != nil {
+		return nativeHostInstallResult{}, err
+	}
+	if err := verifyNativeHost(manifestPath, symlinkPath); err != nil {
+		return nativeHostInstallResult{}, err
+	}
+	return nativeHostInstallResult{
+		ManifestPath: manifestPath,
+		SymlinkPath:  symlinkPath,
+		Executable:   exe,
+		ExtensionID:  extID,
+	}, nil
 }
 
 // writeManifestAtomic writes the manifest as a 0644 file via a same-dir temp

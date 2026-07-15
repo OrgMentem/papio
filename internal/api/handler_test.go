@@ -16,6 +16,7 @@ import (
 	"papio/internal/ipc"
 	"papio/internal/job"
 	"papio/internal/protocol"
+	"papio/internal/watch"
 	"papio/internal/work"
 )
 
@@ -314,6 +315,36 @@ func TestRouterAcquireReportJoinsManifestAgainstLiveJobState(t *testing.T) {
 	}
 	if len(report.Works) != 1 || report.Works[0].Outcome != "imported" || report.Works[0].ParentKey != "PA123" || report.Works[0].AttachmentKey != "AT456" {
 		t.Fatalf("report = %+v", report)
+	}
+}
+
+func TestRouterWatchAddListAndRemove(t *testing.T) {
+	system := testSystem(t)
+	router := Router(system)
+	input := watch.CreateInput{
+		Query: "evidence synthesis", Filters: watch.Filters{YearFrom: 2020, OAOnly: true},
+		Collection: "Reading", CadenceHours: 24, PerRunCap: 3,
+	}
+	var created watch.Watch
+	if rpcErr := callMethod(t, router, "watch.add", input, &created); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	if created.ID == 0 || created.Label != input.Query || created.PerRunCap != 3 {
+		t.Fatalf("created watch = %+v", created)
+	}
+	var listed []watch.Watch
+	if rpcErr := callMethod(t, router, "watch.list", struct{}{}, &listed); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	if len(listed) != 1 || listed[0].ID != created.ID {
+		t.Fatalf("listed watches = %+v", listed)
+	}
+	var removed WatchRemoveResult
+	if rpcErr := callMethod(t, router, "watch.remove", watch.IDInput{ID: created.ID}, &removed); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	if !removed.Removed || removed.ID != created.ID {
+		t.Fatalf("remove result = %+v", removed)
 	}
 }
 
