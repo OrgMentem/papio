@@ -4,17 +4,23 @@ package mcpserver
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"reflect"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"papio/internal/batch"
+	"papio/internal/bootstrap"
+	"papio/internal/config"
 	"papio/internal/job"
+	"papio/internal/protocol"
 	"papio/internal/work"
+	"papio/internal/zotio"
 )
 
 func TestServerExposesExactToolSurface(t *testing.T) {
@@ -37,12 +43,14 @@ func TestServerExposesExactToolSurface(t *testing.T) {
 		t.Fatal(err)
 	}
 	var names []string
-	var actionsResolveTool, applyTool, batchReportTool, batchWaitTool, exportTool, searchTool *mcp.Tool
+	var actionsResolveTool, applyTool, batchAcquireTool, batchReportTool, batchWaitTool, exportTool, searchTool *mcp.Tool
 	for _, tool := range listed.Tools {
 		names = append(names, tool.Name)
 		switch tool.Name {
 		case "papio_actions_resolve":
 			actionsResolveTool = tool
+		case "papio_acquire_batch":
+			batchAcquireTool = tool
 		case "papio_zotio_apply":
 			applyTool = tool
 		case "papio_export_bundle":
@@ -56,7 +64,7 @@ func TestServerExposesExactToolSurface(t *testing.T) {
 		}
 	}
 	sort.Strings(names)
-	want := []string{"papio_acquire", "papio_actions_list", "papio_actions_resolve", "papio_batch_report", "papio_batch_wait", "papio_export_bundle", "papio_search", "papio_status", "papio_watch_add", "papio_watch_list", "papio_watch_remove", "papio_zotio_apply", "papio_zotio_plan"}
+	want := []string{"papio_acquire", "papio_acquire_batch", "papio_actions_list", "papio_actions_resolve", "papio_batch_report", "papio_batch_wait", "papio_export_bundle", "papio_search", "papio_status", "papio_watch_add", "papio_watch_list", "papio_watch_remove", "papio_zotio_apply", "papio_zotio_plan"}
 	if strings.Join(names, ",") != strings.Join(want, ",") {
 		t.Fatalf("tools = %v, want %v", names, want)
 	}
@@ -72,6 +80,18 @@ func TestServerExposesExactToolSurface(t *testing.T) {
 	}
 	if exportTool == nil || exportTool.Annotations == nil || !exportTool.Annotations.ReadOnlyHint {
 		t.Fatalf("export annotations = %+v", exportTool)
+	}
+	if batchAcquireTool == nil || batchAcquireTool.Annotations == nil || batchAcquireTool.Annotations.ReadOnlyHint {
+		t.Fatalf("batch acquire annotations = %+v", batchAcquireTool)
+	}
+	batchAcquireSchema, err := json.Marshal(batchAcquireTool.InputSchema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{`"works"`, `"auto_import"`, `"collection"`, `"label"`, `"include_owned"`} {
+		if !strings.Contains(string(batchAcquireSchema), field) {
+			t.Fatalf("batch acquire schema = %s", batchAcquireSchema)
+		}
 	}
 	if batchReportTool == nil || batchReportTool.Annotations == nil || !batchReportTool.Annotations.ReadOnlyHint {
 		t.Fatalf("batch report annotations = %+v", batchReportTool)
@@ -126,6 +146,143 @@ func TestServerExposesExactToolSurface(t *testing.T) {
 	wantURIs := []string{"papio://artifacts", "papio://bundles", "papio://exports", "papio://jobs", "papio://zotio/plans"}
 	if strings.Join(uris, ",") != strings.Join(wantURIs, ",") {
 		t.Fatalf("resources = %v, want %v", uris, wantURIs)
+	}
+}
+func TestAcquireBatchCreatesReportableCLICompatibleManifest(t *testing.T) {
+	cfg := config.Default()
+	cfg.AccessMode = config.ModeConservative
+	cfg.DataDir = t.TempDir()
+	system, err := bootstrap.New(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = system.Close() })
+
+	now := time.Date(2026, time.July, 15, 12, 0, 0, 0, time.UTC)
+	caller := &fakeRPC{handler: func(method string, params json.RawMessage) (any, error) {
+		switch method {
+		case "zotio.lookup_works":
+			return zotio.LookupWorksResult{Works: []zotio.WorkOwnership{
+				{Status: zotio.OwnershipNotOwned},
+				{Status: zotio.OwnershipOwnedWithPDF},
+				{Status: zotio.OwnershipOwnedMissingPDF, ItemKey: "EXIST0001"},
+			}}, nil
+		case "acquire.submit":
+			var input struct {
+				Request    protocol.WorkRequest `json:"request"`
+				AutoImport *bool                `json:"auto_import"`
+			}
+			if err := json.Unmarshal(params, &input); err != nil {
+				return nil, err
+			}
+			if input.AutoImport == nil || !*input.AutoImport {
+				return nil, fmt.Errorf("auto_import was not defaulted to true")
+			}
+			id, err := system.App.SubmitWithAutoImport(context.Background(), input.Request, input.AutoImport)
+			if err != nil {
+				return nil, err
+			}
+			return struct {
+				JobID string `json:"job_id"`
+			}{JobID: id}, nil
+		case "jobs.get":
+			var input struct {
+				JobID string `json:"job_id"`
+			}
+			if err := json.Unmarshal(params, &input); err != nil {
+				return nil, err
+			}
+			row, err := system.Jobs.Get(context.Background(), input.JobID)
+			if err != nil {
+				return nil, err
+			}
+			return struct {
+				Job *job.Row `json:"job"`
+			}{Job: row}, nil
+		default:
+			return nil, fmt.Errorf("unexpected method %q", method)
+		}
+	}}
+	client := testMCPClientForSystem(t, system, toolDependencies{
+		caller: caller,
+		now:    func() time.Time { return now },
+		wait:   waitForPoll,
+	})
+
+	var output AcquireBatchOutput
+	callToolJSON(t, client, "papio_acquire_batch", map[string]any{
+		"works": []any{
+			map[string]any{"doi": "10.1000/new", "title": "New"},
+			map[string]any{"work": map[string]any{"doi": "10.1000/owned", "title": "Owned"}},
+			map[string]any{"work": map[string]any{"arxiv": "arXiv:2601.12345v2", "title": "Existing"}},
+		},
+		"collection": "Reading",
+		"label":      "weekly",
+	}, &output)
+	if len(output.Submitted) != 2 || len(output.SkippedOwned) != 1 || len(output.ExistingItem) != 1 {
+		t.Fatalf("batch routing = %+v", output)
+	}
+	if output.ExistingItem[0].ZotioItemKey != "EXIST0001" || output.ExistingItem[0].Collection != "Reading" {
+		t.Fatalf("existing-item routing = %+v", output.ExistingItem)
+	}
+
+	requests := make([]protocol.WorkRequest, 3)
+	for i, raw := range []json.RawMessage{
+		json.RawMessage(`{"doi":"10.1000/new","title":"New"}`),
+		json.RawMessage(`{"work":{"doi":"10.1000/owned","title":"Owned"}}`),
+		json.RawMessage(`{"work":{"arxiv":"arXiv:2601.12345v2","title":"Existing"}}`),
+	} {
+		requests[i], err = batch.ParseWork(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	wantManifest := batch.NewManifest(requests, "weekly", "Reading", now)
+	if output.BatchID != wantManifest.ID {
+		t.Fatalf("batch ID = %q, want %q", output.BatchID, wantManifest.ID)
+	}
+	for _, submitted := range output.Submitted {
+		if submitted.RequestID != batch.RequestID(wantManifest.ID, requests[0]) && submitted.RequestID != batch.RequestID(wantManifest.ID, requests[2]) {
+			t.Fatalf("submitted request ID %q is not CLI-compatible", submitted.RequestID)
+		}
+	}
+	manifest, err := batch.Load(cfg.DataDir, output.BatchID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manifest.Label != "weekly" || manifest.Collection != "Reading" ||
+		manifest.Works[0].Status != "submitted" || manifest.Works[1].Status != "skipped_owned" || manifest.Works[2].Status != "existing_item_attached" {
+		t.Fatalf("manifest = %+v", manifest)
+	}
+	for _, manifestWork := range manifest.Works {
+		if manifestWork.Work.Collection != "Reading" {
+			t.Fatalf("manifest collection policy = %+v", manifest.Works)
+		}
+	}
+
+	result, err := client.CallTool(context.Background(), &mcp.CallToolParams{
+		Name: "papio_batch_report", Arguments: map[string]any{"batch_id": output.BatchID},
+	})
+	if err != nil || result.IsError || len(result.Content) != 1 {
+		t.Fatalf("batch report result = %+v, error = %v", result, err)
+	}
+	text, ok := result.Content[0].(*mcp.TextContent)
+	if !ok {
+		t.Fatalf("batch report content = %#v", result.Content)
+	}
+	var report batch.Report
+	if err := json.Unmarshal([]byte(text.Text), &report); err != nil {
+		t.Fatal(err)
+	}
+	if report.BatchID != output.BatchID || report.Summary.Total != 3 {
+		t.Fatalf("batch report = %+v", report)
+	}
+
+	capResult, err := client.CallTool(context.Background(), &mcp.CallToolParams{
+		Name: "papio_acquire_batch", Arguments: map[string]any{"works": make([]any, 51)},
+	})
+	if err != nil || !capResult.IsError {
+		t.Fatalf("batch cap result = %+v, error = %v", capResult, err)
 	}
 }
 
@@ -366,11 +523,14 @@ type fakeRPCCall struct {
 }
 
 type fakeRPC struct {
+	mu      sync.Mutex
 	calls   []fakeRPCCall
 	handler func(string, json.RawMessage) (any, error)
 }
 
 func (f *fakeRPC) Call(_ context.Context, method string, params, result any) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	raw, err := json.Marshal(params)
 	if err != nil {
 		return err
@@ -388,10 +548,14 @@ func (f *fakeRPC) Call(_ context.Context, method string, params, result any) err
 }
 
 func testMCPClient(t *testing.T, dependencies toolDependencies) *mcp.ClientSession {
+	return testMCPClientForSystem(t, nil, dependencies)
+}
+
+func testMCPClientForSystem(t *testing.T, system *bootstrap.System, dependencies toolDependencies) *mcp.ClientSession {
 	t.Helper()
 	ctx := context.Background()
 	serverTransport, clientTransport := mcp.NewInMemoryTransports()
-	serverSession, err := newServer(nil, dependencies).Connect(ctx, serverTransport, nil)
+	serverSession, err := newServer(system, dependencies).Connect(ctx, serverTransport, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -412,7 +576,8 @@ func callToolJSON(t *testing.T, client *mcp.ClientSession, name string, argument
 		t.Fatal(err)
 	}
 	if result.IsError {
-		t.Fatalf("%s error: %+v", name, result.Content)
+		data, _ := json.Marshal(result.Content)
+		t.Fatalf("%s error: %s", name, data)
 	}
 	data, err := json.Marshal(result.StructuredContent)
 	if err != nil {

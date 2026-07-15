@@ -87,6 +87,20 @@ type BatchReportInput struct {
 	Format  string `json:"format,omitempty" jsonschema:"json or markdown; defaults to json"`
 }
 
+// AcquireBatchInput is the MCP equivalent of acquire --batch. Each work may be
+// a bare work object or a discovered-work envelope containing a work field.
+type AcquireBatchInput struct {
+	Works        []map[string]any `json:"works" jsonschema:"one to fifty bare work objects or discovered-work envelopes"`
+	AutoImport   *bool            `json:"auto_import,omitempty" jsonschema:"automatically import ready jobs; defaults to true"`
+	Collection   string           `json:"collection,omitempty" jsonschema:"optional Zotero collection key for every submitted work"`
+	Label        string           `json:"label,omitempty" jsonschema:"optional batch query context"`
+	IncludeOwned bool             `json:"include_owned,omitempty" jsonschema:"submit works already carrying a PDF in Zotio; defaults to false"`
+}
+
+// AcquireBatchOutput records submitted jobs and works routed without a new
+// acquisition job by Papio's standard ownership policy.
+type AcquireBatchOutput = batch.SubmitOutput
+
 // StatusSnapshot is the current active and recently completed job view.
 type StatusSnapshot struct {
 	GeneratedAt string        `json:"generated_at"`
@@ -267,6 +281,44 @@ func newServer(system *bootstrap.System, dependencies toolDependencies) *mcp.Ser
 			SourcesAllow: input.SourcesAllow, SourcesDeny: input.SourcesDeny,
 		}, input.AutoImport)
 		return nil, AcquireOutput{JobID: jobID}, err
+	})
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "papio_acquire_batch", Title: "Acquire a batch of scholarly works",
+		Description: "Create a durable acquisition batch using the same ownership routing, deterministic request IDs, auto-import policy, and manifest as papio acquire --batch.",
+		Annotations: additiveAnnotations(false),
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, input AcquireBatchInput) (*mcp.CallToolResult, AcquireBatchOutput, error) {
+		if system == nil || strings.TrimSpace(system.Config.DataDir) == "" {
+			return nil, AcquireBatchOutput{}, fmt.Errorf("batch acquisition is not configured")
+		}
+		if len(input.Works) == 0 {
+			return nil, AcquireBatchOutput{}, fmt.Errorf("batch contains no works")
+		}
+		if len(input.Works) > 50 {
+			return nil, AcquireBatchOutput{}, fmt.Errorf("batch exceeds maximum of 50 works")
+		}
+		requests := make([]protocol.WorkRequest, len(input.Works))
+		for i, inputWork := range input.Works {
+			raw, err := json.Marshal(inputWork)
+			if err != nil {
+				return nil, AcquireBatchOutput{}, fmt.Errorf("encoding batch work %d: %w", i+1, err)
+			}
+			request, err := batch.ParseWork(raw)
+			if err != nil {
+				return nil, AcquireBatchOutput{}, fmt.Errorf("batch work %d: %w", i+1, err)
+			}
+			requests[i] = request
+		}
+		autoImport := true
+		if input.AutoImport != nil {
+			autoImport = *input.AutoImport
+		}
+		output, err := batch.Submit(ctx, dependencies.caller, system.Config.DataDir, requests, batch.SubmitOptions{
+			AutoImport: &autoImport, Collection: input.Collection, Label: input.Label, IncludeOwned: input.IncludeOwned, Now: dependencies.now(),
+		})
+		if output == nil {
+			return nil, AcquireBatchOutput{}, err
+		}
+		return nil, *output, err
 	})
 
 	mcp.AddTool(server, &mcp.Tool{

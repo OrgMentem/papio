@@ -5,7 +5,6 @@ package cli
 import (
 	"bufio"
 	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -13,7 +12,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -225,18 +223,6 @@ type acquireSubmitParams struct {
 	AutoImport *bool                `json:"auto_import,omitempty"`
 }
 
-type batchWorkInput struct {
-	DOI            string   `json:"doi,omitempty"`
-	PMID           string   `json:"pmid,omitempty"`
-	ArXiv          string   `json:"arxiv,omitempty"`
-	ISBN           string   `json:"isbn,omitempty"`
-	OpenAlex       string   `json:"openalex,omitempty"`
-	Title          string   `json:"title,omitempty"`
-	Authors        []string `json:"authors,omitempty"`
-	Year           int      `json:"year,omitempty"`
-	DesiredVersion string   `json:"desired_version,omitempty"`
-}
-
 type batchSubmission struct {
 	JobID string `json:"job_id"`
 	State string `json:"state"`
@@ -316,94 +302,10 @@ func parseBatch(r io.Reader) ([]protocol.WorkRequest, error) {
 }
 
 func parseBatchWork(data json.RawMessage) (protocol.WorkRequest, error) {
-	var envelope map[string]json.RawMessage
-	if err := json.Unmarshal(data, &envelope); err != nil {
-		return protocol.WorkRequest{}, fmt.Errorf("decoding JSON object: %w", err)
-	}
-	if envelope == nil {
-		return protocol.WorkRequest{}, fmt.Errorf("work must be a JSON object")
-	}
-	if wrapped, ok := envelope["work"]; ok {
-		data = wrapped
-	}
-	var input batchWorkInput
-	if err := json.Unmarshal(data, &input); err != nil {
-		return protocol.WorkRequest{}, fmt.Errorf("decoding work: %w", err)
-	}
-	identifiers, err := batchIdentifiers(input)
-	if err != nil {
-		return protocol.WorkRequest{}, err
-	}
-	authors := trimNonempty(append([]string(nil), input.Authors...))
-	desired := strings.TrimSpace(input.DesiredVersion)
-	if desired == "" {
-		desired = "any"
-	}
-	request := protocol.WorkRequest{
-		SchemaVersion:  protocol.WorkRequestSchemaVersion,
-		RequestID:      batchRequestID(identifiers, input.Title, authors, input.Year),
-		Identifiers:    identifiers,
-		Title:          strings.TrimSpace(input.Title),
-		Authors:        authors,
-		Year:           input.Year,
-		DesiredVersion: desired,
-	}
-	if err := request.Validate(); err != nil {
-		return protocol.WorkRequest{}, err
-	}
-	return request, nil
+	return batch.ParseWork(data)
 }
-
-func batchIdentifiers(input batchWorkInput) (*protocol.Identifiers, error) {
-	ids := &protocol.Identifiers{}
-	var err error
-	for _, field := range []struct {
-		name  string
-		raw   string
-		value *string
-		parse func(string) (string, error)
-	}{
-		{"doi", input.DOI, &ids.DOI, work.NormalizeDOI},
-		{"pmid", input.PMID, &ids.PMID, work.NormalizePMID},
-		{"arxiv", input.ArXiv, &ids.ArXiv, work.NormalizeArXiv},
-		{"isbn", input.ISBN, &ids.ISBN, work.NormalizeISBN},
-		{"openalex", input.OpenAlex, &ids.OpenAlex, work.NormalizeOpenAlex},
-	} {
-		if strings.TrimSpace(field.raw) == "" {
-			continue
-		}
-		*field.value, err = field.parse(field.raw)
-		if err != nil {
-			return nil, fmt.Errorf("normalizing %s: %w", field.name, err)
-		}
-	}
-	if ids.DOI == "" && ids.PMID == "" && ids.ArXiv == "" && ids.ISBN == "" && ids.OpenAlex == "" {
-		return nil, nil
-	}
-	return ids, nil
-}
-
 func batchRequestID(ids *protocol.Identifiers, title string, authors []string, year int) string {
-	key := ""
-	if ids != nil {
-		switch {
-		case ids.DOI != "":
-			key = "doi:" + ids.DOI
-		case ids.ArXiv != "":
-			key = "arxiv:" + ids.ArXiv
-		case ids.PMID != "":
-			key = "pmid:" + ids.PMID
-		case ids.ISBN != "":
-			key = "isbn:" + ids.ISBN
-		case ids.OpenAlex != "":
-			key = "openalex:" + ids.OpenAlex
-		}
-	}
-	if key == "" {
-		key = fmt.Sprintf("title:%s\nauthors:%s\nyear:%d", strings.TrimSpace(title), strings.Join(authors, "\x00"), year)
-	}
-	sum := sha256.Sum256([]byte(key))
-	return fmt.Sprintf("batch-%x", sum[:4])
+	return batch.InitialRequestID(ids, title, authors, year)
 }
 
 func submitAcquire(ctx context.Context, opt *options, request protocol.WorkRequest, autoImport *bool, result *api.SubmitResult) error {
@@ -412,6 +314,14 @@ func submitAcquire(ctx context.Context, opt *options, request protocol.WorkReque
 		params = acquireSubmitParams{Request: request, AutoImport: autoImport}
 	}
 	return opt.call(ctx, "acquire.submit", params, result)
+}
+
+type socketBatchCaller struct {
+	socket string
+}
+
+func (c socketBatchCaller) Call(ctx context.Context, method string, params, result any) error {
+	return callSocket(ctx, c.socket, method, params, result)
 }
 
 func acquireBatch(ctx context.Context, cmd *cobra.Command, opt *options, path string, autoImport *bool, collection, label string, includeOwned bool) error {
@@ -430,14 +340,6 @@ func acquireBatch(ctx context.Context, cmd *cobra.Command, opt *options, path st
 	if err != nil {
 		return err
 	}
-	manifest := batch.NewManifest(requests, label, collection, time.Now())
-	for i := range requests {
-		requests[i].RequestID = manifest.Works[i].RequestID
-	}
-	manifestIndices := make(map[string]int, len(manifest.Works))
-	for i := range manifest.Works {
-		manifestIndices[manifest.Works[i].RequestID] = i
-	}
 	cfg, err := opt.loadConfig()
 	if err != nil {
 		return err
@@ -448,169 +350,52 @@ func acquireBatch(ctx context.Context, cmd *cobra.Command, opt *options, path st
 	if err := starter.Ensure(ctx); err != nil {
 		return err
 	}
-
-	lookupRequest := zotio.LookupWorksRequest{Works: make([]zotio.LookupWork, len(requests))}
-	for i, request := range requests {
-		if request.Identifiers == nil {
-			continue
-		}
-		lookupRequest.Works[i] = zotio.LookupWork{
-			DOI:   request.Identifiers.DOI,
-			ArXiv: request.Identifiers.ArXiv,
-		}
+	output, submitErr := batch.Submit(ctx, socketBatchCaller{socket: socket}, cfg.DataDir, requests, batch.SubmitOptions{
+		AutoImport: autoImport, Collection: collection, Label: label, IncludeOwned: includeOwned,
+	})
+	if output == nil {
+		return submitErr
 	}
-	var ownership zotio.LookupWorksResult
-	if err := callSocket(ctx, socket, "zotio.lookup_works", lookupRequest, &ownership); err != nil {
-		return err
-	}
-	if len(ownership.Works) != len(requests) {
-		return fmt.Errorf("Zotio ownership lookup returned %d results for %d works", len(ownership.Works), len(requests))
-	}
-	for i, classification := range ownership.Works {
-		switch classification.Status {
-		case zotio.OwnershipNotOwned:
-		case zotio.OwnershipOwnedWithPDF:
-			if !includeOwned {
-				manifest.Works[i].Status = "skipped_owned"
-			}
-		case zotio.OwnershipOwnedMissingPDF:
-			manifest.Works[i].Status = "existing_item_attached"
-		default:
-			return fmt.Errorf("Zotio ownership result %d has unknown status %q", i+1, classification.Status)
-		}
-	}
-	requests, skipped, err := applyBatchOwnership(requests, ownership, collection, includeOwned)
-	if err != nil {
-		return err
-	}
-	if ownership.StalenessWarning != "" {
-		if _, err := fmt.Fprintf(opt.errOut, "warning: %s\n", ownership.StalenessWarning); err != nil {
+	if output.StalenessWarning != "" {
+		if _, err := fmt.Fprintf(opt.errOut, "warning: %s\n", output.StalenessWarning); err != nil {
 			return err
 		}
 	}
-
-	results := make([]batchSubmission, len(requests))
-	errs := make([]error, len(requests))
-	var group sync.WaitGroup
-	for index, request := range requests {
-		group.Add(1)
-		go func(index int, request protocol.WorkRequest) {
-			defer group.Done()
-			params := any(request)
-			if autoImport != nil {
-				params = acquireSubmitParams{Request: request, AutoImport: autoImport}
-			}
-			var submitted api.SubmitResult
-			if err := callSocket(ctx, socket, "acquire.submit", params, &submitted); err != nil {
-				errs[index] = err
-				return
-			}
-			results[index].JobID = submitted.JobID
-			var detail api.JobDetail
-			if err := callSocket(ctx, socket, "jobs.get", map[string]string{"job_id": submitted.JobID}, &detail); err != nil {
-				results[index].State = "unknown"
-				errs[index] = fmt.Errorf("getting state for %s: %w", submitted.JobID, err)
-				return
-			}
-			if detail.Job == nil {
-				results[index].State = "unknown"
-				errs[index] = fmt.Errorf("daemon returned no job for %s", submitted.JobID)
-				return
-			}
-			results[index].State = detail.Job.State
-		}(index, request)
+	result := batchSubmitResult{
+		Jobs:             make([]batchSubmission, 0, len(output.Submitted)),
+		BatchID:          output.BatchID,
+		Submitted:        len(output.Submitted),
+		Skipped:          len(output.SkippedOwned),
+		StalenessWarning: output.StalenessWarning,
+		Failed:           output.Failed,
 	}
-	group.Wait()
-
-	output := batchSubmitResult{
-		Jobs:             make([]batchSubmission, 0, len(results)),
-		Skipped:          skipped,
-		StalenessWarning: ownership.StalenessWarning,
-		BatchID:          manifest.ID,
-	}
-	var firstErr error
-	for index, result := range results {
-		manifestWorkIndex, ok := manifestIndices[requests[index].RequestID]
-		if !ok {
-			return fmt.Errorf("batch manifest is missing request %q", requests[index].RequestID)
-		}
-		manifestWork := &manifest.Works[manifestWorkIndex]
-		if result.JobID == "" {
-			output.Failed++
-			manifestWork.Status = "submission_failed"
-			manifestWork.Error = "submit"
-			if firstErr == nil {
-				if errs[index] == nil {
-					firstErr = fmt.Errorf("submitting batch work %d failed without a daemon error", index+1)
-				} else {
-					firstErr = fmt.Errorf("submitting batch work %d: %w", index+1, errs[index])
-				}
-			}
-			continue
-		}
-		manifestWork.JobID = result.JobID
-		output.Jobs = append(output.Jobs, result)
-		output.Submitted++
-		if firstErr == nil && errs[index] != nil {
-			firstErr = errs[index]
-		}
-	}
-	if err := batch.Write(cfg.DataDir, manifest); err != nil {
-		return err
+	for _, submitted := range output.Submitted {
+		result.Jobs = append(result.Jobs, batchSubmission{JobID: submitted.JobID, State: submitted.State})
 	}
 	if opt.jsonOutput {
-		if err := opt.printJSON(output); err != nil {
+		if err := opt.printJSON(result); err != nil {
 			return err
 		}
 	} else {
-		for _, result := range output.Jobs {
-			if _, err := fmt.Fprintf(opt.out, "%s %s\n", result.JobID, result.State); err != nil {
+		for _, submitted := range result.Jobs {
+			if _, err := fmt.Fprintf(opt.out, "%s %s\n", submitted.JobID, submitted.State); err != nil {
 				return err
 			}
 		}
-		if _, err := fmt.Fprintf(opt.out, "Submitted %d job(s); skipped %d already in library; %d failed\n", output.Submitted, output.Skipped, output.Failed); err != nil {
+		if _, err := fmt.Fprintf(opt.out, "Submitted %d job(s); skipped %d already in library; %d failed\n", result.Submitted, result.Skipped, result.Failed); err != nil {
 			return err
 		}
-		if _, err := fmt.Fprintf(opt.out, "Batch %s\n", output.BatchID); err != nil {
+		if _, err := fmt.Fprintf(opt.out, "Batch %s\n", result.BatchID); err != nil {
 			return err
 		}
 	}
-	return firstErr
+	return submitErr
 }
 
-// applyBatchOwnership carries a batch-level target collection into every job,
-// skips already-complete library copies by default, and pins missing-PDF work
-// to its existing Zotero parent so the attachment route is selected.
+// applyBatchOwnership preserves the CLI-local test seam for the shared batch
+// ownership policy.
 func applyBatchOwnership(requests []protocol.WorkRequest, ownership zotio.LookupWorksResult, collection string, includeOwned bool) ([]protocol.WorkRequest, int, error) {
-	if len(ownership.Works) != len(requests) {
-		return nil, 0, fmt.Errorf("Zotio ownership lookup returned %d results for %d works", len(ownership.Works), len(requests))
-	}
-	collection = strings.TrimSpace(collection)
-	pending := make([]protocol.WorkRequest, 0, len(requests))
-	skipped := 0
-	for i, request := range requests {
-		request.Collection = collection
-		classification := ownership.Works[i]
-		switch classification.Status {
-		case zotio.OwnershipNotOwned:
-			pending = append(pending, request)
-		case zotio.OwnershipOwnedWithPDF:
-			if includeOwned {
-				pending = append(pending, request)
-			} else {
-				skipped++
-			}
-		case zotio.OwnershipOwnedMissingPDF:
-			if strings.TrimSpace(classification.ItemKey) == "" {
-				return nil, 0, fmt.Errorf("Zotio ownership result %d is missing its parent item key", i+1)
-			}
-			request.ZotioItemKey = classification.ItemKey
-			pending = append(pending, request)
-		default:
-			return nil, 0, fmt.Errorf("Zotio ownership result %d has unknown status %q", i+1, classification.Status)
-		}
-	}
-	return pending, skipped, nil
+	return batch.ApplyOwnership(requests, ownership, collection, includeOwned)
 }
 
 func waitForJob(ctx context.Context, opt *options, id string) (*api.JobDetail, error) {
