@@ -49,6 +49,9 @@ export interface KeepaliveOptions {
   trackedJobCount(): number;
   /** OpenURL from the most recently received job offer, kept in bridge memory. */
   latestOpenURL(): string | undefined;
+  /** Reports when the keepalive tab has verified an authenticated resolver
+   * return, or when that evidence is lost. */
+  onAuthenticationChanged?(authenticated: boolean): void;
   /** Called once per detected login redirect, after the tab is made visible. */
   onReauthNeeded?(): void;
   /** Overrides the post-reload inspection delay for deterministic tests. */
@@ -63,6 +66,16 @@ const MAX_INTERVAL_MINUTES = 30;
 const DEFAULT_OBSERVE_MS = 15_000;
 const DEFAULT_RELOAD_SETTLE_MS = 1_000;
 const LOGIN_ROUTE = /login|auth|sso|idp|shibboleth|signon/i;
+
+/** Shared conservative detector for login/IdP routes. */
+export function isAuthenticationURL(rawURL: string): boolean {
+  try {
+    const url = new URL(rawURL);
+    return LOGIN_ROUTE.test(url.pathname + url.search);
+  } catch {
+    return false;
+  }
+}
 
 /** Clamp an untrusted storage value to the supported interval range. */
 export function clampKeepaliveInterval(value: unknown): number {
@@ -84,6 +97,7 @@ export class KeepaliveManager {
   private intervalMinutes = DEFAULT_INTERVAL_MINUTES;
   private enabled = true;
   private reauthPaused = false;
+  private authenticated = false;
   private started = false;
   private readonly observeMs: number;
   private readonly reloadSettleMs: number;
@@ -165,6 +179,11 @@ export class KeepaliveManager {
       return undefined;
     }
   }
+  private setAuthenticated(authenticated: boolean): void {
+    if (this.authenticated === authenticated) return;
+    this.authenticated = authenticated;
+    this.options.onAuthenticationChanged?.(authenticated);
+  }
 
   private async createTab(): Promise<void> {
     if (this.resolver === undefined) return;
@@ -178,6 +197,7 @@ export class KeepaliveManager {
       if (tabID !== undefined) {
         this.tabID = tabID;
         this.reauthPaused = false;
+        this.setAuthenticated(false);
         return;
       }
     } catch {
@@ -193,6 +213,7 @@ export class KeepaliveManager {
       if (tab.id === undefined) return;
       this.tabID = tab.id;
       this.reauthPaused = false;
+      this.setAuthenticated(false);
     } catch {
       // Browser policy may reject background tabs. Observe and try again later.
     }
@@ -277,6 +298,7 @@ export class KeepaliveManager {
     } catch {
       this.tabID = undefined;
       this.reauthPaused = false;
+      this.setAuthenticated(false);
       return;
     }
     if (typeof tab.url !== "string") return;
@@ -288,13 +310,18 @@ export class KeepaliveManager {
       return;
     }
     if (finalURL.hostname === this.resolver.hostname) {
+      this.setAuthenticated(true);
       if (this.reauthPaused) await this.resumeAfterReauth();
       return;
     }
-    if (LOGIN_ROUTE.test(finalURL.pathname + finalURL.search)) await this.pauseForReauth();
+    if (isAuthenticationURL(tab.url)) {
+      this.setAuthenticated(false);
+      await this.pauseForReauth();
+    }
   }
 
   private async pauseForReauth(): Promise<void> {
+    this.setAuthenticated(false);
     if (this.reauthPaused || this.tabID === undefined) return;
     this.reauthPaused = true;
     try {
@@ -347,6 +374,7 @@ export class KeepaliveManager {
     const wasAwaitingReauth = this.reauthPaused;
     this.tabID = undefined;
     this.reauthPaused = false;
+    this.setAuthenticated(false);
     if (wasAwaitingReauth) {
       try {
         await this.api.action?.setBadgeText({ text: "" });

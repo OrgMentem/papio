@@ -70,6 +70,7 @@ class FakeTabs {
   readonly onRemoved = new FakeEmitter<[number, { isWindowClosing: boolean }]>();
   readonly created: { url: string; active: boolean }[] = [];
   readonly removed: number[] = [];
+  readonly reloaded: number[] = [];
   readonly live = new Map<number, TabInfo>();
   nextId = 100;
   failCreate = false;
@@ -85,6 +86,10 @@ class FakeTabs {
     const tab = this.live.get(tabID);
     if (!tab) throw new Error("no such tab");
     return tab;
+  }
+  async reload(tabID: number): Promise<void> {
+    if (!this.live.has(tabID)) throw new Error("no such tab");
+    this.reloaded.push(tabID);
   }
   async remove(tabID: number): Promise<void> {
     this.removed.push(tabID);
@@ -316,6 +321,142 @@ test("direct download initiation errors fall back to the broker tab", async () =
 
   expect(h.tabs.created).toEqual([{ url: directURL, active: true }]);
   expect(h.backend.store.activeJobs[0]?.tab_id).toBe(100);
+});
+
+test("tab-less re-offer without a durable offer URL recreates the direct download", async () => {
+  const jobID = "job_0001a_stale_direct";
+  const directURL = "https://dl.acm.org/doi/pdf/10.1145/3630106.3658944";
+  const seed: StoreShape = {
+    activeJobs: [
+      {
+        job_id: jobID,
+        tab_id: -1,
+        offered_at: 1,
+        expires_at: 2,
+        status: "accepted",
+        provider_hosts: [PROVIDER_HOST],
+        download_initiated: true,
+      },
+    ],
+  };
+  const h = makeHarness(seed);
+  const offer = jobOffer(jobID) as { payload: Record<string, unknown> };
+  offer.payload["openurl"] = directURL;
+
+  await h.bridge.start();
+  await h.port.inbound(offer);
+
+  expect(h.downloads.started).toHaveLength(1);
+  expect(h.downloads.started[0]?.url).toBe(directURL);
+  expect(h.backend.store.activeJobs[0]?.download_initiated).toBe(true);
+});
+
+test("offer URLs round-trip through durable state for a worker restart", async () => {
+  const jobID = "job_0001a_durable_direct";
+  const directURL = "https://dl.acm.org/doi/pdf/10.1145/3630106.3658945";
+  const offer = jobOffer(jobID) as { payload: Record<string, unknown> };
+  offer.payload["openurl"] = directURL;
+  const first = makeHarness();
+
+  await first.bridge.start();
+  await first.port.inbound(offer);
+  expect(first.backend.store.offerURLs).toEqual({ [jobID]: directURL });
+
+  const restarted = makeHarness(JSON.parse(JSON.stringify(first.backend.store)) as StoreShape);
+  await restarted.bridge.start();
+  await restarted.port.inbound(offer);
+
+  expect(restarted.downloads.started).toEqual([]);
+  expect(restarted.backend.store.offerURLs).toEqual({ [jobID]: directURL });
+});
+
+test("pre-auth handoffs queue behind one visible tab, then release after auth returns", async () => {
+  const h = makeHarness();
+  const jobIDs = Array.from({ length: 5 }, (_, index) => `job_0001a_queue_${index}`);
+
+  await h.bridge.start();
+  await Promise.all(jobIDs.map((jobID) => h.port.inbound(jobOffer(jobID))));
+
+  expect(h.tabs.created.filter((tab) => tab.active)).toHaveLength(1);
+  expect(h.backend.store.activeJobs.filter((job) => job.status === "queued")).toHaveLength(4);
+
+  const activeJob = h.backend.store.activeJobs.find((job) => job.tab_id >= 0);
+  expect(activeJob).toBeDefined();
+  const activeTabID = activeJob?.tab_id ?? -1;
+  const idpURL = "https://idp.example.edu/sso";
+  await h.tabs.onUpdated.emit(activeTabID, { url: idpURL }, { id: activeTabID, url: idpURL });
+
+  // A pre-existing broker handoff can still be parked at IdP when another tab
+  // returns first; auth release must force that stale redirect through cookies.
+  const stuckTabID = 999;
+  h.backend.store.activeJobs.push({
+    job_id: "job_0001a_idp_stuck",
+    tab_id: stuckTabID,
+    offered_at: h.clock.now,
+    expires_at: h.clock.now + 1,
+    status: "accepted",
+    provider_hosts: [PROVIDER_HOST],
+  });
+  h.tabs.live.set(stuckTabID, { id: stuckTabID, url: idpURL });
+
+  h.clock.now += 1;
+  const providerURL = `https://${PROVIDER_HOST}/stable/returned`;
+  await h.tabs.onUpdated.emit(activeTabID, { url: providerURL }, { id: activeTabID, url: providerURL });
+
+  expect(h.tabs.created).toHaveLength(5);
+  expect(h.tabs.created.filter((tab) => !tab.active)).toHaveLength(4);
+  expect(h.backend.store.activeJobs.filter((job) => job.status === "queued")).toHaveLength(0);
+  expect(h.tabs.reloaded).toEqual([stuckTabID]);
+});
+
+test("a recent auth return drains durable queued handoffs during startup", async () => {
+  const jobID = "job_0001a_restart_queue";
+  const queuedURL = "https://resolver.example.edu/openurl?queued=1";
+  const h = makeHarness({
+    activeJobs: [
+      {
+        job_id: jobID,
+        tab_id: -1,
+        offered_at: 1,
+        expires_at: 2,
+        status: "queued",
+        provider_hosts: [PROVIDER_HOST],
+      },
+    ],
+    offerURLs: { [jobID]: queuedURL },
+    lastAuthReturnedAt: 1_700_000_000_000,
+  });
+
+  await h.bridge.start();
+
+  expect(h.tabs.created).toEqual([{ url: queuedURL, active: false }]);
+  expect(h.backend.store.activeJobs[0]?.status).toBe("accepted");
+  expect(h.backend.store.activeJobs[0]?.tab_id).toBe(100);
+});
+
+test("keepalive authentication evidence releases a restored queued handoff", async () => {
+  const jobID = "job_0001a_keepalive_queue";
+  const queuedURL = "https://resolver.example.edu/openurl?keepalive=1";
+  const h = makeHarness({
+    activeJobs: [
+      {
+        job_id: jobID,
+        tab_id: -1,
+        offered_at: 1,
+        expires_at: 2,
+        status: "queued",
+        provider_hosts: [PROVIDER_HOST],
+      },
+    ],
+    offerURLs: { [jobID]: queuedURL },
+  });
+
+  await h.bridge.start();
+  expect(h.tabs.created).toEqual([]);
+  await h.bridge.setKeepaliveAuthenticated(true);
+
+  expect(h.tabs.created).toEqual([{ url: queuedURL, active: false }]);
+  expect(h.backend.store.activeJobs[0]?.status).toBe("accepted");
 });
 
 test("a changed re-offer replaces an OA browser tab with the institutional fallback", async () => {

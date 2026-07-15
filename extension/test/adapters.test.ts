@@ -236,6 +236,7 @@ class FakeTabs {
     if (!tab) throw new Error("no such tab");
     return tab;
   }
+  async reload(_tabID: number): Promise<void> {}
   async remove(tabID: number): Promise<void> {
     this.live.delete(tabID);
   }
@@ -581,6 +582,7 @@ test("click downloads correlate by adapter when concurrent handoffs share provid
     { kind: "article", adapter_id: "ebsco", adapter_version: "0.1.0", evidence: [] },
   );
   await h.bridge.start();
+  await h.bridge.setKeepaliveAuthenticated(true);
   await h.port.inbound(offer("job_jstor_concurrent_0001", undefined, providerHosts));
   await landOnProvider(h, "job_jstor_concurrent_0001", "www.jstor.org");
   await h.port.inbound(offer("job_ebsco_concurrent_0001", undefined, providerHosts));

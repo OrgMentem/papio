@@ -4,11 +4,11 @@
 // lives in chrome.storage (session preferred, local fallback). Everything here
 // is pure over an injected StateBackend so it is unit-testable without chrome.
 //
-// Privacy invariant: nothing stored here may carry an identity-provider URL,
-// host, title, query, or fragment. Only broker-owned resolver metadata
-// (provider_hosts) plus timing/status fields are persisted.
+// Privacy invariant: no identity-provider URL, host, title, query, or fragment
+// is persisted. Resolver-provided offer URLs are retained only while their
+// active jobs exist so a suspended MV3 worker can recover the exact handoff.
 
-export type JobStatus = "offered" | "accepted" | "auth_pending" | "awaiting_download";
+export type JobStatus = "offered" | "queued" | "accepted" | "auth_pending" | "awaiting_download";
 
 export interface ActiveJob {
   job_id: string;
@@ -40,6 +40,13 @@ export interface ActiveJob {
 
 export interface StoreShape {
   activeJobs: ActiveJob[];
+  /** Resolver-provided offer URL by active job. This is needed to recreate a
+   * broker handoff after a service-worker restart. */
+  offerURLs?: Record<string, string>;
+  /** Most recent local proof that an institutional login returned to a provider.
+   * It is bounded by the bridge before use and lets queued jobs drain after an
+   * MV3 restart while the session is still warm. */
+  lastAuthReturnedAt?: number;
 }
 
 /** Async key/value seam. The real implementation wraps chrome.storage; tests
@@ -65,11 +72,11 @@ export function findByTab(store: StoreShape, tabID: number): ActiveJob | undefin
 export function upsertJob(store: StoreShape, job: ActiveJob): StoreShape {
   const activeJobs = store.activeJobs.filter((j) => j.job_id !== job.job_id);
   activeJobs.push(job);
-  return { activeJobs };
+  return { ...store, activeJobs };
 }
 
 export function removeJob(store: StoreShape, jobID: string): StoreShape {
-  return { activeJobs: store.activeJobs.filter((j) => j.job_id !== jobID) };
+  return { ...store, activeJobs: store.activeJobs.filter((j) => j.job_id !== jobID) };
 }
 
 /** Return a new store with the named job patched. No-op if the job is gone. */
@@ -79,6 +86,7 @@ export function patchJob(
   patch: Partial<Omit<ActiveJob, "job_id">>,
 ): StoreShape {
   return {
+    ...store,
     activeJobs: store.activeJobs.map((j) => (j.job_id === jobID ? { ...j, ...patch } : j)),
   };
 }

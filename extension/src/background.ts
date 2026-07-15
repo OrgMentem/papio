@@ -41,11 +41,11 @@ import {
   type PageVerdict,
 } from "./adapters/types";
 import { observeUnknown } from "./observe";
-// KEEPALIVE INTEGRATION
-import { chromeKeepaliveAPI, initKeepalive } from "./keepalive";
+import { chromeKeepaliveAPI, initKeepalive, isAuthenticationURL } from "./keepalive";
 
 export const NATIVE_HOST = "com.orgmentem.papio";
 const CHROME_PDF_VIEWER_HOST = "mhjfbmdgcfjbbpaeojofohoefgiehjai";
+const AUTH_EVIDENCE_TTL_MS = 30 * 60_000;
 
 
 export interface Listenable<A extends unknown[]> {
@@ -102,15 +102,16 @@ export interface BridgeDeps {
   tabs: {
     create(props: { url: string; active: boolean }): Promise<TabInfo>;
     get(tabID: number): Promise<TabInfo>;
+    reload(tabID: number): Promise<unknown>;
     remove(tabID: number): Promise<void>;
     onUpdated: Listenable<[number, TabChangeInfo, TabInfo]>;
     onRemoved: Listenable<[number, { isWindowClosing: boolean }]>;
   };
   downloads: {
     search(query: { id: number }): Promise<DownloadItemLike[]>;
-    /** Start a browser-managed download. The signed provider URL remains
-     * extension-memory-only: it is never put in a native frame or durable
-     * state. The returned ID is the exact job correlation. */
+    /** Start a browser-managed download. The resolver-provided offer URL stays
+     * local to the extension/browser and is never put in a native frame. The
+     * returned ID is the exact job correlation. */
     download(options: {
       url: string;
       filename: string;
@@ -296,10 +297,16 @@ export class Bridge {
   /** A finished download keeps its broker tab open until the daemon has
    * acknowledged the adoption attempt for that job. */
   private readonly completedDownloadTabs = new Map<string, number>();
-  /** Offer URLs are memory-only so a fallback re-offer can replace an active
-   * OA tab without persisting a possibly signed URL. */
+  /** Resolver-provided offer URLs are cached here after storage hydration. */
   private readonly offerURLs = new Map<string, string>();
-  /** Latest resolver URL from an offer; intentionally memory-only. */
+  /** Authentication observed during this service-worker lifetime. */
+  private authReturnedThisWorker = false;
+  /** Keepalive has observed its resolver tab return from authentication. */
+  private keepaliveAuthenticated = false;
+  /** Atomically reserves the one visible handoff while tabs.create is in flight. */
+  private handoffOpening = false;
+  private drainingQueuedHandoffs = false;
+  /** Latest resolver URL from an offer, retained for the keepalive manager. */
   private latestOfferOpenURL: string | undefined;
 
   constructor(private readonly deps: BridgeDeps) {}
@@ -321,8 +328,15 @@ export class Bridge {
     this.connect();
     this.ready = this.deps.backend.load().then((s) => {
       this.store = s;
+      this.offerURLs.clear();
+      for (const [jobID, url] of Object.entries(s.offerURLs ?? {})) {
+        if (typeof url !== "string" || findByJob(s, jobID) === undefined) continue;
+        this.offerURLs.set(jobID, url);
+        this.latestOfferOpenURL = url;
+      }
     });
     await this.ready;
+    await this.releaseQueuedHandoffs();
   }
 
   /** Cancel an active job on user request (popup cancel button). */
@@ -340,9 +354,8 @@ export class Bridge {
       }
     }
     this.downloads.delete(jobID);
-    this.offerURLs.delete(jobID);
     this.completedDownloadTabs.delete(jobID);
-    await this.update((s) => removeJob(s, jobID));
+    await this.removeJobWithOffer(jobID);
   }
 
   private pendingJobFor(item: DownloadItemLike): string | undefined {
@@ -473,6 +486,95 @@ export class Bridge {
     await this.deps.backend.save(this.store);
   }
 
+  private async upsertJobWithOffer(job: ActiveJob, offerURL: string): Promise<void> {
+    this.offerURLs.set(job.job_id, offerURL);
+    await this.update((s) => {
+      const withJob = upsertJob(s, job);
+      return {
+        ...withJob,
+        offerURLs: { ...(s.offerURLs ?? {}), [job.job_id]: offerURL },
+      };
+    });
+  }
+
+  private async removeJobWithOffer(jobID: string): Promise<void> {
+    this.offerURLs.delete(jobID);
+    await this.update((s) => {
+      const offerURLs = { ...(s.offerURLs ?? {}) };
+      delete offerURLs[jobID];
+      return { ...removeJob(s, jobID), offerURLs };
+    });
+  }
+
+  private hasRecentAuthEvidence(): boolean {
+    const at = this.store.lastAuthReturnedAt;
+    const age = typeof at === "number" ? this.deps.now() - at : Number.POSITIVE_INFINITY;
+    return age >= 0 && age <= AUTH_EVIDENCE_TTL_MS;
+  }
+
+  private hasAuthEvidence(): boolean {
+    return this.authReturnedThisWorker || this.keepaliveAuthenticated || this.hasRecentAuthEvidence();
+  }
+
+  /** Called by keepalive only after its resolver tab has returned from login. */
+  async setKeepaliveAuthenticated(authenticated: boolean): Promise<void> {
+    this.keepaliveAuthenticated = authenticated;
+    if (!authenticated) return;
+    await this.ready;
+    await this.releaseQueuedHandoffs();
+  }
+
+  private async releaseQueuedHandoffs(): Promise<void> {
+    if (!this.hasAuthEvidence() || this.drainingQueuedHandoffs) return;
+    this.drainingQueuedHandoffs = true;
+    try {
+      while (this.hasAuthEvidence()) {
+        const queued = this.store.activeJobs.find((job) => job.status === "queued");
+        if (queued === undefined) return;
+        const url = this.offerURLs.get(queued.job_id);
+        if (url === undefined) {
+          this.send("job_reject", {}, queued.job_id);
+          await this.removeJobWithOffer(queued.job_id);
+          continue;
+        }
+        let tabID: number | undefined;
+        try {
+          tabID = (await this.deps.tabs.create({ url, active: false })).id;
+        } catch (e) {
+          console.error("papio: queued handoff tab creation failed", e);
+        }
+        if (tabID === undefined) {
+          this.send("job_reject", {}, queued.job_id);
+          await this.removeJobWithOffer(queued.job_id);
+          continue;
+        }
+        await this.update((s) =>
+          patchJob(s, queued.job_id, {
+            tab_id: tabID,
+            status: "accepted",
+            download_initiated: false,
+          }),
+        );
+      }
+    } finally {
+      this.drainingQueuedHandoffs = false;
+    }
+  }
+
+  private async reloadAuthenticationHandoffs(): Promise<void> {
+    for (const job of this.store.activeJobs) {
+      if (job.tab_id < 0 || job.status === "queued") continue;
+      try {
+        const tab = await this.deps.tabs.get(job.tab_id);
+        if (typeof tab.url === "string" && isAuthenticationURL(tab.url)) {
+          await this.deps.tabs.reload(job.tab_id);
+        }
+      } catch {
+        // A closed handoff is handled by the normal tab-removal path.
+      }
+    }
+  }
+
   /** Build, self-validate, and post one outbound frame. Validation is a safety
    * net: a frame that would not survive the shared parser is dropped, never
    * emitted. */
@@ -543,77 +645,91 @@ export class Bridge {
     const providerHosts = hostsRaw.filter((h): h is string => typeof h === "string");
     const expected = parseExpected(p["expected"]);
 
-    // Restart/re-offer dedup normally re-accepts a live tab. A re-offer whose
-    // URL changed is the daemon's OA->institution fallback, so close the old
-    // broker tab and open the replacement instead. A direct-offer download has
-    // no tab (id -1) and must remain the single live attempt for its offer.
+    // Restart/re-offer dedup normally re-accepts a live tab. A tab-less job
+    // without its durable offer URL cannot represent an in-flight download:
+    // discard that stale record so this offer recreates the real browser work.
     const existing = findByJob(this.store, jobID);
     if (existing) {
-      if (existing.tab_id < 0 && (priorOfferURL === undefined || priorOfferURL === openurl)) {
-        this.send("job_accept", {}, jobID);
-        return;
-      }
-      let live = false;
-      if (existing.tab_id >= 0) {
+      if (existing.tab_id < 0) {
+        if (priorOfferURL === undefined) {
+          this.downloads.delete(jobID);
+          await this.removeJobWithOffer(jobID);
+        } else if (priorOfferURL === openurl) {
+          this.send("job_accept", {}, jobID);
+          if (existing.status === "queued") await this.releaseQueuedHandoffs();
+          return;
+        } else {
+          this.downloads.delete(jobID);
+          await this.removeJobWithOffer(jobID);
+        }
+      } else {
+        let live = false;
         try {
           const tab = await this.deps.tabs.get(existing.tab_id);
           live = tab.id === existing.tab_id;
         } catch {
           live = false;
         }
-      }
-      if (live && (priorOfferURL === undefined || priorOfferURL === openurl)) {
-        this.send("job_accept", {}, jobID);
-        return;
-      }
-      if (live) {
-        this.closingTabs.add(existing.tab_id);
-        try {
-          await this.deps.tabs.remove(existing.tab_id);
-        } catch (e) {
-          console.error("papio: could not replace prior handoff tab", e);
-          this.send("job_reject", {}, jobID);
+        if (live && (priorOfferURL === undefined || priorOfferURL === openurl)) {
+          this.send("job_accept", {}, jobID);
           return;
         }
+        if (live) {
+          this.closingTabs.add(existing.tab_id);
+          try {
+            await this.deps.tabs.remove(existing.tab_id);
+          } catch (e) {
+            console.error("papio: could not replace prior handoff tab", e);
+            this.send("job_reject", {}, jobID);
+            return;
+          }
+        }
+        await this.removeJobWithOffer(jobID);
       }
-      this.offerURLs.delete(jobID);
-      await this.update((s) => removeJob(s, jobID));
     }
 
     const now = this.deps.now();
     const expiresMs = Date.parse(expiresAt);
-    const makeJob = (tabID: number): ActiveJob => ({
+    const makeJob = (tabID: number, status: ActiveJob["status"] = "accepted"): ActiveJob => ({
       job_id: jobID,
       tab_id: tabID,
       offered_at: now,
       expires_at: Number.isNaN(expiresMs) ? now : expiresMs,
-      status: "accepted",
+      status,
       provider_hosts: providerHosts,
       ...(expected !== undefined ? { expected } : {}),
     });
     if (isDirectFileOffer(openurl)) {
-      await this.update((s) => upsertJob(s, makeJob(-1)));
-      this.offerURLs.set(jobID, openurl);
+      await this.upsertJobWithOffer(makeJob(-1), openurl);
       this.send("job_accept", {}, jobID);
       await this.startDirectOfferDownload(jobID, openurl);
       return;
     }
 
+    const queueHandoff =
+      !this.hasAuthEvidence() &&
+      (this.handoffOpening ||
+        this.store.activeJobs.some((job) => job.tab_id >= 0 && job.status !== "queued"));
+    if (queueHandoff) {
+      await this.upsertJobWithOffer(makeJob(-1, "queued"), openurl);
+      this.send("job_accept", {}, jobID);
+      return;
+    }
+
+    this.handoffOpening = true;
     let tabID: number | undefined;
     try {
-      const tab = await this.deps.tabs.create({ url: openurl, active: true });
-      tabID = tab.id;
+      tabID = (await this.deps.tabs.create({ url: openurl, active: true })).id;
     } catch (e) {
       console.error("papio: tab creation failed; rejecting job", e);
-      this.send("job_reject", {}, jobID);
-      return;
+    } finally {
+      this.handoffOpening = false;
     }
     if (tabID === undefined) {
       this.send("job_reject", {}, jobID);
       return;
     }
-    await this.update((s) => upsertJob(s, makeJob(tabID)));
-    this.offerURLs.set(jobID, openurl);
+    await this.upsertJobWithOffer(makeJob(tabID), openurl);
     this.send("job_accept", {}, jobID);
   }
 
@@ -664,30 +780,42 @@ export class Bridge {
     await this.fallbackToOfferTab(jobID);
   }
 
-  /** Convert a failed download-first attempt into the existing broker tab. */
+  /** Convert a failed download-first attempt into the normal handoff flow. */
   private async fallbackToOfferTab(jobID: string): Promise<void> {
     const job = findByJob(this.store, jobID);
     const url = this.offerURLs.get(jobID);
     if (!job || job.tab_id >= 0 || url === undefined) return;
+    const queueHandoff =
+      !this.hasAuthEvidence() &&
+      (this.handoffOpening ||
+        this.store.activeJobs.some((candidate) => candidate.tab_id >= 0 && candidate.status !== "queued"));
+    if (queueHandoff) {
+      await this.update((s) =>
+        patchJob(s, jobID, {
+          status: "queued",
+          tab_id: -1,
+          download_initiated: false,
+        }),
+      );
+      return;
+    }
+
+    this.handoffOpening = true;
     let tabID: number | undefined;
     try {
-      const tab = await this.deps.tabs.create({ url, active: true });
-      tabID = tab.id;
+      tabID = (await this.deps.tabs.create({ url, active: true })).id;
     } catch (e) {
       console.error("papio: tab creation failed after direct-file download", e);
-      this.send("job_reject", {}, jobID);
-      this.offerURLs.delete(jobID);
-      await this.update((s) => removeJob(s, jobID));
-      return;
+    } finally {
+      this.handoffOpening = false;
     }
     if (tabID === undefined) {
       this.send("job_reject", {}, jobID);
-      this.offerURLs.delete(jobID);
-      await this.update((s) => removeJob(s, jobID));
+      await this.removeJobWithOffer(jobID);
       return;
     }
     await this.update((s) =>
-      patchJob(s, jobID, { tab_id: tabID, download_initiated: false }),
+      patchJob(s, jobID, { tab_id: tabID, status: "accepted", download_initiated: false }),
     );
   }
 
@@ -706,9 +834,8 @@ export class Bridge {
       }
     }
     this.downloads.delete(jobID);
-    this.offerURLs.delete(jobID);
     this.completedDownloadTabs.delete(jobID);
-    await this.update((s) => removeJob(s, jobID));
+    await this.removeJobWithOffer(jobID);
   }
 
   /** The daemon acknowledges download_complete only after it has attempted
@@ -718,7 +845,6 @@ export class Bridge {
     const tabID = this.completedDownloadTabs.get(jobID);
     if (tabID === undefined) return;
     this.completedDownloadTabs.delete(jobID);
-    this.offerURLs.delete(jobID);
     if (tabID >= 0) {
       this.closingTabs.add(tabID);
       try {
@@ -727,7 +853,7 @@ export class Bridge {
         // The viewer may already have closed itself after the download completed.
       }
     }
-    await this.update((s) => removeJob(s, jobID));
+    await this.removeJobWithOffer(jobID);
   }
 
   private async onTabUpdated(tabID: number, change: TabChangeInfo, tab: TabInfo): Promise<void> {
@@ -745,8 +871,7 @@ export class Bridge {
     const onProvider = hostMatches(host, job.provider_hosts);
     if (!onProvider) {
       // Chrome exposes its built-in PDF viewer as an internal extension URL.
-      // The actual tab URL is no longer downloadable, so reuse the memory-only
-      // offer URL that produced that viewer; it is never written to storage.
+      // Reuse the durable resolver-provided offer URL that produced that viewer.
       if (change.status === "complete" && host === CHROME_PDF_VIEWER_HOST) {
         const offeredURL = this.offerURLs.get(job.job_id);
         if (offeredURL !== undefined) {
@@ -781,9 +906,19 @@ export class Bridge {
     }
     if (job.status === "auth_pending") {
       const started = job.auth_started_ms ?? this.deps.now();
-      const elapsed = Math.max(0, this.deps.now() - started);
-      await this.update((s) => patchJob(s, job.job_id, { status: "awaiting_download" }));
+      const now = this.deps.now();
+      const elapsed = Math.max(0, now - started);
+      const firstAuthReturn = !this.authReturnedThisWorker;
+      this.authReturnedThisWorker = true;
+      await this.update((s) => ({
+        ...patchJob(s, job.job_id, { status: "awaiting_download" }),
+        lastAuthReturnedAt: now,
+      }));
       this.send("auth_returned", { elapsed_ms: elapsed }, job.job_id);
+      if (firstAuthReturn) {
+        await this.releaseQueuedHandoffs();
+        await this.reloadAuthenticationHandoffs();
+      }
     }
     // Once the provider page has finished loading on the tracked tab (past any
     // human auth), run the declarative adapter — permission-gated, tracked-tab
@@ -1021,16 +1156,14 @@ export class Bridge {
     // drop our local tab correlation but leave the job parked daemon-side.
     // Cancelling only stands while the handoff has not yet reached download.
     if (job.status === "awaiting_download") {
-      this.offerURLs.delete(job.job_id);
       this.completedDownloadTabs.delete(job.job_id);
-      await this.update((s) => removeJob(s, job.job_id));
+      await this.removeJobWithOffer(job.job_id);
       return;
     }
     this.send("provider_outcome", { outcome: "cancelled" }, job.job_id);
     this.downloads.delete(job.job_id);
-    this.offerURLs.delete(job.job_id);
     this.completedDownloadTabs.delete(job.job_id);
-    await this.update((s) => removeJob(s, job.job_id));
+    await this.removeJobWithOffer(job.job_id);
   }
 
   private correlate(item: DownloadItemLike): ActiveJob | undefined {
@@ -1169,6 +1302,7 @@ function realDeps(): BridgeDeps {
     tabs: {
       create: (props) => chrome.tabs.create(props),
       get: (tabID) => chrome.tabs.get(tabID),
+      reload: (tabID) => chrome.tabs.reload(tabID),
       remove: (tabID) => chrome.tabs.remove(tabID),
       onUpdated: { addListener: (cb) => chrome.tabs.onUpdated.addListener(cb) },
       onRemoved: { addListener: (cb) => chrome.tabs.onRemoved.addListener(cb) },
@@ -1228,6 +1362,9 @@ if (typeof chrome !== "undefined" && chrome.runtime?.id) {
     initKeepalive(chromeKeepaliveAPI(chrome), {
       trackedJobCount: () => bridge.trackedJobCount(),
       latestOpenURL: () => bridge.latestOpenURL(),
+      onAuthenticationChanged: (authenticated) => {
+        void bridge.setKeepaliveAuthenticated(authenticated);
+      },
     }),
   );
 }
