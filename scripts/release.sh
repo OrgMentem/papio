@@ -96,8 +96,7 @@ read_release_metadata() {
   PAPIO_COMMIT=$(git -C "$PAPIO_ROOT" rev-parse HEAD)
   ZOTIO_COMMIT=$(git -C "$ZOTIO_ROOT" rev-parse HEAD)
   RELEASE_EPOCH=$(git -C "$PAPIO_ROOT" show -s --format=%ct HEAD)
-  PAPIO_VERSION=$(python3 "$METADATA_HELPER" go-const-version \
-    --source "$PAPIO_ROOT/internal/api/handler.go")
+  PAPIO_VERSION="$VERSION"
   EXTENSION_VERSION=$(python3 "$METADATA_HELPER" manifest-version \
     --manifest "$EXTENSION_DIR/manifest.json")
 }
@@ -109,10 +108,10 @@ prepare_output() {
 }
 
 build_papio() {
-  # TODO(release): make internal/api.Version ldflags-overridable, then stamp VERSION here.
   (
     cd "$PAPIO_ROOT"
     CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -buildvcs=false \
+      -ldflags "-X papio/internal/api.Version=$VERSION" \
       -o "$OUTPUT_DIR/papio-darwin-arm64" ./cmd/papio
   )
 }

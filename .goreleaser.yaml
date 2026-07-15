@@ -1,0 +1,143 @@
+version: 2
+project_name: papio
+# Group conventional-commit release notes; raw commit lists read as noise on
+# release pages.
+changelog:
+  use: github
+  sort: asc
+  filters:
+    exclude:
+      - "^style"
+      - "^test"
+  groups:
+    - title: Features
+      regexp: '^.*?feat(\(.+\))??!?:.+$'
+      order: 0
+    - title: Fixes
+      regexp: '^.*?fix(\(.+\))??!?:.+$'
+      order: 1
+    - title: Documentation
+      regexp: '^.*?docs(\(.+\))??!?:.+$'
+      order: 2
+    - title: Build & CI
+      regexp: '^.*?(ci|chore|brand)(\(.+\))??!?:.+$'
+      order: 3
+    - title: Other
+      order: 999
+release:
+  footer: |
+    ---
+    **Curated history:** [CHANGELOG.md](https://github.com/OrgMentem/papio/blob/main/CHANGELOG.md) · **Install:** `brew install orgmentem/tap/papio`
+builds:
+  - id: papio
+    main: ./cmd/papio
+    binary: papio
+    env:
+      - CGO_ENABLED=0
+    ldflags:
+      - -s -w -X papio/internal/api.Version={{ .Version }}
+    targets:
+      - darwin_amd64
+      - darwin_arm64
+      - linux_amd64
+      - linux_arm64
+      - windows_amd64
+      - windows_arm64
+archives:
+  - formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+checksum:
+  name_template: checksums.txt
+# Generate Syft SBOMs for released archives.
+sboms:
+  - artifacts: archive
+# Sign release checksums with cosign keyless OIDC. Cosign v3 (installed by
+# cosign-installer v4) requires bundle output for sign-blob: one
+# .sigstore.json replaces the old .sig/.pem pair.
+signs:
+  - cmd: cosign
+    signature: "${artifact}.sigstore.json"
+    args:
+      - sign-blob
+      - --yes
+      - --bundle
+      - "${signature}"
+      - "${artifact}"
+    artifacts: checksum
+brews:
+  - name: papio
+    repository:
+      owner: OrgMentem
+      name: homebrew-tap
+      # The default GITHUB_TOKEN cannot push cross-repo; this fine-grained PAT
+      # has contents:write on homebrew-tap only.
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    commit_msg_template: "papio {{ .Tag }}"
+    # goreleaser writes to the tap root unless told otherwise; brew expects Formula/.
+    directory: Formula
+    homepage: "https://github.com/OrgMentem/papio"
+    description: "Autonomous scholarly-paper acquisition broker that files validated PDFs into Zotero via zotio"
+    install: |
+      bin.install "papio"
+# Windows: self-owned Scoop bucket (mirrors the homebrew-tap pattern). Packages
+# the windows zip archive, which contains the papio binary.
+scoops:
+  - repository:
+      owner: OrgMentem
+      name: scoop-bucket
+      # Same cross-repo constraint as the tap: default GITHUB_TOKEN can't push
+      # to another repo. Fine-grained PAT with contents:write on scoop-bucket.
+      token: "{{ .Env.SCOOP_BUCKET_GITHUB_TOKEN }}"
+    directory: bucket
+    commit_msg_template: "papio {{ .Tag }}"
+    homepage: "https://github.com/OrgMentem/papio"
+    description: "Autonomous scholarly-paper acquisition broker that files validated PDFs into Zotero via zotio"
+    license: MIT
+# Windows: WinGet manifests, PR'd from a fork into microsoft/winget-pkgs.
+winget:
+  - # TEMPORARY (remove after the first winget merge): opening a new-package PR
+    # per release stacks parallel PRs on the moderators and slows the first
+    # merge. Once any version is merged, delete skip_upload — version bumps are
+    # the fast path.
+    skip_upload: true
+    name: papio
+    publisher: OrgMentem
+    license: MIT
+    homepage: "https://github.com/OrgMentem/papio"
+    short_description: "Autonomous scholarly-paper acquisition broker that files validated PDFs into Zotero via zotio"
+    # Author winget commits as the CLA-signed account (not goreleaserbot), so
+    # Microsoft's per-PR CLA check matches and doesn't re-flag Needs-CLA.
+    commit_author:
+      name: enieuwy
+      email: 121954036+enieuwy@users.noreply.github.com
+    repository:
+      owner: OrgMentem
+      # A fork of microsoft/winget-pkgs; goreleaser commits here, then opens a PR upstream.
+      name: winget-pkgs
+      branch: "papio-{{ .Version }}"
+      token: "{{ .Env.WINGET_GITHUB_TOKEN }}"
+      pull_request:
+        enabled: true
+        draft: false
+        base:
+          owner: microsoft
+          name: winget-pkgs
+          branch: master
+# Linux distro packages attached to each GitHub release.
+nfpms:
+  - id: papio
+    package_name: papio
+    ids:
+      - papio
+    formats:
+      - deb
+      - rpm
+      - apk
+    maintainer: "OrgMentem <papio@orgmentem.com>"
+    homepage: "https://github.com/OrgMentem/papio"
+    description: "Autonomous scholarly-paper acquisition broker that files validated PDFs into Zotero via zotio"
+    license: MIT
+    bindir: /usr/bin

@@ -112,7 +112,7 @@ report not OK. The checks below explain every check the command can emit.
 | `source_core` | An enabled CORE source has an API credential. | Configure `sources.core.api_key`, or disable the source. |
 | `source_crossref-tdm` | An enabled Crossref TDM source has an API credential. | Configure `sources.crossref_tdm.api_key`, or disable the source. |
 
-See [`config-reference.md`](config-reference.md) for exact keys and allowed
+See [`config-reference.md`](../reference/config-reference.md) for exact keys and allowed
 values.
 
 ## Zotio-boundary error classes

@@ -1,7 +1,10 @@
 bin/
 dist/
 dist/release/
+site/
 node_modules/
 *.log
+__pycache__/
+*.pyc
 .DS_Store
 .agents/

@@ -1,0 +1,100 @@
+name: ci
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  # Fail CI if go.mod/go.sum drift from source.
+  tidy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: '1.26.x'
+      - name: Check module drift
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+      - name: Verify modules
+        run: go mod verify
+
+  format:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: '1.26.x'
+      - name: Check Formatting
+        run: test -z "$(gofmt -l .)"
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: '1.26.x'
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: v2.12.2
+
+  vuln:
+    runs-on: ubuntu-latest
+    steps:
+      - name: govulncheck
+        uses: golang/govulncheck-action@032d45514ae346b1db93c04b0c90b841c370344f # v1
+        with:
+          go-version-input: '1.26.x'
+
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          fetch-depth: 0
+      - name: betterleaks
+        run: |
+          set -euo pipefail
+          BL_VERSION=1.6.1
+          BL_SHA256=fbefc700a0bd4522cc952dd2a8f259cdb80526d7e60114aca19bb2d6fdc80f81
+          TMP="$(mktemp -d)"
+          curl -sSL "https://github.com/betterleaks/betterleaks/releases/download/v${BL_VERSION}/betterleaks_${BL_VERSION}_linux_x64.tar.gz" -o "$TMP/bl.tar.gz"
+          echo "${BL_SHA256}  $TMP/bl.tar.gz" | sha256sum -c -
+          tar -xzf "$TMP/bl.tar.gz" -C "$TMP" betterleaks
+          "$TMP/betterleaks" git . --no-banner --redact
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: '1.26.x'
+      - name: Build
+        run: go build ./...
+      - name: Test
+        run: go test ./...
+
+  # Browser-plane MV3 extension: TypeScript typecheck + bun tests.
+  extension:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: extension
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: oven-sh/setup-bun@735343b667d3e6f658f44d0eca948eb6282f2b76 # v2.0.2
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Typecheck
+        run: bun run typecheck
+      - name: Test
+        run: bun test

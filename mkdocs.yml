@@ -1,0 +1,83 @@
+# Documentation site config. Consumed natively by Zensical (`zensical build`)
+# and, unchanged, by Material for MkDocs (`mkdocs build`) as a fallback while
+# Zensical (currently 0.0.x, pre-1.0) matures toward full parity.
+#
+# Source Markdown lives in docs/ and is authored by hand.
+
+site_name: papio
+site_description: A local paper-acquisition broker — searches scholarly works, creates bounded acquisition jobs, validates candidate PDFs, and hands ready artifacts to Zotero through Zotio.
+site_author: OrgMentem
+copyright: Copyright &copy; 2026 OrgMentem — MIT. papio is an independent project, not affiliated with or endorsed by Zotero.
+# Canonical URL (required for the sitemap that instant navigation relies on) + repo links.
+site_url: https://orgmentem.github.io/papio/
+repo_url: https://github.com/OrgMentem/papio
+repo_name: OrgMentem/papio
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.instant
+    - navigation.instant.progress
+    - navigation.tracking
+    - navigation.tabs
+    - navigation.sections
+    - navigation.top
+    - navigation.footer
+    - toc.follow
+    - content.code.copy
+    - content.code.annotate
+    - content.tooltips
+    - search.suggest
+    - search.highlight
+    - search.share
+
+extra:
+  # Suppress the "Made with Zensical/Material for MkDocs" footer notice.
+  # License-clean (not an attribution requirement); honored by Material,
+  # and by Zensical where wired (pre-1.0 — verify on deploy).
+  generator: false
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets:
+      base_path: ["."]
+      check_paths: true
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+
+nav:
+  - Home: index.md
+  - Guide:
+      - User guide: guide/user-guide.md
+      - Troubleshooting: guide/troubleshooting.md
+      - Use in a coding agent: guide/agent-skill.md
+  - Reference:
+      - Configuration: reference/config-reference.md

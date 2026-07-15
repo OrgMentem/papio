@@ -2,7 +2,7 @@
 
 All notable changes to Papio are documented here. This initial release entry is
 synthesized from the complete `papio` and `zotio` Git histories and the execution
-records in `dev/acquisition-stack-plan.md`.
+records in `notes/acquisition-stack-plan.md`.
 
 ## [0.2.0] - 2026-07-15
 

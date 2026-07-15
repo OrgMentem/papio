@@ -79,7 +79,7 @@ def go_const_version(args: argparse.Namespace) -> None:
         source = Path(args.source).read_text(encoding="utf-8")
     except OSError as exc:
         raise SystemExit(f"could not read Go version source: {exc}") from exc
-    match = re.search(r'const\s+Version\s*=\s*"([^"]+)"', source)
+    match = re.search(r'(?:const|var)\s+Version\s*=\s*"([^"]+)"', source)
     if match is None:
         raise SystemExit("could not find const Version in Go version source")
     print(match.group(1))
@@ -157,9 +157,9 @@ def release_manifest(args: argparse.Namespace) -> None:
             "papio": {
                 "commit": args.papio_commit,
                 "version": args.papio_version,
-                "version_source": "internal/api/handler.go: const Version",
-                "version_injected": False,
-                "version_injection_note": "Papio does not yet expose an ldflags-overridable version.",
+                "version_source": "internal/api/handler.go: var Version",
+                "version_injected": True,
+                "version_ldflag": "papio/internal/api.Version",
                 "artifact": "papio-darwin-arm64",
             },
             "zotio": {

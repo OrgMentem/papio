@@ -24,7 +24,9 @@ import (
 	"papio/internal/zotio"
 )
 
-const Version = "0.1.0-dev"
+// Version is the papio version, overridable at build time via
+// -ldflags "-X papio/internal/api.Version=<v>". Defaults to a dev marker.
+var Version = "0.1.0-dev"
 
 type SubmitResult struct {
 	JobID string `json:"job_id"`

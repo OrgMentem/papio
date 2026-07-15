@@ -5,7 +5,7 @@ bounded acquisition jobs, validates candidate PDFs, and hands ready artifacts to
 Zotio only through a preview-and-confirmation boundary. It does not handle
 institution credentials, MFA, CAPTCHAs, or subscription crawling.
 
-Use [`config-reference.md`](config-reference.md) to change policy and
+Use [`config-reference.md`](../reference/config-reference.md) to change policy and
 [`troubleshooting.md`](troubleshooting.md) when a job needs attention.
 
 ## 1. Initialize the local profile
