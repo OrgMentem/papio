@@ -735,7 +735,7 @@ Reframe (user direction): getting a PDF the human already clicked into Zotero wa
 - **Adapter flywheel** (`observe.ts`): tracked handoff tabs that land post-SSO on a verified provider host but classify `unknown` are auto-captured through the existing sanitize/fail-closed pipeline into `~/Downloads/papio-fixtures/observed/<host>/`, rate-limited (1/host/hour, 5/day). Every assisted session generates the fixture material for its own future adapter — adapter coverage stops depending on manual captures.
 - **Popup redesign**: batch-first — "needs you" queue with Focus buttons, in-flight, imported/failed sections with counts.
 - Capture registry + optional host permissions + options grants + daemon verified hosts extended ahead of adapters: elsevier/sciencedirect, acm, wiley, tandfonline, sage, psycnet.
-- Elsevier note: the ScienceDirect TDM API (institutional API key from dev.elsevier.com) is the eventual zero-browser path for Elsevier; browser adapter ships first because it needs no key issuance.
+- Elsevier/TDM decision (2026-07-15): publisher TDM APIs (Elsevier, Wiley) require institutional key issuance that individual researchers and papio's realistic users cannot obtain — struck from the roadmap. **Browser-mediated acquisition through the user's real session is papio's strategy**, not a stopgap: real user, real entitlements, adapters + the observe flywheel carry the coverage. Credentialed TDM resolvers remain supported-if-configured (existing fail-closed source config) but nothing plans for them.
 
 ### Execution record and live acceptance (2026-07-14)
 
@@ -748,6 +748,16 @@ Reframe (user direction): getting a PDF the human already clicked into Zotero wa
   4. Plan-time manifests were pinned by the ledger, so zotio binary fixes never reached existing plans (live: an `itemType: document` + `publicationTitle` manifest kept failing after the zotio fix shipped) — a failed apply now purges the plan's cached derivation so the next plan re-resolves with current binaries. Companion zotio fix `5143fc8` routes container titles per item type (proceedingsTitle/bookTitle/Extra) instead of failing whole imports.
 - Extension 0.2.0 batch surfaces deployed the same night: keepalive, observe flywheel, batch popup; worker connected and recovered autonomously across every daemon restart involved.
 
+## Library-aware batches, OA browser fallback, snowball (2026-07-15, shipped)
+
+- Shipped in papio `901c1bf` + `3c9a91a`, zotio `adfd4a8` + `3d6fa3a`.
+- **Library-aware batch**: `acquire --batch` classifies every work against the Zotio mirror first (`zotio.lookup_works`): owned-with-PDF skipped with a summary, owned-without-PDF submitted on the existing-item attachment route with the parent key, unknown works imported fresh. `--collection <name>` rides the dormant work-request/1 `collection` field into job policy; auto-import files imported items into the named collection (created on demand, idempotent, non-fatal).
+- **OA browser fallback**: candidates exhausted by bot-block-class OA failures (403/challenge) hand off the OA URL itself instead of the institutional OpenURL; direct-file URLs (`/pdf`, `.pdf`, `/content/pdf/`, `/doi/pdf/`) skip tabs entirely — the worker downloads immediately through the browser's cookie jar, accepts only `application/pdf` into adoption, and falls back to a broker tab otherwise. OA failure falls back to exactly one institutional handoff.
+- **Snowball**: `papio search --cites/--cited-by/--related-to <doi>` resolve the seed via OpenAlex and apply exact citation filters; free-text query optional when snowballing; RPC + MCP params extended.
+- Live acceptance (2026-07-15): snowball on Schemmer 2023 returned its forward-citation neighborhood; re-running the 20-work batch skipped all 11 owned papers and resubmitted 9; **5 previously-SSO-stranded OA works fetched through the browser and auto-imported within 90 s**; the topic batch (19 items) sits in the new "Trust in AI advice" collection (`UDIEZ6NZ`). Remaining 4-5 park honestly: institutional-only access or Elsevier landing pages awaiting the adapter.
+- Live-found and fixed in the same pass: the extension's PDF-viewer probe was host-grant-gated and direct ACM PDF URLs lack a `.pdf` suffix (→ download-first redesign, `3c9a91a`); zotio posted collection creates as a bare object where the live API demands a JSON array, and the fake server accepted the wrong shape (→ `3d6fa3a`, fake now enforces the real contract).
+- Batch totals across both nights: 20 searched → **16 in Zotero autonomously**, 0 duplicate imports across three re-runs of the same batch file.
+
 ## Next
 
-Build Elsevier + ACM adapters from the observe-flywheel captures (the parked handoff tabs auto-capture on their next post-SSO landing); complete the JSTOR/EBSCO/Springer supervised live acceptances and clear the parked handoff queue in one warm-SSO browser pass; re-pin the packed extension ID; then Phase 5 hardening/release. Elsevier TDM API key (dev.elsevier.com) remains the zero-browser endgame for ScienceDirect.
+Build Elsevier + ACM adapters from the observe-flywheel captures (the parked handoff tabs auto-capture on their next post-SSO landing); complete the JSTOR/EBSCO/Springer supervised live acceptances and clear the parked handoff queue in one warm-SSO browser pass; re-pin the packed extension ID; then Phase 5 hardening/release.
