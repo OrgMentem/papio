@@ -391,6 +391,7 @@ interface MapHarness {
   downloads: FakeDownloads;
   permissions: FakePermissions;
   clock: { now: number };
+  timers: { fn: () => void | Promise<void>; ms: number }[];
   frames(): BrowserMessage[];
 }
 
@@ -402,12 +403,15 @@ function makeMapHarness(specs: AdapterSpec[] = [SPEC]): MapHarness {
   const permissions = new FakePermissions();
   const downloads = new FakeDownloads();
   const clock = { now: 1_700_000_000_000 };
+  const timers: { fn: () => void | Promise<void>; ms: number }[] = [];
   const deps: BridgeDeps = {
     connectNative: () => port,
     manifestVersion: "0.1.0",
     randomUUID: () => crypto.randomUUID(),
     now: () => clock.now,
-    setTimeout: () => {},
+    setTimeout: (fn, ms) => {
+      timers.push({ fn, ms });
+    },
     backend,
     tabs,
     downloads,
@@ -424,6 +428,7 @@ function makeMapHarness(specs: AdapterSpec[] = [SPEC]): MapHarness {
     downloads,
     permissions,
     clock,
+    timers,
     frames: () => port.posted.map(parseBrowserMessage),
   };
 }
@@ -485,6 +490,29 @@ test("auth return classifies the provider landing even without a complete event"
   expect(h.frames().some((f) => f.type === "auth_returned")).toBe(true);
   expect(h.scripting.interpretTabs).toContain(tabID);
   expect(h.downloads.started.length).toBe(1);
+});
+
+test("a transiently unknown provider page is reclassified until it renders", async () => {
+  // The first classify sees an un-upgraded page (unknown); a bounded retry must
+  // re-run the classifier so the eventually-rendered article still downloads.
+  const h = makeMapHarness([SPEC]);
+  h.scripting.verdictQueue.push(
+    { kind: "unknown", adapter_id: "proquest", adapter_version: "0.3.1", evidence: [] },
+    { kind: "article", adapter_id: "proquest", adapter_version: "0.3.1", evidence: [] },
+  );
+  await h.bridge.start();
+  await h.port.inbound(offer("job_retry_0001"));
+  const tabID = await landOnProvider(h, "job_retry_0001");
+
+  // Unknown first: no download yet, but a retry is scheduled.
+  expect(h.downloads.started.length).toBe(0);
+  expect(h.timers.length).toBeGreaterThan(0);
+
+  // Drain the retry; the page now classifies as an article and downloads once.
+  for (const t of h.timers.splice(0)) await t.fn();
+  expect(h.scripting.interpretTabs.length).toBeGreaterThanOrEqual(2);
+  expect(h.downloads.started.length).toBe(1);
+  expect(h.tabs.live.get(tabID)?.url).toContain(PROVIDER);
 });
 
 test("hello reports adapter_versions from the registered specs", async () => {

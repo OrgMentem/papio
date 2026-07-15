@@ -48,6 +48,12 @@ export const NATIVE_HOST = "com.orgmentem.papio";
 const CHROME_PDF_VIEWER_HOST = "mhjfbmdgcfjbbpaeojofohoefgiehjai";
 const AUTH_EVIDENCE_TTL_MS = 30 * 60_000;
 const QUEUED_HANDOFF_RELEASE_MS = 45_000;
+// A provider page can classify `unknown` transiently: its adapter selectors
+// (custom elements, React roots) upgrade after the tab reports complete and
+// after the SSO landing. Re-drive the idempotent classify path on a bounded
+// schedule so a slow render still reaches a decisive verdict.
+const CLASSIFY_RETRY_MS = 2_500;
+const MAX_CLASSIFY_RETRIES = 8;
 
 
 export interface Listenable<A extends unknown[]> {
@@ -320,6 +326,9 @@ export class Bridge {
   /** Forced job IDs awaiting release; consumed by the single active drain so
    * overlapping fallback timers cannot drop each other's requests. */
   private readonly pendingForcedReleases = new Set<string>();
+  /** Per-job bounded reclassification attempts while a provider page renders.
+   * Worker-local; cleared on a decisive verdict, download, or job removal. */
+  private readonly classifyRetries = new Map<string, number>();
 
   constructor(private readonly deps: BridgeDeps) {}
   trackedJobCount(): number {
@@ -523,6 +532,7 @@ export class Bridge {
   private async removeJobWithOffer(jobID: string): Promise<void> {
     this.offerURLs.delete(jobID);
     this.queuedHandoffTimers.delete(jobID);
+    this.classifyRetries.delete(jobID);
     await this.update((s) => {
       const offerURLs = { ...(s.offerURLs ?? {}) };
       delete offerURLs[jobID];
@@ -1172,6 +1182,38 @@ export class Bridge {
     }
     if (!verdict) return;
     await this.applyVerdict(jobID, spec, verdict, host);
+    // A decisive verdict ends the render race; `unknown` may just be an
+    // un-upgraded page, so retry on a bounded schedule. The download latch and
+    // the terminal-status check in retryClassify keep this from ever driving a
+    // second download.
+    if (verdict.kind === "unknown") this.scheduleClassifyRetry(jobID);
+    else this.classifyRetries.delete(jobID);
+  }
+
+  private scheduleClassifyRetry(jobID: string): void {
+    const attempts = this.classifyRetries.get(jobID) ?? 0;
+    if (attempts >= MAX_CLASSIFY_RETRIES) {
+      this.classifyRetries.delete(jobID);
+      return;
+    }
+    this.classifyRetries.set(jobID, attempts + 1);
+    this.deps.setTimeout(() => this.retryClassify(jobID), CLASSIFY_RETRY_MS);
+  }
+
+  private async retryClassify(jobID: string): Promise<void> {
+    await this.ready;
+    const job = findByJob(this.store, jobID);
+    // Stop once the job is gone, has latched a download, or left the states
+    // where an adapter may still act.
+    if (!job || job.download_initiated === true) {
+      this.classifyRetries.delete(jobID);
+      return;
+    }
+    if (job.status !== "accepted" && job.status !== "awaiting_download") {
+      this.classifyRetries.delete(jobID);
+      return;
+    }
+    await this.reclassifyCurrentProviderPage(jobID);
   }
 
 
