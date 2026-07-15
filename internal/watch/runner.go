@@ -42,6 +42,7 @@ type Notifier interface {
 type RunResult struct {
 	WatchID             int64  `json:"watch_id"`
 	Queued              int    `json:"queued"`
+	Failed              int    `json:"failed"`
 	ManifestID          string `json:"manifest_id,omitempty"`
 	ConsecutiveFailures int    `json:"consecutive_failures"`
 	Disabled            bool   `json:"disabled"`
@@ -118,7 +119,7 @@ func (r *Runner) execute(ctx context.Context, watch Watch) (*RunResult, error) {
 		return result, errors.New("watch runner dependencies are not configured")
 	}
 	works, err := r.Discovery.Search(ctx, discovery.SearchParams{
-		Query: watch.Query, Limit: MaxPerRunCap,
+		Query: watch.Query, Limit: min(watch.PerRunCap*3, 25), Slim: true,
 		YearFrom: watch.Filters.YearFrom, YearTo: watch.Filters.YearTo, OAOnly: watch.Filters.OAOnly,
 	})
 	if err != nil {
@@ -130,8 +131,10 @@ func (r *Runner) execute(ctx context.Context, watch Watch) (*RunResult, error) {
 	}
 	lookupRequest := zotio.LookupWorksRequest{Works: make([]zotio.LookupWork, len(requests))}
 	for i, request := range requests {
-		lookupRequest.Works[i] = zotio.LookupWork{
-			DOI: request.Identifiers.DOI, ArXiv: request.Identifiers.ArXiv,
+		if request.Identifiers != nil {
+			lookupRequest.Works[i] = zotio.LookupWork{
+				DOI: request.Identifiers.DOI, ArXiv: request.Identifiers.ArXiv,
+			}
 		}
 	}
 	ownership, err := r.Lookup.LookupWorks(ctx, lookupRequest)
@@ -166,16 +169,14 @@ func (r *Runner) execute(ctx context.Context, watch Watch) (*RunResult, error) {
 		manifest.Works[i].RequestID = requestID
 		manifest.Works[i].Work.RequestID = requestID
 	}
-	var firstErr error
+	autoImport := true
 	for i := range manifest.Works {
 		request := manifest.Works[i].Work
-		jobID, err := r.Submitter.SubmitWithAutoImport(ctx, request, nil)
+		jobID, err := r.Submitter.SubmitWithAutoImport(ctx, request, &autoImport)
 		if err != nil {
 			manifest.Works[i].Status = "submission_failed"
 			manifest.Works[i].Error = "submit"
-			if firstErr == nil {
-				firstErr = fmt.Errorf("submitting watch work %d: %w", i+1, err)
-			}
+			result.Failed++
 			continue
 		}
 		manifest.Works[i].JobID = jobID
@@ -184,11 +185,14 @@ func (r *Runner) execute(ctx context.Context, watch Watch) (*RunResult, error) {
 	if err := batch.Write(r.DataDir, manifest); err != nil {
 		return result, err
 	}
-	if firstErr != nil {
-		return result, firstErr
+	if result.Failed == len(manifest.Works) {
+		return result, fmt.Errorf("all %d watch submissions failed", result.Failed)
 	}
 	if r.Notifier != nil && result.Queued > 0 {
 		r.Notifier.Send(ctx, fmt.Sprintf("watch %s: %d new papers queued", watch.Label, result.Queued))
+	}
+	if result.Failed > 0 {
+		return result, r.Store.MarkDegradedRun(ctx, watch.ID, r.now(), result.Failed, len(manifest.Works))
 	}
 	if err := r.Store.MarkRun(ctx, watch.ID, r.now()); err != nil {
 		return result, err
@@ -200,26 +204,19 @@ func requestsForDiscovered(works []discovery.DiscoveredWork) []protocol.WorkRequ
 	requests := make([]protocol.WorkRequest, 0, len(works))
 	seen := make(map[string]struct{}, len(works))
 	for _, discovered := range works {
-		identifiers := &protocol.Identifiers{
-			DOI: discovered.Work.DOI, PMID: discovered.Work.PMID, ArXiv: discovered.Work.ArXiv,
-			ISBN: discovered.Work.ISBN, OpenAlex: discovered.Work.OpenAlex,
-		}
-		if identifiers.OpenAlex == "" {
-			identifiers.OpenAlex = strings.TrimSpace(discovered.OpenAlexID)
-		}
-		if identifiers.DOI == "" && identifiers.PMID == "" && identifiers.ArXiv == "" && identifiers.ISBN == "" && identifiers.OpenAlex == "" {
+		doi := strings.TrimSpace(discovered.Work.DOI)
+		openAlexID := strings.TrimSpace(discovered.OpenAlexID)
+		title := strings.TrimSpace(discovered.Work.Title)
+		authors := append([]string(nil), discovered.Work.Authors...)
+		if doi == "" && (openAlexID == "" || title == "" || len(authors) == 0 || discovered.Work.Year == 0) {
 			continue
 		}
-		keys := make([]string, 0, 5)
-		for _, item := range []struct {
-			kind, value string
-		}{
-			{"doi", identifiers.DOI}, {"pmid", identifiers.PMID}, {"arxiv", identifiers.ArXiv},
-			{"isbn", identifiers.ISBN}, {"openalex", identifiers.OpenAlex},
-		} {
-			if item.value != "" {
-				keys = append(keys, item.kind+":"+item.value)
-			}
+		keys := make([]string, 0, 2)
+		if doi != "" {
+			keys = append(keys, "doi:"+doi)
+		}
+		if openAlexID != "" {
+			keys = append(keys, "openalex:"+openAlexID)
 		}
 		duplicate := false
 		for _, key := range keys {
@@ -234,11 +231,15 @@ func requestsForDiscovered(works []discovery.DiscoveredWork) []protocol.WorkRequ
 		for _, key := range keys {
 			seen[key] = struct{}{}
 		}
+		var identifiers *protocol.Identifiers
+		if doi != "" {
+			identifiers = &protocol.Identifiers{DOI: doi}
+		}
 		requests = append(requests, protocol.WorkRequest{
 			SchemaVersion: protocol.WorkRequestSchemaVersion,
 			Identifiers:   identifiers,
-			Title:         strings.TrimSpace(discovered.Work.Title),
-			Authors:       append([]string(nil), discovered.Work.Authors...),
+			Title:         title,
+			Authors:       authors,
 			Year:          discovered.Work.Year,
 		})
 	}

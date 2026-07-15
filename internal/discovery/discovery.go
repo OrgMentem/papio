@@ -27,6 +27,8 @@ const (
 	maxAbstractWords = 20_000
 )
 
+const slimFields = "id,doi,title,display_name,publication_year,authorships,primary_location,open_access,cited_by_count"
+
 // HTTPClient is the injected HTTP dependency used to call OpenAlex.
 type HTTPClient interface {
 	Do(*http.Request) (*http.Response, error)
@@ -43,7 +45,9 @@ type Options struct {
 	MaxResponseBytes int64
 }
 
-// SearchParams selects works from OpenAlex.
+// SearchParams selects works from OpenAlex. Slim is an internal-only mode for
+// callers that do not need abstract_inverted_index and must keep response
+// sizes bounded on broad scheduled searches.
 type SearchParams struct {
 	Query     string `json:"query,omitempty"`
 	Limit     int    `json:"limit"`
@@ -53,6 +57,7 @@ type SearchParams struct {
 	Cites     string `json:"cites,omitempty"`
 	CitedBy   string `json:"cited_by,omitempty"`
 	RelatedTo string `json:"related_to,omitempty"`
+	Slim      bool   `json:"-"`
 }
 
 // HasCitationSnowball reports whether the parameters select a citation-based
@@ -269,6 +274,9 @@ func (c *Client) searchURL(params SearchParams, query string, citationFilters []
 	}
 	values.Set("per-page", strconv.Itoa(normalized.Limit))
 	values.Set("mailto", c.email)
+	if normalized.Slim {
+		values.Set("select", slimFields)
+	}
 	filters := make([]string, 0, 3+len(citationFilters))
 	if normalized.YearFrom > 0 {
 		filters = append(filters, fmt.Sprintf("from_publication_date:%04d-01-01", normalized.YearFrom))

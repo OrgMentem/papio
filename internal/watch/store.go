@@ -212,6 +212,35 @@ func (s *Store) MarkRun(ctx context.Context, id int64, at time.Time) error {
 	return nil
 }
 
+// MarkDegradedRun records a partially successful submission batch. It advances
+// the cadence and resets consecutive complete-run failures while retaining the
+// bounded failure count for the user to inspect.
+func (s *Store) MarkDegradedRun(ctx context.Context, id int64, at time.Time, failed, total int) error {
+	if s == nil || s.S == nil {
+		return errors.New("watch store is not configured")
+	}
+	if failed < 1 || total < failed {
+		return errors.New("invalid degraded watch run counts")
+	}
+	result, err := s.S.DB().ExecContext(ctx, `
+		UPDATE watches
+		SET last_run_at = ?, consecutive_failures = 0, last_error = ?
+		WHERE id = ?`,
+		at.UTC().Format(time.RFC3339Nano),
+		fmt.Sprintf("%d of %d watch submissions failed", failed, total), id)
+	if err != nil {
+		return fmt.Errorf("recording degraded watch run: %w", err)
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if count == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
 // RecordFailure records an execution failure as an attempted run. The fifth
 // consecutive failure disables the watch so periodic scheduling cannot loop
 // indefinitely on a broken dependency.

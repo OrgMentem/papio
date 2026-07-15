@@ -320,7 +320,7 @@ func runWatch(ctx context.Context, raw json.RawMessage, system *bootstrap.System
 	}
 	result, err := system.WatchRunner.Run(ctx, params.ID)
 	if err != nil {
-		return failure(err)
+		return watchFailure(err)
 	}
 	return marshal(result)
 }
@@ -609,6 +609,38 @@ func zotioFailure(err error) ([]byte, *ipc.RPCError) {
 		ErrorHTTPStatus: info.HTTPStatus,
 	}
 	return nil, &ipc.RPCError{Code: "internal", Message: "operation failed", Detail: detail}
+}
+
+func watchFailure(err error) ([]byte, *ipc.RPCError) {
+	info := zotio.ErrorInfoFrom(err)
+	if info.Class == zotio.ErrorClassUnknown {
+		info.Class = "watch_execution_failed"
+		info.Hint = watchErrorHint(err)
+	}
+	return nil, &ipc.RPCError{
+		Code: "internal", Message: "watch execution failed",
+		Detail: &ipc.ErrorDetail{
+			ErrorClass:      info.Class,
+			ErrorHint:       info.Hint,
+			ErrorHTTPStatus: info.HTTPStatus,
+		},
+	}
+}
+
+func watchErrorHint(err error) string {
+	message := err.Error()
+	switch {
+	case strings.Contains(message, "response exceeds configured limit"):
+		return "OpenAlex response exceeds configured limit"
+	case strings.Contains(message, "invalid OpenAlex response"):
+		return "OpenAlex response was invalid"
+	case strings.Contains(message, "OpenAlex returned HTTP"):
+		return "OpenAlex returned an error response"
+	case strings.Contains(message, "contact email is required"):
+		return "OpenAlex contact email is required"
+	default:
+		return "watch execution failed"
+	}
 }
 
 func safeMessage(err error, fallback string) string {

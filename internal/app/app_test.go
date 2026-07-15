@@ -15,12 +15,14 @@ import (
 
 	"papio/internal/artifact"
 	"papio/internal/config"
+	"papio/internal/discovery"
 	"papio/internal/fetch"
 	"papio/internal/job"
 	"papio/internal/pdf"
 	"papio/internal/protocol"
 	"papio/internal/resolver"
 	"papio/internal/store"
+	"papio/internal/watch"
 	"papio/internal/work"
 	"papio/internal/zotio"
 )
@@ -117,6 +119,18 @@ type fakeAutoImporter struct {
 func (f *fakeAutoImporter) PlanAndApply(context.Context, string) (string, string, string, error) {
 	f.calls++
 	return f.status, f.parentKey, f.attachmentKey, f.err
+}
+
+type watchDiscoveryForApp struct{ works []discovery.DiscoveredWork }
+
+func (d watchDiscoveryForApp) Search(context.Context, discovery.SearchParams) ([]discovery.DiscoveredWork, error) {
+	return append([]discovery.DiscoveredWork(nil), d.works...), nil
+}
+
+type watchLookupForApp struct{ result *zotio.LookupWorksResult }
+
+func (l watchLookupForApp) LookupWorks(context.Context, zotio.LookupWorksRequest) (*zotio.LookupWorksResult, error) {
+	return l.result, nil
 }
 
 func TestProcessReadyEnrichesMetadataAndNeverPersistsSecrets(t *testing.T) {
@@ -516,6 +530,57 @@ func readyPipeline(svc *Service) {
 	fetches := 0
 	svc.Fetch = fakeDownload(&fetches)
 	svc.Validate = passValidation()
+}
+
+func TestWatchSubmissionForcesAutoImportThroughReady(t *testing.T) {
+	ctx := context.Background()
+	svc, jobs := newTestService(t)
+	svc.Config.Zotio.AutoImport = false
+	importer := &fakeAutoImporter{status: "applied", parentKey: "PARENT01", attachmentKey: "ATTACH01"}
+	svc.AutoImporter = importer
+	readyPipeline(svc)
+
+	watches := watch.NewStore(jobs.S)
+	created, err := watches.Create(ctx, watch.CreateInput{
+		Query: "auto import", Collection: "Reading", CadenceHours: 24, PerRunCap: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner := &watch.Runner{
+		Store: watches,
+		Discovery: watchDiscoveryForApp{works: []discovery.DiscoveredWork{{
+			Work:       work.Work{DOI: "10.1002/example", Title: "Watch paper", Authors: []string{"Ada"}, Year: 2026},
+			OpenAlexID: "https://openalex.org/W2741809807",
+		}}},
+		Lookup:    watchLookupForApp{result: &zotio.LookupWorksResult{Works: []zotio.WorkOwnership{{Status: zotio.OwnershipNotOwned}}}},
+		Submitter: svc,
+		DataDir:   svc.Config.DataDir,
+	}
+	result, err := runner.Run(ctx, created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Queued != 1 || result.Failed != 0 {
+		t.Fatalf("watch run = %+v", result)
+	}
+	row, err := jobs.ClaimNext(ctx, "watch-test", time.Minute)
+	if err != nil || row == nil {
+		t.Fatalf("claim watch job = %+v, %v", row, err)
+	}
+	submitted, err := jobs.Get(ctx, row.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !submitted.Policy.AutoImport || submitted.Policy.Collection != "Reading" {
+		t.Fatalf("watch job policy = %+v", submitted.Policy)
+	}
+	if err := svc.Process(ctx, row); err != nil {
+		t.Fatal(err)
+	}
+	if importer.calls != 1 {
+		t.Fatalf("PlanAndApply calls = %d, want 1", importer.calls)
+	}
 }
 
 func autoImportEvent(t *testing.T, jobs *job.Store, id string) map[string]any {

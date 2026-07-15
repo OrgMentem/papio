@@ -54,6 +54,9 @@ func TestSearchMapsRecordedOpenAlexWorks(t *testing.T) {
 	if got := gotQuery.Get("api_key"); got != "" {
 		t.Fatalf("api_key = %q, want omitted", got)
 	}
+	if got := gotQuery.Get("select"); got != "" {
+		t.Fatalf("select = %q, want omitted for full discovery search", got)
+	}
 	if got, want := gotQuery.Get("filter"), "from_publication_date:2020-01-01,to_publication_date:2024-12-31,open_access.is_oa:true"; got != want {
 		t.Fatalf("filter = %q, want %q", got, want)
 	}
@@ -111,6 +114,29 @@ func TestSearchMapsRecordedOpenAlexWorks(t *testing.T) {
 	}
 	if owned, ok := output[2]["owned"].(bool); !ok || owned {
 		t.Fatalf("third owned JSON = %#v", output[2]["owned"])
+	}
+}
+
+func TestSearchSlimSelectsOnlyWatchFields(t *testing.T) {
+	var query url.Values
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		query = r.URL.Query()
+		_, _ = w.Write([]byte(`{"results":[{"id":"https://openalex.org/W1234","doi":"https://doi.org/10.1000/slim","title":"Slim paper","publication_year":2026,"authorships":[],"open_access":{"is_oa":true}}]}`))
+	}))
+	defer server.Close()
+	client := NewWithOptions(Options{Client: http.DefaultClient, ContactEmail: "researcher@example.org", BaseURL: server.URL})
+	works, err := client.Search(context.Background(), SearchParams{Query: "slim search", Limit: 7, Slim: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := query.Get("select"), slimFields; got != want {
+		t.Fatalf("select = %q, want %q", got, want)
+	}
+	if got, want := query.Get("per-page"), "7"; got != want {
+		t.Fatalf("per-page = %q, want %q", got, want)
+	}
+	if len(works) != 1 || works[0].Abstract != "" || works[0].Work.DOI != "10.1000/slim" {
+		t.Fatalf("slim works = %+v", works)
 	}
 }
 

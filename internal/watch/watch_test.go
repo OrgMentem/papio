@@ -138,10 +138,11 @@ func (f *fakeLookup) LookupWorks(_ context.Context, request zotio.LookupWorksReq
 }
 
 type fakeSubmitter struct {
-	calls     []protocol.WorkRequest
-	byRequest map[string]string
-	err       error
-	auto      []*bool
+	calls      []protocol.WorkRequest
+	byRequest  map[string]string
+	err        error
+	failOnCall map[int]error
+	auto       []*bool
 }
 
 func (f *fakeSubmitter) SubmitWithAutoImport(_ context.Context, request protocol.WorkRequest, auto *bool) (string, error) {
@@ -149,6 +150,9 @@ func (f *fakeSubmitter) SubmitWithAutoImport(_ context.Context, request protocol
 	f.auto = append(f.auto, auto)
 	if f.err != nil {
 		return "", f.err
+	}
+	if err := f.failOnCall[len(f.calls)]; err != nil {
+		return "", err
 	}
 	if f.byRequest == nil {
 		f.byRequest = make(map[string]string)
@@ -171,6 +175,19 @@ func discovered(doi, openAlex string) discovery.DiscoveredWork {
 	return discovery.DiscoveredWork{
 		Work:       work.Work{DOI: doi, Title: "Paper " + doi, Authors: []string{"Ada"}, Year: 2025},
 		OpenAlexID: openAlex,
+	}
+}
+
+func TestOpenAlexOnlyDiscoveryBuildsProtocolValidTitleRequest(t *testing.T) {
+	requests := requestsForDiscovered([]discovery.DiscoveredWork{
+		discovered("", "https://openalex.org/W2741809807"),
+	})
+	if len(requests) != 1 || requests[0].Identifiers != nil {
+		t.Fatalf("requests = %+v, want one title-based request without openalex identifier", requests)
+	}
+	manifest := batch.NewManifest(requests, "watch: protocol", "", time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC))
+	if err := manifest.Works[0].Work.Validate(); err != nil {
+		t.Fatalf("OpenAlex-only discovery request is not protocol-valid: %v (%+v)", err, manifest.Works[0].Work)
 	}
 }
 
@@ -206,7 +223,7 @@ func TestRunnerDeduplicatesCapsManifestsAndNotifies(t *testing.T) {
 	if result.Queued != 2 || result.ManifestID == "" {
 		t.Fatalf("run result = %+v", result)
 	}
-	if len(discoveryFake.params) != 1 || discoveryFake.params[0].Limit != MaxPerRunCap || !discoveryFake.params[0].OAOnly || discoveryFake.params[0].YearFrom != 2020 {
+	if len(discoveryFake.params) != 1 || discoveryFake.params[0].Limit != 6 || !discoveryFake.params[0].Slim || !discoveryFake.params[0].OAOnly || discoveryFake.params[0].YearFrom != 2020 {
 		t.Fatalf("discovery params = %+v", discoveryFake.params)
 	}
 	if len(lookup.requests) != 1 || len(lookup.requests[0].Works) != 4 {
@@ -216,8 +233,8 @@ func TestRunnerDeduplicatesCapsManifestsAndNotifies(t *testing.T) {
 		t.Fatalf("submitted calls = %+v", submitter.calls)
 	}
 	for _, auto := range submitter.auto {
-		if auto != nil {
-			t.Fatalf("watch sent explicit auto-import override %v", auto)
+		if auto == nil || !*auto {
+			t.Fatalf("watch did not force auto-import: %v", auto)
 		}
 	}
 	manifest, err := batch.Load(runner.DataDir, result.ManifestID)
@@ -273,6 +290,70 @@ func TestRunnerRecordsZeroRunsWithoutNotification(t *testing.T) {
 	}
 	if stored.LastRunAt == "" || stored.ConsecutiveFailures != 0 {
 		t.Fatalf("stored zero-work run = %+v", stored)
+	}
+}
+
+func TestRunnerRecordsPartialSubmissionFailureAsDegraded(t *testing.T) {
+	ctx := context.Background()
+	watches := testStore(t)
+	watch := createWatch(t, watches, testWatchInput("partial"))
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	submitter := &fakeSubmitter{failOnCall: map[int]error{2: errors.New("submit failed")}}
+	runner := &Runner{
+		Store: watches,
+		Discovery: &fakeDiscovery{works: []discovery.DiscoveredWork{
+			discovered("10.1000/partial-one", "W3001"),
+			discovered("10.1000/partial-two", "W3002"),
+		}},
+		Lookup: &fakeLookup{result: &zotio.LookupWorksResult{Works: []zotio.WorkOwnership{
+			{Status: zotio.OwnershipNotOwned}, {Status: zotio.OwnershipNotOwned},
+		}}},
+		Submitter: submitter, DataDir: t.TempDir(), Now: func() time.Time { return now },
+	}
+	result, err := runner.Run(ctx, watch.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Queued != 1 || result.Failed != 1 {
+		t.Fatalf("partial result = %+v", result)
+	}
+	manifest, err := batch.Load(runner.DataDir, result.ManifestID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manifest.Works[0].Status != "submitted" || manifest.Works[1].Status != "submission_failed" {
+		t.Fatalf("partial manifest = %+v", manifest.Works)
+	}
+	stored, err := watches.Get(ctx, watch.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.ConsecutiveFailures != 0 || stored.LastError != "1 of 2 watch submissions failed" || stored.LastRunAt == "" {
+		t.Fatalf("degraded watch state = %+v", stored)
+	}
+}
+
+func TestRunnerFailsWhenEverySubmissionFails(t *testing.T) {
+	ctx := context.Background()
+	watches := testStore(t)
+	watch := createWatch(t, watches, testWatchInput("all fail"))
+	runner := &Runner{
+		Store:     watches,
+		Discovery: &fakeDiscovery{works: []discovery.DiscoveredWork{discovered("10.1000/all-fail", "W4001")}},
+		Lookup:    &fakeLookup{result: &zotio.LookupWorksResult{Works: []zotio.WorkOwnership{{Status: zotio.OwnershipNotOwned}}}},
+		Submitter: &fakeSubmitter{err: errors.New("submit failed")}, DataDir: t.TempDir(),
+		Now: func() time.Time { return time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC) },
+	}
+	result, err := runner.Run(ctx, watch.ID)
+	if err == nil || !strings.Contains(err.Error(), "all 1 watch submissions failed") || result.Failed != 1 {
+		t.Fatalf("all-failed result = %+v, error = %v", result, err)
+	}
+	stored, err := watches.Get(ctx, watch.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.ConsecutiveFailures != 1 || stored.LastError != "all 1 watch submissions failed" {
+		t.Fatalf("all-failed watch state = %+v", stored)
 	}
 }
 

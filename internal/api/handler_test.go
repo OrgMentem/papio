@@ -348,6 +348,16 @@ func TestRouterWatchAddListAndRemove(t *testing.T) {
 	}
 }
 
+func TestWatchFailureCarriesSafeRunnerDetail(t *testing.T) {
+	_, rpcErr := watchFailure(errors.New("discovery search: discovery: invalid OpenAlex response: response exceeds configured limit"))
+	if rpcErr == nil || rpcErr.Code != "internal" || rpcErr.Message != "watch execution failed" || rpcErr.Detail == nil {
+		t.Fatalf("watchFailure() = %#v", rpcErr)
+	}
+	if rpcErr.Detail.ErrorClass != "watch_execution_failed" || rpcErr.Detail.ErrorHint != "OpenAlex response exceeds configured limit" {
+		t.Fatalf("watch failure detail = %#v", rpcErr.Detail)
+	}
+}
+
 func TestZotioFailureCarriesOnlySafeTaxonomyDetail(t *testing.T) {
 	_, rpcErr := zotioFailure(errors.New("zotio stderr: unknown item field at https://zotero.example.test/users/42 /Users/reader/private.json"))
 	if rpcErr == nil || rpcErr.Code != "internal" || rpcErr.Message != "operation failed" || rpcErr.Detail == nil {
