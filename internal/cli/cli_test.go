@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"papio/internal/config"
@@ -29,6 +30,31 @@ func TestNormalizeIdentifiersRejectsAmbiguousOrMultipleInputs(t *testing.T) {
 	}
 	if _, err := normalizeIdentifiers([]string{"10.1000/example"}, "10.1000/other", "", "", "", ""); err == nil {
 		t.Fatal("positional plus explicit identifier accepted")
+	}
+}
+
+func TestSearchCommandAllowsSnowballWithoutQuery(t *testing.T) {
+	command := newSearchCommand(&options{})
+	if err := command.Flags().Set("cites", "10.1000/seed"); err != nil {
+		t.Fatal(err)
+	}
+	if err := command.Args(command, nil); err != nil {
+		t.Fatalf("snowball search without query rejected: %v", err)
+	}
+	if err := command.Flags().Set("cites", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := command.Args(command, nil); err == nil {
+		t.Fatal("search without query or a snowball DOI succeeded")
+	}
+	for _, name := range []string{"cites", "cited-by", "related-to"} {
+		flag := command.Flags().Lookup(name)
+		if flag == nil {
+			t.Fatalf("missing --%s flag", name)
+		}
+	}
+	if got := command.Flags().Lookup("cited-by").Usage; !strings.Contains(got, "backward references") || !strings.Contains(got, "cited_by:") {
+		t.Fatalf("cited-by help = %q", got)
 	}
 }
 

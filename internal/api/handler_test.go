@@ -262,3 +262,15 @@ func TestRouterDiscoverySearchValidatesParams(t *testing.T) {
 		}
 	}
 }
+
+func TestRouterDiscoverySearchAcceptsCitationSnowballWithoutQuery(t *testing.T) {
+	system := testSystem(t)
+	system.Discovery = nil
+	router := Router(system)
+	params := map[string]any{
+		"cites": "10.1000/seed", "cited_by": "10.1000/backward", "related_to": "10.1000/related",
+	}
+	if rpcErr := callMethod(t, router, "discovery.search", params, nil); rpcErr == nil || rpcErr.Code != "precondition_failed" {
+		t.Fatalf("citation snowball params RPC error = %+v, want precondition_failed", rpcErr)
+	}
+}

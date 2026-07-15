@@ -40,6 +40,7 @@ var RequiredCapabilities = map[string]string{
 	"import scan":       "read",
 	"import resolve":    "read",
 	"import apply":      "write",
+	"items add-to-collection": "write",
 	"sync":              "sync",
 }
 
@@ -189,6 +190,37 @@ func (c *Client) MissingPDF(ctx context.Context, collection string, limit int) (
 		items[i].Key = strings.TrimSpace(items[i].Key)
 		items[i].Title = strings.TrimSpace(items[i].Title)
 		items[i].DOI = strings.TrimSpace(items[i].DOI)
+		if !keyRE.MatchString(items[i].Key) {
+			return nil, fmt.Errorf("Zotio queue row %d has invalid item key %q", i, items[i].Key)
+		}
+	}
+	return items, nil
+}
+
+// MissingPDFKeys reads missing-PDF state for exact parent keys. It avoids
+// inferring ownership from an arbitrary page of a large library-wide queue.
+func (c *Client) MissingPDFKeys(ctx context.Context, keys []string) ([]MissingPDFItem, error) {
+	if len(keys) == 0 || len(keys) > 50 {
+		return nil, fmt.Errorf("missing-PDF key lookup requires 1..50 item keys")
+	}
+	clean := make([]string, 0, len(keys))
+	for _, key := range keys {
+		key = strings.TrimSpace(key)
+		if !keyRE.MatchString(key) {
+			return nil, fmt.Errorf("invalid Zotero item key %q", key)
+		}
+		clean = append(clean, key)
+	}
+	out, err := c.run(ctx, "--agent", "items", "missing-pdf", "--keys", strings.Join(clean, ","))
+	if err != nil {
+		return nil, fmt.Errorf("reading Zotio missing-PDF queue: %w", err)
+	}
+	var items []MissingPDFItem
+	if err := json.Unmarshal(out, &items); err != nil {
+		return nil, fmt.Errorf("decoding Zotio missing-PDF queue: %w", err)
+	}
+	for i := range items {
+		items[i].Key = strings.TrimSpace(items[i].Key)
 		if !keyRE.MatchString(items[i].Key) {
 			return nil, fmt.Errorf("Zotio queue row %d has invalid item key %q", i, items[i].Key)
 		}
@@ -380,7 +412,7 @@ func compareVersion(left, right string) int {
 }
 
 func requiredSubset(seen map[string]Capability) []Capability {
-	paths := []string{"items missing-pdf", "items get", "attachments add", "import scan", "import resolve", "import apply", "sync"}
+	paths := []string{"items missing-pdf", "items get", "attachments add", "items add-to-collection", "import scan", "import resolve", "import apply", "sync"}
 	out := make([]Capability, 0, len(paths))
 	for _, path := range paths {
 		out = append(out, seen[path])

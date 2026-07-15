@@ -111,6 +111,7 @@ type Policy struct {
 	SourcesDeny    []string `json:"sources_deny,omitempty"`
 	FetchMaxBytes  int64    `json:"fetch_max_bytes"`
 	AutoImport     bool     `json:"auto_import,omitempty"`
+	Collection     string   `json:"collection,omitempty"`
 }
 
 // SourceAllowed applies the allow/deny lists (deny wins; empty allow = all).

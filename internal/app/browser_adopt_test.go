@@ -89,6 +89,77 @@ func TestExhaustedCandidatesRouteToInstitutionalHandoff(t *testing.T) {
 	}
 }
 
+func TestBotBlockedOACandidateRoutesToBrowserHandoff(t *testing.T) {
+	const oaURL = "https://oa.example.org/articles/blocked-paper.pdf"
+	svc, jobs := newTestService(t)
+	svc.Config.AccessMode = config.ModeMaximal
+	svc.Config.Browser.OpenURLBase = "https://openurl.example.edu/resolve"
+	svc.Resolvers = []ResolverEntry{{
+		Adapter: &fakeResolver{name: "openalex", cands: []resolver.Candidate{{
+			Source: "openalex", URL: oaURL, ResolvedWork: work.Work{DOI: "10.1002/example"},
+			Version: resolver.VersionPublished, AccessBasis: resolver.AccessOpen, ReuseLicense: "unknown",
+			ExpectedMIME: "application/pdf", Direct: true, IdentityConfidence: 1,
+		}}},
+		Policy: config.Source{Enabled: true},
+	}}
+	svc.Fetch = func(context.Context, resolver.Candidate, string) (fetch.Result, error) {
+		return fetch.Result{}, &fetch.Error{Class: fetch.ClassInvalid, HTTPStatus: 403, Msg: "permanent HTTP response"}
+	}
+	svc.Validate = passValidation()
+
+	row := processToEnd(t, svc, jobs, "wr_oa_bot_block")
+	if row.State != job.StateAwaitingHuman {
+		t.Fatalf("state = %s, want awaiting_human", row.State)
+	}
+	actions, err := jobs.ListHumanActions(context.Background(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, action := range actions {
+		if action.JobID == row.ID && action.Kind == "openurl_handoff" {
+			if action.Detail != OABrowserHandoffActionDetail(oaURL) {
+				t.Fatalf("handoff detail = %q, want OA browser marker and URL", action.Detail)
+			}
+			return
+		}
+	}
+	t.Fatal("missing OA browser handoff")
+}
+
+func TestForbiddenNonOACandidateKeepsInstitutionalHandoff(t *testing.T) {
+	svc, jobs := newTestService(t)
+	svc.Config.AccessMode = config.ModeMaximal
+	svc.Config.Browser.OpenURLBase = "https://openurl.example.edu/resolve"
+	svc.Resolvers = []ResolverEntry{{
+		Adapter: &fakeResolver{name: "licensed", cands: []resolver.Candidate{{
+			Source: "licensed", URL: "https://licensed.example.org/paper.pdf",
+			ResolvedWork: work.Work{DOI: "10.1002/example"},
+			Version: resolver.VersionPublished, AccessBasis: resolver.AccessLicensedAPI, ReuseLicense: "unknown",
+			ExpectedMIME: "application/pdf", Direct: true, IdentityConfidence: 1,
+		}}},
+		Policy: config.Source{Enabled: true},
+	}}
+	svc.Fetch = func(context.Context, resolver.Candidate, string) (fetch.Result, error) {
+		return fetch.Result{}, &fetch.Error{Class: fetch.ClassInvalid, HTTPStatus: 403, Msg: "permanent HTTP response"}
+	}
+	svc.Validate = passValidation()
+
+	row := processToEnd(t, svc, jobs, "wr_non_oa_forbidden")
+	actions, err := jobs.ListHumanActions(context.Background(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, action := range actions {
+		if action.JobID == row.ID && action.Kind == "openurl_handoff" {
+			if action.Detail != InstitutionalOpenURLHandoffDetail {
+				t.Fatalf("handoff detail = %q, want institutional marker", action.Detail)
+			}
+			return
+		}
+	}
+	t.Fatal("missing institutional handoff")
+}
+
 func TestExhaustedCandidatesConservativeRecordsActionButStaysUnavailable(t *testing.T) {
 	svc, jobs := exhaustingService(t, config.ModeConservative, "https://openurl.example.edu/resolve")
 	row := processToEnd(t, svc, jobs, "wr_conservative")

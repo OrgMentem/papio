@@ -656,3 +656,20 @@ func TestSubmitWithAutoImportOverrideBeatsConfigDefault(t *testing.T) {
 		t.Fatal("config zotio.auto_import did not become new-job default")
 	}
 }
+
+func TestSubmitCarriesCollectionIntoJobPolicy(t *testing.T) {
+	svc, jobs := newTestService(t)
+	request := doiRequest("wr_collection_policy")
+	request.Collection = "  Reading list  "
+	id, err := svc.Submit(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, err := jobs.Get(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.Policy.Collection != "Reading list" {
+		t.Fatalf("policy collection = %q", row.Policy.Collection)
+	}
+}

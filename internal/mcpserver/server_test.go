@@ -68,7 +68,11 @@ func TestServerExposesBoundedPlanApplySurface(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(searchSchema), `"query"`) || !strings.Contains(string(searchSchema), `"oa_only"`) {
+	if !strings.Contains(string(searchSchema), `"query"`) ||
+		!strings.Contains(string(searchSchema), `"oa_only"`) ||
+		!strings.Contains(string(searchSchema), `"cites"`) ||
+		!strings.Contains(string(searchSchema), `"cited_by"`) ||
+		!strings.Contains(string(searchSchema), `"related_to"`) {
 		t.Fatalf("search schema = %s", searchSchema)
 	}
 

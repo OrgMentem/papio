@@ -246,6 +246,74 @@ func TestHandoffJobOfferedExactlyOncePerHelloSession(t *testing.T) {
 	}
 }
 
+func TestOABrowserHandoffOffersCandidateThenFallsBackToInstitution(t *testing.T) {
+	const oaURL = "https://oa.example.org/articles/blocked-paper.pdf"
+	b, jobs, cfg, _ := newBridge(t)
+	ctx := context.Background()
+	id := park(t, jobs, "wr_oa_fallback", handoffWork())
+	if _, err := jobs.OpenHumanAction(ctx, id, handoffActionKind, app.OABrowserHandoffActionDetail(oaURL)); err != nil {
+		t.Fatal(err)
+	}
+
+	msgs, _ := runSync(t, b, hello())
+	offer := firstOfType(msgs, protocol.MsgJobOffer)
+	if offer == nil {
+		t.Fatal("missing OA browser offer")
+	}
+	oaOffer := offer.Payload.(*protocol.JobOfferPayload)
+	if oaOffer.OpenURL != oaURL {
+		t.Fatalf("OA offer URL = %q, want %q", oaOffer.OpenURL, oaURL)
+	}
+	if !slices.Contains(oaOffer.ProviderHosts, "oa.example.org") {
+		t.Fatalf("OA offer hosts = %v, missing OA host", oaOffer.ProviderHosts)
+	}
+
+	msgs, _ = runSync(t, b, inFrame(t, protocol.MsgProviderOutcome, id, map[string]any{"outcome": "no_entitlement"}))
+	fallback := firstOfType(msgs, protocol.MsgJobOffer)
+	if fallback == nil {
+		t.Fatal("failed OA offer did not re-park with institutional handoff")
+	}
+	institutional := fallback.Payload.(*protocol.JobOfferPayload)
+	if institutional.OpenURL == oaURL || !strings.HasPrefix(institutional.OpenURL, cfg.Browser.OpenURLBase+"?") {
+		t.Fatalf("fallback offer URL = %q, want institutional OpenURL", institutional.OpenURL)
+	}
+	row, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.State != job.StateAwaitingHuman {
+		t.Fatalf("state after OA failure = %s, want awaiting_human", row.State)
+	}
+	actions, err := jobs.ListHumanActions(ctx, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundAction := false
+	for _, action := range actions {
+		if action.JobID != id || action.Kind != handoffActionKind {
+			continue
+		}
+		foundAction = true
+		if action.Detail != app.InstitutionalOpenURLHandoffDetail {
+			t.Fatalf("fallback action detail = %q, want institutional handoff", action.Detail)
+		}
+	}
+	if !foundAction {
+		t.Fatal("missing fallback handoff action")
+	}
+	msgs, _ = runSync(t, b, inFrame(t, protocol.MsgJobReject, id, map[string]any{}))
+	if countType(msgs, protocol.MsgJobOffer) != 0 {
+		t.Fatal("institutional fallback must not re-open the OA browser offer")
+	}
+	row, err = jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.State != job.StateUnavailable {
+		t.Fatalf("state after institutional rejection = %s, want unavailable", row.State)
+	}
+}
+
 func TestSentinelSecretNeverEntersMessagesOrDurableRows(t *testing.T) {
 	b, jobs, _, _ := newBridge(t)
 	id := park(t, jobs, "wr_sentinel", handoffWork())

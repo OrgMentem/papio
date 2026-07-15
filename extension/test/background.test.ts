@@ -233,6 +233,28 @@ test("job_offer opens exactly one tab and replies job_accept", async () => {
   expect(h.backend.store.activeJobs.length).toBe(1);
 });
 
+test("a changed re-offer replaces an OA browser tab with the institutional fallback", async () => {
+  const h = makeHarness();
+  const oaURL = "https://oa.example.org/blocked-paper.pdf";
+  const institutionalURL = "https://resolver.example.edu/openurl?fallback=1";
+  const oaOffer = jobOffer("job_0001b_fallback") as { payload: Record<string, unknown> };
+  oaOffer.payload["openurl"] = oaURL;
+  const institutionalOffer = jobOffer("job_0001b_fallback") as { payload: Record<string, unknown> };
+  institutionalOffer.payload["openurl"] = institutionalURL;
+
+  await h.bridge.start();
+  await h.port.inbound(oaOffer);
+  await h.port.inbound(institutionalOffer);
+
+  expect(h.tabs.created).toEqual([
+    { url: oaURL, active: true },
+    { url: institutionalURL, active: true },
+  ]);
+  expect(h.tabs.removed).toEqual([100]);
+  expect(h.backend.store.activeJobs[0]?.tab_id).toBe(101);
+  expect(h.frames().filter((f) => f.type === "job_accept" && f.job_id === "job_0001b_fallback")).toHaveLength(2);
+});
+
 test("job_reject is sent when tab creation fails", async () => {
   const h = makeHarness();
   h.tabs.failCreate = true;
@@ -301,6 +323,86 @@ test("a job-tab download completes to a basename-only frame; unrelated tab ignor
   expect(complete?.payload["filename"]).toBe("paper final.pdf");
   expect(complete?.payload["size_bytes"]).toBe(482913);
   expect(complete?.payload["download_id"]).toBe(1);
+});
+
+test("a PDF-viewer tab starts one download and closes after the adopted file completes", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(jobOffer("job_0010_pdf_viewer"));
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  const viewerURL = `https://${PROVIDER_HOST}/reader/blocked-paper.pdf`;
+
+  await h.tabs.onUpdated.emit(tabID, { url: viewerURL, status: "complete" }, { id: tabID, url: viewerURL });
+  await h.tabs.onUpdated.emit(tabID, { url: viewerURL, status: "complete" }, { id: tabID, url: viewerURL });
+  expect(h.downloads.started).toEqual([
+    {
+      url: viewerURL,
+      filename: "papio/job_0010_pdf_viewer/paper.pdf",
+      conflictAction: "uniquify",
+      saveAs: false,
+    },
+  ]);
+
+  await h.downloads.onCreated.emit({ id: 901, tabId: tabID, state: "in_progress" });
+  h.downloads.items.set(901, {
+    id: 901,
+    tabId: tabID,
+    filename: "/Users/x/Downloads/paper.pdf",
+    fileSize: 128,
+    state: "complete",
+  });
+  await h.downloads.onChanged.emit({ id: 901, state: { current: "complete" } });
+  expect(h.tabs.removed).toEqual([]);
+  await h.port.inbound({
+    protocol: "papio-browser/1",
+    type: "ack",
+    msg_id: "ack_00000001",
+    job_id: "job_0010_pdf_viewer",
+    seq: 1,
+    payload: {},
+  });
+
+  expect(h.frames().some((f) => f.type === "download_complete" && f.job_id === "job_0010_pdf_viewer")).toBe(true);
+  expect(h.tabs.removed).toEqual([tabID]);
+});
+
+test("Chrome's built-in PDF viewer downloads the memory-only offered URL", async () => {
+  const h = makeHarness();
+  const offeredURL = "https://oa.example.org/opaque-download";
+  const offer = jobOffer("job_0010b_chrome_viewer") as { payload: Record<string, unknown> };
+  offer.payload["openurl"] = offeredURL;
+  await h.bridge.start();
+  await h.port.inbound(offer);
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  const chromeViewerURL = "chrome-extension://mhjfbmdgcfjbbpaeojofohoefgiehjai/index.html";
+
+  await h.tabs.onUpdated.emit(
+    tabID,
+    { url: chromeViewerURL, status: "complete" },
+    { id: tabID, url: chromeViewerURL },
+  );
+
+  expect(h.downloads.started).toEqual([
+    {
+      url: offeredURL,
+      filename: "papio/job_0010b_chrome_viewer/paper.pdf",
+      conflictAction: "uniquify",
+      saveAs: false,
+    },
+  ]);
+});
+
+test("a pre-existing content-disposition download prevents PDF-viewer duplication", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(jobOffer("job_0011_pdf_dedup"));
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+
+  await h.downloads.onCreated.emit({ id: 77, tabId: tabID, state: "in_progress" });
+  const pdfURL = `https://${PROVIDER_HOST}/download/paper.pdf`;
+  await h.tabs.onUpdated.emit(tabID, { url: pdfURL, status: "complete" }, { id: tabID, url: pdfURL });
+
+  expect(h.downloads.started).toEqual([]);
 });
 
 test("a correlated download is steered into papio/<job_id>/; unrelated untouched", async () => {

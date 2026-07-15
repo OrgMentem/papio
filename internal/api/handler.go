@@ -91,6 +91,9 @@ func RouterWithShutdown(system *bootstrap.System, shutdown context.CancelFunc) i
 		"zotio.queue": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return zotioQueue(ctx, raw, system)
 		},
+		"zotio.lookup_works": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return zotioLookupWorks(ctx, raw, system)
+		},
 		"zotio.plan": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return zotioPlan(ctx, raw, system)
 		},
@@ -181,6 +184,21 @@ func zotioQueue(ctx context.Context, raw json.RawMessage, system *bootstrap.Syst
 	result, err := system.Zotio.QueueMissingPDF(ctx, options)
 	if err != nil {
 		return nil, &ipc.RPCError{Code: "precondition_failed", Message: safeMessage(err, "Zotio queue failed")}
+	}
+	return marshal(result)
+}
+
+func zotioLookupWorks(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
+	var request zotio.LookupWorksRequest
+	if err := ipc.DecodeParams(raw, &request); err != nil {
+		return badParams(err)
+	}
+	if system.Zotio == nil {
+		return nil, &ipc.RPCError{Code: "precondition_failed", Message: "Zotio integration is not configured"}
+	}
+	result, err := system.Zotio.LookupWorks(ctx, request)
+	if err != nil {
+		return nil, &ipc.RPCError{Code: "precondition_failed", Message: safeMessage(err, "Zotio ownership lookup failed")}
 	}
 	return marshal(result)
 }
@@ -410,14 +428,14 @@ func browserSync(ctx context.Context, raw json.RawMessage, system *bootstrap.Sys
 	return marshal(map[string]any{"outbound": outbound})
 }
 
-// searchDiscovery maps strict RPC input to the single-request OpenAlex client.
+// searchDiscovery maps strict RPC input to the bounded OpenAlex client.
 func searchDiscovery(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
 	var params discovery.SearchParams
 	if err := ipc.DecodeParams(raw, &params); err != nil {
 		return badParams(err)
 	}
-	if strings.TrimSpace(params.Query) == "" {
-		return badParams(errors.New("query is required"))
+	if strings.TrimSpace(params.Query) == "" && !params.HasCitationSnowball() {
+		return badParams(errors.New("query is required unless a citation snowball DOI is supplied"))
 	}
 	if system == nil || system.Discovery == nil {
 		return nil, &ipc.RPCError{Code: "precondition_failed", Message: "discovery is not configured"}

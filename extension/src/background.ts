@@ -45,6 +45,8 @@ import { observeUnknown } from "./observe";
 import { chromeKeepaliveAPI, initKeepalive } from "./keepalive";
 
 export const NATIVE_HOST = "com.orgmentem.papio";
+const CHROME_PDF_VIEWER_HOST = "mhjfbmdgcfjbbpaeojofohoefgiehjai";
+
 
 export interface Listenable<A extends unknown[]> {
   addListener(cb: (...args: A) => void): void;
@@ -195,6 +197,8 @@ function extractDownloadURL(selector: string): string | null {
   }
 }
 
+
+
 /** Self-contained declared click, optionally through one explicitly named
  * control in an open shadow root. It may then wait for one declared in-page
  * gate or click one declared provider download-modal control. No guessed
@@ -268,6 +272,12 @@ export class Bridge {
   /** Tabs we are intentionally closing, so onRemoved does not emit a spurious
    * cancelled outcome for a programmatic close. */
   private readonly closingTabs = new Set<number>();
+  /** A finished download keeps its broker tab open until the daemon has
+   * acknowledged the adoption attempt for that job. */
+  private readonly completedDownloadTabs = new Map<string, number>();
+  /** Offer URLs are memory-only so a fallback re-offer can replace an active
+   * OA tab without persisting a possibly signed URL. */
+  private readonly offerURLs = new Map<string, string>();
   /** Latest resolver URL from an offer; intentionally memory-only. */
   private latestOfferOpenURL: string | undefined;
 
@@ -307,6 +317,8 @@ export class Bridge {
       // Tab may already be gone; the outcome frame is what matters.
     }
     this.downloads.delete(jobID);
+    this.offerURLs.delete(jobID);
+    this.completedDownloadTabs.delete(jobID);
     await this.update((s) => removeJob(s, jobID));
   }
 
@@ -480,7 +492,9 @@ export class Bridge {
         await this.onCancel(msg);
         return;
       case "hello_ack":
+        return;
       case "ack":
+        await this.closeAfterAdoption(msg.job_id);
         return;
       case "error":
         console.warn("papio: daemon reported error", msg.payload);
@@ -501,12 +515,14 @@ export class Bridge {
     const expiresAt = p["expires_at"];
     // Shape is already guaranteed by parseBrowserMessage; these narrow for TS.
     if (typeof openurl !== "string" || !Array.isArray(hostsRaw) || typeof expiresAt !== "string") return;
+    const priorOfferURL = this.offerURLs.get(jobID);
     this.latestOfferOpenURL = openurl;
     const providerHosts = hostsRaw.filter((h): h is string => typeof h === "string");
     const expected = parseExpected(p["expected"]);
 
-    // Restart/re-offer dedup: if we already track this job with a live tab, do
-    // not open a second tab — just re-accept using the existing tab.
+    // Restart/re-offer dedup normally re-accepts a live tab. A re-offer whose
+    // URL changed is the daemon's OA->institution fallback, so close the old
+    // broker tab and open the replacement instead.
     const existing = findByJob(this.store, jobID);
     if (existing) {
       let live = false;
@@ -516,10 +532,21 @@ export class Bridge {
       } catch {
         live = false;
       }
-      if (live) {
+      if (live && (priorOfferURL === undefined || priorOfferURL === openurl)) {
         this.send("job_accept", {}, jobID);
         return;
       }
+      if (live) {
+        this.closingTabs.add(existing.tab_id);
+        try {
+          await this.deps.tabs.remove(existing.tab_id);
+        } catch (e) {
+          console.error("papio: could not replace prior handoff tab", e);
+          this.send("job_reject", {}, jobID);
+          return;
+        }
+      }
+      this.offerURLs.delete(jobID);
       await this.update((s) => removeJob(s, jobID));
     }
 
@@ -549,6 +576,7 @@ export class Bridge {
       ...(expected !== undefined ? { expected } : {}),
     };
     await this.update((s) => upsertJob(s, job));
+    this.offerURLs.set(jobID, openurl);
     this.send("job_accept", {}, jobID);
   }
 
@@ -565,6 +593,25 @@ export class Bridge {
       // Tab already closed.
     }
     this.downloads.delete(jobID);
+    this.offerURLs.delete(jobID);
+    this.completedDownloadTabs.delete(jobID);
+    await this.update((s) => removeJob(s, jobID));
+  }
+
+  /** The daemon acknowledges download_complete only after it has attempted
+   * adoption. Close the broker-owned viewer then, never on a raw tab event. */
+  private async closeAfterAdoption(jobID: string | undefined): Promise<void> {
+    if (jobID === undefined) return;
+    const tabID = this.completedDownloadTabs.get(jobID);
+    if (tabID === undefined) return;
+    this.completedDownloadTabs.delete(jobID);
+    this.offerURLs.delete(jobID);
+    this.closingTabs.add(tabID);
+    try {
+      await this.deps.tabs.remove(tabID);
+    } catch {
+      // The viewer may already have closed itself after the download completed.
+    }
     await this.update((s) => removeJob(s, jobID));
   }
 
@@ -582,6 +629,31 @@ export class Bridge {
     }
     const onProvider = hostMatches(host, job.provider_hosts);
     if (!onProvider) {
+      // Chrome exposes its built-in PDF viewer as an internal extension URL.
+      // The actual tab URL is no longer downloadable, so reuse the memory-only
+      // offer URL that produced that viewer; it is never written to storage.
+      if (change.status === "complete" && host === CHROME_PDF_VIEWER_HOST) {
+        const offeredURL = this.offerURLs.get(job.job_id);
+        if (offeredURL !== undefined) {
+          await this.maybeDownloadPDFViewer(job.job_id, offeredURL, true);
+          return;
+        }
+      }
+      // A direct PDF can legitimately land on a CDN outside the offer's
+      // provider-host list. Its URL alone is sufficient to preserve the
+      // browser download flow without treating that redirect as an IdP hop.
+      if (change.status === "complete") {
+        let directPDF = false;
+        try {
+          directPDF = new URL(url).pathname.toLowerCase().endsWith(".pdf");
+        } catch {
+          directPDF = false;
+        }
+        if (directPDF) {
+          await this.maybeDownloadPDFViewer(job.job_id, url);
+          return;
+        }
+      }
       if (job.status !== "auth_pending") {
         // Left every provider host — human authentication has begun. Emit timing
         // only; the URL/host is never serialised.
@@ -602,7 +674,54 @@ export class Bridge {
     // human auth), run the declarative adapter — permission-gated, tracked-tab
     // only. Re-reads fresh job state; a stale local `job` here is fine.
     if (change.status === "complete") {
+      await this.maybeDownloadPDFViewer(job.job_id, url);
       await this.maybeClassify(job.job_id, host);
+    }
+  }
+
+  /** Download a tracked PDF-viewer navigation through Chrome's download API.
+   * The persisted latch and in-memory correlation jointly ensure that a
+   * content-disposition download or repeated completion event cannot start a
+   * second download for the same job. Page classification stays exclusively in
+   * the declarative adapter path; this method accepts only a PDF URL or the
+   * recognized Chrome PDF viewer. */
+  private async maybeDownloadPDFViewer(jobID: string, url: string, knownPDFViewer = false): Promise<void> {
+    let job = findByJob(this.store, jobID);
+    if (!job || (job.status !== "accepted" && job.status !== "awaiting_download")) return;
+    if (job.download_initiated === true || this.downloads.has(jobID)) return;
+
+    let viewer = knownPDFViewer;
+    if (!viewer) {
+      try {
+        viewer = new URL(url).pathname.toLowerCase().endsWith(".pdf");
+      } catch {
+        viewer = false;
+      }
+    }
+    if (!viewer) return;
+
+    // Re-read after the permission/probe awaits: a content-disposition
+    // download may have been correlated while this probe was in flight.
+    job = findByJob(this.store, jobID);
+    if (!job || job.download_initiated === true || this.downloads.has(jobID)) return;
+    await this.update((s) => patchJob(s, jobID, { download_initiated: true }));
+
+    this.pendingDownloadURLs.set(url, jobID);
+    try {
+      const id = await this.deps.downloads.download({
+        url,
+        filename: `papio/${jobID}/paper.pdf`,
+        conflictAction: "uniquify",
+        saveAs: false,
+      });
+      const track = this.downloads.get(jobID) ?? { ids: new Set<number>(), ambiguous: false };
+      track.ids.add(id);
+      if (track.ids.size > 1) track.ambiguous = true;
+      this.downloads.set(jobID, track);
+    } catch (e) {
+      console.error("papio: PDF-viewer download initiation failed; staying assisted", e);
+    } finally {
+      this.pendingDownloadURLs.delete(url);
     }
   }
 
@@ -787,11 +906,15 @@ export class Bridge {
     // drop our local tab correlation but leave the job parked daemon-side.
     // Cancelling only stands while the handoff has not yet reached download.
     if (job.status === "awaiting_download") {
+      this.offerURLs.delete(job.job_id);
+      this.completedDownloadTabs.delete(job.job_id);
       await this.update((s) => removeJob(s, job.job_id));
       return;
     }
     this.send("provider_outcome", { outcome: "cancelled" }, job.job_id);
     this.downloads.delete(job.job_id);
+    this.offerURLs.delete(job.job_id);
+    this.completedDownloadTabs.delete(job.job_id);
     await this.update((s) => removeJob(s, job.job_id));
   }
 
@@ -826,6 +949,11 @@ export class Bridge {
     await this.ready;
     const job = this.correlate(item);
     if (!job) return; // unrelated tab / unknown origin: ignore entirely
+    if (job.download_initiated !== true) {
+      // Native browser downloads (not just adapter/viewer API requests) must
+      // latch before a later completed-tab event can see a PDF viewer.
+      await this.update((s) => patchJob(s, job.job_id, { download_initiated: true }));
+    }
     const track = this.downloads.get(job.job_id) ?? { ids: new Set<number>(), ambiguous: false };
     track.ids.add(item.id);
     if (track.ids.size > 1) track.ambiguous = true; // simultaneous candidates: user decides
@@ -856,11 +984,11 @@ export class Bridge {
     const size = item.fileSize ?? item.totalBytes ?? item.bytesReceived ?? 0;
     if (filename.length === 0 || size < 1) return; // cannot form a valid frame; leave to the user
 
+    await this.update((s) => patchJob(s, owner.job_id, { status: "awaiting_download" }));
     this.send("download_started", { download_id: delta.id, filename }, owner.job_id);
     this.send("download_complete", { download_id: delta.id, filename, size_bytes: size }, owner.job_id);
-    const jobID = owner.job_id;
-    this.downloads.delete(jobID);
-    await this.update((s) => removeJob(s, jobID)); // extension's work is done; a later tab close is not a cancel
+    this.completedDownloadTabs.set(owner.job_id, owner.tab_id);
+    this.downloads.delete(owner.job_id);
   }
 }
 

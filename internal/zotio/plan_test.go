@@ -3,6 +3,7 @@ package zotio
 
 import (
 	"context"
+	"errors"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -29,6 +30,8 @@ type planCLI struct {
 	previewCalls  int
 	applyCalls    int
 	lastResolveAt string
+	collectionCalls int
+	collectionErr   error
 }
 
 func (c *planCLI) Preflight(context.Context) (*PreflightResult, error) {
@@ -51,6 +54,9 @@ func (c *planCLI) RunJSON(_ context.Context, args ...string) (json.RawMessage, e
 		c.resolveCalls++
 		c.lastResolveAt = args[len(args)-1]
 		return json.RawMessage(c.manifest), nil
+	case strings.Contains(joined, "items add-to-collection"):
+		c.collectionCalls++
+		return json.RawMessage(`{"ok":true}`), c.collectionErr
 	case strings.Contains(joined, "--yes"):
 		c.applyCalls++
 		return json.RawMessage(c.apply), c.applyErr
@@ -350,5 +356,51 @@ func TestManifestDuplicatePlanReturnsNoOpWithoutAttachment(t *testing.T) {
 	}
 	if plans[0].Route != "manifest_duplicate" || result.Status != "no_op" || result.ParentKey != "AB12CD34" || result.AttachmentKey != "" {
 		t.Fatalf("plan=%+v result=%+v", plans[0], result)
+	}
+}
+
+func TestPlanAndApplyFilesPolicyCollectionWithoutRollingBackImport(t *testing.T) {
+	cli := &planCLI{
+		preview: `{"ok":true,"mode":"preview","plan":{"summary":{"planned":1,"no_op":0,"invalid":0}},"result":null}`,
+		apply:   `{"ok":true,"mode":"apply","plan":{"summary":{"planned":1}},"result":{"summary":{"applied":1,"no_op":0,"conflicts":0,"failed":0},"items":[{"key":"AB12CD34","status":"applied","reason":{"item_key":"AT56CH90","upload":"uploaded"}}]}}`,
+		collectionErr: errors.New("collection service unavailable"),
+	}
+	service, jobID := readyPlanService(t, "AB12CD34", cli)
+	row, err := service.Bundle.Jobs.Get(context.Background(), jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	row.Policy.Collection = "Reading"
+	policyJSON, err := json.Marshal(row.Policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Store.DB().Exec(`UPDATE jobs SET policy_json = ? WHERE id = ?`, string(policyJSON), jobID); err != nil {
+		t.Fatal(err)
+	}
+
+	status, parentKey, attachmentKey, err := service.PlanAndApply(context.Background(), jobID)
+	if err != nil {
+		t.Fatalf("collection filing must not fail import: %v", err)
+	}
+	if status != "applied" || parentKey != "AB12CD34" || attachmentKey != "AT56CH90" || cli.collectionCalls != 1 {
+		t.Fatalf("result=(%q,%q,%q) collection calls=%d", status, parentKey, attachmentKey, cli.collectionCalls)
+	}
+	events, err := service.Bundle.Jobs.Events(context.Background(), jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, event := range events {
+		if event["kind"] != "zotio.collection_filing" {
+			continue
+		}
+		detail, _ := event["detail"].(map[string]any)
+		if detail["collection"] == "Reading" && detail["status"] == "error" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("collection filing failure was not recorded: %+v", events)
 	}
 }

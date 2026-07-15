@@ -3,6 +3,8 @@
 package cli
 
 import (
+	"papio/internal/protocol"
+	"papio/internal/zotio"
 	"strings"
 	"testing"
 )
@@ -51,5 +53,37 @@ func TestParseBatchRejectsMoreThanFiftyWorks(t *testing.T) {
 	_, err := parseBatch(strings.NewReader(strings.Repeat(line, 51)))
 	if err == nil || !strings.Contains(err.Error(), "maximum of 50") {
 		t.Fatalf("error = %v, want batch size rejection", err)
+	}
+}
+
+func TestApplyBatchOwnershipSkipsOwnedCopiesAndPinsMissingPDF(t *testing.T) {
+	requests := []protocol.WorkRequest{
+		{RequestID: "new"},
+		{RequestID: "complete"},
+		{RequestID: "missing"},
+	}
+	ownership := zotio.LookupWorksResult{Works: []zotio.WorkOwnership{
+		{Status: zotio.OwnershipNotOwned},
+		{Status: zotio.OwnershipOwnedWithPDF, ItemKey: "PDF00001"},
+		{Status: zotio.OwnershipOwnedMissingPDF, ItemKey: "MISS0001"},
+	}}
+
+	pending, skipped, err := applyBatchOwnership(requests, ownership, " Reading ", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if skipped != 1 || len(pending) != 2 {
+		t.Fatalf("pending=%+v skipped=%d", pending, skipped)
+	}
+	if pending[0].Collection != "Reading" || pending[1].Collection != "Reading" || pending[1].ZotioItemKey != "MISS0001" {
+		t.Fatalf("batch routes = %+v", pending)
+	}
+
+	included, skipped, err := applyBatchOwnership(requests, ownership, "Reading", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if skipped != 0 || len(included) != 3 || included[2].ZotioItemKey != "MISS0001" {
+		t.Fatalf("include-owned routes=%+v skipped=%d", included, skipped)
 	}
 }

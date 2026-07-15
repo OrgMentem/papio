@@ -108,6 +108,7 @@ func (s *Service) SubmitWithAutoImport(ctx context.Context, wr protocol.WorkRequ
 		SourcesDeny:   append([]string(nil), wr.SourcesDeny...),
 		FetchMaxBytes: s.Config.Fetch.MaxBytes,
 		AutoImport:    auto,
+		Collection:     strings.TrimSpace(wr.Collection),
 	}
 	return s.Jobs.CreateRequest(ctx, wr.RequestID, w, wr.ZotioItemKey, wr.Collection, pol, raw)
 }
@@ -213,7 +214,7 @@ func (s *Service) Process(ctx context.Context, row *job.Row) error {
 			return s.Jobs.Transition(ctx, row.ID, job.StateResolving, job.StateRetryWait,
 				map[string]any{"reason": "resolver_temporarily_unavailable"}, job.WithRetryAt(retryAt))
 		}
-		return s.exhaustedCandidates(ctx, row, job.StateResolving, "no_legal_candidates", "no legal candidates")
+		return s.exhaustedCandidates(ctx, row, job.StateResolving, "no_legal_candidates", "no legal candidates", "")
 	}
 
 	if err := s.Jobs.Transition(ctx, row.ID, job.StateResolving, job.StateFetching,
@@ -319,6 +320,10 @@ func (s *Service) resolve(ctx context.Context, row *job.Row) (map[string]resolve
 
 func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[string]resolver.Candidate, retryAt time.Time) error {
 	manual := false
+	// Candidate rows and events retain only redacted URLs. Keep the one
+	// browser-eligible OA URL only through this acquisition pass, then record
+	// it in the local handoff action if the job exhausts.
+	oaBrowserURL := ""
 	for {
 		stored, err := s.Jobs.NextPendingCandidate(ctx, row.ID)
 		if err != nil {
@@ -382,6 +387,9 @@ func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[st
 			_ = os.Remove(temp)
 			class, status, delay := fetchFailure(err)
 			_ = s.Jobs.FinishAttempt(ctx, attempt, class, status, safeType(err))
+			if oaBrowserURL == "" && isOABrowserBlocked(candidate, err) {
+				oaBrowserURL = candidate.URL
+			}
 			switch class {
 			case fetch.ClassRetryable:
 				_ = s.Jobs.MarkCandidate(ctx, stored.ID, "retryable")
@@ -427,29 +435,35 @@ func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[st
 		return s.Jobs.Transition(ctx, row.ID, job.StateFetching, job.StateRetryWait,
 			map[string]any{"reason": "candidate_temporarily_unavailable"}, job.WithRetryAt(retryAt))
 	}
-	return s.exhaustedCandidates(ctx, row, job.StateFetching, "candidates_exhausted", "all candidates exhausted")
+	return s.exhaustedCandidates(ctx, row, job.StateFetching, "candidates_exhausted", "all candidates exhausted", oaBrowserURL)
 }
 
 // exhaustedCandidates handles the terminal "no direct candidate" boundary —
 // either resolving produced zero legal candidates or fetching exhausted them
-// all without an artifact. With an OpenURL base configured, assisted/maximal
-// jobs route to the visible institutional handoff (parked in awaiting_human
-// with an open openurl_handoff action) instead of failing; conservative mode
-// records that the institutional option exists but deliberately does not open
-// it, then ends the job unavailable as before. The handoff detail is a static,
-// redacted note: no signed query ever appears here.
-func (s *Service) exhaustedCandidates(ctx context.Context, row *job.Row, from, reason, terminal string) error {
+// all without an artifact. A bot-blocked open-access candidate gets one
+// browser-native attempt before the ordinary institutional OpenURL handoff.
+// The action detail carries the live OA URL solely for the browser bridge; it
+// is never copied into job events or protocol metadata.
+func (s *Service) exhaustedCandidates(ctx context.Context, row *job.Row, from, reason, terminal, oaBrowserURL string) error {
 	mode := s.Config.AccessMode
-	if s.Config.Browser.OpenURLBase != "" {
-		switch mode {
-		case config.ModeAssisted, config.ModeMaximal:
-			if _, err := s.Jobs.OpenHumanAction(ctx, row.ID, "openurl_handoff",
-				"open-access candidates exhausted; institutional OpenURL handoff available in your browser"); err != nil {
+	switch mode {
+	case config.ModeAssisted, config.ModeMaximal:
+		if oaBrowserURL != "" {
+			if _, err := s.Jobs.OpenHumanAction(ctx, row.ID, "openurl_handoff", OABrowserHandoffActionDetail(oaBrowserURL)); err != nil {
+				return err
+			}
+			return s.Jobs.Transition(ctx, row.ID, from, job.StateAwaitingHuman,
+				map[string]any{"reason": "open_access_browser_handoff"})
+		}
+		if s.Config.Browser.OpenURLBase != "" {
+			if _, err := s.Jobs.OpenHumanAction(ctx, row.ID, "openurl_handoff", InstitutionalOpenURLHandoffDetail); err != nil {
 				return err
 			}
 			return s.Jobs.Transition(ctx, row.ID, from, job.StateAwaitingHuman,
 				map[string]any{"reason": "institutional_handoff"})
-		case config.ModeConservative:
+		}
+	case config.ModeConservative:
+		if s.Config.Browser.OpenURLBase != "" {
 			if _, err := s.Jobs.OpenHumanAction(ctx, row.ID, "openurl_available",
 				"no direct candidates; institutional OpenURL available but not opened in conservative mode"); err != nil {
 				return err
@@ -566,6 +580,51 @@ func (s *Service) autoImportReady(ctx context.Context, row *job.Row) {
 	}
 	detail["status"] = status
 	_ = s.Jobs.RecordEvent(eventCtx, row.ID, "zotio.auto_import", detail)
+}
+
+// InstitutionalOpenURLHandoffDetail describes the ordinary resolver handoff.
+// The browser bridge uses this same durable detail when a one-time OA offer
+// fails, so a re-park cannot alternate back to the OA candidate.
+const InstitutionalOpenURLHandoffDetail = "open-access candidates exhausted; institutional OpenURL handoff available in your browser"
+
+// OABrowserHandoffDetail identifies a handoff that must open the public OA
+// candidate itself rather than constructing an institutional OpenURL. The
+// second line is consumed only by the local browser bridge; protocol frames
+// continue to use their frozen openurl field.
+const OABrowserHandoffDetail = "open-access fetch via browser"
+
+func OABrowserHandoffActionDetail(url string) string {
+	return OABrowserHandoffDetail + "\n" + url
+}
+
+// OABrowserHandoffURL returns the live OA offer URL stored in an OA browser
+// handoff detail. The strict two-line shape avoids accepting an arbitrary
+// human-action message as a browser URL.
+func OABrowserHandoffURL(detail string) (string, bool) {
+	const prefix = OABrowserHandoffDetail + "\n"
+	url, ok := strings.CutPrefix(detail, prefix)
+	if !ok || url == "" || strings.ContainsAny(url, "\r\n") || !strings.HasPrefix(url, "https://") {
+		return "", false
+	}
+	return url, true
+}
+
+func isOABrowserBlocked(candidate resolver.Candidate, err error) bool {
+	if candidate.AccessBasis != resolver.AccessOpen || !strings.HasPrefix(candidate.URL, "https://") {
+		return false
+	}
+	var fe *fetch.Error
+	if !errors.As(err, &fe) {
+		return false
+	}
+	if fe.HTTPStatus == http.StatusForbidden {
+		return true
+	}
+	// Fetch keeps the classification message redacted. Challenge/captcha
+	// payloads are meaningful here: the ordinary browser can clear a public
+	// anti-bot gate without presenting an institutional credential.
+	msg := strings.ToLower(fe.Msg)
+	return strings.Contains(msg, "challenge") || strings.Contains(msg, "anti-bot") || strings.Contains(msg, "captcha")
 }
 
 func fetchFailure(err error) (class string, status int, delay time.Duration) {

@@ -86,6 +86,24 @@ func TestMissingPDFUsesExactCollectionAndValidatesRows(t *testing.T) {
 	}
 }
 
+func TestMissingPDFKeysUsesExactParentKeys(t *testing.T) {
+	var got []string
+	client := &Client{Executable: "zotio", Exec: func(_ context.Context, args ...string) ([]byte, error) {
+		got = append([]string(nil), args...)
+		return []byte(`[{"key":"AB12CD34","title":"Paper"}]`), nil
+	}}
+	items, err := client.MissingPDFKeys(context.Background(), []string{"AB12CD34", "EF56GH78"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].Key != "AB12CD34" {
+		t.Fatalf("items = %+v", items)
+	}
+	if actual, want := strings.Join(got, " "), "--agent items missing-pdf --keys AB12CD34,EF56GH78"; actual != want {
+		t.Fatalf("argv = %q, want %q", actual, want)
+	}
+}
+
 func TestGetItemBuildsTitleAuthorYearFallback(t *testing.T) {
 	client := &Client{Executable: "zotio", Exec: func(_ context.Context, args ...string) ([]byte, error) {
 		if strings.Join(args, " ") != "--agent items get AB12CD34" {

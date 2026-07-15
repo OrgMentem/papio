@@ -126,6 +126,11 @@ func (b *Bridge) handle(ctx context.Context, msg *protocol.BrowserMessage) ([]js
 		if err := b.jobs.S.AppendEvent(ctx, msg.JobID, "browser.job_reject", nil); err != nil {
 			return nil, err
 		}
+		if fellBack, err := b.fallbackOAHandoff(ctx, msg.JobID, "browser_rejected"); err != nil {
+			return nil, err
+		} else if fellBack {
+			return nil, nil
+		}
 		if err := b.resolveHandoff(ctx, msg.JobID, "cancelled"); err != nil {
 			return nil, err
 		}
@@ -224,6 +229,11 @@ func (b *Bridge) outcome(ctx context.Context, jobID string, p *protocol.Provider
 		return b.jobs.Cancel(ctx, jobID, "browser_cancelled")
 
 	case "no_entitlement", "document_delivery_available":
+		if fellBack, err := b.fallbackOAHandoff(ctx, jobID, p.Outcome); err != nil {
+			return err
+		} else if fellBack {
+			return nil
+		}
 		if err := b.resolveHandoff(ctx, jobID, "resolved"); err != nil {
 			return err
 		}
@@ -403,10 +413,10 @@ func (b *Bridge) poll(ctx context.Context) ([]json.RawMessage, error) {
 	if err != nil {
 		return nil, err
 	}
-	handoff := map[string]bool{}
+	handoff := map[string]job.HumanAction{}
 	for _, a := range actions {
 		if a.Kind == handoffActionKind {
-			handoff[a.JobID] = true
+			handoff[a.JobID] = a
 		}
 	}
 	present := map[string]bool{}
@@ -414,7 +424,8 @@ func (b *Bridge) poll(ctx context.Context) ([]json.RawMessage, error) {
 	for i := range awaiting {
 		row := awaiting[i]
 		present[row.ID] = true
-		if !handoff[row.ID] {
+		action, ok := handoff[row.ID]
+		if !ok {
 			continue
 		}
 		// Directory-scan adoption: a file the user (or a steered Chrome
@@ -435,7 +446,7 @@ func (b *Bridge) poll(ctx context.Context) ([]json.RawMessage, error) {
 		if b.offered[row.ID] {
 			continue
 		}
-		offer, err := b.offer(row)
+		offer, err := b.offer(row, action.Detail)
 		if err != nil {
 			return nil, err
 		}
@@ -465,10 +476,16 @@ func (b *Bridge) poll(ctx context.Context) ([]json.RawMessage, error) {
 	return out, nil
 }
 
-// offer builds a job_offer for one parked handoff job.
-func (b *Bridge) offer(row job.Row) (json.RawMessage, error) {
+// offer builds a job_offer for one parked handoff job. OA browser handoffs
+// reuse the frozen OpenURL field with the candidate's public URL; institutional
+// handoffs still construct the regular OpenURL resolver link.
+func (b *Bridge) offer(row job.Row, handoffDetail string) (json.RawMessage, error) {
+	offerURL := OpenURL(b.cfg.Browser.OpenURLBase, row.Work)
+	if oaURL, ok := app.OABrowserHandoffURL(handoffDetail); ok {
+		offerURL = oaURL
+	}
 	hosts := []string{}
-	if h := resolverHost(b.cfg.Browser.OpenURLBase); h != "" {
+	if h := resolverHost(offerURL); h != "" {
 		hosts = append(hosts, h)
 	}
 	hosts = append(hosts, verifiedProviderHosts...)
@@ -477,13 +494,44 @@ func (b *Bridge) offer(row job.Row) (json.RawMessage, error) {
 		expected = nil
 	}
 	payload := protocol.JobOfferPayload{
-		OpenURL:       OpenURL(b.cfg.Browser.OpenURLBase, row.Work),
+		OpenURL:       offerURL,
 		ProviderHosts: hosts,
 		Expected:      expected,
 		AccessMode:    b.cfg.AccessMode,
 		ExpiresAt:     b.now().Add(b.actionExpiry()).UTC().Format(time.RFC3339),
 	}
 	return b.frame(protocol.MsgJobOffer, row.ID, payload)
+}
+
+// fallbackOAHandoff replaces the one-time OA browser offer with the ordinary
+// institutional resolver offer while keeping the job parked. The action's
+// detail is the durable offer discriminator, so a restart cannot re-open the
+// OA URL and alternate forever.
+func (b *Bridge) fallbackOAHandoff(ctx context.Context, jobID, failure string) (bool, error) {
+	if b.cfg.Browser.OpenURLBase == "" {
+		return false, nil
+	}
+	actions, err := b.jobs.ListHumanActions(ctx, true)
+	if err != nil {
+		return false, err
+	}
+	for _, action := range actions {
+		if action.JobID != jobID || action.Kind != handoffActionKind {
+			continue
+		}
+		if _, ok := app.OABrowserHandoffURL(action.Detail); !ok {
+			return false, nil
+		}
+		if _, err := b.jobs.OpenHumanAction(ctx, jobID, handoffActionKind, app.InstitutionalOpenURLHandoffDetail); err != nil {
+			return false, err
+		}
+		if err := b.jobs.RecordEvent(ctx, jobID, "browser.oa_handoff_fallback", map[string]any{"reason": failure}); err != nil {
+			return false, err
+		}
+		delete(b.offered, jobID)
+		return true, nil
+	}
+	return false, nil
 }
 
 // resolveHandoff closes the open openurl_handoff action for a job with the given

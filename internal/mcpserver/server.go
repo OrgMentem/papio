@@ -64,11 +64,14 @@ type ApplyInput struct {
 
 // SearchInput selects a bounded, read-only OpenAlex work search.
 type SearchInput struct {
-	Query    string `json:"query" jsonschema:"scholarly search query"`
-	Limit    int    `json:"limit,omitempty" jsonschema:"maximum results, clamped to 1 through 50"`
-	YearFrom int    `json:"year_from,omitempty" jsonschema:"minimum publication year"`
-	YearTo   int    `json:"year_to,omitempty" jsonschema:"maximum publication year"`
-	OAOnly   bool   `json:"oa_only,omitempty" jsonschema:"return only open-access works"`
+	Query     string `json:"query,omitempty" jsonschema:"optional scholarly search query; required unless a citation snowball DOI is supplied"`
+	Limit     int    `json:"limit,omitempty" jsonschema:"maximum results, clamped to 1 through 50"`
+	YearFrom  int    `json:"year_from,omitempty" jsonschema:"minimum publication year"`
+	YearTo    int    `json:"year_to,omitempty" jsonschema:"maximum publication year"`
+	OAOnly    bool   `json:"oa_only,omitempty" jsonschema:"return only open-access works"`
+	Cites     string `json:"cites,omitempty" jsonschema:"DOI to find papers citing it (forward citations; OpenAlex cites: filter)"`
+	CitedBy   string `json:"cited_by,omitempty" jsonschema:"DOI to find papers it cites (backward references; OpenAlex cited_by: filter)"`
+	RelatedTo string `json:"related_to,omitempty" jsonschema:"DOI to find OpenAlex-related papers (related_to: filter)"`
 }
 
 // New builds one MCP server. Zotero writes are deliberately unreachable from
@@ -103,7 +106,7 @@ func New(system *bootstrap.System) *mcp.Server {
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "papio_search", Title: "Search scholarly works",
-		Description: "Run one bounded, read-only OpenAlex search. This produces work metadata and never creates an acquisition job.",
+		Description: "Run bounded, read-only OpenAlex searches, including citation snowballs. This produces work metadata and never creates an acquisition job.",
 		Annotations: readAnnotations(),
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, input SearchInput) (*mcp.CallToolResult, any, error) {
 		if system == nil || system.Discovery == nil {
@@ -111,6 +114,7 @@ func New(system *bootstrap.System) *mcp.Server {
 		}
 		works, err := system.Discovery.Search(ctx, discovery.SearchParams{
 			Query: input.Query, Limit: input.Limit, YearFrom: input.YearFrom, YearTo: input.YearTo, OAOnly: input.OAOnly,
+			Cites: input.Cites, CitedBy: input.CitedBy, RelatedTo: input.RelatedTo,
 		})
 		if err != nil {
 			return nil, nil, err

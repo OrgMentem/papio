@@ -32,7 +32,7 @@ func newAcquireCommand(opt *options) *cobra.Command {
 	var authors, allowSources, denySources []string
 	var year, queueLimit int
 	var maxCost float64
-	var wait, fromZotio, autoImport bool
+	var wait, fromZotio, autoImport, includeOwned bool
 	var batchPath string
 	command := &cobra.Command{
 		Use:   "acquire [identifier]",
@@ -47,7 +47,7 @@ func newAcquireCommand(opt *options) *cobra.Command {
 				if err := validateBatchFlags(cmd, args, fromZotio, wait); err != nil {
 					return err
 				}
-				return acquireBatch(cmd.Context(), cmd, opt, batchPath, autoImportOverride)
+				return acquireBatch(cmd.Context(), cmd, opt, batchPath, autoImportOverride, strings.TrimSpace(collection), includeOwned)
 			}
 			if fromZotio {
 				if len(args) != 0 || doi != "" || pmid != "" || arxivID != "" || isbn != "" || openalex != "" ||
@@ -126,7 +126,7 @@ func newAcquireCommand(opt *options) *cobra.Command {
 	flags.IntVar(&year, "year", 0, "publication year")
 	flags.StringVar(&requestID, "request-id", "", "stable idempotency key")
 	flags.StringVar(&zotioKey, "zotio-item-key", "", "existing Zotero item key")
-	flags.StringVar(&collection, "collection", "", "collection context")
+	flags.StringVar(&collection, "collection", "", "target Zotero collection name (key when used with --from-zotio)")
 	flags.StringVar(&desiredVersion, "desired-version", "any", "published, accepted, preprint, or any")
 	flags.StringVar(&accessMode, "access-mode", "", "per-request access-mode override")
 	flags.Float64Var(&maxCost, "max-cost", 0, "maximum paid-source cost in USD")
@@ -136,6 +136,7 @@ func newAcquireCommand(opt *options) *cobra.Command {
 	flags.BoolVar(&fromZotio, "from-zotio", false, "queue Zotio items missing an attached PDF")
 	flags.IntVar(&queueLimit, "limit", 25, "maximum Zotio queue rows (1-500)")
 	flags.StringVar(&batchPath, "batch", "", "submit JSONL works from a file or - for standard input")
+	flags.BoolVar(&includeOwned, "include-owned", false, "with --batch, submit works already carrying a PDF in Zotio")
 	flags.BoolVar(&autoImport, "auto-import", false, "plan and apply Zotio import automatically when ready")
 	return command
 }
@@ -239,6 +240,8 @@ type batchSubmission struct {
 type batchSubmitResult struct {
 	Jobs      []batchSubmission `json:"jobs"`
 	Submitted int               `json:"submitted"`
+	Skipped   int               `json:"skipped"`
+	StalenessWarning string     `json:"staleness_warning,omitempty"`
 	Failed    int               `json:"failed"`
 }
 
@@ -261,7 +264,7 @@ func validateBatchFlags(cmd *cobra.Command, args []string, fromZotio, wait bool)
 	}
 	for _, name := range []string{
 		"doi", "pmid", "arxiv", "isbn", "openalex", "title", "author", "year",
-		"request-id", "zotio-item-key", "collection", "desired-version", "access-mode",
+		"request-id", "zotio-item-key", "desired-version", "access-mode",
 		"max-cost", "source", "deny-source", "limit",
 	} {
 		if cmd.Flags().Changed(name) {
@@ -405,7 +408,7 @@ func submitAcquire(ctx context.Context, opt *options, request protocol.WorkReque
 	return opt.call(ctx, "acquire.submit", params, result)
 }
 
-func acquireBatch(ctx context.Context, cmd *cobra.Command, opt *options, path string, autoImport *bool) error {
+func acquireBatch(ctx context.Context, cmd *cobra.Command, opt *options, path string, autoImport *bool, collection string, includeOwned bool) error {
 	var reader io.Reader = cmd.InOrStdin()
 	var file *os.File
 	if path != "-" {
@@ -430,6 +433,30 @@ func acquireBatch(ctx context.Context, cmd *cobra.Command, opt *options, path st
 	starter.Args = []string{"--config", cfg.Path, "daemon", "--socket", socket}
 	if err := starter.Ensure(ctx); err != nil {
 		return err
+	}
+
+	lookupRequest := zotio.LookupWorksRequest{Works: make([]zotio.LookupWork, len(requests))}
+	for i, request := range requests {
+		if request.Identifiers == nil {
+			continue
+		}
+		lookupRequest.Works[i] = zotio.LookupWork{
+			DOI:   request.Identifiers.DOI,
+			ArXiv: request.Identifiers.ArXiv,
+		}
+	}
+	var ownership zotio.LookupWorksResult
+	if err := callSocket(ctx, socket, "zotio.lookup_works", lookupRequest, &ownership); err != nil {
+		return err
+	}
+	requests, skipped, err := applyBatchOwnership(requests, ownership, collection, includeOwned)
+	if err != nil {
+		return err
+	}
+	if ownership.StalenessWarning != "" {
+		if _, err := fmt.Fprintf(opt.errOut, "warning: %s\n", ownership.StalenessWarning); err != nil {
+			return err
+		}
 	}
 
 	results := make([]batchSubmission, len(requests))
@@ -465,7 +492,11 @@ func acquireBatch(ctx context.Context, cmd *cobra.Command, opt *options, path st
 	}
 	group.Wait()
 
-	output := batchSubmitResult{Jobs: make([]batchSubmission, 0, len(results))}
+	output := batchSubmitResult{
+		Jobs:            make([]batchSubmission, 0, len(results)),
+		Skipped:         skipped,
+		StalenessWarning: ownership.StalenessWarning,
+	}
 	var firstErr error
 	for index, result := range results {
 		if result.JobID == "" {
@@ -491,11 +522,46 @@ func acquireBatch(ctx context.Context, cmd *cobra.Command, opt *options, path st
 				return err
 			}
 		}
-		if _, err := fmt.Fprintf(opt.out, "Submitted %d job(s); %d failed\n", output.Submitted, output.Failed); err != nil {
+		if _, err := fmt.Fprintf(opt.out, "Submitted %d job(s); skipped %d already in library; %d failed\n", output.Submitted, output.Skipped, output.Failed); err != nil {
 			return err
 		}
 	}
 	return firstErr
+}
+
+// applyBatchOwnership carries a batch-level target collection into every job,
+// skips already-complete library copies by default, and pins missing-PDF work
+// to its existing Zotero parent so the attachment route is selected.
+func applyBatchOwnership(requests []protocol.WorkRequest, ownership zotio.LookupWorksResult, collection string, includeOwned bool) ([]protocol.WorkRequest, int, error) {
+	if len(ownership.Works) != len(requests) {
+		return nil, 0, fmt.Errorf("Zotio ownership lookup returned %d results for %d works", len(ownership.Works), len(requests))
+	}
+	collection = strings.TrimSpace(collection)
+	pending := make([]protocol.WorkRequest, 0, len(requests))
+	skipped := 0
+	for i, request := range requests {
+		request.Collection = collection
+		classification := ownership.Works[i]
+		switch classification.Status {
+		case zotio.OwnershipNotOwned:
+			pending = append(pending, request)
+		case zotio.OwnershipOwnedWithPDF:
+			if includeOwned {
+				pending = append(pending, request)
+			} else {
+				skipped++
+			}
+		case zotio.OwnershipOwnedMissingPDF:
+			if strings.TrimSpace(classification.ItemKey) == "" {
+				return nil, 0, fmt.Errorf("Zotio ownership result %d is missing its parent item key", i+1)
+			}
+			request.ZotioItemKey = classification.ItemKey
+			pending = append(pending, request)
+		default:
+			return nil, 0, fmt.Errorf("Zotio ownership result %d has unknown status %q", i+1, classification.Status)
+		}
+	}
+	return pending, skipped, nil
 }
 
 func waitForJob(ctx context.Context, opt *options, id string) (*api.JobDetail, error) {

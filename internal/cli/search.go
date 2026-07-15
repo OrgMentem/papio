@@ -14,13 +14,29 @@ import (
 func newSearchCommand(opt *options) *cobra.Command {
 	var limit, yearFrom, yearTo int
 	var oaOnly bool
+	var cites, citedBy, relatedTo string
 	command := &cobra.Command{
-		Use:   "search <query>",
+		Use:   "search [query]",
 		Short: "Search OpenAlex for scholarly works",
-		Args:  cobra.ExactArgs(1),
+		Args: func(cmd *cobra.Command, args []string) error {
+			if err := cobra.MaximumNArgs(1)(cmd, args); err != nil {
+				return err
+			}
+			if (len(args) == 0 || strings.TrimSpace(args[0]) == "") &&
+				strings.TrimSpace(cites) == "" &&
+				strings.TrimSpace(citedBy) == "" && strings.TrimSpace(relatedTo) == "" {
+				return fmt.Errorf("query is required unless a citation snowball DOI is supplied")
+			}
+			return nil
+		},
 		RunE: func(cmd *cobra.Command, args []string) error {
+			query := ""
+			if len(args) == 1 {
+				query = strings.TrimSpace(args[0])
+			}
 			params := discovery.SearchParams{
-				Query: strings.TrimSpace(args[0]), Limit: limit, YearFrom: yearFrom, YearTo: yearTo, OAOnly: oaOnly,
+				Query: query, Limit: limit, YearFrom: yearFrom, YearTo: yearTo, OAOnly: oaOnly,
+				Cites: cites, CitedBy: citedBy, RelatedTo: relatedTo,
 			}
 			var works []discovery.DiscoveredWork
 			if err := opt.call(cmd.Context(), "discovery.search", params, &works); err != nil {
@@ -49,6 +65,9 @@ func newSearchCommand(opt *options) *cobra.Command {
 	flags.IntVar(&yearFrom, "year-from", 0, "minimum publication year")
 	flags.IntVar(&yearTo, "year-to", 0, "maximum publication year")
 	flags.BoolVar(&oaOnly, "oa-only", false, "return only open-access works")
+	flags.StringVar(&cites, "cites", "", "DOI to find papers citing it (forward citations; OpenAlex cites: filter)")
+	flags.StringVar(&citedBy, "cited-by", "", "DOI to find papers it cites (backward references; OpenAlex cited_by: filter)")
+	flags.StringVar(&relatedTo, "related-to", "", "DOI to find OpenAlex-related papers (related_to: filter)")
 	return command
 }
 

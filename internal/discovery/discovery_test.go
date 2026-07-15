@@ -79,7 +79,7 @@ func TestSearchMapsRecordedOpenAlexWorks(t *testing.T) {
 	}
 }
 
-func TestSearchClampsLimitsAndRejectsBlankQuery(t *testing.T) {
+func TestSearchClampsLimitsAndRequiresQueryWithoutSnowball(t *testing.T) {
 	var limits []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		limits = append(limits, r.URL.Query().Get("per-page"))
@@ -97,7 +97,119 @@ func TestSearchClampsLimitsAndRejectsBlankQuery(t *testing.T) {
 		t.Fatalf("limits = %q, want %q", got, want)
 	}
 	if _, err := client.Search(context.Background(), SearchParams{Query: " \t "}); err == nil {
-		t.Fatal("blank query succeeded")
+		t.Fatal("blank query without a citation snowball succeeded")
+	}
+}
+
+func TestSearchCitationSnowballsResolveDOIsAndBuildExactFilters(t *testing.T) {
+	seedFixture, err := os.ReadFile("testdata/openalex_work_by_doi.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	searchFixture, err := os.ReadFile("testdata/openalex_works.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name   string
+		params SearchParams
+		filter string
+	}{
+		{
+			name:   "forward citations use cites",
+			params: SearchParams{Cites: "10.1000/seed"},
+			filter: "cites:W2741809807",
+		},
+		{
+			name:   "backward references use cited_by",
+			params: SearchParams{CitedBy: "10.1000/seed"},
+			filter: "cited_by:W2741809807",
+		},
+		{
+			name:   "related works use related_to",
+			params: SearchParams{RelatedTo: "10.1000/seed"},
+			filter: "related_to:W2741809807",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var lookupPaths []string
+			var searchQuery url.Values
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case strings.HasPrefix(r.URL.Path, "/works/doi:"):
+					lookupPaths = append(lookupPaths, r.URL.Path)
+					_, _ = w.Write(seedFixture)
+				case r.URL.Path == "/works":
+					searchQuery = r.URL.Query()
+					_, _ = w.Write(searchFixture)
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer server.Close()
+			client := NewWithOptions(Options{
+				Client: http.DefaultClient, ContactEmail: "researcher@example.org", BaseURL: server.URL + "/works",
+			})
+			if _, err := client.Search(context.Background(), test.params); err != nil {
+				t.Fatal(err)
+			}
+			if got, want := strings.Join(lookupPaths, ","), "/works/doi:10.1000/seed"; got != want {
+				t.Fatalf("DOI resolution path = %q, want %q", got, want)
+			}
+			if got, want := searchQuery.Get("filter"), test.filter; got != want {
+				t.Fatalf("filter = %q, want %q", got, want)
+			}
+			if _, present := searchQuery["search"]; present {
+				t.Fatalf("search query = %q, want omitted without free text", searchQuery.Get("search"))
+			}
+		})
+	}
+}
+
+func TestSearchCitationSnowballsCacheSeedResolution(t *testing.T) {
+	seedFixture, err := os.ReadFile("testdata/openalex_work_by_doi.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var lookupCount int
+	var filter string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/works/doi:") {
+			lookupCount++
+			_, _ = w.Write(seedFixture)
+			return
+		}
+		filter = r.URL.Query().Get("filter")
+		_, _ = w.Write([]byte(`{"results":[]}`))
+	}))
+	defer server.Close()
+	client := NewWithOptions(Options{
+		Client: http.DefaultClient, ContactEmail: "researcher@example.org", BaseURL: server.URL + "/works",
+	})
+	if _, err := client.Search(context.Background(), SearchParams{
+		Cites: "10.1000/seed", CitedBy: "10.1000/seed", RelatedTo: "10.1000/seed",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if lookupCount != 1 {
+		t.Fatalf("DOI resolution requests = %d, want 1", lookupCount)
+	}
+	if got, want := filter, "cites:W2741809807,cited_by:W2741809807,related_to:W2741809807"; got != want {
+		t.Fatalf("filter = %q, want %q", got, want)
+	}
+}
+
+func TestSearchCitationSnowballReportsMissingSeedDOI(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+	client := NewWithOptions(Options{
+		Client: http.DefaultClient, ContactEmail: "researcher@example.org", BaseURL: server.URL + "/works",
+	})
+	_, err := client.Search(context.Background(), SearchParams{Cites: "10.1000/not-found"})
+	if err == nil || !strings.Contains(err.Error(), `10.1000/not-found`) || !strings.Contains(err.Error(), "not found") {
+		t.Fatalf("missing seed error = %v", err)
 	}
 }
 

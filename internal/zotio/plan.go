@@ -38,6 +38,7 @@ type Plan struct {
 	ExpectedParentKey  string          `json:"expected_parent_key,omitempty"`
 	DOI                string          `json:"doi,omitempty"`
 	AttachmentMode     string          `json:"attachment_mode"`
+	Collection         string          `json:"collection,omitempty"`
 	PreviewArgs        []string        `json:"preview_args"`
 	ApplyArgs          []string        `json:"apply_args"`
 	Preview            json.RawMessage `json:"preview"`
@@ -123,13 +124,18 @@ func (s *Service) PlanJobs(ctx context.Context, jobIDs []string) ([]*Plan, error
 }
 
 func (s *Service) planJob(ctx context.Context, jobID string) (*Plan, error) {
+	row, err := s.Bundle.Jobs.Get(ctx, jobID)
+	if err != nil {
+		return nil, err
+	}
 	bundlePath, acquisition, err := s.Bundle.Export(ctx, jobID, "")
 	if err != nil {
 		return nil, err
 	}
 	artifactPath := filepath.Join(filepath.Dir(bundlePath), filepath.FromSlash(acquisition.Artifact.Path))
 	attachmentMode := s.attachmentMode()
-	idempotencyKey := "zotio_plan:" + jobID + ":" + acquisition.Artifact.SHA256 + ":" + attachmentMode
+	collection := strings.TrimSpace(row.Policy.Collection)
+	idempotencyKey := "zotio_plan:" + jobID + ":" + acquisition.Artifact.SHA256 + ":" + attachmentMode + ":" + collection
 	if existing, err := s.recordedPlan(ctx, idempotencyKey); err != nil {
 		return nil, err
 	} else if existing != nil {
@@ -146,6 +152,7 @@ func (s *Service) planJob(ctx context.Context, jobID string) (*Plan, error) {
 		DOI:            acquisition.Identity.DOI,
 		CreatedAt:      s.now().UTC().Format(time.RFC3339),
 		AttachmentMode: attachmentMode,
+		Collection:     collection,
 	}
 	if acquisition.ZotioItemKey != "" {
 		plan.Route = "existing_item"
@@ -218,6 +225,7 @@ func (s *Service) Apply(ctx context.Context, planID, confirmation string) (*Appl
 	if existing, err := s.recordedApply(ctx, idempotencyKey); err != nil {
 		return nil, err
 	} else if existing != nil {
+		s.fileCollection(ctx, plan, existing)
 		return existing, nil
 	}
 	claimed, err := s.claimApply(ctx, idempotencyKey, plan.JobID)
@@ -225,7 +233,11 @@ func (s *Service) Apply(ctx context.Context, planID, confirmation string) (*Appl
 		return nil, err
 	}
 	if !claimed {
-		return s.recordedApply(ctx, idempotencyKey)
+		result, recordErr := s.recordedApply(ctx, idempotencyKey)
+		if result != nil {
+			s.fileCollection(ctx, plan, result)
+		}
+		return result, recordErr
 	}
 
 	out, commandErr := s.CLI.RunJSON(ctx, plan.ApplyArgs...)
@@ -277,7 +289,24 @@ func (s *Service) Apply(ctx context.Context, planID, confirmation string) (*Appl
 	if err := s.recordApply(ctx, idempotencyKey, result); err != nil {
 		return nil, err
 	}
+	s.fileCollection(ctx, plan, result)
 	return result, nil
+}
+
+// fileCollection applies the optional policy filing after the import has been
+// durably recorded. Filing is deliberately best-effort: an attachment/import
+// must not be rolled back because a collection write cannot be completed.
+func (s *Service) fileCollection(ctx context.Context, plan *Plan, result *ApplyResult) {
+	if plan == nil || result == nil || strings.TrimSpace(plan.Collection) == "" || result.ParentKey == "" {
+		return
+	}
+	if _, err := s.CLI.RunJSON(ctx, "--agent", "--yes", "items", "add-to-collection", result.ParentKey, "--collection-name", plan.Collection); err != nil {
+		_ = s.Bundle.Jobs.RecordEvent(context.WithoutCancel(ctx), plan.JobID, "zotio.collection_filing", map[string]any{
+			"collection": plan.Collection,
+			"status":     "error",
+			"error_type": fmt.Sprintf("%T", err),
+		})
+	}
 }
 
 // PlanAndApply creates an immutable plan for one ready job and immediately

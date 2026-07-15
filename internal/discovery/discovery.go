@@ -45,11 +45,22 @@ type Options struct {
 
 // SearchParams selects works from OpenAlex.
 type SearchParams struct {
-	Query    string `json:"query"`
-	Limit    int    `json:"limit"`
-	YearFrom int    `json:"year_from,omitempty"`
-	YearTo   int    `json:"year_to,omitempty"`
-	OAOnly   bool   `json:"oa_only,omitempty"`
+	Query     string `json:"query,omitempty"`
+	Limit     int    `json:"limit"`
+	YearFrom  int    `json:"year_from,omitempty"`
+	YearTo    int    `json:"year_to,omitempty"`
+	OAOnly    bool   `json:"oa_only,omitempty"`
+	Cites     string `json:"cites,omitempty"`
+	CitedBy   string `json:"cited_by,omitempty"`
+	RelatedTo string `json:"related_to,omitempty"`
+}
+
+// HasCitationSnowball reports whether the parameters select a citation-based
+// search, which can run without a free-text query.
+func (params SearchParams) HasCitationSnowball() bool {
+	return strings.TrimSpace(params.Cites) != "" ||
+		strings.TrimSpace(params.CitedBy) != "" ||
+		strings.TrimSpace(params.RelatedTo) != ""
 }
 
 // DiscoveredWork is the durable, acquisition-neutral description returned by
@@ -97,8 +108,8 @@ func NewWithOptions(opts Options) *Client {
 	}
 }
 
-// Search performs exactly one bounded OpenAlex request and returns the mapped
-// works. It never creates or mutates an acquisition job.
+// Search performs bounded OpenAlex requests and returns the mapped works. It
+// never creates or mutates an acquisition job.
 func (c *Client) Search(ctx context.Context, params SearchParams) ([]DiscoveredWork, error) {
 	if c == nil || c.client == nil {
 		return nil, errors.New("discovery: HTTP client is not configured")
@@ -107,37 +118,26 @@ func (c *Client) Search(ctx context.Context, params SearchParams) ([]DiscoveredW
 		return nil, errors.New("discovery: contact email is required for the OpenAlex polite pool")
 	}
 	query := strings.TrimSpace(params.Query)
-	if query == "" {
-		return nil, errors.New("discovery: query is required")
-	}
-	endpoint, err := c.searchURL(params, query)
-	if err != nil {
-		return nil, err
+	if query == "" && !params.HasCitationSnowball() {
+		return nil, errors.New("discovery: query is required unless a citation snowball DOI is supplied")
 	}
 	requestCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	req, err := http.NewRequestWithContext(requestCtx, http.MethodGet, endpoint.String(), nil)
+	citationFilters, err := c.citationFilters(requestCtx, params)
 	if err != nil {
-		return nil, errors.New("discovery: could not construct request")
+		return nil, err
 	}
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", fmt.Sprintf("papio/%s (mailto:%s)", c.version, c.email))
-
-	resp, err := c.client.Do(req)
+	endpoint, err := c.searchURL(params, query, citationFilters)
 	if err != nil {
-		return nil, fmt.Errorf("discovery: OpenAlex request failed: %w", err)
+		return nil, err
 	}
-	if resp == nil {
-		return nil, errors.New("discovery: OpenAlex returned an empty response")
+	resp, err := c.do(requestCtx, endpoint)
+	if err != nil {
+		return nil, err
 	}
-	if resp.Body != nil {
-		defer func() { _ = resp.Body.Close() }()
-	}
-	if resp.StatusCode < http.StatusOK || resp.StatusCode > http.StatusMultipleChoices {
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		return nil, fmt.Errorf("discovery: OpenAlex returned HTTP %d", resp.StatusCode)
-	}
-	if resp.Body == nil {
-		return nil, errors.New("discovery: OpenAlex response body is missing")
 	}
 
 	var payload searchResponse
@@ -151,17 +151,123 @@ func (c *Client) Search(ctx context.Context, params SearchParams) ([]DiscoveredW
 	return works, nil
 }
 
-func (c *Client) searchURL(params SearchParams, query string) (*url.URL, error) {
-	base, err := url.Parse(c.baseURL)
-	if err != nil || base.Scheme == "" || base.Host == "" || (base.Scheme != "http" && base.Scheme != "https") {
-		return nil, errors.New("discovery: invalid OpenAlex endpoint configuration")
+func (c *Client) do(ctx context.Context, endpoint *url.URL) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
+	if err != nil {
+		return nil, errors.New("discovery: could not construct request")
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", fmt.Sprintf("papio/%s (mailto:%s)", c.version, c.email))
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("discovery: OpenAlex request failed: %w", err)
+	}
+	if resp == nil {
+		return nil, errors.New("discovery: OpenAlex returned an empty response")
+	}
+	if resp.Body == nil {
+		return nil, errors.New("discovery: OpenAlex response body is missing")
+	}
+	return resp, nil
+}
+
+type citationSeed struct {
+	filter string
+	doi    string
+}
+
+func (c *Client) citationFilters(ctx context.Context, params SearchParams) ([]string, error) {
+	seeds := []citationSeed{
+		{filter: "cites", doi: params.Cites},
+		{filter: "cited_by", doi: params.CitedBy},
+		{filter: "related_to", doi: params.RelatedTo},
+	}
+	resolved := make(map[string]string, len(seeds))
+	filters := make([]string, 0, len(seeds))
+	for _, seed := range seeds {
+		if strings.TrimSpace(seed.doi) == "" {
+			continue
+		}
+		doi, err := work.NormalizeDOI(seed.doi)
+		if err != nil {
+			return nil, fmt.Errorf("discovery: invalid DOI for %s: %w", seed.filter, err)
+		}
+		workID, ok := resolved[doi]
+		if !ok {
+			workID, err = c.resolveDOI(ctx, doi)
+			if err != nil {
+				return nil, err
+			}
+			resolved[doi] = workID
+		}
+		filters = append(filters, seed.filter+":"+workID)
+	}
+	return filters, nil
+}
+
+func (c *Client) resolveDOI(ctx context.Context, doi string) (string, error) {
+	endpoint, err := c.seedURL(doi)
+	if err != nil {
+		return "", err
+	}
+	resp, err := c.do(ctx, endpoint)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode == http.StatusNotFound {
+		return "", fmt.Errorf("discovery: OpenAlex seed DOI %q was not found", doi)
+	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return "", fmt.Errorf("discovery: OpenAlex returned HTTP %d resolving DOI %q", resp.StatusCode, doi)
+	}
+	var seed workRecord
+	if err := decodeBoundedJSON(resp.Body, c.maxBody, &seed); err != nil {
+		return "", fmt.Errorf("discovery: invalid OpenAlex seed response: %w", err)
+	}
+	workID := openAlexWorkID(seed.ID)
+	if workID == "" {
+		return "", fmt.Errorf("discovery: OpenAlex returned no work ID for DOI %q", doi)
+	}
+	return workID, nil
+}
+
+func (c *Client) seedURL(doi string) (*url.URL, error) {
+	base, err := c.openAlexBaseURL()
+	if err != nil {
+		return nil, err
+	}
+	base.Path = strings.TrimRight(base.Path, "/") + "/doi:" + doi
+	base.RawPath = ""
+	values := base.Query()
+	values.Set("mailto", c.email)
+	base.RawQuery = values.Encode()
+	return base, nil
+}
+
+func openAlexWorkID(value string) string {
+	value = strings.TrimSpace(value)
+	value = strings.TrimPrefix(value, "https://openalex.org/")
+	value = strings.TrimPrefix(value, "http://openalex.org/")
+	if len(value) < 2 || value[0] != 'W' {
+		return ""
+	}
+	return value
+}
+
+func (c *Client) searchURL(params SearchParams, query string, citationFilters []string) (*url.URL, error) {
+	base, err := c.openAlexBaseURL()
+	if err != nil {
+		return nil, err
 	}
 	normalized := normalizeParams(params)
 	values := base.Query()
-	values.Set("search", query)
+	if query != "" {
+		values.Set("search", query)
+	}
 	values.Set("per-page", strconv.Itoa(normalized.Limit))
 	values.Set("mailto", c.email)
-	filters := make([]string, 0, 3)
+	filters := make([]string, 0, 3+len(citationFilters))
 	if normalized.YearFrom > 0 {
 		filters = append(filters, fmt.Sprintf("from_publication_date:%04d-01-01", normalized.YearFrom))
 	}
@@ -171,10 +277,19 @@ func (c *Client) searchURL(params SearchParams, query string) (*url.URL, error) 
 	if normalized.OAOnly {
 		filters = append(filters, "open_access.is_oa:true")
 	}
+	filters = append(filters, citationFilters...)
 	if len(filters) > 0 {
 		values.Set("filter", strings.Join(filters, ","))
 	}
 	base.RawQuery = values.Encode()
+	return base, nil
+}
+
+func (c *Client) openAlexBaseURL() (*url.URL, error) {
+	base, err := url.Parse(c.baseURL)
+	if err != nil || base.Scheme == "" || base.Host == "" || (base.Scheme != "http" && base.Scheme != "https") {
+		return nil, errors.New("discovery: invalid OpenAlex endpoint configuration")
+	}
 	return base, nil
 }
 
