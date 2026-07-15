@@ -26,6 +26,7 @@ type SubmitOptions struct {
 	AutoImport   *bool
 	Collection   string
 	Label        string
+	Resolver     string
 	IncludeOwned bool
 	Now          time.Time
 }
@@ -224,6 +225,11 @@ func Submit(ctx context.Context, caller Caller, dataDir string, requests []proto
 	}
 	if len(requests) > 50 {
 		return nil, fmt.Errorf("batch exceeds maximum of 50 works")
+	}
+	if resolver := strings.TrimSpace(options.Resolver); resolver != "" {
+		for i := range requests {
+			requests[i].Resolver = resolver
+		}
 	}
 	if options.Now.IsZero() {
 		options.Now = time.Now()

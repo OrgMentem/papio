@@ -27,7 +27,7 @@ import (
 
 func newAcquireCommand(opt *options) *cobra.Command {
 	var doi, pmid, arxivID, isbn, openalex string
-	var title, requestID, zotioKey, collection, desiredVersion, accessMode, label string
+	var title, requestID, zotioKey, collection, desiredVersion, accessMode, resolver, label string
 	var authors, allowSources, denySources []string
 	var year, queueLimit int
 	var maxCost float64
@@ -46,7 +46,7 @@ func newAcquireCommand(opt *options) *cobra.Command {
 				if err := validateBatchFlags(cmd, args, fromZotio, wait); err != nil {
 					return err
 				}
-				return acquireBatch(cmd.Context(), cmd, opt, batchPath, autoImportOverride, strings.TrimSpace(collection), strings.TrimSpace(label), includeOwned)
+				return acquireBatch(cmd.Context(), cmd, opt, batchPath, autoImportOverride, strings.TrimSpace(collection), strings.TrimSpace(resolver), strings.TrimSpace(label), includeOwned)
 			}
 			if cmd.Flags().Changed("label") {
 				return fmt.Errorf("--label is supported only with --batch")
@@ -61,6 +61,9 @@ func newAcquireCommand(opt *options) *cobra.Command {
 				}
 				if autoImportOverride != nil {
 					return fmt.Errorf("--auto-import is not supported with --from-zotio")
+				}
+				if cmd.Flags().Changed("resolver") {
+					return fmt.Errorf("--resolver is not supported with --from-zotio")
 				}
 				options := zotio.QueueOptions{
 					Collection:         strings.TrimSpace(collection),
@@ -97,6 +100,7 @@ func newAcquireCommand(opt *options) *cobra.Command {
 				Collection:         strings.TrimSpace(collection),
 				DesiredVersion:     desiredVersion,
 				AccessModeOverride: accessMode,
+				Resolver:           strings.TrimSpace(resolver),
 				SourcesAllow:       trimNonempty(allowSources),
 				SourcesDeny:        trimNonempty(denySources),
 			}
@@ -131,6 +135,7 @@ func newAcquireCommand(opt *options) *cobra.Command {
 	flags.StringVar(&collection, "collection", "", "target Zotero collection name (key when used with --from-zotio)")
 	flags.StringVar(&desiredVersion, "desired-version", "any", "published, accepted, preprint, or any")
 	flags.StringVar(&accessMode, "access-mode", "", "per-request access-mode override")
+	flags.StringVar(&resolver, "resolver", "", "named institutional OpenURL resolver profile")
 	flags.Float64Var(&maxCost, "max-cost", 0, "maximum paid-source cost in USD")
 	flags.StringSliceVar(&allowSources, "source", nil, "allow only this source (repeatable)")
 	flags.StringSliceVar(&denySources, "deny-source", nil, "deny this source (repeatable)")
@@ -324,7 +329,7 @@ func (c socketBatchCaller) Call(ctx context.Context, method string, params, resu
 	return callSocket(ctx, c.socket, method, params, result)
 }
 
-func acquireBatch(ctx context.Context, cmd *cobra.Command, opt *options, path string, autoImport *bool, collection, label string, includeOwned bool) error {
+func acquireBatch(ctx context.Context, cmd *cobra.Command, opt *options, path string, autoImport *bool, collection, resolver, label string, includeOwned bool) error {
 	var reader io.Reader = cmd.InOrStdin()
 	var file *os.File
 	if path != "-" {
@@ -351,7 +356,7 @@ func acquireBatch(ctx context.Context, cmd *cobra.Command, opt *options, path st
 		return err
 	}
 	output, submitErr := batch.Submit(ctx, socketBatchCaller{socket: socket}, cfg.DataDir, requests, batch.SubmitOptions{
-		AutoImport: autoImport, Collection: collection, Label: label, IncludeOwned: includeOwned,
+		AutoImport: autoImport, Collection: collection, Resolver: resolver, Label: label, IncludeOwned: includeOwned,
 	})
 	if output == nil {
 		return submitErr

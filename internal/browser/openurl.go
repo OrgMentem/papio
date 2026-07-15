@@ -41,11 +41,11 @@ func OpenURL(base string, w work.Work) string {
 	return base + sep + v.Encode()
 }
 
-// verifiedProviderHosts are the registrable domains of the providers with
-// declarative adapters (or adapters in progress) behind the Example University resolver.
-// They ride on every offer so the extension can recognize a post-SSO landing
-// on an entitled provider: the resolver host alone goes blind the moment it
-// routes the tab onward. Matching is exact-or-dot-suffix on the extension side.
+// verifiedProviderHosts are the registrable domains of providers with
+// declarative adapters (or adapters in progress). They ride on every offer so
+// the extension can recognize a post-SSO landing on an entitled provider: the
+// resolver host alone goes blind the moment it routes the tab onward. Matching
+// is exact-or-dot-suffix on the extension side.
 var verifiedProviderHosts = []string{
 	"jstor.org",
 	"proquest.com",

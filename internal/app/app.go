@@ -111,6 +111,16 @@ func (s *Service) SubmitWithAutoImport(ctx context.Context, wr protocol.WorkRequ
 	if err != nil {
 		return "", err
 	}
+	resolverName := strings.TrimSpace(wr.Resolver)
+	if resolverName != "" {
+		if _, ok := s.Config.OpenURLBaseFor(resolverName); !ok {
+			names := s.Config.ResolverNames()
+			if len(names) == 0 {
+				return "", fmt.Errorf("unknown resolver %q (configured profiles: none)", resolverName)
+			}
+			return "", fmt.Errorf("unknown resolver %q (configured profiles: %s)", resolverName, strings.Join(names, ", "))
+		}
+	}
 	desired := wr.DesiredVersion
 	if desired == "" {
 		desired = "any"
@@ -120,7 +130,7 @@ func (s *Service) SubmitWithAutoImport(ctx context.Context, wr protocol.WorkRequ
 		auto = *autoImport
 	}
 	pol := job.Policy{
-		AccessMode: mode, DesiredVersion: desired, MaxCostUSD: wr.MaxCostUSD,
+		AccessMode: mode, DesiredVersion: desired, Resolver: resolverName, MaxCostUSD: wr.MaxCostUSD,
 		SourcesAllow:  append([]string(nil), wr.SourcesAllow...),
 		SourcesDeny:   append([]string(nil), wr.SourcesDeny...),
 		FetchMaxBytes: s.Config.Fetch.MaxBytes,
@@ -482,7 +492,7 @@ func (s *Service) exhaustedCandidates(ctx context.Context, row *job.Row, from, r
 			return s.park(ctx, row.ID, from, job.StateAwaitingHuman,
 				map[string]any{"reason": "open_access_browser_handoff"})
 		}
-		if s.Config.Browser.OpenURLBase != "" {
+		if base, ok := s.Config.OpenURLBaseFor(row.Policy.Resolver); ok && base != "" {
 			if _, err := s.Jobs.OpenHumanAction(ctx, row.ID, "openurl_handoff", InstitutionalOpenURLHandoffDetail); err != nil {
 				return err
 			}
@@ -490,7 +500,7 @@ func (s *Service) exhaustedCandidates(ctx context.Context, row *job.Row, from, r
 				map[string]any{"reason": "institutional_handoff"})
 		}
 	case config.ModeConservative:
-		if s.Config.Browser.OpenURLBase != "" {
+		if base, ok := s.Config.OpenURLBaseFor(row.Policy.Resolver); ok && base != "" {
 			if _, err := s.Jobs.OpenHumanAction(ctx, row.ID, "openurl_available",
 				"no direct candidates; institutional OpenURL available but not opened in conservative mode"); err != nil {
 				return err

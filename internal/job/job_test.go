@@ -30,7 +30,7 @@ func testStore(t *testing.T) *Store {
 }
 
 func testPolicy() Policy {
-	return Policy{AccessMode: "conservative", DesiredVersion: "any", FetchMaxBytes: 1 << 20}
+	return Policy{AccessMode: "conservative", DesiredVersion: "any", Resolver: "institute", FetchMaxBytes: 1 << 20}
 }
 
 func testWork() work.Work {
@@ -55,7 +55,7 @@ func TestCreateRequestIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
-	if row.State != StateQueued || row.Work.DOI != "10.1002/example" || row.Policy.AccessMode != "conservative" {
+	if row.State != StateQueued || row.Work.DOI != "10.1002/example" || row.Policy.AccessMode != "conservative" || row.Policy.Resolver != "institute" {
 		t.Fatalf("row = %+v, want queued job carrying work identity and policy snapshot", row)
 	}
 }

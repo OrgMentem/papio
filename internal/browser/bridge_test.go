@@ -624,6 +624,42 @@ func TestOpenURLPMIDFallbackAndYear(t *testing.T) {
 	}
 }
 
+func TestOpenURLUsesSelectedResolverProfileForPrimoNDEAndVE(t *testing.T) {
+	b, _, cfg, _ := newBridge(t)
+	cfg.Browser.OpenURLBase = "https://example.primo.exlibrisgroup.com/nde/openurl?vid=61EXL_INST:61EXL_NDE"
+	cfg.Browser.Resolvers = map[string]string{
+		"institute": "https://onesearch.library.example-institute.edu/discovery/openurl?vid=61INS_INST:INS",
+	}
+	b = NewBridge(b.jobs, b.svc, cfg)
+	for _, test := range []struct {
+		name, resolver, wantPath, wantVID string
+	}{
+		{name: "NDE default", wantPath: "/nde/openurl", wantVID: "61EXL_INST:61EXL_NDE"},
+		{name: "VE named", resolver: "institute", wantPath: "/discovery/openurl", wantVID: "61INS_INST:INS"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			raw, err := b.offer(job.Row{ID: "job-profile", Work: handoffWork(), Policy: job.Policy{Resolver: test.resolver}}, "institutional handoff")
+			if err != nil {
+				t.Fatal(err)
+			}
+			message, err := protocol.DecodeBrowserMessage(raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			u, err := url.Parse(message.Payload.(*protocol.JobOfferPayload).OpenURL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if u.Path != test.wantPath || u.Query().Get("vid") != test.wantVID {
+				t.Fatalf("resolver URL = %s, want path %s and vid %s", u, test.wantPath, test.wantVID)
+			}
+			if u.Query().Get("rft_id") != "info:doi/10.1002/example.42" {
+				t.Fatalf("rft_id = %q", u.Query().Get("rft_id"))
+			}
+		})
+	}
+}
+
 // SweepAdoptions adopts a settled file WITHOUT any hello/extension connection —
 // the daemon owns completion; the browser plane is only a delivery hint.
 func TestSweepAdoptionsAdoptsWithoutHello(t *testing.T) {

@@ -35,6 +35,7 @@ type AcquireInput struct {
 	Collection         string                `json:"collection,omitempty" jsonschema:"optional Zotero collection key"`
 	DesiredVersion     string                `json:"desired_version,omitempty" jsonschema:"published, accepted, preprint, or any"`
 	AccessModeOverride string                `json:"access_mode_override,omitempty" jsonschema:"conservative, assisted, or maximal"`
+	Resolver           string                `json:"resolver,omitempty" jsonschema:"named institutional OpenURL resolver profile"`
 	MaxCostUSD         *float64              `json:"max_cost_usd,omitempty" jsonschema:"maximum permitted acquisition cost"`
 	SourcesAllow       []string              `json:"sources_allow,omitempty" jsonschema:"optional source allowlist, at most 50"`
 	SourcesDeny        []string              `json:"sources_deny,omitempty" jsonschema:"optional source denylist, at most 50"`
@@ -93,6 +94,7 @@ type AcquireBatchInput struct {
 	Works        []map[string]any `json:"works" jsonschema:"one to fifty bare work objects or discovered-work envelopes"`
 	AutoImport   *bool            `json:"auto_import,omitempty" jsonschema:"automatically import ready jobs; defaults to true"`
 	Collection   string           `json:"collection,omitempty" jsonschema:"optional Zotero collection key for every submitted work"`
+	Resolver     string           `json:"resolver,omitempty" jsonschema:"named institutional OpenURL resolver profile for every submitted work"`
 	Label        string           `json:"label,omitempty" jsonschema:"optional batch query context"`
 	IncludeOwned bool             `json:"include_owned,omitempty" jsonschema:"submit works already carrying a PDF in Zotio; defaults to false"`
 }
@@ -278,6 +280,7 @@ func newServer(system *bootstrap.System, dependencies toolDependencies) *mcp.Ser
 			Identifiers: input.Identifiers, Title: input.Title, Authors: input.Authors, Year: input.Year,
 			ZotioItemKey: input.ZotioItemKey, Collection: input.Collection, DesiredVersion: input.DesiredVersion,
 			AccessModeOverride: input.AccessModeOverride, MaxCostUSD: input.MaxCostUSD,
+			Resolver:     input.Resolver,
 			SourcesAllow: input.SourcesAllow, SourcesDeny: input.SourcesDeny,
 		}, input.AutoImport)
 		return nil, AcquireOutput{JobID: jobID}, err
@@ -313,7 +316,7 @@ func newServer(system *bootstrap.System, dependencies toolDependencies) *mcp.Ser
 			autoImport = *input.AutoImport
 		}
 		output, err := batch.Submit(ctx, dependencies.caller, system.Config.DataDir, requests, batch.SubmitOptions{
-			AutoImport: &autoImport, Collection: input.Collection, Label: input.Label, IncludeOwned: input.IncludeOwned, Now: dependencies.now(),
+			AutoImport: &autoImport, Collection: input.Collection, Resolver: input.Resolver, Label: input.Label, IncludeOwned: input.IncludeOwned, Now: dependencies.now(),
 		})
 		if output == nil {
 			return nil, AcquireBatchOutput{}, err

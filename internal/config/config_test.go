@@ -121,3 +121,68 @@ func TestNotifyDefaultsOnAndLoadsFalse(t *testing.T) {
 		t.Fatal("loaded notify.enabled = true, want false")
 	}
 }
+
+func TestBrowserResolverProfiles(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	data := []byte(`access_mode = "conservative"
+[browser]
+openurl_base_url = "https://example.primo.exlibrisgroup.com/nde/openurl?vid=61EXL_INST:61EXL_NDE"
+
+[browser.resolvers]
+institute = "https://onesearch.library.example-institute.edu/discovery/openurl?vid=61INS_INST:INS"
+`)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := cfg.OpenURLBaseFor("institute"); !ok || got != "https://onesearch.library.example-institute.edu/discovery/openurl?vid=61INS_INST:INS" {
+		t.Fatalf("institute resolver = %q, %t", got, ok)
+	}
+	if got, ok := cfg.OpenURLBaseFor(""); !ok || got != "https://example.primo.exlibrisgroup.com/nde/openurl?vid=61EXL_INST:61EXL_NDE" {
+		t.Fatalf("default resolver = %q, %t", got, ok)
+	}
+	if names := cfg.ResolverNames(); len(names) != 2 || names[0] != "default" || names[1] != "institute" {
+		t.Fatalf("resolver names = %v", names)
+	}
+}
+
+func TestBrowserResolverProfilesRejectInvalidNameAndURL(t *testing.T) {
+	for _, test := range []struct {
+		name, profile, base string
+	}{
+		{name: "uppercase name", profile: "INSTITUTE", base: "https://onesearch.library.example-institute.edu/discovery/openurl?vid=61INS_INST:INS"},
+		{name: "http URL", profile: "institute", base: "http://onesearch.library.example-institute.edu/discovery/openurl?vid=61INS_INST:INS"},
+		{name: "relative URL", profile: "institute", base: "/discovery/openurl"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.toml")
+			data := []byte("access_mode = \"conservative\"\n[browser.resolvers]\n" + test.profile + " = \"" + test.base + "\"\n")
+			if err := os.WriteFile(path, data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Load(path); err == nil {
+				t.Fatal("invalid resolver profile accepted")
+			}
+		})
+	}
+}
+
+func TestBrowserResolverProfilesAbsentKeepsLegacyConfig(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(path, []byte("access_mode = \"conservative\"\n[browser]\nopenurl_base_url = \"https://resolver.example.edu/openurl\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Browser.Resolvers != nil {
+		t.Fatalf("resolvers = %v, want nil", cfg.Browser.Resolvers)
+	}
+	if got, ok := cfg.OpenURLBaseFor(""); !ok || got != "https://resolver.example.edu/openurl" {
+		t.Fatalf("legacy default = %q, %t", got, ok)
+	}
+}

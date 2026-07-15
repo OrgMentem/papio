@@ -87,3 +87,13 @@ func TestApplyBatchOwnershipSkipsOwnedCopiesAndPinsMissingPDF(t *testing.T) {
 		t.Fatalf("include-owned routes=%+v skipped=%d", included, skipped)
 	}
 }
+
+func TestBatchAcceptsResolverFlag(t *testing.T) {
+	command := newAcquireCommand(&options{})
+	if err := command.Flags().Set("resolver", "institute"); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateBatchFlags(command, nil, false, false); err != nil {
+		t.Fatalf("--batch rejected --resolver: %v", err)
+	}
+}

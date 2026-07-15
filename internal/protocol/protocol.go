@@ -131,6 +131,7 @@ type WorkRequest struct {
 	Collection         string       `json:"collection,omitempty"`
 	DesiredVersion     string       `json:"desired_version,omitempty"`
 	AccessModeOverride string       `json:"access_mode_override,omitempty"`
+	Resolver           string       `json:"resolver,omitempty"`
 	MaxCostUSD         *float64     `json:"max_cost_usd,omitempty"`
 	SourcesAllow       []string     `json:"sources_allow,omitempty"`
 	SourcesDeny        []string     `json:"sources_deny,omitempty"`

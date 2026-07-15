@@ -108,6 +108,7 @@ func (e *ErrCostExceeded) Error() string {
 type Policy struct {
 	AccessMode     string   `json:"access_mode"`
 	DesiredVersion string   `json:"desired_version"`
+	Resolver       string   `json:"resolver,omitempty"`
 	MaxCostUSD     *float64 `json:"max_cost_usd,omitempty"`
 	SourcesAllow   []string `json:"sources_allow,omitempty"`
 	SourcesDeny    []string `json:"sources_deny,omitempty"`

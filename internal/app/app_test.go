@@ -752,6 +752,39 @@ func TestSubmitCarriesCollectionIntoJobPolicy(t *testing.T) {
 	}
 }
 
+func TestSubmitResolverProfileAndUnknownValidation(t *testing.T) {
+	svc, jobs := newTestService(t)
+	svc.Config.Browser.OpenURLBase = "https://resolver.example.edu/openurl"
+	svc.Config.Browser.Resolvers = map[string]string{
+		"example": "https://example.primo.exlibrisgroup.com/nde/openurl?vid=61EXL_INST:61EXL_NDE",
+		"institute": "https://onesearch.library.example-institute.edu/discovery/openurl?vid=61INS_INST:INS",
+	}
+	request := doiRequest("wr_resolver_profile")
+	request.Resolver = "institute"
+	id, err := svc.Submit(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, err := jobs.Get(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.Policy.Resolver != "institute" {
+		t.Fatalf("resolver policy = %q", row.Policy.Resolver)
+	}
+	request.RequestID = "wr_unknown_resolver"
+	request.Resolver = "missing"
+	_, err = svc.Submit(context.Background(), request)
+	if err == nil {
+		t.Fatal("unknown resolver accepted")
+	}
+	for _, profile := range []string{"default", "example", "institute"} {
+		if !strings.Contains(err.Error(), profile) {
+			t.Fatalf("unknown resolver error %q does not list %q", err, profile)
+		}
+	}
+}
+
 type fakeNotificationSink struct {
 	human, imported int
 }

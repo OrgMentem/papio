@@ -6,13 +6,14 @@ package config
 
 import (
 	"fmt"
+	toml "github.com/pelletier/go-toml/v2"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
-
-	toml "github.com/pelletier/go-toml/v2"
 )
 
 // Access modes (stack plan "Access profiles").
@@ -66,8 +67,11 @@ type Browser struct {
 	// ExtensionID is the fixed Chrome extension ID allowed to talk to the
 	// native host (32 chars, a-p). Empty disables the bridge.
 	ExtensionID string `toml:"extension_id,omitempty"`
-	// OpenURLBase is the institution's OpenURL resolver base (https).
+	// OpenURLBase is the default institution's OpenURL resolver base (https).
 	OpenURLBase string `toml:"openurl_base_url,omitempty"`
+	// Resolvers contains named institutional OpenURL resolver bases. The
+	// OpenURLBase above remains the implicit "default" profile.
+	Resolvers map[string]string `toml:"resolvers,omitempty"`
 	// AdoptionRoot is the directory Chrome downloads into for adoption;
 	// the daemon rejects reported paths outside <root>/<job_id>/.
 	// Default: <data_dir>/adoptions.
@@ -205,8 +209,18 @@ func (c *Config) validate() error {
 	if c.Browser.ExtensionID != "" && !extensionIDRE.MatchString(c.Browser.ExtensionID) {
 		return fmt.Errorf("browser.extension_id must be 32 chars a-p")
 	}
-	if c.Browser.OpenURLBase != "" && !strings.HasPrefix(c.Browser.OpenURLBase, "https://") {
-		return fmt.Errorf("browser.openurl_base_url must be https")
+	if c.Browser.OpenURLBase != "" {
+		if err := validateOpenURLBase(c.Browser.OpenURLBase); err != nil {
+			return fmt.Errorf("browser.openurl_base_url %w", err)
+		}
+	}
+	for name, base := range c.Browser.Resolvers {
+		if !resolverNameRE.MatchString(name) {
+			return fmt.Errorf("browser.resolvers.%s name must be lowercase alphanumeric", name)
+		}
+		if err := validateOpenURLBase(base); err != nil {
+			return fmt.Errorf("browser.resolvers.%s %w", name, err)
+		}
 	}
 	if c.Browser.ActionExpirySeconds < 0 {
 		return fmt.Errorf("browser.action_expiry_seconds must be >= 0")
@@ -230,6 +244,16 @@ func (c *Config) validate() error {
 
 // extensionIDRE matches Chrome's a-p base16 extension ID alphabet.
 var extensionIDRE = regexp.MustCompile(`^[a-p]{32}$`)
+
+var resolverNameRE = regexp.MustCompile(`^[a-z0-9]+$`)
+
+func validateOpenURLBase(base string) error {
+	u, err := url.Parse(base)
+	if err != nil || u.Scheme != "https" || u.Host == "" || strings.TrimSpace(base) != base {
+		return fmt.Errorf("must be an absolute https URL")
+	}
+	return nil
+}
 
 // EffectiveAdoptionRoot returns the configured adoption root or its default.
 func (c *Config) EffectiveAdoptionRoot() string {
@@ -255,6 +279,31 @@ func (c *Config) FetchTimeout() time.Duration {
 // SourcePolicy returns the effective source policy (zero value when absent).
 func (c *Config) SourcePolicy(name string) Source {
 	return c.Sources[name]
+}
+
+// OpenURLBaseFor returns the configured base for a resolver profile. The empty
+// name selects the legacy default profile, as does the explicit "default"
+// profile name. Its boolean result distinguishes a configured profile from one
+// that is merely unavailable because no default base has been configured.
+func (c *Config) OpenURLBaseFor(name string) (string, bool) {
+	if name == "" || name == "default" {
+		return c.Browser.OpenURLBase, c.Browser.OpenURLBase != ""
+	}
+	base, ok := c.Browser.Resolvers[name]
+	return base, ok
+}
+
+// ResolverNames returns the selectable resolver profiles in stable order.
+func (c *Config) ResolverNames() []string {
+	names := make([]string, 0, len(c.Browser.Resolvers)+1)
+	if c.Browser.OpenURLBase != "" {
+		names = append(names, "default")
+	}
+	for name := range c.Browser.Resolvers {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	return names
 }
 
 // Save validates and atomically writes cfg as a user-only TOML file. An empty

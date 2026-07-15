@@ -187,6 +187,7 @@ func (b *Bridge) handle(ctx context.Context, msg *protocol.BrowserMessage) ([]js
 		return nil, fmt.Errorf("%w: unexpected inbound frame type %q", ErrInvalidFrame, msg.Type)
 	}
 }
+
 // helloRequired tells a still-connected extension that the daemon lost its
 // in-memory browser session (for example, after a daemon restart). The existing
 // error frame keeps papio-browser/1 unchanged while instructing the extension
@@ -201,7 +202,6 @@ func (b *Bridge) helloRequired() ([]json.RawMessage, error) {
 	}
 	return []json.RawMessage{frame}, nil
 }
-
 
 // recordAuth appends a timing-only auth event. The AuthPayload structurally
 // cannot carry a URL, host, title, query, or fragment, so an identity-provider
@@ -480,7 +480,8 @@ func (b *Bridge) poll(ctx context.Context) ([]json.RawMessage, error) {
 // reuse the frozen OpenURL field with the candidate's public URL; institutional
 // handoffs still construct the regular OpenURL resolver link.
 func (b *Bridge) offer(row job.Row, handoffDetail string) (json.RawMessage, error) {
-	offerURL := OpenURL(b.cfg.Browser.OpenURLBase, row.Work)
+	base, _ := b.cfg.OpenURLBaseFor(row.Policy.Resolver)
+	offerURL := OpenURL(base, row.Work)
 	if oaURL, ok := app.OABrowserHandoffURL(handoffDetail); ok {
 		offerURL = oaURL
 	}
@@ -508,7 +509,11 @@ func (b *Bridge) offer(row job.Row, handoffDetail string) (json.RawMessage, erro
 // detail is the durable offer discriminator, so a restart cannot re-open the
 // OA URL and alternate forever.
 func (b *Bridge) fallbackOAHandoff(ctx context.Context, jobID, failure string) (bool, error) {
-	if b.cfg.Browser.OpenURLBase == "" {
+	row, err := b.jobs.Get(ctx, jobID)
+	if err != nil {
+		return false, err
+	}
+	if base, ok := b.cfg.OpenURLBaseFor(row.Policy.Resolver); !ok || base == "" {
 		return false, nil
 	}
 	actions, err := b.jobs.ListHumanActions(ctx, true)
