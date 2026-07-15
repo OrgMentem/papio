@@ -188,7 +188,7 @@ func newActionsCommand(opt *options) *cobra.Command {
 			if err := opt.call(cmd.Context(), "jobs.list", map[string]any{"limit": 500}, &rows); err != nil {
 				return err
 			}
-			urls := actionURLs(actions, rows, cfg.Browser.OpenURLBase, limit)
+			urls := actionURLs(actions, rows, cfg.OpenURLBaseFor, limit)
 			if dryRun && opt.jsonOutput {
 				return opt.printJSON(urls)
 			}
@@ -213,7 +213,7 @@ const openURLTimeout = 5 * time.Second
 
 type commandRunner func(context.Context, string, ...string) error
 
-func actionURLs(actions []job.HumanAction, rows []job.Row, openURLBase string, limit int) []string {
+func actionURLs(actions []job.HumanAction, rows []job.Row, baseFor func(string) (string, bool), limit int) []string {
 	jobs := make(map[string]job.Row, len(rows))
 	for _, row := range rows {
 		jobs[row.ID] = row
@@ -224,7 +224,7 @@ func actionURLs(actions []job.HumanAction, rows []job.Row, openURLBase string, l
 		if !ok || action.Status != "open" || row.State != job.StateAwaitingHuman {
 			continue
 		}
-		target, ok := actionURL(action, row, openURLBase)
+		target, ok := actionURL(action, row, baseFor)
 		if !ok {
 			continue
 		}
@@ -236,17 +236,23 @@ func actionURLs(actions []job.HumanAction, rows []job.Row, openURLBase string, l
 	return urls
 }
 
-func actionURL(action job.HumanAction, row job.Row, openURLBase string) (string, bool) {
+func actionURL(action job.HumanAction, row job.Row, baseFor func(string) (string, bool)) (string, bool) {
 	if direct, ok := app.OABrowserHandoffURL(action.Detail); ok {
 		return direct, true
 	}
 	if detail := strings.TrimSpace(action.Detail); validOpenURL(detail) {
 		return detail, true
 	}
-	if action.Kind != "openurl_handoff" || openURLBase == "" {
+	if action.Kind != "openurl_handoff" {
 		return "", false
 	}
-	target := browser.OpenURL(openURLBase, row.Work)
+	// Honor the job's resolver profile: a Example Institute-routed job must never open the
+	// default (Example University) resolver.
+	base, ok := baseFor(row.Policy.Resolver)
+	if !ok || base == "" {
+		return "", false
+	}
+	target := browser.OpenURL(base, row.Work)
 	return target, validOpenURL(target)
 }
 
@@ -267,7 +273,9 @@ func openActionURLs(ctx context.Context, urls []string, dryRun bool, out io.Writ
 			continue
 		}
 		bounded, cancel := context.WithTimeout(ctx, openURLTimeout)
-		err := run(bounded, "open", target)
+		// The papio extension lives in Chrome; the OS default browser may not.
+		// Handoff tabs must open where the extension can adopt their downloads.
+		err := run(bounded, "open", "-b", chromeBundleID, target)
 		cancel()
 		if err != nil {
 			return err
@@ -275,6 +283,11 @@ func openActionURLs(ctx context.Context, urls []string, dryRun bool, out io.Writ
 	}
 	return nil
 }
+
+// chromeBundleID pins handoff tabs to the browser hosting the papio
+// extension. The native-messaging host manifests are Chrome-scoped today; if
+// other Chromium channels are ever supported this becomes configuration.
+const chromeBundleID = "com.google.Chrome"
 
 func commandExec(ctx context.Context, name string, args ...string) error {
 	return exec.CommandContext(ctx, name, args...).Run()
