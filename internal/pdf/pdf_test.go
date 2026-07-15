@@ -173,10 +173,10 @@ func TestMatchIdentity(t *testing.T) {
 	if got := MatchIdentity(text, target); got.Result != IdentityPass {
 		t.Fatalf("title match: %+v", got)
 	}
-  legacyAPA := work.Work{DOI: "10.1037/0021-9010.87.4.611"}
-  if got := MatchIdentity("Copyright line DOI: 10.1037//0021-9010.87.4.611", legacyAPA); got.Result != IdentityPass {
-    t.Fatalf("legacy APA DOI: %+v", got)
-  }
+	legacyAPA := work.Work{DOI: "10.1037/0021-9010.87.4.611"}
+	if got := MatchIdentity("Copyright line DOI: 10.1037//0021-9010.87.4.611", legacyAPA); got.Result != IdentityPass {
+		t.Fatalf("legacy APA DOI: %+v", got)
+	}
 }
 
 func TestMatchIdentityHonorsTitleThreshold(t *testing.T) {

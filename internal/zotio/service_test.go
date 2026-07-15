@@ -3,8 +3,8 @@ package zotio
 
 import (
 	"context"
-	"errors"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"

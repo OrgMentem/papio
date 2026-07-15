@@ -34,14 +34,14 @@ var (
 // Preflight fails before acquisition or mutation when an installed Zotio is old
 // or missing one of these commands.
 var RequiredCapabilities = map[string]string{
-	"items missing-pdf": "read",
-	"items get":         "read",
-	"attachments add":   "write",
-	"import scan":       "read",
-	"import resolve":    "read",
-	"import apply":      "write",
+	"items missing-pdf":       "read",
+	"items get":               "read",
+	"attachments add":         "write",
+	"import scan":             "read",
+	"import resolve":          "read",
+	"import apply":            "write",
 	"items add-to-collection": "write",
-	"sync":              "sync",
+	"sync":                    "sync",
 }
 
 // ExecFunc is injected by tests. Production uses an argv-only os/exec call;

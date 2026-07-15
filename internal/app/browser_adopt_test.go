@@ -134,7 +134,7 @@ func TestForbiddenNonOACandidateKeepsInstitutionalHandoff(t *testing.T) {
 		Adapter: &fakeResolver{name: "licensed", cands: []resolver.Candidate{{
 			Source: "licensed", URL: "https://licensed.example.org/paper.pdf",
 			ResolvedWork: work.Work{DOI: "10.1002/example"},
-			Version: resolver.VersionPublished, AccessBasis: resolver.AccessLicensedAPI, ReuseLicense: "unknown",
+			Version:      resolver.VersionPublished, AccessBasis: resolver.AccessLicensedAPI, ReuseLicense: "unknown",
 			ExpectedMIME: "application/pdf", Direct: true, IdentityConfidence: 1,
 		}}},
 		Policy: config.Source{Enabled: true},
