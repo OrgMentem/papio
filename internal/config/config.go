@@ -6,7 +6,6 @@ package config
 
 import (
 	"fmt"
-	toml "github.com/pelletier/go-toml/v2"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -14,6 +13,8 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	toml "github.com/pelletier/go-toml/v2"
 )
 
 // Access modes (stack plan "Access profiles").

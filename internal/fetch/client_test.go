@@ -39,7 +39,9 @@ func TestSecureHTTPClientBlocksPrivateRedirectBeforeSecondRequest(t *testing.T) 
 		t.Fatal(err)
 	}
 	req, _ := http.NewRequest(http.MethodGet, "https://example.test/start", nil)
-	if _, err := client.Do(req); err == nil {
+	resp, err := client.Do(req)
+	if err == nil {
+		resp.Body.Close()
 		t.Fatal("private redirect accepted")
 	}
 	if calls != 1 {

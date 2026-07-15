@@ -176,7 +176,7 @@ func decodeStrict(r io.Reader, max int, dst any) error {
 	limited := &io.LimitedReader{R: r, N: int64(max) + 1}
 	raw, err := io.ReadAll(limited)
 	if err != nil {
-		return fmt.Errorf("%w: %v", ErrInvalidRequest, err)
+		return fmt.Errorf("%w: %w", ErrInvalidRequest, err)
 	}
 	if len(raw) > max {
 		return ErrTooLarge
@@ -185,19 +185,19 @@ func decodeStrict(r io.Reader, max int, dst any) error {
 		if errors.Is(err, ErrTrailingJSON) {
 			return err
 		}
-		return fmt.Errorf("%w: %v", ErrInvalidRequest, err)
+		return fmt.Errorf("%w: %w", ErrInvalidRequest, err)
 	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(dst); err != nil {
-		return fmt.Errorf("%w: %v", ErrInvalidRequest, err)
+		return fmt.Errorf("%w: %w", ErrInvalidRequest, err)
 	}
 	var extra json.RawMessage
 	if err := decoder.Decode(&extra); err != io.EOF {
 		if err == nil {
 			return ErrTrailingJSON
 		}
-		return fmt.Errorf("%w: %v", ErrInvalidRequest, err)
+		return fmt.Errorf("%w: %w", ErrInvalidRequest, err)
 	}
 	return nil
 }

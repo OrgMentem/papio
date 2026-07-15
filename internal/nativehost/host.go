@@ -331,7 +331,7 @@ func (b *bridge) writeFrame(data []byte) error {
 	b.writeMu.Lock()
 	defer b.writeMu.Unlock()
 	var header [4]byte
-	binary.LittleEndian.PutUint32(header[:], uint32(len(data)))
+	binary.LittleEndian.PutUint32(header[:], uint32(len(data))) //nolint:gosec // G115: len(data) bounded by MaxBrowserMessageBytes check above.
 	if _, err := b.stdout.Write(header[:]); err != nil {
 		return err
 	}

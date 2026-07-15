@@ -187,7 +187,7 @@ func (d *Downloader) roundTrip(overall context.Context, request *http.Request) (
 	}
 	result := make(chan roundTripResult, 1)
 	go func() {
-		response, err := d.transport.RoundTrip(req)
+		response, err := d.transport.RoundTrip(req) //nolint:bodyclose // late responses are drained/closed via closeBody in the deadline branch below; the success path returns the body to the caller who closes it.
 		result <- roundTripResult{response: response, err: err}
 	}()
 
@@ -281,7 +281,7 @@ func (d *Downloader) saveResponse(overall context.Context, resp *http.Response, 
 			}
 			written += int64(n)
 		}
-		if readErr == io.EOF {
+		if errors.Is(readErr, io.EOF) {
 			break
 		}
 		if readErr != nil {

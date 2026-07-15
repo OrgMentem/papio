@@ -201,7 +201,7 @@ func extractOCR(parent context.Context, path string, cap Capability, opt Semanti
 	ctx, cancel := context.WithTimeout(parent, opt.OCRTimeout)
 	defer cancel()
 	cmd := func() *exec.Cmd {
-		cmd := exec.CommandContext(ctx, cap.PDFToPPM, "-f", "1", "-l", fmt.Sprint(opt.OCRPages), "-scale-to", "2000", "-png", path, prefix)
+		cmd := exec.CommandContext(ctx, cap.PDFToPPM, "-f", "1", "-l", fmt.Sprint(opt.OCRPages), "-scale-to", "2000", "-png", path, prefix) //nolint:gosec // G204: PDFToPPM is a discovered trusted binary path; path/prefix are internal quarantine paths, not user shell input.
 		configureProcessTree(cmd)
 		return cmd
 	}()

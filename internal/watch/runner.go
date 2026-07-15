@@ -103,7 +103,7 @@ func (r *Runner) runWatch(ctx context.Context, watch Watch) (*RunResult, error) 
 	}
 	failure, recordErr := r.Store.RecordFailure(ctx, watch.ID, r.now(), err)
 	if recordErr != nil {
-		return result, fmt.Errorf("%w (recording watch failure: %v)", err, recordErr)
+		return result, fmt.Errorf("%w (recording watch failure: %w)", err, recordErr)
 	}
 	result.ConsecutiveFailures = failure.ConsecutiveFailures
 	result.Disabled = failure.Disabled

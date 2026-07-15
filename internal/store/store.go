@@ -53,7 +53,10 @@ func Open(ctx context.Context, dir string) (*Store, error) {
 	var integrity string
 	if err := db.QueryRowContext(ctx, "PRAGMA integrity_check").Scan(&integrity); err != nil || integrity != "ok" {
 		_ = db.Close()
-		return nil, fmt.Errorf("integrity check on %s: %q %v", path, integrity, err)
+		if err != nil {
+			return nil, fmt.Errorf("integrity check on %s failed: %w", path, err)
+		}
+		return nil, fmt.Errorf("integrity check on %s returned %q, want \"ok\"", path, integrity)
 	}
 	return s, nil
 }

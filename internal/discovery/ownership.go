@@ -49,8 +49,8 @@ func ClassifyOwnership(ctx context.Context, works []DiscoveredWork, lookup Owner
 		if ownership.Status != zotio.OwnershipOwnedWithPDF && ownership.Status != zotio.OwnershipOwnedMissingPDF {
 			continue
 		}
-		works[index].Owned = true
-		works[index].OwnedItemKey = strings.TrimSpace(ownership.ItemKey)
+		works[index].Owned = true                                        //nolint:gosec // G602: index bounded by len(result.Works)==len(works) guard above.
+		works[index].OwnedItemKey = strings.TrimSpace(ownership.ItemKey) //nolint:gosec // G602: same bound.
 	}
 	return strings.TrimSpace(result.StalenessWarning)
 }
