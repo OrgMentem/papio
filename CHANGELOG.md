@@ -4,6 +4,33 @@ All notable changes to Papio are documented here. This initial release entry is
 synthesized from the complete `papio` and `zotio` Git histories and the execution
 records in `notes/acquisition-stack-plan.md`.
 
+## [Unreleased]
+
+### Fixed
+
+- Reliability: overlapping extension state writes are now persisted through a
+  serialized save chain, so a reordered `chrome.storage` write can no longer
+  resurrect a stale snapshot after a service-worker restart.
+- Reliability: concurrent queued-handoff fallback timers no longer drop each
+  other's forced releases; a single drain loop consumes every pending release,
+  so queued jobs can no longer be stranded invisibly with `tab_id -1`.
+- Reliability: a failed native-host idle-poll write now tears the bridge down
+  instead of leaving the process alive but no longer polling (which starved the
+  extension of offers and cancels).
+- Reliability: `fetchCandidates` propagates the `OpenHumanAction` write error
+  before parking a landing-page-only job, matching `exhaustedCandidates`, so a
+  transient write failure can no longer strand a job with no human-action row.
+- Concurrency: removed a redundant drain goroutine in `readBodyWithContext`
+  that doubled leaked goroutines when a response body read hung.
+- MCP `acquire.report` now classifies failures — missing batch as `not_found`,
+  malformed batch ID as `invalid_argument`, and other failures as `internal` —
+  instead of collapsing every error into `not_found`.
+- Batch settlement is now a single source of truth (`batch.Report.Settled`),
+  removing a stale duplicate outcome list in `papio_batch_wait` that carried
+  legacy outcome spellings.
+- Docs/schema for `papio_batch_wait` `timeout_seconds` now state that `0` or an
+  omitted value defaults to 300, matching the implementation.
+
 ## [0.2.0] - 2026-07-15
 
 ### Phase 0 — contracts and prerequisite

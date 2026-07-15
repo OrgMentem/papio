@@ -290,6 +290,11 @@ export class Bridge {
   private seq = 0;
   private store: StoreShape = emptyStore();
   private ready: Promise<void> = Promise.resolve();
+  /** Serializes full-snapshot persistence. Concurrent Chrome events apply their
+   * state transforms synchronously in event order, but chrome.storage gives no
+   * write-ordering guarantee, so saves are chained: each runs after the prior
+   * settles and persists the latest snapshot, so a stale write never wins. */
+  private saveChain: Promise<void> = Promise.resolve();
   private listenersBound = false;
   /** Per-job in-progress download correlation (in-memory; transient). */
   private readonly downloads = new Map<string, DownloadTrack>();
@@ -312,6 +317,9 @@ export class Bridge {
   private latestOfferOpenURL: string | undefined;
   /** Pending fallback-release timers, keyed by queued job. Worker-local only. */
   private readonly queuedHandoffTimers = new Map<string, object>();
+  /** Forced job IDs awaiting release; consumed by the single active drain so
+   * overlapping fallback timers cannot drop each other's requests. */
+  private readonly pendingForcedReleases = new Set<string>();
 
   constructor(private readonly deps: BridgeDeps) {}
   trackedJobCount(): number {
@@ -490,8 +498,15 @@ export class Bridge {
   }
 
   private async update(fn: (store: StoreShape) => StoreShape): Promise<void> {
+    // Apply the transform synchronously so in-memory state stays in event order.
     this.store = fn(this.store);
-    await this.deps.backend.save(this.store);
+    // Persist after any in-flight save settles, writing the latest snapshot so
+    // reordered chrome.storage writes cannot resurrect an older one.
+    const save = this.saveChain.then(() => this.deps.backend.save(this.store));
+    // Keep the chain alive across a failed save without unhandled rejections;
+    // this caller still observes the real error below.
+    this.saveChain = save.catch(() => {});
+    await save;
   }
 
   private async upsertJobWithOffer(job: ActiveJob, offerURL: string): Promise<void> {
@@ -579,17 +594,39 @@ export class Bridge {
   }
 
   private async releaseQueuedHandoffs(fallbackJobID?: string): Promise<void> {
-    if ((!this.hasAuthEvidence() && fallbackJobID === undefined) || this.drainingQueuedHandoffs) return;
+    if (fallbackJobID !== undefined) this.pendingForcedReleases.add(fallbackJobID);
+    if (
+      (!this.hasAuthEvidence() && this.pendingForcedReleases.size === 0) ||
+      this.drainingQueuedHandoffs
+    ) {
+      return;
+    }
     this.drainingQueuedHandoffs = true;
     try {
-      let forcedJobID = fallbackJobID;
-      while (this.hasAuthEvidence() || forcedJobID !== undefined) {
-        const queued =
-          forcedJobID === undefined
-            ? this.store.activeJobs.find((job) => job.status === "queued")
-            : this.store.activeJobs.find((job) => job.job_id === forcedJobID && job.status === "queued");
-        forcedJobID = undefined;
-        if (queued === undefined) return;
+      // One drain loop owns both auth-driven draining and every forced release,
+      // including those queued by overlapping fallback timers while it runs.
+      while (this.hasAuthEvidence() || this.pendingForcedReleases.size > 0) {
+        let selected = this.hasAuthEvidence()
+          ? this.store.activeJobs.find((job) => job.status === "queued")
+          : undefined;
+        const forcedJobID =
+          selected === undefined ? this.pendingForcedReleases.values().next().value : undefined;
+        if (forcedJobID !== undefined) {
+          this.pendingForcedReleases.delete(forcedJobID);
+          selected = this.store.activeJobs.find(
+            (job) => job.job_id === forcedJobID && job.status === "queued",
+          );
+        }
+        if (selected === undefined) {
+          // Auth evidence releases every queued job, so none remaining means
+          // any leftover forced IDs are moot; drop them and stop.
+          if (this.hasAuthEvidence()) {
+            this.pendingForcedReleases.clear();
+            return;
+          }
+          continue;
+        }
+        const queued = selected; // const so narrowing survives the update closure.
         this.queuedHandoffTimers.delete(queued.job_id);
         const url = this.offerURLs.get(queued.job_id);
         if (url === undefined) {

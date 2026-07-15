@@ -881,3 +881,95 @@ test("unplanned port death reconnects with backoff; deliberate disconnect stays 
   expect(bad.port.disconnected).toBe(true);
   expect(bad.timers.length).toBe(timersBefore);
 });
+
+test("concurrent fallback timers release every queued handoff", async () => {
+  const h = makeHarness();
+  // First offer opens the one visible tab; the rest queue behind it, each with
+  // its own worker-local fallback timer.
+  const jobIDs = ["job_conc_active", "job_conc_1", "job_conc_2", "job_conc_3"];
+
+  await h.bridge.start();
+  for (const jobID of jobIDs) await h.port.inbound(jobOffer(jobID));
+
+  expect(h.backend.store.activeJobs.filter((job) => job.status === "queued")).toHaveLength(3);
+  const fallbacks = h.timers.filter((timer) => timer.ms === 45_000);
+  expect(fallbacks).toHaveLength(3);
+
+  // Fire every fallback timer at once. Their drains overlap, so a single-flight
+  // guard that dropped concurrent forced releases would strand all but one job
+  // durably queued with tab_id -1. Every queued handoff must instead release.
+  await Promise.all(fallbacks.map((timer) => timer.fn()));
+
+  expect(h.backend.store.activeJobs.filter((job) => job.status === "queued")).toHaveLength(0);
+  expect(h.backend.store.activeJobs.every((job) => job.tab_id >= 0)).toBe(true);
+  expect(h.tabs.created.filter((tab) => !tab.active)).toHaveLength(3);
+});
+
+// OrderBackend records the peak number of saves in flight at once. Each save
+// yields on a microtask (never a real timer), so genuinely concurrent saves
+// overlap deterministically while serialized ones never do.
+class OrderBackend implements StateBackend {
+  store: StoreShape = emptyStore();
+  maxInFlight = 0;
+  private inFlight = 0;
+  async load(): Promise<StoreShape> {
+    return this.store;
+  }
+  async save(store: StoreShape): Promise<void> {
+    this.inFlight += 1;
+    this.maxInFlight = Math.max(this.maxInFlight, this.inFlight);
+    await Promise.resolve(); // microtask hop: overlapping writes stay in flight together.
+    this.store = store;
+    this.inFlight -= 1;
+  }
+}
+
+test("overlapping state writes persist serially so no stale snapshot wins", async () => {
+  const port = new FakePort();
+  const tabs = new FakeTabs();
+  const downloads = new FakeDownloads();
+  const clock = { now: 1_700_000_000_000 };
+  const backend = new OrderBackend();
+  // A pre-existing visible handoff forces the two new offers to queue (a pure
+  // state write with no intervening tab creation).
+  backend.store = {
+    activeJobs: [
+      {
+        job_id: "seed_visible",
+        tab_id: 100,
+        offered_at: clock.now,
+        expires_at: clock.now + 1_000,
+        status: "accepted",
+        provider_hosts: [PROVIDER_HOST],
+      },
+    ],
+    offerURLs: {},
+  };
+  const deps: BridgeDeps = {
+    connectNative: () => port,
+    randomUUID: () => crypto.randomUUID(),
+    manifestVersion: "0.1.0",
+    now: () => clock.now,
+    setTimeout: () => {},
+    backend,
+    tabs,
+    downloads,
+    adapterSpecs: [],
+    scripting: { executeScript: async () => [] },
+    permissions: { contains: async () => false },
+  };
+  const bridge = new Bridge(deps);
+  await bridge.start();
+  backend.maxInFlight = 0; // ignore any hydration write during start.
+
+  // Two Chrome events land at once; each mutates state and persists a snapshot.
+  await Promise.all([port.inbound(jobOffer("job_write_a")), port.inbound(jobOffer("job_write_b"))]);
+
+  // Serialized persistence keeps at most one save in flight at any moment.
+  // Without the save chain both writes overlap and a reordered chrome.storage
+  // write could persist an older snapshot.
+  expect(backend.maxInFlight).toBe(1);
+
+  const ids = backend.store.activeJobs.map((job) => job.job_id).sort();
+  expect(ids).toEqual(["job_write_a", "job_write_b", "seed_visible"]);
+});

@@ -27,6 +27,17 @@ const SchemaVersion = "papio-batch-manifest/1"
 
 var idPattern = regexp.MustCompile(`^batch-[0-9a-f]{8}$`)
 
+// Sentinel errors let callers classify Load failures instead of treating every
+// failure as a missing manifest. Other Load errors are unexpected (I/O, decode,
+// corrupt manifest) and should surface as internal failures.
+var (
+	// ErrManifestNotFound means the requested batch (or any batch, for "latest")
+	// does not exist.
+	ErrManifestNotFound = errors.New("batch manifest not found")
+	// ErrInvalidBatchID means the requested ID is not a well-formed batch ID.
+	ErrInvalidBatchID = errors.New("invalid batch ID")
+)
+
 // Manifest records one batch submission independently of ephemeral daemon state.
 type Manifest struct {
 	SchemaVersion string         `json:"schema_version"`
@@ -77,6 +88,45 @@ type ReportWork struct {
 	Collection    string               `json:"collection,omitempty"`
 	FilingStatus  string               `json:"filing_status,omitempty"`
 	FilingError   string               `json:"filing_error,omitempty"`
+}
+
+// Outcome tokens are the only values buildWorkReport assigns to ReportWork.
+// Outcome. They are the single source of truth for batch settlement.
+const (
+	OutcomeImported                   = "imported"
+	OutcomeBrowserFetchedThenImported = "browser_fetched_then_imported"
+	OutcomeImportFailed               = "import_failed"
+	OutcomeExistingItemAttached       = "existing_item_attached"
+	OutcomeAwaitingHuman              = "awaiting_human"
+	OutcomeNeedsReview                = "needs_review"
+	OutcomeFailed                     = "failed"
+	OutcomeSkippedOwned               = "skipped_owned"
+	OutcomeInProgress                 = "in_progress"
+)
+
+// terminalOutcomes are the outcomes that will not change without human or
+// operator action. OutcomeInProgress is the only non-terminal outcome
+// buildWorkReport can emit, so a wait settles once no work is in progress.
+var terminalOutcomes = map[string]bool{
+	OutcomeImported:                   true,
+	OutcomeBrowserFetchedThenImported: true,
+	OutcomeImportFailed:               true,
+	OutcomeExistingItemAttached:       true,
+	OutcomeAwaitingHuman:              true,
+	OutcomeNeedsReview:                true,
+	OutcomeFailed:                     true,
+	OutcomeSkippedOwned:               true,
+}
+
+// Settled reports whether every work has reached a terminal outcome, so a
+// batch-wait loop can stop polling. It is the canonical settlement check.
+func (r *Report) Settled() bool {
+	for _, work := range r.Works {
+		if !terminalOutcomes[work.Outcome] {
+			return false
+		}
+	}
+	return true
 }
 
 // Jobs is the narrow durable state dependency needed to build a report.
@@ -202,7 +252,7 @@ func Load(dataDir, requested string) (*Manifest, error) {
 		entries, err := os.ReadDir(directory(dataDir))
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
-				return nil, fmt.Errorf("no batch manifests found")
+				return nil, fmt.Errorf("no batch manifests found: %w", ErrManifestNotFound)
 			}
 			return nil, fmt.Errorf("listing batch manifests: %w", err)
 		}
@@ -224,12 +274,12 @@ func Load(dataDir, requested string) (*Manifest, error) {
 			}
 		}
 		if latest == nil {
-			return nil, fmt.Errorf("no batch manifests found")
+			return nil, fmt.Errorf("no batch manifests found: %w", ErrManifestNotFound)
 		}
 		return latest, nil
 	}
 	if !idPattern.MatchString(requested) {
-		return nil, fmt.Errorf("invalid batch ID %q", requested)
+		return nil, fmt.Errorf("%w %q", ErrInvalidBatchID, requested)
 	}
 	return loadPath(path(dataDir, requested))
 }
@@ -238,7 +288,7 @@ func loadPath(manifestPath string) (*Manifest, error) {
 	data, err := os.ReadFile(manifestPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return nil, fmt.Errorf("batch manifest not found")
+			return nil, fmt.Errorf("%w", ErrManifestNotFound)
 		}
 		return nil, fmt.Errorf("reading batch manifest: %w", err)
 	}
@@ -287,29 +337,29 @@ func buildWorkReport(ctx context.Context, manifestWork ManifestWork, jobs Jobs, 
 	item := ReportWork{RequestID: manifestWork.RequestID, JobID: manifestWork.JobID, Work: manifestWork.Work, Collection: manifestWork.Work.Collection}
 	switch manifestWork.Status {
 	case "skipped_owned":
-		item.Outcome = "skipped_owned"
+		item.Outcome = OutcomeSkippedOwned
 		return item, nil
 	case "submission_failed":
-		item.Outcome, item.FailureClass = "failed", "submission"
+		item.Outcome, item.FailureClass = OutcomeFailed, "submission"
 		return item, nil
 	case "submitted", "existing_item_attached":
 	default:
 		return item, fmt.Errorf("unknown manifest work status %q", manifestWork.Status)
 	}
 	if manifestWork.JobID == "" {
-		item.Outcome, item.FailureClass = "failed", "missing_job"
+		item.Outcome, item.FailureClass = OutcomeFailed, "missing_job"
 		return item, nil
 	}
 	row, err := jobs.Get(ctx, manifestWork.JobID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			item.Outcome, item.FailureClass = "failed", "missing_job"
+			item.Outcome, item.FailureClass = OutcomeFailed, "missing_job"
 			return item, nil
 		}
 		return item, err
 	}
 	if row == nil {
-		item.Outcome, item.FailureClass = "failed", "missing_job"
+		item.Outcome, item.FailureClass = OutcomeFailed, "missing_job"
 		return item, nil
 	}
 	if row.Policy.Collection != "" {
@@ -327,32 +377,32 @@ func buildWorkReport(ctx context.Context, manifestWork ManifestWork, jobs Jobs, 
 	case job.StateReady:
 		switch {
 		case autoImport.Status == "error":
-			item.Outcome = "import_failed"
+			item.Outcome = OutcomeImportFailed
 			item.ErrorClass, item.ErrorHint = autoImport.ErrorClass, autoImport.ErrorHint
 		case manifestWork.Status == "existing_item_attached":
-			item.Outcome = "existing_item_attached"
+			item.Outcome = OutcomeExistingItemAttached
 		case autoImport.Status == "applied" && autoImport.ParentKey != "" && autoImport.AttachmentKey != "":
 			item.ParentKey, item.AttachmentKey = autoImport.ParentKey, autoImport.AttachmentKey
 			if browserFetched(events) {
-				item.Outcome = "browser_fetched_then_imported"
+				item.Outcome = OutcomeBrowserFetchedThenImported
 			} else {
-				item.Outcome = "imported"
+				item.Outcome = OutcomeImported
 			}
 		default:
-			item.Outcome, item.Reason = "in_progress", job.StateReady
+			item.Outcome, item.Reason = OutcomeInProgress, job.StateReady
 		}
 	case job.StateAwaitingHuman:
-		item.Outcome, item.Reason = "awaiting_human", awaitingReason(actions)
+		item.Outcome, item.Reason = OutcomeAwaitingHuman, awaitingReason(actions)
 	case job.StateNeedsReview:
-		item.Outcome = "needs_review"
+		item.Outcome = OutcomeNeedsReview
 	case job.StateFailed, job.StateUnavailable, job.StateCancelled:
-		item.Outcome = "failed"
+		item.Outcome = OutcomeFailed
 		item.FailureClass = row.TerminalReason
 		if item.FailureClass == "" {
 			item.FailureClass = row.State
 		}
 	default:
-		item.Outcome, item.Reason = "in_progress", row.State
+		item.Outcome, item.Reason = OutcomeInProgress, row.State
 	}
 	return item, nil
 }

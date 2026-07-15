@@ -197,9 +197,15 @@ func (b *bridge) run(ctx context.Context) error {
 	pollCtx, cancelPoll := context.WithCancel(ctx)
 	var pollWG sync.WaitGroup
 	pollWG.Add(1)
+	pollFatal := make(chan error, 1)
 	go func() {
 		defer pollWG.Done()
-		b.pollLoop(pollCtx)
+		if err := b.pollLoop(pollCtx); err != nil {
+			select {
+			case pollFatal <- err:
+			default:
+			}
+		}
 	}()
 	defer func() {
 		cancelPoll()
@@ -227,6 +233,8 @@ func (b *bridge) run(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			return nil
+		case err := <-pollFatal:
+			return err
 		case err := <-readErr:
 			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 				return nil // Chrome closed the port: clean shutdown.
@@ -287,26 +295,28 @@ func (b *bridge) handleInbound(ctx context.Context, frame []byte) error {
 
 // pollLoop drains daemon-initiated frames while stdin is idle. Sync errors are
 // transient (the daemon may be restarting) and never terminate the bridge; a
-// stdout write failure does, because the port is gone.
-func (b *bridge) pollLoop(ctx context.Context) {
+// stdout write failure does, because the port is gone: it is returned so run
+// tears the whole bridge down instead of surviving as an inert, non-polling
+// process that starves the extension of offers and cancels.
+func (b *bridge) pollLoop(ctx context.Context) error {
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
-			return
+			return nil
 		case <-ticker.C:
 			outbound, err := b.syncer.Sync(ctx, nil)
 			if err != nil {
 				if ctx.Err() != nil {
-					return
+					return nil
 				}
 				_, _ = fmt.Fprintln(b.stderr, "papio-native-host: poll browser.sync:", err)
 				continue
 			}
 			if err := b.writeOutbound(outbound); err != nil {
 				_, _ = fmt.Fprintln(b.stderr, "papio-native-host: poll write:", err)
-				return
+				return err
 			}
 		}
 	}

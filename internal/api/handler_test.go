@@ -318,6 +318,34 @@ func TestRouterAcquireReportJoinsManifestAgainstLiveJobState(t *testing.T) {
 	}
 }
 
+// acquire.report must not collapse every failure into not_found: a well-formed
+// but missing batch is not_found, while a malformed batch ID is invalid_argument
+// so clients can distinguish a missing resource from a bad request.
+func TestRouterAcquireReportClassifiesErrors(t *testing.T) {
+	system := testSystem(t)
+	router := Router(system)
+	cases := []struct {
+		name    string
+		batchID string
+		want    string
+	}{
+		{name: "missing but valid id", batchID: "batch-00000000", want: "not_found"},
+		{name: "latest with none present", batchID: "latest", want: "not_found"},
+		{name: "malformed id", batchID: "not-a-batch", want: "invalid_argument"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rpcErr := callMethod(t, router, "acquire.report", AcquireReportParams{BatchID: tc.batchID}, nil)
+			if rpcErr == nil {
+				t.Fatalf("expected %s error, got nil", tc.want)
+			}
+			if rpcErr.Code != tc.want {
+				t.Fatalf("code = %q, want %q (message %q)", rpcErr.Code, tc.want, rpcErr.Message)
+			}
+		})
+	}
+}
+
 func TestRouterWatchAddListAndRemove(t *testing.T) {
 	system := testSystem(t)
 	router := Router(system)

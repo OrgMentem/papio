@@ -454,7 +454,9 @@ func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[st
 	}
 
 	if manual {
-		_, _ = s.Jobs.OpenHumanAction(ctx, row.ID, "manual_download", "a resolver returned a landing page but no verified direct PDF")
+		if _, err := s.Jobs.OpenHumanAction(ctx, row.ID, "manual_download", "a resolver returned a landing page but no verified direct PDF"); err != nil {
+			return err
+		}
 		return s.park(ctx, row.ID, job.StateFetching, job.StateAwaitingHuman,
 			map[string]any{"reason": "landing_page_only"})
 	}

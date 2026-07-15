@@ -311,3 +311,36 @@ func TestBuildReportSurfacesCollectionFilingOutcome(t *testing.T) {
 		t.Fatalf("filed work must not carry a failure note:\n%s", rendered)
 	}
 }
+
+// Settled is the single source of truth for batch-wait completion: it settles
+// only on canonical terminal outcomes emitted by buildWorkReport. A legacy or
+// unknown token must NOT settle (regression for the stale hand-maintained list
+// that treated legacy spellings like "browser_imported" as settled).
+func TestReportSettledUsesCanonicalTerminalOutcomes(t *testing.T) {
+	terminal := []string{
+		OutcomeImported, OutcomeBrowserFetchedThenImported, OutcomeImportFailed,
+		OutcomeExistingItemAttached, OutcomeAwaitingHuman, OutcomeNeedsReview,
+		OutcomeFailed, OutcomeSkippedOwned,
+	}
+	for _, outcome := range terminal {
+		report := &Report{Works: []ReportWork{{Outcome: outcome}}}
+		if !report.Settled() {
+			t.Fatalf("outcome %q should settle", outcome)
+		}
+	}
+	nonTerminal := []string{OutcomeInProgress, "browser_imported", "browser-imported", "skipped", "existing-item attached", ""}
+	for _, outcome := range nonTerminal {
+		report := &Report{Works: []ReportWork{{Outcome: outcome}}}
+		if report.Settled() {
+			t.Fatalf("outcome %q must not settle", outcome)
+		}
+	}
+	// A report settles only when every work is terminal.
+	mixed := &Report{Works: []ReportWork{{Outcome: OutcomeImported}, {Outcome: OutcomeInProgress}}}
+	if mixed.Settled() {
+		t.Fatal("a report with an in-progress work must not settle")
+	}
+	if !(&Report{}).Settled() {
+		t.Fatal("an empty report settles vacuously")
+	}
+}

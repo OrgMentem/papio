@@ -314,7 +314,8 @@ func (d *Downloader) saveResponse(overall context.Context, resp *http.Response, 
 }
 
 // readBodyWithContext bounds even a custom response body that ignores Close.
-// A late read is discarded; its goroutine owns the buffer until it returns.
+// A late read is discarded harmlessly: result is buffered (cap 1) and the read
+// goroutine writes exactly once, so its send never blocks even with no reader.
 func readBodyWithContext(ctx context.Context, body io.Reader, buffer []byte) (int, error) {
 	type readResult struct {
 		n   int
@@ -329,7 +330,6 @@ func readBodyWithContext(ctx context.Context, body io.Reader, buffer []byte) (in
 	case done := <-result:
 		return done.n, done.err
 	case <-ctx.Done():
-		go func() { <-result }()
 		return 0, ctx.Err()
 	}
 }

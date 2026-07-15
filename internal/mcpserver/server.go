@@ -147,7 +147,7 @@ type ActionsResolveOutput struct {
 // BatchWaitInput bounds one wait for a persisted acquisition batch.
 type BatchWaitInput struct {
 	BatchID        string `json:"batch_id" jsonschema:"batch ID returned by papio acquire --batch, or latest"`
-	TimeoutSeconds int    `json:"timeout_seconds,omitempty" jsonschema:"maximum wait in seconds, 1 through 600; defaults to 300"`
+	TimeoutSeconds int    `json:"timeout_seconds,omitempty" jsonschema:"maximum wait in seconds, 1 through 600; 0 or omitted defaults to 300"`
 	PollSeconds    int    `json:"poll_seconds,omitempty" jsonschema:"seconds between reports; defaults to 5"`
 }
 
@@ -769,19 +769,7 @@ func waitForBatch(ctx context.Context, dependencies toolDependencies, input Batc
 }
 
 func batchReportSettled(report *batch.Report) bool {
-	if report == nil {
-		return false
-	}
-	for _, work := range report.Works {
-		switch work.Outcome {
-		case "imported", "browser_imported", "browser-imported", "browser_fetched_then_imported",
-			"import_failed", "awaiting_human", "needs_review", "failed", "skipped", "skipped_owned",
-			"existing_item_attached", "existing-item attached":
-		default:
-			return false
-		}
-	}
-	return true
+	return report != nil && report.Settled()
 }
 
 func waitForPoll(ctx context.Context, duration time.Duration) error {

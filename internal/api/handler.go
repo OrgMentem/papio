@@ -206,7 +206,14 @@ func acquireReport(ctx context.Context, raw json.RawMessage, system *bootstrap.S
 	}
 	report, err := BatchReport(ctx, system, params.BatchID)
 	if err != nil {
-		return nil, &ipc.RPCError{Code: "not_found", Message: safeMessage(err, "batch report not found")}
+		switch {
+		case errors.Is(err, batch.ErrManifestNotFound):
+			return nil, &ipc.RPCError{Code: "not_found", Message: safeMessage(err, "batch report not found")}
+		case errors.Is(err, batch.ErrInvalidBatchID):
+			return nil, &ipc.RPCError{Code: "invalid_argument", Message: safeMessage(err, "invalid batch id")}
+		default:
+			return nil, &ipc.RPCError{Code: "internal", Message: safeMessage(err, "batch report failed")}
+		}
 	}
 	return marshal(report)
 }

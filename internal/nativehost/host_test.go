@@ -210,6 +210,38 @@ func TestStdinEOFCleanExit(t *testing.T) {
 	}
 }
 
+// failWriter fails every write, standing in for a broken stdout pipe whose peer
+// is gone while stdin remains open.
+type failWriter struct{}
+
+func (failWriter) Write([]byte) (int, error) { return 0, errors.New("stdout gone") }
+
+// TestPollWriteFailureTerminatesRun: a failed idle-poll write must tear the
+// whole bridge down, not silently stop polling while the process stays alive.
+// Otherwise the native host lingers as an inert connection and the extension
+// receives no further offers or cancels. Regression for the stranded-host bug.
+func TestPollWriteFailureTerminatesRun(t *testing.T) {
+	stdinR, stdinW := io.Pipe()
+	defer func() { _ = stdinW.Close() }() // stdin stays open: no EOF exit path.
+
+	// Every idle poll (nil inbound) returns a daemon-initiated frame to write.
+	fake := &fakeSyncer{onSync: func(messages []json.RawMessage) ([]json.RawMessage, error) {
+		return []json.RawMessage{rawMsg(t, protocol.MsgCancel, "cancelid0001", "job_1", 0, map[string]any{})}, nil
+	}}
+
+	done := make(chan error, 1)
+	go func() { done <- newBridge(fake, stdinR, failWriter{}, io.Discard).run(context.Background()) }()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("run returned nil, want the poll write error")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("run did not return after a poll write failure")
+	}
+}
+
 // TestValidateOrigin: only the exact configured extension origin is accepted.
 func TestValidateOrigin(t *testing.T) {
 	const id = "abcdefghijklmnopabcdefghijklmnop"
