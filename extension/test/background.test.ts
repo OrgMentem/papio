@@ -145,7 +145,7 @@ interface Harness {
   tabs: FakeTabs;
   downloads: FakeDownloads;
   clock: { now: number };
-  timers: { fn: () => void; ms: number }[];
+  timers: { fn: () => void | Promise<void>; ms: number }[];
   frames(): BrowserMessage[];
   postedStrings(): string[];
 }
@@ -159,7 +159,7 @@ function makeHarness(seed?: StoreShape): Harness {
   const tabs = new FakeTabs();
   const downloads = new FakeDownloads();
   const clock = { now: 1_700_000_000_000 };
-  const timers: { fn: () => void; ms: number }[] = [];
+  const timers: { fn: () => void | Promise<void>; ms: number }[] = [];
   const deps: BridgeDeps = {
     connectNative: () => {
       if (connects++ === 0) return port;
@@ -384,7 +384,12 @@ test("pre-auth handoffs queue behind one visible tab, then release after auth re
   expect(activeJob).toBeDefined();
   const activeTabID = activeJob?.tab_id ?? -1;
   const idpURL = "https://idp.example.edu/sso";
-  await h.tabs.onUpdated.emit(activeTabID, { url: idpURL }, { id: activeTabID, url: idpURL });
+  await h.tabs.onUpdated.emit(
+    activeTabID,
+    { url: idpURL, status: "complete" },
+    { id: activeTabID, url: idpURL },
+  );
+  expect(h.backend.store.activeJobs.filter((job) => job.status === "queued")).toHaveLength(4);
 
   // A pre-existing broker handoff can still be parked at IdP when another tab
   // returns first; auth release must force that stale redirect through cookies.
@@ -407,6 +412,79 @@ test("pre-auth handoffs queue behind one visible tab, then release after auth re
   expect(h.tabs.created.filter((tab) => !tab.active)).toHaveLength(4);
   expect(h.backend.store.activeJobs.filter((job) => job.status === "queued")).toHaveLength(0);
   expect(h.tabs.reloaded).toEqual([stuckTabID]);
+});
+
+test("a warm resolver landing releases queued handoffs without an auth event", async () => {
+  const h = makeHarness();
+  const jobIDs = ["job_0001a_warm_0", "job_0001a_warm_1", "job_0001a_warm_2"];
+
+  await h.bridge.start();
+  for (const jobID of jobIDs) await h.port.inbound(jobOffer(jobID));
+  const firstTabID = h.backend.store.activeJobs.find((job) => job.tab_id >= 0)?.tab_id ?? -1;
+
+  await h.tabs.onUpdated.emit(firstTabID, { url: OPENURL, status: "complete" }, { id: firstTabID, url: OPENURL });
+
+  expect(h.tabs.created).toEqual([
+    { url: OPENURL, active: true },
+    { url: OPENURL, active: false },
+    { url: OPENURL, active: false },
+  ]);
+  expect(h.backend.store.activeJobs.filter((job) => job.status === "queued")).toEqual([]);
+  expect(h.backend.store.lastAuthReturnedAt).toBe(h.clock.now);
+  expect(h.frames().some((frame) => frame.type === "auth_returned")).toBe(false);
+});
+
+test("a queued handoff falls back to a background tab after 45 seconds", async () => {
+  const h = makeHarness();
+
+  await h.bridge.start();
+  await h.port.inbound(jobOffer("job_0001a_timer_active"));
+  await h.port.inbound(jobOffer("job_0001a_timer_queued"));
+  const fallback = h.timers.find((timer) => timer.ms === 45_000);
+  expect(fallback).toBeDefined();
+
+  await fallback?.fn();
+
+  expect(h.tabs.created).toEqual([
+    { url: OPENURL, active: true },
+    { url: OPENURL, active: false },
+  ]);
+  expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_0001a_timer_queued")?.status).toBe("accepted");
+});
+
+test("startup releases queued handoffs when a tracked tab is already on a non-IdP page", async () => {
+  const activeID = 100;
+  const queuedURL = "https://resolver.example.edu/openurl?queued=live";
+  const h = makeHarness({
+    activeJobs: [
+      {
+        job_id: "job_0001a_live_active",
+        tab_id: activeID,
+        offered_at: 1,
+        expires_at: 2,
+        status: "accepted",
+        provider_hosts: [PROVIDER_HOST],
+      },
+      {
+        job_id: "job_0001a_live_queued",
+        tab_id: -1,
+        offered_at: 1,
+        expires_at: 2,
+        status: "queued",
+        provider_hosts: [PROVIDER_HOST],
+      },
+    ],
+    offerURLs: {
+      job_0001a_live_active: OPENURL,
+      job_0001a_live_queued: queuedURL,
+    },
+  });
+  h.tabs.live.set(activeID, { id: activeID, url: OPENURL });
+
+  await h.bridge.start();
+
+  expect(h.tabs.created).toEqual([{ url: queuedURL, active: false }]);
+  expect(h.backend.store.lastAuthReturnedAt).toBe(h.clock.now);
 });
 
 test("a recent auth return drains durable queued handoffs during startup", async () => {

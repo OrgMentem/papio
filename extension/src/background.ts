@@ -46,6 +46,7 @@ import { chromeKeepaliveAPI, initKeepalive, isAuthenticationURL } from "./keepal
 export const NATIVE_HOST = "com.orgmentem.papio";
 const CHROME_PDF_VIEWER_HOST = "mhjfbmdgcfjbbpaeojofohoefgiehjai";
 const AUTH_EVIDENCE_TTL_MS = 30 * 60_000;
+const QUEUED_HANDOFF_RELEASE_MS = 45_000;
 
 
 export interface Listenable<A extends unknown[]> {
@@ -96,8 +97,8 @@ export interface BridgeDeps {
   manifestVersion: string;
   randomUUID(): string;
   now(): number;
-  /** Injectable timer so tests control reconnect backoff. */
-  setTimeout(fn: () => void, ms: number): void;
+  /** Injectable timers so tests control reconnect backoff and queue release. */
+  setTimeout(fn: () => void | Promise<void>, ms: number): void;
   backend: StateBackend;
   tabs: {
     create(props: { url: string; active: boolean }): Promise<TabInfo>;
@@ -308,6 +309,8 @@ export class Bridge {
   private drainingQueuedHandoffs = false;
   /** Latest resolver URL from an offer, retained for the keepalive manager. */
   private latestOfferOpenURL: string | undefined;
+  /** Pending fallback-release timers, keyed by queued job. Worker-local only. */
+  private readonly queuedHandoffTimers = new Map<string, object>();
 
   constructor(private readonly deps: BridgeDeps) {}
   trackedJobCount(): number {
@@ -336,7 +339,11 @@ export class Bridge {
       }
     });
     await this.ready;
+    for (const job of this.store.activeJobs) {
+      if (job.status === "queued") this.scheduleQueuedHandoffRelease(job.job_id);
+    }
     await this.releaseQueuedHandoffs();
+    await this.releaseQueuedHandoffsForLiveLanding();
   }
 
   /** Cancel an active job on user request (popup cancel button). */
@@ -499,6 +506,7 @@ export class Bridge {
 
   private async removeJobWithOffer(jobID: string): Promise<void> {
     this.offerURLs.delete(jobID);
+    this.queuedHandoffTimers.delete(jobID);
     await this.update((s) => {
       const offerURLs = { ...(s.offerURLs ?? {}) };
       delete offerURLs[jobID];
@@ -516,6 +524,51 @@ export class Bridge {
     return this.authReturnedThisWorker || this.keepaliveAuthenticated || this.hasRecentAuthEvidence();
   }
 
+  /** Persist evidence from a usable resolver landing in the same durable stamp
+   * used by an auth return. The first observed signal also releases any cold
+   * queue and refreshes tabs still parked at an IdP. */
+  private async recordUsableSession(now: number): Promise<void> {
+    const firstAuthEvidence = !this.authReturnedThisWorker;
+    this.authReturnedThisWorker = true;
+    await this.update((s) => ({ ...s, lastAuthReturnedAt: now }));
+    if (firstAuthEvidence) {
+      await this.releaseQueuedHandoffs();
+      await this.reloadAuthenticationHandoffs();
+    }
+  }
+
+  /** A queue must not become an invisible permanent sink when an already-warm
+   * SSO session never produces an IdP round trip. Timers are deliberately
+   * worker-local: startup independently checks durable evidence and live tabs. */
+  private scheduleQueuedHandoffRelease(jobID: string): void {
+    if (this.queuedHandoffTimers.has(jobID)) return;
+    const token = {};
+    this.queuedHandoffTimers.set(jobID, token);
+    this.deps.setTimeout(async () => {
+      if (this.queuedHandoffTimers.get(jobID) !== token) return;
+      this.queuedHandoffTimers.delete(jobID);
+      await this.ready;
+      await this.releaseQueuedHandoffs(jobID);
+    }, QUEUED_HANDOFF_RELEASE_MS);
+  }
+
+  /** Startup has no worker-local timer state. A tracked tab already settled
+   * away from an IdP is the same usable-session evidence as a warm landing. */
+  private async releaseQueuedHandoffsForLiveLanding(): Promise<void> {
+    for (const job of this.store.activeJobs) {
+      if (job.tab_id < 0 || job.status === "queued") continue;
+      try {
+        const tab = await this.deps.tabs.get(job.tab_id);
+        if (typeof tab.url === "string" && !isAuthenticationURL(tab.url)) {
+          await this.recordUsableSession(this.deps.now());
+          return;
+        }
+      } catch {
+        // A closed tab is handled by the normal tab-removal path.
+      }
+    }
+  }
+
   /** Called by keepalive only after its resolver tab has returned from login. */
   async setKeepaliveAuthenticated(authenticated: boolean): Promise<void> {
     this.keepaliveAuthenticated = authenticated;
@@ -524,13 +577,19 @@ export class Bridge {
     await this.releaseQueuedHandoffs();
   }
 
-  private async releaseQueuedHandoffs(): Promise<void> {
-    if (!this.hasAuthEvidence() || this.drainingQueuedHandoffs) return;
+  private async releaseQueuedHandoffs(fallbackJobID?: string): Promise<void> {
+    if ((!this.hasAuthEvidence() && fallbackJobID === undefined) || this.drainingQueuedHandoffs) return;
     this.drainingQueuedHandoffs = true;
     try {
-      while (this.hasAuthEvidence()) {
-        const queued = this.store.activeJobs.find((job) => job.status === "queued");
+      let forcedJobID = fallbackJobID;
+      while (this.hasAuthEvidence() || forcedJobID !== undefined) {
+        const queued =
+          forcedJobID === undefined
+            ? this.store.activeJobs.find((job) => job.status === "queued")
+            : this.store.activeJobs.find((job) => job.job_id === forcedJobID && job.status === "queued");
+        forcedJobID = undefined;
         if (queued === undefined) return;
+        this.queuedHandoffTimers.delete(queued.job_id);
         const url = this.offerURLs.get(queued.job_id);
         if (url === undefined) {
           this.send("job_reject", {}, queued.job_id);
@@ -712,6 +771,7 @@ export class Bridge {
         this.store.activeJobs.some((job) => job.tab_id >= 0 && job.status !== "queued"));
     if (queueHandoff) {
       await this.upsertJobWithOffer(makeJob(-1, "queued"), openurl);
+      this.scheduleQueuedHandoffRelease(jobID);
       this.send("job_accept", {}, jobID);
       return;
     }
@@ -797,6 +857,7 @@ export class Bridge {
           download_initiated: false,
         }),
       );
+      this.scheduleQueuedHandoffRelease(jobID);
       return;
     }
 
@@ -868,6 +929,8 @@ export class Bridge {
     } catch {
       return;
     }
+    const successfulLanding = change.status === "complete" && !isAuthenticationURL(url);
+    if (successfulLanding) await this.recordUsableSession(this.deps.now());
     const onProvider = hostMatches(host, job.provider_hosts);
     if (!onProvider) {
       // Chrome exposes its built-in PDF viewer as an internal extension URL.
@@ -894,9 +957,9 @@ export class Bridge {
           return;
         }
       }
-      if (job.status !== "auth_pending") {
-        // Left every provider host — human authentication has begun. Emit timing
-        // only; the URL/host is never serialised.
+      if (job.status !== "auth_pending" && !successfulLanding) {
+        // Leaving every provider host for an IdP starts human authentication.
+        // A completed non-IdP page is instead a usable resolver landing.
         await this.update((s) =>
           patchJob(s, job.job_id, { status: "auth_pending", auth_started_ms: this.deps.now() }),
         );
