@@ -79,6 +79,7 @@ export interface DownloadItemLike {
   referrer?: string | undefined;
   finalUrl?: string | undefined;
   url?: string | undefined;
+  mime?: string | undefined;
   /** Present in the test fake and some Chromium builds; absent in stable
    * chrome.downloads.DownloadItem, in which case we fall back to referrer. */
   tabId?: number | undefined;
@@ -116,6 +117,8 @@ export interface BridgeDeps {
       conflictAction: "uniquify";
       saveAs: false;
     }): Promise<number>;
+    removeFile(downloadID: number): Promise<void>;
+    erase(query: { id: number }): Promise<number[]>;
     onCreated: Listenable<[DownloadItemLike]>;
     onChanged: Listenable<[DownloadDeltaLike]>;
     /** chrome.downloads.onDeterminingFilename — Chrome-only; absent elsewhere.
@@ -150,6 +153,8 @@ export interface BridgeDeps {
 interface DownloadTrack {
   ids: Set<number>;
   ambiguous: boolean;
+  /** True only for a direct-file offer attempted before any broker tab opens. */
+  directOffer: boolean;
 }
 
 function hostMatches(host: string, providerHosts: string[]): boolean {
@@ -177,6 +182,22 @@ function sameDownloadRoute(a: string, b: string): boolean {
     const left = new URL(a);
     const right = new URL(b);
     return left.origin === right.origin && left.pathname === right.pathname;
+  } catch {
+    return false;
+  }
+}
+
+/** Recognize public direct-file routes without guessing from content. These
+ * paths can be handed to chrome.downloads before a browser tab is needed. */
+function isDirectFileOffer(raw: string): boolean {
+  try {
+    const path = new URL(raw).pathname.toLowerCase();
+    return (
+      path.endsWith(".pdf") ||
+      path.includes("/content/pdf/") ||
+      path.includes("/doi/pdf/") ||
+      /(?:^|\/)pdf(?:\/|$)/.test(path)
+    );
   } catch {
     return false;
   }
@@ -310,11 +331,13 @@ export class Bridge {
     const job = findByJob(this.store, jobID);
     if (!job) return;
     this.send("provider_outcome", { outcome: "cancelled" }, jobID);
-    this.closingTabs.add(job.tab_id);
-    try {
-      await this.deps.tabs.remove(job.tab_id);
-    } catch {
-      // Tab may already be gone; the outcome frame is what matters.
+    if (job.tab_id >= 0) {
+      this.closingTabs.add(job.tab_id);
+      try {
+        await this.deps.tabs.remove(job.tab_id);
+      } catch {
+        // Tab may already be gone; the outcome frame is what matters.
+      }
     }
     this.downloads.delete(jobID);
     this.offerURLs.delete(jobID);
@@ -522,15 +545,22 @@ export class Bridge {
 
     // Restart/re-offer dedup normally re-accepts a live tab. A re-offer whose
     // URL changed is the daemon's OA->institution fallback, so close the old
-    // broker tab and open the replacement instead.
+    // broker tab and open the replacement instead. A direct-offer download has
+    // no tab (id -1) and must remain the single live attempt for its offer.
     const existing = findByJob(this.store, jobID);
     if (existing) {
+      if (existing.tab_id < 0 && (priorOfferURL === undefined || priorOfferURL === openurl)) {
+        this.send("job_accept", {}, jobID);
+        return;
+      }
       let live = false;
-      try {
-        const tab = await this.deps.tabs.get(existing.tab_id);
-        live = tab.id === existing.tab_id;
-      } catch {
-        live = false;
+      if (existing.tab_id >= 0) {
+        try {
+          const tab = await this.deps.tabs.get(existing.tab_id);
+          live = tab.id === existing.tab_id;
+        } catch {
+          live = false;
+        }
       }
       if (live && (priorOfferURL === undefined || priorOfferURL === openurl)) {
         this.send("job_accept", {}, jobID);
@@ -550,6 +580,25 @@ export class Bridge {
       await this.update((s) => removeJob(s, jobID));
     }
 
+    const now = this.deps.now();
+    const expiresMs = Date.parse(expiresAt);
+    const makeJob = (tabID: number): ActiveJob => ({
+      job_id: jobID,
+      tab_id: tabID,
+      offered_at: now,
+      expires_at: Number.isNaN(expiresMs) ? now : expiresMs,
+      status: "accepted",
+      provider_hosts: providerHosts,
+      ...(expected !== undefined ? { expected } : {}),
+    });
+    if (isDirectFileOffer(openurl)) {
+      await this.update((s) => upsertJob(s, makeJob(-1)));
+      this.offerURLs.set(jobID, openurl);
+      this.send("job_accept", {}, jobID);
+      await this.startDirectOfferDownload(jobID, openurl);
+      return;
+    }
+
     let tabID: number | undefined;
     try {
       const tab = await this.deps.tabs.create({ url: openurl, active: true });
@@ -563,21 +612,83 @@ export class Bridge {
       this.send("job_reject", {}, jobID);
       return;
     }
-
-    const now = this.deps.now();
-    const expiresMs = Date.parse(expiresAt);
-    const job: ActiveJob = {
-      job_id: jobID,
-      tab_id: tabID,
-      offered_at: now,
-      expires_at: Number.isNaN(expiresMs) ? now : expiresMs,
-      status: "accepted",
-      provider_hosts: providerHosts,
-      ...(expected !== undefined ? { expected } : {}),
-    };
-    await this.update((s) => upsertJob(s, job));
+    await this.update((s) => upsertJob(s, makeJob(tabID)));
     this.offerURLs.set(jobID, openurl);
     this.send("job_accept", {}, jobID);
+  }
+
+  /** Start the one download-first attempt for an unequivocal direct-file URL.
+   * Any initiation error falls back to the normal broker-tab handoff. */
+  private async startDirectOfferDownload(jobID: string, url: string): Promise<void> {
+    const job = findByJob(this.store, jobID);
+    if (!job || job.tab_id >= 0 || job.download_initiated === true) return;
+    await this.update((s) => patchJob(s, jobID, { download_initiated: true }));
+    // Register the direct-offer classification before Chrome can emit
+    // onCreated/onChanged for a small cached response.
+    this.downloads.set(jobID, { ids: new Set<number>(), ambiguous: false, directOffer: true });
+    this.pendingDownloadURLs.set(url, jobID);
+    try {
+      const id = await this.deps.downloads.download({
+        url,
+        filename: `papio/${jobID}/paper.pdf`,
+        conflictAction: "uniquify",
+        saveAs: false,
+      });
+      const track = this.downloads.get(jobID) ?? { ids: new Set<number>(), ambiguous: false, directOffer: true };
+      track.ids.add(id);
+      track.directOffer = true;
+      if (track.ids.size > 1) track.ambiguous = true;
+      this.downloads.set(jobID, track);
+    } catch (e) {
+      console.error("papio: direct-file download initiation failed; opening handoff tab", e);
+      this.downloads.delete(jobID);
+      await this.fallbackToOfferTab(jobID);
+    } finally {
+      this.pendingDownloadURLs.delete(url);
+    }
+  }
+
+  /** Remove a non-PDF direct attempt and return to the established tab flow. */
+  private async discardDirectOffer(jobID: string, downloadID: number): Promise<void> {
+    this.downloads.delete(jobID);
+    try {
+      await this.deps.downloads.removeFile(downloadID);
+    } catch {
+      // Interrupted downloads may not have produced a removable file.
+    }
+    try {
+      await this.deps.downloads.erase({ id: downloadID });
+    } catch {
+      // Clearing history is best-effort; opening the human-visible fallback is not.
+    }
+    await this.fallbackToOfferTab(jobID);
+  }
+
+  /** Convert a failed download-first attempt into the existing broker tab. */
+  private async fallbackToOfferTab(jobID: string): Promise<void> {
+    const job = findByJob(this.store, jobID);
+    const url = this.offerURLs.get(jobID);
+    if (!job || job.tab_id >= 0 || url === undefined) return;
+    let tabID: number | undefined;
+    try {
+      const tab = await this.deps.tabs.create({ url, active: true });
+      tabID = tab.id;
+    } catch (e) {
+      console.error("papio: tab creation failed after direct-file download", e);
+      this.send("job_reject", {}, jobID);
+      this.offerURLs.delete(jobID);
+      await this.update((s) => removeJob(s, jobID));
+      return;
+    }
+    if (tabID === undefined) {
+      this.send("job_reject", {}, jobID);
+      this.offerURLs.delete(jobID);
+      await this.update((s) => removeJob(s, jobID));
+      return;
+    }
+    await this.update((s) =>
+      patchJob(s, jobID, { tab_id: tabID, download_initiated: false }),
+    );
   }
 
   private async onCancel(msg: BrowserMessage): Promise<void> {
@@ -585,12 +696,14 @@ export class Bridge {
     if (jobID === undefined) return;
     const job = findByJob(this.store, jobID);
     if (!job) return;
-    // Broker-owned by construction (we only track tabs we created).
-    this.closingTabs.add(job.tab_id);
-    try {
-      await this.deps.tabs.remove(job.tab_id);
-    } catch {
-      // Tab already closed.
+    if (job.tab_id >= 0) {
+      // Broker-owned by construction (we only track tabs we created).
+      this.closingTabs.add(job.tab_id);
+      try {
+        await this.deps.tabs.remove(job.tab_id);
+      } catch {
+        // Tab already closed.
+      }
     }
     this.downloads.delete(jobID);
     this.offerURLs.delete(jobID);
@@ -606,11 +719,13 @@ export class Bridge {
     if (tabID === undefined) return;
     this.completedDownloadTabs.delete(jobID);
     this.offerURLs.delete(jobID);
-    this.closingTabs.add(tabID);
-    try {
-      await this.deps.tabs.remove(tabID);
-    } catch {
-      // The viewer may already have closed itself after the download completed.
+    if (tabID >= 0) {
+      this.closingTabs.add(tabID);
+      try {
+        await this.deps.tabs.remove(tabID);
+      } catch {
+        // The viewer may already have closed itself after the download completed.
+      }
     }
     await this.update((s) => removeJob(s, jobID));
   }
@@ -714,7 +829,7 @@ export class Bridge {
         conflictAction: "uniquify",
         saveAs: false,
       });
-      const track = this.downloads.get(jobID) ?? { ids: new Set<number>(), ambiguous: false };
+      const track = this.downloads.get(jobID) ?? { ids: new Set<number>(), ambiguous: false, directOffer: false };
       track.ids.add(id);
       if (track.ids.size > 1) track.ambiguous = true;
       this.downloads.set(jobID, track);
@@ -862,7 +977,7 @@ export class Bridge {
                   // Correlate by Chrome's returned ID, not URL/referrer
                   // heuristics. onChanged can now complete even if onCreated
                   // raced the Promise.
-                  this.downloads.set(jobID, { ids: new Set([id]), ambiguous: false });
+                  this.downloads.set(jobID, { ids: new Set([id]), ambiguous: false, directOffer: false });
                 } finally {
                   this.pendingDownloadURLs.delete(href);
                 }
@@ -947,14 +1062,17 @@ export class Bridge {
 
   private async onDownloadCreated(item: DownloadItemLike): Promise<void> {
     await this.ready;
-    const job = this.correlate(item);
+    // API-started downloads usually have no tabId. Match the exact pending
+    // offer URL before applying broad tab/provider correlation.
+    const exactJobID = this.trackedJobFor(item.id) ?? this.pendingJobFor(item);
+    const job = exactJobID === undefined ? this.correlate(item) : findByJob(this.store, exactJobID);
     if (!job) return; // unrelated tab / unknown origin: ignore entirely
     if (job.download_initiated !== true) {
       // Native browser downloads (not just adapter/viewer API requests) must
       // latch before a later completed-tab event can see a PDF viewer.
       await this.update((s) => patchJob(s, job.job_id, { download_initiated: true }));
     }
-    const track = this.downloads.get(job.job_id) ?? { ids: new Set<number>(), ambiguous: false };
+    const track = this.downloads.get(job.job_id) ?? { ids: new Set<number>(), ambiguous: false, directOffer: false };
     track.ids.add(item.id);
     if (track.ids.size > 1) track.ambiguous = true; // simultaneous candidates: user decides
     this.downloads.set(job.job_id, track);
@@ -962,14 +1080,26 @@ export class Bridge {
 
   private async onDownloadChanged(delta: DownloadDeltaLike): Promise<void> {
     await this.ready;
-    if (delta.state?.current !== "complete") return;
+    const state = delta.state?.current;
+    if (state !== "complete") {
+      if (state === "interrupted") {
+        for (const job of this.store.activeJobs) {
+          const track = this.downloads.get(job.job_id);
+          if (track?.directOffer === true && track.ids.has(delta.id)) {
+            await this.discardDirectOffer(job.job_id, delta.id);
+            return;
+          }
+        }
+      }
+      return;
+    }
     let owner: ActiveJob | undefined;
     let track: DownloadTrack | undefined;
-    for (const j of this.store.activeJobs) {
-      const t = this.downloads.get(j.job_id);
-      if (t && t.ids.has(delta.id)) {
-        owner = j;
-        track = t;
+    for (const job of this.store.activeJobs) {
+      const candidate = this.downloads.get(job.job_id);
+      if (candidate && candidate.ids.has(delta.id)) {
+        owner = job;
+        track = candidate;
         break;
       }
     }
@@ -978,6 +1108,13 @@ export class Bridge {
 
     const found = await this.deps.downloads.search({ id: delta.id });
     const item = found[0];
+    if (track.directOffer) {
+      const mime = item?.mime?.split(";", 1)[0]?.trim().toLowerCase();
+      if (mime !== "application/pdf") {
+        await this.discardDirectOffer(owner.job_id, delta.id);
+        return;
+      }
+    }
     if (!item) return;
     const rawName = item.filename ?? delta.filename?.current ?? "";
     const filename = rawName.split(/[\\/]/).pop() ?? "";
@@ -1038,6 +1175,8 @@ function realDeps(): BridgeDeps {
     },
     downloads: {
       download: (options) => chrome.downloads.download(options),
+      removeFile: (downloadID) => chrome.downloads.removeFile(downloadID),
+      erase: (query) => chrome.downloads.erase(query),
       search: (query) => chrome.downloads.search(query),
       onCreated: { addListener: (cb) => chrome.downloads.onCreated.addListener(cb) },
       onChanged: { addListener: (cb) => chrome.downloads.onChanged.addListener(cb) },

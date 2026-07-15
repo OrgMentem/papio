@@ -274,6 +274,10 @@ class FakeDownloads {
     if (this.determineBeforeReturn) await this.determine(id);
     return id;
   }
+  async removeFile(_downloadID: number): Promise<void> {}
+  async erase(query: { id: number }): Promise<number[]> {
+    return [query.id];
+  }
   async determine(id: number): Promise<void> {
     const item = this.items.get(id);
     if (!item) throw new Error(`unknown fake download ${id}`);

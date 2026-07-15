@@ -105,6 +105,9 @@ class FakeDownloads {
     conflictAction: "uniquify";
     saveAs: false;
   }[] = [];
+  readonly removedFiles: number[] = [];
+  readonly erased: number[] = [];
+  failDownload = false;
   async download(options: {
     url: string;
     filename: string;
@@ -112,7 +115,15 @@ class FakeDownloads {
     saveAs: false;
   }): Promise<number> {
     this.started.push(options);
+    if (this.failDownload) throw new Error("download blocked");
     return 900 + this.started.length;
+  }
+  async removeFile(downloadID: number): Promise<void> {
+    this.removedFiles.push(downloadID);
+  }
+  async erase(query: { id: number }): Promise<number[]> {
+    this.erased.push(query.id);
+    return [query.id];
   }
   async search(query: { id: number }): Promise<DownloadItemLike[]> {
     const item = this.items.get(query.id);
@@ -233,9 +244,83 @@ test("job_offer opens exactly one tab and replies job_accept", async () => {
   expect(h.backend.store.activeJobs.length).toBe(1);
 });
 
+test("direct OA file offer downloads before opening a tab and adopts only PDF MIME", async () => {
+  const h = makeHarness();
+  const directURL = "https://dl.acm.org/doi/pdf/10.1145/3630106.3658941";
+  const offer = jobOffer("job_0001a_direct_pdf") as { payload: Record<string, unknown> };
+  offer.payload["openurl"] = directURL;
+  await h.bridge.start();
+  await h.port.inbound(offer);
+
+  expect(h.tabs.created).toEqual([]);
+  expect(h.downloads.started).toEqual([
+    {
+      url: directURL,
+      filename: "papio/job_0001a_direct_pdf/paper.pdf",
+      conflictAction: "uniquify",
+      saveAs: false,
+    },
+  ]);
+  h.downloads.items.set(901, {
+    id: 901,
+    filename: "/Users/x/Downloads/paper.pdf",
+    fileSize: 64,
+    mime: "application/pdf",
+    state: "complete",
+  });
+  await h.downloads.onChanged.emit({ id: 901, state: { current: "complete" } });
+  expect(h.frames().some((f) => f.type === "download_complete" && f.job_id === "job_0001a_direct_pdf")).toBe(true);
+  await h.port.inbound({
+    protocol: "papio-browser/1",
+    type: "ack",
+    msg_id: "ack_00000002",
+    job_id: "job_0001a_direct_pdf",
+    seq: 1,
+    payload: {},
+  });
+  expect(h.backend.store.activeJobs).toEqual([]);
+  expect(h.tabs.removed).toEqual([]);
+});
+
+test("non-PDF direct offer removes junk and falls back to the broker tab", async () => {
+  const h = makeHarness();
+  const directURL = "https://dl.acm.org/doi/pdf/10.1145/3630106.3658942";
+  const offer = jobOffer("job_0001a_direct_fallback") as { payload: Record<string, unknown> };
+  offer.payload["openurl"] = directURL;
+  await h.bridge.start();
+  await h.port.inbound(offer);
+  h.downloads.items.set(901, {
+    id: 901,
+    filename: "/Users/x/Downloads/challenge.html",
+    fileSize: 64,
+    mime: "text/html",
+    state: "complete",
+  });
+  await h.downloads.onChanged.emit({ id: 901, state: { current: "complete" } });
+
+  expect(h.downloads.removedFiles).toEqual([901]);
+  expect(h.downloads.erased).toEqual([901]);
+  expect(h.tabs.created).toEqual([{ url: directURL, active: true }]);
+  expect(h.backend.store.activeJobs[0]?.tab_id).toBe(100);
+  expect(h.backend.store.activeJobs[0]?.download_initiated).toBe(false);
+});
+
+test("direct download initiation errors fall back to the broker tab", async () => {
+  const h = makeHarness();
+  h.downloads.failDownload = true;
+  const directURL = "https://dl.acm.org/doi/pdf/10.1145/3630106.3658943";
+  const offer = jobOffer("job_0001a_direct_error") as { payload: Record<string, unknown> };
+  offer.payload["openurl"] = directURL;
+  await h.bridge.start();
+  await h.port.inbound(offer);
+
+  expect(h.tabs.created).toEqual([{ url: directURL, active: true }]);
+  expect(h.backend.store.activeJobs[0]?.tab_id).toBe(100);
+});
+
 test("a changed re-offer replaces an OA browser tab with the institutional fallback", async () => {
   const h = makeHarness();
-  const oaURL = "https://oa.example.org/blocked-paper.pdf";
+  const oaURL = "https://oa.example.org/blocked-paper";
   const institutionalURL = "https://resolver.example.edu/openurl?fallback=1";
   const oaOffer = jobOffer("job_0001b_fallback") as { payload: Record<string, unknown> };
   oaOffer.payload["openurl"] = oaURL;
