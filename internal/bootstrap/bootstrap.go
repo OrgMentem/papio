@@ -73,13 +73,17 @@ func (s *serialAutoImporter) PlanAndApply(ctx context.Context, jobID string) (st
 	defer s.mu.Unlock()
 
 	status, parentKey, attachmentKey, err = s.importer.PlanAndApply(ctx, jobID)
-	if err == nil || ctx.Err() != nil {
-		return status, parentKey, attachmentKey, err
+	if err == nil {
+		return status, parentKey, attachmentKey, nil
+	}
+	if ctx.Err() != nil {
+		return status, parentKey, attachmentKey, zotio.WithErrorInfo(err)
 	}
 	if err := waitAutoImportRetry(ctx, s.backoff); err != nil {
-		return "failed", "", "", err
+		return "failed", "", "", zotio.WithErrorInfo(err)
 	}
-	return s.importer.PlanAndApply(ctx, jobID)
+	status, parentKey, attachmentKey, err = s.importer.PlanAndApply(ctx, jobID)
+	return status, parentKey, attachmentKey, zotio.WithErrorInfo(err)
 }
 
 func waitAutoImportRetry(ctx context.Context, delay time.Duration) error {

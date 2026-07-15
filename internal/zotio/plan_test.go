@@ -408,6 +408,9 @@ func TestPlanAndApplyFilesPolicyCollectionWithoutRollingBackImport(t *testing.T)
 		}
 		detail, _ := event["detail"].(map[string]any)
 		if detail["collection"] == "Reading" && detail["status"] == "error" {
+			if detail["error_class"] != ErrorClassUnknown || detail["error_type"] == "" {
+				t.Fatalf("collection filing detail = %#v", detail)
+			}
 			found = true
 		}
 	}
@@ -506,7 +509,7 @@ func TestPlanAndApplyAutoEnrichFailureLeavesImportApplied(t *testing.T) {
 		t.Fatalf("result = (%q, %q, %q)", status, parentKey, attachmentKey)
 	}
 	detail := zotioEventDetail(t, service, jobID, "zotio.enrich")
-	if detail["status"] != "error" || detail["summary"] == "" || detail["error_type"] == "" {
+	if detail["status"] != "error" || detail["summary"] == "" || detail["error_type"] == "" || detail["error_class"] != ErrorClassUnknown {
 		t.Fatalf("enrich failure event = %#v", detail)
 	}
 }

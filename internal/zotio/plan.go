@@ -302,11 +302,20 @@ func (s *Service) fileCollection(ctx context.Context, plan *Plan, result *ApplyR
 		return
 	}
 	if _, err := s.CLI.RunJSON(ctx, "--agent", "--yes", "items", "add-to-collection", result.ParentKey, "--collection-name", plan.Collection); err != nil {
-		_ = s.Bundle.Jobs.RecordEvent(context.WithoutCancel(ctx), plan.JobID, "zotio.collection_filing", map[string]any{
-			"collection": plan.Collection,
-			"status":     "error",
-			"error_type": fmt.Sprintf("%T", err),
-		})
+		info := ErrorInfoFrom(err)
+		detail := map[string]any{
+			"collection":  plan.Collection,
+			"status":      "error",
+			"error_type":  fmt.Sprintf("%T", err),
+			"error_class": info.Class,
+		}
+		if info.Hint != "" {
+			detail["error_hint"] = info.Hint
+		}
+		if info.HTTPStatus != 0 {
+			detail["error_http_status"] = info.HTTPStatus
+		}
+		_ = s.Bundle.Jobs.RecordEvent(context.WithoutCancel(ctx), plan.JobID, "zotio.collection_filing", detail)
 	}
 }
 
@@ -329,9 +338,17 @@ func (s *Service) enrichAutoImportedParent(ctx context.Context, plan *Plan, resu
 		"--agent", "--yes", "items", "enrich",
 		"--missing-doi", "--missing-abstract", "--keys", result.ParentKey,
 	); err != nil {
+		info := ErrorInfoFrom(err)
 		detail["status"] = "error"
 		detail["summary"] = "metadata enrichment failed"
 		detail["error_type"] = fmt.Sprintf("%T", err)
+		detail["error_class"] = info.Class
+		if info.Hint != "" {
+			detail["error_hint"] = info.Hint
+		}
+		if info.HTTPStatus != 0 {
+			detail["error_http_status"] = info.HTTPStatus
+		}
 	} else {
 		detail["status"] = "applied"
 	}
@@ -583,22 +600,23 @@ func (s *Service) recordPlan(ctx context.Context, key, path string, plan *Plan) 
 }
 
 func (s *Service) recordFailedApplyAndInvalidatePlan(ctx context.Context, key string, plan *Plan, zotio json.RawMessage, applyErr error) error {
+	info := ClassifyError(applyErr, zotio)
 	result := &ApplyResult{
 		PlanID:    plan.ID,
 		JobID:     plan.JobID,
 		Status:    "failed",
 		ParentKey: plan.ExpectedParentKey,
 		AppliedAt: s.now().UTC().Format(time.RFC3339),
-		Error:     applyErr.Error(),
+		Error:     info.Hint,
 		Zotio:     zotio,
 	}
 	if err := s.recordApply(ctx, key, result); err != nil {
-		return fmt.Errorf("recording failed Zotio apply: %w", err)
+		return WithErrorInfo(fmt.Errorf("recording failed Zotio apply: %w", applyErr), zotio)
 	}
 	if err := s.invalidatePlan(ctx, plan); err != nil {
-		return fmt.Errorf("%w (invalidating cached Zotio plan: %v)", applyErr, err)
+		return WithErrorInfo(fmt.Errorf("%w (invalidating cached Zotio plan: %v)", applyErr, err), zotio)
 	}
-	return applyErr
+	return WithErrorInfo(applyErr, zotio)
 }
 
 func (s *Service) invalidatePlan(ctx context.Context, plan *Plan) error {

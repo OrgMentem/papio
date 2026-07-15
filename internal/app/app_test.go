@@ -22,6 +22,7 @@ import (
 	"papio/internal/resolver"
 	"papio/internal/store"
 	"papio/internal/work"
+	"papio/internal/zotio"
 )
 
 type fakeResolver struct {
@@ -581,7 +582,7 @@ func TestProcessReadyAutoImportsOnce(t *testing.T) {
 func TestProcessReadyAutoImportFailureLeavesJobReady(t *testing.T) {
 	svc, jobs := newTestService(t)
 	svc.Config.Zotio.AutoImport = true
-	importer := &fakeAutoImporter{err: errors.New("zotio unavailable")}
+	importer := &fakeAutoImporter{err: zotio.WithErrorInfo(errors.New("zotio stderr: unknown item field at https://zotero.example.test/users/42 /Users/reader/private.db"))}
 	svc.AutoImporter = importer
 	readyPipeline(svc)
 
@@ -604,8 +605,15 @@ func TestProcessReadyAutoImportFailureLeavesJobReady(t *testing.T) {
 		t.Fatalf("job state = %s, want ready", ready.State)
 	}
 	detail := autoImportEvent(t, jobs, id)
-	if detail["status"] != "error" || detail["error_type"] == "" {
+	if detail["status"] != "error" || detail["error_type"] == "" || detail["error_class"] != zotio.ErrorClassZoteroFieldValidation || detail["error_hint"] != "unknown item field" {
 		t.Fatalf("auto-import failure detail = %#v", detail)
+	}
+	encoded, err := json.Marshal(detail)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "zotero.example.test") || strings.Contains(string(encoded), "/Users/reader") {
+		t.Fatalf("auto-import event leaked private detail: %s", encoded)
 	}
 	if importer.calls != 1 {
 		t.Fatalf("auto-import calls = %d, want 1", importer.calls)

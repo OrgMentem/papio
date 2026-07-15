@@ -43,11 +43,20 @@ type Request struct {
 	Params   json.RawMessage `json:"params"`
 }
 
-// Error is a machine-readable RPC failure. Its message is intentionally safe to
-// render to a local command user.
+// Error is a machine-readable RPC failure. Its message and optional detail are
+// intentionally safe to render to a local command user.
 type Error struct {
-	Code    string `json:"code"`
-	Message string `json:"message"`
+	Code    string       `json:"code"`
+	Message string       `json:"message"`
+	Detail  *ErrorDetail `json:"detail,omitempty"`
+}
+
+// ErrorDetail carries bounded, pre-sanitized diagnostic metadata for a safe
+// RPC failure. Handlers must never put raw upstream error text here.
+type ErrorDetail struct {
+	ErrorClass      string `json:"error_class,omitempty"`
+	ErrorHint       string `json:"error_hint,omitempty"`
+	ErrorHTTPStatus int    `json:"error_http_status,omitempty"`
 }
 
 // Response is returned for every validly decoded request.
@@ -63,6 +72,7 @@ type Response struct {
 type RPCError struct {
 	Code    string
 	Message string
+	Detail  *ErrorDetail
 }
 
 func (e *RPCError) Error() string {

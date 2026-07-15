@@ -422,7 +422,7 @@ func zotioPlan(ctx context.Context, raw json.RawMessage, system *bootstrap.Syste
 	}
 	plans, err := system.Zotio.PlanJobs(ctx, params.JobIDs)
 	if err != nil {
-		return failure(err)
+		return zotioFailure(err)
 	}
 	return marshal(map[string]any{"plans": plans})
 }
@@ -440,7 +440,7 @@ func zotioApply(ctx context.Context, raw json.RawMessage, system *bootstrap.Syst
 	}
 	result, err := system.Zotio.Apply(ctx, params.PlanID, params.ConfirmationSHA256)
 	if err != nil {
-		return failure(err)
+		return zotioFailure(err)
 	}
 	return marshal(result)
 }
@@ -516,6 +516,16 @@ func failure(err error) ([]byte, *ipc.RPCError) {
 	default:
 		return nil, &ipc.RPCError{Code: "internal", Message: "operation failed"}
 	}
+}
+
+func zotioFailure(err error) ([]byte, *ipc.RPCError) {
+	info := zotio.ErrorInfoFrom(err)
+	detail := &ipc.ErrorDetail{
+		ErrorClass:      info.Class,
+		ErrorHint:       info.Hint,
+		ErrorHTTPStatus: info.HTTPStatus,
+	}
+	return nil, &ipc.RPCError{Code: "internal", Message: "operation failed", Detail: detail}
 }
 
 func safeMessage(err error, fallback string) string {

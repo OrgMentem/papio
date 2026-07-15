@@ -5,6 +5,8 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -312,5 +314,25 @@ func TestRouterAcquireReportJoinsManifestAgainstLiveJobState(t *testing.T) {
 	}
 	if len(report.Works) != 1 || report.Works[0].Outcome != "imported" || report.Works[0].ParentKey != "PA123" || report.Works[0].AttachmentKey != "AT456" {
 		t.Fatalf("report = %+v", report)
+	}
+}
+
+func TestZotioFailureCarriesOnlySafeTaxonomyDetail(t *testing.T) {
+	_, rpcErr := zotioFailure(errors.New("zotio stderr: unknown item field at https://zotero.example.test/users/42 /Users/reader/private.json"))
+	if rpcErr == nil || rpcErr.Code != "internal" || rpcErr.Message != "operation failed" || rpcErr.Detail == nil {
+		t.Fatalf("zotioFailure() = %#v", rpcErr)
+	}
+	if rpcErr.Detail.ErrorClass != "zotero_field_validation" || rpcErr.Detail.ErrorHint != "unknown item field" {
+		t.Fatalf("zotio failure detail = %#v", rpcErr.Detail)
+	}
+	encoded, err := json.Marshal(rpcErr.Detail)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(encoded) == "" || string(encoded) == "null" || string(encoded) == "[]" {
+		t.Fatalf("encoded detail = %s", encoded)
+	}
+	if strings.Contains(string(encoded), "zotero.example.test") || strings.Contains(string(encoded), "/Users/reader") {
+		t.Fatalf("zotio failure leaked private detail: %s", encoded)
 	}
 }

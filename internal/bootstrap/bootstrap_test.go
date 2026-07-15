@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"papio/internal/config"
+	"papio/internal/zotio"
 )
 
 func TestNewWiresResolverOrderAndCoreServices(t *testing.T) {
@@ -137,6 +138,20 @@ func TestSerialAutoImporterRetriesOnce(t *testing.T) {
 	}
 	if got := calls.Load(); got != 2 {
 		t.Fatalf("calls = %d, want 2", got)
+	}
+}
+
+func TestSerialAutoImporterClassifiesFinalError(t *testing.T) {
+	importer := autoImporterFunc(func(context.Context, string) (string, string, string, error) {
+		return "failed", "", "", errors.New("zotio stderr: unknown item field at /Users/reader/private.json")
+	})
+	serial := newSerialAutoImporter(importer)
+	serial.backoff = time.Millisecond
+
+	_, _, _, err := serial.PlanAndApply(context.Background(), "job")
+	info := zotio.ErrorInfoFrom(err)
+	if info.Class != zotio.ErrorClassZoteroFieldValidation || info.Hint != "unknown item field" {
+		t.Fatalf("classified retry error = %+v", info)
 	}
 }
 

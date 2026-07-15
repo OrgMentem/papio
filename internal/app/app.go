@@ -40,6 +40,15 @@ type AutoImporter interface {
 	PlanAndApply(context.Context, string) (status, parentKey, attachmentKey string, err error)
 }
 
+// classifiedAutoImportError is implemented by the bootstrap decorator. It
+// keeps Zotio-specific taxonomy out of the application service while allowing
+// durable events to retain safe, actionable failure detail.
+type classifiedAutoImportError interface {
+	ErrorClass() string
+	ErrorHint() string
+	ErrorHTTPStatus() int
+}
+
 // NotificationSink receives best-effort daemon UX notifications after durable
 // job state transitions.
 type NotificationSink interface {
@@ -591,8 +600,16 @@ func (s *Service) autoImportReady(ctx context.Context, row *job.Row) {
 	detail["parent_key"] = parentKey
 	detail["attachment_key"] = attachmentKey
 	if err != nil {
+		class, hint, httpStatus := autoImportErrorInfo(err)
 		detail["status"] = "error"
 		detail["error_type"] = safeType(err)
+		detail["error_class"] = class
+		if hint != "" {
+			detail["error_hint"] = hint
+		}
+		if httpStatus != 0 {
+			detail["error_http_status"] = httpStatus
+		}
 		_ = s.Jobs.RecordEvent(eventCtx, row.ID, "zotio.auto_import", detail)
 		return
 	}
@@ -663,6 +680,19 @@ func safeType(err error) string {
 	// Persist only the type/category, never arbitrary upstream text that may
 	// contain a bearer URL, query, body, token, or credential.
 	return fmt.Sprintf("%T", err)
+}
+
+func autoImportErrorInfo(err error) (class, hint string, httpStatus int) {
+	class = "unknown"
+	var classified classifiedAutoImportError
+	if errors.As(err, &classified) {
+		if value := strings.TrimSpace(classified.ErrorClass()); value != "" {
+			class = value
+		}
+		hint = strings.TrimSpace(classified.ErrorHint())
+		httpStatus = classified.ErrorHTTPStatus()
+	}
+	return class, hint, httpStatus
 }
 
 func earlierTime(current, candidate time.Time) time.Time {

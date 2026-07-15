@@ -225,7 +225,7 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
 
 	res := Response{Protocol: ProtocolVersion, ID: req.ID}
 	if rpcErr != nil {
-		res.Error = &Error{Code: rpcErr.Code, Message: rpcErr.Message}
+		res.Error = &Error{Code: rpcErr.Code, Message: rpcErr.Message, Detail: rpcErr.Detail}
 	} else if len(result) == 0 || !validJSON(result) {
 		res.Error = &Error{Code: "internal", Message: "handler returned an invalid result"}
 	} else {

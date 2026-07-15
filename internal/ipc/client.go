@@ -30,10 +30,22 @@ func NewUnixClient(socketPath string) *Client {
 type RemoteError struct {
 	Code    string
 	Message string
+	Detail  *ErrorDetail
 }
 
 func (e *RemoteError) Error() string {
-	return e.Code + ": " + e.Message
+	if e == nil {
+		return ""
+	}
+	message := e.Code + ": " + e.Message
+	if e.Detail == nil || e.Detail.ErrorClass == "" {
+		return message
+	}
+	detail := e.Detail.ErrorClass
+	if e.Detail.ErrorHint != "" {
+		detail += ": " + e.Detail.ErrorHint
+	}
+	return message + " [" + detail + "]"
 }
 
 // CallRaw invokes method with one raw JSON object (or null) and returns the raw
@@ -96,7 +108,7 @@ func (c *Client) CallRaw(ctx context.Context, id, method string, params json.Raw
 		return nil, fmt.Errorf("%w: response id mismatch", ErrInvalidRequest)
 	}
 	if res.Error != nil {
-		return nil, &RemoteError{Code: res.Error.Code, Message: res.Error.Message}
+		return nil, &RemoteError{Code: res.Error.Code, Message: res.Error.Message, Detail: res.Error.Detail}
 	}
 	return res.Result, nil
 }

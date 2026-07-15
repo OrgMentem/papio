@@ -169,6 +169,79 @@ func TestMarkdownSnapshot(t *testing.T) {
 	}
 }
 
+func TestBuildReportClassifiesLatestAutoImportOutcome(t *testing.T) {
+	manifest := &Manifest{
+		SchemaVersion: SchemaVersion,
+		ID:            "batch-deadbeef",
+		CreatedAt:     "2026-07-15T12:00:00Z",
+		Works: []ManifestWork{
+			manifestWork("wr-live-one", "e484422626", "submitted", "Failed auto import"),
+			manifestWork("wr-live-two", "dddf9b73", "submitted", "Recovered auto import"),
+			manifestWork("wr-missing-keys", "job-missing-keys", "submitted", "Incomplete applied result"),
+			manifestWork("wr-duplicate", "job-duplicate", "submitted", "Duplicate import"),
+		},
+	}
+	jobs := fakeJobs{
+		rows: map[string]*job.Row{
+			"e484422626":       reportRow("e484422626", job.StateReady, ""),
+			"dddf9b73":         reportRow("dddf9b73", job.StateReady, ""),
+			"job-missing-keys": reportRow("job-missing-keys", job.StateReady, ""),
+			"job-duplicate":    reportRow("job-duplicate", job.StateReady, ""),
+		},
+		events: map[string][]map[string]any{
+			"e484422626": {
+				autoImportErrorEvent("zotero_field_validation", "unknown item field"),
+			},
+			"dddf9b73": {
+				autoImportErrorEvent("network", "network connection failed"),
+				autoImportEvent("PA123", "AT456"),
+			},
+			"job-missing-keys": {
+				{"kind": "zotio.auto_import", "detail": map[string]any{"status": "applied", "parent_key": "PA123"}},
+			},
+			"job-duplicate": {
+				autoImportErrorEvent("network", "network connection failed"),
+				{"kind": "zotio.auto_import", "detail": map[string]any{"status": "duplicate", "parent_key": "PA123"}},
+			},
+		},
+	}
+	report, err := BuildReport(context.Background(), manifest, jobs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := report.Works[0]; got.Outcome != "import_failed" || got.ErrorClass != "zotero_field_validation" || got.ErrorHint != "unknown item field" {
+		t.Fatalf("failed auto import = %+v", got)
+	}
+	if got := report.Works[1]; got.Outcome != "imported" || got.ParentKey != "PA123" || got.AttachmentKey != "AT456" {
+		t.Fatalf("recovered auto import = %+v", got)
+	}
+	for _, index := range []int{2, 3} {
+		if got := report.Works[index]; got.Outcome == "imported" || got.Outcome == "import_failed" {
+			t.Fatalf("work %d falsely classified as imported failure = %+v", index, got)
+		}
+	}
+	if report.Summary.Outcomes["import_failed"] != 1 {
+		t.Fatalf("summary = %+v", report.Summary)
+	}
+}
+
+func TestMarkdownRendersImportFailedErrorClassAndHint(t *testing.T) {
+	report := &Report{
+		BatchID: "batch-deadbeef",
+		Summary: ReportSummary{Total: 1, Outcomes: map[string]int{"import_failed": 1}},
+		Works: []ReportWork{{
+			Outcome: "import_failed", JobID: "e484422626", Work: protocol.WorkRequest{Title: "Failed import"},
+			ErrorClass: "zotero_field_validation", ErrorHint: "unknown item field",
+		}},
+	}
+	rendered := Markdown(report)
+	for _, want := range []string{"## Import Failed (1)", "zotero_field_validation", "unknown item field"} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("Markdown() missing %q:\\n%s", want, rendered)
+		}
+	}
+}
+
 func manifestWork(requestID, jobID, status, title string) ManifestWork {
 	return ManifestWork{
 		RequestID: requestID, JobID: jobID, Status: status,
@@ -182,4 +255,13 @@ func reportRow(id, state, terminalReason string) *job.Row {
 
 func autoImportEvent(parent, attachment string) map[string]any {
 	return map[string]any{"kind": "zotio.auto_import", "detail": map[string]any{"status": "applied", "parent_key": parent, "attachment_key": attachment}}
+}
+
+func autoImportErrorEvent(class, hint string) map[string]any {
+	return map[string]any{
+		"kind": "zotio.auto_import",
+		"detail": map[string]any{
+			"status": "error", "error_class": class, "error_hint": hint,
+		},
+	}
 }

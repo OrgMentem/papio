@@ -60,6 +60,12 @@ func printBatchReport(opt *options, report *batch.Report) error {
 		if item.FailureClass != "" {
 			detail = item.FailureClass
 		}
+		if item.ErrorClass != "" {
+			detail = item.ErrorClass
+			if item.ErrorHint != "" {
+				detail += ": " + item.ErrorHint
+			}
+		}
 		if item.ParentKey != "" || item.AttachmentKey != "" {
 			keys := strings.Trim(strings.Join([]string{item.ParentKey, item.AttachmentKey}, "/"), "/")
 			if detail != "" {

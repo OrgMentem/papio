@@ -20,6 +20,7 @@ import (
 
 	"papio/internal/job"
 	"papio/internal/protocol"
+	"papio/internal/zotio"
 )
 
 const SchemaVersion = "papio-batch-manifest/1"
@@ -69,6 +70,8 @@ type ReportWork struct {
 	Outcome       string               `json:"outcome"`
 	Reason        string               `json:"reason,omitempty"`
 	FailureClass  string               `json:"failure_class,omitempty"`
+	ErrorClass    string               `json:"error_class,omitempty"`
+	ErrorHint     string               `json:"error_hint,omitempty"`
 	ParentKey     string               `json:"parent_key,omitempty"`
 	AttachmentKey string               `json:"attachment_key,omitempty"`
 	Collection    string               `json:"collection,omitempty"`
@@ -314,20 +317,24 @@ func buildWorkReport(ctx context.Context, manifestWork ManifestWork, jobs Jobs, 
 	if err != nil {
 		return item, err
 	}
-	parent, attachment, imported := importKeys(events)
+	autoImport := latestAutoImport(events)
 	switch row.State {
 	case job.StateReady:
-		item.ParentKey, item.AttachmentKey = parent, attachment
-		if item.ParentKey == "" && row.ZotioItemKey != "" {
-			item.ParentKey = row.ZotioItemKey
-		}
 		switch {
+		case autoImport.Status == "error":
+			item.Outcome = "import_failed"
+			item.ErrorClass, item.ErrorHint = autoImport.ErrorClass, autoImport.ErrorHint
 		case manifestWork.Status == "existing_item_attached":
 			item.Outcome = "existing_item_attached"
-		case browserFetched(events):
-			item.Outcome = "browser_fetched_then_imported"
-		case imported || row.State == job.StateReady:
-			item.Outcome = "imported"
+		case autoImport.Status == "applied" && autoImport.ParentKey != "" && autoImport.AttachmentKey != "":
+			item.ParentKey, item.AttachmentKey = autoImport.ParentKey, autoImport.AttachmentKey
+			if browserFetched(events) {
+				item.Outcome = "browser_fetched_then_imported"
+			} else {
+				item.Outcome = "imported"
+			}
+		default:
+			item.Outcome, item.Reason = "in_progress", job.StateReady
 		}
 	case job.StateAwaitingHuman:
 		item.Outcome, item.Reason = "awaiting_human", awaitingReason(actions)
@@ -345,25 +352,37 @@ func buildWorkReport(ctx context.Context, manifestWork ManifestWork, jobs Jobs, 
 	return item, nil
 }
 
-func importKeys(events []map[string]any) (parent, attachment string, imported bool) {
+type autoImportDetail struct {
+	Status        string
+	ParentKey     string
+	AttachmentKey string
+	ErrorClass    string
+	ErrorHint     string
+}
+
+// latestAutoImport returns the most recent durable auto-import event. A later
+// applied or duplicate event therefore supersedes an earlier failure.
+func latestAutoImport(events []map[string]any) autoImportDetail {
+	var latest autoImportDetail
 	for _, event := range events {
 		if stringField(event, "kind") != "zotio.auto_import" {
 			continue
 		}
 		detail, _ := event["detail"].(map[string]any)
-		status, _ := detail["status"].(string)
-		if status != "applied" && status != "no_op" {
-			continue
+		latest = autoImportDetail{
+			Status:        stringField(detail, "status"),
+			ParentKey:     stringField(detail, "parent_key"),
+			AttachmentKey: stringField(detail, "attachment_key"),
 		}
-		imported = true
-		if value, _ := detail["parent_key"].(string); value != "" {
-			parent = value
+		if class := stringField(detail, "error_class"); zotio.IsErrorClass(class) {
+			latest.ErrorClass = class
 		}
-		if value, _ := detail["attachment_key"].(string); value != "" {
-			attachment = value
-		}
+		latest.ErrorHint = zotio.SanitizeErrorHint(stringField(detail, "error_hint"))
 	}
-	return parent, attachment, imported
+	if latest.Status == "error" && latest.ErrorClass == "" {
+		latest.ErrorClass = zotio.ErrorClassUnknown
+	}
+	return latest
 }
 
 func browserFetched(events []map[string]any) bool {
@@ -419,7 +438,7 @@ func Markdown(report *Report) string {
 	for _, item := range report.Works {
 		groups[item.Outcome] = append(groups[item.Outcome], item)
 	}
-	for _, outcome := range []string{"imported", "browser_fetched_then_imported", "existing_item_attached", "awaiting_human", "needs_review", "failed", "skipped_owned", "in_progress"} {
+	for _, outcome := range []string{"imported", "browser_fetched_then_imported", "existing_item_attached", "import_failed", "awaiting_human", "needs_review", "failed", "skipped_owned", "in_progress"} {
 		items := groups[outcome]
 		if len(items) == 0 {
 			continue
@@ -442,7 +461,7 @@ func Markdown(report *Report) string {
 
 func summaryLine(outcomes map[string]int) string {
 	parts := make([]string, 0, len(outcomes))
-	for _, outcome := range []string{"imported", "browser_fetched_then_imported", "existing_item_attached", "awaiting_human", "needs_review", "failed", "skipped_owned", "in_progress"} {
+	for _, outcome := range []string{"imported", "browser_fetched_then_imported", "existing_item_attached", "import_failed", "awaiting_human", "needs_review", "failed", "skipped_owned", "in_progress"} {
 		if count := outcomes[outcome]; count != 0 {
 			parts = append(parts, fmt.Sprintf("%d %s", count, outcome))
 		}
@@ -455,12 +474,18 @@ func markdownHeading(outcome string) string {
 }
 
 func markdownDetail(item ReportWork) string {
-	parts := make([]string, 0, 4)
+	parts := make([]string, 0, 6)
 	if item.Reason != "" {
 		parts = append(parts, item.Reason)
 	}
 	if item.FailureClass != "" {
 		parts = append(parts, item.FailureClass)
+	}
+	if item.ErrorClass != "" {
+		parts = append(parts, item.ErrorClass)
+	}
+	if item.ErrorHint != "" {
+		parts = append(parts, item.ErrorHint)
 	}
 	if item.ParentKey != "" {
 		parts = append(parts, "parent `"+item.ParentKey+"`")
