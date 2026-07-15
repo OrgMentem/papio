@@ -6,6 +6,19 @@ validated provenance-tracked PDF jobs, and hands ready artifacts to
 boundary. It uses ordinary Chrome for human-authenticated access and never
 handles credentials, MFA, CAPTCHAs, or subscription crawling.
 
+## Prerequisites
+
+- macOS with Go-built binaries from a release (or `go build ./cmd/papio`).
+- Poppler and Tesseract for PDF validation and the OCR text gate:
+  `brew install poppler tesseract` (or disable OCR in the config — see the
+  [configuration reference](docs/config-reference.md)).
+- Google Chrome with the papio extension loaded unpacked for
+  human-authenticated access (`papio init` prints the exact steps; skip with
+  `papio init --skip-browser` for OA-only headless use).
+- [zotio](https://github.com/orgmentem/zotio) on PATH (or `[zotio] executable`
+  in the config) for Zotero import; optional — without it papio stops at
+  validated bundles.
+
 ## Quick start
 
 ```sh
