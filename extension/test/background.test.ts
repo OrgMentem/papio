@@ -931,6 +931,8 @@ test("overlapping state writes persist serially so no stale snapshot wins", asyn
   const downloads = new FakeDownloads();
   const clock = { now: 1_700_000_000_000 };
   const backend = new OrderBackend();
+  // The seeded handoff needs a live tab so startup reconciliation keeps it.
+  tabs.live.set(100, { id: 100, url: `https://${PROVIDER_HOST}/seed` });
   // A pre-existing visible handoff forces the two new offers to queue (a pure
   // state write with no intervening tab creation).
   backend.store = {

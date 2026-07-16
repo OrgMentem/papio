@@ -396,11 +396,53 @@ export class Bridge {
       }
     });
     await this.ready;
+    await this.reconcileTabs();
     for (const job of this.store.activeJobs) {
       if (job.status === "queued") this.scheduleQueuedHandoffRelease(job.job_id);
     }
     await this.releaseQueuedHandoffs();
     await this.releaseQueuedHandoffsForLiveLanding();
+  }
+
+  /**
+   * On spin-up the tracked tab_id can be stale: a tab closed while the MV3
+   * worker slept (its onTabRemoved never fired), or session-restore reopened
+   * provider tabs with fresh ids. Verify each tracked tab still exists and
+   * recover the ones that don't, so a job never strands invisibly on a dead
+   * tab (the "jobs stuck at auth_returned" failure).
+   */
+  private async reconcileTabs(): Promise<void> {
+    for (const job of [...this.store.activeJobs]) {
+      if (job.tab_id < 0) continue; // already queued / awaiting an open
+      let alive = false;
+      try {
+        const tab = await this.deps.tabs.get(job.tab_id);
+        alive = tab?.id === job.tab_id;
+      } catch {
+        alive = false;
+      }
+      if (alive) continue;
+      if (job.status === "awaiting_download") {
+        // Past auth: a download may have completed or be in flight into the
+        // job's adoption dir, which the daemon's poll-scan adopts. Park it, as
+        // onTabRemoved would have.
+        this.completedDownloadTabs.delete(job.job_id);
+        await this.removeJobWithOffer(job.job_id);
+        continue;
+      }
+      // Pre-download tab vanished: re-queue so the handoff choreography reopens
+      // it (one visible at a time, forced release within the fallback window)
+      // instead of leaving the job pointed at a dead tab. Without a retained
+      // offer URL there is nothing to reopen, so drop it.
+      if (this.offerURLs.get(job.job_id) === undefined) {
+        await this.removeJobWithOffer(job.job_id);
+        continue;
+      }
+      await this.update((s) =>
+        patchJob(s, job.job_id, { tab_id: -1, status: "queued", download_initiated: false }),
+      );
+      this.scheduleQueuedHandoffRelease(job.job_id);
+    }
   }
 
   /** Cancel an active job on user request (popup cancel button). */

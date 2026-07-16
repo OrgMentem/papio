@@ -623,6 +623,61 @@ test("declining consent records manual and never auto-accepts", async () => {
   expect(h.scripting.termsAccepts.length).toBe(0);
 });
 
+test("startup reconciliation re-queues a job whose pre-download tab vanished", async () => {
+  // A tab closed while the worker slept never fired onTabRemoved, so the job
+  // still points at a dead tab. Reconcile must recover it, not strand it.
+  const h = makeMapHarness([SPEC]);
+  await h.bridge.start();
+  await h.port.inbound(offer("job_recon_0001"));
+  const tabID = await landOnProvider(h, "job_recon_0001");
+  expect(tabID).toBeGreaterThanOrEqual(0);
+
+  h.tabs.live.delete(tabID); // vanished while worker asleep
+  await h.bridge.start(); // worker wakes
+
+  // Recovered: no longer pointed at the dead tab. Auth evidence from the prior
+  // landing lets the same start() reopen it immediately; otherwise it is queued
+  // and the forced-release timer reopens it. Either way it lands on a live tab.
+  const job = h.backend.store.activeJobs.find((j) => j.job_id === "job_recon_0001");
+  expect(job).toBeDefined();
+  expect(job?.tab_id).not.toBe(tabID);
+  for (const t of h.timers.splice(0)) await t.fn();
+  const reopened = h.backend.store.activeJobs.find((j) => j.job_id === "job_recon_0001");
+  expect(reopened?.tab_id).toBeGreaterThanOrEqual(0);
+  expect(h.tabs.live.has(reopened?.tab_id ?? -1)).toBe(true);
+});
+
+test("startup reconciliation parks a past-auth job whose tab vanished", async () => {
+  const h = makeMapHarness([SPEC]);
+  await h.bridge.start();
+  await h.port.inbound(offer("job_recon_0002"));
+  const tabID = await landOnProvider(h, "job_recon_0002");
+  // Drive through auth to awaiting_download.
+  const idp = "https://idp.example.edu/sso?SAMLRequest=x";
+  h.tabs.live.set(tabID, { id: tabID, url: idp });
+  await h.tabs.onUpdated.emit(tabID, { url: idp }, { id: tabID, url: idp });
+  const prov = `https://${PROVIDER}/doc?x=1`;
+  h.tabs.live.set(tabID, { id: tabID, url: prov });
+  await h.tabs.onUpdated.emit(tabID, { url: prov }, { id: tabID, url: prov });
+  expect(h.backend.store.activeJobs.find((j) => j.job_id === "job_recon_0002")?.status).toBe("awaiting_download");
+
+  h.tabs.live.delete(tabID);
+  await h.bridge.start();
+  // Parked: download may have landed in the adoption dir for the daemon to scan.
+  expect(h.backend.store.activeJobs.some((j) => j.job_id === "job_recon_0002")).toBe(false);
+});
+
+test("startup reconciliation leaves a job with a live tab untouched", async () => {
+  const h = makeMapHarness([SPEC]);
+  await h.bridge.start();
+  await h.port.inbound(offer("job_recon_0003"));
+  const tabID = await landOnProvider(h, "job_recon_0003");
+  await h.bridge.start();
+  const job = h.backend.store.activeJobs.find((j) => j.job_id === "job_recon_0003");
+  expect(job?.tab_id).toBe(tabID);
+  expect(job?.status).toBe("accepted");
+});
+
 test("hello reports adapter_versions from the registered specs", async () => {
   const jstor: AdapterSpec = { id: "jstor", version: "1.2.0", hosts: ["www.jstor.org"], classify: [] };
   const h = makeMapHarness([SPEC, jstor]);
