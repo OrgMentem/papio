@@ -56,6 +56,17 @@ export interface AdapterSpec {
    * selectors to hydrate before classifying. Fixture Documents stay synchronous. */
   settleTimeoutMs?: number;
   download?: DownloadRule;
+  /** The terms-and-conditions accept control, found by accessible text inside
+   * the open modal. Clicked ONLY when the user has recorded informed consent to
+   * auto-accept publisher terms; otherwise the terms gate stays human. */
+  termsAccept?: TermsAcceptRule;
+}
+
+export interface TermsAcceptRule {
+  /** The open terms modal container (same selector as the `terms` classify rule). */
+  modalSelector: string;
+  /** Accessible-text needles identifying the accept-and-download control. */
+  textAny: string[];
 }
 
 export interface AdapterContext {
@@ -292,6 +303,10 @@ export const adapters: AdapterSpec[] = [
       shadowSelector: "#button-element",
       postClickWaitFor: "mfe-download-pharos-modal.terms-and-conditions[open]",
       postClickTimeoutMs: 3000,
+    },
+    termsAccept: {
+      modalSelector: "mfe-download-pharos-modal.terms-and-conditions[open]",
+      textAny: ["accept and download"],
     },
   },
   {

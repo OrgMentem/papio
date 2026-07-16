@@ -10,6 +10,12 @@
 
 export type JobStatus = "offered" | "queued" | "accepted" | "auth_pending" | "awaiting_download";
 
+/** Durable, informed user choice for auto-accepting publisher terms &
+ * conditions. `undefined` = never asked; `"accept"` = consented to papio
+ * agreeing to publisher T&C on their behalf; `"manual"` = will accept manually. */
+export type TermsConsent = "accept" | "manual" | undefined;
+export const TERMS_CONSENT_KEY = "papio_terms_consent_v1";
+
 export interface ActiveJob {
   job_id: string;
   tab_id: number;
@@ -36,6 +42,10 @@ export interface ActiveJob {
    * streak's first observation, for the 2×(≥5s apart) ui_changed debounce. */
   unknown_count?: number;
   last_unknown_ms?: number;
+  /** Set when the adapter hit a terms-and-conditions gate while the user has
+   * not yet recorded a consent choice, so the popup can surface the one-time
+   * informed-consent prompt. Cleared once consent is decided. */
+  needs_terms_consent?: boolean;
 }
 
 export interface StoreShape {

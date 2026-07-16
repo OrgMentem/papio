@@ -8,7 +8,7 @@
 // ./capture; the popup only wires the DOM.
 
 import { captureFixture, type ChromeCaptureApi, type PageCapture, type Provider, type Scenario } from "./capture";
-import { chromeBackend, type ActiveJob } from "./state";
+import { chromeBackend, type ActiveJob, TERMS_CONSENT_KEY } from "./state";
 
 type JobSection = "needs-you" | "in-flight" | "done" | "failed";
 
@@ -203,10 +203,54 @@ export function renderJobs(
   if (emptyEl) emptyEl.hidden = jobs.length > 0;
 }
 
+export async function sendTermsConsent(value: "accept" | "manual"): Promise<void> {
+  await chrome.runtime.sendMessage({ channel: "papio", action: "terms_consent", value });
+}
+
+/**
+ * Show the one-time informed-consent prompt when a job hit a publisher
+ * terms-and-conditions gate and the user has not yet chosen. Pure over the
+ * document so it is testable; the caller supplies the current consent value and
+ * the choice handler. Hidden once a choice exists or no terms gate is pending.
+ */
+export function renderTermsConsent(
+  doc: Document,
+  jobs: ActiveJob[],
+  consent: "accept" | "manual" | undefined,
+  onChoice: (value: "accept" | "manual") => void,
+): void {
+  const card = doc.getElementById("terms-consent");
+  if (!card) return;
+  const pending = consent === undefined && jobs.some((j) => j.needs_terms_consent === true);
+  card.hidden = !pending;
+  if (!pending) return;
+  const enable = doc.getElementById("terms-consent-enable");
+  const decline = doc.getElementById("terms-consent-decline");
+  if (enable instanceof HTMLButtonElement && !enable.dataset.wired) {
+    enable.dataset.wired = "1";
+    enable.addEventListener("click", () => onChoice("accept"));
+  }
+  if (decline instanceof HTMLButtonElement && !decline.dataset.wired) {
+    decline.dataset.wired = "1";
+    decline.addEventListener("click", () => onChoice("manual"));
+  }
+}
+
 export async function refresh(): Promise<void> {
   const { activeJobs } = await chromeBackend(chrome.storage).load();
   renderJobs(document, activeJobs, realActions(), () => {
     void refresh();
+  });
+  let consent: "accept" | "manual" | undefined;
+  try {
+    const got = await chrome.storage.local.get(TERMS_CONSENT_KEY);
+    const v = got[TERMS_CONSENT_KEY];
+    consent = v === "accept" || v === "manual" ? v : undefined;
+  } catch {
+    consent = undefined;
+  }
+  renderTermsConsent(document, activeJobs, consent, (value) => {
+    void sendTermsConsent(value).then(() => refresh());
   });
 }
 

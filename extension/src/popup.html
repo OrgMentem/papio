@@ -181,14 +181,52 @@
         margin-top: 8px;
         word-break: break-all;
       }
+      .brand {
+        align-items: center;
+        display: flex;
+        gap: 8px;
+        margin-bottom: 10px;
+      }
+      .brand svg {
+        height: 22px;
+        width: 22px;
+      }
+      .brand-name {
+        color: #4f46e5;
+        font-size: 14px;
+        font-weight: 700;
+        letter-spacing: 0.01em;
+      }
     </style>
   </head>
   <body>
     <header>
+      <div class="brand">
+        <svg viewBox="0 0 512 512" role="img" aria-label="papio">
+          <path d="M342.2 71.1 A204 204 0 1 0 440.9 169.8" fill="none" stroke="#4f46e5" stroke-width="46" stroke-linecap="round"/>
+          <path fill="#4f46e5" fill-rule="evenodd" d="M190 156 L234 156 A74 74 0 0 1 234 304 L234 356 H190 Z M234 200 A30 30 0 0 1 234 260 Z"/>
+          <circle cx="400.2" cy="111.8" r="27" fill="#e6c877"/>
+        </svg>
+        <span class="brand-name">papio</span>
+      </div>
       <h1>Acquisition batch</h1>
       <p id="summary" class="summary">0 need you · 0 downloading · 0 imported · 0 failed</p>
     </header>
     <div id="empty" class="empty" hidden>No active jobs.</div>
+
+    <section id="terms-consent" class="terms-consent" hidden>
+      <h2>Publisher terms &amp; conditions</h2>
+      <p>
+        A publisher requires accepting its terms &amp; conditions before the
+        download. papio can accept these for you automatically on future
+        downloads — this means papio will agree to each publisher's terms on
+        your behalf. You can change this anytime in Options.
+      </p>
+      <div class="terms-consent-controls">
+        <button id="terms-consent-enable" class="primary" type="button">Auto-accept terms</button>
+        <button id="terms-consent-decline" type="button">I'll accept manually</button>
+      </div>
+    </section>
 
     <section id="needs-you-section" aria-labelledby="needs-you-heading">
       <div class="section-heading">

@@ -14,7 +14,7 @@ import {
   type PageVerdict,
 } from "../src/adapters/types";
 import { parseBrowserMessage, type BrowserMessage } from "../src/protocol";
-import { emptyStore, type StateBackend, type StoreShape } from "../src/state";
+import { emptyStore, type StateBackend, type StoreShape, type TermsConsent } from "../src/state";
 import {
   Bridge,
   type BridgeDeps,
@@ -343,6 +343,7 @@ class FakeScripting {
     followupSelector?: string;
   }[] = [];
   readonly rawClickArgs: unknown[][] = [];
+  readonly termsAccepts: { tabId: number; modalSelector: string; textAny: unknown }[] = [];
   readonly interpretTabs: number[] = [];
   async executeScript(inj: {
     target: { tabId: number };
@@ -353,6 +354,10 @@ class FakeScripting {
     if (args.length === 1) {
       this.extracted.push({ tabId: inj.target.tabId, selector: String(args[0]) });
       return [{ result: this.href }];
+    }
+    if (args.length === 2) {
+      this.termsAccepts.push({ tabId: inj.target.tabId, modalSelector: String(args[0]), textAny: args[1] });
+      return [{ result: true }];
     }
     if (args.length === 5) {
       this.rawClickArgs.push([...args]);
@@ -392,6 +397,7 @@ interface MapHarness {
   permissions: FakePermissions;
   clock: { now: number };
   timers: { fn: () => void | Promise<void>; ms: number }[];
+  settings: { consent: TermsConsent };
   frames(): BrowserMessage[];
 }
 
@@ -404,6 +410,7 @@ function makeMapHarness(specs: AdapterSpec[] = [SPEC]): MapHarness {
   const downloads = new FakeDownloads();
   const clock = { now: 1_700_000_000_000 };
   const timers: { fn: () => void | Promise<void>; ms: number }[] = [];
+  const settings = { consent: undefined as TermsConsent };
   const deps: BridgeDeps = {
     connectNative: () => port,
     manifestVersion: "0.1.0",
@@ -418,6 +425,12 @@ function makeMapHarness(specs: AdapterSpec[] = [SPEC]): MapHarness {
     adapterSpecs: specs,
     scripting,
     permissions,
+    settings: {
+      getTermsConsent: async () => settings.consent,
+      setTermsConsent: async (v) => {
+        settings.consent = v;
+      },
+    },
   };
   return {
     bridge: new Bridge(deps),
@@ -429,6 +442,7 @@ function makeMapHarness(specs: AdapterSpec[] = [SPEC]): MapHarness {
     permissions,
     clock,
     timers,
+    settings,
     frames: () => port.posted.map(parseBrowserMessage),
   };
 }
@@ -547,6 +561,66 @@ test("a stray non-opener PDF tab is not adopted", async () => {
   await h.tabs.onUpdated.emit(strayTab, { status: 'complete', url: pdfUrl }, { id: strayTab, url: pdfUrl, openerTabId: 12345 });
   expect(h.downloads.started.length).toBe(0);
   expect(h.tabs.live.has(strayTab)).toBe(true);
+});
+
+const TERMS_SPEC: AdapterSpec = {
+  id: "termsprov",
+  version: "1.0.0",
+  hosts: [PROVIDER],
+  classify: [],
+  termsAccept: { modalSelector: "div.terms[open]", textAny: ["accept and download"] },
+};
+const termsVerdict = { kind: "terms" as const, adapter_id: "termsprov", adapter_version: "1.0.0", evidence: [] };
+
+test("terms verdict auto-accepts only when the user has consented", async () => {
+  const h = makeMapHarness([TERMS_SPEC]);
+  h.settings.consent = "accept";
+  h.scripting.verdict = termsVerdict;
+  await h.bridge.start();
+  await h.port.inbound(offer("job_terms_0001"));
+  await landOnProvider(h, "job_terms_0001");
+
+  expect(h.scripting.termsAccepts.length).toBe(1);
+  expect(h.scripting.termsAccepts[0]?.modalSelector).toBe("div.terms[open]");
+  // Auto-accept emits no provider_outcome; the ensuing download is the record.
+  expect(h.frames().some((f) => f.type === "provider_outcome")).toBe(false);
+});
+
+test("terms verdict stays a human step and flags consent when undecided", async () => {
+  const h = makeMapHarness([TERMS_SPEC]);
+  h.scripting.verdict = termsVerdict; // consent stays undefined
+  await h.bridge.start();
+  await h.port.inbound(offer("job_terms_0002"));
+  await landOnProvider(h, "job_terms_0002");
+
+  expect(h.scripting.termsAccepts.length).toBe(0);
+  expect(h.frames().some((f) => f.type === "provider_outcome" && f.payload.outcome === "terms_acceptance_required")).toBe(true);
+  expect(h.backend.store.activeJobs.find((j) => j.job_id === "job_terms_0002")?.needs_terms_consent).toBe(true);
+});
+
+test("granting consent clears the prompt flag and re-attempts the pending terms gate", async () => {
+  const h = makeMapHarness([TERMS_SPEC]);
+  h.scripting.verdict = termsVerdict;
+  await h.bridge.start();
+  await h.port.inbound(offer("job_terms_0003"));
+  await landOnProvider(h, "job_terms_0003");
+  expect(h.backend.store.activeJobs[0]?.needs_terms_consent).toBe(true);
+
+  await h.bridge.requestTermsConsent("accept");
+  expect(h.settings.consent).toBe("accept");
+  expect(h.backend.store.activeJobs[0]?.needs_terms_consent).toBe(false);
+  expect(h.scripting.termsAccepts.length).toBeGreaterThanOrEqual(1);
+});
+
+test("declining consent records manual and never auto-accepts", async () => {
+  const h = makeMapHarness([TERMS_SPEC]);
+  h.scripting.verdict = termsVerdict;
+  await h.bridge.start();
+  await h.port.inbound(offer("job_terms_0004"));
+  await landOnProvider(h, "job_terms_0004");
+  await h.bridge.requestTermsConsent("manual");
+  expect(h.settings.consent).toBe("manual");
+  expect(h.scripting.termsAccepts.length).toBe(0);
 });
 
 test("hello reports adapter_versions from the registered specs", async () => {

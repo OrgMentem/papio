@@ -75,7 +75,45 @@ function render(list: HTMLUListElement): void {
   }
 }
 
+const TERMS_CONSENT_KEY = "papio_terms_consent_v1";
+
+async function renderTermsConsent(): Promise<void> {
+  const statusEl = document.getElementById("terms-consent-status");
+  if (!statusEl) return;
+  let consent: string | undefined;
+  try {
+    const got = await chrome.storage.local.get(TERMS_CONSENT_KEY);
+    const v = got[TERMS_CONSENT_KEY];
+    consent = v === "accept" || v === "manual" ? v : undefined;
+  } catch {
+    consent = undefined;
+  }
+  statusEl.textContent =
+    consent === "accept"
+      ? "On — papio accepts publisher terms automatically"
+      : consent === "manual"
+        ? "Off — you accept terms yourself"
+        : "Ask on first download";
+}
+
+function wireTermsConsent(): void {
+  const on = document.getElementById("terms-consent-on");
+  const off = document.getElementById("terms-consent-off");
+  if (on instanceof HTMLButtonElement) {
+    on.addEventListener("click", () => {
+      void chrome.storage.local.set({ [TERMS_CONSENT_KEY]: "accept" }).then(renderTermsConsent);
+    });
+  }
+  if (off instanceof HTMLButtonElement) {
+    off.addEventListener("click", () => {
+      void chrome.storage.local.set({ [TERMS_CONSENT_KEY]: "manual" }).then(renderTermsConsent);
+    });
+  }
+}
+
 const list = document.getElementById("sources");
 if (list instanceof HTMLUListElement) {
   render(list);
 }
+wireTermsConsent();
+void renderTermsConsent();

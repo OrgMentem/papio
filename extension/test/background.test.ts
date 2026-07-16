@@ -183,6 +183,7 @@ function makeHarness(seed?: StoreShape): Harness {
     adapterSpecs: [],
     scripting: { executeScript: async () => [] },
     permissions: { contains: async () => false },
+    settings: { getTermsConsent: async () => undefined, setTermsConsent: async () => {} },
   };
   return {
     bridge: new Bridge(deps),
@@ -957,6 +958,7 @@ test("overlapping state writes persist serially so no stale snapshot wins", asyn
     adapterSpecs: [],
     scripting: { executeScript: async () => [] },
     permissions: { contains: async () => false },
+    settings: { getTermsConsent: async () => undefined, setTermsConsent: async () => {} },
   };
   const bridge = new Bridge(deps);
   await bridge.start();

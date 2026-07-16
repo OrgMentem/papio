@@ -75,6 +75,23 @@
       source to assisted behaviour immediately.
     </p>
     <ul id="sources"></ul>
+
+    <h1 style="margin-top: 28px">Publisher terms &amp; conditions</h1>
+    <p class="lede">
+      Some publishers require accepting their terms &amp; conditions before a download. When enabled,
+      papio accepts these automatically on your behalf. This is a legal agreement to each publisher's
+      terms; leave it off to accept them yourself in the browser.
+    </p>
+    <div id="terms-consent-row" style="display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 0; border-top: 1px solid #e3e3e3">
+      <div>
+        <div class="source-label">Auto-accept publisher terms</div>
+        <div class="source-host" id="terms-consent-status">Ask on first download</div>
+      </div>
+      <div style="display: flex; gap: 8px">
+        <button id="terms-consent-on" type="button">Enable</button>
+        <button id="terms-consent-off" type="button">Disable</button>
+      </div>
+    </div>
     <script src="./options.js" type="module"></script>
   </body>
 </html>

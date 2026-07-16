@@ -32,6 +32,8 @@ import {
   type ActiveJob,
   type StateBackend,
   type StoreShape,
+  type TermsConsent,
+  TERMS_CONSENT_KEY,
 } from "./state";
 import {
   adapters,
@@ -161,6 +163,12 @@ export interface BridgeDeps {
   permissions: {
     contains(perm: { origins: string[] }): Promise<boolean>;
   };
+  /** Durable user settings (chrome.storage.local). Currently the informed
+   * consent for auto-accepting publisher terms & conditions. */
+  settings: {
+    getTermsConsent(): Promise<TermsConsent>;
+    setTermsConsent(value: Exclude<TermsConsent, undefined>): Promise<void>;
+  };
 }
 
 interface DownloadTrack {
@@ -229,6 +237,32 @@ function extractDownloadURL(selector: string): string | null {
   } catch {
     return null;
   }
+}
+
+/** Self-contained click of a terms-and-conditions accept control, found by
+ * accessible text inside an open modal (piercing shadow roots). Runs ONLY when
+ * the user has recorded informed consent; the extension never guesses terms
+ * controls otherwise. Returns whether a matching control was clicked. */
+function clickTermsAccept(modalSelector: string, textAny: string[]): boolean {
+  const modal = document.querySelector(modalSelector);
+  if (!modal) return false;
+  const needles = textAny.map((t) => t.toLowerCase());
+  const walk = (root: ParentNode): boolean => {
+    for (const el of Array.from(root.querySelectorAll("*"))) {
+      const label = ((el as HTMLElement).innerText ?? "") + " " + (el.getAttribute?.("aria-label") ?? "");
+      const text = label.toLowerCase();
+      if (needles.some((n) => text.includes(n))) {
+        const shadow = (el as HTMLElement & { shadowRoot?: ShadowRoot | null }).shadowRoot;
+        const inner = shadow?.querySelector<HTMLElement>("#button-element");
+        (inner ?? (el as HTMLElement)).click();
+        return true;
+      }
+      const sub = (el as HTMLElement & { shadowRoot?: ShadowRoot | null }).shadowRoot;
+      if (sub && walk(sub)) return true;
+    }
+    return false;
+  };
+  return walk(modal);
 }
 
 
@@ -385,6 +419,43 @@ export class Bridge {
     this.downloads.delete(jobID);
     this.completedDownloadTabs.delete(jobID);
     await this.removeJobWithOffer(jobID);
+  }
+
+  /**
+   * Record the user's informed terms-consent choice (popup first-use prompt),
+   * clear the pending-prompt flags, and — when they consented — re-drive the
+   * still-open terms gate on every flagged job so the current downloads
+   * complete without a second visit. Idempotent and safe if jobs have moved on.
+   */
+  async requestTermsConsent(value: Exclude<TermsConsent, undefined>): Promise<void> {
+    await this.ready;
+    await this.deps.settings.setTermsConsent(value);
+    const flagged = this.store.activeJobs.filter((j) => j.needs_terms_consent === true).map((j) => j.job_id);
+    for (const jobID of flagged) {
+      await this.update((s) => patchJob(s, jobID, { needs_terms_consent: false }));
+    }
+    if (value !== "accept") return;
+    for (const jobID of flagged) {
+      await this.reclassifyCurrentProviderPage(jobID);
+    }
+  }
+
+  /** Inject the consented terms-accept click on the tracked tab. Gated by the
+   * caller on recorded consent; returns whether a control was clicked. */
+  private async acceptTerms(jobID: string, rule: { modalSelector: string; textAny: string[] }): Promise<boolean> {
+    const job = findByJob(this.store, jobID);
+    if (!job || job.tab_id < 0) return false;
+    try {
+      const results = await this.deps.scripting.executeScript({
+        target: { tabId: job.tab_id },
+        func: clickTermsAccept,
+        args: [rule.modalSelector, rule.textAny],
+      });
+      return results[0]?.result === true;
+    } catch (e) {
+      console.error("papio: terms accept click failed; staying assisted", e);
+      return false;
+    }
   }
 
   private pendingJobFor(item: DownloadItemLike): string | undefined {
@@ -1396,9 +1467,27 @@ export class Bridge {
       case "login":
         // Human is still authenticating: stay auth_pending, emit nothing.
         return;
-      case "terms":
+      case "terms": {
+        const consent = await this.deps.settings.getTermsConsent();
+        if (consent === "accept" && spec.termsAccept) {
+          const accepted = await this.acceptTerms(job.job_id, spec.termsAccept);
+          if (accepted) {
+            // The accept click opens the provider PDF (often in a new viewer
+            // tab), which the download / viewer-adoption path captures and
+            // reports as download_started/complete. No extra frame: the
+            // frozen protocol has no terms-accepted outcome, and the download
+            // events are the audit trail.
+            return;
+          }
+        }
         this.send("provider_outcome", { outcome: "terms_acceptance_required", adapter_version: av }, jobID);
+        // First terms gate with no recorded choice: flag for the popup's
+        // one-time informed-consent prompt.
+        if (consent === undefined) {
+          await this.update((s) => patchJob(s, jobID, { needs_terms_consent: true }));
+        }
         return;
+      }
       case "no_entitlement":
         this.send("provider_outcome", { outcome: "no_entitlement", adapter_version: av }, jobID);
         return;
@@ -1548,6 +1637,25 @@ function isCancelRequest(message: unknown): message is CancelRequest {
   );
 }
 
+interface TermsConsentRequest {
+  channel: "papio";
+  action: "terms_consent";
+  value: "accept" | "manual";
+}
+
+function isTermsConsentRequest(message: unknown): message is TermsConsentRequest {
+  return (
+    typeof message === "object" &&
+    message !== null &&
+    "channel" in message &&
+    message.channel === "papio" &&
+    "action" in message &&
+    message.action === "terms_consent" &&
+    "value" in message &&
+    (message.value === "accept" || message.value === "manual")
+  );
+}
+
 function realDeps(): BridgeDeps {
   return {
     connectNative: (name) => {
@@ -1604,6 +1712,20 @@ function realDeps(): BridgeDeps {
     permissions: {
       contains: (perm) => chrome.permissions.contains(perm),
     },
+    settings: {
+      async getTermsConsent() {
+        try {
+          const got = await chrome.storage.local.get(TERMS_CONSENT_KEY);
+          const v = got[TERMS_CONSENT_KEY];
+          return v === "accept" || v === "manual" ? v : undefined;
+        } catch {
+          return undefined;
+        }
+      },
+      async setTermsConsent(value) {
+        await chrome.storage.local.set({ [TERMS_CONSENT_KEY]: value });
+      },
+    },
   };
 }
 
@@ -1620,6 +1742,10 @@ if (typeof chrome !== "undefined" && chrome.runtime?.id) {
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (isCancelRequest(message)) {
       void bridge.requestCancel(message.job_id).then(() => sendResponse({ ok: true }));
+      return true; // async sendResponse
+    }
+    if (isTermsConsentRequest(message)) {
+      void bridge.requestTermsConsent(message.value).then(() => sendResponse({ ok: true }));
       return true; // async sendResponse
     }
     return false;
