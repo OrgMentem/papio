@@ -830,10 +830,16 @@ Root gaps fixed this session (all committed, 118 tests pass): `fe0a643` (settleT
 
 `bbc7163`. Stale `tab_id`s (tab closed while the MV3 worker slept → no `onTabRemoved`; or session-restore reopened provider tabs with new ids) left jobs pointed at dead tabs → classify never ran → invisible strand at auth_returned/accepted (the "12 jobs stuck" mirage). `start()` (runs on every spin-up) now calls `reconcileTabs`: verify each tracked tab via `tabs.get`; park past-auth jobs (download may sit in the adoption dir for the daemon poll-scan), re-queue pre-download jobs through the existing handoff choreography (reopened one-at-a-time, forced-released in the fallback window), drop offer-URL-less ones; healthy live-tab jobs untouched. Unit-tested all three paths; live-verified the invariant holds (zero activeJobs referencing a dead tab post-deploy).
 
+### Cold-start dormancy FIXED (2026-07-16)
+
+`026944b`. An MV3 worker sleeps after ~30s idle; the reconnect backoff uses `setTimeout` (dies with the worker), and the daemon can't wake a dormant worker (the native connection originates from the extension). So a job queued while the worker slept — the watchlist "grows while you sleep" path — never arrived until an unrelated event woke the worker. Fix: register a `chrome.alarms` alarm (1 min) + `onAlarm` listener; the alarm wakes the worker, whose top-level `start()` re-establishes the native connection so queued offers arrive; `onKeepaliveAlarm` reconnects if the port is still down. Added the `alarms` permission + a BridgeDeps seam. Unit-tested (register / reconnect-on-drop / no-op-when-healthy). Bundle loads clean in a fresh profile (no `DidStartWorkerFail`) and `chrome.alarms.create` registers in-extension; a copied profile rejects the new permission via Secure Preferences MAC (copied-profile artifact — real installs auto-grant on reload).
+
+**Reliability spine (Tier 1) complete:** fixture write-path (`05705d6`), tab reconciliation (`bbc7163`), cold-start dormancy (`026944b`).
+
 ### Next (updated 2026-07-16, post-CDP)
 
-1. Fix MV3 worker cold-start dormancy: with no keepalive tab the worker sleeps and daemon offers never land; add alarms-based keepalive when jobs are pending or a daemon-side reconnect nudge. (Reconcile now recovers strands on wake, but offers still need the worker awake to arrive.)
-2. Build Elsevier + ACM adapters from real observe captures (fixtures now file correctly); add `oup.com`/`cell.com` to `verifiedProviderHosts` with proof.
-3. Re-pin the packed extension ID after adapters land; signing/notarization + Web Store when credentials exist; instsci fork archival on approval.
+1. Build Elsevier + ACM adapters from real observe captures (fixtures now file correctly); add `oup.com`/`cell.com` to `verifiedProviderHosts` with proof.
+2. Re-pin the packed extension ID after adapters land; signing/notarization + Web Store when credentials exist; instsci fork archival on approval.
+3. When deploying the `alarms` permission to the real profile, reload the extension via `chrome://extensions` (or restart Chrome) so Chrome grants the new permission — `chrome.runtime.reload()` alone does not re-read permissions.
 
 Reusable CDP harness for autonomous extension debugging: copy profile + manifest → launch binary with `--user-data-dir=<copy> --remote-debugging-port=<port>` → connect a CDP client → `browser.targets()` find the `service_worker` → `worker().evaluate(...)` reads `chrome.storage.session`/`chrome.tabs`/`chrome.downloads` and injects into pages. This is the way to observe MV3 SW state the default profile hides.
