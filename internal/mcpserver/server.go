@@ -23,8 +23,6 @@ import (
 	"papio/internal/zotio"
 )
 
-const Version = "0.1.0"
-
 type AcquireInput struct {
 	RequestID          string                `json:"request_id,omitempty" jsonschema:"stable idempotency key; omit to generate one"`
 	Identifiers        *protocol.Identifiers `json:"identifiers,omitempty" jsonschema:"DOI, PMID, arXiv, ISBN, or OpenAlex identity"`
@@ -260,7 +258,7 @@ func New(system *bootstrap.System) *mcp.Server {
 
 func newServer(system *bootstrap.System, dependencies toolDependencies) *mcp.Server {
 	server := mcp.NewServer(&mcp.Implementation{
-		Name: "papio", Title: "Papio paper acquisition", Version: Version,
+		Name: "papio", Title: "Papio paper acquisition", Version: api.Version,
 	}, &mcp.ServerOptions{
 		Instructions: "Acquire papers into durable Papio jobs. Export ready acquisition bundles. Always call papio_zotio_plan and inspect its preview before papio_zotio_apply; apply accepts only the returned plan ID and exact confirmation SHA-256.",
 		Capabilities: &mcp.ServerCapabilities{},
