@@ -70,6 +70,10 @@ export interface NativePort {
 export interface TabInfo {
   id?: number | undefined;
   url?: string | undefined;
+  /** Chrome sets this on a tab opened by another tab (e.g. a provider's
+   * "download" that opens the PDF in a new viewer tab). Correlates the viewer
+   * tab back to the tracked handoff tab that spawned it. */
+  openerTabId?: number | undefined;
 }
 
 export interface TabChangeInfo {
@@ -968,7 +972,13 @@ export class Bridge {
   private async onTabUpdated(tabID: number, change: TabChangeInfo, tab: TabInfo): Promise<void> {
     await this.ready;
     const job = findByTab(this.store, tabID);
-    if (!job) return;
+    if (!job) {
+      // A provider "download" that opens the PDF in a NEW viewer tab (e.g. JSTOR
+      // navigates to /stable/pdf/<id>.pdf) is untracked here. Adopt it for the
+      // tracked handoff tab that spawned it so the PDF still flows to the daemon.
+      if (change.status === "complete") await this.maybeAdoptViewerTab(tabID, change.url ?? tab.url, tab.openerTabId);
+      return;
+    }
     const url = change.url ?? tab.url;
     if (url === undefined) return;
     let host: string;
@@ -1089,6 +1099,66 @@ export class Bridge {
       this.downloads.set(jobID, track);
     } catch (e) {
       console.error("papio: PDF-viewer download initiation failed; staying assisted", e);
+    } finally {
+      this.pendingDownloadURLs.delete(url);
+    }
+  }
+
+  /**
+   * Adopt a PDF that a provider opened in a NEW viewer tab (target=_blank
+   * navigation to a `.pdf`), correlating it to the tracked handoff tab that
+   * spawned it. The adapter's click set `download_initiated` but produced a
+   * viewer, not a `chrome.downloads` item — so gate on "no download tracked
+   * yet" (this.downloads) rather than the latch. Downloads the URL through the
+   * browser cookie jar so the daemon's adoption/import path runs, then closes
+   * the viewer tab. Falls back to leaving the tab (assisted) on any ambiguity.
+   */
+  private async maybeAdoptViewerTab(viewerTabId: number, url: string | undefined, openerTabId: number | undefined): Promise<void> {
+    if (url === undefined) return;
+    let isPDF = false;
+    let host: string;
+    try {
+      const u = new URL(url);
+      host = u.hostname;
+      isPDF = u.pathname.toLowerCase().endsWith(".pdf");
+    } catch {
+      return;
+    }
+    if (!isPDF) return;
+
+    // Prefer the opener correlation; fall back to a unique provider-host job
+    // that clicked (download_initiated) but has no real download yet.
+    const candidates = this.store.activeJobs.filter((j) => {
+      if (this.downloads.has(j.job_id)) return false;
+      if (j.status !== "accepted" && j.status !== "awaiting_download") return false;
+      if (openerTabId !== undefined && j.tab_id === openerTabId) return true;
+      return openerTabId === undefined && j.download_initiated === true && hostMatches(host, j.provider_hosts);
+    });
+    const job = candidates.length === 1 ? candidates[0] : candidates.find((j) => j.tab_id === openerTabId);
+    if (!job) return;
+
+    this.pendingDownloadURLs.set(url, job.job_id);
+    try {
+      const id = await this.deps.downloads.download({
+        url,
+        filename: `papio/${job.job_id}/paper.pdf`,
+        conflictAction: "uniquify",
+        saveAs: false,
+      });
+      const track = this.downloads.get(job.job_id) ?? { ids: new Set<number>(), ambiguous: false, directOffer: false };
+      track.ids.add(id);
+      if (track.ids.size > 1) track.ambiguous = true;
+      this.downloads.set(job.job_id, track);
+      if (job.download_initiated !== true) {
+        await this.update((s) => patchJob(s, job.job_id, { download_initiated: true }));
+      }
+      try {
+        await this.deps.tabs.remove(viewerTabId);
+      } catch {
+        // Viewer tab already gone; adoption still proceeds.
+      }
+    } catch (e) {
+      console.error("papio: viewer-tab PDF adoption failed; staying assisted", e);
     } finally {
       this.pendingDownloadURLs.delete(url);
     }

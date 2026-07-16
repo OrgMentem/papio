@@ -515,6 +515,40 @@ test("a transiently unknown provider page is reclassified until it renders", asy
   expect(h.tabs.live.get(tabID)?.url).toContain(PROVIDER);
 });
 
+test("a provider PDF opened in a new viewer tab is adopted for the opener job", async () => {
+  // JSTOR-class providers "download" by opening the PDF in a new tab. That tab
+  // is untracked; it must be adopted for the handoff tab that spawned it.
+  const h = makeMapHarness([SPEC]);
+  await h.bridge.start();
+  await h.port.inbound(offer("job_viewer_0001"));
+  const trackedTab = h.backend.store.activeJobs.find(j => j.job_id === 'job_viewer_0001')?.tab_id ?? -1;
+  expect(trackedTab).toBeGreaterThanOrEqual(0);
+
+  // A new viewer tab opens on the provider .pdf, spawned by the tracked tab.
+  const viewerTab = 999;
+  const pdfUrl = `https://${PROVIDER}/doc/259290.pdf?refreqid=x`;
+  h.tabs.live.set(viewerTab, { id: viewerTab, url: pdfUrl, openerTabId: trackedTab });
+  await h.tabs.onUpdated.emit(viewerTab, { status: 'complete', url: pdfUrl }, { id: viewerTab, url: pdfUrl, openerTabId: trackedTab });
+
+  // The PDF is downloaded for the opener job and the viewer tab is closed.
+  expect(h.downloads.started.map(d => d.url)).toContain(pdfUrl);
+  expect(h.downloads.started.some(d => d.filename.includes('job_viewer_0001'))).toBe(true);
+  expect(h.tabs.live.has(viewerTab)).toBe(false);
+});
+
+test("a stray non-opener PDF tab is not adopted", async () => {
+  const h = makeMapHarness([SPEC]);
+  await h.bridge.start();
+  await h.port.inbound(offer("job_viewer_0002"));
+  const strayTab = 998;
+  const pdfUrl = `https://${PROVIDER}/doc/other.pdf`;
+  // openerTabId points at an unrelated tab; no download_initiated job matches.
+  h.tabs.live.set(strayTab, { id: strayTab, url: pdfUrl, openerTabId: 12345 });
+  await h.tabs.onUpdated.emit(strayTab, { status: 'complete', url: pdfUrl }, { id: strayTab, url: pdfUrl, openerTabId: 12345 });
+  expect(h.downloads.started.length).toBe(0);
+  expect(h.tabs.live.has(strayTab)).toBe(true);
+});
+
 test("hello reports adapter_versions from the registered specs", async () => {
   const jstor: AdapterSpec = { id: "jstor", version: "1.2.0", hosts: ["www.jstor.org"], classify: [] };
   const h = makeMapHarness([SPEC, jstor]);
