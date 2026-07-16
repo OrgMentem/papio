@@ -811,12 +811,18 @@ Shipped (post-auth classification hardening, all unit-tested, extension suite 11
 - **Still not proven end-to-end:** JSTOR's terms-accept → PDF download → adoption. JSTOR gates the actual download behind a trusted user gesture; synthetic `element.click()` and even puppeteer trusted clicks on the shadow-DOM `mfe-*` accept button did not reliably produce the PDF (and once terms are accepted in-session, re-clicking download emitted no download). This is JSTOR's human step; a real click should complete it and the `download_initiated`+host-correlation adoption path should then capture it — unverified this session.
 - **Observe-flywheel quirk surfaced:** fixture captures download as `data:text/html … papio-fixture` items landing as `~/Downloads/download (N).html`, not under `papio-fixtures/observed/<host>/`. Worth confirming the observe write path.
 
+### JSTOR end-to-end PROVEN (2026-07-16)
+
+`813dc82` (viewer-tab adoption) closes the loop. Full chain verified live via CDP:
+adapter classifies `article` → clicks download (autonomous) → **[human accepts JSTOR's terms modal]** → JSTOR opens the entitled PDF in a NEW tab (`/stable/pdf/259290.pdf`) → the extension adopts that untracked viewer tab by `openerTabId` correlation → `download_started` → `download_complete` (McKnight, 1.8 MB) → `auto_import`. McKnight (`9UB62PLM`) is in Zotero with its PDF attachment (`mcknight-cummings-chervany-1998-initial-trust`, application/pdf). The auto_import returned `no_op` because it was already present — the dedup path, not a failure.
+
+Root gaps fixed this session (all committed, 118 tests pass): `fe0a643` (settleTimeoutMs + classify-on-auth-return), `7676b37` (bounded reclassify retry), `813dc82` (viewer-tab PDF adoption). The **only** non-automated step in JSTOR is accepting its terms modal (a deliberate legal gesture JSTOR gates behind a trusted click); everything before and after is now automatic.
+
 ### Next (updated 2026-07-16, post-CDP)
 
-1. **Prove JSTOR end-to-end with a real terms click** (user gesture) and confirm the PDF adopts+imports; if adoption misses (JSTOR PDF served from a delivery host off the tracked tab), fix `correlate()` host matching for JSTOR delivery URLs.
-2. Harden tab tracking across re-offer/restart/session-restore: reconcile tracked `tab_id`s against live tabs (by offer-URL) and adopt `"unloaded"` restored provider tabs, so churn/real-world Chrome restarts don't strand jobs on dead tabs.
-3. Verify `observeUnknown` writes fixtures to `papio-fixtures/observed/` (not the plain Downloads folder); then build Elsevier + ACM adapters from captures.
-4. Add `oup.com`/`cell.com` to `verifiedProviderHosts` alongside adapter/observe proof.
-5. Re-pin the packed extension ID after adapters land; signing/notarization + Web Store when credentials exist; instsci fork archival on approval.
+1. Harden tab tracking across re-offer/restart/session-restore: reconcile tracked `tab_id`s against live tabs (by offer-URL) and adopt `"unloaded"` restored provider tabs, so churn/real-world Chrome restarts don't strand jobs on dead tabs (this caused the earlier "12 jobs stuck" mirage).
+2. Verify `observeUnknown` writes fixtures to `papio-fixtures/observed/` (not the plain Downloads folder); then build Elsevier + ACM adapters from captures.
+3. Add `oup.com`/`cell.com` to `verifiedProviderHosts` alongside adapter/observe proof.
+4. Re-pin the packed extension ID after adapters land; signing/notarization + Web Store when credentials exist; instsci fork archival on approval.
 
 Reusable CDP harness for autonomous extension debugging: copy profile + manifest → launch binary with `--user-data-dir=<copy> --remote-debugging-port=<port>` → connect a CDP client → `browser.targets()` find the `service_worker` → `worker().evaluate(...)` reads `chrome.storage.session`/`chrome.tabs`/`chrome.downloads` and injects into pages. This is the way to observe MV3 SW state the default profile hides.
