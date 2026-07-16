@@ -57,7 +57,11 @@ const QUEUED_HANDOFF_RELEASE_MS = 45_000;
 // schedule so a slow render still reaches a decisive verdict.
 const CLASSIFY_RETRY_MS = 2_500;
 const MAX_CLASSIFY_RETRIES = 8;
-
+// The alarm that wakes an idle MV3 worker to re-establish the daemon connection
+// so queued offers arrive without a keepalive tab or user activity. One minute
+// is Chrome's reliable floor for a packed extension; it bounds delivery latency.
+const KEEPALIVE_ALARM = "papio-keepalive";
+const KEEPALIVE_ALARM_MINUTES = 1;
 
 export interface Listenable<A extends unknown[]> {
   addListener(cb: (...args: A) => void): void;
@@ -169,6 +173,13 @@ export interface BridgeDeps {
   settings: {
     getTermsConsent(): Promise<TermsConsent>;
     setTermsConsent(value: Exclude<TermsConsent, undefined>): Promise<void>;
+  };
+  /** chrome.alarms seam. An MV3 service worker sleeps after ~30s idle; a
+   * periodic alarm is the only thing that wakes it, so pending daemon offers
+   * reach an idle worker with no keepalive tab or user activity. */
+  alarms: {
+    create(name: string, info: { periodInMinutes: number }): void;
+    onAlarm: Listenable<[{ name: string }]>;
   };
 }
 
@@ -386,6 +397,10 @@ export class Bridge {
   async start(): Promise<void> {
     this.bindListeners();
     this.connect();
+    // Wake this worker even when idle so queued daemon offers reach it (the
+    // native connection originates here, so the daemon cannot wake a dormant
+    // worker itself). Idempotent: re-creating the same alarm just resets it.
+    this.deps.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: KEEPALIVE_ALARM_MINUTES });
     this.ready = this.deps.backend.load().then((s) => {
       this.store = s;
       this.offerURLs.clear();
@@ -557,6 +572,20 @@ export class Bridge {
       if (base.length === 0) return;
       suggest({ filename: `papio/${job.job_id}/${base}`, conflictAction: "uniquify" });
     });
+    this.deps.alarms.onAlarm.addListener((alarm) => {
+      if (alarm.name === KEEPALIVE_ALARM) return this.onKeepaliveAlarm();
+    });
+  }
+
+  /** The keepalive alarm woke the worker. The top-level start() on this same
+   * spin-up already reconnects; this is the safety net that re-establishes the
+   * daemon connection if it is still down, so any queued offers arrive. */
+  private async onKeepaliveAlarm(): Promise<void> {
+    await this.ready;
+    if (this.port === null && !this.closingDeliberately) {
+      this.reconnectAttempts = 0;
+      this.connect();
+    }
   }
 
   /** Consecutive unplanned disconnects; resets on a healthy inbound frame. */
@@ -1774,6 +1803,12 @@ function realDeps(): BridgeDeps {
       },
       async setTermsConsent(value) {
         await chrome.storage.local.set({ [TERMS_CONSENT_KEY]: value });
+      },
+    },
+    alarms: {
+      create: (name, info) => chrome.alarms.create(name, info),
+      onAlarm: {
+        addListener: (cb) => chrome.alarms.onAlarm.addListener(cb),
       },
     },
   };

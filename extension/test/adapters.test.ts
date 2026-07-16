@@ -398,6 +398,7 @@ interface MapHarness {
   clock: { now: number };
   timers: { fn: () => void | Promise<void>; ms: number }[];
   settings: { consent: TermsConsent };
+  alarms: { created: { name: string }[]; fire(name: string): void };
   frames(): BrowserMessage[];
 }
 
@@ -411,6 +412,17 @@ function makeMapHarness(specs: AdapterSpec[] = [SPEC]): MapHarness {
   const clock = { now: 1_700_000_000_000 };
   const timers: { fn: () => void | Promise<void>; ms: number }[] = [];
   const settings = { consent: undefined as TermsConsent };
+  const alarmListeners: ((a: { name: string }) => void)[] = [];
+  const alarms = {
+    created: [] as { name: string; info: { periodInMinutes: number } }[],
+    create: (name: string, info: { periodInMinutes: number }) => {
+      alarms.created.push({ name, info });
+    },
+    onAlarm: { addListener: (cb: (a: { name: string }) => void) => alarmListeners.push(cb) },
+    fire: (name: string) => {
+      for (const cb of alarmListeners) cb({ name });
+    },
+  };
   const deps: BridgeDeps = {
     connectNative: () => port,
     manifestVersion: "0.1.0",
@@ -431,6 +443,7 @@ function makeMapHarness(specs: AdapterSpec[] = [SPEC]): MapHarness {
         settings.consent = v;
       },
     },
+    alarms,
   };
   return {
     bridge: new Bridge(deps),
@@ -443,6 +456,7 @@ function makeMapHarness(specs: AdapterSpec[] = [SPEC]): MapHarness {
     clock,
     timers,
     settings,
+    alarms,
     frames: () => port.posted.map(parseBrowserMessage),
   };
 }
@@ -676,6 +690,39 @@ test("startup reconciliation leaves a job with a live tab untouched", async () =
   const job = h.backend.store.activeJobs.find((j) => j.job_id === "job_recon_0003");
   expect(job?.tab_id).toBe(tabID);
   expect(job?.status).toBe("accepted");
+});
+
+test("startup registers the periodic keepalive alarm", async () => {
+  const h = makeMapHarness([SPEC]);
+  await h.bridge.start();
+  expect(h.alarms.created.some((a) => a.name === "papio-keepalive")).toBe(true);
+});
+
+test("the keepalive alarm reconnects a worker whose native port had dropped", async () => {
+  // MV3 dormancy / daemon restart kills the port; the setTimeout backoff dies
+  // with a sleeping worker, so the alarm wake must re-establish the connection.
+  const h = makeMapHarness([SPEC]);
+  await h.bridge.start();
+  const hellosBefore = h.frames().filter((f) => f.type === "hello").length;
+
+  h.port.disconnect(); // port death; onDisconnect nulls the port + queues a backoff timer (unfired)
+  await Promise.resolve();
+  h.alarms.fire("papio-keepalive");
+  await Promise.resolve();
+  await Promise.resolve();
+
+  const hellosAfter = h.frames().filter((f) => f.type === "hello").length;
+  expect(hellosAfter).toBe(hellosBefore + 1);
+});
+
+test("the keepalive alarm is a no-op while the port is healthy", async () => {
+  const h = makeMapHarness([SPEC]);
+  await h.bridge.start();
+  const hellosBefore = h.frames().filter((f) => f.type === "hello").length;
+  h.alarms.fire("papio-keepalive");
+  await Promise.resolve();
+  await Promise.resolve();
+  expect(h.frames().filter((f) => f.type === "hello").length).toBe(hellosBefore);
 });
 
 test("hello reports adapter_versions from the registered specs", async () => {
