@@ -57,6 +57,12 @@ export interface StoreShape {
    * It is bounded by the bridge before use and lets queued jobs drain after an
    * MV3 restart while the session is still warm. */
   lastAuthReturnedAt?: number;
+  /** Per-job count of authentication drives that never reached a download,
+   * within this browser session. Accumulates across worker restarts and parks
+   * (cleared on browser close with the rest of session state); reset once a
+   * download proves the session works. Bounds re-driving a job whose warm SSO
+   * session cannot complete human authentication. */
+  authAttempts?: Record<string, number>;
 }
 
 /** Async key/value seam. The real implementation wraps chrome.storage; tests

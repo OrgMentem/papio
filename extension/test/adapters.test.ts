@@ -692,6 +692,78 @@ test("startup reconciliation leaves a job with a live tab untouched", async () =
   expect(job?.status).toBe("accepted");
 });
 
+test("repeated authentication failures cap re-driving and report human_auth_required", async () => {
+  // A warm session that cannot clear the IdP (expired SSO) would otherwise be
+  // re-offered and re-driven forever, thrashing the provider. After
+  // MAX_AUTH_ATTEMPTS drives that reach auth without a download, the extension
+  // must stop opening broker tabs and report the human step instead.
+  const h = makeMapHarness([SPEC]);
+  h.scripting.verdict = { kind: "login", adapter_id: "proquest", adapter_version: "0.3.1", evidence: [] };
+  await h.bridge.start();
+  const idp = "https://idp.example.edu/sso?SAMLRequest=x";
+
+  // Three drives that each reach authentication but never download.
+  for (let i = 0; i < 3; i++) {
+    await h.port.inbound(offer("job_authstall_0001"));
+    const tabID = h.backend.store.activeJobs.find((j) => j.job_id === "job_authstall_0001")?.tab_id ?? -1;
+    expect(tabID).toBeGreaterThanOrEqual(0);
+    h.tabs.live.set(tabID, { id: tabID, url: idp });
+    await h.tabs.onUpdated.emit(tabID, { url: idp }, { id: tabID, url: idp });
+    expect(h.backend.store.activeJobs.find((j) => j.job_id === "job_authstall_0001")?.status).toBe("auth_pending");
+    h.tabs.live.delete(tabID); // tab dies before the session ever authenticates
+  }
+  expect(h.backend.store.authAttempts?.["job_authstall_0001"]).toBe(3);
+
+  const tabsBefore = h.tabs.nextId;
+  const outcomesBefore = h.frames().filter((f) => f.type === "provider_outcome").length;
+
+  // Fourth offer is capped: no broker tab opens and one human_auth_required
+  // outcome is reported. The job is not re-tracked (no re-drive this session).
+  await h.port.inbound(offer("job_authstall_0001"));
+  expect(h.tabs.nextId).toBe(tabsBefore); // tabs.create never called
+  expect(h.backend.store.activeJobs.some((j) => j.job_id === "job_authstall_0001")).toBe(false);
+  const outcomes = h.frames().filter((f) => f.type === "provider_outcome");
+  expect(outcomes.length).toBe(outcomesBefore + 1);
+  expect(outcomes.at(-1)?.payload["outcome"]).toBe("human_auth_required");
+
+  // A further capped offer this worker lifetime stays quiet (no re-report, no tab).
+  await h.port.inbound(offer("job_authstall_0001"));
+  expect(h.frames().filter((f) => f.type === "provider_outcome").length).toBe(outcomesBefore + 1);
+  expect(h.tabs.nextId).toBe(tabsBefore);
+});
+
+test("a completed download clears the auth-failure budget", async () => {
+  // An earlier expired-session streak must not cap a job whose session later
+  // works: a real download proves auth succeeded and resets the counter.
+  const h = makeMapHarness([SPEC]);
+  h.scripting.verdict = { kind: "login", adapter_id: "proquest", adapter_version: "0.3.1", evidence: [] };
+  await h.bridge.start();
+  const idp = "https://idp.example.edu/sso?SAMLRequest=x";
+
+  for (let i = 0; i < 2; i++) {
+    await h.port.inbound(offer("job_authreset_0001"));
+    const t = h.backend.store.activeJobs.find((j) => j.job_id === "job_authreset_0001")?.tab_id ?? -1;
+    h.tabs.live.set(t, { id: t, url: idp });
+    await h.tabs.onUpdated.emit(t, { url: idp }, { id: t, url: idp });
+    h.tabs.live.delete(t);
+  }
+  expect(h.backend.store.authAttempts?.["job_authreset_0001"]).toBe(2);
+
+  // Third drive authenticates and downloads the article.
+  h.scripting.verdict = { kind: "article", adapter_id: "proquest", adapter_version: "0.3.1", evidence: [] };
+  await h.port.inbound(offer("job_authreset_0001"));
+  const tabID = h.backend.store.activeJobs.find((j) => j.job_id === "job_authreset_0001")?.tab_id ?? -1;
+  h.tabs.live.set(tabID, { id: tabID, url: idp });
+  await h.tabs.onUpdated.emit(tabID, { url: idp }, { id: tabID, url: idp });
+  const prov = `https://${PROVIDER}/doc?x=1`;
+  h.tabs.live.set(tabID, { id: tabID, url: prov });
+  await h.tabs.onUpdated.emit(tabID, { url: prov }, { id: tabID, url: prov });
+  expect(h.downloads.started.length).toBe(1);
+  await h.downloads.onChanged.emit({ id: 701, state: { current: "complete" } });
+
+  expect(h.backend.store.authAttempts?.["job_authreset_0001"]).toBeUndefined();
+});
+
 test("startup registers the periodic keepalive alarm", async () => {
   const h = makeMapHarness([SPEC]);
   await h.bridge.start();

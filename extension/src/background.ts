@@ -57,6 +57,13 @@ const QUEUED_HANDOFF_RELEASE_MS = 45_000;
 // schedule so a slow render still reaches a decisive verdict.
 const CLASSIFY_RETRY_MS = 2_500;
 const MAX_CLASSIFY_RETRIES = 8;
+// A job whose warm SSO session cannot complete human authentication would
+// otherwise be re-driven on every daemon re-offer and worker spin-up forever,
+// thrashing the provider (repeat navigations trip bot walls) and burning the
+// resolver. Cap authentication drives per browser session; past it the job is
+// reported human_auth_required (kept parked daemon-side, non-terminal) and no
+// longer opens broker tabs until a fresh launch clears the budget.
+const MAX_AUTH_ATTEMPTS = 3;
 // The alarm that wakes an idle MV3 worker to re-establish the daemon connection
 // so queued offers arrive without a keepalive tab or user activity. One minute
 // is Chrome's reliable floor for a packed extension; it bounds delivery latency.
@@ -379,6 +386,12 @@ export class Bridge {
   /** Per-job bounded reclassification attempts while a provider page renders.
    * Worker-local; cleared on a decisive verdict, download, or job removal. */
   private readonly classifyRetries = new Map<string, number>();
+  /** Broker-tab ids whose auth attempt is already counted, so the SSO redirect
+   * dance within one drive increments the budget only once. Worker-local. */
+  private readonly authCountedTabs = new Set<number>();
+  /** Jobs already reported human_auth_required this worker lifetime, so a capped
+   * job refreshes the daemon's human action at most once per spin-up. */
+  private readonly authStalledReported = new Set<string>();
 
   constructor(private readonly deps: BridgeDeps) {}
   trackedJobCount(): number {
@@ -450,6 +463,14 @@ export class Bridge {
       // instead of leaving the job pointed at a dead tab. Without a retained
       // offer URL there is nothing to reopen, so drop it.
       if (this.offerURLs.get(job.job_id) === undefined) {
+        await this.removeJobWithOffer(job.job_id);
+        continue;
+      }
+      if (this.authAttemptsFor(job.job_id) >= MAX_AUTH_ATTEMPTS) {
+        // Already failed to authenticate this job MAX_AUTH_ATTEMPTS times this
+        // session: surface the human step and leave it parked instead of
+        // re-queueing it into another doomed drive.
+        this.reportAuthStalled(job.job_id);
         await this.removeJobWithOffer(job.job_id);
         continue;
       }
@@ -692,6 +713,43 @@ export class Bridge {
       delete offerURLs[jobID];
       return { ...removeJob(s, jobID), offerURLs };
     });
+  }
+
+  /** Count at most one authentication attempt per broker-tab drive. The SSO
+   * redirect dance can toggle auth_pending several times within one tab, so the
+   * budget debounces on tab id; each fresh drive (a new tab from a re-offer or a
+   * reconcile re-queue) is a distinct attempt. Persisted so attempts accumulate
+   * across service-worker restarts within a browser session. */
+  private async noteAuthAttempt(jobID: string, tabID: number): Promise<void> {
+    if (this.authCountedTabs.has(tabID)) return;
+    this.authCountedTabs.add(tabID);
+    await this.update((s) => {
+      const authAttempts = { ...(s.authAttempts ?? {}) };
+      authAttempts[jobID] = (authAttempts[jobID] ?? 0) + 1;
+      return { ...s, authAttempts };
+    });
+  }
+
+  private authAttemptsFor(jobID: string): number {
+    return (this.store.authAttempts ?? {})[jobID] ?? 0;
+  }
+
+  /** Report the human authentication step for a capped job, at most once per
+   * worker lifetime. human_auth_required is non-terminal daemon-side: the job
+   * stays parked (awaiting_human) and is re-offered on a future warm launch. */
+  private reportAuthStalled(jobID: string): void {
+    if (this.authStalledReported.has(jobID)) return;
+    this.authStalledReported.add(jobID);
+    this.send("provider_outcome", { outcome: "human_auth_required" }, jobID);
+  }
+
+  /** Clear a job's auth-failure budget once a real download proves the session
+   * works, so an earlier expired-session streak cannot cap a now-valid job. */
+  private clearAuthAttempts(store: StoreShape, jobID: string): StoreShape {
+    if (store.authAttempts?.[jobID] === undefined) return store;
+    const authAttempts = { ...store.authAttempts };
+    delete authAttempts[jobID];
+    return { ...store, authAttempts };
   }
 
   private hasRecentAuthEvidence(): boolean {
@@ -949,6 +1007,16 @@ export class Bridge {
       }
     }
 
+    if (this.authAttemptsFor(jobID) >= MAX_AUTH_ATTEMPTS) {
+      // This browser session has driven the job through human authentication
+      // MAX_AUTH_ATTEMPTS times without a download: the warm session cannot
+      // complete it. Report the human step (once) and decline to open another
+      // broker tab. No job_reject — that is terminal; the job stays parked and
+      // is re-offered on a future launch with a fresh budget.
+      this.reportAuthStalled(jobID);
+      return;
+    }
+
     const now = this.deps.now();
     const expiresMs = Date.parse(expiresAt);
     const makeJob = (tabID: number, status: ActiveJob["status"] = "accepted"): ActiveJob => ({
@@ -1173,6 +1241,7 @@ export class Bridge {
           patchJob(s, job.job_id, { status: "auth_pending", auth_started_ms: this.deps.now() }),
         );
         this.send("auth_pending", {}, job.job_id);
+        await this.noteAuthAttempt(job.job_id, tabID);
       }
       return;
     }
@@ -1582,6 +1651,7 @@ export class Bridge {
 
   private async onTabRemoved(tabID: number): Promise<void> {
     await this.ready;
+    this.authCountedTabs.delete(tabID);
     if (this.closingTabs.delete(tabID)) return; // programmatic close, not a user cancel
     const job = findByTab(this.store, tabID);
     if (!job) return;
@@ -1689,7 +1759,10 @@ export class Bridge {
     const size = item.fileSize ?? item.totalBytes ?? item.bytesReceived ?? 0;
     if (filename.length === 0 || size < 1) return; // cannot form a valid frame; leave to the user
 
-    await this.update((s) => patchJob(s, owner.job_id, { status: "awaiting_download" }));
+    await this.update((s) =>
+      this.clearAuthAttempts(patchJob(s, owner.job_id, { status: "awaiting_download" }), owner.job_id),
+    );
+    this.authStalledReported.delete(owner.job_id);
     this.send("download_started", { download_id: delta.id, filename }, owner.job_id);
     this.send("download_complete", { download_id: delta.id, filename, size_bytes: size }, owner.job_id);
     this.completedDownloadTabs.set(owner.job_id, owner.tab_id);
