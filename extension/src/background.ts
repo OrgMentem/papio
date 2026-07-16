@@ -42,6 +42,7 @@ import {
   type AdapterSpec,
   type PageVerdict,
 } from "./adapters/types";
+import { takePendingFixtureFilename } from "./capture";
 import { observeUnknown } from "./observe";
 import { chromeKeepaliveAPI, initKeepalive, isAuthenticationURL } from "./keepalive";
 import { routeResolverService, type ResolverRoute } from "./resolver";
@@ -497,6 +498,13 @@ export class Bridge {
       return this.onDownloadChanged(delta);
     });
     this.deps.downloads.onDeterminingFilename?.addListener((item, suggest) => {
+      // Fixture writes are data: URLs whose `filename` Chrome ignores; relocate
+      // them to the enqueued papio-fixtures path before any job correlation.
+      const fixtureName = takePendingFixtureFilename(item.url ?? "");
+      if (fixtureName) {
+        suggest({ filename: fixtureName, conflictAction: "uniquify" });
+        return;
+      }
       // The event can race on either side of downloads.download resolving:
       // use its exact returned ID after resolution, or the pending URL before.
       // Host fallback remains fail-closed when several jobs share a provider.

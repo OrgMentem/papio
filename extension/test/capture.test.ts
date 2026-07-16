@@ -8,9 +8,11 @@ import { expect, test } from "bun:test";
 
 import {
   captureFixture,
+  downloadFixture,
   MAX_CAPTURE_BYTES,
   sanitizeFixture,
   residualLeak,
+  takePendingFixtureFilename,
   type ChromeCaptureApi,
   type FixtureMeta,
   type PageCapture,
@@ -196,6 +198,24 @@ test("capture downloads sanitized HTML at the versioned fixture path", async () 
   expect(decoded).toBe(expected);
   expect(decoded).not.toContain("?tk="); // the download link's query is gone
   expect(decoded.startsWith("<!-- papio-fixture ")).toBe(true);
+});
+
+test("fixture writes enqueue their path for onDeterminingFilename (data: URLs ignore filename)", async () => {
+  // Chrome ignores downloads.download's filename for data: URLs, so the intended
+  // path must be recoverable by the onDeterminingFilename listener.
+  // Drain any residue enqueued by other tests (module-level FIFO queue).
+  while (takePendingFixtureFilename("data:text/html") !== undefined) {
+    /* drain */
+  }
+  const { api } = fakeChrome(CLEAN_PAGE);
+  await downloadFixture(api, "papio-fixtures/observed/www.jstor.org/2026.html", "<p>x</p>");
+  const dataUrl = "data:text/html;charset=utf-8,%3Cp%3Ex%3C%2Fp%3E";
+
+  // A non-fixture (real) download is never relocated by the fixture queue.
+  expect(takePendingFixtureFilename("https://www.jstor.org/stable/pdf/1.pdf")).toBeUndefined();
+  // The fixture download's intended path is dequeued once, then drained.
+  expect(takePendingFixtureFilename(dataUrl)).toBe("papio-fixtures/observed/www.jstor.org/2026.html");
+  expect(takePendingFixtureFilename(dataUrl)).toBeUndefined();
 });
 
 test("capture masks a token-shaped provider path before writing", async () => {

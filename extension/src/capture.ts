@@ -368,6 +368,20 @@ export interface ChromeCaptureApi {
   };
 }
 
+/** Chrome ignores downloads.download's `filename` for `data:` URLs, so fixture
+ * writes would land as `download (N).html`. downloadFixture enqueues the
+ * intended relative path here; the background onDeterminingFilename listener
+ * dequeues it to relocate the file. FIFO is safe because fixture writes are
+ * serialized (observe queue) and manual capture is a discrete user gesture. */
+const pendingFixtureFilenames: string[] = [];
+
+/** Dequeue the intended path for a fixture `data:` download, for the
+ * onDeterminingFilename listener. Non-fixture downloads pass through untouched. */
+export function takePendingFixtureFilename(url: string): string | undefined {
+  if (!url.startsWith("data:text/html")) return undefined;
+  return pendingFixtureFilenames.shift();
+}
+
 /** Write already-sanitized fixture HTML through Chrome's download manager. Both
  * manual captures and auto-observations use this exact final write path. */
 export async function downloadFixture(
@@ -376,6 +390,9 @@ export async function downloadFixture(
   sanitized: string,
 ): Promise<{ downloadId: number; filename: string }> {
   const url = `data:text/html;charset=utf-8,${encodeURIComponent(sanitized)}`;
+  // Chrome ignores `filename` for data: URLs; the onDeterminingFilename listener
+  // relocates the file using this enqueued path.
+  pendingFixtureFilenames.push(filename);
   const downloadId = await api.downloads.download({
     url,
     filename,
