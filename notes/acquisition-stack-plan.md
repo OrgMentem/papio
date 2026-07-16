@@ -822,11 +822,15 @@ Root gaps fixed this session (all committed, 118 tests pass): `fe0a643` (settleT
 
 `1d40d30` makes the one remaining human step optional with informed consent. A durable, revocable `chrome.storage.local` consent (`accept`/`manual`/unset) gates auto-clicking the publisher terms modal: on the first terms gate the popup shows a one-time consent card (clear caution that papio agrees to each publisher's T&C on the user's behalf); the options page toggles it anytime. When `accept`, `applyVerdict`'s `terms` case injects `clickTermsAccept` (accept control found by accessible text in the open modal) → the PDF opens → viewer-tab adoption imports it, fully hands-free. Granting consent re-drives already-pending terms gates. No new protocol frame (the download events are the audit trail). 122 tests pass; consent storage round-trip verified live via CDP. With consent on, JSTOR needs zero human steps.
 
+### Observe fixture write-path FIXED (2026-07-16)
+
+`05705d6`. Chrome ignores `downloads.download`'s `filename` for `data:` URLs, so every observe fixture had been landing as `~/Downloads/download (N).html` — silently misfiling the whole flywheel corpus. Fix: `downloadFixture` enqueues the intended path; the `onDeterminingFilename` listener dequeues it (before job-PDF correlation) and `suggest()`s it, which Chrome honors for `data:` URLs. Live-verified via CDP: a ScienceDirect capture filed to `papio-fixtures/observed/sciencedirect-com/<ts>.html` (21 KB, valid provenance header), zero strays. **Unblocks Elsevier/ACM adapter-building.** Note: the observe rate limiter (5/host/day, in `chrome.storage.local`) can mask captures — clear `papio_observed_capture_rate_v1` when testing.
+
 ### Next (updated 2026-07-16, post-CDP)
 
 1. Harden tab tracking across re-offer/restart/session-restore: reconcile tracked `tab_id`s against live tabs (by offer-URL) and adopt `"unloaded"` restored provider tabs, so churn/real-world Chrome restarts don't strand jobs on dead tabs (this caused the earlier "12 jobs stuck" mirage).
-2. Verify `observeUnknown` writes fixtures to `papio-fixtures/observed/` (not the plain Downloads folder); then build Elsevier + ACM adapters from captures.
-3. Add `oup.com`/`cell.com` to `verifiedProviderHosts` alongside adapter/observe proof.
+2. Fix MV3 worker cold-start dormancy: with no keepalive tab the worker sleeps and daemon offers never land; add alarms-based keepalive when jobs are pending or a daemon-side reconnect nudge.
+3. Build Elsevier + ACM adapters from real observe captures (now that fixtures file correctly); add `oup.com`/`cell.com` to `verifiedProviderHosts` with proof.
 4. Re-pin the packed extension ID after adapters land; signing/notarization + Web Store when credentials exist; instsci fork archival on approval.
 
 Reusable CDP harness for autonomous extension debugging: copy profile + manifest → launch binary with `--user-data-dir=<copy> --remote-debugging-port=<port>` → connect a CDP client → `browser.targets()` find the `service_worker` → `worker().evaluate(...)` reads `chrome.storage.session`/`chrome.tabs`/`chrome.downloads` and injects into pages. This is the way to observe MV3 SW state the default profile hides.
