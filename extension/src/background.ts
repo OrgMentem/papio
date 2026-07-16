@@ -1806,9 +1806,9 @@ function realDeps(): BridgeDeps {
       },
     },
     alarms: {
-      create: (name, info) => chrome.alarms.create(name, info),
+      create: (name, info) => chrome.alarms?.create(name, info),
       onAlarm: {
-        addListener: (cb) => chrome.alarms.onAlarm.addListener(cb),
+        addListener: (cb) => chrome.alarms?.onAlarm?.addListener(cb),
       },
     },
   };
