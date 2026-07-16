@@ -836,10 +836,16 @@ Root gaps fixed this session (all committed, 118 tests pass): `fe0a643` (settleT
 
 **Reliability spine (Tier 1) complete:** fixture write-path (`05705d6`), tab reconciliation (`bbc7163`), cold-start dormancy (`026944b`).
 
+### ACM adapter + OUP/Cell hosts (2026-07-16)
+
+`d903043` (ACM adapter), `e607a5b` (oup.com/cell.com verified hosts), `dfec5d9` (defensive `chrome.alarms` guard — a missing permission no longer bricks the worker). ACM entitled article pages expose `a#downloadPdfUrl[data-doi]` whose href is the direct entitled PDF (`/doi/pdf/<doi>?download=true`); href-method adapter classifies article on `meta[publication_doi]` + that anchor. Verified live via CDP: article rule matches live `dl.acm.org` DOM, extracted href downloads a real 1.98 MB PDF; fixture + drift tests (132 pass). Non-entitled ACM → unknown (no isolated capture). `oup.com`/`cell.com` added to `verifiedProviderHosts` so JAMIA/Heliyon landings are observed + viewer-tab-adoptable.
+
+**ScienceDirect/Elsevier DEFERRED:** Cloudflare bot-challenges the CDP-driven browser ("Just a moment…"), so no entitled DOM is capturable under automation — even the earlier flywheel "capture" was a Cloudflare page. Needs a real-user observe-flywheel capture (a human session doesn't trip Cloudflare), then a 4-line spec addition.
+
 ### Next (updated 2026-07-16, post-CDP)
 
-1. Build Elsevier + ACM adapters from real observe captures (fixtures now file correctly); add `oup.com`/`cell.com` to `verifiedProviderHosts` with proof.
+1. ScienceDirect/Elsevier adapter from a real-user observe capture (Cloudflare blocks automated capture). ACM's viewer/href pattern + the fixture write-path are ready to receive it.
 2. Re-pin the packed extension ID after adapters land; signing/notarization + Web Store when credentials exist; instsci fork archival on approval.
-3. When deploying the `alarms` permission to the real profile, reload the extension via `chrome://extensions` (or restart Chrome) so Chrome grants the new permission — `chrome.runtime.reload()` alone does not re-read permissions.
+3. When deploying the `alarms` permission to the real profile, reload via `chrome://extensions` (or restart Chrome) so Chrome grants it — `chrome.runtime.reload()` alone does not re-read permissions.
 
 Reusable CDP harness for autonomous extension debugging: copy profile + manifest → launch binary with `--user-data-dir=<copy> --remote-debugging-port=<port>` → connect a CDP client → `browser.targets()` find the `service_worker` → `worker().evaluate(...)` reads `chrome.storage.session`/`chrome.tabs`/`chrome.downloads` and injects into pages. This is the way to observe MV3 SW state the default profile hides.
