@@ -225,6 +225,40 @@ func TestBuildReportClassifiesLatestAutoImportOutcome(t *testing.T) {
 	}
 }
 
+func TestBuildReportClassifiesNoOpAsExistingItem(t *testing.T) {
+	// A no_op auto-import means the work already exists in the library
+	// (deduplicated by the exports ledger). It must report as a terminal
+	// existing-item outcome, never as perpetually in-progress.
+	manifest := &Manifest{
+		SchemaVersion: SchemaVersion,
+		ID:            "batch-noop",
+		CreatedAt:     "2026-07-15T12:00:00Z",
+		Works: []ManifestWork{
+			manifestWork("wr-noop", "job-noop", "submitted", "Already in library"),
+		},
+	}
+	jobs := fakeJobs{
+		rows: map[string]*job.Row{
+			"job-noop": reportRow("job-noop", job.StateReady, ""),
+		},
+		events: map[string][]map[string]any{
+			"job-noop": {
+				{"kind": "zotio.auto_import", "detail": map[string]any{"status": "no_op", "parent_key": "PA999"}},
+			},
+		},
+	}
+	report, err := BuildReport(context.Background(), manifest, jobs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := report.Works[0]; got.Outcome != OutcomeExistingItemAttached || got.ParentKey != "PA999" {
+		t.Fatalf("no_op auto import = %+v, want existing_item_attached with parent PA999", got)
+	}
+	if report.Summary.Outcomes[OutcomeInProgress] != 0 {
+		t.Fatalf("no_op misclassified as in_progress: %+v", report.Summary)
+	}
+}
+
 func TestMarkdownRendersImportFailedErrorClassAndHint(t *testing.T) {
 	report := &Report{
 		BatchID: "batch-deadbeef",

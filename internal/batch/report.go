@@ -388,6 +388,12 @@ func buildWorkReport(ctx context.Context, manifestWork ManifestWork, jobs Jobs, 
 			} else {
 				item.Outcome = OutcomeImported
 			}
+		case autoImport.Status == "no_op" || autoImport.Status == "duplicate":
+			// The apply mutated nothing: the work already exists in the library,
+			// deduplicated by the exports-ledger idempotency key. That is a
+			// terminal success ("already in your library"), not in-progress.
+			item.Outcome = OutcomeExistingItemAttached
+			item.ParentKey = autoImport.ParentKey
 		default:
 			item.Outcome, item.Reason = OutcomeInProgress, job.StateReady
 		}
