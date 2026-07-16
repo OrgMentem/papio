@@ -369,4 +369,26 @@ export const adapters: AdapterSpec[] = [
       method: "href",
     },
   },
+  {
+    // Verified live 2026-07-16 against an entitled ACM Digital Library article
+    // (fixtures/acm/success.html). The download anchor's id + data-doi are
+    // stable and its href is the direct entitled PDF (?download=true), fetched
+    // via the browser cookie jar. No isolated no-entitlement capture was
+    // available at build time, so non-entitled ACM pages classify unknown and
+    // stay assisted rather than risk a wrong verdict.
+    id: "acm",
+    version: "0.1.0",
+    hosts: ["dl.acm.org"],
+    classify: [
+      {
+        kind: "article",
+        all: ["meta[name='publication_doi']", "a#downloadPdfUrl[data-doi][href*='/doi/pdf/']"],
+      },
+    ],
+    download: {
+      selector: "a#downloadPdfUrl[data-doi][href*='/doi/pdf/']",
+      requireKind: "article",
+      method: "href",
+    },
+  },
 ];
