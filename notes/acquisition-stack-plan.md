@@ -818,6 +818,10 @@ adapter classifies `article` → clicks download (autonomous) → **[human accep
 
 Root gaps fixed this session (all committed, 118 tests pass): `fe0a643` (settleTimeoutMs + classify-on-auth-return), `7676b37` (bounded reclassify retry), `813dc82` (viewer-tab PDF adoption). The **only** non-automated step in JSTOR is accepting its terms modal (a deliberate legal gesture JSTOR gates behind a trusted click); everything before and after is now automatic.
 
+### Opt-in terms auto-accept (2026-07-16)
+
+`1d40d30` makes the one remaining human step optional with informed consent. A durable, revocable `chrome.storage.local` consent (`accept`/`manual`/unset) gates auto-clicking the publisher terms modal: on the first terms gate the popup shows a one-time consent card (clear caution that papio agrees to each publisher's T&C on the user's behalf); the options page toggles it anytime. When `accept`, `applyVerdict`'s `terms` case injects `clickTermsAccept` (accept control found by accessible text in the open modal) → the PDF opens → viewer-tab adoption imports it, fully hands-free. Granting consent re-drives already-pending terms gates. No new protocol frame (the download events are the audit trail). 122 tests pass; consent storage round-trip verified live via CDP. With consent on, JSTOR needs zero human steps.
+
 ### Next (updated 2026-07-16, post-CDP)
 
 1. Harden tab tracking across re-offer/restart/session-restore: reconcile tracked `tab_id`s against live tabs (by offer-URL) and adopt `"unloaded"` restored provider tabs, so churn/real-world Chrome restarts don't strand jobs on dead tabs (this caused the earlier "12 jobs stuck" mirage).
