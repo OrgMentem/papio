@@ -59,6 +59,8 @@ var verifiedProviderHosts = []string{
 	"tandfonline.com",
 	"sagepub.com",
 	"apa.org",
+	"oup.com",
+	"cell.com",
 }
 
 // resolverHost returns the hostname of the OpenURL base; it joins the verified
