@@ -425,6 +425,7 @@ export class Bridge {
     });
     await this.ready;
     await this.reconcileTabs();
+    await this.redrivePendingTermsGates();
     for (const job of this.store.activeJobs) {
       if (job.status === "queued") this.scheduleQueuedHandoffRelease(job.job_id);
     }
@@ -509,13 +510,36 @@ export class Bridge {
   async requestTermsConsent(value: Exclude<TermsConsent, undefined>): Promise<void> {
     await this.ready;
     await this.deps.settings.setTermsConsent(value);
-    const flagged = this.store.activeJobs.filter((j) => j.needs_terms_consent === true).map((j) => j.job_id);
+    if (value !== "accept") {
+      // User declined auto-accept: clear the one-time prompt flag so the popup
+      // stops asking; any open gate stays assisted.
+      for (const jobID of this.store.activeJobs.filter((j) => j.needs_terms_consent === true).map((j) => j.job_id)) {
+        await this.update((s) => patchJob(s, jobID, { needs_terms_consent: false }));
+      }
+      return;
+    }
+    await this.redrivePendingTermsGates();
+  }
+
+  /** Re-drive every job still parked at a terms gate now that consent is
+   * "accept": clear the one-time prompt flag and re-run classification on the
+   * live provider tab so an open terms modal is accepted and the download
+   * completes without a second visit. Runs when the user grants consent AND on
+   * worker startup, so a grant that landed while the worker was asleep (missing
+   * the one-shot re-drive) still completes on the next connect. Idempotent: a
+   * job with no live tab or an already-closed modal is a no-op. */
+  private async redrivePendingTermsGates(): Promise<void> {
+    if ((await this.deps.settings.getTermsConsent()) !== "accept") return;
+    const flagged = this.store.activeJobs
+      .filter((j) => j.needs_terms_consent === true && j.tab_id >= 0)
+      .map((j) => j.job_id);
     for (const jobID of flagged) {
       await this.update((s) => patchJob(s, jobID, { needs_terms_consent: false }));
-    }
-    if (value !== "accept") return;
-    for (const jobID of flagged) {
-      await this.reclassifyCurrentProviderPage(jobID);
+      try {
+        await this.reclassifyCurrentProviderPage(jobID);
+      } catch (e) {
+        console.error("papio: terms re-drive failed; staying assisted", e);
+      }
     }
   }
 

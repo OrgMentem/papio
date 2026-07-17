@@ -637,6 +637,27 @@ test("declining consent records manual and never auto-accepts", async () => {
   expect(h.scripting.termsAccepts.length).toBe(0);
 });
 
+test("startup re-drives a pending terms gate when consent was granted while asleep", async () => {
+  // The consent grant's one-shot re-drive can miss a job if the worker was
+  // asleep when the popup message arrived. On the next connect, startup must
+  // re-drive any still-flagged gate now that consent is "accept".
+  const h = makeMapHarness([TERMS_SPEC]);
+  h.scripting.verdict = termsVerdict; // consent undefined -> flags the gate
+  await h.bridge.start();
+  await h.port.inbound(offer("job_terms_wake_0001"));
+  await landOnProvider(h, "job_terms_wake_0001");
+  expect(h.backend.store.activeJobs[0]?.needs_terms_consent).toBe(true);
+  expect(h.scripting.termsAccepts.length).toBe(0);
+
+  // Consent recorded directly (popup wrote it) while the one-shot re-drive
+  // never ran for this job — it stays flagged with its tab still open.
+  h.settings.consent = "accept";
+  await h.bridge.start(); // worker wakes
+
+  expect(h.backend.store.activeJobs[0]?.needs_terms_consent).toBe(false);
+  expect(h.scripting.termsAccepts.length).toBeGreaterThanOrEqual(1);
+});
+
 test("startup reconciliation re-queues a job whose pre-download tab vanished", async () => {
   // A tab closed while the worker slept never fired onTabRemoved, so the job
   // still points at a dead tab. Reconcile must recover it, not strand it.
