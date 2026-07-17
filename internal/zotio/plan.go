@@ -195,10 +195,11 @@ func (s *Service) planJob(ctx context.Context, jobID string) (*Plan, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := s.recordPlan(ctx, idempotencyKey, path, plan); err != nil {
+	recorded, err := s.recordPlan(ctx, idempotencyKey, path, plan)
+	if err != nil {
 		return nil, err
 	}
-	return plan, nil
+	return recorded, nil
 }
 
 // Apply verifies the immutable plan, artifact content address, and explicit
@@ -234,10 +235,19 @@ func (s *Service) Apply(ctx context.Context, planID, confirmation string) (*Appl
 	}
 	if !claimed {
 		result, recordErr := s.recordedApply(ctx, idempotencyKey)
+		if recordErr != nil {
+			return nil, recordErr
+		}
 		if result != nil {
 			s.fileCollection(ctx, plan, result)
+			return result, nil
 		}
-		return result, recordErr
+		// Another worker holds the reservation but has not recorded a result
+		// yet: the mutation is in flight. Returning (nil,nil) would let
+		// PlanAndApply synthesize a spurious 'failed' while the real Zotero
+		// write is still running, which outer retry could turn into a duplicate
+		// or contended mutation. Surface an explicit retryable conflict.
+		return nil, WithErrorInfo(fmt.Errorf("Zotio apply reservation for plan %s is in progress: %w", plan.ID, job.ErrConflict))
 	}
 
 	out, commandErr := s.CLI.RunJSON(ctx, plan.ApplyArgs...)
@@ -588,15 +598,30 @@ func (s *Service) recordedPlan(ctx context.Context, key string) (*Plan, error) {
 	return s.LoadPlan(strings.TrimSuffix(filepath.Base(path), ".json"))
 }
 
-func (s *Service) recordPlan(ctx context.Context, key, path string, plan *Plan) error {
+func (s *Service) recordPlan(ctx context.Context, key, path string, plan *Plan) (*Plan, error) {
 	encoded, err := json.Marshal(plan)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	_, err = s.Store.DB().ExecContext(ctx,
-		`INSERT INTO exports (job_id, kind, idempotency_key, path, result_json, created_at) VALUES (?, 'zotio_plan', ?, ?, ?, ?)`,
-		plan.JobID, key, path, string(encoded), store.Now())
-	return err
+	if _, err := s.Store.DB().ExecContext(ctx,
+		`INSERT INTO exports (job_id, kind, idempotency_key, path, result_json, created_at)
+		 VALUES (?, 'zotio_plan', ?, ?, ?, ?)
+		 ON CONFLICT(idempotency_key) DO NOTHING`,
+		plan.JobID, key, path, string(encoded), store.Now()); err != nil {
+		return nil, err
+	}
+	// A concurrent PlanJobs for the same key may have inserted first; the plain
+	// INSERT would otherwise fail on the unique idempotency_key. Re-read and
+	// return the canonical recorded plan so duplicate callers converge on one
+	// plan instead of erroring or diverging on plan ID.
+	recorded, err := s.recordedPlan(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	if recorded == nil {
+		return plan, nil
+	}
+	return recorded, nil
 }
 
 func (s *Service) recordFailedApplyAndInvalidatePlan(ctx context.Context, key string, plan *Plan, zotio json.RawMessage, applyErr error) error {

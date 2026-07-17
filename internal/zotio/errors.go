@@ -21,6 +21,7 @@ const (
 	ErrorClassZoteroFieldValidation    = "zotero_field_validation"
 	ErrorClassMirrorSyncFailed         = "mirror_sync_failed"
 	ErrorClassZotioExecTimeout         = "zotio_exec_timeout"
+	ErrorClassZotioCanceled            = "zotio_canceled"
 	ErrorClassZotioNotConfigured       = "zotio_not_configured"
 	ErrorClassPlanConfirmationMismatch = "plan_confirmation_mismatch"
 	ErrorClassReservationConflict      = "reservation_conflict"
@@ -118,6 +119,9 @@ func ClassifyError(err error, envelopes ...json.RawMessage) ErrorInfo {
 	if strings.Contains(lower, "unknown item field") {
 		return safeErrorInfo(ErrorClassZoteroFieldValidation, "unknown item field", 0)
 	}
+	if errors.Is(err, context.Canceled) || strings.Contains(lower, "zotio command canceled") {
+		return safeErrorInfo(ErrorClassZotioCanceled, "Zotio command canceled", 0)
+	}
 	if strings.Contains(lower, "zotio command timed out") || errors.Is(err, context.DeadlineExceeded) {
 		return safeErrorInfo(ErrorClassZotioExecTimeout, "Zotio command timed out", 0)
 	}
@@ -157,6 +161,7 @@ func IsErrorClass(class string) bool {
 		ErrorClassZoteroFieldValidation,
 		ErrorClassMirrorSyncFailed,
 		ErrorClassZotioExecTimeout,
+		ErrorClassZotioCanceled,
 		ErrorClassZotioNotConfigured,
 		ErrorClassPlanConfirmationMismatch,
 		ErrorClassReservationConflict,

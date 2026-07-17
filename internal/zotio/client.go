@@ -343,8 +343,16 @@ func (c *Client) run(ctx context.Context, args ...string) ([]byte, error) {
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	err = cmd.Run()
-	if ctx.Err() != nil {
-		return nil, fmt.Errorf("zotio command timed out after %s", timeout)
+	// context.Canceled (parent/daemon shutdown) and context.DeadlineExceeded
+	// (real timeout) both surface through ctx.Err(); they must not collapse into
+	// one retryable "timed out" outcome. Preserve stdout on either path so
+	// RunJSON can still recover a mutation envelope the CLI already wrote before
+	// being killed, avoiding an ambiguous in-flight reservation.
+	if cause := ctx.Err(); cause != nil {
+		if errors.Is(cause, context.Canceled) {
+			return stdout.Bytes(), fmt.Errorf("zotio command canceled: %w", cause)
+		}
+		return stdout.Bytes(), fmt.Errorf("zotio command timed out after %s: %w", timeout, cause)
 	}
 	if stdout.overflow {
 		return nil, fmt.Errorf("zotio stdout exceeds %d bytes", maxStdoutBytes)

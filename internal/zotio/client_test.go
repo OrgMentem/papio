@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"os"
 	"strings"
 	"testing"
 )
@@ -178,5 +180,48 @@ func TestBoundedBufferReportsOverflowWithoutShortWrite(t *testing.T) {
 	n, err := buffer.Write(input)
 	if err != nil || n != len(input) || !buffer.overflow || buffer.String() != "abcd" {
 		t.Fatalf("write = (%d, %v), buffer=%q overflow=%v", n, err, buffer.String(), buffer.overflow)
+	}
+}
+
+func TestRunCanceledContextClassifiesAsCancelNotTimeout(t *testing.T) {
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A real exec path is required: when c.Exec is set run() returns before the
+	// ctx.Err() branch, so this drives the production LookPath/CommandContext
+	// code that must distinguish cancellation from a genuine timeout.
+	client := &Client{Executable: self}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, runErr := client.RunJSON(ctx, "--agent", "noop")
+	if runErr == nil {
+		t.Fatal("canceled context returned no error")
+	}
+	if !strings.Contains(runErr.Error(), "zotio command canceled") || strings.Contains(runErr.Error(), "timed out") {
+		t.Fatalf("run error = %v, want cancel wording not timeout", runErr)
+	}
+	if !errors.Is(runErr, context.Canceled) {
+		t.Fatalf("run error does not wrap context.Canceled: %v", runErr)
+	}
+	if info := ErrorInfoFrom(runErr); info.Class != ErrorClassZotioCanceled {
+		t.Fatalf("class = %q, want %q", info.Class, ErrorClassZotioCanceled)
+	}
+}
+
+func TestRunJSONPreservesEnvelopeOnCancelError(t *testing.T) {
+	envelope := `{"ok":false,"mode":"apply","result":{"summary":{"applied":1}}}`
+	client := &Client{Executable: "zotio", Exec: func(_ context.Context, _ ...string) ([]byte, error) {
+		return []byte(envelope), fmt.Errorf("zotio command canceled: %w", context.Canceled)
+	}}
+	out, err := client.RunJSON(context.Background(), "--agent", "--yes", "import", "apply")
+	if err == nil {
+		t.Fatal("expected non-nil run error alongside preserved envelope")
+	}
+	if !strings.Contains(string(out), `"applied":1`) {
+		t.Fatalf("envelope not preserved on cancel: out=%s", out)
+	}
+	if info := ErrorInfoFrom(err); info.Class != ErrorClassZotioCanceled {
+		t.Fatalf("class = %q, want %q", info.Class, ErrorClassZotioCanceled)
 	}
 }

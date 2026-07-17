@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"strings"
 	"testing"
@@ -56,6 +57,30 @@ func TestSanitizeErrorHintStripsURLsAndPaths(t *testing.T) {
 	hint := SanitizeErrorHint("request https://zotero.example.test/users/42 at /Users/reader/private/papio.db C:\\Users\\reader\\papio.db failed")
 	if strings.ContainsAny(hint, "/\\") || strings.Contains(hint, "zotero.example.test") || strings.Contains(hint, "reader") {
 		t.Fatalf("SanitizeErrorHint leaked private detail: %q", hint)
+	}
+}
+
+func TestClassifyErrorDistinguishesCancelFromTimeout(t *testing.T) {
+	cases := []struct {
+		name      string
+		err       error
+		wantClass string
+		wantHint  string
+	}{
+		{"wrapped context canceled", fmt.Errorf("zotio command canceled: %w", context.Canceled), ErrorClassZotioCanceled, "Zotio command canceled"},
+		{"bare context canceled", context.Canceled, ErrorClassZotioCanceled, "Zotio command canceled"},
+		{"canceled message only", errors.New("zotio command canceled"), ErrorClassZotioCanceled, "Zotio command canceled"},
+		{"wrapped deadline exceeded", fmt.Errorf("zotio command timed out after 30s: %w", context.DeadlineExceeded), ErrorClassZotioExecTimeout, "Zotio command timed out"},
+		{"bare deadline exceeded", context.DeadlineExceeded, ErrorClassZotioExecTimeout, "Zotio command timed out"},
+		{"timeout message only", errors.New("zotio command timed out after 2m0s"), ErrorClassZotioExecTimeout, "Zotio command timed out"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			info := ClassifyError(tc.err)
+			if info.Class != tc.wantClass || info.Hint != tc.wantHint {
+				t.Fatalf("ClassifyError() = %+v, want class=%q hint=%q", info, tc.wantClass, tc.wantHint)
+			}
+		})
 	}
 }
 

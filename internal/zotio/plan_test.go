@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -531,5 +532,109 @@ func TestPlanAndApplyAutoEnrichCanBeDisabled(t *testing.T) {
 	}
 	if cli.enrichCalls != 0 {
 		t.Fatalf("disabled auto-enrich calls = %d, want 0", cli.enrichCalls)
+	}
+}
+
+// lockedCLI serializes planCLI access so concurrent Service calls exercise the
+// exports-ledger conflict handling without racing the fake CLI's counters.
+type lockedCLI struct {
+	mu    sync.Mutex
+	inner *planCLI
+}
+
+func (c *lockedCLI) Preflight(ctx context.Context) (*PreflightResult, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.inner.Preflight(ctx)
+}
+func (c *lockedCLI) MissingPDF(ctx context.Context, collection string, limit int) ([]MissingPDFItem, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.inner.MissingPDF(ctx, collection, limit)
+}
+func (c *lockedCLI) GetItem(ctx context.Context, key string) (*Item, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.inner.GetItem(ctx, key)
+}
+func (c *lockedCLI) Sync(ctx context.Context) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.inner.Sync(ctx)
+}
+func (c *lockedCLI) RunJSON(ctx context.Context, args ...string) (json.RawMessage, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.inner.RunJSON(ctx, args...)
+}
+
+func TestPlanJobsConcurrentSameJobConverge(t *testing.T) {
+	inner := &planCLI{
+		preview: `{"ok":true,"mode":"preview","plan":{"summary":{"planned":1,"no_op":0,"invalid":0}},"result":null}`,
+	}
+	service, jobID := readyPlanService(t, "AB12CD34", &lockedCLI{inner: inner})
+
+	// Materialize the bundle artifact once up front: bundle export uses an
+	// O_EXCL create that is not concurrency-safe for the same job, an FS concern
+	// unrelated to the exports-ledger convergence under test. Warming it (idempotent
+	// once the file exists) lets both goroutines reach recordPlan's ON CONFLICT path.
+	if _, _, err := service.Bundle.Export(context.Background(), jobID, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+	plans := make([][]*Plan, 2)
+	errs := make([]error, 2)
+	start := make(chan struct{})
+	for i := range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			plans[i], errs[i] = service.PlanJobs(context.Background(), []string{jobID})
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	for i := range 2 {
+		if errs[i] != nil {
+			t.Fatalf("PlanJobs[%d] err = %v", i, errs[i])
+		}
+		if len(plans[i]) != 1 || plans[i][0].ID == "" {
+			t.Fatalf("PlanJobs[%d] = %+v", i, plans[i])
+		}
+	}
+	// Both concurrent callers must converge on one canonical recorded plan
+	// rather than one failing on the unique idempotency_key constraint.
+	if plans[0][0].ID != plans[1][0].ID {
+		t.Fatalf("plans diverged: %s vs %s", plans[0][0].ID, plans[1][0].ID)
+	}
+	var planRows int
+	if err := service.Store.DB().QueryRow(`SELECT count(*) FROM exports WHERE kind='zotio_plan'`).Scan(&planRows); err != nil {
+		t.Fatal(err)
+	}
+	if planRows != 1 {
+		t.Fatalf("ledger zotio_plan rows = %d, want 1", planRows)
+	}
+}
+
+func TestApplyInFlightReservationConflictIsRetryable(t *testing.T) {
+	// Apply's in-flight reservation branch must surface an explicit retryable
+	// conflict instead of (nil,nil): the error wraps job.ErrConflict and
+	// classifies as a reservation conflict so outer retry logic backs off
+	// rather than synthesizing a spurious failure over an in-flight mutation.
+	err := WithErrorInfo(fmt.Errorf("Zotio apply reservation for plan %s is in progress: %w", "zplan_deadbeefdeadbeefdeadbeef01", job.ErrConflict))
+	if err == nil {
+		t.Fatal("expected non-nil retryable conflict error")
+	}
+	if !errors.Is(err, job.ErrConflict) {
+		t.Fatalf("error is not errors.Is job.ErrConflict: %v", err)
+	}
+	if info := ErrorInfoFrom(err); info.Class != ErrorClassReservationConflict {
+		t.Fatalf("class = %q, want %q", info.Class, ErrorClassReservationConflict)
+	}
+	if !strings.Contains(err.Error(), "reservation for plan") || !strings.Contains(err.Error(), "is in progress") {
+		t.Fatalf("message = %q", err.Error())
 	}
 }
