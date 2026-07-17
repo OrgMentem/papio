@@ -339,13 +339,19 @@ func (b *Bridge) scanAdoptionDir(_ context.Context, jobID string) (string, bool)
 // SweepAdoptions adopts any settled file sitting in a parked handoff job's
 // adoption directory, independently of whether the extension is connected or
 // has said hello. This makes directory adoption self-driving: the daemon owns
-// completion, the browser plane is only a delivery hint. It never emits frames
-// and never opens offers. Safe to call on a timer.
+// completion, the browser plane is only a delivery hint. It scans the adoption
+// root directly rather than the newest-N job list, so a settled download is
+// never missed behind a large handoff backlog. It never emits frames or opens
+// offers. Safe to call on a timer.
 func (b *Bridge) SweepAdoptions(ctx context.Context) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	awaiting, err := b.jobs.List(ctx, job.StateAwaitingHuman, 200)
+	root := b.cfg.EffectiveAdoptionRoot()
+	entries, err := os.ReadDir(root)
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
 		return err
 	}
 	actions, err := b.jobs.ListHumanActions(ctx, true)
@@ -358,17 +364,24 @@ func (b *Bridge) SweepAdoptions(ctx context.Context) error {
 			handoff[a.JobID] = true
 		}
 	}
-	for i := range awaiting {
-		row := awaiting[i]
-		if !handoff[row.ID] {
+	for _, e := range entries {
+		if !e.IsDir() || e.Name() == "rejected" {
 			continue
 		}
-		name, ok := b.scanAdoptionDir(ctx, row.ID)
+		jobID := e.Name()
+		if !handoff[jobID] {
+			continue // no open handoff action: not an adoptable handoff job
+		}
+		row, err := b.jobs.Get(ctx, jobID)
+		if err != nil || row == nil || row.State != job.StateAwaitingHuman {
+			continue
+		}
+		name, ok := b.scanAdoptionDir(ctx, jobID)
 		if !ok {
 			continue
 		}
-		if err := b.adopt(ctx, row.ID, name); err != nil {
-			if evErr := b.jobs.S.AppendEvent(ctx, row.ID, "browser.adoption_deferred",
+		if err := b.adopt(ctx, jobID, name); err != nil {
+			if evErr := b.jobs.S.AppendEvent(ctx, jobID, "browser.adoption_deferred",
 				map[string]any{"filename": name, "reason": truncate(err.Error(), 200)}); evErr != nil {
 				return evErr
 			}
@@ -377,7 +390,43 @@ func (b *Bridge) SweepAdoptions(ctx context.Context) error {
 	return nil
 }
 
-// RunSweeper calls SweepAdoptions on an interval until ctx is cancelled.
+// SweepTerminalAdoptions removes the per-job adoption landing directory of any
+// terminal job. A ready job's PDF has already been promoted into the immutable
+// artifact store (Zotero imports from there, never from the landing copy), and
+// cancelled/failed/unavailable jobs never produced anything the user needs from
+// this directory, so the landing bytes are pure disk growth. Non-terminal jobs
+// are load-bearing and never swept: awaiting_human handoffs may still receive a
+// download, and needs_review inspection files are referenced by open actions.
+// The rejected/ sibling directory, which deliberately preserves files a human
+// must re-supply, is left untouched. Best-effort, idempotent, and safe on a
+// timer.
+func (b *Bridge) SweepTerminalAdoptions(ctx context.Context) error {
+	root := b.cfg.EffectiveAdoptionRoot()
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	for _, e := range entries {
+		if !e.IsDir() || e.Name() == "rejected" {
+			continue
+		}
+		row, err := b.jobs.Get(ctx, e.Name())
+		if err != nil || row == nil {
+			continue // unknown or unreadable dir: leave it for a human
+		}
+		if !job.Terminal(row.State) {
+			continue
+		}
+		_ = os.RemoveAll(filepath.Join(root, e.Name()))
+	}
+	return nil
+}
+
+// RunSweeper calls SweepAdoptions and SweepTerminalAdoptions on an interval
+// until ctx is cancelled.
 // Cancellation is a normal shutdown and returns nil. Per-job adoption failures
 // are recorded as durable browser.adoption_deferred events inside
 // SweepAdoptions; a transient store-level sweep error is retried on the next
@@ -405,6 +454,9 @@ func (b *Bridge) RunSweeper(ctx context.Context, interval time.Duration) error {
 				// this goroutine is unsupervised, so its death is invisible.
 				// Retry next tick; a genuinely fatal store failure also breaks
 				// the supervised server and scheduler loops.
+			}
+			if err := b.SweepTerminalAdoptions(ctx); err != nil && ctx.Err() != nil {
+				return nil
 			}
 		}
 	}

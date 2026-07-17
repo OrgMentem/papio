@@ -259,6 +259,46 @@ func TestBuildReportClassifiesNoOpAsExistingItem(t *testing.T) {
 	}
 }
 
+func TestBuildReportReadyWithoutImportEventSettlesAcquired(t *testing.T) {
+	// #4: RecordEvent errors in autoImportReady are best-effort, so a dropped
+	// insert can leave a ready job with no auto_import event. Ready is terminal
+	// for acquisition (the PDF is a validated artifact), so it must settle as
+	// acquired, never perpetually in_progress.
+	manifest := &Manifest{
+		SchemaVersion: SchemaVersion, ID: "batch-acq", CreatedAt: "2026-07-15T12:00:00Z",
+		Works: []ManifestWork{
+			manifestWork("wr-dropped", "job-dropped", "submitted", "Import event dropped"),
+			manifestWork("wr-skipped", "job-skipped", "submitted", "Zotio not configured"),
+		},
+	}
+	autoImportRow := func(id string) *job.Row {
+		return &job.Row{ID: id, State: job.StateReady, Policy: job.Policy{Collection: "Reading", AutoImport: true}}
+	}
+	jobs := fakeJobs{
+		rows: map[string]*job.Row{"job-dropped": autoImportRow("job-dropped"), "job-skipped": autoImportRow("job-skipped")},
+		events: map[string][]map[string]any{
+			// job-dropped: no auto_import event at all (the insert was dropped).
+			"job-skipped": {{"kind": "zotio.auto_import", "detail": map[string]any{"status": "skipped", "reason": "zotio_not_configured"}}},
+		},
+	}
+	report, err := BuildReport(context.Background(), manifest, jobs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := report.Works[0]; got.Outcome != OutcomeAcquired || got.Reason != "import_unconfirmed" {
+		t.Fatalf("dropped-event ready job = %+v, want acquired/import_unconfirmed", got)
+	}
+	if got := report.Works[1]; got.Outcome != OutcomeAcquired || got.Reason != "import_skipped" {
+		t.Fatalf("skipped ready job = %+v, want acquired/import_skipped", got)
+	}
+	if report.Summary.Outcomes[OutcomeInProgress] != 0 {
+		t.Fatalf("ready job misclassified as in_progress: %+v", report.Summary)
+	}
+	if !report.Settled() {
+		t.Fatal("acquired works must settle a batch wait")
+	}
+}
+
 func TestMarkdownRendersImportFailedErrorClassAndHint(t *testing.T) {
 	report := &Report{
 		BatchID: "batch-deadbeef",

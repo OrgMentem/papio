@@ -707,3 +707,57 @@ func TestRunSweeperSurvivesStoreError(t *testing.T) {
 		t.Fatal("RunSweeper did not return after cancel")
 	}
 }
+
+func TestSweepTerminalAdoptionsRemovesOnlyTerminalDirs(t *testing.T) {
+	b, jobs, cfg, _ := newBridge(t)
+	ctx := context.Background()
+	root := cfg.EffectiveAdoptionRoot()
+
+	readyID := park(t, jobs, "wr_ready", handoffWork())
+	if err := jobs.Transition(ctx, readyID, job.StateAwaitingHuman, job.StateValidating, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.Transition(ctx, readyID, job.StateValidating, job.StateReady, nil); err != nil {
+		t.Fatal(err)
+	}
+	unavailableID := park(t, jobs, "wr_unavailable", handoffWork())
+	if err := jobs.Transition(ctx, unavailableID, job.StateAwaitingHuman, job.StateUnavailable, nil, job.WithTerminalReason("no_entitlement")); err != nil {
+		t.Fatal(err)
+	}
+	awaitingID := park(t, jobs, "wr_awaiting", handoffWork())
+
+	place := func(parts ...string) {
+		p := filepath.Join(append([]string{root}, parts...)...)
+		if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte("%PDF-1.4\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	place(readyID, "paper.pdf")
+	place(unavailableID, "paper.pdf")
+	place(awaitingID, "paper.pdf")
+	place("rejected", "wr_x", "bad.pdf")
+	place("job_stray_dir", "stray.pdf")
+
+	if err := b.SweepTerminalAdoptions(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	gone := func(name string) {
+		if _, err := os.Stat(filepath.Join(root, name)); !os.IsNotExist(err) {
+			t.Fatalf("expected %s removed, stat err = %v", name, err)
+		}
+	}
+	kept := func(name string) {
+		if _, err := os.Stat(filepath.Join(root, name)); err != nil {
+			t.Fatalf("expected %s preserved: %v", name, err)
+		}
+	}
+	gone(readyID)       // ready: PDF is promoted to the artifact store
+	gone(unavailableID) // terminal: nothing here the user needs
+	kept(awaitingID)    // non-terminal handoff may still receive a download
+	kept("rejected")    // user-facing rejected files are preserved
+	kept("job_stray_dir")
+}

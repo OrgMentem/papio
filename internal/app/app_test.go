@@ -811,3 +811,176 @@ func TestParkNotifiesAfterSuccessfulTransition(t *testing.T) {
 		t.Fatalf("human notifications = %d, want 1", notifier.human)
 	}
 }
+
+func TestImportNeedsRetry(t *testing.T) {
+	ev := func(status string) map[string]any {
+		return map[string]any{"kind": "zotio.auto_import", "detail": map[string]any{"status": status}}
+	}
+	errN := func(n int) []map[string]any {
+		out := make([]map[string]any, n)
+		for i := range out {
+			out[i] = ev("error")
+		}
+		return out
+	}
+	cases := []struct {
+		name   string
+		events []map[string]any
+		want   bool
+	}{
+		{"missing event", nil, true},
+		{"applied", []map[string]any{ev("applied")}, false},
+		{"no_op", []map[string]any{ev("no_op")}, false},
+		{"duplicate", []map[string]any{ev("duplicate")}, false},
+		{"skipped retries", []map[string]any{ev("skipped")}, true},
+		{"error then applied wins", []map[string]any{ev("error"), ev("applied")}, false},
+		{"under cap", errN(maxImportAttempts - 1), true},
+		{"at cap gives up", errN(maxImportAttempts), false},
+	}
+	for _, c := range cases {
+		if got := importNeedsRetry(c.events); got != c.want {
+			t.Errorf("%s: importNeedsRetry = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+func TestRetryPendingImportsIsNoOpWithoutImporter(t *testing.T) {
+	svc, _ := newTestService(t)
+	svc.AutoImporter = nil
+	if err := svc.retryPendingImports(context.Background()); err != nil {
+		t.Fatalf("retry with no importer: %v", err)
+	}
+}
+
+func TestRetryPendingImportsRedrivesFailedImportUntilCap(t *testing.T) {
+	ctx := context.Background()
+	svc, jobs := newTestService(t)
+	svc.Config.Zotio.AutoImport = true
+	importer := &fakeAutoImporter{err: zotio.WithErrorInfo(errors.New("zotio stderr: transient outage"))}
+	svc.AutoImporter = importer
+	readyPipeline(svc)
+
+	id, err := svc.Submit(ctx, doiRequest("wr_retry_cap"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, err := jobs.ClaimNext(ctx, "worker", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Process(ctx, row); err != nil {
+		t.Fatal(err)
+	}
+	if importer.calls != 1 {
+		t.Fatalf("inline import calls = %d, want 1", importer.calls)
+	}
+
+	// Ready is terminal, so only the retry pass re-drives the failing import.
+	// It must re-drive up to the attempt cap, then give up.
+	for range 10 {
+		if err := svc.retryPendingImports(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if importer.calls != maxImportAttempts {
+		t.Fatalf("PlanAndApply calls = %d, want cap %d", importer.calls, maxImportAttempts)
+	}
+	ready, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ready.State != job.StateReady {
+		t.Fatalf("job state after retries = %s, want ready (PDF stays a validated artifact)", ready.State)
+	}
+}
+
+func TestRetryPendingImportsStopsAfterSuccess(t *testing.T) {
+	ctx := context.Background()
+	svc, jobs := newTestService(t)
+	svc.Config.Zotio.AutoImport = true
+	importer := &fakeAutoImporter{err: zotio.WithErrorInfo(errors.New("zotio stderr: transient outage"))}
+	svc.AutoImporter = importer
+	readyPipeline(svc)
+
+	id, err := svc.Submit(ctx, doiRequest("wr_retry_ok"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, err := jobs.ClaimNext(ctx, "worker", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Process(ctx, row); err != nil {
+		t.Fatal(err)
+	}
+
+	// Zotio recovers: the next retry imports, and no further retry re-drives it.
+	importer.err = nil
+	importer.status = "applied"
+	importer.parentKey = "PARENT01"
+	importer.attachmentKey = "ATTACH01"
+	if err := svc.retryPendingImports(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.retryPendingImports(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if importer.calls != 2 {
+		t.Fatalf("PlanAndApply calls = %d, want 2 (one inline failure + one successful retry)", importer.calls)
+	}
+	events, err := jobs.Events(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if importNeedsRetry(events) {
+		t.Fatal("a successfully imported job must not need another retry")
+	}
+}
+
+func TestResolverRetryBudgetEscalatesAfterCap(t *testing.T) {
+	ctx := context.Background()
+	svc, jobs := newTestService(t) // conservative mode: exhaustion escalates to unavailable
+	svc.RetryDelay = time.Millisecond
+	svc.Resolvers = []ResolverEntry{{Adapter: &fakeResolver{name: "fixture", cands: []resolver.Candidate{{
+		Source: "fixture", URL: "https://example.test/p.pdf", Version: resolver.VersionPublished,
+		AccessBasis: resolver.AccessOpen, ReuseLicense: "unknown", Direct: true, IdentityConfidence: 1,
+	}}}, Policy: config.Source{Enabled: true}}}
+	svc.Fetch = func(context.Context, resolver.Candidate, string) (fetch.Result, error) {
+		return fetch.Result{}, &fetch.Error{Class: fetch.ClassRetryable, HTTPStatus: 503, RetryAfter: time.Millisecond, Msg: "service unavailable"}
+	}
+	svc.Validate = passValidation()
+
+	id, err := svc.Submit(ctx, doiRequest("wr_retry_budget"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Drive the job repeatedly through its temporary-failure retry cycle. It
+	// must retry exactly maxRetryAttempts times, then escalate instead of
+	// cycling retry_wait forever.
+	retryWaits := 0
+	for range maxRetryAttempts + 4 {
+		row, err := jobs.Get(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if row.State != job.StateQueued && row.State != job.StateRetryWait {
+			break
+		}
+		if err := svc.Process(ctx, row); err != nil {
+			t.Fatal(err)
+		}
+		if after, _ := jobs.Get(ctx, id); after.State == job.StateRetryWait {
+			retryWaits++
+		}
+	}
+	if retryWaits != maxRetryAttempts {
+		t.Fatalf("retry_wait cycles = %d, want cap %d", retryWaits, maxRetryAttempts)
+	}
+	row, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.State != job.StateUnavailable {
+		t.Fatalf("state after exhausting retry budget = %s, want unavailable (escalated, not retry_wait forever)", row.State)
+	}
+}

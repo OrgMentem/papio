@@ -45,6 +45,27 @@ type MaintenanceRunner interface {
 	RunDue(context.Context) error
 }
 
+// MaintenanceRunners runs several maintenance runners in order on each pass, so
+// one daemon composes independent periodic tasks (watchlists, import retry)
+// behind the scheduler's single Maintenance seam. Every runner runs even if an
+// earlier one errors; the first error is returned for the caller, though
+// maintenance errors are best-effort and never stop acquisition workers.
+type MaintenanceRunners []MaintenanceRunner
+
+// RunDue runs each non-nil runner once and returns the first error, if any.
+func (rs MaintenanceRunners) RunDue(ctx context.Context) error {
+	var firstErr error
+	for _, r := range rs {
+		if r == nil {
+			continue
+		}
+		if err := r.RunDue(ctx); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
 // SchedulerConfig controls worker, lease, polling, and periodic maintenance behavior.
 type SchedulerConfig struct {
 	Owner               string

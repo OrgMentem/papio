@@ -195,7 +195,7 @@ func New(ctx context.Context, cfg config.Config) (*System, error) {
 		LeaseDuration:       60 * time.Second,
 		HeartbeatInterval:   15 * time.Second,
 		PollInterval:        250 * time.Millisecond,
-		Maintenance:         watchRunner,
+		Maintenance:         daemon.MaintenanceRunners{watchRunner, service.ImportRetrier()},
 		MaintenanceInterval: time.Minute,
 	})
 	if err != nil {

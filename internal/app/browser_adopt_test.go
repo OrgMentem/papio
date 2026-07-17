@@ -12,6 +12,7 @@ import (
 	"papio/internal/config"
 	"papio/internal/fetch"
 	"papio/internal/job"
+	"papio/internal/pdf"
 	"papio/internal/resolver"
 	"papio/internal/work"
 )
@@ -248,5 +249,83 @@ func TestAdoptDownloadValidatesAndPromotes(t *testing.T) {
 	}
 	if err := svc.Artifacts.Verify(row.ArtifactSHA256); err != nil {
 		t.Fatalf("artifact verify: %v", err)
+	}
+}
+
+func TestAdoptDownloadRepArksToAwaitingHumanOnValidationInfraError(t *testing.T) {
+	svc, jobs := newTestService(t)
+	svc.Validate = passValidation()
+	id := parkAwaitingHuman(t, jobs, "wr_adopt_infra")
+	dir := filepath.Join(svc.Config.EffectiveAdoptionRoot(), id)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	pdfPath := filepath.Join(dir, "paper.pdf")
+	if err := os.WriteFile(pdfPath, pdfBytes("adopted"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Make the immutable artifact store read-only so Promote (an atomic rename
+	// into it) fails after validation passes: a post-validation infra error
+	// that leaves validateCandidate returning (false, false, err). The
+	// quarantine and database dirs stay writable, so only Promote fails.
+	artRoot := filepath.Join(svc.Config.DataDir, "artifacts")
+	if err := os.Chmod(artRoot, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(artRoot, 0o700) })
+
+	if err := svc.AdoptDownload(context.Background(), id, pdfPath); err == nil {
+		t.Fatal("expected the promote failure to surface")
+	}
+	row, err := jobs.Get(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.State != job.StateAwaitingHuman {
+		t.Fatalf("adoption infra error left job in %s, want awaiting_human (a validating strand lets RecoverStale rewind it to resolving and discard the file)", row.State)
+	}
+	// The adopted file must be preserved so the directory sweep can retry it.
+	if _, statErr := os.Stat(pdfPath); statErr != nil {
+		t.Fatalf("adopted file was not preserved for retry: %v", statErr)
+	}
+}
+
+func TestAdoptDownloadRejectedUnquarantinableGoesNeedsReview(t *testing.T) {
+	svc, jobs := newTestService(t)
+	svc.Validate = func(context.Context, string, string, work.Work) (pdf.ValidationReport, error) {
+		return pdf.ValidationReport{
+			Payload:    pdf.PayloadReport{OK: true},
+			Structural: pdf.StructuralReport{Valid: true, Pages: 2},
+			Text:       pdf.TextReport{Chars: 2000},
+			Identity:   pdf.IdentityDecision{Result: pdf.IdentityReject},
+		}, nil
+	}
+	id := parkAwaitingHuman(t, jobs, "wr_reject_stuck")
+	dir := filepath.Join(svc.Config.EffectiveAdoptionRoot(), id)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	pdfPath := filepath.Join(dir, "paper.pdf")
+	if err := os.WriteFile(pdfPath, pdfBytes("adopted"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Occupy the rejected/ sibling with a regular file so MkdirAll(rejected/<job>)
+	// fails: the rejected download then cannot be moved out of the adoption dir.
+	if err := os.WriteFile(filepath.Join(svc.Config.EffectiveAdoptionRoot(), "rejected"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.AdoptDownload(context.Background(), id, pdfPath); err != nil {
+		t.Fatalf("adopt: %v", err)
+	}
+	row, err := jobs.Get(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.State != job.StateNeedsReview {
+		t.Fatalf("unquarantinable rejection left job in %s, want needs_review so the sweep stops re-adopting", row.State)
+	}
+	// The file remains where the user can act on it.
+	if _, statErr := os.Stat(pdfPath); statErr != nil {
+		t.Fatalf("rejected file not preserved: %v", statErr)
 	}
 }

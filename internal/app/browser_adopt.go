@@ -122,6 +122,18 @@ func (s *Service) AdoptDownload(ctx context.Context, jobID, path string) error {
 
 	accepted, parked, err := s.validateCandidate(ctx, row, stored, result)
 	if err != nil {
+		// validateCandidate returns before completing a transition on an
+		// infrastructure error (start-attempt / promote / store failure),
+		// leaving the job in validating. Left there, the scheduler's
+		// RecoverStale rewinds it to resolving and re-fetches, discarding the
+		// user's supplied download for whatever OA resolution finds. Re-park in
+		// awaiting_human (best-effort) so the file — still in the adoption
+		// directory under the job's still-open handoff action — is preserved and
+		// re-driven by the directory sweep; a transient store error clears on a
+		// later tick. The original error is still returned so the bridge records
+		// it as browser.adoption_deferred.
+		_ = s.park(context.WithoutCancel(ctx), jobID, job.StateValidating, job.StateAwaitingHuman,
+			map[string]any{"reason": "adoption_validation_error"})
 		return err
 	}
 	if accepted || parked {
@@ -134,8 +146,24 @@ func (s *Service) AdoptDownload(ctx context.Context, jobID, path string) error {
 	// for the user) so the daemon's directory sweep does not re-adopt and
 	// re-reject the same file forever.
 	rejectDir := filepath.Join(s.Config.EffectiveAdoptionRoot(), "rejected", jobID)
+	moved := false
 	if mkErr := os.MkdirAll(rejectDir, 0o700); mkErr == nil {
-		_ = os.Rename(path, filepath.Join(rejectDir, filepath.Base(path)))
+		if renErr := os.Rename(path, filepath.Join(rejectDir, filepath.Base(path))); renErr == nil {
+			moved = true
+		}
+	}
+	if !moved {
+		// The rejected file could not be moved out of the adoption directory, so
+		// re-parking in awaiting_human would let the directory sweep re-adopt and
+		// re-reject the same file every tick. Park in needs_review instead — the
+		// adoption sweep never scans it — with an action telling the user to
+		// remove or replace the file so the loop cannot spin.
+		if _, err := s.Jobs.OpenHumanAction(ctx, jobID, "manual_download",
+			"the adopted download failed validation and could not be quarantined; remove or replace the file in the adoption directory"); err != nil {
+			return err
+		}
+		return s.park(ctx, jobID, job.StateFetching, job.StateNeedsReview,
+			map[string]any{"reason": "adopted_download_rejected_unquarantined"})
 	}
 	if _, err := s.Jobs.OpenHumanAction(ctx, jobID, "manual_download",
 		"the adopted download failed validation; please supply a different file"); err != nil {

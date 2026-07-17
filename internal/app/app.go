@@ -238,6 +238,9 @@ func (s *Service) Process(ctx context.Context, row *job.Row) error {
 	}
 	if len(live) == 0 {
 		if !retryAt.IsZero() {
+			if s.retryBudgetExhausted(ctx, row.ID) {
+				return s.exhaustedCandidates(ctx, row, job.StateResolving, "retry_budget_exhausted", "temporary source failures did not clear", "")
+			}
 			return s.Jobs.Transition(ctx, row.ID, job.StateResolving, job.StateRetryWait,
 				map[string]any{"reason": "resolver_temporarily_unavailable"}, job.WithRetryAt(retryAt))
 		}
@@ -461,6 +464,9 @@ func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[st
 			map[string]any{"reason": "landing_page_only"})
 	}
 	if !retryAt.IsZero() {
+		if s.retryBudgetExhausted(ctx, row.ID) {
+			return s.exhaustedCandidates(ctx, row, job.StateFetching, "retry_budget_exhausted", "temporary candidate failures did not clear", oaBrowserURL)
+		}
 		return s.Jobs.Transition(ctx, row.ID, job.StateFetching, job.StateRetryWait,
 			map[string]any{"reason": "candidate_temporarily_unavailable"}, job.WithRetryAt(retryAt))
 	}
@@ -475,6 +481,36 @@ func (s *Service) park(ctx context.Context, jobID, from, to string, detail map[s
 		s.Notifier.HumanAction(context.WithoutCancel(ctx))
 	}
 	return nil
+}
+
+// maxRetryAttempts bounds how many times a job may cycle through retry_wait for
+// temporary resolver/fetch failures. A permanently "temporary" source would
+// otherwise retry forever; past the cap the job escalates to the ordinary
+// exhaustion boundary (institutional handoff, or unavailable) instead of
+// re-scheduling another attempt.
+const maxRetryAttempts = 8
+
+// retryBudgetExhausted reports whether a job has already cycled through
+// retry_wait at least maxRetryAttempts times. It counts durable transition
+// events into retry_wait so the bound survives daemon restarts. A read error
+// never escalates: best-effort maintenance prefers another retry to falsely
+// giving up on a job.
+func (s *Service) retryBudgetExhausted(ctx context.Context, jobID string) bool {
+	events, err := s.Jobs.Events(ctx, jobID)
+	if err != nil {
+		return false
+	}
+	n := 0
+	for _, event := range events {
+		if kind, _ := event["kind"].(string); kind != "job.transition" {
+			continue
+		}
+		detail, _ := event["detail"].(map[string]any)
+		if to, _ := detail["to"].(string); to == job.StateRetryWait {
+			n++
+		}
+	}
+	return n >= maxRetryAttempts
 }
 
 // exhaustedCandidates handles the terminal "no direct candidate" boundary —

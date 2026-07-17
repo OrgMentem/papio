@@ -642,3 +642,25 @@ func TestSchedulerReturnsQueuedWorkerFailure(t *testing.T) {
 		t.Fatalf("Run error = %v, want %v", err, want)
 	}
 }
+
+type maintenanceFunc func(context.Context) error
+
+func (f maintenanceFunc) RunDue(ctx context.Context) error { return f(ctx) }
+
+func TestMaintenanceRunnersRunAllAndReturnFirstError(t *testing.T) {
+	var order []string
+	errFirst := errors.New("first failure")
+	runners := MaintenanceRunners{
+		maintenanceFunc(func(context.Context) error { order = append(order, "a"); return nil }),
+		nil, // a nil runner is skipped, not a panic
+		maintenanceFunc(func(context.Context) error { order = append(order, "b"); return errFirst }),
+		maintenanceFunc(func(context.Context) error { order = append(order, "c"); return errors.New("second failure") }),
+	}
+	err := runners.RunDue(context.Background())
+	if !errors.Is(err, errFirst) {
+		t.Fatalf("RunDue error = %v, want first error %v", err, errFirst)
+	}
+	if len(order) != 3 || order[0] != "a" || order[1] != "b" || order[2] != "c" {
+		t.Fatalf("run order = %v, want [a b c] (every runner runs despite an earlier error)", order)
+	}
+}

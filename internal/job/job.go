@@ -64,6 +64,10 @@ var allowed = map[string]map[string]bool{
 	StateValidating: {
 		StateReady: true, StateFetching: true, StateResolving: true,
 		StateNeedsReview: true, StateFailed: true, StateCancelled: true,
+		// Adoption re-parks here on a transient validation/store error so the
+		// supplied download is preserved for the directory sweep to retry,
+		// rather than being rewound to resolving and replaced by an OA fetch.
+		StateAwaitingHuman: true,
 	},
 	StateAwaitingHuman: {
 		StateResolving: true, StateFetching: true, StateCancelled: true, StateFailed: true,

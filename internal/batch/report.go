@@ -97,6 +97,7 @@ const (
 	OutcomeBrowserFetchedThenImported = "browser_fetched_then_imported"
 	OutcomeImportFailed               = "import_failed"
 	OutcomeExistingItemAttached       = "existing_item_attached"
+	OutcomeAcquired                   = "acquired"
 	OutcomeAwaitingHuman              = "awaiting_human"
 	OutcomeNeedsReview                = "needs_review"
 	OutcomeFailed                     = "failed"
@@ -112,6 +113,7 @@ var terminalOutcomes = map[string]bool{
 	OutcomeBrowserFetchedThenImported: true,
 	OutcomeImportFailed:               true,
 	OutcomeExistingItemAttached:       true,
+	OutcomeAcquired:                   true,
 	OutcomeAwaitingHuman:              true,
 	OutcomeNeedsReview:                true,
 	OutcomeFailed:                     true,
@@ -394,8 +396,18 @@ func buildWorkReport(ctx context.Context, manifestWork ManifestWork, jobs Jobs, 
 			// terminal success ("already in your library"), not in-progress.
 			item.Outcome = OutcomeExistingItemAttached
 			item.ParentKey = autoImport.ParentKey
+		case autoImport.Status == "skipped" || !row.Policy.AutoImport:
+			// Acquisition succeeded and import was not requested (auto-import
+			// off) or could not run (zotio not configured). The PDF is a
+			// validated artifact: a terminal success, not in-progress work.
+			item.Outcome, item.Reason = OutcomeAcquired, "import_skipped"
 		default:
-			item.Outcome, item.Reason = OutcomeInProgress, job.StateReady
+			// Ready is terminal for acquisition: the PDF is a validated
+			// artifact. A missing auto-import outcome (a dropped event insert,
+			// or the import-retry pass has not yet re-driven it) must not read
+			// as perpetually in_progress; it settles as acquired and a later
+			// successful import event supersedes it on the next report.
+			item.Outcome, item.Reason = OutcomeAcquired, "import_unconfirmed"
 		}
 	case job.StateAwaitingHuman:
 		item.Outcome, item.Reason = OutcomeAwaitingHuman, awaitingReason(actions)
@@ -528,7 +540,7 @@ func Markdown(report *Report) string {
 	for _, item := range report.Works {
 		groups[item.Outcome] = append(groups[item.Outcome], item)
 	}
-	for _, outcome := range []string{"imported", "browser_fetched_then_imported", "existing_item_attached", "import_failed", "awaiting_human", "needs_review", "failed", "skipped_owned", "in_progress"} {
+	for _, outcome := range []string{"imported", "browser_fetched_then_imported", "existing_item_attached", "acquired", "import_failed", "awaiting_human", "needs_review", "failed", "skipped_owned", "in_progress"} {
 		items := groups[outcome]
 		if len(items) == 0 {
 			continue
@@ -551,7 +563,7 @@ func Markdown(report *Report) string {
 
 func summaryLine(outcomes map[string]int) string {
 	parts := make([]string, 0, len(outcomes))
-	for _, outcome := range []string{"imported", "browser_fetched_then_imported", "existing_item_attached", "import_failed", "awaiting_human", "needs_review", "failed", "skipped_owned", "in_progress"} {
+	for _, outcome := range []string{"imported", "browser_fetched_then_imported", "existing_item_attached", "acquired", "import_failed", "awaiting_human", "needs_review", "failed", "skipped_owned", "in_progress"} {
 		if count := outcomes[outcome]; count != 0 {
 			parts = append(parts, fmt.Sprintf("%d %s", count, outcome))
 		}
