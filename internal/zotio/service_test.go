@@ -108,6 +108,63 @@ func TestQueueMissingPDFSubmitsDeterministicRequestsAndSkipsUnidentified(t *test
 	}
 }
 
+// A DOI-bearing queue row must still carry the Zotero item's creators/year: the
+// missing-PDF list row omits them, so the request is enriched from GetItem.
+// Regression for authorless `--from-zotio` requests that broke bundle export.
+func TestQueueMissingPDFEnrichesDOIItemsWithAuthors(t *testing.T) {
+	cli := &fakeCLI{
+		items: []MissingPDFItem{
+			{Key: "AB12CD34", Title: "list-row title", DOI: "https://doi.org/10.1000/One"},
+		},
+		details: map[string]*Item{
+			"AB12CD34": {Key: "AB12CD34", Title: "canonical title", Authors: []string{"Lee, John D.", "See, Katrina A."}, Year: 2004},
+		},
+	}
+	submitter := &fakeSubmitter{}
+	service := &Service{CLI: cli, Submitter: submitter}
+	if _, err := service.QueueMissingPDF(context.Background(), QueueOptions{Limit: 5}); err != nil {
+		t.Fatal(err)
+	}
+	if len(submitter.requests) != 1 {
+		t.Fatalf("requests = %+v", submitter.requests)
+	}
+	req := submitter.requests[0]
+	if req.Identifiers == nil || req.Identifiers.DOI != "10.1000/one" {
+		t.Fatalf("DOI not anchored: %+v", req.Identifiers)
+	}
+	if len(req.Authors) != 2 || req.Authors[0] != "Lee, John D." || req.Year != 2004 {
+		t.Fatalf("authors/year not enriched from item: authors=%v year=%d", req.Authors, req.Year)
+	}
+	if req.Title != "canonical title" {
+		t.Fatalf("title not refreshed from item: %q", req.Title)
+	}
+}
+
+// When the item lookup misses, a DOI row still queues (DOI-anchored), never
+// erroring — enrichment is best-effort, not a new hard dependency.
+func TestQueueMissingPDFDOIItemQueuesWhenItemLookupMisses(t *testing.T) {
+	cli := &fakeCLI{
+		items: []MissingPDFItem{
+			{Key: "AB12CD34", Title: "list-row title", DOI: "https://doi.org/10.1000/One"},
+		},
+	}
+	submitter := &fakeSubmitter{}
+	service := &Service{CLI: cli, Submitter: submitter}
+	if _, err := service.QueueMissingPDF(context.Background(), QueueOptions{Limit: 5}); err != nil {
+		t.Fatal(err)
+	}
+	if len(submitter.requests) != 1 {
+		t.Fatalf("requests = %+v", submitter.requests)
+	}
+	req := submitter.requests[0]
+	if req.Identifiers == nil || req.Identifiers.DOI != "10.1000/one" {
+		t.Fatalf("DOI not anchored on lookup miss: %+v", req.Identifiers)
+	}
+	if len(req.Authors) != 0 || req.Title != "list-row title" {
+		t.Fatalf("expected DOI-only fallback: authors=%v title=%q", req.Authors, req.Title)
+	}
+}
+
 func TestQueueMissingPDFDefaultsLimitAndDesiredVersion(t *testing.T) {
 	cli := &fakeCLI{}
 	service := &Service{CLI: cli, Submitter: &fakeSubmitter{}}

@@ -320,6 +320,17 @@ func (s *Service) requestForQueueItem(ctx context.Context, row MissingPDFItem, o
 			return protocol.WorkRequest{}, "invalid DOI from Zotio: " + err.Error()
 		}
 		request.Identifiers = &protocol.Identifiers{DOI: doi}
+		// Best-effort: enrich the DOI-anchored request with the item's
+		// creators/year, which the missing-PDF list row does not carry. A DOI is
+		// not a reason to drop authors — downstream bundle export and new-item
+		// routing want them. A lookup miss leaves the request DOI-only.
+		if item, ierr := s.CLI.GetItem(ctx, row.Key); ierr == nil {
+			if item.Title != "" {
+				request.Title = item.Title
+			}
+			request.Authors = append([]string(nil), item.Authors...)
+			request.Year = item.Year
+		}
 	} else {
 		item, err := s.CLI.GetItem(ctx, row.Key)
 		if err != nil {
