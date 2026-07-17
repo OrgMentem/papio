@@ -658,6 +658,44 @@ test("startup re-drives a pending terms gate when consent was granted while asle
   expect(h.scripting.termsAccepts.length).toBeGreaterThanOrEqual(1);
 });
 
+const TERMS_DL_SPEC: AdapterSpec = {
+  id: "termsdl",
+  version: "1.0.0",
+  hosts: [PROVIDER],
+  classify: [],
+  download: { selector: "button.dl", requireKind: "article", method: "click" },
+  termsAccept: { modalSelector: "div.terms[open]", textAny: ["accept and download"] },
+};
+
+test("a latched download-click keeps re-classifying until a late terms modal is accepted", async () => {
+  // Terms-gated providers (JSTOR) upgrade the terms modal AFTER the download
+  // click latches download_initiated. The classify retry must keep watching so
+  // the late modal is caught and accepted — without ever re-clicking / starting
+  // a second download.
+  const h = makeMapHarness([TERMS_DL_SPEC]);
+  h.settings.consent = "accept";
+  const article = { kind: "article" as const, adapter_id: "termsdl", adapter_version: "1.0.0", evidence: [] };
+  const terms = { kind: "terms" as const, adapter_id: "termsdl", adapter_version: "1.0.0", evidence: [] };
+  // 1st classify: article -> click (latches). 2nd (retry): still article (modal
+  // not upgraded). 3rd (retry): terms -> acceptTerms.
+  h.scripting.verdictQueue.push(article, article, terms);
+  await h.bridge.start();
+  await h.port.inbound(offer("job_termsdl_0001"));
+  await landOnProvider(h, "job_termsdl_0001");
+
+  expect(h.scripting.clicked.length).toBe(1); // download clicked once (latched)
+  expect(h.backend.store.activeJobs[0]?.download_initiated).toBe(true);
+  expect(h.scripting.termsAccepts.length).toBe(0); // modal not upgraded yet
+  expect(h.timers.length).toBeGreaterThan(0); // retry scheduled despite the latch
+
+  // Drain retries: the late terms modal is caught and accepted.
+  for (let i = 0; i < 8 && h.scripting.termsAccepts.length === 0 && h.timers.length > 0; i++) {
+    for (const t of h.timers.splice(0)) await t.fn();
+  }
+  expect(h.scripting.termsAccepts.length).toBeGreaterThanOrEqual(1);
+  expect(h.scripting.clicked.length).toBe(1); // retry never re-clicked the download
+});
+
 test("startup reconciliation re-queues a job whose pre-download tab vanished", async () => {
   // A tab closed while the worker slept never fired onTabRemoved, so the job
   // still points at a dead tab. Reconcile must recover it, not strand it.

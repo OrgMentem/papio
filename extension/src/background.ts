@@ -1496,11 +1496,23 @@ export class Bridge {
     if (!verdict) return;
     await this.applyVerdict(jobID, spec, verdict, host);
     // A decisive verdict ends the render race; `unknown` may just be an
-    // un-upgraded page, so retry on a bounded schedule. The download latch and
-    // the terminal-status check in retryClassify keep this from ever driving a
-    // second download.
-    if (verdict.kind === "unknown") this.scheduleClassifyRetry(jobID);
-    else this.classifyRetries.delete(jobID);
+    // un-upgraded page, so retry on a bounded schedule. A latched download-click
+    // that opens a declared terms gate must ALSO keep retrying: providers like
+    // JSTOR upgrade the terms modal (mfe-*) AFTER the click, so a single
+    // post-click classify can miss it. A retry can never start a second
+    // download — every download-initiation path bails on download_initiated —
+    // so it only serves to catch the terms modal and accept it.
+    const after = findByJob(this.store, jobID);
+    const awaitingTermsGate =
+      spec.termsAccept !== undefined &&
+      (after?.status === "accepted" || after?.status === "awaiting_download") &&
+      after?.download_initiated === true &&
+      !this.downloads.has(jobID);
+    if (verdict.kind === "unknown" || (verdict.kind !== "terms" && awaitingTermsGate)) {
+      this.scheduleClassifyRetry(jobID);
+    } else {
+      this.classifyRetries.delete(jobID);
+    }
   }
 
   private scheduleClassifyRetry(jobID: string): void {
@@ -1516,9 +1528,12 @@ export class Bridge {
   private async retryClassify(jobID: string): Promise<void> {
     await this.ready;
     const job = findByJob(this.store, jobID);
-    // Stop once the job is gone, has latched a download, or left the states
-    // where an adapter may still act.
-    if (!job || job.download_initiated === true) {
+    // Stop once the job is gone or an actual download is tracked. The guard is
+    // the tracked download, NOT download_initiated: a click that latched to open
+    // a terms gate has download_initiated=true but no download yet, and the
+    // retry must continue so a late-upgrading terms modal is caught. No download
+    // can fire twice — every initiation path still bails on download_initiated.
+    if (!job || this.downloads.has(jobID)) {
       this.classifyRetries.delete(jobID);
       return;
     }
