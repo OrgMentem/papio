@@ -329,7 +329,7 @@ export const adapters: AdapterSpec[] = [
     // Verified live 2026-07-14 against a Example University-authenticated EBSCOhost record
     // and its provider-owned download-format modal (fixtures/ebsco/success.html).
     id: "ebsco",
-    version: "0.1.0",
+    version: "0.2.0",
     hosts: ["research.ebsco.com"],
     settleTimeoutMs: 5000,
     classify: [
@@ -347,13 +347,23 @@ export const adapters: AdapterSpec[] = [
           "button[data-auto='card-call-to-action']",
         ],
       },
+      {
+        // Live flow lands on the PDF viewer, where the article renders to
+        // canvas; the record-page download button is absent there.
+        kind: "article",
+        all: ["meta[name='citation_title']", "canvas"],
+      },
     ],
     download: {
-      selector: "button[data-auto='card-call-to-action-download-button']",
+      // Entitlement is implied on the viewer (the article is rendered); the real
+      // gate is the viewer URL, whose opid/recordId build the aggregator call.
+      selector: "meta[name='citation_title']",
       requireKind: "article",
-      method: "click",
-      followupSelector: "button[data-auto='bulk-download-modal-download-button']",
-      postClickTimeoutMs: 5000,
+      method: "api",
+      idPattern: "/c/([^/]+)/viewer/pdf/([^/?#]+)",
+      urlTemplate:
+        "https://research.ebsco.com/api/researcher-edge-aggregator/v1/records/{2}/fulltext/pdf?sourceRecordId={2}&opid={1}&intent=view&lang=en-US",
+      jsonField: "url",
     },
   },
   {
