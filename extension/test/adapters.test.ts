@@ -346,6 +346,8 @@ class FakeScripting {
   readonly rawClickArgs: unknown[][] = [];
   readonly termsAccepts: { tabId: number; modalSelector: string; textAny: unknown }[] = [];
   readonly interpretTabs: number[] = [];
+  constructedURL: string | null = "https://provider.example.edu/pdf/default.pdf";
+  readonly constructedArgs: { tabId: number; selector: string; idPattern: unknown; urlTemplate: unknown }[] = [];
   async executeScript(inj: {
     target: { tabId: number };
     func: (...args: never[]) => unknown;
@@ -369,6 +371,13 @@ class FakeScripting {
         ...(typeof args[4] === "string" ? { followupSelector: args[4] } : {}),
       });
       return [{ result: true }];
+    }
+    // constructDownloadURL(selector, idPattern, urlTemplate): selector is a
+    // string, unlike interpret's leading null — that discriminates the two
+    // 3-arg injections.
+    if (args.length === 3 && typeof args[0] === "string") {
+      this.constructedArgs.push({ tabId: inj.target.tabId, selector: args[0], idPattern: args[1], urlTemplate: args[2] });
+      return [{ result: this.constructedURL }];
     }
     this.interpretTabs.push(inj.target.tabId);
     return [{ result: this.verdictQueue.shift() ?? this.verdict }];
@@ -1197,4 +1206,51 @@ test("a decisive verdict between two unknowns resets the streak", async () => {
   await landOnProvider(h, "job_reset_0001");
   expect(h.frames().some((f) => f.type === "provider_outcome")).toBe(false);
   expect(h.backend.store.activeJobs[0]?.unknown_count).toBe(1);
+});
+
+const URL_SPEC: AdapterSpec = {
+  id: "urlprov",
+  version: "1.0.0",
+  hosts: [PROVIDER],
+  classify: [],
+  download: {
+    selector: "button.dl",
+    requireKind: "article",
+    method: "url",
+    idPattern: "/stable/([^?#]+)",
+    urlTemplate: "https://provider.example.edu/pdf/{id}.pdf",
+    requiresTermsConsent: true,
+  },
+};
+
+test("url-method adapter fetches the direct endpoint autonomously with terms consent", async () => {
+  // JSTOR-class: the entitled PDF is at a constructible URL. With consent,
+  // fetch it via the downloads API — no click, no gesture.
+  const h = makeMapHarness([URL_SPEC]);
+  h.settings.consent = "accept";
+  h.scripting.constructedURL = "https://provider.example.edu/pdf/4093878.pdf";
+  h.scripting.verdict = { kind: "article", adapter_id: "urlprov", adapter_version: "1.0.0", evidence: [] };
+  await h.bridge.start();
+  await h.port.inbound(offer("job_url_0001"));
+  await landOnProvider(h, "job_url_0001");
+
+  expect(h.scripting.clicked.length).toBe(0); // no gesture click
+  expect(h.downloads.started.length).toBe(1);
+  expect(h.downloads.started[0]?.url).toBe("https://provider.example.edu/pdf/4093878.pdf");
+  expect(h.backend.store.activeJobs[0]?.download_initiated).toBe(true);
+});
+
+test("url-method adapter stays assisted (prompts, no fetch) without terms consent", async () => {
+  const h = makeMapHarness([URL_SPEC]);
+  // consent undefined -> gate stays human
+  h.scripting.verdict = { kind: "article", adapter_id: "urlprov", adapter_version: "1.0.0", evidence: [] };
+  await h.bridge.start();
+  await h.port.inbound(offer("job_url_0002"));
+  await landOnProvider(h, "job_url_0002");
+
+  expect(h.downloads.started.length).toBe(0); // no autonomous fetch
+  expect(h.backend.store.activeJobs[0]?.needs_terms_consent).toBe(true);
+  expect(h.backend.store.activeJobs[0]?.download_initiated).not.toBe(true);
+  const prompts = h.frames().filter((f) => f.type === "provider_outcome" && f.payload["outcome"] === "terms_acceptance_required");
+  expect(prompts.length).toBeGreaterThanOrEqual(1);
 });

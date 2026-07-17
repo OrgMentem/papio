@@ -34,8 +34,12 @@ export interface DownloadRule {
   requireKind: "article";
   /** `href` extracts an HTTPS anchor and uses chrome.downloads.download.
    * `click` activates the explicitly selected element (or an explicitly
-   * selected control in its open shadow root). */
-  method: "href" | "click";
+   * selected control in its open shadow root).
+   * `url` constructs the direct PDF endpoint from the page URL (idPattern +
+   * urlTemplate) and fetches it via chrome.downloads.download — no click, no
+   * gesture. The privileged downloads API carries the session cookies, so an
+   * entitled endpoint (e.g. JSTOR /stable/pdf/<id>.pdf) is fetched autonomously. */
+  method: "href" | "click" | "url";
   shadowSelector?: string;
   /** Wait for this fixture-backed in-page gate before reclassification. */
   postClickWaitFor?: string;
@@ -44,6 +48,16 @@ export interface DownloadRule {
   followupSelector?: string;
   /** Shared bounded wait for post-click gate/follow-up insertion. */
   postClickTimeoutMs?: number;
+  /** method "url": regex matched against the page URL; capture group 1 fills
+   * {id} in urlTemplate. */
+  idPattern?: string;
+  /** method "url": HTTPS template with a single {id} placeholder resolving to
+   * the direct PDF endpoint. */
+  urlTemplate?: string;
+  /** method "url": fetch the endpoint only when the user has recorded consent to
+   * auto-accept publisher terms (the fetch bypasses the terms UI); without
+   * consent the gate stays human, prompted once. */
+  requiresTermsConsent?: boolean;
 }
 
 export interface AdapterSpec {
@@ -299,10 +313,10 @@ export const adapters: AdapterSpec[] = [
     download: {
       selector: "mfe-download-pharos-button[data-qa='download-pdf'][data-doi]",
       requireKind: "article",
-      method: "click",
-      shadowSelector: "#button-element",
-      postClickWaitFor: "mfe-download-pharos-modal.terms-and-conditions[open]",
-      postClickTimeoutMs: 3000,
+      method: "url",
+      idPattern: "/stable/([^?#]+)",
+      urlTemplate: "https://www.jstor.org/stable/pdf/{id}.pdf",
+      requiresTermsConsent: true,
     },
     termsAccept: {
       modalSelector: "mfe-download-pharos-modal.terms-and-conditions[open]",

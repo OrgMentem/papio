@@ -258,6 +258,33 @@ function extractDownloadURL(selector: string): string | null {
   }
 }
 
+/** Self-contained builder for a provider's direct PDF endpoint, injected into
+ * the tracked page. It fills {id} in urlTemplate from idPattern's first capture
+ * against the page URL, and only when the declared entitled download control is
+ * present (the same signal the `article` verdict uses). The URL is handed to
+ * chrome.downloads.download, which carries the session cookies; it never crosses
+ * native messaging or storage. */
+function constructDownloadURL(
+  selector: string,
+  idPattern: string | null,
+  urlTemplate: string | null,
+): string | null {
+  if (!urlTemplate) return null;
+  if (!document.querySelector(selector)) return null;
+  let id = "";
+  if (idPattern) {
+    const m = location.href.match(new RegExp(idPattern));
+    if (!m || m[1] === undefined) return null;
+    id = m[1];
+  }
+  try {
+    const u = new URL(urlTemplate.replace("{id}", id), location.href);
+    return u.protocol === "https:" ? u.href : null;
+  } catch {
+    return null;
+  }
+}
+
 /** Self-contained click of a terms-and-conditions accept control, found by
  * accessible text inside an open modal (piercing shadow roots). Runs ONLY when
  * the user has recorded informed consent; the extension never guesses terms
@@ -1606,6 +1633,19 @@ export class Bridge {
       case "article": {
         const dl = spec.download;
         if (dl && job.download_initiated !== true) {
+          if (dl.method === "url" && dl.requiresTermsConsent === true) {
+            const consent = await this.deps.settings.getTermsConsent();
+            if (consent !== "accept") {
+              // The direct-endpoint fetch bypasses the publisher terms UI, so
+              // gate it on recorded consent to auto-accept terms. Without
+              // consent, prompt once and stay assisted — no fetch, no latch.
+              this.send("provider_outcome", { outcome: "terms_acceptance_required", adapter_version: av }, jobID);
+              if (consent === undefined) {
+                await this.update((s) => patchJob(s, jobID, { needs_terms_consent: true }));
+              }
+              return;
+            }
+          }
           // Latch BEFORE resolving/downloading (persisted) so no
           // re-classification can ever initiate a second download for this
           // job. Failure falls back to assisted mode; the user can still use
@@ -1629,6 +1669,27 @@ export class Bridge {
               const clicked = results[0]?.result === true;
               if (clicked && dl.postClickWaitFor !== undefined) {
                 await this.reclassifyCurrentProviderPage(jobID);
+              }
+            } else if (dl.method === "url") {
+              const built = await this.deps.scripting.executeScript({
+                target: { tabId: job.tab_id },
+                func: constructDownloadURL,
+                args: [dl.selector, dl.idPattern ?? null, dl.urlTemplate ?? null],
+              });
+              const url = built[0]?.result;
+              if (typeof url === "string" && url.startsWith("https://")) {
+                this.pendingDownloadURLs.set(url, jobID);
+                try {
+                  const id = await this.deps.downloads.download({
+                    url,
+                    filename: `papio/${jobID}/paper.pdf`,
+                    conflictAction: "uniquify",
+                    saveAs: false,
+                  });
+                  this.downloads.set(jobID, { ids: new Set([id]), ambiguous: false, directOffer: false });
+                } finally {
+                  this.pendingDownloadURLs.delete(url);
+                }
               }
             } else {
               const links = await this.deps.scripting.executeScript({

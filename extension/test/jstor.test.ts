@@ -31,8 +31,8 @@ test.skipIf(!fixtureExists("jstor", "success"))(
     expect(verdict.kind).toBe("article");
     expect(verdict.adapter_id).toBe("jstor");
     expect(doc.querySelector(spec.download?.selector ?? "")).not.toBeNull();
-    expect(spec.download?.method).toBe("click");
-    expect(spec.download?.shadowSelector).toBe("#button-element");
+    expect(spec.download?.method).toBe("url");
+    expect(spec.download?.urlTemplate).toContain("/stable/pdf/");
     for (const item of verdict.evidence) expect(item).not.toMatch(/iron cage/i);
   },
 );
