@@ -17,6 +17,7 @@ import { parseBrowserMessage, type BrowserMessage } from "../src/protocol";
 import { emptyStore, type StateBackend, type StoreShape, type TermsConsent } from "../src/state";
 import {
   Bridge,
+  clickTermsAccept,
   type BridgeDeps,
   type DownloadDeltaLike,
   type DownloadItemLike,
@@ -694,6 +695,44 @@ test("a latched download-click keeps re-classifying until a late terms modal is 
   }
   expect(h.scripting.termsAccepts.length).toBeGreaterThanOrEqual(1);
   expect(h.scripting.clicked.length).toBe(1); // retry never re-clicked the download
+});
+
+test("clickTermsAccept clicks the real accept control, not a wrapping container", () => {
+  // JSTOR's terms footer is a <div> holding both "Cancel" and "Accept and
+  // download"; the accept control is an mfe-*-button with a shadow
+  // #button-element. The walk must click the button, never the container div
+  // (which is a no-op and left the modal open live).
+  const win = new Window();
+  const doc = win.document;
+  doc.body.innerHTML =
+    "<mfe-download-pharos-modal class='terms-and-conditions' open>" +
+    "<div class='cta'>" +
+    "<mfe-download-pharos-button id='cancel'>Cancel</mfe-download-pharos-button>" +
+    "<mfe-download-pharos-button id='accept'>Accept and download</mfe-download-pharos-button>" +
+    "</div></mfe-download-pharos-modal>";
+  const clicks: string[] = [];
+  doc.querySelector(".cta")?.addEventListener("click", () => clicks.push("div"));
+  for (const id of ["cancel", "accept"]) {
+    const btn = doc.getElementById(id) as unknown as {
+      attachShadow: (init: { mode: string }) => ShadowRoot;
+    };
+    const sr = btn.attachShadow({ mode: "open" });
+    sr.innerHTML = "<button id='button-element'></button>";
+    sr.querySelector("#button-element")?.addEventListener("click", () => clicks.push(id));
+  }
+  const prev = globalThis.document;
+  Object.assign(globalThis, { document: doc });
+  try {
+    const ok = clickTermsAccept("mfe-download-pharos-modal.terms-and-conditions[open]", ["accept and download"]);
+    expect(ok).toBe(true);
+    // The accept button's shadow #button-element is the click TARGET (old bug
+    // clicked the container div directly, so target was "div"). A composed
+    // click then bubbles to .cta, which is fine — Cancel is never clicked.
+    expect(clicks[0]).toBe("accept");
+    expect(clicks).not.toContain("cancel");
+  } finally {
+    Object.assign(globalThis, { document: prev });
+  }
 });
 
 test("startup reconciliation re-queues a job whose pre-download tab vanished", async () => {

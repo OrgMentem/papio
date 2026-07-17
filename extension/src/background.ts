@@ -262,19 +262,31 @@ function extractDownloadURL(selector: string): string | null {
  * accessible text inside an open modal (piercing shadow roots). Runs ONLY when
  * the user has recorded informed consent; the extension never guesses terms
  * controls otherwise. Returns whether a matching control was clicked. */
-function clickTermsAccept(modalSelector: string, textAny: string[]): boolean {
+export function clickTermsAccept(modalSelector: string, textAny: string[]): boolean {
   const modal = document.querySelector(modalSelector);
   if (!modal) return false;
   const needles = textAny.map((t) => t.toLowerCase());
   const walk = (root: ParentNode): boolean => {
     for (const el of Array.from(root.querySelectorAll("*"))) {
-      const label = ((el as HTMLElement).innerText ?? "") + " " + (el.getAttribute?.("aria-label") ?? "");
-      const text = label.toLowerCase();
-      if (needles.some((n) => text.includes(n))) {
-        const shadow = (el as HTMLElement & { shadowRoot?: ShadowRoot | null }).shadowRoot;
-        const inner = shadow?.querySelector<HTMLElement>("#button-element");
-        (inner ?? (el as HTMLElement)).click();
-        return true;
+      // Click only a genuine control, never a wrapping container whose text
+      // merely includes the accept label: a modal footer <div> holds both
+      // "Cancel" and "Accept and download", and clicking it is a no-op. The
+      // real control is button-like (JSTOR's is an mfe-*-button with a shadow
+      // #button-element).
+      const tag = el.tagName.toLowerCase();
+      const actionable =
+        tag === "button" ||
+        tag === "a" ||
+        el.getAttribute?.("role") === "button" ||
+        tag.endsWith("-button");
+      if (actionable) {
+        const label = ((el as HTMLElement).innerText ?? "") + " " + (el.getAttribute?.("aria-label") ?? "");
+        if (needles.some((n) => label.toLowerCase().includes(n))) {
+          const shadow = (el as HTMLElement & { shadowRoot?: ShadowRoot | null }).shadowRoot;
+          const inner = shadow?.querySelector<HTMLElement>("#button-element");
+          (inner ?? (el as HTMLElement)).click();
+          return true;
+        }
       }
       const sub = (el as HTMLElement & { shadowRoot?: ShadowRoot | null }).shadowRoot;
       if (sub && walk(sub)) return true;
