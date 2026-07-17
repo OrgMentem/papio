@@ -286,6 +286,8 @@ class FakeDownloads {
   >();
   readonly items = new Map<number, DownloadItemLike>();
   determineBeforeReturn = false;
+  emitOnCreated = false;
+  crossOriginRedirect: string | undefined = undefined;
   readonly started: {
     url: string;
     filename: string;
@@ -300,10 +302,23 @@ class FakeDownloads {
   }): Promise<number> {
     this.started.push(options);
     const id = 700 + this.started.length;
+    if (this.emitOnCreated) {
+      // Chrome dispatches onCreated at creation (pre-redirect, so the URL still
+      // matches the pending offer) and does NOT wait for the async handler
+      // before asking for a filename — so do not await here. This makes the
+      // test exercise the synchronous ID binding, not the post-await one.
+      void this.onCreated.emit({
+        id,
+        url: options.url,
+        filename: "/Users/test/Downloads/out.pdf",
+        fileSize: 12345,
+        state: "in_progress",
+      });
+    }
     this.items.set(id, {
       id,
-      url: options.url.replace("TOKEN=ephemeral", "TOKEN=normalized"),
-      finalUrl: "https://media.proquest.com/redirected/out.pdf",
+      url: this.crossOriginRedirect ?? options.url.replace("TOKEN=ephemeral", "TOKEN=normalized"),
+      finalUrl: this.crossOriginRedirect ?? "https://media.proquest.com/redirected/out.pdf",
       filename: "/Users/test/Downloads/out.pdf",
       fileSize: 12345,
       state: "in_progress",
@@ -1300,4 +1315,27 @@ test("resolveDownloadURL (api): fetches the aggregator JSON and extracts the PDF
   } finally {
     Object.assign(globalThis, prev);
   }
+});
+
+test("cross-origin api download is relocated into papio/<job>/ via the ID bound at onCreated", async () => {
+  const h = makeMapHarness();
+  // Chrome fires onCreated (pre-redirect) before asking for the filename.
+  h.downloads.emitOnCreated = true;
+  // The provider's entitled download redirects to a different origin, so the
+  // determine-time URL no longer matches the pending offer (the EBSCO case:
+  // research.ebsco.com -> content.ebscohost.com).
+  h.downloads.crossOriginRedirect = "https://content.ebscohost.com/cds/retrieve?content=signed";
+  // The filename is determined before downloads.download resolves, so the
+  // initiation code has not tracked the returned ID yet — only onCreated has.
+  h.downloads.determineBeforeReturn = true;
+  h.scripting.verdict = { kind: "article", adapter_id: "proquest", adapter_version: "0.3.1", evidence: [] };
+  await h.bridge.start();
+  await h.port.inbound(offer("job_xorigin_0001", { title: EXPECTED_TITLE }));
+  await landOnProvider(h, "job_xorigin_0001");
+  // Despite the cross-origin determine URL (no pending-URL match) and the ID
+  // not yet tracked by the initiation code, the file lands under papio/<job>/
+  // because onCreated bound the download ID to the job synchronously.
+  expect(h.downloads.items.get(701)?.filename).toBe(
+    "/Users/test/Downloads/papio/job_xorigin_0001/out.pdf",
+  );
 });

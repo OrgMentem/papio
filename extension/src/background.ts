@@ -258,6 +258,21 @@ function extractDownloadURL(selector: string): string | null {
   }
 }
 
+/** Self-contained meta-tag PDF-URL extractor, injected verbatim into the tracked
+ * page. Returns only an HTTPS URL from the named meta tag's content. The URL
+ * stays in extension memory and is handed directly to chrome.downloads.download;
+ * it never crosses native messaging or storage. */
+function extractMetaURL(metaName: string): string | null {
+  const el = document.querySelector(`meta[name="${metaName}"]`);
+  if (!(el instanceof HTMLMetaElement)) return null;
+  try {
+    const u = new URL(el.content, location.href);
+    return u.protocol === "https:" ? u.href : null;
+  } catch {
+    return null;
+  }
+}
+
 /** Self-contained resolver for a provider's direct PDF endpoint, injected into
  * the tracked page. It fills {N}/{id} in urlTemplate from idPattern's capture
  * groups against the page URL, and only when the declared entitled download
@@ -1648,7 +1663,7 @@ export class Bridge {
       case "article": {
         const dl = spec.download;
         if (dl && job.download_initiated !== true) {
-          if ((dl.method === "url" || dl.method === "api") && dl.requiresTermsConsent === true) {
+          if ((dl.method === "url" || dl.method === "api" || dl.method === "meta") && dl.requiresTermsConsent === true) {
             const consent = await this.deps.settings.getTermsConsent();
             if (consent !== "accept") {
               // The direct-endpoint fetch bypasses the publisher terms UI, so
@@ -1692,6 +1707,27 @@ export class Bridge {
                 args: [dl.selector, dl.idPattern ?? null, dl.urlTemplate ?? null, dl.jsonField ?? null],
               });
               const url = built[0]?.result;
+              if (typeof url === "string" && url.startsWith("https://")) {
+                this.pendingDownloadURLs.set(url, jobID);
+                try {
+                  const id = await this.deps.downloads.download({
+                    url,
+                    filename: `papio/${jobID}/paper.pdf`,
+                    conflictAction: "uniquify",
+                    saveAs: false,
+                  });
+                  this.downloads.set(jobID, { ids: new Set([id]), ambiguous: false, directOffer: false });
+                } finally {
+                  this.pendingDownloadURLs.delete(url);
+                }
+              }
+            } else if (dl.method === "meta") {
+              const metas = await this.deps.scripting.executeScript({
+                target: { tabId: job.tab_id },
+                func: extractMetaURL,
+                args: [dl.metaName ?? "citation_pdf_url"],
+              });
+              const url = metas[0]?.result;
               if (typeof url === "string" && url.startsWith("https://")) {
                 this.pendingDownloadURLs.set(url, jobID);
                 try {
@@ -1826,6 +1862,20 @@ export class Bridge {
   }
 
   private async onDownloadCreated(item: DownloadItemLike): Promise<void> {
+    // Bind the download's ID to its job synchronously — before any await — so
+    // the onDeterminingFilename event that fires right after onCreated (and must
+    // call suggest() synchronously) can relocate the file into papio/<job>/ by
+    // ID. This is what lets a cross-origin api/url download land correctly:
+    // its provider redirect changes the URL before onDeterminingFilename, but at
+    // creation no redirect has occurred yet, so the pending-offer URL matches
+    // here and the ID is tracked in time.
+    const earlyJobID = this.trackedJobFor(item.id) ?? this.pendingJobFor(item);
+    if (earlyJobID !== undefined) {
+      const early = this.downloads.get(earlyJobID) ?? { ids: new Set<number>(), ambiguous: false, directOffer: false };
+      early.ids.add(item.id);
+      if (early.ids.size > 1) early.ambiguous = true;
+      this.downloads.set(earlyJobID, early);
+    }
     await this.ready;
     // API-started downloads usually have no tabId. Match the exact pending
     // offer URL before applying broad tab/provider correlation.

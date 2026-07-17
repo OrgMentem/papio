@@ -39,7 +39,7 @@ export interface DownloadRule {
    * urlTemplate) and fetches it via chrome.downloads.download — no click, no
    * gesture. The privileged downloads API carries the session cookies, so an
    * entitled endpoint (e.g. JSTOR /stable/pdf/<id>.pdf) is fetched autonomously. */
-  method: "href" | "click" | "url" | "api";
+  method: "href" | "click" | "url" | "api" | "meta";
   shadowSelector?: string;
   /** Wait for this fixture-backed in-page gate before reclassification. */
   postClickWaitFor?: string;
@@ -60,6 +60,11 @@ export interface DownloadRule {
   requiresTermsConsent?: boolean;
   /** method "api": field in the urlTemplate JSON response holding the PDF URL. */
   jsonField?: string;
+  /** method "meta": name of the page meta tag whose content is the entitled PDF
+   * URL (default "citation_pdf_url", the Highwire/Google-Scholar standard that
+   * Elsevier/ScienceDirect and others expose). The URL is fetched via the
+   * privileged downloads API — no click, no gesture — like the "url" method. */
+  metaName?: string;
 }
 
 export interface AdapterSpec {
@@ -415,6 +420,37 @@ export const adapters: AdapterSpec[] = [
       selector: "a#downloadPdfUrl[data-doi][href*='/doi/pdf/']",
       requireKind: "article",
       method: "href",
+    },
+  },
+  {
+    // STRUCTURAL-ONLY (synthetic citation_pdf_url DOM in sciencedirect.test.ts),
+    // NOT yet live-verified.
+    // ScienceDirect sits behind Cloudflare, which bot-challenges automated
+    // capture, so no entitled DOM could be captured under automation at build
+    // time. This adapter follows the citation_pdf_url standard (the
+    // Highwire/Google-Scholar meta tag carrying the entitled pdfft URL that
+    // Elsevier exposes) and fetches it via the privileged downloads API — no
+    // click, no gesture — gated on recorded terms consent, exactly like the
+    // JSTOR url / EBSCO api adapters. Confirm live against a real entitled
+    // session (a warm human browser does not trip Cloudflare) before trusting
+    // it; if ScienceDirect gates the pdfft URL behind an interstitial
+    // (isDTMRedir), the meta URL fetch will need a follow-up.
+    id: "sciencedirect",
+    version: "0.1.0",
+    hosts: ["sciencedirect.com"],
+    settleTimeoutMs: 5000,
+    classify: [
+      {
+        kind: "article",
+        all: ["meta[name='citation_pdf_url']", "meta[name='citation_title']"],
+      },
+    ],
+    download: {
+      selector: "meta[name='citation_pdf_url']",
+      requireKind: "article",
+      method: "meta",
+      metaName: "citation_pdf_url",
+      requiresTermsConsent: true,
     },
   },
 ];
