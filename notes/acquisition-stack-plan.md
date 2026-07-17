@@ -876,3 +876,20 @@ A read-only scout review of the Go daemon's adoption + import path (state confir
 - **#10 P2 (low-freq/high-impact) — crash after Zotero mutation but before ledger finalization can replay the mutation.** `zotio/plan.go:706-727` reclaims any `zotio_apply` row with `result_json IS NULL` as abandoned, then re-invokes the `--yes` mutation — risking a duplicate item/attachment. Fix direction: lease/unknown-outcome reconciliation or provider-side idempotency keyed by the immutable plan. (In foreign/uncommitted `zotio` — do not touch until that work lands.)
 
 Safeguards confirmed present: path confinement + symlink/irregular rejection, dotfile/partial-suffix/ambiguous-file skipping in the scanner, `ClaimNext`/`RecoverStale` reclaim of ordinary active leases, periodic terminal-quarantine sweep, and idempotent Zotio replay once a result is recorded.
+
+## Autonomous JSTOR + EBSCO via url/api download methods (2026-07-17)
+
+Broke the assumption that terms/click-gated providers (JSTOR, EBSCO) need a human gesture. They don't: Chrome gates *provider-JS* downloads on a trusted user gesture the extension SW can't synthesize, but the privileged `chrome.downloads.download` API needs **no** gesture — and both providers serve the entitled PDF at a fetchable endpoint.
+
+Two new `DownloadRule` methods (`extension/src/adapters/types.ts`) + `resolveDownloadURL` (`background.ts`), injected page-side, entitlement-gated, resolved URL handed to the downloads API:
+- **`url`** — build a direct PDF endpoint from the page URL (`idPattern` capture groups fill `{1}`/`{2}`/`{id}` in `urlTemplate`). **JSTOR**: `https://www.jstor.org/stable/pdf/<stableID>.pdf` (200 `application/pdf` with session cookies). Gated on recorded terms consent (`requiresTermsConsent`) since it bypasses the terms UI; without consent it prompts once and stays assisted.
+- **`api`** — build an endpoint that returns JSON, fetch it (session cookies), read the PDF URL from `jsonField`. **EBSCO**: viewer `/c/<opid>/viewer/pdf/<recordId>` → `research.ebsco.com/api/researcher-edge-aggregator/v1/records/<id>/fulltext/pdf` (JSON `{url}`) → `content.ebscohost.com/cds/retrieve` → PDF.
+
+EBSCO is viewer-based (lands on the PDF viewer, not the record page the old click-adapter targeted): added a viewer `article` classify rule (`citation_title` + rendered `canvas`) alongside the retained record-page rules so the 5 record fixtures still classify unchanged.
+
+Live-verified: JSTOR delivered 2 papers end-to-end (attached to Zotero, no gesture); EBSCO ran the full pipeline once — `resolving → institutional_handoff → auth_returned → download_started → download_complete (2.1 MB, no gesture) → needs_review`. Commits `e31a664` (JSTOR url), `88926a3` (api method + resolveDownloadURL), `3f85a04` (EBSCO viewer api). 142 extension tests green.
+
+**Follow-ups:**
+- **EBSCO api-download adoption**: the cross-origin `content.ebscohost.com` response (content-disposition `retrieve.pdf`) landed in `~/Downloads` root and `adoption_deferred` → the job reached `needs_review` with an empty `artifact_sha256`. The autonomous *fetch* works; binding a cross-origin api download to the job (filename honoring + adoption correlation) needs a fix so it flows to `ready`/attach like `href`/`url` downloads.
+- **Identity confirmation for opaque filenames**: EBSCO's generic `retrieve.pdf` gives the identity gate nothing to match, forcing `needs_review`. Consider confirming identity from the job's known metadata (title/DOI) or the PDF's embedded text so entitled api downloads can auto-import.
+- **EBSCO record-page path**: `download.method` is now `api` (viewer). A record-page `article` landing can't api-download (idPattern is viewer-only) and would stay assisted; harmless since the live flow lands on the viewer, but worth confirming the resolver always routes to the viewer.
