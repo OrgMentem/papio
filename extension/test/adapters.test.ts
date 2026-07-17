@@ -18,6 +18,7 @@ import { emptyStore, type StateBackend, type StoreShape, type TermsConsent } fro
 import {
   Bridge,
   clickTermsAccept,
+  resolveDownloadURL,
   type BridgeDeps,
   type DownloadDeltaLike,
   type DownloadItemLike,
@@ -347,7 +348,7 @@ class FakeScripting {
   readonly termsAccepts: { tabId: number; modalSelector: string; textAny: unknown }[] = [];
   readonly interpretTabs: number[] = [];
   constructedURL: string | null = "https://provider.example.edu/pdf/default.pdf";
-  readonly constructedArgs: { tabId: number; selector: string; idPattern: unknown; urlTemplate: unknown }[] = [];
+  readonly constructedArgs: { tabId: number; selector: string; idPattern: unknown; urlTemplate: unknown; jsonField: unknown }[] = [];
   async executeScript(inj: {
     target: { tabId: number };
     func: (...args: never[]) => unknown;
@@ -372,11 +373,10 @@ class FakeScripting {
       });
       return [{ result: true }];
     }
-    // constructDownloadURL(selector, idPattern, urlTemplate): selector is a
-    // string, unlike interpret's leading null — that discriminates the two
-    // 3-arg injections.
-    if (args.length === 3 && typeof args[0] === "string") {
-      this.constructedArgs.push({ tabId: inj.target.tabId, selector: args[0], idPattern: args[1], urlTemplate: args[2] });
+    // resolveDownloadURL(selector, idPattern, urlTemplate, jsonField): uniquely
+    // 4-arg (interpret is 3, click is 5).
+    if (args.length === 4) {
+      this.constructedArgs.push({ tabId: inj.target.tabId, selector: String(args[0]), idPattern: args[1], urlTemplate: args[2], jsonField: args[3] });
       return [{ result: this.constructedURL }];
     }
     this.interpretTabs.push(inj.target.tabId);
@@ -1253,4 +1253,51 @@ test("url-method adapter stays assisted (prompts, no fetch) without terms consen
   expect(h.backend.store.activeJobs[0]?.download_initiated).not.toBe(true);
   const prompts = h.frames().filter((f) => f.type === "provider_outcome" && f.payload["outcome"] === "terms_acceptance_required");
   expect(prompts.length).toBeGreaterThanOrEqual(1);
+});
+
+test("resolveDownloadURL (url): builds the endpoint from a multi-group template + gate", async () => {
+  const win = new Window({ url: "https://www.jstor.org/stable/4093878?seq=1" });
+  win.document.body.innerHTML = "<button class='dl'></button>";
+  const prev = { document: globalThis.document, location: globalThis.location };
+  Object.assign(globalThis, { document: win.document, location: { href: "https://www.jstor.org/stable/4093878?seq=1" } });
+  try {
+    expect(await resolveDownloadURL("button.dl", "/stable/([^?#]+)", "https://www.jstor.org/stable/pdf/{id}.pdf", null)).toBe(
+      "https://www.jstor.org/stable/pdf/4093878.pdf",
+    );
+    // entitlement gate: control absent -> null (never fetch a non-downloadable page)
+    win.document.body.innerHTML = "";
+    expect(await resolveDownloadURL("button.dl", null, "https://x/y.pdf", null)).toBeNull();
+  } finally {
+    Object.assign(globalThis, prev);
+  }
+});
+
+test("resolveDownloadURL (api): fetches the aggregator JSON and extracts the PDF URL", async () => {
+  // EBSCO's exact two-step: viewer URL -> aggregator API (JSON {url}) -> content URL.
+  const win = new Window({ url: "https://research.ebsco.com/c/6to2aa/viewer/pdf/mhqkskujrf?route=details" });
+  win.document.body.innerHTML = "<div id='v'></div>";
+  let fetched = "";
+  const prev = { document: globalThis.document, location: globalThis.location, fetch: globalThis.fetch };
+  Object.assign(globalThis, {
+    document: win.document,
+    location: { href: "https://research.ebsco.com/c/6to2aa/viewer/pdf/mhqkskujrf?route=details" },
+    fetch: async (u: string) => {
+      fetched = u;
+      return { ok: true, json: async () => ({ url: "https://content.ebscohost.com/cds/retrieve?content=TOKEN" }) } as Response;
+    },
+  });
+  try {
+    const url = await resolveDownloadURL(
+      "#v",
+      "/c/([^/]+)/viewer/pdf/([^/?#]+)",
+      "https://research.ebsco.com/api/researcher-edge-aggregator/v1/records/{2}/fulltext/pdf?sourceRecordId={2}&opid={1}&intent=view",
+      "url",
+    );
+    expect(fetched).toBe(
+      "https://research.ebsco.com/api/researcher-edge-aggregator/v1/records/mhqkskujrf/fulltext/pdf?sourceRecordId=mhqkskujrf&opid=6to2aa&intent=view",
+    );
+    expect(url).toBe("https://content.ebscohost.com/cds/retrieve?content=TOKEN");
+  } finally {
+    Object.assign(globalThis, prev);
+  }
 });

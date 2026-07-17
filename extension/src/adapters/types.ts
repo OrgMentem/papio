@@ -39,7 +39,7 @@ export interface DownloadRule {
    * urlTemplate) and fetches it via chrome.downloads.download — no click, no
    * gesture. The privileged downloads API carries the session cookies, so an
    * entitled endpoint (e.g. JSTOR /stable/pdf/<id>.pdf) is fetched autonomously. */
-  method: "href" | "click" | "url";
+  method: "href" | "click" | "url" | "api";
   shadowSelector?: string;
   /** Wait for this fixture-backed in-page gate before reclassification. */
   postClickWaitFor?: string;
@@ -48,16 +48,18 @@ export interface DownloadRule {
   followupSelector?: string;
   /** Shared bounded wait for post-click gate/follow-up insertion. */
   postClickTimeoutMs?: number;
-  /** method "url": regex matched against the page URL; capture group 1 fills
-   * {id} in urlTemplate. */
+  /** method "url"/"api": regex matched against the page URL; capture groups fill
+   * {1},{2},… (and {id} = {1}) in urlTemplate. */
   idPattern?: string;
-  /** method "url": HTTPS template with a single {id} placeholder resolving to
-   * the direct PDF endpoint. */
+  /** method "url": the resolved HTTPS PDF endpoint. method "api": an HTTPS
+   * endpoint returning JSON whose jsonField holds the PDF URL. */
   urlTemplate?: string;
   /** method "url": fetch the endpoint only when the user has recorded consent to
    * auto-accept publisher terms (the fetch bypasses the terms UI); without
    * consent the gate stays human, prompted once. */
   requiresTermsConsent?: boolean;
+  /** method "api": field in the urlTemplate JSON response holding the PDF URL. */
+  jsonField?: string;
 }
 
 export interface AdapterSpec {

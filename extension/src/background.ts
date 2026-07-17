@@ -258,27 +258,42 @@ function extractDownloadURL(selector: string): string | null {
   }
 }
 
-/** Self-contained builder for a provider's direct PDF endpoint, injected into
- * the tracked page. It fills {id} in urlTemplate from idPattern's first capture
- * against the page URL, and only when the declared entitled download control is
- * present (the same signal the `article` verdict uses). The URL is handed to
- * chrome.downloads.download, which carries the session cookies; it never crosses
- * native messaging or storage. */
-function constructDownloadURL(
+/** Self-contained resolver for a provider's direct PDF endpoint, injected into
+ * the tracked page. It fills {N}/{id} in urlTemplate from idPattern's capture
+ * groups against the page URL, and only when the declared entitled download
+ * control is present (the same signal the `article` verdict uses). For method
+ * "api" the built URL returns JSON carrying the real download URL in jsonField
+ * (fetched with the page's session cookies). The resolved URL is handed to
+ * chrome.downloads.download; it never crosses native messaging or storage. */
+export async function resolveDownloadURL(
   selector: string,
   idPattern: string | null,
   urlTemplate: string | null,
-): string | null {
+  jsonField: string | null,
+): Promise<string | null> {
   if (!urlTemplate) return null;
   if (!document.querySelector(selector)) return null;
-  let id = "";
+  let built = urlTemplate;
   if (idPattern) {
     const m = location.href.match(new RegExp(idPattern));
-    if (!m || m[1] === undefined) return null;
-    id = m[1];
+    if (!m) return null;
+    built = built.replace(/\{(\d+|id)\}/g, (_, k: string) => m[k === "id" ? 1 : Number(k)] ?? "");
+  }
+  let target = built;
+  if (jsonField) {
+    try {
+      const r = await fetch(built, { credentials: "include" });
+      if (!r.ok) return null;
+      const data = (await r.json()) as Record<string, unknown>;
+      const raw = data[jsonField];
+      if (typeof raw !== "string") return null;
+      target = raw;
+    } catch {
+      return null;
+    }
   }
   try {
-    const u = new URL(urlTemplate.replace("{id}", id), location.href);
+    const u = new URL(target, location.href);
     return u.protocol === "https:" ? u.href : null;
   } catch {
     return null;
@@ -1633,7 +1648,7 @@ export class Bridge {
       case "article": {
         const dl = spec.download;
         if (dl && job.download_initiated !== true) {
-          if (dl.method === "url" && dl.requiresTermsConsent === true) {
+          if ((dl.method === "url" || dl.method === "api") && dl.requiresTermsConsent === true) {
             const consent = await this.deps.settings.getTermsConsent();
             if (consent !== "accept") {
               // The direct-endpoint fetch bypasses the publisher terms UI, so
@@ -1670,11 +1685,11 @@ export class Bridge {
               if (clicked && dl.postClickWaitFor !== undefined) {
                 await this.reclassifyCurrentProviderPage(jobID);
               }
-            } else if (dl.method === "url") {
+            } else if (dl.method === "url" || dl.method === "api") {
               const built = await this.deps.scripting.executeScript({
                 target: { tabId: job.tab_id },
-                func: constructDownloadURL,
-                args: [dl.selector, dl.idPattern ?? null, dl.urlTemplate ?? null],
+                func: resolveDownloadURL,
+                args: [dl.selector, dl.idPattern ?? null, dl.urlTemplate ?? null, dl.jsonField ?? null],
               });
               const url = built[0]?.result;
               if (typeof url === "string" && url.startsWith("https://")) {
