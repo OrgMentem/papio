@@ -197,10 +197,40 @@
         font-weight: 700;
         letter-spacing: 0.01em;
       }
+      header {
+        position: relative;
+      }
+      .settings-btn {
+        background: none;
+        border: none;
+        border-radius: 6px;
+        color: #607080;
+        cursor: pointer;
+        line-height: 0;
+        padding: 4px;
+        position: absolute;
+        right: 0;
+        top: 0;
+      }
+      .settings-btn:hover {
+        background: #f4f7f9;
+        color: #283849;
+      }
+      .settings-btn svg {
+        display: block;
+        height: 18px;
+        width: 18px;
+      }
     </style>
   </head>
   <body>
     <header>
+      <button id="settings-btn" class="settings-btn" type="button" title="Settings" aria-label="Settings">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <circle cx="12" cy="12" r="3"/>
+          <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+        </svg>
+      </button>
       <div class="brand">
         <svg viewBox="0 0 512 512" role="img" aria-label="papio">
           <path d="M 95.0 374.6 A 200 200 0 1 1 243.7 455.6" fill="none" stroke="#2b2d42" stroke-width="46" stroke-linecap="round"/>

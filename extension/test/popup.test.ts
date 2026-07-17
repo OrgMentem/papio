@@ -5,7 +5,7 @@ import { readFileSync } from "node:fs";
 
 import { Window } from "happy-dom";
 
-import { cancelJob, focusJob, renderJobs, type PopupActions } from "../src/popup";
+import { cancelJob, focusJob, renderJobs, wireSettings, type PopupActions } from "../src/popup";
 import type { ActiveJob } from "../src/state";
 
 function popupDocument(): Document {
@@ -80,7 +80,8 @@ test("renders a batch with needs-you first and correct phase counts", () => {
 test("focus button activates the correct broker-owned tab and then its window", async () => {
   const doc = popupDocument();
   const tabCalls: Array<[number, { active: boolean }]> = [];
-  const windowCalls: Array<[number, { focused: boolean }]> = [];
+  const windowCalls: Array<[number, { focused: boolean; state?: string }]> = [];
+  let windowState = "normal";
   Object.assign(globalThis, {
     chrome: {
       tabs: {
@@ -90,21 +91,35 @@ test("focus button activates the correct broker-owned tab and then its window", 
         },
       },
       windows: {
-        update: async (windowID: number, properties: { focused: boolean }) => {
+        get: async (windowID: number) => ({ id: windowID, state: windowState }),
+        update: async (windowID: number, properties: { focused: boolean; state?: string }) => {
           windowCalls.push([windowID, properties]);
         },
       },
     },
   });
-  const actions: PopupActions = { cancel: async () => {}, focus: focusJob };
+  // Capture the wired action's promise so completion is awaited directly,
+  // instead of guessing a scheduler delay.
+  let focused: Promise<void> = Promise.resolve();
+  const actions: PopupActions = {
+    cancel: async () => {},
+    focus: (target) => (focused = focusJob(target)),
+  };
   renderJobs(doc, [job("auth_pending", { tab_id: 91 })], actions);
 
   const focus = Array.from(doc.querySelectorAll("button")).find((button) => button.textContent === "Focus");
   focus?.click();
-  await Promise.resolve();
+  await focused;
 
+  // A normal window keeps its state — focus only, never a forced resize.
   expect(tabCalls).toEqual([[91, { active: true }]]);
   expect(windowCalls).toEqual([[42, { focused: true }]]);
+
+  // A minimized work window is restored while it is focused.
+  windowState = "minimized";
+  focus?.click();
+  await focused;
+  expect(windowCalls[1]).toEqual([42, { focused: true, state: "normal" }]);
 });
 
 test("cancel remains wired for an in-flight handoff", async () => {
@@ -129,4 +144,20 @@ test("cancel remains wired for an in-flight handoff", async () => {
 
   expect(messages).toEqual([{ channel: "papio", action: "cancel", job_id: "cancel-me" }]);
   expect(doc.querySelector("#in-flight-list .job")).toBeNull();
+});
+
+test("settings cog opens the options page and closes the popup", () => {
+  const doc = popupDocument();
+  let opened = 0;
+  let closed = 0;
+  Object.assign(globalThis, {
+    chrome: { runtime: { openOptionsPage: () => { opened += 1; return Promise.resolve(); } } },
+    window: { close: () => { closed += 1; } },
+  });
+  wireSettings(doc);
+  const button = doc.getElementById("settings-btn") as unknown as HTMLButtonElement;
+  expect(button).not.toBeNull();
+  button.click();
+  expect(opened).toBe(1);
+  expect(closed).toBe(1);
 });

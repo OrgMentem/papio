@@ -66,7 +66,14 @@ function titleFor(job: ActiveJob): string {
 
 export async function focusJob(job: ActiveJob): Promise<void> {
   const tab = await chrome.tabs.update(job.tab_id, { active: true });
-  if (tab?.windowId !== undefined) await chrome.windows.update(tab.windowId, { focused: true });
+  if (tab?.windowId === undefined) return;
+  // Work-window tabs live in a minimized window; restore before focusing.
+  // A normal/maximized window keeps its state — only focus changes.
+  const win = await chrome.windows.get(tab.windowId);
+  await chrome.windows.update(tab.windowId, {
+    focused: true,
+    ...(win.state === "minimized" ? { state: "normal" as const } : {}),
+  });
 }
 export async function cancelJob(jobID: string): Promise<void> {
   await chrome.runtime.sendMessage({ channel: "papio", action: "cancel", job_id: jobID });
@@ -293,7 +300,19 @@ export function wireCapture(doc: Document = document): void {
   });
 }
 
+export function wireSettings(doc: Document = document): void {
+  const button = doc.getElementById("settings-btn");
+  if (!(button instanceof HTMLButtonElement)) {
+    return;
+  }
+  button.addEventListener("click", () => {
+    void chrome.runtime.openOptionsPage();
+    window.close();
+  });
+}
+
 if (typeof document !== "undefined" && typeof chrome !== "undefined") {
   wireCapture();
+  wireSettings();
   void refresh();
 }
