@@ -309,10 +309,24 @@ func (b *AcquisitionBundle) Validate() error {
 	if b.Identity.DOI != "" && !doiRE.MatchString(b.Identity.DOI) {
 		return fmt.Errorf("invalid identity.doi %q", b.Identity.DOI)
 	}
-	if len(b.Identity.Title) < 3 || len(b.Identity.Title) > 500 {
+	// Full bibliographic identity is authoritative only for NEW-item bundles,
+	// where Papio creates the Zotero item from the bundle. For an
+	// attach-to-existing bundle (ZotioItemKey set) the item already exists in
+	// Zotero with its own metadata and the attach carries only the item key and
+	// file, so title/authors are descriptive, not required — but their upper
+	// bounds still apply to any values that are present.
+	if b.ZotioItemKey == "" {
+		if len(b.Identity.Title) < 3 {
+			return fmt.Errorf("identity.title length out of range")
+		}
+		if len(b.Identity.Authors) == 0 {
+			return fmt.Errorf("identity.authors must have 1..100 entries")
+		}
+	}
+	if len(b.Identity.Title) > 500 {
 		return fmt.Errorf("identity.title length out of range")
 	}
-	if len(b.Identity.Authors) == 0 || len(b.Identity.Authors) > 100 {
+	if len(b.Identity.Authors) > 100 {
 		return fmt.Errorf("identity.authors must have 1..100 entries")
 	}
 	if b.Identity.Year != 0 && (b.Identity.Year < 1000 || b.Identity.Year > 2100) {

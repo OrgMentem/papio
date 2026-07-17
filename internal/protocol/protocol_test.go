@@ -101,3 +101,60 @@ func TestBundlePathMustMatchSHA(t *testing.T) {
 		t.Fatalf("path-mismatch err = %v, want content-address mismatch", derr)
 	}
 }
+
+// Identity invariants are route-aware: a new-item bundle (no zotio_item_key)
+// must carry full bibliographic identity, but an attach-to-existing bundle only
+// carries an item key + file, so its identity is descriptive and optional. This
+// is the `acquire --from-zotio` unblock — authorless Zotero items must still
+// attach.
+func TestBundleIdentityInvariantsAreRouteAware(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join(corpusDir(t, "valid"), "acquisition-bundle-min.json"))
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+	base, err := DecodeAcquisitionBundle(data)
+	if err != nil {
+		t.Fatalf("decode base fixture: %v", err)
+	}
+
+	t.Run("new_item_requires_authors", func(t *testing.T) {
+		b := *base
+		b.ZotioItemKey = ""
+		b.Identity.Authors = nil
+		if err := b.Validate(); err == nil || !strings.Contains(err.Error(), "authors") {
+			t.Fatalf("authorless new-item bundle err = %v, want authors invariant", err)
+		}
+	})
+
+	t.Run("new_item_requires_title", func(t *testing.T) {
+		b := *base
+		b.ZotioItemKey = ""
+		b.Identity.Title = "ab"
+		if err := b.Validate(); err == nil || !strings.Contains(err.Error(), "title") {
+			t.Fatalf("short-title new-item bundle err = %v, want title invariant", err)
+		}
+	})
+
+	t.Run("attach_allows_missing_identity", func(t *testing.T) {
+		b := *base
+		b.ZotioItemKey = "AB12CD34"
+		b.Identity.Authors = nil
+		b.Identity.Title = ""
+		if err := b.Validate(); err != nil {
+			t.Fatalf("authorless attach bundle rejected: %v", err)
+		}
+	})
+
+	t.Run("attach_still_bounds_authors", func(t *testing.T) {
+		b := *base
+		b.ZotioItemKey = "AB12CD34"
+		big := make([]string, 101)
+		for i := range big {
+			big[i] = "x"
+		}
+		b.Identity.Authors = big
+		if err := b.Validate(); err == nil || !strings.Contains(err.Error(), "authors") {
+			t.Fatalf("101-author attach bundle err = %v, want upper-bound rejection", err)
+		}
+	})
+}
