@@ -6,6 +6,18 @@ records in `notes/acquisition-stack-plan.md`.
 
 ## [Unreleased]
 
+### Added
+
+- Brand: a papio logo — an oblique lowercase **p** (coral `#E85D4A`) inside a
+  broken ink ring (`#2B2D42`); the p's descender becomes a download arrow that
+  exits through the ring's bottom gap. Structural sibling of the zotio badge
+  with its own palette. Vector sources live in `docs/assets/` (`logo.svg`,
+  `logo-dark.svg` for dark surfaces, `logo-tile.svg` for theme-agnostic toolbar
+  icons, `logo-wordmark.svg`, `logo-wordmark-dark.svg`) and are used in the
+  README wordmark header, the docs site logo/favicon (`mkdocs.yml`), the Chrome
+  extension toolbar/action icons (`extension/icons/`, wired in
+  `manifest.json`), and the extension popup header.
+
 ### Fixed
 
 - Reliability: overlapping extension state writes are now persisted through a

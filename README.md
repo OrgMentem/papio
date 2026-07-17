@@ -1,4 +1,10 @@
-# papio
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/logo-wordmark-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="docs/assets/logo-wordmark.svg">
+    <img alt="papio" src="docs/assets/logo-wordmark.svg" width="200">
+  </picture>
+</p>
 
 Papio is a local paper-acquisition broker: it searches scholarly works, creates
 validated provenance-tracked PDF jobs, and hands ready artifacts to

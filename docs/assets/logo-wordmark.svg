@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 660">
+  <title>papio</title>
+  <desc>papio mark: an oblique lowercase p inside a broken ring; the p's descender becomes a download arrow exiting through the ring's bottom gap — the paper fetcher reaching out of the library.</desc>
+  <g transform="translate(56.5 0) scale(0.78)">
+    <path d="M 95.0 374.6 A 200 200 0 1 1 243.7 455.6" fill="none" stroke="#2B2D42" stroke-width="46" stroke-linecap="round"/>
+  <g transform="translate(264 244) skewX(-10)">
+    <circle cx="0" cy="0" r="68" fill="none" stroke="#E85D4A" stroke-width="42"/>
+  </g>
+  <path d="M 208.0 176.0 L 163.2 430.0" fill="none" stroke="#E85D4A" stroke-width="42" stroke-linecap="round"/>
+  <path d="M 115.7 416.0 L 215.7 416.0 L 152.6 490.0 Z" fill="#E85D4A" stroke="#E85D4A" stroke-width="10" stroke-linejoin="round"/>
+  </g>
+  <text x="256" y="600" text-anchor="middle" font-family="Helvetica Neue, Helvetica, Arial, sans-serif" font-size="150" font-weight="600" font-style="italic" letter-spacing="2" fill="#2B2D42">papio</text>
+</svg>
