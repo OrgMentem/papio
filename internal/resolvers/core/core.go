@@ -465,7 +465,11 @@ func temporaryStatus(source string, resp *http.Response) error {
 	return &resolver.TemporaryError{Err: fmt.Errorf("%s: API returned HTTP %d", source, resp.StatusCode), RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After"), time.Now())}
 }
 func parseRetryAfter(value string, now time.Time) time.Duration {
-	if seconds, err := strconv.Atoi(strings.TrimSpace(value)); err == nil && seconds >= 0 {
+	if seconds, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64); err == nil && seconds >= 0 {
+		const maxDuration = time.Duration(1<<63 - 1)
+		if seconds > int64(maxDuration/time.Second) {
+			return maxDuration
+		}
 		return time.Duration(seconds) * time.Second
 	}
 	if when, err := http.ParseTime(value); err == nil && when.After(now) {

@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"papio/internal/redact"
 	"papio/internal/resolver"
@@ -292,4 +293,71 @@ func TestRetryClasses(t *testing.T) {
 			t.Fatalf("network failure must be temporary; err=%v", err)
 		}
 	})
+}
+
+// TestSelectResultRequiresPositiveIdentity pins that an identifier-scoped query
+// only selects a result whose DOI/PMID field positively equals the request. A
+// result whose identifier field is empty cannot be verified and is rejected, so
+// a wrong (or unverifiable) work is never emitted.
+func TestSelectResultRequiresPositiveIdentity(t *testing.T) {
+	t.Run("pmid empty field not selected", func(t *testing.T) {
+		requested := work.Work{PMID: "12345"}
+		results := []epmcResult{{ID: "a", PMID: ""}}
+		if got := selectResult(results, requested, matchPMID); got != nil {
+			t.Errorf("selectResult with empty PMID field = %+v, want nil", got)
+		}
+	})
+	t.Run("pmid matching field selected", func(t *testing.T) {
+		requested := work.Work{PMID: "12345"}
+		results := []epmcResult{{ID: "a", PMID: ""}, {ID: "b", PMID: "12345"}}
+		got := selectResult(results, requested, matchPMID)
+		if got == nil || got.ID != "b" {
+			t.Errorf("selectResult matching PMID = %+v, want result b", got)
+		}
+	})
+	t.Run("doi empty field not selected", func(t *testing.T) {
+		requested := work.Work{DOI: "10.1000/test"}
+		results := []epmcResult{{ID: "a", DOI: ""}}
+		if got := selectResult(results, requested, matchDOI); got != nil {
+			t.Errorf("selectResult with empty DOI field = %+v, want nil", got)
+		}
+	})
+	t.Run("doi matching field selected", func(t *testing.T) {
+		requested := work.Work{DOI: "10.1000/test"}
+		results := []epmcResult{{ID: "a", DOI: ""}, {ID: "b", DOI: "10.1000/test"}}
+		got := selectResult(results, requested, matchDOI)
+		if got == nil || got.ID != "b" {
+			t.Errorf("selectResult matching DOI = %+v, want result b", got)
+		}
+	})
+}
+
+// TestParseRetryAfterClampsHugeValues pins the overflow-safe Retry-After
+// parsing: a header large enough to overflow the nanosecond multiply must clamp
+// to the max duration rather than wrap to a garbage (possibly negative) value.
+func TestParseRetryAfterClampsHugeValues(t *testing.T) {
+	const maxDuration = time.Duration(1<<63 - 1)
+	now := time.Now()
+	cases := []struct {
+		name  string
+		value string
+		want  time.Duration
+	}{
+		{"empty", "", 0},
+		{"garbage", "not-a-number", 0},
+		{"normal seconds", "5", 5 * time.Second},
+		{"overflow multiply clamps to max", "99999999999", maxDuration},
+		{"beyond int64 range falls through", "9999999999999999999", 0},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := parseRetryAfter(c.value, now)
+			if got != c.want {
+				t.Errorf("parseRetryAfter(%q) = %v, want %v", c.value, got, c.want)
+			}
+			if got < 0 {
+				t.Errorf("parseRetryAfter(%q) = %v, must never be negative", c.value, got)
+			}
+		})
+	}
 }

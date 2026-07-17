@@ -255,19 +255,26 @@ func selectResult(results []epmcResult, requested work.Work, mode matchMode) *ep
 	}
 	switch mode {
 	case matchDOI:
-		want, _ := work.NormalizeDOI(requested.DOI)
+		want, err := work.NormalizeDOI(requested.DOI)
+		if err != nil || want == "" {
+			return nil
+		}
 		for i := range results {
-			got := strings.TrimSpace(results[i].DOI)
-			if got == "" || strings.EqualFold(got, want) {
+			// An identifier-scoped query must confirm the requested identity;
+			// a record whose DOI field is absent cannot be verified as the
+			// requested work, so it is never selected.
+			if strings.EqualFold(strings.TrimSpace(results[i].DOI), want) {
 				return &results[i]
 			}
 		}
 		return nil
 	case matchPMID:
-		want, _ := work.NormalizePMID(requested.PMID)
+		want, err := work.NormalizePMID(requested.PMID)
+		if err != nil || want == "" {
+			return nil
+		}
 		for i := range results {
-			got := strings.TrimSpace(results[i].PMID)
-			if got == "" || got == want {
+			if strings.TrimSpace(results[i].PMID) == want {
 				return &results[i]
 			}
 		}
@@ -401,7 +408,11 @@ func parseRetryAfter(value string, now time.Time) time.Duration {
 	if value == "" {
 		return 0
 	}
-	if seconds, err := strconv.Atoi(value); err == nil && seconds >= 0 {
+	if seconds, err := strconv.ParseInt(value, 10, 64); err == nil && seconds >= 0 {
+		const maxDuration = time.Duration(1<<63 - 1)
+		if seconds > int64(maxDuration/time.Second) {
+			return maxDuration
+		}
 		return time.Duration(seconds) * time.Second
 	}
 	if deadline, err := http.ParseTime(value); err == nil && deadline.After(now) {

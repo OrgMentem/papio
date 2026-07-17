@@ -242,3 +242,33 @@ func TestResolveRequiresTextMiningMarkerAndLeavesUnknownVersionUnknown(t *testin
 		t.Fatalf("unknown content version mapped to %q", got[0].Version)
 	}
 }
+
+// TestParseRetryAfterClampsHugeValues pins the overflow-safe Retry-After
+// parsing: a header large enough to overflow the nanosecond multiply must clamp
+// to the max duration rather than wrap to a garbage (possibly negative) value.
+func TestParseRetryAfterClampsHugeValues(t *testing.T) {
+	const maxDuration = time.Duration(1<<63 - 1)
+	now := time.Now()
+	cases := []struct {
+		name  string
+		value string
+		want  time.Duration
+	}{
+		{"empty", "", 0},
+		{"garbage", "not-a-number", 0},
+		{"normal seconds", "5", 5 * time.Second},
+		{"overflow multiply clamps to max", "99999999999", maxDuration},
+		{"beyond int64 range falls through", "9999999999999999999", 0},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := parseRetryAfter(c.value, now)
+			if got != c.want {
+				t.Errorf("parseRetryAfter(%q) = %v, want %v", c.value, got, c.want)
+			}
+			if got < 0 {
+				t.Errorf("parseRetryAfter(%q) = %v, must never be negative", c.value, got)
+			}
+		})
+	}
+}

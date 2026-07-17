@@ -308,7 +308,11 @@ func parseRetryAfter(value string, now time.Time) time.Duration {
 	if value == "" {
 		return 0
 	}
-	if seconds, err := strconv.Atoi(value); err == nil && seconds >= 0 {
+	if seconds, err := strconv.ParseInt(value, 10, 64); err == nil && seconds >= 0 {
+		const maxDuration = time.Duration(1<<63 - 1)
+		if seconds > int64(maxDuration/time.Second) {
+			return maxDuration
+		}
 		return time.Duration(seconds) * time.Second
 	}
 	if deadline, err := http.ParseTime(value); err == nil && deadline.After(now) {
