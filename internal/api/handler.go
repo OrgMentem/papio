@@ -606,12 +606,14 @@ func failure(err error) ([]byte, *ipc.RPCError) {
 	case errors.As(err, &actionKind):
 		return nil, &ipc.RPCError{Code: "invalid_argument", Message: safeMessage(err, "unsupported human action")}
 	default:
+		log.Printf("rpc internal error: %v", err)
 		return nil, &ipc.RPCError{Code: "internal", Message: "operation failed"}
 	}
 }
 
 func zotioFailure(err error) ([]byte, *ipc.RPCError) {
 	info := zotio.ErrorInfoFrom(err)
+	log.Printf("rpc zotio error [%s]: %v", info.Class, err)
 	detail := &ipc.ErrorDetail{
 		ErrorClass:      info.Class,
 		ErrorHint:       info.Hint,
@@ -622,6 +624,7 @@ func zotioFailure(err error) ([]byte, *ipc.RPCError) {
 
 func watchFailure(err error) ([]byte, *ipc.RPCError) {
 	info := zotio.ErrorInfoFrom(err)
+	log.Printf("rpc watch error [%s]: %v", info.Class, err)
 	if info.Class == zotio.ErrorClassUnknown {
 		info.Class = "watch_execution_failed"
 		info.Hint = watchErrorHint(err)

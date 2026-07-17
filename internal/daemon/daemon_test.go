@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"sync"
@@ -126,6 +127,54 @@ func TestAutostarterUsesExecutableCommandSeamOnce(t *testing.T) {
 		if calls[0][i] != want[i] {
 			t.Fatalf("command args = %#v, want %#v", calls[0], want)
 		}
+	}
+}
+
+func TestAutostarterRoutesDaemonOutputToLog(t *testing.T) {
+	// stdout/stderr must persist to the daemon log (not /dev/null) so swallowed
+	// server-side errors stay diagnosable; stdin stays discarded.
+	dir := t.TempDir()
+	nullFile, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nullFile.Close()
+	logFile, err := os.CreateTemp(dir, "daemon-*.log")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer logFile.Close()
+	started := false
+	starter := &Autostarter{
+		SocketPath:    filepath.Join(dir, "papio.sock"),
+		StartTimeout:  time.Second,
+		RetryInterval: time.Millisecond,
+		Executable:    func() (string, error) { return "/test/papio", nil },
+		Command:       func(name string, args ...string) *exec.Cmd { return exec.Command(name, args...) },
+		OpenNull:      func() (*os.File, error) { return nullFile, nil },
+		OpenLog:       func() (*os.File, error) { return logFile, nil },
+		Start: func(_ context.Context, cmd *exec.Cmd) error {
+			if cmd.Stdin != nullFile {
+				t.Error("daemon stdin should be discarded to null")
+			}
+			if cmd.Stdout != logFile || cmd.Stderr != logFile {
+				t.Error("daemon stdout/stderr should route to the log file, not null")
+			}
+			started = true
+			return nil
+		},
+		Ready: func(context.Context, string) error {
+			if !started {
+				return errors.New("not ready")
+			}
+			return nil
+		},
+	}
+	if err := starter.Ensure(context.Background()); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	if !started {
+		t.Fatal("daemon was not started")
 	}
 }
 

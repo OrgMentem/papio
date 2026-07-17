@@ -24,6 +24,7 @@ type Autostarter struct {
 	SocketPath string
 	Args       []string
 	LockPath   string
+	LogPath    string
 
 	StartTimeout  time.Duration
 	RetryInterval time.Duration
@@ -33,6 +34,7 @@ type Autostarter struct {
 	Start      func(context.Context, *exec.Cmd) error
 	Ready      func(context.Context, string) error
 	OpenNull   func() (*os.File, error)
+	OpenLog    func() (*os.File, error)
 }
 
 // NewAutostarter returns an autostarter with production-safe defaults.
@@ -82,13 +84,26 @@ func (a *Autostarter) Ensure(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("open detached daemon stdio: %w", err)
 	}
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = null, null, null
+	logFile, err := cfg.OpenLog()
+	if err != nil {
+		_ = null.Close()
+		return fmt.Errorf("open detached daemon log: %w", err)
+	}
+	// stdin is discarded; stdout/stderr persist to the daemon log so that
+	// server-side errors (see the api failure handlers, which log the wrapped
+	// error before returning a safe RPC message) remain diagnosable after the
+	// detached daemon outlives this caller. Previously all three went to
+	// /dev/null, turning any swallowed error into an undebuggable [unknown].
+	cmd.Stdin = null
+	cmd.Stdout, cmd.Stderr = logFile, logFile
 	if err := ctx.Err(); err != nil {
 		_ = null.Close()
+		_ = logFile.Close()
 		return err
 	}
 	err = cfg.Start(ctx, cmd)
 	_ = null.Close()
+	_ = logFile.Close()
 	if err != nil {
 		return fmt.Errorf("start daemon: %w", err)
 	}
@@ -115,6 +130,9 @@ func (a *Autostarter) defaults() (Autostarter, error) {
 	if cfg.LockPath == "" {
 		cfg.LockPath = cfg.SocketPath + ".start.lock"
 	}
+	if cfg.LogPath == "" {
+		cfg.LogPath = filepath.Join(filepath.Dir(cfg.SocketPath), "daemon.log")
+	}
 	if cfg.StartTimeout <= 0 {
 		cfg.StartTimeout = 5 * time.Second
 	}
@@ -140,6 +158,12 @@ func (a *Autostarter) defaults() (Autostarter, error) {
 	}
 	if cfg.OpenNull == nil {
 		cfg.OpenNull = func() (*os.File, error) { return os.OpenFile(os.DevNull, os.O_RDWR, 0) }
+	}
+	if cfg.OpenLog == nil {
+		logPath := cfg.LogPath
+		cfg.OpenLog = func() (*os.File, error) {
+			return os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+		}
 	}
 	return cfg, nil
 }
