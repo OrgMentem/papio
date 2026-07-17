@@ -118,3 +118,31 @@ func TestClassifyIdentifier(t *testing.T) {
 		t.Error("ClassifyIdentifier(gibberish) succeeded, want error")
 	}
 }
+
+func TestNormalizePMID(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"12345", "12345"},
+		{"007", "7"},          // leading zeros trimmed, still a positive id
+		{"pmid:12345", "12345"}, // prefix stripped
+		{" 12345 ", "12345"},  // surrounding space trimmed
+		{"0", ""},             // zero is not a positive PMID -> error
+		{"0000000000", ""},    // all-zero trims to empty -> error
+		{"12a45", ""},         // non-digits rejected
+		{"", ""},
+	}
+	for _, c := range cases {
+		got, err := NormalizePMID(c.in)
+		if c.want == "" {
+			if err == nil {
+				t.Errorf("NormalizePMID(%q) = %q, want error", c.in, got)
+			}
+			continue
+		}
+		if err != nil || got != c.want {
+			t.Errorf("NormalizePMID(%q) = %q, %v; want %q", c.in, got, err, c.want)
+		}
+	}
+}

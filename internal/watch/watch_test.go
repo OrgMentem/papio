@@ -117,6 +117,43 @@ func TestDueSelectsEnabledExpiredWatches(t *testing.T) {
 	}
 }
 
+func TestDueSkipsCorruptLastRun(t *testing.T) {
+	ctx := context.Background()
+	watches := testStore(t)
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	healthy := createWatch(t, watches, testWatchInput("healthy"))
+	corrupt := createWatch(t, watches, testWatchInput("corrupt"))
+	if _, err := watches.S.DB().ExecContext(ctx, `UPDATE watches SET last_run_at = ? WHERE id = ?`, "not-a-timestamp", corrupt.ID); err != nil {
+		t.Fatal(err)
+	}
+	selected, err := watches.Due(ctx, now)
+	if err != nil {
+		t.Fatalf("Due returned error on corrupt row: %v", err)
+	}
+	var sawHealthy, sawCorrupt bool
+	for _, watch := range selected {
+		switch watch.ID {
+		case healthy.ID:
+			sawHealthy = true
+		case corrupt.ID:
+			sawCorrupt = true
+		}
+	}
+	if !sawHealthy {
+		t.Fatalf("healthy watch %d missing from due result %+v", healthy.ID, selected)
+	}
+	if sawCorrupt {
+		t.Fatalf("corrupt watch %d must be skipped, got %+v", corrupt.ID, selected)
+	}
+	got, err := watches.Get(ctx, corrupt.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.LastError == "" {
+		t.Fatalf("corrupt watch last_error = %q, want recorded parse failure", got.LastError)
+	}
+}
+
 type fakeDiscovery struct {
 	works  []discovery.DiscoveredWork
 	err    error

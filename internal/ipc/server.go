@@ -58,6 +58,9 @@ func (r Router) Handle(ctx context.Context, req Request) ([]byte, *RPCError) {
 type Server struct {
 	SocketPath string
 	Handler    Handler
+	// IdleTimeout bounds reading one request and writing its response on an
+	// accepted connection. Zero uses DefaultConnIdleTimeout.
+	IdleTimeout time.Duration
 
 	callMu sync.Mutex
 }
@@ -215,6 +218,15 @@ func (s *Server) ServeListener(ctx context.Context, listener net.Listener) error
 }
 
 func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
+	timeout := s.IdleTimeout
+	if timeout <= 0 {
+		timeout = DefaultConnIdleTimeout
+	}
+	// Framing relies on EOF after CloseWrite, so a half-open peer that opens
+	// the socket and sends a partial frame (or nothing) without closing would
+	// otherwise block this goroutine and hold its fd until daemon shutdown.
+	// Bound the request read so such a client is reaped instead.
+	_ = conn.SetReadDeadline(time.Now().Add(timeout))
 	req, err := DecodeRequest(conn)
 	if err != nil {
 		return
@@ -239,6 +251,9 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
 			return
 		}
 	}
+	// Bound the response write so a client that never reads cannot stall this
+	// goroutine indefinitely.
+	_ = conn.SetWriteDeadline(time.Now().Add(timeout))
 	_, _ = conn.Write(data)
 }
 

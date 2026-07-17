@@ -180,13 +180,32 @@ func (s *Store) Due(ctx context.Context, now time.Time) ([]Watch, error) {
 		}
 		lastRun, err := time.Parse(time.RFC3339Nano, watch.LastRunAt)
 		if err != nil {
-			return nil, fmt.Errorf("parsing watch %d last_run_at: %w", watch.ID, err)
+			// A single corrupt/legacy last_run_at (schema drift, manual DB
+			// edit, or a future writer) must not abort the whole sweep and
+			// silently halt every other enabled watch. Isolate the bad row:
+			// skip it and record an operator-visible diagnostic. A later forced
+			// run rewrites a valid timestamp and clears the annotation.
+			s.recordCorruptLastRun(ctx, watch.ID, watch.LastRunAt, err)
+			continue
 		}
 		if !lastRun.Add(time.Duration(watch.CadenceHours) * time.Hour).After(now) {
 			due = append(due, watch)
 		}
 	}
 	return due, nil
+}
+
+// recordCorruptLastRun best-effort annotates a watch whose stored last_run_at
+// could not be parsed so the fault surfaces via `watch list` instead of
+// silently halting scheduling. It never returns an error: Due has already
+// isolated the row from the sweep, and a diagnostic write must not itself abort
+// scheduling of the remaining healthy watches.
+func (s *Store) recordCorruptLastRun(ctx context.Context, id int64, value string, cause error) {
+	if s == nil || s.S == nil {
+		return
+	}
+	message := storedError(fmt.Errorf("unparseable last_run_at %q: %w", value, cause))
+	_, _ = s.S.DB().ExecContext(ctx, `UPDATE watches SET last_error = ? WHERE id = ?`, message, id)
 }
 
 // MarkRun records a successful (including zero-new-work) execution and resets

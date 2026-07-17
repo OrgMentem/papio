@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"regexp"
+	"time"
 )
 
 const (
@@ -20,6 +21,13 @@ const (
 	MaxRequestBytes = 64 << 10
 	// MaxResultBytes bounds a successful result or an error response envelope.
 	MaxResultBytes = 1 << 20
+
+	// DefaultConnIdleTimeout bounds how long the server waits to read a full
+	// request from, or write a response to, one accepted connection. It caps
+	// half-open peers that open the socket and then stall (partial frame or no
+	// close) so a single misbehaving client cannot leak a goroutine and fd
+	// until daemon shutdown.
+	DefaultConnIdleTimeout = 30 * time.Second
 )
 
 var (

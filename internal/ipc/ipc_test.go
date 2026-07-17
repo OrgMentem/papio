@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -308,5 +310,61 @@ func TestServeListenerClosesIdleClientsWhenListenerCloses(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("ServeListener did not stop after listener close with idle client")
+	}
+}
+
+func TestServeConnReadDeadlineReapsStalledClient(t *testing.T) {
+	socket := filepath.Join(shortTempDir(t), "s")
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &Server{
+		Handler:     HandlerFunc(func(context.Context, Request) ([]byte, *RPCError) { return []byte(`{}`), nil }),
+		IdleTimeout: 100 * time.Millisecond,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- server.ServeListener(ctx, listener) }()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Errorf("ServeListener: %v", err)
+			}
+		case <-time.After(time.Second):
+			t.Error("ServeListener did not stop after cancellation")
+		}
+	})
+
+	conn, err := net.Dial("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	// Send a partial request prefix and never CloseWrite: framing relies on
+	// EOF, so without the server's read deadline this connection would stall
+	// the serveConn goroutine indefinitely.
+	if _, err := conn.Write([]byte(`{"protocol":`)); err != nil {
+		t.Fatalf("write partial request: %v", err)
+	}
+
+	// Bound comfortably above IdleTimeout but well below any hang: the server
+	// must close the connection once its read deadline fires.
+	if err := conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 64)
+	n, err := conn.Read(buf)
+	if err == nil {
+		t.Fatalf("read returned %d bytes with no error; server did not reap stalled client", n)
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		t.Fatalf("client read hit its own 2s deadline (%v); server never closed the stalled connection", err)
+	}
+	if !errors.Is(err, io.EOF) && !errors.Is(err, syscall.ECONNRESET) {
+		t.Fatalf("read error = %v, want server-side close (EOF or reset)", err)
 	}
 }

@@ -158,7 +158,14 @@ func NormalizePMID(raw string) (string, error) {
 	if !pmidRE.MatchString(s) {
 		return "", fmt.Errorf("invalid PMID %q", raw)
 	}
-	return strings.TrimLeft(s, "0"), nil
+	normalized := strings.TrimLeft(s, "0")
+	if normalized == "" {
+		// pmidRE admits "0"/"0000000000", but a PMID is a positive integer;
+		// trimming leading zeros must not yield an empty identifier that would
+		// build an unbounded upstream query and match an arbitrary record.
+		return "", fmt.Errorf("invalid PMID %q", raw)
+	}
+	return normalized, nil
 }
 
 // NormalizeISBN strips hyphens/spaces and validates length (10 or 13); the
