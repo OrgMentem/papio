@@ -378,9 +378,11 @@ func (b *Bridge) SweepAdoptions(ctx context.Context) error {
 }
 
 // RunSweeper calls SweepAdoptions on an interval until ctx is cancelled.
-// Cancellation is a normal shutdown and returns nil. A sweep error is logged as
-// a deferral inside SweepAdoptions where possible; a store-level failure stops
-// the loop and is returned to the supervisor.
+// Cancellation is a normal shutdown and returns nil. Per-job adoption failures
+// are recorded as durable browser.adoption_deferred events inside
+// SweepAdoptions; a transient store-level sweep error is retried on the next
+// tick rather than returned, because this goroutine is unsupervised and a dead
+// sweeper silently strands every subsequently downloaded PDF.
 func (b *Bridge) RunSweeper(ctx context.Context, interval time.Duration) error {
 	if interval <= 0 {
 		interval = 2 * time.Second
@@ -396,7 +398,13 @@ func (b *Bridge) RunSweeper(ctx context.Context, interval time.Duration) error {
 				if ctx.Err() != nil {
 					return nil
 				}
-				return err
+				// Best-effort, idempotent scan: a transient store error (DB
+				// busy, a momentary read failure) must NOT kill the only
+				// directory-adoption loop. A dead sweeper silently strands
+				// every PDF that lands afterward until a daemon restart, and
+				// this goroutine is unsupervised, so its death is invisible.
+				// Retry next tick; a genuinely fatal store failure also breaks
+				// the supervised server and scheduler loops.
 			}
 		}
 	}

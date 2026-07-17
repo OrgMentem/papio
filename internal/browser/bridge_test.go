@@ -677,3 +677,33 @@ func TestSweepAdoptionsAdoptsWithoutHello(t *testing.T) {
 		t.Fatalf("sweeper did not adopt: %+v", row)
 	}
 }
+
+// RunSweeper must survive a transient store error: a dead adoption loop would
+// silently strand every subsequently downloaded PDF, and the daemon supervisor
+// does not watch this goroutine. Closing the DB forces every sweep to error;
+// the loop must keep running and return nil only on cancellation (the pre-fix
+// code returned the store error on the first failing tick).
+func TestRunSweeperSurvivesStoreError(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	if err := jobs.S.DB().Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- b.RunSweeper(ctx, time.Millisecond) }()
+	time.Sleep(25 * time.Millisecond) // let several sweeps fail
+	select {
+	case err := <-done:
+		t.Fatalf("RunSweeper exited early with %v; a transient store error must not kill the adoption loop", err)
+	default:
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("RunSweeper returned %v after cancel; want nil", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("RunSweeper did not return after cancel")
+	}
+}
