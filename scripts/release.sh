@@ -125,6 +125,13 @@ build_zotio() {
   )
 }
 
+check_cross_artifact_compatibility() {
+  python3 "$METADATA_HELPER" compat \
+    --repo-root "$PAPIO_ROOT" \
+    --papio-version "$PAPIO_VERSION" \
+    --zotio-binary "$OUTPUT_DIR/zotio-darwin-arm64"
+}
+
 build_extension() {
   (
     cd "$EXTENSION_DIR"
@@ -162,6 +169,26 @@ package_extension() {
     zip -X -q -r "$extension_archive" "${entries[@]}"
   )
   python3 "$METADATA_HELPER" verify-extension-archive --zip-path "$extension_archive"
+
+  local firefox_stage="$TEMP_DIR/extension-firefox"
+  local firefox_archive="$OUTPUT_DIR/papio-extension-firefox-$VERSION.zip"
+  local firefox_entries=(manifest.json dist)
+
+  mkdir -p "$firefox_stage"
+  cp "$EXTENSION_DIR/firefox/manifest.json" "$firefox_stage/manifest.json"
+  cp -R "$EXTENSION_DIR/firefox/dist" "$firefox_stage/dist"
+  if [[ -d "$EXTENSION_DIR/firefox/icons" ]]; then
+    cp -R "$EXTENSION_DIR/firefox/icons" "$firefox_stage/icons"
+    firefox_entries+=(icons)
+  fi
+
+  python3 "$METADATA_HELPER" normalize-timestamps \
+    --directory "$firefox_stage" --epoch "$RELEASE_EPOCH"
+  (
+    cd "$firefox_stage"
+    zip -X -q -r "$firefox_archive" "${firefox_entries[@]}"
+  )
+  python3 "$METADATA_HELPER" verify-extension-archive --zip-path "$firefox_archive"
 }
 
 capture_sboms() {
@@ -237,6 +264,7 @@ run_step 'reading release source metadata' read_release_metadata
 run_step 'preparing release directory' prepare_output
 run_step 'building papio darwin-arm64 binary' build_papio
 run_step 'building zotio darwin-arm64 binary' build_zotio
+run_step 'checking cross-artifact compatibility' check_cross_artifact_compatibility
 run_step 'building browser extension' build_extension
 run_step 'packaging browser extension' package_extension
 run_step 'capturing dependency SBOMs' capture_sboms

@@ -8,6 +8,7 @@ import base64
 import hashlib
 import re
 import json
+import subprocess
 import os
 from pathlib import Path
 import sys
@@ -83,6 +84,176 @@ def go_const_version(args: argparse.Namespace) -> None:
     if match is None:
         raise SystemExit("could not find const Version in Go version source")
     print(match.group(1))
+
+SEMVER_CORE_RE = re.compile(
+    r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$"
+)
+
+
+def semver_core(version: str) -> tuple[int, int, int]:
+    match = SEMVER_CORE_RE.fullmatch(version)
+    if match is None:
+        raise ValueError(f"must be x.y.z semver: {version!r}")
+    return (int(match.group(1)), int(match.group(2)), int(match.group(3)))
+
+
+def read_version(path: Path, name: str) -> str:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))["version"]
+    except (OSError, json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise SystemExit(f"could not read {name} version from {path}: {exc}") from exc
+    if not isinstance(value, str) or not value:
+        raise SystemExit(f"{name} version in {path} must be a non-empty string")
+    return value
+
+
+def read_const_version(root: Path, relative_path: str, const_name: str) -> str:
+    path = root / relative_path
+    try:
+        source = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise SystemExit(f"could not read {const_name} source {path}: {exc}") from exc
+    match = re.search(
+        rf'^\s*(?:const\s+)?{re.escape(const_name)}\s*=\s*"([^"]+)"',
+        source,
+        flags=re.MULTILINE,
+    )
+    if match is None:
+        raise SystemExit(f"could not find {const_name} const in {path}")
+    return match.group(1)
+
+
+def bundled_zotio_version(binary: str) -> str:
+    try:
+        result = subprocess.run(
+            [binary, "version", "--agent"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError as exc:
+        raise ValueError(f"could not run bundled zotio binary {binary}: {exc}") from exc
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
+        raise ValueError(f"bundled zotio version command failed: {detail}")
+    try:
+        data = json.loads(result.stdout)
+        version = data["version"]
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise ValueError(
+            f"bundled zotio version command did not return a JSON version: {exc}"
+        ) from exc
+    if not isinstance(version, str) or not version:
+        raise ValueError("bundled zotio version command returned an empty version")
+    return version
+
+
+def compat(args: argparse.Namespace) -> None:
+    root = Path(args.repo_root)
+    manifest_version_value = read_version(root / "extension/manifest.json", "manifest")
+    package_version_value = read_version(root / "extension/package.json", "package")
+    min_extension_version = read_const_version(
+        root, "internal/browser/bridge.go", "MinExtensionVersion"
+    )
+    min_daemon_version = read_const_version(
+        root, "extension/src/background.ts", "MIN_DAEMON_VERSION"
+    )
+    minimum_zotio_version = read_const_version(
+        root, "internal/zotio/client.go", "MinimumVersion"
+    )
+
+    versions = {
+        "manifest": manifest_version_value,
+        "package": package_version_value,
+        "MinExtensionVersion": min_extension_version,
+        "MIN_DAEMON_VERSION": min_daemon_version,
+        "MinimumVersion": minimum_zotio_version,
+    }
+    if args.papio_version is not None:
+        versions["papio"] = args.papio_version
+
+    zotio_version: str | None = None
+    zotio_error: str | None = None
+    if not args.skip_zotio:
+        if args.zotio_binary is None:
+            raise SystemExit("compat requires --zotio-binary unless --skip-zotio is set")
+        try:
+            zotio_version = bundled_zotio_version(args.zotio_binary)
+            versions["zotio"] = zotio_version
+        except ValueError as exc:
+            zotio_error = str(exc)
+
+    parsed_versions: dict[str, tuple[int, int, int]] = {}
+    format_failures: list[str] = []
+    for name, version in versions.items():
+        try:
+            parsed_versions[name] = semver_core(version)
+        except ValueError as exc:
+            format_failures.append(f"{name} {exc}")
+
+    failures: list[str] = []
+
+    def check(name: str, passed: bool, detail: str) -> None:
+        print(f"{'PASS' if passed else 'FAIL'} {name}: {detail}")
+        if not passed:
+            failures.append(name)
+
+    check(
+        "version format",
+        not format_failures,
+        "all versions are valid x.y.z semver"
+        if not format_failures
+        else "; ".join(format_failures),
+    )
+    check(
+        "extension package version",
+        manifest_version_value == package_version_value,
+        f"manifest {manifest_version_value} == package {package_version_value}",
+    )
+
+    extension_floor_ready = {
+        "MinExtensionVersion",
+        "manifest",
+    }.issubset(parsed_versions)
+    check(
+        "daemon extension floor",
+        extension_floor_ready
+        and parsed_versions["MinExtensionVersion"] <= parsed_versions["manifest"],
+        f"MinExtensionVersion {min_extension_version} <= manifest {manifest_version_value}"
+        if extension_floor_ready
+        else "cannot compare invalid version",
+    )
+
+    if args.papio_version is not None:
+        daemon_floor_ready = {
+            "MIN_DAEMON_VERSION",
+            "papio",
+        }.issubset(parsed_versions)
+        check(
+            "extension daemon floor",
+            daemon_floor_ready
+            and parsed_versions["MIN_DAEMON_VERSION"] <= parsed_versions["papio"],
+            f"MIN_DAEMON_VERSION {min_daemon_version} <= papio {args.papio_version}"
+            if daemon_floor_ready
+            else "cannot compare invalid version",
+        )
+
+    if not args.skip_zotio:
+        zotio_floor_ready = zotio_error is None and {
+            "zotio",
+            "MinimumVersion",
+        }.issubset(parsed_versions)
+        check(
+            "bundled zotio floor",
+            zotio_floor_ready
+            and parsed_versions["zotio"] >= parsed_versions["MinimumVersion"],
+            f"zotio {zotio_version} >= MinimumVersion {minimum_zotio_version}"
+            if zotio_floor_ready
+            else zotio_error or "cannot compare invalid version",
+        )
+
+    if failures:
+        raise SystemExit(f"compatibility preflight failed: {', '.join(failures)}")
 
 
 
@@ -171,7 +342,10 @@ def release_manifest(args: argparse.Namespace) -> None:
             },
             "extension": {
                 "version": args.extension_version,
-                "artifact": f"papio-extension-{args.version}.zip",
+                "artifacts": {
+                    "chrome": f"papio-extension-{args.version}.zip",
+                    "firefox": f"papio-extension-firefox-{args.version}.zip",
+                },
                 "pinned": bool(args.extension_id),
                 "extension_id": args.extension_id or None,
                 "extension_id_derivation": (
@@ -214,6 +388,26 @@ def parser() -> argparse.ArgumentParser:
     go_version = commands.add_parser("go-const-version")
     go_version.add_argument("--source", required=True)
     go_version.set_defaults(func=go_const_version)
+
+    compatibility = commands.add_parser(
+        "compat",
+        help="check compatibility across the release artifacts",
+    )
+    compatibility.add_argument("--repo-root", required=True)
+    compatibility.add_argument(
+        "--papio-version",
+        help="papio version being released; omit to skip the extension daemon floor",
+    )
+    compatibility.add_argument(
+        "--zotio-binary",
+        help="path to the zotio binary being bundled",
+    )
+    compatibility.add_argument(
+        "--skip-zotio",
+        action="store_true",
+        help="skip the bundled zotio minimum-version check",
+    )
+    compatibility.set_defaults(func=compat)
 
     timestamps = commands.add_parser("normalize-timestamps")
     timestamps.add_argument("--directory", required=True)

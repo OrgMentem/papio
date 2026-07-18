@@ -9,6 +9,13 @@ permissions:
   contents: read
 
 jobs:
+  compat:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - name: Check cross-artifact compatibility
+        run: python3 scripts/release_metadata.py compat --repo-root . --skip-zotio
+
   # Fail CI if go.mod/go.sum drift from source.
   tidy:
     runs-on: ubuntu-latest
