@@ -8,6 +8,123 @@ records in `notes/acquisition-stack-plan.md`.
 
 ### Added
 
+- `papio init` now captures the browser extension IDs during first-run setup, so
+  the native messaging host installs on the first run instead of failing with
+  `browser.extension_id is not set` and forcing a config hand-edit and re-run.
+  The Firefox add-on ID defaults to the built extension's fixed gecko id
+  (`papio@orgmentem.com`) so Firefox works out of the box; the Chrome ID is
+  prompted (paste the value from `chrome://extensions`). New `--extension-id`
+  and `--firefox-extension-id` flags cover non-interactive setup. Unit-tested
+  (flag and interactive paths, including that the captured Chrome ID reaches the
+  native-host install) and smoke-verified end to end.
+
+- Actionable error categories in `papio status`. Every parked or settled-without-
+  a-file job now shows a short, stable category and a one-line next step instead
+  of a raw internal reason (or nothing, for failed/unavailable). The catalog is
+  config-aware: a job that found no copy under assisted/maximal mode with no
+  institution configured surfaces as `institution_not_configured` pointing at
+  `papio init`, rather than a silent `unavailable`. Categories/guidance are added
+  to the status JSON (`category`, `guidance`) for agents. The same category and
+  next-step now print under `papio acquire --wait` when a job parks or settles
+  without a file, and the desktop human-action notification tells the user to
+  `run papio status to see why` instead of a bare count. Unit-tested; the status
+  view and `acquire --wait` guidance are smoke-verified against the live daemon.
+
+- Per-institution access profiles and guided institution onboarding. Named
+  resolver profiles under `[browser.resolvers.<name>]` are now full institution
+  tables (`openurl_base_url` plus optional `shibboleth_entity_id` and
+  `proquest_account_id`), so a multi-institution user routes each job's login to
+  the right library. This lifts the earlier "default profile only" limitation on
+  federated login-routing and the ProQuest account-id unlock: the daemon now
+  wires `login_entity_id`/`proquest_account_id` per selected profile, and a
+  named institution never inherits the default institution's identity.
+  `papio init` gained an "Institution" step (and `--openurl-base`,
+  `--shibboleth-entity-id`, `--proquest-account-id` flags); the ProQuest prompt
+  accepts a pasted resolver URL and extracts `accountid=` for users who don't
+  know their numeric id. Config validation, per-profile offer wiring, and the
+  account-id extractor are unit-tested; the interactive flow is smoke-verified
+  end to end.
+  Older single-base configs keep loading: a resolver profile may still be a bare
+  `name = "https://…"` string (shorthand for `openurl_base_url`), so no config
+  migration is required.
+
+- ProQuest account-id unlock: on ProQuest's "Find your institution" wall, papio
+  appends `?accountid=<id>` to the current URL, which unlocks Example University's
+  institutional access with **no sign-in at all** (verified live 2026-07-18 —
+  resolves the wall cold, "Access provided by EXAMPLE UNIVERSITY"). New
+  per-institution config `[browser] proquest_account_id` (digits); the daemon
+  passes it as the optional job-offer field `proquest_account_id` (default
+  profile only); the ProQuest adapter gains `accountIdParam: "accountid"`, and
+  on a `login` verdict papio appends it (latched, once) — preferred over the
+  federated route since it needs no credentials. This is the fix for the
+  ProQuest openurl-handler blocker (the Shibboleth-DS route authenticated only
+  ProQuest's main context, not the link-resolver handler). Config + protocol +
+  adapter + bridge are unit-tested; the full download still needs a live pass on
+  a ProQuest-*held* title.
+
+- Institution auto-selection ("login routing"): on a provider login wall, papio
+  navigates the handoff tab straight to the institution's federated login,
+  skipping the provider's institution picker — selection is deterministic config
+  (which institution you're at), not a secret, so only credential entry stays
+  with you. New per-institution config `[browser] shibboleth_entity_id` (the
+  Shibboleth IdP entityID, e.g. Example University's `https://idp.example.edu/entity`); the
+  daemon passes it to the extension as the optional job-offer field
+  `login_entity_id` (default resolver profile only, to avoid mis-routing another
+  institution's job); and an adapter gains an optional `federatedLogin` template
+  (`{entityID}` placeholder). On a `login` verdict papio navigates once (latched)
+  to `<federated-login>?entityID=<configured>`. ProQuest ships the route
+  (verified live 2026-07-17: Example University's entityID via ProQuest's Shibboleth DS URL
+  routes straight to `idp.example.edu` login, skipping the WAYF picker). Config +
+  protocol + adapter classify + bridge routing are unit-tested; the full
+  post-sign-in download on a ProQuest-held title still needs a live pass.
+
+- ProQuest institution-wall handling (`proquest` adapter v0.2.0): a `login`
+  classify rule (ordered before `article`) now recognizes ProQuest's "Find your
+  institution" wall (`form#institutionForm` + `input#institutionName`,
+  fixture-backed `fixtures/proquest/login-return.html` captured live via CDP).
+  Papio surfaces it as a human sign-in step (`login` → `auth_pending`) instead
+  of silently staying assisted/`unknown`. Matters disproportionately because
+  Example University's OpenURL resolver routes many titles (incl. SAGE/T&F journals) to
+  ProQuest rather than the publisher. Classify verified by fixtures; the full
+  post-sign-in download recovery (authenticate ProQuest → re-drive → entitled
+  docview → download) still needs a live pass.
+
+- SAGE Journals adapter (`journals.sagepub.com`), fixture-backed
+  (`fixtures/sage/success.html`, captured live via CDP from a Example University-authenticated
+  article). SAGE emits no Highwire metas; classifies on `publication_doi` + the
+  `downloadPdfUrl` anchor (same shape as ACM) and downloads that anchor's
+  `/doi/pdf/<doi>?download=true` href. Classify is fixture-verified; the
+  end-to-end download is not yet live-exercised because Example University's resolver routed
+  the SAGE test title to ProQuest rather than sagepub (the adapter fires when a
+  title routes to journals.sagepub.com).
+
+- Wiley Online Library adapter (`onlinelibrary.wiley.com`), fixture-backed
+  (`fixtures/wiley/success.html`, captured from a Example University-authenticated article).
+  Classifies via the Highwire `citation_pdf_url`/`citation_title` metas, then
+  builds and fetches Wiley's direct `/doi/pdfdirect/<doi>?download=true` file
+  through the privileged downloads API — `citation_pdf_url` (`/doi/pdf/`) and
+  the `/doi/epdf/` link both return an HTML viewer wrapper, only `pdfdirect`
+  returns the file (verified live end-to-end: 1.15 MB PDF → `ready`). Closes the
+  gap where Wiley pages classified `unknown` and stayed assisted (browser-
+  agnostic; affected Chrome too). tandfonline/psycnet remain unimplemented —
+  permissioned but not yet fixture-backed (both paywalled in the dev session;
+  psycnet also emits no standard metadata).
+
+- Firefox dev loop: `bun run dev` runs `build.ts --watch` (rebuilds `firefox/`
+  on any `src/`, `icons/`, or `manifest.json` change) alongside `web-ext run`,
+  which hot-reloads the add-on in a dedicated Firefox Developer Edition instance.
+  `web-ext-config.mjs` pins an absolute, gitignored dev profile
+  (`.ff-dev-profile`) so permissions and institutional logins persist across
+  reloads — and, being path-based, boots straight in without Firefox's
+  profile-chooser modal. web-ext installs and hot-reloads over the devtools
+  RDP (not WebDriver/Marionette), so it does not set `navigator.webdriver` — but
+  that live RDP connection makes Firefox show its remote-control indicator and
+  is itself an automation surface a bot wall could fingerprint. Two modes:
+  `bun run dev` for fast iteration and fixture testing; for real Cloudflare-
+  walled providers, `bun run build` then load `firefox/` manually via
+  `about:debugging` (one-shot install, no persistent connection, no indicator,
+  `navigator.webdriver` false).
+
 - Brand: a papio logo — an oblique lowercase **p** (coral `#E85D4A`) inside a
   broken ink ring (`#2B2D42`); the p's descender becomes a download arrow that
   exits through the ring's bottom gap. Structural sibling of the zotio badge
@@ -17,6 +134,39 @@ records in `notes/acquisition-stack-plan.md`.
   README wordmark header, the docs site logo/favicon (`mkdocs.yml`), the Chrome
   extension toolbar/action icons (`extension/icons/`, wired in
   `manifest.json`), and the extension popup header.
+- Brand: the README header wordmark (`logo-wordmark.svg`,
+  `logo-wordmark-dark.svg`) is now an animated SVG. The mark builds in on a calm
+  ~10s loop — the broken ring draws on, the coral **p** and download arrow drop
+  into place, the wordmark rises in — then a cheeky little papio (baboon) head
+  peeks over the wordmark to blink, tilt, and wave before ducking away, leaving a
+  long clean hold on the finished logo. Pure CSS (no script/SMIL, self-contained
+  for GitHub's `<img>` rendering); the resting state is byte-for-byte the prior
+  static logo and `prefers-reduced-motion: reduce` shows it with no animation.
+- Background work window: papio now does its browsing in one dedicated
+  minimized, unfocused Chrome window instead of the user's tab strip. Every
+  broker handoff tab (first, queued, and download-fallback) and the keepalive
+  tab route there; provider-spawned viewer tabs inherit it via their opener.
+  A tab surfaces (window restored + focused, tab activated) only when the
+  human is needed: on the IdP transition (`auth_pending`), on keepalive
+  reauth, and from the popup's Focus button — which now also restores a
+  minimized window. Opt out anytime via the options page ("Keep papio tabs in
+  a background window"); disabling restores the legacy visible-handoff
+  behavior, as does any runtime without `chrome.windows`.
+- Firefox support, day one: `bun run build` now emits a second complete
+  extension at `extension/firefox/` (MV3 event-page background as a classic
+  iife bundle, `browser_specific_settings.gecko.id = papio@orgmentem.com`,
+  `strict_min_version 128`) generated from the same `manifest.json` source of
+  truth. The native-host installer registers a Firefox manifest
+  (`allowed_extensions`, Mozilla `NativeMessagingHosts` dir) alongside
+  Chrome's when the new `[browser] firefox_extension_id` config is set, and
+  the host accepts Firefox's bare-ID invocation with the same exact-match,
+  fail-closed validation as Chrome's origin. The options page gained a
+  "Library resolver access" grant section because Firefox treats MV3
+  `host_permissions` as runtime-optional; on Chrome it simply shows the
+  install-time grants. No behavior change for Chrome users. The provider
+  section also gained "Grant all providers" / "Revoke all" — one click issues a
+  single `permissions.request` for every publisher origin (one Firefox
+  doorhanger) instead of ten separate grants.
 
 ### Fixed
 

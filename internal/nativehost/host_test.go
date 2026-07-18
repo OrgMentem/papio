@@ -242,24 +242,30 @@ func TestPollWriteFailureTerminatesRun(t *testing.T) {
 	}
 }
 
-// TestValidateOrigin: only the exact configured extension origin is accepted.
+// TestValidateOrigin accepts only exact configured Chrome origins or Firefox IDs.
 func TestValidateOrigin(t *testing.T) {
-	const id = "abcdefghijklmnopabcdefghijklmnop"
+	const chromeID = "abcdefghijklmnopabcdefghijklmnop"
+	const firefoxID = "papio@orgmentem.com"
 	cases := []struct {
-		name    string
-		args    []string
-		wantErr bool
+		name                string
+		args                []string
+		configuredFirefoxID string
+		wantErr             bool
 	}{
-		{"exact", []string{"chrome-extension://" + id + "/"}, false},
-		{"no-trailing-slash", []string{"chrome-extension://" + id}, false},
-		{"with-window-handle", []string{"chrome-extension://" + id + "/", "--parent-window=123"}, false},
-		{"wrong-id", []string{"chrome-extension://ponmlkjihgfedcbaponmlkjihgfedcba/"}, true},
-		{"missing", []string{"--parent-window=123"}, true},
-		{"empty", nil, true},
+		{"chrome exact", []string{"chrome-extension://" + chromeID + "/"}, firefoxID, false},
+		{"chrome with window handle", []string{"chrome-extension://" + chromeID + "/", "--parent-window=123"}, firefoxID, false},
+		{"chrome no trailing slash", []string{"chrome-extension://" + chromeID}, firefoxID, true},
+		{"wrong chrome ID", []string{"chrome-extension://ponmlkjihgfedcbaponmlkjihgfedcba/"}, firefoxID, true},
+		{"firefox exact", []string{"/path/to/com.orgmentem.papio.json", firefoxID}, firefoxID, false},
+		{"firefox configured empty", []string{"/path/to/com.orgmentem.papio.json", firefoxID}, "", true},
+		{"wrong Firefox ID", []string{"/path/to/com.orgmentem.papio.json", "other@orgmentem.org"}, firefoxID, true},
+		{"manifest path alone", []string{"/path/to/com.orgmentem.papio.json"}, firefoxID, true},
+		{"missing", []string{"--parent-window=123"}, firefoxID, true},
+		{"empty", nil, firefoxID, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := validateOrigin(tc.args, id)
+			err := validateOrigin(tc.args, chromeID, tc.configuredFirefoxID)
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("validateOrigin(%v) err = %v, wantErr = %v", tc.args, err, tc.wantErr)
 			}

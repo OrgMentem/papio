@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -71,6 +72,80 @@ func TestSaveRejectsInvalidZotioAttachmentMode(t *testing.T) {
 	}
 }
 
+func TestSaveRejectsInvalidFirefoxExtensionID(t *testing.T) {
+	for _, id := range []string{
+		"not-an-addon-id",
+		"papio@",
+		"{not-a-guid}",
+		"papio@orgmentem.com ",
+	} {
+		t.Run(id, func(t *testing.T) {
+			cfg := Default()
+			cfg.AccessMode = ModeConservative
+			cfg.Browser.FirefoxExtensionID = id
+			if err := Save(cfg, filepath.Join(t.TempDir(), "config.toml")); err == nil {
+				t.Fatalf("invalid Firefox extension ID %q accepted", id)
+			}
+		})
+	}
+}
+
+func TestSaveAcceptsFirefoxExtensionIDs(t *testing.T) {
+	for _, id := range []string{
+		"papio@orgmentem.com",
+		"{01234567-89ab-cdef-0123-456789abcdef}",
+	} {
+		t.Run(id, func(t *testing.T) {
+			cfg := Default()
+			cfg.AccessMode = ModeConservative
+			cfg.Browser.FirefoxExtensionID = id
+			if err := Save(cfg, filepath.Join(t.TempDir(), "config.toml")); err != nil {
+				t.Fatalf("valid Firefox extension ID %q rejected: %v", id, err)
+			}
+		})
+	}
+}
+
+func TestSaveValidatesShibbolethEntityID(t *testing.T) {
+	cfg := Default()
+	cfg.AccessMode = ModeConservative
+	cfg.Browser.ShibbolethEntityID = "https://idp.example.edu/entity"
+	if err := Save(cfg, filepath.Join(t.TempDir(), "config.toml")); err != nil {
+		t.Fatalf("valid Shibboleth entity ID rejected: %v", err)
+	}
+
+	for _, entityID := range []string{"http://idp.example.edu/entity", "https://"} {
+		t.Run(entityID, func(t *testing.T) {
+			cfg := Default()
+			cfg.AccessMode = ModeConservative
+			cfg.Browser.ShibbolethEntityID = entityID
+			if err := Save(cfg, filepath.Join(t.TempDir(), "config.toml")); err == nil {
+				t.Fatalf("invalid Shibboleth entity ID %q accepted", entityID)
+			}
+		})
+	}
+}
+
+func TestSaveValidatesProquestAccountID(t *testing.T) {
+	cfg := Default()
+	cfg.AccessMode = ModeConservative
+	cfg.Browser.ProquestAccountID = "12345"
+	if err := Save(cfg, filepath.Join(t.TempDir(), "config.toml")); err != nil {
+		t.Fatalf("valid ProQuest account ID rejected: %v", err)
+	}
+
+	for _, accountID := range []string{"17227x", strings.Repeat("1", 65)} {
+		t.Run(accountID, func(t *testing.T) {
+			cfg := Default()
+			cfg.AccessMode = ModeConservative
+			cfg.Browser.ProquestAccountID = accountID
+			if err := Save(cfg, filepath.Join(t.TempDir(), "config.toml")); err == nil {
+				t.Fatalf("invalid ProQuest account ID %q accepted", accountID)
+			}
+		})
+	}
+}
+
 func TestZotioAutoImportDefaultsOffAndLoadsTrue(t *testing.T) {
 	if Default().Zotio.AutoImport {
 		t.Fatal("default zotio.auto_import = true, want false")
@@ -127,9 +202,13 @@ func TestBrowserResolverProfiles(t *testing.T) {
 	data := []byte(`access_mode = "conservative"
 [browser]
 openurl_base_url = "https://example.primo.exlibrisgroup.com/nde/openurl?vid=61EXL_INST:61EXL_NDE"
+shibboleth_entity_id = "https://idp.example.edu/entity"
+proquest_account_id = "12345"
 
-[browser.resolvers]
-institute = "https://onesearch.library.example-institute.edu/discovery/openurl?vid=61INS_INST:INS"
+[browser.resolvers.institute]
+openurl_base_url = "https://onesearch.library.example-institute.edu/discovery/openurl?vid=61INS_INST:INS"
+shibboleth_entity_id = "https://idp.example-institute.edu/idp/shibboleth"
+proquest_account_id = "67890"
 `)
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatal(err)
@@ -147,6 +226,16 @@ institute = "https://onesearch.library.example-institute.edu/discovery/openurl?v
 	if names := cfg.ResolverNames(); len(names) != 2 || names[0] != "default" || names[1] != "institute" {
 		t.Fatalf("resolver names = %v", names)
 	}
+	// Each profile carries its own institutional identity; a named institution
+	// never inherits the default institution's entityID/accountid.
+	def, _ := cfg.InstitutionFor("")
+	if def.ShibbolethEntityID != "https://idp.example.edu/entity" || def.ProquestAccountID != "12345" {
+		t.Fatalf("default institution = %+v", def)
+	}
+	institute, ok := cfg.InstitutionFor("institute")
+	if !ok || institute.ShibbolethEntityID != "https://idp.example-institute.edu/idp/shibboleth" || institute.ProquestAccountID != "67890" {
+		t.Fatalf("institute institution = %+v, %t", institute, ok)
+	}
 }
 
 func TestBrowserResolverProfilesRejectInvalidNameAndURL(t *testing.T) {
@@ -159,7 +248,7 @@ func TestBrowserResolverProfilesRejectInvalidNameAndURL(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "config.toml")
-			data := []byte("access_mode = \"conservative\"\n[browser.resolvers]\n" + test.profile + " = \"" + test.base + "\"\n")
+			data := []byte("access_mode = \"conservative\"\n[browser.resolvers." + test.profile + "]\nopenurl_base_url = \"" + test.base + "\"\n")
 			if err := os.WriteFile(path, data, 0o600); err != nil {
 				t.Fatal(err)
 			}
@@ -167,6 +256,17 @@ func TestBrowserResolverProfilesRejectInvalidNameAndURL(t *testing.T) {
 				t.Fatal("invalid resolver profile accepted")
 			}
 		})
+	}
+}
+
+func TestBrowserResolverProfileRejectsInvalidAccountID(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	data := []byte("access_mode = \"conservative\"\n[browser.resolvers.institute]\nopenurl_base_url = \"https://onesearch.library.example-institute.edu/discovery/openurl\"\nproquest_account_id = \"nan\"\n")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("non-numeric named-profile account id accepted")
 	}
 }
 
@@ -184,5 +284,26 @@ func TestBrowserResolverProfilesAbsentKeepsLegacyConfig(t *testing.T) {
 	}
 	if got, ok := cfg.OpenURLBaseFor(""); !ok || got != "https://resolver.example.edu/openurl" {
 		t.Fatalf("legacy default = %q, %t", got, ok)
+	}
+}
+
+func TestBrowserResolverStringShorthandLoads(t *testing.T) {
+	// The pre-1.0 shorthand `name = "https://…"` must keep loading as a
+	// base-only institution so existing configs need no migration.
+	path := filepath.Join(t.TempDir(), "config.toml")
+	data := []byte("access_mode = \"conservative\"\n[browser.resolvers]\nune = 'https://example.alma.exlibrisgroup.com/view/uresolver/61EXL_INST/openurl?svc_dat=viewit'\n")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("string shorthand rejected: %v", err)
+	}
+	inst, ok := cfg.InstitutionFor("example")
+	if !ok || inst.OpenURLBase != "https://example.alma.exlibrisgroup.com/view/uresolver/61EXL_INST/openurl?svc_dat=viewit" {
+		t.Fatalf("example shorthand = %+v, %t", inst, ok)
+	}
+	if inst.ShibbolethEntityID != "" || inst.ProquestAccountID != "" {
+		t.Fatalf("shorthand should leave login identity empty: %+v", inst)
 	}
 }

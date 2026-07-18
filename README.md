@@ -18,9 +18,11 @@ handles credentials, MFA, CAPTCHAs, or subscription crawling.
 - Poppler and Tesseract for PDF validation and the OCR text gate:
   `brew install poppler tesseract` (or disable OCR in the config — see the
   [configuration reference](docs/config-reference.md)).
-- Google Chrome with the papio extension loaded unpacked for
-  human-authenticated access (`papio init` prints the exact steps; skip with
-  `papio init --skip-browser` for OA-only headless use).
+- Google Chrome or Firefox with the papio extension loaded for
+  human-authenticated access — Chrome loads `extension/` unpacked, Firefox
+  loads the generated `extension/firefox/` build via `about:debugging`
+  (`papio init` prints the exact steps; skip with `papio init --skip-browser`
+  for OA-only headless use).
 - [zotio](https://github.com/orgmentem/zotio) on PATH (or `[zotio] executable`
   in the config) for Zotero import; optional — without it papio stops at
   validated bundles.

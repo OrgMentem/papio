@@ -25,13 +25,14 @@ func runCLI(t *testing.T, args ...string) (string, string, error) {
 
 // writeTestConfig writes a config.toml under a temp PAPIO_CONFIG_DIR and returns
 // the config dir and the resolved current-executable path (post EvalSymlinks).
-func writeTestConfig(t *testing.T, extensionID string) (string, string) {
+func writeTestConfig(t *testing.T, extensionID, firefoxExtensionID string) (string, string) {
 	t.Helper()
 	configDir := t.TempDir()
 	t.Setenv("PAPIO_CONFIG_DIR", configDir)
 	cfg := config.Default()
 	cfg.AccessMode = config.ModeMaximal
 	cfg.Browser.ExtensionID = extensionID
+	cfg.Browser.FirefoxExtensionID = firefoxExtensionID
 	if err := config.Save(cfg, ""); err != nil {
 		t.Fatalf("save config: %v", err)
 	}
@@ -45,48 +46,81 @@ func writeTestConfig(t *testing.T, extensionID string) (string, string) {
 	return configDir, exe
 }
 
-func TestNativeHostInstallWritesManifestAndSymlink(t *testing.T) {
+func TestNativeHostInstallWritesBrowserManifestsAndSymlink(t *testing.T) {
 	extID := strings.Repeat("a", 32) // valid 32-char a-p extension ID
-	configDir, exe := writeTestConfig(t, extID)
+	const firefoxID = "papio@orgmentem.com"
+	configDir, exe := writeTestConfig(t, extID, firefoxID)
 	manifestDir := t.TempDir()
+	firefoxManifestDir := t.TempDir()
 
-	_, stderr, err := runCLI(t, "--json", "native-host", "install", "--manifest-dir", manifestDir)
+	_, stderr, err := runCLI(t, "--json", "native-host", "install", "--manifest-dir", manifestDir, "--firefox-manifest-dir", firefoxManifestDir)
 	if err != nil {
 		t.Fatalf("install: %v (%s)", err, stderr)
 	}
 
-	// Manifest decodes with the expected name, path, and allowed_origins.
-	manifestPath := filepath.Join(manifestDir, "com.orgmentem.papio.json")
+	manifestPath := filepath.Join(manifestDir, nativeHostManifestName+".json")
+	firefoxManifestPath := filepath.Join(firefoxManifestDir, nativeHostManifestName+".json")
 	data, err := os.ReadFile(manifestPath)
 	if err != nil {
-		t.Fatalf("read manifest: %v", err)
+		t.Fatalf("read Chrome manifest: %v", err)
 	}
-	var manifest nativeHostManifest
-	if err := json.Unmarshal(data, &manifest); err != nil {
-		t.Fatalf("decode manifest: %v (%q)", err, string(data))
+	firefoxData, err := os.ReadFile(firefoxManifestPath)
+	if err != nil {
+		t.Fatalf("read Firefox manifest: %v", err)
 	}
-	symlinkPath := filepath.Join(configDir, "bin", "papio-native-host")
-	if manifest.Name != "com.orgmentem.papio" {
-		t.Fatalf("manifest name = %q", manifest.Name)
+	var chromeKeys, firefoxKeys map[string]json.RawMessage
+	if err := json.Unmarshal(data, &chromeKeys); err != nil {
+		t.Fatalf("decode Chrome manifest keys: %v", err)
 	}
-	if manifest.Type != "stdio" {
-		t.Fatalf("manifest type = %q", manifest.Type)
+	if err := json.Unmarshal(firefoxData, &firefoxKeys); err != nil {
+		t.Fatalf("decode Firefox manifest keys: %v", err)
 	}
-	if manifest.Path != symlinkPath {
-		t.Fatalf("manifest path = %q, want %q", manifest.Path, symlinkPath)
+	if _, ok := chromeKeys["allowed_extensions"]; ok {
+		t.Fatal("Chrome manifest contains allowed_extensions")
 	}
-	wantOrigins := []string{"chrome-extension://" + extID + "/"}
-	if len(manifest.AllowedOrigins) != 1 || manifest.AllowedOrigins[0] != wantOrigins[0] {
-		t.Fatalf("allowed_origins = %v, want %v", manifest.AllowedOrigins, wantOrigins)
+	if _, ok := firefoxKeys["allowed_origins"]; ok {
+		t.Fatal("Firefox manifest contains allowed_origins")
 	}
 
-	// Manifest file is 0644.
-	info, err := os.Stat(manifestPath)
-	if err != nil {
-		t.Fatal(err)
+	var chromeManifest, firefoxManifest nativeHostManifest
+	if err := json.Unmarshal(data, &chromeManifest); err != nil {
+		t.Fatalf("decode Chrome manifest: %v (%q)", err, string(data))
 	}
-	if info.Mode().Perm() != 0o644 {
-		t.Fatalf("manifest mode = %v", info.Mode().Perm())
+	if err := json.Unmarshal(firefoxData, &firefoxManifest); err != nil {
+		t.Fatalf("decode Firefox manifest: %v (%q)", err, string(firefoxData))
+	}
+	symlinkPath := filepath.Join(configDir, "bin", nativeHostBinaryName)
+	for name, manifest := range map[string]nativeHostManifest{
+		"Chrome":  chromeManifest,
+		"Firefox": firefoxManifest,
+	} {
+		if manifest.Name != nativeHostManifestName {
+			t.Fatalf("%s manifest name = %q", name, manifest.Name)
+		}
+		if manifest.Type != "stdio" {
+			t.Fatalf("%s manifest type = %q", name, manifest.Type)
+		}
+		if manifest.Path != symlinkPath {
+			t.Fatalf("%s manifest path = %q, want %q", name, manifest.Path, symlinkPath)
+		}
+	}
+	wantOrigins := []string{"chrome-extension://" + extID + "/"}
+	if len(chromeManifest.AllowedOrigins) != 1 || chromeManifest.AllowedOrigins[0] != wantOrigins[0] {
+		t.Fatalf("Chrome allowed_origins = %v, want %v", chromeManifest.AllowedOrigins, wantOrigins)
+	}
+	if len(firefoxManifest.AllowedExtensions) != 1 || firefoxManifest.AllowedExtensions[0] != firefoxID {
+		t.Fatalf("Firefox allowed_extensions = %v, want [%s]", firefoxManifest.AllowedExtensions, firefoxID)
+	}
+
+	// Manifest files are 0644.
+	for _, path := range []string{manifestPath, firefoxManifestPath} {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode().Perm() != 0o644 {
+			t.Fatalf("manifest mode = %v, want 0644", info.Mode().Perm())
+		}
 	}
 
 	// Symlink points at the resolved test binary.
@@ -98,46 +132,56 @@ func TestNativeHostInstallWritesManifestAndSymlink(t *testing.T) {
 		t.Fatalf("symlink target = %q, want %q", target, exe)
 	}
 
-	// A second install is idempotent: no error, same manifest.
-	if _, stderr, err := runCLI(t, "native-host", "install", "--manifest-dir", manifestDir); err != nil {
+	// A second install is idempotent: no error, same manifests.
+	if _, stderr, err := runCLI(t, "native-host", "install", "--manifest-dir", manifestDir, "--firefox-manifest-dir", firefoxManifestDir); err != nil {
 		t.Fatalf("second install: %v (%s)", err, stderr)
 	}
 	data2, err := os.ReadFile(manifestPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(data, data2) {
-		t.Fatalf("manifest changed on re-install:\n%s\n---\n%s", data, data2)
+	firefoxData2, err := os.ReadFile(firefoxManifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(data, data2) || !bytes.Equal(firefoxData, firefoxData2) {
+		t.Fatal("manifest changed on re-install")
 	}
 }
 
 func TestNativeHostStatusAndUninstall(t *testing.T) {
 	extID := strings.Repeat("b", 32)
-	configDir, _ := writeTestConfig(t, extID)
+	const firefoxID = "papio@orgmentem.com"
+	configDir, _ := writeTestConfig(t, extID, firefoxID)
 	manifestDir := t.TempDir()
-	manifestPath := filepath.Join(manifestDir, "com.orgmentem.papio.json")
-	symlinkPath := filepath.Join(configDir, "bin", "papio-native-host")
+	firefoxManifestDir := t.TempDir()
+	manifestPath := filepath.Join(manifestDir, nativeHostManifestName+".json")
+	firefoxManifestPath := filepath.Join(firefoxManifestDir, nativeHostManifestName+".json")
+	symlinkPath := filepath.Join(configDir, "bin", nativeHostBinaryName)
 
-	// Status before install: absent.
-	before := statusJSON(t, manifestDir)
-	if before["manifest_present"] != false {
-		t.Fatalf("pre-install manifest_present = %v", before["manifest_present"])
+	// Status before install: both manifests absent.
+	before := statusJSON(t, manifestDir, firefoxManifestDir)
+	if before["manifest_present"] != false || before["firefox_manifest_present"] != false {
+		t.Fatalf("pre-install manifest presence = Chrome:%v Firefox:%v", before["manifest_present"], before["firefox_manifest_present"])
 	}
-	if before["extension_id"] != extID {
-		t.Fatalf("pre-install extension_id = %v", before["extension_id"])
+	if before["extension_id"] != extID || before["firefox_extension_id"] != firefoxID {
+		t.Fatalf("pre-install extension IDs = Chrome:%v Firefox:%v", before["extension_id"], before["firefox_extension_id"])
 	}
 	if before["target_exists"] != false {
 		t.Fatalf("pre-install target_exists = %v", before["target_exists"])
 	}
 
-	if _, stderr, err := runCLI(t, "native-host", "install", "--manifest-dir", manifestDir); err != nil {
+	if _, stderr, err := runCLI(t, "native-host", "install", "--manifest-dir", manifestDir, "--firefox-manifest-dir", firefoxManifestDir); err != nil {
 		t.Fatalf("install: %v (%s)", err, stderr)
 	}
 
-	// Status after install: present, target exists.
-	after := statusJSON(t, manifestDir)
-	if after["manifest_present"] != true {
-		t.Fatalf("post-install manifest_present = %v", after["manifest_present"])
+	// Status after install: both manifests present, target exists.
+	after := statusJSON(t, manifestDir, firefoxManifestDir)
+	if after["manifest_present"] != true || after["firefox_manifest_present"] != true {
+		t.Fatalf("post-install manifest presence = Chrome:%v Firefox:%v", after["manifest_present"], after["firefox_manifest_present"])
+	}
+	if after["firefox_manifest_path"] != firefoxManifestPath {
+		t.Fatalf("post-install firefox_manifest_path = %v", after["firefox_manifest_path"])
 	}
 	if after["target_exists"] != true {
 		t.Fatalf("post-install target_exists = %v", after["target_exists"])
@@ -146,37 +190,62 @@ func TestNativeHostStatusAndUninstall(t *testing.T) {
 		t.Fatalf("post-install symlink_path = %v", after["symlink_path"])
 	}
 
-	// Uninstall removes both artifacts.
-	if _, stderr, err := runCLI(t, "native-host", "uninstall", "--manifest-dir", manifestDir); err != nil {
+	// Uninstall removes both manifests and the symlink.
+	if _, stderr, err := runCLI(t, "native-host", "uninstall", "--manifest-dir", manifestDir, "--firefox-manifest-dir", firefoxManifestDir); err != nil {
 		t.Fatalf("uninstall: %v (%s)", err, stderr)
 	}
-	if _, err := os.Stat(manifestPath); !os.IsNotExist(err) {
-		t.Fatalf("manifest still present after uninstall: %v", err)
-	}
-	if _, err := os.Lstat(symlinkPath); !os.IsNotExist(err) {
-		t.Fatalf("symlink still present after uninstall: %v", err)
+	for _, path := range []string{manifestPath, firefoxManifestPath, symlinkPath} {
+		if _, err := os.Lstat(path); !os.IsNotExist(err) {
+			t.Fatalf("artifact still present after uninstall %s: %v", path, err)
+		}
 	}
 
 	// Repeat uninstall is idempotent.
-	if _, stderr, err := runCLI(t, "native-host", "uninstall", "--manifest-dir", manifestDir); err != nil {
+	if _, stderr, err := runCLI(t, "native-host", "uninstall", "--manifest-dir", manifestDir, "--firefox-manifest-dir", firefoxManifestDir); err != nil {
 		t.Fatalf("second uninstall: %v (%s)", err, stderr)
 	}
 
-	// Status after uninstall: absent again.
-	gone := statusJSON(t, manifestDir)
-	if gone["manifest_present"] != false {
-		t.Fatalf("post-uninstall manifest_present = %v", gone["manifest_present"])
+	// Status after uninstall: both manifests absent again.
+	gone := statusJSON(t, manifestDir, firefoxManifestDir)
+	if gone["manifest_present"] != false || gone["firefox_manifest_present"] != false {
+		t.Fatalf("post-uninstall manifest presence = Chrome:%v Firefox:%v", gone["manifest_present"], gone["firefox_manifest_present"])
 	}
 	if gone["target_exists"] != false {
 		t.Fatalf("post-uninstall target_exists = %v", gone["target_exists"])
 	}
 }
 
-func TestNativeHostInstallRequiresExtensionID(t *testing.T) {
-	writeTestConfig(t, "") // no extension_id
+func TestNativeHostInstallWithoutFirefoxWritesChromeOnly(t *testing.T) {
+	extID := strings.Repeat("c", 32)
+	writeTestConfig(t, extID, "")
 	manifestDir := t.TempDir()
+	firefoxManifestDir := t.TempDir()
 
-	_, _, err := runCLI(t, "native-host", "install", "--manifest-dir", manifestDir)
+	stdout, stderr, err := runCLI(t, "--json", "native-host", "install", "--manifest-dir", manifestDir, "--firefox-manifest-dir", firefoxManifestDir)
+	if err != nil {
+		t.Fatalf("install: %v (%s)", err, stderr)
+	}
+	if _, err := os.Stat(filepath.Join(manifestDir, nativeHostManifestName+".json")); err != nil {
+		t.Fatalf("Chrome manifest missing: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(firefoxManifestDir, nativeHostManifestName+".json")); !os.IsNotExist(err) {
+		t.Fatalf("Firefox manifest written without Firefox extension ID: %v", err)
+	}
+	var result map[string]any
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatalf("decode install result: %v", err)
+	}
+	if result["firefox_manifest_path"] != "" {
+		t.Fatalf("firefox_manifest_path = %v, want empty", result["firefox_manifest_path"])
+	}
+}
+
+func TestNativeHostInstallRequiresExtensionID(t *testing.T) {
+	writeTestConfig(t, "", "papio@orgmentem.com") // no Chrome extension_id
+	manifestDir := t.TempDir()
+	firefoxManifestDir := t.TempDir()
+
+	_, _, err := runCLI(t, "native-host", "install", "--manifest-dir", manifestDir, "--firefox-manifest-dir", firefoxManifestDir)
 	if err == nil {
 		t.Fatal("install without extension_id succeeded")
 	}
@@ -187,11 +256,14 @@ func TestNativeHostInstallRequiresExtensionID(t *testing.T) {
 	if _, statErr := os.Stat(filepath.Join(manifestDir, "com.orgmentem.papio.json")); !os.IsNotExist(statErr) {
 		t.Fatalf("manifest written despite missing extension_id: %v", statErr)
 	}
+	if _, statErr := os.Stat(filepath.Join(firefoxManifestDir, nativeHostManifestName+".json")); !os.IsNotExist(statErr) {
+		t.Fatalf("Firefox manifest written despite missing Chrome extension_id: %v", statErr)
+	}
 }
 
-func statusJSON(t *testing.T, manifestDir string) map[string]any {
+func statusJSON(t *testing.T, manifestDir, firefoxManifestDir string) map[string]any {
 	t.Helper()
-	stdout, stderr, err := runCLI(t, "--json", "native-host", "status", "--manifest-dir", manifestDir)
+	stdout, stderr, err := runCLI(t, "--json", "native-host", "status", "--manifest-dir", manifestDir, "--firefox-manifest-dir", firefoxManifestDir)
 	if err != nil {
 		t.Fatalf("status: %v (%s)", err, stderr)
 	}

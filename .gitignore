@@ -1,5 +1,8 @@
 bin/
 dist/
+extension/firefox/
+extension/web-ext-artifacts/
+extension/.ff-dev-profile/
 dist/release/
 site/
 node_modules/

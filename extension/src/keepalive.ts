@@ -13,6 +13,7 @@ export interface KeepaliveTabs {
     active: boolean;
     pinned: boolean;
     muted: boolean;
+    windowId?: number;
   }): Promise<KeepaliveTab>;
   reload(tabID: number): Promise<unknown>;
   get(tabID: number): Promise<KeepaliveTab>;
@@ -54,6 +55,13 @@ export interface KeepaliveOptions {
   onAuthenticationChanged?(authenticated: boolean): void;
   /** Called once per detected login redirect, after the tab is made visible. */
   onReauthNeeded?(): void;
+  /** Id of papio's dedicated background work window, when one exists. The
+   * keepalive tab is created there so it stays out of the user's tab strip. */
+  workWindowID?(): number | undefined;
+  /** Brings a reauth-parked keepalive tab's window to the front. Needed when
+   * the tab lives in the minimized work window; tabs.update alone cannot
+   * surface it. Best-effort. */
+  surfaceReauthTab?(tabID: number): Promise<void>;
   /** Overrides the post-reload inspection delay for deterministic tests. */
   reloadSettleMs?: number;
   /** Overrides job/recovery observation cadence for deterministic tests. */
@@ -203,13 +211,25 @@ export class KeepaliveManager {
     } catch {
       // Querying is a best-effort restart recovery; creation below remains safe.
     }
+    const base = {
+      url: this.resolver.origin,
+      active: false,
+      pinned: true,
+      muted: true,
+    };
+    const windowID = this.options.workWindowID?.();
     try {
-      const tab = await this.api.tabs.create({
-        url: this.resolver.origin,
-        active: false,
-        pinned: true,
-        muted: true,
-      });
+      let tab: KeepaliveTab;
+      try {
+        tab = await this.api.tabs.create(
+          windowID !== undefined ? { ...base, windowId: windowID } : base,
+        );
+      } catch (e) {
+        // The work window may have been closed between lookup and create;
+        // fall back to the user's current window rather than skip a cycle.
+        if (windowID === undefined) throw e;
+        tab = await this.api.tabs.create(base);
+      }
       if (tab.id === undefined) return;
       this.tabID = tab.id;
       this.reauthPaused = false;
@@ -326,6 +346,8 @@ export class KeepaliveManager {
     this.reauthPaused = true;
     try {
       await this.api.tabs.update(this.tabID, { active: true, pinned: false, muted: false });
+      // In work-window mode the tab lives in a minimized window; bring it up.
+      await this.options.surfaceReauthTab?.(this.tabID);
     } catch {
       // The reauth callback/badge still gives the user a recoverable signal.
     }

@@ -893,3 +893,68 @@ Live-verified: JSTOR delivered 2 papers end-to-end (attached to Zotero, no gestu
 - **EBSCO api-download adoption**: the cross-origin `content.ebscohost.com` response (content-disposition `retrieve.pdf`) landed in `~/Downloads` root and `adoption_deferred` → the job reached `needs_review` with an empty `artifact_sha256`. The autonomous *fetch* works; binding a cross-origin api download to the job (filename honoring + adoption correlation) needs a fix so it flows to `ready`/attach like `href`/`url` downloads.
 - **Identity confirmation for opaque filenames**: EBSCO's generic `retrieve.pdf` gives the identity gate nothing to match, forcing `needs_review`. Consider confirming identity from the job's known metadata (title/DOI) or the PDF's embedded text so entitled api downloads can auto-import.
 - **EBSCO record-page path**: `download.method` is now `api` (viewer). A record-page `article` landing can't api-download (idPattern is viewer-only) and would stay assisted; harmless since the live flow lands on the viewer, but worth confirming the resolver always routes to the viewer.
+
+## Release UX shape: headless-most operation, browser plane, detection posture (2026-07-17)
+
+Feasibility analysis for the public-release UX ("do most work invisibly, surface only when the user is needed"). Grounded in current code; decisions locked below.
+
+### Attention tiers (current inventory)
+
+| Tier | What | Status |
+|---|---|---|
+| Silent | OA resolvers, validation, quarantine, zotio import (pure Go daemon) | done |
+| Silent | Direct-file offers → `downloads.download`, no tab (`background.ts` `startDirectOfferDownload`) | done |
+| Silent-ish | JSTOR/EBSCO `url`/`api` methods — no gesture, but the classified tab still spawns | tab visible |
+| Background | Keepalive tab (`active:false, pinned, muted`), queued handoffs (`active:false`) | done |
+| Foreground | First handoff tab + direct-download fallback tab open `active:true`; viewer tabs and SSO redirects land in the user's window | **the remaining disruption** |
+
+A rendered tab remains genuinely required for institutional access: (1) SameSite cookies + SSO redirect chains ride real navigations — extension-origin SW `fetch` is cross-site and unreliable through Alma/Primo 302 chains; (2) `interpret()` classifies live DOM via `executeScript` (provider SPAs don't exist in fetched HTML); (3) Chrome gives extensions no invisible rendering surface (`offscreen` can't host cross-origin interactive pages). But tab **visibility** is a pure UX choice, and hidden-tab classification is already proven by the keepalive and queued-handoff paths.
+
+### Decision: dedicated background work window ("headless mode")
+
+All papio tabs (handoffs, keepalive, provider-spawned viewer tabs by `openerTabId` inheritance) live in one `chrome.windows.create({ focused: false, state: "minimized" })` window instead of the user's tab strip. Every `tabs.create` gains that `windowId`; the `active: true` opens are dropped. The one-visible-handoff latch (`handoffOpening`) becomes one-*surfaced*-handoff; the queue drains invisibly. Surfacing on needs-you (SSO, terms without consent, identity review, bot challenge): existing macOS notification + popup `focusJob` (`tabs.update({active}) + windows.update({focused})`) brings the exact tab forward; after resolution the window recedes. Bot challenges thereby become ordinary needs-you actions, not failures.
+
+Verification caveats (use the observe flywheel): background/minimized tabs get timer throttling and no rAF; SPAs that defer on `document.hidden` (EBSCO `mfe-*` viewer is the risk case) may need a per-adapter `requiresVisible` fallback that briefly surfaces the tab. `windows.create` may flash on creation (cosmetic).
+
+### Decision: no fixed/separate backend browser — ever, absent the reversal trigger
+
+The entitlement **is** the user's institutional session in their daily browser (the warm-session one-login model, proven live 2026-07-15). A separate backend browser (hidden Chrome instance, second profile, headless, CloakBrowser) would need its own SSO session (profiles don't share cookie jars; the profile lock forbids sharing; profile copies look like token theft to IdPs), doubles login burden, and *creates* automation-detection risk papio does not currently have. Nothing extra is installed for the user: the daily browser is the browser plane; the daemon (installed by `papio init`) is the backend.
+
+**CloakBrowser contingency (not a dependency).** CloakBrowser (CloakHQ) is a stealth Chromium — 66 C++ fingerprint patches, Playwright/Puppeteer API, current binaries behind a Pro subscription, residential-proxy scraper posture (it is what instsci uses). Papio does not have the problem it solves: traffic originates from a real human-authenticated interactive browser, and the only bot-wall hit so far (ScienceDirect) was papio's own hourly re-drive — fixed behaviorally (auth-drive cap), not with stealth. Library proxies detect rate/volume, which budgets and one-job-per-request already bound; a cloaked browser would risk users' institutional accounts and forfeit the "ordinary Chrome, human login stays human" defensibility. **Reversal trigger:** revisit only if ≥2 verified providers block classification/download in the user's ordinary entitled browser, attributable to automation detection of extension actions (not volume). Until then CloakBrowser stays this paragraph.
+
+### Cross-browser matrix
+
+The protocol is runtime-agnostic (papio-browser/1, dual Go/TS fixtures) and `background.ts` injects all browser APIs through the `deps` seam (`onDeterminingFilename` already optional) — the porting boundary exists.
+
+| Target | Verdict | Work |
+|---|---|---|
+| Edge / Brave / Vivaldi / Opera / Arc | near-free | Per-browser native-host manifest paths in `papio init`; same Chrome Web Store listing installs in most forks. |
+| Firefox | moderate, fast-follow | Native messaging supported (`allowed_extensions` + gecko ID manifest). MV3 background = event pages, not SW (build-target switch). No `onDeterminingFilename` → click-method filename steering degrades, but direct/`url`/`api`/`href` survive via `downloads.download({filename})`. MV3 `host_permissions` are runtime-opt-in → onboarding must request grants. AMO signing + separate listing. |
+| Safari | not feasible now | Requires a containing macOS app; native messaging only extension↔app (an app relaying to the daemon socket is doable), but `browser.downloads` is effectively unsupported — no download-adoption path. Park until Apple ships the API. |
+
+Shape: one shared TS core (protocol, adapters, state machine) + thin per-browser shells behind the `deps` seam. Launch claim: "works in your browser" for the Chromium family; Firefox fast-follow; never promise Safari.
+
+### Release sequence
+
+1. Work-window headless mode (extension-only) + per-provider hidden-classification verification.
+2. `papio init` multi-browser native-host registration (Chromium forks).
+3. Web Store submission + packed-ID re-pin (already planned).
+4. Firefox port — **pulled into day one** (user's personal browser; see execution record below). Later: Chrome side panel (114+) as the richer needs-you surface.
+
+### Work-window execution record (2026-07-17)
+
+Release-sequence item 1 implemented (extension-only, protocol untouched):
+- `BridgeDeps` gains an optional `windows` seam (+ optional `tabs.update`); absent seam or the `papio_work_window_v1 = false` setting falls back to the exact legacy behavior. All three broker-tab call sites route through one serialized `openBrokerTab` (creation mutex prevents racing two work windows); the window is created `{focused:false, state:"minimized"}` with the first job URL, reused across offers, and recreated when the user closes it (`workWindowID` in session state, verified via `windows.get` before reuse).
+- Surfacing: `auth_pending` transition calls `surfaceWorkTab` (activate tab, restore+focus window; state:"normal" applied only when minimized so a maximized user window is never resized). Popup `focusJob` and keepalive `pauseForReauth` restore minimized windows the same way. Keepalive tab is created inside the work window when one exists, with a fall-back to the current window if it closed mid-create.
+- Options page: "Keep papio tabs in a background window" toggle (default on).
+- Verified: extension suite 147 pass / typecheck / build green (7 new tests: window routing, reuse/recreate-after-close, auth surfacing, disabled fallback, popup minimized-restore, keepalive routing + fallback).
+- **Live follow-up before release:** per-provider hidden-tab classification pass via the observe flywheel (EBSCO `mfe-*` viewer is the render-deferral risk case); add a per-adapter `requiresVisible` brief-surface fallback only if a provider actually stalls hidden.
+
+### Firefox day-one execution record (2026-07-17)
+
+Firefox promoted from fast-follow to day one (it is the user's daily browser). Both planes shipped:
+- **Extension**: `build.ts` emits `extension/firefox/` (gitignored, generated) from the same `manifest.json` source of truth — background bundled as a classic iife (Firefox MV3 has no service workers and no module event pages; build fails if the bundle contains a top-level `export`), gecko id `papio@orgmentem.com`, `strict_min_version 128.0` (first release with `optional_host_permissions`), `minimum_chrome_version` dropped, description de-Chromed. No polyfill: Firefox's `chrome.*` namespace returns promises. Pre-verified compatibilities: `downloads.download({filename})` with subdirectories (all adapters are API-initiated — no `click` method in the registry, so the Chrome-only `onDeterminingFilename` steering is never load-bearing), fixture `data:` downloads honor `filename` natively (the steering exists for a Chrome-only bug), `finalUrl` already optional, `storage.session` guarded, `windows`/`alarms`/`scripting` supported.
+- **Runtime host permissions**: Firefox treats MV3 `host_permissions` as opt-in; the options page gained a "Library resolver access" grant section (same grant/revoke machinery as provider sources) for the Alma/Primo/OneSearch origins.
+- **Go**: `[browser] firefox_extension_id` (email-style or braced-GUID validation), native-host installer writes a second manifest with `allowed_extensions` into the Mozilla `NativeMessagingHosts` dir (uninstall/status cover it; `--firefox-manifest-dir` override), and `validateOrigin` accepts either Chrome's `chrome-extension://<id>/` origin or Firefox's bare gecko-ID argv entry — exact match only, empty config disables each browser independently.
+- Verified: `go test ./internal/{config,cli,nativehost}` + vet green; extension suite 150 pass / typecheck / dual-target build green.
+- **Live wiring PROVEN (2026-07-17, same session):** user's running Firefox (started with `--remote-debugging-port=9222`) accepted the build via WebDriver BiDi `webExtension.install` (temporary add-on, id `papio@orgmentem.com` preserved). Firefox spawned `papio-native-host` with argv `[mozilla manifest path, papio@orgmentem.com]`; the rebuilt binary (HEAD + this session's Go changes, deployed to `~/.local/bin/papio`, `native-host install` writing both manifests) validated it, and the daemon re-offered two parked jobs within seconds — `browser.job_accept` ×2 and `auth_pending` (Example University IdP tab) landed in the events log. Remaining human steps: complete SSO in the surfaced IdP tab; grant resolver + provider host permissions in the options page (Firefox doorhangers need real clicks — MV3 host permissions are runtime-opt-in). Caveats: temporary add-ons drop on Firefox restart (re-install via BiDi or `about:debugging`; AMO unlisted signing is the durable path) and the Chrome unpacked extension is still installed — two concurrent browser sessions re-offer the same parked jobs, so disable one extension once Firefox is confirmed primary.

@@ -38,21 +38,41 @@ with `~/` are expanded when Papio loads them.
 | Key | Type | Default | Effect and constraints |
 | --- | --- | --- | --- |
 | `extension_id` | string | empty | The Chrome extension ID allowed to use the native host. It must be 32 characters from `a` through `p`; an empty value disables the bridge. |
+| `firefox_extension_id` | string | empty | The Firefox (Gecko) add-on ID allowed to use the native host — `papio@orgmentem.com` for the built extension. Accepts an email-style ID or a braced GUID; an empty value disables the Firefox bridge. |
 | `openurl_base_url` | string URL | empty | Legacy/default institutional OpenURL resolver base. It must use `https://`; an empty value prevents default-profile institutional routing. Existing query parameters are preserved when Papio adds citation metadata. Prefer the institution's direct-link-enabled endpoint so a single electronic service bypasses the resolver menu. |
+| `shibboleth_entity_id` | string URL | empty | Default institution's Shibboleth IdP entityID (`https://`). When set, a provider login wall is auto-routed to this IdP (skipping the WAYF selector). Empty disables federated login-routing for the default profile. |
+| `proquest_account_id` | string digits | empty | Default institution's ProQuest account id (digits, max 64). When set, Papio appends `?accountid=<id>` to unlock the institution's ProQuest link-resolver without a manual sign-in. Empty disables the append. During `papio init` you may paste a ProQuest URL containing `accountid=` instead of the bare id. |
 | `download_adoption_root` | path string | empty | Root for browser-download adoption. When empty, the effective value is `<data_dir>/adoptions`; adoption is confined to a job subdirectory beneath this root. |
 | `action_expiry_seconds` | integer seconds | `1800` | Maximum open time for one browser handoff. It must not be negative. |
 
 The browser path uses the user's ordinary Chrome session. It is not configured
 with passwords, MFA, CAPTCHA tokens, or publisher credentials.
 
+`papio init` collects `extension_id` and `firefox_extension_id` during setup
+(Firefox defaults to the built add-on's `papio@orgmentem.com`), or set them
+non-interactively with `--extension-id` / `--firefox-extension-id`, so the
+native messaging host installs on the first run.
+
 ### `[browser.resolvers]`
 
-Named resolver profiles map lowercase alphanumeric names to HTTPS OpenURL bases:
+Named resolver profiles are per-institution tables keyed by a lowercase
+alphanumeric name. Each carries its own OpenURL base and, optionally, the same
+`shibboleth_entity_id` and `proquest_account_id` login fields as the default
+`[browser]` institution — so a multi-institution user routes each job's login
+to the right library instead of inheriting the default's identity:
 
 ```toml
-[browser.resolvers]
-campus = "https://library.example.edu/discovery/openurl?institution=EXAMPLE"
+[browser.resolvers.campus]
+openurl_base_url = "https://library.example.edu/discovery/openurl?institution=EXAMPLE"
+shibboleth_entity_id = "https://idp.example.edu/idp/shibboleth"  # optional
+proquest_account_id = "12345"                                     # optional
 ```
+
+A profile may also be written as a bare string — `campus =
+"https://library.example.edu/discovery/openurl?institution=EXAMPLE"` — which is
+shorthand for a table with only `openurl_base_url` set. This keeps older
+single-base configs valid; add the table form when a profile needs its own
+login identity.
 
 Select one with `papio acquire --resolver campus`, `papio acquire --batch
 works.json --resolver campus`, or the corresponding MCP field. The selected

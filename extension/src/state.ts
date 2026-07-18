@@ -16,6 +16,10 @@ export type JobStatus = "offered" | "queued" | "accepted" | "auth_pending" | "aw
 export type TermsConsent = "accept" | "manual" | undefined;
 export const TERMS_CONSENT_KEY = "papio_terms_consent_v1";
 
+/** Durable user choice for the dedicated background work window. `false`
+ * disables routing and restores legacy in-window tabs; absent means enabled. */
+export const WORK_WINDOW_KEY = "papio_work_window_v1";
+
 export interface ActiveJob {
   job_id: string;
   tab_id: number;
@@ -63,6 +67,10 @@ export interface StoreShape {
    * download proves the session works. Bounds re-driving a job whose warm SSO
    * session cannot complete human authentication. */
   authAttempts?: Record<string, number>;
+  /** Id of papio's dedicated background work window, when work-window mode
+   * has created one this browser session. Window ids are session-scoped, never
+   * sensitive. Verified live (and recreated) before every reuse. */
+  workWindowID?: number;
 }
 
 /** Async key/value seam. The real implementation wraps chrome.storage; tests

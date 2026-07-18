@@ -74,7 +74,18 @@
       you have signed in yourself. Login, MFA, and CAPTCHAs always stay with you. Revoking returns the
       source to assisted behaviour immediately.
     </p>
+    <div id="provider-bulk" style="display: flex; gap: 8px; margin-bottom: 4px">
+      <button id="grant-all" type="button">Grant all providers</button>
+      <button id="revoke-all" type="button">Revoke all</button>
+    </div>
     <ul id="sources"></ul>
+
+    <h1 style="margin-top: 28px">Library resolver access</h1>
+    <p class="lede">
+      Firefox asks you to grant this access at runtime; Chrome grants it when the extension is installed.
+      Papio uses it to resolve your library's links when completing an explicitly requested download.
+    </p>
+    <ul id="library-resolvers"></ul>
 
     <h1 style="margin-top: 28px">Publisher terms &amp; conditions</h1>
     <p class="lede">
@@ -90,6 +101,23 @@
       <div style="display: flex; gap: 8px">
         <button id="terms-consent-on" type="button">Enable</button>
         <button id="terms-consent-off" type="button">Disable</button>
+      </div>
+    </div>
+
+    <h1 style="margin-top: 28px">Background work window</h1>
+    <p class="lede">
+      Papio does its browsing in one dedicated minimized window instead of your tab strip, and only
+      brings a tab forward when you are needed (for example institutional sign-in). Turn this off to
+      open papio tabs in your current window instead.
+    </p>
+    <div id="work-window-row" style="display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 0; border-top: 1px solid #e3e3e3">
+      <div>
+        <div class="source-label">Keep papio tabs in a background window</div>
+        <div class="source-host" id="work-window-status">On</div>
+      </div>
+      <div style="display: flex; gap: 8px">
+        <button id="work-window-on" type="button">Enable</button>
+        <button id="work-window-off" type="button">Disable</button>
       </div>
     </div>
     <script src="./options.js" type="module"></script>

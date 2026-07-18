@@ -69,13 +69,19 @@ class FakeBackend implements StateBackend {
 class FakeTabs {
   readonly onUpdated = new FakeEmitter<[number, TabChangeInfo, TabInfo]>();
   readonly onRemoved = new FakeEmitter<[number, { isWindowClosing: boolean }]>();
-  readonly created: { url: string; active: boolean }[] = [];
+  readonly created: { url: string; active: boolean; windowId?: number }[] = [];
   readonly removed: number[] = [];
   readonly reloaded: number[] = [];
+  /** Tab ids activated through tabs.update({active: true}). */
+  readonly activated: number[] = [];
   readonly live = new Map<number, TabInfo>();
   nextId = 100;
   failCreate = false;
-  async create(props: { url: string; active: boolean }): Promise<TabInfo> {
+  async update(tabID: number, props: { active: boolean }): Promise<TabInfo> {
+    if (props.active) this.activated.push(tabID);
+    return this.live.get(tabID) ?? {};
+  }
+  async create(props: { url: string; active: boolean; windowId?: number }): Promise<TabInfo> {
     this.created.push(props);
     if (this.failCreate) throw new Error("tab creation blocked");
     const id = this.nextId++;
@@ -95,6 +101,43 @@ class FakeTabs {
   async remove(tabID: number): Promise<void> {
     this.removed.push(tabID);
     this.live.delete(tabID);
+  }
+}
+
+class FakeWindows {
+  readonly created: { url: string; focused: boolean; state: string }[] = [];
+  readonly updated: { windowID: number; props: { focused?: boolean; state?: string } }[] = [];
+  readonly live = new Map<number, { id: number; state: string }>();
+  nextId = 500;
+  constructor(private readonly tabs: FakeTabs) {}
+  async create(props: {
+    url: string;
+    focused: boolean;
+    state: "minimized";
+  }): Promise<{ id: number; state: string; tabs: TabInfo[] }> {
+    this.created.push(props);
+    const id = this.nextId++;
+    this.live.set(id, { id, state: props.state });
+    const tab = await this.tabs.create({ url: props.url, active: false, windowId: id });
+    return { id, state: props.state, tabs: [tab] };
+  }
+  async get(windowID: number): Promise<{ id: number; state: string }> {
+    const win = this.live.get(windowID);
+    if (!win) throw new Error("no such window");
+    return win;
+  }
+  async update(
+    windowID: number,
+    props: { focused?: boolean; state?: "normal" },
+  ): Promise<unknown> {
+    this.updated.push({ windowID, props });
+    const win = this.live.get(windowID);
+    if (win && props.state !== undefined) win.state = props.state;
+    return win ?? {};
+  }
+  /** Simulate the user closing the work window. */
+  close(windowID: number): void {
+    this.live.delete(windowID);
   }
 }
 
@@ -145,13 +188,17 @@ interface Harness {
   backend: FakeBackend;
   tabs: FakeTabs;
   downloads: FakeDownloads;
+  windows?: FakeWindows;
   clock: { now: number };
   timers: { fn: () => void | Promise<void>; ms: number }[];
   frames(): BrowserMessage[];
   postedStrings(): string[];
 }
 
-function makeHarness(seed?: StoreShape): Harness {
+function makeHarness(
+  seed?: StoreShape,
+  opts?: { windows?: boolean; workWindowEnabled?: boolean },
+): Harness {
   const port = new FakePort();
   const ports = [port];
   let connects = 0;
@@ -159,6 +206,7 @@ function makeHarness(seed?: StoreShape): Harness {
   if (seed) backend.store = seed;
   const tabs = new FakeTabs();
   const downloads = new FakeDownloads();
+  const windows = opts?.windows === true ? new FakeWindows(tabs) : undefined;
   const clock = { now: 1_700_000_000_000 };
   const timers: { fn: () => void | Promise<void>; ms: number }[] = [];
   const deps: BridgeDeps = {
@@ -183,7 +231,14 @@ function makeHarness(seed?: StoreShape): Harness {
     adapterSpecs: [],
     scripting: { executeScript: async () => [] },
     permissions: { contains: async () => false },
-    settings: { getTermsConsent: async () => undefined, setTermsConsent: async () => {} },
+    settings: {
+      getTermsConsent: async () => undefined,
+      setTermsConsent: async () => {},
+      ...(opts?.workWindowEnabled !== undefined
+        ? { getWorkWindowEnabled: async () => opts.workWindowEnabled === true }
+        : {}),
+    },
+    ...(windows !== undefined ? { windows } : {}),
     alarms: { create: () => {}, onAlarm: { addListener: () => {} } },
   };
   return {
@@ -194,6 +249,7 @@ function makeHarness(seed?: StoreShape): Harness {
     backend,
     tabs,
     downloads,
+    ...(windows !== undefined ? { windows } : {}),
     clock,
     timers,
     frames: () => ports.flatMap((p) => p.posted.map(parseBrowserMessage)),
@@ -978,4 +1034,65 @@ test("overlapping state writes persist serially so no stale snapshot wins", asyn
 
   const ids = backend.store.activeJobs.map((job) => job.job_id).sort();
   expect(ids).toEqual(["job_write_a", "job_write_b", "seed_visible"]);
+});
+
+test("work-window mode routes the first handoff into one minimized unfocused window", async () => {
+  const h = makeHarness(undefined, { windows: true });
+  await h.bridge.start();
+  await h.port.inbound(jobOffer("job_ww_first"));
+
+  expect(h.windows?.created).toEqual([{ url: OPENURL, focused: false, state: "minimized" }]);
+  // The tab was created by windows.create inside the work window, never
+  // focused, and the job tracks it like any broker tab.
+  expect(h.tabs.created).toEqual([{ url: OPENURL, active: false, windowId: 500 }]);
+  expect(h.backend.store.workWindowID).toBe(500);
+  expect(h.backend.store.activeJobs[0]?.tab_id).toBe(100);
+  const accept = h.frames().find((f) => f.type === "job_accept");
+  expect(accept?.job_id).toBe("job_ww_first");
+});
+
+test("work window is reused across offers and recreated after the user closes it", async () => {
+  // Warm auth evidence so every offer opens immediately instead of queueing.
+  const h = makeHarness(
+    { ...emptyStore(), lastAuthReturnedAt: 1_700_000_000_000 },
+    { windows: true },
+  );
+  await h.bridge.start();
+  await h.port.inbound(jobOffer("job_ww_a"));
+  await h.port.inbound(jobOffer("job_ww_b"));
+
+  expect(h.windows?.created.length).toBe(1);
+  expect(h.tabs.created.map((t) => t.windowId)).toEqual([500, 500]);
+
+  // User closes the work window: the next offer recreates it.
+  h.windows?.close(500);
+  await h.port.inbound(jobOffer("job_ww_c"));
+  expect(h.windows?.created.length).toBe(2);
+  expect(h.backend.store.workWindowID).toBe(501);
+});
+
+test("IdP navigation surfaces the work-window tab: activate + restore + focus", async () => {
+  const h = makeHarness(undefined, { windows: true });
+  await h.bridge.start();
+  await h.port.inbound(jobOffer("job_ww_auth"));
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+
+  const idpURL = "https://idp.example.edu/sso?SAMLRequest=x";
+  await h.tabs.onUpdated.emit(tabID, { url: idpURL }, { id: tabID, url: idpURL });
+
+  expect(h.frames().some((f) => f.type === "auth_pending")).toBe(true);
+  expect(h.tabs.activated).toEqual([tabID]);
+  expect(h.windows?.updated).toEqual([
+    { windowID: 500, props: { focused: true, state: "normal" } },
+  ]);
+});
+
+test("disabling the work-window setting restores the legacy visible handoff", async () => {
+  const h = makeHarness(undefined, { windows: true, workWindowEnabled: false });
+  await h.bridge.start();
+  await h.port.inbound(jobOffer("job_ww_off"));
+
+  expect(h.windows?.created).toEqual([]);
+  expect(h.tabs.created).toEqual([{ url: OPENURL, active: true }]);
+  expect(h.backend.store.workWindowID).toBeUndefined();
 });

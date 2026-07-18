@@ -42,6 +42,14 @@ export interface JobOfferPayload {
   expected?: JobOfferExpected;
   access_mode: "assisted" | "maximal";
   expires_at: string;
+  /** The institution's Shibboleth IdP entityID, when the daemon knows it.
+   * Lets an adapter's federated-login route auto-select the institution on a
+   * provider login wall. Optional; an https URL when present. */
+  login_entity_id?: string;
+  /** The institution's ProQuest account id, when the daemon knows it. Lets the
+   * ProQuest adapter unlock the openurl link-resolver by appending
+   * ?accountid=<id>. Optional; digits when present. */
+  proquest_account_id?: string;
 }
 
 /** Timing only — no URL/host/title/query/fragment fields exist by design. */
@@ -262,7 +270,7 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
       break;
     }
     case "job_offer": {
-      requireKeys(p, "job_offer", ["openurl", "provider_hosts", "access_mode", "expires_at"], ["expected"]);
+      requireKeys(p, "job_offer", ["openurl", "provider_hosts", "access_mode", "expires_at"], ["expected", "login_entity_id", "proquest_account_id"]);
       const openurl = str(p, "openurl", "job_offer", 4000);
       if (!openurl.startsWith("https://")) fail("job_offer.openurl must be https");
       const hosts = p["provider_hosts"];
@@ -281,6 +289,14 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
         requireKeys(ex, "job_offer.expected", [], ["doi", "title"]);
         if ("doi" in ex) str(ex, "doi", "job_offer.expected", 300);
         if ("title" in ex) str(ex, "title", "job_offer.expected", 500);
+      }
+      if ("login_entity_id" in p) {
+        const entity = str(p, "login_entity_id", "job_offer", 4000);
+        if (!entity.startsWith("https://")) fail("job_offer.login_entity_id must be https");
+      }
+      if ("proquest_account_id" in p) {
+        const acct = str(p, "proquest_account_id", "job_offer", 64);
+        if (!/^[0-9]+$/.test(acct)) fail("job_offer.proquest_account_id must be digits");
       }
       break;
     }

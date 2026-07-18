@@ -627,8 +627,8 @@ func TestOpenURLPMIDFallbackAndYear(t *testing.T) {
 func TestOpenURLUsesSelectedResolverProfileForPrimoNDEAndVE(t *testing.T) {
 	b, _, cfg, _ := newBridge(t)
 	cfg.Browser.OpenURLBase = "https://example.primo.exlibrisgroup.com/nde/openurl?vid=61EXL_INST:61EXL_NDE"
-	cfg.Browser.Resolvers = map[string]string{
-		"institute": "https://onesearch.library.example-institute.edu/discovery/openurl?vid=61INS_INST:INS",
+	cfg.Browser.Resolvers = map[string]config.Institution{
+		"institute": {OpenURLBase: "https://onesearch.library.example-institute.edu/discovery/openurl?vid=61INS_INST:INS"},
 	}
 	b = NewBridge(b.jobs, b.svc, cfg)
 	for _, test := range []struct {
@@ -655,6 +655,48 @@ func TestOpenURLUsesSelectedResolverProfileForPrimoNDEAndVE(t *testing.T) {
 			}
 			if u.Query().Get("rft_id") != "info:doi/10.1002/example.42" {
 				t.Fatalf("rft_id = %q", u.Query().Get("rft_id"))
+			}
+		})
+	}
+}
+
+func TestOfferLoginRoutingIsPerResolverProfile(t *testing.T) {
+	b, _, cfg, _ := newBridge(t)
+	cfg.Browser.ShibbolethEntityID = "https://idp.example.edu/entity"
+	cfg.Browser.ProquestAccountID = "12345"
+	cfg.Browser.Resolvers = map[string]config.Institution{
+		// A named institution carries its own login identity...
+		"institute": {
+			OpenURLBase:        "https://onesearch.library.example-institute.edu/discovery/openurl",
+			ShibbolethEntityID: "https://idp.example-institute.edu/idp/shibboleth",
+			ProquestAccountID:  "67890",
+		},
+		// ...and one without an identity gets none (no default leakage).
+		"bare": {OpenURLBase: "https://library.example.edu/openurl"},
+	}
+	b = NewBridge(b.jobs, b.svc, cfg)
+
+	for _, test := range []struct {
+		name, resolver, wantEntityID, wantAccountID string
+	}{
+		{name: "default", wantEntityID: "https://idp.example.edu/entity", wantAccountID: "12345"},
+		{name: "named carries own identity", resolver: "institute", wantEntityID: "https://idp.example-institute.edu/idp/shibboleth", wantAccountID: "67890"},
+		{name: "named without identity leaks nothing", resolver: "bare"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			raw, err := b.offer(job.Row{ID: "job-login-route", Work: handoffWork(), Policy: job.Policy{Resolver: test.resolver}}, "institutional handoff")
+			if err != nil {
+				t.Fatal(err)
+			}
+			message, err := protocol.DecodeBrowserMessage(raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := message.Payload.(*protocol.JobOfferPayload).LoginEntityID; got != test.wantEntityID {
+				t.Fatalf("login_entity_id = %q, want %q", got, test.wantEntityID)
+			}
+			if got := message.Payload.(*protocol.JobOfferPayload).ProquestAccountID; got != test.wantAccountID {
+				t.Fatalf("proquest_account_id = %q, want %q", got, test.wantAccountID)
 			}
 		})
 	}

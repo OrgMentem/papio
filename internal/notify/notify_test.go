@@ -56,9 +56,9 @@ func TestCoalescerSummarizesEachNotificationClass(t *testing.T) {
 	coalescer.HumanAction(context.Background())
 
 	want := []string{
-		"1 paper needs your attention",
+		"1 paper needs your attention; run papio status to see why",
 		"1 paper imported",
-		"3 papers need your attention",
+		"3 papers need your attention; run papio status to see why",
 	}
 	if !reflect.DeepEqual(recorded.messages, want) {
 		t.Fatalf("messages = %#v, want %#v", recorded.messages, want)

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"papio/internal/api"
+	"papio/internal/config"
 	"papio/internal/job"
 	"papio/internal/work"
 )
@@ -30,7 +31,7 @@ func TestBuildStatusSnapshotGroupsRecentJobsAndDetails(t *testing.T) {
 		"ready":   {Events: []map[string]any{{"kind": "job.transition", "detail": map[string]any{"source": "arxiv"}}, {"kind": "zotio.auto_import", "detail": map[string]any{"status": "applied"}}}},
 	}
 
-	snapshot := buildStatusSnapshot(rows, details, now)
+	snapshot := buildStatusSnapshot(rows, details, now, config.Config{})
 	if len(snapshot.Groups) != 5 {
 		t.Fatalf("groups = %#v", snapshot.Groups)
 	}
@@ -45,6 +46,12 @@ func TestBuildStatusSnapshotGroupsRecentJobsAndDetails(t *testing.T) {
 	}
 	if got := snapshot.Groups[2].Jobs[0].Reason; got != "semantic_or_identity_review" {
 		t.Fatalf("review reason = %q", got)
+	}
+	if got := snapshot.Groups[1].Jobs[0].Category; got != "login_required" {
+		t.Fatalf("human category = %q", got)
+	}
+	if got := snapshot.Groups[2].Jobs[0].Category; got != "identity_review" || snapshot.Groups[2].Jobs[0].Guidance == "" {
+		t.Fatalf("review category/guidance = %q / %q", got, snapshot.Groups[2].Jobs[0].Guidance)
 	}
 	if got := snapshot.Groups[3].Jobs[0].ImportStatus; got != "applied" {
 		t.Fatalf("ready import status = %q", got)
@@ -78,5 +85,27 @@ func TestRenderStatusRefreshPlainFollowRepaintsWithoutANSI(t *testing.T) {
 	}
 	if strings.Count(got, "papio status") != 2 || !strings.Contains(got, "A paper") {
 		t.Fatalf("plain follow output = %q", got)
+	}
+}
+
+func TestRenderStatusRefreshShowsCategoryAndGuidance(t *testing.T) {
+	snapshot := statusSnapshot{
+		GeneratedAt: "2026-07-18T00:00:00Z",
+		Groups: []statusGroup{{Phase: "failed / unavailable", Jobs: []statusJob{{
+			Title: "Some paper", Provider: "—", State: job.StateUnavailable, Age: "3h",
+			Reason: "no_legal_candidates", Category: "institution_not_configured",
+			Guidance: "No institution is configured, so institutional access was never attempted. Run `papio init`.",
+		}}}},
+	}
+	var out bytes.Buffer
+	if err := renderStatusRefresh(&out, snapshot, false); err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+	if !strings.Contains(got, "institution_not_configured") {
+		t.Fatalf("category not shown in DETAIL: %q", got)
+	}
+	if !strings.Contains(got, "    → No institution is configured") {
+		t.Fatalf("guidance sub-line not rendered: %q", got)
 	}
 }

@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -42,7 +43,7 @@ func defaultInitDependencies() initDependencies {
 		},
 		CheckZotio: checkZotioVersion,
 		InstallNative: func(cfg config.Config) error {
-			_, err := installNativeHost(cfg, "")
+			_, err := installNativeHost(cfg, "", "")
 			return err
 		},
 		RunDoctor: func(ctx context.Context, opt *options) (doctor.Report, error) {
@@ -61,6 +62,8 @@ func newInitCommand(opt *options) *cobra.Command {
 func newInitCommandWithDependencies(opt *options, deps initDependencies) *cobra.Command {
 	var nonInteractive, skipBrowser bool
 	var email, zotioPath, attachmentMode string
+	var openurlBase, shibbolethEntityID, proquestAccountID string
+	var extensionID, firefoxExtensionID string
 
 	command := &cobra.Command{
 		Use:   "init",
@@ -71,14 +74,24 @@ func newInitCommandWithDependencies(opt *options, deps initDependencies) *cobra.
 				return fmt.Errorf("init command dependencies are incomplete")
 			}
 			return runInit(cmd, opt, deps, initOptions{
-				nonInteractive: nonInteractive,
-				skipBrowser:    skipBrowser,
-				email:          email,
-				zotioPath:      zotioPath,
-				attachmentMode: attachmentMode,
-				emailSet:       cmd.Flags().Changed("email"),
-				zotioPathSet:   cmd.Flags().Changed("zotio-path"),
-				attachmentSet:  cmd.Flags().Changed("attachment-mode"),
+				nonInteractive:     nonInteractive,
+				skipBrowser:        skipBrowser,
+				email:              email,
+				zotioPath:          zotioPath,
+				attachmentMode:     attachmentMode,
+				openurlBase:        openurlBase,
+				shibbolethEntityID: shibbolethEntityID,
+				proquestAccountID:  proquestAccountID,
+				extensionID:        extensionID,
+				firefoxExtensionID: firefoxExtensionID,
+				emailSet:           cmd.Flags().Changed("email"),
+				zotioPathSet:       cmd.Flags().Changed("zotio-path"),
+				attachmentSet:      cmd.Flags().Changed("attachment-mode"),
+				openurlBaseSet:     cmd.Flags().Changed("openurl-base"),
+				entityIDSet:        cmd.Flags().Changed("shibboleth-entity-id"),
+				proquestSet:        cmd.Flags().Changed("proquest-account-id"),
+				extensionIDSet:     cmd.Flags().Changed("extension-id"),
+				firefoxIDSet:       cmd.Flags().Changed("firefox-extension-id"),
 			})
 		},
 	}
@@ -86,19 +99,34 @@ func newInitCommandWithDependencies(opt *options, deps initDependencies) *cobra.
 	command.Flags().StringVar(&email, "email", "", "contact email for polite API pools")
 	command.Flags().StringVar(&zotioPath, "zotio-path", "", "zotio executable path")
 	command.Flags().StringVar(&attachmentMode, "attachment-mode", "", "zotio attachment mode: stored or linked-file")
+	command.Flags().StringVar(&openurlBase, "openurl-base", "", "institution OpenURL resolver base URL")
+	command.Flags().StringVar(&shibbolethEntityID, "shibboleth-entity-id", "", "Shibboleth IdP entityID for federated login-routing")
+	command.Flags().StringVar(&proquestAccountID, "proquest-account-id", "", "ProQuest account id, or a ProQuest URL containing accountid=")
+	command.Flags().StringVar(&extensionID, "extension-id", "", "Chrome extension ID allowed to reach the native host")
+	command.Flags().StringVar(&firefoxExtensionID, "firefox-extension-id", "", "Firefox add-on ID allowed to reach the native host")
 	command.Flags().BoolVar(&skipBrowser, "skip-browser", false, "skip Chrome extension and native-host setup")
 	return command
 }
 
 type initOptions struct {
-	nonInteractive bool
-	skipBrowser    bool
-	email          string
-	zotioPath      string
-	attachmentMode string
-	emailSet       bool
-	zotioPathSet   bool
-	attachmentSet  bool
+	nonInteractive     bool
+	skipBrowser        bool
+	email              string
+	zotioPath          string
+	attachmentMode     string
+	openurlBase        string
+	shibbolethEntityID string
+	proquestAccountID  string
+	extensionID        string
+	firefoxExtensionID string
+	emailSet           bool
+	zotioPathSet       bool
+	attachmentSet      bool
+	openurlBaseSet     bool
+	entityIDSet        bool
+	proquestSet        bool
+	extensionIDSet     bool
+	firefoxIDSet       bool
 }
 
 func runInit(cmd *cobra.Command, opt *options, deps initDependencies, input initOptions) error {
@@ -243,6 +271,87 @@ func applyInitConfig(cmd *cobra.Command, out io.Writer, cfg *config.Config, exis
 			return fmt.Errorf("browser integration choice must be yes or no")
 		}
 	}
+
+	// Browser extension identity: the native host only accepts these exact
+	// extension IDs. Firefox's add-on ID is fixed for the built extension, so it
+	// defaults to the known value and works on the first run. Chrome assigns an
+	// unpacked extension its own ID, so paste the one shown at chrome://extensions
+	// (or pass --extension-id) — an empty value leaves the Chrome bridge disabled.
+	if !input.nonInteractive && !input.skipBrowser {
+		fmt.Fprintln(out, "Browser extension")
+		if !input.extensionIDSet {
+			value, err := initPrompt(reader, out, "Chrome extension ID from chrome://extensions (blank to skip Chrome)", cfg.Browser.ExtensionID)
+			if err != nil {
+				return err
+			}
+			cfg.Browser.ExtensionID = value
+		}
+		if !input.firefoxIDSet {
+			firefoxDefault := cfg.Browser.FirefoxExtensionID
+			if firefoxDefault == "" {
+				firefoxDefault = defaultFirefoxExtensionID
+			}
+			value, err := initPrompt(reader, out, "Firefox add-on ID (blank to skip Firefox)", firefoxDefault)
+			if err != nil {
+				return err
+			}
+			cfg.Browser.FirefoxExtensionID = value
+		}
+	}
+
+	// Institution: which library's OpenURL resolver and optional federated-login
+	// identity to route jobs through. Prompted only when browser integration is
+	// active. The ProQuest step accepts a pasted resolver URL and extracts the
+	// account id, so a user who does not know the numeric id can still set it.
+	if !input.nonInteractive && !input.skipBrowser {
+		fmt.Fprintln(out, "Institution")
+		if !input.openurlBaseSet {
+			value, err := initPrompt(reader, out, "Library OpenURL resolver base URL (blank to skip)", cfg.Browser.OpenURLBase)
+			if err != nil {
+				return err
+			}
+			cfg.Browser.OpenURLBase = value
+		}
+		if cfg.Browser.OpenURLBase != "" {
+			if !input.entityIDSet {
+				value, err := initPrompt(reader, out, "Shibboleth IdP entityID for auto login-routing (blank to skip)", cfg.Browser.ShibbolethEntityID)
+				if err != nil {
+					return err
+				}
+				cfg.Browser.ShibbolethEntityID = value
+			}
+			if !input.proquestSet {
+				raw, err := initPrompt(reader, out, "ProQuest account id, or paste a ProQuest URL with accountid= (blank to skip)", cfg.Browser.ProquestAccountID)
+				if err != nil {
+					return err
+				}
+				id, err := proquestAccountIDFromInput(raw)
+				if err != nil {
+					return err
+				}
+				cfg.Browser.ProquestAccountID = id
+			}
+		}
+	}
+	if input.openurlBaseSet {
+		cfg.Browser.OpenURLBase = strings.TrimSpace(input.openurlBase)
+	}
+	if input.entityIDSet {
+		cfg.Browser.ShibbolethEntityID = strings.TrimSpace(input.shibbolethEntityID)
+	}
+	if input.proquestSet {
+		id, err := proquestAccountIDFromInput(input.proquestAccountID)
+		if err != nil {
+			return err
+		}
+		cfg.Browser.ProquestAccountID = id
+	}
+	if input.extensionIDSet {
+		cfg.Browser.ExtensionID = strings.TrimSpace(input.extensionID)
+	}
+	if input.firefoxIDSet {
+		cfg.Browser.FirefoxExtensionID = strings.TrimSpace(input.firefoxExtensionID)
+	}
 	return nil
 }
 
@@ -259,6 +368,30 @@ func initPrompt(reader *bufio.Reader, out io.Writer, label, defaultValue string)
 		return defaultValue, nil
 	}
 	return value, nil
+}
+
+// accountIDParamRE captures an accountid=<digits> query parameter from anywhere
+// in a pasted ProQuest URL. proquestAccountDigitsRE matches a bare numeric id.
+var accountIDParamRE = regexp.MustCompile(`[?&]accountid=([0-9]+)`)
+var proquestAccountDigitsRE = regexp.MustCompile(`^[0-9]+$`)
+
+// proquestAccountIDFromInput turns first-run input into a ProQuest account id.
+// It accepts a bare numeric id, or any URL/string containing accountid=<digits>
+// (as seen in a ProQuest link-resolver URL after logging in through a library),
+// so a user who does not know the numeric id can paste a URL from their browser.
+// Blank input yields an empty id (feature disabled).
+func proquestAccountIDFromInput(input string) (string, error) {
+	s := strings.TrimSpace(input)
+	if s == "" {
+		return "", nil
+	}
+	if proquestAccountDigitsRE.MatchString(s) {
+		return s, nil
+	}
+	if m := accountIDParamRE.FindStringSubmatch(s); m != nil {
+		return m[1], nil
+	}
+	return "", fmt.Errorf("no ProQuest account id found in %q: paste a URL containing accountid=NNNN or the numeric id", s)
 }
 
 func validateInitEmail(value string) error {
@@ -299,10 +432,15 @@ func initLine(out io.Writer, pass bool, step, detail string) {
 	_, _ = fmt.Fprintf(out, "%s %s: %s\n", mark, step, detail)
 }
 
+// defaultFirefoxExtensionID is the built Firefox add-on's fixed gecko id (see
+// extension/build.ts). It is the init default so Firefox works on the first run
+// without the user discovering an ID.
+const defaultFirefoxExtensionID = "papio@orgmentem.com"
+
 func writeBrowserInstructions(out io.Writer) {
 	extensionPath, err := filepath.Abs("extension")
 	if err != nil {
 		extensionPath = "extension"
 	}
-	_, _ = fmt.Fprintf(out, "Browser setup:\n  1. Open chrome://extensions.\n  2. Enable Developer mode.\n  3. Click Load unpacked and select %s.\n  4. Open Papio's Details page and grant the optional host permissions only for publisher sites you use.\n  5. If Chrome assigned a new unpacked extension ID, set browser.extension_id to it and rerun papio init to register the native host.\n", extensionPath)
+	_, _ = fmt.Fprintf(out, "Browser setup:\n  Chrome:\n    1. Open chrome://extensions.\n    2. Enable Developer mode, then click Load unpacked and select %s.\n    3. Open Papio's Details page and grant optional host permissions only for publisher sites you use.\n    4. If the extension ID Chrome shows differs from the one you entered, re-run: papio init --extension-id <id>.\n  Firefox:\n    1. Open about:debugging#/runtime/this-firefox and click Load Temporary Add-on.\n    2. Select %s/firefox/manifest.json (its add-on ID %s is set by default).\n    3. On Papio's options page, grant the Library resolver access permission.\n", extensionPath, extensionPath, defaultFirefoxExtensionID)
 }

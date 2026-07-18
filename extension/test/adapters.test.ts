@@ -11,6 +11,7 @@ import {
   interpret,
   type AdapterContext,
   type AdapterSpec,
+  type DownloadRule,
   type PageVerdict,
 } from "../src/adapters/types";
 import { parseBrowserMessage, type BrowserMessage } from "../src/protocol";
@@ -219,6 +220,92 @@ test.skipIf(liveArticle === null)("captured proquest article fixture classifies 
   expect(interpret(liveArticle as Document, SPEC, ctx(EXPECTED_TITLE)).kind).toBe("article");
 });
 
+// Wiley Online Library: captured 2026-07-17 from a Example University-authenticated article
+// (fixtures/wiley/success.html). The article page carries the Highwire
+// citation_pdf_url meta the adapter downloads through.
+const wileyArticle = loadFixture("wiley", "success");
+test.skipIf(wileyArticle === null)(
+  "captured wiley article fixture classifies as article via the citation metas",
+  () => {
+    const spec = adapters.find((a) => a.id === "wiley") as AdapterSpec;
+    const verdict = interpret(wileyArticle as Document, spec, ctx());
+    expect(verdict.kind).toBe("article");
+    expect(verdict.adapter_id).toBe("wiley");
+  },
+);
+
+test("wiley stays unknown on a page lacking the citation_pdf_url/title metas", () => {
+  const spec = adapters.find((a) => a.id === "wiley") as AdapterSpec;
+  const page = parseHTML("<!doctype html><html><head><title>Journal home</title></head><body><h1>Psychology &amp; Marketing</h1></body></html>");
+  expect(interpret(page, spec, ctx()).kind).toBe("unknown");
+});
+
+test("wiley download builds the /doi/pdfdirect endpoint from the DOI in the page URL", () => {
+  const spec = adapters.find((a) => a.id === "wiley") as AdapterSpec;
+  const rule = spec.download as DownloadRule;
+  expect(rule.method).toBe("url");
+  // Mirrors resolveDownloadURL's substitution against location.href.
+  const build = (href: string): string | null => {
+    const m = href.match(new RegExp(rule.idPattern as string));
+    if (!m) return null;
+    return (rule.urlTemplate as string).replace(
+      /\{(\d+|id)\}/g,
+      (_, k: string) => m[k === "id" ? 1 : Number(k)] ?? "",
+    );
+  };
+  const want = "https://onlinelibrary.wiley.com/doi/pdfdirect/10.1002/mar.21498?download=true";
+  expect(build("https://onlinelibrary.wiley.com/doi/10.1002/mar.21498")).toBe(want);
+  expect(build("https://onlinelibrary.wiley.com/doi/full/10.1002/mar.21498")).toBe(want);
+  expect(build("https://onlinelibrary.wiley.com/doi/epdf/10.1002/mar.21498")).toBe(want);
+  // A different DOI (slashed suffix) still resolves.
+  expect(build("https://onlinelibrary.wiley.com/doi/abs/10.1111/jcpp.13440")).toBe(
+    "https://onlinelibrary.wiley.com/doi/pdfdirect/10.1111/jcpp.13440?download=true",
+  );
+});
+
+// SAGE Journals: captured 2026-07-17 via CDP from a Example University-authenticated article
+// (fixtures/sage/success.html). No Highwire metas; classifies on publication_doi
+// + the downloadPdfUrl anchor, downloads that anchor's href (method href).
+const sageArticle = loadFixture("sage", "success");
+test.skipIf(sageArticle === null)(
+  "captured sage article fixture classifies as article via publication_doi + pdf anchor",
+  () => {
+    const spec = adapters.find((a) => a.id === "sage") as AdapterSpec;
+    const verdict = interpret(sageArticle as Document, spec, ctx());
+    expect(verdict.kind).toBe("article");
+    expect(verdict.adapter_id).toBe("sage");
+  },
+);
+
+test("sage stays unknown without the publication_doi + downloadPdfUrl signals", () => {
+  const spec = adapters.find((a) => a.id === "sage") as AdapterSpec;
+  const page = parseHTML("<!doctype html><html><head><title>SAGE Journals</title></head><body><h1>Journal home</h1></body></html>");
+  expect(interpret(page, spec, ctx()).kind).toBe("unknown");
+});
+
+// ProQuest "Find your institution" wall (fixtures/proquest/login-return.html,
+// captured live via CDP): Example University routes heavily through ProQuest, and without a
+// ProQuest session it blocks the article behind an institution-selection form.
+// The login rule (ordered before article) must catch it so papio surfaces a
+// sign-in step instead of staying assisted.
+const pqLogin = loadFixture("proquest", "login-return");
+test.skipIf(pqLogin === null)(
+  "proquest institution wall classifies as login, not unknown/article",
+  () => {
+    const spec = adapters.find((a) => a.id === "proquest") as AdapterSpec;
+    expect(interpret(pqLogin as Document, spec, ctx()).kind).toBe("login");
+  },
+);
+
+const pqSuccess = loadFixture("proquest", "success");
+test.skipIf(pqSuccess === null)(
+  "proquest entitled docview still classifies as article after the login rule",
+  () => {
+    const spec = adapters.find((a) => a.id === "proquest") as AdapterSpec;
+    expect(interpret(pqSuccess as Document, spec, ctx()).kind).toBe("article");
+  },
+);
+
 // --- Contract 4: background verdict mapping -----------------------------------
 
 class FakeEmitter<A extends unknown[]> {
@@ -272,7 +359,13 @@ class FakeTabs {
     if (!tab) throw new Error("no such tab");
     return tab;
   }
+  readonly navigations: [number, { active?: boolean; url?: string }][] = [];
   async reload(_tabID: number): Promise<void> {}
+  async update(tabID: number, props: { active?: boolean; url?: string }): Promise<TabInfo> {
+    this.navigations.push([tabID, props]);
+    if (props.url !== undefined) this.live.set(tabID, { id: tabID, url: props.url });
+    return this.live.get(tabID) ?? { id: tabID };
+  }
   async remove(tabID: number): Promise<void> {
     this.live.delete(tabID);
   }
@@ -490,6 +583,8 @@ function offer(
   jobID: string,
   expected?: { title?: string },
   providerHosts: string[] = [PROVIDER],
+  loginEntityID?: string,
+  proquestAccountID?: string,
 ): unknown {
   return {
     protocol: "papio-browser/1",
@@ -503,6 +598,8 @@ function offer(
       access_mode: "maximal",
       expires_at: EXPIRES,
       ...(expected !== undefined ? { expected } : {}),
+      ...(loginEntityID !== undefined ? { login_entity_id: loginEntityID } : {}),
+      ...(proquestAccountID !== undefined ? { proquest_account_id: proquestAccountID } : {}),
     },
   };
 }
@@ -511,9 +608,9 @@ async function landOnProvider(
   h: MapHarness,
   jobID: string,
   host: string = PROVIDER,
+  url: string = `https://${host}/pqdweb`,
 ): Promise<number> {
   const tabID = h.backend.store.activeJobs.find((j) => j.job_id === jobID)?.tab_id ?? -1;
-  const url = `https://${host}/pqdweb`;
   h.tabs.live.set(tabID, { id: tabID, url });
   await h.tabs.onUpdated.emit(tabID, { url, status: "complete" }, { id: tabID, url });
   return tabID;
@@ -1168,6 +1265,108 @@ test("login verdict stays auth_pending — no outcome frame, no click", async ()
   await landOnProvider(h, "job_login_0001");
   expect(h.frames().some((f) => f.type === "provider_outcome")).toBe(false);
   expect(h.downloads.started.length).toBe(0);
+});
+
+// Federated login-routing: on a login wall, when the adapter declares a
+// federatedLogin route and the offer carried the institution entityID, papio
+// navigates the handoff tab straight to the IdP (auto-selecting the institution)
+// — credential entry still stays with the human.
+const FED_LOGIN_SPEC: AdapterSpec = {
+  id: "proquest",
+  version: "1.0.0",
+  hosts: [PROVIDER],
+  classify: [{ kind: "login", all: ["#login-form"] }],
+  federatedLogin: "https://sp.example/Shibboleth.sso/DS?entityID={entityID}&target=https://sp.example/home",
+};
+
+// Account-id unlock (ProQuest): on a login wall, appending ?accountid=<id> to
+// the current URL unlocks institutional access with no sign-in. Preferred over
+// the federated route when the offer carries an account id.
+const ACCT_SPEC: AdapterSpec = {
+  id: "proquest",
+  version: "1.0.0",
+  hosts: [PROVIDER],
+  classify: [{ kind: "login", all: ["#login-form"] }],
+  accountIdParam: "accountid",
+  federatedLogin: "https://sp.example/Shibboleth.sso/DS?entityID={entityID}&target=https://sp.example/home",
+};
+
+test("login verdict appends the account id to the current URL, preferring it over federated login", async () => {
+  const h = makeMapHarness([ACCT_SPEC]);
+  h.scripting.verdict = { kind: "login", adapter_id: "proquest", adapter_version: "1.0.0", evidence: [] };
+  await h.bridge.start();
+  await h.port.inbound(offer("job_acct_0001", undefined, [PROVIDER], "https://idp.example.edu/entity", "12345"));
+  const tabID = await landOnProvider(h, "job_acct_0001", PROVIDER, `https://${PROVIDER}/openurl/handler/x`);
+  const nav = h.tabs.navigations.filter(([, p]) => p.url !== undefined).map(([, p]) => p.url);
+  expect(nav).toContain(`https://${PROVIDER}/openurl/handler/x?accountid=12345`);
+  // Account id preferred: no federated (DS) navigation.
+  expect(nav.some((u) => u?.includes("Shibboleth.sso/DS"))).toBe(false);
+});
+
+test("account id unlock does not fire without an offer account id (falls back to federated)", async () => {
+  const h = makeMapHarness([ACCT_SPEC]);
+  h.scripting.verdict = { kind: "login", adapter_id: "proquest", adapter_version: "1.0.0", evidence: [] };
+  await h.bridge.start();
+  await h.port.inbound(offer("job_acct_noacct_0001", undefined, [PROVIDER], "https://idp.example.edu/entity"));
+  const tabID = await landOnProvider(h, "job_acct_noacct_0001", PROVIDER, `https://${PROVIDER}/openurl/handler/x`);
+  const nav = h.tabs.navigations.filter(([, p]) => p.url !== undefined).map(([, p]) => p.url);
+  expect(nav.some((u) => u?.includes("accountid="))).toBe(false);
+  expect(nav.some((u) => u?.includes("Shibboleth.sso/DS"))).toBe(true);
+});
+
+test("login verdict routes the handoff tab to the federated login with the offer entityID", async () => {
+  const h = makeMapHarness([FED_LOGIN_SPEC]);
+  h.scripting.verdict = { kind: "login", adapter_id: "proquest", adapter_version: "1.0.0", evidence: [] };
+  await h.bridge.start();
+  await h.port.inbound(offer("job_fedlogin_0001", undefined, [PROVIDER], "https://idp.example.edu/entity"));
+  const tabID = await landOnProvider(h, "job_fedlogin_0001");
+  expect(h.tabs.navigations).toContainEqual([
+    tabID,
+    { url: "https://sp.example/Shibboleth.sso/DS?entityID=https%3A%2F%2Fidp.example.edu%2Fentity&target=https://sp.example/home" },
+  ]);
+  // Still a human sign-in step: no outcome, no download.
+  expect(h.frames().some((f) => f.type === "provider_outcome")).toBe(false);
+  expect(h.downloads.started.length).toBe(0);
+});
+
+test("login verdict does not route without an offer entityID", async () => {
+  const h = makeMapHarness([FED_LOGIN_SPEC]);
+  h.scripting.verdict = { kind: "login", adapter_id: "proquest", adapter_version: "1.0.0", evidence: [] };
+  await h.bridge.start();
+  await h.port.inbound(offer("job_fedlogin_noent_0001"));
+  await landOnProvider(h, "job_fedlogin_noent_0001");
+  expect(h.tabs.navigations.some(([, p]) => p.url !== undefined)).toBe(false);
+});
+
+test("login verdict does not re-route while the human is signing in (latched)", async () => {
+  const h = makeMapHarness([FED_LOGIN_SPEC]);
+  h.scripting.verdict = { kind: "login", adapter_id: "proquest", adapter_version: "1.0.0", evidence: [] };
+  await h.bridge.start();
+  await h.port.inbound(offer("job_fedlogin_latch_0001", undefined, [PROVIDER], "https://idp.example.edu/entity"));
+  await landOnProvider(h, "job_fedlogin_latch_0001");
+  await landOnProvider(h, "job_fedlogin_latch_0001");
+  const routes = h.tabs.navigations.filter(([, p]) => p.url !== undefined);
+  expect(routes.length).toBe(1);
+});
+
+test("federated login return re-drives the openurl once, warm, to reach the article", async () => {
+  const h = makeMapHarness([FED_LOGIN_SPEC]);
+  h.scripting.verdict = { kind: "login", adapter_id: "proquest", adapter_version: "1.0.0", evidence: [] };
+  await h.bridge.start();
+  await h.port.inbound(offer("job_fedredrive_0001", undefined, [PROVIDER], "https://idp.example.edu/entity"));
+  const tabID = await landOnProvider(h, "job_fedredrive_0001");
+  // Simulate the federated round-trip: tab goes to the IdP, then returns.
+  const idp = "https://idp.example.edu/idp/profile/SAML2/Redirect/SSO";
+  h.tabs.live.set(tabID, { id: tabID, url: idp });
+  await h.tabs.onUpdated.emit(tabID, { url: idp }, { id: tabID, url: idp });
+  expect(h.backend.store.activeJobs[0]?.status).toBe("auth_pending");
+  const prov = `https://${PROVIDER}/pqdweb?doc=1`;
+  h.tabs.live.set(tabID, { id: tabID, url: prov });
+  await h.tabs.onUpdated.emit(tabID, { url: prov }, { id: tabID, url: prov });
+  // On the auth return, papio re-drives the original openurl exactly once.
+  const openurlDrives = h.tabs.navigations.filter(([, p]) => p.url === OPENURL);
+  expect(openurlDrives.length).toBe(1);
+  expect(openurlDrives[0]?.[0]).toBe(tabID);
 });
 
 test("unknown escalates to ui_changed only on the second observation ≥5s later", async () => {

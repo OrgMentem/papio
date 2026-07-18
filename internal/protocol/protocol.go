@@ -421,11 +421,13 @@ type HelloPayload struct {
 
 // JobOfferPayload asks the extension to open one OpenURL-resolved job.
 type JobOfferPayload struct {
-	OpenURL       string            `json:"openurl"`
-	ProviderHosts []string          `json:"provider_hosts"`
-	Expected      *JobOfferExpected `json:"expected,omitempty"`
-	AccessMode    string            `json:"access_mode"`
-	ExpiresAt     string            `json:"expires_at"`
+	OpenURL           string            `json:"openurl"`
+	ProviderHosts     []string          `json:"provider_hosts"`
+	Expected          *JobOfferExpected `json:"expected,omitempty"`
+	AccessMode        string            `json:"access_mode"`
+	LoginEntityID     string            `json:"login_entity_id,omitempty"`
+	ProquestAccountID string            `json:"proquest_account_id,omitempty"`
+	ExpiresAt         string            `json:"expires_at"`
 }
 
 // JobOfferExpected carries wrong-work guard hints.
@@ -567,7 +569,7 @@ func DecodeBrowserMessage(data []byte) (*BrowserMessage, error) {
 	case MsgJobOffer:
 		p := &JobOfferPayload{}
 		if err = browserRequireFields(payloadFields, "openurl", "provider_hosts", "access_mode", "expires_at"); err == nil {
-			err = browserRejectNullFields(payloadFields, "expected")
+			err = browserRejectNullFields(payloadFields, "expected", "login_entity_id", "proquest_account_id")
 		}
 		if raw, ok := payloadFields["expected"]; ok && err == nil {
 			var expectedFields map[string]json.RawMessage
@@ -654,6 +656,19 @@ func DecodeBrowserMessage(data []byte) (*BrowserMessage, error) {
 func (p *JobOfferPayload) validate() error {
 	if p.OpenURL == "" || browserTextLen(p.OpenURL) > 4000 || !strings.HasPrefix(p.OpenURL, "https://") {
 		return fmt.Errorf("openurl must be a bounded https URL")
+	}
+	if p.LoginEntityID != "" && (browserTextLen(p.LoginEntityID) > 4000 || !strings.HasPrefix(p.LoginEntityID, "https://")) {
+		return fmt.Errorf("login_entity_id must be a bounded https URL")
+	}
+	if p.ProquestAccountID != "" {
+		if len(p.ProquestAccountID) > 64 {
+			return fmt.Errorf("proquest_account_id must be digits")
+		}
+		for _, r := range p.ProquestAccountID {
+			if r < '0' || r > '9' {
+				return fmt.Errorf("proquest_account_id must be digits")
+			}
+		}
 	}
 	if len(p.ProviderHosts) < 1 || len(p.ProviderHosts) > 20 {
 		return fmt.Errorf("provider_hosts must have 1..20 entries")

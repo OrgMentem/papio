@@ -118,7 +118,15 @@ func newAcquireCommand(opt *options) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return opt.printResult(detail, "%s: %s", detail.Job.ID, detail.Job.State)
+			prose := fmt.Sprintf("%s: %s", detail.Job.ID, detail.Job.State)
+			if !opt.jsonOutput {
+				cfg, _ := opt.loadConfig()
+				reason := transitionReason(detail.Events, detail.Job.State)
+				if g := waitGuidance(detail.Job.State, reason, detail.Job.Policy.Resolver, detail.Job.Policy.AccessMode, cfg); g != "" {
+					prose += "\n" + g
+				}
+			}
+			return opt.printResult(detail, "%s", prose)
 		},
 	}
 	flags := command.Flags()

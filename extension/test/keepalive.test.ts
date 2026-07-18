@@ -53,14 +53,27 @@ class FakeTabs {
     active: boolean;
     pinned: boolean;
     muted: boolean;
+    windowId?: number;
   }[] = [];
+  /** When set, creation into any windowId throws (window closed race). */
+  failWindowCreate = false;
   readonly reloaded: number[] = [];
   readonly removed: number[] = [];
   readonly updates: { id: number; properties: { active?: boolean; pinned?: boolean; muted?: boolean } }[] = [];
   readonly live = new Map<number, KeepaliveTab>();
   nextURL: string | undefined;
 
-  async create(properties: { url: string; active: boolean; pinned: boolean; muted: boolean }): Promise<KeepaliveTab> {
+  async create(properties: {
+    url: string;
+    active: boolean;
+    pinned: boolean;
+    muted: boolean;
+    windowId?: number;
+  }): Promise<KeepaliveTab> {
+    if (this.failWindowCreate && properties.windowId !== undefined) {
+      this.created.push(properties);
+      throw new Error("no such window");
+    }
     const id = this.created.length + 1;
     this.created.push(properties);
     this.live.set(id, { id, url: properties.url });
@@ -101,7 +114,7 @@ class FakeTabs {
   }
 }
 
-function makeHarness(interval: unknown = 4): {
+function makeHarness(interval: unknown = 4, workWindowID?: () => number | undefined): {
   manager: KeepaliveManager;
   jobs: { count: number };
   tabs: FakeTabs;
@@ -123,6 +136,7 @@ function makeHarness(interval: unknown = 4): {
   const manager = new KeepaliveManager(api, {
     trackedJobCount: () => jobs.count,
     latestOpenURL: () => RESOLVER_OPENURL,
+    ...(workWindowID !== undefined ? { workWindowID } : {}),
     onReauthNeeded: () => {
       reauths.count += 1;
     },
@@ -195,4 +209,22 @@ test("clamps configured intervals to supported bounds", async () => {
   const high = makeHarness(99);
   await high.manager.init();
   expect(high.timers.latestDelay()).toBe(30 * 60_000);
+});
+
+test("creates the keepalive tab inside the work window, falling back when it is gone", async () => {
+  const routed = makeHarness(4, () => 500);
+  await routed.manager.init();
+  expect(routed.tabs.created).toEqual([
+    { url: "https://resolver.example.edu", active: false, pinned: true, muted: true, windowId: 500 },
+  ]);
+
+  // The work window closed between lookup and create: retry lands the tab in
+  // the user's current window instead of skipping the keepalive cycle.
+  const fallback = makeHarness(4, () => 500);
+  fallback.tabs.failWindowCreate = true;
+  await fallback.manager.init();
+  expect(fallback.tabs.created).toEqual([
+    { url: "https://resolver.example.edu", active: false, pinned: true, muted: true, windowId: 500 },
+    { url: "https://resolver.example.edu", active: false, pinned: true, muted: true },
+  ]);
 });

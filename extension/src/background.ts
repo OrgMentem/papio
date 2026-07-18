@@ -34,6 +34,7 @@ import {
   type StoreShape,
   type TermsConsent,
   TERMS_CONSENT_KEY,
+  WORK_WINDOW_KEY,
 } from "./state";
 import {
   adapters,
@@ -95,6 +96,15 @@ export interface TabChangeInfo {
   status?: string | undefined;
 }
 
+export interface WindowInfo {
+  id?: number | undefined;
+  /** "minimized" | "normal" | ... — used only to avoid un-maximizing a normal
+   * window when surfacing. */
+  state?: string | undefined;
+  /** Populated by windows.create when the window is created with a URL. */
+  tabs?: TabInfo[] | undefined;
+}
+
 export interface DownloadItemLike {
   id: number;
   state?: string | undefined;
@@ -126,12 +136,28 @@ export interface BridgeDeps {
   setTimeout(fn: () => void | Promise<void>, ms: number): void;
   backend: StateBackend;
   tabs: {
-    create(props: { url: string; active: boolean }): Promise<TabInfo>;
+    create(props: { url: string; active: boolean; windowId?: number }): Promise<TabInfo>;
     get(tabID: number): Promise<TabInfo>;
     reload(tabID: number): Promise<unknown>;
     remove(tabID: number): Promise<void>;
+    /** Optional: surface a work-window tab on human auth ({active}), or
+     * navigate the handoff tab to a federated-login route ({url}). */
+    update?(tabID: number, props: { active?: boolean; url?: string }): Promise<unknown>;
     onUpdated: Listenable<[number, TabChangeInfo, TabInfo]>;
     onRemoved: Listenable<[number, { isWindowClosing: boolean }]>;
+  };
+  /** chrome.windows seam. When present (and the user setting allows), every
+   * broker tab is routed into one dedicated minimized "work window" instead of
+   * the user's tab strip; a tab surfaces only when the human is needed (IdP
+   * authentication). Absent on platforms without the API — tabs then open in
+   * the current window with the legacy visibility rules. */
+  windows?: {
+    create(props: { url: string; focused: boolean; state: "minimized" }): Promise<WindowInfo>;
+    get(windowID: number): Promise<WindowInfo>;
+    update(
+      windowID: number,
+      props: { focused?: boolean; state?: "normal" },
+    ): Promise<unknown>;
   };
   downloads: {
     search(query: { id: number }): Promise<DownloadItemLike[]>;
@@ -175,11 +201,13 @@ export interface BridgeDeps {
   permissions: {
     contains(perm: { origins: string[] }): Promise<boolean>;
   };
-  /** Durable user settings (chrome.storage.local). Currently the informed
-   * consent for auto-accepting publisher terms & conditions. */
+  /** Durable user settings (chrome.storage.local): informed consent for
+   * auto-accepting publisher terms, and the background work-window toggle. */
   settings: {
     getTermsConsent(): Promise<TermsConsent>;
     setTermsConsent(value: Exclude<TermsConsent, undefined>): Promise<void>;
+    /** Optional; absent means enabled. Only consulted when `windows` exists. */
+    getWorkWindowEnabled?(): Promise<boolean>;
   };
   /** chrome.alarms seam. An MV3 service worker sleeps after ~30s idle; a
    * periodic alarm is the only thing that wakes it, so pending daemon offers
@@ -438,6 +466,23 @@ export class Bridge {
   private readonly completedDownloadTabs = new Map<string, number>();
   /** Resolver-provided offer URLs are cached here after storage hydration. */
   private readonly offerURLs = new Map<string, string>();
+  /** Institution Shibboleth entityIDs from job offers (login_entity_id), used to
+   * build an adapter's federated-login route on a `login` verdict. Worker-local;
+   * re-offers repopulate it. */
+  private readonly loginEntityIDs = new Map<string, string>();
+  /** Provider account ids from job offers (proquest_account_id), appended to the
+   * provider URL to unlock institutional access. Worker-local. */
+  private readonly proquestAccountIDs = new Map<string, string>();
+  /** Jobs whose provider URL was already account-id-appended this drive, so a
+   * still-walled page doesn't loop. Cleared on job removal. */
+  private readonly accountIdAppended = new Set<string>();
+  /** Jobs whose handoff tab was already routed to federated login this drive, so
+   * repeated `login` classifies do not re-navigate mid sign-in. Cleared on job
+   * removal. */
+  private readonly federatedLoginRouted = new Set<string>();
+  /** Jobs whose openurl was re-driven once after federated login returned, so a
+   * still-walled page doesn't loop. Cleared on job removal. */
+  private readonly federatedReDriven = new Set<string>();
   /** Authentication observed during this service-worker lifetime. */
   private authReturnedThisWorker = false;
   /** Keepalive has observed its resolver tab return from authentication. */
@@ -461,14 +506,105 @@ export class Bridge {
   /** Jobs already reported human_auth_required this worker lifetime, so a capped
    * job refreshes the daemon's human action at most once per spin-up. */
   private readonly authStalledReported = new Set<string>();
+  /** Serializes work-window creation so concurrent offers cannot race two
+   * dedicated windows into existence. Worker-local only. */
+  private workTabChain: Promise<unknown> = Promise.resolve();
 
   constructor(private readonly deps: BridgeDeps) {}
   trackedJobCount(): number {
     return this.store.activeJobs.length;
   }
 
+  /** Work-window mode is on when the platform has a windows API and the user
+   * has not disabled the setting (absent getter or absent value = enabled). */
+  private async workWindowActive(): Promise<boolean> {
+    if (this.deps.windows === undefined) return false;
+    const get = this.deps.settings.getWorkWindowEnabled;
+    if (get === undefined) return true;
+    try {
+      return await get();
+    } catch {
+      return true;
+    }
+  }
+
+  /** Open a broker tab. In work-window mode every tab lands unfocused in the
+   * dedicated minimized window; otherwise the legacy rule applies and
+   * `surfaceFallback` decides whether the tab takes focus. Never throws —
+   * returns undefined on failure, matching the call sites' reject paths. */
+  private async openBrokerTab(url: string, surfaceFallback: boolean): Promise<number | undefined> {
+    if (await this.workWindowActive()) {
+      const opened = this.workTabChain.then(() => this.openWorkWindowTab(url));
+      this.workTabChain = opened.catch(() => undefined);
+      try {
+        return await opened;
+      } catch (e) {
+        console.error("papio: work-window tab creation failed", e);
+        return undefined;
+      }
+    }
+    try {
+      return (await this.deps.tabs.create({ url, active: surfaceFallback })).id;
+    } catch (e) {
+      console.error("papio: tab creation failed", e);
+      return undefined;
+    }
+  }
+
+  /** Create the tab inside the dedicated work window, creating or recreating
+   * the window (minimized, unfocused) when it is missing or was closed. */
+  private async openWorkWindowTab(url: string): Promise<number | undefined> {
+    const windows = this.deps.windows;
+    if (windows === undefined) return undefined;
+    const existing = this.store.workWindowID;
+    if (existing !== undefined) {
+      try {
+        await windows.get(existing);
+        return (await this.deps.tabs.create({ url, active: false, windowId: existing })).id;
+      } catch {
+        // Window closed by the user (or the tab create raced its closing):
+        // fall through and recreate.
+      }
+    }
+    const created = await windows.create({ url, focused: false, state: "minimized" });
+    if (created.id !== undefined) {
+      const windowID = created.id;
+      await this.update((s) => ({ ...s, workWindowID: windowID }));
+    }
+    return created.tabs?.find((tab) => tab.id !== undefined)?.id;
+  }
+
+  /** Bring a work-window tab to the human: activate it and restore/focus the
+   * work window. No-op outside work-window mode (legacy tabs are already
+   * visible) and best-effort throughout — auth proceeds regardless. */
+  private async surfaceWorkTab(tabID: number): Promise<void> {
+    const windowID = this.store.workWindowID;
+    const windows = this.deps.windows;
+    if (windowID === undefined || windows === undefined) return;
+    try {
+      await this.deps.tabs.update?.(tabID, { active: true });
+    } catch {
+      // The tab may already be gone; window focus below still helps.
+    }
+    try {
+      const win = await windows.get(windowID);
+      await windows.update(windowID, {
+        focused: true,
+        ...(win.state === "minimized" ? { state: "normal" as const } : {}),
+      });
+    } catch {
+      // Window gone; the popup badge and notification remain the signal.
+    }
+  }
+
   latestOpenURL(): string | undefined {
     return this.latestOfferOpenURL;
+  }
+
+  /** The keepalive manager pins its resolver tab inside the work window when
+   * one exists, keeping papio's whole footprint out of the user's tab strip. */
+  workWindowIDForKeepalive(): number | undefined {
+    return this.store.workWindowID;
   }
 
 
@@ -801,6 +937,11 @@ export class Bridge {
     this.offerURLs.delete(jobID);
     this.queuedHandoffTimers.delete(jobID);
     this.classifyRetries.delete(jobID);
+    this.loginEntityIDs.delete(jobID);
+    this.federatedLoginRouted.delete(jobID);
+    this.federatedReDriven.delete(jobID);
+    this.proquestAccountIDs.delete(jobID);
+    this.accountIdAppended.delete(jobID);
     await this.update((s) => {
       const offerURLs = { ...(s.offerURLs ?? {}) };
       delete offerURLs[jobID];
@@ -951,7 +1092,7 @@ export class Bridge {
         }
         let tabID: number | undefined;
         try {
-          tabID = (await this.deps.tabs.create({ url, active: false })).id;
+          tabID = await this.openBrokerTab(url, false);
         } catch (e) {
           console.error("papio: queued handoff tab creation failed", e);
         }
@@ -1056,6 +1197,14 @@ export class Bridge {
     this.latestOfferOpenURL = openurl;
     const providerHosts = hostsRaw.filter((h): h is string => typeof h === "string");
     const expected = parseExpected(p["expected"]);
+    const loginEntityID = p["login_entity_id"];
+    if (typeof loginEntityID === "string" && loginEntityID.length > 0) {
+      this.loginEntityIDs.set(jobID, loginEntityID);
+    }
+    const proquestAccountID = p["proquest_account_id"];
+    if (typeof proquestAccountID === "string" && proquestAccountID.length > 0) {
+      this.proquestAccountIDs.set(jobID, proquestAccountID);
+    }
 
     // Restart/re-offer dedup normally re-accepts a live tab. A tab-less job
     // without its durable offer URL cannot represent an in-flight download:
@@ -1142,7 +1291,7 @@ export class Bridge {
     this.handoffOpening = true;
     let tabID: number | undefined;
     try {
-      tabID = (await this.deps.tabs.create({ url: openurl, active: true })).id;
+      tabID = await this.openBrokerTab(openurl, true);
     } catch (e) {
       console.error("papio: tab creation failed; rejecting job", e);
     } finally {
@@ -1227,7 +1376,7 @@ export class Bridge {
     this.handoffOpening = true;
     let tabID: number | undefined;
     try {
-      tabID = (await this.deps.tabs.create({ url, active: true })).id;
+      tabID = await this.openBrokerTab(url, true);
     } catch (e) {
       console.error("papio: tab creation failed after direct-file download", e);
     } finally {
@@ -1335,6 +1484,7 @@ export class Bridge {
         );
         this.send("auth_pending", {}, job.job_id);
         await this.noteAuthAttempt(job.job_id, tabID);
+        await this.surfaceWorkTab(tabID);
       }
       return;
     }
@@ -1352,6 +1502,18 @@ export class Bridge {
       if (firstAuthReturn) {
         await this.releaseQueuedHandoffs();
         await this.reloadAuthenticationHandoffs();
+      }
+      // If we routed this job through federated login, the return lands on the
+      // provider's generic post-login page (the DS target), not the article.
+      // Re-drive the original openurl once so the now-warm session resolves the
+      // entitled page; the fresh navigation triggers classify below.
+      if (this.federatedLoginRouted.has(job.job_id) && !this.federatedReDriven.has(job.job_id)) {
+        const openurl = this.offerURLs.get(job.job_id);
+        if (openurl !== undefined && this.deps.tabs.update !== undefined) {
+          this.federatedReDriven.add(job.job_id);
+          await this.deps.tabs.update(job.tab_id, { url: openurl });
+          return;
+        }
       }
       // The provider landing that ends authentication frequently arrives
       // without a `status: "complete"` (SPA soft-nav, history push, or a
@@ -1594,6 +1756,62 @@ export class Bridge {
     this.deps.setTimeout(() => this.retryClassify(jobID), CLASSIFY_RETRY_MS);
   }
 
+  /** Auto-select the institution on a provider login wall: navigate the handoff
+   * tab to the adapter's federated-login entry with the offer's entityID, once
+   * per drive. Institution selection is deterministic config, not a secret; the
+   * human still enters credentials at the IdP. No-op without a configured route,
+   * a known entityID, or a `tabs.update` seam, and never re-navigates mid
+   * sign-in (latched, cleared on job removal). */
+  private async maybeRouteFederatedLogin(jobID: string, job: ActiveJob, spec: AdapterSpec): Promise<void> {
+    const template = spec.federatedLogin;
+    const entityID = this.loginEntityIDs.get(jobID);
+    if (template === undefined || entityID === undefined) return;
+    if (this.federatedLoginRouted.has(jobID)) return;
+    if (this.deps.tabs.update === undefined) return;
+    const url = template.replace("{entityID}", encodeURIComponent(entityID));
+    if (!url.startsWith("https://")) return;
+    this.federatedLoginRouted.add(jobID);
+    try {
+      await this.deps.tabs.update(job.tab_id, { url });
+    } catch (e) {
+      // Let a later classify retry route again if this navigation failed.
+      this.federatedLoginRouted.delete(jobID);
+      console.error("papio: federated login route failed", e);
+    }
+  }
+
+  /** Unlock a provider's openurl link-resolver by appending its institutional
+   * account id (ProQuest: ?accountid=<id>) to the current tab URL — fully
+   * autonomous, no sign-in. Returns true if it navigated. No-op without a
+   * configured param/account id or a `tabs.update` seam, if the current URL
+   * already carries the param, or if already appended this drive (latched). */
+  private async maybeAppendAccountId(jobID: string, job: ActiveJob, spec: AdapterSpec): Promise<boolean> {
+    const param = spec.accountIdParam;
+    const accountID = this.proquestAccountIDs.get(jobID);
+    if (param === undefined || accountID === undefined) return false;
+    if (this.accountIdAppended.has(jobID)) return false;
+    if (this.deps.tabs.update === undefined) return false;
+    let current: string;
+    try {
+      current = (await this.deps.tabs.get(job.tab_id)).url ?? "";
+    } catch {
+      return false;
+    }
+    if (!current.startsWith("https://")) return false;
+    const url = new URL(current);
+    if (url.searchParams.get(param) === accountID) return false;
+    url.searchParams.set(param, accountID);
+    this.accountIdAppended.add(jobID);
+    try {
+      await this.deps.tabs.update(job.tab_id, { url: url.toString() });
+      return true;
+    } catch (e) {
+      this.accountIdAppended.delete(jobID);
+      console.error("papio: account-id unlock failed", e);
+      return false;
+    }
+  }
+
   private async retryClassify(jobID: string): Promise<void> {
     await this.ready;
     const job = findByJob(this.store, jobID);
@@ -1776,7 +1994,15 @@ export class Bridge {
         return;
       }
       case "login":
-        // Human is still authenticating: stay auth_pending, emit nothing.
+        // A provider login wall. If the adapter has a federated-login route and
+        // the offer carried the institution entityID, auto-select the institution
+        // by navigating the handoff tab straight to the IdP (skipping the
+        // provider's picker); the human still enters credentials there. Then stay
+        // auth_pending, emit nothing.
+        // Prefer the autonomous account-id unlock; fall back to federated login.
+        if (!(await this.maybeAppendAccountId(jobID, job, spec))) {
+          await this.maybeRouteFederatedLogin(jobID, job, spec);
+        }
         return;
       case "terms": {
         const consent = await this.deps.settings.getTermsConsent();
@@ -2008,9 +2234,22 @@ function realDeps(): BridgeDeps {
       get: (tabID) => chrome.tabs.get(tabID),
       reload: (tabID) => chrome.tabs.reload(tabID),
       remove: (tabID) => chrome.tabs.remove(tabID),
+      update: (tabID, props) => chrome.tabs.update(tabID, props),
       onUpdated: { addListener: (cb) => chrome.tabs.onUpdated.addListener(cb) },
       onRemoved: { addListener: (cb) => chrome.tabs.onRemoved.addListener(cb) },
     },
+    // chrome.windows is present in every Chromium; guarded for other runtimes.
+    ...(typeof chrome.windows !== "undefined"
+      ? {
+          windows: {
+            create: (props: { url: string; focused: boolean; state: "minimized" }) =>
+              chrome.windows.create(props) as Promise<WindowInfo>,
+            get: (windowID: number) => chrome.windows.get(windowID) as Promise<WindowInfo>,
+            update: (windowID: number, props: { focused?: boolean; state?: "normal" }) =>
+              chrome.windows.update(windowID, props),
+          },
+        }
+      : {}),
     downloads: {
       download: (options) => chrome.downloads.download(options),
       removeFile: (downloadID) => chrome.downloads.removeFile(downloadID),
@@ -2054,6 +2293,14 @@ function realDeps(): BridgeDeps {
       async setTermsConsent(value) {
         await chrome.storage.local.set({ [TERMS_CONSENT_KEY]: value });
       },
+      async getWorkWindowEnabled() {
+        try {
+          const got = await chrome.storage.local.get(WORK_WINDOW_KEY);
+          return got[WORK_WINDOW_KEY] !== false;
+        } catch {
+          return true;
+        }
+      },
     },
     alarms: {
       create: (name, info) => chrome.alarms?.create(name, info),
@@ -2090,8 +2337,22 @@ if (typeof chrome !== "undefined" && chrome.runtime?.id) {
     initKeepalive(chromeKeepaliveAPI(chrome), {
       trackedJobCount: () => bridge.trackedJobCount(),
       latestOpenURL: () => bridge.latestOpenURL(),
+      workWindowID: () => bridge.workWindowIDForKeepalive(),
       onAuthenticationChanged: (authenticated) => {
         void bridge.setKeepaliveAuthenticated(authenticated);
+      },
+      surfaceReauthTab: async (tabID) => {
+        try {
+          const tab = await chrome.tabs.get(tabID);
+          if (tab.windowId === undefined) return;
+          const win = await chrome.windows.get(tab.windowId);
+          await chrome.windows.update(tab.windowId, {
+            focused: true,
+            ...(win.state === "minimized" ? { state: "normal" as const } : {}),
+          });
+        } catch {
+          // Badge and popup remain the recoverable reauth signal.
+        }
       },
     }),
   );

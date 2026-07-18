@@ -755,9 +755,9 @@ func TestSubmitCarriesCollectionIntoJobPolicy(t *testing.T) {
 func TestSubmitResolverProfileAndUnknownValidation(t *testing.T) {
 	svc, jobs := newTestService(t)
 	svc.Config.Browser.OpenURLBase = "https://resolver.example.edu/openurl"
-	svc.Config.Browser.Resolvers = map[string]string{
-		"example": "https://example.primo.exlibrisgroup.com/nde/openurl?vid=61EXL_INST:61EXL_NDE",
-		"institute": "https://onesearch.library.example-institute.edu/discovery/openurl?vid=61INS_INST:INS",
+	svc.Config.Browser.Resolvers = map[string]config.Institution{
+		"example": {OpenURLBase: "https://example.primo.exlibrisgroup.com/nde/openurl?vid=61EXL_INST:61EXL_NDE"},
+		"institute": {OpenURLBase: "https://onesearch.library.example-institute.edu/discovery/openurl?vid=61INS_INST:INS"},
 	}
 	request := doiRequest("wr_resolver_profile")
 	request.Resolver = "institute"

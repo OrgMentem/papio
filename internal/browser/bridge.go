@@ -540,8 +540,8 @@ func (b *Bridge) poll(ctx context.Context) ([]json.RawMessage, error) {
 // reuse the frozen OpenURL field with the candidate's public URL; institutional
 // handoffs still construct the regular OpenURL resolver link.
 func (b *Bridge) offer(row job.Row, handoffDetail string) (json.RawMessage, error) {
-	base, _ := b.cfg.OpenURLBaseFor(row.Policy.Resolver)
-	offerURL := OpenURL(base, row.Work)
+	inst, _ := b.cfg.InstitutionFor(row.Policy.Resolver)
+	offerURL := OpenURL(inst.OpenURLBase, row.Work)
 	if oaURL, ok := app.OABrowserHandoffURL(handoffDetail); ok {
 		offerURL = oaURL
 	}
@@ -561,6 +561,13 @@ func (b *Bridge) offer(row job.Row, handoffDetail string) (json.RawMessage, erro
 		AccessMode:    b.cfg.AccessMode,
 		ExpiresAt:     b.now().Add(b.actionExpiry()).UTC().Format(time.RFC3339),
 	}
+	// Federated login-routing: hand this job's institution Shibboleth entityID
+	// and ProQuest account id to the extension so it can auto-select the
+	// institution on a provider login wall and unlock ProQuest's link-resolver.
+	// Values are per-profile (InstitutionFor), so a named institution routes its
+	// own login and never inherits the default institution's identity.
+	payload.LoginEntityID = inst.ShibbolethEntityID
+	payload.ProquestAccountID = inst.ProquestAccountID
 	return b.frame(protocol.MsgJobOffer, row.ID, payload)
 }
 

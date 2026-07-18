@@ -1,10 +1,10 @@
 // Copyright 2026 OrgMentem. Licensed under MIT. See LICENSE.
 
-// Package nativehost implements papio's Chrome native-messaging host bridge.
+// Package nativehost implements papio's browser native-messaging host bridge.
 //
-// The host is a thin, disposable relay: Chrome launches papio-native-host,
-// hands it the extension origin as an untrusted argument, and speaks the
-// locked papio-browser/1 protocol over stdin/stdout using Chrome's 4-byte
+// The host is a thin, disposable relay: a browser launches papio-native-host,
+// hands it its extension identity as an untrusted argument, and speaks the
+// locked papio-browser/1 protocol over stdin/stdout using the browser's 4-byte
 // little-endian length framing. This process owns no durable state. It
 // validates the origin, enforces framing and the fail-closed protocol
 // invariants (bounded frame size, hello-first, strictly increasing seq), and
@@ -28,7 +28,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 
@@ -89,17 +88,17 @@ type Syncer interface {
 }
 
 // Run is the papio-native-host entrypoint. It loads config, refuses a missing
-// or mismatched extension origin, ensures the daemon is running, and relays
-// frames between Chrome and the daemon until stdin closes or ctx is cancelled.
+// or mismatched browser extension identity, ensures the daemon is running, and
+// relays frames between the browser and the daemon until stdin closes or ctx is cancelled.
 func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	cfg, err := config.Load("")
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
-	if cfg.Browser.ExtensionID == "" {
-		return errors.New("browser bridge disabled: browser.extension_id is not configured")
+	if cfg.Browser.ExtensionID == "" && cfg.Browser.FirefoxExtensionID == "" {
+		return errors.New("browser bridge disabled: browser.extension_id and browser.firefox_extension_id are not configured")
 	}
-	if err := validateOrigin(args, cfg.Browser.ExtensionID); err != nil {
+	if err := validateOrigin(args, cfg.Browser.ExtensionID, cfg.Browser.FirefoxExtensionID); err != nil {
 		return fmt.Errorf("reject native-messaging origin: %w", err)
 	}
 
@@ -120,27 +119,28 @@ func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	return newBridge(syncer, stdin, stdout, stderr).run(ctx)
 }
 
-// validateOrigin enforces that Chrome supplied exactly the configured
-// extension origin. The argument is untrusted: it is only compared, never
-// trusted to name a different allowed extension. Chrome passes the origin as
-// "chrome-extension://<id>/"; a trailing native-window handle (Windows) is
-// ignored because it does not carry the scheme.
-func validateOrigin(args []string, wantID string) error {
-	const scheme = "chrome-extension://"
-	for _, arg := range args {
-		if !strings.HasPrefix(arg, scheme) {
-			continue
+// validateOrigin accepts only configured browser invocation identities. Chrome
+// passes exactly "chrome-extension://<id>/"; Firefox passes its configured
+// Gecko extension ID as a bare argument after the app manifest path. Every
+// argument is untrusted and compared exactly, so neither browser can name an
+// extension that the configuration did not allow.
+func validateOrigin(args []string, chromeID, firefoxID string) error {
+	if chromeID != "" {
+		wantChromeOrigin := "chrome-extension://" + chromeID + "/"
+		for _, arg := range args {
+			if arg == wantChromeOrigin {
+				return nil
+			}
 		}
-		id := strings.TrimPrefix(arg, scheme)
-		if slash := strings.IndexByte(id, '/'); slash >= 0 {
-			id = id[:slash]
-		}
-		if id == wantID {
-			return nil
-		}
-		return fmt.Errorf("origin extension id does not match configured extension_id")
 	}
-	return errors.New("missing chrome-extension origin argument")
+	if firefoxID != "" {
+		for _, arg := range args {
+			if arg == firefoxID {
+				return nil
+			}
+		}
+	}
+	return errors.New("missing configured browser extension identity argument")
 }
 
 // ipcSyncer forwards frames to the daemon's browser.sync RPC. Each call opens a

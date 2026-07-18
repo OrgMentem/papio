@@ -81,6 +81,17 @@ export interface AdapterSpec {
    * the open modal. Clicked ONLY when the user has recorded informed consent to
    * auto-accept publisher terms; otherwise the terms gate stays human. */
   termsAccept?: TermsAcceptRule;
+  /** Provider federated-login entry, used ONLY on a `login` verdict when the
+   * job offer carries a `login_entity_id`. `{entityID}` is replaced with the
+   * URL-encoded institution entityID; papio navigates the handoff tab there to
+   * auto-select the institution (skipping the provider's institution picker),
+   * leaving credential entry to the human. Absent = surface the wall as-is. */
+  federatedLogin?: string;
+  /** Query param this provider's openurl handler needs to unlock institutional
+   * access (ProQuest: "accountid"). On a `login` verdict, if the offer carries a
+   * provider account id, papio appends `?<param>=<id>` to the current URL —
+   * fully autonomous, no sign-in. Tried before federatedLogin. */
+  accountIdParam?: string;
 }
 
 export interface TermsAcceptRule {
@@ -280,14 +291,38 @@ export const adapters: AdapterSpec[] = [
     // unentitled) stays `unknown`: distinguishing those needs fixtures
     // we do not have yet.
     id: "proquest",
-    version: "0.1.0",
+    version: "0.2.0",
     hosts: ["proquest.com"],
-    classify: [{ kind: "article", all: ["a[id^='downloadPDFLink_']", "h1"] }],
+    classify: [
+      // ProQuest's "Find your institution" wall (fixtures/proquest/login-return.html):
+      // when the resolver routes here without a ProQuest institutional session,
+      // it blocks the article behind an institution-selection form instead of
+      // showing the download link. Classify it `login` (ordered first) so papio
+      // surfaces it as a human sign-in step rather than staying silently
+      // assisted/unknown — Example University routes heavily through ProQuest. After the user
+      // authenticates (OpenAthens/Shibboleth → Example University), the re-drive lands on the
+      // entitled docview matched by the article rule below.
+      { kind: "login", all: ["form#institutionForm", "input#institutionName"] },
+      { kind: "article", all: ["a[id^='downloadPDFLink_']", "h1"] },
+    ],
     download: {
       selector: "a[id^='downloadPDFLink_']",
       requireKind: "article",
       method: "href",
     },
+    // On the login wall, route straight to the institution's Shibboleth login
+    // via ProQuest's discovery-service entry with the configured entityID,
+    // skipping the "Find your institution" picker. {entityID} is filled from the
+    // offer's login_entity_id; the target returns to ProQuest, and papio
+    // re-drives the openurl once the session is warm. Verified live 2026-07-17:
+    // this DS URL with Example University's entityID routes directly to idp.example.edu login.
+    // Preferred over federatedLogin for ProQuest: appending ?accountid=<id>
+    // unlocks Example University's institutional access with no sign-in at all (verified live
+    // 2026-07-18 — resolves the wall cold, "Access provided by EXAMPLE
+    // UNIVERSITY"). federatedLogin stays as a fallback when no account id is set.
+    accountIdParam: "accountid",
+    federatedLogin:
+      "https://shibboleth-sp.prod.proquest.com/Shibboleth.sso/DS?entityID={entityID}&target=https://shibboleth-sp.prod.proquest.com/ONE_SEARCH/PRODWWW",
   },
   {
     // Verified live 2026-07-14 against Example University-authenticated and isolated
@@ -451,6 +486,64 @@ export const adapters: AdapterSpec[] = [
       method: "meta",
       metaName: "citation_pdf_url",
       requiresTermsConsent: true,
+    },
+  },
+  {
+    // Verified live 2026-07-17 against a Example University-authenticated Wiley Online Library
+    // article (fixtures/wiley/success.html). The page's citation_pdf_url meta
+    // points at /doi/pdf/<doi>, but that path returns an HTML viewer wrapper —
+    // the actual file is Wiley's /doi/pdfdirect/<doi>?download=true endpoint
+    // (what the viewer's download button builds; confirmed live to return the
+    // PDF while /doi/pdf/ returns HTML). So classify on the citation metas but
+    // build the direct endpoint from the DOI in the page URL and fetch it
+    // through the privileged downloads API with the session cookies. No
+    // publisher terms modal, so no consent gate.
+    id: "wiley",
+    version: "0.2.0",
+    hosts: ["onlinelibrary.wiley.com"],
+    settleTimeoutMs: 5000,
+    classify: [
+      {
+        kind: "article",
+        all: ["meta[name='citation_pdf_url']", "meta[name='citation_title']"],
+      },
+    ],
+    download: {
+      selector: "meta[name='citation_pdf_url']",
+      requireKind: "article",
+      method: "url",
+      // Wiley article/abstract/viewer paths all carry the DOI after /doi/[seg/].
+      idPattern: "/doi/(?:[a-z]+/)?(10\\.[^?#]+)",
+      urlTemplate: "https://onlinelibrary.wiley.com/doi/pdfdirect/{1}?download=true",
+    },
+  },
+  {
+    // Classify fixture-verified 2026-07-17 against a live Example University-authenticated SAGE
+    // article captured via CDP (fixtures/sage/success.html). SAGE sits behind
+    // Cloudflare and emits no Highwire citation_* metas; it exposes
+    // publication_doi plus a "Download PDF" anchor (id downloadPdfUrl, same shape
+    // as ACM) whose live href is the direct /doi/pdf/<doi>?download=true file.
+    // The sanitizer strips the ?download=true query from the captured fixture, so
+    // the selector keys on the stable id/path/data-doi and the href method reads
+    // the live anchor href at download time.
+    // NOTE: end-to-end download NOT yet live-exercised — Example University's resolver routed
+    // the SAGE test title (10.1177/0018720814547570) to ProQuest, not sagepub, so
+    // the flow never landed on a SAGE page. Adapter fires when the resolver routes
+    // a title to journals.sagepub.com; download method mirrors ACM's proven href.
+    id: "sage",
+    version: "0.1.0",
+    hosts: ["journals.sagepub.com"],
+    settleTimeoutMs: 5000,
+    classify: [
+      {
+        kind: "article",
+        all: ["meta[name='publication_doi']", "a#downloadPdfUrl[data-doi][href*='/doi/pdf/']"],
+      },
+    ],
+    download: {
+      selector: "a#downloadPdfUrl[data-doi][href*='/doi/pdf/']",
+      requireKind: "article",
+      method: "href",
     },
   },
 ];

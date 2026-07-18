@@ -82,10 +82,8 @@ func NewCoalescer(sender Sender) *Coalescer {
 // HumanAction records a job that needs human attention.
 func (c *Coalescer) HumanAction(ctx context.Context) {
 	c.notify(ctx, "human_action", func(count int) string {
-		if count == 1 {
-			return "1 paper needs your attention"
-		}
-		return plural(count, "paper needs your attention", "papers need your attention")
+		base := plural(count, "paper needs your attention", "papers need your attention")
+		return base + "; run papio status to see why"
 	})
 }
 

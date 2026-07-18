@@ -68,17 +68,56 @@ type Browser struct {
 	// ExtensionID is the fixed Chrome extension ID allowed to talk to the
 	// native host (32 chars, a-p). Empty disables the bridge.
 	ExtensionID string `toml:"extension_id,omitempty"`
+	// FirefoxExtensionID is the Gecko add-on ID allowed to reach the native
+	// host. Empty disables the Firefox bridge.
+	FirefoxExtensionID string `toml:"firefox_extension_id,omitempty"`
 	// OpenURLBase is the default institution's OpenURL resolver base (https).
 	OpenURLBase string `toml:"openurl_base_url,omitempty"`
-	// Resolvers contains named institutional OpenURL resolver bases. The
-	// OpenURLBase above remains the implicit "default" profile.
-	Resolvers map[string]string `toml:"resolvers,omitempty"`
+	// ShibbolethEntityID is the default institution's Shibboleth IdP entityID;
+	// empty disables federated login-routing.
+	ShibbolethEntityID string `toml:"shibboleth_entity_id,omitempty"`
+	// ProquestAccountID is the institution's ProQuest account id used to unlock
+	// ProQuest's OpenURL link-resolver; empty disables.
+	ProquestAccountID string `toml:"proquest_account_id,omitempty"`
+	// Resolvers contains named institutional access profiles. Each named
+	// profile carries its own OpenURL base and optional federated-login
+	// identity, so a multi-institution user routes each job to the right
+	// library. The top-level OpenURLBase / ShibbolethEntityID /
+	// ProquestAccountID fields above are the implicit "default" profile.
+	Resolvers map[string]Institution `toml:"resolvers,omitempty"`
 	// AdoptionRoot is the directory Chrome downloads into for adoption;
 	// the daemon rejects reported paths outside <root>/<job_id>/.
 	// Default: <data_dir>/adoptions.
 	AdoptionRoot string `toml:"download_adoption_root,omitempty"`
 	// ActionExpirySeconds bounds how long one browser handoff stays open.
 	ActionExpirySeconds int `toml:"action_expiry_seconds,omitempty"`
+}
+
+// Institution is one library's institutional-access identity: its OpenURL
+// link-resolver base plus the optional Shibboleth entityID and ProQuest
+// account id used to auto-route provider login walls without a manual WAYF
+// selection. Named institutions live in Browser.Resolvers; the default
+// institution is expressed by the top-level Browser fields.
+type Institution struct {
+	// OpenURLBase is the institution's OpenURL resolver base (https).
+	OpenURLBase string `toml:"openurl_base_url"`
+	// ShibbolethEntityID is the institution's Shibboleth IdP entityID; empty
+	// disables federated login-routing for this profile.
+	ShibbolethEntityID string `toml:"shibboleth_entity_id,omitempty"`
+	// ProquestAccountID unlocks this institution's ProQuest link-resolver;
+	// empty disables the accountid append for this profile.
+	ProquestAccountID string `toml:"proquest_account_id,omitempty"`
+}
+
+// UnmarshalText lets a resolver profile be written as a bare OpenURL base
+// string — the shorthand `name = "https://…"` — in addition to a full
+// institution table. go-toml routes scalar string values here and decodes
+// tables through the struct fields normally (including DisallowUnknownFields),
+// so the string form keeps pre-existing single-base resolver configs loading
+// without a migration while the table form adds the per-profile login identity.
+func (i *Institution) UnmarshalText(text []byte) error {
+	i.OpenURLBase = string(text)
+	return nil
 }
 
 // Zotio configures the credential-owning Zotero CLI boundary. Papio invokes
@@ -210,17 +249,36 @@ func (c *Config) validate() error {
 	if c.Browser.ExtensionID != "" && !extensionIDRE.MatchString(c.Browser.ExtensionID) {
 		return fmt.Errorf("browser.extension_id must be 32 chars a-p")
 	}
+	if c.Browser.FirefoxExtensionID != "" && !firefoxExtensionIDRE.MatchString(c.Browser.FirefoxExtensionID) {
+		return fmt.Errorf("browser.firefox_extension_id must be a Gecko email-like ID or braced GUID")
+	}
 	if c.Browser.OpenURLBase != "" {
 		if err := validateOpenURLBase(c.Browser.OpenURLBase); err != nil {
 			return fmt.Errorf("browser.openurl_base_url %w", err)
 		}
 	}
-	for name, base := range c.Browser.Resolvers {
+	if c.Browser.ShibbolethEntityID != "" {
+		if err := validateOpenURLBase(c.Browser.ShibbolethEntityID); err != nil {
+			return fmt.Errorf("browser.shibboleth_entity_id %w", err)
+		}
+	}
+	if c.Browser.ProquestAccountID != "" && (len(c.Browser.ProquestAccountID) > 64 || !proquestAccountIDRE.MatchString(c.Browser.ProquestAccountID)) {
+		return fmt.Errorf("browser.proquest_account_id must be digits (max 64)")
+	}
+	for name, inst := range c.Browser.Resolvers {
 		if !resolverNameRE.MatchString(name) {
 			return fmt.Errorf("browser.resolvers.%s name must be lowercase alphanumeric", name)
 		}
-		if err := validateOpenURLBase(base); err != nil {
-			return fmt.Errorf("browser.resolvers.%s %w", name, err)
+		if err := validateOpenURLBase(inst.OpenURLBase); err != nil {
+			return fmt.Errorf("browser.resolvers.%s.openurl_base_url %w", name, err)
+		}
+		if inst.ShibbolethEntityID != "" {
+			if err := validateOpenURLBase(inst.ShibbolethEntityID); err != nil {
+				return fmt.Errorf("browser.resolvers.%s.shibboleth_entity_id %w", name, err)
+			}
+		}
+		if inst.ProquestAccountID != "" && (len(inst.ProquestAccountID) > 64 || !proquestAccountIDRE.MatchString(inst.ProquestAccountID)) {
+			return fmt.Errorf("browser.resolvers.%s.proquest_account_id must be digits (max 64)", name)
 		}
 	}
 	if c.Browser.ActionExpirySeconds < 0 {
@@ -246,7 +304,11 @@ func (c *Config) validate() error {
 // extensionIDRE matches Chrome's a-p base16 extension ID alphabet.
 var extensionIDRE = regexp.MustCompile(`^[a-p]{32}$`)
 
+// firefoxExtensionIDRE matches Gecko's email-like or braced-GUID add-on ID.
+var firefoxExtensionIDRE = regexp.MustCompile(`^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+$|^\{[0-9a-fA-F-]{36}\}$`)
+
 var resolverNameRE = regexp.MustCompile(`^[a-z0-9]+$`)
+var proquestAccountIDRE = regexp.MustCompile(`^[0-9]+$`)
 
 func validateOpenURLBase(base string) error {
 	u, err := url.Parse(base)
@@ -282,16 +344,30 @@ func (c *Config) SourcePolicy(name string) Source {
 	return c.Sources[name]
 }
 
-// OpenURLBaseFor returns the configured base for a resolver profile. The empty
-// name selects the legacy default profile, as does the explicit "default"
-// profile name. Its boolean result distinguishes a configured profile from one
-// that is merely unavailable because no default base has been configured.
-func (c *Config) OpenURLBaseFor(name string) (string, bool) {
+// InstitutionFor returns the institutional-access identity for a resolver
+// profile. The empty name (and the explicit "default" name) select the default
+// institution expressed by the top-level Browser fields; any other name selects
+// a named profile from Browser.Resolvers. The boolean reports whether a usable
+// profile exists (default: a non-empty OpenURL base; named: map presence).
+func (c *Config) InstitutionFor(name string) (Institution, bool) {
 	if name == "" || name == "default" {
-		return c.Browser.OpenURLBase, c.Browser.OpenURLBase != ""
+		inst := Institution{
+			OpenURLBase:        c.Browser.OpenURLBase,
+			ShibbolethEntityID: c.Browser.ShibbolethEntityID,
+			ProquestAccountID:  c.Browser.ProquestAccountID,
+		}
+		return inst, inst.OpenURLBase != ""
 	}
-	base, ok := c.Browser.Resolvers[name]
-	return base, ok
+	inst, ok := c.Browser.Resolvers[name]
+	return inst, ok
+}
+
+// OpenURLBaseFor returns the configured OpenURL base for a resolver profile.
+// Its boolean result distinguishes a configured profile from one that is merely
+// unavailable because no base has been configured.
+func (c *Config) OpenURLBaseFor(name string) (string, bool) {
+	inst, ok := c.InstitutionFor(name)
+	return inst.OpenURLBase, ok
 }
 
 // ResolverNames returns the selectable resolver profiles in stable order.

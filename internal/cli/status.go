@@ -13,6 +13,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"papio/internal/api"
+	"papio/internal/config"
 	"papio/internal/job"
 )
 
@@ -35,6 +36,8 @@ type statusJob struct {
 	State        string `json:"state"`
 	Age          string `json:"age"`
 	Reason       string `json:"reason,omitempty"`
+	Category     string `json:"category,omitempty"`
+	Guidance     string `json:"guidance,omitempty"`
 	ImportStatus string `json:"import_status,omitempty"`
 }
 
@@ -96,10 +99,11 @@ func loadStatusSnapshot(ctx context.Context, opt *options, now time.Time) (statu
 		}
 		details[row.ID] = detail
 	}
-	return buildStatusSnapshot(rows, details, now), nil
+	cfg, _ := opt.loadConfig() // best-effort; guidance degrades to generic without it
+	return buildStatusSnapshot(rows, details, now, cfg), nil
 }
 
-func buildStatusSnapshot(rows []job.Row, details map[string]api.JobDetail, now time.Time) statusSnapshot {
+func buildStatusSnapshot(rows []job.Row, details map[string]api.JobDetail, now time.Time, cfg config.Config) statusSnapshot {
 	groups := map[string][]statusJob{
 		"working":            nil,
 		"awaiting_human":     nil,
@@ -126,8 +130,11 @@ func buildStatusSnapshot(rows []job.Row, details map[string]api.JobDetail, now t
 		if item.Title == "" {
 			item.Title = "(untitled)"
 		}
-		if group == "awaiting_human" || group == "needs_review" {
+		if group == "awaiting_human" || group == "needs_review" || group == "failed_unavailable" {
 			item.Reason = transitionReason(detail.Events, row.State)
+			exp := explainJob(row.State, item.Reason, row.Policy.Resolver, row.Policy.AccessMode, cfg)
+			item.Category = exp.Category
+			item.Guidance = exp.Guidance
 		}
 		if group == "ready" {
 			item.ImportStatus = autoImportStatus(detail.Events)
@@ -274,12 +281,20 @@ func renderStatusRefresh(out io.Writer, snapshot statusSnapshot, terminal bool) 
 			return err
 		}
 		for _, item := range group.Jobs {
-			detail := item.Reason
+			detail := item.Category
+			if detail == "" {
+				detail = item.Reason
+			}
 			if item.ImportStatus != "" {
 				detail = "import=" + item.ImportStatus
 			}
 			if _, err := fmt.Fprintf(out, "%-50s  %-18s  %-16s  %-6s  %s\n", item.Title, item.Provider, item.State, item.Age, detail); err != nil {
 				return err
+			}
+			if item.Guidance != "" {
+				if _, err := fmt.Fprintf(out, "    → %s\n", item.Guidance); err != nil {
+					return err
+				}
 			}
 		}
 	}

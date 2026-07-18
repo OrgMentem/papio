@@ -1,8 +1,8 @@
 // Copyright 2026 OrgMentem. Licensed under MIT. See LICENSE.
-// Options page: per-source optional-host permission grant/revoke. The button
-// click is the user gesture chrome.permissions.request requires. Selecting the
-// daemon's `maximal` access mode never grants a Chrome permission by itself —
-// that only happens here, explicitly.
+// Options page: source and library-resolver host permission grant/revoke. The
+// button click is the user gesture chrome.permissions.request requires.
+// Selecting the daemon's `maximal` access mode never grants a Chrome permission
+// by itself — that only happens here, explicitly.
 
 interface Source {
   label: string;
@@ -23,9 +23,16 @@ const SOURCES: Source[] = [
   { label: "APA PsycNet", origin: "https://psycnet.apa.org/*" },
 ];
 
-function render(list: HTMLUListElement): void {
+// Must mirror manifest.json host_permissions exactly.
+const LIBRARY_RESOLVERS: Source[] = [
+  { label: "Ex Libris Alma", origin: "https://*.alma.exlibrisgroup.com/*" },
+  { label: "Ex Libris Primo", origin: "https://*.primo.exlibrisgroup.com/*" },
+  { label: "Example Institute OneSearch", origin: "https://onesearch.library.example-institute.edu/*" },
+];
+
+function render(list: HTMLUListElement, sources: Source[]): void {
   list.replaceChildren();
-  for (const source of SOURCES) {
+  for (const source of sources) {
     const item = document.createElement("li");
 
     const meta = document.createElement("div");
@@ -75,6 +82,31 @@ function render(list: HTMLUListElement): void {
   }
 }
 
+// Bulk grant/revoke for every provider source. permissions.request accepts all
+// origins in one call, so a single click yields one Firefox doorhanger listing
+// them all — the gesture must reach request() with no await before it.
+function wireProviderBulk(list: HTMLUListElement, sources: Source[]): void {
+  const origins = sources.map((source) => source.origin);
+  const grantAll = document.getElementById("grant-all");
+  const revokeAll = document.getElementById("revoke-all");
+  if (grantAll instanceof HTMLButtonElement) {
+    grantAll.addEventListener("click", () => {
+      void chrome.permissions.request({ origins }).then(
+        () => render(list, sources),
+        () => {},
+      );
+    });
+  }
+  if (revokeAll instanceof HTMLButtonElement) {
+    revokeAll.addEventListener("click", () => {
+      void chrome.permissions.remove({ origins }).then(
+        () => render(list, sources),
+        () => {},
+      );
+    });
+  }
+}
+
 const TERMS_CONSENT_KEY = "papio_terms_consent_v1";
 
 async function renderTermsConsent(): Promise<void> {
@@ -111,9 +143,48 @@ function wireTermsConsent(): void {
   }
 }
 
-const list = document.getElementById("sources");
-if (list instanceof HTMLUListElement) {
-  render(list);
+const WORK_WINDOW_KEY = "papio_work_window_v1";
+
+async function renderWorkWindow(): Promise<void> {
+  const statusEl = document.getElementById("work-window-status");
+  if (!statusEl) return;
+  let enabled = true;
+  try {
+    const got = await chrome.storage.local.get(WORK_WINDOW_KEY);
+    enabled = got[WORK_WINDOW_KEY] !== false;
+  } catch {
+    enabled = true;
+  }
+  statusEl.textContent = enabled
+    ? "On — papio tabs stay in a minimized background window"
+    : "Off — papio tabs open in your current window";
+}
+
+function wireWorkWindow(): void {
+  const on = document.getElementById("work-window-on");
+  const off = document.getElementById("work-window-off");
+  if (on instanceof HTMLButtonElement) {
+    on.addEventListener("click", () => {
+      void chrome.storage.local.set({ [WORK_WINDOW_KEY]: true }).then(renderWorkWindow);
+    });
+  }
+  if (off instanceof HTMLButtonElement) {
+    off.addEventListener("click", () => {
+      void chrome.storage.local.set({ [WORK_WINDOW_KEY]: false }).then(renderWorkWindow);
+    });
+  }
+}
+
+const sourceList = document.getElementById("sources");
+if (sourceList instanceof HTMLUListElement) {
+  render(sourceList, SOURCES);
+  wireProviderBulk(sourceList, SOURCES);
+}
+const libraryResolverList = document.getElementById("library-resolvers");
+if (libraryResolverList instanceof HTMLUListElement) {
+  render(libraryResolverList, LIBRARY_RESOLVERS);
 }
 wireTermsConsent();
 void renderTermsConsent();
+wireWorkWindow();
+void renderWorkWindow();
