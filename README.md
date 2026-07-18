@@ -17,7 +17,7 @@ handles credentials, MFA, CAPTCHAs, or subscription crawling.
 - macOS with Go-built binaries from a release (or `go build ./cmd/papio`).
 - Poppler and Tesseract for PDF validation and the OCR text gate:
   `brew install poppler tesseract` (or disable OCR in the config — see the
-  [configuration reference](docs/config-reference.md)).
+  [configuration reference](docs/reference/config-reference.md)).
 - Google Chrome or Firefox with the papio extension loaded for
   human-authenticated access — Chrome loads `extension/` unpacked, Firefox
   loads the generated `extension/firefox/` build via `about:debugging`
@@ -44,13 +44,13 @@ papio daemon stop
 
 ## Documentation
 
-- [User guide](docs/user-guide.md) — research workflow, browser pass, reports,
+- [User guide](docs/guide/user-guide.md) — research workflow, browser pass, reports,
   watches, and identity reviews.
-- [MCP agent guide](docs/agent-guide.md) — every `papio_*` tool, safety
+- [MCP agent guide](docs/guide/agent-skill.md) — every `papio_*` tool, safety
   semantics, and CLI equivalence.
-- [Configuration reference](docs/config-reference.md) — every TOML key,
+- [Configuration reference](docs/reference/config-reference.md) — every TOML key,
   default, constraint, and effect.
-- [Troubleshooting](docs/troubleshooting.md) — extension reload, daemon
+- [Troubleshooting](docs/guide/troubleshooting.md) — extension reload, daemon
   recovery, doctor output, and stable Zotio error classes.
 
 License: MIT.
