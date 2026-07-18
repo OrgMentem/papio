@@ -8,6 +8,13 @@ records in `notes/acquisition-stack-plan.md`.
 
 ### Added
 
+- The MCP `papio_status` tool now surfaces the same actionable `category` and
+  `guidance` as the CLI for parked and no-file jobs (including the config-aware
+  `institution_not_configured`), so agents driving Papio over MCP get the same
+  diagnosis and next step as a human. The category catalog moved to a shared
+  `internal/errcat` package consumed by both the CLI and the MCP server, so the
+  two surfaces cannot drift.
+
 - `papio init` now captures the browser extension IDs during first-run setup, so
   the native messaging host installs on the first run instead of failing with
   `browser.extension_id is not set` and forcing a config hand-edit and re-run.

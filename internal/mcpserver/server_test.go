@@ -14,6 +14,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"papio/internal/api"
 	"papio/internal/batch"
 	"papio/internal/bootstrap"
 	"papio/internal/config"
@@ -356,6 +357,26 @@ func TestStatusToolGroupsLiveJobsThroughRPC(t *testing.T) {
 	}
 	if len(fake.calls) != 6 {
 		t.Fatalf("RPC calls = %+v", fake.calls)
+	}
+}
+
+func TestBuildStatusSnapshotSurfacesActionableCategory(t *testing.T) {
+	now := time.Date(2026, time.July, 18, 12, 0, 0, 0, time.UTC)
+	rows := []job.Row{{
+		ID: "job-login", State: job.StateAwaitingHuman,
+		UpdatedAt: now.Add(-5 * time.Minute).Format(time.RFC3339Nano),
+		Work:      work.Work{Title: "Parked on institutional login"},
+	}}
+	details := map[string]api.JobDetail{
+		"job-login": {Events: []map[string]any{{"kind": "job.transition", "detail": map[string]any{"to": job.StateAwaitingHuman, "reason": "institutional_handoff"}}}},
+	}
+	snapshot := buildStatusSnapshot(rows, details, config.Config{}, now)
+	if len(snapshot.Groups) != 1 || len(snapshot.Groups[0].Jobs) != 1 {
+		t.Fatalf("groups = %+v", snapshot.Groups)
+	}
+	got := snapshot.Groups[0].Jobs[0]
+	if got.Category != "login_required" || got.Guidance == "" {
+		t.Fatalf("MCP status job = category %q guidance %q, want login_required with guidance", got.Category, got.Guidance)
 	}
 }
 

@@ -19,6 +19,7 @@ import (
 	"papio/internal/api"
 	"papio/internal/batch"
 	"papio/internal/daemon"
+	"papio/internal/errcat"
 	"papio/internal/job"
 	"papio/internal/protocol"
 	"papio/internal/work"
@@ -122,7 +123,7 @@ func newAcquireCommand(opt *options) *cobra.Command {
 			if !opt.jsonOutput {
 				cfg, _ := opt.loadConfig()
 				reason := transitionReason(detail.Events, detail.Job.State)
-				if g := waitGuidance(detail.Job.State, reason, detail.Job.Policy.Resolver, detail.Job.Policy.AccessMode, cfg); g != "" {
+				if g := errcat.WaitGuidance(detail.Job.State, reason, detail.Job.Policy.Resolver, detail.Job.Policy.AccessMode, cfg); g != "" {
 					prose += "\n" + g
 				}
 			}

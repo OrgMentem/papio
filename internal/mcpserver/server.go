@@ -16,7 +16,9 @@ import (
 	"papio/internal/api"
 	"papio/internal/batch"
 	"papio/internal/bootstrap"
+	"papio/internal/config"
 	"papio/internal/discovery"
+	"papio/internal/errcat"
 	"papio/internal/ipc"
 	"papio/internal/job"
 	"papio/internal/protocol"
@@ -121,6 +123,8 @@ type StatusJob struct {
 	State        string `json:"state"`
 	Age          string `json:"age"`
 	Reason       string `json:"reason,omitempty"`
+	Category     string `json:"category,omitempty"`
+	Guidance     string `json:"guidance,omitempty"`
 	ImportStatus string `json:"import_status,omitempty"`
 }
 
@@ -241,6 +245,7 @@ func (c localRPCCaller) Call(ctx context.Context, method string, params, result 
 
 type toolDependencies struct {
 	caller rpcCaller
+	cfg    config.Config
 	now    func() time.Time
 	wait   func(context.Context, time.Duration) error
 }
@@ -253,7 +258,11 @@ func defaultToolDependencies(caller rpcCaller) toolDependencies {
 // every tool except papio_zotio_apply, which requires an immutable plan ID and
 // its exact confirmation digest.
 func New(system *bootstrap.System) *mcp.Server {
-	return newServer(system, defaultToolDependencies(newLocalRPCCaller(system)))
+	deps := defaultToolDependencies(newLocalRPCCaller(system))
+	if system != nil {
+		deps.cfg = system.Config
+	}
+	return newServer(system, deps)
 }
 
 func newServer(system *bootstrap.System, dependencies toolDependencies) *mcp.Server {
@@ -448,10 +457,10 @@ type ActionsListInput struct{}
 func addLoopClosureTools(server *mcp.Server, dependencies toolDependencies) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "papio_status", Title: "Summarize Papio jobs",
-		Description: "Return active and recently completed acquisition jobs grouped into the same working, human-review, ready, and failed phases as papio status. Read-only.",
+		Description: "Return active and recently completed acquisition jobs grouped into the same working, human-review, ready, and failed phases as papio status. Parked or no-file jobs carry an actionable category and a one-line next step (e.g. institution_not_configured -> run papio init). Read-only.",
 		Annotations: readAnnotations(),
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, _ StatusInput) (*mcp.CallToolResult, StatusSnapshot, error) {
-		snapshot, err := loadStatusSnapshot(ctx, dependencies.caller, dependencies.now())
+		snapshot, err := loadStatusSnapshot(ctx, dependencies.caller, dependencies.cfg, dependencies.now())
 		return nil, snapshot, err
 	})
 
@@ -539,7 +548,7 @@ const (
 	defaultBatchWaitPollSeconds    = 5
 )
 
-func loadStatusSnapshot(ctx context.Context, caller rpcCaller, now time.Time) (StatusSnapshot, error) {
+func loadStatusSnapshot(ctx context.Context, caller rpcCaller, cfg config.Config, now time.Time) (StatusSnapshot, error) {
 	if caller == nil {
 		return StatusSnapshot{}, fmt.Errorf("Papio RPC is not configured")
 	}
@@ -559,10 +568,10 @@ func loadStatusSnapshot(ctx context.Context, caller rpcCaller, now time.Time) (S
 		}
 		details[row.ID] = detail
 	}
-	return buildStatusSnapshot(rows, details, now), nil
+	return buildStatusSnapshot(rows, details, cfg, now), nil
 }
 
-func buildStatusSnapshot(rows []job.Row, details map[string]api.JobDetail, now time.Time) StatusSnapshot {
+func buildStatusSnapshot(rows []job.Row, details map[string]api.JobDetail, cfg config.Config, now time.Time) StatusSnapshot {
 	groups := map[string][]StatusJob{
 		"working":            nil,
 		"awaiting_human":     nil,
@@ -590,8 +599,11 @@ func buildStatusSnapshot(rows []job.Row, details map[string]api.JobDetail, now t
 		if item.Title == "" {
 			item.Title = "(untitled)"
 		}
-		if group == "awaiting_human" || group == "needs_review" {
+		if group == "awaiting_human" || group == "needs_review" || group == "failed_unavailable" {
 			item.Reason = transitionReason(detail.Events, row.State)
+			exp := errcat.Explain(row.State, item.Reason, row.Policy.Resolver, row.Policy.AccessMode, cfg)
+			item.Category = exp.Category
+			item.Guidance = exp.Guidance
 		}
 		if group == "ready" {
 			item.ImportStatus = autoImportStatus(detail.Events)

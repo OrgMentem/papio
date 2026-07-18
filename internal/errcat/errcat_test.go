@@ -1,6 +1,6 @@
 // Copyright 2026 OrgMentem. Licensed under MIT. See LICENSE.
 
-package cli
+package errcat
 
 import (
 	"strings"
@@ -9,7 +9,7 @@ import (
 	"papio/internal/config"
 )
 
-func TestExplainJobCategoriesAndGuidance(t *testing.T) {
+func TestExplainCategoriesAndGuidance(t *testing.T) {
 	withInstitution := config.Config{
 		AccessMode: config.ModeMaximal,
 		Browser:    config.Browser{OpenURLBase: "https://library.example.edu/openurl"},
@@ -47,7 +47,7 @@ func TestExplainJobCategoriesAndGuidance(t *testing.T) {
 		{name: "cancelled", state: "cancelled", reason: "—", wantCategory: "cancelled"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			got := explainJob(test.state, test.reason, test.resolver, test.accessMode, test.cfg)
+			got := Explain(test.state, test.reason, test.resolver, test.accessMode, test.cfg)
 			if got.Category != test.wantCategory {
 				t.Fatalf("category = %q, want %q", got.Category, test.wantCategory)
 			}
@@ -66,7 +66,7 @@ func TestExplainNoAccessNamedProfileNotConfigured(t *testing.T) {
 		AccessMode: config.ModeAssisted,
 		Browser:    config.Browser{OpenURLBase: "https://default.example.edu/openurl"},
 	}
-	got := explainJob("unavailable", "candidates_exhausted", "campus", config.ModeAssisted, cfg)
+	got := Explain("unavailable", "candidates_exhausted", "campus", config.ModeAssisted, cfg)
 	if got.Category != "institution_not_configured" {
 		t.Fatalf("named-profile miss category = %q, want institution_not_configured", got.Category)
 	}
@@ -75,19 +75,19 @@ func TestExplainNoAccessNamedProfileNotConfigured(t *testing.T) {
 func TestWaitGuidance(t *testing.T) {
 	cfg := config.Config{AccessMode: config.ModeMaximal}
 	// Success and non-actionable states produce no guidance block.
-	if g := waitGuidance("ready", "", "", "", cfg); g != "" {
+	if g := WaitGuidance("ready", "", "", "", cfg); g != "" {
 		t.Fatalf("ready guidance = %q, want empty", g)
 	}
-	if g := waitGuidance("resolving", "", "", "", cfg); g != "" {
+	if g := WaitGuidance("resolving", "", "", "", cfg); g != "" {
 		t.Fatalf("resolving guidance = %q, want empty", g)
 	}
 	// A parked job renders a bracketed category and an arrow next-step.
-	g := waitGuidance("awaiting_human", "institutional_handoff", "", "", cfg)
+	g := WaitGuidance("awaiting_human", "institutional_handoff", "", "", cfg)
 	if !strings.Contains(g, "[login_required]") || !strings.Contains(g, "\u2192") {
 		t.Fatalf("awaiting_human guidance = %q", g)
 	}
 	// The config-aware no-access case reaches acquire --wait output too.
-	g = waitGuidance("unavailable", "no_legal_candidates", "", config.ModeMaximal, cfg)
+	g = WaitGuidance("unavailable", "no_legal_candidates", "", config.ModeMaximal, cfg)
 	if !strings.Contains(g, "[institution_not_configured]") {
 		t.Fatalf("unavailable guidance = %q", g)
 	}

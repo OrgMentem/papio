@@ -14,6 +14,7 @@ import (
 
 	"papio/internal/api"
 	"papio/internal/config"
+	"papio/internal/errcat"
 	"papio/internal/job"
 )
 
@@ -132,7 +133,7 @@ func buildStatusSnapshot(rows []job.Row, details map[string]api.JobDetail, now t
 		}
 		if group == "awaiting_human" || group == "needs_review" || group == "failed_unavailable" {
 			item.Reason = transitionReason(detail.Events, row.State)
-			exp := explainJob(row.State, item.Reason, row.Policy.Resolver, row.Policy.AccessMode, cfg)
+			exp := errcat.Explain(row.State, item.Reason, row.Policy.Resolver, row.Policy.AccessMode, cfg)
 			item.Category = exp.Category
 			item.Guidance = exp.Guidance
 		}
