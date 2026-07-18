@@ -1,6 +1,6 @@
 // Copyright 2026 OrgMentem. Licensed under MIT. See LICENSE.
 
-// Package update checks the public papio releases feed at most once a day.
+// Package update checks public Papio-family release feeds at most once a day.
 package update
 
 import (
@@ -16,13 +16,16 @@ import (
 )
 
 const (
-	releasesURL     = "https://api.github.com/repos/orgmentem/papio/releases/latest"
-	ReleasesPageURL = "https://github.com/orgmentem/papio/releases/latest"
-	cacheName       = "update-cache.json"
-	checkEvery      = 24 * time.Hour
+	releasesURL          = "https://api.github.com/repos/orgmentem/papio/releases/latest"
+	ReleasesPageURL      = "https://github.com/orgmentem/papio/releases/latest"
+	ZotioReleasesURL     = "https://api.github.com/repos/OrgMentem/zotio/releases/latest"
+	ZotioReleasesPageURL = "https://github.com/OrgMentem/zotio/releases/latest"
+	cacheName            = "update-cache.json"
+	zotioCacheName       = "update-cache-zotio.json"
+	checkEvery           = 24 * time.Hour
 )
 
-// Info describes the latest papio release known to the checker.
+// Info describes the latest release known to a checker.
 type Info struct {
 	LatestVersion string
 	URL           string
@@ -36,11 +39,13 @@ type Options struct {
 	ReleasesURL string
 	Client      *http.Client
 	Now         func() time.Time
+	CacheName   string
 }
 
 // Checker caches the release metadata in the papio data directory.
 type Checker struct {
 	dataDir     string
+	cacheName   string
 	releasesURL string
 	client      *http.Client
 	now         func() time.Time
@@ -48,11 +53,12 @@ type Checker struct {
 }
 
 type cache struct {
-	ETag          string    `json:"etag,omitempty"`
-	LatestVersion string    `json:"latest_version,omitempty"`
-	URL           string    `json:"url,omitempty"`
-	CheckedAt     time.Time `json:"checked_at,omitempty"`
-	LastNaggedAt  time.Time `json:"last_nagged_at,omitempty"`
+	ETag             string    `json:"etag,omitempty"`
+	LatestVersion    string    `json:"latest_version,omitempty"`
+	URL              string    `json:"url,omitempty"`
+	CheckedAt        time.Time `json:"checked_at,omitempty"`
+	LastNaggedAt     time.Time `json:"last_nagged_at,omitempty"`
+	InstalledVersion string    `json:"installed_version,omitempty"`
 }
 
 type release struct {
@@ -63,6 +69,16 @@ type release struct {
 // New creates a checker that uses the public GitHub releases endpoint.
 func New(dataDir string) *Checker {
 	return NewWithOptions(Options{DataDir: dataDir})
+}
+
+// NewZotio creates a checker for the public Zotio releases endpoint. Its
+// metadata and rate limit are independent from Papio's cache.
+func NewZotio(dataDir string) *Checker {
+	return NewWithOptions(Options{
+		DataDir:     dataDir,
+		ReleasesURL: ZotioReleasesURL,
+		CacheName:   zotioCacheName,
+	})
 }
 
 // NewWithOptions creates a checker with explicit transport and clock seams.
@@ -79,8 +95,13 @@ func NewWithOptions(options Options) *Checker {
 	if endpoint == "" {
 		endpoint = releasesURL
 	}
+	cacheFile := options.CacheName
+	if cacheFile == "" {
+		cacheFile = cacheName
+	}
 	return &Checker{
 		dataDir:     options.DataDir,
+		cacheName:   cacheFile,
 		releasesURL: endpoint,
 		client:      client,
 		now:         now,
@@ -170,11 +191,16 @@ func IsNewer(latest, current string) bool {
 	return compareVersion(latest, current) > 0
 }
 
-// UpgradeHint returns the channel-appropriate update instruction.
+// UpgradeHint returns Papio's channel-appropriate update instruction.
 func UpgradeHint(executable, releaseURL string) string {
+	return UpgradeHintFor(executable, "papio", releaseURL)
+}
+
+// UpgradeHintFor returns the channel-appropriate instruction for a formula.
+func UpgradeHintFor(executable, formula, releaseURL string) string {
 	clean := filepath.Clean(executable)
 	if strings.HasPrefix(clean, "/opt/homebrew/") || strings.HasPrefix(clean, "/usr/local/Cellar/") {
-		return "brew upgrade papio"
+		return "brew upgrade " + formula
 	}
 	return releaseURL
 }
@@ -201,7 +227,7 @@ func compareVersion(left, right string) int {
 }
 
 func (c *Checker) cachePath() string {
-	return filepath.Join(c.dataDir, cacheName)
+	return filepath.Join(c.dataDir, c.cacheName)
 }
 
 func (c *Checker) readCache() cache {
@@ -214,6 +240,44 @@ func (c *Checker) readCache() cache {
 		return cache{}
 	}
 	return cached
+}
+
+// CachedState returns release metadata and the last successful local Zotio
+// preflight version without making a request or starting a subprocess.
+func (c *Checker) CachedState() (*Info, string) {
+	if c == nil {
+		return nil, ""
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	cached := c.readCache()
+	return cached.info(), cached.InstalledVersion
+}
+
+// Cached returns release metadata already on disk without making a request.
+func (c *Checker) Cached() *Info {
+	info, _ := c.CachedState()
+	return info
+}
+
+// InstalledVersion returns the last Zotio version recorded by a successful
+// local preflight. It never runs a subprocess or makes a network request.
+func (c *Checker) InstalledVersion() string {
+	_, version := c.CachedState()
+	return version
+}
+
+// RememberInstalledVersion records a successful local Zotio preflight. Cache
+// failures are deliberately soft, matching release-check persistence behavior.
+func (c *Checker) RememberInstalledVersion(version string) {
+	if c == nil || strings.TrimSpace(version) == "" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	cached := c.readCache()
+	cached.InstalledVersion = strings.TrimSpace(version)
+	_ = c.writeCache(cached)
 }
 
 func (c *Checker) writeCache(cached cache) error {

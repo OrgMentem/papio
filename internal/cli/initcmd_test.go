@@ -330,7 +330,7 @@ func TestInitUpdateCheckPromptWritesBothAnswers(t *testing.T) {
 			if cfg.Updates.Check != test.want {
 				t.Fatalf("updates.check = %t, want %t", cfg.Updates.Check, test.want)
 			}
-			if !strings.Contains(out, "Check for papio updates once a day? Queries GitHub releases only; nothing else is sent. [Y/n]") {
+			if !strings.Contains(out, "Check for papio and zotio updates once a day? Queries GitHub releases only; nothing else is sent. [Y/n]") {
 				t.Fatalf("update prompt missing from output: %q", out)
 			}
 		})

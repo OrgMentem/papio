@@ -107,7 +107,7 @@ func newInitCommandWithDependencies(opt *options, deps initDependencies) *cobra.
 	command.Flags().StringVar(&extensionID, "extension-id", "", "Chrome extension ID allowed to reach the native host")
 	command.Flags().StringVar(&firefoxExtensionID, "firefox-extension-id", "", "Firefox add-on ID allowed to reach the native host")
 	command.Flags().BoolVar(&skipBrowser, "skip-browser", false, "skip Chrome extension and native-host setup")
-	command.Flags().BoolVar(&checkUpdates, "check-updates", true, "check GitHub releases once a day")
+	command.Flags().BoolVar(&checkUpdates, "check-updates", true, "Check for papio and zotio updates once a day? Queries GitHub releases only; nothing else is sent. [Y/n]")
 	return command
 }
 
@@ -385,7 +385,7 @@ func initPrompt(reader *bufio.Reader, out io.Writer, label, defaultValue string)
 }
 
 func initUpdateCheckPrompt(reader *bufio.Reader, out io.Writer) (bool, error) {
-	const prompt = "Check for papio updates once a day? Queries GitHub releases only; nothing else is sent. [Y/n]"
+	const prompt = "Check for papio and zotio updates once a day? Queries GitHub releases only; nothing else is sent. [Y/n]"
 	if _, err := fmt.Fprint(out, prompt+" "); err != nil {
 		return false, err
 	}

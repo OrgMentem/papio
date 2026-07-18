@@ -132,12 +132,14 @@ func callSocket(ctx context.Context, socket, method string, params, result any) 
 }
 
 type daemonPingResult struct {
-	Status             string `json:"status"`
-	Version            string `json:"version"`
-	ExtensionConnected bool   `json:"extension_connected"`
-	ExtensionVersion   string `json:"extension_version,omitempty"`
-	UpdateAvailable    bool   `json:"update_available"`
-	LatestVersion      string `json:"latest_version,omitempty"`
+	Status               string `json:"status"`
+	Version              string `json:"version"`
+	ExtensionConnected   bool   `json:"extension_connected"`
+	ExtensionVersion     string `json:"extension_version,omitempty"`
+	UpdateAvailable      bool   `json:"update_available"`
+	LatestVersion        string `json:"latest_version,omitempty"`
+	ZotioUpdateAvailable bool   `json:"zotio_update_available"`
+	ZotioLatestVersion   string `json:"zotio_latest_version,omitempty"`
 }
 
 func (o *options) warnDaemonVersion(ctx context.Context, socket string, cfg config.Config) error {
@@ -163,24 +165,24 @@ func (o *options) warnDaemonVersion(ctx context.Context, socket string, cfg conf
 }
 
 func (o *options) warnAvailableUpdate(cfg config.Config, status daemonPingResult) error {
-	if o.updateHintShown || !status.UpdateAvailable || status.LatestVersion == "" || o.errOut == nil {
+	if o.updateHintShown || !cfg.Updates.Check || o.errOut == nil {
 		return nil
 	}
-	if !update.New(cfg.DataDir).TryMarkNagged(time.Now()) {
+	updates := make([]string, 0, 2)
+	if status.UpdateAvailable && status.LatestVersion != "" {
+		updates = append(updates, fmt.Sprintf("papio %s (you have %s)", status.LatestVersion, api.Version))
+	}
+	zotio := update.NewZotio(cfg.DataDir)
+	if info, installed := zotio.CachedState(); info != nil {
+		if installed != "" && update.IsNewer(info.LatestVersion, installed) {
+			updates = append(updates, fmt.Sprintf("zotio %s (you have %s)", info.LatestVersion, installed))
+		}
+	}
+	if len(updates) == 0 || !update.New(cfg.DataDir).TryMarkNagged(time.Now()) {
 		return nil
 	}
 	o.updateHintShown = true
-	executable, err := os.Executable()
-	if err != nil {
-		executable = ""
-	}
-	_, err = fmt.Fprintf(
-		o.errOut,
-		"papio: version %s is available (you have %s) — %s\n",
-		status.LatestVersion,
-		api.Version,
-		update.UpgradeHint(executable, update.ReleasesPageURL),
-	)
+	_, err := fmt.Fprintf(o.errOut, "papio: updates available: %s — run 'papio doctor' for details\n", strings.Join(updates, ", "))
 	return err
 }
 

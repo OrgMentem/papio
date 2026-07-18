@@ -90,4 +90,5 @@ migration plan before merging; do not tag first and design compatibility later.
 - [ ] Take the Chrome ZIP and Firefox package from `scripts/release.sh` output.
 - [ ] Prepare the store listing text for the manifest version.
 - [ ] Submit each store package for review.
+- [ ] Note that store-installed extensions update automatically, while manually loaded `about:debugging` or unpacked builds require the new release-bundle ZIP.
 - [ ] The human performs final publication after review; do not automate it.

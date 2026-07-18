@@ -132,3 +132,56 @@ func TestVersionAndUpgradeHints(t *testing.T) {
 		t.Fatalf("release hint = %q", got)
 	}
 }
+
+func TestTargetsUseSeparateCachesAndRateLimits(t *testing.T) {
+	now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
+	var papioCalls, zotioCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/papio":
+			papioCalls.Add(1)
+			_, _ = w.Write([]byte(`{"tag_name":"v1.2.3","html_url":"https://example.test/papio"}`))
+		case "/zotio":
+			zotioCalls.Add(1)
+			_, _ = w.Write([]byte(`{"tag_name":"v4.5.6","html_url":"https://example.test/zotio"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	dataDir := t.TempDir()
+	papio := NewWithOptions(Options{
+		DataDir: dataDir, ReleasesURL: server.URL + "/papio", CacheName: cacheName,
+		Client: server.Client(), Now: func() time.Time { return now },
+	})
+	zotio := NewWithOptions(Options{
+		DataDir: dataDir, ReleasesURL: server.URL + "/zotio", CacheName: zotioCacheName,
+		Client: server.Client(), Now: func() time.Time { return now },
+	})
+	for _, checker := range []*Checker{papio, zotio} {
+		if _, err := checker.Check(context.Background()); err != nil {
+			t.Fatalf("Check: %v", err)
+		}
+		if _, err := checker.Check(context.Background()); err != nil {
+			t.Fatalf("cached Check: %v", err)
+		}
+	}
+	if papioCalls.Load() != 1 || zotioCalls.Load() != 1 {
+		t.Fatalf("calls papio=%d zotio=%d", papioCalls.Load(), zotioCalls.Load())
+	}
+	if papio.cachePath() == zotio.cachePath() {
+		t.Fatalf("targets share cache path %q", papio.cachePath())
+	}
+}
+
+func TestZotioCheckerPersistsInstalledVersionWithoutChecking(t *testing.T) {
+	checker := NewZotio(t.TempDir())
+	checker.RememberInstalledVersion(" 1.2.3 ")
+	if got := checker.InstalledVersion(); got != "1.2.3" {
+		t.Fatalf("installed version = %q", got)
+	}
+	if info := checker.Cached(); info != nil {
+		t.Fatalf("cached release = %#v", info)
+	}
+}

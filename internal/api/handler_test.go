@@ -8,6 +8,8 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -21,6 +23,7 @@ import (
 	"papio/internal/update"
 	"papio/internal/watch"
 	"papio/internal/work"
+	"papio/internal/zotio"
 )
 
 func testSystem(t *testing.T) *bootstrap.System {
@@ -49,6 +52,15 @@ func callMethod(t *testing.T, router ipc.Router, method string, params any, resu
 		}
 	}
 	return rpcErr
+}
+
+type preflightOnlyCLI struct {
+	zotio.CLI
+	result *zotio.PreflightResult
+}
+
+func (c preflightOnlyCLI) Preflight(context.Context) (*zotio.PreflightResult, error) {
+	return c.result, nil
 }
 
 func TestRouterSubmitListGetAndCancel(t *testing.T) {
@@ -178,7 +190,10 @@ func TestRouterPingIncludesUpdatesOnlyWhenEnabled(t *testing.T) {
 		t.Fatal(rpcErr)
 	}
 	if _, ok := disabled["update_available"]; ok {
-		t.Fatalf("disabled update status = %s", disabled)
+		t.Fatalf("disabled papio update status = %s", disabled)
+	}
+	if _, ok := disabled["zotio_update_available"]; ok {
+		t.Fatalf("disabled zotio update status = %s", disabled)
 	}
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -190,15 +205,38 @@ func TestRouterPingIncludesUpdatesOnlyWhenEnabled(t *testing.T) {
 		ReleasesURL: server.URL,
 		Client:      server.Client(),
 	})
+	cache := []byte(`{"latest_version":"1.1.0","url":"https://example.test/zotio","installed_version":"1.0.0"}`)
+	if err := os.WriteFile(filepath.Join(system.Config.DataDir, "update-cache-zotio.json"), cache, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	var enabled struct {
-		UpdateAvailable *bool  `json:"update_available"`
-		LatestVersion   string `json:"latest_version"`
+		UpdateAvailable      *bool  `json:"update_available"`
+		LatestVersion        string `json:"latest_version"`
+		ZotioUpdateAvailable *bool  `json:"zotio_update_available"`
+		ZotioLatestVersion   string `json:"zotio_latest_version"`
 	}
 	if rpcErr := callMethod(t, router, "ping", struct{}{}, &enabled); rpcErr != nil {
 		t.Fatal(rpcErr)
 	}
 	if enabled.UpdateAvailable == nil || !*enabled.UpdateAvailable || enabled.LatestVersion != "99.0.0" {
 		t.Fatalf("enabled update status = %+v", enabled)
+	}
+	if enabled.ZotioUpdateAvailable == nil || !*enabled.ZotioUpdateAvailable || enabled.ZotioLatestVersion != "1.1.0" {
+		t.Fatalf("enabled Zotio update status = %+v", enabled)
+	}
+}
+
+func TestZotioPreflightCachesInstalledVersion(t *testing.T) {
+	system := testSystem(t)
+	system.Zotio = &zotio.Service{
+		CLI: preflightOnlyCLI{result: &zotio.PreflightResult{Version: "1.2.3"}},
+	}
+	var result zotio.PreflightResult
+	if rpcErr := callMethod(t, Router(system), "zotio.preflight", struct{}{}, &result); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	if got := update.NewZotio(system.Config.DataDir).InstalledVersion(); got != "1.2.3" {
+		t.Fatalf("cached Zotio version = %q", got)
 	}
 }
 

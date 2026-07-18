@@ -5,6 +5,7 @@ package doctor
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -153,6 +154,7 @@ func TestRunIntegrationUpdates(t *testing.T) {
 	baseConfig := func() config.Config {
 		cfg := config.Default()
 		cfg.Path = filepath.Join(t.TempDir(), "config.toml")
+		cfg.DataDir = t.TempDir()
 		return cfg
 	}
 	depsFor := func(cfg config.Config) IntegrationDependencies {
@@ -168,15 +170,21 @@ func TestRunIntegrationUpdates(t *testing.T) {
 			ZotioPreflight: func(context.Context, config.Config) (*zotio.PreflightResult, error) {
 				return &zotio.PreflightResult{Version: "1.2.3"}, nil
 			},
+			CheckUpdates: func(context.Context, config.Config) (*update.Info, error) {
+				return &update.Info{LatestVersion: "1.2.3", URL: "https://example.test/papio"}, nil
+			},
+			CheckZotioUpdates: func(context.Context, config.Config) (*update.Info, error) {
+				return &update.Info{LatestVersion: "1.2.3", URL: "https://example.test/zotio"}, nil
+			},
 		}
 	}
-	find := func(report Report) Check {
+	find := func(report Report, name string) Check {
 		for _, check := range report.Checks {
-			if check.Name == "updates" {
+			if check.Name == name {
 				return check
 			}
 		}
-		t.Fatalf("updates check missing: %+v", report.Checks)
+		t.Fatalf("%s check missing: %+v", name, report.Checks)
 		return Check{}
 	}
 
@@ -184,38 +192,62 @@ func TestRunIntegrationUpdates(t *testing.T) {
 		cfg := baseConfig()
 		deps := depsFor(cfg)
 		deps.CheckUpdates = func(context.Context, config.Config) (*update.Info, error) {
-			t.Fatal("disabled update check was invoked")
+			t.Fatal("disabled papio update check was invoked")
 			return nil, nil
 		}
-		got := find(RunIntegration(context.Background(), deps))
-		if got.Status != Skip || got.Detail != "update check disabled ([updates] check = false)" {
-			t.Fatalf("updates check = %#v", got)
+		deps.CheckZotioUpdates = func(context.Context, config.Config) (*update.Info, error) {
+			t.Fatal("disabled zotio update check was invoked")
+			return nil, nil
+		}
+		report := RunIntegration(context.Background(), deps)
+		for _, name := range []string{"updates (papio)", "updates (zotio)"} {
+			got := find(report, name)
+			if got.Status != Skip || got.Detail != "update check disabled ([updates] check = false)" {
+				t.Fatalf("%s check = %#v", name, got)
+			}
 		}
 	})
 
 	t.Run("current", func(t *testing.T) {
 		cfg := baseConfig()
 		cfg.Updates.Check = true
-		deps := depsFor(cfg)
-		deps.CheckUpdates = func(context.Context, config.Config) (*update.Info, error) {
-			return &update.Info{LatestVersion: "1.2.3", URL: "https://example.test/releases"}, nil
-		}
-		got := find(RunIntegration(context.Background(), deps))
-		if got.Status != Pass || got.Detail != "papio 1.2.3 is current" {
-			t.Fatalf("updates check = %#v", got)
+		report := RunIntegration(context.Background(), depsFor(cfg))
+		for _, name := range []string{"updates (papio)", "updates (zotio)"} {
+			got := find(report, name)
+			if got.Status != Pass {
+				t.Fatalf("%s check = %#v", name, got)
+			}
 		}
 	})
 
-	t.Run("behind", func(t *testing.T) {
+	t.Run("zotio behind", func(t *testing.T) {
+		cfg := baseConfig()
+		cfg.Updates.Check = true
+		cfg.Zotio.Executable = "/opt/homebrew/bin/zotio"
+		deps := depsFor(cfg)
+		deps.CheckZotioUpdates = func(context.Context, config.Config) (*update.Info, error) {
+			return &update.Info{LatestVersion: "1.2.4", URL: "https://example.test/zotio"}, nil
+		}
+		got := find(RunIntegration(context.Background(), deps), "updates (zotio)")
+		if got.Status != Warn || got.Detail != "zotio 1.2.4 available (you have 1.2.3)" || got.Remediation != "brew upgrade zotio" {
+			t.Fatalf("zotio update check = %#v", got)
+		}
+	})
+
+	t.Run("zotio preflight failed", func(t *testing.T) {
 		cfg := baseConfig()
 		cfg.Updates.Check = true
 		deps := depsFor(cfg)
-		deps.CheckUpdates = func(context.Context, config.Config) (*update.Info, error) {
-			return &update.Info{LatestVersion: "1.2.4", URL: "https://example.test/releases"}, nil
+		deps.ZotioPreflight = func(context.Context, config.Config) (*zotio.PreflightResult, error) {
+			return nil, errors.New("zotio not found")
 		}
-		got := find(RunIntegration(context.Background(), deps))
-		if got.Status != Warn || got.Detail != "papio 1.2.4 available (you have 1.2.3)" || got.Remediation != "https://example.test/releases" {
-			t.Fatalf("updates check = %#v", got)
+		deps.CheckZotioUpdates = func(context.Context, config.Config) (*update.Info, error) {
+			t.Fatal("zotio update check ran despite failed preflight")
+			return nil, nil
+		}
+		got := find(RunIntegration(context.Background(), deps), "updates (zotio)")
+		if got.Status != Skip || got.Detail != "skipped: zotio preflight failed" {
+			t.Fatalf("zotio update check = %#v", got)
 		}
 	})
 }

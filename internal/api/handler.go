@@ -146,12 +146,14 @@ func RouterWithShutdown(system *bootstrap.System, shutdown context.CancelFunc) i
 }
 
 type statusResult struct {
-	Status             string `json:"status"`
-	Version            string `json:"version"`
-	ExtensionConnected bool   `json:"extension_connected"`
-	ExtensionVersion   string `json:"extension_version,omitempty"`
-	UpdateAvailable    *bool  `json:"update_available,omitempty"`
-	LatestVersion      string `json:"latest_version,omitempty"`
+	Status               string `json:"status"`
+	Version              string `json:"version"`
+	ExtensionConnected   bool   `json:"extension_connected"`
+	ExtensionVersion     string `json:"extension_version,omitempty"`
+	UpdateAvailable      *bool  `json:"update_available,omitempty"`
+	LatestVersion        string `json:"latest_version,omitempty"`
+	ZotioUpdateAvailable *bool  `json:"zotio_update_available,omitempty"`
+	ZotioLatestVersion   string `json:"zotio_latest_version,omitempty"`
 }
 
 func ping(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
@@ -170,6 +172,12 @@ func ping(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([
 			available = update.IsNewer(info.LatestVersion, Version)
 		}
 		result.UpdateAvailable = &available
+		zotioAvailable := false
+		if info, installed := update.NewZotio(system.Config.DataDir).CachedState(); info != nil {
+			result.ZotioLatestVersion = info.LatestVersion
+			zotioAvailable = installed != "" && update.IsNewer(info.LatestVersion, installed)
+		}
+		result.ZotioUpdateAvailable = &zotioAvailable
 	}
 	return marshal(result)
 }
@@ -254,6 +262,7 @@ func zotioPreflight(ctx context.Context, raw json.RawMessage, system *bootstrap.
 	if err != nil {
 		return nil, &ipc.RPCError{Code: "precondition_failed", Message: safeMessage(err, "Zotio preflight failed")}
 	}
+	update.NewZotio(system.Config.DataDir).RememberInstalledVersion(result.Version)
 	return marshal(result)
 }
 

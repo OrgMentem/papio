@@ -204,14 +204,15 @@ type DaemonStatus struct {
 // are deliberately independent of command-line plumbing so other callers can
 // reuse RunIntegration.
 type IntegrationDependencies struct {
-	CLIVersion     string
-	LoadConfig     func() (config.Config, error)
-	DaemonStatus   func(context.Context, config.Config) (DaemonStatus, error)
-	ManifestDir    func(config.Config) (string, error)
-	FirefoxDir     func(config.Config) (string, error)
-	ReadFile       func(string) ([]byte, error)
-	ZotioPreflight func(context.Context, config.Config) (*zotio.PreflightResult, error)
-	CheckUpdates   func(context.Context, config.Config) (*update.Info, error)
+	CLIVersion        string
+	LoadConfig        func() (config.Config, error)
+	DaemonStatus      func(context.Context, config.Config) (DaemonStatus, error)
+	ManifestDir       func(config.Config) (string, error)
+	FirefoxDir        func(config.Config) (string, error)
+	ReadFile          func(string) ([]byte, error)
+	ZotioPreflight    func(context.Context, config.Config) (*zotio.PreflightResult, error)
+	CheckUpdates      func(context.Context, config.Config) (*update.Info, error)
+	CheckZotioUpdates func(context.Context, config.Config) (*update.Info, error)
 }
 
 // RunIntegration checks the daemon, browser extension, native-host manifests,
@@ -233,7 +234,8 @@ func RunIntegration(ctx context.Context, deps IntegrationDependencies) Report {
 		add("native host (Chrome)", Skip, reason, "")
 		add("native host (Firefox)", Skip, reason, "")
 		add("zotio", Skip, reason, "")
-		add("updates", Skip, reason, "")
+		add("updates (papio)", Skip, reason, "")
+		add("updates (zotio)", Skip, reason, "")
 	}
 
 	if !integrationDependenciesComplete(deps) {
@@ -256,13 +258,13 @@ func RunIntegration(ctx context.Context, deps IntegrationDependencies) Report {
 	if err != nil {
 		add("daemon", Fail, err.Error(), "papio status")
 		skipRemainingAfterDaemon(add, "skipped: daemon is unreachable")
-		runUpdateCheck(ctx, cfg, deps, add)
+		runUpdateChecks(ctx, cfg, deps, nil, add)
 		return report
 	}
 	if status.Status != "ok" || strings.TrimSpace(status.Version) == "" {
 		add("daemon", Fail, fmt.Sprintf("unexpected daemon status %q (version %q)", status.Status, status.Version), "papio status")
 		skipRemainingAfterDaemon(add, "skipped: daemon status is invalid")
-		runUpdateCheck(ctx, cfg, deps, add)
+		runUpdateChecks(ctx, cfg, deps, nil, add)
 		return report
 	}
 	if status.Version != deps.CLIVersion {
@@ -283,31 +285,43 @@ func RunIntegration(ctx context.Context, deps IntegrationDependencies) Report {
 	runManifestChecks(cfg, deps, add)
 
 	preflight, err := deps.ZotioPreflight(ctx, cfg)
-	if err != nil {
-		add("zotio", Fail, err.Error(), "install or update zotio, then rerun papio doctor")
+	if err != nil || preflight == nil {
+		detail := "zotio preflight returned no result"
+		if err != nil {
+			detail = err.Error()
+		}
+		preflight = nil
+		add("zotio", Fail, detail, "install or update zotio, then rerun papio doctor")
 	} else {
 		add("zotio", Pass, fmt.Sprintf("version %s; %d required capabilities available", preflight.Version, len(preflight.Capabilities)), "")
+		update.NewZotio(cfg.DataDir).RememberInstalledVersion(preflight.Version)
 	}
-	runUpdateCheck(ctx, cfg, deps, add)
+	runUpdateChecks(ctx, cfg, deps, preflight, add)
 	return report
 }
 
-func runUpdateCheck(ctx context.Context, cfg config.Config, deps IntegrationDependencies, add func(string, string, string, string)) {
+func runUpdateChecks(ctx context.Context, cfg config.Config, deps IntegrationDependencies, preflight *zotio.PreflightResult, add func(string, string, string, string)) {
 	if !cfg.Updates.Check {
-		add("updates", Skip, "update check disabled ([updates] check = false)", "")
+		add("updates (papio)", Skip, "update check disabled ([updates] check = false)", "")
+		add("updates (zotio)", Skip, "update check disabled ([updates] check = false)", "")
 		return
 	}
+	runPapioUpdateCheck(ctx, cfg, deps, add)
+	runZotioUpdateCheck(ctx, cfg, deps, preflight, add)
+}
+
+func runPapioUpdateCheck(ctx context.Context, cfg config.Config, deps IntegrationDependencies, add func(string, string, string, string)) {
 	if deps.CheckUpdates == nil {
-		add("updates", Skip, "skipped: update checker is not configured", "")
+		add("updates (papio)", Skip, "skipped: update checker is not configured", "")
 		return
 	}
 	info, err := deps.CheckUpdates(ctx, cfg)
 	if err != nil || info == nil {
-		add("updates", Warn, "could not check for papio updates", "rerun papio doctor later")
+		add("updates (papio)", Warn, "could not check for papio updates", "rerun papio doctor later")
 		return
 	}
 	if !update.IsNewer(info.LatestVersion, deps.CLIVersion) {
-		add("updates", Pass, fmt.Sprintf("papio %s is current", deps.CLIVersion), "")
+		add("updates (papio)", Pass, fmt.Sprintf("papio %s is current", deps.CLIVersion), "")
 		return
 	}
 	executable, err := os.Executable()
@@ -315,10 +329,36 @@ func runUpdateCheck(ctx context.Context, cfg config.Config, deps IntegrationDepe
 		executable = ""
 	}
 	add(
-		"updates",
+		"updates (papio)",
 		Warn,
 		fmt.Sprintf("papio %s available (you have %s)", info.LatestVersion, deps.CLIVersion),
 		update.UpgradeHint(executable, info.URL),
+	)
+}
+
+func runZotioUpdateCheck(ctx context.Context, cfg config.Config, deps IntegrationDependencies, preflight *zotio.PreflightResult, add func(string, string, string, string)) {
+	if preflight == nil || strings.TrimSpace(preflight.Version) == "" {
+		add("updates (zotio)", Skip, "skipped: zotio preflight failed", "")
+		return
+	}
+	if deps.CheckZotioUpdates == nil {
+		add("updates (zotio)", Skip, "skipped: update checker is not configured", "")
+		return
+	}
+	info, err := deps.CheckZotioUpdates(ctx, cfg)
+	if err != nil || info == nil {
+		add("updates (zotio)", Warn, "could not check for zotio updates", "rerun papio doctor later")
+		return
+	}
+	if !update.IsNewer(info.LatestVersion, preflight.Version) {
+		add("updates (zotio)", Pass, fmt.Sprintf("zotio %s is current", preflight.Version), "")
+		return
+	}
+	add(
+		"updates (zotio)",
+		Warn,
+		fmt.Sprintf("zotio %s available (you have %s)", info.LatestVersion, preflight.Version),
+		update.UpgradeHintFor(cfg.Zotio.Executable, "zotio", info.URL),
 	)
 }
 

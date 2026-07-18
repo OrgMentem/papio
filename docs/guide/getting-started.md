@@ -33,10 +33,10 @@ papio init
 
 `papio init` writes validated configuration, creates the data directory and
 applies database migrations, checks the Zotio executable, installs the native
-messaging host, asks whether Papio may check GitHub releases once a day for
-new versions (default yes; nothing else is ever sent), and runs `doctor`. It
-is idempotent, so rerunning it updates setup without creating a separate
-profile.
+messaging host, and asks: “Check for papio and zotio updates once a day? Queries
+GitHub releases only; nothing else is sent. [Y/n]” It defaults to yes and then
+runs `doctor`. It is idempotent, so rerunning it updates setup without creating
+a separate profile.
 
 The interactive setup asks for:
 
@@ -72,7 +72,7 @@ These flags set the corresponding setup values:
 | `--proquest-account-id` | A ProQuest account ID or URL containing `accountid=`. |
 | `--extension-id` | Chrome extension ID permitted to reach the native host. |
 | `--firefox-extension-id` | Firefox add-on ID permitted to reach the native host. |
-| `--check-updates` | Allow a once-daily GitHub releases check for new versions (default `true`). |
+| `--check-updates` | Check for papio and zotio updates once a day? Queries GitHub releases only; nothing else is sent. [Y/n] |
 | `--non-interactive` | Do not prompt; retain existing values unless a flag overrides them. |
 | `--skip-browser` | Skip Chrome extension and native-host setup. |
 

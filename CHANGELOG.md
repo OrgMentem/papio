@@ -13,11 +13,10 @@ records in `notes/acquisition-stack-plan.md`.
   shipped with, so the popup can show a calm "papio X.Y is available" line
   when the connected daemon is older — Papio itself performs no network
   activity for this. Separately, an opt-in `[updates] check = true` setting
-  (offered by the `papio init` prompt, default yes) has the daemon consult
-  the GitHub releases API at most once a day, surfacing results in
-  `papio doctor`, daemon status, and a once-daily stderr hint with the
-  channel-appropriate upgrade command. Configurations without the setting
-  never check.
+  (offered by the `papio init` prompt, default yes) has the daemon consult the
+  Papio and Zotio GitHub releases APIs independently at most once a day. Papio
+  status appears in daemon status; both targets surface in `papio doctor` and a
+  once-daily stderr hint. Configurations without the setting never check.
 
 - Version-skew awareness across every surface. The `hello_ack` handshake now
   carries the daemon's version and a feature list (optional, backward
@@ -225,6 +224,11 @@ records in `notes/acquisition-stack-plan.md`.
 
 ### Changed
 
+- Rewrote the README on the zotio template: centered wordmark + tagline +
+  badges + docs nav, a "Why papio" section with the hard boundaries, the
+  mermaid pipeline and access-mode table from the docs landing page, the
+  research loop, validation/provenance and zotio-boundary sections, the MCP
+  tool surface, and install paths (brew, scoop, signed releases, source).
 - Redesigned the wordmark's baboon cameo: the abstract head is now a
   recognizable hamadryas baboon (cape mantle, long muzzle, heavy brow) that
   peeks up holding a stack of papers instead of waving. Light and dark

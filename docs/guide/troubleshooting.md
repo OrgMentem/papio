@@ -111,6 +111,11 @@ options page shows extension and daemon versions together. Extension updates
 arrive through the browser store, while the daemon is updated manually, so an
 extension newer than its daemon is the common direction.
 
+Store-installed extensions update automatically. Manually loaded builds from
+`about:debugging` or an unpacked `dist/` do not; download the new ZIP from the
+release bundle instead. The daemon's extension floor and the popup states flag
+an extension that is too old.
+
 ### Learning about new releases
 
 Papio never installs updates on its own, and it never contacts a server
@@ -124,12 +129,12 @@ without being told to. Two mechanisms tell you a newer release exists:
   activity involved.
 - **Opt-in release check.** With `check = true` under `[updates]` in the
   configuration (the `papio init` prompt offers this, defaulting to yes), the
-  daemon asks the GitHub releases API for the latest version at most once a
-  day. The request carries no identifying payload beyond the connection
-  itself, and GitHub already hosts the binaries you would download. Results
-  appear in `papio doctor`, in daemon status, and as a single standard-error
-  hint (at most once per day). Configurations without the `[updates]` section
-  never check.
+  daemon asks the Papio and Zotio GitHub releases APIs for their latest versions
+  at most once a day each. The requests carry no identifying payload beyond the
+  connection itself, and GitHub already hosts the binaries you would download.
+  Results appear in `papio doctor`, and as a single standard-error hint (at
+  most once per day). Configurations without the `[updates]` section never
+  check.
 
 ## Keepalive asks you to sign in again
 

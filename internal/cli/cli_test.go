@@ -113,10 +113,10 @@ func TestConfigInitWritesPrivateStructuredConfig(t *testing.T) {
 
 func TestDaemonPingResultDecodesFullStatus(t *testing.T) {
 	var result daemonPingResult
-	if err := ipc.DecodeResult(json.RawMessage(`{"status":"ok","version":"1.2.3","extension_connected":true,"extension_version":"4.5.6","update_available":true,"latest_version":"1.2.4"}`), &result); err != nil {
+	if err := ipc.DecodeResult(json.RawMessage(`{"status":"ok","version":"1.2.3","extension_connected":true,"extension_version":"4.5.6","update_available":true,"latest_version":"1.2.4","zotio_update_available":true,"zotio_latest_version":"5.6.7"}`), &result); err != nil {
 		t.Fatalf("decode ping result: %v", err)
 	}
-	if result.Status != "ok" || result.Version != "1.2.3" || !result.ExtensionConnected || result.ExtensionVersion != "4.5.6" || !result.UpdateAvailable || result.LatestVersion != "1.2.4" {
+	if result.Status != "ok" || result.Version != "1.2.3" || !result.ExtensionConnected || result.ExtensionVersion != "4.5.6" || !result.UpdateAvailable || result.LatestVersion != "1.2.4" || !result.ZotioUpdateAvailable || result.ZotioLatestVersion != "5.6.7" {
 		t.Fatalf("ping result = %+v", result)
 	}
 }
@@ -200,7 +200,7 @@ func TestCallHintsForAvailableUpdateOncePerDay(t *testing.T) {
 	newOptions := func() (*options, *bytes.Buffer) {
 		opt, _, stderr := versionWarningTestOptions(api.Version)
 		opt.configLoader = func(string) (config.Config, error) {
-			return config.Config{DataDir: dataDir}, nil
+			return config.Config{DataDir: dataDir, Updates: config.Updates{Check: true}}, nil
 		}
 		opt.rpcCall = func(_ context.Context, _ string, method string, _ any, result any) error {
 			if method == "ping" {
@@ -219,7 +219,7 @@ func TestCallHintsForAvailableUpdateOncePerDay(t *testing.T) {
 			t.Fatalf("first call: %v", err)
 		}
 	}
-	want := "papio: version 99.0.0 is available (you have " + api.Version + ") — https://github.com/orgmentem/papio/releases/latest\n"
+	want := "papio: updates available: papio 99.0.0 (you have " + api.Version + ") — run 'papio doctor' for details\n"
 	if got := firstStderr.String(); got != want {
 		t.Fatalf("first stderr = %q, want %q", got, want)
 	}
@@ -230,6 +230,34 @@ func TestCallHintsForAvailableUpdateOncePerDay(t *testing.T) {
 	}
 	if got := secondStderr.String(); got != "" {
 		t.Fatalf("second stderr = %q, want empty due to persisted nag", got)
+	}
+}
+
+func TestCallHintIncludesCachedZotioUpdate(t *testing.T) {
+	dataDir := t.TempDir()
+	cache := `{"latest_version":"1.1.0","url":"https://example.test/zotio","installed_version":"1.0.0"}`
+	if err := os.WriteFile(filepath.Join(dataDir, "update-cache-zotio.json"), []byte(cache), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	opt, _, stderr := versionWarningTestOptions(api.Version)
+	opt.configLoader = func(string) (config.Config, error) {
+		return config.Config{DataDir: dataDir, Updates: config.Updates{Check: true}}, nil
+	}
+	opt.rpcCall = func(_ context.Context, _ string, method string, _ any, result any) error {
+		if method == "ping" {
+			status := result.(*daemonPingResult)
+			status.Version = api.Version
+			status.UpdateAvailable = true
+			status.LatestVersion = "99.0.0"
+		}
+		return nil
+	}
+	if err := opt.call(context.Background(), "jobs.list", struct{}{}, &struct{}{}); err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	want := "papio: updates available: papio 99.0.0 (you have " + api.Version + "), zotio 1.1.0 (you have 1.0.0) — run 'papio doctor' for details\n"
+	if got := stderr.String(); got != want {
+		t.Fatalf("stderr = %q, want %q", got, want)
 	}
 }
 

@@ -51,6 +51,9 @@ func defaultDoctorDependencies(opt *options) doctor.IntegrationDependencies {
 		CheckUpdates: func(ctx context.Context, cfg config.Config) (*update.Info, error) {
 			return update.New(cfg.DataDir).Check(ctx)
 		},
+		CheckZotioUpdates: func(ctx context.Context, cfg config.Config) (*update.Info, error) {
+			return update.NewZotio(cfg.DataDir).Check(ctx)
+		},
 	}
 }
 
