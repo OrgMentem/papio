@@ -31,6 +31,7 @@ handles credentials, MFA, CAPTCHAs, or subscription crawling.
 
 ```sh
 papio init
+# `papio doctor` checks the whole chain, including the browser extension and zotio
 papio doctor
 papio search "appropriate reliance on AI" --limit 10
 papio acquire 10.1371/journal.pone.0262026 --wait
@@ -41,6 +42,12 @@ papio version
 papio daemon status
 papio daemon stop
 ```
+
+## Sister project: zotio
+
+Papio acquires validated PDFs into immutable bundles. [zotio](https://github.com/orgmentem/zotio)
+is the trust-and-automation layer for Zotero that imports those bundles
+preview-first. Papio works without zotio, stopping at validated bundles.
 
 ## Documentation
 

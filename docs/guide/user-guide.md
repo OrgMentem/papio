@@ -142,6 +142,11 @@ sections. Use its Focus control only when authentication or a provider-owned
 decision is required. `papio actions open` always targets Chrome, where the
 extension and your institutional session live.
 
+The popup also reports daemon health: it shows a version line when healthy and
+actionable states when the daemon is unreachable or either side is out of date.
+The toolbar badge shows `!` when attention is needed, and the options-page
+footer shows the extension and daemon versions together.
+
 For institutional handoffs, Papio first uses the selected resolver profile.
 A direct-link-enabled resolver goes straight to the provider. When Alma/Primo
 instead renders an online-services menu, the extension follows the

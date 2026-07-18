@@ -10,6 +10,7 @@ The server uses the same local configuration, daemon, durable jobs, and Zotio
 boundary as the CLI. Its tools are named `papio_*`; its read resources are
 `papio://jobs`, `papio://artifacts`, `papio://bundles`, `papio://zotio/plans`,
 and `papio://exports`.
+When acquisitions fail unexpectedly, run `papio_doctor` first.
 
 ## Canonical acquisition loop
 

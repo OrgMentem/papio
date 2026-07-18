@@ -109,6 +109,9 @@ Run the health check after setup, especially after changing configuration:
 papio doctor
 ```
 
+It checks core readiness plus the local integration chain: configuration, daemon
+and extension connectivity, native-host manifests, and Zotio.
+
 ## 5. Acquire a first paper
 
 Queue one DOI and wait for its job to settle:

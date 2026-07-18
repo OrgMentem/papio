@@ -50,7 +50,7 @@ papio status --follow                                        # working / awaitin
 papio actions list                                           # open browser handoffs and identity reviews
 ```
 
-Run [`papio doctor`](guide/troubleshooting.md#read-doctor-output) any time to see connectivity, PDF tooling, and Zotio-boundary readiness as stable `PASS`/`WARN`/`FAIL` rows.
+Run [`papio doctor`](guide/troubleshooting.md#version-skew-and-updates) any time to see core readiness plus daemon, extension, native-host, and Zotio integration status.
 
 New here? Start with the [user guide](guide/user-guide.md), then tune policy in the [configuration reference](reference/config-reference.md).
 
@@ -68,6 +68,6 @@ New here? Start with the [user guide](guide/user-guide.md), then tune policy in 
 - **[Command reference](reference/commands.md)** — every `papio` command and its flags.
 - **[MCP tools](reference/mcp-tools.md)** — every `papio_*` tool and read resource, with parameters and boundaries.
 - **[Configuration](reference/config-reference.md)** — every TOML key, default, constraint, and effect.
-- **[Troubleshooting](guide/troubleshooting.md)** — extension reload, daemon recovery, reading `doctor`, and the stable Zotio-boundary error classes.
+- **[Troubleshooting](guide/troubleshooting.md)** — extension reload, daemon and extension version skew, `doctor`, and the stable Zotio-boundary error classes.
 
 </div>

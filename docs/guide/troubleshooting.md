@@ -74,6 +74,43 @@ If a handoff remains stale after the daemon is back, reload the extension using
 the MV3 procedure above, then inspect `papio actions list` and `papio status`.
 Do not cancel a job merely because its old popup row is stale.
 
+## Version skew and updates
+
+Run `papio doctor` first when an update or browser integration seems wrong. It
+checks core readiness first, then the local integration chain:
+
+```text
+PASS  access_mode              explicit access mode configured
+PASS  pdftotext                Poppler semantic extraction available
+...
+PASS  config                   parsed /Users/me/.config/papio/config.toml
+PASS  daemon                   reachable; version 0.1.0
+WARN  extension                extension has not connected since daemon start
+PASS  native host (Chrome)     manifest allows configured extension
+PASS  native host (Firefox)    manifest allows configured extension
+PASS  zotio                    version 1.0.0; required capabilities available
+```
+
+To update Papio, build or install the new binary, then stop the existing
+daemon:
+
+```sh
+papio daemon stop
+```
+
+The next daemon-backed command autostarts the new daemon; there is no
+`papio daemon restart` command. If the CLI and daemon versions differ, the CLI
+prints a warning on standard error. An unknown-field configuration error means
+the configuration was written by a newer Papio binary; install a matching or
+newer binary before continuing.
+
+The extension popup reports **daemon unreachable**, **Papio daemon out of
+date**, and **extension out of date** when it needs attention; the toolbar shows
+`!` in those states. When healthy, the popup shows the daemon version, and its
+options page shows extension and daemon versions together. Extension updates
+arrive through the browser store, while the daemon is updated manually, so an
+extension newer than its daemon is the common direction.
+
 ## Keepalive asks you to sign in again
 
 The browser extension keeps one pinned, muted resolver tab while nonterminal

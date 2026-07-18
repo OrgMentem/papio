@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
 	"strings"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 	"papio/internal/bootstrap"
 	"papio/internal/config"
 	"papio/internal/discovery"
+	"papio/internal/doctor"
 	"papio/internal/errcat"
 	"papio/internal/ipc"
 	"papio/internal/job"
@@ -244,10 +246,11 @@ func (c localRPCCaller) Call(ctx context.Context, method string, params, result 
 }
 
 type toolDependencies struct {
-	caller rpcCaller
-	cfg    config.Config
-	now    func() time.Time
-	wait   func(context.Context, time.Duration) error
+	caller    rpcCaller
+	cfg       config.Config
+	now       func() time.Time
+	wait      func(context.Context, time.Duration) error
+	doctorRun func(context.Context) doctor.Report
 }
 
 func defaultToolDependencies(caller rpcCaller) toolDependencies {
@@ -261,8 +264,42 @@ func New(system *bootstrap.System) *mcp.Server {
 	deps := defaultToolDependencies(newLocalRPCCaller(system))
 	if system != nil {
 		deps.cfg = system.Config
+		deps.doctorRun = doctorReportForSystem(system)
 	}
 	return newServer(system, deps)
+}
+
+func doctorReportForSystem(system *bootstrap.System) func(context.Context) doctor.Report {
+	return func(ctx context.Context) doctor.Report {
+		readiness := doctor.Run(ctx, system.Config, system.Store, system.PDFCapability, system.WorkerBinary)
+		integration := doctor.RunIntegration(ctx, doctor.IntegrationDependencies{
+			CLIVersion: api.Version,
+			LoadConfig: func() (config.Config, error) {
+				return system.Config, nil
+			},
+			DaemonStatus: func(context.Context, config.Config) (doctor.DaemonStatus, error) {
+				status := doctor.DaemonStatus{Status: "ok", Version: api.Version}
+				if system.Browser != nil {
+					status.ExtensionVersion, _, status.ExtensionConnected = system.Browser.SessionInfo()
+				}
+				return status, nil
+			},
+			ManifestDir: func(config.Config) (string, error) {
+				return doctor.DefaultChromeNativeMessagingHostsDir()
+			},
+			FirefoxDir: func(config.Config) (string, error) {
+				return doctor.DefaultFirefoxNativeMessagingHostsDir()
+			},
+			ReadFile: os.ReadFile,
+			ZotioPreflight: func(ctx context.Context, cfg config.Config) (*zotio.PreflightResult, error) {
+				return zotio.New(cfg.Zotio).Preflight(ctx)
+			},
+		})
+		return doctor.Report{
+			OK:     readiness.OK && integration.OK,
+			Checks: append(readiness.Checks, integration.Checks...),
+		}
+	}
 }
 
 func newServer(system *bootstrap.System, dependencies toolDependencies) *mcp.Server {
@@ -452,9 +489,28 @@ func Run(ctx context.Context, system *bootstrap.System) error {
 
 type StatusInput struct{}
 
+type DoctorInput struct{}
+
 type ActionsListInput struct{}
 
 func addLoopClosureTools(server *mcp.Server, dependencies toolDependencies) {
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "papio_doctor", Title: "Diagnose Papio integrations",
+		Description: "Run papio's integration diagnostics: config, daemon, browser extension connectivity, native-messaging host manifests, and Zotio preflight. Returns pass/warn/fail/skip checks with fix guidance. Read-only.",
+		Annotations: readAnnotations(),
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, _ DoctorInput) (*mcp.CallToolResult, doctor.Report, error) {
+		if dependencies.doctorRun == nil {
+			return nil, doctor.Report{
+				OK: false,
+				Checks: []doctor.Check{{
+					Name: "doctor", Status: doctor.Fail, Detail: "in-process diagnostics are not configured",
+					Remediation: "run papio mcp through the Papio daemon",
+				}},
+			}, nil
+		}
+		return nil, dependencies.doctorRun(ctx), nil
+	})
+
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "papio_status", Title: "Summarize Papio jobs",
 		Description: "Return active and recently completed acquisition jobs grouped into the same working, human-review, ready, and failed phases as papio status. Parked or no-file jobs carry an actionable category and a one-line next step (e.g. institution_not_configured -> run papio init). Read-only.",

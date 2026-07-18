@@ -34,6 +34,7 @@ jobs, export bundles, or mutate Zotero.
 | `papio_batch_report` | `batch_id` (required persisted batch ID or `latest`); `format` (optional `json` or `markdown`, default `json`) | Read-only manifest, job, event, and human-action report. |
 | `papio_batch_wait` | `batch_id` (required persisted batch ID or `latest`); `timeout_seconds` (optional, 1–600; `0` or omitted defaults to 300); `poll_seconds` (optional, default 5) | Read-only polling of one batch report. Returns `report` and `settled`; it submits, imports, and resolves nothing. A human-review outcome is settled rather than implicitly successful. |
 | `papio_status` | None | Read-only snapshot of active and recently completed jobs, grouped as working, awaiting human review, needs review, ready, or failed/unavailable. Each job includes `id`, `title`, `provider`, `state`, and `age`; review and failed/unavailable jobs also return `reason`, actionable `category`, and one-line `guidance`. Ready jobs return `import_status`. |
+| `papio_doctor` | None | Read-only integration diagnostics for loaded configuration, the in-process daemon, browser-extension connectivity, Chrome and Firefox native-messaging manifests, and Zotio preflight. Returns `ok` and pass/warn/fail/skip checks with remediation guidance. |
 
 ## Actions, artifacts, and Zotio
 
@@ -67,6 +68,7 @@ is unavailable.
 | `papio_batch_report` | `papio batch report <batch-id-or-latest>` | Add `--markdown` for the Markdown digest. |
 | `papio_batch_wait` | No single command | Poll `papio batch report <batch-id-or-latest>` or use `papio status --follow`. |
 | `papio_status` | `papio status` | Add `--follow` for a two-second refresh loop. |
+| `papio_doctor` | `papio doctor` | Both return integration diagnostics; the MCP tool also uses the daemon's in-process readiness handles. |
 | `papio_actions_list` | `papio actions list` | Add `--all` to include resolved CLI actions. |
 | `papio_actions_resolve` | `papio actions resolve <action-id> --accept` or `--reject` | Both surfaces accept or reject only identity reviews. |
 | `papio_export_bundle` | `papio bundle export <job-id>` | CLI destination is `--output <directory>`. |

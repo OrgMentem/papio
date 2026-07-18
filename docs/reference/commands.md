@@ -206,7 +206,7 @@ papio daemon stop
 
 ## `papio doctor`
 
-Check acquisition-core readiness
+Check acquisition readiness and local integrations
 
 ```
 papio doctor

@@ -18,6 +18,7 @@ import (
 	"papio/internal/batch"
 	"papio/internal/bootstrap"
 	"papio/internal/config"
+	"papio/internal/doctor"
 	"papio/internal/job"
 	"papio/internal/protocol"
 	"papio/internal/work"
@@ -44,7 +45,7 @@ func TestServerExposesExactToolSurface(t *testing.T) {
 		t.Fatal(err)
 	}
 	var names []string
-	var actionsResolveTool, applyTool, batchAcquireTool, batchReportTool, batchWaitTool, exportTool, searchTool *mcp.Tool
+	var actionsResolveTool, applyTool, batchAcquireTool, batchReportTool, batchWaitTool, doctorTool, exportTool, searchTool *mcp.Tool
 	for _, tool := range listed.Tools {
 		names = append(names, tool.Name)
 		switch tool.Name {
@@ -52,6 +53,8 @@ func TestServerExposesExactToolSurface(t *testing.T) {
 			actionsResolveTool = tool
 		case "papio_acquire_batch":
 			batchAcquireTool = tool
+		case "papio_doctor":
+			doctorTool = tool
 		case "papio_zotio_apply":
 			applyTool = tool
 		case "papio_export_bundle":
@@ -65,7 +68,7 @@ func TestServerExposesExactToolSurface(t *testing.T) {
 		}
 	}
 	sort.Strings(names)
-	want := []string{"papio_acquire", "papio_acquire_batch", "papio_actions_list", "papio_actions_resolve", "papio_batch_report", "papio_batch_wait", "papio_export_bundle", "papio_search", "papio_status", "papio_watch_add", "papio_watch_list", "papio_watch_remove", "papio_zotio_apply", "papio_zotio_plan"}
+	want := []string{"papio_acquire", "papio_acquire_batch", "papio_actions_list", "papio_actions_resolve", "papio_batch_report", "papio_batch_wait", "papio_doctor", "papio_export_bundle", "papio_search", "papio_status", "papio_watch_add", "papio_watch_list", "papio_watch_remove", "papio_zotio_apply", "papio_zotio_plan"}
 	if strings.Join(names, ",") != strings.Join(want, ",") {
 		t.Fatalf("tools = %v, want %v", names, want)
 	}
@@ -78,6 +81,9 @@ func TestServerExposesExactToolSurface(t *testing.T) {
 	}
 	if !strings.Contains(string(schema), `"plan_id"`) || !strings.Contains(string(schema), `"confirmation_sha256"`) || strings.Contains(string(schema), `"job_id"`) {
 		t.Fatalf("apply schema bypasses plan confirmation: %s", schema)
+	}
+	if doctorTool == nil || doctorTool.Annotations == nil || !doctorTool.Annotations.ReadOnlyHint {
+		t.Fatalf("doctor annotations = %+v", doctorTool)
 	}
 	if exportTool == nil || exportTool.Annotations == nil || !exportTool.Annotations.ReadOnlyHint {
 		t.Fatalf("export annotations = %+v", exportTool)
@@ -147,6 +153,48 @@ func TestServerExposesExactToolSurface(t *testing.T) {
 	wantURIs := []string{"papio://artifacts", "papio://bundles", "papio://exports", "papio://jobs", "papio://zotio/plans"}
 	if strings.Join(uris, ",") != strings.Join(wantURIs, ",") {
 		t.Fatalf("resources = %v, want %v", uris, wantURIs)
+	}
+}
+
+func TestDoctorReportsInProcessIntegrationFailures(t *testing.T) {
+	cfg := config.Default()
+	cfg.AccessMode = config.ModeConservative
+	cfg.DataDir = t.TempDir()
+	cfg.Zotio.Executable = "papio-test-zotio-not-installed"
+	system, err := bootstrap.New(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = system.Close() })
+
+	ctx := context.Background()
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	serverSession, err := New(system).Connect(ctx, serverTransport, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = serverSession.Close() })
+	client := mcp.NewClient(&mcp.Implementation{Name: "papio-test", Version: "1"}, nil)
+	clientSession, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = clientSession.Close() })
+
+	var report doctor.Report
+	callToolJSON(t, clientSession, "papio_doctor", map[string]any{}, &report)
+	checks := make(map[string]doctor.Check, len(report.Checks))
+	for _, check := range report.Checks {
+		checks[check.Name] = check
+	}
+	if got, ok := checks["config"]; !ok || got.Status != doctor.Pass {
+		t.Fatalf("config check = %#v", got)
+	}
+	if got, ok := checks["daemon"]; !ok || got.Status != doctor.Pass || got.Detail != "reachable; version "+api.Version {
+		t.Fatalf("daemon check = %#v", got)
+	}
+	if got, ok := checks["zotio"]; !ok || got.Status != doctor.Fail {
+		t.Fatalf("zotio check = %#v", got)
 	}
 }
 func TestAcquireBatchCreatesReportableCLICompatibleManifest(t *testing.T) {
