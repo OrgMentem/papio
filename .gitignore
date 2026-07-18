@@ -11,3 +11,7 @@ __pycache__/
 *.pyc
 .DS_Store
 .agents/
+# Go binaries built in the repo root (go build ./cmd/papio, ./cmd/docs-gen)
+/papio
+/docs-gen
+.playwright-cli/
