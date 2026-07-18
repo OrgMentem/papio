@@ -54,7 +54,7 @@ New here? Start with the [user guide](guide/user-guide.md), then tune policy in 
 - **[Browser handoff](concepts/browser-handoff.md)** — the ordinary-browser extension, native-host bridge, work-window headless mode, and no-CDP posture.
 - **[Validation & provenance](concepts/validation-and-provenance.md)** — PDF structure, identity, OCR gates, and the immutable acquisition bundle.
 - **[Command reference](reference/commands.md)** — every `papio` command and its flags.
-- **[MCP tools](reference/mcp-tools.md)** — every `papio_*` tool and read resource, with parameters and boundaries.
+- **[MCP tools](reference/mcp-tools.md)** — the `papio_command_search` and `papio_command_run` command facade, the `papio_acquire_batch` and `papio_batch_wait` composite tools, and read resources, with parameters and boundaries.
 - **[Configuration](reference/config-reference.md)** — every TOML key, default, constraint, and effect.
 - **[Troubleshooting](guide/troubleshooting.md)** — extension reload, daemon and extension version skew, `doctor`, and the stable Zotio-boundary error classes.
 

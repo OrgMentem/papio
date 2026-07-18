@@ -18,7 +18,6 @@ import (
 
 	"papio/internal/api"
 	"papio/internal/batch"
-	"papio/internal/daemon"
 	"papio/internal/errcat"
 	"papio/internal/job"
 	"papio/internal/protocol"
@@ -331,11 +330,12 @@ func submitAcquire(ctx context.Context, opt *options, request protocol.WorkReque
 }
 
 type socketBatchCaller struct {
+	opt    *options
 	socket string
 }
 
 func (c socketBatchCaller) Call(ctx context.Context, method string, params, result any) error {
-	return callSocket(ctx, c.socket, method, params, result)
+	return c.opt.socketCall(ctx, c.socket, method, params, result)
 }
 
 func acquireBatch(ctx context.Context, cmd *cobra.Command, opt *options, path string, autoImport *bool, collection, resolver, label string, includeOwned bool) error {
@@ -359,12 +359,12 @@ func acquireBatch(ctx context.Context, cmd *cobra.Command, opt *options, path st
 		return err
 	}
 	socket := filepath.Join(cfg.DataDir, "papio.sock")
-	starter := daemon.NewAutostarter(socket)
+	starter := opt.autostarter(socket)
 	starter.Args = []string{"--config", cfg.Path, "daemon", "--socket", socket}
 	if err := starter.Ensure(ctx); err != nil {
 		return err
 	}
-	output, submitErr := batch.Submit(ctx, socketBatchCaller{socket: socket}, cfg.DataDir, requests, batch.SubmitOptions{
+	output, submitErr := batch.Submit(ctx, socketBatchCaller{opt: opt, socket: socket}, cfg.DataDir, requests, batch.SubmitOptions{
 		AutoImport: autoImport, Collection: collection, Resolver: resolver, Label: label, IncludeOwned: includeOwned,
 	})
 	if output == nil {

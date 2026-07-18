@@ -40,15 +40,38 @@ type options struct {
 
 // NewRoot builds a command tree with no process-global output state.
 func NewRoot(out, errOut io.Writer) *cobra.Command {
-	opt := &options{out: out, errOut: errOut}
+	return newRoot(&options{out: out, errOut: errOut})
+}
+
+// NewInProcessRoot builds a papio command tree whose RPC calls route through
+// call instead of the daemon socket, for embedding the CLI command surface in
+// the in-process MCP server. It performs no autostart and no daemon version
+// handshake: the embedding process already owns the configured services.
+func NewInProcessRoot(out, errOut io.Writer, cfg config.Config, call func(context.Context, string, any, any) error) *cobra.Command {
+	opt := &options{
+		out:                  out,
+		errOut:               errOut,
+		daemonVersionChecked: true,
+		configLoader:         func(string) (config.Config, error) { return cfg, nil },
+		newAutostarter: func(socket string) *daemon.Autostarter {
+			return &daemon.Autostarter{SocketPath: socket, Ready: func(context.Context, string) error { return nil }}
+		},
+		rpcCall: func(ctx context.Context, _ string, method string, params, result any) error {
+			return call(ctx, method, params, result)
+		},
+	}
+	return newRoot(opt)
+}
+
+func newRoot(opt *options) *cobra.Command {
 	root := &cobra.Command{
 		Use:           "papio",
 		Short:         "Legitimate paper-acquisition broker",
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}
-	root.SetOut(out)
-	root.SetErr(errOut)
+	root.SetOut(opt.out)
+	root.SetErr(opt.errOut)
 	root.PersistentFlags().StringVar(&opt.configPath, "config", "", "config TOML path")
 	root.PersistentFlags().BoolVar(&opt.jsonOutput, "json", false, "emit structured JSON")
 	root.AddCommand(
@@ -204,6 +227,7 @@ func newVersionCommand(opt *options) *cobra.Command {
 	return &cobra.Command{
 		Use:   "version",
 		Short: "Print version information",
+		Annotations: map[string]string{"mcp:read-only": "true"},
 		Args:  cobra.NoArgs,
 		RunE: func(*cobra.Command, []string) error {
 			return opt.printResult(map[string]string{"version": api.Version}, "papio %s", api.Version)
@@ -212,7 +236,7 @@ func newVersionCommand(opt *options) *cobra.Command {
 }
 
 func newConfigCommand(opt *options) *cobra.Command {
-	command := &cobra.Command{Use: "config", Short: "Manage papio configuration"}
+	command := &cobra.Command{Use: "config", Short: "Manage papio configuration", Annotations: map[string]string{"mcp:hidden": "true"}}
 	var mode, email, dataDir string
 	var force bool
 	initCommand := &cobra.Command{

@@ -72,6 +72,7 @@ func newDoctorCommandWithDependencies(opt *options, deps doctor.IntegrationDepen
 	return &cobra.Command{
 		Use:   "doctor",
 		Short: "Check acquisition readiness and local integrations",
+		Annotations: map[string]string{"mcp:read-only": "true"},
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			report := runDoctor(cmd.Context(), deps, readiness)

@@ -19,6 +19,7 @@ func newBatchCommand(opt *options) *cobra.Command {
 	report := &cobra.Command{
 		Use:   "report <batch-id|latest>",
 		Short: "Join a batch manifest with live acquisition outcomes",
+		Annotations: map[string]string{"mcp:read-only": "true"},
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if markdown && opt.jsonOutput {

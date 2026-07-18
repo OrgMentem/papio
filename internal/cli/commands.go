@@ -28,6 +28,7 @@ func newJobsCommand(opt *options) *cobra.Command {
 	list := &cobra.Command{
 		Use:   "list",
 		Short: "List jobs",
+		Annotations: map[string]string{"mcp:read-only": "true"},
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			var rows []job.Row
@@ -52,6 +53,7 @@ func newJobsCommand(opt *options) *cobra.Command {
 	get := &cobra.Command{
 		Use:   "get <job-id>",
 		Short: "Show one job with events and actions",
+		Annotations: map[string]string{"mcp:read-only": "true"},
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			var detail *api.JobDetail
@@ -118,6 +120,7 @@ func newActionsCommand(opt *options) *cobra.Command {
 	list := &cobra.Command{
 		Use:   "list",
 		Short: "List open human actions",
+		Annotations: map[string]string{"mcp:read-only": "true"},
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			openOnly := !all
@@ -298,6 +301,7 @@ func newArtifactsCommand(opt *options) *cobra.Command {
 	get := &cobra.Command{
 		Use:   "get <job-id-or-sha256>",
 		Short: "Show a validated artifact",
+		Annotations: map[string]string{"mcp:read-only": "true"},
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			params := map[string]string{"job_id": args[0]}

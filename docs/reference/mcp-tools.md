@@ -1,15 +1,15 @@
 # MCP tools
 
-Run Papio as an MCP stdio server:
+Run *papio* as an MCP stdio server:
 
 ```sh
 papio mcp
 ```
 
-The server uses the same local configuration, daemon, durable jobs, and Zotio
-boundary as the CLI. Its tools are named `papio_*`. All object keys below are
-JSON keys; optional fields may be omitted and use the stated default where one
-exists.
+The MCP command surface derives from the *papio* CLI command tree, which is
+the single source of truth. The default surface is a compact command facade:
+two command tools, two composite tools, and read resources. All tool results
+are JSON; object keys below are JSON keys.
 
 ## Read resources
 
@@ -24,56 +24,79 @@ jobs, export bundles, or mutate Zotero.
 | `papio://zotio/plans` | Up to 100 immutable Zotio preview records. |
 | `papio://exports` | Up to 100 bundle, Zotio-plan, and Zotio-apply ledger records. |
 
-## Discovery and acquisition
+## Command facade (default)
+
+The default command surface contains these two tools:
 
 | Tool | Parameters | Result and boundary |
 | --- | --- | --- |
-| `papio_search` | `query` (optional unless no citation-snowball DOI is supplied); `limit` (optional, clamped to 1–50); `year_from`, `year_to`, `oa_only` (optional); `cites`, `cited_by`, `related_to` (optional DOI filters); `new_only` (optional) | Bounded, read-only OpenAlex results. Results include `owned` and `owned_item_key` when local Zotio lookup is available. `new_only` filters owned results after the OpenAlex limit, so fewer results can be returned. It never creates a job. |
-| `papio_acquire` | `request_id` (optional stable idempotency key); `identifiers` (optional DOI, PMID, arXiv, ISBN, or OpenAlex identity); or `title`, `authors`, and `year`; `zotio_item_key`, `collection`, `desired_version`, `access_mode_override`, `resolver`, `max_cost_usd`, `sources_allow`, `sources_deny`, `auto_import` (all optional) | Queues one bounded, policy-controlled job and returns `job_id`; it does not write to Zotero. `desired_version` is `published`, `accepted`, `preprint`, or `any`; `access_mode_override` is `conservative`, `assisted`, or `maximal`; `resolver` selects a named institutional OpenURL resolver profile. Each source list is limited to 50 entries. Omitting `auto_import` uses the configured default. |
-| `papio_acquire_batch` | `works` (required; 1–50 bare work objects or discovered-work envelopes); `auto_import`, `collection`, `resolver`, `label`, `include_owned` (optional) | Creates a durable batch using the CLI batch path's ownership routing, deterministic request IDs, auto-import policy, and manifest. Returns `batch_id` plus submitted and ownership-routing outcomes. `auto_import` defaults to `true`; `collection` defaults to `label` when unset; `include_owned` defaults to `false`. |
-| `papio_batch_report` | `batch_id` (required persisted batch ID or `latest`); `format` (optional `json` or `markdown`, default `json`) | Read-only manifest, job, event, and human-action report. |
-| `papio_batch_wait` | `batch_id` (required persisted batch ID or `latest`); `timeout_seconds` (optional, 1–600; `0` or omitted defaults to 300); `poll_seconds` (optional, default 5) | Read-only polling of one batch report. Returns `report` and `settled`; it submits, imports, and resolves nothing. A human-review outcome is settled rather than implicitly successful. |
-| `papio_status` | None | Read-only snapshot of active and recently completed jobs, grouped as working, awaiting human review, needs review, ready, or failed/unavailable. Each job includes `id`, `title`, `provider`, `state`, and `age`; review and failed/unavailable jobs also return `reason`, actionable `category`, and one-line `guidance`. Ready jobs return `import_status`. |
-| `papio_doctor` | None | Read-only integration diagnostics for loaded configuration, the in-process daemon, browser-extension connectivity, Chrome and Firefox native-messaging manifests, and Zotio preflight. Returns `ok` and pass/warn/fail/skip checks with remediation guidance. |
+| `papio_command_search` | `query` (optional case-insensitive substring match over command names and summaries); `name` (optional exact, space-separated command path, such as `"zotio apply"`) | Returns JSON. Omit both parameters to list every runnable command. Supplying `name` returns that command's summary, `read_only`, `takes_args`, and command-local `flags` (each flag's name, type, default, and description). |
+| `papio_command_run` | `name` (required exact, space-separated command path, such as `"status"` or `"zotio apply"`); `flags` (optional object of command-local flags by name); `args` (optional string of positional arguments only) | Executes the command in-process against the same daemon, jobs, and Zotio boundary as the CLI, and returns JSON. The server injects `--json`. Raw flag tokens in `args` are rejected. Inherited global `--config` and `--json` flags are never exposed and are rejected. |
 
-## Actions, artifacts, and Zotio
+For example, applying a Zotio plan uses the command facade rather than a
+standalone Zotio tool:
+
+```json
+{
+  "name": "zotio apply",
+  "args": "<plan-id>",
+  "flags": {
+    "confirm-sha256": "<digest-from-zotio-plan>"
+  }
+}
+```
+
+`zotio plan` previews a mutation and prints a confirmation SHA-256 for each
+plan. `zotio apply` requires the exact plan ID and that digest; it is the only
+path that mutates Zotero.
+
+## Mirror surface
+
+Set `PAPIO_MCP_SURFACE=mirror` to expose one MCP tool per runnable CLI command.
+Each tool is named `papio_<path>`, where the space-separated command path is
+joined with underscores: for example, `papio_status`, `papio_search`,
+`papio_zotio_apply`, and `papio_watch_add`.
+
+Mirror tools expose their command-local flags as native parameters plus an
+`args` string for positional arguments. They use the same validation as the
+facade: raw flag tokens in `args`, and inherited global `--config` and
+`--json` flags, are rejected.
+
+## Composite tools
+
+These tools are always present in both the default facade and mirror surfaces
+because no single CLI command supplies their MCP operation.
 
 | Tool | Parameters | Result and boundary |
 | --- | --- | --- |
-| `papio_actions_list` | None | Read-only open actions with IDs, job IDs, kinds, and details. A `verify_identity` action intentionally includes the local quarantine path for inspection. |
-| `papio_actions_resolve` | `action_id` (required open `verify_identity` action); `verdict` (required `accept` or `reject`) | Resolves only a verified-identity action and returns the job ID and new state. `accept` asserts that the caller inspected the quarantined artifact and verified that it is the requested work; `reject` records that it is not. |
-| `papio_export_bundle` | `job_id` (required ready job); `output_dir` (optional private destination) | Read-only, idempotent export of a validated PDF and provenance bundle. Without `output_dir`, Papio uses its data directory. |
-| `papio_zotio_plan` | `job_ids` (required; 1–50 ready job IDs) | Exports ready jobs, routes them through Zotio, and persists immutable mutation previews. It never applies a Zotero mutation. |
-| `papio_zotio_apply` | `plan_id` (required); `confirmation_sha256` (required exact value returned by `papio_zotio_plan`) | Applies exactly one immutable preview. Replaying the same confirmed plan is idempotent. This is the only MCP tool that writes to Zotero. |
+| `papio_acquire_batch` | `works` (required; 1–50 bare work objects or discovered-work envelopes); `auto_import` (optional, default `true`); `collection` (optional; defaults to `label`); `resolver` (optional); `label` (optional); `include_owned` (optional, default `false`) | Bulk-input equivalent of `acquire --batch`, whose stdin path is unavailable over MCP. Returns the batch manifest/routing result, including `batch_id`. |
+| `papio_batch_wait` | `batch_id` (required persisted batch ID or `latest`); `timeout_seconds` (optional, 1–600, default `300`); `poll_seconds` (optional, default `5`) | Read-only polling of one batch report. Returns `report` and `settled`. A human-review outcome is settled, not implicitly successful. |
 
-## Scheduled discovery
+## Hidden commands
 
-| Tool | Parameters | Result and boundary |
-| --- | --- | --- |
-| `papio_watch_add` | `query` (required); `cadence_hours` (required positive integer); `label`, `filters`, `collection`, `per_run_cap` (optional). `filters` contains optional `year_from`, `year_to`, and `oa_only`; `label` defaults to `query`; `per_run_cap` defaults to 10. | Creates a bounded, durable scheduled discovery watch and returns its state. Each run applies Papio's existing batch, ownership, auto-import, collection, and notification policy. |
-| `papio_watch_list` | None | Read-only scheduled-watch rows, including last-run and failure state. |
-| `papio_watch_remove` | `id` (required scheduled watch ID) | Permanently removes the watch and returns `id` and `removed`. It does not delete jobs or Zotero items created by earlier watch runs. |
+Commands annotated `mcp:hidden`, and their whole subtrees, are excluded from
+both surfaces. The excluded commands are `init`, `config`, `daemon`,
+`native-host`, and `mcp`. Commands annotated `mcp:read-only` report
+`read_only: true` through `papio_command_search`.
 
-## CLI equivalence
+## Old tool -> command_run
 
-The MCP tools use the same application surface as these CLI commands. “No
-single command” means the CLI has no one-call equivalent, not that the operation
-is unavailable.
+The former typed tools below are replaced on the default surface by
+`papio_command_run`. `args` is positional arguments only; `flags` uses the
+CLI's hyphenated command-local flag names.
 
-| MCP tool | Closest CLI operation | Notes |
-| --- | --- | --- |
-| `papio_search` | `papio search [query]` | CLI supports `--cites`, `--cited-by`, `--related-to`, `--new-only`, and the same bounded filters. |
-| `papio_acquire` | `papio acquire [identifier]` | Submits one acquisition request. |
-| `papio_acquire_batch` | `papio acquire --batch <file-or->` | The CLI reads JSONL work input and creates a persisted batch. |
-| `papio_batch_report` | `papio batch report <batch-id-or-latest>` | Add `--markdown` for the Markdown digest. |
-| `papio_batch_wait` | No single command | Poll `papio batch report <batch-id-or-latest>` or use `papio status --follow`. |
-| `papio_status` | `papio status` | Add `--follow` for a two-second refresh loop. |
-| `papio_doctor` | `papio doctor` | Both return integration diagnostics; the MCP tool also uses the daemon's in-process readiness handles. |
-| `papio_actions_list` | `papio actions list` | Add `--all` to include resolved CLI actions. |
-| `papio_actions_resolve` | `papio actions resolve <action-id> --accept` or `--reject` | Both surfaces accept or reject only identity reviews. |
-| `papio_export_bundle` | `papio bundle export <job-id>` | CLI destination is `--output <directory>`. |
-| `papio_zotio_plan` | `papio zotio plan <job-id> [job-id...]` | Preview first. |
-| `papio_zotio_apply` | `papio zotio apply <plan-id> --confirm-sha256 <digest>` | The SHA-256 is mandatory. |
-| `papio_watch_add` | `papio watch add <query>` | CLI cadence is `daily`, `weekly`, or `Nh`; MCP takes positive `cadence_hours`. |
-| `papio_watch_list` | `papio watch list` | Both are read-only. |
-| `papio_watch_remove` | `papio watch remove <id>` | Neither removes prior jobs or Zotero items. |
+| Old tool | `papio_command_run` invocation |
+| --- | --- |
+| `papio_search` | `name: "search"`; `args: "<query>"`; `flags: {limit, year-from, year-to, oa-only, cites, cited-by, related-to, new-only}` |
+| `papio_acquire` | `name: "acquire"`; `args: "<identifier>"`; `flags: {doi, pmid, arxiv, isbn, openalex, title, author, year, request-id, zotio-item-key, collection, desired-version, access-mode, resolver, max-cost, source, deny-source, auto-import}` |
+| `papio_status` | `name: "status"`; `flags: {follow}` |
+| `papio_doctor` | `name: "doctor"` |
+| `papio_actions_list` | `name: "actions list"`; `flags: {all}` |
+| `papio_actions_resolve` | `name: "actions resolve"`; `args: "<action-id>"`; `flags: {accept}` **or** `flags: {reject}` (exactly one) |
+| `papio_export_bundle` | `name: "bundle export"`; `args: "<job-id>"`; `flags: {output}` |
+| `papio_zotio_plan` | `name: "zotio plan"`; `args: "<job-id> <job-id> ..."` |
+| `papio_zotio_apply` | `name: "zotio apply"`; `args: "<plan-id>"`; `flags: {"confirm-sha256": "<digest-from-zotio-plan>"}` |
+| `papio_watch_add` | `name: "watch add"`; `args: "<query>"`; `flags: {label, collection, cadence, limit-per-run, oa-only, year-from, year-to}` |
+| `papio_watch_list` | `name: "watch list"` |
+| `papio_watch_remove` | `name: "watch remove"`; `args: "<id>"` |
+| `papio_batch_report` | `name: "batch report"`; `args: "<batch-id-or-latest>"`; `flags: {markdown}` |

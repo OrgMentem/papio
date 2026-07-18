@@ -202,18 +202,20 @@ you can import however you like.
 - **`--json`** on any command for structured output.
 - **`papio mcp`** serves an MCP stdio server with the same configuration,
   daemon, durable jobs, and Zotio boundary as the CLI.
-- **15 `papio_*` tools** mirror the research loop — `papio_search`,
-  `papio_acquire`, `papio_acquire_batch`, `papio_batch_report`,
-  `papio_batch_wait`, `papio_status`, `papio_doctor`, `papio_actions_list`,
-  `papio_actions_resolve`, `papio_export_bundle`, `papio_zotio_plan`,
-  `papio_zotio_apply`, plus scheduled-watch management
+- **A command facade** derived from the CLI, so agents reach the whole tool
+  surface through two tools without a parallel layer that can drift:
+  `papio_command_search` to discover commands and `papio_command_run` to
+  execute one (JSON output). Set `PAPIO_MCP_SURFACE=mirror` to expose one
+  `papio_<command>` tool apiece instead
   ([full reference](https://orgmentem.github.io/papio/reference/mcp-tools/)).
+- **Two composite tools** with no single-command equivalent — `papio_acquire_batch`
+  (bulk work input) and `papio_batch_wait` (bounded polling).
 - **Read resources** — `papio://jobs`, `papio://artifacts`, `papio://bundles`,
   `papio://zotio/plans`, `papio://exports` — expose recent durable state
   without creating jobs or mutating anything.
-- **One writer.** `papio_zotio_apply` is the only MCP tool that writes to
-  Zotero, and it demands the exact confirmation SHA-256 from
-  `papio_zotio_plan`.
+- **One writer.** `papio_command_run` with `zotio apply` is the only path that
+  writes to Zotero, and it demands the exact confirmation SHA-256 from
+  `zotio plan`.
 
 Register it in an MCP host:
 

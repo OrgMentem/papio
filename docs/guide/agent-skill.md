@@ -6,32 +6,39 @@ Run *papio* as an MCP stdio server with:
 papio mcp
 ```
 
-The server uses the same local configuration, daemon, durable jobs, and Zotio
-boundary as the CLI. Its tools are named `papio_*`; its read resources are
-`papio://jobs`, `papio://artifacts`, `papio://bundles`, `papio://zotio/plans`,
-and `papio://exports`.
-When acquisitions fail unexpectedly, run `papio_doctor` first.
+The server uses a command facade: `papio_command_search` discovers runnable
+commands and `papio_command_run` runs them. The composite tools
+`papio_acquire_batch` and `papio_batch_wait` remain first-class tools. Its read
+resources are `papio://jobs`, `papio://artifacts`, `papio://bundles`,
+`papio://zotio/plans`, and `papio://exports`.
+When acquisitions fail unexpectedly, run `papio_command_run` with
+`name="doctor"` first. Use `papio_command_search` to discover commands and
+their command-local flags.
 
 ## Canonical acquisition loop
 
 Use the loop below for a research set. It separates discovery, durable
 acquisition, observation, identity review, and Zotero mutation.
 
-1. Call `papio_search` with a bounded query or citation-snowball DOI.
+1. Use `papio_command_run` with `name="search"` and a bounded query as `args`
+   (or use `papio_acquire_batch` directly for already selected works).
 2. Create the persisted acquisition batch from selected works with
    `papio_acquire_batch`. It accepts 1–50 bare work objects or discovered-work
-   envelopes and returns a `batch_id`. Use item-level `papio_acquire` only when
-   submitting one work; it returns a `job_id`, not a `batch_id`.
+   envelopes and returns a `batch_id`.
 3. Once there is a persisted batch ID, call `papio_batch_wait` with a bounded
    timeout. It stops either when all work is settled, including human-review
    work, or when its timeout expires.
-4. Call `papio_batch_report` for JSON or Markdown outcomes.
-5. Call `papio_actions_list`. For an open `verify_identity` action, inspect the
-   local quarantine path in its detail and then call `papio_actions_resolve`
-   with `accept` or `reject`.
-6. For ready jobs that need Zotero mutation, call `papio_zotio_plan`, inspect
-   every immutable preview, then call `papio_zotio_apply` with the returned
-   plan ID and exact confirmation SHA-256.
+4. Use `papio_command_run` with `name="batch report"` and the batch ID as
+   `args` for outcomes.
+5. Use `papio_command_run` with `name="actions list"` to list open actions.
+   For an open `verify_identity` action, inspect the local quarantine path in
+   its detail, then use `papio_command_run` with `name="actions resolve"`,
+   `args="<action-id>"`, and exactly one of `flags: {"accept": true}` or
+   `flags: {"reject": true}`.
+6. For ready jobs that need Zotero mutation, use `papio_command_run` with
+   `name="zotio plan"` and the job IDs as `args`, inspect every immutable
+   preview, then use it with `name="zotio apply"`, `args="<plan-id>"`, and
+   `flags: {"confirm-sha256": "<exact digest>"}`.
 
 Do not turn a human-action state into an implicit success. A settled report can
 contain `awaiting_human` or `needs_review`; those are explicit outcomes, not
@@ -45,20 +52,25 @@ reference, see [MCP tools](../reference/mcp-tools.md).
 ### Identity review is an assertion, not a heuristic override
 
 Only resolve an open `verify_identity` action. The action detail identifies a
-local quarantine file precisely so the human or agent can inspect it. Passing
-`verdict: "accept"` is an assertion that the file is the requested work; it is
-not permission to accept a merely plausible PDF. Passing `reject` records the
-opposite. The resolution surface does not apply to other human-action kinds.
+local quarantine file precisely so the human or agent can inspect it. Running
+`papio_command_run` with `name="actions resolve"`, the action ID as `args`, and
+`flags: {"accept": true}` is an assertion that the file is the requested work;
+it is not permission to accept a merely plausible PDF. Use
+`flags: {"reject": true}` to record the opposite. The resolution surface does
+not apply to other human-action kinds.
 
 ### Zotio writes require a separate confirmation
 
-`papio_zotio_plan` is a preview step. Inspect the returned plans and preserve
-the returned `confirmation_sha256` for each one. `papio_zotio_apply` requires
-the exact `plan_id` and exact digest from that preview. Do not substitute a
-locally recomputed digest, truncate it, or reuse one from a different plan. A
+`papio_command_run` with `name="zotio plan"` is a preview step. Inspect the
+returned plans and preserve the returned `confirmation_sha256` for each one.
+`papio_command_run` with `name="zotio apply"` requires the exact `plan_id` as
+`args` and exact digest from that preview as
+`flags: {"confirm-sha256": "<exact digest>"}`. Do not substitute a locally
+recomputed digest, truncate it, or reuse one from a different plan. A
 confirmation mismatch is a safe failure; create and inspect a new preview.
+Only `papio_command_run` with `name="zotio apply"` can mutate Zotero.
 
 `auto_import` on acquisition is policy-driven daemon behavior. It does not make
-`papio_acquire` itself a Zotero-write tool, and an auto-import failure remains
+acquisition a Zotero-write operation, and an auto-import failure remains
 reportable rather than changing the validated acquisition into a failed PDF.
 

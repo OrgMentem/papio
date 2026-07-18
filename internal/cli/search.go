@@ -18,6 +18,7 @@ func newSearchCommand(opt *options) *cobra.Command {
 	command := &cobra.Command{
 		Use:   "search [query]",
 		Short: "Search OpenAlex for scholarly works",
+		Annotations: map[string]string{"mcp:read-only": "true"},
 		Args: func(cmd *cobra.Command, args []string) error {
 			if err := cobra.MaximumNArgs(1)(cmd, args); err != nil {
 				return err

@@ -145,6 +145,31 @@ func RouterWithShutdown(system *bootstrap.System, shutdown context.CancelFunc) i
 	return ipc.Router{Methods: methods}
 }
 
+// InProcessCaller routes RPC methods through the local router in-process,
+// without a socket. It backs the embedded MCP server and the CLI command
+// facade that server exposes, so both reach the same handlers the daemon
+// serves over IPC.
+func InProcessCaller(system *bootstrap.System) func(context.Context, string, any, any) error {
+	router := Router(system)
+	return func(ctx context.Context, method string, params, result any) error {
+		if router.Methods == nil {
+			return errors.New("papio RPC is not configured")
+		}
+		raw, err := json.Marshal(params)
+		if err != nil {
+			return err
+		}
+		response, rpcErr := router.Handle(ctx, ipc.Request{Method: method, Params: raw})
+		if rpcErr != nil {
+			return rpcErr
+		}
+		if result == nil {
+			return nil
+		}
+		return json.Unmarshal(response, result)
+	}
+}
+
 type statusResult struct {
 	Status               string `json:"status"`
 	Version              string `json:"version"`

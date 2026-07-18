@@ -17,6 +17,7 @@ func newZotioCommand(opt *options) *cobra.Command {
 	preflight := &cobra.Command{
 		Use:   "preflight",
 		Short: "Verify the configured Zotio version and capabilities",
+		Annotations: map[string]string{"mcp:read-only": "true"},
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			var result zotio.PreflightResult

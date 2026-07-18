@@ -47,6 +47,7 @@ func newStatusCommand(opt *options) *cobra.Command {
 	command := &cobra.Command{
 		Use:   "status",
 		Short: "Show active and recent acquisition jobs",
+		Annotations: map[string]string{"mcp:read-only": "true"},
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			refresh := func() error {

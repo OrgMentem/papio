@@ -66,9 +66,10 @@ func newInitCommandWithDependencies(opt *options, deps initDependencies) *cobra.
 	var extensionID, firefoxExtensionID string
 
 	command := &cobra.Command{
-		Use:   "init",
-		Short: "Set up papio for a first run",
-		Args:  cobra.NoArgs,
+		Use:         "init",
+		Short:       "Set up papio for a first run",
+		Annotations: map[string]string{"mcp:hidden": "true"},
+		Args:        cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if deps.Bootstrap == nil || deps.CheckZotio == nil || deps.InstallNative == nil || deps.RunDoctor == nil {
 				return fmt.Errorf("init command dependencies are incomplete")
@@ -475,5 +476,5 @@ func writeBrowserInstructions(out io.Writer) {
 	if err != nil {
 		extensionPath = "extension"
 	}
-	_, _ = fmt.Fprintf(out, "Browser setup:\n  Chrome:\n    1. Open chrome://extensions.\n    2. Enable Developer mode, then click Load unpacked and select %s.\n    3. Open Papio's Details page and grant optional host permissions only for publisher sites you use.\n    4. If the extension ID Chrome shows differs from the one you entered, re-run: papio init --extension-id <id>.\n  Firefox:\n    1. Open about:debugging#/runtime/this-firefox and click Load Temporary Add-on.\n    2. Select %s/firefox/manifest.json (its add-on ID %s is set by default).\n    3. On Papio's options page, grant the Library resolver access permission.\n", extensionPath, extensionPath, defaultFirefoxExtensionID)
+	_, _ = fmt.Fprintf(out, "Browser setup:\n  Chrome:\n    1. Open chrome://extensions.\n    2. Enable Developer mode, then click Load unpacked and select %s.\n    3. Open papio's Details page and grant optional host permissions only for publisher sites you use.\n    4. If the extension ID Chrome shows differs from the one you entered, re-run: papio init --extension-id <id>.\n  Firefox:\n    1. Open about:debugging#/runtime/this-firefox and click Load Temporary Add-on.\n    2. Select %s/firefox/manifest.json (its add-on ID %s is set by default).\n    3. On papio's options page, grant the Library resolver access permission.\n", extensionPath, extensionPath, defaultFirefoxExtensionID)
 }

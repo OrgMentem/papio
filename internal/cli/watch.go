@@ -56,7 +56,7 @@ func newWatchAddCommand(opt *options) *cobra.Command {
 
 func newWatchListCommand(opt *options) *cobra.Command {
 	return &cobra.Command{
-		Use: "list", Short: "List scheduled discovery watches", Args: cobra.NoArgs,
+		Use: "list", Short: "List scheduled discovery watches", Args: cobra.NoArgs, Annotations: map[string]string{"mcp:read-only": "true"},
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			var watches []watch.Watch
 			if err := opt.call(cmd.Context(), "watch.list", struct{}{}, &watches); err != nil {

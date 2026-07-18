@@ -2,17 +2,21 @@
 package cli
 
 import (
+	"io"
+
 	"github.com/spf13/cobra"
 
+	"papio/internal/api"
 	"papio/internal/bootstrap"
 	"papio/internal/mcpserver"
 )
 
 func newMCPCommand(opt *options) *cobra.Command {
 	return &cobra.Command{
-		Use:   "mcp",
-		Short: "Serve Papio tools and resources over MCP stdio",
-		Args:  cobra.NoArgs,
+		Use:         "mcp",
+		Short:       "Serve papio tools and resources over MCP stdio",
+		Annotations: map[string]string{"mcp:hidden": "true"},
+		Args:        cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			cfg, err := opt.loadConfig()
 			if err != nil {
@@ -23,7 +27,11 @@ func newMCPCommand(opt *options) *cobra.Command {
 				return err
 			}
 			defer system.Close()
-			return mcpserver.Run(cmd.Context(), system)
+			call := api.InProcessCaller(system)
+			factory := func(out, errOut io.Writer) *cobra.Command {
+				return NewInProcessRoot(out, errOut, cfg, call)
+			}
+			return mcpserver.Run(cmd.Context(), system, factory)
 		},
 	}
 }
