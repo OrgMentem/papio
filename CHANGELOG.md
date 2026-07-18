@@ -8,6 +8,43 @@ records in `notes/acquisition-stack-plan.md`.
 
 ### Added
 
+- Version-skew awareness across every surface. The `hello_ack` handshake now
+  carries the daemon's version and a feature list (optional, backward
+  compatible within `papio-browser/1`), so the auto-updating extension can
+  degrade gracefully against an older daemon instead of failing opaquely. The
+  popup reports daemon health directly: a quiet version line when healthy, and
+  actionable states for daemon-unreachable, daemon-out-of-date, and
+  extension-out-of-date; the toolbar badge shows `!` when attention is needed
+  and stays clear otherwise. The options page footer shows extension and
+  daemon versions at a glance. The daemon records the connected extension's
+  version and rejects extensions below a minimum floor with a clear
+  update-the-extension message.
+
+- `papio doctor` now walks the whole integration chain in one report: the
+  Phase-1 readiness checks (config paths, database, PDF tooling, credentials)
+  followed by integration checks — daemon reachability and version match,
+  browser-extension connectivity, native-messaging-host manifests for Chrome
+  and Firefox, and the Zotio preflight — each failure with a concrete `fix:`
+  line. The same diagnostics are exposed to agents as a read-only
+  `papio_doctor` MCP tool.
+
+- Every CLI command now warns on stderr (once per invocation, never on
+  stdout) when the running daemon's version differs from the CLI binary,
+  with the exact recovery command.
+
+- Release engineering: `release_metadata.py compat` mechanically verifies the
+  cross-artifact compatibility floors (daemon↔extension minimums, Zotio
+  minimum version, extension manifest/package version agreement) as a
+  `release.sh` step and a source-only CI check; `release.sh` now also
+  packages the Firefox extension archive alongside the Chrome one. A shared
+  release runbook lives at `.agents/skills/papio-release/SKILL.md` and is
+  cross-referenced from zotio.
+
+- Documentation: a `Version skew and updates` troubleshooting section (update
+  flow, popup states, config-newer-than-binary errors), sister-project
+  cross-references between papio and zotio in both READMEs and docs, and
+  regenerated command reference.
+
 - The MCP `papio_status` tool now surfaces the same actionable `category` and
   `guidance` as the CLI for parked and no-file jobs (including the config-aware
   `institution_not_configured`), so agents driving Papio over MCP get the same
@@ -174,6 +211,13 @@ records in `notes/acquisition-stack-plan.md`.
   section also gained "Grant all providers" / "Revoke all" — one click issues a
   single `permissions.request` for every publisher origin (one Firefox
   doorhanger) instead of ten separate grants.
+
+### Changed
+
+- Config unknown-field errors now explain that the config was likely written
+  for a newer papio and name the offending fields, instead of surfacing a raw
+  TOML parse error. Zotio preflight failures name the installed version, the
+  configured executable path, and the action that fixes the mismatch.
 
 ### Fixed
 
