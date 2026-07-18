@@ -225,10 +225,15 @@ records in `notes/acquisition-stack-plan.md`.
 ### Changed
 
 - Rewrote the README on the zotio template: centered wordmark + tagline +
-  badges + docs nav, a "Why papio" section with the hard boundaries, the
-  mermaid pipeline and access-mode table from the docs landing page, the
-  research loop, validation/provenance and zotio-boundary sections, the MCP
-  tool surface, and install paths (brew, scoop, signed releases, source).
+  badges + docs nav, a "Why papio" section with the hard boundaries, a
+  hand-drawn two-row serpentine architecture diagram in the brand palette
+  (`docs/assets/architecture.svg` + `-dark.svg`, theme-switched via a
+  `<picture>` element; replacing the mermaid flowchart, which rendered
+  poorly on GitHub) with the
+  access-mode table, the research loop, validation/provenance and
+  zotio-boundary sections, the MCP tool surface, and install paths (brew,
+  scoop, signed releases, source). Brand style: *papio* italic in prose,
+  zotio plain.
 - Redesigned the wordmark's baboon cameo: the abstract head is now a
   recognizable hamadryas baboon (cape mantle, long muzzle, heavy brow) that
   peeks up holding a stack of papers instead of waving. Light and dark

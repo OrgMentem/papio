@@ -41,7 +41,7 @@
   &middot;
   <a href="https://orgmentem.github.io/papio/reference/mcp-tools/"><strong>MCP tools</strong></a>
   &middot;
-  <a href="https://orgmentem.github.io/papio/guide/user-guide/"><strong>User guide</strong></a>
+  <a href="https://orgmentem.github.io/papio/"><strong>Documentation</strong></a>
 </p>
 
 <p align="center">
@@ -58,6 +58,7 @@
 ```bash
 brew install orgmentem/tap/papio                          # or grab a signed binary from Releases
 papio init                                                # guided setup: config, data dir, DB, native host, doctor
+papio doctor                                              # checks the whole chain, including the browser extension and zotio
 papio search "appropriate reliance on AI" --limit 20 --year-from 2023
 papio acquire 10.1371/journal.pone.0262026 --auto-import --wait
 papio status --follow                                     # working / awaiting-human / needs-review / ready / failed
@@ -100,20 +101,11 @@ Each acquisition is a durable job. The broker ranks candidates
 deterministically and resolves them in order — it never accepts the first URL
 it finds:
 
-```mermaid
-flowchart LR
-  U[You or an agent] --> C[papio CLI / MCP]
-  C --> D[Daemon: policy + durable jobs]
-  D --> R[OA / licensed API resolvers]
-  D --> O[Institutional OpenURL handoff]
-  O --> E[Extension in your own browser]
-  E --> H[Human login / MFA / CAPTCHA]
-  R --> V[Bounded fetch + PDF validation]
-  E --> V
-  V --> B[Immutable acquisition bundle]
-  B --> Z[Zotio preview then apply]
-  Z --> L[Zotero library]
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/architecture-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset="docs/assets/architecture.svg">
+  <img alt="papio acquisition pipeline: you or an agent drive papio's durable, bounded jobs; open-access and licensed APIs run before your own browser, where login, MFA, and CAPTCHA stay human; both paths converge in quarantine and PDF validation, producing an immutable bundle with provenance that reaches the Zotero library through zotio preview-then-apply" src="docs/assets/architecture.svg">
+</picture>
 
 | Plane | Backend | Handles credentials? |
 |---|---|---|
@@ -328,6 +320,8 @@ any subcommand.
 for Zotero that imports them preview-first — and audits, heals, and certifies
 the library they land in. If *papio* fills the gaps in your library, zotio makes
 sure the library stays fit to cite.
+
+*papio* also works without zotio, stopping at validated bundles.
 
 ---
 
