@@ -1,0 +1,7 @@
+/* Brand style: papio is set lowercase-italic wherever it appears as prose.
+   The header site name comes from site_name (plain text), so the italic is
+   applied here instead. */
+.md-header__topic .md-ellipsis,
+.md-nav--primary > .md-nav__title {
+  font-style: italic;
+}

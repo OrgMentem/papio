@@ -16,6 +16,9 @@ repo_url: https://github.com/OrgMentem/papio
 repo_name: OrgMentem/papio
 edit_uri: edit/main/docs/
 
+extra_css:
+  - stylesheets/extra.css
+
 theme:
   name: material
   logo: assets/logo-dark.svg
