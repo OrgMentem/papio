@@ -47,17 +47,17 @@
 <p align="center">
   Finding a paper is easy; <em>legitimately acquiring</em> it is the tedious
   part. <code>papio</code> searches scholarly works on OpenAlex, turns your
-  picks into durable, bounded acquisition jobs, resolves each one through
+  picks into tracked acquisition jobs, resolves each one through
   open-access and licensed sources first — falling back to a visible
   institutional pass in your own browser only when needed — validates every
-  PDF before you trust it, and hands ready artifacts to Zotero through
+  PDF before you trust it, and hands ready PDFs to Zotero through
   <a href="https://github.com/OrgMentem/zotio">zotio</a> behind a
   preview-and-confirmation boundary.
 </p>
 
 ```bash
 brew install orgmentem/tap/papio                          # or grab a signed binary from Releases
-papio init                                                # guided setup: config, data dir, DB, native host, doctor
+papio init                                                # guided setup: config, data folder, database, browser connector, health check
 papio doctor                                              # checks the whole chain, including the browser extension and zotio
 papio search "appropriate reliance on AI" --limit 20 --year-from 2023
 papio acquire 10.1371/journal.pone.0262026 --auto-import --wait
@@ -71,7 +71,7 @@ papio actions list                                        # open browser handoff
 
 Discovery is a solved problem — getting the PDF is not. The gap between "found
 it on OpenAlex" and "validated PDF in my library" is a swamp of publisher
-landing pages, SSO redirects, quarantine-worthy downloads, and hand-filed
+landing pages, single sign-on redirects, dubious downloads, and hand-filed
 imports. Existing tools either stop at metadata or cross lines you don't want
 crossed.
 
@@ -82,11 +82,11 @@ crossed.
   handoff **in your ordinary Chrome or Firefox session** — login, MFA, and
   CAPTCHAs stay human decisions. `papio` never stores institution credentials
   and never does subscription crawling.
-- **Durable, bounded jobs.** Every request becomes a persisted job with a
-  stable request ID — reruns are idempotent, batches are capped, budgets and
-  source allow/deny lists are enforced by the daemon, not by hope.
+- **Tracked, repeatable jobs.** Every request becomes a saved job with a
+  stable ID — running it again is safe and won't duplicate, batches are capped,
+  and budgets and allowed/blocked sources are enforced by papio, not by hope.
 - **Validated before trusted.** Every candidate PDF is quarantined and gated on
-  structure, identity, and a bounded OCR fallback. Ambiguous identity parks in
+  structure, identity, and an OCR fallback. Ambiguous identity parks in
   `needs_review` for a human verdict instead of silently importing the wrong
   paper.
 - **Zotero writes only through zotio.** `papio zotio plan` produces an
@@ -97,22 +97,22 @@ crossed.
 
 ## How it works
 
-Each acquisition is a durable job. The broker ranks candidates
-deterministically and resolves them in order — it never accepts the first URL
+Each acquisition is a tracked job. `papio` ranks the possible sources by a fixed
+set of rules and tries them in order — it never accepts the first URL
 it finds:
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/architecture-dark.svg">
   <source media="(prefers-color-scheme: light)" srcset="docs/assets/architecture.svg">
-  <img alt="papio acquisition pipeline: you or an agent drive papio's durable, bounded jobs; open-access and licensed APIs run before your own browser via the papio extension (installed once), where login, MFA, and CAPTCHA stay human; both paths converge in quarantine and PDF validation, producing an immutable bundle with provenance that reaches the Zotero library through zotio preview-then-apply" src="docs/assets/architecture.svg">
+  <img alt="papio acquisition pipeline: you or an agent drive papio's tracked jobs; open-access and licensed APIs run before your own browser via the papio extension (installed once), where login, MFA, and CAPTCHA stay human; both paths converge in quarantine and PDF validation, producing an immutable bundle with provenance that reaches the Zotero library through zotio preview-then-apply" src="docs/assets/architecture.svg">
 </picture>
 
-| Plane | Backend | Handles credentials? |
+| Stage | Source / tooling | Handles credentials? |
 |---|---|---|
-| **Discovery** | OpenAlex (read-only, bounded) | No |
-| **Fetch — open** | arXiv · Europe PMC · Unpaywall · OpenAlex · CORE · Crossref TDM | No (API keys only where configured) |
-| **Fetch — institutional** | OpenURL handoff in your ordinary browser session | No — login/MFA/CAPTCHA stay human |
-| **Validation** | Local PDF structure + identity + bounded OCR (Poppler, Tesseract) | No |
+| **Discovery** | OpenAlex (read-only) | No |
+| **Download — open** | arXiv · Europe PMC · Unpaywall · OpenAlex · CORE · Crossref TDM | No (API keys only where configured) |
+| **Download — institutional** | OpenURL handoff in your ordinary browser session | No — login/2FA/CAPTCHA stay human |
+| **Validation** | Local PDF structure + identity + OCR (Poppler, Tesseract) | No |
 | **Zotero writes** | `zotio` — preview (`plan`) then confirmed `apply` | No — `papio` never stores Zotero credentials |
 
 `papio` runs in one of three access modes — `conservative`, `assisted`, or
@@ -126,14 +126,14 @@ inside legitimate, user-authorized access
 ## The research loop
 
 Discover, acquire in bulk, watch progress, review the exceptions — then let
-the artifacts flow into Zotero:
+the finished PDFs flow into Zotero:
 
 ```bash
-# 1. Discover — bounded, read-only; marks works already in your Zotio library
+# 1. Discover — read-only; marks works already in your zotio library
 papio search "trust in AI advice" --limit 20 --year-from 2022
 papio search --cites 10.1002/mar.21498          # citation snowball: who cites this paper?
 
-# 2. Acquire — one work or a capped batch of durable jobs
+# 2. Acquire — one work or a capped batch of tracked jobs
 papio acquire 10.1016/j.chb.2020.106607 --auto-import --wait
 papio acquire arXiv:2401.00001 --desired-version published
 
@@ -149,18 +149,18 @@ papio doctor                          # whole-chain readiness when something loo
 papio watch add "appropriate reliance on AI" --cadence weekly
 ```
 
-A browser handoff is a first-class job state, not a failure: the job parks as
-`awaiting_human`, `papio actions list` names it, and one warm SSO pass in your
+A browser handoff is a normal job state, not a failure: the job parks as
+`awaiting_human`, `papio actions list` names it, and one sign-in pass in your
 own browser lets the extension finish the download — validated, filed, and
-imported like any other artifact
+imported like any other PDF
 ([browser handoff](https://orgmentem.github.io/papio/concepts/browser-handoff/)).
 
 ---
 
-## Validated, provenance-tracked artifacts
+## Validated, provenance-tracked PDFs
 
 No PDF is trusted because a server returned `200 OK`. Every candidate is
-quarantined and must pass three gates before it becomes an artifact
+quarantined and must pass three gates before it becomes a trusted PDF
 ([validation & provenance](https://orgmentem.github.io/papio/concepts/validation-and-provenance/)):
 
 - **Structure** — it is a real, parseable PDF, not an HTML error page with a
@@ -168,12 +168,12 @@ quarantined and must pass three gates before it becomes an artifact
 - **Identity** — the document's own metadata and text match the requested work;
   ambiguity parks the job in `needs_review` with the quarantine path exposed
   for human inspection (`papio actions list` → accept/reject).
-- **Text** — a bounded OCR fallback (Tesseract) guarantees the artifact is
+- **Text** — an OCR fallback (Tesseract) makes the PDF
   searchable before import.
 
-What survives is an **immutable, content-addressed acquisition bundle**:
-the validated PDF plus a provenance record of where it came from, how it was
-fetched, and every gate it passed — exportable with `papio bundle`, inspectable
+What survives is a **permanent acquisition bundle**:
+the validated PDF plus a record of where it came from, how it was
+fetched, and every check it passed — exportable with `papio bundle`, inspectable
 with `papio artifacts`.
 
 ---
@@ -181,11 +181,11 @@ with `papio artifacts`.
 ## Zotero writes only through zotio
 
 `papio` acquires; [zotio](https://github.com/OrgMentem/zotio) imports. The
-boundary is explicit and cryptographic:
+handoff is explicit and verifiable:
 
 ```bash
-papio zotio plan <job-id>       # immutable mutation preview + confirmation SHA-256
-papio zotio apply <plan-id> --confirm-sha256 <sha256>   # applies exactly that preview, idempotently
+papio zotio plan <job-id>       # preview of the exact changes + a confirmation code
+papio zotio apply <plan-id> --confirm-sha256 <sha256>   # applies exactly that preview; safe to repeat
 ```
 
 `--auto-import` on `acquire` routes through the same plan/apply machinery.
@@ -200,8 +200,8 @@ you can import however you like.
 ([MCP agent guide](https://orgmentem.github.io/papio/guide/agent-skill/)):
 
 - **`--json`** on any command for structured output.
-- **`papio mcp`** serves an MCP stdio server with the same configuration,
-  daemon, durable jobs, and Zotio boundary as the CLI.
+- **`papio mcp`** serves an MCP server with the same configuration,
+  background service, tracked jobs, and zotio boundary as the CLI.
 - **A command facade** derived from the CLI, so agents reach the whole tool
   surface through two tools without a parallel layer that can drift:
   `papio_command_search` to discover commands and `papio_command_run` to
@@ -209,9 +209,9 @@ you can import however you like.
   `papio_<command>` tool apiece instead
   ([full reference](https://orgmentem.github.io/papio/reference/mcp-tools/)).
 - **Two composite tools** with no single-command equivalent — `papio_acquire_batch`
-  (bulk work input) and `papio_batch_wait` (bounded polling).
+  (bulk work input) and `papio_batch_wait` (polls until settled or timeout).
 - **Read resources** — `papio://jobs`, `papio://artifacts`, `papio://bundles`,
-  `papio://zotio/plans`, `papio://exports` — expose recent durable state
+  `papio://zotio/plans`, `papio://exports` — expose recent saved state
   without creating jobs or mutating anything.
 - **One writer.** `papio_command_run` with `zotio apply` is the only path that
   writes to Zotero, and it demands the exact confirmation SHA-256 from
@@ -279,14 +279,14 @@ papio doctor
 ## Health check & troubleshooting
 
 ```bash
-papio doctor        # sources, PDF tooling, daemon, extension, native host, Zotio boundary
+papio doctor        # sources, PDF tools, background service, extension, connector, zotio
 ```
 
 - **Extension shows disconnected** — reload it in the browser after upgrades;
-  `papio doctor` reports daemon/extension version skew explicitly.
+  `papio doctor` reports version mismatches between the background service and extension.
 - **Job stuck in `awaiting_human`** — `papio actions list` names the browser
   pass or identity review it is waiting for.
-- **Zotio errors** — the boundary reports stable error classes; see the
+- **zotio errors** — the boundary reports stable error classes; see the
   [troubleshooting guide](https://orgmentem.github.io/papio/guide/troubleshooting/).
 
 ---

@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1200" height="560" viewBox="0 0 1200 560" role="img" aria-labelledby="title description">
   <title id="title">Acquisition pipeline</title>
-  <desc id="description">You or an agent asks papio to queue a durable, bounded job. papio tries open sources first — arXiv, Unpaywall, PMC, and licensed APIs — or hands the request to your own browser via the papio extension (installed once, manually), where login, MFA, and CAPTCHA stay human. The paths converge, then the PDF is quarantined and validated as the right paper, a real PDF, and searchable, packaged as a validated bundle recording where it came from, previewed and applied through zotio, and added to the Zotero library.</desc>
+  <desc id="description">You or an agent asks papio to queue a tracked job. papio tries open sources first — arXiv, Unpaywall, PMC, and licensed APIs — or hands the request to your own browser via the papio extension (installed once, manually), where login, MFA, and CAPTCHA stay human. The paths converge, then the PDF is quarantined and validated as the right paper, a real PDF, and searchable, packaged as a validated bundle recording where it came from, previewed and applied through zotio, and added to the Zotero library.</desc>
   <defs>
     <marker id="arrow-navy" viewBox="0 0 14 14" refX="14" refY="7" markerWidth="14" markerHeight="14" markerUnits="userSpaceOnUse" orient="auto">
       <path class="arrow-ink" d="M 0 0 L 14 7 L 0 14 Z"/>
@@ -42,11 +42,11 @@
       <text class="node-label" x="140" y="201" dominant-baseline="middle">You or an agent</text>
     </g>
 
-    <g aria-label="papio — queues durable, bounded jobs">
+    <g aria-label="papio — queues tracked jobs">
       <rect class="node" x="330" y="160" width="270" height="80" rx="12"/>
       <text class="node-label" x="465" y="196">
         <tspan x="465" y="196" font-style="italic">papio</tspan>
-        <tspan class="node-sub" x="465" y="219">queues durable, bounded jobs</tspan>
+        <tspan class="node-sub" x="465" y="219">queues tracked jobs</tspan>
       </text>
     </g>
 

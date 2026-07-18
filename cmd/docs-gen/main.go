@@ -348,8 +348,8 @@ func llmsDesc(body string) string {
 func renderLLMSIndex(pages []llmsPage) string {
 	var b strings.Builder
 	b.WriteString("# papio\n\n")
-	b.WriteString("> A local paper-acquisition broker — searches scholarly works, creates bounded acquisition jobs, validates candidate PDFs, and hands ready artifacts to Zotero through Zotio.\n\n")
-	b.WriteString("For AI agents: papio is a local, safety-bounded paper-acquisition broker. Fastest path:\n")
+	b.WriteString("> A local paper-acquisition broker — searches scholarly works, creates acquisition jobs, validates candidate PDFs, and hands ready artifacts to Zotero through zotio.\n\n")
+	b.WriteString("For AI agents: papio is a local paper-acquisition broker. Fastest path:\n")
 	b.WriteString("1. Install: build `./cmd/papio` (see [Getting started](" + llmsSiteURL + "guide/getting-started/)); install Poppler and Tesseract for PDF validation.\n")
 	b.WriteString("2. Initialize the local profile with `papio init`.\n")
 	b.WriteString("3. For MCP hosts, run `papio mcp`; its tools are `papio_*` (see [MCP tools](" + llmsSiteURL + "reference/mcp-tools/)).\n")

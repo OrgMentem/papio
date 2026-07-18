@@ -45,7 +45,7 @@ func newWatchAddCommand(opt *options) *cobra.Command {
 	}
 	flags := command.Flags()
 	flags.StringVar(&label, "label", "", "human label (defaults to query)")
-	flags.StringVar(&collection, "collection", "", "Zotio collection for queued papers")
+	flags.StringVar(&collection, "collection", "", "zotio collection for queued papers")
 	flags.StringVar(&cadence, "cadence", "daily", "daily, weekly, or Nh")
 	flags.IntVar(&perRunCap, "limit-per-run", watch.DefaultPerRunCap, "maximum new papers queued per run (1-50)")
 	flags.IntVar(&yearFrom, "year-from", 0, "minimum publication year")

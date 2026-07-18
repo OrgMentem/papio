@@ -4,7 +4,7 @@
 
 ## Go core, TypeScript browser plane
 
-**Context:** The durable workload is local orchestration and state: bounded HTTP and subprocesses, SQLite, deterministic transitions, hashing, atomic files, CLI/MCP, and release packaging. An ordinary cross-platform Chrome extension is JavaScript regardless of the core language.
+**Context:** The durable workload is local orchestration and state: resource-limited HTTP and subprocess calls, SQLite, deterministic transitions, hashing, atomic files, CLI/MCP, and release packaging. An ordinary cross-platform Chrome extension is JavaScript regardless of the core language.
 
 **Decision:** Keep the daemon, CLI, native-messaging host, policy, queue, provenance, validation, and zotio integration in Go. Keep the Manifest V3 extension and provider DOM adapters in TypeScript. Each language stays on its side of the process boundary.
 
@@ -16,9 +16,9 @@
 
 **Decision:** Use an ordinary user-authenticated browser through the extension and native host. Do not use CDP, headless Chrome, stealth patches, copied cookies, or anti-bot evasion for publisher access.
 
-**Why:** The browser handoff preserves the user's control and keeps protected-site access inside legitimate, user-authorized sessions. The extension reports bounded outcomes to the daemon; it does not turn browser automation into a credential or evasion channel. See [Browser handoff](../concepts/browser-handoff.md).
+**Why:** The browser handoff preserves the user's control and keeps protected-site access inside legitimate, user-authorized sessions. The extension reports narrow, metadata-only outcomes to the daemon; it does not turn browser automation into a credential or evasion channel. See [Browser handoff](../concepts/browser-handoff.md).
 
-## Zotio is the Zotero boundary
+## zotio is the Zotero boundary
 
 **Context:** Zotero metadata creation, deduplication, attachments, and mutation plans already belong to zotio.
 
@@ -32,7 +32,7 @@
 
 **Decision:** Require an explicit access-mode choice; never silently enable automation. `conservative`, `assisted`, and `maximal` define the allowed behavior, and licensed/TDM adapters remain separately enabled capabilities.
 
-**Why:** Maximal automation is still bounded by legitimate, user-authorized access: login, MFA, CAPTCHA, and publisher/library terms remain human actions. Unknown or changed provider UI falls back to assisted behavior rather than guessing. See [Access modes](../concepts/access-modes.md).
+**Why:** Maximal automation is still limited to legitimate, user-authorized access: login, MFA, CAPTCHA, and publisher/library terms remain human actions. Unknown or changed provider UI falls back to assisted behavior rather than guessing. See [Access modes](../concepts/access-modes.md).
 
 ## Daemon-owned durable state
 
@@ -40,7 +40,7 @@
 
 **Decision:** The single-user Go daemon owns the SQLite write connection and all state transitions. The MV3 extension is restartable and disposable; it keeps only minimal tab/job correlation and reconnects for authoritative state.
 
-**Why:** A durable daemon can snapshot policy into jobs, schedule bounded work, validate artifacts, and retain redacted event history independently of browser lifecycle or provider UI drift. The native host forwards bounded messages but does not own the queue or persist browser state.
+**Why:** A durable daemon can snapshot policy into jobs, schedule capped work, validate artifacts, and retain redacted event history independently of browser lifecycle or provider UI drift. The native host forwards size-limited messages but does not own the queue or persist browser state.
 
 ## Reversal triggers
 

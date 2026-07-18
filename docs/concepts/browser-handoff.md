@@ -7,43 +7,40 @@ institutional OpenURL availability without opening a handoff.
 
 ## One ordinary browser, not browser automation
 
-*papio* uses the browser the user already uses for institutional access. A
-Manifest V3 extension opens broker-owned tabs and connects through a local
-native-messaging host to the Go daemon using `papio-browser/1`. The daemon
-remains authoritative for jobs and state; the native host forwards bounded
-messages and does not own the queue or persist browser state.
+*papio* uses the browser you already use for institutional access. A browser
+extension opens its own tabs and connects to *papio* through a small local
+connector. *papio* stays in charge of jobs and state; the connector only passes
+short messages and never owns the queue or stores browser data.
 
-This is a no-CDP design. *papio* does not launch a separate profile, hidden
-backend browser, headless browser, or a CDP-controlled browser, and it does not
-copy cookies or automate sign-in. The ordinary-browser posture keeps
-`navigator.webdriver` false. CDP-driven publisher trials triggered Cloudflare
-loops; the extension instead relies on the user's real, human-authenticated
-session.
+*papio* never uses an automated or hidden browser. It does not launch a separate
+browser, run one in the background, copy your cookies, or fill in sign-in forms.
+Because everything happens in your ordinary browser, publisher sites see a normal
+person, not a robot — automated browsers trip anti-bot checks and get blocked.
+*papio* relies on your real, signed-in session instead.
 
 ```mermaid
 flowchart LR
-    D["Go daemon<br/>authoritative jobs"] <-->|"bounded metadata (papio-browser/1)"| H[Native host]
-    H <-->|native messaging| E[MV3 extension]
-    E --> B["User's ordinary browser<br/>broker-owned tabs"]
-    B --> I["Institutional resolver<br/>and provider"]
-    E --> A["Adoption root<br/>job download"]
+    D["papio<br/>background service"] <-->|"metadata only"| H[Local connector]
+    H <-->|local link| E[Browser extension]
+    E --> B["Your ordinary browser<br/>papio's own tabs"]
+    B --> I["Library resolver<br/>and publisher"]
+    E --> A["Download folder<br/>per job"]
     A --> D
 ```
 
-The extension tags and tracks only broker-owned tabs. It runs provider adapters
-only on hosts the user grants, detects a return from an identity provider
-without recording the IdP URL or title, correlates a job download, and closes
-only broker-owned tabs when a job completes or is cancelled. Its service worker
-can restart; it retains only minimal tab/job correlation and re-requests the
-daemon's authoritative state.
+The extension tracks only its own tabs. It runs provider-specific code only on
+sites you grant, notices when you return from your institution's login page
+without recording that page's address or title, matches up the job's download,
+and closes only its own tabs when a job finishes or is cancelled. The extension
+can restart at any time; it keeps only a minimal tab-to-job mapping and asks
+*papio* for the authoritative state.
 
-## Headless-most work window
+## An out-of-the-way work window
 
-“Headless” here means *out of the way*, not a headless browser. *papio* keeps
-broker tabs in one dedicated browser work window, created minimized and
-unfocused. The window is reused for later offers and recreated if the user
-closes it, so ordinary tabs do not receive a succession of resolver and
-provider pages.
+This window is *out of the way*, not a hidden browser. *papio* keeps its tabs in
+one dedicated window, opened minimized and unfocused. It is reused for later
+handoffs and reopened if you close it, so your ordinary tabs are not flooded with
+login and publisher pages.
 
 The extension surfaces the exact work tab only when a human decision is needed:
 
@@ -51,22 +48,21 @@ The extension surfaces the exact work tab only when a human decision is needed:
 - publisher terms requiring a decision; or
 - identity review.
 
-After that step, the work window can recede and the broker continues its
-bounded work. This preserves the one-login-per-research-session model without
+After that step, the work window can slip back out of the way and *papio* continues
+its work. This preserves the one-login-per-research-session model without
 asking *papio* to handle passwords, MFA, CAPTCHA tokens, or publisher
 credentials.
 
 ## Chrome and Firefox
 
-The browser protocol is shared across Chrome and Firefox. *papio* installs a
-native-host manifest for each browser, and the native host validates each
-caller exactly: Chrome supplies the configured extension origin; Firefox
-supplies the configured Gecko add-on ID. An empty browser extension ID disables
-that browser's bridge independently.
+The extension works the same way in Chrome and Firefox. *papio* installs a
+connector for each browser, and the connector checks each caller: Chrome
+supplies the configured extension ID; Firefox supplies the configured add-on ID.
+Leaving a browser's extension ID empty turns off that browser's connection.
 
 Firefox is a day-one target. Its built add-on ID is fixed as
-`papio@orgmentem.com`; the Firefox native-host manifest uses
-`allowed_extensions` for that ID. Firefox treats host access as runtime opt-in,
+`papio@orgmentem.com`; the Firefox connector is set to allow that ID. Firefox
+treats host access as opt-in at runtime,
 so the extension options page includes a resolver-access grant alongside the
 per-provider grants.
 
@@ -76,8 +72,8 @@ per-provider grants.
 
 | Key | Purpose |
 | --- | --- |
-| `extension_id` | Chrome extension ID allowed to use the native host; empty disables the Chrome bridge. |
-| `firefox_extension_id` | Firefox add-on ID allowed to use the native host; empty disables the Firefox bridge. |
+| `extension_id` | Chrome extension ID allowed to use the connector; empty disables the Chrome bridge. |
+| `firefox_extension_id` | Firefox add-on ID allowed to use the connector; empty disables the Firefox bridge. |
 | `openurl_base_url` | Default institution's HTTPS OpenURL resolver base. |
 | `shibboleth_entity_id` | Optional default IdP entity ID for skipping a provider's WAYF selector. |
 | `proquest_account_id` | Optional default ProQuest account ID for the `accountid` append. |
@@ -100,9 +96,9 @@ per source through the extension UI. *papio* does not request `<all_urls>`,
 `cookies`, or `debugger`; it does not request access to identity-provider hosts.
 Selecting maximal mode does not grant a browser permission.
 
-Native messaging carries metadata only, within *papio*'s bounded message size.
-PDF bytes, cookies, credentials, raw browser DOM, screenshots, and secret- or
-signed-URL values never cross that boundary. For a selected download, the
+The link to the browser carries metadata only, within *papio*'s fixed message-size limit.
+PDF bytes, cookies, credentials, page contents, screenshots, and secret- or
+signed-URL values never cross that link. For a selected download, the
 extension reports metadata such as the download item and final filename; the
 file itself lands under `<download_adoption_root>/<job_id>/` for adoption and
 validation. See [Configuration reference](../reference/config-reference.md)
@@ -112,8 +108,8 @@ for `download_adoption_root` and the effective default.
 
 The default `[browser]` institution can provide an `openurl_base_url` plus
 optional `shibboleth_entity_id` and `proquest_account_id`. The entity ID lets a
-provider login route directly to the institution's IdP rather than stopping at
-a WAYF selector. A ProQuest account ID causes *papio* to append `?accountid=` to
+provider's login jump straight to your institution's sign-in page instead of
+stopping at a “Where are you from?” chooser. A ProQuest account ID causes *papio* to append `?accountid=` to
 the resolver link, which can unlock the institution's ProQuest route.
 
 For multiple libraries, define `[browser.resolvers.<name>]` profiles. Every

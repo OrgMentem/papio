@@ -1,8 +1,8 @@
 # Getting started
 
-*papio* is a local paper-acquisition broker. It creates bounded acquisition jobs,
-validates candidate PDFs, and sends ready artifacts to Zotio only through its
-preview-and-confirmation boundary.
+*papio* finds scholarly papers, checks each PDF is the paper you asked for, and
+hands finished PDFs to your Zotero library through `zotio` — which always shows
+you a preview before it writes anything.
 
 ## 1. Prerequisites
 
@@ -20,7 +20,7 @@ brew install poppler tesseract
 ```
 
 Install Chrome or Firefox to use the browser extension. Install `zotio` and
-make it available on `PATH` only when you want *papio* to import ready artifacts
+make it available on `PATH` only when you want *papio* to import finished PDFs
 into Zotero.
 
 ## 2. Initialize the local profile
@@ -31,12 +31,11 @@ Run the guided first-run setup:
 papio init
 ```
 
-`papio init` writes validated configuration, creates the data directory and
-applies database migrations, checks the Zotio executable, installs the native
-messaging host, and asks: “Check for *papio* and zotio updates once a day? Queries
-GitHub releases only; nothing else is sent. [Y/n]” It defaults to yes and then
-runs `doctor`. It is idempotent, so rerunning it updates setup without creating
-a separate profile.
+`papio init` writes your configuration, creates the data folder and its database,
+checks the `zotio` program, installs the browser connector, and asks: “Check for
+*papio* and zotio updates once a day? Queries GitHub releases only; nothing else
+is sent. [Y/n]” It defaults to yes and then runs `doctor`. You can run it again
+safely — it updates your setup without creating a second profile.
 
 The interactive setup asks for:
 
@@ -53,7 +52,7 @@ The interactive setup asks for:
    account ID from the URL.
 
 For an unattended setup, `--non-interactive` retains existing values unless a
-flag overrides them. Use `--skip-browser` to omit Chrome/Firefox and native-host
+flag overrides them. Use `--skip-browser` to omit Chrome/Firefox and browser-connector
 setup:
 
 ```sh
@@ -65,16 +64,16 @@ These flags set the corresponding setup values:
 | Flag | Value |
 | --- | --- |
 | `--email` | Contact email for polite API pools. |
-| `--zotio-path` | Zotio executable path. |
+| `--zotio-path` | zotio executable path. |
 | `--attachment-mode` | `stored` or `linked-file`. |
 | `--openurl-base` | Institution OpenURL resolver base URL. |
 | `--shibboleth-entity-id` | Shibboleth IdP entityID for federated login-routing. |
 | `--proquest-account-id` | A ProQuest account ID or URL containing `accountid=`. |
-| `--extension-id` | Chrome extension ID permitted to reach the native host. |
-| `--firefox-extension-id` | Firefox add-on ID permitted to reach the native host. |
+| `--extension-id` | Chrome extension ID permitted to reach the connector. |
+| `--firefox-extension-id` | Firefox add-on ID permitted to reach the connector. |
 | `--check-updates` | Allow a once-daily GitHub releases check for new *papio* and zotio versions (default `true`). |
 | `--non-interactive` | Do not prompt; retain existing values unless a flag overrides them. |
-| `--skip-browser` | Skip Chrome extension and native-host setup. |
+| `--skip-browser` | Skip Chrome extension and connector setup. |
 
 ## 3. Load the extension
 
@@ -112,8 +111,8 @@ Run the health check after setup, especially after changing configuration:
 papio doctor
 ```
 
-It checks core readiness plus the local integration chain: configuration, daemon
-and extension connectivity, native-host manifests, and Zotio.
+It checks papio itself plus the pieces it depends on: your configuration, the
+background service and browser extension, the connector, and zotio.
 
 ## 5. Acquire a first paper
 

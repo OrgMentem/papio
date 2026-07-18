@@ -3,7 +3,7 @@
 *papio* separates discovery and acquisition policy from institutional access. Every
 acquisition starts with open-access and enabled licensed API sources; browser
 handoff is only considered when those sources do not produce an acceptable
-artifact. See [Browser handoff](../concepts/browser-handoff.md) for the browser-side flow.
+PDF. See [Browser handoff](../concepts/browser-handoff.md) for the browser-side flow.
 
 `access_mode` is a required first-run choice. A fresh guided `papio init` selects
 `conservative`; *papio* never silently selects an automation mode. See the
@@ -23,9 +23,9 @@ budgets, and allowed uses; `maximal` does not grant them permission.
 
 ## Safety contract
 
-Institutional access is bounded to one explicit work request per
+Institutional access covers one explicit work request per
 subscription-provider job. *papio* does not crawl a subscription database or a
-journal issue; only OA and API sources may process bounded batches.
+journal issue; only OA and API sources process batches, and each batch is capped.
 
 !!! warning "Never automate around access controls"
 
@@ -43,22 +43,22 @@ journal issue; only OA and API sources may process bounded batches.
   optional host permissions; *papio* never requests `<all_urls>`. A user gesture in
   the extension UI grants a permission, and revoking it immediately returns that
   source to assisted behavior.
-- **The daemon decides.** Core policy is authoritative; browser messages report
-  observations and outcomes but cannot authorize a disallowed source or state
-  transition. Durable job state lives in the daemon's SQLite database, not in the
+- **papio decides, not the browser.** papio's own policy is authoritative; the
+  browser reports what it sees and does, but cannot authorize a disallowed source
+  or step. Saved job state lives in papio's local database, not in the
   restartable, disposable extension.
 - **Uncertainty stops automation.** Unknown provider, page, or protocol states
   fail closed to `action_required` or `needs_review`; *papio* does not use a generic
   "click the likely download button" fallback.
-- **Native messaging carries neither files nor secrets.** The browser downloads
-  into the configured adoption root's job subdirectory, and the host reports only
-  metadata and a path. The daemon rejects paths outside that root. Persisted URLs
+- **The link to the browser carries neither files nor secrets.** The browser downloads
+  into the folder papio set aside for that job, and the connector reports only a short
+  description and a path. papio rejects paths outside that folder. Persisted URLs
   are redacted; signed query values, cookies, API keys, credential fields, and
   page bodies are not logged.
-- **Ready means verified.** Before Zotio sees an artifact, *papio* makes it
-  immutable and content-addressed, structurally validates and identity-checks it,
-  hashes it, and links provenance. `access_basis` and `reuse_license` remain
+- **Ready means verified.** Before zotio sees a file, *papio* makes it permanent,
+  checks its structure and identity, records its content hash, and links its
+  provenance. `access_basis` and `reuse_license` remain
   separate: downloadable does not imply an open license or redistribution right.
-- **Zotio is the sole Zotero mutation boundary.** *papio* hands curated artifacts to
-  Zotio rather than mutating Zotero directly; other components never receive
+- **zotio is the only path that writes to Zotero.** *papio* hands finished files to
+  zotio rather than writing to Zotero directly; nothing else receives
   acquisition state.

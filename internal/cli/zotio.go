@@ -12,11 +12,11 @@ import (
 func newZotioCommand(opt *options) *cobra.Command {
 	command := &cobra.Command{
 		Use:   "zotio",
-		Short: "Preview and apply Zotero integration through Zotio",
+		Short: "Preview and apply Zotero integration through zotio",
 	}
 	preflight := &cobra.Command{
 		Use:   "preflight",
-		Short: "Verify the configured Zotio version and capabilities",
+		Short: "Verify the configured zotio version and capabilities",
 		Annotations: map[string]string{"mcp:read-only": "true"},
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
@@ -29,7 +29,7 @@ func newZotioCommand(opt *options) *cobra.Command {
 	}
 	plan := &cobra.Command{
 		Use:   "plan <job-id> [job-id...]",
-		Short: "Export ready jobs and preview exact Zotio mutations",
+		Short: "Export ready jobs and preview exact zotio mutations",
 		Args:  cobra.RangeArgs(1, 50),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			var result struct {
@@ -52,7 +52,7 @@ func newZotioCommand(opt *options) *cobra.Command {
 	var confirmation string
 	apply := &cobra.Command{
 		Use:   "apply <plan-id>",
-		Short: "Apply one immutable Zotio plan after SHA-256 confirmation",
+		Short: "Apply one immutable zotio plan after SHA-256 confirmation",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			var result zotio.ApplyResult

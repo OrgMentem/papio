@@ -21,8 +21,8 @@ jobs, export bundles, or mutate Zotero.
 | `papio://jobs` | Up to 100 recent durable acquisition jobs. |
 | `papio://artifacts` | Up to 100 recent validated, content-addressed PDF artifacts. |
 | `papio://bundles` | Up to 100 bundle export records. |
-| `papio://zotio/plans` | Up to 100 immutable Zotio preview records. |
-| `papio://exports` | Up to 100 bundle, Zotio-plan, and Zotio-apply ledger records. |
+| `papio://zotio/plans` | Up to 100 immutable zotio preview records. |
+| `papio://exports` | Up to 100 bundle, zotio-plan, and zotio-apply ledger records. |
 
 ## Command facade (default)
 
@@ -31,10 +31,10 @@ The default command surface contains these two tools:
 | Tool | Parameters | Result and boundary |
 | --- | --- | --- |
 | `papio_command_search` | `query` (optional case-insensitive substring match over command names and summaries); `name` (optional exact, space-separated command path, such as `"zotio apply"`) | Returns JSON. Omit both parameters to list every runnable command. Supplying `name` returns that command's summary, `read_only`, `takes_args`, and command-local `flags` (each flag's name, type, default, and description). |
-| `papio_command_run` | `name` (required exact, space-separated command path, such as `"status"` or `"zotio apply"`); `flags` (optional object of command-local flags by name); `args` (optional string of positional arguments only) | Executes the command in-process against the same daemon, jobs, and Zotio boundary as the CLI, and returns JSON. The server injects `--json`. Raw flag tokens in `args` are rejected. Inherited global `--config` and `--json` flags are never exposed and are rejected. |
+| `papio_command_run` | `name` (required exact, space-separated command path, such as `"status"` or `"zotio apply"`); `flags` (optional object of command-local flags by name); `args` (optional string of positional arguments only) | Executes the command in-process against the same daemon, jobs, and zotio boundary as the CLI, and returns JSON. The server injects `--json`. Raw flag tokens in `args` are rejected. Inherited global `--config` and `--json` flags are never exposed and are rejected. |
 
-For example, applying a Zotio plan uses the command facade rather than a
-standalone Zotio tool:
+For example, applying a zotio plan uses the command facade rather than a
+standalone zotio tool:
 
 ```json
 {

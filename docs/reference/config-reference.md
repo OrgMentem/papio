@@ -28,9 +28,9 @@ with `~/` are expanded when Papio loads them.
 
 | Key | Type | Default | Effect and constraints |
 | --- | --- | --- | --- |
-| `ocr_enabled` | boolean | `true` | Enables the bounded OCR fallback. If it is enabled, doctor requires both `pdftoppm` and `tesseract`; disabling it makes image-only papers require review. |
+| `ocr_enabled` | boolean | `true` | Enables the OCR fallback. If it is enabled, doctor requires both `pdftoppm` and `tesseract`; disabling it makes image-only papers require review. |
 | `min_text_chars` | integer | `400` | Minimum extracted-text threshold used by PDF validation before OCR fallback is relevant. |
-| `max_ocr_pages` | integer | `4` | Maximum pages processed by the bounded OCR fallback. |
+| `max_ocr_pages` | integer | `4` | Maximum pages processed by the OCR fallback. |
 | `title_match_threshold` | number | `0.6` | PDF title-match threshold. It must be greater than 0 and no greater than 1. |
 
 ## `[browser]`
@@ -90,13 +90,13 @@ custom resolver origin stays in assisted mode.
 
 | Key | Type | Default | Effect and constraints |
 | --- | --- | --- | --- |
-| `executable` | path or command string | `zotio` | Zotio executable Papio invokes at the Zotero boundary. It must not be empty. |
-| `timeout_seconds` | integer seconds | `120` | Zotio command deadline. It must be between 5 and 600 seconds inclusive. |
-| `attachment_mode` | string | `stored` | Zotio attachment mode. Allowed values are `stored` and `linked-file`. |
-| `auto_import` | boolean | `false` | Default acquisition policy for automatic Zotio plan-and-apply after a job is ready. An `acquire --auto-import` request can opt in per job. |
-| `auto_enrich` | boolean | `true` | After the first applied auto-import, enables the conservative scoped Zotio enrichment of missing DOI and abstract fields for the imported parent. |
+| `executable` | path or command string | `zotio` | zotio executable Papio invokes at the Zotero boundary. It must not be empty. |
+| `timeout_seconds` | integer seconds | `120` | zotio command deadline. It must be between 5 and 600 seconds inclusive. |
+| `attachment_mode` | string | `stored` | zotio attachment mode. Allowed values are `stored` and `linked-file`. |
+| `auto_import` | boolean | `false` | Default acquisition policy for automatic zotio plan-and-apply after a job is ready. An `acquire --auto-import` request can opt in per job. |
+| `auto_enrich` | boolean | `true` | After the first applied auto-import, enables the conservative scoped zotio enrichment of missing DOI and abstract fields for the imported parent. |
 
-Papio invokes Zotio but does not read or store Zotero credentials. Manual
+Papio invokes zotio but does not read or store Zotero credentials. Manual
 mutation remains preview-first: `papio zotio plan` returns immutable plans and
 `papio zotio apply` requires the exact confirmation SHA-256.
 

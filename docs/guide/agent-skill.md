@@ -1,6 +1,6 @@
 # MCP agent guide
 
-Run *papio* as an MCP stdio server with:
+Run *papio* as an MCP server with:
 
 ```sh
 papio mcp
@@ -17,15 +17,15 @@ their command-local flags.
 
 ## Canonical acquisition loop
 
-Use the loop below for a research set. It separates discovery, durable
-acquisition, observation, identity review, and Zotero mutation.
+Use the loop below for a research set. It separates discovery, acquisition,
+observation, identity review, and Zotero writes.
 
-1. Use `papio_command_run` with `name="search"` and a bounded query as `args`
+1. Use `papio_command_run` with `name="search"` and a search query as `args`
    (or use `papio_acquire_batch` directly for already selected works).
-2. Create the persisted acquisition batch from selected works with
+2. Create the saved acquisition batch from selected works with
    `papio_acquire_batch`. It accepts 1–50 bare work objects or discovered-work
    envelopes and returns a `batch_id`.
-3. Once there is a persisted batch ID, call `papio_batch_wait` with a bounded
+3. Once there is a persisted batch ID, call `papio_batch_wait` with a
    timeout. It stops either when all work is settled, including human-review
    work, or when its timeout expires.
 4. Use `papio_command_run` with `name="batch report"` and the batch ID as
@@ -59,7 +59,7 @@ it is not permission to accept a merely plausible PDF. Use
 `flags: {"reject": true}` to record the opposite. The resolution surface does
 not apply to other human-action kinds.
 
-### Zotio writes require a separate confirmation
+### zotio writes require a separate confirmation
 
 `papio_command_run` with `name="zotio plan"` is a preview step. Inspect the
 returned plans and preserve the returned `confirmation_sha256` for each one.
@@ -70,7 +70,7 @@ recomputed digest, truncate it, or reuse one from a different plan. A
 confirmation mismatch is a safe failure; create and inspect a new preview.
 Only `papio_command_run` with `name="zotio apply"` can mutate Zotero.
 
-`auto_import` on acquisition is policy-driven daemon behavior. It does not make
+`auto_import` on acquisition is a policy setting papio applies automatically. It does not make
 acquisition a Zotero-write operation, and an auto-import failure remains
 reportable rather than changing the validated acquisition into a failed PDF.
 

@@ -1,9 +1,9 @@
 # User guide
 
-*papio* is a local paper-acquisition broker. It searches scholarly works, creates
-bounded acquisition jobs, validates candidate PDFs, and hands ready artifacts to
-Zotio only through a preview-and-confirmation boundary. It does not handle
-institution credentials, MFA, CAPTCHAs, or subscription crawling.
+*papio* finds scholarly papers, checks each PDF is the paper you asked for, and
+hands finished PDFs to your Zotero library through `zotio`, which always shows you
+a preview first. It does not handle institution logins, two-factor codes,
+CAPTCHAs, or bulk-downloading from subscription databases.
 
 Use [`config-reference.md`](../reference/config-reference.md) to change policy and
 [`troubleshooting.md`](troubleshooting.md) when a job needs attention.
@@ -16,11 +16,11 @@ Run the guided setup before any acquisition:
 papio init
 ```
 
-`papio init` writes validated configuration, creates the data directory and
-migrates its database, checks the Zotio executable, installs the native host
-unless browser setup is skipped, and runs `doctor`. It is idempotent. Its
-interactive prompts collect a contact email, Zotio path, attachment mode, and
-whether to install browser integration.
+`papio init` writes your configuration, creates the data folder and its database,
+checks the `zotio` program, installs the browser connector (unless you skip
+browser setup), and runs `doctor`. You can run it again safely. It asks for a
+contact email, the `zotio` path, an attachment mode, and whether to set up
+browser integration.
 
 For an unattended profile, retain existing values unless an option overrides
 them:
@@ -35,15 +35,15 @@ after any manual configuration change.
 
 ## 2. Discover a research set
 
-Start with a bounded OpenAlex search:
+Start with an OpenAlex search:
 
 ```sh
 papio search "appropriate reliance on AI" --limit 20 --year-from 2023
 ```
 
 `--oa-only` limits results to works marked open access. `--year-to` sets an
-upper publication-year bound. Search output marks a result already found in the
-local Zotio library as `[in library]`; JSON output exposes the same state as
+upper publication-year limit. Search output marks a result already found in the
+local zotio library as `[in library]`; JSON output exposes the same state as
 `owned` and, when available, `owned_item_key`.
 
 Use `--new-only` when you want the result set to omit library-owned works:
@@ -53,7 +53,7 @@ papio search "appropriate reliance on AI" --limit 20 --new-only --json
 ```
 
 Ownership filtering happens after OpenAlex applies `--limit`, so a `--new-only`
-search can return fewer rows than its limit. If Zotio ownership lookup is not
+search can return fewer rows than its limit. If zotio ownership lookup is not
 available, discovery continues with all results treated as unowned.
 
 ### Grow from a seed paper
@@ -74,25 +74,25 @@ OpenAlex-related papers.
 ## 3. Acquire the selected works as a batch
 
 Give `acquire --batch` a JSONL file of work records (or `-` for standard input).
-A batch is capped at 50 works and receives stable per-work request IDs, so
-rerunning the same input is idempotent.
+A batch holds up to 50 works, each with a stable ID, so running the same file
+again is safe and won't create duplicates.
 
 ```sh
 papio acquire --batch works.jsonl --auto-import \
   --collection "AI reading" --label "appropriate-reliance"
 ```
 
-`--auto-import` asks *papio* to plan and apply the Zotio import after a job becomes
+`--auto-import` asks *papio* to plan and apply the zotio import after a job becomes
 ready. It is non-fatal to acquisition: an import error remains visible in the
-batch report and can be retried through the normal Zotio preview flow.
+batch report and can be retried through the normal zotio preview flow.
 
-`--collection` carries the requested Zotio collection with each work; the
-collection is created on demand by Zotio and repeated imports are idempotent.
+`--collection` carries the requested zotio collection with each work; the
+collection is created on demand by zotio, and importing the same work again is safe.
 `--label` is batch query context for later reports. *papio* first classifies batch
-works against the Zotio mirror: works already owning a PDF are skipped, a known
+works against your zotio library: works already owning a PDF are skipped, a known
 item without a PDF is queued on its existing-item attachment route, and other
 works are acquired as new items. Add `--include-owned` only when a batch should
-also submit works that already carry a Zotio PDF.
+also submit works that already carry a zotio PDF.
 
 You can queue one work instead:
 
@@ -104,11 +104,11 @@ The one-work command also accepts `--doi`, `--pmid`, `--arxiv`, `--isbn`, or
 `--openalex`; title-based requests need `--title`, repeatable `--author`, and
 `--year`. Use `--desired-version` with `published`, `accepted`, `preprint`, or
 `any`, `--source` or `--deny-source` to constrain sources, and `--max-cost` to
-bound paid-source cost.
+cap paid-source cost.
 
 ## 4. Follow the work instead of guessing
 
-`status` groups durable jobs into working, awaiting-human, needs-review, ready,
+`status` groups your jobs into working, awaiting-human, needs-review, ready,
 and failed or unavailable phases:
 
 ```sh
@@ -142,27 +142,26 @@ sections. Use its Focus control only when authentication or a provider-owned
 decision is required. `papio actions open` always targets Chrome, where the
 extension and your institutional session live.
 
-The popup also reports daemon health: it shows a version line when healthy and
-actionable states when the daemon is unreachable or either side is out of date.
+The popup also reports the background service's health: it shows a version line
+when all is well, and clear warnings when the service is unreachable or the two sides are out of date.
 The toolbar badge shows `!` when attention is needed, and the options-page
-footer shows the extension and daemon versions together.
+footer shows the extension and background-service versions together.
 
-For institutional handoffs, *papio* first uses the selected resolver profile.
-A direct-link-enabled resolver goes straight to the provider. When Alma/Primo
-instead renders an online-services menu, the extension follows the
-institution-ranked first electronic-service link in the same broker-owned tab;
-you do not need to click **Available Online** or **View full text**. It never
-chooses physical-item, scan, interlibrary-loan, or publisher-terms actions.
-Those remain explicit human decisions. A custom resolver host outside the
-packaged extension permissions remains assisted.
+For institutional handoffs, *papio* uses your library's OpenURL resolver first.
+If it links straight to the provider, papio follows it. When Alma/Primo shows an
+online-services menu instead, the extension follows your library's top full-text
+link in papio's own tab; you do not need to click **Available Online** or **View
+full text**. It never chooses physical-item, scan, interlibrary-loan, or
+terms-acceptance options — those stay your decisions. If your library's resolver
+is on a domain the extension isn't preapproved for, that step stays assisted.
 
 Grant optional extension host permissions only for publisher sites you use.
-While nonterminal handoff jobs exist, the extension maintains one pinned, muted
-resolver tab and periodically reloads it to keep a research session warm. If an
-IdP redirect is detected, it pauses reloads, brings the tab forward, and marks a
-single re-authentication request. Sign in normally in that tab; after the return
-from the IdP, keepalive resumes. This is the one-login-per-research-session
-workflow recorded for the extension, not credential automation.
+While handoff jobs are still open, the extension keeps one pinned, muted tab and
+reloads it now and then to keep your session alive. If it detects that your
+institution's login page has taken over, it stops reloading, brings the tab
+forward, and flags a single sign-in request. Sign in normally there; once you're
+back, the extension resumes. This keeps you to one login per research session —
+it does not automate your credentials.
 
 ## 6. Read the batch outcome
 
@@ -181,7 +180,7 @@ skipped-owned, and in-progress.
 
 ## 7. Turn a successful search into a watchlist
 
-A watch repeats bounded discovery, ownership filtering, capped submission,
+A watch repeats discovery, ownership filtering, capped submission,
 auto-import policy, collection routing, and notifications on a schedule:
 
 ```sh
@@ -193,17 +192,17 @@ papio watch remove <watch-id>
 ```
 
 `--cadence` accepts `daily`, `weekly`, or `Nh`; `--limit-per-run` accepts 1
-through 50. `--year-from` and `--year-to` apply the same publication-year bounds
+through 50. `--year-from` and `--year-to` apply the same publication-year limits
 as search. Watch execution is serial, records its last result, and auto-disables
 a watch after five consecutive failures. Removing a watch does not remove jobs
 or Zotero items created by earlier runs.
 
 ## 8. Resolve identity reviews deliberately
 
-A PDF can be structurally valid yet park in `needs_review` when its semantic or
-identity evidence needs human confirmation. `papio actions list` shows the open
-`verify_identity` action and its local quarantine-file path. Inspect that local
-artifact before deciding:
+A PDF can be well-formed yet still land in `needs_review` when papio isn't sure
+it's the paper you asked for. `papio actions list` shows the open
+`verify_identity` action and the path to the quarantined file. Open that file and
+check it before deciding:
 
 ```sh
 papio actions resolve <action-id> --accept
@@ -211,10 +210,10 @@ papio actions resolve <action-id> --accept
 papio actions resolve <action-id> --reject
 ```
 
-`--accept` asserts that you inspected the quarantined PDF and verified it is the
-requested work. It requeues the parked candidate; the accepted artifact is
-recorded as `user_confirmed`, not as a machine identity pass. `--reject` records
-that the artifact is not the requested work and cancels the review. Resolution
+`--accept` states that you opened the quarantined PDF and confirmed it is the
+work you wanted. It requeues the candidate; the result is recorded as
+`user_confirmed`, not as an automatic match. `--reject` records that it is not
+the right work and cancels the review. Resolution
 applies only to an open `verify_identity` action; it does not waive explicit
 wrong-work, encrypted, or active-content rejection.
 
@@ -225,10 +224,10 @@ A batch report labels `awaiting_human` work with one of these reasons:
 | Reason | Meaning | Next action |
 | --- | --- | --- |
 | `institutional` | No direct candidate completed; an institutional OpenURL handoff is waiting. | Open the queue, sign in through ordinary Chrome if needed, and complete the allowed provider flow. |
-| `oa_browser` | An OA URL was handed to the browser after bounded broker fetching could not complete it. | Use the offered browser handoff; the browser may download through its existing cookie jar or present a page for you. |
+| `oa_browser` | An open-access URL was handed to the browser after papio's own download could not complete it. | Use the offered browser handoff; the browser may download through its existing cookie jar or present a page for you. |
 | `terms` | The extension observed terms acceptance is required. | Read and decide on the publisher's terms yourself; *papio* does not accept them for you. |
 
 `needs_review` is separate from these browser states: it is an identity decision
-on a quarantined local artifact. `openurl_available` is an advisory action in
+on a quarantined file. `openurl_available` is an advisory action in
 conservative mode; it records that institutional access exists but was not
 opened automatically.

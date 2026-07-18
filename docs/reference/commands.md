@@ -25,17 +25,17 @@ papio acquire [identifier] [flags]
 | `--access-mode` | `string` |  | per-request access-mode override |
 | `--arxiv` | `string` |  | arXiv ID |
 | `--author` | `stringSlice` | `[]` | author (repeatable) |
-| `--auto-import` | `bool` | `false` | plan and apply Zotio import automatically when ready |
+| `--auto-import` | `bool` | `false` | plan and apply zotio import automatically when ready |
 | `--batch` | `string` |  | submit JSONL works from a file or - for standard input |
 | `--collection` | `string` |  | target Zotero collection name (key when used with --from-zotio) |
 | `--deny-source` | `stringSlice` | `[]` | deny this source (repeatable) |
 | `--desired-version` | `string` | `any` | published, accepted, preprint, or any |
 | `--doi` | `string` |  | DOI |
-| `--from-zotio` | `bool` | `false` | queue Zotio items missing an attached PDF |
-| `--include-owned` | `bool` | `false` | with --batch, submit works already carrying a PDF in Zotio |
+| `--from-zotio` | `bool` | `false` | queue zotio items missing an attached PDF |
+| `--include-owned` | `bool` | `false` | with --batch, submit works already carrying a PDF in zotio |
 | `--isbn` | `string` |  | ISBN |
 | `--label` | `string` |  | batch query context; also the default target collection when --collection is unset |
-| `--limit` | `int` | `25` | maximum Zotio queue rows (1-500) |
+| `--limit` | `int` | `25` | maximum zotio queue rows (1-500) |
 | `--max-cost` | `float64` | `0` | maximum paid-source cost in USD |
 | `--openalex` | `string` |  | OpenAlex work ID |
 | `--pmid` | `string` |  | PubMed ID |
@@ -285,7 +285,7 @@ papio jobs retry <job-id>
 
 ## `papio mcp`
 
-Serve Papio tools and resources over MCP stdio
+Serve papio tools and resources over MCP stdio
 
 ```
 papio mcp
@@ -396,7 +396,7 @@ papio watch add <query> [flags]
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
 | `--cadence` | `string` | `daily` | daily, weekly, or Nh |
-| `--collection` | `string` |  | Zotio collection for queued papers |
+| `--collection` | `string` |  | zotio collection for queued papers |
 | `--label` | `string` |  | human label (defaults to query) |
 | `--limit-per-run` | `int` | `10` | maximum new papers queued per run (1-50) |
 | `--oa-only` | `bool` | `false` | return only open-access works |
@@ -429,7 +429,7 @@ papio watch run <id>
 
 ## `papio zotio`
 
-Preview and apply Zotero integration through Zotio
+Preview and apply Zotero integration through zotio
 
 ```
 papio zotio
@@ -437,7 +437,7 @@ papio zotio
 
 ### `papio zotio apply`
 
-Apply one immutable Zotio plan after SHA-256 confirmation
+Apply one immutable zotio plan after SHA-256 confirmation
 
 ```
 papio zotio apply <plan-id> [flags]
@@ -449,7 +449,7 @@ papio zotio apply <plan-id> [flags]
 
 ### `papio zotio plan`
 
-Export ready jobs and preview exact Zotio mutations
+Export ready jobs and preview exact zotio mutations
 
 ```
 papio zotio plan <job-id> [job-id...]
@@ -457,7 +457,7 @@ papio zotio plan <job-id> [job-id...]
 
 ### `papio zotio preflight`
 
-Verify the configured Zotio version and capabilities
+Verify the configured zotio version and capabilities
 
 ```
 papio zotio preflight

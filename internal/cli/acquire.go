@@ -148,12 +148,12 @@ func newAcquireCommand(opt *options) *cobra.Command {
 	flags.StringSliceVar(&allowSources, "source", nil, "allow only this source (repeatable)")
 	flags.StringSliceVar(&denySources, "deny-source", nil, "deny this source (repeatable)")
 	flags.BoolVar(&wait, "wait", false, "wait for a terminal or human-action state")
-	flags.BoolVar(&fromZotio, "from-zotio", false, "queue Zotio items missing an attached PDF")
-	flags.IntVar(&queueLimit, "limit", 25, "maximum Zotio queue rows (1-500)")
+	flags.BoolVar(&fromZotio, "from-zotio", false, "queue zotio items missing an attached PDF")
+	flags.IntVar(&queueLimit, "limit", 25, "maximum zotio queue rows (1-500)")
 	flags.StringVar(&batchPath, "batch", "", "submit JSONL works from a file or - for standard input")
-	flags.BoolVar(&includeOwned, "include-owned", false, "with --batch, submit works already carrying a PDF in Zotio")
+	flags.BoolVar(&includeOwned, "include-owned", false, "with --batch, submit works already carrying a PDF in zotio")
 	flags.StringVar(&label, "label", "", "batch query context; also the default target collection when --collection is unset")
-	flags.BoolVar(&autoImport, "auto-import", false, "plan and apply Zotio import automatically when ready")
+	flags.BoolVar(&autoImport, "auto-import", false, "plan and apply zotio import automatically when ready")
 	return command
 }
 
