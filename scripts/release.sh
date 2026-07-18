@@ -95,6 +95,14 @@ check_prerequisites() {
 read_release_metadata() {
   PAPIO_COMMIT=$(git -C "$PAPIO_ROOT" rev-parse HEAD)
   ZOTIO_COMMIT=$(git -C "$ZOTIO_ROOT" rev-parse HEAD)
+  # Stamp the bundled zotio with zotio's OWN version (its nearest tag), not
+  # papio's release version — the compat check compares this against papio's
+  # zotio floor, so it must reflect the real zotio being shipped.
+  ZOTIO_VERSION=${ZOTIO_VERSION:-$(git -C "$ZOTIO_ROOT" describe --tags 2>/dev/null | sed 's/^v//')}
+  if [[ -z "$ZOTIO_VERSION" ]]; then
+    printf 'could not determine zotio version (no tags in %s); set ZOTIO_VERSION\n' "$ZOTIO_ROOT" >&2
+    return 1
+  fi
   RELEASE_EPOCH=$(git -C "$PAPIO_ROOT" show -s --format=%ct HEAD)
   PAPIO_VERSION="$VERSION"
   EXTENSION_VERSION=$(python3 "$METADATA_HELPER" manifest-version \
@@ -120,7 +128,7 @@ build_zotio() {
   (
     cd "$ZOTIO_ROOT"
     CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -buildvcs=false \
-      -ldflags "-X zotio/internal/cli.version=$VERSION" \
+      -ldflags "-X zotio/internal/cli.version=$ZOTIO_VERSION" \
       -o "$OUTPUT_DIR/zotio-darwin-arm64" ./cmd/zotio
   )
 }

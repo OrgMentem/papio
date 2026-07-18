@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
-  "name": "Papio",
-  "version": "0.2.0",
+  "name": "papio",
+  "version": "0.3.0",
   "description": "Ordinary-Chrome institutional handoff for the papio paper-acquisition broker. Human login stays human; one explicitly requested download per job.",
   "minimum_chrome_version": "120",
   "icons": {
@@ -42,7 +42,7 @@
   ],
   "options_page": "dist/options.html",
   "action": {
-    "default_title": "Papio",
+    "default_title": "papio",
     "default_popup": "dist/popup.html",
     "default_icon": {
       "16": "icons/icon16.png",

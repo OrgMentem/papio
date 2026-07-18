@@ -136,16 +136,16 @@ def bundled_zotio_version(binary: str) -> str:
     if result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
         raise ValueError(f"bundled zotio version command failed: {detail}")
-    try:
-        data = json.loads(result.stdout)
-        version = data["version"]
-    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+    # Zotio prints a plain "zotio X.Y.Z" line (see papio's own runtime preflight
+    # in internal/zotio/client.go), not JSON. Parse the same shape here so the
+    # release check matches what the daemon actually validates.
+    match = re.match(r"^zotio (\d+\.\d+\.\d+(?:[-+][^ \n]+)?)", result.stdout.strip())
+    if not match:
         raise ValueError(
-            f"bundled zotio version command did not return a JSON version: {exc}"
-        ) from exc
-    if not isinstance(version, str) or not version:
-        raise ValueError("bundled zotio version command returned an empty version")
-    return version
+            "bundled zotio version command did not return a 'zotio X.Y.Z' line: "
+            f"{result.stdout.strip()!r}"
+        )
+    return match.group(1)
 
 
 def compat(args: argparse.Namespace) -> None:

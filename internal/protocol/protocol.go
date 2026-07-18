@@ -310,7 +310,7 @@ func (b *AcquisitionBundle) Validate() error {
 		return fmt.Errorf("invalid identity.doi %q", b.Identity.DOI)
 	}
 	// Full bibliographic identity is authoritative only for NEW-item bundles,
-	// where Papio creates the Zotero item from the bundle. For an
+	// where papio creates the Zotero item from the bundle. For an
 	// attach-to-existing bundle (ZotioItemKey set) the item already exists in
 	// Zotero with its own metadata and the attach carries only the item key and
 	// file, so title/authors are descriptive, not required — but their upper

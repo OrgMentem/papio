@@ -44,7 +44,7 @@ func TestPreflightRequiresVersionAndTypedCapabilities(t *testing.T) {
 
 func TestPreflightRejectsOldOrIncompleteZotio(t *testing.T) {
 	old := &Client{Executable: "zotio", Exec: func(_ context.Context, _ ...string) ([]byte, error) {
-		return []byte("zotio 0.8.0\n"), nil
+		return []byte("zotio 0.9.0\n"), nil
 	}}
 	if _, err := old.Preflight(context.Background()); err == nil || !strings.Contains(err.Error(), "older") || !strings.Contains(err.Error(), old.Executable) {
 		t.Fatalf("old preflight err = %v", err)

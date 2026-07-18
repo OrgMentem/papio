@@ -1,6 +1,6 @@
 // Copyright 2026 OrgMentem. Licensed under MIT. See LICENSE.
 
-// Package update checks public Papio-family release feeds at most once a day.
+// Package update checks public papio-family release feeds at most once a day.
 package update
 
 import (
@@ -72,7 +72,7 @@ func New(dataDir string) *Checker {
 }
 
 // NewZotio creates a checker for the public Zotio releases endpoint. Its
-// metadata and rate limit are independent from Papio's cache.
+// metadata and rate limit are independent from papio's cache.
 func NewZotio(dataDir string) *Checker {
 	return NewWithOptions(Options{
 		DataDir:     dataDir,
@@ -191,7 +191,7 @@ func IsNewer(latest, current string) bool {
 	return compareVersion(latest, current) > 0
 }
 
-// UpgradeHint returns Papio's channel-appropriate update instruction.
+// UpgradeHint returns papio's channel-appropriate update instruction.
 func UpgradeHint(executable, releaseURL string) string {
 	return UpgradeHintFor(executable, "papio", releaseURL)
 }

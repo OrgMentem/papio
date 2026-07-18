@@ -25,7 +25,7 @@ const ZotioPlanSchemaVersion = "papio-zotio-plan/1"
 
 var planIDRE = regexp.MustCompile(`^zplan_[a-f0-9]{26}$`)
 
-// Plan is Papio's immutable confirmation object around one exact Zotio preview.
+// Plan is papio's immutable confirmation object around one exact Zotio preview.
 type Plan struct {
 	SchemaVersion      string          `json:"schema_version"`
 	ID                 string          `json:"id"`
@@ -94,7 +94,7 @@ type importManifest struct {
 	} `json:"entries"`
 }
 
-// PlanJobs previews one exact Zotio mutation per ready Papio job and records it
+// PlanJobs previews one exact Zotio mutation per ready papio job and records it
 // in the exports ledger. Existing equivalent plans are returned idempotently.
 func (s *Service) PlanJobs(ctx context.Context, jobIDs []string) ([]*Plan, error) {
 	if err := s.requirePlanServices(); err != nil {

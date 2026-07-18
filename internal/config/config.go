@@ -121,7 +121,7 @@ func (i *Institution) UnmarshalText(text []byte) error {
 	return nil
 }
 
-// Zotio configures the credential-owning Zotero CLI boundary. Papio invokes
+// Zotio configures the credential-owning Zotero CLI boundary. papio invokes
 // this executable but never reads or stores Zotero credentials itself.
 type Zotio struct {
 	Executable     string `toml:"executable"`

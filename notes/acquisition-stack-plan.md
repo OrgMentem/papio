@@ -2,7 +2,7 @@
 
 **Status:** Phases 0–2 complete including live Example University acceptance (2026-07-14); Phase 3 substantially complete (ProQuest live-accepted incl. account-id unlock; Wiley live-verified; SAGE fixture-complete; JSTOR committed; EBSCO and Springer fixture-complete; JSTOR/EBSCO/Springer live acceptances pending); browser protocol v1 locked; Phase 4 complete including live gates (2026-07-14). Public-release UX push complete (2026-07-18): work-window headless mode, Firefox day-one, per-institution access profiles, guided `papio init` onboarding, and actionable error categories across CLI + MCP (see execution records below). Remaining: packed-ID re-pin (deferred), T&F/PsycNet adapters, per-institution non-Example University entityIDs.
 **Date:** 2026-07-13  
-**Name:** `papio` — repo `~/@dev/papio/`, Go module/binary `papio`, config `~/.config/papio/`, native host `papio-native-host` (basename dispatch), native-host manifest `com.orgmentem.papio`, extension product name Papio (ID comes from the separately preserved signing key).
+**Name:** `papio` — repo `~/@dev/papio/`, Go module/binary `papio`, config `~/.config/papio/`, native host `papio-native-host` (basename dispatch), native-host manifest `com.orgmentem.papio`, extension product name *papio* (ID comes from the separately preserved signing key).
 
 ## Executive decision
 
@@ -11,7 +11,7 @@ Build a **new standalone acquisition system** at `~/@dev/<broker>/` with a delib
 - **Go 1.26 core and native host:** durable queue, policy, resolver ordering, bounded HTTP, SQLite, artifact quarantine/validation, provenance, CLI/MCP, and zotio integration.
 - **TypeScript Manifest V3 extension:** ordinary user-controlled Chrome tabs, OpenURL/provider DOM adapters, visible human authentication handoff, and Chrome-managed downloads. Bun is used only for extension package management, scripts, build, and tests; the shipped extension runs as browser JavaScript and the installed host is the Go binary.
 - **No Python runtime and no continuation of the instsci product architecture.** The fork remains a temporary read-only behavioral reference until selected fixtures and edge cases are ported.
-- **No direct broker-to-Zotero writes.** Zotio remains the sole Zotero mutation/dedup/import boundary. A small zotio prerequisite is required for stored-file attachment to an existing item; the current “zero zotio changes” assumption was disproved by source inspection.
+- **No direct broker-to-Zotero writes.** zotio remains the sole Zotero mutation/dedup/import boundary. A small zotio prerequisite is required for stored-file attachment to an existing item; the current “zero zotio changes” assumption was disproved by source inspection.
 - **No direct inscribi dependency.** Inscribi continues consuming selected PDFs plus Zotero BibTeX/CSL-JSON exports. It does not know how papers were acquired.
 
 This is not “Go instead of TypeScript.” It puts each language on the side of the process boundary where it has a durable advantage. Browser code will be JavaScript regardless of the core language; keeping policy, recovery, provenance, and untrusted-file handling in Go avoids adding a Node/Bun runtime and native SQLite dependency to the installed host.
@@ -128,7 +128,7 @@ Do not revisit languages because an adapter is inconvenient.
 10. Every accepted artifact is immutable, content-addressed, structurally validated, identity-checked, hashed, and provenance-linked before zotio sees it.
 11. URLs persisted in events are redacted. Signed query values, cookies, API keys, credential fields, and page bodies are not logged.
 12. `access_basis` and `reuse_license` are distinct. “Downloadable” never implies open license or redistribution permission.
-13. Zotio alone mutates Zotero. Inscribi sees curated inputs, never acquisition state.
+13. zotio alone mutates Zotero. Inscribi sees curated inputs, never acquisition state.
 
 ## Access profiles
 
@@ -381,7 +381,7 @@ MCP tools/resources:
 - `zotio_plan`, `zotio_apply`
 - job/artifact provenance resources with redacted fields
 
-## Zotio integration: corrected contract and prerequisite
+## zotio integration: corrected contract and prerequisite
 
 ### What already works
 
@@ -419,7 +419,7 @@ Use Zotero's official Web API upload flow:
 7. classify 403, 409, 412, 413, and 429 distinctly;
 8. on a failed new child, record/retry or roll back only the tool-created empty attachment without touching user-owned content.
 
-Zotio remains the only component holding Zotero credentials and performing writes.
+zotio remains the only component holding Zotero credentials and performing writes.
 
 ### Broker-to-zotio flow
 
@@ -607,7 +607,7 @@ None of these weaken the first-release access or validation invariants.
 | Queue | cancel each stage; crash each durable boundary; stale lease; retry idempotency; two requests for same DOI; concurrent readers/one writer |
 | Browser | missing extension; exact installed native-host invocation; protocol skew; worker restart; native-host restart; source grant/revoke; auth page; multiple accounts; terms gate; no entitlement; selector drift; user closes tab; simultaneous related/unrelated downloads |
 | Privacy | no cookie/debugger permissions; no IdP host permissions; sentinel password and IdP path/query/fragment never enter messages/logs/SQLite; signed bearer URLs never persist |
-| Zotio | stored create; stored existing attach; `{exists:1}`; upload/register failure; quota; conflict; retry no duplicate; preview/apply identity |
+| zotio | stored create; stored existing attach; `{exists:1}`; upload/register failure; quota; conflict; retry no duplicate; preview/apply identity |
 | Release | clean install; no Node/Python requirement for host; extension registration; signed binary; DB migrate/backup/restore; downgrade refusal |
 
 ## Explicit non-goals
@@ -690,7 +690,7 @@ None of these weaken the first-release access or validation invariants.
 
 - Implemented `internal/zotio` (minimum-version preflight, typed capability registry, bounded argv-only execution, and sync gated on terminal `sync_summary errored==0`), service conversion of missing-PDF queue entries to `WorkRequest`s with DOI/title-author-year fallback, immutable preview plans, confirmation SHA-256, idempotent export-ledger apply, `papio zotio plan|apply`, `acquire --from-zotio --limit`, `--zotio-item-key`, RPC routes, bootstrap wiring, `[zotio]` configuration, and migration `0003_browser_access_basis.sql` normalizing legacy browser candidate basis `subscription` to `institutional`.
 - Implemented MCP over the same application service: tools `papio_acquire`, `papio_export_bundle`, `papio_zotio_plan`, and `papio_zotio_apply` (requiring plan ID and exact confirmation SHA-256), plus `papio://jobs`, `papio://artifacts`, `papio://bundles`, `papio://zotio/plans`, and `papio://exports` resources; the surface was unit-tested with an in-memory MCP client.
-- Dedup hardening now syncs the Zotio mirror before `PlanJobs` classifies duplicates (`Client.Sync`, including allow-list and capability paths); duplicate import classification is an auditable `import_duplicate` no-op keyed to `MatchedKey`, not an error.
+- Dedup hardening now syncs the zotio mirror before `PlanJobs` classifies duplicates (`Client.Sync`, including allow-list and capability paths); duplicate import classification is an auditable `import_duplicate` no-op keyed to `MatchedKey`, not an error.
 - Live new-item route: DOI `10.3389/fcomp.2025.1560448` imported as parent `QMAFWN42` with attachment `W8C6SWUK` via `zplan_01f2eb54202dcd21dd7d2940a2`; arXiv `2605.10930` imported via `job_6b3711ba01aa546c18abc52dc9`.
 - Live duplicate route: reacquiring DOI `10.3389/fcomp.2025.1560448` through `job_90cd762d87d47f9db27e98b1b7` produced `zplan_cdc4e7ca0e6c436ce8831d3876` as a duplicate no-op; applying twice was idempotent and the library retained exactly one copy.
 - Live existing-item stored route: missing-PDF item `2LSPBIZS` (DOI `10.1186/s12913-020-05129-1`) reached ready in about 8 s with SHA-256 `4069bc5ccb3d54a0287fd0f2a9b773962c8ff5ccd4bff4bd9e1240967d854b62`; `zplan_1005869fab01cb1c6d0d3d8739` selected `existing_item` stored mode with confirmation `sha256:b05f14894bd720c45cb648a315481a9ba63c56673e53de6554f84860aea96fe6`; apply returned attachment key `7WJWP5AH` (stored upload 1,621,182 bytes, MD5 `f4044051`), and replay returned the identical idempotency-ledger result. The item left the live missing-PDF queue; the temporary `attachment_mode = 'stored'` gate setting was restored to linked-file.
@@ -726,7 +726,7 @@ None of these weaken the first-release access or validation invariants.
 
 ## Discovery and autonomy overhaul (2026-07-14, shipped)
 
-Reframe (user direction): getting a PDF the human already clicked into Zotero was never the bottleneck — the Zotero connector did that. Papio's value is **autonomous acquisition**: an AI agent asks for papers on a topic and papio searches, procures ~20 in parallel, imports them, and keeps the institutional session warm so a whole research session costs one SSO login. Design locked this session:
+Reframe (user direction): getting a PDF the human already clicked into Zotero was never the bottleneck — the Zotero connector did that. *papio*'s value is **autonomous acquisition**: an AI agent asks for papers on a topic and papio searches, procures ~20 in parallel, imports them, and keeps the institutional session warm so a whole research session costs one SSO login. Design locked this session:
 
 - **Discovery** (`internal/discovery`): OpenAlex works-search (free, keyless, best topic relevance + OA links + citation counts) behind `papio search` / RPC `discovery.search` / MCP `papio_search`. Returns `DiscoveredWork` = `work.Work` + OpenAlexID/IsOA/OAURL/CitedBy/Abstract. Composable, not monolithic: search output pipes into acquire.
 - **Batch acquisition**: `papio acquire --batch file.jsonl|-` fans out client-side over the existing acquire RPC (WorkRequest v1 stays frozen), accepts bare works or DiscoveredWork envelopes, deterministic per-identifier request-ids for idempotent re-runs, ≤50 per batch.
@@ -751,7 +751,7 @@ Reframe (user direction): getting a PDF the human already clicked into Zotero wa
 ## Library-aware batches, OA browser fallback, snowball (2026-07-15, shipped)
 
 - Shipped in papio `901c1bf` + `3c9a91a`, zotio `adfd4a8` + `3d6fa3a`.
-- **Library-aware batch**: `acquire --batch` classifies every work against the Zotio mirror first (`zotio.lookup_works`): owned-with-PDF skipped with a summary, owned-without-PDF submitted on the existing-item attachment route with the parent key, unknown works imported fresh. `--collection <name>` rides the dormant work-request/1 `collection` field into job policy; auto-import files imported items into the named collection (created on demand, idempotent, non-fatal).
+- **Library-aware batch**: `acquire --batch` classifies every work against the zotio mirror first (`zotio.lookup_works`): owned-with-PDF skipped with a summary, owned-without-PDF submitted on the existing-item attachment route with the parent key, unknown works imported fresh. `--collection <name>` rides the dormant work-request/1 `collection` field into job policy; auto-import files imported items into the named collection (created on demand, idempotent, non-fatal).
 - **OA browser fallback**: candidates exhausted by bot-block-class OA failures (403/challenge) hand off the OA URL itself instead of the institutional OpenURL; direct-file URLs (`/pdf`, `.pdf`, `/content/pdf/`, `/doi/pdf/`) skip tabs entirely — the worker downloads immediately through the browser's cookie jar, accepts only `application/pdf` into adoption, and falls back to a broker tab otherwise. OA failure falls back to exactly one institutional handoff.
 - **Snowball**: `papio search --cites/--cited-by/--related-to <doi>` resolve the seed via OpenAlex and apply exact citation filters; free-text query optional when snowballing; RPC + MCP params extended.
 - Live acceptance (2026-07-15): snowball on Schemmer 2023 returned its forward-citation neighborhood; re-running the 20-work batch skipped all 11 owned papers and resubmitted 9; **5 previously-SSO-stranded OA works fetched through the browser and auto-imported within 90 s**; the topic batch (19 items) sits in the new "Trust in AI advice" collection (`UDIEZ6NZ`). Remaining 4-5 park honestly: institutional-only access or Elsevier landing pages awaiting the adapter.
@@ -866,7 +866,7 @@ A read-only scout review of the Go daemon's adoption + import path (state confir
 
 - **[FIXED] #1 P1 — the adoption sweeper could silently die permanently.** `RunSweeper` (`internal/browser/bridge.go`) returned on any transient `SweepAdoptions` store error, and the daemon supervisor (`internal/cli/daemon.go:74-88`) never selects `sweeperDone` while healthy — so one DB-busy blip killed the only directory-adoption loop, silently stranding every PDF that landed afterward until a daemon restart. Now resilient: a transient sweep error is retried on the next tick (best-effort, idempotent scan); a genuinely fatal store failure still surfaces via the supervised server/scheduler loops. Test: `TestRunSweeperSurvivesStoreError`.
 - **#2 P1 — adoption validation/storage error strands the adopted file.** `browser_adopt.go` transitions `awaiting_human→validating` then returns on any `validateCandidate` error; generic scheduler `RecoverStale` later rewinds `validating→resolving`, so the user-supplied download is never re-scanned and ordinary resolver work may replace it. Fix direction: on adoption failure return to `awaiting_human` with a durable manual-download action (or an explicit retry state) that preserves/re-drives the source path.
-- **#3 P1 — transient Zotio outage leaves a validated PDF permanently unimported.** `autoImportReady` (`app.go:605-632`) calls `PlanAndApply` once, records an `error` event, returns; `ready` is terminal so the scheduler never revisits it. Manual `papio zotio plan/apply` required (documented). Fix direction: a durable import-pending/retry state or idempotent import-retry queue with bounded backoff — **must be designed together with #10** (the ledger replay window) to stay dedup-safe.
+- **#3 P1 — transient zotio outage leaves a validated PDF permanently unimported.** `autoImportReady` (`app.go:605-632`) calls `PlanAndApply` once, records an `error` event, returns; `ready` is terminal so the scheduler never revisits it. Manual `papio zotio plan/apply` required (documented). Fix direction: a durable import-pending/retry state or idempotent import-retry queue with bounded backoff — **must be designed together with #10** (the ledger replay window) to stay dedup-safe.
 - **#4 P1 — swallowed `auto_import` event errors make a terminal job indistinguishable from unfinished.** Every `RecordEvent` in `autoImportReady` is `_`-assigned; `batch/report.go` maps a `ready` job with no `auto_import` event to `in_progress`, so a dropped event insert leaves batch wait `in_progress` forever. Fix direction: durable/transactional import outcome, or an explicit `import_status_unknown` in reporting.
 - **#5 P2 — failed rejected-file quarantine → endless re-adopt/re-reject loop.** `browser_adopt.go:132-143` ignores `MkdirAll(rejected/…)`/`os.Rename` failures then re-parks; the 2 s sweeper re-scans the still-present file forever. Fix direction: treat the move as part of the rejection commit; on failure enter a distinct blocked state and stop scanning that basename.
 - **#6 P2 — adoption scan has a hard 200-job newest-first ceiling (no pagination).** With >200 `awaiting_human` handoffs an older settled PDF is never scanned. Fix direction: paginate by cursor, or scan adoption-root dirs independently. (Not biting now — queue drained.)
@@ -875,7 +875,7 @@ A read-only scout review of the Go daemon's adoption + import path (state confir
 - **#9 P2 — successful/needs-review adoption leaves the download in the adoption tree forever.** Confirmed live: 15+ `ready` jobs each still hold their PDF under `~/Downloads/papio/<job>/`; `SweepTerminalQuarantine` cleans only the artifact quarantine, not the adoption root — unbounded disk growth. Fix direction: after a successful copy/validation decision, remove/archive the source; add adoption-root cleanup for terminal jobs. **Gate: confirm Zotero imports a copy (imported_file) not a link before deleting** — `zotio` link-mode not found by grep.
 - **#10 P2 (low-freq/high-impact) — crash after Zotero mutation but before ledger finalization can replay the mutation.** `zotio/plan.go:706-727` reclaims any `zotio_apply` row with `result_json IS NULL` as abandoned, then re-invokes the `--yes` mutation — risking a duplicate item/attachment. Fix direction: lease/unknown-outcome reconciliation or provider-side idempotency keyed by the immutable plan. (In foreign/uncommitted `zotio` — do not touch until that work lands.)
 
-Safeguards confirmed present: path confinement + symlink/irregular rejection, dotfile/partial-suffix/ambiguous-file skipping in the scanner, `ClaimNext`/`RecoverStale` reclaim of ordinary active leases, periodic terminal-quarantine sweep, and idempotent Zotio replay once a result is recorded.
+Safeguards confirmed present: path confinement + symlink/irregular rejection, dotfile/partial-suffix/ambiguous-file skipping in the scanner, `ClaimNext`/`RecoverStale` reclaim of ordinary active leases, periodic terminal-quarantine sweep, and idempotent zotio replay once a result is recorded.
 
 ## Autonomous JSTOR + EBSCO via url/api download methods (2026-07-17)
 
@@ -920,7 +920,7 @@ Verification caveats (use the observe flywheel): background/minimized tabs get t
 
 The entitlement **is** the user's institutional session in their daily browser (the warm-session one-login model, proven live 2026-07-15). A separate backend browser (hidden Chrome instance, second profile, headless, CloakBrowser) would need its own SSO session (profiles don't share cookie jars; the profile lock forbids sharing; profile copies look like token theft to IdPs), doubles login burden, and *creates* automation-detection risk papio does not currently have. Nothing extra is installed for the user: the daily browser is the browser plane; the daemon (installed by `papio init`) is the backend.
 
-**CloakBrowser contingency (not a dependency).** CloakBrowser (CloakHQ) is a stealth Chromium — 66 C++ fingerprint patches, Playwright/Puppeteer API, current binaries behind a Pro subscription, residential-proxy scraper posture (it is what instsci uses). Papio does not have the problem it solves: traffic originates from a real human-authenticated interactive browser, and the only bot-wall hit so far (ScienceDirect) was papio's own hourly re-drive — fixed behaviorally (auth-drive cap), not with stealth. Library proxies detect rate/volume, which budgets and one-job-per-request already bound; a cloaked browser would risk users' institutional accounts and forfeit the "ordinary Chrome, human login stays human" defensibility. **Reversal trigger:** revisit only if ≥2 verified providers block classification/download in the user's ordinary entitled browser, attributable to automation detection of extension actions (not volume). Until then CloakBrowser stays this paragraph.
+**CloakBrowser contingency (not a dependency).** CloakBrowser (CloakHQ) is a stealth Chromium — 66 C++ fingerprint patches, Playwright/Puppeteer API, current binaries behind a Pro subscription, residential-proxy scraper posture (it is what instsci uses). *papio* does not have the problem it solves: traffic originates from a real human-authenticated interactive browser, and the only bot-wall hit so far (ScienceDirect) was papio's own hourly re-drive — fixed behaviorally (auth-drive cap), not with stealth. Library proxies detect rate/volume, which budgets and one-job-per-request already bound; a cloaked browser would risk users' institutional accounts and forfeit the "ordinary Chrome, human login stays human" defensibility. **Reversal trigger:** revisit only if ≥2 verified providers block classification/download in the user's ordinary entitled browser, attributable to automation detection of extension actions (not volume). Until then CloakBrowser stays this paragraph.
 
 ### Cross-browser matrix
 

@@ -3,6 +3,8 @@ dist/
 extension/firefox/
 extension/web-ext-artifacts/
 extension/.ff-dev-profile/
+extension/.env
+.env
 dist/release/
 site/
 node_modules/

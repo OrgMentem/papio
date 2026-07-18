@@ -1,5 +1,5 @@
 // Copyright 2026 OrgMentem. Licensed under MIT. See LICENSE.
-// Package zotio owns Papio's narrow, credential-free subprocess boundary to
+// Package zotio owns papio's narrow, credential-free subprocess boundary to
 // Zotio. Zotio remains authoritative for Zotero reads, writes, deduplication,
 // and attachment upload semantics.
 package zotio
@@ -20,7 +20,7 @@ import (
 )
 
 const (
-	MinimumVersion = "1.0.0"
+	MinimumVersion = "0.10.0"
 	maxStdoutBytes = 8 << 20
 	maxStderrBytes = 64 << 10
 )
@@ -45,7 +45,7 @@ var RequiredCapabilities = map[string]string{
 }
 
 // ExecFunc is injected by tests. Production uses an argv-only os/exec call;
-// Papio never constructs a shell command.
+// papio never constructs a shell command.
 type ExecFunc func(context.Context, ...string) ([]byte, error)
 
 // Client invokes one configured Zotio executable with bounded output and time.
@@ -112,7 +112,7 @@ type creator struct {
 	Name      string `json:"name"`
 }
 
-// New creates a client from validated Papio configuration.
+// New creates a client from validated papio configuration.
 func New(cfg config.Zotio) *Client {
 	return &Client{
 		Executable: cfg.Executable,

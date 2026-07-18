@@ -1,20 +1,20 @@
 # Changelog
 
-All notable changes to Papio are documented here. This initial release entry is
+All notable changes to *papio* are documented here. This initial release entry is
 synthesized from the complete `papio` and `zotio` Git histories and the execution
 records in `notes/acquisition-stack-plan.md`.
 
-## [Unreleased]
+## [0.3.0] - 2026-07-18
 
 ### Added
 
 - Update discovery, without auto-install and without silent network calls.
   Store-delivered extension builds are stamped with the daemon version they
   shipped with, so the popup can show a calm "papio X.Y is available" line
-  when the connected daemon is older — Papio itself performs no network
+  when the connected daemon is older — *papio* itself performs no network
   activity for this. Separately, an opt-in `[updates] check = true` setting
   (offered by the `papio init` prompt, default yes) has the daemon consult the
-  Papio and Zotio GitHub releases APIs independently at most once a day. Papio
+  *papio* and zotio GitHub releases APIs independently at most once a day. *papio*
   status appears in daemon status; both targets surface in `papio doctor` and a
   once-daily stderr hint. Configurations without the setting never check.
 
@@ -34,7 +34,7 @@ records in `notes/acquisition-stack-plan.md`.
   Phase-1 readiness checks (config paths, database, PDF tooling, credentials)
   followed by integration checks — daemon reachability and version match,
   browser-extension connectivity, native-messaging-host manifests for Chrome
-  and Firefox, and the Zotio preflight — each failure with a concrete `fix:`
+  and Firefox, and the zotio preflight — each failure with a concrete `fix:`
   line. The same diagnostics are exposed to agents as a read-only
   `papio_doctor` MCP tool.
 
@@ -43,12 +43,30 @@ records in `notes/acquisition-stack-plan.md`.
   with the exact recovery command.
 
 - Release engineering: `release_metadata.py compat` mechanically verifies the
-  cross-artifact compatibility floors (daemon↔extension minimums, Zotio
+  cross-artifact compatibility floors (daemon↔extension minimums, zotio
   minimum version, extension manifest/package version agreement) as a
   `release.sh` step and a source-only CI check; `release.sh` now also
   packages the Firefox extension archive alongside the Chrome one. A shared
   release runbook lives at `.agents/skills/papio-release/SKILL.md` and is
   cross-referenced from zotio.
+
+- Extension store submission path for Chrome Web Store and Firefox Add-ons
+  (AMO). `extension/scripts/submit-firefox.sh` signs and submits the built
+  Firefox package via `web-ext` (AMO API credentials from `extension/.env`),
+  and `extension/scripts/submit-chrome.sh` uploads the Chrome package via
+  `chrome-webstore-upload-cli`; both are exposed as `bun run submit:firefox`
+  and `bun run submit:chrome`. Paste-ready store listing kits (name, summary,
+  full description, per-permission rationale, data-collection disclosure, and
+  reviewer build instructions for the bundled source) live at
+  `extension/docs/amo-listing.md` and
+  `extension/docs/chrome-web-store-listing.md`.
+
+- The bundled-zotio compatibility floor (`internal/zotio/client.go`
+  `MinimumVersion`) now targets a released zotio line (`0.10.0`) instead of an
+  unreleased `1.0.0`; a built zotio 0.10.0 satisfies every capability, operation,
+  and write-target *papio*'s preflight requires. `release.sh` now stamps the
+  bundled zotio binary with zotio's own version rather than *papio*'s, so the
+  cross-artifact compatibility check reflects the real zotio being shipped.
 
 - Documentation: a `Version skew and updates` troubleshooting section (update
   flow, popup states, config-newer-than-binary errors), sister-project
@@ -57,7 +75,7 @@ records in `notes/acquisition-stack-plan.md`.
 
 - The MCP `papio_status` tool now surfaces the same actionable `category` and
   `guidance` as the CLI for parked and no-file jobs (including the config-aware
-  `institution_not_configured`), so agents driving Papio over MCP get the same
+  `institution_not_configured`), so agents driving *papio* over MCP get the same
   diagnosis and next step as a human. The category catalog moved to a shared
   `internal/errcat` package consumed by both the CLI and the MCP server, so the
   two surfaces cannot drift.
@@ -136,7 +154,7 @@ records in `notes/acquisition-stack-plan.md`.
   classify rule (ordered before `article`) now recognizes ProQuest's "Find your
   institution" wall (`form#institutionForm` + `input#institutionName`,
   fixture-backed `fixtures/proquest/login-return.html` captured live via CDP).
-  Papio surfaces it as a human sign-in step (`login` → `auth_pending`) instead
+  *papio* surfaces it as a human sign-in step (`login` → `auth_pending`) instead
   of silently staying assisted/`unknown`. Matters disproportionately because
   Example University's OpenURL resolver routes many titles (incl. SAGE/T&F journals) to
   ProQuest rather than the publisher. Classify verified by fixtures; the full
@@ -242,8 +260,20 @@ records in `notes/acquisition-stack-plan.md`.
   muzzle) stay navy on the coral face in both modes.
 - Config unknown-field errors now explain that the config was likely written
   for a newer papio and name the offending fields, instead of surfacing a raw
-  TOML parse error. Zotio preflight failures name the installed version, the
+  TOML parse error. zotio preflight failures name the installed version, the
   configured executable path, and the action that fixes the mismatch.
+- MCP tool surface now derives from the papio CLI command tree instead of a
+  parallel set of hand-maintained typed tools, so the CLI is the single source
+  of truth and the two can no longer drift. The default surface is a command
+  facade — `papio_command_search` to discover commands and `papio_command_run`
+  to execute one (JSON output, command-local flags only, inherited globals
+  rejected); `PAPIO_MCP_SURFACE=mirror` instead exposes one `papio_<command>`
+  tool apiece. Setup and lifecycle commands (`init`, `config`, `daemon`,
+  `native-host`, `mcp`) are hidden via `mcp:hidden` annotations. Two composite
+  tools with no single-command equivalent stay first-class — `papio_acquire_batch`
+  (bulk work input) and `papio_batch_wait` (bounded polling) — alongside the
+  five read resources. Migrated the server library from
+  `modelcontextprotocol/go-sdk` to `mark3labs/mcp-go` for parity with zotio.
 
 ### Fixed
 
@@ -274,10 +304,10 @@ records in `notes/acquisition-stack-plan.md`.
 
 ### Phase 0 — contracts and prerequisite
 
-- Established the Papio Go/Bun workspace, fail-closed shared protocol fixtures,
+- Established the *papio* Go/Bun workspace, fail-closed shared protocol fixtures,
   and draft work-request, acquisition-bundle, and browser contracts.
-- Added Zotio's stored-attachment upload path with reconciliation and retry-safe
-  Web API registration, which is the import prerequisite for Papio exports.
+- Added zotio's stored-attachment upload path with reconciliation and retry-safe
+  Web API registration, which is the import prerequisite for *papio* exports.
 
 ### Phase 1 — durable open-access acquisition
 
@@ -303,9 +333,9 @@ records in `notes/acquisition-stack-plan.md`.
   strict cross-runtime fixtures; retained Go as the core after the reversal
   review.
 
-### Phase 4 — Zotio, MCP, and human resolution
+### Phase 4 — zotio, MCP, and human resolution
 
-- Added Zotio capability/version preflight, preview/apply plans, confirmation
+- Added zotio capability/version preflight, preview/apply plans, confirmation
   hashes, import-ledger idempotency, missing-PDF intake, and stored attachments.
 - Added MCP tools and resources over the same application service, plus bounded
   human identity-review resolution and action lifecycle cleanup.
@@ -317,12 +347,12 @@ records in `notes/acquisition-stack-plan.md`.
   session keepalive, observed-provider fixture capture, library-aware batches,
   OA browser fallback, snowball search, status/reporting, notifications,
   watchlists, MCP loop closure, and first-run onboarding.
-- Updated Zotio integration with collection-aware missing-PDF scopes, item-type
+- Updated zotio integration with collection-aware missing-PDF scopes, item-type
   valid container-title mapping, exact-key enrichment, and transactional
   workflow execution.
 
 ### Phase 5 — release preparation
 
-- Added local release artifacts for Papio and Zotio binaries, the extension ZIP,
+- Added local release artifacts for *papio* and zotio binaries, the extension ZIP,
   dependency inventories, license reports, hashes, and a machine-readable
   release manifest.

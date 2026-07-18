@@ -531,7 +531,7 @@ func Markdown(report *Report) string {
 		return ""
 	}
 	var out strings.Builder
-	fmt.Fprintf(&out, "# Papio batch `%s`\n\n", report.BatchID)
+	fmt.Fprintf(&out, "# papio batch `%s`\n\n", report.BatchID)
 	if report.Label != "" {
 		fmt.Fprintf(&out, "Label: %s\n\n", report.Label)
 	}

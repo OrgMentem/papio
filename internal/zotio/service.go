@@ -24,12 +24,12 @@ type CLI interface {
 	RunJSON(context.Context, ...string) (json.RawMessage, error)
 }
 
-// Submitter is Papio's command-independent acquisition application service.
+// Submitter is papio's command-independent acquisition application service.
 type Submitter interface {
 	Submit(context.Context, protocol.WorkRequest) (string, error)
 }
 
-// Service coordinates Zotio observations with Papio acquisition requests.
+// Service coordinates Zotio observations with papio acquisition requests.
 type Service struct {
 	CLI            CLI
 	Submitter      Submitter
@@ -52,7 +52,7 @@ type QueueOptions struct {
 	SourcesDeny        []string `json:"sources_deny,omitempty"`
 }
 
-// QueuedJob links one Zotero parent item to its idempotent Papio request/job.
+// QueuedJob links one Zotero parent item to its idempotent papio request/job.
 type QueuedJob struct {
 	ZotioItemKey string `json:"zotio_item_key"`
 	RequestID    string `json:"request_id"`
@@ -256,7 +256,7 @@ func (s *Service) findParentItemKeys(ctx context.Context, identifier lookupIdent
 }
 
 // QueueMissingPDF preflights Zotio, reads one bounded queue slice, and submits
-// deterministic Papio requests. Re-running it returns existing live jobs.
+// deterministic papio requests. Re-running it returns existing live jobs.
 func (s *Service) QueueMissingPDF(ctx context.Context, options QueueOptions) (*QueueResult, error) {
 	if s == nil || s.CLI == nil || s.Submitter == nil {
 		return nil, fmt.Errorf("Zotio integration is not configured")

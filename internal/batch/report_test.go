@@ -163,7 +163,7 @@ func TestMarkdownSnapshot(t *testing.T) {
 			{Outcome: "failed", JobID: "job-failed", Work: protocol.WorkRequest{Title: "Broken"}, FailureClass: "network_exhausted"},
 		},
 	}
-	const want = "# Papio batch `batch-deadbeef`\n\nLabel: weekly\n\n3 works: 1 imported, 1 awaiting_human, 1 failed.\n\n## Imported (1)\n- Imported (`job-import`): parent `PA123`; attachment `AT456`; collection `Reading`\n\n## Awaiting Human (1)\n- Needs browser (`job-human`): oa_browser\n\n## Failed (1)\n- Broken (`job-failed`): network_exhausted\n"
+	const want = "# papio batch `batch-deadbeef`\n\nLabel: weekly\n\n3 works: 1 imported, 1 awaiting_human, 1 failed.\n\n## Imported (1)\n- Imported (`job-import`): parent `PA123`; attachment `AT456`; collection `Reading`\n\n## Awaiting Human (1)\n- Needs browser (`job-human`): oa_browser\n\n## Failed (1)\n- Broken (`job-failed`): network_exhausted\n"
 	if got := Markdown(report); got != want {
 		t.Fatalf("markdown snapshot (-want +got):\nwant:\n%s\ngot:\n%s", want, got)
 	}
