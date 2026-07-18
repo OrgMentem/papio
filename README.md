@@ -104,7 +104,7 @@ it finds:
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/architecture-dark.svg">
   <source media="(prefers-color-scheme: light)" srcset="docs/assets/architecture.svg">
-  <img alt="papio acquisition pipeline: you or an agent drive papio's durable, bounded jobs; open-access and licensed APIs run before your own browser, where login, MFA, and CAPTCHA stay human; both paths converge in quarantine and PDF validation, producing an immutable bundle with provenance that reaches the Zotero library through zotio preview-then-apply" src="docs/assets/architecture.svg">
+  <img alt="papio acquisition pipeline: you or an agent drive papio's durable, bounded jobs; open-access and licensed APIs run before your own browser via the papio extension (installed once), where login, MFA, and CAPTCHA stay human; both paths converge in quarantine and PDF validation, producing an immutable bundle with provenance that reaches the Zotero library through zotio preview-then-apply" src="docs/assets/architecture.svg">
 </picture>
 
 | Plane | Backend | Handles credentials? |

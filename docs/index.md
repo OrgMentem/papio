@@ -8,8 +8,8 @@ Finding a paper is easy; *legitimately acquiring* it and getting a validated PDF
 
 Each acquisition is a durable, bounded job. `papio` ranks candidates deterministically and resolves them in order — the broker never accepts the first URL it finds:
 
-![papio acquisition pipeline: you or an agent drive papio's durable, bounded jobs; open sources run before your own browser, where login, MFA, and CAPTCHA stay human; both paths converge in quarantine and PDF validation, producing a validated bundle with provenance that reaches the Zotero library through zotio preview-then-apply](assets/architecture.svg#only-light)
-![papio acquisition pipeline: you or an agent drive papio's durable, bounded jobs; open sources run before your own browser, where login, MFA, and CAPTCHA stay human; both paths converge in quarantine and PDF validation, producing a validated bundle with provenance that reaches the Zotero library through zotio preview-then-apply](assets/architecture-dark.svg#only-dark)
+![papio acquisition pipeline: you or an agent drive papio's durable, bounded jobs; open sources run before your own browser via the papio extension (installed once), where login, MFA, and CAPTCHA stay human; both paths converge in quarantine and PDF validation, producing a validated bundle with provenance that reaches the Zotero library through zotio preview-then-apply](assets/architecture.svg#only-light)
+![papio acquisition pipeline: you or an agent drive papio's durable, bounded jobs; open sources run before your own browser via the papio extension (installed once), where login, MFA, and CAPTCHA stay human; both paths converge in quarantine and PDF validation, producing a validated bundle with provenance that reaches the Zotero library through zotio preview-then-apply](assets/architecture-dark.svg#only-dark)
 
 1. **Discover.** `papio search` returns bounded, read-only OpenAlex results, marking works already in your Zotio library.
 2. **Acquire.** A capped batch (or one work) becomes durable jobs with stable request IDs, so reruns are idempotent.

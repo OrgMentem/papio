@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1200" height="560" viewBox="0 0 1200 560" role="img" aria-labelledby="title description">
   <title id="title">Acquisition pipeline</title>
-  <desc id="description">You or an agent asks papio to queue a durable, bounded job. papio tries open sources first — arXiv, Unpaywall, PMC, and licensed APIs — or hands the request to your own browser, where login, MFA, and CAPTCHA stay human. The paths converge, then the PDF is quarantined and validated as the right paper, a real PDF, and searchable, packaged as a validated bundle recording where it came from, previewed and applied through zotio, and added to the Zotero library.</desc>
+  <desc id="description">You or an agent asks papio to queue a durable, bounded job. papio tries open sources first — arXiv, Unpaywall, PMC, and licensed APIs — or hands the request to your own browser via the papio extension (installed once, manually), where login, MFA, and CAPTCHA stay human. The paths converge, then the PDF is quarantined and validated as the right paper, a real PDF, and searchable, packaged as a validated bundle recording where it came from, previewed and applied through zotio, and added to the Zotero library.</desc>
   <defs>
     <marker id="arrow-navy" viewBox="0 0 14 14" refX="14" refY="7" markerWidth="14" markerHeight="14" markerUnits="userSpaceOnUse" orient="auto">
       <path class="arrow-ink" d="M 0 0 L 14 7 L 0 14 Z"/>
@@ -60,11 +60,12 @@
       </text>
     </g>
 
-    <g aria-label="Your own browser — login, MFA &amp; CAPTCHA stay human">
+    <g aria-label="Your own browser — via the papio extension; login, MFA &amp; CAPTCHA stay human">
       <rect class="human-node" x="720" y="215" width="390" height="96" rx="12"/>
-      <text class="node-label human-label" x="915" y="258">
-        <tspan x="915" y="258">Your own browser</tspan>
-        <tspan class="node-sub" x="915" y="281">login, MFA &amp; CAPTCHA stay human</tspan>
+      <text class="node-label human-label" x="915" y="248">
+        <tspan x="915" y="248">Your own browser</tspan>
+        <tspan class="node-sub" x="915" y="271">via the <tspan font-style="italic">papio</tspan> extension (installed once)</tspan>
+        <tspan class="node-sub" x="915" y="291">login, MFA &amp; CAPTCHA stay human</tspan>
       </text>
     </g>
 
