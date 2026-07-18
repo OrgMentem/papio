@@ -8,6 +8,21 @@ Finding a paper is easy; *legitimately acquiring* it and getting a validated PDF
 
 Each acquisition is a durable, bounded job. `papio` ranks candidates deterministically and resolves them in order — the broker never accepts the first URL it finds:
 
+```mermaid
+flowchart LR
+  U[You or an agent] --> C[papio CLI / MCP]
+  C --> D[Daemon: policy + durable jobs]
+  D --> R[OA / licensed API resolvers]
+  D --> O[Institutional OpenURL handoff]
+  O --> E[Extension in your own browser]
+  E --> H[Human login / MFA / CAPTCHA]
+  R --> V[Bounded fetch + PDF validation]
+  E --> V
+  V --> B[Immutable acquisition bundle]
+  B --> Z[Zotio preview then apply]
+  Z --> L[Zotero library]
+```
+
 1. **Discover.** `papio search` returns bounded, read-only OpenAlex results, marking works already in your Zotio library.
 2. **Acquire.** A capped batch (or one work) becomes durable jobs with stable request IDs, so reruns are idempotent.
 3. **Resolve & fetch.** Open-access and explicitly licensed APIs run before institutional access; a bounded fetch quarantines each candidate.
@@ -43,9 +58,16 @@ New here? Start with the [user guide](guide/user-guide.md), then tune policy in 
 
 <div class="grid cards" markdown>
 
+- **[Getting started](guide/getting-started.md)** — prerequisites, `papio init`, and your first acquisition end to end.
 - **[User guide](guide/user-guide.md)** — the research workflow: discover, acquire in batches, follow jobs, complete a browser pass, and resolve identity reviews.
-- **[Configuration](reference/config-reference.md)** — every TOML key, default, constraint, and effect, from access mode to per-source budgets.
+- **[Use in a coding agent](guide/agent-skill.md)** — drive papio over MCP (`papio mcp`): the canonical acquisition loop and its safety semantics.
+- **[Access modes & safety](concepts/access-modes.md)** — `conservative` / `assisted` / `maximal` and the non-negotiable product and safety boundaries.
+- **[Acquisition pipeline](concepts/acquisition-pipeline.md)** — resolver order, deterministic candidate ranking, job states, and bounded fetch.
+- **[Browser handoff](concepts/browser-handoff.md)** — the ordinary-browser extension, native-host bridge, work-window headless mode, and no-CDP posture.
+- **[Validation & provenance](concepts/validation-and-provenance.md)** — PDF structure, identity, OCR gates, and the immutable acquisition bundle.
+- **[Command reference](reference/commands.md)** — every `papio` command and its flags.
+- **[MCP tools](reference/mcp-tools.md)** — every `papio_*` tool and read resource, with parameters and boundaries.
+- **[Configuration](reference/config-reference.md)** — every TOML key, default, constraint, and effect.
 - **[Troubleshooting](guide/troubleshooting.md)** — extension reload, daemon recovery, reading `doctor`, and the stable Zotio-boundary error classes.
-- **[Use in a coding agent](guide/agent-skill.md)** — drive papio over MCP (`papio mcp`): every `papio_*` tool, its safety semantics, and CLI equivalence.
 
 </div>
