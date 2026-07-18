@@ -31,6 +31,12 @@ export interface HelloPayload {
   adapter_versions?: Record<string, string>;
 }
 
+export interface HelloAckPayload {
+  daemon_version?: string;
+  features?: string[];
+}
+
+
 export interface JobOfferExpected {
   doi?: string;
   title?: string;
@@ -339,7 +345,22 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
       if (message.length === 0) fail("error.message required");
       break;
     }
-    case "hello_ack":
+    case "hello_ack": {
+      requireKeys(p, "hello_ack", [], ["daemon_version", "features"]);
+      if ("daemon_version" in p) str(p, "daemon_version", "hello_ack", 50);
+      if ("features" in p) {
+        const features = p["features"];
+        if (!Array.isArray(features) || features.length > 32) {
+          fail("hello_ack.features must be an array with at most 32 entries");
+        }
+        for (const feature of features) {
+          if (typeof feature !== "string" || Array.from(feature).length === 0 || Array.from(feature).length > 64) {
+            fail("hello_ack.features entries must be non-empty strings with at most 64 chars");
+          }
+        }
+      }
+      break;
+    }
     case "ack":
     case "job_accept":
     case "job_reject":

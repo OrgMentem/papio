@@ -1,0 +1,10 @@
+{
+  "protocol": "papio-browser/1",
+  "type": "hello_ack",
+  "msg_id": "daemon-ack-001",
+  "seq": 1,
+  "payload": {
+    "daemon_version": "0.1.0",
+    "features": ["browser_handoff"]
+  }
+}

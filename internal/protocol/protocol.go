@@ -418,6 +418,14 @@ type HelloPayload struct {
 	ExtensionVersion string            `json:"extension_version"`
 	AdapterVersions  map[string]string `json:"adapter_versions,omitempty"`
 }
+// HelloAckPayload announces the daemon version and supported bridge features.
+// Both fields are optional so extensions remain compatible with older daemons
+// that acknowledge hello with an empty object.
+type HelloAckPayload struct {
+	DaemonVersion string   `json:"daemon_version,omitempty"`
+	Features      []string `json:"features,omitempty"`
+}
+
 
 // JobOfferPayload asks the extension to open one OpenURL-resolved job.
 type JobOfferPayload struct {
@@ -469,8 +477,8 @@ type ErrorPayload struct {
 	Message string `json:"message"`
 }
 
-// EmptyPayload is used by types that carry no data (hello_ack, ack,
-// job_accept, job_reject, cancel).
+// EmptyPayload is used by types that carry no data (ack, job_accept,
+// job_reject, cancel).
 type EmptyPayload struct{}
 
 // BrowserMessage is one decoded native-messaging envelope. Payload holds the
@@ -566,6 +574,28 @@ func DecodeBrowserMessage(data []byte) (*BrowserMessage, error) {
 			}
 		}
 		msg.Payload = p
+	case MsgHelloAck:
+		p := &HelloAckPayload{}
+		err = browserRejectNullFields(payloadFields, "daemon_version", "features")
+		var features []json.RawMessage
+		if raw, ok := payloadFields["features"]; ok && err == nil {
+			err = strictDecode(raw, &features)
+		}
+		if err == nil {
+			err = strictDecode(env.Payload, p)
+		}
+		if err == nil {
+			err = p.validate()
+		}
+		for _, feature := range features {
+			if err != nil {
+				break
+			}
+			if string(feature) == "null" {
+				err = fmt.Errorf("hello_ack.features entries cannot be null")
+			}
+		}
+		msg.Payload = p
 	case MsgJobOffer:
 		p := &JobOfferPayload{}
 		if err = browserRequireFields(payloadFields, "openurl", "provider_hosts", "access_mode", "expires_at"); err == nil {
@@ -640,7 +670,7 @@ func DecodeBrowserMessage(data []byte) (*BrowserMessage, error) {
 			}
 		}
 		msg.Payload = p
-	case MsgHelloAck, MsgAck, MsgJobAccept, MsgJobReject, MsgCancel:
+	case MsgAck, MsgJobAccept, MsgJobReject, MsgCancel:
 		p := &EmptyPayload{}
 		err = strictDecode(env.Payload, p)
 		msg.Payload = p
@@ -690,6 +720,21 @@ func (p *JobOfferPayload) validate() error {
 	if p.Expected != nil {
 		if browserTextLen(p.Expected.DOI) > 300 || browserTextLen(p.Expected.Title) > 500 {
 			return fmt.Errorf("expected hints exceed bounds")
+		}
+	}
+	return nil
+}
+
+func (p *HelloAckPayload) validate() error {
+	if browserTextLen(p.DaemonVersion) > 50 {
+		return fmt.Errorf("hello_ack.daemon_version exceeds 50 chars")
+	}
+	if len(p.Features) > 32 {
+		return fmt.Errorf("hello_ack.features capped at 32")
+	}
+	for _, feature := range p.Features {
+		if feature == "" || browserTextLen(feature) > 64 {
+			return fmt.Errorf("hello_ack.features entries must be non-empty (max 64)")
 		}
 	}
 	return nil

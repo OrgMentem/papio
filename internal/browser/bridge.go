@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -28,7 +29,10 @@ import (
 	"papio/internal/store"
 )
 
-const handoffActionKind = "openurl_handoff"
+const (
+	handoffActionKind    = "openurl_handoff"
+	MinExtensionVersion = "0.1.0"
+)
 
 // ErrInvalidFrame marks a client-side protocol violation (a frame that fails
 // strict decode, arrives before hello, or is not a legal inbound type). The RPC
@@ -44,19 +48,29 @@ type Bridge struct {
 	svc  *app.Service
 	cfg  config.Config
 
-	mu         sync.Mutex
-	seq        int64
-	helloSeen  bool
-	offered    map[string]bool // handoff jobs offered this hello-session
-	cancelSent map[string]bool // jobs a daemon-side cancel was already announced for
-	now        func() time.Time
+	// Version and Features are daemon capabilities announced in hello_ack.
+	Version  string
+	Features []string
+
+	// ExtensionVersion and AdapterVersions describe the current hello-session.
+	ExtensionVersion string
+	AdapterVersions  map[string]string
+
+	mu                sync.Mutex
+	seq               int64
+	helloSeen         bool
+	extensionOutdated bool
+	offered           map[string]bool // handoff jobs offered this hello-session
+	cancelSent        map[string]bool // jobs a daemon-side cancel was already announced for
+	now               func() time.Time
 }
 
 // NewBridge constructs the bridge. It is cheap and always constructed; whether
 // any job is ever offered depends on config (extension_id / openurl base).
-func NewBridge(jobs *job.Store, svc *app.Service, cfg config.Config) *Bridge {
+func NewBridge(jobs *job.Store, svc *app.Service, cfg config.Config, version string, features []string) *Bridge {
 	return &Bridge{
 		jobs: jobs, svc: svc, cfg: cfg,
+		Version: version, Features: features,
 		offered: map[string]bool{}, cancelSent: map[string]bool{},
 		now: time.Now,
 	}
@@ -87,6 +101,9 @@ func (b *Bridge) Sync(ctx context.Context, frames []json.RawMessage) ([]json.Raw
 			return nil, err
 		}
 		out = append(out, replies...)
+		if b.extensionOutdated {
+			return out, nil
+		}
 	}
 	if !b.helloSeen {
 		required, err := b.helloRequired()
@@ -105,10 +122,20 @@ func (b *Bridge) Sync(ctx context.Context, frames []json.RawMessage) ([]json.Raw
 // handle dispatches one decoded inbound frame.
 func (b *Bridge) handle(ctx context.Context, msg *protocol.BrowserMessage) ([]json.RawMessage, error) {
 	if msg.Type == protocol.MsgHello {
+		p := msg.Payload.(*protocol.HelloPayload)
 		b.helloSeen = true
+		b.extensionOutdated = compareVersion(p.ExtensionVersion, MinExtensionVersion) < 0
+		b.ExtensionVersion = p.ExtensionVersion
+		b.AdapterVersions = p.AdapterVersions
 		b.offered = map[string]bool{}
 		b.cancelSent = map[string]bool{}
-		ack, err := b.frame(protocol.MsgHelloAck, "", protocol.EmptyPayload{})
+		if b.extensionOutdated {
+			return b.extensionOutdatedError()
+		}
+		ack, err := b.frame(protocol.MsgHelloAck, "", protocol.HelloAckPayload{
+			DaemonVersion: b.Version,
+			Features:      b.Features,
+		})
 		if err != nil {
 			return nil, err
 		}
@@ -117,6 +144,10 @@ func (b *Bridge) handle(ctx context.Context, msg *protocol.BrowserMessage) ([]js
 	if !b.helloSeen {
 		return b.helloRequired()
 	}
+	if b.extensionOutdated {
+		return b.extensionOutdatedError()
+	}
+
 
 	switch msg.Type {
 	case protocol.MsgJobAccept:
@@ -203,6 +234,37 @@ func (b *Bridge) helloRequired() ([]json.RawMessage, error) {
 	return []json.RawMessage{frame}, nil
 }
 
+func (b *Bridge) extensionOutdatedError() ([]json.RawMessage, error) {
+	frame, err := b.frame(protocol.MsgError, "", protocol.ErrorPayload{
+		Code:    "extension_outdated",
+		Message: "update the extension from the store, then reconnect",
+	})
+	if err != nil {
+		return nil, err
+	}
+	return []json.RawMessage{frame}, nil
+}
+
+func compareVersion(left, right string) int {
+	parse := func(value string) [3]int {
+		var parts [3]int
+		for i, raw := range strings.SplitN(value, ".", 3) {
+			parts[i], _ = strconv.Atoi(raw)
+		}
+		return parts
+	}
+	a, b := parse(left), parse(right)
+	for i := range a {
+		if a[i] < b[i] {
+			return -1
+		}
+		if a[i] > b[i] {
+			return 1
+		}
+	}
+	return 0
+}
+
 // recordAuth appends a timing-only auth event. The AuthPayload structurally
 // cannot carry a URL, host, title, query, or fragment, so an identity-provider
 // address cannot enter the event stream through this path.
@@ -211,6 +273,7 @@ func (b *Bridge) recordAuth(ctx context.Context, msg *protocol.BrowserMessage) e
 	if msg.Type == protocol.MsgAuthReturned {
 		kind = "browser.auth_returned"
 	}
+
 	detail := map[string]any{}
 	if p := msg.Payload.(*protocol.AuthPayload); p.ElapsedMS != nil {
 		detail["elapsed_ms"] = *p.ElapsedMS

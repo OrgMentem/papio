@@ -6,6 +6,7 @@
 package protocol
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -72,6 +73,47 @@ func TestInvalidCorpusFailsClosed(t *testing.T) {
 		if derr := decodeByPrefix(t, e.Name(), data); derr == nil {
 			t.Errorf("invalid fixture %s was accepted; the contract must fail closed", e.Name())
 		}
+	}
+}
+
+func TestHelloAckPayloadRoundTripAndBounds(t *testing.T) {
+	frame := func(payload any) []byte {
+		t.Helper()
+		data, err := json.Marshal(map[string]any{
+			"protocol": BrowserProtocolVersion,
+			"type":     MsgHelloAck,
+			"msg_id":   "daemon-ack-001",
+			"seq":      1,
+			"payload":  payload,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return data
+	}
+
+	msg, err := DecodeBrowserMessage(frame(HelloAckPayload{
+		DaemonVersion: "0.1.0",
+		Features:      []string{"browser_handoff"},
+	}))
+	if err != nil {
+		t.Fatalf("decode hello_ack: %v", err)
+	}
+	payload := msg.Payload.(*HelloAckPayload)
+	if payload.DaemonVersion != "0.1.0" || len(payload.Features) != 1 || payload.Features[0] != "browser_handoff" {
+		t.Fatalf("round-trip payload = %#v", payload)
+	}
+	if _, err := DecodeBrowserMessage(frame(EmptyPayload{})); err != nil {
+		t.Fatalf("empty hello_ack rejected: %v", err)
+	}
+	if _, err := DecodeBrowserMessage(frame(map[string]any{"daemon_version": strings.Repeat("v", 51)})); err == nil {
+		t.Fatal("hello_ack accepted daemon_version longer than 50 chars")
+	}
+	if _, err := DecodeBrowserMessage(frame(map[string]any{"features": make([]string, 33)})); err == nil {
+		t.Fatal("hello_ack accepted more than 32 features")
+	}
+	if _, err := DecodeBrowserMessage(frame(map[string]any{"features": []any{nil}})); err == nil {
+		t.Fatal("hello_ack accepted null feature entry")
 	}
 }
 

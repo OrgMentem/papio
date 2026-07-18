@@ -36,7 +36,7 @@ func newDaemonCommand(opt *options) *cobra.Command {
 			if probeErr == nil {
 				return fmt.Errorf("daemon already running at %s", socket)
 			}
-			system, err := bootstrap.New(cmd.Context(), cfg)
+			system, err := bootstrap.NewWithVersion(cmd.Context(), cfg, api.Version)
 			if err != nil {
 				return err
 			}

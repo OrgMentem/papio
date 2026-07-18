@@ -33,6 +33,27 @@ test("invalid browser corpus fails closed", () => {
     expect(() => parseBrowserMessageBytes(text), name).toThrow(ProtocolError);
   }
 });
+
+test("hello_ack accepts optional daemon details and rejects invalid members", () => {
+  const frame = (payload: Record<string, unknown>) => ({
+    protocol: "papio-browser/1",
+    type: "hello_ack",
+    msg_id: "daemon-ack-001",
+    seq: 1,
+    payload,
+  });
+
+  expect(parseBrowserMessage(frame({})).payload).toEqual({});
+  expect(parseBrowserMessage(frame({
+    daemon_version: "0.1.0",
+    features: ["browser_handoff"],
+  })).payload).toEqual({
+    daemon_version: "0.1.0",
+    features: ["browser_handoff"],
+  });
+  expect(() => parseBrowserMessage(frame({ features: [null] }))).toThrow(ProtocolError);
+  expect(() => parseBrowserMessage(frame({ daemon_version: "v".repeat(51) }))).toThrow(ProtocolError);
+});
 test("auth payloads structurally reject URLs", () => {
   expect(() =>
     parseBrowserMessage({

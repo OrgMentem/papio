@@ -101,7 +101,13 @@ func waitAutoImportRetry(ctx context.Context, delay time.Duration) error {
 }
 
 // New builds one production system without starting background goroutines.
+// New constructs the production system with the development version marker.
+// Daemon startup passes its build version through NewWithVersion.
 func New(ctx context.Context, cfg config.Config) (*System, error) {
+	return NewWithVersion(ctx, cfg, "0.1.0-dev")
+}
+
+func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*System, error) {
 	db, err := store.Open(ctx, cfg.DataDir)
 	if err != nil {
 		return nil, err
@@ -205,7 +211,7 @@ func New(ctx context.Context, cfg config.Config) (*System, error) {
 		Config: cfg, Store: db, Jobs: jobs, Artifacts: artifacts, Budgets: budgets,
 		App: service, Scheduler: scheduler, Watches: watches, WatchRunner: watchRunner,
 		Bundle:        bundleExporter,
-		Browser:       browser.NewBridge(jobs, service, cfg),
+		Browser:       browser.NewBridge(jobs, service, cfg, version, nil),
 		Discovery:     discoveryClient,
 		Zotio:         zotioService,
 		PDFCapability: capability, WorkerBinary: executable,

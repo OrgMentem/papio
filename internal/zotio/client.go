@@ -126,12 +126,12 @@ func (c *Client) Preflight(ctx context.Context) (*PreflightResult, error) {
 	if err != nil {
 		return nil, fmt.Errorf("zotio version preflight: %w", err)
 	}
-	version, err := parseVersion(string(versionOut))
+	version, err := parseVersion(string(versionOut), c.Executable)
 	if err != nil {
 		return nil, err
 	}
 	if compareVersion(version, MinimumVersion) < 0 {
-		return nil, fmt.Errorf("zotio %s is too old; Papio requires >= %s", version, MinimumVersion)
+		return nil, fmt.Errorf("zotio %s at %s is older than papio requires (>= %s) — update your zotio installation, then retry", version, c.Executable, MinimumVersion)
 	}
 
 	capabilityOut, err := c.run(ctx, "capabilities")
@@ -149,14 +149,14 @@ func (c *Client) Preflight(ctx context.Context) (*PreflightResult, error) {
 	for path, operation := range RequiredCapabilities {
 		capability, ok := seen[path]
 		if !ok {
-			return nil, fmt.Errorf("zotio capability %q is unavailable; install a current zotio build", path)
+			return nil, fmt.Errorf("zotio %s at %s is missing capability %q required by papio — update zotio at %s, then retry", version, c.Executable, path, c.Executable)
 		}
 		if capability.Operation != operation {
-			return nil, fmt.Errorf("zotio capability %q reports operation %q, want %q", path, capability.Operation, operation)
+			return nil, fmt.Errorf("zotio %s at %s reports operation %q for capability %q, but papio requires %q — update zotio at %s, then retry", version, c.Executable, capability.Operation, path, operation, c.Executable)
 		}
 	}
 	if capability := seen["attachments add"]; capability.WriteTarget != "web_api" {
-		return nil, fmt.Errorf("zotio capability %q must target web_api", capability.Path)
+		return nil, fmt.Errorf("zotio %s at %s reports write target %q for capability %q, but papio requires %q — update zotio at %s, then retry", version, c.Executable, capability.WriteTarget, capability.Path, "web_api", c.Executable)
 	}
 
 	return &PreflightResult{
@@ -391,10 +391,10 @@ func (b *boundedBuffer) Write(p []byte) (int, error) {
 	return original, nil
 }
 
-func parseVersion(out string) (string, error) {
+func parseVersion(out, executable string) (string, error) {
 	match := versionRE.FindStringSubmatch(strings.TrimSpace(out))
 	if match == nil {
-		return "", fmt.Errorf("unexpected zotio version output %q", strings.TrimSpace(out))
+		return "", fmt.Errorf("unexpected zotio version output %q from configured executable %q; it may not be zotio — configure zotio at %s, then retry", strings.TrimSpace(out), executable, executable)
 	}
 	return match[1], nil
 }

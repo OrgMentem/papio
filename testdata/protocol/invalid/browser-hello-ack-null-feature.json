@@ -1,0 +1,9 @@
+{
+  "protocol": "papio-browser/1",
+  "type": "hello_ack",
+  "msg_id": "daemon-ack-bad1",
+  "seq": 1,
+  "payload": {
+    "features": [null]
+  }
+}

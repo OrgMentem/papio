@@ -5,6 +5,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -211,6 +212,14 @@ func Load(path string) (Config, error) {
 	dec := toml.NewDecoder(strings.NewReader(string(data)))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&cfg); err != nil {
+		var missing *toml.StrictMissingError
+		if errors.As(err, &missing) {
+			fields := make([]string, 0, len(missing.Errors))
+			for _, decodeErr := range missing.Errors {
+				fields = append(fields, strings.Join(decodeErr.Key(), "."))
+			}
+			return cfg, fmt.Errorf("config %s contains fields this papio build does not recognize (%s). This usually means the config was written for a newer papio — update papio, or remove those fields: %w", path, strings.Join(fields, ", "), err)
+		}
 		return cfg, fmt.Errorf("parsing config %s (unknown fields are rejected): %w", path, err)
 	}
 	if err := cfg.validate(); err != nil {

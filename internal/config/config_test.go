@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	toml "github.com/pelletier/go-toml/v2"
 )
 
 func TestSaveLoadRoundTripAndPermissions(t *testing.T) {
@@ -60,6 +62,40 @@ func TestLoadRejectsUnknownFields(t *testing.T) {
 	}
 	if _, err := Load(path); err == nil {
 		t.Fatal("unknown config field accepted")
+	}
+}
+
+func TestLoadExplainsUnknownBrowserField(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(path, []byte("access_mode='conservative'\n[browser]\nbogus_option=true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("unknown browser config field accepted")
+	}
+	if !strings.Contains(err.Error(), "browser.bogus_option") || !strings.Contains(err.Error(), "update papio") {
+		t.Fatalf("unknown browser config error = %q", err)
+	}
+	var missing *toml.StrictMissingError
+	if !errors.As(err, &missing) {
+		t.Fatalf("unknown browser config error = %v, want wrapped StrictMissingError", err)
+	}
+}
+
+func TestLoadKeepsGenericParseErrorForInvalidTOML(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(path, []byte("access_mode='conservative'\n[broken\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("invalid TOML accepted")
+	}
+	if !strings.Contains(err.Error(), "parsing config") || strings.Contains(err.Error(), "update papio") {
+		t.Fatalf("invalid TOML error = %q", err)
 	}
 }
 

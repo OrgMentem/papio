@@ -18,7 +18,6 @@ import (
 	"papio/internal/api"
 	"papio/internal/app"
 	"papio/internal/browser"
-	"papio/internal/doctor"
 	"papio/internal/job"
 )
 
@@ -340,34 +339,3 @@ func newBundleCommand(opt *options) *cobra.Command {
 	return command
 }
 
-func newDoctorCommand(opt *options) *cobra.Command {
-	return &cobra.Command{
-		Use:   "doctor",
-		Short: "Check acquisition-core readiness",
-		Args:  cobra.NoArgs,
-		RunE: func(cmd *cobra.Command, _ []string) error {
-			var report doctor.Report
-			if err := opt.call(cmd.Context(), "doctor.run", struct{}{}, &report); err != nil {
-				return err
-			}
-			if opt.jsonOutput {
-				return opt.printJSON(report)
-			}
-			return renderDoctorReport(opt.out, report)
-		},
-	}
-}
-
-func renderDoctorReport(out io.Writer, report doctor.Report) error {
-	for _, check := range report.Checks {
-		if _, err := fmt.Fprintf(out, "%-4s  %-24s %s\n", strings.ToUpper(check.Status), check.Name, check.Detail); err != nil {
-			return err
-		}
-		if check.Remediation != "" {
-			if _, err := fmt.Fprintf(out, "      %s\n", check.Remediation); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}

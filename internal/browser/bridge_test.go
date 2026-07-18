@@ -56,7 +56,7 @@ func newBridge(t *testing.T) (*Bridge, *job.Store, config.Config, string) {
 			Identity:   pdf.IdentityDecision{Result: pdf.IdentityPass, Evidence: []string{"doi match"}},
 		}, nil
 	}
-	return NewBridge(jobs, svc, cfg), jobs, cfg, data
+	return NewBridge(jobs, svc, cfg, "0.1.0-test", []string{"browser_handoff"}), jobs, cfg, data
 }
 
 func handoffWork() work.Work {
@@ -163,13 +163,67 @@ func TestHelloIsAcknowledged(t *testing.T) {
 	}
 }
 
+func TestHelloAckAnnouncesDaemonVersion(t *testing.T) {
+	b, _, _, _ := newBridge(t)
+	msgs, _ := runSync(t, b, hello())
+	ack := firstOfType(msgs, protocol.MsgHelloAck)
+	if ack == nil {
+		t.Fatalf("no hello_ack in %v", msgs)
+	}
+	payload := ack.Payload.(*protocol.HelloAckPayload)
+	if payload.DaemonVersion != "0.1.0-test" {
+		t.Fatalf("daemon_version = %q, want 0.1.0-test", payload.DaemonVersion)
+	}
+	if !slices.Equal(payload.Features, []string{"browser_handoff"}) {
+		t.Fatalf("features = %v, want [browser_handoff]", payload.Features)
+	}
+}
+
+func TestHelloRecordsExtensionDetails(t *testing.T) {
+	b, _, _, _ := newBridge(t)
+	runSync(t, b, inFrame(t, protocol.MsgHello, "", map[string]any{
+		"extension_version": "1.2.3",
+		"adapter_versions":  map[string]string{"jstor": "1.0.0"},
+	}))
+	if b.ExtensionVersion != "1.2.3" {
+		t.Fatalf("extension version = %q, want 1.2.3", b.ExtensionVersion)
+	}
+	if b.AdapterVersions["jstor"] != "1.0.0" {
+		t.Fatalf("adapter version = %q, want 1.0.0", b.AdapterVersions["jstor"])
+	}
+}
+
+func TestOutdatedExtensionReceivesUpdateError(t *testing.T) {
+	b, _, _, _ := newBridge(t)
+	msgs, _ := runSync(t, b, inFrame(t, protocol.MsgHello, "", map[string]any{
+		"extension_version": "0.0.9",
+	}))
+	if len(msgs) != 1 {
+		t.Fatalf("hello replies = %d, want one error", len(msgs))
+	}
+	if firstOfType(msgs, protocol.MsgHelloAck) != nil {
+		t.Fatalf("outdated extension received hello_ack: %v", msgs)
+	}
+	errMsg := firstOfType(msgs, protocol.MsgError)
+	if errMsg == nil {
+		t.Fatalf("outdated extension did not receive error: %v", msgs)
+	}
+	payload := errMsg.Payload.(*protocol.ErrorPayload)
+	if payload.Code != "extension_outdated" {
+		t.Fatalf("error code = %q, want extension_outdated", payload.Code)
+	}
+	if !strings.Contains(payload.Message, "update the extension from the store") {
+		t.Fatalf("error message = %q", payload.Message)
+	}
+}
+
 func TestDaemonRestartReturnsHelloRequired(t *testing.T) {
 	active, jobs, cfg, _ := newBridge(t)
 	id := park(t, jobs, "wr_restart", handoffWork())
 	runSync(t, active, hello())
 
 	// A new daemon has the same durable jobs but no in-memory hello-session.
-	restarted := NewBridge(jobs, active.svc, cfg)
+	restarted := NewBridge(jobs, active.svc, cfg, active.Version, active.Features)
 	msgs, _ := runSync(t, restarted)
 	if len(msgs) != 1 {
 		t.Fatalf("restart poll frames = %d, want 1", len(msgs))
@@ -630,7 +684,7 @@ func TestOpenURLUsesSelectedResolverProfileForPrimoNDEAndVE(t *testing.T) {
 	cfg.Browser.Resolvers = map[string]config.Institution{
 		"institute": {OpenURLBase: "https://onesearch.library.example-institute.edu/discovery/openurl?vid=61INS_INST:INS"},
 	}
-	b = NewBridge(b.jobs, b.svc, cfg)
+	b = NewBridge(b.jobs, b.svc, cfg, b.Version, b.Features)
 	for _, test := range []struct {
 		name, resolver, wantPath, wantVID string
 	}{
@@ -674,7 +728,7 @@ func TestOfferLoginRoutingIsPerResolverProfile(t *testing.T) {
 		// ...and one without an identity gets none (no default leakage).
 		"bare": {OpenURLBase: "https://library.example.edu/openurl"},
 	}
-	b = NewBridge(b.jobs, b.svc, cfg)
+	b = NewBridge(b.jobs, b.svc, cfg, b.Version, b.Features)
 
 	for _, test := range []struct {
 		name, resolver, wantEntityID, wantAccountID string
