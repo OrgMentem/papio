@@ -79,6 +79,8 @@ export interface StoreShape {
    * Version is null when an older daemon does not report one. */
   connectionStatus?: DaemonConnectionStatus;
   daemonVersion?: string | null;
+  /** True when this build shipped with a newer daemon than the one connected. */
+  daemonUpdateHint?: boolean;
   daemonFeatures?: string[];
 
 }
@@ -95,6 +97,7 @@ export function emptyStore(): StoreShape {
     activeJobs: [],
     connectionStatus: "disconnected",
     daemonVersion: null,
+    daemonUpdateHint: false,
     daemonFeatures: [],
   };
 }

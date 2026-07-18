@@ -135,7 +135,7 @@ check_cross_artifact_compatibility() {
 build_extension() {
   (
     cd "$EXTENSION_DIR"
-    bun run build
+    PAPIO_DAEMON_VERSION="$VERSION" bun run build
   )
 }
 

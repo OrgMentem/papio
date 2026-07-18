@@ -17,6 +17,8 @@ import { watch as fsWatch } from "node:fs";
 
 const firefoxRoot = "firefox";
 const firefoxDist = `${firefoxRoot}/dist`;
+const buildDaemonVersion = process.env.PAPIO_DAEMON_VERSION ?? "0.0.0-dev";
+
 
 async function build(entrypoints: string[], outdir: string, format: "esm" | "iife"): Promise<number> {
   const result = await Bun.build({
@@ -25,6 +27,9 @@ async function build(entrypoints: string[], outdir: string, format: "esm" | "iif
     target: "browser",
     format,
     sourcemap: "none",
+    define: {
+      __PAPIO_DAEMON_VERSION__: JSON.stringify(buildDaemonVersion),
+    },
   });
   if (!result.success) {
     for (const log of result.logs) console.error(log);

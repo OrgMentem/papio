@@ -9,6 +9,7 @@ import { parseBrowserMessage, type BrowserMessage } from "../src/protocol";
 import { emptyStore, type StateBackend, type StoreShape } from "../src/state";
 import {
   Bridge,
+  hasDaemonUpdateHint,
   type BridgeDeps,
   type DownloadDeltaLike,
   type DownloadItemLike,
@@ -350,8 +351,27 @@ test("hello acknowledgment persists daemon version, features, and connected stat
     connectionStatus: "connected",
     daemonVersion: "0.1.0",
     daemonFeatures: ["browser-v1", "direct-download"],
+    daemonUpdateHint: false,
   });
   expect(h.action.texts.at(-1)).toBe("");
+});
+
+test("hello acknowledgment persists an informational update hint without changing health", async () => {
+  Object.assign(globalThis, { __PAPIO_DAEMON_VERSION__: "0.2.0" });
+  try {
+    const h = makeHarness();
+    await h.bridge.start();
+    await h.port.inbound(helloAck({ daemon_version: "0.1.0" }));
+
+    expect(h.backend.store).toMatchObject({
+      connectionStatus: "connected",
+      daemonVersion: "0.1.0",
+      daemonUpdateHint: true,
+    });
+    expect(h.action.texts.at(-1)).toBe("");
+  } finally {
+    delete (globalThis as Record<string, unknown>).__PAPIO_DAEMON_VERSION__;
+  }
 });
 
 test("an older daemon's empty hello acknowledgment remains connected", async () => {
@@ -364,6 +384,16 @@ test("an older daemon's empty hello acknowledgment remains connected", async () 
     daemonVersion: null,
     daemonFeatures: [],
   });
+});
+
+test("daemon update hints compare released semver cores against the build stamp", () => {
+  expect(hasDaemonUpdateHint("0.1.0", "0.2.0")).toBe(true);
+  expect(hasDaemonUpdateHint("0.2.0", "0.2.0")).toBe(false);
+  expect(hasDaemonUpdateHint("0.3.0", "0.2.0")).toBe(false);
+  expect(hasDaemonUpdateHint("0.2.0-dev", "0.2.0")).toBe(false);
+  expect(hasDaemonUpdateHint("0.1.0", "0.0.0-dev")).toBe(false);
+  expect(hasDaemonUpdateHint(null, "0.2.0")).toBe(false);
+  expect(hasDaemonUpdateHint("unknown", "0.2.0")).toBe(false);
 });
 
 test("a daemon below the compatibility floor is marked outdated and badged", async () => {

@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -20,6 +21,7 @@ import (
 	"papio/internal/daemon"
 	"papio/internal/ipc"
 	"papio/internal/job"
+	"papio/internal/update"
 )
 
 type options struct {
@@ -28,11 +30,12 @@ type options struct {
 	out        io.Writer
 	errOut     io.Writer
 
-	daemonVersionChecked        bool
+	daemonVersionChecked bool
+	updateHintShown      bool
 
-	configLoader    func(string) (config.Config, error)
-	newAutostarter  func(string) *daemon.Autostarter
-	rpcCall         func(context.Context, string, string, any, any) error
+	configLoader   func(string) (config.Config, error)
+	newAutostarter func(string) *daemon.Autostarter
+	rpcCall        func(context.Context, string, string, any, any) error
 }
 
 // NewRoot builds a command tree with no process-global output state.
@@ -91,7 +94,7 @@ func (o *options) call(ctx context.Context, method string, params, result any) e
 	}
 	if ensureResult.Started {
 		o.daemonVersionChecked = true
-	} else if err := o.warnDaemonVersion(ctx, socket); err != nil {
+	} else if err := o.warnDaemonVersion(ctx, socket, cfg); err != nil {
 		return err
 	}
 	return o.socketCall(ctx, socket, method, params, result)
@@ -103,7 +106,7 @@ func (o *options) callExisting(ctx context.Context, method string, params, resul
 		return err
 	}
 	socket := filepath.Join(cfg.DataDir, "papio.sock")
-	if err := o.warnDaemonVersion(ctx, socket); err != nil {
+	if err := o.warnDaemonVersion(ctx, socket, cfg); err != nil {
 		return err
 	}
 	return o.socketCall(ctx, socket, method, params, result)
@@ -133,9 +136,11 @@ type daemonPingResult struct {
 	Version            string `json:"version"`
 	ExtensionConnected bool   `json:"extension_connected"`
 	ExtensionVersion   string `json:"extension_version,omitempty"`
+	UpdateAvailable    bool   `json:"update_available"`
+	LatestVersion      string `json:"latest_version,omitempty"`
 }
 
-func (o *options) warnDaemonVersion(ctx context.Context, socket string) error {
+func (o *options) warnDaemonVersion(ctx context.Context, socket string, cfg config.Config) error {
 	if o.daemonVersionChecked {
 		return nil
 	}
@@ -144,6 +149,9 @@ func (o *options) warnDaemonVersion(ctx context.Context, socket string) error {
 		return err
 	}
 	o.daemonVersionChecked = true
+	if err := o.warnAvailableUpdate(cfg, status); err != nil {
+		return err
+	}
 	if status.Version == "" || api.Version == "" || status.Version == api.Version {
 		return nil
 	}
@@ -151,6 +159,28 @@ func (o *options) warnDaemonVersion(ctx context.Context, socket string) error {
 		return nil
 	}
 	_, err := fmt.Fprintf(o.errOut, "papio: daemon is running %s but this CLI is %s — run 'papio daemon stop'; the next command starts the matching daemon\n", status.Version, api.Version)
+	return err
+}
+
+func (o *options) warnAvailableUpdate(cfg config.Config, status daemonPingResult) error {
+	if o.updateHintShown || !status.UpdateAvailable || status.LatestVersion == "" || o.errOut == nil {
+		return nil
+	}
+	if !update.New(cfg.DataDir).TryMarkNagged(time.Now()) {
+		return nil
+	}
+	o.updateHintShown = true
+	executable, err := os.Executable()
+	if err != nil {
+		executable = ""
+	}
+	_, err = fmt.Fprintf(
+		o.errOut,
+		"papio: version %s is available (you have %s) — %s\n",
+		status.LatestVersion,
+		api.Version,
+		update.UpgradeHint(executable, update.ReleasesPageURL),
+	)
 	return err
 }
 

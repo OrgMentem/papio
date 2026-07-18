@@ -111,6 +111,26 @@ options page shows extension and daemon versions together. Extension updates
 arrive through the browser store, while the daemon is updated manually, so an
 extension newer than its daemon is the common direction.
 
+### Learning about new releases
+
+Papio never installs updates on its own, and it never contacts a server
+without being told to. Two mechanisms tell you a newer release exists:
+
+- **Through the extension (no network use by Papio).** Store-delivered
+  extension updates carry the daemon version they were released with. When the
+  popup notices the connected daemon is older, its version line changes to
+  `papio <new> is available` with the upgrade command. Papio itself sends
+  nothing anywhere; the browser's normal store update is the only network
+  activity involved.
+- **Opt-in release check.** With `check = true` under `[updates]` in the
+  configuration (the `papio init` prompt offers this, defaulting to yes), the
+  daemon asks the GitHub releases API for the latest version at most once a
+  day. The request carries no identifying payload beyond the connection
+  itself, and GitHub already hosts the binaries you would download. Results
+  appear in `papio doctor`, in daemon status, and as a single standard-error
+  hint (at most once per day). Configurations without the `[updates]` section
+  never check.
+
 ## Keepalive asks you to sign in again
 
 The browser extension keeps one pinned, muted resolver tab while nonterminal

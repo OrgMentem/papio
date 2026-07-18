@@ -13,6 +13,7 @@ import (
 	"papio/internal/config"
 	"papio/internal/pdf"
 	"papio/internal/store"
+	"papio/internal/update"
 	"papio/internal/zotio"
 )
 
@@ -146,4 +147,75 @@ func TestRunIntegrationReportsVersionSkewAndSkipsUnconfiguredManifests(t *testin
 	if got := report.Checks[3]; got.Name != "native host (Chrome)" || got.Status != Skip {
 		t.Fatalf("Chrome manifest check = %#v", got)
 	}
+}
+
+func TestRunIntegrationUpdates(t *testing.T) {
+	baseConfig := func() config.Config {
+		cfg := config.Default()
+		cfg.Path = filepath.Join(t.TempDir(), "config.toml")
+		return cfg
+	}
+	depsFor := func(cfg config.Config) IntegrationDependencies {
+		return IntegrationDependencies{
+			CLIVersion: "1.2.3",
+			LoadConfig: func() (config.Config, error) { return cfg, nil },
+			DaemonStatus: func(context.Context, config.Config) (DaemonStatus, error) {
+				return DaemonStatus{Status: "ok", Version: "1.2.3"}, nil
+			},
+			ManifestDir: func(config.Config) (string, error) { return t.TempDir(), nil },
+			FirefoxDir:  func(config.Config) (string, error) { return t.TempDir(), nil },
+			ReadFile:    os.ReadFile,
+			ZotioPreflight: func(context.Context, config.Config) (*zotio.PreflightResult, error) {
+				return &zotio.PreflightResult{Version: "1.2.3"}, nil
+			},
+		}
+	}
+	find := func(report Report) Check {
+		for _, check := range report.Checks {
+			if check.Name == "updates" {
+				return check
+			}
+		}
+		t.Fatalf("updates check missing: %+v", report.Checks)
+		return Check{}
+	}
+
+	t.Run("disabled", func(t *testing.T) {
+		cfg := baseConfig()
+		deps := depsFor(cfg)
+		deps.CheckUpdates = func(context.Context, config.Config) (*update.Info, error) {
+			t.Fatal("disabled update check was invoked")
+			return nil, nil
+		}
+		got := find(RunIntegration(context.Background(), deps))
+		if got.Status != Skip || got.Detail != "update check disabled ([updates] check = false)" {
+			t.Fatalf("updates check = %#v", got)
+		}
+	})
+
+	t.Run("current", func(t *testing.T) {
+		cfg := baseConfig()
+		cfg.Updates.Check = true
+		deps := depsFor(cfg)
+		deps.CheckUpdates = func(context.Context, config.Config) (*update.Info, error) {
+			return &update.Info{LatestVersion: "1.2.3", URL: "https://example.test/releases"}, nil
+		}
+		got := find(RunIntegration(context.Background(), deps))
+		if got.Status != Pass || got.Detail != "papio 1.2.3 is current" {
+			t.Fatalf("updates check = %#v", got)
+		}
+	})
+
+	t.Run("behind", func(t *testing.T) {
+		cfg := baseConfig()
+		cfg.Updates.Check = true
+		deps := depsFor(cfg)
+		deps.CheckUpdates = func(context.Context, config.Config) (*update.Info, error) {
+			return &update.Info{LatestVersion: "1.2.4", URL: "https://example.test/releases"}, nil
+		}
+		got := find(RunIntegration(context.Background(), deps))
+		if got.Status != Warn || got.Detail != "papio 1.2.4 available (you have 1.2.3)" || got.Remediation != "https://example.test/releases" {
+			t.Fatalf("updates check = %#v", got)
+		}
+	})
 }

@@ -67,8 +67,8 @@ func TestInitFreshWritesConfigAndAppliesMigrations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load config: %v", err)
 	}
-	if cfg.Email != "reader@example.test" || cfg.AccessMode != config.ModeConservative {
-		t.Fatalf("config = %+v, want email and conservative access mode", cfg)
+	if cfg.Email != "reader@example.test" || cfg.AccessMode != config.ModeConservative || !cfg.Updates.Check {
+		t.Fatalf("config = %+v, want email, conservative access mode, and enabled update checks", cfg)
 	}
 	if _, err := os.Stat(filepath.Join(cfg.DataDir, "papio.db")); err != nil {
 		t.Fatalf("migration bootstrap did not create database: %v", err)
@@ -279,6 +279,7 @@ func TestInitInteractiveCapturesExtensionIDsAndInstalls(t *testing.T) {
 		"abcdefghijklmnopabcdefghijklmnop",
 		"",
 		"",
+		"",
 	}, "\n") + "\n"
 	if _, err := runInitStdin(t, path, deps, answers); err != nil {
 		t.Fatalf("init: %v", err)
@@ -296,5 +297,42 @@ func TestInitInteractiveCapturesExtensionIDsAndInstalls(t *testing.T) {
 	// The captured Chrome ID reaches the native-host install in the same run.
 	if installedID != "abcdefghijklmnopabcdefghijklmnop" {
 		t.Fatalf("native host installed with extension_id %q", installedID)
+	}
+}
+
+func TestInitUpdateCheckPromptWritesBothAnswers(t *testing.T) {
+	for _, test := range []struct {
+		name, answer string
+		want         bool
+	}{
+		{name: "default yes", answer: "", want: true},
+		{name: "no", answer: "n", want: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			path := filepath.Join(home, ".config", "papio", "config.toml")
+			answers := strings.Join([]string{
+				"reader@example.test",
+				"zotio",
+				"stored",
+				"no",
+				test.answer,
+			}, "\n") + "\n"
+			out, err := runInitStdin(t, path, initTestDependencies(t), answers)
+			if err != nil {
+				t.Fatalf("init: %v\n%s", err, out)
+			}
+			cfg, err := config.Load(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.Updates.Check != test.want {
+				t.Fatalf("updates.check = %t, want %t", cfg.Updates.Check, test.want)
+			}
+			if !strings.Contains(out, "Check for papio updates once a day? Queries GitHub releases only; nothing else is sent. [Y/n]") {
+				t.Fatalf("update prompt missing from output: %q", out)
+			}
+		})
 	}
 }

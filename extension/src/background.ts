@@ -53,6 +53,7 @@ const CHROME_PDF_VIEWER_HOST = "mhjfbmdgcfjbbpaeojofohoefgiehjai";
 /** Lowest native daemon that can service this extension. */
 const MIN_DAEMON_VERSION = "0.1.0";
 
+
 const AUTH_EVIDENCE_TTL_MS = 30 * 60_000;
 const QUEUED_HANDOFF_RELEASE_MS = 45_000;
 // A provider page can classify `unknown` transiently: its adapter selectors
@@ -238,23 +239,33 @@ function hostMatches(host: string, providerHosts: string[]): boolean {
   return providerHosts.some((h) => host === h || host.endsWith("." + h));
 }
 
+/** Parse a released semver (with an optional leading v) without retaining its
+ * prerelease identifier: callers only need to distinguish release from pre-release. */
+function parseSemver(version: string): [number, number, number, boolean] | null {
+  const match = /^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z.-]+)?$/.exec(version);
+  if (match === null) return null;
+  const [, major, minor, patch, prerelease] = match;
+  return [Number(major), Number(minor), Number(patch), prerelease !== undefined];
+}
+
 /** True when a released semver (with an optional leading v) is older than the
  * bridge's compatibility floor. Unparseable daemon banners stay connected: the
  * daemon has already completed the protocol handshake. */
-function isSemverLowerThan(version: string, minimum: string): boolean {
-  const parse = (value: string): [number, number, number, boolean] | null => {
-    const match = /^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z.-]+)?$/.exec(value);
-    if (match === null) return null;
-    const [, major, minor, patch, prerelease] = match;
-    return [Number(major), Number(minor), Number(patch), prerelease !== undefined];
-  };
-  const actual = parse(version);
-  const floor = parse(minimum);
+function isSemverLowerThan(version: string, minimum: string, includePrerelease = true): boolean {
+  const actual = parseSemver(version);
+  const floor = parseSemver(minimum);
   if (actual === null || floor === null) return false;
   for (let i = 0; i < 3; i += 1) {
     if (actual[i] !== floor[i]) return actual[i]! < floor[i]!;
   }
-  return actual[3] && !floor[3];
+  return includePrerelease && actual[3] && !floor[3];
+}
+
+/** Whether a stamped extension release has a newer daemon version available.
+ * Buildless development bundles deliberately carry the 0.0.0-dev sentinel. */
+export function hasDaemonUpdateHint(daemonVersion: string | null, stampedVersion: string): boolean {
+  if (daemonVersion === null || stampedVersion === "" || stampedVersion === "0.0.0-dev") return false;
+  return isSemverLowerThan(daemonVersion, stampedVersion, false);
 }
 
 /** Narrow a job_offer's optional `expected` block to the resolver-declared work
@@ -1225,10 +1236,13 @@ export class Bridge {
           : [];
         const connectionStatus =
           version !== null && isSemverLowerThan(version, MIN_DAEMON_VERSION) ? "daemon_outdated" : "connected";
+        const stampedVersion =
+          typeof __PAPIO_DAEMON_VERSION__ === "string" ? __PAPIO_DAEMON_VERSION__ : "";
         await this.update((s) => ({
           ...s,
           connectionStatus,
           daemonVersion: version,
+          daemonUpdateHint: hasDaemonUpdateHint(version, stampedVersion),
           daemonFeatures: features,
         }));
         await this.syncConnectionBadge(connectionStatus);

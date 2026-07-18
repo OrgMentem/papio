@@ -84,6 +84,19 @@ test("renders daemon connection and compatibility states", () => {
   expect(doc.getElementById("daemon-status")?.classList.contains("quiet")).toBe(true);
   expect(doc.getElementById("daemon-status-message")?.textContent).toBe("papio daemon v0.1.0");
 
+  Object.assign(globalThis, { __PAPIO_DAEMON_VERSION__: "0.2.0" });
+  renderDaemonStatus(doc, {
+    connectionStatus: "connected",
+    daemonVersion: "0.1.0",
+    daemonUpdateHint: true,
+  });
+  expect(doc.getElementById("daemon-status")?.classList.contains("quiet")).toBe(false);
+  expect(doc.getElementById("daemon-status-message")?.textContent).toBe(
+    "papio 0.2.0 is available — daemon is v0.1.0",
+  );
+  expect(doc.getElementById("daemon-status-hint")?.textContent).toBe("brew upgrade papio, then: papio daemon stop");
+  delete (globalThis as Record<string, unknown>).__PAPIO_DAEMON_VERSION__;
+
   renderDaemonStatus(doc, { connectionStatus: "disconnected" });
   expect(doc.getElementById("daemon-status")?.textContent).toContain("papio daemon isn't reachable");
   expect(doc.getElementById("daemon-status-hint")?.textContent).toBe("run: papio daemon status");

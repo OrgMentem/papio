@@ -17,6 +17,7 @@ import (
 	"papio/internal/config"
 	"papio/internal/doctor"
 	"papio/internal/pdf"
+	"papio/internal/update"
 	"papio/internal/zotio"
 )
 
@@ -46,6 +47,9 @@ func defaultDoctorDependencies(opt *options) doctor.IntegrationDependencies {
 		ReadFile: os.ReadFile,
 		ZotioPreflight: func(ctx context.Context, cfg config.Config) (*zotio.PreflightResult, error) {
 			return zotio.New(cfg.Zotio).Preflight(ctx)
+		},
+		CheckUpdates: func(ctx context.Context, cfg config.Config) (*update.Info, error) {
+			return update.New(cfg.DataDir).Check(ctx)
 		},
 	}
 }

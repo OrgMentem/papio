@@ -60,7 +60,7 @@ func newInitCommand(opt *options) *cobra.Command {
 }
 
 func newInitCommandWithDependencies(opt *options, deps initDependencies) *cobra.Command {
-	var nonInteractive, skipBrowser bool
+	var checkUpdates, nonInteractive, skipBrowser bool
 	var email, zotioPath, attachmentMode string
 	var openurlBase, shibbolethEntityID, proquestAccountID string
 	var extensionID, firefoxExtensionID string
@@ -84,6 +84,7 @@ func newInitCommandWithDependencies(opt *options, deps initDependencies) *cobra.
 				proquestAccountID:  proquestAccountID,
 				extensionID:        extensionID,
 				firefoxExtensionID: firefoxExtensionID,
+				checkUpdates:       checkUpdates,
 				emailSet:           cmd.Flags().Changed("email"),
 				zotioPathSet:       cmd.Flags().Changed("zotio-path"),
 				attachmentSet:      cmd.Flags().Changed("attachment-mode"),
@@ -92,6 +93,7 @@ func newInitCommandWithDependencies(opt *options, deps initDependencies) *cobra.
 				proquestSet:        cmd.Flags().Changed("proquest-account-id"),
 				extensionIDSet:     cmd.Flags().Changed("extension-id"),
 				firefoxIDSet:       cmd.Flags().Changed("firefox-extension-id"),
+				checkUpdatesSet:    cmd.Flags().Changed("check-updates"),
 			})
 		},
 	}
@@ -105,6 +107,7 @@ func newInitCommandWithDependencies(opt *options, deps initDependencies) *cobra.
 	command.Flags().StringVar(&extensionID, "extension-id", "", "Chrome extension ID allowed to reach the native host")
 	command.Flags().StringVar(&firefoxExtensionID, "firefox-extension-id", "", "Firefox add-on ID allowed to reach the native host")
 	command.Flags().BoolVar(&skipBrowser, "skip-browser", false, "skip Chrome extension and native-host setup")
+	command.Flags().BoolVar(&checkUpdates, "check-updates", true, "check GitHub releases once a day")
 	return command
 }
 
@@ -119,6 +122,7 @@ type initOptions struct {
 	proquestAccountID  string
 	extensionID        string
 	firefoxExtensionID string
+	checkUpdates       bool
 	emailSet           bool
 	zotioPathSet       bool
 	attachmentSet      bool
@@ -127,6 +131,7 @@ type initOptions struct {
 	proquestSet        bool
 	extensionIDSet     bool
 	firefoxIDSet       bool
+	checkUpdatesSet    bool
 }
 
 func runInit(cmd *cobra.Command, opt *options, deps initDependencies, input initOptions) error {
@@ -352,6 +357,15 @@ func applyInitConfig(cmd *cobra.Command, out io.Writer, cfg *config.Config, exis
 	if input.firefoxIDSet {
 		cfg.Browser.FirefoxExtensionID = strings.TrimSpace(input.firefoxExtensionID)
 	}
+	if input.nonInteractive || input.checkUpdatesSet {
+		cfg.Updates.Check = input.checkUpdates
+	} else {
+		enabled, err := initUpdateCheckPrompt(reader, out)
+		if err != nil {
+			return err
+		}
+		cfg.Updates.Check = enabled
+	}
 	return nil
 }
 
@@ -368,6 +382,25 @@ func initPrompt(reader *bufio.Reader, out io.Writer, label, defaultValue string)
 		return defaultValue, nil
 	}
 	return value, nil
+}
+
+func initUpdateCheckPrompt(reader *bufio.Reader, out io.Writer) (bool, error) {
+	const prompt = "Check for papio updates once a day? Queries GitHub releases only; nothing else is sent. [Y/n]"
+	if _, err := fmt.Fprint(out, prompt+" "); err != nil {
+		return false, err
+	}
+	value, err := reader.ReadString('\n')
+	if err != nil && len(value) == 0 {
+		return false, fmt.Errorf("reading update check choice: %w", err)
+	}
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", "y", "yes":
+		return true, nil
+	case "n", "no":
+		return false, nil
+	default:
+		return false, fmt.Errorf("update check choice must be yes or no")
+	}
 }
 
 // accountIDParamRE captures an accountid=<digits> query parameter from anywhere

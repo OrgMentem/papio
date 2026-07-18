@@ -233,6 +233,23 @@ func TestNotifyDefaultsOnAndLoadsFalse(t *testing.T) {
 	}
 }
 
+func TestUpdatesCheckDefaultsOffAndLoadsTrue(t *testing.T) {
+	if Default().Updates.Check {
+		t.Fatal("default updates.check = true, want false")
+	}
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(path, []byte("access_mode='conservative'\n[updates]\ncheck=true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Updates.Check {
+		t.Fatal("loaded updates.check = false, want true")
+	}
+}
+
 func TestBrowserResolverProfiles(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.toml")
 	data := []byte(`access_mode = "conservative"

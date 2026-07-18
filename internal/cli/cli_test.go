@@ -113,10 +113,10 @@ func TestConfigInitWritesPrivateStructuredConfig(t *testing.T) {
 
 func TestDaemonPingResultDecodesFullStatus(t *testing.T) {
 	var result daemonPingResult
-	if err := ipc.DecodeResult(json.RawMessage(`{"status":"ok","version":"1.2.3","extension_connected":true,"extension_version":"4.5.6"}`), &result); err != nil {
+	if err := ipc.DecodeResult(json.RawMessage(`{"status":"ok","version":"1.2.3","extension_connected":true,"extension_version":"4.5.6","update_available":true,"latest_version":"1.2.4"}`), &result); err != nil {
 		t.Fatalf("decode ping result: %v", err)
 	}
-	if result.Status != "ok" || result.Version != "1.2.3" || !result.ExtensionConnected || result.ExtensionVersion != "4.5.6" {
+	if result.Status != "ok" || result.Version != "1.2.3" || !result.ExtensionConnected || result.ExtensionVersion != "4.5.6" || !result.UpdateAvailable || result.LatestVersion != "1.2.4" {
 		t.Fatalf("ping result = %+v", result)
 	}
 }
@@ -192,6 +192,44 @@ func TestCallVersionWarningLeavesJSONOutputClean(t *testing.T) {
 	}
 	if got := stderr.String(); !strings.Contains(got, "papio: daemon is running ") {
 		t.Fatalf("stderr = %q, want version warning", got)
+	}
+}
+
+func TestCallHintsForAvailableUpdateOncePerDay(t *testing.T) {
+	dataDir := t.TempDir()
+	newOptions := func() (*options, *bytes.Buffer) {
+		opt, _, stderr := versionWarningTestOptions(api.Version)
+		opt.configLoader = func(string) (config.Config, error) {
+			return config.Config{DataDir: dataDir}, nil
+		}
+		opt.rpcCall = func(_ context.Context, _ string, method string, _ any, result any) error {
+			if method == "ping" {
+				status := result.(*daemonPingResult)
+				status.Version = api.Version
+				status.UpdateAvailable = true
+				status.LatestVersion = "99.0.0"
+			}
+			return nil
+		}
+		return opt, stderr
+	}
+	first, firstStderr := newOptions()
+	for range 2 {
+		if err := first.call(context.Background(), "jobs.list", struct{}{}, &struct{}{}); err != nil {
+			t.Fatalf("first call: %v", err)
+		}
+	}
+	want := "papio: version 99.0.0 is available (you have " + api.Version + ") — https://github.com/orgmentem/papio/releases/latest\n"
+	if got := firstStderr.String(); got != want {
+		t.Fatalf("first stderr = %q, want %q", got, want)
+	}
+
+	second, secondStderr := newOptions()
+	if err := second.call(context.Background(), "jobs.list", struct{}{}, &struct{}{}); err != nil {
+		t.Fatalf("second call: %v", err)
+	}
+	if got := secondStderr.String(); got != "" {
+		t.Fatalf("second stderr = %q, want empty due to persisted nag", got)
 	}
 }
 

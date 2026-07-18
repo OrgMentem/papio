@@ -8,6 +8,17 @@ records in `notes/acquisition-stack-plan.md`.
 
 ### Added
 
+- Update discovery, without auto-install and without silent network calls.
+  Store-delivered extension builds are stamped with the daemon version they
+  shipped with, so the popup can show a calm "papio X.Y is available" line
+  when the connected daemon is older — Papio itself performs no network
+  activity for this. Separately, an opt-in `[updates] check = true` setting
+  (offered by the `papio init` prompt, default yes) has the daemon consult
+  the GitHub releases API at most once a day, surfacing results in
+  `papio doctor`, daemon status, and a once-daily stderr hint with the
+  channel-appropriate upgrade command. Configurations without the setting
+  never check.
+
 - Version-skew awareness across every surface. The `hello_ack` handshake now
   carries the daemon's version and a feature list (optional, backward
   compatible within `papio-browser/1`), so the auto-updating extension can
@@ -214,6 +225,12 @@ records in `notes/acquisition-stack-plan.md`.
 
 ### Changed
 
+- Redesigned the wordmark's baboon cameo: the abstract head is now a
+  recognizable hamadryas baboon (cape mantle, long muzzle, heavy brow) that
+  peeks up holding a stack of papers instead of waving. Light and dark
+  wordmark variants stay in sync; in dark mode the paper stack renders navy
+  against the cream mantle for contrast, and the face details (eyes, brows,
+  muzzle) stay navy on the coral face in both modes.
 - Config unknown-field errors now explain that the config was likely written
   for a newer papio and name the offending fields, instead of surfacing a raw
   TOML parse error. Zotio preflight failures name the installed version, the

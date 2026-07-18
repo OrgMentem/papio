@@ -6,6 +6,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -16,6 +18,7 @@ import (
 	"papio/internal/ipc"
 	"papio/internal/job"
 	"papio/internal/protocol"
+	"papio/internal/update"
 	"papio/internal/watch"
 	"papio/internal/work"
 )
@@ -164,6 +167,38 @@ func TestRouterPingIncludesBrowserSession(t *testing.T) {
 	}
 	if !status.ExtensionConnected || status.ExtensionVersion != "1.2.3" {
 		t.Fatalf("connected ping = %+v", status)
+	}
+}
+
+func TestRouterPingIncludesUpdatesOnlyWhenEnabled(t *testing.T) {
+	system := testSystem(t)
+	router := Router(system)
+	var disabled map[string]json.RawMessage
+	if rpcErr := callMethod(t, router, "ping", struct{}{}, &disabled); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	if _, ok := disabled["update_available"]; ok {
+		t.Fatalf("disabled update status = %s", disabled)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"tag_name":"v99.0.0","html_url":"https://example.test/releases/v99.0.0"}`))
+	}))
+	defer server.Close()
+	system.Updates = update.NewWithOptions(update.Options{
+		DataDir:     system.Config.DataDir,
+		ReleasesURL: server.URL,
+		Client:      server.Client(),
+	})
+	var enabled struct {
+		UpdateAvailable *bool  `json:"update_available"`
+		LatestVersion   string `json:"latest_version"`
+	}
+	if rpcErr := callMethod(t, router, "ping", struct{}{}, &enabled); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	if enabled.UpdateAvailable == nil || !*enabled.UpdateAvailable || enabled.LatestVersion != "99.0.0" {
+		t.Fatalf("enabled update status = %+v", enabled)
 	}
 }
 

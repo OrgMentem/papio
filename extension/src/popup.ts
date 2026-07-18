@@ -22,7 +22,7 @@ export interface PopupActions {
  * batch. */
 export function renderDaemonStatus(
   doc: Document,
-  status: Pick<StoreShape, "connectionStatus" | "daemonVersion">,
+  status: Pick<StoreShape, "connectionStatus" | "daemonVersion" | "daemonUpdateHint">,
 ): void {
   const card = doc.getElementById("daemon-status");
   const message = doc.getElementById("daemon-status-message");
@@ -33,12 +33,24 @@ export function renderDaemonStatus(
   let action = "";
   let quiet = false;
   switch (status.connectionStatus ?? "disconnected") {
-    case "connected":
-      if (typeof status.daemonVersion === "string" && status.daemonVersion.length > 0) {
+    case "connected": {
+      const stampedVersion =
+        typeof __PAPIO_DAEMON_VERSION__ === "string" ? __PAPIO_DAEMON_VERSION__ : "";
+      if (
+        status.daemonUpdateHint === true &&
+        stampedVersion !== "" &&
+        stampedVersion !== "0.0.0-dev" &&
+        typeof status.daemonVersion === "string" &&
+        status.daemonVersion.length > 0
+      ) {
+        line = `papio ${stampedVersion} is available — daemon is v${status.daemonVersion}`;
+        action = "brew upgrade papio, then: papio daemon stop";
+      } else if (typeof status.daemonVersion === "string" && status.daemonVersion.length > 0) {
         line = `papio daemon v${status.daemonVersion}`;
         quiet = true;
       }
       break;
+    }
     case "daemon_outdated":
       line = "papio daemon is out of date — update papio to keep downloads working";
       action = "update papio, then restart the daemon";

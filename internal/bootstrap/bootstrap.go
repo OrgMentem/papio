@@ -30,6 +30,7 @@ import (
 	"papio/internal/resolvers/openalex"
 	"papio/internal/resolvers/unpaywall"
 	"papio/internal/store"
+	"papio/internal/update"
 	"papio/internal/watch"
 	"papio/internal/work"
 	"papio/internal/zotio"
@@ -55,6 +56,7 @@ type System struct {
 	Watches       *watch.Store
 	WatchRunner   *watch.Runner
 	Zotio         *zotio.Service
+	Updates       *update.Checker
 }
 
 const autoImportRetryBackoff = 2 * time.Second
@@ -207,6 +209,11 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 	if err != nil {
 		return nil, err
 	}
+	var updates *update.Checker
+	if cfg.Updates.Check {
+		updates = update.New(cfg.DataDir)
+	}
+
 	system := &System{
 		Config: cfg, Store: db, Jobs: jobs, Artifacts: artifacts, Budgets: budgets,
 		App: service, Scheduler: scheduler, Watches: watches, WatchRunner: watchRunner,
@@ -214,6 +221,7 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 		Browser:       browser.NewBridge(jobs, service, cfg, version, nil),
 		Discovery:     discoveryClient,
 		Zotio:         zotioService,
+		Updates:       updates,
 		PDFCapability: capability, WorkerBinary: executable,
 	}
 	failed = false

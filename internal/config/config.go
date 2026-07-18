@@ -136,6 +136,11 @@ type Notify struct {
 	Enabled bool `toml:"enabled"`
 }
 
+// Updates configures the optional daily release check.
+type Updates struct {
+	Check bool `toml:"check"`
+}
+
 // Config is the loaded, validated configuration.
 type Config struct {
 	AccessMode string            `toml:"access_mode"`
@@ -146,6 +151,7 @@ type Config struct {
 	Browser    Browser           `toml:"browser"`
 	Zotio      Zotio             `toml:"zotio"`
 	Notify     Notify            `toml:"notify"`
+	Updates    Updates           `toml:"updates"`
 	Sources    map[string]Source `toml:"sources"`
 
 	// Path this config was loaded from ("" for defaults).

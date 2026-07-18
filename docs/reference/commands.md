@@ -223,6 +223,7 @@ papio init [flags]
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
 | `--attachment-mode` | `string` |  | zotio attachment mode: stored or linked-file |
+| `--check-updates` | `bool` | `true` | check GitHub releases once a day |
 | `--email` | `string` |  | contact email for polite API pools |
 | `--extension-id` | `string` |  | Chrome extension ID allowed to reach the native host |
 | `--firefox-extension-id` | `string` |  | Firefox add-on ID allowed to reach the native host |

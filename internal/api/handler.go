@@ -20,6 +20,7 @@ import (
 	"papio/internal/ipc"
 	"papio/internal/job"
 	"papio/internal/protocol"
+	"papio/internal/update"
 	"papio/internal/watch"
 	"papio/internal/zotio"
 )
@@ -149,9 +150,11 @@ type statusResult struct {
 	Version            string `json:"version"`
 	ExtensionConnected bool   `json:"extension_connected"`
 	ExtensionVersion   string `json:"extension_version,omitempty"`
+	UpdateAvailable    *bool  `json:"update_available,omitempty"`
+	LatestVersion      string `json:"latest_version,omitempty"`
 }
 
-func ping(_ context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
+func ping(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
 	var params struct{}
 	if err := ipc.DecodeParams(raw, &params); err != nil {
 		return badParams(err)
@@ -159,6 +162,14 @@ func ping(_ context.Context, raw json.RawMessage, system *bootstrap.System) ([]b
 	result := statusResult{Status: "ok", Version: Version}
 	if system != nil && system.Browser != nil {
 		result.ExtensionVersion, _, result.ExtensionConnected = system.Browser.SessionInfo()
+	}
+	if system != nil && system.Updates != nil {
+		available := false
+		if info, _ := system.Updates.Check(ctx); info != nil {
+			result.LatestVersion = info.LatestVersion
+			available = update.IsNewer(info.LatestVersion, Version)
+		}
+		result.UpdateAvailable = &available
 	}
 	return marshal(result)
 }
