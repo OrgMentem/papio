@@ -107,7 +107,7 @@ func newInitCommandWithDependencies(opt *options, deps initDependencies) *cobra.
 	command.Flags().StringVar(&extensionID, "extension-id", "", "Chrome extension ID allowed to reach the native host")
 	command.Flags().StringVar(&firefoxExtensionID, "firefox-extension-id", "", "Firefox add-on ID allowed to reach the native host")
 	command.Flags().BoolVar(&skipBrowser, "skip-browser", false, "skip Chrome extension and native-host setup")
-	command.Flags().BoolVar(&checkUpdates, "check-updates", true, "Check for papio and zotio updates once a day? Queries GitHub releases only; nothing else is sent. [Y/n]")
+	command.Flags().BoolVar(&checkUpdates, "check-updates", true, "check for papio and zotio updates once a day via GitHub releases (sends nothing else)")
 	return command
 }
 

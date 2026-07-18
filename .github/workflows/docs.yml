@@ -6,6 +6,7 @@ on:
     paths:
       - "docs/**"
       - "mkdocs.yml"
+      - "cmd/docs-gen/**"
       - ".github/workflows/docs.yml"
   workflow_dispatch:
 
@@ -28,6 +29,13 @@ jobs:
         run: pip install -r docs/requirements.txt
       - name: Build site
         run: zensical build
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+      - name: Generate agent docs (llms.txt, llms-full.txt)
+        run: |
+          go run ./cmd/docs-gen -llms-out site
+          head -12 site/llms.txt
       - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5
         with:
           path: site

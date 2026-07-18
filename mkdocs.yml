@@ -2,7 +2,9 @@
 # and, unchanged, by Material for MkDocs (`mkdocs build`) as a fallback while
 # Zensical (currently 0.0.x, pre-1.0) matures toward full parity.
 #
-# Source Markdown lives in docs/ and is authored by hand.
+# Source Markdown lives in docs/. Pages under docs/reference/ are CODE-GENERATED
+# by `cmd/docs-gen` (run `go run ./cmd/docs-gen`) — never hand-edit them.
+# Everything else in docs/ is authored by hand.
 
 site_name: papio
 site_description: A local paper-acquisition broker — searches scholarly works, creates bounded acquisition jobs, validates candidate PDFs, and hands ready artifacts to Zotero through Zotio.
