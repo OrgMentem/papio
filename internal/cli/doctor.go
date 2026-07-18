@@ -41,9 +41,16 @@ type integrationDoctorReport struct {
 	Checks []integrationDoctorCheck `json:"checks"`
 }
 
+type doctorDaemonStatus struct {
+	Status             string `json:"status"`
+	Version            string `json:"version"`
+	ExtensionConnected bool   `json:"extension_connected"`
+	ExtensionVersion   string `json:"extension_version"`
+}
+
 type doctorDependencies struct {
 	LoadConfig     func(*options) (config.Config, error)
-	DaemonStatus   func(context.Context, *options, config.Config) (map[string]string, error)
+	DaemonStatus   func(context.Context, *options, config.Config) (doctorDaemonStatus, error)
 	ManifestDir    func() (string, error)
 	FirefoxDir     func() (string, error)
 	ReadFile       func(string) ([]byte, error)
@@ -55,12 +62,12 @@ func defaultDoctorDependencies() doctorDependencies {
 		LoadConfig: func(opt *options) (config.Config, error) {
 			return opt.loadConfig()
 		},
-		DaemonStatus: func(ctx context.Context, opt *options, _ config.Config) (map[string]string, error) {
+		DaemonStatus: func(ctx context.Context, opt *options, _ config.Config) (doctorDaemonStatus, error) {
 			// callExisting deliberately avoids daemon.NewAutostarter: doctor must
 			// diagnose a stopped daemon, not hide it by starting one.
-			var status map[string]string
+			var status doctorDaemonStatus
 			if err := opt.callExisting(ctx, "ping", struct{}{}, &status); err != nil {
-				return nil, err
+				return doctorDaemonStatus{}, err
 			}
 			return status, nil
 		},
@@ -109,6 +116,7 @@ func runIntegrationDoctor(ctx context.Context, opt *options, deps doctorDependen
 	}
 	skipRemaining := func(reason string) {
 		add("daemon", doctorSkip, reason, "")
+		add("extension", doctorSkip, reason, "")
 		add("native host (Chrome)", doctorSkip, reason, "")
 		add("native host (Firefox)", doctorSkip, reason, "")
 		add("zotio", doctorSkip, reason, "")
@@ -133,22 +141,33 @@ func runIntegrationDoctor(ctx context.Context, opt *options, deps doctorDependen
 	status, err := deps.DaemonStatus(ctx, opt, cfg)
 	if err != nil {
 		add("daemon", doctorFail, err.Error(), "papio status")
+		add("extension", doctorSkip, "skipped: daemon is unreachable", "")
 		add("native host (Chrome)", doctorSkip, "skipped: daemon is unreachable", "")
 		add("native host (Firefox)", doctorSkip, "skipped: daemon is unreachable", "")
 		add("zotio", doctorSkip, "skipped: daemon is unreachable", "")
 		return report
 	}
-	if status["status"] != "ok" || strings.TrimSpace(status["version"]) == "" {
-		add("daemon", doctorFail, fmt.Sprintf("unexpected daemon status %q (version %q)", status["status"], status["version"]), "papio status")
+	if status.Status != "ok" || strings.TrimSpace(status.Version) == "" {
+		add("daemon", doctorFail, fmt.Sprintf("unexpected daemon status %q (version %q)", status.Status, status.Version), "papio status")
+		add("extension", doctorSkip, "skipped: daemon status is invalid", "")
 		add("native host (Chrome)", doctorSkip, "skipped: daemon status is invalid", "")
 		add("native host (Firefox)", doctorSkip, "skipped: daemon status is invalid", "")
 		add("zotio", doctorSkip, "skipped: daemon status is invalid", "")
 		return report
 	}
-	if status["version"] != api.Version {
-		add("daemon", doctorWarn, fmt.Sprintf("reachable; daemon %s, CLI %s", status["version"], api.Version), "papio daemon stop (next command autostarts the new daemon)")
+	if status.Version != api.Version {
+		add("daemon", doctorWarn, fmt.Sprintf("reachable; daemon %s, CLI %s", status.Version, api.Version), "papio daemon stop (next command autostarts the new daemon)")
 	} else {
-		add("daemon", doctorPass, "reachable; version "+status["version"], "")
+		add("daemon", doctorPass, "reachable; version "+status.Version, "")
+	}
+	if status.ExtensionConnected {
+		detail := "connected"
+		if status.ExtensionVersion != "" {
+			detail += " (v" + status.ExtensionVersion + ")"
+		}
+		add("extension", doctorPass, detail, "")
+	} else {
+		add("extension", doctorWarn, "extension has not connected since daemon start", "install and enable the browser extension, then run papio init to install the native-host manifest")
 	}
 
 	runManifestDoctorChecks(cfg, deps, add)

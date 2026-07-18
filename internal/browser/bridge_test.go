@@ -179,17 +179,21 @@ func TestHelloAckAnnouncesDaemonVersion(t *testing.T) {
 	}
 }
 
-func TestHelloRecordsExtensionDetails(t *testing.T) {
+func TestSessionInfoAfterHello(t *testing.T) {
 	b, _, _, _ := newBridge(t)
 	runSync(t, b, inFrame(t, protocol.MsgHello, "", map[string]any{
 		"extension_version": "1.2.3",
 		"adapter_versions":  map[string]string{"jstor": "1.0.0"},
 	}))
-	if b.ExtensionVersion != "1.2.3" {
-		t.Fatalf("extension version = %q, want 1.2.3", b.ExtensionVersion)
+	version, adapterCount, helloSeen := b.SessionInfo()
+	if version != "1.2.3" {
+		t.Fatalf("extension version = %q, want 1.2.3", version)
 	}
-	if b.AdapterVersions["jstor"] != "1.0.0" {
-		t.Fatalf("adapter version = %q, want 1.0.0", b.AdapterVersions["jstor"])
+	if adapterCount != 1 {
+		t.Fatalf("adapter count = %d, want 1", adapterCount)
+	}
+	if !helloSeen {
+		t.Fatal("hello was not recorded")
 	}
 }
 

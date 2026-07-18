@@ -61,7 +61,9 @@ func Router(system *bootstrap.System) ipc.Router {
 // The delayed callback lets the successful response flush before cancellation.
 func RouterWithShutdown(system *bootstrap.System, shutdown context.CancelFunc) ipc.Router {
 	methods := map[string]ipc.MethodHandler{
-		"ping": ping,
+		"ping": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return ping(ctx, raw, system)
+		},
 		"acquire.submit": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return submit(ctx, raw, system)
 		},
@@ -142,12 +144,23 @@ func RouterWithShutdown(system *bootstrap.System, shutdown context.CancelFunc) i
 	return ipc.Router{Methods: methods}
 }
 
-func ping(_ context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+type statusResult struct {
+	Status             string `json:"status"`
+	Version            string `json:"version"`
+	ExtensionConnected bool   `json:"extension_connected"`
+	ExtensionVersion   string `json:"extension_version,omitempty"`
+}
+
+func ping(_ context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
 	var params struct{}
 	if err := ipc.DecodeParams(raw, &params); err != nil {
 		return badParams(err)
 	}
-	return marshal(map[string]string{"status": "ok", "version": Version})
+	result := statusResult{Status: "ok", Version: Version}
+	if system != nil && system.Browser != nil {
+		result.ExtensionVersion, _, result.ExtensionConnected = system.Browser.SessionInfo()
+	}
+	return marshal(result)
 }
 
 type acquireSubmitParams struct {

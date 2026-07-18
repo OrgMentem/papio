@@ -286,6 +286,29 @@ function helloRequiredError(): unknown {
   };
 }
 
+function helloAck(payload: { daemon_version?: string; features?: string[] } = {}): unknown {
+  return {
+    protocol: "papio-browser/1",
+    type: "hello_ack",
+    msg_id: "hello_ack_000001",
+    seq: 1,
+    payload,
+  };
+}
+
+function extensionOutdatedError(): unknown {
+  return {
+    protocol: "papio-browser/1",
+    type: "error",
+    msg_id: "error_00000002",
+    seq: 1,
+    payload: {
+      code: "extension_outdated",
+      message: "extension must be updated",
+    },
+  };
+}
+
 test("hello is the first outgoing frame with a valid msg_id and seq 0", async () => {
   const h = makeHarness();
   await h.bridge.start();
@@ -294,6 +317,46 @@ test("hello is the first outgoing frame with a valid msg_id and seq 0", async ()
   expect(first?.seq).toBe(0);
   expect(first?.msg_id).toMatch(/^[A-Za-z0-9_-]{8,64}$/);
   expect(first?.payload["extension_version"]).toBe("0.1.0");
+});
+
+test("hello acknowledgment persists daemon version, features, and connected status", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ daemon_version: "0.1.0", features: ["browser-v1", "direct-download"] }));
+
+  expect(h.backend.store).toMatchObject({
+    connectionStatus: "connected",
+    daemonVersion: "0.1.0",
+    daemonFeatures: ["browser-v1", "direct-download"],
+  });
+});
+
+test("an older daemon's empty hello acknowledgment remains connected", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(helloAck());
+
+  expect(h.backend.store).toMatchObject({
+    connectionStatus: "connected",
+    daemonVersion: null,
+    daemonFeatures: [],
+  });
+});
+
+test("a daemon below the compatibility floor is marked outdated", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ daemon_version: "0.0.9" }));
+
+  expect(h.backend.store.connectionStatus).toBe("daemon_outdated");
+});
+
+test("extension-outdated daemon error is persisted for the popup", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(extensionOutdatedError());
+
+  expect(h.backend.store.connectionStatus).toBe("extension_outdated");
 });
 
 test("job_offer opens exactly one tab and replies job_accept", async () => {

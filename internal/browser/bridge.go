@@ -52,9 +52,9 @@ type Bridge struct {
 	Version  string
 	Features []string
 
-	// ExtensionVersion and AdapterVersions describe the current hello-session.
-	ExtensionVersion string
-	AdapterVersions  map[string]string
+	// extensionVersion and adapterVersions describe the current hello-session.
+	extensionVersion string
+	adapterVersions  map[string]string
 
 	mu                sync.Mutex
 	seq               int64
@@ -74,6 +74,12 @@ func NewBridge(jobs *job.Store, svc *app.Service, cfg config.Config, version str
 		offered: map[string]bool{}, cancelSent: map[string]bool{},
 		now: time.Now,
 	}
+}
+// SessionInfo returns a consistent snapshot of the current extension hello-session.
+func (b *Bridge) SessionInfo() (extensionVersion string, adapterCount int, helloSeen bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.extensionVersion, len(b.adapterVersions), b.helloSeen
 }
 
 // Sync processes a batch of inbound frames (possibly empty for a poll) and
@@ -125,8 +131,8 @@ func (b *Bridge) handle(ctx context.Context, msg *protocol.BrowserMessage) ([]js
 		p := msg.Payload.(*protocol.HelloPayload)
 		b.helloSeen = true
 		b.extensionOutdated = compareVersion(p.ExtensionVersion, MinExtensionVersion) < 0
-		b.ExtensionVersion = p.ExtensionVersion
-		b.AdapterVersions = p.AdapterVersions
+		b.extensionVersion = p.ExtensionVersion
+		b.adapterVersions = p.AdapterVersions
 		b.offered = map[string]bool{}
 		b.cancelSent = map[string]bool{}
 		if b.extensionOutdated {

@@ -40,6 +40,26 @@
         font-size: 12px;
         margin: 4px 0 16px;
       }
+      .daemon-status {
+        border-left: 3px solid #a15c17;
+        color: #6d4316;
+        font-size: 12px;
+        margin: 0 0 16px;
+        padding-left: 9px;
+      }
+      .daemon-status-message {
+        font-weight: 600;
+      }
+      .daemon-status-hint {
+        margin-top: 2px;
+      }
+      .daemon-status.quiet {
+        border-left: 0;
+        color: #607080;
+        font-size: 11px;
+        margin: -10px 0 16px;
+        padding-left: 0;
+      }
       .empty {
         color: #607080;
         margin: 12px 0;
@@ -245,6 +265,10 @@
       <h1>Acquisition batch</h1>
       <p id="summary" class="summary">0 need you · 0 downloading · 0 imported · 0 failed</p>
     </header>
+    <div id="daemon-status" class="daemon-status" hidden>
+      <div id="daemon-status-message" class="daemon-status-message"></div>
+      <div id="daemon-status-hint" class="daemon-status-hint"></div>
+    </div>
     <div id="empty" class="empty" hidden>No active jobs.</div>
 
     <section id="terms-consent" class="terms-consent" hidden>

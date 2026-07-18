@@ -5,7 +5,7 @@ import { readFileSync } from "node:fs";
 
 import { Window } from "happy-dom";
 
-import { cancelJob, focusJob, renderJobs, wireSettings, type PopupActions } from "../src/popup";
+import { cancelJob, focusJob, renderDaemonStatus, renderJobs, wireSettings, type PopupActions } from "../src/popup";
 import type { ActiveJob } from "../src/state";
 
 function popupDocument(): Document {
@@ -75,6 +75,27 @@ test("renders a batch with needs-you first and correct phase counts", () => {
   expect(doc.querySelector("#done-section")?.hasAttribute("open")).toBe(false);
   expect(doc.querySelector("#failed-section")?.hasAttribute("open")).toBe(false);
   expect(doc.getElementById("capture-btn")).not.toBeNull();
+});
+
+test("renders daemon connection and compatibility states", () => {
+  const doc = popupDocument();
+  renderDaemonStatus(doc, { connectionStatus: "connected", daemonVersion: "0.1.0" });
+  expect(doc.getElementById("daemon-status")?.hidden).toBe(false);
+  expect(doc.getElementById("daemon-status")?.classList.contains("quiet")).toBe(true);
+  expect(doc.getElementById("daemon-status-message")?.textContent).toBe("papio daemon v0.1.0");
+
+  renderDaemonStatus(doc, { connectionStatus: "disconnected" });
+  expect(doc.getElementById("daemon-status")?.textContent).toContain("papio daemon isn't reachable");
+  expect(doc.getElementById("daemon-status-hint")?.textContent).toBe("run: papio daemon status");
+
+  renderDaemonStatus(doc, { connectionStatus: "daemon_outdated", daemonVersion: "0.0.9" });
+  expect(doc.getElementById("daemon-status")?.textContent).toContain("papio daemon is out of date");
+  expect(doc.getElementById("daemon-status-hint")?.textContent).toContain("update papio");
+
+  renderDaemonStatus(doc, { connectionStatus: "extension_outdated" });
+  expect(doc.getElementById("daemon-status")?.textContent).toContain(
+    "this extension is older than your papio daemon supports",
+  );
 });
 
 test("focus button activates the correct broker-owned tab and then its window", async () => {

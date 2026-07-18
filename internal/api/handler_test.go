@@ -139,6 +139,34 @@ func TestRouterRetryAndStrictEmptyParams(t *testing.T) {
 	}
 }
 
+func TestRouterPingIncludesBrowserSession(t *testing.T) {
+	system := testSystem(t)
+	router := Router(system)
+	var status struct {
+		Status             string `json:"status"`
+		Version            string `json:"version"`
+		ExtensionConnected bool   `json:"extension_connected"`
+		ExtensionVersion   string `json:"extension_version"`
+	}
+	if rpcErr := callMethod(t, router, "ping", struct{}{}, &status); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	if status.Status != "ok" || status.Version != Version || status.ExtensionConnected || status.ExtensionVersion != "" {
+		t.Fatalf("initial ping = %+v", status)
+	}
+
+	hello := json.RawMessage(`{"protocol":"papio-browser/1","type":"hello","msg_id":"client-hello-status","seq":0,"payload":{"extension_version":"1.2.3"}}`)
+	if rpcErr := callMethod(t, router, "browser.sync", map[string]any{"messages": []json.RawMessage{hello}}, nil); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	if rpcErr := callMethod(t, router, "ping", struct{}{}, &status); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	if !status.ExtensionConnected || status.ExtensionVersion != "1.2.3" {
+		t.Fatalf("connected ping = %+v", status)
+	}
+}
+
 func TestRouterDoctorProducesStructuredReport(t *testing.T) {
 	system := testSystem(t)
 	var result struct {

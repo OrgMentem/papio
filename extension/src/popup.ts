@@ -8,13 +8,53 @@
 // ./capture; the popup only wires the DOM.
 
 import { captureFixture, type ChromeCaptureApi, type PageCapture, type Provider, type Scenario } from "./capture";
-import { chromeBackend, type ActiveJob, TERMS_CONSENT_KEY } from "./state";
+import { chromeBackend, type ActiveJob, type StoreShape, TERMS_CONSENT_KEY } from "./state";
 
 type JobSection = "needs-you" | "in-flight" | "done" | "failed";
 
 export interface PopupActions {
   cancel(jobID: string): Promise<void>;
   focus(job: ActiveJob): Promise<void>;
+}
+
+/** Render the native-daemon compatibility state independently of job activity,
+ * so a connection or version problem remains visible in an otherwise empty
+ * batch. */
+export function renderDaemonStatus(
+  doc: Document,
+  status: Pick<StoreShape, "connectionStatus" | "daemonVersion">,
+): void {
+  const card = doc.getElementById("daemon-status");
+  const message = doc.getElementById("daemon-status-message");
+  const hint = doc.getElementById("daemon-status-hint");
+  if (!card || !message || !hint) return;
+
+  let line = "";
+  let action = "";
+  let quiet = false;
+  switch (status.connectionStatus ?? "disconnected") {
+    case "connected":
+      if (typeof status.daemonVersion === "string" && status.daemonVersion.length > 0) {
+        line = `papio daemon v${status.daemonVersion}`;
+        quiet = true;
+      }
+      break;
+    case "daemon_outdated":
+      line = "papio daemon is out of date — update papio to keep downloads working";
+      action = "update papio, then restart the daemon";
+      break;
+    case "extension_outdated":
+      line = "this extension is older than your papio daemon supports — update it from your browser's extension store";
+      break;
+    case "disconnected":
+      line = "papio daemon isn't reachable";
+      action = "run: papio daemon status";
+      break;
+  }
+  card.hidden = line.length === 0;
+  card.classList.toggle("quiet", quiet);
+  message.textContent = line;
+  hint.textContent = action;
 }
 
 interface ClassifiedJob {
@@ -244,8 +284,9 @@ export function renderTermsConsent(
 }
 
 export async function refresh(): Promise<void> {
-  const { activeJobs } = await chromeBackend(chrome.storage).load();
-  renderJobs(document, activeJobs, realActions(), () => {
+  const store = await chromeBackend(chrome.storage).load();
+  renderDaemonStatus(document, store);
+  renderJobs(document, store.activeJobs, realActions(), () => {
     void refresh();
   });
   let consent: "accept" | "manual" | undefined;
@@ -256,7 +297,7 @@ export async function refresh(): Promise<void> {
   } catch {
     consent = undefined;
   }
-  renderTermsConsent(document, activeJobs, consent, (value) => {
+  renderTermsConsent(document, store.activeJobs, consent, (value) => {
     void sendTermsConsent(value).then(() => refresh());
   });
 }

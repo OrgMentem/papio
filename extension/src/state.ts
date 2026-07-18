@@ -20,6 +20,10 @@ export const TERMS_CONSENT_KEY = "papio_terms_consent_v1";
  * disables routing and restores legacy in-window tabs; absent means enabled. */
 export const WORK_WINDOW_KEY = "papio_work_window_v1";
 
+/** Native-daemon compatibility as last reported by the bridge. `undefined`
+ * remains valid for state persisted by earlier extension versions. */
+export type DaemonConnectionStatus = "connected" | "disconnected" | "daemon_outdated" | "extension_outdated";
+
 export interface ActiveJob {
   job_id: string;
   tab_id: number;
@@ -71,6 +75,12 @@ export interface StoreShape {
    * has created one this browser session. Window ids are session-scoped, never
    * sensitive. Verified live (and recreated) before every reuse. */
   workWindowID?: number;
+  /** Native-daemon connection and capability data, refreshed by hello_ack.
+   * Version is null when an older daemon does not report one. */
+  connectionStatus?: DaemonConnectionStatus;
+  daemonVersion?: string | null;
+  daemonFeatures?: string[];
+
 }
 
 /** Async key/value seam. The real implementation wraps chrome.storage; tests
@@ -81,7 +91,12 @@ export interface StateBackend {
 }
 
 export function emptyStore(): StoreShape {
-  return { activeJobs: [] };
+  return {
+    activeJobs: [],
+    connectionStatus: "disconnected",
+    daemonVersion: null,
+    daemonFeatures: [],
+  };
 }
 
 export function findByJob(store: StoreShape, jobID: string): ActiveJob | undefined {

@@ -34,8 +34,8 @@ func TestDoctorAllGreen(t *testing.T) {
 	var out bytes.Buffer
 	command := newDoctorCommandWithDependencies(&options{out: &out}, doctorDependencies{
 		LoadConfig: func(*options) (config.Config, error) { return cfg, nil },
-		DaemonStatus: func(context.Context, *options, config.Config) (map[string]string, error) {
-			return map[string]string{"status": "ok", "version": api.Version}, nil
+		DaemonStatus: func(context.Context, *options, config.Config) (doctorDaemonStatus, error) {
+			return doctorDaemonStatus{Status: "ok", Version: api.Version, ExtensionConnected: true, ExtensionVersion: "1.2.3"}, nil
 		},
 		ManifestDir: func() (string, error) { return chromeDir, nil },
 		FirefoxDir:  func() (string, error) { return firefoxDir, nil },
@@ -48,10 +48,55 @@ func TestDoctorAllGreen(t *testing.T) {
 		t.Fatalf("doctor: %v", err)
 	}
 	got := out.String()
-	for _, name := range []string{"config", "daemon", "native host (Chrome)", "native host (Firefox)", "zotio"} {
+	for _, name := range []string{"config", "daemon", "extension", "native host (Chrome)", "native host (Firefox)", "zotio"} {
 		if !strings.Contains(got, "PASS") || !strings.Contains(got, name) {
 			t.Fatalf("doctor output missing passing %q: %q", name, got)
 		}
+	}
+	if !strings.Contains(got, "connected (v1.2.3)") {
+		t.Fatalf("doctor output missing extension version: %q", got)
+	}
+}
+
+func TestDoctorExtensionNotConnectedWarnsWithSetupFix(t *testing.T) {
+	cfg := config.Default()
+	cfg.Path = filepath.Join(t.TempDir(), "config.toml")
+	report := runIntegrationDoctor(context.Background(), &options{}, doctorDependencies{
+		LoadConfig: func(*options) (config.Config, error) { return cfg, nil },
+		DaemonStatus: func(context.Context, *options, config.Config) (doctorDaemonStatus, error) {
+			return doctorDaemonStatus{Status: "ok", Version: api.Version}, nil
+		},
+		ManifestDir: func() (string, error) { return t.TempDir(), nil },
+		FirefoxDir:  func() (string, error) { return t.TempDir(), nil },
+		ReadFile:    os.ReadFile,
+		ZotioPreflight: func(context.Context, config.Config) (*zotio.PreflightResult, error) {
+			return &zotio.PreflightResult{Version: "1.2.3"}, nil
+		},
+	})
+	got := report.Checks[2]
+	if got.Name != "extension" || got.Status != doctorWarn || got.Detail != "extension has not connected since daemon start" || !strings.Contains(got.Fix, "browser extension") || !strings.Contains(got.Fix, "papio init") {
+		t.Fatalf("extension check = %#v", got)
+	}
+}
+
+func TestDoctorDaemonDownSkipsExtension(t *testing.T) {
+	cfg := config.Default()
+	cfg.Path = filepath.Join(t.TempDir(), "config.toml")
+	report := runIntegrationDoctor(context.Background(), &options{}, doctorDependencies{
+		LoadConfig: func(*options) (config.Config, error) { return cfg, nil },
+		DaemonStatus: func(context.Context, *options, config.Config) (doctorDaemonStatus, error) {
+			return doctorDaemonStatus{}, errors.New("daemon is unreachable")
+		},
+		ManifestDir: func() (string, error) { return t.TempDir(), nil },
+		FirefoxDir:  func() (string, error) { return t.TempDir(), nil },
+		ReadFile:    os.ReadFile,
+		ZotioPreflight: func(context.Context, config.Config) (*zotio.PreflightResult, error) {
+			return &zotio.PreflightResult{Version: "1.2.3"}, nil
+		},
+	})
+	got := report.Checks[2]
+	if got.Name != "extension" || got.Status != doctorSkip || got.Detail != "skipped: daemon is unreachable" {
+		t.Fatalf("extension check = %#v", got)
 	}
 }
 
@@ -61,9 +106,9 @@ func TestDoctorConfigFailureSkipsDaemon(t *testing.T) {
 		LoadConfig: func(*options) (config.Config, error) {
 			return config.Config{}, errors.New("parsing config: unknown field \"browser.new_field\"")
 		},
-		DaemonStatus: func(context.Context, *options, config.Config) (map[string]string, error) {
+		DaemonStatus: func(context.Context, *options, config.Config) (doctorDaemonStatus, error) {
 			daemonCalled = true
-			return nil, nil
+			return doctorDaemonStatus{}, nil
 		},
 		ManifestDir: func() (string, error) { return "", nil },
 		FirefoxDir:  func() (string, error) { return "", nil },
@@ -90,8 +135,8 @@ func TestDoctorFailureReturnsCommandError(t *testing.T) {
 	var out bytes.Buffer
 	command := newDoctorCommandWithDependencies(&options{out: &out}, doctorDependencies{
 		LoadConfig: func(*options) (config.Config, error) { return cfg, nil },
-		DaemonStatus: func(context.Context, *options, config.Config) (map[string]string, error) {
-			return map[string]string{"status": "ok", "version": api.Version}, nil
+		DaemonStatus: func(context.Context, *options, config.Config) (doctorDaemonStatus, error) {
+			return doctorDaemonStatus{Status: "ok", Version: api.Version}, nil
 		},
 		ManifestDir: func() (string, error) { return t.TempDir(), nil },
 		FirefoxDir:  func() (string, error) { return t.TempDir(), nil },

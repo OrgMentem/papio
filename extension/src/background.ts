@@ -50,6 +50,9 @@ import { routeResolverService, type ResolverRoute } from "./resolver";
 
 export const NATIVE_HOST = "com.orgmentem.papio";
 const CHROME_PDF_VIEWER_HOST = "mhjfbmdgcfjbbpaeojofohoefgiehjai";
+/** Lowest native daemon that can service this extension. */
+const MIN_DAEMON_VERSION = "0.1.0";
+
 const AUTH_EVIDENCE_TTL_MS = 30 * 60_000;
 const QUEUED_HANDOFF_RELEASE_MS = 45_000;
 // A provider page can classify `unknown` transiently: its adapter selectors
@@ -227,6 +230,25 @@ interface DownloadTrack {
 
 function hostMatches(host: string, providerHosts: string[]): boolean {
   return providerHosts.some((h) => host === h || host.endsWith("." + h));
+}
+
+/** True when a released semver (with an optional leading v) is older than the
+ * bridge's compatibility floor. Unparseable daemon banners stay connected: the
+ * daemon has already completed the protocol handshake. */
+function isSemverLowerThan(version: string, minimum: string): boolean {
+  const parse = (value: string): [number, number, number, boolean] | null => {
+    const match = /^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z.-]+)?$/.exec(value);
+    if (match === null) return null;
+    const [, major, minor, patch, prerelease] = match;
+    return [Number(major), Number(minor), Number(patch), prerelease !== undefined];
+  };
+  const actual = parse(version);
+  const floor = parse(minimum);
+  if (actual === null || floor === null) return false;
+  for (let i = 0; i < 3; i += 1) {
+    if (actual[i] !== floor[i]) return actual[i]! < floor[i]!;
+  }
+  return actual[3] && !floor[3];
 }
 
 /** Narrow a job_offer's optional `expected` block to the resolver-declared work
@@ -848,28 +870,12 @@ export class Bridge {
   private connect(): void {
     const port = this.deps.connectNative(NATIVE_HOST);
     this.port = port;
-    this.seq = 0;
     port.onMessage.addListener((msg) => {
       if (this.port !== port) return;
       this.reconnectAttempts = 0;
       return this.onInbound(msg);
     });
-    port.onDisconnect.addListener(() => {
-      // A stale port may report its close after recovery opened a replacement.
-      if (this.port !== port) return;
-      this.port = null;
-      if (this.closingDeliberately) return;
-      // Unplanned port death (daemon restart, host exit, Chrome nap): the
-      // daemon owns all durable state, so reconnect + re-hello is always
-      // safe. Bounded exponential backoff, capped at 60s, gives up after
-      // 8 attempts until the next user-visible event restarts the cycle.
-      if (this.reconnectAttempts >= 8) return;
-      const delay = Math.min(60_000, 1_000 * 2 ** this.reconnectAttempts);
-      this.reconnectAttempts += 1;
-      this.deps.setTimeout(() => {
-        if (this.port === null && !this.closingDeliberately) this.connect();
-      }, delay);
-    });
+    port.onDisconnect.addListener(() => this.onPortDisconnect(port));
     // hello is the mandatory first frame after connect (seq 0).
     const adapterVersions: Record<string, string> = {};
     for (const spec of this.deps.adapterSpecs) adapterVersions[spec.id] = spec.version;
@@ -877,6 +883,25 @@ export class Bridge {
       extension_version: this.deps.manifestVersion,
       adapter_versions: adapterVersions,
     });
+  }
+
+  private async onPortDisconnect(port: NativePort): Promise<void> {
+    // A stale port may report its close after recovery opened a replacement.
+    if (this.port !== port) return;
+    this.port = null;
+    await this.ready;
+    await this.update((s) => ({ ...s, connectionStatus: "disconnected" }));
+    if (this.closingDeliberately) return;
+    // Unplanned port death (daemon restart, host exit, Chrome nap): the daemon
+    // owns all durable state, so reconnect + re-hello is always safe. Bounded
+    // exponential backoff, capped at 60s, gives up after 8 attempts until the
+    // next user-visible event restarts the cycle.
+    if (this.reconnectAttempts >= 8) return;
+    const delay = Math.min(60_000, 1_000 * 2 ** this.reconnectAttempts);
+    this.reconnectAttempts += 1;
+    this.deps.setTimeout(() => {
+      if (this.port === null && !this.closingDeliberately) this.connect();
+    }, delay);
   }
 
   private disconnect(): void {
@@ -1169,14 +1194,28 @@ export class Bridge {
       case "cancel":
         await this.onCancel(msg);
         return;
-      case "hello_ack":
+      case "hello_ack": {
+        const version = typeof msg.payload.daemon_version === "string" ? msg.payload.daemon_version : null;
+        const features = Array.isArray(msg.payload.features)
+          ? msg.payload.features.filter((feature): feature is string => typeof feature === "string")
+          : [];
+        await this.update((s) => ({
+          ...s,
+          connectionStatus: version !== null && isSemverLowerThan(version, MIN_DAEMON_VERSION) ? "daemon_outdated" : "connected",
+          daemonVersion: version,
+          daemonFeatures: features,
+        }));
         return;
+      }
       case "ack":
         await this.closeAfterAdoption(msg.job_id);
         return;
       case "error":
         console.warn("papio: daemon reported error", msg.payload);
         if (msg.payload.code === "expected_hello") this.reconnectForHello();
+        if (msg.payload.code === "extension_outdated") {
+          await this.update((s) => ({ ...s, connectionStatus: "extension_outdated" }));
+        }
         return;
       default:
         // Extension->daemon-only types are ignored if echoed back.
