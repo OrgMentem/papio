@@ -1,13 +1,271 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 660">
   <title>papio</title>
-  <desc>papio mark: an oblique lowercase p inside a broken ring; the p's descender becomes a download arrow exiting through the ring's bottom gap — the paper fetcher reaching out of the library.</desc>
+  <desc>Animated papio wordmark: an oblique lowercase p and download arrow build inside a broken ring, followed by a brief cameo of a hamadryas baboon peeking up holding a stack of papers.</desc>
+  <defs>
+    <clipPath id="cameo-window">
+      <rect x="330" y="370" width="145" height="152" rx="48"/>
+    </clipPath>
+  </defs>
+  <style>
+    :root {
+      --mark: #F5F1E8;
+      --accent: #E85D4A;
+      --cream: #2B2D42;
+      --feature: #2B2D42;
+      --cycle: 10s;
+      --ease-out: cubic-bezier(.22, 1, .36, 1);
+    }
+
+    .logo-ring {
+      stroke: var(--mark);
+      stroke-dasharray: 1300;
+      animation: ring-build var(--cycle) var(--ease-out) infinite;
+    }
+
+    .logo-bowl {
+      stroke: var(--accent);
+      transform-box: fill-box;
+      transform-origin: center;
+      animation: bowl-build var(--cycle) var(--ease-out) infinite;
+    }
+
+    .logo-stem {
+      stroke: var(--accent);
+      stroke-dasharray: 300;
+      animation: stem-build var(--cycle) var(--ease-out) infinite;
+    }
+
+    .logo-arrow {
+      fill: var(--accent);
+      stroke: var(--accent);
+      animation: arrow-drop var(--cycle) var(--ease-out) infinite;
+    }
+
+    .logo-wordmark {
+      fill: var(--mark);
+      animation: wordmark-build var(--cycle) var(--ease-out) infinite;
+    }
+
+    .baboon-motion {
+      animation: baboon-peek var(--cycle) var(--ease-out) infinite;
+    }
+
+    .baboon-mantle {
+      fill: var(--mark);
+    }
+
+    .baboon-face {
+      fill: var(--accent);
+    }
+
+    .baboon-line {
+      stroke: var(--feature);
+      fill: none;
+    }
+
+    .paper-sheet {
+      fill: var(--cream);
+      stroke: var(--mark);
+    }
+
+    .paper-line {
+      stroke: var(--accent);
+      fill: none;
+    }
+
+    .baboon-paw {
+      fill: var(--accent);
+    }
+
+    .baboon-feature {
+      fill: var(--feature);
+      stroke: var(--feature);
+    }
+
+    .baboon-head {
+      transform-origin: 0 12px;
+      animation: head-tilt var(--cycle) ease-in-out infinite;
+    }
+
+    .paper-stack {
+      transform-origin: 0px 62px;
+      animation: stack-bob var(--cycle) ease-in-out infinite;
+    }
+
+    .raised-brow {
+      animation: brow-lift var(--cycle) ease-in-out infinite;
+    }
+
+    .eyes-open {
+      animation: eyes-open var(--cycle) steps(1, end) infinite;
+    }
+
+    .eyes-shut {
+      opacity: 0;
+      animation: eyes-shut var(--cycle) steps(1, end) infinite;
+    }
+
+    @keyframes ring-build {
+      0% { opacity: 0; stroke-dashoffset: 1300; }
+      2% { opacity: 1; stroke-dashoffset: 1300; }
+      12%, 100% { opacity: 1; stroke-dashoffset: 0; }
+    }
+
+    @keyframes bowl-build {
+      0%, 9% { opacity: 0; transform: scale(.72); }
+      18%, 100% { opacity: 1; transform: none; }
+    }
+
+    @keyframes stem-build {
+      0%, 5% { opacity: 0; stroke-dashoffset: 300; transform: translateY(-14px); }
+      6% { opacity: 1; stroke-dashoffset: 300; transform: translateY(-14px); }
+      15% { opacity: 1; stroke-dashoffset: 0; transform: translateY(-14px); }
+      21%, 100% { opacity: 1; stroke-dashoffset: 0; transform: none; }
+    }
+
+    @keyframes arrow-drop {
+      0%, 14% { opacity: 0; transform: translateY(-24px); }
+      15% { opacity: 1; transform: translateY(-24px); }
+      21%, 100% { opacity: 1; transform: none; }
+    }
+
+    @keyframes wordmark-build {
+      0%, 18% { opacity: 0; transform: translateY(18px); }
+      27%, 100% { opacity: 1; transform: none; }
+    }
+
+    @keyframes baboon-peek {
+      0%, 24% { opacity: 0; transform: translateY(130px); }
+      25% { opacity: 1; transform: translateY(130px); }
+      29% { opacity: 1; transform: translateY(0); }
+      36% { opacity: 1; transform: translateY(0); }
+      40%, 100% { opacity: 0; transform: translateY(130px); }
+    }
+
+    @keyframes head-tilt {
+      0%, 28% { transform: rotate(0); }
+      31% { transform: rotate(-5deg); }
+      34% { transform: rotate(4deg); }
+      37%, 100% { transform: rotate(0); }
+    }
+
+    @keyframes stack-bob {
+      0%, 28% { transform: rotate(0); }
+      31% { transform: rotate(-3deg); }
+      34% { transform: rotate(2.5deg); }
+      38%, 100% { transform: rotate(0); }
+    }
+
+    @keyframes brow-lift {
+      0%, 29% { transform: translateY(0); }
+      31%, 34% { transform: translateY(-9px); }
+      37%, 100% { transform: translateY(0); }
+    }
+
+    @keyframes eyes-open {
+      0%, 30.9% { opacity: 1; }
+      31%, 32.1% { opacity: 0; }
+      32.2%, 100% { opacity: 1; }
+    }
+
+    @keyframes eyes-shut {
+      0%, 30.9% { opacity: 0; }
+      31%, 32.1% { opacity: 1; }
+      32.2%, 100% { opacity: 0; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .logo-ring,
+      .logo-bowl,
+      .logo-stem,
+      .logo-arrow,
+      .logo-wordmark,
+      .baboon-motion,
+      .baboon-head,
+      .paper-stack,
+      .raised-brow,
+      .eyes-open,
+      .eyes-shut {
+        animation: none !important;
+      }
+
+      .logo-ring,
+      .logo-stem {
+        opacity: 1;
+        stroke-dashoffset: 0;
+      }
+
+      .logo-bowl,
+      .logo-arrow,
+      .logo-wordmark {
+        opacity: 1;
+        transform: none;
+      }
+
+      .baboon-motion {
+        opacity: 0;
+        transform: translateY(130px);
+      }
+
+      .eyes-open { opacity: 1; }
+      .eyes-shut { opacity: 0; }
+    }
+  </style>
+
+  <g clip-path="url(#cameo-window)" aria-hidden="true">
+    <g transform="translate(400 458)">
+      <g class="baboon-motion" transform="translate(0 130)" opacity="0">
+        <g class="baboon-head">
+          <g transform="translate(2 -14) scale(0.36) translate(-400 -246)">
+            <path class="baboon-mantle" d="M400 91c-18-17-33-36-46-55-41 37-89 59-145 75-71 20-123 54-155 106-30 49-34 105-12 167h716c22-62 18-118-12-167-32-52-84-86-155-106-56-16-104-38-145-75-13 19-28 38-46 55Z"/>
+            <path class="baboon-face" d="M 316 150 C 330 132, 370 122, 400 122 C 430 122, 470 132, 484 150 C 496 176, 492 210, 474 244 C 462 268, 454 286, 450 308 C 446 344, 430 368, 400 370 C 370 368, 354 344, 350 308 C 346 286, 338 268, 326 244 C 308 210, 304 176, 316 150 Z"/>
+            <g class="raised-brow">
+              <path class="baboon-feature" d="M 334 170 C 350 154, 372 148, 396 154 C 398 158, 398 164, 396 168 C 374 164, 354 168, 340 178 C 336 176, 334 173, 334 170 Z"/>
+            </g>
+            <path class="baboon-feature" d="M 466 170 C 450 154, 428 148, 404 154 C 402 158, 402 164, 404 168 C 426 164, 446 168, 460 178 C 464 176, 466 173, 466 170 Z"/>
+            <path class="baboon-line" stroke-width="4" stroke-linecap="round" d="M 371 240 C 366 264, 364 290, 366 312"/>
+            <path class="baboon-line" stroke-width="4" stroke-linecap="round" d="M 429 240 C 434 264, 436 290, 434 312"/>
+            <ellipse class="baboon-feature" cx="390" cy="330" rx="6" ry="9" transform="rotate(24 390 330)"/>
+            <ellipse class="baboon-feature" cx="410" cy="330" rx="6" ry="9" transform="rotate(-24 410 330)"/>
+            <path class="baboon-line" stroke-width="5" stroke-linecap="round" d="M 384 352 Q 402 362 420 350"/>
+          </g>
+          <g class="eyes-open">
+            <circle class="baboon-feature" cx="-4.1" cy="-33.4" r="3.3"/>
+            <circle class="baboon-feature" cx="8.1" cy="-33.4" r="3.3"/>
+          </g>
+          <g class="eyes-shut" stroke-width="3" stroke-linecap="round">
+            <path class="baboon-line" d="M -7.4 -33.4 Q -4.1 -30.2 -0.8 -33.4"/>
+            <path class="baboon-line" d="M 4.8 -33.4 Q 8.1 -30.2 11.4 -33.4"/>
+          </g>
+        </g>
+        <rect class="baboon-mantle" x="-76" y="30" width="156" height="40"/>
+        <g class="paper-stack">
+          <g transform="rotate(-4 0 45)"><rect class="paper-sheet" stroke-width="4" x="-42" y="30" width="84" height="30" rx="3"/></g>
+          <g transform="rotate(3 0 48)"><rect class="paper-sheet" stroke-width="4" x="-40" y="33" width="80" height="30" rx="3"/></g>
+          <g transform="rotate(-7 0 51)">
+            <rect class="paper-sheet" stroke-width="4" x="-38" y="36" width="76" height="30" rx="3"/>
+            <path class="paper-line" stroke-width="4" stroke-linecap="round" d="M -10 47 L 8 47 M -10 55 L 2 55"/>
+            <g class="baboon-paw">
+              <rect x="-36" y="32" width="6" height="15" rx="3"/>
+              <rect x="-28" y="31" width="6" height="17" rx="3"/>
+              <rect x="-20" y="32" width="6" height="15" rx="3"/>
+              <rect x="16" y="32" width="6" height="15" rx="3"/>
+              <rect x="24" y="31" width="6" height="17" rx="3"/>
+              <rect x="32" y="32" width="6" height="15" rx="3"/>
+            </g>
+          </g>
+        </g>
+      </g>
+    </g>
+  </g>
+
   <g transform="translate(56.5 0) scale(0.78)">
-    <path d="M 95.0 374.6 A 200 200 0 1 1 243.7 455.6" fill="none" stroke="#F5F1E8" stroke-width="46" stroke-linecap="round"/>
-  <g transform="translate(264 244) skewX(-10)">
-    <circle cx="0" cy="0" r="68" fill="none" stroke="#E85D4A" stroke-width="42"/>
+    <path class="logo-ring" d="M 95.0 374.6 A 200 200 0 1 1 243.7 455.6" fill="none" stroke="#2B2D42" stroke-width="46" stroke-linecap="round"/>
+    <g transform="translate(264 244) skewX(-10)">
+      <circle class="logo-bowl" cx="0" cy="0" r="68" fill="none" stroke="#E85D4A" stroke-width="42"/>
+    </g>
+    <path class="logo-stem" d="M 208.0 176.0 L 163.2 430.0" fill="none" stroke="#E85D4A" stroke-width="42" stroke-linecap="round"/>
+    <path class="logo-arrow" d="M 115.7 416.0 L 215.7 416.0 L 152.6 490.0 Z" fill="#E85D4A" stroke="#E85D4A" stroke-width="10" stroke-linejoin="round"/>
   </g>
-  <path d="M 208.0 176.0 L 163.2 430.0" fill="none" stroke="#E85D4A" stroke-width="42" stroke-linecap="round"/>
-  <path d="M 115.7 416.0 L 215.7 416.0 L 152.6 490.0 Z" fill="#E85D4A" stroke="#E85D4A" stroke-width="10" stroke-linejoin="round"/>
-  </g>
-  <text x="256" y="600" text-anchor="middle" font-family="Helvetica Neue, Helvetica, Arial, sans-serif" font-size="150" font-weight="600" font-style="italic" letter-spacing="2" fill="#F5F1E8">papio</text>
+  <text class="logo-wordmark" x="256" y="600" text-anchor="middle" font-family="Helvetica Neue, Helvetica, Arial, sans-serif" font-size="150" font-weight="600" font-style="italic" letter-spacing="2" fill="#F5F1E8">papio</text>
 </svg>

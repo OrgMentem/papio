@@ -132,9 +132,9 @@ without being told to. Two mechanisms tell you a newer release exists:
   daemon asks the Papio and Zotio GitHub releases APIs for their latest versions
   at most once a day each. The requests carry no identifying payload beyond the
   connection itself, and GitHub already hosts the binaries you would download.
-  Results appear in `papio doctor`, and as a single standard-error hint (at
-  most once per day). Configurations without the `[updates]` section never
-  check.
+  Results appear in `papio doctor`, in daemon status, and as a single
+  standard-error hint (at most once per day). Configurations without the
+  `[updates]` section never check.
 
 ## Keepalive asks you to sign in again
 

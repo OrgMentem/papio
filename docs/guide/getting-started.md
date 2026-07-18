@@ -72,7 +72,7 @@ These flags set the corresponding setup values:
 | `--proquest-account-id` | A ProQuest account ID or URL containing `accountid=`. |
 | `--extension-id` | Chrome extension ID permitted to reach the native host. |
 | `--firefox-extension-id` | Firefox add-on ID permitted to reach the native host. |
-| `--check-updates` | Check for papio and zotio updates once a day? Queries GitHub releases only; nothing else is sent. [Y/n] |
+| `--check-updates` | Allow a once-daily GitHub releases check for new papio and zotio versions (default `true`). |
 | `--non-interactive` | Do not prompt; retain existing values unless a flag overrides them. |
 | `--skip-browser` | Skip Chrome extension and native-host setup. |
 
