@@ -125,12 +125,12 @@ func TestNormalizePMID(t *testing.T) {
 		want string
 	}{
 		{"12345", "12345"},
-		{"007", "7"},          // leading zeros trimmed, still a positive id
+		{"007", "7"},            // leading zeros trimmed, still a positive id
 		{"pmid:12345", "12345"}, // prefix stripped
-		{" 12345 ", "12345"},  // surrounding space trimmed
-		{"0", ""},             // zero is not a positive PMID -> error
-		{"0000000000", ""},    // all-zero trims to empty -> error
-		{"12a45", ""},         // non-digits rejected
+		{" 12345 ", "12345"},    // surrounding space trimmed
+		{"0", ""},               // zero is not a positive PMID -> error
+		{"0000000000", ""},      // all-zero trims to empty -> error
+		{"12a45", ""},           // non-digits rejected
 		{"", ""},
 	}
 	for _, c := range cases {

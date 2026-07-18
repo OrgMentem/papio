@@ -418,6 +418,7 @@ type HelloPayload struct {
 	ExtensionVersion string            `json:"extension_version"`
 	AdapterVersions  map[string]string `json:"adapter_versions,omitempty"`
 }
+
 // HelloAckPayload announces the daemon version and supported bridge features.
 // Both fields are optional so extensions remain compatible with older daemons
 // that acknowledge hello with an empty object.
@@ -425,7 +426,6 @@ type HelloAckPayload struct {
 	DaemonVersion string   `json:"daemon_version,omitempty"`
 	Features      []string `json:"features,omitempty"`
 }
-
 
 // JobOfferPayload asks the extension to open one OpenURL-resolved job.
 type JobOfferPayload struct {

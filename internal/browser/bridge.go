@@ -30,7 +30,7 @@ import (
 )
 
 const (
-	handoffActionKind    = "openurl_handoff"
+	handoffActionKind   = "openurl_handoff"
 	MinExtensionVersion = "0.1.0"
 )
 
@@ -75,6 +75,7 @@ func NewBridge(jobs *job.Store, svc *app.Service, cfg config.Config, version str
 		now: time.Now,
 	}
 }
+
 // SessionInfo returns a consistent snapshot of the current extension hello-session.
 func (b *Bridge) SessionInfo() (extensionVersion string, adapterCount int, helloSeen bool) {
 	b.mu.Lock()
@@ -153,7 +154,6 @@ func (b *Bridge) handle(ctx context.Context, msg *protocol.BrowserMessage) ([]js
 	if b.extensionOutdated {
 		return b.extensionOutdatedError()
 	}
-
 
 	switch msg.Type {
 	case protocol.MsgJobAccept:
