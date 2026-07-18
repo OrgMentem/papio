@@ -1,4 +1,4 @@
-# papio
+# *papio*
 
 **A local paper-acquisition broker.** Search scholarly works, create bounded acquisition jobs, validate candidate PDFs, and hand ready artifacts to your Zotero library — from the terminal or from a coding agent.
 
@@ -8,20 +8,8 @@ Finding a paper is easy; *legitimately acquiring* it and getting a validated PDF
 
 Each acquisition is a durable, bounded job. `papio` ranks candidates deterministically and resolves them in order — the broker never accepts the first URL it finds:
 
-```mermaid
-flowchart LR
-  U[You or an agent] --> C[papio CLI / MCP]
-  C --> D[Daemon: policy + durable jobs]
-  D --> R[OA / licensed API resolvers]
-  D --> O[Institutional OpenURL handoff]
-  O --> E[Extension in your own browser]
-  E --> H[Human login / MFA / CAPTCHA]
-  R --> V[Bounded fetch + PDF validation]
-  E --> V
-  V --> B[Immutable acquisition bundle]
-  B --> Z[Zotio preview then apply]
-  Z --> L[Zotero library]
-```
+![papio acquisition pipeline: you or an agent drive papio's durable, bounded jobs; open sources run before your own browser, where login, MFA, and CAPTCHA stay human; both paths converge in quarantine and PDF validation, producing a validated bundle with provenance that reaches the Zotero library through zotio preview-then-apply](assets/architecture.svg#only-light)
+![papio acquisition pipeline: you or an agent drive papio's durable, bounded jobs; open sources run before your own browser, where login, MFA, and CAPTCHA stay human; both paths converge in quarantine and PDF validation, producing a validated bundle with provenance that reaches the Zotero library through zotio preview-then-apply](assets/architecture-dark.svg#only-dark)
 
 1. **Discover.** `papio search` returns bounded, read-only OpenAlex results, marking works already in your Zotio library.
 2. **Acquire.** A capped batch (or one work) becomes durable jobs with stable request IDs, so reruns are idempotent.
@@ -60,7 +48,7 @@ New here? Start with the [user guide](guide/user-guide.md), then tune policy in 
 
 - **[Getting started](guide/getting-started.md)** — prerequisites, `papio init`, and your first acquisition end to end.
 - **[User guide](guide/user-guide.md)** — the research workflow: discover, acquire in batches, follow jobs, complete a browser pass, and resolve identity reviews.
-- **[Use in a coding agent](guide/agent-skill.md)** — drive papio over MCP (`papio mcp`): the canonical acquisition loop and its safety semantics.
+- **[Use in a coding agent](guide/agent-skill.md)** — drive *papio* over MCP (`papio mcp`): the canonical acquisition loop and its safety semantics.
 - **[Access modes & safety](concepts/access-modes.md)** — `conservative` / `assisted` / `maximal` and the non-negotiable product and safety boundaries.
 - **[Acquisition pipeline](concepts/acquisition-pipeline.md)** — resolver order, deterministic candidate ranking, job states, and bounded fetch.
 - **[Browser handoff](concepts/browser-handoff.md)** — the ordinary-browser extension, native-host bridge, work-window headless mode, and no-CDP posture.

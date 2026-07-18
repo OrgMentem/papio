@@ -1,12 +1,12 @@
 # Getting started
 
-Papio is a local paper-acquisition broker. It creates bounded acquisition jobs,
+*papio* is a local paper-acquisition broker. It creates bounded acquisition jobs,
 validates candidate PDFs, and sends ready artifacts to Zotio only through its
 preview-and-confirmation boundary.
 
 ## 1. Prerequisites
 
-Papio currently runs on macOS. Install a Go-built `papio` binary, or build it
+*papio* currently runs on macOS. Install a Go-built `papio` binary, or build it
 from this checkout:
 
 ```sh
@@ -20,7 +20,7 @@ brew install poppler tesseract
 ```
 
 Install Chrome or Firefox to use the browser extension. Install `zotio` and
-make it available on `PATH` only when you want Papio to import ready artifacts
+make it available on `PATH` only when you want *papio* to import ready artifacts
 into Zotero.
 
 ## 2. Initialize the local profile
@@ -33,7 +33,7 @@ papio init
 
 `papio init` writes validated configuration, creates the data directory and
 applies database migrations, checks the Zotio executable, installs the native
-messaging host, and asks: “Check for papio and zotio updates once a day? Queries
+messaging host, and asks: “Check for *papio* and zotio updates once a day? Queries
 GitHub releases only; nothing else is sent. [Y/n]” It defaults to yes and then
 runs `doctor`. It is idempotent, so rerunning it updates setup without creating
 a separate profile.
@@ -49,7 +49,7 @@ The interactive setup asks for:
 5. Institution settings when browser integration is enabled: a library OpenURL
    resolver base URL; if that URL is set, an optional Shibboleth IdP entityID
    for auto login-routing and a ProQuest account ID. For ProQuest, paste either
-   the numeric ID or a ProQuest URL containing `accountid=`; Papio extracts the
+   the numeric ID or a ProQuest URL containing `accountid=`; *papio* extracts the
    account ID from the URL.
 
 For an unattended setup, `--non-interactive` retains existing values unless a
@@ -72,7 +72,7 @@ These flags set the corresponding setup values:
 | `--proquest-account-id` | A ProQuest account ID or URL containing `accountid=`. |
 | `--extension-id` | Chrome extension ID permitted to reach the native host. |
 | `--firefox-extension-id` | Firefox add-on ID permitted to reach the native host. |
-| `--check-updates` | Allow a once-daily GitHub releases check for new papio and zotio versions (default `true`). |
+| `--check-updates` | Allow a once-daily GitHub releases check for new *papio* and zotio versions (default `true`). |
 | `--non-interactive` | Do not prompt; retain existing values unless a flag overrides them. |
 | `--skip-browser` | Skip Chrome extension and native-host setup. |
 
@@ -86,7 +86,7 @@ installation. Load the unpacked extension in the browser you use.
 1. Open `chrome://extensions`.
 2. Enable **Developer mode**, then choose **Load unpacked** and select
    `extension/`.
-3. Open Papio's **Details** page and grant optional host permissions only for
+3. Open *papio*'s **Details** page and grant optional host permissions only for
    publisher sites you use.
 4. If Chrome shows an ID different from the one configured during setup, rerun:
 
@@ -99,7 +99,7 @@ installation. Load the unpacked extension in the browser you use.
 1. Open `about:debugging#/runtime/this-firefox` and choose **Load Temporary
    Add-on**.
 2. Select `extension/firefox/manifest.json`.
-3. On Papio's options page, grant the Library resolver access permission.
+3. On *papio*'s options page, grant the Library resolver access permission.
 
 The built Firefox extension uses `papio@orgmentem.com` by default. Pass
 `--firefox-extension-id` only when the allowed add-on ID must differ.

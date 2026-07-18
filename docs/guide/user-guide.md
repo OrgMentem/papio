@@ -1,6 +1,6 @@
 # User guide
 
-Papio is a local paper-acquisition broker. It searches scholarly works, creates
+*papio* is a local paper-acquisition broker. It searches scholarly works, creates
 bounded acquisition jobs, validates candidate PDFs, and hands ready artifacts to
 Zotio only through a preview-and-confirmation boundary. It does not handle
 institution credentials, MFA, CAPTCHAs, or subscription crawling.
@@ -82,13 +82,13 @@ papio acquire --batch works.jsonl --auto-import \
   --collection "AI reading" --label "appropriate-reliance"
 ```
 
-`--auto-import` asks Papio to plan and apply the Zotio import after a job becomes
+`--auto-import` asks *papio* to plan and apply the Zotio import after a job becomes
 ready. It is non-fatal to acquisition: an import error remains visible in the
 batch report and can be retried through the normal Zotio preview flow.
 
 `--collection` carries the requested Zotio collection with each work; the
 collection is created on demand by Zotio and repeated imports are idempotent.
-`--label` is batch query context for later reports. Papio first classifies batch
+`--label` is batch query context for later reports. *papio* first classifies batch
 works against the Zotio mirror: works already owning a PDF are skipped, a known
 item without a PDF is queued on its existing-item attachment route, and other
 works are acquired as new items. Add `--include-owned` only when a batch should
@@ -147,7 +147,7 @@ actionable states when the daemon is unreachable or either side is out of date.
 The toolbar badge shows `!` when attention is needed, and the options-page
 footer shows the extension and daemon versions together.
 
-For institutional handoffs, Papio first uses the selected resolver profile.
+For institutional handoffs, *papio* first uses the selected resolver profile.
 A direct-link-enabled resolver goes straight to the provider. When Alma/Primo
 instead renders an online-services menu, the extension follows the
 institution-ranked first electronic-service link in the same broker-owned tab;
@@ -226,7 +226,7 @@ A batch report labels `awaiting_human` work with one of these reasons:
 | --- | --- | --- |
 | `institutional` | No direct candidate completed; an institutional OpenURL handoff is waiting. | Open the queue, sign in through ordinary Chrome if needed, and complete the allowed provider flow. |
 | `oa_browser` | An OA URL was handed to the browser after bounded broker fetching could not complete it. | Use the offered browser handoff; the browser may download through its existing cookie jar or present a page for you. |
-| `terms` | The extension observed terms acceptance is required. | Read and decide on the publisher's terms yourself; Papio does not accept them for you. |
+| `terms` | The extension observed terms acceptance is required. | Read and decide on the publisher's terms yourself; *papio* does not accept them for you. |
 
 `needs_review` is separate from these browser states: it is an identity decision
 on a quarantined local artifact. `openurl_available` is an advisory action in

@@ -1,6 +1,6 @@
 # Validation and provenance
 
-Papio does not treat a download URL as an artifact. It fetches candidates in rank
+*papio* does not treat a download URL as an artifact. It fetches candidates in rank
 order and quarantines each bounded fetch before it can become part of a ready
 job. This page describes the decision between that quarantine and a trusted,
 exportable PDF. For the surrounding resolver and job flow, see the
@@ -11,7 +11,7 @@ exportable PDF. For the surrounding resolver and job flow, see the
 Validation has three gates. A candidate must clear each applicable gate; it is
 not accepted merely because a server returned PDF-like bytes.
 
-1. **Structural gate.** Papio rejects a payload that is not acceptable for
+1. **Structural gate.** *papio* rejects a payload that is not acceptable for
    adoption, then checks the PDF header and EOF, parses its structure and page
    count in a bounded isolated worker, and records encryption and active-content
    flags. A malformed, zero-page, encrypted/password-protected, active-JavaScript,
@@ -20,9 +20,9 @@ not accepted merely because a server returned PDF-like bytes.
    either one.
 2. **Identity gate.** Extracted evidence is compared with the requested work,
    including title, author, year, and DOI evidence. A conflicting DOI or clearly
-   different title or author is an explicit wrong-work rejection. Papio does not
+   different title or author is an explicit wrong-work rejection. *papio* does not
    accept the first plausible URL or substitute one work for another.
-3. **Bounded text gate.** Papio uses Poppler's bounded text extraction for the
+3. **Bounded text gate.** *papio* uses Poppler's bounded text extraction for the
    semantic evidence. When text is absent or too sparse, it renders only the
    first bounded set of pages with Poppler and runs Tesseract OCR, recording that
    OCR informed identity. OCR is a fallback for evidence, not a way to make an
@@ -39,7 +39,7 @@ The `[pdf]` configuration controls the bounded text gate:
 
 See the [configuration reference](../reference/config-reference.md#pdf) for
 all four settings, defaults, and constraints. In particular, enabled OCR
-requires `pdftoppm` and `tesseract`; Papio reports its structural, semantic, and
+requires `pdftoppm` and `tesseract`; *papio* reports its structural, semantic, and
 OCR capabilities separately.
 
 ## Review is a human decision
@@ -63,7 +63,7 @@ wrong-work, encrypted, or active-content rejection.
 
 ## From accepted PDF to bundle
 
-After validation, Papio atomically places the file at
+After validation, *papio* atomically places the file at
 `artifacts/<sha256>.pdf`. The SHA-256 is computed with its exact size, and the
 artifact is immutable and content-addressed from that point onward.
 
@@ -83,7 +83,7 @@ decision; the relative artifact path; and a provenance event digest. It also
 carries the Zotio item key when the request originated with Zotio.
 
 **Access basis and reuse license are separate facts.** Access basis records the
-basis on which Papio acquired the candidate under the selected policy; reuse
+basis on which *papio* acquired the candidate under the selected policy; reuse
 license records license information for that candidate. A usable access path is
 not proof of an open reuse license, so unknown copyright is never exported as an
 open-license claim.

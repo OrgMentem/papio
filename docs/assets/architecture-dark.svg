@@ -10,13 +10,13 @@
     </marker>
     <style>
       /* Theme palette: only this block differs between variants. */
-      .card { fill: #F5F1E8; stroke: #2B2D42; }
-      .node, .arrow-ink { fill: #2B2D42; }
+      .card { fill: #2B2D42; stroke: #F5F1E8; }
+      .node, .arrow-ink { fill: #F5F1E8; }
       .human-node, .arrow-coral { fill: #E85D4A; }
-      .node-label { fill: #F5F1E8; }
+      .node-label { fill: #2B2D42; }
       .human-label { fill: #F5F1E8; }
-      .header-label { fill: #2B2D42; }
-      .flow { stroke: #2B2D42; }
+      .header-label { fill: #F5F1E8; }
+      .flow { stroke: #F5F1E8; }
       .human-flow { stroke: #E85D4A; }
       .type { font-family: system-ui, -apple-system, 'Segoe UI', sans-serif; }
       .node-label { font-size: 18px; font-weight: 650; text-anchor: middle; }

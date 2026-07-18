@@ -26,8 +26,8 @@ extension path alone is not a substitute.
 
 1. Open `chrome://extensions`.
 2. Turn on **Developer mode** if it is not already enabled.
-3. Find Papio and use its reload arrow.
-4. Open the Papio details page and confirm its optional host permissions still
+3. Find *papio* and use its reload arrow.
+4. Open the *papio* details page and confirm its optional host permissions still
    cover only the publisher sites you intend to use.
 5. Open the popup or run `papio actions list` to give the worker a reason to
    reconnect.
@@ -35,9 +35,9 @@ extension path alone is not a substitute.
 ### Automated Chrome reload
 
 Where local Chrome automation is already authorized, use Chrome's
-`developerPrivate.reload` operation for the Papio extension. This is the
-programmatic equivalent of the reload arrow; it is not a Papio CLI command and
-must target the installed Papio extension, not an arbitrary extension.
+`developerPrivate.reload` operation for the *papio* extension. This is the
+programmatic equivalent of the reload arrow; it is not a *papio* CLI command and
+must target the installed *papio* extension, not an arbitrary extension.
 
 ### Last resort: purge the service-worker cache
 
@@ -50,7 +50,7 @@ Use this only with Chrome completely closed:
 3. Reopen Chrome and use the `chrome://extensions` reload procedure above.
 
 This purge also clears service-worker state for web PWAs in that profile; those
-PWAs re-register on their next use. Do not delete the Papio data directory or
+PWAs re-register on their next use. Do not delete the *papio* data directory or
 its database as a substitute for reloading the extension.
 
 ## Daemon restart and recovery
@@ -91,7 +91,7 @@ PASS  native host (Firefox)    manifest allows configured extension
 PASS  zotio                    version 1.0.0; required capabilities available
 ```
 
-To update Papio, build or install the new binary, then stop the existing
+To update *papio*, build or install the new binary, then stop the existing
 daemon:
 
 ```sh
@@ -101,10 +101,10 @@ papio daemon stop
 The next daemon-backed command autostarts the new daemon; there is no
 `papio daemon restart` command. If the CLI and daemon versions differ, the CLI
 prints a warning on standard error. An unknown-field configuration error means
-the configuration was written by a newer Papio binary; install a matching or
+the configuration was written by a newer *papio* binary; install a matching or
 newer binary before continuing.
 
-The extension popup reports **daemon unreachable**, **Papio daemon out of
+The extension popup reports **daemon unreachable**, ***papio* daemon out of
 date**, and **extension out of date** when it needs attention; the toolbar shows
 `!` in those states. When healthy, the popup shows the daemon version, and its
 options page shows extension and daemon versions together. Extension updates
@@ -118,18 +118,18 @@ an extension that is too old.
 
 ### Learning about new releases
 
-Papio never installs updates on its own, and it never contacts a server
+*papio* never installs updates on its own, and it never contacts a server
 without being told to. Two mechanisms tell you a newer release exists:
 
-- **Through the extension (no network use by Papio).** Store-delivered
+- **Through the extension (no network use by *papio*).** Store-delivered
   extension updates carry the daemon version they were released with. When the
   popup notices the connected daemon is older, its version line changes to
-  `papio <new> is available` with the upgrade command. Papio itself sends
+  `papio <new> is available` with the upgrade command. *papio* itself sends
   nothing anywhere; the browser's normal store update is the only network
   activity involved.
 - **Opt-in release check.** With `check = true` under `[updates]` in the
   configuration (the `papio init` prompt offers this, defaulting to yes), the
-  daemon asks the Papio and Zotio GitHub releases APIs for their latest versions
+  daemon asks the *papio* and Zotio GitHub releases APIs for their latest versions
   at most once a day each. The requests carry no identifying payload beyond the
   connection itself, and GitHub already hosts the binaries you would download.
   Results appear in `papio doctor`, in daemon status, and as a single
@@ -149,8 +149,8 @@ keepalive, brings the tab forward, and marks a re-authentication request.
 3. Return to the provider page. The extension detects the return and resumes
    keepalive.
 
-Do not put credentials in Papio configuration, native-messaging payloads, or
-an MCP tool call. Papio is designed to reuse the ordinary browser session, not
+Do not put credentials in *papio* configuration, native-messaging payloads, or
+an MCP tool call. *papio* is designed to reuse the ordinary browser session, not
 to automate authentication.
 
 ## Read `doctor` output
@@ -162,10 +162,10 @@ report not OK. The checks below explain every check the command can emit.
 | --- | --- | --- |
 | `access_mode` | An explicit allowed access mode is configured. | Set `access_mode` to `conservative`, `assisted`, or `maximal`; `papio init` creates a conservative profile. |
 | `fetch_policy` | HTTPS-only fetch policy is active. | A warning means `fetch.allow_http_loopback` is on; disable it outside loopback fixture work. |
-| `data_dir` | The data directory is private and writable. | Correct ownership or permissions so Papio can create and write the configured directory. |
+| `data_dir` | The data directory is private and writable. | Correct ownership or permissions so *papio* can create and write the configured directory. |
 | `config_permissions` | The config is user-only. | A missing config is a warning; create it with `papio init`. A group/world-readable config is a failure; set it to mode `0600`. |
 | `database` | SQLite integrity check and schema-version read succeeded. | If unavailable in this run, use doctor through the daemon. For an integrity failure, restore a verified backup before acquiring more work. |
-| `pdf_worker` | The current Papio binary can run its isolated pdfcpu worker. | Reinstall or rebuild the `papio` binary and retry doctor. |
+| `pdf_worker` | The current *papio* binary can run its isolated pdfcpu worker. | Reinstall or rebuild the `papio` binary and retry doctor. |
 | `pdftotext` | Poppler semantic extraction is available. | Install Poppler; this is a failure. |
 | `pdfinfo` | Poppler's independent page-count check is available. | Install Poppler for the structural cross-check; this is a warning. |
 | `ocr` | Bounded OCR dependencies are available when OCR is enabled. | Install Poppler and Tesseract, or explicitly disable OCR. A disabled OCR fallback is a warning because image-only papers need review. |
@@ -179,7 +179,7 @@ values.
 
 ## Zotio-boundary error classes
 
-Papio stores and prints the following stable, privacy-safe error classes for
+*papio* stores and prints the following stable, privacy-safe error classes for
 Zotio-boundary failures. Their hints are sanitized and bounded; use the class
 and hint from `papio batch report`, `papio jobs get`, or JSON output rather than
 copying credentials or filesystem paths into a ticket.
@@ -190,7 +190,7 @@ copying credentials or filesystem paths into a ticket.
 | `zotero_field_validation` | Zotio rejected an item field, such as an unknown item field. | Update the incompatible field mapping or compatible Zotio version, then create a new plan rather than reusing the failed one. |
 | `mirror_sync_failed` | Synchronizing the Zotio mirror failed. | Restore local Zotio connectivity and synchronization, then retry planning. |
 | `zotio_exec_timeout` | A Zotio command exceeded its deadline. | Confirm the executable works; if the operation legitimately needs more time, set `[zotio].timeout_seconds` within 5–600 and retry. |
-| `zotio_not_configured` | Papio has no usable Zotio integration. | Run `papio init` with the correct `--zotio-path`, or set `[zotio].executable` to a usable command. |
+| `zotio_not_configured` | *papio* has no usable Zotio integration. | Run `papio init` with the correct `--zotio-path`, or set `[zotio].executable` to a usable command. |
 | `plan_confirmation_mismatch` | The supplied confirmation SHA-256 did not match the immutable plan. | Run `papio zotio plan` again, inspect its preview, and pass that plan's exact SHA-256 to `papio zotio apply`. |
 | `reservation_conflict` | The apply reservation conflicted or was not finalized. | Let any concurrent apply finish, then make a new plan and apply it; do not force a stale reservation. |
 | `local_db_locked` | A local database was locked. | Let the competing local process finish or close it, then retry the Zotio operation. |
@@ -215,7 +215,7 @@ Use the report reason to choose the next step:
   institution session.
 - `oa_browser`: an OA URL needs the browser path after bounded broker fetching
   did not complete it.
-- `terms`: the user must read and decide on publisher terms; Papio does not
+- `terms`: the user must read and decide on publisher terms; *papio* does not
   accept them.
 - `needs_review`: inspect the quarantine path in the open `verify_identity`
   action, then explicitly accept or reject it with `papio actions resolve`.

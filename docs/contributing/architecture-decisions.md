@@ -1,6 +1,6 @@
 # Architecture decisions
 
-papio records its load-bearing decisions in the acquisition-stack plan. This page gives the short version for contributors: preserve these boundaries unless the stated evidence for changing them exists.
+*papio* records its load-bearing decisions in the acquisition-stack plan. This page gives the short version for contributors: preserve these boundaries unless the stated evidence for changing them exists.
 
 ## Go core, TypeScript browser plane
 
@@ -22,9 +22,9 @@ papio records its load-bearing decisions in the acquisition-stack plan. This pag
 
 **Context:** Zotero metadata creation, deduplication, attachments, and mutation plans already belong to zotio.
 
-**Decision:** papio never writes Zotero directly. It produces validated, provenance-linked acquisition output and hands it to zotio behind zotio's preview/apply boundary.
+**Decision:** *papio* never writes Zotero directly. It produces validated, provenance-linked acquisition output and hands it to zotio behind zotio's preview/apply boundary.
 
-**Why:** A single owner for Zotero reads, writes, item schema, deduplication, and attachments prevents a second mutation path with different rules. papio owns acquisition; zotio owns Zotero mutation.
+**Why:** A single owner for Zotero reads, writes, item schema, deduplication, and attachments prevents a second mutation path with different rules. *papio* owns acquisition; zotio owns Zotero mutation.
 
 ## Explicit access modes
 

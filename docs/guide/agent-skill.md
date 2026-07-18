@@ -1,6 +1,6 @@
 # MCP agent guide
 
-Run Papio as an MCP stdio server with:
+Run *papio* as an MCP stdio server with:
 
 ```sh
 papio mcp
