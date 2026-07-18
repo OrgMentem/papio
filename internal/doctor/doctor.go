@@ -5,6 +5,8 @@ package doctor
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -14,6 +16,7 @@ import (
 	"papio/internal/config"
 	"papio/internal/pdf"
 	"papio/internal/store"
+	"papio/internal/zotio"
 )
 
 // Status values are stable CLI/agent output.
@@ -21,6 +24,7 @@ const (
 	Pass = "pass"
 	Warn = "warn"
 	Fail = "fail"
+	Skip = "skip"
 )
 
 // Check is one deterministic diagnostic. Detail never contains a credential.
@@ -185,4 +189,169 @@ func DefaultWorkerPath() string {
 	}
 	path, _ = filepath.Abs(path)
 	return path
+}
+
+// DaemonStatus is the daemon information returned by the ping status RPC.
+type DaemonStatus struct {
+	Status             string `json:"status"`
+	Version            string `json:"version"`
+	ExtensionConnected bool   `json:"extension_connected"`
+	ExtensionVersion   string `json:"extension_version"`
+}
+
+// IntegrationDependencies supplies the local integration checks. The functions
+// are deliberately independent of command-line plumbing so other callers can
+// reuse RunIntegration.
+type IntegrationDependencies struct {
+	CLIVersion      string
+	LoadConfig      func() (config.Config, error)
+	DaemonStatus    func(context.Context, config.Config) (DaemonStatus, error)
+	ManifestDir     func(config.Config) (string, error)
+	FirefoxDir      func(config.Config) (string, error)
+	ReadFile        func(string) ([]byte, error)
+	ZotioPreflight  func(context.Context, config.Config) (*zotio.PreflightResult, error)
+}
+
+// RunIntegration checks the daemon, browser extension, native-host manifests,
+// and zotio. Configuration is loaded by the supplied seam so this function can
+// report parse errors as part of the same diagnostic report.
+func RunIntegration(ctx context.Context, deps IntegrationDependencies) Report {
+	report := Report{OK: true}
+	add := func(name, status, detail, remediation string) {
+		report.Checks = append(report.Checks, Check{
+			Name: name, Status: status, Detail: detail, Remediation: remediation,
+		})
+		if status == Fail {
+			report.OK = false
+		}
+	}
+	skipRemaining := func(reason string) {
+		add("daemon", Skip, reason, "")
+		add("extension", Skip, reason, "")
+		add("native host (Chrome)", Skip, reason, "")
+		add("native host (Firefox)", Skip, reason, "")
+		add("zotio", Skip, reason, "")
+	}
+
+	if !integrationDependenciesComplete(deps) {
+		add("doctor", Fail, "doctor command dependencies are incomplete", "reinstall papio")
+		return report
+	}
+	cfg, err := deps.LoadConfig()
+	if err != nil {
+		remediation := "correct the configuration error above"
+		if strings.Contains(strings.ToLower(err.Error()), "unknown field") {
+			remediation = "update papio or remove the unrecognized field"
+		}
+		add("config", Fail, err.Error(), remediation)
+		skipRemaining("skipped: configuration did not parse")
+		return report
+	}
+	add("config", Pass, "parsed "+cfg.Path, "")
+
+	status, err := deps.DaemonStatus(ctx, cfg)
+	if err != nil {
+		add("daemon", Fail, err.Error(), "papio status")
+		skipRemainingAfterDaemon(add, "skipped: daemon is unreachable")
+		return report
+	}
+	if status.Status != "ok" || strings.TrimSpace(status.Version) == "" {
+		add("daemon", Fail, fmt.Sprintf("unexpected daemon status %q (version %q)", status.Status, status.Version), "papio status")
+		skipRemainingAfterDaemon(add, "skipped: daemon status is invalid")
+		return report
+	}
+	if status.Version != deps.CLIVersion {
+		add("daemon", Warn, fmt.Sprintf("reachable; daemon %s, CLI %s", status.Version, deps.CLIVersion), "papio daemon stop (next command autostarts the new daemon)")
+	} else {
+		add("daemon", Pass, "reachable; version "+status.Version, "")
+	}
+	if status.ExtensionConnected {
+		detail := "connected"
+		if status.ExtensionVersion != "" {
+			detail += " (v" + status.ExtensionVersion + ")"
+		}
+		add("extension", Pass, detail, "")
+	} else {
+		add("extension", Warn, "extension has not connected since daemon start", "install and enable the browser extension, then run papio init to install the native-host manifest")
+	}
+
+	runManifestChecks(cfg, deps, add)
+
+	preflight, err := deps.ZotioPreflight(ctx, cfg)
+	if err != nil {
+		add("zotio", Fail, err.Error(), "install or update zotio, then rerun papio doctor")
+		return report
+	}
+	add("zotio", Pass, fmt.Sprintf("version %s; %d required capabilities available", preflight.Version, len(preflight.Capabilities)), "")
+	return report
+}
+
+func integrationDependenciesComplete(deps IntegrationDependencies) bool {
+	return deps.CLIVersion != "" && deps.LoadConfig != nil && deps.DaemonStatus != nil && deps.ManifestDir != nil && deps.FirefoxDir != nil && deps.ReadFile != nil && deps.ZotioPreflight != nil
+}
+
+func skipRemainingAfterDaemon(add func(string, string, string, string), reason string) {
+	add("extension", Skip, reason, "")
+	add("native host (Chrome)", Skip, reason, "")
+	add("native host (Firefox)", Skip, reason, "")
+	add("zotio", Skip, reason, "")
+}
+
+func runManifestChecks(cfg config.Config, deps IntegrationDependencies, add func(string, string, string, string)) {
+	runManifestCheck("native host (Chrome)", cfg.Browser.ExtensionID, "chrome-extension://", cfg, deps.ManifestDir, deps.ReadFile, add)
+	runManifestCheck("native host (Firefox)", cfg.Browser.FirefoxExtensionID, "", cfg, deps.FirefoxDir, deps.ReadFile, add)
+}
+
+const nativeHostManifestName = "com.orgmentem.papio"
+
+type nativeHostManifest struct {
+	AllowedOrigins    []string `json:"allowed_origins"`
+	AllowedExtensions []string `json:"allowed_extensions"`
+}
+
+func runManifestCheck(name, extensionID, originPrefix string, cfg config.Config, manifestDir func(config.Config) (string, error), readFile func(string) ([]byte, error), add func(string, string, string, string)) {
+	if extensionID == "" {
+		add(name, Skip, "skipped: extension ID is not configured", "")
+		return
+	}
+	dir, err := manifestDir(cfg)
+	if err != nil {
+		add(name, Fail, err.Error(), "register the native host manually for this browser")
+		return
+	}
+	path := filepath.Join(dir, nativeHostManifestName+".json")
+	data, err := readFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			add(name, Fail, "manifest is missing at "+path, "papio native-host install")
+			return
+		}
+		add(name, Fail, fmt.Sprintf("reading manifest %s: %v", path, err), "papio native-host install")
+		return
+	}
+	var manifest nativeHostManifest
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		add(name, Fail, fmt.Sprintf("parsing manifest %s: %v", path, err), "papio native-host install")
+		return
+	}
+	if originPrefix != "" {
+		allowedOrigin := originPrefix + extensionID + "/"
+		if !containsString(manifest.AllowedOrigins, allowedOrigin) {
+			add(name, Fail, "manifest does not allow "+allowedOrigin, "papio native-host install")
+			return
+		}
+	} else if !containsString(manifest.AllowedExtensions, extensionID) {
+		add(name, Fail, "manifest does not allow "+extensionID, "papio native-host install")
+		return
+	}
+	add(name, Pass, "manifest allows configured extension", "")
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }

@@ -27,6 +27,12 @@ type options struct {
 	jsonOutput bool
 	out        io.Writer
 	errOut     io.Writer
+
+	daemonVersionChecked        bool
+
+	configLoader    func(string) (config.Config, error)
+	newAutostarter  func(string) *daemon.Autostarter
+	rpcCall         func(context.Context, string, string, any, any) error
 }
 
 // NewRoot builds a command tree with no process-global output state.
@@ -65,6 +71,9 @@ func NewRoot(out, errOut io.Writer) *cobra.Command {
 }
 
 func (o *options) loadConfig() (config.Config, error) {
+	if o.configLoader != nil {
+		return o.configLoader(o.configPath)
+	}
 	return config.Load(o.configPath)
 }
 
@@ -74,12 +83,18 @@ func (o *options) call(ctx context.Context, method string, params, result any) e
 		return err
 	}
 	socket := filepath.Join(cfg.DataDir, "papio.sock")
-	starter := daemon.NewAutostarter(socket)
+	starter := o.autostarter(socket)
 	starter.Args = []string{"--config", cfg.Path, "daemon", "--socket", socket}
-	if err := starter.Ensure(ctx); err != nil {
+	ensureResult, err := starter.EnsureWithResult(ctx)
+	if err != nil {
 		return err
 	}
-	return callSocket(ctx, socket, method, params, result)
+	if ensureResult.Started {
+		o.daemonVersionChecked = true
+	} else if err := o.warnDaemonVersion(ctx, socket); err != nil {
+		return err
+	}
+	return o.socketCall(ctx, socket, method, params, result)
 }
 
 func (o *options) callExisting(ctx context.Context, method string, params, result any) error {
@@ -87,12 +102,56 @@ func (o *options) callExisting(ctx context.Context, method string, params, resul
 	if err != nil {
 		return err
 	}
-	return callSocket(ctx, filepath.Join(cfg.DataDir, "papio.sock"), method, params, result)
+	socket := filepath.Join(cfg.DataDir, "papio.sock")
+	if err := o.warnDaemonVersion(ctx, socket); err != nil {
+		return err
+	}
+	return o.socketCall(ctx, socket, method, params, result)
+}
+
+func (o *options) autostarter(socket string) *daemon.Autostarter {
+	if o.newAutostarter != nil {
+		return o.newAutostarter(socket)
+	}
+	return daemon.NewAutostarter(socket)
+}
+
+func (o *options) socketCall(ctx context.Context, socket, method string, params, result any) error {
+	if o.rpcCall != nil {
+		return o.rpcCall(ctx, socket, method, params, result)
+	}
+	return callSocket(ctx, socket, method, params, result)
 }
 
 func callSocket(ctx context.Context, socket, method string, params, result any) error {
 	client := ipc.NewUnixClient(socket)
 	return client.Call(ctx, job.NewID("rpc"), method, params, result)
+}
+
+type daemonPingResult struct {
+	Status             string `json:"status"`
+	Version            string `json:"version"`
+	ExtensionConnected bool   `json:"extension_connected"`
+	ExtensionVersion   string `json:"extension_version,omitempty"`
+}
+
+func (o *options) warnDaemonVersion(ctx context.Context, socket string) error {
+	if o.daemonVersionChecked {
+		return nil
+	}
+	var status daemonPingResult
+	if err := o.socketCall(ctx, socket, "ping", struct{}{}, &status); err != nil {
+		return err
+	}
+	o.daemonVersionChecked = true
+	if status.Version == "" || api.Version == "" || status.Version == api.Version {
+		return nil
+	}
+	if o.errOut == nil {
+		return nil
+	}
+	_, err := fmt.Fprintf(o.errOut, "papio: daemon is running %s but this CLI is %s — run 'papio daemon stop'; the next command starts the matching daemon\n", status.Version, api.Version)
+	return err
 }
 
 func (o *options) printJSON(value any) error {

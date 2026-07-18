@@ -212,6 +212,12 @@ export interface BridgeDeps {
     /** Optional; absent means enabled. Only consulted when `windows` exists. */
     getWorkWindowEnabled?(): Promise<boolean>;
   };
+  /** Toolbar badge for connection health. Kept injectable so bridge logic has
+   * no dependency on a particular browser global. */
+  action: {
+    setBadgeText(details: { text: string }): Promise<void>;
+    setBadgeBackgroundColor(details: { color: string }): Promise<void>;
+  };
   /** chrome.alarms seam. An MV3 service worker sleeps after ~30s idle; a
    * periodic alarm is the only thing that wakes it, so pending daemon offers
    * reach an idle worker with no keepalive tab or user activity. */
@@ -629,6 +635,23 @@ export class Bridge {
     return this.store.workWindowID;
   }
 
+  /** Keep the persistent daemon-health state visible without interrupting the
+   * user. A badge failure is non-fatal: native bridging must keep recovering. */
+  private async syncConnectionBadge(status = this.store.connectionStatus): Promise<void> {
+    try {
+      if (status === "connected") {
+        await this.deps.action.setBadgeText({ text: "" });
+        return;
+      }
+      await Promise.all([
+        this.deps.action.setBadgeText({ text: "!" }),
+        this.deps.action.setBadgeBackgroundColor({ color: "#777777" }),
+      ]);
+    } catch {
+      // Browser action APIs are advisory; do not make a healthy bridge fail.
+    }
+  }
+
 
   /** Bind browser listeners (once), open the native connection, send hello, and
    * hydrate persisted job/tab correlation. Safe to call on every SW spin-up.
@@ -651,6 +674,7 @@ export class Bridge {
       }
     });
     await this.ready;
+    await this.syncConnectionBadge();
     await this.reconcileTabs();
     await this.redrivePendingTermsGates();
     for (const job of this.store.activeJobs) {
@@ -889,8 +913,8 @@ export class Bridge {
     // A stale port may report its close after recovery opened a replacement.
     if (this.port !== port) return;
     this.port = null;
-    await this.ready;
     await this.update((s) => ({ ...s, connectionStatus: "disconnected" }));
+    await this.syncConnectionBadge("disconnected");
     if (this.closingDeliberately) return;
     // Unplanned port death (daemon restart, host exit, Chrome nap): the daemon
     // owns all durable state, so reconnect + re-hello is always safe. Bounded
@@ -1199,12 +1223,15 @@ export class Bridge {
         const features = Array.isArray(msg.payload.features)
           ? msg.payload.features.filter((feature): feature is string => typeof feature === "string")
           : [];
+        const connectionStatus =
+          version !== null && isSemverLowerThan(version, MIN_DAEMON_VERSION) ? "daemon_outdated" : "connected";
         await this.update((s) => ({
           ...s,
-          connectionStatus: version !== null && isSemverLowerThan(version, MIN_DAEMON_VERSION) ? "daemon_outdated" : "connected",
+          connectionStatus,
           daemonVersion: version,
           daemonFeatures: features,
         }));
+        await this.syncConnectionBadge(connectionStatus);
         return;
       }
       case "ack":
@@ -1215,6 +1242,7 @@ export class Bridge {
         if (msg.payload.code === "expected_hello") this.reconnectForHello();
         if (msg.payload.code === "extension_outdated") {
           await this.update((s) => ({ ...s, connectionStatus: "extension_outdated" }));
+          await this.syncConnectionBadge("extension_outdated");
         }
         return;
       default:
@@ -2340,6 +2368,10 @@ function realDeps(): BridgeDeps {
           return true;
         }
       },
+    },
+    action: {
+      setBadgeText: (details) => chrome.action.setBadgeText(details),
+      setBadgeBackgroundColor: (details) => chrome.action.setBadgeBackgroundColor(details),
     },
     alarms: {
       create: (name, info) => chrome.alarms?.create(name, info),

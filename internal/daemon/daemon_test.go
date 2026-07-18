@@ -110,11 +110,19 @@ func TestAutostarterUsesExecutableCommandSeamOnce(t *testing.T) {
 			return nil
 		},
 	}
-	if err := starter.Ensure(context.Background()); err != nil {
-		t.Fatalf("Ensure: %v", err)
+	result, err := starter.EnsureWithResult(context.Background())
+	if err != nil {
+		t.Fatalf("EnsureWithResult: %v", err)
 	}
-	if err := starter.Ensure(context.Background()); err != nil {
-		t.Fatalf("second Ensure: %v", err)
+	if !result.Started {
+		t.Fatal("EnsureWithResult did not report the daemon it started")
+	}
+	result, err = starter.EnsureWithResult(context.Background())
+	if err != nil {
+		t.Fatalf("second EnsureWithResult: %v", err)
+	}
+	if result.Started {
+		t.Fatal("EnsureWithResult reported an already-running daemon as started")
 	}
 	if starts != 1 || len(calls) != 1 {
 		t.Fatalf("starts=%d command calls=%d, want one", starts, len(calls))

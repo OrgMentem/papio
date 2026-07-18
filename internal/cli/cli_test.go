@@ -4,14 +4,20 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"papio/internal/api"
 	"papio/internal/config"
+	"papio/internal/daemon"
 	"papio/internal/discovery"
+	"papio/internal/ipc"
 )
 
 func TestNormalizeIdentifiersAcceptsCommonDOIAndArXivForms(t *testing.T) {
@@ -103,4 +109,112 @@ func TestConfigInitWritesPrivateStructuredConfig(t *testing.T) {
 	if err != nil || cfg.AccessMode != config.ModeMaximal || cfg.Email != "reader@example.test" {
 		t.Fatalf("loaded config = %+v, %v", cfg, err)
 	}
+}
+
+func TestDaemonPingResultDecodesFullStatus(t *testing.T) {
+	var result daemonPingResult
+	if err := ipc.DecodeResult(json.RawMessage(`{"status":"ok","version":"1.2.3","extension_connected":true,"extension_version":"4.5.6"}`), &result); err != nil {
+		t.Fatalf("decode ping result: %v", err)
+	}
+	if result.Status != "ok" || result.Version != "1.2.3" || !result.ExtensionConnected || result.ExtensionVersion != "4.5.6" {
+		t.Fatalf("ping result = %+v", result)
+	}
+}
+
+func TestCallWarnsOnceForVersionSkew(t *testing.T) {
+	opt, _, stderr := versionWarningTestOptions(api.Version + "-old")
+	for range 2 {
+		if err := opt.call(context.Background(), "jobs.list", struct{}{}, &struct{}{}); err != nil {
+			t.Fatalf("call: %v", err)
+		}
+	}
+	want := "papio: daemon is running " + api.Version + "-old but this CLI is " + api.Version + " — run 'papio daemon stop'; the next command starts the matching daemon\n"
+	if got := stderr.String(); got != want {
+		t.Fatalf("stderr = %q, want %q", got, want)
+	}
+}
+
+func TestCallDoesNotWarnWhenDaemonVersionMatches(t *testing.T) {
+	opt, _, stderr := versionWarningTestOptions(api.Version)
+	if err := opt.call(context.Background(), "jobs.list", struct{}{}, &struct{}{}); err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if got := stderr.String(); got != "" {
+		t.Fatalf("stderr = %q, want empty", got)
+	}
+}
+
+func TestCallSkipsVersionWarningWhenItStartsDaemon(t *testing.T) {
+	opt, _, stderr := versionWarningTestOptions(api.Version + "-old")
+	started := false
+	logPath := filepath.Join(t.TempDir(), "daemon.log")
+	opt.newAutostarter = func(socket string) *daemon.Autostarter {
+		return &daemon.Autostarter{
+			SocketPath: socket,
+			LockPath:   filepath.Join(t.TempDir(), "daemon.lock"),
+			LogPath:    logPath,
+			Executable: func() (string, error) { return "/test/papio", nil },
+			Command:    func(name string, args ...string) *exec.Cmd { return exec.Command(name, args...) },
+			Start: func(context.Context, *exec.Cmd) error {
+				started = true
+				return nil
+			},
+			Ready: func(context.Context, string) error {
+				if started {
+					return nil
+				}
+				return errors.New("not ready")
+			},
+		}
+	}
+	if err := opt.call(context.Background(), "jobs.list", struct{}{}, &struct{}{}); err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if !started {
+		t.Fatal("call did not start the daemon")
+	}
+	if got := stderr.String(); got != "" {
+		t.Fatalf("stderr = %q, want empty", got)
+	}
+}
+
+func TestCallVersionWarningLeavesJSONOutputClean(t *testing.T) {
+	opt, stdout, stderr := versionWarningTestOptions(api.Version + "-old")
+	opt.jsonOutput = true
+	if err := opt.call(context.Background(), "jobs.list", struct{}{}, &struct{}{}); err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if err := opt.printResult(map[string]string{"status": "ok"}, "ignored"); err != nil {
+		t.Fatalf("print JSON result: %v", err)
+	}
+	if got := stdout.String(); got != "{\"status\":\"ok\"}\n" {
+		t.Fatalf("stdout = %q, want JSON only", got)
+	}
+	if got := stderr.String(); !strings.Contains(got, "papio: daemon is running ") {
+		t.Fatalf("stderr = %q, want version warning", got)
+	}
+}
+
+func versionWarningTestOptions(daemonVersion string) (*options, *bytes.Buffer, *bytes.Buffer) {
+	var stdout, stderr bytes.Buffer
+	opt := &options{
+		out:    &stdout,
+		errOut: &stderr,
+		configLoader: func(string) (config.Config, error) {
+			return config.Config{DataDir: "/test/data"}, nil
+		},
+		newAutostarter: func(socket string) *daemon.Autostarter {
+			return &daemon.Autostarter{
+				SocketPath: socket,
+				Ready:      func(context.Context, string) error { return nil },
+			}
+		},
+		rpcCall: func(_ context.Context, _ string, method string, _ any, result any) error {
+			if method == "ping" {
+				result.(*daemonPingResult).Version = daemonVersion
+			}
+			return nil
+		},
+	}
+	return opt, &stdout, &stderr
 }

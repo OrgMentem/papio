@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"papio/internal/api"
 	"papio/internal/config"
 	"papio/internal/ipc"
 )
@@ -34,16 +35,20 @@ func TestZotioApplyRendersSafeFailureDetail(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	server := &ipc.Server{Handler: ipc.HandlerFunc(func(_ context.Context, request ipc.Request) ([]byte, *ipc.RPCError) {
-		if request.Method != "zotio.apply" {
+		switch request.Method {
+		case "ping":
+			return []byte(`{"status":"ok","version":"` + api.Version + `","extension_connected":false,"extension_version":""}`), nil
+		case "zotio.apply":
+			return nil, &ipc.RPCError{
+				Code:    "internal",
+				Message: "operation failed",
+				Detail: &ipc.ErrorDetail{
+					ErrorClass: "zotero_field_validation",
+					ErrorHint:  "unknown item field",
+				},
+			}
+		default:
 			return nil, &ipc.RPCError{Code: "unexpected", Message: "unexpected method"}
-		}
-		return nil, &ipc.RPCError{
-			Code:    "internal",
-			Message: "operation failed",
-			Detail: &ipc.ErrorDetail{
-				ErrorClass: "zotero_field_validation",
-				ErrorHint:  "unknown item field",
-			},
 		}
 	})}
 	done := make(chan error, 1)

@@ -42,52 +42,67 @@ func NewAutostarter(socketPath string) *Autostarter {
 	return &Autostarter{SocketPath: socketPath}
 }
 
-// Ensure returns once another daemon is ready or a single daemon command has
-// been started and its socket becomes ready. Contending callers share an
-// advisory lock and always check readiness both before and after acquiring it.
+// EnsureResult describes how EnsureWithResult made the daemon available.
+type EnsureResult struct {
+	// Started reports whether this call launched the daemon process.
+	Started bool
+}
+
+// Ensure ensures a daemon is ready. Callers that need to know whether this
+// invocation launched it should use EnsureWithResult.
 func (a *Autostarter) Ensure(ctx context.Context) error {
+	_, err := a.EnsureWithResult(ctx)
+	return err
+}
+
+// EnsureWithResult returns once another daemon is ready or a single daemon
+// command has been started and its socket becomes ready. Contending callers
+// share an advisory lock and always check readiness both before and after
+// acquiring it.
+func (a *Autostarter) EnsureWithResult(ctx context.Context) (EnsureResult, error) {
+	result := EnsureResult{}
 	cfg, err := a.defaults()
 	if err != nil {
-		return err
+		return result, err
 	}
 	if err := ctx.Err(); err != nil {
-		return err
+		return result, err
 	}
 	if err := cfg.Ready(ctx, cfg.SocketPath); err == nil {
-		return nil
+		return result, nil
 	} else if ctx.Err() != nil {
-		return ctx.Err()
+		return result, ctx.Err()
 	}
 	unlock, err := acquireLock(ctx, cfg.LockPath, cfg.RetryInterval)
 	if err != nil {
-		return err
+		return result, err
 	}
 	defer unlock()
 
 	if err := cfg.Ready(ctx, cfg.SocketPath); err == nil {
-		return nil
+		return result, nil
 	} else if ctx.Err() != nil {
-		return ctx.Err()
+		return result, ctx.Err()
 	}
 	if err := ctx.Err(); err != nil {
-		return err
+		return result, err
 	}
 	executable, err := cfg.Executable()
 	if err != nil {
-		return fmt.Errorf("locate papio executable: %w", err)
+		return result, fmt.Errorf("locate papio executable: %w", err)
 	}
 	cmd := cfg.Command(executable, cfg.Args...)
 	if cmd == nil {
-		return errors.New("daemon command factory returned nil")
+		return result, errors.New("daemon command factory returned nil")
 	}
 	null, err := cfg.OpenNull()
 	if err != nil {
-		return fmt.Errorf("open detached daemon stdio: %w", err)
+		return result, fmt.Errorf("open detached daemon stdio: %w", err)
 	}
 	logFile, err := cfg.OpenLog()
 	if err != nil {
 		_ = null.Close()
-		return fmt.Errorf("open detached daemon log: %w", err)
+		return result, fmt.Errorf("open detached daemon log: %w", err)
 	}
 	// stdin is discarded; stdout/stderr persist to the daemon log so that
 	// server-side errors (see the api failure handlers, which log the wrapped
@@ -99,14 +114,15 @@ func (a *Autostarter) Ensure(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		_ = null.Close()
 		_ = logFile.Close()
-		return err
+		return result, err
 	}
 	err = cfg.Start(ctx, cmd)
 	_ = null.Close()
 	_ = logFile.Close()
 	if err != nil {
-		return fmt.Errorf("start daemon: %w", err)
+		return result, fmt.Errorf("start daemon: %w", err)
 	}
+	result.Started = true
 	if cmd.Process != nil {
 		go func() { _ = cmd.Wait() }()
 	}
@@ -114,9 +130,9 @@ func (a *Autostarter) Ensure(ctx context.Context) error {
 	readyCtx, cancel := context.WithTimeout(ctx, cfg.StartTimeout)
 	defer cancel()
 	if err := waitReady(readyCtx, cfg.Ready, cfg.SocketPath, cfg.RetryInterval); err != nil {
-		return fmt.Errorf("wait for daemon socket: %w", err)
+		return result, fmt.Errorf("wait for daemon socket: %w", err)
 	}
-	return nil
+	return result, nil
 }
 
 func (a *Autostarter) defaults() (Autostarter, error) {

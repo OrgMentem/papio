@@ -66,6 +66,17 @@ class FakeBackend implements StateBackend {
   }
 }
 
+class FakeAction {
+  readonly texts: string[] = [];
+  readonly backgroundColors: string[] = [];
+  async setBadgeText(details: { text: string }): Promise<void> {
+    this.texts.push(details.text);
+  }
+  async setBadgeBackgroundColor(details: { color: string }): Promise<void> {
+    this.backgroundColors.push(details.color);
+  }
+}
+
 class FakeTabs {
   readonly onUpdated = new FakeEmitter<[number, TabChangeInfo, TabInfo]>();
   readonly onRemoved = new FakeEmitter<[number, { isWindowClosing: boolean }]>();
@@ -188,6 +199,7 @@ interface Harness {
   backend: FakeBackend;
   tabs: FakeTabs;
   downloads: FakeDownloads;
+  action: FakeAction;
   windows?: FakeWindows;
   clock: { now: number };
   timers: { fn: () => void | Promise<void>; ms: number }[];
@@ -209,6 +221,7 @@ function makeHarness(
   const windows = opts?.windows === true ? new FakeWindows(tabs) : undefined;
   const clock = { now: 1_700_000_000_000 };
   const timers: { fn: () => void | Promise<void>; ms: number }[] = [];
+  const action = new FakeAction();
   const deps: BridgeDeps = {
     connectNative: () => {
       if (connects++ === 0) return port;
@@ -239,6 +252,7 @@ function makeHarness(
         : {}),
     },
     ...(windows !== undefined ? { windows } : {}),
+    action,
     alarms: { create: () => {}, onAlarm: { addListener: () => {} } },
   };
   return {
@@ -249,6 +263,7 @@ function makeHarness(
     backend,
     tabs,
     downloads,
+    action,
     ...(windows !== undefined ? { windows } : {}),
     clock,
     timers,
@@ -319,6 +334,13 @@ test("hello is the first outgoing frame with a valid msg_id and seq 0", async ()
   expect(first?.payload["extension_version"]).toBe("0.1.0");
 });
 
+test("startup clears a stale badge when persisted daemon health is connected", async () => {
+  const h = makeHarness({ ...emptyStore(), connectionStatus: "connected" });
+  await h.bridge.start();
+
+  expect(h.action.texts).toEqual([""]);
+});
+
 test("hello acknowledgment persists daemon version, features, and connected status", async () => {
   const h = makeHarness();
   await h.bridge.start();
@@ -329,6 +351,7 @@ test("hello acknowledgment persists daemon version, features, and connected stat
     daemonVersion: "0.1.0",
     daemonFeatures: ["browser-v1", "direct-download"],
   });
+  expect(h.action.texts.at(-1)).toBe("");
 });
 
 test("an older daemon's empty hello acknowledgment remains connected", async () => {
@@ -343,20 +366,24 @@ test("an older daemon's empty hello acknowledgment remains connected", async () 
   });
 });
 
-test("a daemon below the compatibility floor is marked outdated", async () => {
+test("a daemon below the compatibility floor is marked outdated and badged", async () => {
   const h = makeHarness();
   await h.bridge.start();
   await h.port.inbound(helloAck({ daemon_version: "0.0.9" }));
 
   expect(h.backend.store.connectionStatus).toBe("daemon_outdated");
+  expect(h.action.texts.at(-1)).toBe("!");
+  expect(h.action.backgroundColors.at(-1)).toBe("#777777");
 });
 
-test("extension-outdated daemon error is persisted for the popup", async () => {
+test("extension-outdated daemon error is persisted and badged", async () => {
   const h = makeHarness();
   await h.bridge.start();
   await h.port.inbound(extensionOutdatedError());
 
   expect(h.backend.store.connectionStatus).toBe("extension_outdated");
+  expect(h.action.texts.at(-1)).toBe("!");
+  expect(h.action.backgroundColors.at(-1)).toBe("#777777");
 });
 
 test("job_offer opens exactly one tab and replies job_accept", async () => {
@@ -982,17 +1009,21 @@ test("hello-required error reconnects once and does not duplicate a live tab", a
   expect(h.frames().filter((f) => f.type === "job_accept" && f.job_id === "job_0007_session").length).toBe(1);
 });
 
-test("unplanned port death reconnects with backoff; deliberate disconnect stays down", async () => {
-  // Unplanned: daemon restarted -> onDisconnect without a protocol error.
+test("unplanned port death marks the badge unhealthy and reconnect clears it", async () => {
   const h = makeHarness();
   await h.bridge.start();
-  const hellosBefore = h.frames().filter((f) => f.type === "hello").length;
+  await h.port.inbound(helloAck());
+  expect(h.action.texts.at(-1)).toBe("");
+
   await h.port.emitDisconnect();
   expect(h.timers.length).toBe(1);
   expect(h.timers[0]?.ms).toBe(1000);
-  h.timers[0]?.fn();
-  const hellosAfter = h.frames().filter((f) => f.type === "hello").length;
-  expect(hellosAfter).toBe(hellosBefore + 1); // re-hello on reconnect
+  expect(h.action.texts.at(-1)).toBe("!");
+  expect(h.action.backgroundColors.at(-1)).toBe("#777777");
+
+  await h.timers[0]?.fn();
+  await h.ports[1]?.inbound(helloAck());
+  expect(h.action.texts.at(-1)).toBe("");
 
   // Deliberate: malformed frame -> fail-closed disconnect, no timer scheduled.
   const bad = makeHarness();
@@ -1001,6 +1032,19 @@ test("unplanned port death reconnects with backoff; deliberate disconnect stays 
   await bad.port.inbound({ protocol: "papio-browser/1", type: "not_a_type", msg_id: "x", seq: 0, payload: {} });
   expect(bad.port.disconnected).toBe(true);
   expect(bad.timers.length).toBe(timersBefore);
+});
+
+test("backoff exhaustion leaves the daemon-unavailable badge set", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  for (let attempt = 0; attempt <= 8; attempt += 1) {
+    await h.ports.at(-1)?.emitDisconnect();
+    if (attempt < 8) await h.timers.at(-1)?.fn();
+  }
+
+  expect(h.timers).toHaveLength(8);
+  expect(h.action.texts.at(-1)).toBe("!");
+  expect(h.action.backgroundColors.at(-1)).toBe("#777777");
 });
 
 test("concurrent fallback timers release every queued handoff", async () => {
@@ -1081,6 +1125,10 @@ test("overlapping state writes persist serially so no stale snapshot wins", asyn
     scripting: { executeScript: async () => [] },
     permissions: { contains: async () => false },
     settings: { getTermsConsent: async () => undefined, setTermsConsent: async () => {} },
+    action: {
+      setBadgeText: async () => {},
+      setBadgeBackgroundColor: async () => {},
+    },
     alarms: { create: () => {}, onAlarm: { addListener: () => {} } },
   };
   const bridge = new Bridge(deps);

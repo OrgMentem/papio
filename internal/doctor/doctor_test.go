@@ -13,6 +13,7 @@ import (
 	"papio/internal/config"
 	"papio/internal/pdf"
 	"papio/internal/store"
+	"papio/internal/zotio"
 )
 
 func executable(t *testing.T) string {
@@ -115,5 +116,34 @@ func TestRunWarnsWhenOCRExplicitlyDisabled(t *testing.T) {
 	}
 	if !warned {
 		t.Fatalf("disabled OCR warning missing: %+v", report.Checks)
+	}
+}
+
+func TestRunIntegrationReportsVersionSkewAndSkipsUnconfiguredManifests(t *testing.T) {
+	cfg := config.Default()
+	cfg.Path = filepath.Join(t.TempDir(), "config.toml")
+	report := RunIntegration(context.Background(), IntegrationDependencies{
+		CLIVersion: "cli-version",
+		LoadConfig: func() (config.Config, error) {
+			return cfg, nil
+		},
+		DaemonStatus: func(context.Context, config.Config) (DaemonStatus, error) {
+			return DaemonStatus{Status: "ok", Version: "daemon-version"}, nil
+		},
+		ManifestDir: func(config.Config) (string, error) { return t.TempDir(), nil },
+		FirefoxDir:  func(config.Config) (string, error) { return t.TempDir(), nil },
+		ReadFile:    os.ReadFile,
+		ZotioPreflight: func(context.Context, config.Config) (*zotio.PreflightResult, error) {
+			return &zotio.PreflightResult{Version: "1.2.3"}, nil
+		},
+	})
+	if !report.OK {
+		t.Fatalf("integration report failed: %+v", report)
+	}
+	if got := report.Checks[1]; got.Name != "daemon" || got.Status != Warn || !strings.Contains(got.Detail, "daemon-version") {
+		t.Fatalf("daemon check = %#v", got)
+	}
+	if got := report.Checks[3]; got.Name != "native host (Chrome)" || got.Status != Skip {
+		t.Fatalf("Chrome manifest check = %#v", got)
 	}
 }

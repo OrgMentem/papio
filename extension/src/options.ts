@@ -4,6 +4,8 @@
 // Selecting the daemon's `maximal` access mode never grants a Chrome permission
 // by itself — that only happens here, explicitly.
 
+import { chromeBackend, type StoreShape } from "./state";
+
 interface Source {
   label: string;
   origin: string;
@@ -175,6 +177,46 @@ function wireWorkWindow(): void {
   }
 }
 
+async function renderDaemonFooter(): Promise<void> {
+  const footer = document.getElementById("daemon-footer");
+  if (!footer) return;
+
+  const extensionVersion = chrome.runtime.getManifest().version;
+  let daemon: Pick<StoreShape, "connectionStatus" | "daemonVersion"> = {
+    connectionStatus: "disconnected",
+    daemonVersion: null,
+  };
+  try {
+    // Share the popup's persisted bridge-state read rather than opening a
+    // second native connection from this page.
+    daemon = await chromeBackend(chrome.storage).load();
+  } catch {
+    // A storage failure is indistinguishable from an unavailable daemon here.
+  }
+
+  const prefix = `papio extension v${extensionVersion} · `;
+  switch (daemon.connectionStatus ?? "disconnected") {
+    case "connected":
+      footer.textContent =
+        typeof daemon.daemonVersion === "string" && daemon.daemonVersion.length > 0
+          ? `${prefix}daemon v${daemon.daemonVersion} (connected)`
+          : `${prefix}daemon connected (version unknown)`;
+      return;
+    case "daemon_outdated":
+      footer.textContent =
+        typeof daemon.daemonVersion === "string" && daemon.daemonVersion.length > 0
+          ? `${prefix}daemon v${daemon.daemonVersion} (outdated)`
+          : `${prefix}daemon connected (outdated)`;
+      return;
+    case "extension_outdated":
+      footer.textContent = `${prefix}daemon connected (extension outdated)`;
+      return;
+    case "disconnected":
+      footer.textContent = `${prefix}daemon not connected`;
+      return;
+  }
+}
+
 const sourceList = document.getElementById("sources");
 if (sourceList instanceof HTMLUListElement) {
   render(sourceList, SOURCES);
@@ -188,3 +230,4 @@ wireTermsConsent();
 void renderTermsConsent();
 wireWorkWindow();
 void renderWorkWindow();
+void renderDaemonFooter();

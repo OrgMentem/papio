@@ -124,11 +124,11 @@ func newDaemonCommand(opt *options) *cobra.Command {
 		Short: "Check the running daemon without autostarting one",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			var result map[string]string
+			var result daemonPingResult
 			if err := callExisting(cmd.Context(), "ping", &result); err != nil {
 				return err
 			}
-			return opt.printResult(result, "Daemon %s (%s)", result["status"], result["version"])
+			return opt.printResult(result, "Daemon %s (%s)", result.Status, result.Version)
 		},
 	}
 	command.AddCommand(stop, status)

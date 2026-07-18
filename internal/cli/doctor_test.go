@@ -14,10 +14,11 @@ import (
 
 	"papio/internal/api"
 	"papio/internal/config"
+	"papio/internal/doctor"
 	"papio/internal/zotio"
 )
 
-func TestDoctorAllGreen(t *testing.T) {
+func TestDoctorAllGreenRendersReadinessBeforeIntegration(t *testing.T) {
 	chromeDir := t.TempDir()
 	firefoxDir := t.TempDir()
 	cfg := config.Default()
@@ -32,22 +33,28 @@ func TestDoctorAllGreen(t *testing.T) {
 	})
 
 	var out bytes.Buffer
-	command := newDoctorCommandWithDependencies(&options{out: &out}, doctorDependencies{
-		LoadConfig: func(*options) (config.Config, error) { return cfg, nil },
-		DaemonStatus: func(context.Context, *options, config.Config) (doctorDaemonStatus, error) {
-			return doctorDaemonStatus{Status: "ok", Version: api.Version, ExtensionConnected: true, ExtensionVersion: "1.2.3"}, nil
+	command := newDoctorCommandWithDependencies(&options{out: &out}, doctor.IntegrationDependencies{
+		CLIVersion: api.Version,
+		LoadConfig: func() (config.Config, error) { return cfg, nil },
+		DaemonStatus: func(context.Context, config.Config) (doctor.DaemonStatus, error) {
+			return doctor.DaemonStatus{Status: "ok", Version: api.Version, ExtensionConnected: true, ExtensionVersion: "1.2.3"}, nil
 		},
-		ManifestDir: func() (string, error) { return chromeDir, nil },
-		FirefoxDir:  func() (string, error) { return firefoxDir, nil },
+		ManifestDir: func(config.Config) (string, error) { return chromeDir, nil },
+		FirefoxDir:  func(config.Config) (string, error) { return firefoxDir, nil },
 		ReadFile:    os.ReadFile,
 		ZotioPreflight: func(context.Context, config.Config) (*zotio.PreflightResult, error) {
 			return &zotio.PreflightResult{Version: "1.2.3", Capabilities: []zotio.Capability{{Path: "items get"}}}, nil
 		},
+	}, func(context.Context, config.Config) doctor.Report {
+		return doctor.Report{OK: true, Checks: []doctor.Check{{Name: "access_mode", Status: doctor.Pass, Detail: "explicit access mode configured"}}}
 	})
 	if err := command.ExecuteContext(context.Background()); err != nil {
 		t.Fatalf("doctor: %v", err)
 	}
 	got := out.String()
+	if readiness, integration := strings.Index(got, "access_mode"), strings.Index(got, "config"); readiness < 0 || integration < 0 || readiness > integration {
+		t.Fatalf("doctor report order = %q", got)
+	}
 	for _, name := range []string{"config", "daemon", "extension", "native host (Chrome)", "native host (Firefox)", "zotio"} {
 		if !strings.Contains(got, "PASS") || !strings.Contains(got, name) {
 			t.Fatalf("doctor output missing passing %q: %q", name, got)
@@ -61,20 +68,9 @@ func TestDoctorAllGreen(t *testing.T) {
 func TestDoctorExtensionNotConnectedWarnsWithSetupFix(t *testing.T) {
 	cfg := config.Default()
 	cfg.Path = filepath.Join(t.TempDir(), "config.toml")
-	report := runIntegrationDoctor(context.Background(), &options{}, doctorDependencies{
-		LoadConfig: func(*options) (config.Config, error) { return cfg, nil },
-		DaemonStatus: func(context.Context, *options, config.Config) (doctorDaemonStatus, error) {
-			return doctorDaemonStatus{Status: "ok", Version: api.Version}, nil
-		},
-		ManifestDir: func() (string, error) { return t.TempDir(), nil },
-		FirefoxDir:  func() (string, error) { return t.TempDir(), nil },
-		ReadFile:    os.ReadFile,
-		ZotioPreflight: func(context.Context, config.Config) (*zotio.PreflightResult, error) {
-			return &zotio.PreflightResult{Version: "1.2.3"}, nil
-		},
-	})
+	report := doctor.RunIntegration(context.Background(), testDoctorDependencies(t, cfg, doctor.DaemonStatus{Status: "ok", Version: api.Version}))
 	got := report.Checks[2]
-	if got.Name != "extension" || got.Status != doctorWarn || got.Detail != "extension has not connected since daemon start" || !strings.Contains(got.Fix, "browser extension") || !strings.Contains(got.Fix, "papio init") {
+	if got.Name != "extension" || got.Status != doctor.Warn || got.Detail != "extension has not connected since daemon start" || !strings.Contains(got.Remediation, "browser extension") || !strings.Contains(got.Remediation, "papio init") {
 		t.Fatalf("extension check = %#v", got)
 	}
 }
@@ -82,74 +78,68 @@ func TestDoctorExtensionNotConnectedWarnsWithSetupFix(t *testing.T) {
 func TestDoctorDaemonDownSkipsExtension(t *testing.T) {
 	cfg := config.Default()
 	cfg.Path = filepath.Join(t.TempDir(), "config.toml")
-	report := runIntegrationDoctor(context.Background(), &options{}, doctorDependencies{
-		LoadConfig: func(*options) (config.Config, error) { return cfg, nil },
-		DaemonStatus: func(context.Context, *options, config.Config) (doctorDaemonStatus, error) {
-			return doctorDaemonStatus{}, errors.New("daemon is unreachable")
-		},
-		ManifestDir: func() (string, error) { return t.TempDir(), nil },
-		FirefoxDir:  func() (string, error) { return t.TempDir(), nil },
-		ReadFile:    os.ReadFile,
-		ZotioPreflight: func(context.Context, config.Config) (*zotio.PreflightResult, error) {
-			return &zotio.PreflightResult{Version: "1.2.3"}, nil
-		},
-	})
+	deps := testDoctorDependencies(t, cfg, doctor.DaemonStatus{})
+	deps.DaemonStatus = func(context.Context, config.Config) (doctor.DaemonStatus, error) {
+		return doctor.DaemonStatus{}, errors.New("daemon is unreachable")
+	}
+	report := doctor.RunIntegration(context.Background(), deps)
 	got := report.Checks[2]
-	if got.Name != "extension" || got.Status != doctorSkip || got.Detail != "skipped: daemon is unreachable" {
+	if got.Name != "extension" || got.Status != doctor.Skip || got.Detail != "skipped: daemon is unreachable" {
 		t.Fatalf("extension check = %#v", got)
 	}
 }
 
 func TestDoctorConfigFailureSkipsDaemon(t *testing.T) {
 	daemonCalled := false
-	report := runIntegrationDoctor(context.Background(), &options{}, doctorDependencies{
-		LoadConfig: func(*options) (config.Config, error) {
-			return config.Config{}, errors.New("parsing config: unknown field \"browser.new_field\"")
-		},
-		DaemonStatus: func(context.Context, *options, config.Config) (doctorDaemonStatus, error) {
-			daemonCalled = true
-			return doctorDaemonStatus{}, nil
-		},
-		ManifestDir: func() (string, error) { return "", nil },
-		FirefoxDir:  func() (string, error) { return "", nil },
-		ReadFile:    os.ReadFile,
-		ZotioPreflight: func(context.Context, config.Config) (*zotio.PreflightResult, error) {
-			return nil, nil
-		},
-	})
+	deps := testDoctorDependencies(t, config.Config{}, doctor.DaemonStatus{})
+	deps.LoadConfig = func() (config.Config, error) {
+		return config.Config{}, errors.New("parsing config: unknown field \"browser.new_field\"")
+	}
+	deps.DaemonStatus = func(context.Context, config.Config) (doctor.DaemonStatus, error) {
+		daemonCalled = true
+		return doctor.DaemonStatus{}, nil
+	}
+	report := doctor.RunIntegration(context.Background(), deps)
 	if report.OK || daemonCalled {
 		t.Fatalf("report/daemon call = %#v / %t", report, daemonCalled)
 	}
-	if got := report.Checks[0]; got.Status != doctorFail || got.Fix != "update papio or remove the unrecognized field" {
+	if got := report.Checks[0]; got.Status != doctor.Fail || got.Remediation != "update papio or remove the unrecognized field" {
 		t.Fatalf("config check = %#v", got)
 	}
-	if got := report.Checks[1]; got.Name != "daemon" || got.Status != doctorSkip {
+	if got := report.Checks[1]; got.Name != "daemon" || got.Status != doctor.Skip {
 		t.Fatalf("daemon check = %#v", got)
 	}
 }
 
-func TestDoctorFailureReturnsCommandError(t *testing.T) {
+func TestDoctorReadinessFailureReturnsCommandError(t *testing.T) {
 	cfg := config.Default()
 	cfg.Path = filepath.Join(t.TempDir(), "config.toml")
-	cfg.Browser.ExtensionID = "abcdefghijklmnopabcdefghijklmnop"
 	var out bytes.Buffer
-	command := newDoctorCommandWithDependencies(&options{out: &out}, doctorDependencies{
-		LoadConfig: func(*options) (config.Config, error) { return cfg, nil },
-		DaemonStatus: func(context.Context, *options, config.Config) (doctorDaemonStatus, error) {
-			return doctorDaemonStatus{Status: "ok", Version: api.Version}, nil
-		},
-		ManifestDir: func() (string, error) { return t.TempDir(), nil },
-		FirefoxDir:  func() (string, error) { return t.TempDir(), nil },
-		ReadFile:    os.ReadFile,
-		ZotioPreflight: func(context.Context, config.Config) (*zotio.PreflightResult, error) {
-			return &zotio.PreflightResult{Version: "1.2.3"}, nil
-		},
+	command := newDoctorCommandWithDependencies(&options{out: &out}, testDoctorDependencies(t, cfg, doctor.DaemonStatus{Status: "ok", Version: api.Version}), func(context.Context, config.Config) doctor.Report {
+		return doctor.Report{OK: false, Checks: []doctor.Check{{Name: "pdf_worker", Status: doctor.Fail, Detail: "not runnable", Remediation: "rebuild papio"}}}
 	})
 	if err := command.ExecuteContext(context.Background()); !errors.Is(err, errDoctorFailed) {
 		t.Fatalf("doctor error = %v, want failure", err)
 	}
-	if !strings.Contains(out.String(), "FAIL") || !strings.Contains(out.String(), "fix: papio native-host install") {
+	if !strings.Contains(out.String(), "FAIL") || !strings.Contains(out.String(), "fix: rebuild papio") {
 		t.Fatalf("doctor output = %q", out.String())
+	}
+}
+
+func testDoctorDependencies(t *testing.T, cfg config.Config, status doctor.DaemonStatus) doctor.IntegrationDependencies {
+	t.Helper()
+	return doctor.IntegrationDependencies{
+		CLIVersion: api.Version,
+		LoadConfig: func() (config.Config, error) { return cfg, nil },
+		DaemonStatus: func(context.Context, config.Config) (doctor.DaemonStatus, error) {
+			return status, nil
+		},
+		ManifestDir: func(config.Config) (string, error) { return t.TempDir(), nil },
+		FirefoxDir:  func(config.Config) (string, error) { return t.TempDir(), nil },
+		ReadFile:    os.ReadFile,
+		ZotioPreflight: func(context.Context, config.Config) (*zotio.PreflightResult, error) {
+			return &zotio.PreflightResult{Version: "1.2.3"}, nil
+		},
 	}
 }
 

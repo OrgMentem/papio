@@ -561,6 +561,10 @@ function makeMapHarness(specs: AdapterSpec[] = [SPEC]): MapHarness {
         settings.consent = v;
       },
     },
+    action: {
+      setBadgeText: async () => {},
+      setBadgeBackgroundColor: async () => {},
+    },
     alarms,
   };
   return {
