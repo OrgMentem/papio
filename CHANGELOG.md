@@ -10,6 +10,19 @@ execution records in `notes/acquisition-stack-plan.md`.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-19
+
+### Added
+
+- Broader browser reach for the native-messaging connector. `papio native-host
+  install` now registers the host with every installed Chromium browser it
+  detects — Chrome, Edge, Vivaldi, Brave, Opera (Chromium too) — plus Firefox,
+  each at its own per-user location (directory on macOS/Linux, registry key on
+  Windows), so the same extension works across them. A new `browser.extension_ids`
+  config field lists additional Chrome-family extension IDs (e.g. an Edge
+  Add-ons build) alongside `extension_id`; the daemon accepts any of them and the
+  manifest's `allowed_origins` lists them all.
+
 ### Fixed
 
 A triaged glean audit pass (33 confirmed findings fixed, each with a
@@ -52,19 +65,6 @@ regression test where behavior changed):
   fail-closed at the zotio integration boundary (the published v1 protocol
   contract is unchanged); batch identity hashes widened from 32 to 128 bits,
   with manifests from earlier releases still readable.
-
-## [0.5.0] - 2026-07-19
-
-### Added
-
-- Broader browser reach for the native-messaging connector. `papio native-host
-  install` now registers the host with every installed Chromium browser it
-  detects — Chrome, Edge, Vivaldi, Brave, Opera (Chromium too) — plus Firefox,
-  each at its own per-user location (directory on macOS/Linux, registry key on
-  Windows), so the same extension works across them. A new `browser.extension_ids`
-  config field lists additional Chrome-family extension IDs (e.g. an Edge
-  Add-ons build) alongside `extension_id`; the daemon accepts any of them and the
-  manifest's `allowed_origins` lists them all.
 
 ## [0.4.0] - 2026-07-19
 
