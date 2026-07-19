@@ -25,6 +25,11 @@ changelog:
     - title: Other
       order: 999
 release:
+  # Make re-runs idempotent: on a 422 (asset already exists from a prior
+  # partial run), delete the existing asset and retry the upload. Without
+  # this, "fix the secrets and re-run" (per dev runbook) dies on asset
+  # conflicts before the Homebrew/Scoop pushes happen — as it did for 0.4.0.
+  replace_existing_artifacts: true
   footer: |
     ---
     **Curated history:** [CHANGELOG.md](https://github.com/OrgMentem/papio/blob/main/CHANGELOG.md) · **Install:** `brew install orgmentem/tap/papio`
