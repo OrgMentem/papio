@@ -98,4 +98,7 @@ nav:
       - Configuration: reference/config-reference.md
   - Contributing:
       - Architecture decisions: contributing/architecture-decisions.md
+  - Changelog:
+      - Daemon & CLI: changelog/daemon.md
+      - Browser extension: changelog/extension.md
   - Privacy: privacy.md

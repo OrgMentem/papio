@@ -1,8 +1,12 @@
 # Changelog
 
-All notable changes to *papio* are documented here. This initial release entry is
-synthesized from the complete `papio` and `zotio` Git histories and the execution
-records in `notes/acquisition-stack-plan.md`.
+All notable changes to the *papio* daemon and CLI are documented here, keyed
+to `v*` release tags. The browser extension is versioned and released
+independently (`ext-v*` tags): from extension 0.3.1 onward its changes live in
+`extension/CHANGELOG.md`. Through `[0.3.0]` the two shared a version stream,
+so older sections below include extension entries. The initial release entry
+is synthesized from the complete `papio` and `zotio` Git histories and the
+execution records in `notes/acquisition-stack-plan.md`.
 
 ## [0.5.0] - 2026-07-19
 

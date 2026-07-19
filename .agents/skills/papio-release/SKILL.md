@@ -39,10 +39,45 @@ publishes the GitHub release and all binaries, but the Homebrew/Scoop steps fail
 | `extension/src/background.ts:54` — `MIN_DAEMON_VERSION` | Extension acceptance of a daemon in `hello_ack`. | The extension requires a `hello_ack` feature. |
 | `internal/zotio/client.go:23` — `MinimumVersion` | *papio*'s zotio subprocess preflight. | *papio* invokes a capability that older zotio lacks. Prefer adding it to `RequiredCapabilities` before raising a version floor. |
 
+Floor policy — compatibility is carried by floors and `hello_ack` feature
+flags, never by version-number correlation between artifacts:
+
+- **Additive capability** → advertise it in `hello_ack` `features[]` and gate
+  extension behavior on its presence. Never bump a floor for an additive
+  change. (Store extensions auto-update while daemons update manually, so the
+  common skew is *new extension + old daemon* — the extension carries the
+  backward-compat burden.)
+- **Hard dependency** → bump the floor **in the same commit/PR** as the change
+  that creates the dependency, to the counterpart release that introduced it.
+- New protocol fields stay optional/`omitempty` within `papio-browser/1`.
+
 Run the compatibility preflight before tagging: `release_metadata.py compat`
 runs from `scripts/release.sh` and release CI. Floors are mechanically
 enforced there; decide **when** to move them by the rules above, then let the
 script verify the declaration is coherent.
+
+## Changelogs
+
+Two files, split by **shipped artifact** (not by commit):
+
+| File | Covers | Keyed to |
+| --- | --- | --- |
+| `CHANGELOG.md` | daemon + CLI | `v*` tags |
+| `extension/CHANGELOG.md` | browser extension | `ext-v*` tags / manifest version |
+
+Attribution rule: *which artifact's user-visible behavior changed?* A protocol
+change spanning both sides gets an entry in **both** files — that is correct,
+not duplication (each user population sees a different behavior change).
+Commits never need to be cleanly one-sided; changelogs are written by hand,
+not derived from `git log`. Both accumulate under `## [Unreleased]` and are
+finalized to `## [x.y.z] - date` at tag time.
+
+Both changelogs are published on the docs site (`docs/changelog/*.md` are
+snippet includes of the real files — edit the real files, never the docs
+mirrors). This is the only changelog CWS users get (CWS has no version-history
+UI). AMO *does* have a public per-version "Release Notes" field — paste the
+extension changelog entry into the AMO Developer Hub after each upload
+(`web-ext sign` cannot set it).
 
 ## Release order
 
@@ -78,7 +113,9 @@ migration plan before merging; do not tag first and design compatibility later.
 
 - [ ] Confirm the relevant gates are green in both repositories.
 - [ ] Run the compatibility preflight and resolve every floor mismatch.
-- [ ] Update both applicable `CHANGELOG.md` files.
+- [ ] Finalize the `[Unreleased]` section of the changelog matching the tag
+      stream (`CHANGELOG.md` for `v*`, `extension/CHANGELOG.md` for `ext-v*`);
+      see the Changelogs section for the attribution rule.
 - [ ] Regenerate documentation with `make docs-gen` and commit any generated
       drift.
 - [ ] Confirm `extension/manifest.json` has the intended extension version.
@@ -200,9 +237,15 @@ new package replaces only the code.
   publication; never gate a daemon release on store approval.
 - **The extension version lives in TWO files** — `extension/manifest.json` **and**
   `extension/package.json`. The compat preflight (`release_metadata.py compat`, run
-  in CI) fails the build if they differ, so bump **both** together. (`bun.lock`
-  doesn't pin the root version, so `--frozen-lockfile` is unaffected.)
+  in CI) fails the build if they differ. Bump both atomically with
+  `make ext-bump VERSION=x.y.z`. (`bun.lock` doesn't pin the root version, so
+  `--frozen-lockfile` is unaffected.)
 - **AMO version numbers are unique across channels.** "Version X already exists"
   means it was uploaded before — even as an unlisted/self-distributed signed
   build — so bump the version and resubmit. Cross-store version skew (e.g. CWS
   0.3.0, AMO 0.3.1) is fine; the listings are independent.
+- **The popup's daemon-update hint goes stale under decoupled cadences.** The
+  extension compares the daemon's reported version against
+  `__PAPIO_DAEMON_VERSION__` stamped at extension *build* time — daemon
+  releases shipped after the last extension build won't trigger it. Treat it
+  as a floor hint; the CLI's once-daily update hint is the real channel.

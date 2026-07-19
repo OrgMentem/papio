@@ -256,6 +256,34 @@ def compat(args: argparse.Namespace) -> None:
         raise SystemExit(f"compatibility preflight failed: {', '.join(failures)}")
 
 
+def bump_extension(args: argparse.Namespace) -> None:
+    """Set the extension version in both files that must move together.
+
+    The extension version lives in extension/manifest.json AND
+    extension/package.json; the `compat` preflight fails CI when they differ.
+    Rewrites are regex-targeted to the top-level "version" key so the rest of
+    each file's formatting is untouched.
+    """
+    version = args.version
+    try:
+        semver_core(version)
+    except ValueError as exc:
+        raise SystemExit(f"bump-extension: {exc}")
+    root = Path(args.repo_root)
+    version_re = re.compile(r'^(\s*"version"\s*:\s*")([^"]+)(")', re.MULTILINE)
+    for relative in ("extension/manifest.json", "extension/package.json"):
+        path = root / relative
+        text = path.read_text(encoding="utf-8")
+        updated, count = version_re.subn(
+            lambda m: f"{m.group(1)}{version}{m.group(3)}", text, count=1
+        )
+        if count != 1:
+            raise SystemExit(f"bump-extension: no version field found in {relative}")
+        old = version_re.search(text).group(2)
+        path.write_text(updated, encoding="utf-8")
+        print(f"{relative}: {old} -> {version}")
+
+
 
 
 def normalize_timestamps(args: argparse.Namespace) -> None:
@@ -408,6 +436,14 @@ def parser() -> argparse.ArgumentParser:
         help="skip the bundled zotio minimum-version check",
     )
     compatibility.set_defaults(func=compat)
+
+    bump = commands.add_parser(
+        "bump-extension",
+        help="set the extension version in manifest.json and package.json together",
+    )
+    bump.add_argument("--repo-root", required=True)
+    bump.add_argument("--version", required=True)
+    bump.set_defaults(func=bump_extension)
 
     timestamps = commands.add_parser("normalize-timestamps")
     timestamps.add_argument("--directory", required=True)
