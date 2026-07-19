@@ -98,3 +98,4 @@ nav:
       - Configuration: reference/config-reference.md
   - Contributing:
       - Architecture decisions: contributing/architecture-decisions.md
+  - Privacy: privacy.md

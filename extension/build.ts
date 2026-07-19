@@ -60,10 +60,6 @@ async function buildAll(): Promise<void> {
   const chromeManifest = JSON.parse(await readFile("manifest.json", "utf8")) as Record<string, unknown>;
   const { minimum_chrome_version: _, ...firefoxManifest } = chromeManifest;
   firefoxManifest.background = { scripts: ["dist/background.js"] };
-  // The shared description names Chrome; the Firefox listing should not.
-  if (typeof firefoxManifest.description === "string") {
-    firefoxManifest.description = firefoxManifest.description.replace("Ordinary-Chrome", "Ordinary-browser");
-  }
   firefoxManifest.browser_specific_settings = {
     gecko: {
       id: "papio@orgmentem.com",
