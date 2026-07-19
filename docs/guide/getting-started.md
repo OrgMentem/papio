@@ -6,14 +6,62 @@ you a preview before it writes anything.
 
 ## 1. Prerequisites
 
-*papio* runs on macOS, Linux, and Windows. Install a released binary — Homebrew
-(macOS/Linux), Scoop (Windows), or a prebuilt archive from the
-[releases page](https://github.com/OrgMentem/papio/releases) — or build from this
-checkout:
+*papio* runs on macOS, Linux, and Windows. Install a released binary:
 
-```sh
-go build ./cmd/papio
-```
+=== "macOS"
+
+    **Homebrew** — `brew upgrade` tracks new releases:
+
+    ```bash
+    brew install orgmentem/tap/papio
+    ```
+
+=== "Linux"
+
+    **Homebrew** (Linuxbrew):
+
+    ```bash
+    brew install orgmentem/tap/papio
+    ```
+
+    **Distro packages** — every [GitHub release](https://github.com/OrgMentem/papio/releases) ships `.deb`, `.rpm`, and `.apk` for amd64/arm64. Download the file for your arch, then:
+
+    ```bash
+    # Debian / Ubuntu
+    sudo dpkg -i papio_<version>_linux_amd64.deb
+
+    # Fedora / RHEL / openSUSE
+    sudo rpm -i papio_<version>_linux_amd64.rpm
+
+    # Alpine
+    sudo apk add --allow-untrusted papio_<version>_linux_amd64.apk
+    ```
+
+=== "Windows"
+
+    **Scoop** — `scoop update papio` tracks new releases:
+
+    ```powershell
+    scoop bucket add orgmentem https://github.com/OrgMentem/scoop-bucket
+    scoop install papio
+    ```
+
+    !!! note "WinGet is on the way"
+        A `winget install OrgMentem.papio` manifest is pending review in `microsoft/winget-pkgs`. Until it lands, use Scoop or a prebuilt archive.
+
+=== "Prebuilt binary"
+
+    Every [GitHub release](https://github.com/OrgMentem/papio/releases) ships archives for macOS, Linux, and Windows (amd64/arm64) with cosign-signed checksums and SBOMs. Unpack and put `papio` on your `PATH`:
+
+    - **macOS:** clear the Gatekeeper quarantine — `xattr -d com.apple.quarantine papio`, then `chmod +x papio`
+    - **Linux:** `chmod +x papio`
+    - **Windows:** unzip and add the folder to your `PATH`
+
+=== "From source"
+
+    ```sh
+    go build ./cmd/papio
+    ```
 
 PDF validation and OCR use Poppler and Tesseract:
 
