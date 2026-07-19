@@ -4,7 +4,7 @@ All notable changes to *papio* are documented here. This initial release entry i
 synthesized from the complete `papio` and `zotio` Git histories and the execution
 records in `notes/acquisition-stack-plan.md`.
 
-## [Unreleased]
+## [0.4.0] - 2026-07-19
 
 ### Added
 
