@@ -21,6 +21,11 @@ const (
 	DefaultPerRunCap     = 10
 	MaxPerRunCap         = 50
 	DisableAfterFailures = 5
+
+	KindDiscovery = "discovery"
+	KindBackfill  = "backfill"
+	ModeAcquire   = "acquire"
+	ModeAlert     = "alert"
 )
 
 // Filters is the persisted subset of discovery search filters that a watch may
@@ -32,10 +37,12 @@ type Filters struct {
 	OAOnly   bool `json:"oa_only,omitempty"`
 }
 
-// Watch is one durable scheduled discovery search.
+// Watch is one durable scheduled discovery search or library backfill.
 type Watch struct {
 	ID                  int64   `json:"id"`
 	Label               string  `json:"label"`
+	Kind                string  `json:"kind"`
+	Mode                string  `json:"mode"`
 	Query               string  `json:"query"`
 	Filters             Filters `json:"filters"`
 	Collection          string  `json:"collection,omitempty"`
@@ -51,6 +58,8 @@ type Watch struct {
 // CreateInput is the strict API and CLI input for a new watch.
 type CreateInput struct {
 	Label        string  `json:"label,omitempty"`
+	Kind         string  `json:"kind,omitempty"`
+	Mode         string  `json:"mode,omitempty"`
 	Query        string  `json:"query"`
 	Filters      Filters `json:"filters,omitempty"`
 	Collection   string  `json:"collection,omitempty"`
@@ -67,6 +76,18 @@ type IDInput struct {
 type FailureResult struct {
 	ConsecutiveFailures int
 	Disabled            bool
+}
+
+// DigestEntry is one previously unowned discovery reported by an alert watch.
+type DigestEntry struct {
+	WorkKey     string `json:"work_key"`
+	TitleKey    string `json:"-"`
+	Title       string `json:"title"`
+	Authors     string `json:"authors"`
+	Year        int    `json:"year"`
+	DOI         string `json:"doi,omitempty"`
+	IsOA        bool   `json:"is_oa"`
+	FirstSeenAt string `json:"first_seen_at"`
 }
 
 // Store layers watch semantics over the process-wide single-writer SQLite
@@ -90,9 +111,9 @@ func (s *Store) Create(ctx context.Context, input CreateInput) (*Watch, error) {
 		return nil, fmt.Errorf("encoding watch filters: %w", err)
 	}
 	result, err := s.S.DB().ExecContext(ctx, `
-		INSERT INTO watches (label, query, filters_json, collection, cadence_hours, per_run_cap, enabled, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, 1, ?)`,
-		input.Label, input.Query, string(filters), input.Collection, input.CadenceHours, input.PerRunCap, store.Now())
+		INSERT INTO watches (label, kind, mode, query, filters_json, collection, cadence_hours, per_run_cap, enabled, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`,
+		input.Label, input.Kind, input.Mode, input.Query, string(filters), input.Collection, input.CadenceHours, input.PerRunCap, store.Now())
 	if err != nil {
 		return nil, fmt.Errorf("creating watch: %w", err)
 	}
@@ -137,6 +158,114 @@ func (s *Store) List(ctx context.Context) ([]Watch, error) {
 		return nil, fmt.Errorf("iterating watches: %w", err)
 	}
 	return watches, nil
+}
+
+// RecordDigest stores alert-watch discoveries, retaining only the first sighting
+// of each stable work key.
+func (s *Store) RecordDigest(ctx context.Context, watchID int64, at time.Time, entries []DigestEntry) (int, error) {
+	if s == nil || s.S == nil {
+		return 0, errors.New("watch store is not configured")
+	}
+	if watchID <= 0 {
+		return 0, errors.New("watch id must be positive")
+	}
+	if _, err := s.Get(ctx, watchID); err != nil {
+		return 0, err
+	}
+	tx, err := s.S.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("starting watch digest transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	firstSeenAt := at.UTC().Format(time.RFC3339Nano)
+	reported := 0
+	for _, entry := range entries {
+		entry.WorkKey = strings.TrimSpace(entry.WorkKey)
+		entry.TitleKey = strings.TrimSpace(entry.TitleKey)
+		entry.Title = strings.TrimSpace(entry.Title)
+		entry.DOI = strings.TrimSpace(entry.DOI)
+		if entry.WorkKey == "" || entry.Title == "" {
+			return 0, errors.New("watch digest entry requires work_key and title")
+		}
+		if entry.DOI != "" && entry.TitleKey != "" && entry.TitleKey != entry.WorkKey {
+			result, err := tx.ExecContext(ctx, `
+				UPDATE watch_digest_entries
+				SET work_key = ?, doi = ?
+				WHERE watch_id = ? AND work_key = ?`,
+				entry.WorkKey, entry.DOI, watchID, entry.TitleKey)
+			if err != nil {
+				return 0, fmt.Errorf("migrating watch digest: %w", err)
+			}
+			count, err := result.RowsAffected()
+			if err != nil {
+				return 0, err
+			}
+			if count > 0 {
+				continue
+			}
+		}
+		result, err := tx.ExecContext(ctx, `
+			INSERT INTO watch_digest_entries
+				(watch_id, work_key, title, authors, year, doi, is_oa, first_seen_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(watch_id, work_key) DO NOTHING`,
+			watchID, entry.WorkKey, entry.Title, strings.TrimSpace(entry.Authors), entry.Year,
+			entry.DOI, entry.IsOA, firstSeenAt)
+		if err != nil {
+			return 0, fmt.Errorf("recording watch digest: %w", err)
+		}
+		count, err := result.RowsAffected()
+		if err != nil {
+			return 0, err
+		}
+		reported += int(count)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("committing watch digest: %w", err)
+	}
+	return reported, nil
+}
+
+// Digest returns recent alert-watch discoveries, newest first.
+func (s *Store) Digest(ctx context.Context, watchID int64, limit int) ([]DigestEntry, error) {
+	if s == nil || s.S == nil {
+		return nil, errors.New("watch store is not configured")
+	}
+	if watchID <= 0 {
+		return nil, errors.New("watch id must be positive")
+	}
+	if _, err := s.Get(ctx, watchID); err != nil {
+		return nil, err
+	}
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	rows, err := s.S.DB().QueryContext(ctx, `
+		SELECT work_key, title, authors, year, doi, is_oa, first_seen_at
+		FROM watch_digest_entries
+		WHERE watch_id = ?
+		ORDER BY id DESC
+		LIMIT ?`, watchID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("listing watch digest: %w", err)
+	}
+	defer rows.Close()
+	entries := make([]DigestEntry, 0)
+	for rows.Next() {
+		var entry DigestEntry
+		if err := rows.Scan(
+			&entry.WorkKey, &entry.Title, &entry.Authors, &entry.Year,
+			&entry.DOI, &entry.IsOA, &entry.FirstSeenAt,
+		); err != nil {
+			return nil, err
+		}
+		entries = append(entries, entry)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating watch digest: %w", err)
+	}
+	return entries, nil
 }
 
 // Remove permanently deletes a watch. Existing acquisition jobs and manifests
@@ -297,7 +426,7 @@ func (s *Store) RecordFailure(ctx context.Context, id int64, at time.Time, runEr
 }
 
 const watchSelect = `
-	SELECT id, label, query, filters_json, collection, cadence_hours, per_run_cap,
+	SELECT id, label, kind, mode, query, filters_json, collection, cadence_hours, per_run_cap,
 	       enabled, COALESCE(last_run_at, ''), created_at, consecutive_failures, last_error
 	FROM watches`
 
@@ -309,7 +438,7 @@ func scanWatch(scanner watchScanner) (*Watch, error) {
 	var watch Watch
 	var filters string
 	if err := scanner.Scan(
-		&watch.ID, &watch.Label, &watch.Query, &filters, &watch.Collection,
+		&watch.ID, &watch.Label, &watch.Kind, &watch.Mode, &watch.Query, &filters, &watch.Collection,
 		&watch.CadenceHours, &watch.PerRunCap, &watch.Enabled, &watch.LastRunAt,
 		&watch.CreatedAt, &watch.ConsecutiveFailures, &watch.LastError,
 	); err != nil {
@@ -322,17 +451,22 @@ func scanWatch(scanner watchScanner) (*Watch, error) {
 }
 
 func normalizeCreateInput(input CreateInput) (CreateInput, error) {
+	input.Kind = strings.TrimSpace(input.Kind)
+	input.Mode = strings.TrimSpace(input.Mode)
 	input.Query = strings.TrimSpace(input.Query)
 	input.Label = strings.TrimSpace(input.Label)
 	input.Collection = strings.TrimSpace(input.Collection)
-	if input.Query == "" {
-		return CreateInput{}, errors.New("watch query is required")
+	if input.Kind == "" {
+		input.Kind = KindDiscovery
 	}
-	if input.Label == "" {
-		input.Label = input.Query
+	if input.Mode == "" {
+		input.Mode = ModeAcquire
 	}
-	if input.Collection == "" {
-		input.Collection = input.Query
+	if input.Kind != KindDiscovery && input.Kind != KindBackfill {
+		return CreateInput{}, fmt.Errorf("unknown watch kind %q", input.Kind)
+	}
+	if input.Mode != ModeAcquire && input.Mode != ModeAlert {
+		return CreateInput{}, fmt.Errorf("unknown watch mode %q", input.Mode)
 	}
 	if input.CadenceHours <= 0 {
 		return CreateInput{}, errors.New("watch cadence_hours must be positive")
@@ -348,6 +482,34 @@ func normalizeCreateInput(input CreateInput) (CreateInput, error) {
 	}
 	if input.Filters.YearFrom > 0 && input.Filters.YearTo > 0 && input.Filters.YearFrom > input.Filters.YearTo {
 		return CreateInput{}, errors.New("watch year_from cannot exceed year_to")
+	}
+	switch input.Kind {
+	case KindDiscovery:
+		if input.Query == "" {
+			return CreateInput{}, errors.New("watch query is required")
+		}
+		if input.Label == "" {
+			input.Label = input.Query
+		}
+		if input.Collection == "" {
+			input.Collection = input.Query
+		}
+	case KindBackfill:
+		if input.Query != "" {
+			return CreateInput{}, errors.New("backfill watch does not accept a query")
+		}
+		if input.Filters != (Filters{}) {
+			return CreateInput{}, errors.New("backfill watch does not accept filters")
+		}
+		if input.Mode != ModeAcquire {
+			return CreateInput{}, errors.New("backfill watch mode must be acquire")
+		}
+		if input.Label == "" {
+			input.Label = "backfill"
+			if input.Collection != "" {
+				input.Label += ": " + input.Collection
+			}
+		}
 	}
 	return input, nil
 }

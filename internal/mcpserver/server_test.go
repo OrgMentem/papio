@@ -23,6 +23,7 @@ import (
 	"papio/internal/config"
 	"papio/internal/job"
 	"papio/internal/protocol"
+	"papio/internal/work"
 	"papio/internal/zotio"
 )
 
@@ -239,6 +240,176 @@ func TestBatchWaitToolSettlesAndTimesOut(t *testing.T) {
 			t.Fatalf("RPC calls = %+v", fake.calls)
 		}
 	})
+}
+
+func TestJobsResourceEnvelope(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		count     int
+		truncated bool
+	}{
+		{name: "truncated", count: resourceRowCap + 1, truncated: true},
+		{name: "complete", count: 3, truncated: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			system := newResourceTestSystem(t)
+			seedResourceJobs(t, system, tc.count)
+
+			value, err := jobsResource(context.Background(), system)
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertResourcePage(t, value, "jobs", min(tc.count, resourceRowCap), tc.truncated)
+		})
+	}
+}
+
+func TestJobsResourceEmptyEnvelopeUsesArray(t *testing.T) {
+	value, err := jobsResource(context.Background(), newResourceTestSystem(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"jobs":[]`) {
+		t.Fatalf("jobs resource JSON = %s, want empty jobs array", data)
+	}
+}
+
+func TestArtifactsResourceEnvelope(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		count     int
+		truncated bool
+	}{
+		{name: "truncated", count: resourceRowCap + 1, truncated: true},
+		{name: "complete", count: 3, truncated: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			system := newResourceTestSystem(t)
+			seedResourceArtifacts(t, system, tc.count)
+
+			value, err := artifactsResource(context.Background(), system)
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertResourcePage(t, value, "artifacts", min(tc.count, resourceRowCap), tc.truncated)
+		})
+	}
+}
+
+func TestExportsResourceEnvelope(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		count     int
+		kind      string
+		filter    string
+		key       string
+		truncated bool
+	}{
+		{name: "exports truncated", count: resourceRowCap + 1, kind: "zotio_apply", key: "exports", truncated: true},
+		{name: "exports complete", count: 3, kind: "zotio_apply", key: "exports", truncated: false},
+		{name: "bundles complete", count: 3, kind: "bundle", filter: "bundle", key: "bundles", truncated: false},
+		{name: "plans complete", count: 3, kind: "zotio_plan", filter: "zotio_plan", key: "plans", truncated: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			system := newResourceTestSystem(t)
+			seedResourceExports(t, system, tc.count, tc.kind)
+
+			value, err := exportsResource(context.Background(), system, tc.filter)
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertResourcePage(t, value, tc.key, min(tc.count, resourceRowCap), tc.truncated)
+		})
+	}
+}
+
+func newResourceTestSystem(t *testing.T) *bootstrap.System {
+	t.Helper()
+	cfg := config.Default()
+	cfg.DataDir = t.TempDir()
+	system, err := bootstrap.New(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = system.Close() })
+	return system
+}
+
+func seedResourceJobs(t *testing.T, system *bootstrap.System, count int) {
+	t.Helper()
+	ctx := context.Background()
+	policy := job.Policy{AccessMode: config.ModeConservative, DesiredVersion: "any"}
+	for i := range count {
+		if _, err := system.Jobs.CreateRequest(ctx, fmt.Sprintf("resource-job-%03d", i), work.Work{
+			DOI: fmt.Sprintf("10.1000/resource-job-%03d", i),
+		}, "", "", policy, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func seedResourceArtifacts(t *testing.T, system *bootstrap.System, count int) {
+	t.Helper()
+	ctx := context.Background()
+	for i := range count {
+		if err := system.Jobs.UpsertArtifact(ctx, job.Artifact{
+			SHA256:    fmt.Sprintf("%064x", i+1),
+			SizeBytes: 1,
+			MIME:      "application/pdf",
+			Path:      fmt.Sprintf("/tmp/resource-%03d.pdf", i),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func seedResourceExports(t *testing.T, system *bootstrap.System, count int, kind string) {
+	t.Helper()
+	ctx := context.Background()
+	for i := range count {
+		if _, err := system.Store.DB().ExecContext(ctx,
+			`INSERT INTO exports(job_id, kind, idempotency_key, created_at) VALUES (?, ?, ?, ?)`,
+			fmt.Sprintf("resource-job-%03d", i), kind, fmt.Sprintf("resource-export-%03d", i), "2026-07-20T00:00:00Z"); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func assertResourcePage(t *testing.T, value any, key string, wantCount int, wantTruncated bool) {
+	t.Helper()
+	data, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var page map[string]json.RawMessage
+	if err := json.Unmarshal(data, &page); err != nil {
+		t.Fatal(err)
+	}
+	if len(page) != 2 {
+		t.Fatalf("resource page has %d keys, want %q and %q", len(page), key, "truncated")
+	}
+	rows, ok := page[key]
+	if !ok {
+		t.Fatalf("resource page = %s, missing %q", data, key)
+	}
+	var entries []json.RawMessage
+	if err := json.Unmarshal(rows, &entries); err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != wantCount {
+		t.Fatalf("%s count = %d, want %d", key, len(entries), wantCount)
+	}
+	var truncated bool
+	if err := json.Unmarshal(page["truncated"], &truncated); err != nil {
+		t.Fatal(err)
+	}
+	if truncated != wantTruncated {
+		t.Fatalf("truncated = %t, want %t", truncated, wantTruncated)
+	}
 }
 
 type fakeRPCCall struct {

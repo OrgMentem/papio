@@ -52,7 +52,7 @@ type System struct {
 	Browser       *browser.Bridge
 	PDFCapability pdf.Capability
 	WorkerBinary  string
-	Discovery     *discovery.Client
+	Discovery     discovery.Source
 	Watches       *watch.Store
 	WatchRunner   *watch.Runner
 	Zotio         *zotio.Service
@@ -156,11 +156,17 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 
 	entries := resolverEntries(cfg, metadataClient)
 	service := app.New(cfg, jobs, artifacts, budgets)
-	var watchNotifier notify.Sender
+	var senders []notify.Sender
 	if cfg.Notify.Enabled {
-		desktopNotifier := notify.NewMacOS()
-		service.Notifier = notify.NewCoalescer(desktopNotifier)
-		watchNotifier = desktopNotifier
+		senders = append(senders, notify.NewMacOS())
+	}
+	if cfg.Notify.WebhookURL != "" {
+		senders = append(senders, notify.NewWebhook(cfg.Notify.WebhookURL, cfg.Notify.WebhookSecret))
+	}
+	var watchNotifier notify.Sender
+	if len(senders) > 0 {
+		watchNotifier = notify.Fanout(senders...)
+		service.Notifier = notify.NewCoalescer(watchNotifier)
 	}
 	service.Resolvers = entries
 	service.Fetch = func(ctx context.Context, candidate resolver.Candidate, path string) (fetch.Result, error) {
@@ -199,13 +205,11 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 		AttachmentMode: cfg.Zotio.AttachmentMode, AutoEnrich: cfg.Zotio.AutoEnrich,
 	}
 	service.AutoImporter = newSerialAutoImporter(zotioService)
-	discoveryClient := discovery.NewWithOptions(discovery.Options{
-		ContactEmail: cfg.Email, BaseURL: cfg.Sources[config.SourceOpenAlex].BaseURLForDev,
-	})
+	discoveryClient := discovery.NewMulti(discoverySources(cfg)...)
 	watches := watch.NewStore(db)
 	watchRunner := &watch.Runner{
 		Store: watches, Discovery: discoveryClient, Lookup: zotioService, Submitter: service,
-		Notifier: watchNotifier, DataDir: cfg.DataDir,
+		Backfill: zotioService, Notifier: watchNotifier, DataDir: cfg.DataDir,
 	}
 	scheduler, err := daemon.NewScheduler(jobs, service, daemon.SchedulerConfig{
 		Owner:               job.NewID("daemon"),
@@ -261,4 +265,28 @@ func resolverEntries(cfg config.Config, client *fetch.SecureHTTPClient) []app.Re
 		{Adapter: coreresolver.NewWithOptions(coreresolver.Options{Client: client, APIKey: cfg.Sources[config.SourceCORE].APIKey, BaseURL: cfg.Sources[config.SourceCORE].BaseURLForDev}), Policy: cfg.SourcePolicy(config.SourceCORE)},
 		{Adapter: crossreftdm.NewWithOptions(crossreftdm.Options{Client: client, APIKey: cfg.Sources[config.SourceCrossrefTDM].APIKey, BaseURL: cfg.Sources[config.SourceCrossrefTDM].BaseURLForDev}), Policy: cfg.SourcePolicy(config.SourceCrossrefTDM)},
 	}
+}
+
+// discoverySources builds the configured discovery backends in merge-preference
+// order. An empty selection keeps the historical OpenAlex-only behavior.
+func discoverySources(cfg config.Config) []discovery.Source {
+	names := cfg.Discovery.Sources
+	if len(names) == 0 {
+		names = []string{config.SourceOpenAlex}
+	}
+	sources := make([]discovery.Source, 0, len(names))
+	for _, name := range names {
+		switch name {
+		case config.SourceOpenAlex:
+			sources = append(sources, discovery.NewWithOptions(discovery.Options{
+				ContactEmail: cfg.Email, BaseURL: cfg.Sources[config.SourceOpenAlex].BaseURLForDev,
+			}))
+		case config.SourceSemanticScholar:
+			sources = append(sources, discovery.NewSemanticScholarWithOptions(discovery.SemanticScholarOptions{
+				APIKey:  cfg.Sources[config.SourceSemanticScholar].APIKey,
+				BaseURL: cfg.Sources[config.SourceSemanticScholar].BaseURLForDev,
+			}))
+		}
+	}
+	return sources
 }

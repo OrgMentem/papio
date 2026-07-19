@@ -45,9 +45,9 @@ type Options struct {
 	MaxResponseBytes int64
 }
 
-// SearchParams selects works from OpenAlex. Slim is an internal-only mode for
-// callers that do not need abstract_inverted_index and must keep response
-// sizes bounded on broad scheduled searches.
+// SearchParams selects works from configured sources. Slim is an internal-only
+// mode for callers that do not need abstract_inverted_index and must keep
+// response sizes bounded on broad scheduled searches.
 type SearchParams struct {
 	Query     string `json:"query,omitempty"`
 	Limit     int    `json:"limit"`
@@ -57,6 +57,7 @@ type SearchParams struct {
 	Cites     string `json:"cites,omitempty"`
 	CitedBy   string `json:"cited_by,omitempty"`
 	RelatedTo string `json:"related_to,omitempty"`
+	Source    string `json:"source,omitempty"`
 	Slim      bool   `json:"-"`
 }
 
@@ -79,6 +80,7 @@ type DiscoveredWork struct {
 	Abstract     string    `json:"abstract"`
 	Owned        bool      `json:"owned"`
 	OwnedItemKey string    `json:"owned_item_key,omitempty"`
+	Source       string    `json:"source,omitempty"`
 }
 
 // Client searches OpenAlex works.
@@ -88,6 +90,11 @@ type Client struct {
 	baseURL string
 	version string
 	maxBody int64
+}
+
+// Name identifies the OpenAlex backend.
+func (c *Client) Name() string {
+	return "openalex"
 }
 
 // NewWithOptions constructs a client with a bounded ten-second default HTTP
@@ -374,6 +381,7 @@ func discoveredWork(record workRecord) DiscoveredWork {
 		OAURL:      strings.TrimSpace(record.OpenAccess.OAURL),
 		CitedBy:    record.CitedByCount,
 		Abstract:   invertAbstract(record.AbstractInvertedIndex),
+		Source:     "openalex",
 	}
 }
 

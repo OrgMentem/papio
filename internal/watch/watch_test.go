@@ -57,11 +57,90 @@ func TestCreateDefaultsCollectionToQuery(t *testing.T) {
 	}
 }
 
+func TestCreateBackfillWatchValidation(t *testing.T) {
+	watches := testStore(t)
+	for _, test := range []struct {
+		name    string
+		input   CreateInput
+		wantErr string
+	}{
+		{
+			name:  "defaults",
+			input: CreateInput{Kind: KindBackfill, Collection: "Reading", CadenceHours: 24, PerRunCap: 2},
+		},
+		{
+			name:    "query",
+			input:   CreateInput{Kind: KindBackfill, Query: "not allowed", CadenceHours: 24, PerRunCap: 2},
+			wantErr: "does not accept a query",
+		},
+		{
+			name:    "filters",
+			input:   CreateInput{Kind: KindBackfill, Filters: Filters{OAOnly: true}, CadenceHours: 24, PerRunCap: 2},
+			wantErr: "does not accept filters",
+		},
+		{
+			name:    "alert",
+			input:   CreateInput{Kind: KindBackfill, Mode: ModeAlert, CadenceHours: 24, PerRunCap: 2},
+			wantErr: "mode must be acquire",
+		},
+		{
+			name:    "unknown kind",
+			input:   CreateInput{Kind: "other", Query: "query", CadenceHours: 24, PerRunCap: 2},
+			wantErr: "unknown watch kind",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			created, err := watches.Create(context.Background(), test.input)
+			if test.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+					t.Fatalf("Create() error = %v, want %q", err, test.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if created.Kind != KindBackfill || created.Mode != ModeAcquire || created.Query != "" || created.Label != "backfill: Reading" {
+				t.Fatalf("created backfill = %+v", created)
+			}
+		})
+	}
+}
+
+func TestRecordDigestIsIdempotentAndNewestFirst(t *testing.T) {
+	ctx := context.Background()
+	watches := testStore(t)
+	created := createWatch(t, watches, testWatchInput("digest"))
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	entries := []DigestEntry{
+		{WorkKey: "10.1000/first", Title: "First", Authors: "Ada", Year: 2024, DOI: "10.1000/first"},
+		{WorkKey: "second", Title: "Second", Authors: "Grace", Year: 2025, IsOA: true},
+	}
+	reported, err := watches.RecordDigest(ctx, created.ID, now, entries)
+	if err != nil || reported != 2 {
+		t.Fatalf("RecordDigest() = %d, %v; want 2, nil", reported, err)
+	}
+	reported, err = watches.RecordDigest(ctx, created.ID, now.Add(time.Hour), entries)
+	if err != nil || reported != 0 {
+		t.Fatalf("duplicate RecordDigest() = %d, %v; want 0, nil", reported, err)
+	}
+	digest, err := watches.Digest(ctx, created.ID, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(digest) != 2 || digest[0].WorkKey != "second" || digest[1].WorkKey != "10.1000/first" || digest[0].FirstSeenAt != now.Format(time.RFC3339Nano) {
+		t.Fatalf("Digest() = %+v", digest)
+	}
+	if _, err := watches.Digest(ctx, created.ID+1, 100); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("Digest() missing watch error = %v, want sql.ErrNoRows", err)
+	}
+}
+
 func TestStoreCRUD(t *testing.T) {
 	ctx := context.Background()
 	watches := testStore(t)
 	created := createWatch(t, watches, testWatchInput("neural retrieval"))
-	if created.ID == 0 || created.Label != "neural retrieval" || created.Query != "neural retrieval" {
+	if created.ID == 0 || created.Label != "neural retrieval" || created.Kind != KindDiscovery || created.Mode != ModeAcquire || created.Query != "neural retrieval" {
 		t.Fatalf("created watch = %+v", created)
 	}
 	if created.Filters.YearFrom != 2020 || created.Filters.YearTo != 2026 || !created.Filters.OAOnly || created.Collection != "Reading" || created.PerRunCap != 2 {
@@ -216,6 +295,20 @@ func (f *fakeNotifier) Send(_ context.Context, message string) {
 	f.messages = append(f.messages, message)
 }
 
+type fakeBackfillQueue struct {
+	result  *zotio.QueueResult
+	err     error
+	options []zotio.QueueOptions
+}
+
+func (f *fakeBackfillQueue) QueueMissingPDF(_ context.Context, options zotio.QueueOptions) (*zotio.QueueResult, error) {
+	f.options = append(f.options, options)
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.result, nil
+}
+
 func discovered(doi, openAlex string) discovery.DiscoveredWork {
 	return discovery.DiscoveredWork{
 		Work:       work.Work{DOI: doi, Title: "Paper " + doi, Authors: []string{"Ada"}, Year: 2025},
@@ -307,6 +400,107 @@ func TestRunnerDeduplicatesCapsManifestsAndNotifies(t *testing.T) {
 	}
 	if submitter.calls[2].RequestID != requestIDs[0] || submitter.calls[3].RequestID != requestIDs[1] {
 		t.Fatalf("repeat request IDs = %q, %q; want %q, %q", submitter.calls[2].RequestID, submitter.calls[3].RequestID, requestIDs[0], requestIDs[1])
+	}
+}
+
+func TestRunnerBackfillQueuesAndMarksRun(t *testing.T) {
+	ctx := context.Background()
+	watches := testStore(t)
+	watch := createWatch(t, watches, CreateInput{
+		Kind: KindBackfill, Collection: "Reading", CadenceHours: 24, PerRunCap: 2,
+	})
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	backfill := &fakeBackfillQueue{result: &zotio.QueueResult{Queued: []zotio.QueuedJob{{}, {}}}}
+	notifier := &fakeNotifier{}
+	runner := &Runner{
+		Store: watches, Backfill: backfill, Notifier: notifier,
+		Now: func() time.Time { return now },
+	}
+
+	result, err := runner.Run(ctx, watch.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Queued != 2 || len(backfill.options) != 1 || backfill.options[0].Collection != "Reading" || backfill.options[0].Limit != 2 {
+		t.Fatalf("backfill result = %+v, options = %+v", result, backfill.options)
+	}
+	if len(notifier.messages) != 1 || notifier.messages[0] != "watch backfill: Reading: 2 missing PDFs queued" {
+		t.Fatalf("notifications = %+v", notifier.messages)
+	}
+	stored, err := watches.Get(ctx, watch.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.LastRunAt != now.Format(time.RFC3339Nano) || stored.ConsecutiveFailures != 0 {
+		t.Fatalf("stored backfill run = %+v", stored)
+	}
+}
+
+func TestRunnerAlertReportsOnlyNewDigestEntries(t *testing.T) {
+	ctx := context.Background()
+
+	watches := testStore(t)
+	watch := createWatch(t, watches, CreateInput{
+		Kind: KindDiscovery, Mode: ModeAlert, Query: "alerts", Collection: "Reading", CadenceHours: 24, PerRunCap: 2,
+	})
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	works := []discovery.DiscoveredWork{
+		{Work: work.Work{DOI: "10.1000/first", Title: "First Work", Authors: []string{"Ada", "Grace"}, Year: 2025}, OpenAlexID: "https://openalex.org/W2741809807", IsOA: true},
+		{Work: work.Work{Title: "  Second   Work ", Authors: []string{"Lin"}, Year: 2024}, OpenAlexID: "https://openalex.org/W2741809808"},
+	}
+	submitter := &fakeSubmitter{}
+	notifier := &fakeNotifier{}
+	runner := &Runner{
+		Store: watches, Discovery: &fakeDiscovery{works: works},
+		Lookup: &fakeLookup{result: &zotio.LookupWorksResult{Works: []zotio.WorkOwnership{
+			{Status: zotio.OwnershipNotOwned}, {Status: zotio.OwnershipNotOwned},
+		}}},
+		Submitter: submitter, Notifier: notifier, DataDir: t.TempDir(),
+		Now: func() time.Time { return now },
+	}
+
+	first, err := runner.Run(ctx, watch.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Reported != 2 || first.Queued != 0 || first.ManifestID != "" || len(submitter.calls) != 0 {
+		t.Fatalf("first alert run = %+v, submitted = %+v", first, submitter.calls)
+	}
+	digest, err := watches.Digest(ctx, watch.ID, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(digest) != 2 || digest[0].WorkKey != "second work" || digest[0].Authors != "Lin" || digest[1].WorkKey != "10.1000/first" || !digest[1].IsOA {
+		t.Fatalf("digest = %+v", digest)
+	}
+	second, err := runner.Run(ctx, watch.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Reported != 0 || len(submitter.calls) != 0 {
+		t.Fatalf("second alert run = %+v, submitted = %+v", second, submitter.calls)
+	}
+	if len(notifier.messages) != 1 || notifier.messages[0] != "watch alerts: 2 new works found — papio watch digest "+fmt.Sprint(watch.ID) {
+		t.Fatalf("notifications = %+v", notifier.messages)
+	}
+}
+
+func TestRunnerBackfillMissingDependencyRecordsFailure(t *testing.T) {
+	ctx := context.Background()
+	watches := testStore(t)
+	watch := createWatch(t, watches, CreateInput{Kind: KindBackfill, CadenceHours: 24, PerRunCap: 2})
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	runner := &Runner{Store: watches, Now: func() time.Time { return now }}
+
+	if _, err := runner.Run(ctx, watch.ID); err == nil || err.Error() != "watch runner backfill dependency is not configured" {
+		t.Fatalf("Run() error = %v", err)
+	}
+	stored, err := watches.Get(ctx, watch.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.ConsecutiveFailures != 1 || stored.LastError != "watch runner backfill dependency is not configured" {
+		t.Fatalf("stored backfill failure = %+v", stored)
 	}
 }
 

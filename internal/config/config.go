@@ -36,6 +36,7 @@ const (
 	SourceOpenAlexContent = "openalex_content"
 	SourceCORE            = "core"
 	SourceCrossrefTDM     = "crossref_tdm"
+	SourceSemanticScholar = "semanticscholar"
 )
 
 // Source is one resolver's policy knobs.
@@ -155,9 +156,24 @@ type Zotio struct {
 	AutoEnrich     bool   `toml:"auto_enrich"`
 }
 
-// Notify configures best-effort local desktop notifications from the daemon.
+// Notify configures best-effort notifications from the daemon: local desktop
+// notifications and an optional remote webhook. Both are fire-and-forget; a
+// delivery failure never fails the work that triggered it.
 type Notify struct {
 	Enabled bool `toml:"enabled"`
+	// WebhookURL, when set, receives every notification as a JSON POST in
+	// addition to (not instead of) the local desktop channel.
+	WebhookURL string `toml:"webhook_url"`
+	// WebhookSecret, when set, is sent as "Authorization: Bearer <secret>".
+	WebhookSecret string `toml:"webhook_secret"`
+}
+
+// Discovery selects which discovery backends serve search and watches, in
+// merge-preference order. Empty means OpenAlex only (the historical default).
+// Per-backend API keys and dev base URLs live in the existing [sources] map
+// under the same name (e.g. sources.semanticscholar.api_key).
+type Discovery struct {
+	Sources []string `toml:"sources"`
 }
 
 // Updates configures the optional daily release check.
@@ -176,6 +192,7 @@ type Config struct {
 	Zotio      Zotio             `toml:"zotio"`
 	Notify     Notify            `toml:"notify"`
 	Updates    Updates           `toml:"updates"`
+	Discovery  Discovery         `toml:"discovery"`
 	Sources    map[string]Source `toml:"sources"`
 
 	// Path this config was loaded from ("" for defaults).
@@ -357,6 +374,25 @@ func (c *Config) validate() error {
 		if s.BaseURLForDev != "" && !strings.HasPrefix(s.BaseURLForDev, "http://127.0.0.1") && !strings.HasPrefix(s.BaseURLForDev, "http://localhost") {
 			return fmt.Errorf("sources.%s.base_url_for_dev must be loopback", name)
 		}
+	}
+	if c.Notify.WebhookURL != "" {
+		u, err := url.Parse(c.Notify.WebhookURL)
+		if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
+			return fmt.Errorf("notify.webhook_url must be an absolute http(s) URL")
+		}
+	}
+	if c.Notify.WebhookSecret != "" && c.Notify.WebhookURL == "" {
+		return fmt.Errorf("notify.webhook_secret is set but notify.webhook_url is empty")
+	}
+	seenDiscovery := map[string]bool{}
+	for _, name := range c.Discovery.Sources {
+		if name != SourceOpenAlex && name != SourceSemanticScholar {
+			return fmt.Errorf("discovery.sources entry %q must be %s or %s", name, SourceOpenAlex, SourceSemanticScholar)
+		}
+		if seenDiscovery[name] {
+			return fmt.Errorf("discovery.sources lists %q twice", name)
+		}
+		seenDiscovery[name] = true
 	}
 	return nil
 }

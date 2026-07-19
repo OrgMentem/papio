@@ -34,6 +34,11 @@ type Submitter interface {
 	SubmitWithAutoImport(context.Context, protocol.WorkRequest, *bool) (string, error)
 }
 
+// BackfillQueue queues Zotio items missing PDFs through its idempotent path.
+type BackfillQueue interface {
+	QueueMissingPDF(context.Context, zotio.QueueOptions) (*zotio.QueueResult, error)
+}
+
 // Notifier sends an optional best-effort local notification.
 type Notifier interface {
 	Send(context.Context, string)
@@ -43,6 +48,7 @@ type Notifier interface {
 type RunResult struct {
 	WatchID             int64  `json:"watch_id"`
 	Queued              int    `json:"queued"`
+	Reported            int    `json:"reported,omitempty"`
 	Failed              int    `json:"failed"`
 	ManifestID          string `json:"manifest_id,omitempty"`
 	ConsecutiveFailures int    `json:"consecutive_failures"`
@@ -56,6 +62,7 @@ type Runner struct {
 	Discovery Discovery
 	Lookup    OwnershipLookup
 	Submitter Submitter
+	Backfill  BackfillQueue
 	Notifier  Notifier
 	DataDir   string
 	Now       func() time.Time
@@ -116,7 +123,36 @@ func (r *Runner) runWatch(ctx context.Context, watch Watch) (*RunResult, error) 
 
 func (r *Runner) execute(ctx context.Context, watch Watch) (*RunResult, error) {
 	result := &RunResult{WatchID: watch.ID}
-	if r.Discovery == nil || r.Lookup == nil || r.Submitter == nil {
+	if watch.Kind == KindBackfill {
+		if r.Backfill == nil {
+			return result, errors.New("watch runner backfill dependency is not configured")
+		}
+		queued, err := r.Backfill.QueueMissingPDF(ctx, zotio.QueueOptions{
+			Collection: watch.Collection,
+			Limit:      watch.PerRunCap,
+		})
+		if err != nil {
+			return result, fmt.Errorf("queueing missing PDFs: %w", err)
+		}
+		if queued == nil {
+			return result, errors.New("queueing missing PDFs returned no result")
+		}
+		result.Queued = len(queued.Queued)
+		if r.Notifier != nil && result.Queued > 0 {
+			r.Notifier.Send(ctx, fmt.Sprintf("watch %s: %d missing PDFs queued", watch.Label, result.Queued))
+		}
+		if err := r.Store.MarkRun(ctx, watch.ID, r.now()); err != nil {
+			return result, err
+		}
+		return result, nil
+	}
+	if watch.Kind != KindDiscovery {
+		return result, fmt.Errorf("unknown watch kind %q", watch.Kind)
+	}
+	if watch.Mode != ModeAcquire && watch.Mode != ModeAlert {
+		return result, fmt.Errorf("unknown watch mode %q", watch.Mode)
+	}
+	if r.Discovery == nil || r.Lookup == nil || (watch.Mode == ModeAcquire && r.Submitter == nil) {
 		return result, errors.New("watch runner dependencies are not configured")
 	}
 	works, err := r.Discovery.Search(ctx, discovery.SearchParams{
@@ -126,15 +162,15 @@ func (r *Runner) execute(ctx context.Context, watch Watch) (*RunResult, error) {
 	if err != nil {
 		return result, fmt.Errorf("discovery search: %w", err)
 	}
-	requests := requestsForDiscovered(works)
+	requests := requestsForDiscoveredWithWork(works)
 	if len(requests) == 0 {
 		return result, r.Store.MarkRun(ctx, watch.ID, r.now())
 	}
 	lookupRequest := zotio.LookupWorksRequest{Works: make([]zotio.LookupWork, len(requests))}
 	for i, request := range requests {
-		if request.Identifiers != nil {
+		if request.Work.Identifiers != nil {
 			lookupRequest.Works[i] = zotio.LookupWork{
-				DOI: request.Identifiers.DOI, ArXiv: request.Identifiers.ArXiv,
+				DOI: request.Work.Identifiers.DOI, ArXiv: request.Work.Identifiers.ArXiv,
 			}
 		}
 	}
@@ -145,7 +181,7 @@ func (r *Runner) execute(ctx context.Context, watch Watch) (*RunResult, error) {
 	if ownership == nil || len(ownership.Works) != len(requests) {
 		return result, fmt.Errorf("Zotio ownership lookup returned %d results for %d works", ownershipCount(ownership), len(requests))
 	}
-	queued := make([]protocol.WorkRequest, 0, min(watch.PerRunCap, len(requests)))
+	queued := make([]discoveredRequest, 0, min(watch.PerRunCap, len(requests)))
 	for i, classification := range ownership.Works {
 		switch classification.Status {
 		case zotio.OwnershipNotOwned:
@@ -162,8 +198,30 @@ func (r *Runner) execute(ctx context.Context, watch Watch) (*RunResult, error) {
 	if len(queued) == 0 {
 		return result, r.Store.MarkRun(ctx, watch.ID, r.now())
 	}
+	if watch.Mode == ModeAlert {
+		entries, err := digestEntriesForDiscovered(queued)
+		if err != nil {
+			return result, err
+		}
+		reported, err := r.Store.RecordDigest(ctx, watch.ID, r.now(), entries)
+		if err != nil {
+			return result, err
+		}
+		result.Reported = reported
+		if r.Notifier != nil && reported > 0 {
+			r.Notifier.Send(ctx, fmt.Sprintf("watch %s: %d new works found — papio watch digest %d", watch.Label, reported, watch.ID))
+		}
+		if err := r.Store.MarkRun(ctx, watch.ID, r.now()); err != nil {
+			return result, err
+		}
+		return result, nil
+	}
 
-	manifest := batch.NewManifest(queued, "watch: "+watch.Label, watch.Collection, r.now())
+	queuedWorks := make([]protocol.WorkRequest, len(queued))
+	for i, request := range queued {
+		queuedWorks[i] = request.Work
+	}
+	manifest := batch.NewManifest(queuedWorks, "watch: "+watch.Label, watch.Collection, r.now())
 	result.ManifestID = manifest.ID
 	for i := range manifest.Works {
 		requestID := batch.RequestID(fmt.Sprintf("watch-%d", watch.ID), manifest.Works[i].Work)
@@ -201,23 +259,44 @@ func (r *Runner) execute(ctx context.Context, watch Watch) (*RunResult, error) {
 	return result, nil
 }
 
+type discoveredRequest struct {
+	Work       protocol.WorkRequest
+	Discovered discovery.DiscoveredWork
+}
+
 func requestsForDiscovered(works []discovery.DiscoveredWork) []protocol.WorkRequest {
-	requests := make([]protocol.WorkRequest, 0, len(works))
+	requestsWithWork := requestsForDiscoveredWithWork(works)
+	requests := make([]protocol.WorkRequest, len(requestsWithWork))
+	for i, request := range requestsWithWork {
+		requests[i] = request.Work
+	}
+	return requests
+}
+
+func requestsForDiscoveredWithWork(works []discovery.DiscoveredWork) []discoveredRequest {
+	requests := make([]discoveredRequest, 0, len(works))
 	seen := make(map[string]struct{}, len(works))
 	for _, discovered := range works {
 		doi := strings.TrimSpace(discovered.Work.DOI)
+		arXiv, err := work.NormalizeArXiv(discovered.Work.ArXiv)
+		if err != nil {
+			arXiv = ""
+		}
 		openAlexID, err := work.NormalizeOpenAlex(discovered.OpenAlexID)
 		if err != nil {
 			openAlexID = ""
 		}
 		title := strings.TrimSpace(discovered.Work.Title)
 		authors := append([]string(nil), discovered.Work.Authors...)
-		if doi == "" && (openAlexID == "" || title == "" || len(authors) == 0 || discovered.Work.Year == 0) {
+		if doi == "" && arXiv == "" && (openAlexID == "" || title == "" || len(authors) == 0 || discovered.Work.Year == 0) {
 			continue
 		}
-		keys := make([]string, 0, 2)
+		keys := make([]string, 0, 3)
 		if doi != "" {
 			keys = append(keys, "doi:"+doi)
+		}
+		if arXiv != "" {
+			keys = append(keys, "arxiv:"+arXiv)
 		}
 		if openAlexID != "" {
 			keys = append(keys, "openalex:"+openAlexID)
@@ -236,18 +315,58 @@ func requestsForDiscovered(works []discovery.DiscoveredWork) []protocol.WorkRequ
 			seen[key] = struct{}{}
 		}
 		var identifiers *protocol.Identifiers
-		if doi != "" || openAlexID != "" {
-			identifiers = &protocol.Identifiers{DOI: doi, OpenAlex: openAlexID}
+		if doi != "" || arXiv != "" || openAlexID != "" {
+			identifiers = &protocol.Identifiers{DOI: doi, ArXiv: arXiv, OpenAlex: openAlexID}
 		}
-		requests = append(requests, protocol.WorkRequest{
-			SchemaVersion: protocol.WorkRequestSchemaVersion,
-			Identifiers:   identifiers,
-			Title:         title,
-			Authors:       authors,
-			Year:          discovered.Work.Year,
+		requests = append(requests, discoveredRequest{
+			Work: protocol.WorkRequest{
+				SchemaVersion: protocol.WorkRequestSchemaVersion,
+				Identifiers:   identifiers,
+				Title:         title,
+				Authors:       authors,
+				Year:          discovered.Work.Year,
+			},
+			Discovered: discovered,
 		})
 	}
 	return requests
+}
+
+func digestEntriesForDiscovered(requests []discoveredRequest) ([]DigestEntry, error) {
+	entries := make([]DigestEntry, 0, len(requests))
+	for _, request := range requests {
+		title := strings.TrimSpace(request.Discovered.Work.Title)
+		titleKey := strings.Join(strings.Fields(strings.ToLower(title)), " ")
+		doi, arXiv := "", ""
+		if request.Work.Identifiers != nil {
+			doi = strings.TrimSpace(request.Work.Identifiers.DOI)
+			arXiv = strings.TrimSpace(request.Work.Identifiers.ArXiv)
+		}
+		workKey := titleKey
+		if doi != "" {
+			normalized, err := work.NormalizeDOI(doi)
+			if err != nil {
+				return nil, fmt.Errorf("normalizing watch digest DOI: %w", err)
+			}
+			doi = normalized
+			workKey = doi
+		} else if arXiv != "" {
+			workKey = "arxiv:" + arXiv
+		}
+		if workKey == "" {
+			return nil, errors.New("watch digest work requires a DOI, arXiv ID, or title")
+		}
+		entries = append(entries, DigestEntry{
+			WorkKey:  workKey,
+			TitleKey: titleKey,
+			Title:    title,
+			Authors:  strings.Join(request.Discovered.Work.Authors, ", "),
+			Year:     request.Discovered.Work.Year,
+			DOI:      doi,
+			IsOA:     request.Discovered.IsOA,
+		})
+	}
+	return entries, nil
 }
 
 func ownershipCount(result *zotio.LookupWorksResult) int {

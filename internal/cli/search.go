@@ -3,21 +3,23 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
 	"github.com/spf13/cobra"
 
 	"papio/internal/discovery"
+	"papio/internal/ipc"
 )
 
 func newSearchCommand(opt *options) *cobra.Command {
 	var limit, yearFrom, yearTo int
 	var oaOnly, newOnly bool
-	var cites, citedBy, relatedTo string
+	var cites, citedBy, relatedTo, source string
 	command := &cobra.Command{
 		Use:         "search [query]",
-		Short:       "Search OpenAlex for scholarly works",
+		Short:       "Search configured discovery backends for scholarly works",
 		Annotations: map[string]string{"mcp:read-only": "true"},
 		Args: func(cmd *cobra.Command, args []string) error {
 			if err := cobra.MaximumNArgs(1)(cmd, args); err != nil {
@@ -37,11 +39,11 @@ func newSearchCommand(opt *options) *cobra.Command {
 			}
 			params := discovery.SearchParams{
 				Query: query, Limit: limit, YearFrom: yearFrom, YearTo: yearTo, OAOnly: oaOnly,
-				Cites: cites, CitedBy: citedBy, RelatedTo: relatedTo,
+				Cites: cites, CitedBy: citedBy, RelatedTo: relatedTo, Source: source,
 			}
 			var works []discovery.DiscoveredWork
 			if err := opt.call(cmd.Context(), "discovery.search", params, &works); err != nil {
-				return err
+				return sourceRequiresCurrentDaemon(source, err)
 			}
 			if newOnly {
 				works = newWorksOnly(works)
@@ -70,11 +72,24 @@ func newSearchCommand(opt *options) *cobra.Command {
 	flags.IntVar(&yearFrom, "year-from", 0, "minimum publication year")
 	flags.IntVar(&yearTo, "year-to", 0, "maximum publication year")
 	flags.BoolVar(&oaOnly, "oa-only", false, "return only open-access works")
+	flags.StringVar(&source, "source", "", "discovery backend: openalex or semanticscholar (default: all configured)")
 	flags.BoolVar(&newOnly, "new-only", false, "omit works already in your library; filters after --limit and may return fewer results")
 	flags.StringVar(&cites, "cites", "", "DOI to find papers citing it (forward citations; OpenAlex cites: filter)")
 	flags.StringVar(&citedBy, "cited-by", "", "DOI to find papers it cites (backward references; OpenAlex cited_by: filter)")
 	flags.StringVar(&relatedTo, "related-to", "", "DOI to find OpenAlex-related papers (related_to: filter)")
 	return command
+}
+
+func sourceRequiresCurrentDaemon(source string, err error) error {
+	if strings.TrimSpace(source) == "" {
+		return err
+	}
+	var remoteErr *ipc.RemoteError
+	if !errors.As(err, &remoteErr) || remoteErr.Code != "invalid_argument" ||
+		!strings.Contains(remoteErr.Message, `unknown field "source"`) {
+		return err
+	}
+	return fmt.Errorf("%w: --source requires a daemon running this papio version; run 'papio daemon stop' and retry", err)
 }
 
 func firstAuthor(authors []string) string {

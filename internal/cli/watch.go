@@ -14,25 +14,51 @@ import (
 
 func newWatchCommand(opt *options) *cobra.Command {
 	command := &cobra.Command{Use: "watch", Short: "Manage scheduled discovery watchlists"}
-	command.AddCommand(newWatchAddCommand(opt), newWatchListCommand(opt), newWatchRemoveCommand(opt), newWatchRunCommand(opt))
+	command.AddCommand(
+		newWatchAddCommand(opt),
+		newWatchListCommand(opt),
+		newWatchDigestCommand(opt),
+		newWatchRemoveCommand(opt),
+		newWatchRunCommand(opt),
+	)
 	return command
 }
 
 func newWatchAddCommand(opt *options) *cobra.Command {
-	var label, collection, cadence string
+	var label, collection, cadence, kind, mode string
 	var perRunCap, yearFrom, yearTo int
 	var oaOnly bool
 	command := &cobra.Command{
-		Use:   "add <query>",
+		Use:   "add [query]",
 		Short: "Add a scheduled discovery watch",
-		Args:  cobra.ExactArgs(1),
+		Long: "Add a scheduled discovery watch. Backfill watches take no query. " +
+			"Alert-mode discovery watches report new works without acquiring them.",
+		Args: func(_ *cobra.Command, args []string) error {
+			switch kind {
+			case watch.KindBackfill:
+				if len(args) != 0 {
+					return fmt.Errorf("backfill watches take no query")
+				}
+			case watch.KindDiscovery:
+				if len(args) != 1 {
+					return fmt.Errorf("discovery watches require one query")
+				}
+			default:
+				return fmt.Errorf("unknown watch kind %q", kind)
+			}
+			return nil
+		},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cadenceHours, err := parseWatchCadence(cadence)
 			if err != nil {
 				return err
 			}
+			query := ""
+			if len(args) == 1 {
+				query = strings.TrimSpace(args[0])
+			}
 			input := watch.CreateInput{
-				Label: label, Query: strings.TrimSpace(args[0]), Collection: collection,
+				Label: label, Kind: kind, Mode: mode, Query: query, Collection: collection,
 				Filters:      watch.Filters{YearFrom: yearFrom, YearTo: yearTo, OAOnly: oaOnly},
 				CadenceHours: cadenceHours, PerRunCap: perRunCap,
 			}
@@ -46,6 +72,8 @@ func newWatchAddCommand(opt *options) *cobra.Command {
 	flags := command.Flags()
 	flags.StringVar(&label, "label", "", "human label (defaults to query)")
 	flags.StringVar(&collection, "collection", "", "zotio collection for queued papers")
+	flags.StringVar(&kind, "kind", watch.KindDiscovery, "watch kind: discovery or backfill")
+	flags.StringVar(&mode, "mode", watch.ModeAcquire, "discovery mode: acquire or alert")
 	flags.StringVar(&cadence, "cadence", "daily", "daily, weekly, or Nh")
 	flags.IntVar(&perRunCap, "limit-per-run", watch.DefaultPerRunCap, "maximum new papers queued per run (1-50)")
 	flags.IntVar(&yearFrom, "year-from", 0, "minimum publication year")
@@ -79,6 +107,43 @@ func newWatchListCommand(opt *options) *cobra.Command {
 	}
 }
 
+func newWatchDigestCommand(opt *options) *cobra.Command {
+	var limit int
+	command := &cobra.Command{
+		Use:         "digest <id>",
+		Short:       "Show recently reported works from an alert watch",
+		Args:        cobra.ExactArgs(1),
+		Annotations: map[string]string{"mcp:read-only": "true"},
+		RunE: func(cmd *cobra.Command, args []string) error {
+			id, err := parseWatchID(args[0])
+			if err != nil {
+				return err
+			}
+			var result struct {
+				WatchID int64               `json:"watch_id"`
+				Entries []watch.DigestEntry `json:"entries"`
+			}
+			if err := opt.call(cmd.Context(), "watch.digest", map[string]any{"id": id, "limit": limit}, &result); err != nil {
+				return err
+			}
+			if opt.jsonOutput {
+				return opt.printJSON(result.Entries)
+			}
+			for _, entry := range result.Entries {
+				if _, err := fmt.Fprintf(
+					opt.out, "%d | %s | %s | %s | %s\n",
+					entry.Year, entry.Authors, entry.Title, entry.DOI, oaMarker(entry.IsOA),
+				); err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+	}
+	command.Flags().IntVar(&limit, "limit", 100, "maximum digest entries to show (1-500)")
+	return command
+}
+
 func newWatchRemoveCommand(opt *options) *cobra.Command {
 	return &cobra.Command{
 		Use: "remove <id>", Short: "Remove a scheduled discovery watch", Args: cobra.ExactArgs(1),
@@ -110,6 +175,9 @@ func newWatchRunCommand(opt *options) *cobra.Command {
 			var result watch.RunResult
 			if err := opt.call(cmd.Context(), "watch.run", watch.IDInput{ID: id}, &result); err != nil {
 				return err
+			}
+			if result.Reported > 0 {
+				return opt.printResult(result, "Watch %d reported %d new work(s) — papio watch digest %d", result.WatchID, result.Reported, result.WatchID)
 			}
 			return opt.printResult(result, "Watch %d queued %d paper(s)", result.WatchID, result.Queued)
 		},

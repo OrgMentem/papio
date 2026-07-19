@@ -79,6 +79,9 @@ func RouterWithShutdown(system *bootstrap.System, shutdown context.CancelFunc) i
 		"watch.add": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return addWatch(ctx, raw, system)
 		},
+		"watch.digest": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return watchDigest(ctx, raw, system)
+		},
 		"watch.list": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return listWatches(ctx, raw, system)
 		},
@@ -341,6 +344,12 @@ type WatchRemoveResult struct {
 	Removed bool  `json:"removed"`
 }
 
+// WatchDigestResult contains recent alert-watch discoveries.
+type WatchDigestResult struct {
+	WatchID int64               `json:"watch_id"`
+	Entries []watch.DigestEntry `json:"entries"`
+}
+
 func addWatch(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
 	var input watch.CreateInput
 	if err := ipc.DecodeParams(raw, &input); err != nil {
@@ -369,6 +378,27 @@ func listWatches(ctx context.Context, raw json.RawMessage, system *bootstrap.Sys
 		return failure(err)
 	}
 	return marshal(watches)
+}
+
+func watchDigest(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
+	var params struct {
+		ID    int64 `json:"id"`
+		Limit int   `json:"limit"`
+	}
+	if err := ipc.DecodeParams(raw, &params); err != nil || params.ID <= 0 {
+		if err == nil {
+			err = errors.New("watch id is required")
+		}
+		return badParams(err)
+	}
+	if system == nil || system.Watches == nil {
+		return nil, &ipc.RPCError{Code: "precondition_failed", Message: "watchlists are not configured"}
+	}
+	entries, err := system.Watches.Digest(ctx, params.ID, params.Limit)
+	if err != nil {
+		return failure(err)
+	}
+	return marshal(WatchDigestResult{WatchID: params.ID, Entries: entries})
 }
 
 func removeWatch(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {

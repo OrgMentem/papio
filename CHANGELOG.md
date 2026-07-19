@@ -10,6 +10,40 @@ execution records in `notes/acquisition-stack-plan.md`.
 
 ## [Unreleased]
 
+### Added
+
+- **Backfill watches**: `papio watch add --kind backfill` schedules the
+  existing `acquire --from-zotio` queue on a cadence, so a growing Zotero
+  library steadily self-completes its missing PDFs. Runs are bounded by
+  `--limit-per-run` and idempotent (deterministic per-item request IDs), and
+  the watch is force-runnable with `papio watch run` like any other.
+- **Alert-only watches**: `papio watch add --mode alert` runs the scheduled
+  discovery search and library-ownership filter but *reports* new works
+  instead of acquiring them. New finds are recorded once per watch (re-runs
+  never re-report) and browsable with the new `papio watch digest <id>`
+  command; notifications point at the digest.
+- **Webhook notifications**: a new `notify.webhook_url` config field delivers
+  every daemon notification (watch results, human-action handoffs, imports) as
+  a JSON POST — Slack/Discord/ntfy-style receivers work out of the box — in
+  addition to the local desktop channel. Optional `notify.webhook_secret` is
+  sent as a bearer token. Delivery is best-effort and never fails the work
+  that triggered it.
+- **Semantic Scholar discovery backend**: discovery is now pluggable behind a
+  source seam. `discovery.sources = ["openalex", "semanticscholar"]` in config
+  fans searches (and watches) across both backends with DOI/title
+  deduplication in preference order; `papio search --source` selects one
+  explicitly. Citation snowball (`--cites`, `--cited-by`) is supported on both;
+  arXiv-only Semantic Scholar results now carry their identifier through to
+  acquisition. API key (optional) lives at `sources.semanticscholar.api_key`.
+
+### Changed
+
+- The MCP read resources (`papio://jobs`, `papio://artifacts`,
+  `papio://exports`, …) now return `{"<name>": [...], "truncated": bool}`
+  envelopes instead of bare arrays, making the 100-row cap honest. Filtered
+  and paginated access remains available through the command facade
+  (`jobs list --state --limit`).
+
 ## [0.5.0] - 2026-07-19
 
 ### Added

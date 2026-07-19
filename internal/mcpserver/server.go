@@ -255,15 +255,15 @@ func jsonToolResult(value any) (*mcplib.CallToolResult, error) {
 type resourceLoader func(context.Context, *bootstrap.System) (any, error)
 
 func registerResources(s *server.MCPServer, system *bootstrap.System) {
-	addJSONResource(s, system, "papio://jobs", "jobs", "Recent durable acquisition jobs", jobsResource)
-	addJSONResource(s, system, "papio://artifacts", "artifacts", "Recent validated content-addressed PDF artifacts", artifactsResource)
-	addJSONResource(s, system, "papio://bundles", "bundles", "Recent acquisition bundle export records", func(ctx context.Context, system *bootstrap.System) (any, error) {
+	addJSONResource(s, system, "papio://jobs", "jobs", "Recent durable acquisition jobs (up to 100 rows; truncated is true when additional rows exist). For filtered or paginated access, use papio_command_run with jobs list --state --limit.", jobsResource)
+	addJSONResource(s, system, "papio://artifacts", "artifacts", "Recent validated content-addressed PDF artifacts (up to 100 rows; truncated is true when additional rows exist).", artifactsResource)
+	addJSONResource(s, system, "papio://bundles", "bundles", "Recent acquisition bundle export records (up to 100 rows; truncated is true when additional rows exist).", func(ctx context.Context, system *bootstrap.System) (any, error) {
 		return exportsResource(ctx, system, "bundle")
 	})
-	addJSONResource(s, system, "papio://zotio/plans", "zotio-plans", "Recent immutable Zotio preview records", func(ctx context.Context, system *bootstrap.System) (any, error) {
+	addJSONResource(s, system, "papio://zotio/plans", "zotio-plans", "Recent immutable Zotio preview records (up to 100 rows; truncated is true when additional rows exist).", func(ctx context.Context, system *bootstrap.System) (any, error) {
 		return exportsResource(ctx, system, "zotio_plan")
 	})
-	addJSONResource(s, system, "papio://exports", "exports", "Recent bundle, plan, and Zotio apply ledger records", func(ctx context.Context, system *bootstrap.System) (any, error) {
+	addJSONResource(s, system, "papio://exports", "exports", "Recent bundle, plan, and Zotio apply ledger records (up to 100 rows; truncated is true when additional rows exist).", func(ctx context.Context, system *bootstrap.System) (any, error) {
 		return exportsResource(ctx, system, "")
 	})
 }
@@ -285,12 +285,29 @@ func addJSONResource(s *server.MCPServer, system *bootstrap.System, uri, name, d
 	)
 }
 
+const resourceRowCap = 100
+
+type jobsResourceEnvelope struct {
+	Jobs      []job.Row `json:"jobs"`
+	Truncated bool      `json:"truncated"`
+}
+
 func jobsResource(ctx context.Context, system *bootstrap.System) (any, error) {
-	return system.Jobs.List(ctx, "", 100)
+	rows, err := system.Jobs.List(ctx, "", resourceRowCap+1)
+	if err != nil {
+		return nil, err
+	}
+	jobs, truncated := truncate(rows, resourceRowCap)
+	return jobsResourceEnvelope{Jobs: jobs, Truncated: truncated}, nil
+}
+
+type artifactsResourceEnvelope struct {
+	Artifacts []job.Artifact `json:"artifacts"`
+	Truncated bool           `json:"truncated"`
 }
 
 func artifactsResource(ctx context.Context, system *bootstrap.System) (any, error) {
-	rows, err := system.Store.DB().QueryContext(ctx, `SELECT sha256 FROM artifacts ORDER BY created_at DESC LIMIT 100`)
+	rows, err := system.Store.DB().QueryContext(ctx, `SELECT sha256 FROM artifacts ORDER BY created_at DESC LIMIT 101`)
 	if err != nil {
 		return nil, err
 	}
@@ -310,6 +327,7 @@ func artifactsResource(ctx context.Context, system *bootstrap.System) (any, erro
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
+	hashes, truncated := truncate(hashes, resourceRowCap)
 	artifacts := make([]job.Artifact, 0, len(hashes))
 	for _, sha := range hashes {
 		artifact, err := system.Jobs.GetArtifact(ctx, sha)
@@ -320,7 +338,7 @@ func artifactsResource(ctx context.Context, system *bootstrap.System) (any, erro
 			artifacts = append(artifacts, *artifact)
 		}
 	}
-	return artifacts, nil
+	return artifactsResourceEnvelope{Artifacts: artifacts, Truncated: truncated}, nil
 }
 
 type exportRecord struct {
@@ -333,6 +351,21 @@ type exportRecord struct {
 	CreatedAt      string          `json:"created_at"`
 }
 
+type exportsResourceEnvelope struct {
+	Exports   []exportRecord `json:"exports"`
+	Truncated bool           `json:"truncated"`
+}
+
+type bundlesResourceEnvelope struct {
+	Bundles   []exportRecord `json:"bundles"`
+	Truncated bool           `json:"truncated"`
+}
+
+type zotioPlansResourceEnvelope struct {
+	Plans     []exportRecord `json:"plans"`
+	Truncated bool           `json:"truncated"`
+}
+
 func exportsResource(ctx context.Context, system *bootstrap.System, kind string) (any, error) {
 	query := `SELECT id, job_id, kind, COALESCE(idempotency_key,''), COALESCE(path,''), COALESCE(result_json,''), created_at FROM exports`
 	args := []any{}
@@ -340,7 +373,7 @@ func exportsResource(ctx context.Context, system *bootstrap.System, kind string)
 		query += ` WHERE kind = ?`
 		args = append(args, kind)
 	}
-	query += ` ORDER BY id DESC LIMIT 100`
+	query += ` ORDER BY id DESC LIMIT 101`
 	rows, err := system.Store.DB().QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
@@ -362,5 +395,26 @@ func exportsResource(ctx context.Context, system *bootstrap.System, kind string)
 	if err := rows.Close(); err != nil {
 		return nil, err
 	}
-	return records, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	records, truncated := truncate(records, resourceRowCap)
+	switch kind {
+	case "bundle":
+		return bundlesResourceEnvelope{Bundles: records, Truncated: truncated}, nil
+	case "zotio_plan":
+		return zotioPlansResourceEnvelope{Plans: records, Truncated: truncated}, nil
+	default:
+		return exportsResourceEnvelope{Exports: records, Truncated: truncated}, nil
+	}
+}
+
+func truncate[T any](rows []T, cap int) ([]T, bool) {
+	if len(rows) <= cap {
+		if rows == nil {
+			return []T{}, false
+		}
+		return rows, false
+	}
+	return rows[:cap], true
 }

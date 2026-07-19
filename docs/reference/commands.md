@@ -340,7 +340,7 @@ papio native-host uninstall [flags]
 
 ## `papio search`
 
-Search OpenAlex for scholarly works
+Search configured discovery backends for scholarly works
 
 ```
 papio search [query] [flags]
@@ -354,6 +354,7 @@ papio search [query] [flags]
 | `--new-only` | `bool` | `false` | omit works already in your library; filters after --limit and may return fewer results |
 | `--oa-only` | `bool` | `false` | return only open-access works |
 | `--related-to` | `string` |  | DOI to find OpenAlex-related papers (related_to: filter) |
+| `--source` | `string` |  | discovery backend: openalex or semanticscholar (default: all configured) |
 | `--year-from` | `int` | `0` | minimum publication year |
 | `--year-to` | `int` | `0` | maximum publication year |
 
@@ -389,19 +390,35 @@ papio watch
 
 Add a scheduled discovery watch
 
+Add a scheduled discovery watch. Backfill watches take no query. Alert-mode discovery watches report new works without acquiring them.
+
 ```
-papio watch add <query> [flags]
+papio watch add [query] [flags]
 ```
 
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
 | `--cadence` | `string` | `daily` | daily, weekly, or Nh |
 | `--collection` | `string` |  | zotio collection for queued papers |
+| `--kind` | `string` | `discovery` | watch kind: discovery or backfill |
 | `--label` | `string` |  | human label (defaults to query) |
 | `--limit-per-run` | `int` | `10` | maximum new papers queued per run (1-50) |
+| `--mode` | `string` | `acquire` | discovery mode: acquire or alert |
 | `--oa-only` | `bool` | `false` | return only open-access works |
 | `--year-from` | `int` | `0` | minimum publication year |
 | `--year-to` | `int` | `0` | maximum publication year |
+
+### `papio watch digest`
+
+Show recently reported works from an alert watch
+
+```
+papio watch digest <id> [flags]
+```
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--limit` | `int` | `100` | maximum digest entries to show (1-500) |
 
 ### `papio watch list`
 
