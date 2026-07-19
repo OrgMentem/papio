@@ -13,7 +13,7 @@ papio
 
 ## Short description (CWS, <= 132 chars)
 
-Browser half of papio: one visible, requested institutional PDF download per job, in your own session. Talks only to a local daemon.
+papio's browser half: open-access first, then a visible institutional handoff in your own session. Login stays human; not a bot.
 
 ## Category
 
@@ -21,18 +21,23 @@ Productivity (or Developer Tools if a research/utility category is unavailable)
 
 ## Detailed description (paste into CWS)
 
+CWS renders this field as plain text (no Markdown/HTML; URLs auto-link). Keep it
+in sync with the AMO kit's Markdown version in `amo-listing.md`.
+
 ```text
-papio is a paper-acquisition broker for your Zotero library. This extension is the browser half of papio: it performs the visible institutional handoff for an acquisition job in your own, already-logged-in Chrome session.
+papio automates the tedious part of getting research papers — the gap between "want it" and "validated PDF in my library." It searches scholarly works, turns your picks into repeatable jobs, fetches each one, validates every PDF, and files it into Zotero. You — or an AI agent — drive it; papio does the legwork.
 
-When the local papio daemon needs a licensed PDF that open-access sources did not provide, it opens the provider page in a tab and — for the one paper you asked for — locates and downloads that single PDF. Discovery, open-access resolution, PDF validation, and filing into Zotero all happen in the separately installed papio command-line daemon. This extension only runs the part that must happen inside your real browser.
+This extension is papio's browser half: it runs the institutional OpenURL handoff and relays the download to the papio app over native messaging. You'll need that app installed — see the setup guide for your platform: https://orgmentem.github.io/papio/guide/getting-started/
 
-- Your session, your login. papio never automates or drives a separate browser. Institutional sign-in stays entirely human.
-- One download per job. Each job results in a single, explicitly requested PDF download. No crawling, scraping, or bulk downloads.
-- Local-only communication. The extension talks exclusively to a papio daemon on your own machine via Chrome native messaging. It has no backend of its own.
-- Permission on demand. Publisher domains are optional permissions, requested only when a job needs them.
-- No telemetry. No analytics, ads, tracking, or data collection.
+What makes it different:
+- No credentials stored, no bulk scraping. papio never keeps your institution logins, and it fetches only the papers you explicitly request — one at a time — never mass-downloading from publishers.
+- Your real session, not a bot. Native messaging and extension APIs only — no WebDriver, no CDP, no stealth — so your browser never looks automated.
+- Validated before trusted. Every candidate PDF is checked for structure and identity; anything ambiguous parks for your review instead of importing the wrong paper.
+- Built for AI agents. papio runs as an MCP server, so an assistant can drive the whole workflow.
 
-papio requires the separately installed papio daemon and command-line tool. On its own, this extension does nothing.
+Privacy: papio collects no data.
+
+Docs: https://orgmentem.github.io/papio/
 ```
 
 ## Privacy practices (CWS Data-usage form)

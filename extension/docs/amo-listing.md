@@ -14,29 +14,33 @@ papio
 
 ## Summary (AMO, <= 250 chars)
 
-The browser half of papio, the paper-acquisition broker for your Zotero library. Performs one visible, explicitly requested institutional download per job in your own logged-in session, talking only to a local papio daemon. No accounts, no telemetry.
+papio's browser connector: the last mile of a local, agent-drivable paper-acquisition tool. Open-access and licensed sources are tried first, then a visible institutional handoff in your own Chrome/Firefox session — login and CAPTCHAs stay human.
 
 ## Categories and tags
 
 - Category: Other (or Bookmarks / Productivity if a closer fit is offered)
 - Suggested tags: zotero, research, papers, academic, pdf, library, openurl
 
-## Full description (paste into AMO)
+## Full description (paste into AMO — Markdown)
 
-```html
-<p><strong><em>papio</em> is a paper-acquisition broker for your Zotero library.</strong> This add-on is the browser half of <em>papio</em>: it performs the visible institutional handoff for an acquisition job in your own, already-logged-in browser session. When the local <em>papio</em> daemon needs a licensed PDF that open-access sources did not provide, it opens the provider page in a tab, and — for the one paper you asked for — locates and downloads that single PDF.</p>
+AMO renders this field as Markdown; HTML is shown literally. Keep this body in
+sync with the Chrome kit's plain-text version in `chrome-web-store-listing.md`.
 
-<p>The command-line <em>papio</em> daemon (installed separately) does discovery, open-access resolution, PDF validation, and hands finished files to Zotero through zotio. This extension only runs the part that must happen inside your real browser: reaching a licensed source through your institution's own login.</p>
+```md
+**_papio_ automates the tedious part of getting research papers** — the gap between "want it" and "validated PDF in my library." It searches scholarly works, turns your picks into repeatable jobs, fetches each one, validates every PDF, and files it into Zotero. You — or an AI agent — drive it; _papio_ does the legwork.
 
-<ul>
-  <li><strong>Your session, your login.</strong> <em>papio</em> never automates or drives a separate browser. Institutional sign-in (SSO/Shibboleth) stays entirely human; the extension acts inside the session you are already in.</li>
-  <li><strong>One download per job.</strong> Each acquisition job results in a single, explicitly requested PDF download. The extension does not crawl, scrape, or bulk-download.</li>
-  <li><strong>Local-only communication.</strong> The extension talks exclusively to a <em>papio</em> daemon on your own machine over Firefox native messaging. It sends nothing to any remote server of its own.</li>
-  <li><strong>Permission on demand.</strong> Provider websites are optional permissions: Firefox asks for access to a publisher's domain only when a job actually needs it.</li>
-  <li><strong>No telemetry.</strong> No analytics, no ads, no tracking, no data collection.</li>
-</ul>
+This extension is _papio_'s browser half: it runs the institutional OpenURL handoff and relays the download to the _papio_ app over native messaging. You'll need that app installed — see the [setup guide](https://orgmentem.github.io/papio/guide/getting-started/) for your platform.
 
-<p><em>papio</em> is for researchers who already use Zotero and an institutional library, and who want the tedious "found it, now legitimately get the PDF" step handled without giving up a human, non-automated browsing session. It requires the separately installed <em>papio</em> daemon and command-line tool; on its own the extension does nothing.</p>
+**What makes it different**
+
+- **No credentials stored, no bulk scraping.** _papio_ never keeps your institution logins, and it fetches only the papers you explicitly request — one at a time — never mass-downloading from publishers.
+- **Your real session, not a bot.** Native messaging and extension APIs only — no WebDriver, no CDP, no stealth — so your browser never looks automated.
+- **Validated before trusted.** Every candidate PDF is checked for structure and identity; anything ambiguous parks for your review instead of importing the wrong paper.
+- **Built for AI agents.** _papio_ runs as an MCP server, so an assistant can drive the whole workflow.
+
+**Privacy.** _papio_ collects no data.
+
+[Documentation](https://orgmentem.github.io/papio/)
 ```
 
 ## Privacy and data-collection disclosure
