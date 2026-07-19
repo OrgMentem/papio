@@ -665,6 +665,10 @@ export class Bridge {
           ungranted += 1;
         }
       }
+      // The contains() calls above are async; if the port dropped meanwhile,
+      // onPortDisconnect already painted "!" — don't overwrite it with a stale
+      // connected-state badge.
+      if (this.store.connectionStatus !== "connected") return;
       if (ungranted > 0) {
         await Promise.all([
           this.deps.action.setBadgeText({ text: String(ungranted) }),

@@ -379,6 +379,20 @@ test("a granted resolver origin leaves the connected badge clear", async () => {
   expect(h.action.texts.at(-1)).toBe("");
 });
 
+test("a stale connected badge sync cannot mask a disconnected state", async () => {
+  const h = makeHarness({
+    ...emptyStore(),
+    connectionStatus: "disconnected",
+    resolverOrigins: ["https://onesearch.library.example.edu"],
+  });
+  h.deps.permissions.contains = async () => false;
+  // Called as "connected", but the store already flipped to disconnected while
+  // the permission checks were in flight: the guard must skip the count paint.
+  await h.bridge.syncConnectionBadge("connected");
+
+  expect(h.action.texts).not.toContain("1");
+});
+
 test("hello acknowledgment persists an informational update hint without changing health", async () => {
   Object.assign(globalThis, { __PAPIO_DAEMON_VERSION__: "0.2.0" });
   try {

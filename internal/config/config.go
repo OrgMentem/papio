@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -415,7 +416,18 @@ func (c *Config) ResolverOrigins() []string {
 		if err != nil || u.Scheme != "https" || u.Host == "" {
 			return
 		}
-		origin := u.Scheme + "://" + u.Host
+		host := strings.ToLower(u.Hostname())
+		if host == "" {
+			return
+		}
+		origin := "https://" + host
+		if port := u.Port(); port != "" && port != "443" {
+			n, convErr := strconv.Atoi(port)
+			if convErr != nil || n < 1 || n > 65535 {
+				return
+			}
+			origin += ":" + port
+		}
 		if _, dup := seen[origin]; dup {
 			return
 		}
@@ -427,6 +439,10 @@ func (c *Config) ResolverOrigins() []string {
 		add(inst.OpenURLBase)
 	}
 	slices.Sort(origins)
+	// Match the protocol cap so every accepted config yields a valid hello_ack.
+	if len(origins) > 32 {
+		origins = origins[:32]
+	}
 	return origins
 }
 

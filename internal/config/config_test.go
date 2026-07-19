@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -379,5 +380,37 @@ func TestResolverOrigins(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("ResolverOrigins()[%d] = %q, want %q (all=%v)", i, got[i], want[i], got)
 		}
+	}
+}
+
+func TestResolverOriginsCanonicalize(t *testing.T) {
+	cfg := Config{Browser: Browser{
+		OpenURLBase: "https://MixedCase.Example.EDU:443/openurl",
+		Resolvers: map[string]Institution{
+			"ported":  {OpenURLBase: "https://library.example.edu:8443/openurl"},
+			"badport": {OpenURLBase: "https://bad.example.edu:99999/openurl"},
+		},
+	}}
+	got := cfg.ResolverOrigins()
+	want := []string{"https://library.example.edu:8443", "https://mixedcase.example.edu"}
+	if len(got) != len(want) {
+		t.Fatalf("ResolverOrigins() = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("ResolverOrigins()[%d] = %q, want %q (all=%v)", i, got[i], want[i], got)
+		}
+	}
+}
+
+func TestResolverOriginsCap(t *testing.T) {
+	resolvers := make(map[string]Institution)
+	for i := range 40 {
+		id := strconv.Itoa(100 + i)
+		resolvers["r"+id] = Institution{OpenURLBase: "https://lib" + id + ".example.edu/openurl"}
+	}
+	cfg := Config{Browser: Browser{Resolvers: resolvers}}
+	if got := cfg.ResolverOrigins(); len(got) != 32 {
+		t.Fatalf("ResolverOrigins() len = %d, want 32 (protocol cap)", len(got))
 	}
 }
