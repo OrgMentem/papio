@@ -94,10 +94,11 @@ func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
-	if cfg.Browser.ExtensionID == "" && cfg.Browser.FirefoxExtensionID == "" {
+	chromeIDs := cfg.Browser.ChromiumExtensionIDs()
+	if len(chromeIDs) == 0 && cfg.Browser.FirefoxExtensionID == "" {
 		return errors.New("browser bridge disabled: browser.extension_id and browser.firefox_extension_id are not configured")
 	}
-	if err := validateOrigin(args, cfg.Browser.ExtensionID, cfg.Browser.FirefoxExtensionID); err != nil {
+	if err := validateOrigin(args, chromeIDs, cfg.Browser.FirefoxExtensionID); err != nil {
 		return fmt.Errorf("reject native-messaging origin: %w", err)
 	}
 
@@ -121,13 +122,16 @@ func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	return newBridge(syncer, stdin, stdout, stderr).run(ctx)
 }
 
-// validateOrigin accepts only configured browser invocation identities. Chrome
-// passes exactly "chrome-extension://<id>/"; Firefox passes its configured
-// Gecko extension ID as a bare argument after the app manifest path. Every
-// argument is untrusted and compared exactly, so neither browser can name an
-// extension that the configuration did not allow.
-func validateOrigin(args []string, chromeID, firefoxID string) error {
-	if chromeID != "" {
+// validateOrigin accepts only configured browser invocation identities. A
+// Chromium browser passes exactly "chrome-extension://<id>/" — any of the
+// configured Chrome-family IDs is accepted, so the same daemon serves the same
+// extension across Chrome, Edge, Vivaldi, Brave, and Opera (and an Edge-store
+// copy with a different ID). Firefox passes its configured Gecko extension ID as
+// a bare argument after the app manifest path. Every argument is untrusted and
+// compared exactly, so no browser can name an extension the configuration did
+// not allow.
+func validateOrigin(args []string, chromeIDs []string, firefoxID string) error {
+	for _, chromeID := range chromeIDs {
 		wantChromeOrigin := "chrome-extension://" + chromeID + "/"
 		for _, arg := range args {
 			if arg == wantChromeOrigin {

@@ -23,7 +23,8 @@ PDF validation and OCR use Poppler and Tesseract:
 | Debian/Ubuntu | `sudo apt install poppler-utils tesseract-ocr` |
 | Windows | `scoop install poppler tesseract` |
 
-Install Chrome or Firefox to use the browser extension. Install `zotio` and
+Install a supported browser for the extension: any Chromium browser — Chrome,
+Edge, Vivaldi, Brave, Opera — or Firefox. Install `zotio` and
 make it available on `PATH` only when you want *papio* to import finished PDFs
 into Zotero.
 
@@ -81,8 +82,14 @@ These flags set the corresponding setup values:
 
 ## 3. Load the extension
 
-`papio init` prints the exact browser setup steps after attempting native-host
-installation. Load the unpacked extension in the browser you use.
+`papio init` (and `papio native-host install`) registers the connector with
+every Chromium browser it detects installed — Chrome, Edge, Vivaldi, Brave,
+Opera — plus Firefox, so the same extension works in any of them. It prints the
+exact browser setup steps after attempting native-host installation. Load the
+unpacked extension in the browser you use. Installing the same package from the
+Chrome Web Store keeps one extension ID across every Chromium browser; if you
+also publish on the Edge Add-ons store (a different ID) or ship a differently
+keyed build, add those IDs to `browser.extension_ids`.
 
 On Windows the connector is registered under the current-user registry
 (`HKCU\Software\{Google\Chrome,Mozilla}\NativeMessagingHosts`) and the host runs

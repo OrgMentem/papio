@@ -374,8 +374,12 @@ func skipRemainingAfterDaemon(add func(string, string, string, string), reason s
 }
 
 func runManifestChecks(cfg config.Config, deps IntegrationDependencies, add func(string, string, string, string)) {
-	runManifestCheck("native host (Chrome)", cfg.Browser.ExtensionID, "chrome-extension://", cfg, deps.ManifestDir, deps.ReadFile, add)
-	runManifestCheck("native host (Firefox)", cfg.Browser.FirefoxExtensionID, "", cfg, deps.FirefoxDir, deps.ReadFile, add)
+	runManifestCheck("native host (Chrome)", cfg.Browser.ChromiumExtensionIDs(), "chrome-extension://", cfg, deps.ManifestDir, deps.ReadFile, add)
+	var firefoxIDs []string
+	if cfg.Browser.FirefoxExtensionID != "" {
+		firefoxIDs = []string{cfg.Browser.FirefoxExtensionID}
+	}
+	runManifestCheck("native host (Firefox)", firefoxIDs, "", cfg, deps.FirefoxDir, deps.ReadFile, add)
 }
 
 const nativeHostManifestName = "com.orgmentem.papio"
@@ -385,8 +389,8 @@ type nativeHostManifest struct {
 	AllowedExtensions []string `json:"allowed_extensions"`
 }
 
-func runManifestCheck(name, extensionID, originPrefix string, cfg config.Config, manifestDir func(config.Config) (string, error), readFile func(string) ([]byte, error), add func(string, string, string, string)) {
-	if extensionID == "" {
+func runManifestCheck(name string, extensionIDs []string, originPrefix string, cfg config.Config, manifestDir func(config.Config) (string, error), readFile func(string) ([]byte, error), add func(string, string, string, string)) {
+	if len(extensionIDs) == 0 {
 		add(name, Skip, "skipped: extension ID is not configured", "")
 		return
 	}
@@ -410,15 +414,17 @@ func runManifestCheck(name, extensionID, originPrefix string, cfg config.Config,
 		add(name, Fail, fmt.Sprintf("parsing manifest %s: %v", path, err), "papio native-host install")
 		return
 	}
-	if originPrefix != "" {
-		allowedOrigin := originPrefix + extensionID + "/"
-		if !containsString(manifest.AllowedOrigins, allowedOrigin) {
-			add(name, Fail, "manifest does not allow "+allowedOrigin, "papio native-host install")
+	for _, extensionID := range extensionIDs {
+		if originPrefix != "" {
+			allowedOrigin := originPrefix + extensionID + "/"
+			if !containsString(manifest.AllowedOrigins, allowedOrigin) {
+				add(name, Fail, "manifest does not allow "+allowedOrigin, "papio native-host install")
+				return
+			}
+		} else if !containsString(manifest.AllowedExtensions, extensionID) {
+			add(name, Fail, "manifest does not allow "+extensionID, "papio native-host install")
 			return
 		}
-	} else if !containsString(manifest.AllowedExtensions, extensionID) {
-		add(name, Fail, "manifest does not allow "+extensionID, "papio native-host install")
-		return
 	}
 	add(name, Pass, "manifest allows configured extension", "")
 }

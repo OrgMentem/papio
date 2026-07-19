@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -273,4 +274,80 @@ func statusJSON(t *testing.T, manifestDir, firefoxManifestDir string) map[string
 		t.Fatalf("decode status: %v (%q)", err, stdout)
 	}
 	return out
+}
+
+func TestNativeHostInstallMultipleChromiumIDs(t *testing.T) {
+	const primary = "abcdefghijklmnopabcdefghijklmnop"
+	const secondary = "ponmlkjihgfedcbaponmlkjihgfedcba"
+	configDir := t.TempDir()
+	t.Setenv("PAPIO_CONFIG_DIR", configDir)
+	cfg := config.Default()
+	cfg.AccessMode = config.ModeMaximal
+	cfg.Browser.ExtensionID = primary
+	cfg.Browser.ExtensionIDs = []string{secondary}
+	if err := config.Save(cfg, ""); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+	manifestDir := t.TempDir()
+	if _, stderr, err := runCLI(t, "native-host", "install", "--manifest-dir", manifestDir); err != nil {
+		t.Fatalf("install: %v (%s)", err, stderr)
+	}
+	data, err := os.ReadFile(filepath.Join(manifestDir, nativeHostManifestName+".json"))
+	if err != nil {
+		t.Fatalf("read manifest: %v", err)
+	}
+	var m nativeHostManifest
+	if err := json.Unmarshal(data, &m); err != nil {
+		t.Fatalf("decode manifest: %v", err)
+	}
+	want := []string{"chrome-extension://" + primary + "/", "chrome-extension://" + secondary + "/"}
+	if strings.Join(m.AllowedOrigins, ",") != strings.Join(want, ",") {
+		t.Fatalf("allowed_origins = %v, want %v", m.AllowedOrigins, want)
+	}
+}
+
+func TestBrowserTargetsDetectsInstalledForks(t *testing.T) {
+	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
+		t.Skip("fork detection assertions are unix-path specific")
+	}
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	targets, err := browserTargets()
+	if err != nil {
+		t.Fatalf("browserTargets: %v", err)
+	}
+	edge, ok := findTarget(targets, "edge")
+	if !ok {
+		t.Fatal("edge is not modeled")
+	}
+	if edge.present {
+		t.Fatal("edge must be absent before its profile dir exists")
+	}
+	if err := os.MkdirAll(filepath.Dir(edge.dir), 0o755); err != nil {
+		t.Fatalf("create edge profile dir: %v", err)
+	}
+
+	targets, err = browserTargets()
+	if err != nil {
+		t.Fatalf("browserTargets: %v", err)
+	}
+	for _, tc := range []struct {
+		id          string
+		wantPresent bool
+	}{
+		{"chrome", true},   // baseline, always present
+		{"firefox", true},  // baseline, always present
+		{"edge", true},     // profile dir now exists
+		{"brave", false},   // no profile dir
+		{"vivaldi", false}, // no profile dir
+	} {
+		target, ok := findTarget(targets, tc.id)
+		if !ok {
+			t.Fatalf("%s not modeled", tc.id)
+		}
+		if target.present != tc.wantPresent {
+			t.Fatalf("%s present = %t, want %t", tc.id, target.present, tc.wantPresent)
+		}
+	}
 }

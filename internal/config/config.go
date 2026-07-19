@@ -71,6 +71,11 @@ type Browser struct {
 	// ExtensionID is the fixed Chrome extension ID allowed to talk to the
 	// native host (32 chars, a-p). Empty disables the bridge.
 	ExtensionID string `toml:"extension_id,omitempty"`
+	// ExtensionIDs are additional Chrome-family (Chromium) extension IDs
+	// allowed to reach the native host alongside ExtensionID — e.g. an Edge
+	// Add-ons store copy or a second keyed build, which carry different IDs
+	// than the Chrome Web Store package. Each is 32 chars a-p.
+	ExtensionIDs []string `toml:"extension_ids,omitempty"`
 	// FirefoxExtensionID is the Gecko add-on ID allowed to reach the native
 	// host. Empty disables the Firefox bridge.
 	FirefoxExtensionID string `toml:"firefox_extension_id,omitempty"`
@@ -94,6 +99,23 @@ type Browser struct {
 	AdoptionRoot string `toml:"download_adoption_root,omitempty"`
 	// ActionExpirySeconds bounds how long one browser handoff stays open.
 	ActionExpirySeconds int `toml:"action_expiry_seconds,omitempty"`
+}
+
+// ChromiumExtensionIDs returns the deduplicated Chrome-family extension IDs
+// allowed to reach the native host: the primary ExtensionID first, then any
+// additional ExtensionIDs. Empty entries are dropped. Every Chromium browser
+// (Chrome, Edge, Vivaldi, Brave, Opera, …) shares this same allowlist.
+func (b Browser) ChromiumExtensionIDs() []string {
+	seen := make(map[string]bool)
+	ids := make([]string, 0, 1+len(b.ExtensionIDs))
+	for _, id := range append([]string{b.ExtensionID}, b.ExtensionIDs...) {
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		ids = append(ids, id)
+	}
+	return ids
 }
 
 // Institution is one library's institutional-access identity: its OpenURL
@@ -281,6 +303,11 @@ func (c *Config) validate() error {
 	}
 	if c.Browser.ExtensionID != "" && !extensionIDRE.MatchString(c.Browser.ExtensionID) {
 		return fmt.Errorf("browser.extension_id must be 32 chars a-p")
+	}
+	for _, id := range c.Browser.ExtensionIDs {
+		if !extensionIDRE.MatchString(id) {
+			return fmt.Errorf("browser.extension_ids entries must each be 32 chars a-p")
+		}
 	}
 	if c.Browser.FirefoxExtensionID != "" && !firefoxExtensionIDRE.MatchString(c.Browser.FirefoxExtensionID) {
 		return fmt.Errorf("browser.firefox_extension_id must be a Gecko email-like ID or braced GUID")

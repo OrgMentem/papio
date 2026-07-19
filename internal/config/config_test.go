@@ -414,3 +414,35 @@ func TestResolverOriginsCap(t *testing.T) {
 		t.Fatalf("ResolverOrigins() len = %d, want 32 (protocol cap)", len(got))
 	}
 }
+
+func TestChromiumExtensionIDsDedupesPrimaryFirst(t *testing.T) {
+	b := Browser{ExtensionID: "aaaa", ExtensionIDs: []string{"bbbb", "aaaa", "", "cccc"}}
+	got := b.ChromiumExtensionIDs()
+	want := []string{"aaaa", "bbbb", "cccc"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("ChromiumExtensionIDs = %v, want %v", got, want)
+	}
+	if ids := (Browser{}).ChromiumExtensionIDs(); len(ids) != 0 {
+		t.Fatalf("empty browser returned %v", ids)
+	}
+}
+
+func TestSaveRejectsInvalidExtensionIDs(t *testing.T) {
+	cfg := Default()
+	cfg.AccessMode = ModeConservative
+	cfg.Browser.ExtensionID = "abcdefghijklmnopabcdefghijklmnop"
+	cfg.Browser.ExtensionIDs = []string{"not-a-valid-id"}
+	if err := Save(cfg, filepath.Join(t.TempDir(), "config.toml")); err == nil {
+		t.Fatal("invalid browser.extension_ids entry accepted")
+	}
+}
+
+func TestSaveAcceptsMultipleExtensionIDs(t *testing.T) {
+	cfg := Default()
+	cfg.AccessMode = ModeConservative
+	cfg.Browser.ExtensionID = "abcdefghijklmnopabcdefghijklmnop"
+	cfg.Browser.ExtensionIDs = []string{"ponmlkjihgfedcbaponmlkjihgfedcba"}
+	if err := Save(cfg, filepath.Join(t.TempDir(), "config.toml")); err != nil {
+		t.Fatalf("valid browser.extension_ids rejected: %v", err)
+	}
+}

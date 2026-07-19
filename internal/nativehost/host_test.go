@@ -249,23 +249,29 @@ func TestValidateOrigin(t *testing.T) {
 	cases := []struct {
 		name                string
 		args                []string
+		chromeIDs           []string
 		configuredFirefoxID string
 		wantErr             bool
 	}{
-		{"chrome exact", []string{"chrome-extension://" + chromeID + "/"}, firefoxID, false},
-		{"chrome with window handle", []string{"chrome-extension://" + chromeID + "/", "--parent-window=123"}, firefoxID, false},
-		{"chrome no trailing slash", []string{"chrome-extension://" + chromeID}, firefoxID, true},
-		{"wrong chrome ID", []string{"chrome-extension://ponmlkjihgfedcbaponmlkjihgfedcba/"}, firefoxID, true},
-		{"firefox exact", []string{"/path/to/com.orgmentem.papio.json", firefoxID}, firefoxID, false},
-		{"firefox configured empty", []string{"/path/to/com.orgmentem.papio.json", firefoxID}, "", true},
-		{"wrong Firefox ID", []string{"/path/to/com.orgmentem.papio.json", "other@orgmentem.org"}, firefoxID, true},
-		{"manifest path alone", []string{"/path/to/com.orgmentem.papio.json"}, firefoxID, true},
-		{"missing", []string{"--parent-window=123"}, firefoxID, true},
-		{"empty", nil, firefoxID, true},
+		{"chrome exact", []string{"chrome-extension://" + chromeID + "/"}, nil, firefoxID, false},
+		{"chrome with window handle", []string{"chrome-extension://" + chromeID + "/", "--parent-window=123"}, nil, firefoxID, false},
+		{"chrome no trailing slash", []string{"chrome-extension://" + chromeID}, nil, firefoxID, true},
+		{"wrong chrome ID", []string{"chrome-extension://ponmlkjihgfedcbaponmlkjihgfedcba/"}, nil, firefoxID, true},
+		{"second configured chrome ID", []string{"chrome-extension://ponmlkjihgfedcbaponmlkjihgfedcba/"}, []string{chromeID, "ponmlkjihgfedcbaponmlkjihgfedcba"}, firefoxID, false},
+		{"firefox exact", []string{"/path/to/com.orgmentem.papio.json", firefoxID}, nil, firefoxID, false},
+		{"firefox configured empty", []string{"/path/to/com.orgmentem.papio.json", firefoxID}, nil, "", true},
+		{"wrong Firefox ID", []string{"/path/to/com.orgmentem.papio.json", "other@orgmentem.org"}, nil, firefoxID, true},
+		{"manifest path alone", []string{"/path/to/com.orgmentem.papio.json"}, nil, firefoxID, true},
+		{"missing", []string{"--parent-window=123"}, nil, firefoxID, true},
+		{"empty", nil, nil, firefoxID, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := validateOrigin(tc.args, chromeID, tc.configuredFirefoxID)
+			chromeIDs := tc.chromeIDs
+			if chromeIDs == nil {
+				chromeIDs = []string{chromeID}
+			}
+			err := validateOrigin(tc.args, chromeIDs, tc.configuredFirefoxID)
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("validateOrigin(%v) err = %v, wantErr = %v", tc.args, err, tc.wantErr)
 			}
