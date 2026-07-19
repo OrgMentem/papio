@@ -68,7 +68,7 @@ func TestRoundTrip(t *testing.T) {
 		Job   string `json:"job"`
 		State string `json:"state"`
 	}
-	err := NewUnixClient(socket).Call(context.Background(), "request_01", "jobs.get", struct {
+	err := NewSocketClient(socket).Call(context.Background(), "request_01", "jobs.get", struct {
 		Job string `json:"job"`
 	}{Job: "job_01"}, &result)
 	if err != nil {
@@ -81,7 +81,7 @@ func TestRoundTrip(t *testing.T) {
 
 func TestRouterRejectsUnknownMethod(t *testing.T) {
 	socket, _ := startTestServer(t, Router{Methods: map[string]MethodHandler{}})
-	_, err := NewUnixClient(socket).CallRaw(context.Background(), "request_01", "jobs.unknown", json.RawMessage(`{}`))
+	_, err := NewSocketClient(socket).CallRaw(context.Background(), "request_01", "jobs.unknown", json.RawMessage(`{}`))
 	var remote *RemoteError
 	if !errors.As(err, &remote) || remote.Code != "unknown_method" {
 		t.Fatalf("CallRaw error = %v, want unknown_method", err)
@@ -165,7 +165,7 @@ func TestClientDeadlineCancelsBlockedResponse(t *testing.T) {
 	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
 	defer cancel()
-	_, err = NewUnixClient(socket).CallRaw(ctx, "request_01", "jobs.get", json.RawMessage(`{}`))
+	_, err = NewSocketClient(socket).CallRaw(ctx, "request_01", "jobs.get", json.RawMessage(`{}`))
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("CallRaw error = %v, want deadline exceeded", err)
 	}
@@ -224,7 +224,7 @@ func TestRoundTripAllowsLargeJSONNumber(t *testing.T) {
 	socket, _ := startTestServer(t, HandlerFunc(func(context.Context, Request) ([]byte, *RPCError) {
 		return []byte(`{"value":1e1000}`), nil
 	}))
-	result, err := NewUnixClient(socket).CallRaw(context.Background(), "request_01", "jobs.get", json.RawMessage(`{}`))
+	result, err := NewSocketClient(socket).CallRaw(context.Background(), "request_01", "jobs.get", json.RawMessage(`{}`))
 	if err != nil {
 		t.Fatalf("CallRaw: %v", err)
 	}

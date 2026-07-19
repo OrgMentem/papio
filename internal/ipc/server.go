@@ -6,10 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"os"
-	"path/filepath"
 	"sync"
-	"syscall"
 	"time"
 )
 
@@ -52,7 +49,8 @@ func (r Router) Handle(ctx context.Context, req Request) ([]byte, *RPCError) {
 	return handler(ctx, req.Params)
 }
 
-// Server exposes one-request-per-connection RPC over a Unix-domain socket.
+// Server exposes one-request-per-connection RPC over the daemon's local
+// endpoint (a Unix-domain socket or a Windows named pipe).
 // Calls are serialized before entering Handler so handlers that perform a
 // sequence of writes retain the daemon's single-writer ordering.
 type Server struct {
@@ -62,100 +60,42 @@ type Server struct {
 	// accepted connection. Zero uses DefaultConnIdleTimeout.
 	IdleTimeout time.Duration
 
+	// cleanup removes the endpoint this server created; it is set by Listen and
+	// invoked by Serve on exit. It is a no-op transport where nothing persists.
+	cleanup func() error
+
 	callMu sync.Mutex
 }
 
-// Listen creates Server.SocketPath with owner-only permissions. A regular file
-// is never removed. A stale Unix socket is removed only after a failed dial;
-// an active listener is left untouched.
-func (s *Server) Listen() (*net.UnixListener, error) {
+// Listen creates the daemon's local endpoint with owner-only permissions,
+// delegating the platform specifics (Unix-domain socket or Windows named pipe)
+// to listenSocket. A stale endpoint is reclaimed only when no daemon answers.
+func (s *Server) Listen() (net.Listener, error) {
 	if s.SocketPath == "" {
 		return nil, fmt.Errorf("ipc socket path is required")
 	}
 	if s.Handler == nil {
 		return nil, fmt.Errorf("ipc handler is required")
 	}
-	if err := os.MkdirAll(filepath.Dir(s.SocketPath), 0700); err != nil {
-		return nil, fmt.Errorf("create ipc directory: %w", err)
-	}
-	if err := prepareSocket(s.SocketPath); err != nil {
+	listener, cleanup, err := listenSocket(s.SocketPath)
+	if err != nil {
 		return nil, err
 	}
-	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: s.SocketPath, Net: "unix"})
-	if err != nil {
-		if errors.Is(err, syscall.EADDRINUSE) {
-			return nil, ErrSocketInUse
-		}
-		return nil, fmt.Errorf("listen ipc socket: %w", err)
-	}
-	// net.UnixListener otherwise unlinks its path on Close, which could remove
-	// a replacement file created after the daemon started.
-	listener.SetUnlinkOnClose(false)
-	if err := os.Chmod(s.SocketPath, 0600); err != nil {
-		_ = listener.Close()
-		_ = os.Remove(s.SocketPath)
-		return nil, fmt.Errorf("restrict ipc socket permissions: %w", err)
-	}
+	s.cleanup = cleanup
 	return listener, nil
 }
 
-func prepareSocket(path string) error {
-	info, err := os.Lstat(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("inspect ipc socket: %w", err)
-	}
-	if info.Mode()&os.ModeSocket == 0 {
-		return ErrUnsafeSocketPath
-	}
-
-	conn, err := net.DialTimeout("unix", path, 100*time.Millisecond)
-	if err == nil {
-		_ = conn.Close()
-		return ErrSocketInUse
-	}
-	var netErr *net.OpError
-	if errors.As(err, &netErr) && (errors.Is(netErr.Err, syscall.ECONNREFUSED) || errors.Is(netErr.Err, syscall.ENOENT)) {
-		if err := removeSocketIfSame(path, info); err != nil {
-			return fmt.Errorf("remove stale ipc socket: %w", err)
-		}
-		return nil
-	}
-	return fmt.Errorf("probe existing ipc socket: %w", err)
-}
-
-// Serve listens until ctx is cancelled. It removes only the socket that it
+// Serve listens until ctx is cancelled. It removes only the endpoint that it
 // created when it exits.
 func (s *Server) Serve(ctx context.Context) error {
 	listener, err := s.Listen()
 	if err != nil {
 		return err
 	}
-	info, err := os.Lstat(s.SocketPath)
-	if err != nil {
-		_ = listener.Close()
-		return fmt.Errorf("inspect created ipc socket: %w", err)
+	if s.cleanup != nil {
+		defer func() { _ = s.cleanup() }()
 	}
-	defer func() { _ = removeSocketIfSame(s.SocketPath, info) }()
 	return s.ServeListener(ctx, listener)
-}
-
-// removeSocketIfSame removes path only if it is still the socket identified by
-// expected. It prevents shutdown cleanup from deleting a replacement file.
-func removeSocketIfSame(path string, expected os.FileInfo) error {
-	current, err := os.Lstat(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	if current.Mode()&os.ModeSocket == 0 || !os.SameFile(expected, current) {
-		return nil
-	}
-	return os.Remove(path)
 }
 
 // ServeListener serves an already-created listener, which makes deterministic

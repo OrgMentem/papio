@@ -6,12 +6,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"syscall"
 	"time"
+
+	"papio/internal/ipc"
 )
 
 // CommandFactory constructs the daemon command. The default uses exec.Command
@@ -196,16 +196,16 @@ func acquireLock(ctx context.Context, path string, retry time.Duration) (func(),
 		return nil, fmt.Errorf("open autostart lock: %w", err)
 	}
 	for {
-		err = syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
-		if err == nil {
-			return func() {
-				_ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
-				_ = file.Close()
-			}, nil
-		}
-		if !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EAGAIN) {
+		locked, err := tryLockFile(file)
+		if err != nil {
 			_ = file.Close()
 			return nil, fmt.Errorf("lock autostart: %w", err)
+		}
+		if locked {
+			return func() {
+				_ = unlockFile(file)
+				_ = file.Close()
+			}, nil
 		}
 		timer := time.NewTimer(retry)
 		select {
@@ -219,8 +219,7 @@ func acquireLock(ctx context.Context, path string, retry time.Duration) (func(),
 }
 
 func probeSocket(ctx context.Context, socketPath string) error {
-	var dialer net.Dialer
-	conn, err := dialer.DialContext(ctx, "unix", socketPath)
+	conn, err := ipc.Dial(ctx, socketPath)
 	if err != nil {
 		return err
 	}

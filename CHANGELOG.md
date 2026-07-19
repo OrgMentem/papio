@@ -4,6 +4,23 @@ All notable changes to *papio* are documented here. This initial release entry i
 synthesized from the complete `papio` and `zotio` Git histories and the execution
 records in `notes/acquisition-stack-plan.md`.
 
+## [Unreleased]
+
+### Added
+
+- First-class Windows support. The daemon's local RPC runs over a named pipe on
+  Windows — restricted to the current user via an explicit SDDL, the analog of
+  the Unix socket's `0600` — while macOS and Linux keep their Unix-domain
+  socket; the transport is chosen at build time. `papio init`, `papio
+  native-host install/uninstall/status`, and `papio doctor` register the browser
+  connector through the per-user registry
+  (`HKCU\Software\...\NativeMessagingHosts`) instead of a manifest directory,
+  and — because Windows has no unprivileged symlinks — install a copy of the
+  `papio` binary as the native host (rerun `papio init` after upgrading to
+  refresh it). Configuration lives at `%APPDATA%\papio` and data at
+  `%LOCALAPPDATA%\papio`, and the update hint recognizes Scoop
+  (`scoop update papio`). macOS and Linux behavior is unchanged.
+
 ## [0.3.0] - 2026-07-18
 
 ### Added

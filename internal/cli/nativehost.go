@@ -8,20 +8,28 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 
 	"github.com/spf13/cobra"
 
 	"papio/internal/config"
+	"papio/internal/nativehost"
 )
 
 // Native-host registration constants. The runtime dispatches to native-host
-// mode by executable basename (nativeHostBinaryName); browsers launch the host
+// mode by executable basename (nativehost.ExecName); browsers launch the host
 // through the manifest named nativeHostManifestName.
 const (
 	nativeHostManifestName = "com.orgmentem.papio"
-	nativeHostBinaryName   = "papio-native-host"
 	nativeHostDescription  = "papio native-messaging host for institutional paper-acquisition handoff"
+)
+
+// browserKind selects which browser's native-messaging registration a platform
+// helper targets.
+type browserKind int
+
+const (
+	browserChrome browserKind = iota
+	browserFirefox
 )
 
 // nativeHostManifest is a browser native-messaging host manifest. Metadata
@@ -36,51 +44,12 @@ type nativeHostManifest struct {
 	AllowedExtensions []string `json:"allowed_extensions,omitempty"`
 }
 
-// nativeHostSymlinkPath is the fixed-name executable Chrome invokes. The
-// installer points it at the current papio binary; runtime dispatch keys off
-// its basename.
-func nativeHostSymlinkPath() string {
-	return filepath.Join(config.Dir(), "bin", nativeHostBinaryName)
-}
-
-// defaultManifestDir is Chrome's per-user NativeMessagingHosts directory.
-func defaultManifestDir() (string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", err
-	}
-	switch runtime.GOOS {
-	case "darwin":
-		return filepath.Join(home, "Library", "Application Support", "Google", "Chrome", "NativeMessagingHosts"), nil
-	case "linux":
-		return filepath.Join(home, ".config", "google-chrome", "NativeMessagingHosts"), nil
-	default:
-		return "", fmt.Errorf("native-messaging host install is not supported on %s (register the manifest manually)", runtime.GOOS)
-	}
-}
-
 // resolveManifestDir prefers an explicit override (tests, custom Chrome dirs).
 func resolveManifestDir(override string) (string, error) {
 	if override != "" {
 		return override, nil
 	}
 	return defaultManifestDir()
-}
-
-// defaultFirefoxManifestDir is Firefox's per-user NativeMessagingHosts directory.
-func defaultFirefoxManifestDir() (string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", err
-	}
-	switch runtime.GOOS {
-	case "darwin":
-		return filepath.Join(home, "Library", "Application Support", "Mozilla", "NativeMessagingHosts"), nil
-	case "linux":
-		return filepath.Join(home, ".mozilla", "native-messaging-hosts"), nil
-	default:
-		return "", fmt.Errorf("Firefox native-messaging host install is not supported on %s (register the manifest manually)", runtime.GOOS)
-	}
 }
 
 // resolveFirefoxManifestDir prefers an explicit override (tests, custom Firefox dirs).
@@ -101,7 +70,7 @@ func newNativeHostCommand(opt *options) *cobra.Command {
 
 	install := &cobra.Command{
 		Use:   "install",
-		Short: "Register native-messaging host manifests and executable symlink",
+		Short: "Register native-messaging host manifests and the host executable",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			cfg, err := opt.loadConfig()
@@ -119,7 +88,7 @@ func newNativeHostCommand(opt *options) *cobra.Command {
 				"executable":            result.Executable,
 				"extension_id":          result.ExtensionID,
 				"firefox_extension_id":  cfg.Browser.FirefoxExtensionID,
-			}, "Installed native host:\n  manifest:         %s\n  firefox manifest: %s\n  symlink:          %s -> %s",
+			}, "Installed native host:\n  manifest:         %s\n  firefox manifest: %s\n  host:             %s -> %s",
 				result.ManifestPath, result.FirefoxManifestPath, result.SymlinkPath, result.Executable)
 		},
 	}
@@ -128,7 +97,7 @@ func newNativeHostCommand(opt *options) *cobra.Command {
 
 	uninstall := &cobra.Command{
 		Use:   "uninstall",
-		Short: "Remove native-messaging host manifests and executable symlink",
+		Short: "Remove native-messaging host manifests and the host executable",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			dir, err := resolveManifestDir(manifestDir)
@@ -141,9 +110,8 @@ func newNativeHostCommand(opt *options) *cobra.Command {
 			}
 			manifestPath := filepath.Join(dir, nativeHostManifestName+".json")
 			firefoxManifestPath := filepath.Join(firefoxDir, nativeHostManifestName+".json")
-			symlinkPath := nativeHostSymlinkPath()
-			removed := make([]string, 0, 3)
-			for _, path := range []string{manifestPath, firefoxManifestPath, symlinkPath} {
+			removed := make([]string, 0, 4)
+			for _, path := range []string{manifestPath, firefoxManifestPath} {
 				if err := os.Remove(path); err != nil {
 					if !errors.Is(err, os.ErrNotExist) {
 						return err
@@ -152,6 +120,18 @@ func newNativeHostCommand(opt *options) *cobra.Command {
 				}
 				removed = append(removed, path)
 			}
+			if err := deregisterManifest(browserChrome); err != nil {
+				return err
+			}
+			if err := deregisterManifest(browserFirefox); err != nil {
+				return err
+			}
+			hostRemoved, err := nativehost.RemoveExecutable()
+			if err != nil {
+				return err
+			}
+			removed = append(removed, hostRemoved...)
+			symlinkPath := nativehost.ExecPath()
 			return opt.printResult(map[string]any{
 				"manifest_path":         manifestPath,
 				"firefox_manifest_path": firefoxManifestPath,
@@ -182,21 +162,14 @@ func newNativeHostCommand(opt *options) *cobra.Command {
 			}
 			manifestPath := filepath.Join(dir, nativeHostManifestName+".json")
 			firefoxManifestPath := filepath.Join(firefoxDir, nativeHostManifestName+".json")
-			symlinkPath := nativeHostSymlinkPath()
+			symlinkPath := nativehost.ExecPath()
 
 			_, manErr := os.Stat(manifestPath)
 			manifestPresent := manErr == nil
 			_, firefoxManErr := os.Stat(firefoxManifestPath)
 			firefoxManifestPresent := firefoxManErr == nil
 
-			var symlinkTarget string
-			targetExists := false
-			if target, rErr := os.Readlink(symlinkPath); rErr == nil {
-				symlinkTarget = target
-				if _, sErr := os.Stat(symlinkPath); sErr == nil {
-					targetExists = true
-				}
-			}
+			symlinkTarget, targetExists := nativehost.ExecTarget()
 			return opt.printResult(map[string]any{
 				"manifest_path":            manifestPath,
 				"manifest_present":         manifestPresent,
@@ -242,14 +215,8 @@ func installNativeHost(cfg config.Config, manifestDir, firefoxManifestDir string
 		exe = resolved
 	}
 
-	symlinkPath := nativeHostSymlinkPath()
-	if err := os.MkdirAll(filepath.Dir(symlinkPath), 0o755); err != nil {
-		return nativeHostInstallResult{}, err
-	}
-	if err := os.Remove(symlinkPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return nativeHostInstallResult{}, err
-	}
-	if err := os.Symlink(exe, symlinkPath); err != nil {
+	hostPath, err := nativehost.InstallExecutable(exe)
+	if err != nil {
 		return nativeHostInstallResult{}, err
 	}
 
@@ -264,14 +231,17 @@ func installNativeHost(cfg config.Config, manifestDir, firefoxManifestDir string
 	chromeManifest := nativeHostManifest{
 		Name:           nativeHostManifestName,
 		Description:    nativeHostDescription,
-		Path:           symlinkPath,
+		Path:           hostPath,
 		Type:           "stdio",
 		AllowedOrigins: []string{"chrome-extension://" + extID + "/"},
 	}
 	if err := writeManifestAtomic(manifestPath, chromeManifest); err != nil {
 		return nativeHostInstallResult{}, err
 	}
-	if err := verifyNativeHost(manifestPath, symlinkPath); err != nil {
+	if err := registerManifest(browserChrome, manifestPath); err != nil {
+		return nativeHostInstallResult{}, err
+	}
+	if err := verifyNativeHost(manifestPath); err != nil {
 		return nativeHostInstallResult{}, err
 	}
 
@@ -288,14 +258,17 @@ func installNativeHost(cfg config.Config, manifestDir, firefoxManifestDir string
 		firefoxManifest := nativeHostManifest{
 			Name:              nativeHostManifestName,
 			Description:       nativeHostDescription,
-			Path:              symlinkPath,
+			Path:              hostPath,
 			Type:              "stdio",
 			AllowedExtensions: []string{firefoxID},
 		}
 		if err := writeManifestAtomic(firefoxManifestPath, firefoxManifest); err != nil {
 			return nativeHostInstallResult{}, err
 		}
-		if err := verifyNativeHost(firefoxManifestPath, symlinkPath); err != nil {
+		if err := registerManifest(browserFirefox, firefoxManifestPath); err != nil {
+			return nativeHostInstallResult{}, err
+		}
+		if err := verifyNativeHost(firefoxManifestPath); err != nil {
 			return nativeHostInstallResult{}, err
 		}
 	}
@@ -303,7 +276,7 @@ func installNativeHost(cfg config.Config, manifestDir, firefoxManifestDir string
 	return nativeHostInstallResult{
 		ManifestPath:        manifestPath,
 		FirefoxManifestPath: firefoxManifestPath,
-		SymlinkPath:         symlinkPath,
+		SymlinkPath:         hostPath,
 		Executable:          exe,
 		ExtensionID:         extID,
 	}, nil
@@ -343,8 +316,9 @@ func writeManifestAtomic(path string, manifest nativeHostManifest) error {
 }
 
 // verifyNativeHost is the install smoke test: the manifest must re-read and
-// JSON-decode with the expected name, and the symlink target must exist.
-func verifyNativeHost(manifestPath, symlinkPath string) error {
+// JSON-decode with the expected name, and the installed host executable must
+// resolve to a real target.
+func verifyNativeHost(manifestPath string) error {
 	data, err := os.ReadFile(manifestPath)
 	if err != nil {
 		return fmt.Errorf("verifying native host manifest: %w", err)
@@ -356,12 +330,8 @@ func verifyNativeHost(manifestPath, symlinkPath string) error {
 	if manifest.Name != nativeHostManifestName {
 		return fmt.Errorf("native host manifest name = %q, want %q", manifest.Name, nativeHostManifestName)
 	}
-	target, err := os.Readlink(symlinkPath)
-	if err != nil {
-		return fmt.Errorf("verifying native host symlink %s: %w", symlinkPath, err)
-	}
-	if _, err := os.Lstat(target); err != nil {
-		return fmt.Errorf("native host symlink target %s is unreachable: %w", target, err)
+	if _, ok := nativehost.ExecTarget(); !ok {
+		return fmt.Errorf("native host executable %s does not resolve to a real target", nativehost.ExecPath())
 	}
 	return nil
 }

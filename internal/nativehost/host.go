@@ -26,8 +26,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -50,14 +50,13 @@ const syncMethod = "browser.sync"
 // autostart would spawn another native host instead of the daemon.
 const nativeHostBasename = "papio-native-host"
 
-// resolveDaemonExecutable returns the real papio binary to autostart as the
-// daemon, resolving the installed papio-native-host symlink to its target.
-func resolveDaemonExecutable() (string, error) {
-	exe, err := os.Executable()
-	if err != nil {
-		return "", err
-	}
-	return resolveExecutablePath(exe)
+// InvokedAsHost reports whether argv0 names the native-messaging host
+// executable a browser launched. Browsers start a fixed-name file
+// (papio-native-host, or papio-native-host.exe on Windows); dispatch keys off
+// that basename, ignoring any executable extension.
+func InvokedAsHost(argv0 string) bool {
+	base := filepath.Base(argv0)
+	return strings.TrimSuffix(base, filepath.Ext(base)) == nativeHostBasename
 }
 
 // resolveExecutablePath resolves exe through any symlinks (falling back to exe
@@ -68,7 +67,7 @@ func resolveExecutablePath(exe string) (string, error) {
 	if err != nil {
 		resolved = exe
 	}
-	if filepath.Base(resolved) == nativeHostBasename {
+	if InvokedAsHost(resolved) {
 		return "", fmt.Errorf("resolved executable %q still dispatches as native host; cannot autostart daemon", resolved)
 	}
 	return resolved, nil
@@ -105,17 +104,20 @@ func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	socket := filepath.Join(cfg.DataDir, "papio.sock")
 	starter := daemon.NewAutostarter(socket)
 	starter.Args = []string{"--config", cfg.Path, "daemon", "--socket", socket}
-	// Chrome launches this process through the installed papio-native-host
-	// symlink, so os.Executable reports that symlink. Autostart must spawn the
-	// real binary under its own basename; otherwise the child re-dispatches into
-	// native-host mode (basename == papio-native-host), never starts the daemon,
-	// and Ensure times out on a socket that never appears.
+	// A browser launches this process through the installed host executable
+	// (a symlink on Unix, a copy on Windows), so os.Executable reports that
+	// host path. Autostart must spawn the real papio binary under its own
+	// basename; otherwise the child re-dispatches into native-host mode
+	// (basename == papio-native-host), never starts the daemon, and Ensure
+	// times out on a socket that never appears. resolveDaemonExecutable is
+	// platform-specific: it follows the symlink on Unix and reads the recorded
+	// target on Windows.
 	starter.Executable = resolveDaemonExecutable
 	if err := starter.Ensure(ctx); err != nil {
 		return fmt.Errorf("ensure daemon: %w", err)
 	}
 
-	syncer := &ipcSyncer{client: ipc.NewUnixClient(socket)}
+	syncer := &ipcSyncer{client: ipc.NewSocketClient(socket)}
 	return newBridge(syncer, stdin, stdout, stderr).run(ctx)
 }
 

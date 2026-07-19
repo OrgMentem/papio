@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -164,6 +165,11 @@ func Dir() string {
 	if d := os.Getenv("PAPIO_CONFIG_DIR"); d != "" {
 		return d
 	}
+	if runtime.GOOS == "windows" {
+		if appData := os.Getenv("APPDATA"); appData != "" {
+			return filepath.Join(appData, "papio")
+		}
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "."
@@ -171,12 +177,23 @@ func Dir() string {
 	return filepath.Join(home, ".config", "papio")
 }
 
+// defaultDataDir is the baseline data directory: %LOCALAPPDATA%\papio on Windows
+// (non-roaming, the right home for a database), ~/.local/share/papio elsewhere.
+func defaultDataDir() string {
+	if runtime.GOOS == "windows" {
+		if localAppData := os.Getenv("LOCALAPPDATA"); localAppData != "" {
+			return filepath.Join(localAppData, "papio")
+		}
+	}
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".local", "share", "papio")
+}
+
 // Default returns the baseline configuration. AccessMode is deliberately empty:
 // callers that acquire must see ErrAccessModeUnset until the user chooses.
 func Default() Config {
-	home, _ := os.UserHomeDir()
 	return Config{
-		DataDir: filepath.Join(home, ".local", "share", "papio"),
+		DataDir: defaultDataDir(),
 		Fetch:   Fetch{MaxBytes: 100 << 20, TimeoutSeconds: 120},
 		PDF:     PDF{OCREnabled: true, MinTextChars: 400, MaxOCRPages: 4, TitleMatchThreshold: 0.6},
 		Browser: Browser{ActionExpirySeconds: 1800},

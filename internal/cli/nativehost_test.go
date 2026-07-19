@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"papio/internal/config"
+	"papio/internal/nativehost"
 )
 
 // runCLI executes the root command with args, returning stdout, stderr, and err.
@@ -49,7 +50,7 @@ func writeTestConfig(t *testing.T, extensionID, firefoxExtensionID string) (stri
 func TestNativeHostInstallWritesBrowserManifestsAndSymlink(t *testing.T) {
 	extID := strings.Repeat("a", 32) // valid 32-char a-p extension ID
 	const firefoxID = "papio@orgmentem.com"
-	configDir, exe := writeTestConfig(t, extID, firefoxID)
+	_, exe := writeTestConfig(t, extID, firefoxID)
 	manifestDir := t.TempDir()
 	firefoxManifestDir := t.TempDir()
 
@@ -89,7 +90,7 @@ func TestNativeHostInstallWritesBrowserManifestsAndSymlink(t *testing.T) {
 	if err := json.Unmarshal(firefoxData, &firefoxManifest); err != nil {
 		t.Fatalf("decode Firefox manifest: %v (%q)", err, string(firefoxData))
 	}
-	symlinkPath := filepath.Join(configDir, "bin", nativeHostBinaryName)
+	symlinkPath := nativehost.ExecPath()
 	for name, manifest := range map[string]nativeHostManifest{
 		"Chrome":  chromeManifest,
 		"Firefox": firefoxManifest,
@@ -152,12 +153,12 @@ func TestNativeHostInstallWritesBrowserManifestsAndSymlink(t *testing.T) {
 func TestNativeHostStatusAndUninstall(t *testing.T) {
 	extID := strings.Repeat("b", 32)
 	const firefoxID = "papio@orgmentem.com"
-	configDir, _ := writeTestConfig(t, extID, firefoxID)
+	writeTestConfig(t, extID, firefoxID)
 	manifestDir := t.TempDir()
 	firefoxManifestDir := t.TempDir()
 	manifestPath := filepath.Join(manifestDir, nativeHostManifestName+".json")
 	firefoxManifestPath := filepath.Join(firefoxManifestDir, nativeHostManifestName+".json")
-	symlinkPath := filepath.Join(configDir, "bin", nativeHostBinaryName)
+	symlinkPath := nativehost.ExecPath()
 
 	// Status before install: both manifests absent.
 	before := statusJSON(t, manifestDir, firefoxManifestDir)

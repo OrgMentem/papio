@@ -6,8 +6,10 @@ you a preview before it writes anything.
 
 ## 1. Prerequisites
 
-*papio* currently runs on macOS. Install a Go-built `papio` binary, or build it
-from this checkout:
+*papio* runs on macOS, Linux, and Windows. Install a released binary — Homebrew
+(macOS/Linux), Scoop (Windows), or a prebuilt archive from the
+[releases page](https://github.com/OrgMentem/papio/releases) — or build from this
+checkout:
 
 ```sh
 go build ./cmd/papio
@@ -15,9 +17,11 @@ go build ./cmd/papio
 
 PDF validation and OCR use Poppler and Tesseract:
 
-```sh
-brew install poppler tesseract
-```
+| OS | Install |
+| --- | --- |
+| macOS | `brew install poppler tesseract` |
+| Debian/Ubuntu | `sudo apt install poppler-utils tesseract-ocr` |
+| Windows | `scoop install poppler tesseract` |
 
 Install Chrome or Firefox to use the browser extension. Install `zotio` and
 make it available on `PATH` only when you want *papio* to import finished PDFs
@@ -79,6 +83,12 @@ These flags set the corresponding setup values:
 
 `papio init` prints the exact browser setup steps after attempting native-host
 installation. Load the unpacked extension in the browser you use.
+
+On Windows the connector is registered under the current-user registry
+(`HKCU\Software\{Google\Chrome,Mozilla}\NativeMessagingHosts`) and the host runs
+from a copy of the `papio` binary; rerun `papio init` after upgrading *papio* so
+that copy is refreshed. On macOS and Linux the connector is a symlink and needs
+no refresh.
 
 ### Chrome
 

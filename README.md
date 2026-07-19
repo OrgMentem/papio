@@ -293,7 +293,8 @@ papio doctor        # sources, PDF tools, background service, extension, connect
 
 ## Configuration
 
-Config file: `~/.config/papio/config.toml` (override with `--config`). Access
+Config file: `~/.config/papio/config.toml` — on Windows `%APPDATA%\papio\config.toml`
+(override with `--config`). Access
 modes, resolver profiles, source allow/deny lists, budgets, OCR, and the zotio
 executable are all configured there — every key, default, constraint, and
 effect is in the

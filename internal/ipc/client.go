@@ -18,12 +18,18 @@ type Client struct {
 	Dial DialFunc
 }
 
-// NewUnixClient constructs a client for a Unix-domain socket.
-func NewUnixClient(socketPath string) *Client {
+// NewSocketClient constructs a client for the daemon's local endpoint at path
+// (a Unix-domain socket or a Windows named pipe, resolved by dialSocket).
+func NewSocketClient(path string) *Client {
 	return &Client{Dial: func(ctx context.Context) (net.Conn, error) {
-		var d net.Dialer
-		return d.DialContext(ctx, "unix", socketPath)
+		return dialSocket(ctx, path)
 	}}
+}
+
+// Dial opens one connection to the daemon's local endpoint at path. It lets
+// callers outside this package probe the endpoint without building a Client.
+func Dial(ctx context.Context, path string) (net.Conn, error) {
+	return dialSocket(ctx, path)
 }
 
 // RemoteError is a classified error returned by the daemon.
@@ -130,14 +136,15 @@ func (c *Client) Call(ctx context.Context, id, method string, params any, result
 	return nil
 }
 
-// WaitForSocket waits until a Unix socket accepts a connection. It is used by
-// autostart to converge concurrent command invocations without spawn storms.
+// WaitForSocket waits until the daemon's local endpoint accepts a connection.
+// It is used by autostart to converge concurrent command invocations without
+// spawn storms.
 func WaitForSocket(ctx context.Context, socketPath string, retry time.Duration) error {
 	if retry <= 0 {
 		retry = 25 * time.Millisecond
 	}
 	for {
-		conn, err := NewUnixClient(socketPath).Dial(ctx)
+		conn, err := NewSocketClient(socketPath).Dial(ctx)
 		if err == nil {
 			_ = conn.Close()
 			return nil

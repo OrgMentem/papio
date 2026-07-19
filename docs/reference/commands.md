@@ -301,7 +301,7 @@ papio native-host
 
 ### `papio native-host install`
 
-Register native-messaging host manifests and executable symlink
+Register native-messaging host manifests and the host executable
 
 ```
 papio native-host install [flags]
@@ -327,7 +327,7 @@ papio native-host status [flags]
 
 ### `papio native-host uninstall`
 
-Remove native-messaging host manifests and executable symlink
+Remove native-messaging host manifests and the host executable
 
 ```
 papio native-host uninstall [flags]

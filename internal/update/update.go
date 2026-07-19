@@ -202,6 +202,12 @@ func UpgradeHintFor(executable, formula, releaseURL string) string {
 	if strings.HasPrefix(clean, "/opt/homebrew/") || strings.HasPrefix(clean, "/usr/local/Cellar/") {
 		return "brew upgrade " + formula
 	}
+	// Scoop installs under <scoop>/apps/<name> and shims under <scoop>/shims.
+	// Normalize separators so detection is independent of the host that built
+	// the string (Windows uses backslashes).
+	if normalized := strings.ToLower(strings.ReplaceAll(clean, `\`, "/")); strings.Contains(normalized, "/scoop/") {
+		return "scoop update " + formula
+	}
 	return releaseURL
 }
 

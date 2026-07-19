@@ -131,6 +131,9 @@ func TestVersionAndUpgradeHints(t *testing.T) {
 	if got := UpgradeHint("/Applications/papio", "https://example.test/releases"); got != "https://example.test/releases" {
 		t.Fatalf("release hint = %q", got)
 	}
+	if got := UpgradeHint(`C:\Users\x\scoop\apps\papio\current\papio.exe`, "https://example.test/releases"); got != "scoop update papio" {
+		t.Fatalf("scoop hint = %q", got)
+	}
 }
 
 func TestTargetsUseSeparateCachesAndRateLimits(t *testing.T) {

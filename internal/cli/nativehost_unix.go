@@ -1,21 +1,20 @@
 // Copyright 2026 OrgMentem. Licensed under MIT. See LICENSE.
-package doctor
+
+//go:build !windows
+
+package cli
 
 import (
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
-
-	"papio/internal/config"
 )
 
-// DefaultChromeNativeMessagingHostsDir returns Chrome's per-user native-messaging
-// manifest directory.
-func DefaultChromeNativeMessagingHostsDir() (string, error) {
-	if runtime.GOOS == "windows" {
-		return filepath.Join(config.Dir(), "manifests", "chrome"), nil
-	}
+// defaultManifestDir is Chrome's per-user NativeMessagingHosts directory. On
+// Unix the browser discovers the manifest by scanning this directory, so no
+// registry step is needed.
+func defaultManifestDir() (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", err
@@ -30,12 +29,8 @@ func DefaultChromeNativeMessagingHostsDir() (string, error) {
 	}
 }
 
-// DefaultFirefoxNativeMessagingHostsDir returns Firefox's per-user
-// native-messaging manifest directory.
-func DefaultFirefoxNativeMessagingHostsDir() (string, error) {
-	if runtime.GOOS == "windows" {
-		return filepath.Join(config.Dir(), "manifests", "firefox"), nil
-	}
+// defaultFirefoxManifestDir is Firefox's per-user NativeMessagingHosts directory.
+func defaultFirefoxManifestDir() (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", err
@@ -49,3 +44,10 @@ func DefaultFirefoxNativeMessagingHostsDir() (string, error) {
 		return "", fmt.Errorf("Firefox native-messaging host install is not supported on %s (register the manifest manually)", runtime.GOOS)
 	}
 }
+
+// registerManifest and deregisterManifest are no-ops on Unix: browsers discover
+// the host from the manifest file's location in the NativeMessagingHosts
+// directory, not through a registry.
+func registerManifest(browserKind, string) error { return nil }
+
+func deregisterManifest(browserKind) error { return nil }

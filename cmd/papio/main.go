@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"syscall"
 
 	"papio/internal/cli"
@@ -16,7 +15,7 @@ import (
 )
 
 func main() {
-	if filepath.Base(os.Args[0]) == "papio-native-host" {
+	if nativehost.InvokedAsHost(os.Args[0]) {
 		// Chrome invokes the native host with the extension origin as an
 		// untrusted argument. Stdout is frame-only; diagnostics go to stderr.
 		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

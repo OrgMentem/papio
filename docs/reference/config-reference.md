@@ -1,6 +1,7 @@
 # Configuration reference
 
-Papio loads TOML from `~/.config/papio/config.toml` unless the global
+Papio loads TOML from `~/.config/papio/config.toml` (on Windows,
+`%APPDATA%\papio\config.toml`) unless the global
 `--config <path>` option selects another file. Configuration is layered over the
 built-in defaults; unknown TOML fields are rejected. `papio init` writes a
 validated user-only config file and `papio doctor` reports readiness.
@@ -14,7 +15,7 @@ with `~/` are expanded when Papio loads them.
 | --- | --- | --- | --- |
 | `access_mode` | string | empty | Required before acquisition. Allowed values are `conservative`, `assisted`, and `maximal`; a fresh guided `papio init` chooses `conservative`. Conservative records institutional OpenURL availability without opening a handoff; assisted and maximal can route eligible exhaustion to browser handoff. |
 | `email` | string | empty | Contact identity for polite API pools. Doctor fails when enabled Unpaywall has no email; enabled OpenAlex also requires an email and API key. |
-| `data_dir` | path string | `~/.local/share/papio` | Private writable data directory for the database, artifacts, socket, and default browser-adoption directory. |
+| `data_dir` | path string | `~/.local/share/papio` (Windows: `%LOCALAPPDATA%\papio`) | Private writable data directory for the database, artifacts, socket, and default browser-adoption directory. |
 
 ## `[fetch]`
 

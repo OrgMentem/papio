@@ -150,7 +150,7 @@ func (o *options) socketCall(ctx context.Context, socket, method string, params,
 }
 
 func callSocket(ctx context.Context, socket, method string, params, result any) error {
-	client := ipc.NewUnixClient(socket)
+	client := ipc.NewSocketClient(socket)
 	return client.Call(ctx, job.NewID("rpc"), method, params, result)
 }
 
