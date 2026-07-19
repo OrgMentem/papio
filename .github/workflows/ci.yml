@@ -93,7 +93,11 @@ jobs:
           "$TMP/betterleaks" git . --no-banner --redact
 
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
@@ -103,6 +107,28 @@ jobs:
         run: go build ./...
       - name: Test
         run: go test ./...
+
+  # Platform-specific files (named-pipe IPC, registry native host, flock vs
+  # LockFileEx) are never compiled on the ubuntu test runner. Cross-compile and
+  # vet every target so a Windows- or macOS-only break fails CI, not a release.
+  cross-build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        goos: [windows, darwin, linux]
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: '1.26.x'
+      - name: Build (${{ matrix.goos }})
+        run: go build ./...
+        env:
+          GOOS: ${{ matrix.goos }}
+      - name: Vet (${{ matrix.goos }})
+        run: go vet ./...
+        env:
+          GOOS: ${{ matrix.goos }}
 
   # Browser-plane MV3 extension: TypeScript typecheck + bun tests.
   extension:
@@ -119,3 +145,5 @@ jobs:
         run: bun run typecheck
       - name: Test
         run: bun test
+      - name: Build bundles and lint Firefox
+        run: bun run lint:firefox

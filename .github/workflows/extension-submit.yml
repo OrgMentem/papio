@@ -1,0 +1,99 @@
+name: extension-submit
+
+# Automated browser-store submission for the MV3 extension.
+#
+# The extension is versioned and released independently of the daemon (v*)
+# tags — it carries its own version in extension/manifest.json and is only
+# resubmitted when it changes. Trigger this by pushing an `ext-v<version>` tag
+# that matches manifest.json, or run it manually from the Actions tab.
+#
+# The `store-submit` GitHub Environment gates the job: configure it with
+# required reviewers so a human approves each submission (the release runbook's
+# "the human authorizes publication" rule) and attach the store credentials as
+# environment secrets:
+#   Chrome Web Store: CWS_CLIENT_ID, CWS_CLIENT_SECRET, CWS_REFRESH_TOKEN, CWS_EXTENSION_ID
+#   Firefox AMO:      WEB_EXT_API_KEY, WEB_EXT_API_SECRET
+#
+# First-time only: the Chrome Web Store item must be created by hand once (the
+# API cannot create the initial listing); afterward this drives version updates.
+# Chrome defaults to a draft upload (a human clicks Publish in the dashboard);
+# set chrome_publish=true to also submit for review.
+
+on:
+  push:
+    tags:
+      - 'ext-v*'
+  workflow_dispatch:
+    inputs:
+      chrome:
+        description: 'Chrome: upload to the Web Store'
+        type: boolean
+        default: true
+      chrome_publish:
+        description: 'Chrome: also submit for review (else upload a draft only)'
+        type: boolean
+        default: false
+      firefox:
+        description: 'Firefox: sign + submit the listed version to AMO'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: extension-submit
+  cancel-in-progress: false
+
+jobs:
+  submit:
+    runs-on: ubuntu-latest
+    environment: store-submit
+    defaults:
+      run:
+        working-directory: extension
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: oven-sh/setup-bun@735343b667d3e6f658f44d0eca948eb6282f2b76 # v2.0.2
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Verify manifest version matches tag
+        if: startsWith(github.ref, 'refs/tags/ext-v')
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#ext-v}"
+          manifest="$(python3 -c "import json;print(json.load(open('manifest.json'))['version'])")"
+          echo "tag=$tag manifest=$manifest"
+          if [ "$tag" != "$manifest" ]; then
+            echo "extension/manifest.json version ($manifest) does not match tag ($tag)" >&2
+            exit 1
+          fi
+      - name: Build and lint bundles
+        run: bun run lint:firefox
+      - name: Submit to Chrome Web Store
+        if: github.event_name == 'push' || github.event.inputs.chrome == 'true'
+        env:
+          CWS_CLIENT_ID: ${{ secrets.CWS_CLIENT_ID }}
+          CWS_CLIENT_SECRET: ${{ secrets.CWS_CLIENT_SECRET }}
+          CWS_REFRESH_TOKEN: ${{ secrets.CWS_REFRESH_TOKEN }}
+          CWS_EXTENSION_ID: ${{ secrets.CWS_EXTENSION_ID }}
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event.inputs.chrome_publish }}" = "true" ]; then
+            bun run submit:chrome --publish
+          else
+            bun run submit:chrome
+          fi
+      - name: Submit to Firefox AMO
+        if: github.event_name == 'push' || github.event.inputs.firefox == 'true'
+        env:
+          WEB_EXT_API_KEY: ${{ secrets.WEB_EXT_API_KEY }}
+          WEB_EXT_API_SECRET: ${{ secrets.WEB_EXT_API_SECRET }}
+        run: bun run submit:firefox listed
+      - name: Upload store artifacts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: extension-store-artifacts
+          path: extension/web-ext-artifacts/
+          if-no-files-found: ignore
