@@ -331,9 +331,7 @@ func resolvedWork(result *epmcResult) work.Work {
 	if pmid, err := work.NormalizePMID(result.PMID); err == nil {
 		resolved.PMID = pmid
 	}
-	for _, name := range authorNames(result.AuthorString) {
-		resolved.Authors = append(resolved.Authors, name)
-	}
+	resolved.Authors = append(resolved.Authors, authorNames(result.AuthorString)...)
 	resolved.Year = publicationYear(result.PubYear)
 	return resolved
 }

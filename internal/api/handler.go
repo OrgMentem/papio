@@ -198,8 +198,12 @@ func ping(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([
 		}
 		result.UpdateAvailable = &available
 		checker := system.Updates
+		// The refresh must outlive this RPC: WithoutCancel keeps the request's
+		// values but detaches its cancellation so a returning ping cannot abort
+		// the once-daily check.
+		refreshCtx := context.WithoutCancel(ctx)
 		go func() {
-			_, _ = checker.Check(context.Background())
+			_, _ = checker.Check(refreshCtx)
 		}()
 		zotioAvailable := false
 		if info, installed := update.NewZotio(system.Config.DataDir).CachedState(); info != nil {
