@@ -109,8 +109,14 @@ scoops:
     license: MIT
 # Windows: WinGet manifests, PR'd from a fork into microsoft/winget-pkgs.
 winget:
-  - # First new-package PR opens with v0.5.0; after it merges, each release's
-    # version bump rides moderators' fast path.
+  - # Paused again after v0.5.0 opened the first new-package PR
+    # (microsoft/winget-pkgs#404562, pending moderation). A second release
+    # before that merges would open a duplicate new-package PR — WinGet's
+    # bot flags concurrent submissions of an unmerged package, which reads
+    # badly for a first-time publisher. Re-enable (delete this skip_upload
+    # line) once #404562 merges; every release after that rides the fast
+    # version-bump path with no PR-collision risk.
+    skip_upload: true
     name: papio
     publisher: OrgMentem
     license: MIT

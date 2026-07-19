@@ -128,8 +128,12 @@ migration plan before merging; do not tag first and design compatibility later.
 - [ ] Check the Homebrew formula **and** Scoop bucket updated. A `401` there means
       the tap/bucket PAT secrets are missing/expired — the release binaries are
       fine; fix the secrets and re-run.
-- [ ] Note the WinGet PR; its `skip_upload` setting may mean no PR is created
-      until that temporary setting is removed.
+- [ ] WinGet: check `.goreleaser.yaml`'s `skip_upload` before tagging, not after.
+      It is currently `true` — paused until the first-package PR
+      (microsoft/winget-pkgs#404562) merges, so a release cut while it's
+      pending doesn't open a duplicate new-package PR. Once #404562 merges,
+      delete the `skip_upload` line so subsequent releases ride the normal
+      version-bump path.
 - [ ] Validate the tagged papio artifacts before announcing them.
 
 ## Extension store submission
