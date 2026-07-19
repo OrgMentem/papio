@@ -17,10 +17,10 @@ func newBatchCommand(opt *options) *cobra.Command {
 	command := &cobra.Command{Use: "batch", Short: "Inspect persisted acquisition batches"}
 	var markdown bool
 	report := &cobra.Command{
-		Use:   "report <batch-id|latest>",
-		Short: "Join a batch manifest with live acquisition outcomes",
+		Use:         "report <batch-id|latest>",
+		Short:       "Join a batch manifest with live acquisition outcomes",
 		Annotations: map[string]string{"mcp:read-only": "true"},
-		Args:  cobra.ExactArgs(1),
+		Args:        cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if markdown && opt.jsonOutput {
 				return fmt.Errorf("--markdown cannot be combined with --json")

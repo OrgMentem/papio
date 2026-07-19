@@ -13,8 +13,8 @@ import (
 	"testing"
 	"time"
 
-	mcplib "github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/client"
+	mcplib "github.com/mark3labs/mcp-go/mcp"
 	"github.com/spf13/cobra"
 
 	"papio/internal/api"

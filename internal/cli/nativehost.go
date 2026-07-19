@@ -93,8 +93,8 @@ func resolveFirefoxManifestDir(override string) (string, error) {
 
 func newNativeHostCommand(opt *options) *cobra.Command {
 	command := &cobra.Command{
-		Use:   "native-host",
-		Short: "Manage browser native-messaging host registration",
+		Use:         "native-host",
+		Short:       "Manage browser native-messaging host registration",
 		Annotations: map[string]string{"mcp:hidden": "true"},
 	}
 	var manifestDir, firefoxManifestDir string

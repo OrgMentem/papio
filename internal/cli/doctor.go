@@ -70,10 +70,10 @@ func newDoctorCommand(opt *options) *cobra.Command {
 
 func newDoctorCommandWithDependencies(opt *options, deps doctor.IntegrationDependencies, readiness doctorReadinessRunner) *cobra.Command {
 	return &cobra.Command{
-		Use:   "doctor",
-		Short: "Check acquisition readiness and local integrations",
+		Use:         "doctor",
+		Short:       "Check acquisition readiness and local integrations",
 		Annotations: map[string]string{"mcp:read-only": "true"},
-		Args:  cobra.NoArgs,
+		Args:        cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			report := runDoctor(cmd.Context(), deps, readiness)
 			if opt.jsonOutput {

@@ -15,10 +15,10 @@ func newZotioCommand(opt *options) *cobra.Command {
 		Short: "Preview and apply Zotero integration through zotio",
 	}
 	preflight := &cobra.Command{
-		Use:   "preflight",
-		Short: "Verify the configured zotio version and capabilities",
+		Use:         "preflight",
+		Short:       "Verify the configured zotio version and capabilities",
 		Annotations: map[string]string{"mcp:read-only": "true"},
-		Args:  cobra.NoArgs,
+		Args:        cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			var result zotio.PreflightResult
 			if err := opt.call(cmd.Context(), "zotio.preflight", struct{}{}, &result); err != nil {

@@ -225,10 +225,10 @@ func (o *options) printResult(value any, prose string, args ...any) error {
 
 func newVersionCommand(opt *options) *cobra.Command {
 	return &cobra.Command{
-		Use:   "version",
-		Short: "Print version information",
+		Use:         "version",
+		Short:       "Print version information",
 		Annotations: map[string]string{"mcp:read-only": "true"},
-		Args:  cobra.NoArgs,
+		Args:        cobra.NoArgs,
 		RunE: func(*cobra.Command, []string) error {
 			return opt.printResult(map[string]string{"version": api.Version}, "papio %s", api.Version)
 		},

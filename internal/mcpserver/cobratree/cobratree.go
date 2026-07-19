@@ -86,11 +86,11 @@ type commandSummary struct {
 }
 
 type commandDetail struct {
-	Name      string        `json:"name"`
-	Summary   string        `json:"summary"`
-	ReadOnly  bool          `json:"read_only"`
-	TakesArgs bool          `json:"takes_args"`
-	Flags     []flagDetail  `json:"flags"`
+	Name      string       `json:"name"`
+	Summary   string       `json:"summary"`
+	ReadOnly  bool         `json:"read_only"`
+	TakesArgs bool         `json:"takes_args"`
+	Flags     []flagDetail `json:"flags"`
 }
 
 type flagDetail struct {

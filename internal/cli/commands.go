@@ -26,10 +26,10 @@ func newJobsCommand(opt *options) *cobra.Command {
 	var state string
 	var limit int
 	list := &cobra.Command{
-		Use:   "list",
-		Short: "List jobs",
+		Use:         "list",
+		Short:       "List jobs",
 		Annotations: map[string]string{"mcp:read-only": "true"},
-		Args:  cobra.NoArgs,
+		Args:        cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			var rows []job.Row
 			if err := opt.call(cmd.Context(), "jobs.list", map[string]any{"state": state, "limit": limit}, &rows); err != nil {
@@ -51,10 +51,10 @@ func newJobsCommand(opt *options) *cobra.Command {
 
 	var wait bool
 	get := &cobra.Command{
-		Use:   "get <job-id>",
-		Short: "Show one job with events and actions",
+		Use:         "get <job-id>",
+		Short:       "Show one job with events and actions",
 		Annotations: map[string]string{"mcp:read-only": "true"},
-		Args:  cobra.ExactArgs(1),
+		Args:        cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			var detail *api.JobDetail
 			if wait {
@@ -118,10 +118,10 @@ func newActionsCommand(opt *options) *cobra.Command {
 	command := &cobra.Command{Use: "actions", Short: "Inspect required human actions"}
 	var all bool
 	list := &cobra.Command{
-		Use:   "list",
-		Short: "List open human actions",
+		Use:         "list",
+		Short:       "List open human actions",
 		Annotations: map[string]string{"mcp:read-only": "true"},
-		Args:  cobra.NoArgs,
+		Args:        cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			openOnly := !all
 			var actions []job.HumanAction
@@ -299,10 +299,10 @@ func newArtifactsCommand(opt *options) *cobra.Command {
 	command := &cobra.Command{Use: "artifacts", Short: "Inspect validated immutable artifacts"}
 	var sha bool
 	get := &cobra.Command{
-		Use:   "get <job-id-or-sha256>",
-		Short: "Show a validated artifact",
+		Use:         "get <job-id-or-sha256>",
+		Short:       "Show a validated artifact",
 		Annotations: map[string]string{"mcp:read-only": "true"},
-		Args:  cobra.ExactArgs(1),
+		Args:        cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			params := map[string]string{"job_id": args[0]}
 			if sha {

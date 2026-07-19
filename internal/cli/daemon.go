@@ -19,10 +19,10 @@ import (
 func newDaemonCommand(opt *options) *cobra.Command {
 	var socket string
 	command := &cobra.Command{
-		Use:   "daemon",
-		Short: "Run or control the local acquisition daemon",
+		Use:         "daemon",
+		Short:       "Run or control the local acquisition daemon",
 		Annotations: map[string]string{"mcp:hidden": "true"},
-		Args:  cobra.NoArgs,
+		Args:        cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) (runErr error) {
 			cfg, err := opt.loadConfig()
 			if err != nil {
