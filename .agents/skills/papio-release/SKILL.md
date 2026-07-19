@@ -115,6 +115,21 @@ signs + submits the listed version to AMO (`--upload-source-code` is required �
 the bundle is bun-processed). Local equivalents: `cd extension && bun run
 submit:chrome [--publish]` / `bun run submit:firefox listed`.
 
+### The `store-submit` environment
+
+Required-reviewer gate on the submission job. Config that bit us this session:
+- **Deployment ref rules must allow both `ext-v*` (tag) AND `main` (branch).** The
+  tag rule alone blocks manual `workflow_dispatch` runs (they execute on `main`),
+  which then fail *instantly with zero steps* — the deploy ref is rejected before
+  the job starts, which looks baffling until you check the environment rules.
+- Keep **"Prevent self-review" OFF** for a solo maintainer, or you can never
+  approve your own run.
+- **No environment secrets needed** — the org/repo secrets are visible to the
+  gated job.
+- Approve in the Actions UI, or: `gh api
+  repos/OWNER/REPO/actions/runs/<id>/pending_deployments -F
+  'environment_ids[]=<id>' -f state=approved`.
+
 ### One-time setup (per store — cannot be automated)
 
 - **CWS item** must be created by hand once (the API cannot create the initial
@@ -125,8 +140,11 @@ submit:chrome [--publish]` / `bun run submit:firefox listed`.
   the refresh token expires after 7 days) → OAuth client of type **Desktop app**
   (NOT "Chrome extension" — that type is for in-page OAuth and cannot do this
   flow) → `npx chrome-webstore-upload-keys` mints `CWS_REFRESH_TOKEN`.
-- **AMO**: `WEB_EXT_API_KEY`/`WEB_EXT_API_SECRET` from the AMO API-key page; the
-  first `submit:firefox listed` creates the listing.
+- **AMO**: `WEB_EXT_API_KEY`/`WEB_EXT_API_SECRET` from the AMO API-key page — these
+  are **account-wide** (reused across sibling repos, e.g. from Tabloupe). AMO needs
+  no manual item creation: `submit:firefox listed` matches the add-on by its Gecko
+  id (`papio@orgmentem.com`) and updates the existing listing (or creates it on the
+  first listed submission). Contrast CWS, whose first item must be made by hand.
 - **Trader/non-trader (EU DSA)**: *papio* declares **Non-trader** — free,
   off-profession OSS, which avoids the trader-only public name+address
   verification. One-time dashboard step; revisit only if the extension is
@@ -137,6 +155,11 @@ submit:chrome [--publish]` / `bun run submit:firefox listed`.
 Shared OAuth creds are **org** secrets scoped to selected repos: `CWS_CLIENT_ID`,
 `CWS_CLIENT_SECRET`, `CWS_REFRESH_TOKEN`, `WEB_EXT_API_KEY`, `WEB_EXT_API_SECRET`.
 The per-extension `CWS_EXTENSION_ID` is a repo/environment secret — never org-wide.
+
+Set them without leaking values: `gh secret set NAME --org OrgMentem --visibility
+selected --repos papio` uses a hidden prompt — never pass `--body` (shell history).
+Reuse account-wide creds (`WEB_EXT_*`, the CWS OAuth trio) by adding repos to
+`--repos`; keep `CWS_EXTENSION_ID` per-repo.
 
 ### Screenshots
 
@@ -175,3 +198,11 @@ new package replaces only the code.
 - Store-installed extensions auto-update once approved; manually loaded
   (`about:debugging`/unpacked) builds need the new ZIP. The human performs final
   publication; never gate a daemon release on store approval.
+- **The extension version lives in TWO files** — `extension/manifest.json` **and**
+  `extension/package.json`. The compat preflight (`release_metadata.py compat`, run
+  in CI) fails the build if they differ, so bump **both** together. (`bun.lock`
+  doesn't pin the root version, so `--frozen-lockfile` is unaffected.)
+- **AMO version numbers are unique across channels.** "Version X already exists"
+  means it was uploaded before — even as an unlisted/self-distributed signed
+  build — so bump the version and resubmit. Cross-store version skew (e.g. CWS
+  0.3.0, AMO 0.3.1) is fine; the listings are independent.
