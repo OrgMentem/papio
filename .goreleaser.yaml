@@ -109,11 +109,8 @@ scoops:
     license: MIT
 # Windows: WinGet manifests, PR'd from a fork into microsoft/winget-pkgs.
 winget:
-  - # TEMPORARY (remove after the first winget merge): opening a new-package PR
-    # per release stacks parallel PRs on the moderators and slows the first
-    # merge. Once any version is merged, delete skip_upload — version bumps are
-    # the fast path.
-    skip_upload: true
+  - # First new-package PR opens with v0.5.0; after it merges, each release's
+    # version bump rides moderators' fast path.
     name: papio
     publisher: OrgMentem
     license: MIT
