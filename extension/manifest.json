@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "papio",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Fetch scholarly PDFs through your library in your own signed-in browser. You handle login and CAPTCHAs; papio downloads the paper.",
   "minimum_chrome_version": "120",
   "icons": {
