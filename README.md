@@ -33,15 +33,16 @@
 </p>
 
 <p align="center">
-  <a href="https://orgmentem.github.io/papio/"><strong>Home</strong></a>
-  &middot;
+  <strong>Docs:</strong>
   <a href="https://orgmentem.github.io/papio/guide/getting-started/"><strong>Get started</strong></a>
   &middot;
   <a href="https://orgmentem.github.io/papio/reference/commands/"><strong>Commands</strong></a>
   &middot;
   <a href="https://orgmentem.github.io/papio/reference/mcp-tools/"><strong>MCP tools</strong></a>
   &middot;
-  <a href="https://orgmentem.github.io/papio/"><strong>Documentation</strong></a>
+  <a href="https://orgmentem.github.io/papio/concepts/acquisition-pipeline/"><strong>How it works</strong></a>
+  &middot;
+  <a href="https://orgmentem.github.io/papio/guide/user-guide/"><strong>User guide</strong></a>
 </p>
 
 <p align="center">
