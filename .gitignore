@@ -12,7 +12,10 @@ node_modules/
 __pycache__/
 *.pyc
 .DS_Store
-.agents/
+.agents/*
+!.agents/skills/
+.agents/skills/*
+!.agents/skills/papio-release/
 # Go binaries built in the repo root (go build ./cmd/papio, ./cmd/docs-gen)
 /papio
 /docs-gen
