@@ -4,16 +4,19 @@
 hands finished PDFs to your Zotero library through `zotio` — which always shows
 you a preview before it writes anything.
 
-## 1. Prerequisites
+## 1. Install
 
-*papio* runs on macOS, Linux, and Windows. Install a released binary:
+*papio* has two parts: the **CLI & daemon** — it finds papers, validates each PDF, and files finished artifacts into Zotero through `zotio` — and a **browser extension** that hands off publisher-gated downloads from your logged-in browser. Install the CLI, load the extension, then wire them together with `papio init` ([step 2](#2-initialize-the-local-profile)).
+
+### The CLI & daemon
+
+*papio* runs on macOS, Linux, and Windows. For PDF validation it shells out to **Poppler** (`pdftotext`, for text-based identity checks) and, for scanned papers, **Tesseract** (OCR). Poppler is strongly recommended — without it papio can't read a PDF's text and flags candidates for manual review instead of auto-validating. Tesseract is optional: it only matters for image-only/scanned PDFs, and you can turn OCR off with `pdf.ocr_enabled = false`. Structural checks run inside the papio binary and need neither. Install the released binary plus these helpers:
 
 === "macOS"
 
-    **Homebrew** — `brew upgrade` tracks new releases:
-
     ```bash
-    brew install orgmentem/tap/papio
+    brew install orgmentem/tap/papio   # brew upgrade tracks new releases
+    brew install poppler tesseract     # PDF validation + OCR
     ```
 
 === "Linux"
@@ -24,26 +27,28 @@ you a preview before it writes anything.
     brew install orgmentem/tap/papio
     ```
 
-    **Distro packages** — every [GitHub release](https://github.com/OrgMentem/papio/releases) ships `.deb`, `.rpm`, and `.apk` for amd64/arm64. Download the file for your arch, then:
+    **Distro packages** — every [GitHub release](https://github.com/OrgMentem/papio/releases) ships `.deb`, `.rpm`, and `.apk` for amd64/arm64. Download the file for your arch, then install it alongside Poppler/Tesseract:
 
     ```bash
     # Debian / Ubuntu
     sudo dpkg -i papio_<version>_linux_amd64.deb
+    sudo apt install poppler-utils tesseract-ocr
 
     # Fedora / RHEL / openSUSE
     sudo rpm -i papio_<version>_linux_amd64.rpm
+    sudo dnf install poppler-utils tesseract
 
     # Alpine
     sudo apk add --allow-untrusted papio_<version>_linux_amd64.apk
+    sudo apk add poppler-utils tesseract-ocr
     ```
 
 === "Windows"
 
-    **Scoop** — `scoop update papio` tracks new releases:
-
     ```powershell
     scoop bucket add orgmentem https://github.com/OrgMentem/scoop-bucket
-    scoop install papio
+    scoop install papio               # scoop update papio tracks new releases
+    scoop install poppler tesseract   # PDF validation + OCR
     ```
 
     !!! note "WinGet is on the way"
@@ -57,24 +62,39 @@ you a preview before it writes anything.
     - **Linux:** `chmod +x papio`
     - **Windows:** unzip and add the folder to your `PATH`
 
+    Install Poppler (and Tesseract for OCR) from your OS package manager — see the macOS / Linux / Windows tabs above.
+
 === "From source"
 
     ```sh
     go build ./cmd/papio
     ```
 
-PDF validation and OCR use Poppler and Tesseract:
+    Requires Poppler (and Tesseract for OCR) on your `PATH` — see the macOS / Linux / Windows tabs above.
 
-| OS | Install |
-| --- | --- |
-| macOS | `brew install poppler tesseract` |
-| Debian/Ubuntu | `sudo apt install poppler-utils tesseract-ocr` |
-| Windows | `scoop install poppler tesseract` |
+Install `zotio` and put it on your `PATH` when you want *papio* to import finished PDFs into Zotero.
 
-Install a supported browser for the extension: any Chromium browser — Chrome,
-Edge, Vivaldi, Brave, Opera — or Firefox. Install `zotio` and
-make it available on `PATH` only when you want *papio* to import finished PDFs
-into Zotero.
+### The browser extension
+
+*papio* bundles a browser extension (in `extension/`) that runs in any Chromium browser — Chrome, Edge, Vivaldi, Brave, Opera — or Firefox. It reaches the daemon through a native-messaging connector that `papio init` installs, so load it now to get its ID, then hand that ID to `papio init` in the next step. (Installing the same package from the Chrome Web Store keeps one extension ID across every Chromium browser; if you also publish on the Edge Add-ons store — a different ID — or ship a differently keyed build, add those IDs to `browser.extension_ids`.)
+
+=== "Chrome / Chromium"
+
+    1. Open `chrome://extensions`.
+    2. Enable **Developer mode**, then choose **Load unpacked** and select `extension/`.
+    3. Open *papio*'s **Details** page and grant optional host permissions only for the publisher sites you use.
+    4. Note the extension ID shown on the card — you'll give it to `papio init`. If it later differs from the configured one, rerun `papio init --extension-id <id>`.
+
+=== "Firefox"
+
+    1. Open `about:debugging#/runtime/this-firefox` and choose **Load Temporary Add-on**.
+    2. Select `extension/firefox/manifest.json`.
+    3. On *papio*'s options page, grant the Library resolver access permission.
+
+    The built Firefox add-on uses the fixed ID `papio@orgmentem.com` by default; pass `--firefox-extension-id` to `papio init` only when the allowed add-on ID must differ.
+
+!!! note "Windows connector refresh"
+    On Windows the connector is registered under the current-user registry (`HKCU\Software\{Google\Chrome,Mozilla}\NativeMessagingHosts`) and runs from a copy of the `papio` binary — rerun `papio init` after upgrading *papio* so that copy is refreshed. On macOS and Linux the connector is a symlink and needs no refresh.
 
 ## 2. Initialize the local profile
 
@@ -128,47 +148,7 @@ These flags set the corresponding setup values:
 | `--non-interactive` | Do not prompt; retain existing values unless a flag overrides them. |
 | `--skip-browser` | Skip Chrome extension and connector setup. |
 
-## 3. Load the extension
-
-`papio init` (and `papio native-host install`) registers the connector with
-every Chromium browser it detects installed — Chrome, Edge, Vivaldi, Brave,
-Opera — plus Firefox, so the same extension works in any of them. It prints the
-exact browser setup steps after attempting native-host installation. Load the
-unpacked extension in the browser you use. Installing the same package from the
-Chrome Web Store keeps one extension ID across every Chromium browser; if you
-also publish on the Edge Add-ons store (a different ID) or ship a differently
-keyed build, add those IDs to `browser.extension_ids`.
-
-On Windows the connector is registered under the current-user registry
-(`HKCU\Software\{Google\Chrome,Mozilla}\NativeMessagingHosts`) and the host runs
-from a copy of the `papio` binary; rerun `papio init` after upgrading *papio* so
-that copy is refreshed. On macOS and Linux the connector is a symlink and needs
-no refresh.
-
-### Chrome
-
-1. Open `chrome://extensions`.
-2. Enable **Developer mode**, then choose **Load unpacked** and select
-   `extension/`.
-3. Open *papio*'s **Details** page and grant optional host permissions only for
-   publisher sites you use.
-4. If Chrome shows an ID different from the one configured during setup, rerun:
-
-   ```sh
-   papio init --extension-id <id>
-   ```
-
-### Firefox
-
-1. Open `about:debugging#/runtime/this-firefox` and choose **Load Temporary
-   Add-on**.
-2. Select `extension/firefox/manifest.json`.
-3. On *papio*'s options page, grant the Library resolver access permission.
-
-The built Firefox extension uses `papio@orgmentem.com` by default. Pass
-`--firefox-extension-id` only when the allowed add-on ID must differ.
-
-## 4. Check readiness
+## 3. Check readiness
 
 Run the health check after setup, especially after changing configuration:
 
@@ -179,7 +159,7 @@ papio doctor
 It checks papio itself plus the pieces it depends on: your configuration, the
 background service and browser extension, the connector, and zotio.
 
-## 5. Acquire a first paper
+## 4. Acquire a first paper
 
 Queue one DOI and wait for its job to settle:
 
