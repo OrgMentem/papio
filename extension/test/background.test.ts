@@ -302,7 +302,9 @@ function helloRequiredError(): unknown {
   };
 }
 
-function helloAck(payload: { daemon_version?: string; features?: string[] } = {}): unknown {
+function helloAck(
+  payload: { daemon_version?: string; features?: string[]; resolver_origins?: string[] } = {},
+): unknown {
   return {
     protocol: "papio-browser/1",
     type: "hello_ack",
@@ -353,6 +355,27 @@ test("hello acknowledgment persists daemon version, features, and connected stat
     daemonFeatures: ["browser-v1", "direct-download"],
     daemonUpdateHint: false,
   });
+  expect(h.action.texts.at(-1)).toBe("");
+});
+
+test("hello_ack caches resolver origins and badges ungranted ones while connected", async () => {
+  const h = makeHarness();
+  h.deps.permissions.contains = async () => false;
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ resolver_origins: ["https://onesearch.library.example.edu"] }));
+
+  expect(h.backend.store.resolverOrigins).toEqual(["https://onesearch.library.example.edu"]);
+  expect(h.action.texts.at(-1)).toBe("1");
+  expect(h.action.backgroundColors.at(-1)).toBe("#1a73e8");
+});
+
+test("a granted resolver origin leaves the connected badge clear", async () => {
+  const h = makeHarness();
+  h.deps.permissions.contains = async ({ origins }) =>
+    origins.length === 1 && origins[0] === "https://onesearch.library.example.edu/*";
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ resolver_origins: ["https://onesearch.library.example.edu"] }));
+
   expect(h.action.texts.at(-1)).toBe("");
 });
 

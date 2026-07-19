@@ -34,6 +34,9 @@ export interface HelloPayload {
 export interface HelloAckPayload {
   daemon_version?: string;
   features?: string[];
+  /** https origins of the daemon's configured OpenURL resolvers. The extension
+   * requests a host permission for each so it can steer that resolver's menu. */
+  resolver_origins?: string[];
 }
 
 
@@ -346,7 +349,7 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
       break;
     }
     case "hello_ack": {
-      requireKeys(p, "hello_ack", [], ["daemon_version", "features"]);
+      requireKeys(p, "hello_ack", [], ["daemon_version", "features", "resolver_origins"]);
       if ("daemon_version" in p) str(p, "daemon_version", "hello_ack", 50);
       if ("features" in p) {
         const features = p["features"];
@@ -357,6 +360,24 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
           if (typeof feature !== "string" || Array.from(feature).length === 0 || Array.from(feature).length > 64) {
             fail("hello_ack.features entries must be non-empty strings with at most 64 chars");
           }
+        }
+      }
+      if ("resolver_origins" in p) {
+        const origins = p["resolver_origins"];
+        if (!Array.isArray(origins) || origins.length > 32) {
+          fail("hello_ack.resolver_origins must be an array with at most 32 entries");
+        }
+        for (const origin of origins) {
+          let ok = typeof origin === "string" && origin.length <= 300 && origin.startsWith("https://");
+          if (ok) {
+            try {
+              const u = new URL(origin as string);
+              ok = u.protocol === "https:" && u.host !== "" && `${u.protocol}//${u.host}` === origin;
+            } catch {
+              ok = false;
+            }
+          }
+          if (!ok) fail("hello_ack.resolver_origins entries must be bounded https origins");
         }
       }
       break;

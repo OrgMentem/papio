@@ -179,6 +179,19 @@ func TestHelloAckAnnouncesDaemonVersion(t *testing.T) {
 	}
 }
 
+func TestHelloAckAdvertisesResolverOrigins(t *testing.T) {
+	b, _, _, _ := newBridge(t)
+	msgs, _ := runSync(t, b, hello())
+	ack := firstOfType(msgs, protocol.MsgHelloAck)
+	if ack == nil {
+		t.Fatalf("no hello_ack in %v", msgs)
+	}
+	origins := ack.Payload.(*protocol.HelloAckPayload).ResolverOrigins
+	if !slices.Equal(origins, []string{"https://openurl.example.edu"}) {
+		t.Fatalf("resolver_origins = %v, want [https://openurl.example.edu]", origins)
+	}
+}
+
 func TestSessionInfoAfterHello(t *testing.T) {
 	b, _, _, _ := newBridge(t)
 	runSync(t, b, inFrame(t, protocol.MsgHello, "", map[string]any{

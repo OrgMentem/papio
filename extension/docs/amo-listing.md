@@ -69,8 +69,9 @@ that manifest key is honored from Firefox 140, `web-ext lint` emits a benign
 | `scripting` | Required | Runs a small content routine on the provider page to locate the requested paper's download link (per-provider adapters). It reads only what is needed to find that one link. |
 | `storage` | Required | Stores extension settings and short-lived job/tab correlation state that must survive the MV3 event page being suspended. |
 | `alarms` | Required | Schedules reconnect backoff to the local daemon without keeping the event page awake continuously. |
-| `host_permissions`: `*.alma.exlibrisgroup.com`, `*.primo.exlibrisgroup.com`, `onesearch.library.example-institute.edu` | Required host access | The library discovery/resolver surfaces *papio* must read to route a job to the right licensed source. |
+| `host_permissions`: `*.alma.exlibrisgroup.com`, `*.primo.exlibrisgroup.com` | Required host access | The library discovery/resolver surfaces *papio* must read to route a job to the right licensed source. |
 | `optional_host_permissions`: jstor.org, proquest.com, ebsco, springer, sciencedirect, dl.acm.org, wiley, tandfonline, sagepub, psycnet.apa.org | Optional host access (runtime opt-in) | Publisher/provider sites where a licensed PDF may live. Firefox prompts for each domain only when a job actually needs it; none are granted at install. |
+| `optional_host_permissions`: `https://*/*` | Optional host access (runtime opt-in) | Some libraries run their OpenURL resolver on a custom domain (e.g. `onesearch.library.<uni>.edu.au`) outside the Ex Libris hosts above. This pattern is **never granted at install and never requested in bulk**: *papio* only ever calls `permissions.request` for the exact resolver origin the user configured in their local daemon (`[browser] openurl_base_url`), so the effective grant is that one host. It exists so any institution works without hard-coding its domain in the extension. |
 
 ## Reviewer notes and build instructions
 

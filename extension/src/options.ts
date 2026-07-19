@@ -29,7 +29,6 @@ const SOURCES: Source[] = [
 const LIBRARY_RESOLVERS: Source[] = [
   { label: "Ex Libris Alma", origin: "https://*.alma.exlibrisgroup.com/*" },
   { label: "Ex Libris Primo", origin: "https://*.primo.exlibrisgroup.com/*" },
-  { label: "Example Institute OneSearch", origin: "https://onesearch.library.example-institute.edu/*" },
 ];
 
 function render(list: HTMLUListElement, sources: Source[]): void {
@@ -217,6 +216,39 @@ async function renderDaemonFooter(): Promise<void> {
   }
 }
 
+// Match an origin against the static host_permissions wildcards so the
+// configured-resolver section lists only custom domains that still need a grant;
+// cloud Ex Libris resolvers are already covered by those wildcards.
+function coveredByManifest(origin: string): boolean {
+  let host: string;
+  try {
+    host = new URL(origin).host;
+  } catch {
+    return false;
+  }
+  return (chrome.runtime.getManifest().host_permissions ?? []).some((pattern: string) => {
+    const m = /^https:\/\/(\*\.)?([^/*]+)\/\*$/.exec(pattern);
+    if (!m) return false;
+    return m[1] ? host === m[2] || host.endsWith(`.${m[2]}`) : host === m[2];
+  });
+}
+
+// Render the user's configured resolver origins (from the daemon, via hello_ack)
+// that aren't already covered by a static wildcard. Each is grantable exactly
+// like a provider source, so institution identity stays in config, not code.
+async function renderConfiguredResolvers(): Promise<void> {
+  const list = document.getElementById("configured-resolvers");
+  if (!(list instanceof HTMLUListElement)) return;
+  const store: StoreShape = await chromeBackend(chrome.storage).load();
+  const custom = (store.resolverOrigins ?? []).filter((origin) => !coveredByManifest(origin));
+  const section = document.getElementById("configured-resolvers-section");
+  if (section instanceof HTMLElement) section.hidden = custom.length === 0;
+  render(
+    list,
+    custom.map((origin) => ({ label: origin.replace(/^https:\/\//, ""), origin: `${origin}/*` })),
+  );
+}
+
 const sourceList = document.getElementById("sources");
 if (sourceList instanceof HTMLUListElement) {
   render(sourceList, SOURCES);
@@ -226,6 +258,7 @@ const libraryResolverList = document.getElementById("library-resolvers");
 if (libraryResolverList instanceof HTMLUListElement) {
   render(libraryResolverList, LIBRARY_RESOLVERS);
 }
+void renderConfiguredResolvers();
 wireTermsConsent();
 void renderTermsConsent();
 wireWorkWindow();

@@ -8,6 +8,21 @@ records in `notes/acquisition-stack-plan.md`.
 
 ### Added
 
+- Automatic, institution-agnostic library-resolver access. When a library's
+  OpenURL resolver shows a "full text options" menu instead of direct-linking
+  to the provider, *papio* follows the institution's top-ranked electronic
+  service link itself — gated on a host permission for that resolver origin.
+  The daemon advertises its configured resolver origins in the `hello_ack`
+  handshake (new optional `resolver_origins`, backward compatible within
+  `papio-browser/1`); the extension requests exactly those origins, so the
+  popup surfaces a one-click "Allow library access" prompt (and the toolbar
+  badge counts them) whenever a configured resolver isn't granted yet, and the
+  options page lists the user's own resolvers under "Your library". Custom
+  resolver domains outside the built-in Ex Libris hosts are reached through an
+  optional `https://*/*` pattern that is never granted in bulk — only the exact
+  configured origin is ever requested. Institution identity lives only in
+  `config.toml`, never in extension code.
+
 - Update discovery, without auto-install and without silent network calls.
   Store-delivered extension builds are stamped with the daemon version they
   shipped with, so the popup can show a calm "papio X.Y is available" line

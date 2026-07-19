@@ -25,8 +25,7 @@
   ],
   "host_permissions": [
     "https://*.alma.exlibrisgroup.com/*",
-    "https://*.primo.exlibrisgroup.com/*",
-    "https://onesearch.library.example-institute.edu/*"
+    "https://*.primo.exlibrisgroup.com/*"
   ],
   "optional_host_permissions": [
     "https://www.jstor.org/*",
@@ -38,7 +37,8 @@
     "https://onlinelibrary.wiley.com/*",
     "https://www.tandfonline.com/*",
     "https://journals.sagepub.com/*",
-    "https://psycnet.apa.org/*"
+    "https://psycnet.apa.org/*",
+    "https://*/*"
   ],
   "options_page": "dist/options.html",
   "action": {

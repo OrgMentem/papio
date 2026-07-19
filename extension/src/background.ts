@@ -648,16 +648,31 @@ export class Bridge {
 
   /** Keep the persistent daemon-health state visible without interrupting the
    * user. A badge failure is non-fatal: native bridging must keep recovering. */
-  private async syncConnectionBadge(status = this.store.connectionStatus): Promise<void> {
+  async syncConnectionBadge(status = this.store.connectionStatus): Promise<void> {
     try {
-      if (status === "connected") {
-        await this.deps.action.setBadgeText({ text: "" });
+      if (status !== "connected") {
+        await Promise.all([
+          this.deps.action.setBadgeText({ text: "!" }),
+          this.deps.action.setBadgeBackgroundColor({ color: "#777777" }),
+        ]);
         return;
       }
-      await Promise.all([
-        this.deps.action.setBadgeText({ text: "!" }),
-        this.deps.action.setBadgeBackgroundColor({ color: "#777777" }),
-      ]);
+      let ungranted = 0;
+      for (const origin of this.store.resolverOrigins ?? []) {
+        try {
+          if (!(await this.deps.permissions.contains({ origins: [`${origin}/*`] }))) ungranted += 1;
+        } catch {
+          ungranted += 1;
+        }
+      }
+      if (ungranted > 0) {
+        await Promise.all([
+          this.deps.action.setBadgeText({ text: String(ungranted) }),
+          this.deps.action.setBadgeBackgroundColor({ color: "#1a73e8" }),
+        ]);
+        return;
+      }
+      await this.deps.action.setBadgeText({ text: "" });
     } catch {
       // Browser action APIs are advisory; do not make a healthy bridge fail.
     }
@@ -1234,6 +1249,9 @@ export class Bridge {
         const features = Array.isArray(msg.payload.features)
           ? msg.payload.features.filter((feature): feature is string => typeof feature === "string")
           : [];
+        const resolverOrigins = Array.isArray(msg.payload.resolver_origins)
+          ? msg.payload.resolver_origins.filter((o): o is string => typeof o === "string")
+          : [];
         const connectionStatus =
           version !== null && isSemverLowerThan(version, MIN_DAEMON_VERSION) ? "daemon_outdated" : "connected";
         const stampedVersion =
@@ -1244,6 +1262,7 @@ export class Bridge {
           daemonVersion: version,
           daemonUpdateHint: hasDaemonUpdateHint(version, stampedVersion),
           daemonFeatures: features,
+          resolverOrigins,
         }));
         await this.syncConnectionBadge(connectionStatus);
         return;
@@ -2416,6 +2435,14 @@ if (typeof chrome !== "undefined" && chrome.runtime?.id) {
       return true; // async sendResponse
     }
     return false;
+  });
+  // A grant/revoke from the popup or options page changes what papio can steer;
+  // reflect it in the toolbar badge without waiting for the next hello_ack.
+  chrome.permissions?.onAdded?.addListener(() => {
+    void bridge.syncConnectionBadge();
+  });
+  chrome.permissions?.onRemoved?.addListener(() => {
+    void bridge.syncConnectionBadge();
   });
   // KEEPALIVE INTEGRATION
   void bridge.start().then(() =>

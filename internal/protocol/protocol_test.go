@@ -115,6 +115,26 @@ func TestHelloAckPayloadRoundTripAndBounds(t *testing.T) {
 	if _, err := DecodeBrowserMessage(frame(map[string]any{"features": []any{nil}})); err == nil {
 		t.Fatal("hello_ack accepted null feature entry")
 	}
+	acked, err := DecodeBrowserMessage(frame(HelloAckPayload{
+		ResolverOrigins: []string{"https://onesearch.library.example.edu", "https://example.primo.exlibrisgroup.com"},
+	}))
+	if err != nil {
+		t.Fatalf("decode resolver_origins: %v", err)
+	}
+	if got := acked.Payload.(*HelloAckPayload).ResolverOrigins; len(got) != 2 || got[0] != "https://onesearch.library.example.edu" {
+		t.Fatalf("resolver_origins round-trip = %#v", got)
+	}
+	if _, err := DecodeBrowserMessage(frame(map[string]any{"resolver_origins": make([]string, 33)})); err == nil {
+		t.Fatal("hello_ack accepted more than 32 resolver_origins")
+	}
+	if _, err := DecodeBrowserMessage(frame(map[string]any{"resolver_origins": []any{nil}})); err == nil {
+		t.Fatal("hello_ack accepted null resolver_origin entry")
+	}
+	for _, bad := range []string{"http://insecure.example.edu", "https://example.edu/path", "https://example.edu?x=1", "ftp://example.edu"} {
+		if _, err := DecodeBrowserMessage(frame(map[string]any{"resolver_origins": []string{bad}})); err == nil {
+			t.Fatalf("hello_ack accepted invalid resolver origin %q", bad)
+		}
+	}
 }
 
 // The IdP privacy invariant is structural: auth payloads cannot carry a URL.
@@ -148,7 +168,7 @@ func TestJobOfferLoginEntityIDValidation(t *testing.T) {
 func TestJobOfferProquestAccountIDValidation(t *testing.T) {
 	const withoutAccountID = `{"protocol":"papio-browser/1","type":"job_offer","msg_id":"offer-msg-1","job_id":"job_offer_1","seq":1,"payload":{"openurl":"https://resolver.example.edu/openurl","provider_hosts":["example.edu"],"access_mode":"maximal","expires_at":"2026-07-17T12:00:00Z"}}`
 	const withAccountID = `{"protocol":"papio-browser/1","type":"job_offer","msg_id":"offer-msg-2","job_id":"job_offer_2","seq":2,"payload":{"openurl":"https://resolver.example.edu/openurl","provider_hosts":["example.edu"],"access_mode":"maximal","proquest_account_id":"12345","expires_at":"2026-07-17T12:00:00Z"}}`
-	const nonDigits = `{"protocol":"papio-browser/1","type":"job_offer","msg_id":"offer-msg-3","job_id":"job_offer_3","seq":3,"payload":{"openurl":"https://resolver.example.edu/openurl","provider_hosts":["example.edu"],"access_mode":"maximal","proquest_account_id":"17227x","expires_at":"2026-07-17T12:00:00Z"}}`
+	const nonDigits = `{"protocol":"papio-browser/1","type":"job_offer","msg_id":"offer-msg-3","job_id":"job_offer_3","seq":3,"payload":{"openurl":"https://resolver.example.edu/openurl","provider_hosts":["example.edu"],"access_mode":"maximal","proquest_account_id":"12345x","expires_at":"2026-07-17T12:00:00Z"}}`
 
 	msg, err := DecodeBrowserMessage([]byte(withAccountID))
 	if err != nil {

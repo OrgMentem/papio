@@ -5,7 +5,7 @@ import { readFileSync } from "node:fs";
 
 import { Window } from "happy-dom";
 
-import { cancelJob, focusJob, renderDaemonStatus, renderJobs, wireSettings, type PopupActions } from "../src/popup";
+import { cancelJob, focusJob, renderDaemonStatus, renderJobs, renderResolverGrants, wireSettings, type PopupActions } from "../src/popup";
 import type { ActiveJob } from "../src/state";
 
 function popupDocument(): Document {
@@ -13,6 +13,8 @@ function popupDocument(): Document {
   window.document.write(readFileSync(new URL("../src/popup.html", import.meta.url), "utf8"));
   Object.assign(globalThis, {
     document: window.document,
+    Event: window.Event,
+    HTMLElement: window.HTMLElement,
     HTMLButtonElement: window.HTMLButtonElement,
     HTMLSelectElement: window.HTMLSelectElement,
     HTMLUListElement: window.HTMLUListElement,
@@ -194,4 +196,28 @@ test("settings cog opens the options page and closes the popup", () => {
   button.click();
   expect(opened).toBe(1);
   expect(closed).toBe(1);
+});
+
+test("renders a one-click library grant for ungranted resolvers", () => {
+  const doc = popupDocument();
+  const grants: string[][] = [];
+  renderResolverGrants(doc, ["https://onesearch.library.example.edu"], (origins) => grants.push(origins));
+
+  const section = doc.getElementById("resolver-grant");
+  expect(section?.hidden).toBe(false);
+  expect(section?.textContent).toContain("onesearch.library.example.edu");
+  const button = section?.querySelector("button") as HTMLButtonElement | null;
+  expect(button?.textContent).toBe("Allow library access");
+
+  button?.click();
+  expect(grants).toEqual([["https://onesearch.library.example.edu"]]);
+  expect(button?.disabled).toBe(true);
+});
+
+test("hides the library grant prompt when every resolver is granted", () => {
+  const doc = popupDocument();
+  renderResolverGrants(doc, [], () => {});
+  const section = doc.getElementById("resolver-grant");
+  expect(section?.hidden).toBe(true);
+  expect(section?.children.length).toBe(0);
 });

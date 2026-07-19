@@ -68,6 +68,11 @@
                 "type": "array",
                 "maxItems": 32,
                 "items": { "type": "string", "minLength": 1, "maxLength": 64 }
+              },
+              "resolver_origins": {
+                "type": "array",
+                "maxItems": 32,
+                "items": { "type": "string", "maxLength": 300, "pattern": "^https://[a-z0-9.-]{3,253}(:[0-9]{1,5})?$" }
               }
             }
           }

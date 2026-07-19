@@ -140,8 +140,9 @@ func (b *Bridge) handle(ctx context.Context, msg *protocol.BrowserMessage) ([]js
 			return b.extensionOutdatedError()
 		}
 		ack, err := b.frame(protocol.MsgHelloAck, "", protocol.HelloAckPayload{
-			DaemonVersion: b.Version,
-			Features:      b.Features,
+			DaemonVersion:   b.Version,
+			Features:        b.Features,
+			ResolverOrigins: b.cfg.ResolverOrigins(),
 		})
 		if err != nil {
 			return nil, err

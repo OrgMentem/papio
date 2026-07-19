@@ -425,6 +425,10 @@ type HelloPayload struct {
 type HelloAckPayload struct {
 	DaemonVersion string   `json:"daemon_version,omitempty"`
 	Features      []string `json:"features,omitempty"`
+	// ResolverOrigins are the https origins of the daemon's configured OpenURL
+	// resolvers. The extension requests a host permission for each so it can
+	// steer that resolver's menu; institution identity stays in config, not code.
+	ResolverOrigins []string `json:"resolver_origins,omitempty"`
 }
 
 // JobOfferPayload asks the extension to open one OpenURL-resolved job.
@@ -576,10 +580,14 @@ func DecodeBrowserMessage(data []byte) (*BrowserMessage, error) {
 		msg.Payload = p
 	case MsgHelloAck:
 		p := &HelloAckPayload{}
-		err = browserRejectNullFields(payloadFields, "daemon_version", "features")
+		err = browserRejectNullFields(payloadFields, "daemon_version", "features", "resolver_origins")
 		var features []json.RawMessage
 		if raw, ok := payloadFields["features"]; ok && err == nil {
 			err = strictDecode(raw, &features)
+		}
+		var origins []json.RawMessage
+		if raw, ok := payloadFields["resolver_origins"]; ok && err == nil {
+			err = strictDecode(raw, &origins)
 		}
 		if err == nil {
 			err = strictDecode(env.Payload, p)
@@ -593,6 +601,14 @@ func DecodeBrowserMessage(data []byte) (*BrowserMessage, error) {
 			}
 			if string(feature) == "null" {
 				err = fmt.Errorf("hello_ack.features entries cannot be null")
+			}
+		}
+		for _, origin := range origins {
+			if err != nil {
+				break
+			}
+			if string(origin) == "null" {
+				err = fmt.Errorf("hello_ack.resolver_origins entries cannot be null")
 			}
 		}
 		msg.Payload = p
@@ -737,7 +753,26 @@ func (p *HelloAckPayload) validate() error {
 			return fmt.Errorf("hello_ack.features entries must be non-empty (max 64)")
 		}
 	}
+	if len(p.ResolverOrigins) > 32 {
+		return fmt.Errorf("hello_ack.resolver_origins capped at 32")
+	}
+	for _, origin := range p.ResolverOrigins {
+		if !validResolverOrigin(origin) {
+			return fmt.Errorf("hello_ack.resolver_origins entries must be bounded https origins")
+		}
+	}
 	return nil
+}
+
+// validResolverOrigin reports whether s is a bounded https origin
+// (scheme://host[:port]) with no path, query, or fragment. The extension
+// re-validates with URL() before requesting a host permission for it.
+func validResolverOrigin(s string) bool {
+	if browserTextLen(s) > 300 || !strings.HasPrefix(s, "https://") {
+		return false
+	}
+	host := s[len("https://"):]
+	return host != "" && !strings.ContainsAny(host, "/?#")
 }
 
 func (p *ProviderOutcomePayload) validate() error {

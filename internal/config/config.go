@@ -398,6 +398,38 @@ func (c *Config) ResolverNames() []string {
 	return names
 }
 
+// ResolverOrigins returns the distinct https origins of every configured OpenURL
+// resolver base (default plus each named profile), sorted. The extension needs a
+// host permission on a resolver origin to steer its "full text options" menu; it
+// requests exactly these origins and drops any already covered by a static
+// host_permission. Institution identity therefore lives only in the user's
+// config, never in extension code.
+func (c *Config) ResolverOrigins() []string {
+	seen := make(map[string]struct{})
+	origins := make([]string, 0, len(c.Browser.Resolvers)+1)
+	add := func(base string) {
+		if base == "" {
+			return
+		}
+		u, err := url.Parse(base)
+		if err != nil || u.Scheme != "https" || u.Host == "" {
+			return
+		}
+		origin := u.Scheme + "://" + u.Host
+		if _, dup := seen[origin]; dup {
+			return
+		}
+		seen[origin] = struct{}{}
+		origins = append(origins, origin)
+	}
+	add(c.Browser.OpenURLBase)
+	for _, inst := range c.Browser.Resolvers {
+		add(inst.OpenURLBase)
+	}
+	slices.Sort(origins)
+	return origins
+}
+
 // Save validates and atomically writes cfg as a user-only TOML file. An empty
 // path uses the default config location. API keys may be present, so neither
 // temporary nor final files are group/world-readable.

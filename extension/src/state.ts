@@ -82,7 +82,11 @@ export interface StoreShape {
   /** True when this build shipped with a newer daemon than the one connected. */
   daemonUpdateHint?: boolean;
   daemonFeatures?: string[];
-
+  /** https origins of the daemon's configured OpenURL resolvers, from hello_ack.
+   * The popup and options page request a host permission for each so papio can
+   * steer that resolver's menu. Not sensitive: these are the user's own library
+   * discovery hosts, the same origins already carried in every job offer. */
+  resolverOrigins?: string[];
 }
 
 /** Async key/value seam. The real implementation wraps chrome.storage; tests

@@ -170,7 +170,7 @@ func TestSaveValidatesProquestAccountID(t *testing.T) {
 		t.Fatalf("valid ProQuest account ID rejected: %v", err)
 	}
 
-	for _, accountID := range []string{"17227x", strings.Repeat("1", 65)} {
+	for _, accountID := range []string{"12345x", strings.Repeat("1", 65)} {
 		t.Run(accountID, func(t *testing.T) {
 			cfg := Default()
 			cfg.AccessMode = ModeConservative
@@ -344,7 +344,7 @@ func TestBrowserResolverStringShorthandLoads(t *testing.T) {
 	// The pre-1.0 shorthand `name = "https://…"` must keep loading as a
 	// base-only institution so existing configs need no migration.
 	path := filepath.Join(t.TempDir(), "config.toml")
-	data := []byte("access_mode = \"conservative\"\n[browser.resolvers]\nune = 'https://example.alma.exlibrisgroup.com/view/uresolver/61EXL_INST/openurl?svc_dat=viewit'\n")
+	data := []byte("access_mode = \"conservative\"\n[browser.resolvers]\nexample = 'https://example.alma.exlibrisgroup.com/view/uresolver/61EXL_INST/openurl?svc_dat=viewit'\n")
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -358,5 +358,26 @@ func TestBrowserResolverStringShorthandLoads(t *testing.T) {
 	}
 	if inst.ShibbolethEntityID != "" || inst.ProquestAccountID != "" {
 		t.Fatalf("shorthand should leave login identity empty: %+v", inst)
+	}
+}
+
+func TestResolverOrigins(t *testing.T) {
+	cfg := Config{Browser: Browser{
+		OpenURLBase: "https://example.primo.exlibrisgroup.com/nde/openurl?vid=61EXL_INST:61EXL_NDE",
+		Resolvers: map[string]Institution{
+			"institute": {OpenURLBase: "https://onesearch.library.example-institute.edu/discovery/openurl?vid=61INS_INST:INS"},
+			"dupe":      {OpenURLBase: "https://example.primo.exlibrisgroup.com/other/openurl"},
+			"blank":     {OpenURLBase: ""},
+		},
+	}}
+	got := cfg.ResolverOrigins()
+	want := []string{"https://example.primo.exlibrisgroup.com", "https://onesearch.library.example-institute.edu"}
+	if len(got) != len(want) {
+		t.Fatalf("ResolverOrigins() = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("ResolverOrigins()[%d] = %q, want %q (all=%v)", i, got[i], want[i], got)
+		}
 	}
 }

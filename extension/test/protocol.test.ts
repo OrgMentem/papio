@@ -53,6 +53,18 @@ test("hello_ack accepts optional daemon details and rejects invalid members", ()
   });
   expect(() => parseBrowserMessage(frame({ features: [null] }))).toThrow(ProtocolError);
   expect(() => parseBrowserMessage(frame({ daemon_version: "v".repeat(51) }))).toThrow(ProtocolError);
+  expect(
+    parseBrowserMessage(frame({ resolver_origins: ["https://onesearch.library.example.edu"] })).payload,
+  ).toEqual({ resolver_origins: ["https://onesearch.library.example.edu"] });
+  expect(() => parseBrowserMessage(frame({ resolver_origins: [null] }))).toThrow(ProtocolError);
+  for (const bad of [
+    "http://insecure.example.edu",
+    "https://example.edu/path",
+    "https://example.edu?x=1",
+    "ftp://example.edu",
+  ]) {
+    expect(() => parseBrowserMessage(frame({ resolver_origins: [bad] }))).toThrow(ProtocolError);
+  }
 });
 test("auth payloads structurally reject URLs", () => {
   expect(() =>

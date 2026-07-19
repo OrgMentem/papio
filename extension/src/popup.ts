@@ -295,6 +295,38 @@ export function renderTermsConsent(
   }
 }
 
+/**
+ * Surface a one-click grant for library resolvers papio cannot yet steer. The
+ * origins come from the daemon's config (via hello_ack), so the user never needs
+ * to know or type a URL. `onAllow` must reach chrome.permissions.request inside
+ * the button's click gesture, so the ungranted set is computed by the caller.
+ */
+export function renderResolverGrants(
+  doc: Document,
+  ungrantedOrigins: string[],
+  onAllow: (origins: string[]) => void,
+): void {
+  const container = doc.getElementById("resolver-grant");
+  if (!(container instanceof HTMLElement)) return;
+  container.replaceChildren();
+  container.hidden = ungrantedOrigins.length === 0;
+  if (ungrantedOrigins.length === 0) return;
+
+  const hosts = ungrantedOrigins.map((origin) => origin.replace(/^https:\/\//, "")).join(", ");
+  const heading = doc.createElement("h2");
+  heading.textContent = "Library access";
+  const lede = doc.createElement("p");
+  lede.textContent = `Allow papio to use your library resolver so it can finish downloads without a manual click: ${hosts}`;
+  const button = doc.createElement("button");
+  button.type = "button";
+  button.textContent = "Allow library access";
+  button.addEventListener("click", () => {
+    button.disabled = true;
+    onAllow(ungrantedOrigins);
+  });
+  container.append(heading, lede, button);
+}
+
 export async function refresh(): Promise<void> {
   const store = await chromeBackend(chrome.storage).load();
   renderDaemonStatus(document, store);
@@ -311,6 +343,17 @@ export async function refresh(): Promise<void> {
   }
   renderTermsConsent(document, store.activeJobs, consent, (value) => {
     void sendTermsConsent(value).then(() => refresh());
+  });
+  const ungranted: string[] = [];
+  for (const origin of store.resolverOrigins ?? []) {
+    try {
+      if (!(await chrome.permissions.contains({ origins: [`${origin}/*`] }))) ungranted.push(origin);
+    } catch {
+      ungranted.push(origin);
+    }
+  }
+  renderResolverGrants(document, ungranted, (toGrant) => {
+    void chrome.permissions.request({ origins: toGrant.map((origin) => `${origin}/*`) }).then(() => refresh());
   });
 }
 
