@@ -657,6 +657,7 @@ func (js *Store) RecoverStale(ctx context.Context) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	defer func() { _ = rows.Close() }()
 	type stale struct{ id, state string }
 	var found []stale
 	for rows.Next() {
@@ -736,6 +737,7 @@ func (js *Store) SweepTerminalQuarantine(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	defer func() { _ = rows.Close() }()
 	var ids []string
 	for rows.Next() {
 		var id string
@@ -786,6 +788,7 @@ func (js *Store) Get(ctx context.Context, jobID string) (*Row, error) {
 	if err != nil {
 		return nil, err
 	}
+	defer func() { _ = ids.Close() }()
 	for ids.Next() {
 		var kind, value string
 		if err := ids.Scan(&kind, &value); err != nil {
@@ -847,6 +850,7 @@ func (js *Store) List(ctx context.Context, state string, limit int) ([]Row, erro
 	if err != nil {
 		return nil, err
 	}
+	defer func() { _ = rows.Close() }()
 	var out []Row
 	var idList []string
 	for rows.Next() {
@@ -1255,6 +1259,7 @@ func (js *Store) ListHumanActions(ctx context.Context, openOnly bool) ([]HumanAc
 	if err != nil {
 		return nil, err
 	}
+	defer func() { _ = rows.Close() }()
 	var out []HumanAction
 	for rows.Next() {
 		var h HumanAction
@@ -1298,6 +1303,7 @@ func (js *Store) Events(ctx context.Context, jobID string) ([]map[string]any, er
 	if err != nil {
 		return nil, err
 	}
+	defer func() { _ = rows.Close() }()
 	var out []map[string]any
 	for rows.Next() {
 		var seq int64

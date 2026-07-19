@@ -81,6 +81,10 @@ func Validate(ctx context.Context, in ValidationInput, opt ValidationOptions) (V
 
 // ValidateBytes is a convenient name for callers emphasizing the parent-side
 // byte gate. It rejects a nil WorkerBinary rather than ever parsing locally.
+// A filesystem in.Path is required: Body only satisfies the in-memory payload
+// gate, while structural validation and text extraction always read in.Path
+// from disk. Passing Body without Path fails once validation reaches those
+// stages.
 func ValidateBytes(ctx context.Context, in ValidationInput, opt ValidationOptions) (ValidationReport, error) {
 	if in.WorkerBinary == "" {
 		return ValidationReport{}, errors.New("pdf worker binary is required")

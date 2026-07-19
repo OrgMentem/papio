@@ -294,6 +294,7 @@ func artifactsResource(ctx context.Context, system *bootstrap.System) (any, erro
 	if err != nil {
 		return nil, err
 	}
+	defer func() { _ = rows.Close() }()
 	var hashes []string
 	for rows.Next() {
 		var sha string
@@ -344,6 +345,7 @@ func exportsResource(ctx context.Context, system *bootstrap.System, kind string)
 	if err != nil {
 		return nil, err
 	}
+	defer func() { _ = rows.Close() }()
 	var records []exportRecord
 	for rows.Next() {
 		var record exportRecord
