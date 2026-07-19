@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -264,6 +265,81 @@ func TestRouterPingReturnsCachedUpdateBeforeRefresh(t *testing.T) {
 	case <-refreshStarted:
 	case <-time.After(time.Second):
 		t.Fatal("ping did not trigger an update refresh")
+	}
+}
+
+func TestRouterPingStartsOnlyOneBackgroundUpdateRefresh(t *testing.T) {
+	system := testSystem(t)
+	refreshStarted := make(chan struct{}, 1)
+	extraRefresh := make(chan struct{}, 1)
+	releaseRefresh := make(chan struct{})
+	released := false
+	var refreshes atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if refreshes.Add(1) > 1 {
+			select {
+			case extraRefresh <- struct{}{}:
+			default:
+			}
+		}
+		select {
+		case refreshStarted <- struct{}{}:
+		default:
+		}
+		<-releaseRefresh
+		http.Error(w, "unavailable", http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+	defer func() {
+		if !released {
+			close(releaseRefresh)
+		}
+	}()
+	system.Updates = update.NewWithOptions(update.Options{
+		DataDir:     system.Config.DataDir,
+		ReleasesURL: server.URL,
+		Client:      server.Client(),
+	})
+	router := Router(system)
+
+	if rpcErr := callMethod(t, router, "ping", struct{}{}, nil); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	select {
+	case <-refreshStarted:
+	case <-time.After(time.Second):
+		t.Fatal("ping did not trigger an update refresh")
+	}
+
+	pingDone := make(chan *ipc.RPCError, 10)
+	for range 10 {
+		go func() {
+			_, rpcErr := router.Handle(context.Background(), ipc.Request{Method: "ping", Params: json.RawMessage(`{}`)})
+			pingDone <- rpcErr
+		}()
+	}
+	// Give every rapid ping time to observe the active refresh before the
+	// blocked checker is released.
+	time.Sleep(50 * time.Millisecond)
+	if refreshes.Load() != 1 {
+		t.Fatalf("refreshes started = %d, want 1", refreshes.Load())
+	}
+	close(releaseRefresh)
+	released = true
+	for range 10 {
+		select {
+		case rpcErr := <-pingDone:
+			if rpcErr != nil {
+				t.Fatal(rpcErr)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("ping did not return after refresh completed")
+		}
+	}
+	select {
+	case <-extraRefresh:
+		t.Fatal("rapid pings started an additional queued refresh")
+	case <-time.After(250 * time.Millisecond):
 	}
 }
 

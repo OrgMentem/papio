@@ -186,6 +186,36 @@ func TestSelectResultTitleRequiresMatchingBibliography(t *testing.T) {
 	}
 }
 
+func TestSelectResultTitleAcceptsFullNameAuthors(t *testing.T) {
+	requested := work.Work{
+		Title:   "Some OA Paper",
+		Authors: []string{"John Smith", "Jane Doe"},
+		Year:    2020,
+	}
+	result := epmcResult{
+		Title:        requested.Title,
+		AuthorString: "Smith J, Doe J",
+		PubYear:      "2020",
+	}
+	if got := selectResult([]epmcResult{result}, requested, matchTitle); got == nil {
+		t.Fatal("selectResult rejected full author names matching Europe PMC wire format")
+	}
+}
+
+func TestSameAuthorCanonicalizesNameOrder(t *testing.T) {
+	for _, author := range []string{"Smith J", "J Smith", "John Smith", "Smith, John"} {
+		if !sameAuthor(author, "John Smith") {
+			t.Errorf("sameAuthor(%q, %q) = false, want true", author, "John Smith")
+		}
+	}
+}
+
+func TestSameAuthorRejectsDistinctUTF8Initials(t *testing.T) {
+	if sameAuthor("Émile Smith", "Östen Smith") {
+		t.Fatal("sameAuthor accepted distinct non-ASCII initials")
+	}
+}
+
 func TestLandingOnlyWhenNoPDF(t *testing.T) {
 	body := `{"hitCount":1,"resultList":{"result":[{
       "id":"PMC9","source":"PMC","doi":"10.1000/only-html","title":"HTML Only","isOpenAccess":"Y",

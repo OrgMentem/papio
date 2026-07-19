@@ -41,9 +41,12 @@ func MatchIdentityWithThreshold(text string, target work.Work, titleThreshold fl
 		titleThreshold = 0.6
 	}
 	frontMatter := identityFrontMatter(text)
-	for _, marker := range nonArticleMarkers {
-		if strings.HasPrefix(firstNonEmptyLine(frontMatter), marker) {
-			return reject("non-article marker: " + marker)
+	for _, line := range strings.Split(frontMatter, "\n") {
+		line = strings.ToLower(strings.TrimSpace(line))
+		for _, marker := range nonArticleMarkers {
+			if strings.HasPrefix(line, marker) {
+				return reject("non-article marker: " + marker)
+			}
 		}
 	}
 
@@ -153,15 +156,6 @@ func identityFrontMatter(text string) string {
 		return text[:identityFrontMatterBytes]
 	}
 	return text
-}
-
-func firstNonEmptyLine(text string) string {
-	for _, line := range strings.Split(text, "\n") {
-		if line = strings.TrimSpace(line); line != "" {
-			return strings.ToLower(line)
-		}
-	}
-	return ""
 }
 
 func identityTitleTokens(title string) []string {

@@ -313,8 +313,9 @@ func (d *Downloader) saveResponse(overall context.Context, resp *http.Response, 
 	}, nil
 }
 
-// readBodyWithContext closes a blocked response body and drains the worker
-// before returning for cancellation, containing the worker's lifetime.
+// readBodyWithContext closes a blocked response body on cancellation. A
+// well-behaved ReadCloser unblocks Read when closed; broken implementations
+// cannot be allowed to hold the download indefinitely.
 func readBodyWithContext(ctx context.Context, body io.ReadCloser, buffer []byte) (int, error) {
 	type readResult struct {
 		n   int
@@ -330,7 +331,14 @@ func readBodyWithContext(ctx context.Context, body io.ReadCloser, buffer []byte)
 		return done.n, done.err
 	case <-ctx.Done():
 		_ = body.Close()
-		<-result
+		// Do not wait indefinitely for a pathological body whose Close does
+		// not unblock Read. The buffered result lets that sole goroutine exit
+		// once it eventually returns, while the bounded wait preserves the
+		// caller's cancellation guarantee.
+		select {
+		case <-result:
+		case <-time.After(100 * time.Millisecond):
+		}
 		return 0, ctx.Err()
 	}
 }
@@ -574,7 +582,23 @@ func isRedirect(status int) bool {
 }
 
 func sameOrigin(a, b *url.URL) bool {
-	return strings.EqualFold(a.Scheme, b.Scheme) && strings.EqualFold(a.Host, b.Host)
+	return strings.EqualFold(a.Scheme, b.Scheme) &&
+		strings.EqualFold(a.Hostname(), b.Hostname()) &&
+		effectivePort(a) == effectivePort(b)
+}
+
+func effectivePort(u *url.URL) string {
+	if port := u.Port(); port != "" {
+		return port
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "http":
+		return "80"
+	case "https":
+		return "443"
+	default:
+		return ""
+	}
 }
 
 // crossHostHeaders creates an empty header set for another origin. Candidate

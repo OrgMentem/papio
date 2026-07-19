@@ -122,7 +122,7 @@ func TestResolveLookupsAndTemporaryNetworkFailure(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if len(requested) != 3 || !strings.Contains(requested[0].URL.Path, "doi.org") || !strings.HasSuffix(requested[1].URL.Path, "/W123456789") || requested[2].URL.Query().Get("search") != "A precise title" || requested[2].URL.Query().Get("per_page") != "1" {
+	if len(requested) != 3 || !strings.Contains(requested[0].URL.Path, "doi.org") || !strings.HasSuffix(requested[1].URL.Path, "/W123456789") || requested[2].URL.Query().Get("search") != "A precise title" || requested[2].URL.Query().Get("per_page") != "10" {
 		t.Fatalf("lookup requests = %#v", requested)
 	}
 
@@ -187,6 +187,37 @@ func TestResolveTitleRequiresMatchingBibliography(t *testing.T) {
 				t.Fatalf("candidates = %#v, want nil", candidates)
 			}
 		})
+	}
+}
+
+func TestResolveTitleSelectsMatchingSecondResult(t *testing.T) {
+	const body = `{"results":[
+		{"title":"Exact title and related work","publication_year":2024,"authorships":[{"author":{"display_name":"A. Author"}}],"open_access":{"is_oa":true},"best_oa_location":{"is_oa":true,"pdf_url":"https://files.example/near.pdf"}},
+		{"title":"Exact title","publication_year":2024,"authorships":[{"author":{"display_name":"A. Author"}}],"open_access":{"is_oa":true},"best_oa_location":{"is_oa":true,"pdf_url":"https://files.example/match.pdf"}}
+	]}`
+	r := New(clientFunc(func(req *http.Request) (*http.Response, error) {
+		if got := req.URL.Query().Get("per_page"); got != "10" {
+			t.Fatalf("per_page = %q, want 10", got)
+		}
+		return responseFor(http.StatusOK, body, nil), nil
+	}), "contact@example.org", "private-key")
+
+	candidates, err := r.Resolve(context.Background(), work.Work{
+		Title:   "Exact title",
+		Authors: []string{"A. Author"},
+		Year:    2024,
+	})
+	if err != nil || len(candidates) != 1 {
+		t.Fatalf("Resolve = %#v, %v; want one candidate", candidates, err)
+	}
+	if candidates[0].URL != "https://files.example/match.pdf" {
+		t.Fatalf("candidate URL = %q, want exact second result", candidates[0].URL)
+	}
+}
+
+func TestSameAuthorRejectsDistinctUTF8Initials(t *testing.T) {
+	if sameAuthor("Émile Smith", "Östen Smith") {
+		t.Fatal("sameAuthor accepted distinct non-ASCII initials")
 	}
 }
 

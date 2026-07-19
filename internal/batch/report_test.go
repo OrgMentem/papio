@@ -83,6 +83,39 @@ func TestManifestWriteAndLoadPreservesBatchShape(t *testing.T) {
 	}
 }
 
+func TestLoadReadsLegacyManifestIDAndFindsLatest(t *testing.T) {
+	const legacyID = "batch-deadbeef"
+	manifest := &Manifest{
+		SchemaVersion: SchemaVersion,
+		ID:            legacyID,
+		CreatedAt:     "2026-07-14T12:00:00Z",
+		Works:         []ManifestWork{},
+	}
+	data, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dataDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dataDir, "batches"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dataDir, "batches", legacyID+".json"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, err := Load(dataDir, legacyID)
+	if err != nil || loaded.ID != legacyID {
+		t.Fatalf("Load(%q) = %+v, %v", legacyID, loaded, err)
+	}
+	latest, err := Load(dataDir, "latest")
+	if err != nil || latest.ID != legacyID {
+		t.Fatalf("Load(latest) = %+v, %v", latest, err)
+	}
+	if err := Write(dataDir, manifest); err == nil {
+		t.Fatal("Write accepted a legacy manifest ID")
+	}
+}
+
 func TestBuildReportClassifiesSeededJobsEventsAndActions(t *testing.T) {
 	manifest := &Manifest{
 		SchemaVersion: SchemaVersion, ID: "batch-deadbeef", CreatedAt: "2026-07-15T12:00:00Z", Label: "weekly", Collection: "Reading",

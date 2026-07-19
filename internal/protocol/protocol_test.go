@@ -93,26 +93,48 @@ func TestStrictDecodeRejectsTrailingDocuments(t *testing.T) {
 	}
 }
 
-func TestZotioItemKeyValidationMatchesZotio(t *testing.T) {
+func TestZotioItemKeyValidationMatchesV1Schema(t *testing.T) {
+	bundleFixture, err := os.ReadFile(filepath.Join(corpusDir(t, "valid"), "acquisition-bundle-min.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var bundleFields map[string]any
+	if err := json.Unmarshal(bundleFixture, &bundleFields); err != nil {
+		t.Fatal(err)
+	}
+
 	for _, tc := range []struct {
 		key     string
 		wantErr bool
 	}{
-		{key: "AB12CD34"},
-		{key: "ab12CD34", wantErr: true},
-		{key: "AB12CD3", wantErr: true},
-		{key: "AB12CD345", wantErr: true},
+		{key: "A"},
+		{key: "ab12CD34"},
+		{key: strings.Repeat("a", 32)},
+		{key: "ab-12", wantErr: true},
+		{key: strings.Repeat("a", 33), wantErr: true},
 	} {
 		t.Run(tc.key, func(t *testing.T) {
-			request := &WorkRequest{
+			requestData, err := json.Marshal(WorkRequest{
 				SchemaVersion:  WorkRequestSchemaVersion,
 				RequestID:      "request-0001",
 				Identifiers:    &Identifiers{DOI: "10.1000/example"},
 				ZotioItemKey:   tc.key,
 				DesiredVersion: "any",
+			})
+			if err != nil {
+				t.Fatal(err)
 			}
-			if err := request.Validate(); (err != nil) != tc.wantErr {
-				t.Fatalf("Validate() error = %v, want error %t", err, tc.wantErr)
+			if _, err := DecodeWorkRequest(requestData); (err != nil) != tc.wantErr {
+				t.Fatalf("DecodeWorkRequest() error = %v, want error %t", err, tc.wantErr)
+			}
+
+			bundleFields["zotio_item_key"] = tc.key
+			bundleData, err := json.Marshal(bundleFields)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := DecodeAcquisitionBundle(bundleData); (err != nil) != tc.wantErr {
+				t.Fatalf("DecodeAcquisitionBundle() error = %v, want error %t", err, tc.wantErr)
 			}
 		})
 	}

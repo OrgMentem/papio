@@ -467,6 +467,74 @@ func TestValidationPersistsArtifactMetadataBeforePromotion(t *testing.T) {
 	}
 }
 
+func TestValidationRemovesMetadataWhenPromotionFails(t *testing.T) {
+	ctx := context.Background()
+	svc, jobs := newTestService(t)
+	id, err := jobs.CreateRequest(ctx, "wr_promotion_rollback", work.Work{DOI: "10.1002/example"}, "", "", job.Policy{
+		AccessMode: config.ModeConservative, DesiredVersion: "any",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := jobs.InsertCandidates(ctx, id, []job.Candidate{{
+		JobID: id, Source: "fixture", URLRedacted: "https://example.test/paper.pdf", URLKey: "promotion-rollback",
+		Version: resolver.VersionPublished, AccessBasis: resolver.AccessOpen, ReuseLicense: "unknown",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	candidate, err := jobs.NextPendingCandidate(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, edge := range [][2]string{
+		{job.StateQueued, job.StateResolving},
+		{job.StateResolving, job.StateFetching},
+		{job.StateFetching, job.StateValidating},
+	} {
+		if err := jobs.Transition(ctx, id, edge[0], edge[1], nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	row, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	qdir, err := svc.Artifacts.QuarantineDir(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := pdfBytes("promotion-rollback")
+	tempPath := filepath.Join(qdir, "candidate.tmp")
+	if err := os.WriteFile(tempPath, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(body)
+	sha := hex.EncodeToString(sum[:])
+	svc.Validate = func(context.Context, string, string, work.Work) (pdf.ValidationReport, error) {
+		if err := os.Remove(tempPath); err != nil {
+			t.Fatal(err)
+		}
+		return passValidation()(context.Background(), "", "", work.Work{})
+	}
+
+	if _, _, err := svc.validateCandidate(ctx, row, candidate, fetch.Result{
+		TempPath: tempPath, SHA256: sha, SizeBytes: int64(len(body)), SniffedMIME: "application/pdf",
+	}); err == nil {
+		t.Fatal("validation succeeded despite promotion failure")
+	}
+	dest, err := svc.Artifacts.ArtifactPath(sha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(dest); !os.IsNotExist(err) {
+		t.Fatalf("artifact file remains after promotion failure: %v", err)
+	}
+	art, err := jobs.GetArtifact(ctx, sha)
+	if err != nil || art != nil {
+		t.Fatalf("artifact metadata remains after promotion failure = %+v, %v", art, err)
+	}
+}
+
 func TestSubmitRequiresExplicitAccessMode(t *testing.T) {
 	svc, _ := newTestService(t)
 	svc.Config.AccessMode = ""

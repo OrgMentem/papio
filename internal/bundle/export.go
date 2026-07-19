@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"papio/internal/artifact"
@@ -28,6 +29,44 @@ type Exporter struct {
 	Artifacts *artifact.Store
 	DataDir   string
 	Now       func() time.Time
+}
+
+var exportDestinationLocks = struct {
+	sync.Mutex
+	locks map[string]*exportDestinationLock
+}{locks: make(map[string]*exportDestinationLock)}
+
+type exportDestinationLock struct {
+	mu   sync.Mutex
+	refs int
+}
+
+func lockExportDestination(destination string) func() {
+	key, err := filepath.Abs(destination)
+	if err != nil {
+		key = destination
+	}
+	key = filepath.Clean(key)
+
+	exportDestinationLocks.Lock()
+	lock := exportDestinationLocks.locks[key]
+	if lock == nil {
+		lock = &exportDestinationLock{}
+		exportDestinationLocks.locks[key] = lock
+	}
+	lock.refs++
+	exportDestinationLocks.Unlock()
+
+	lock.mu.Lock()
+	return func() {
+		lock.mu.Unlock()
+		exportDestinationLocks.Lock()
+		lock.refs--
+		if lock.refs == 0 {
+			delete(exportDestinationLocks.locks, key)
+		}
+		exportDestinationLocks.Unlock()
+	}
 }
 
 // Export creates (or verifies and reuses) bundle.json and its relative
@@ -105,6 +144,9 @@ func (e *Exporter) Export(ctx context.Context, jobID, destination string) (strin
 	if destination == "" {
 		destination = filepath.Join(e.DataDir, "bundles", jobID)
 	}
+	unlock := lockExportDestination(destination)
+	defer unlock()
+
 	destinationExisted, err := pathExists(destination)
 	if err != nil {
 		return "", nil, err
@@ -123,25 +165,28 @@ func (e *Exporter) Export(ctx context.Context, jobID, destination string) (strin
 		return "", nil, err
 	}
 	bundlePath := filepath.Join(destination, "bundle.json")
+	rollback := func(primary error, bundleCreated bool) (string, *protocol.AcquisitionBundle, error) {
+		cleanupErr := cleanupExport(destination, artifactsDir, artifactPath, bundlePath,
+			destinationExisted, artifactsDirExisted, artifactCreated, bundleCreated)
+		if cleanupErr != nil {
+			return "", nil, fmt.Errorf("exporting bundle: %w", errors.Join(primary, cleanupErr))
+		}
+		return "", nil, primary
+	}
 	bundleExisted, err := pathExists(bundlePath)
 	if err != nil {
-		return "", nil, err
+		return rollback(err, false)
 	}
 	encoded, err := json.MarshalIndent(b, "", "  ")
 	if err != nil {
-		return "", nil, err
+		return rollback(err, false)
 	}
 	encoded = append(encoded, '\n')
 	if err := atomicWrite(bundlePath, encoded, 0o600); err != nil {
-		return "", nil, err
+		return rollback(err, false)
 	}
 	if err := e.record(ctx, jobID, art.SHA256, bundlePath); err != nil {
-		cleanupErr := cleanupExport(destination, artifactsDir, artifactPath, bundlePath,
-			destinationExisted, artifactsDirExisted, artifactCreated, !bundleExisted)
-		if cleanupErr != nil {
-			return "", nil, fmt.Errorf("recording bundle export: %w", errors.Join(err, cleanupErr))
-		}
-		return "", nil, err
+		return rollback(err, !bundleExisted)
 	}
 	return bundlePath, b, nil
 }

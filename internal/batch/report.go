@@ -25,7 +25,12 @@ import (
 
 const SchemaVersion = "papio-batch-manifest/1"
 
-var idPattern = regexp.MustCompile(`^batch-[0-9a-f]{32}$`)
+// generatedIDPattern guards writes. readableIDPattern additionally accepts
+// v0.4.0's 8-hex manifest IDs when reading existing state.
+var (
+	generatedIDPattern = regexp.MustCompile(`^batch-[0-9a-f]{32}$`)
+	readableIDPattern  = regexp.MustCompile(`^batch-[0-9a-f]{8}(?:[0-9a-f]{24})?$`)
+)
 
 // Sentinel errors let callers classify Load failures instead of treating every
 // failure as a missing manifest. Other Load errors are unexpected (I/O, decode,
@@ -212,7 +217,7 @@ func path(dataDir, id string) string { return filepath.Join(directory(dataDir), 
 
 // Write persists a private manifest atomically.
 func Write(dataDir string, manifest *Manifest) error {
-	if manifest == nil || !idPattern.MatchString(manifest.ID) || manifest.SchemaVersion != SchemaVersion {
+	if manifest == nil || !generatedIDPattern.MatchString(manifest.ID) || manifest.SchemaVersion != SchemaVersion {
 		return errors.New("invalid batch manifest")
 	}
 	if err := os.MkdirAll(directory(dataDir), 0o700); err != nil {
@@ -264,7 +269,7 @@ func Load(dataDir, requested string) (*Manifest, error) {
 				continue
 			}
 			id := strings.TrimSuffix(entry.Name(), ".json")
-			if !idPattern.MatchString(id) {
+			if !readableIDPattern.MatchString(id) {
 				continue
 			}
 			manifest, err := loadPath(path(dataDir, id))
@@ -280,7 +285,7 @@ func Load(dataDir, requested string) (*Manifest, error) {
 		}
 		return latest, nil
 	}
-	if !idPattern.MatchString(requested) {
+	if !readableIDPattern.MatchString(requested) {
 		return nil, fmt.Errorf("%w %q", ErrInvalidBatchID, requested)
 	}
 	return loadPath(path(dataDir, requested))
@@ -298,7 +303,7 @@ func loadPath(manifestPath string) (*Manifest, error) {
 	if err := json.Unmarshal(data, &manifest); err != nil {
 		return nil, fmt.Errorf("decoding batch manifest: %w", err)
 	}
-	if manifest.SchemaVersion != SchemaVersion || !idPattern.MatchString(manifest.ID) {
+	if manifest.SchemaVersion != SchemaVersion || !readableIDPattern.MatchString(manifest.ID) {
 		return nil, errors.New("invalid batch manifest")
 	}
 	return &manifest, nil

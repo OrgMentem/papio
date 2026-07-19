@@ -163,6 +163,12 @@ func TestMatchIdentity(t *testing.T) {
 	if got := MatchIdentity("Supporting Information doi:10.1234/abc.9", target); got.Result != IdentityReject {
 		t.Fatalf("marker: %+v", got)
 	}
+	if got := MatchIdentity("Journal header\nSupplementary Information\nDOI: 10.1234/abc.9", target); got.Result != IdentityReject {
+		t.Fatalf("supplementary heading after journal header: %+v", got)
+	}
+	if got := MatchIdentity("Journal header\nThis article cites supplementary material for methodological detail.\nDOI: 10.1234/abc.9", target); got.Result != IdentityPass {
+		t.Fatalf("front-matter supplementary citation: %+v", got)
+	}
 	if got := MatchIdentity("doi:10.9999/nope", target); got.Result != IdentityReject {
 		t.Fatalf("wrong DOI: %+v", got)
 	}

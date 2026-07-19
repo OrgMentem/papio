@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"testing"
 )
 
@@ -119,6 +120,58 @@ func TestPromoteConcurrentlyConvergesForSameHash(t *testing.T) {
 	}
 	if err := s.Verify(sha); err != nil {
 		t.Fatalf("verify converged artifact: %v", err)
+	}
+}
+
+func TestPromoteFallsBackWhenHardLinksUnsupported(t *testing.T) {
+	s, err := New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	q, err := s.QuarantineDir("job_x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := []byte("%PDF-1.4 fixture body")
+	temp := filepath.Join(q, "download.tmp")
+	if err := os.WriteFile(temp, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sha, _, err := HashFile(temp)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	originalLink := linkFile
+	linkFile = func(oldname, newname string) error {
+		return &os.LinkError{Op: "link", Old: oldname, New: newname, Err: syscall.EOPNOTSUPP}
+	}
+	t.Cleanup(func() { linkFile = originalLink })
+
+	dest, err := s.Promote(temp, sha)
+	if err != nil {
+		t.Fatalf("promote without hard links: %v", err)
+	}
+	if err := s.Verify(sha); err != nil {
+		t.Fatalf("verify fallback artifact: %v", err)
+	}
+	if _, err := os.Stat(temp); !os.IsNotExist(err) {
+		t.Fatalf("fallback temp remains: %v", err)
+	}
+
+	duplicate := filepath.Join(q, "duplicate.tmp")
+	if err := os.WriteFile(duplicate, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	duplicateDest, err := s.Promote(duplicate, sha)
+	if err != nil {
+		t.Fatalf("fallback duplicate promote: %v", err)
+	}
+	if duplicateDest != dest {
+		t.Fatalf("fallback duplicate destination = %q, want %q", duplicateDest, dest)
+	}
+	if _, err := os.Stat(duplicate); !os.IsNotExist(err) {
+		t.Fatalf("fallback duplicate temp remains: %v", err)
 	}
 }
 

@@ -560,6 +560,68 @@ func TestDownloadValidationDoesNotBlockSessionSync(t *testing.T) {
 	}
 }
 
+func TestPollDiscoveredDownloadValidationDoesNotBlockSessionSync(t *testing.T) {
+	b, jobs, cfg, _ := newBridge(t)
+	id := park(t, jobs, "wr_poll_unblocked_sync", handoffWork())
+	runSync(t, b, hello())
+	writeFixturePDF(t, filepath.Join(cfg.EffectiveAdoptionRoot(), id, "paper.pdf"))
+
+	validationStarted := make(chan struct{})
+	releaseValidation := make(chan struct{})
+	validationReleased := false
+	t.Cleanup(func() {
+		if !validationReleased {
+			close(releaseValidation)
+		}
+	})
+	b.svc.Validate = func(context.Context, string, string, work.Work) (pdf.ValidationReport, error) {
+		close(validationStarted)
+		<-releaseValidation
+		return pdf.ValidationReport{
+			Payload:    pdf.PayloadReport{OK: true},
+			Structural: pdf.StructuralReport{Valid: true, Pages: 3},
+			Text:       pdf.TextReport{Chars: 4000},
+			Identity:   pdf.IdentityDecision{Result: pdf.IdentityPass, Evidence: []string{"doi match"}},
+		}, nil
+	}
+
+	adoptionDone := make(chan error, 1)
+	go func() {
+		_, err := b.Sync(context.Background(), nil)
+		adoptionDone <- err
+	}()
+	select {
+	case <-validationStarted:
+	case <-time.After(time.Second):
+		t.Fatal("poll-time adoption never reached validation")
+	}
+
+	pollDone := make(chan error, 1)
+	go func() {
+		_, err := b.Sync(context.Background(), nil)
+		pollDone <- err
+	}()
+	select {
+	case err := <-pollDone:
+		if err != nil {
+			t.Fatalf("poll during poll-time validation: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("session sync blocked on poll-time download validation")
+	}
+
+	close(releaseValidation)
+	validationReleased = true
+	select {
+	case err := <-adoptionDone:
+		if err != nil {
+			t.Fatalf("poll-time adoption: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("poll-time adoption did not finish")
+	}
+}
+
 func TestDownloadForUnrelatedJobDoesNotAdoptAnotherJobsFile(t *testing.T) {
 	b, jobs, cfg, _ := newBridge(t)
 	ctx := context.Background()

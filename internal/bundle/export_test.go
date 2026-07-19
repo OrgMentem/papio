@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"papio/internal/artifact"
@@ -170,6 +171,74 @@ func TestExportCleansFilesWhenLedgerRecordingFails(t *testing.T) {
 	var count int
 	if err := exporter.Jobs.S.DB().QueryRowContext(ctx, `SELECT count(*) FROM exports WHERE job_id = ?`, id).Scan(&count); err != nil || count != 0 {
 		t.Fatalf("export ledger count = %d, %v; want zero", count, err)
+	}
+}
+
+func TestExportCleansArtifactWhenBundleWriteFails(t *testing.T) {
+	exporter, id, sha := readyFixture(t)
+	destination := t.TempDir()
+	if err := os.Mkdir(filepath.Join(destination, "bundle.json"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, _, err := exporter.Export(context.Background(), id, destination); err == nil {
+		t.Fatal("export succeeded despite bundle write failure")
+	}
+	if _, err := os.Stat(filepath.Join(destination, "artifacts", sha+".pdf")); !os.IsNotExist(err) {
+		t.Fatalf("artifact remains after bundle write failure: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(destination, "artifacts")); !os.IsNotExist(err) {
+		t.Fatalf("artifact directory remains after bundle write failure: %v", err)
+	}
+}
+
+func TestConcurrentFailedExportPreservesWinnerFiles(t *testing.T) {
+	exporter, id, sha := readyFixture(t)
+	ctx := context.Background()
+	if _, err := exporter.Jobs.S.DB().ExecContext(ctx, `
+		CREATE TRIGGER reject_bundle_export_update
+		BEFORE UPDATE ON exports
+		WHEN NEW.kind = 'bundle'
+		BEGIN
+			SELECT RAISE(ABORT, 'injected ledger update failure');
+		END`); err != nil {
+		t.Fatalf("create failure trigger: %v", err)
+	}
+	destination := filepath.Join(t.TempDir(), "export")
+	unlock := lockExportDestination(destination)
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	var wg sync.WaitGroup
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, _, err := exporter.Export(ctx, id, destination)
+			results <- err
+		}()
+	}
+	close(start)
+	unlock()
+	wg.Wait()
+	close(results)
+
+	var successes, failures int
+	for err := range results {
+		if err == nil {
+			successes++
+		} else {
+			failures++
+		}
+	}
+	if successes != 1 || failures != 1 {
+		t.Fatalf("concurrent exports: successes=%d failures=%d", successes, failures)
+	}
+	if _, err := os.Stat(filepath.Join(destination, "bundle.json")); err != nil {
+		t.Fatalf("winner bundle.json missing: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(destination, "artifacts", sha+".pdf")); err != nil {
+		t.Fatalf("winner artifact missing: %v", err)
 	}
 }
 

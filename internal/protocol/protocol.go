@@ -38,7 +38,7 @@ const MaxBrowserInteger int64 = 1<<53 - 1
 var (
 	requestIDRE  = regexp.MustCompile(`^[A-Za-z0-9_-]{8,128}$`)
 	msgIDRE      = regexp.MustCompile(`^[A-Za-z0-9_-]{8,64}$`)
-	zoteroKeyRE  = regexp.MustCompile(`^[A-Z0-9]{8}$`)
+	zoteroKeyRE  = regexp.MustCompile(`^[A-Za-z0-9]{1,32}$`)
 	doiRE        = regexp.MustCompile(`^10\.[0-9]{4,9}/\S{1,200}$`)
 	pmidRE       = regexp.MustCompile(`^[0-9]{1,10}$`)
 	arxivRE      = regexp.MustCompile(`^([0-9]{4}\.[0-9]{4,5})(v[0-9]+)?$|^[a-z-]+(\.[A-Z]{2})?/[0-9]{7}$`)

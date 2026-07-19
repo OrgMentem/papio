@@ -80,11 +80,15 @@ func TestMissingPDFUsesExactCollectionAndValidatesRows(t *testing.T) {
 		t.Fatalf("argv = %q, want %q", got, want)
 	}
 
-	client.Exec = func(_ context.Context, _ ...string) ([]byte, error) {
-		return []byte(`[{"key":"../../bad","title":"Paper"}]`), nil
-	}
-	if _, err := client.MissingPDF(context.Background(), "", 1); err == nil {
-		t.Fatal("invalid Zotero key accepted")
+	for _, key := range []string{"../../bad", "ab12CD34", "AB12CD3", "AB12CD345"} {
+		t.Run(key, func(t *testing.T) {
+			client.Exec = func(_ context.Context, _ ...string) ([]byte, error) {
+				return []byte(fmt.Sprintf(`[{"key":%q,"title":"Paper"}]`, key)), nil
+			}
+			if _, err := client.MissingPDF(context.Background(), "", 1); err == nil || !strings.Contains(err.Error(), "Zotio queue row 0 has invalid item key") {
+				t.Fatalf("invalid Zotero queue key error = %v", err)
+			}
+		})
 	}
 }
 

@@ -14,6 +14,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"papio/internal/redact"
 	"papio/internal/resolver"
@@ -21,8 +23,9 @@ import (
 )
 
 const (
-	defaultBaseURL = "https://api.openalex.org/works"
-	defaultMaxBody = int64(1 << 20)
+	defaultBaseURL        = "https://api.openalex.org/works"
+	defaultMaxBody        = int64(1 << 20)
+	defaultSearchPageSize = 10
 )
 
 // HTTPClient is the injected HTTP dependency used to call OpenAlex.
@@ -137,11 +140,14 @@ func (r *Resolver) Resolve(ctx context.Context, requested work.Work) ([]resolver
 		if err := decodeBoundedJSON(resp.Body, r.maxBody, &results); err != nil {
 			return nil, fmt.Errorf("openalex: invalid response: %w", err)
 		}
-		if len(results.Results) == 0 {
-			return nil, nil
+		matched := false
+		for _, result := range results.Results {
+			if matchesTitleSearch(result, requested) {
+				record, matched = result, true
+				break
+			}
 		}
-		record = results.Results[0]
-		if !matchesTitleSearch(record, requested) {
+		if !matched {
 			return nil, nil
 		}
 	} else if err := decodeBoundedJSON(resp.Body, r.maxBody, &record); err != nil {
@@ -210,7 +216,7 @@ func (r *Resolver) lookupURL(requested work.Work) (*url.URL, string, bool, error
 		lookup, search = "title", true
 		query := base.Query()
 		query.Set("search", strings.TrimSpace(requested.Title))
-		query.Set("per_page", "1")
+		query.Set("per_page", strconv.Itoa(defaultSearchPageSize))
 		base.RawQuery = query.Encode()
 	default:
 		return base, "", false, nil
@@ -355,18 +361,46 @@ func sameAuthorLists(recordAuthors, requestedAuthors []string) bool {
 }
 
 func sameAuthor(left, right string) bool {
-	left, right = normalizeTitle(left), normalizeTitle(right)
-	if left == "" || right == "" {
-		return false
+	leftSurname, leftInitial, leftOK := canonicalAuthor(left)
+	rightSurname, rightInitial, rightOK := canonicalAuthor(right)
+	return leftOK && rightOK && leftSurname == rightSurname && leftInitial == rightInitial
+}
+
+func canonicalAuthor(value string) (string, rune, bool) {
+	value = strings.TrimSpace(value)
+	if comma := strings.IndexRune(value, ','); comma >= 0 {
+		surname := normalizeTitle(value[:comma])
+		givenNames := strings.Fields(normalizeTitle(value[comma+1:]))
+		if surname == "" || len(givenNames) == 0 {
+			return "", 0, false
+		}
+		initial, ok := firstAuthorRune(givenNames[0])
+		return surname, initial, ok
 	}
-	if left == right {
-		return true
+
+	parts := strings.Fields(normalizeTitle(value))
+	if len(parts) < 2 {
+		return "", 0, false
 	}
-	leftParts, rightParts := strings.Fields(left), strings.Fields(right)
-	if len(leftParts) == 0 || len(rightParts) == 0 || leftParts[len(leftParts)-1] != rightParts[len(rightParts)-1] {
-		return false
+	if isAuthorInitial(parts[len(parts)-1]) {
+		initial, ok := firstAuthorRune(parts[len(parts)-1])
+		return strings.Join(parts[:len(parts)-1], " "), initial, ok
 	}
-	return leftParts[0][0] == rightParts[0][0]
+	initial, ok := firstAuthorRune(parts[0])
+	return parts[len(parts)-1], initial, ok
+}
+
+func isAuthorInitial(value string) bool {
+	value = strings.Trim(value, ".")
+	_, size := utf8.DecodeRuneInString(value)
+	return size > 0 && size == len(value)
+}
+
+func firstAuthorRune(value string) (rune, bool) {
+	for _, r := range value {
+		return unicode.ToLower(r), true
+	}
+	return 0, false
 }
 
 func normalizeTitle(value string) string {

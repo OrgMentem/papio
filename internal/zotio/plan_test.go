@@ -28,6 +28,7 @@ type planCLI struct {
 	preview         string
 	apply           string
 	applyErr        error
+	applyFn         func(context.Context) (json.RawMessage, error)
 	enrichErr       error
 	resolveCalls    int
 	syncCalls       int
@@ -54,7 +55,7 @@ func (c *planCLI) Sync(context.Context) error {
 	c.syncCalls++
 	return nil
 }
-func (c *planCLI) RunJSON(_ context.Context, args ...string) (json.RawMessage, error) {
+func (c *planCLI) RunJSON(ctx context.Context, args ...string) (json.RawMessage, error) {
 	joined := strings.Join(args, " ")
 	switch {
 	case strings.Contains(joined, "import resolve"):
@@ -72,6 +73,9 @@ func (c *planCLI) RunJSON(_ context.Context, args ...string) (json.RawMessage, e
 		return json.RawMessage(`{"ok":true}`), c.enrichErr
 	case strings.Contains(joined, "--yes"):
 		c.applyCalls++
+		if c.applyFn != nil {
+			return c.applyFn(ctx)
+		}
 		return json.RawMessage(c.apply), c.applyErr
 	default:
 		c.previewCalls++
@@ -209,6 +213,17 @@ func TestExistingItemPlanUsesConfiguredLinkedAttachmentMode(t *testing.T) {
 	}
 }
 
+func TestPlanRejectsInvalidPersistedZotioItemKey(t *testing.T) {
+	cli := &planCLI{}
+	service, jobID := readyPlanService(t, "ab12CD34", cli)
+	if _, err := service.PlanJobs(context.Background(), []string{jobID}); err == nil || !strings.Contains(err.Error(), `invalid Zotero item key "ab12CD34"`) {
+		t.Fatalf("plan error = %v", err)
+	}
+	if cli.previewCalls != 0 {
+		t.Fatalf("preview calls = %d, want 0", cli.previewCalls)
+	}
+}
+
 func TestApplyRecoversAbandonedReservation(t *testing.T) {
 	cli := &planCLI{
 		preview: `{"ok":true,"mode":"preview","plan":{"summary":{"planned":1,"no_op":0,"invalid":0}},"result":null}`,
@@ -258,7 +273,14 @@ func TestClaimApplyReservesInProgressStatus(t *testing.T) {
 	).Scan(&raw); err != nil {
 		t.Fatal(err)
 	}
-	if raw != `{"status":"in_progress"}` {
+	var claim struct {
+		Status    string `json:"status"`
+		ClaimedAt int64  `json:"claimed_at"`
+	}
+	if err := json.Unmarshal([]byte(raw), &claim); err != nil {
+		t.Fatal(err)
+	}
+	if claim.Status != "in_progress" || claim.ClaimedAt == 0 {
 		t.Fatalf("claim result_json = %q", raw)
 	}
 	claimed, err = service.claimApply(ctx, key, jobID)
@@ -267,6 +289,76 @@ func TestClaimApplyReservesInProgressStatus(t *testing.T) {
 	}
 	if claimed {
 		t.Fatal("second apply claim acquired an in-progress reservation")
+	}
+}
+
+func TestClaimApplyReclaimsExpiredReservation(t *testing.T) {
+	service, jobID := readyPlanService(t, "AB12CD34", &planCLI{})
+	key := "zotio_apply:claim-expired"
+	if claimed, err := service.claimApply(context.Background(), key, jobID); err != nil || !claimed {
+		t.Fatalf("initial claim = %t, %v", claimed, err)
+	}
+	service.Now = func() time.Time {
+		return time.Date(2026, 7, 14, 12, 16, 0, 0, time.UTC)
+	}
+	claimed, err := service.claimApply(context.Background(), key, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !claimed {
+		t.Fatal("expired in-progress reservation was not reclaimed")
+	}
+}
+
+func TestCancelledApplyFinalizesClaimAndReplans(t *testing.T) {
+	var cancel context.CancelFunc
+	cli := &planCLI{
+		preview: `{"ok":true,"mode":"preview","plan":{"summary":{"planned":1,"no_op":0,"invalid":0}},"result":null}`,
+		apply:   `{"ok":true,"mode":"apply","plan":{"summary":{"planned":1}},"result":{"summary":{"applied":1,"no_op":0,"conflicts":0,"failed":0},"items":[{"key":"AB12CD34","status":"applied","reason":{"item_key":"AT56CH90","upload":"uploaded"}}]}}`,
+	}
+	cli.applyFn = func(ctx context.Context) (json.RawMessage, error) {
+		cancel()
+		return nil, ctx.Err()
+	}
+	service, jobID := readyPlanService(t, "AB12CD34", cli)
+	plans, err := service.PlanJobs(context.Background(), []string{jobID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	plan := plans[0]
+	if _, err := service.Apply(ctx, plan.ID, plan.ConfirmationSHA256); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled apply error = %v", err)
+	}
+	var raw string
+	if err := service.Store.DB().QueryRow(
+		`SELECT result_json FROM exports WHERE kind = 'zotio_apply' AND idempotency_key = ?`,
+		"zotio_apply:"+plan.ID+":"+plan.ConfirmationSHA256,
+	).Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	var recorded ApplyResult
+	if err := json.Unmarshal([]byte(raw), &recorded); err != nil {
+		t.Fatal(err)
+	}
+	if recorded.Status != "failed" {
+		t.Fatalf("cancelled apply record = %+v", recorded)
+	}
+	cli.applyFn = nil
+	replanned, err := service.PlanJobs(context.Background(), []string{jobID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replanned[0].ID == plan.ID {
+		t.Fatal("cancelled apply retained its invalidated plan")
+	}
+	result, err := service.Apply(context.Background(), replanned[0].ID, replanned[0].ConfirmationSHA256)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != "applied" || cli.applyCalls != 2 {
+		t.Fatalf("reapplied result = %+v calls=%d", result, cli.applyCalls)
 	}
 }
 
@@ -478,11 +570,23 @@ func TestFileCollectionSkipsQueueCollectionKey(t *testing.T) {
 	cli := &planCLI{}
 	service := &Service{CLI: cli}
 	service.fileCollection(context.Background(),
-		&Plan{Collection: "ZX98YU76"},
+		&Plan{Collection: "ZX98YU76", CollectionIsKey: true},
 		&ApplyResult{ParentKey: "AB12CD34"},
 	)
 	if cli.collectionCalls != 0 {
 		t.Fatalf("collection calls = %d, want 0", cli.collectionCalls)
+	}
+}
+
+func TestFileCollectionFilesKeyShapedNameWithoutItemKey(t *testing.T) {
+	cli := &planCLI{}
+	service, jobID := readyPlanService(t, "", cli)
+	service.fileCollection(context.Background(),
+		&Plan{JobID: jobID, Collection: "PAPERS24"},
+		&ApplyResult{ParentKey: "AB12CD34"},
+	)
+	if cli.collectionCalls != 1 {
+		t.Fatalf("collection calls = %d, want 1", cli.collectionCalls)
 	}
 }
 

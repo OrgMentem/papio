@@ -12,12 +12,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -25,6 +27,9 @@ import (
 
 //go:embed migrations/*.sql
 var migrationFS embed.FS
+
+// linkFile lets tests simulate filesystems that do not support hard links.
+var linkFile = os.Link
 
 // Store wraps the single-writer database handle.
 type Store struct {
@@ -185,24 +190,66 @@ func (s *Store) Backup(ctx context.Context, destPath string) error {
 		return err
 	}
 	tmpPath := tmp.Name()
+	defer func() { _ = os.Remove(tmpPath) }()
 	if err := tmp.Close(); err != nil {
-		_ = os.Remove(tmpPath)
 		return err
 	}
 	if err := os.Remove(tmpPath); err != nil {
 		return err
 	}
-	defer func() { _ = os.Remove(tmpPath) }()
 	if _, err := s.db.ExecContext(ctx, "VACUUM INTO ?", tmpPath); err != nil {
 		return err
 	}
-	if err := os.Link(tmpPath, destPath); err != nil {
-		if errors.Is(err, fs.ErrExist) {
+	if err := linkFile(tmpPath, destPath); err != nil {
+		switch {
+		case errors.Is(err, fs.ErrExist):
 			return fmt.Errorf("backup destination %s already exists", destPath)
+		case linkUnsupported(err):
+			if err := copyFileExclusive(tmpPath, destPath); err != nil {
+				if errors.Is(err, fs.ErrExist) {
+					return fmt.Errorf("backup destination %s already exists", destPath)
+				}
+				return err
+			}
+		default:
+			return err
 		}
+	}
+	return nil
+}
+
+func copyFileExclusive(srcPath, destPath string) (err error) {
+	dest, err := os.OpenFile(destPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
 		return err
 	}
-	return os.Remove(tmpPath)
+	defer func() {
+		if closeErr := dest.Close(); err == nil && closeErr != nil {
+			err = closeErr
+		}
+		if err != nil {
+			_ = os.Remove(destPath)
+		}
+	}()
+
+	src, err := os.Open(srcPath)
+	if err != nil {
+		return err
+	}
+	_, copyErr := io.Copy(dest, src)
+	closeErr := src.Close()
+	if copyErr != nil {
+		return copyErr
+	}
+	return closeErr
+}
+
+func linkUnsupported(err error) bool {
+	var linkErr *os.LinkError
+	return errors.As(err, &linkErr) &&
+		(errors.Is(linkErr.Err, syscall.EPERM) ||
+			errors.Is(linkErr.Err, syscall.ENOTSUP) ||
+			errors.Is(linkErr.Err, syscall.EOPNOTSUPP))
 }
 
 // Checkpoint truncates the WAL (used before backups and by doctor).

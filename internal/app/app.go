@@ -621,10 +621,20 @@ func (s *Service) validateCandidate(ctx context.Context, row *job.Row, stored *j
 	}
 	// Persist the metadata before the atomic rename so a database failure
 	// cannot leave an immutable file with no durable owner.
+	existingArtifact, err := s.Jobs.GetArtifact(ctx, result.SHA256)
+	if err != nil {
+		return false, false, err
+	}
 	if err := s.Jobs.UpsertArtifact(ctx, art); err != nil {
 		return false, false, err
 	}
 	if _, err := s.Artifacts.Promote(result.TempPath, result.SHA256); err != nil {
+		if existingArtifact == nil {
+			if _, cleanupErr := s.Jobs.S.DB().ExecContext(context.WithoutCancel(ctx),
+				`DELETE FROM artifacts WHERE sha256 = ?`, result.SHA256); cleanupErr != nil {
+				return false, false, errors.Join(err, fmt.Errorf("removing unpromoted artifact metadata: %w", cleanupErr))
+			}
+		}
 		return false, false, err
 	}
 	if err := s.Jobs.MarkCandidate(ctx, stored.ID, "accepted"); err != nil {

@@ -572,7 +572,7 @@ func (b *Bridge) poll(ctx context.Context) ([]json.RawMessage, error) {
 		// adopts; zero or several (or an in-progress .crdownload) waits —
 		// ambiguity stays with the user, per the fail-closed rule.
 		if name, ok := b.scanAdoptionDir(ctx, row.ID); ok {
-			if err := b.adopt(ctx, row.ID, name); err != nil {
+			if err := b.adoptOutsideSessionLock(ctx, row.ID, name); err != nil {
 				if evErr := b.jobs.S.AppendEvent(ctx, row.ID, "browser.adoption_deferred",
 					map[string]any{"filename": name, "reason": truncate(err.Error(), 200)}); evErr != nil {
 					return nil, evErr

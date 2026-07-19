@@ -21,7 +21,10 @@ import (
 	"papio/internal/store"
 )
 
-const ZotioPlanSchemaVersion = "papio-zotio-plan/1"
+const (
+	ZotioPlanSchemaVersion = "papio-zotio-plan/1"
+	applyClaimLease        = 15 * time.Minute
+)
 
 var planIDRE = regexp.MustCompile(`^zplan_[a-f0-9]{26}$`)
 
@@ -36,6 +39,7 @@ type Plan struct {
 	ArtifactSHA256     string          `json:"artifact_sha256"`
 	ManifestPath       string          `json:"manifest_path,omitempty"`
 	ExpectedParentKey  string          `json:"expected_parent_key,omitempty"`
+	CollectionIsKey    bool            `json:"collection_is_key,omitempty"`
 	DOI                string          `json:"doi,omitempty"`
 	AttachmentMode     string          `json:"attachment_mode"`
 	Collection         string          `json:"collection,omitempty"`
@@ -155,6 +159,15 @@ func (s *Service) planJob(ctx context.Context, jobID string) (*Plan, error) {
 		Collection:     collection,
 	}
 	if acquisition.ZotioItemKey != "" {
+		if !keyRE.MatchString(acquisition.ZotioItemKey) {
+			return nil, fmt.Errorf("invalid Zotero item key %q", acquisition.ZotioItemKey)
+		}
+		// Missing-PDF queue jobs carry an existing Zotio item and a collection
+		// key. Direct acquisitions normally have no item key, so a key-shaped
+		// collection name remains a name and is filed. The unsupported case of
+		// supplying both an explicit item key and a key-shaped collection name
+		// remains ambiguous.
+		plan.CollectionIsKey = keyRE.MatchString(collection)
 		plan.Route = "existing_item"
 		plan.ExpectedParentKey = acquisition.ZotioItemKey
 		plan.PreviewArgs = []string{"--agent", "attachments", "add", acquisition.ZotioItemKey, artifactPath, "--mode", attachmentMode}
@@ -315,9 +328,9 @@ func (s *Service) fileCollection(ctx context.Context, plan *Plan, result *ApplyR
 	if collection == "" {
 		return
 	}
-	if keyRE.MatchString(collection) {
-		// Queue collection filters are keys; their existing parent already belongs
-		// to that collection, while add-to-collection accepts names only.
+	if plan.CollectionIsKey {
+		// A missing-PDF queue filter is a Zotero collection key. The existing
+		// parent already belongs to that collection; filing accepts names only.
 		return
 	}
 	detail := map[string]any{"collection": collection}
@@ -644,10 +657,11 @@ func (s *Service) recordFailedApplyAndInvalidatePlan(ctx context.Context, key st
 		Error:     info.Hint,
 		Zotio:     zotio,
 	}
-	if err := s.recordApply(ctx, key, result); err != nil {
+	durableCtx := context.WithoutCancel(ctx)
+	if err := s.recordApply(durableCtx, key, result); err != nil {
 		return WithErrorInfo(fmt.Errorf("recording failed Zotio apply: %w", applyErr), zotio)
 	}
-	if err := s.invalidatePlan(ctx, plan); err != nil {
+	if err := s.invalidatePlan(durableCtx, plan); err != nil {
 		return WithErrorInfo(fmt.Errorf("%w (invalidating cached Zotio plan: %w)", applyErr, err), zotio)
 	}
 	return WithErrorInfo(applyErr, zotio)
@@ -712,9 +726,11 @@ func (s *Service) recordedApply(ctx context.Context, key string) (*ApplyResult, 
 }
 
 func (s *Service) claimApply(ctx context.Context, key, jobID string) (bool, error) {
+	now := s.now().UTC()
+	leaseExpiry := now.Add(-applyClaimLease).Unix()
 	result, err := s.Store.DB().ExecContext(ctx, `
 		INSERT INTO exports (job_id, kind, idempotency_key, result_json, created_at)
-		VALUES (?, 'zotio_apply', ?, '{"status":"in_progress"}', ?)
+		VALUES (?, 'zotio_apply', ?, json_object('status', 'in_progress', 'claimed_at', ?), ?)
 		ON CONFLICT(idempotency_key) DO UPDATE SET
 			job_id = excluded.job_id,
 			kind = excluded.kind,
@@ -722,9 +738,14 @@ func (s *Service) claimApply(ctx context.Context, key, jobID string) (bool, erro
 			result_json = excluded.result_json,
 			created_at = excluded.created_at
 		WHERE exports.kind = 'zotio_apply' AND (
-			exports.result_json IS NULL OR json_extract(exports.result_json, '$.status') = 'failed'
+			exports.result_json IS NULL
+			OR json_extract(exports.result_json, '$.status') = 'failed'
+			OR (
+				json_extract(exports.result_json, '$.status') = 'in_progress'
+				AND CAST(json_extract(exports.result_json, '$.claimed_at') AS INTEGER) <= ?
+			)
 		)`,
-		jobID, key, store.Now())
+		jobID, key, now.Unix(), store.Now(), leaseExpiry)
 	if err != nil {
 		return false, err
 	}

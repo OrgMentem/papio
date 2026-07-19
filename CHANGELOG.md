@@ -16,11 +16,11 @@ A triaged glean audit pass (33 confirmed findings fixed, each with a
 regression test where behavior changed):
 
 - OA resolver identity verification: CORE, Europe PMC, and OpenAlex title
-  searches now verify normalized title, publication year, and the full author
-  list before trusting a result; Unpaywall requires the returned DOI to match
-  the requested one; arXiv compares exact version-stripped IDs instead of
-  substring matching. Cuts wrong-paper acquisition risk across the discovery
-  plane.
+  searches now verify the normalized title — plus publication year and the
+  full author list whenever the request supplies them — before trusting a
+  result; Unpaywall requires the returned DOI to match the requested one;
+  arXiv compares exact version-stripped IDs instead of substring matching.
+  Cuts wrong-paper acquisition risk across the discovery plane.
 - PDF identity matching scopes DOI and supplementary-material signals to the
   document's front matter, so a bibliography citing other DOIs — or a body
   mention of "supplementary material" — no longer rejects a correct article.
@@ -31,12 +31,14 @@ regression test where behavior changed):
   instead of hard-linking the immutable store (a consumer mutating the copy
   could corrupt it); concurrent same-hash promotions converge atomically;
   failed exports roll back the files they created; failed SQLite backups no
-  longer strand a partial destination file.
+  longer strand a partial destination file; promotion and backup fall back
+  gracefully on filesystems without hard-link support.
 - Concurrency: RPC calls on separate IPC connections no longer serialize
   daemon-wide behind one slow call; the browser bridge releases its session
   lock during PDF validation on download adoption; the serial auto-importer
   releases its lock during retry backoff; concurrent Zotio plan applies of the
-  same plan are now mutually exclusive.
+  same plan are now mutually exclusive, and a claim abandoned by a crash or
+  cancellation heals after a 15-minute lease instead of wedging the plan.
 - Job lifecycle: context cancellation during auto-import stays retryable
   instead of recording a permanent failure; crash recovery clears abandoned
   quarantine files and the quarantine sweep continues past individual cleanup
@@ -46,9 +48,10 @@ regression test where behavior changed):
   the next event; `ping` answers from cache instead of blocking on the daily
   update check.
 - Protocol strictness: strict JSON decoding rejects trailing documents; batch
-  submissions reject unknown fields; Zotero item keys are validated at the
-  protocol boundary with zotio's exact 8-character contract; batch identity
-  hashes widened from 32 to 128 bits.
+  submissions reject unknown fields; Zotero item keys are validated
+  fail-closed at the zotio integration boundary (the published v1 protocol
+  contract is unchanged); batch identity hashes widened from 32 to 128 bits,
+  with manifests from earlier releases still readable.
 
 ## [0.5.0] - 2026-07-19
 

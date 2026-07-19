@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 )
 
 // Layout under the data directory.
@@ -22,6 +23,9 @@ const (
 	quarantineDir = "quarantine"
 	artifactsDir  = "artifacts"
 )
+
+// linkFile lets tests simulate filesystems that do not support hard links.
+var linkFile = os.Link
 
 // Store manages quarantine and immutable artifact paths under dataDir.
 type Store struct{ dataDir string }
@@ -68,7 +72,10 @@ func (s *Store) ArtifactPath(sha string) (string, error) {
 // verifying its hash on the way. Idempotent: if the artifact already exists
 // with matching content, the temp file is discarded and the existing path is
 // returned. The temp file must live on the same filesystem (it does; both are
-// under dataDir), allowing link to atomically claim the destination.
+// under dataDir), allowing link to atomically claim the destination. On
+// filesystems without hard-link support, Promote checks that the destination is
+// absent before renaming instead; that fallback is weaker against cross-process
+// publication races.
 func (s *Store) Promote(tempPath, expectedSHA string) (string, error) {
 	dest, err := s.ArtifactPath(expectedSHA)
 	if err != nil {
@@ -84,25 +91,63 @@ func (s *Store) Promote(tempPath, expectedSHA string) (string, error) {
 	if sha != expectedSHA {
 		return "", fmt.Errorf("quarantine file hash %s does not match expected %s", sha, expectedSHA)
 	}
-	if err := os.Link(tempPath, dest); err != nil {
-		if !errors.Is(err, fs.ErrExist) {
+
+	renamed := false
+	if err := linkFile(tempPath, dest); err != nil {
+		switch {
+		case errors.Is(err, fs.ErrExist):
+			if err := validateExisting(dest, expectedSHA); err != nil {
+				return "", err
+			}
+		case linkUnsupported(err):
+			if _, statErr := os.Lstat(dest); statErr == nil {
+				if err := validateExisting(dest, expectedSHA); err != nil {
+					return "", err
+				}
+			} else if !os.IsNotExist(statErr) {
+				return "", fmt.Errorf("checking existing artifact: %w", statErr)
+			} else if err := os.Rename(tempPath, dest); err != nil {
+				if !errors.Is(err, fs.ErrExist) {
+					return "", fmt.Errorf("promoting artifact without hard links: %w", err)
+				}
+				if err := validateExisting(dest, expectedSHA); err != nil {
+					return "", err
+				}
+			} else {
+				renamed = true
+			}
+		default:
 			return "", fmt.Errorf("promoting artifact: %w", err)
-		}
-		got, existingSize, hashErr := HashFile(dest)
-		if hashErr != nil {
-			return "", fmt.Errorf("hashing existing artifact: %w", hashErr)
-		}
-		if existingSize == 0 || got != expectedSHA {
-			return "", fmt.Errorf("existing artifact %s has hash %s, want %s", dest, got, expectedSHA)
 		}
 	}
 	if err := os.Chmod(dest, 0o400); err != nil {
 		return "", err
 	}
-	if err := os.Remove(tempPath); err != nil {
-		return "", err
+	if !renamed {
+		if err := os.Remove(tempPath); err != nil {
+			return "", err
+		}
 	}
 	return dest, nil
+}
+
+func validateExisting(dest, expectedSHA string) error {
+	got, existingSize, err := HashFile(dest)
+	if err != nil {
+		return fmt.Errorf("hashing existing artifact: %w", err)
+	}
+	if existingSize == 0 || got != expectedSHA {
+		return fmt.Errorf("existing artifact %s has hash %s, want %s", dest, got, expectedSHA)
+	}
+	return nil
+}
+
+func linkUnsupported(err error) bool {
+	var linkErr *os.LinkError
+	return errors.As(err, &linkErr) &&
+		(errors.Is(linkErr.Err, syscall.EPERM) ||
+			errors.Is(linkErr.Err, syscall.ENOTSUP) ||
+			errors.Is(linkErr.Err, syscall.EOPNOTSUPP))
 }
 
 // Verify re-hashes a stored artifact against its name.

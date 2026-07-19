@@ -10,6 +10,7 @@ import (
 	"errors"
 	"log"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"papio/internal/batch"
@@ -61,9 +62,10 @@ func Router(system *bootstrap.System) ipc.Router {
 // RouterWithShutdown adds the process-lifecycle method used by `daemon stop`.
 // The delayed callback lets the successful response flush before cancellation.
 func RouterWithShutdown(system *bootstrap.System, shutdown context.CancelFunc) ipc.Router {
+	var updateRefreshInFlight atomic.Bool
 	methods := map[string]ipc.MethodHandler{
 		"ping": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
-			return ping(ctx, raw, system)
+			return ping(ctx, raw, system, &updateRefreshInFlight)
 		},
 		"acquire.submit": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return submit(ctx, raw, system)
@@ -181,7 +183,7 @@ type statusResult struct {
 	ZotioLatestVersion   string `json:"zotio_latest_version,omitempty"`
 }
 
-func ping(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
+func ping(ctx context.Context, raw json.RawMessage, system *bootstrap.System, updateRefreshInFlight *atomic.Bool) ([]byte, *ipc.RPCError) {
 	var params struct{}
 	if err := ipc.DecodeParams(raw, &params); err != nil {
 		return badParams(err)
@@ -191,20 +193,24 @@ func ping(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([
 		result.ExtensionVersion, _, result.ExtensionConnected = system.Browser.SessionInfo()
 	}
 	if system != nil && system.Updates != nil {
+		refresh := updateRefreshInFlight.CompareAndSwap(false, true)
 		available := false
 		if info := system.Updates.Cached(); info != nil {
 			result.LatestVersion = info.LatestVersion
 			available = update.IsNewer(info.LatestVersion, Version)
 		}
 		result.UpdateAvailable = &available
-		checker := system.Updates
-		// The refresh must outlive this RPC: WithoutCancel keeps the request's
-		// values but detaches its cancellation so a returning ping cannot abort
-		// the once-daily check.
-		refreshCtx := context.WithoutCancel(ctx)
-		go func() {
-			_, _ = checker.Check(refreshCtx)
-		}()
+		if refresh {
+			checker := system.Updates
+			// The refresh must outlive this RPC: WithoutCancel keeps the request's
+			// values but detaches its cancellation so a returning ping cannot abort
+			// the once-daily check.
+			refreshCtx := context.WithoutCancel(ctx)
+			go func() {
+				defer updateRefreshInFlight.Store(false)
+				_, _ = checker.Check(refreshCtx)
+			}()
+		}
 		zotioAvailable := false
 		if info, installed := update.NewZotio(system.Config.DataDir).CachedState(); info != nil {
 			result.ZotioLatestVersion = info.LatestVersion

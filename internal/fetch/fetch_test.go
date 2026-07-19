@@ -448,6 +448,61 @@ func TestCredentialsAreStrippedWhenOnlyPortChanges(t *testing.T) {
 	}
 }
 
+func TestCredentialsSurviveDefaultPortRedirect(t *testing.T) {
+	var second *http.Request
+	d := testDownloader(t, publicResolver(nil), roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Port() == "" {
+			return response(http.StatusFound, "", map[string]string{"Location": "https://papers.example:443/file"}), nil
+		}
+		second = req.Clone(req.Context())
+		return response(http.StatusOK, "%PDF-1.7", nil), nil
+	}))
+	req, _ := http.NewRequest(http.MethodGet, "https://papers.example/file", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	if _, err := d.DownloadRequest(context.Background(), req, filepath.Join(t.TempDir(), "x")); err != nil {
+		t.Fatal(err)
+	}
+	if second == nil || second.Header.Get("Authorization") != "Bearer secret" {
+		t.Fatal("authorization was stripped on a same-origin default-port redirect")
+	}
+}
+
+func TestReadBodyWithContextReturnsWhenCloseDoesNotUnblockRead(t *testing.T) {
+	body := newCloseIgnoringBody()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	defer close(body.release)
+	readDone := make(chan error, 1)
+	go func() {
+		_, err := readBodyWithContext(ctx, body, make([]byte, 1))
+		readDone <- err
+	}()
+	select {
+	case <-body.started:
+	case <-time.After(time.Second):
+		t.Fatal("reader did not start")
+	}
+
+	start := time.Now()
+	cancel()
+	select {
+	case err := <-readDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("read error = %v, want context canceled", err)
+		}
+		if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+			t.Fatalf("cancellation returned after %s", elapsed)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("read did not return after cancellation")
+	}
+	select {
+	case <-body.closed:
+	default:
+		t.Fatal("cancellation did not close response body")
+	}
+}
+
 func TestReadBodyWithContextClosesAndDrainsBlockedReader(t *testing.T) {
 	body := newCloseBlockingBody()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -551,6 +606,31 @@ func (b *closeBlockingBody) Close() error {
 	default:
 		close(b.closed)
 	}
+	return nil
+}
+
+type closeIgnoringBody struct {
+	closed  chan struct{}
+	release chan struct{}
+	started chan struct{}
+}
+
+func newCloseIgnoringBody() *closeIgnoringBody {
+	return &closeIgnoringBody{
+		closed:  make(chan struct{}),
+		release: make(chan struct{}),
+		started: make(chan struct{}),
+	}
+}
+
+func (b *closeIgnoringBody) Read(_ []byte) (int, error) {
+	close(b.started)
+	<-b.release
+	return 0, io.EOF
+}
+
+func (b *closeIgnoringBody) Close() error {
+	close(b.closed)
 	return nil
 }
 

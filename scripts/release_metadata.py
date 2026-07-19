@@ -89,6 +89,9 @@ SEMVER_CORE_RE = re.compile(
     r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$"
 )
 
+CHROME_MANIFEST_VERSION_RE = re.compile(r"^\d+(?:\.\d+){0,3}$")
+TOP_LEVEL_VERSION_RE = re.compile(r'^(  "version"\s*:\s*")([^"]+)(")', re.MULTILINE)
+
 
 def semver_core(version: str) -> tuple[int, int, int]:
     match = SEMVER_CORE_RE.fullmatch(version)
@@ -265,21 +268,37 @@ def bump_extension(args: argparse.Namespace) -> None:
     each file's formatting is untouched.
     """
     version = args.version
-    try:
-        semver_core(version)
-    except ValueError as exc:
-        raise SystemExit(f"bump-extension: {exc}")
+    if CHROME_MANIFEST_VERSION_RE.fullmatch(version) is None:
+        raise SystemExit(
+            "bump-extension: Chrome manifest version must be 1-4 dot-separated "
+            f"integers without prerelease or build suffixes: {version!r}"
+        )
     root = Path(args.repo_root)
-    version_re = re.compile(r'^(\s*"version"\s*:\s*")([^"]+)(")', re.MULTILINE)
+    updates: list[tuple[Path, str, str, str]] = []
     for relative in ("extension/manifest.json", "extension/package.json"):
         path = root / relative
-        text = path.read_text(encoding="utf-8")
-        updated, count = version_re.subn(
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise SystemExit(f"bump-extension: could not read {relative}: {exc}") from exc
+        parsed_version = read_version(path, relative)
+        match = TOP_LEVEL_VERSION_RE.search(text)
+        if match is None:
+            raise SystemExit(
+                f"bump-extension: no top-level version field found in {relative}"
+            )
+        old = match.group(2)
+        if old != parsed_version:
+            raise SystemExit(
+                f"bump-extension: top-level version in {relative} ({old!r}) "
+                f"does not match its parsed version ({parsed_version!r})"
+            )
+        updated = TOP_LEVEL_VERSION_RE.sub(
             lambda m: f"{m.group(1)}{version}{m.group(3)}", text, count=1
         )
-        if count != 1:
-            raise SystemExit(f"bump-extension: no version field found in {relative}")
-        old = version_re.search(text).group(2)
+        updates.append((path, relative, old, updated))
+
+    for path, relative, old, updated in updates:
         path.write_text(updated, encoding="utf-8")
         print(f"{relative}: {old} -> {version}")
 
