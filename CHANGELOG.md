@@ -4,6 +4,19 @@ All notable changes to *papio* are documented here. This initial release entry i
 synthesized from the complete `papio` and `zotio` Git histories and the execution
 records in `notes/acquisition-stack-plan.md`.
 
+## [0.5.0] - 2026-07-19
+
+### Added
+
+- Broader browser reach for the native-messaging connector. `papio native-host
+  install` now registers the host with every installed Chromium browser it
+  detects — Chrome, Edge, Vivaldi, Brave, Opera (Chromium too) — plus Firefox,
+  each at its own per-user location (directory on macOS/Linux, registry key on
+  Windows), so the same extension works across them. A new `browser.extension_ids`
+  config field lists additional Chrome-family extension IDs (e.g. an Edge
+  Add-ons build) alongside `extension_id`; the daemon accepts any of them and the
+  manifest's `allowed_origins` lists them all.
+
 ## [0.4.0] - 2026-07-19
 
 ### Added
@@ -20,14 +33,6 @@ records in `notes/acquisition-stack-plan.md`.
   refresh it). Configuration lives at `%APPDATA%\papio` and data at
   `%LOCALAPPDATA%\papio`, and the update hint recognizes Scoop
   (`scoop update papio`). macOS and Linux behavior is unchanged.
-- Broader browser reach for the native-messaging connector. `papio native-host
-  install` now registers the host with every installed Chromium browser it
-  detects — Chrome, Edge, Vivaldi, Brave, Opera (Chromium too) — plus Firefox,
-  each at its own per-user location (directory on macOS/Linux, registry key on
-  Windows), so the same extension works across them. A new `browser.extension_ids`
-  config field lists additional Chrome-family extension IDs (e.g. an Edge
-  Add-ons build) alongside `extension_id`; the daemon accepts any of them and the
-  manifest's `allowed_origins` lists them all.
 
 ## [0.3.0] - 2026-07-18
 
