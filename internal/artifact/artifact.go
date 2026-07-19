@@ -8,8 +8,10 @@ package artifact
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -66,7 +68,7 @@ func (s *Store) ArtifactPath(sha string) (string, error) {
 // verifying its hash on the way. Idempotent: if the artifact already exists
 // with matching content, the temp file is discarded and the existing path is
 // returned. The temp file must live on the same filesystem (it does; both are
-// under dataDir), making the rename atomic.
+// under dataDir), allowing link to atomically claim the destination.
 func (s *Store) Promote(tempPath, expectedSHA string) (string, error) {
 	dest, err := s.ArtifactPath(expectedSHA)
 	if err != nil {
@@ -82,15 +84,22 @@ func (s *Store) Promote(tempPath, expectedSHA string) (string, error) {
 	if sha != expectedSHA {
 		return "", fmt.Errorf("quarantine file hash %s does not match expected %s", sha, expectedSHA)
 	}
-	if _, err := os.Stat(dest); err == nil {
-		// Content-addressed: same hash, same bytes. Drop the duplicate.
-		_ = os.Remove(tempPath)
-		return dest, nil
+	if err := os.Link(tempPath, dest); err != nil {
+		if !errors.Is(err, fs.ErrExist) {
+			return "", fmt.Errorf("promoting artifact: %w", err)
+		}
+		got, existingSize, hashErr := HashFile(dest)
+		if hashErr != nil {
+			return "", fmt.Errorf("hashing existing artifact: %w", hashErr)
+		}
+		if existingSize == 0 || got != expectedSHA {
+			return "", fmt.Errorf("existing artifact %s has hash %s, want %s", dest, got, expectedSHA)
+		}
 	}
-	if err := os.Rename(tempPath, dest); err != nil {
-		return "", fmt.Errorf("promoting artifact: %w", err)
+	if err := os.Chmod(dest, 0o400); err != nil {
+		return "", err
 	}
-	if err := os.Chmod(dest, 0o400); err != nil { // immutable by convention: read-only
+	if err := os.Remove(tempPath); err != nil {
 		return "", err
 	}
 	return dest, nil

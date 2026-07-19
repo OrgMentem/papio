@@ -192,11 +192,15 @@ func ping(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([
 	}
 	if system != nil && system.Updates != nil {
 		available := false
-		if info, _ := system.Updates.Check(ctx); info != nil {
+		if info := system.Updates.Cached(); info != nil {
 			result.LatestVersion = info.LatestVersion
 			available = update.IsNewer(info.LatestVersion, Version)
 		}
 		result.UpdateAvailable = &available
+		checker := system.Updates
+		go func() {
+			_, _ = checker.Check(context.Background())
+		}()
 		zotioAvailable := false
 		if info, installed := update.NewZotio(system.Config.DataDir).CachedState(); info != nil {
 			result.ZotioLatestVersion = info.LatestVersion

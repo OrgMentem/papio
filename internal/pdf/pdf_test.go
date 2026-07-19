@@ -173,6 +173,12 @@ func TestMatchIdentity(t *testing.T) {
 	if got := MatchIdentity(text, target); got.Result != IdentityPass {
 		t.Fatalf("title match: %+v", got)
 	}
+	if got := MatchIdentity(text+"\fReferences\n10.9999/nope", target); got.Result != IdentityPass {
+		t.Fatalf("reference DOI: %+v", got)
+	}
+	if got := MatchIdentity(text+"\nAbstract\nSee supplementary material for methods.", target); got.Result != IdentityPass {
+		t.Fatalf("body supplementary mention: %+v", got)
+	}
 	legacyAPA := work.Work{DOI: "10.1037/0021-9010.87.4.611"}
 	if got := MatchIdentity("Copyright line DOI: 10.1037//0021-9010.87.4.611", legacyAPA); got.Result != IdentityPass {
 		t.Fatalf("legacy APA DOI: %+v", got)

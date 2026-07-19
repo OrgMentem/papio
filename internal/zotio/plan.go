@@ -308,11 +308,20 @@ func (s *Service) Apply(ctx context.Context, planID, confirmation string) (*Appl
 // durably recorded. Filing is deliberately best-effort: an attachment/import
 // must not be rolled back because a collection write cannot be completed.
 func (s *Service) fileCollection(ctx context.Context, plan *Plan, result *ApplyResult) {
-	if plan == nil || result == nil || strings.TrimSpace(plan.Collection) == "" || result.ParentKey == "" {
+	if plan == nil || result == nil || result.ParentKey == "" {
 		return
 	}
-	detail := map[string]any{"collection": plan.Collection}
-	if _, err := s.CLI.RunJSON(ctx, "--agent", "--yes", "items", "add-to-collection", result.ParentKey, "--collection-name", plan.Collection); err != nil {
+	collection := strings.TrimSpace(plan.Collection)
+	if collection == "" {
+		return
+	}
+	if keyRE.MatchString(collection) {
+		// Queue collection filters are keys; their existing parent already belongs
+		// to that collection, while add-to-collection accepts names only.
+		return
+	}
+	detail := map[string]any{"collection": collection}
+	if _, err := s.CLI.RunJSON(ctx, "--agent", "--yes", "items", "add-to-collection", result.ParentKey, "--collection-name", collection); err != nil {
 		info := ErrorInfoFrom(err)
 		detail["status"] = "error"
 		detail["error_type"] = fmt.Sprintf("%T", err)
@@ -686,17 +695,17 @@ func (s *Service) recordedApply(ctx context.Context, key string) (*ApplyResult, 
 		return nil, err
 	}
 	if !raw.Valid || raw.String == "" {
-		// A process can stop after claiming a reservation but before recording
-		// Zotio's result. claimApply replaces that abandoned claim below.
+		// A legacy reservation may have been recorded before claims carried an
+		// explicit in-progress status. claimApply replaces it below.
 		return nil, nil
 	}
 	var result ApplyResult
 	if err := json.Unmarshal([]byte(raw.String), &result); err != nil {
 		return nil, fmt.Errorf("decoding recorded Zotio apply: %w", err)
 	}
-	if result.Status == "failed" {
-		// A Zotio-side defect may have caused a recorded failure. Let claimApply
-		// replace it so a later replay can apply the same idempotent mutation.
+	if result.Status == "in_progress" || result.Status == "failed" {
+		// A failed apply is replayable; an in-progress apply remains owned by
+		// another worker and is surfaced as a conflict by Apply.
 		return nil, nil
 	}
 	return &result, nil
@@ -704,13 +713,13 @@ func (s *Service) recordedApply(ctx context.Context, key string) (*ApplyResult, 
 
 func (s *Service) claimApply(ctx context.Context, key, jobID string) (bool, error) {
 	result, err := s.Store.DB().ExecContext(ctx, `
-		INSERT INTO exports (job_id, kind, idempotency_key, created_at)
-		VALUES (?, 'zotio_apply', ?, ?)
+		INSERT INTO exports (job_id, kind, idempotency_key, result_json, created_at)
+		VALUES (?, 'zotio_apply', ?, '{"status":"in_progress"}', ?)
 		ON CONFLICT(idempotency_key) DO UPDATE SET
 			job_id = excluded.job_id,
 			kind = excluded.kind,
 			path = NULL,
-			result_json = NULL,
+			result_json = excluded.result_json,
 			created_at = excluded.created_at
 		WHERE exports.kind = 'zotio_apply' AND (
 			exports.result_json IS NULL OR json_extract(exports.result_json, '$.status') = 'failed'
@@ -729,7 +738,8 @@ func (s *Service) recordApply(ctx context.Context, key string, result *ApplyResu
 		return err
 	}
 	updated, err := s.Store.DB().ExecContext(ctx,
-		`UPDATE exports SET result_json = ? WHERE kind = 'zotio_apply' AND idempotency_key = ? AND result_json IS NULL`,
+		`UPDATE exports SET result_json = ? WHERE kind = 'zotio_apply' AND idempotency_key = ?
+			AND json_extract(result_json, '$.status') = 'in_progress'`,
 		string(raw), key)
 	if err != nil {
 		return err
@@ -775,9 +785,6 @@ func materializePrivateFile(source, target, expectedSHA string) error {
 		return nil
 	}
 	_ = os.Remove(target)
-	if err := os.Link(source, target); err == nil {
-		return verifyFileSHA256(target, expectedSHA)
-	}
 	in, err := os.Open(source)
 	if err != nil {
 		return err

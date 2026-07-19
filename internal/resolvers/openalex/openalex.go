@@ -141,6 +141,9 @@ func (r *Resolver) Resolve(ctx context.Context, requested work.Work) ([]resolver
 			return nil, nil
 		}
 		record = results.Results[0]
+		if !matchesTitleSearch(record, requested) {
+			return nil, nil
+		}
 	} else if err := decodeBoundedJSON(resp.Body, r.maxBody, &record); err != nil {
 		return nil, fmt.Errorf("openalex: invalid response: %w", err)
 	}
@@ -310,6 +313,64 @@ func resolvedWork(record workRecord) work.Work {
 		}
 	}
 	return resolved
+}
+
+func matchesTitleSearch(record workRecord, requested work.Work) bool {
+	if normalizeTitle(record.Title) != normalizeTitle(requested.Title) {
+		return false
+	}
+	if requested.Year != 0 && record.PublicationYear != requested.Year {
+		return false
+	}
+	recordAuthors := make([]string, 0, len(record.Authorships))
+	for _, authorship := range record.Authorships {
+		if name := strings.TrimSpace(authorship.Author.DisplayName); name != "" {
+			recordAuthors = append(recordAuthors, name)
+		}
+	}
+	return sameAuthorLists(recordAuthors, requested.Authors)
+}
+
+func sameAuthorLists(recordAuthors, requestedAuthors []string) bool {
+	if len(requestedAuthors) == 0 {
+		return true
+	}
+	if len(recordAuthors) != len(requestedAuthors) {
+		return false
+	}
+	matched := make([]bool, len(recordAuthors))
+	for _, requestedAuthor := range requestedAuthors {
+		found := false
+		for i, recordAuthor := range recordAuthors {
+			if !matched[i] && sameAuthor(recordAuthor, requestedAuthor) {
+				matched[i], found = true, true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+func sameAuthor(left, right string) bool {
+	left, right = normalizeTitle(left), normalizeTitle(right)
+	if left == "" || right == "" {
+		return false
+	}
+	if left == right {
+		return true
+	}
+	leftParts, rightParts := strings.Fields(left), strings.Fields(right)
+	if len(leftParts) == 0 || len(rightParts) == 0 || leftParts[len(leftParts)-1] != rightParts[len(rightParts)-1] {
+		return false
+	}
+	return leftParts[0][0] == rightParts[0][0]
+}
+
+func normalizeTitle(value string) string {
+	return strings.ToLower(strings.Join(strings.Fields(value), " "))
 }
 
 func isLoopbackHost(host string) bool {

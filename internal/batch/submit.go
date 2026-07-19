@@ -3,6 +3,7 @@
 package batch
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -58,6 +59,18 @@ type workInput struct {
 	Authors        []string `json:"authors,omitempty"`
 	Year           int      `json:"year,omitempty"`
 	DesiredVersion string   `json:"desired_version,omitempty"`
+	Container      string   `json:"container,omitempty"`
+}
+
+type discoveredWorkEnvelope struct {
+	Work         json.RawMessage `json:"work"`
+	OpenAlexID   json.RawMessage `json:"openalex_id"`
+	IsOA         json.RawMessage `json:"is_oa"`
+	OAURL        json.RawMessage `json:"oa_url"`
+	CitedBy      json.RawMessage `json:"cited_by"`
+	Abstract     json.RawMessage `json:"abstract"`
+	Owned        json.RawMessage `json:"owned"`
+	OwnedItemKey json.RawMessage `json:"owned_item_key"`
 }
 
 // ParseWork decodes one bare work or discovered-work envelope with the same
@@ -70,11 +83,19 @@ func ParseWork(data json.RawMessage) (protocol.WorkRequest, error) {
 	if envelope == nil {
 		return protocol.WorkRequest{}, fmt.Errorf("work must be a JSON object")
 	}
-	if wrapped, ok := envelope["work"]; ok {
-		data = wrapped
+	if _, ok := envelope["work"]; ok {
+		var discovered discoveredWorkEnvelope
+		dec := json.NewDecoder(bytes.NewReader(data))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&discovered); err != nil {
+			return protocol.WorkRequest{}, fmt.Errorf("decoding discovered work: %w", err)
+		}
+		data = discovered.Work
 	}
 	var input workInput
-	if err := json.Unmarshal(data, &input); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&input); err != nil {
 		return protocol.WorkRequest{}, fmt.Errorf("decoding work: %w", err)
 	}
 	identifiers, err := identifiers(input)
@@ -136,6 +157,8 @@ func trimNonempty(values []string) []string {
 	return out
 }
 
+const batchIdentityHashBytes = 16
+
 func batchRequestID(ids *protocol.Identifiers, title string, authors []string, year int) string {
 	key := ""
 	if ids != nil {
@@ -156,7 +179,7 @@ func batchRequestID(ids *protocol.Identifiers, title string, authors []string, y
 		key = fmt.Sprintf("title:%s\nauthors:%s\nyear:%d", strings.TrimSpace(title), strings.Join(authors, "\x00"), year)
 	}
 	sum := sha256.Sum256([]byte(key))
-	return fmt.Sprintf("batch-%x", sum[:4])
+	return fmt.Sprintf("batch-%x", sum[:batchIdentityHashBytes])
 }
 
 // InitialRequestID returns the pre-manifest deterministic request identity

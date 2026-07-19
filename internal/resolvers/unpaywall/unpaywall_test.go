@@ -26,14 +26,14 @@ func responseFor(status int, body string, headers map[string]string) *http.Respo
 }
 
 func TestResolveVectors(t *testing.T) {
-	const best = `{"is_oa":true,"title":"A title","year":2024,"publication_year":1999,"z_authors":[{"given":"A.","family":"Author"}],"best_oa_location":{"url_for_pdf":"https://best.example/article.pdf","url_for_landing_page":"https://best.example/article","host_type":"publisher","version":"publishedVersion","license":"cc-by"},"oa_locations":[{"url_for_pdf":"https://later.example/article.pdf"}]}`
-	const fallback = `{"is_oa":true,"best_oa_location":{"url":"https://landing.example/best"},"oa_locations":[{"url":"https://landing.example/first"},{"url_for_pdf":"https://pdf.example/first.pdf","version":"acceptedVersion"},{"url_for_pdf":"https://pdf.example/second.pdf"}]}`
-	const landing = `{"is_oa":true,"best_oa_location":{"url":"https://landing.example/best"},"oa_locations":[{"url":"https://landing.example/first"}]}`
-	const missing = `{"is_oa":true,"best_oa_location":{"url_for_pdf":"https://best.example/article.pdf"}}`
-	const secret = `{"is_oa":true,"best_oa_location":{"url_for_pdf":"https://files.example/a.pdf?token=SECRET"}}`
-	const invalidBest = `{"is_oa":true,"best_oa_location":{"url_for_pdf":"not a URL"},"oa_locations":[{"url_for_pdf":"https://pdf.example/fallback.pdf"}]}`
-	const invalidBestLanding = `{"is_oa":true,"best_oa_location":{"url_for_landing_page":"not a URL","url":"https://landing.example/best"}}`
-	const fallbackLanding = `{"is_oa":true,"best_oa_location":{"url_for_landing_page":"not a URL"},"oa_locations":[{"url":"https://landing.example/fallback"}]}`
+	const best = `{"doi":"10.1000/example","is_oa":true,"title":"A title","year":2024,"publication_year":1999,"z_authors":[{"given":"A.","family":"Author"}],"best_oa_location":{"url_for_pdf":"https://best.example/article.pdf","url_for_landing_page":"https://best.example/article","host_type":"publisher","version":"publishedVersion","license":"cc-by"},"oa_locations":[{"url_for_pdf":"https://later.example/article.pdf"}]}`
+	const fallback = `{"doi":"10.1000/example","is_oa":true,"best_oa_location":{"url":"https://landing.example/best"},"oa_locations":[{"url":"https://landing.example/first"},{"url_for_pdf":"https://pdf.example/first.pdf","version":"acceptedVersion"},{"url_for_pdf":"https://pdf.example/second.pdf"}]}`
+	const landing = `{"doi":"10.1000/example","is_oa":true,"best_oa_location":{"url":"https://landing.example/best"},"oa_locations":[{"url":"https://landing.example/first"}]}`
+	const missing = `{"doi":"10.1000/example","is_oa":true,"best_oa_location":{"url_for_pdf":"https://best.example/article.pdf"}}`
+	const secret = `{"doi":"10.1000/example","is_oa":true,"best_oa_location":{"url_for_pdf":"https://files.example/a.pdf?token=SECRET"}}`
+	const invalidBest = `{"doi":"10.1000/example","is_oa":true,"best_oa_location":{"url_for_pdf":"not a URL"},"oa_locations":[{"url_for_pdf":"https://pdf.example/fallback.pdf"}]}`
+	const invalidBestLanding = `{"doi":"10.1000/example","is_oa":true,"best_oa_location":{"url_for_landing_page":"not a URL","url":"https://landing.example/best"}}`
+	const fallbackLanding = `{"doi":"10.1000/example","is_oa":true,"best_oa_location":{"url_for_landing_page":"not a URL"},"oa_locations":[{"url":"https://landing.example/fallback"}]}`
 
 	tests := []struct {
 		name        string
@@ -141,5 +141,33 @@ func TestResolveIncludesDiscoveredWork(t *testing.T) {
 	got := candidates[0].ResolvedWork
 	if got.DOI != "10.1000/example" || got.Title != "Source title" || got.Year != 2024 || strings.Join(got.Authors, ",") != "A. Author,B. Author" {
 		t.Fatalf("ResolvedWork = %#v", got)
+	}
+}
+
+func TestResolveRequiresMatchingDOI(t *testing.T) {
+	const location = `,"is_oa":true,"best_oa_location":{"url_for_pdf":"https://files.example/article.pdf"}}`
+	cases := []struct {
+		name string
+		body string
+		want bool
+	}{
+		{"case-insensitive match", `{"doi":"10.1000/EXAMPLE"` + location, true},
+		{"doi URL match", `{"doi_url":"https://doi.org/10.1000/example"` + location, true},
+		{"mismatched DOI", `{"doi":"10.1000/other"` + location, false},
+		{"missing DOI", `{"is_oa":true,"best_oa_location":{"url_for_pdf":"https://files.example/article.pdf"}}`, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := New(clientFunc(func(*http.Request) (*http.Response, error) {
+				return responseFor(http.StatusOK, tc.body, nil), nil
+			}), "contact@example.org")
+			candidates, err := r.Resolve(context.Background(), work.Work{DOI: "10.1000/example"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if (len(candidates) == 1) != tc.want {
+				t.Fatalf("candidates = %#v, want match=%v", candidates, tc.want)
+			}
+		})
 	}
 }

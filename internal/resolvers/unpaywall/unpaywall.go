@@ -138,6 +138,9 @@ func (r *Resolver) Resolve(ctx context.Context, requested work.Work) ([]resolver
 	if err := decodeBoundedJSON(resp.Body, r.maxBody, &record); err != nil {
 		return nil, fmt.Errorf("unpaywall: invalid response: %w", err)
 	}
+	if !matchesDOI(record, doi) {
+		return nil, nil
+	}
 	if !record.IsOA {
 		return nil, nil
 	}
@@ -244,6 +247,15 @@ func resolvedWork(record response) work.Work {
 		}
 	}
 	return resolved
+}
+
+func matchesDOI(record response, requested string) bool {
+	for _, raw := range []string{record.DOI, record.DOIURL} {
+		if doi, err := work.NormalizeDOI(raw); err == nil && strings.EqualFold(doi, requested) {
+			return true
+		}
+	}
+	return false
 }
 
 func chooseLocation(best *location, locations []location) (*location, string, bool, string) {

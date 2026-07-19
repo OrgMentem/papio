@@ -143,16 +143,19 @@ func TestResolvePreservesBibliographicIdentityAndStripsCrossHostBearer(t *testin
 	}
 }
 
-func TestResolveRejectsConflictingTitleAuthorsAndNonFullTextLinks(t *testing.T) {
+func TestResolveRejectsConflictingTitleBibliographyAndNonFullTextLinks(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"results":[
-			{"doi":"10.1000/other","title":"Same title","authors":["Different Author"],"downloadUrl":"https://files.example/conflict.pdf"},
-			{"doi":"10.1000/other2","title":"Same title","authors":["Expected Author"],"links":[{"url":"https://publisher.example/metadata","type":"landing"}]}
+			{"doi":"10.1000/other","title":"Same title","authors":["Expected Author"],"yearPublished":2024,"downloadUrl":"https://files.example/incomplete-authors.pdf"},
+			{"doi":"10.1000/other2","title":"Same title","authors":["Expected Author","Second Author"],"yearPublished":2023,"downloadUrl":"https://files.example/wrong-year.pdf"},
+			{"doi":"10.1000/other3","title":"Same title","authors":["Expected Author","Second Author"],"yearPublished":2024,"links":[{"url":"https://publisher.example/metadata","type":"landing"}]}
 		]}`))
 	}))
 	defer server.Close()
 
-	got, err := NewWithOptions(Options{Client: server.Client(), APIKey: "key", BaseURL: server.URL}).Resolve(context.Background(), work.Work{Title: "Same title", Authors: []string{"Expected Author"}})
+	got, err := NewWithOptions(Options{Client: server.Client(), APIKey: "key", BaseURL: server.URL}).Resolve(context.Background(), work.Work{
+		Title: "Same title", Authors: []string{"Expected Author", "Second Author"}, Year: 2024,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -211,6 +211,17 @@ func TestEmptyResults(t *testing.T) {
 	}
 }
 
+func TestFirstResultRequiresExactArXivID(t *testing.T) {
+	feed := atomFeed{Entries: []atomEntry{
+		{ID: "http://arxiv.org/abs/2004.12345v1"},
+		{ID: "http://arxiv.org/abs/2004.1234v2"},
+	}}
+	got := feed.firstResult("2004.1234")
+	if got == nil || got.ID != "http://arxiv.org/abs/2004.1234v2" {
+		t.Fatalf("firstResult = %+v, want the exact ID", got)
+	}
+}
+
 func TestNoArxivIdentitySkipsNetwork(t *testing.T) {
 	hit := false
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

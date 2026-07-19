@@ -205,6 +205,10 @@ func TestRouterPingIncludesUpdatesOnlyWhenEnabled(t *testing.T) {
 		ReleasesURL: server.URL,
 		Client:      server.Client(),
 	})
+	papioCache := []byte(`{"latest_version":"99.0.0","url":"https://example.test/releases/v99.0.0"}`)
+	if err := os.WriteFile(filepath.Join(system.Config.DataDir, "update-cache.json"), papioCache, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	cache := []byte(`{"latest_version":"1.1.0","url":"https://example.test/zotio","installed_version":"1.0.0"}`)
 	if err := os.WriteFile(filepath.Join(system.Config.DataDir, "update-cache-zotio.json"), cache, 0o600); err != nil {
 		t.Fatal(err)
@@ -223,6 +227,43 @@ func TestRouterPingIncludesUpdatesOnlyWhenEnabled(t *testing.T) {
 	}
 	if enabled.ZotioUpdateAvailable == nil || !*enabled.ZotioUpdateAvailable || enabled.ZotioLatestVersion != "1.1.0" {
 		t.Fatalf("enabled Zotio update status = %+v", enabled)
+	}
+}
+
+func TestRouterPingReturnsCachedUpdateBeforeRefresh(t *testing.T) {
+	system := testSystem(t)
+	refreshStarted := make(chan struct{}, 1)
+	releaseRefresh := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		select {
+		case refreshStarted <- struct{}{}:
+		default:
+		}
+		select {
+		case <-releaseRefresh:
+		case <-time.After(2 * time.Second):
+		}
+		_, _ = w.Write([]byte(`{"tag_name":"v99.0.0","html_url":"https://example.test/releases/v99.0.0"}`))
+	}))
+	defer server.Close()
+	defer close(releaseRefresh)
+	system.Updates = update.NewWithOptions(update.Options{
+		DataDir:     system.Config.DataDir,
+		ReleasesURL: server.URL,
+		Client:      server.Client(),
+	})
+
+	start := time.Now()
+	if rpcErr := callMethod(t, Router(system), "ping", struct{}{}, nil); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("ping blocked on update refresh for %s", elapsed)
+	}
+	select {
+	case <-refreshStarted:
+	case <-time.After(time.Second):
+		t.Fatal("ping did not trigger an update refresh")
 	}
 }
 
@@ -383,7 +424,7 @@ func TestRouterDiscoverySearchAcceptsCitationSnowballWithoutQuery(t *testing.T) 
 func TestRouterAcquireReportJoinsManifestAgainstLiveJobState(t *testing.T) {
 	system := testSystem(t)
 	ctx := context.Background()
-	id, err := system.Jobs.CreateRequest(ctx, "batch-deadbeef-11111111", work.Work{DOI: "10.1000/report"}, "", "Reading", job.Policy{
+	id, err := system.Jobs.CreateRequest(ctx, "batch-dededededededededededededededede-11111111111111111111111111111111", work.Work{DOI: "10.1000/report"}, "", "Reading", job.Policy{
 		AccessMode: config.ModeConservative, DesiredVersion: "any", Collection: "Reading",
 	}, nil)
 	if err != nil {
@@ -401,10 +442,10 @@ func TestRouterAcquireReportJoinsManifestAgainstLiveJobState(t *testing.T) {
 		t.Fatal(err)
 	}
 	manifest := &batch.Manifest{
-		SchemaVersion: batch.SchemaVersion, ID: "batch-deadbeef", CreatedAt: "2026-07-15T12:00:00Z", Collection: "Reading",
+		SchemaVersion: batch.SchemaVersion, ID: "batch-dededededededededededededededede", CreatedAt: "2026-07-15T12:00:00Z", Collection: "Reading",
 		Works: []batch.ManifestWork{{
-			RequestID: "batch-deadbeef-11111111", JobID: id, Status: "submitted",
-			Work: protocol.WorkRequest{SchemaVersion: protocol.WorkRequestSchemaVersion, RequestID: "batch-deadbeef-11111111", Identifiers: &protocol.Identifiers{DOI: "10.1000/report"}, Collection: "Reading"},
+			RequestID: "batch-dededededededededededededededede-11111111111111111111111111111111", JobID: id, Status: "submitted",
+			Work: protocol.WorkRequest{SchemaVersion: protocol.WorkRequestSchemaVersion, RequestID: "batch-dededededededededededededededede-11111111111111111111111111111111", Identifiers: &protocol.Identifiers{DOI: "10.1000/report"}, Collection: "Reading"},
 		}},
 	}
 	if err := batch.Write(system.Config.DataDir, manifest); err != nil {
@@ -430,7 +471,7 @@ func TestRouterAcquireReportClassifiesErrors(t *testing.T) {
 		batchID string
 		want    string
 	}{
-		{name: "missing but valid id", batchID: "batch-00000000", want: "not_found"},
+		{name: "missing but valid id", batchID: "batch-00000000000000000000000000000000", want: "not_found"},
 		{name: "latest with none present", batchID: "latest", want: "not_found"},
 		{name: "malformed id", batchID: "not-a-batch", want: "invalid_argument"},
 	}

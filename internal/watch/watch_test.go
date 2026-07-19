@@ -223,12 +223,12 @@ func discovered(doi, openAlex string) discovery.DiscoveredWork {
 	}
 }
 
-func TestOpenAlexOnlyDiscoveryBuildsProtocolValidTitleRequest(t *testing.T) {
+func TestOpenAlexOnlyDiscoveryRetainsIdentifier(t *testing.T) {
 	requests := requestsForDiscovered([]discovery.DiscoveredWork{
 		discovered("", "https://openalex.org/W2741809807"),
 	})
-	if len(requests) != 1 || requests[0].Identifiers != nil {
-		t.Fatalf("requests = %+v, want one title-based request without openalex identifier", requests)
+	if len(requests) != 1 || requests[0].Identifiers == nil || requests[0].Identifiers.OpenAlex != "W2741809807" {
+		t.Fatalf("requests = %+v, want one request with its normalized OpenAlex identifier", requests)
 	}
 	manifest := batch.NewManifest(requests, "watch: protocol", "", time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC))
 	if err := manifest.Works[0].Work.Validate(); err != nil {

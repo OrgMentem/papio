@@ -66,7 +66,7 @@ func TestAcquireBatchCreatesReportableCLICompatibleManifest(t *testing.T) {
 			return zotio.LookupWorksResult{Works: []zotio.WorkOwnership{
 				{Status: zotio.OwnershipNotOwned},
 				{Status: zotio.OwnershipOwnedWithPDF},
-				{Status: zotio.OwnershipOwnedMissingPDF, ItemKey: "EXIST0001"},
+				{Status: zotio.OwnershipOwnedMissingPDF, ItemKey: "EXIST001"},
 			}}, nil
 		case "acquire.submit":
 			var input struct {
@@ -123,7 +123,7 @@ func TestAcquireBatchCreatesReportableCLICompatibleManifest(t *testing.T) {
 	if len(output.Submitted) != 2 || len(output.SkippedOwned) != 1 || len(output.ExistingItem) != 1 {
 		t.Fatalf("batch routing = %+v", output)
 	}
-	if output.ExistingItem[0].ZotioItemKey != "EXIST0001" || output.ExistingItem[0].Collection != "Reading" {
+	if output.ExistingItem[0].ZotioItemKey != "EXIST001" || output.ExistingItem[0].Collection != "Reading" {
 		t.Fatalf("existing-item routing = %+v", output.ExistingItem)
 	}
 

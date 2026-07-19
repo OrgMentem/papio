@@ -3,6 +3,7 @@ package zotio
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -239,6 +240,59 @@ func TestApplyRecoversAbandonedReservation(t *testing.T) {
 	}
 }
 
+func TestClaimApplyReservesInProgressStatus(t *testing.T) {
+	service, jobID := readyPlanService(t, "AB12CD34", &planCLI{})
+	ctx := context.Background()
+	key := "zotio_apply:claim-exclusive"
+
+	claimed, err := service.claimApply(ctx, key, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !claimed {
+		t.Fatal("first apply claim was not acquired")
+	}
+	var raw string
+	if err := service.Store.DB().QueryRowContext(ctx,
+		`SELECT result_json FROM exports WHERE kind = 'zotio_apply' AND idempotency_key = ?`, key,
+	).Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	if raw != `{"status":"in_progress"}` {
+		t.Fatalf("claim result_json = %q", raw)
+	}
+	claimed, err = service.claimApply(ctx, key, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed {
+		t.Fatal("second apply claim acquired an in-progress reservation")
+	}
+}
+
+func TestMaterializePrivateFileCopiesSource(t *testing.T) {
+	source := filepath.Join(t.TempDir(), "source.pdf")
+	target := filepath.Join(t.TempDir(), "target.pdf")
+	contents := []byte("immutable artifact contents")
+	if err := os.WriteFile(source, contents, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	expected := fmt.Sprintf("%x", sha256.Sum256(contents))
+	if err := materializePrivateFile(source, target, expected); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte("mutated staging file"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(contents) {
+		t.Fatalf("source changed through staged file: %q", got)
+	}
+}
+
 func TestFailedManifestApplyInvalidatesCachedDerivation(t *testing.T) {
 	invalidManifest := `{"schema_version":2,"entries":[{"path":"paper.pdf","classification":"new","action":"create","identifier_type":"doi","identifier":"10.1002/example","status":"resolved","item":{"itemType":"document","title":"Example Paper","publicationTitle":"not allowed for document"}}]}`
 	correctedManifest := `{"schema_version":2,"entries":[{"path":"paper.pdf","classification":"new","action":"create","identifier_type":"doi","identifier":"10.1002/example","status":"resolved","item":{"itemType":"journalArticle","title":"Example Paper","DOI":"10.1002/example"}}]}`
@@ -417,6 +471,18 @@ func TestPlanAndApplyFilesPolicyCollectionWithoutRollingBackImport(t *testing.T)
 	}
 	if !found {
 		t.Fatalf("collection filing failure was not recorded: %+v", events)
+	}
+}
+
+func TestFileCollectionSkipsQueueCollectionKey(t *testing.T) {
+	cli := &planCLI{}
+	service := &Service{CLI: cli}
+	service.fileCollection(context.Background(),
+		&Plan{Collection: "ZX98YU76"},
+		&ApplyResult{ParentKey: "AB12CD34"},
+	)
+	if cli.collectionCalls != 0 {
+		t.Fatalf("collection calls = %d, want 0", cli.collectionCalls)
 	}
 }
 

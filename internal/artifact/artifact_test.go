@@ -5,6 +5,7 @@ package artifact
 import (
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 )
 
@@ -57,6 +58,67 @@ func TestPromoteIsAtomicIdempotentAndVerifiable(t *testing.T) {
 	_ = os.WriteFile(temp3, []byte("different"), 0o600)
 	if _, err := s.Promote(temp3, sha); err == nil {
 		t.Fatal("promoted mismatched content")
+	}
+}
+
+func TestPromoteConcurrentlyConvergesForSameHash(t *testing.T) {
+	s, err := New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	q, err := s.QuarantineDir("job_x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := []byte("%PDF-1.4 fixture body")
+	tempPaths := []string{
+		filepath.Join(q, "download1.tmp"),
+		filepath.Join(q, "download2.tmp"),
+	}
+	for _, tempPath := range tempPaths {
+		if err := os.WriteFile(tempPath, body, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sha, _, err := HashFile(tempPaths[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	start := make(chan struct{})
+	results := make(chan string, len(tempPaths))
+	errs := make(chan error, len(tempPaths))
+	var wg sync.WaitGroup
+	for _, tempPath := range tempPaths {
+		wg.Add(1)
+		go func(path string) {
+			defer wg.Done()
+			<-start
+			dest, err := s.Promote(path, sha)
+			if err != nil {
+				errs <- err
+				return
+			}
+			results <- dest
+		}(tempPath)
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	close(errs)
+	for err := range errs {
+		t.Fatalf("concurrent promote: %v", err)
+	}
+	var dest string
+	for result := range results {
+		if dest == "" {
+			dest = result
+		} else if result != dest {
+			t.Fatalf("promotion destinations = %q and %q, want one path", dest, result)
+		}
+	}
+	if err := s.Verify(sha); err != nil {
+		t.Fatalf("verify converged artifact: %v", err)
 	}
 }
 

@@ -222,6 +222,45 @@ func TestDownloadWithHeadersDoesNotLeakCustomCredentialsAcrossHosts(t *testing.T
 	}
 }
 
+func TestDownloadWithHeadersStripsCredentialsOnHTTPSDowngrade(t *testing.T) {
+	var requests []*http.Request
+	lookups := 0
+	resolver := resolverFunc(func(_ context.Context, _ string, _ string) ([]netip.Addr, error) {
+		lookups++
+		if lookups == 1 {
+			return []netip.Addr{netip.MustParseAddr("8.8.8.8")}, nil
+		}
+		return []netip.Addr{netip.MustParseAddr("127.0.0.1")}, nil
+	})
+	d := testDownloader(t, resolver, roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		requests = append(requests, req.Clone(req.Context()))
+		if req.URL.Scheme == "https" {
+			return response(http.StatusFound, "", map[string]string{"Location": "http://origin.example/file"}), nil
+		}
+		return response(http.StatusOK, "%PDF-1.7", nil), nil
+	}))
+	d.policy.AllowHTTPLoopback = true
+
+	headers := map[string]string{
+		"Authorization": "Bearer transient-secret",
+		"X-API-Key":     "transient-key",
+	}
+	if _, err := d.DownloadWithHeaders(context.Background(), "https://origin.example/file", headers, filepath.Join(t.TempDir(), "x")); err != nil {
+		t.Fatal(err)
+	}
+	if len(requests) != 2 {
+		t.Fatalf("requests = %d", len(requests))
+	}
+	if requests[1].URL.Scheme != "http" {
+		t.Fatalf("second-hop scheme = %q", requests[1].URL.Scheme)
+	}
+	for _, name := range []string{"Authorization", "X-API-Key"} {
+		if got := requests[1].Header.Get(name); got != "" {
+			t.Fatalf("caller header %s forwarded to plaintext: %q", name, got)
+		}
+	}
+}
+
 func TestRedirectLimit(t *testing.T) {
 	d := testDownloader(t, publicResolver(nil), roundTripFunc(func(*http.Request) (*http.Response, error) {
 		return response(http.StatusFound, "", map[string]string{"Location": "https://papers.example/again"}), nil
@@ -409,6 +448,37 @@ func TestCredentialsAreStrippedWhenOnlyPortChanges(t *testing.T) {
 	}
 }
 
+func TestReadBodyWithContextClosesAndDrainsBlockedReader(t *testing.T) {
+	body := newCloseBlockingBody()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	readDone := make(chan error, 1)
+	go func() {
+		_, err := readBodyWithContext(ctx, body, make([]byte, 1))
+		readDone <- err
+	}()
+	select {
+	case <-body.started:
+	case <-time.After(time.Second):
+		t.Fatal("reader did not start")
+	}
+
+	cancel()
+	select {
+	case err := <-readDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("read error = %v, want context canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("read did not finish after cancellation")
+	}
+	select {
+	case <-body.closed:
+	default:
+		t.Fatal("cancellation did not close response body")
+	}
+}
+
 func TestHeaderBodyAndOverallTimeoutsAreBounded(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
@@ -463,13 +533,15 @@ func TestHeaderBodyAndOverallTimeoutsAreBounded(t *testing.T) {
 }
 
 type closeBlockingBody struct {
-	closed chan struct{}
+	closed  chan struct{}
+	started chan struct{}
 }
 
 func newCloseBlockingBody() *closeBlockingBody {
-	return &closeBlockingBody{closed: make(chan struct{})}
+	return &closeBlockingBody{closed: make(chan struct{}), started: make(chan struct{})}
 }
 func (b *closeBlockingBody) Read(_ []byte) (int, error) {
+	close(b.started)
 	<-b.closed
 	return 0, errors.New("body closed")
 }

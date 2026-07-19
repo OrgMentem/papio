@@ -140,6 +140,52 @@ func TestSerialAutoImporterRetriesOnce(t *testing.T) {
 		t.Fatalf("calls = %d, want 2", got)
 	}
 }
+func TestSerialAutoImporterReleasesLockDuringRetryBackoff(t *testing.T) {
+	firstFailed := make(chan struct{})
+	otherStarted := make(chan struct{})
+	var firstOnce, otherOnce sync.Once
+	importer := autoImporterFunc(func(_ context.Context, jobID string) (string, string, string, error) {
+		switch jobID {
+		case "retry":
+			firstOnce.Do(func() { close(firstFailed) })
+			return "failed", "", "", errors.New("temporary failure")
+		case "other":
+			otherOnce.Do(func() { close(otherStarted) })
+			return "attached", "parent", "attachment", nil
+		default:
+			t.Fatalf("unexpected job ID %q", jobID)
+			return "", "", "", nil
+		}
+	})
+	serial := newSerialAutoImporter(importer)
+	serial.backoff = time.Second
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	retryDone := make(chan error, 1)
+	go func() {
+		_, _, _, err := serial.PlanAndApply(ctx, "retry")
+		retryDone <- err
+	}()
+
+	<-firstFailed
+	otherDone := make(chan error, 1)
+	go func() {
+		_, _, _, err := serial.PlanAndApply(context.Background(), "other")
+		otherDone <- err
+	}()
+	select {
+	case <-otherStarted:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("other import remained blocked by retry backoff")
+	}
+	if err := <-otherDone; err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	if err := <-retryDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("retry error = %v, want context cancellation", err)
+	}
+}
 
 func TestSerialAutoImporterClassifiesFinalError(t *testing.T) {
 	importer := autoImporterFunc(func(context.Context, string) (string, string, string, error) {

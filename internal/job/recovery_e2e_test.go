@@ -194,3 +194,47 @@ func TestRecoverStaleRewindsDurableBoundariesAndSweepsTerminalQuarantine(t *test
 		t.Fatalf("open human actions = %+v, want review and awaiting actions untouched", actions)
 	}
 }
+
+func TestSweepTerminalQuarantineContinuesAfterCleanupError(t *testing.T) {
+	ctx := context.Background()
+	jobs := testStore(t)
+	artifacts, err := artifact.New(filepath.Dir(jobs.S.Path()))
+	if err != nil {
+		t.Fatalf("create artifact layout: %v", err)
+	}
+
+	newTerminal := func(requestID string) string {
+		t.Helper()
+		id, err := jobs.CreateRequest(ctx, requestID, testWork(), "", "", testPolicy(), nil)
+		if err != nil {
+			t.Fatalf("create terminal job: %v", err)
+		}
+		if err := jobs.Transition(ctx, id, StateQueued, StateResolving, nil); err != nil {
+			t.Fatalf("transition to resolving: %v", err)
+		}
+		if err := jobs.Transition(ctx, id, StateResolving, StateUnavailable, nil, WithTerminalReason("fixture")); err != nil {
+			t.Fatalf("transition to unavailable: %v", err)
+		}
+		return id
+	}
+
+	brokenID := newTerminal("sweep-broken-0001")
+	cleanID := newTerminal("sweep-clean-0001")
+	if _, err := jobs.S.DB().ExecContext(ctx, "UPDATE jobs SET id = ? WHERE id = ?", "invalid/id", brokenID); err != nil {
+		t.Fatalf("make invalid cleanup id: %v", err)
+	}
+	cleanDir, err := artifacts.QuarantineDir(cleanID)
+	if err != nil {
+		t.Fatalf("create clean quarantine: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(cleanDir, "download.tmp"), []byte("stale"), 0o600); err != nil {
+		t.Fatalf("write clean quarantine: %v", err)
+	}
+
+	if err := jobs.SweepTerminalQuarantine(ctx); err == nil {
+		t.Fatal("sweep succeeded despite invalid terminal job id")
+	}
+	if _, err := os.Stat(cleanDir); !os.IsNotExist(err) {
+		t.Fatalf("clean quarantine stat = %v, want removed despite another cleanup failure", err)
+	}
+}

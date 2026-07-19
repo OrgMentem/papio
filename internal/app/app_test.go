@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -352,6 +353,19 @@ func TestCrashRecoveryRefetchesMidflightWithoutDuplicateDurableRecords(t *testin
 					t.Fatal(err)
 				}
 			}
+			qdir, err := svc.Artifacts.QuarantineDir(id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			stalePaths := []string{
+				filepath.Join(qdir, "stale-fetch.tmp"),
+				filepath.Join(qdir, "stale-validate.tmp"),
+			}
+			for _, stalePath := range stalePaths {
+				if err := os.WriteFile(stalePath, pdfBytes("stale"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
 			recovered, err := jobs.RecoverStale(context.Background())
 			if err != nil || len(recovered) != 1 || recovered[0] != id {
 				t.Fatalf("recovered = %v, %v", recovered, err)
@@ -362,6 +376,11 @@ func TestCrashRecoveryRefetchesMidflightWithoutDuplicateDurableRecords(t *testin
 			}
 			if err := svc.Process(context.Background(), row); err != nil {
 				t.Fatal(err)
+			}
+			for _, stalePath := range stalePaths {
+				if _, err := os.Stat(stalePath); !os.IsNotExist(err) {
+					t.Fatalf("recovered quarantine file %q exists: %v", stalePath, err)
+				}
 			}
 			ready, err := jobs.Get(context.Background(), id)
 			if err != nil || ready.State != job.StateReady || fetches != 1 {
@@ -378,6 +397,73 @@ func TestCrashRecoveryRefetchesMidflightWithoutDuplicateDurableRecords(t *testin
 				t.Fatalf("durable duplicates: artifacts=%d candidates=%d", artifacts, candidates)
 			}
 		})
+	}
+}
+func TestValidationPersistsArtifactMetadataBeforePromotion(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	svc, jobs := newTestService(t)
+	id, err := jobs.CreateRequest(ctx, "wr_artifact_metadata_first", work.Work{DOI: "10.1002/example"}, "", "", job.Policy{
+		AccessMode: config.ModeConservative, DesiredVersion: "any",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := jobs.InsertCandidates(ctx, id, []job.Candidate{{
+		JobID: id, Source: "fixture", URLRedacted: "https://example.test/paper.pdf", URLKey: "paper",
+		Version: resolver.VersionPublished, AccessBasis: resolver.AccessOpen, ReuseLicense: "unknown",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	candidate, err := jobs.NextPendingCandidate(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, edge := range [][2]string{
+		{job.StateQueued, job.StateResolving},
+		{job.StateResolving, job.StateFetching},
+		{job.StateFetching, job.StateValidating},
+	} {
+		if err := jobs.Transition(ctx, id, edge[0], edge[1], nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	row, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	qdir, err := svc.Artifacts.QuarantineDir(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := pdfBytes("promotion-order")
+	tempPath := filepath.Join(qdir, "candidate.tmp")
+	if err := os.WriteFile(tempPath, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(body)
+	sha := hex.EncodeToString(sum[:])
+	svc.Validate = func(context.Context, string, string, work.Work) (pdf.ValidationReport, error) {
+		cancel()
+		return passValidation()(context.Background(), "", "", work.Work{})
+	}
+
+	_, _, err = svc.validateCandidate(ctx, row, candidate, fetch.Result{
+		TempPath: tempPath, SHA256: sha, SizeBytes: int64(len(body)), SniffedMIME: "application/pdf",
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("validation = %v, want context cancellation", err)
+	}
+	dest, err := svc.Artifacts.ArtifactPath(sha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(dest); !os.IsNotExist(err) {
+		t.Fatalf("artifact was promoted after metadata persistence failed: %v", err)
+	}
+	art, err := jobs.GetArtifact(context.Background(), sha)
+	if err != nil || art != nil {
+		t.Fatalf("artifact metadata after failed persistence = %+v, %v", art, err)
 	}
 }
 
@@ -641,6 +727,38 @@ func TestProcessReadyAutoImportsOnce(t *testing.T) {
 	}
 	if notifier.imported != 1 {
 		t.Fatalf("import notifications = %d, want 1", notifier.imported)
+	}
+}
+func TestAutoImportCancellationDoesNotRecordFailure(t *testing.T) {
+	svc, jobs := newTestService(t)
+	svc.Config.Zotio.AutoImport = true
+	importer := &fakeAutoImporter{err: context.Canceled}
+	svc.AutoImporter = importer
+	id, err := svc.Submit(context.Background(), doiRequest("wr_auto_import_cancelled"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, err := jobs.Get(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	svc.autoImportReady(ctx, row)
+	if importer.calls != 1 {
+		t.Fatalf("PlanAndApply calls = %d, want 1", importer.calls)
+	}
+	events, err := jobs.Events(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range events {
+		if event["kind"] == "zotio.auto_import" {
+			t.Fatalf("cancelled auto-import recorded a durable outcome: %#v", event)
+		}
+	}
+	if !importNeedsRetry(events) {
+		t.Fatal("cancelled auto-import must remain eligible for a later retry")
 	}
 }
 

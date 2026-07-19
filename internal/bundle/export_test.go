@@ -124,6 +124,55 @@ func TestExportIsSchemaValidPrivateAndIdempotent(t *testing.T) {
 	}
 }
 
+func TestExportCopiesArtifactWithoutMutatingStore(t *testing.T) {
+	exporter, id, sha := readyFixture(t)
+	ctx := context.Background()
+	bundlePath, bundle, err := exporter.Export(ctx, id, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	exportedArtifact := filepath.Join(filepath.Dir(bundlePath), filepath.FromSlash(bundle.Artifact.Path))
+	if err := os.Chmod(exportedArtifact, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(exportedArtifact, []byte("reader annotation"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	storedArtifact, err := exporter.Jobs.GetArtifact(ctx, sha)
+	if err != nil || storedArtifact == nil {
+		t.Fatalf("get stored artifact: %v", err)
+	}
+	got, _, err := artifact.HashFile(storedArtifact.Path)
+	if err != nil || got != sha {
+		t.Fatalf("stored artifact hash = %q, %v; want %q", got, err, sha)
+	}
+}
+
+func TestExportCleansFilesWhenLedgerRecordingFails(t *testing.T) {
+	exporter, id, _ := readyFixture(t)
+	ctx := context.Background()
+	if _, err := exporter.Jobs.S.DB().ExecContext(ctx, `
+		CREATE TRIGGER reject_bundle_export
+		BEFORE INSERT ON exports
+		WHEN NEW.kind = 'bundle'
+		BEGIN
+			SELECT RAISE(ABORT, 'injected ledger failure');
+		END`); err != nil {
+		t.Fatalf("create failure trigger: %v", err)
+	}
+	destination := filepath.Join(t.TempDir(), "export")
+	if _, _, err := exporter.Export(ctx, id, destination); err == nil {
+		t.Fatal("export succeeded despite ledger failure")
+	}
+	if _, err := os.Stat(destination); !os.IsNotExist(err) {
+		t.Fatalf("failed export directory remains: %v", err)
+	}
+	var count int
+	if err := exporter.Jobs.S.DB().QueryRowContext(ctx, `SELECT count(*) FROM exports WHERE job_id = ?`, id).Scan(&count); err != nil || count != 0 {
+		t.Fatalf("export ledger count = %d, %v; want zero", count, err)
+	}
+}
+
 func TestExportPreservesUserConfirmedIdentity(t *testing.T) {
 	exporter, id, sha := readyFixture(t)
 	ctx := context.Background()

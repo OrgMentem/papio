@@ -12,6 +12,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"regexp"
 	"strings"
 	"time"
@@ -37,7 +38,7 @@ const MaxBrowserInteger int64 = 1<<53 - 1
 var (
 	requestIDRE  = regexp.MustCompile(`^[A-Za-z0-9_-]{8,128}$`)
 	msgIDRE      = regexp.MustCompile(`^[A-Za-z0-9_-]{8,64}$`)
-	zoteroKeyRE  = regexp.MustCompile(`^[A-Za-z0-9]{1,32}$`)
+	zoteroKeyRE  = regexp.MustCompile(`^[A-Z0-9]{8}$`)
 	doiRE        = regexp.MustCompile(`^10\.[0-9]{4,9}/\S{1,200}$`)
 	pmidRE       = regexp.MustCompile(`^[0-9]{1,10}$`)
 	arxivRE      = regexp.MustCompile(`^([0-9]{4}\.[0-9]{4,5})(v[0-9]+)?$|^[a-z-]+(\.[A-Z]{2})?/[0-9]{7}$`)
@@ -58,8 +59,12 @@ func strictDecode(data []byte, v any) error {
 	if err := dec.Decode(v); err != nil {
 		return err
 	}
-	if dec.More() {
-		return fmt.Errorf("trailing data after JSON document")
+	var trailing any
+	if err := dec.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("trailing data after JSON document")
+		}
+		return fmt.Errorf("trailing data after JSON document: %w", err)
 	}
 	return nil
 }

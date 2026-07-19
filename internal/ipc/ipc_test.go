@@ -79,6 +79,46 @@ func TestRoundTrip(t *testing.T) {
 	}
 }
 
+func TestConcurrentCallsDoNotBlockEachOther(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	socket, _ := startTestServer(t, HandlerFunc(func(_ context.Context, req Request) ([]byte, *RPCError) {
+		if req.Method == "slow.call" {
+			close(started)
+			<-release
+		}
+		return []byte(`{}`), nil
+	}))
+
+	slowDone := make(chan error, 1)
+	go func() {
+		var result map[string]any
+		slowDone <- NewSocketClient(socket).Call(context.Background(), "slow_req_01", "slow.call", struct{}{}, &result)
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("slow call did not start")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	var result map[string]any
+	if err := NewSocketClient(socket).Call(ctx, "fast_req_01", "fast.call", struct{}{}, &result); err != nil {
+		t.Fatalf("fast call blocked behind slow call: %v", err)
+	}
+
+	close(release)
+	select {
+	case err := <-slowDone:
+		if err != nil {
+			t.Fatalf("slow call: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("slow call did not finish")
+	}
+}
+
 func TestRouterRejectsUnknownMethod(t *testing.T) {
 	socket, _ := startTestServer(t, Router{Methods: map[string]MethodHandler{}})
 	_, err := NewSocketClient(socket).CallRaw(context.Background(), "request_01", "jobs.unknown", json.RawMessage(`{}`))

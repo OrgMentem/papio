@@ -218,6 +218,28 @@ test("fixture writes enqueue their path for onDeterminingFilename (data: URLs ig
   expect(takePendingFixtureFilename(dataUrl)).toBeUndefined();
 });
 
+test("a rejected fixture download does not leave a filename for the next download", async () => {
+  while (takePendingFixtureFilename("data:text/html") !== undefined) {
+    /* drain */
+  }
+  const rejected: Pick<ChromeCaptureApi, "downloads"> = {
+    downloads: {
+      download: async () => {
+        throw new Error("download rejected");
+      },
+    },
+  };
+  await expect(downloadFixture(rejected, "papio-fixtures/stale.html", "<p>stale</p>")).rejects.toThrow(
+    "download rejected",
+  );
+
+  const { api } = fakeChrome(CLEAN_PAGE);
+  await downloadFixture(api, "papio-fixtures/current.html", "<p>current</p>");
+  expect(takePendingFixtureFilename("data:text/html;charset=utf-8,%3Cp%3Ecurrent%3C%2Fp%3E")).toBe(
+    "papio-fixtures/current.html",
+  );
+});
+
 test("capture masks a token-shaped provider path before writing", async () => {
   const dynamicPath: PageCapture = {
     html: `<div class="record-details">x</div>`,

@@ -119,3 +119,39 @@ func TestOpenRollsForwardSchemaOneWithoutLosingDurableRows(t *testing.T) {
 		t.Fatalf("doctor after roll-forward is unhealthy: %+v", report)
 	}
 }
+
+func TestBackupCleansFailedOutputAndAllowsRetry(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("close database: %v", err)
+		}
+	})
+	backupDir := t.TempDir()
+	destination := filepath.Join(backupDir, "backup.db")
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	if err := db.Backup(canceled, destination); err == nil {
+		t.Fatal("backup with canceled context succeeded")
+	}
+	if _, err := os.Stat(destination); !os.IsNotExist(err) {
+		t.Fatalf("failed backup destination remains: %v", err)
+	}
+	partials, err := filepath.Glob(filepath.Join(backupDir, ".papio-backup-*.tmp"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(partials) != 0 {
+		t.Fatalf("failed backup temporary files remain: %v", partials)
+	}
+	if err := db.Backup(ctx, destination); err != nil {
+		t.Fatalf("backup retry: %v", err)
+	}
+	if _, err := os.Stat(destination); err != nil {
+		t.Fatalf("backup destination after retry: %v", err)
+	}
+}

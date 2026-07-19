@@ -184,9 +184,7 @@ type Store struct{ S *store.Store }
 // NewID returns a 26-hex-char random identifier with a type prefix.
 func NewID(prefix string) string {
 	var b [13]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		panic(err) // crypto/rand failure is unrecoverable
-	}
+	_, _ = rand.Read(b[:])
 	return prefix + "_" + hex.EncodeToString(b[:])
 }
 
@@ -753,12 +751,13 @@ func (js *Store) SweepTerminalQuarantine(ctx context.Context) error {
 	if err := rows.Err(); err != nil {
 		return err
 	}
+	var cleanupErr error
 	for _, id := range ids {
 		if err := artifacts.CleanQuarantine(id); err != nil {
-			return fmt.Errorf("clean terminal quarantine for %s: %w", id, err)
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("clean terminal quarantine for %s: %w", id, err))
 		}
 	}
-	return nil
+	return cleanupErr
 }
 
 // Get loads one job row with its work-request identity.

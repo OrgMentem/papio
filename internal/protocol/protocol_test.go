@@ -76,6 +76,48 @@ func TestInvalidCorpusFailsClosed(t *testing.T) {
 	}
 }
 
+func TestStrictDecodeRejectsTrailingDocuments(t *testing.T) {
+	data, err := json.Marshal(WorkRequest{
+		SchemaVersion:  WorkRequestSchemaVersion,
+		RequestID:      "request-0001",
+		Identifiers:    &Identifiers{DOI: "10.1000/example"},
+		DesiredVersion: "any",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, trailing := range []string{`{}`, `trailing`} {
+		if _, err := DecodeWorkRequest(append(data, trailing...)); err == nil {
+			t.Fatalf("DecodeWorkRequest accepted trailing %q", trailing)
+		}
+	}
+}
+
+func TestZotioItemKeyValidationMatchesZotio(t *testing.T) {
+	for _, tc := range []struct {
+		key     string
+		wantErr bool
+	}{
+		{key: "AB12CD34"},
+		{key: "ab12CD34", wantErr: true},
+		{key: "AB12CD3", wantErr: true},
+		{key: "AB12CD345", wantErr: true},
+	} {
+		t.Run(tc.key, func(t *testing.T) {
+			request := &WorkRequest{
+				SchemaVersion:  WorkRequestSchemaVersion,
+				RequestID:      "request-0001",
+				Identifiers:    &Identifiers{DOI: "10.1000/example"},
+				ZotioItemKey:   tc.key,
+				DesiredVersion: "any",
+			}
+			if err := request.Validate(); (err != nil) != tc.wantErr {
+				t.Fatalf("Validate() error = %v, want error %t", err, tc.wantErr)
+			}
+		})
+	}
+}
+
 func TestHelloAckPayloadRoundTripAndBounds(t *testing.T) {
 	frame := func(payload any) []byte {
 		t.Helper()

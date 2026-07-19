@@ -157,6 +157,39 @@ func TestResolveIncludesDiscoveredWork(t *testing.T) {
 	}
 }
 
+func TestResolveTitleRequiresMatchingBibliography(t *testing.T) {
+	const matched = `{"results":[{"title":"Exact title","publication_year":2024,"authorships":[{"author":{"display_name":"A. Author"}},{"author":{"display_name":"B. Author"}}],"open_access":{"is_oa":true},"best_oa_location":{"is_oa":true,"pdf_url":"https://files.example/article.pdf"}}]}`
+	const nearTitle = `{"results":[{"title":"Exact title and related work","publication_year":2024,"authorships":[{"author":{"display_name":"A. Author"}},{"author":{"display_name":"B. Author"}}],"open_access":{"is_oa":true},"best_oa_location":{"is_oa":true,"pdf_url":"https://files.example/article.pdf"}}]}`
+	const wrongYear = `{"results":[{"title":"Exact title","publication_year":2023,"authorships":[{"author":{"display_name":"A. Author"}},{"author":{"display_name":"B. Author"}}],"open_access":{"is_oa":true},"best_oa_location":{"is_oa":true,"pdf_url":"https://files.example/article.pdf"}}]}`
+	const incompleteAuthors = `{"results":[{"title":"Exact title","publication_year":2024,"authorships":[{"author":{"display_name":"A. Author"}}],"open_access":{"is_oa":true},"best_oa_location":{"is_oa":true,"pdf_url":"https://files.example/article.pdf"}}]}`
+	requested := work.Work{Title: "Exact title", Authors: []string{"A. Author", "B. Author"}, Year: 2024}
+	for name, body := range map[string]string{
+		"matching bibliography":   matched,
+		"near-title first result": nearTitle,
+		"wrong year":              wrongYear,
+		"incomplete author list":  incompleteAuthors,
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := New(clientFunc(func(*http.Request) (*http.Response, error) {
+				return responseFor(http.StatusOK, body, nil), nil
+			}), "contact@example.org", "private-key")
+			candidates, err := r.Resolve(context.Background(), requested)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if name == "matching bibliography" {
+				if len(candidates) != 1 {
+					t.Fatalf("candidates = %#v, want one", candidates)
+				}
+				return
+			}
+			if candidates != nil {
+				t.Fatalf("candidates = %#v, want nil", candidates)
+			}
+		})
+	}
+}
+
 func TestOfficialEndpointRequiresAPIKey(t *testing.T) {
 	called := false
 	r := New(clientFunc(func(*http.Request) (*http.Response, error) {

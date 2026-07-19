@@ -165,6 +165,27 @@ func TestResolveByPMIDAndTitle(t *testing.T) {
 	})
 }
 
+func TestSelectResultTitleRequiresMatchingBibliography(t *testing.T) {
+	requested := work.Work{Title: "Some OA Paper", Authors: []string{"Smith J", "Doe A"}, Year: 2020}
+	cases := []struct {
+		name   string
+		result epmcResult
+		want   bool
+	}{
+		{"matching title, authors, and year", epmcResult{Title: requested.Title, AuthorString: "Smith J, Doe A", PubYear: "2020"}, true},
+		{"incomplete author list", epmcResult{Title: requested.Title, AuthorString: "Smith J", PubYear: "2020"}, false},
+		{"wrong year", epmcResult{Title: requested.Title, AuthorString: "Smith J, Doe A", PubYear: "2021"}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := selectResult([]epmcResult{tc.result}, requested, matchTitle)
+			if (got != nil) != tc.want {
+				t.Fatalf("selectResult = %+v, want match=%v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestLandingOnlyWhenNoPDF(t *testing.T) {
 	body := `{"hitCount":1,"resultList":{"result":[{
       "id":"PMC9","source":"PMC","doi":"10.1000/only-html","title":"HTML Only","isOpenAccess":"Y",

@@ -13,6 +13,7 @@ import (
 	"papio/internal/batch"
 	"papio/internal/discovery"
 	"papio/internal/protocol"
+	"papio/internal/work"
 	"papio/internal/zotio"
 )
 
@@ -205,7 +206,10 @@ func requestsForDiscovered(works []discovery.DiscoveredWork) []protocol.WorkRequ
 	seen := make(map[string]struct{}, len(works))
 	for _, discovered := range works {
 		doi := strings.TrimSpace(discovered.Work.DOI)
-		openAlexID := strings.TrimSpace(discovered.OpenAlexID)
+		openAlexID, err := work.NormalizeOpenAlex(discovered.OpenAlexID)
+		if err != nil {
+			openAlexID = ""
+		}
 		title := strings.TrimSpace(discovered.Work.Title)
 		authors := append([]string(nil), discovered.Work.Authors...)
 		if doi == "" && (openAlexID == "" || title == "" || len(authors) == 0 || discovered.Work.Year == 0) {
@@ -232,8 +236,8 @@ func requestsForDiscovered(works []discovery.DiscoveredWork) []protocol.WorkRequ
 			seen[key] = struct{}{}
 		}
 		var identifiers *protocol.Identifiers
-		if doi != "" {
-			identifiers = &protocol.Identifiers{DOI: doi}
+		if doi != "" || openAlexID != "" {
+			identifiers = &protocol.Identifiers{DOI: doi, OpenAlex: openAlexID}
 		}
 		requests = append(requests, protocol.WorkRequest{
 			SchemaVersion: protocol.WorkRequestSchemaVersion,

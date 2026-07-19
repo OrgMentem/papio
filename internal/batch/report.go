@@ -25,7 +25,7 @@ import (
 
 const SchemaVersion = "papio-batch-manifest/1"
 
-var idPattern = regexp.MustCompile(`^batch-[0-9a-f]{8}$`)
+var idPattern = regexp.MustCompile(`^batch-[0-9a-f]{32}$`)
 
 // Sentinel errors let callers classify Load failures instead of treating every
 // failure as a missing manifest. Other Load errors are unexpected (I/O, decode,
@@ -171,13 +171,13 @@ func ID(requests []protocol.WorkRequest, now time.Time) string {
 	}
 	sort.Strings(values)
 	sum := sha256.Sum256([]byte(now.Format("2006-01-02") + "\n" + strings.Join(values, "\n")))
-	return "batch-" + hex.EncodeToString(sum[:4])
+	return "batch-" + hex.EncodeToString(sum[:batchIdentityHashBytes])
 }
 
 // RequestID supplies a deterministic, unique-within-batch idempotency key.
 func RequestID(batchID string, request protocol.WorkRequest) string {
 	sum := sha256.Sum256([]byte(workIdentity(request)))
-	return batchID + "-" + hex.EncodeToString(sum[:4])
+	return batchID + "-" + hex.EncodeToString(sum[:batchIdentityHashBytes])
 }
 
 func workIdentity(request protocol.WorkRequest) string {

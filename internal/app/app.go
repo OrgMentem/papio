@@ -215,6 +215,12 @@ func (s *Service) Process(ctx context.Context, row *job.Row) error {
 	default:
 		return nil // terminal and parked human states are not runnable
 	}
+	// Runnable jobs cannot retain a user-review file: those states are not
+	// claimed by the scheduler. Any contents here belong to a crashed attempt
+	// that recovery has rewound before issuing fresh resolver URLs.
+	if err := s.Artifacts.CleanQuarantine(row.ID); err != nil {
+		return err
+	}
 
 	// Resolver order step 1: verified local content-addressed cache.
 	if row.Work.DOI != "" {
@@ -599,7 +605,7 @@ func (s *Service) validateCandidate(ctx context.Context, row *job.Row, stored *j
 			map[string]any{"reason": "wrong_work"})
 	}
 
-	dest, err := s.Artifacts.Promote(result.TempPath, result.SHA256)
+	dest, err := s.Artifacts.ArtifactPath(result.SHA256)
 	if err != nil {
 		return false, false, err
 	}
@@ -613,7 +619,12 @@ func (s *Service) validateCandidate(ctx context.Context, row *job.Row, stored *j
 		Encrypted: report.Structural.Encrypted, HasActiveContent: active,
 		IdentityResult: identityResult, Path: dest,
 	}
+	// Persist the metadata before the atomic rename so a database failure
+	// cannot leave an immutable file with no durable owner.
 	if err := s.Jobs.UpsertArtifact(ctx, art); err != nil {
+		return false, false, err
+	}
+	if _, err := s.Artifacts.Promote(result.TempPath, result.SHA256); err != nil {
 		return false, false, err
 	}
 	if err := s.Jobs.MarkCandidate(ctx, stored.ID, "accepted"); err != nil {
@@ -648,6 +659,9 @@ func (s *Service) autoImportReady(ctx context.Context, row *job.Row) {
 	detail["parent_key"] = parentKey
 	detail["attachment_key"] = attachmentKey
 	if err != nil {
+		if ctx.Err() != nil {
+			return
+		}
 		class, hint, httpStatus := autoImportErrorInfo(err)
 		detail["status"] = "error"
 		detail["error_type"] = safeType(err)

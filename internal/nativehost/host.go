@@ -389,9 +389,7 @@ func (b *bridge) sendError(code, message string) {
 // newMsgID returns a msg_id matching protocol.msgIDRE (^[A-Za-z0-9_-]{8,64}$).
 func newMsgID() string {
 	var b [12]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return "hosterror000000" // valid-length fallback; crypto/rand never fails in practice.
-	}
+	_, _ = rand.Read(b[:])
 	return "h" + hex.EncodeToString(b[:])
 }
 

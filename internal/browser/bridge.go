@@ -186,7 +186,7 @@ func (b *Bridge) handle(ctx context.Context, msg *protocol.BrowserMessage) ([]js
 			map[string]any{"filename": p.Filename, "size_bytes": p.SizeBytes}); err != nil {
 			return nil, err
 		}
-		if err := b.adopt(ctx, msg.JobID, p.Filename); err != nil {
+		if err := b.adoptOutsideSessionLock(ctx, msg.JobID, p.Filename); err != nil {
 			// Environmental failure (file not there yet, Chrome rename race,
 			// user saved elsewhere) must not sever the bridge: record it, keep
 			// the job parked, and let the poll-time directory scan pick the
@@ -224,6 +224,16 @@ func (b *Bridge) handle(ctx context.Context, msg *protocol.BrowserMessage) ([]js
 	default:
 		return nil, fmt.Errorf("%w: unexpected inbound frame type %q", ErrInvalidFrame, msg.Type)
 	}
+}
+
+// adoptOutsideSessionLock runs validation without blocking unrelated browser
+// syncs. The adoption service leases the durable job state before validation,
+// so releasing the in-memory session lock cannot admit a competing adoption.
+// The caller must hold b.mu; it is held again before this method returns.
+func (b *Bridge) adoptOutsideSessionLock(ctx context.Context, jobID, filename string) error {
+	b.mu.Unlock()
+	defer b.mu.Lock()
+	return b.adopt(ctx, jobID, filename)
 }
 
 // helloRequired tells a still-connected extension that the daemon lost its
@@ -414,8 +424,6 @@ func (b *Bridge) scanAdoptionDir(_ context.Context, jobID string) (string, bool)
 // never missed behind a large handoff backlog. It never emits frames or opens
 // offers. Safe to call on a timer.
 func (b *Bridge) SweepAdoptions(ctx context.Context) error {
-	b.mu.Lock()
-	defer b.mu.Unlock()
 	root := b.cfg.EffectiveAdoptionRoot()
 	entries, err := os.ReadDir(root)
 	if err != nil {

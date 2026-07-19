@@ -45,6 +45,7 @@ func TestCoalescerSummarizesEachNotificationClass(t *testing.T) {
 	recorded := &recordingSender{}
 	coalescer := NewCoalescer(recorded)
 	coalescer.Now = func() time.Time { return now }
+	coalescer.after = func(time.Duration, func()) {}
 
 	coalescer.HumanAction(context.Background())
 	now = now.Add(10 * time.Second)
@@ -60,6 +61,31 @@ func TestCoalescerSummarizesEachNotificationClass(t *testing.T) {
 		"1 paper imported",
 		"3 papers need your attention; run papio status to see why",
 	}
+	if !reflect.DeepEqual(recorded.messages, want) {
+		t.Fatalf("messages = %#v, want %#v", recorded.messages, want)
+	}
+}
+
+func TestCoalescerFlushesPendingNotificationsWhenWindowCloses(t *testing.T) {
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	recorded := &recordingSender{}
+	coalescer := NewCoalescer(recorded)
+	coalescer.Now = func() time.Time { return now }
+	var callbacks []func()
+	coalescer.after = func(_ time.Duration, callback func()) {
+		callbacks = append(callbacks, callback)
+	}
+
+	coalescer.Imported(context.Background())
+	now = now.Add(10 * time.Second)
+	coalescer.Imported(context.Background())
+	if len(callbacks) != 1 {
+		t.Fatalf("scheduled callbacks = %d, want 1", len(callbacks))
+	}
+	now = now.Add(50 * time.Second)
+	callbacks[0]()
+
+	want := []string{"1 paper imported", "1 paper imported"}
 	if !reflect.DeepEqual(recorded.messages, want) {
 		t.Fatalf("messages = %#v, want %#v", recorded.messages, want)
 	}

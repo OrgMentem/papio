@@ -16,6 +16,12 @@ for the full pre-split extension history.
 
 ## [Unreleased]
 
+### Fixed
+
+- The developer-only fixture-capture tool no longer leaks its filename
+  reservation when Chrome rejects a download; unclaimed reservations expire
+  after one minute.
+
 ## [0.3.1] - 2026-07-19
 
 First version submitted to Firefox Add-ons (AMO, listed channel). Chrome Web

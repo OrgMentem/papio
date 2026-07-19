@@ -10,6 +10,7 @@ import (
 	"database/sql"
 	"embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -170,14 +171,38 @@ func (s *Store) AppendEvent(ctx context.Context, jobID, kind string, detail map[
 
 // Backup copies the live database to destPath using VACUUM INTO (safe under WAL).
 func (s *Store) Backup(ctx context.Context, destPath string) error {
-	if err := os.MkdirAll(filepath.Dir(destPath), 0o700); err != nil {
+	dir := filepath.Dir(destPath)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
 	if _, err := os.Stat(destPath); err == nil {
 		return fmt.Errorf("backup destination %s already exists", destPath)
+	} else if !os.IsNotExist(err) {
+		return err
 	}
-	_, err := s.db.ExecContext(ctx, "VACUUM INTO ?", destPath)
-	return err
+	tmp, err := os.CreateTemp(dir, ".papio-backup-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := os.Remove(tmpPath); err != nil {
+		return err
+	}
+	defer func() { _ = os.Remove(tmpPath) }()
+	if _, err := s.db.ExecContext(ctx, "VACUUM INTO ?", tmpPath); err != nil {
+		return err
+	}
+	if err := os.Link(tmpPath, destPath); err != nil {
+		if errors.Is(err, fs.ErrExist) {
+			return fmt.Errorf("backup destination %s already exists", destPath)
+		}
+		return err
+	}
+	return os.Remove(tmpPath)
 }
 
 // Checkpoint truncates the WAL (used before backups and by doctor).

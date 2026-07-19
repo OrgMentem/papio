@@ -226,11 +226,28 @@ func (f *atomFeed) firstResult(base string) *atomEntry {
 		if strings.Contains(id, "/api/errors") {
 			return nil
 		}
-		if strings.Contains(id, base) {
+		if entryArXivID(id) == base {
 			return &f.Entries[i]
 		}
 	}
 	return nil
+}
+
+func entryArXivID(raw string) string {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return ""
+	}
+	path := strings.Trim(parsed.Path, "/")
+	if !strings.HasPrefix(path, "abs/") {
+		return ""
+	}
+	id, err := work.NormalizeArXiv(strings.TrimPrefix(path, "abs/"))
+	if err != nil {
+		return ""
+	}
+	base, _ := splitVersion(id)
+	return base
 }
 
 // resolvedWork carries the source-discovered bibliographic identity for the app

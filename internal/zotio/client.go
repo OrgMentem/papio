@@ -166,7 +166,7 @@ func (c *Client) Preflight(ctx context.Context) (*PreflightResult, error) {
 	}, nil
 }
 
-// MissingPDF returns Zotio's synced missing-PDF queue, optionally collection-scoped.
+// MissingPDF returns Zotio's synced missing-PDF queue, optionally filtered to an exact collection key.
 func (c *Client) MissingPDF(ctx context.Context, collection string, limit int) ([]MissingPDFItem, error) {
 	if collection != "" && !keyRE.MatchString(collection) {
 		return nil, fmt.Errorf("invalid Zotero collection key %q", collection)

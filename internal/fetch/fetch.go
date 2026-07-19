@@ -94,8 +94,8 @@ func (d *Downloader) Fetch(ctx context.Context, rawURL, quarantinePath string) (
 
 // DownloadWithHeaders downloads rawURL with ephemeral request headers. Headers
 // are copied into the request and are never retained in Result or Error. On a
-// cross-host redirect, every caller-supplied header is removed before the next
-// hop so source credentials and request metadata cannot leak.
+// redirect outside the original origin, every caller-supplied header is removed
+// before the next hop so source credentials and request metadata cannot leak.
 func (d *Downloader) DownloadWithHeaders(ctx context.Context, rawURL string, headers map[string]string, quarantinePath string) (Result, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
@@ -108,7 +108,7 @@ func (d *Downloader) DownloadWithHeaders(ctx context.Context, rawURL string, hea
 }
 
 // DownloadRequest downloads a GET request. It preserves request headers on the
-// first hop only; on a redirect that changes host or port, it removes every
+// first hop only; on a redirect outside the original origin, it removes every
 // caller-supplied header before the next hop.
 func (d *Downloader) DownloadRequest(ctx context.Context, request *http.Request, quarantinePath string) (Result, error) {
 	if request == nil || request.URL == nil {
@@ -155,7 +155,7 @@ func (d *Downloader) DownloadRequest(ctx context.Context, request *http.Request,
 			next := current.Clone(overall)
 			next.URL = nextURL
 			next.Host = ""
-			if !sameHost(current.URL, nextURL) {
+			if !sameOrigin(current.URL, nextURL) {
 				next.Header = crossHostHeaders(next.Header)
 			}
 			current = next
@@ -313,10 +313,9 @@ func (d *Downloader) saveResponse(overall context.Context, resp *http.Response, 
 	}, nil
 }
 
-// readBodyWithContext bounds even a custom response body that ignores Close.
-// A late read is discarded harmlessly: result is buffered (cap 1) and the read
-// goroutine writes exactly once, so its send never blocks even with no reader.
-func readBodyWithContext(ctx context.Context, body io.Reader, buffer []byte) (int, error) {
+// readBodyWithContext closes a blocked response body and drains the worker
+// before returning for cancellation, containing the worker's lifetime.
+func readBodyWithContext(ctx context.Context, body io.ReadCloser, buffer []byte) (int, error) {
 	type readResult struct {
 		n   int
 		err error
@@ -330,6 +329,8 @@ func readBodyWithContext(ctx context.Context, body io.Reader, buffer []byte) (in
 	case done := <-result:
 		return done.n, done.err
 	case <-ctx.Done():
+		_ = body.Close()
+		<-result
 		return 0, ctx.Err()
 	}
 }
@@ -572,8 +573,8 @@ func isRedirect(status int) bool {
 		status == http.StatusPermanentRedirect
 }
 
-func sameHost(a, b *url.URL) bool {
-	return strings.EqualFold(a.Host, b.Host)
+func sameOrigin(a, b *url.URL) bool {
+	return strings.EqualFold(a.Scheme, b.Scheme) && strings.EqualFold(a.Host, b.Host)
 }
 
 // crossHostHeaders creates an empty header set for another origin. Candidate

@@ -29,7 +29,7 @@ func NewSecureHTTPClient(policy Policy, resolver Resolver, transport http.RoundT
 }
 
 // Do implements the small HTTPClient interfaces used by metadata resolvers.
-// Caller-supplied headers are removed on every cross-host redirect.
+// Caller-supplied headers are removed on every redirect outside the origin.
 func (c *SecureHTTPClient) Do(request *http.Request) (*http.Response, error) {
 	if c == nil || c.downloader == nil || request == nil || request.URL == nil {
 		return nil, invalid("invalid request")
@@ -72,7 +72,7 @@ func (c *SecureHTTPClient) Do(request *http.Request) (*http.Response, error) {
 			next := current.Clone(overall)
 			next.URL = nextURL
 			next.Host = ""
-			if !sameHost(current.URL, nextURL) {
+			if !sameOrigin(current.URL, nextURL) {
 				next.Header = crossHostHeaders(next.Header)
 			}
 			current = next

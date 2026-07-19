@@ -105,14 +105,28 @@ func (e *Exporter) Export(ctx context.Context, jobID, destination string) (strin
 	if destination == "" {
 		destination = filepath.Join(e.DataDir, "bundles", jobID)
 	}
-	if err := os.MkdirAll(filepath.Join(destination, "artifacts"), 0o700); err != nil {
+	destinationExisted, err := pathExists(destination)
+	if err != nil {
+		return "", nil, err
+	}
+	artifactsDir := filepath.Join(destination, "artifacts")
+	artifactsDirExisted, err := pathExists(artifactsDir)
+	if err != nil {
+		return "", nil, err
+	}
+	if err := os.MkdirAll(artifactsDir, 0o700); err != nil {
 		return "", nil, err
 	}
 	artifactPath := filepath.Join(destination, filepath.FromSlash(b.Artifact.Path))
-	if err := materializeArtifact(art.Path, artifactPath, art.SHA256); err != nil {
+	artifactCreated, err := materializeArtifact(art.Path, artifactPath, art.SHA256)
+	if err != nil {
 		return "", nil, err
 	}
 	bundlePath := filepath.Join(destination, "bundle.json")
+	bundleExisted, err := pathExists(bundlePath)
+	if err != nil {
+		return "", nil, err
+	}
 	encoded, err := json.MarshalIndent(b, "", "  ")
 	if err != nil {
 		return "", nil, err
@@ -122,6 +136,11 @@ func (e *Exporter) Export(ctx context.Context, jobID, destination string) (strin
 		return "", nil, err
 	}
 	if err := e.record(ctx, jobID, art.SHA256, bundlePath); err != nil {
+		cleanupErr := cleanupExport(destination, artifactsDir, artifactPath, bundlePath,
+			destinationExisted, artifactsDirExisted, artifactCreated, !bundleExisted)
+		if cleanupErr != nil {
+			return "", nil, fmt.Errorf("recording bundle export: %w", errors.Join(err, cleanupErr))
+		}
 		return "", nil, err
 	}
 	return bundlePath, b, nil
@@ -138,21 +157,18 @@ func digest(b *protocol.AcquisitionBundle) (string, error) {
 	return "sha256:" + hex.EncodeToString(sum[:]), nil
 }
 
-func materializeArtifact(source, target, expectedSHA string) (retErr error) {
+func materializeArtifact(source, target, expectedSHA string) (created bool, retErr error) {
 	if got, _, err := artifact.HashFile(target); err == nil {
 		if got == expectedSHA {
-			return nil
+			return false, nil
 		}
-		return fmt.Errorf("existing bundle artifact %s has hash %s, want %s", target, got, expectedSHA)
+		return false, fmt.Errorf("existing bundle artifact %s has hash %s, want %s", target, got, expectedSHA)
 	} else if !os.IsNotExist(err) {
-		return err
-	}
-	if err := os.Link(source, target); err == nil {
-		return nil
+		return false, err
 	}
 	in, err := os.Open(source)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer func() {
 		if closeErr := in.Close(); retErr == nil && closeErr != nil {
@@ -161,26 +177,60 @@ func materializeArtifact(source, target, expectedSHA string) (retErr error) {
 	}()
 	out, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o400)
 	if err != nil {
-		return err
+		return false, err
 	}
 	_, copyErr := io.Copy(out, in)
 	closeErr := out.Close()
 	if copyErr != nil || closeErr != nil {
 		_ = os.Remove(target)
 		if copyErr != nil {
-			return copyErr
+			return false, copyErr
 		}
-		return closeErr
+		return false, closeErr
 	}
 	got, _, err := artifact.HashFile(target)
 	if err != nil {
-		return err
+		_ = os.Remove(target)
+		return false, err
 	}
 	if got != expectedSHA {
 		_ = os.Remove(target)
-		return fmt.Errorf("copied artifact hash %s, want %s", got, expectedSHA)
+		return false, fmt.Errorf("copied artifact hash %s, want %s", got, expectedSHA)
 	}
-	return nil
+	return true, nil
+}
+
+func pathExists(path string) (bool, error) {
+	_, err := os.Lstat(path)
+	if err == nil {
+		return true, nil
+	}
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	return false, err
+}
+
+func cleanupExport(destination, artifactsDir, artifactPath, bundlePath string, destinationExisted, artifactsDirExisted, artifactCreated, bundleCreated bool) error {
+	var errs []error
+	remove := func(path string) {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			errs = append(errs, err)
+		}
+	}
+	if bundleCreated {
+		remove(bundlePath)
+	}
+	if artifactCreated {
+		remove(artifactPath)
+	}
+	if !artifactsDirExisted {
+		remove(artifactsDir)
+	}
+	if !destinationExisted {
+		remove(destination)
+	}
+	return errors.Join(errs...)
 }
 
 func atomicWrite(path string, data []byte, mode os.FileMode) error {

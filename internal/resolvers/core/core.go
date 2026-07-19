@@ -214,7 +214,7 @@ func (r *Resolver) candidates(records []record, requested work.Work, requestedDO
 				continue
 			}
 			match, confidence = "doi_match", 1
-		case titleSearch && sameTitleAndAuthors(record.Title, record.authorNames(), requested.Title, requested.Authors):
+		case titleSearch && matchesTitleSearch(record.Title, record.authorNames(), record.publicationYear(), requested):
 			match, confidence = "title_match", 0.8
 		default:
 			continue
@@ -314,21 +314,37 @@ func doiLanding(doi string) string {
 func sameTitle(left, right string) bool {
 	return normalizeTitle(left) != "" && normalizeTitle(left) == normalizeTitle(right)
 }
-func sameTitleAndAuthors(recordTitle string, recordAuthors []string, requestedTitle string, requestedAuthors []string) bool {
-	if !sameTitle(recordTitle, requestedTitle) {
+func matchesTitleSearch(recordTitle string, recordAuthors []string, recordYear int, requested work.Work) bool {
+	if !sameTitle(recordTitle, requested.Title) {
 		return false
 	}
-	if len(recordAuthors) == 0 || len(requestedAuthors) == 0 {
+	if requested.Year != 0 && recordYear != requested.Year {
+		return false
+	}
+	return sameAuthorLists(recordAuthors, requested.Authors)
+}
+
+func sameAuthorLists(recordAuthors, requestedAuthors []string) bool {
+	if len(requestedAuthors) == 0 {
 		return true
 	}
-	for _, recordAuthor := range recordAuthors {
-		for _, requestedAuthor := range requestedAuthors {
-			if sameAuthor(recordAuthor, requestedAuthor) {
-				return true
+	if len(recordAuthors) != len(requestedAuthors) {
+		return false
+	}
+	matched := make([]bool, len(recordAuthors))
+	for _, requestedAuthor := range requestedAuthors {
+		found := false
+		for i, recordAuthor := range recordAuthors {
+			if !matched[i] && sameAuthor(recordAuthor, requestedAuthor) {
+				matched[i], found = true, true
+				break
 			}
 		}
+		if !found {
+			return false
+		}
 	}
-	return false
+	return true
 }
 func sameAuthor(left, right string) bool {
 	left, right = normalizeTitle(left), normalizeTitle(right)
@@ -384,13 +400,17 @@ func (r record) authorNames() []string {
 }
 
 func (r record) resolvedWork() work.Work {
+	return work.Work{DOI: canonicalDOI(r.DOI), Title: strings.TrimSpace(r.Title), Authors: r.authorNames(), Year: r.publicationYear()}
+}
+
+func (r record) publicationYear() int {
 	year := r.YearPublished
 	if year == 0 && len(r.PublishedDate) >= 4 {
 		if parsed, err := strconv.Atoi(r.PublishedDate[:4]); err == nil {
 			year = parsed
 		}
 	}
-	return work.Work{DOI: canonicalDOI(r.DOI), Title: strings.TrimSpace(r.Title), Authors: r.authorNames(), Year: year}
+	return year
 }
 
 func mapVersion(value string) string {

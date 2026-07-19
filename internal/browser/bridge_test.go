@@ -496,6 +496,70 @@ func TestDownloadCompleteRejectsTraversalAndAdoptsValidFile(t *testing.T) {
 	}
 }
 
+func TestDownloadValidationDoesNotBlockSessionSync(t *testing.T) {
+	b, jobs, cfg, _ := newBridge(t)
+	id := park(t, jobs, "wr_unblocked_sync", handoffWork())
+	runSync(t, b, hello())
+	writeFixturePDF(t, filepath.Join(cfg.EffectiveAdoptionRoot(), id, "paper.pdf"))
+
+	validationStarted := make(chan struct{})
+	releaseValidation := make(chan struct{})
+	validationReleased := false
+	t.Cleanup(func() {
+		if !validationReleased {
+			close(releaseValidation)
+		}
+	})
+	b.svc.Validate = func(context.Context, string, string, work.Work) (pdf.ValidationReport, error) {
+		close(validationStarted)
+		<-releaseValidation
+		return pdf.ValidationReport{
+			Payload:    pdf.PayloadReport{OK: true},
+			Structural: pdf.StructuralReport{Valid: true, Pages: 3},
+			Text:       pdf.TextReport{Chars: 4000},
+			Identity:   pdf.IdentityDecision{Result: pdf.IdentityPass, Evidence: []string{"doi match"}},
+		}, nil
+	}
+
+	frame := inFrame(t, protocol.MsgDownloadComplete, id,
+		map[string]any{"download_id": 7, "filename": "paper.pdf", "size_bytes": 533})
+	adoptionDone := make(chan error, 1)
+	go func() {
+		_, err := b.Sync(context.Background(), []json.RawMessage{frame})
+		adoptionDone <- err
+	}()
+	select {
+	case <-validationStarted:
+	case <-time.After(time.Second):
+		t.Fatal("download adoption never reached validation")
+	}
+
+	pollDone := make(chan error, 1)
+	go func() {
+		_, err := b.Sync(context.Background(), nil)
+		pollDone <- err
+	}()
+	select {
+	case err := <-pollDone:
+		if err != nil {
+			t.Fatalf("poll during validation: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("session sync blocked on download validation")
+	}
+
+	close(releaseValidation)
+	validationReleased = true
+	select {
+	case err := <-adoptionDone:
+		if err != nil {
+			t.Fatalf("download adoption: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("download adoption did not finish")
+	}
+}
+
 func TestDownloadForUnrelatedJobDoesNotAdoptAnotherJobsFile(t *testing.T) {
 	b, jobs, cfg, _ := newBridge(t)
 	ctx := context.Background()

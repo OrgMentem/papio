@@ -34,21 +34,22 @@ func MatchIdentity(text string, target work.Work) IdentityDecision {
 	return MatchIdentityWithThreshold(text, target, 0.6)
 }
 
-// MatchIdentityWithThreshold applies the same exact DOI and non-article rules,
-// then requires the configured share of significant title tokens.
+// MatchIdentityWithThreshold applies the front-matter DOI and non-article
+// rules, then requires the configured share of significant title tokens.
 func MatchIdentityWithThreshold(text string, target work.Work, titleThreshold float64) IdentityDecision {
 	if titleThreshold <= 0 || titleThreshold > 1 {
 		titleThreshold = 0.6
 	}
-	haystack := strings.ToLower(text)
+	frontMatter := identityFrontMatter(text)
 	for _, marker := range nonArticleMarkers {
-		if strings.Contains(haystack, marker) {
+		if strings.HasPrefix(firstNonEmptyLine(frontMatter), marker) {
 			return reject("non-article marker: " + marker)
 		}
 	}
 
+	haystack := strings.ToLower(text)
 	wantDOI := normalizeDOI(target.DOI)
-	gotDOIs := documentDOIs(text)
+	gotDOIs := documentDOIs(frontMatter)
 	if wantDOI != "" && len(gotDOIs) != 0 {
 		for _, gotDOI := range gotDOIs {
 			if gotDOI == wantDOI {
@@ -140,6 +141,27 @@ func documentDOIs(text string) []string {
 		}
 	}
 	return out
+}
+
+const identityFrontMatterBytes = 1 << 10
+
+func identityFrontMatter(text string) string {
+	if firstPage, _, ok := strings.Cut(text, "\f"); ok {
+		text = firstPage
+	}
+	if len(text) > identityFrontMatterBytes {
+		return text[:identityFrontMatterBytes]
+	}
+	return text
+}
+
+func firstNonEmptyLine(text string) string {
+	for _, line := range strings.Split(text, "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			return strings.ToLower(line)
+		}
+	}
+	return ""
 }
 
 func identityTitleTokens(title string) []string {

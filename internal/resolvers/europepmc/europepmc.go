@@ -280,9 +280,8 @@ func selectResult(results []epmcResult, requested work.Work, mode matchMode) *ep
 		}
 		return nil
 	case matchTitle:
-		want := normalizeTitle(requested.Title)
 		for i := range results {
-			if normalizeTitle(results[i].Title) == want {
+			if matchesTitleSearch(results[i].Title, authorNames(results[i].AuthorString), publicationYear(results[i].PubYear), requested) {
 				return &results[i]
 			}
 		}
@@ -332,15 +331,74 @@ func resolvedWork(result *epmcResult) work.Work {
 	if pmid, err := work.NormalizePMID(result.PMID); err == nil {
 		resolved.PMID = pmid
 	}
-	for _, name := range strings.Split(result.AuthorString, ",") {
+	for _, name := range authorNames(result.AuthorString) {
+		resolved.Authors = append(resolved.Authors, name)
+	}
+	resolved.Year = publicationYear(result.PubYear)
+	return resolved
+}
+
+func matchesTitleSearch(recordTitle string, recordAuthors []string, recordYear int, requested work.Work) bool {
+	if normalizeTitle(recordTitle) != normalizeTitle(requested.Title) {
+		return false
+	}
+	if requested.Year != 0 && recordYear != requested.Year {
+		return false
+	}
+	return sameAuthorLists(recordAuthors, requested.Authors)
+}
+
+func authorNames(value string) []string {
+	var names []string
+	for _, name := range strings.Split(value, ",") {
 		if name = strings.TrimSpace(name); name != "" {
-			resolved.Authors = append(resolved.Authors, name)
+			names = append(names, name)
 		}
 	}
-	if year, err := strconv.Atoi(strings.TrimSpace(result.PubYear)); err == nil {
-		resolved.Year = year
+	return names
+}
+
+func publicationYear(value string) int {
+	year, _ := strconv.Atoi(strings.TrimSpace(value))
+	return year
+}
+
+func sameAuthorLists(recordAuthors, requestedAuthors []string) bool {
+	if len(requestedAuthors) == 0 {
+		return true
 	}
-	return resolved
+	if len(recordAuthors) != len(requestedAuthors) {
+		return false
+	}
+	matched := make([]bool, len(recordAuthors))
+	for _, requestedAuthor := range requestedAuthors {
+		found := false
+		for i, recordAuthor := range recordAuthors {
+			if !matched[i] && sameAuthor(recordAuthor, requestedAuthor) {
+				matched[i], found = true, true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+func sameAuthor(left, right string) bool {
+	left, right = normalizeTitle(left), normalizeTitle(right)
+	if left == "" || right == "" {
+		return false
+	}
+	if left == right {
+		return true
+	}
+	leftParts, rightParts := strings.Fields(left), strings.Fields(right)
+	if len(leftParts) == 0 || len(rightParts) == 0 || leftParts[len(leftParts)-1] != rightParts[len(rightParts)-1] {
+		return false
+	}
+	return leftParts[0][0] == rightParts[0][0]
 }
 
 func reuseLicense(value string) string {

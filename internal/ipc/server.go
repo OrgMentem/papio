@@ -50,9 +50,8 @@ func (r Router) Handle(ctx context.Context, req Request) ([]byte, *RPCError) {
 }
 
 // Server exposes one-request-per-connection RPC over the daemon's local
-// endpoint (a Unix-domain socket or a Windows named pipe).
-// Calls are serialized before entering Handler so handlers that perform a
-// sequence of writes retain the daemon's single-writer ordering.
+// endpoint (a Unix-domain socket or a Windows named pipe). Each connection
+// owns its response write, so independent calls can dispatch concurrently.
 type Server struct {
 	SocketPath string
 	Handler    Handler
@@ -63,8 +62,6 @@ type Server struct {
 	// cleanup removes the endpoint this server created; it is set by Listen and
 	// invoked by Serve on exit. It is a no-op transport where nothing persists.
 	cleanup func() error
-
-	callMu sync.Mutex
 }
 
 // Listen creates the daemon's local endpoint with owner-only permissions,
@@ -171,9 +168,7 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
 	if err != nil {
 		return
 	}
-	s.callMu.Lock()
 	result, rpcErr := s.Handler.Handle(ctx, req)
-	s.callMu.Unlock()
 
 	res := Response{Protocol: ProtocolVersion, ID: req.ID}
 	if rpcErr != nil {
