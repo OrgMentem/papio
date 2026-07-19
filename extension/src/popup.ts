@@ -407,8 +407,24 @@ export function wireSettings(doc: Document = document): void {
   });
 }
 
+// The capture-fixture panel is a developer-only tool. Show and wire it only for
+// unpacked development installs; store-installed users never see it. getSelf()
+// needs no "management" permission.
+async function wireDevTools(doc: Document = document): Promise<void> {
+  let development = false;
+  try {
+    development = (await chrome.management.getSelf()).installType === "development";
+  } catch {
+    development = false;
+  }
+  if (!development) return;
+  const section = doc.querySelector<HTMLElement>(".capture");
+  if (section) section.hidden = false;
+  wireCapture(doc);
+}
+
 if (typeof document !== "undefined" && typeof chrome !== "undefined") {
-  wireCapture();
+  void wireDevTools();
   wireSettings();
   void refresh();
 }
