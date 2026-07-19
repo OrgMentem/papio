@@ -6,13 +6,13 @@ Finding a paper is easy; *legitimately getting* it and landing a validated PDF i
 
 ## How it works
 
-Every request becomes a tracked job. `papio` ranks the possible sources and tries them in order — it never just grabs the first URL it finds:
+Every request becomes a job. `papio` ranks the possible sources and tries them in order — it never just grabs the first URL it finds:
 
-![papio acquisition pipeline: you or an agent drive papio's tracked jobs; open sources run before your own browser via the papio extension (installed once), where login, MFA, and CAPTCHA stay human; both paths converge in quarantine and PDF validation, producing a validated bundle with provenance that reaches the Zotero library through zotio preview-then-apply](assets/architecture.svg#only-light)
-![papio acquisition pipeline: you or an agent drive papio's tracked jobs; open sources run before your own browser via the papio extension (installed once), where login, MFA, and CAPTCHA stay human; both paths converge in quarantine and PDF validation, producing a validated bundle with provenance that reaches the Zotero library through zotio preview-then-apply](assets/architecture-dark.svg#only-dark)
+![papio acquisition pipeline: you or an agent drive papio's jobs; open sources run before your own browser via the papio extension (installed once), where login, MFA, and CAPTCHA stay human; both paths converge in quarantine and PDF validation, producing a validated bundle with provenance that reaches the Zotero library through zotio preview-then-apply](assets/architecture.svg#only-light)
+![papio acquisition pipeline: you or an agent drive papio's jobs; open sources run before your own browser via the papio extension (installed once), where login, MFA, and CAPTCHA stay human; both paths converge in quarantine and PDF validation, producing a validated bundle with provenance that reaches the Zotero library through zotio preview-then-apply](assets/architecture-dark.svg#only-dark)
 
 1. **Discover.** `papio search` returns read-only OpenAlex results and marks works already in your zotio library.
-2. **Acquire.** A batch (up to 50 works) or a single work becomes tracked jobs, each with a stable ID, so running the same request again is safe and won't duplicate.
+2. **Acquire.** A batch (up to 50 works) or a single work becomes jobs, each with a stable ID, so running the same request again is safe and won't duplicate.
 3. **Find & download.** Open-access and licensed sources are tried before institutional access; each candidate is downloaded under strict size and time limits, then held in quarantine.
 4. **Validate.** Every PDF must pass checks on its structure, its identity, and — if needed — a text scan before it is trusted; anything ambiguous waits in `needs_review`.
 5. **Hand off.** Finished PDFs reach Zotero **only** through `zotio` — `papio zotio plan` shows you exactly what will change, and `papio zotio apply` only runs after you confirm it.
@@ -51,7 +51,7 @@ New here? Start with the [user guide](guide/user-guide.md), then tune policy in 
 - **[Use in a coding agent](guide/agent-skill.md)** — drive *papio* over MCP (`papio mcp`): the canonical acquisition loop and its safety semantics.
 - **[Access modes & safety](concepts/access-modes.md)** — `conservative` / `assisted` / `maximal` and the non-negotiable product and safety boundaries.
 - **[Acquisition pipeline](concepts/acquisition-pipeline.md)** — the order papio tries sources, how candidates are ranked, job states, and download limits.
-- **[Browser handoff](concepts/browser-handoff.md)** — the ordinary-browser extension, its local connector, the out-of-the-way work window, and why papio never uses an automated browser.
+- **[Browser handoff](concepts/browser-handoff.md)** — the ordinary-browser extension, its local connector, the minimized work window, and why papio never uses an automated browser.
 - **[Validation & provenance](concepts/validation-and-provenance.md)** — PDF structure, identity, OCR gates, and the permanent acquisition bundle.
 - **[Command reference](reference/commands.md)** — every `papio` command and its flags.
 - **[MCP tools](reference/mcp-tools.md)** — the `papio_command_search` and `papio_command_run` command facade, the `papio_acquire_batch` and `papio_batch_wait` composite tools, and read resources, with parameters and boundaries.

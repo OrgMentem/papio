@@ -1,6 +1,6 @@
 # Acquisition pipeline
 
-An acquisition is a saved job: it turns a request into a validated PDF, or
+An acquisition is a job: it turns a request into a validated PDF, or
 records why that did not happen. *papio* keeps the request separate from the
 eventual zotio export, so a finished acquisition is not rewritten by a later
 preview or apply.

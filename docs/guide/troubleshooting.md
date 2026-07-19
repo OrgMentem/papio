@@ -15,10 +15,10 @@ other commands start the service automatically when they need it. Use
 `papio batch report <batch-id-or-latest> --markdown` to see a research set's
 joined outcome.
 
-## The Chrome extension is running old code
+## The Chrome extension is outdated
 
-An unpacked extension can keep running older code even after the files on disk
-change. The fix is an explicit extension reload; a Chrome restart, killing the
+An unpacked extension can keep running outdated code even after you change the
+files on disk. The fix is an explicit extension reload; a Chrome restart, killing the
 process, or reloading the extension's folder alone is not enough.
 
 ### Preferred UI reload

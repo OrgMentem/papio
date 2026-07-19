@@ -35,12 +35,12 @@ and closes only its own tabs when a job finishes or is cancelled. The extension
 can restart at any time; it keeps only a minimal tab-to-job mapping and asks
 *papio* for the authoritative state.
 
-## An out-of-the-way work window
+## The minimized work window
 
-This window is *out of the way*, not a hidden browser. *papio* keeps its tabs in
-one dedicated window, opened minimized and unfocused. It is reused for later
-handoffs and reopened if you close it, so your ordinary tabs are not flooded with
-login and publisher pages.
+*papio* keeps its tabs in one dedicated browser window, opened minimized and
+unfocused — a normal window kept out of your way, not a hidden or automated
+browser. It is reused for later handoffs and reopened if you close it, so your
+ordinary tabs are not flooded with login and publisher pages.
 
 The extension surfaces the exact work tab only when a human decision is needed:
 
@@ -48,7 +48,7 @@ The extension surfaces the exact work tab only when a human decision is needed:
 - publisher terms requiring a decision; or
 - identity review.
 
-After that step, the work window can slip back out of the way and *papio* continues
+After that step, the window can be minimized again and *papio* continues
 its work. This preserves the one-login-per-research-session model without
 asking *papio* to handle passwords, MFA, CAPTCHA tokens, or publisher
 credentials.

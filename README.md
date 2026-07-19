@@ -47,7 +47,7 @@
 <p align="center">
   Finding a paper is easy; <em>legitimately acquiring</em> it is the tedious
   part. <code>papio</code> searches scholarly works on OpenAlex, turns your
-  picks into tracked acquisition jobs, resolves each one through
+  picks into acquisition jobs, resolves each one through
   open-access and licensed sources first — falling back to a visible
   institutional pass in your own browser only when needed — validates every
   PDF before you trust it, and hands ready PDFs to Zotero through
@@ -82,7 +82,7 @@ crossed.
   handoff **in your ordinary Chrome or Firefox session** — login, MFA, and
   CAPTCHAs stay human decisions. `papio` never stores institution credentials
   and never does subscription crawling.
-- **Tracked, repeatable jobs.** Every request becomes a saved job with a
+- **Repeatable jobs.** Every request becomes a job with a
   stable ID — running it again is safe and won't duplicate, batches are capped,
   and budgets and allowed/blocked sources are enforced by papio, not by hope.
 - **Validated before trusted.** Every candidate PDF is quarantined and gated on
@@ -97,14 +97,14 @@ crossed.
 
 ## How it works
 
-Each acquisition is a tracked job. `papio` ranks the possible sources by a fixed
+Each acquisition is a job. `papio` ranks the possible sources by a fixed
 set of rules and tries them in order — it never accepts the first URL
 it finds:
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/architecture-dark.svg">
   <source media="(prefers-color-scheme: light)" srcset="docs/assets/architecture.svg">
-  <img alt="papio acquisition pipeline: you or an agent drive papio's tracked jobs; open-access and licensed APIs run before your own browser via the papio extension (installed once), where login, MFA, and CAPTCHA stay human; both paths converge in quarantine and PDF validation, producing an immutable bundle with provenance that reaches the Zotero library through zotio preview-then-apply" src="docs/assets/architecture.svg">
+  <img alt="papio acquisition pipeline: you or an agent drive papio's jobs; open-access and licensed APIs run before your own browser via the papio extension (installed once), where login, MFA, and CAPTCHA stay human; both paths converge in quarantine and PDF validation, producing an immutable bundle with provenance that reaches the Zotero library through zotio preview-then-apply" src="docs/assets/architecture.svg">
 </picture>
 
 | Stage | Source / tooling | Handles credentials? |
@@ -133,7 +133,7 @@ the finished PDFs flow into Zotero:
 papio search "trust in AI advice" --limit 20 --year-from 2022
 papio search --cites 10.1002/mar.21498          # citation snowball: who cites this paper?
 
-# 2. Acquire — one work or a capped batch of tracked jobs
+# 2. Acquire — one work or a capped batch of jobs
 papio acquire 10.1016/j.chb.2020.106607 --auto-import --wait
 papio acquire arXiv:2401.00001 --desired-version published
 
@@ -201,7 +201,7 @@ you can import however you like.
 
 - **`--json`** on any command for structured output.
 - **`papio mcp`** serves an MCP server with the same configuration,
-  background service, tracked jobs, and zotio boundary as the CLI.
+  background service, jobs, and zotio boundary as the CLI.
 - **A command facade** derived from the CLI, so agents reach the whole tool
   surface through two tools without a parallel layer that can drift:
   `papio_command_search` to discover commands and `papio_command_run` to
