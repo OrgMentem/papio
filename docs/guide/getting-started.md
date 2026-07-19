@@ -21,12 +21,6 @@ you a preview before it writes anything.
 
 === "Linux"
 
-    **Homebrew** (Linuxbrew):
-
-    ```bash
-    brew install orgmentem/tap/papio
-    ```
-
     **Distro packages** — every [GitHub release](https://github.com/OrgMentem/papio/releases) ships `.deb`, `.rpm`, and `.apk` for amd64/arm64. Download the file for your arch, then install it alongside Poppler/Tesseract:
 
     ```bash
