@@ -10,6 +10,8 @@ execution records in `notes/acquisition-stack-plan.md`.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-07-20
+
 ### Added
 
 - **Backfill watches**: `papio watch add --kind backfill` schedules the
