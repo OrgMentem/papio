@@ -2,15 +2,15 @@
 
 _Last updated: 2026-07-19_
 
-papio is a **local** paper-acquisition tool. It runs on your own machine and, for
+*papio* is a **local** paper-acquisition tool. It runs on your own machine and, for
 the institutional handoff, inside your own browser. This policy covers both the
-papio application (daemon and CLI) and the **papio browser extension**.
+*papio* application (daemon and CLI) and the **_papio_ browser extension**.
 
 ## The short version
 
-**papio collects no personal data. Nothing is sent to OrgMentem or any third
-party.** The extension talks only to the papio application running locally on
-your computer, over the browser's native-messaging channel. There is no papio
+**_papio_ collects no personal data. Nothing is sent to OrgMentem or any third
+party.** The extension talks only to the *papio* application running locally on
+your computer, over the browser's native-messaging channel. There is no *papio*
 server, no account, no telemetry, and no analytics.
 
 ## What the extension does and does not do
@@ -19,7 +19,7 @@ server, no account, no telemetry, and no analytics.
   communicates solely with the local native-messaging host `com.orgmentem.papio`
   on your own machine.
 - **No credentials are stored.** You sign in to your institution and solve any
-  MFA or CAPTCHA yourself, in your own browser session. papio never sees, stores,
+  MFA or CAPTCHA yourself, in your own browser session. *papio* never sees, stores,
   or transmits your usernames, passwords, cookies, or session tokens.
 - **No bulk scraping.** The extension downloads only the papers you explicitly
   request, one at a time, as part of a specific acquisition job. It does not
@@ -33,7 +33,7 @@ server, no account, no telemetry, and no analytics.
 - **In your browser:** the extension keeps its own settings and short-lived job
   and tab state (via the `storage` API) so it can survive service-worker
   suspension and reconnect to the local app. This never leaves your browser.
-- **On your computer:** the papio application stores the papers it acquires, along
+- **On your computer:** the *papio* application stores the papers it acquires, along
   with their metadata and job records, in its local data directory. These files
   stay on your machine (and go only to your own Zotero library if you enable that
   integration).
@@ -49,11 +49,11 @@ store listing.
 
 ## Third parties
 
-papio does not sell your data, does not share it with third parties, and does not
+*papio* does not sell your data, does not share it with third parties, and does not
 use or transfer it for advertising, creditworthiness, or any purpose unrelated to
 performing the acquisition you requested. When you request a paper, your browser
 contacts your institution and the relevant publisher directly, exactly as it
-would if you visited those sites yourself; papio adds no intermediary.
+would if you visited those sites yourself; *papio* adds no intermediary.
 
 ## Changes
 
