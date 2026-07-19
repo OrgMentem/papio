@@ -13,6 +13,14 @@
     ":semanticCommits",
   ],
   labels: ["renovate", "dependencies"],
+  // Captured provider fixtures are sanitized snapshots of real pages, not papio
+  // dependencies. Renovate must not rewrite libraries embedded in them (e.g. the
+  // MathJax CDN URL inside the ProQuest captures).
+  ignorePaths: [
+    "**/node_modules/**",
+    "**/bower_components/**",
+    "extension/fixtures/**",
+  ],
   prConcurrentLimit: 10,
   rebaseWhen: "behind-base-branch",
   dependencyDashboardTitle: "Renovate · papio dependencies",
