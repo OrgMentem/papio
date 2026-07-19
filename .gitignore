@@ -17,3 +17,6 @@ __pycache__/
 /papio
 /docs-gen
 .playwright-cli/
+
+# Scratch tier: throwaway dev artifacts (oracle one-shots, etc.)
+dev/scratch/
