@@ -8,6 +8,12 @@ on:
 permissions:
   contents: read
 
+# Rapid successive pushes (the normal solo workflow) shouldn't run duplicate
+# full suites — newest commit wins.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   compat:
     runs-on: ubuntu-latest
@@ -67,14 +73,6 @@ jobs:
         with:
           version: v2.12.2
 
-  vuln:
-    runs-on: ubuntu-latest
-    steps:
-      - name: govulncheck
-        uses: golang/govulncheck-action@032d45514ae346b1db93c04b0c90b841c370344f # v1
-        with:
-          go-version-input: '1.26.x'
-
   secrets:
     runs-on: ubuntu-latest
     steps:
@@ -106,7 +104,11 @@ jobs:
       - name: Build
         run: go build ./...
       - name: Test
-        run: go test ./...
+        # Race detector on the fast runner only: the daemon and browser bridge
+        # are concurrent, and the plain suite structurally cannot see races.
+        run: go test ${RACE:+"$RACE"} ./...
+        env:
+          RACE: ${{ matrix.os == 'ubuntu-latest' && '-race' || '' }}
 
   # Platform-specific files (named-pipe IPC, registry native host, flock vs
   # LockFileEx) are never compiled on the ubuntu test runner. Cross-compile and

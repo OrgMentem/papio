@@ -1,0 +1,11 @@
+#!/bin/sh
+# Committed git hooks — enable once per clone with: make hooks
+# Pre-push budget: <15s. Full tests stay in CI on purpose — a slow hook
+# trains you to --no-verify, which loses the whole layer.
+set -eu
+
+go vet ./...
+
+# Cross-artifact compatibility floors (daemon<->extension version agreement,
+# manifest.json == package.json). This exact desync has broken CI before.
+python3 scripts/release_metadata.py compat --repo-root . --skip-zotio

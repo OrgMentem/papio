@@ -1,4 +1,4 @@
-.PHONY: build test vet docs-gen docs-build docs-serve ext-bump
+.PHONY: build test vet docs-gen docs-build docs-serve ext-bump hooks
 
 build:
 	go build ./...
@@ -31,3 +31,9 @@ ifndef VERSION
 	$(error usage: make ext-bump VERSION=x.y.z)
 endif
 	python3 scripts/release_metadata.py bump-extension --repo-root . --version $(VERSION)
+
+# Enable the committed git hooks (.githooks/) for this clone. One-time setup;
+# pre-commit = identity guard + gofmt + staged secret scan, pre-push = vet +
+# compat preflight. CI remains the authority.
+hooks:
+	git config core.hooksPath .githooks
