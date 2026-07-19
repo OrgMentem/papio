@@ -5,6 +5,7 @@
 // by itself — that only happens here, explicitly.
 
 import { chromeBackend, type StoreShape } from "./state";
+import { renderPapio } from "./dom";
 
 interface Source {
   label: string;
@@ -121,12 +122,13 @@ async function renderTermsConsent(): Promise<void> {
   } catch {
     consent = undefined;
   }
-  statusEl.textContent =
+  const text =
     consent === "accept"
       ? "On — papio accepts publisher terms automatically"
       : consent === "manual"
         ? "Off — you accept terms yourself"
         : "Ask on first download";
+  renderPapio(statusEl, text);
 }
 
 function wireTermsConsent(): void {
@@ -156,9 +158,10 @@ async function renderWorkWindow(): Promise<void> {
   } catch {
     enabled = true;
   }
-  statusEl.textContent = enabled
+  const text = enabled
     ? "On — papio tabs stay in a minimized background window"
     : "Off — papio tabs open in your current window";
+  renderPapio(statusEl, text);
 }
 
 function wireWorkWindow(): void {
@@ -196,22 +199,26 @@ async function renderDaemonFooter(): Promise<void> {
   const prefix = `papio extension v${extensionVersion} · `;
   switch (daemon.connectionStatus ?? "disconnected") {
     case "connected":
-      footer.textContent =
+      renderPapio(
+        footer,
         typeof daemon.daemonVersion === "string" && daemon.daemonVersion.length > 0
           ? `${prefix}daemon v${daemon.daemonVersion} (connected)`
-          : `${prefix}daemon connected (version unknown)`;
+          : `${prefix}daemon connected (version unknown)`,
+      );
       return;
     case "daemon_outdated":
-      footer.textContent =
+      renderPapio(
+        footer,
         typeof daemon.daemonVersion === "string" && daemon.daemonVersion.length > 0
           ? `${prefix}daemon v${daemon.daemonVersion} (outdated)`
-          : `${prefix}daemon connected (outdated)`;
+          : `${prefix}daemon connected (outdated)`,
+      );
       return;
     case "extension_outdated":
-      footer.textContent = `${prefix}daemon connected (extension outdated)`;
+      renderPapio(footer, `${prefix}daemon connected (extension outdated)`);
       return;
     case "disconnected":
-      footer.textContent = `${prefix}daemon not connected`;
+      renderPapio(footer, `${prefix}daemon not connected`);
       return;
   }
 }

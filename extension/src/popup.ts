@@ -9,6 +9,7 @@
 
 import { captureFixture, type ChromeCaptureApi, type PageCapture, type Provider, type Scenario } from "./capture";
 import { chromeBackend, type ActiveJob, type StoreShape, TERMS_CONSENT_KEY } from "./state";
+import { renderPapio } from "./dom";
 
 type JobSection = "needs-you" | "in-flight" | "done" | "failed";
 
@@ -65,7 +66,7 @@ export function renderDaemonStatus(
   }
   card.hidden = line.length === 0;
   card.classList.toggle("quiet", quiet);
-  message.textContent = line;
+  renderPapio(message, line);
   hint.textContent = action;
 }
 
@@ -316,7 +317,7 @@ export function renderResolverGrants(
   const heading = doc.createElement("h2");
   heading.textContent = "Library access";
   const lede = doc.createElement("p");
-  lede.textContent = `Allow papio to use your library resolver so it can finish downloads without a manual click: ${hosts}`;
+  renderPapio(lede, `Allow papio to use your library resolver so it can finish downloads without a manual click: ${hosts}`);
   const button = doc.createElement("button");
   button.type = "button";
   button.textContent = "Allow library access";
