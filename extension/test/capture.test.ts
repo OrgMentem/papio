@@ -27,9 +27,10 @@ const META: FixtureMeta = {
   capturedISO: "2026-07-14T00:00:00.000Z",
 };
 
-test("script/style/textarea bodies are emptied but tags survive", () => {
+test("script/style/textarea/SVG bodies are emptied but tags survive", () => {
   const out = sanitizeFixture(
-    `<div><script>fetch('/steal?c='+document.cookie)</script><style>.x{color:red}</style><textarea>typed secret</textarea></div>`,
+    `<script>document.cookie</script><style>body{color:red}</style><textarea>typed secret</textarea>` +
+      `<svg aria-label="icon"><style>.secret{}</style><path d="${TOKEN}"></path></svg>`,
     META,
   );
   expect(out).not.toContain("document.cookie");
@@ -37,18 +38,51 @@ test("script/style/textarea bodies are emptied but tags survive", () => {
   expect(out).not.toContain("typed secret");
   expect(out).toContain("<script></script>");
   expect(out).toContain("<textarea></textarea>");
+  expect(out).toContain(`<svg aria-label="icon"></svg>`);
 });
 
 test("query strings and fragments are stripped from url attributes", () => {
   const out = sanitizeFixture(
-    `<a href="https://www.proquest.com/pdf/1?tk=SENTINELabc#frag">x</a><img src="/img/logo.png?v=3">`,
+    `<a href="https://www.proquest.com/pdf/1?tk=SENTINELabc#frag">x</a>` +
+      `<img src="/img/logo.png?v=3"><button data-href="?id=doi:10.1000/example&sid=provider">Lookup</button>`,
     META,
   );
   expect(out).toContain(`href="https://www.proquest.com/pdf/1"`);
   expect(out).toContain(`src="/img/logo.png"`);
+  expect(out).toContain(`data-href=""`);
   expect(out).not.toContain("SENTINEL");
   expect(out).not.toContain("#frag");
   expect(out).not.toContain("v=3");
+});
+
+test("semantic URL paths survive while opaque path segments and queries are masked", () => {
+  const out = sanitizeFixture(
+    `<a href="/products/ejournals/pdf/10.1055/a-2821-8219.pdf?ticket=${TOKEN}">PDF</a>` +
+      `<a href="/download/56ec3ea3-966b-4a98-9584-f8f51fe6f1d0/file.pdf">opaque</a>`,
+    META,
+  );
+  expect(out).toContain(`href="/products/ejournals/pdf/10.1055/a-2821-8219.pdf"`);
+  expect(out).toContain(`href="/download/TOKEN/file.pdf"`);
+  expect(out).not.toContain("ticket=");
+  expect(residualLeak(out)).toBeNull();
+});
+
+test("provider URL metas remain queryless selector evidence while token metas are dropped", () => {
+  const out = sanitizeFixture(
+    `<meta name="citation_pdf_url" content="https://hal.science/hal-04206682/document?token=${TOKEN}">` +
+      `<meta name="wkhealth_pdf_url" content="https://journals.lww.com/downloadpdf.aspx?an=${TOKEN}">` +
+      `<meta name="csrf-token" content="${TOKEN}">`,
+    META,
+  );
+  expect(out).toContain(
+    `name="citation_pdf_url" content="https://hal.science/hal-04206682/document"`,
+  );
+  expect(out).toContain(
+    `name="wkhealth_pdf_url" content="https://journals.lww.com/downloadpdf.aspx"`,
+  );
+  expect(out).not.toContain("csrf-token");
+  expect(out).not.toContain("token=");
+  expect(residualLeak(out)).toBeNull();
 });
 
 test("input values and value attributes are blanked", () => {
@@ -60,6 +94,70 @@ test("input values and value attributes are blanked", () => {
   expect(out).not.toContain("hunter2");
   expect(out).not.toContain("autocomplete");
   expect(out).toContain(`name="pw"`); // structural attrs survive
+});
+
+test("short request ids and CSP nonces are blanked and guarded", () => {
+  const out = sanitizeFixture(
+    `<script src="/bundle.js" nonce="9ab35b571eb2fec3"></script>` +
+      `<div data-request-id="9ab35b571eb2fec3-MNL" class="page">x</div>` +
+      `<meta name="request-id" content="95054841648dcefe-SJC">`,
+    META,
+  );
+  expect(out).toContain(`nonce=""`);
+  expect(out).toContain(`data-request-id=""`);
+  expect(out).not.toContain("9ab35b571eb2fec3");
+  expect(out).not.toContain("95054841648dcefe");
+  expect(residualLeak(out)).toBeNull();
+  // The guard itself rejects a survivor independently of the rewriter.
+  expect(residualLeak(`<div data-request-id="9ab35b571eb2fec3-MNL">x</div>`)).toContain(
+    "per-request identifier",
+  );
+  expect(residualLeak(`<meta name="request-id" content="95054841648dcefe-SJC">`)).toContain(
+    "per-request identifier",
+  );
+});
+
+test("email addresses are masked in text, attributes, and mailto links", () => {
+  const out = sanitizeFixture(
+    `<a href="mailto:masayoshi.mase.mh@hitachi.com">Contact</a>` +
+      `<meta name="citation_author_email" content="owen@stanford.edu">` +
+      `<span>reach bbseiler@stanford.edu for reprints</span>`,
+    META,
+  );
+  expect(out).not.toContain("hitachi.com");
+  expect(out).not.toContain("stanford.edu");
+  expect(out).not.toContain("@");
+  expect(residualLeak(out)).toBeNull();
+  expect(residualLeak(`<span>owen@stanford.edu</span>`)).toContain("email address");
+});
+
+test("provider-specific URL attributes lose queries like href/src do", () => {
+  const out = sanitizeFixture(
+    `<div data-fullTexturl="/content/journals/10.1146/x.html?itemId=/content/journals/10.1146/x&mimeType=html">a</div>` +
+      `<comp institution-log-in-url="https://www.cambridge.org/core/shibboleth?app=core&ref=/core/product" register-url="/core/register?ref=/core/product">b</comp>`,
+    META,
+  );
+  expect(out).toContain(`data-fullTexturl="/content/journals/10.1146/x.html"`);
+  expect(out).toContain(`institution-log-in-url="https://www.cambridge.org/core/shibboleth"`);
+  expect(out).toContain(`register-url="/core/register"`);
+  expect(out).not.toContain("itemId=");
+  expect(out).not.toContain("ref=");
+  expect(residualLeak(out)).toBeNull();
+  expect(residualLeak(`<div data-fullTexturl="/x.html?itemId=1">a</div>`)).toContain(
+    "query string",
+  );
+});
+
+test("stable selector prefixes survive while per-record id suffixes are masked", () => {
+  const out = sanitizeFixture(
+    `<a id="downloadPDFLink_MSTAR_216440925" href="/pdf/1">PDF</a>` +
+      `<div id="fulltext_translation2_MSTAR_216440925">x</div>`,
+    META,
+  );
+  expect(out).toContain(`id="downloadPDFLink_MSTAR_TOKEN"`);
+  expect(out).toContain(`id="fulltext_TOKEN_MSTAR_TOKEN"`);
+  expect(out).not.toContain("216440925");
+  expect(residualLeak(out)).toBeNull();
 });
 
 test("inline styles are blanked because they are not selector evidence", () => {
@@ -105,13 +203,16 @@ test("token-shaped runs are masked in BOTH attributes and text", () => {
   expect(out).not.toContain(TOKEN);
 });
 
-test("scrubbing a long comment body preserves its closing delimiter", () => {
+test("comments are emptied without merging adjacent markup", () => {
   const out = sanitizeFixture(
-    `<!--eslint-disable-next-line-vue/no-v-html--><mfe-content-details-pharos-button>ok</mfe-content-details-pharos-button><!--eslint-enable-->`,
+    `before<!--<a href="/account?token=${TOKEN}">private</a>-->` +
+      `<mfe-content-details-pharos-button>ok</mfe-content-details-pharos-button><!--eslint-enable-->after`,
     META,
   );
-  expect(out).toContain(`<!--TOKEN--><mfe-content-details-pharos-button>`);
-  expect(out).toContain(`</mfe-content-details-pharos-button><!--eslint-enable-->`);
+  expect(out).toContain(
+    `before<!----><mfe-content-details-pharos-button>ok</mfe-content-details-pharos-button><!---->after`,
+  );
+  expect(out).not.toContain("private");
   expect(residualLeak(out)).toBeNull();
 });
 
@@ -138,6 +239,23 @@ test("the papio-fixture header is the first line and exactly formatted", () => {
   expect(firstLine).toBe(
     `<!-- papio-fixture provider="proquest" scenario="success" origin="https://www.proquest.com/docview/1" captured="2026-07-14T00:00:00.000Z" -->`,
   );
+});
+
+test("residual guard accepts the validated provenance header with a semantic long origin", () => {
+  const out = sanitizeFixture(`<p>paywall</p>`, {
+    ...META,
+    provider: "nature",
+    scenario: "no-entitlement",
+    originNoQuery: "https://www.nature.com/articles/nature14539",
+  });
+  expect(residualLeak(out)).toBeNull();
+});
+
+test("residual guard still rejects token-shaped values in non-provenance comments", () => {
+  const out =
+    `<!-- papio-fixture provider="nature" scenario="success" origin="https://www.nature.com/articles/TOKEN" captured="2026-07-14T00:00:00.000Z" -->\n` +
+    `<!-- ${TOKEN} -->`;
+  expect(residualLeak(out)).toContain("token-shaped value");
 });
 
 test("sanitization is deterministic", () => {
@@ -255,7 +373,7 @@ test("capture masks a token-shaped provider path before writing", async () => {
   expect(encoded).toBeDefined();
   const decoded = decodeURIComponent(encoded ?? "");
   expect(decoded).not.toContain(TOKEN);
-  expect(decoded).toContain(`origin="https://www.jstor.org/TOKEN"`);
+  expect(decoded).toContain(`origin="https://www.jstor.org/stable/TOKEN"`);
   expect(residualLeak(decoded)).toBeNull();
 });
 

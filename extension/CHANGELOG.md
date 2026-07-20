@@ -26,12 +26,30 @@ for the full pre-split extension history.
 - Adapters can declare `requiresVisible`; their handoff tabs then open in a
   normal, unfocused window instead of the minimized work window (fix path
   for providers that under-render while hidden). No current adapter sets it.
+- **14 new fixture-backed provider adapter families**: APA PsycNet, Annual
+  Reviews, Taylor & Francis Online, Emerald Insight, Cambridge Core, Thieme
+  Connect, Nature, Oxford Academic (Silverchair), MIT Press, BMJ,
+  PsychiatryOnline, JAMA Network, Wolters Kluwer/LWW (Ovid journals), and
+  HAL — each registered from an authentic captured page (success plus a
+  denial capture where one was reachable), doubling adapter coverage of the
+  real missing-PDF corpus. Ovid SSO-walled and ISHS Acta Horticulturae
+  member-credit pages stay assisted: no authentic entitled capture exists,
+  so no adapter is registered for them.
+- `scripts/sanitize-fixture.ts`: one-command capture sanitation — reads a raw
+  saved page, runs `sanitizeFixture`, verifies the residual-leak guard, and
+  writes the committable fixture with its provenance header.
 
 ### Fixed
 
 - The developer-only fixture-capture tool no longer leaks its filename
   reservation when Chrome rejects a download; unclaimed reservations expire
   after one minute.
+- Fixture sanitization hardened for the new captures: URL-valued provider
+  metas (e.g. `citation_pdf_url`, `wkhealth_pdf_url`) keep queryless selector
+  evidence instead of being dropped, comments are emptied without merging
+  adjacent markup, script/style/SVG bodies are always emptied, and the
+  provenance header's provider label is itself guarded against opaque
+  observed-host names.
 
 ## [0.3.1] - 2026-07-19
 

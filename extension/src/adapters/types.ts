@@ -549,4 +549,432 @@ export const adapters: AdapterSpec[] = [
       method: "href",
     },
   },
+  {
+    // Verified live 2026-07-20 in a fresh browser against the public full-text
+    // page for APA UID 2025-01080-001 and the access wall for 2023-82557-001
+    // (fixtures/psycnet/*). PsycNet's Angular shell uses a stable #pdf anchor
+    // only after full article content has rendered; denied records replace it
+    // with an explicit Get Access control. doi.apa.org is included because APA
+    // DOI landings route into the same PsycNet application.
+    id: "psycnet",
+    version: "0.1.0",
+    hosts: ["psycnet.apa.org", "doi.apa.org"],
+    settleTimeoutMs: 5000,
+    classify: [
+      {
+        kind: "no_entitlement",
+        all: [
+          "meta[name='citation_doi']",
+          "a.pdf[aria-label='Get Access']",
+        ],
+      },
+      {
+        kind: "article",
+        all: [
+          "#psycnet_fulltext_article_content",
+          "a#pdf[href*='/fulltext/'][href$='.pdf']",
+        ],
+      },
+    ],
+    download: {
+      selector: "a#pdf[href*='/fulltext/'][href$='.pdf']",
+      requireKind: "article",
+      method: "href",
+    },
+  },
+  {
+    // Verified 2026-07-20 against the public OA Annual Reviews article in
+    // fixtures/annualreviews/success.html. The platform's PDF action is a
+    // JavaScript-backed POST form whose anchor href is "#", so href extraction
+    // is impossible: click exactly the fixture-backed Download PDF control.
+    // Non-OA pages can render the same form, therefore require the explicit
+    // Open Access marker and full-text container as entitlement evidence.
+    id: "annualreviews",
+    version: "0.1.0",
+    hosts: ["annualreviews.org"],
+    classify: [
+      {
+        kind: "article",
+        all: [
+          "meta[name='citation_title']",
+          ".article-access.item-meta-data__oa .accesstext",
+          "#html_fulltext",
+          "form.ft-download-content__form--pdf a[aria-label='Download PDF']",
+        ],
+      },
+    ],
+    download: {
+      selector: "form.ft-download-content__form--pdf a[aria-label='Download PDF']",
+      requireKind: "article",
+      method: "click",
+    },
+  },
+  {
+    // Verified against authentic Taylor & Francis Online publisher captures
+    // archived 2025-12-09 (OA article) and 2023-03-31 (Access Denial), stored
+    // under fixtures/tandfonline/. The journal platform is distinct from
+    // taylorfrancis.com books, whose citation_pdf_url can be only a preview.
+    // Require the rendered OA badge plus the direct /doi/pdf/ control.
+    id: "tandfonline",
+    version: "0.1.0",
+    hosts: ["tandfonline.com"],
+    settleTimeoutMs: 5000,
+    classify: [
+      {
+        kind: "no_entitlement",
+        all: [
+          "[role='region'][aria-label='Purchase Options']",
+          "[data-pb-dropzone='accessDenialDropZone']",
+        ],
+      },
+      {
+        kind: "article",
+        all: [
+          ".accessLogo .access-icon.oa",
+          ".downloadPDFLink a.show-pdf[href*='/doi/pdf/']",
+        ],
+      },
+    ],
+    download: {
+      selector: ".downloadPDFLink a.show-pdf[href*='/doi/pdf/']",
+      requireKind: "article",
+      method: "href",
+    },
+  },
+  {
+    // Verified against authentic Emerald Insight publisher captures archived
+    // 2025-01-23 (OA PDF control) and 2024-07-13 (No License turnaway), stored
+    // as fixtures/emerald/*. Current unauthenticated automation is WAF-blocked.
+    // Emerald has no citation_pdf_url here; the real PDF is the stable
+    // intent_pdf_link anchor. Its query carries only a title and is ignored by
+    // classification while href reads the complete live URL.
+    id: "emerald",
+    version: "0.1.0",
+    hosts: ["emerald.com"],
+    settleTimeoutMs: 5000,
+    classify: [
+      {
+        kind: "no_entitlement",
+        all: ["#turnaway-block", ".turnaway__dropdown"],
+      },
+      {
+        kind: "article",
+        all: [
+          "meta[name='dc.Title']",
+          "a.intent_pdf_link[href*='/insight/content/doi/'][href*='/full/pdf']",
+        ],
+      },
+    ],
+    download: {
+      selector: "a.intent_pdf_link[href*='/insight/content/doi/'][href*='/full/pdf']",
+      requireKind: "article",
+      method: "href",
+    },
+  },
+  {
+    // Verified 2026-07-20 against live Cambridge Core journal fixtures for
+    // both an OA article and a purchase wall. Denied pages still publish
+    // citation_pdf_url, so require the action-bar PDF control and its rendered
+    // content-view anchor. citation_journal_title excludes Cambridge book
+    // chapters, which use the same PDF service under /core/books/.
+    id: "cambridge",
+    version: "0.1.0",
+    hosts: ["cambridge.org"],
+    settleTimeoutMs: 5000,
+    classify: [
+      {
+        kind: "no_entitlement",
+        all: [
+          "meta[name='citation_journal_title']",
+          "a[data-test-id='buttonGetAccess']",
+          "#access-block .access-options",
+        ],
+      },
+      {
+        kind: "article",
+        all: [
+          "meta[name='citation_journal_title']",
+          "[data-test-id='buttonSavePDFOptions']",
+          "a[href*='/core/services/aop-cambridge-core/content/view/']",
+        ],
+      },
+    ],
+    download: {
+      selector: "a[href*='/core/services/aop-cambridge-core/content/view/']",
+      requireKind: "article",
+      method: "href",
+    },
+  },
+  {
+    // Verified 2026-07-20 against three public Thieme E-Journals full-text
+    // pages, including fixtures/thieme/success.html. citation_pdf_url and
+    // #pdfLink also appear on abstract-only routes, so they are not sufficient
+    // access signals. Require the platform's fullText page state and rendered
+    // article body, then read the live relative PDF anchor through the browser
+    // cookie jar. The captured abstract route stays unknown/assisted.
+    id: "thieme",
+    version: "0.1.0",
+    hosts: ["thieme-connect.com"],
+    classify: [
+      {
+        kind: "article",
+        all: [
+          "meta[name='page'][content='fullText']",
+          "section#htmlfulltext",
+          "a#pdfLink[href*='/products/ejournals/pdf/']",
+        ],
+      },
+    ],
+    download: {
+      selector: "a#pdfLink[href*='/products/ejournals/pdf/']",
+      requireKind: "article",
+      method: "href",
+    },
+  },
+  {
+    // Verified 2026-07-20 against a finalized public Nature Communications
+    // article (fixtures/nature/success.html) and the subscription preview for
+    // nature14539 (fixtures/nature/no-entitlement.html). Nature publishes
+    // citation_pdf_url even on paywalled pages, so it is not an entitlement
+    // signal. Require both access=Yes and the rendered download control, then
+    // use that control's href: Article-in-Press pages can use _reference.pdf
+    // while their citation meta still points at an HTML-canonicalizing .pdf.
+    id: "nature",
+    version: "0.1.0",
+    hosts: ["nature.com"],
+    settleTimeoutMs: 5000,
+    classify: [
+      {
+        kind: "no_entitlement",
+        all: [
+          "meta[name='access'][content='No']",
+          "[data-test='entitlement-box']",
+        ],
+      },
+      {
+        kind: "article",
+        all: [
+          "meta[name='access'][content='Yes']",
+          "meta[name='citation_title']",
+          "a[data-test='download-pdf'][data-article-pdf='true']",
+        ],
+      },
+    ],
+    download: {
+      selector: "a[data-test='download-pdf'][data-article-pdf='true']",
+      requireKind: "article",
+      method: "href",
+    },
+  },
+  {
+    // Verified live 2026-07-20 against a public PNAS Nexus article and a
+    // subscription-only Child Development article (fixtures/oup/*). Oxford
+    // Academic is Silverchair-backed: entitled articles expose a stable
+    // article-pdfLink, while denied pages redirect to article-abstract and
+    // render the js-no-access-jumplink control. Prefer the rendered action over
+    // citation_pdf_url so a metadata-only paywall cannot look entitled.
+    id: "oup",
+    version: "0.1.0",
+    hosts: ["academic.oup.com"],
+    settleTimeoutMs: 5000,
+    classify: [
+      {
+        kind: "no_entitlement",
+        all: [
+          "meta[name='citation_title']",
+          "a.js-no-access-jumplink",
+          "#no-access-message.article-top-info-user-restricted-options",
+        ],
+      },
+      {
+        kind: "article",
+        all: [
+          "meta[name='citation_title']",
+          "a.article-pdfLink[href*='/article-pdf/']",
+        ],
+      },
+    ],
+    download: {
+      selector: "a.article-pdfLink[href*='/article-pdf/']",
+      requireKind: "article",
+      method: "href",
+    },
+  },
+  {
+    // Verified live 2026-07-20 against an OA Quantitative Science Studies
+    // article and the subscription-only Long Short-Term Memory article
+    // (fixtures/mitpress/*). MIT Press uses Silverchair's stable article PDF
+    // action. Paywalled article-abstract routes still publish citation_pdf_url,
+    // so require the rendered purchase wall and prioritize it over metadata.
+    id: "mitpress",
+    version: "0.1.0",
+    hosts: ["direct.mit.edu"],
+    settleTimeoutMs: 5000,
+    classify: [
+      {
+        kind: "no_entitlement",
+        all: [
+          "meta[name='citation_title']",
+          ".article-top-info-user-restricted-options",
+          "#dvPurchaseButton.ppv-wrap",
+        ],
+      },
+      {
+        kind: "article",
+        all: [
+          "meta[name='citation_title']",
+          "a.article-pdfLink[href*='/article-pdf/']",
+        ],
+      },
+    ],
+    download: {
+      selector: "a.article-pdfLink[href*='/article-pdf/']",
+      requireKind: "article",
+      method: "href",
+    },
+  },
+  {
+    // Verified 2026-07-20 against BMJ's live JATS OA metadata and an authentic
+    // 2024 publisher capture of BMJ Open DOI 10.1136/bmjopen-2017-017569
+    // (fixtures/bmj/success.html). Current automated HTML fetches hit
+    // Cloudflare, but papio runs in the user's non-automated browser. Restrict
+    // auto-download to explicit citation_access=all pages: closed BMJ articles
+    // stay assisted even if they publish PDF-shaped metadata.
+    id: "bmj",
+    version: "0.1.0",
+    hosts: ["bmj.com"],
+    settleTimeoutMs: 5000,
+    classify: [
+      {
+        kind: "article",
+        all: [
+          "meta[name='citation_public_url']",
+          "meta[name='citation_access'][content='all']",
+          "meta[name='citation_pdf_url']",
+          "a.article-pdf-download[href$='.full.pdf']",
+        ],
+      },
+    ],
+    download: {
+      selector: "a.article-pdf-download[href$='.full.pdf']",
+      requireKind: "article",
+      method: "href",
+    },
+  },
+  {
+    // Verified 2026-07-20 against authentic publisher captures of an entitled
+    // STAR*D article and a denied 2024 American Journal of Psychiatry article
+    // (fixtures/psychiatryonline/*). Silverchair exposes access state directly;
+    // denied pages may still render downloadPdfUrl, so the full-access marker
+    // is load-bearing and the no-access rule must run first.
+    id: "psychiatryonline",
+    version: "0.1.0",
+    hosts: ["psychiatryonline.org"],
+    settleTimeoutMs: 5000,
+    classify: [
+      {
+        kind: "no_entitlement",
+        all: [
+          "meta[name='publication_doi']",
+          "[data-article-access='no'][data-article-access-type='other']",
+        ],
+      },
+      {
+        kind: "article",
+        all: [
+          "meta[name='publication_doi']",
+          "[data-article-access='full'][data-article-access-type='full']",
+          "a#downloadPdfUrl[data-doi]",
+        ],
+      },
+    ],
+    download: {
+      selector: "a#downloadPdfUrl[data-doi]",
+      requireKind: "article",
+      method: "href",
+    },
+  },
+  {
+    // Verified 2026-07-20 against an authentic JAMA Psychiatry publisher
+    // capture of DOI 10.1001/archgenpsychiatry.2010.116
+    // (fixtures/jamanetwork/success.html). This older JAMA control has no href:
+    // site JavaScript checks access using data-article-url before downloading,
+    // so click the exact control. Gate on both Free and full-text access;
+    // sign-in/purchase controls also appear on free pages and are not verdicts.
+    id: "jamanetwork",
+    version: "0.1.0",
+    hosts: ["jamanetwork.com"],
+    settleTimeoutMs: 5000,
+    classify: [
+      {
+        kind: "article",
+        all: [
+          "meta[name='citation_doi']",
+          ".article-full-text[data-userhasaccess='True']",
+          "a#pdf-link.pdfaccess[data-article-url$='.pdf'][data-ajax-url='/Content/CheckPdfAccess']",
+        ],
+        any: [".meta-access-type.free-access", ".meta-access-type.open-access"],
+      },
+    ],
+    download: {
+      selector:
+        "a#pdf-link.pdfaccess[data-article-url$='.pdf'][data-ajax-url='/Content/CheckPdfAccess']",
+      requireKind: "article",
+      method: "click",
+    },
+  },
+  {
+    // Verified 2026-07-20 against an authentic 2024 LWW full-text capture of
+    // DOI 10.4103/0972-6748.57865 (fixtures/lww/success.html), corroborated by
+    // its current Ovid/PMC OA records. LWW publishes the exact browser PDF URL
+    // in wkhealth_pdf_url even when no anchor is rendered. Require the actual
+    // full-text container so abstract/paywall pages with metadata stay assisted.
+    id: "lww",
+    version: "0.1.0",
+    hosts: ["journals.lww.com"],
+    settleTimeoutMs: 5000,
+    classify: [
+      {
+        kind: "article",
+        all: [
+          "meta[name='wkhealth_doi']",
+          "meta[name='wkhealth_pdf_url']",
+          "article#ej-article-view .ejp-fulltext-content.js-ejp-fulltext-content",
+        ],
+      },
+    ],
+    download: {
+      selector: "meta[name='wkhealth_pdf_url']",
+      requireKind: "article",
+      method: "meta",
+      metaName: "wkhealth_pdf_url",
+    },
+  },
+  {
+    // Verified 2026-07-20 against the live public HAL record
+    // hal-04206682 (fixtures/hal/success.html). HAL exposes the real
+    // repository file in the Highwire citation_pdf_url meta
+    // (/hal-…/document); the browser download API follows it without a
+    // provider login. Records without a deposited file omit this meta and
+    // remain assisted/unknown rather than being misclassified.
+    id: "hal",
+    version: "0.1.0",
+    hosts: ["hal.science"],
+    classify: [
+      {
+        kind: "article",
+        all: [
+          "meta[name='citation_title']",
+          "meta[name='citation_doi']",
+          "meta[name='citation_pdf_url']",
+        ],
+      },
+    ],
+    download: {
+      selector: "meta[name='citation_pdf_url']",
+      requireKind: "article",
+      method: "meta",
+      metaName: "citation_pdf_url",
+    },
+  },
 ];

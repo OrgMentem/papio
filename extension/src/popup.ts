@@ -7,7 +7,15 @@
 // work. Sanitization and the fail-closed residual-secret guard live in
 // ./capture; the popup only wires the DOM.
 
-import { captureFixture, type ChromeCaptureApi, type PageCapture, type Provider, type Scenario } from "./capture";
+import {
+  captureFixture,
+  PROVIDERS,
+  SCENARIOS,
+  type ChromeCaptureApi,
+  type PageCapture,
+  type Provider,
+  type Scenario,
+} from "./capture";
 import { chromeBackend, type ActiveJob, type StoreShape, TERMS_CONSENT_KEY } from "./state";
 import { renderPapio } from "./dom";
 
@@ -560,6 +568,22 @@ export function wireCapture(doc: Document = document): void {
     !statusEl
   ) {
     return;
+  }
+
+  // The registry is the single source of truth: a newly registered adapter is
+  // capturable without touching popup markup.
+  for (const [select, values] of [
+    [providerEl, PROVIDERS],
+    [scenarioEl, SCENARIOS],
+  ] as const) {
+    select.replaceChildren(
+      ...values.map((value) => {
+        const option = doc.createElement("option");
+        option.value = value;
+        option.textContent = value;
+        return option;
+      }),
+    );
   }
 
   button.addEventListener("click", () => {

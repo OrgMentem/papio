@@ -29,7 +29,19 @@ export type Provider =
   | "wiley"
   | "tandfonline"
   | "sage"
-  | "psycnet";
+  | "psycnet"
+  | "hal"
+  | "nature"
+  | "thieme"
+  | "cambridge"
+  | "emerald"
+  | "annualreviews"
+  | "oup"
+  | "mitpress"
+  | "bmj"
+  | "psychiatryonline"
+  | "jamanetwork"
+  | "lww";
 
 /** Adapter scenarios the capture UI can record; unreachable states stay assisted. */
 export type Scenario =
@@ -51,6 +63,18 @@ export const PROVIDERS: readonly Provider[] = [
   "tandfonline",
   "sage",
   "psycnet",
+  "hal",
+  "nature",
+  "thieme",
+  "cambridge",
+  "emerald",
+  "annualreviews",
+  "oup",
+  "mitpress",
+  "bmj",
+  "psychiatryonline",
+  "jamanetwork",
+  "lww",
 ];
 export const SCENARIOS: readonly Scenario[] = [
   "success",
@@ -88,12 +112,49 @@ const TOKEN_RE = /[A-Za-z0-9+/_-]{24,}/g;
 
 /** Elements whose *contents* never belong in a selector fixture. Their bodies
  * are emptied; the (attribute-scrubbed) open/close tags stay so structure and
- * selectors are preserved. `style` goes too — selectors matter, styling does
- * not — and `textarea` so no typed secret survives in its body. */
-const EMPTIED_CONTENT = /(<(script|noscript|iframe|object|embed|style|textarea)\b[^>]*>)[\s\S]*?(<\/\2\s*>)/gi;
+ * selectors are preserved. `style` and SVG internals go too — neither is
+ * classifier evidence, and inline SVG style nodes confuse HTML fixture parsers
+ * by entering raw-text mode. `textarea` is emptied so no typed secret survives. */
+const EMPTIED_CONTENT = /(<(script|noscript|iframe|object|embed|style|textarea|svg)\b[^>]*>)[\s\S]*?(<\/\2\s*>)/gi;
 
-/** URL-bearing attributes: query string and fragment are removed from each. */
-const URL_ATTRS: Record<string, true> = { href: true, src: true, action: true, "data-src": true };
+/** Email addresses identify real people (authors, librarians, the capturing
+ * user) and are never selector evidence. Masked in text and attribute values,
+ * and rejected by residualLeak if one survives. */
+const EMAIL_RE = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g;
+
+/** URL-bearing attributes: query string and fragment are removed from each.
+ * Beyond the fixed names, any attribute whose (dash/underscore-insensitive)
+ * name ends in url/uri/href/src/link is URL-valued — providers ship
+ * `data-fullTexturl`, `institution-log-in-url`, `register-url`, and similar
+ * auth-return carriers whose queries must not reach a committed fixture. */
+const URL_ATTRS: Record<string, true> = {
+  href: true,
+  src: true,
+  action: true,
+  "data-src": true,
+  "data-href": true,
+};
+
+function isURLAttr(lname: string): boolean {
+  if (URL_ATTRS[lname]) return true;
+  const flat = lname.replace(/[-_:.]/g, "");
+  return /(?:url|uri|href|src|link)$/.test(flat);
+}
+
+/** Attributes that exist only to carry a per-request or per-session value —
+ * CSP nonces, CDN request ids, session ids, CSRF fields. Name-keyed and
+ * blanked outright: their values are short enough to slip under TOKEN_RE but
+ * are still request-scoped identifiers, never selector evidence. */
+function isSessionAttr(lname: string): boolean {
+  const flat = lname.replace(/[-_:.]/g, "");
+  return (
+    flat.endsWith("nonce") ||
+    flat.endsWith("requestid") ||
+    flat.endsWith("sessionid") ||
+    flat.includes("csrf") ||
+    flat.includes("xsrf")
+  );
+}
 
 /** Attribute names whose static values are selector-bearing. Semantic CSS/BEM
  * names and explicit provider test hooks survive, but opaque token-shaped runs
@@ -107,6 +168,7 @@ const STRUCTURAL_ATTRS: Record<string, true> = {
   rel: true,
   type: true,
   role: true,
+
   "data-auto": true,
   "data-test": true,
   "data-testid": true,
@@ -114,9 +176,9 @@ const STRUCTURAL_ATTRS: Record<string, true> = {
   "data-qa": true,
 };
 
-/** Replace every token-shaped run with the literal `TOKEN`. */
+/** Replace every token-shaped run and email address with the literal `TOKEN`. */
 function scrubTokens(text: string): string {
-  return text.replace(TOKEN_RE, "TOKEN");
+  return text.replace(EMAIL_RE, "TOKEN").replace(TOKEN_RE, "TOKEN");
 }
 
 function isSemanticSelectorToken(token: string): boolean {
@@ -125,8 +187,39 @@ function isSemanticSelectorToken(token: string): boolean {
   return words.length >= 2 && words.every((word) => /^[A-Za-z]{2,16}$/.test(word));
 }
 
+/** Structural attribute values keep semantic word runs and lose only the
+ * opaque parts of a mixed identifier: `downloadPDFLink_MSTAR_216440925`
+ * becomes `downloadPDFLink_MSTAR_TOKEN`, so an adapter can match a stable
+ * prefix (`[id^='downloadPDFLink_']`) while the per-record suffix is masked. */
 function scrubSelectorTokens(text: string): string {
-  return text.replace(TOKEN_RE, (token) => (isSemanticSelectorToken(token) ? token : "TOKEN"));
+  return text.replace(TOKEN_RE, (token) => {
+    if (isSemanticSelectorToken(token)) return token;
+    const parts = token.split(/([-_]+)/);
+    if (parts.length === 1) return "TOKEN";
+    return parts
+      .map((part) => {
+        if (/^[-_]+$/.test(part) || part === "") return part;
+        const words = part.replace(/([a-z])([A-Z])/g, "$1-$2").split("-");
+        return words.every((word) => /^[A-Za-z]{2,16}$/.test(word)) ? part : "TOKEN";
+      })
+      .join("")
+      .replace(/TOKEN(?:[-_]+TOKEN)+/g, "TOKEN");
+  });
+}
+
+/** URL path segments are checked independently. A slash is routing syntax, not
+ * evidence that adjacent semantic path words form one opaque credential. */
+const URL_TOKEN_RE = /[A-Za-z0-9+_-]{24,}/g;
+
+function scrubURLValue(value: string): string {
+  const cut = value.search(/[?#]/);
+  const queryless = cut === -1 ? value : value.slice(0, cut);
+  return queryless
+    .split("/")
+    .map((segment) =>
+      segment.replace(URL_TOKEN_RE, (token) => (isSemanticSelectorToken(token) ? token : "TOKEN")),
+    )
+    .join("/");
 }
 
 const ATTR_RE = /([-\w:]+)(\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+)))?/g;
@@ -161,6 +254,19 @@ function hasTokenContent(attrs: ParsedAttr[]): boolean {
   return false;
 }
 
+/** URL-valued provider metadata is selector evidence, but its path/query can
+ * carry record or session identifiers and must be scrubbed like href/src. */
+function urlMeta(attrs: ParsedAttr[]): boolean {
+  const name = attrs.find((a) => a.name.toLowerCase() === "name")?.value.toLowerCase();
+  const content = attrs.find((a) => a.name.toLowerCase() === "content")?.value;
+  return (
+    name !== undefined &&
+    content !== undefined &&
+    /(?:^|[_:.-])url$/.test(name) &&
+    /^(?:https?:\/\/|\/)/i.test(content)
+  );
+}
+
 /** Rewrite a single start tag: strip URL query/fragment, blank form values,
  * drop autofill hints, mask token-shaped attribute values. Returns the empty
  * string when the whole tag must disappear (token-bearing `<meta>`). */
@@ -178,7 +284,15 @@ function rewriteStartTag(raw: string): string {
 
   const attrs = parseAttrs(attrRegion);
 
-  if (tag === "meta" && hasTokenContent(attrs)) return "";
+  const metaName =
+    tag === "meta"
+      ? (attrs.find((a) => a.name.toLowerCase() === "name")?.value.toLowerCase() ?? "")
+      : "";
+  // A meta *named* for a per-request identifier is dropped whole even when its
+  // value is too short for TOKEN_RE (e.g. CDN ray/request ids).
+  if (isSessionAttr(metaName)) return "";
+  const safeURLMeta = tag === "meta" && urlMeta(attrs);
+  if (tag === "meta" && !safeURLMeta && hasTokenContent(attrs)) return "";
 
   const isFormValue = tag === "input" || tag === "select" || tag === "option" || tag === "button";
 
@@ -196,16 +310,18 @@ function rewriteStartTag(raw: string): string {
 
     let value = a.value;
 
-    // Blank form and inline-style values: neither can be an adapter selector,
-    // and both can carry user/session-specific content.
-    if ((lname === "value" && isFormValue) || lname === "style") {
+    // Blank form values, inline style, and per-request identifier attributes:
+    // none can be an adapter selector, and all can carry user/session-specific
+    // content (nonces and CDN request ids are short enough to pass TOKEN_RE).
+    if ((lname === "value" && isFormValue) || lname === "style" || isSessionAttr(lname)) {
       value = "";
     } else {
-      if (URL_ATTRS[lname]) {
-        const cut = value.search(/[?#]/);
-        if (cut !== -1) value = value.slice(0, cut);
+      if (isURLAttr(lname) || (safeURLMeta && lname === "content")) {
+        value = scrubURLValue(value);
+      } else {
+        value = STRUCTURAL_ATTRS[lname] ? scrubSelectorTokens(value) : scrubTokens(value);
       }
-      value = STRUCTURAL_ATTRS[lname] ? scrubSelectorTokens(value) : scrubTokens(value);
+      value = value.replace(EMAIL_RE, "TOKEN");
     }
 
     rendered.push(`${a.name}="${value}"`);
@@ -224,7 +340,7 @@ const TOKEN_STREAM = /<!--[\s\S]*?-->|<[^>]*>/g;
  *  1. Empty the bodies of script/style/etc. (their content is never a selector).
  *  2. Walk the remaining markup as a tag/comment/text stream:
  *     - start tags   → strip URL tails, blank form values, mask token attrs;
- *     - comments      → mask token-shaped runs;
+ *     - comments      → emptied (comments are never selector evidence);
  *     - text nodes    → mask token-shaped runs;
  *     - end tags/etc. → passed through untouched.
  *  3. Prepend the papio-fixture header (added last, so it is never scrubbed).
@@ -241,10 +357,10 @@ export function sanitizeFixture(html: string, meta: SanitizedFixtureMeta): strin
     if (start > last) out += scrubTokens(emptied.slice(last, start));
 
     if (token.startsWith("<!--")) {
-      // Scrub only the comment body. Including the trailing `--` in a
-      // token-shaped match would destroy the `-->` delimiter and merge later
-      // markup into the comment.
-      out += `<!--${scrubTokens(token.slice(4, -3))}-->`;
+      // Comments are never selector evidence and frequently hide disabled
+      // markup containing session-bearing URLs. Keep an empty node so adjacent
+      // text cannot merge, but retain none of the comment body.
+      out += "<!---->";
     } else if (/^<\s*\//.test(token)) {
       out += token; // end tag: no attributes to touch
     } else if (/^<\s*[a-zA-Z]/.test(token)) {
@@ -264,7 +380,7 @@ export function sanitizeFixture(html: string, meta: SanitizedFixtureMeta): strin
  * token-shaped path runs while preserving the stable origin. */
 export function fixtureHeader(meta: SanitizedFixtureMeta): string {
   const parsed = new URL(meta.originNoQuery);
-  const scrubbedPath = scrubTokens(parsed.pathname);
+  const scrubbedPath = scrubURLValue(parsed.pathname);
   const safePath = scrubbedPath.startsWith("/") ? scrubbedPath : `/${scrubbedPath}`;
   return (
     `<!-- papio-fixture provider="${meta.provider}" scenario="${meta.scenario}"` +
@@ -280,14 +396,24 @@ export function fixtureHeader(meta: SanitizedFixtureMeta): string {
  * remain guarded.
  */
 export function residualLeak(sanitized: string): string | null {
-  const urlQuery = /(?:href|src|action|data-src)\s*=\s*"[^"]*\?[^"]*"/i.exec(sanitized);
-  if (urlQuery) return "a href/src attribute still contains a query string";
+  const email = new RegExp(EMAIL_RE.source).exec(sanitized);
+  if (email) return `an email address survived sanitization (${email[0].slice(0, 8)}…)`;
 
   const residual = (value: string, allowSemanticSelector = false): string | undefined => {
     for (const match of value.matchAll(new RegExp(TOKEN_RE.source, "g"))) {
       const token = match[0];
       if (allowSemanticSelector && isSemanticSelectorToken(token)) continue;
       return token;
+    }
+    return undefined;
+  };
+  const residualURL = (value: string): string | undefined => {
+    for (const segment of value.split("/")) {
+      for (const match of segment.matchAll(new RegExp(URL_TOKEN_RE.source, "g"))) {
+        const token = match[0];
+        if (isSemanticSelectorToken(token)) continue;
+        return token;
+      }
     }
     return undefined;
   };
@@ -299,17 +425,51 @@ export function residualLeak(sanitized: string): string | null {
     if (textToken) return `a token-shaped value survived sanitization (${textToken.slice(0, 8)}…)`;
 
     if (syntax.startsWith("<!--")) {
-      const commentToken = residual(syntax.slice(4, -3));
+      // The first comment is generated by fixtureHeader(). Its origin is
+      // already query-free and path-scrubbed, but a short semantic path can
+      // combine with the hostname into a token-shaped run
+      // (e.g. nature.com/articles/nature14539). Validate the whole generated
+      // shape before exempting it; every other comment remains guarded.
+      const provenance =
+        start === 0
+          ? /^<!-- papio-fixture provider="([a-z][a-z0-9_-]*)" scenario="[a-z][a-z0-9_-]*" origin="https:\/\/[^"?\s]+\/[^"?\s]*" captured="\d{4}-\d{2}-\d{2}T[^"\s]+" -->$/.exec(
+              syntax,
+            )
+          : null;
+      // The generated shape is trusted, but the provider field may originate
+      // from an observed hostname. Keep guarding it against opaque per-user
+      // or session subdomains.
+      const commentToken = provenance
+        ? residual(provenance[1] ?? "")
+        : residual(syntax.slice(4, -3));
       if (commentToken) return `a token-shaped value survived sanitization (${commentToken.slice(0, 8)}…)`;
     } else if (/^<\s*[a-zA-Z]/.test(syntax)) {
-      const head = /^<\s*[a-zA-Z][-\w]*/.exec(syntax);
+      const head = /^<\s*([a-zA-Z][-\w]*)/.exec(syntax);
       const close = /\s*\/?>$/.exec(syntax);
       if (head && close) {
         const attrs = parseAttrs(syntax.slice(head[0].length, syntax.length - close[0].length));
+        if (head[1]?.toLowerCase() === "meta") {
+          const metaName =
+            attrs.find((a) => a.name.toLowerCase() === "name")?.value.toLowerCase() ?? "";
+          const content = attrs.find((a) => a.name.toLowerCase() === "content")?.value ?? "";
+          if (isSessionAttr(metaName) && content !== "") {
+            return `a per-request identifier meta survived sanitization (${metaName})`;
+          }
+        }
+        const safeURLMeta = head[1]?.toLowerCase() === "meta" && urlMeta(attrs);
         for (const attr of attrs) {
           if (!attr.hasValue) continue;
           const lname = attr.name.toLowerCase();
-          const attrToken = residual(attr.value, STRUCTURAL_ATTRS[lname] === true);
+          if (isSessionAttr(lname) && attr.value !== "") {
+            return `a per-request identifier attribute survived sanitization (${attr.name})`;
+          }
+          const urlValued = isURLAttr(lname) || (safeURLMeta && lname === "content");
+          if (urlValued && /[?#]/.test(attr.value)) {
+            return "a URL-bearing attribute still contains a query string";
+          }
+          const attrToken = urlValued
+            ? residualURL(attr.value)
+            : residual(attr.value, STRUCTURAL_ATTRS[lname] === true);
           if (attrToken) return `a token-shaped value survived sanitization (${attrToken.slice(0, 8)}…)`;
         }
       }

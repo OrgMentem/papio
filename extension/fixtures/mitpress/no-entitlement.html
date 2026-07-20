@@ -1,0 +1,1817 @@
+<!-- papio-fixture provider="mitpress" scenario="no-entitlement" origin="https://direct.mit.edu/neco/article/9/8/1735/6109/Long-Short-Term-Memory" captured="2026-07-20T09:41:45.324Z" -->
+<html lang="en" class=""><head>
+    <!---->
+    <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+        <title>Long Short-Term Memory | Neural Computation | MIT Press</title>
+        
+                
+
+
+
+    <script type="text/javascript" async="" charset="utf-8" src="https://www.gstatic.com/recaptcha/releases/TOKEN/recaptcha__en.js" crossorigin="anonymous" integrity="TOKEN"></script><script async="" src="https://chimpstatic.com/mcjs-connected/js/users/TOKEN/TOKEN.js"></script><script type="text/javascript" async="" src="https://mit.hum.works/js/main.js"></script><script src="https://connect.facebook.net/signals/config/752654432048884" async=""></script><script type="text/javascript" async="" src="https://connect.facebook.net/en_US/fbevents.js"></script><script type="text/javascript" async="" src="https://www.google-analytics.com/analytics.js"></script><script type="text/javascript" async="" src="https://www.googletagmanager.com/gtag/js"></script><script type="text/javascript" async="" src="https://www.googletagmanager.com/gtag/js"></script><script type="text/javascript" async="" src="https://www.googletagmanager.com/gtm.js"></script><script src="https://ajax.googleapis.com/ajax/libs/jquery/3.4.1/jquery.min.js" type="text/javascript"></script>
+<script></script>
+<script src="//mitp.silverchair-cdn.com/Themes/Silver/app/vendor/v-639181352930775520/jquery-migrate-3.1.0.min.js" type="text/javascript"></script>
+
+    <script type="text/javascript" src="https://platform-api.sharethis.com/js/sharethis.js" async="async"></script>
+
+
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=10">
+
+    
+    <meta http-equiv="X-UA-Compatible" content="IE=Edge">
+    <!---->
+    <meta name="format-detection" content="telephone=no">
+    
+<!---->
+  <link rel="apple-touch-icon" sizes="180x180" href="//mitp.silverchair-cdn.com/Themes/Client/app/img/favicons/v-639181349854296358/apple-touch-icon.png">
+  <link rel="icon" type="image/png" href="//mitp.silverchair-cdn.com/Themes/Client/app/img/favicons/v-639181349854446349/favicon-32x32.png" sizes="32x32">
+  <link rel="icon" type="image/png" href="//mitp.silverchair-cdn.com/Themes/Client/app/img/favicons/v-639181349854296358/favicon-16x16.png" sizes="16x16">
+  <link rel="mask-icon" href="//mitp.silverchair-cdn.com/Themes/Client/app/img/favicons/v-639181349854996394/safari-pinned-tab.svg" color="#5bbad5">
+  <link rel="icon" href="//mitp.silverchair-cdn.com/Themes/Client/app/img/favicons/v-639181349854496374/favicon.ico">
+  <link rel="manifest" href="//mitp.silverchair-cdn.com/Themes/Client/app/img/favicons/v-639181349854546393/manifest.json">
+  
+  <meta name="theme-color" content="#000000">
+
+
+    
+
+
+  <link rel="stylesheet" type="text/css" href="//mitp.silverchair-cdn.com/Themes/Client/app/css/v-639195065624748179/site.min.css">
+  <link rel="stylesheet" type="text/css" href="//mitp.silverchair-cdn.com/Themes/Client/app/css/icons/v-639181349854196375/style.css">
+  <link rel="stylesheet" type="text/css" href="//mitp.silverchair-cdn.com/Themes/Client/app/css/v-639181349851996311/bg_img.css">
+
+<link href="/Themes/Client/app/css/SiteFonts/SiteFonts.css" rel="stylesheet">
+
+
+            <link href="//mitp.silverchair-cdn.com/data/SiteBuilderAssets/Live/CSS/neco/v-638760949040543819/site.css" rel="stylesheet" type="text/css">
+
+            <script></script>
+
+    
+
+        <script type="text/javascript"></script>
+    
+    
+    
+    <link rel="stylesheet" type="text/css" href="//cdn.jsdelivr.net/chartist.js/latest/chartist.min.css">
+
+    <meta name="citation_author" content="Hochreiter, Sepp"><meta name="citation_author_institution" content="Fakultät für Informatik, Technische Universität München, 80290 München, Germany"><meta name="citation_author" content="Schmidhuber, Jürgen"><meta name="citation_author_institution" content="IDSIA, Corso Elvezia 36, 6900 Lugano, Switzerland"><meta name="citation_title" content="Long Short-Term Memory"><meta name="citation_firstpage" content="1735"><meta name="citation_lastpage" content="1780"><meta name="citation_doi" content="10.1162/neco.1997.9.8.1735"><meta name="citation_pmid" content="9377276"><meta name="citation_journal_title" content="Neural Computation"><meta name="citation_journal_abbrev" content="Neural Comput"><meta name="citation_volume" content="9"><meta name="citation_issue" content="8"><meta name="citation_publication_date" content="1997/11/15"><meta name="citation_issn" content="0899-7667"><meta name="citation_publisher" content="MIT Press"><meta name="citation_pdf_url" content="https://direct.mit.edu/neco/article-pdf/9/8/1735/813796/neco.1997.9.8.1735.pdf"><meta name="dc.identifier" content="10.1162/neco.1997.9.8.1735">
+
+<meta name="citation_xml_url" content="https://direct.mit.edu/neco/article-xml/9/8/1735/6109">
+    <meta name="description" content="Abstract. Learning to store information over extended time intervals by recurrent backpropagation takes a very long time, mostly because of insufficient,">
+
+
+    <link rel="canonical" href="https://direct.mit.edu/neco/article/9/8/1735/6109/Long-Short-Term-Memory">
+
+
+
+
+
+
+    <meta name="publish_date" content="1997-11-15">
+
+    
+
+
+
+    <meta name="product_code" content="COMPMARC">
+    <meta name="product_code" content="cognet_Complete">
+    <meta name="product_code" content="Cognet_Complete_MARC">
+    <meta name="product_code" content="ppv-neco">
+    
+    <meta name="product_code" content="NC">
+    <meta name="product_code" content="NCE">
+    <meta name="product_code" content="NC_01011997_03011998">
+    <meta name="product_code" content="COMP">
+    <meta name="product_code" content="ALL_CONTENT">
+    <meta name="product_code" content="J_6109">
+    <meta name="product_code" content="I_610">
+
+    <script type="application/ld+json"></script>
+<meta property="og:site_name" content="MIT Press">
+<meta property="og:title" content="Long Short-Term Memory">
+<meta property="og:description" content="Abstract. Learning to store information over extended time intervals by recurrent backpropagation takes a very long time, mostly because of insufficient, decaying error backflow. We briefly review Hochreiter's (1991) analysis of this problem, then address it by introducing a novel, efficient, gradient based method called long short-term memory (LSTM). Truncating the gradient where this does not do harm, LSTM can learn to bridge minimal time lags in excess of 1000 discrete-time steps by enforcing constant error flow through constant error carousels within special units. Multiplicative gate units learn to open and close access to the constant error flow. LSTM is local in space and time; its computational complexity per time step and weight is O. 1. Our experiments with artificial data involve local, distributed, real-valued, and noisy pattern representations. In comparisons with real-time recurrent learning, back propagation through time, recurrent cascade correlation, Elman nets, and neural sequence chunking, LSTM leads to many more successful runs, and learns much faster. LSTM also solves complex, artificial long-time-lag tasks that have never been solved by previous recurrent network algorithms.">
+<meta property="og:type" content="article">
+<meta property="og:url" content="https://dx.doi.org/10.1162/neco.1997.9.8.1735">
+<meta property="og:updated_time" content="">
+
+
+
+<meta property="og:image:alt" content="Issue Cover">
+
+
+
+
+    
+
+
+
+    <script type="text/javascript" async="async" src="https://securepubads.g.doubleclick.net/tag/js/gpt.js"></script>
+
+    <script></script>
+
+
+<script></script>
+    
+
+
+
+<script src="https://servedbyadbutler.com/app.js" type="text/javascript"></script>
+<script></script>
+    
+
+
+
+
+
+
+    <script src="https://scholar.google.com/scholar_js/casa.js" async=""></script>
+<script type="text/javascript" async="" src="https://googleads.g.doubleclick.net/pagead/viewthroughconversion/794009366/"></script><script type="text/javascript" async="" src="https://googleads.g.doubleclick.net/pagead/viewthroughconversion/794009366/"></script><style type="text/css"></style><style type="text/css"></style><style type="text/css"></style><style id="MJX-CHTML-styles"></style><link rel="stylesheet" href="https://badge.dimensions.ai/badge.css"></head>
+
+<body data-sitename="neuralcomputation" class="off-canvas pg_Article pg_article gdpr-visible" theme-neco="" data-sitestyletemplate="Journal">
+            <noscript></noscript>
+            <nav aria-label="Skip navigation">
+                <a href="" class="skipnav">Skip to Main Content</a>
+            </nav>
+<input id="hdnSiteID" name="hdnSiteID" type="hidden" value=""><input id="hdnAdDelaySeconds" name="hdnAdDelaySeconds" type="hidden" value=""><input id="hdnAdConfigurationTop" name="hdnAdConfigurationTop" type="hidden" value=""><input id="hdnAdConfigurationRightRail" name="hdnAdConfigurationRightRail" type="hidden" value="">
+    <div class="ad-banner js-ad-revealer ad-banner-revealer" role="region" aria-label="Advertisement" aria-hidden="true">
+    <div class="widget-AdBlock widget-instance-HeaderRevealerAd" data-widget-name="AdBlock" data-widget-instance="HeaderRevealerAd">
+        
+ 
+    </div>
+
+    </div>
+    
+
+
+
+
+<section class="master-header row vt-site-header" role="banner">
+
+    <div class="ad-banner js-ad-banner">
+    <div class="widget-AdBlock widget-instance-HeaderAd" data-widget-name="AdBlock" data-widget-instance="HeaderAd">
+            <input type="hidden" class="hfAdBlockInfo" data-divid="TOKEN" data-slotname="451443" data-targetname="179758" data-sizes="[[728, 90]]" data-enabled-on-mobile="True" data-adprovider-typeid="2" data-accountid="" data-outofpagead="False" data-sticky-time="5" data-lazyloaded="False" data-position-keyword="" data-position-targeting-key="position" data-skip-size-mapping="False" data-native-placement-id="" data-wps-adsize-number="0" data-wps-network-id="0" data-wps-site-id="0" data-wps-zone-ids="" data-wps-brandlock-keyword="" data-tapnative-aid="" data-tapnative-div-id="" data-suppress-display="false" data-fallback-divid="">
+    <div class="adblock-wrap js-adblock-wrap " style="">
+                <p class="adblock-advertisement-text js-adblock-advertisement-text hide">Advertisement</p>
+
+<div id="placement_TOKEN_adBlockHeader" adslot="451443" class="adblock-slot-placeholder js-adblock" style=""></div>
+
+
+    </div>
+
+ 
+    </div>
+
+    </div>
+
+    <div class="widget-SitePageHeader widget-instance-SitePageHeader" data-widget-name="SitePageHeader" data-widget-instance="SitePageHeader">
+            <div class="site-theme-header">
+        <div class="site-theme-header_contents global-nav-base">
+
+
+<div class="global-nav">
+            <a class="js-dropdown-trigger global-nav-trigger" href="javascript:;">
+            <picture>
+                <source media="(min-width: 601px)" srcset="//mitp.silverchair-cdn.TOKEN.svg">
+                <img class="logo-NeuralComputation site-theme-header-image" src="//mitp.silverchair-cdn.com/UI/app/svg/umbrella/logo.svg" alt="MIT Press Direct, home">
+            </picture>
+                <i class="icon-general_arrow-down arrow-icon"><span class="screenreader-text">Open Menu</span></i>
+        </a>
+        <nav class="navbar-menu global-nav-dropdown js-dropdown" aria-label="Primary navigation">
+            <div class="site-theme-header-logo">
+                <a href="/" class="site-theme-header-image-wrap">
+                        <picture>
+                            <source media="(min-width: 601px)" srcset="//mitp.silverchair-cdn.TOKEN.svg">
+                            <img class="logo-NeuralComputation site-theme-header-image" src="//mitp.silverchair-cdn.com/UI/app/svg/umbrella/logo.svg" alt="MIT Press Direct, home">
+                        </picture>
+                </a>
+                <a href="javascript:;" class="icon-general-close menu-close js-menu-close"><span class="screenreader-text">Close</span></a>
+            </div>
+                    <ul class="site-menu site-menu-lvl-0 js-theme-dropdown">
+                <li class="site-menu-item site-menu-lvl-0 site-menu-item-Books " id="site-menu-item-14014">
+                        <a href="javascript:;" class="nav-link js-theme-dropdown-trigger" aria-expanded="false">Books <i class="icon-general_arrow-down arrow-icon"><span class="screenreader-text">Open Menu</span></i></a>
+
+                            <ul class="site-menu site-menu-lvl-1 js-theme-dropdown">
+                <li class="site-menu-item site-menu-lvl-1 site-menu-item-Books-Home " id="site-menu-item-14016">
+                        <a href="/books" class="nav-link">Books Home                      </a>
+
+                    
+                </li>
+                <li class="site-menu-item site-menu-lvl-1 site-menu-item-Browse-Books " id="site-menu-item-14017">
+                        <a href="/books/search-results" class="nav-link">Browse Books                      </a>
+
+                    
+                </li>
+        </ul>
+
+                </li>
+                <li class="site-menu-item site-menu-lvl-0 site-menu-item-Journals " id="site-menu-item-14015">
+                        <a href="javascript:;" class="nav-link js-theme-dropdown-trigger" aria-expanded="false">Journals <i class="icon-general_arrow-down arrow-icon"><span class="screenreader-text">Open Menu</span></i></a>
+
+                            <ul class="site-menu site-menu-lvl-1 js-theme-dropdown">
+                <li class="site-menu-item site-menu-lvl-1 site-menu-item-Journals-Home " id="site-menu-item-14018">
+                        <a href="/journals" class="nav-link">Journals Home                      </a>
+
+                    
+                </li>
+                <li class="site-menu-item site-menu-lvl-1 site-menu-item-Browse-Journals " id="site-menu-item-14019">
+                        <a href="/journals/pages/browse_by_title" class="nav-link">Browse Journals                      </a>
+
+                    
+                </li>
+        </ul>
+
+                </li>
+                <li class="site-menu-item site-menu-lvl-0 site-menu-item-CogNet " id="site-menu-item-14020">
+                        <a href="/pages/cognet" class="nav-link">CogNet                      </a>
+
+                    
+                </li>
+                <li class="site-menu-item site-menu-lvl-0 site-menu-item-About-MIT-Press-Direct " id="site-menu-item-14021">
+                        <a href="/pages/about" class="nav-link">About MIT Press Direct                      </a>
+
+                    
+                </li>
+                <li class="site-menu-item site-menu-lvl-0 site-menu-item-Customer-Support " id="site-menu-item-14022">
+                        <a href="/pages/customer_support" class="nav-link">Customer Support                      </a>
+
+                    
+                </li>
+                <li class="site-menu-item site-menu-lvl-0 site-menu-item-Librarians " id="site-menu-item-14023">
+                        <a href="/pages/librarians" class="nav-link">Librarians                      </a>
+
+                    
+                </li>
+        </ul>
+
+        </nav>
+    
+</div>
+
+
+
+    <input type="hidden" class="hfEnableEnhancedAutoSuggest" value="" name="searchScope" aria-hidden="true">
+        <div class="mobile-menu-trigger_wrap mobile-search_wrap">
+            <button type="button" class="mobile-search_toggle at-search-toggle" aria-expanded="false" data-theme-dropdown-trigger="search-dropdown"><i class="icon-menu_search" aria-hidden="true"></i><span class="screenreader-text">Search Dropdown Menu</span></button>
+        </div>
+    <div class="navbar-search-container mobile-dropdown search-dropdown" data-theme-dropdown="search-dropdown">
+        <div class="navbar-search">
+            <form class="microsite-search js-MicrositeSearch" aria-label="header search" role="search">
+                <fieldset class="searchbar-fieldset">
+                    <legend><span class="screenreader-text">header search</span></legend>
+                    <div class="navbar-search-input_wrap">
+                        
+                        <input class="navbar-search-input microsite-search-term at-microsite-search-term search-term-autosuggest" data-autosuggest-hint="TOKEN" data-autosuggest-results="TOKEN" data-autosuggest-id="TOKEN" data-searchfilter="TOKEN" placeholder="Search..." aria-label="Search..." type="text" maxlength="255" id="MicrositeSearchTerm-SitePageHeader">
+                        
+                        <input type="hidden" name="hfAutoCompleteMaxResults" class="hfAutoCompleteMaxResults" value="" aria-hidden="true">
+                        <input type="hidden" name="hfSolrAutoSuggestMinimumCharactersLength" class="hfSolrAutoSuggestMinimumCharactersLength" value="" aria-hidden="true">
+                        <input type="hidden" name="hfSolrJournalName" class="hfSolrJournalName" value="" aria-hidden="true">
+                        <input type="hidden" name="hfSolrJournalID" class="hfSolrJournalID" value="" aria-hidden="true">
+                        <label for="TOKEN" aria-hidden="true">
+                            <span class="screenreader-text">Search input auto suggest</span>
+                        </label>
+                        <input type="text" id="micrositeSearchTermInputHint-SitePageHeader" data-autosuggest-id="TOKEN" class="microsite-search-term-input-hint" tabindex="-1" aria-hidden="true" disabled="">
+                        <ul data-autosuggest-id="TOKEN" class="term-list hidden"></ul>
+                    </div>
+                        <div class="navbar-search-filter_wrap">
+                            <label for="TOKEN">
+                                <span class="screenreader-text">filter your search</span>
+                            </label>
+                            <select class="navbar-search-filter navbar-search-filter-site at-navbar-search-filter" id="navbar-search-filter-site-SitePageHeader" data-autosuggest-id="TOKEN">
+<option class="header-search-bar-filters-item" value="" data-siteid="0">All Content</option><option class="header-search-bar-filters-item" value="" data-siteid="1000001">All Journals</option><option class="header-search-bar-filters-item selected" value="" data-siteid="1000015" selected="">Neural Computation</option>                            </select>
+                        </div>
+                    <div class="navbar-search-submit_wrap">
+                        
+                        <button type="button" class="microsite-search-icon navbar-search-submit icon-menu_search"><span class="screenreader-text">Search</span></button>
+                    </div>
+                </fieldset>
+            </form><!---->
+        </div><!---->
+<div class="navbar-search-advanced">
+    <a href="/advanced-search" class="advanced-search">Advanced Search</a>
+</div>    </div><!---->
+
+<input type="hidden" name="parentSiteName" class="hfParentSiteName" value="" aria-hidden="true">
+<input type="hidden" class="hfSolrMaxAllowSearchChar" value="" aria-hidden="true">
+<input type="hidden" class="hfJournalShortName" value="" aria-hidden="true">
+<input type="hidden" class="hfSearchPlaceholder" value="" aria-hidden="true">
+<input type="hidden" name="hfGlobalSearchSiteURL" class="hfGlobalSearchSiteURL" value="" aria-hidden="true">
+<input type="hidden" name="hfSearchSiteURL" id="hfSiteURL" value="" aria-hidden="true">
+<input type="hidden" class="hfQuickSearchUrl" value="" aria-hidden="true">
+<script type="text/javascript"></script>
+
+                <div class="tablet-menu-trigger_wrap">
+        <!---->
+        <button type="button" class="btn-reset tablet-sign-in" data-theme-dropdown-trigger="tablet-user-dropdown" aria-controls="tablet-user-dropdown" aria-expanded="false"><i class="icon-menu_account"><span class="screenreader-text">User Tools Dropdown</span></i></button>
+    </div>
+<div class="site-theme-header-menu-item_wrap tablet-menu" id="tablet-user-dropdown" data-theme-dropdown="tablet-user-dropdown">
+    <!---->
+
+    <!---->
+        <div class="site-theme-header-menu-item"><a href="/my-account/register" class="register at-register js-register-user-modals">Register</a></div>
+
+    <!---->
+
+    <!---->
+
+        <!---->
+        <div class="site-theme-header-menu-item not-authenicated">
+                <button type="button" class="btn-reset dropdown-toggle signin at-signin-dropdown at-signin-username" id="header-account-info-user-fullname" data-login-location="TOKEN?returnUrl=" data-theme-dropdown-trigger="sign-in-dropdown" aria-controls="sign-in-dropdown" aria-expanded="false" rel="nofollow">
+                    
+Sign In                    <i class="icon-general_arrow-down arrow-icon"><span class="screenreader-text">Open Menu</span></i>
+                </button>
+                <div class="dropdown-panel dropdown-panel-signin dropdown-panel-form at-signin-dropdown-panel" id="sign-in-dropdown" data-theme-dropdown="sign-in-dropdown">
+                    <div class="spinner"></div>
+                </div><!---->
+        </div>
+
+</div>
+        </div><!---->
+    </div><!---->
+
+
+    <div class="journal-header journal-bg">
+        <div class="journal-header_content ">
+
+    <div class="journal-logo_wrap">
+        <a href="//direct.mit.edu/neco" class="journal-logo-link">
+            <picture>
+                <source media="(min-width: 601px)" srcset="//mitp.silverchair-cdn.TOKEN.svg">
+                <img class="logo-NeuralComputation journal-logo" src="//mitp.silverchair-cdn.com/data/SiteBuilderAssets/Live/Images/neco/NECO_title-691296143.svg" alt="Neural Computation">
+            </picture>
+        </a>
+    </div>
+
+            
+
+
+<div class="navbar-menu_wrap">
+            <a class="mobile-site-menu-toggle" data-theme-dropdown-trigger="microsite-nav-menu" aria-controls="microsite-nav-menu" aria-expanded="false" href="javascript:;"><i class="icon-menu_hamburger"><span class="screenreader-text">Toggle Menu</span></i><span class="tablet-menu-label">Menu</span></a>
+            <nav class="navbar-menu" id="microsite-nav-menu" data-theme-dropdown="microsite-nav-menu" aria-label="Primary navigation">
+                    <ul class="site-menu site-menu-lvl-0 js-theme-dropdown">
+<li class="site-menu-item site-menu-lvl-0 " id="site-menu-item-11596">
+        <a href="/neco/issue" class="nav-link">Issues</a>
+    </li> <li class="site-menu-item site-menu-lvl-0 " id="site-menu-item-11597">
+        <a href="/neco/online-early" class="nav-link">Online Early</a>
+    </li> <li class="site-menu-item site-menu-lvl-0 " id="site-menu-item-11594">
+        <button type="button" class="btn-reset nav-link js-theme-dropdown-trigger" aria-expanded="false">About<i class="nav-arrow icon-general_arrow-down arrow-icon"><span class="screenreader-text">Open Menu</span></i></button>
+        <ul class="site-menu site-menu-lvl-1 js-theme-dropdown">
+<li class="site-menu-item site-menu-lvl-1 " id="site-menu-item-11598">
+        <a href="/neco/pages/editorial-info" class="nav-link">Editorial Info</a>
+    </li> <li class="site-menu-item site-menu-lvl-1 " id="site-menu-item-11599">
+        <a href="/neco/pages/abstracting-indexing" class="nav-link">Abstracting and Indexing</a>
+    </li> <li class="site-menu-item site-menu-lvl-1 " id="site-menu-item-11600">
+        <a href="/neco/../journals/pages/release-schedule" class="nav-link">Release Schedule</a>
+    </li> <li class="site-menu-item site-menu-lvl-1 " id="site-menu-item-11601">
+        <a href="/neco/../journals/pages/rights-permissions" class="nav-link">Rights and Permissions</a>
+    </li> <li class="site-menu-item site-menu-lvl-1 " id="site-menu-item-11602">
+        <a href="/neco/../journals/pages/authors" class="nav-link">Author Resources</a>
+    </li> <li class="site-menu-item site-menu-lvl-1 " id="site-menu-item-11603">
+        <a href="/neco/../journals/pages/advertising-info" class="nav-link">Advertising Info</a>
+    </li> <li class="site-menu-item site-menu-lvl-1 " id="site-menu-item-11604">
+        <a href="/neco/../journals/pages/publication-ethics" class="nav-link">Publication Ethics</a>
+    </li>     </ul>
+ </li> <li class="site-menu-item site-menu-lvl-0 " id="site-menu-item-11595">
+        <button type="button" class="btn-reset nav-link js-theme-dropdown-trigger" aria-expanded="false">Submit<i class="nav-arrow icon-general_arrow-down arrow-icon"><span class="screenreader-text">Open Menu</span></i></button>
+        <ul class="site-menu site-menu-lvl-1 js-theme-dropdown">
+<li class="site-menu-item site-menu-lvl-1 " id="site-menu-item-11605">
+        <a href="/neco/pages/submission-guidelines" class="nav-link">Submission Guidelines</a>
+    </li> <li class="site-menu-item site-menu-lvl-1 " id="site-menu-item-11606">
+        <a href="/neco/../DocumentLibrary/PubAgreements/NECO_pub_agreement.pdf" class="nav-link">Publication Agreement</a>
+    </li> <li class="site-menu-item site-menu-lvl-1 " id="site-menu-item-11607">
+        <a href="/neco/../journals/pages/open-access" class="nav-link">Open Access</a>
+    </li> <li class="site-menu-item site-menu-lvl-1 " id="site-menu-item-11608">
+        <a href="/neco/../journals/pages/publication-ethics" class="nav-link">Publication Ethics</a>
+    </li>     </ul>
+ </li> <li class="site-menu-item site-menu-lvl-0 " id="site-menu-item-11609">
+        <a href="https://mitpressjournals.mit.edu/shop/journal/" class="nav-link" target="_blank">Subscribe<span class="screenreader-text">Open External Link</span></a>
+    </li>     </ul>
+ 
+            </nav>
+</div><!---->
+
+        </div><!---->
+
+    </div><!---->
+
+
+<input id="routename" name="RouteName" type="hidden" value="">
+
+ 
+    </div>
+
+</section>
+
+<div id="main" class="content-main js-main ui-base" role="main">
+    <section class="master-main row">
+        <div class="content-main_content">
+            <span id="skipNav" tabindex="-1"></span>
+            
+
+
+
+
+
+<div class="page-column-wrap article-browse_content ">
+<div id="InfoColumn" class="page-column page-column--left">
+
+    <div class="info-inner-wrap can-stick">
+
+        <button type="button" class="btn-as-icon toggle-left-col__close icon-general-close">
+            <span class="screenreader-text">Close navigation menu</span>
+        </button>
+        <div class="responsive-nav-title">Article navigation</div>
+
+        <div class="info-widget-wrap">
+    <div class="widget-IssueInfo widget-instance-IssueInfo_Article" data-widget-name="IssueInfo" data-widget-instance="IssueInfo_Article">
+        
+
+<div id="issueInfo-IssueInfo_Article" class="article-info-wrap clearfix ">
+<div class="article-issue-info">
+    <div class="volume-issue__wrap">
+            <a href="/neco/issue/9/8">
+
+            <span class="volume issue">Volume 9, Issue 8</span>
+
+            </a>
+    </div>
+
+    <div class="ii-pub-date">
+November 1997    </div>
+
+
+    
+
+</div>
+<div class="article-issue-img">
+            <a href="/neco/issue/9/8">
+        <img id="issueImage" class="fb-featured-image at-coverimage" src="https://mitp.silverchair-cdn.com/mitp/content_public/journal/neco/issue/9/8/1/m_cover.jpeg" alt="Neural Computation Cover Image for Volume 9, Issue 8">
+            </a>
+</div>
+
+    
+
+</div>
+ 
+    </div>
+                <div class="widget-ArticleNavLinks widget-instance-ArticleNavLinks_Article" data-widget-name="ArticleNavLinks" data-widget-instance="ArticleNavLinks_Article">
+        <ul class="inline-list">
+        <li class="prev arrow">
+            <a href="/neco/article/9/8/1711/6104/Adaptive-Mixtures-of-Probabilistic-Transducers"><i class="icon-general_arrow-left"></i>Previous <span>Article</span></a>
+        </li>
+            <li class="next arrow">
+            <a href="/neco/article/9/8/1781/6106/Factor-Analysis-Using-Delta-Rule-Wake-Sleep">Next <span>Article</span><i class="icon-general_arrow-right"></i></a>
+        </li>
+</ul>
+ 
+    </div>
+
+            
+    <div class="widget-ArticleJumpLinks widget-instance-ArticleJumpLinks_Widget" data-widget-name="ArticleJumpLinks" data-widget-instance="ArticleJumpLinks_Widget">
+        <div class="content-nav">
+        <div class="jumplink-title">Article Contents</div>
+    <ul class="jumplink-list"><li class="section-jump-link js-article-jump-link head-1 abstract-section-jumplink" link-destination="919056">
+                <div class="section-jump-link__link-wrap">
+
+                    <a class="jumplink scrollTo" href="">Abstract</a>
+                </div>
+            </li></ul>
+</div>
+ 
+    </div>
+
+
+
+        </div>
+    </div>
+</div> 
+        
+
+    <div id="ContentColumn" class="page-column page-column--center center-content can-stick">
+        <div class="article-browse_content-wrap js-content-standard">
+                <div class="widget-ArticleMainView widget-instance-ArticleMainView_Abstract" data-widget-name="ArticleMainView" data-widget-instance="TOKEN">
+        
+<div class="article-browse-top article-browse-mobile-nav">
+    <div class="article-browse-mobile-nav-inner">
+        <button type="button" class="btn toggle-left-col toggle-left-col__article">Article Navigation</button>
+    </div>
+</div>    <div class="content-inner-wrap">
+        
+    <div class="widget-ArticleTopInfo widget-instance-ArticleTopInfo_Abstract" data-widget-name="ArticleTopInfo" data-widget-instance="ArticleTopInfo_Abstract">
+        <div class="module-widget article-top-widget content-metadata_wrap">
+
+
+<div class="article-groups left-flag">
+        <span class="article-date">November 15 1997</span>
+
+</div>
+
+
+    <div class="widget-items">
+    <h1 class="wi-article-title article-title-main" id="aria6109">
+
+        Long Short-Term Memory
+
+    <span data-resource-id-access="6109"><i class="js-access-icon-placeholder icon-availability_cart" title="Unavailable"><span class="screenreader-text">Unavailable</span></i></span>
+    </h1>
+                    <div class="special-collections-wrap">
+                                <div>
+                                                <span>In Special Collection:</span>
+                                        <a class="collection-cognet" href="https://direct.mit.edu/neco/collection/19822/CogNet">CogNet</a>
+                                </div>
+
+                    </div>
+<div class="wi-authors">
+    <div class="al-authors-list">
+
+        <input type="hidden" id="js-hdn-enable-corresponding-author-icon" value="">
+                <div class="al-author-name">
+
+                            <!---->
+            <a rel="nofollow" class="linked-name js-linked-name stats-author-info-trigger" href="javascript:;" aria-haspopup="true" aria-expanded="false">Sepp Hochreiter</a><span class="al-author-delim">, </span>
+
+
+                    <div class="al-author-info-wrap arrow-up stats-author-info-panel">
+<div class="info-card-author authorInfo_ArticleTopInfo_Abstract">
+    <div class="name-role-wrap">
+        <div class="info-card-name">
+    Sepp Hochreiter
+</div>
+
+    </div>
+
+    <div class="info-card-affilitation">
+        <div class="aff">Fakultät für Informatik, Technische Universität München, 80290 München, Germany</div>
+    </div>
+
+    <div class="info-card-search-label">
+        Search for other works by this author on:
+    </div>
+
+<div class="info-card-search info-card-search-internal">
+    <a href="/neco/search-results" rel="nofollow">This Site</a>
+</div>
+
+    <div class="info-card-search info-card-search-google">
+        <a href="http://scholar.google.com/scholar" target="_blank">Google Scholar</a>
+    </div>
+</div>                    </div>
+                </div>
+                <div class="al-author-name">
+
+                                <a rel="nofollow" class="linked-name js-linked-name stats-author-info-trigger" href="javascript:;" aria-haspopup="true" aria-expanded="false">Jürgen Schmidhuber</a>
+
+                    <div class="al-author-info-wrap arrow-up stats-author-info-panel">
+<div class="info-card-author authorInfo_ArticleTopInfo_Abstract">
+    <div class="name-role-wrap">
+        <div class="info-card-name">
+    Jürgen Schmidhuber
+</div>
+
+    </div>
+
+    <div class="info-card-affilitation">
+        <div class="aff">IDSIA, Corso Elvezia 36, 6900 Lugano, Switzerland</div>
+    </div>
+
+    <div class="info-card-search-label">
+        Search for other works by this author on:
+    </div>
+
+<div class="info-card-search info-card-search-internal">
+    <a href="/neco/search-results" rel="nofollow">This Site</a>
+</div>
+
+    <div class="info-card-search info-card-search-google">
+        <a href="http://scholar.google.com/scholar" target="_blank">Google Scholar</a>
+    </div>
+</div>                    </div>
+                </div>
+    </div>
+</div>
+
+
+
+
+
+<div class="wi-crossmark-button">
+    <script src="https://crossmark-cdn.crossref.org/widget/v2.0/widget.js"></script>
+    <a href="javascript:;" class="stats-crossmark-updates" data-target="crossmark" style="">
+        <img src="https://crossmark-cdn.crossref.org/widget/v2.0/logos/CROSSMARK_Color_horizontal.svg" width="150" alt="Crossmark: Check for Updates">
+    </a>
+</div>
+
+
+    <div class="js-author-expand-collapse-metadata-wrap author-expand-collapse-metadata-wrap stats-article-metadata-trigger-wrap">
+        <a href="javascript:;" class="js-expand-collapse-metadata author-expand-collapse-metadata stats-article-metadata-trigger">
+            <i class="js-metadata-toggle-icon icon-general-add"></i>Author and Article Information
+        </a>
+    </div>
+<div class="js-metadata-wrap metadata">
+
+
+
+<div id="authorInfoFullList" class="author-info-full-list">
+            <div class="author-info-wrap">
+                
+<span class="author-full-name">Sepp Hochreiter</span>
+
+                    <div class="author-affiliation">
+                        <div class="aff">Fakultät für Informatik, Technische Universität München, 80290 München, Germany</div>
+                    </div>
+            </div>
+            <div class="author-info-wrap">
+                
+<span class="author-full-name">Jürgen Schmidhuber</span>
+
+                    <div class="author-affiliation">
+                        <div class="aff">IDSIA, Corso Elvezia 36, 6900 Lugano, Switzerland</div>
+                    </div>
+            </div>
+</div>
+            <div class="metadata-pubhistory">
+                    <div class="pubhistory-entry">
+                        <span class="pubhistory-state">Received:</span>
+                        <span class="pubhistory-date">August 28 1995</span>
+                    </div>
+                    <div class="pubhistory-entry">
+                        <span class="pubhistory-state">Accepted:</span>
+                        <span class="pubhistory-date">February 24 1997</span>
+                    </div>
+
+            </div>
+            <div class="metadata-issn">
+                    <div class="metadata-issn-online">Online ISSN: 1530-888X</div>
+                                    <div class="metadata-issn-print">Print ISSN: 0899-7667</div>
+            </div>
+            <div class="metadata-copyright">
+                <div class="copyright copyright-statement">© 1997 Massachusetts Institute of Technology</div><div class="copyright copyright-year">1997</div>
+            </div>
+
+</div>
+
+
+<div class="pub-history-wrap clearfix">
+
+            <div class="pub-history-row clearfix">
+            <div class="ww-citation-primary"><em>Neural Computation</em> (1997) 9 (8): 1735–1780.</div>
+        </div>
+        <div class="pub-history-row citation-wrap-row clearfix">
+                <div class="ww-citation-wrap-doi">
+                    <div class="citation-doi">
+                        <a href="https://doi.org/10.1162/neco.1997.9.8.1735" target="_blank">https://doi.org/10.1162/neco.1997.9.8.1735</a>
+                    </div>
+                </div>
+
+                <div class="ww-citation-history-wrap js-history-dropdown-wrap">
+                    <a href="javascript:;" class="history-label js-history-dropdown-trigger">
+                        <span>Article history</span><i class="icon-history-small"></i>
+                    </a>
+
+                    <div class="ww-history js-history-entries-wrap">
+                            <div class="history-entry">
+                                <div class="wi-state">Received:</div>
+                                <div class="wi-date">August 28 1995</div>
+                            </div>
+                            <div class="history-entry">
+                                <div class="wi-state">Accepted:</div>
+                                <div class="wi-date">February 24 1997</div>
+                            </div>
+                    </div>
+                </div>
+        </div>
+
+</div>
+
+
+
+    </div>
+</div>
+
+<script></script>
+
+ 
+    </div>
+    <div class="widget-ArticleLinks widget-instance-ArticleLinks_Abstract" data-widget-name="ArticleLinks" data-widget-instance="ArticleLinks_Abstract">
+         
+    </div>
+<div class="toolbar-wrap vt-toolbar-wrap" role="navigation">
+    <div class="toolbar-inner-wrap">
+<div class="toolbar-inner-wrap ">
+    <ul id="Toolbar" class="debug js-toolbar toolbar">
+
+    <li class="toolbar-item item-cite js-item-cite">
+<div class="getCitationDiv at-CiteButton">
+    <a href="javascript:;" class="stats-get-citation" data-modal-source-id="toolbox-get-citation" rel="nofollow">
+        <i class="icon-cite">
+            <span class="screenreader-text">Cite Icon</span>
+        </i>
+        <span class="toolbar-text normalize">Cite</span>
+    </a>
+</div>
+    </li>
+
+
+<li class="toolbar-item item-tools">
+    <div class="widget-ToolboxPermissions widget-instance-ToolboxPermissions_Abstract" data-widget-name="ToolboxPermissions" data-widget-instance="TOKEN">
+            <div class="module-widget">
+          <a id="PermissionsLink" href="/journals/pages/rights-permissions" class="" onclick="window.open(this.href); return false;" rel="nofollow">Permissions</a>
+    </div>
+ 
+    </div>
+
+</li>
+    <li class="toolbar-item item-with-dropdown item-share">
+        <a href="javascript:;" class="drop-trigger js-toolbar-dropdown at-ShareButton" data-dropdown="ShareDrop" role="button" aria-expanded="false">
+            <i class="icon-menu_share"><span class="screenreader-text">Share Icon</span></i>
+            <span class="toolbar-label">
+                <span class="toolbar-text">Share</span>
+                <i class="arrow-icon icon-general_arrow-down js-toolbar-arrow-icon"></i>
+            </span>
+        </a>
+        <ul id="ShareDrop" class="addthis_toolbox addthis_default_style addthis_20x20_style f-dropdown js-dropdown-content" data-dropdown-content="">
+
+    <li>
+        <a class="st-custom-button addthis_button_facebook js-share-link" data-network="facebook" data-title="Long Short-Term Memory" data-url="https://direct.mit.edu/neco/article-abstract/9/8/1735/6109/Long-Short-Term-Memory" data-email-subject="Long Short-Term Memory" href="javascript:;" rel="nofollow"><span>Facebook</span></a>
+    </li>
+    <li>
+        <a class="st-custom-button addthis_button_twitter js-share-link" data-network="twitter" data-title="Long Short-Term Memory" data-url="https://direct.mit.edu/neco/article-abstract/9/8/1735/6109/Long-Short-Term-Memory" data-email-subject="Long Short-Term Memory" href="javascript:;" rel="nofollow"><span>X</span></a>
+    </li>
+    <li>
+        <a class="st-custom-button addthis_button_linkedin js-share-link" data-network="linkedin" data-title="Long Short-Term Memory" data-url="https://direct.mit.edu/neco/article-abstract/9/8/1735/6109/Long-Short-Term-Memory" data-email-subject="Long Short-Term Memory" href="javascript:;" rel="nofollow"><span>LinkedIn</span></a>
+    </li>
+    <li>
+        <a class="st-custom-button addthis_button_email js-share-link" data-network="email" data-title="Long Short-Term Memory" data-url="https://direct.mit.edu/neco/article-abstract/9/8/1735/6109/Long-Short-Term-Memory" data-email-subject="Long Short-Term Memory" href="javascript:;" rel="nofollow"><span>Email</span></a>
+    </li>
+    <li>
+        <a class="st-custom-button addthis_button_bluesky js-share-link" data-network="bluesky" data-title="Long Short-Term Memory" data-url=" https://direct.mit.edu/neco/article-abstract/9/8/1735/6109/Long-Short-Term-Memory" data-email-subject="Long Short-Term Memory" href="javascript:;" rel="nofollow"><span>Bluesky</span></a>
+    </li>
+
+
+
+        </ul>
+    </li>
+<li class="toolbar-item item-with-dropdown item-views js-item-views hide">
+  <a href="javascript:;" class="js-toolbar-dropdown" data-dropdown="FilterDrop" role="button" aria-expanded="false">
+    <i class="icon-menu_views"><span class="screenreader-text">Views Icon</span></i>
+    <span class="toolbar-label">
+      <span class="toolbar-text">Views</span>
+      <i class="icon-general_arrow-down arrow-icon js-toolbar-arrow-icon"><span class="screenreader-text">Open Menu</span></i>
+    </span>
+  </a>
+  <ul id="ViewsDrop" class="f-dropdown js-dropdown-content" data-dropdown-content="">
+      <li class="article-content-filter js-content-filter hide" data-content-filter="article-content"><a href="javascript:;" rel="nofollow"><span>Article contents</span></a></li>
+      <li class="article-content-filter js-content-filter hide" data-content-filter="figures-tables"><a href="javascript:;" rel="nofollow"><span>Figures &amp; tables</span></a></li>
+      <li class="article-content-filter js-content-filter hide" data-content-filter="video"><a href="javascript:;" rel="nofollow"><span>Video</span></a></li>
+      <li class="article-content-filter js-content-filter hide" data-content-filter="audio"><a href="javascript:;" rel="nofollow"><span>Audio</span></a></li>
+      <li class="article-content-filter js-content-filter hide" data-content-filter="supplementary-data"><a href="javascript:;" rel="nofollow"><span>Supplementary Material</span></a></li>
+      <li class="article-content-filter js-content-filter hide" data-content-filter="peer-review"><a href="javascript:;" rel="nofollow"><span>Peer Review</span></a></li>
+  </ul>
+</li>
+
+<li class="search-dropdown-trigger_wrap toolbar-item">
+    <a href="javascript:;" data-theme-dropdown-trigger="toolbar-search-dropdown" aria-controls="toolbar-search-dropdown" aria-expanded="false">
+        <i class="icon-menu_search"></i>
+        <span class="site-search-text">Search Site</span>
+    </a>
+</li>
+
+    </ul>
+</div>
+
+<div id="getCitation" data-content-id="toolbox-get-citation" class="modal-only-content vt-citation-modal">
+  <div class="modal-title">Citation</div>
+  <p>Sepp Hochreiter<span class="al-author-delim">, </span>Jürgen Schmidhuber; Long Short-Term Memory. <em><em>Neural Comput</em></em> 1997; 9 (8): 1735–1780. doi: <a href="https://doi.org/10.1162/neco.1997.9.8.1735" target="_blank">https://doi.org/10.1162/neco.1997.9.8.1735</a></p>
+  <p class="citation-label">Download citation file:</p>
+  <ul>
+      <li><a href="/Citation/Download" rel="nofollow">Ris (Zotero)</a></li>
+          <li><a href="/Citation/Download" rel="nofollow">Reference Manager</a></li>
+          <li><a href="/Citation/Download" rel="nofollow">EasyBib</a></li>
+          <li><a href="/Citation/Download" rel="nofollow">Bookends</a></li>
+
+      <li><a href="/Citation/Download" rel="nofollow">Mendeley</a></li>
+
+      <li><a href="/Citation/Download" rel="nofollow">Papers</a></li>
+
+      <li><a href="/Citation/Download" rel="nofollow">EndNote</a></li>
+          <li><a href="/Citation/Download" rel="nofollow">RefWorks</a></li>
+          <li><a href="/Citation/Download" rel="nofollow">BibTex</a></li>
+          </ul>
+</div>
+
+
+        <div class="toolbar-search" id="toolbar-search-dropdown" data-theme-dropdown="toolbar-search-dropdown">
+            <fieldset>
+                <legend class="screenreader-text">toolbar search</legend>
+
+    <div class="widget-SitePageHeader widget-instance-SiteSearch_ArticleMainView_Abstract" data-widget-name="SitePageHeader" data-widget-instance="TOKEN">
+        
+
+    <input type="hidden" class="hfEnableEnhancedAutoSuggest" value="" name="searchScope" aria-hidden="true">
+        <div class="mobile-menu-trigger_wrap mobile-search_wrap">
+            <button type="button" class="mobile-search_toggle at-search-toggle" aria-expanded="false" data-theme-dropdown-trigger="search-dropdown"><i class="icon-menu_search" aria-hidden="true"></i><span class="screenreader-text">Search Dropdown Menu</span></button>
+        </div>
+    <div class="navbar-search-container mobile-dropdown search-dropdown" data-theme-dropdown="search-dropdown">
+        <div class="navbar-search">
+            <form class="microsite-search js-MicrositeSearch" aria-label="toolbar search" role="search">
+                <fieldset class="searchbar-fieldset">
+                    <legend><span class="screenreader-text">toolbar search</span></legend>
+                    <div class="navbar-search-input_wrap">
+                        
+                        <input class="navbar-search-input microsite-search-term at-microsite-search-term search-term-autosuggest" data-autosuggest-hint="TOKEN" data-autosuggest-results="TOKEN" data-autosuggest-id="TOKEN" data-searchfilter="TOKEN" placeholder="Search..." aria-label="Search..." type="text" maxlength="255" id="MicrositeSearchTerm-SiteSearch_ArticleMainView_Abstract">
+                        
+                        <input type="hidden" name="hfAutoCompleteMaxResults" class="hfAutoCompleteMaxResults" value="" aria-hidden="true">
+                        <input type="hidden" name="hfSolrAutoSuggestMinimumCharactersLength" class="hfSolrAutoSuggestMinimumCharactersLength" value="" aria-hidden="true">
+                        <input type="hidden" name="hfSolrJournalName" class="hfSolrJournalName" value="" aria-hidden="true">
+                        <input type="hidden" name="hfSolrJournalID" class="hfSolrJournalID" value="" aria-hidden="true">
+                        <label for="TOKEN" aria-hidden="true">
+                            <span class="screenreader-text">Search input auto suggest</span>
+                        </label>
+                        <input type="text" id="micrositeSearchTermInputHint-SiteSearch_ArticleMainView_Abstract" data-autosuggest-id="TOKEN" class="microsite-search-term-input-hint" tabindex="-1" aria-hidden="true" disabled="">
+                        <ul data-autosuggest-id="TOKEN" class="term-list hidden"></ul>
+                    </div>
+                        <div class="navbar-search-filter_wrap">
+                            <label for="TOKEN">
+                                <span class="screenreader-text">filter your search</span>
+                            </label>
+                            <select class="navbar-search-filter navbar-search-filter-site at-navbar-search-filter" id="navbar-search-filter-site-SiteSearch_ArticleMainView_Abstract" data-autosuggest-id="TOKEN">
+<option class="header-search-bar-filters-item" value="" data-siteid="0">All Content</option><option class="header-search-bar-filters-item" value="" data-siteid="1000001">All Journals</option><option class="header-search-bar-filters-item selected" value="" data-siteid="1000015" selected="">Neural Computation</option>                            </select>
+                        </div>
+                    <div class="navbar-search-submit_wrap">
+                        
+                        <button type="button" class="microsite-search-icon navbar-search-submit icon-menu_search"><span class="screenreader-text">Search</span></button>
+                    </div>
+                </fieldset>
+            </form><!---->
+        </div><!---->
+<div class="navbar-search-advanced">
+    <a href="/advanced-search" class="advanced-search">Advanced Search</a>
+</div>    </div><!---->
+
+ 
+    </div>
+
+            </fieldset>
+        </div>
+    </div><!---->
+</div><!---->
+
+<div class="article-body">
+    <div id="articleMainView-articleId" class="js-articleMainView-articleId" data-articleid="6109" style=""></div>
+    <div id="ContentTab" class="content active">
+    <div class="widget-ArticleFulltext widget-instance-ArticleFulltext_Abstract" data-widget-name="ArticleFulltext" data-widget-instance="TOKEN">
+        <input type="hidden" name="js-hfArticleLinksReferencesDoiRegex" id="js-hfArticleLinksReferencesDoiRegex" value="">
+
+<div class="module-widget">
+    <div class="widget-items" data-widgetname="ArticleFulltext">
+        <span id="sr-fig-viewer-action" hidden="">Open figure viewer</span>
+        
+
+
+
+
+
+                <h2 scrollto-destination="919056" id="919056" data-section-title="Abstract" class="abstract-title jumplink-heading">Abstract</h2>
+                <div class="">
+                <div id="919056-content" class="article-section-wrapper js-article-section js-content-section  " data-section-parent-id="0">
+                    
+                    <section class="abstract" aria-label="Main abstract"><p>Learning to store information over extended time intervals by recurrent backpropagation takes a very long time, mostly because of insufficient, decaying error backflow. We briefly review Hochreiter's (1991) analysis of this problem, then address it by introducing a novel, efficient, gradient based method called long short-term memory (LSTM). Truncating the gradient where this does not do harm, LSTM can learn to bridge minimal time lags in excess of 1000 discrete-time steps by enforcing constant error flow through constant error carousels within special units. Multiplicative gate units learn to open and close access to the constant error flow. LSTM is local in space and time; its computational complexity per time step and weight is <em>O</em>. 1. Our experiments with artificial data involve local, distributed, real-valued, and noisy pattern representations. In comparisons with real-time recurrent learning, back propagation through time, recurrent cascade correlation, Elman nets, and neural sequence chunking, LSTM leads to many more successful runs, and learns much faster. LSTM also solves complex, artificial long-time-lag tasks that have never been solved by previous recurrent network algorithms.</p></section>
+                </div>
+                    <div class="article-metadata-panel clearfix rs_skip">
+    <div class="widget-SolrResourceMetadata widget-instance-ContentMetadata_ArticleFulltext_Article" data-widget-name="SolrResourceMetadata" data-widget-instance="TOKEN">
+        
+
+
+ 
+    </div>
+
+                    </div>
+        <!---->
+        </div> 
+
+
+            <div class="article-metadata-standalone-panel clearfix"></div>
+
+                <div class="pdf-notice">
+                    This content is only available as a PDF.
+                </div>
+
+
+
+        
+
+
+        <div class="TOKEN-section-wrapper ">
+            
+            <div class="copyright copyright-statement">© 1997 Massachusetts Institute of Technology</div><div class="copyright copyright-year">1997</div>
+        </div>
+<!---->
+
+
+        <span id="UserHasAccess" data-userhasaccess="False"></span>
+
+    </div><!---->
+    </div><!----> 
+    </div>
+                <div class="article-top-info-user-restricted-options">You do not currently have access to this content.</div>
+
+        <div id="ContentTabFilteredView"></div>
+
+    </div>
+</div>
+
+
+    </div>
+
+ 
+    </div>
+<div class="user-comments-wrap js-userComments">
+    <div class="widget-UserCommentBody widget-instance-UserCommentBody" data-widget-name="UserCommentBody" data-widget-instance="UserCommentBody">
+         
+    </div>
+    <div class="widget-UserComment widget-instance-UserComment" data-widget-name="UserComment" data-widget-instance="UserComment">
+         
+    </div>
+
+</div>
+
+            <div>    <a id="FullTextLink"></a></div>
+
+<div id="unauth" class="unauth-wrap">
+                <div class="unauth-row clearfix">
+                <h2 class="unauth-signin-title">Sign in</h2>
+    <div class="register-ribbon-wrap">
+        <div class="register-ribbon-text">
+            Don't already have an account? <a class="register-ribbon-link" href="/my-account/register">Register</a>
+        </div>
+    </div>
+            <!---->
+        <div class="unauth-column-wrap">
+                <div class="unauth-column">
+    <div class="widget-LoginForm widget-instance-ArticlePage_LoginForm" data-widget-name="LoginForm" data-widget-instance="ArticlePage_LoginForm">
+            <div class="signin-form">
+
+        <div class="preloader-wrap hide">
+            <div class="preloader">
+                <div class="spinner"></div>
+            </div>
+        </div>
+
+        
+        <div class="login-form__section-wrap">
+                <form class="login-form__section">
+                    <div class="login-form__heading">
+                        <h3>Client Account</h3>
+                    </div>
+                    <!---->
+                    <div id="LoginErrorMessage" class="error at-error" data-default-message="You could not be signed in. Please check your email address / username and password and try again.">
+                    </div>
+                    <div class="login-form__row">
+                        <label for="TOKEN" class="login-form__label">
+                            <span class="login-form__label-text">Email address / Username</span>
+                            <a class="question-icon" href="" data-reveal-id="modalSignInEmail"><span>?</span></a>
+                        </label>
+                        <input id="user_ArticlePage_LoginForm" type="text" class="username at-username" aria-required="true" aria-describedby="LoginErrorMessage">
+                    </div>
+                    <div class="login-form__row">
+                        <label for="TOKEN" class="login-form__label-text">Password</label>
+                        <input id="pass_ArticlePage_LoginForm" type="password" class="password at-password" aria-required="true" aria-describedby="LoginErrorMessage">
+                    </div>
+                    
+                    <input type="hidden" id="enableReCaptcha" name="enableReCaptcha" value="">
+                        <div class="login-form__row">
+                            <div class="login-form-captcha">
+    <div class="widget-ReCaptcha widget-instance-login-form-captcha" data-widget-name="ReCaptcha" data-widget-instance="login-form-captcha">
+                <div id="captcha" data-captchakey="TOKEN" data-fallback-captcha-key=""><div style=""><div><iframe title="reCAPTCHA" width="304" height="78" role="presentation" name="a-ynyieltiszyi" frameborder="0" scrolling="no" sandbox="allow-forms allow-popups allow-same-origin allow-scripts allow-top-navigation allow-modals TOKEN TOKEN" src="https://www.google.com/recaptcha/api2/anchor"></iframe></div><textarea id="g-recaptcha-response" name="g-recaptcha-response" class="g-recaptcha-response" style=""></textarea></div><iframe style=""></iframe></div>
+        <div class="captchaAlert" style="">
+            Could not validate captcha.  Please try again.
+        </div>
+            <script type="text/javascript"></script>
+            <script src="https://www.google.com/recaptcha/api.js" async="" defer=""></script>
+    <input type="hidden" id="recaptchaWidgetInstance" value="">
+    <input type="hidden" id="recaptchaUseV3" value="">
+ 
+    </div>
+
+                            </div>
+                        </div>
+
+                    <div class="login-form__row">
+                        <button type="button" class="signin-button btn at-signin-button">Sign In</button>
+                        <div class="login-form__link-wrap">
+                            <a class="logged-out-link at-reset-link" href="/my-account/reset-password" rel="nofollow">Reset password</a>
+                        </div>
+                        <div class="login-form__link-wrap">
+                            <a class="logged-out-link at-register-link js-register-user-modals" href="/my-account/register" data-target="register" rel="nofollow">Register</a>
+                        </div>
+                    </div>
+
+                    <!---->
+                </form>
+
+
+                    <div class="login-form__section login-form__row--lower">
+                            <h3 class="login-form__heading">Sign in via your Institution</h3>
+
+                        <a class="logged-out-link institutional-login-link at-institutional-login-link" href="/institutional-login" rel="nofollow">Sign in via your Institution</a>
+                    </div>
+
+
+
+        </div>
+    </div>
+ 
+    </div>
+
+                </div>
+    <div class="widget-RestoreGuestAccess widget-instance-ArticlePage_RestoreGuestAccess" data-widget-name="RestoreGuestAccess" data-widget-instance="TOKEN">
+         
+    </div>
+                    <input type="hidden" id="resourceId" value="">
+                    <input type="hidden" id="resourceTypeId" value="">
+                <!---->
+                            <div class="unauth-column entities">
+                        <div class="unauth-society-row">
+
+                        </div>
+                                    </div><!---->
+
+        </div><!---->
+        </div>
+    <div class="product-type_wrap">
+    <div class="widget-BuyThisResourceLink widget-instance-ArticlePage_BuyThisResourceLink" data-widget-name="BuyThisResourceLink" data-widget-instance="TOKEN">
+                <div id="dvPurchaseButton" class="ppv-wrap">
+                                        <div id="buyThisResourceLink" class="buyThisResourceLink ppv box">
+    <a class="store-link js-add-to-cart" href="https://direct.mit.edu/store/add/6109/3" rel="nofollow" data-article-doi="" data-article-title="" data-article-type="" data-journal-short-name="" data-currency="" data-price="">
+        <i class="icon-availability_cart"></i> <span>Buy This Article</span>
+    </a>
+    <div class="widget-ExternalProductLink widget-instance-BuyThisResource" data-widget-name="ExternalProductLink" data-widget-instance="BuyThisResource">
+          
+    </div>
+
+                </div>
+
+        </div>
+
+
+ 
+    </div>
+            </div>
+</div><!---->
+
+            
+        </div>
+    </div> 
+    <div id="Sidebar" class="page-column page-column--right">
+        <input type="hidden" class="js-sidebar-stick-only-last-ad" value="">
+
+    <div class="widget-AdBlock widget-instance-ArticlePageTopSidebar" data-widget-name="AdBlock" data-widget-instance="ArticlePageTopSidebar">
+        
+ 
+    </div>
+
+
+        <div class="sidebar-widget_wrap">
+    <div class="widget-DynamicWidgetLayout widget-instance-Article_RightRail" data-widget-name="DynamicWidgetLayout" data-widget-instance="Article_RightRail">
+        <div class="widget widget-dynamic " data-count="1">
+    
+
+    <div class="widget-dynamic-inner-wrap">
+
+    <div class="widget-DynamicWidgetLayout widget-instance-Article_TOKEN" data-widget-name="DynamicWidgetLayout" data-widget-instance="Article_RightRailB0">
+        <div class="widget widget-dynamic right-rail" data-count="7">
+    
+
+    <div class="widget-dynamic-inner-wrap">
+
+    <div class="widget-DynamicWidgetLayout widget-instance-Article_TOKEN" data-widget-name="DynamicWidgetLayout" data-widget-instance="Article_RightRailB0B0">
+        <div class="widget widget-dynamic article-alerts alerts" data-count="1">
+    
+
+    <div class="widget-dynamic-inner-wrap">
+
+    <div class="widget-Alerts widget-instance-Article_TOKEN-alerts" data-widget-name="Alerts" data-widget-instance="TOKEN">
+            <div id="alerts" class="widget widget-alerts rail-widget_wrap vt-widget-alerts">
+        <h2 class="alerts-widget-header">Email alerts</h2>
+        <div class="widget-links_wrap">
+                    <div class="userAlert alertType-1">
+                            <a href="javascript:;" class="js-open-alert-modal" role="button" aria-haspopup="dialog" data-user-logged-in="False" data-alert-type="1" data-eissn="" rel="nofollow">Article Activity Alert</a>
+                    </div>
+                    <div class="userAlert alertType-5">
+                            <a href="javascript:;" class="js-open-alert-modal" role="button" aria-haspopup="dialog" data-user-logged-in="False" data-alert-type="5" data-eissn="1530-888X" rel="nofollow">Latest Issue Alert</a>
+                    </div>
+                                    <div class="userAlertSignUpModal reveal-modal small" data-bypass-confirmation="false" data-enable-guest-signup="false" data-reveal="" role="dialog" aria-modal="true" aria-hidden="true" aria-live="assertive" aria-label="Alert sign-up" style="">
+    <div class="userAlertSignUp"></div>
+    <a href="javascript:;" role="button" class="close-reveal-modal js-close-modal" aria-label="Close alert sign-up modal">
+        <i class="icon-general-close" aria-hidden="true"></i>
+        <span class="screenreader-text">Close Modal</span>
+    </a>
+</div>
+
+        </div>
+    </div>
+ 
+    </div>
+
+    </div>
+
+</div> 
+    </div>
+    <div class="widget-DynamicWidgetLayout widget-instance-Article_TOKEN" data-widget-name="DynamicWidgetLayout" data-widget-instance="Article_RightRailB0B1">
+        <div class="widget widget-dynamic article-article-level-metrics article-level-metrics" data-count="1">
+    
+
+    <div class="widget-dynamic-inner-wrap">
+
+    <div class="widget-ArticleLevelMetrics widget-instance-Article_TOKEN-article-level-metrics" data-widget-name="ArticleLevelMetrics" data-widget-instance="TOKEN">
+        
+
+
+
+    <div class="artmet-wrapper horizontal-artmet">
+<div class="artmet-condensed-wrap clearfix">
+    <div class="artmet-condensed-stats clearfix">
+            <div class="artmet-item artmet-views">
+                <span class="artmet-number">31,424</span>
+                <span class="artmet-text">Views</span>
+            </div>
+
+                <div class="artmet-item artmet-citations">
+                    <span class="artmet-number">
+                            <a href="https://www.webofscience.com/api/gateway" target="_blank" rel="nofollow">61,463</a>
+                    </span>
+                    <span class="artmet-text">Web of Science</span>
+                </div>
+                <div class="artmet-item artmet-citations">
+                    <span class="artmet-number">
+                            <a href="https://direct.mit.edu/neco/crossref-citedby/6109" target="_blank" rel="nofollow">83,846</a>
+                    </span>
+                    <span class="artmet-text">Crossref</span>
+                </div>
+
+            <div class="artmet-item artmet-badges-wrap">
+
+                    <div class="artmet-item artmet-dimensions">
+    <div class="widget-DimensionsBadge widget-instance-ArticleLevelMetrics_DimensionsBadge" data-widget-name="DimensionsBadge" data-widget-instance="TOKEN">
+        <span class="__dimensions_badge_embed__" data-doi="10.1162/neco.1997.9.8.1735" data-legend="false" data-style="small_circle" data-hide-zero-citations="true" data-dimensions-badge-installed="true"><a class="__dimensions_Link" href="https://badge.dimensions.ai/details/doi/10.1162/neco.1997.9.8.1735" target="_blank" referrerpolicy="TOKEN" aria-label="92k total citations on Dimensions." style=""><div class="__dimensions_Badge __dimensions_Badge_style_small_circle"><div class="__dimensions_Badge_Image">
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 600"></svg>
+
+  <div class="__db_background"></div>
+
+  <div class="__db_shape">
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 600" xmlns:xlink="http://www.w3.org/1999/xlink"></svg>
+  </div>
+
+  <div class="__db_score __db_score_normal">92k</div>
+  <div class="__db_label">CITATIONS</div>
+
+  <img src="https://badge.dimensions.ai/badge" class="__dimensions_png" alt="92k total citations on Dimensions.">
+</div>
+</div><div class="__dimensions_Badge_Legend_padding __dimensions_Badge_Legend_hover-right  __dimensions_Badge_Legend_style_small_circle"><div class="__dimensions_Badge_Legend">
+      <div class="__dimensions_Badge_stat_group __dimensions_Badge_stat_group_citations">
+        <div class="__dimensions_Badge_stat __dimensions_Badge_stat_total_citations">
+          <span class="__dimensions_Badge_stat_icon"></span>
+          <span class="__dimensions_Badge_stat_count">92k</span>
+          <span class="__dimensions_Badge_stat_text">Total citations</span>
+        </div>
+        <div class="__dimensions_Badge_stat __dimensions_Badge_stat_recent_citations">
+          <span class="__dimensions_Badge_stat_icon"></span>
+          <span class="__dimensions_Badge_stat_count">22k</span>
+          <span class="__dimensions_Badge_stat_text">Recent citations</span>
+        </div>
+      </div>
+      <div class="__dimensions_Badge_stat_group __dimensions_Badge_stat_group_cr">
+        <div class="__dimensions_Badge_stat __dimensions_Badge_stat_fcr">
+          <span class="__dimensions_Badge_stat_icon"></span>
+          <span class="__dimensions_Badge_stat_count">n/a</span>
+          <span class="__dimensions_Badge_stat_text">Field Citation Ratio</span>
+        </div>
+        <div class="__dimensions_Badge_stat __dimensions_Badge_stat_rcr">
+          <span class="__dimensions_Badge_stat_icon"></span>
+          <span class="__dimensions_Badge_stat_count">214</span>
+          <span class="__dimensions_Badge_stat_text">Relative Citation Ratio</span>
+        </div>
+      </div></div></div></a></span>
+<script async="" src="https://badge.dimensions.ai/badge.js" charset="utf-8"></script>
+ 
+    </div>
+
+                    </div>
+            </div>
+    </div>
+        <div class="artmet-modal-trigger-wrap clearfix">
+            <a href="javascript:;" role="button" class="artmet-modal-trigger js-artmet-modal-trigger at-alm-metrics-modal-trigger" data-article-id="6109" aria-haspopup="dialog" aria-expanded="false" aria-controls="MetricsModal" rel="nofollow"><i class="icon-metrics"></i><span>View Metrics</span></a>
+        </div>
+</div>
+
+
+            <div class="artmet-modal js-artmet-modal" id="MetricsModal" role="dialog" aria-modal="true" aria-hidden="true" aria-live="assertive" aria-labelledby="widget-title-1-id" tabindex="-1">
+                <div class="artmet-modal-contents js-metric-modal-contents at-alm-modal-contents" id="MetricsModalContents">
+                    <a href="javascript:;" role="button" class="artmet-close-modal js-artmet-close-modal" aria-label="Close metrics modal">
+                        <span aria-hidden="true">×</span>
+                        <span class="screenreader-text">Close Modal</span>
+                    </a>
+                </div>
+            </div>
+    </div>
+
+ 
+    </div>
+
+    </div>
+
+</div> 
+    </div>
+    <div class="widget-DynamicWidgetLayout widget-instance-Article_TOKEN" data-widget-name="DynamicWidgetLayout" data-widget-instance="Article_RightRailB0B2">
+        <div class="widget widget-dynamic home-adblock" data-count="1">
+    
+
+    <div class="widget-dynamic-inner-wrap">
+
+    <div class="widget-AdBlock widget-instance-Article_TOKEN_RightRail_Pillow_Ad_Bottom" data-widget-name="AdBlock" data-widget-instance="TOKEN">
+            <input type="hidden" class="hfAdBlockInfo" data-divid="TOKEN" data-slotname="451445" data-targetname="179758" data-sizes="[[300, 350]]" data-enabled-on-mobile="True" data-adprovider-typeid="2" data-accountid="" data-outofpagead="False" data-sticky-time="5" data-lazyloaded="False" data-position-keyword="" data-position-targeting-key="position" data-skip-size-mapping="False" data-native-placement-id="" data-wps-adsize-number="0" data-wps-network-id="0" data-wps-site-id="0" data-wps-zone-ids="" data-wps-brandlock-keyword="" data-tapnative-aid="" data-tapnative-div-id="" data-suppress-display="false" data-fallback-divid="">
+    <div class="adblock-wrap js-adblock-wrap " style="">
+                <p class="adblock-advertisement-text js-adblock-advertisement-text hide">Advertisement</p>
+
+<div id="placement_TOKEN_adBlockNone" adslot="451445" class="adblock-slot-placeholder js-adblock" style=""></div>
+
+
+    </div>
+
+ 
+    </div>
+
+    </div>
+
+</div> 
+    </div>
+    <div class="widget-DynamicWidgetLayout widget-instance-Article_TOKEN" data-widget-name="DynamicWidgetLayout" data-widget-instance="Article_RightRailB0B3">
+        <div class="widget widget-dynamic TOKEN article-list-new-popular" data-count="1">
+    
+
+    <div class="widget-dynamic-inner-wrap">
+
+    <div class="widget-ArticleListNewAndPopular widget-instance-Article_TOKEN_ArticleNewPopularCombined" data-widget-name="TOKEN" data-widget-instance="TOKEN">
+            <div class="vt-new-and-popular-combined new-and-popular-combined">
+        <h2 class="screenreader-text">New and popular articles</h2>
+        <ul class="articleListNewAndPopularCombinedView">
+                <li>
+                    <a href="javascript:;" class="js-new-and-popular-mode active" data-mode="MostRecent" data-instancename="TOKEN" aria-label="View Latest articles">Latest</a>
+                </li>
+                <li>
+                    <a href="javascript:;" class="js-new-and-popular-mode " data-mode="MostRead" data-instancename="TOKEN" aria-label="View Most Read articles">Most Read</a>
+                </li>
+                <li>
+                    <a href="javascript:;" class="js-new-and-popular-mode " data-mode="MostCited" data-instancename="TOKEN" aria-label="View Most Cited articles">Most Cited</a>
+                </li>
+        </ul>
+            <section class="js-new-and-popular-content js-new-and-popular-content-MostRecent hasContent">
+
+
+
+
+    <div id="newPopularList-Article_TOKEN_ArticleNewPopularCombined" class="fb new-and-popular vt-new-and-popular-Article_TOKEN_ArticleNewPopularCombined">
+
+
+        <div class="widget-dynamic-entry-wrap">
+<div class="widget-dynamic-entry">
+    <div class="fb-item-title">
+                <a href="/neco/article/doi/10.1162/NECO.a.1545/137281/Hierarchical-Active-Inference-Using-Successor">Hierarchical Active Inference Using Successor Representations</a>
+
+
+    </div>
+</div>
+<div class="widget-dynamic-entry">
+    <div class="fb-item-title">
+                <a href="/neco/article/doi/10.1162/NECO.a.1544/137282/TOKEN">A Hidden Markov Model–Inspired Sequence Classification Method for Hyperdimensional Computing</a>
+
+
+    </div>
+</div>
+<div class="widget-dynamic-entry">
+    <div class="fb-item-title">
+                <a href="/neco/article/doi/10.1162/NECO.a.1547/137283/TOKEN">W-Kernel and Its Principal Space for Frequentist Evaluation of Bayesian Estimators</a>
+
+
+    </div>
+</div>
+<div class="widget-dynamic-entry">
+    <div class="fb-item-title">
+                <a href="/neco/article/doi/10.1162/NECO.a.1543/137284/TOKEN">A Model-Free Reinforcement Learning Implementation of Decision Making Under Uncertainty by Sequential Sampling</a>
+
+
+    </div>
+</div>
+        </div>
+    </div>
+            </section>
+            <section class="js-new-and-popular-content js-new-and-popular-content-MostRead hide">
+            </section>
+            <section class="js-new-and-popular-content js-new-and-popular-content-MostCited hide">
+            </section>
+        <div class="spinner hide"></div>
+    </div>
+ 
+    </div>
+
+    </div>
+
+</div> 
+    </div>
+    <div class="widget-DynamicWidgetLayout widget-instance-Article_TOKEN" data-widget-name="DynamicWidgetLayout" data-widget-instance="Article_RightRailB0B4">
+        <div class="widget widget-dynamic article-article-cited-by article-cited-by" data-count="1">
+    
+
+    <div class="widget-dynamic-inner-wrap">
+
+    <div class="widget-ArticleCitedBy widget-instance-Article_TOKEN-article-cited-by" data-widget-name="ArticleCitedBy" data-widget-instance="TOKEN">
+        <div class="rail-widget_wrap vt-articles-cited-by">
+    <h2 class="article-cited-title">Cited By</h2>
+    <div class="widget-links_wrap">
+            <div class="article-cited-link-wrap web-of-science">
+                <a href="https://www.webofscience.com/api/gateway" target="_blank" rel="nofollow">Web of Science (61463)</a>
+            </div>
+                    <div class="article-cited-link-wrap google-scholar-url">
+                <a href="http://scholar.google.com/scholar" target="_blank" rel="nofollow">Google Scholar</a>
+            </div>
+                    <div class="article-cited-link-wrap crossref-citedby">
+                <a href="https://direct.mit.edu/neco/crossref-citedby/6109" rel="nofollow">Crossref (83846)</a>
+            </div>
+    </div>
+</div> 
+    </div>
+
+    </div>
+
+</div> 
+    </div>
+    <div class="widget-DynamicWidgetLayout widget-instance-Article_TOKEN" data-widget-name="DynamicWidgetLayout" data-widget-instance="Article_RightRailB0B5">
+        <div class="widget widget-dynamic article-related-content-solr-articles related-content-solr" data-count="2">
+    
+
+    <div class="widget-dynamic-inner-wrap">
+
+    <div class="widget-RelatedContentSolr widget-instance-Article_TOKEN_RightRail_RelatedContentArticles" data-widget-name="RelatedContentSolr" data-widget-instance="TOKEN">
+            <div class="vt-related-content related-content_wrap rail-widget_wrap">
+        <h2>Related Articles</h2>
+
+        <div class="widget-links_wrap">
+                <div class="article-title">
+                    <a href="/neco/article/12/10/2451/6415/Learning-to-Forget-Continual-Prediction-with-LSTM">Learning to Forget: Continual Prediction with LSTM</a>
+    <div class="content-meta"><span class="j-name">Neural Comput</span> <span class="j-date">(October,2000)</span></div>
+
+                </div>
+                <div class="article-title">
+                    <a href="/neco/article/14/8/1907/6680/Sufficient-Conditions-for-Error-Backflow">Sufficient Conditions for Error Backflow Convergence in Dynamical Recurrent Neural Networks</a>
+    <div class="content-meta"><span class="j-name">Neural Comput</span> <span class="j-date">(August,2002)</span></div>
+
+                </div>
+                <div class="article-title">
+                    <a href="/rest/article/doi/10.1162/REST.a.1708/135190/Identification-of-Semiparametric-Panel-Multinomial">Identification of Semiparametric Panel Multinomial Choice Models with Infinite-Dimensional Fixed Effects</a>
+    <div class="content-meta"><span class="j-name">The Review of Economics and Statistics</span> <span class="j-date">(February,2026)</span></div>
+
+                </div>
+                <div class="article-title">
+                    <a href="/grey/article/doi/10.1162/grey_a_00423/128687/Korean-Writing-in-the-Age-of-Multilingual-Word">Korean Writing in the Age of Multilingual Word Processing: A History
+                    of the Non-Linear Alphabet</a>
+    <div class="content-meta"><span class="j-name">Grey Room</span> <span class="j-date">(April,2025)</span></div>
+
+                </div>
+        </div>
+    </div>
+ 
+    </div>
+
+    </div>
+
+</div> 
+    </div>
+    <div class="widget-DynamicWidgetLayout widget-instance-Article_TOKEN" data-widget-name="DynamicWidgetLayout" data-widget-instance="Article_RightRailB0B6">
+        <div class="widget widget-dynamic article-self-serve-content-ad-bottom self-serve-content-ad-bottom self-serve-content-ad" data-count="1">
+    
+
+    <div class="widget-dynamic-inner-wrap">
+
+
+    </div>
+
+</div> 
+    </div>
+
+    </div>
+
+</div> 
+    </div>
+
+    </div>
+
+</div> 
+    </div>
+
+        </div>
+
+    <div class="widget-AdBlock widget-instance-ArticlePageTopMainBodyBottom" data-widget-name="AdBlock" data-widget-instance="TOKEN">
+        
+ 
+    </div>
+
+
+
+
+    </div> 
+</div>
+
+
+
+    <div class="widget-Lockss widget-instance-Article_Lockss" data-widget-name="Lockss" data-widget-instance="Article_Lockss">
+         
+    </div>
+
+
+
+
+    <div class="widget-VideoListAccess widget-instance-Article_VideoListAccess" data-widget-name="VideoListAccess" data-widget-instance="Article_VideoListAccess">
+         
+    </div>
+
+
+    <div class="widget-ArticleListAccess widget-instance-Article_AccessIconData" data-widget-name="ArticleListAccess" data-widget-instance="Article_AccessIconData">
+        
+
+    <script type="text/javascript"></script>
+ 
+    </div>
+
+
+
+        </div><!---->
+    </section>
+</div>
+<div class="mobile-mask">
+</div>
+<section class="footer_wrap vt-site-footer" role="contentinfo">
+    
+
+
+<div class="ad-banner js-ad-banner ad-banner-footer">
+    <div class="widget-AdBlock widget-instance-FooterAd" data-widget-name="AdBlock" data-widget-instance="FooterAd">
+            <input type="hidden" class="hfAdBlockInfo" data-divid="TOKEN" data-slotname="451444" data-targetname="179758" data-sizes="[[728, 90]]" data-enabled-on-mobile="True" data-adprovider-typeid="2" data-accountid="" data-outofpagead="False" data-sticky-time="5" data-lazyloaded="False" data-position-keyword="" data-position-targeting-key="position" data-skip-size-mapping="False" data-native-placement-id="" data-wps-adsize-number="0" data-wps-network-id="0" data-wps-site-id="0" data-wps-zone-ids="" data-wps-brandlock-keyword="" data-tapnative-aid="" data-tapnative-div-id="" data-suppress-display="false" data-fallback-divid="">
+    <div class="adblock-wrap js-adblock-wrap " style="">
+                <p class="adblock-advertisement-text js-adblock-advertisement-text hide">Advertisement</p>
+
+<div id="placement_TOKEN_adBlockFooter" adslot="451444" class="adblock-slot-placeholder js-adblock" style=""></div>
+
+
+    </div>
+
+ 
+    </div>
+
+</div>
+
+<div class="sticky-footer-ad js-sticky-footer-ad">
+    <div class="widget-AdBlock widget-instance-StickyAd" data-widget-name="AdBlock" data-widget-instance="StickyAd">
+        
+ 
+    </div>
+
+</div>
+
+
+    <div class="widget-SitePageFooter widget-instance-SitePageFooter" data-widget-name="SitePageFooter" data-widget-instance="SitePageFooter">
+            <div class="journal-footer journal-bg">
+        <div class="journal-footer_content clearfix foot-left">
+    <div class="journal-footer-affiliations aff-left">
+        <!---->
+            <a href="" target="">
+                <img id="footer-logo-NeuralComputation" class="journal-footer-affiliations-logo" src="//mitp.silverchair-cdn.com/data/SiteBuilderAssets/Live/Images/neco/NECO_title-691296143.svg" alt="Neural Computation">
+            </a>
+    </div>
+        </div>
+    <div class="journal-footer-colophon">
+        <ul>
+                <li><span>Online ISSN</span> 1530-888X</li>
+                            <li><span>Print ISSN</span> 0899-7667</li>
+                    </ul>
+    </div>
+    </div>
+ 
+    </div>
+
+
+
+<div class="site-theme-footer">
+        <div class="site-theme-footer_content">
+    <div class="widget-SelfServeContent widget-instance-UmbrellaFooterSelfServe" data-widget-name="SelfServeContent" data-widget-instance="UmbrellaFooterSelfServe">
+        
+
+
+
+    <input type="hidden" class="SelfServeContentId" value="">
+    <input type="hidden" class="SelfServeVersionId" value="">
+
+<footer>
+<div class="site-theme-footer">
+<div class="site-theme-footer_content">
+<div class="widget-SelfServeContent widget-instance-UmbrellaFooterSelfServe">
+<div class="site-theme-footer">
+<div class="site-theme-footer_content">
+<div class="widget-SelfServeContent widget-instance-UmbrellaFooterSelfServe">
+<div class="theme-footer">
+<div class="flex-row">
+<div class="col-3 custom footer-branding">
+<div class="footer-logo-wrap">
+<div class="footer-logo">
+<a href="https://direct.mit.edu">
+<img alt="MIT Press Direct, home" src="//mitp.silverchair-cdn.com/UI/app/svg/umbrella/logo.svg">
+</a>
+</div>
+</div>
+<div class="contact-info-wrap">
+<h5 class="mb-1">A product of <a href="https://mitpress.mit.edu" target="_blank">The MIT Press</a></h5>
+<a href="https://mitpress.mit.edu/newsletter/" class="btn mb-1" target="_blank">Newsletter sign up</a>
+</div>
+<div class="social-icons-wrap">
+<ul class="social-icons-list">
+    <!---->
+    <li><a class="social-link" href="https://bsky.app/profile/mitpress.bsky.social" target="_blank"><span class="icon-social-bluesky"></span><span class="screenreader-text">Bluesky</span></a></li>
+    <!---->
+    <li><a class="social-link" href="https://www.facebook.com/mitpress/" target="_blank"><span class="icon-social-facebook"></span><span class="screenreader-text">Facebook</span></a></li>
+    <!---->
+    <li><a class="social-link" href="https://www.instagram.com/mitpress/" target="_blank"><span class="icon-social-instagram"></span><span class="screenreader-text">Instagram</span></a></li>
+    <!---->
+    <li><a class="social-link" href="https://www.linkedin.com/company/the-mit-press/" target="_blank"><span class="icon-social-linkedin"></span><span class="screenreader-text">LinkedIn</span></a></li>
+    <!---->
+    <li><a class="social-link" href="https://twitter.com/mitpress" target="_blank"><span class="icon-social-twitter"></span><span class="screenreader-text">X</span></a></li>
+    <!---->
+    <li><a class="social-link" href="https://www.youtube.com/channel/TOKEN" target="_blank"><span class="icon-social-youtube"></span><span class="screenreader-text">YouTube</span></a></li>
+</ul>
+</div>
+</div>
+<div class="col-9 custom footer-nav">
+<div class="flex-row">
+<div class="col-3">
+<div class="footer-links-group with-header">
+<h3 class="footer-links-header">MIT Press Direct</h3>
+<ul class="list-lvl-0">
+    <li class="list-lvl-0"><a href="/about">About MIT Press Direct</a></li>
+    <li class="list-lvl-0"><a href="/books">Books</a></li>
+    <li class="list-lvl-0"><a href="/journals">Journals</a></li>
+    <li class="list-lvl-0"><a href="/pages/cognet">CogNet</a></li>
+</ul>
+</div>
+</div>
+<div class="col-3">
+<div class="footer-links-group with-header">
+<h3 class="footer-links-header">Information</h3>
+<ul class="list-lvl-0">
+    <li class="list-lvl-0"><a href="https://accessibility.mit.edu/" target="_blank">Accessibility at MIT<br>
+    </a></li>
+    <li class="list-lvl-0"><a href="https://direct.mit.edu/pages/accessibility">MIT Press Direct VPAT</a><a href="/DocumentLibrary/VPAT/TOKEN.docx" target="_blank"> </a></li>
+    <li class="list-lvl-0"><a href="/journals/pages/authors">For Authors</a></li>
+    <li class="list-lvl-0"><a href="/pages/customer_support">For Customers</a></li>
+    <li class="list-lvl-0"><a href="/pages/librarians">For Librarians</a></li>
+    <li class="list-lvl-0"><a href="/books/pages/direct-to-open">Direct to Open</a></li>
+    <li class="list-lvl-0"><a href="/journals/pages/open-access">Open Access</a></li>
+    <li class="list-lvl-0"><a href="https://mitpress.mit.edu/media-inquiries/" target="_blank">Media Inquiries</a></li>
+    <li class="list-lvl-0"><a href="/journals/pages/rights-permissions">Rights and Permissions</a></li>
+    <li class="list-lvl-0"><a href="/journals/pages/advertising-info">For Advertisers</a></li>
+</ul>
+</div>
+</div>
+<div class="col-3">
+<div class="footer-links-group with-header">
+<h3 class="footer-links-header">MIT Press</h3>
+<ul class="list-lvl-0">
+    <li class="list-lvl-0"><a href="https://mitpress.mit.edu/about" target="_blank">About the MIT Press</a></li>
+    <li class="list-lvl-0"><a href="https://thereader.mitpress.mit.edu/" target="_blank">The MIT Press Reader</a></li>
+    <li class="list-lvl-0"><a href="https://mitpress.mit.edu/blog" target="_blank">MIT Press Blog</a></li>
+    <li class="list-lvl-0"><a href="https://mitpress.mit.edu/catalogs" target="_blank">Seasonal Catalogs</a></li>
+    <li class="list-lvl-0"><a href="https://mitpress.mit.edu" target="_blank">MIT Press Home</a></li>
+    <li class="list-lvl-0"><a href="https://mitpress.mit.edu/give-mit-press" target="_blank">Give to the MIT Press</a></li>
+</ul>
+</div>
+</div>
+<div class="col-3">
+<div class="footer-links-group with-header">
+<h3 class="footer-links-header">Contact Us</h3>
+<ul class="list-lvl-0">
+    <li class="list-lvl-0"><a href="/books/pages/User_Guides_and_FAQ">FAQ</a></li>
+    <li class="list-lvl-0"><a href="https://mitpress.atlassian.net/servicedesk/customer/portal/3" target="_blank">Direct Service Desk</a></li>
+</ul>
+</div>
+</div>
+</div>
+</div>
+</div>
+<div class="legal-links-wrap">
+<div class="copyright-date">
+© 2026 The MIT Press
+</div>
+<ul class="legal-links">
+    <li>
+    <a href="https://mitpress.mit.edu/terms-use" target="_blank">Terms of Use</a>
+    </li>
+    <li>
+    <a href="https://mitpress.mit.edu/privacy" target="_blank">Privacy
+    Statement</a>
+    </li>
+    <li>
+    <a href="https://www.crossref.org/" target="_blank">Crossref Member</a>
+    </li>
+    <li>
+    <a href="https://www.projectcounter.org/" target="_blank">COUNTER Member</a>&nbsp;</li>
+    <li class="copyright">The MIT Press colophon is registered in the U.S. Patent and Trademark Office</li>
+</ul>
+</div>
+</div>
+</div>
+</div>
+<!---->
+</div>
+<!----></div>
+</div>
+</div>
+</footer>
+
+
+
+ 
+    </div>
+
+
+
+        </div><!---->
+</div><!---->
+<div class="ss-ui-only">
+
+    <div class="widget-SelfServeContent widget-instance-SSuiOnlySelfServe" data-widget-name="SelfServeContent" data-widget-instance="SSuiOnlySelfServe">
+        
+
+
+
+    <input type="hidden" class="SelfServeContentId" value="">
+    <input type="hidden" class="SelfServeVersionId" value="">
+
+<style type="text/css"></style>
+
+
+
+ 
+    </div>
+
+</div>
+
+<div class="ad-banner js-ad-interstitial">
+    <div class="widget-AdBlock widget-instance-Interstitial" data-widget-name="AdBlock" data-widget-instance="Interstitial">
+        
+ 
+    </div>
+
+</div>
+</section>
+
+
+
+
+
+    
+
+
+
+    <div class="widget-SiteWideModals widget-instance-SiteWideModals" data-widget-name="SiteWideModals" data-widget-instance="SiteWideModals">
+        <div id="revealModal" class="reveal-modal" data-reveal="" aria-hidden="true" aria-live="assertive" tabindex="-1" style="">
+    <div id="revealContent"></div>
+    <a class="close-reveal-modal" href="javascript:;" aria-label="Close modal"><i class="icon-general-close"><span class="screenreader-text">Close Modal</span></i></a>
+</div>
+
+<div id="globalModalContainer" class="modal-global-container" role="dialog" aria-hidden="true" aria-live="assertive" tabindex="-1">
+    <div id="globalModalContent">
+        <div class="js-globalModalPlaceholder"></div>
+    </div>
+    <a href="javascript:;" class="close-modal js-close-modal" role="button" aria-label="Close modal">
+        <i class="icon-general-close" aria-hidden="true"></i>
+        <span class="screenreader-text">Close Modal</span>
+    </a>
+</div>
+<div id="globalModalOverlay" class="modal-overlay js-modal-overlay"></div>
+
+    <div id="NeedSubscription" class="reveal-modal small" data-reveal="" aria-hidden="true" style="">
+            <div class="subscription-needed">
+                <div class="modal-heading">This Feature Is Available To Subscribers Only</div>
+                <p><a class="btn modal-sign_in-btn" href="/sign-in">Sign In</a> or <a class="modal-register-link" href="/my-account/register">Create an Account</a></p>
+            </div>
+
+
+        <a class="close-reveal-modal" href="javascript:;"><i class="icon-general-close"><span class="screenreader-text">Close Modal</span></i></a>
+    </div>
+
+
+<div id="noAccessReveal" class="reveal-modal tiny" data-reveal="" style="" aria-hidden="true">
+    <a class="close-reveal-modal" href="javascript:;" aria-label="Close modal"><i class="icon-general-close"><span class="screenreader-text">Close Modal</span></i></a>
+    <div id="noAccessForm">
+        <div class="spinner"></div>
+    </div>
+</div>
+
+
+<div id="cookieShareModal" class="cookie-share-modal-content" hidden="">
+    <h2 id="cookieShareModalTitle" class="js-modal-label">Sharing Unavailable</h2>
+    <p>Sharing content requires targeting cookies to be enabled. Please update your cookie preferences to use this feature.</p>
+    <div class="cookie-share-modal__actions">
+        <button type="button" class="btn btn-primary js-share-cookie-prefs-btn">Update Cookie Preferences</button>
+        <button type="button" class="btn js-close-modal">Cancel</button>
+    </div>
+</div> 
+    </div>
+
+    
+
+
+
+
+
+
+<script type="text/javascript"></script>
+<script id="MathJax-script" async="" src="//cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+
+
+    <!---->
+    <!---->
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    <script type="text/javascript" src="//mitp.silverchair-cdn.com/Themes/Client/app/jsdist/v-639195065855723107/site.min.js"></script>
+
+
+    
+    
+    <script defer="" src="//cdn.jsdelivr.net/chartist.js/latest/chartist.min.js"></script>
+
+
+
+
+
+
+    
+
+    
+    
+
+
+    <div class="widget-GdprCookieBanner widget-instance-GdprCookieBanner" data-widget-name="GdprCookieBanner" data-widget-instance="GdprCookieBanner">
+        <div class="gdpr-cookie-wrapper js-gdpr-banner at-gdprprompt" role="region" aria-label="Cookie consent">
+    <div class="gdpr-cookie-body">
+        This site uses cookies. By continuing to use our website, you are agreeing to <a href="https://direct.mit.edu/DocumentLibrary/MITP%20Direct%20PRIVACY%20POLICY%202019-02-26.pdf">our privacy policy.</a> No content on this site may be used to train artificial intelligence systems without permission in writing from the MIT Press.
+    </div>
+    <div class="gdpr-cookie-links_wrap">
+        <a href="javascript:;" class="js-gdpr-cookie-acceptLink at-acceptgdpr" aria-label="Accept cookie consent">Accept</a>
+    </div>
+            <input id="hdnDomain" type="hidden" value="">
+
+    <input id="hdnDomainGdpr" type="hidden" value="">
+    <input id="hdnClientIdGdpr" type="hidden" value="">
+</div> 
+    </div>
+
+
+    <div class="ad-banner js-ad-riser ad-banner-riser" role="region" aria-label="Advertisement">
+    <div class="widget-AdBlock widget-instance-RiserAd" data-widget-name="AdBlock" data-widget-instance="RiserAd">
+        
+ 
+    </div>
+
+    </div>
+
+
+
+            
+    <div class="end-of-page-js"></div>
+
+
+
+
+<script id="" text="" charset="" type="text/javascript" src="https://www.googletagmanager.com/gtag/js"></script><script type="text/javascript" id="" charset=""></script><script type="text/javascript" id="mcjs" charset=""></script>
+<script type="text/javascript" id="" charset=""></script>
+<script src="https://form-assets.mailchimp.com/snippet/account/3224650" type="text/javascript"></script><div style=""><div style=""></div><div class="TOKEN-recaptcha-bubble-arrow" style=""></div><div class="TOKEN-recaptcha-bubble-arrow" style=""></div><div style=""><iframe title="recaptcha challenge expires in two minutes" name="c-ynyieltiszyi" frameborder="0" scrolling="no" sandbox="allow-forms allow-popups allow-same-origin allow-scripts allow-top-navigation allow-modals TOKEN TOKEN" src="https://www.google.com/recaptcha/api2/bframe" style=""></iframe></div></div></body></html>

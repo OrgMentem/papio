@@ -16,10 +16,12 @@ import {
   renderPageAcquire,
   refresh,
   renderResolverGrants,
+  wireCapture,
   wireSettings,
   type PopupActions,
 } from "../src/popup";
 import type { ActiveJob } from "../src/state";
+import { PROVIDERS, SCENARIOS } from "../src/capture";
 
 function popupDocument(): Document {
   const window = new Window();
@@ -90,6 +92,15 @@ test("renders a batch with needs-you first and correct phase counts", () => {
   expect(doc.querySelector("#done-section")?.hasAttribute("open")).toBe(false);
   expect(doc.querySelector("#failed-section")?.hasAttribute("open")).toBe(false);
   expect(doc.getElementById("capture-btn")).not.toBeNull();
+});
+
+test("capture selects offer every registered provider and scenario", () => {
+  const doc = popupDocument();
+  wireCapture(doc);
+  const values = (id: string): string[] =>
+    Array.from(doc.querySelectorAll<HTMLOptionElement>(`#${id} option`)).map((o) => o.value);
+  expect(values("capture-provider")).toEqual([...PROVIDERS]);
+  expect(values("capture-scenario")).toEqual([...SCENARIOS]);
 });
 
 test("renders daemon connection and compatibility states", () => {

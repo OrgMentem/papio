@@ -287,6 +287,297 @@ test("sage stays unknown without the publication_doi + downloadPdfUrl signals", 
   expect(interpret(page, spec, ctx()).kind).toBe("unknown");
 });
 
+const halArticle = loadFixture("hal", "success");
+test.skipIf(halArticle === null)(
+  "captured HAL record classifies as article through citation_pdf_url",
+  () => {
+    const spec = adapters.find((a) => a.id === "hal") as AdapterSpec;
+    const verdict = interpret(halArticle as Document, spec, ctx("Deep learning"));
+    expect(verdict.kind).toBe("article");
+    expect(verdict.adapter_id).toBe("hal");
+    expect(spec.download?.method).toBe("meta");
+  },
+);
+
+test("HAL records without a deposited document stay unknown", () => {
+  const spec = adapters.find((a) => a.id === "hal") as AdapterSpec;
+  const page = parseHTML(
+    "<html><head><meta name='citation_title' content='Metadata-only record'>" +
+      "<meta name='citation_doi' content='10.1000/no-file'></head></html>",
+  );
+  expect(interpret(page, spec, ctx()).kind).toBe("unknown");
+});
+
+const natureArticle = loadFixture("nature", "success");
+test.skipIf(natureArticle === null)(
+  "captured Nature OA article classifies on access metadata and its PDF control",
+  () => {
+    const spec = adapters.find((a) => a.id === "nature") as AdapterSpec;
+    const verdict = interpret(natureArticle as Document, spec, ctx());
+    expect(verdict.kind).toBe("article");
+    expect(spec.download?.method).toBe("href");
+  },
+);
+
+const naturePaywall = loadFixture("nature", "no-entitlement");
+test.skipIf(naturePaywall === null)(
+  "captured Nature subscription preview is not mistaken for an article",
+  () => {
+    const spec = adapters.find((a) => a.id === "nature") as AdapterSpec;
+    const verdict = interpret(naturePaywall as Document, spec, ctx());
+    expect(verdict.kind).toBe("no_entitlement");
+  },
+);
+
+const thiemeArticle = loadFixture("thieme", "success");
+test.skipIf(thiemeArticle === null)(
+  "captured Thieme full-text page classifies through rendered body and PDF anchor",
+  () => {
+    const spec = adapters.find((a) => a.id === "thieme") as AdapterSpec;
+    const verdict = interpret(thiemeArticle as Document, spec, ctx());
+    expect(verdict.kind).toBe("article");
+    expect(spec.download?.method).toBe("href");
+  },
+);
+
+const thiemeAbstract = loadFixture("thieme", "drift");
+test.skipIf(thiemeAbstract === null)(
+  "captured Thieme abstract route stays assisted despite universal PDF metadata",
+  () => {
+    const spec = adapters.find((a) => a.id === "thieme") as AdapterSpec;
+    expect(interpret(thiemeAbstract as Document, spec, ctx()).kind).toBe("unknown");
+  },
+);
+
+const cambridgeArticle = loadFixture("cambridge", "success");
+test.skipIf(cambridgeArticle === null)(
+  "captured Cambridge journal article classifies through its action-bar PDF controls",
+  () => {
+    const spec = adapters.find((a) => a.id === "cambridge") as AdapterSpec;
+    expect(interpret(cambridgeArticle as Document, spec, ctx()).kind).toBe("article");
+    expect(spec.download?.method).toBe("href");
+  },
+);
+
+const cambridgePaywall = loadFixture("cambridge", "no-entitlement");
+test.skipIf(cambridgePaywall === null)(
+  "captured Cambridge purchase wall wins despite citation_pdf_url metadata",
+  () => {
+    const spec = adapters.find((a) => a.id === "cambridge") as AdapterSpec;
+    expect(interpret(cambridgePaywall as Document, spec, ctx()).kind).toBe("no_entitlement");
+  },
+);
+
+test("Cambridge book-shaped pages stay outside the journal adapter", () => {
+  const spec = adapters.find((a) => a.id === "cambridge") as AdapterSpec;
+  const page = parseHTML(
+    "<html><head><meta name='citation_inbook_title' content='A book'>" +
+      "</head><body><button data-test-id='buttonSavePDFOptions'></button>" +
+      "<a href='/core/services/aop-cambridge-core/content/view/ID/book.pdf'>PDF</a></body></html>",
+  );
+  expect(interpret(page, spec, ctx()).kind).toBe("unknown");
+});
+
+const emeraldArticle = loadFixture("emerald", "success");
+test.skipIf(emeraldArticle === null)(
+  "captured Emerald OA page classifies through its real PDF anchor",
+  () => {
+    const spec = adapters.find((a) => a.id === "emerald") as AdapterSpec;
+    expect(interpret(emeraldArticle as Document, spec, ctx()).kind).toBe("article");
+    expect(spec.download?.method).toBe("href");
+  },
+);
+
+const emeraldPaywall = loadFixture("emerald", "no-entitlement");
+test.skipIf(emeraldPaywall === null)(
+  "captured Emerald No License turnaway classifies as no entitlement",
+  () => {
+    const spec = adapters.find((a) => a.id === "emerald") as AdapterSpec;
+    expect(interpret(emeraldPaywall as Document, spec, ctx()).kind).toBe("no_entitlement");
+  },
+);
+
+const tandfArticle = loadFixture("tandfonline", "success");
+test.skipIf(tandfArticle === null)(
+  "captured Taylor and Francis OA journal page classifies through its direct PDF control",
+  () => {
+    const spec = adapters.find((a) => a.id === "tandfonline") as AdapterSpec;
+    expect(interpret(tandfArticle as Document, spec, ctx()).kind).toBe("article");
+    expect(spec.download?.method).toBe("href");
+  },
+);
+
+const tandfPaywall = loadFixture("tandfonline", "no-entitlement");
+test.skipIf(tandfPaywall === null)(
+  "captured Taylor and Francis Access Denial page classifies as no entitlement",
+  () => {
+    const spec = adapters.find((a) => a.id === "tandfonline") as AdapterSpec;
+    expect(interpret(tandfPaywall as Document, spec, ctx()).kind).toBe("no_entitlement");
+  },
+);
+
+test("Taylor and Francis book metadata is outside the journal adapter host scope", () => {
+  const spec = adapters.find((a) => a.id === "tandfonline") as AdapterSpec;
+  expect(spec.hosts).not.toContain("taylorfrancis.com");
+});
+
+const psycnetArticle = loadFixture("psycnet", "success");
+test.skipIf(psycnetArticle === null)(
+  "captured PsycNet full-text page classifies through its rendered PDF control",
+  () => {
+    const spec = adapters.find((a) => a.id === "psycnet") as AdapterSpec;
+    expect(interpret(psycnetArticle as Document, spec, ctx()).kind).toBe("article");
+    expect(spec.download?.method).toBe("href");
+  },
+);
+
+const psycnetPaywall = loadFixture("psycnet", "no-entitlement");
+test.skipIf(psycnetPaywall === null)(
+  "captured PsycNet record with Get Access classifies as no entitlement",
+  () => {
+    const spec = adapters.find((a) => a.id === "psycnet") as AdapterSpec;
+    expect(interpret(psycnetPaywall as Document, spec, ctx()).kind).toBe("no_entitlement");
+  },
+);
+
+const annualReviewsArticle = loadFixture("annualreviews", "success");
+test.skipIf(annualReviewsArticle === null)(
+  "captured Annual Reviews OA page classifies through its PDF POST control",
+  () => {
+    const spec = adapters.find((a) => a.id === "annualreviews") as AdapterSpec;
+    expect(interpret(annualReviewsArticle as Document, spec, ctx()).kind).toBe("article");
+    expect(spec.download?.method).toBe("click");
+  },
+);
+
+test("Annual Reviews PDF controls without the OA marker stay assisted", () => {
+  const spec = adapters.find((a) => a.id === "annualreviews") as AdapterSpec;
+  const page = parseHTML(
+    "<html><head><meta name='citation_title' content='Closed review'></head>" +
+      "<body><div id='html_fulltext'></div>" +
+      "<form class='ft-download-content__form--pdf'><a aria-label='Download PDF'></a></form></body></html>",
+  );
+  expect(interpret(page, spec, ctx()).kind).toBe("unknown");
+});
+
+const oupArticle = loadFixture("oup", "success");
+test.skipIf(oupArticle === null)(
+  "captured Oxford Academic OA article classifies through its PDF action",
+  () => {
+    const spec = adapters.find((a) => a.id === "oup") as AdapterSpec;
+    expect(interpret(oupArticle as Document, spec, ctx()).kind).toBe("article");
+    expect(spec.download?.method).toBe("href");
+  },
+);
+
+const oupPaywall = loadFixture("oup", "no-entitlement");
+test.skipIf(oupPaywall === null)(
+  "captured Oxford Academic abstract paywall classifies as no entitlement",
+  () => {
+    const spec = adapters.find((a) => a.id === "oup") as AdapterSpec;
+    expect(interpret(oupPaywall as Document, spec, ctx()).kind).toBe("no_entitlement");
+  },
+);
+
+const mitPressArticle = loadFixture("mitpress", "success");
+test.skipIf(mitPressArticle === null)(
+  "captured MIT Press OA article classifies through its PDF action",
+  () => {
+    const spec = adapters.find((a) => a.id === "mitpress") as AdapterSpec;
+    expect(interpret(mitPressArticle as Document, spec, ctx()).kind).toBe("article");
+    expect(spec.download?.method).toBe("href");
+  },
+);
+
+const mitPressPaywall = loadFixture("mitpress", "no-entitlement");
+test.skipIf(mitPressPaywall === null)(
+  "captured MIT Press purchase wall classifies as no entitlement",
+  () => {
+    const spec = adapters.find((a) => a.id === "mitpress") as AdapterSpec;
+    expect(interpret(mitPressPaywall as Document, spec, ctx()).kind).toBe("no_entitlement");
+  },
+);
+
+const bmjArticle = loadFixture("bmj", "success");
+test.skipIf(bmjArticle === null)(
+  "captured BMJ Open article classifies through its explicit OA PDF action",
+  () => {
+    const spec = adapters.find((a) => a.id === "bmj") as AdapterSpec;
+    expect(interpret(bmjArticle as Document, spec, ctx()).kind).toBe("article");
+    expect(spec.download?.method).toBe("href");
+  },
+);
+
+test("BMJ PDF metadata without explicit open access stays assisted", () => {
+  const spec = adapters.find((a) => a.id === "bmj") as AdapterSpec;
+  const page = parseHTML(
+    "<html><head><meta name='citation_doi' content='10.1136/closed'>" +
+      "<meta name='citation_pdf_url' content='https://bmj.com/content/closed.full.pdf'></head>" +
+      "<body><a class='article-pdf-download' href='/content/closed.full.pdf'>PDF</a></body></html>",
+  );
+  expect(interpret(page, spec, ctx()).kind).toBe("unknown");
+});
+
+const psychiatryArticle = loadFixture("psychiatryonline", "success");
+test.skipIf(psychiatryArticle === null)(
+  "captured PsychiatryOnline full-access article classifies through its PDF action",
+  () => {
+    const spec = adapters.find((a) => a.id === "psychiatryonline") as AdapterSpec;
+    expect(interpret(psychiatryArticle as Document, spec, ctx()).kind).toBe("article");
+    expect(spec.download?.method).toBe("href");
+  },
+);
+
+const psychiatryPaywall = loadFixture("psychiatryonline", "no-entitlement");
+test.skipIf(psychiatryPaywall === null)(
+  "captured PsychiatryOnline no-access article overrides its PDF-shaped link",
+  () => {
+    const spec = adapters.find((a) => a.id === "psychiatryonline") as AdapterSpec;
+    expect(interpret(psychiatryPaywall as Document, spec, ctx()).kind).toBe("no_entitlement");
+  },
+);
+
+const jamaArticle = loadFixture("jamanetwork", "success");
+test.skipIf(jamaArticle === null)(
+  "captured free JAMA article classifies through its access-checked PDF control",
+  () => {
+    const spec = adapters.find((a) => a.id === "jamanetwork") as AdapterSpec;
+    expect(interpret(jamaArticle as Document, spec, ctx()).kind).toBe("article");
+    expect(spec.download?.method).toBe("click");
+  },
+);
+
+test("JAMA PDF controls without a Free or Open Access marker stay assisted", () => {
+  const spec = adapters.find((a) => a.id === "jamanetwork") as AdapterSpec;
+  const page = parseHTML(
+    "<html><head><meta name='citation_doi' content='10.1001/closed'></head>" +
+      "<body><div class='article-full-text' data-userhasaccess='True'></div>" +
+      "<a id='pdf-link' class='pdfaccess' data-article-url='/article.pdf' " +
+      "data-ajax-url='/Content/CheckPdfAccess'>PDF</a></body></html>",
+  );
+  expect(interpret(page, spec, ctx()).kind).toBe("unknown");
+});
+
+const lwwArticle = loadFixture("lww", "success");
+test.skipIf(lwwArticle === null)(
+  "captured LWW full-text article classifies through its wkhealth PDF metadata",
+  () => {
+    const spec = adapters.find((a) => a.id === "lww") as AdapterSpec;
+    expect(interpret(lwwArticle as Document, spec, ctx()).kind).toBe("article");
+    expect(spec.download?.method).toBe("meta");
+  },
+);
+
+test("LWW PDF metadata without a rendered full-text body stays assisted", () => {
+  const spec = adapters.find((a) => a.id === "lww") as AdapterSpec;
+  const page = parseHTML(
+    "<html><head><meta name='wkhealth_doi' content='10.1097/closed'>" +
+      "<meta name='wkhealth_pdf_url' content='https://journals.lww.com/downloadpdf.aspx'></head>" +
+      "<body><article id='ej-article-view'><section>Abstract only</section></article></body></html>",
+  );
+  expect(interpret(page, spec, ctx()).kind).toBe("unknown");
+});
+
 // ProQuest "Find your institution" wall (fixtures/proquest/login-return.html,
 // captured live via CDP): Example University routes heavily through ProQuest, and without a
 // ProQuest session it blocks the article behind an institution-selection form.
