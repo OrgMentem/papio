@@ -8,7 +8,7 @@ so older sections below include extension entries. The initial release entry
 is synthesized from the complete `papio` and `zotio` Git histories and the
 execution records in `notes/acquisition-stack-plan.md`.
 
-## [Unreleased]
+## [0.7.0] - 2026-07-20
 
 ### Added
 
