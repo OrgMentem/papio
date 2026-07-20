@@ -114,6 +114,19 @@ Deploy = `brew upgrade --cask papio` (or let the tap do it) → `papio daemon
 stop` → any command autostarts the new daemon and runs pending schema
 migrations. Verify with `papio daemon status` + `papio doctor`.
 
+**A papio deploy has THREE binary locations, and the third one bites.**
+`papio native-host install` pins `~/.config/papio/bin/papio-native-host` as a
+symlink to whichever `papio` binary ran the install (e.g. `~/.local/bin/papio`)
+— NOT the Homebrew path. The browser-facing native host is a
+frame-validating hop: a stale one accepts `hello`, proxies the NEW daemon's
+`hello_ack` (so the extension enables new features), then drops the session
+on the first frame type it predates — the popup flashes an error and shows
+"daemon isn't reachable" while `papio daemon status` says ok. The hello_ack
+feature contract does not cover this hop. After deploying a binary with
+protocol changes, also refresh the symlink target (`ls -la
+~/.config/papio/bin/`) and kill the running `papio-native-host` process so
+the browser respawns it on the new binary.
+
 ## Protocol bump policy
 
 Keep additive optional fields on `papio-browser/1`. Update both parsers, the

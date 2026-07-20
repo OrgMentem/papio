@@ -168,7 +168,7 @@ export interface BridgeDeps {
     get(windowID: number): Promise<WindowInfo>;
     update(
       windowID: number,
-      props: { focused?: boolean; state?: "normal" },
+      props: { focused?: boolean; state?: "normal" | "minimized" },
     ): Promise<unknown>;
   };
   downloads: {
@@ -643,6 +643,16 @@ export class Bridge {
       focused: false,
       state: visible ? "normal" : "minimized",
     });
+    // macOS Firefox often ignores `state`/`focused` at creation time
+    // (bugzilla 1271047): the "minimized" work window arrives front and
+    // center. Re-asserting the state after creation is the reliable form.
+    if (!visible && created.id !== undefined && created.state !== "minimized") {
+      try {
+        await windows.update(created.id, { focused: false, state: "minimized" });
+      } catch {
+        // Cosmetic only: a visible work window still brokers correctly.
+      }
+    }
     if (created.id !== undefined) {
       const windowID = created.id;
       await this.update((s) => ({ ...s, workWindowID: windowID }));
