@@ -1413,3 +1413,43 @@ test("disabling the work-window setting restores the legacy visible handoff", as
   expect(h.tabs.created).toEqual([{ url: OPENURL, active: true }]);
   expect(h.backend.store.workWindowID).toBeUndefined();
 });
+
+test("an HTML adapter download is refused, discarded, and reported as download_not_pdf", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(jobOffer("job_0020_html_trap"));
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+
+  // The provider served its "get access" page where the PDF should be —
+  // adopting it would only bounce off the daemon's %PDF validation.
+  await h.downloads.onCreated.emit({ id: 7, tabId: tabID, state: "in_progress" });
+  h.downloads.items.set(7, {
+    id: 7,
+    tabId: tabID,
+    filename: "/Users/x/Downloads/1071181319631264.pdf",
+    fileSize: 48210,
+    mime: "text/html",
+    state: "complete",
+  });
+  await h.downloads.onChanged.emit({ id: 7, state: { current: "complete" } });
+
+  expect(h.frames().some((f) => f.type === "download_started")).toBe(false);
+  expect(h.frames().some((f) => f.type === "download_complete")).toBe(false);
+  const error = h.frames().find((f) => f.type === "error");
+  expect(error?.job_id).toBe("job_0020_html_trap");
+  expect(error?.payload["code"]).toBe("download_not_pdf");
+  expect(h.downloads.removedFiles).toContain(7);
+
+  // A genuine PDF on the same job afterwards still adopts normally.
+  await h.downloads.onCreated.emit({ id: 8, tabId: tabID, state: "in_progress" });
+  h.downloads.items.set(8, {
+    id: 8,
+    tabId: tabID,
+    filename: "/Users/x/Downloads/real.pdf",
+    fileSize: 91,
+    mime: "application/pdf",
+    state: "complete",
+  });
+  await h.downloads.onChanged.emit({ id: 8, state: { current: "complete" } });
+  expect(h.frames().some((f) => f.type === "download_complete")).toBe(true);
+});

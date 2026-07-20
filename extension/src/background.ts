@@ -1567,6 +1567,12 @@ export class Bridge {
 
   /** Remove a non-PDF direct attempt and return to the established tab flow. */
   private async discardDirectOffer(jobID: string, downloadID: number): Promise<void> {
+    await this.discardDownload(jobID, downloadID);
+    await this.fallbackToOfferTab(jobID);
+  }
+
+  /** Erase a download we refuse to adopt: tracking, file, and history entry. */
+  private async discardDownload(jobID: string, downloadID: number): Promise<void> {
     this.downloads.delete(jobID);
     try {
       await this.deps.downloads.removeFile(downloadID);
@@ -1578,7 +1584,6 @@ export class Bridge {
     } catch {
       // Clearing history is best-effort; opening the human-visible fallback is not.
     }
-    await this.fallbackToOfferTab(jobID);
   }
 
   /** Convert a failed download-first attempt into the normal handoff flow. */
@@ -2379,12 +2384,25 @@ export class Bridge {
 
     const found = await this.deps.downloads.search({ id: delta.id });
     const item = found[0];
+    const mime = item?.mime?.split(";", 1)[0]?.trim().toLowerCase();
     if (track.directOffer) {
-      const mime = item?.mime?.split(";", 1)[0]?.trim().toLowerCase();
       if (mime !== "application/pdf") {
         await this.discardDirectOffer(owner.job_id, delta.id);
         return;
       }
+    } else if (mime === "text/html" || mime === "application/xhtml+xml") {
+      // The provider served a web page where the PDF should be — the classic
+      // no-entitlement wrapper (SAGE "get access"). Adopting it would only
+      // bounce off the daemon's %PDF validation and burn a round trip, so
+      // refuse here, discard the file, and tell the daemon why. The job stays
+      // parked with its human actions; the tab stays for the human.
+      await this.discardDownload(owner.job_id, delta.id);
+      this.send(
+        "error",
+        { code: "download_not_pdf", message: "provider served HTML where a PDF was expected (likely no entitlement)" },
+        owner.job_id,
+      );
+      return;
     }
     if (!item) return;
     const rawName = item.filename ?? delta.filename?.current ?? "";
