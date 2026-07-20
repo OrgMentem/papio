@@ -14,6 +14,7 @@ const (
 	failureDefaultLimit = 50
 	failureMaxLimit     = 200
 	failureReasonLimit  = 80
+	failureCutoffPad    = 5 * time.Second
 )
 
 // FailureGroup describes a recurring acquisition outcome and a recent example.
@@ -49,8 +50,13 @@ func (js *Store) Failures(ctx context.Context, since time.Time, limit int) ([]Fa
 		         '{}'
 		       ) AS detail_json
 		FROM jobs j
-		WHERE j.state IN ('failed', 'unavailable', 'needs_review', 'awaiting_human')`
-	rows, err := js.S.DB().QueryContext(ctx, query)
+		WHERE j.state IN ('failed', 'unavailable', 'needs_review', 'awaiting_human')
+		  AND (? = '' OR julianday(j.updated_at) >= julianday(?))`
+	coarseCutoff := ""
+	if !since.IsZero() {
+		coarseCutoff = since.Add(-failureCutoffPad).UTC().Format(time.RFC3339Nano)
+	}
+	rows, err := js.S.DB().QueryContext(ctx, query, coarseCutoff, coarseCutoff)
 	if err != nil {
 		return nil, err
 	}

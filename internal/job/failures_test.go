@@ -62,6 +62,16 @@ func TestFailures(t *testing.T) {
 			want:  []FailureGroup{{State: StateUnavailable, Provider: "-", Reason: "new", Count: 1}},
 		},
 		{
+			name: "excludes failures well before the cutoff",
+			setup: func(t *testing.T, js *Store) []string {
+				old := createFailure(t, js, "failures-well-before-cutoff", StateFailed, "old", nil, false)
+				setFailureUpdatedAt(t, js, old, "2026-01-01T00:00:00Z")
+				return nil
+			},
+			since: time.Date(2026, time.January, 15, 0, 0, 0, 0, time.UTC),
+			want:  []FailureGroup{},
+		},
+		{
 			name: "uses terminal reason when transition detail omits it",
 			setup: func(t *testing.T, js *Store) []string {
 				createFailureWithTerminalReason(t, js, "failures-terminal-reason", StateUnavailable, "no viable candidates")

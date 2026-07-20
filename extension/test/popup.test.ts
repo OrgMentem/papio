@@ -166,8 +166,10 @@ test("reads page-acquire capability from the live worker", async () => {
   expect(requests).toEqual([{ channel: "papio", action: "get_capabilities" }]);
 });
 
-test("refresh gates acquisition from the live worker, not persisted features", async () => {
+test("refreshes live capability when negotiation completes", async () => {
   const doc = popupDocument();
+  let pageAcquireAvailable = false;
+  let onChanged: ((changes: unknown, areaName: string) => unknown) | undefined;
   Object.assign(globalThis, {
     chrome: {
       storage: {
@@ -181,14 +183,23 @@ test("refresh gates acquisition from the live worker, not persisted features", a
           }),
         },
         local: { get: async () => ({}) },
+        onChanged: {
+          addListener: (listener: (changes: unknown, areaName: string) => unknown) => {
+            onChanged = listener;
+          },
+        },
       },
-      runtime: { sendMessage: async () => ({ page_acquire: false }) },
+      runtime: { sendMessage: async () => ({ page_acquire: pageAcquireAvailable }) },
       permissions: { contains: async () => false },
     },
   });
 
   await refresh();
   expect(doc.getElementById("page-acquire")?.hidden).toBe(true);
+
+  pageAcquireAvailable = true;
+  await onChanged?.({ papio_state_v1: {} }, "session");
+  expect(doc.getElementById("page-acquire")?.hidden).toBe(false);
 });
 
 test("disables page acquisition when the current page has no DOI", async () => {

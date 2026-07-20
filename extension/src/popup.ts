@@ -441,7 +441,27 @@ export function renderPageAcquire(
   });
 }
 
+let capabilityWatcherBound = false;
+
+/** Re-query the live worker when persisted bridge state changes after hello_ack. */
+function watchLiveCapability(): void {
+  if (capabilityWatcherBound) return;
+  const onChanged = chrome.storage.onChanged;
+  if (onChanged === undefined) return;
+  capabilityWatcherBound = true;
+  onChanged.addListener((changes, areaName) => {
+    if (
+      (areaName !== "session" && areaName !== "local") ||
+      !("papio_state_v1" in changes)
+    ) {
+      return;
+    }
+    return refresh();
+  });
+}
+
 export async function refresh(): Promise<void> {
+  watchLiveCapability();
   const [store, pageAcquireEnabled] = await Promise.all([
     chromeBackend(chrome.storage).load(),
     livePageAcquireAvailable(),
