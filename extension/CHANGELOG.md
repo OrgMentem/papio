@@ -14,6 +14,20 @@ History before 0.3.1 was recorded in the root `CHANGELOG.md` (the extension
 and daemon shared a version stream through 0.3.0); see its `[0.3.0]` section
 for the full pre-split extension history.
 
+## [0.4.3] - 2026-07-20
+
+### Fixed
+
+- The options page now requests host access for every registered adapter,
+  keeping provider support and Firefox runtime grants in sync.
+- Assisted downloads are attributed through the complete adapter registry when
+  exactly one tracked job matches the provider host; ambiguous downloads remain
+  unowned.
+- Firefox now ignores broad native/manual download correlation because it
+  cannot steer those files into papio's adoption directory; only exact
+  extension-started downloads are acknowledged, so assisted controls remain
+  manual while direct extension-API downloads remain automatic.
+
 ## [0.4.2] - 2026-07-20
 
 ### Fixed

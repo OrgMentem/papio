@@ -1681,15 +1681,20 @@ export class Bridge {
     } catch {
       return;
     }
+    const adapter = this.deps.adapterSpecs.find((candidate) => hostMatches(host, candidate.hosts));
+    // The registry is source-controlled and may cover hosts omitted from the
+    // capped offer list. Persist its identity before any permission-dependent
+    // classification so later native download events can safely correlate it.
+    if (adapter !== undefined && job.adapter_id !== adapter.id) {
+      await this.update((s) => patchJob(s, job.job_id, { adapter_id: adapter.id }));
+    }
     const successfulLanding = change.status === "complete" && !isAuthenticationURL(url);
     if (successfulLanding) await this.recordUsableSession(this.deps.now());
     if (change.status === "complete" && (await this.maybeRouteResolver(job, url))) return;
     // The offer's provider_hosts list is capped by the protocol (20 entries);
     // the adapter registry is the authoritative host source for classification,
     // so a tracked handoff landing on any registered family is on-provider.
-    const onProvider =
-      hostMatches(host, job.provider_hosts) ||
-      this.deps.adapterSpecs.some((candidate) => hostMatches(host, candidate.hosts));
+    const onProvider = hostMatches(host, job.provider_hosts) || adapter !== undefined;
     if (!onProvider) {
       // Chrome exposes its built-in PDF viewer as an internal extension URL.
       // Reuse the durable resolver-provided offer URL that produced that viewer.
@@ -1780,6 +1785,7 @@ export class Bridge {
   private async maybeDownloadPDFViewer(jobID: string, url: string, knownPDFViewer = false): Promise<void> {
     let job = findByJob(this.store, jobID);
     if (!job || (job.status !== "accepted" && job.status !== "awaiting_download")) return;
+    if (this.isFirefoxClickDownload(job)) return;
     if (job.download_initiated === true || this.downloads.has(jobID)) return;
 
     let viewer = knownPDFViewer;
@@ -1843,6 +1849,7 @@ export class Bridge {
     // that clicked (download_initiated) but has no real download yet.
     const candidates = this.store.activeJobs.filter((j) => {
       if (this.downloads.has(j.job_id)) return false;
+      if (this.isFirefoxClickDownload(j)) return false;
       if (j.status !== "accepted" && j.status !== "awaiting_download") return false;
       if (openerTabId !== undefined && j.tab_id === openerTabId) return true;
       return openerTabId === undefined && j.download_initiated === true && hostMatches(host, j.provider_hosts);
@@ -1922,6 +1929,24 @@ export class Bridge {
       return false;
     }
   }
+  /** Firefox cannot steer a native click download into papio/<job>, so a click
+   * adapter must remain human-assisted there. Direct API downloads carry their
+   * own filename and are unaffected. */
+  private isFirefoxClickDownload(job: ActiveJob): boolean {
+    if (this.deps.downloads.onDeterminingFilename !== undefined || job.adapter_id === undefined) return false;
+    const spec = this.deps.adapterSpecs.find((candidate) => candidate.id === job.adapter_id);
+    return spec?.download?.method === "click";
+  }
+
+  /** A manual browser download may originate from an offer host or from a
+   * source-controlled adapter host that was recorded on the tracked landing. */
+  private matchesManualDownloadHost(job: ActiveJob, host: string): boolean {
+    if (hostMatches(host, job.provider_hosts)) return true;
+    if (job.adapter_id === undefined) return false;
+    const spec = this.deps.adapterSpecs.find((candidate) => candidate.id === job.adapter_id);
+    return spec !== undefined && hostMatches(host, spec.hosts);
+  }
+
 
   /**
    * Classify the tracked tab's current provider page with the single injected
@@ -2123,7 +2148,11 @@ export class Bridge {
     switch (verdict.kind) {
       case "article": {
         const dl = spec.download;
-        if (dl && job.download_initiated !== true) {
+        if (
+          dl &&
+          job.download_initiated !== true &&
+          !(dl.method === "click" && this.deps.downloads.onDeterminingFilename === undefined)
+        ) {
           if ((dl.method === "url" || dl.method === "api" || dl.method === "meta") && dl.requiresTermsConsent === true) {
             const consent = await this.deps.settings.getTermsConsent();
             if (consent !== "accept") {
@@ -2304,12 +2333,18 @@ export class Bridge {
   }
 
   private correlate(item: DownloadItemLike): ActiveJob | undefined {
+    // Firefox cannot relocate native/manual downloads into papio/<job>. Only
+    // exact IDs/URLs registered by downloads.download are safe there; those
+    // bypass this broad tab/host correlation path.
+    if (this.deps.downloads.onDeterminingFilename === undefined) return undefined;
     if (typeof item.tabId === "number") {
       const byTab = findByTab(this.store, item.tabId);
-      if (byTab) return byTab;
-      // Fall through: provider viewers often download from a child tab the
-      // extension did not create; host matching below still requires the
-      // download to originate from an advertised provider host.
+      if (byTab) {
+        if (this.isFirefoxClickDownload(byTab)) return undefined;
+        return byTab;
+      }
+      // extension did not create; host matching below requires an advertised
+      // provider host or the job's persisted registry adapter.
     }
     const src = item.referrer ?? item.finalUrl ?? item.url;
     if (src === undefined || src.length === 0) return undefined;
@@ -2320,13 +2355,15 @@ export class Bridge {
       return undefined;
     }
     const initiated = this.store.activeJobs.filter((job) => {
-      if (job.download_initiated !== true || job.adapter_id === undefined) return false;
+      if (this.isFirefoxClickDownload(job) || job.download_initiated !== true || job.adapter_id === undefined) return false;
       const spec = this.deps.adapterSpecs.find((candidate) => candidate.id === job.adapter_id);
       return spec !== undefined && hostMatches(host, spec.hosts);
     });
     if (initiated.length === 1) return initiated[0];
     if (initiated.length > 1) return undefined;
-    const matches = this.store.activeJobs.filter((job) => hostMatches(host, job.provider_hosts));
+    const matches = this.store.activeJobs.filter(
+      (job) => !this.isFirefoxClickDownload(job) && this.matchesManualDownloadHost(job, host),
+    );
     return matches.length === 1 ? matches[0] : undefined;
   }
 

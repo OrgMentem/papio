@@ -213,7 +213,7 @@ interface Harness {
 
 function makeHarness(
   seed?: StoreShape,
-  opts?: { windows?: boolean; workWindowEnabled?: boolean },
+  opts?: { windows?: boolean; workWindowEnabled?: boolean; firefox?: boolean },
 ): Harness {
   const port = new FakePort();
   const ports = [port];
@@ -222,6 +222,7 @@ function makeHarness(
   if (seed) backend.store = seed;
   const tabs = new FakeTabs();
   const downloads = new FakeDownloads();
+  if (opts?.firefox === true) Reflect.deleteProperty(downloads, "onDeterminingFilename");
   const windows = opts?.windows === true ? new FakeWindows(tabs) : undefined;
   const clock = { now: 1_700_000_000_000 };
   const timers: { fn: () => void | Promise<void>; ms: number }[] = [];
@@ -813,6 +814,90 @@ test("a registered adapter host classifies even when absent from the offer's pro
   expect(injections.some((i) => i.func === interpret && i.target.tabId === tabID)).toBe(true);
 });
 
+test("a unique manual Chrome download from a registry-only host is correlated", async () => {
+  const h = makeHarness();
+  h.deps.adapterSpecs.push(PROVIDER_ADAPTER);
+  await h.bridge.start();
+  await h.port.inbound({
+    protocol: "papio-browser/1",
+    type: "job_offer",
+    msg_id: "offer_00000003",
+    job_id: "job_0001a_registry_manual",
+    seq: 0,
+    payload: {
+      openurl: OPENURL,
+      provider_hosts: ["resolver.example.edu"],
+      access_mode: "assisted",
+      expires_at: EXPIRES,
+    },
+  });
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  const articleURL = `https://${PROVIDER_HOST}/stable/article`;
+  await h.tabs.onUpdated.emit(tabID, { url: articleURL, status: "complete" }, { id: tabID, url: articleURL });
+
+  expect(h.backend.store.activeJobs[0]?.adapter_id).toBe(PROVIDER_ADAPTER.id);
+  await h.downloads.onCreated.emit({
+    id: 31,
+    url: `https://${PROVIDER_HOST}/download/article.pdf`,
+    state: "in_progress",
+  });
+  h.downloads.items.set(31, {
+    id: 31,
+    filename: "/Users/x/Downloads/article.pdf",
+    fileSize: 91,
+    state: "complete",
+  });
+  await h.downloads.onChanged.emit({ id: 31, state: { current: "complete" } });
+
+  expect(h.frames().some((frame) => frame.type === "download_complete" && frame.job_id === "job_0001a_registry_manual")).toBe(true);
+});
+
+test("a manual registry-host download with two matching jobs remains unowned", async () => {
+  const h = makeHarness({
+    ...emptyStore(),
+    activeJobs: [
+      {
+        job_id: "job_0001a_registry_ambiguous_a",
+        tab_id: 100,
+        offered_at: 1,
+        expires_at: 2,
+        status: "accepted",
+        provider_hosts: ["resolver.example.edu"],
+        adapter_id: PROVIDER_ADAPTER.id,
+      },
+      {
+        job_id: "job_0001a_registry_ambiguous_b",
+        tab_id: 101,
+        offered_at: 1,
+        expires_at: 2,
+        status: "accepted",
+        provider_hosts: ["resolver.example.edu"],
+        adapter_id: PROVIDER_ADAPTER.id,
+      },
+    ],
+  });
+  h.deps.adapterSpecs.push(PROVIDER_ADAPTER);
+  h.tabs.live.set(100, { id: 100, url: `https://${PROVIDER_HOST}/stable/a` });
+  h.tabs.live.set(101, { id: 101, url: `https://${PROVIDER_HOST}/stable/b` });
+  await h.bridge.start();
+
+  await h.downloads.onCreated.emit({
+    id: 32,
+    url: `https://${PROVIDER_HOST}/download/article.pdf`,
+    state: "in_progress",
+  });
+  h.downloads.items.set(32, {
+    id: 32,
+    filename: "/Users/x/Downloads/article.pdf",
+    fileSize: 91,
+    state: "complete",
+  });
+  await h.downloads.onChanged.emit({ id: 32, state: { current: "complete" } });
+
+  expect(h.frames().some((frame) => frame.type === "download_complete")).toBe(false);
+  expect(h.backend.store.activeJobs.every((job) => job.download_initiated !== true)).toBe(true);
+});
+
 
 test("a queued handoff falls back to a background tab after 45 seconds", async () => {
   const h = makeHarness();
@@ -1007,6 +1092,126 @@ test("a job-tab download completes to a basename-only frame; unrelated tab ignor
   expect(complete?.payload["filename"]).toBe("paper final.pdf");
   expect(complete?.payload["size_bytes"]).toBe(482913);
   expect(complete?.payload["download_id"]).toBe(1);
+});
+
+test("Firefox keeps click adapters assisted and ignores their manual job-tab downloads", async () => {
+  const h = makeHarness(undefined, { firefox: true });
+  const clickAdapter: AdapterSpec = {
+    ...PROVIDER_ADAPTER,
+    download: { selector: "button.download", requireKind: "article", method: "click" },
+  };
+  const injections: Parameters<BridgeDeps["scripting"]["executeScript"]>[0][] = [];
+  h.deps.adapterSpecs.push(clickAdapter);
+  h.deps.permissions.contains = async () => true;
+  h.deps.scripting.executeScript = async (injection) => {
+    injections.push(injection);
+    return [{ result: { kind: "article" } }];
+  };
+  await h.bridge.start();
+  await h.port.inbound(jobOffer("job_0004_firefox_click"));
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  const articleURL = `https://${PROVIDER_HOST}/stable/article`;
+  await h.tabs.onUpdated.emit(tabID, { url: articleURL, status: "complete" }, { id: tabID, url: articleURL });
+
+  expect(injections).toHaveLength(1);
+  expect(injections[0]?.func).toBe(interpret);
+  expect(h.backend.store.activeJobs[0]?.download_initiated).not.toBe(true);
+  await h.downloads.onCreated.emit({
+    id: 41,
+    tabId: tabID,
+    url: `https://${PROVIDER_HOST}/download/article.pdf`,
+    state: "in_progress",
+  });
+  h.downloads.items.set(41, {
+    id: 41,
+    tabId: tabID,
+    filename: "/Users/x/Downloads/article.pdf",
+    fileSize: 91,
+    state: "complete",
+  });
+  await h.downloads.onChanged.emit({ id: 41, state: { current: "complete" } });
+
+  expect(h.frames().some((frame) => frame.type === "download_complete")).toBe(false);
+  expect(h.backend.store.activeJobs[0]?.status).toBe("accepted");
+});
+
+test("Firefox ignores manual downloads from non-click adapters without exact ownership", async () => {
+  const h = makeHarness(undefined, { firefox: true });
+  const hrefAdapter: AdapterSpec = {
+    ...PROVIDER_ADAPTER,
+    id: "firefox-href",
+    download: { selector: "a.download", requireKind: "article", method: "href" },
+  };
+  h.deps.adapterSpecs.push(hrefAdapter);
+  h.deps.permissions.contains = async () => false;
+  await h.bridge.start();
+  await h.port.inbound(jobOffer("job_0004_firefox_href"));
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  const articleURL = `https://${PROVIDER_HOST}/stable/article`;
+  await h.tabs.onUpdated.emit(tabID, { url: articleURL, status: "complete" }, { id: tabID, url: articleURL });
+
+  expect(h.backend.store.activeJobs[0]?.adapter_id).toBe("firefox-href");
+  await h.downloads.onCreated.emit({
+    id: 42,
+    tabId: tabID,
+    url: `https://${PROVIDER_HOST}/download/article.pdf`,
+    state: "in_progress",
+  });
+  h.downloads.items.set(42, {
+    id: 42,
+    tabId: tabID,
+    filename: "/Users/x/Downloads/article.pdf",
+    fileSize: 91,
+    state: "complete",
+  });
+  await h.downloads.onChanged.emit({ id: 42, state: { current: "complete" } });
+
+  expect(h.frames().some((frame) => frame.type === "download_complete")).toBe(false);
+  expect(h.backend.store.activeJobs[0]?.download_initiated).not.toBe(true);
+});
+
+test("Firefox adapter API downloads remain filename-controlled and report normally", async () => {
+  const h = makeHarness(undefined, { firefox: true });
+  const apiAdapter: AdapterSpec = {
+    ...PROVIDER_ADAPTER,
+    download: {
+      selector: "meta[name='citation_pdf_url']",
+      requireKind: "article",
+      method: "api",
+      urlTemplate: `https://${PROVIDER_HOST}/api/article`,
+      jsonField: "pdf_url",
+    },
+  };
+  h.deps.adapterSpecs.push(apiAdapter);
+  h.deps.permissions.contains = async () => true;
+  h.deps.scripting.executeScript = async (injection) =>
+    injection.func === interpret
+      ? [{ result: { kind: "article" } }]
+      : [{ result: `https://${PROVIDER_HOST}/download/article.pdf` }];
+  await h.bridge.start();
+  await h.port.inbound(jobOffer("job_0004_firefox_api"));
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  const articleURL = `https://${PROVIDER_HOST}/stable/article`;
+  await h.tabs.onUpdated.emit(tabID, { url: articleURL, status: "complete" }, { id: tabID, url: articleURL });
+
+  expect(h.downloads.started).toEqual([
+    {
+      url: `https://${PROVIDER_HOST}/download/article.pdf`,
+      filename: "papio/job_0004_firefox_api/paper.pdf",
+      conflictAction: "uniquify",
+      saveAs: false,
+    },
+  ]);
+  await h.downloads.onCreated.emit({ id: 901, state: "in_progress" });
+  h.downloads.items.set(901, {
+    id: 901,
+    filename: "/Users/x/Downloads/article.pdf",
+    fileSize: 91,
+    state: "complete",
+  });
+  await h.downloads.onChanged.emit({ id: 901, state: { current: "complete" } });
+
+  expect(h.frames().some((frame) => frame.type === "download_complete" && frame.job_id === "job_0004_firefox_api")).toBe(true);
 });
 
 test("a PDF-viewer tab starts one download and closes after the adopted file completes", async () => {

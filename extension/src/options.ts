@@ -6,25 +6,61 @@
 
 import { chromeBackend, type StoreShape } from "./state";
 import { renderPapio } from "./dom";
+import { adapters, type AdapterSpec } from "./adapters/types";
 
-interface Source {
+export interface Source {
   label: string;
   origin: string;
 }
 
-// Must mirror manifest.json optional_host_permissions exactly.
-const SOURCES: Source[] = [
-  { label: "JSTOR", origin: "https://www.jstor.org/*" },
-  { label: "ProQuest", origin: "https://www.proquest.com/*" },
-  { label: "EBSCO", origin: "https://research.ebsco.com/*" },
-  { label: "Springer Nature Link", origin: "https://link.springer.com/*" },
-  { label: "ScienceDirect (Elsevier)", origin: "https://www.sciencedirect.com/*" },
-  { label: "ACM Digital Library", origin: "https://dl.acm.org/*" },
-  { label: "Wiley Online Library", origin: "https://onlinelibrary.wiley.com/*" },
-  { label: "Taylor & Francis Online", origin: "https://www.tandfonline.com/*" },
-  { label: "SAGE Journals", origin: "https://journals.sagepub.com/*" },
-  { label: "APA PsycNet", origin: "https://psycnet.apa.org/*" },
-];
+const ADAPTER_LABELS: Readonly<Record<string, string>> = {
+  acm: "ACM Digital Library",
+  annualreviews: "Annual Reviews",
+  bmj: "BMJ",
+  cambridge: "Cambridge Core",
+  ebsco: "EBSCO",
+  emerald: "Emerald Insight",
+  hal: "HAL",
+  jamanetwork: "JAMA Network",
+  jstor: "JSTOR",
+  lww: "Lippincott Williams & Wilkins",
+  mitpress: "MIT Press Direct",
+  nature: "Nature",
+  oup: "Oxford Academic",
+  proquest: "ProQuest",
+  psychiatryonline: "PsychiatryOnline",
+  psycnet: "APA PsycNet",
+  sage: "SAGE Journals",
+  sciencedirect: "ScienceDirect (Elsevier)",
+  springer: "Springer Nature Link",
+  tandfonline: "Taylor & Francis Online",
+  thieme: "Thieme Connect",
+  wiley: "Wiley Online Library",
+};
+
+function adapterLabel(adapter: AdapterSpec): string {
+  const known = ADAPTER_LABELS[adapter.id];
+  if (known) return known;
+  const words = adapter.id
+    .split(/[-_]+/)
+    .filter(Boolean)
+    .map((word) => word.charAt(0).toUpperCase() + word.slice(1));
+  return words.join(" ") || adapter.hosts[0] || "Unknown provider";
+}
+
+/** Produce host permissions that match the provider and all its subdomains. */
+export function providerSourcesFromAdapters(adapterSpecs: readonly AdapterSpec[]): Source[] {
+  const sources = new Map<string, Source>();
+  for (const adapter of adapterSpecs) {
+    for (const host of adapter.hosts) {
+      const origin = `https://*.${host.toLowerCase()}/*`;
+      if (!sources.has(origin)) sources.set(origin, { label: adapterLabel(adapter), origin });
+    }
+  }
+  return [...sources.values()];
+}
+
+export const PROVIDER_SOURCES = providerSourcesFromAdapters(adapters);
 
 // Must mirror manifest.json host_permissions exactly.
 const LIBRARY_RESOLVERS: Source[] = [
@@ -258,8 +294,8 @@ async function renderConfiguredResolvers(): Promise<void> {
 
 const sourceList = document.getElementById("sources");
 if (sourceList instanceof HTMLUListElement) {
-  render(sourceList, SOURCES);
-  wireProviderBulk(sourceList, SOURCES);
+  render(sourceList, PROVIDER_SOURCES);
+  wireProviderBulk(sourceList, PROVIDER_SOURCES);
 }
 const libraryResolverList = document.getElementById("library-resolvers");
 if (libraryResolverList instanceof HTMLUListElement) {
