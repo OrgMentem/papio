@@ -594,6 +594,36 @@ func TestRouterWatchAddListAndRemove(t *testing.T) {
 	}
 }
 
+func TestRouterWatchDigestAcquireClassifiesMissingResources(t *testing.T) {
+	system := testSystem(t)
+	created, err := system.Watches.Create(context.Background(), watch.CreateInput{
+		Kind: watch.KindDiscovery, Mode: watch.ModeAlert, Query: "digest", Collection: "Reading", CadenceHours: 24, PerRunCap: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := system.Watches.RecordDigest(context.Background(), created.ID, time.Now(), []watch.DigestEntry{{
+		WorkKey: "10.1000/digest", Title: "Digest",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	router := Router(system)
+	for _, tc := range []struct {
+		name   string
+		params map[string]any
+	}{
+		{name: "watch", params: map[string]any{"id": created.ID + 1}},
+		{name: "key", params: map[string]any{"id": created.ID, "keys": []string{"missing"}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rpcErr := callMethod(t, router, "watch.digest_acquire", tc.params, nil)
+			if rpcErr == nil || rpcErr.Code != "not_found" {
+				t.Fatalf("watch.digest_acquire error = %#v, want not_found", rpcErr)
+			}
+		})
+	}
+}
+
 func TestWatchFailureCarriesSafeRunnerDetail(t *testing.T) {
 	_, rpcErr := watchFailure(errors.New("discovery search: discovery: invalid OpenAlex response: response exceeds configured limit"))
 	if rpcErr == nil || rpcErr.Code != "internal" || rpcErr.Message != "watch execution failed" || rpcErr.Detail == nil {

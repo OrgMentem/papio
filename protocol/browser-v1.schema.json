@@ -90,10 +90,16 @@
             "additionalProperties": false,
             "required": ["url"],
             "properties": {
-              "url": { "type": "string", "format": "uri", "maxLength": 4000, "pattern": "^[Hh][Tt][Tt][Pp][Ss]?://.+" },
-              "doi": { "type": "string", "maxLength": 512 },
-              "title": { "type": "string", "maxLength": 1024 },
-              "source": { "type": "string", "maxLength": 1024 }
+              "url": {
+                "type": "string",
+                "format": "uri",
+                "maxLength": 4000,
+                "pattern": "^[Hh][Tt][Tt][Pp][Ss]?://.+",
+                "allOf": [{ "pattern": "^[^\\u0000]*$" }]
+              },
+              "doi": { "type": "string", "maxLength": 512, "pattern": "^[^\\u0000]*$" },
+              "title": { "type": "string", "maxLength": 1024, "pattern": "^[^\\u0000]*$" },
+              "source": { "type": "string", "maxLength": 1024, "pattern": "^[^\\u0000]*$" }
             }
           }
         }
@@ -106,10 +112,26 @@
           "payload": {
             "type": "object",
             "additionalProperties": false,
+            "oneOf": [
+              {
+                "required": ["job_id"],
+                "not": { "required": ["error"] }
+              },
+              {
+                "required": ["error"],
+                "not": { "required": ["job_id"] }
+              }
+            ],
+            "allOf": [
+              {
+                "if": { "properties": { "duplicate": { "const": true } }, "required": ["duplicate"] },
+                "then": { "required": ["job_id"] }
+              }
+            ],
             "properties": {
               "job_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,128}$" },
               "duplicate": { "type": "boolean" },
-              "error": { "type": "string", "maxLength": 1000 }
+              "error": { "type": "string", "minLength": 1, "maxLength": 1000, "pattern": "^[^\\u0000]+$" }
             }
           }
         }

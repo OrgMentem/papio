@@ -37,7 +37,7 @@ func (js *Store) Failures(ctx context.Context, since time.Time, limit int) ([]Fa
 
 	query := `
 		WITH failure_jobs AS (
-			SELECT j.id, j.state, j.updated_at,
+			SELECT j.id, j.state, j.updated_at, COALESCE(j.terminal_reason, '') AS terminal_reason,
 			       COALESCE(
 			         (SELECT c.url_redacted FROM candidates c WHERE c.id = j.selected_candidate_id),
 			         (SELECT c.url_redacted FROM candidates c WHERE c.job_id = j.id ORDER BY c.created_at DESC, c.id DESC LIMIT 1),
@@ -51,19 +51,19 @@ func (js *Store) Failures(ctx context.Context, since time.Time, limit int) ([]Fa
 			       ) AS detail_json
 			FROM jobs j
 			WHERE j.state IN ('failed', 'unavailable', 'needs_review', 'awaiting_human')
-			  AND (? = '' OR j.updated_at >= ?)
+			  AND (? = '' OR julianday(j.updated_at) >= julianday(?))
 		), ranked AS (
 			SELECT *, ROW_NUMBER() OVER (
-				PARTITION BY state, candidate_url, detail_json
-				ORDER BY updated_at DESC, id DESC
+				PARTITION BY state, candidate_url, detail_json, terminal_reason
+				ORDER BY julianday(updated_at) DESC, id DESC
 			) AS sample_rank
 			FROM failure_jobs
 		)
-		SELECT state, candidate_url, detail_json, COUNT(*),
+		SELECT state, candidate_url, detail_json, terminal_reason, COUNT(*),
 		       MAX(CASE WHEN sample_rank = 1 THEN id END),
-		       MAX(updated_at)
+		       MAX(CASE WHEN sample_rank = 1 THEN julianday(updated_at) END)
 		FROM ranked
-		GROUP BY state, candidate_url, detail_json`
+		GROUP BY state, candidate_url, detail_json, terminal_reason`
 	cutoff := ""
 	if !since.IsZero() {
 		cutoff = since.UTC().Format(time.RFC3339Nano)
@@ -76,17 +76,24 @@ func (js *Store) Failures(ctx context.Context, since time.Time, limit int) ([]Fa
 
 	type aggregate struct {
 		FailureGroup
-		sampleUpdatedAt string
+		sampleUpdatedAt float64
 	}
 	groups := make(map[string]*aggregate)
 	for rows.Next() {
-		var state, candidateURL, detailJSON, id, updatedAt string
+		var state, candidateURL, detailJSON, terminalReason, id string
 		var count int
-		if err := rows.Scan(&state, &candidateURL, &detailJSON, &count, &id, &updatedAt); err != nil {
+		var updatedAt float64
+		if err := rows.Scan(&state, &candidateURL, &detailJSON, &terminalReason, &count, &id, &updatedAt); err != nil {
 			return nil, err
 		}
 		provider := failureProvider(candidateURL)
 		reason := failureReason(detailJSON)
+		if reason == "" {
+			reason = normalizeFailureReason(terminalReason)
+		}
+		if reason == "" {
+			reason = "-"
+		}
 		key := state + "\x00" + provider + "\x00" + reason
 		group := groups[key]
 		if group == nil {
@@ -119,24 +126,32 @@ func (js *Store) Failures(ctx context.Context, since time.Time, limit int) ([]Fa
 
 func failureProvider(rawURL string) string {
 	parsed, err := url.Parse(rawURL)
-	if err != nil || parsed.Hostname() == "" {
+	if err != nil {
 		return "-"
 	}
-	return parsed.Hostname()
+	host := strings.TrimSuffix(strings.ToLower(parsed.Hostname()), ".")
+	if host == "" {
+		return "-"
+	}
+	return host
 }
 
 func failureReason(detailJSON string) string {
 	var detail map[string]any
 	if json.Unmarshal([]byte(detailJSON), &detail) != nil {
-		return "-"
+		return ""
 	}
 	reason, ok := detail["reason"].(string)
 	if !ok {
-		return "-"
+		return ""
 	}
+	return normalizeFailureReason(reason)
+}
+
+func normalizeFailureReason(reason string) string {
 	reason = strings.TrimSpace(reason)
 	if reason == "" {
-		return "-"
+		return ""
 	}
 	runes := []rune(reason)
 	if len(runes) > failureReasonLimit {

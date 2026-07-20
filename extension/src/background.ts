@@ -276,6 +276,15 @@ export function hasDaemonUpdateHint(daemonVersion: string | null, stampedVersion
   return isSemverLowerThan(daemonVersion, stampedVersion, false);
 }
 
+/** Capabilities are valid only for the hello exchange on the current port. */
+function clearNegotiationState(store: StoreShape): StoreShape {
+  return {
+    ...store,
+    daemonFeatures: [],
+    resolverOrigins: [],
+  };
+}
+
 /** Narrow a job_offer's optional `expected` block to the resolver-declared work
  * hints we persist for classification. Never carries an IdP value. */
 function parseExpected(raw: unknown): { title?: string; doi?: string } | undefined {
@@ -488,6 +497,7 @@ async function clickDeclaredDownload(
 }
 
 export class Bridge {
+  private hydrated = false;
   private port: NativePort | null = null;
   /** page_acquire acknowledgements carry no correlation id, so requests are
    * serialized in popup-message order and resolved FIFO. */
@@ -732,20 +742,24 @@ export class Bridge {
    * await, satisfying MV3's top-level-registration expectation. */
   async start(): Promise<void> {
     this.bindListeners();
-    this.connect();
-    // Wake this worker even when idle so queued daemon offers reach it (the
-    // native connection originates here, so the daemon cannot wake a dormant
-    // worker itself). Idempotent: re-creating the same alarm just resets it.
-    this.deps.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: KEEPALIVE_ALARM_MINUTES });
-    this.ready = this.deps.backend.load().then((s) => {
-      this.store = s;
+    this.ready = this.deps.backend.load().then(async (s) => {
+      // A service-worker restart may hydrate a prior connection's hello_ack.
+      // Keep durable job correlation, but never revive its capabilities.
+      this.store = clearNegotiationState(s);
       this.offerURLs.clear();
       for (const [jobID, url] of Object.entries(s.offerURLs ?? {})) {
         if (typeof url !== "string" || findByJob(s, jobID) === undefined) continue;
         this.offerURLs.set(jobID, url);
         this.latestOfferOpenURL = url;
       }
+      this.hydrated = true;
+      await this.update((current) => current);
     });
+    this.connect();
+    // Wake this worker even when idle so queued daemon offers reach it (the
+    // native connection originates here, so the daemon cannot wake a dormant
+    // worker itself). Idempotent: re-creating the same alarm just resets it.
+    this.deps.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: KEEPALIVE_ALARM_MINUTES });
     await this.ready;
     await this.syncConnectionBadge();
     await this.reconcileTabs();
@@ -834,6 +848,9 @@ export class Bridge {
       !(this.store.daemonFeatures ?? []).includes("page_acquire")
     ) {
       return { error: "Page acquisition is not available from this daemon" };
+    }
+    if (typeof payload.doi !== "string" || payload.doi.trim() === "") {
+      return { error: "page has no DOI" };
     }
     return new Promise<PageAcquireAckPayload>((resolve) => {
       this.pageAcquireWaiters.push(resolve);
@@ -996,6 +1013,10 @@ export class Bridge {
   private closingDeliberately = false;
 
   private connect(): void {
+    // A previous service-worker instance may have persisted a completed
+    // handshake. Clear it before hello so no request can use stale features.
+    this.store = clearNegotiationState(this.store);
+    if (this.hydrated) void this.update((current) => current);
     const port = this.deps.connectNative(NATIVE_HOST);
     this.port = port;
     port.onMessage.addListener((msg) => {

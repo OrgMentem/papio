@@ -1,0 +1,1 @@
+{"protocol":"papio-browser/1","type":"page_acquire_ack","msg_id":"page-acquire-ack-error","seq":2,"payload":{"error":"page has no DOI"}}

@@ -179,6 +179,28 @@ func TestHelloAckAnnouncesDaemonVersion(t *testing.T) {
 	}
 }
 
+func TestHelloAckFeatureCapReservesMandatoryPageAcquire(t *testing.T) {
+	b, _, _, _ := newBridge(t)
+	features := make([]string, 32)
+	for i := range features {
+		features[i] = strings.Repeat("x", i+1)
+	}
+	b = NewBridge(b.jobs, b.svc, b.cfg, b.Version, features)
+
+	msgs, _ := runSync(t, b, hello())
+	ack := firstOfType(msgs, protocol.MsgHelloAck)
+	if ack == nil {
+		t.Fatalf("no hello_ack in %v", msgs)
+	}
+	got := ack.Payload.(*protocol.HelloAckPayload).Features
+	if len(got) != 32 {
+		t.Fatalf("features length = %d, want 32", len(got))
+	}
+	if got[30] != features[30] || got[31] != pageAcquireFeature {
+		t.Fatalf("features = %v, want first 31 caller features and %q", got, pageAcquireFeature)
+	}
+}
+
 func TestHelloAckAdvertisesResolverOrigins(t *testing.T) {
 	b, _, _, _ := newBridge(t)
 	msgs, _ := runSync(t, b, hello())
@@ -241,6 +263,31 @@ func TestPageAcquireInvalidDOIReturnsErrorWithoutSubmit(t *testing.T) {
 	}
 	if count != 0 {
 		t.Fatalf("jobs after invalid page acquire = %d, want 0", count)
+	}
+}
+
+func TestPageAcquireWithoutDOIReturnsErrorWithoutSubmit(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	runSync(t, b, hello())
+
+	msgs, _ := runSync(t, b, inFrame(t, protocol.MsgPageAcquire, "", protocol.PageAcquirePayload{
+		URL:   "https://publisher.example.edu/article/42",
+		Title: "A DOI-less page",
+	}))
+	ack := firstOfType(msgs, protocol.MsgPageAcquireAck)
+	if ack == nil {
+		t.Fatalf("no page_acquire_ack in %v", msgs)
+	}
+	payload := ack.Payload.(*protocol.PageAcquireAckPayload)
+	if payload.Error != "page has no DOI" || payload.JobID != "" || payload.Duplicate {
+		t.Fatalf("page_acquire_ack = %#v", payload)
+	}
+	var count int
+	if err := jobs.S.DB().QueryRowContext(context.Background(), "SELECT COUNT(*) FROM jobs").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("jobs after DOI-less page acquire = %d, want 0", count)
 	}
 }
 

@@ -367,6 +367,35 @@ test("hello acknowledgment persists daemon version, features, and connected stat
   expect(h.action.texts.at(-1)).toBe("");
 });
 
+test("a restarted worker clears persisted page-acquire capability before hello_ack", async () => {
+  const h = makeHarness({
+    ...emptyStore(),
+    connectionStatus: "connected",
+    daemonVersion: "0.1.0",
+    daemonUpdateHint: true,
+    daemonFeatures: ["page_acquire"],
+    resolverOrigins: ["https://onesearch.library.example.edu"],
+  });
+  await h.bridge.start();
+
+  expect(h.backend.store).toMatchObject({
+    daemonFeatures: [],
+    resolverOrigins: [],
+  });
+  let response: unknown;
+  void h.bridge.requestPageAcquire({
+    url: "https://publisher.example.edu/article/42",
+    doi: "10.1000/example.42",
+  }).then((value) => {
+    response = value;
+  });
+  await Promise.resolve();
+  await Promise.resolve();
+  expect(response).toEqual({ error: "Page acquisition is not available from this daemon" });
+  expect(h.frames().map((frame) => frame.type)).toEqual(["hello"]);
+});
+
+
 test("relays page acquisition and routes its acknowledgement to the popup", async () => {
   const h = makeHarness();
   await h.bridge.start();
@@ -395,6 +424,25 @@ test("relays page acquisition and routes its acknowledgement to the popup", asyn
     payload: { job_id: "job_page_acquire_001", duplicate: true },
   });
   expect(await acknowledgement).toEqual({ job_id: "job_page_acquire_001", duplicate: true });
+});
+
+test("refuses a DOI-less page acquisition without sending a frame", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ daemon_version: "0.1.0", features: ["page_acquire"] }));
+
+  let response: unknown;
+  void h.bridge.requestPageAcquire({
+    url: "https://publisher.example.edu/article/42",
+    title: "A DOI-less page",
+    source: "popup",
+  }).then((value) => {
+    response = value;
+  });
+  await Promise.resolve();
+  await Promise.resolve();
+  expect(response).toEqual({ error: "page has no DOI" });
+  expect(h.frames().map((frame) => frame.type)).toEqual(["hello"]);
 });
 
 test("hello_ack caches resolver origins and badges ungranted ones while connected", async () => {

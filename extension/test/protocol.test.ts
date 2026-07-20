@@ -91,6 +91,10 @@ test("page_acquire messages parse strictly", () => {
     job_id: "job_page_acquire_001",
     duplicate: true,
   })).payload).toEqual({ job_id: "job_page_acquire_001", duplicate: true });
+  expect(parseBrowserMessage(frame("page_acquire_ack", {
+    error: "page has no DOI",
+  })).payload).toEqual({ error: "page has no DOI" });
+
 
   for (const payload of [
     {},
@@ -98,6 +102,10 @@ test("page_acquire messages parse strictly", () => {
     { url: "https://publisher.example.edu/article/42", doi: "d".repeat(513) },
     { url: null },
     { url: "https://publisher.example.edu/article/42", unexpected: true },
+    { url: "https://publisher.example.edu/article/\0" },
+    { url: "https://publisher.example.edu/article/42", doi: "10.1000/\0example" },
+    { url: "https://publisher.example.edu/article/42", title: "Example\0 Paper" },
+    { url: "https://publisher.example.edu/article/42", source: "pop\0up" },
   ]) {
     expect(() => parseBrowserMessage(frame("page_acquire", payload))).toThrow(ProtocolError);
   }
@@ -106,6 +114,12 @@ test("page_acquire messages parse strictly", () => {
     { duplicate: "yes" },
     { error: null },
     { unexpected: true },
+    {},
+    { duplicate: true },
+    { job_id: "job_page_acquire_001", error: "already queued" },
+    { error: "bad\0error" },
+    { error: "" },
+    { job_id: "", error: "page has no DOI" },
   ]) {
     expect(() => parseBrowserMessage(frame("page_acquire_ack", payload))).toThrow(ProtocolError);
   }

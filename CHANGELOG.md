@@ -10,6 +10,28 @@ execution records in `notes/acquisition-stack-plan.md`.
 
 ## [Unreleased]
 
+### Added
+
+- **`papio jobs failures`** (+`jobs.failures` RPC): groups jobs that did not
+  complete on their own (failed, unavailable, needs-review, awaiting-human)
+  by state, provider host, and terminal reason, with `--since` (Go durations,
+  `Nd` days, or RFC3339) — so adapter and resolver work can be prioritized
+  from real failure data.
+- **`papio acquire --from-digest <watch> [--keys ...]`** (+`watch.digest_acquire`
+  RPC): queues pending alert-watch digest entries as acquisition jobs through
+  the same submission path watches use, preserving the recorded identifiers so
+  deduplication holds; entries are removed only after their manifest is
+  persisted and submission succeeded. `papio watch digest clear <id>`
+  (+`watch.digest_clear`) empties a digest.
+- **Structured webhook notifications**: webhook payloads now carry `event`,
+  `watch_id`, `watch_label`, and `count` alongside `message` for routable
+  receivers; plain notices keep the exact previous `{source, message,
+  sent_at}` shape.
+- **Click-to-acquire support**: the daemon accepts the new `page_acquire`
+  browser-protocol message (advertised via the `page_acquire` `hello_ack`
+  feature) and queues the page's DOI through the normal acquisition pipeline,
+  answering with `page_acquire_ack` (job id or duplicate marker).
+
 ## [0.6.0] - 2026-07-20
 
 ### Added

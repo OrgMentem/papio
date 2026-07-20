@@ -10,6 +10,7 @@ import (
 
 	"papio/internal/config"
 	"papio/internal/watch"
+	"papio/internal/zotio"
 )
 
 func TestParseWatchCadence(t *testing.T) {
@@ -100,6 +101,7 @@ func TestAcquireFromDigestRejectsIncompatibleInputs(t *testing.T) {
 		{name: "positional identifier", args: []string{"acquire", "--from-digest", "7", "10.1000/example"}, want: "positional"},
 		{name: "batch", args: []string{"acquire", "--from-digest", "7", "--batch", "works.jsonl"}, want: "--batch"},
 		{name: "zotio", args: []string{"acquire", "--from-digest", "7", "--from-zotio"}, want: "--from-zotio"},
+		{name: "empty keys", args: []string{"acquire", "--from-digest", "7", "--keys", ""}, want: "at least one"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
@@ -113,5 +115,27 @@ func TestAcquireFromDigestRejectsIncompatibleInputs(t *testing.T) {
 				t.Fatalf("acquire %v error = %v, want message containing %q", test.args[1:], err, test.want)
 			}
 		})
+	}
+}
+
+func TestAcquireFromZotioParsesLimit(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	root := NewInProcessRoot(&stdout, &stderr, config.Config{}, func(_ context.Context, method string, params any, result any) error {
+		if method != "zotio.queue" {
+			t.Fatalf("method = %q, want zotio.queue", method)
+		}
+		options, ok := params.(zotio.QueueOptions)
+		if !ok {
+			t.Fatalf("params = %T, want zotio.QueueOptions", params)
+		}
+		if options.Limit != 7 {
+			t.Fatalf("queue limit = %d, want 7", options.Limit)
+		}
+		*result.(*zotio.QueueResult) = zotio.QueueResult{}
+		return nil
+	})
+	root.SetArgs([]string{"acquire", "--from-zotio", "--limit", "7"})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("acquire --from-zotio --limit: %v (%s)", err, stderr.String())
 	}
 }

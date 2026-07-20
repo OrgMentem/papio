@@ -4,9 +4,13 @@ package watch
 
 import (
 	"context"
+	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
+	"papio/internal/batch"
 	"papio/internal/discovery"
 	"papio/internal/work"
 	"papio/internal/zotio"
@@ -55,6 +59,53 @@ func TestRunnerHandlesArXivOnlyDiscoveries(t *testing.T) {
 				t.Fatalf("digest = %+v, want arXiv-keyed entry", digest)
 			}
 		})
+	}
+}
+
+func TestRunnerAcquireDigestPreservesDiscoveryIdentifiers(t *testing.T) {
+	ctx := context.Background()
+	watches := testStore(t)
+	watched := createWatch(t, watches, CreateInput{
+		Kind: KindDiscovery, Mode: ModeAlert, Query: "identifiers", Collection: "Reading", CadenceHours: 24, PerRunCap: 1,
+	})
+	now := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
+	discovered := discovery.DiscoveredWork{
+		Work:       work.Work{DOI: "10.1000/identifiers", Title: "Identifier Work", Authors: []string{"Ada"}, Year: 2026},
+		OpenAlexID: "https://openalex.org/W2741809807",
+	}
+	requests := requestsForDiscoveredWithWork([]discovery.DiscoveredWork{discovered})
+	if len(requests) != 1 {
+		t.Fatalf("discovery requests = %+v, want one", requests)
+	}
+	wantRequestID := batch.RequestID(fmt.Sprintf("watch-%d", watched.ID), requests[0].Work)
+	runner := &Runner{
+		Store:     watches,
+		Discovery: &fakeDiscovery{works: []discovery.DiscoveredWork{discovered}},
+		Lookup:    &fakeLookup{result: &zotio.LookupWorksResult{Works: []zotio.WorkOwnership{{Status: zotio.OwnershipNotOwned}}}},
+		DataDir:   t.TempDir(),
+		Now:       func() time.Time { return now },
+	}
+	if _, err := runner.Run(ctx, watched.ID); err != nil {
+		t.Fatal(err)
+	}
+	digest, err := watches.Digest(ctx, watched.ID, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(digest) != 1 || digest[0].Identifiers == nil || digest[0].Identifiers.OpenAlex != "W2741809807" {
+		t.Fatalf("digest = %+v, want persisted OpenAlex identifier", digest)
+	}
+	submitter := &fakeSubmitter{}
+	runner.Submitter = submitter
+	queued, err := runner.AcquireDigest(ctx, watched.ID, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if queued != 1 || len(submitter.calls) != 1 {
+		t.Fatalf("AcquireDigest() = %d, submitted = %+v; want one queued submission", queued, submitter.calls)
+	}
+	if got := submitter.calls[0].RequestID; got != wantRequestID {
+		t.Fatalf("digest request ID = %q, want acquire-mode ID %q", got, wantRequestID)
 	}
 }
 
@@ -138,5 +189,47 @@ func TestRunnerAcquireDigestStopsAfterSubmissionFailure(t *testing.T) {
 	}
 	if len(entries) != 2 || entries[0].WorkKey != "10.1000/two" || entries[1].WorkKey != "10.1000/one" {
 		t.Fatalf("digest after partial acquisition = %+v, want failed and unsubmitted rows", entries)
+	}
+	manifest, err := batch.Load(runner.DataDir, "latest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(manifest.Works) != 2 || manifest.Works[0].Status != "submitted" || manifest.Works[1].Status != "submission_failed" {
+		t.Fatalf("partial digest manifest = %+v, want attempted works only", manifest.Works)
+	}
+}
+
+func TestRunnerAcquireDigestPreservesEntriesWhenManifestWriteFails(t *testing.T) {
+	ctx := context.Background()
+	watches := testStore(t)
+	created := createWatch(t, watches, CreateInput{
+		Kind: KindDiscovery, Mode: ModeAlert, Query: "digest", Collection: "Reading", CadenceHours: 24, PerRunCap: 1,
+	})
+	now := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
+	if _, err := watches.RecordDigest(ctx, created.ID, now, []DigestEntry{{
+		WorkKey: "10.1000/manifest", Title: "Manifest", DOI: "10.1000/manifest",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	dataDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dataDir, "batches"), []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runner := &Runner{
+		Store:     watches,
+		Submitter: &fakeSubmitter{},
+		DataDir:   dataDir,
+		Now:       func() time.Time { return now },
+	}
+	queued, err := runner.AcquireDigest(ctx, created.ID, nil)
+	if err == nil || queued != 1 {
+		t.Fatalf("AcquireDigest() = %d, %v; want 1 and manifest write failure", queued, err)
+	}
+	entries, err := watches.Digest(ctx, created.ID, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].WorkKey != "10.1000/manifest" {
+		t.Fatalf("digest after manifest write failure = %+v, want unremoved entry", entries)
 	}
 }

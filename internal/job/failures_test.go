@@ -62,6 +62,35 @@ func TestFailures(t *testing.T) {
 			want:  []FailureGroup{{State: StateUnavailable, Provider: "-", Reason: "new", Count: 1}},
 		},
 		{
+			name: "uses terminal reason when transition detail omits it",
+			setup: func(t *testing.T, js *Store) []string {
+				createFailureWithTerminalReason(t, js, "failures-terminal-reason", StateUnavailable, "no viable candidates")
+				return nil
+			},
+			want: []FailureGroup{{State: StateUnavailable, Provider: "-", Reason: "no viable candidates", Count: 1}},
+		},
+		{
+			name: "filters and samples fractional timestamps chronologically",
+			setup: func(t *testing.T, js *Store) []string {
+				exact := createFailure(t, js, "failures-time-exact", StateFailed, "timing", []string{"https://time.example.test/a"}, false)
+				fractional := createFailure(t, js, "failures-time-fractional", StateFailed, "timing", []string{"https://time.example.test/a"}, false)
+				setFailureUpdatedAt(t, js, exact, "2026-03-01T12:00:00Z")
+				setFailureUpdatedAt(t, js, fractional, "2026-03-01T12:00:00.5Z")
+				return []string{fractional}
+			},
+			since: time.Date(2026, time.March, 1, 12, 0, 0, 0, time.UTC),
+			want:  []FailureGroup{{State: StateFailed, Provider: "time.example.test", Reason: "timing", Count: 2}},
+		},
+		{
+			name: "groups provider hostnames case insensitively without root dot",
+			setup: func(t *testing.T, js *Store) []string {
+				createFailure(t, js, "failures-host-uppercase", StateFailed, "network", []string{"https://API.Example.Test/a"}, false)
+				createFailure(t, js, "failures-host-root-dot", StateFailed, "network", []string{"https://api.example.test./b"}, false)
+				return nil
+			},
+			want: []FailureGroup{{State: StateFailed, Provider: "api.example.test", Reason: "network", Count: 2}},
+		},
+		{
 			name: "clamps the result limit",
 			setup: func(t *testing.T, js *Store) []string {
 				for i := range failureMaxLimit + 1 {
@@ -160,6 +189,21 @@ func createFailure(t *testing.T, js *Store, requestID, state, reason string, url
 		t.Fatalf("to %s: %v", state, err)
 	}
 	return id
+}
+
+func createFailureWithTerminalReason(t *testing.T, js *Store, requestID, state, reason string) {
+	t.Helper()
+	ctx := context.Background()
+	id, err := js.CreateRequest(ctx, requestID, testWork(), "", "", testPolicy(), nil)
+	if err != nil {
+		t.Fatalf("create %s: %v", requestID, err)
+	}
+	if err := js.Transition(ctx, id, StateQueued, StateResolving, nil); err != nil {
+		t.Fatalf("to resolving: %v", err)
+	}
+	if err := js.Transition(ctx, id, StateResolving, state, nil, WithTerminalReason(reason)); err != nil {
+		t.Fatalf("to %s: %v", state, err)
+	}
 }
 
 func setFailureUpdatedAt(t *testing.T, js *Store, id, at string) {

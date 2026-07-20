@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"papio/internal/protocol"
 	"papio/internal/store"
 )
 
@@ -80,15 +81,19 @@ type FailureResult struct {
 
 // DigestEntry is one previously unowned discovery reported by an alert watch.
 type DigestEntry struct {
-	WorkKey     string `json:"work_key"`
-	TitleKey    string `json:"-"`
-	Title       string `json:"title"`
-	Authors     string `json:"authors"`
-	Year        int    `json:"year"`
-	DOI         string `json:"doi,omitempty"`
-	IsOA        bool   `json:"is_oa"`
-	FirstSeenAt string `json:"first_seen_at"`
+	WorkKey     string                `json:"work_key"`
+	TitleKey    string                `json:"-"`
+	Title       string                `json:"title"`
+	Authors     string                `json:"authors"`
+	Year        int                   `json:"year"`
+	DOI         string                `json:"doi,omitempty"`
+	IsOA        bool                  `json:"is_oa"`
+	FirstSeenAt string                `json:"first_seen_at"`
+	Identifiers *protocol.Identifiers `json:"identifiers,omitempty"`
 }
+
+// ErrDigestEntryNotFound indicates a requested digest work key is absent.
+var ErrDigestEntryNotFound = errors.New("watch digest entry not found")
 
 // Store layers watch semantics over the process-wide single-writer SQLite
 // handle.
@@ -185,15 +190,24 @@ func (s *Store) RecordDigest(ctx context.Context, watchID int64, at time.Time, e
 		entry.TitleKey = strings.TrimSpace(entry.TitleKey)
 		entry.Title = strings.TrimSpace(entry.Title)
 		entry.DOI = strings.TrimSpace(entry.DOI)
+		identifiersJSON := ""
+		if entry.Identifiers != nil {
+			encoded, err := json.Marshal(entry.Identifiers)
+			if err != nil {
+				return 0, fmt.Errorf("encoding watch digest identifiers: %w", err)
+			}
+			identifiersJSON = string(encoded)
+		}
 		if entry.WorkKey == "" || entry.Title == "" {
 			return 0, errors.New("watch digest entry requires work_key and title")
 		}
 		if entry.DOI != "" && entry.TitleKey != "" && entry.TitleKey != entry.WorkKey {
 			result, err := tx.ExecContext(ctx, `
 				UPDATE watch_digest_entries
-				SET work_key = ?, doi = ?
+				SET work_key = ?, doi = ?,
+				identifiers_json = ?
 				WHERE watch_id = ? AND work_key = ?`,
-				entry.WorkKey, entry.DOI, watchID, entry.TitleKey)
+				entry.WorkKey, entry.DOI, identifiersJSON, watchID, entry.TitleKey)
 			if err != nil {
 				return 0, fmt.Errorf("migrating watch digest: %w", err)
 			}
@@ -207,11 +221,11 @@ func (s *Store) RecordDigest(ctx context.Context, watchID int64, at time.Time, e
 		}
 		result, err := tx.ExecContext(ctx, `
 			INSERT INTO watch_digest_entries
-				(watch_id, work_key, title, authors, year, doi, is_oa, first_seen_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+				(watch_id, work_key, title, authors, year, doi, identifiers_json, is_oa, first_seen_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(watch_id, work_key) DO NOTHING`,
 			watchID, entry.WorkKey, entry.Title, strings.TrimSpace(entry.Authors), entry.Year,
-			entry.DOI, entry.IsOA, firstSeenAt)
+			entry.DOI, identifiersJSON, entry.IsOA, firstSeenAt)
 		if err != nil {
 			return 0, fmt.Errorf("recording watch digest: %w", err)
 		}
@@ -242,7 +256,7 @@ func (s *Store) Digest(ctx context.Context, watchID int64, limit int) ([]DigestE
 		limit = 100
 	}
 	rows, err := s.S.DB().QueryContext(ctx, `
-		SELECT work_key, title, authors, year, doi, is_oa, first_seen_at
+		SELECT work_key, title, authors, year, doi, is_oa, first_seen_at, identifiers_json
 		FROM watch_digest_entries
 		WHERE watch_id = ?
 		ORDER BY id DESC
@@ -254,10 +268,14 @@ func (s *Store) Digest(ctx context.Context, watchID int64, limit int) ([]DigestE
 	entries := make([]DigestEntry, 0)
 	for rows.Next() {
 		var entry DigestEntry
+		var identifiersJSON string
 		if err := rows.Scan(
 			&entry.WorkKey, &entry.Title, &entry.Authors, &entry.Year,
-			&entry.DOI, &entry.IsOA, &entry.FirstSeenAt,
+			&entry.DOI, &entry.IsOA, &entry.FirstSeenAt, &identifiersJSON,
 		); err != nil {
+			return nil, err
+		}
+		if err := decodeDigestIdentifiers(&entry, identifiersJSON); err != nil {
 			return nil, err
 		}
 		entries = append(entries, entry)
@@ -303,7 +321,7 @@ func (s *Store) TakeDigest(ctx context.Context, watchID int64, keys []string) ([
 	}
 
 	query := `
-		SELECT work_key, title, authors, year, doi, is_oa, first_seen_at
+		SELECT work_key, title, authors, year, doi, is_oa, first_seen_at, identifiers_json
 		FROM watch_digest_entries
 		WHERE watch_id = ?`
 	args := []any{watchID}
@@ -335,10 +353,14 @@ func (s *Store) TakeDigest(ctx context.Context, watchID int64, keys []string) ([
 	found := make(map[string]struct{}, len(requested))
 	for rows.Next() {
 		var entry DigestEntry
+		var identifiersJSON string
 		if err := rows.Scan(
 			&entry.WorkKey, &entry.Title, &entry.Authors, &entry.Year,
-			&entry.DOI, &entry.IsOA, &entry.FirstSeenAt,
+			&entry.DOI, &entry.IsOA, &entry.FirstSeenAt, &identifiersJSON,
 		); err != nil {
+			return nil, err
+		}
+		if err := decodeDigestIdentifiers(&entry, identifiersJSON); err != nil {
 			return nil, err
 		}
 		entries = append(entries, entry)
@@ -349,7 +371,7 @@ func (s *Store) TakeDigest(ctx context.Context, watchID int64, keys []string) ([
 	}
 	for key := range requested {
 		if _, ok := found[key]; !ok {
-			return nil, fmt.Errorf("watch digest entry %q not found", key)
+			return nil, fmt.Errorf("%w: %q", ErrDigestEntryNotFound, key)
 		}
 	}
 	return entries, nil
@@ -377,8 +399,20 @@ func (s *Store) deleteDigestEntry(ctx context.Context, watchID int64, workKey st
 		return fmt.Errorf("counting deleted watch digest entry: %w", err)
 	}
 	if count != 1 {
-		return fmt.Errorf("watch digest entry %q not found", workKey)
+		return fmt.Errorf("%w: %q", ErrDigestEntryNotFound, workKey)
 	}
+	return nil
+}
+
+func decodeDigestIdentifiers(entry *DigestEntry, encoded string) error {
+	if encoded == "" {
+		return nil
+	}
+	var identifiers protocol.Identifiers
+	if err := json.Unmarshal([]byte(encoded), &identifiers); err != nil {
+		return fmt.Errorf("decoding watch digest identifiers: %w", err)
+	}
+	entry.Identifiers = &identifiers
 	return nil
 }
 

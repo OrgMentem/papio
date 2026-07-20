@@ -108,6 +108,10 @@ func browserTextLen(value string) int {
 	return utf8.RuneCountInString(value)
 }
 
+func browserHasNUL(value string) bool {
+	return strings.IndexByte(value, 0) >= 0
+}
+
 // ---------------------------------------------------------------------------
 // WorkRequest (work-request/1)
 // ---------------------------------------------------------------------------
@@ -440,7 +444,9 @@ type HelloAckPayload struct {
 }
 
 // PageAcquirePayload asks the daemon to queue the paper identified on the
-// user's current page. Source is advisory provenance only.
+// user's current page. Source is advisory provenance only. DOI stays optional
+// on the wire for forward evolution, although the current daemon requires it
+// before it will submit an acquisition.
 type PageAcquirePayload struct {
 	URL    string `json:"url"`
 	DOI    string `json:"doi,omitempty"`
@@ -656,6 +662,13 @@ func DecodeBrowserMessage(data []byte) (*BrowserMessage, error) {
 			err = strictDecode(env.Payload, p)
 		}
 		if err == nil {
+			if _, ok := payloadFields["job_id"]; ok && p.JobID == "" {
+				err = fmt.Errorf("page_acquire_ack.job_id must be non-empty")
+			} else if _, ok := payloadFields["error"]; ok && p.Error == "" {
+				err = fmt.Errorf("page_acquire_ack.error must be non-empty")
+			}
+		}
+		if err == nil {
 			err = p.validate()
 		}
 		msg.Payload = p
@@ -750,6 +763,9 @@ func (p *PageAcquirePayload) validate() error {
 	if browserTextLen(p.URL) == 0 || browserTextLen(p.URL) > 4000 {
 		return fmt.Errorf("page_acquire.url required (max 4000)")
 	}
+	if browserHasNUL(p.URL) {
+		return fmt.Errorf("page_acquire.url cannot contain NUL")
+	}
 	u, err := url.ParseRequestURI(p.URL)
 	if err != nil || (!strings.EqualFold(u.Scheme, "http") && !strings.EqualFold(u.Scheme, "https")) || u.Host == "" {
 		return fmt.Errorf("page_acquire.url must be a parseable http(s) URL")
@@ -757,21 +773,41 @@ func (p *PageAcquirePayload) validate() error {
 	if browserTextLen(p.DOI) > 512 {
 		return fmt.Errorf("page_acquire.doi exceeds 512 chars")
 	}
+	if browserHasNUL(p.DOI) {
+		return fmt.Errorf("page_acquire.doi cannot contain NUL")
+	}
 	if browserTextLen(p.Title) > 1024 {
 		return fmt.Errorf("page_acquire.title exceeds 1024 chars")
 	}
+	if browserHasNUL(p.Title) {
+		return fmt.Errorf("page_acquire.title cannot contain NUL")
+	}
 	if browserTextLen(p.Source) > 1024 {
 		return fmt.Errorf("page_acquire.source exceeds 1024 chars")
+	}
+	if browserHasNUL(p.Source) {
+		return fmt.Errorf("page_acquire.source cannot contain NUL")
 	}
 	return nil
 }
 
 func (p *PageAcquireAckPayload) validate() error {
-	if p.JobID != "" && !requestIDRE.MatchString(p.JobID) {
+	hasJobID := p.JobID != ""
+	hasError := p.Error != ""
+	if hasJobID == hasError {
+		return fmt.Errorf("page_acquire_ack requires exactly one of job_id or error")
+	}
+	if hasJobID && !requestIDRE.MatchString(p.JobID) {
 		return fmt.Errorf("page_acquire_ack.job_id is invalid")
 	}
 	if browserTextLen(p.Error) > 1000 {
 		return fmt.Errorf("page_acquire_ack.error exceeds 1000 chars")
+	}
+	if browserHasNUL(p.Error) {
+		return fmt.Errorf("page_acquire_ack.error cannot contain NUL")
+	}
+	if p.Duplicate && !hasJobID {
+		return fmt.Errorf("page_acquire_ack.duplicate requires job_id")
 	}
 	return nil
 }

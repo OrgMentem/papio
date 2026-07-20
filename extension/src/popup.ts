@@ -340,6 +340,8 @@ interface PageMetadata {
   title?: string;
 }
 
+const NO_DOI_FOUND = "no DOI found on this page";
+
 function pageAcquireStatus(response: PageAcquireResponse): string {
   if (typeof response.error === "string" && response.error.length > 0) return response.error;
   if (typeof response.job_id === "string" && response.job_id.length > 0) {
@@ -371,13 +373,17 @@ export async function acquireCurrentPage(): Promise<PageAcquireResponse> {
   ) {
     throw new Error("Could not read the current page");
   }
+  const page = metadata as PageMetadata;
+  if (typeof page.doi !== "string" || !page.doi) {
+    return { error: NO_DOI_FOUND };
+  }
   const result: unknown = await chrome.runtime.sendMessage({
     channel: "papio",
     action: "page_acquire",
     payload: {
-      url: (metadata as PageMetadata).url,
-      ...((metadata as PageMetadata).doi ? { doi: (metadata as PageMetadata).doi } : {}),
-      ...((metadata as PageMetadata).title ? { title: (metadata as PageMetadata).title } : {}),
+      url: page.url,
+      doi: page.doi,
+      ...(page.title ? { title: page.title } : {}),
       source: "popup",
     },
   });
@@ -400,18 +406,20 @@ export function renderPageAcquire(
   section.hidden = !enabled;
   if (!enabled || button.dataset.wired) return;
   button.dataset.wired = "1";
+  let noDOIFound = false;
   button.addEventListener("click", () => {
     button.disabled = true;
     status.textContent = "Acquiring…";
     void onAcquire().then(
       (response) => {
+        noDOIFound = response.error === NO_DOI_FOUND;
         status.textContent = pageAcquireStatus(response);
       },
       (error: unknown) => {
         status.textContent = error instanceof Error ? error.message : "Could not acquire this page";
       },
     ).finally(() => {
-      button.disabled = false;
+      button.disabled = noDOIFound;
     });
   });
 }

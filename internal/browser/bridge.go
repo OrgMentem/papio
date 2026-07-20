@@ -82,12 +82,23 @@ func NewBridge(jobs *job.Store, svc *app.Service, cfg config.Config, version str
 }
 
 func appendFeature(features []string, feature string) []string {
-	for _, existing := range features {
-		if existing == feature {
-			return append([]string(nil), features...)
+	result := append([]string(nil), features...)
+	for i, existing := range result {
+		if existing != feature {
+			continue
 		}
+		if len(result) <= 32 {
+			return result
+		}
+		if i < 32 {
+			return result[:32]
+		}
+		return append(result[:31], feature)
 	}
-	return append(append([]string(nil), features...), feature)
+	if len(result) >= 32 {
+		result = result[:31]
+	}
+	return append(result, feature)
 }
 
 // SessionInfo returns a consistent snapshot of the current extension hello-session.
@@ -271,25 +282,24 @@ func (b *Bridge) pageAcquire(ctx context.Context, payload *protocol.PageAcquireP
 }
 
 func pageAcquireRequest(payload *protocol.PageAcquirePayload) (protocol.WorkRequest, error) {
-	identity := "url:" + payload.URL
-	title := strings.TrimSpace(payload.Title)
+	doi := strings.TrimSpace(payload.DOI)
+	if doi == "" {
+		return protocol.WorkRequest{}, errors.New("page has no DOI")
+	}
+	normalizedDOI, err := work.NormalizeDOI(doi)
+	if err != nil {
+		return protocol.WorkRequest{}, fmt.Errorf("invalid page DOI: %w", err)
+	}
 	request := protocol.WorkRequest{
 		SchemaVersion:  protocol.WorkRequestSchemaVersion,
 		DesiredVersion: "any",
+		Identifiers:    &protocol.Identifiers{DOI: normalizedDOI},
 	}
-	if payload.DOI == "" {
+	title := strings.TrimSpace(payload.Title)
+	if len(title) >= 3 && len(title) <= 500 {
 		request.Title = title
-	} else if len(title) >= 3 && len(title) <= 500 {
-		request.Title = title
 	}
-	if payload.DOI != "" {
-		doi, err := work.NormalizeDOI(payload.DOI)
-		if err != nil {
-			return protocol.WorkRequest{}, fmt.Errorf("invalid page DOI: %w", err)
-		}
-		request.Identifiers = &protocol.Identifiers{DOI: doi}
-		identity = "doi:" + doi
-	}
+	identity := "doi:" + normalizedDOI
 	sum := sha256.Sum256([]byte(identity))
 	request.RequestID = "page_acquire_" + hex.EncodeToString(sum[:])
 	return request, nil

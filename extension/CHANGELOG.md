@@ -16,6 +16,17 @@ for the full pre-split extension history.
 
 ## [Unreleased]
 
+### Added
+
+- **Acquire this page**: a popup button (shown only when the connected daemon
+  advertises the `page_acquire` feature) reads the current tab's
+  `citation_doi` metadata under the activeTab grant and asks the daemon to
+  acquire the paper; pages without a DOI show "no DOI found on this page"
+  and send nothing.
+- Adapters can declare `requiresVisible`; their handoff tabs then open in a
+  normal, unfocused window instead of the minimized work window (fix path
+  for providers that under-render while hidden). No current adapter sets it.
+
 ### Fixed
 
 - The developer-only fixture-capture tool no longer leaks its filename

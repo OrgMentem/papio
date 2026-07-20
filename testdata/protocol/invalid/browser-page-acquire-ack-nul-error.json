@@ -1,0 +1,1 @@
+{"protocol":"papio-browser/1","type":"page_acquire_ack","msg_id":"page-acquire-ack-nul","seq":2,"payload":{"error":"bad\u0000error"}}

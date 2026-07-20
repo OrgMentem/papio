@@ -87,7 +87,7 @@ func (r *Runner) Run(ctx context.Context, id int64) (*RunResult, error) {
 }
 
 // AcquireDigest submits pending alert discoveries through the normal watch
-// acquisition path, removing each entry only after its submission succeeds.
+// acquisition path, removing entries only after their manifest is durable.
 func (r *Runner) AcquireDigest(ctx context.Context, watchID int64, keys []string) (queued int, err error) {
 	if r == nil || r.Store == nil || r.Submitter == nil {
 		return 0, errors.New("watch runner dependencies are not configured")
@@ -119,6 +119,7 @@ func (r *Runner) AcquireDigest(ctx context.Context, watchID int64, keys []string
 	}
 	manifest := batch.NewManifest(works, "watch: "+watch.Label, watch.Collection, r.now())
 	autoImport := true
+	succeeded := make([]DigestEntry, 0, len(entries))
 	for i := range manifest.Works {
 		requestID := batch.RequestID(fmt.Sprintf("watch-%d", watch.ID), manifest.Works[i].Work)
 		manifest.Works[i].RequestID = requestID
@@ -128,19 +129,28 @@ func (r *Runner) AcquireDigest(ctx context.Context, watchID int64, keys []string
 		if submitErr != nil {
 			manifest.Works[i].Status = "submission_failed"
 			manifest.Works[i].Error = "submit"
+			manifest.Works = manifest.Works[:i+1]
 			if writeErr := batch.Write(r.DataDir, manifest); writeErr != nil {
 				return queued, fmt.Errorf("%w (writing digest manifest: %v)", submitErr, writeErr)
+			}
+			for _, entry := range succeeded {
+				if err := r.Store.deleteDigestEntry(ctx, watchID, entry.WorkKey); err != nil {
+					return queued, err
+				}
 			}
 			return queued, submitErr
 		}
 		manifest.Works[i].JobID = jobID
 		queued++
-		if err := r.Store.deleteDigestEntry(ctx, watchID, entries[i].WorkKey); err != nil {
-			return queued, err
-		}
+		succeeded = append(succeeded, entries[i])
 	}
 	if err := batch.Write(r.DataDir, manifest); err != nil {
 		return queued, err
+	}
+	for _, entry := range succeeded {
+		if err := r.Store.deleteDigestEntry(ctx, watchID, entry.WorkKey); err != nil {
+			return queued, err
+		}
 	}
 	return queued, nil
 }
@@ -440,9 +450,10 @@ func digestEntriesForDiscovered(requests []discoveredRequest) ([]DigestEntry, er
 			Title:    title,
 			Authors:  strings.Join(request.Discovered.Work.Authors, ", "),
 
-			Year: request.Discovered.Work.Year,
-			DOI:  doi,
-			IsOA: request.Discovered.IsOA,
+			Year:        request.Discovered.Work.Year,
+			DOI:         doi,
+			Identifiers: request.Work.Identifiers,
+			IsOA:        request.Discovered.IsOA,
 		})
 	}
 	return entries, nil
@@ -462,6 +473,10 @@ func workRequestForDigest(entry DigestEntry) (protocol.WorkRequest, error) {
 		if author = strings.TrimSpace(author); author != "" {
 			request.Authors = append(request.Authors, author)
 		}
+	}
+	if entry.Identifiers != nil {
+		request.Identifiers = entry.Identifiers
+		return request, nil
 	}
 	if doi := strings.TrimSpace(entry.DOI); doi != "" {
 		normalized, err := work.NormalizeDOI(doi)

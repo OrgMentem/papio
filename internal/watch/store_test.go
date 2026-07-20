@@ -4,8 +4,11 @@ package watch
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
+
+	"papio/internal/protocol"
 )
 
 func TestRecordDigestMigratesTitleKeyToDOI(t *testing.T) {
@@ -33,6 +36,26 @@ func TestRecordDigestMigratesTitleKeyToDOI(t *testing.T) {
 	}
 	if len(digest) != 1 || digest[0].WorkKey != "10.1000/the-same-work" || digest[0].DOI != "10.1000/the-same-work" {
 		t.Fatalf("Digest() = %+v, want one DOI-keyed entry", digest)
+	}
+}
+
+func TestRecordDigestPreservesIdentifiers(t *testing.T) {
+	ctx := context.Background()
+	watches := testStore(t)
+	created := createWatch(t, watches, testWatchInput("digest identifiers"))
+	now := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
+	want := &protocol.Identifiers{DOI: "10.1000/identifiers", OpenAlex: "W2741809807"}
+	if _, err := watches.RecordDigest(ctx, created.ID, now, []DigestEntry{{
+		WorkKey: "10.1000/identifiers", Title: "Identifiers", DOI: want.DOI, Identifiers: want,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	digest, err := watches.Digest(ctx, created.ID, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(digest) != 1 || digest[0].Identifiers == nil || *digest[0].Identifiers != *want {
+		t.Fatalf("Digest() = %+v, want persisted identifiers %+v", digest, want)
 	}
 }
 
@@ -83,14 +106,15 @@ func TestTakeDigest(t *testing.T) {
 	}
 
 	for _, test := range []struct {
-		name    string
-		keys    []string
-		want    []string
-		wantErr bool
+		name         string
+		keys         []string
+		want         []string
+		wantErr      bool
+		wantNotFound bool
 	}{
 		{name: "all entries", want: []string{"arxiv:2601.12345v2", "10.1000/two", "10.1000/one"}},
 		{name: "selected entries", keys: []string{"10.1000/one", "arxiv:2601.12345v2"}, want: []string{"arxiv:2601.12345v2", "10.1000/one"}},
-		{name: "unknown key", keys: []string{"10.1000/one", "missing"}, wantErr: true},
+		{name: "unknown key", keys: []string{"10.1000/one", "missing"}, wantErr: true, wantNotFound: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			entries, err := watches.TakeDigest(ctx, created.ID, test.keys)
@@ -98,6 +122,9 @@ func TestTakeDigest(t *testing.T) {
 				t.Fatalf("TakeDigest() error = %v, wantErr %v", err, test.wantErr)
 			}
 			if test.wantErr {
+				if test.wantNotFound && !errors.Is(err, ErrDigestEntryNotFound) {
+					t.Fatalf("TakeDigest() error = %v, want ErrDigestEntryNotFound", err)
+				}
 				return
 			}
 			if len(entries) != len(test.want) {

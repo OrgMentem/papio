@@ -244,12 +244,34 @@ func TestPageAcquirePayloadRoundTripAndValidation(t *testing.T) {
 		{name: "unknown field", payload: map[string]any{
 			"url": "https://publisher.example.edu/article/42", "debug": "no",
 		}},
+		{name: "NUL URL", payload: map[string]any{
+			"url": "https://publisher.example.edu/article/\x00",
+		}},
+		{name: "NUL DOI", payload: map[string]any{
+			"url": "https://publisher.example.edu/article/42", "doi": "10.1000/\x00example",
+		}},
+		{name: "NUL title", payload: map[string]any{
+			"url": "https://publisher.example.edu/article/42", "title": "Example\x00 Paper",
+		}},
+		{name: "NUL source", payload: map[string]any{
+			"url": "https://publisher.example.edu/article/42", "source": "pop\x00up",
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if _, err := DecodeBrowserMessage(frame(MsgPageAcquire, tc.payload)); err == nil {
 				t.Fatal("page_acquire was accepted")
 			}
 		})
+	}
+
+	errorAck, err := DecodeBrowserMessage(frame(MsgPageAcquireAck, PageAcquireAckPayload{
+		Error: "page has no DOI",
+	}))
+	if err != nil {
+		t.Fatalf("decode page_acquire error ack: %v", err)
+	}
+	if got := errorAck.Payload.(*PageAcquireAckPayload); got.Error != "page has no DOI" || got.JobID != "" || got.Duplicate {
+		t.Fatalf("round-trip error ack = %#v", got)
 	}
 
 	ack, err := DecodeBrowserMessage(frame(MsgPageAcquireAck, PageAcquireAckPayload{
@@ -266,6 +288,12 @@ func TestPageAcquirePayloadRoundTripAndValidation(t *testing.T) {
 		{"duplicate": nil},
 		{"error": strings.Repeat("e", 1001)},
 		{"unexpected": true},
+		{},
+		{"duplicate": true},
+		{"job_id": "job_page_acquire_001", "error": "already queued"},
+		{"error": "bad\x00error"},
+		{"error": ""},
+		{"job_id": "", "error": "page has no DOI"},
 	} {
 		if _, err := DecodeBrowserMessage(frame(MsgPageAcquireAck, payload)); err == nil {
 			t.Fatalf("page_acquire_ack payload %#v was accepted", payload)

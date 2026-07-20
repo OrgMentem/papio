@@ -43,6 +43,7 @@ export interface HelloAckPayload {
 
 export interface PageAcquirePayload {
   url: string;
+  /** Optional on the wire for forward evolution; this daemon currently requires it. */
   doi?: string;
   title?: string;
   source?: string;
@@ -200,6 +201,10 @@ function str(obj: Record<string, unknown>, key: string, what: string, max = 1000
   return v;
 }
 
+function rejectNUL(value: string, what: string): void {
+  if (value.includes("\0")) fail(`${what} cannot contain NUL`);
+}
+
 function int(obj: Record<string, unknown>, key: string, what: string, min: number): number {
   const v = obj[key];
   if (typeof v !== "number" || !Number.isInteger(v)) fail(`${what}.${key} must be an integer`);
@@ -297,6 +302,7 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
     case "page_acquire": {
       requireKeys(p, "page_acquire", ["url"], ["doi", "title", "source"]);
       const pageURL = str(p, "url", "page_acquire", 4000);
+      rejectNUL(pageURL, "page_acquire.url");
       let validURL = false;
       try {
         const u = new URL(pageURL);
@@ -305,20 +311,31 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
         validURL = false;
       }
       if (!validURL) fail("page_acquire.url must be a parseable http(s) URL");
-      if ("doi" in p) str(p, "doi", "page_acquire", 512);
-      if ("title" in p) str(p, "title", "page_acquire", 1024);
-      if ("source" in p) str(p, "source", "page_acquire", 1024);
+      if ("doi" in p) rejectNUL(str(p, "doi", "page_acquire", 512), "page_acquire.doi");
+      if ("title" in p) rejectNUL(str(p, "title", "page_acquire", 1024), "page_acquire.title");
+      if ("source" in p) rejectNUL(str(p, "source", "page_acquire", 1024), "page_acquire.source");
       break;
     }
     case "page_acquire_ack": {
       requireKeys(p, "page_acquire_ack", [], ["job_id", "duplicate", "error"]);
-      if ("job_id" in p && !JOB_ID_RE.test(str(p, "job_id", "page_acquire_ack", 128))) {
+      const jobID = "job_id" in p ? str(p, "job_id", "page_acquire_ack", 128) : "";
+      if ("job_id" in p && jobID === "") fail("page_acquire_ack.job_id must be non-empty");
+      if (jobID !== "" && !JOB_ID_RE.test(jobID)) {
         fail("page_acquire_ack.job_id is invalid");
       }
-      if ("duplicate" in p && typeof p["duplicate"] !== "boolean") {
+      const error = "error" in p ? str(p, "error", "page_acquire_ack", 1000) : "";
+      if ("error" in p && error === "") fail("page_acquire_ack.error must be non-empty");
+      rejectNUL(error, "page_acquire_ack.error");
+      if ((jobID !== "") === (error !== "")) {
+        fail("page_acquire_ack requires exactly one of job_id or error");
+      }
+      const duplicate = p["duplicate"];
+      if (duplicate !== undefined && typeof duplicate !== "boolean") {
         fail("page_acquire_ack.duplicate must be a boolean");
       }
-      if ("error" in p) str(p, "error", "page_acquire_ack", 1000);
+      if (duplicate === true && jobID === "") {
+        fail("page_acquire_ack.duplicate requires job_id");
+      }
       break;
     }
     case "job_offer": {

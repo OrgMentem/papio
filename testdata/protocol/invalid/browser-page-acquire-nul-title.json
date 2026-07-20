@@ -1,0 +1,1 @@
+{"protocol":"papio-browser/1","type":"page_acquire","msg_id":"page-acquire-nul-title","seq":1,"payload":{"url":"https://publisher.example.edu/article/42","title":"An\u0000Example Paper"}}

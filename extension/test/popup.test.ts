@@ -5,7 +5,17 @@ import { readFileSync } from "node:fs";
 
 import { Window } from "happy-dom";
 
-import { cancelJob, focusJob, renderDaemonStatus, renderJobs, renderPageAcquire, renderResolverGrants, wireSettings, type PopupActions } from "../src/popup";
+import {
+  acquireCurrentPage,
+  cancelJob,
+  focusJob,
+  renderDaemonStatus,
+  renderJobs,
+  renderPageAcquire,
+  renderResolverGrants,
+  wireSettings,
+  type PopupActions,
+} from "../src/popup";
 import type { ActiveJob } from "../src/state";
 
 function popupDocument(): Document {
@@ -135,6 +145,48 @@ test("gates page acquisition on the negotiated feature", async () => {
   await Promise.resolve();
   expect(calls).toBe(1);
   expect(doc.getElementById("page-acquire-status")?.textContent).toBe("Queued: job_page_acquire_001");
+});
+
+test("disables page acquisition when the current page has no DOI", async () => {
+  const doc = popupDocument();
+  let calls = 0;
+  renderPageAcquire(doc, true, async () => {
+    calls += 1;
+    return { error: "no DOI found on this page" };
+  });
+
+  const button = doc.getElementById("page-acquire-btn") as HTMLButtonElement;
+  button.click();
+  await Promise.resolve();
+  await Promise.resolve();
+
+  expect(calls).toBe(1);
+  expect(button.disabled).toBe(true);
+  expect(doc.getElementById("page-acquire-status")?.textContent).toBe("no DOI found on this page");
+});
+
+test("does not send a DOI-less scraped page to the daemon", async () => {
+  popupDocument();
+  let messages = 0;
+  Object.assign(globalThis, {
+    chrome: {
+      tabs: { query: async () => [{ id: 1 }] },
+      scripting: {
+        executeScript: async () => [{
+          result: { url: "https://publisher.example.edu/article/42", title: "A DOI-less page" },
+        }],
+      },
+      runtime: {
+        sendMessage: async () => {
+          messages += 1;
+          return { job_id: "job_page_acquire_001" };
+        },
+      },
+    },
+  });
+
+  await expect(acquireCurrentPage()).resolves.toEqual({ error: "no DOI found on this page" });
+  expect(messages).toBe(0);
 });
 
 test("focus button activates the correct broker-owned tab and then its window", async () => {

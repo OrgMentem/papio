@@ -81,10 +81,14 @@ func newAcquireCommand(opt *options) *cobra.Command {
 						return fmt.Errorf("--%s is not supported with --from-digest", name)
 					}
 				}
+				keys := trimNonempty(digestKeys)
+				if cmd.Flags().Changed("keys") && len(keys) == 0 {
+					return fmt.Errorf("--keys requires at least one non-empty digest work key")
+				}
 				params := struct {
 					ID   int64    `json:"id"`
 					Keys []string `json:"keys,omitempty"`
-				}{ID: fromDigest, Keys: trimNonempty(digestKeys)}
+				}{ID: fromDigest, Keys: keys}
 				var result api.WatchDigestAcquireResult
 				if err := opt.call(cmd.Context(), "watch.digest_acquire", params, &result); err != nil {
 					return err
@@ -192,6 +196,7 @@ func newAcquireCommand(opt *options) *cobra.Command {
 	flags.StringSliceVar(&denySources, "deny-source", nil, "deny this source (repeatable)")
 	flags.BoolVar(&wait, "wait", false, "wait for a terminal or human-action state")
 	flags.BoolVar(&fromZotio, "from-zotio", false, "queue zotio items missing an attached PDF")
+	flags.IntVar(&queueLimit, "limit", 25, "maximum Zotio items to queue")
 	flags.Int64Var(&fromDigest, "from-digest", 0, "queue pending entries from an alert watch")
 	flags.StringSliceVar(&digestKeys, "keys", nil, "digest work keys to queue (comma-separated)")
 	flags.StringVar(&batchPath, "batch", "", "submit JSONL works from a file or - for standard input")

@@ -4,11 +4,13 @@ package api
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 
 	"papio/internal/bootstrap"
 	"papio/internal/ipc"
+	"papio/internal/watch"
 )
 
 // WatchDigestAcquireResult reports how many pending digest entries were queued.
@@ -37,6 +39,9 @@ func acquireWatchDigest(ctx context.Context, raw json.RawMessage, system *bootst
 	}
 	queued, err := system.WatchRunner.AcquireDigest(ctx, params.ID, params.Keys)
 	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) || errors.Is(err, watch.ErrDigestEntryNotFound) {
+			return nil, &ipc.RPCError{Code: "not_found", Message: "watch digest entry not found"}
+		}
 		return watchFailure(err)
 	}
 	return marshal(WatchDigestAcquireResult{Queued: queued})
