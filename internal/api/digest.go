@@ -57,10 +57,10 @@ func clearWatchDigest(ctx context.Context, raw json.RawMessage, system *bootstra
 		}
 		return badParams(err)
 	}
-	if system == nil || system.Watches == nil {
+	if system == nil || system.WatchRunner == nil {
 		return nil, &ipc.RPCError{Code: "precondition_failed", Message: "watchlists are not configured"}
 	}
-	cleared, err := system.Watches.ClearDigest(ctx, params.ID)
+	cleared, err := system.WatchRunner.ClearDigest(ctx, params.ID)
 	if err != nil {
 		return failure(err)
 	}

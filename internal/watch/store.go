@@ -81,15 +81,17 @@ type FailureResult struct {
 
 // DigestEntry is one previously unowned discovery reported by an alert watch.
 type DigestEntry struct {
-	WorkKey     string                `json:"work_key"`
-	TitleKey    string                `json:"-"`
-	Title       string                `json:"title"`
-	Authors     string                `json:"authors"`
-	Year        int                   `json:"year"`
-	DOI         string                `json:"doi,omitempty"`
-	IsOA        bool                  `json:"is_oa"`
-	FirstSeenAt string                `json:"first_seen_at"`
-	Identifiers *protocol.Identifiers `json:"identifiers,omitempty"`
+	WorkKey      string                `json:"work_key"`
+	TitleKey     string                `json:"-"`
+	Title        string                `json:"title"`
+	Authors      string                `json:"authors"`
+	AuthorNames  []string              `json:"-"`
+	Year         int                   `json:"year"`
+	DOI          string                `json:"doi,omitempty"`
+	IsOA         bool                  `json:"is_oa"`
+	FirstSeenAt  string                `json:"first_seen_at"`
+	Identifiers  *protocol.Identifiers `json:"identifiers,omitempty"`
+	titleAliases []string
 }
 
 // ErrDigestEntryNotFound indicates a requested digest work key is absent.
@@ -165,8 +167,8 @@ func (s *Store) List(ctx context.Context) ([]Watch, error) {
 	return watches, nil
 }
 
-// RecordDigest stores alert-watch discoveries, retaining only the first sighting
-// of each stable work key.
+// RecordDigest stores alert-watch discoveries, retaining each identity's first
+// sighting even after it has been cleared or acquired.
 func (s *Store) RecordDigest(ctx context.Context, watchID int64, at time.Time, entries []DigestEntry) (int, error) {
 	if s == nil || s.S == nil {
 		return 0, errors.New("watch store is not configured")
@@ -189,43 +191,91 @@ func (s *Store) RecordDigest(ctx context.Context, watchID int64, at time.Time, e
 		entry.WorkKey = strings.TrimSpace(entry.WorkKey)
 		entry.TitleKey = strings.TrimSpace(entry.TitleKey)
 		entry.Title = strings.TrimSpace(entry.Title)
+		entry.Authors = strings.TrimSpace(entry.Authors)
 		entry.DOI = strings.TrimSpace(entry.DOI)
-		identifiersJSON := ""
-		if entry.Identifiers != nil {
-			encoded, err := json.Marshal(entry.Identifiers)
-			if err != nil {
-				return 0, fmt.Errorf("encoding watch digest identifiers: %w", err)
-			}
-			identifiersJSON = string(encoded)
+		if entry.Authors == "" && len(entry.AuthorNames) > 0 {
+			entry.Authors = strings.Join(entry.AuthorNames, ", ")
 		}
 		if entry.WorkKey == "" || entry.Title == "" {
 			return 0, errors.New("watch digest entry requires work_key and title")
 		}
-		if entry.DOI != "" && entry.TitleKey != "" && entry.TitleKey != entry.WorkKey {
-			result, err := tx.ExecContext(ctx, `
-				UPDATE watch_digest_entries
-				SET work_key = ?, doi = ?,
-				identifiers_json = ?
-				WHERE watch_id = ? AND work_key = ?`,
-				entry.WorkKey, entry.DOI, identifiersJSON, watchID, entry.TitleKey)
-			if err != nil {
-				return 0, fmt.Errorf("migrating watch digest: %w", err)
-			}
-			count, err := result.RowsAffected()
+
+		existing, duplicates, err := findDigestIdentities(ctx, tx, watchID, entry)
+		if err != nil {
+			return 0, err
+		}
+		if existing != nil {
+			identifiersJSON, doi, err := mergeDigestIdentifiers(existing.identifiersJSON, entry)
 			if err != nil {
 				return 0, err
 			}
-			if count > 0 {
-				continue
+			for _, duplicate := range duplicates {
+				identifiersJSON, err = mergeDigestIdentifierJSON(identifiersJSON, duplicate.identifiersJSON, duplicate.doi)
+				if err != nil {
+					return 0, err
+				}
 			}
+			workKey, err := canonicalDigestWorkKey(entry, identifiersJSON)
+			if err != nil {
+				return 0, err
+			}
+			authorsJSON, err := mergeDigestAuthors(existing.authorsJSON, entry)
+			if err != nil {
+				return 0, err
+			}
+			authors := entry.Authors
+			if authors == "" {
+				authors = existing.authors
+			}
+			firstSeenAt := existing.firstSeenAt
+			consumed := existing.consumed
+			for _, duplicate := range duplicates {
+				if authors == "" {
+					authors = duplicate.authors
+				}
+				if authorsJSON == "" {
+					authorsJSON = duplicate.authorsJSON
+				}
+				if duplicate.firstSeenAt < firstSeenAt {
+					firstSeenAt = duplicate.firstSeenAt
+				}
+				consumed = consumed || duplicate.consumed
+				if _, err := tx.ExecContext(ctx, `DELETE FROM watch_digest_entries WHERE id = ?`, duplicate.id); err != nil {
+					return 0, fmt.Errorf("merging duplicate watch digest identity: %w", err)
+				}
+			}
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE watch_digest_entries
+				SET work_key = ?, title = ?, authors = ?, authors_json = ?, year = ?, doi = ?,
+					identifiers_json = ?, is_oa = ?, first_seen_at = ?, consumed = ?
+				WHERE id = ?`,
+				workKey, entry.Title, authors, authorsJSON, entry.Year, doi,
+				identifiersJSON, entry.IsOA, firstSeenAt, consumed, existing.id,
+			); err != nil {
+				return 0, fmt.Errorf("migrating watch digest: %w", err)
+			}
+			continue
+		}
+
+		identifiersJSON, doi, err := mergeDigestIdentifiers("", entry)
+		if err != nil {
+			return 0, err
+		}
+		workKey, err := canonicalDigestWorkKey(entry, identifiersJSON)
+		if err != nil {
+			return 0, err
+		}
+		authorsJSON, err := mergeDigestAuthors("", entry)
+		if err != nil {
+			return 0, err
 		}
 		result, err := tx.ExecContext(ctx, `
 			INSERT INTO watch_digest_entries
-				(watch_id, work_key, title, authors, year, doi, identifiers_json, is_oa, first_seen_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+				(watch_id, work_key, title, authors, authors_json, year, doi, identifiers_json, is_oa, first_seen_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(watch_id, work_key) DO NOTHING`,
-			watchID, entry.WorkKey, entry.Title, strings.TrimSpace(entry.Authors), entry.Year,
-			entry.DOI, identifiersJSON, entry.IsOA, firstSeenAt)
+			watchID, workKey, entry.Title, entry.Authors, authorsJSON, entry.Year,
+			doi, identifiersJSON, entry.IsOA, firstSeenAt)
 		if err != nil {
 			return 0, fmt.Errorf("recording watch digest: %w", err)
 		}
@@ -256,9 +306,9 @@ func (s *Store) Digest(ctx context.Context, watchID int64, limit int) ([]DigestE
 		limit = 100
 	}
 	rows, err := s.S.DB().QueryContext(ctx, `
-		SELECT work_key, title, authors, year, doi, is_oa, first_seen_at, identifiers_json
+		SELECT work_key, title, authors, authors_json, year, doi, is_oa, first_seen_at, identifiers_json
 		FROM watch_digest_entries
-		WHERE watch_id = ?
+		WHERE watch_id = ? AND consumed = 0
 		ORDER BY id DESC
 		LIMIT ?`, watchID, limit)
 	if err != nil {
@@ -268,11 +318,14 @@ func (s *Store) Digest(ctx context.Context, watchID int64, limit int) ([]DigestE
 	entries := make([]DigestEntry, 0)
 	for rows.Next() {
 		var entry DigestEntry
-		var identifiersJSON string
+		var identifiersJSON, authorsJSON string
 		if err := rows.Scan(
-			&entry.WorkKey, &entry.Title, &entry.Authors, &entry.Year,
+			&entry.WorkKey, &entry.Title, &entry.Authors, &authorsJSON, &entry.Year,
 			&entry.DOI, &entry.IsOA, &entry.FirstSeenAt, &identifiersJSON,
 		); err != nil {
+			return nil, err
+		}
+		if err := decodeDigestAuthors(&entry, authorsJSON); err != nil {
 			return nil, err
 		}
 		if err := decodeDigestIdentifiers(&entry, identifiersJSON); err != nil {
@@ -286,7 +339,7 @@ func (s *Store) Digest(ctx context.Context, watchID int64, limit int) ([]DigestE
 	return entries, nil
 }
 
-// ClearDigest removes every pending alert discovery for watchID.
+// ClearDigest consumes every pending alert discovery for watchID.
 func (s *Store) ClearDigest(ctx context.Context, watchID int64) (int, error) {
 	if s == nil || s.S == nil {
 		return 0, errors.New("watch store is not configured")
@@ -297,7 +350,10 @@ func (s *Store) ClearDigest(ctx context.Context, watchID int64) (int, error) {
 	if _, err := s.Get(ctx, watchID); err != nil {
 		return 0, err
 	}
-	result, err := s.S.DB().ExecContext(ctx, `DELETE FROM watch_digest_entries WHERE watch_id = ?`, watchID)
+	result, err := s.S.DB().ExecContext(ctx, `
+		UPDATE watch_digest_entries
+		SET consumed = 1
+		WHERE watch_id = ? AND consumed = 0`, watchID)
 	if err != nil {
 		return 0, fmt.Errorf("clearing watch digest: %w", err)
 	}
@@ -321,26 +377,17 @@ func (s *Store) TakeDigest(ctx context.Context, watchID int64, keys []string) ([
 	}
 
 	query := `
-		SELECT work_key, title, authors, year, doi, is_oa, first_seen_at, identifiers_json
+		SELECT work_key, title, authors, authors_json, year, doi, is_oa, first_seen_at, identifiers_json
 		FROM watch_digest_entries
-		WHERE watch_id = ?`
+		WHERE watch_id = ? AND consumed = 0`
 	args := []any{watchID}
 	requested := make(map[string]struct{}, len(keys))
-	if len(keys) > 0 {
-		placeholders := make([]string, 0, len(keys))
-		for _, key := range keys {
-			key = strings.TrimSpace(key)
-			if key == "" {
-				return nil, errors.New("watch digest key must not be empty")
-			}
-			if _, duplicate := requested[key]; duplicate {
-				continue
-			}
-			requested[key] = struct{}{}
-			placeholders = append(placeholders, "?")
-			args = append(args, key)
+	for _, key := range keys {
+		key = strings.TrimSpace(key)
+		if key == "" {
+			return nil, errors.New("watch digest key must not be empty")
 		}
-		query += ` AND work_key IN (` + strings.Join(placeholders, ", ") + `)`
+		requested[key] = struct{}{}
 	}
 	query += ` ORDER BY id DESC`
 
@@ -349,35 +396,63 @@ func (s *Store) TakeDigest(ctx context.Context, watchID int64, keys []string) ([
 		return nil, fmt.Errorf("taking watch digest: %w", err)
 	}
 	defer rows.Close()
-	entries := make([]DigestEntry, 0)
-	found := make(map[string]struct{}, len(requested))
+	candidates := make([]DigestEntry, 0)
 	for rows.Next() {
 		var entry DigestEntry
-		var identifiersJSON string
+		var identifiersJSON, authorsJSON string
 		if err := rows.Scan(
-			&entry.WorkKey, &entry.Title, &entry.Authors, &entry.Year,
+			&entry.WorkKey, &entry.Title, &entry.Authors, &authorsJSON, &entry.Year,
 			&entry.DOI, &entry.IsOA, &entry.FirstSeenAt, &identifiersJSON,
 		); err != nil {
+			return nil, err
+		}
+		if err := decodeDigestAuthors(&entry, authorsJSON); err != nil {
 			return nil, err
 		}
 		if err := decodeDigestIdentifiers(&entry, identifiersJSON); err != nil {
 			return nil, err
 		}
-		entries = append(entries, entry)
-		found[entry.WorkKey] = struct{}{}
+		candidates = append(candidates, entry)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterating watch digest: %w", err)
 	}
+	if len(requested) == 0 {
+		return candidates, nil
+	}
+
+	selected := make(map[int]struct{})
 	for key := range requested {
-		if _, ok := found[key]; !ok {
+		directMatches := make([]int, 0, 1)
+		titleMatches := make([]int, 0, 1)
+		for i, entry := range candidates {
+			if digestEntryMatchesKey(entry, key) {
+				directMatches = append(directMatches, i)
+			} else if digestEntryMatchesTitle(entry, key) {
+				titleMatches = append(titleMatches, i)
+			}
+		}
+		if len(directMatches) > 0 {
+			for _, i := range directMatches {
+				selected[i] = struct{}{}
+			}
+			continue
+		}
+		if len(titleMatches) != 1 {
 			return nil, fmt.Errorf("%w: %q", ErrDigestEntryNotFound, key)
+		}
+		selected[titleMatches[0]] = struct{}{}
+	}
+	entries := make([]DigestEntry, 0, len(selected))
+	for i, entry := range candidates {
+		if _, ok := selected[i]; ok {
+			entries = append(entries, entry)
 		}
 	}
 	return entries, nil
 }
 
-func (s *Store) deleteDigestEntry(ctx context.Context, watchID int64, workKey string) error {
+func (s *Store) consumeDigestEntry(ctx context.Context, watchID int64, workKey string) error {
 	if s == nil || s.S == nil {
 		return errors.New("watch store is not configured")
 	}
@@ -389,14 +464,15 @@ func (s *Store) deleteDigestEntry(ctx context.Context, watchID int64, workKey st
 		return errors.New("watch digest key must not be empty")
 	}
 	result, err := s.S.DB().ExecContext(ctx, `
-		DELETE FROM watch_digest_entries
-		WHERE watch_id = ? AND work_key = ?`, watchID, workKey)
+		UPDATE watch_digest_entries
+		SET consumed = 1
+		WHERE watch_id = ? AND work_key = ? AND consumed = 0`, watchID, workKey)
 	if err != nil {
-		return fmt.Errorf("deleting watch digest entry: %w", err)
+		return fmt.Errorf("consuming watch digest entry: %w", err)
 	}
 	count, err := result.RowsAffected()
 	if err != nil {
-		return fmt.Errorf("counting deleted watch digest entry: %w", err)
+		return fmt.Errorf("counting consumed watch digest entries: %w", err)
 	}
 	if count != 1 {
 		return fmt.Errorf("%w: %q", ErrDigestEntryNotFound, workKey)
@@ -404,15 +480,364 @@ func (s *Store) deleteDigestEntry(ctx context.Context, watchID int64, workKey st
 	return nil
 }
 
-func decodeDigestIdentifiers(entry *DigestEntry, encoded string) error {
+type digestIdentity struct {
+	id              int64
+	workKey         string
+	title           string
+	doi             string
+	identifiersJSON string
+	authors         string
+	authorsJSON     string
+	firstSeenAt     string
+	consumed        bool
+}
+
+func findDigestIdentities(ctx context.Context, tx *sql.Tx, watchID int64, entry DigestEntry) (*digestIdentity, []digestIdentity, error) {
+	rows, err := tx.QueryContext(ctx, `
+		SELECT id, work_key, title, doi, identifiers_json, authors, authors_json, first_seen_at, consumed
+		FROM watch_digest_entries
+		WHERE watch_id = ?
+		ORDER BY first_seen_at ASC, id ASC`, watchID)
+	if err != nil {
+		return nil, nil, fmt.Errorf("finding watch digest identity: %w", err)
+	}
+	defer rows.Close()
+
+	want := digestIdentityAliases(entry)
+	wantStable := digestStableIdentityAliases(entry)
+	var stableMatches []digestIdentity
+	var exactMatch, match *digestIdentity
+	for rows.Next() {
+		var row digestIdentity
+		if err := rows.Scan(
+			&row.id, &row.workKey, &row.title, &row.doi, &row.identifiersJSON, &row.authors,
+			&row.authorsJSON, &row.firstSeenAt, &row.consumed,
+		); err != nil {
+			return nil, nil, err
+		}
+		existing := DigestEntry{
+			WorkKey: row.workKey,
+			Title:   row.title,
+			DOI:     row.doi,
+		}
+		if err := decodeDigestIdentifiers(&existing, row.identifiersJSON); err != nil {
+			return nil, nil, err
+		}
+		existingAliases := digestIdentityAliases(existing)
+		if !digestIdentitiesOverlap(want, existingAliases) {
+			continue
+		}
+		existingStable := digestStableIdentityAliases(existing)
+		if digestStableIdentifiersConflict(entry, existing) {
+			continue
+		}
+		if digestIdentitiesOverlap(wantStable, existingStable) {
+			stableMatches = append(stableMatches, row)
+			continue
+		}
+		if len(wantStable) > 0 && len(existingStable) > 0 {
+			// A shared title or legacy key cannot establish that two differently
+			// identified works are the same work.
+			continue
+		}
+		if row.workKey == entry.WorkKey {
+			candidate := row
+			exactMatch = &candidate
+			continue
+		}
+		if match == nil {
+			candidate := row
+			match = &candidate
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, fmt.Errorf("iterating watch digest identities: %w", err)
+	}
+	if len(stableMatches) > 0 {
+		return &stableMatches[0], stableMatches[1:], nil
+	}
+	if exactMatch != nil {
+		return exactMatch, nil, nil
+	}
+	return match, nil, nil
+}
+
+func digestStableIdentifiersConflict(left, right DigestEntry) bool {
+	leftIDs := digestEntryIdentifiers(left)
+	rightIDs := digestEntryIdentifiers(right)
+	return (leftIDs.DOI != "" && rightIDs.DOI != "" && !strings.EqualFold(leftIDs.DOI, rightIDs.DOI)) ||
+		(leftIDs.ArXiv != "" && rightIDs.ArXiv != "" && !strings.EqualFold(leftIDs.ArXiv, rightIDs.ArXiv)) ||
+		(leftIDs.OpenAlex != "" && rightIDs.OpenAlex != "" && !strings.EqualFold(leftIDs.OpenAlex, rightIDs.OpenAlex))
+}
+
+func digestIdentitiesOverlap(left, right map[string]struct{}) bool {
+	for alias := range left {
+		if _, ok := right[alias]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func digestIdentityAliases(entry DigestEntry) map[string]struct{} {
+	aliases := make(map[string]struct{})
+	add := func(kind, value string) {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			aliases[kind+":"+strings.ToLower(value)] = struct{}{}
+		}
+	}
+	addTitle := func(value string) {
+		if value = normalizeDigestTitle(value); value != "" {
+			aliases["title:"+value] = struct{}{}
+		}
+	}
+
+	add("key", entry.WorkKey)
+	addTitle(entry.TitleKey)
+	addTitle(entry.Title)
+	for _, titleAlias := range entry.titleAliases {
+		addTitle(titleAlias)
+	}
+	for alias := range digestStableIdentityAliases(entry) {
+		aliases[alias] = struct{}{}
+	}
+	if entry.Identifiers != nil {
+		add("pmid", entry.Identifiers.PMID)
+		add("isbn", entry.Identifiers.ISBN)
+	}
+	return aliases
+}
+
+func digestEntryMatchesKey(entry DigestEntry, key string) bool {
+	key = strings.ToLower(strings.TrimSpace(key))
+	aliases := digestIdentityAliases(entry)
+	if _, ok := aliases["key:"+key]; ok && !digestEntryMatchesTitle(entry, key) {
+		return true
+	}
+	if _, ok := aliases[key]; ok {
+		return true
+	}
+	_, ok := aliases["doi:"+key]
+	return ok
+}
+
+func digestEntryMatchesTitle(entry DigestEntry, key string) bool {
+	_, ok := digestIdentityAliases(entry)["title:"+normalizeDigestTitle(key)]
+	return ok
+}
+
+func digestStableIdentityAliases(entry DigestEntry) map[string]struct{} {
+	identifiers := digestEntryIdentifiers(entry)
+	aliases := make(map[string]struct{}, 3)
+	add := func(kind, value string) {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			aliases[kind+":"+strings.ToLower(value)] = struct{}{}
+		}
+	}
+	add("doi", identifiers.DOI)
+	add("arxiv", identifiers.ArXiv)
+	add("openalex", identifiers.OpenAlex)
+	return aliases
+}
+
+func digestEntryIdentifiers(entry DigestEntry) protocol.Identifiers {
+	var identifiers protocol.Identifiers
+	if entry.Identifiers != nil {
+		identifiers = *entry.Identifiers
+	}
+	if doi := strings.TrimSpace(entry.DOI); doi != "" {
+		identifiers.DOI = doi
+	}
+	workKey := strings.TrimSpace(entry.WorkKey)
+	lowerWorkKey := strings.ToLower(workKey)
+	if identifiers.ArXiv == "" && strings.HasPrefix(lowerWorkKey, "arxiv:") {
+		identifiers.ArXiv = workKey[len("arxiv:"):]
+	}
+	if identifiers.OpenAlex == "" && strings.HasPrefix(lowerWorkKey, "openalex:") {
+		identifiers.OpenAlex = workKey[len("openalex:"):]
+	}
+	if identifiers.DOI == "" && strings.HasPrefix(lowerWorkKey, "10.") && strings.Contains(workKey, "/") {
+		identifiers.DOI = workKey
+	}
+	return identifiers
+}
+
+func canonicalDigestWorkKey(entry DigestEntry, identifiersJSON string) (string, error) {
+	identifiers := digestEntryIdentifiers(entry)
+	if identifiersJSON != "" {
+		if err := json.Unmarshal([]byte(identifiersJSON), &identifiers); err != nil {
+			return "", fmt.Errorf("decoding watch digest identifiers: %w", err)
+		}
+	}
+	if doi := strings.TrimSpace(identifiers.DOI); doi != "" {
+		return doi, nil
+	}
+	if arXiv := strings.TrimSpace(identifiers.ArXiv); arXiv != "" {
+		return "arxiv:" + strings.TrimPrefix(arXiv, "arXiv:"), nil
+	}
+	if openAlex := strings.TrimSpace(identifiers.OpenAlex); openAlex != "" {
+		return "openalex:" + strings.TrimPrefix(openAlex, "openalex:"), nil
+	}
+	if titleKey := normalizeDigestTitle(entry.TitleKey); titleKey != "" {
+		return titleKey, nil
+	}
+	if titleKey := normalizeDigestTitle(entry.Title); titleKey != "" {
+		return titleKey, nil
+	}
+	return strings.TrimSpace(entry.WorkKey), nil
+}
+
+func normalizeDigestTitle(value string) string {
+	return strings.Join(strings.Fields(strings.ToLower(strings.TrimSpace(value))), " ")
+}
+
+type digestIdentifierPayload struct {
+	protocol.Identifiers
+	TitleAliases []string `json:"title_aliases,omitempty"`
+}
+
+func decodeDigestIdentifierPayload(encoded string) (digestIdentifierPayload, error) {
+	var payload digestIdentifierPayload
 	if encoded == "" {
+		return payload, nil
+	}
+	if err := json.Unmarshal([]byte(encoded), &payload); err != nil {
+		return digestIdentifierPayload{}, fmt.Errorf("decoding watch digest identifiers: %w", err)
+	}
+	return payload, nil
+}
+
+func addDigestTitleAliases(payload *digestIdentifierPayload, values ...string) {
+	seen := make(map[string]struct{}, len(payload.TitleAliases)+len(values))
+	aliases := make([]string, 0, len(payload.TitleAliases)+len(values))
+	for _, value := range append(payload.TitleAliases, values...) {
+		if value = normalizeDigestTitle(value); value != "" {
+			if _, duplicate := seen[value]; !duplicate {
+				seen[value] = struct{}{}
+				aliases = append(aliases, value)
+			}
+		}
+	}
+	payload.TitleAliases = aliases
+}
+
+func encodeDigestIdentifierPayload(payload digestIdentifierPayload) (string, error) {
+	if payload.Identifiers == (protocol.Identifiers{}) && len(payload.TitleAliases) == 0 {
+		return "", nil
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return "", fmt.Errorf("encoding watch digest identifiers: %w", err)
+	}
+	return string(encoded), nil
+}
+
+func mergeDigestIdentifiers(existingJSON string, entry DigestEntry) (string, string, error) {
+	payload, err := decodeDigestIdentifierPayload(existingJSON)
+	if err != nil {
+		return "", "", err
+	}
+	incoming := digestEntryIdentifiers(entry)
+	if incoming.DOI != "" {
+		payload.DOI = incoming.DOI
+	}
+	if incoming.PMID != "" {
+		payload.PMID = incoming.PMID
+	}
+	if incoming.ArXiv != "" {
+		payload.ArXiv = incoming.ArXiv
+	}
+	if incoming.ISBN != "" {
+		payload.ISBN = incoming.ISBN
+	}
+	if incoming.OpenAlex != "" {
+		payload.OpenAlex = incoming.OpenAlex
+	}
+	addDigestTitleAliases(&payload, entry.TitleKey, entry.Title)
+	encoded, err := encodeDigestIdentifierPayload(payload)
+	if err != nil {
+		return "", "", err
+	}
+	return encoded, payload.DOI, nil
+}
+
+func mergeDigestIdentifierJSON(existingJSON, incomingJSON, incomingDOI string) (string, error) {
+	existing, err := decodeDigestIdentifierPayload(existingJSON)
+	if err != nil {
+		return "", err
+	}
+	incoming, err := decodeDigestIdentifierPayload(incomingJSON)
+	if err != nil {
+		return "", err
+	}
+	if incoming.DOI == "" {
+		incoming.DOI = incomingDOI
+	}
+	if existing.DOI == "" {
+		existing.DOI = incoming.DOI
+	}
+	if existing.PMID == "" {
+		existing.PMID = incoming.PMID
+	}
+	if existing.ArXiv == "" {
+		existing.ArXiv = incoming.ArXiv
+	}
+	if existing.ISBN == "" {
+		existing.ISBN = incoming.ISBN
+	}
+	if existing.OpenAlex == "" {
+		existing.OpenAlex = incoming.OpenAlex
+	}
+	addDigestTitleAliases(&existing, incoming.TitleAliases...)
+	return encodeDigestIdentifierPayload(existing)
+}
+
+func mergeDigestAuthors(existingJSON string, entry DigestEntry) (string, error) {
+	authors := entry.AuthorNames
+	if len(authors) == 0 && strings.TrimSpace(entry.Authors) == "" {
+		return existingJSON, nil
+	}
+	if len(authors) == 0 {
+		for _, author := range strings.Split(entry.Authors, ",") {
+			if author = strings.TrimSpace(author); author != "" {
+				authors = append(authors, author)
+			}
+		}
+	}
+	encoded, err := json.Marshal(authors)
+	if err != nil {
+		return "", fmt.Errorf("encoding watch digest authors: %w", err)
+	}
+	return string(encoded), nil
+}
+
+func decodeDigestAuthors(entry *DigestEntry, encoded string) error {
+	if encoded == "" {
+		for _, author := range strings.Split(entry.Authors, ",") {
+			if author = strings.TrimSpace(author); author != "" {
+				entry.AuthorNames = append(entry.AuthorNames, author)
+			}
+		}
 		return nil
 	}
-	var identifiers protocol.Identifiers
-	if err := json.Unmarshal([]byte(encoded), &identifiers); err != nil {
-		return fmt.Errorf("decoding watch digest identifiers: %w", err)
+	if err := json.Unmarshal([]byte(encoded), &entry.AuthorNames); err != nil {
+		return fmt.Errorf("decoding watch digest authors: %w", err)
 	}
-	entry.Identifiers = &identifiers
+	return nil
+}
+
+func decodeDigestIdentifiers(entry *DigestEntry, encoded string) error {
+	payload, err := decodeDigestIdentifierPayload(encoded)
+	if err != nil {
+		return err
+	}
+	entry.titleAliases = append(entry.titleAliases, payload.TitleAliases...)
+	if payload.Identifiers != (protocol.Identifiers{}) {
+		identifiers := payload.Identifiers
+		entry.Identifiers = &identifiers
+	}
 	return nil
 }
 

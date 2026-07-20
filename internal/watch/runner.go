@@ -87,9 +87,9 @@ func (r *Runner) Run(ctx context.Context, id int64) (*RunResult, error) {
 }
 
 // AcquireDigest submits pending alert discoveries through the normal watch
-// acquisition path, removing entries only after their manifest is durable.
+// acquisition path, consuming entries only after their manifest is durable.
 func (r *Runner) AcquireDigest(ctx context.Context, watchID int64, keys []string) (queued int, err error) {
-	if r == nil || r.Store == nil || r.Submitter == nil {
+	if r == nil || r.Store == nil || r.Lookup == nil || r.Submitter == nil {
 		return 0, errors.New("watch runner dependencies are not configured")
 	}
 	r.mu.Lock()
@@ -111,15 +111,59 @@ func (r *Runner) AcquireDigest(ctx context.Context, watchID int64, keys []string
 	}
 
 	works := make([]protocol.WorkRequest, len(entries))
+	lookupRequest := zotio.LookupWorksRequest{Works: make([]zotio.LookupWork, len(entries))}
 	for i, entry := range entries {
 		works[i], err = workRequestForDigest(entry)
 		if err != nil {
 			return 0, err
 		}
+		if works[i].Identifiers != nil {
+			lookupRequest.Works[i] = zotio.LookupWork{
+				DOI:   works[i].Identifiers.DOI,
+				ArXiv: works[i].Identifiers.ArXiv,
+			}
+		}
+		if lookupRequest.Works[i].DOI == "" && lookupRequest.Works[i].ArXiv == "" {
+			return 0, fmt.Errorf("watch digest entry %q cannot be authoritatively classified without a DOI or arXiv ID", entry.WorkKey)
+		}
 	}
-	manifest := batch.NewManifest(works, "watch: "+watch.Label, watch.Collection, r.now())
+	ownership, err := r.Lookup.LookupWorks(ctx, lookupRequest)
+	if err != nil {
+		return 0, fmt.Errorf("Zotio ownership lookup: %w", err)
+	}
+	if ownership == nil || len(ownership.Works) != len(entries) {
+		return 0, fmt.Errorf("Zotio ownership lookup returned %d results for %d works", ownershipCount(ownership), len(entries))
+	}
+	if strings.TrimSpace(ownership.StalenessWarning) != "" {
+		return 0, fmt.Errorf("Zotio ownership lookup is stale: %s", ownership.StalenessWarning)
+	}
+
+	eligibleEntries := make([]DigestEntry, 0, len(entries))
+	eligibleWorks := make([]protocol.WorkRequest, 0, len(works))
+	consumedEntries := make([]DigestEntry, 0, len(entries))
+	for i, classification := range ownership.Works {
+		switch classification.Status {
+		case zotio.OwnershipNotOwned:
+			eligibleEntries = append(eligibleEntries, entries[i])
+			eligibleWorks = append(eligibleWorks, works[i])
+		case zotio.OwnershipOwnedWithPDF, zotio.OwnershipOwnedMissingPDF:
+			consumedEntries = append(consumedEntries, entries[i])
+		default:
+			return 0, fmt.Errorf("Zotio ownership result %d has unknown status %q", i+1, classification.Status)
+		}
+	}
+	for _, entry := range consumedEntries {
+		if err := r.Store.consumeDigestEntry(ctx, watchID, entry.WorkKey); err != nil {
+			return 0, err
+		}
+	}
+	if len(eligibleEntries) == 0 {
+		return 0, nil
+	}
+
+	manifest := batch.NewManifest(eligibleWorks, "watch: "+watch.Label, watch.Collection, r.now())
 	autoImport := true
-	succeeded := make([]DigestEntry, 0, len(entries))
+	succeeded := make([]DigestEntry, 0, len(eligibleEntries))
 	for i := range manifest.Works {
 		requestID := batch.RequestID(fmt.Sprintf("watch-%d", watch.ID), manifest.Works[i].Work)
 		manifest.Works[i].RequestID = requestID
@@ -134,7 +178,7 @@ func (r *Runner) AcquireDigest(ctx context.Context, watchID int64, keys []string
 				return queued, fmt.Errorf("%w (writing digest manifest: %w)", submitErr, writeErr)
 			}
 			for _, entry := range succeeded {
-				if err := r.Store.deleteDigestEntry(ctx, watchID, entry.WorkKey); err != nil {
+				if err := r.Store.consumeDigestEntry(ctx, watchID, entry.WorkKey); err != nil {
 					return queued, err
 				}
 			}
@@ -142,17 +186,28 @@ func (r *Runner) AcquireDigest(ctx context.Context, watchID int64, keys []string
 		}
 		manifest.Works[i].JobID = jobID
 		queued++
-		succeeded = append(succeeded, entries[i])
+		succeeded = append(succeeded, eligibleEntries[i])
 	}
 	if err := batch.Write(r.DataDir, manifest); err != nil {
 		return queued, err
 	}
 	for _, entry := range succeeded {
-		if err := r.Store.deleteDigestEntry(ctx, watchID, entry.WorkKey); err != nil {
+		if err := r.Store.consumeDigestEntry(ctx, watchID, entry.WorkKey); err != nil {
 			return queued, err
 		}
 	}
 	return queued, nil
+}
+
+// ClearDigest consumes all pending alert discoveries while serializing with
+// acquisition.
+func (r *Runner) ClearDigest(ctx context.Context, watchID int64) (int, error) {
+	if r == nil || r.Store == nil {
+		return 0, errors.New("watch runner is not configured")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.Store.ClearDigest(ctx, watchID)
 }
 
 // RunDue serially executes all watches due at the current time. Per-watch
@@ -444,12 +499,13 @@ func digestEntriesForDiscovered(requests []discoveredRequest) ([]DigestEntry, er
 		if workKey == "" {
 			return nil, errors.New("watch digest work requires a DOI, arXiv ID, or title")
 		}
+		authors := append([]string(nil), request.Discovered.Work.Authors...)
 		entries = append(entries, DigestEntry{
-			WorkKey:  workKey,
-			TitleKey: titleKey,
-			Title:    title,
-			Authors:  strings.Join(request.Discovered.Work.Authors, ", "),
-
+			WorkKey:     workKey,
+			TitleKey:    titleKey,
+			Title:       title,
+			Authors:     strings.Join(authors, ", "),
+			AuthorNames: authors,
 			Year:        request.Discovered.Work.Year,
 			DOI:         doi,
 			Identifiers: request.Work.Identifiers,
@@ -469,9 +525,13 @@ func workRequestForDigest(entry DigestEntry) (protocol.WorkRequest, error) {
 		Title:         title,
 		Year:          entry.Year,
 	}
-	for _, author := range strings.Split(entry.Authors, ",") {
-		if author = strings.TrimSpace(author); author != "" {
-			request.Authors = append(request.Authors, author)
+	if len(entry.AuthorNames) > 0 {
+		request.Authors = append(request.Authors, entry.AuthorNames...)
+	} else {
+		for _, author := range strings.Split(entry.Authors, ",") {
+			if author = strings.TrimSpace(author); author != "" {
+				request.Authors = append(request.Authors, author)
+			}
 		}
 	}
 	if entry.Identifiers != nil {

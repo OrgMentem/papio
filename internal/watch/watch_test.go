@@ -470,7 +470,7 @@ func TestRunnerAlertReportsOnlyNewDigestEntries(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(digest) != 2 || digest[0].WorkKey != "second work" || digest[0].Authors != "Lin" || digest[1].WorkKey != "10.1000/first" || !digest[1].IsOA {
+	if len(digest) != 2 || digest[0].WorkKey != "openalex:W2741809808" || digest[0].Authors != "Lin" || digest[1].WorkKey != "10.1000/first" || !digest[1].IsOA {
 		t.Fatalf("digest = %+v", digest)
 	}
 	second, err := runner.Run(ctx, watch.ID)

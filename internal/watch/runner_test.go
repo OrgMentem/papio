@@ -13,6 +13,7 @@ import (
 
 	"papio/internal/batch"
 	"papio/internal/discovery"
+	"papio/internal/protocol"
 	"papio/internal/work"
 	"papio/internal/zotio"
 )
@@ -110,6 +111,84 @@ func TestRunnerAcquireDigestPreservesDiscoveryIdentifiers(t *testing.T) {
 	}
 }
 
+func TestRunnerAcquireDigestRejectsNonAuthoritativeEntriesBeforeSubmission(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
+	for _, test := range []struct {
+		name  string
+		entry DigestEntry
+	}{
+		{
+			name:  "title only",
+			entry: DigestEntry{WorkKey: "title only", Title: "Title Only"},
+		},
+		{
+			name: "OpenAlex only",
+			entry: DigestEntry{
+				WorkKey: "openalex:W2741809807", Title: "OpenAlex Only",
+				Identifiers: &protocol.Identifiers{OpenAlex: "W2741809807"},
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			watches := testStore(t)
+			watched := createWatch(t, watches, CreateInput{
+				Kind: KindDiscovery, Mode: ModeAlert, Query: test.name, Collection: "Reading", CadenceHours: 24, PerRunCap: 1,
+			})
+			if _, err := watches.RecordDigest(ctx, watched.ID, now, []DigestEntry{test.entry}); err != nil {
+				t.Fatal(err)
+			}
+			lookup := &fakeLookup{}
+			submitter := &fakeSubmitter{}
+			runner := &Runner{
+				Store: watches, Lookup: lookup, Submitter: submitter, DataDir: t.TempDir(), Now: func() time.Time { return now },
+			}
+
+			if queued, err := runner.AcquireDigest(ctx, watched.ID, nil); err == nil || queued != 0 {
+				t.Fatalf("AcquireDigest() = %d, %v; want a non-authoritative identity error", queued, err)
+			}
+			if len(lookup.requests) != 0 || len(submitter.calls) != 0 {
+				t.Fatalf("lookup requests = %+v, submitted = %+v; want neither", lookup.requests, submitter.calls)
+			}
+			if digest, err := watches.Digest(ctx, watched.ID, 100); err != nil || len(digest) != 1 {
+				t.Fatalf("Digest() after rejected acquisition = %+v, %v; want one pending entry", digest, err)
+			}
+		})
+	}
+}
+
+func TestRunnerAcquireDigestFailsClosedOnStaleOwnership(t *testing.T) {
+	ctx := context.Background()
+	watches := testStore(t)
+	watched := createWatch(t, watches, CreateInput{
+		Kind: KindDiscovery, Mode: ModeAlert, Query: "stale ownership", Collection: "Reading", CadenceHours: 24, PerRunCap: 1,
+	})
+	now := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
+	if _, err := watches.RecordDigest(ctx, watched.ID, now, []DigestEntry{{
+		WorkKey: "10.1000/stale", Title: "Stale", DOI: "10.1000/stale",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	lookup := &fakeLookup{result: &zotio.LookupWorksResult{
+		Works:            []zotio.WorkOwnership{{Status: zotio.OwnershipNotOwned}},
+		StalenessWarning: "mirror refresh failed",
+	}}
+	submitter := &fakeSubmitter{}
+	runner := &Runner{
+		Store: watches, Lookup: lookup, Submitter: submitter, DataDir: t.TempDir(), Now: func() time.Time { return now },
+	}
+
+	if queued, err := runner.AcquireDigest(ctx, watched.ID, nil); err == nil || queued != 0 {
+		t.Fatalf("AcquireDigest() = %d, %v; want stale ownership error", queued, err)
+	}
+	if len(lookup.requests) != 1 || len(submitter.calls) != 0 {
+		t.Fatalf("lookup requests = %+v, submitted = %+v; want one lookup and no submissions", lookup.requests, submitter.calls)
+	}
+	if digest, err := watches.Digest(ctx, watched.ID, 100); err != nil || len(digest) != 1 {
+		t.Fatalf("Digest() after stale ownership = %+v, %v; want one pending entry", digest, err)
+	}
+}
+
 func TestRunnerAcquireDigest(t *testing.T) {
 	ctx := context.Background()
 	watches := testStore(t)
@@ -124,7 +203,11 @@ func TestRunnerAcquireDigest(t *testing.T) {
 		t.Fatal(err)
 	}
 	submitter := &fakeSubmitter{}
-	runner := &Runner{Store: watches, Submitter: submitter, DataDir: t.TempDir(), Now: func() time.Time { return now }}
+	runner := &Runner{
+		Store: watches, Lookup: &fakeLookup{result: &zotio.LookupWorksResult{Works: []zotio.WorkOwnership{
+			{Status: zotio.OwnershipNotOwned}, {Status: zotio.OwnershipNotOwned},
+		}}}, Submitter: submitter, DataDir: t.TempDir(), Now: func() time.Time { return now },
+	}
 
 	queued, err := runner.AcquireDigest(ctx, discoveryWatch.ID, nil)
 	if err != nil {
@@ -158,6 +241,78 @@ func TestRunnerAcquireDigest(t *testing.T) {
 		t.Fatal("AcquireDigest() accepted a backfill watch")
 	}
 }
+func TestRunnerAcquireDigestRechecksOwnershipAndPreservesAuthors(t *testing.T) {
+	ctx := context.Background()
+	watches := testStore(t)
+	created := createWatch(t, watches, CreateInput{
+		Kind: KindDiscovery, Mode: ModeAlert, Query: "digest", Collection: "Reading", CadenceHours: 24, PerRunCap: 2,
+	})
+	now := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
+	entries := []DigestEntry{
+		{WorkKey: "10.1000/owned", Title: "Owned", Authors: "Ada", AuthorNames: []string{"Ada"}, DOI: "10.1000/owned"},
+		{WorkKey: "10.1000/unowned", Title: "Unowned", Authors: "Smith, Jr., Ada", AuthorNames: []string{"Smith, Jr.", "Ada"}, DOI: "10.1000/unowned"},
+	}
+	if _, err := watches.RecordDigest(ctx, created.ID, now, entries); err != nil {
+		t.Fatal(err)
+	}
+	lookup := &fakeLookup{result: &zotio.LookupWorksResult{Works: []zotio.WorkOwnership{
+		{Status: zotio.OwnershipNotOwned}, {Status: zotio.OwnershipOwnedWithPDF},
+	}}}
+	submitter := &fakeSubmitter{}
+	runner := &Runner{Store: watches, Lookup: lookup, Submitter: submitter, DataDir: t.TempDir(), Now: func() time.Time { return now }}
+
+	queued, err := runner.AcquireDigest(ctx, created.ID, nil)
+	if err != nil || queued != 1 || len(submitter.calls) != 1 {
+		t.Fatalf("AcquireDigest() = %d, %v, submitted = %+v; want one unowned submission", queued, err, submitter.calls)
+	}
+	if len(lookup.requests) != 1 || len(lookup.requests[0].Works) != 2 {
+		t.Fatalf("ownership lookups = %+v, want one lookup for both digest entries", lookup.requests)
+	}
+	if got := submitter.calls[0].Authors; len(got) != 2 || got[0] != "Smith, Jr." || got[1] != "Ada" {
+		t.Fatalf("submitted authors = %q, want lossless names", got)
+	}
+	if digest, err := watches.Digest(ctx, created.ID, 100); err != nil || len(digest) != 0 {
+		t.Fatalf("Digest() after ownership check = %+v, %v; want no pending entries", digest, err)
+	}
+	reported, err := watches.RecordDigest(ctx, created.ID, now.Add(time.Hour), entries)
+	if err != nil || reported != 0 {
+		t.Fatalf("repeated RecordDigest() = %d, %v; want 0, nil", reported, err)
+	}
+	if digest, err := watches.Digest(ctx, created.ID, 100); err != nil || len(digest) != 0 {
+		t.Fatalf("Digest() after repeat = %+v, %v; want no pending entries", digest, err)
+	}
+}
+
+func TestRunnerAcquireDigestFailsClosedOnUnknownOwnership(t *testing.T) {
+	ctx := context.Background()
+	watches := testStore(t)
+	created := createWatch(t, watches, CreateInput{
+		Kind: KindDiscovery, Mode: ModeAlert, Query: "digest", Collection: "Reading", CadenceHours: 24, PerRunCap: 1,
+	})
+	now := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
+	if _, err := watches.RecordDigest(ctx, created.ID, now, []DigestEntry{{
+		WorkKey: "10.1000/unknown", Title: "Unknown", DOI: "10.1000/unknown",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	submitter := &fakeSubmitter{}
+	runner := &Runner{
+		Store: watches,
+		Lookup: &fakeLookup{result: &zotio.LookupWorksResult{Works: []zotio.WorkOwnership{
+			{Status: "unexpected"},
+		}}},
+		Submitter: submitter, DataDir: t.TempDir(), Now: func() time.Time { return now },
+	}
+	if queued, err := runner.AcquireDigest(ctx, created.ID, nil); err == nil || queued != 0 {
+		t.Fatalf("AcquireDigest() = %d, %v; want 0 and unknown ownership error", queued, err)
+	}
+	if len(submitter.calls) != 0 {
+		t.Fatalf("submitted = %+v, want no submission after unknown ownership", submitter.calls)
+	}
+	if digest, err := watches.Digest(ctx, created.ID, 100); err != nil || len(digest) != 1 {
+		t.Fatalf("Digest() after unknown ownership = %+v, %v; want pending entry", digest, err)
+	}
+}
 
 func TestRunnerAcquireDigestStopsAfterSubmissionFailure(t *testing.T) {
 	ctx := context.Background()
@@ -174,7 +329,9 @@ func TestRunnerAcquireDigestStopsAfterSubmissionFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	runner := &Runner{
-		Store:     watches,
+		Store: watches, Lookup: &fakeLookup{result: &zotio.LookupWorksResult{Works: []zotio.WorkOwnership{
+			{Status: zotio.OwnershipNotOwned}, {Status: zotio.OwnershipNotOwned}, {Status: zotio.OwnershipNotOwned},
+		}}},
 		Submitter: &fakeSubmitter{failOnCall: map[int]error{2: context.DeadlineExceeded}},
 		DataDir:   t.TempDir(),
 		Now:       func() time.Time { return now },
@@ -218,6 +375,7 @@ func TestRunnerAcquireDigestPreservesEntriesWhenManifestWriteFails(t *testing.T)
 	}
 	runner := &Runner{
 		Store:     watches,
+		Lookup:    &fakeLookup{result: &zotio.LookupWorksResult{Works: []zotio.WorkOwnership{{Status: zotio.OwnershipNotOwned}}}},
 		Submitter: &fakeSubmitter{},
 		DataDir:   dataDir,
 		Now:       func() time.Time { return now },
