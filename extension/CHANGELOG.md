@@ -14,6 +14,15 @@ History before 0.3.1 was recorded in the root `CHANGELOG.md` (the extension
 and daemon shared a version stream through 0.3.0); see its `[0.3.0]` section
 for the full pre-split extension history.
 
+## [0.4.1] - 2026-07-20
+
+### Fixed
+
+- Tracked institutional handoffs now classify provider landings from the
+  extension's complete adapter registry instead of relying only on the
+  protocol-capped `provider_hosts` offer list. Resolver redirects can therefore
+  reach every 0.4.0 adapter family while unregistered hosts remain assisted.
+
 ## [0.4.0] - 2026-07-20
 
 ### Added
