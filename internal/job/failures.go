@@ -111,6 +111,9 @@ func (js *Store) Failures(ctx context.Context, since time.Time, limit int) ([]Fa
 		out = append(out, group.FailureGroup)
 	}
 	sortFailureGroups(out)
+	for i := range out {
+		out[i].Reason = displayFailureReason(out[i].Reason)
+	}
 	if len(out) > limit {
 		out = out[:limit]
 	}
@@ -142,13 +145,13 @@ func failureReason(detailJSON string) string {
 }
 
 func normalizeFailureReason(reason string) string {
-	reason = strings.TrimSpace(reason)
-	if reason == "" {
-		return ""
-	}
+	return strings.TrimSpace(reason)
+}
+
+func displayFailureReason(reason string) string {
 	runes := []rune(reason)
 	if len(runes) > failureReasonLimit {
-		reason = string(runes[:failureReasonLimit])
+		return string(runes[:failureReasonLimit])
 	}
 	return reason
 }

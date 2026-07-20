@@ -13,6 +13,7 @@ import (
 func TestFailures(t *testing.T) {
 	ctx := context.Background()
 	longReason := strings.Repeat("x", failureReasonLimit+7)
+	longReasonPrefix := strings.Repeat("x", failureReasonLimit)
 
 	tests := []struct {
 		name      string
@@ -47,6 +48,21 @@ func TestFailures(t *testing.T) {
 				{State: StateNeedsReview, Provider: "-", Reason: "inspect identity", Count: 1},
 				{State: StateUnavailable, Provider: "newest.example.test", Reason: "newest candidate", Count: 1},
 				{State: StateUnavailable, Provider: "selected.example.test", Reason: strings.Repeat("x", failureReasonLimit), Count: 1},
+			},
+		},
+		{
+			name: "keeps distinct long reasons in separate groups",
+			setup: func(t *testing.T, js *Store) []string {
+				firstReason := longReasonPrefix + " first"
+				secondReason := longReasonPrefix + " second"
+				createFailure(t, js, "failures-long-first", StateFailed, firstReason, []string{"https://api.example.test/first.pdf"}, false)
+				createFailure(t, js, "failures-long-first-again", StateFailed, firstReason, []string{"https://api.example.test/again.pdf"}, false)
+				createFailure(t, js, "failures-long-second", StateFailed, secondReason, []string{"https://api.example.test/second.pdf"}, false)
+				return nil
+			},
+			want: []FailureGroup{
+				{State: StateFailed, Provider: "api.example.test", Reason: longReasonPrefix, Count: 2},
+				{State: StateFailed, Provider: "api.example.test", Reason: longReasonPrefix, Count: 1},
 			},
 		},
 		{
