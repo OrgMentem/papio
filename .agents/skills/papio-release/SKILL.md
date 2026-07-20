@@ -54,7 +54,11 @@ flags, never by version-number correlation between artifacts:
 Run the compatibility preflight before tagging: `release_metadata.py compat`
 runs from `scripts/release.sh` and release CI. Floors are mechanically
 enforced there; decide **when** to move them by the rules above, then let the
-script verify the declaration is coherent.
+script verify the declaration is coherent. Running it standalone requires
+explicit args (there are no defaults):
+`python3 scripts/release_metadata.py compat --repo-root . --papio-version
+<x.y.z> --zotio-binary "$(command -v zotio)"` — `--zotio-binary` is required
+unless `--skip-zotio` is passed.
 
 ## Changelogs
 
@@ -99,6 +103,17 @@ ship a config change and the binary that understands it together. Build, move
 the binary into place, then run `papio daemon stop`; there is no `daemon
 restart`, and the next command autostarts the new daemon.
 
+Local deploy after a tagged release: papio installs as a Homebrew **cask**
+(`/opt/homebrew/Caskroom/papio/<ver>/papio`), and the tap can deliver the new
+binary via scheduled `brew upgrade` without any action — the running daemon
+keeps its old version until restarted, so the machine sits in silent skew
+(0.6.0 deployed under a live 0.1.0-dev daemon within hours of tagging). The
+CLI detects this and prints the remediation (`daemon is running X but this
+CLI is Y — run 'papio daemon stop'`); `papio daemon status` surfaces it too.
+Deploy = `brew upgrade --cask papio` (or let the tap do it) → `papio daemon
+stop` → any command autostarts the new daemon and runs pending schema
+migrations. Verify with `papio daemon status` + `papio doctor`.
+
 ## Protocol bump policy
 
 Keep additive optional fields on `papio-browser/1`. Update both parsers, the
@@ -127,7 +142,8 @@ migration plan before merging; do not tag first and design compatibility later.
       smoke test passed.
 - [ ] Check the Homebrew formula **and** Scoop bucket updated. A `401` there means
       the tap/bucket PAT secrets are missing/expired — the release binaries are
-      fine; fix the secrets and re-run.
+      fine; fix the secrets and re-run. (A fully green release run already
+      proves both pushes worked — no separate check needed.)
 - [ ] WinGet: check `.goreleaser.yaml`'s `skip_upload` before tagging, not after.
       It is currently `true` — paused until the first-package PR
       (microsoft/winget-pkgs#404562) merges, so a release cut while it's
@@ -196,6 +212,17 @@ Required-reviewer gate on the submission job. Config that bit us this session:
 Shared OAuth creds are **org** secrets scoped to selected repos: `CWS_CLIENT_ID`,
 `CWS_CLIENT_SECRET`, `CWS_REFRESH_TOKEN`, `WEB_EXT_API_KEY`, `WEB_EXT_API_SECRET`.
 The per-extension `CWS_EXTENSION_ID` is a repo/environment secret — never org-wide.
+
+**Current status — all secrets exist and work; do not re-verify or re-mint.**
+As of v0.6.0 (2026-07-20): org secrets `CWS_CLIENT_ID`, `CWS_CLIENT_SECRET`,
+`CWS_REFRESH_TOKEN`, `WEB_EXT_API_KEY`, `WEB_EXT_API_SECRET`,
+`HOMEBREW_TAP_GITHUB_TOKEN`, `SCOOP_BUCKET_GITHUB_TOKEN`, `WINGET_GITHUB_TOKEN`
+(all visibility=selected, incl. papio; set 2026-07-19) plus repo secret
+`CWS_EXTENSION_ID`. The tap/bucket tokens are proven by the green v0.6.0
+release run; the CWS/AMO creds by the initial store submissions. Only revisit
+on a `401`/auth failure (names via `gh secret list --org OrgMentem` /
+`--repo OrgMentem/papio`; values are write-only — recover from the password
+manager or re-mint, never from GitHub).
 
 Set them without leaking values: `gh secret set NAME --org OrgMentem --visibility
 selected --repos papio` uses a hidden prompt — never pass `--body` (shell history).
