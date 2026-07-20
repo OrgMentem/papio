@@ -1,0 +1,9 @@
+{
+  "protocol": "papio-browser/1",
+  "type": "page_acquire",
+  "msg_id": "page-acquire-003",
+  "seq": 1,
+  "payload": {
+    "url": "ftp://publisher.example.edu/article/42"
+  }
+}

@@ -21,6 +21,11 @@ import (
 	"papio/internal/job"
 )
 
+type jobsFailuresResult struct {
+	Failures []job.FailureGroup `json:"failures"`
+	Since    string             `json:"since,omitempty"`
+}
+
 func newJobsCommand(opt *options) *cobra.Command {
 	command := &cobra.Command{Use: "jobs", Short: "Inspect and control acquisition jobs"}
 	var state string
@@ -110,7 +115,33 @@ func newJobsCommand(opt *options) *cobra.Command {
 			return opt.printResult(result, "Retrying %s", args[0])
 		},
 	}
-	command.AddCommand(list, get, cancel, retry)
+	var failuresSince string
+	var failuresLimit int
+	failures := &cobra.Command{
+		Use:         "failures",
+		Short:       "Group acquisition jobs that need attention",
+		Annotations: map[string]string{"mcp:read-only": "true"},
+		Args:        cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			var result jobsFailuresResult
+			if err := opt.call(cmd.Context(), "jobs.failures", map[string]any{"since": failuresSince, "limit": failuresLimit}, &result); err != nil {
+				return err
+			}
+			if opt.jsonOutput {
+				return opt.printJSON(result)
+			}
+			for _, group := range result.Failures {
+				if _, err := fmt.Fprintf(opt.out, "%d | %s | %s | %s (sample: %s)\n", group.Count, group.State, group.Provider, group.Reason, group.Sample); err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+	}
+	failures.Flags().StringVar(&failuresSince, "since", "", "include jobs updated since a duration or RFC3339 timestamp")
+	failures.Flags().IntVar(&failuresLimit, "limit", 50, "maximum groups (1-200)")
+
+	command.AddCommand(list, get, cancel, retry, failures)
 	return command
 }
 

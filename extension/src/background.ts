@@ -20,6 +20,8 @@ import {
   parseBrowserMessage,
   type BrowserMessage,
   type BrowserMessageType,
+  type PageAcquireAckPayload,
+  type PageAcquirePayload,
 } from "./protocol";
 import {
   chromeBackend,
@@ -75,6 +77,11 @@ const MAX_AUTH_ATTEMPTS = 3;
 const KEEPALIVE_ALARM = "papio-keepalive";
 const KEEPALIVE_ALARM_MINUTES = 1;
 
+/** Whether this adapter's SPA must render outside the minimized work window. */
+export function needsVisibleWindow(spec: AdapterSpec | undefined): boolean {
+  return spec?.requiresVisible === true;
+}
+
 export interface Listenable<A extends unknown[]> {
   addListener(cb: (...args: A) => void): void;
 }
@@ -85,6 +92,7 @@ export interface NativePort {
   onDisconnect: Listenable<[]>;
   disconnect(): void;
 }
+
 
 export interface TabInfo {
   id?: number | undefined;
@@ -150,13 +158,13 @@ export interface BridgeDeps {
     onUpdated: Listenable<[number, TabChangeInfo, TabInfo]>;
     onRemoved: Listenable<[number, { isWindowClosing: boolean }]>;
   };
-  /** chrome.windows seam. When present (and the user setting allows), every
-   * broker tab is routed into one dedicated minimized "work window" instead of
-   * the user's tab strip; a tab surfaces only when the human is needed (IdP
-   * authentication). Absent on platforms without the API — tabs then open in
-   * the current window with the legacy visibility rules. */
+  /** chrome.windows seam. When present (and the user setting allows), broker
+   * tabs use one dedicated minimized "work window" instead of the user's tab
+   * strip, except an adapter whose SPA needs a visible window. A tab otherwise
+   * surfaces only when the human is needed (IdP authentication). Absent on
+   * platforms without the API — tabs then open with the legacy visibility rules. */
   windows?: {
-    create(props: { url: string; focused: boolean; state: "minimized" }): Promise<WindowInfo>;
+    create(props: { url: string; focused: boolean; state: "minimized" | "normal" }): Promise<WindowInfo>;
     get(windowID: number): Promise<WindowInfo>;
     update(
       windowID: number,
@@ -481,6 +489,9 @@ async function clickDeclaredDownload(
 
 export class Bridge {
   private port: NativePort | null = null;
+  /** page_acquire acknowledgements carry no correlation id, so requests are
+   * serialized in popup-message order and resolved FIFO. */
+  private readonly pageAcquireWaiters: Array<(ack: PageAcquireAckPayload) => void> = [];
   /** Signed provider URL -> job for the narrow interval between calling
    * chrome.downloads.download and receiving its ID. Memory-only: never stored
    * or framed. This lets onDeterminingFilename steer the exact adapter-started
@@ -567,13 +578,22 @@ export class Bridge {
     }
   }
 
-  /** Open a broker tab. In work-window mode every tab lands unfocused in the
-   * dedicated minimized window; otherwise the legacy rule applies and
-   * `surfaceFallback` decides whether the tab takes focus. Never throws —
-   * returns undefined on failure, matching the call sites' reject paths. */
+  /** Open a broker tab. Work-window tabs stay unfocused and minimized unless a
+   * directly matched adapter requires its SPA to render visibly; otherwise the
+   * legacy rule applies and `surfaceFallback` decides whether the tab takes
+   * focus. Never throws — returns undefined on failure, matching callers. */
   private async openBrokerTab(url: string, surfaceFallback: boolean): Promise<number | undefined> {
     if (await this.workWindowActive()) {
-      const opened = this.workTabChain.then(() => this.openWorkWindowTab(url));
+      let targetAdapter: AdapterSpec | undefined;
+      try {
+        const host = new URL(url).hostname;
+        targetAdapter = this.deps.adapterSpecs.find((candidate) => hostMatches(host, candidate.hosts));
+      } catch {
+        // The browser will reject malformed handoff URLs through the normal path.
+      }
+      const opened = this.workTabChain.then(() =>
+        this.openWorkWindowTab(url, needsVisibleWindow(targetAdapter)),
+      );
       this.workTabChain = opened.catch(() => undefined);
       try {
         return await opened;
@@ -590,27 +610,50 @@ export class Bridge {
     }
   }
 
-  /** Create the tab inside the dedicated work window, creating or recreating
-   * the window (minimized, unfocused) when it is missing or was closed. */
-  private async openWorkWindowTab(url: string): Promise<number | undefined> {
+  /** Create the tab inside the dedicated work window, keeping a directly
+   * matched visible-required adapter out of the minimized state. */
+  private async openWorkWindowTab(url: string, visible: boolean): Promise<number | undefined> {
     const windows = this.deps.windows;
     if (windows === undefined) return undefined;
     const existing = this.store.workWindowID;
     if (existing !== undefined) {
       try {
-        await windows.get(existing);
+        const win = await windows.get(existing);
+        if (visible && win.state === "minimized") {
+          await windows.update(existing, { focused: false, state: "normal" });
+        }
         return (await this.deps.tabs.create({ url, active: false, windowId: existing })).id;
       } catch {
         // Window closed by the user (or the tab create raced its closing):
         // fall through and recreate.
       }
     }
-    const created = await windows.create({ url, focused: false, state: "minimized" });
+    const created = await windows.create({
+      url,
+      focused: false,
+      state: visible ? "normal" : "minimized",
+    });
     if (created.id !== undefined) {
       const windowID = created.id;
       await this.update((s) => ({ ...s, workWindowID: windowID }));
     }
     return created.tabs?.find((tab) => tab.id !== undefined)?.id;
+  }
+
+  /** Restore only adapters whose SPA cannot hydrate while the work window is hidden. */
+  private async restoreWorkWindowForAdapter(spec: AdapterSpec): Promise<void> {
+    if (!needsVisibleWindow(spec)) return;
+    const windowID = this.store.workWindowID;
+    const windows = this.deps.windows;
+    if (windowID === undefined || windows === undefined) return;
+    try {
+      const win = await windows.get(windowID);
+      if (win.state === "minimized") {
+        await windows.update(windowID, { focused: false, state: "normal" });
+      }
+    } catch {
+      // The handoff continues assisted if the dedicated window disappeared.
+    }
   }
 
   /** Bring a work-window tab to the human: activate it and restore/focus the
@@ -765,6 +808,7 @@ export class Bridge {
 
   /** Cancel an active job on user request (popup cancel button). */
   async requestCancel(jobID: string): Promise<void> {
+
     await this.ready;
     const job = findByJob(this.store, jobID);
     if (!job) return;
@@ -780,6 +824,36 @@ export class Bridge {
     this.downloads.delete(jobID);
     this.completedDownloadTabs.delete(jobID);
     await this.removeJobWithOffer(jobID);
+  }
+
+  /** Forward an active-page acquisition request and await the daemon ack. */
+  async requestPageAcquire(payload: PageAcquirePayload): Promise<PageAcquireAckPayload> {
+    await this.ready;
+    if (
+      this.store.connectionStatus !== "connected" ||
+      !(this.store.daemonFeatures ?? []).includes("page_acquire")
+    ) {
+      return { error: "Page acquisition is not available from this daemon" };
+    }
+    return new Promise<PageAcquireAckPayload>((resolve) => {
+      this.pageAcquireWaiters.push(resolve);
+      const frame: Record<string, unknown> = {
+        url: payload.url,
+        ...(payload.doi !== undefined ? { doi: payload.doi } : {}),
+        ...(payload.title !== undefined ? { title: payload.title } : {}),
+        ...(payload.source !== undefined ? { source: payload.source } : {}),
+      };
+      if (!this.send("page_acquire", frame)) {
+        this.pageAcquireWaiters.pop();
+        resolve({ error: "Could not send page acquisition request" });
+      }
+    });
+  }
+
+  private failPageAcquireWaiters(error: string): void {
+    while (this.pageAcquireWaiters.length > 0) {
+      this.pageAcquireWaiters.shift()?.({ error });
+    }
   }
 
   /**
@@ -943,6 +1017,7 @@ export class Bridge {
     // A stale port may report its close after recovery opened a replacement.
     if (this.port !== port) return;
     this.port = null;
+    this.failPageAcquireWaiters("The daemon disconnected before acknowledging this page");
     await this.update((s) => ({ ...s, connectionStatus: "disconnected" }));
     await this.syncConnectionBadge("disconnected");
     if (this.closingDeliberately) return;
@@ -962,6 +1037,7 @@ export class Bridge {
     this.closingDeliberately = true;
     const port = this.port;
     this.port = null;
+    this.failPageAcquireWaiters("The daemon disconnected before acknowledging this page");
     if (!port) return;
     try {
       port.disconnect();
@@ -978,6 +1054,7 @@ export class Bridge {
     // schedule a second recovery after connect() has installed its replacement.
     this.closingDeliberately = true;
     this.port = null;
+    this.failPageAcquireWaiters("The daemon restarted before acknowledging this page");
     try {
       port.disconnect();
     } catch {
@@ -1210,9 +1287,9 @@ export class Bridge {
   /** Build, self-validate, and post one outbound frame. Validation is a safety
    * net: a frame that would not survive the shared parser is dropped, never
    * emitted. */
-  private send(type: BrowserMessageType, payload: Record<string, unknown>, jobID?: string): void {
+  private send(type: BrowserMessageType, payload: Record<string, unknown>, jobID?: string): boolean {
     const port = this.port;
-    if (!port) return;
+    if (!port) return false;
     const env: Record<string, unknown> = {
       protocol: BROWSER_PROTOCOL_VERSION,
       type,
@@ -1225,9 +1302,10 @@ export class Bridge {
       parseBrowserMessage(env);
     } catch (e) {
       console.error("papio: refusing to send invalid frame", type, e);
-      return;
+      return false;
     }
     port.postMessage(env);
+    return true;
   }
 
   private async onInbound(raw: unknown): Promise<void> {
@@ -1269,6 +1347,17 @@ export class Bridge {
           resolverOrigins,
         }));
         await this.syncConnectionBadge(connectionStatus);
+        return;
+      }
+      case "page_acquire_ack": {
+        const waiter = this.pageAcquireWaiters.shift();
+        if (waiter) {
+          waiter({
+            ...(typeof msg.payload.job_id === "string" ? { job_id: msg.payload.job_id } : {}),
+            ...(typeof msg.payload.duplicate === "boolean" ? { duplicate: msg.payload.duplicate } : {}),
+            ...(typeof msg.payload.error === "string" ? { error: msg.payload.error } : {}),
+          });
+        }
         return;
       }
       case "ack":
@@ -1804,6 +1893,7 @@ export class Bridge {
       await this.recordUnknown(job, host);
       return; // no declarative adapter for this verified host
     }
+    await this.restoreWorkWindowForAdapter(spec);
     let granted = false;
     try {
       granted = await this.deps.permissions.contains({ origins: [`https://${host}/*`] });
@@ -2296,6 +2386,39 @@ function isCancelRequest(message: unknown): message is CancelRequest {
   );
 }
 
+interface PageAcquireRequest {
+  channel: "papio";
+  action: "page_acquire";
+  payload: PageAcquirePayload;
+}
+
+function isPageAcquireRequest(message: unknown): message is PageAcquireRequest {
+  if (
+    typeof message !== "object" ||
+    message === null ||
+    !("channel" in message) ||
+    message.channel !== "papio" ||
+    !("action" in message) ||
+    message.action !== "page_acquire" ||
+    !("payload" in message) ||
+    typeof message.payload !== "object" ||
+    message.payload === null ||
+    Array.isArray(message.payload)
+  ) {
+    return false;
+  }
+  const payload = message.payload as Record<string, unknown>;
+  if (!Object.keys(payload).every((key) => key === "url" || key === "doi" || key === "title" || key === "source")) {
+    return false;
+  }
+  return (
+    typeof payload.url === "string" &&
+    (payload.doi === undefined || typeof payload.doi === "string") &&
+    (payload.title === undefined || typeof payload.title === "string") &&
+    (payload.source === undefined || typeof payload.source === "string")
+  );
+}
+
 interface TermsConsentRequest {
   channel: "papio";
   action: "terms_consent";
@@ -2346,7 +2469,7 @@ function realDeps(): BridgeDeps {
     ...(typeof chrome.windows !== "undefined"
       ? {
           windows: {
-            create: (props: { url: string; focused: boolean; state: "minimized" }) =>
+            create: (props: { url: string; focused: boolean; state: "minimized" | "normal" }) =>
               chrome.windows.create(props) as Promise<WindowInfo>,
             get: (windowID: number) => chrome.windows.get(windowID) as Promise<WindowInfo>,
             update: (windowID: number, props: { focused?: boolean; state?: "normal" }) =>
@@ -2430,6 +2553,10 @@ if (typeof chrome !== "undefined" && chrome.runtime?.id) {
   chrome.runtime.onStartup.addListener(() => {});
   chrome.runtime.onInstalled.addListener(() => {});
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+    if (isPageAcquireRequest(message)) {
+      void bridge.requestPageAcquire(message.payload).then(sendResponse);
+      return true; // async native acknowledgement
+    }
     if (isCancelRequest(message)) {
       void bridge.requestCancel(message.job_id).then(() => sendResponse({ ok: true }));
       return true; // async sendResponse

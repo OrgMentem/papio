@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/url"
 	"regexp"
 	"strings"
 	"time"
@@ -397,6 +398,8 @@ func enumRequired(field, value string, allowed ...string) error {
 const (
 	MsgHello            = "hello"
 	MsgHelloAck         = "hello_ack"
+	MsgPageAcquire      = "page_acquire"
+	MsgPageAcquireAck   = "page_acquire_ack"
 	MsgJobOffer         = "job_offer"
 	MsgJobAccept        = "job_accept"
 	MsgJobReject        = "job_reject"
@@ -434,6 +437,23 @@ type HelloAckPayload struct {
 	// resolvers. The extension requests a host permission for each so it can
 	// steer that resolver's menu; institution identity stays in config, not code.
 	ResolverOrigins []string `json:"resolver_origins,omitempty"`
+}
+
+// PageAcquirePayload asks the daemon to queue the paper identified on the
+// user's current page. Source is advisory provenance only.
+type PageAcquirePayload struct {
+	URL    string `json:"url"`
+	DOI    string `json:"doi,omitempty"`
+	Title  string `json:"title,omitempty"`
+	Source string `json:"source,omitempty"`
+}
+
+// PageAcquireAckPayload reports the durable queue result without exposing
+// internal state to the browser.
+type PageAcquireAckPayload struct {
+	JobID     string `json:"job_id,omitempty"`
+	Duplicate bool   `json:"duplicate,omitempty"`
+	Error     string `json:"error,omitempty"`
 }
 
 // JobOfferPayload asks the extension to open one OpenURL-resolved job.
@@ -617,6 +637,28 @@ func DecodeBrowserMessage(data []byte) (*BrowserMessage, error) {
 			}
 		}
 		msg.Payload = p
+	case MsgPageAcquire:
+		p := &PageAcquirePayload{}
+		if err = browserRequireFields(payloadFields, "url"); err == nil {
+			err = browserRejectNullFields(payloadFields, "doi", "title", "source")
+		}
+		if err == nil {
+			err = strictDecode(env.Payload, p)
+		}
+		if err == nil {
+			err = p.validate()
+		}
+		msg.Payload = p
+	case MsgPageAcquireAck:
+		p := &PageAcquireAckPayload{}
+		err = browserRejectNullFields(payloadFields, "job_id", "duplicate", "error")
+		if err == nil {
+			err = strictDecode(env.Payload, p)
+		}
+		if err == nil {
+			err = p.validate()
+		}
+		msg.Payload = p
 	case MsgJobOffer:
 		p := &JobOfferPayload{}
 		if err = browserRequireFields(payloadFields, "openurl", "provider_hosts", "access_mode", "expires_at"); err == nil {
@@ -702,6 +744,36 @@ func DecodeBrowserMessage(data []byte) (*BrowserMessage, error) {
 		return nil, fmt.Errorf("browser message %s: %w", env.Type, err)
 	}
 	return msg, nil
+}
+
+func (p *PageAcquirePayload) validate() error {
+	if browserTextLen(p.URL) == 0 || browserTextLen(p.URL) > 4000 {
+		return fmt.Errorf("page_acquire.url required (max 4000)")
+	}
+	u, err := url.ParseRequestURI(p.URL)
+	if err != nil || (!strings.EqualFold(u.Scheme, "http") && !strings.EqualFold(u.Scheme, "https")) || u.Host == "" {
+		return fmt.Errorf("page_acquire.url must be a parseable http(s) URL")
+	}
+	if browserTextLen(p.DOI) > 512 {
+		return fmt.Errorf("page_acquire.doi exceeds 512 chars")
+	}
+	if browserTextLen(p.Title) > 1024 {
+		return fmt.Errorf("page_acquire.title exceeds 1024 chars")
+	}
+	if browserTextLen(p.Source) > 1024 {
+		return fmt.Errorf("page_acquire.source exceeds 1024 chars")
+	}
+	return nil
+}
+
+func (p *PageAcquireAckPayload) validate() error {
+	if p.JobID != "" && !requestIDRE.MatchString(p.JobID) {
+		return fmt.Errorf("page_acquire_ack.job_id is invalid")
+	}
+	if browserTextLen(p.Error) > 1000 {
+		return fmt.Errorf("page_acquire_ack.error exceeds 1000 chars")
+	}
+	return nil
 }
 
 func (p *JobOfferPayload) validate() error {

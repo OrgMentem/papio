@@ -35,6 +35,12 @@ func NewWebhook(url, secret string) *Webhook {
 // Send posts a bounded notification and deliberately ignores every failure so
 // an unavailable endpoint cannot interrupt daemon work.
 func (w *Webhook) Send(ctx context.Context, message string) {
+	w.SendEvent(ctx, Event{Message: message})
+}
+
+// SendEvent posts a bounded structured notification and deliberately ignores
+// every failure so an unavailable endpoint cannot interrupt daemon work.
+func (w *Webhook) SendEvent(ctx context.Context, event Event) {
 	if ctx == nil || ctx.Err() != nil {
 		return
 	}
@@ -47,13 +53,13 @@ func (w *Webhook) Send(ctx context.Context, message string) {
 		now = w.Now
 	}
 	payload, err := json.Marshal(struct {
-		Source  string `json:"source"`
-		Message string `json:"message"`
-		SentAt  string `json:"sent_at"`
+		Source string `json:"source"`
+		Event
+		SentAt string `json:"sent_at"`
 	}{
-		Source:  "papio",
-		Message: message,
-		SentAt:  now().UTC().Format(time.RFC3339),
+		Source: "papio",
+		Event:  event,
+		SentAt: now().UTC().Format(time.RFC3339),
 	})
 	if err != nil {
 		return

@@ -32,12 +32,21 @@ func newAcquireCommand(opt *options) *cobra.Command {
 	var year, queueLimit int
 	var maxCost float64
 	var wait, fromZotio, autoImport, includeOwned bool
+	var fromDigest int64
 	var batchPath string
+	var digestKeys []string
 	command := &cobra.Command{
 		Use:   "acquire [identifier]",
 		Short: "Submit one paper-acquisition request",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			fromDigestRequested := cmd.Flags().Changed("from-digest")
+			if fromDigestRequested && cmd.Flags().Changed("batch") {
+				return fmt.Errorf("--from-digest cannot be combined with --batch")
+			}
+			if !fromDigestRequested && cmd.Flags().Changed("keys") {
+				return fmt.Errorf("--keys is supported only with --from-digest")
+			}
 			autoImportOverride := boolOverride(cmd, "auto-import", autoImport)
 			if cmd.Flags().Changed("batch") {
 				if batchPath == "" {
@@ -47,6 +56,40 @@ func newAcquireCommand(opt *options) *cobra.Command {
 					return err
 				}
 				return acquireBatch(cmd.Context(), cmd, opt, batchPath, autoImportOverride, strings.TrimSpace(collection), strings.TrimSpace(resolver), strings.TrimSpace(label), includeOwned)
+			}
+			if fromDigestRequested {
+				if fromDigest <= 0 {
+					return fmt.Errorf("--from-digest requires a positive watch ID")
+				}
+				if fromZotio {
+					return fmt.Errorf("--from-digest cannot be combined with --from-zotio")
+				}
+				if len(args) != 0 {
+					return fmt.Errorf("--from-digest cannot be combined with a positional identifier")
+				}
+				for _, name := range []string{
+					"doi", "pmid", "arxiv", "isbn", "openalex", "title", "author", "year", "request-id", "zotio-item-key",
+				} {
+					if cmd.Flags().Changed(name) {
+						return fmt.Errorf("--from-digest cannot be combined with one-work identity flags")
+					}
+				}
+				for _, name := range []string{
+					"wait", "auto-import", "collection", "desired-version", "access-mode", "resolver", "max-cost", "source", "deny-source", "limit", "include-owned", "label",
+				} {
+					if cmd.Flags().Changed(name) {
+						return fmt.Errorf("--%s is not supported with --from-digest", name)
+					}
+				}
+				params := struct {
+					ID   int64    `json:"id"`
+					Keys []string `json:"keys,omitempty"`
+				}{ID: fromDigest, Keys: trimNonempty(digestKeys)}
+				var result api.WatchDigestAcquireResult
+				if err := opt.call(cmd.Context(), "watch.digest_acquire", params, &result); err != nil {
+					return err
+				}
+				return opt.printResult(result, "Queued %d digest work(s)", result.Queued)
 			}
 			if cmd.Flags().Changed("label") {
 				return fmt.Errorf("--label is supported only with --batch")
@@ -149,7 +192,8 @@ func newAcquireCommand(opt *options) *cobra.Command {
 	flags.StringSliceVar(&denySources, "deny-source", nil, "deny this source (repeatable)")
 	flags.BoolVar(&wait, "wait", false, "wait for a terminal or human-action state")
 	flags.BoolVar(&fromZotio, "from-zotio", false, "queue zotio items missing an attached PDF")
-	flags.IntVar(&queueLimit, "limit", 25, "maximum zotio queue rows (1-500)")
+	flags.Int64Var(&fromDigest, "from-digest", 0, "queue pending entries from an alert watch")
+	flags.StringSliceVar(&digestKeys, "keys", nil, "digest work keys to queue (comma-separated)")
 	flags.StringVar(&batchPath, "batch", "", "submit JSONL works from a file or - for standard input")
 	flags.BoolVar(&includeOwned, "include-owned", false, "with --batch, submit works already carrying a PDF in zotio")
 	flags.StringVar(&label, "label", "", "batch query context; also the default target collection when --collection is unset")

@@ -66,6 +66,50 @@ test("hello_ack accepts optional daemon details and rejects invalid members", ()
     expect(() => parseBrowserMessage(frame({ resolver_origins: [bad] }))).toThrow(ProtocolError);
   }
 });
+
+test("page_acquire messages parse strictly", () => {
+  const frame = (type: "page_acquire" | "page_acquire_ack", payload: Record<string, unknown>) => ({
+    protocol: "papio-browser/1",
+    type,
+    msg_id: "page-acquire-001",
+    seq: 1,
+    payload,
+  });
+
+  expect(parseBrowserMessage(frame("page_acquire", {
+    url: "https://publisher.example.edu/article/42",
+    doi: "10.1000/example.42",
+    title: "An Example Paper",
+    source: "popup",
+  })).payload).toEqual({
+    url: "https://publisher.example.edu/article/42",
+    doi: "10.1000/example.42",
+    title: "An Example Paper",
+    source: "popup",
+  });
+  expect(parseBrowserMessage(frame("page_acquire_ack", {
+    job_id: "job_page_acquire_001",
+    duplicate: true,
+  })).payload).toEqual({ job_id: "job_page_acquire_001", duplicate: true });
+
+  for (const payload of [
+    {},
+    { url: "ftp://publisher.example.edu/article/42" },
+    { url: "https://publisher.example.edu/article/42", doi: "d".repeat(513) },
+    { url: null },
+    { url: "https://publisher.example.edu/article/42", unexpected: true },
+  ]) {
+    expect(() => parseBrowserMessage(frame("page_acquire", payload))).toThrow(ProtocolError);
+  }
+  for (const payload of [
+    { job_id: null },
+    { duplicate: "yes" },
+    { error: null },
+    { unexpected: true },
+  ]) {
+    expect(() => parseBrowserMessage(frame("page_acquire_ack", payload))).toThrow(ProtocolError);
+  }
+});
 test("auth payloads structurally reject URLs", () => {
   expect(() =>
     parseBrowserMessage({

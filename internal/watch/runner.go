@@ -12,6 +12,7 @@ import (
 
 	"papio/internal/batch"
 	"papio/internal/discovery"
+	"papio/internal/notify"
 	"papio/internal/protocol"
 	"papio/internal/work"
 	"papio/internal/zotio"
@@ -85,6 +86,65 @@ func (r *Runner) Run(ctx context.Context, id int64) (*RunResult, error) {
 	return r.runWatch(ctx, *watch)
 }
 
+// AcquireDigest submits pending alert discoveries through the normal watch
+// acquisition path, removing each entry only after its submission succeeds.
+func (r *Runner) AcquireDigest(ctx context.Context, watchID int64, keys []string) (queued int, err error) {
+	if r == nil || r.Store == nil || r.Submitter == nil {
+		return 0, errors.New("watch runner dependencies are not configured")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	watch, err := r.Store.Get(ctx, watchID)
+	if err != nil {
+		return 0, err
+	}
+	if watch.Kind != KindDiscovery {
+		return 0, fmt.Errorf("watch %d is not a discovery watch", watchID)
+	}
+	entries, err := r.Store.TakeDigest(ctx, watchID, keys)
+	if err != nil {
+		return 0, err
+	}
+	if len(entries) == 0 {
+		return 0, nil
+	}
+
+	works := make([]protocol.WorkRequest, len(entries))
+	for i, entry := range entries {
+		works[i], err = workRequestForDigest(entry)
+		if err != nil {
+			return 0, err
+		}
+	}
+	manifest := batch.NewManifest(works, "watch: "+watch.Label, watch.Collection, r.now())
+	autoImport := true
+	for i := range manifest.Works {
+		requestID := batch.RequestID(fmt.Sprintf("watch-%d", watch.ID), manifest.Works[i].Work)
+		manifest.Works[i].RequestID = requestID
+		manifest.Works[i].Work.RequestID = requestID
+
+		jobID, submitErr := r.Submitter.SubmitWithAutoImport(ctx, manifest.Works[i].Work, &autoImport)
+		if submitErr != nil {
+			manifest.Works[i].Status = "submission_failed"
+			manifest.Works[i].Error = "submit"
+			if writeErr := batch.Write(r.DataDir, manifest); writeErr != nil {
+				return queued, fmt.Errorf("%w (writing digest manifest: %v)", submitErr, writeErr)
+			}
+			return queued, submitErr
+		}
+		manifest.Works[i].JobID = jobID
+		queued++
+		if err := r.Store.deleteDigestEntry(ctx, watchID, entries[i].WorkKey); err != nil {
+			return queued, err
+		}
+	}
+	if err := batch.Write(r.DataDir, manifest); err != nil {
+		return queued, err
+	}
+	return queued, nil
+}
+
 // RunDue serially executes all watches due at the current time. Per-watch
 // failures are recorded by runWatch and intentionally do not stop later due
 // watches or crash the daemon scheduler.
@@ -139,7 +199,13 @@ func (r *Runner) execute(ctx context.Context, watch Watch) (*RunResult, error) {
 		}
 		result.Queued = len(queued.Queued)
 		if r.Notifier != nil && result.Queued > 0 {
-			r.Notifier.Send(ctx, fmt.Sprintf("watch %s: %d missing PDFs queued", watch.Label, result.Queued))
+			notify.Emit(ctx, r.Notifier, notify.Event{
+				Kind:       "watch.backfill",
+				Message:    fmt.Sprintf("watch %s: %d missing PDFs queued", watch.Label, result.Queued),
+				WatchID:    watch.ID,
+				WatchLabel: watch.Label,
+				Count:      result.Queued,
+			})
 		}
 		if err := r.Store.MarkRun(ctx, watch.ID, r.now()); err != nil {
 			return result, err
@@ -209,7 +275,13 @@ func (r *Runner) execute(ctx context.Context, watch Watch) (*RunResult, error) {
 		}
 		result.Reported = reported
 		if r.Notifier != nil && reported > 0 {
-			r.Notifier.Send(ctx, fmt.Sprintf("watch %s: %d new works found — papio watch digest %d", watch.Label, reported, watch.ID))
+			notify.Emit(ctx, r.Notifier, notify.Event{
+				Kind:       "watch.alert",
+				Message:    fmt.Sprintf("watch %s: %d new works found — papio watch digest %d", watch.Label, reported, watch.ID),
+				WatchID:    watch.ID,
+				WatchLabel: watch.Label,
+				Count:      reported,
+			})
 		}
 		if err := r.Store.MarkRun(ctx, watch.ID, r.now()); err != nil {
 			return result, err
@@ -248,7 +320,13 @@ func (r *Runner) execute(ctx context.Context, watch Watch) (*RunResult, error) {
 		return result, fmt.Errorf("all %d watch submissions failed", result.Failed)
 	}
 	if r.Notifier != nil && result.Queued > 0 {
-		r.Notifier.Send(ctx, fmt.Sprintf("watch %s: %d new papers queued", watch.Label, result.Queued))
+		notify.Emit(ctx, r.Notifier, notify.Event{
+			Kind:       "watch.acquire",
+			Message:    fmt.Sprintf("watch %s: %d new papers queued", watch.Label, result.Queued),
+			WatchID:    watch.ID,
+			WatchLabel: watch.Label,
+			Count:      result.Queued,
+		})
 	}
 	if result.Failed > 0 {
 		return result, r.Store.MarkDegradedRun(ctx, watch.ID, r.now(), result.Failed, len(manifest.Works))
@@ -361,12 +439,46 @@ func digestEntriesForDiscovered(requests []discoveredRequest) ([]DigestEntry, er
 			TitleKey: titleKey,
 			Title:    title,
 			Authors:  strings.Join(request.Discovered.Work.Authors, ", "),
-			Year:     request.Discovered.Work.Year,
-			DOI:      doi,
-			IsOA:     request.Discovered.IsOA,
+
+			Year: request.Discovered.Work.Year,
+			DOI:  doi,
+			IsOA: request.Discovered.IsOA,
 		})
 	}
 	return entries, nil
+}
+
+func workRequestForDigest(entry DigestEntry) (protocol.WorkRequest, error) {
+	title := strings.TrimSpace(entry.Title)
+	if title == "" {
+		return protocol.WorkRequest{}, errors.New("watch digest entry requires title")
+	}
+	request := protocol.WorkRequest{
+		SchemaVersion: protocol.WorkRequestSchemaVersion,
+		Title:         title,
+		Year:          entry.Year,
+	}
+	for _, author := range strings.Split(entry.Authors, ",") {
+		if author = strings.TrimSpace(author); author != "" {
+			request.Authors = append(request.Authors, author)
+		}
+	}
+	if doi := strings.TrimSpace(entry.DOI); doi != "" {
+		normalized, err := work.NormalizeDOI(doi)
+		if err != nil {
+			return protocol.WorkRequest{}, fmt.Errorf("normalizing watch digest DOI: %w", err)
+		}
+		request.Identifiers = &protocol.Identifiers{DOI: normalized}
+		return request, nil
+	}
+	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(entry.WorkKey)), "arxiv:") {
+		arXiv, err := work.NormalizeArXiv(entry.WorkKey)
+		if err != nil {
+			return protocol.WorkRequest{}, fmt.Errorf("normalizing watch digest arXiv ID: %w", err)
+		}
+		request.Identifiers = &protocol.Identifiers{ArXiv: arXiv}
+	}
+	return request, nil
 }
 
 func ownershipCount(result *zotio.LookupWorksResult) int {

@@ -1,0 +1,12 @@
+{
+  "protocol": "papio-browser/1",
+  "type": "page_acquire",
+  "msg_id": "page-acquire-001",
+  "seq": 1,
+  "payload": {
+    "url": "https://publisher.example.edu/article/42",
+    "doi": "10.1000/example.42",
+    "title": "An Example Paper",
+    "source": "popup"
+  }
+}

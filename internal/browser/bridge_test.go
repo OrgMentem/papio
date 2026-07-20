@@ -174,8 +174,8 @@ func TestHelloAckAnnouncesDaemonVersion(t *testing.T) {
 	if payload.DaemonVersion != "0.1.0-test" {
 		t.Fatalf("daemon_version = %q, want 0.1.0-test", payload.DaemonVersion)
 	}
-	if !slices.Equal(payload.Features, []string{"browser_handoff"}) {
-		t.Fatalf("features = %v, want [browser_handoff]", payload.Features)
+	if !slices.Equal(payload.Features, []string{"browser_handoff", pageAcquireFeature}) {
+		t.Fatalf("features = %v, want [browser_handoff %s]", payload.Features, pageAcquireFeature)
 	}
 }
 
@@ -189,6 +189,79 @@ func TestHelloAckAdvertisesResolverOrigins(t *testing.T) {
 	origins := ack.Payload.(*protocol.HelloAckPayload).ResolverOrigins
 	if !slices.Equal(origins, []string{"https://openurl.example.edu"}) {
 		t.Fatalf("resolver_origins = %v, want [https://openurl.example.edu]", origins)
+	}
+}
+
+func TestPageAcquireSubmitsNormalizedDOI(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	runSync(t, b, hello())
+
+	msgs, _ := runSync(t, b, inFrame(t, protocol.MsgPageAcquire, "", protocol.PageAcquirePayload{
+		URL:    "https://publisher.example.edu/article/42",
+		DOI:    "https://doi.org/10.1000/Example.42",
+		Title:  "An Example Paper",
+		Source: "popup",
+	}))
+	ack := firstOfType(msgs, protocol.MsgPageAcquireAck)
+	if ack == nil {
+		t.Fatalf("no page_acquire_ack in %v", msgs)
+	}
+	payload := ack.Payload.(*protocol.PageAcquireAckPayload)
+	if payload.JobID == "" || payload.Duplicate || payload.Error != "" {
+		t.Fatalf("page_acquire_ack = %#v", payload)
+	}
+	row, err := jobs.Get(context.Background(), payload.JobID)
+	if err != nil {
+		t.Fatalf("submitted job: %v", err)
+	}
+	if row.Work.DOI != "10.1000/example.42" {
+		t.Fatalf("submitted DOI = %q, want normalized DOI", row.Work.DOI)
+	}
+}
+
+func TestPageAcquireInvalidDOIReturnsErrorWithoutSubmit(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	runSync(t, b, hello())
+
+	msgs, _ := runSync(t, b, inFrame(t, protocol.MsgPageAcquire, "", protocol.PageAcquirePayload{
+		URL: "https://publisher.example.edu/article/42",
+		DOI: "not-a-doi",
+	}))
+	ack := firstOfType(msgs, protocol.MsgPageAcquireAck)
+	if ack == nil {
+		t.Fatalf("no page_acquire_ack in %v", msgs)
+	}
+	payload := ack.Payload.(*protocol.PageAcquireAckPayload)
+	if payload.Error == "" || payload.JobID != "" || payload.Duplicate {
+		t.Fatalf("page_acquire_ack = %#v", payload)
+	}
+	var count int
+	if err := jobs.S.DB().QueryRowContext(context.Background(), "SELECT COUNT(*) FROM jobs").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("jobs after invalid page acquire = %d, want 0", count)
+	}
+}
+
+func TestPageAcquireDuplicateSurfacesExistingJob(t *testing.T) {
+	b, _, _, _ := newBridge(t)
+	runSync(t, b, hello())
+	frame := inFrame(t, protocol.MsgPageAcquire, "", protocol.PageAcquirePayload{
+		URL: "https://publisher.example.edu/article/42",
+		DOI: "10.1000/example.42",
+	})
+	first, _ := runSync(t, b, frame)
+	second, _ := runSync(t, b, frame)
+	firstAck := firstOfType(first, protocol.MsgPageAcquireAck)
+	secondAck := firstOfType(second, protocol.MsgPageAcquireAck)
+	if firstAck == nil || secondAck == nil {
+		t.Fatalf("page acquire acknowledgements = %v / %v", first, second)
+	}
+	firstPayload := firstAck.Payload.(*protocol.PageAcquireAckPayload)
+	secondPayload := secondAck.Payload.(*protocol.PageAcquireAckPayload)
+	if firstPayload.JobID == "" || secondPayload.JobID != firstPayload.JobID || !secondPayload.Duplicate {
+		t.Fatalf("duplicate acknowledgements = %#v / %#v", firstPayload, secondPayload)
 	}
 }
 

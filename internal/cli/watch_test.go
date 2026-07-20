@@ -5,6 +5,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"strings"
 	"testing"
 
 	"papio/internal/config"
@@ -87,5 +88,30 @@ func TestWatchRunDisplaysReportedAlertWorks(t *testing.T) {
 	}
 	if got := stdout.String(); got != "Watch 7 reported 2 new work(s) — papio watch digest 7\n" {
 		t.Fatalf("stdout = %q", got)
+	}
+}
+
+func TestAcquireFromDigestRejectsIncompatibleInputs(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{name: "positional identifier", args: []string{"acquire", "--from-digest", "7", "10.1000/example"}, want: "positional"},
+		{name: "batch", args: []string{"acquire", "--from-digest", "7", "--batch", "works.jsonl"}, want: "--batch"},
+		{name: "zotio", args: []string{"acquire", "--from-digest", "7", "--from-zotio"}, want: "--from-zotio"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			root := NewInProcessRoot(&stdout, &stderr, config.Config{}, func(_ context.Context, method string, _ any, _ any) error {
+				t.Fatalf("unexpected RPC %q", method)
+				return nil
+			})
+			root.SetArgs(test.args)
+			err := root.Execute()
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("acquire %v error = %v, want message containing %q", test.args[1:], err, test.want)
+			}
+		})
 	}
 }

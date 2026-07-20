@@ -57,3 +57,86 @@ func TestRunnerHandlesArXivOnlyDiscoveries(t *testing.T) {
 		})
 	}
 }
+
+func TestRunnerAcquireDigest(t *testing.T) {
+	ctx := context.Background()
+	watches := testStore(t)
+	discoveryWatch := createWatch(t, watches, CreateInput{
+		Kind: KindDiscovery, Mode: ModeAlert, Query: "digest", Collection: "Reading", CadenceHours: 24, PerRunCap: 2,
+	})
+	now := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
+	if _, err := watches.RecordDigest(ctx, discoveryWatch.ID, now, []DigestEntry{
+		{WorkKey: "10.1000/digest", Title: "Digest DOI", Authors: "Ada, Bob", Year: 2026, DOI: "10.1000/digest"},
+		{WorkKey: "arxiv:2601.12345v2", Title: "Digest arXiv", Authors: "Cara", Year: 2026},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	submitter := &fakeSubmitter{}
+	runner := &Runner{Store: watches, Submitter: submitter, DataDir: t.TempDir(), Now: func() time.Time { return now }}
+
+	queued, err := runner.AcquireDigest(ctx, discoveryWatch.ID, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if queued != 2 || len(submitter.calls) != 2 {
+		t.Fatalf("AcquireDigest() = %d, submitted = %+v; want 2 queued submissions", queued, submitter.calls)
+	}
+	if submitter.calls[0].Identifiers == nil || submitter.calls[0].Identifiers.ArXiv != "2601.12345v2" {
+		t.Fatalf("first digest request = %+v, want normalized arXiv identifier", submitter.calls[0])
+	}
+	if submitter.calls[1].Identifiers == nil || submitter.calls[1].Identifiers.DOI != "10.1000/digest" {
+		t.Fatalf("second digest request = %+v, want DOI identifier", submitter.calls[1])
+	}
+	entries, err := watches.Digest(ctx, discoveryWatch.ID, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("digest after acquisition = %+v, want no submitted entries", entries)
+	}
+	queued, err = runner.AcquireDigest(ctx, discoveryWatch.ID, nil)
+	if err != nil || queued != 0 {
+		t.Fatalf("empty AcquireDigest() = %d, %v; want 0, nil", queued, err)
+	}
+
+	backfillWatch := createWatch(t, watches, CreateInput{
+		Kind: KindBackfill, Collection: "Reading", CadenceHours: 24, PerRunCap: 2,
+	})
+	if _, err := runner.AcquireDigest(ctx, backfillWatch.ID, nil); err == nil {
+		t.Fatal("AcquireDigest() accepted a backfill watch")
+	}
+}
+
+func TestRunnerAcquireDigestStopsAfterSubmissionFailure(t *testing.T) {
+	ctx := context.Background()
+	watches := testStore(t)
+	created := createWatch(t, watches, CreateInput{
+		Kind: KindDiscovery, Mode: ModeAlert, Query: "digest", Collection: "Reading", CadenceHours: 24, PerRunCap: 3,
+	})
+	now := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
+	if _, err := watches.RecordDigest(ctx, created.ID, now, []DigestEntry{
+		{WorkKey: "10.1000/one", Title: "One", DOI: "10.1000/one"},
+		{WorkKey: "10.1000/two", Title: "Two", DOI: "10.1000/two"},
+		{WorkKey: "10.1000/three", Title: "Three", DOI: "10.1000/three"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	runner := &Runner{
+		Store:     watches,
+		Submitter: &fakeSubmitter{failOnCall: map[int]error{2: context.DeadlineExceeded}},
+		DataDir:   t.TempDir(),
+		Now:       func() time.Time { return now },
+	}
+
+	queued, err := runner.AcquireDigest(ctx, created.ID, nil)
+	if err != context.DeadlineExceeded || queued != 1 {
+		t.Fatalf("AcquireDigest() = %d, %v; want 1, deadline exceeded", queued, err)
+	}
+	entries, err := watches.Digest(ctx, created.ID, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 || entries[0].WorkKey != "10.1000/two" || entries[1].WorkKey != "10.1000/one" {
+		t.Fatalf("digest after partial acquisition = %+v, want failed and unsubmitted rows", entries)
+	}
+}

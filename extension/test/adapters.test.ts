@@ -67,6 +67,10 @@ test("every registered adapter is fixture-backed, versioned, and host-scoped", (
   expect(adapters.map((a) => a.id)).toContain("proquest");
 });
 
+test("registered adapters leave work-window visibility at the default", () => {
+  for (const spec of adapters) expect(spec.requiresVisible).toBeUndefined();
+});
+
 test("interpret waits for late-upgraded custom elements when settleTimeoutMs is set", async () => {
   // JSTOR's tracked tab fires `complete` post-SSO before its `mfe-*` custom
   // elements upgrade. The live (doc === null) path must observe the DOM until

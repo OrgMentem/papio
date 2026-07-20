@@ -82,6 +82,12 @@ func RouterWithShutdown(system *bootstrap.System, shutdown context.CancelFunc) i
 		"watch.digest": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return watchDigest(ctx, raw, system)
 		},
+		"watch.digest_acquire": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return acquireWatchDigest(ctx, raw, system)
+		},
+		"watch.digest_clear": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return clearWatchDigest(ctx, raw, system)
+		},
 		"watch.list": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return listWatches(ctx, raw, system)
 		},
@@ -93,6 +99,9 @@ func RouterWithShutdown(system *bootstrap.System, shutdown context.CancelFunc) i
 		},
 		"jobs.list": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return listJobs(ctx, raw, system)
+		},
+		"jobs.failures": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return listFailures(ctx, raw, system)
 		},
 		"jobs.get": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return getJob(ctx, raw, system)

@@ -1,0 +1,9 @@
+{
+  "protocol": "papio-browser/1",
+  "type": "page_acquire",
+  "msg_id": "page-acquire-002",
+  "seq": 1,
+  "payload": {
+    "title": "An Example Paper"
+  }
+}

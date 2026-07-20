@@ -77,6 +77,9 @@ export interface AdapterSpec {
    * selectors to hydrate before classifying. Fixture Documents stay synchronous. */
   settleTimeoutMs?: number;
   download?: DownloadRule;
+  /** Minimized work windows under-render some provider SPAs; keep this adapter's
+   * handoff window visible without focusing it. */
+  requiresVisible?: boolean;
   /** The terms-and-conditions accept control, found by accessible text inside
    * the open modal. Clicked ONLY when the user has recorded informed consent to
    * auto-accept publisher terms; otherwise the terms gate stays human. */

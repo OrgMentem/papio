@@ -268,6 +268,120 @@ func (s *Store) Digest(ctx context.Context, watchID int64, limit int) ([]DigestE
 	return entries, nil
 }
 
+// ClearDigest removes every pending alert discovery for watchID.
+func (s *Store) ClearDigest(ctx context.Context, watchID int64) (int, error) {
+	if s == nil || s.S == nil {
+		return 0, errors.New("watch store is not configured")
+	}
+	if watchID <= 0 {
+		return 0, errors.New("watch id must be positive")
+	}
+	if _, err := s.Get(ctx, watchID); err != nil {
+		return 0, err
+	}
+	result, err := s.S.DB().ExecContext(ctx, `DELETE FROM watch_digest_entries WHERE watch_id = ?`, watchID)
+	if err != nil {
+		return 0, fmt.Errorf("clearing watch digest: %w", err)
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("counting cleared watch digest entries: %w", err)
+	}
+	return int(count), nil
+}
+
+// TakeDigest returns pending alert discoveries without removing them.
+func (s *Store) TakeDigest(ctx context.Context, watchID int64, keys []string) ([]DigestEntry, error) {
+	if s == nil || s.S == nil {
+		return nil, errors.New("watch store is not configured")
+	}
+	if watchID <= 0 {
+		return nil, errors.New("watch id must be positive")
+	}
+	if _, err := s.Get(ctx, watchID); err != nil {
+		return nil, err
+	}
+
+	query := `
+		SELECT work_key, title, authors, year, doi, is_oa, first_seen_at
+		FROM watch_digest_entries
+		WHERE watch_id = ?`
+	args := []any{watchID}
+	requested := make(map[string]struct{}, len(keys))
+	if len(keys) > 0 {
+		placeholders := make([]string, 0, len(keys))
+		for _, key := range keys {
+			key = strings.TrimSpace(key)
+			if key == "" {
+				return nil, errors.New("watch digest key must not be empty")
+			}
+			if _, duplicate := requested[key]; duplicate {
+				continue
+			}
+			requested[key] = struct{}{}
+			placeholders = append(placeholders, "?")
+			args = append(args, key)
+		}
+		query += ` AND work_key IN (` + strings.Join(placeholders, ", ") + `)`
+	}
+	query += ` ORDER BY id DESC`
+
+	rows, err := s.S.DB().QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("taking watch digest: %w", err)
+	}
+	defer rows.Close()
+	entries := make([]DigestEntry, 0)
+	found := make(map[string]struct{}, len(requested))
+	for rows.Next() {
+		var entry DigestEntry
+		if err := rows.Scan(
+			&entry.WorkKey, &entry.Title, &entry.Authors, &entry.Year,
+			&entry.DOI, &entry.IsOA, &entry.FirstSeenAt,
+		); err != nil {
+			return nil, err
+		}
+		entries = append(entries, entry)
+		found[entry.WorkKey] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating watch digest: %w", err)
+	}
+	for key := range requested {
+		if _, ok := found[key]; !ok {
+			return nil, fmt.Errorf("watch digest entry %q not found", key)
+		}
+	}
+	return entries, nil
+}
+
+func (s *Store) deleteDigestEntry(ctx context.Context, watchID int64, workKey string) error {
+	if s == nil || s.S == nil {
+		return errors.New("watch store is not configured")
+	}
+	if watchID <= 0 {
+		return errors.New("watch id must be positive")
+	}
+	workKey = strings.TrimSpace(workKey)
+	if workKey == "" {
+		return errors.New("watch digest key must not be empty")
+	}
+	result, err := s.S.DB().ExecContext(ctx, `
+		DELETE FROM watch_digest_entries
+		WHERE watch_id = ? AND work_key = ?`, watchID, workKey)
+	if err != nil {
+		return fmt.Errorf("deleting watch digest entry: %w", err)
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("counting deleted watch digest entry: %w", err)
+	}
+	if count != 1 {
+		return fmt.Errorf("watch digest entry %q not found", workKey)
+	}
+	return nil
+}
+
 // Remove permanently deletes a watch. Existing acquisition jobs and manifests
 // remain durable history; only future scheduling is removed.
 func (s *Store) Remove(ctx context.Context, id int64) error {

@@ -7,9 +7,11 @@ import { expect, test } from "bun:test";
 
 import { parseBrowserMessage, type BrowserMessage } from "../src/protocol";
 import { emptyStore, type StateBackend, type StoreShape } from "../src/state";
+import type { AdapterSpec } from "../src/adapters/types";
 import {
   Bridge,
   hasDaemonUpdateHint,
+  needsVisibleWindow,
   type BridgeDeps,
   type DownloadDeltaLike,
   type DownloadItemLike,
@@ -125,7 +127,7 @@ class FakeWindows {
   async create(props: {
     url: string;
     focused: boolean;
-    state: "minimized";
+    state: "minimized" | "normal";
   }): Promise<{ id: number; state: string; tabs: TabInfo[] }> {
     this.created.push(props);
     const id = this.nextId++;
@@ -273,7 +275,7 @@ function makeHarness(
   };
 }
 
-function jobOffer(jobID: string): unknown {
+function jobOffer(jobID: string, openurl = OPENURL): unknown {
   return {
     protocol: "papio-browser/1",
     type: "job_offer",
@@ -281,13 +283,20 @@ function jobOffer(jobID: string): unknown {
     job_id: jobID,
     seq: 0,
     payload: {
-      openurl: OPENURL,
+      openurl,
       provider_hosts: [PROVIDER_HOST],
       access_mode: "assisted",
       expires_at: EXPIRES,
     },
   };
 }
+
+const PROVIDER_ADAPTER: AdapterSpec = {
+  id: "provider",
+  version: "1.0.0",
+  hosts: [PROVIDER_HOST],
+  classify: [],
+};
 
 function helloRequiredError(): unknown {
   return {
@@ -356,6 +365,36 @@ test("hello acknowledgment persists daemon version, features, and connected stat
     daemonUpdateHint: false,
   });
   expect(h.action.texts.at(-1)).toBe("");
+});
+
+test("relays page acquisition and routes its acknowledgement to the popup", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ daemon_version: "0.1.0", features: ["page_acquire"] }));
+
+  const acknowledgement = h.bridge.requestPageAcquire({
+    url: "https://publisher.example.edu/article/42",
+    doi: "10.1000/example.42",
+    title: "An Example Paper",
+    source: "popup",
+  });
+  await Promise.resolve();
+  const request = h.frames().at(-1);
+  expect(request?.type).toBe("page_acquire");
+  expect(request?.payload).toEqual({
+    url: "https://publisher.example.edu/article/42",
+    doi: "10.1000/example.42",
+    title: "An Example Paper",
+    source: "popup",
+  });
+  await h.port.inbound({
+    protocol: "papio-browser/1",
+    type: "page_acquire_ack",
+    msg_id: "page-acquire-ack-001",
+    seq: 2,
+    payload: { job_id: "job_page_acquire_001", duplicate: true },
+  });
+  expect(await acknowledgement).toEqual({ job_id: "job_page_acquire_001", duplicate: true });
 });
 
 test("hello_ack caches resolver origins and badges ungranted ones while connected", async () => {
@@ -1227,6 +1266,57 @@ test("work-window mode routes the first handoff into one minimized unfocused win
   expect(h.backend.store.activeJobs[0]?.tab_id).toBe(100);
   const accept = h.frames().find((f) => f.type === "job_accept");
   expect(accept?.job_id).toBe("job_ww_first");
+});
+
+test("requiresVisible is opt-in and fails closed for unmatched adapters", () => {
+  const cases: { spec: AdapterSpec | undefined; wantsVisible: boolean }[] = [
+    { spec: undefined, wantsVisible: false },
+    { spec: PROVIDER_ADAPTER, wantsVisible: false },
+    { spec: { ...PROVIDER_ADAPTER, requiresVisible: true }, wantsVisible: true },
+  ];
+  for (const { spec, wantsVisible } of cases) {
+    expect(needsVisibleWindow(spec)).toBe(wantsVisible);
+  }
+});
+
+test("work-window visibility follows the matched adapter requirement", async () => {
+  const cases: {
+    adapterSpecs: AdapterSpec[];
+    expectedState: string;
+    expectedUpdates: { windowID: number; props: { focused?: boolean; state?: string } }[];
+  }[] = [
+    {
+      adapterSpecs: [{ ...PROVIDER_ADAPTER, requiresVisible: true }],
+      expectedState: "normal",
+      expectedUpdates: [{ windowID: 500, props: { focused: false, state: "normal" } }],
+    },
+    { adapterSpecs: [PROVIDER_ADAPTER], expectedState: "minimized", expectedUpdates: [] },
+    { adapterSpecs: [], expectedState: "minimized", expectedUpdates: [] },
+  ];
+  for (const [index, c] of cases.entries()) {
+    const h = makeHarness(undefined, { windows: true });
+    h.deps.adapterSpecs = c.adapterSpecs;
+    await h.bridge.start();
+    await h.port.inbound(jobOffer(`job_ww_visibility_${index}`));
+    const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+    const url = `https://${PROVIDER_HOST}/stable/123`;
+
+    await h.tabs.onUpdated.emit(tabID, { status: "complete", url }, { id: tabID, url });
+
+    expect(h.windows?.live.get(500)?.state).toBe(c.expectedState);
+    expect(h.windows?.updated).toEqual(c.expectedUpdates);
+  }
+});
+
+test("a directly matched visible-required handoff opens a normal unfocused window", async () => {
+  const h = makeHarness(undefined, { windows: true });
+  h.deps.adapterSpecs = [{ ...PROVIDER_ADAPTER, requiresVisible: true }];
+  const providerURL = `https://${PROVIDER_HOST}/stable/123`;
+  await h.bridge.start();
+  await h.port.inbound(jobOffer("job_ww_visible_target", providerURL));
+
+  expect(h.windows?.created).toEqual([{ url: providerURL, focused: false, state: "normal" }]);
+  expect(h.windows?.updated).toEqual([]);
 });
 
 test("work window is reused across offers and recreated after the user closes it", async () => {

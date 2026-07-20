@@ -5,11 +5,13 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"reflect"
 	"testing"
 
 	"papio/internal/app"
 	"papio/internal/browser"
+	"papio/internal/config"
 	"papio/internal/job"
 	"papio/internal/work"
 )
@@ -58,5 +60,66 @@ func TestActionURLsSelectAwaitingActionsMostRecentAndDryRun(t *testing.T) {
 	}
 	if got := out.String(); got != want[0]+"\n"+want[1]+"\n"+want[2]+"\n" {
 		t.Fatalf("dry-run output = %q", got)
+	}
+}
+
+func TestJobsFailuresCommandOutputsGroups(t *testing.T) {
+	want := jobsFailuresResult{
+		Failures: []job.FailureGroup{{Count: 2, State: job.StateFailed, Provider: "api.example.test", Reason: "timeout", Sample: "job_01"}},
+		Since:    "2026-01-01T00:00:00Z",
+	}
+	tests := []struct {
+		name string
+		json bool
+	}{
+		{name: "aligned rows"},
+		{name: "json", json: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var out, errOut bytes.Buffer
+			var gotParams map[string]any
+			root := NewInProcessRoot(&out, &errOut, config.Config{}, func(_ context.Context, method string, params, result any) error {
+				if method != "jobs.failures" {
+					t.Fatalf("method = %q, want jobs.failures", method)
+				}
+				gotParams = params.(map[string]any)
+				*result.(*jobsFailuresResult) = want
+				return nil
+			})
+			args := []string{"jobs", "failures", "--since", "30d", "--limit", "2"}
+			if tc.json {
+				args = append([]string{"--json"}, args...)
+			}
+			root.SetArgs(args)
+			if err := root.ExecuteContext(context.Background()); err != nil {
+				t.Fatalf("jobs failures: %v", err)
+			}
+			if !reflect.DeepEqual(gotParams, map[string]any{"since": "30d", "limit": 2}) {
+				t.Fatalf("params = %#v", gotParams)
+			}
+			if tc.json {
+				var got jobsFailuresResult
+				if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+					t.Fatalf("decode output: %v", err)
+				}
+				if !reflect.DeepEqual(got, want) {
+					t.Fatalf("JSON = %#v, want %#v", got, want)
+				}
+				return
+			}
+			if got := out.String(); got != "2 | failed | api.example.test | timeout (sample: job_01)\n" {
+				t.Fatalf("output = %q", got)
+			}
+		})
+	}
+
+	command := newJobsCommand(&options{})
+	failures, _, err := command.Find([]string{"failures"})
+	if err != nil {
+		t.Fatalf("find failures command: %v", err)
+	}
+	if failures.Annotations["mcp:read-only"] != "true" {
+		t.Fatalf("failures annotations = %#v", failures.Annotations)
 	}
 }

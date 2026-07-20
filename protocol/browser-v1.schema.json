@@ -12,6 +12,8 @@
       "enum": [
         "hello",
         "hello_ack",
+        "page_acquire",
+        "page_acquire_ack",
         "job_offer",
         "job_accept",
         "job_reject",
@@ -74,6 +76,40 @@
                 "maxItems": 32,
                 "items": { "type": "string", "maxLength": 300, "pattern": "^https://[a-z0-9.-]{3,253}(:[0-9]{1,5})?$" }
               }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "page_acquire" } } },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["url"],
+            "properties": {
+              "url": { "type": "string", "format": "uri", "maxLength": 4000, "pattern": "^[Hh][Tt][Tt][Pp][Ss]?://.+" },
+              "doi": { "type": "string", "maxLength": 512 },
+              "title": { "type": "string", "maxLength": 1024 },
+              "source": { "type": "string", "maxLength": 1024 }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "page_acquire_ack" } } },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "job_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,128}$" },
+              "duplicate": { "type": "boolean" },
+              "error": { "type": "string", "maxLength": 1000 }
             }
           }
         }

@@ -35,3 +35,79 @@ func TestRecordDigestMigratesTitleKeyToDOI(t *testing.T) {
 		t.Fatalf("Digest() = %+v, want one DOI-keyed entry", digest)
 	}
 }
+
+func TestClearDigest(t *testing.T) {
+	ctx := context.Background()
+	watches := testStore(t)
+	created := createWatch(t, watches, testWatchInput("clear digest"))
+	now := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
+	if _, err := watches.RecordDigest(ctx, created.ID, now, []DigestEntry{
+		{WorkKey: "10.1000/one", Title: "One"},
+		{WorkKey: "10.1000/two", Title: "Two"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, test := range []struct {
+		name    string
+		watchID int64
+		want    int
+		wantErr bool
+	}{
+		{name: "removes entries", watchID: created.ID, want: 2},
+		{name: "requires existing watch", watchID: created.ID + 1, wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := watches.ClearDigest(ctx, test.watchID)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("ClearDigest() error = %v, wantErr %v", err, test.wantErr)
+			}
+			if got != test.want {
+				t.Fatalf("ClearDigest() = %d, want %d", got, test.want)
+			}
+		})
+	}
+}
+
+func TestTakeDigest(t *testing.T) {
+	ctx := context.Background()
+	watches := testStore(t)
+	created := createWatch(t, watches, testWatchInput("take digest"))
+	now := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
+	if _, err := watches.RecordDigest(ctx, created.ID, now, []DigestEntry{
+		{WorkKey: "10.1000/one", Title: "One"},
+		{WorkKey: "10.1000/two", Title: "Two"},
+		{WorkKey: "arxiv:2601.12345v2", Title: "Three"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, test := range []struct {
+		name    string
+		keys    []string
+		want    []string
+		wantErr bool
+	}{
+		{name: "all entries", want: []string{"arxiv:2601.12345v2", "10.1000/two", "10.1000/one"}},
+		{name: "selected entries", keys: []string{"10.1000/one", "arxiv:2601.12345v2"}, want: []string{"arxiv:2601.12345v2", "10.1000/one"}},
+		{name: "unknown key", keys: []string{"10.1000/one", "missing"}, wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			entries, err := watches.TakeDigest(ctx, created.ID, test.keys)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("TakeDigest() error = %v, wantErr %v", err, test.wantErr)
+			}
+			if test.wantErr {
+				return
+			}
+			if len(entries) != len(test.want) {
+				t.Fatalf("TakeDigest() = %+v, want keys %v", entries, test.want)
+			}
+			for i, entry := range entries {
+				if entry.WorkKey != test.want[i] {
+					t.Fatalf("TakeDigest()[%d].WorkKey = %q, want %q", i, entry.WorkKey, test.want[i])
+				}
+			}
+		})
+	}
+}

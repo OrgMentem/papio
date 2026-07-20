@@ -141,7 +141,29 @@ func newWatchDigestCommand(opt *options) *cobra.Command {
 		},
 	}
 	command.Flags().IntVar(&limit, "limit", 100, "maximum digest entries to show (1-500)")
+	command.AddCommand(newWatchDigestClearCommand(opt))
 	return command
+}
+
+func newWatchDigestClearCommand(opt *options) *cobra.Command {
+	return &cobra.Command{
+		Use:   "clear <id>",
+		Short: "Clear pending works from an alert watch digest",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			id, err := parseWatchID(args[0])
+			if err != nil {
+				return err
+			}
+			var result struct {
+				Cleared int `json:"cleared"`
+			}
+			if err := opt.call(cmd.Context(), "watch.digest_clear", map[string]any{"id": id}, &result); err != nil {
+				return err
+			}
+			return opt.printResult(result, "Cleared %d digest work(s)", result.Cleared)
+		},
+	}
 }
 
 func newWatchRemoveCommand(opt *options) *cobra.Command {

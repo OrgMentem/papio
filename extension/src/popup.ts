@@ -328,9 +328,101 @@ export function renderResolverGrants(
   container.append(heading, lede, button);
 }
 
+interface PageAcquireResponse {
+  job_id?: string;
+  duplicate?: boolean;
+  error?: string;
+}
+
+interface PageMetadata {
+  url: string;
+  doi?: string;
+  title?: string;
+}
+
+function pageAcquireStatus(response: PageAcquireResponse): string {
+  if (typeof response.error === "string" && response.error.length > 0) return response.error;
+  if (typeof response.job_id === "string" && response.job_id.length > 0) {
+    return response.duplicate === true ? `Already queued: ${response.job_id}` : `Queued: ${response.job_id}`;
+  }
+  return "The daemon did not acknowledge this page.";
+}
+
+export async function acquireCurrentPage(): Promise<PageAcquireResponse> {
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (tab?.id === undefined) throw new Error("No active tab");
+  const [injected] = await chrome.scripting.executeScript({
+    target: { tabId: tab.id },
+    func: (): PageMetadata => {
+      const doi = document.querySelector('meta[name="citation_doi"]')?.getAttribute("content")?.trim();
+      const title = document.querySelector('meta[name="citation_title"]')?.getAttribute("content")?.trim() || document.title.trim();
+      return {
+        url: location.href,
+        ...(doi ? { doi } : {}),
+        ...(title ? { title } : {}),
+      };
+    },
+  });
+  const metadata = injected?.result;
+  if (
+    typeof metadata !== "object" ||
+    metadata === null ||
+    typeof (metadata as PageMetadata).url !== "string"
+  ) {
+    throw new Error("Could not read the current page");
+  }
+  const result: unknown = await chrome.runtime.sendMessage({
+    channel: "papio",
+    action: "page_acquire",
+    payload: {
+      url: (metadata as PageMetadata).url,
+      ...((metadata as PageMetadata).doi ? { doi: (metadata as PageMetadata).doi } : {}),
+      ...((metadata as PageMetadata).title ? { title: (metadata as PageMetadata).title } : {}),
+      source: "popup",
+    },
+  });
+  if (typeof result !== "object" || result === null) {
+    throw new Error("The daemon did not acknowledge this page");
+  }
+  return result as PageAcquireResponse;
+}
+
+/** Show page acquisition only when this connected daemon negotiated support. */
+export function renderPageAcquire(
+  doc: Document,
+  enabled: boolean,
+  onAcquire: () => Promise<PageAcquireResponse> = acquireCurrentPage,
+): void {
+  const section = doc.getElementById("page-acquire");
+  const button = doc.getElementById("page-acquire-btn");
+  const status = doc.getElementById("page-acquire-status");
+  if (!(section instanceof HTMLElement) || !(button instanceof HTMLButtonElement) || !status) return;
+  section.hidden = !enabled;
+  if (!enabled || button.dataset.wired) return;
+  button.dataset.wired = "1";
+  button.addEventListener("click", () => {
+    button.disabled = true;
+    status.textContent = "Acquiring…";
+    void onAcquire().then(
+      (response) => {
+        status.textContent = pageAcquireStatus(response);
+      },
+      (error: unknown) => {
+        status.textContent = error instanceof Error ? error.message : "Could not acquire this page";
+      },
+    ).finally(() => {
+      button.disabled = false;
+    });
+  });
+}
+
 export async function refresh(): Promise<void> {
   const store = await chromeBackend(chrome.storage).load();
   renderDaemonStatus(document, store);
+  renderPageAcquire(
+    document,
+    store.connectionStatus === "connected" && (store.daemonFeatures ?? []).includes("page_acquire"),
+  );
   renderJobs(document, store.activeJobs, realActions(), () => {
     void refresh();
   });

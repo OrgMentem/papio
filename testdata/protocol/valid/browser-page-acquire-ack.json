@@ -1,0 +1,10 @@
+{
+  "protocol": "papio-browser/1",
+  "type": "page_acquire_ack",
+  "msg_id": "page-acquire-ack-001",
+  "seq": 2,
+  "payload": {
+    "job_id": "job_page_acquire_001",
+    "duplicate": true
+  }
+}

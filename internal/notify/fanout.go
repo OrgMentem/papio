@@ -23,3 +23,9 @@ func (f senderFanout) Send(ctx context.Context, message string) {
 		sender.Send(ctx, message)
 	}
 }
+
+func (f senderFanout) SendEvent(ctx context.Context, event Event) {
+	for _, sender := range f {
+		Emit(ctx, sender, event)
+	}
+}

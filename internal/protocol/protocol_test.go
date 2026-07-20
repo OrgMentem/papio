@@ -201,6 +201,78 @@ func TestHelloAckPayloadRoundTripAndBounds(t *testing.T) {
 	}
 }
 
+func TestPageAcquirePayloadRoundTripAndValidation(t *testing.T) {
+	frame := func(typ string, payload any) []byte {
+		t.Helper()
+		data, err := json.Marshal(map[string]any{
+			"protocol": BrowserProtocolVersion,
+			"type":     typ,
+			"msg_id":   "page-acquire-001",
+			"seq":      1,
+			"payload":  payload,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return data
+	}
+
+	valid := PageAcquirePayload{
+		URL: "https://publisher.example.edu/article/42",
+		DOI: "10.1000/Example.42", Title: "An Example Paper", Source: "popup",
+	}
+	msg, err := DecodeBrowserMessage(frame(MsgPageAcquire, valid))
+	if err != nil {
+		t.Fatalf("decode page_acquire: %v", err)
+	}
+	if got := msg.Payload.(*PageAcquirePayload); *got != valid {
+		t.Fatalf("round-trip payload = %#v, want %#v", got, valid)
+	}
+
+	for _, tc := range []struct {
+		name    string
+		payload map[string]any
+	}{
+		{name: "missing URL", payload: map[string]any{}},
+		{name: "bad scheme", payload: map[string]any{"url": "ftp://publisher.example.edu/article/42"}},
+		{name: "oversize DOI", payload: map[string]any{
+			"url": "https://publisher.example.edu/article/42", "doi": strings.Repeat("d", 513),
+		}},
+		{name: "null optional field", payload: map[string]any{
+			"url": "https://publisher.example.edu/article/42", "title": nil,
+		}},
+		{name: "unknown field", payload: map[string]any{
+			"url": "https://publisher.example.edu/article/42", "debug": "no",
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := DecodeBrowserMessage(frame(MsgPageAcquire, tc.payload)); err == nil {
+				t.Fatal("page_acquire was accepted")
+			}
+		})
+	}
+
+	ack, err := DecodeBrowserMessage(frame(MsgPageAcquireAck, PageAcquireAckPayload{
+		JobID: "job_page_acquire_001", Duplicate: true,
+	}))
+	if err != nil {
+		t.Fatalf("decode page_acquire_ack: %v", err)
+	}
+	if got := ack.Payload.(*PageAcquireAckPayload); got.JobID != "job_page_acquire_001" || !got.Duplicate {
+		t.Fatalf("round-trip ack = %#v", got)
+	}
+	for _, payload := range []map[string]any{
+		{"job_id": nil},
+		{"duplicate": nil},
+		{"error": strings.Repeat("e", 1001)},
+		{"unexpected": true},
+	} {
+		if _, err := DecodeBrowserMessage(frame(MsgPageAcquireAck, payload)); err == nil {
+			t.Fatalf("page_acquire_ack payload %#v was accepted", payload)
+		}
+	}
+}
+
 // The IdP privacy invariant is structural: auth payloads cannot carry a URL.
 func TestAuthPayloadRejectsURLFields(t *testing.T) {
 	msg := []byte(`{"protocol":"papio-browser/1","type":"auth_returned","msg_id":"m_auth_ret1","job_id":"job_0002_tyler","seq":5,"payload":{"url":"https://idp.example.edu/sso?token=SECRET"}}`)

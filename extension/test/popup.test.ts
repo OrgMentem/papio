@@ -5,7 +5,7 @@ import { readFileSync } from "node:fs";
 
 import { Window } from "happy-dom";
 
-import { cancelJob, focusJob, renderDaemonStatus, renderJobs, renderResolverGrants, wireSettings, type PopupActions } from "../src/popup";
+import { cancelJob, focusJob, renderDaemonStatus, renderJobs, renderPageAcquire, renderResolverGrants, wireSettings, type PopupActions } from "../src/popup";
 import type { ActiveJob } from "../src/state";
 
 function popupDocument(): Document {
@@ -111,6 +111,30 @@ test("renders daemon connection and compatibility states", () => {
   expect(doc.getElementById("daemon-status")?.textContent).toContain(
     "this extension is older than your papio daemon supports",
   );
+});
+
+test("gates page acquisition on the negotiated feature", async () => {
+  const doc = popupDocument();
+  let calls = 0;
+  const acquire = async () => {
+    calls += 1;
+    return { job_id: "job_page_acquire_001" };
+  };
+
+  renderPageAcquire(doc, false, acquire);
+  const section = doc.getElementById("page-acquire");
+  const button = doc.getElementById("page-acquire-btn") as HTMLButtonElement;
+  expect(section?.hidden).toBe(true);
+  button.click();
+  expect(calls).toBe(0);
+
+  renderPageAcquire(doc, true, acquire);
+  expect(section?.hidden).toBe(false);
+  button.click();
+  await Promise.resolve();
+  await Promise.resolve();
+  expect(calls).toBe(1);
+  expect(doc.getElementById("page-acquire-status")?.textContent).toBe("Queued: job_page_acquire_001");
 });
 
 test("focus button activates the correct broker-owned tab and then its window", async () => {

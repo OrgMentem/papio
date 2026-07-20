@@ -11,7 +11,10 @@ package browser
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"database/sql"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -27,11 +30,13 @@ import (
 	"papio/internal/job"
 	"papio/internal/protocol"
 	"papio/internal/store"
+	"papio/internal/work"
 )
 
 const (
 	handoffActionKind   = "openurl_handoff"
 	MinExtensionVersion = "0.1.0"
+	pageAcquireFeature  = "page_acquire"
 )
 
 // ErrInvalidFrame marks a client-side protocol violation (a frame that fails
@@ -70,10 +75,19 @@ type Bridge struct {
 func NewBridge(jobs *job.Store, svc *app.Service, cfg config.Config, version string, features []string) *Bridge {
 	return &Bridge{
 		jobs: jobs, svc: svc, cfg: cfg,
-		Version: version, Features: features,
+		Version: version, Features: appendFeature(features, pageAcquireFeature),
 		offered: map[string]bool{}, cancelSent: map[string]bool{},
 		now: time.Now,
 	}
+}
+
+func appendFeature(features []string, feature string) []string {
+	for _, existing := range features {
+		if existing == feature {
+			return append([]string(nil), features...)
+		}
+	}
+	return append(append([]string(nil), features...), feature)
 }
 
 // SessionInfo returns a consistent snapshot of the current extension hello-session.
@@ -157,6 +171,9 @@ func (b *Bridge) handle(ctx context.Context, msg *protocol.BrowserMessage) ([]js
 	}
 
 	switch msg.Type {
+	case protocol.MsgPageAcquire:
+		return b.pageAcquire(ctx, msg.Payload.(*protocol.PageAcquirePayload))
+
 	case protocol.MsgJobAccept:
 		return nil, b.jobs.S.AppendEvent(ctx, msg.JobID, "browser.job_accept", nil)
 
@@ -224,6 +241,83 @@ func (b *Bridge) handle(ctx context.Context, msg *protocol.BrowserMessage) ([]js
 	default:
 		return nil, fmt.Errorf("%w: unexpected inbound frame type %q", ErrInvalidFrame, msg.Type)
 	}
+}
+
+func (b *Bridge) pageAcquire(ctx context.Context, payload *protocol.PageAcquirePayload) ([]json.RawMessage, error) {
+	request, err := pageAcquireRequest(payload)
+	if err != nil {
+		return b.pageAcquireError(err)
+	}
+	if existing, err := b.liveJobForRequest(ctx, request.RequestID); err != nil {
+		return b.pageAcquireError(err)
+	} else if existing != "" {
+		ack, err := b.frame(protocol.MsgPageAcquireAck, "", protocol.PageAcquireAckPayload{
+			JobID: existing, Duplicate: true,
+		})
+		if err != nil {
+			return nil, err
+		}
+		return []json.RawMessage{ack}, nil
+	}
+	jobID, err := b.svc.Submit(ctx, request)
+	if err != nil {
+		return b.pageAcquireError(err)
+	}
+	ack, err := b.frame(protocol.MsgPageAcquireAck, "", protocol.PageAcquireAckPayload{JobID: jobID})
+	if err != nil {
+		return nil, err
+	}
+	return []json.RawMessage{ack}, nil
+}
+
+func pageAcquireRequest(payload *protocol.PageAcquirePayload) (protocol.WorkRequest, error) {
+	identity := "url:" + payload.URL
+	title := strings.TrimSpace(payload.Title)
+	request := protocol.WorkRequest{
+		SchemaVersion:  protocol.WorkRequestSchemaVersion,
+		DesiredVersion: "any",
+	}
+	if payload.DOI == "" {
+		request.Title = title
+	} else if len(title) >= 3 && len(title) <= 500 {
+		request.Title = title
+	}
+	if payload.DOI != "" {
+		doi, err := work.NormalizeDOI(payload.DOI)
+		if err != nil {
+			return protocol.WorkRequest{}, fmt.Errorf("invalid page DOI: %w", err)
+		}
+		request.Identifiers = &protocol.Identifiers{DOI: doi}
+		identity = "doi:" + doi
+	}
+	sum := sha256.Sum256([]byte(identity))
+	request.RequestID = "page_acquire_" + hex.EncodeToString(sum[:])
+	return request, nil
+}
+
+func (b *Bridge) liveJobForRequest(ctx context.Context, requestID string) (string, error) {
+	var jobID string
+	err := b.jobs.S.DB().QueryRowContext(ctx,
+		`SELECT id FROM jobs WHERE work_request_id = ? AND state NOT IN ('failed','cancelled','unavailable') ORDER BY created_at DESC LIMIT 1`,
+		requestID,
+	).Scan(&jobID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return jobID, nil
+}
+
+func (b *Bridge) pageAcquireError(err error) ([]json.RawMessage, error) {
+	ack, frameErr := b.frame(protocol.MsgPageAcquireAck, "", protocol.PageAcquireAckPayload{
+		Error: truncate(err.Error(), 1000),
+	})
+	if frameErr != nil {
+		return nil, frameErr
+	}
+	return []json.RawMessage{ack}, nil
 }
 
 // adoptOutsideSessionLock runs validation without blocking unrelated browser

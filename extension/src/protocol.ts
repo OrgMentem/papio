@@ -14,6 +14,8 @@ export const MAX_BROWSER_INTEGER = Number.MAX_SAFE_INTEGER;
 export type BrowserMessageType =
   | "hello"
   | "hello_ack"
+  | "page_acquire"
+  | "page_acquire_ack"
   | "job_offer"
   | "job_accept"
   | "job_reject"
@@ -39,6 +41,18 @@ export interface HelloAckPayload {
   resolver_origins?: string[];
 }
 
+export interface PageAcquirePayload {
+  url: string;
+  doi?: string;
+  title?: string;
+  source?: string;
+}
+
+export interface PageAcquireAckPayload {
+  job_id?: string;
+  duplicate?: boolean;
+  error?: string;
+}
 
 export interface JobOfferExpected {
   doi?: string;
@@ -114,6 +128,8 @@ export class ProtocolError extends Error {
 const MSG_TYPES: Record<string, true> = {
   hello: true,
   hello_ack: true,
+  page_acquire: true,
+  page_acquire_ack: true,
   job_offer: true,
   job_accept: true,
   job_reject: true,
@@ -276,6 +292,33 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
           }
         }
       }
+      break;
+    }
+    case "page_acquire": {
+      requireKeys(p, "page_acquire", ["url"], ["doi", "title", "source"]);
+      const pageURL = str(p, "url", "page_acquire", 4000);
+      let validURL = false;
+      try {
+        const u = new URL(pageURL);
+        validURL = (u.protocol === "http:" || u.protocol === "https:") && u.host !== "";
+      } catch {
+        validURL = false;
+      }
+      if (!validURL) fail("page_acquire.url must be a parseable http(s) URL");
+      if ("doi" in p) str(p, "doi", "page_acquire", 512);
+      if ("title" in p) str(p, "title", "page_acquire", 1024);
+      if ("source" in p) str(p, "source", "page_acquire", 1024);
+      break;
+    }
+    case "page_acquire_ack": {
+      requireKeys(p, "page_acquire_ack", [], ["job_id", "duplicate", "error"]);
+      if ("job_id" in p && !JOB_ID_RE.test(str(p, "job_id", "page_acquire_ack", 128))) {
+        fail("page_acquire_ack.job_id is invalid");
+      }
+      if ("duplicate" in p && typeof p["duplicate"] !== "boolean") {
+        fail("page_acquire_ack.duplicate must be a boolean");
+      }
+      if ("error" in p) str(p, "error", "page_acquire_ack", 1000);
       break;
     }
     case "job_offer": {
