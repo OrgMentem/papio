@@ -252,6 +252,78 @@ func TestAdoptDownloadValidatesAndPromotes(t *testing.T) {
 	}
 }
 
+func TestAcceptedAdoptionReviewReusesExactContentOverride(t *testing.T) {
+	svc, jobs := newTestService(t)
+	svc.Config.Browser.OpenURLBase = "https://resolver.example.edu/openurl"
+	svc.Config.AccessMode = config.ModeMaximal
+	svc.Fetch = func(context.Context, resolver.Candidate, string) (fetch.Result, error) {
+		return fetch.Result{}, context.Canceled
+	}
+	svc.Validate = func(context.Context, string, string, work.Work) (pdf.ValidationReport, error) {
+		return pdf.ValidationReport{
+			Payload:    pdf.PayloadReport{OK: true},
+			Structural: pdf.StructuralReport{Valid: true, Pages: 2},
+			Text:       pdf.TextReport{Chars: 2000},
+			Identity:   pdf.IdentityDecision{Result: pdf.IdentityReview},
+		}, nil
+	}
+	ctx := context.Background()
+	id := parkAwaitingHuman(t, jobs, "wr_adopt_review")
+	dir := filepath.Join(svc.Config.EffectiveAdoptionRoot(), id)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "paper.pdf")
+	if err := os.WriteFile(path, pdfBytes("reviewed"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.AdoptDownload(ctx, id, path); err != nil {
+		t.Fatalf("first adopt: %v", err)
+	}
+	actions, err := jobs.ListHumanActions(ctx, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var reviewID int64
+	for _, action := range actions {
+		if action.JobID == id && action.Kind == "verify_identity" {
+			reviewID = action.ID
+			break
+		}
+	}
+	if reviewID == 0 {
+		t.Fatal("missing verify_identity action")
+	}
+	if _, state, err := jobs.ResolveReview(ctx, reviewID, "accept"); err != nil || state != job.StateFetching {
+		t.Fatalf("accept review = %q, %v", state, err)
+	}
+
+	// The scheduler cannot retain a live browser candidate, so it re-resolves
+	// and returns to the institutional handoff. The unchanged source file is
+	// then adopted again by the directory sweep.
+	row, err := jobs.ClaimNext(ctx, "review-worker", time.Minute)
+	if err != nil || row == nil || row.ID != id {
+		t.Fatalf("claim accepted review = %+v, %v", row, err)
+	}
+	if err := svc.Process(ctx, row); err != nil {
+		t.Fatalf("re-resolve accepted review: %v", err)
+	}
+	if err := svc.AdoptDownload(ctx, id, path); err != nil {
+		t.Fatalf("second adopt: %v", err)
+	}
+	ready, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ready.State != job.StateReady || ready.ArtifactSHA256 == "" {
+		t.Fatalf("reviewed adoption = %+v", ready)
+	}
+	art, err := jobs.GetArtifact(ctx, ready.ArtifactSHA256)
+	if err != nil || art == nil || art.IdentityResult != "user_confirmed" {
+		t.Fatalf("reviewed artifact = %+v, %v", art, err)
+	}
+}
+
 func TestAdoptDownloadRepArksToAwaitingHumanOnValidationInfraError(t *testing.T) {
 	svc, jobs := newTestService(t)
 	svc.Validate = passValidation()

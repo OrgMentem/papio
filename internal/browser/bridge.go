@@ -491,9 +491,12 @@ func (b *Bridge) adopt(ctx context.Context, jobID, filename string) error {
 
 // scanAdoptionDir looks for exactly one settled candidate file in a parked
 // job's adoption directory. Dotfiles (.DS_Store) are invisible; any
-// .crdownload/.download marks an in-progress Chrome write and defers the whole
-// scan; more than one visible file is ambiguous and adopts nothing. The
-// returned name feeds adopt(), which re-applies full confinement checks.
+// .crdownload/.download marks an in-progress Chrome write and .part a Firefox
+// one; either defers the whole scan. A zero-byte file is the browser's
+// placeholder target (Firefox creates the final name empty while streaming
+// into name.part), never a settled download, so it defers the scan too. More
+// than one visible file is ambiguous and adopts nothing. The returned name
+// feeds adopt(), which re-applies full confinement checks.
 func (b *Bridge) scanAdoptionDir(_ context.Context, jobID string) (string, bool) {
 	dir := filepath.Join(b.cfg.EffectiveAdoptionRoot(), jobID)
 	entries, err := os.ReadDir(dir)
@@ -506,11 +509,14 @@ func (b *Bridge) scanAdoptionDir(_ context.Context, jobID string) (string, bool)
 		if strings.HasPrefix(n, ".") {
 			continue
 		}
-		if strings.HasSuffix(n, ".crdownload") || strings.HasSuffix(n, ".download") {
-			return "", false // Chrome is still writing; wait for the rename
+		if strings.HasSuffix(n, ".crdownload") || strings.HasSuffix(n, ".download") || strings.HasSuffix(n, ".part") {
+			return "", false // the browser is still writing; wait for the rename
 		}
 		if !e.Type().IsRegular() {
 			continue
+		}
+		if info, err := e.Info(); err != nil || info.Size() == 0 {
+			return "", false // placeholder target of an in-progress write
 		}
 		if name != "" {
 			return "", false // ambiguous: stays with the user

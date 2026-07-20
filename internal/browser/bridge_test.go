@@ -797,6 +797,8 @@ func TestPollScanAdoptsSingleSettledFileAndDefersAmbiguity(t *testing.T) {
 	single := park(t, jobs, "wr_scan_single", handoffWork())
 	ambig := park(t, jobs, "wr_scan_ambig", handoffWork())
 	partial := park(t, jobs, "wr_scan_partial", handoffWork())
+	ffPartial := park(t, jobs, "wr_scan_ff_partial", handoffWork())
+	placeholder := park(t, jobs, "wr_scan_placeholder", handoffWork())
 	root := cfg.EffectiveAdoptionRoot()
 	writeFixturePDF(t, filepath.Join(root, single, "paper.pdf"))
 	if err := os.WriteFile(filepath.Join(root, single, ".DS_Store"), []byte{0}, 0o644); err != nil {
@@ -806,6 +808,20 @@ func TestPollScanAdoptsSingleSettledFileAndDefersAmbiguity(t *testing.T) {
 	writeFixturePDF(t, filepath.Join(root, ambig, "b.pdf"))
 	writeFixturePDF(t, filepath.Join(root, partial, "c.pdf"))
 	if err := os.WriteFile(filepath.Join(root, partial, "c.pdf.crdownload"), []byte{0}, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Firefox streams into name.part beside a zero-byte final-name placeholder.
+	if err := os.MkdirAll(filepath.Join(root, ffPartial), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ffPartial, "d.pdf"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeFixturePDF(t, filepath.Join(root, ffPartial, "d.pdf.part"))
+	if err := os.MkdirAll(filepath.Join(root, placeholder), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, placeholder, "e.pdf"), nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -825,6 +841,14 @@ func TestPollScanAdoptsSingleSettledFileAndDefersAmbiguity(t *testing.T) {
 	pRow, _ := jobs.Get(ctx, partial)
 	if pRow.State != job.StateAwaitingHuman {
 		t.Fatalf("in-progress .crdownload must defer the scan: %+v", pRow)
+	}
+	fRow, _ := jobs.Get(ctx, ffPartial)
+	if fRow.State != job.StateAwaitingHuman {
+		t.Fatalf("in-progress Firefox .part must defer the scan: %+v", fRow)
+	}
+	eRow, _ := jobs.Get(ctx, placeholder)
+	if eRow.State != job.StateAwaitingHuman {
+		t.Fatalf("zero-byte placeholder must defer the scan: %+v", eRow)
 	}
 }
 

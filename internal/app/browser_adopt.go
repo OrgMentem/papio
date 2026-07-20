@@ -84,12 +84,16 @@ func (s *Service) AdoptDownload(ctx context.Context, jobID, path string) error {
 	}
 
 	// Synthetic provenance: a browser-adopted institutional download of unknown
-	// reuse license. A per-adoption url_key keeps the candidate row unambiguous.
+	// reuse license. Key the candidate by content so accepting an identity review
+	// applies only to those exact bytes. The scheduler deliberately re-resolves
+	// after review acceptance; a repeated adoption of the unchanged file must
+	// therefore recover the candidate's durable review_override instead of
+	// creating a fresh candidate and parking the same PDF forever.
 	version := resolver.VersionPublished
 	if v := row.Policy.DesiredVersion; v != "" && v != "any" {
 		version = v
 	}
-	key := "browser-adopt:" + job.NewID("dl")
+	key := "browser-adopt:sha256:" + sha
 	if _, err := s.Jobs.InsertCandidates(ctx, jobID, []job.Candidate{{
 		JobID: jobID, Source: "browser", URLRedacted: "browser://adopted-download",
 		URLKey: key, Version: version, AccessBasis: resolver.AccessInstitutional, ReuseLicense: "unknown",

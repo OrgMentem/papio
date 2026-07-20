@@ -8,6 +8,18 @@ so older sections below include extension entries. The initial release entry
 is synthesized from the complete `papio` and `zotio` Git histories and the
 execution records in `notes/acquisition-stack-plan.md`.
 
+## [0.7.1] - 2026-07-20
+
+### Fixed
+
+- Browser-download adoption now waits for Firefox `.part` writes and their
+  zero-byte target placeholders to settle before validating the final file,
+  preventing valid PDFs from being quarantined mid-download.
+- Accepting an identity review for a browser-adopted PDF now binds the override
+  to that file's SHA-256 candidate key, so the scheduler's safe re-resolution
+  path reaches `ready` for the same bytes instead of parking the same PDF for
+  review again.
+
 ## [0.7.0] - 2026-07-20
 
 ### Added
