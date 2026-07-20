@@ -1684,7 +1684,12 @@ export class Bridge {
     const successfulLanding = change.status === "complete" && !isAuthenticationURL(url);
     if (successfulLanding) await this.recordUsableSession(this.deps.now());
     if (change.status === "complete" && (await this.maybeRouteResolver(job, url))) return;
-    const onProvider = hostMatches(host, job.provider_hosts);
+    // The offer's provider_hosts list is capped by the protocol (20 entries);
+    // the adapter registry is the authoritative host source for classification,
+    // so a tracked handoff landing on any registered family is on-provider.
+    const onProvider =
+      hostMatches(host, job.provider_hosts) ||
+      this.deps.adapterSpecs.some((candidate) => hostMatches(host, candidate.hosts));
     if (!onProvider) {
       // Chrome exposes its built-in PDF viewer as an internal extension URL.
       // Reuse the durable resolver-provided offer URL that produced that viewer.
@@ -2078,7 +2083,10 @@ export class Bridge {
     } catch {
       return;
     }
-    if (!hostMatches(host, job.provider_hosts)) return;
+    const onRegisteredProvider =
+      hostMatches(host, job.provider_hosts) ||
+      this.deps.adapterSpecs.some((candidate) => hostMatches(host, candidate.hosts));
+    if (!onRegisteredProvider) return;
     await this.maybeClassify(jobID, host);
   }
 

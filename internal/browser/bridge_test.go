@@ -414,8 +414,13 @@ func TestHandoffJobOfferedExactlyOncePerHelloSession(t *testing.T) {
 	if p.AccessMode != cfg.AccessMode {
 		t.Fatalf("access_mode = %q", p.AccessMode)
 	}
+	// The wire list is capped at 20 by the protocol; adapter families beyond
+	// the pre-0.4.1 set are recognized by the extension's own registry instead.
 	if !slices.Contains(p.ProviderHosts, "springer.com") {
 		t.Fatalf("provider_hosts = %v, missing springer.com", p.ProviderHosts)
+	}
+	if len(p.ProviderHosts) > 20 {
+		t.Fatalf("provider_hosts %d entries exceeds the protocol cap", len(p.ProviderHosts))
 	}
 	if _, err := time.Parse(time.RFC3339, p.ExpiresAt); err != nil {
 		t.Fatalf("expires_at not RFC3339: %q (%v)", p.ExpiresAt, err)

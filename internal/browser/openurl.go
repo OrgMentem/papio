@@ -46,6 +46,13 @@ func OpenURL(base string, w work.Work) string {
 // the extension can recognize a post-SSO landing on an entitled provider: the
 // resolver host alone goes blind the moment it routes the tab onward. Matching
 // is exact-or-dot-suffix on the extension side.
+//
+// The browser protocol caps provider_hosts at 20 entries and extensions
+// before 0.4.1 fail-closed on longer lists, so this list must stay within the
+// cap and cannot simply grow with the adapter registry. Extensions from 0.4.1
+// also recognize any host in their own adapter registry (the registry is the
+// authoritative adapter-host source); this list only needs the families whose
+// entitled landings predate that behavior.
 var verifiedProviderHosts = []string{
 	"jstor.org",
 	"proquest.com",

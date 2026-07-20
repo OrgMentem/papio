@@ -8,6 +8,7 @@ import { expect, test } from "bun:test";
 import { parseBrowserMessage, type BrowserMessage } from "../src/protocol";
 import { emptyStore, type StateBackend, type StoreShape } from "../src/state";
 import type { AdapterSpec } from "../src/adapters/types";
+import { interpret } from "../src/adapters/types";
 import {
   Bridge,
   hasDaemonUpdateHint,
@@ -773,6 +774,43 @@ test("a tracked resolver landing routes its electronic service only with origin 
     { id: deniedTabID, url: OPENURL },
   );
   expect(injectedWithoutPermission).toBe(false);
+});
+
+test("a registered adapter host classifies even when absent from the offer's provider_hosts", async () => {
+  // The protocol caps provider_hosts at 20 entries, so an offer cannot name
+  // every adapter family; the registry is the authoritative host source.
+  const h = makeHarness();
+  h.deps.adapterSpecs.push(PROVIDER_ADAPTER);
+  h.deps.permissions.contains = async () => true;
+  const injections: Parameters<BridgeDeps["scripting"]["executeScript"]>[0][] = [];
+  h.deps.scripting.executeScript = async (injection) => {
+    injections.push(injection);
+    return [{ result: { kind: "unknown" } }];
+  };
+
+  await h.bridge.start();
+  await h.port.inbound({
+    protocol: "papio-browser/1",
+    type: "job_offer",
+    msg_id: "offer_00000002",
+    job_id: "job_0001a_registry_host",
+    seq: 0,
+    payload: {
+      openurl: OPENURL,
+      provider_hosts: ["resolver.example.edu"],
+      access_mode: "assisted",
+      expires_at: EXPIRES,
+    },
+  });
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  const articleURL = `https://${PROVIDER_HOST}/stable/article`;
+  await h.tabs.onUpdated.emit(
+    tabID,
+    { url: articleURL, status: "complete" },
+    { id: tabID, url: articleURL },
+  );
+
+  expect(injections.some((i) => i.func === interpret && i.target.tabId === tabID)).toBe(true);
 });
 
 
