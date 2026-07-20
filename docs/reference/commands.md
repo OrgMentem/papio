@@ -31,11 +31,13 @@ papio acquire [identifier] [flags]
 | `--deny-source` | `stringSlice` | `[]` | deny this source (repeatable) |
 | `--desired-version` | `string` | `any` | published, accepted, preprint, or any |
 | `--doi` | `string` |  | DOI |
+| `--from-digest` | `int64` | `0` | queue pending entries from an alert watch |
 | `--from-zotio` | `bool` | `false` | queue zotio items missing an attached PDF |
 | `--include-owned` | `bool` | `false` | with --batch, submit works already carrying a PDF in zotio |
 | `--isbn` | `string` |  | ISBN |
+| `--keys` | `stringSlice` | `[]` | digest work keys to queue (comma-separated) |
 | `--label` | `string` |  | batch query context; also the default target collection when --collection is unset |
-| `--limit` | `int` | `25` | maximum zotio queue rows (1-500) |
+| `--limit` | `int` | `25` | maximum Zotio items to queue |
 | `--max-cost` | `float64` | `0` | maximum paid-source cost in USD |
 | `--openalex` | `string` |  | OpenAlex work ID |
 | `--pmid` | `string` |  | PubMed ID |
@@ -250,6 +252,19 @@ Cancel a nonterminal job
 papio jobs cancel <job-id>
 ```
 
+### `papio jobs failures`
+
+Group acquisition jobs that need attention
+
+```
+papio jobs failures [flags]
+```
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--limit` | `int` | `50` | maximum groups (1-200) |
+| `--since` | `string` |  | include jobs updated since a duration or RFC3339 timestamp |
+
 ### `papio jobs get`
 
 Show one job with events and actions
@@ -419,6 +434,14 @@ papio watch digest <id> [flags]
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
 | `--limit` | `int` | `100` | maximum digest entries to show (1-500) |
+
+#### `papio watch digest clear`
+
+Clear pending works from an alert watch digest
+
+```
+papio watch digest clear <id>
+```
 
 ### `papio watch list`
 

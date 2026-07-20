@@ -10,9 +10,13 @@ The server uses a command facade: `papio_command_search` discovers runnable
 commands and `papio_command_run` runs them. The composite tools
 `papio_acquire_batch` and `papio_batch_wait` remain first-class tools. Its read
 resources are `papio://jobs`, `papio://artifacts`, `papio://bundles`,
-`papio://zotio/plans`, and `papio://exports`.
+`papio://zotio/plans`, and `papio://exports`. List resources return a
+`{"<name>": [...], "truncated": bool}` envelope capped at 100 rows; when
+`truncated` is true, use the facade (`jobs list` with `--state`/`--limit`)
+for filtered access.
 When acquisitions fail unexpectedly, run `papio_command_run` with
-`name="doctor"` first. Use `papio_command_search` to discover commands and
+`name="doctor"` first, and `name="jobs failures"` to see where failures
+cluster. Use `papio_command_search` to discover commands and
 their command-local flags.
 
 ## Canonical acquisition loop

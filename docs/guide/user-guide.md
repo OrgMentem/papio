@@ -35,7 +35,9 @@ after any manual configuration change.
 
 ## 2. Discover a research set
 
-Start with an OpenAlex search:
+Start with a discovery search (OpenAlex by default; add Semantic Scholar via
+`discovery.sources` in config, or pick one backend for a single query with
+`--source openalex|semanticscholar`):
 
 ```sh
 papio search "appropriate reliance on AI" --limit 20 --year-from 2023
@@ -196,6 +198,47 @@ through 50. `--year-from` and `--year-to` apply the same publication-year limits
 as search. Watch execution is serial, records its last result, and auto-disables
 a watch after five consecutive failures. Removing a watch does not remove jobs
 or Zotero items created by earlier runs.
+
+### Alert-only watches: report first, acquire on demand
+
+`--mode alert` runs the same discovery and ownership filtering but records new
+works in a per-watch digest instead of acquiring them — each work is reported
+once, ever:
+
+```sh
+papio watch add "appropriate reliance on AI" --cadence weekly --mode alert
+papio watch digest <watch-id>            # review what's new
+papio acquire --from-digest <watch-id>   # queue everything pending
+papio acquire --from-digest <watch-id> --keys 10.1000/example  # or just some
+papio watch digest clear <watch-id>      # discard the rest
+```
+
+Acquired entries leave the digest automatically; cleared ones simply stop
+being pending (they will not be re-reported).
+
+### Backfill watches: self-completing Zotero library
+
+`--kind backfill` takes no query — each run queues Zotero items that are
+missing an attached PDF, exactly like `papio acquire --from-zotio`, bounded by
+`--limit-per-run`:
+
+```sh
+papio watch add --kind backfill --cadence daily --limit-per-run 10 \
+  --collection "AI reading"
+```
+
+Re-runs are idempotent: already-queued or since-completed items are skipped.
+
+### Triage failures
+
+When acquisitions die, see where they cluster before digging into single jobs:
+
+```sh
+papio jobs failures --since 30d
+```
+
+Rows group by state, provider host, and terminal reason with a sample job id
+for `papio jobs get`.
 
 ## 8. Resolve identity reviews deliberately
 

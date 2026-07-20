@@ -107,12 +107,21 @@ mutation remains preview-first: `papio zotio plan` returns immutable plans and
 | Key | Type | Default | Effect and constraints |
 | --- | --- | --- | --- |
 | `enabled` | boolean | `true` | Enables best-effort local desktop notifications from the daemon. The daemon coalesces park and applied-import notices in a 60-second window. |
+| `webhook_url` | string URL | empty | When set, every notification is also delivered as a JSON POST (`{source, event, message, watch_id, watch_label, count, sent_at}`; plain notices carry only `source`, `message`, `sent_at`). Independent of `enabled`, which governs only the desktop channel. Must be an absolute http(s) URL. Delivery is best-effort and never fails the triggering work. |
+| `webhook_secret` | string | empty | Sent as `Authorization: Bearer <secret>` on webhook posts. Requires `webhook_url`. |
+
+## `[discovery]`
+
+| Key | Type | Default | Effect and constraints |
+| --- | --- | --- | --- |
+| `sources` | string array | empty (= `["openalex"]`) | Discovery backends for `papio search` and watches, in merge-preference order. Valid entries: `openalex`, `semanticscholar` (each at most once). Results merge with DOI-then-title deduplication; earlier backends win ties. Per-backend API keys live under `[sources.<name>]` (e.g. `sources.semanticscholar.api_key`, optional — Semantic Scholar works keyless at public rate limits). |
 
 ## `[sources.<name>]`
 
 `[sources]` is a map of resolver policies. The supported built-in names are
-`arxiv`, `europepmc`, `unpaywall`, `openalex`, `openalex_content`, `core`, and
-`crossref_tdm`. Each named section accepts these keys:
+`arxiv`, `europepmc`, `unpaywall`, `openalex`, `openalex_content`, `core`,
+`crossref_tdm`, and `semanticscholar` (discovery-only; see `[discovery]`).
+Each named section accepts these keys:
 
 | Key | Type | Default | Effect and constraints |
 | --- | --- | --- | --- |

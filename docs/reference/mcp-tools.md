@@ -96,7 +96,7 @@ CLI's hyphenated command-local flag names.
 | `papio_export_bundle` | `name: "bundle export"`; `args: "<job-id>"`; `flags: {output}` |
 | `papio_zotio_plan` | `name: "zotio plan"`; `args: "<job-id> <job-id> ..."` |
 | `papio_zotio_apply` | `name: "zotio apply"`; `args: "<plan-id>"`; `flags: {"confirm-sha256": "<digest-from-zotio-plan>"}` |
-| `papio_watch_add` | `name: "watch add"`; `args: "<query>"`; `flags: {label, collection, cadence, limit-per-run, oa-only, year-from, year-to}` |
+| `papio_watch_add` | `name: "watch add"`; `args: "<query>"` (omit for `--kind backfill`); `flags: {label, collection, cadence, limit-per-run, oa-only, year-from, year-to, kind, mode}` |
 | `papio_watch_list` | `name: "watch list"` |
 | `papio_watch_remove` | `name: "watch remove"`; `args: "<id>"` |
 | `papio_batch_report` | `name: "batch report"`; `args: "<batch-id-or-latest>"`; `flags: {markdown}` |
