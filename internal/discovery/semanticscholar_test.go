@@ -129,6 +129,92 @@ func TestSemanticScholarSearchSnowballs(t *testing.T) {
 	}
 }
 
+func TestSemanticScholarSnowballsFilterResultsAndFillLimit(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		params     SearchParams
+		path       string
+		response   string
+		wantTitles string
+	}{
+		{
+			name:   "citation applies lower year bound",
+			params: SearchParams{Cites: "10.1000/seed", Limit: 1, YearFrom: 2020},
+			path:   "/paper/DOI:10.1000/seed/citations",
+			response: `{"data":[
+				{"citingPaper":{"title":"Too old","year":2019}},
+				{"citingPaper":{"title":"At lower bound","year":2020}}
+			]}`,
+			wantTitles: "At lower bound",
+		},
+		{
+			name:   "reference applies upper year bound",
+			params: SearchParams{CitedBy: "10.1000/seed", Limit: 1, YearTo: 2020},
+			path:   "/paper/DOI:10.1000/seed/references",
+			response: `{"data":[
+				{"citedPaper":{"title":"Unknown year"}},
+				{"citedPaper":{"title":"Too new","year":2021}},
+				{"citedPaper":{"title":"At upper bound","year":2020}}
+			]}`,
+			wantTitles: "At upper bound",
+		},
+		{
+			name:   "citation applies OA-only",
+			params: SearchParams{Cites: "10.1000/seed", Limit: 1, OAOnly: true},
+			path:   "/paper/DOI:10.1000/seed/citations",
+			response: `{"data":[
+				{"citingPaper":{"title":"Closed","isOpenAccess":false}},
+				{"citingPaper":{"title":"Open","isOpenAccess":true}}
+			]}`,
+			wantTitles: "Open",
+		},
+		{
+			name:   "filters a larger page before enforcing limit",
+			params: SearchParams{CitedBy: "10.1000/seed", Limit: 2, YearFrom: 2020},
+			path:   "/paper/DOI:10.1000/seed/references",
+			response: `{"data":[
+				{"citedPaper":{"title":"Too old","year":2019}},
+				{"citedPaper":{"title":"First match","year":2020}},
+				{"citedPaper":{"title":"Second match","year":2021}},
+				{"citedPaper":{"title":"Over limit","year":2022}}
+			]}`,
+			wantTitles: "First match, Second match",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var gotQuery url.Values
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if got, want := r.URL.Path, test.path; got != want {
+					t.Errorf("path = %q, want %q", got, want)
+				}
+				gotQuery = r.URL.Query()
+				_, _ = w.Write([]byte(test.response))
+			}))
+			defer server.Close()
+
+			works, err := NewSemanticScholarWithOptions(SemanticScholarOptions{
+				Client: http.DefaultClient, BaseURL: server.URL,
+			}).Search(context.Background(), test.params)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got, want := gotQuery.Get("limit"), "100"; got != want {
+				t.Fatalf("limit = %q, want %q", got, want)
+			}
+			titles := make([]string, 0, len(works))
+			for _, discovered := range works {
+				if got, want := discovered.Source, "semanticscholar"; got != want {
+					t.Fatalf("source = %q, want %q", got, want)
+				}
+				titles = append(titles, discovered.Work.Title)
+			}
+			if got := strings.Join(titles, ", "); got != test.wantTitles {
+				t.Fatalf("titles = %q, want %q", got, test.wantTitles)
+			}
+		})
+	}
+}
+
 func TestSemanticScholarYearFiltersSupportOpenBounds(t *testing.T) {
 	for _, test := range []struct {
 		params SearchParams
@@ -153,5 +239,15 @@ func TestSemanticScholarRejectsUnsupportedOrMultipleSnowballs(t *testing.T) {
 		if _, err := client.Search(context.Background(), params); err == nil {
 			t.Fatalf("params %+v succeeded", params)
 		}
+	}
+}
+
+func TestSemanticScholarRejectsTextQueryWithSnowball(t *testing.T) {
+	client := NewSemanticScholarWithOptions(SemanticScholarOptions{Client: http.DefaultClient})
+	_, err := client.Search(context.Background(), SearchParams{
+		Query: "resilient discovery", Cites: "10.1000/seed",
+	})
+	if err == nil || !strings.Contains(err.Error(), "cannot be combined with a citation snowball") {
+		t.Fatalf("Search() error = %v, want text-query snowball rejection", err)
 	}
 }

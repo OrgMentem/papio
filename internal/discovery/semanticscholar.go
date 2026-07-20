@@ -74,6 +74,9 @@ func (s *SemanticScholar) Search(ctx context.Context, params SearchParams) ([]Di
 	if err != nil {
 		return nil, err
 	}
+	if kind != "" && query != "" {
+		return nil, errors.New("semanticscholar: text query cannot be combined with a citation snowball")
+	}
 	if query == "" && kind == "" {
 		return nil, errors.New("semanticscholar: query is required unless a citation snowball DOI is supplied")
 	}
@@ -124,7 +127,7 @@ func (s *SemanticScholar) Search(ctx context.Context, params SearchParams) ([]Di
 			papers = append(papers, citation.CitedPaper)
 		}
 	}
-	return mapSemanticScholarPapers(papers), nil
+	return mapSemanticScholarPapers(filterSemanticScholarSnowballPapers(papers, params)), nil
 }
 
 func semanticScholarSnowball(params SearchParams) (string, string, error) {
@@ -220,7 +223,7 @@ func (s *SemanticScholar) snowballURL(kind, doi string, params SearchParams) (*u
 		fields[i] = prefix + "." + field
 	}
 	values.Set("fields", strings.Join(fields, ","))
-	values.Set("limit", strconv.Itoa(semanticScholarLimitFor(params.Limit)))
+	values.Set("limit", strconv.Itoa(semanticScholarSnowballFetchLimit(params)))
 	base.RawQuery = values.Encode()
 	return base, nil
 }
@@ -246,6 +249,13 @@ func semanticScholarLimitFor(limit int) int {
 	return limit
 }
 
+func semanticScholarSnowballFetchLimit(params SearchParams) int {
+	if params.YearFrom != 0 || params.YearTo != 0 || params.OAOnly {
+		return semanticScholarMaxLimit
+	}
+	return semanticScholarLimitFor(params.Limit)
+}
+
 func semanticScholarYear(params SearchParams) string {
 	if params.YearFrom == 0 && params.YearTo == 0 {
 		return ""
@@ -259,6 +269,30 @@ func semanticScholarYear(params SearchParams) string {
 		to = strconv.Itoa(params.YearTo)
 	}
 	return from + "-" + to
+}
+
+func filterSemanticScholarSnowballPapers(papers []semanticScholarPaper, params SearchParams) []semanticScholarPaper {
+	limit := semanticScholarLimitFor(params.Limit)
+	filtered := make([]semanticScholarPaper, 0, min(len(papers), limit))
+	for _, paper := range papers {
+		if paper.Year == 0 && (params.YearFrom != 0 || params.YearTo != 0) {
+			continue
+		}
+		if params.YearFrom != 0 && paper.Year < params.YearFrom {
+			continue
+		}
+		if params.YearTo != 0 && paper.Year > params.YearTo {
+			continue
+		}
+		if params.OAOnly && !paper.IsOpenAccess {
+			continue
+		}
+		filtered = append(filtered, paper)
+		if len(filtered) == limit {
+			break
+		}
+	}
+	return filtered
 }
 
 type semanticScholarSearchResponse struct {
