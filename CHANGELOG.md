@@ -8,6 +8,22 @@ so older sections below include extension entries. The initial release entry
 is synthesized from the complete `papio` and `zotio` Git histories and the
 execution records in `notes/acquisition-stack-plan.md`.
 
+## [0.7.2] - 2026-07-20
+
+### Fixed
+
+- Scheduled backfills now scan the complete Zotio missing-PDF queue and skip
+  already-live request IDs without consuming the per-run cap, preventing one
+  persistent entry from starving later work.
+- Alert-watch digests now retain consumed identities as a durable seen set,
+  merge title, arXiv, OpenAlex, and DOI aliases, preserve author names
+  losslessly, recheck Zotio ownership before acquisition, and serialize clear
+  and acquire operations.
+- Long failure reasons remain separate groups until after display truncation,
+  so unrelated failures with a common prefix no longer collapse together.
+- Semantic Scholar citation and reference snowballs now enforce year and
+  open-access filters and reject ambiguous query-plus-snowball requests.
+
 ## [0.7.1] - 2026-07-20
 
 ### Fixed
