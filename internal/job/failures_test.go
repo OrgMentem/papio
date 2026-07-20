@@ -82,6 +82,20 @@ func TestFailures(t *testing.T) {
 			want:  []FailureGroup{{State: StateFailed, Provider: "time.example.test", Reason: "timing", Count: 2}},
 		},
 		{
+			name: "filters and samples nanosecond timestamps exactly",
+			setup: func(t *testing.T, js *Store) []string {
+				before := createFailure(t, js, "failures-nanos-before", StateFailed, "nanotiming", []string{"https://nanos.example.test/a"}, false)
+				atCutoff := createFailure(t, js, "failures-nanos-at-cutoff", StateFailed, "nanotiming", []string{"https://nanos.example.test/a"}, false)
+				newest := createFailure(t, js, "failures-nanos-newest", StateFailed, "nanotiming", []string{"https://nanos.example.test/a"}, false)
+				setFailureUpdatedAt(t, js, before, "2026-03-02T12:00:00.123456788Z")
+				setFailureUpdatedAt(t, js, atCutoff, "2026-03-02T12:00:00.123456789Z")
+				setFailureUpdatedAt(t, js, newest, "2026-03-02T12:00:00.123456790Z")
+				return []string{newest}
+			},
+			since: time.Date(2026, time.March, 2, 12, 0, 0, 123456789, time.UTC),
+			want:  []FailureGroup{{State: StateFailed, Provider: "nanos.example.test", Reason: "nanotiming", Count: 2}},
+		},
+		{
 			name: "groups provider hostnames case insensitively without root dot",
 			setup: func(t *testing.T, js *Store) []string {
 				createFailure(t, js, "failures-host-uppercase", StateFailed, "network", []string{"https://API.Example.Test/a"}, false)

@@ -382,6 +382,7 @@ test("a restarted worker clears persisted page-acquire capability before hello_a
     daemonFeatures: [],
     resolverOrigins: [],
   });
+  expect(h.bridge.pageAcquireAvailable()).toBe(false);
   let response: unknown;
   void h.bridge.requestPageAcquire({
     url: "https://publisher.example.edu/article/42",

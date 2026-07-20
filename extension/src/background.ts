@@ -840,13 +840,18 @@ export class Bridge {
     await this.removeJobWithOffer(jobID);
   }
 
+  /** True only after this port's hello_ack has advertised page acquisition. */
+  pageAcquireAvailable(): boolean {
+    return (
+      this.store.connectionStatus === "connected" &&
+      (this.store.daemonFeatures ?? []).includes("page_acquire")
+    );
+  }
+
   /** Forward an active-page acquisition request and await the daemon ack. */
   async requestPageAcquire(payload: PageAcquirePayload): Promise<PageAcquireAckPayload> {
     await this.ready;
-    if (
-      this.store.connectionStatus !== "connected" ||
-      !(this.store.daemonFeatures ?? []).includes("page_acquire")
-    ) {
+    if (!this.pageAcquireAvailable()) {
       return { error: "Page acquisition is not available from this daemon" };
     }
     if (typeof payload.doi !== "string" || payload.doi.trim() === "") {
@@ -2440,6 +2445,22 @@ function isPageAcquireRequest(message: unknown): message is PageAcquireRequest {
   );
 }
 
+interface CapabilitiesRequest {
+  channel: "papio";
+  action: "get_capabilities";
+}
+
+function isCapabilitiesRequest(message: unknown): message is CapabilitiesRequest {
+  return (
+    typeof message === "object" &&
+    message !== null &&
+    "channel" in message &&
+    message.channel === "papio" &&
+    "action" in message &&
+    message.action === "get_capabilities"
+  );
+}
+
 interface TermsConsentRequest {
   channel: "papio";
   action: "terms_consent";
@@ -2574,6 +2595,10 @@ if (typeof chrome !== "undefined" && chrome.runtime?.id) {
   chrome.runtime.onStartup.addListener(() => {});
   chrome.runtime.onInstalled.addListener(() => {});
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+    if (isCapabilitiesRequest(message)) {
+      sendResponse({ page_acquire: bridge.pageAcquireAvailable() });
+      return false;
+    }
     if (isPageAcquireRequest(message)) {
       void bridge.requestPageAcquire(message.payload).then(sendResponse);
       return true; // async native acknowledgement

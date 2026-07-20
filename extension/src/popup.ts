@@ -342,6 +342,23 @@ interface PageMetadata {
 
 const NO_DOI_FOUND = "no DOI found on this page";
 
+/** Capability state belongs to the live worker, never a prior session snapshot. */
+export async function livePageAcquireAvailable(): Promise<boolean> {
+  try {
+    const response: unknown = await chrome.runtime.sendMessage({
+      channel: "papio",
+      action: "get_capabilities",
+    });
+    return (
+      typeof response === "object" &&
+      response !== null &&
+      (response as Record<string, unknown>)["page_acquire"] === true
+    );
+  } catch {
+    return false;
+  }
+}
+
 function pageAcquireStatus(response: PageAcquireResponse): string {
   if (typeof response.error === "string" && response.error.length > 0) return response.error;
   if (typeof response.job_id === "string" && response.job_id.length > 0) {
@@ -425,12 +442,12 @@ export function renderPageAcquire(
 }
 
 export async function refresh(): Promise<void> {
-  const store = await chromeBackend(chrome.storage).load();
+  const [store, pageAcquireEnabled] = await Promise.all([
+    chromeBackend(chrome.storage).load(),
+    livePageAcquireAvailable(),
+  ]);
   renderDaemonStatus(document, store);
-  renderPageAcquire(
-    document,
-    store.connectionStatus === "connected" && (store.daemonFeatures ?? []).includes("page_acquire"),
-  );
+  renderPageAcquire(document, pageAcquireEnabled);
   renderJobs(document, store.activeJobs, realActions(), () => {
     void refresh();
   });

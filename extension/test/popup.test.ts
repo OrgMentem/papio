@@ -8,10 +8,12 @@ import { Window } from "happy-dom";
 import {
   acquireCurrentPage,
   cancelJob,
+  livePageAcquireAvailable,
   focusJob,
   renderDaemonStatus,
   renderJobs,
   renderPageAcquire,
+  refresh,
   renderResolverGrants,
   wireSettings,
   type PopupActions,
@@ -145,6 +147,48 @@ test("gates page acquisition on the negotiated feature", async () => {
   await Promise.resolve();
   expect(calls).toBe(1);
   expect(doc.getElementById("page-acquire-status")?.textContent).toBe("Queued: job_page_acquire_001");
+});
+
+test("reads page-acquire capability from the live worker", async () => {
+  const requests: unknown[] = [];
+  Object.assign(globalThis, {
+    chrome: {
+      runtime: {
+        sendMessage: async (request: unknown) => {
+          requests.push(request);
+          return { page_acquire: false };
+        },
+      },
+    },
+  });
+
+  expect(await livePageAcquireAvailable()).toBe(false);
+  expect(requests).toEqual([{ channel: "papio", action: "get_capabilities" }]);
+});
+
+test("refresh gates acquisition from the live worker, not persisted features", async () => {
+  const doc = popupDocument();
+  Object.assign(globalThis, {
+    chrome: {
+      storage: {
+        session: {
+          get: async () => ({
+            papio_state_v1: {
+              activeJobs: [],
+              connectionStatus: "connected",
+              daemonFeatures: ["page_acquire"],
+            },
+          }),
+        },
+        local: { get: async () => ({}) },
+      },
+      runtime: { sendMessage: async () => ({ page_acquire: false }) },
+      permissions: { contains: async () => false },
+    },
+  });
+
+  await refresh();
+  expect(doc.getElementById("page-acquire")?.hidden).toBe(true);
 });
 
 test("disables page acquisition when the current page has no DOI", async () => {
