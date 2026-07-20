@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -588,8 +589,9 @@ func TestHeaderBodyAndOverallTimeoutsAreBounded(t *testing.T) {
 }
 
 type closeBlockingBody struct {
-	closed  chan struct{}
-	started chan struct{}
+	closeOnce sync.Once
+	closed    chan struct{}
+	started   chan struct{}
 }
 
 func newCloseBlockingBody() *closeBlockingBody {
@@ -601,11 +603,7 @@ func (b *closeBlockingBody) Read(_ []byte) (int, error) {
 	return 0, errors.New("body closed")
 }
 func (b *closeBlockingBody) Close() error {
-	select {
-	case <-b.closed:
-	default:
-		close(b.closed)
-	}
+	b.closeOnce.Do(func() { close(b.closed) })
 	return nil
 }
 
