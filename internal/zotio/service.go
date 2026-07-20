@@ -3,7 +3,9 @@ package zotio
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -287,6 +289,21 @@ func (s *Service) QueueMissingPDF(ctx context.Context, options QueueOptions) (*Q
 			})
 			continue
 		}
+		if s.Store != nil {
+			if existing, lerr := s.liveJobForRequest(ctx, request.RequestID); lerr != nil {
+				return nil, fmt.Errorf("checking live job for Zotio item %s: %w", row.Key, lerr)
+			} else if existing != "" {
+				// Deterministic request IDs make resubmission a no-op upstream,
+				// but reporting the item as queued every run turns a stuck job
+				// into recurring notification noise. Truthful count: skip it.
+				result.Skipped = append(result.Skipped, SkippedItem{
+					ZotioItemKey: row.Key,
+					Title:        row.Title,
+					Reason:       "already queued as " + existing,
+				})
+				continue
+			}
+		}
 		jobID, err := s.Submitter.Submit(ctx, request)
 		if err != nil {
 			return nil, fmt.Errorf("submitting Zotio item %s: %w", row.Key, err)
@@ -299,6 +316,24 @@ func (s *Service) QueueMissingPDF(ctx context.Context, options QueueOptions) (*Q
 		})
 	}
 	return result, nil
+}
+
+// liveJobForRequest reports a non-terminal job already carrying requestID, so
+// repeat backfill runs count only genuinely new submissions (mirrors the
+// browser bridge's page_acquire duplicate check).
+func (s *Service) liveJobForRequest(ctx context.Context, requestID string) (string, error) {
+	var jobID string
+	err := s.Store.DB().QueryRowContext(ctx,
+		`SELECT id FROM jobs WHERE work_request_id = ? AND state NOT IN ('failed','cancelled','unavailable') ORDER BY created_at DESC LIMIT 1`,
+		requestID,
+	).Scan(&jobID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return jobID, nil
 }
 
 func (s *Service) requestForQueueItem(ctx context.Context, row MissingPDFItem, options QueueOptions) (protocol.WorkRequest, string) {

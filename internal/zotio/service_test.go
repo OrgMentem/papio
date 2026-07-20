@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"papio/internal/protocol"
+	"papio/internal/store"
 )
 
 type fakeCLI struct {
@@ -213,5 +214,57 @@ func TestLookupWorksClassifiesOwnedPDFMissingPDFAndNewWork(t *testing.T) {
 		if result.Works[i] != want[i] {
 			t.Fatalf("work %d = %+v, want %+v", i, result.Works[i], want[i])
 		}
+	}
+}
+
+// Regression: repeat backfill runs re-counted items whose deterministic
+// request already had a live job, turning stuck jobs into recurring
+// "queued 1" notifications. Live requests must report as skipped.
+func TestQueueMissingPDFSkipsItemsWithLiveJobs(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+	seed := func(requestID, jobID, state string) {
+		t.Helper()
+		if _, err := st.DB().ExecContext(ctx,
+			`INSERT INTO work_requests (id, created_at) VALUES (?, '2026-07-20T00:00:00Z')`, requestID); err != nil {
+			t.Fatalf("seed request: %v", err)
+		}
+		if _, err := st.DB().ExecContext(ctx,
+			`INSERT INTO jobs (id, work_request_id, state, policy_json, created_at, updated_at)
+			 VALUES (?, ?, ?, '{}', '2026-07-20T00:00:00Z', '2026-07-20T00:00:00Z')`,
+			jobID, requestID, state); err != nil {
+			t.Fatalf("seed job: %v", err)
+		}
+	}
+	// LIVEKEY01 has an in-flight job; DONEKEY01's only job is terminal.
+	seed("request_zotio_LIVEKEY01", "job_live", "awaiting_human")
+	seed("request_zotio_DONEKEY01", "job_done", "failed")
+
+	cli := &fakeCLI{items: []MissingPDFItem{
+		{Key: "LIVEKEY01", Title: "Stuck paper", DOI: "10.1000/live"},
+		{Key: "DONEKEY01", Title: "Retryable paper", DOI: "10.1000/done"},
+	}}
+	submitter := &fakeSubmitter{}
+	service := &Service{CLI: cli, Submitter: submitter, Store: st}
+
+	result, err := service.QueueMissingPDF(ctx, QueueOptions{})
+	if err != nil {
+		t.Fatalf("QueueMissingPDF: %v", err)
+	}
+	if len(result.Queued) != 1 || result.Queued[0].ZotioItemKey != "DONEKEY01" {
+		t.Fatalf("queued = %+v, want only DONEKEY01", result.Queued)
+	}
+	if len(result.Skipped) != 1 || result.Skipped[0].ZotioItemKey != "LIVEKEY01" {
+		t.Fatalf("skipped = %+v, want only LIVEKEY01", result.Skipped)
+	}
+	if want := "already queued as job_live"; result.Skipped[0].Reason != want {
+		t.Fatalf("skip reason = %q, want %q", result.Skipped[0].Reason, want)
+	}
+	if len(submitter.requests) != 1 || submitter.requests[0].RequestID != "request_zotio_DONEKEY01" {
+		t.Fatalf("submitted = %+v, want only the terminal-job item", submitter.requests)
 	}
 }
