@@ -210,6 +210,10 @@ Required-reviewer gate on the submission job. Config that bit us this session:
   the refresh token expires after 7 days) → OAuth client of type **Desktop app**
   (NOT "Chrome extension" — that type is for in-page OAuth and cannot do this
   flow) → `npx chrome-webstore-upload-keys` mints `CWS_REFRESH_TOKEN`.
+- **CWS publisher ID**: Developer Dashboard → **Publisher → Settings**. Store it
+  as `CWS_PUBLISHER_ID`; it identifies the developer account and is distinct
+  from each extension's item ID. API v2 requires both values even for a
+  draft-only upload.
 - **AMO**: `WEB_EXT_API_KEY`/`WEB_EXT_API_SECRET` from the AMO API-key page — these
   are **account-wide** (reused across sibling repos, e.g. from Tabloupe). AMO needs
   no manual item creation: `submit:firefox listed` matches the add-on by its Gecko
@@ -224,23 +228,25 @@ Required-reviewer gate on the submission job. Config that bit us this session:
 
 Shared OAuth creds are **org** secrets scoped to selected repos: `CWS_CLIENT_ID`,
 `CWS_CLIENT_SECRET`, `CWS_REFRESH_TOKEN`, `WEB_EXT_API_KEY`, `WEB_EXT_API_SECRET`.
-The per-extension `CWS_EXTENSION_ID` is a repo/environment secret — never org-wide.
+The account-wide `CWS_PUBLISHER_ID` belongs beside those org settings (it is an
+identifier, not a credential). The per-extension `CWS_EXTENSION_ID` is a
+repo/environment secret — never org-wide.
 
-**Current status — all secrets exist and work; do not re-verify or re-mint.**
-As of v0.6.0 (2026-07-20): org secrets `CWS_CLIENT_ID`, `CWS_CLIENT_SECRET`,
-`CWS_REFRESH_TOKEN`, `WEB_EXT_API_KEY`, `WEB_EXT_API_SECRET`,
-`HOMEBREW_TAP_GITHUB_TOKEN`, `SCOOP_BUCKET_GITHUB_TOKEN`, `WINGET_GITHUB_TOKEN`
-(all visibility=selected, incl. papio; set 2026-07-19) plus repo secret
-`CWS_EXTENSION_ID`. The tap/bucket tokens are proven by the green v0.6.0
-release run; the CWS/AMO creds by the initial store submissions. Only revisit
-on a `401`/auth failure (names via `gh secret list --org OrgMentem` /
-`--repo OrgMentem/papio`; values are write-only — recover from the password
-manager or re-mint, never from GitHub).
+**Current status.** As of ext-v0.4.2 (2026-07-20), the OAuth trio,
+`WEB_EXT_*`, tap/bucket tokens, and per-repo `CWS_EXTENSION_ID` exist and work;
+`CWS_PUBLISHER_ID` is not configured. `submit-chrome.sh` therefore uses the
+official CWS API v1 fallback, which Google supports only through 2026-10-14,
+and refuses to upload from 2026-10-15 onward. Add the publisher ID before that
+date; do not re-mint OAuth credentials.
+
+Secret names can be inspected with `gh secret list --org OrgMentem` /
+`--repo OrgMentem/papio`; values are write-only — recover credentials from the
+password manager or re-mint them, never from GitHub.
 
 Set them without leaking values: `gh secret set NAME --org OrgMentem --visibility
 selected --repos papio` uses a hidden prompt — never pass `--body` (shell history).
-Reuse account-wide creds (`WEB_EXT_*`, the CWS OAuth trio) by adding repos to
-`--repos`; keep `CWS_EXTENSION_ID` per-repo.
+Reuse account-wide settings (`WEB_EXT_*`, the CWS OAuth trio and publisher ID)
+by adding repos to `--repos`; keep `CWS_EXTENSION_ID` per-repo.
 
 ### Screenshots
 

@@ -14,6 +14,14 @@ History before 0.3.1 was recorded in the root `CHANGELOG.md` (the extension
 and daemon shared a version stream through 0.3.0); see its `[0.3.0]` section
 for the full pre-split extension history.
 
+## [0.4.2] - 2026-07-20
+
+### Fixed
+
+- Repackages the 0.4.1 tracked-provider-host fix after its store workflow
+  stopped before either upload when Chrome's publishing client added a required
+  API v2 publisher identifier. Extension runtime behavior is unchanged.
+
 ## [0.4.1] - 2026-07-20
 
 ### Fixed

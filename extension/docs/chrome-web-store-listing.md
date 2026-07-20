@@ -85,8 +85,10 @@ OAuth2 client and refresh token with the Chrome Web Store API enabled:
    `https://www.googleapis.com/auth/chromewebstore` (see the
    chrome-webstore-upload docs for the one-time consent flow).
 3. Put the values in `extension/.env` as `CWS_CLIENT_ID`, `CWS_CLIENT_SECRET`,
-   `CWS_REFRESH_TOKEN`, and `CWS_EXTENSION_ID` (the item id from the dashboard
-   URL, available after the first manual upload).
+   `CWS_REFRESH_TOKEN`, `CWS_EXTENSION_ID` (the item id from the dashboard URL),
+   and `CWS_PUBLISHER_ID` (Developer Dashboard → **Publisher → Settings**).
+   The publisher ID identifies the developer account; it is not the extension
+   ID. Chrome Web Store API v2 requires both.
 
 ## Launch checklist
 

@@ -11,7 +11,7 @@ name: extension-submit
 # required reviewers so a human approves each submission (the release runbook's
 # "the human authorizes publication" rule) and attach the store credentials as
 # environment secrets:
-#   Chrome Web Store: CWS_CLIENT_ID, CWS_CLIENT_SECRET, CWS_REFRESH_TOKEN, CWS_EXTENSION_ID
+#   Chrome Web Store: CWS_CLIENT_ID, CWS_CLIENT_SECRET, CWS_REFRESH_TOKEN, CWS_EXTENSION_ID, CWS_PUBLISHER_ID
 #   Firefox AMO:      WEB_EXT_API_KEY, WEB_EXT_API_SECRET
 #
 # First-time only: the Chrome Web Store item must be created by hand once (the
@@ -77,6 +77,7 @@ jobs:
           CWS_CLIENT_SECRET: ${{ secrets.CWS_CLIENT_SECRET }}
           CWS_REFRESH_TOKEN: ${{ secrets.CWS_REFRESH_TOKEN }}
           CWS_EXTENSION_ID: ${{ secrets.CWS_EXTENSION_ID }}
+          CWS_PUBLISHER_ID: ${{ secrets.CWS_PUBLISHER_ID }}
         run: |
           set -euo pipefail
           if [ "${{ github.event.inputs.chrome_publish }}" = "true" ]; then

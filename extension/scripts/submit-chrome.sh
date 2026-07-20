@@ -13,12 +13,12 @@
 # initial listing). After that, this script drives version updates. Chrome Web
 # Store review can take days; store-installed users auto-update once approved.
 #
-# Credentials come from extension/.env (see docs/chrome-web-store-listing.md for
-# how to mint the OAuth token):
+# Credentials come from extension/.env (see docs/chrome-web-store-listing.md):
 #   CWS_CLIENT_ID       OAuth2 client id
 #   CWS_CLIENT_SECRET   OAuth2 client secret
 #   CWS_REFRESH_TOKEN   OAuth2 refresh token
-#   CWS_EXTENSION_ID    the Web Store item id (from the dashboard URL)
+#   CWS_EXTENSION_ID    Web Store item id (from the dashboard URL)
+#   CWS_PUBLISHER_ID    publisher account id (Publisher > Settings)
 set -Eeuo pipefail
 
 PUBLISH=false
@@ -54,6 +54,23 @@ export CLIENT_ID="$CWS_CLIENT_ID"
 export CLIENT_SECRET="$CWS_CLIENT_SECRET"
 export REFRESH_TOKEN="$CWS_REFRESH_TOKEN"
 
+# CLI 4 uses Chrome Web Store API v2, whose resource path includes the
+# publisher account ID. Existing installations predate that required setting;
+# use Google's still-supported v1 API only as a bounded migration fallback.
+# Google retires v1 on 2026-10-15, so fail closed then rather than discovering
+# the missing publisher ID during an upload.
+CLI_VERSION=4.0.1
+if [[ -n "${CWS_PUBLISHER_ID:-}" ]]; then
+  export PUBLISHER_ID="$CWS_PUBLISHER_ID"
+else
+  today=$(date -u +%F)
+  if [[ "$today" == "2026-10-15" || "$today" > "2026-10-15" ]]; then
+    echo "error: CWS_PUBLISHER_ID missing; find it under Developer Dashboard > Publisher > Settings" >&2
+    exit 1
+  fi
+  CLI_VERSION=3.5.0
+  echo "warning: CWS_PUBLISHER_ID missing; using CWS API v1 fallback (retires 2026-10-15)" >&2
+fi
 echo "==> building extension (Chrome dist/ + Firefox firefox/)"
 bun run build
 
@@ -68,12 +85,15 @@ zip -X -q -r "$ZIP" "${entries[@]}"
 
 # No command = upload + publish; the `upload` command uploads a draft only.
 cli_args=(--source "$ZIP" --extension-id "$CWS_EXTENSION_ID")
+if [[ -n "${CWS_PUBLISHER_ID:-}" ]]; then
+  cli_args+=(--publisher-id "$CWS_PUBLISHER_ID")
+fi
 if $PUBLISH; then
   echo "==> uploading + publishing to Chrome Web Store item $CWS_EXTENSION_ID"
-  bunx chrome-webstore-upload-cli@4.0.1 "${cli_args[@]}"
+  bunx "chrome-webstore-upload-cli@$CLI_VERSION" "${cli_args[@]}"
 else
   echo "==> uploading draft to Chrome Web Store item $CWS_EXTENSION_ID (not publishing)"
-  bunx chrome-webstore-upload-cli@4.0.1 upload "${cli_args[@]}"
+  bunx "chrome-webstore-upload-cli@$CLI_VERSION" upload "${cli_args[@]}"
 fi
 
 echo "==> done."
