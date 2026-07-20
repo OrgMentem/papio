@@ -87,8 +87,8 @@ func TestQueueMissingPDFSubmitsDeterministicRequestsAndSkipsUnidentified(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cli.collection != "ZX98YU76" || cli.limit != 12 {
-		t.Fatalf("queue args = (%q,%d)", cli.collection, cli.limit)
+	if cli.collection != "ZX98YU76" || cli.limit != 0 {
+		t.Fatalf("complete-scan args = (%q,%d)", cli.collection, cli.limit)
 	}
 	if len(result.Queued) != 2 || len(result.Skipped) != 1 || len(submitter.requests) != 2 {
 		t.Fatalf("result = %+v requests=%+v", result, submitter.requests)
@@ -167,14 +167,22 @@ func TestQueueMissingPDFDOIItemQueuesWhenItemLookupMisses(t *testing.T) {
 }
 
 func TestQueueMissingPDFDefaultsLimitAndDesiredVersion(t *testing.T) {
-	cli := &fakeCLI{}
+	items := make([]MissingPDFItem, 26)
+	for i := range items {
+		items[i] = MissingPDFItem{
+			Key:   fmt.Sprintf("ITEM%04d", i),
+			Title: "Paper",
+			DOI:   "10.1000/default",
+		}
+	}
+	cli := &fakeCLI{items: items}
 	service := &Service{CLI: cli, Submitter: &fakeSubmitter{}}
 	result, err := service.QueueMissingPDF(context.Background(), QueueOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cli.limit != 25 || result.Preflight.Version != "1.0.0" {
-		t.Fatalf("limit=%d preflight=%+v", cli.limit, result.Preflight)
+	if cli.limit != 0 || len(result.Queued) != 25 || result.Preflight.Version != "1.0.0" {
+		t.Fatalf("limit=%d queued=%d preflight=%+v", cli.limit, len(result.Queued), result.Preflight)
 	}
 }
 
@@ -251,9 +259,12 @@ func TestQueueMissingPDFSkipsItemsWithLiveJobs(t *testing.T) {
 	submitter := &fakeSubmitter{}
 	service := &Service{CLI: cli, Submitter: submitter, Store: st}
 
-	result, err := service.QueueMissingPDF(ctx, QueueOptions{})
+	result, err := service.QueueMissingPDF(ctx, QueueOptions{Limit: 1})
 	if err != nil {
 		t.Fatalf("QueueMissingPDF: %v", err)
+	}
+	if cli.limit != 0 {
+		t.Fatalf("missing-PDF limit = %d, want complete scan", cli.limit)
 	}
 	if len(result.Queued) != 1 || result.Queued[0].ZotioItemKey != "DONEKEY01" {
 		t.Fatalf("queued = %+v, want only DONEKEY01", result.Queued)
@@ -266,5 +277,32 @@ func TestQueueMissingPDFSkipsItemsWithLiveJobs(t *testing.T) {
 	}
 	if len(submitter.requests) != 1 || submitter.requests[0].RequestID != "request_zotio_DONEKEY01" {
 		t.Fatalf("submitted = %+v, want only the terminal-job item", submitter.requests)
+	}
+}
+
+func TestQueueMissingPDFBoundsSkippedOutputWhileScanning(t *testing.T) {
+	cli := &fakeCLI{items: []MissingPDFItem{
+		{Key: "SKIPKEY01", Title: "Invalid DOI", DOI: "not a DOI"},
+		{Key: "SKIPKEY02", Title: "Also invalid", DOI: "still not a DOI"},
+		{Key: "QUEUEKEY1", Title: "Queue me", DOI: "10.1000/queue"},
+	}}
+	submitter := &fakeSubmitter{}
+	service := &Service{CLI: cli, Submitter: submitter}
+
+	result, err := service.QueueMissingPDF(context.Background(), QueueOptions{Limit: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cli.limit != 0 {
+		t.Fatalf("missing-PDF limit = %d, want complete scan", cli.limit)
+	}
+	if len(result.Queued) != 1 || result.Queued[0].ZotioItemKey != "QUEUEKEY1" {
+		t.Fatalf("queued = %+v, want only QUEUEKEY1", result.Queued)
+	}
+	if len(result.Skipped) != 1 || result.Skipped[0].ZotioItemKey != "SKIPKEY01" {
+		t.Fatalf("skipped = %+v, want bounded output beginning with SKIPKEY01", result.Skipped)
+	}
+	if len(submitter.requests) != 1 || submitter.requests[0].ZotioItemKey != "QUEUEKEY1" {
+		t.Fatalf("submitted = %+v, want only QUEUEKEY1", submitter.requests)
 	}
 }

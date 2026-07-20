@@ -257,8 +257,9 @@ func (s *Service) findParentItemKeys(ctx context.Context, identifier lookupIdent
 	return keys, nil
 }
 
-// QueueMissingPDF preflights Zotio, reads one bounded queue slice, and submits
-// deterministic papio requests. Re-running it returns existing live jobs.
+// QueueMissingPDF preflights Zotio, scans its complete missing-PDF queue, and
+// submits at most options.Limit deterministic papio requests. Re-running it
+// returns existing live jobs.
 func (s *Service) QueueMissingPDF(ctx context.Context, options QueueOptions) (*QueueResult, error) {
 	if s == nil || s.CLI == nil || s.Submitter == nil {
 		return nil, fmt.Errorf("Zotio integration is not configured")
@@ -266,27 +267,38 @@ func (s *Service) QueueMissingPDF(ctx context.Context, options QueueOptions) (*Q
 	if options.Limit == 0 {
 		options.Limit = 25
 	}
+	if options.Limit < 1 || options.Limit > 500 {
+		return nil, fmt.Errorf("limit must be in 1..500")
+	}
 	preflight, err := s.CLI.Preflight(ctx)
 	if err != nil {
 		return nil, err
 	}
-	items, err := s.CLI.MissingPDF(ctx, strings.TrimSpace(options.Collection), options.Limit)
+	items, err := s.CLI.MissingPDF(ctx, strings.TrimSpace(options.Collection), 0)
 	if err != nil {
 		return nil, err
 	}
 	result := &QueueResult{
 		Preflight: preflight,
-		Queued:    make([]QueuedJob, 0, len(items)),
-		Skipped:   make([]SkippedItem, 0),
+		Queued:    make([]QueuedJob, 0, options.Limit),
+		Skipped:   make([]SkippedItem, 0, options.Limit),
 	}
-	for _, row := range items {
-		request, reason := s.requestForQueueItem(ctx, row, options)
-		if reason != "" {
+	appendSkipped := func(row MissingPDFItem, reason string) {
+		if len(result.Skipped) < options.Limit {
 			result.Skipped = append(result.Skipped, SkippedItem{
 				ZotioItemKey: row.Key,
 				Title:        row.Title,
 				Reason:       reason,
 			})
+		}
+	}
+	for _, row := range items {
+		if len(result.Queued) >= options.Limit {
+			break
+		}
+		request, reason := s.requestForQueueItem(ctx, row, options)
+		if reason != "" {
+			appendSkipped(row, reason)
 			continue
 		}
 		if s.Store != nil {
@@ -296,11 +308,7 @@ func (s *Service) QueueMissingPDF(ctx context.Context, options QueueOptions) (*Q
 				// Deterministic request IDs make resubmission a no-op upstream,
 				// but reporting the item as queued every run turns a stuck job
 				// into recurring notification noise. Truthful count: skip it.
-				result.Skipped = append(result.Skipped, SkippedItem{
-					ZotioItemKey: row.Key,
-					Title:        row.Title,
-					Reason:       "already queued as " + existing,
-				})
+				appendSkipped(row, "already queued as "+existing)
 				continue
 			}
 		}

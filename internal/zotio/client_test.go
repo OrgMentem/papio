@@ -92,6 +92,24 @@ func TestMissingPDFUsesExactCollectionAndValidatesRows(t *testing.T) {
 	}
 }
 
+func TestMissingPDFUsesNoLimitForCompleteScan(t *testing.T) {
+	var got []string
+	client := &Client{Executable: "zotio", Exec: func(_ context.Context, args ...string) ([]byte, error) {
+		got = append([]string(nil), args...)
+		return []byte(`[]`), nil
+	}}
+	if _, err := client.MissingPDF(context.Background(), "", 0); err != nil {
+		t.Fatal(err)
+	}
+	want := "--agent items missing-pdf --limit 0"
+	if strings.Join(got, " ") != want {
+		t.Fatalf("argv = %q, want %q", got, want)
+	}
+	if _, err := client.MissingPDF(context.Background(), "", -1); err == nil || !strings.Contains(err.Error(), "limit must be 0 or in 1..500") {
+		t.Fatalf("negative limit error = %v", err)
+	}
+}
+
 func TestMissingPDFKeysUsesExactParentKeys(t *testing.T) {
 	var got []string
 	client := &Client{Executable: "zotio", Exec: func(_ context.Context, args ...string) ([]byte, error) {

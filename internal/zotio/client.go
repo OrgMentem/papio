@@ -167,12 +167,13 @@ func (c *Client) Preflight(ctx context.Context) (*PreflightResult, error) {
 }
 
 // MissingPDF returns Zotio's synced missing-PDF queue, optionally filtered to an exact collection key.
+// A limit of zero explicitly requests Zotio's complete queue.
 func (c *Client) MissingPDF(ctx context.Context, collection string, limit int) ([]MissingPDFItem, error) {
 	if collection != "" && !keyRE.MatchString(collection) {
 		return nil, fmt.Errorf("invalid Zotero collection key %q", collection)
 	}
-	if limit < 1 || limit > 500 {
-		return nil, fmt.Errorf("limit must be in 1..500")
+	if limit < 0 || limit > 500 {
+		return nil, fmt.Errorf("limit must be 0 or in 1..500")
 	}
 	args := []string{"--agent", "items", "missing-pdf", "--limit", strconv.Itoa(limit)}
 	if collection != "" {
