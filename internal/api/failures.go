@@ -58,17 +58,20 @@ func parseFailuresSince(value string, now time.Time) (time.Time, error) {
 	}
 	if strings.HasSuffix(value, "d") {
 		days, err := strconv.ParseInt(strings.TrimSuffix(value, "d"), 10, 64)
-		if err != nil || days > int64(time.Duration(1<<63-1)/(24*time.Hour)) || days < -int64(time.Duration(1<<63-1)/(24*time.Hour)) {
-			return time.Time{}, errors.New("since must be a duration or RFC3339 timestamp")
+		if err != nil || days < 0 || days > int64(time.Duration(1<<63-1)/(24*time.Hour)) {
+			return time.Time{}, errors.New("since must be a non-negative duration or RFC3339 timestamp")
 		}
 		return now.Add(-time.Duration(days) * 24 * time.Hour), nil
 	}
 	if duration, err := time.ParseDuration(value); err == nil {
+		if duration < 0 {
+			return time.Time{}, errors.New("since must be a non-negative duration or RFC3339 timestamp")
+		}
 		return now.Add(-duration), nil
 	}
 	timestamp, err := time.Parse(time.RFC3339, value)
 	if err != nil {
-		return time.Time{}, errors.New("since must be a duration or RFC3339 timestamp")
+		return time.Time{}, errors.New("since must be a non-negative duration or RFC3339 timestamp")
 	}
 	return timestamp.UTC(), nil
 }

@@ -35,7 +35,7 @@ papio acquire [identifier] [flags]
 | `--from-zotio` | `bool` | `false` | queue zotio items missing an attached PDF |
 | `--include-owned` | `bool` | `false` | with --batch, submit works already carrying a PDF in zotio |
 | `--isbn` | `string` |  | ISBN |
-| `--keys` | `stringSlice` | `[]` | digest work keys to queue (comma-separated) |
+| `--keys` | `stringArray` | `[]` | digest work key to queue (repeatable) |
 | `--label` | `string` |  | batch query context; also the default target collection when --collection is unset |
 | `--limit` | `int` | `25` | maximum Zotio items to queue |
 | `--max-cost` | `float64` | `0` | maximum paid-source cost in USD |

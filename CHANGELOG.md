@@ -32,6 +32,15 @@ execution records in `notes/acquisition-stack-plan.md`.
   feature) and queues the page's DOI through the normal acquisition pipeline,
   answering with `page_acquire_ack` (job id or duplicate marker).
 
+### Fixed
+
+- `papio acquire --from-digest --keys` now treats every `--keys` value as one
+  opaque work key: keys containing commas (title-derived digest keys) are no
+  longer split into fragments that miss valid entries. Repeat the flag for
+  multiple keys.
+- `papio jobs failures --since` rejects negative durations (`-1h`, `-1d`)
+  instead of silently computing a future cutoff that hid every failure.
+
 ## [0.6.0] - 2026-07-20
 
 ### Added

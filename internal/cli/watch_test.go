@@ -5,9 +5,11 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 
+	"papio/internal/api"
 	"papio/internal/config"
 	"papio/internal/watch"
 	"papio/internal/zotio"
@@ -115,6 +117,38 @@ func TestAcquireFromDigestRejectsIncompatibleInputs(t *testing.T) {
 				t.Fatalf("acquire %v error = %v, want message containing %q", test.args[1:], err, test.want)
 			}
 		})
+	}
+}
+
+func TestAcquireFromDigestPreservesOpaqueRepeatedKeys(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	root := NewInProcessRoot(&stdout, &stderr, config.Config{}, func(_ context.Context, method string, params any, result any) error {
+		if method != "watch.digest_acquire" {
+			t.Fatalf("method = %q, want watch.digest_acquire", method)
+		}
+		var request struct {
+			ID   int64    `json:"id"`
+			Keys []string `json:"keys"`
+		}
+		encoded, err := json.Marshal(params)
+		if err != nil {
+			t.Fatalf("marshal params: %v", err)
+		}
+		if err := json.Unmarshal(encoded, &request); err != nil {
+			t.Fatalf("unmarshal params: %v", err)
+		}
+		if request.ID != 7 {
+			t.Fatalf("digest ID = %d, want 7", request.ID)
+		}
+		if len(request.Keys) != 2 || request.Keys[0] != "a study, revisited" || request.Keys[1] != "another study" {
+			t.Fatalf("digest keys = %#v, want opaque, trimmed repeated keys", request.Keys)
+		}
+		*result.(*api.WatchDigestAcquireResult) = api.WatchDigestAcquireResult{Queued: 2}
+		return nil
+	})
+	root.SetArgs([]string{"acquire", "--from-digest", "7", "--keys", " a study, revisited ", "--keys", "\tanother study\n"})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("acquire --from-digest --keys: %v (%s)", err, stderr.String())
 	}
 }
 

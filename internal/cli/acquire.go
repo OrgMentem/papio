@@ -198,7 +198,7 @@ func newAcquireCommand(opt *options) *cobra.Command {
 	flags.BoolVar(&fromZotio, "from-zotio", false, "queue zotio items missing an attached PDF")
 	flags.IntVar(&queueLimit, "limit", 25, "maximum Zotio items to queue")
 	flags.Int64Var(&fromDigest, "from-digest", 0, "queue pending entries from an alert watch")
-	flags.StringSliceVar(&digestKeys, "keys", nil, "digest work keys to queue (comma-separated)")
+	flags.StringArrayVar(&digestKeys, "keys", nil, "digest work key to queue (repeatable)")
 	flags.StringVar(&batchPath, "batch", "", "submit JSONL works from a file or - for standard input")
 	flags.BoolVar(&includeOwned, "include-owned", false, "with --batch, submit works already carrying a PDF in zotio")
 	flags.StringVar(&label, "label", "", "batch query context; also the default target collection when --collection is unset")

@@ -653,3 +653,18 @@ func TestZotioFailureCarriesOnlySafeTaxonomyDetail(t *testing.T) {
 		t.Fatalf("zotio failure leaked private detail: %s", encoded)
 	}
 }
+
+func TestParseFailuresSinceRejectsNegativeLookbacks(t *testing.T) {
+	now := time.Date(2026, time.July, 20, 12, 0, 0, 0, time.UTC)
+	for _, value := range []string{"-1", "-1d", "-1h"} {
+		t.Run(value, func(t *testing.T) {
+			_, err := parseFailuresSince(value, now)
+			if err == nil {
+				t.Fatalf("parseFailuresSince(%q) succeeded", value)
+			}
+			if err.Error() != "since must be a non-negative duration or RFC3339 timestamp" {
+				t.Fatalf("parseFailuresSince(%q) error = %q", value, err)
+			}
+		})
+	}
+}
