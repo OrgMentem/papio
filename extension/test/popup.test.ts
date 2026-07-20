@@ -9,6 +9,7 @@ import {
   acquireCurrentPage,
   cancelJob,
   livePageAcquireAvailable,
+  collectPageMetadata,
   focusJob,
   renderDaemonStatus,
   renderJobs,
@@ -351,4 +352,57 @@ test("hides the library grant prompt when every resolver is granted", () => {
   const section = doc.getElementById("resolver-grant");
   expect(section?.hidden).toBe(true);
   expect(section?.children.length).toBe(0);
+});
+
+// --- collectPageMetadata DOI fallback chain -------------------------------
+// SAGE (Atypon) abstract pages carry no citation_doi; the scraper must fall
+// back through publication_doi, dc.Identifier[scheme=doi], and the URL path.
+
+function pageDocument(html: string, href: string): void {
+  const window = new Window({ url: href });
+  window.document.write(html);
+  Object.assign(globalThis, { document: window.document, location: new URL(href) });
+}
+
+test("collectPageMetadata prefers citation_doi when present", () => {
+  pageDocument(
+    `<html><head><meta name="citation_doi" content=" 10.1002/prefer "><meta name="publication_doi" content="10.9999/wrong"><meta name="citation_title" content="Preferred"></head></html>`,
+    "https://onlinelibrary.wiley.com/doi/10.1002/prefer",
+  );
+  const page = collectPageMetadata();
+  expect(page.doi).toBe("10.1002/prefer");
+  expect(page.title).toBe("Preferred");
+});
+
+test("collectPageMetadata reads SAGE publication_doi and dc.Identifier", () => {
+  pageDocument(
+    `<html><head><meta name="dc.Identifier" scheme="publisher-id" content="10.1177_1071181319631264"><meta name="dc.Identifier" scheme="doi" content="10.1177/1071181319631264"><title>Trust Engineering</title></head></html>`,
+    "https://journals.sagepub.com/doi/abs/10.1177/1071181319631264",
+  );
+  expect(collectPageMetadata().doi).toBe("10.1177/1071181319631264");
+
+  pageDocument(
+    `<html><head><meta name="publication_doi" content="10.1177/1071181319631264"></head></html>`,
+    "https://journals.sagepub.com/doi/abs/10.1177/1071181319631264",
+  );
+  expect(collectPageMetadata().doi).toBe("10.1177/1071181319631264");
+});
+
+test("collectPageMetadata falls back to a DOI-shaped URL path", () => {
+  pageDocument(
+    `<html><head><title>Bare page</title></head></html>`,
+    "https://journals.sagepub.com/doi/abs/10.1177/1071181319631264?journalCode=pro",
+  );
+  const page = collectPageMetadata();
+  expect(page.doi).toBe("10.1177/1071181319631264");
+});
+
+test("collectPageMetadata reports no DOI on DOI-less pages", () => {
+  pageDocument(
+    `<html><head><title>News article</title></head></html>`,
+    "https://example.com/news/story-42",
+  );
+  const page = collectPageMetadata();
+  expect(page.doi).toBeUndefined();
+  expect(page.title).toBe("News article");
 });

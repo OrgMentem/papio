@@ -342,6 +342,54 @@ interface PageMetadata {
 
 const NO_DOI_FOUND = "no DOI found on this page";
 
+/**
+ * Runs INSIDE the page via scripting.executeScript — must stay fully
+ * self-contained (no outer-scope references survive serialization).
+ *
+ * DOI sources, in trust order: Google Scholar's citation_doi (Wiley,
+ * Springer, most publishers), SAGE's publication_doi, Dublin Core
+ * dc.Identifier[scheme=doi] (Atypon platforms omit citation_doi on
+ * abstract pages), then a DOI-shaped match in the URL path or canonical
+ * link (journals.sagepub.com/doi/abs/10.1177/... carries it verbatim).
+ * The daemon re-validates and normalizes whatever we send.
+ */
+export function collectPageMetadata(): PageMetadata {
+  const clean = (value: string | null | undefined): string => (value ?? "").trim();
+  const meta = (name: string): string =>
+    clean(document.querySelector(`meta[name="${name}"]`)?.getAttribute("content"));
+  let doi = meta("citation_doi") || meta("publication_doi");
+  if (!doi) {
+    for (const el of Array.from(
+      document.querySelectorAll('meta[name="dc.Identifier"], meta[name="DC.Identifier"], meta[name="dc.identifier"]'),
+    )) {
+      const scheme = clean(el.getAttribute("scheme")).toLowerCase();
+      const content = clean(el.getAttribute("content"));
+      if (!content) continue;
+      if (scheme === "doi") { doi = content; break; }
+      if (!scheme && content.toLowerCase().startsWith("doi:")) { doi = content.slice(4).trim(); break; }
+      if (!scheme && /^10\.\d{4,9}\//.test(content)) { doi = content; break; }
+    }
+  }
+  if (!doi) {
+    const doiInPath = (value: string): string => {
+      let decoded = value;
+      try { decoded = decodeURIComponent(value); } catch { /* keep raw */ }
+      const match = decoded.match(/10\.\d{4,9}\/[^\s?#]+/);
+      return match ? match[0] : "";
+    };
+    doi =
+      doiInPath(location.pathname) ||
+      doiInPath(clean(document.querySelector('link[rel="canonical"]')?.getAttribute("href"))) ||
+      doiInPath(clean(document.querySelector('meta[property="og:url"]')?.getAttribute("content")));
+  }
+  const title = meta("citation_title") || document.title.trim();
+  return {
+    url: location.href,
+    ...(doi ? { doi } : {}),
+    ...(title ? { title } : {}),
+  };
+}
+
 /** Capability state belongs to the live worker, never a prior session snapshot. */
 export async function livePageAcquireAvailable(): Promise<boolean> {
   try {
@@ -372,15 +420,7 @@ export async function acquireCurrentPage(): Promise<PageAcquireResponse> {
   if (tab?.id === undefined) throw new Error("No active tab");
   const [injected] = await chrome.scripting.executeScript({
     target: { tabId: tab.id },
-    func: (): PageMetadata => {
-      const doi = document.querySelector('meta[name="citation_doi"]')?.getAttribute("content")?.trim();
-      const title = document.querySelector('meta[name="citation_title"]')?.getAttribute("content")?.trim() || document.title.trim();
-      return {
-        url: location.href,
-        ...(doi ? { doi } : {}),
-        ...(title ? { title } : {}),
-      };
-    },
+    func: collectPageMetadata,
   });
   const metadata = injected?.result;
   if (
