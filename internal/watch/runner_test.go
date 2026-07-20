@@ -4,6 +4,7 @@ package watch
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -180,7 +181,7 @@ func TestRunnerAcquireDigestStopsAfterSubmissionFailure(t *testing.T) {
 	}
 
 	queued, err := runner.AcquireDigest(ctx, created.ID, nil)
-	if err != context.DeadlineExceeded || queued != 1 {
+	if !errors.Is(err, context.DeadlineExceeded) || queued != 1 {
 		t.Fatalf("AcquireDigest() = %d, %v; want 1, deadline exceeded", queued, err)
 	}
 	entries, err := watches.Digest(ctx, created.ID, 100)

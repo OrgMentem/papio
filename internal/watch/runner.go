@@ -131,7 +131,7 @@ func (r *Runner) AcquireDigest(ctx context.Context, watchID int64, keys []string
 			manifest.Works[i].Error = "submit"
 			manifest.Works = manifest.Works[:i+1]
 			if writeErr := batch.Write(r.DataDir, manifest); writeErr != nil {
-				return queued, fmt.Errorf("%w (writing digest manifest: %v)", submitErr, writeErr)
+				return queued, fmt.Errorf("%w (writing digest manifest: %w)", submitErr, writeErr)
 			}
 			for _, entry := range succeeded {
 				if err := r.Store.deleteDigestEntry(ctx, watchID, entry.WorkKey); err != nil {
