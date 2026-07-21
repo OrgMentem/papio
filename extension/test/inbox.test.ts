@@ -392,7 +392,7 @@ test("the action kind renders as a status glyph with an accessible label, not a 
   const badge = page.document.querySelector<HTMLElement>("[data-triage-item-id='action:manual'] .item-status");
   expect(badge?.dataset.status).toBe("manual_download");
   expect(badge?.getAttribute("aria-label")).toBe("Manual download needed");
-  expect(badge?.title).toBe("Manual download needed");
+  expect(badge?.dataset.label).toBe("Manual download needed");
   expect(page.document.querySelector("[data-triage-item-id='action:manual'] dd[data-fact='action']")).toBeNull();
 });
 

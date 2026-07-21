@@ -31,10 +31,12 @@ for the full pre-split extension history.
   reference-style line (authors, year, hyperlinked DOI) in a user-selected
   citation style — APA, MLA, or Chicago — persisted across visits. The DOI
   link is the citation's locator, replacing the separate "Open DOI" row.
-- **Status glyph column in the inbox**: every row leads with a colored,
-  tooltipped glyph for its kind (manual download ↓, browser handoff ↗,
-  verify identity ?, watch hit ✶, retraction !); unknown kinds from a newer
-  daemon degrade to a neutral dot. This replaces the action-kind pill.
+- **Status glyph column in the inbox**: every row leads with a colored glyph
+  for its kind (manual download ↓, browser handoff ↗, verify identity ?,
+  watch hit ✶, retraction !); unknown kinds from a newer daemon degrade to a
+  neutral dot. This replaces the action-kind pill. Hovering a glyph shows
+  its meaning instantly (no native-tooltip delay), and a legend in the
+  footer spells out all five.
 - **Collapsible backend details per inbox row**: item id, job id, and
   revision move out of the visible row into a collapsed "Backend details"
   section.

@@ -529,7 +529,32 @@
         height: 26px;
         justify-content: center;
         margin-top: 1px;
+        position: relative;
         width: 26px;
+      }
+
+      /* Instant tooltip: the glyph's meaning appears on hover without the
+         native title delay. Screen readers get it from aria-label instead. */
+      .triage-item .item-status::after {
+        background: var(--color-ink);
+        border-radius: var(--radius-control);
+        color: var(--color-page);
+        content: attr(data-label);
+        font-size: var(--font-size-label);
+        font-weight: 600;
+        left: 0;
+        opacity: 0;
+        padding: var(--space-1) var(--space-2);
+        pointer-events: none;
+        position: absolute;
+        top: calc(100% + var(--space-1));
+        transition: opacity var(--transition-fast);
+        white-space: nowrap;
+        z-index: 1;
+      }
+
+      .triage-item .item-status:hover::after {
+        opacity: 1;
       }
 
       .item-status[data-status="manual_download"] {
@@ -679,6 +704,27 @@
         padding-top: var(--space-3);
       }
 
+      #status-legend {
+        align-items: center;
+        display: flex;
+        flex: 1 1 100%;
+        flex-wrap: wrap;
+        gap: var(--space-1) var(--space-3);
+      }
+
+      #status-legend .item-status {
+        display: inline-flex;
+        font-size: 10px;
+        height: 18px;
+        margin: 0 var(--space-1) 0 0;
+        vertical-align: middle;
+        width: 18px;
+      }
+
+      #status-legend span[data-status] + span {
+        margin-right: var(--space-2);
+      }
+
       #shortcut-help {
         flex: 1 1 auto;
         min-width: 0;
@@ -807,6 +853,13 @@
     <p id="operation-status" role="status" aria-live="polite"></p>
     <button id="load-more" type="button" hidden>Load more</button>
     <footer>
+      <p id="status-legend">
+        <span class="item-status" data-status="manual_download" aria-hidden="true">↓</span><span>manual download</span>
+        <span class="item-status" data-status="openurl_handoff" aria-hidden="true">↗</span><span>browser handoff</span>
+        <span class="item-status" data-status="verify_identity" aria-hidden="true">?</span><span>verify identity</span>
+        <span class="item-status" data-status="watch_hit" aria-hidden="true">✶</span><span>watch hit</span>
+        <span class="item-status" data-status="retraction" aria-hidden="true">!</span><span>retraction</span>
+      </p>
       <p id="shortcut-help">
         <strong>Keyboard:</strong> j/k select · a acts on the selected item (accept, acquire, or
         open — whichever applies) · d dismisses or rejects · o opens its link. Paused while typing

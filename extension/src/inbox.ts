@@ -554,7 +554,7 @@ function renderItem(item: TriageSnapshotItem): HTMLElement {
   const badge = element("span", status.glyph);
   badge.className = "item-status";
   badge.dataset.status = status.key;
-  badge.title = status.label;
+  badge.dataset.label = status.label;
   badge.setAttribute("role", "img");
   badge.setAttribute("aria-label", status.label);
   card.append(badge);
