@@ -123,11 +123,21 @@ func inFrame(t *testing.T, typ, jobID string, payload any) json.RawMessage {
 	return raw
 }
 
+// testSessionID is the default native-host session identity for tests that
+// exercise a single browser.
+const testSessionID = "sess-primary-000000000000000000000000"
+
 // sync runs one Sync batch and decodes every outbound frame (asserting each is a
 // valid papio-browser frame), returning the decoded messages and their raw bytes.
 func runSync(t *testing.T, b *Bridge, frames ...json.RawMessage) ([]*protocol.BrowserMessage, []json.RawMessage) {
 	t.Helper()
-	out, err := b.Sync(context.Background(), frames)
+	return runSyncAs(t, b, testSessionID, frames...)
+}
+
+// runSyncAs is runSync for a specific native-host session.
+func runSyncAs(t *testing.T, b *Bridge, sessionID string, frames ...json.RawMessage) ([]*protocol.BrowserMessage, []json.RawMessage) {
+	t.Helper()
+	out, err := b.Sync(context.Background(), sessionID, false, frames)
 	if err != nil {
 		t.Fatalf("sync: %v", err)
 	}
@@ -701,7 +711,7 @@ func TestSentinelSecretNeverEntersMessagesOrDurableRows(t *testing.T) {
 	// fails the strict decode and stores nothing.
 	bad := json.RawMessage(`{"protocol":"papio-browser/1","type":"auth_returned","msg_id":"client-msg-9","seq":9,"job_id":"` + id +
 		`","payload":{"elapsed_ms":10,"idp_url":"https://idp.example/saml?token=` + sentinel + `"}}`)
-	if _, err := b.Sync(context.Background(), []json.RawMessage{bad}); err == nil {
+	if _, err := b.Sync(context.Background(), testSessionID, false, []json.RawMessage{bad}); err == nil {
 		t.Fatal("smuggled idp_url field must be rejected")
 	}
 
@@ -777,7 +787,7 @@ func TestDownloadCompleteRejectsTraversalAndAdoptsValidFile(t *testing.T) {
 	for _, bad := range []string{"../evil.pdf", "/etc/passwd.pdf"} {
 		frame := inFrame(t, protocol.MsgDownloadComplete, id,
 			map[string]any{"download_id": 1, "filename": bad, "size_bytes": 100})
-		if _, err := b.Sync(context.Background(), []json.RawMessage{frame}); err == nil {
+		if _, err := b.Sync(context.Background(), testSessionID, false, []json.RawMessage{frame}); err == nil {
 			t.Fatalf("filename %q must be rejected", bad)
 		}
 	}
@@ -830,7 +840,7 @@ func TestDownloadValidationDoesNotBlockSessionSync(t *testing.T) {
 		map[string]any{"download_id": 7, "filename": "paper.pdf", "size_bytes": 533})
 	adoptionDone := make(chan error, 1)
 	go func() {
-		_, err := b.Sync(context.Background(), []json.RawMessage{frame})
+		_, err := b.Sync(context.Background(), testSessionID, false, []json.RawMessage{frame})
 		adoptionDone <- err
 	}()
 	select {
@@ -841,7 +851,7 @@ func TestDownloadValidationDoesNotBlockSessionSync(t *testing.T) {
 
 	pollDone := make(chan error, 1)
 	go func() {
-		_, err := b.Sync(context.Background(), nil)
+		_, err := b.Sync(context.Background(), testSessionID, false, nil)
 		pollDone <- err
 	}()
 	select {
@@ -892,7 +902,7 @@ func TestPollDiscoveredDownloadValidationDoesNotBlockSessionSync(t *testing.T) {
 
 	adoptionDone := make(chan error, 1)
 	go func() {
-		_, err := b.Sync(context.Background(), nil)
+		_, err := b.Sync(context.Background(), testSessionID, false, nil)
 		adoptionDone <- err
 	}()
 	select {
@@ -903,7 +913,7 @@ func TestPollDiscoveredDownloadValidationDoesNotBlockSessionSync(t *testing.T) {
 
 	pollDone := make(chan error, 1)
 	go func() {
-		_, err := b.Sync(context.Background(), nil)
+		_, err := b.Sync(context.Background(), testSessionID, false, nil)
 		pollDone <- err
 	}()
 	select {
@@ -1006,7 +1016,7 @@ func TestPollScanAdoptsSingleSettledFileAndDefersAmbiguity(t *testing.T) {
 	}
 
 	runSync(t, b, hello())
-	if _, err := b.Sync(ctx, nil); err != nil { // poll triggers the scan
+	if _, err := b.Sync(ctx, testSessionID, false, nil); err != nil { // poll triggers the scan
 		t.Fatal(err)
 	}
 
@@ -1114,7 +1124,7 @@ func TestJobRejectEndsHandoffUnavailable(t *testing.T) {
 	}
 }
 
-func TestHandoffOutcomeRecordsFailureAndReArmsOffer(t *testing.T) {
+func TestHandoffOutcomeIsAuditOnlyAndKeepsActionOpen(t *testing.T) {
 	b, jobs, _, _ := newBridge(t)
 	ctx := context.Background()
 	id := park(t, jobs, "wr_hfail", handoffWork())
@@ -1125,16 +1135,13 @@ func TestHandoffOutcomeRecordsFailureAndReArmsOffer(t *testing.T) {
 	}
 	msgs, _ := runSync(t, b, inFrame(t, protocol.MsgHandoffOutcome, id,
 		map[string]any{"outcome": "stale_sso", "final_host": "login.openathens.net"}))
-	// The same sync's poll re-offers with a freshly minted OpenURL: that IS the
-	// recovery, so a second job_offer frame must go out immediately.
-	reOffered := false
+	// Recovery lives in the extension (it re-drives the tab through the
+	// resolver); the daemon must NOT emit a duplicate job_offer — the
+	// deterministic offer URL would be deduplicated without a reload anyway.
 	for _, m := range msgs {
-		if m.Type == protocol.MsgJobOffer && m.JobID == id {
-			reOffered = true
+		if m.Type == protocol.MsgJobOffer {
+			t.Fatalf("unexpected duplicate job_offer after IdP failure: %+v", m)
 		}
-	}
-	if !reOffered {
-		t.Fatal("expected a fresh job_offer after the IdP failure")
 	}
 
 	row, _ := jobs.Get(ctx, id)
@@ -1169,7 +1176,7 @@ func TestHandoffOutcomeRecordsFailureAndReArmsOffer(t *testing.T) {
 		t.Fatalf("events missing handoff_failed=%v handoff_offered=%v", failed, offered)
 	}
 	if !b.offered[id] {
-		t.Fatal("re-offer must mark the job offered again")
+		t.Fatal("offer bookkeeping must be untouched by an IdP failure report")
 	}
 
 	// Unknown job: dropped fail-closed, no error, no event.

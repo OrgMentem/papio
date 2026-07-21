@@ -307,10 +307,15 @@ func (r *Resolver) ResolveSiblings(ctx context.Context, requested work.Work) ([]
 		if resolved.DOI == "" || resolved.DOI == canonicalDOI {
 			continue
 		}
-		if normalizeTitle(record.Title) != normalizeTitle(canonical.Title) {
+		if normalizeSiblingTitle(record.Title) != normalizeSiblingTitle(canonical.Title) {
 			continue
 		}
-		if canonical.Year != 0 && record.PublicationYear != 0 {
+		if canonical.Year != 0 {
+			// A sibling of a dated canonical work must itself be dated and
+			// close: an undated record is too weak a match to auto-accept.
+			if record.PublicationYear == 0 {
+				continue
+			}
 			if diff := record.PublicationYear - canonical.Year; diff < -3 || diff > 3 {
 				continue
 			}
@@ -348,6 +353,24 @@ func (r *Resolver) ResolveSiblings(ctx context.Context, requested work.Work) ([]
 		candidates = append(candidates, candidate)
 	}
 	return candidates, nil
+}
+
+// normalizeSiblingTitle compares titles across publisher/preprint records,
+// which frequently disagree on punctuation and dashes ("Trust: A Study" vs
+// "Trust — A Study"). Non-alphanumeric runs collapse to single spaces. This
+// is deliberately sibling-only: the primary title-search matcher keeps its
+// narrower normalizeTitle semantics.
+func normalizeSiblingTitle(value string) string {
+	var builder strings.Builder
+	builder.Grow(len(value))
+	for _, r := range strings.ToLower(value) {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			builder.WriteRune(r)
+		} else {
+			builder.WriteRune(' ')
+		}
+	}
+	return strings.Join(strings.Fields(builder.String()), " ")
 }
 
 // sharesAuthorSurname reports whether any author family name appears in both

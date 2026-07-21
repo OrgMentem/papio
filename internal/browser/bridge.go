@@ -18,8 +18,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -51,10 +53,12 @@ const (
 // layer maps it to invalid_argument; other Sync errors are internal.
 var ErrInvalidFrame = errors.New("invalid browser frame")
 
-// Bridge is the per-daemon-run browser session. hello is tracked in memory: a
-// fresh hello resets the offered/cancelled bookkeeping, which is exactly the
-// recovery an MV3 service-worker restart needs (the extension reconnects, says
-// hello again, and re-receives outstanding offers).
+// Bridge is the per-daemon-run browser bridge. Sessions are tracked in
+// memory: each native-host process carries a session_id, exactly one session
+// holds the offer/handoff flow, and later hellos from other browsers wait as
+// pending instead of silently stealing the session. A fresh hello from the
+// holder still resets the offered/cancelled bookkeeping, which is exactly the
+// recovery an MV3 service-worker restart needs.
 type Bridge struct {
 	jobs        *job.Store
 	svc         *app.Service
@@ -67,18 +71,47 @@ type Bridge struct {
 	Version  string
 	Features []string
 
-	// extensionVersion and adapterVersions describe the current hello-session.
-	extensionVersion string
-	adapterVersions  map[string]string
-
-	mu                sync.Mutex
-	seq               int64
-	helloSeen         bool
-	extensionOutdated bool
-	offered           map[string]bool // handoff jobs offered this hello-session
-	cancelSent        map[string]bool // jobs a daemon-side cancel was already announced for
-	now               func() time.Time
+	mu           sync.Mutex
+	seq          int64
+	holder       *browserSession
+	pending      map[string]*browserSession
+	deniedHellos int
+	takeovers    int
+	offered      map[string]bool // handoff jobs offered to the current holder
+	cancelSent   map[string]bool // jobs a daemon-side cancel was already announced for
+	now          func() time.Time
 }
+
+// browserSession is one native-host connection that said hello.
+type browserSession struct {
+	ID               string
+	ExtensionVersion string
+	AdapterVersions  map[string]string
+	HelloAt          time.Time
+	LastSyncAt       time.Time
+	Outdated         bool
+	// needsAck makes the next Sync from this session deliver a hello_ack:
+	// a session promoted by claim or stale-takeover was denied its ack at
+	// hello time and must still receive one before offers mean anything.
+	needsAck bool
+}
+
+// legacySessionID stands in for native hosts older than the session_id field.
+// It cannot collide with real ids (32 hex chars). Legacy hosts cannot be
+// arbitrated, so a legacy hello always takes the session (and loses it to any
+// later hello), preserving the historical last-hello-wins behavior.
+const legacySessionID = "legacy"
+
+// sessionStaleAfter is how long a holder may go without syncing before
+// another browser may take over. Live native hosts poll every 2 seconds
+// (nativehost.pollInterval); 5x that absorbs scheduling hiccups without
+// making crash recovery feel slow.
+const sessionStaleAfter = 10 * time.Second
+
+// pendingExpireAfter prunes pending sessions whose native host stopped
+// syncing without a goodbye (browser killed) so `papio browser sessions`
+// reflects reality.
+const pendingExpireAfter = 5 * time.Minute
 
 // NewBridge constructs the bridge. It is cheap and always constructed; whether
 // any job is ever offered depends on config (extension_id / openurl base).
@@ -88,7 +121,7 @@ func NewBridge(jobs *job.Store, svc *app.Service, triageService *triage.Service,
 		Version: version,
 		Features: appendFeatures(features,
 			pageAcquireFeature, triageSnapshotFeature, triageMutationsFeature, reviewPreviewFeature),
-		offered: map[string]bool{}, cancelSent: map[string]bool{},
+		offered: map[string]bool{}, cancelSent: map[string]bool{}, pending: map[string]*browserSession{},
 		now: time.Now,
 	}
 }
@@ -127,48 +160,173 @@ func appendFeature(features []string, feature string) []string {
 	return appendFeatures(features, feature)
 }
 
-// SessionInfo returns a consistent snapshot of the current extension hello-session.
+// SessionInfo returns a consistent snapshot of the holder hello-session.
 func (b *Bridge) SessionInfo() (extensionVersion string, adapterCount int, helloSeen bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.extensionVersion, len(b.adapterVersions), b.helloSeen
+	if b.holder == nil {
+		return "", 0, false
+	}
+	return b.holder.ExtensionVersion, len(b.holder.AdapterVersions), true
 }
 
-// Sync processes a batch of inbound frames (possibly empty for a poll) and
-// returns the outbound command frames. Every inbound frame is re-validated with
-// protocol.DecodeBrowserMessage; malformed frames fail the whole call closed.
-// A valid frame or poll arriving after a daemon restart but before hello gets a
-// protocol error frame so the still-connected extension can reconnect and
-// establish a fresh hello-session. Every outbound frame is self-validated by
-// the same decoder before it leaves.
-func (b *Bridge) Sync(ctx context.Context, frames []json.RawMessage) ([]json.RawMessage, error) {
+// SessionSummary is one connected browser session for status/CLI surfaces.
+type SessionSummary struct {
+	ID               string `json:"id"`
+	ExtensionVersion string `json:"extension_version"`
+	Holder           bool   `json:"holder"`
+	HelloAt          string `json:"hello_at"`
+	LastSyncAt       string `json:"last_sync_at"`
+}
+
+// Sessions lists the holder and every pending session, holder first, plus the
+// arbitration counters accumulated since daemon start.
+func (b *Bridge) Sessions() (sessions []SessionSummary, deniedHellos, takeovers int) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.holder != nil {
+		sessions = append(sessions, summarize(b.holder, true))
+	}
+	rest := make([]*browserSession, 0, len(b.pending))
+	for _, session := range b.pending {
+		rest = append(rest, session)
+	}
+	sort.Slice(rest, func(i, j int) bool { return rest[i].LastSyncAt.After(rest[j].LastSyncAt) })
+	for _, session := range rest {
+		sessions = append(sessions, summarize(session, false))
+	}
+	return sessions, b.deniedHellos, b.takeovers
+}
+
+func summarize(session *browserSession, holder bool) SessionSummary {
+	return SessionSummary{
+		ID:               session.ID,
+		ExtensionVersion: session.ExtensionVersion,
+		Holder:           holder,
+		HelloAt:          session.HelloAt.UTC().Format(time.RFC3339),
+		LastSyncAt:       session.LastSyncAt.UTC().Format(time.RFC3339),
+	}
+}
+
+// Claim promotes a pending session to holder (the `papio browser use` path).
+// The demoted holder stays pending — it is still alive and polling.
+func (b *Bridge) Claim(sessionID string) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.holder != nil && strings.HasPrefix(b.holder.ID, sessionID) && sessionID != "" {
+		return nil // already the holder
+	}
+	var match *browserSession
+	for id, session := range b.pending {
+		if strings.HasPrefix(id, sessionID) && sessionID != "" {
+			if match != nil {
+				return fmt.Errorf("browser session prefix %q is ambiguous (run 'papio browser sessions')", sessionID)
+			}
+			match = session
+		}
+	}
+	if match == nil {
+		return fmt.Errorf("unknown browser session %q (run 'papio browser sessions')", sessionID)
+	}
+	b.promote(match, "claimed via papio browser use")
+	return nil
+}
+
+// promote makes session the holder. The caller holds b.mu. The previous
+// holder, when still present, is demoted to pending rather than dropped so an
+// explicit claim can be reversed with another claim.
+func (b *Bridge) promote(session *browserSession, reason string) {
+	if b.holder != nil && b.holder.ID != session.ID {
+		b.pending[b.holder.ID] = b.holder
+	}
+	delete(b.pending, session.ID)
+	session.needsAck = true
+	b.holder = session
+	b.offered = map[string]bool{}
+	b.cancelSent = map[string]bool{}
+	b.takeovers++
+	log.Printf("papio: browser session %s (v%s) now holds the bridge: %s", shortSession(session.ID), session.ExtensionVersion, reason)
+}
+
+func shortSession(id string) string {
+	if len(id) > 12 {
+		return id[:12]
+	}
+	return id
+}
+
+// Sync processes a batch of inbound frames (possibly empty for a poll) from
+// one native-host session and returns the outbound command frames. Every
+// inbound frame is re-validated with protocol.DecodeBrowserMessage; malformed
+// frames fail the whole call closed. A frame or poll from a session the
+// daemon does not know (daemon restart, dropped stale holder) gets a protocol
+// error frame instructing the extension to re-hello. Only the holder session
+// receives offer/cancel traffic; goodbye releases the session immediately.
+// Every outbound frame is self-validated by the same decoder before it leaves.
+func (b *Bridge) Sync(ctx context.Context, sessionID string, goodbye bool, frames []json.RawMessage) ([]json.RawMessage, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if sessionID == "" {
+		sessionID = legacySessionID
+	}
+	if goodbye {
+		b.release(sessionID)
+		return nil, nil
+	}
+	now := b.now()
+	b.prunePending(now)
+	if b.holder != nil && b.holder.ID == sessionID {
+		b.holder.LastSyncAt = now
+	} else if session, ok := b.pending[sessionID]; ok {
+		session.LastSyncAt = now
+		// Succession: a silent or departed holder yields to the session that
+		// is demonstrably alive right now.
+		if b.holder == nil {
+			b.promote(session, "previous holder disconnected")
+		} else if now.Sub(b.holder.LastSyncAt) > sessionStaleAfter {
+			stale := b.holder
+			delete(b.pending, stale.ID) // do not resurrect a silent holder
+			b.promote(session, "holder "+shortSession(stale.ID)+" went silent")
+			delete(b.pending, stale.ID)
+		}
+	}
 
 	var out []json.RawMessage
+	if b.holder != nil && b.holder.ID == sessionID && b.holder.needsAck && !b.holder.Outdated {
+		ack, err := b.helloAck()
+		if err != nil {
+			return nil, err
+		}
+		b.holder.needsAck = false
+		out = append(out, ack)
+	}
 	for _, raw := range frames {
 		msg, err := protocol.DecodeBrowserMessage(raw)
 		if err != nil {
 			return nil, fmt.Errorf("%w: %w", ErrInvalidFrame, err)
 		}
-		if !b.helloSeen && msg.Type != protocol.MsgHello {
+		if msg.Type != protocol.MsgHello && !b.knownSession(sessionID) {
 			return b.helloRequired()
 		}
-		replies, err := b.handle(ctx, msg)
+		replies, err := b.handle(ctx, sessionID, msg)
 		if err != nil {
 			return nil, err
 		}
 		out = append(out, replies...)
-		if b.extensionOutdated {
+		if b.holder != nil && b.holder.ID == sessionID && b.holder.Outdated {
 			return out, nil
 		}
 	}
-	if !b.helloSeen {
+	if !b.knownSession(sessionID) {
 		required, err := b.helloRequired()
 		if err != nil {
 			return nil, err
 		}
 		return append(out, required...), nil
+	}
+	if b.holder == nil || b.holder.ID != sessionID || b.holder.Outdated {
+		// Pending sessions poll but never receive offer/cancel traffic.
+		return out, nil
 	}
 	polled, err := b.poll(ctx)
 	if err != nil {
@@ -177,34 +335,69 @@ func (b *Bridge) Sync(ctx context.Context, frames []json.RawMessage) ([]json.Raw
 	return append(out, polled...), nil
 }
 
-// handle dispatches one decoded inbound frame.
-func (b *Bridge) handle(ctx context.Context, msg *protocol.BrowserMessage) ([]json.RawMessage, error) {
-	if msg.Type == protocol.MsgHello {
-		p := msg.Payload.(*protocol.HelloPayload)
-		b.helloSeen = true
-		b.extensionOutdated = compareVersion(p.ExtensionVersion, MinExtensionVersion) < 0
-		b.extensionVersion = p.ExtensionVersion
-		b.adapterVersions = p.AdapterVersions
-		b.offered = map[string]bool{}
-		b.cancelSent = map[string]bool{}
-		if b.extensionOutdated {
-			return b.extensionOutdatedError()
-		}
-		ack, err := b.frame(protocol.MsgHelloAck, "", protocol.HelloAckPayload{
-			DaemonVersion:   b.Version,
-			Features:        b.Features,
-			ResolverOrigins: b.cfg.ResolverOrigins(),
-		})
-		if err != nil {
-			return nil, err
-		}
-		return []json.RawMessage{ack}, nil
+// knownSession reports whether the session already completed a hello this
+// daemon run. The caller holds b.mu.
+func (b *Bridge) knownSession(sessionID string) bool {
+	if b.holder != nil && b.holder.ID == sessionID {
+		return true
 	}
-	if !b.helloSeen {
+	_, ok := b.pending[sessionID]
+	return ok
+}
+
+// release forgets a departing session. The caller holds b.mu.
+func (b *Bridge) release(sessionID string) {
+	delete(b.pending, sessionID)
+	if b.holder != nil && b.holder.ID == sessionID {
+		log.Printf("papio: browser session %s (v%s) disconnected", shortSession(sessionID), b.holder.ExtensionVersion)
+		b.holder = nil
+	}
+}
+
+// prunePending drops pending sessions whose native host stopped syncing
+// without a goodbye. The caller holds b.mu.
+func (b *Bridge) prunePending(now time.Time) {
+	for id, session := range b.pending {
+		if now.Sub(session.LastSyncAt) > pendingExpireAfter {
+			delete(b.pending, id)
+		}
+	}
+}
+
+// helloAck builds the capability acknowledgement frame. The caller holds b.mu.
+func (b *Bridge) helloAck() (json.RawMessage, error) {
+	return b.frame(protocol.MsgHelloAck, "", protocol.HelloAckPayload{
+		DaemonVersion:   b.Version,
+		Features:        b.Features,
+		ResolverOrigins: b.cfg.ResolverOrigins(),
+	})
+}
+
+// handle dispatches one decoded inbound frame from sessionID.
+func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.BrowserMessage) ([]json.RawMessage, error) {
+	if msg.Type == protocol.MsgHello {
+		return b.handleHello(sessionID, msg.Payload.(*protocol.HelloPayload))
+	}
+	session := b.sessionByID(sessionID)
+	if session == nil {
 		return b.helloRequired()
 	}
-	if b.extensionOutdated {
+	if session.Outdated {
 		return b.extensionOutdatedError()
+	}
+	if b.holder == nil || b.holder.ID != sessionID {
+		switch msg.Type {
+		case protocol.MsgPageAcquire, protocol.MsgTriageSnapshotRequest, protocol.MsgTriageCountsRequest,
+			protocol.MsgTriageDecide, protocol.MsgHumanActionResolve, protocol.MsgReviewPreviewRequest:
+			// Stateless request/response traffic works from any browser:
+			// "Acquire this page" and the inbox must not depend on who holds
+			// the handoff flow.
+		default:
+			// Offer/handoff frames from a non-holder are refused: acting on
+			// them is exactly the silent session fight this arbitration
+			// exists to prevent.
+			return b.sessionBusy(msg.JobID)
+		}
 	}
 
 	switch msg.Type {
@@ -296,6 +489,75 @@ func (b *Bridge) handle(ctx context.Context, msg *protocol.BrowserMessage) ([]js
 	default:
 		return nil, fmt.Errorf("%w: unexpected inbound frame type %q", ErrInvalidFrame, msg.Type)
 	}
+}
+
+// handleHello arbitrates a hello from sessionID. The holder keeps the
+// session; a hello from another browser waits as pending unless the holder
+// has gone silent. Legacy hosts (no session_id) cannot be arbitrated and keep
+// the historical last-hello-wins behavior in both directions.
+func (b *Bridge) handleHello(sessionID string, p *protocol.HelloPayload) ([]json.RawMessage, error) {
+	now := b.now()
+	session := &browserSession{
+		ID:               sessionID,
+		ExtensionVersion: p.ExtensionVersion,
+		AdapterVersions:  p.AdapterVersions,
+		HelloAt:          now,
+		LastSyncAt:       now,
+		Outdated:         compareVersion(p.ExtensionVersion, MinExtensionVersion) < 0,
+	}
+	holderAlive := b.holder != nil && now.Sub(b.holder.LastSyncAt) <= sessionStaleAfter
+	sameSession := b.holder != nil && b.holder.ID == sessionID
+	legacyInvolved := sessionID == legacySessionID || (b.holder != nil && b.holder.ID == legacySessionID)
+	if b.holder != nil && holderAlive && !sameSession && !legacyInvolved {
+		b.pending[sessionID] = session
+		b.deniedHellos++
+		log.Printf("papio: browser session %s (v%s) denied: session held by %s (v%s)",
+			shortSession(sessionID), session.ExtensionVersion, shortSession(b.holder.ID), b.holder.ExtensionVersion)
+		return b.sessionBusy("")
+	}
+	if b.holder != nil && !sameSession {
+		b.takeovers++
+		log.Printf("papio: browser session %s (v%s) took over from %s: holder silent or legacy",
+			shortSession(sessionID), session.ExtensionVersion, shortSession(b.holder.ID))
+	}
+	delete(b.pending, sessionID)
+	b.holder = session
+	b.offered = map[string]bool{}
+	b.cancelSent = map[string]bool{}
+	if session.Outdated {
+		return b.extensionOutdatedError()
+	}
+	ack, err := b.helloAck()
+	if err != nil {
+		return nil, err
+	}
+	return []json.RawMessage{ack}, nil
+}
+
+// sessionByID resolves holder or pending. The caller holds b.mu.
+func (b *Bridge) sessionByID(sessionID string) *browserSession {
+	if b.holder != nil && b.holder.ID == sessionID {
+		return b.holder
+	}
+	return b.pending[sessionID]
+}
+
+// sessionBusy tells a non-holder browser who owns the bridge and how to
+// switch. Delivered as an ordinary error frame so old extensions log it
+// instead of breaking.
+func (b *Bridge) sessionBusy(jobID string) ([]json.RawMessage, error) {
+	holderVersion := ""
+	if b.holder != nil {
+		holderVersion = b.holder.ExtensionVersion
+	}
+	frame, err := b.frame(protocol.MsgError, jobID, protocol.ErrorPayload{
+		Code:    "session_busy",
+		Message: "another browser holds the papio session (v" + holderVersion + "); run 'papio browser sessions' then 'papio browser use' to switch",
+	})
+	if err != nil {
+		return nil, err
+	}
+	return []json.RawMessage{frame}, nil
 }
 
 // triageSnapshot answers only an explicit request. It progressively lowers the
@@ -1083,10 +1345,12 @@ func (b *Bridge) offer(row job.Row, action job.HumanAction) (json.RawMessage, er
 }
 
 // handoffOutcome records an extension-reported IdP failure on a parked
-// handoff and re-arms the offer so the next poll sends a freshly minted
-// OpenURL. The job stays awaiting_human and the action stays open: the human
-// is mid-recovery and the fresh link is the recovery path. Unknown jobs or
-// jobs without an open handoff are dropped fail-closed.
+// handoff. The job stays awaiting_human and the action stays open: the human
+// is mid-recovery, and the extension re-drives the handoff tab through the
+// resolver itself (re-offering here would duplicate the frame — the offer URL
+// is deterministic, and the extension never renavigates an already-tracked
+// tab on a repeat job_offer). Unknown jobs or jobs without an open handoff
+// are dropped fail-closed.
 func (b *Bridge) handoffOutcome(ctx context.Context, jobID string, p *protocol.HandoffOutcomePayload) error {
 	actions, err := b.jobs.ListHumanActions(ctx, true)
 	if err != nil {
@@ -1106,7 +1370,6 @@ func (b *Bridge) handoffOutcome(ctx context.Context, jobID string, p *protocol.H
 		map[string]any{"outcome": p.Outcome, "final_host": p.FinalHost}); err != nil {
 		return err
 	}
-	delete(b.offered, jobID)
 	return nil
 }
 

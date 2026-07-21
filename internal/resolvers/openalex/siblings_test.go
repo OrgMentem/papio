@@ -66,6 +66,15 @@ func TestResolveSiblingsFindsOAPreprintOfPaywalledDOI(t *testing.T) {
 	}
 }
 
+func TestResolveSiblingsMatchesAcrossPunctuationDrift(t *testing.T) {
+	r := siblingResolver(t, siblingSearchBody(
+		"How Explanations Shape Trust.", 2022, "10.2139/ssrn.4020557", "Andrea Ferrario", "https://ssrn.example/paper.pdf"))
+	candidates, err := r.ResolveSiblings(context.Background(), work.Work{DOI: "10.1145/3531146.3533202"})
+	if err != nil || len(candidates) != 1 {
+		t.Fatalf("candidates = %#v, err = %v; want punctuation-equivalent title to match", candidates, err)
+	}
+}
+
 func TestResolveSiblingsRejectsWeakMatches(t *testing.T) {
 	for _, test := range []struct {
 		name string
@@ -77,6 +86,8 @@ func TestResolveSiblingsRejectsWeakMatches(t *testing.T) {
 			"How Explanations Shape Trust", 2022, "10.2139/ssrn.4020557", "Grace Hopper", "https://ssrn.example/paper.pdf")},
 		{name: "year too far", body: siblingSearchBody(
 			"How Explanations Shape Trust", 2015, "10.2139/ssrn.4020557", "Andrea Ferrario", "https://ssrn.example/paper.pdf")},
+		{name: "missing year rejected when canonical is dated", body: siblingSearchBody(
+			"How Explanations Shape Trust", 0, "10.2139/ssrn.4020557", "Andrea Ferrario", "https://ssrn.example/paper.pdf")},
 		{name: "same doi is not a sibling", body: siblingSearchBody(
 			"How Explanations Shape Trust", 2022, "10.1145/3531146.3533202", "Andrea Ferrario", "https://ssrn.example/paper.pdf")},
 	} {

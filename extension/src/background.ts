@@ -2074,10 +2074,24 @@ export class Bridge {
     if (change.status === "complete") {
       const failure = detectAuthFailure(url, tab.title);
       if (failure !== undefined && !this.handoffOutcomeSent.has(`${job.job_id}:${failure}`)) {
-        // Record-only: the daemon re-arms the handoff; the human stays in
-        // control of the tab, so never close or renavigate it here.
-        this.handoffOutcomeSent.add(`${job.job_id}:${failure}`);
-        this.send("handoff_outcome", { outcome: failure, final_host: host }, job.job_id);
+        // Mark only after a successful send: a dropped native port must not
+        // permanently swallow the one report this job gets for this outcome.
+        if (this.send("handoff_outcome", { outcome: failure, final_host: host }, job.job_id)) {
+          this.handoffOutcomeSent.add(`${job.job_id}:${failure}`);
+          // The dead IdP page is not recoverable by waiting. Re-drive the
+          // tab through the retained resolver offer URL once: the resolver
+          // mints a fresh SAML exchange against the now-warmer session. The
+          // daemon only records the failure; recovery lives here.
+          const openurl = this.offerURLs.get(job.job_id);
+          if (openurl !== undefined && this.deps.tabs.update !== undefined) {
+            try {
+              await this.deps.tabs.update(job.tab_id, { url: openurl });
+              return;
+            } catch {
+              // Tab vanished mid-recovery; the normal removal path re-queues.
+            }
+          }
+        }
       }
     }
     const adapter = this.deps.adapterSpecs.find((candidate) => hostMatches(host, candidate.hosts));
