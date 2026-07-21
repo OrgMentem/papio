@@ -128,7 +128,14 @@
         border-bottom: 1px solid var(--color-border);
         display: grid;
         gap: var(--space-3);
-        padding-bottom: var(--space-6);
+        grid-template-columns: minmax(0, 1fr) auto;
+        padding-bottom: var(--space-4);
+      }
+
+      .brand,
+      #connection-status,
+      #shortcut-help {
+        grid-column: 1 / -1;
       }
 
       h1,
@@ -173,39 +180,56 @@
       }
 
       #connection-status {
-        background: var(--color-surface);
-        border-left: var(--space-1) solid var(--color-border);
-        border-radius: 0 var(--radius-control) var(--radius-control) 0;
+        align-items: center;
         color: var(--color-muted);
+        display: flex;
         font-size: var(--font-size-small);
-        padding: var(--space-2) var(--space-3);
+        gap: var(--space-2);
+      }
+
+      #connection-status::before {
+        background: var(--color-control-border);
+        border-radius: 50%;
+        content: "";
+        flex: 0 0 auto;
+        height: 8px;
+        width: 8px;
       }
 
       #connection-status[data-state="connected"] {
-        background: var(--color-ok-surface);
-        border-left-color: var(--color-ok-border);
         color: var(--color-ok);
+      }
+
+      #connection-status[data-state="connected"]::before {
+        background: var(--color-ok-border);
       }
 
       #connection-status[data-state="disconnected"] {
         background: var(--color-warning-surface);
-        border-left-color: var(--color-warning-border);
+        border: 1px solid var(--color-warning-border);
+        border-radius: var(--radius-control);
         color: var(--color-warning);
         font-weight: 600;
+        padding: var(--space-2) var(--space-3);
+      }
+
+      #connection-status[data-state="disconnected"]::before {
+        background: var(--color-warning-border);
       }
 
       #inbox-counts {
-        align-items: center;
-        align-self: start;
-        background: var(--color-surface);
-        border: 1px solid var(--color-border);
-        border-radius: var(--radius-pill);
-        color: var(--color-context);
-        display: inline-flex;
+        align-self: center;
+        color: var(--color-muted);
         font-size: var(--font-size-small);
         font-variant-numeric: tabular-nums;
-        justify-self: start;
-        padding: var(--space-1) var(--space-3);
+        grid-column: 1;
+        grid-row: 3;
+      }
+
+      .toolbar {
+        grid-column: 2;
+        grid-row: 3;
+        justify-content: flex-end;
       }
 
       .toolbar,
@@ -293,9 +317,7 @@
       }
 
       .triage-group {
-        display: grid;
-        gap: var(--space-1);
-        margin-bottom: var(--space-4);
+        margin-bottom: var(--space-6);
       }
 
       .triage-group > h2 {
@@ -323,82 +345,67 @@
 
       .triage-group-retraction {
         --kind-accent: var(--color-danger-border);
-        --kind-badge-ink: var(--color-danger);
-        --kind-badge-surface: var(--color-danger-surface);
       }
 
       .triage-group-human_action {
-        --kind-accent: var(--color-primary-solid);
-        --kind-badge-ink: var(--color-primary);
-        --kind-badge-surface: var(--color-primary-surface);
+        --kind-accent: var(--color-primary-border);
       }
 
       .triage-group-watch_hit {
         --kind-accent: var(--color-control-border);
-        --kind-badge-ink: var(--color-muted);
-        --kind-badge-surface: var(--color-neutral-badge);
       }
 
       .triage-group-retraction > h2 {
         color: var(--color-danger);
       }
 
+      .triage-group > h2 {
+        margin-bottom: var(--space-2);
+      }
+
+      /* Items render as one divided list per group: a shared surface with
+         hairline separators, not individual outlined cards. */
       .triage-item {
         align-items: center;
         background: var(--color-surface);
-        border: 1px solid var(--color-border);
-        border-left: var(--space-1) solid var(--kind-accent, var(--color-border));
-        border-radius: var(--radius-card);
+        border-inline: 1px solid var(--color-border);
         display: grid;
         gap: var(--space-1) var(--space-3);
-        grid-template-columns: max-content minmax(0, 1fr) auto;
+        grid-template-columns: minmax(0, 1fr) auto;
         min-width: 0;
-        padding: var(--space-2) var(--space-3);
-        transition:
-          background-color var(--transition-fast),
-          border-color var(--transition-fast);
+        padding: var(--space-2) var(--space-4);
+        transition: background-color var(--transition-fast);
       }
 
-      .triage-item::before {
-        background: var(--kind-badge-surface, var(--color-neutral-badge));
-        border-radius: var(--radius-pill);
-        color: var(--kind-badge-ink, var(--color-muted));
-        font-size: var(--font-size-label);
-        font-weight: 700;
-        justify-self: start;
-        letter-spacing: 0.06em;
-        line-height: 1;
-        padding: var(--space-1) var(--space-2);
-        text-transform: uppercase;
-        grid-column: 1;
-        grid-row: 1;
+      .triage-group > .triage-item:first-of-type {
+        border-top: 1px solid var(--color-border);
+        border-top-left-radius: var(--radius-card);
+        border-top-right-radius: var(--radius-card);
       }
 
-      .triage-group-retraction .triage-item::before {
-        content: "Integrity alert";
+      .triage-group > .triage-item:last-of-type {
+        border-bottom: 1px solid var(--color-border);
+        border-bottom-left-radius: var(--radius-card);
+        border-bottom-right-radius: var(--radius-card);
       }
 
-      .triage-group-human_action .triage-item::before {
-        content: "Action needed";
-      }
-
-      .triage-group-watch_hit .triage-item::before {
-        content: "Watch hit";
+      .triage-item + .triage-item {
+        border-top: 1px solid var(--color-border);
       }
 
       .triage-item:hover {
-        border-color: var(--color-control-border);
+        background: var(--color-surface-hover);
       }
 
       .triage-item:focus {
         outline: var(--focus-width) solid var(--color-primary);
-        outline-offset: var(--focus-offset);
+        outline-offset: calc(-1 * var(--focus-width));
       }
 
       .triage-item h3 {
         color: var(--color-ink);
         font-size: var(--font-size-body);
-        grid-column: 2;
+        grid-column: 1;
         grid-row: 1;
         line-height: 1.3;
         min-width: 0;
@@ -412,7 +419,7 @@
         display: flex;
         flex-wrap: wrap;
         gap: 0 var(--space-1);
-        grid-column: 2;
+        grid-column: 1;
         min-width: 0;
       }
 
@@ -437,7 +444,21 @@
         word-break: break-word;
       }
 
+      /* Identifier-like values (DOIs, job ids) read as code; prose does not.
+         Retraction/watch rows lead with an identifier fact; human-action rows
+         lead with prose and end with the job id. */
       .item-facts dt:first-child + dd {
+        font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
+        font-size: var(--font-size-label);
+      }
+
+      .triage-group-human_action .item-facts dt:first-child + dd {
+        font-family: inherit;
+        font-size: var(--font-size-small);
+      }
+
+      .triage-group-human_action .item-facts dd:last-of-type {
+        color: var(--color-muted);
         font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
         font-size: var(--font-size-label);
       }
@@ -463,12 +484,12 @@
 
       .item-links {
         font-size: var(--font-size-small);
-        grid-column: 2;
+        grid-column: 1;
         overflow-wrap: anywhere;
       }
 
       .triage-item > .item-controls {
-        grid-column: 3;
+        grid-column: 2;
         grid-row: 1 / span 4;
         justify-self: end;
         margin: 0;
@@ -480,30 +501,23 @@
       }
 
       .item-result {
-        border-left: var(--space-1) solid var(--color-primary-border);
-        color: var(--color-context);
+        color: var(--color-primary);
         font-size: var(--font-size-small);
         font-weight: 600;
-        padding-left: var(--space-2);
-        grid-column: 2;
+        grid-column: 1;
       }
 
       #item-list > p {
-        background: var(--color-surface);
-        border: 1px dashed var(--color-control-border);
-        border-radius: var(--radius-card);
-        color: var(--color-context);
-        padding: var(--space-6);
+        color: var(--color-muted);
+        padding: var(--space-8) 0;
+        text-align: center;
       }
 
       #operation-status {
-        background: var(--color-primary-surface);
-        border-left: var(--space-1) solid var(--color-primary-border);
-        border-radius: 0 var(--radius-control) var(--radius-control) 0;
         color: var(--color-context);
         font-size: var(--font-size-small);
+        font-weight: 600;
         margin: var(--space-4) 0;
-        padding: var(--space-2) var(--space-3);
       }
 
       #operation-status:empty {
@@ -576,11 +590,11 @@
         }
 
         .triage-item {
-          grid-template-columns: max-content minmax(0, 1fr);
+          grid-template-columns: minmax(0, 1fr);
         }
 
         .triage-item > .item-controls {
-          grid-column: 2;
+          grid-column: 1;
           grid-row: auto;
           justify-self: start;
         }
