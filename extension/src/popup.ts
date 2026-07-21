@@ -404,6 +404,12 @@ const captureApi: ChromeCaptureApi = {
 };
 
 export function wireCapture(doc: Document = document): void {
+  // The dev-only capture panel needs the element constructors for its
+  // instanceof narrowing; a DOM environment without them (some test DOMs)
+  // simply has no panel to wire.
+  if (typeof HTMLSelectElement === "undefined" || typeof HTMLButtonElement === "undefined") {
+    return;
+  }
   const providerEl = doc.getElementById("capture-provider");
   const scenarioEl = doc.getElementById("capture-scenario");
   const button = doc.getElementById("capture-btn");
