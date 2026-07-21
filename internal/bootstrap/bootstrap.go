@@ -295,6 +295,12 @@ func (s *System) Close() error {
 		previewErr = s.Preview.Shutdown(ctx)
 		cancel()
 	}
+	if s.App != nil {
+		// Launched on_ready hooks record their durable outcome event after the
+		// command exits; give them a bounded window before SQLite goes away so
+		// a normal daemon stop does not lose the audit record.
+		s.App.DrainHooks(5 * time.Second)
+	}
 	if s.Store == nil {
 		return previewErr
 	}

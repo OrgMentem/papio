@@ -1363,8 +1363,11 @@ func TestOnReadyHookFailureLeavesJobReady(t *testing.T) {
 		t.Fatalf("hook failure must be non-fatal: %v", err)
 	}
 	detail := waitForHookEvent(t, jobs, id)
-	if detail["status"] != "error" || detail["stderr_tail"] != "boom" {
+	if detail["status"] != "error" {
 		t.Fatalf("hook failure detail = %#v", detail)
+	}
+	if _, leaked := detail["stderr_tail"]; leaked {
+		t.Fatalf("raw hook stderr persisted to a durable event: %#v", detail)
 	}
 	ready, err := jobs.Get(context.Background(), id)
 	if err != nil {

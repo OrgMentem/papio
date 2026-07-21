@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // stderrTailLimit bounds how much captured stderr survives into Result.
@@ -59,7 +60,9 @@ func (r *Runner) Run(ctx context.Context, env map[string]string) Result {
 	sort.Strings(keys)
 	extra := make([]string, 0, len(env))
 	for _, key := range keys {
-		extra = append(extra, key+"="+env[key])
+		// NUL in a value (e.g. hostile remote metadata in a title) would make
+		// os/exec reject the entire environment and the hook never start.
+		extra = append(extra, key+"="+strings.ReplaceAll(env[key], "\x00", ""))
 	}
 	if r.Exec != nil {
 		return r.Exec(ctx, r.Command, extra)
@@ -80,15 +83,22 @@ func runShell(ctx context.Context, command string, extra []string, timeout time.
 	cmd := exec.CommandContext(ctx, shell, flag, command)
 	cmd.Env = append(os.Environ(), extra...)
 	cmd.Stdout = io.Discard
-	stderr := &tailBuffer{limit: stderrTailLimit}
+	stderr := &tailBuffer{limit: 2 * stderrTailLimit}
 	cmd.Stderr = stderr
+	// Kill the whole process tree at deadline, not just the shell: a hook
+	// like `worker & wait` must not outlive the timeout or hold the stderr
+	// pipe open. WaitDelay bounds the pipe wait even if a grandchild escaped
+	// the group.
+	setProcessGroup(cmd)
+	cmd.Cancel = func() error { return killProcessGroup(cmd) }
+	cmd.WaitDelay = 3 * time.Second
 
 	start := time.Now()
 	err := cmd.Run()
 	result := Result{
 		Ran:        true,
 		Duration:   time.Since(start),
-		StderrTail: strings.ToValidUTF8(stderr.String(), "\uFFFD"),
+		StderrTail: capUTF8(stderr.String(), stderrTailLimit),
 	}
 	switch {
 	case err == nil:
@@ -131,3 +141,18 @@ func (t *tailBuffer) Write(p []byte) (int, error) {
 }
 
 func (t *tailBuffer) String() string { return t.buf.String() }
+
+// capUTF8 repairs invalid UTF-8 first, then truncates to at most limit bytes
+// on a rune boundary — replacement runes are three bytes each, so repairing
+// after truncation could exceed the cap.
+func capUTF8(s string, limit int) string {
+	s = strings.ToValidUTF8(s, "\uFFFD")
+	if len(s) <= limit {
+		return s
+	}
+	cut := limit
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
+}

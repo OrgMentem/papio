@@ -51,7 +51,9 @@ Option B.
 - **Hooks are fire-and-forget.** One run per ready transition, bounded by
   `hooks.timeout_seconds`, never retried, never able to fail or block the
   job. The durable `hook.on_ready` job event (`status`, `exit_code`,
-  `duration_ms`, `stderr_tail`) is the audit trail.
+  `duration_ms`) is the audit trail. Raw hook stderr is never persisted:
+  the hook inherits the daemon environment, so its output can carry
+  credentials, and durable events stay secret-free by invariant.
 - **`PAPIO_PDF` is read-only.** It points into the immutable
   content-addressed artifact store; consumers copy.
 - **zotio stays the only deep integration** (ADR: "zotio is the Zotero

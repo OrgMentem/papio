@@ -83,6 +83,15 @@ UI). AMO *does* have a public per-version "Release Notes" field — paste the
 extension changelog entry into the AMO Developer Hub after each upload
 (`web-ext sign` cannot set it).
 
+**No private-tool names in public prose.** Changelogs, README, and `docs/`
+are published; never name internal tooling (glean, beads, run IDs) in them —
+attribute fixes neutrally ("a triaged audit pass"). Enforced mechanically:
+both repos' `.githooks/pre-commit` reject staged CHANGELOG/README/docs
+content matching `glean|beads` (papio and zotio alike). Commit messages and
+GitHub release notes deserve the same discipline — GoReleaser derives release
+notes from commit *subjects*, and the hook cannot see those, so keep tool
+names out of subjects for release-bound commits.
+
 ## Release order
 
 1. If `MinimumVersion` moved, release zotio first: follow

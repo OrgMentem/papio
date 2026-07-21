@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"papio/internal/artifact"
@@ -85,6 +86,9 @@ type Service struct {
 	// ReadyHook, when non-nil with a command, runs the user's on_ready hook
 	// once per ready transition. Nil disables it.
 	ReadyHook *hook.Runner
+	// hookWG tracks launched on_ready hook goroutines so shutdown can drain
+	// them before the store closes (DrainHooks).
+	hookWG sync.WaitGroup
 
 	RetryDelay time.Duration
 	Now        func() time.Time
@@ -830,13 +834,21 @@ func (s *Service) autoImportReady(ctx context.Context, row *job.Row) {
 
 // runReadyHook fires the user's on_ready hook exactly once per ready
 // transition, detached from the caller: hook latency or failure never blocks
-// or fails acquisition. Import retries never re-fire it.
+// or fails acquisition. Import retries never re-fire it. Raw hook stderr is
+// deliberately NEVER persisted: the hook inherits the daemon environment, so
+// its output can carry credentials, and durable events must stay
+// secret-free. The durable audit trail is status, exit code, and duration.
 func (s *Service) runReadyHook(ctx context.Context, row *job.Row, sha string) {
 	if s.ReadyHook == nil || strings.TrimSpace(s.ReadyHook.Command) == "" {
 		return
 	}
 	eventCtx := context.WithoutCancel(ctx)
 	pdfPath, err := s.Artifacts.ArtifactPath(sha)
+	if err == nil && !filepath.IsAbs(pdfPath) {
+		// The env contract promises an absolute path; a relative data_dir
+		// must not leak a cwd-dependent PAPIO_PDF to the hook.
+		pdfPath, err = filepath.Abs(pdfPath)
+	}
 	if err != nil {
 		_ = s.Jobs.RecordEvent(eventCtx, row.ID, "hook.on_ready",
 			map[string]any{"status": "error", "reason": "artifact_path"})
@@ -853,7 +865,9 @@ func (s *Service) runReadyHook(ctx context.Context, row *job.Row, sha string) {
 		"PAPIO_STATE":      "ready",
 	}
 	jobID := row.ID
+	s.hookWG.Add(1)
 	go func() {
+		defer s.hookWG.Done()
 		result := s.ReadyHook.Run(eventCtx, env)
 		detail := map[string]any{
 			"exit_code":   result.ExitCode,
@@ -864,11 +878,26 @@ func (s *Service) runReadyHook(ctx context.Context, row *job.Row, sha string) {
 		} else {
 			detail["status"] = "error"
 		}
-		if result.StderrTail != "" {
-			detail["stderr_tail"] = result.StderrTail
-		}
 		_ = s.Jobs.RecordEvent(eventCtx, jobID, "hook.on_ready", detail)
 	}()
+}
+
+// DrainHooks waits up to timeout for launched on_ready hooks to finish and
+// record their events. Shutdown calls it before the store closes so a hook
+// outcome insert does not race the SQLite connection teardown; hooks that
+// outlive the timeout are abandoned (their own deadline still bounds them).
+func (s *Service) DrainHooks(timeout time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		s.hookWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
 }
 
 // InstitutionalOpenURLHandoffDetail describes the ordinary resolver handoff.

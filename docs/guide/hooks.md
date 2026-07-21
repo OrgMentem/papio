@@ -25,8 +25,9 @@ Contract:
 - **Fire-and-forget.** A slow or failing hook never blocks or fails the job.
   papio does not retry hooks.
 - **Audited.** Each run records a durable `hook.on_ready` job event with
-  `status`, `exit_code`, `duration_ms`, and (on failure) a bounded
-  `stderr_tail`.
+  `status`, `exit_code`, and `duration_ms`. Hook stdout/stderr is **not**
+  recorded (it could carry secrets from your environment) — have your
+  command do its own logging if you need output.
 - **Shell semantics.** The command runs via `/bin/sh -c` (`cmd /C` on
   Windows). The recipes below are POSIX-shell.
 - **Concurrency.** Concurrent ready jobs may run hooks concurrently; if your

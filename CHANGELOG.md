@@ -176,7 +176,7 @@ execution records in `notes/acquisition-stack-plan.md`.
 
 ### Fixed
 
-A triaged glean audit pass (33 confirmed findings fixed, each with a
+A triaged audit pass (33 confirmed findings fixed, each with a
 regression test where behavior changed):
 
 - OA resolver identity verification: CORE, Europe PMC, and OpenAlex title
