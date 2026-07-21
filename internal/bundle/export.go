@@ -79,7 +79,7 @@ func (e *Exporter) Export(ctx context.Context, jobID, destination string) (strin
 	if err != nil {
 		return "", nil, err
 	}
-	if row.State != job.StateReady || row.ArtifactSHA256 == "" {
+	if (row.State != job.StateReady && row.State != job.StateImported) || row.ArtifactSHA256 == "" {
 		return "", nil, fmt.Errorf("job %s is %s, not ready", jobID, row.State)
 	}
 	art, err := e.Jobs.GetArtifact(ctx, row.ArtifactSHA256)

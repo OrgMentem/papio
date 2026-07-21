@@ -30,6 +30,7 @@ const (
 	StateFetching      = "fetching"
 	StateValidating    = "validating"
 	StateReady         = "ready"
+	StateImported      = "imported"
 	StateAwaitingHuman = "awaiting_human"
 	StateRetryWait     = "retry_wait"
 	StateNeedsReview   = "needs_review"
@@ -39,10 +40,11 @@ const (
 )
 
 // Terminal reports whether a state ends the acquisition attempt. ready is the
-// acquisition terminal; exports are separate idempotent records.
+// acquisition terminal; imported additionally records a completed Zotero
+// export; other exports remain separate idempotent records.
 func Terminal(state string) bool {
 	switch state {
-	case StateReady, StateUnavailable, StateFailed, StateCancelled:
+	case StateReady, StateImported, StateUnavailable, StateFailed, StateCancelled:
 		return true
 	}
 	return false
@@ -80,6 +82,9 @@ var allowed = map[string]map[string]bool{
 	},
 	StateRetryWait:   {StateResolving: true, StateFetching: true, StateCancelled: true, StateFailed: true},
 	StateNeedsReview: {StateResolving: true, StateFetching: true, StateCancelled: true},
+	// A successful zotio apply files the artifact in Zotero; imported is the
+	// only edge out of ready and is itself fully terminal.
+	StateReady: {StateImported: true},
 }
 
 // ErrConflict is returned when a CAS transition loses (state changed or the
@@ -484,7 +489,7 @@ func (js *Store) transition(ctx context.Context, jobID, from, to string, detail 
 	}
 	if Terminal(to) {
 		actionStatus := "cancelled"
-		if to == StateReady {
+		if to == StateReady || to == StateImported {
 			actionStatus = "resolved"
 		}
 		if _, err := tx.ExecContext(ctx,
@@ -716,7 +721,7 @@ func (js *Store) CloseStaleHumanActions(ctx context.Context) error {
 		   AND EXISTS (
 		       SELECT 1 FROM jobs
 		       WHERE jobs.id = human_actions.job_id
-		         AND jobs.state IN ('ready', 'unavailable', 'failed', 'cancelled')
+		         AND jobs.state IN ('ready', 'imported', 'unavailable', 'failed', 'cancelled')
 		   )`, store.Now(), informationalActionKind)
 	return err
 }
@@ -734,7 +739,7 @@ func (js *Store) SweepTerminalQuarantine(ctx context.Context) error {
 	}
 	rows, err := js.S.DB().QueryContext(ctx, `
 		SELECT id FROM jobs
-		 WHERE state IN ('ready', 'unavailable', 'failed', 'cancelled')`)
+		 WHERE state IN ('ready', 'imported', 'unavailable', 'failed', 'cancelled')`)
 	if err != nil {
 		return err
 	}
@@ -1048,7 +1053,7 @@ func (js *Store) FindCandidateByArtifact(ctx context.Context, sha string) (*Cand
 	var id sql.NullInt64
 	err := js.S.DB().QueryRowContext(ctx, `
 		SELECT selected_candidate_id FROM jobs
-		WHERE artifact_sha256 = ? AND state = 'ready' AND selected_candidate_id IS NOT NULL
+		WHERE artifact_sha256 = ? AND state IN ('ready','imported') AND selected_candidate_id IS NOT NULL
 		ORDER BY updated_at ASC LIMIT 1`, sha).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -1066,7 +1071,7 @@ func (js *Store) FindArtifactByDOI(ctx context.Context, doi string) (*Artifact, 
 	err := js.S.DB().QueryRowContext(ctx, `
 		SELECT j.artifact_sha256 FROM jobs j
 		JOIN identifiers i ON i.work_request_id = j.work_request_id
-		WHERE i.kind = 'doi' AND i.value = ? AND j.state = 'ready' AND j.artifact_sha256 IS NOT NULL
+		WHERE i.kind = 'doi' AND i.value = ? AND j.state IN ('ready','imported') AND j.artifact_sha256 IS NOT NULL
 		ORDER BY j.updated_at DESC LIMIT 1`, doi).Scan(&sha)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -1086,7 +1091,9 @@ type HumanActionBinding struct {
 }
 
 type openHumanActionOptions struct {
-	binding *HumanActionBinding
+	binding      *HumanActionBinding
+	requiresAuth bool
+	blockedBy    string
 }
 
 // OpenHumanActionOption configures one human action.
@@ -1108,6 +1115,22 @@ func WithHumanActionBinding(binding HumanActionBinding) OpenHumanActionOption {
 		binding.QuarantinePath = strings.TrimSpace(binding.QuarantinePath)
 		binding.QuarantineSHA256 = strings.ToLower(strings.TrimSpace(binding.QuarantineSHA256))
 		options.binding = &binding
+		return nil
+	}
+}
+
+// WithAccessClassification records why the action exists: requiresAuth is
+// true when an authenticated institutional session is needed; blockedBy is
+// one of "anti_bot", "paywall", "landing_page", or "".
+func WithAccessClassification(requiresAuth bool, blockedBy string) OpenHumanActionOption {
+	return func(options *openHumanActionOptions) error {
+		switch blockedBy {
+		case "", "anti_bot", "paywall", "landing_page":
+		default:
+			return fmt.Errorf("invalid human action blocked_by %q", blockedBy)
+		}
+		options.requiresAuth = requiresAuth
+		options.blockedBy = blockedBy
 		return nil
 	}
 }
@@ -1153,15 +1176,15 @@ func (js *Store) OpenHumanAction(ctx context.Context, jobID, kind, detail string
 	case err == nil:
 		if options.binding == nil {
 			_, err = tx.ExecContext(ctx,
-				`UPDATE human_actions SET detail = ?, revision = revision + 1 WHERE id = ?`,
-				nullable(detail), actionID)
+				`UPDATE human_actions SET detail = ?, requires_auth = ?, blocked_by = ?, revision = revision + 1 WHERE id = ?`,
+				nullable(detail), options.requiresAuth, options.blockedBy, actionID)
 		} else {
 			_, err = tx.ExecContext(ctx, `
 				UPDATE human_actions
-				SET detail = ?, candidate_id = ?, quarantine_path = ?, quarantine_sha256 = ?,
+				SET detail = ?, requires_auth = ?, blocked_by = ?, candidate_id = ?, quarantine_path = ?, quarantine_sha256 = ?,
 					revision = revision + 1
 				WHERE id = ?`,
-				nullable(detail), options.binding.CandidateID, options.binding.QuarantinePath,
+				nullable(detail), options.requiresAuth, options.blockedBy, options.binding.CandidateID, options.binding.QuarantinePath,
 				options.binding.QuarantineSHA256, actionID)
 		}
 		if err != nil {
@@ -1175,9 +1198,9 @@ func (js *Store) OpenHumanAction(ctx context.Context, jobID, kind, detail string
 		}
 		res, err := tx.ExecContext(ctx, `
 			INSERT INTO human_actions
-				(job_id, kind, status, detail, candidate_id, quarantine_path, quarantine_sha256, revision, created_at)
-			VALUES (?, ?, 'open', ?, ?, ?, ?, 1, ?)`,
-			jobID, kind, nullable(detail), candidateID, path, sha, store.Now())
+				(job_id, kind, status, detail, requires_auth, blocked_by, candidate_id, quarantine_path, quarantine_sha256, revision, created_at)
+			VALUES (?, ?, 'open', ?, ?, ?, ?, ?, ?, 1, ?)`,
+			jobID, kind, nullable(detail), options.requiresAuth, options.blockedBy, candidateID, path, sha, store.Now())
 		if err != nil {
 			return 0, err
 		}
@@ -1453,6 +1476,8 @@ type HumanAction struct {
 	Kind             string `json:"kind"`
 	Status           string `json:"status"`
 	Detail           string `json:"detail,omitempty"`
+	RequiresAuth     bool   `json:"requires_auth"`
+	BlockedBy        string `json:"blocked_by,omitempty"`
 	CreatedAt        string `json:"created_at"`
 	CandidateID      int64  `json:"candidate_id,omitempty"`
 	QuarantinePath   string `json:"quarantine_path,omitempty"`
@@ -1462,7 +1487,7 @@ type HumanAction struct {
 
 // ListHumanActions returns actions, optionally only open ones.
 func (js *Store) ListHumanActions(ctx context.Context, openOnly bool) ([]HumanAction, error) {
-	q := `SELECT id, job_id, kind, status, COALESCE(detail,''), created_at,
+	q := `SELECT id, job_id, kind, status, COALESCE(detail,''), requires_auth, blocked_by, created_at,
 		COALESCE(candidate_id, 0), quarantine_path, quarantine_sha256, revision
 		FROM human_actions`
 	if openOnly {
@@ -1478,7 +1503,7 @@ func (js *Store) ListHumanActions(ctx context.Context, openOnly bool) ([]HumanAc
 	for rows.Next() {
 		var h HumanAction
 		if err := rows.Scan(
-			&h.ID, &h.JobID, &h.Kind, &h.Status, &h.Detail, &h.CreatedAt,
+			&h.ID, &h.JobID, &h.Kind, &h.Status, &h.Detail, &h.RequiresAuth, &h.BlockedBy, &h.CreatedAt,
 			&h.CandidateID, &h.QuarantinePath, &h.QuarantineSHA256, &h.Revision,
 		); err != nil {
 			_ = rows.Close()

@@ -187,6 +187,31 @@ func TestExistingItemPlanApplyIsConfirmedAndIdempotent(t *testing.T) {
 	if err != nil || replay.AttachmentKey != "AT56CH90" || cli.applyCalls != 1 {
 		t.Fatalf("replay=%+v err=%v calls=%d", replay, err, cli.applyCalls)
 	}
+	// M3: a durably recorded apply advances the acquisition lifecycle.
+	row, err := service.Bundle.Jobs.Get(context.Background(), jobID)
+	if err != nil || row.State != job.StateImported {
+		t.Fatalf("job state after apply = %q, %v; want imported", row.State, err)
+	}
+	events, err := service.Bundle.Jobs.Events(context.Background(), jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	importedEvent := false
+	for _, event := range events {
+		if event["kind"] != "job.transition" {
+			continue
+		}
+		detail, _ := event["detail"].(map[string]any)
+		if detail["to"] == job.StateImported {
+			if detail["parent_key"] != "AB12CD34" || detail["attachment_key"] != "AT56CH90" || detail["status"] != "applied" {
+				t.Fatalf("imported transition detail = %+v", detail)
+			}
+			importedEvent = true
+		}
+	}
+	if !importedEvent {
+		t.Fatal("missing ready->imported transition event with item keys")
+	}
 	var plansCount, appliesCount int
 	_ = service.Store.DB().QueryRow(`SELECT count(*) FROM exports WHERE kind='zotio_plan'`).Scan(&plansCount)
 	_ = service.Store.DB().QueryRow(`SELECT count(*) FROM exports WHERE kind='zotio_apply'`).Scan(&appliesCount)

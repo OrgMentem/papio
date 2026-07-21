@@ -333,6 +333,10 @@ func (s *Service) resolve(ctx context.Context, row *job.Row) (map[string]resolve
 		_ = s.Jobs.FinishAttempt(ctx, attempt, "success", 0, fmt.Sprintf("candidates=%d", valid))
 	}
 
+	if len(all) == 0 && strings.TrimSpace(row.Work.DOI) != "" {
+		all = append(all, s.resolveSiblings(ctx, row)...)
+	}
+
 	ranked, evidence := resolver.Rank(row.Policy.DesiredVersion, all)
 	resolved := row.Work
 	for _, c := range ranked {
@@ -362,6 +366,61 @@ func (s *Service) resolve(ctx context.Context, row *job.Row) (map[string]resolve
 		return nil, retryAt, err
 	}
 	return live, retryAt, nil
+}
+
+// SiblingResolver is the optional adapter capability behind the C3 version
+// hop: when the canonical identifier yields zero legal candidates, an adapter
+// may look up open-access sibling versions (preprints, repository copies
+// under a different DOI) of the same work.
+type SiblingResolver interface {
+	ResolveSiblings(ctx context.Context, requested work.Work) ([]resolver.Candidate, error)
+}
+
+// resolveSiblings runs the one-shot version hop. Sibling candidates carry
+// deliberately different identifiers, so the identifier-conflict filter is
+// skipped: strict title/author matching happened in the adapter, and PDF
+// semantic-identity validation against row.Work remains the acceptance gate.
+// Errors never fail resolution — the hop must not make an acquisition worse.
+func (s *Service) resolveSiblings(ctx context.Context, row *job.Row) []resolver.Candidate {
+	for _, entry := range s.Resolvers {
+		sibling, ok := entry.Adapter.(SiblingResolver)
+		if !ok {
+			continue
+		}
+		name := entry.Adapter.Name()
+		if !row.Policy.SourceAllowed(name) || !entry.Policy.Enabled {
+			continue
+		}
+		// The attempts.stage CHECK allows only resolve/fetch/validate; the
+		// sibling pass is a resolve-stage attempt distinguished by its detail.
+		attempt, err := s.Jobs.StartAttempt(ctx, row.ID, 0, "resolve", name)
+		if err != nil {
+			return nil
+		}
+		if s.Budgets != nil {
+			if err := s.Budgets.Acquire(ctx, name, entry.Policy, entry.EstimatedCost); err != nil {
+				_ = s.Jobs.FinishAttempt(ctx, attempt, "budget_blocked", 0, safeType(err))
+				continue
+			}
+		}
+		cands, err := sibling.ResolveSiblings(ctx, row.Work)
+		if err != nil {
+			_ = s.Jobs.FinishAttempt(ctx, attempt, "failed", 0, safeType(err))
+			continue
+		}
+		valid := make([]resolver.Candidate, 0, len(cands))
+		for _, c := range cands {
+			if c.Source != name || resolver.ValidateCandidate(c) != nil {
+				continue
+			}
+			valid = append(valid, c)
+		}
+		_ = s.Jobs.FinishAttempt(ctx, attempt, "success", 0, fmt.Sprintf("sibling_candidates=%d", len(valid)))
+		if len(valid) > 0 {
+			return valid
+		}
+	}
+	return nil
 }
 
 func (s *Service) enrich(ctx context.Context, row *job.Row) error {
@@ -528,7 +587,7 @@ func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[st
 	}
 
 	if manual {
-		if _, err := s.Jobs.OpenHumanAction(ctx, row.ID, "manual_download", "a resolver returned a landing page but no verified direct PDF"); err != nil {
+		if _, err := s.Jobs.OpenHumanAction(ctx, row.ID, "manual_download", "a resolver returned a landing page but no verified direct PDF", job.WithAccessClassification(false, "landing_page")); err != nil {
 			return err
 		}
 		return s.park(ctx, row.ID, job.StateFetching, job.StateAwaitingHuman,
@@ -595,14 +654,14 @@ func (s *Service) exhaustedCandidates(ctx context.Context, row *job.Row, from, r
 	switch mode {
 	case config.ModeAssisted, config.ModeMaximal:
 		if oaBrowserURL != "" {
-			if _, err := s.Jobs.OpenHumanAction(ctx, row.ID, "openurl_handoff", OABrowserHandoffActionDetail(oaBrowserURL)); err != nil {
+			if _, err := s.Jobs.OpenHumanAction(ctx, row.ID, "openurl_handoff", OABrowserHandoffActionDetail(oaBrowserURL), job.WithAccessClassification(false, "anti_bot")); err != nil {
 				return err
 			}
 			return s.park(ctx, row.ID, from, job.StateAwaitingHuman,
 				map[string]any{"reason": "open_access_browser_handoff"})
 		}
 		if base, ok := s.Config.OpenURLBaseFor(row.Policy.Resolver); ok && base != "" {
-			if _, err := s.Jobs.OpenHumanAction(ctx, row.ID, "openurl_handoff", InstitutionalOpenURLHandoffDetail); err != nil {
+			if _, err := s.Jobs.OpenHumanAction(ctx, row.ID, "openurl_handoff", InstitutionalOpenURLHandoffDetail, job.WithAccessClassification(true, "paywall")); err != nil {
 				return err
 			}
 			return s.park(ctx, row.ID, from, job.StateAwaitingHuman,
@@ -766,7 +825,7 @@ func (s *Service) autoImportReady(ctx context.Context, row *job.Row) {
 // InstitutionalOpenURLHandoffDetail describes the ordinary resolver handoff.
 // The browser bridge uses this same durable detail when a one-time OA offer
 // fails, so a re-park cannot alternate back to the OA candidate.
-const InstitutionalOpenURLHandoffDetail = "open-access candidates exhausted; institutional OpenURL handoff available in your browser"
+const InstitutionalOpenURLHandoffDetail = "institutional OpenURL handoff: sign in to your institution first, then run 'papio actions open' — a fresh link is generated on each open; if the provider reports a stale or expired session, re-run 'papio actions open'"
 
 // OABrowserHandoffDetail identifies a handoff that must open the public OA
 // candidate itself rather than constructing an institutional OpenURL. The

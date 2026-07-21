@@ -17,6 +17,7 @@ export type BrowserMessageType =
   | "page_acquire"
   | "page_acquire_ack"
   | "job_offer"
+  | "handoff_outcome"
   | "job_accept"
   | "job_reject"
   | "auth_pending"
@@ -84,6 +85,17 @@ export interface JobOfferPayload {
    * ProQuest adapter unlock the openurl link-resolver by appending
    * ?accountid=<id>. Optional; digits when present. */
   proquest_account_id?: string;
+  /** True when the handoff needs an authenticated institutional session; false
+   * or absent means the URL is publicly reachable (open access). */
+  requires_auth?: boolean;
+}
+
+/** Reports that a handoff tab terminated on an identity-provider failure
+ * page. final_host is a bare hostname; no path, query, or page content ever
+ * crosses the bridge. */
+export interface HandoffOutcomePayload {
+  outcome: "stale_sso" | "auth_error";
+  final_host: string;
 }
 
 /** Timing only — no URL/host/title/query/fragment fields exist by design. */
@@ -250,6 +262,7 @@ const MSG_TYPES: Record<string, true> = {
   page_acquire: true,
   page_acquire_ack: true,
   job_offer: true,
+  handoff_outcome: true,
   job_accept: true,
   job_reject: true,
   auth_pending: true,
@@ -274,6 +287,7 @@ const MSG_TYPES: Record<string, true> = {
 
 const JOB_SCOPED: Record<string, true> = {
   job_offer: true,
+  handoff_outcome: true,
   job_accept: true,
   job_reject: true,
   auth_pending: true,
@@ -612,7 +626,7 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
       break;
     }
     case "job_offer": {
-      requireKeys(p, "job_offer", ["openurl", "provider_hosts", "access_mode", "expires_at"], ["expected", "login_entity_id", "proquest_account_id"]);
+      requireKeys(p, "job_offer", ["openurl", "provider_hosts", "access_mode", "expires_at"], ["expected", "login_entity_id", "proquest_account_id", "requires_auth"]);
       const openurl = str(p, "openurl", "job_offer", 4000);
       if (!openurl.startsWith("https://")) fail("job_offer.openurl must be https");
       const hosts = p["provider_hosts"];
@@ -640,6 +654,19 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
         const acct = str(p, "proquest_account_id", "job_offer", 64);
         if (!/^[0-9]+$/.test(acct)) fail("job_offer.proquest_account_id must be digits");
       }
+      if ("requires_auth" in p && typeof p["requires_auth"] !== "boolean") {
+        fail("job_offer.requires_auth must be a boolean");
+      }
+      break;
+    }
+    case "handoff_outcome": {
+      requireKeys(p, "handoff_outcome", ["outcome", "final_host"]);
+      const outcome = str(p, "outcome", "handoff_outcome", 20);
+      if (outcome !== "stale_sso" && outcome !== "auth_error") {
+        fail(`invalid handoff outcome ${JSON.stringify(outcome)}`);
+      }
+      const host = str(p, "final_host", "handoff_outcome", 253);
+      if (!HOST_RE.test(host)) fail("handoff_outcome.final_host must be a hostname");
       break;
     }
     case "auth_pending":

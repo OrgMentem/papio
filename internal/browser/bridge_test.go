@@ -1114,6 +1114,69 @@ func TestJobRejectEndsHandoffUnavailable(t *testing.T) {
 	}
 }
 
+func TestHandoffOutcomeRecordsFailureAndReArmsOffer(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	id := park(t, jobs, "wr_hfail", handoffWork())
+	// hello + first poll offers the handoff once.
+	runSync(t, b, hello())
+	if !b.offered[id] {
+		t.Fatal("handoff was not offered on first sync")
+	}
+	msgs, _ := runSync(t, b, inFrame(t, protocol.MsgHandoffOutcome, id,
+		map[string]any{"outcome": "stale_sso", "final_host": "login.openathens.net"}))
+	// The same sync's poll re-offers with a freshly minted OpenURL: that IS the
+	// recovery, so a second job_offer frame must go out immediately.
+	reOffered := false
+	for _, m := range msgs {
+		if m.Type == protocol.MsgJobOffer && m.JobID == id {
+			reOffered = true
+		}
+	}
+	if !reOffered {
+		t.Fatal("expected a fresh job_offer after the IdP failure")
+	}
+
+	row, _ := jobs.Get(ctx, id)
+	if row.State != job.StateAwaitingHuman {
+		t.Fatalf("job state = %q, want awaiting_human", row.State)
+	}
+	actions, _ := jobs.ListHumanActions(ctx, true)
+	stillOpen := false
+	for _, a := range actions {
+		if a.JobID == id && a.Kind == handoffActionKind {
+			stillOpen = true
+		}
+	}
+	if !stillOpen {
+		t.Fatal("handoff action must stay open after an IdP failure")
+	}
+	events, _ := jobs.Events(ctx, id)
+	var failed, offered bool
+	for _, e := range events {
+		switch e["kind"] {
+		case "browser.handoff_failed":
+			detail, _ := e["detail"].(map[string]any)
+			if detail["outcome"] != "stale_sso" || detail["final_host"] != "login.openathens.net" {
+				t.Fatalf("handoff_failed detail = %+v", detail)
+			}
+			failed = true
+		case "browser.handoff_offered":
+			offered = true
+		}
+	}
+	if !failed || !offered {
+		t.Fatalf("events missing handoff_failed=%v handoff_offered=%v", failed, offered)
+	}
+	if !b.offered[id] {
+		t.Fatal("re-offer must mark the job offered again")
+	}
+
+	// Unknown job: dropped fail-closed, no error, no event.
+	runSync(t, b, inFrame(t, protocol.MsgHandoffOutcome, "job_unknown_0001",
+		map[string]any{"outcome": "auth_error", "final_host": "idp.example.edu"}))
+}
+
 func TestDaemonSideCancelEmitsCancelFrameOnce(t *testing.T) {
 	b, jobs, _, _ := newBridge(t)
 	ctx := context.Background()
@@ -1164,7 +1227,7 @@ func TestOpenURLUsesSelectedResolverProfileForPrimoNDEAndVE(t *testing.T) {
 		{name: "VE named", resolver: "institute", wantPath: "/discovery/openurl", wantVID: "61INS_INST:INS"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			raw, err := b.offer(job.Row{ID: "job-profile", Work: handoffWork(), Policy: job.Policy{Resolver: test.resolver}}, "institutional handoff")
+			raw, err := b.offer(job.Row{ID: "job-profile", Work: handoffWork(), Policy: job.Policy{Resolver: test.resolver}}, job.HumanAction{Kind: handoffActionKind, Detail: "institutional handoff", RequiresAuth: true})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1210,7 +1273,7 @@ func TestOfferLoginRoutingIsPerResolverProfile(t *testing.T) {
 		{name: "named without identity leaks nothing", resolver: "bare"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			raw, err := b.offer(job.Row{ID: "job-login-route", Work: handoffWork(), Policy: job.Policy{Resolver: test.resolver}}, "institutional handoff")
+			raw, err := b.offer(job.Row{ID: "job-login-route", Work: handoffWork(), Policy: job.Policy{Resolver: test.resolver}}, job.HumanAction{Kind: handoffActionKind, Detail: "institutional handoff", RequiresAuth: true})
 			if err != nil {
 				t.Fatal(err)
 			}

@@ -405,6 +405,7 @@ const (
 	MsgPageAcquire              = "page_acquire"
 	MsgPageAcquireAck           = "page_acquire_ack"
 	MsgJobOffer                 = "job_offer"
+	MsgHandoffOutcome           = "handoff_outcome"
 	MsgJobAccept                = "job_accept"
 	MsgJobReject                = "job_reject"
 	MsgAuthPending              = "auth_pending"
@@ -429,7 +430,7 @@ const (
 
 // jobScoped lists the types that must carry a job_id.
 var jobScoped = map[string]bool{
-	MsgJobOffer: true, MsgJobAccept: true, MsgJobReject: true,
+	MsgJobOffer: true, MsgJobAccept: true, MsgJobReject: true, MsgHandoffOutcome: true,
 	MsgAuthPending: true, MsgAuthReturned: true,
 	MsgDownloadStarted: true, MsgDownloadComplete: true,
 	MsgProviderOutcome: true, MsgCancel: true,
@@ -480,6 +481,7 @@ type JobOfferPayload struct {
 	AccessMode        string            `json:"access_mode"`
 	LoginEntityID     string            `json:"login_entity_id,omitempty"`
 	ProquestAccountID string            `json:"proquest_account_id,omitempty"`
+	RequiresAuth      bool              `json:"requires_auth,omitempty"`
 	ExpiresAt         string            `json:"expires_at"`
 }
 
@@ -487,6 +489,14 @@ type JobOfferPayload struct {
 type JobOfferExpected struct {
 	DOI   string `json:"doi,omitempty"`
 	Title string `json:"title,omitempty"`
+}
+
+// HandoffOutcomePayload reports that a handoff tab terminated on an
+// identity-provider failure page. FinalHost is a bare hostname; no path,
+// query, or page content ever crosses the bridge.
+type HandoffOutcomePayload struct {
+	Outcome   string `json:"outcome"`
+	FinalHost string `json:"final_host"`
 }
 
 // AuthPayload deliberately carries only timing. No URL, host, title, query, or
@@ -836,7 +846,7 @@ func DecodeBrowserMessage(data []byte) (*BrowserMessage, error) {
 	case MsgJobOffer:
 		p := &JobOfferPayload{}
 		if err = browserRequireFields(payloadFields, "openurl", "provider_hosts", "access_mode", "expires_at"); err == nil {
-			err = browserRejectNullFields(payloadFields, "expected", "login_entity_id", "proquest_account_id")
+			err = browserRejectNullFields(payloadFields, "expected", "login_entity_id", "proquest_account_id", "requires_auth")
 		}
 		if raw, ok := payloadFields["expected"]; ok && err == nil {
 			var expectedFields map[string]json.RawMessage
@@ -845,6 +855,15 @@ func DecodeBrowserMessage(data []byte) (*BrowserMessage, error) {
 			}
 		}
 		if err == nil {
+			err = strictDecode(env.Payload, p)
+		}
+		if err == nil {
+			err = p.validate()
+		}
+		msg.Payload = p
+	case MsgHandoffOutcome:
+		p := &HandoffOutcomePayload{}
+		if err = browserRequireFields(payloadFields, "outcome", "final_host"); err == nil {
 			err = strictDecode(env.Payload, p)
 		}
 		if err == nil {
@@ -1088,6 +1107,16 @@ func (p *JobOfferPayload) validate() error {
 		if browserTextLen(p.Expected.DOI) > 300 || browserTextLen(p.Expected.Title) > 500 {
 			return fmt.Errorf("expected hints exceed bounds")
 		}
+	}
+	return nil
+}
+
+func (p *HandoffOutcomePayload) validate() error {
+	if err := enumRequired("handoff_outcome.outcome", p.Outcome, "stale_sso", "auth_error"); err != nil {
+		return err
+	}
+	if p.FinalHost == "" || len(p.FinalHost) > 253 || !hostRE.MatchString(p.FinalHost) {
+		return fmt.Errorf("handoff_outcome.final_host must be a bounded hostname")
 	}
 	return nil
 }

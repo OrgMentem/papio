@@ -416,6 +416,15 @@ func buildWorkReport(ctx context.Context, manifestWork ManifestWork, jobs Jobs, 
 		}
 	case job.StateAwaitingHuman:
 		item.Outcome, item.Reason = OutcomeAwaitingHuman, awaitingReason(actions)
+	case job.StateImported:
+		// The imported transition event carries the keys, so reports need no
+		// exports-table access through the narrow Jobs interface.
+		item.ParentKey, item.AttachmentKey = importedKeys(events)
+		if browserFetched(events) {
+			item.Outcome = OutcomeBrowserFetchedThenImported
+		} else {
+			item.Outcome = OutcomeImported
+		}
 	case job.StateNeedsReview:
 		item.Outcome = OutcomeNeedsReview
 	case job.StateFailed, job.StateUnavailable, job.StateCancelled:
@@ -516,13 +525,30 @@ func awaitingReason(actions []job.HumanAction) string {
 		case "terms_acceptance_required":
 			return "terms"
 		case "openurl_handoff":
-			if strings.HasPrefix(action.Detail, "open-access fetch via browser\n") {
+			if !action.RequiresAuth {
 				return "oa_browser"
 			}
 			return "institutional"
 		}
 	}
 	return "institutional"
+}
+
+// importedKeys reads the Zotero item keys from the latest ready->imported
+// transition event.
+func importedKeys(events []map[string]any) (parentKey, attachmentKey string) {
+	for i := len(events) - 1; i >= 0; i-- {
+		event := events[i]
+		if stringField(event, "kind") != "job.transition" {
+			continue
+		}
+		detail, _ := event["detail"].(map[string]any)
+		if stringField(detail, "to") != job.StateImported {
+			continue
+		}
+		return stringField(detail, "parent_key"), stringField(detail, "attachment_key")
+	}
+	return "", ""
 }
 
 func stringField(value map[string]any, key string) string {

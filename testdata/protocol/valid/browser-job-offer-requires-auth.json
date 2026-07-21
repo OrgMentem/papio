@@ -1,0 +1,16 @@
+{
+  "protocol": "papio-browser/1",
+  "type": "job_offer",
+  "msg_id": "m_offer_002",
+  "job_id": "job_0002_tyler",
+  "seq": 4,
+  "payload": {
+    "openurl": "https://oa.example.test/paper.pdf",
+    "provider_hosts": [
+      "oa.example.test"
+    ],
+    "access_mode": "assisted",
+    "requires_auth": false,
+    "expires_at": "2026-07-13T11:00:00Z"
+  }
+}

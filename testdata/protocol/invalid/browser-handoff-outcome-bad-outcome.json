@@ -1,0 +1,11 @@
+{
+  "protocol": "papio-browser/1",
+  "type": "handoff_outcome",
+  "msg_id": "m_hfail_002",
+  "job_id": "job_0002_tyler",
+  "seq": 10,
+  "payload": {
+    "outcome": "network_error",
+    "final_host": "login.openathens.net"
+  }
+}

@@ -111,6 +111,7 @@ func buildStatusSnapshot(rows []job.Row, details map[string]api.JobDetail, now t
 		"awaiting_human":     nil,
 		"needs_review":       nil,
 		"ready":              nil,
+		"imported":           nil,
 		"failed_unavailable": nil,
 	}
 	for _, row := range rows {
@@ -152,6 +153,7 @@ func buildStatusSnapshot(rows []job.Row, details map[string]api.JobDetail, now t
 		{"awaiting_human", "awaiting_human"},
 		{"needs_review", "needs_review"},
 		{"ready", "ready (last 24h)"},
+		{"imported", "imported (last 24h)"},
 		{"failed_unavailable", "failed / unavailable"},
 	}
 	snapshot := statusSnapshot{GeneratedAt: now.UTC().Format(time.RFC3339Nano)}
@@ -182,6 +184,8 @@ func statusPhase(state string) string {
 		return "needs_review"
 	case job.StateReady:
 		return "ready"
+	case job.StateImported:
+		return "imported"
 	case job.StateFailed, job.StateUnavailable, job.StateCancelled:
 		return "failed_unavailable"
 	default:

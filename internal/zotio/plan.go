@@ -240,6 +240,9 @@ func (s *Service) Apply(ctx context.Context, planID, confirmation string) (*Appl
 		return nil, err
 	} else if existing != nil {
 		s.fileCollection(ctx, plan, existing)
+		if err := s.markImported(ctx, existing); err != nil {
+			return nil, err
+		}
 		return existing, nil
 	}
 	claimed, err := s.claimApply(ctx, idempotencyKey, plan.JobID)
@@ -253,6 +256,9 @@ func (s *Service) Apply(ctx context.Context, planID, confirmation string) (*Appl
 		}
 		if result != nil {
 			s.fileCollection(ctx, plan, result)
+			if err := s.markImported(ctx, result); err != nil {
+				return nil, err
+			}
 			return result, nil
 		}
 		// Another worker holds the reservation but has not recorded a result
@@ -312,9 +318,37 @@ func (s *Service) Apply(ctx context.Context, planID, confirmation string) (*Appl
 	if err := s.recordApply(ctx, idempotencyKey, result); err != nil {
 		return nil, err
 	}
+	if err := s.markImported(ctx, result); err != nil {
+		return nil, err
+	}
 	s.fileCollection(ctx, plan, result)
 	s.enrichAutoImportedParent(ctx, plan, result)
 	return result, nil
+}
+
+// markImported advances the acquisition lifecycle once the Zotero write is
+// durably recorded: ready -> imported, carrying the item keys in the
+// transition detail so reports need no exports-table access. A conflict means
+// another actor (or an earlier replay) already moved the job — fine either
+// way, the exports ledger stays the durable source of truth.
+func (s *Service) markImported(ctx context.Context, result *ApplyResult) error {
+	if result == nil || result.JobID == "" {
+		return nil
+	}
+	switch result.Status {
+	case "applied", "no_op":
+	default:
+		return nil
+	}
+	err := s.Bundle.Jobs.Transition(ctx, result.JobID, job.StateReady, job.StateImported, map[string]any{
+		"status":         result.Status,
+		"parent_key":     result.ParentKey,
+		"attachment_key": result.AttachmentKey,
+	})
+	if errors.Is(err, job.ErrConflict) {
+		return nil
+	}
+	return err
 }
 
 // fileCollection applies the optional policy filing after the import has been

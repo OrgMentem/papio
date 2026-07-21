@@ -15,6 +15,7 @@
         "page_acquire",
         "page_acquire_ack",
         "job_offer",
+        "handoff_outcome",
         "job_accept",
         "job_reject",
         "auth_pending",
@@ -208,7 +209,7 @@
   },
   "allOf": [
     {
-      "if": { "properties": { "type": { "enum": ["job_offer", "job_accept", "job_reject", "auth_pending", "auth_returned", "download_started", "download_complete", "provider_outcome", "cancel"] } } },
+      "if": { "properties": { "type": { "enum": ["job_offer", "handoff_outcome", "job_accept", "job_reject", "auth_pending", "auth_returned", "download_started", "download_complete", "provider_outcome", "cancel"] } } },
       "then": { "required": ["job_id"] }
     },
     {
@@ -336,7 +337,26 @@
                 }
               },
               "access_mode": { "enum": ["assisted", "maximal"] },
+              "login_entity_id": { "type": "string", "format": "uri", "maxLength": 4000, "pattern": "^https://" },
+              "proquest_account_id": { "type": "string", "maxLength": 64, "pattern": "^[0-9]+$" },
+              "requires_auth": { "type": "boolean" },
               "expires_at": { "type": "string", "format": "date-time" }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "handoff_outcome" } } },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["outcome", "final_host"],
+            "properties": {
+              "outcome": { "enum": ["stale_sso", "auth_error"] },
+              "final_host": { "type": "string", "pattern": "^[a-z0-9.-]{3,253}$" }
             }
           }
         }

@@ -102,42 +102,16 @@ func (r *Resolver) Resolve(ctx context.Context, requested work.Work) ([]resolver
 	if lookup == "" {
 		return nil, nil
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
-	if err != nil {
-		return nil, errors.New("openalex: could not construct request")
+	body, err := r.fetch(ctx, endpoint)
+	if err != nil || body == nil {
+		return nil, err
 	}
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := r.client.Do(req)
-	if err != nil {
-		return nil, &resolver.TemporaryError{Err: errors.New("openalex: request failed")}
-	}
-	if resp == nil {
-		return nil, &resolver.TemporaryError{Err: errors.New("openalex: empty HTTP response")}
-	}
-	if resp.Body != nil {
-		defer func() { _ = resp.Body.Close() }()
-	}
-	switch {
-	case resp.StatusCode == http.StatusNotFound:
-		return nil, nil
-	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
-		return nil, errors.New("openalex: request was rejected (check polite-pool contact and API credentials)")
-	case resp.StatusCode == http.StatusRequestTimeout || resp.StatusCode == http.StatusTooManyRequests:
-		return nil, temporaryStatus("openalex", resp)
-	case resp.StatusCode >= 500 && resp.StatusCode <= 599:
-		return nil, temporaryStatus("openalex", resp)
-	case resp.StatusCode < 200 || resp.StatusCode > 299:
-		return nil, fmt.Errorf("openalex: unexpected HTTP status %d", resp.StatusCode)
-	}
-	if resp.Body == nil {
-		return nil, errors.New("openalex: response body is missing")
-	}
+	defer func() { _ = body.Close() }()
 
 	var record workRecord
 	if search {
 		var results searchResponse
-		if err := decodeBoundedJSON(resp.Body, r.maxBody, &results); err != nil {
+		if err := decodeBoundedJSON(body, r.maxBody, &results); err != nil {
 			return nil, fmt.Errorf("openalex: invalid response: %w", err)
 		}
 		matched := false
@@ -150,7 +124,7 @@ func (r *Resolver) Resolve(ctx context.Context, requested work.Work) ([]resolver
 		if !matched {
 			return nil, nil
 		}
-	} else if err := decodeBoundedJSON(resp.Body, r.maxBody, &record); err != nil {
+	} else if err := decodeBoundedJSON(body, r.maxBody, &record); err != nil {
 		return nil, fmt.Errorf("openalex: invalid response: %w", err)
 	}
 
@@ -228,6 +202,173 @@ func (r *Resolver) lookupURL(requested work.Work) (*url.URL, string, bool, error
 	}
 	base.RawQuery = query.Encode()
 	return base, lookup, search, nil
+}
+
+// fetch issues one authenticated OpenAlex GET and maps HTTP statuses to the
+// resolver error taxonomy. A nil ReadCloser with nil error means "not found".
+func (r *Resolver) fetch(ctx context.Context, endpoint *url.URL) (io.ReadCloser, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
+	if err != nil {
+		return nil, errors.New("openalex: could not construct request")
+	}
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := r.client.Do(req)
+	if err != nil {
+		return nil, &resolver.TemporaryError{Err: errors.New("openalex: request failed")}
+	}
+	if resp == nil {
+		return nil, &resolver.TemporaryError{Err: errors.New("openalex: empty HTTP response")}
+	}
+	closeBody := func() {
+		if resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+	}
+	switch {
+	case resp.StatusCode == http.StatusNotFound:
+		closeBody()
+		return nil, nil
+	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
+		closeBody()
+		return nil, errors.New("openalex: request was rejected (check polite-pool contact and API credentials)")
+	case resp.StatusCode == http.StatusRequestTimeout || resp.StatusCode == http.StatusTooManyRequests:
+		closeBody()
+		return nil, temporaryStatus("openalex", resp)
+	case resp.StatusCode >= 500 && resp.StatusCode <= 599:
+		closeBody()
+		return nil, temporaryStatus("openalex", resp)
+	case resp.StatusCode < 200 || resp.StatusCode > 299:
+		closeBody()
+		return nil, fmt.Errorf("openalex: unexpected HTTP status %d", resp.StatusCode)
+	}
+	if resp.Body == nil {
+		return nil, errors.New("openalex: response body is missing")
+	}
+	return resp.Body, nil
+}
+
+// maxSiblingCandidates bounds how many OA sibling versions one hop may emit.
+const maxSiblingCandidates = 3
+
+// ResolveSiblings finds open-access sibling versions (preprints, repository
+// copies under a different DOI) of a work whose canonical identifier yielded
+// no OA candidates. It fetches the canonical record even when it is not open
+// access — the record supplies the authoritative title/year/authors used for
+// strict sibling matching — then runs one title search. Max two OpenAlex
+// requests.
+func (r *Resolver) ResolveSiblings(ctx context.Context, requested work.Work) ([]resolver.Candidate, error) {
+	if r.client == nil || r.email == "" {
+		return nil, nil
+	}
+	canonicalDOI, err := work.NormalizeDOI(requested.DOI)
+	if err != nil {
+		return nil, nil
+	}
+	canonical := work.Work{Title: requested.Title, Year: requested.Year, Authors: requested.Authors}
+	if endpoint, lookup, _, err := r.lookupURL(work.Work{DOI: canonicalDOI}); err == nil && lookup != "" {
+		body, err := r.fetch(ctx, endpoint)
+		if err != nil {
+			return nil, err
+		}
+		if body != nil {
+			var record workRecord
+			decodeErr := decodeBoundedJSON(body, r.maxBody, &record)
+			_ = body.Close()
+			if decodeErr == nil {
+				canonical = resolvedWork(record)
+			}
+		}
+	}
+	if strings.TrimSpace(canonical.Title) == "" {
+		return nil, nil
+	}
+
+	endpoint, lookup, _, err := r.lookupURL(work.Work{Title: canonical.Title})
+	if err != nil || lookup == "" {
+		return nil, err
+	}
+	body, err := r.fetch(ctx, endpoint)
+	if err != nil || body == nil {
+		return nil, err
+	}
+	defer func() { _ = body.Close() }()
+	var results searchResponse
+	if err := decodeBoundedJSON(body, r.maxBody, &results); err != nil {
+		return nil, fmt.Errorf("openalex: invalid response: %w", err)
+	}
+
+	var candidates []resolver.Candidate
+	for _, record := range results.Results {
+		if len(candidates) >= maxSiblingCandidates {
+			break
+		}
+		resolved := resolvedWork(record)
+		if resolved.DOI == "" || resolved.DOI == canonicalDOI {
+			continue
+		}
+		if normalizeTitle(record.Title) != normalizeTitle(canonical.Title) {
+			continue
+		}
+		if canonical.Year != 0 && record.PublicationYear != 0 {
+			if diff := record.PublicationYear - canonical.Year; diff < -3 || diff > 3 {
+				continue
+			}
+		}
+		if !sharesAuthorSurname(resolved.Authors, canonical.Authors) {
+			continue
+		}
+		if !record.isOpenAccess() {
+			continue
+		}
+		location, source, direct := chooseLocation(record.BestOALocation, record.Locations)
+		if location == nil {
+			continue
+		}
+		candidateURL := location.PDFURL
+		if !direct {
+			candidateURL = landingURL(location)
+		}
+		candidate := resolver.Candidate{
+			Source: "openalex", URL: candidateURL, Landing: landingURL(location),
+			Version: mapVersion(location.Version), AccessBasis: resolver.AccessOpen,
+			ReuseLicense: reuseLicense(location.License), ExpectedMIME: expectedMIME(direct),
+			Direct: direct, IdentityConfidence: 0.6, ResolvedWork: resolved,
+			Evidence: []string{
+				"openalex lookup=sibling",
+				"openalex sibling_of=" + safeEvidenceValue(canonicalDOI),
+				"openalex location=" + source,
+				"openalex oa_status=" + safeEvidenceValue(record.oaStatus()),
+				"openalex url=" + redact.URL(candidateURL),
+			},
+		}
+		if err := resolver.ValidateCandidate(candidate); err != nil {
+			continue
+		}
+		candidates = append(candidates, candidate)
+	}
+	return candidates, nil
+}
+
+// sharesAuthorSurname reports whether any author family name appears in both
+// lists. Sibling matching deliberately keys on surnames only: preprint and
+// publisher records frequently disagree on initials versus given names.
+func sharesAuthorSurname(left, right []string) bool {
+	if len(left) == 0 || len(right) == 0 {
+		return false
+	}
+	surnames := make(map[string]bool, len(left))
+	for _, author := range left {
+		if surname, _, ok := canonicalAuthor(author); ok {
+			surnames[surname] = true
+		}
+	}
+	for _, author := range right {
+		if surname, _, ok := canonicalAuthor(author); ok && surnames[surname] {
+			return true
+		}
+	}
+	return false
 }
 
 type searchResponse struct {

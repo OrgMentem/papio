@@ -151,8 +151,8 @@ func TestBuildReportClassifiesSeededJobsEventsAndActions(t *testing.T) {
 			"job-attach": {autoImportEvent("PX123", "AX456")},
 		},
 		actions: []job.HumanAction{
-			{JobID: "job-institution", Kind: "openurl_handoff", Status: "open", Detail: "institutional handoff"},
-			{JobID: "job-oa", Kind: "openurl_handoff", Status: "open", Detail: "open-access fetch via browser\nhttps://example.test/paper.pdf"},
+			{JobID: "job-institution", Kind: "openurl_handoff", Status: "open", RequiresAuth: true, BlockedBy: "paywall", Detail: "institutional handoff"},
+			{JobID: "job-oa", Kind: "openurl_handoff", Status: "open", RequiresAuth: false, BlockedBy: "anti_bot", Detail: "open-access fetch via browser\nhttps://example.test/paper.pdf"},
 			{JobID: "job-terms", Kind: "terms_acceptance_required", Status: "open"},
 		},
 	}

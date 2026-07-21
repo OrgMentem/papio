@@ -429,7 +429,7 @@ func TestReadyTransitionResolvesOpenHumanActions(t *testing.T) {
 func TestCloseStaleHumanActionsClosesOnlyTerminalJobs(t *testing.T) {
 	js := testStore(t)
 	ctx := context.Background()
-	terminalStates := []string{StateReady, StateUnavailable, StateFailed, StateCancelled}
+	terminalStates := []string{StateReady, StateImported, StateUnavailable, StateFailed, StateCancelled}
 	terminalIDs := make(map[string]bool, len(terminalStates))
 	for _, state := range terminalStates {
 		id, err := js.CreateRequest(ctx, "wr_stale_"+state, testWork(), "", "", testPolicy(), nil)
@@ -439,7 +439,15 @@ func TestCloseStaleHumanActionsClosesOnlyTerminalJobs(t *testing.T) {
 		if err := js.Transition(ctx, id, StateQueued, StateResolving, nil); err != nil {
 			t.Fatal(err)
 		}
-		if err := js.Transition(ctx, id, StateResolving, state, nil); err != nil {
+		if state == StateImported {
+			// imported is only reachable through ready.
+			if err := js.Transition(ctx, id, StateResolving, StateReady, nil); err != nil {
+				t.Fatal(err)
+			}
+			if err := js.Transition(ctx, id, StateReady, StateImported, nil); err != nil {
+				t.Fatal(err)
+			}
+		} else if err := js.Transition(ctx, id, StateResolving, state, nil); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := js.OpenHumanAction(ctx, id, "stale_"+state, "stale"); err != nil {

@@ -163,7 +163,7 @@ func newActionsCommand(opt *options) *cobra.Command {
 				return opt.printJSON(actions)
 			}
 			for _, action := range actions {
-				if _, err := fmt.Fprintf(opt.out, "%d\t%s\t%s\t%s\n", action.ID, action.JobID, action.Kind, action.Status); err != nil {
+				if _, err := fmt.Fprintf(opt.out, "%d\t%s\t%s\t%s%s\n", action.ID, action.JobID, action.Kind, action.Status, accessHint(action)); err != nil {
 					return err
 				}
 			}
@@ -222,6 +222,12 @@ func newActionsCommand(opt *options) *cobra.Command {
 				return err
 			}
 			urls := actionURLs(actions, rows, cfg.OpenURLBaseFor, limit)
+			if len(urls) == 0 && len(actions) > 0 && !opt.jsonOutput {
+				if _, err := fmt.Fprintf(opt.out, "%d open action(s), none openable from here — run 'papio actions list' for details\n", len(actions)); err != nil {
+					return err
+				}
+				return nil
+			}
 			if dryRun && opt.jsonOutput {
 				return opt.printJSON(urls)
 			}
@@ -240,6 +246,19 @@ func newActionsCommand(opt *options) *cobra.Command {
 	resolve.Flags().BoolVar(&reject, "reject", false, "reject the identity review")
 	command.AddCommand(list, resolve, open)
 	return command
+}
+
+// accessHint renders the auth-requirement classification so a user can tell
+// "just open it" from "sign in first" without decoding action details.
+func accessHint(action job.HumanAction) string {
+	switch {
+	case action.RequiresAuth:
+		return "\tsign in to your institution first, then 'papio actions open'"
+	case action.Kind == "openurl_handoff":
+		return "\topen access — no login needed"
+	default:
+		return ""
+	}
 }
 
 const openURLTimeout = 5 * time.Second
@@ -311,7 +330,7 @@ func openActionURLs(ctx context.Context, urls []string, dryRun bool, out io.Writ
 		err := run(bounded, "open", "-b", chromeBundleID, target)
 		cancel()
 		if err != nil {
-			return err
+			return fmt.Errorf("opening %s: %w (check 'papio doctor' if the browser or extension is not set up)", target, err)
 		}
 	}
 	return nil
@@ -323,7 +342,17 @@ func openActionURLs(ctx context.Context, urls []string, dryRun bool, out io.Writ
 const chromeBundleID = "com.google.Chrome"
 
 func commandExec(ctx context.Context, name string, args ...string) error {
-	return exec.CommandContext(ctx, name, args...).Run()
+	output, err := exec.CommandContext(ctx, name, args...).CombinedOutput()
+	if err != nil {
+		if trimmed := strings.TrimSpace(string(output)); trimmed != "" {
+			if len(trimmed) > 200 {
+				trimmed = trimmed[:200]
+			}
+			return fmt.Errorf("%w: %s", err, trimmed)
+		}
+		return err
+	}
+	return nil
 }
 
 func newArtifactsCommand(opt *options) *cobra.Command {

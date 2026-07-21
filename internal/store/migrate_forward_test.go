@@ -44,6 +44,10 @@ func TestOpenRollsForwardSchemaOneWithoutLosingDurableRows(t *testing.T) {
 		VALUES ('migration-job-0001', 'browser', 'https://example.test/<redacted>', 'migration-candidate-key', 'published', 'subscription', 'unknown', '2026-07-15T00:00:00Z');
 		INSERT INTO human_actions(job_id, kind, detail, created_at)
 		VALUES ('migration-job-0001', 'verify_identity', 'inspect local copy', '2026-07-15T00:00:00Z');
+		INSERT INTO human_actions(job_id, kind, detail, created_at)
+		VALUES ('migration-job-0001', 'openurl_handoff', 'open-access fetch via browser' || char(10) || 'https://oa.example.test/paper.pdf', '2026-07-15T00:00:00Z');
+		INSERT INTO human_actions(job_id, kind, detail, created_at)
+		VALUES ('migration-job-0001', 'openurl_handoff', 'open-access candidates exhausted; institutional OpenURL handoff available in your browser', '2026-07-15T00:00:01Z');
 		INSERT INTO exports(job_id, kind, idempotency_key, path, result_json, created_at)
 		VALUES ('migration-job-0001', 'bundle', 'bundle:migration-job-0001:fixture', '/tmp/fixture', '{"fixture":true}', '2026-07-15T00:00:00Z');
 	`); err != nil {
@@ -59,8 +63,8 @@ func TestOpenRollsForwardSchemaOneWithoutLosingDurableRows(t *testing.T) {
 	}
 	defer migrated.Close()
 	version, err := migrated.UserVersion(ctx)
-	if err != nil || version != 10 {
-		t.Fatalf("user_version = %d, %v; want 10", version, err)
+	if err != nil || version != 11 {
+		t.Fatalf("user_version = %d, %v; want 11", version, err)
 	}
 
 	var jobs, actions, exports int
@@ -73,8 +77,26 @@ func TestOpenRollsForwardSchemaOneWithoutLosingDurableRows(t *testing.T) {
 	if err := migrated.DB().QueryRowContext(ctx, "SELECT COUNT(*) FROM exports").Scan(&exports); err != nil {
 		t.Fatalf("count exports: %v", err)
 	}
-	if jobs != 1 || actions != 1 || exports != 1 {
-		t.Fatalf("migrated durable rows jobs=%d actions=%d exports=%d, want 1 each", jobs, actions, exports)
+	if jobs != 1 || actions != 3 || exports != 1 {
+		t.Fatalf("migrated durable rows jobs=%d actions=%d exports=%d, want 1/3/1", jobs, actions, exports)
+	}
+
+	// 0011 backfill: legacy detail markers become structured classification.
+	var oaAuth, instAuth int
+	var oaBlocked, instBlocked string
+	if err := migrated.DB().QueryRowContext(ctx,
+		"SELECT requires_auth, blocked_by FROM human_actions WHERE kind = 'openurl_handoff' AND detail LIKE 'open-access fetch%'").Scan(&oaAuth, &oaBlocked); err != nil {
+		t.Fatalf("read OA handoff backfill: %v", err)
+	}
+	if oaAuth != 0 || oaBlocked != "anti_bot" {
+		t.Fatalf("OA handoff backfill = requires_auth %d blocked_by %q, want 0/anti_bot", oaAuth, oaBlocked)
+	}
+	if err := migrated.DB().QueryRowContext(ctx,
+		"SELECT requires_auth, blocked_by FROM human_actions WHERE kind = 'openurl_handoff' AND detail LIKE 'open-access candidates exhausted%'").Scan(&instAuth, &instBlocked); err != nil {
+		t.Fatalf("read institutional handoff backfill: %v", err)
+	}
+	if instAuth != 1 || instBlocked != "paywall" {
+		t.Fatalf("institutional handoff backfill = requires_auth %d blocked_by %q, want 1/paywall", instAuth, instBlocked)
 	}
 
 	var spent float64

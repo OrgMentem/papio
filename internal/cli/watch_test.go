@@ -11,6 +11,7 @@ import (
 
 	"papio/internal/api"
 	"papio/internal/config"
+	"papio/internal/protocol"
 	"papio/internal/watch"
 	"papio/internal/zotio"
 )
@@ -251,6 +252,39 @@ func TestAcquireFromDigestPreservesOpaqueRepeatedKeys(t *testing.T) {
 	root.SetArgs([]string{"acquire", "--from-digest", "7", "--keys", " a study, revisited ", "--keys", "\tanother study\n"})
 	if err := root.Execute(); err != nil {
 		t.Fatalf("acquire --from-digest --keys: %v (%s)", err, stderr.String())
+	}
+}
+
+func TestAcquireSingleLabelDefaultsCollection(t *testing.T) {
+	for _, test := range []struct {
+		name           string
+		args           []string
+		wantCollection string
+	}{
+		{name: "label seeds collection", args: []string{"acquire", "--doi", "10.1000/x", "--label", "trust handoff"}, wantCollection: "trust handoff"},
+		{name: "explicit collection wins", args: []string{"acquire", "--doi", "10.1000/x", "--label", "trust handoff", "--collection", "Reading"}, wantCollection: "Reading"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			root := NewInProcessRoot(&stdout, &stderr, config.Config{}, func(_ context.Context, method string, params any, result any) error {
+				if method != "acquire.submit" {
+					t.Fatalf("method = %q, want acquire.submit", method)
+				}
+				request, ok := params.(protocol.WorkRequest)
+				if !ok {
+					t.Fatalf("params = %T, want protocol.WorkRequest", params)
+				}
+				if request.Collection != test.wantCollection {
+					t.Fatalf("collection = %q, want %q", request.Collection, test.wantCollection)
+				}
+				*result.(*api.SubmitResult) = api.SubmitResult{JobID: "job_test_0001"}
+				return nil
+			})
+			root.SetArgs(test.args)
+			if err := root.Execute(); err != nil {
+				t.Fatalf("acquire --label: %v (%s)", err, stderr.String())
+			}
+		})
 	}
 }
 

@@ -253,7 +253,7 @@ func (s *Sentinel) readyDOIs(ctx context.Context) ([]string, error) {
 		  FROM jobs j
 		  JOIN identifiers i ON i.work_request_id = j.work_request_id
 		  JOIN artifacts a ON a.sha256 = j.artifact_sha256
-		 WHERE j.state = 'ready' AND i.kind = 'doi'
+		 WHERE j.state IN ('ready','imported') AND i.kind = 'doi'
 		 ORDER BY i.value`)
 	if err != nil {
 		return nil, fmt.Errorf("retraction: query ready library DOIs: %w", err)

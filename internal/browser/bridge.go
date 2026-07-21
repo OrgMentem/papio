@@ -229,6 +229,9 @@ func (b *Bridge) handle(ctx context.Context, msg *protocol.BrowserMessage) ([]js
 	case protocol.MsgJobAccept:
 		return nil, b.jobs.S.AppendEvent(ctx, msg.JobID, "browser.job_accept", nil)
 
+	case protocol.MsgHandoffOutcome:
+		return nil, b.handoffOutcome(ctx, msg.JobID, msg.Payload.(*protocol.HandoffOutcomePayload))
+
 	case protocol.MsgJobReject:
 		if err := b.jobs.S.AppendEvent(ctx, msg.JobID, "browser.job_reject", nil); err != nil {
 			return nil, err
@@ -1009,8 +1012,12 @@ func (b *Bridge) poll(ctx context.Context) ([]json.RawMessage, error) {
 		if b.offered[row.ID] {
 			continue
 		}
-		offer, err := b.offer(row, action.Detail)
+		offer, err := b.offer(row, action)
 		if err != nil {
+			return nil, err
+		}
+		if err := b.jobs.S.AppendEvent(ctx, row.ID, "browser.handoff_offered",
+			map[string]any{"requires_auth": action.RequiresAuth}); err != nil {
 			return nil, err
 		}
 		out = append(out, offer)
@@ -1042,10 +1049,10 @@ func (b *Bridge) poll(ctx context.Context) ([]json.RawMessage, error) {
 // offer builds a job_offer for one parked handoff job. OA browser handoffs
 // reuse the frozen OpenURL field with the candidate's public URL; institutional
 // handoffs still construct the regular OpenURL resolver link.
-func (b *Bridge) offer(row job.Row, handoffDetail string) (json.RawMessage, error) {
+func (b *Bridge) offer(row job.Row, action job.HumanAction) (json.RawMessage, error) {
 	inst, _ := b.cfg.InstitutionFor(row.Policy.Resolver)
 	offerURL := OpenURL(inst.OpenURLBase, row.Work)
-	if oaURL, ok := app.OABrowserHandoffURL(handoffDetail); ok {
+	if oaURL, ok := app.OABrowserHandoffURL(action.Detail); ok {
 		offerURL = oaURL
 	}
 	hosts := []string{}
@@ -1062,6 +1069,7 @@ func (b *Bridge) offer(row job.Row, handoffDetail string) (json.RawMessage, erro
 		ProviderHosts: hosts,
 		Expected:      expected,
 		AccessMode:    b.cfg.AccessMode,
+		RequiresAuth:  action.RequiresAuth,
 		ExpiresAt:     b.now().Add(b.actionExpiry()).UTC().Format(time.RFC3339),
 	}
 	// Federated login-routing: hand this job's institution Shibboleth entityID
@@ -1072,6 +1080,34 @@ func (b *Bridge) offer(row job.Row, handoffDetail string) (json.RawMessage, erro
 	payload.LoginEntityID = inst.ShibbolethEntityID
 	payload.ProquestAccountID = inst.ProquestAccountID
 	return b.frame(protocol.MsgJobOffer, row.ID, payload)
+}
+
+// handoffOutcome records an extension-reported IdP failure on a parked
+// handoff and re-arms the offer so the next poll sends a freshly minted
+// OpenURL. The job stays awaiting_human and the action stays open: the human
+// is mid-recovery and the fresh link is the recovery path. Unknown jobs or
+// jobs without an open handoff are dropped fail-closed.
+func (b *Bridge) handoffOutcome(ctx context.Context, jobID string, p *protocol.HandoffOutcomePayload) error {
+	actions, err := b.jobs.ListHumanActions(ctx, true)
+	if err != nil {
+		return err
+	}
+	open := false
+	for _, action := range actions {
+		if action.JobID == jobID && action.Kind == handoffActionKind {
+			open = true
+			break
+		}
+	}
+	if !open {
+		return nil
+	}
+	if err := b.jobs.S.AppendEvent(ctx, jobID, "browser.handoff_failed",
+		map[string]any{"outcome": p.Outcome, "final_host": p.FinalHost}); err != nil {
+		return err
+	}
+	delete(b.offered, jobID)
+	return nil
 }
 
 // fallbackOAHandoff replaces the one-time OA browser offer with the ordinary
@@ -1097,7 +1133,7 @@ func (b *Bridge) fallbackOAHandoff(ctx context.Context, jobID, failure string) (
 		if _, ok := app.OABrowserHandoffURL(action.Detail); !ok {
 			return false, nil
 		}
-		if _, err := b.jobs.OpenHumanAction(ctx, jobID, handoffActionKind, app.InstitutionalOpenURLHandoffDetail); err != nil {
+		if _, err := b.jobs.OpenHumanAction(ctx, jobID, handoffActionKind, app.InstitutionalOpenURLHandoffDetail, job.WithAccessClassification(true, "paywall")); err != nil {
 			return false, err
 		}
 		if err := b.jobs.RecordEvent(ctx, jobID, "browser.oa_handoff_fallback", map[string]any{"reason": failure}); err != nil {

@@ -95,8 +95,10 @@ func newAcquireCommand(opt *options) *cobra.Command {
 				}
 				return opt.printResult(result, "Queued %d digest work(s)", result.Queued)
 			}
-			if cmd.Flags().Changed("label") {
-				return fmt.Errorf("--label is supported only with --batch")
+			// --label defaults the target collection, exactly as in batch mode
+			// (batch.Submit does the same when --collection is unset).
+			if strings.TrimSpace(collection) == "" {
+				collection = strings.TrimSpace(label)
 			}
 			if fromZotio {
 				if len(args) != 0 || doi != "" || pmid != "" || arxivID != "" || isbn != "" || openalex != "" ||
@@ -201,7 +203,7 @@ func newAcquireCommand(opt *options) *cobra.Command {
 	flags.StringArrayVar(&digestKeys, "keys", nil, "digest work key to queue (repeatable)")
 	flags.StringVar(&batchPath, "batch", "", "submit JSONL works from a file or - for standard input")
 	flags.BoolVar(&includeOwned, "include-owned", false, "with --batch, submit works already carrying a PDF in zotio")
-	flags.StringVar(&label, "label", "", "batch query context; also the default target collection when --collection is unset")
+	flags.StringVar(&label, "label", "", "query context; also the default target collection when --collection is unset")
 	flags.BoolVar(&autoImport, "auto-import", false, "plan and apply zotio import automatically when ready")
 	return command
 }

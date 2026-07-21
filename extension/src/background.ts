@@ -49,6 +49,7 @@ import { takePendingFixtureFilename } from "./capture";
 import { observeUnknown } from "./observe";
 import { chromeKeepaliveAPI, initKeepalive, isAuthenticationURL } from "./keepalive";
 import { routeResolverService, type ResolverRoute } from "./resolver";
+import { detectAuthFailure } from "./authfail";
 
 export const NATIVE_HOST = "com.orgmentem.papio";
 const CHROME_PDF_VIEWER_HOST = "mhjfbmdgcfjbbpaeojofohoefgiehjai";
@@ -106,6 +107,9 @@ export interface NativePort {
 export interface TabInfo {
   id?: number | undefined;
   url?: string | undefined;
+  /** Page title when available; used only for local IdP failure-page
+   * heuristics and never sent over the bridge. */
+  title?: string | undefined;
   /** Chrome sets this on a tab opened by another tab (e.g. a provider's
    * "download" that opens the PDF in a new viewer tab). Correlates the viewer
    * tab back to the tracked handoff tab that spawned it. */
@@ -582,6 +586,9 @@ export class Bridge {
   /** Jobs whose openurl was re-driven once after federated login returned, so a
    * still-walled page doesn't loop. Cleared on job removal. */
   private readonly federatedReDriven = new Set<string>();
+  /** Jobs that already reported a given handoff failure outcome, so one bad
+   * IdP page does not spam the daemon. Cleared on job removal. */
+  private readonly handoffOutcomeSent = new Set<string>();
   /** Authentication observed during this service-worker lifetime. */
   private authReturnedThisWorker = false;
   /** Keepalive has observed its resolver tab return from authentication. */
@@ -1474,6 +1481,8 @@ export class Bridge {
     this.loginEntityIDs.delete(jobID);
     this.federatedLoginRouted.delete(jobID);
     this.federatedReDriven.delete(jobID);
+    this.handoffOutcomeSent.delete(`${jobID}:stale_sso`);
+    this.handoffOutcomeSent.delete(`${jobID}:auth_error`);
     this.proquestAccountIDs.delete(jobID);
     this.accountIdAppended.delete(jobID);
     await this.update((s) => {
@@ -2061,6 +2070,15 @@ export class Bridge {
       host = new URL(url).hostname;
     } catch {
       return;
+    }
+    if (change.status === "complete") {
+      const failure = detectAuthFailure(url, tab.title);
+      if (failure !== undefined && !this.handoffOutcomeSent.has(`${job.job_id}:${failure}`)) {
+        // Record-only: the daemon re-arms the handoff; the human stays in
+        // control of the tab, so never close or renavigate it here.
+        this.handoffOutcomeSent.add(`${job.job_id}:${failure}`);
+        this.send("handoff_outcome", { outcome: failure, final_host: host }, job.job_id);
+      }
     }
     const adapter = this.deps.adapterSpecs.find((candidate) => hostMatches(host, candidate.hosts));
     // The registry is source-controlled and may cover hosts omitted from the
