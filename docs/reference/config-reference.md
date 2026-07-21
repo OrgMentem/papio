@@ -92,7 +92,7 @@ custom resolver origin stays in assisted mode.
 
 | Key | Type | Default | Effect and constraints |
 | --- | --- | --- | --- |
-| `executable` | path or command string | `zotio` | zotio executable Papio invokes at the Zotero boundary. It must not be empty. |
+| `executable` | path or command string | `zotio` | zotio executable Papio invokes at the Zotero boundary. Optional: an empty value disables the deep Zotero integration (auto-import, plan/apply, queue); ownership lookup then classifies every work as not-owned. Required only when `auto_import = true`. |
 | `timeout_seconds` | integer seconds | `120` | zotio command deadline. It must be between 5 and 600 seconds inclusive. |
 | `attachment_mode` | string | `stored` | zotio attachment mode. Allowed values are `stored` and `linked-file`. |
 | `auto_import` | boolean | `false` | Default acquisition policy for automatic zotio plan-and-apply after a job is ready. An `acquire --auto-import` request can opt in per job. |
@@ -101,6 +101,13 @@ custom resolver origin stays in assisted mode.
 Papio invokes zotio but does not read or store Zotero credentials. Manual
 mutation remains preview-first: `papio zotio plan` returns immutable plans and
 `papio zotio apply` requires the exact confirmation SHA-256.
+
+## `[hooks]`
+
+| Key | Type | Default | Effect and constraints |
+| --- | --- | --- | --- |
+| `on_ready` | shell command string | empty | When set, runs once via the system shell (`/bin/sh -c`; `cmd /C` on Windows) each time a job reaches `ready` (validated artifact). Job metadata arrives as `PAPIO_*` environment variables. Fire-and-forget: a failing hook is recorded as a `hook.on_ready` job event but never fails or retries the job. Empty disables it. See the [hooks guide](../guide/hooks.md). |
+| `timeout_seconds` | integer seconds | `120` | Deadline for one hook run. Validated (5..600) only when `on_ready` is set. |
 
 ## `[notify]`
 

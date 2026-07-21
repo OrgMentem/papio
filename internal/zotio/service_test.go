@@ -186,6 +186,30 @@ func TestQueueMissingPDFDefaultsLimitAndDesiredVersion(t *testing.T) {
 	}
 }
 
+func TestLookupWorksUnconfiguredDegradesToNotOwned(t *testing.T) {
+	result, err := (&Service{}).LookupWorks(context.Background(), LookupWorksRequest{Works: []LookupWork{
+		{DOI: "10.1000/anything"},
+		{ArXiv: "arXiv:2601.12345v2"},
+	}})
+	if err != nil {
+		t.Fatalf("unconfigured lookup must degrade, not error: %v", err)
+	}
+	if len(result.Works) != 2 {
+		t.Fatalf("works = %d, want 2", len(result.Works))
+	}
+	for i, ownership := range result.Works {
+		if ownership.Status != OwnershipNotOwned {
+			t.Fatalf("work %d status = %q, want not_owned", i, ownership.Status)
+		}
+	}
+	if result.StalenessWarning != "Zotio is not configured; ownership was not checked" {
+		t.Fatalf("staleness warning = %q", result.StalenessWarning)
+	}
+	if _, err := (&Service{}).LookupWorks(context.Background(), LookupWorksRequest{}); err == nil {
+		t.Fatal("empty request must still error on bounds")
+	}
+}
+
 func TestLookupWorksClassifiesOwnedPDFMissingPDFAndNewWork(t *testing.T) {
 	cli := &fakeCLI{
 		items: []MissingPDFItem{{Key: "MISS0001"}},

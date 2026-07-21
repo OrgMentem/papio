@@ -170,6 +170,17 @@ type Notify struct {
 	WebhookSecret string `toml:"webhook_secret"`
 }
 
+// Hooks configures best-effort local commands the daemon runs at job
+// lifecycle points. Hooks are fire-and-forget: a failing hook never fails
+// the job that triggered it, and papio never retries a hook.
+type Hooks struct {
+	// OnReady, when set, runs once via the system shell each time a job
+	// reaches the ready state (validated artifact). Empty disables it.
+	OnReady string `toml:"on_ready"`
+	// TimeoutSeconds bounds one hook run. Default 120, range 5..600.
+	TimeoutSeconds int `toml:"timeout_seconds"`
+}
+
 // Discovery selects which discovery backends serve search and watches, in
 // merge-preference order. Empty means OpenAlex only (the historical default).
 // Per-backend API keys and dev base URLs live in the existing [sources] map
@@ -193,6 +204,7 @@ type Config struct {
 	Browser    Browser           `toml:"browser"`
 	Zotio      Zotio             `toml:"zotio"`
 	Notify     Notify            `toml:"notify"`
+	Hooks      Hooks             `toml:"hooks"`
 	Updates    Updates           `toml:"updates"`
 	Discovery  Discovery         `toml:"discovery"`
 	Sources    map[string]Source `toml:"sources"`
@@ -240,6 +252,7 @@ func Default() Config {
 		Browser: Browser{ActionExpirySeconds: 1800},
 		Zotio:   Zotio{Executable: "zotio", TimeoutSeconds: 120, AttachmentMode: "stored", AutoImport: false, AutoEnrich: true},
 		Notify:  Notify{Enabled: true},
+		Hooks:   Hooks{TimeoutSeconds: 120},
 		Sources: map[string]Source{
 			SourceArXiv:            {Enabled: true, RatePerSec: 1, Burst: 1},
 			SourceEuropePMC:        {Enabled: true, RatePerSec: 2, Burst: 2},
@@ -365,8 +378,8 @@ func (c *Config) validate() error {
 	if c.Browser.ActionExpirySeconds < 0 {
 		return fmt.Errorf("browser.action_expiry_seconds must be >= 0")
 	}
-	if strings.TrimSpace(c.Zotio.Executable) == "" {
-		return fmt.Errorf("zotio.executable is required")
+	if strings.TrimSpace(c.Zotio.Executable) == "" && c.Zotio.AutoImport {
+		return fmt.Errorf("zotio.auto_import requires zotio.executable")
 	}
 	if c.Zotio.TimeoutSeconds < 5 || c.Zotio.TimeoutSeconds > 600 {
 		return fmt.Errorf("zotio.timeout_seconds must be in 5..600")
@@ -387,6 +400,9 @@ func (c *Config) validate() error {
 	}
 	if c.Notify.WebhookSecret != "" && c.Notify.WebhookURL == "" {
 		return fmt.Errorf("notify.webhook_secret is set but notify.webhook_url is empty")
+	}
+	if c.Hooks.OnReady != "" && (c.Hooks.TimeoutSeconds < 5 || c.Hooks.TimeoutSeconds > 600) {
+		return fmt.Errorf("hooks.timeout_seconds must be in 5..600")
 	}
 	seenDiscovery := map[string]bool{}
 	for _, name := range c.Discovery.Sources {

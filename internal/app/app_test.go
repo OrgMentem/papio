@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 	"papio/internal/config"
 	"papio/internal/discovery"
 	"papio/internal/fetch"
+	"papio/internal/hook"
 	"papio/internal/job"
 	"papio/internal/pdf"
 	"papio/internal/protocol"
@@ -1250,5 +1252,125 @@ func TestResolverRetryBudgetEscalatesAfterCap(t *testing.T) {
 	}
 	if row.State != job.StateUnavailable {
 		t.Fatalf("state after exhausting retry budget = %s, want unavailable (escalated, not retry_wait forever)", row.State)
+	}
+}
+
+func hookEvent(t *testing.T, jobs *job.Store, id string) map[string]any {
+	t.Helper()
+	events, err := jobs.Events(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range events {
+		if event["kind"] == "hook.on_ready" {
+			detail, ok := event["detail"].(map[string]any)
+			if !ok {
+				t.Fatalf("hook event detail = %#v", event["detail"])
+			}
+			return detail
+		}
+	}
+	return nil
+}
+
+func waitForHookEvent(t *testing.T, jobs *job.Store, id string) map[string]any {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if detail := hookEvent(t, jobs, id); detail != nil {
+			return detail
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("no hook.on_ready event recorded")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestProcessReadyFiresOnReadyHookOnce(t *testing.T) {
+	svc, jobs := newTestService(t)
+	readyPipeline(svc)
+	var mu sync.Mutex
+	var envs [][]string
+	svc.ReadyHook = &hook.Runner{
+		Command: "configured",
+		Exec: func(_ context.Context, _ string, env []string) hook.Result {
+			mu.Lock()
+			envs = append(envs, env)
+			mu.Unlock()
+			return hook.Result{Ran: true, ExitCode: 0}
+		},
+	}
+
+	id, err := svc.Submit(context.Background(), doiRequest("wr_hook_ok_01"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, err := jobs.ClaimNext(context.Background(), "worker", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Process(context.Background(), row); err != nil {
+		t.Fatal(err)
+	}
+	ready, err := jobs.Get(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ready.State != job.StateReady {
+		t.Fatalf("job state = %s, want ready", ready.State)
+	}
+	detail := waitForHookEvent(t, jobs, id)
+	if detail["status"] != "ok" {
+		t.Fatalf("hook detail = %#v, want status ok", detail)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(envs) != 1 {
+		t.Fatalf("hook invocations = %d, want 1", len(envs))
+	}
+	byKey := map[string]string{}
+	for _, kv := range envs[0] {
+		key, value, _ := strings.Cut(kv, "=")
+		byKey[key] = value
+	}
+	if byKey["PAPIO_DOI"] != "10.1002/example" || byKey["PAPIO_JOB_ID"] != id ||
+		byKey["PAPIO_STATE"] != "ready" || byKey["PAPIO_SHA256"] != ready.ArtifactSHA256 ||
+		!strings.HasSuffix(byKey["PAPIO_PDF"], ready.ArtifactSHA256+".pdf") {
+		t.Fatalf("hook env = %#v", byKey)
+	}
+}
+
+func TestOnReadyHookFailureLeavesJobReady(t *testing.T) {
+	svc, jobs := newTestService(t)
+	readyPipeline(svc)
+	svc.ReadyHook = &hook.Runner{
+		Command: "configured",
+		Exec: func(_ context.Context, _ string, _ []string) hook.Result {
+			return hook.Result{Ran: true, ExitCode: 1, StderrTail: "boom"}
+		},
+	}
+
+	id, err := svc.Submit(context.Background(), doiRequest("wr_hook_fail_01"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, err := jobs.ClaimNext(context.Background(), "worker", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Process(context.Background(), row); err != nil {
+		t.Fatalf("hook failure must be non-fatal: %v", err)
+	}
+	detail := waitForHookEvent(t, jobs, id)
+	if detail["status"] != "error" || detail["stderr_tail"] != "boom" {
+		t.Fatalf("hook failure detail = %#v", detail)
+	}
+	ready, err := jobs.Get(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ready.State != job.StateReady {
+		t.Fatalf("job state = %s, want ready despite hook failure", ready.State)
 	}
 }

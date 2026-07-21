@@ -22,6 +22,7 @@ func TestSaveLoadRoundTripAndPermissions(t *testing.T) {
 	cfg.Sources[SourceOpenAlex] = Source{Enabled: true, APIKey: "secret", RatePerSec: 2, Burst: 1}
 	cfg.Zotio.Executable = filepath.Join(t.TempDir(), "zotio")
 	cfg.Zotio.AttachmentMode = "linked-file"
+	cfg.Hooks.OnReady = "true"
 	if err := Save(cfg, path); err != nil {
 		t.Fatal(err)
 	}
@@ -43,7 +44,7 @@ func TestSaveLoadRoundTripAndPermissions(t *testing.T) {
 	if got.AccessMode != cfg.AccessMode || got.Email != cfg.Email ||
 		got.Sources[SourceOpenAlex].APIKey != "secret" ||
 		got.Zotio.Executable != cfg.Zotio.Executable ||
-		got.Zotio.AttachmentMode != "linked-file" || got.Path != path {
+		got.Zotio.AttachmentMode != "linked-file" || got.Hooks.OnReady != "true" || got.Path != path {
 		t.Fatalf("round trip = %+v", got)
 	}
 }
@@ -53,6 +54,38 @@ func TestSaveRequiresExplicitAccessMode(t *testing.T) {
 	var unset *ErrAccessModeUnset
 	if !errors.As(err, &unset) {
 		t.Fatalf("save err = %v, want ErrAccessModeUnset", err)
+	}
+}
+
+func TestSaveAllowsEmptyZotioExecutableUnlessAutoImport(t *testing.T) {
+	cfg := Default()
+	cfg.AccessMode = ModeConservative
+	cfg.Zotio.Executable = ""
+	if err := Save(cfg, filepath.Join(t.TempDir(), "config.toml")); err != nil {
+		t.Fatalf("empty zotio.executable rejected: %v", err)
+	}
+	cfg.Zotio.AutoImport = true
+	err := Save(cfg, filepath.Join(t.TempDir(), "config.toml"))
+	if err == nil || !strings.Contains(err.Error(), "zotio.auto_import requires zotio.executable") {
+		t.Fatalf("auto_import without executable err = %v", err)
+	}
+}
+
+func TestSaveValidatesHooksTimeoutOnlyWhenOnReadySet(t *testing.T) {
+	cfg := Default()
+	cfg.AccessMode = ModeConservative
+	cfg.Hooks.TimeoutSeconds = 0
+	if err := Save(cfg, filepath.Join(t.TempDir(), "config.toml")); err != nil {
+		t.Fatalf("hooks timeout validated while on_ready empty: %v", err)
+	}
+	cfg.Hooks.OnReady = "true"
+	err := Save(cfg, filepath.Join(t.TempDir(), "config.toml"))
+	if err == nil || !strings.Contains(err.Error(), "hooks.timeout_seconds must be in 5..600") {
+		t.Fatalf("out-of-range hooks timeout err = %v", err)
+	}
+	cfg.Hooks.TimeoutSeconds = 120
+	if err := Save(cfg, filepath.Join(t.TempDir(), "config.toml")); err != nil {
+		t.Fatalf("valid hooks config rejected: %v", err)
 	}
 }
 

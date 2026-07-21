@@ -251,3 +251,51 @@ func TestRunIntegrationUpdates(t *testing.T) {
 		}
 	})
 }
+
+func TestRunIntegrationSkipsZotioWhenUnconfigured(t *testing.T) {
+	cfg := config.Default()
+	cfg.Path = filepath.Join(t.TempDir(), "config.toml")
+	cfg.DataDir = t.TempDir()
+	cfg.Zotio.Executable = ""
+	cfg.Updates.Check = true
+	deps := IntegrationDependencies{
+		CLIVersion: "1.2.3",
+		LoadConfig: func() (config.Config, error) { return cfg, nil },
+		DaemonStatus: func(context.Context, config.Config) (DaemonStatus, error) {
+			return DaemonStatus{Status: "ok", Version: "1.2.3"}, nil
+		},
+		ManifestDir: func(config.Config) (string, error) { return t.TempDir(), nil },
+		FirefoxDir:  func(config.Config) (string, error) { return t.TempDir(), nil },
+		ReadFile:    os.ReadFile,
+		ZotioPreflight: func(context.Context, config.Config) (*zotio.PreflightResult, error) {
+			t.Fatal("zotio preflight ran despite empty executable")
+			return nil, nil
+		},
+		CheckUpdates: func(context.Context, config.Config) (*update.Info, error) {
+			return &update.Info{LatestVersion: "1.2.3", URL: "https://example.test/papio"}, nil
+		},
+		CheckZotioUpdates: func(context.Context, config.Config) (*update.Info, error) {
+			t.Fatal("zotio update check ran despite empty executable")
+			return nil, nil
+		},
+	}
+	report := RunIntegration(context.Background(), deps)
+	var zotioCheck, zotioUpdates Check
+	for _, check := range report.Checks {
+		switch check.Name {
+		case "zotio":
+			zotioCheck = check
+		case "updates (zotio)":
+			zotioUpdates = check
+		}
+	}
+	if zotioCheck.Status != Skip || !strings.Contains(zotioCheck.Detail, "not configured") {
+		t.Fatalf("zotio check = %#v, want Skip not-configured", zotioCheck)
+	}
+	if !report.OK {
+		t.Fatalf("unconfigured zotio must not fail doctor: %+v", report)
+	}
+	if zotioUpdates.Status != Skip || zotioUpdates.Detail != "skipped: zotio is not configured" {
+		t.Fatalf("zotio updates check = %#v", zotioUpdates)
+	}
+}

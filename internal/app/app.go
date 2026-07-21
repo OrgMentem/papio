@@ -19,6 +19,7 @@ import (
 	"papio/internal/budget"
 	"papio/internal/config"
 	"papio/internal/fetch"
+	"papio/internal/hook"
 	"papio/internal/job"
 	"papio/internal/pdf"
 	"papio/internal/protocol"
@@ -81,6 +82,9 @@ type Service struct {
 	Validate     ValidateFunc
 	AutoImporter AutoImporter
 	Notifier     NotificationSink
+	// ReadyHook, when non-nil with a command, runs the user's on_ready hook
+	// once per ready transition. Nil disables it.
+	ReadyHook *hook.Runner
 
 	RetryDelay time.Duration
 	Now        func() time.Time
@@ -241,6 +245,7 @@ func (s *Service) Process(ctx context.Context, row *job.Row) error {
 				return err
 			}
 			s.autoImportReady(ctx, row)
+			s.runReadyHook(ctx, row, cached.SHA256)
 			return nil
 		}
 	}
@@ -780,6 +785,7 @@ func (s *Service) validateCandidate(ctx context.Context, row *job.Row, stored *j
 		return false, false, err
 	}
 	s.autoImportReady(ctx, row)
+	s.runReadyHook(ctx, row, result.SHA256)
 	return true, false, nil
 }
 
@@ -820,6 +826,49 @@ func (s *Service) autoImportReady(ctx context.Context, row *job.Row) {
 	if status == "applied" && s.Notifier != nil {
 		s.Notifier.Imported(eventCtx)
 	}
+}
+
+// runReadyHook fires the user's on_ready hook exactly once per ready
+// transition, detached from the caller: hook latency or failure never blocks
+// or fails acquisition. Import retries never re-fire it.
+func (s *Service) runReadyHook(ctx context.Context, row *job.Row, sha string) {
+	if s.ReadyHook == nil || strings.TrimSpace(s.ReadyHook.Command) == "" {
+		return
+	}
+	eventCtx := context.WithoutCancel(ctx)
+	pdfPath, err := s.Artifacts.ArtifactPath(sha)
+	if err != nil {
+		_ = s.Jobs.RecordEvent(eventCtx, row.ID, "hook.on_ready",
+			map[string]any{"status": "error", "reason": "artifact_path"})
+		return
+	}
+	env := map[string]string{
+		"PAPIO_JOB_ID":     row.ID,
+		"PAPIO_REQUEST_ID": row.WorkRequestID,
+		"PAPIO_DOI":        row.Work.DOI,
+		"PAPIO_ARXIV":      row.Work.ArXiv,
+		"PAPIO_TITLE":      row.Work.Title,
+		"PAPIO_SHA256":     sha,
+		"PAPIO_PDF":        pdfPath,
+		"PAPIO_STATE":      "ready",
+	}
+	jobID := row.ID
+	go func() {
+		result := s.ReadyHook.Run(eventCtx, env)
+		detail := map[string]any{
+			"exit_code":   result.ExitCode,
+			"duration_ms": result.Duration.Milliseconds(),
+		}
+		if result.Err == nil && result.ExitCode == 0 {
+			detail["status"] = "ok"
+		} else {
+			detail["status"] = "error"
+		}
+		if result.StderrTail != "" {
+			detail["stderr_tail"] = result.StderrTail
+		}
+		_ = s.Jobs.RecordEvent(eventCtx, jobID, "hook.on_ready", detail)
+	}()
 }
 
 // InstitutionalOpenURLHandoffDetail describes the ordinary resolver handoff.

@@ -111,13 +111,23 @@ type LookupWorksResult struct {
 
 // LookupWorks classifies up to one batch of DOI/arXiv works against Zotio's
 // synced mirror. A failed sync is deliberately non-fatal: the prior mirror is
-// still useful, and the caller receives a bounded staleness warning.
+// still useful, and the caller receives a bounded staleness warning. An
+// unconfigured Zotio (nil CLI) is a supported mode, not an error: every work
+// classifies as not-owned and the warning says ownership was not checked, so
+// batch submit and watches keep working without a Zotero library.
 func (s *Service) LookupWorks(ctx context.Context, request LookupWorksRequest) (*LookupWorksResult, error) {
-	if s == nil || s.CLI == nil {
-		return nil, fmt.Errorf("Zotio integration is not configured")
-	}
 	if len(request.Works) == 0 || len(request.Works) > 50 {
 		return nil, fmt.Errorf("work lookup requires 1..50 works")
+	}
+	if s == nil || s.CLI == nil {
+		result := &LookupWorksResult{
+			Works:            make([]WorkOwnership, len(request.Works)),
+			StalenessWarning: "Zotio is not configured; ownership was not checked",
+		}
+		for i := range result.Works {
+			result.Works[i].Status = OwnershipNotOwned
+		}
+		return result, nil
 	}
 	result := &LookupWorksResult{Works: make([]WorkOwnership, len(request.Works))}
 	for i := range result.Works {

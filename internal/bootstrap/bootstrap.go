@@ -21,6 +21,7 @@ import (
 	"papio/internal/doctor"
 	"papio/internal/enrich"
 	"papio/internal/fetch"
+	"papio/internal/hook"
 	"papio/internal/job"
 	"papio/internal/notify"
 	"papio/internal/pdf"
@@ -39,6 +40,7 @@ import (
 	"papio/internal/watch"
 	"papio/internal/work"
 	"papio/internal/zotio"
+	"strings"
 	"sync"
 	"time"
 )
@@ -213,11 +215,21 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 
 	bundleExporter := &bundle.Exporter{Jobs: jobs, Artifacts: artifacts, DataDir: cfg.DataDir}
 	zotioService := &zotio.Service{
-		CLI: zotio.New(cfg.Zotio), Submitter: service,
-		Bundle: bundleExporter, Store: db, DataDir: cfg.DataDir,
+		Submitter: service,
+		Bundle:    bundleExporter, Store: db, DataDir: cfg.DataDir,
 		AttachmentMode: cfg.Zotio.AttachmentMode, AutoEnrich: cfg.Zotio.AutoEnrich,
 	}
-	service.AutoImporter = newSerialAutoImporter(zotioService)
+	if strings.TrimSpace(cfg.Zotio.Executable) != "" {
+		// zotio is optional: an empty executable disables the deep Zotero
+		// integration (auto-import, plan/apply, queue) while ownership lookup
+		// degrades to not-owned and hooks remain the generic hand-off seam.
+		zotioService.CLI = zotio.New(cfg.Zotio)
+		service.AutoImporter = newSerialAutoImporter(zotioService)
+	}
+	service.ReadyHook = &hook.Runner{
+		Command: cfg.Hooks.OnReady,
+		Timeout: time.Duration(cfg.Hooks.TimeoutSeconds) * time.Second,
+	}
 	discoveryClient := discovery.NewMulti(discoverySources(cfg)...)
 	watches := watch.NewStore(db)
 	watchRunner := &watch.Runner{

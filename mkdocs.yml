@@ -89,6 +89,7 @@ nav:
       - Getting started: guide/getting-started.md
       - User guide: guide/user-guide.md
       - Use in a coding agent: guide/agent-skill.md
+      - Hooks (papis & more): guide/hooks.md
       - Troubleshooting: guide/troubleshooting.md
   - Concepts:
       - Access modes & safety: concepts/access-modes.md
