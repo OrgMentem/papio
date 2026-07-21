@@ -144,11 +144,15 @@ func TestClaimSwitchesHolderAndReoffersHandoffs(t *testing.T) {
 	runSyncAs(t, b, sessA, helloAs("0.3.1"))
 	runSyncAs(t, b, sessB, helloAs("0.4.0"))
 
-	if err := b.Claim("nope"); err == nil {
+	if _, err := b.Claim("nope"); err == nil {
 		t.Fatal("claiming an unknown session must error")
 	}
-	if err := b.Claim(sessB[:12]); err != nil { // prefix match
+	resolved, err := b.Claim(sessB[:12]) // prefix match
+	if err != nil {
 		t.Fatal(err)
+	}
+	if resolved != sessB {
+		t.Fatalf("resolved claim id = %q, want full %q", resolved, sessB)
 	}
 	msgs, _ := runSyncAs(t, b, sessB)
 	if firstOfType(msgs, protocol.MsgHelloAck) == nil || firstOfType(msgs, protocol.MsgJobOffer) == nil {
@@ -164,6 +168,51 @@ func TestClaimSwitchesHolderAndReoffersHandoffs(t *testing.T) {
 		t.Fatalf("sessions after claim = %+v", sessions)
 	}
 	_ = id
+}
+
+func TestClaimPrefixMatchingHolderAndPendingIsAmbiguous(t *testing.T) {
+	b, _, _, _ := newBridge(t)
+	// Both ids share the "aaaa" prefix; sessA holds, the other pends.
+	similar := "aaaa9999aaaa9999aaaa9999aaaa9999"
+	runSyncAs(t, b, sessA, helloAs("0.4.0"))
+	runSyncAs(t, b, similar, helloAs("0.3.1"))
+
+	if _, err := b.Claim("aaaa"); err == nil {
+		t.Fatal("prefix matching holder AND a pending session must be ambiguous, not a silent no-op")
+	}
+	if resolved, err := b.Claim(sessA); err != nil || resolved != sessA {
+		t.Fatalf("exact holder claim = %q, %v; want no-op success", resolved, err)
+	}
+	version, _, _ := b.SessionInfo()
+	if version != "0.4.0" {
+		t.Fatalf("holder changed by ambiguous/no-op claims: %q", version)
+	}
+}
+
+func TestPromotedOutdatedSessionIsToldNotSilentlySeated(t *testing.T) {
+	b, _, _, _ := newBridge(t)
+	advance := settableClock(b)
+	runSyncAs(t, b, sessA, helloAs("0.4.0"))
+	runSyncAs(t, b, sessB, helloAs("0.0.1")) // below MinExtensionVersion, denied+pending
+
+	advance(sessionStaleAfter + time.Second)
+	msgs, _ := runSyncAs(t, b, sessB) // stale takeover promotes the outdated session
+	outdated := firstOfType(msgs, protocol.MsgError)
+	if outdated == nil || outdated.Payload.(*protocol.ErrorPayload).Code != "extension_outdated" {
+		t.Fatalf("promoted outdated session must be told extension_outdated, got %+v", msgs)
+	}
+}
+
+func TestOutdatedPendingSessionStillPassesStatelessFrames(t *testing.T) {
+	b, _, _, _ := newBridge(t)
+	runSyncAs(t, b, sessA, helloAs("0.4.0"))
+	runSyncAs(t, b, sessB, helloAs("0.0.1"))
+
+	msgs, _ := runSyncAs(t, b, sessB, inFrame(t, protocol.MsgPageAcquire, "",
+		map[string]any{"url": "https://journals.example.test/outdated-pending", "doi": "10.1234/outdated-pending"}))
+	if firstOfType(msgs, protocol.MsgPageAcquireAck) == nil {
+		t.Fatalf("stateless page_acquire from an outdated pending session must pass, got %+v", msgs)
+	}
 }
 
 func TestLegacyHostsKeepLastHelloWins(t *testing.T) {

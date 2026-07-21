@@ -80,11 +80,18 @@ func newBrowserCommand(opt *options) *cobra.Command {
 					return errors.New("no other browser session to switch to")
 				}
 			}
-			var result map[string]any
+			var result struct {
+				Claimed   bool   `json:"claimed"`
+				SessionID string `json:"session_id"`
+			}
 			if err := opt.call(cmd.Context(), "browser.claim", map[string]string{"session_id": target}, &result); err != nil {
 				return err
 			}
-			return opt.printResult(result, "browser session %s now holds the papio session", shortSessionID(target))
+			resolved := result.SessionID
+			if resolved == "" {
+				resolved = target
+			}
+			return opt.printResult(result, "browser session %s now holds the papio session", shortSessionID(resolved))
 		},
 	}
 	use.Flags().BoolVar(&latest, "latest", false, "switch to the most recently active pending session")

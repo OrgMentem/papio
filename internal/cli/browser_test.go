@@ -5,6 +5,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -28,8 +29,13 @@ func TestBrowserUseLatestPicksNewestPendingSession(t *testing.T) {
 			return nil
 		case "browser.claim":
 			claimed = params.(map[string]string)["session_id"]
-			*result.(*map[string]any) = map[string]any{"claimed": true}
-			return nil
+			// The RunE decodes into an anonymous struct; round-trip through
+			// JSON instead of type-asserting a private shape.
+			encoded, err := json.Marshal(map[string]any{"claimed": true, "session_id": claimed})
+			if err != nil {
+				return err
+			}
+			return json.Unmarshal(encoded, result)
 		default:
 			t.Fatalf("unexpected method %q", method)
 			return nil

@@ -26,6 +26,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -135,7 +136,7 @@ func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 func newSessionID() string {
 	var raw [16]byte
 	if _, err := rand.Read(raw[:]); err != nil {
-		return fmt.Sprintf("fallback-%d", time.Now().UnixNano())
+		return fmt.Sprintf("fallback-%d-%d", os.Getpid(), time.Now().UnixNano())
 	}
 	return hex.EncodeToString(raw[:])
 }

@@ -705,10 +705,11 @@ func browserClaim(raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.R
 	if strings.TrimSpace(params.SessionID) == "" {
 		return badParams(errors.New("session_id is required"))
 	}
-	if err := system.Browser.Claim(params.SessionID); err != nil {
+	resolved, err := system.Browser.Claim(params.SessionID)
+	if err != nil {
 		return nil, &ipc.RPCError{Code: "invalid_argument", Message: safeMessage(err, "unknown browser session")}
 	}
-	return marshal(map[string]any{"claimed": true, "session_id": params.SessionID})
+	return marshal(map[string]any{"claimed": true, "session_id": resolved})
 }
 
 // searchDiscovery maps strict RPC input to the bounded OpenAlex client.

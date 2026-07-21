@@ -77,9 +77,14 @@ type Bridge struct {
 	pending      map[string]*browserSession
 	deniedHellos int
 	takeovers    int
-	offered      map[string]bool // handoff jobs offered to the current holder
-	cancelSent   map[string]bool // jobs a daemon-side cancel was already announced for
-	now          func() time.Time
+	// epoch increments whenever holder identity changes. Code that releases
+	// b.mu mid-flight (adoption windows inside poll) re-checks it afterwards:
+	// a concurrent claim/takeover must not let a resumed poll send offers to
+	// a demoted session or pollute the new holder's bookkeeping.
+	epoch      uint64
+	offered    map[string]bool // handoff jobs offered to the current holder
+	cancelSent map[string]bool // jobs a daemon-side cancel was already announced for
+	now        func() time.Time
 }
 
 // browserSession is one native-host connection that said hello.
@@ -208,28 +213,37 @@ func summarize(session *browserSession, holder bool) SessionSummary {
 	}
 }
 
-// Claim promotes a pending session to holder (the `papio browser use` path).
-// The demoted holder stays pending — it is still alive and polling.
-func (b *Bridge) Claim(sessionID string) error {
+// Claim promotes a pending session to holder (the `papio browser use` path)
+// and returns the resolved full session id. The demoted holder stays pending
+// — it is still alive and polling. sessionID may be an unambiguous prefix.
+func (b *Bridge) Claim(sessionID string) (string, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.holder != nil && strings.HasPrefix(b.holder.ID, sessionID) && sessionID != "" {
-		return nil // already the holder
+	prefix := strings.TrimSpace(sessionID)
+	if prefix == "" {
+		return "", errors.New("browser session id is required")
 	}
-	var match *browserSession
+	var matches []*browserSession
+	if b.holder != nil && strings.HasPrefix(b.holder.ID, prefix) {
+		matches = append(matches, b.holder)
+	}
 	for id, session := range b.pending {
-		if strings.HasPrefix(id, sessionID) && sessionID != "" {
-			if match != nil {
-				return fmt.Errorf("browser session prefix %q is ambiguous (run 'papio browser sessions')", sessionID)
-			}
-			match = session
+		if strings.HasPrefix(id, prefix) {
+			matches = append(matches, session)
 		}
 	}
-	if match == nil {
-		return fmt.Errorf("unknown browser session %q (run 'papio browser sessions')", sessionID)
+	switch {
+	case len(matches) == 0:
+		return "", fmt.Errorf("unknown browser session %q (run 'papio browser sessions')", prefix)
+	case len(matches) > 1:
+		// Ambiguity includes the holder: a prefix matching both the holder
+		// and a pending session must not report a silent no-op success.
+		return "", fmt.Errorf("browser session prefix %q is ambiguous (run 'papio browser sessions')", prefix)
+	case matches[0] == b.holder:
+		return b.holder.ID, nil // already the holder
 	}
-	b.promote(match, "claimed via papio browser use")
-	return nil
+	b.promote(matches[0], "claimed via papio browser use")
+	return b.holder.ID, nil
 }
 
 // promote makes session the holder. The caller holds b.mu. The previous
@@ -242,6 +256,7 @@ func (b *Bridge) promote(session *browserSession, reason string) {
 	delete(b.pending, session.ID)
 	session.needsAck = true
 	b.holder = session
+	b.epoch++
 	b.offered = map[string]bool{}
 	b.cancelSent = map[string]bool{}
 	b.takeovers++
@@ -292,13 +307,24 @@ func (b *Bridge) Sync(ctx context.Context, sessionID string, goodbye bool, frame
 	}
 
 	var out []json.RawMessage
-	if b.holder != nil && b.holder.ID == sessionID && b.holder.needsAck && !b.holder.Outdated {
-		ack, err := b.helloAck()
-		if err != nil {
-			return nil, err
-		}
+	if b.holder != nil && b.holder.ID == sessionID && b.holder.needsAck {
 		b.holder.needsAck = false
-		out = append(out, ack)
+		if b.holder.Outdated {
+			// A promoted session skipped the hello path where the outdated
+			// gate normally answers; staying silent would leave an
+			// incompatible extension holding the bridge unaware.
+			outdated, err := b.extensionOutdatedError()
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, outdated...)
+		} else {
+			ack, err := b.helloAck()
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, ack)
+		}
 	}
 	for _, raw := range frames {
 		msg, err := protocol.DecodeBrowserMessage(raw)
@@ -351,6 +377,7 @@ func (b *Bridge) release(sessionID string) {
 	if b.holder != nil && b.holder.ID == sessionID {
 		log.Printf("papio: browser session %s (v%s) disconnected", shortSession(sessionID), b.holder.ExtensionVersion)
 		b.holder = nil
+		b.epoch++
 	}
 }
 
@@ -382,22 +409,24 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 	if session == nil {
 		return b.helloRequired()
 	}
-	if session.Outdated {
-		return b.extensionOutdatedError()
-	}
 	if b.holder == nil || b.holder.ID != sessionID {
 		switch msg.Type {
 		case protocol.MsgPageAcquire, protocol.MsgTriageSnapshotRequest, protocol.MsgTriageCountsRequest,
 			protocol.MsgTriageDecide, protocol.MsgHumanActionResolve, protocol.MsgReviewPreviewRequest:
-			// Stateless request/response traffic works from any browser:
-			// "Acquire this page" and the inbox must not depend on who holds
-			// the handoff flow.
+			// Stateless request/response traffic works from any browser —
+			// even an outdated one; every frame is protocol-validated
+			// regardless of version. "Acquire this page" and the inbox must
+			// not depend on who holds the handoff flow.
 		default:
 			// Offer/handoff frames from a non-holder are refused: acting on
 			// them is exactly the silent session fight this arbitration
 			// exists to prevent.
 			return b.sessionBusy(msg.JobID)
 		}
+	} else if session.Outdated {
+		// The outdated gate is holder-only: it protects the offer/handoff
+		// flow, which is the only surface with version-coupled semantics.
+		return b.extensionOutdatedError()
 	}
 
 	switch msg.Type {
@@ -521,6 +550,9 @@ func (b *Bridge) handleHello(sessionID string, p *protocol.HelloPayload) ([]json
 			shortSession(sessionID), session.ExtensionVersion, shortSession(b.holder.ID))
 	}
 	delete(b.pending, sessionID)
+	if b.holder == nil || b.holder.ID != session.ID {
+		b.epoch++
+	}
 	b.holder = session
 	b.offered = map[string]bool{}
 	b.cancelSent = map[string]bool{}
@@ -1248,6 +1280,10 @@ func (b *Bridge) poll(ctx context.Context) ([]json.RawMessage, error) {
 		}
 	}
 	present := map[string]bool{}
+	// adoptOutsideSessionLock releases b.mu; a concurrent claim/takeover in
+	// that window must abort this poll — its offers would go to a demoted
+	// session and its bookkeeping would pollute the new holder's maps.
+	epoch := b.epoch
 	var out []json.RawMessage
 	for i := range awaiting {
 		row := awaiting[i]
@@ -1262,7 +1298,11 @@ func (b *Bridge) poll(ctx context.Context) ([]json.RawMessage, error) {
 		// adopts; zero or several (or an in-progress .crdownload) waits —
 		// ambiguity stays with the user, per the fail-closed rule.
 		if name, ok := b.scanAdoptionDir(ctx, row.ID); ok {
-			if err := b.adoptOutsideSessionLock(ctx, row.ID, name); err != nil {
+			err := b.adoptOutsideSessionLock(ctx, row.ID, name)
+			if b.epoch != epoch {
+				return out, nil
+			}
+			if err != nil {
 				if evErr := b.jobs.S.AppendEvent(ctx, row.ID, "browser.adoption_deferred",
 					map[string]any{"filename": name, "reason": truncate(err.Error(), 200)}); evErr != nil {
 					return nil, evErr

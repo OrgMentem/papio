@@ -279,19 +279,31 @@ func RunIntegration(ctx context.Context, deps IntegrationDependencies) Report {
 		if status.ExtensionVersion != "" {
 			detail += " (v" + status.ExtensionVersion + ")"
 		}
+		fix := ""
 		if status.PendingBrowserSessions > 0 {
 			detail += fmt.Sprintf("; %d other browser(s) waiting", status.PendingBrowserSessions)
-			add("extension", Pass, detail,
-				"run 'papio browser sessions' and 'papio browser use' to switch, or disable the papio extension in browsers you don't use")
-		} else {
-			add("extension", Pass, detail, "")
+			fix = "run 'papio browser sessions' and 'papio browser use' to switch, or disable the papio extension in browsers you don't use"
 		}
+		if status.BrowserSessionDenied > 0 {
+			// Denied hellos with no live pending session mean another browser
+			// competed earlier this daemon run (it may have been pruned).
+			detail += fmt.Sprintf("; %d hello(s) denied since daemon start", status.BrowserSessionDenied)
+			if fix == "" {
+				fix = "another browser competed for the papio session; run 'papio browser sessions' to inspect"
+			}
+		}
+		add("extension", Pass, detail, fix)
 	} else {
 		add("extension", Warn, "extension has not connected since daemon start", "install and enable the browser extension, then run papio init to install the native-host manifest")
 	}
 
 	runManifestChecks(cfg, deps, add)
 
+	if strings.TrimSpace(cfg.Zotio.Executable) == "" {
+		add("zotio", Skip, "not configured (optional — Zotero import disabled)", "")
+		runUpdateChecks(ctx, cfg, deps, nil, add)
+		return report
+	}
 	preflight, err := deps.ZotioPreflight(ctx, cfg)
 	if err != nil || preflight == nil {
 		detail := "zotio preflight returned no result"
@@ -345,6 +357,10 @@ func runPapioUpdateCheck(ctx context.Context, cfg config.Config, deps Integratio
 }
 
 func runZotioUpdateCheck(ctx context.Context, cfg config.Config, deps IntegrationDependencies, preflight *zotio.PreflightResult, add func(string, string, string, string)) {
+	if strings.TrimSpace(cfg.Zotio.Executable) == "" {
+		add("updates (zotio)", Skip, "skipped: zotio is not configured", "")
+		return
+	}
 	if preflight == nil || strings.TrimSpace(preflight.Version) == "" {
 		add("updates (zotio)", Skip, "skipped: zotio preflight failed", "")
 		return
