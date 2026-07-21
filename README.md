@@ -229,11 +229,15 @@ claude mcp add papio -- papio mcp
 
 ## Install
 
-**Homebrew (macOS / Linux):**
+**Homebrew (macOS):**
 
 ```bash
 brew install orgmentem/tap/papio
 ```
+
+**Linux (deb / rpm / apk):** download the package for your distro from the
+[GitHub releases](https://github.com/OrgMentem/papio/releases) and install it
+with `dpkg -i`, `rpm -i`, or `apk add --allow-untrusted`.
 
 **Scoop (Windows):**
 
