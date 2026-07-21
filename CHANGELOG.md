@@ -42,11 +42,11 @@ execution records in `notes/acquisition-stack-plan.md`.
   actions). The `job_offer` protocol message carries `requires_auth` for the
   extension.
 - **Open-access sibling fallback**: when a DOI's own record yields no legal
-  candidate, the OpenAlex resolver searches for open-access sibling versions
-  (preprints or repository copies under a different DOI) with strict
-  title/year/author matching and tries those before parking the job — a
-  paywalled paper with a free SSRN/arXiv copy no longer requires a manual
-  re-search.
+  candidate — or every candidate it did yield fails to fetch — the OpenAlex
+  resolver searches for open-access sibling versions (preprints or repository
+  copies under a different DOI) with strict title/year/author matching and
+  tries those before parking the job — a paywalled paper with a free
+  SSRN/arXiv copy no longer requires a manual re-search.
 - **Stale-SSO handoff recovery**: the daemon records `browser.handoff_offered`
   and `browser.handoff_failed` job events (new `handoff_outcome` protocol
   message), and institutional handoff guidance now says to sign in first and
