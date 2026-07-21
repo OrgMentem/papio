@@ -356,7 +356,7 @@ function render(): void {
   if (elements === null) return;
   const isDisconnected = !state.connected;
   elements.connection.textContent = isDisconnected
-    ? `Daemon unavailable: ${state.connectionMessage}. Run papio status for details.`
+    ? `Disconnected: ${state.connectionMessage}. Run papio status for details.`
     : state.connectionMessage;
   elements.connection.dataset.state = isDisconnected ? "disconnected" : "connected";
   elements.reconnect.hidden = !isDisconnected;

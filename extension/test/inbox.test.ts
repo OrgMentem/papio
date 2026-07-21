@@ -281,7 +281,7 @@ test("a daemon-down refresh leaves the page rendered, shows reconnect, and disab
   available = false;
   page.document.getElementById("refresh-inbox")?.dispatchEvent(new Event("click", { bubbles: true }));
   await settle();
-  expect(page.document.getElementById("connection-status")?.textContent).toContain("Daemon unavailable");
+  expect(page.document.getElementById("connection-status")?.textContent).toContain("Disconnected");
   expect(page.document.getElementById("reconnect-daemon")?.hidden).toBe(false);
   expect(page.document.querySelector<HTMLButtonElement>("[data-operation='acquire']")?.disabled).toBe(true);
   expect(page.document.querySelector("[data-triage-item-id='hit:one']")?.textContent).toContain("Still visible");

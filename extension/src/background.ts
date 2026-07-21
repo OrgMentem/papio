@@ -84,8 +84,9 @@ const HELLO_WAIT_TIMEOUT_MS = 5_000;
 const TRIAGE_SNAPSHOT_FEATURE = "triage_snapshot_v1";
 const TRIAGE_MUTATIONS_FEATURE = "triage_mutations_v1";
 const REVIEW_PREVIEW_FEATURE = "review_preview_v1";
-const INBOX_PAGE_PATH = "inbox.html";
-const POPUP_PAGE_PATH = "popup.html";
+// Fallback for a manifest without an action popup; both build targets ship
+// the pages under dist/ (see build.ts) and the manifest is the source of truth.
+const POPUP_PAGE_PATH = "dist/popup.html";
 
 /** Whether this adapter's SPA must render outside the minimized work window. */
 export function needsVisibleWindow(spec: AdapterSpec | undefined): boolean {
@@ -3243,10 +3244,14 @@ function realDeps(): BridgeDeps {
 // Wiring runs only inside a real extension service worker, never under bun test.
 if (typeof chrome !== "undefined" && chrome.runtime?.id) {
   const bridge = new Bridge(realDeps());
+  // The broker authorizes senders by exact page URL. Derive the popup path
+  // from the manifest and the inbox as its sibling so the authorized URLs
+  // can never drift from the shipped page layout again.
+  const declaredPopup = chrome.runtime.getManifest().action?.default_popup ?? POPUP_PAGE_PATH;
   const inboxRuntimeURLs: InboxRuntimeURLs = {
     runtimeID: chrome.runtime.id,
-    inboxURL: chrome.runtime.getURL(INBOX_PAGE_PATH),
-    popupURL: chrome.runtime.getURL(POPUP_PAGE_PATH),
+    inboxURL: chrome.runtime.getURL(declaredPopup.replace(/[^/]*$/, "inbox.html")),
+    popupURL: chrome.runtime.getURL(declaredPopup),
   };
   // Top-level registrations give Chrome a reason to start this worker at
   // browser launch and after install/update. Without them a cold-started
