@@ -54,7 +54,8 @@ func TestSystemWiresAndClosesPreviewServer(t *testing.T) {
 	if err := system.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := http.Get(capabilityURL); err == nil {
+	if after, err := http.Get(capabilityURL); err == nil {
+		_ = after.Body.Close()
 		t.Fatal("preview URL remained reachable after system close")
 	}
 }

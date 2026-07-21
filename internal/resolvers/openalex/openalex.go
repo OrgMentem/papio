@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -570,15 +569,6 @@ func firstAuthorRune(value string) (rune, bool) {
 
 func normalizeTitle(value string) string {
 	return strings.ToLower(strings.Join(strings.Fields(value), " "))
-}
-
-func isLoopbackHost(host string) bool {
-	host = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
-	if host == "localhost" {
-		return true
-	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
 }
 
 func identifierTail(raw string) string {

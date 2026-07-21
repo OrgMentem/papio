@@ -9,6 +9,7 @@ package hook
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"os"
 	"os/exec"
@@ -107,7 +108,8 @@ func runShell(ctx context.Context, command string, extra []string, timeout time.
 		result.Err, result.ExitCode = ctx.Err(), -1
 	default:
 		result.Err = err
-		if exit, ok := err.(*exec.ExitError); ok {
+		var exit *exec.ExitError
+		if errors.As(err, &exit) {
 			result.ExitCode = exit.ExitCode()
 		} else {
 			result.ExitCode = -1

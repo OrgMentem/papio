@@ -161,10 +161,6 @@ func appendFeatures(features []string, required ...string) []string {
 	return append(result, orderedRequired...)
 }
 
-func appendFeature(features []string, feature string) []string {
-	return appendFeatures(features, feature)
-}
-
 // SessionInfo returns a consistent snapshot of the holder hello-session.
 func (b *Bridge) SessionInfo() (extensionVersion string, adapterCount int, helloSeen bool) {
 	b.mu.Lock()

@@ -74,7 +74,7 @@ func (s *Server) Start(ctx context.Context) error {
 		return err
 	}
 	s.listener = listener
-	s.http = &http.Server{Handler: s}
+	s.http = &http.Server{Handler: s, ReadHeaderTimeout: 5 * time.Second}
 	go func(server *http.Server, l net.Listener) {
 		_ = server.Serve(l)
 	}(s.http, listener)

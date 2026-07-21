@@ -137,7 +137,7 @@ func TestSiblingHopSkippedWhenPrimaryCandidatesExist(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(adapter.hopRequests) != 0 {
-		t.Fatalf("sibling hop ran despite %d primary candidate(s)", len(adapter.fakeResolver.cands))
+		t.Fatalf("sibling hop ran despite %d primary candidate(s)", len(adapter.cands))
 	}
 }
 

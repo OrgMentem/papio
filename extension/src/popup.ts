@@ -478,5 +478,8 @@ if (typeof document !== "undefined" && typeof chrome !== "undefined") {
   wireSettings();
   wireInboxLauncher();
   wirePrimaryShortcut();
-  void refresh();
+  // The initial refresh must not float: a popup opened before storage is
+  // reachable (or a test importing this module) would otherwise surface an
+  // unhandled rejection. Later refreshes re-render; this one is best-effort.
+  refresh().catch((e) => console.debug("papio: initial popup refresh failed", e));
 }
