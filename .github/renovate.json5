@@ -23,6 +23,10 @@
   ],
   prConcurrentLimit: 10,
   rebaseWhen: "behind-base-branch",
+  // Renovate bumps go.mod via `go get` but does not tidy go.sum; ci.yml's `tidy`
+  // job fails on the resulting stale transitive entries. Run `go mod tidy` after
+  // each Go update so PRs land tidy.
+  postUpdateOptions: ["gomodTidy"],
   dependencyDashboardTitle: "Renovate · papio dependencies",
   packageRules: [
     {
