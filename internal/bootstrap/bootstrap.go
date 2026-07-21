@@ -18,6 +18,7 @@ import (
 	"papio/internal/daemon"
 	"papio/internal/discovery"
 	"papio/internal/doctor"
+	"papio/internal/enrich"
 	"papio/internal/fetch"
 	"papio/internal/job"
 	"papio/internal/notify"
@@ -169,6 +170,11 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 		service.Notifier = notify.NewCoalescer(watchNotifier)
 	}
 	service.Resolvers = entries
+	if cfg.SourcePolicy(config.SourceCrossrefMetadata).Enabled {
+		service.Enricher = enrich.NewWithOptions(enrich.Options{
+			Client: metadataClient, BaseURL: cfg.Sources[config.SourceCrossrefMetadata].BaseURLForDev,
+		})
+	}
 	service.Fetch = func(ctx context.Context, candidate resolver.Candidate, path string) (fetch.Result, error) {
 		return downloader.DownloadWithHeaders(ctx, candidate.URL, candidate.RequestHeaders, path)
 	}

@@ -29,14 +29,15 @@ const (
 
 // Source names used across config, budgets, and resolver registry.
 const (
-	SourceArXiv           = "arxiv"
-	SourceEuropePMC       = "europepmc"
-	SourceUnpaywall       = "unpaywall"
-	SourceOpenAlex        = "openalex"
-	SourceOpenAlexContent = "openalex_content"
-	SourceCORE            = "core"
-	SourceCrossrefTDM     = "crossref_tdm"
-	SourceSemanticScholar = "semanticscholar"
+	SourceArXiv            = "arxiv"
+	SourceEuropePMC        = "europepmc"
+	SourceUnpaywall        = "unpaywall"
+	SourceOpenAlex         = "openalex"
+	SourceOpenAlexContent  = "openalex_content"
+	SourceCORE             = "core"
+	SourceCrossrefTDM      = "crossref_tdm"
+	SourceCrossrefMetadata = "crossref_metadata"
+	SourceSemanticScholar  = "semanticscholar"
 )
 
 // Source is one resolver's policy knobs.
@@ -239,13 +240,14 @@ func Default() Config {
 		Zotio:   Zotio{Executable: "zotio", TimeoutSeconds: 120, AttachmentMode: "stored", AutoImport: false, AutoEnrich: true},
 		Notify:  Notify{Enabled: true},
 		Sources: map[string]Source{
-			SourceArXiv:           {Enabled: true, RatePerSec: 1, Burst: 1},
-			SourceEuropePMC:       {Enabled: true, RatePerSec: 2, Burst: 2},
-			SourceUnpaywall:       {Enabled: true, RatePerSec: 1, Burst: 1},
-			SourceOpenAlex:        {Enabled: false, RatePerSec: 2, Burst: 2},
-			SourceOpenAlexContent: {Enabled: false},
-			SourceCORE:            {Enabled: false, RatePerSec: 0.4, Burst: 1},
-			SourceCrossrefTDM:     {Enabled: false, RatePerSec: 1, Burst: 1},
+			SourceArXiv:            {Enabled: true, RatePerSec: 1, Burst: 1},
+			SourceEuropePMC:        {Enabled: true, RatePerSec: 2, Burst: 2},
+			SourceUnpaywall:        {Enabled: true, RatePerSec: 1, Burst: 1},
+			SourceOpenAlex:         {Enabled: false, RatePerSec: 2, Burst: 2},
+			SourceOpenAlexContent:  {Enabled: false},
+			SourceCORE:             {Enabled: false, RatePerSec: 0.4, Burst: 1},
+			SourceCrossrefTDM:      {Enabled: false, RatePerSec: 1, Burst: 1},
+			SourceCrossrefMetadata: {Enabled: true, RatePerSec: 1, Burst: 1},
 		},
 	}
 }

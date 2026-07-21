@@ -40,6 +40,12 @@ type AutoImporter interface {
 	PlanAndApply(context.Context, string) (status, parentKey, attachmentKey string, err error)
 }
 
+// MetadataEnricher adds corroborated identifiers to title-only work before
+// resolvers use those identifiers to find acquisition candidates.
+type MetadataEnricher interface {
+	Enrich(context.Context, work.Work) (work.Work, bool, error)
+}
+
 // classifiedAutoImportError is implemented by the bootstrap decorator. It
 // keeps Zotio-specific taxonomy out of the application service while allowing
 // durable events to retain safe, actionable failure detail.
@@ -70,6 +76,7 @@ type Service struct {
 	Artifacts    *artifact.Store
 	Budgets      *budget.Manager
 	Resolvers    []ResolverEntry
+	Enricher     MetadataEnricher
 	Fetch        FetchFunc
 	Validate     ValidateFunc
 	AutoImporter AutoImporter
@@ -270,6 +277,9 @@ func (s *Service) resolve(ctx context.Context, row *job.Row) (map[string]resolve
 	}
 	var all []resolver.Candidate
 	var retryAt time.Time
+	if err := s.enrich(ctx, row); err != nil {
+		return nil, time.Time{}, err
+	}
 	for _, entry := range s.Resolvers {
 		if entry.Adapter == nil {
 			continue
@@ -352,6 +362,61 @@ func (s *Service) resolve(ctx context.Context, row *job.Row) (map[string]resolve
 		return nil, retryAt, err
 	}
 	return live, retryAt, nil
+}
+
+func (s *Service) enrich(ctx context.Context, row *job.Row) error {
+	if s.Enricher == nil || row.Work.DOI != "" || strings.TrimSpace(row.Work.Title) == "" {
+		return nil
+	}
+	name := config.SourceCrossrefMetadata
+	policy := s.Config.SourcePolicy(name)
+	if !policy.Enabled || !row.Policy.SourceAllowed(name) {
+		return nil
+	}
+	attempt, err := s.Jobs.StartAttempt(ctx, row.ID, 0, "resolve", name)
+	if err != nil {
+		return err
+	}
+	if s.Budgets != nil {
+		if err := s.Budgets.Acquire(ctx, name, policy, 0); err != nil {
+			_ = s.Jobs.FinishAttempt(ctx, attempt, "budget_blocked", 0, safeType(err))
+			var exceeded *budget.ErrExceeded
+			if errors.As(err, &exceeded) {
+				return nil
+			}
+			return err
+		}
+	}
+	enriched, matched, err := s.Enricher.Enrich(ctx, row.Work)
+	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if delay, temporary := resolver.Temporary(err); temporary {
+			if s.Budgets != nil {
+				_ = s.Budgets.Defer(ctx, name, earlierRetry(time.Time{}, s.Now(), delay, s.RetryDelay))
+			}
+			_ = s.Jobs.FinishAttempt(ctx, attempt, "retryable", 0, safeType(err))
+		} else {
+			_ = s.Jobs.FinishAttempt(ctx, attempt, "failed", 0, safeType(err))
+		}
+		return nil
+	}
+	if !matched {
+		_ = s.Jobs.FinishAttempt(ctx, attempt, "success", 0, "no_confident_match")
+		return nil
+	}
+	if conflicts(row.Work, enriched) {
+		_ = s.Jobs.FinishAttempt(ctx, attempt, "success", 0, "metadata_conflict_rejected")
+		return nil
+	}
+	updated, err := s.Jobs.FillWorkMetadata(ctx, row.ID, enriched)
+	if err != nil {
+		return err
+	}
+	row.Work = updated.Work
+	_ = s.Jobs.FinishAttempt(ctx, attempt, "success", 0, "metadata_enriched")
+	return nil
 }
 
 func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[string]resolver.Candidate, retryAt time.Time) error {

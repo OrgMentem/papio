@@ -66,6 +66,20 @@ func TestLoadRejectsUnknownFields(t *testing.T) {
 	}
 }
 
+func TestLoadRetainsDefaultCrossrefMetadataPolicyWhenSourceIsAbsent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(path, []byte("access_mode='conservative'\n[sources.unpaywall]\nenabled=true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.SourcePolicy(SourceCrossrefMetadata); got != (Source{Enabled: true, RatePerSec: 1, Burst: 1}) {
+		t.Fatalf("crossref metadata policy = %+v", got)
+	}
+}
+
 func TestLoadExplainsUnknownBrowserField(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.toml")
 	if err := os.WriteFile(path, []byte("access_mode='conservative'\n[browser]\nbogus_option=true\n"), 0o600); err != nil {

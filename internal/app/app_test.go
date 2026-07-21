@@ -29,16 +29,30 @@ import (
 )
 
 type fakeResolver struct {
-	name  string
-	cands []resolver.Candidate
-	err   error
-	calls int
+	name      string
+	cands     []resolver.Candidate
+	err       error
+	calls     int
+	requested []work.Work
 }
 
 func (f *fakeResolver) Name() string { return f.name }
-func (f *fakeResolver) Resolve(context.Context, work.Work) ([]resolver.Candidate, error) {
+func (f *fakeResolver) Resolve(_ context.Context, requested work.Work) ([]resolver.Candidate, error) {
 	f.calls++
+	f.requested = append(f.requested, requested)
 	return append([]resolver.Candidate(nil), f.cands...), f.err
+}
+
+type fakeEnricher struct {
+	result  work.Work
+	matched bool
+	err     error
+	calls   int
+}
+
+func (f *fakeEnricher) Enrich(context.Context, work.Work) (work.Work, bool, error) {
+	f.calls++
+	return f.result, f.matched, f.err
 }
 
 func newTestService(t *testing.T) (*Service, *job.Store) {
@@ -64,6 +78,73 @@ func newTestService(t *testing.T) (*Service, *job.Store) {
 	cfg.Sources["fixture"] = config.Source{Enabled: true}
 	svc := New(cfg, &job.Store{S: db}, artifacts, nil)
 	return svc, svc.Jobs
+}
+
+func TestResolveEnrichesTitleOnlyWorkBeforeResolvers(t *testing.T) {
+	svc, jobs := newTestService(t)
+	enricher := &fakeEnricher{result: work.Work{
+		DOI: "10.1234/crossref", Title: "Exact Title", Authors: []string{"Jane Smith"}, Year: 2024,
+	}, matched: true}
+	adapter := &fakeResolver{name: "fixture"}
+	svc.Enricher = enricher
+	svc.Resolvers = []ResolverEntry{{Adapter: adapter, Policy: config.Source{Enabled: true}}}
+
+	id, err := svc.Submit(context.Background(), protocol.WorkRequest{
+		SchemaVersion: protocol.WorkRequestSchemaVersion, RequestID: "wr_enrich_0001",
+		Title: "Exact Title", Authors: []string{"Jane Smith"}, Year: 2024,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, err := jobs.Get(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := svc.resolve(context.Background(), row); err != nil {
+		t.Fatal(err)
+	}
+	persisted, err := jobs.Get(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if enricher.calls != 1 || adapter.calls != 1 {
+		t.Fatalf("enricher/resolver calls = %d/%d, want 1/1", enricher.calls, adapter.calls)
+	}
+	if persisted.Work.DOI != "10.1234/crossref" {
+		t.Fatalf("persisted DOI = %q", persisted.Work.DOI)
+	}
+	if len(adapter.requested) != 1 || adapter.requested[0].DOI != persisted.Work.DOI {
+		t.Fatalf("resolver received %+v, want enriched DOI", adapter.requested)
+	}
+}
+
+func TestResolveContinuesAfterTemporaryEnrichmentFailure(t *testing.T) {
+	svc, jobs := newTestService(t)
+	enricher := &fakeEnricher{err: &resolver.TemporaryError{Err: errors.New("rate limited")}}
+	adapter := &fakeResolver{name: "fixture"}
+	svc.Enricher = enricher
+	svc.Resolvers = []ResolverEntry{{Adapter: adapter, Policy: config.Source{Enabled: true}}}
+
+	id, err := svc.Submit(context.Background(), protocol.WorkRequest{
+		SchemaVersion: protocol.WorkRequestSchemaVersion, RequestID: "wr_enrich_0002",
+		Title: "Exact Title", Authors: []string{"Jane Smith"}, Year: 2024,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, err := jobs.Get(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, retryAt, err := svc.resolve(context.Background(), row); err != nil || !retryAt.IsZero() {
+		t.Fatalf("resolve = retry %v, error %v", retryAt, err)
+	}
+	if enricher.calls != 1 || adapter.calls != 1 {
+		t.Fatalf("enricher/resolver calls = %d/%d, want 1/1", enricher.calls, adapter.calls)
+	}
+	if len(adapter.requested) != 1 || adapter.requested[0].DOI != "" {
+		t.Fatalf("resolver received %+v, want original title-only work", adapter.requested)
+	}
 }
 
 func doiRequest(id string) protocol.WorkRequest {

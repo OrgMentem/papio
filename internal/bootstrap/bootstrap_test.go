@@ -48,7 +48,7 @@ func TestNewWiresResolverOrderAndCoreServices(t *testing.T) {
 	if !reflect.DeepEqual(names, want) {
 		t.Fatalf("resolver order = %v, want %v", names, want)
 	}
-	if system.App.Fetch == nil || system.App.Validate == nil || system.Scheduler == nil || system.Bundle == nil {
+	if system.App.Fetch == nil || system.App.Validate == nil || system.App.Enricher == nil || system.Scheduler == nil || system.Bundle == nil {
 		t.Fatal("bootstrap left a core service unwired")
 	}
 	if system.Zotio.AutoEnrich {
