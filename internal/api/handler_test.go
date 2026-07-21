@@ -466,6 +466,35 @@ func TestRouterBrowserSyncHandshakeAndInvalidFrame(t *testing.T) {
 	}
 }
 
+func TestRouterBrowserSessionsAndClaim(t *testing.T) {
+	system := testSystem(t)
+	router := Router(system)
+
+	hello := json.RawMessage(`{"protocol":"papio-browser/1","type":"hello","msg_id":"client-hello-2","seq":0,"payload":{"extension_version":"1.2.3"}}`)
+	if rpcErr := callMethod(t, router, "browser.sync",
+		map[string]any{"session_id": "aaaabbbbccccddddeeeeffff00001111", "messages": []json.RawMessage{hello}}, nil); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	var result struct {
+		Sessions []struct {
+			ID               string `json:"id"`
+			ExtensionVersion string `json:"extension_version"`
+			Holder           bool   `json:"holder"`
+		} `json:"sessions"`
+		DeniedHellos int `json:"denied_hellos"`
+	}
+	if rpcErr := callMethod(t, router, "browser.sessions", struct{}{}, &result); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	if len(result.Sessions) != 1 || !result.Sessions[0].Holder || result.Sessions[0].ExtensionVersion != "1.2.3" {
+		t.Fatalf("sessions = %+v", result)
+	}
+	rpcErr := callMethod(t, router, "browser.claim", map[string]string{"session_id": "nonexistent"}, nil)
+	if rpcErr == nil || rpcErr.Code != "invalid_argument" {
+		t.Fatalf("claim unknown session = %+v, want invalid_argument", rpcErr)
+	}
+}
+
 func TestRouterResolveIdentityReviewAction(t *testing.T) {
 	system := testSystem(t)
 	ctx := context.Background()

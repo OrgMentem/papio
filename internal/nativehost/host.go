@@ -118,8 +118,26 @@ func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		return fmt.Errorf("ensure daemon: %w", err)
 	}
 
-	syncer := &ipcSyncer{client: ipc.NewSocketClient(socket)}
-	return newBridge(syncer, stdin, stdout, stderr).run(ctx)
+	syncer := &ipcSyncer{client: ipc.NewSocketClient(socket), sessionID: newSessionID()}
+	runErr := newBridge(syncer, stdin, stdout, stderr).run(ctx)
+	// Best-effort goodbye so the daemon releases this browser's session
+	// immediately instead of waiting out the staleness window. The relay ctx
+	// may already be cancelled (browser closed the port), so use a fresh one.
+	goodbyeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+	defer cancel()
+	_ = syncer.goodbye(goodbyeCtx)
+	return runErr
+}
+
+// newSessionID mints the per-native-host-process browser session identity the
+// daemon arbitrates on. Identity must never abort the host: an entropy
+// failure falls back to a process-unique string.
+func newSessionID() string {
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return fmt.Sprintf("fallback-%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(raw[:])
 }
 
 // validateOrigin accepts only configured browser invocation identities. A
@@ -150,15 +168,18 @@ func validateOrigin(args []string, chromeIDs []string, firefoxID string) error {
 }
 
 // ipcSyncer forwards frames to the daemon's browser.sync RPC. Each call opens a
-// fresh one-shot connection (ipc.Client semantics); the daemon correlates the
-// bridge session server-side.
+// fresh one-shot connection (ipc.Client semantics); session_id lets the daemon
+// arbitrate between concurrently connected browsers.
 type ipcSyncer struct {
-	client *ipc.Client
+	client    *ipc.Client
+	sessionID string
 }
 
 // syncRequest is the browser.sync request body.
 type syncRequest struct {
-	Messages []json.RawMessage `json:"messages"`
+	SessionID string            `json:"session_id,omitempty"`
+	Goodbye   bool              `json:"goodbye,omitempty"`
+	Messages  []json.RawMessage `json:"messages"`
 }
 
 // syncResponse is the browser.sync response body.
@@ -166,15 +187,26 @@ type syncResponse struct {
 	Outbound []json.RawMessage `json:"outbound"`
 }
 
-func (s *ipcSyncer) Sync(ctx context.Context, messages []json.RawMessage) ([]json.RawMessage, error) {
+// request builds the browser.sync body for this session.
+func (s *ipcSyncer) request(goodbye bool, messages []json.RawMessage) syncRequest {
 	if messages == nil {
 		messages = []json.RawMessage{}
 	}
+	return syncRequest{SessionID: s.sessionID, Goodbye: goodbye, Messages: messages}
+}
+
+func (s *ipcSyncer) Sync(ctx context.Context, messages []json.RawMessage) ([]json.RawMessage, error) {
 	var resp syncResponse
-	if err := s.client.Call(ctx, job.NewID("rpc"), syncMethod, syncRequest{Messages: messages}, &resp); err != nil {
+	if err := s.client.Call(ctx, job.NewID("rpc"), syncMethod, s.request(false, messages), &resp); err != nil {
 		return nil, err
 	}
 	return resp.Outbound, nil
+}
+
+// goodbye tells the daemon this browser session is gone. Fire-and-forget.
+func (s *ipcSyncer) goodbye(ctx context.Context) error {
+	var resp syncResponse
+	return s.client.Call(ctx, job.NewID("rpc"), syncMethod, s.request(true, nil), &resp)
 }
 
 // bridge is the stateful per-connection relay. lastSeq and seenHello enforce

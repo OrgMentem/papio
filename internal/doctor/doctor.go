@@ -194,10 +194,12 @@ func DefaultWorkerPath() string {
 
 // DaemonStatus is the daemon information returned by the ping status RPC.
 type DaemonStatus struct {
-	Status             string `json:"status"`
-	Version            string `json:"version"`
-	ExtensionConnected bool   `json:"extension_connected"`
-	ExtensionVersion   string `json:"extension_version"`
+	Status                 string `json:"status"`
+	Version                string `json:"version"`
+	ExtensionConnected     bool   `json:"extension_connected"`
+	ExtensionVersion       string `json:"extension_version"`
+	PendingBrowserSessions int    `json:"pending_browser_sessions"`
+	BrowserSessionDenied   int    `json:"browser_session_denied"`
 }
 
 // IntegrationDependencies supplies the local integration checks. The functions
@@ -277,7 +279,13 @@ func RunIntegration(ctx context.Context, deps IntegrationDependencies) Report {
 		if status.ExtensionVersion != "" {
 			detail += " (v" + status.ExtensionVersion + ")"
 		}
-		add("extension", Pass, detail, "")
+		if status.PendingBrowserSessions > 0 {
+			detail += fmt.Sprintf("; %d other browser(s) waiting", status.PendingBrowserSessions)
+			add("extension", Pass, detail,
+				"run 'papio browser sessions' and 'papio browser use' to switch, or disable the papio extension in browsers you don't use")
+		} else {
+			add("extension", Pass, detail, "")
+		}
 	} else {
 		add("extension", Warn, "extension has not connected since daemon start", "install and enable the browser extension, then run papio init to install the native-host manifest")
 	}

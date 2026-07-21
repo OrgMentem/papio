@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -324,5 +325,36 @@ func TestResolveExecutableRejectsNativeHostTarget(t *testing.T) {
 	}
 	if _, err := resolveExecutablePath(hostExe); err == nil {
 		t.Fatal("resolveExecutablePath accepted a native-host basename, want error")
+	}
+}
+
+// The IPC envelope must carry a stable per-process session identity so the
+// daemon can arbitrate between concurrently connected browsers, and the
+// goodbye flag so a cleanly departing browser releases its session at once.
+func TestSyncRequestCarriesSessionIdentityAndGoodbye(t *testing.T) {
+	id := newSessionID()
+	if len(id) != 32 {
+		t.Fatalf("session id = %q, want 32 hex chars", id)
+	}
+	if other := newSessionID(); other == id {
+		t.Fatal("session ids must be unique per process start")
+	}
+	syncer := &ipcSyncer{sessionID: id}
+
+	normal := syncer.request(false, nil)
+	if normal.SessionID != id || normal.Goodbye || normal.Messages == nil || len(normal.Messages) != 0 {
+		t.Fatalf("normal request = %+v", normal)
+	}
+	encoded, err := json.Marshal(normal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(encoded), `"session_id":"`+id+`"`) || strings.Contains(string(encoded), `"goodbye"`) {
+		t.Fatalf("normal request JSON = %s", encoded)
+	}
+
+	goodbye := syncer.request(true, nil)
+	if !goodbye.Goodbye || goodbye.SessionID != id {
+		t.Fatalf("goodbye request = %+v", goodbye)
 	}
 }

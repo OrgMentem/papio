@@ -84,6 +84,7 @@ func newRoot(opt *options) *cobra.Command {
 		newJobsCommand(opt),
 		newStatusCommand(opt),
 		newActionsCommand(opt),
+		newBrowserCommand(opt),
 		newInboxCommand(opt),
 		newArtifactsCommand(opt),
 		newBundleCommand(opt),

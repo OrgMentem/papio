@@ -154,6 +154,12 @@ func RouterWithShutdown(system *bootstrap.System, shutdown context.CancelFunc) i
 		"browser.sync": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return browserSync(ctx, raw, system)
 		},
+		"browser.sessions": func(_ context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return browserSessions(raw, system)
+		},
+		"browser.claim": func(_ context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return browserClaim(raw, system)
+		},
 	}
 	if shutdown != nil {
 		methods["daemon.shutdown"] = func(_ context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
@@ -194,14 +200,16 @@ func InProcessCaller(system *bootstrap.System) func(context.Context, string, any
 }
 
 type statusResult struct {
-	Status               string `json:"status"`
-	Version              string `json:"version"`
-	ExtensionConnected   bool   `json:"extension_connected"`
-	ExtensionVersion     string `json:"extension_version,omitempty"`
-	UpdateAvailable      *bool  `json:"update_available,omitempty"`
-	LatestVersion        string `json:"latest_version,omitempty"`
-	ZotioUpdateAvailable *bool  `json:"zotio_update_available,omitempty"`
-	ZotioLatestVersion   string `json:"zotio_latest_version,omitempty"`
+	Status                 string `json:"status"`
+	Version                string `json:"version"`
+	ExtensionConnected     bool   `json:"extension_connected"`
+	ExtensionVersion       string `json:"extension_version,omitempty"`
+	PendingBrowserSessions int    `json:"pending_browser_sessions,omitempty"`
+	BrowserSessionDenied   int    `json:"browser_session_denied,omitempty"`
+	UpdateAvailable        *bool  `json:"update_available,omitempty"`
+	LatestVersion          string `json:"latest_version,omitempty"`
+	ZotioUpdateAvailable   *bool  `json:"zotio_update_available,omitempty"`
+	ZotioLatestVersion     string `json:"zotio_latest_version,omitempty"`
 }
 
 func ping(ctx context.Context, raw json.RawMessage, system *bootstrap.System, updateRefreshInFlight *atomic.Bool) ([]byte, *ipc.RPCError) {
@@ -212,6 +220,13 @@ func ping(ctx context.Context, raw json.RawMessage, system *bootstrap.System, up
 	result := statusResult{Status: "ok", Version: Version}
 	if system != nil && system.Browser != nil {
 		result.ExtensionVersion, _, result.ExtensionConnected = system.Browser.SessionInfo()
+		sessions, denied, _ := system.Browser.Sessions()
+		for _, session := range sessions {
+			if !session.Holder {
+				result.PendingBrowserSessions++
+			}
+		}
+		result.BrowserSessionDenied = denied
 	}
 	if system != nil && system.Updates != nil {
 		refresh := updateRefreshInFlight.CompareAndSwap(false, true)
@@ -645,12 +660,14 @@ func zotioApply(ctx context.Context, raw json.RawMessage, system *bootstrap.Syst
 
 func browserSync(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
 	var params struct {
-		Messages []json.RawMessage `json:"messages,omitempty"`
+		SessionID string            `json:"session_id,omitempty"`
+		Goodbye   bool              `json:"goodbye,omitempty"`
+		Messages  []json.RawMessage `json:"messages,omitempty"`
 	}
 	if err := ipc.DecodeParams(raw, &params); err != nil {
 		return badParams(err)
 	}
-	outbound, err := system.Browser.Sync(ctx, params.Messages)
+	outbound, err := system.Browser.Sync(ctx, params.SessionID, params.Goodbye, params.Messages)
 	if err != nil {
 		if errors.Is(err, browser.ErrInvalidFrame) {
 			// A fail-closed protocol violation is a client error.
@@ -662,6 +679,36 @@ func browserSync(ctx context.Context, raw json.RawMessage, system *bootstrap.Sys
 		outbound = []json.RawMessage{}
 	}
 	return marshal(map[string]any{"outbound": outbound})
+}
+
+// browserSessions lists connected browser sessions and arbitration counters.
+func browserSessions(raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
+	var params struct{}
+	if err := ipc.DecodeParams(raw, &params); err != nil {
+		return badParams(err)
+	}
+	sessions, denied, takeovers := system.Browser.Sessions()
+	if sessions == nil {
+		sessions = []browser.SessionSummary{}
+	}
+	return marshal(map[string]any{"sessions": sessions, "denied_hellos": denied, "takeovers": takeovers})
+}
+
+// browserClaim promotes a pending browser session to holder.
+func browserClaim(raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
+	var params struct {
+		SessionID string `json:"session_id"`
+	}
+	if err := ipc.DecodeParams(raw, &params); err != nil {
+		return badParams(err)
+	}
+	if strings.TrimSpace(params.SessionID) == "" {
+		return badParams(errors.New("session_id is required"))
+	}
+	if err := system.Browser.Claim(params.SessionID); err != nil {
+		return nil, &ipc.RPCError{Code: "invalid_argument", Message: safeMessage(err, "unknown browser session")}
+	}
+	return marshal(map[string]any{"claimed": true, "session_id": params.SessionID})
 }
 
 // searchDiscovery maps strict RPC input to the bounded OpenAlex client.
