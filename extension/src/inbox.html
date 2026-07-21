@@ -500,11 +500,22 @@
         padding: var(--space-1) var(--space-2);
       }
 
+      /* Success/guidance text stays the calm primary tone; a daemon-rejected
+         change reads as a real error; a connectivity blip reads as transient
+         (it clears itself once the auto-reconnect above succeeds). */
       .item-result {
         color: var(--color-primary);
         font-size: var(--font-size-small);
         font-weight: 600;
         grid-column: 1;
+      }
+
+      .item-result[data-tone="error"] {
+        color: var(--color-danger);
+      }
+
+      .item-result[data-tone="offline"] {
+        color: var(--color-warning);
       }
 
       #item-list > p {

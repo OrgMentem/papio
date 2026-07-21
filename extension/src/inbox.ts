@@ -36,7 +36,7 @@ interface PageState {
   selectedID: string | null;
   pending: Set<string>;
   previewed: Set<string>;
-  itemMessages: Map<string, string>;
+  itemMessages: Map<string, { text: string; tone: "info" | "error" | "offline" }>;
   confirmation: Confirmation | null;
   focusSelectionAfterRender: boolean;
   loading: boolean;
@@ -84,9 +84,55 @@ async function runtimeMessage(type: string, request: Record<string, unknown>): P
   return chrome.runtime.sendMessage({ type, request });
 }
 
+// A disconnect is usually the daemon's own port healing (extension reload,
+// SW nap, brief restart) — the background worker already reconnects with its
+// own backoff. Mirror that here so the banner clears itself instead of
+// leaving the user staring at a stale error until they click Reconnect.
+let reconnectToken = 0;
+let reconnectScheduled = false;
+let reconnectAttempts = 0;
+const RECONNECT_DELAYS_MS = [1000, 2000, 4000, 8000, 15000];
+
+function cancelAutoReconnect(): void {
+  reconnectToken += 1;
+  reconnectScheduled = false;
+  reconnectAttempts = 0;
+}
+
+function scheduleAutoReconnect(): void {
+  if (reconnectScheduled) return;
+  reconnectScheduled = true;
+  const delay = RECONNECT_DELAYS_MS[Math.min(reconnectAttempts, RECONNECT_DELAYS_MS.length - 1)];
+  reconnectAttempts += 1;
+  const token = reconnectToken;
+  setTimeout(() => {
+    reconnectScheduled = false;
+    if (token !== reconnectToken) return;
+    void refreshInbox();
+  }, delay);
+}
+
+// Errors caused by connectivity loss (tone "offline") describe a condition
+// that resolves itself once reconnected; a stale "daemon disconnected"
+// message left on a row after the daemon is back would be misleading.
+// Errors from the daemon actually rejecting the request (tone "error")
+// persist until the item changes.
+function clearOfflineItemMessages(): void {
+  for (const [id, entry] of state.itemMessages) {
+    if (entry.tone === "offline") state.itemMessages.delete(id);
+  }
+}
+
 function setConnection(connected: boolean, message: string): void {
+  const wasConnected = state.connected;
   state.connected = connected;
   state.connectionMessage = message;
+  if (connected) {
+    cancelAutoReconnect();
+    if (!wasConnected) clearOfflineItemMessages();
+  } else {
+    scheduleAutoReconnect();
+  }
 }
 
 function itemForID(id: string): TriageSnapshotItem | null {
@@ -187,9 +233,9 @@ function element<K extends keyof HTMLElementTagNameMap>(tag: K, text?: string): 
   return created;
 }
 
-function operationMessage(itemID: string, message: string): void {
-  state.itemMessages.set(itemID, message);
-  if (elements !== null) elements.operationStatus.textContent = message;
+function operationMessage(itemID: string, text: string, tone: "info" | "error" | "offline" = "info"): void {
+  state.itemMessages.set(itemID, { text, tone });
+  if (elements !== null) elements.operationStatus.textContent = text;
 }
 
 function announce(message: string): void {
@@ -297,10 +343,11 @@ function renderItem(item: TriageSnapshotItem): HTMLElement {
   for (const operation of item.ops) controls.append(operationButton(item, operation));
   if (controls.childElementCount > 0) card.append(controls);
 
-  const message = state.itemMessages.get(item.id);
-  if (message !== undefined) {
-    const result = element("p", message);
+  const entry = state.itemMessages.get(item.id);
+  if (entry !== undefined) {
+    const result = element("p", entry.text);
     result.className = "item-result";
+    result.dataset.tone = entry.tone;
     result.setAttribute("role", "status");
     card.append(result);
   }
@@ -356,7 +403,7 @@ function render(): void {
   if (elements === null) return;
   const isDisconnected = !state.connected;
   elements.connection.textContent = isDisconnected
-    ? `Disconnected: ${state.connectionMessage}. Run papio status for details.`
+    ? `Disconnected: ${state.connectionMessage} Reconnecting automatically — run papio status if this persists.`
     : state.connectionMessage;
   elements.connection.dataset.state = isDisconnected ? "disconnected" : "connected";
   elements.reconnect.hidden = !isDisconnected;
@@ -486,7 +533,7 @@ function requestRefresh(): void {
 
 function beginMutation(item: TriageSnapshotItem): boolean {
   if (!state.connected) {
-    operationMessage(item.id, "Daemon unavailable. Reconnect before changing this item.");
+    operationMessage(item.id, "Daemon unavailable — reconnecting automatically.", "offline");
     render();
     return false;
   }
@@ -501,7 +548,7 @@ async function finishMutation(item: TriageSnapshotItem, response: unknown): Prom
   state.pending.delete(item.id);
   if (!result.ok) {
     setConnection(false, result.message);
-    operationMessage(item.id, result.message);
+    operationMessage(item.id, result.message, "offline");
     render();
     return;
   }
@@ -513,12 +560,12 @@ async function finishMutation(item: TriageSnapshotItem, response: unknown): Prom
       render();
       return;
     case "conflict":
-      operationMessage(item.id, "changed elsewhere — refreshed");
+      operationMessage(item.id, "changed elsewhere — refreshed", "info");
       render();
       await refreshInbox();
       return;
     case "error":
-      operationMessage(item.id, result.detail ?? "The daemon could not apply this change.");
+      operationMessage(item.id, result.detail ?? "The daemon could not apply this change.", "error");
       render();
       return;
   }
@@ -548,12 +595,12 @@ function closeDialog(restoreFocus: boolean): void {
 
 function requestConfirmation(item: TriageSnapshotItem, verdict: Verdict): void {
   if (item.kind !== "human_action" || typeof item.action_id !== "number" || typeof item.revision !== "number") {
-    operationMessage(item.id, "This action is missing its revision and cannot be changed.");
+    operationMessage(item.id, "This action is missing its revision and cannot be changed.", "error");
     render();
     return;
   }
   if (verdict === "accept" && item.action_kind === "verify_identity" && !hasViewedPreview(item)) {
-    operationMessage(item.id, "View the PDF before accepting it.");
+    operationMessage(item.id, "View the PDF before accepting it.", "info");
     render();
     return;
   }
@@ -580,13 +627,13 @@ async function resolveConfirmation(): Promise<void> {
     return;
   }
   if (confirmation.verdict === "accept" && item.action_kind === "verify_identity" && !hasViewedPreview(item)) {
-    operationMessage(item.id, "View the PDF before accepting it.");
+    operationMessage(item.id, "View the PDF before accepting it.", "info");
     closeDialog(true);
     render();
     return;
   }
   if (confirmation.verdict === "accept" && (typeof item.sha256 !== "string" || item.sha256.length === 0)) {
-    operationMessage(item.id, "This PDF is missing its snapshot hash and cannot be accepted.");
+    operationMessage(item.id, "This PDF is missing its snapshot hash and cannot be accepted.", "error");
     closeDialog(true);
     render();
     return;
@@ -617,32 +664,32 @@ async function requestPreview(item: TriageSnapshotItem): Promise<void> {
     state.pending.delete(item.id);
     if (!result.ok) {
       setConnection(false, result.message);
-      operationMessage(item.id, result.message);
+      operationMessage(item.id, result.message, "offline");
       render();
       return;
     }
     const url = safePreviewURL(result.value.url);
     if (url === null || result.value.sha256 !== item.sha256) {
-      operationMessage(item.id, "Preview did not match this snapshot — refreshed.");
+      operationMessage(item.id, "Preview did not match this snapshot — refreshed.", "info");
       render();
       await refreshInbox();
       return;
     }
     const token = previewToken(item);
     if (token === null) {
-      operationMessage(item.id, "This PDF is missing a verifiable snapshot hash.");
+      operationMessage(item.id, "This PDF is missing a verifiable snapshot hash.", "error");
       render();
       return;
     }
     state.previewed.add(token);
     openNewTab(url);
-    operationMessage(item.id, "PDF opened. Accept is now available.");
+    operationMessage(item.id, "PDF opened. Accept is now available.", "info");
     render();
   } catch (error) {
     state.pending.delete(item.id);
     const message = error instanceof Error ? error.message : "The daemon is unavailable.";
     setConnection(false, message);
-    operationMessage(item.id, message);
+    operationMessage(item.id, message, "offline");
     render();
   }
 }
@@ -660,7 +707,7 @@ function activateOperation(item: TriageSnapshotItem, operation: TriageOperation)
     case "open": {
       const url = firstSafeLink(item);
       if (url === null) {
-        operationMessage(item.id, "This item has no safe link to open.");
+        operationMessage(item.id, "This item has no safe link to open.", "error");
         render();
       } else {
         openNewTab(url);
@@ -669,7 +716,7 @@ function activateOperation(item: TriageSnapshotItem, operation: TriageOperation)
       return;
     }
     case "retry":
-      operationMessage(item.id, "Retry is not available from this inbox version.");
+      operationMessage(item.id, "Retry is not available from this inbox version.", "error");
       render();
       return;
   }
