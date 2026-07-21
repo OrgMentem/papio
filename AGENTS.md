@@ -37,6 +37,16 @@ The extension has **zero runtime deps** — both bundles are plain browser JS. `
   parse. Deploy order: build binary → `mv` into place → `papio daemon stop` → next command
   autostarts the new daemon. There is no `daemon restart`; `daemon status`/`stop` don't
   autostart, other commands do.
+- **This machine has TWO papio binaries** and both must be updated on deploy:
+  `/opt/homebrew/bin/papio` (CLI/daemon on PATH) and `~/.local/bin/papio` (target of
+  the native-messaging symlink `~/.config/papio/bin/papio-native-host`). Updating only
+  the first leaves browsers spawning the OLD native host (daemon shows a `legacy`
+  browser session). After replacing it, kill the running `papio-native-host` process;
+  Chrome respawns it from the new binary within seconds.
+- **Never `cp` over an existing papio binary on macOS** — overwriting the inode of a
+  previously-executed signed binary poisons the kernel's signature cache and the next
+  exec dies with SIGKILL (exit 137). Use `mv` or `rm` first so the copy gets a fresh
+  inode.
 - **A new store migration bumps `user_version`, and three tests hardcode the number**:
   `internal/cli/clean_install_test.go` ("schema version N", twice),
   `internal/doctor/doctor_test.go`, `internal/store/migrate_forward_test.go`.
