@@ -19,7 +19,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
-	"gopkg.in/yaml.v2"
+	"gopkg.in/yaml.v3"
 
 	"papio/internal/cli"
 )
@@ -256,54 +256,40 @@ func readLLMSNav(path string) ([]llmsNavPage, error) {
 		return nil, err
 	}
 	var config struct {
-		Nav []yaml.MapSlice `yaml:"nav"`
+		Nav yaml.Node `yaml:"nav"`
 	}
 	if err := yaml.Unmarshal(raw, &config); err != nil {
 		return nil, err
 	}
 
 	var pages []llmsNavPage
-	for _, entry := range config.Nav {
-		for _, item := range entry {
-			section, ok := item.Key.(string)
-			if !ok {
-				return nil, fmt.Errorf("invalid nav section %v", item.Key)
-			}
-			if page, ok := item.Value.(string); ok {
+	// nav is a sequence of single-key mappings ("Section: page.md" or
+	// "Section:\n  - Title: page.md"); yaml.Node preserves declaration order so
+	// the generated index stays deterministic.
+	for _, entry := range config.Nav.Content {
+		for i := 0; i+1 < len(entry.Content); i += 2 {
+			keyNode, valNode := entry.Content[i], entry.Content[i+1]
+			section := keyNode.Value
+			switch valNode.Kind {
+			case yaml.ScalarNode:
+				page := valNode.Value
 				pages = append(pages, llmsNavPage{rel: strings.TrimSuffix(page, ".md"), section: llmsSection(section, page)})
-				continue
-			}
-			children, ok := item.Value.([]interface{})
-			if !ok {
-				return nil, fmt.Errorf("invalid nav section %q", section)
-			}
-			for _, child := range children {
-				for _, childItem := range llmsMapItems(child) {
-					page, ok := childItem.Value.(string)
-					if !ok {
-						return nil, fmt.Errorf("invalid nav page in section %q", section)
+			case yaml.SequenceNode:
+				for _, child := range valNode.Content {
+					for j := 0; j+1 < len(child.Content); j += 2 {
+						pageNode := child.Content[j+1]
+						if pageNode.Kind != yaml.ScalarNode {
+							return nil, fmt.Errorf("invalid nav page in section %q", section)
+						}
+						pages = append(pages, llmsNavPage{rel: strings.TrimSuffix(pageNode.Value, ".md"), section: section})
 					}
-					pages = append(pages, llmsNavPage{rel: strings.TrimSuffix(page, ".md"), section: section})
 				}
+			default:
+				return nil, fmt.Errorf("invalid nav section %q", section)
 			}
 		}
 	}
 	return pages, nil
-}
-
-func llmsMapItems(v interface{}) yaml.MapSlice {
-	switch v := v.(type) {
-	case yaml.MapSlice:
-		return v
-	case map[interface{}]interface{}:
-		items := make(yaml.MapSlice, 0, len(v))
-		for key, value := range v {
-			items = append(items, yaml.MapItem{Key: key, Value: value})
-		}
-		return items
-	default:
-		return nil
-	}
 }
 
 func llmsSection(navTitle, path string) string {
