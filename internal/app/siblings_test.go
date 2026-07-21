@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"papio/internal/config"
+	"papio/internal/fetch"
 	"papio/internal/job"
 	"papio/internal/resolver"
 	"papio/internal/work"
@@ -137,5 +138,106 @@ func TestSiblingHopSkippedWhenPrimaryCandidatesExist(t *testing.T) {
 	}
 	if len(adapter.hopRequests) != 0 {
 		t.Fatalf("sibling hop ran despite %d primary candidate(s)", len(adapter.fakeResolver.cands))
+	}
+}
+
+// primaryCandidate is a valid direct OA candidate whose fetch the test fails.
+func primaryCandidate() resolver.Candidate {
+	return resolver.Candidate{
+		Source: "openalex", URL: "https://publisher.example/blocked.pdf", Version: resolver.VersionPublished,
+		AccessBasis: resolver.AccessOpen, ReuseLicense: "cc-by-4.0", ExpectedMIME: "application/pdf",
+		Direct: true, IdentityConfidence: 1,
+	}
+}
+
+// failingThen returns a FetchFunc that permanently fails failURL (blocked
+// class, never retried) and succeeds for everything else (mirroring
+// fakeDownload's success shape).
+func failingThen(failURL string, fetches *int) FetchFunc {
+	inner := fakeDownload(fetches)
+	return func(ctx context.Context, c resolver.Candidate, path string) (fetch.Result, error) {
+		if c.URL == failURL {
+			return fetch.Result{}, &fetch.Error{Class: fetch.ClassBlocked, HTTPStatus: 403}
+		}
+		return inner(ctx, c, path)
+	}
+}
+
+func TestExhaustedPrimaryCandidatesTriggerSiblingHop(t *testing.T) {
+	svc, jobs := newTestService(t)
+	primary := primaryCandidate()
+	adapter := &fakeSiblingResolver{
+		fakeResolver: fakeResolver{name: "openalex", cands: []resolver.Candidate{primary}},
+		siblings:     []resolver.Candidate{siblingCandidate()},
+	}
+	svc.Resolvers = []ResolverEntry{{Adapter: adapter, Policy: config.Source{Enabled: true}}}
+	fetches := 0
+	svc.Fetch = failingThen(primary.URL, &fetches)
+	svc.Validate = passValidation()
+
+	id, err := svc.Submit(context.Background(), doiRequest("wr_sibling_hop_04"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, err := jobs.ClaimNext(context.Background(), "worker", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Process(context.Background(), row); err != nil {
+		t.Fatal(err)
+	}
+	got, err := jobs.Get(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != job.StateReady {
+		t.Fatalf("job state = %q (%s), want ready via the sibling after primary exhaustion", got.State, got.TerminalReason)
+	}
+	if len(adapter.hopRequests) != 1 {
+		t.Fatalf("hopRequests = %d, want exactly one", len(adapter.hopRequests))
+	}
+}
+
+func TestSiblingHopFailureStillExhaustsWithoutLooping(t *testing.T) {
+	svc, jobs := newTestService(t)
+	primary := primaryCandidate()
+	sibling := siblingCandidate()
+	adapter := &fakeSiblingResolver{
+		fakeResolver: fakeResolver{name: "openalex", cands: []resolver.Candidate{primary}},
+		siblings:     []resolver.Candidate{sibling},
+	}
+	svc.Resolvers = []ResolverEntry{{Adapter: adapter, Policy: config.Source{Enabled: true}}}
+	fetches := 0
+	svc.Fetch = func(context.Context, resolver.Candidate, string) (fetch.Result, error) {
+		fetches++
+		return fetch.Result{}, &fetch.Error{Class: fetch.ClassBlocked, HTTPStatus: 403}
+	}
+	svc.Validate = passValidation()
+
+	id, err := svc.Submit(context.Background(), doiRequest("wr_sibling_hop_05"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, err := jobs.ClaimNext(context.Background(), "worker", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Process(context.Background(), row); err != nil {
+		t.Fatal(err)
+	}
+	got, err := jobs.Get(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Both primary and sibling failed: the exhaustion verdict stands and the
+	// hop ran exactly once (dedupe/hopTried prevent any loop).
+	if got.State == job.StateReady {
+		t.Fatal("job must not be ready when every candidate fails")
+	}
+	if len(adapter.hopRequests) != 1 {
+		t.Fatalf("hopRequests = %d, want exactly one", len(adapter.hopRequests))
+	}
+	if fetches != 2 {
+		t.Fatalf("fetches = %d, want primary + sibling exactly once each", fetches)
 	}
 }

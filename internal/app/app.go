@@ -359,6 +359,16 @@ func (s *Service) resolve(ctx context.Context, row *job.Row) (map[string]resolve
 		row.Work = updated.Work
 	}
 
+	persisted, live := candidateRows(row, ranked, evidence)
+	if _, err := s.Jobs.InsertCandidates(ctx, row.ID, persisted); err != nil {
+		return nil, retryAt, err
+	}
+	return live, retryAt, nil
+}
+
+// candidateRows converts ranked candidates into their persisted (redacted)
+// rows and the in-memory live map keyed for fetch-time lookup.
+func candidateRows(row *job.Row, ranked []resolver.Candidate, evidence []string) ([]job.Candidate, map[string]resolver.Candidate) {
 	persisted := make([]job.Candidate, 0, len(ranked))
 	live := make(map[string]resolver.Candidate, len(ranked))
 	for i, c := range ranked {
@@ -371,16 +381,41 @@ func (s *Service) resolve(ctx context.Context, row *job.Row) (map[string]resolve
 			Direct: c.Direct, IdentityConfidence: c.IdentityConfidence, RankEvidence: evidence[i], Rank: i,
 		})
 	}
-	if _, err := s.Jobs.InsertCandidates(ctx, row.ID, persisted); err != nil {
-		return nil, retryAt, err
+	return persisted, live
+}
+
+// siblingHop is the C3 version hop at the fetch-exhaustion boundary: the
+// canonical identifier produced candidates, every one failed, and the job is
+// about to park or go unavailable. One OpenAlex sibling lookup runs and its
+// candidates enter the normal pending queue. InsertCandidates deduplicates by
+// url_key, so a repeated hop (later Process re-entry, or hop candidates
+// themselves failing) inserts zero and the exhaustion verdict stands — no
+// loop is possible.
+func (s *Service) siblingHop(ctx context.Context, row *job.Row, live map[string]resolver.Candidate) bool {
+	if strings.TrimSpace(row.Work.DOI) == "" {
+		return false
 	}
-	return live, retryAt, nil
+	cands := s.resolveSiblings(ctx, row)
+	if len(cands) == 0 {
+		return false
+	}
+	ranked, evidence := resolver.Rank(row.Policy.DesiredVersion, cands)
+	persisted, hopLive := candidateRows(row, ranked, evidence)
+	inserted, err := s.Jobs.InsertCandidates(ctx, row.ID, persisted)
+	if err != nil || inserted == 0 {
+		return false
+	}
+	for key, c := range hopLive {
+		live[key] = c
+	}
+	return true
 }
 
 // SiblingResolver is the optional adapter capability behind the C3 version
-// hop: when the canonical identifier yields zero legal candidates, an adapter
-// may look up open-access sibling versions (preprints, repository copies
-// under a different DOI) of the same work.
+// hop: when the canonical identifier yields zero legal candidates — or every
+// candidate it yielded has failed (see siblingHop) — an adapter may look up
+// open-access sibling versions (preprints, repository copies under a
+// different DOI) of the same work.
 type SiblingResolver interface {
 	ResolveSiblings(ctx context.Context, requested work.Work) ([]resolver.Candidate, error)
 }
@@ -493,12 +528,24 @@ func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[st
 	// browser-eligible OA URL only through this acquisition pass, then record
 	// it in the local handoff action if the job exhausts.
 	oaBrowserURL := ""
+	hopTried := false
 	for {
 		stored, err := s.Jobs.NextPendingCandidate(ctx, row.ID)
 		if err != nil {
 			return err
 		}
 		if stored == nil {
+			// The pending queue drained. Before any terminal or parking
+			// verdict, try the OA sibling hop once — but never pre-empt an
+			// ordinary retry wait, where the primary candidates deserve
+			// their next attempt first.
+			if !hopTried {
+				hopTried = true
+				endsHere := manual || retryAt.IsZero() || s.retryBudgetExhausted(ctx, row.ID)
+				if endsHere && s.siblingHop(ctx, row, live) {
+					continue
+				}
+			}
 			break
 		}
 		candidate, ok := live[stored.URLKey]
