@@ -37,6 +37,11 @@ The extension has **zero runtime deps** — both bundles are plain browser JS. `
   parse. Deploy order: build binary → `mv` into place → `papio daemon stop` → next command
   autostarts the new daemon. There is no `daemon restart`; `daemon status`/`stop` don't
   autostart, other commands do.
+- **A new store migration bumps `user_version`, and three tests hardcode the number**:
+  `internal/cli/clean_install_test.go` ("schema version N", twice),
+  `internal/doctor/doctor_test.go`, `internal/store/migrate_forward_test.go`.
+  `go test ./...` fails after adding `internal/store/migrations/NNNN_*.sql` until
+  all three assertions are bumped.
 
 ### Protocol (dual Go/TS)
 - The protocol is validated **twice** — `internal/protocol/protocol.go` (emit + decode +
@@ -60,6 +65,11 @@ The extension has **zero runtime deps** — both bundles are plain browser JS. `
 - Firefox treats MV3 `host_permissions` as **runtime opt-in** — the options page must let
   the user grant them (Chrome grants at install). Same gecko id (`papio@orgmentem.com`) as
   the Web Store build, so the native host `allowed_extensions` matches.
+- **Firefox never acknowledges native/manual downloads.** Without `onDeterminingFilename`
+  a file cannot be steered into `papio/<job>/`, so broad tab/host download correlation is
+  disabled on Firefox — only exact `downloads.download`-started files are owned, and click
+  adapters stay human-assisted there by design. Don't "fix" a Firefox click adapter by
+  widening correlation; the daemon would acknowledge a file it can never adopt.
 
 ### Automation detection (this is load-bearing — papio's whole value is "real human browser")
 - **Never drive the user's browser via WebDriver/BiDi for real work.** Firefox BiDi sets

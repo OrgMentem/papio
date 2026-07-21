@@ -179,10 +179,15 @@ per-permission rationale, and privacy disclosures live in
 Bump `extension/manifest.json`, push an **`ext-v<version>`** tag (must match the
 manifest), or run the workflow manually. The **`store-submit` GitHub Environment**
 gates the job behind a required-reviewer approval — that approval IS the "human
-authorizes publication" step. Chrome uploads a **draft** by default (you click
-Publish in the dashboard); `chrome_publish=true` also submits for review. Firefox
-signs + submits the listed version to AMO (`--upload-source-code` is required —
-the bundle is bun-processed). Local equivalents: `cd extension && bun run
+authorizes publication" step. Chrome uploads a **draft** by default; going live
+is a second act — click **Submit for review** in the dashboard (CWS then
+**auto-publishes when review passes**, unless deferred publishing is enabled)
+or pass `chrome_publish=true` to submit from CI. Firefox signs + submits the
+listed version to AMO (`--upload-source-code` is required — the bundle is
+bun-processed). Manual `workflow_dispatch` runs **skip the AMO step** unless
+`firefox=true` (safe for Chrome-only retries/verification) and build the chosen
+`--ref` — pass the `ext-v*` tag, not `main`, if `main` has moved past the
+release commit. Local equivalents: `cd extension && bun run
 submit:chrome [--publish]` / `bun run submit:firefox listed`.
 
 ### The `store-submit` environment
@@ -196,9 +201,13 @@ Required-reviewer gate on the submission job. Config that bit us this session:
   approve your own run.
 - **No environment secrets needed** — the org/repo secrets are visible to the
   gated job.
-- Approve in the Actions UI, or: `gh api
-  repos/OWNER/REPO/actions/runs/<id>/pending_deployments -F
-  'environment_ids[]=<id>' -f state=approved`.
+- **Every `ext-v*` run parks at `waiting` here until approved** — a bare
+  "watch all runs for HEAD" therefore blocks forever on extension releases.
+  Approve first, then watch specific run IDs.
+- Approve in the Actions UI, or self-contained:
+  `envid=$(gh api repos/OWNER/REPO/actions/runs/<run>/pending_deployments --jq '.[0].environment.id')`
+  then `gh api --method POST repos/OWNER/REPO/actions/runs/<run>/pending_deployments
+  -F "environment_ids[]=$envid" -f state=approved -f comment='…'`.
 
 ### One-time setup (per store — cannot be automated)
 
@@ -232,12 +241,13 @@ The account-wide `CWS_PUBLISHER_ID` belongs beside those org settings (it is an
 identifier, not a credential). The per-extension `CWS_EXTENSION_ID` is a
 repo/environment secret — never org-wide.
 
-**Current status.** As of ext-v0.4.2 (2026-07-20), the OAuth trio,
-`WEB_EXT_*`, tap/bucket tokens, and per-repo `CWS_EXTENSION_ID` exist and work;
-`CWS_PUBLISHER_ID` is not configured. `submit-chrome.sh` therefore uses the
-official CWS API v1 fallback, which Google supports only through 2026-10-14,
-and refuses to upload from 2026-10-15 onward. Add the publisher ID before that
-date; do not re-mint OAuth credentials.
+**Current status.** As of ext-v0.4.3 (2026-07-20) everything is configured and
+verified: the OAuth trio, `WEB_EXT_*`, tap/bucket tokens, per-repo
+`CWS_EXTENSION_ID`, and `CWS_PUBLISHER_ID` (org secret, selected for
+papio+zotio). `submit-chrome.sh` takes the CWS API v2 path
+(`chrome-webstore-upload-cli@4.0.1` with `--publisher-id`); the v1 fallback and
+its 2026-10-15 retirement are moot unless the secret is removed. Do not re-mint
+OAuth credentials.
 
 Secret names can be inspected with `gh secret list --org OrgMentem` /
 `--repo OrgMentem/papio`; values are write-only — recover credentials from the
@@ -294,6 +304,23 @@ new package replaces only the code.
   means it was uploaded before — even as an unlisted/self-distributed signed
   build — so bump the version and resubmit. Cross-store version skew (e.g. CWS
   0.3.0, AMO 0.3.1) is fine; the listings are independent.
+- **CWS locks the item while a submission is in review** — every upload fails
+  with "You may not edit or publish an item that is in review". An `ext-v*` tag
+  pushed during a pending CWS review fails at the Chrome step (build and AMO
+  are unaffected); wait for review to clear, then `gh run rerun <id>` or
+  re-dispatch. Don't stack extension releases while one is in review.
+- **The CWS Items row conflates draft and live.** It shows the *item* status
+  beside the *latest uploaded* version — "Published - public" + "Version 0.4.3"
+  can mean 0.3.0 is live and 0.4.3 is an unpublished draft. The public listing
+  page (`chromewebstore.google.com/detail/<item-id>`) shows the real live
+  version.
+- **AMO's first listed approval is the slow one, and the public page 404s until
+  it lands** (looks "unlisted"; the dev hub's "Listed Version … Awaiting
+  Review" is the true state). `nativeMessaging` excludes papio from
+  auto-approval, so a human reviews it: expect days (observed: CWS same-day,
+  AMO multi-day). Fill the per-version **Notes to Reviewer** with
+  companion-daemon install/test instructions — reviewers cannot exercise papio
+  without the daemon and bounce the review with questions otherwise.
 - **The popup's daemon-update hint goes stale under decoupled cadences.** The
   extension compares the daemon's reported version against
   `__PAPIO_DAEMON_VERSION__` stamped at extension *build* time — daemon
