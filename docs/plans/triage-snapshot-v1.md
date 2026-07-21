@@ -122,8 +122,12 @@ Capability bound to (action_id, sha256), short-lived, GET/HEAD+ranges only
 
 - ADR-0002 Option A FAILED both browsers: Chrome 118+ blocks extension
   `tabs.create/update` to `file://` without the default-off per-extension
-  toggle; Firefox forbids `file://` in `tabs.create/update` outright (MDN;
-  Bugzilla 1266960 open, 1617594 REOPENED as of 2026-07-10). Option B stands.
+  toggle; Firefox forbids `file://` in `tabs.create/update` outright
+  (Bugzilla 1266960 open, 1617594 REOPENED as of 2026-07-10). Firefox 153
+  (released 2026-07-21) adds an off-by-default "Access local files" user
+  permission, but it is content-script-scoped only (Bug 2034168 comment #1) —
+  it does not enable extension-page or tabs.* file navigation. Option B
+  stands.
 - D5 resolved as migration 0010 (`human_actions`: candidate_id,
   quarantine_path, quarantine_sha256, revision); the SHA computed at fetch
   time was never persisted, and candidate linkage was inference-only via the

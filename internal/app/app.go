@@ -658,8 +658,14 @@ func (s *Service) validateCandidate(ctx context.Context, row *job.Row, stored *j
 	case needsIdentityReview && !stored.ReviewOverride:
 		_ = s.Jobs.FinishAttempt(ctx, attempt, "needs_review", 0, "semantic_or_identity_review")
 		_ = s.Jobs.MarkCandidate(ctx, stored.ID, "skipped")
-		_, _ = s.Jobs.OpenHumanAction(ctx, row.ID, "verify_identity",
-			fmt.Sprintf("PDF text or identity requires human verification; local quarantine file: %s", result.TempPath))
+		if _, err := s.Jobs.OpenHumanAction(ctx, row.ID, "verify_identity",
+			fmt.Sprintf("PDF text or identity requires human verification; local quarantine file: %s", result.TempPath),
+			job.WithHumanActionBinding(job.HumanActionBinding{
+				CandidateID: stored.ID, QuarantinePath: result.TempPath, QuarantineSHA256: result.SHA256,
+			}),
+		); err != nil {
+			return false, false, err
+		}
 		return false, true, s.park(ctx, row.ID, job.StateValidating, job.StateNeedsReview,
 			map[string]any{"reason": "semantic_or_identity_review"})
 	case report.Identity.Result != pdf.IdentityPass && report.Identity.Result != pdf.IdentityReview:

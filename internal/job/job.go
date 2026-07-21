@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"papio/internal/artifact"
@@ -1076,10 +1077,67 @@ func (js *Store) FindArtifactByDOI(ctx context.Context, doi string) (*Artifact, 
 	return js.GetArtifact(ctx, sha)
 }
 
+// HumanActionBinding ties an identity-review action to the exact candidate and
+// quarantined file the reviewer sees.
+type HumanActionBinding struct {
+	CandidateID      int64
+	QuarantinePath   string
+	QuarantineSHA256 string
+}
+
+type openHumanActionOptions struct {
+	binding *HumanActionBinding
+}
+
+// OpenHumanActionOption configures one human action.
+type OpenHumanActionOption func(*openHumanActionOptions) error
+
+// WithHumanActionBinding persists the immutable identity-review inputs used by
+// preview and compare-and-swap review resolution.
+func WithHumanActionBinding(binding HumanActionBinding) OpenHumanActionOption {
+	return func(options *openHumanActionOptions) error {
+		if binding.CandidateID <= 0 {
+			return errors.New("human action binding requires a candidate ID")
+		}
+		if strings.TrimSpace(binding.QuarantinePath) == "" {
+			return errors.New("human action binding requires a quarantine path")
+		}
+		if !validSHA256(binding.QuarantineSHA256) {
+			return errors.New("human action binding requires a SHA-256")
+		}
+		binding.QuarantinePath = strings.TrimSpace(binding.QuarantinePath)
+		binding.QuarantineSHA256 = strings.ToLower(strings.TrimSpace(binding.QuarantineSHA256))
+		options.binding = &binding
+		return nil
+	}
+}
+
+func validSHA256(value string) bool {
+	value = strings.TrimSpace(value)
+	if len(value) != 64 {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
+}
+
 // OpenHumanAction records a required human step for a job. Re-parking the
 // same job and action kind refreshes the existing action rather than creating
 // another open prompt.
-func (js *Store) OpenHumanAction(ctx context.Context, jobID, kind, detail string) (int64, error) {
+func (js *Store) OpenHumanAction(ctx context.Context, jobID, kind, detail string, opts ...OpenHumanActionOption) (int64, error) {
+	var options openHumanActionOptions
+	for _, option := range opts {
+		if option == nil {
+			continue
+		}
+		if err := option(&options); err != nil {
+			return 0, err
+		}
+	}
+	if options.binding != nil && kind != "verify_identity" {
+		return 0, errors.New("human action binding is only valid for verify_identity")
+	}
+
 	tx, err := js.S.DB().BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err
@@ -1093,14 +1151,33 @@ func (js *Store) OpenHumanAction(ctx context.Context, jobID, kind, detail string
 		 ORDER BY id ASC LIMIT 1`, jobID, kind).Scan(&actionID)
 	switch {
 	case err == nil:
-		if _, err := tx.ExecContext(ctx,
-			`UPDATE human_actions SET detail = ? WHERE id = ?`, nullable(detail), actionID); err != nil {
+		if options.binding == nil {
+			_, err = tx.ExecContext(ctx,
+				`UPDATE human_actions SET detail = ?, revision = revision + 1 WHERE id = ?`,
+				nullable(detail), actionID)
+		} else {
+			_, err = tx.ExecContext(ctx, `
+				UPDATE human_actions
+				SET detail = ?, candidate_id = ?, quarantine_path = ?, quarantine_sha256 = ?,
+					revision = revision + 1
+				WHERE id = ?`,
+				nullable(detail), options.binding.CandidateID, options.binding.QuarantinePath,
+				options.binding.QuarantineSHA256, actionID)
+		}
+		if err != nil {
 			return 0, err
 		}
 	case errors.Is(err, sql.ErrNoRows):
-		res, err := tx.ExecContext(ctx,
-			`INSERT INTO human_actions (job_id, kind, status, detail, created_at) VALUES (?, ?, 'open', ?, ?)`,
-			jobID, kind, nullable(detail), store.Now())
+		binding := options.binding
+		candidateID, path, sha := any(nil), "", ""
+		if binding != nil {
+			candidateID, path, sha = binding.CandidateID, binding.QuarantinePath, binding.QuarantineSHA256
+		}
+		res, err := tx.ExecContext(ctx, `
+			INSERT INTO human_actions
+				(job_id, kind, status, detail, candidate_id, quarantine_path, quarantine_sha256, revision, created_at)
+			VALUES (?, ?, 'open', ?, ?, ?, ?, 1, ?)`,
+			jobID, kind, nullable(detail), candidateID, path, sha, store.Now())
 		if err != nil {
 			return 0, err
 		}
@@ -1141,69 +1218,178 @@ func (js *Store) ResolveHumanAction(ctx context.Context, actionID int64, status 
 // ResolveReview applies a human accept or reject verdict to a parked identity
 // review. It atomically closes the action and moves the job to its next durable
 // boundary, leaving no interval in which a closed action still parks a job.
+// ReviewOutcome reports the result of a compare-and-swap identity review.
+type ReviewOutcome string
+
+const (
+	ReviewApplied        ReviewOutcome = "applied"
+	ReviewAlreadyApplied ReviewOutcome = "already_applied"
+	ReviewConflict       ReviewOutcome = "conflict"
+)
+
+// ResolveReviewInput supplies the immutable snapshot fields required for a
+// modern review transition.
+type ResolveReviewInput struct {
+	ActionID         int64
+	Verdict          string
+	ExpectedRevision int64
+	ExpectedSHA256   string
+}
+
+// ReviewResolution is the durable result of resolving an identity review.
+type ReviewResolution struct {
+	Outcome ReviewOutcome
+	JobID   string
+	State   string
+}
+
+// ResolveReview preserves the legacy action-resolution API for CLI callers
+// that predate review bindings. New callers must use ResolveReviewCAS.
 func (js *Store) ResolveReview(ctx context.Context, actionID int64, verdict string) (string, string, error) {
-	if verdict != "accept" && verdict != "reject" {
-		return "", "", fmt.Errorf("invalid review verdict %q", verdict)
+	resolution, err := js.resolveReview(ctx, ResolveReviewInput{
+		ActionID: actionID, Verdict: verdict,
+	}, true)
+	if err != nil {
+		return "", "", err
+	}
+	if resolution.Outcome != ReviewApplied {
+		return "", "", fmt.Errorf("%w: human action %d is not open", ErrConflict, actionID)
+	}
+	return resolution.JobID, resolution.State, nil
+}
+
+// ResolveReviewCAS atomically applies a review only when its rendered binding
+// still identifies the same open action and quarantined file.
+func (js *Store) ResolveReviewCAS(ctx context.Context, input ResolveReviewInput) (ReviewResolution, error) {
+	if input.ExpectedRevision <= 0 {
+		return ReviewResolution{}, errors.New("expected review revision is required")
+	}
+	if input.Verdict == "accept" {
+		if !validSHA256(input.ExpectedSHA256) {
+			return ReviewResolution{}, errors.New("expected SHA-256 is required for accept")
+		}
+		input.ExpectedSHA256 = strings.ToLower(strings.TrimSpace(input.ExpectedSHA256))
+	}
+	return js.resolveReview(ctx, input, false)
+}
+
+func (js *Store) resolveReview(ctx context.Context, input ResolveReviewInput, legacy bool) (ReviewResolution, error) {
+	if input.ActionID <= 0 || (input.Verdict != "accept" && input.Verdict != "reject") {
+		return ReviewResolution{}, fmt.Errorf("invalid review action or verdict")
 	}
 	tx, err := js.S.DB().BeginTx(ctx, nil)
 	if err != nil {
-		return "", "", err
+		return ReviewResolution{}, normalizeReviewBusy(err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
 	var action HumanAction
-	if err := tx.QueryRowContext(ctx,
-		`SELECT id, job_id, kind, status, COALESCE(detail,''), created_at FROM human_actions WHERE id = ?`, actionID).
-		Scan(&action.ID, &action.JobID, &action.Kind, &action.Status, &action.Detail, &action.CreatedAt); err != nil {
-		return "", "", err
+	err = tx.QueryRowContext(ctx, `
+		SELECT id, job_id, kind, status, COALESCE(detail,''), created_at,
+			COALESCE(candidate_id, 0), quarantine_path, quarantine_sha256, revision
+		FROM human_actions WHERE id = ?`, input.ActionID).Scan(
+		&action.ID, &action.JobID, &action.Kind, &action.Status, &action.Detail, &action.CreatedAt,
+		&action.CandidateID, &action.QuarantinePath, &action.QuarantineSHA256, &action.Revision)
+	if errors.Is(err, sql.ErrNoRows) {
+		if legacy {
+			return ReviewResolution{}, err
+		}
+		return ReviewResolution{Outcome: ReviewConflict}, nil
+	}
+	if err != nil {
+		return ReviewResolution{}, normalizeReviewBusy(err)
 	}
 	if action.Kind != "verify_identity" {
-		return "", "", &ErrHumanActionKind{ActionID: actionID, Kind: action.Kind}
+		return ReviewResolution{}, &ErrHumanActionKind{ActionID: input.ActionID, Kind: action.Kind}
 	}
 	if action.Status != "open" {
-		return "", "", fmt.Errorf("%w: human action %d is not open", ErrConflict, actionID)
+		var state string
+		if err := tx.QueryRowContext(ctx, `SELECT state FROM jobs WHERE id = ?`, action.JobID).Scan(&state); err != nil {
+			return ReviewResolution{}, normalizeReviewBusy(err)
+		}
+		var applied int
+		err := tx.QueryRowContext(ctx, `
+			SELECT 1 FROM events
+			WHERE job_id = ? AND kind = 'human_action.resolve'
+				AND detail_json LIKE ? AND detail_json LIKE ?
+			ORDER BY seq DESC LIMIT 1`,
+			action.JobID,
+			fmt.Sprintf("%%\"action_id\":%d%%", action.ID),
+			fmt.Sprintf("%%\"verdict\":\"%s\"%%", input.Verdict),
+		).Scan(&applied)
+		switch {
+		case err == nil:
+			return ReviewResolution{Outcome: ReviewAlreadyApplied, JobID: action.JobID, State: state}, nil
+		case errors.Is(err, sql.ErrNoRows):
+			return ReviewResolution{Outcome: ReviewConflict, JobID: action.JobID, State: state}, nil
+		default:
+			return ReviewResolution{}, normalizeReviewBusy(err)
+		}
 	}
+	if !legacy && action.Revision != input.ExpectedRevision {
+		return ReviewResolution{Outcome: ReviewConflict, JobID: action.JobID}, nil
+	}
+
 	var from string
 	if err := tx.QueryRowContext(ctx, `SELECT state FROM jobs WHERE id = ?`, action.JobID).Scan(&from); err != nil {
-		return "", "", err
+		return ReviewResolution{}, normalizeReviewBusy(err)
 	}
 	if from != StateNeedsReview {
-		return "", "", fmt.Errorf("%w: job %s is not awaiting identity review", ErrConflict, action.JobID)
+		return ReviewResolution{Outcome: ReviewConflict, JobID: action.JobID, State: from}, nil
 	}
 
 	now := store.Now()
-	res, err := tx.ExecContext(ctx,
-		`UPDATE human_actions SET status = 'resolved', resolved_at = ? WHERE id = ? AND status = 'open'`, now, actionID)
-	if err != nil {
-		return "", "", err
+	query := `UPDATE human_actions SET status = 'resolved', resolved_at = ? WHERE id = ? AND status = 'open'`
+	args := []any{now, action.ID}
+	if !legacy {
+		query += ` AND revision = ?`
+		args = append(args, input.ExpectedRevision)
+		if input.Verdict == "accept" {
+			query += ` AND quarantine_sha256 = ?`
+			args = append(args, input.ExpectedSHA256)
+		}
 	}
-	if changed, _ := res.RowsAffected(); changed != 1 {
-		return "", "", fmt.Errorf("%w: human action %d is not open", ErrConflict, actionID)
+	res, err := tx.ExecContext(ctx, query, args...)
+	if err != nil {
+		return ReviewResolution{}, normalizeReviewBusy(err)
+	}
+	if changed, err := res.RowsAffected(); err != nil {
+		return ReviewResolution{}, err
+	} else if changed != 1 {
+		return ReviewResolution{Outcome: ReviewConflict, JobID: action.JobID}, nil
 	}
 
 	to, reason := StateCancelled, "review_rejected"
 	terminalReason := "review_rejected"
-	if verdict == "accept" {
-		var candidateID sql.NullInt64
-		err := tx.QueryRowContext(ctx, `
-			SELECT candidate_id FROM attempts
-			WHERE job_id = ? AND stage = 'validate' AND outcome = 'needs_review'
-			ORDER BY id DESC LIMIT 1`, action.JobID).Scan(&candidateID)
-		if errors.Is(err, sql.ErrNoRows) {
-			err = nil
+	if input.Verdict == "accept" {
+		candidateID := action.CandidateID
+		if candidateID == 0 {
+			var candidate sql.NullInt64
+			err := tx.QueryRowContext(ctx, `
+				SELECT candidate_id FROM attempts
+				WHERE job_id = ? AND stage = 'validate' AND outcome = 'needs_review'
+				ORDER BY id DESC LIMIT 1`, action.JobID).Scan(&candidate)
+			if errors.Is(err, sql.ErrNoRows) {
+				err = nil
+			}
+			if err != nil {
+				return ReviewResolution{}, normalizeReviewBusy(err)
+			}
+			if candidate.Valid {
+				candidateID = candidate.Int64
+			}
 		}
-		if err != nil {
-			return "", "", err
-		}
-		if candidateID.Valid {
+		if candidateID > 0 {
 			res, err := tx.ExecContext(ctx,
 				`UPDATE candidates SET review_override = 1, status = 'pending' WHERE id = ? AND job_id = ?`,
-				candidateID.Int64, action.JobID)
+				candidateID, action.JobID)
 			if err != nil {
-				return "", "", err
+				return ReviewResolution{}, normalizeReviewBusy(err)
 			}
-			if changed, _ := res.RowsAffected(); changed != 1 {
-				return "", "", fmt.Errorf("%w: candidate %d not found for job %s", ErrConflict, candidateID.Int64, action.JobID)
+			if changed, err := res.RowsAffected(); err != nil {
+				return ReviewResolution{}, err
+			} else if changed != 1 {
+				return ReviewResolution{Outcome: ReviewConflict, JobID: action.JobID}, nil
 			}
 			to = StateFetching
 		} else {
@@ -1214,7 +1400,7 @@ func (js *Store) ResolveReview(ctx context.Context, actionID int64, verdict stri
 	}
 	detail, err := json.Marshal(map[string]any{"from": from, "to": to, "reason": reason})
 	if err != nil {
-		return "", "", err
+		return ReviewResolution{}, err
 	}
 	res, err = tx.ExecContext(ctx, `
 		UPDATE jobs SET state = ?, updated_at = ?, lease_owner = NULL, lease_expires_at = NULL,
@@ -1222,35 +1408,63 @@ func (js *Store) ResolveReview(ctx context.Context, actionID int64, verdict stri
 		WHERE id = ? AND state = ?`,
 		to, now, nullable(terminalReason), action.JobID, from)
 	if err != nil {
-		return "", "", err
+		return ReviewResolution{}, normalizeReviewBusy(err)
 	}
-	if changed, _ := res.RowsAffected(); changed != 1 {
-		return "", "", fmt.Errorf("%w: job %s not in state %s", ErrConflict, action.JobID, from)
+	if changed, err := res.RowsAffected(); err != nil {
+		return ReviewResolution{}, err
+	} else if changed != 1 {
+		return ReviewResolution{Outcome: ReviewConflict, JobID: action.JobID}, nil
+	}
+	resolutionDetail, err := json.Marshal(map[string]any{"action_id": action.ID, "verdict": input.Verdict})
+	if err != nil {
+		return ReviewResolution{}, err
+	}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO events (job_id, at, kind, detail_json) VALUES (?, ?, 'human_action.resolve', ?)`,
+		action.JobID, now, string(resolutionDetail)); err != nil {
+		return ReviewResolution{}, normalizeReviewBusy(err)
 	}
 	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO events (job_id, at, kind, detail_json) VALUES (?, ?, 'job.transition', ?)`,
 		action.JobID, now, string(detail)); err != nil {
-		return "", "", err
+		return ReviewResolution{}, normalizeReviewBusy(err)
 	}
 	if err := tx.Commit(); err != nil {
-		return "", "", err
+		return ReviewResolution{}, normalizeReviewBusy(err)
 	}
-	return action.JobID, to, nil
+	return ReviewResolution{Outcome: ReviewApplied, JobID: action.JobID, State: to}, nil
+}
+
+func normalizeReviewBusy(err error) error {
+	if err == nil {
+		return nil
+	}
+	message := strings.ToLower(err.Error())
+	if strings.Contains(message, "sqlite_busy") || strings.Contains(message, "database is locked") || strings.Contains(message, "database is busy") {
+		return fmt.Errorf("%w: review transaction busy", ErrConflict)
+	}
+	return err
 }
 
 // HumanAction is one pending or resolved human step.
 type HumanAction struct {
-	ID        int64  `json:"id"`
-	JobID     string `json:"job_id"`
-	Kind      string `json:"kind"`
-	Status    string `json:"status"`
-	Detail    string `json:"detail,omitempty"`
-	CreatedAt string `json:"created_at"`
+	ID               int64  `json:"id"`
+	JobID            string `json:"job_id"`
+	Kind             string `json:"kind"`
+	Status           string `json:"status"`
+	Detail           string `json:"detail,omitempty"`
+	CreatedAt        string `json:"created_at"`
+	CandidateID      int64  `json:"candidate_id,omitempty"`
+	QuarantinePath   string `json:"quarantine_path,omitempty"`
+	QuarantineSHA256 string `json:"quarantine_sha256,omitempty"`
+	Revision         int64  `json:"revision"`
 }
 
 // ListHumanActions returns actions, optionally only open ones.
 func (js *Store) ListHumanActions(ctx context.Context, openOnly bool) ([]HumanAction, error) {
-	q := `SELECT id, job_id, kind, status, COALESCE(detail,''), created_at FROM human_actions`
+	q := `SELECT id, job_id, kind, status, COALESCE(detail,''), created_at,
+		COALESCE(candidate_id, 0), quarantine_path, quarantine_sha256, revision
+		FROM human_actions`
 	if openOnly {
 		q += ` WHERE status = 'open'`
 	}
@@ -1263,7 +1477,10 @@ func (js *Store) ListHumanActions(ctx context.Context, openOnly bool) ([]HumanAc
 	var out []HumanAction
 	for rows.Next() {
 		var h HumanAction
-		if err := rows.Scan(&h.ID, &h.JobID, &h.Kind, &h.Status, &h.Detail, &h.CreatedAt); err != nil {
+		if err := rows.Scan(
+			&h.ID, &h.JobID, &h.Kind, &h.Status, &h.Detail, &h.CreatedAt,
+			&h.CandidateID, &h.QuarantinePath, &h.QuarantineSHA256, &h.Revision,
+		); err != nil {
 			_ = rows.Close()
 			return nil, err
 		}

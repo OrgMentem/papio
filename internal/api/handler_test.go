@@ -21,6 +21,7 @@ import (
 	"papio/internal/ipc"
 	"papio/internal/job"
 	"papio/internal/protocol"
+	"papio/internal/triage"
 	"papio/internal/update"
 	"papio/internal/watch"
 	"papio/internal/work"
@@ -53,6 +54,46 @@ func callMethod(t *testing.T, router ipc.Router, method string, params any, resu
 		}
 	}
 	return rpcErr
+}
+
+func TestTriageSnapshotCountsAndDismiss(t *testing.T) {
+	system := testSystem(t)
+	watched, err := system.Watches.Create(context.Background(), watch.CreateInput{
+		Query: "triage API", Filters: watch.Filters{YearFrom: 2020, OAOnly: true},
+		Collection: "Reading", CadenceHours: 24, PerRunCap: 10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := system.Watches.RecordDigest(context.Background(), watched.ID, time.Now(), []watch.DigestEntry{{
+		WorkKey: "10.1000/triage-api", Title: "Triage API", DOI: "10.1000/triage-api", Abstract: "Context",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	router := Router(system)
+	var snapshot triage.Snapshot
+	if rpcErr := callMethod(t, router, "triage.snapshot", map[string]any{"limit": 100}, &snapshot); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	if snapshot.Schema != triage.SchemaVersion || len(snapshot.Items) != 1 || snapshot.Items[0].WatchHit == nil {
+		t.Fatalf("snapshot = %+v", snapshot)
+	}
+	var outcome triageDecideResult
+	if rpcErr := callMethod(t, router, "triage.decide", map[string]any{
+		"item_id": snapshot.Items[0].ID, "op": "dismiss", "watch_scope": "all",
+	}, &outcome); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	if outcome.Outcome != "applied" {
+		t.Fatalf("dismiss outcome = %+v", outcome)
+	}
+	var counts triage.Counts
+	if rpcErr := callMethod(t, router, "triage.counts", map[string]any{}, &counts); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	if counts.PendingTotal != 0 || counts.WatchHits != 0 {
+		t.Fatalf("counts after dismiss = %+v", counts)
+	}
 }
 
 type preflightOnlyCLI struct {

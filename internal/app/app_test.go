@@ -657,7 +657,8 @@ func TestAcceptedIdentityReviewResumesAndRecordsOverride(t *testing.T) {
 		t.Fatalf("initial review state = %+v", parked)
 	}
 	actions, err := jobs.ListHumanActions(context.Background(), true)
-	if err != nil || len(actions) != 1 || actions[0].Kind != "verify_identity" || !strings.Contains(actions[0].Detail, "local quarantine file:") {
+	if err != nil || len(actions) != 1 || actions[0].Kind != "verify_identity" || !strings.Contains(actions[0].Detail, "local quarantine file:") ||
+		actions[0].CandidateID <= 0 || actions[0].QuarantinePath == "" || len(actions[0].QuarantineSHA256) != 64 || actions[0].Revision != 1 {
 		t.Fatalf("review action = %+v, %v", actions, err)
 	}
 	if _, state, err := jobs.ResolveReview(context.Background(), actions[0].ID, "accept"); err != nil || state != job.StateFetching {

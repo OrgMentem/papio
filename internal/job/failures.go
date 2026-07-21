@@ -4,7 +4,9 @@ package job
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"net/url"
 	"strings"
 	"time"
@@ -118,6 +120,65 @@ func (js *Store) Failures(ctx context.Context, since time.Time, limit int) ([]Fa
 		out = out[:limit]
 	}
 	return out, nil
+}
+
+// FailureGroupCount returns the number of distinct recent failure groups from
+// an existing read transaction. It keeps triage counts on the same SQLite
+// snapshot as its inbox items.
+func (js *Store) FailureGroupCount(ctx context.Context, tx *sql.Tx, since time.Time) (int, error) {
+	if tx == nil {
+		return 0, errors.New("failure group count requires a transaction")
+	}
+	coarseCutoff := ""
+	if !since.IsZero() {
+		coarseCutoff = since.Add(-failureCutoffPad).UTC().Format(time.RFC3339Nano)
+	}
+	rows, err := tx.QueryContext(ctx, `
+		SELECT j.id, j.state, j.updated_at, COALESCE(j.terminal_reason, ''),
+		       COALESCE(
+		         (SELECT c.url_redacted FROM candidates c WHERE c.id = j.selected_candidate_id),
+		         (SELECT c.url_redacted FROM candidates c WHERE c.job_id = j.id ORDER BY c.created_at DESC, c.id DESC LIMIT 1),
+		         ''
+		       ) AS candidate_url,
+		       COALESCE(
+		         (SELECT e.detail_json FROM events e
+		          WHERE e.job_id = j.id AND e.kind = 'job.transition'
+		          ORDER BY e.seq DESC LIMIT 1),
+		         '{}'
+		       ) AS detail_json
+		FROM jobs j
+		WHERE j.state IN ('failed', 'unavailable', 'needs_review', 'awaiting_human')
+		  AND (? = '' OR julianday(j.updated_at) >= julianday(?))`, coarseCutoff, coarseCutoff)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+	groups := make(map[string]struct{})
+	for rows.Next() {
+		var state, candidateURL, detailJSON, terminalReason, id, updatedAtRaw string
+		if err := rows.Scan(&id, &state, &updatedAtRaw, &terminalReason, &candidateURL, &detailJSON); err != nil {
+			return 0, err
+		}
+		updatedAt, err := time.Parse(time.RFC3339Nano, updatedAtRaw)
+		if err != nil {
+			return 0, err
+		}
+		if !since.IsZero() && updatedAt.Before(since) {
+			continue
+		}
+		reason := failureReason(detailJSON)
+		if reason == "" {
+			reason = normalizeFailureReason(terminalReason)
+		}
+		if reason == "" {
+			reason = "-"
+		}
+		groups[state+"\x00"+failureProvider(candidateURL)+"\x00"+reason] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	return len(groups), nil
 }
 
 func failureProvider(rawURL string) string {

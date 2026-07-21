@@ -213,6 +213,34 @@ func TestRecordDigestIsIdempotentAndNewestFirst(t *testing.T) {
 	}
 }
 
+func TestRecordDigestCapsAbstractAndConsumeDigest(t *testing.T) {
+	ctx := context.Background()
+	watches := testStore(t)
+	created := createWatch(t, watches, testWatchInput("digest abstracts"))
+	abstract := strings.Repeat("界", maxDigestAbstractRunes+1)
+	if reported, err := watches.RecordDigest(ctx, created.ID, time.Now(), []DigestEntry{
+		{WorkKey: "10.1000/one", Title: "One", DOI: "10.1000/one", Abstract: abstract},
+		{WorkKey: "10.1000/two", Title: "Two", DOI: "10.1000/two"},
+	}); err != nil || reported != 2 {
+		t.Fatalf("RecordDigest() = %d, %v; want 2, nil", reported, err)
+	}
+
+	entries, err := watches.TakeDigest(ctx, created.ID, []string{"10.1000/one"})
+	if err != nil || len(entries) != 1 || len([]rune(entries[0].Abstract)) != maxDigestAbstractRunes {
+		t.Fatalf("TakeDigest() = %+v, %v; want capped abstract", entries, err)
+	}
+	if consumed, err := watches.ConsumeDigest(ctx, created.ID, []string{"doi:10.1000/one"}); err != nil || consumed != 1 {
+		t.Fatalf("ConsumeDigest() = %d, %v; want 1, nil", consumed, err)
+	}
+	if _, err := watches.ConsumeDigest(ctx, created.ID, []string{"10.1000/one"}); !errors.Is(err, ErrDigestEntryNotFound) {
+		t.Fatalf("second ConsumeDigest() error = %v, want ErrDigestEntryNotFound", err)
+	}
+	digest, err := watches.Digest(ctx, created.ID, 100)
+	if err != nil || len(digest) != 1 || digest[0].WorkKey != "10.1000/two" {
+		t.Fatalf("Digest() = %+v, %v; want only second entry", digest, err)
+	}
+}
+
 func TestStoreCRUD(t *testing.T) {
 	ctx := context.Background()
 	watches := testStore(t)

@@ -7,6 +7,7 @@ package bootstrap
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"os"
 	"papio/internal/app"
@@ -23,6 +24,7 @@ import (
 	"papio/internal/job"
 	"papio/internal/notify"
 	"papio/internal/pdf"
+	"papio/internal/preview"
 	"papio/internal/resolver"
 	"papio/internal/resolvers/arxiv"
 	coreresolver "papio/internal/resolvers/core"
@@ -30,7 +32,9 @@ import (
 	"papio/internal/resolvers/europepmc"
 	"papio/internal/resolvers/openalex"
 	"papio/internal/resolvers/unpaywall"
+	"papio/internal/retraction"
 	"papio/internal/store"
+	"papio/internal/triage"
 	"papio/internal/update"
 	"papio/internal/watch"
 	"papio/internal/work"
@@ -51,6 +55,7 @@ type System struct {
 	Scheduler     *daemon.Scheduler
 	Bundle        *bundle.Exporter
 	Browser       *browser.Bridge
+	Preview       *preview.Server
 	PDFCapability pdf.Capability
 	WorkerBinary  string
 	Discovery     discovery.Source
@@ -58,6 +63,8 @@ type System struct {
 	WatchRunner   *watch.Runner
 	Zotio         *zotio.Service
 	Updates       *update.Checker
+	Retractions   *retraction.Sentinel
+	Triage        *triage.Service
 }
 
 const autoImportRetryBackoff = 2 * time.Second
@@ -217,13 +224,25 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 		Store: watches, Discovery: discoveryClient, Lookup: zotioService, Submitter: service,
 		Backfill: zotioService, Notifier: watchNotifier, DataDir: cfg.DataDir,
 	}
+	var retractions *retraction.Sentinel
+	if policy := cfg.SourcePolicy(config.SourceRetractionWatch); policy.Enabled {
+		retractions = retraction.New(retraction.Options{
+			Store: db, Budgets: budgets, Policy: policy, Client: metadataClient,
+			DataDir: cfg.DataDir, BaseURL: policy.BaseURLForDev, Notifier: watchNotifier,
+		})
+	}
+	triageService := triage.New(db, watches, jobs)
+	if retractions != nil {
+		triageService.RegisterSource(retractions)
+	}
+	maintenance := daemon.MaintenanceRunners{watchRunner, service.ImportRetrier(), retractions}
 	scheduler, err := daemon.NewScheduler(jobs, service, daemon.SchedulerConfig{
 		Owner:               job.NewID("daemon"),
 		Workers:             3,
 		LeaseDuration:       60 * time.Second,
 		HeartbeatInterval:   15 * time.Second,
 		PollInterval:        250 * time.Millisecond,
-		Maintenance:         daemon.MaintenanceRunners{watchRunner, service.ImportRetrier()},
+		Maintenance:         maintenance,
 		MaintenanceInterval: time.Minute,
 	})
 	if err != nil {
@@ -239,21 +258,33 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 		App: service, Scheduler: scheduler, Watches: watches, WatchRunner: watchRunner,
 		Bundle:        bundleExporter,
 		Browser:       browser.NewBridge(jobs, service, cfg, version, nil),
+		Preview:       preview.New(),
 		Discovery:     discoveryClient,
 		Zotio:         zotioService,
 		Updates:       updates,
+		Retractions:   retractions,
+		Triage:        triageService,
 		PDFCapability: capability, WorkerBinary: executable,
 	}
 	failed = false
 	return system, nil
 }
 
-// Close releases the process-wide database connection.
+// Close releases the process-wide services and database connection.
 func (s *System) Close() error {
-	if s == nil || s.Store == nil {
+	if s == nil {
 		return nil
 	}
-	return s.Store.Close()
+	var previewErr error
+	if s.Preview != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		previewErr = s.Preview.Shutdown(ctx)
+		cancel()
+	}
+	if s.Store == nil {
+		return previewErr
+	}
+	return errors.Join(previewErr, s.Store.Close())
 }
 
 // DoctorReport runs readiness checks against this live system without exposing

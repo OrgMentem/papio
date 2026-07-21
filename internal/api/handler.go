@@ -97,6 +97,15 @@ func RouterWithShutdown(system *bootstrap.System, shutdown context.CancelFunc) i
 		"watch.run": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return runWatch(ctx, raw, system)
 		},
+		"triage.snapshot": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return triageSnapshot(ctx, raw, system)
+		},
+		"triage.counts": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return triageCounts(ctx, raw, system)
+		},
+		"triage.decide": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return triageDecide(ctx, raw, system)
+		},
 		"jobs.list": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return listJobs(ctx, raw, system)
 		},
@@ -523,21 +532,7 @@ func retryJob(ctx context.Context, raw json.RawMessage, system *bootstrap.System
 }
 
 func resolveAction(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
-	var params struct {
-		ActionID int64  `json:"action_id"`
-		Verdict  string `json:"verdict"`
-	}
-	if err := ipc.DecodeParams(raw, &params); err != nil || params.ActionID <= 0 || (params.Verdict != "accept" && params.Verdict != "reject") {
-		if err == nil {
-			err = errors.New("action_id and verdict (accept or reject) are required")
-		}
-		return badParams(err)
-	}
-	jobID, state, err := system.Jobs.ResolveReview(ctx, params.ActionID, params.Verdict)
-	if err != nil {
-		return failure(err)
-	}
-	return marshal(map[string]any{"job_id": jobID, "state": state})
+	return resolveActionCAS(ctx, raw, system)
 }
 
 func listActions(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {

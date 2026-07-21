@@ -78,6 +78,9 @@ func TestLoadRetainsDefaultCrossrefMetadataPolicyWhenSourceIsAbsent(t *testing.T
 	if got := cfg.SourcePolicy(SourceCrossrefMetadata); got != (Source{Enabled: true, RatePerSec: 1, Burst: 1}) {
 		t.Fatalf("crossref metadata policy = %+v", got)
 	}
+	if got := cfg.SourcePolicy(SourceRetractionWatch); got != (Source{Enabled: true, RatePerSec: 1, Burst: 1}) {
+		t.Fatalf("retraction watch policy = %+v", got)
+	}
 }
 
 func TestLoadExplainsUnknownBrowserField(t *testing.T) {

@@ -93,9 +93,24 @@ type DigestEntry struct {
 	Year         int                   `json:"year"`
 	DOI          string                `json:"doi,omitempty"`
 	IsOA         bool                  `json:"is_oa"`
+	Abstract     string                `json:"abstract,omitempty"`
 	FirstSeenAt  string                `json:"first_seen_at"`
 	Identifiers  *protocol.Identifiers `json:"identifiers,omitempty"`
 	titleAliases []string
+}
+
+const maxDigestAbstractRunes = 2000
+
+func truncateDigestAbstract(value string) string {
+	value = strings.TrimSpace(value)
+	runes := 0
+	for index := range value {
+		if runes == maxDigestAbstractRunes {
+			return value[:index]
+		}
+		runes++
+	}
+	return value
 }
 
 // ErrDigestEntryNotFound indicates a requested digest work key is absent.
@@ -197,6 +212,7 @@ func (s *Store) RecordDigest(ctx context.Context, watchID int64, at time.Time, e
 		entry.Title = strings.TrimSpace(entry.Title)
 		entry.Authors = strings.TrimSpace(entry.Authors)
 		entry.DOI = strings.TrimSpace(entry.DOI)
+		entry.Abstract = truncateDigestAbstract(entry.Abstract)
 		if entry.Authors == "" && len(entry.AuthorNames) > 0 {
 			entry.Authors = strings.Join(entry.AuthorNames, ", ")
 		}
@@ -251,10 +267,10 @@ func (s *Store) RecordDigest(ctx context.Context, watchID int64, at time.Time, e
 			if _, err := tx.ExecContext(ctx, `
 				UPDATE watch_digest_entries
 				SET work_key = ?, title = ?, authors = ?, authors_json = ?, year = ?, doi = ?,
-					identifiers_json = ?, is_oa = ?, first_seen_at = ?, consumed = ?
+					identifiers_json = ?, is_oa = ?, abstract = ?, first_seen_at = ?, consumed = ?
 				WHERE id = ?`,
 				workKey, entry.Title, authors, authorsJSON, entry.Year, doi,
-				identifiersJSON, entry.IsOA, firstSeenAt, consumed, existing.id,
+				identifiersJSON, entry.IsOA, entry.Abstract, firstSeenAt, consumed, existing.id,
 			); err != nil {
 				return 0, fmt.Errorf("migrating watch digest: %w", err)
 			}
@@ -275,11 +291,11 @@ func (s *Store) RecordDigest(ctx context.Context, watchID int64, at time.Time, e
 		}
 		result, err := tx.ExecContext(ctx, `
 			INSERT INTO watch_digest_entries
-				(watch_id, work_key, title, authors, authors_json, year, doi, identifiers_json, is_oa, first_seen_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+				(watch_id, work_key, title, authors, authors_json, year, doi, identifiers_json, is_oa, abstract, first_seen_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(watch_id, work_key) DO NOTHING`,
 			watchID, workKey, entry.Title, entry.Authors, authorsJSON, entry.Year,
-			doi, identifiersJSON, entry.IsOA, firstSeenAt)
+			doi, identifiersJSON, entry.IsOA, entry.Abstract, firstSeenAt)
 		if err != nil {
 			return 0, fmt.Errorf("recording watch digest: %w", err)
 		}
@@ -310,7 +326,7 @@ func (s *Store) Digest(ctx context.Context, watchID int64, limit int) ([]DigestE
 		limit = 100
 	}
 	rows, err := s.S.DB().QueryContext(ctx, `
-		SELECT work_key, title, authors, authors_json, year, doi, is_oa, first_seen_at, identifiers_json
+		SELECT work_key, title, authors, authors_json, year, doi, is_oa, abstract, first_seen_at, identifiers_json
 		FROM watch_digest_entries
 		WHERE watch_id = ? AND consumed = 0
 		ORDER BY id DESC
@@ -325,7 +341,7 @@ func (s *Store) Digest(ctx context.Context, watchID int64, limit int) ([]DigestE
 		var identifiersJSON, authorsJSON string
 		if err := rows.Scan(
 			&entry.WorkKey, &entry.Title, &entry.Authors, &authorsJSON, &entry.Year,
-			&entry.DOI, &entry.IsOA, &entry.FirstSeenAt, &identifiersJSON,
+			&entry.DOI, &entry.IsOA, &entry.Abstract, &entry.FirstSeenAt, &identifiersJSON,
 		); err != nil {
 			return nil, err
 		}
@@ -381,7 +397,7 @@ func (s *Store) TakeDigest(ctx context.Context, watchID int64, keys []string) ([
 	}
 
 	query := `
-		SELECT work_key, title, authors, authors_json, year, doi, is_oa, first_seen_at, identifiers_json
+		SELECT work_key, title, authors, authors_json, year, doi, is_oa, abstract, first_seen_at, identifiers_json
 		FROM watch_digest_entries
 		WHERE watch_id = ? AND consumed = 0`
 	args := []any{watchID}
@@ -406,7 +422,7 @@ func (s *Store) TakeDigest(ctx context.Context, watchID int64, keys []string) ([
 		var identifiersJSON, authorsJSON string
 		if err := rows.Scan(
 			&entry.WorkKey, &entry.Title, &entry.Authors, &authorsJSON, &entry.Year,
-			&entry.DOI, &entry.IsOA, &entry.FirstSeenAt, &identifiersJSON,
+			&entry.DOI, &entry.IsOA, &entry.Abstract, &entry.FirstSeenAt, &identifiersJSON,
 		); err != nil {
 			return nil, err
 		}
@@ -454,6 +470,50 @@ func (s *Store) TakeDigest(ctx context.Context, watchID int64, keys []string) ([
 		}
 	}
 	return entries, nil
+}
+
+// ConsumeDigest marks the specified pending digest entries as consumed. Keys
+// use the same identity matching as TakeDigest so callers may address a work
+// by a stable identifier rather than its current canonical work key.
+func (s *Store) ConsumeDigest(ctx context.Context, watchID int64, workKeys []string) (int, error) {
+	if s == nil || s.S == nil {
+		return 0, errors.New("watch store is not configured")
+	}
+	if watchID <= 0 {
+		return 0, errors.New("watch id must be positive")
+	}
+	if len(workKeys) == 0 {
+		return 0, errors.New("watch digest keys are required")
+	}
+	entries, err := s.TakeDigest(ctx, watchID, workKeys)
+	if err != nil {
+		return 0, err
+	}
+	tx, err := s.S.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("starting watch digest consume transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	for _, entry := range entries {
+		result, err := tx.ExecContext(ctx, `
+			UPDATE watch_digest_entries
+			SET consumed = 1
+			WHERE watch_id = ? AND work_key = ? AND consumed = 0`, watchID, entry.WorkKey)
+		if err != nil {
+			return 0, fmt.Errorf("consuming watch digest entry: %w", err)
+		}
+		count, err := result.RowsAffected()
+		if err != nil {
+			return 0, fmt.Errorf("counting consumed watch digest entries: %w", err)
+		}
+		if count != 1 {
+			return 0, fmt.Errorf("%w: %q", ErrDigestEntryNotFound, entry.WorkKey)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("committing watch digest consume: %w", err)
+	}
+	return len(entries), nil
 }
 
 func (s *Store) consumeDigestEntry(ctx context.Context, watchID int64, workKey string) error {

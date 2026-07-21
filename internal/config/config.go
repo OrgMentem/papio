@@ -37,6 +37,7 @@ const (
 	SourceCORE             = "core"
 	SourceCrossrefTDM      = "crossref_tdm"
 	SourceCrossrefMetadata = "crossref_metadata"
+	SourceRetractionWatch  = "retraction_watch"
 	SourceSemanticScholar  = "semanticscholar"
 )
 
@@ -248,6 +249,7 @@ func Default() Config {
 			SourceCORE:             {Enabled: false, RatePerSec: 0.4, Burst: 1},
 			SourceCrossrefTDM:      {Enabled: false, RatePerSec: 1, Burst: 1},
 			SourceCrossrefMetadata: {Enabled: true, RatePerSec: 1, Burst: 1},
+			SourceRetractionWatch:  {Enabled: true, RatePerSec: 1, Burst: 1},
 		},
 	}
 }

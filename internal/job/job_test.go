@@ -548,7 +548,7 @@ func TestOpenHumanActionRefreshesExistingOpenKind(t *testing.T) {
 	for _, action := range actions {
 		switch action.ID {
 		case firstID:
-			if action.Detail != "latest detail" || action.Status != "open" {
+			if action.Detail != "latest detail" || action.Status != "open" || action.Revision != 2 {
 				t.Fatalf("refreshed action = %+v", action)
 			}
 		case otherID:
@@ -625,11 +625,60 @@ func parkIdentityReview(t *testing.T, js *Store, requestID string) (string, int6
 	if err := js.MarkCandidate(ctx, candidate.ID, "skipped"); err != nil {
 		t.Fatal(err)
 	}
-	actionID, err := js.OpenHumanAction(ctx, id, "verify_identity", "local quarantine file: /tmp/paper.pdf")
+	actionID, err := js.OpenHumanAction(ctx, id, "verify_identity", "local quarantine file: /tmp/paper.pdf",
+		WithHumanActionBinding(HumanActionBinding{
+			CandidateID: candidate.ID, QuarantinePath: "/tmp/paper.pdf",
+			QuarantineSHA256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		}),
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return id, candidate.ID, actionID
+}
+
+func TestResolveReviewCASOutcomes(t *testing.T) {
+	const sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	tests := []struct {
+		name     string
+		revision int64
+		sha      string
+		want     ReviewOutcome
+	}{
+		{name: "wrong revision conflicts", revision: 2, sha: sha, want: ReviewConflict},
+		{name: "wrong SHA conflicts", revision: 1, sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", want: ReviewConflict},
+		{name: "applies", revision: 1, sha: sha, want: ReviewApplied},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			js := testStore(t)
+			id, _, actionID := parkIdentityReview(t, js, "wr_review_cas_"+test.name)
+			got, err := js.ResolveReviewCAS(context.Background(), ResolveReviewInput{
+				ActionID: actionID, Verdict: "accept", ExpectedRevision: test.revision, ExpectedSHA256: test.sha,
+			})
+			if err != nil || got.Outcome != test.want {
+				t.Fatalf("ResolveReviewCAS() = %+v, %v; want %s, nil", got, err, test.want)
+			}
+			if test.want != ReviewApplied {
+				row, _ := js.Get(context.Background(), id)
+				if row.State != StateNeedsReview {
+					t.Fatalf("conflicted resolution changed job = %+v", row)
+				}
+			}
+		})
+	}
+
+	js := testStore(t)
+	_, _, actionID := parkIdentityReview(t, js, "wr_review_cas_replay")
+	input := ResolveReviewInput{
+		ActionID: actionID, Verdict: "accept", ExpectedRevision: 1, ExpectedSHA256: sha,
+	}
+	if got, err := js.ResolveReviewCAS(context.Background(), input); err != nil || got.Outcome != ReviewApplied {
+		t.Fatalf("first ResolveReviewCAS() = %+v, %v", got, err)
+	}
+	if got, err := js.ResolveReviewCAS(context.Background(), input); err != nil || got.Outcome != ReviewAlreadyApplied {
+		t.Fatalf("replayed ResolveReviewCAS() = %+v, %v; want already_applied", got, err)
+	}
 }
 
 func TestResolveHumanActionRequiresOpenAction(t *testing.T) {

@@ -210,6 +210,17 @@ func (r *Runner) ClearDigest(ctx context.Context, watchID int64) (int, error) {
 	return r.Store.ClearDigest(ctx, watchID)
 }
 
+// ConsumeDigest marks specific pending alert discoveries as dismissed while
+// serializing with acquisition.
+func (r *Runner) ConsumeDigest(ctx context.Context, watchID int64, workKeys []string) (int, error) {
+	if r == nil || r.Store == nil {
+		return 0, errors.New("watch runner is not configured")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.Store.ConsumeDigest(ctx, watchID, workKeys)
+}
+
 // RunDue serially executes all watches due at the current time. Per-watch
 // failures are recorded by runWatch and intentionally do not stop later due
 // watches or crash the daemon scheduler.
@@ -511,6 +522,7 @@ func digestEntriesForDiscovered(requests []discoveredRequest) ([]DigestEntry, er
 			DOI:         doi,
 			Identifiers: request.Work.Identifiers,
 			IsOA:        request.Discovered.IsOA,
+			Abstract:    request.Discovered.Abstract,
 		})
 	}
 	return entries, nil
