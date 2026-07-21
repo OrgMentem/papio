@@ -681,10 +681,12 @@ type ReviewPreviewRequestPayload struct {
 // immutable file metadata; a quarantine path must never cross the bridge.
 type ReviewPreviewResultPayload struct {
 	RequestID string `json:"request_id"`
-	URL       string `json:"url"`
-	SHA256    string `json:"sha256"`
-	SizeBytes int64  `json:"size_bytes"`
-	ExpiresAt string `json:"expires_at"`
+	Outcome   string `json:"outcome"`
+	Detail    string `json:"detail,omitempty"`
+	URL       string `json:"url,omitempty"`
+	SHA256    string `json:"sha256,omitempty"`
+	SizeBytes int64  `json:"size_bytes,omitempty"`
+	ExpiresAt string `json:"expires_at,omitempty"`
 }
 
 // BrowserMessage is one decoded native-messaging envelope. Payload holds the
@@ -998,7 +1000,7 @@ func DecodeBrowserMessage(data []byte) (*BrowserMessage, error) {
 	case MsgReviewPreviewResult:
 		p := &ReviewPreviewResultPayload{}
 		err = decodeTriagePayload(env.Payload, payloadFields, "review_preview_result",
-			[]string{"request_id", "url", "sha256", "size_bytes", "expires_at"}, p)
+			[]string{"request_id", "outcome"}, p)
 		if err == nil {
 			err = p.validate()
 		}
@@ -1640,6 +1642,21 @@ func validateTriageURL(what, value, scheme string) error {
 func (p *ReviewPreviewResultPayload) validate() error {
 	if err := validateCorrelationID("review_preview_result.request_id", p.RequestID); err != nil {
 		return err
+	}
+	if err := enumRequired("review_preview_result.outcome", p.Outcome, "ok", "error"); err != nil {
+		return err
+	}
+	if err := validateTriageText("review_preview_result.detail", p.Detail, 1000); err != nil {
+		return err
+	}
+	if p.Outcome == "error" {
+		if p.URL != "" || p.SHA256 != "" || p.SizeBytes != 0 || p.ExpiresAt != "" {
+			return fmt.Errorf("review_preview_result: error outcome must not carry capability fields")
+		}
+		return nil
+	}
+	if p.Detail != "" {
+		return fmt.Errorf("review_preview_result: ok outcome must not carry a detail")
 	}
 	if err := validateTriageURL("review_preview_result.url", p.URL, "http"); err != nil {
 		return err

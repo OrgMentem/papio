@@ -818,11 +818,11 @@ func (b *Bridge) humanActionResolveResult(requestID, outcome, detail string) ([]
 
 func (b *Bridge) reviewPreview(ctx context.Context, request *protocol.ReviewPreviewRequestPayload) ([]json.RawMessage, error) {
 	if b.jobs == nil || b.preview == nil {
-		return nil, errors.New("review preview is not configured")
+		return b.reviewPreviewError(request.RequestID, "review preview is not configured")
 	}
 	actions, err := b.jobs.ListHumanActions(ctx, true)
 	if err != nil {
-		return nil, err
+		return b.reviewPreviewError(request.RequestID, "review preview is temporarily unavailable")
 	}
 	var action *job.HumanAction
 	for i := range actions {
@@ -832,19 +832,36 @@ func (b *Bridge) reviewPreview(ctx context.Context, request *protocol.ReviewPrev
 		}
 	}
 	if action == nil || action.Kind != "verify_identity" {
-		return nil, fmt.Errorf("review action %d is unavailable", request.ActionID)
+		return b.reviewPreviewError(request.RequestID, fmt.Sprintf("review action %d is unavailable", request.ActionID))
 	}
 	info, err := os.Stat(action.QuarantinePath)
 	if err != nil || !info.Mode().IsRegular() {
-		return nil, fmt.Errorf("review action %d preview is unavailable", request.ActionID)
+		return b.reviewPreviewError(request.RequestID, fmt.Sprintf("review action %d preview is unavailable", request.ActionID))
 	}
 	url, err := b.preview.Issue(action.ID, action.QuarantinePath, action.QuarantineSHA256, info.Size(), previewCapabilityTTL)
 	if err != nil {
-		return nil, err
+		return b.reviewPreviewError(request.RequestID, "preview could not be issued")
 	}
 	frame, err := b.frame(protocol.MsgReviewPreviewResult, "", protocol.ReviewPreviewResultPayload{
-		RequestID: request.RequestID, URL: url, SHA256: action.QuarantineSHA256, SizeBytes: info.Size(),
+		RequestID: request.RequestID, Outcome: "ok", URL: url, SHA256: action.QuarantineSHA256, SizeBytes: info.Size(),
 		ExpiresAt: b.now().UTC().Add(previewCapabilityTTL).Format(time.RFC3339Nano),
+	})
+	if err != nil {
+		return nil, err
+	}
+	return []json.RawMessage{frame}, nil
+}
+
+// reviewPreviewError reports an ordinary, expected preview failure (not
+// configured, action gone, file missing, issuance failure) as a structured
+// review_preview_result frame instead of a raw Go error. A raw error here
+// would propagate through Sync into the native host's fatal error path
+// (internal/nativehost/host.go: any browser.sync error tears the whole
+// native-messaging connection down), turning a routine "this PDF is no
+// longer available" into a hard disconnect on every click.
+func (b *Bridge) reviewPreviewError(requestID, detail string) ([]json.RawMessage, error) {
+	frame, err := b.frame(protocol.MsgReviewPreviewResult, "", protocol.ReviewPreviewResultPayload{
+		RequestID: requestID, Outcome: "error", Detail: truncate(detail, 1000),
 	})
 	if err != nil {
 		return nil, err

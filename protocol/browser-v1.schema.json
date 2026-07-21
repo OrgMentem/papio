@@ -602,14 +602,38 @@
           "payload": {
             "type": "object",
             "additionalProperties": false,
-            "required": ["request_id", "url", "sha256", "size_bytes", "expires_at"],
+            "required": ["request_id", "outcome"],
             "properties": {
               "request_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,64}$" },
+              "outcome": { "enum": ["ok", "error"] },
+              "detail": { "type": "string", "maxLength": 1000, "pattern": "^[^\\u0000]*$" },
               "url": { "type": "string", "maxLength": 4000, "pattern": "^http://127\\.0\\.0\\.1:[0-9]{1,5}/p/[A-Za-z0-9_-]+$" },
               "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
               "size_bytes": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
               "expires_at": { "type": "string", "format": "date-time" }
-            }
+            },
+            "allOf": [
+              {
+                "if": { "properties": { "outcome": { "const": "ok" } }, "required": ["outcome"] },
+                "then": {
+                  "required": ["url", "sha256", "size_bytes", "expires_at"],
+                  "not": { "required": ["detail"] }
+                }
+              },
+              {
+                "if": { "properties": { "outcome": { "const": "error" } }, "required": ["outcome"] },
+                "then": {
+                  "not": {
+                    "anyOf": [
+                      { "required": ["url"] },
+                      { "required": ["sha256"] },
+                      { "required": ["size_bytes"] },
+                      { "required": ["expires_at"] }
+                    ]
+                  }
+                }
+              }
+            ]
           }
         }
       }

@@ -237,10 +237,12 @@ export interface ReviewPreviewRequestPayload {
 
 export interface ReviewPreviewResultPayload {
   request_id: string;
-  url: string;
-  sha256: string;
-  size_bytes: number;
-  expires_at: string;
+  outcome: "ok" | "error";
+  detail?: string;
+  url?: string;
+  sha256?: string;
+  size_bytes?: number;
+  expires_at?: string;
 }
 
 export interface BrowserMessage {
@@ -832,8 +834,20 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
       break;
     }
     case "review_preview_result": {
-      requireKeys(p, "review_preview_result", ["request_id", "url", "sha256", "size_bytes", "expires_at"]);
+      requireKeys(p, "review_preview_result", ["request_id", "outcome"], ["detail", "url", "sha256", "size_bytes", "expires_at"]);
       correlationID(p, "request_id", "review_preview_result");
+      const outcome = triageText(p, "outcome", "review_preview_result", 10);
+      if (outcome !== "ok" && outcome !== "error") fail("review_preview_result.outcome must be ok or error");
+      if ("detail" in p) triageText(p, "detail", "review_preview_result", 1000);
+      const hasCapability = "url" in p || "sha256" in p || "size_bytes" in p || "expires_at" in p;
+      if (outcome === "error") {
+        if (hasCapability) fail("review_preview_result: error outcome must not carry capability fields");
+        break;
+      }
+      if ("detail" in p) fail("review_preview_result: ok outcome must not carry a detail");
+      if (!("url" in p) || !("sha256" in p) || !("size_bytes" in p) || !("expires_at" in p)) {
+        fail("review_preview_result: ok outcome requires url, sha256, size_bytes, expires_at");
+      }
       const preview = triageURL(triageText(p, "url", "review_preview_result", 4000), "review_preview_result.url", "http:");
       if (preview.hostname !== "127.0.0.1" || preview.port === "" || !preview.pathname.startsWith("/p/") || preview.search !== "" || preview.hash !== "") {
         fail("review_preview_result.url must be a loopback capability URL");

@@ -1,0 +1,1 @@
+{"protocol":"papio-browser/1","type":"review_preview_result","msg_id":"preview-bad-003","seq":10,"payload":{"request_id":"request-0005","outcome":"error","detail":"unavailable","url":"http://127.0.0.1:12345/p/capability-token"}}

@@ -1194,7 +1194,7 @@ export class Bridge {
 
   async requestPreview(
     request: { action_id: number },
-  ): Promise<BrokerReply<{ preview: Record<string, unknown> }>> {
+  ): Promise<BrokerReply<{ outcome: string; detail?: string; preview?: Record<string, unknown> }>> {
     const result = await this.requestNative(
       "review_preview_request",
       request,
@@ -1204,8 +1204,16 @@ export class Bridge {
     );
     if (result.kind !== "response" || result.payload === undefined) return this.nativeFailure(result);
     if (result.code !== undefined) return this.failure(result.code, result.message ?? "The request is unavailable");
-    const { request_id: _requestID, ...preview } = result.payload;
-    return { ok: true, preview };
+    const outcome = result.payload["outcome"] as string;
+    if (outcome === "error") {
+      return {
+        ok: true,
+        outcome,
+        ...(typeof result.payload["detail"] === "string" ? { detail: result.payload["detail"] } : {}),
+      };
+    }
+    const { request_id: _requestID, outcome: _outcome, ...preview } = result.payload;
+    return { ok: true, outcome, preview };
   }
 
   /**

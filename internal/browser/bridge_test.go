@@ -361,7 +361,7 @@ func TestReviewPreviewAndResolveNeverLeakQuarantinePath(t *testing.T) {
 			continue
 		}
 		payload := msg.Payload.(*protocol.ReviewPreviewResultPayload)
-		if payload.RequestID != "request-preview-001" || payload.SHA256 != sha || payload.SizeBytes != int64(len("%PDF-preview")) {
+		if payload.RequestID != "request-preview-001" || payload.Outcome != "ok" || payload.SHA256 != sha || payload.SizeBytes != int64(len("%PDF-preview")) {
 			t.Fatalf("preview payload = %+v", payload)
 		}
 		if strings.Contains(string(raw[i]), path) || strings.Contains(string(raw[i]), "quarantine_path") {
@@ -389,6 +389,33 @@ func TestReviewPreviewAndResolveNeverLeakQuarantinePath(t *testing.T) {
 	if response.Code != http.StatusNotFound {
 		t.Fatalf("revoked preview status = %d, want %d", response.Code, http.StatusNotFound)
 	}
+}
+
+// A preview failure that predates this fix (action already gone, quarantine
+// file missing, etc.) was returned as a raw Go error, which propagated
+// through Sync() and, per internal/nativehost/host.go's fatal-error
+// contract, killed the whole native-messaging connection on every click.
+// It must instead come back as an ordinary review_preview_result frame with
+// outcome "error", leaving Sync() (and the connection) untouched.
+func TestReviewPreviewOnMissingActionReturnsErrorOutcomeWithoutFailingSync(t *testing.T) {
+	b, _, _, _ := newBridge(t)
+	runSync(t, b, hello())
+	msgs, _ := runSync(t, b, inFrame(t, protocol.MsgReviewPreviewRequest, "",
+		protocol.ReviewPreviewRequestPayload{RequestID: "request-preview-missing", ActionID: 999999}))
+	result := firstOfType(msgs, protocol.MsgReviewPreviewResult)
+	if result == nil {
+		t.Fatalf("review preview result missing: %v", msgs)
+	}
+	payload := result.Payload.(*protocol.ReviewPreviewResultPayload)
+	if payload.RequestID != "request-preview-missing" || payload.Outcome != "error" || payload.Detail == "" {
+		t.Fatalf("review preview error payload = %+v", payload)
+	}
+	if payload.URL != "" || payload.SHA256 != "" || payload.SizeBytes != 0 || payload.ExpiresAt != "" {
+		t.Fatalf("error outcome leaked capability fields: %+v", payload)
+	}
+	// The connection must still be usable: a follow-up sync succeeds (runSync
+	// itself fails the test if Sync returns an error).
+	runSync(t, b)
 }
 
 func TestHelloAckAdvertisesResolverOrigins(t *testing.T) {

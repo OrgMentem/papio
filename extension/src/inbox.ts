@@ -660,16 +660,34 @@ async function requestPreview(item: TriageSnapshotItem): Promise<void> {
   if (!beginMutation(item)) return;
   try {
     const response = await runtimeMessage("papio.preview", { action_id: item.action_id });
-    const result = responseValue<{ url: string; sha256: string }>(response, "preview");
     state.pending.delete(item.id);
-    if (!result.ok) {
-      setConnection(false, result.message);
-      operationMessage(item.id, result.message, "offline");
+    // Only a genuine transport/RPC failure (ok !== true) means connectivity
+    // is actually down. The daemon rejecting this specific preview (action
+    // gone, quarantine file missing, …) comes back as ok:true with
+    // outcome:"error" — an ordinary business result, not a disconnect.
+    if (!isRecord(response) || response["ok"] !== true || typeof response["outcome"] !== "string") {
+      const message = errorFromResponse(response);
+      setConnection(false, message);
+      operationMessage(item.id, message, "offline");
       render();
       return;
     }
-    const url = safePreviewURL(result.value.url);
-    if (url === null || result.value.sha256 !== item.sha256) {
+    if (response["outcome"] === "error") {
+      const detail = typeof response["detail"] === "string" ? response["detail"] : "This PDF could not be previewed.";
+      operationMessage(item.id, detail, "error");
+      render();
+      return;
+    }
+    const preview = response["preview"];
+    if (!isRecord(preview) || typeof preview["url"] !== "string" || typeof preview["sha256"] !== "string") {
+      operationMessage(item.id, "The daemon returned an invalid preview.", "error");
+      render();
+      return;
+    }
+    const previewURL = preview["url"];
+    const previewSHA256 = preview["sha256"];
+    const url = safePreviewURL(previewURL);
+    if (url === null || previewSHA256 !== item.sha256) {
       operationMessage(item.id, "Preview did not match this snapshot — refreshed.", "info");
       render();
       await refreshInbox();

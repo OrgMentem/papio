@@ -212,7 +212,7 @@ test("keyboard navigation moves rows and verify_identity is preview-gated and co
   ], { counts: counts({ pending_total: 2, actions: 2, watch_hits: 0, retractions: 0 }) });
   const page = await inboxDocument((message) => {
     if (message.type === "papio.preview") {
-      return { ok: true, preview: { url: previewURL, sha256, size_bytes: 99, expires_at: "2026-07-21T10:10:00Z" } };
+      return { ok: true, outcome: "ok", preview: { url: previewURL, sha256, size_bytes: 99, expires_at: "2026-07-21T10:10:00Z" } };
     }
     if (message.type === "papio.action.resolve") return { ok: true, outcome: "applied" };
     return snapshotReply(fixture, message);
@@ -285,6 +285,31 @@ test("a daemon-down refresh leaves the page rendered, shows reconnect, and disab
   expect(page.document.getElementById("reconnect-daemon")?.hidden).toBe(false);
   expect(page.document.querySelector<HTMLButtonElement>("[data-operation='acquire']")?.disabled).toBe(true);
   expect(page.document.querySelector("[data-triage-item-id='hit:one']")?.textContent).toContain("Still visible");
+});
+
+test("a rejected preview (business error) stays connected and does not disconnect", async () => {
+  // Regression: the daemon rejecting one specific preview request (action
+  // already resolved, quarantine file gone, …) used to come back from the
+  // native bridge as a raw transport failure and got treated exactly like a
+  // dead connection — the banner flipped to Disconnected on every click even
+  // though nothing else was actually wrong. It must now surface as an
+  // ordinary per-item error with the connection left alone.
+  const fixture = snapshot([verifyIdentity()], {
+    counts: counts({ pending_total: 1, actions: 1, watch_hits: 0, retractions: 0 }),
+  });
+  const page = await inboxDocument((message) => {
+    if (message.type === "papio.preview") {
+      return { ok: true, outcome: "error", detail: "review action 17 is unavailable" };
+    }
+    return snapshotReply(fixture, message);
+  });
+  page.document.querySelector<HTMLButtonElement>("[data-operation='preview']")?.click();
+  await settle();
+  expect(page.document.querySelector(".item-result")?.textContent).toBe("review action 17 is unavailable");
+  expect(page.document.querySelector(".item-result")?.getAttribute("data-tone")).toBe("error");
+  expect(page.document.getElementById("connection-status")?.textContent).not.toContain("Disconnected");
+  expect(page.document.getElementById("reconnect-daemon")?.hidden).toBe(true);
+  expect(page.opened).toEqual([]);
 });
 
 test("an acknowledged removal focuses the next triage row", async () => {
