@@ -57,6 +57,83 @@ func TestCreateDefaultsCollectionToQuery(t *testing.T) {
 	}
 }
 
+func TestCreateDiscoveryCitationSnowballValidation(t *testing.T) {
+	watches := testStore(t)
+	base := CreateInput{Kind: KindDiscovery, CadenceHours: 24, PerRunCap: 2}
+	for _, test := range []struct {
+		name      string
+		input     CreateInput
+		wantCites string
+		wantErr   string
+	}{
+		{name: "cites only normalizes DOI", input: CreateInput{
+			Kind: KindDiscovery, CadenceHours: 24, PerRunCap: 2,
+			Filters: Filters{Cites: "HTTPS://DOI.ORG/10.1000/Seed."},
+		}, wantCites: "10.1000/seed"},
+		{name: "requires query or snowball", input: base, wantErr: "query is required unless a citation snowball"},
+		{name: "rejects malformed DOI", input: CreateInput{
+			Kind: KindDiscovery, CadenceHours: 24, PerRunCap: 2, Filters: Filters{Cites: "not-a-doi"},
+		}, wantErr: "invalid DOI for cites"},
+		{name: "rejects query and snowball", input: CreateInput{
+			Kind: KindDiscovery, Query: "retrieval", CadenceHours: 24, PerRunCap: 2, Filters: Filters{Cites: "10.1000/seed"},
+		}, wantErr: "cannot be combined with a citation snowball"},
+		{name: "rejects multiple snowballs", input: CreateInput{
+			Kind: KindDiscovery, CadenceHours: 24, PerRunCap: 2,
+			Filters: Filters{Cites: "10.1000/seed", CitedBy: "10.1000/other"},
+		}, wantErr: "exactly one citation snowball"},
+		{name: "rejects related snowballs", input: CreateInput{
+			Kind: KindDiscovery, CadenceHours: 24, PerRunCap: 2, Filters: Filters{RelatedTo: "10.1000/seed"},
+		}, wantErr: "related_to is unsupported"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			created, err := watches.Create(context.Background(), test.input)
+			if test.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+					t.Fatalf("Create() error = %v, want %q", err, test.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if created.Query != "" || created.Filters.Cites != test.wantCites {
+				t.Fatalf("created watch = %+v, want normalized cites %q", created, test.wantCites)
+			}
+			var filtersJSON string
+			if err := watches.S.DB().QueryRowContext(context.Background(), `SELECT filters_json FROM watches WHERE id = ?`, created.ID).Scan(&filtersJSON); err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(filtersJSON, `"cites":"10.1000/seed"`) {
+				t.Fatalf("filters_json = %s, want normalized cites", filtersJSON)
+			}
+		})
+	}
+}
+
+func TestScanWatchAcceptsLegacyFiltersJSON(t *testing.T) {
+	watches := testStore(t)
+	result, err := watches.S.DB().ExecContext(context.Background(), `
+		INSERT INTO watches (label, kind, mode, query, filters_json, collection, cadence_hours, per_run_cap, enabled, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`,
+		"legacy", KindDiscovery, ModeAcquire, "retrieval", `{"year_from":2020,"oa_only":true}`,
+		"Reading", 24, 2, "2026-07-21T00:00:00Z",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := result.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := watches.Get(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.Filters != (Filters{YearFrom: 2020, OAOnly: true}) {
+		t.Fatalf("legacy filters = %+v", created.Filters)
+	}
+}
+
 func TestCreateBackfillWatchValidation(t *testing.T) {
 	watches := testStore(t)
 	for _, test := range []struct {

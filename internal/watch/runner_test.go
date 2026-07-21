@@ -18,6 +18,41 @@ import (
 	"papio/internal/zotio"
 )
 
+func TestRunnerPassesCitationSnowballFiltersToDiscovery(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		filters Filters
+	}{
+		{name: "cites", filters: Filters{Cites: "10.1000/seed"}},
+		{name: "cited by", filters: Filters{CitedBy: "10.1000/seed"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			watches := testStore(t)
+			watched := createWatch(t, watches, CreateInput{
+				Kind: KindDiscovery, Mode: ModeAlert, CadenceHours: 24, PerRunCap: 2, Filters: test.filters,
+			})
+			discoveryFake := &fakeDiscovery{}
+			runner := &Runner{
+				Store: watches, Discovery: discoveryFake, Lookup: &fakeLookup{},
+				Now: func() time.Time { return time.Date(2026, 7, 21, 12, 0, 0, 0, time.UTC) },
+			}
+
+			if _, err := runner.Run(ctx, watched.ID); err != nil {
+				t.Fatal(err)
+			}
+			if len(discoveryFake.params) != 1 {
+				t.Fatalf("discovery searches = %d, want one", len(discoveryFake.params))
+			}
+			params := discoveryFake.params[0]
+			if params.Query != "" || params.Cites != test.filters.Cites || params.CitedBy != test.filters.CitedBy ||
+				params.RelatedTo != test.filters.RelatedTo {
+				t.Fatalf("discovery params = %+v, want snowball filters %+v", params, test.filters)
+			}
+		})
+	}
+}
+
 func TestRunnerHandlesArXivOnlyDiscoveries(t *testing.T) {
 	for _, mode := range []string{ModeAcquire, ModeAlert} {
 		t.Run(mode, func(t *testing.T) {

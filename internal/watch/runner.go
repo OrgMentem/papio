@@ -289,6 +289,7 @@ func (r *Runner) execute(ctx context.Context, watch Watch) (*RunResult, error) {
 	works, err := r.Discovery.Search(ctx, discovery.SearchParams{
 		Query: watch.Query, Limit: min(watch.PerRunCap*3, 25), Slim: true,
 		YearFrom: watch.Filters.YearFrom, YearTo: watch.Filters.YearTo, OAOnly: watch.Filters.OAOnly,
+		Cites: watch.Filters.Cites, CitedBy: watch.Filters.CitedBy, RelatedTo: watch.Filters.RelatedTo,
 	})
 	if err != nil {
 		return result, fmt.Errorf("discovery search: %w", err)

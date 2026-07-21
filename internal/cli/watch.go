@@ -26,6 +26,7 @@ func newWatchCommand(opt *options) *cobra.Command {
 
 func newWatchAddCommand(opt *options) *cobra.Command {
 	var label, collection, cadence, kind, mode string
+	var cites, citedBy, relatedTo string
 	var perRunCap, yearFrom, yearTo int
 	var oaOnly bool
 	command := &cobra.Command{
@@ -33,15 +34,20 @@ func newWatchAddCommand(opt *options) *cobra.Command {
 		Short: "Add a scheduled discovery watch",
 		Long: "Add a scheduled discovery watch. Backfill watches take no query. " +
 			"Alert-mode discovery watches report new works without acquiring them.",
-		Args: func(_ *cobra.Command, args []string) error {
+		Args: func(cmd *cobra.Command, args []string) error {
+			if err := cobra.MaximumNArgs(1)(cmd, args); err != nil {
+				return err
+			}
 			switch kind {
 			case watch.KindBackfill:
 				if len(args) != 0 {
 					return fmt.Errorf("backfill watches take no query")
 				}
 			case watch.KindDiscovery:
-				if len(args) != 1 {
-					return fmt.Errorf("discovery watches require one query")
+				if (len(args) == 0 || strings.TrimSpace(args[0]) == "") &&
+					strings.TrimSpace(cites) == "" &&
+					strings.TrimSpace(citedBy) == "" && strings.TrimSpace(relatedTo) == "" {
+					return fmt.Errorf("query is required unless a citation snowball DOI is supplied")
 				}
 			default:
 				return fmt.Errorf("unknown watch kind %q", kind)
@@ -59,7 +65,10 @@ func newWatchAddCommand(opt *options) *cobra.Command {
 			}
 			input := watch.CreateInput{
 				Label: label, Kind: kind, Mode: mode, Query: query, Collection: collection,
-				Filters:      watch.Filters{YearFrom: yearFrom, YearTo: yearTo, OAOnly: oaOnly},
+				Filters: watch.Filters{
+					YearFrom: yearFrom, YearTo: yearTo, OAOnly: oaOnly,
+					Cites: cites, CitedBy: citedBy, RelatedTo: relatedTo,
+				},
 				CadenceHours: cadenceHours, PerRunCap: perRunCap,
 			}
 			var created watch.Watch
@@ -79,6 +88,9 @@ func newWatchAddCommand(opt *options) *cobra.Command {
 	flags.IntVar(&yearFrom, "year-from", 0, "minimum publication year")
 	flags.IntVar(&yearTo, "year-to", 0, "maximum publication year")
 	flags.BoolVar(&oaOnly, "oa-only", false, "return only open-access works")
+	flags.StringVar(&cites, "cites", "", "DOI to find papers citing it (forward citations; OpenAlex cites: filter)")
+	flags.StringVar(&citedBy, "cited-by", "", "DOI to find papers it cites (backward references; OpenAlex cited_by: filter)")
+	flags.StringVar(&relatedTo, "related-to", "", "DOI to find OpenAlex-related papers (related_to: filter)")
 	return command
 }
 
@@ -97,6 +109,10 @@ func newWatchListCommand(opt *options) *cobra.Command {
 				state := "enabled"
 				if !item.Enabled {
 					state = "disabled"
+				}
+				filters := watchFilterSummary(item.Filters)
+				if filters != "" {
+					state += " | " + filters
 				}
 				if _, err := fmt.Fprintf(opt.out, "%d | %s | every %dh | %s\n", item.ID, item.Label, item.CadenceHours, state); err != nil {
 					return err
@@ -204,6 +220,26 @@ func newWatchRunCommand(opt *options) *cobra.Command {
 			return opt.printResult(result, "Watch %d queued %d paper(s)", result.WatchID, result.Queued)
 		},
 	}
+}
+
+func watchFilterSummary(filters watch.Filters) string {
+	parts := make([]string, 0, 6)
+	if filters.YearFrom != 0 || filters.YearTo != 0 {
+		parts = append(parts, fmt.Sprintf("years %d-%d", filters.YearFrom, filters.YearTo))
+	}
+	if filters.OAOnly {
+		parts = append(parts, "open access")
+	}
+	if filters.Cites != "" {
+		parts = append(parts, "cites "+filters.Cites)
+	}
+	if filters.CitedBy != "" {
+		parts = append(parts, "cited by "+filters.CitedBy)
+	}
+	if filters.RelatedTo != "" {
+		parts = append(parts, "related to "+filters.RelatedTo)
+	}
+	return strings.Join(parts, ", ")
 }
 
 func parseWatchCadence(value string) (int, error) {

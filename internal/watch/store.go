@@ -16,6 +16,7 @@ import (
 
 	"papio/internal/protocol"
 	"papio/internal/store"
+	"papio/internal/work"
 )
 
 const (
@@ -33,9 +34,12 @@ const (
 // apply. Query and limit live on Watch so the search is always bounded by its
 // per-run cap.
 type Filters struct {
-	YearFrom int  `json:"year_from,omitempty"`
-	YearTo   int  `json:"year_to,omitempty"`
-	OAOnly   bool `json:"oa_only,omitempty"`
+	YearFrom  int    `json:"year_from,omitempty"`
+	YearTo    int    `json:"year_to,omitempty"`
+	OAOnly    bool   `json:"oa_only,omitempty"`
+	Cites     string `json:"cites,omitempty"`
+	CitedBy   string `json:"cited_by,omitempty"`
+	RelatedTo string `json:"related_to,omitempty"`
 }
 
 // Watch is one durable scheduled discovery search or library backfill.
@@ -1023,6 +1027,49 @@ func scanWatch(scanner watchScanner) (*Watch, error) {
 	return &watch, nil
 }
 
+func (filters Filters) citationSnowballCount() int {
+	count := 0
+	for _, doi := range []string{filters.Cites, filters.CitedBy, filters.RelatedTo} {
+		if strings.TrimSpace(doi) != "" {
+			count++
+		}
+	}
+	return count
+}
+
+func normalizeCitationSnowballFilters(filters *Filters) error {
+	for _, seed := range []struct {
+		name  string
+		value *string
+	}{
+		{name: "cites", value: &filters.Cites},
+		{name: "cited_by", value: &filters.CitedBy},
+		{name: "related_to", value: &filters.RelatedTo},
+	} {
+		if strings.TrimSpace(*seed.value) == "" {
+			*seed.value = ""
+			continue
+		}
+		doi, err := work.NormalizeDOI(*seed.value)
+		if err != nil {
+			return fmt.Errorf("watch invalid DOI for %s: %w", seed.name, err)
+		}
+		*seed.value = doi
+	}
+	return nil
+}
+
+func watchSnowballLabel(filters Filters) string {
+	switch {
+	case filters.Cites != "":
+		return "cites: " + filters.Cites
+	case filters.CitedBy != "":
+		return "cited by: " + filters.CitedBy
+	default:
+		return "related to: " + filters.RelatedTo
+	}
+}
+
 func normalizeCreateInput(input CreateInput) (CreateInput, error) {
 	input.Kind = strings.TrimSpace(input.Kind)
 	input.Mode = strings.TrimSpace(input.Mode)
@@ -1056,16 +1103,40 @@ func normalizeCreateInput(input CreateInput) (CreateInput, error) {
 	if input.Filters.YearFrom > 0 && input.Filters.YearTo > 0 && input.Filters.YearFrom > input.Filters.YearTo {
 		return CreateInput{}, errors.New("watch year_from cannot exceed year_to")
 	}
+	if err := normalizeCitationSnowballFilters(&input.Filters); err != nil {
+		return CreateInput{}, err
+	}
 	switch input.Kind {
 	case KindDiscovery:
-		if input.Query == "" {
-			return CreateInput{}, errors.New("watch query is required")
+		snowballCount := input.Filters.citationSnowballCount()
+		if input.Query == "" && snowballCount == 0 {
+			return CreateInput{}, errors.New("watch query is required unless a citation snowball DOI is supplied")
+		}
+		// Watches do not select a single discovery source, so they must use the
+		// common Semantic Scholar/OpenAlex snowball subset to avoid failing every
+		// scheduled tick when Semantic Scholar is configured.
+		if snowballCount > 1 {
+			return CreateInput{}, errors.New("watch supports exactly one citation snowball DOI because configured discovery sources may include Semantic Scholar")
+		}
+		if input.Filters.RelatedTo != "" {
+			return CreateInput{}, errors.New("watch related_to is unsupported because configured discovery sources may include Semantic Scholar")
+		}
+		if input.Query != "" && snowballCount != 0 {
+			return CreateInput{}, errors.New("watch query cannot be combined with a citation snowball because configured discovery sources may include Semantic Scholar")
 		}
 		if input.Label == "" {
-			input.Label = input.Query
+			if input.Query != "" {
+				input.Label = input.Query
+			} else {
+				input.Label = watchSnowballLabel(input.Filters)
+			}
 		}
 		if input.Collection == "" {
-			input.Collection = input.Query
+			if input.Query != "" {
+				input.Collection = input.Query
+			} else {
+				input.Collection = watchSnowballLabel(input.Filters)
+			}
 		}
 	case KindBackfill:
 		if input.Query != "" {

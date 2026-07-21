@@ -40,7 +40,7 @@ func TestWatchCommandExposesRequestedFlags(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"label", "collection", "kind", "mode", "cadence", "limit-per-run", "year-from", "year-to", "oa-only"} {
+	for _, name := range []string{"label", "collection", "kind", "mode", "cadence", "limit-per-run", "year-from", "year-to", "oa-only", "cites", "cited-by", "related-to"} {
 		if add.Flags().Lookup(name) == nil {
 			t.Fatalf("watch add missing --%s", name)
 		}
@@ -73,6 +73,108 @@ func TestWatchCommandBackfillArgsAndDigestMetadata(t *testing.T) {
 	}
 	if digest.Annotations["mcp:read-only"] != "true" || digest.Flags().Lookup("limit") == nil {
 		t.Fatalf("watch digest metadata = %#v, flags = %#v", digest.Annotations, digest.Flags())
+	}
+}
+
+func TestWatchAddAllowsCitationSnowballWithoutQuery(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	root := NewInProcessRoot(&stdout, &stderr, config.Config{}, func(_ context.Context, method string, params any, result any) error {
+		if method != "watch.add" {
+			t.Fatalf("method = %q, want watch.add", method)
+		}
+		input, ok := params.(watch.CreateInput)
+		if !ok {
+			t.Fatalf("params = %T, want watch.CreateInput", params)
+		}
+		if input.Query != "" || input.Filters.Cites != "HTTPS://DOI.ORG/10.1000/Seed." {
+			t.Fatalf("watch input = %+v, want cites-only filter", input)
+		}
+		*result.(*watch.Watch) = watch.Watch{ID: 1, Label: "cites: 10.1000/seed"}
+		return nil
+	})
+	root.SetArgs([]string{"watch", "add", "--cites", "HTTPS://DOI.ORG/10.1000/Seed."})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("watch add --cites: %v (%s)", err, stderr.String())
+	}
+}
+
+func TestWatchAddQueryOrCitationSnowballArgs(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		args    []string
+		cites   string
+		wantErr string
+	}{
+		{name: "missing query and snowball", wantErr: "query is required unless a citation snowball"},
+		{name: "cites without query", cites: "10.1000/seed"},
+		{name: "query", args: []string{"retrieval"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			command := newWatchCommand(&options{})
+			add, _, err := command.Find([]string{"add"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if test.cites != "" {
+				if err := add.Flags().Set("cites", test.cites); err != nil {
+					t.Fatal(err)
+				}
+			}
+			err = add.Args(add, test.args)
+			if test.wantErr == "" {
+				if err != nil {
+					t.Fatal(err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+				t.Fatalf("watch add Args(%q) error = %v, want %q", test.args, err, test.wantErr)
+			}
+		})
+	}
+}
+
+func TestWatchListRendersCitationFilters(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	root := NewInProcessRoot(&stdout, &stderr, config.Config{}, func(_ context.Context, method string, _ any, result any) error {
+		if method != "watch.list" {
+			t.Fatalf("method = %q, want watch.list", method)
+		}
+		*result.(*[]watch.Watch) = []watch.Watch{{
+			ID: 1, Label: "seed", CadenceHours: 24, Enabled: true, Filters: watch.Filters{Cites: "10.1000/seed"},
+		}}
+		return nil
+	})
+	root.SetArgs([]string{"watch", "list"})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("watch list: %v (%s)", err, stderr.String())
+	}
+	if got := stdout.String(); !strings.Contains(got, "cites 10.1000/seed") {
+		t.Fatalf("watch list output = %q, want citation filter", got)
+	}
+}
+
+func TestWatchListJSONIncludesCitationFilters(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	root := NewInProcessRoot(&stdout, &stderr, config.Config{}, func(_ context.Context, method string, _ any, result any) error {
+		if method != "watch.list" {
+			t.Fatalf("method = %q, want watch.list", method)
+		}
+		*result.(*[]watch.Watch) = []watch.Watch{{
+			ID: 1, Filters: watch.Filters{CitedBy: "10.1000/seed"},
+		}}
+		return nil
+	})
+	root.SetArgs([]string{"--json", "watch", "list"})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("watch list --json: %v (%s)", err, stderr.String())
+	}
+	var listed []watch.Watch
+	if err := json.Unmarshal(stdout.Bytes(), &listed); err != nil {
+		t.Fatal(err)
+	}
+	if len(listed) != 1 || listed[0].Filters.CitedBy != "10.1000/seed" {
+		t.Fatalf("JSON watch list = %+v, want cited_by filter", listed)
 	}
 }
 
