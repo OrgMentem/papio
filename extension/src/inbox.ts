@@ -274,6 +274,8 @@ function selectItem(itemID: string, focus: boolean): void {
   if (focus) rowForItem(itemID)?.focus();
 }
 
+const LINK_LABELS: Record<string, string> = { doi: "DOI", arxiv: "arXiv", openalex: "OpenAlex" };
+
 function renderLinks(item: TriageSnapshotItem): HTMLElement | null {
   const links = element("p");
   links.className = "item-links";
@@ -282,7 +284,7 @@ function renderLinks(item: TriageSnapshotItem): HTMLElement | null {
     const url = safeExternalURL(link.url);
     if (url === null) continue;
     if (count > 0) links.append(document.createTextNode(" · "));
-    const anchor = element("a", `Open ${link.rel}`);
+    const anchor = element("a", `Open ${LINK_LABELS[link.rel] ?? link.rel}`);
     anchor.href = url;
     anchor.target = "_blank";
     anchor.rel = "noopener noreferrer";
@@ -324,27 +326,70 @@ function operationButton(item: TriageSnapshotItem, operation: TriageOperation): 
   return button;
 }
 
+// The daemon falls back to the action kind ("manual download") when a job
+// has no bibliographic title. Prefer the first safe link (usually the DOI)
+// as the display title, and mark either fallback as a placeholder so it does
+// not masquerade as a paper title.
+function displayTitle(item: TriageSnapshotItem): { text: string; placeholder: boolean } {
+  const kindLabel =
+    item.kind === "human_action" && typeof item.action_kind === "string"
+      ? item.action_kind.replaceAll("_", " ")
+      : null;
+  if (kindLabel === null || item.title !== kindLabel) return { text: item.title, placeholder: false };
+  const url = firstSafeLink(item);
+  if (url !== null) return { text: url.replace(/^https:\/\//, ""), placeholder: true };
+  return { text: item.title, placeholder: true };
+}
+
+function isFilePath(token: string): boolean {
+  return /^\/(?:[^/]+\/){2,}[^/]+$/.test(token);
+}
+
+// Absolute filesystem paths inside a fact (quarantine files) render as an
+// ellipsized code span with the full path in the tooltip, so a long path
+// cannot dominate the row. URLs keep their scheme and stay plain text.
+function appendFactText(target: HTMLElement, text: string): void {
+  const parts = text.split(/(\s+)/);
+  if (!parts.some(isFilePath)) {
+    target.textContent = text;
+    return;
+  }
+  for (const part of parts) {
+    if (isFilePath(part)) {
+      const span = element("span", part);
+      span.className = "file-path";
+      span.title = part;
+      target.append(span);
+    } else if (part !== "") {
+      target.append(document.createTextNode(part));
+    }
+  }
+}
+
 function renderItem(item: TriageSnapshotItem): HTMLElement {
   const card = element("article");
   card.className = "triage-item";
   card.dataset.triageItemId = item.id;
   card.tabIndex = item.id === state.selectedID ? 0 : -1;
-  card.setAttribute("aria-label", item.title);
+  const title = displayTitle(item);
+  card.setAttribute("aria-label", title.text);
   card.addEventListener("focusin", () => selectItem(item.id, false));
   card.addEventListener("click", () => selectItem(item.id, false));
 
-  card.append(element("h3", item.title));
+  const heading = element("h3", title.text);
+  if (title.placeholder) heading.classList.add("title-placeholder");
+  card.append(heading);
 
   if (item.facts.length > 0) {
     const facts = element("dl");
     facts.className = "item-facts";
     for (const fact of item.facts) {
+      const slug = fact.label.toLowerCase().replace(/[^a-z0-9]+/g, "-");
       const dt = element("dt", fact.label);
-      const dd = element("dd", fact.text);
-      if (fact.label === "Action") {
-        dt.dataset.fact = "action";
-        dd.dataset.fact = "action";
-      }
+      dt.dataset.fact = slug;
+      const dd = element("dd");
+      dd.dataset.fact = slug;
+      appendFactText(dd, fact.text);
       facts.append(dt, dd);
     }
     card.append(facts);
@@ -355,7 +400,7 @@ function renderItem(item: TriageSnapshotItem): HTMLElement {
 
   const controls = element("div");
   controls.className = "item-controls";
-  controls.setAttribute("aria-label", `Actions for ${item.title}`);
+  controls.setAttribute("aria-label", `Actions for ${title.text}`);
   const preview = previewButton(item);
   if (preview !== null) controls.append(preview);
   for (const operation of item.ops) controls.append(operationButton(item, operation));
@@ -388,7 +433,11 @@ function renderCounts(): void {
     elements.counts.textContent = "Counts unavailable";
     return;
   }
-  elements.counts.textContent = `${counts.pending_total} pending · ${counts.retractions} retractions · ${counts.actions} human actions · ${counts.watch_hits} watch hits`;
+  const parts = [`${counts.pending_total} pending`];
+  if (counts.retractions > 0) parts.push(`${counts.retractions} retractions`);
+  if (counts.actions > 0) parts.push(`${counts.actions} human actions`);
+  if (counts.watch_hits > 0) parts.push(`${counts.watch_hits} watch hits`);
+  elements.counts.textContent = parts.join(" · ");
 }
 
 function renderDialog(): void {

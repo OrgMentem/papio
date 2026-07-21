@@ -28,6 +28,20 @@ for the full pre-split extension history.
   "open access — just render it" handoffs from ones needing an institutional
   sign-in (groundwork for surfacing this in the popup).
 
+### Changed
+
+- **Inbox visual overhaul**: paper titles are larger, semibold, and clamp to
+  two lines instead of truncating at one; the action-kind pill no longer
+  stretches into a full-width bar; authors/year render as plain metadata
+  prose (labels kept for screen readers); job ids demote to a muted
+  monospace line; quarantine file paths collapse to an ellipsized code span
+  with the full path in the tooltip. "Open" is styled as the primary action
+  on rows where it is the advancing step, while Dismiss/Reject become quiet
+  ghost buttons with a danger hover. The header consolidates to two rows,
+  the counts line omits zero buckets, link labels capitalize properly
+  ("Open DOI"), and rows whose title is just the action kind fall back to
+  the paper's DOI styled as a placeholder.
+
 ## [0.4.3] - 2026-07-20
 
 ### Fixed
