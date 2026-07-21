@@ -419,7 +419,7 @@ test("backend identifiers collapse into a details section and the citation carri
 
   // The job id lives only inside the collapsed backend-details section.
   const debug = row?.querySelector(".item-debug");
-  expect(debug?.querySelector("summary")?.textContent).toBe("Backend details");
+  expect(debug?.querySelector("summary")?.getAttribute("aria-label")).toBe("Backend details");
   expect(debug?.textContent).toContain("job-18");
   expect(row?.querySelector(".item-facts")).toBeNull();
 

@@ -533,9 +533,11 @@
         width: 26px;
       }
 
-      /* Instant tooltip: the glyph's meaning appears on hover without the
-         native title delay. Screen readers get it from aria-label instead. */
-      .triage-item .item-status::after {
+      /* Instant tooltip for icon-only affordances (status glyphs, the
+         backend-details disclosure): the meaning appears on hover without
+         the native title delay. Screen readers get aria-label instead. */
+      .triage-item .item-status::after,
+      .triage-item .item-debug summary::after {
         background: var(--color-ink);
         border-radius: var(--radius-control);
         color: var(--color-page);
@@ -553,7 +555,8 @@
         z-index: 1;
       }
 
-      .triage-item .item-status:hover::after {
+      .triage-item .item-status:hover::after,
+      .triage-item .item-debug summary:hover::after {
         opacity: 1;
       }
 
@@ -602,11 +605,36 @@
         font-size: var(--font-size-label);
       }
 
+      /* Icon-only disclosure: a quiet "⋯" chip; the label lives in the
+         tooltip and accessible name. */
       .item-debug summary {
+        align-items: center;
+        border: 1px solid transparent;
+        border-radius: var(--radius-pill);
         cursor: pointer;
-        letter-spacing: 0.04em;
-        text-transform: uppercase;
-        width: fit-content;
+        display: inline-flex;
+        font-weight: 700;
+        height: 18px;
+        justify-content: center;
+        line-height: 1;
+        list-style: none;
+        position: relative;
+        width: 26px;
+      }
+
+      .item-debug summary::-webkit-details-marker {
+        display: none;
+      }
+
+      .item-debug summary:hover {
+        background: var(--color-surface-hover);
+        border-color: var(--color-control-border);
+      }
+
+      .item-debug[open] summary {
+        background: var(--color-surface-hover);
+        border-color: var(--color-control-border);
+        color: var(--color-context);
       }
 
       .item-debug dl {

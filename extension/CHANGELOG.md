@@ -39,8 +39,8 @@ for the full pre-split extension history.
   spells out all five. The footer (legend + keyboard help) sticks to the
   viewport bottom, so both stay visible without scrolling.
 - **Collapsible backend details per inbox row**: item id, job id, and
-  revision move out of the visible row into a collapsed "Backend details"
-  section.
+  revision move out of the visible row into a collapsed section behind a
+  quiet "⋯" chip (meaning on hover; "Backend details" to screen readers).
 
 ### Changed
 

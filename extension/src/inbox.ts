@@ -533,7 +533,10 @@ function renderDebug(item: TriageSnapshotItem): HTMLElement {
   }
   const debug = element("details");
   debug.className = "item-debug";
-  debug.append(element("summary", "Backend details"));
+  const summary = element("summary", "⋯");
+  summary.dataset.label = "Backend details";
+  summary.setAttribute("aria-label", "Backend details");
+  debug.append(summary);
   const list = element("dl");
   for (const [label, value] of rows) list.append(element("dt", label), element("dd", value));
   debug.append(list);
