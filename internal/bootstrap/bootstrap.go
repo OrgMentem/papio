@@ -253,12 +253,14 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 		updates = update.New(cfg.DataDir)
 	}
 
+	previewServer := preview.New()
+
 	system := &System{
 		Config: cfg, Store: db, Jobs: jobs, Artifacts: artifacts, Budgets: budgets,
 		App: service, Scheduler: scheduler, Watches: watches, WatchRunner: watchRunner,
 		Bundle:        bundleExporter,
-		Browser:       browser.NewBridge(jobs, service, cfg, version, nil),
-		Preview:       preview.New(),
+		Browser:       browser.NewBridge(jobs, service, triageService, watchRunner, previewServer, cfg, version, nil),
+		Preview:       previewServer,
 		Discovery:     discoveryClient,
 		Zotio:         zotioService,
 		Updates:       updates,

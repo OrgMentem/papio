@@ -400,21 +400,31 @@ func enumRequired(field, value string, allowed ...string) error {
 
 // Browser message types.
 const (
-	MsgHello            = "hello"
-	MsgHelloAck         = "hello_ack"
-	MsgPageAcquire      = "page_acquire"
-	MsgPageAcquireAck   = "page_acquire_ack"
-	MsgJobOffer         = "job_offer"
-	MsgJobAccept        = "job_accept"
-	MsgJobReject        = "job_reject"
-	MsgAuthPending      = "auth_pending"
-	MsgAuthReturned     = "auth_returned"
-	MsgDownloadStarted  = "download_started"
-	MsgDownloadComplete = "download_complete"
-	MsgProviderOutcome  = "provider_outcome"
-	MsgCancel           = "cancel"
-	MsgAck              = "ack"
-	MsgError            = "error"
+	MsgHello                    = "hello"
+	MsgHelloAck                 = "hello_ack"
+	MsgPageAcquire              = "page_acquire"
+	MsgPageAcquireAck           = "page_acquire_ack"
+	MsgJobOffer                 = "job_offer"
+	MsgJobAccept                = "job_accept"
+	MsgJobReject                = "job_reject"
+	MsgAuthPending              = "auth_pending"
+	MsgAuthReturned             = "auth_returned"
+	MsgDownloadStarted          = "download_started"
+	MsgDownloadComplete         = "download_complete"
+	MsgProviderOutcome          = "provider_outcome"
+	MsgCancel                   = "cancel"
+	MsgAck                      = "ack"
+	MsgError                    = "error"
+	MsgTriageSnapshotRequest    = "triage_snapshot_request"
+	MsgTriageSnapshotResponse   = "triage_snapshot_response"
+	MsgTriageCountsRequest      = "triage_counts_request"
+	MsgTriageCountsResponse     = "triage_counts_response"
+	MsgTriageDecide             = "triage_decide"
+	MsgTriageDecideResult       = "triage_decide_result"
+	MsgHumanActionResolve       = "human_action_resolve"
+	MsgHumanActionResolveResult = "human_action_resolve_result"
+	MsgReviewPreviewRequest     = "review_preview_request"
+	MsgReviewPreviewResult      = "review_preview_result"
 )
 
 // jobScoped lists the types that must carry a job_id.
@@ -515,6 +525,157 @@ type ErrorPayload struct {
 // EmptyPayload is used by types that carry no data (ack, job_accept,
 // job_reject, cancel).
 type EmptyPayload struct{}
+
+// TriageSnapshotRequestPayload requests one immutable schema-v1 inbox page.
+// Schema versions are negotiated explicitly because a future snapshot schema
+// cannot safely add fields to this locked browser message family.
+type TriageSnapshotRequestPayload struct {
+	RequestID      string  `json:"request_id"`
+	SchemaVersions []int64 `json:"schema_versions"`
+	Limit          int64   `json:"limit,omitempty"`
+	Cursor         string  `json:"cursor,omitempty"`
+}
+
+// TriageCounts contains complete, unpaginated inbox counts.
+type TriageCounts struct {
+	PendingTotal    int64 `json:"pending_total"`
+	WatchHits       int64 `json:"watch_hits"`
+	Actions         int64 `json:"actions"`
+	Retractions     int64 `json:"retractions"`
+	JobsWorking     int64 `json:"jobs_working"`
+	JobsNeedsReview int64 `json:"jobs_needs_review"`
+	FailureGroups7d int64 `json:"failure_groups_7d"`
+}
+
+// TriageFact is bounded display text attached to an inbox item.
+type TriageFact struct {
+	Label string `json:"label"`
+	Text  string `json:"text"`
+}
+
+// TriageLink is a daemon-derived destination for an inbox item.
+type TriageLink struct {
+	Rel string `json:"rel"`
+	URL string `json:"url"`
+}
+
+// TriageWork is the immutable work identity attached to a watch hit.
+type TriageWork struct {
+	DOI     string `json:"doi"`
+	Title   string `json:"title"`
+	Authors string `json:"authors"`
+	Year    int64  `json:"year"`
+	IsOA    bool   `json:"is_oa"`
+}
+
+// TriageWatch identifies a watch contributing a grouped watch hit. Work keys
+// are deliberately absent: they are daemon-only mutation inputs.
+type TriageWatch struct {
+	ID    int64  `json:"id"`
+	Label string `json:"label"`
+}
+
+// TriageSnapshotItem is one schema-v1 inbox item. Its kind-specific fields are
+// flat on the wire to keep the snapshot contract stable.
+type TriageSnapshotItem struct {
+	Kind  string       `json:"kind"`
+	ID    string       `json:"id"`
+	Rank  int64        `json:"rank"`
+	Title string       `json:"title"`
+	Facts []TriageFact `json:"facts"`
+	Links []TriageLink `json:"links"`
+	Ops   []string     `json:"ops"`
+
+	Work        *TriageWork   `json:"work,omitempty"`
+	Abstract    string        `json:"abstract,omitempty"`
+	Watches     []TriageWatch `json:"watches,omitempty"`
+	FirstSeenAt string        `json:"first_seen_at,omitempty"`
+
+	ActionID   int64  `json:"action_id,omitempty"`
+	JobID      string `json:"job_id,omitempty"`
+	ActionKind string `json:"action_kind,omitempty"`
+	JobState   string `json:"job_state,omitempty"`
+	Revision   int64  `json:"revision,omitempty"`
+	SHA256     string `json:"sha256,omitempty"`
+	SizeBytes  int64  `json:"size_bytes,omitempty"`
+
+	DOI       string `json:"doi,omitempty"`
+	Nature    string `json:"nature,omitempty"`
+	NoticedAt string `json:"noticed_at,omitempty"`
+	NoticeDOI string `json:"notice_doi,omitempty"`
+}
+
+// TriageSnapshotResponsePayload is a correlated immutable schema-v1 snapshot.
+type TriageSnapshotResponsePayload struct {
+	RequestID             string               `json:"request_id"`
+	Schema                int64                `json:"schema"`
+	GeneratedAt           string               `json:"generated_at"`
+	Counts                TriageCounts         `json:"counts"`
+	Items                 []TriageSnapshotItem `json:"items"`
+	Cursor                string               `json:"cursor,omitempty"`
+	HasMore               bool                 `json:"has_more"`
+	UnsupportedItemsCount int64                `json:"unsupported_items_count"`
+}
+
+// TriageCountsRequestPayload asks for complete counts without a snapshot page.
+type TriageCountsRequestPayload struct {
+	RequestID string `json:"request_id"`
+}
+
+// TriageCountsResponsePayload is the correlated complete-count response.
+type TriageCountsResponsePayload struct {
+	RequestID string       `json:"request_id"`
+	Counts    TriageCounts `json:"counts"`
+}
+
+// TriageDecidePayload consumes one current watch-hit item.
+type TriageDecidePayload struct {
+	RequestID  string          `json:"request_id"`
+	ItemID     string          `json:"item_id"`
+	Op         string          `json:"op"`
+	WatchScope json.RawMessage `json:"watch_scope,omitempty"`
+}
+
+// TriageDecideResultPayload reports a non-replayable mutation result.
+type TriageDecideResultPayload struct {
+	RequestID string `json:"request_id"`
+	Outcome   string `json:"outcome"`
+	Detail    string `json:"detail,omitempty"`
+}
+
+// HumanActionResolvePayload binds a verdict to a rendered action revision and,
+// for accept, the quarantined bytes' immutable digest.
+type HumanActionResolvePayload struct {
+	RequestID        string `json:"request_id"`
+	ActionID         int64  `json:"action_id"`
+	Verdict          string `json:"verdict"`
+	ExpectedRevision int64  `json:"expected_revision"`
+	ExpectedSHA256   string `json:"expected_sha256,omitempty"`
+}
+
+// HumanActionResolveResultPayload has the same contract as a triage decision.
+type HumanActionResolveResultPayload struct {
+	RequestID string `json:"request_id"`
+	Outcome   string `json:"outcome"`
+	Detail    string `json:"detail,omitempty"`
+}
+
+// ReviewPreviewRequestPayload asks for a short-lived loopback capability for
+// the bound review action.
+type ReviewPreviewRequestPayload struct {
+	RequestID string `json:"request_id"`
+	ActionID  int64  `json:"action_id"`
+}
+
+// ReviewPreviewResultPayload deliberately exposes only a capability URL and
+// immutable file metadata; a quarantine path must never cross the bridge.
+type ReviewPreviewResultPayload struct {
+	RequestID string `json:"request_id"`
+	URL       string `json:"url"`
+	SHA256    string `json:"sha256"`
+	SizeBytes int64  `json:"size_bytes"`
+	ExpiresAt string `json:"expires_at"`
+}
 
 // BrowserMessage is one decoded native-messaging envelope. Payload holds the
 // type-specific struct (e.g. *HelloPayload).
@@ -746,6 +907,83 @@ func DecodeBrowserMessage(data []byte) (*BrowserMessage, error) {
 			}
 		}
 		msg.Payload = p
+	case MsgTriageSnapshotRequest:
+		p := &TriageSnapshotRequestPayload{}
+		err = decodeTriagePayload(env.Payload, payloadFields, "triage_snapshot_request",
+			[]string{"request_id", "schema_versions"}, p)
+		if err == nil {
+			err = p.validate()
+		}
+		msg.Payload = p
+	case MsgTriageSnapshotResponse:
+		p := &TriageSnapshotResponsePayload{}
+		err = decodeTriagePayload(env.Payload, payloadFields, "triage_snapshot_response",
+			[]string{"request_id", "schema", "generated_at", "counts", "items", "has_more", "unsupported_items_count"}, p)
+		if err == nil {
+			err = p.validate()
+		}
+		msg.Payload = p
+	case MsgTriageCountsRequest:
+		p := &TriageCountsRequestPayload{}
+		err = decodeTriagePayload(env.Payload, payloadFields, "triage_counts_request", []string{"request_id"}, p)
+		if err == nil {
+			err = validateCorrelationID("triage_counts_request.request_id", p.RequestID)
+		}
+		msg.Payload = p
+	case MsgTriageCountsResponse:
+		p := &TriageCountsResponsePayload{}
+		err = decodeTriagePayload(env.Payload, payloadFields, "triage_counts_response", []string{"request_id", "counts"}, p)
+		if err == nil {
+			err = validateCorrelationID("triage_counts_response.request_id", p.RequestID)
+		}
+		if err == nil {
+			err = p.Counts.validate()
+		}
+		msg.Payload = p
+	case MsgTriageDecide:
+		p := &TriageDecidePayload{}
+		err = decodeTriagePayload(env.Payload, payloadFields, "triage_decide", []string{"request_id", "item_id", "op"}, p)
+		if err == nil {
+			err = p.validate()
+		}
+		msg.Payload = p
+	case MsgTriageDecideResult:
+		p := &TriageDecideResultPayload{}
+		err = decodeTriagePayload(env.Payload, payloadFields, "triage_decide_result", []string{"request_id", "outcome"}, p)
+		if err == nil {
+			err = p.validate("triage_decide_result")
+		}
+		msg.Payload = p
+	case MsgHumanActionResolve:
+		p := &HumanActionResolvePayload{}
+		err = decodeTriagePayload(env.Payload, payloadFields, "human_action_resolve",
+			[]string{"request_id", "action_id", "verdict", "expected_revision"}, p)
+		if err == nil {
+			err = p.validate()
+		}
+		msg.Payload = p
+	case MsgHumanActionResolveResult:
+		p := &HumanActionResolveResultPayload{}
+		err = decodeTriagePayload(env.Payload, payloadFields, "human_action_resolve_result", []string{"request_id", "outcome"}, p)
+		if err == nil {
+			err = p.validate()
+		}
+		msg.Payload = p
+	case MsgReviewPreviewRequest:
+		p := &ReviewPreviewRequestPayload{}
+		err = decodeTriagePayload(env.Payload, payloadFields, "review_preview_request", []string{"request_id", "action_id"}, p)
+		if err == nil {
+			err = p.validate()
+		}
+		msg.Payload = p
+	case MsgReviewPreviewResult:
+		p := &ReviewPreviewResultPayload{}
+		err = decodeTriagePayload(env.Payload, payloadFields, "review_preview_result",
+			[]string{"request_id", "url", "sha256", "size_bytes", "expires_at"}, p)
+		if err == nil {
+			err = p.validate()
+		}
+		msg.Payload = p
 	case MsgAck, MsgJobAccept, MsgJobReject, MsgCancel:
 		p := &EmptyPayload{}
 		err = strictDecode(env.Payload, p)
@@ -911,4 +1149,481 @@ func validateDownload(id int64, filename string) error {
 		return fmt.Errorf("filename must be a bare name without path separators")
 	}
 	return nil
+}
+
+func decodeTriagePayload(data []byte, fields map[string]json.RawMessage, what string, required []string, target any) error {
+	if err := browserRequireFields(fields, required...); err != nil {
+		return err
+	}
+	if err := browserRejectNullValues(data, what); err != nil {
+		return err
+	}
+	if err := strictDecode(data, target); err != nil {
+		return err
+	}
+	return nil
+}
+
+func browserRejectNullValues(data []byte, what string) error {
+	var value any
+	if err := json.Unmarshal(data, &value); err != nil {
+		return fmt.Errorf("%s: %w", what, err)
+	}
+	var visit func(any) bool
+	visit = func(v any) bool {
+		switch typed := v.(type) {
+		case nil:
+			return true
+		case []any:
+			for _, child := range typed {
+				if visit(child) {
+					return true
+				}
+			}
+		case map[string]any:
+			for _, child := range typed {
+				if visit(child) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	if visit(value) {
+		return fmt.Errorf("%s cannot contain null", what)
+	}
+	return nil
+}
+
+func validateCorrelationID(what, value string) error {
+	if !msgIDRE.MatchString(value) {
+		return fmt.Errorf("%s must match the msg_id charset (8..64 chars)", what)
+	}
+	return nil
+}
+
+func validateTriageText(what, value string, max int) error {
+	if browserTextLen(value) > max {
+		return fmt.Errorf("%s exceeds %d chars", what, max)
+	}
+	if browserHasNUL(value) {
+		return fmt.Errorf("%s cannot contain NUL", what)
+	}
+	return nil
+}
+
+func validateTriageTime(what, value string) error {
+	if !rfc3339RE.MatchString(value) {
+		return fmt.Errorf("%s must be RFC3339", what)
+	}
+	if _, err := time.Parse(time.RFC3339, value); err != nil {
+		return fmt.Errorf("%s: %w", what, err)
+	}
+	return nil
+}
+
+func (p *TriageSnapshotRequestPayload) validate() error {
+	if err := validateCorrelationID("triage_snapshot_request.request_id", p.RequestID); err != nil {
+		return err
+	}
+	if len(p.SchemaVersions) != 1 || p.SchemaVersions[0] != 1 {
+		return fmt.Errorf("triage_snapshot_request.schema_versions must be [1]")
+	}
+	if p.Limit != 0 && (p.Limit < 1 || p.Limit > 100) {
+		return fmt.Errorf("triage_snapshot_request.limit must be between 1 and 100")
+	}
+	return validateTriageText("triage_snapshot_request.cursor", p.Cursor, 256)
+}
+
+func (counts TriageCounts) validate() error {
+	values := []int64{
+		counts.PendingTotal, counts.WatchHits, counts.Actions, counts.Retractions,
+		counts.JobsWorking, counts.JobsNeedsReview, counts.FailureGroups7d,
+	}
+	for _, value := range values {
+		if value < 0 || value > MaxBrowserInteger {
+			return fmt.Errorf("triage counts must be in range 0..%d", MaxBrowserInteger)
+		}
+	}
+	if counts.PendingTotal != counts.WatchHits+counts.Actions+counts.Retractions {
+		return fmt.Errorf("triage pending_total must equal watch_hits + actions + retractions")
+	}
+	return nil
+}
+
+func (item *TriageSnapshotItem) UnmarshalJSON(data []byte) error {
+	fields, err := browserObjectFields(data, "triage item")
+	if err != nil {
+		return err
+	}
+	var wire struct {
+		Kind  string       `json:"kind"`
+		ID    string       `json:"id"`
+		Rank  int64        `json:"rank"`
+		Title string       `json:"title"`
+		Facts []TriageFact `json:"facts"`
+		Links []TriageLink `json:"links"`
+		Ops   []string     `json:"ops"`
+
+		Work        *TriageWork   `json:"work"`
+		Abstract    string        `json:"abstract"`
+		Watches     []TriageWatch `json:"watches"`
+		FirstSeenAt string        `json:"first_seen_at"`
+
+		ActionID   int64  `json:"action_id"`
+		JobID      string `json:"job_id"`
+		ActionKind string `json:"action_kind"`
+		JobState   string `json:"job_state"`
+		Revision   int64  `json:"revision"`
+		SHA256     string `json:"sha256"`
+		SizeBytes  int64  `json:"size_bytes"`
+
+		DOI       string `json:"doi"`
+		Nature    string `json:"nature"`
+		NoticedAt string `json:"noticed_at"`
+		NoticeDOI string `json:"notice_doi"`
+	}
+	if err := strictDecode(data, &wire); err != nil {
+		return err
+	}
+	core := []string{"kind", "id", "rank", "title", "facts", "links", "ops"}
+	allowed := append([]string(nil), core...)
+	switch wire.Kind {
+	case "watch_hit":
+		allowed = append(allowed, "work", "abstract", "watches", "first_seen_at")
+		if err := browserRequireFields(fields, append(core, "work", "abstract", "watches", "first_seen_at")...); err != nil {
+			return err
+		}
+	case "human_action":
+		allowed = append(allowed, "action_id", "job_id", "action_kind", "job_state", "revision", "sha256", "size_bytes")
+		if err := browserRequireFields(fields, append(core, "action_id", "job_id", "action_kind", "job_state", "revision", "sha256", "size_bytes")...); err != nil {
+			return err
+		}
+	case "retraction":
+		allowed = append(allowed, "doi", "nature", "noticed_at", "notice_doi")
+		if err := browserRequireFields(fields, append(core, "doi", "nature", "noticed_at")...); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("unsupported triage item kind %q", wire.Kind)
+	}
+	allowedSet := make(map[string]bool, len(allowed))
+	for _, key := range allowed {
+		allowedSet[key] = true
+	}
+	for key := range fields {
+		if !allowedSet[key] {
+			return fmt.Errorf("triage item %s: unknown field %q", wire.Kind, key)
+		}
+	}
+	*item = TriageSnapshotItem{
+		Kind: wire.Kind, ID: wire.ID, Rank: wire.Rank, Title: wire.Title, Facts: wire.Facts, Links: wire.Links, Ops: wire.Ops,
+		Work: wire.Work, Abstract: wire.Abstract, Watches: wire.Watches, FirstSeenAt: wire.FirstSeenAt,
+		ActionID: wire.ActionID, JobID: wire.JobID, ActionKind: wire.ActionKind, JobState: wire.JobState,
+		Revision: wire.Revision, SHA256: wire.SHA256, SizeBytes: wire.SizeBytes,
+		DOI: wire.DOI, Nature: wire.Nature, NoticedAt: wire.NoticedAt, NoticeDOI: wire.NoticeDOI,
+	}
+	return item.validate()
+}
+
+func (item TriageSnapshotItem) MarshalJSON() ([]byte, error) {
+	core := map[string]any{
+		"kind": item.Kind, "id": item.ID, "rank": item.Rank, "title": item.Title,
+		"facts": item.Facts, "links": item.Links, "ops": item.Ops,
+	}
+	switch item.Kind {
+	case "watch_hit":
+		core["work"], core["abstract"], core["watches"], core["first_seen_at"] =
+			item.Work, item.Abstract, item.Watches, item.FirstSeenAt
+	case "human_action":
+		core["action_id"], core["job_id"], core["action_kind"], core["job_state"] =
+			item.ActionID, item.JobID, item.ActionKind, item.JobState
+		core["revision"], core["sha256"], core["size_bytes"] = item.Revision, item.SHA256, item.SizeBytes
+	case "retraction":
+		core["doi"], core["nature"], core["noticed_at"] = item.DOI, item.Nature, item.NoticedAt
+		if item.NoticeDOI != "" {
+			core["notice_doi"] = item.NoticeDOI
+		}
+	}
+	return json.Marshal(core)
+}
+
+func (item TriageSnapshotItem) validate() error {
+	if err := enumRequired("triage item kind", item.Kind, "watch_hit", "human_action", "retraction"); err != nil {
+		return err
+	}
+	if item.ID == "" {
+		return fmt.Errorf("triage item id is required")
+	}
+	if err := validateTriageText("triage item.id", item.ID, 1024); err != nil {
+		return err
+	}
+	if item.Rank < 0 || item.Rank > MaxBrowserInteger {
+		return fmt.Errorf("triage item.rank must be in range 0..%d", MaxBrowserInteger)
+	}
+	if err := validateTriageText("triage item.title", item.Title, 500); err != nil {
+		return err
+	}
+	if len(item.Facts) > 8 {
+		return fmt.Errorf("triage item.facts capped at 8")
+	}
+	for _, fact := range item.Facts {
+		if err := validateTriageText("triage fact.label", fact.Label, 40); err != nil {
+			return err
+		}
+		if err := validateTriageText("triage fact.text", fact.Text, 400); err != nil {
+			return err
+		}
+	}
+	if len(item.Links) > 16 {
+		return fmt.Errorf("triage item.links capped at 16")
+	}
+	for _, link := range item.Links {
+		if err := enumRequired("triage link.rel", link.Rel, "doi", "arxiv", "openalex", "landing", "preview"); err != nil {
+			return err
+		}
+		if err := validateTriageURL("triage link.url", link.URL, "https"); err != nil {
+			return err
+		}
+	}
+	seenOps := make(map[string]bool, len(item.Ops))
+	for _, op := range item.Ops {
+		if err := enumRequired("triage item op", op, "acquire", "dismiss", "accept", "reject", "open", "retry"); err != nil {
+			return err
+		}
+		if seenOps[op] {
+			return fmt.Errorf("triage item ops cannot repeat %q", op)
+		}
+		seenOps[op] = true
+	}
+	switch item.Kind {
+	case "watch_hit":
+		if item.Work == nil || len(item.Watches) == 0 || len(item.Watches) > 100 {
+			return fmt.Errorf("watch_hit requires 1..100 watches and work")
+		}
+		if err := validateTriageText("watch_hit.work.doi", item.Work.DOI, 300); err != nil {
+			return err
+		}
+		if err := validateTriageText("watch_hit.work.title", item.Work.Title, 500); err != nil {
+			return err
+		}
+		if err := validateTriageText("watch_hit.work.authors", item.Work.Authors, 200); err != nil {
+			return err
+		}
+		if item.Work.Year < 0 || item.Work.Year > MaxBrowserInteger {
+			return fmt.Errorf("watch_hit.work.year must be in range 0..%d", MaxBrowserInteger)
+		}
+		if err := validateTriageText("watch_hit.abstract", item.Abstract, 2000); err != nil {
+			return err
+		}
+		if err := validateTriageTime("watch_hit.first_seen_at", item.FirstSeenAt); err != nil {
+			return err
+		}
+		seen := make(map[int64]bool, len(item.Watches))
+		for _, watch := range item.Watches {
+			if watch.ID <= 0 || watch.ID > MaxBrowserInteger || seen[watch.ID] {
+				return fmt.Errorf("watch_hit.watches must have unique positive IDs")
+			}
+			seen[watch.ID] = true
+			if err := validateTriageText("watch_hit.watches.label", watch.Label, 500); err != nil {
+				return err
+			}
+		}
+	case "human_action":
+		if item.ActionID <= 0 || item.ActionID > MaxBrowserInteger || item.Revision <= 0 || item.Revision > MaxBrowserInteger {
+			return fmt.Errorf("human_action action_id and revision must be positive browser integers")
+		}
+		if !requestIDRE.MatchString(item.JobID) {
+			return fmt.Errorf("human_action.job_id is invalid")
+		}
+		if err := validateTriageText("human_action.action_kind", item.ActionKind, 100); err != nil || item.ActionKind == "" {
+			if err != nil {
+				return err
+			}
+			return fmt.Errorf("human_action.action_kind is required")
+		}
+		if err := validateTriageText("human_action.job_state", item.JobState, 50); err != nil || item.JobState == "" {
+			if err != nil {
+				return err
+			}
+			return fmt.Errorf("human_action.job_state is required")
+		}
+		if item.SHA256 != "" && !sha256RE.MatchString(item.SHA256) {
+			return fmt.Errorf("human_action.sha256 must be a lowercase SHA-256")
+		}
+		if item.SizeBytes < 0 || item.SizeBytes > MaxBrowserInteger {
+			return fmt.Errorf("human_action.size_bytes must be in range 0..%d", MaxBrowserInteger)
+		}
+	case "retraction":
+		if err := validateTriageText("retraction.doi", item.DOI, 300); err != nil || item.DOI == "" {
+			if err != nil {
+				return err
+			}
+			return fmt.Errorf("retraction.doi is required")
+		}
+		if err := enumRequired("retraction.nature", item.Nature, "retraction", "correction", "concern"); err != nil {
+			return err
+		}
+		if err := validateTriageTime("retraction.noticed_at", item.NoticedAt); err != nil {
+			return err
+		}
+		if err := validateTriageText("retraction.notice_doi", item.NoticeDOI, 300); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (p *TriageSnapshotResponsePayload) validate() error {
+	if err := validateCorrelationID("triage_snapshot_response.request_id", p.RequestID); err != nil {
+		return err
+	}
+	if p.Schema != 1 {
+		return fmt.Errorf("triage_snapshot_response.schema must be 1")
+	}
+	if err := validateTriageTime("triage_snapshot_response.generated_at", p.GeneratedAt); err != nil {
+		return err
+	}
+	if err := p.Counts.validate(); err != nil {
+		return err
+	}
+	if len(p.Items) > 100 {
+		return fmt.Errorf("triage_snapshot_response.items capped at 100")
+	}
+	for _, item := range p.Items {
+		if err := item.validate(); err != nil {
+			return err
+		}
+	}
+	if p.UnsupportedItemsCount < 0 || p.UnsupportedItemsCount > MaxBrowserInteger {
+		return fmt.Errorf("triage_snapshot_response.unsupported_items_count must be non-negative")
+	}
+	if p.HasMore && p.Cursor == "" {
+		return fmt.Errorf("triage_snapshot_response.cursor required when has_more")
+	}
+	if !p.HasMore && p.Cursor != "" {
+		return fmt.Errorf("triage_snapshot_response.cursor must be omitted when not has_more")
+	}
+	return validateTriageText("triage_snapshot_response.cursor", p.Cursor, 256)
+}
+
+func (p *TriageDecidePayload) validate() error {
+	if err := validateCorrelationID("triage_decide.request_id", p.RequestID); err != nil {
+		return err
+	}
+	if p.ItemID == "" {
+		return fmt.Errorf("triage_decide.item_id is required")
+	}
+	if err := validateTriageText("triage_decide.item_id", p.ItemID, 1024); err != nil {
+		return err
+	}
+	if err := enumRequired("triage_decide.op", p.Op, "acquire", "dismiss"); err != nil {
+		return err
+	}
+	if p.Op == "acquire" && len(p.WatchScope) != 0 {
+		return fmt.Errorf("triage_decide.watch_scope is only valid for dismiss")
+	}
+	if p.Op == "dismiss" {
+		if len(p.WatchScope) == 0 {
+			return fmt.Errorf("triage_decide.watch_scope is required for dismiss")
+		}
+		return validateTriageWatchScope(p.WatchScope)
+	}
+	return nil
+}
+
+func validateTriageWatchScope(raw json.RawMessage) error {
+	var all string
+	if err := strictDecode(raw, &all); err == nil {
+		if all != "all" {
+			return fmt.Errorf("triage_decide.watch_scope must be all or watch IDs")
+		}
+		return nil
+	}
+	var ids []int64
+	if err := strictDecode(raw, &ids); err != nil || len(ids) == 0 || len(ids) > 100 {
+		return fmt.Errorf("triage_decide.watch_scope must be all or 1 to 100 watch IDs")
+	}
+	seen := make(map[int64]bool, len(ids))
+	for _, id := range ids {
+		if id <= 0 || id > MaxBrowserInteger || seen[id] {
+			return fmt.Errorf("triage_decide.watch_scope contains an invalid watch ID")
+		}
+		seen[id] = true
+	}
+	return nil
+}
+
+func (p *TriageDecideResultPayload) validate(what string) error {
+	if err := validateCorrelationID(what+".request_id", p.RequestID); err != nil {
+		return err
+	}
+	if err := enumRequired(what+".outcome", p.Outcome, "applied", "already_applied", "conflict", "error"); err != nil {
+		return err
+	}
+	return validateTriageText(what+".detail", p.Detail, 1000)
+}
+
+func (p *HumanActionResolvePayload) validate() error {
+	if err := validateCorrelationID("human_action_resolve.request_id", p.RequestID); err != nil {
+		return err
+	}
+	if p.ActionID <= 0 || p.ActionID > MaxBrowserInteger || p.ExpectedRevision <= 0 || p.ExpectedRevision > MaxBrowserInteger {
+		return fmt.Errorf("human_action_resolve.action_id and expected_revision must be positive browser integers")
+	}
+	if err := enumRequired("human_action_resolve.verdict", p.Verdict, "accept", "reject"); err != nil {
+		return err
+	}
+	if p.Verdict == "accept" && !sha256RE.MatchString(p.ExpectedSHA256) {
+		return fmt.Errorf("human_action_resolve.expected_sha256 is required for accept")
+	}
+	if p.ExpectedSHA256 != "" && !sha256RE.MatchString(p.ExpectedSHA256) {
+		return fmt.Errorf("human_action_resolve.expected_sha256 must be a lowercase SHA-256")
+	}
+	return nil
+}
+
+func (p *HumanActionResolveResultPayload) validate() error {
+	return (&TriageDecideResultPayload{RequestID: p.RequestID, Outcome: p.Outcome, Detail: p.Detail}).validate("human_action_resolve_result")
+}
+
+func (p *ReviewPreviewRequestPayload) validate() error {
+	if err := validateCorrelationID("review_preview_request.request_id", p.RequestID); err != nil {
+		return err
+	}
+	if p.ActionID <= 0 || p.ActionID > MaxBrowserInteger {
+		return fmt.Errorf("review_preview_request.action_id must be a positive browser integer")
+	}
+	return nil
+}
+
+func validateTriageURL(what, value, scheme string) error {
+	if err := validateTriageText(what, value, 4000); err != nil {
+		return err
+	}
+	u, err := url.ParseRequestURI(value)
+	if err != nil || u.Scheme != scheme || u.Host == "" {
+		return fmt.Errorf("%s must be a %s URL", what, scheme)
+	}
+	return nil
+}
+
+func (p *ReviewPreviewResultPayload) validate() error {
+	if err := validateCorrelationID("review_preview_result.request_id", p.RequestID); err != nil {
+		return err
+	}
+	if err := validateTriageURL("review_preview_result.url", p.URL, "http"); err != nil {
+		return err
+	}
+	u, _ := url.ParseRequestURI(p.URL)
+	if u.Hostname() != "127.0.0.1" || u.Port() == "" || !strings.HasPrefix(u.Path, "/p/") || u.RawQuery != "" || u.Fragment != "" {
+		return fmt.Errorf("review_preview_result.url must be a loopback capability URL")
+	}
+	if !sha256RE.MatchString(p.SHA256) {
+		return fmt.Errorf("review_preview_result.sha256 must be a lowercase SHA-256")
+	}
+	if p.SizeBytes < 0 || p.SizeBytes > MaxBrowserInteger {
+		return fmt.Errorf("review_preview_result.size_bytes must be in range 0..%d", MaxBrowserInteger)
+	}
+	return validateTriageTime("review_preview_result.expires_at", p.ExpiresAt)
 }

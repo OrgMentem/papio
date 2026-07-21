@@ -6,240 +6,228 @@
     <title>papio</title>
     <style>
       :root {
-        color: #182231;
+        --color-ink: #182231;
+        --color-brand-ink: #2b2d42;
+        --color-brand-accent: #d94f3d;
+        --color-muted: #607080;
+        --color-context: #426789;
+        --color-border: #dce3ea;
+        --color-control-border: #b8c5d1;
+        --color-surface: #fdfefe;
+        --color-surface-hover: #f4f7f9;
+        --color-primary: #12549b;
+        --color-primary-border: #8db9eb;
+        --color-primary-surface: #eaf3ff;
+        --color-primary-hover: #dcecff;
+        --color-warning: #6d4316;
+        --color-warning-border: #a15c17;
+        --font-size-label: 11px;
+        --font-size-small: 12px;
+        --font-size-body: 13px;
+        --font-size-brand: 14px;
+        --space-1: 4px;
+        --space-2: 8px;
+        --space-3: 12px;
+        --space-4: 16px;
+        --space-6: 24px;
+        --space-8: 32px;
+        --radius-control: 6px;
+        --radius-card: 8px;
+        --popup-width: 360px;
+        --control-height: 32px;
+        --brand-mark-size: 22px;
+        --settings-mark-size: 18px;
+        --transition-fast: 140ms ease-out;
+        color: var(--color-ink);
         font-family:
           ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
           sans-serif;
       }
-      body {
+      * {
         box-sizing: border-box;
-        font-size: 13px;
+      }
+      [hidden] {
+        display: none !important;
+      }
+      body {
+        background: var(--color-surface);
+        font-size: var(--font-size-body);
         line-height: 1.4;
         margin: 0;
-        padding: 16px;
-        width: 360px;
+        padding: var(--space-4);
+        width: var(--popup-width);
       }
-      h1,
-      h2 {
-        margin: 0;
-      }
-      h1 {
-        font-size: 17px;
-        letter-spacing: -0.01em;
+      header {
+        padding-right: var(--space-8);
+        position: relative;
       }
       h2,
-      summary {
-        color: #516171;
-        font-size: 11px;
+      p {
+        margin: 0;
+      }
+      h2 {
+        color: var(--color-muted);
+        font-size: var(--font-size-label);
         font-weight: 700;
         letter-spacing: 0.07em;
         text-transform: uppercase;
       }
-      .summary {
-        color: #607080;
-        font-size: 12px;
-        margin: 4px 0 16px;
-      }
-      .daemon-status {
-        border-left: 3px solid #a15c17;
-        color: #6d4316;
-        font-size: 12px;
-        margin: 0 0 16px;
-        padding-left: 9px;
-      }
-      .daemon-status-message {
-        font-weight: 600;
-      }
-      .daemon-status-hint {
-        margin-top: 2px;
-      }
-      .daemon-status.quiet {
-        border-left: 0;
-        color: #607080;
-        font-size: 11px;
-        margin: -10px 0 16px;
-        padding-left: 0;
-      }
-      .empty {
-        color: #607080;
-        margin: 12px 0;
-      }
-      section {
-        margin-top: 16px;
-      }
-      .section-heading {
-        align-items: baseline;
-        display: flex;
-        justify-content: space-between;
-        margin-bottom: 6px;
-      }
-      .count {
-        background: #edf1f5;
-        border-radius: 999px;
-        color: #435365;
-        font-size: 11px;
-        line-height: 18px;
-        min-width: 18px;
-        text-align: center;
-      }
-      ul {
-        list-style: none;
-        margin: 0;
-        padding: 0;
-      }
-      .job {
-        align-items: flex-start;
-        border-top: 1px solid #e6ebf0;
-        display: flex;
-        gap: 10px;
-        justify-content: space-between;
-        padding: 10px 0;
-      }
-      .job-details {
-        min-width: 0;
-      }
-      .job-provider {
-        color: #607080;
-        font-size: 11px;
-        font-weight: 600;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-      }
-      .job-title {
-        font-weight: 600;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-      }
-      .job-state,
-      .job-reason {
-        font-size: 12px;
-        margin-top: 2px;
-      }
-      .job-state {
-        color: #426789;
-      }
-      .job-reason {
-        color: #a15c17;
-      }
-      #failed-section .job-state {
-        color: #a33d42;
-      }
-      .job-controls {
-        display: flex;
-        flex: 0 0 auto;
-        gap: 6px;
-      }
-      button {
-        background: #fff;
-        border: 1px solid #cbd5df;
-        border-radius: 6px;
-        color: #283849;
-        cursor: pointer;
-        font: inherit;
-        font-size: 12px;
-        padding: 4px 9px;
-      }
-      button:hover {
-        background: #f4f7f9;
-      }
-      button.primary {
-        background: #eaf3ff;
-        border-color: #9fc6f5;
-        color: #12549b;
-      }
-      button.primary:hover {
-        background: #dcecff;
-      }
-      details {
-        border-top: 1px solid #e6ebf0;
-        margin-top: 12px;
-        padding-top: 10px;
-      }
-      summary {
-        cursor: pointer;
-        list-style: none;
-      }
-      summary::-webkit-details-marker {
-        display: none;
-      }
-      summary::after {
-        color: #718194;
-        content: "›";
-        float: right;
-        font-size: 16px;
-        line-height: 12px;
-      }
-      details[open] summary::after {
-        transform: rotate(90deg);
-      }
-      details ul {
-        margin-top: 6px;
-      }
-      .capture {
-        border-top: 1px solid #dce3ea;
-        margin-top: 18px;
-        padding-top: 14px;
-      }
-      .capture .row {
-        display: flex;
-        gap: 8px;
-        margin: 8px 0;
-      }
-      .capture select {
-        background: #fff;
-        border: 1px solid #cbd5df;
-        border-radius: 6px;
-        flex: 1;
-        font: inherit;
-        padding: 4px 6px;
-      }
-      .capture-status {
-        color: #607080;
-        font-size: 12px;
-        margin-top: 8px;
-        word-break: break-all;
-      }
       .brand {
         align-items: center;
         display: flex;
-        gap: 8px;
-        margin-bottom: 10px;
+        gap: var(--space-2);
+        margin-bottom: var(--space-4);
       }
       .brand svg {
-        height: 22px;
-        width: 22px;
+        height: var(--brand-mark-size);
+        width: var(--brand-mark-size);
       }
       .brand-name {
-        color: #2b2d42;
-        font-size: 14px;
+        color: var(--color-brand-ink);
+        font-size: var(--font-size-brand);
         font-weight: 700;
         letter-spacing: 0.01em;
       }
-      header {
-        position: relative;
-      }
       .settings-btn {
-        background: none;
-        border: none;
-        border-radius: 6px;
-        color: #607080;
-        cursor: pointer;
+        background: transparent;
+        border: 0;
+        color: var(--color-muted);
         line-height: 0;
-        padding: 4px;
+        padding: var(--space-1);
         position: absolute;
         right: 0;
         top: 0;
       }
       .settings-btn:hover {
-        background: #f4f7f9;
-        color: #283849;
+        background: var(--color-surface-hover);
+        color: var(--color-ink);
       }
       .settings-btn svg {
         display: block;
-        height: 18px;
-        width: 18px;
+        height: var(--settings-mark-size);
+        width: var(--settings-mark-size);
+      }
+      .daemon-status {
+        border-left: var(--space-1) solid var(--color-warning-border);
+        color: var(--color-warning);
+        font-size: var(--font-size-small);
+        margin-bottom: var(--space-4);
+        padding-left: var(--space-3);
+      }
+      .daemon-status-message {
+        font-weight: 600;
+      }
+      .daemon-status-hint {
+        margin-top: var(--space-1);
+      }
+      .launcher {
+        border: 1px solid var(--color-border);
+        border-radius: var(--radius-card);
+        display: grid;
+        overflow: hidden;
+      }
+      .launcher-action {
+        align-items: stretch;
+        display: flex;
+        flex-direction: column;
+        gap: var(--space-2);
+        padding: var(--space-3);
+      }
+      .launcher-action + .launcher-action {
+        border-top: 1px solid var(--color-border);
+      }
+      .launcher-action > button {
+        align-self: flex-end;
+      }
+      .launcher-action p,
+      .capture-status {
+        color: var(--color-muted);
+        font-size: var(--font-size-small);
+      }
+      .page-acquire-context {
+        color: var(--color-context);
+      }
+      .capture-status {
+        word-break: break-word;
+      }
+      .capture-status:empty {
+        display: none;
+      }
+      .resolver-grant,
+      .terms-consent,
+      .capture {
+        border-top: 1px solid var(--color-border);
+        margin-top: var(--space-4);
+        padding-top: var(--space-3);
+      }
+      .resolver-grant,
+      .terms-consent {
+        display: grid;
+        gap: var(--space-2);
+      }
+      .terms-consent-controls {
+        display: flex;
+        flex-wrap: wrap;
+        gap: var(--space-2);
+        justify-content: flex-end;
+      }
+      .capture .row {
+        display: flex;
+        gap: var(--space-2);
+        margin: var(--space-2) 0;
+      }
+      .capture select {
+        background: var(--color-surface);
+        border: 1px solid var(--color-control-border);
+        border-radius: var(--radius-control);
+        color: var(--color-ink);
+        flex: 1;
+        font: inherit;
+        min-height: var(--control-height);
+        padding: var(--space-1) var(--space-2);
+      }
+      button {
+        background: var(--color-surface);
+        border: 1px solid var(--color-control-border);
+        border-radius: var(--radius-control);
+        color: var(--color-ink);
+        cursor: pointer;
+        font: inherit;
+        font-size: var(--font-size-small);
+        min-height: var(--control-height);
+        padding: var(--space-1) var(--space-3);
+        transition:
+          background-color var(--transition-fast),
+          border-color var(--transition-fast),
+          color var(--transition-fast);
+      }
+      button:hover:not(:disabled) {
+        background: var(--color-surface-hover);
+      }
+      button.primary {
+        background: var(--color-primary-surface);
+        border-color: var(--color-primary-border);
+        color: var(--color-primary);
+        font-weight: 600;
+      }
+      button.primary:hover:not(:disabled) {
+        background: var(--color-primary-hover);
+      }
+      button:focus-visible,
+      select:focus-visible {
+        outline: 2px solid var(--color-primary);
+        outline-offset: 2px;
+      }
+      button:disabled {
+        cursor: not-allowed;
+        opacity: 0.55;
+      }
+      .daemon-footer {
+        border-top: 1px solid var(--color-border);
+        color: var(--color-muted);
+        font-size: var(--font-size-label);
+        margin-top: var(--space-4);
+        padding-top: var(--space-3);
       }
     </style>
   </head>
@@ -248,82 +236,66 @@
       <button id="settings-btn" class="settings-btn" type="button" title="Settings" aria-label="Settings">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
           <circle cx="12" cy="12" r="3"/>
-          <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+          <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09A1.65 1.65 0 0 0 19.4 15z"/>
         </svg>
       </button>
       <div class="brand">
-        <svg viewBox="0 0 512 512" role="img" aria-label="papio">
-          <path d="M 95.0 374.6 A 200 200 0 1 1 243.7 455.6" fill="none" stroke="#2b2d42" stroke-width="46" stroke-linecap="round"/>
+        <svg viewBox="0 0 512 512" aria-hidden="true">
+          <path d="M 95.0 374.6 A 200 200 0 1 1 243.7 455.6" fill="none" stroke="var(--color-brand-ink)" stroke-width="46" stroke-linecap="round"/>
           <g transform="translate(264 244) skewX(-10)">
-            <circle cx="0" cy="0" r="68" fill="none" stroke="#e85d4a" stroke-width="42"/>
+            <circle cx="0" cy="0" r="68" fill="none" stroke="var(--color-brand-accent)" stroke-width="42"/>
           </g>
-          <path d="M 208.0 176.0 L 163.2 430.0" fill="none" stroke="#e85d4a" stroke-width="42" stroke-linecap="round"/>
-          <path d="M 115.7 416.0 L 215.7 416.0 L 152.6 490.0 Z" fill="#e85d4a" stroke="#e85d4a" stroke-width="10" stroke-linejoin="round"/>
+          <path d="M 208.0 176.0 L 163.2 430.0" fill="none" stroke="var(--color-brand-accent)" stroke-width="42" stroke-linecap="round"/>
+          <path d="M 115.7 416.0 L 215.7 416.0 L 152.6 490.0 Z" fill="var(--color-brand-accent)" stroke="var(--color-brand-accent)" stroke-width="10" stroke-linejoin="round"/>
         </svg>
         <span class="brand-name"><em>papio</em></span>
       </div>
-      <h1>Acquisition batch</h1>
-      <p id="summary" class="summary">0 need you · 0 downloading · 0 imported · 0 failed</p>
     </header>
-    <div id="daemon-status" class="daemon-status" hidden>
+    <div id="daemon-status" class="daemon-status" role="status" aria-live="polite" hidden>
       <div id="daemon-status-message" class="daemon-status-message"></div>
       <div id="daemon-status-hint" class="daemon-status-hint"></div>
     </div>
-    <section id="resolver-grant" class="resolver-grant" hidden></section>
-    <section id="page-acquire" class="page-acquire" hidden>
-      <button id="page-acquire-btn" class="primary" type="button">Acquire this page</button>
-      <div id="page-acquire-status" class="capture-status" aria-live="polite"></div>
-    </section>
-    <div id="empty" class="empty" hidden>No active jobs.</div>
+    <main>
+      <section class="launcher" aria-label="Paper actions">
+        <div id="page-acquire" class="launcher-action" hidden>
+          <button id="page-acquire-btn" class="primary" type="button" disabled>Acquire this page</button>
+          <p id="page-acquire-doi">Detecting DOI…</p>
+          <p id="page-acquire-context" class="page-acquire-context"></p>
+          <div id="page-acquire-status" class="capture-status" aria-live="polite"></div>
+        </div>
+        <div class="launcher-action">
+          <button id="open-inbox-btn" type="button">Open inbox</button>
+          <p>Review papers and actions that need your attention.</p>
+          <div id="open-inbox-status" class="capture-status" aria-live="polite"></div>
+        </div>
+      </section>
+      <section id="resolver-grant" class="resolver-grant" hidden></section>
 
-    <section id="terms-consent" class="terms-consent" hidden>
-      <h2>Publisher terms &amp; conditions</h2>
-      <p>
-        A publisher requires accepting its terms &amp; conditions before the
-        download. <em>papio</em> can accept these for you automatically on future
-        downloads — this means <em>papio</em> will agree to each publisher's terms on
-        your behalf. You can change this anytime in Options.
-      </p>
-      <div class="terms-consent-controls">
-        <button id="terms-consent-enable" class="primary" type="button">Auto-accept terms</button>
-        <button id="terms-consent-decline" type="button">I'll accept manually</button>
-      </div>
-    </section>
+      <section id="terms-consent" class="terms-consent" hidden>
+        <h2>Publisher terms &amp; conditions</h2>
+        <p>
+          A publisher requires accepting its terms &amp; conditions before the
+          download. <em>papio</em> can accept these for you automatically on future
+          downloads — this means <em>papio</em> will agree to each publisher's terms on
+          your behalf. You can change this anytime in Options.
+        </p>
+        <div class="terms-consent-controls">
+          <button id="terms-consent-enable" class="primary" type="button">Auto-accept terms</button>
+          <button id="terms-consent-decline" type="button">I'll accept manually</button>
+        </div>
+      </section>
 
-    <section id="needs-you-section" aria-labelledby="needs-you-heading">
-      <div class="section-heading">
-        <h2 id="needs-you-heading">Needs you</h2>
-        <span id="needs-you-count" class="count">0</span>
-      </div>
-      <ul id="needs-you-list"></ul>
-    </section>
-
-    <section id="in-flight-section" aria-labelledby="in-flight-heading">
-      <div class="section-heading">
-        <h2 id="in-flight-heading">In flight</h2>
-        <span id="in-flight-count" class="count">0</span>
-      </div>
-      <ul id="in-flight-list"></ul>
-    </section>
-
-    <details id="done-section">
-      <summary>Imported <span id="done-count" class="count">0</span></summary>
-      <ul id="done-list"></ul>
-    </details>
-    <details id="failed-section">
-      <summary>Failed <span id="failed-count" class="count">0</span></summary>
-      <ul id="failed-list"></ul>
-    </details>
-
-    <section class="capture" hidden>
-      <h2>Capture fixture (dev)</h2>
-      <div class="row">
-        <select id="capture-provider" aria-label="Provider"></select>
-        <select id="capture-scenario" aria-label="Scenario"></select>
-      </div>
-      <button id="capture-btn" type="button">Capture active tab</button>
-      <div id="capture-status" class="capture-status"></div>
-    </section>
+      <section class="capture" hidden>
+        <h2>Capture fixture (dev)</h2>
+        <div class="row">
+          <select id="capture-provider" aria-label="Provider"></select>
+          <select id="capture-scenario" aria-label="Scenario"></select>
+        </div>
+        <button id="capture-btn" type="button">Capture active tab</button>
+        <div id="capture-status" class="capture-status" aria-live="polite"></div>
+      </section>
+    </main>
+    <footer id="daemon-footer" class="daemon-footer" aria-live="polite" hidden></footer>
 
     <script src="./popup.js" type="module"></script>
   </body>

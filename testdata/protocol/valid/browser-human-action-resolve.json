@@ -1,0 +1,1 @@
+{"protocol":"papio-browser/1","type":"human_action_resolve","msg_id":"resolve-req-0001","seq":7,"payload":{"request_id":"request-0004","action_id":42,"verdict":"accept","expected_revision":1,"expected_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}

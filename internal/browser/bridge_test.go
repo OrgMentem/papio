@@ -5,6 +5,8 @@ package browser
 import (
 	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -18,8 +20,11 @@ import (
 	"papio/internal/config"
 	"papio/internal/job"
 	"papio/internal/pdf"
+	"papio/internal/preview"
 	"papio/internal/protocol"
 	"papio/internal/store"
+	"papio/internal/triage"
+	"papio/internal/watch"
 	"papio/internal/work"
 )
 
@@ -47,6 +52,14 @@ func newBridge(t *testing.T) (*Bridge, *job.Store, config.Config, string) {
 	cfg.Browser.OpenURLBase = "https://openurl.example.edu/resolve"
 	cfg.Browser.ActionExpirySeconds = 1800
 	jobs := &job.Store{S: db}
+	watches := watch.NewStore(db)
+	triageService := triage.New(db, watches, jobs)
+	previewServer := preview.New()
+	t.Cleanup(func() {
+		if err := previewServer.Shutdown(context.Background()); err != nil {
+			t.Errorf("close preview: %v", err)
+		}
+	})
 	svc := app.New(cfg, jobs, artifacts, nil)
 	svc.Validate = func(context.Context, string, string, work.Work) (pdf.ValidationReport, error) {
 		return pdf.ValidationReport{
@@ -56,7 +69,7 @@ func newBridge(t *testing.T) (*Bridge, *job.Store, config.Config, string) {
 			Identity:   pdf.IdentityDecision{Result: pdf.IdentityPass, Evidence: []string{"doi match"}},
 		}, nil
 	}
-	return NewBridge(jobs, svc, cfg, "0.1.0-test", []string{"browser_handoff"}), jobs, cfg, data
+	return NewBridge(jobs, svc, triageService, &watch.Runner{Store: watches}, previewServer, cfg, "0.1.0-test", []string{"browser_handoff"}), jobs, cfg, data
 }
 
 func handoffWork() work.Work {
@@ -174,18 +187,20 @@ func TestHelloAckAnnouncesDaemonVersion(t *testing.T) {
 	if payload.DaemonVersion != "0.1.0-test" {
 		t.Fatalf("daemon_version = %q, want 0.1.0-test", payload.DaemonVersion)
 	}
-	if !slices.Equal(payload.Features, []string{"browser_handoff", pageAcquireFeature}) {
-		t.Fatalf("features = %v, want [browser_handoff %s]", payload.Features, pageAcquireFeature)
+	if !slices.Equal(payload.Features, []string{
+		"browser_handoff", pageAcquireFeature, triageSnapshotFeature, triageMutationsFeature, reviewPreviewFeature,
+	}) {
+		t.Fatalf("features = %v, want required bridge feature set", payload.Features)
 	}
 }
 
-func TestHelloAckFeatureCapReservesMandatoryPageAcquire(t *testing.T) {
+func TestHelloAckFeatureCapReservesMandatoryFeatures(t *testing.T) {
 	b, _, _, _ := newBridge(t)
 	features := make([]string, 32)
 	for i := range features {
 		features[i] = strings.Repeat("x", i+1)
 	}
-	b = NewBridge(b.jobs, b.svc, b.cfg, b.Version, features)
+	b = NewBridge(b.jobs, b.svc, b.triage, b.watchRunner, b.preview, b.cfg, b.Version, features)
 
 	msgs, _ := runSync(t, b, hello())
 	ack := firstOfType(msgs, protocol.MsgHelloAck)
@@ -193,11 +208,176 @@ func TestHelloAckFeatureCapReservesMandatoryPageAcquire(t *testing.T) {
 		t.Fatalf("no hello_ack in %v", msgs)
 	}
 	got := ack.Payload.(*protocol.HelloAckPayload).Features
-	if len(got) != 32 {
-		t.Fatalf("features length = %d, want 32", len(got))
+	want := append(append([]string(nil), features[:28]...),
+		pageAcquireFeature, triageSnapshotFeature, triageMutationsFeature, reviewPreviewFeature)
+	if !slices.Equal(got, want) {
+		t.Fatalf("features = %v, want %v", got, want)
 	}
-	if got[30] != features[30] || got[31] != pageAcquireFeature {
-		t.Fatalf("features = %v, want first 31 caller features and %q", got, pageAcquireFeature)
+}
+
+func TestOldHelloNeverReceivesUnsolicitedTriageFrames(t *testing.T) {
+	b, _, _, _ := newBridge(t)
+	msgs, _ := runSync(t, b, hello())
+	for _, msg := range msgs {
+		switch msg.Type {
+		case protocol.MsgTriageSnapshotResponse, protocol.MsgTriageCountsResponse,
+			protocol.MsgTriageDecideResult, protocol.MsgHumanActionResolveResult,
+			protocol.MsgReviewPreviewResult:
+			t.Fatalf("old hello received unsolicited new frame %q", msg.Type)
+		}
+	}
+}
+
+func TestTriageSnapshotReducesMaximalPageToFrameCap(t *testing.T) {
+	b, _, _, _ := newBridge(t)
+	watched, err := b.watchRunner.Store.Create(context.Background(), watch.CreateInput{
+		Query: "frame boundary", Filters: watch.Filters{YearFrom: 2020},
+		Collection: "Reading", CadenceHours: 24, PerRunCap: 50,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries := make([]watch.DigestEntry, 0, 100)
+	for i := 1; i <= 100; i++ {
+		suffix := strings.Repeat("x", i)
+		entries = append(entries, watch.DigestEntry{
+			WorkKey: "10.1000/" + suffix, DOI: "10.1000/" + suffix,
+			Title: strings.Repeat("T", 500), Authors: strings.Repeat("A", 200),
+			Abstract: strings.Repeat("B", 2000), Year: 2026, IsOA: true,
+		})
+	}
+	if _, err := b.watchRunner.Store.RecordDigest(context.Background(), watched.ID, b.now(), entries); err != nil {
+		t.Fatal(err)
+	}
+
+	msgs, raw := runSync(t, b, hello(), inFrame(t, protocol.MsgTriageSnapshotRequest, "",
+		protocol.TriageSnapshotRequestPayload{RequestID: "request-frame-001", SchemaVersions: []int64{1}, Limit: 100}))
+	for i, msg := range msgs {
+		if msg.Type != protocol.MsgTriageSnapshotResponse {
+			continue
+		}
+		if len(raw[i]) > protocol.MaxBrowserMessageBytes {
+			t.Fatalf("snapshot frame is %d bytes, cap %d", len(raw[i]), protocol.MaxBrowserMessageBytes)
+		}
+		payload := msg.Payload.(*protocol.TriageSnapshotResponsePayload)
+		if len(payload.Items) == 0 || len(payload.Items) >= 100 || !payload.HasMore || payload.Cursor == "" {
+			t.Fatalf("frame-limited snapshot = %+v", payload)
+		}
+		return
+	}
+	t.Fatal("triage snapshot response missing")
+}
+
+func TestTriageCountsResponseEchoesRequestID(t *testing.T) {
+	b, _, _, _ := newBridge(t)
+	msgs, _ := runSync(t, b, hello(), inFrame(t, protocol.MsgTriageCountsRequest, "",
+		protocol.TriageCountsRequestPayload{RequestID: "request-count-001"}))
+	result := firstOfType(msgs, protocol.MsgTriageCountsResponse)
+	if result == nil {
+		t.Fatalf("triage counts response missing: %v", msgs)
+	}
+	if payload := result.Payload.(*protocol.TriageCountsResponsePayload); payload.RequestID != "request-count-001" {
+		t.Fatalf("counts response request_id = %q", payload.RequestID)
+	}
+}
+
+func TestTriageDismissConsumesSelectedWatchHit(t *testing.T) {
+	b, _, _, _ := newBridge(t)
+	watched, err := b.watchRunner.Store.Create(context.Background(), watch.CreateInput{
+		Query: "dismiss", Filters: watch.Filters{YearFrom: 2020},
+		Collection: "Reading", CadenceHours: 24, PerRunCap: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.watchRunner.Store.RecordDigest(context.Background(), watched.ID, b.now(), []watch.DigestEntry{{
+		WorkKey: "10.1000/dismiss", DOI: "10.1000/dismiss", Title: "Dismiss me",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := b.triage.Snapshot(context.Background(), triage.SnapshotRequest{Limit: 1})
+	if err != nil || len(snapshot.Items) != 1 {
+		t.Fatalf("initial snapshot = %+v, %v", snapshot, err)
+	}
+	msgs, _ := runSync(t, b, hello(), inFrame(t, protocol.MsgTriageDecide, "",
+		protocol.TriageDecidePayload{
+			RequestID: "request-dismiss-001", ItemID: snapshot.Items[0].ID, Op: "dismiss",
+			WatchScope: json.RawMessage(`"all"`),
+		}))
+	result := firstOfType(msgs, protocol.MsgTriageDecideResult)
+	if result == nil {
+		t.Fatalf("triage decision response missing: %v", msgs)
+	}
+	payload := result.Payload.(*protocol.TriageDecideResultPayload)
+	if payload.RequestID != "request-dismiss-001" || payload.Outcome != "applied" {
+		t.Fatalf("triage decision payload = %+v", payload)
+	}
+	after, err := b.triage.Snapshot(context.Background(), triage.SnapshotRequest{Limit: 1})
+	if err != nil || len(after.Items) != 0 {
+		t.Fatalf("dismissed snapshot = %+v, %v", after, err)
+	}
+}
+
+func TestReviewPreviewAndResolveNeverLeakQuarantinePath(t *testing.T) {
+	b, jobs, _, data := newBridge(t)
+	const sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	id, err := jobs.CreateRequest(context.Background(), "wr_browser_review",
+		work.Work{DOI: "10.1000/review", Title: "Review"}, "", "",
+		job.Policy{AccessMode: config.ModeMaximal, DesiredVersion: "any", FetchMaxBytes: 1 << 20}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := jobs.S.DB().ExecContext(context.Background(), `UPDATE jobs SET state = 'needs_review' WHERE id = ?`, id); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(data, "quarantine-review.pdf")
+	if err := os.WriteFile(path, []byte("%PDF-preview"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	actionID, err := jobs.OpenHumanAction(context.Background(), id, "verify_identity", "review the PDF",
+		job.WithHumanActionBinding(job.HumanActionBinding{
+			CandidateID: 1, QuarantinePath: path, QuarantineSHA256: sha,
+		}))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	msgs, raw := runSync(t, b, hello(), inFrame(t, protocol.MsgReviewPreviewRequest, "",
+		protocol.ReviewPreviewRequestPayload{RequestID: "request-preview-001", ActionID: actionID}))
+	previewIndex := -1
+	var previewURL string
+	for i, msg := range msgs {
+		if msg.Type != protocol.MsgReviewPreviewResult {
+			continue
+		}
+		payload := msg.Payload.(*protocol.ReviewPreviewResultPayload)
+		if payload.RequestID != "request-preview-001" || payload.SHA256 != sha || payload.SizeBytes != int64(len("%PDF-preview")) {
+			t.Fatalf("preview payload = %+v", payload)
+		}
+		if strings.Contains(string(raw[i]), path) || strings.Contains(string(raw[i]), "quarantine_path") {
+			t.Fatalf("preview frame leaked quarantine path: %s", raw[i])
+		}
+		previewIndex, previewURL = i, payload.URL
+	}
+	if previewIndex < 0 {
+		t.Fatalf("review preview response missing: %v", msgs)
+	}
+
+	msgs, _ = runSync(t, b, inFrame(t, protocol.MsgHumanActionResolve, "",
+		protocol.HumanActionResolvePayload{RequestID: "request-resolve-001", ActionID: actionID, Verdict: "reject", ExpectedRevision: 1}))
+	result := firstOfType(msgs, protocol.MsgHumanActionResolveResult)
+	if result == nil {
+		t.Fatalf("human action resolve response missing: %v", msgs)
+	}
+	payload := result.Payload.(*protocol.HumanActionResolveResultPayload)
+	if payload.RequestID != "request-resolve-001" || payload.Outcome != "applied" {
+		t.Fatalf("human action resolve payload = %+v", payload)
+	}
+	request := httptest.NewRequest(http.MethodGet, previewURL, nil)
+	response := httptest.NewRecorder()
+	b.preview.ServeHTTP(response, request)
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("revoked preview status = %d, want %d", response.Code, http.StatusNotFound)
 	}
 }
 
@@ -360,7 +540,7 @@ func TestDaemonRestartReturnsHelloRequired(t *testing.T) {
 	runSync(t, active, hello())
 
 	// A new daemon has the same durable jobs but no in-memory hello-session.
-	restarted := NewBridge(jobs, active.svc, cfg, active.Version, active.Features)
+	restarted := NewBridge(jobs, active.svc, active.triage, active.watchRunner, active.preview, cfg, active.Version, active.Features)
 	msgs, _ := runSync(t, restarted)
 	if len(msgs) != 1 {
 		t.Fatalf("restart poll frames = %d, want 1", len(msgs))
@@ -976,7 +1156,7 @@ func TestOpenURLUsesSelectedResolverProfileForPrimoNDEAndVE(t *testing.T) {
 	cfg.Browser.Resolvers = map[string]config.Institution{
 		"institute": {OpenURLBase: "https://onesearch.library.example-institute.edu/discovery/openurl?vid=61INS_INST:INS"},
 	}
-	b = NewBridge(b.jobs, b.svc, cfg, b.Version, b.Features)
+	b = NewBridge(b.jobs, b.svc, b.triage, b.watchRunner, b.preview, cfg, b.Version, b.Features)
 	for _, test := range []struct {
 		name, resolver, wantPath, wantVID string
 	}{
@@ -1020,7 +1200,7 @@ func TestOfferLoginRoutingIsPerResolverProfile(t *testing.T) {
 		// ...and one without an identity gets none (no default leakage).
 		"bare": {OpenURLBase: "https://library.example.edu/openurl"},
 	}
-	b = NewBridge(b.jobs, b.svc, cfg, b.Version, b.Features)
+	b = NewBridge(b.jobs, b.svc, b.triage, b.watchRunner, b.preview, cfg, b.Version, b.Features)
 
 	for _, test := range []struct {
 		name, resolver, wantEntityID, wantAccountID string

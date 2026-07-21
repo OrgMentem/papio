@@ -424,3 +424,43 @@ func TestBundleIdentityInvariantsAreRouteAware(t *testing.T) {
 		}
 	})
 }
+
+func TestTriageFixturePayloadRoundTrips(t *testing.T) {
+	cases := map[string]string{
+		"browser-triage-snapshot-request.json":     MsgTriageSnapshotRequest,
+		"browser-triage-snapshot-response.json":    MsgTriageSnapshotResponse,
+		"browser-triage-counts-request.json":       MsgTriageCountsRequest,
+		"browser-triage-counts-response.json":      MsgTriageCountsResponse,
+		"browser-triage-decide.json":               MsgTriageDecide,
+		"browser-triage-decide-result.json":        MsgTriageDecideResult,
+		"browser-human-action-resolve.json":        MsgHumanActionResolve,
+		"browser-human-action-resolve-result.json": MsgHumanActionResolveResult,
+		"browser-review-preview-request.json":      MsgReviewPreviewRequest,
+		"browser-review-preview-result.json":       MsgReviewPreviewResult,
+	}
+	for name, wantType := range cases {
+		t.Run(name, func(t *testing.T) {
+			data, err := os.ReadFile(filepath.Join(corpusDir(t, "valid"), name))
+			if err != nil {
+				t.Fatal(err)
+			}
+			message, err := DecodeBrowserMessage(data)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if message.Type != wantType {
+				t.Fatalf("type = %q, want %q", message.Type, wantType)
+			}
+			encoded, err := json.Marshal(map[string]any{
+				"protocol": message.Protocol, "type": message.Type, "msg_id": message.MsgID,
+				"seq": message.Seq, "payload": message.Payload,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := DecodeBrowserMessage(encoded); err != nil {
+				t.Fatalf("round-trip decode: %v", err)
+			}
+		})
+	}
+}

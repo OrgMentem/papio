@@ -2,10 +2,8 @@
 // Bundles the Chrome MV3 extension into dist/ and produces a Firefox MV3
 // extension root in firefox/. Bun is a build tool here only — both shipped
 // artifacts are plain browser JavaScript with zero runtime dependencies.
-//   dist/background.js                  Chrome module service worker
-//   firefox/dist/background.js          Firefox classic event-page script
-//   dist/{options,popup}.{js,html}      Chrome extension pages
-//   firefox/dist/{options,popup}.{js,html} Firefox extension pages
+//   dist/{inbox,options,popup}.{js,html} Chrome extension pages
+//   firefox/dist/{inbox,options,popup}.{js,html} Firefox extension pages
 //
 // Pass --watch to rebuild on changes to src/, icons/, or manifest.json — the
 // dev loop (see `bun run dev`) pairs this with `web-ext run`, which reloads the
@@ -18,6 +16,20 @@ import { watch as fsWatch } from "node:fs";
 const firefoxRoot = "firefox";
 const firefoxDist = `${firefoxRoot}/dist`;
 const buildDaemonVersion = process.env.PAPIO_DAEMON_VERSION ?? "0.0.0-dev";
+
+const extensionPageNames = ["inbox", "options", "popup"] as const;
+
+async function assertExtensionPages(outdir: string): Promise<void> {
+  await Promise.all(
+    extensionPageNames.map(async (pageName) => {
+      await readFile(`${outdir}/${pageName}.html`, "utf8");
+      const bundle = await readFile(`${outdir}/${pageName}.js`, "utf8");
+      if (bundle.includes("innerHTML")) {
+        throw new Error(`${outdir}/${pageName}.js must not contain innerHTML; use textContent instead`);
+      }
+    }),
+  );
+}
 
 
 async function build(entrypoints: string[], outdir: string, format: "esm" | "iife"): Promise<number> {
@@ -40,23 +52,31 @@ async function build(entrypoints: string[], outdir: string, format: "esm" | "iif
 
 async function buildAll(): Promise<void> {
   const chromeBundles = await build(
-    ["src/background.ts", "src/options.ts", "src/popup.ts"],
+    ["src/background.ts", "src/inbox.ts", "src/options.ts", "src/popup.ts"],
     "dist",
     "esm",
   );
-  await cp("src/options.html", "dist/options.html");
-  await cp("src/popup.html", "dist/popup.html");
-  console.log(`built Chrome: ${chromeBundles} bundles + 2 html shells into dist/`);
+  await Promise.all([
+    cp("src/inbox.html", "dist/inbox.html"),
+    cp("src/options.html", "dist/options.html"),
+    cp("src/popup.html", "dist/popup.html"),
+  ]);
+  await assertExtensionPages("dist");
+  console.log(`built Chrome: ${chromeBundles} bundles + 3 html shells into dist/`);
 
   await mkdir(firefoxDist, { recursive: true });
   const firefoxBackgroundBundles = await build(["src/background.ts"], firefoxDist, "iife");
-  const firefoxPageBundles = await build(["src/options.ts", "src/popup.ts"], firefoxDist, "esm");
+  const firefoxPageBundles = await build(["src/inbox.ts", "src/options.ts", "src/popup.ts"], firefoxDist, "esm");
   await Promise.all([
+    cp("src/inbox.html", `${firefoxDist}/inbox.html`),
     cp("src/options.html", `${firefoxDist}/options.html`),
     cp("src/popup.html", `${firefoxDist}/popup.html`),
     cp("icons", `${firefoxRoot}/icons`, { recursive: true }),
   ]);
+  await assertExtensionPages(firefoxDist);
 
+  // manifest.json deliberately omits content_security_policy: MV3's default
+  // extension_pages CSP already prohibits inline and remotely hosted scripts.
   const chromeManifest = JSON.parse(await readFile("manifest.json", "utf8")) as Record<string, unknown>;
   const { minimum_chrome_version: _, ...firefoxManifest } = chromeManifest;
   firefoxManifest.background = { scripts: ["dist/background.js"] };
@@ -72,11 +92,12 @@ async function buildAll(): Promise<void> {
   await writeFile(`${firefoxRoot}/manifest.json`, `${JSON.stringify(firefoxManifest, null, 2)}\n`);
 
   const firefoxBackground = await readFile(`${firefoxDist}/background.js`, "utf8");
-  if (/^export /m.test(firefoxBackground)) {
-    throw new Error("Firefox background bundle must be a classic script, not an ES module");
+  const firefoxInbox = await readFile(`${firefoxDist}/inbox.js`, "utf8");
+  if (/^export /m.test(firefoxBackground) || /^export /m.test(firefoxInbox)) {
+    throw new Error("Firefox background and inbox bundles must not contain top-level exports");
   }
   console.log(
-    `built Firefox: ${firefoxBackgroundBundles + firefoxPageBundles} bundles + 2 html shells + icons into firefox/`,
+    `built Firefox: ${firefoxBackgroundBundles + firefoxPageBundles} bundles + 3 html shells + icons into firefox/`,
   );
 }
 

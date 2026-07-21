@@ -1,0 +1,1 @@
+{"protocol":"papio-browser/1","type":"triage_counts_response","msg_id":"counts-bad-002","seq":4,"payload":{"counts":{"pending_total":0,"watch_hits":0,"actions":0,"retractions":0,"jobs_working":0,"jobs_needs_review":0,"failure_groups_7d":0}}}

@@ -28,15 +28,22 @@ import (
 	"papio/internal/app"
 	"papio/internal/config"
 	"papio/internal/job"
+	"papio/internal/preview"
 	"papio/internal/protocol"
 	"papio/internal/store"
+	"papio/internal/triage"
+	"papio/internal/watch"
 	"papio/internal/work"
 )
 
 const (
-	handoffActionKind   = "openurl_handoff"
-	MinExtensionVersion = "0.1.0"
-	pageAcquireFeature  = "page_acquire"
+	handoffActionKind      = "openurl_handoff"
+	MinExtensionVersion    = "0.1.0"
+	pageAcquireFeature     = "page_acquire"
+	triageSnapshotFeature  = "triage_snapshot_v1"
+	triageMutationsFeature = "triage_mutations_v1"
+	reviewPreviewFeature   = "review_preview_v1"
+	previewCapabilityTTL   = 10 * time.Minute
 )
 
 // ErrInvalidFrame marks a client-side protocol violation (a frame that fails
@@ -49,9 +56,12 @@ var ErrInvalidFrame = errors.New("invalid browser frame")
 // recovery an MV3 service-worker restart needs (the extension reconnects, says
 // hello again, and re-receives outstanding offers).
 type Bridge struct {
-	jobs *job.Store
-	svc  *app.Service
-	cfg  config.Config
+	jobs        *job.Store
+	svc         *app.Service
+	triage      *triage.Service
+	watchRunner *watch.Runner
+	preview     *preview.Server
+	cfg         config.Config
 
 	// Version and Features are daemon capabilities announced in hello_ack.
 	Version  string
@@ -72,33 +82,49 @@ type Bridge struct {
 
 // NewBridge constructs the bridge. It is cheap and always constructed; whether
 // any job is ever offered depends on config (extension_id / openurl base).
-func NewBridge(jobs *job.Store, svc *app.Service, cfg config.Config, version string, features []string) *Bridge {
+func NewBridge(jobs *job.Store, svc *app.Service, triageService *triage.Service, watchRunner *watch.Runner, previewServer *preview.Server, cfg config.Config, version string, features []string) *Bridge {
 	return &Bridge{
-		jobs: jobs, svc: svc, cfg: cfg,
-		Version: version, Features: appendFeature(features, pageAcquireFeature),
+		jobs: jobs, svc: svc, triage: triageService, watchRunner: watchRunner, preview: previewServer, cfg: cfg,
+		Version: version,
+		Features: appendFeatures(features,
+			pageAcquireFeature, triageSnapshotFeature, triageMutationsFeature, reviewPreviewFeature),
 		offered: map[string]bool{}, cancelSent: map[string]bool{},
 		now: time.Now,
 	}
 }
 
+func appendFeatures(features []string, required ...string) []string {
+	mandatory := make(map[string]bool, len(required))
+	orderedRequired := make([]string, 0, len(required))
+	for _, feature := range required {
+		if feature != "" && !mandatory[feature] {
+			mandatory[feature] = true
+			orderedRequired = append(orderedRequired, feature)
+		}
+	}
+	result := make([]string, 0, 32)
+	for _, feature := range features {
+		if len(result) == 32-len(orderedRequired) {
+			break
+		}
+		if feature != "" && !mandatory[feature] {
+			duplicate := false
+			for _, existing := range result {
+				if existing == feature {
+					duplicate = true
+					break
+				}
+			}
+			if !duplicate {
+				result = append(result, feature)
+			}
+		}
+	}
+	return append(result, orderedRequired...)
+}
+
 func appendFeature(features []string, feature string) []string {
-	result := append([]string(nil), features...)
-	for i, existing := range result {
-		if existing != feature {
-			continue
-		}
-		if len(result) <= 32 {
-			return result
-		}
-		if i < 32 {
-			return result[:32]
-		}
-		return append(result[:31], feature)
-	}
-	if len(result) >= 32 {
-		result = result[:31]
-	}
-	return append(result, feature)
+	return appendFeatures(features, feature)
 }
 
 // SessionInfo returns a consistent snapshot of the current extension hello-session.
@@ -185,6 +211,21 @@ func (b *Bridge) handle(ctx context.Context, msg *protocol.BrowserMessage) ([]js
 	case protocol.MsgPageAcquire:
 		return b.pageAcquire(ctx, msg.Payload.(*protocol.PageAcquirePayload))
 
+	case protocol.MsgTriageSnapshotRequest:
+		return b.triageSnapshot(ctx, msg.Payload.(*protocol.TriageSnapshotRequestPayload))
+
+	case protocol.MsgTriageCountsRequest:
+		return b.triageCounts(ctx, msg.Payload.(*protocol.TriageCountsRequestPayload))
+
+	case protocol.MsgTriageDecide:
+		return b.triageDecide(ctx, msg.Payload.(*protocol.TriageDecidePayload))
+
+	case protocol.MsgHumanActionResolve:
+		return b.humanActionResolve(ctx, msg.Payload.(*protocol.HumanActionResolvePayload))
+
+	case protocol.MsgReviewPreviewRequest:
+		return b.reviewPreview(ctx, msg.Payload.(*protocol.ReviewPreviewRequestPayload))
+
 	case protocol.MsgJobAccept:
 		return nil, b.jobs.S.AppendEvent(ctx, msg.JobID, "browser.job_accept", nil)
 
@@ -254,6 +295,280 @@ func (b *Bridge) handle(ctx context.Context, msg *protocol.BrowserMessage) ([]js
 	}
 }
 
+// triageSnapshot answers only an explicit request. It progressively lowers the
+// requested page size before framing so a maximal page cannot breach the native
+// messaging cap; each retry asks the service for a real page so its cursor
+// remains valid for exactly the returned item count.
+func (b *Bridge) triageSnapshot(ctx context.Context, request *protocol.TriageSnapshotRequestPayload) ([]json.RawMessage, error) {
+	if b.triage == nil {
+		return nil, errors.New("triage service is not configured")
+	}
+	limit := request.Limit
+	if limit == 0 {
+		limit = 50
+	}
+	for {
+		snapshot, err := b.triage.Snapshot(ctx, triage.SnapshotRequest{Limit: int(limit), Cursor: request.Cursor})
+		if err != nil {
+			return nil, err
+		}
+		payload := triageSnapshotPayload(request.RequestID, snapshot)
+		if b.frameFits(protocol.MsgTriageSnapshotResponse, payload) {
+			frame, err := b.frame(protocol.MsgTriageSnapshotResponse, "", payload)
+			if err != nil {
+				return nil, err
+			}
+			return []json.RawMessage{frame}, nil
+		}
+		if len(snapshot.Items) <= 1 {
+			return nil, fmt.Errorf("triage snapshot item exceeds browser frame cap %d", protocol.MaxBrowserMessageBytes)
+		}
+		limit = int64(len(snapshot.Items) - 1)
+	}
+}
+
+func triageSnapshotPayload(requestID string, snapshot triage.Snapshot) protocol.TriageSnapshotResponsePayload {
+	items := make([]protocol.TriageSnapshotItem, 0, len(snapshot.Items))
+	for _, item := range snapshot.Items {
+		payload := protocol.TriageSnapshotItem{
+			Kind: item.Kind, ID: item.ID, Rank: int64(item.Rank), Title: item.Title,
+			Facts: triageFacts(item.Facts), Links: triageLinks(item.Links), Ops: append([]string(nil), item.Ops...),
+		}
+		switch item.Kind {
+		case triage.KindWatchHit:
+			hit := item.WatchHit
+			if hit != nil {
+				payload.Work = &protocol.TriageWork{
+					DOI: hit.Work.DOI, Title: hit.Work.Title, Authors: hit.Work.Authors,
+					Year: int64(hit.Work.Year), IsOA: hit.Work.IsOA,
+				}
+				payload.Abstract = hit.Abstract
+				payload.Watches = make([]protocol.TriageWatch, 0, len(hit.Watches))
+				for _, watched := range hit.Watches {
+					payload.Watches = append(payload.Watches, protocol.TriageWatch{ID: watched.ID, Label: watched.Label})
+				}
+				payload.FirstSeenAt = hit.FirstSeenAt
+			}
+		case triage.KindHumanAction:
+			action := item.HumanAction
+			if action != nil {
+				payload.ActionID, payload.JobID = action.ActionID, action.JobID
+				payload.ActionKind, payload.JobState = action.ActionKind, action.JobState
+				payload.Revision, payload.SHA256, payload.SizeBytes = action.Revision, action.SHA256, action.SizeBytes
+			}
+		case triage.KindRetraction:
+			retraction := item.Retraction
+			if retraction != nil {
+				payload.DOI, payload.Nature = retraction.DOI, retraction.Nature
+				payload.NoticedAt = retraction.NoticedAt.UTC().Format(time.RFC3339Nano)
+				payload.NoticeDOI = retraction.NoticeDOI
+			}
+		}
+		items = append(items, payload)
+	}
+	return protocol.TriageSnapshotResponsePayload{
+		RequestID: requestID, Schema: int64(snapshot.Schema), GeneratedAt: snapshot.GeneratedAt,
+		Counts: triageCountsPayload(snapshot.Counts), Items: items, Cursor: snapshot.Cursor,
+		HasMore: snapshot.HasMore, UnsupportedItemsCount: int64(snapshot.UnsupportedItemsCount),
+	}
+}
+
+func triageFacts(facts []triage.Fact) []protocol.TriageFact {
+	result := make([]protocol.TriageFact, 0, len(facts))
+	for _, fact := range facts {
+		result = append(result, protocol.TriageFact{Label: fact.Label, Text: fact.Text})
+	}
+	return result
+}
+
+func triageLinks(links []triage.Link) []protocol.TriageLink {
+	result := make([]protocol.TriageLink, 0, len(links))
+	for _, link := range links {
+		result = append(result, protocol.TriageLink{Rel: link.Rel, URL: link.URL})
+	}
+	return result
+}
+
+func triageCountsPayload(counts triage.Counts) protocol.TriageCounts {
+	return protocol.TriageCounts{
+		PendingTotal: int64(counts.PendingTotal), WatchHits: int64(counts.WatchHits), Actions: int64(counts.Actions),
+		Retractions: int64(counts.Retractions), JobsWorking: int64(counts.JobsWorking),
+		JobsNeedsReview: int64(counts.JobsNeedsReview), FailureGroups7d: int64(counts.FailureGroups7d),
+	}
+}
+
+func (b *Bridge) triageCounts(ctx context.Context, request *protocol.TriageCountsRequestPayload) ([]json.RawMessage, error) {
+	if b.triage == nil {
+		return nil, errors.New("triage service is not configured")
+	}
+	counts, err := b.triage.Counts(ctx)
+	if err != nil {
+		return nil, err
+	}
+	frame, err := b.frame(protocol.MsgTriageCountsResponse, "", protocol.TriageCountsResponsePayload{
+		RequestID: request.RequestID, Counts: triageCountsPayload(counts),
+	})
+	if err != nil {
+		return nil, err
+	}
+	return []json.RawMessage{frame}, nil
+}
+
+func (b *Bridge) triageDecide(ctx context.Context, request *protocol.TriageDecidePayload) ([]json.RawMessage, error) {
+	if b.triage == nil || b.watchRunner == nil {
+		return b.triageDecisionResult(request.RequestID, "error", "triage mutations are not configured")
+	}
+	hit, err := b.triage.FindWatchHit(ctx, request.ItemID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return b.triageDecisionResult(request.RequestID, "conflict", "")
+	}
+	if err != nil {
+		return b.triageDecisionResult(request.RequestID, "error", err.Error())
+	}
+	if request.Op == "acquire" {
+		for _, watched := range hit.Watches {
+			if _, err := b.watchRunner.AcquireDigest(ctx, watched.ID, []string{watched.WorkKey}); err != nil {
+				if errors.Is(err, watch.ErrDigestEntryNotFound) || errors.Is(err, sql.ErrNoRows) {
+					return b.triageDecisionResult(request.RequestID, "conflict", "")
+				}
+				return b.triageDecisionResult(request.RequestID, "error", err.Error())
+			}
+		}
+		return b.triageDecisionResult(request.RequestID, "applied", "")
+	}
+	selected, err := triageDismissScope(request.WatchScope, hit.Watches)
+	if err != nil {
+		return b.triageDecisionResult(request.RequestID, "error", err.Error())
+	}
+	for _, watched := range hit.Watches {
+		if !selected[watched.ID] {
+			continue
+		}
+		if _, err := b.watchRunner.ConsumeDigest(ctx, watched.ID, []string{watched.WorkKey}); err != nil {
+			if errors.Is(err, watch.ErrDigestEntryNotFound) || errors.Is(err, sql.ErrNoRows) {
+				return b.triageDecisionResult(request.RequestID, "conflict", "")
+			}
+			return b.triageDecisionResult(request.RequestID, "error", err.Error())
+		}
+	}
+	return b.triageDecisionResult(request.RequestID, "applied", "")
+}
+
+func triageDismissScope(raw json.RawMessage, watches []triage.Watch) (map[int64]bool, error) {
+	var all string
+	if err := json.Unmarshal(raw, &all); err == nil {
+		if all != "all" {
+			return nil, errors.New("watch_scope must be all or watch IDs")
+		}
+		selected := make(map[int64]bool, len(watches))
+		for _, watched := range watches {
+			selected[watched.ID] = true
+		}
+		return selected, nil
+	}
+	var ids []int64
+	if err := json.Unmarshal(raw, &ids); err != nil {
+		return nil, errors.New("watch_scope must be all or watch IDs")
+	}
+	available, selected := make(map[int64]bool, len(watches)), make(map[int64]bool, len(ids))
+	for _, watched := range watches {
+		available[watched.ID] = true
+	}
+	for _, id := range ids {
+		if !available[id] || selected[id] {
+			return nil, errors.New("watch_scope contains an invalid watch ID")
+		}
+		selected[id] = true
+	}
+	return selected, nil
+}
+
+func (b *Bridge) triageDecisionResult(requestID, outcome, detail string) ([]json.RawMessage, error) {
+	frame, err := b.frame(protocol.MsgTriageDecideResult, "", protocol.TriageDecideResultPayload{
+		RequestID: requestID, Outcome: outcome, Detail: truncate(detail, 1000),
+	})
+	if err != nil {
+		return nil, err
+	}
+	return []json.RawMessage{frame}, nil
+}
+
+func (b *Bridge) humanActionResolve(ctx context.Context, request *protocol.HumanActionResolvePayload) ([]json.RawMessage, error) {
+	if b.jobs == nil {
+		return b.humanActionResolveResult(request.RequestID, "error", "jobs are not configured")
+	}
+	resolution, err := b.jobs.ResolveReviewCAS(ctx, job.ResolveReviewInput{
+		ActionID: request.ActionID, Verdict: request.Verdict,
+		ExpectedRevision: request.ExpectedRevision, ExpectedSHA256: request.ExpectedSHA256,
+	})
+	if err != nil {
+		if errors.Is(err, job.ErrConflict) {
+			return b.humanActionResolveResult(request.RequestID, "conflict", "")
+		}
+		return b.humanActionResolveResult(request.RequestID, "error", err.Error())
+	}
+	if b.preview != nil && (resolution.Outcome == job.ReviewApplied || resolution.Outcome == job.ReviewAlreadyApplied) {
+		b.preview.Revoke(request.ActionID)
+	}
+	return b.humanActionResolveResult(request.RequestID, string(resolution.Outcome), "")
+}
+
+func (b *Bridge) humanActionResolveResult(requestID, outcome, detail string) ([]json.RawMessage, error) {
+	frame, err := b.frame(protocol.MsgHumanActionResolveResult, "", protocol.HumanActionResolveResultPayload{
+		RequestID: requestID, Outcome: outcome, Detail: truncate(detail, 1000),
+	})
+	if err != nil {
+		return nil, err
+	}
+	return []json.RawMessage{frame}, nil
+}
+
+func (b *Bridge) reviewPreview(ctx context.Context, request *protocol.ReviewPreviewRequestPayload) ([]json.RawMessage, error) {
+	if b.jobs == nil || b.preview == nil {
+		return nil, errors.New("review preview is not configured")
+	}
+	actions, err := b.jobs.ListHumanActions(ctx, true)
+	if err != nil {
+		return nil, err
+	}
+	var action *job.HumanAction
+	for i := range actions {
+		if actions[i].ID == request.ActionID {
+			action = &actions[i]
+			break
+		}
+	}
+	if action == nil || action.Kind != "verify_identity" {
+		return nil, fmt.Errorf("review action %d is unavailable", request.ActionID)
+	}
+	info, err := os.Stat(action.QuarantinePath)
+	if err != nil || !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("review action %d preview is unavailable", request.ActionID)
+	}
+	url, err := b.preview.Issue(action.ID, action.QuarantinePath, action.QuarantineSHA256, info.Size(), previewCapabilityTTL)
+	if err != nil {
+		return nil, err
+	}
+	frame, err := b.frame(protocol.MsgReviewPreviewResult, "", protocol.ReviewPreviewResultPayload{
+		RequestID: request.RequestID, URL: url, SHA256: action.QuarantineSHA256, SizeBytes: info.Size(),
+		ExpiresAt: b.now().UTC().Add(previewCapabilityTTL).Format(time.RFC3339Nano),
+	})
+	if err != nil {
+		return nil, err
+	}
+	return []json.RawMessage{frame}, nil
+}
+
+func (b *Bridge) frameFits(msgType string, payload any) bool {
+	raw, err := json.Marshal(map[string]any{
+		"protocol": protocol.BrowserProtocolVersion,
+		"type":     msgType,
+		"msg_id":   "AAAAAAAAAAAAAAAAAAAAAA",
+		"seq":      b.seq + 1,
+		"payload":  payload,
+	})
+	return err == nil && len(raw) <= protocol.MaxBrowserMessageBytes
+}
 func (b *Bridge) pageAcquire(ctx context.Context, payload *protocol.PageAcquirePayload) ([]json.RawMessage, error) {
 	request, err := pageAcquireRequest(payload)
 	if err != nil {

@@ -7,18 +7,19 @@ import { Window } from "happy-dom";
 
 import {
   acquireCurrentPage,
-  cancelJob,
-  livePageAcquireAvailable,
   collectPageMetadata,
-  focusJob,
+  OPEN_INBOX_MESSAGE,
+  openInbox,
   renderDaemonStatus,
-  renderJobs,
   renderPageAcquire,
-  refresh,
+  renderPageContext,
   renderResolverGrants,
+  renderTermsConsent,
   wireCapture,
+  wireDevTools,
+  wireInboxLauncher,
+  wirePrimaryShortcut,
   wireSettings,
-  type PopupActions,
 } from "../src/popup";
 import type { ActiveJob } from "../src/state";
 import { PROVIDERS, SCENARIOS } from "../src/capture";
@@ -32,66 +33,35 @@ function popupDocument(): Document {
     HTMLElement: window.HTMLElement,
     HTMLButtonElement: window.HTMLButtonElement,
     HTMLSelectElement: window.HTMLSelectElement,
-    HTMLUListElement: window.HTMLUListElement,
   });
   return window.document as unknown as Document;
 }
 
-function job(status: ActiveJob["status"] | "imported" | "failed", overrides: Partial<ActiveJob> = {}): ActiveJob {
+function job(overrides: Partial<ActiveJob> = {}): ActiveJob {
   return {
-    job_id: `job-${status}`,
+    job_id: "job-1",
     tab_id: 17,
     offered_at: 1,
     expires_at: 2,
-    status: status as unknown as ActiveJob["status"],
+    status: "accepted",
     provider_hosts: ["www.jstor.org"],
-    expected: { title: `A ${status} paper` },
     ...overrides,
   };
 }
 
-function fakeActions() {
-  const focused: ActiveJob[] = [];
-  const cancelled: string[] = [];
-  const actions: PopupActions = {
-    focus: async (activeJob) => {
-      focused.push(activeJob);
-    },
-    cancel: async (jobID) => {
-      cancelled.push(jobID);
-    },
-  };
-  return { actions, focused, cancelled };
-}
-
-test("renders a batch with needs-you first and correct phase counts", () => {
+test("renders one card with two verbs and no redundant launcher headings", () => {
   const doc = popupDocument();
-  const { actions } = fakeActions();
-  renderJobs(
-    doc,
-    [
-      job("accepted", { job_id: "in-flight" }),
-      job("auth_pending", { job_id: "sign-in", tab_id: 9 }),
-      job("awaiting_download", { job_id: "manual-download", tab_id: 10 }),
-      job("imported", { job_id: "imported" }),
-      job("failed", { job_id: "failed" }),
-    ],
-    actions,
-  );
+  const launcher = doc.querySelector(".launcher");
 
-  expect(doc.getElementById("summary")?.textContent).toBe("2 need you · 1 downloading · 1 imported · 1 failed");
-  expect(doc.getElementById("needs-you-count")?.textContent).toBe("2");
-  expect(doc.getElementById("in-flight-count")?.textContent).toBe("1");
-  expect(doc.getElementById("done-count")?.textContent).toBe("1");
-  expect(doc.getElementById("failed-count")?.textContent).toBe("1");
-  expect(doc.querySelector("#needs-you-list .job-title")?.textContent).toBe("A auth_pending paper");
-  expect(doc.querySelector("#needs-you-list")?.textContent).toContain("Sign in to continue");
-  expect(doc.querySelector("#needs-you-list")?.textContent).toContain("Download the paper");
-  expect(doc.querySelector("#in-flight-list")?.textContent).toContain("Opening provider");
-  expect(doc.querySelector("#in-flight-list .job-provider")?.textContent).toBe("jstor.org");
-  expect(doc.querySelector("#done-section")?.hasAttribute("open")).toBe(false);
-  expect(doc.querySelector("#failed-section")?.hasAttribute("open")).toBe(false);
-  expect(doc.getElementById("capture-btn")).not.toBeNull();
+  expect(doc.querySelector("h1")).toBeNull();
+  expect(launcher?.querySelectorAll(".launcher-action")).toHaveLength(2);
+  expect(launcher?.querySelector("h2")).toBeNull();
+  expect(doc.getElementById("page-acquire-btn")?.textContent).toBe("Acquire this page");
+  expect(doc.getElementById("page-acquire-doi")?.textContent).toBe("Detecting DOI…");
+  expect(doc.getElementById("open-inbox-btn")?.textContent).toBe("Open inbox");
+  expect(doc.getElementById("needs-you-section")).toBeNull();
+  expect(doc.getElementById("terms-consent")).not.toBeNull();
+  expect(doc.getElementById("resolver-grant")).not.toBeNull();
 });
 
 test("capture selects offer every registered provider and scenario", () => {
@@ -103,12 +73,45 @@ test("capture selects offer every registered provider and scenario", () => {
   expect(values("capture-scenario")).toEqual([...SCENARIOS]);
 });
 
-test("renders daemon connection and compatibility states", () => {
+test("shows capture tools only for unpacked Chrome manifests", () => {
+  const production = popupDocument();
+  Object.assign(globalThis, {
+    chrome: {
+      runtime: {
+        getManifest: () => ({ manifest_version: 3, update_url: "https://clients2.google.com/service/update2/crx" }),
+      },
+    },
+  });
+  wireDevTools(production);
+  expect(production.querySelector<HTMLElement>(".capture")?.hidden).toBe(true);
+  expect(production.querySelectorAll("#capture-provider option")).toHaveLength(0);
+
+  const unpacked = popupDocument();
+  Object.assign(globalThis, {
+    chrome: { runtime: { getManifest: () => ({ manifest_version: 3 }) } },
+  });
+  wireDevTools(unpacked);
+  expect(unpacked.querySelector<HTMLElement>(".capture")?.hidden).toBe(false);
+  expect(unpacked.querySelectorAll("#capture-provider option")).toHaveLength(PROVIDERS.length);
+
+  const firefox = popupDocument();
+  Object.assign(globalThis, {
+    chrome: {
+      runtime: {
+        getManifest: () => ({ manifest_version: 3, browser_specific_settings: { gecko: { id: "papio@example.test" } } }),
+      },
+    },
+  });
+  wireDevTools(firefox);
+  expect(firefox.querySelector<HTMLElement>(".capture")?.hidden).toBe(true);
+});
+
+test("renders daemon problems by the actions and the version in the footer", () => {
   const doc = popupDocument();
   renderDaemonStatus(doc, { connectionStatus: "connected", daemonVersion: "0.1.0" });
-  expect(doc.getElementById("daemon-status")?.hidden).toBe(false);
-  expect(doc.getElementById("daemon-status")?.classList.contains("quiet")).toBe(true);
-  expect(doc.getElementById("daemon-status-message")?.textContent).toBe("papio daemon v0.1.0");
+  expect(doc.getElementById("daemon-status")?.hidden).toBe(true);
+  expect(doc.getElementById("daemon-footer")?.hidden).toBe(false);
+  expect(doc.getElementById("daemon-footer")?.textContent).toBe("papio daemon v0.1.0");
 
   Object.assign(globalThis, { __PAPIO_DAEMON_VERSION__: "0.2.0" });
   renderDaemonStatus(doc, {
@@ -116,120 +119,54 @@ test("renders daemon connection and compatibility states", () => {
     daemonVersion: "0.1.0",
     daemonUpdateHint: true,
   });
-  expect(doc.getElementById("daemon-status")?.classList.contains("quiet")).toBe(false);
+  expect(doc.getElementById("daemon-status")?.hidden).toBe(false);
   expect(doc.getElementById("daemon-status-message")?.textContent).toBe(
     "papio 0.2.0 is available — daemon is v0.1.0",
   );
-  expect(doc.getElementById("daemon-status-hint")?.textContent).toBe("brew upgrade papio, then: papio daemon stop");
+  expect(doc.getElementById("daemon-footer")?.textContent).toBe("papio daemon v0.1.0");
   delete (globalThis as Record<string, unknown>).__PAPIO_DAEMON_VERSION__;
 
   renderDaemonStatus(doc, { connectionStatus: "disconnected" });
   expect(doc.getElementById("daemon-status")?.textContent).toContain("papio daemon isn't reachable");
   expect(doc.getElementById("daemon-status-hint")?.textContent).toBe("run: papio daemon status");
-
-  renderDaemonStatus(doc, { connectionStatus: "daemon_outdated", daemonVersion: "0.0.9" });
-  expect(doc.getElementById("daemon-status")?.textContent).toContain("papio daemon is out of date");
-  expect(doc.getElementById("daemon-status-hint")?.textContent).toContain("update papio");
-
-  renderDaemonStatus(doc, { connectionStatus: "extension_outdated" });
-  expect(doc.getElementById("daemon-status")?.textContent).toContain(
-    "this extension is older than your papio daemon supports",
-  );
+  expect(doc.getElementById("daemon-footer")?.hidden).toBe(true);
 });
 
-test("gates page acquisition on the negotiated feature", async () => {
+test("keeps acquisition available with a detected DOI even without a negotiated daemon", async () => {
   const doc = popupDocument();
   let calls = 0;
-  const acquire = async () => {
+  renderPageAcquire(doc, async () => {
     calls += 1;
-    return { job_id: "job_page_acquire_001" };
-  };
+    throw new Error("papio daemon isn't reachable");
+  });
+  renderPageContext(doc, { url: "https://doi.org/10.1000/example", doi: "10.1000/example" }, []);
 
-  renderPageAcquire(doc, false, acquire);
   const section = doc.getElementById("page-acquire");
   const button = doc.getElementById("page-acquire-btn") as HTMLButtonElement;
-  expect(section?.hidden).toBe(true);
-  button.click();
-  expect(calls).toBe(0);
-
-  renderPageAcquire(doc, true, acquire);
   expect(section?.hidden).toBe(false);
+  expect(button.disabled).toBe(false);
   button.click();
   await Promise.resolve();
   await Promise.resolve();
   expect(calls).toBe(1);
-  expect(doc.getElementById("page-acquire-status")?.textContent).toBe("Queued: job_page_acquire_001");
+  expect(button.disabled).toBe(false);
+  expect(doc.getElementById("page-acquire-status")?.textContent).toBe("papio daemon isn't reachable");
 });
 
-test("reads page-acquire capability from the live worker", async () => {
-  const requests: unknown[] = [];
-  Object.assign(globalThis, {
-    chrome: {
-      runtime: {
-        sendMessage: async (request: unknown) => {
-          requests.push(request);
-          return { page_acquire: false };
-        },
-      },
-    },
-  });
-
-  expect(await livePageAcquireAvailable()).toBe(false);
-  expect(requests).toEqual([{ channel: "papio", action: "get_capabilities" }]);
-});
-
-test("refreshes live capability when negotiation completes", async () => {
-  const doc = popupDocument();
-  let pageAcquireAvailable = false;
-  let onChanged: ((changes: unknown, areaName: string) => unknown) | undefined;
-  Object.assign(globalThis, {
-    chrome: {
-      storage: {
-        session: {
-          get: async () => ({
-            papio_state_v1: {
-              activeJobs: [],
-              connectionStatus: "connected",
-              daemonFeatures: ["page_acquire"],
-            },
-          }),
-        },
-        local: { get: async () => ({}) },
-        onChanged: {
-          addListener: (listener: (changes: unknown, areaName: string) => unknown) => {
-            onChanged = listener;
-          },
-        },
-      },
-      runtime: { sendMessage: async () => ({ page_acquire: pageAcquireAvailable }) },
-      permissions: { contains: async () => false },
-    },
-  });
-
-  await refresh();
-  expect(doc.getElementById("page-acquire")?.hidden).toBe(true);
-
-  pageAcquireAvailable = true;
-  await onChanged?.({ papio_state_v1: {} }, "session");
-  expect(doc.getElementById("page-acquire")?.hidden).toBe(false);
-});
-
-test("disables page acquisition when the current page has no DOI", async () => {
+test("disables page acquisition when the current page has no DOI", () => {
   const doc = popupDocument();
   let calls = 0;
-  renderPageAcquire(doc, true, async () => {
+  renderPageAcquire(doc, async () => {
     calls += 1;
-    return { error: "no DOI found on this page" };
+    return { job_id: "job_page_acquire_001" };
   });
+  renderPageContext(doc, undefined, []);
 
   const button = doc.getElementById("page-acquire-btn") as HTMLButtonElement;
-  button.click();
-  await Promise.resolve();
-  await Promise.resolve();
-
-  expect(calls).toBe(1);
   expect(button.disabled).toBe(true);
-  expect(doc.getElementById("page-acquire-status")?.textContent).toBe("no DOI found on this page");
+  expect(doc.getElementById("page-acquire-doi")?.textContent).toBe("No DOI detected on this page");
+  button.click();
+  expect(calls).toBe(0);
 });
 
 test("does not send a DOI-less scraped page to the daemon", async () => {
@@ -256,73 +193,74 @@ test("does not send a DOI-less scraped page to the daemon", async () => {
   expect(messages).toBe(0);
 });
 
-test("focus button activates the correct broker-owned tab and then its window", async () => {
+test("shows the detected DOI and a local in-flight acquisition", () => {
   const doc = popupDocument();
-  const tabCalls: Array<[number, { active: boolean }]> = [];
-  const windowCalls: Array<[number, { focused: boolean; state?: string }]> = [];
-  let windowState = "normal";
-  Object.assign(globalThis, {
-    chrome: {
-      tabs: {
-        update: async (tabID: number, properties: { active: boolean }) => {
-          tabCalls.push([tabID, properties]);
-          return { windowId: 42 };
-        },
-      },
-      windows: {
-        get: async (windowID: number) => ({ id: windowID, state: windowState }),
-        update: async (windowID: number, properties: { focused: boolean; state?: string }) => {
-          windowCalls.push([windowID, properties]);
-        },
-      },
-    },
-  });
-  // Capture the wired action's promise so completion is awaited directly,
-  // instead of guessing a scheduler delay.
-  let focused: Promise<void> = Promise.resolve();
-  const actions: PopupActions = {
-    cancel: async () => {},
-    focus: (target) => (focused = focusJob(target)),
-  };
-  renderJobs(doc, [job("auth_pending", { tab_id: 91 })], actions);
+  renderPageContext(doc, { url: "https://doi.org/10.1000/example", doi: "10.1000/example" }, [
+    job({ expected: { doi: "doi:10.1000/example" } }),
+  ]);
 
-  const focus = Array.from(doc.querySelectorAll("button")).find((button) => button.textContent === "Focus");
-  focus?.click();
-  await focused;
-
-  // A normal window keeps its state — focus only, never a forced resize.
-  expect(tabCalls).toEqual([[91, { active: true }]]);
-  expect(windowCalls).toEqual([[42, { focused: true }]]);
-
-  // A minimized work window is restored while it is focused.
-  windowState = "minimized";
-  focus?.click();
-  await focused;
-  expect(windowCalls[1]).toEqual([42, { focused: true, state: "normal" }]);
+  expect(doc.getElementById("page-acquire-doi")?.textContent).toBe("Detected DOI: 10.1000/example");
+  expect(doc.getElementById("page-acquire-context")?.textContent).toBe(
+    "An acquisition for this DOI is already in progress.",
+  );
 });
 
-test("cancel remains wired for an in-flight handoff", async () => {
-  const doc = popupDocument();
-  const messages: unknown[] = [];
+test("opens the singleton inbox through the broker when it acknowledges", async () => {
+  const requests: unknown[] = [];
+  const created: unknown[] = [];
   Object.assign(globalThis, {
     chrome: {
-      runtime: {
-        sendMessage: async (message: unknown) => {
-          messages.push(message);
-        },
-      },
+      runtime: { sendMessage: async (message: unknown) => { requests.push(message); return { opened: true }; } },
+      tabs: { create: async (options: unknown) => { created.push(options); } },
     },
   });
-  const actions: PopupActions = { cancel: cancelJob, focus: async () => {} };
-  renderJobs(doc, [job("accepted", { job_id: "cancel-me" })], actions);
 
-  const cancel = Array.from(doc.querySelectorAll("button")).find((button) => button.textContent === "Cancel");
-  cancel?.click();
+  await openInbox();
+  expect(requests).toEqual([{ type: OPEN_INBOX_MESSAGE }]);
+  expect(created).toEqual([]);
+});
+
+test("falls back to a direct inbox tab when the broker does not answer", async () => {
+  const doc = popupDocument();
+  const created: unknown[] = [];
+  Object.assign(globalThis, {
+    chrome: {
+      runtime: { sendMessage: async () => undefined },
+      tabs: { create: async (options: unknown) => { created.push(options); } },
+    },
+  });
+  wireInboxLauncher(doc);
+
+  (doc.getElementById("open-inbox-btn") as HTMLButtonElement).click();
   await Promise.resolve();
   await Promise.resolve();
+  expect(created).toEqual([{ url: "dist/inbox.html" }]);
+});
 
-  expect(messages).toEqual([{ channel: "papio", action: "cancel", job_id: "cancel-me" }]);
-  expect(doc.querySelector("#in-flight-list .job")).toBeNull();
+test("Enter invokes the primary acquisition action", async () => {
+  const doc = popupDocument();
+  let calls = 0;
+  renderPageAcquire(doc, async () => {
+    calls += 1;
+    return { job_id: "job_page_acquire_001" };
+  });
+  wirePrimaryShortcut(doc);
+  renderPageContext(doc, { url: "https://doi.org/10.1000/example", doi: "10.1000/example" }, []);
+
+  doc.dispatchEvent(new doc.defaultView!.KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  await Promise.resolve();
+  await Promise.resolve();
+  expect(calls).toBe(1);
+});
+
+test("keeps the informed-consent guidance available", () => {
+  const doc = popupDocument();
+  const choices: string[] = [];
+  renderTermsConsent(doc, [job({ needs_terms_consent: true })], undefined, (choice) => choices.push(choice));
+
+  expect(doc.getElementById("terms-consent")?.hidden).toBe(false);
+  (doc.getElementById("terms-consent-enable") as HTMLButtonElement).click();
+  expect(choices).toEqual(["accept"]);
 });
 
 test("settings cog opens the options page and closes the popup", () => {
@@ -335,7 +273,6 @@ test("settings cog opens the options page and closes the popup", () => {
   });
   wireSettings(doc);
   const button = doc.getElementById("settings-btn") as unknown as HTMLButtonElement;
-  expect(button).not.toBeNull();
   button.click();
   expect(opened).toBe(1);
   expect(closed).toBe(1);
