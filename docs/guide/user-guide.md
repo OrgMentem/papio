@@ -106,12 +106,16 @@ The one-work command also accepts `--doi`, `--pmid`, `--arxiv`, `--isbn`, or
 `--openalex`; title-based requests need `--title`, repeatable `--author`, and
 `--year`. Use `--desired-version` with `published`, `accepted`, `preprint`, or
 `any`, `--source` or `--deny-source` to constrain sources, and `--max-cost` to
-cap paid-source cost.
+cap paid-source cost. `--label` works here too: it records the query context
+and seeds the target collection when `--collection` is unset.
 
 ## 4. Follow the work instead of guessing
 
 `status` groups your jobs into working, awaiting-human, needs-review, ready,
-and failed or unavailable phases:
+imported, and failed or unavailable phases. `ready` means a validated PDF is
+waiting for import; once a zotio apply files it, the job moves to `imported`
+with its Zotero item keys, so neither surface keeps presenting finished work
+as actionable:
 
 ```sh
 papio status --follow
@@ -266,8 +270,8 @@ A batch report labels `awaiting_human` work with one of these reasons:
 
 | Reason | Meaning | Next action |
 | --- | --- | --- |
-| `institutional` | No direct candidate completed; an institutional OpenURL handoff is waiting. | Open the queue, sign in through ordinary Chrome if needed, and complete the allowed provider flow. |
-| `oa_browser` | An open-access URL was handed to the browser after papio's own download could not complete it. | Use the offered browser handoff; the browser may download through its existing cookie jar or present a page for you. |
+| `institutional` | No direct candidate completed; an institutional OpenURL handoff is waiting. **Sign in to your institution first**, then open the handoff. | Open the queue, sign in through ordinary Chrome if needed, and complete the allowed provider flow. If the provider reports a stale session, re-run `papio actions open` for a fresh link. |
+| `oa_browser` | The work is **open access — no login needed**; its URL just refuses non-browser downloads. | Use the offered browser handoff; the browser may download through its existing cookie jar or present a page for you. |
 | `terms` | The extension observed terms acceptance is required. | Read and decide on the publisher's terms yourself; *papio* does not accept them for you. |
 
 `needs_review` is separate from these browser states: it is an identity decision

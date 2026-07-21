@@ -5,6 +5,12 @@ exhausted direct acquisition, [assisted and maximal access modes](access-modes.m
 can route it to the user's existing browser session. Conservative mode records
 institutional OpenURL availability without opening a handoff.
 
+Not every handoff needs a login: some open-access pages simply refuse
+non-browser downloads. `papio actions list` says which is which for every
+parked job — "open access — no login needed" versus "sign in to your
+institution first" — so you never authenticate for a paper that did not
+require it.
+
 ## One ordinary browser, not browser automation
 
 *papio* uses the browser you already use for institutional access. A browser
@@ -53,6 +59,18 @@ its work. This preserves the one-login-per-research-session model without
 asking *papio* to handle passwords, MFA, CAPTCHA tokens, or publisher
 credentials.
 
+### If your institution's sign-in reports a stale session
+
+Institutional sign-ins are time-boxed: if login plus MFA takes long enough,
+the identity provider can reject the original handoff with a "stale" or
+"expired request" page. That page is a dead end, not a failure of your
+session — sign in first, then re-run `papio actions open`; every open mints a
+fresh resolver link. The extension recognizes the common OpenAthens and
+Shibboleth failure pages itself, records the outcome on the job's audit trail
+(`papio jobs get <id>` shows it), and retries the handoff tab through the
+resolver once on your behalf. Only the outcome and the identity provider's
+hostname are reported — never the page's contents.
+
 ## Chrome and Firefox
 
 The extension works the same way in Chrome and Firefox. *papio* installs a
@@ -65,6 +83,25 @@ Firefox is a day-one target. Its built add-on ID is fixed as
 treats host access as opt-in at runtime,
 so the extension options page includes a resolver-access grant alongside the
 per-provider grants.
+
+## One browser holds the session
+
+With papio installed in more than one browser — say the store extension in
+your daily browser and a development build in a second profile — exactly one
+browser holds the offer/handoff flow at a time. The first to connect wins;
+others wait, visibly, instead of silently taking over:
+
+- `papio browser sessions` lists the holder and every waiting session with
+  extension versions and last-contact times.
+- `papio browser use <id>` (or `--latest`) hands the session to another
+  browser on demand.
+- Quitting the holder releases the session immediately; a holder that stops
+  responding (crashed browser) yields to a live waiting session within about
+  ten seconds.
+- `papio doctor` and `papio status` report when other browsers are waiting.
+
+Clicking **Acquire this page** and using the inbox work from any connected
+browser regardless of which one holds the handoff flow.
 
 ## Browser configuration
 

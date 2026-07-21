@@ -36,7 +36,7 @@ papio acquire [identifier] [flags]
 | `--include-owned` | `bool` | `false` | with --batch, submit works already carrying a PDF in zotio |
 | `--isbn` | `string` |  | ISBN |
 | `--keys` | `stringArray` | `[]` | digest work key to queue (repeatable) |
-| `--label` | `string` |  | batch query context; also the default target collection when --collection is unset |
+| `--label` | `string` |  | query context; also the default target collection when --collection is unset |
 | `--limit` | `int` | `25` | maximum Zotio items to queue |
 | `--max-cost` | `float64` | `0` | maximum paid-source cost in USD |
 | `--openalex` | `string` |  | OpenAlex work ID |
@@ -135,6 +135,34 @@ papio batch report <batch-id|latest> [flags]
 | --- | --- | --- | --- |
 | `--markdown` | `bool` | `false` | emit an agent-ready Markdown digest |
 
+## `papio browser`
+
+Inspect and switch connected browser sessions
+
+```
+papio browser
+```
+
+### `papio browser sessions`
+
+List browser sessions connected since daemon start
+
+```
+papio browser sessions
+```
+
+### `papio browser use`
+
+Give one browser session the papio offer/handoff flow
+
+```
+papio browser use [session-id] [flags]
+```
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--latest` | `bool` | `false` | switch to the most recently active pending session |
+
 ## `papio bundle`
 
 Export validated acquisition bundles
@@ -212,6 +240,26 @@ Check acquisition readiness and local integrations
 
 ```
 papio doctor
+```
+
+## `papio inbox`
+
+Show the triage inbox
+
+```
+papio inbox [flags]
+```
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--limit` | `int` | `0` | maximum items (default 50, maximum 100) |
+
+### `papio inbox counts`
+
+Show complete triage inbox counts
+
+```
+papio inbox counts
 ```
 
 ## `papio init`
@@ -414,12 +462,15 @@ papio watch add [query] [flags]
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
 | `--cadence` | `string` | `daily` | daily, weekly, or Nh |
+| `--cited-by` | `string` |  | DOI to find papers it cites (backward references; OpenAlex cited_by: filter) |
+| `--cites` | `string` |  | DOI to find papers citing it (forward citations; OpenAlex cites: filter) |
 | `--collection` | `string` |  | zotio collection for queued papers |
 | `--kind` | `string` | `discovery` | watch kind: discovery or backfill |
 | `--label` | `string` |  | human label (defaults to query) |
 | `--limit-per-run` | `int` | `10` | maximum new papers queued per run (1-50) |
 | `--mode` | `string` | `acquire` | discovery mode: acquire or alert |
 | `--oa-only` | `bool` | `false` | return only open-access works |
+| `--related-to` | `string` |  | DOI to find OpenAlex-related papers (related_to: filter) |
 | `--year-from` | `int` | `0` | minimum publication year |
 | `--year-to` | `int` | `0` | maximum publication year |
 

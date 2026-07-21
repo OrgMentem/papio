@@ -8,6 +8,62 @@ so older sections below include extension entries. The initial release entry
 is synthesized from the complete `papio` and `zotio` Git histories and the
 execution records in `notes/acquisition-stack-plan.md`.
 
+## [Unreleased]
+
+### Added
+
+- **`[hooks] on_ready`** — a generic post-acquisition hand-off: when a job
+  reaches `ready`, the daemon runs a user-configured shell command once with
+  the job's metadata in `PAPIO_*` environment variables (`PAPIO_DOI`,
+  `PAPIO_PDF`, `PAPIO_TITLE`, …). Fire-and-forget with a durable
+  `hook.on_ready` job event as the audit trail; file acquisitions into papis,
+  Calibre, a plain folder, or any script without a bespoke integration
+  (ADR-0004). zotio remains the deep Zotero path.
+- **zotio is now optional**: an empty `zotio.executable` disables the deep
+  Zotero integration instead of rejecting the config. Ownership lookup
+  degrades to not-owned with a staleness warning so `batch submit` and
+  watches keep working, `doctor` reports zotio as "not configured
+  (optional)", and `zotio.auto_import = true` still requires the executable.
+- **Browser session arbitration** (`papio browser sessions` / `papio browser
+  use <id>|--latest`, +`browser.sessions`/`browser.claim` RPCs): with papio
+  installed in more than one browser, exactly one session now holds the
+  offer/handoff flow. Later hellos wait as pending (`session_busy`) instead of
+  silently stealing the session; a holder silent for 10 s yields to a live
+  pending session; a cleanly closing browser releases immediately. Session
+  identity rides the daemon↔native-host envelope, so extensions of every
+  version participate. `papio status` and `doctor` report waiting browsers and
+  denied hellos, and the extension-version flap between competing browsers is
+  gone (ADR-0003).
+- **Handoff actions say whether a login is needed**: human actions carry
+  `requires_auth` and `blocked_by` (`anti_bot`, `paywall`, `landing_page`),
+  `papio actions list` prints "open access — no login needed" vs "sign in to
+  your institution first", and batch reports classify handoffs from the
+  structured fields (schema v11 migrates and backfills existing parked
+  actions). The `job_offer` protocol message carries `requires_auth` for the
+  extension.
+- **Open-access sibling fallback**: when a DOI's own record yields no legal
+  candidate, the OpenAlex resolver searches for open-access sibling versions
+  (preprints or repository copies under a different DOI) with strict
+  title/year/author matching and tries those before parking the job — a
+  paywalled paper with a free SSRN/arXiv copy no longer requires a manual
+  re-search.
+- **Stale-SSO handoff recovery**: the daemon records `browser.handoff_offered`
+  and `browser.handoff_failed` job events (new `handoff_outcome` protocol
+  message), and institutional handoff guidance now says to sign in first and
+  simply re-open on a stale-session error — every open mints a fresh link.
+- **`imported` terminal job state**: a successful `zotio apply` (manual or
+  auto-import) advances the job `ready → imported` with the Zotero item keys
+  on the transition, so `jobs list` and `status` stop presenting filed work as
+  actionable; batch reports read the keys from the job itself.
+- `--label` now works on single `papio acquire` (not just `--batch`), seeding
+  the target collection when `--collection` is unset.
+
+### Fixed
+
+- `papio actions open` failures now name the URL and underlying error (with a
+  `papio doctor` hint) instead of a bare `exit status 1`, and explain when
+  open actions exist but none are openable from the CLI.
+
 ## [0.7.2] - 2026-07-20
 
 ### Fixed

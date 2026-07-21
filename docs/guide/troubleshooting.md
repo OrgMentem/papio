@@ -150,6 +150,34 @@ Do not put credentials in *papio* configuration, in messages to the extension,
 or in an MCP tool call. *papio* is designed to reuse the ordinary browser session, not
 to automate authentication.
 
+### The sign-in page says the request is stale or expired
+
+Institutional sign-ins are time-boxed. If login plus a two-factor step takes
+long enough, the identity provider may reject the original handoff link with a
+"stale request" or "expired" page even though your session is now valid. Sign
+in first, then re-run `papio actions open` — every open generates a fresh
+resolver link. The extension recognizes the common OpenAthens/Shibboleth
+failure pages, records a `browser.handoff_failed` event on the job (visible in
+`papio jobs get <id>`), and retries the handoff tab once on its own.
+
+## Two browsers fight over papio
+
+With the extension enabled in more than one browser or profile, only one
+browser holds the offer/handoff flow; the others wait as pending and their
+popups may look idle. Symptoms: handoff tabs open in the "wrong" browser, or
+`doctor` reports "N other browser(s) waiting".
+
+```sh
+papio browser sessions          # holder + pending, versions, last contact
+papio browser use --latest      # hand the session to the newest pending browser
+papio browser use <session-id>  # or pick one explicitly
+```
+
+Quitting the holding browser releases the session immediately; a crashed
+holder yields within about ten seconds. If you never want a browser to hold
+the session, disable the papio extension there. Page acquisition and the inbox
+keep working from every connected browser either way.
+
 ## Read `doctor` output
 
 `doctor` prints stable `PASS`, `WARN`, and `FAIL` rows. Any `FAIL` makes the

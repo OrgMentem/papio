@@ -14,6 +14,20 @@ History before 0.3.1 was recorded in the root `CHANGELOG.md` (the extension
 and daemon shared a version stream through 0.3.0); see its `[0.3.0]` section
 for the full pre-split extension history.
 
+## [Unreleased]
+
+### Added
+
+- **Stale-SSO detection and recovery on handoff tabs**: when a tracked
+  institutional handoff lands on an identity-provider failure page
+  (OpenAthens/Shibboleth stale or expired session), the extension reports a
+  `handoff_outcome` to the daemon for the job's audit trail and re-drives the
+  tab through the resolver once, minting a fresh sign-in exchange — no page
+  content leaves the browser, only the outcome and the IdP hostname.
+- `job_offer` now carries `requires_auth`, so the extension can distinguish
+  "open access — just render it" handoffs from ones needing an institutional
+  sign-in (groundwork for surfacing this in the popup).
+
 ## [0.4.3] - 2026-07-20
 
 ### Fixed
