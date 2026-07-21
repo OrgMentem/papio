@@ -52,6 +52,18 @@ The extension has **zero runtime deps** — both bundles are plain browser JS. `
   `internal/doctor/doctor_test.go`, `internal/store/migrate_forward_test.go`.
   `go test ./...` fails after adding `internal/store/migrations/NNNN_*.sql` until
   all three assertions are bumped.
+- **`papio daemon stop` can look hung for 15-30s** when the daemon is mid-graceful-shutdown,
+  not deadlocked — don't jump to "infinite loop" from growing `ps` CPU time alone. A `SIGKILL`'d
+  daemon leaves its unix socket file behind (never runs its own cleanup), so a subsequent
+  command hangs connecting to a dead socket; `rm` the socket at the configured `--socket` path
+  and restart before assuming a code-level bug.
+- **A long-running local dev `papio.db` can hold rows that predate a later validation.**
+  `job.WithHumanActionBinding` (quarantine_path/sha256 non-empty) only applies to actions
+  created *through* that code path going forward — pre-existing rows from before the guard
+  existed sit with an empty binding forever. A feature that assumes "this required field is
+  always populated" can be correct for every current code path and still break on old dev data.
+  Check row/job `created_at` and whether the schema/validation predates it before assuming a
+  "shouldn't happen" state is a live bug.
 
 ### Protocol (dual Go/TS)
 - The protocol is validated **twice** — `internal/protocol/protocol.go` (emit + decode +
@@ -63,6 +75,21 @@ The extension has **zero runtime deps** — both bundles are plain browser JS. `
   for the default resolver profile** (`row.Policy.Resolver == "" || "default"`) in
   `internal/browser/bridge.go` `offer()` — sending them for a `institute` job would mis-route
   another institution's login. Per-profile values are a future extension.
+- **A non-nil error from a browser-bridge RPC handler kills the whole native-messaging
+  session, not just that request.** `internal/nativehost/host.go` treats any error out of
+  `Bridge.Sync()` as fatal per its own doc comment ("the connection is considered bad"). Every
+  handler in `internal/browser/bridge.go` MUST encode ordinary/expected failures (item gone,
+  file missing, not configured, …) into a structured `outcome`/`detail` result field — mirror
+  `TriageDecideResultPayload`/`HumanActionResolveResultPayload`/`ReviewPreviewResultPayload` —
+  never return a raw Go `error` for a routine condition. `reviewPreview` got this wrong and
+  every click on a stale review action was silently disconnecting the extension.
+- **Extension unit tests manually whitelist DOM globals.** `extension/test/inbox.test.ts`
+  loads the real `src/inbox.html` (good, no fixture drift) but exposes only specific DOM
+  constructors on `globalThis` for `instanceof` checks (`HTMLElement`, `HTMLButtonElement`,
+  `HTMLTimeElement`, …). Adding a new form control (e.g. an `<input>` checked via
+  `instanceof HTMLInputElement`) needs the matching constructor added to that
+  `Object.assign(globalThis, {...})` block too, or every test in the file fails with an
+  unhelpful generic error.
 
 ### Firefox / cross-browser extension
 - Firefox MV3 has **no service worker** — background is a classic **event-page iife**
