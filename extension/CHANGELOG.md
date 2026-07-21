@@ -35,8 +35,9 @@ for the full pre-split extension history.
   for its kind (manual download ↓, browser handoff ↗, verify identity ?,
   watch hit ✶, retraction !); unknown kinds from a newer daemon degrade to a
   neutral dot. This replaces the action-kind pill. Hovering a glyph shows
-  its meaning instantly (no native-tooltip delay), and a legend in the
-  footer spells out all five.
+  its meaning instantly (no native-tooltip delay), and the footer legend
+  spells out all five. The footer (legend + keyboard help) sticks to the
+  viewport bottom, so both stay visible without scrolling.
 - **Collapsible backend details per inbox row**: item id, job id, and
   revision move out of the visible row into a collapsed "Backend details"
   section.
