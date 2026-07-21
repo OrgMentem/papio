@@ -1602,7 +1602,7 @@ func (p *HumanActionResolvePayload) validate() error {
 	if p.ActionID <= 0 || p.ActionID > MaxBrowserInteger || p.ExpectedRevision <= 0 || p.ExpectedRevision > MaxBrowserInteger {
 		return fmt.Errorf("human_action_resolve.action_id and expected_revision must be positive browser integers")
 	}
-	if err := enumRequired("human_action_resolve.verdict", p.Verdict, "accept", "reject"); err != nil {
+	if err := enumRequired("human_action_resolve.verdict", p.Verdict, "accept", "reject", "dismiss"); err != nil {
 		return err
 	}
 	if p.Verdict == "accept" && !sha256RE.MatchString(p.ExpectedSHA256) {

@@ -223,7 +223,7 @@ export interface TriageDecideResultPayload {
 export interface HumanActionResolvePayload {
   request_id: string;
   action_id: number;
-  verdict: "accept" | "reject";
+  verdict: "accept" | "reject" | "dismiss";
   expected_revision: number;
   expected_sha256?: string;
 }
@@ -816,7 +816,7 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
       int(p, "action_id", "human_action_resolve", 1);
       int(p, "expected_revision", "human_action_resolve", 1);
       const verdict = triageText(p, "verdict", "human_action_resolve", 20);
-      if (verdict !== "accept" && verdict !== "reject") fail("human_action_resolve.verdict must be accept or reject");
+      if (verdict !== "accept" && verdict !== "reject" && verdict !== "dismiss") fail("human_action_resolve.verdict must be accept, reject, or dismiss");
       if (verdict === "accept" && !("expected_sha256" in p)) fail("human_action_resolve.expected_sha256 is required for accept");
       if ("expected_sha256" in p) {
         const sha = triageText(p, "expected_sha256", "human_action_resolve", 64);

@@ -136,6 +136,103 @@ func TestSnapshotGroupsWatchHitsAndAssignsRanks(t *testing.T) {
 	}
 }
 
+func TestHumanActionItemsCarryWorkIdentityAndCorrectOps(t *testing.T) {
+	service, _, jobs := triageTestService(t)
+	ctx := context.Background()
+
+	bound := createTriageAction(t, jobs, "wr_action_bound")
+
+	unbound, err := jobs.CreateRequest(ctx, "wr_action_unbound",
+		work.Work{DOI: "10.1000/wr_action_unbound", Title: "Unbound review work"}, "", "",
+		job.Policy{AccessMode: "conservative", DesiredVersion: "any", Resolver: "fixture", FetchMaxBytes: 1 << 20}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := jobs.S.DB().ExecContext(ctx, `UPDATE jobs SET state = 'needs_review' WHERE id = ?`, unbound); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := jobs.OpenHumanAction(ctx, unbound, "verify_identity", "legacy row with no binding"); err != nil {
+		t.Fatal(err)
+	}
+
+	manual, err := jobs.CreateRequest(ctx, "wr_action_manual",
+		work.Work{DOI: "10.1000/wr_action_manual", Title: "Manual download work"}, "", "",
+		job.Policy{AccessMode: "conservative", DesiredVersion: "any", Resolver: "fixture", FetchMaxBytes: 1 << 20}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := jobs.OpenHumanAction(ctx, manual, "manual_download", "a resolver returned a landing page"); err != nil {
+		t.Fatal(err)
+	}
+
+	snapshot, err := service.Snapshot(ctx, SnapshotRequest{Limit: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	byJob := make(map[string]Item, len(snapshot.Items))
+	for _, item := range snapshot.Items {
+		if item.HumanAction != nil {
+			byJob[item.HumanAction.JobID] = item
+		}
+	}
+	if len(byJob) != 3 {
+		t.Fatalf("human action items = %d, want 3: %+v", len(byJob), snapshot.Items)
+	}
+
+	boundItem := byJob[bound]
+	if boundItem.Title != "Review work" {
+		t.Fatalf("bound item title = %q, want the paper title", boundItem.Title)
+	}
+	if len(boundItem.Links) != 1 || boundItem.Links[0].URL == "" {
+		t.Fatalf("bound item links = %+v, want a DOI link", boundItem.Links)
+	}
+	wantOps := map[string]bool{"accept": true, "reject": true, "open": true}
+	for _, op := range boundItem.Ops {
+		if !wantOps[op] {
+			t.Fatalf("bound item ops = %v, unexpected %q", boundItem.Ops, op)
+		}
+		delete(wantOps, op)
+	}
+	if len(wantOps) != 0 {
+		t.Fatalf("bound item ops = %v, missing %v", boundItem.Ops, wantOps)
+	}
+
+	unboundItem := byJob[unbound]
+	if unboundItem.Title != "Unbound review work" {
+		t.Fatalf("unbound item title = %q, want the paper title", unboundItem.Title)
+	}
+	for _, op := range unboundItem.Ops {
+		if op == "accept" {
+			t.Fatalf("unbound (unpreviewable) item offered accept: %v", unboundItem.Ops)
+		}
+	}
+	if !containsOp(unboundItem.Ops, "reject") {
+		t.Fatalf("unbound item ops = %v, want reject available without a valid binding", unboundItem.Ops)
+	}
+
+	manualItem := byJob[manual]
+	if manualItem.Title != "Manual download work" {
+		t.Fatalf("manual item title = %q, want the paper title", manualItem.Title)
+	}
+	if !containsOp(manualItem.Ops, "dismiss") {
+		t.Fatalf("manual_download item ops = %v, want dismiss (it has no accept/reject flow)", manualItem.Ops)
+	}
+	for _, op := range manualItem.Ops {
+		if op == "accept" || op == "reject" {
+			t.Fatalf("manual_download item offered a review-only op: %v", manualItem.Ops)
+		}
+	}
+}
+
+func containsOp(ops []string, want string) bool {
+	for _, op := range ops {
+		if op == want {
+			return true
+		}
+	}
+	return false
+}
+
 func TestSnapshotCursorPaginationAndCounts(t *testing.T) {
 	service, watches, jobs := triageTestService(t)
 	watched := createTriageWatch(t, watches, "cursor")

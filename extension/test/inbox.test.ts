@@ -46,6 +46,7 @@ async function inboxDocument(
     Element: window.Element,
     HTMLElement: window.HTMLElement,
     HTMLButtonElement: window.HTMLButtonElement,
+    HTMLInputElement: window.HTMLInputElement,
     HTMLTimeElement: window.HTMLTimeElement,
     chrome: {
       runtime: {
@@ -120,9 +121,9 @@ function manualAction(id: string, rank: number, title: string): TriageSnapshotIt
     id,
     rank,
     title,
-    facts: [],
+    facts: [{ label: "Action", text: "manual download" }],
     links: [],
-    ops: ["reject"],
+    ops: ["dismiss"],
     action_id: 18,
     job_id: "job-18",
     action_kind: "manual_download",
@@ -325,4 +326,70 @@ test("an acknowledged removal focuses the next triage row", async () => {
   await settle();
   expect(page.document.querySelector("[data-triage-item-id='hit:first']")).toBeNull();
   expect(page.document.activeElement?.getAttribute("data-triage-item-id")).toBe("hit:second");
+});
+
+test("dismissing a human_action item confirms and calls papio.action.resolve, not triage.decide", async () => {
+  // Regression: humanActionItems now offers "dismiss" for non-review kinds
+  // (manual_download, openurl_handoff), but the client's dismiss handler was
+  // written only for watch_hit's papio.triage.decide RPC. Routing a
+  // human_action dismiss through that path would silently no-op (the
+  // server-side triage_decide handler can never find a "action:N" id in the
+  // watch-hit table) and report a confusing "changed elsewhere" conflict.
+  const fixture = snapshot([manualAction("action:manual", 1, "Manual action")], {
+    counts: counts({ pending_total: 1, actions: 1, watch_hits: 0, retractions: 0 }),
+  });
+  const page = await inboxDocument((message) => {
+    if (message.type === "papio.action.resolve") return { ok: true, outcome: "applied" };
+    return snapshotReply(fixture, message);
+  });
+  page.document.querySelector<HTMLButtonElement>("[data-operation='dismiss']")?.click();
+  await settle();
+  expect(page.document.getElementById("confirm-dialog")?.hidden).toBe(false);
+  expect(page.document.getElementById("confirm-dialog-message")?.textContent).toContain("Dismiss");
+  expect(page.requests.filter((request) => request.type === "papio.triage.decide")).toHaveLength(0);
+  page.document.getElementById("confirm-submit")?.dispatchEvent(new Event("click", { bubbles: true }));
+  await settle();
+  expect(page.requests.find((request) => request.type === "papio.action.resolve")?.request).toEqual({
+    action_id: 18,
+    verdict: "dismiss",
+    expected_revision: 1,
+  });
+  expect(page.document.querySelector("[data-triage-item-id='action:manual']")).toBeNull();
+});
+
+test("the filter narrows visible items, keeps counts intact, and reports a distinct empty state", async () => {
+  const fixture = snapshot([
+    watchHit("hit:one", 1, "Attention and memory"),
+    manualAction("action:manual", 2, "Cognitive load review"),
+  ], { counts: counts({ pending_total: 2, actions: 1, watch_hits: 1, retractions: 0 }) });
+  const page = await inboxDocument((message) => snapshotReply(fixture, message));
+  const filterInput = page.document.getElementById("item-filter") as HTMLInputElement;
+
+  filterInput.value = "memory";
+  filterInput.dispatchEvent(new Event("input", { bubbles: true }));
+  await settle();
+  expect(Array.from(page.document.querySelectorAll("[data-triage-item-id]"), (row) => row.getAttribute("data-triage-item-id"))).toEqual(["hit:one"]);
+  expect(page.document.getElementById("inbox-counts")?.textContent).toContain("2 pending");
+
+  filterInput.value = "no such paper exists";
+  filterInput.dispatchEvent(new Event("input", { bubbles: true }));
+  await settle();
+  expect(page.document.querySelectorAll("[data-triage-item-id]")).toHaveLength(0);
+  expect(page.document.querySelector("#item-list > p")?.textContent).toContain("No items match");
+
+  filterInput.value = "";
+  filterInput.dispatchEvent(new Event("input", { bubbles: true }));
+  await settle();
+  expect(page.document.querySelectorAll("[data-triage-item-id]")).toHaveLength(2);
+});
+
+test("the action kind renders as a hidden-label eyebrow, not a plain fact row", async () => {
+  const fixture = snapshot([manualAction("action:manual", 1, "Manual action")], {
+    counts: counts({ pending_total: 1, actions: 1, watch_hits: 0, retractions: 0 }),
+  });
+  const page = await inboxDocument((message) => snapshotReply(fixture, message));
+  const dt = page.document.querySelector<HTMLElement>("[data-triage-item-id='action:manual'] dt[data-fact='action']");
+  const dd = page.document.querySelector<HTMLElement>("[data-triage-item-id='action:manual'] dd[data-fact='action']");
+  expect(dt?.textContent).toBe("Action");
+  expect(dd?.textContent).toBe("manual download");
 });

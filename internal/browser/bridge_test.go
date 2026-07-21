@@ -418,6 +418,49 @@ func TestReviewPreviewOnMissingActionReturnsErrorOutcomeWithoutFailingSync(t *te
 	runSync(t, b)
 }
 
+// Regression: manual_download/openurl_handoff actions had no closing op at
+// all before dismiss existed — humanActionItems only ever offered "open",
+// which was itself dead (these items carried no Links). A dismiss verdict
+// must close the action and cancel the job over the wire, for any kind, not
+// only verify_identity.
+func TestHumanActionResolveDismissClosesNonReviewAction(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	id, err := jobs.CreateRequest(context.Background(), "wr_browser_dismiss",
+		work.Work{DOI: "10.1000/dismiss", Title: "Dismiss me"}, "", "",
+		job.Policy{AccessMode: config.ModeMaximal, DesiredVersion: "any", FetchMaxBytes: 1 << 20}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	actionID, err := jobs.OpenHumanAction(context.Background(), id, "manual_download", "a resolver returned a landing page")
+	if err != nil {
+		t.Fatal(err)
+	}
+	runSync(t, b, hello())
+	msgs, _ := runSync(t, b, inFrame(t, protocol.MsgHumanActionResolve, "",
+		protocol.HumanActionResolvePayload{RequestID: "request-dismiss-001", ActionID: actionID, Verdict: "dismiss", ExpectedRevision: 1}))
+	result := firstOfType(msgs, protocol.MsgHumanActionResolveResult)
+	if result == nil {
+		t.Fatalf("human action resolve response missing: %v", msgs)
+	}
+	payload := result.Payload.(*protocol.HumanActionResolveResultPayload)
+	if payload.RequestID != "request-dismiss-001" || payload.Outcome != "applied" {
+		t.Fatalf("dismiss payload = %+v", payload)
+	}
+	row, err := jobs.Get(context.Background(), id)
+	if err != nil || row.State != job.StateCancelled || row.TerminalReason != "user_dismissed" {
+		t.Fatalf("dismissed job = %+v, %v", row, err)
+	}
+	actions, err := jobs.ListHumanActions(context.Background(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, action := range actions {
+		if action.ID == actionID {
+			t.Fatalf("dismissed action still open: %+v", action)
+		}
+	}
+}
+
 func TestHelloAckAdvertisesResolverOrigins(t *testing.T) {
 	b, _, _, _ := newBridge(t)
 	msgs, _ := runSync(t, b, hello())

@@ -568,7 +568,7 @@
             "properties": {
               "request_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,64}$" },
               "action_id": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
-              "verdict": { "enum": ["accept", "reject"] },
+              "verdict": { "enum": ["accept", "reject", "dismiss"] },
               "expected_revision": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
               "expected_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
             },

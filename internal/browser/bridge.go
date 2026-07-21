@@ -790,6 +790,18 @@ func (b *Bridge) humanActionResolve(ctx context.Context, request *protocol.Human
 	if b.jobs == nil {
 		return b.humanActionResolveResult(request.RequestID, "error", "jobs are not configured")
 	}
+	if request.Verdict == "dismiss" {
+		if _, err := b.jobs.DismissHumanAction(ctx, request.ActionID, request.ExpectedRevision); err != nil {
+			if errors.Is(err, job.ErrConflict) {
+				return b.humanActionResolveResult(request.RequestID, "conflict", "")
+			}
+			return b.humanActionResolveResult(request.RequestID, "error", err.Error())
+		}
+		if b.preview != nil {
+			b.preview.Revoke(request.ActionID)
+		}
+		return b.humanActionResolveResult(request.RequestID, "applied", "")
+	}
 	resolution, err := b.jobs.ResolveReviewCAS(ctx, job.ResolveReviewInput{
 		ActionID: request.ActionID, Verdict: request.Verdict,
 		ExpectedRevision: request.ExpectedRevision, ExpectedSHA256: request.ExpectedSHA256,

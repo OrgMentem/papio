@@ -1469,6 +1469,56 @@ func normalizeReviewBusy(err error) error {
 	return err
 }
 
+// DismissHumanAction atomically closes any open human action (compare-and-swap
+// on revision) and cancels its job. Unlike ResolveReviewCAS this is not
+// restricted to verify_identity — it is the generic "give up on this" escape
+// hatch for every action kind (manual_download, openurl_handoff, an orphaned
+// verify_identity with no usable quarantine binding, ...). Cancel is its own
+// idempotent, retry-safe operation, so a job that is already terminal for
+// some other reason is left untouched; only the stale action needs closing.
+func (js *Store) DismissHumanAction(ctx context.Context, actionID, expectedRevision int64) (jobID string, err error) {
+	if actionID <= 0 || expectedRevision <= 0 {
+		return "", errors.New("dismiss requires a positive action ID and revision")
+	}
+	tx, err := js.S.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return "", normalizeReviewBusy(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if err := tx.QueryRowContext(ctx, `SELECT job_id FROM human_actions WHERE id = ?`, actionID).Scan(&jobID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", fmt.Errorf("%w: human action %d does not exist", ErrConflict, actionID)
+		}
+		return "", normalizeReviewBusy(err)
+	}
+	now := store.Now()
+	res, err := tx.ExecContext(ctx,
+		`UPDATE human_actions SET status = 'cancelled', resolved_at = ? WHERE id = ? AND status = 'open' AND revision = ?`,
+		now, actionID, expectedRevision)
+	if err != nil {
+		return "", normalizeReviewBusy(err)
+	}
+	if changed, err := res.RowsAffected(); err != nil {
+		return "", err
+	} else if changed != 1 {
+		return "", fmt.Errorf("%w: human action %d is not open at revision %d", ErrConflict, actionID, expectedRevision)
+	}
+	resolutionDetail, err := json.Marshal(map[string]any{"action_id": actionID, "verdict": "dismiss"})
+	if err != nil {
+		return "", err
+	}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO events (job_id, at, kind, detail_json) VALUES (?, ?, 'human_action.resolve', ?)`,
+		jobID, now, string(resolutionDetail)); err != nil {
+		return "", normalizeReviewBusy(err)
+	}
+	if err := tx.Commit(); err != nil {
+		return "", normalizeReviewBusy(err)
+	}
+	return jobID, js.Cancel(ctx, jobID, "user_dismissed")
+}
+
 // HumanAction is one pending or resolved human step.
 type HumanAction struct {
 	ID               int64  `json:"id"`

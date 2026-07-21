@@ -602,48 +602,131 @@ func watchFacts(work Work) []Fact {
 	return facts
 }
 
+// humanActionItems loads open human actions with their work identity so the
+// inbox shows a paper's title/authors/DOI instead of only the daemon's
+// internal job id — matching watch_hit's Work/watchFacts treatment. Any kind
+// is dismissible (Store.Cancel is idempotent on an already-terminal job);
+// only verify_identity additionally offers accept (gated on a valid
+// quarantine binding) and reject (never gated — reject needs no SHA match).
 func humanActionItems(ctx context.Context, tx *sql.Tx) ([]Item, error) {
 	rows, err := tx.QueryContext(ctx, `
 		SELECT a.id, a.job_id, a.kind, j.state, COALESCE(a.detail, ''),
-			a.revision, a.quarantine_sha256
+			a.revision, a.quarantine_sha256, j.work_request_id,
+			COALESCE(w.title, ''), COALESCE(w.authors_json, '[]'), COALESCE(w.year, 0)
 		FROM human_actions a
 		JOIN jobs j ON j.id = a.job_id
+		JOIN work_requests w ON w.id = j.work_request_id
 		WHERE a.status = 'open'
 		ORDER BY a.id ASC`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	items := make([]Item, 0)
+	type row struct {
+		action             HumanAction
+		detail             string
+		workRequestID      string
+		title, authorsJSON string
+		year               int
+	}
+	loaded := make([]row, 0)
+	workRequestIDs := make([]string, 0)
 	for rows.Next() {
-		var action HumanAction
-		var detail string
-		if err := rows.Scan(&action.ActionID, &action.JobID, &action.ActionKind, &action.JobState, &detail,
-			&action.Revision, &action.SHA256); err != nil {
+		var r row
+		if err := rows.Scan(&r.action.ActionID, &r.action.JobID, &r.action.ActionKind, &r.action.JobState, &r.detail,
+			&r.action.Revision, &r.action.SHA256, &r.workRequestID, &r.title, &r.authorsJSON, &r.year); err != nil {
 			return nil, err
 		}
-		if action.ActionID <= 0 || action.JobID == "" || action.ActionKind == "" || action.Revision <= 0 {
+		if r.action.ActionID <= 0 || r.action.JobID == "" || r.action.ActionKind == "" || r.action.Revision <= 0 {
 			return nil, errors.New("invalid open human action")
 		}
-		title := bounded(strings.ReplaceAll(action.ActionKind, "_", " "), 500)
-		facts := make([]Fact, 0, 2)
-		if detail = bounded(detail, 400); detail != "" {
-			facts = append(facts, Fact{Label: "Detail", Text: detail})
-		}
-		facts = append(facts, Fact{Label: "Job", Text: bounded(action.JobID, 400)})
-		ops := []string{"open"}
-		if action.ActionKind == "verify_identity" && action.JobState == job.StateNeedsReview && validSHA256(action.SHA256) {
-			ops = []string{"accept", "reject", "open"}
-		}
-		items = append(items, Item{
-			Kind: KindHumanAction, ID: fmt.Sprintf("action:%d", action.ActionID), Title: title,
-			Facts: facts, Links: []Link{}, Ops: ops, HumanAction: &action,
-		})
+		loaded = append(loaded, r)
+		workRequestIDs = append(workRequestIDs, r.workRequestID)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
+	identifiers, err := identifiersByWorkRequest(ctx, tx, workRequestIDs)
+	if err != nil {
+		return nil, err
+	}
+	items := make([]Item, 0, len(loaded))
+	for _, r := range loaded {
+		var authors []string
+		_ = json.Unmarshal([]byte(r.authorsJSON), &authors)
+		ids := identifiers[r.workRequestID]
+		work := Work{DOI: ids["doi"], Title: bounded(r.title, 500), Authors: bounded(strings.Join(authors, ", "), 200), Year: r.year}
+
+		title := work.Title
+		if title == "" {
+			title = bounded(strings.ReplaceAll(r.action.ActionKind, "_", " "), 500)
+		}
+		facts := make([]Fact, 0, 5)
+		facts = append(facts, Fact{Label: "Action", Text: bounded(strings.ReplaceAll(r.action.ActionKind, "_", " "), 60)})
+		facts = append(facts, watchFacts(work)...)
+		if r.detail = bounded(r.detail, 400); r.detail != "" {
+			facts = append(facts, Fact{Label: "Detail", Text: r.detail})
+		}
+		facts = append(facts, Fact{Label: "Job", Text: bounded(r.action.JobID, 400)})
+
+		links := canonicalLinks(ids["doi"], ids["arxiv"], ids["openalex"])
+		ops := []string{"dismiss"}
+		if len(links) > 0 {
+			ops = append(ops, "open")
+		}
+		if r.action.ActionKind == "verify_identity" && r.action.JobState == job.StateNeedsReview {
+			ops = []string{"reject"}
+			if validSHA256(r.action.SHA256) {
+				ops = []string{"accept", "reject"}
+			}
+			if len(links) > 0 {
+				ops = append(ops, "open")
+			}
+		}
+		items = append(items, Item{
+			Kind: KindHumanAction, ID: fmt.Sprintf("action:%d", r.action.ActionID), Title: title,
+			Facts: facts, Links: links, Ops: ops, HumanAction: &r.action,
+		})
+	}
 	return items, nil
+}
+
+// identifiersByWorkRequest batch-loads every identifier for the given work
+// requests in one query, avoiding an N+1 lookup per open human action.
+func identifiersByWorkRequest(ctx context.Context, tx *sql.Tx, workRequestIDs []string) (map[string]map[string]string, error) {
+	out := make(map[string]map[string]string, len(workRequestIDs))
+	if len(workRequestIDs) == 0 {
+		return out, nil
+	}
+	seen := make(map[string]bool, len(workRequestIDs))
+	placeholders := make([]string, 0, len(workRequestIDs))
+	args := make([]any, 0, len(workRequestIDs))
+	for _, id := range workRequestIDs {
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		placeholders = append(placeholders, "?")
+		args = append(args, id)
+	}
+	rows, err := tx.QueryContext(ctx,
+		`SELECT work_request_id, kind, value FROM identifiers WHERE work_request_id IN (`+strings.Join(placeholders, ",")+`)`,
+		args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var workRequestID, kind, value string
+		if err := rows.Scan(&workRequestID, &kind, &value); err != nil {
+			return nil, err
+		}
+		if out[workRequestID] == nil {
+			out[workRequestID] = make(map[string]string, 3)
+		}
+		out[workRequestID][kind] = value
+	}
+	return out, rows.Err()
 }
 
 func normalizeRetractionItem(item *Item) error {

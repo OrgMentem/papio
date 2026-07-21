@@ -714,6 +714,76 @@ func TestResolveHumanActionRequiresOpenAction(t *testing.T) {
 	}
 }
 
+func TestDismissHumanActionClosesActionAndCancelsJob(t *testing.T) {
+	js := testStore(t)
+	ctx := context.Background()
+	id, _, actionID := parkIdentityReview(t, js, "wr_dismiss")
+	jobID, err := js.DismissHumanAction(ctx, actionID, 1)
+	if err != nil || jobID != id {
+		t.Fatalf("DismissHumanAction() = %q, %v; want %q, nil", jobID, err, id)
+	}
+	row, err := js.Get(ctx, id)
+	if err != nil || row.State != StateCancelled || row.TerminalReason != "user_dismissed" {
+		t.Fatalf("dismissed job = %+v, %v", row, err)
+	}
+	actions, err := js.ListHumanActions(ctx, false)
+	if err != nil || len(actions) != 1 || actions[0].Status != "cancelled" {
+		t.Fatalf("actions = %+v, %v", actions, err)
+	}
+	if _, err := js.DismissHumanAction(ctx, actionID, 1); !errors.Is(err, ErrConflict) {
+		t.Fatalf("replayed dismiss error = %v, want ErrConflict", err)
+	}
+}
+
+func TestDismissHumanActionWrongRevisionConflicts(t *testing.T) {
+	js := testStore(t)
+	ctx := context.Background()
+	id, _, actionID := parkIdentityReview(t, js, "wr_dismiss_conflict")
+	if _, err := js.DismissHumanAction(ctx, actionID, 2); !errors.Is(err, ErrConflict) {
+		t.Fatalf("wrong-revision dismiss error = %v, want ErrConflict", err)
+	}
+	row, _ := js.Get(ctx, id)
+	if row.State != StateNeedsReview {
+		t.Fatalf("conflicted dismiss changed job state to %s", row.State)
+	}
+}
+
+func TestDismissHumanActionMissingActionConflicts(t *testing.T) {
+	js := testStore(t)
+	if _, err := js.DismissHumanAction(context.Background(), 999999, 1); !errors.Is(err, ErrConflict) {
+		t.Fatalf("missing action dismiss error = %v, want ErrConflict", err)
+	}
+}
+
+// Regression: this is the exact production bug — a verify_identity action
+// created before quarantine bindings were mandatory has an empty
+// quarantine_path/quarantine_sha256, so it can never preview or be accepted,
+// and before dismiss existed had no way to leave the inbox at all. Dismiss
+// must close it without touching the (empty) binding fields.
+func TestDismissHumanActionWorksWithoutQuarantineBinding(t *testing.T) {
+	js := testStore(t)
+	ctx := context.Background()
+	id, err := js.CreateRequest(ctx, "wr_dismiss_unbound", testWork(), "", "", testPolicy(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := js.S.DB().ExecContext(ctx, `UPDATE jobs SET state = 'needs_review' WHERE id = ?`, id); err != nil {
+		t.Fatal(err)
+	}
+	actionID, err := js.OpenHumanAction(ctx, id, "verify_identity", "legacy row with no binding")
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobID, err := js.DismissHumanAction(ctx, actionID, 1)
+	if err != nil || jobID != id {
+		t.Fatalf("DismissHumanAction() on unbound action = %q, %v; want %q, nil", jobID, err, id)
+	}
+	row, err := js.Get(ctx, id)
+	if err != nil || row.State != StateCancelled {
+		t.Fatalf("dismissed unbound job = %+v, %v", row, err)
+	}
+}
+
 func TestResolveReviewRejectCancelsJobAndResolvesAction(t *testing.T) {
 	js := testStore(t)
 	ctx := context.Background()

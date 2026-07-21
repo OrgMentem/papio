@@ -4,11 +4,12 @@ import type { TriageCounts, TriageSnapshotItem, TriageSnapshotResponsePayload } 
 
 type Snapshot = Omit<TriageSnapshotResponsePayload, "request_id">;
 type TriageOperation = TriageSnapshotItem["ops"][number];
-type Verdict = "accept" | "reject";
+type Verdict = "accept" | "reject" | "dismiss";
 
 interface PageElements {
   connection: HTMLElement;
   counts: HTMLElement;
+  filterInput: HTMLInputElement;
   refresh: HTMLButtonElement;
   reconnect: HTMLButtonElement;
   list: HTMLElement;
@@ -40,6 +41,7 @@ interface PageState {
   confirmation: Confirmation | null;
   focusSelectionAfterRender: boolean;
   loading: boolean;
+  filterQuery: string;
 }
 
 const state: PageState = {
@@ -55,6 +57,7 @@ const state: PageState = {
   confirmation: null,
   focusSelectionAfterRender: false,
   loading: false,
+  filterQuery: "",
 };
 
 let elements: PageElements | null = null;
@@ -139,6 +142,12 @@ function itemForID(id: string): TriageSnapshotItem | null {
   return state.snapshot?.items.find((item) => item.id === id) ?? null;
 }
 
+function matchesFilter(item: TriageSnapshotItem, query: string): boolean {
+  if (query === "") return true;
+  const haystack = [item.title, ...item.facts.map((fact) => fact.text)].join(" \u0000 ").toLowerCase();
+  return haystack.includes(query);
+}
+
 function orderedItems(): TriageSnapshotItem[] {
   if (state.snapshot === null) return [];
   const classRank: Record<TriageSnapshotItem["kind"], number> = {
@@ -146,7 +155,10 @@ function orderedItems(): TriageSnapshotItem[] {
     human_action: 1,
     watch_hit: 2,
   };
-  return [...state.snapshot.items].sort((left, right) => classRank[left.kind] - classRank[right.kind] || left.rank - right.rank);
+  const query = state.filterQuery.trim().toLowerCase();
+  return [...state.snapshot.items]
+    .filter((item) => matchesFilter(item, query))
+    .sort((left, right) => classRank[left.kind] - classRank[right.kind] || left.rank - right.rank);
 }
 
 function safeExternalURL(value: string): string | null {
@@ -327,7 +339,13 @@ function renderItem(item: TriageSnapshotItem): HTMLElement {
     const facts = element("dl");
     facts.className = "item-facts";
     for (const fact of item.facts) {
-      facts.append(element("dt", fact.label), element("dd", fact.text));
+      const dt = element("dt", fact.label);
+      const dd = element("dd", fact.text);
+      if (fact.label === "Action") {
+        dt.dataset.fact = "action";
+        dd.dataset.fact = "action";
+      }
+      facts.append(dt, dd);
     }
     card.append(facts);
   }
@@ -390,10 +408,12 @@ function renderDialog(): void {
     elements.dialogMessage.textContent = `Accept this PDF as ${item.title}? It leaves quarantine.`;
   } else if (confirmation.verdict === "reject") {
     elements.dialogMessage.textContent = `Reject ${item.title}? It cancels the job.`;
+  } else if (confirmation.verdict === "dismiss") {
+    elements.dialogMessage.textContent = `Dismiss ${item.title}? It cancels the job and closes this action.`;
   } else {
     elements.dialogMessage.textContent = `Accept ${item.title}?`;
   }
-  elements.dialogConfirm.textContent = confirmation.verdict === "accept" ? "Accept" : "Reject";
+  elements.dialogConfirm.textContent = confirmation.verdict === "accept" ? "Accept" : confirmation.verdict === "reject" ? "Reject" : "Dismiss";
   elements.dialogConfirm.disabled = state.pending.has(item.id);
   elements.dialogCancel.disabled = state.pending.has(item.id);
   elements.dialog.hidden = false;
@@ -428,8 +448,10 @@ function render(): void {
 
   if (state.snapshot === null) {
     elements.list.append(element("p", "No snapshot is available yet. Reconnect to retrieve the inbox."));
-  } else if (items.length === 0) {
+  } else if (state.snapshot.items.length === 0) {
     elements.list.append(element("p", "Your inbox is clear."));
+  } else if (items.length === 0) {
+    elements.list.append(element("p", `No items match "${state.filterQuery.trim()}".`));
   }
   if (state.snapshot?.unsupported_items_count && state.snapshot.unsupported_items_count > 0) {
     elements.list.append(element("p", `${state.snapshot.unsupported_items_count} newer item(s) need a newer extension.`));
@@ -571,6 +593,9 @@ async function finishMutation(item: TriageSnapshotItem, response: unknown): Prom
   }
 }
 
+// decide drives the watch_hit-only triage-decide RPC (acquire/dismiss a
+// watch digest entry). human_action dismiss goes through requestConfirmation
+// + papio.action.resolve instead — it cancels a job, not a watch entry.
 async function decide(item: TriageSnapshotItem, operation: "acquire" | "dismiss"): Promise<void> {
   if (!beginMutation(item)) return;
   try {
@@ -715,8 +740,11 @@ async function requestPreview(item: TriageSnapshotItem): Promise<void> {
 function activateOperation(item: TriageSnapshotItem, operation: TriageOperation): void {
   switch (operation) {
     case "acquire":
-    case "dismiss":
       void decide(item, operation);
+      return;
+    case "dismiss":
+      if (item.kind === "human_action") requestConfirmation(item, "dismiss");
+      else void decide(item, operation);
       return;
     case "accept":
     case "reject":
@@ -782,12 +810,15 @@ function handleKeyboard(event: KeyboardEvent): void {
         activatePrimary(items[current]!);
       }
       return;
-    case "d":
-      if (current >= 0 && hasOperation(items[current]!, "dismiss")) {
+    case "d": {
+      const current_ = items[current];
+      if (current >= 0 && current_ !== undefined && hasOperation(current_, "dismiss")) {
         event.preventDefault();
-        void decide(items[current]!, "dismiss");
+        if (current_.kind === "human_action") requestConfirmation(current_, "dismiss");
+        else void decide(current_, "dismiss");
       }
       return;
+    }
     case "o":
       if (current >= 0) {
         event.preventDefault();
@@ -830,6 +861,7 @@ function trapDialogFocus(event: KeyboardEvent): void {
 function bootstrap(): void {
   const connection = document.getElementById("connection-status");
   const counts = document.getElementById("inbox-counts");
+  const filterInput = document.getElementById("item-filter");
   const refresh = document.getElementById("refresh-inbox");
   const reconnect = document.getElementById("reconnect-daemon");
   const list = document.getElementById("item-list");
@@ -843,6 +875,7 @@ function bootstrap(): void {
   if (
     !(connection instanceof HTMLElement) ||
     !(counts instanceof HTMLElement) ||
+    !(filterInput instanceof HTMLInputElement) ||
     !(refresh instanceof HTMLButtonElement) ||
     !(reconnect instanceof HTMLButtonElement) ||
     !(list instanceof HTMLElement) ||
@@ -859,6 +892,7 @@ function bootstrap(): void {
   elements = {
     connection,
     counts,
+    filterInput,
     refresh,
     reconnect,
     list,
@@ -872,6 +906,10 @@ function bootstrap(): void {
   };
   refresh.addEventListener("click", requestRefresh);
   reconnect.addEventListener("click", requestRefresh);
+  filterInput.addEventListener("input", () => {
+    state.filterQuery = filterInput.value;
+    render();
+  });
   loadMore.addEventListener("click", () => {
     void refreshInbox(true);
   });

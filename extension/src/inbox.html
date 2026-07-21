@@ -133,8 +133,7 @@
       }
 
       .brand,
-      #connection-status,
-      #shortcut-help {
+      #connection-status {
         grid-column: 1 / -1;
       }
 
@@ -240,9 +239,22 @@
         gap: var(--space-2);
       }
 
-      #shortcut-help {
+      #item-filter {
+        appearance: none;
+        background: var(--color-surface);
+        border: 1px solid var(--color-control-border);
+        border-radius: var(--radius-control);
+        color: var(--color-ink);
+        flex: 1 1 12rem;
+        font: inherit;
+        font-size: var(--font-size-small);
+        min-height: var(--control-height);
+        min-width: 0;
+        padding: var(--space-1) var(--space-3);
+      }
+
+      #item-filter::placeholder {
         color: var(--color-muted);
-        font-size: var(--font-size-label);
       }
 
       #shortcut-help strong {
@@ -274,7 +286,8 @@
       }
 
       button:focus-visible,
-      a:focus-visible {
+      a:focus-visible,
+      #item-filter:focus-visible {
         outline: 2px solid var(--color-primary);
         outline-offset: 2px;
       }
@@ -463,7 +476,12 @@
         font-size: var(--font-size-label);
       }
 
-      .triage-group-human_action .item-facts:has(> dt:nth-of-type(2):last-of-type) dt {
+      /* The action kind is a category tag, not a labeled fact: its DT is
+         visually hidden (kept for screen readers) and its DD renders as a
+         small eyebrow pill that always sits on its own line directly under
+         the title, regardless of where the daemon places it in the fact
+         list. */
+      .triage-group-human_action dt[data-fact="action"] {
         clip-path: inset(50%);
         height: 1px;
         overflow: hidden;
@@ -472,14 +490,19 @@
         width: 1px;
       }
 
-      .triage-group-human_action
-        .item-facts:has(> dt:nth-of-type(2):last-of-type)
-        dd
-        + dt
-        + dd::before {
+      .triage-group-human_action dd[data-fact="action"] {
+        background: var(--color-surface-hover);
+        border-radius: 999px;
         color: var(--color-muted);
-        content: "·";
-        margin-right: var(--space-1);
+        flex: 1 0 100%;
+        font-family: inherit;
+        font-size: var(--font-size-label);
+        font-weight: 700;
+        letter-spacing: 0.04em;
+        order: -1;
+        padding: 0.1em var(--space-2);
+        text-transform: uppercase;
+        width: fit-content;
       }
 
       .item-links {
@@ -540,18 +563,25 @@
       }
 
       footer {
+        align-items: baseline;
         border-top: 1px solid var(--color-border);
         color: var(--color-muted);
-        display: grid;
+        display: flex;
+        flex-wrap: wrap;
         font-size: var(--font-size-label);
-        gap: var(--space-2);
-        justify-items: end;
+        gap: var(--space-2) var(--space-4);
+        justify-content: space-between;
         padding-top: var(--space-3);
-        text-align: right;
+      }
+
+      #shortcut-help {
+        flex: 1 1 auto;
+        min-width: 0;
       }
 
       #generated-at {
         overflow-wrap: anywhere;
+        text-align: right;
       }
 
       #confirm-dialog {
@@ -638,15 +668,20 @@
       <p id="connection-status" role="status" aria-live="polite">Connecting to daemon…</p>
       <p id="inbox-counts">Counts unavailable</p>
       <div class="toolbar" aria-label="Inbox controls">
+        <input id="item-filter" type="search" placeholder="Filter by title, DOI, or detail…" aria-label="Filter inbox items" />
         <button id="refresh-inbox" type="button">Refresh</button>
         <button id="reconnect-daemon" type="button" hidden>Reconnect</button>
       </div>
-      <p id="shortcut-help"><strong>Shortcuts:</strong> j/k move, a primary action, d dismiss, o open first link. Shortcuts pause while typing or confirming.</p>
     </header>
     <main id="item-list" aria-label="Triage items"></main>
     <p id="operation-status" role="status" aria-live="polite"></p>
     <button id="load-more" type="button" hidden>Load more</button>
     <footer>
+      <p id="shortcut-help">
+        <strong>Keyboard:</strong> j/k select · a acts on the selected item (accept, acquire, or
+        open — whichever applies) · d dismisses or rejects · o opens its link. Paused while typing
+        or a dialog is open.
+      </p>
       <time id="generated-at">generated at —</time>
     </footer>
     <div id="confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="confirm-dialog-title" aria-describedby="confirm-dialog-message" hidden>
