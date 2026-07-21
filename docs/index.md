@@ -38,7 +38,7 @@ papio status --follow                                        # working / awaitin
 papio actions list                                           # open browser handoffs and identity reviews
 ```
 
-Run [`papio doctor`](guide/troubleshooting.md#version-mismatches-and-updates) any time to see readiness across papio, the browser extension, its connector, and zotio.
+Run [`papio doctor`](guide/troubleshooting.md#version-mismatches-and-updates) any time to see readiness across *papio*, the browser extension, its connector, and zotio.
 
 New here? Start with the [user guide](guide/user-guide.md), then tune policy in the [configuration reference](reference/config-reference.md).
 
@@ -50,8 +50,8 @@ New here? Start with the [user guide](guide/user-guide.md), then tune policy in 
 - **[User guide](guide/user-guide.md)** — the research workflow: discover, acquire in batches, follow jobs, complete a browser pass, and resolve identity reviews.
 - **[Use in a coding agent](guide/agent-skill.md)** — drive *papio* over MCP (`papio mcp`): the canonical acquisition loop and its safety semantics.
 - **[Access modes & safety](concepts/access-modes.md)** — `conservative` / `assisted` / `maximal` and the non-negotiable product and safety boundaries.
-- **[Acquisition pipeline](concepts/acquisition-pipeline.md)** — the order papio tries sources, how candidates are ranked, job states, and download limits.
-- **[Browser handoff](concepts/browser-handoff.md)** — the ordinary-browser extension, its local connector, the minimized work window, and why papio never uses an automated browser.
+- **[Acquisition pipeline](concepts/acquisition-pipeline.md)** — the order *papio* tries sources, how candidates are ranked, job states, and download limits.
+- **[Browser handoff](concepts/browser-handoff.md)** — the ordinary-browser extension, its local connector, the minimized work window, and why *papio* never uses an automated browser.
 - **[Validation & provenance](concepts/validation-and-provenance.md)** — PDF structure, identity, OCR gates, and the permanent acquisition bundle.
 - **[Command reference](reference/commands.md)** — every `papio` command and its flags.
 - **[MCP tools](reference/mcp-tools.md)** — the `papio_command_search` and `papio_command_run` command facade, the `papio_acquire_batch` and `papio_batch_wait` composite tools, and read resources, with parameters and boundaries.

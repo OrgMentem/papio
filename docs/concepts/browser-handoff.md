@@ -86,7 +86,7 @@ per-provider grants.
 
 ## One browser holds the session
 
-With papio installed in more than one browser — say the store extension in
+With *papio* installed in more than one browser — say the store extension in
 your daily browser and a development build in a second profile — exactly one
 browser holds the offer/handoff flow at a time. The first to connect wins;
 others wait, visibly, instead of silently taking over:

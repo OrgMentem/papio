@@ -75,7 +75,7 @@ Do not cancel a job merely because its old popup row is stale.
 ## Version mismatches and updates
 
 Run `papio doctor` first when an update or browser integration seems wrong. It
-checks papio first, then the pieces it depends on:
+checks *papio* first, then the pieces it depends on:
 
 ```text
 PASS  access_mode              explicit access mode configured
@@ -160,7 +160,7 @@ resolver link. The extension recognizes the common OpenAthens/Shibboleth
 failure pages, records a `browser.handoff_failed` event on the job (visible in
 `papio jobs get <id>`), and retries the handoff tab once on its own.
 
-## Two browsers fight over papio
+## Two browsers fight over *papio*
 
 With the extension enabled in more than one browser or profile, only one
 browser holds the offer/handoff flow; the others wait as pending and their
@@ -175,7 +175,7 @@ papio browser use <session-id>  # or pick one explicitly
 
 Quitting the holding browser releases the session immediately; a crashed
 holder yields within about ten seconds. If you never want a browser to hold
-the session, disable the papio extension there. Page acquisition and the inbox
+the session, disable the *papio* extension there. Page acquisition and the inbox
 keep working from every connected browser either way.
 
 ## Read `doctor` output
@@ -238,7 +238,7 @@ Use the report reason to choose the next step:
 
 - `institutional`: the ordinary Chrome OpenURL handoff needs the user's
   institution session.
-- `oa_browser`: an open-access URL needs the browser after papio's own download
+- `oa_browser`: an open-access URL needs the browser after *papio*'s own download
   did not complete it.
 - `terms`: the user must read and decide on publisher terms; *papio* does not
   accept them.

@@ -85,7 +85,7 @@ crossed.
   and never does subscription crawling.
 - **Repeatable jobs.** Every request becomes a job with a
   stable ID — running it again is safe and won't duplicate, batches are capped,
-  and budgets and allowed/blocked sources are enforced by papio, not by hope.
+  and budgets and allowed/blocked sources are enforced by *papio*, not by hope.
 - **Validated before trusted.** Every candidate PDF is quarantined and gated on
   structure, identity, and an OCR fallback. Ambiguous identity parks in
   `needs_review` for a human verdict instead of silently importing the wrong

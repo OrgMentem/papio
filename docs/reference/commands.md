@@ -37,7 +37,7 @@ papio acquire [identifier] [flags]
 | `--isbn` | `string` |  | ISBN |
 | `--keys` | `stringArray` | `[]` | digest work key to queue (repeatable) |
 | `--label` | `string` |  | query context; also the default target collection when --collection is unset |
-| `--limit` | `int` | `25` | maximum Zotio items to queue |
+| `--limit` | `int` | `25` | maximum zotio items to queue |
 | `--max-cost` | `float64` | `0` | maximum paid-source cost in USD |
 | `--openalex` | `string` |  | OpenAlex work ID |
 | `--pmid` | `string` |  | PubMed ID |

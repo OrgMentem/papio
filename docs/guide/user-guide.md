@@ -154,9 +154,9 @@ The toolbar badge shows `!` when attention is needed, and the options-page
 footer shows the extension and background-service versions together.
 
 For institutional handoffs, *papio* uses your library's OpenURL resolver first.
-If it links straight to the provider, papio follows it. When Alma/Primo shows an
+If it links straight to the provider, *papio* follows it. When Alma/Primo shows an
 online-services menu instead, the extension follows your library's top full-text
-link in papio's own tab; you do not need to click **Available Online** or **View
+link in *papio*'s own tab; you do not need to click **Available Online** or **View
 full text**. It never chooses physical-item, scan, interlibrary-loan, or
 terms-acceptance options — those stay your decisions. If your library's resolver
 is on a domain the extension isn't preapproved for, that step stays assisted.
@@ -246,7 +246,7 @@ for `papio jobs get`.
 
 ## 8. Resolve identity reviews deliberately
 
-A PDF can be well-formed yet still land in `needs_review` when papio isn't sure
+A PDF can be well-formed yet still land in `needs_review` when *papio* isn't sure
 it's the paper you asked for. `papio actions list` shows the open
 `verify_identity` action and the path to the quarantined file. Open that file and
 check it before deciding:

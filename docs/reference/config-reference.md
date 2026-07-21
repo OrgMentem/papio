@@ -1,13 +1,13 @@
 # Configuration reference
 
-Papio loads TOML from `~/.config/papio/config.toml` (on Windows,
+*papio* loads TOML from `~/.config/papio/config.toml` (on Windows,
 `%APPDATA%\papio\config.toml`) unless the global
 `--config <path>` option selects another file. Configuration is layered over the
 built-in defaults; unknown TOML fields are rejected. `papio init` writes a
 validated user-only config file and `papio doctor` reports readiness.
 
 The tables below list every decoded key in `internal/config`. Paths beginning
-with `~/` are expanded when Papio loads them.
+with `~/` are expanded when *papio* loads them.
 
 ## Top-level keys
 
@@ -41,9 +41,9 @@ with `~/` are expanded when Papio loads them.
 | `extension_id` | string | empty | The Chrome extension ID allowed to use the native host. It must be 32 characters from `a` through `p`; an empty value disables the bridge. |
 | `extension_ids` | list of strings | empty | Additional Chrome-family extension IDs allowed to reach the native host alongside `extension_id` — e.g. an Edge Add-ons store copy or a second keyed build, which carry different IDs than the Chrome Web Store package. Each is 32 chars `a`–`p`. The manifest's `allowed_origins` lists `extension_id` plus every entry here. |
 | `firefox_extension_id` | string | empty | The Firefox (Gecko) add-on ID allowed to use the native host — `papio@orgmentem.com` for the built extension. Accepts an email-style ID or a braced GUID; an empty value disables the Firefox bridge. |
-| `openurl_base_url` | string URL | empty | Legacy/default institutional OpenURL resolver base. It must use `https://`; an empty value prevents default-profile institutional routing. Existing query parameters are preserved when Papio adds citation metadata. Prefer the institution's direct-link-enabled endpoint so a single electronic service bypasses the resolver menu. |
+| `openurl_base_url` | string URL | empty | Legacy/default institutional OpenURL resolver base. It must use `https://`; an empty value prevents default-profile institutional routing. Existing query parameters are preserved when *papio* adds citation metadata. Prefer the institution's direct-link-enabled endpoint so a single electronic service bypasses the resolver menu. |
 | `shibboleth_entity_id` | string URL | empty | Default institution's Shibboleth IdP entityID (`https://`). When set, a provider login wall is auto-routed to this IdP (skipping the WAYF selector). Empty disables federated login-routing for the default profile. |
-| `proquest_account_id` | string digits | empty | Default institution's ProQuest account id (digits, max 64). When set, Papio appends `?accountid=<id>` to unlock the institution's ProQuest link-resolver without a manual sign-in. Empty disables the append. During `papio init` you may paste a ProQuest URL containing `accountid=` instead of the bare id. |
+| `proquest_account_id` | string digits | empty | Default institution's ProQuest account id (digits, max 64). When set, *papio* appends `?accountid=<id>` to unlock the institution's ProQuest link-resolver without a manual sign-in. Empty disables the append. During `papio init` you may paste a ProQuest URL containing `accountid=` instead of the bare id. |
 | `download_adoption_root` | path string | empty | Root for browser-download adoption. When empty, the effective value is `<data_dir>/adoptions`; adoption is confined to a job subdirectory beneath this root. |
 | `action_expiry_seconds` | integer seconds | `1800` | Maximum open time for one browser handoff. It must not be negative. |
 
@@ -92,13 +92,13 @@ custom resolver origin stays in assisted mode.
 
 | Key | Type | Default | Effect and constraints |
 | --- | --- | --- | --- |
-| `executable` | path or command string | `zotio` | zotio executable Papio invokes at the Zotero boundary. Optional: an empty value disables the deep Zotero integration (auto-import, plan/apply, queue); ownership lookup then classifies every work as not-owned. Required only when `auto_import = true`. |
+| `executable` | path or command string | `zotio` | zotio executable *papio* invokes at the Zotero boundary. Optional: an empty value disables the deep Zotero integration (auto-import, plan/apply, queue); ownership lookup then classifies every work as not-owned. Required only when `auto_import = true`. |
 | `timeout_seconds` | integer seconds | `120` | zotio command deadline. It must be between 5 and 600 seconds inclusive. |
 | `attachment_mode` | string | `stored` | zotio attachment mode. Allowed values are `stored` and `linked-file`. |
 | `auto_import` | boolean | `false` | Default acquisition policy for automatic zotio plan-and-apply after a job is ready. An `acquire --auto-import` request can opt in per job. |
 | `auto_enrich` | boolean | `true` | After the first applied auto-import, enables the conservative scoped zotio enrichment of missing DOI and abstract fields for the imported parent. |
 
-Papio invokes zotio but does not read or store Zotero credentials. Manual
+*papio* invokes zotio but does not read or store Zotero credentials. Manual
 mutation remains preview-first: `papio zotio plan` returns immutable plans and
 `papio zotio apply` requires the exact confirmation SHA-256.
 
@@ -153,7 +153,7 @@ Each named section accepts these keys:
 
 ## Watch configuration
 
-There is no `[watch]` section or watch-specific key in Papio's TOML config.
+There is no `[watch]` section or watch-specific key in *papio*'s TOML config.
 Watch query, year filters, OA filter, collection, cadence, and per-run cap are
 stored with each watch created by `papio watch add` or the corresponding MCP
 tool. Use `papio watch list` to inspect them and `papio watch remove <id>` to
@@ -161,7 +161,7 @@ remove one.
 
 ## Validation and file permissions
 
-Papio validates configuration when loading and saving it. It writes the config
+*papio* validates configuration when loading and saving it. It writes the config
 file with mode `0600` and its config directory with mode `0700`; doctor reports
 a configuration permission failure when group or other read bits are present.
 Use `papio doctor` rather than weakening these permissions to diagnose a setup

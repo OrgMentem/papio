@@ -1,6 +1,6 @@
 # Hooks: hand off acquisitions to any library manager
 
-papio's deep integration is [zotio](https://github.com/OrgMentem/zotio) →
+*papio*'s deep integration is [zotio](https://github.com/OrgMentem/zotio) →
 Zotero: ownership deduplication, idempotent plan/apply, import retry,
 enrichment, and collection filing. If you file papers somewhere else —
 [papis](https://github.com/papis/papis), Calibre, a plain folder, your own
@@ -23,7 +23,7 @@ Contract:
 - **Fires once per ready transition.** Import retries and daemon restarts do
   not re-fire it.
 - **Fire-and-forget.** A slow or failing hook never blocks or fails the job.
-  papio does not retry hooks.
+  *papio* does not retry hooks.
 - **Audited.** Each run records a durable `hook.on_ready` job event with
   `status`, `exit_code`, and `duration_ms`. Hook stdout/stderr is **not**
   recorded (it could carry secrets from your environment) — have your
@@ -46,7 +46,7 @@ Contract:
 | `PAPIO_PDF` | absolute path to the validated PDF | yes |
 | `PAPIO_STATE` | `ready` | yes |
 
-**Treat `PAPIO_PDF` as read-only.** It points into papio's immutable
+**Treat `PAPIO_PDF` as read-only.** It points into *papio*'s immutable
 content-addressed artifact store. Copy the file if you need to move or rename
 it — `papis add` and `cp` both copy by default.
 
@@ -83,4 +83,4 @@ on_ready = 'cp "$PAPIO_PDF" "$HOME/Papers/"'
 (auto-import, `papio zotio …` commands) is disabled, ownership lookup treats
 every work as new, and `papio doctor` reports zotio as
 `not configured (optional)`. Hooks are then the only automatic hand-off —
-papio acquires and validates; your hook files.
+*papio* acquires and validates; your hook files.

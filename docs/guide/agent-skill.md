@@ -74,7 +74,7 @@ recomputed digest, truncate it, or reuse one from a different plan. A
 confirmation mismatch is a safe failure; create and inspect a new preview.
 Only `papio_command_run` with `name="zotio apply"` can mutate Zotero.
 
-`auto_import` on acquisition is a policy setting papio applies automatically. It does not make
+`auto_import` on acquisition is a policy setting *papio* applies automatically. It does not make
 acquisition a Zotero-write operation, and an auto-import failure remains
 reportable rather than changing the validated acquisition into a failed PDF.
 

@@ -198,7 +198,7 @@ func newAcquireCommand(opt *options) *cobra.Command {
 	flags.StringSliceVar(&denySources, "deny-source", nil, "deny this source (repeatable)")
 	flags.BoolVar(&wait, "wait", false, "wait for a terminal or human-action state")
 	flags.BoolVar(&fromZotio, "from-zotio", false, "queue zotio items missing an attached PDF")
-	flags.IntVar(&queueLimit, "limit", 25, "maximum Zotio items to queue")
+	flags.IntVar(&queueLimit, "limit", 25, "maximum zotio items to queue")
 	flags.Int64Var(&fromDigest, "from-digest", 0, "queue pending entries from an alert watch")
 	flags.StringArrayVar(&digestKeys, "keys", nil, "digest work key to queue (repeatable)")
 	flags.StringVar(&batchPath, "batch", "", "submit JSONL works from a file or - for standard input")

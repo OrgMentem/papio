@@ -38,7 +38,7 @@ for the full pre-split extension history.
   exactly one tracked job matches the provider host; ambiguous downloads remain
   unowned.
 - Firefox now ignores broad native/manual download correlation because it
-  cannot steer those files into papio's adoption directory; only exact
+  cannot steer those files into *papio*'s adoption directory; only exact
   extension-started downloads are acknowledged, so assisted controls remain
   manual while direct extension-API downloads remain automatic.
 

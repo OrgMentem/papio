@@ -25,7 +25,7 @@ execution records in `notes/acquisition-stack-plan.md`.
   watches keep working, `doctor` reports zotio as "not configured
   (optional)", and `zotio.auto_import = true` still requires the executable.
 - **Browser session arbitration** (`papio browser sessions` / `papio browser
-  use <id>|--latest`, +`browser.sessions`/`browser.claim` RPCs): with papio
+  use <id>|--latest`, +`browser.sessions`/`browser.claim` RPCs): with *papio*
   installed in more than one browser, exactly one session now holds the
   offer/handoff flow. Later hellos wait as pending (`session_busy`) instead of
   silently stealing the session; a holder silent for 10 s yields to a live
@@ -68,12 +68,12 @@ execution records in `notes/acquisition-stack-plan.md`.
 
 ### Fixed
 
-- Scheduled backfills now scan the complete Zotio missing-PDF queue and skip
+- Scheduled backfills now scan the complete zotio missing-PDF queue and skip
   already-live request IDs without consuming the per-run cap, preventing one
   persistent entry from starving later work.
 - Alert-watch digests now retain consumed identities as a durable seen set,
   merge title, arXiv, OpenAlex, and DOI aliases, preserve author names
-  losslessly, recheck Zotio ownership before acquisition, and serialize clear
+  losslessly, recheck zotio ownership before acquisition, and serialize clear
   and acquire operations.
 - Long failure reasons remain separate groups until after display truncation,
   so unrelated failures with a common prefix no longer collapse together.
@@ -200,7 +200,7 @@ regression test where behavior changed):
 - Concurrency: RPC calls on separate IPC connections no longer serialize
   daemon-wide behind one slow call; the browser bridge releases its session
   lock during PDF validation on download adoption; the serial auto-importer
-  releases its lock during retry backoff; concurrent Zotio plan applies of the
+  releases its lock during retry backoff; concurrent zotio plan applies of the
   same plan are now mutually exclusive, and a claim abandoned by a crash or
   cancellation heals after a 15-minute lease instead of wedging the plan.
 - Job lifecycle: context cancellation during auto-import stays retryable
@@ -315,7 +315,7 @@ regression test where behavior changed):
 
 - Documentation: a `Version skew and updates` troubleshooting section (update
   flow, popup states, config-newer-than-binary errors), sister-project
-  cross-references between papio and zotio in both READMEs and docs, and
+  cross-references between *papio* and zotio in both READMEs and docs, and
   regenerated command reference.
 
 - The MCP `papio_status` tool now surfaces the same actionable `category` and
@@ -365,21 +365,21 @@ regression test where behavior changed):
   `name = "https://…"` string (shorthand for `openurl_base_url`), so no config
   migration is required.
 
-- ProQuest account-id unlock: on ProQuest's "Find your institution" wall, papio
+- ProQuest account-id unlock: on ProQuest's "Find your institution" wall, *papio*
   appends `?accountid=<id>` to the current URL, which unlocks Example University's
   institutional access with **no sign-in at all** (verified live 2026-07-18 —
   resolves the wall cold, "Access provided by EXAMPLE UNIVERSITY"). New
   per-institution config `[browser] proquest_account_id` (digits); the daemon
   passes it as the optional job-offer field `proquest_account_id` (default
   profile only); the ProQuest adapter gains `accountIdParam: "accountid"`, and
-  on a `login` verdict papio appends it (latched, once) — preferred over the
+  on a `login` verdict *papio* appends it (latched, once) — preferred over the
   federated route since it needs no credentials. This is the fix for the
   ProQuest openurl-handler blocker (the Shibboleth-DS route authenticated only
   ProQuest's main context, not the link-resolver handler). Config + protocol +
   adapter + bridge are unit-tested; the full download still needs a live pass on
   a ProQuest-*held* title.
 
-- Institution auto-selection ("login routing"): on a provider login wall, papio
+- Institution auto-selection ("login routing"): on a provider login wall, *papio*
   navigates the handoff tab straight to the institution's federated login,
   skipping the provider's institution picker — selection is deterministic config
   (which institution you're at), not a secret, so only credential entry stays
@@ -388,7 +388,7 @@ regression test where behavior changed):
   daemon passes it to the extension as the optional job-offer field
   `login_entity_id` (default resolver profile only, to avoid mis-routing another
   institution's job); and an adapter gains an optional `federatedLogin` template
-  (`{entityID}` placeholder). On a `login` verdict papio navigates once (latched)
+  (`{entityID}` placeholder). On a `login` verdict *papio* navigates once (latched)
   to `<federated-login>?entityID=<configured>`. ProQuest ships the route
   (verified live 2026-07-17: Example University's entityID via ProQuest's Shibboleth DS URL
   routes straight to `idp.example.edu` login, skipping the WAYF picker). Config +
@@ -442,7 +442,7 @@ regression test where behavior changed):
   `about:debugging` (one-shot install, no persistent connection, no indicator,
   `navigator.webdriver` false).
 
-- Brand: a papio logo — an oblique lowercase **p** (coral `#E85D4A`) inside a
+- Brand: a *papio* logo — an oblique lowercase **p** (coral `#E85D4A`) inside a
   broken ink ring (`#2B2D42`); the p's descender becomes a download arrow that
   exits through the ring's bottom gap. Structural sibling of the zotio badge
   with its own palette. Vector sources live in `docs/assets/` (`logo.svg`,
@@ -459,7 +459,7 @@ regression test where behavior changed):
   long clean hold on the finished logo. Pure CSS (no script/SMIL, self-contained
   for GitHub's `<img>` rendering); the resting state is byte-for-byte the prior
   static logo and `prefers-reduced-motion: reduce` shows it with no animation.
-- Background work window: papio now does its browsing in one dedicated
+- Background work window: *papio* now does its browsing in one dedicated
   minimized, unfocused Chrome window instead of the user's tab strip. Every
   broker handoff tab (first, queued, and download-fallback) and the keepalive
   tab route there; provider-spawned viewer tabs inherit it via their opener.
@@ -504,10 +504,10 @@ regression test where behavior changed):
   against the cream mantle for contrast, and the face details (eyes, brows,
   muzzle) stay navy on the coral face in both modes.
 - Config unknown-field errors now explain that the config was likely written
-  for a newer papio and name the offending fields, instead of surfacing a raw
+  for a newer *papio* and name the offending fields, instead of surfacing a raw
   TOML parse error. zotio preflight failures name the installed version, the
   configured executable path, and the action that fixes the mismatch.
-- MCP tool surface now derives from the papio CLI command tree instead of a
+- MCP tool surface now derives from the *papio* CLI command tree instead of a
   parallel set of hand-maintained typed tools, so the CLI is the single source
   of truth and the two can no longer drift. The default surface is a command
   facade — `papio_command_search` to discover commands and `papio_command_run`

@@ -150,7 +150,7 @@ Run the health check after setup, especially after changing configuration:
 papio doctor
 ```
 
-It checks papio itself plus the pieces it depends on: your configuration, the
+It checks *papio* itself plus the pieces it depends on: your configuration, the
 background service and browser extension, the connector, and zotio.
 
 ## 4. Acquire a first paper

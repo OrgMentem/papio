@@ -43,16 +43,16 @@ journal issue; only OA and API sources process batches, and each batch is capped
   optional host permissions; *papio* never requests `<all_urls>`. A user gesture in
   the extension UI grants a permission, and revoking it immediately returns that
   source to assisted behavior.
-- **papio decides, not the browser.** papio's own policy is authoritative; the
+- **papio decides, not the browser.** *papio*'s own policy is authoritative; the
   browser reports what it sees and does, but cannot authorize a disallowed source
-  or step. Saved job state lives in papio's local database, not in the
+  or step. Saved job state lives in *papio*'s local database, not in the
   restartable, disposable extension.
 - **Uncertainty stops automation.** Unknown provider, page, or protocol states
   fail closed to `action_required` or `needs_review`; *papio* does not use a generic
   "click the likely download button" fallback.
 - **The link to the browser carries neither files nor secrets.** The browser downloads
-  into the folder papio set aside for that job, and the connector reports only a short
-  description and a path. papio rejects paths outside that folder. Persisted URLs
+  into the folder *papio* set aside for that job, and the connector reports only a short
+  description and a path. *papio* rejects paths outside that folder. Persisted URLs
   are redacted; signed query values, cookies, API keys, credential fields, and
   page bodies are not logged.
 - **Ready means verified.** Before zotio sees a file, *papio* makes it permanent,
