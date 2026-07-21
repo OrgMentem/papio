@@ -12,6 +12,7 @@ import { interpret } from "../src/adapters/types";
 import {
   Bridge,
   hasDaemonUpdateHint,
+  handleInboxRuntimeMessage,
   needsVisibleWindow,
   type BridgeDeps,
   type DownloadDeltaLike,
@@ -73,11 +74,15 @@ class FakeBackend implements StateBackend {
 class FakeAction {
   readonly texts: string[] = [];
   readonly backgroundColors: string[] = [];
+  readonly titles: string[] = [];
   async setBadgeText(details: { text: string }): Promise<void> {
     this.texts.push(details.text);
   }
   async setBadgeBackgroundColor(details: { color: string }): Promise<void> {
     this.backgroundColors.push(details.color);
+  }
+  async setTitle(details: { title: string }): Promise<void> {
+    this.titles.push(details.title);
   }
 }
 
@@ -92,17 +97,26 @@ class FakeTabs {
   readonly live = new Map<number, TabInfo>();
   nextId = 100;
   failCreate = false;
-  async update(tabID: number, props: { active: boolean }): Promise<TabInfo> {
+  async update(tabID: number, props: { active?: boolean; url?: string }): Promise<TabInfo> {
     if (props.active) this.activated.push(tabID);
-    return this.live.get(tabID) ?? {};
+    const tab = this.live.get(tabID);
+    if (tab && props.url !== undefined) tab.url = props.url;
+    return tab ?? {};
   }
   async create(props: { url: string; active: boolean; windowId?: number }): Promise<TabInfo> {
     this.created.push(props);
     if (this.failCreate) throw new Error("tab creation blocked");
     const id = this.nextId++;
-    const tab: TabInfo = { id, url: props.url };
+    const tab: TabInfo = {
+      id,
+      url: props.url,
+      ...(props.windowId !== undefined ? { windowId: props.windowId } : {}),
+    };
     this.live.set(id, tab);
     return tab;
+  }
+  async query(query: { url: string }): Promise<TabInfo[]> {
+    return [...this.live.values()].filter((tab) => tab.url === query.url);
   }
   async get(tabID: number): Promise<TabInfo> {
     const tab = this.live.get(tabID);
@@ -195,6 +209,14 @@ class FakeDownloads {
   }
 }
 
+class FakeAlarms {
+  readonly onAlarm = new FakeEmitter<[{ name: string }]>();
+  readonly created: string[] = [];
+  create(name: string): void {
+    this.created.push(name);
+  }
+}
+
 interface Harness {
   bridge: Bridge;
   deps: BridgeDeps;
@@ -208,6 +230,7 @@ interface Harness {
   clock: { now: number };
   timers: { fn: () => void | Promise<void>; ms: number }[];
   frames(): BrowserMessage[];
+  alarms: FakeAlarms;
   postedStrings(): string[];
 }
 
@@ -227,6 +250,7 @@ function makeHarness(
   const clock = { now: 1_700_000_000_000 };
   const timers: { fn: () => void | Promise<void>; ms: number }[] = [];
   const action = new FakeAction();
+  const alarms = new FakeAlarms();
   const deps: BridgeDeps = {
     connectNative: () => {
       if (connects++ === 0) return port;
@@ -258,7 +282,7 @@ function makeHarness(
     },
     ...(windows !== undefined ? { windows } : {}),
     action,
-    alarms: { create: () => {}, onAlarm: { addListener: () => {} } },
+    alarms: { create: (name) => alarms.create(name), onAlarm: alarms.onAlarm },
   };
   return {
     bridge: new Bridge(deps),
@@ -272,6 +296,7 @@ function makeHarness(
     ...(windows !== undefined ? { windows } : {}),
     clock,
     timers,
+    alarms,
     frames: () => ports.flatMap((p) => p.posted.map(parseBrowserMessage)),
     postedStrings: () => ports.flatMap((p) => p.posted.map((f) => JSON.stringify(f))),
   };
@@ -336,6 +361,40 @@ function extensionOutdatedError(): unknown {
       message: "extension must be updated",
     },
   };
+}
+
+function triageCounts(pending = 0): Record<string, number> {
+  return {
+    pending_total: pending,
+    watch_hits: pending,
+    actions: 0,
+    retractions: 0,
+    jobs_working: 0,
+    jobs_needs_review: 0,
+    failure_groups_7d: 0,
+  };
+}
+
+function nativeResult(type: string, payload: Record<string, unknown>): unknown {
+  return {
+    protocol: "papio-browser/1",
+    type,
+    msg_id: `result_${crypto.randomUUID().replace(/-/g, "")}`,
+    seq: 9,
+    payload,
+  };
+}
+
+function snapshotResult(requestID: string, pending = 0): unknown {
+  return nativeResult("triage_snapshot_response", {
+    request_id: requestID,
+    schema: 1,
+    generated_at: "2027-01-01T00:00:00Z",
+    counts: triageCounts(pending),
+    items: [],
+    has_more: false,
+    unsupported_items_count: 0,
+  });
 }
 
 test("hello is the first outgoing frame with a valid msg_id and seq 0", async () => {
@@ -1695,4 +1754,197 @@ test("an HTML adapter download is refused, discarded, and reported as download_n
   });
   await h.downloads.onChanged.emit({ id: 8, state: { current: "complete" } });
   expect(h.frames().some((f) => f.type === "download_complete")).toBe(true);
+});
+
+test("inbox runtime messages validate the exact extension sender", async () => {
+  const h = makeHarness();
+  const urls = {
+    runtimeID: "papio-test-id",
+    inboxURL: "chrome-extension://papio-test-id/inbox.html",
+    popupURL: "chrome-extension://papio-test-id/popup.html",
+  };
+  const message = { type: "papio.triage.counts", request: {} };
+
+  for (const sender of [
+    { id: "papio-test-id", url: "chrome-extension://papio-test-id/options.html" },
+    { id: "papio-test-id", url: "https://provider.example/article" },
+    { id: "other-extension", url: urls.inboxURL },
+  ]) {
+    await expect(handleInboxRuntimeMessage(h.bridge, message, sender, urls)).resolves.toEqual({
+      ok: false,
+      error: { code: "unauthorized", message: "This sender cannot access the inbox broker" },
+    });
+  }
+
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ daemon_version: "0.1.0", features: [] }));
+  await expect(handleInboxRuntimeMessage(h.bridge, message, { id: urls.runtimeID, url: urls.inboxURL }, urls)).resolves
+    .toEqual({
+      ok: false,
+      error: {
+        code: "feature_unavailable",
+        message: "This daemon does not support the requested inbox feature",
+      },
+    });
+});
+
+test("open inbox runtime request focuses the singleton or creates it from the popup", async () => {
+  const h = makeHarness(undefined, { windows: true });
+  const urls = {
+    runtimeID: "papio-test-id",
+    inboxURL: "chrome-extension://papio-test-id/inbox.html",
+    popupURL: "chrome-extension://papio-test-id/popup.html",
+  };
+  h.tabs.live.set(88, { id: 88, url: urls.inboxURL, windowId: 600 });
+  h.windows?.live.set(600, { id: 600, state: "minimized" });
+
+  await expect(
+    handleInboxRuntimeMessage(h.bridge, { type: "papio.openInbox" }, { id: urls.runtimeID, url: urls.popupURL }, urls),
+  ).resolves.toEqual({ opened: true });
+  expect(h.tabs.activated).toEqual([88]);
+  expect(h.windows?.updated).toContainEqual({ windowID: 600, props: { focused: true } });
+  expect(h.tabs.created).toEqual([]);
+
+  h.tabs.live.clear();
+  await expect(
+    handleInboxRuntimeMessage(h.bridge, { type: "papio.openInbox" }, { id: urls.runtimeID, url: urls.popupURL }, urls),
+  ).resolves.toEqual({ opened: true });
+  expect(h.tabs.created).toEqual([{ url: urls.inboxURL, active: true }]);
+
+  await expect(
+    handleInboxRuntimeMessage(
+      h.bridge,
+      { type: "papio.openInbox" },
+      { id: urls.runtimeID, url: "chrome-extension://papio-test-id/options.html" },
+      urls,
+    ),
+  ).resolves.toMatchObject({ ok: false, error: { code: "unauthorized" } });
+});
+
+test("triage native replies correlate by request_id even when they arrive out of order", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(
+    helloAck({
+      daemon_version: "0.1.0",
+      features: ["triage_snapshot_v1", "triage_mutations_v1", "review_preview_v1"],
+    }),
+  );
+
+  const first = h.bridge.requestTriageSnapshot({ schema_versions: [1] });
+  const second = h.bridge.requestTriageSnapshot({ schema_versions: [1] });
+  await Promise.resolve();
+  await Promise.resolve();
+  const requests = h.frames().filter((frame) => frame.type === "triage_snapshot_request");
+  const firstID = requests[0]?.payload["request_id"];
+  const secondID = requests[1]?.payload["request_id"];
+  expect(typeof firstID).toBe("string");
+  expect(typeof secondID).toBe("string");
+
+  await h.port.inbound(snapshotResult(secondID as string, 2));
+  await h.port.inbound(snapshotResult(firstID as string, 1));
+  await expect(first).resolves.toMatchObject({ ok: true, snapshot: { counts: { pending_total: 1 } } });
+  await expect(second).resolves.toMatchObject({ ok: true, snapshot: { counts: { pending_total: 2 } } });
+});
+
+test("triage requests time out and late echoes are dropped", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ daemon_version: "0.1.0", features: ["triage_snapshot_v1"] }));
+  const pending = h.bridge.requestTriageCounts();
+  await Promise.resolve();
+  await Promise.resolve();
+  const request = h.frames().find((frame) => frame.type === "triage_counts_request");
+  const requestID = request?.payload["request_id"];
+  const timeout = h.timers.find((timer) => timer.ms === 15_000);
+  expect(typeof requestID).toBe("string");
+  expect(timeout).toBeDefined();
+
+  const originalDebug = console.debug;
+  const debugLines: unknown[][] = [];
+  console.debug = (...args: unknown[]) => {
+    debugLines.push(args);
+  };
+  try {
+    await timeout?.fn();
+    await expect(pending).resolves.toMatchObject({ ok: false, error: { code: "timeout" } });
+    await h.port.inbound(
+      nativeResult("triage_counts_response", { request_id: requestID as string, counts: triageCounts(3) }),
+    );
+  } finally {
+    console.debug = originalDebug;
+  }
+  expect(debugLines.some((line) => line.join(" ").includes("unknown or late triage response"))).toBe(true);
+});
+
+test("a user-visible triage request forces reconnect and waits for a fresh hello", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.emitDisconnect();
+
+  const pending = h.bridge.requestTriageSnapshot({ schema_versions: [1] });
+  await Promise.resolve();
+  expect(h.ports).toHaveLength(2);
+  const reconnected = h.ports[1];
+  expect(reconnected).toBeDefined();
+  await reconnected?.inbound(helloAck({ daemon_version: "0.1.0", features: ["triage_snapshot_v1"] }));
+  await Promise.resolve();
+  const request = h.frames().find((frame) => frame.type === "triage_snapshot_request");
+  const requestID = request?.payload["request_id"];
+  expect(typeof requestID).toBe("string");
+  await reconnected?.inbound(snapshotResult(requestID as string, 1));
+  await expect(pending).resolves.toMatchObject({ ok: true, snapshot: { counts: { pending_total: 1 } } });
+});
+
+test("heartbeat counts obey disconnected, permission, then pending badge precedence", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(
+    helloAck({
+      daemon_version: "0.1.0",
+      features: ["triage_snapshot_v1"],
+      resolver_origins: ["https://resolver.example.edu"],
+    }),
+  );
+  h.deps.permissions.contains = async () => true;
+
+  const refresh = h.alarms.onAlarm.emit({ name: "papio-keepalive" });
+  await Promise.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
+  const request = h.frames().find((frame) => frame.type === "triage_counts_request");
+  const requestID = request?.payload["request_id"];
+  expect(typeof requestID).toBe("string");
+  await h.port.inbound(
+    nativeResult("triage_counts_response", { request_id: requestID as string, counts: triageCounts(4) }),
+  );
+  await refresh;
+  expect(h.action.texts.at(-1)).toBe("4");
+  expect(h.action.titles.at(-1)).toBe("Papio: 4 pending triage items");
+
+  h.deps.permissions.contains = async () => false;
+  await h.bridge.syncConnectionBadge();
+  expect(h.action.texts.at(-1)).toBe("1");
+  expect(h.action.titles.at(-1)).toBe("Papio: 1 provider permission need attention");
+
+  await h.port.emitDisconnect();
+  expect(h.action.texts.at(-1)).toBe("!");
+  expect(h.action.titles.at(-1)).toBe("Papio: daemon disconnected");
+});
+
+test("inbound native handlers finish in receipt order across asynchronous awaits", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+
+  const first = h.port.inbound(jobOffer("job_chain_first"));
+  const second = h.port.inbound(jobOffer("job_chain_second"));
+  await Promise.all([first, second]);
+
+  expect(
+    h
+      .frames()
+      .filter((frame) => frame.type === "job_accept")
+      .map((frame) => frame.job_id),
+  ).toEqual(["job_chain_first", "job_chain_second"]);
 });

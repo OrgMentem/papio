@@ -5,14 +5,53 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>papio — inbox</title>
+    <style>
+      :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+      body { max-width: 72rem; margin: 0 auto; padding: 1.5rem; line-height: 1.45; }
+      header, footer { display: grid; gap: .75rem; }
+      .toolbar, .item-controls { display: flex; flex-wrap: wrap; gap: .5rem; align-items: center; }
+      #connection-status { padding: .75rem; border: 1px solid currentColor; }
+      [data-state="disconnected"] { font-weight: 600; }
+      #shortcut-help { margin: 0; }
+      .triage-group { margin: 2rem 0; }
+      .triage-item { padding: 1rem; margin: .75rem 0; border: 1px solid currentColor; }
+      .triage-item:focus { outline: 3px solid Highlight; outline-offset: 2px; }
+      .item-facts { display: grid; grid-template-columns: max-content 1fr; gap: .25rem .75rem; }
+      .item-facts dt { font-weight: 600; }
+      .item-facts dd { margin: 0; }
+      .item-result { font-weight: 600; }
+      #confirm-dialog[hidden] { display: none; }
+      #confirm-dialog { position: fixed; inset: 0; display: grid; place-items: center; background: rgb(0 0 0 / 45%); }
+      #confirm-dialog > section { max-width: 32rem; padding: 1.5rem; border: 1px solid currentColor; background: Canvas; color: CanvasText; }
+    </style>
   </head>
   <body>
     <header>
       <h1><em>papio</em> inbox</h1>
-      <div id="connection-status" role="status" aria-live="polite"></div>
+      <p id="connection-status" role="status" aria-live="polite">Connecting to daemon…</p>
+      <p id="inbox-counts">Counts unavailable</p>
+      <div class="toolbar" aria-label="Inbox controls">
+        <button id="refresh-inbox" type="button">Refresh</button>
+        <button id="reconnect-daemon" type="button" hidden>Reconnect</button>
+      </div>
+      <p id="shortcut-help"><strong>Shortcuts:</strong> j/k move, a primary action, d dismiss, o open first link. Shortcuts pause while typing or confirming.</p>
     </header>
     <main id="item-list" aria-label="Triage items"></main>
-    <footer></footer>
+    <p id="operation-status" role="status" aria-live="polite"></p>
+    <button id="load-more" type="button" hidden>Load more</button>
+    <footer>
+      <time id="generated-at">generated at —</time>
+    </footer>
+    <div id="confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="confirm-dialog-title" aria-describedby="confirm-dialog-message" hidden>
+      <section>
+        <h2 id="confirm-dialog-title">Confirm change</h2>
+        <p id="confirm-dialog-message"></p>
+        <div class="item-controls">
+          <button id="confirm-cancel" type="button">Cancel</button>
+          <button id="confirm-submit" type="button">Confirm</button>
+        </div>
+      </section>
+    </div>
     <script src="./inbox.js" type="module"></script>
   </body>
 </html>

@@ -76,6 +76,15 @@ const MAX_AUTH_ATTEMPTS = 3;
 // is Chrome's reliable floor for a packed extension; it bounds delivery latency.
 const KEEPALIVE_ALARM = "papio-keepalive";
 const KEEPALIVE_ALARM_MINUTES = 1;
+/** Bound a foreground runtime request without retaining it past the worker's
+ * lifetime. Native frames themselves are bounded by the protocol parser. */
+const TRIAGE_REQUEST_TIMEOUT_MS = 15_000;
+const HELLO_WAIT_TIMEOUT_MS = 5_000;
+const TRIAGE_SNAPSHOT_FEATURE = "triage_snapshot_v1";
+const TRIAGE_MUTATIONS_FEATURE = "triage_mutations_v1";
+const REVIEW_PREVIEW_FEATURE = "review_preview_v1";
+const INBOX_PAGE_PATH = "inbox.html";
+const POPUP_PAGE_PATH = "popup.html";
 
 /** Whether this adapter's SPA must render outside the minimized work window. */
 export function needsVisibleWindow(spec: AdapterSpec | undefined): boolean {
@@ -100,6 +109,7 @@ export interface TabInfo {
   /** Chrome sets this on a tab opened by another tab (e.g. a provider's
    * "download" that opens the PDF in a new viewer tab). Correlates the viewer
    * tab back to the tracked handoff tab that spawned it. */
+  windowId?: number | undefined;
   openerTabId?: number | undefined;
 }
 
@@ -156,6 +166,8 @@ export interface BridgeDeps {
      * navigate the handoff tab to a federated-login route ({url}). */
     update?(tabID: number, props: { active?: boolean; url?: string }): Promise<unknown>;
     onUpdated: Listenable<[number, TabChangeInfo, TabInfo]>;
+    /** Used only for the singleton inbox tab. */
+    query?(query: { url: string }): Promise<TabInfo[]>;
     onRemoved: Listenable<[number, { isWindowClosing: boolean }]>;
   };
   /** chrome.windows seam. When present (and the user setting allows), broker
@@ -226,6 +238,7 @@ export interface BridgeDeps {
   action: {
     setBadgeText(details: { text: string }): Promise<void>;
     setBadgeBackgroundColor(details: { color: string }): Promise<void>;
+    setTitle?(details: { title: string }): Promise<void>;
   };
   /** chrome.alarms seam. An MV3 service worker sleeps after ~30s idle; a
    * periodic alarm is the only thing that wakes it, so pending daemon offers
@@ -237,11 +250,37 @@ export interface BridgeDeps {
 }
 
 interface DownloadTrack {
+
   ids: Set<number>;
   ambiguous: boolean;
   /** True only for a direct-file offer attempted before any broker tab opens. */
   directOffer: boolean;
 }
+
+type NativeRequestKind = "response" | "transport" | "timeout";
+
+interface NativeRequestResult {
+  kind: NativeRequestKind;
+  payload?: Record<string, unknown>;
+  code?: string;
+  message?: string;
+}
+
+interface PendingNativeRequest {
+  expectedType: BrowserMessageType;
+  resolve(result: NativeRequestResult): void;
+}
+
+interface BrokerFailure {
+  ok: false;
+  error: { code: string; message: string };
+}
+
+interface BrokerSuccess<T extends Record<string, unknown>> {
+  ok: true;
+}
+
+type BrokerReply<T extends Record<string, unknown>> = BrokerFailure | (BrokerSuccess<T> & T);
 
 function hostMatches(host: string, providerHosts: string[]): boolean {
   return providerHosts.some((h) => host === h || host.endsWith("." + h));
@@ -569,6 +608,19 @@ export class Bridge {
   /** Serializes work-window creation so concurrent offers cannot race two
    * dedicated windows into existence. Worker-local only. */
   private workTabChain: Promise<unknown> = Promise.resolve();
+  /** Native port messages may await storage, tabs, or downloads. Preserve wire
+   * receipt order across those awaits so state transitions never interleave. */
+  private inboundChain: Promise<void> = Promise.resolve();
+  /** One resolver per correlated native triage request. It is intentionally
+   * worker-memory only; daemon state remains the authority after a restart. */
+  private readonly pendingNativeRequests = new Map<string, PendingNativeRequest>();
+  private portGeneration = 0;
+  private helloAckGeneration = -1;
+  private helloSentGeneration = -1;
+  private readonly helloWaiters = new Set<(acknowledged: boolean) => void>();
+  private requestIDSequence = 0;
+  /** Best-effort display cache only, refreshed from daemon counts or snapshots. */
+  private triagePendingCount: number | undefined;
 
   constructor(private readonly deps: BridgeDeps) {}
   trackedJobCount(): number {
@@ -711,12 +763,15 @@ export class Bridge {
 
   /** Keep the persistent daemon-health state visible without interrupting the
    * user. A badge failure is non-fatal: native bridging must keep recovering. */
+  /** Badge precedence is semantic, not color-only: disconnected, permission
+   * blockers, then the last daemon-reported pending triage count. */
   async syncConnectionBadge(status = this.store.connectionStatus): Promise<void> {
     try {
       if (status !== "connected") {
         await Promise.all([
           this.deps.action.setBadgeText({ text: "!" }),
           this.deps.action.setBadgeBackgroundColor({ color: "#777777" }),
+          this.deps.action.setTitle?.({ title: "Papio: daemon disconnected" }),
         ]);
         return;
       }
@@ -736,10 +791,24 @@ export class Bridge {
         await Promise.all([
           this.deps.action.setBadgeText({ text: String(ungranted) }),
           this.deps.action.setBadgeBackgroundColor({ color: "#1a73e8" }),
+          this.deps.action.setTitle?.({
+            title: `Papio: ${ungranted} provider permission${ungranted === 1 ? "" : "s"} need attention`,
+          }),
         ]);
         return;
       }
-      await this.deps.action.setBadgeText({ text: "" });
+      const pending = this.triagePendingCount;
+      await Promise.all([
+        this.deps.action.setBadgeText({ text: pending !== undefined && pending > 0 ? String(pending) : "" }),
+        this.deps.action.setTitle?.({
+          title:
+            pending === undefined
+              ? "Papio: connected"
+              : pending === 0
+                ? "Papio: no pending triage items"
+                : `Papio: ${pending} pending triage item${pending === 1 ? "" : "s"}`,
+        }),
+      ]);
     } catch {
       // Browser action APIs are advisory; do not make a healthy bridge fail.
     }
@@ -888,6 +957,249 @@ export class Bridge {
     }
   }
 
+  /** Focus an existing inbox tab before creating one. This is browser-local UI
+   * state only; no tab id is retained because a worker can disappear at will. */
+  async openInbox(inboxURL: string): Promise<void> {
+    const existing = (await this.deps.tabs.query?.({ url: inboxURL })) ?? [];
+    const tab = existing.find((candidate) => candidate.id !== undefined);
+    if (tab?.id !== undefined) {
+      await this.deps.tabs.update?.(tab.id, { active: true });
+      if (tab.windowId !== undefined && this.deps.windows !== undefined) {
+        await this.deps.windows.update(tab.windowId, { focused: true });
+      }
+      return;
+    }
+    await this.deps.tabs.create({ url: inboxURL, active: true });
+  }
+
+  private failure(code: string, message: string): BrokerFailure {
+    return { ok: false, error: { code, message } };
+  }
+
+  private nativeFailure(result: NativeRequestResult): BrokerFailure {
+    switch (result.kind) {
+      case "timeout":
+        return this.failure("timeout", "The daemon did not respond in time");
+      case "transport":
+        return this.failure(result.code ?? "connection_lost", result.message ?? "The daemon is unavailable");
+      default:
+        return this.failure(result.code ?? "daemon_error", result.message ?? "The daemon rejected the request");
+    }
+  }
+
+  /** A hello acknowledgement belongs to exactly one native port. */
+  private hasCurrentHello(): boolean {
+    return this.port !== null && this.helloAckGeneration === this.portGeneration;
+  }
+
+  private settleHelloWaiters(acknowledged: boolean): void {
+    for (const waiter of this.helloWaiters) waiter(acknowledged);
+    this.helloWaiters.clear();
+  }
+
+  private waitForCurrentHello(): Promise<boolean> {
+    if (this.hasCurrentHello()) return Promise.resolve(true);
+    return new Promise<boolean>((resolve) => {
+      const waiter = (acknowledged: boolean) => {
+        if (!this.helloWaiters.delete(waiter)) return;
+        resolve(acknowledged);
+      };
+      this.helloWaiters.add(waiter);
+      this.deps.setTimeout(() => waiter(false), HELLO_WAIT_TIMEOUT_MS);
+    });
+  }
+
+  /** Foreground requests must never rely on the next passive reconnect tick. */
+  private async ensureConnected(): Promise<boolean> {
+    await this.ready;
+    if (this.hasCurrentHello()) return true;
+    this.reconnectAttempts = 0;
+    // A freshly opened port already has a current hello in flight; coalesce
+    // foreground callers on that acknowledgement rather than churning ports.
+    if (this.port !== null && this.helloSentGeneration === this.portGeneration) {
+      return this.waitForCurrentHello();
+    }
+    if (this.port === null) {
+      this.closingDeliberately = false;
+      this.connect();
+    } else {
+      this.reconnectForHello();
+    }
+    return this.waitForCurrentHello();
+  }
+
+  private nextRequestID(): string {
+    // UUID text is already a valid msg-id once hyphens are removed. A local
+    // sequence makes a deterministic test seam and a late echo unable to
+    // collide with a later request in this worker lifetime.
+    const random = this.deps.randomUUID().replace(/-/g, "");
+    const suffix = `_${this.requestIDSequence++}`;
+    return random.length + suffix.length <= 64 ? `${random}${suffix}` : random;
+  }
+
+  private failPendingNativeRequests(code: string, message: string): void {
+    for (const pending of this.pendingNativeRequests.values()) {
+      pending.resolve({ kind: "transport", code, message });
+    }
+    this.pendingNativeRequests.clear();
+  }
+
+  private sendCorrelated(
+    type: BrowserMessageType,
+    payload: Record<string, unknown>,
+    expectedType: BrowserMessageType,
+  ): Promise<NativeRequestResult> {
+    const requestID = this.nextRequestID();
+    return new Promise<NativeRequestResult>((resolve) => {
+      const pending: PendingNativeRequest = { expectedType, resolve };
+      this.pendingNativeRequests.set(requestID, pending);
+      this.deps.setTimeout(() => {
+        if (this.pendingNativeRequests.get(requestID) !== pending) return;
+        this.pendingNativeRequests.delete(requestID);
+        resolve({ kind: "timeout" });
+      }, TRIAGE_REQUEST_TIMEOUT_MS);
+      if (!this.send(type, { ...payload, request_id: requestID })) {
+        this.pendingNativeRequests.delete(requestID);
+        resolve({
+          kind: "transport",
+          code: "connection_lost",
+          message: "The daemon connection was lost before the request was sent",
+        });
+        this.reconnectForHello();
+      }
+    });
+  }
+
+  private async requestNative(
+    type: BrowserMessageType,
+    payload: Record<string, unknown>,
+    expectedType: BrowserMessageType,
+    feature: string,
+    mutation: boolean,
+  ): Promise<NativeRequestResult> {
+    const attempts = mutation ? 1 : 2;
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      if (!(await this.ensureConnected())) {
+        return {
+          kind: "transport",
+          code: "connection_timeout",
+          message: "Could not establish a current daemon session",
+        };
+      }
+      if (!(this.store.daemonFeatures ?? []).includes(feature)) {
+        return {
+          kind: "response",
+          code: "feature_unavailable",
+          message: "This daemon does not support the requested inbox feature",
+        };
+      }
+      const result = await this.sendCorrelated(type, payload, expectedType);
+      if (result.kind !== "transport" || mutation || attempt + 1 === attempts) return result;
+      // Reads are safe to retry once after a confirmed transport failure;
+      // mutations deliberately return their ambiguous status to the page.
+    }
+    return { kind: "transport", code: "connection_lost", message: "The daemon is unavailable" };
+  }
+
+  async requestTriageSnapshot(
+    request: { schema_versions: [1]; limit?: number; cursor?: string },
+  ): Promise<BrokerReply<{ snapshot: Record<string, unknown> }>> {
+    const result = await this.requestNative(
+      "triage_snapshot_request",
+      request,
+      "triage_snapshot_response",
+      TRIAGE_SNAPSHOT_FEATURE,
+      false,
+    );
+    if (result.kind !== "response" || result.payload === undefined) return this.nativeFailure(result);
+    if (result.code !== undefined) return this.failure(result.code, result.message ?? "The request is unavailable");
+    const { request_id: _requestID, ...snapshot } = result.payload;
+    const counts = snapshot["counts"];
+    if (typeof counts === "object" && counts !== null && typeof (counts as Record<string, unknown>)["pending_total"] === "number") {
+      this.triagePendingCount = (counts as Record<string, number>)["pending_total"];
+      await this.syncConnectionBadge();
+    }
+    return { ok: true, snapshot };
+  }
+
+  async requestTriageCounts(): Promise<BrokerReply<{ counts: Record<string, unknown>; generated_at: string }>> {
+    const result = await this.requestNative(
+      "triage_counts_request",
+      {},
+      "triage_counts_response",
+      TRIAGE_SNAPSHOT_FEATURE,
+      false,
+    );
+    if (result.kind !== "response" || result.payload === undefined) return this.nativeFailure(result);
+    if (result.code !== undefined) return this.failure(result.code, result.message ?? "The request is unavailable");
+    const counts = result.payload["counts"];
+    if (typeof counts !== "object" || counts === null) return this.failure("invalid_response", "The daemon returned invalid counts");
+    const pending = (counts as Record<string, unknown>)["pending_total"];
+    if (typeof pending === "number") {
+      this.triagePendingCount = pending;
+      await this.syncConnectionBadge();
+    }
+    return {
+      ok: true,
+      counts: counts as Record<string, unknown>,
+      generated_at: new Date(this.deps.now()).toISOString(),
+    };
+  }
+
+  async requestTriageDecision(
+    request: { item_id: string; op: "acquire" | "dismiss"; watch_scope?: "all" | number[] },
+  ): Promise<BrokerReply<{ outcome: string; detail?: string }>> {
+    const result = await this.requestNative(
+      "triage_decide",
+      request,
+      "triage_decide_result",
+      TRIAGE_MUTATIONS_FEATURE,
+      true,
+    );
+    if (result.kind !== "response" || result.payload === undefined) return this.nativeFailure(result);
+    if (result.code !== undefined) return this.failure(result.code, result.message ?? "The request is unavailable");
+    return {
+      ok: true,
+      outcome: result.payload["outcome"] as string,
+      ...(typeof result.payload["detail"] === "string" ? { detail: result.payload["detail"] } : {}),
+    };
+  }
+
+  async requestActionResolve(
+    request: { action_id: number; verdict: "accept" | "reject"; expected_revision: number; expected_sha256?: string },
+  ): Promise<BrokerReply<{ outcome: string; detail?: string }>> {
+    const result = await this.requestNative(
+      "human_action_resolve",
+      request,
+      "human_action_resolve_result",
+      TRIAGE_MUTATIONS_FEATURE,
+      true,
+    );
+    if (result.kind !== "response" || result.payload === undefined) return this.nativeFailure(result);
+    if (result.code !== undefined) return this.failure(result.code, result.message ?? "The request is unavailable");
+    return {
+      ok: true,
+      outcome: result.payload["outcome"] as string,
+      ...(typeof result.payload["detail"] === "string" ? { detail: result.payload["detail"] } : {}),
+    };
+  }
+
+  async requestPreview(
+    request: { action_id: number },
+  ): Promise<BrokerReply<{ preview: Record<string, unknown> }>> {
+    const result = await this.requestNative(
+      "review_preview_request",
+      request,
+      "review_preview_result",
+      REVIEW_PREVIEW_FEATURE,
+      false,
+    );
+    if (result.kind !== "response" || result.payload === undefined) return this.nativeFailure(result);
+    if (result.code !== undefined) return this.failure(result.code, result.message ?? "The request is unavailable");
+    const { request_id: _requestID, ...preview } = result.payload;
+    return { ok: true, preview };
+  }
+
   /**
    * Record the user's informed terms-consent choice (popup first-use prompt),
    * clear the pending-prompt flags, and — when they consented — re-drive the
@@ -1012,11 +1324,17 @@ export class Bridge {
   /** The keepalive alarm woke the worker. The top-level start() on this same
    * spin-up already reconnects; this is the safety net that re-establishes the
    * daemon connection if it is still down, so any queued offers arrive. */
+  /** The keepalive alarm both reconnects the broker and refreshes the
+   * non-authoritative pending count when the negotiated schema supports it. */
   private async onKeepaliveAlarm(): Promise<void> {
     await this.ready;
     if (this.port === null && !this.closingDeliberately) {
       this.reconnectAttempts = 0;
       this.connect();
+      return;
+    }
+    if (this.hasCurrentHello() && (this.store.daemonFeatures ?? []).includes(TRIAGE_SNAPSHOT_FEATURE)) {
+      await this.requestTriageCounts();
     }
   }
 
@@ -1034,19 +1352,28 @@ export class Bridge {
     if (this.hydrated) void this.update((current) => current);
     const port = this.deps.connectNative(NATIVE_HOST);
     this.port = port;
+    this.portGeneration += 1;
+    this.helloAckGeneration = -1;
+    this.helloSentGeneration = -1;
+    this.triagePendingCount = undefined;
     port.onMessage.addListener((msg) => {
       if (this.port !== port) return;
       this.reconnectAttempts = 0;
-      return this.onInbound(msg);
+      return this.enqueueInbound(msg, port);
     });
     port.onDisconnect.addListener(() => this.onPortDisconnect(port));
     // hello is the mandatory first frame after connect (seq 0).
     const adapterVersions: Record<string, string> = {};
     for (const spec of this.deps.adapterSpecs) adapterVersions[spec.id] = spec.version;
-    this.send("hello", {
-      extension_version: this.deps.manifestVersion,
-      adapter_versions: adapterVersions,
-    });
+    this.helloSentGeneration = this.portGeneration;
+    if (
+      !this.send("hello", {
+        extension_version: this.deps.manifestVersion,
+        adapter_versions: adapterVersions,
+      })
+    ) {
+      this.helloSentGeneration = -1;
+    }
   }
 
   private async onPortDisconnect(port: NativePort): Promise<void> {
@@ -1054,6 +1381,11 @@ export class Bridge {
     if (this.port !== port) return;
     this.port = null;
     this.failPageAcquireWaiters("The daemon disconnected before acknowledging this page");
+    this.settleHelloWaiters(false);
+    this.failPendingNativeRequests(
+      "connection_lost",
+      "The daemon disconnected before acknowledging the request",
+    );
     await this.update((s) => ({ ...s, connectionStatus: "disconnected" }));
     await this.syncConnectionBadge("disconnected");
     if (this.closingDeliberately) return;
@@ -1074,6 +1406,11 @@ export class Bridge {
     const port = this.port;
     this.port = null;
     this.failPageAcquireWaiters("The daemon disconnected before acknowledging this page");
+    this.settleHelloWaiters(false);
+    this.failPendingNativeRequests(
+      "connection_lost",
+      "The daemon disconnected before acknowledging the request",
+    );
     if (!port) return;
     try {
       port.disconnect();
@@ -1091,6 +1428,11 @@ export class Bridge {
     this.closingDeliberately = true;
     this.port = null;
     this.failPageAcquireWaiters("The daemon restarted before acknowledging this page");
+    this.settleHelloWaiters(false);
+    this.failPendingNativeRequests(
+      "connection_lost",
+      "The daemon restarted before acknowledging the request",
+    );
     try {
       port.disconnect();
     } catch {
@@ -1340,8 +1682,38 @@ export class Bridge {
       console.error("papio: refusing to send invalid frame", type, e);
       return false;
     }
-    port.postMessage(env);
-    return true;
+    try {
+      port.postMessage(env);
+      return true;
+    } catch (e) {
+      console.error("papio: native postMessage failed", e);
+      return false;
+    }
+  }
+
+  private enqueueInbound(raw: unknown, sourcePort: NativePort): Promise<void> {
+    const dispatched = this.inboundChain.then(() => {
+      if (this.port !== sourcePort) return;
+      return this.onInbound(raw);
+    });
+    // Keep later frames progressing even if a single handler fails unexpectedly;
+    // the returned promise still exposes that failure to the event emitter.
+    this.inboundChain = dispatched.catch((e) => {
+      console.error("papio: inbound handler failed", e);
+    });
+    return dispatched;
+  }
+
+  private resolveNativeResponse(msg: BrowserMessage): void {
+    const requestID = msg.payload["request_id"];
+    if (typeof requestID !== "string") return;
+    const pending = this.pendingNativeRequests.get(requestID);
+    if (pending === undefined || pending.expectedType !== msg.type) {
+      console.debug("papio: dropping unknown or late triage response", msg.type, requestID);
+      return;
+    }
+    this.pendingNativeRequests.delete(requestID);
+    pending.resolve({ kind: "response", payload: msg.payload });
   }
 
   private async onInbound(raw: unknown): Promise<void> {
@@ -1383,6 +1755,8 @@ export class Bridge {
           resolverOrigins,
         }));
         await this.syncConnectionBadge(connectionStatus);
+        this.helloAckGeneration = this.portGeneration;
+        this.settleHelloWaiters(true);
         return;
       }
       case "page_acquire_ack": {
@@ -1396,6 +1770,13 @@ export class Bridge {
         }
         return;
       }
+      case "triage_snapshot_response":
+      case "triage_counts_response":
+      case "triage_decide_result":
+      case "human_action_resolve_result":
+      case "review_preview_result":
+        this.resolveNativeResponse(msg);
+        return;
       case "ack":
         await this.closeAfterAdoption(msg.job_id);
         return;
@@ -2553,6 +2934,174 @@ function isTermsConsentRequest(message: unknown): message is TermsConsentRequest
   );
 }
 
+interface InboxRuntimeSender {
+  id?: string;
+  url?: string;
+}
+
+interface InboxRuntimeURLs {
+  runtimeID: string;
+  inboxURL: string;
+  popupURL: string;
+}
+
+type InboxRuntimeReply =
+  | BrokerFailure
+  | { opened: true }
+  | BrokerReply<{ snapshot: Record<string, unknown> }>
+  | BrokerReply<{ counts: Record<string, unknown>; generated_at: string }>
+  | BrokerReply<{ outcome: string; detail?: string }>
+  | BrokerReply<{ preview: Record<string, unknown> }>;
+
+function isObjectRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function hasOnlyKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+  return Object.keys(value).every((key) => keys.includes(key));
+}
+
+function isPositiveSafeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 1;
+}
+
+function isInboxSender(sender: InboxRuntimeSender, urls: InboxRuntimeURLs): boolean {
+  return sender.id === urls.runtimeID && sender.url === urls.inboxURL;
+}
+
+function isOpenInboxSender(sender: InboxRuntimeSender, urls: InboxRuntimeURLs): boolean {
+  return sender.id === urls.runtimeID && (sender.url === urls.inboxURL || sender.url === urls.popupURL);
+}
+
+function runtimeFailure(code: string, message: string): BrokerFailure {
+  return { ok: false, error: { code, message } };
+}
+
+function isSnapshotRuntimeRequest(
+  value: unknown,
+): value is { schema_versions: [1]; limit?: number; cursor?: string } {
+  if (!isObjectRecord(value) || !hasOnlyKeys(value, ["schema_versions", "limit", "cursor"])) return false;
+  const versions = value["schema_versions"];
+  return (
+    Array.isArray(versions) &&
+    versions.length === 1 &&
+    versions[0] === 1 &&
+    (value["limit"] === undefined || (isPositiveSafeInteger(value["limit"]) && value["limit"] <= 100)) &&
+    (value["cursor"] === undefined || (typeof value["cursor"] === "string" && value["cursor"].length <= 256))
+  );
+}
+
+function isCountsRuntimeRequest(value: unknown): value is Record<string, never> {
+  return isObjectRecord(value) && Object.keys(value).length === 0;
+}
+
+function isDecisionRuntimeRequest(
+  value: unknown,
+): value is { item_id: string; op: "acquire" | "dismiss"; watch_scope?: "all" | number[] } {
+  if (!isObjectRecord(value) || !hasOnlyKeys(value, ["item_id", "op", "watch_scope"])) return false;
+  const itemID = value["item_id"];
+  const op = value["op"];
+  const watchScope = value["watch_scope"];
+  if (typeof itemID !== "string" || itemID.length === 0 || itemID.length > 1024) return false;
+  if (op !== "acquire" && op !== "dismiss") return false;
+  if (op === "acquire") return watchScope === undefined;
+  if (watchScope === "all") return true;
+  if (!Array.isArray(watchScope) || watchScope.length < 1 || watchScope.length > 100) return false;
+  const ids = new Set<number>();
+  for (const id of watchScope) {
+    if (!isPositiveSafeInteger(id) || ids.has(id)) return false;
+    ids.add(id);
+  }
+  return true;
+}
+
+function isResolveRuntimeRequest(
+  value: unknown,
+): value is { action_id: number; verdict: "accept" | "reject"; expected_revision: number; expected_sha256?: string } {
+  if (!isObjectRecord(value) || !hasOnlyKeys(value, ["action_id", "verdict", "expected_revision", "expected_sha256"])) {
+    return false;
+  }
+  const verdict = value["verdict"];
+  const expectedSHA = value["expected_sha256"];
+  if (
+    !isPositiveSafeInteger(value["action_id"]) ||
+    !isPositiveSafeInteger(value["expected_revision"]) ||
+    (verdict !== "accept" && verdict !== "reject")
+  ) {
+    return false;
+  }
+  if (verdict === "accept" && typeof expectedSHA !== "string") return false;
+  return expectedSHA === undefined || (typeof expectedSHA === "string" && /^[a-f0-9]{64}$/.test(expectedSHA));
+}
+
+function isPreviewRuntimeRequest(value: unknown): value is { action_id: number } {
+  return isObjectRecord(value) && hasOnlyKeys(value, ["action_id"]) && isPositiveSafeInteger(value["action_id"]);
+}
+
+/**
+ * The inbox's finite, validated runtime boundary. Only the extension page may
+ * make daemon-backed requests; the popup may only ask to open that page.
+ */
+export async function handleInboxRuntimeMessage(
+  bridge: Bridge,
+  message: unknown,
+  sender: InboxRuntimeSender,
+  urls: InboxRuntimeURLs,
+): Promise<InboxRuntimeReply | undefined> {
+  if (!isObjectRecord(message) || typeof message["type"] !== "string") return undefined;
+  const type = message["type"];
+  if (type === "papio.openInbox") {
+    if (!isOpenInboxSender(sender, urls)) return runtimeFailure("unauthorized", "This sender cannot open the inbox");
+    if (!hasOnlyKeys(message, ["type"])) return runtimeFailure("invalid_request", "Invalid inbox open request");
+    try {
+      await bridge.openInbox(urls.inboxURL);
+      return { opened: true };
+    } catch {
+      return runtimeFailure("open_failed", "Could not open the inbox");
+    }
+  }
+  if (
+    type !== "papio.triage.snapshot" &&
+    type !== "papio.triage.counts" &&
+    type !== "papio.triage.decide" &&
+    type !== "papio.action.resolve" &&
+    type !== "papio.preview"
+  ) {
+    return undefined;
+  }
+  if (!isInboxSender(sender, urls)) {
+    return runtimeFailure("unauthorized", "This sender cannot access the inbox broker");
+  }
+  if (!hasOnlyKeys(message, ["type", "request"])) {
+    return runtimeFailure("invalid_request", "Invalid inbox broker request");
+  }
+  const request = message["request"];
+  switch (type) {
+    case "papio.triage.snapshot":
+      return isSnapshotRuntimeRequest(request)
+        ? bridge.requestTriageSnapshot(request)
+        : runtimeFailure("invalid_request", "Invalid triage snapshot request");
+    case "papio.triage.counts":
+      return isCountsRuntimeRequest(request)
+        ? bridge.requestTriageCounts()
+        : runtimeFailure("invalid_request", "Invalid triage counts request");
+    case "papio.triage.decide":
+      return isDecisionRuntimeRequest(request)
+        ? bridge.requestTriageDecision(request)
+        : runtimeFailure("invalid_request", "Invalid triage decision request");
+    case "papio.action.resolve":
+      return isResolveRuntimeRequest(request)
+        ? bridge.requestActionResolve(request)
+        : runtimeFailure("invalid_request", "Invalid action resolution request");
+    case "papio.preview":
+      return isPreviewRuntimeRequest(request)
+        ? bridge.requestPreview(request)
+        : runtimeFailure("invalid_request", "Invalid preview request");
+    default:
+      return undefined;
+  }
+}
+
 function realDeps(): BridgeDeps {
   return {
     connectNative: (name) => {
@@ -2577,6 +3126,7 @@ function realDeps(): BridgeDeps {
       reload: (tabID) => chrome.tabs.reload(tabID),
       remove: (tabID) => chrome.tabs.remove(tabID),
       update: (tabID, props) => chrome.tabs.update(tabID, props),
+      query: (query) => chrome.tabs.query(query),
       onUpdated: { addListener: (cb) => chrome.tabs.onUpdated.addListener(cb) },
       onRemoved: { addListener: (cb) => chrome.tabs.onRemoved.addListener(cb) },
     },
@@ -2647,6 +3197,7 @@ function realDeps(): BridgeDeps {
     action: {
       setBadgeText: (details) => chrome.action.setBadgeText(details),
       setBadgeBackgroundColor: (details) => chrome.action.setBadgeBackgroundColor(details),
+      setTitle: (details) => chrome.action.setTitle(details),
     },
     alarms: {
       create: (name, info) => chrome.alarms?.create(name, info),
@@ -2660,6 +3211,11 @@ function realDeps(): BridgeDeps {
 // Wiring runs only inside a real extension service worker, never under bun test.
 if (typeof chrome !== "undefined" && chrome.runtime?.id) {
   const bridge = new Bridge(realDeps());
+  const inboxRuntimeURLs: InboxRuntimeURLs = {
+    runtimeID: chrome.runtime.id,
+    inboxURL: chrome.runtime.getURL(INBOX_PAGE_PATH),
+    popupURL: chrome.runtime.getURL(POPUP_PAGE_PATH),
+  };
   // Top-level registrations give Chrome a reason to start this worker at
   // browser launch and after install/update. Without them a cold-started
   // Chrome leaves the worker dead (and the daemon unreachable) until an
@@ -2668,6 +3224,20 @@ if (typeof chrome !== "undefined" && chrome.runtime?.id) {
   chrome.runtime.onStartup.addListener(() => {});
   chrome.runtime.onInstalled.addListener(() => {});
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+    if (
+      isObjectRecord(message) &&
+      (message["type"] === "papio.openInbox" ||
+        message["type"] === "papio.triage.snapshot" ||
+        message["type"] === "papio.triage.counts" ||
+        message["type"] === "papio.triage.decide" ||
+        message["type"] === "papio.action.resolve" ||
+        message["type"] === "papio.preview")
+    ) {
+      void handleInboxRuntimeMessage(bridge, message, _sender, inboxRuntimeURLs).then((reply) => {
+        sendResponse(reply);
+      });
+      return true;
+    }
     if (isCapabilitiesRequest(message)) {
       sendResponse({ page_acquire: bridge.pageAcquireAvailable() });
       return false;
@@ -2693,6 +3263,9 @@ if (typeof chrome !== "undefined" && chrome.runtime?.id) {
   });
   chrome.permissions?.onRemoved?.addListener(() => {
     void bridge.syncConnectionBadge();
+  });
+  chrome.notifications?.onClicked?.addListener(() => {
+    void bridge.openInbox(inboxRuntimeURLs.inboxURL);
   });
   // KEEPALIVE INTEGRATION
   void bridge.start().then(() =>
