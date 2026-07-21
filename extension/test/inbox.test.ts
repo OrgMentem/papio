@@ -48,6 +48,7 @@ async function inboxDocument(
     HTMLButtonElement: window.HTMLButtonElement,
     HTMLInputElement: window.HTMLInputElement,
     HTMLTimeElement: window.HTMLTimeElement,
+    HTMLSelectElement: window.HTMLSelectElement,
     chrome: {
       runtime: {
         sendMessage: async (message: RuntimeRequest) => {
@@ -383,13 +384,69 @@ test("the filter narrows visible items, keeps counts intact, and reports a disti
   expect(page.document.querySelectorAll("[data-triage-item-id]")).toHaveLength(2);
 });
 
-test("the action kind renders as a hidden-label eyebrow, not a plain fact row", async () => {
+test("the action kind renders as a status glyph with an accessible label, not a fact row", async () => {
   const fixture = snapshot([manualAction("action:manual", 1, "Manual action")], {
     counts: counts({ pending_total: 1, actions: 1, watch_hits: 0, retractions: 0 }),
   });
   const page = await inboxDocument((message) => snapshotReply(fixture, message));
-  const dt = page.document.querySelector<HTMLElement>("[data-triage-item-id='action:manual'] dt[data-fact='action']");
-  const dd = page.document.querySelector<HTMLElement>("[data-triage-item-id='action:manual'] dd[data-fact='action']");
-  expect(dt?.textContent).toBe("Action");
-  expect(dd?.textContent).toBe("manual download");
+  const badge = page.document.querySelector<HTMLElement>("[data-triage-item-id='action:manual'] .item-status");
+  expect(badge?.dataset.status).toBe("manual_download");
+  expect(badge?.getAttribute("aria-label")).toBe("Manual download needed");
+  expect(badge?.title).toBe("Manual download needed");
+  expect(page.document.querySelector("[data-triage-item-id='action:manual'] dd[data-fact='action']")).toBeNull();
+});
+
+test("backend identifiers collapse into a details section and the citation carries the DOI link", async () => {
+  const item = manualAction("action:manual", 1, "Manual action");
+  item.facts = [
+    { label: "Action", text: "manual download" },
+    { label: "Authors", text: "Yann LeCun, Yoshua Bengio, Geoffrey Hinton" },
+    { label: "Year", text: "2015" },
+    { label: "Detail", text: "a resolver returned a landing page but no verified direct PDF" },
+    { label: "Job", text: "job-18" },
+  ];
+  item.links = [{ rel: "doi", url: "https://doi.org/10.1038/nature14539" }];
+  const fixture = snapshot([item], {
+    counts: counts({ pending_total: 1, actions: 1, watch_hits: 0, retractions: 0 }),
+  });
+  const page = await inboxDocument((message) => snapshotReply(fixture, message));
+  const row = page.document.querySelector<HTMLElement>("[data-triage-item-id='action:manual']");
+
+  // APA (default): inverted initials, parenthesized year, DOI URL as the link.
+  const citation = row?.querySelector(".item-citation");
+  expect(citation?.textContent).toBe("LeCun, Y., Bengio, Y., & Hinton, G. (2015). https://doi.org/10.1038/nature14539");
+  expect(citation?.querySelector("a")?.href).toBe("https://doi.org/10.1038/nature14539");
+
+  // The job id lives only inside the collapsed backend-details section.
+  const debug = row?.querySelector(".item-debug");
+  expect(debug?.querySelector("summary")?.textContent).toBe("Backend details");
+  expect(debug?.textContent).toContain("job-18");
+  expect(row?.querySelector(".item-facts")).toBeNull();
+
+  // Detail renders as unlabeled prose.
+  expect(row?.querySelector(".item-detail")?.textContent).toBe("a resolver returned a landing page but no verified direct PDF");
+
+  // Switching the style re-renders the citation in MLA.
+  const select = page.document.getElementById("citation-style") as HTMLSelectElement;
+  select.value = "mla";
+  select.dispatchEvent(new Event("change", { bubbles: true }));
+  await settle();
+  expect(page.document.querySelector("[data-triage-item-id='action:manual'] .item-citation")?.textContent).toBe(
+    "LeCun, Yann, et al. 2015, doi.org/10.1038/nature14539.",
+  );
+});
+
+test("an author suffix duplicated in the title is stripped for display", async () => {
+  const item = manualAction("action:manual", 1, "Trust Engineering for Human-AI Teams - Neta Ezer, Sylvain Bruni");
+  item.facts = [
+    { label: "Action", text: "manual download" },
+    { label: "Authors", text: "Neta Ezer, Sylvain Bruni, Yang Cai" },
+  ];
+  const fixture = snapshot([item], {
+    counts: counts({ pending_total: 1, actions: 1, watch_hits: 0, retractions: 0 }),
+  });
+  const page = await inboxDocument((message) => snapshotReply(fixture, message));
+  expect(page.document.querySelector("[data-triage-item-id='action:manual'] h3")?.textContent).toBe(
+    "Trust Engineering for Human-AI Teams",
+  );
 });

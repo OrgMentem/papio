@@ -6,6 +6,28 @@ type Snapshot = Omit<TriageSnapshotResponsePayload, "request_id">;
 type TriageOperation = TriageSnapshotItem["ops"][number];
 type Verdict = "accept" | "reject" | "dismiss";
 
+type CitationStyle = "apa" | "mla" | "chicago";
+
+const CITATION_STYLE_KEY = "papio_inbox_citation_style_v1";
+
+function storedCitationStyle(): CitationStyle {
+  try {
+    const value = window.localStorage.getItem(CITATION_STYLE_KEY);
+    if (value === "apa" || value === "mla" || value === "chicago") return value;
+  } catch {
+    // Storage can be unavailable; fall back to the default.
+  }
+  return "apa";
+}
+
+function persistCitationStyle(style: CitationStyle): void {
+  try {
+    window.localStorage.setItem(CITATION_STYLE_KEY, style);
+  } catch {
+    // Non-fatal: the choice simply resets on the next visit.
+  }
+}
+
 interface PageElements {
   connection: HTMLElement;
   counts: HTMLElement;
@@ -20,6 +42,7 @@ interface PageElements {
   dialogMessage: HTMLElement;
   dialogCancel: HTMLButtonElement;
   dialogConfirm: HTMLButtonElement;
+  citationStyle: HTMLSelectElement;
 }
 
 interface Confirmation {
@@ -42,6 +65,7 @@ interface PageState {
   focusSelectionAfterRender: boolean;
   loading: boolean;
   filterQuery: string;
+  citationStyle: CitationStyle;
 }
 
 const state: PageState = {
@@ -58,6 +82,7 @@ const state: PageState = {
   focusSelectionAfterRender: false,
   loading: false,
   filterQuery: "",
+  citationStyle: storedCitationStyle(),
 };
 
 let elements: PageElements | null = null;
@@ -274,24 +299,119 @@ function selectItem(itemID: string, focus: boolean): void {
   if (focus) rowForItem(itemID)?.focus();
 }
 
-const LINK_LABELS: Record<string, string> = { doi: "DOI", arxiv: "arXiv", openalex: "OpenAlex" };
+const LINK_LABELS: Record<string, string> = { arxiv: "arXiv", openalex: "OpenAlex", landing: "landing page" };
 
-function renderLinks(item: TriageSnapshotItem): HTMLElement | null {
-  const links = element("p");
-  links.className = "item-links";
-  let count = 0;
+function factText(item: TriageSnapshotItem, label: string): string | null {
+  const fact = item.facts.find((candidate) => candidate.label === label);
+  return fact === undefined || fact.text === "" ? null : fact.text;
+}
+
+interface AuthorName {
+  family: string;
+  givens: string[];
+}
+
+function parseAuthor(name: string): AuthorName {
+  const words = name.split(/\s+/).filter((word) => word !== "" && !word.startsWith("("));
+  const family = words[words.length - 1];
+  if (family === undefined) return { family: name, givens: [] };
+  return { family, givens: words.slice(0, -1) };
+}
+
+function invertedInitials(name: string): string {
+  const { family, givens } = parseAuthor(name);
+  const initials = givens.map((given) => `${given.charAt(0).toUpperCase()}.`).join(" ");
+  return initials === "" ? family : `${family}, ${initials}`;
+}
+
+function invertedFull(name: string): string {
+  const { family, givens } = parseAuthor(name);
+  return givens.length === 0 ? family : `${family}, ${givens.join(" ")}`;
+}
+
+function apaAuthors(authors: string[]): string {
+  const names = authors.map(invertedInitials);
+  if (names.length === 1) return names[0]!;
+  if (names.length <= 7) return `${names.slice(0, -1).join(", ")}, & ${names[names.length - 1]!}`;
+  return `${names.slice(0, 6).join(", ")}, … ${names[names.length - 1]!}`;
+}
+
+function mlaAuthors(authors: string[]): string {
+  const first = invertedFull(authors[0]!);
+  if (authors.length === 1) return first;
+  if (authors.length === 2) return `${first}, and ${authors[1]!}`;
+  return `${first}, et al.`;
+}
+
+function chicagoAuthors(authors: string[]): string {
+  const first = invertedFull(authors[0]!);
+  if (authors.length === 1) return first;
+  if (authors.length > 7) return `${first}, ${authors.slice(1, 7).join(", ")}, et al.`;
+  const rest = authors.slice(1);
+  const last = rest.pop()!;
+  return rest.length === 0 ? `${first}, and ${last}` : `${first}, ${rest.join(", ")}, and ${last}`;
+}
+
+function sentence(text: string): string {
+  return text.endsWith(".") ? text : `${text}.`;
+}
+
+function citationAnchor(url: string, text: string): HTMLAnchorElement {
+  const anchor = element("a", text);
+  anchor.href = url;
+  anchor.target = "_blank";
+  anchor.rel = "noopener noreferrer";
+  return anchor;
+}
+
+// One reference-style line per item: authors and year in the selected
+// citation style, with the DOI hyperlinked as its own URL — the link IS the
+// citation's locator, replacing a separate "Open DOI" row. Non-DOI links
+// follow as short labeled anchors. A row whose displayed title is already
+// the DOI (placeholder fallback) does not repeat that link here.
+function renderCitation(item: TriageSnapshotItem, placeholderURL: string | null): HTMLElement | null {
+  const authorsText = factText(item, "Authors");
+  const year = factText(item, "Year");
+  const safe: Array<{ rel: string; url: string }> = [];
   for (const link of item.links) {
     const url = safeExternalURL(link.url);
-    if (url === null) continue;
-    if (count > 0) links.append(document.createTextNode(" · "));
-    const anchor = element("a", `Open ${LINK_LABELS[link.rel] ?? link.rel}`);
-    anchor.href = url;
-    anchor.target = "_blank";
-    anchor.rel = "noopener noreferrer";
-    links.append(anchor);
-    count += 1;
+    if (url !== null) safe.push({ rel: link.rel, url });
   }
-  return count > 0 ? links : null;
+  const doi = safe.find((link) => link.rel === "doi");
+  const extras = safe.filter((link) => link !== doi);
+  if (authorsText === null && year === null && safe.length === 0) return null;
+
+  const style = state.citationStyle;
+  const authors = authorsText === null ? [] : authorsText.split(", ").filter((name) => name !== "");
+  let prefix = "";
+  if (authors.length > 0) {
+    if (style === "apa") {
+      const names = apaAuthors(authors);
+      prefix = year === null ? sentence(names) : `${names} (${year}).`;
+    } else if (style === "mla") {
+      const names = sentence(mlaAuthors(authors));
+      prefix = year === null ? names : doi === undefined ? `${names} ${year}.` : `${names} ${year},`;
+    } else {
+      const names = sentence(chicagoAuthors(authors));
+      prefix = year === null ? names : `${names} ${year}.`;
+    }
+  } else if (year !== null) {
+    prefix = style === "apa" ? `(${year}).` : `${year}.`;
+  }
+
+  const citation = element("p");
+  citation.className = "item-citation";
+  if (prefix !== "") citation.append(document.createTextNode(`${prefix} `));
+  const doiShown = doi !== undefined && placeholderURL !== null && doi.url.replace(/^https:\/\//, "") === placeholderURL;
+  if (doi !== undefined && !doiShown) {
+    citation.append(citationAnchor(doi.url, style === "apa" ? doi.url : doi.url.replace(/^https:\/\//, "")));
+    if (style !== "apa") citation.append(document.createTextNode("."));
+  }
+  for (const link of extras) {
+    if (citation.childNodes.length > 0) citation.append(document.createTextNode(" · "));
+    citation.append(citationAnchor(link.url, LINK_LABELS[link.rel] ?? link.rel));
+  }
+  return citation.childNodes.length > 0 ? citation : null;
 }
 
 function previewButton(item: TriageSnapshotItem): HTMLButtonElement | null {
@@ -329,16 +449,31 @@ function operationButton(item: TriageSnapshotItem, operation: TriageOperation): 
 // The daemon falls back to the action kind ("manual download") when a job
 // has no bibliographic title. Prefer the first safe link (usually the DOI)
 // as the display title, and mark either fallback as a placeholder so it does
-// not masquerade as a paper title.
+// not masquerade as a paper title. Ingested titles sometimes arrive with the
+// author list appended after " - "; that would duplicate the citation line,
+// so a suffix matching the Authors fact is stripped.
 function displayTitle(item: TriageSnapshotItem): { text: string; placeholder: boolean } {
   const kindLabel =
     item.kind === "human_action" && typeof item.action_kind === "string"
       ? item.action_kind.replaceAll("_", " ")
       : null;
-  if (kindLabel === null || item.title !== kindLabel) return { text: item.title, placeholder: false };
+  if (kindLabel === null || item.title !== kindLabel) {
+    return { text: stripAuthorSuffix(item.title, factText(item, "Authors")), placeholder: false };
+  }
   const url = firstSafeLink(item);
   if (url !== null) return { text: url.replace(/^https:\/\//, ""), placeholder: true };
   return { text: item.title, placeholder: true };
+}
+
+function stripAuthorSuffix(title: string, authors: string | null): string {
+  if (authors === null) return title;
+  const index = title.lastIndexOf(" - ");
+  if (index <= 0) return title;
+  const suffix = title.slice(index + 3).trim().toLowerCase();
+  const known = authors.trim().toLowerCase();
+  if (suffix.length < 8 || known.length < 8) return title;
+  if (known.startsWith(suffix) || suffix.startsWith(known)) return title.slice(0, index).trimEnd();
+  return title;
 }
 
 function isFilePath(token: string): boolean {
@@ -366,6 +501,45 @@ function appendFactText(target: HTMLElement, text: string): void {
   }
 }
 
+const KNOWN_FACT_LABELS: Record<string, true> = { Action: true, Authors: true, Year: true, Detail: true, Job: true };
+
+const STATUS_META: Record<string, { glyph: string; label: string }> = {
+  manual_download: { glyph: "↓", label: "Manual download needed" },
+  openurl_handoff: { glyph: "↗", label: "Browser handoff ready" },
+  verify_identity: { glyph: "?", label: "Identity verification needed" },
+  watch_hit: { glyph: "✶", label: "New watch hit" },
+  retraction: { glyph: "!", label: "Retraction notice" },
+};
+
+// The status glyph is the row's quick-reference column; its meaning rides in
+// the tooltip and accessible name. The action-kind vocabulary is open (a new
+// daemon can ship new kinds), so unknown kinds degrade to a neutral dot with
+// the raw kind as the label instead of breaking the row.
+function statusMeta(item: TriageSnapshotItem): { key: string; glyph: string; label: string } {
+  const key = item.kind === "human_action" && typeof item.action_kind === "string" ? item.action_kind : item.kind;
+  const meta = STATUS_META[key];
+  if (meta !== undefined) return { key, glyph: meta.glyph, label: meta.label };
+  return { key: "unknown", glyph: "•", label: key.replaceAll("_", " ") };
+}
+
+// Backend identifiers matter for debugging, not triage: they live in a
+// collapsed <details> so the row stays about the paper.
+function renderDebug(item: TriageSnapshotItem): HTMLElement {
+  const rows: Array<[string, string]> = [["item", item.id]];
+  const job = factText(item, "Job");
+  if (job !== null) rows.push(["job", job]);
+  if (item.kind === "human_action" && typeof item.revision === "number") {
+    rows.push(["revision", String(item.revision)]);
+  }
+  const debug = element("details");
+  debug.className = "item-debug";
+  debug.append(element("summary", "Backend details"));
+  const list = element("dl");
+  for (const [label, value] of rows) list.append(element("dt", label), element("dd", value));
+  debug.append(list);
+  return debug;
+}
+
 function renderItem(item: TriageSnapshotItem): HTMLElement {
   const card = element("article");
   card.className = "triage-item";
@@ -376,14 +550,31 @@ function renderItem(item: TriageSnapshotItem): HTMLElement {
   card.addEventListener("focusin", () => selectItem(item.id, false));
   card.addEventListener("click", () => selectItem(item.id, false));
 
+  const status = statusMeta(item);
+  const badge = element("span", status.glyph);
+  badge.className = "item-status";
+  badge.dataset.status = status.key;
+  badge.title = status.label;
+  badge.setAttribute("role", "img");
+  badge.setAttribute("aria-label", status.label);
+  card.append(badge);
+
+  const body = element("div");
+  body.className = "item-body";
+  card.append(body);
+
   const heading = element("h3", title.text);
   if (title.placeholder) heading.classList.add("title-placeholder");
-  card.append(heading);
+  body.append(heading);
 
-  if (item.facts.length > 0) {
+  const citation = renderCitation(item, title.placeholder ? title.text : null);
+  if (citation !== null) body.append(citation);
+
+  const leftovers = item.facts.filter((fact) => KNOWN_FACT_LABELS[fact.label] !== true);
+  if (leftovers.length > 0) {
     const facts = element("dl");
     facts.className = "item-facts";
-    for (const fact of item.facts) {
+    for (const fact of leftovers) {
       const slug = fact.label.toLowerCase().replace(/[^a-z0-9]+/g, "-");
       const dt = element("dt", fact.label);
       dt.dataset.fact = slug;
@@ -392,11 +583,27 @@ function renderItem(item: TriageSnapshotItem): HTMLElement {
       appendFactText(dd, fact.text);
       facts.append(dt, dd);
     }
-    card.append(facts);
+    body.append(facts);
   }
 
-  const links = renderLinks(item);
-  if (links !== null) card.append(links);
+  const detail = factText(item, "Detail");
+  if (detail !== null) {
+    const paragraph = element("p");
+    paragraph.className = "item-detail";
+    appendFactText(paragraph, detail);
+    body.append(paragraph);
+  }
+
+  body.append(renderDebug(item));
+
+  const entry = state.itemMessages.get(item.id);
+  if (entry !== undefined) {
+    const result = element("p", entry.text);
+    result.className = "item-result";
+    result.dataset.tone = entry.tone;
+    result.setAttribute("role", "status");
+    body.append(result);
+  }
 
   const controls = element("div");
   controls.className = "item-controls";
@@ -406,14 +613,6 @@ function renderItem(item: TriageSnapshotItem): HTMLElement {
   for (const operation of item.ops) controls.append(operationButton(item, operation));
   if (controls.childElementCount > 0) card.append(controls);
 
-  const entry = state.itemMessages.get(item.id);
-  if (entry !== undefined) {
-    const result = element("p", entry.text);
-    result.className = "item-result";
-    result.dataset.tone = entry.tone;
-    result.setAttribute("role", "status");
-    card.append(result);
-  }
   return card;
 }
 
@@ -433,10 +632,12 @@ function renderCounts(): void {
     elements.counts.textContent = "Counts unavailable";
     return;
   }
+  const plural = (count: number, singular: string): string =>
+    `${count} ${count === 1 ? singular : `${singular}s`}`;
   const parts = [`${counts.pending_total} pending`];
-  if (counts.retractions > 0) parts.push(`${counts.retractions} retractions`);
-  if (counts.actions > 0) parts.push(`${counts.actions} human actions`);
-  if (counts.watch_hits > 0) parts.push(`${counts.watch_hits} watch hits`);
+  if (counts.retractions > 0) parts.push(plural(counts.retractions, "retraction"));
+  if (counts.actions > 0) parts.push(plural(counts.actions, "human action"));
+  if (counts.watch_hits > 0) parts.push(plural(counts.watch_hits, "watch hit"));
   elements.counts.textContent = parts.join(" · ");
 }
 
@@ -921,6 +1122,7 @@ function bootstrap(): void {
   const dialogMessage = document.getElementById("confirm-dialog-message");
   const dialogCancel = document.getElementById("confirm-cancel");
   const dialogConfirm = document.getElementById("confirm-submit");
+  const citationStyle = document.getElementById("citation-style");
   if (
     !(connection instanceof HTMLElement) ||
     !(counts instanceof HTMLElement) ||
@@ -931,6 +1133,7 @@ function bootstrap(): void {
     !(operationStatus instanceof HTMLElement) ||
     !(generatedAt instanceof HTMLTimeElement) ||
     !(loadMore instanceof HTMLButtonElement) ||
+    !(citationStyle instanceof HTMLSelectElement) ||
     !(dialog instanceof HTMLElement) ||
     !(dialogMessage instanceof HTMLElement) ||
     !(dialogCancel instanceof HTMLButtonElement) ||
@@ -948,6 +1151,7 @@ function bootstrap(): void {
     operationStatus,
     generatedAt,
     loadMore,
+    citationStyle,
     dialog,
     dialogMessage,
     dialogCancel,
@@ -955,6 +1159,15 @@ function bootstrap(): void {
   };
   refresh.addEventListener("click", requestRefresh);
   reconnect.addEventListener("click", requestRefresh);
+  citationStyle.value = state.citationStyle;
+  citationStyle.addEventListener("change", () => {
+    const value = citationStyle.value;
+    if (value === "apa" || value === "mla" || value === "chicago") {
+      state.citationStyle = value;
+      persistCitationStyle(value);
+      render();
+    }
+  });
   filterInput.addEventListener("input", () => {
     state.filterQuery = filterInput.value;
     render();

@@ -27,6 +27,17 @@ for the full pre-split extension history.
 - `job_offer` now carries `requires_auth`, so the extension can distinguish
   "open access — just render it" handoffs from ones needing an institutional
   sign-in (groundwork for surfacing this in the popup).
+- **Citation-style rendering in the inbox**: each item now shows a
+  reference-style line (authors, year, hyperlinked DOI) in a user-selected
+  citation style — APA, MLA, or Chicago — persisted across visits. The DOI
+  link is the citation's locator, replacing the separate "Open DOI" row.
+- **Status glyph column in the inbox**: every row leads with a colored,
+  tooltipped glyph for its kind (manual download ↓, browser handoff ↗,
+  verify identity ?, watch hit ✶, retraction !); unknown kinds from a newer
+  daemon degrade to a neutral dot. This replaces the action-kind pill.
+- **Collapsible backend details per inbox row**: item id, job id, and
+  revision move out of the visible row into a collapsed "Backend details"
+  section.
 
 ### Changed
 
@@ -40,7 +51,9 @@ for the full pre-split extension history.
   ghost buttons with a danger hover. The header consolidates to two rows,
   the counts line omits zero buckets, link labels capitalize properly
   ("Open DOI"), and rows whose title is just the action kind fall back to
-  the paper's DOI styled as a placeholder.
+  the paper's DOI styled as a placeholder. Detail text lost its "DETAIL"
+  label and reads as plain prose, author lists duplicated into a title's
+  " - " suffix are stripped, and the counts line pluralizes correctly.
 
 ## [0.4.3] - 2026-07-20
 
