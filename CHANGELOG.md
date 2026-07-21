@@ -47,6 +47,10 @@ execution records in `notes/acquisition-stack-plan.md`.
   copies under a different DOI) with strict title/year/author matching and
   tries those before parking the job — a paywalled paper with a free
   SSRN/arXiv copy no longer requires a manual re-search.
+- **OpenAlex works without an API key**: the resolver now runs in OpenAlex's
+  free polite pool with just the configured contact email — matching the
+  search/discovery client — and treats `sources.openalex.api_key` as optional
+  premium capacity. `doctor` reports the polite-pool state instead of failing.
 - **Stale-SSO handoff recovery**: the daemon records `browser.handoff_offered`
   and `browser.handoff_failed` job events (new `handoff_outcome` protocol
   message), and institutional handoff guidance now says to sign in first and

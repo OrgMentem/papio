@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -221,15 +222,23 @@ func TestSameAuthorRejectsDistinctUTF8Initials(t *testing.T) {
 	}
 }
 
-func TestOfficialEndpointRequiresAPIKey(t *testing.T) {
-	called := false
-	r := New(clientFunc(func(*http.Request) (*http.Response, error) {
-		called = true
-		return responseFor(http.StatusOK, `{}`, nil), nil
+// The OpenAlex works API is free in the polite pool: a contact email is the
+// only requirement and the api_key parameter is optional premium capacity —
+// the same stance as the discovery client.
+func TestKeylessPolitePoolSendsMailtoAndOmitsAPIKey(t *testing.T) {
+	var gotQuery url.Values
+	r := New(clientFunc(func(req *http.Request) (*http.Response, error) {
+		gotQuery = req.URL.Query()
+		return responseFor(http.StatusNotFound, "", nil), nil
 	}), "contact@example.org")
-	_, err := r.Resolve(context.Background(), work.Work{DOI: "10.1000/example"})
-	if err == nil || called {
-		t.Fatalf("Resolve = %v, called=%v; want actionable configuration error before request", err, called)
+	if _, err := r.Resolve(context.Background(), work.Work{DOI: "10.1000/example"}); err != nil {
+		t.Fatalf("keyless polite-pool resolve errored: %v", err)
+	}
+	if got := gotQuery.Get("mailto"); got != "contact@example.org" {
+		t.Fatalf("mailto = %q, want the polite-pool contact", got)
+	}
+	if got := gotQuery.Get("api_key"); got != "" {
+		t.Fatalf("api_key = %q, want omitted when unconfigured", got)
 	}
 }
 
@@ -252,22 +261,6 @@ func TestIdentifierTail(t *testing.T) {
 		if got := identifierTail(raw); got != want[name] {
 			t.Errorf("%s: identifierTail(%q) = %q, want %q", name, raw, got, want[name])
 		}
-	}
-}
-
-func TestNonLoopbackEndpointRequiresAPIKey(t *testing.T) {
-	called := false
-	r := NewWithOptions(Options{
-		Client: clientFunc(func(*http.Request) (*http.Response, error) {
-			called = true
-			return responseFor(http.StatusOK, `{}`, nil), nil
-		}),
-		ContactEmail: "contact@example.org",
-		BaseURL:      "https://api.test/works",
-	})
-	_, err := r.Resolve(context.Background(), work.Work{DOI: "10.1000/example"})
-	if err == nil || called {
-		t.Fatalf("Resolve = %v, called=%v; want configuration error before request", err, called)
 	}
 }
 

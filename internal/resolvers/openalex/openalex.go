@@ -167,9 +167,10 @@ func (r *Resolver) lookupURL(requested work.Work) (*url.URL, string, bool, error
 	if err != nil || !validHTTPURL(base.String()) {
 		return nil, "", false, errors.New("openalex: invalid endpoint configuration")
 	}
-	if r.apiKey == "" && !isLoopbackHost(base.Hostname()) {
-		return nil, "", false, errors.New("openalex: API key is required except for an explicit loopback endpoint")
-	}
+	// The OpenAlex works API is free in the polite pool: a contact email is
+	// the requirement (enforced by the Resolve/ResolveSiblings entry checks),
+	// an API key is optional premium capacity. The discovery client takes the
+	// same stance.
 	lookup, search := "", false
 	switch {
 	case strings.TrimSpace(requested.DOI) != "":

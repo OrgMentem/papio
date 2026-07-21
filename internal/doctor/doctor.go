@@ -162,8 +162,10 @@ func checkSourceCredentials(cfg config.Config, add func(string, string, string, 
 		}
 	}
 	if cfg.SourcePolicy(config.SourceOpenAlex).Enabled {
-		if strings.TrimSpace(cfg.Email) == "" || strings.TrimSpace(cfg.SourcePolicy(config.SourceOpenAlex).APIKey) == "" {
-			add("source_openalex", Fail, "OpenAlex is enabled without contact email and API key", "set email and sources.openalex.api_key, or disable the source")
+		if strings.TrimSpace(cfg.Email) == "" {
+			add("source_openalex", Fail, "OpenAlex is enabled without a contact email", "set email (polite pool); sources.openalex.api_key is optional premium capacity")
+		} else if strings.TrimSpace(cfg.SourcePolicy(config.SourceOpenAlex).APIKey) == "" {
+			add("source_openalex", Pass, "OpenAlex polite-pool contact configured (no API key)", "")
 		} else {
 			add("source_openalex", Pass, "OpenAlex credentials configured", "")
 		}
