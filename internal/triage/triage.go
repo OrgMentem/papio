@@ -84,13 +84,15 @@ type WatchHit struct {
 // HumanAction carries fields needed to display and safely resolve a human
 // action. Quarantine paths and candidate IDs never leave the daemon.
 type HumanAction struct {
-	ActionID   int64  `json:"action_id"`
-	JobID      string `json:"job_id"`
-	ActionKind string `json:"action_kind"`
-	JobState   string `json:"job_state"`
-	Revision   int64  `json:"revision"`
-	SHA256     string `json:"sha256"`
-	SizeBytes  int64  `json:"size_bytes"`
+	ActionID     int64  `json:"action_id"`
+	JobID        string `json:"job_id"`
+	ActionKind   string `json:"action_kind"`
+	JobState     string `json:"job_state"`
+	Revision     int64  `json:"revision"`
+	SHA256       string `json:"sha256"`
+	SizeBytes    int64  `json:"size_bytes"`
+	RequiresAuth *bool  `json:"requires_auth,omitempty"`
+	BlockedBy    string `json:"blocked_by,omitempty"`
 }
 
 // Retraction carries the retraction-specific portion of an Item.
@@ -158,13 +160,15 @@ func (item *Item) UnmarshalJSON(data []byte) error {
 		Watches     []Watch `json:"watches"`
 		FirstSeenAt string  `json:"first_seen_at"`
 
-		ActionID   int64  `json:"action_id"`
-		JobID      string `json:"job_id"`
-		ActionKind string `json:"action_kind"`
-		JobState   string `json:"job_state"`
-		Revision   int64  `json:"revision"`
-		SHA256     string `json:"sha256"`
-		SizeBytes  int64  `json:"size_bytes"`
+		ActionID     int64  `json:"action_id"`
+		JobID        string `json:"job_id"`
+		ActionKind   string `json:"action_kind"`
+		JobState     string `json:"job_state"`
+		Revision     int64  `json:"revision"`
+		SHA256       string `json:"sha256"`
+		SizeBytes    int64  `json:"size_bytes"`
+		RequiresAuth *bool  `json:"requires_auth"`
+		BlockedBy    string `json:"blocked_by"`
 
 		DOI       string    `json:"doi"`
 		Nature    string    `json:"nature"`
@@ -194,6 +198,7 @@ func (item *Item) UnmarshalJSON(data []byte) error {
 		item.HumanAction = &HumanAction{
 			ActionID: wire.ActionID, JobID: wire.JobID, ActionKind: wire.ActionKind, JobState: wire.JobState,
 			Revision: wire.Revision, SHA256: wire.SHA256, SizeBytes: wire.SizeBytes,
+			RequiresAuth: wire.RequiresAuth, BlockedBy: wire.BlockedBy,
 		}
 	case KindRetraction:
 		if wire.DOI == "" || wire.Nature == "" || wire.NoticedAt.IsZero() {
@@ -611,7 +616,7 @@ func watchFacts(work Work) []Fact {
 func humanActionItems(ctx context.Context, tx *sql.Tx) ([]Item, error) {
 	rows, err := tx.QueryContext(ctx, `
 		SELECT a.id, a.job_id, a.kind, j.state, COALESCE(a.detail, ''),
-			a.revision, a.quarantine_sha256, j.work_request_id,
+			a.revision, a.quarantine_sha256, a.requires_auth, a.blocked_by, j.work_request_id,
 			COALESCE(w.title, ''), COALESCE(w.authors_json, '[]'), COALESCE(w.year, 0)
 		FROM human_actions a
 		JOIN jobs j ON j.id = a.job_id
@@ -625,6 +630,8 @@ func humanActionItems(ctx context.Context, tx *sql.Tx) ([]Item, error) {
 	type row struct {
 		action             HumanAction
 		detail             string
+		requiresAuth       bool
+		blockedBy          string
 		workRequestID      string
 		title, authorsJSON string
 		year               int
@@ -634,12 +641,13 @@ func humanActionItems(ctx context.Context, tx *sql.Tx) ([]Item, error) {
 	for rows.Next() {
 		var r row
 		if err := rows.Scan(&r.action.ActionID, &r.action.JobID, &r.action.ActionKind, &r.action.JobState, &r.detail,
-			&r.action.Revision, &r.action.SHA256, &r.workRequestID, &r.title, &r.authorsJSON, &r.year); err != nil {
+			&r.action.Revision, &r.action.SHA256, &r.requiresAuth, &r.blockedBy, &r.workRequestID, &r.title, &r.authorsJSON, &r.year); err != nil {
 			return nil, err
 		}
 		if r.action.ActionID <= 0 || r.action.JobID == "" || r.action.ActionKind == "" || r.action.Revision <= 0 {
 			return nil, errors.New("invalid open human action")
 		}
+		r.action.RequiresAuth, r.action.BlockedBy = &r.requiresAuth, r.blockedBy
 		loaded = append(loaded, r)
 		workRequestIDs = append(workRequestIDs, r.workRequestID)
 	}

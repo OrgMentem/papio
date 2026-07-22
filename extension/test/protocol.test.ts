@@ -25,6 +25,18 @@ test("valid browser corpus parses", () => {
   }
 });
 
+test("triage access classification is optional and strictly parsed when present", () => {
+  const text = readFileSync(join(corpusRoot, "valid", "browser-triage-snapshot-response.json"), "utf8");
+  expect(JSON.stringify(parseBrowserMessageBytes(text).payload))
+    .toContain('"requires_auth":true,"blocked_by":"paywall"');
+
+  const legacy = text.replace(',"requires_auth":true,"blocked_by":"paywall"', "");
+  expect(parseBrowserMessageBytes(legacy).protocol).toBe("papio-browser/1");
+
+  const invalid = text.replace('"blocked_by":"paywall"', '"blocked_by":"captcha"');
+  expect(() => parseBrowserMessageBytes(invalid)).toThrow(ProtocolError);
+});
+
 test("invalid browser corpus fails closed", () => {
   const fixtures = readdirSync(join(corpusRoot, "invalid")).filter((name) => name.startsWith("browser-"));
   expect(fixtures.length).toBeGreaterThanOrEqual(4);

@@ -398,6 +398,7 @@ test("the action kind renders as a status glyph with an accessible label, not a 
 
 test("backend identifiers collapse into a details section and the citation carries the DOI link", async () => {
   const item = manualAction("action:manual", 1, "Manual action");
+
   item.facts = [
     { label: "Action", text: "manual download" },
     { label: "Authors", text: "Yann LeCun, Yoshua Bengio, Geoffrey Hinton" },
@@ -448,6 +449,24 @@ test("backend identifiers collapse into a details section and the citation carri
   expect(page.document.querySelector("[data-triage-item-id='action:manual'] .item-citation")?.textContent).toBe(
     "LeCun, Yann, et al. 2015, doi.org/10.1038/nature14539.",
   );
+});
+
+test("renders access hints only when the daemon classifies a human action", async () => {
+  const openAccess = manualAction("action:open-access", 1, "Open access action");
+  openAccess.requires_auth = false;
+  const institutional = manualAction("action:institutional", 2, "Institutional action");
+  institutional.requires_auth = true;
+  const legacy = manualAction("action:legacy", 3, "Legacy action");
+  const fixture = snapshot([openAccess, institutional, legacy], {
+    counts: counts({ pending_total: 3, actions: 3, watch_hits: 0, retractions: 0 }),
+  });
+  const page = await inboxDocument((message) => snapshotReply(fixture, message));
+
+  expect(page.document.querySelector("[data-triage-item-id='action:open-access'] .access-hint")?.textContent)
+    .toBe("open access — no login needed");
+  expect(page.document.querySelector("[data-triage-item-id='action:institutional'] .access-hint")?.textContent)
+    .toBe("sign in to your institution first");
+  expect(page.document.querySelector("[data-triage-item-id='action:legacy'] .access-hint")).toBeNull();
 });
 
 test("an author suffix duplicated in the title is stripped for display", async () => {

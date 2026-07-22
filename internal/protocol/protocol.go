@@ -601,13 +601,15 @@ type TriageSnapshotItem struct {
 	Watches     []TriageWatch `json:"watches,omitempty"`
 	FirstSeenAt string        `json:"first_seen_at,omitempty"`
 
-	ActionID   int64  `json:"action_id,omitempty"`
-	JobID      string `json:"job_id,omitempty"`
-	ActionKind string `json:"action_kind,omitempty"`
-	JobState   string `json:"job_state,omitempty"`
-	Revision   int64  `json:"revision,omitempty"`
-	SHA256     string `json:"sha256,omitempty"`
-	SizeBytes  int64  `json:"size_bytes,omitempty"`
+	ActionID     int64  `json:"action_id,omitempty"`
+	JobID        string `json:"job_id,omitempty"`
+	ActionKind   string `json:"action_kind,omitempty"`
+	JobState     string `json:"job_state,omitempty"`
+	Revision     int64  `json:"revision,omitempty"`
+	SHA256       string `json:"sha256,omitempty"`
+	SizeBytes    int64  `json:"size_bytes,omitempty"`
+	RequiresAuth *bool  `json:"requires_auth,omitempty"`
+	BlockedBy    string `json:"blocked_by,omitempty"`
 
 	DOI       string `json:"doi,omitempty"`
 	Nature    string `json:"nature,omitempty"`
@@ -1301,13 +1303,15 @@ func (item *TriageSnapshotItem) UnmarshalJSON(data []byte) error {
 		Watches     []TriageWatch `json:"watches"`
 		FirstSeenAt string        `json:"first_seen_at"`
 
-		ActionID   int64  `json:"action_id"`
-		JobID      string `json:"job_id"`
-		ActionKind string `json:"action_kind"`
-		JobState   string `json:"job_state"`
-		Revision   int64  `json:"revision"`
-		SHA256     string `json:"sha256"`
-		SizeBytes  int64  `json:"size_bytes"`
+		ActionID     int64  `json:"action_id"`
+		JobID        string `json:"job_id"`
+		ActionKind   string `json:"action_kind"`
+		JobState     string `json:"job_state"`
+		Revision     int64  `json:"revision"`
+		SHA256       string `json:"sha256"`
+		SizeBytes    int64  `json:"size_bytes"`
+		RequiresAuth *bool  `json:"requires_auth"`
+		BlockedBy    string `json:"blocked_by"`
 
 		DOI       string `json:"doi"`
 		Nature    string `json:"nature"`
@@ -1326,9 +1330,18 @@ func (item *TriageSnapshotItem) UnmarshalJSON(data []byte) error {
 			return err
 		}
 	case "human_action":
-		allowed = append(allowed, "action_id", "job_id", "action_kind", "job_state", "revision", "sha256", "size_bytes")
+		allowed = append(allowed, "action_id", "job_id", "action_kind", "job_state", "revision", "sha256", "size_bytes",
+			"requires_auth", "blocked_by")
 		if err := browserRequireFields(fields, append(core, "action_id", "job_id", "action_kind", "job_state", "revision", "sha256", "size_bytes")...); err != nil {
 			return err
+		}
+		if err := browserRejectNullFields(fields, "requires_auth", "blocked_by"); err != nil {
+			return err
+		}
+		if _, ok := fields["blocked_by"]; ok {
+			if err := enumRequired("human_action.blocked_by", wire.BlockedBy, "anti_bot", "paywall", "landing_page"); err != nil {
+				return err
+			}
 		}
 	case "retraction":
 		allowed = append(allowed, "doi", "nature", "noticed_at", "notice_doi")
@@ -1352,6 +1365,7 @@ func (item *TriageSnapshotItem) UnmarshalJSON(data []byte) error {
 		Work: wire.Work, Abstract: wire.Abstract, Watches: wire.Watches, FirstSeenAt: wire.FirstSeenAt,
 		ActionID: wire.ActionID, JobID: wire.JobID, ActionKind: wire.ActionKind, JobState: wire.JobState,
 		Revision: wire.Revision, SHA256: wire.SHA256, SizeBytes: wire.SizeBytes,
+		RequiresAuth: wire.RequiresAuth, BlockedBy: wire.BlockedBy,
 		DOI: wire.DOI, Nature: wire.Nature, NoticedAt: wire.NoticedAt, NoticeDOI: wire.NoticeDOI,
 	}
 	return item.validate()
@@ -1370,6 +1384,12 @@ func (item TriageSnapshotItem) MarshalJSON() ([]byte, error) {
 		core["action_id"], core["job_id"], core["action_kind"], core["job_state"] =
 			item.ActionID, item.JobID, item.ActionKind, item.JobState
 		core["revision"], core["sha256"], core["size_bytes"] = item.Revision, item.SHA256, item.SizeBytes
+		if item.RequiresAuth != nil {
+			core["requires_auth"] = *item.RequiresAuth
+		}
+		if item.BlockedBy != "" {
+			core["blocked_by"] = item.BlockedBy
+		}
 	case "retraction":
 		core["doi"], core["nature"], core["noticed_at"] = item.DOI, item.Nature, item.NoticedAt
 		if item.NoticeDOI != "" {
@@ -1484,6 +1504,11 @@ func (item TriageSnapshotItem) validate() error {
 		}
 		if item.SizeBytes < 0 || item.SizeBytes > MaxBrowserInteger {
 			return fmt.Errorf("human_action.size_bytes must be in range 0..%d", MaxBrowserInteger)
+		}
+		if item.BlockedBy != "" {
+			if err := enumRequired("human_action.blocked_by", item.BlockedBy, "anti_bot", "paywall", "landing_page"); err != nil {
+				return err
+			}
 		}
 	case "retraction":
 		if err := validateTriageText("retraction.doi", item.DOI, 300); err != nil || item.DOI == "" {

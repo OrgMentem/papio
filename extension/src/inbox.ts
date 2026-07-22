@@ -522,6 +522,18 @@ function statusMeta(item: TriageSnapshotItem): { key: string; glyph: string; lab
   return { key: "unknown", glyph: "•", label: key.replaceAll("_", " ") };
 }
 
+// Access classification is optional so snapshots from older daemons retain
+// their existing presentation. Newer daemon snapshots distinguish an action
+// that merely needs opening from one that first needs institutional sign-in.
+function accessHint(item: TriageSnapshotItem): HTMLElement | null {
+  if (item.kind !== "human_action" || item.requires_auth === undefined) return null;
+  const hint = element("p", item.requires_auth
+    ? "sign in to your institution first"
+    : "open access — no login needed");
+  hint.className = "access-hint";
+  return hint;
+}
+
 // Backend identifiers remain out of the ordinary triage flow. Their compact
 // disclosure sits beside the action/status text and preserves native button
 // keyboard semantics and state.
@@ -597,6 +609,8 @@ function renderItem(item: TriageSnapshotItem): HTMLElement {
 
   const citation = renderCitation(item, title.placeholder ? title.text : null);
   if (citation !== null) body.append(citation);
+  const hint = accessHint(item);
+  if (hint !== null) body.append(hint);
 
   const leftovers = item.facts.filter((fact) => KNOWN_FACT_LABELS[fact.label] !== true);
   if (leftovers.length > 0) {

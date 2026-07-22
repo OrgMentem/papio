@@ -164,6 +164,14 @@ func TestHumanActionItemsCarryWorkIdentityAndCorrectOps(t *testing.T) {
 	if _, err := jobs.OpenHumanAction(ctx, manual, "manual_download", "a resolver returned a landing page"); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := jobs.S.DB().ExecContext(ctx,
+		`UPDATE human_actions SET requires_auth = 1, blocked_by = 'paywall' WHERE job_id = ?`, bound); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := jobs.S.DB().ExecContext(ctx,
+		`UPDATE human_actions SET requires_auth = 0, blocked_by = 'landing_page' WHERE job_id = ?`, manual); err != nil {
+		t.Fatal(err)
+	}
 
 	snapshot, err := service.Snapshot(ctx, SnapshotRequest{Limit: 100})
 	if err != nil {
@@ -180,6 +188,10 @@ func TestHumanActionItemsCarryWorkIdentityAndCorrectOps(t *testing.T) {
 	}
 
 	boundItem := byJob[bound]
+	if boundItem.HumanAction.RequiresAuth == nil || !*boundItem.HumanAction.RequiresAuth || boundItem.HumanAction.BlockedBy != "paywall" {
+		t.Fatalf("bound item access = requires_auth %v, blocked_by %q, want true/paywall",
+			boundItem.HumanAction.RequiresAuth, boundItem.HumanAction.BlockedBy)
+	}
 	if boundItem.Title != "Review work" {
 		t.Fatalf("bound item title = %q, want the paper title", boundItem.Title)
 	}
@@ -211,6 +223,10 @@ func TestHumanActionItemsCarryWorkIdentityAndCorrectOps(t *testing.T) {
 	}
 
 	manualItem := byJob[manual]
+	if manualItem.HumanAction.RequiresAuth == nil || *manualItem.HumanAction.RequiresAuth || manualItem.HumanAction.BlockedBy != "landing_page" {
+		t.Fatalf("manual item access = requires_auth %v, blocked_by %q, want false/landing_page",
+			manualItem.HumanAction.RequiresAuth, manualItem.HumanAction.BlockedBy)
+	}
 	if manualItem.Title != "Manual download work" {
 		t.Fatalf("manual item title = %q, want the paper title", manualItem.Title)
 	}

@@ -648,6 +648,7 @@ func triageSnapshotPayload(requestID string, snapshot triage.Snapshot) protocol.
 				payload.ActionID, payload.JobID = action.ActionID, action.JobID
 				payload.ActionKind, payload.JobState = action.ActionKind, action.JobState
 				payload.Revision, payload.SHA256, payload.SizeBytes = action.Revision, action.SHA256, action.SizeBytes
+				payload.RequiresAuth, payload.BlockedBy = action.RequiresAuth, action.BlockedBy
 			}
 		case triage.KindRetraction:
 			retraction := item.Retraction

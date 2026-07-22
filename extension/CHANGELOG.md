@@ -27,6 +27,7 @@ for the full pre-split extension history.
 - `job_offer` now carries `requires_auth`, so the extension can distinguish
   "open access — just render it" handoffs from ones needing an institutional
   sign-in (groundwork for surfacing this in the popup).
+- **Inbox access guidance**: triage actions now say “open access — no login needed” or “sign in to your institution first” when the daemon has classified their access requirements.
 - **Citation-style rendering in the inbox**: each item now shows a
   reference-style line (authors, year, hyperlinked DOI) in a user-selected
   citation style — APA, MLA, or Chicago — persisted across visits. The DOI

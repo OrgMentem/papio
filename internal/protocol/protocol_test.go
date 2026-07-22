@@ -464,3 +464,24 @@ func TestTriageFixturePayloadRoundTrips(t *testing.T) {
 		})
 	}
 }
+
+func TestTriageSnapshotRejectsUnknownBlockedBy(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join(corpusDir(t, "valid"), "browser-triage-snapshot-response.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var frame map[string]any
+	if err := json.Unmarshal(data, &frame); err != nil {
+		t.Fatal(err)
+	}
+	payload := frame["payload"].(map[string]any)
+	items := payload["items"].([]any)
+	items[1].(map[string]any)["blocked_by"] = "captcha"
+	mutated, err := json.Marshal(frame)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := DecodeBrowserMessage(mutated); err == nil || !strings.Contains(err.Error(), "blocked_by") {
+		t.Fatalf("unknown blocked_by err = %v, want rejection", err)
+	}
+}

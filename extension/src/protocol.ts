@@ -192,6 +192,8 @@ export interface TriageSnapshotItem {
   revision?: number;
   sha256?: string;
   size_bytes?: number;
+  requires_auth?: boolean;
+  blocked_by?: "anti_bot" | "paywall" | "landing_page";
   doi?: string;
   nature?: "retraction" | "correction" | "concern";
   noticed_at?: string;
@@ -444,7 +446,9 @@ function triageItem(raw: unknown): void {
     default:
       fail(`unsupported triage item kind ${JSON.stringify(kind)}`);
   }
-  const optional = kind === "retraction" ? ["notice_doi"] : [];
+  const optional = kind === "human_action"
+    ? ["requires_auth", "blocked_by"]
+    : kind === "retraction" ? ["notice_doi"] : [];
   requireKeys(item, `triage item ${kind}`, [...core, ...extra], optional);
   if (triageText(item, "id", `triage item ${kind}`, 1024) === "") fail("triage item.id is required");
   int(item, "rank", `triage item ${kind}`, 0);
@@ -506,6 +510,15 @@ function triageItem(raw: unknown): void {
     const sha = triageText(item, "sha256", "human_action", 64);
     if (sha !== "" && !/^[a-f0-9]{64}$/.test(sha)) fail("human_action.sha256 must be lowercase SHA-256");
     int(item, "size_bytes", "human_action", 0);
+    if ("requires_auth" in item && typeof item["requires_auth"] !== "boolean") {
+      fail("human_action.requires_auth must be a boolean");
+    }
+    if ("blocked_by" in item) {
+      const blockedBy = triageText(item, "blocked_by", "human_action", 50);
+      if (!["anti_bot", "paywall", "landing_page"].includes(blockedBy)) {
+        fail("human_action.blocked_by is invalid");
+      }
+    }
   } else {
     if (triageText(item, "doi", "retraction", 300) === "") fail("retraction.doi is required");
     const nature = triageText(item, "nature", "retraction", 50);
