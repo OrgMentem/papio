@@ -417,10 +417,22 @@ test("backend identifiers collapse into a details section and the citation carri
   expect(citation?.textContent).toBe("LeCun, Y., Bengio, Y., & Hinton, G. (2015). https://doi.org/10.1038/nature14539");
   expect(citation?.querySelector("a")?.href).toBe("https://doi.org/10.1038/nature14539");
 
-  // The job id lives only inside the collapsed backend-details section.
-  const debug = row?.querySelector(".item-debug");
-  expect(debug?.querySelector("summary")?.getAttribute("aria-label")).toBe("Backend details");
-  expect(debug?.textContent).toContain("job-18");
+  // The backend strip is hidden by default, toggles from the title line, and
+  // exposes item/job/revision as three peer columns when requested.
+  const debug = row?.querySelector<HTMLDListElement>(".item-debug");
+  const debugToggle = row?.querySelector<HTMLButtonElement>(".item-heading .item-debug-toggle");
+  expect(debugToggle?.getAttribute("aria-label")).toBe("Backend details");
+  expect(debugToggle?.getAttribute("aria-expanded")).toBe("false");
+  expect(debug?.hidden).toBe(true);
+  debugToggle?.click();
+  expect(debugToggle?.getAttribute("aria-expanded")).toBe("true");
+  expect(debug?.hidden).toBe(false);
+  const debugFields = debug === null || debug === undefined ? [] : Array.from(debug.querySelectorAll(".item-debug-field"));
+  expect(debugFields.map((field) => field.textContent)).toEqual([
+    "itemaction:manual",
+    "jobjob-18",
+    "revision1",
+  ]);
   expect(row?.querySelector(".item-facts")).toBeNull();
 
   // Detail renders as unlabeled prose.

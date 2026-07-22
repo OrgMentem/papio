@@ -38,9 +38,10 @@ for the full pre-split extension history.
   its meaning instantly (no native-tooltip delay), and the footer legend
   spells out all five. The footer (legend + keyboard help) sticks to the
   viewport bottom, so both stay visible without scrolling.
-- **Collapsible backend details per inbox row**: item id, job id, and
-  revision move out of the visible row into a collapsed section behind a
-  quiet "⋯" chip (meaning on hover; "Backend details" to screen readers).
+- **Collapsible backend details per inbox row**: a quiet "⋯" chip at the end
+  of the title line reveals item id, job id, and revision as three compact
+  columns. Its meaning remains available on hover and as "Backend details" to
+  screen readers.
 
 ### Changed
 

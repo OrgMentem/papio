@@ -522,25 +522,42 @@ function statusMeta(item: TriageSnapshotItem): { key: string; glyph: string; lab
   return { key: "unknown", glyph: "•", label: key.replaceAll("_", " ") };
 }
 
-// Backend identifiers matter for debugging, not triage: they live in a
-// collapsed <details> so the row stays about the paper.
-function renderDebug(item: TriageSnapshotItem): HTMLElement {
+// Backend identifiers remain out of the ordinary triage flow. A compact
+// button lives beside the title; its three-column strip is revealed only on
+// demand, preserving native button keyboard semantics and state.
+function renderDebug(item: TriageSnapshotItem): { toggle: HTMLButtonElement; list: HTMLDListElement } {
   const rows: Array<[string, string]> = [["item", item.id]];
   const job = factText(item, "Job");
   if (job !== null) rows.push(["job", job]);
   if (item.kind === "human_action" && typeof item.revision === "number") {
     rows.push(["revision", String(item.revision)]);
   }
-  const debug = element("details");
-  debug.className = "item-debug";
-  const summary = element("summary", "⋯");
-  summary.dataset.label = "Backend details";
-  summary.setAttribute("aria-label", "Backend details");
-  debug.append(summary);
   const list = element("dl");
-  for (const [label, value] of rows) list.append(element("dt", label), element("dd", value));
-  debug.append(list);
-  return debug;
+  list.className = "item-debug";
+  list.hidden = true;
+  list.id = `backend-details-${item.id}`;
+  for (const [label, value] of rows) {
+    const field = element("div");
+    field.className = "item-debug-field";
+    const valueElement = element("dd", value);
+    valueElement.title = value;
+    field.append(element("dt", label), valueElement);
+    list.append(field);
+  }
+
+  const toggle = element("button", "⋯");
+  toggle.className = "item-debug-toggle";
+  toggle.type = "button";
+  toggle.dataset.label = "Backend details";
+  toggle.setAttribute("aria-controls", list.id);
+  toggle.setAttribute("aria-expanded", "false");
+  toggle.setAttribute("aria-label", "Backend details");
+  toggle.addEventListener("click", () => {
+    const expanded = toggle.getAttribute("aria-expanded") === "true";
+    toggle.setAttribute("aria-expanded", String(!expanded));
+    list.hidden = expanded;
+  });
+  return { toggle, list };
 }
 
 function renderItem(item: TriageSnapshotItem): HTMLElement {
@@ -566,9 +583,13 @@ function renderItem(item: TriageSnapshotItem): HTMLElement {
   body.className = "item-body";
   card.append(body);
 
-  const heading = element("h3", title.text);
-  if (title.placeholder) heading.classList.add("title-placeholder");
-  body.append(heading);
+  const heading = element("div");
+  heading.className = "item-heading";
+  const headingText = element("h3", title.text);
+  if (title.placeholder) headingText.classList.add("title-placeholder");
+  const debug = renderDebug(item);
+  heading.append(headingText, debug.toggle);
+  body.append(heading, debug.list);
 
   const citation = renderCitation(item, title.placeholder ? title.text : null);
   if (citation !== null) body.append(citation);
@@ -597,7 +618,7 @@ function renderItem(item: TriageSnapshotItem): HTMLElement {
     body.append(paragraph);
   }
 
-  body.append(renderDebug(item));
+  // Debug details are positioned directly below the title when opened.
 
   const entry = state.itemMessages.get(item.id);
   if (entry !== undefined) {

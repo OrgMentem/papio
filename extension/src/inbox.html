@@ -537,7 +537,7 @@
          backend-details disclosure): the meaning appears on hover without
          the native title delay. Screen readers get aria-label instead. */
       .triage-item .item-status::after,
-      .triage-item .item-debug summary::after {
+      .triage-item .item-debug-toggle::after {
         background: var(--color-ink);
         border-radius: var(--radius-control);
         color: var(--color-page);
@@ -556,8 +556,9 @@
       }
 
       .triage-item .item-status:hover::after,
-      .triage-item .item-debug summary:hover::after {
-        opacity: 1;
+      .triage-item .item-status:focus-visible::after,
+      .triage-item .item-debug-toggle:hover::after,
+      .triage-item .item-debug-toggle:focus-visible::after {
       }
 
       .item-status[data-status="manual_download"] {
@@ -598,50 +599,59 @@
         overflow-wrap: anywhere;
       }
 
-      /* Backend identifiers matter for debugging, not triage: collapsed by
-         default so the row stays about the paper. */
-      .item-debug {
-        color: var(--color-muted);
-        font-size: var(--font-size-label);
+      /* Backend identifiers remain available without taking a visible row:
+         the trailing dots open a compact three-column debugging strip. */
+      .item-heading {
+        align-items: start;
+        display: flex;
+        gap: var(--space-2);
+        min-width: 0;
       }
 
-      /* Icon-only disclosure: a quiet "⋯" chip; the label lives in the
-         tooltip and accessible name. */
-      .item-debug summary {
+      .item-heading h3 {
+        flex: 1 1 auto;
+      }
+
+      .item-debug-toggle {
         align-items: center;
+        background: transparent;
         border: 1px solid transparent;
         border-radius: var(--radius-pill);
+        color: var(--color-muted);
         cursor: pointer;
         display: inline-flex;
+        flex: none;
+        font: inherit;
         font-weight: 700;
         height: 18px;
         justify-content: center;
         line-height: 1;
-        list-style: none;
+        padding: 0;
         position: relative;
         width: 26px;
       }
 
-      .item-debug summary::-webkit-details-marker {
-        display: none;
-      }
-
-      .item-debug summary:hover {
+      .item-debug-toggle:hover,
+      .item-debug-toggle[aria-expanded="true"] {
         background: var(--color-surface-hover);
         border-color: var(--color-control-border);
       }
 
-      .item-debug[open] summary {
-        background: var(--color-surface-hover);
-        border-color: var(--color-control-border);
+      .item-debug-toggle[aria-expanded="true"] {
         color: var(--color-context);
       }
 
-      .item-debug dl {
+      .item-debug {
+        color: var(--color-muted);
         display: grid;
-        gap: var(--space-1) var(--space-2);
-        grid-template-columns: auto 1fr;
-        margin: var(--space-1) 0 0;
+        font-size: var(--font-size-label);
+        gap: var(--space-2);
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        margin: 0;
+      }
+
+      .item-debug-field {
+        min-width: 0;
       }
 
       .item-debug dt {
@@ -653,7 +663,9 @@
       .item-debug dd {
         font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
         margin: 0;
-        overflow-wrap: anywhere;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
       }
 
       /* Long filesystem paths (quarantine files) collapse to one ellipsized
