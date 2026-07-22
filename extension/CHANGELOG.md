@@ -39,9 +39,9 @@ for the full pre-split extension history.
   spells out all five. The footer (legend + keyboard help) sticks to the
   viewport bottom, so both stay visible without scrolling.
 - **Collapsible backend details per inbox row**: a quiet "⋯" chip at the end
-  of the title line reveals item id, job id, and revision as three compact
-  columns. Its meaning remains available on hover and as "Backend details" to
-  screen readers.
+  of the actionable status line reveals item id, job id, and revision as
+  three compact columns. Its meaning remains available on hover and as
+  "Backend details" to screen readers.
 
 ### Changed
 

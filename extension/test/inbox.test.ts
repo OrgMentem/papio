@@ -190,7 +190,7 @@ test("renders rank-ordered bands, label:text facts, and only safe HTTPS links", 
     "Human actions (2)",
     "Watch hits (1)",
   ]);
-  expect(Array.from(page.document.querySelectorAll(".triage-item h3"), (heading) => heading.textContent)).toEqual([
+  expect(Array.from(page.document.querySelectorAll(".triage-item h3"), (heading) => heading.firstChild?.textContent)).toEqual([
     "Retraction notice",
     "Manual action",
     "Verified PDF title",
@@ -417,10 +417,10 @@ test("backend identifiers collapse into a details section and the citation carri
   expect(citation?.textContent).toBe("LeCun, Y., Bengio, Y., & Hinton, G. (2015). https://doi.org/10.1038/nature14539");
   expect(citation?.querySelector("a")?.href).toBe("https://doi.org/10.1038/nature14539");
 
-  // The backend strip is hidden by default, toggles from the title line, and
-  // exposes item/job/revision as three peer columns when requested.
+  // The backend strip is hidden by default; its trigger trails the actionable
+  // detail text and exposes item/job/revision as three peer columns.
   const debug = row?.querySelector<HTMLDListElement>(".item-debug");
-  const debugToggle = row?.querySelector<HTMLButtonElement>(".item-heading .item-debug-toggle");
+  const debugToggle = row?.querySelector<HTMLButtonElement>(".item-detail .item-debug-toggle");
   expect(debugToggle?.getAttribute("aria-label")).toBe("Backend details");
   expect(debugToggle?.getAttribute("aria-expanded")).toBe("false");
   expect(debug?.hidden).toBe(true);
@@ -433,10 +433,11 @@ test("backend identifiers collapse into a details section and the citation carri
     "jobjob-18",
     "revision1",
   ]);
+  expect(row?.querySelector(".item-debug")?.previousElementSibling).toBe(row?.querySelector(".item-detail"));
   expect(row?.querySelector(".item-facts")).toBeNull();
 
-  // Detail renders as unlabeled prose.
-  expect(row?.querySelector(".item-detail")?.textContent).toBe("a resolver returned a landing page but no verified direct PDF");
+  // Detail remains unlabeled prose; the dots are a trailing affordance.
+  expect(row?.querySelector(".item-detail")?.textContent?.startsWith("a resolver returned a landing page but no verified direct PDF")).toBe(true);
 
   // Switching the style re-renders the citation in MLA.
   const select = page.document.getElementById("citation-style") as HTMLSelectElement;

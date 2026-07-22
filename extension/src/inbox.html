@@ -382,30 +382,6 @@
         text-transform: uppercase;
       }
 
-      .triage-group > h2 {
-        align-items: center;
-        display: flex;
-        gap: var(--space-3);
-      }
-
-      .triage-group > h2::after {
-        background: var(--kind-accent, var(--color-border));
-        content: "";
-        flex: 1;
-        height: 1px;
-        opacity: 0.7;
-      }
-
-      .triage-group-retraction {
-        --kind-accent: var(--color-danger-border);
-      }
-
-      .triage-group-human_action {
-        --kind-accent: var(--color-primary-border);
-      }
-
-      .triage-group-watch_hit {
-        --kind-accent: var(--color-control-border);
       }
 
       .triage-group-retraction > h2 {
@@ -599,18 +575,8 @@
         overflow-wrap: anywhere;
       }
 
-      /* Backend identifiers remain available without taking a visible row:
-         the trailing dots open a compact three-column debugging strip. */
-      .item-heading {
-        align-items: start;
-        display: flex;
-        gap: var(--space-2);
-        min-width: 0;
-      }
-
-      .item-heading h3 {
-        flex: 1 1 auto;
-      }
+      /* Backend identifiers remain available without adding another visual
+         line: their dots button follows the actionable status text. */
 
       .item-debug-toggle {
         align-items: center;
@@ -626,7 +592,8 @@
         height: 18px;
         justify-content: center;
         line-height: 1;
-        padding: 0;
+        margin-inline-start: var(--space-1);
+        vertical-align: text-bottom;
         position: relative;
         width: 26px;
       }

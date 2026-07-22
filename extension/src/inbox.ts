@@ -583,13 +583,10 @@ function renderItem(item: TriageSnapshotItem): HTMLElement {
   body.className = "item-body";
   card.append(body);
 
-  const heading = element("div");
-  heading.className = "item-heading";
   const headingText = element("h3", title.text);
   if (title.placeholder) headingText.classList.add("title-placeholder");
   const debug = renderDebug(item);
-  heading.append(headingText, debug.toggle);
-  body.append(heading, debug.list);
+  body.append(headingText);
 
   const citation = renderCitation(item, title.placeholder ? title.text : null);
   if (citation !== null) body.append(citation);
@@ -615,10 +612,16 @@ function renderItem(item: TriageSnapshotItem): HTMLElement {
     const paragraph = element("p");
     paragraph.className = "item-detail";
     appendFactText(paragraph, detail);
+    paragraph.append(debug.toggle);
     body.append(paragraph);
+  } else if (citation !== null) {
+    // Non-action items have no instruction line; keep the disclosure at the
+    // end of their metadata rather than creating a standalone controls row.
+    citation.append(debug.toggle);
+  } else {
+    headingText.append(debug.toggle);
   }
-
-  // Debug details are positioned directly below the title when opened.
+  body.append(debug.list);
 
   const entry = state.itemMessages.get(item.id);
   if (entry !== undefined) {
