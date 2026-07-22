@@ -4,6 +4,7 @@ package cli
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -19,6 +20,7 @@ import (
 	"papio/internal/api"
 	"papio/internal/batch"
 	"papio/internal/errcat"
+	"papio/internal/ingest"
 	"papio/internal/job"
 	"papio/internal/protocol"
 	"papio/internal/work"
@@ -50,7 +52,7 @@ func newAcquireCommand(opt *options) *cobra.Command {
 			autoImportOverride := boolOverride(cmd, "auto-import", autoImport)
 			if cmd.Flags().Changed("batch") {
 				if batchPath == "" {
-					return fmt.Errorf("--batch requires a JSONL file path or - for standard input")
+					return fmt.Errorf("--batch requires a file path (JSONL, RIS, BibTeX, CSL-JSON, or NBIB) or - for standard input")
 				}
 				if err := validateBatchFlags(cmd, args, fromZotio, wait); err != nil {
 					return err
@@ -201,7 +203,7 @@ func newAcquireCommand(opt *options) *cobra.Command {
 	flags.IntVar(&queueLimit, "limit", 25, "maximum zotio items to queue")
 	flags.Int64Var(&fromDigest, "from-digest", 0, "queue pending entries from an alert watch")
 	flags.StringArrayVar(&digestKeys, "keys", nil, "digest work key to queue (repeatable)")
-	flags.StringVar(&batchPath, "batch", "", "submit JSONL works from a file or - for standard input")
+	flags.StringVar(&batchPath, "batch", "", "submit works from a JSONL, RIS, BibTeX, CSL-JSON, or MEDLINE/NBIB file (or - for standard input)")
 	flags.BoolVar(&includeOwned, "include-owned", false, "with --batch, submit works already carrying a PDF in zotio")
 	flags.StringVar(&label, "label", "", "query context; also the default target collection when --collection is unset")
 	flags.BoolVar(&autoImport, "auto-import", false, "plan and apply zotio import automatically when ready")
@@ -365,6 +367,31 @@ func parseBatch(r io.Reader) ([]protocol.WorkRequest, error) {
 	return requests, nil
 }
 
+func parseBatchInput(path string, reader io.Reader) ([]protocol.WorkRequest, error) {
+	data, err := io.ReadAll(io.LimitReader(reader, 8<<20+1))
+	if err != nil {
+		return nil, fmt.Errorf("reading batch: %w", err)
+	}
+	if len(data) > 8<<20 {
+		return nil, fmt.Errorf("batch input exceeds 8 MiB")
+	}
+	format := ingest.Detect(path, data)
+	if format == ingest.FormatJSONL {
+		return parseBatch(bytes.NewReader(data))
+	}
+	requests, err := ingest.Parse(format, data)
+	if err != nil {
+		return nil, err
+	}
+	if len(requests) > 50 {
+		return nil, fmt.Errorf("batch exceeds maximum of 50 works")
+	}
+	if len(requests) == 0 {
+		return nil, fmt.Errorf("batch contains no works")
+	}
+	return requests, nil
+}
+
 func parseBatchWork(data json.RawMessage) (protocol.WorkRequest, error) {
 	return batch.ParseWork(data)
 }
@@ -401,7 +428,7 @@ func acquireBatch(ctx context.Context, cmd *cobra.Command, opt *options, path st
 		defer file.Close()
 		reader = file
 	}
-	requests, err := parseBatch(reader)
+	requests, err := parseBatchInput(path, reader)
 	if err != nil {
 		return err
 	}

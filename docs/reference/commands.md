@@ -26,7 +26,7 @@ papio acquire [identifier] [flags]
 | `--arxiv` | `string` |  | arXiv ID |
 | `--author` | `stringSlice` | `[]` | author (repeatable) |
 | `--auto-import` | `bool` | `false` | plan and apply zotio import automatically when ready |
-| `--batch` | `string` |  | submit JSONL works from a file or - for standard input |
+| `--batch` | `string` |  | submit works from a JSONL, RIS, BibTeX, CSL-JSON, or MEDLINE/NBIB file (or - for standard input) |
 | `--collection` | `string` |  | target Zotero collection name (key when used with --from-zotio) |
 | `--deny-source` | `stringSlice` | `[]` | deny this source (repeatable) |
 | `--desired-version` | `string` | `any` | published, accepted, preprint, or any |

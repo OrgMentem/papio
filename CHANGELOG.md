@@ -22,9 +22,12 @@ execution records in `notes/acquisition-stack-plan.md`.
 - **`papio init` defaults the Chrome extension ID to the Chrome Web Store
   package** (`npccengdhjmpojpjmjoeeclpdhcjelhf`) — a store install needs no ID
   copying; only unpacked development builds still paste theirs.
-- Triage snapshots now expose whether a human action needs institutional
-  sign-in or has open access, so browser inboxes can show the same access
-  guidance as `papio actions list`.
+- Triage snapshot schema 2 exposes institutional sign-in/open-access guidance
+  only for actions classified by the acquisition waterfall; schema 1 remains
+  available unchanged for older browser extensions.
+- **Standard bibliographic ingestion for `acquire --batch`**: RIS, BibTeX,
+  CSL-JSON, and MEDLINE/NBIB use one robust interchange pipeline for reference
+  managers, database exports, and systematic-review tools.
 
 ### Changed
 

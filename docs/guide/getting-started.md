@@ -173,6 +173,13 @@ Queue one DOI and wait for its job to settle:
 papio acquire <doi> --wait
 ```
 
+*papio* also ingests standard bibliographic batches—RIS, BibTeX, CSL-JSON, and
+MEDLINE/NBIB—through `acquire --batch`:
+
+```sh
+papio acquire --batch refs.ris --label "thesis background"
+```
+
 Next, choose an [access mode](../concepts/access-modes.md), follow the
 [User guide](user-guide.md) for discovery and browser handoffs, or review every
 setting in the [configuration reference](../reference/config-reference.md).

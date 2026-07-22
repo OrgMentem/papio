@@ -75,14 +75,26 @@ OpenAlex-related papers.
 
 ## 3. Acquire the selected works as a batch
 
-Give `acquire --batch` a JSONL file of work records (or `-` for standard input).
-A batch holds up to 50 works, each with a stable ID, so running the same file
-again is safe and won't create duplicates.
+Give `acquire --batch` a JSONL file of work records, or a RIS (`.ris`), BibTeX
+(`.bib` or `.bibtex`), CSL-JSON (a `.json` file whose top level is an array), or
+MEDLINE/NBIB (`.nbib`) file. *papio* detects file formats by extension and
+content-sniffs standard input (`-`). A batch holds up to 50 works; identifier
+normalization and deduplication are identical for every format, so running the
+same file again is safe and will not create duplicates.
 
 ```sh
 papio acquire --batch works.jsonl --auto-import \
   --collection "AI reading" --label "appropriate-reliance"
 ```
+
+For example, export a reference list from Zotero, Rayyan, or Covidence as RIS:
+
+```sh
+papio acquire --batch refs.ris --label "thesis background"
+```
+
+Each record needs an identifier (DOI, PMID, arXiv, ISBN, OpenAlex) or a
+complete title/authors/year tuple — the same identity rule as JSONL input.
 
 `--auto-import` asks *papio* to plan and apply the zotio import after a job becomes
 ready. It is non-fatal to acquisition: an import error remains visible in the
