@@ -198,7 +198,7 @@ func TestHelloAckAnnouncesDaemonVersion(t *testing.T) {
 		t.Fatalf("daemon_version = %q, want 0.1.0-test", payload.DaemonVersion)
 	}
 	if !slices.Equal(payload.Features, []string{
-		"browser_handoff", pageAcquireFeature, triageSnapshotFeature, triageMutationsFeature, reviewPreviewFeature,
+		"browser_handoff", pageAcquireFeature, triageSnapshotFeature, triageSnapshotSchema2Feature, triageMutationsFeature, reviewPreviewFeature,
 	}) {
 		t.Fatalf("features = %v, want required bridge feature set", payload.Features)
 	}
@@ -218,8 +218,8 @@ func TestHelloAckFeatureCapReservesMandatoryFeatures(t *testing.T) {
 		t.Fatalf("no hello_ack in %v", msgs)
 	}
 	got := ack.Payload.(*protocol.HelloAckPayload).Features
-	want := append(append([]string(nil), features[:28]...),
-		pageAcquireFeature, triageSnapshotFeature, triageMutationsFeature, reviewPreviewFeature)
+	want := append(append([]string(nil), features[:27]...),
+		pageAcquireFeature, triageSnapshotFeature, triageSnapshotSchema2Feature, triageMutationsFeature, reviewPreviewFeature)
 	if !slices.Equal(got, want) {
 		t.Fatalf("features = %v, want %v", got, want)
 	}
@@ -276,6 +276,82 @@ func TestTriageSnapshotReducesMaximalPageToFrameCap(t *testing.T) {
 		return
 	}
 	t.Fatal("triage snapshot response missing")
+}
+
+func TestTriageSnapshotNegotiatesSchema2AccessClassification(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	id := park(t, jobs, "wr_snapshot_schema", handoffWork())
+	if _, err := jobs.S.DB().ExecContext(context.Background(),
+		`UPDATE human_actions SET requires_auth = 1, blocked_by = 'paywall' WHERE job_id = ?`, id); err != nil {
+		t.Fatal(err)
+	}
+	runSync(t, b, hello())
+
+	schema1, schema1Raw := runSync(t, b, inFrame(t, protocol.MsgTriageSnapshotRequest, "",
+		protocol.TriageSnapshotRequestPayload{RequestID: "request-schema1-001", SchemaVersions: []int64{1}}))
+	response := firstOfType(schema1, protocol.MsgTriageSnapshotResponse)
+	if response == nil {
+		t.Fatal("schema-1 snapshot response missing")
+	}
+	legacy := response.Payload.(*protocol.TriageSnapshotResponsePayload)
+	if legacy.Schema != 1 || len(legacy.Items) != 1 || legacy.Items[0].RequiresAuth != nil || legacy.Items[0].BlockedBy != "" {
+		t.Fatalf("schema-1 locked action shape = %+v", legacy)
+	}
+	assertLockedSchema1Snapshot(t, schema1Raw)
+
+	schema2, _ := runSync(t, b, inFrame(t, protocol.MsgTriageSnapshotRequest, "",
+		protocol.TriageSnapshotRequestPayload{RequestID: "request-schema2-001", SchemaVersions: []int64{2}}))
+	response = firstOfType(schema2, protocol.MsgTriageSnapshotResponse)
+	if response == nil {
+		t.Fatal("schema-2 snapshot response missing")
+	}
+	current := response.Payload.(*protocol.TriageSnapshotResponsePayload)
+	if current.Schema != 2 || len(current.Items) != 1 || current.Items[0].RequiresAuth == nil ||
+		!*current.Items[0].RequiresAuth || current.Items[0].BlockedBy != "paywall" {
+		t.Fatalf("schema-2 access classification = %+v", current)
+	}
+}
+
+func assertLockedSchema1Snapshot(t *testing.T, frames []json.RawMessage) {
+	t.Helper()
+	allowed := map[string]bool{
+		"kind": true, "id": true, "rank": true, "title": true, "facts": true, "links": true, "ops": true,
+		"action_id": true, "job_id": true, "action_kind": true, "job_state": true, "revision": true, "sha256": true, "size_bytes": true,
+	}
+	for _, frame := range frames {
+		var envelope struct {
+			Type    string `json:"type"`
+			Payload struct {
+				Schema int                          `json:"schema"`
+				Items  []map[string]json.RawMessage `json:"items"`
+			} `json:"payload"`
+		}
+		if err := json.Unmarshal(frame, &envelope); err != nil {
+			t.Fatal(err)
+		}
+		if envelope.Type != protocol.MsgTriageSnapshotResponse {
+			continue
+		}
+		if envelope.Payload.Schema != 1 {
+			t.Fatalf("locked parser received schema %d, want 1", envelope.Payload.Schema)
+		}
+		for _, item := range envelope.Payload.Items {
+			var kind string
+			if err := json.Unmarshal(item["kind"], &kind); err != nil {
+				t.Fatal(err)
+			}
+			if kind != "human_action" {
+				continue
+			}
+			for field := range item {
+				if !allowed[field] {
+					t.Fatalf("locked schema-1 parser rejected unknown human_action field %q", field)
+				}
+			}
+		}
+		return
+	}
+	t.Fatal("locked schema-1 parser received no snapshot response")
 }
 
 func TestTriageCountsResponseEchoesRequestID(t *testing.T) {

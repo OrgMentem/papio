@@ -428,7 +428,7 @@ function triageCounts(raw: unknown, what: string): void {
   if (pending !== visible) fail(`${what}.pending_total must equal visible item counts`);
 }
 
-function triageItem(raw: unknown): void {
+function triageItem(raw: unknown, schema: 1 | 2): void {
   const item = asRecord(raw, "triage item");
   const core = ["kind", "id", "rank", "title", "facts", "links", "ops"];
   const kind = triageText(item, "kind", "triage item", 50);
@@ -446,7 +446,7 @@ function triageItem(raw: unknown): void {
     default:
       fail(`unsupported triage item kind ${JSON.stringify(kind)}`);
   }
-  const optional = kind === "human_action"
+  const optional = kind === "human_action" && schema === 2
     ? ["requires_auth", "blocked_by"]
     : kind === "retraction" ? ["notice_doi"] : [];
   requireKeys(item, `triage item ${kind}`, [...core, ...extra], optional);
@@ -510,13 +510,18 @@ function triageItem(raw: unknown): void {
     const sha = triageText(item, "sha256", "human_action", 64);
     if (sha !== "" && !/^[a-f0-9]{64}$/.test(sha)) fail("human_action.sha256 must be lowercase SHA-256");
     int(item, "size_bytes", "human_action", 0);
-    if ("requires_auth" in item && typeof item["requires_auth"] !== "boolean") {
-      fail("human_action.requires_auth must be a boolean");
-    }
-    if ("blocked_by" in item) {
-      const blockedBy = triageText(item, "blocked_by", "human_action", 50);
-      if (!["anti_bot", "paywall", "landing_page"].includes(blockedBy)) {
-        fail("human_action.blocked_by is invalid");
+    if (schema === 2) {
+      if (("requires_auth" in item) !== ("blocked_by" in item)) {
+        fail("human_action.requires_auth and blocked_by must be present together");
+      }
+      if ("requires_auth" in item && typeof item["requires_auth"] !== "boolean") {
+        fail("human_action.requires_auth must be a boolean");
+      }
+      if ("blocked_by" in item) {
+        const blockedBy = triageText(item, "blocked_by", "human_action", 50);
+        if (!["anti_bot", "paywall", "landing_page"].includes(blockedBy)) {
+          fail("human_action.blocked_by is invalid");
+        }
       }
     }
   } else {
@@ -761,8 +766,8 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
       requireKeys(p, "triage_snapshot_request", ["request_id", "schema_versions"], ["limit", "cursor"]);
       correlationID(p, "request_id", "triage_snapshot_request");
       const versions = p["schema_versions"];
-      if (!Array.isArray(versions) || versions.length !== 1 || versions[0] !== 1) {
-        fail("triage_snapshot_request.schema_versions must be [1]");
+      if (!Array.isArray(versions) || versions.length !== 1 || (versions[0] !== 1 && versions[0] !== 2)) {
+        fail("triage_snapshot_request.schema_versions must be [1] or [2]");
       }
       if ("limit" in p) int(p, "limit", "triage_snapshot_request", 1);
       if ("limit" in p && (p["limit"] as number) > 100) fail("triage_snapshot_request.limit must be <= 100");
@@ -773,12 +778,13 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
       requireKeys(p, "triage_snapshot_response",
         ["request_id", "schema", "generated_at", "counts", "items", "has_more", "unsupported_items_count"], ["cursor"]);
       correlationID(p, "request_id", "triage_snapshot_response");
-      if (p["schema"] !== 1) fail("triage_snapshot_response.schema must be 1");
+      if (p["schema"] !== 1 && p["schema"] !== 2) fail("triage_snapshot_response.schema must be 1 or 2");
+      const schema = p["schema"] as 1 | 2;
       triageTime(p, "generated_at", "triage_snapshot_response");
       triageCounts(p["counts"], "triage_snapshot_response.counts");
       const items = p["items"];
       if (!Array.isArray(items) || items.length > 100) fail("triage_snapshot_response.items must have at most 100 entries");
-      for (const item of items) triageItem(item);
+      for (const item of items) triageItem(item, schema);
       if (typeof p["has_more"] !== "boolean") fail("triage_snapshot_response.has_more must be boolean");
       int(p, "unsupported_items_count", "triage_snapshot_response", 0);
       if (p["has_more"] === true && !("cursor" in p)) fail("triage_snapshot_response.cursor required when has_more");

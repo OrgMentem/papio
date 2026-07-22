@@ -297,7 +297,7 @@ func renderStatusRefresh(out io.Writer, snapshot statusSnapshot, terminal bool) 
 		missing := *snapshot.LibraryMissingPDFs
 		line := "Library: complete — no items missing PDFs\n"
 		if missing > 0 {
-			line = fmt.Sprintf("Library: %d item(s) missing PDFs — papio acquire --from-zotio fills them\n", missing)
+			line = fmt.Sprintf("Library: %d item(s) missing PDFs — papio acquire --from-zotio queues them (25 per run by default)\n", missing)
 		}
 		if _, err := fmt.Fprint(out, line); err != nil {
 			return err

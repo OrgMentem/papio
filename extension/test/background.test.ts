@@ -385,10 +385,10 @@ function nativeResult(type: string, payload: Record<string, unknown>): unknown {
   };
 }
 
-function snapshotResult(requestID: string, pending = 0): unknown {
+function snapshotResult(requestID: string, pending = 0, schema: 1 | 2 = 1): unknown {
   return nativeResult("triage_snapshot_response", {
     request_id: requestID,
-    schema: 1,
+    schema,
     generated_at: "2027-01-01T00:00:00Z",
     counts: triageCounts(pending),
     items: [],
@@ -1836,6 +1836,7 @@ test("triage native replies correlate by request_id even when they arrive out of
   await Promise.resolve();
   await Promise.resolve();
   const requests = h.frames().filter((frame) => frame.type === "triage_snapshot_request");
+  expect(requests.map((frame) => frame.payload["schema_versions"])).toEqual([[1], [1]]);
   const firstID = requests[0]?.payload["request_id"];
   const secondID = requests[1]?.payload["request_id"];
   expect(typeof firstID).toBe("string");
@@ -1845,6 +1846,24 @@ test("triage native replies correlate by request_id even when they arrive out of
   await h.port.inbound(snapshotResult(firstID as string, 1));
   await expect(first).resolves.toMatchObject({ ok: true, snapshot: { counts: { pending_total: 1 } } });
   await expect(second).resolves.toMatchObject({ ok: true, snapshot: { counts: { pending_total: 2 } } });
+});
+
+test("triage snapshot uses schema 2 only after the daemon advertises it", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(helloAck({
+    daemon_version: "0.1.0",
+    features: ["triage_snapshot_v1", "triage_snapshot_schema_v2"],
+  }));
+
+  const pending = h.bridge.requestTriageSnapshot({ schema_versions: [1] });
+  await Promise.resolve();
+  await Promise.resolve();
+  const request = h.frames().find((frame) => frame.type === "triage_snapshot_request");
+  expect(request?.payload["schema_versions"]).toEqual([2]);
+  const requestID = request?.payload["request_id"];
+  await h.port.inbound(snapshotResult(requestID as string, 1, 2));
+  await expect(pending).resolves.toMatchObject({ ok: true });
 });
 
 test("triage requests time out and late echoes are dropped", async () => {

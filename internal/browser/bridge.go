@@ -39,13 +39,14 @@ import (
 )
 
 const (
-	handoffActionKind      = "openurl_handoff"
-	MinExtensionVersion    = "0.1.0"
-	pageAcquireFeature     = "page_acquire"
-	triageSnapshotFeature  = "triage_snapshot_v1"
-	triageMutationsFeature = "triage_mutations_v1"
-	reviewPreviewFeature   = "review_preview_v1"
-	previewCapabilityTTL   = 10 * time.Minute
+	handoffActionKind            = "openurl_handoff"
+	MinExtensionVersion          = "0.1.0"
+	pageAcquireFeature           = "page_acquire"
+	triageSnapshotFeature        = "triage_snapshot_v1"
+	triageSnapshotSchema2Feature = "triage_snapshot_schema_v2"
+	triageMutationsFeature       = "triage_mutations_v1"
+	reviewPreviewFeature         = "review_preview_v1"
+	previewCapabilityTTL         = 10 * time.Minute
 )
 
 // ErrInvalidFrame marks a client-side protocol violation (a frame that fails
@@ -125,7 +126,7 @@ func NewBridge(jobs *job.Store, svc *app.Service, triageService *triage.Service,
 		jobs: jobs, svc: svc, triage: triageService, watchRunner: watchRunner, preview: previewServer, cfg: cfg,
 		Version: version,
 		Features: appendFeatures(features,
-			pageAcquireFeature, triageSnapshotFeature, triageMutationsFeature, reviewPreviewFeature),
+			pageAcquireFeature, triageSnapshotFeature, triageSnapshotSchema2Feature, triageMutationsFeature, reviewPreviewFeature),
 		offered: map[string]bool{}, cancelSent: map[string]bool{}, pending: map[string]*browserSession{},
 		now: time.Now,
 	}
@@ -605,7 +606,7 @@ func (b *Bridge) triageSnapshot(ctx context.Context, request *protocol.TriageSna
 		if err != nil {
 			return nil, err
 		}
-		payload := triageSnapshotPayload(request.RequestID, snapshot)
+		payload := triageSnapshotPayload(request.RequestID, request.SchemaVersions[0], snapshot)
 		if b.frameFits(protocol.MsgTriageSnapshotResponse, payload) {
 			frame, err := b.frame(protocol.MsgTriageSnapshotResponse, "", payload)
 			if err != nil {
@@ -620,7 +621,7 @@ func (b *Bridge) triageSnapshot(ctx context.Context, request *protocol.TriageSna
 	}
 }
 
-func triageSnapshotPayload(requestID string, snapshot triage.Snapshot) protocol.TriageSnapshotResponsePayload {
+func triageSnapshotPayload(requestID string, schema int64, snapshot triage.Snapshot) protocol.TriageSnapshotResponsePayload {
 	items := make([]protocol.TriageSnapshotItem, 0, len(snapshot.Items))
 	for _, item := range snapshot.Items {
 		payload := protocol.TriageSnapshotItem{
@@ -648,7 +649,9 @@ func triageSnapshotPayload(requestID string, snapshot triage.Snapshot) protocol.
 				payload.ActionID, payload.JobID = action.ActionID, action.JobID
 				payload.ActionKind, payload.JobState = action.ActionKind, action.JobState
 				payload.Revision, payload.SHA256, payload.SizeBytes = action.Revision, action.SHA256, action.SizeBytes
-				payload.RequiresAuth, payload.BlockedBy = action.RequiresAuth, action.BlockedBy
+				if schema == 2 && action.BlockedBy != "" {
+					payload.RequiresAuth, payload.BlockedBy = action.RequiresAuth, action.BlockedBy
+				}
 			}
 		case triage.KindRetraction:
 			retraction := item.Retraction
@@ -661,7 +664,7 @@ func triageSnapshotPayload(requestID string, snapshot triage.Snapshot) protocol.
 		items = append(items, payload)
 	}
 	return protocol.TriageSnapshotResponsePayload{
-		RequestID: requestID, Schema: int64(snapshot.Schema), GeneratedAt: snapshot.GeneratedAt,
+		RequestID: requestID, Schema: schema, GeneratedAt: snapshot.GeneratedAt,
 		Counts: triageCountsPayload(snapshot.Counts), Items: items, Cursor: snapshot.Cursor,
 		HasMore: snapshot.HasMore, UnsupportedItemsCount: int64(snapshot.UnsupportedItemsCount),
 	}

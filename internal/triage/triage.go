@@ -647,7 +647,9 @@ func humanActionItems(ctx context.Context, tx *sql.Tx) ([]Item, error) {
 		if r.action.ActionID <= 0 || r.action.JobID == "" || r.action.ActionKind == "" || r.action.Revision <= 0 {
 			return nil, errors.New("invalid open human action")
 		}
-		r.action.RequiresAuth, r.action.BlockedBy = &r.requiresAuth, r.blockedBy
+		if r.blockedBy != "" {
+			r.action.RequiresAuth, r.action.BlockedBy = &r.requiresAuth, r.blockedBy
+		}
 		loaded = append(loaded, r)
 		workRequestIDs = append(workRequestIDs, r.workRequestID)
 	}

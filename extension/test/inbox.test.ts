@@ -454,10 +454,12 @@ test("backend identifiers collapse into a details section and the citation carri
 test("renders access hints only when the daemon classifies a human action", async () => {
   const openAccess = manualAction("action:open-access", 1, "Open access action");
   openAccess.requires_auth = false;
+  openAccess.blocked_by = "anti_bot";
   const institutional = manualAction("action:institutional", 2, "Institutional action");
   institutional.requires_auth = true;
-  const legacy = manualAction("action:legacy", 3, "Legacy action");
-  const fixture = snapshot([openAccess, institutional, legacy], {
+  institutional.blocked_by = "paywall";
+  const unclassified = verifyIdentity("action:unclassified", 3);
+  const fixture = snapshot([openAccess, institutional, unclassified], {
     counts: counts({ pending_total: 3, actions: 3, watch_hits: 0, retractions: 0 }),
   });
   const page = await inboxDocument((message) => snapshotReply(fixture, message));
@@ -466,7 +468,7 @@ test("renders access hints only when the daemon classifies a human action", asyn
     .toBe("open access — no login needed");
   expect(page.document.querySelector("[data-triage-item-id='action:institutional'] .access-hint")?.textContent)
     .toBe("sign in to your institution first");
-  expect(page.document.querySelector("[data-triage-item-id='action:legacy'] .access-hint")).toBeNull();
+  expect(page.document.querySelector("[data-triage-item-id='action:unclassified'] .access-hint")).toBeNull();
 });
 
 test("an author suffix duplicated in the title is stripped for display", async () => {

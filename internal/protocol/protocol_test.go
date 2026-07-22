@@ -485,3 +485,36 @@ func TestTriageSnapshotRejectsUnknownBlockedBy(t *testing.T) {
 		t.Fatalf("unknown blocked_by err = %v, want rejection", err)
 	}
 }
+
+func TestTriageSnapshotSchema1RejectsAccessFieldsButAllowsTheirAbsence(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join(corpusDir(t, "valid"), "browser-triage-snapshot-response.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var frame map[string]any
+	if err := json.Unmarshal(data, &frame); err != nil {
+		t.Fatal(err)
+	}
+	payload := frame["payload"].(map[string]any)
+	payload["schema"] = float64(1)
+	action := payload["items"].([]any)[1].(map[string]any)
+	delete(action, "requires_auth")
+	delete(action, "blocked_by")
+	legacy, err := json.Marshal(frame)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := DecodeBrowserMessage(legacy); err != nil {
+		t.Fatalf("schema-1 snapshot without access fields rejected: %v", err)
+	}
+
+	action["requires_auth"] = true
+	action["blocked_by"] = "paywall"
+	withAccessFields, err := json.Marshal(frame)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := DecodeBrowserMessage(withAccessFields); err == nil || !strings.Contains(err.Error(), "schema 1") {
+		t.Fatalf("schema-1 snapshot with access fields err = %v, want rejection", err)
+	}
+}

@@ -536,9 +536,9 @@ type ErrorPayload struct {
 // job_reject, cancel).
 type EmptyPayload struct{}
 
-// TriageSnapshotRequestPayload requests one immutable schema-v1 inbox page.
-// Schema versions are negotiated explicitly because a future snapshot schema
-// cannot safely add fields to this locked browser message family.
+// TriageSnapshotRequestPayload requests one immutable inbox page. Schema
+// versions are negotiated explicitly because a future snapshot schema cannot
+// safely add fields to this locked browser message family.
 type TriageSnapshotRequestPayload struct {
 	RequestID      string  `json:"request_id"`
 	SchemaVersions []int64 `json:"schema_versions"`
@@ -585,8 +585,8 @@ type TriageWatch struct {
 	Label string `json:"label"`
 }
 
-// TriageSnapshotItem is one schema-v1 inbox item. Its kind-specific fields are
-// flat on the wire to keep the snapshot contract stable.
+// TriageSnapshotItem is one inbox item. Its kind-specific fields are flat on
+// the wire to keep each snapshot schema stable.
 type TriageSnapshotItem struct {
 	Kind  string       `json:"kind"`
 	ID    string       `json:"id"`
@@ -617,7 +617,7 @@ type TriageSnapshotItem struct {
 	NoticeDOI string `json:"notice_doi,omitempty"`
 }
 
-// TriageSnapshotResponsePayload is a correlated immutable schema-v1 snapshot.
+// TriageSnapshotResponsePayload is a correlated immutable snapshot.
 type TriageSnapshotResponsePayload struct {
 	RequestID             string               `json:"request_id"`
 	Schema                int64                `json:"schema"`
@@ -1259,8 +1259,8 @@ func (p *TriageSnapshotRequestPayload) validate() error {
 	if err := validateCorrelationID("triage_snapshot_request.request_id", p.RequestID); err != nil {
 		return err
 	}
-	if len(p.SchemaVersions) != 1 || p.SchemaVersions[0] != 1 {
-		return fmt.Errorf("triage_snapshot_request.schema_versions must be [1]")
+	if len(p.SchemaVersions) != 1 || (p.SchemaVersions[0] != 1 && p.SchemaVersions[0] != 2) {
+		return fmt.Errorf("triage_snapshot_request.schema_versions must be [1] or [2]")
 	}
 	if p.Limit != 0 && (p.Limit < 1 || p.Limit > 100) {
 		return fmt.Errorf("triage_snapshot_request.limit must be between 1 and 100")
@@ -1505,6 +1505,9 @@ func (item TriageSnapshotItem) validate() error {
 		if item.SizeBytes < 0 || item.SizeBytes > MaxBrowserInteger {
 			return fmt.Errorf("human_action.size_bytes must be in range 0..%d", MaxBrowserInteger)
 		}
+		if (item.RequiresAuth != nil) != (item.BlockedBy != "") {
+			return fmt.Errorf("human_action.requires_auth and blocked_by must be present together")
+		}
 		if item.BlockedBy != "" {
 			if err := enumRequired("human_action.blocked_by", item.BlockedBy, "anti_bot", "paywall", "landing_page"); err != nil {
 				return err
@@ -1534,8 +1537,8 @@ func (p *TriageSnapshotResponsePayload) validate() error {
 	if err := validateCorrelationID("triage_snapshot_response.request_id", p.RequestID); err != nil {
 		return err
 	}
-	if p.Schema != 1 {
-		return fmt.Errorf("triage_snapshot_response.schema must be 1")
+	if p.Schema != 1 && p.Schema != 2 {
+		return fmt.Errorf("triage_snapshot_response.schema must be 1 or 2")
 	}
 	if err := validateTriageTime("triage_snapshot_response.generated_at", p.GeneratedAt); err != nil {
 		return err
@@ -1549,6 +1552,9 @@ func (p *TriageSnapshotResponsePayload) validate() error {
 	for _, item := range p.Items {
 		if err := item.validate(); err != nil {
 			return err
+		}
+		if p.Schema == 1 && (item.RequiresAuth != nil || item.BlockedBy != "") {
+			return fmt.Errorf("triage_snapshot_response.schema 1 cannot include access classification")
 		}
 	}
 	if p.UnsupportedItemsCount < 0 || p.UnsupportedItemsCount > MaxBrowserInteger {

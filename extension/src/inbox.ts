@@ -526,8 +526,8 @@ function statusMeta(item: TriageSnapshotItem): { key: string; glyph: string; lab
 // their existing presentation. Newer daemon snapshots distinguish an action
 // that merely needs opening from one that first needs institutional sign-in.
 function accessHint(item: TriageSnapshotItem): HTMLElement | null {
-  if (item.kind !== "human_action" || item.requires_auth === undefined) return null;
-  const hint = element("p", item.requires_auth
+  if (item.kind !== "human_action" || (item.blocked_by === undefined && item.requires_auth === undefined)) return null;
+  const hint = element("p", item.requires_auth === true
     ? "sign in to your institution first"
     : "open access — no login needed");
   hint.className = "access-hint";

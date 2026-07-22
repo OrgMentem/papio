@@ -213,6 +213,10 @@ func TestHumanActionItemsCarryWorkIdentityAndCorrectOps(t *testing.T) {
 	if unboundItem.Title != "Unbound review work" {
 		t.Fatalf("unbound item title = %q, want the paper title", unboundItem.Title)
 	}
+	if unboundItem.HumanAction.RequiresAuth != nil || unboundItem.HumanAction.BlockedBy != "" {
+		t.Fatalf("unclassified action access = requires_auth %v, blocked_by %q, want absent",
+			unboundItem.HumanAction.RequiresAuth, unboundItem.HumanAction.BlockedBy)
+	}
 	for _, op := range unboundItem.Ops {
 		if op == "accept" {
 			t.Fatalf("unbound (unpreviewable) item offered accept: %v", unboundItem.Ops)

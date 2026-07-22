@@ -116,7 +116,7 @@ func TestRenderStatusRefreshShowsLibraryCompleteness(t *testing.T) {
 	if err := renderStatusRefresh(&out, snapshot, false); err != nil {
 		t.Fatal(err)
 	}
-	if got := out.String(); !strings.Contains(got, "Library: 87 item(s) missing PDFs — papio acquire --from-zotio fills them") {
+	if got := out.String(); !strings.Contains(got, "Library: 87 item(s) missing PDFs — papio acquire --from-zotio queues them (25 per run by default)") {
 		t.Fatalf("library line missing: %q", got)
 	}
 

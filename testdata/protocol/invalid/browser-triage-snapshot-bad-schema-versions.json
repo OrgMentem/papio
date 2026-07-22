@@ -1,1 +1,1 @@
-{"protocol":"papio-browser/1","type":"triage_snapshot_request","msg_id":"snapshot-bad-001","seq":1,"payload":{"request_id":"request-0001","schema_versions":[2]}}
+{"protocol":"papio-browser/1","type":"triage_snapshot_request","msg_id":"snapshot-bad-001","seq":1,"payload":{"request_id":"request-0001","schema_versions":[3]}}

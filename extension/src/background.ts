@@ -82,6 +82,7 @@ const KEEPALIVE_ALARM_MINUTES = 1;
 const TRIAGE_REQUEST_TIMEOUT_MS = 15_000;
 const HELLO_WAIT_TIMEOUT_MS = 5_000;
 const TRIAGE_SNAPSHOT_FEATURE = "triage_snapshot_v1";
+const TRIAGE_SNAPSHOT_SCHEMA_2_FEATURE = "triage_snapshot_schema_v2";
 const TRIAGE_MUTATIONS_FEATURE = "triage_mutations_v1";
 const REVIEW_PREVIEW_FEATURE = "review_preview_v1";
 // Fallback for a manifest without an action popup; both build targets ship
@@ -1112,9 +1113,12 @@ export class Bridge {
   async requestTriageSnapshot(
     request: { schema_versions: [1]; limit?: number; cursor?: string },
   ): Promise<BrokerReply<{ snapshot: Record<string, unknown> }>> {
+    const schemaVersions: [1] | [2] = (this.store.daemonFeatures ?? []).includes(TRIAGE_SNAPSHOT_SCHEMA_2_FEATURE)
+      ? [2]
+      : request.schema_versions;
     const result = await this.requestNative(
       "triage_snapshot_request",
-      request,
+      { ...request, schema_versions: schemaVersions },
       "triage_snapshot_response",
       TRIAGE_SNAPSHOT_FEATURE,
       false,

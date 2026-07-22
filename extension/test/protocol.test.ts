@@ -25,13 +25,18 @@ test("valid browser corpus parses", () => {
   }
 });
 
-test("triage access classification is optional and strictly parsed when present", () => {
+test("triage schema 1 keeps the locked action shape while schema 2 carries access classification", () => {
   const text = readFileSync(join(corpusRoot, "valid", "browser-triage-snapshot-response.json"), "utf8");
   expect(JSON.stringify(parseBrowserMessageBytes(text).payload))
     .toContain('"requires_auth":true,"blocked_by":"paywall"');
 
-  const legacy = text.replace(',"requires_auth":true,"blocked_by":"paywall"', "");
-  expect(parseBrowserMessageBytes(legacy).protocol).toBe("papio-browser/1");
+  const schema1 = text
+    .replace('"schema":2', '"schema":1')
+    .replace(',"requires_auth":true,"blocked_by":"paywall"', "");
+  expect(parseBrowserMessageBytes(schema1).protocol).toBe("papio-browser/1");
+
+  const invalidSchema1 = text.replace('"schema":2', '"schema":1');
+  expect(() => parseBrowserMessageBytes(invalidSchema1)).toThrow(ProtocolError);
 
   const invalid = text.replace('"blocked_by":"paywall"', '"blocked_by":"captcha"');
   expect(() => parseBrowserMessageBytes(invalid)).toThrow(ProtocolError);

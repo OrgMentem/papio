@@ -252,12 +252,12 @@ func newActionsCommand(opt *options) *cobra.Command {
 // "just open it" from "sign in first" without decoding action details.
 func accessHint(action job.HumanAction) string {
 	switch {
+	case action.BlockedBy == "":
+		return ""
 	case action.RequiresAuth:
 		return "\tsign in to your institution first, then 'papio actions open'"
-	case action.Kind == "openurl_handoff":
-		return "\topen access — no login needed"
 	default:
-		return ""
+		return "\topen access — no login needed"
 	}
 }
 

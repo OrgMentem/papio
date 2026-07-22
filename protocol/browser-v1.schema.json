@@ -191,10 +191,43 @@
         }
       ]
     },
+    "human_action_item_v1": {
+      "allOf": [
+        { "$ref": "#/$defs/item_core" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "id", "rank", "title", "facts", "links", "ops", "action_id", "job_id", "action_kind", "job_state", "revision", "sha256", "size_bytes"],
+          "properties": {
+            "kind": { "const": "human_action" },
+            "id": { "type": "string", "minLength": 1, "maxLength": 1024, "pattern": "^[^\\u0000]+$" },
+            "rank": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+            "title": { "type": "string", "maxLength": 500, "pattern": "^[^\\u0000]*$" },
+            "facts": { "type": "array", "maxItems": 8, "items": { "$ref": "#/$defs/fact" } },
+            "links": { "type": "array", "maxItems": 16, "items": { "$ref": "#/$defs/link" } },
+            "ops": { "type": "array", "uniqueItems": true, "items": { "enum": ["acquire", "dismiss", "accept", "reject", "open", "retry"] } },
+            "action_id": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+            "job_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,128}$" },
+            "action_kind": { "type": "string", "minLength": 1, "maxLength": 100, "pattern": "^[^\\u0000]+$" },
+            "job_state": { "type": "string", "minLength": 1, "maxLength": 50, "pattern": "^[^\\u0000]+$" },
+            "revision": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+            "sha256": { "type": "string", "pattern": "^(|[a-f0-9]{64})$" },
+            "size_bytes": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
+          }
+        }
+      ]
+    },
     "triage_item": {
       "oneOf": [
         { "$ref": "#/$defs/watch_hit_item" },
         { "$ref": "#/$defs/human_action_item" },
+        { "$ref": "#/$defs/retraction_item" }
+      ]
+    },
+    "triage_item_v1": {
+      "oneOf": [
+        { "$ref": "#/$defs/watch_hit_item" },
+        { "$ref": "#/$defs/human_action_item_v1" },
         { "$ref": "#/$defs/retraction_item" }
       ]
     },
@@ -465,7 +498,7 @@
             "required": ["request_id", "schema_versions"],
             "properties": {
               "request_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,64}$" },
-              "schema_versions": { "type": "array", "minItems": 1, "maxItems": 1, "items": { "const": 1 } },
+              "schema_versions": { "type": "array", "minItems": 1, "maxItems": 1, "items": { "enum": [1, 2] } },
               "limit": { "type": "integer", "minimum": 1, "maximum": 100 },
               "cursor": { "type": "string", "maxLength": 256, "pattern": "^[^\\u0000]*$" }
             }
@@ -483,7 +516,7 @@
             "required": ["request_id", "schema", "generated_at", "counts", "items", "has_more", "unsupported_items_count"],
             "properties": {
               "request_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,64}$" },
-              "schema": { "const": 1 },
+              "schema": { "enum": [1, 2] },
               "generated_at": { "type": "string", "format": "date-time" },
               "counts": { "$ref": "#/$defs/counts" },
               "items": { "type": "array", "maxItems": 100, "items": { "$ref": "#/$defs/triage_item" } },
@@ -493,7 +526,8 @@
             },
             "allOf": [
               { "if": { "properties": { "has_more": { "const": true } }, "required": ["has_more"] }, "then": { "required": ["cursor"] } },
-              { "if": { "properties": { "has_more": { "const": false } }, "required": ["has_more"] }, "then": { "not": { "required": ["cursor"] } } }
+              { "if": { "properties": { "has_more": { "const": false } }, "required": ["has_more"] }, "then": { "not": { "required": ["cursor"] } } },
+              { "if": { "properties": { "schema": { "const": 1 } }, "required": ["schema"] }, "then": { "properties": { "items": { "items": { "$ref": "#/$defs/triage_item_v1" } } } } }
             ]
           }
         }
