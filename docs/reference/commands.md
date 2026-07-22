@@ -295,7 +295,7 @@ papio init [flags]
 | `--attachment-mode` | `string` |  | zotio attachment mode: stored or linked-file |
 | `--check-updates` | `bool` | `true` | check for papio and zotio updates once a day via GitHub releases (sends nothing else) |
 | `--email` | `string` |  | contact email for polite API pools |
-| `--extension-id` | `string` |  | Chrome extension ID allowed to reach the native host |
+| `--extension-id` | `string` |  | Chrome extension ID allowed to reach the native host, or an unpacked extension folder path (papio computes its ID) |
 | `--firefox-extension-id` | `string` |  | Firefox add-on ID allowed to reach the native host |
 | `--institution-url` | `string` |  | library discovery or resolver URL; papio derives the OpenURL base |
 | `--non-interactive` | `bool` | `false` | do not prompt; retain existing values unless a flag overrides them |

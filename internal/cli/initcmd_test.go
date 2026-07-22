@@ -432,7 +432,7 @@ func TestInitInteractiveInstitutionPromptUsesExistingBaseDefault(t *testing.T) {
 	if got.Browser.OpenURLBase != existingBase {
 		t.Fatalf("openurl base = %q, want existing %q", got.Browser.OpenURLBase, existingBase)
 	}
-	wantPrompt := "› resolver [" + existingBase + "]:"
+	wantPrompt := "› resolver [keep current: " + existingBase + "]:"
 	if !strings.Contains(out, wantPrompt) {
 		t.Fatalf("institution prompt = %q, want default prompt %q", out, wantPrompt)
 	}
@@ -475,5 +475,42 @@ func TestInitUpdateCheckPromptWritesBothAnswers(t *testing.T) {
 				t.Fatalf("update prompt missing from output: %q", out)
 			}
 		})
+	}
+}
+
+// Vector verified against a live chrome://extensions card: the unpacked ID
+// is SHA-256 of the absolute load path, first 16 bytes, nibbles mapped a-p.
+func TestChromeUnpackedIDMatchesChromeAlgorithm(t *testing.T) {
+	if got := chromeUnpackedID("/Users/ellis/@dev/papio/extension"); got != "ehhfplhmddankkocjpldplaokajlbmah" {
+		t.Fatalf("unpacked id = %q", got)
+	}
+}
+
+func TestResolveChromeExtensionID(t *testing.T) {
+	dir := t.TempDir()
+	id, from, err := resolveChromeExtensionID(dir)
+	if err != nil || from != dir || id != chromeUnpackedID(dir) {
+		t.Fatalf("path input = %q %q %v", id, from, err)
+	}
+	literal, from, err := resolveChromeExtensionID("abcdefghijklmnopabcdefghijklmnop")
+	if err != nil || from != "" || literal != "abcdefghijklmnopabcdefghijklmnop" {
+		t.Fatalf("literal input = %q %q %v", literal, from, err)
+	}
+	if _, _, err := resolveChromeExtensionID(dir + "/missing"); err == nil {
+		t.Fatal("missing folder must error")
+	}
+}
+
+func TestInitDisplayDefaultSources(t *testing.T) {
+	if got := initDisplayDefault("https://r.example.edu/openurl", "from Zotero"); got != "from Zotero: https://r.example.edu/openurl" {
+		t.Fatalf("sourced short = %q", got)
+	}
+	long := "https://une.alma.exlibrisgroup.com/view/uresolver/61UNE_INST/openurl?svc_dat=viewit&u.ignore_date_coverage=true"
+	got := initDisplayDefault(long, "")
+	if !strings.HasPrefix(got, "keep current: ") || strings.Contains(got, "svc_dat=viewit&u.ignore") || !strings.Contains(got, "…") {
+		t.Fatalf("ellipsized = %q", got)
+	}
+	if got := initDisplayDefault("zotio", ""); got != "zotio" {
+		t.Fatalf("plain = %q", got)
 	}
 }

@@ -94,7 +94,7 @@ Install `zotio` and put it on your `PATH` when you want *papio* to import finish
     For hacking on the extension itself, load it unpacked from a checkout:
 
     1. Open `chrome://extensions`, enable **Developer mode**, choose **Load unpacked**, and select `extension/`.
-    2. Note the extension ID shown on the card — unpacked builds get a machine-specific ID, so hand it to `papio init --extension-id <id>`.
+    2. Hand the ID to `papio init --extension-id <id>` — or pass the extension *folder path* instead and *papio* computes the ID itself (unpacked IDs are derived from the load directory).
 
     Manually loaded builds do not auto-update; reload after each rebuild.
 

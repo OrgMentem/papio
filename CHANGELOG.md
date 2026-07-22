@@ -8,6 +8,18 @@ so older sections below include extension entries. The initial release entry
 is synthesized from the complete `papio` and `zotio` Git histories and the
 execution records in `notes/acquisition-stack-plan.md`.
 
+## [Unreleased]
+
+### Changed
+
+- `papio init` autodiscovers more of its own answers: the zotio executable is
+  resolved from PATH and labeled with its source, prompt defaults name where
+  they came from (`keep current` vs `from Zotero`), the Browser step lists
+  the browsers detected on the machine, the Chrome extension ID prompt and
+  `--extension-id` accept an unpacked extension *folder path* and compute
+  the ID from it, and the browser setup instructions print only when the
+  extension is not already connected.
+
 ## [0.9.2] - 2026-07-22
 
 ### Fixed

@@ -5,6 +5,8 @@ package cli
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net/mail"
@@ -13,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"time"
 
@@ -110,7 +113,7 @@ func newInitCommandWithDependencies(opt *options, deps initDependencies) *cobra.
 	command.Flags().StringVar(&openurlBase, "openurl-base", "", "institution OpenURL resolver base URL")
 	command.Flags().StringVar(&shibbolethEntityID, "shibboleth-entity-id", "", "Shibboleth IdP entityID for federated login-routing")
 	command.Flags().StringVar(&proquestAccountID, "proquest-account-id", "", "ProQuest account id, or a ProQuest URL containing accountid=")
-	command.Flags().StringVar(&extensionID, "extension-id", "", "Chrome extension ID allowed to reach the native host")
+	command.Flags().StringVar(&extensionID, "extension-id", "", "Chrome extension ID allowed to reach the native host, or an unpacked extension folder path (papio computes its ID)")
 	command.Flags().StringVar(&firefoxExtensionID, "firefox-extension-id", "", "Firefox add-on ID allowed to reach the native host")
 	command.Flags().BoolVar(&skipBrowser, "skip-browser", false, "skip Chrome extension and native-host setup")
 	command.Flags().BoolVar(&checkUpdates, "check-updates", true, "check for papio and zotio updates once a day via GitHub releases (sends nothing else)")
@@ -181,6 +184,7 @@ func runInit(cmd *cobra.Command, opt *options, deps initDependencies, input init
 		initLine(opt.out, true, "zotio", "available at "+cfg.Zotio.Executable)
 	}
 
+	browserInstalled := false
 	if input.skipBrowser {
 		initLine(opt.out, true, "Browser", "skipped")
 	} else if err := deps.InstallNative(cfg); err != nil {
@@ -188,12 +192,15 @@ func runInit(cmd *cobra.Command, opt *options, deps initDependencies, input init
 		writeBrowserInstructions(opt.out, cfg)
 	} else {
 		initLine(opt.out, true, "Browser", "native messaging host installed")
-		writeBrowserInstructions(opt.out, cfg)
+		browserInstalled = true
 	}
 
 	report, err := deps.RunDoctor(cmd.Context(), opt)
 	if err != nil {
 		initLine(opt.out, false, "Daemon and doctor", fmt.Sprintf("%v", err))
+		if browserInstalled {
+			writeBrowserInstructions(opt.out, cfg)
+		}
 		fmt.Fprintln(opt.out, "\nNext: papio doctor --start")
 		return nil
 	}
@@ -202,12 +209,28 @@ func runInit(cmd *cobra.Command, opt *options, deps initDependencies, input init
 	} else {
 		initLine(opt.out, false, "Daemon and doctor", "daemon autostarted; doctor reported failures")
 	}
+	// Setup instructions only when the extension is not already talking to
+	// the daemon — a healthy re-run should not re-print install steps.
+	if browserInstalled && !initExtensionHealthy(report) {
+		writeBrowserInstructions(opt.out, cfg)
+	}
 	// Init already succeeded or failed step by step above; the full PASS table
 	// is noise here. Summarize, show only what needs attention, and point at
 	// `papio doctor` for the rest.
 	writeInitDoctorSummary(opt.out, report)
 	fmt.Fprintln(opt.out, "\nNext: "+initNextAction(input, report))
 	return nil
+}
+
+// initExtensionHealthy reports whether doctor saw a connected, current
+// extension.
+func initExtensionHealthy(report doctor.Report) bool {
+	for _, check := range report.Checks {
+		if check.Name == "extension" {
+			return check.Status == doctor.Pass
+		}
+	}
+	return false
 }
 
 // writeInitDoctorSummary prints one summary line plus any non-PASS checks.
@@ -295,9 +318,21 @@ func applyInitConfig(cmd *cobra.Command, out io.Writer, cfg *config.Config, exis
 	}
 
 	if !input.nonInteractive {
-		sections.header("zotio", "The Zotero boundary: imports are previewed and confirmed there.")
+		sections.header("zotio", "The Zotero boundary: imports are previewed and confirmed there. stored copies PDFs into Zotero; linked-file references papio's copy on disk.")
 		if !input.zotioPathSet {
-			value, err := initPrompt(reader, out, "zotio executable", cfg.Zotio.Executable)
+			zotioDefault, zotioSource := cfg.Zotio.Executable, ""
+			// A bare command name is autodiscovered so the prompt shows the
+			// real binary instead of asking the user to know their PATH.
+			if zotioDefault == "" || !strings.Contains(zotioDefault, string(os.PathSeparator)) {
+				lookup := zotioDefault
+				if lookup == "" {
+					lookup = "zotio"
+				}
+				if resolved, err := exec.LookPath(lookup); err == nil {
+					zotioDefault, zotioSource = resolved, "found on PATH"
+				}
+			}
+			value, err := initPromptSourced(reader, out, "zotio executable", zotioDefault, zotioSource)
 			if err != nil {
 				return err
 			}
@@ -319,7 +354,11 @@ func applyInitConfig(cmd *cobra.Command, out io.Writer, cfg *config.Config, exis
 	}
 
 	if !input.nonInteractive && !input.skipBrowser {
-		sections.header("Browser", "Institutional access runs in your own signed-in browser.")
+		explain := "Institutional access runs in your own signed-in browser — any Chromium browser (Chrome, Edge, Brave, Vivaldi) or Firefox."
+		if detected := detectBrowsers(); len(detected) > 0 {
+			explain += " Detected: " + strings.Join(detected, ", ") + "."
+		}
+		sections.header("Browser", explain)
 		yes, err := initYesNo(reader, out, "Install browser integration?", true)
 		if err != nil {
 			return err
@@ -338,7 +377,7 @@ func applyInitConfig(cmd *cobra.Command, out io.Writer, cfg *config.Config, exis
 	// case. An empty value leaves that browser's bridge disabled.
 	if !input.nonInteractive && !input.skipBrowser {
 		_, dim := initStyle(out)
-		fmt.Fprintf(out, "  %s\n", dim("Web Store installs use the default ID; unpacked builds: paste the ID from chrome://extensions."))
+		fmt.Fprintf(out, "  %s\n", dim("Web Store installs use the default ID; unpacked builds: paste the ID from chrome://extensions, or the extension folder path and papio computes it."))
 		if !input.extensionIDSet {
 			chromeDefault := cfg.Browser.ExtensionID
 			if chromeDefault == "" {
@@ -348,7 +387,14 @@ func applyInitConfig(cmd *cobra.Command, out io.Writer, cfg *config.Config, exis
 			if err != nil {
 				return err
 			}
-			cfg.Browser.ExtensionID = value
+			id, computedFrom, err := resolveChromeExtensionID(value)
+			if err != nil {
+				return err
+			}
+			if computedFrom != "" {
+				initLine(out, true, "Browser", "computed unpacked extension ID "+id+" from "+computedFrom)
+			}
+			cfg.Browser.ExtensionID = id
 		}
 		if !input.firefoxIDSet {
 			firefoxDefault := cfg.Browser.FirefoxExtensionID
@@ -383,14 +429,13 @@ func applyInitConfig(cmd *cobra.Command, out io.Writer, cfg *config.Config, exis
 	if !input.nonInteractive && !input.skipBrowser {
 		sections.header("Institution", "Paste your library's discovery/search URL — papio derives the resolver. Blank to skip.")
 		if !input.openurlBaseSet && !input.institutionURLSet {
-			defaultValue := cfg.Browser.OpenURLBase
-			if defaultValue == "" {
-				if resolver, ok := institution.ZoteroResolver(); ok {
-					defaultValue = resolver
-					initLine(out, true, "Institution", "found an OpenURL resolver in your Zotero settings")
-				}
+			defaultValue, defaultSource := cfg.Browser.OpenURLBase, ""
+			if defaultValue != "" {
+				defaultSource = "keep current"
+			} else if resolver, ok := institution.ZoteroResolver(); ok {
+				defaultValue, defaultSource = resolver, "from Zotero"
 			}
-			value, err := initPrompt(reader, out, "resolver", defaultValue)
+			value, err := initPromptSourced(reader, out, "resolver", defaultValue, defaultSource)
 			if err != nil {
 				return err
 			}
@@ -458,7 +503,14 @@ func applyInitConfig(cmd *cobra.Command, out io.Writer, cfg *config.Config, exis
 		cfg.Browser.ProquestAccountID = id
 	}
 	if input.extensionIDSet {
-		cfg.Browser.ExtensionID = strings.TrimSpace(input.extensionID)
+		id, computedFrom, err := resolveChromeExtensionID(input.extensionID)
+		if err != nil {
+			return err
+		}
+		if computedFrom != "" {
+			initLine(out, true, "Browser", "computed unpacked extension ID "+id+" from "+computedFrom)
+		}
+		cfg.Browser.ExtensionID = id
 	}
 	if input.firefoxIDSet {
 		cfg.Browser.FirefoxExtensionID = strings.TrimSpace(input.firefoxExtensionID)
@@ -524,18 +576,31 @@ func (s *initSections) header(title, explain string) {
 
 // initDisplayDefault renders a prompt default. Long values (stored resolver
 // URLs) are middle-ellipsized so the question stays readable; the full value
-// is still what a blank answer keeps.
-func initDisplayDefault(value string) string {
-	const max = 48
+// is still what a blank answer keeps. A non-empty source names where the
+// default came from ("keep current" = existing config, "from Zotero", …).
+func initDisplayDefault(value, source string) string {
+	display := value
 	trimmed := strings.TrimPrefix(value, "https://")
-	if len(trimmed) <= max {
-		return value
+	if len(trimmed) > 48 {
+		display = trimmed[:28] + "…" + trimmed[len(trimmed)-16:]
+		if source == "" {
+			source = "keep current"
+		}
 	}
-	return "keep current: " + trimmed[:28] + "…" + trimmed[len(trimmed)-16:]
+	if source == "" {
+		return display
+	}
+	return source + ": " + display
 }
 
 func initPrompt(reader *bufio.Reader, out io.Writer, label, defaultValue string) (string, error) {
-	display := initDisplayDefault(defaultValue)
+	return initPromptSourced(reader, out, label, defaultValue, "")
+}
+
+// initPromptSourced is initPrompt with a named default source shown inside
+// the bracket, e.g. `resolver [from Zotero: …]`.
+func initPromptSourced(reader *bufio.Reader, out io.Writer, label, defaultValue, source string) (string, error) {
+	display := initDisplayDefault(defaultValue, source)
 	if _, err := fmt.Fprintf(out, "  › %s [%s]: ", label, display); err != nil {
 		return "", err
 	}
@@ -548,6 +613,86 @@ func initPrompt(reader *bufio.Reader, out io.Writer, label, defaultValue string)
 		return defaultValue, nil
 	}
 	return value, nil
+}
+
+// chromeUnpackedID computes the extension ID Chrome assigns an unpacked
+// build: the first 16 bytes of SHA-256 over the absolute load directory,
+// each nibble mapped 0→a…f→p. Lets init accept a folder path where an ID
+// is expected. Verified against a live chrome://extensions card.
+func chromeUnpackedID(dir string) string {
+	sum := sha256.Sum256([]byte(dir))
+	encoded := hex.EncodeToString(sum[:16])
+	id := make([]byte, len(encoded))
+	for i := 0; i < len(encoded); i++ {
+		c := encoded[i]
+		if c >= '0' && c <= '9' {
+			id[i] = 'a' + (c - '0')
+		} else {
+			id[i] = 'a' + (c - 'a') + 10
+		}
+	}
+	return string(id)
+}
+
+// resolveChromeExtensionID turns prompt/flag input into an extension ID:
+// a folder path (absolute, ~-prefixed, or containing a separator) yields the
+// computed unpacked ID; anything else passes through as a literal ID.
+func resolveChromeExtensionID(raw string) (id string, computedFrom string, err error) {
+	value := strings.TrimSpace(raw)
+	if value == "" || !strings.ContainsAny(value, "/\\~") {
+		return value, "", nil
+	}
+	if strings.HasPrefix(value, "~") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", "", fmt.Errorf("expanding %q: %w", value, err)
+		}
+		value = filepath.Join(home, strings.TrimPrefix(value, "~"))
+	}
+	absolute, err := filepath.Abs(value)
+	if err != nil {
+		return "", "", fmt.Errorf("resolving %q: %w", value, err)
+	}
+	if _, err := os.Stat(absolute); err != nil {
+		return "", "", fmt.Errorf("extension folder %s: %w", absolute, err)
+	}
+	return chromeUnpackedID(absolute), absolute, nil
+}
+
+// detectBrowsers names installed browsers, best-effort, for the Browser
+// section explanation. Empty when nothing is detectable.
+func detectBrowsers() []string {
+	found := []string{}
+	if runtime.GOOS == "darwin" {
+		apps := []struct{ name, path string }{
+			{"Chrome", "Google Chrome.app"},
+			{"Edge", "Microsoft Edge.app"},
+			{"Brave", "Brave Browser.app"},
+			{"Vivaldi", "Vivaldi.app"},
+			{"Opera", "Opera.app"},
+			{"Firefox", "Firefox.app"},
+		}
+		home, _ := os.UserHomeDir()
+		for _, app := range apps {
+			for _, root := range []string{"/Applications", filepath.Join(home, "Applications")} {
+				if _, err := os.Stat(filepath.Join(root, app.path)); err == nil {
+					found = append(found, app.name)
+					break
+				}
+			}
+		}
+		return found
+	}
+	binaries := []struct{ name, binary string }{
+		{"Chrome", "google-chrome"}, {"Chromium", "chromium"}, {"Edge", "microsoft-edge"},
+		{"Brave", "brave-browser"}, {"Vivaldi", "vivaldi"}, {"Firefox", "firefox"},
+	}
+	for _, b := range binaries {
+		if _, err := exec.LookPath(b.binary); err == nil {
+			found = append(found, b.name)
+		}
+	}
+	return found
 }
 
 // initYesNo is the single yes/no grammar for the guided flow: [Y/n] or [y/N],
