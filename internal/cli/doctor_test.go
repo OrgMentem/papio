@@ -75,17 +75,27 @@ func TestDoctorExtensionNotConnectedWarnsWithSetupFix(t *testing.T) {
 	}
 }
 
-func TestDoctorDaemonDownSkipsExtension(t *testing.T) {
+func TestDoctorDaemonDownCollapsesIntegrationSkips(t *testing.T) {
 	cfg := config.Default()
 	cfg.Path = filepath.Join(t.TempDir(), "config.toml")
 	deps := testDoctorDependencies(t, cfg, doctor.DaemonStatus{})
 	deps.DaemonStatus = func(context.Context, config.Config) (doctor.DaemonStatus, error) {
-		return doctor.DaemonStatus{}, errors.New("daemon is unreachable")
+		return doctor.DaemonStatus{}, errors.New("dial ipc daemon: no such file or directory")
 	}
 	report := doctor.RunIntegration(context.Background(), deps)
+	daemonCheck := report.Checks[1]
+	if daemonCheck.Name != "daemon" || daemonCheck.Status != doctor.Fail || !strings.Contains(daemonCheck.Detail, "not running or unreachable") || !strings.Contains(daemonCheck.Remediation, "--start") {
+		t.Fatalf("daemon check = %#v", daemonCheck)
+	}
 	got := report.Checks[2]
-	if got.Name != "extension" || got.Status != doctor.Skip || got.Detail != "skipped: daemon is unreachable" {
-		t.Fatalf("extension check = %#v", got)
+	if got.Name != "integrations" || got.Status != doctor.Skip || got.Detail != "skipped: daemon is unreachable (extension, native hosts, zotio)" {
+		t.Fatalf("integrations check = %#v", got)
+	}
+	// The single collapsed skip replaces the old four-line cascade.
+	for _, check := range report.Checks {
+		if check.Status == doctor.Skip && check.Name != "integrations" && !strings.HasPrefix(check.Name, "updates") {
+			t.Fatalf("unexpected extra skip check %#v", check)
+		}
 	}
 }
 

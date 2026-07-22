@@ -234,12 +234,7 @@ func RunIntegration(ctx context.Context, deps IntegrationDependencies) Report {
 	}
 	skipRemaining := func(reason string) {
 		add("daemon", Skip, reason, "")
-		add("extension", Skip, reason, "")
-		add("native host (Chrome)", Skip, reason, "")
-		add("native host (Firefox)", Skip, reason, "")
-		add("zotio", Skip, reason, "")
-		add("updates (papio)", Skip, reason, "")
-		add("updates (zotio)", Skip, reason, "")
+		add("integrations", Skip, reason+" (extension, native hosts, zotio, updates)", "")
 	}
 
 	if !integrationDependenciesComplete(deps) {
@@ -260,14 +255,14 @@ func RunIntegration(ctx context.Context, deps IntegrationDependencies) Report {
 
 	status, err := deps.DaemonStatus(ctx, cfg)
 	if err != nil {
-		add("daemon", Fail, err.Error(), "papio status")
-		skipRemainingAfterDaemon(add, "skipped: daemon is unreachable")
+		add("daemon", Fail, "not running or unreachable ("+err.Error()+")", "papio doctor --start (any other papio command also autostarts it)")
+		add("integrations", Skip, "skipped: daemon is unreachable (extension, native hosts, zotio)", "")
 		runUpdateChecks(ctx, cfg, deps, nil, add)
 		return report
 	}
 	if status.Status != "ok" || strings.TrimSpace(status.Version) == "" {
-		add("daemon", Fail, fmt.Sprintf("unexpected daemon status %q (version %q)", status.Status, status.Version), "papio status")
-		skipRemainingAfterDaemon(add, "skipped: daemon status is invalid")
+		add("daemon", Fail, fmt.Sprintf("unexpected daemon status %q (version %q)", status.Status, status.Version), "papio daemon stop, then rerun doctor")
+		add("integrations", Skip, "skipped: daemon status is invalid (extension, native hosts, zotio)", "")
 		runUpdateChecks(ctx, cfg, deps, nil, add)
 		return report
 	}
@@ -390,13 +385,6 @@ func runZotioUpdateCheck(ctx context.Context, cfg config.Config, deps Integratio
 
 func integrationDependenciesComplete(deps IntegrationDependencies) bool {
 	return deps.CLIVersion != "" && deps.LoadConfig != nil && deps.DaemonStatus != nil && deps.ManifestDir != nil && deps.FirefoxDir != nil && deps.ReadFile != nil && deps.ZotioPreflight != nil
-}
-
-func skipRemainingAfterDaemon(add func(string, string, string, string), reason string) {
-	add("extension", Skip, reason, "")
-	add("native host (Chrome)", Skip, reason, "")
-	add("native host (Firefox)", Skip, reason, "")
-	add("zotio", Skip, reason, "")
 }
 
 func runManifestChecks(cfg config.Config, deps IntegrationDependencies, add func(string, string, string, string)) {

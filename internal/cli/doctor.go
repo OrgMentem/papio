@@ -65,7 +65,24 @@ func runReadinessDoctor(ctx context.Context, cfg config.Config) doctor.Report {
 }
 
 func newDoctorCommand(opt *options) *cobra.Command {
-	return newDoctorCommandWithDependencies(opt, defaultDoctorDependencies(opt), runReadinessDoctor)
+	var start bool
+	deps := defaultDoctorDependencies(opt)
+	diagnose := deps.DaemonStatus
+	deps.DaemonStatus = func(ctx context.Context, cfg config.Config) (doctor.DaemonStatus, error) {
+		if !start {
+			return diagnose(ctx, cfg)
+		}
+		// --start opts into the same autostart every ordinary command uses, so
+		// a first-run doctor can bring the daemon up instead of reporting it down.
+		var status doctor.DaemonStatus
+		if err := opt.call(ctx, "ping", struct{}{}, &status); err != nil {
+			return doctor.DaemonStatus{}, err
+		}
+		return status, nil
+	}
+	command := newDoctorCommandWithDependencies(opt, deps, runReadinessDoctor)
+	command.Flags().BoolVar(&start, "start", false, "autostart the daemon before integration checks instead of diagnosing a stopped one")
+	return command
 }
 
 func newDoctorCommandWithDependencies(opt *options, deps doctor.IntegrationDependencies, readiness doctorReadinessRunner) *cobra.Command {

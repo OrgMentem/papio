@@ -348,9 +348,11 @@ func commandExec(ctx context.Context, name string, args ...string) error {
 			if len(trimmed) > 200 {
 				trimmed = trimmed[:200]
 			}
-			return fmt.Errorf("%w: %s", err, trimmed)
+			return fmt.Errorf("%s: %w: %s", name, err, trimmed)
 		}
-		return err
+		// Name the command even without output: a bare "exit status 1" is
+		// undebuggable from the CLI surface.
+		return fmt.Errorf("%s: %w", name, err)
 	}
 	return nil
 }
