@@ -17,6 +17,12 @@ import (
 
 var diagnoseURLRE = regexp.MustCompile(`https?://[^\s"'<>]+`)
 
+// diagnosePathRE matches absolute filesystem paths (POSIX with two or more
+// segments, or Windows drive paths) so quarantine/data-dir locations embedded
+// in action and event details never reach a support report. DOIs are safe:
+// they never start with a path separator.
+var diagnosePathRE = regexp.MustCompile(`\B/(?:[\w.@+~-]+/)+[\w.@+~-]+|\b[A-Za-z]:\\[^\s"'<>]+`)
+
 type diagnoseReport struct {
 	GeneratedAt        string           `json:"generated_at"`
 	DaemonVersion      string           `json:"daemon_version"`
@@ -176,7 +182,8 @@ func diagnoseURLs(text string) []string {
 }
 
 func scrubDiagnoseText(text string) string {
-	return diagnoseURLRE.ReplaceAllStringFunc(text, redact.URL)
+	text = diagnoseURLRE.ReplaceAllStringFunc(text, redact.URL)
+	return diagnosePathRE.ReplaceAllString(text, "<local-path>")
 }
 
 func printDiagnoseReport(out interface{ Write([]byte) (int, error) }, report diagnoseReport) error {

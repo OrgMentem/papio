@@ -119,8 +119,15 @@ func TestAdapterDiagnoseRedactsURLsInBothOutputModes(t *testing.T) {
 		if err := root.ExecuteContext(context.Background()); err != nil {
 			t.Fatalf("adapter diagnose: %v", err)
 		}
-		if got := out.String(); strings.Contains(got, "token=SECRET") {
+		got := out.String()
+		if strings.Contains(got, "token=SECRET") {
 			t.Fatalf("secret leaked in output: %q", got)
+		}
+		if strings.Contains(got, "/quarantine/") || strings.Contains(got, "/Users/reader") {
+			t.Fatalf("local path leaked in output: %q", got)
+		}
+		if !strings.Contains(got, "<local-path>") {
+			t.Fatalf("path placeholder missing: %q", got)
 		}
 	}
 }
@@ -158,7 +165,7 @@ func diagnoseTestDetail() api.JobDetail {
 			BlockedBy:    "institutional_sign_in",
 			Revision:     3,
 			CreatedAt:    "2026-07-22T12:01:00Z",
-			Detail:       "Open " + providerURL,
+			Detail:       "Open " + providerURL + " (local quarantine file: /Users/reader/.local/share/papio/quarantine/job_01.pdf)",
 		}},
 		Events: []map[string]any{{
 			"at":     "2026-07-22T12:01:00Z",

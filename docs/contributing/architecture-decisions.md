@@ -52,8 +52,8 @@
 
 ## Handoff offers do not hard-expire
 
-**Context:** Browser handoffs need a fresh resolver link when an institution rejects an old authentication request, but the daemon already reissues that link whenever a user opens actions or the inbox.
+**Context:** Browser handoffs need a fresh resolver link when an institution rejects an old authentication request. `papio actions open` constructs the resolver URL at open time, and the browser bridge offers a parked handoff anew per extension session; the extension inbox opens the links a triage item already carries.
 
-**Decision:** *papio* keeps the fresh-link-per-open model: every `papio actions open` or inbox open mints a fresh handoff link. The wire `expires_at` remains advisory; there is no daemon-side expiry sweeper, and `human_actions.expires_at` remains unenforced.
+**Decision:** *papio* keeps re-issue-on-open instead of hard expiry: `papio actions open` mints a fresh handoff link each run, and the bridge re-offers parked jobs to each new extension session. The wire `expires_at` remains advisory; there is no daemon-side expiry sweeper, and `human_actions.expires_at` remains unenforced.
 
-**Why:** Offers are local-only, so there is no confidentiality window to enforce. Reissuing on open already handles stale links, while hard expiry would add a user-visible failure mode without a safety benefit.
+**Why:** Offers are local-only, so there is no confidentiality window to enforce. Re-issue on open and re-offer per session already handle stale links where they are constructed, while hard expiry would add a user-visible failure mode without a safety benefit. If inbox-opened links prove staleness-prone in practice, the fix is minting fresh links for inbox open — not expiring offers.
