@@ -279,14 +279,20 @@ func applyInitConfig(cmd *cobra.Command, out io.Writer, cfg *config.Config, exis
 	}
 
 	// Browser extension identity: the native host only accepts these exact
-	// extension IDs. Firefox's add-on ID is fixed for the built extension, so it
-	// defaults to the known value and works on the first run. Chrome assigns an
-	// unpacked extension its own ID, so paste the one shown at chrome://extensions
-	// (or pass --extension-id) — an empty value leaves the Chrome bridge disabled.
+	// extension IDs. Both browsers now have fixed IDs for the published
+	// packages — the Chrome Web Store item and the built Firefox add-on — so
+	// both default to the known value and work on the first run. Only an
+	// unpacked development build carries a machine-specific Chrome ID; paste
+	// the one shown at chrome://extensions (or pass --extension-id) in that
+	// case. An empty value leaves that browser's bridge disabled.
 	if !input.nonInteractive && !input.skipBrowser {
 		fmt.Fprintln(out, "Browser extension")
 		if !input.extensionIDSet {
-			value, err := initPrompt(reader, out, "Chrome extension ID from chrome://extensions (blank to skip Chrome)", cfg.Browser.ExtensionID)
+			chromeDefault := cfg.Browser.ExtensionID
+			if chromeDefault == "" {
+				chromeDefault = defaultChromeExtensionID
+			}
+			value, err := initPrompt(reader, out, "Chrome extension ID (Web Store install uses the default; unpacked builds: paste the ID from chrome://extensions)", chromeDefault)
 			if err != nil {
 				return err
 			}
@@ -466,6 +472,12 @@ func initLine(out io.Writer, pass bool, step, detail string) {
 	_, _ = fmt.Fprintf(out, "%s %s: %s\n", mark, step, detail)
 }
 
+// defaultChromeExtensionID is the Chrome Web Store package's fixed item id
+// (https://chromewebstore.google.com/detail/papio/npccengdhjmpojpjmjoeeclpdhcjelhf).
+// It is the init default so a store-installed extension works on the first run;
+// unpacked development builds carry a different, machine-specific ID.
+const defaultChromeExtensionID = "npccengdhjmpojpjmjoeeclpdhcjelhf"
+
 // defaultFirefoxExtensionID is the built Firefox add-on's fixed gecko id (see
 // extension/build.ts). It is the init default so Firefox works on the first run
 // without the user discovering an ID.
@@ -476,5 +488,5 @@ func writeBrowserInstructions(out io.Writer) {
 	if err != nil {
 		extensionPath = "extension"
 	}
-	_, _ = fmt.Fprintf(out, "Browser setup:\n  Chrome:\n    1. Open chrome://extensions.\n    2. Enable Developer mode, then click Load unpacked and select %s.\n    3. Open papio's Details page and grant optional host permissions only for publisher sites you use.\n    4. If the extension ID Chrome shows differs from the one you entered, re-run: papio init --extension-id <id>.\n  Firefox:\n    1. Open about:debugging#/runtime/this-firefox and click Load Temporary Add-on.\n    2. Select %s/firefox/manifest.json (its add-on ID %s is set by default).\n    3. On papio's options page, grant the Library resolver access permission.\n", extensionPath, extensionPath, defaultFirefoxExtensionID)
+	_, _ = fmt.Fprintf(out, "Browser setup:\n  Chrome:\n    1. Install papio from the Chrome Web Store: https://chromewebstore.google.com/detail/papio/%s\n       (unpacked development builds instead: chrome://extensions -> Developer mode -> Load unpacked -> %s, then re-run: papio init --extension-id <id shown on the card>).\n    2. Open papio's Details page and grant optional host permissions only for publisher sites you use.\n  Firefox:\n    1. Open about:debugging#/runtime/this-firefox and click Load Temporary Add-on (AMO listing pending review).\n    2. Select %s/firefox/manifest.json (its add-on ID %s is set by default).\n    3. On papio's options page, grant the Library resolver access permission.\n", defaultChromeExtensionID, extensionPath, extensionPath, defaultFirefoxExtensionID)
 }

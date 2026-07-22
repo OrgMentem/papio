@@ -17,9 +17,10 @@ joined outcome.
 
 ## The Chrome extension is outdated
 
-An unpacked extension can keep running outdated code even after you change the
-files on disk. The fix is an explicit extension reload; a Chrome restart, killing the
-process, or reloading the extension's folder alone is not enough.
+Store-installed extensions update automatically — this section is for unpacked
+development builds, which can keep running outdated code even after you change
+the files on disk. The fix is an explicit extension reload; a Chrome restart,
+killing the process, or reloading the extension's folder alone is not enough.
 
 ### Preferred UI reload
 

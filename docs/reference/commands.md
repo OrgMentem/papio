@@ -239,8 +239,12 @@ papio daemon stop
 Check acquisition readiness and local integrations
 
 ```
-papio doctor
+papio doctor [flags]
 ```
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--start` | `bool` | `false` | autostart the daemon before integration checks instead of diagnosing a stopped one |
 
 ## `papio inbox`
 

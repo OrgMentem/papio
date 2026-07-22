@@ -70,22 +70,33 @@ Install `zotio` and put it on your `PATH` when you want *papio* to import finish
 
 ### The browser extension
 
-*papio* bundles a browser extension (in `extension/`) that runs in any Chromium browser — Chrome, Edge, Vivaldi, Brave, Opera — or Firefox. It reaches the daemon through a native-messaging connector that `papio init` installs, so load it now to get its ID, then hand that ID to `papio init` in the next step. (Installing the same package from the Chrome Web Store keeps one extension ID across every Chromium browser; if you also publish on the Edge Add-ons store — a different ID — or ship a differently keyed build, add those IDs to `browser.extension_ids`.)
+*papio* bundles a browser extension that runs in any Chromium browser — Chrome, Edge, Vivaldi, Brave, Opera — or Firefox. It reaches the daemon through a native-messaging connector that `papio init` installs.
 
 === "Chrome / Chromium"
 
-    1. Open `chrome://extensions`.
-    2. Enable **Developer mode**, then choose **Load unpacked** and select `extension/`.
-    3. Open *papio*'s **Details** page and grant optional host permissions only for the publisher sites you use.
-    4. Note the extension ID shown on the card — you'll give it to `papio init`. If it later differs from the configured one, rerun `papio init --extension-id <id>`.
+    1. Install [**papio** from the Chrome Web Store](https://chromewebstore.google.com/detail/papio/npccengdhjmpojpjmjoeeclpdhcjelhf). The store package keeps one fixed extension ID — `npccengdhjmpojpjmjoeeclpdhcjelhf` — across every Chromium browser, and `papio init` uses it by default, so there is nothing to copy.
+    2. Open *papio*'s **Details** page and grant optional host permissions only for the publisher sites you use.
+
+    Store-installed extensions update automatically. (If you install a differently keyed build — e.g. a future Edge Add-ons store copy, which carries a different ID — add its ID to `browser.extension_ids`.)
 
 === "Firefox"
 
+    The add-on is awaiting review on Firefox Add-ons (AMO); until it is published, load the built add-on temporarily:
+
     1. Open `about:debugging#/runtime/this-firefox` and choose **Load Temporary Add-on**.
-    2. Select `extension/firefox/manifest.json`.
+    2. Select `extension/firefox/manifest.json` (from a release bundle or a local `bun run build`).
     3. On *papio*'s options page, grant the Library resolver access permission.
 
-    The built Firefox add-on uses the fixed ID `papio@orgmentem.com` by default; pass `--firefox-extension-id` to `papio init` only when the allowed add-on ID must differ.
+    Temporary add-ons do not persist across Firefox restarts. The built add-on uses the fixed ID `papio@orgmentem.com` by default; pass `--firefox-extension-id` to `papio init` only when the allowed add-on ID must differ.
+
+=== "Development install (unpacked)"
+
+    For hacking on the extension itself, load it unpacked from a checkout:
+
+    1. Open `chrome://extensions`, enable **Developer mode**, choose **Load unpacked**, and select `extension/`.
+    2. Note the extension ID shown on the card — unpacked builds get a machine-specific ID, so hand it to `papio init --extension-id <id>`.
+
+    Manually loaded builds do not auto-update; reload after each rebuild.
 
 !!! note "Windows connector refresh"
     On Windows the connector is registered under the current-user registry (`HKCU\Software\{Google\Chrome,Mozilla}\NativeMessagingHosts`) and runs from a copy of the `papio` binary — rerun `papio init` after upgrading *papio* so that copy is refreshed. On macOS and Linux the connector is a symlink and needs no refresh.
@@ -109,9 +120,10 @@ The interactive setup asks for:
 1. A contact email for polite API pools.
 2. The `zotio` executable and attachment mode (`stored` or `linked-file`).
 3. Whether to install browser integration.
-4. Browser extension identities: the Chrome extension ID from
-   `chrome://extensions` and the Firefox add-on ID. Firefox defaults to the
-   built add-on's fixed ID, `papio@orgmentem.com`.
+4. Browser extension identities: the Chrome extension ID (defaults to the
+   Chrome Web Store package's fixed ID; only unpacked development builds need
+   a different one) and the Firefox add-on ID, which defaults to the built
+   add-on's fixed ID, `papio@orgmentem.com`.
 5. Institution settings when browser integration is enabled: a library OpenURL
    resolver base URL; if that URL is set, an optional Shibboleth IdP entityID
    for auto login-routing and a ProQuest account ID. For ProQuest, paste either

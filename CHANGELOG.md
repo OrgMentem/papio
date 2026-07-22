@@ -8,6 +8,37 @@ so older sections below include extension entries. The initial release entry
 is synthesized from the complete `papio` and `zotio` Git histories and the
 execution records in `notes/acquisition-stack-plan.md`.
 
+## [Unreleased]
+
+### Added
+
+- **Library-completeness line in `papio status`**: when zotio is configured,
+  status leads with `Library: N item(s) missing PDFs — papio acquire
+  --from-zotio fills them` (or `Library: complete`), backed by a new
+  `zotio.missing_count` RPC over zotio's local mirror.
+- **`papio doctor --start`**: opts doctor into the same daemon autostart every
+  ordinary command uses, so a first run can bring the stack up instead of
+  reporting it down. Default behavior still diagnoses a stopped daemon.
+- **`papio init` defaults the Chrome extension ID to the Chrome Web Store
+  package** (`npccengdhjmpojpjmjoeeclpdhcjelhf`) — a store install needs no ID
+  copying; only unpacked development builds still paste theirs.
+- Triage snapshots now expose whether a human action needs institutional
+  sign-in or has open access, so browser inboxes can show the same access
+  guidance as `papio actions list`.
+
+### Changed
+
+- Doctor's daemon-unreachable report collapses the four dependent SKIP lines
+  into one `integrations` line and names the actual problem ("not running or
+  unreachable") with the `--start` remediation, instead of a six-line cascade
+  for a stopped daemon.
+- Opener failures in `papio actions open` now name the failing command even
+  when it produced no output (no more bare `exit status 1`).
+- Getting-started, README, and troubleshooting now document the Chrome Web
+  Store install as the default path; unpacked loading moved under a
+  development-install tab. Firefox remains a temporary add-on until the AMO
+  listing clears review.
+
 ## [0.8.0] - 2026-07-21
 
 ### Added

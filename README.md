@@ -8,8 +8,8 @@
 
 <p align="center">
   <strong>
-    The paper-acquisition broker for your
-    <a href="https://www.zotero.org/">Zotero</a> library
+    Fill the missing PDFs in your
+    <a href="https://www.zotero.org/">Zotero</a> library — and keep it that way
   </strong>
 </p>
 
@@ -46,13 +46,14 @@
 </p>
 
 <p align="center">
-  Finding a paper is easy; <em>legitimately acquiring</em> it is the tedious
-  part. <code>papio</code> searches scholarly works on OpenAlex, turns your
-  picks into acquisition jobs, resolves each one through
-  open-access and licensed sources first — falling back to a visible
-  institutional pass in your own browser only when needed — validates every
-  PDF before you trust it, and hands ready PDFs to Zotero through
-  <a href="https://github.com/OrgMentem/zotio">zotio</a> behind a
+  Finding a paper is easy; <em>getting its PDF, legitimately</em> is the tedious
+  part. <code>papio</code> backfills the works in your library that lack full
+  text, checking open-access and licensed sources first and falling back to a
+  visible institutional pass in your own browser only when needed. Watch a
+  collection and new matches arrive with verified full text; or hand the loop
+  to a research agent over MCP — without handing it your university
+  credentials. Every PDF is validated before it reaches Zotero through
+  <a href="https://github.com/OrgMentem/zotio">zotio</a>'s
   preview-and-confirmation boundary.
 </p>
 
@@ -263,10 +264,11 @@ git clone https://github.com/OrgMentem/papio && cd papio && go build ./cmd/papio
   `brew install poppler tesseract` (or disable OCR in the
   [config](https://orgmentem.github.io/papio/reference/config-reference/)).
 - **Chrome or Firefox with the *papio* extension** for human-authenticated
-  institutional access — Chrome loads `extension/` unpacked, Firefox loads the
-  generated `extension/firefox/` build via `about:debugging`. `papio init`
-  prints the exact steps; skip with `papio init --skip-browser` for OA-only
-  headless use.
+  institutional access — Chrome installs it from the
+  [Chrome Web Store](https://chromewebstore.google.com/detail/papio/npccengdhjmpojpjmjoeeclpdhcjelhf);
+  Firefox loads the built `extension/firefox/` via `about:debugging` until the
+  AMO listing clears review. `papio init` prints the exact steps; skip with
+  `papio init --skip-browser` for OA-only headless use.
 - **[zotio](https://github.com/OrgMentem/zotio)** on `PATH` (or
   `[zotio] executable` in the config) for Zotero import; optional — without it
   *papio* stops at validated bundles.
