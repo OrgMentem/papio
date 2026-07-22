@@ -53,8 +53,10 @@ import { detectAuthFailure } from "./authfail";
 
 export const NATIVE_HOST = "com.orgmentem.papio";
 const CHROME_PDF_VIEWER_HOST = "mhjfbmdgcfjbbpaeojofohoefgiehjai";
-/** Lowest native daemon that can service this extension. */
-const MIN_DAEMON_VERSION = "0.1.0";
+/** Lowest native daemon that can service this extension. 0.9.0 renamed the
+ * wire access mode to "delegated"; older daemons emit "maximal", which this
+ * extension rejects fail-closed. */
+const MIN_DAEMON_VERSION = "0.9.0";
 
 
 const AUTH_EVIDENCE_TTL_MS = 30 * 60_000;

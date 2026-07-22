@@ -39,8 +39,10 @@ import (
 )
 
 const (
-	handoffActionKind            = "openurl_handoff"
-	MinExtensionVersion          = "0.1.0"
+	handoffActionKind = "openurl_handoff"
+	// MinExtensionVersion: 0.5.0 renamed the wire access mode to "delegated";
+	// older extensions fail-closed on offers carrying it.
+	MinExtensionVersion          = "0.5.0"
 	pageAcquireFeature           = "page_acquire"
 	triageSnapshotFeature        = "triage_snapshot_v1"
 	triageSnapshotSchema2Feature = "triage_snapshot_schema_v2"

@@ -34,12 +34,12 @@ func TestSecondBrowserHelloIsDeniedNotStolen(t *testing.T) {
 	b, jobs, _, _ := newBridge(t)
 	id := park(t, jobs, "wr_arb_deny", handoffWork())
 
-	msgs, _ := runSyncAs(t, b, sessA, helloAs("0.4.0"))
+	msgs, _ := runSyncAs(t, b, sessA, helloAs("0.6.0"))
 	if firstOfType(msgs, protocol.MsgHelloAck) == nil || firstOfType(msgs, protocol.MsgJobOffer) == nil {
 		t.Fatalf("holder must receive hello_ack + job_offer, got %+v", msgs)
 	}
 
-	msgs, _ = runSyncAs(t, b, sessB, helloAs("0.3.1"))
+	msgs, _ = runSyncAs(t, b, sessB, helloAs("0.5.1"))
 	busy := firstOfType(msgs, protocol.MsgError)
 	if busy == nil || busy.Payload.(*protocol.ErrorPayload).Code != "session_busy" {
 		t.Fatalf("second browser must be denied with session_busy, got %+v", msgs)
@@ -50,7 +50,7 @@ func TestSecondBrowserHelloIsDeniedNotStolen(t *testing.T) {
 
 	// The holder's identity is stable: no version flap.
 	version, _, connected := b.SessionInfo()
-	if !connected || version != "0.4.0" {
+	if !connected || version != "0.6.0" {
 		t.Fatalf("SessionInfo = %q/%v, want holder 0.4.0", version, connected)
 	}
 
@@ -69,8 +69,8 @@ func TestSecondBrowserHelloIsDeniedNotStolen(t *testing.T) {
 func TestNonHolderStatelessFramesPassAndHandoffFramesBlock(t *testing.T) {
 	b, jobs, _, _ := newBridge(t)
 	id := park(t, jobs, "wr_arb_frames", handoffWork())
-	runSyncAs(t, b, sessA, helloAs("0.4.0"))
-	runSyncAs(t, b, sessB, helloAs("0.3.1"))
+	runSyncAs(t, b, sessA, helloAs("0.6.0"))
+	runSyncAs(t, b, sessB, helloAs("0.5.1"))
 
 	// Stateless page_acquire from the non-holder browser still works.
 	msgs, _ := runSyncAs(t, b, sessB, inFrame(t, protocol.MsgPageAcquire, "",
@@ -99,8 +99,8 @@ func TestStaleHolderYieldsToLiveSession(t *testing.T) {
 	advance := settableClock(b)
 	id := park(t, jobs, "wr_arb_stale", handoffWork())
 
-	runSyncAs(t, b, sessA, helloAs("0.3.1"))
-	runSyncAs(t, b, sessB, helloAs("0.4.0")) // denied, pending
+	runSyncAs(t, b, sessA, helloAs("0.5.1"))
+	runSyncAs(t, b, sessB, helloAs("0.6.0")) // denied, pending
 
 	// A goes silent (killed native host); B keeps polling.
 	advance(sessionStaleAfter + time.Second)
@@ -113,7 +113,7 @@ func TestStaleHolderYieldsToLiveSession(t *testing.T) {
 		t.Fatalf("promoted session must receive the outstanding offer, got %+v", msgs)
 	}
 	version, _, _ := b.SessionInfo()
-	if version != "0.4.0" {
+	if version != "0.6.0" {
 		t.Fatalf("holder after takeover = %q, want 0.4.0", version)
 	}
 	if _, _, takeovers := b.Sessions(); takeovers != 1 {
@@ -123,7 +123,7 @@ func TestStaleHolderYieldsToLiveSession(t *testing.T) {
 
 func TestGoodbyeReleasesSessionImmediately(t *testing.T) {
 	b, _, _, _ := newBridge(t)
-	runSyncAs(t, b, sessA, helloAs("0.3.1"))
+	runSyncAs(t, b, sessA, helloAs("0.5.1"))
 
 	if _, err := b.Sync(context.Background(), sessA, true, nil); err != nil {
 		t.Fatal(err)
@@ -132,7 +132,7 @@ func TestGoodbyeReleasesSessionImmediately(t *testing.T) {
 		t.Fatal("goodbye must release the holder")
 	}
 	// The next browser takes the session with no stale wait.
-	msgs, _ := runSyncAs(t, b, sessB, helloAs("0.4.0"))
+	msgs, _ := runSyncAs(t, b, sessB, helloAs("0.6.0"))
 	if firstOfType(msgs, protocol.MsgHelloAck) == nil {
 		t.Fatalf("post-goodbye hello must be granted, got %+v", msgs)
 	}
@@ -141,8 +141,8 @@ func TestGoodbyeReleasesSessionImmediately(t *testing.T) {
 func TestClaimSwitchesHolderAndReoffersHandoffs(t *testing.T) {
 	b, jobs, _, _ := newBridge(t)
 	id := park(t, jobs, "wr_arb_claim", handoffWork())
-	runSyncAs(t, b, sessA, helloAs("0.3.1"))
-	runSyncAs(t, b, sessB, helloAs("0.4.0"))
+	runSyncAs(t, b, sessA, helloAs("0.5.1"))
+	runSyncAs(t, b, sessB, helloAs("0.6.0"))
 
 	if _, err := b.Claim("nope"); err == nil {
 		t.Fatal("claiming an unknown session must error")
@@ -174,8 +174,8 @@ func TestClaimPrefixMatchingHolderAndPendingIsAmbiguous(t *testing.T) {
 	b, _, _, _ := newBridge(t)
 	// Both ids share the "aaaa" prefix; sessA holds, the other pends.
 	similar := "aaaa9999aaaa9999aaaa9999aaaa9999"
-	runSyncAs(t, b, sessA, helloAs("0.4.0"))
-	runSyncAs(t, b, similar, helloAs("0.3.1"))
+	runSyncAs(t, b, sessA, helloAs("0.6.0"))
+	runSyncAs(t, b, similar, helloAs("0.5.1"))
 
 	if _, err := b.Claim("aaaa"); err == nil {
 		t.Fatal("prefix matching holder AND a pending session must be ambiguous, not a silent no-op")
@@ -184,7 +184,7 @@ func TestClaimPrefixMatchingHolderAndPendingIsAmbiguous(t *testing.T) {
 		t.Fatalf("exact holder claim = %q, %v; want no-op success", resolved, err)
 	}
 	version, _, _ := b.SessionInfo()
-	if version != "0.4.0" {
+	if version != "0.6.0" {
 		t.Fatalf("holder changed by ambiguous/no-op claims: %q", version)
 	}
 }
@@ -192,7 +192,7 @@ func TestClaimPrefixMatchingHolderAndPendingIsAmbiguous(t *testing.T) {
 func TestPromotedOutdatedSessionIsToldNotSilentlySeated(t *testing.T) {
 	b, _, _, _ := newBridge(t)
 	advance := settableClock(b)
-	runSyncAs(t, b, sessA, helloAs("0.4.0"))
+	runSyncAs(t, b, sessA, helloAs("0.6.0"))
 	runSyncAs(t, b, sessB, helloAs("0.0.1")) // below MinExtensionVersion, denied+pending
 
 	advance(sessionStaleAfter + time.Second)
@@ -205,7 +205,7 @@ func TestPromotedOutdatedSessionIsToldNotSilentlySeated(t *testing.T) {
 
 func TestOutdatedPendingSessionStillPassesStatelessFrames(t *testing.T) {
 	b, _, _, _ := newBridge(t)
-	runSyncAs(t, b, sessA, helloAs("0.4.0"))
+	runSyncAs(t, b, sessA, helloAs("0.6.0"))
 	runSyncAs(t, b, sessB, helloAs("0.0.1"))
 
 	msgs, _ := runSyncAs(t, b, sessB, inFrame(t, protocol.MsgPageAcquire, "",
@@ -217,17 +217,17 @@ func TestOutdatedPendingSessionStillPassesStatelessFrames(t *testing.T) {
 
 func TestLegacyHostsKeepLastHelloWins(t *testing.T) {
 	b, _, _, _ := newBridge(t)
-	if _, err := b.Sync(context.Background(), "", false, []json.RawMessage{helloAs("0.3.1")}); err != nil {
+	if _, err := b.Sync(context.Background(), "", false, []json.RawMessage{helloAs("0.5.1")}); err != nil {
 		t.Fatal(err)
 	}
-	if version, _, _ := b.SessionInfo(); version != "0.3.1" {
+	if version, _, _ := b.SessionInfo(); version != "0.5.1" {
 		t.Fatalf("legacy holder = %q", version)
 	}
 	// A second legacy hello replaces the first: the historical behavior.
-	if _, err := b.Sync(context.Background(), "", false, []json.RawMessage{helloAs("0.4.0")}); err != nil {
+	if _, err := b.Sync(context.Background(), "", false, []json.RawMessage{helloAs("0.6.0")}); err != nil {
 		t.Fatal(err)
 	}
-	if version, _, _ := b.SessionInfo(); version != "0.4.0" {
+	if version, _, _ := b.SessionInfo(); version != "0.6.0" {
 		t.Fatalf("legacy last-hello-wins broken, holder = %q", version)
 	}
 	// A session-aware host immediately displaces a legacy holder.
