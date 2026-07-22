@@ -21,6 +21,58 @@ import (
 //go:embed migrations/0001_init.sql
 var schemaV1 string
 
+//go:embed migrations/0013_zotio_tag_state.sql
+var schemaV13 string
+
+func TestOpenRollsForwardSchemaThirteenTagLedger(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	dbPath := filepath.Join(dataDir, "papio.db")
+	raw, err := sql.Open("sqlite", "file:"+dbPath+"?_pragma=foreign_keys(ON)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.ExecContext(ctx, schemaV13); err != nil {
+		t.Fatalf("apply schema v13: %v", err)
+	}
+	if _, err := raw.ExecContext(ctx, `
+		INSERT INTO zotio_tag_state (item_key, tag, updated_at)
+		VALUES ('LEGACY13', 'papio:unavailable', '2026-07-23T00:00:00Z');
+		PRAGMA user_version = 13;
+	`); err != nil {
+		t.Fatalf("seed schema v13: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	migrated, err := store.Open(ctx, dataDir)
+	if err != nil {
+		t.Fatalf("roll schema v13 forward: %v", err)
+	}
+	defer migrated.Close()
+	version, err := migrated.UserVersion(ctx)
+	if err != nil || version != 14 {
+		t.Fatalf("user_version = %d, %v; want 14", version, err)
+	}
+	var status string
+	if err := migrated.DB().QueryRowContext(ctx,
+		`SELECT status FROM zotio_tag_state WHERE item_key = 'LEGACY13'`,
+	).Scan(&status); err != nil {
+		t.Fatalf("read migrated tag ownership: %v", err)
+	}
+	if status != "owned" {
+		t.Fatalf("migrated status = %q, want owned", status)
+	}
+	var scopes int
+	if err := migrated.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM zotio_item_scope`).Scan(&scopes); err != nil {
+		t.Fatalf("read new scope table: %v", err)
+	}
+	if scopes != 0 {
+		t.Fatalf("migrated scope rows = %d, want 0", scopes)
+	}
+}
+
 func TestOpenRollsForwardSchemaOneWithoutLosingDurableRows(t *testing.T) {
 	ctx := context.Background()
 	dataDir := t.TempDir()
@@ -65,8 +117,8 @@ func TestOpenRollsForwardSchemaOneWithoutLosingDurableRows(t *testing.T) {
 	}
 	defer migrated.Close()
 	version, err := migrated.UserVersion(ctx)
-	if err != nil || version != 13 {
-		t.Fatalf("user_version = %d, %v; want 13", version, err)
+	if err != nil || version != 14 {
+		t.Fatalf("user_version = %d, %v; want 14", version, err)
 	}
 
 	var jobs, actions, exports int

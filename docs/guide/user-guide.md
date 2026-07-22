@@ -262,13 +262,25 @@ reading:
 - `papio:unavailable` — every OA and institutional route failed as of the
   last attempt. A saved search on this tag is your inter-library-loan /
   chase-it-yourself worklist; the tag clears itself if a later re-check
-  succeeds.
+  succeeds or you attach a PDF manually.
 
 Nothing else is ever tagged: a clean acquisition's only trace is the attached
 PDF. Tags converge with job state on the daemon's maintenance cadence;
 `papio zotio tags reconcile` forces one pass. Both are automatic-type tags,
 so Zotero's tag selector can hide the whole namespace, and colors are yours
 to assign (many people make `papio:needs-action` red).
+
+Papio never retypes or removes a same-name manual tag. Before uninstalling,
+disable the feature, restart the daemon so it reloads that setting, then force
+the cleanup pass:
+
+```sh
+# after setting zotio.exception_tags = false
+papio daemon stop
+papio zotio tags reconcile
+```
+
+The pass removes only automatic tags owned by papio.
 
 ### Triage failures
 

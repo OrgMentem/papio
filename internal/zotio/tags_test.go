@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -14,12 +16,18 @@ import (
 	"papio/internal/work"
 )
 
-// tagCLI records tag mutations; every other RunJSON shape is unexpected.
+// tagCLI records one-key tag mutations and models exact-key missing-PDF reads.
 type tagCLI struct {
-	version    string
-	preflights int
-	calls      [][]string
-	failAdds   bool
+	version       string
+	preflights    int
+	calls         [][]string
+	failAdds      bool
+	resolved      map[string]bool
+	existingTypes map[string]int
+	failKeys      map[string]error
+	resultErrors  map[string]error
+	removeNoOp    bool
+	mu            sync.Mutex
 }
 
 func (f *tagCLI) Preflight(context.Context) (*PreflightResult, error) {
@@ -33,6 +41,15 @@ func (f *tagCLI) Preflight(context.Context) (*PreflightResult, error) {
 func (f *tagCLI) MissingPDF(context.Context, string, int) ([]MissingPDFItem, error) {
 	return nil, fmt.Errorf("not used")
 }
+func (f *tagCLI) MissingPDFKeys(_ context.Context, keys []string) ([]MissingPDFItem, error) {
+	items := make([]MissingPDFItem, 0, len(keys))
+	for _, key := range keys {
+		if !f.resolved[key] {
+			items = append(items, MissingPDFItem{Key: key})
+		}
+	}
+	return items, nil
+}
 func (f *tagCLI) GetItem(context.Context, string) (*Item, error) { return nil, fmt.Errorf("not used") }
 func (f *tagCLI) Sync(context.Context) error                     { return nil }
 func (f *tagCLI) RunJSON(_ context.Context, args ...string) (json.RawMessage, error) {
@@ -40,11 +57,50 @@ func (f *tagCLI) RunJSON(_ context.Context, args ...string) (json.RawMessage, er
 	if !strings.Contains(joined, "items tags add") && !strings.Contains(joined, "items tags remove") {
 		return nil, fmt.Errorf("unexpected RunJSON %q", args)
 	}
+	key := args[len(args)-1]
+	f.mu.Lock()
+	f.calls = append(f.calls, append([]string(nil), args...))
+	f.mu.Unlock()
+	if err := f.failKeys[key]; err != nil {
+		return nil, err
+	}
 	if f.failAdds && strings.Contains(joined, "items tags add") {
 		return nil, fmt.Errorf("simulated zotio failure")
 	}
-	f.calls = append(f.calls, args)
-	return json.RawMessage(`{}`), nil
+	status := "applied"
+	var reason any
+	if tagType, exists := f.existingTypes[key]; exists && strings.Contains(joined, "items tags add") {
+		status = "no_op"
+		tag := args[len(args)-2]
+		reason = map[string]any{"tag_types": map[string]int{tag: tagType}}
+	}
+	if f.removeNoOp && strings.Contains(joined, "items tags remove") {
+		status = "no_op"
+		reason = "tag not present"
+	}
+	raw, _ := json.Marshal(map[string]any{
+		"result": map[string]any{"items": []map[string]any{{"key": key, "status": status, "reason": reason}}},
+	})
+	return raw, f.resultErrors[key]
+}
+
+type slowTagCLI struct {
+	*tagCLI
+	active atomic.Int32
+	max    atomic.Int32
+}
+
+func (f *slowTagCLI) RunJSON(ctx context.Context, args ...string) (json.RawMessage, error) {
+	active := f.active.Add(1)
+	for {
+		seen := f.max.Load()
+		if active <= seen || f.max.CompareAndSwap(seen, active) {
+			break
+		}
+	}
+	time.Sleep(20 * time.Millisecond)
+	defer f.active.Add(-1)
+	return f.tagCLI.RunJSON(ctx, args...)
 }
 
 func tagTestService(t *testing.T, cli CLI) (*Service, *job.Store) {
@@ -64,6 +120,11 @@ func createJob(t *testing.T, jobs *job.Store, requestID, itemKey string, states 
 		DOI: "10.1000/" + strings.ToLower(itemKey), Title: "Paper " + itemKey,
 	}, itemKey, "", job.Policy{AccessMode: "conservative", DesiredVersion: "any", FetchMaxBytes: 1 << 20}, nil)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := jobs.S.DB().ExecContext(ctx,
+		`INSERT INTO zotio_item_scope(item_key, scope, observed_at) VALUES (?, 'personal', ?) ON CONFLICT(item_key) DO NOTHING`,
+		itemKey, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 		t.Fatal(err)
 	}
 	from := job.StateQueued
@@ -92,6 +153,15 @@ func tagStateRows(t *testing.T, s *Service) map[string]string {
 		out[key] = tag
 	}
 	return out
+}
+
+func tagStateStatus(t *testing.T, s *Service, key string) (string, string) {
+	t.Helper()
+	var tag, status string
+	if err := s.Store.DB().QueryRow(`SELECT tag, status FROM zotio_tag_state WHERE item_key = ?`, key).Scan(&tag, &status); err != nil {
+		t.Fatal(err)
+	}
+	return tag, status
 }
 
 func TestReconcileTagsConvergesAndIsIdempotent(t *testing.T) {
@@ -123,7 +193,8 @@ func TestReconcileTagsConvergesAndIsIdempotent(t *testing.T) {
 		t.Fatalf("ledger = %v", state)
 	}
 
-	// Converged: the steady-state pass must not preflight or invoke zotio.
+	// Converged: the steady-state pass may re-check attachments, but must
+	// not preflight or issue a tag mutation.
 	cli.calls = nil
 	preflights := cli.preflights
 	result, err = service.ReconcileTags(ctx)
@@ -146,7 +217,7 @@ func TestReconcileTagsConvergesAndIsIdempotent(t *testing.T) {
 	if result.Removed != 1 || result.Added != 0 || len(cli.calls) != 1 {
 		t.Fatalf("clear pass = %+v calls=%q", result, cli.calls)
 	}
-	if joined := strings.Join(cli.calls[0], " "); !strings.HasPrefix(joined, "--agent --yes --group= items tags remove --tag "+TagNeedsAction+" AAAA1111") {
+	if joined := strings.Join(cli.calls[0], " "); !strings.HasPrefix(joined, "--agent --yes --group= items tags remove --automatic-only --tag "+TagNeedsAction+" AAAA1111") {
 		t.Fatalf("remove call = %q", joined)
 	}
 	if state := tagStateRows(t, service); len(state) != 1 || state["BBBB2222"] != TagUnavailable {
@@ -174,7 +245,7 @@ func TestReconcileTagsTransitionRemovesOldTagFirst(t *testing.T) {
 	if result.Removed != 1 || result.Added != 1 || len(cli.calls) != 2 {
 		t.Fatalf("transition pass = %+v calls=%q", result, cli.calls)
 	}
-	if !strings.Contains(strings.Join(cli.calls[0], " "), "items tags remove --tag "+TagNeedsAction) {
+	if !strings.Contains(strings.Join(cli.calls[0], " "), "items tags remove --automatic-only --tag "+TagNeedsAction) {
 		t.Fatalf("first call must remove the old tag: %q", cli.calls[0])
 	}
 	if !strings.Contains(strings.Join(cli.calls[1], " "), "items tags add --automatic --tag "+TagUnavailable) {
@@ -228,8 +299,12 @@ func TestReconcileTagsFailedWriteRetriesNextPass(t *testing.T) {
 	if _, err := service.ReconcileTags(ctx); err == nil {
 		t.Fatal("expected simulated failure")
 	}
-	if state := tagStateRows(t, service); len(state) != 0 {
-		t.Fatalf("failed write must not be recorded as applied: %v", state)
+	var status string
+	if err := service.Store.DB().QueryRow(`SELECT status FROM zotio_tag_state WHERE item_key = 'GGGG7777'`).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != tagStatusPending {
+		t.Fatalf("failed write ledger status = %q, want pending", status)
 	}
 	cli.failAdds = false
 	result, err := service.ReconcileTags(ctx)
@@ -238,6 +313,209 @@ func TestReconcileTagsFailedWriteRetriesNextPass(t *testing.T) {
 	}
 	if result.Added != 1 {
 		t.Fatalf("retry pass = %+v", result)
+	}
+}
+
+func TestReconcileTagsRecoversOwnedAutomaticTagAfterCrash(t *testing.T) {
+	cli := &tagCLI{existingTypes: map[string]int{"RECOVER1": 1}}
+	service, jobs := tagTestService(t, cli)
+	createJob(t, jobs, "request_zotio_RECOVER1", "RECOVER1", job.StateResolving, job.StateUnavailable)
+	if _, err := service.Store.DB().Exec(
+		`INSERT INTO zotio_tag_state (item_key, tag, status, updated_at) VALUES (?, ?, ?, ?)`,
+		"RECOVER1", TagUnavailable, tagStatusPending, time.Now().UTC().Format(time.RFC3339Nano),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := service.ReconcileTags(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Added != 0 {
+		t.Fatalf("recovery no-op must not count as a new add: %+v", result)
+	}
+	if _, status := tagStateStatus(t, service, "RECOVER1"); status != tagStatusOwned {
+		t.Fatalf("recovered status = %q, want owned", status)
+	}
+}
+
+func TestReconcileTagsPreservesPreexistingManualTag(t *testing.T) {
+	ctx := context.Background()
+	cli := &tagCLI{existingTypes: map[string]int{"MANUAL01": 0}}
+	service, jobs := tagTestService(t, cli)
+	jobID := createJob(t, jobs, "request_zotio_MANUAL01", "MANUAL01", job.StateResolving, job.StateAwaitingHuman)
+
+	if _, err := service.ReconcileTags(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if tag, status := tagStateStatus(t, service, "MANUAL01"); tag != TagNeedsAction || status != tagStatusForeign {
+		t.Fatalf("manual-tag ledger = (%q,%q), want foreign %q", tag, status, TagNeedsAction)
+	}
+	if err := jobs.Transition(ctx, jobID, job.StateAwaitingHuman, job.StateResolving, nil); err != nil {
+		t.Fatal(err)
+	}
+	cli.calls = nil
+	if _, err := service.ReconcileTags(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(cli.calls) != 0 {
+		t.Fatalf("manual tag must not be removed: calls=%q", cli.calls)
+	}
+	if state := tagStateRows(t, service); len(state) != 0 {
+		t.Fatalf("foreign ledger should clear locally: %v", state)
+	}
+}
+
+func TestReconcileTagsClearsAfterManualPDFAttachment(t *testing.T) {
+	ctx := context.Background()
+	cli := &tagCLI{}
+	service, jobs := tagTestService(t, cli)
+	createJob(t, jobs, "request_zotio_RESOLVED", "RESOLVED", job.StateResolving, job.StateUnavailable)
+	if _, err := service.ReconcileTags(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	cli.calls = nil
+	cli.resolved = map[string]bool{"RESOLVED": true}
+	result, err := service.ReconcileTags(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Removed != 1 || len(cli.calls) != 1 || !strings.Contains(strings.Join(cli.calls[0], " "), "--automatic-only") {
+		t.Fatalf("manual attachment clear = %+v calls=%q", result, cli.calls)
+	}
+}
+
+func TestReconcileTagsAcceptsAlreadyRemovedAutomaticTag(t *testing.T) {
+	ctx := context.Background()
+	cli := &tagCLI{}
+	service, jobs := tagTestService(t, cli)
+	createJob(t, jobs, "request_zotio_REMOVED1", "REMOVED1", job.StateResolving, job.StateUnavailable)
+	if _, err := service.ReconcileTags(ctx); err != nil {
+		t.Fatal(err)
+	}
+	createJob(t, jobs, "request_zotio_REMOVED2", "REMOVED1", job.StateResolving)
+	cli.removeNoOp = true
+	if _, err := service.ReconcileTags(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if state := tagStateRows(t, service); len(state) != 0 {
+		t.Fatalf("already-removed tag must clear ledger: %v", state)
+	}
+}
+
+func TestReconcileTagsDisableClearsOwnedTags(t *testing.T) {
+	ctx := context.Background()
+	cli := &tagCLI{}
+	service, jobs := tagTestService(t, cli)
+	createJob(t, jobs, "request_zotio_DISABLE1", "DISABLE1", job.StateResolving, job.StateUnavailable)
+	if _, err := service.ReconcileTags(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	service.ExceptionTags = false
+	cli.calls = nil
+	result, err := service.ReconcileTags(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Removed != 1 || len(tagStateRows(t, service)) != 0 {
+		t.Fatalf("disabled clear = %+v ledger=%v", result, tagStateRows(t, service))
+	}
+}
+
+func TestReconcileTagsExcludesUnknownLibraryScope(t *testing.T) {
+	cli := &tagCLI{}
+	service, jobs := tagTestService(t, cli)
+	createJob(t, jobs, "request_zotio_UNKNOWN1", "UNKNOWN1", job.StateResolving, job.StateUnavailable)
+	if _, err := service.Store.DB().Exec(`DELETE FROM zotio_item_scope WHERE item_key = 'UNKNOWN1'`); err != nil {
+		t.Fatal(err)
+	}
+	result, err := service.ReconcileTags(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Checked != 0 || len(cli.calls) != 0 {
+		t.Fatalf("unknown-scope result = %+v calls=%q", result, cli.calls)
+	}
+}
+
+func TestReconcileTagsMissingKeyDoesNotBlockOtherItems(t *testing.T) {
+	ctx := context.Background()
+	cli := &tagCLI{failKeys: map[string]error{"AAAA4040": fmt.Errorf("Zotero HTTP 404")}}
+	service, jobs := tagTestService(t, cli)
+	createJob(t, jobs, "request_zotio_AAAA4040", "AAAA4040", job.StateResolving, job.StateUnavailable)
+	createJob(t, jobs, "request_zotio_BBBBOKAY", "BBBBOKAY", job.StateResolving, job.StateUnavailable)
+
+	if _, err := service.ReconcileTags(ctx); err == nil {
+		t.Fatal("expected isolated 404 to remain reportable")
+	}
+	if _, status := tagStateStatus(t, service, "AAAA4040"); status != tagStatusMissing {
+		t.Fatalf("missing-key status = %q", status)
+	}
+	if _, status := tagStateStatus(t, service, "BBBBOKAY"); status != tagStatusOwned {
+		t.Fatalf("valid-key status = %q, want owned", status)
+	}
+	cli.calls = nil
+	if _, err := service.ReconcileTags(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(cli.calls) != 0 {
+		t.Fatalf("settled missing target must not poison later passes: %q", cli.calls)
+	}
+}
+
+func TestReconcileTagsPersistsAppliedOutcomeDespiteCommandError(t *testing.T) {
+	ctx := context.Background()
+	cli := &tagCLI{resultErrors: map[string]error{"PARTIAL1": fmt.Errorf("journal failed after mutation")}}
+	service, jobs := tagTestService(t, cli)
+	jobID := createJob(t, jobs, "request_zotio_PARTIAL1", "PARTIAL1", job.StateResolving, job.StateAwaitingHuman)
+
+	if _, err := service.ReconcileTags(ctx); err == nil {
+		t.Fatal("expected aggregate command error")
+	}
+	if _, status := tagStateStatus(t, service, "PARTIAL1"); status != tagStatusOwned {
+		t.Fatalf("applied outcome status = %q, want owned", status)
+	}
+	delete(cli.resultErrors, "PARTIAL1")
+	if err := jobs.Transition(ctx, jobID, job.StateAwaitingHuman, job.StateResolving, nil); err != nil {
+		t.Fatal(err)
+	}
+	result, err := service.ReconcileTags(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Removed != 1 {
+		t.Fatalf("clear after partial outcome = %+v", result)
+	}
+}
+
+func TestReconcileTagsSerializesConcurrentPasses(t *testing.T) {
+	base := &tagCLI{}
+	cli := &slowTagCLI{tagCLI: base}
+	service, jobs := tagTestService(t, cli)
+	createJob(t, jobs, "request_zotio_SERIAL01", "SERIAL01", job.StateResolving, job.StateUnavailable)
+
+	start := make(chan struct{})
+	errs := make(chan error, 2)
+	for range 2 {
+		go func() {
+			<-start
+			_, err := service.ReconcileTags(context.Background())
+			errs <- err
+		}()
+	}
+	close(start)
+	for range 2 {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := cli.max.Load(); got != 1 {
+		t.Fatalf("max concurrent mutations = %d, want 1", got)
+	}
+	if len(base.calls) != 1 {
+		t.Fatalf("mutation calls = %d, want one converging add", len(base.calls))
 	}
 }
 
@@ -261,13 +539,21 @@ func TestDesiredTagMapping(t *testing.T) {
 	}
 }
 
-func TestTagReconcilerDisabled(t *testing.T) {
+func TestTagReconcilerDisabledOnlyWhileCleanupRemains(t *testing.T) {
 	service, _ := tagTestService(t, &tagCLI{})
 	service.ExceptionTags = false
 	if service.TagReconciler() != nil {
-		t.Fatal("reconciler must be nil when exception tags are disabled")
+		t.Fatal("fresh disabled reconciler must add no maintenance work")
 	}
-	service.ExceptionTags = true
+	if _, err := service.Store.DB().Exec(
+		`INSERT INTO zotio_tag_state (item_key, tag, status, updated_at) VALUES (?, ?, ?, ?)`,
+		"CLEANUP1", TagUnavailable, tagStatusOwned, time.Now().UTC().Format(time.RFC3339Nano),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if service.TagReconciler() == nil {
+		t.Fatal("disabled reconciler must remain active while cleanup state exists")
+	}
 	service.CLI = nil
 	if service.TagReconciler() != nil {
 		t.Fatal("reconciler must be nil without a zotio CLI")

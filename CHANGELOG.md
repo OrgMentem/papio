@@ -17,12 +17,16 @@ execution records in `notes/acquisition-stack-plan.md`.
   Zotero itself by maintaining two reconciled automatic tags on linked items —
   `papio:needs-action` (acquisition parked on a human action) and
   `papio:unavailable` (OA and institutional routes exhausted, as of the last
-  attempt). Tags are a pure function of each item's newest job state,
-  converged on the maintenance cadence and repaired rather than replayed
-  (schema v13 adds the applied-state ledger); success stays untagged because
-  the attachment itself is the signal. `papio zotio tags reconcile` runs one
-  pass on demand. Requires zotio ≥ 0.13.0 (`items tags add --automatic`);
-  personal library only. Design record: zotio `dev/adr/0004`.
+  attempt). Desired state combines each item's newest job with a live
+  exact-key attachment check, so a PDF attached manually clears the marker.
+  Schema v14 rolls the v13 applied-state ledger forward with personal-library
+  provenance plus pending/owned/foreign/missing-target state; per-item
+  mutations survive partial failures,
+  serialize concurrent passes, and never claim or remove a same-name manual
+  tag. `papio zotio tags reconcile` runs one pass on demand. Requires zotio ≥
+  0.13.0 (`items tags add --automatic`, `items tags remove --automatic-only`);
+  personal library only. Turning the feature off cleans up papio-owned tags.
+  Design record: zotio `dev/adr/0004`.
 - Backfill re-checks `unavailable` items after a cool-down
   (`zotio.unavailable_recheck_days`, default 14) instead of retrying them on
   every watch cadence — availability drifts upward (green-OA deposits,

@@ -247,3 +247,10 @@ func TestRunJSONPreservesEnvelopeOnCancelError(t *testing.T) {
 		t.Fatalf("class = %q, want %q", info.Class, ErrorClassZotioCanceled)
 	}
 }
+
+func TestWithoutEnvRemovesAmbientGroupScope(t *testing.T) {
+	got := withoutEnv([]string{"PATH=/bin", "ZOTERO_GROUP=123", "OTHER=ok"}, "ZOTERO_GROUP")
+	if strings.Join(got, ",") != "PATH=/bin,OTHER=ok" {
+		t.Fatalf("filtered env = %v", got)
+	}
+}

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"papio/internal/bundle"
@@ -48,6 +49,7 @@ type Service struct {
 	// before QueueMissingPDF re-checks it. Zero disables the cool-down.
 	UnavailableRecheck time.Duration
 	Now                func() time.Time
+	tagMu              sync.Mutex
 }
 
 // QueueOptions configures one bounded import of Zotio's missing-PDF queue.
@@ -309,6 +311,11 @@ func (s *Service) QueueMissingPDF(ctx context.Context, options QueueOptions) (*Q
 	if err != nil {
 		return nil, err
 	}
+	if s.Store != nil {
+		if err := s.observePersonalItems(ctx, items); err != nil {
+			return nil, err
+		}
+	}
 	result := &QueueResult{
 		Preflight: preflight,
 		Queued:    make([]QueuedJob, 0, options.Limit),
@@ -361,6 +368,39 @@ func (s *Service) QueueMissingPDF(ctx context.Context, options QueueOptions) (*Q
 		})
 	}
 	return result, nil
+}
+
+// observePersonalItems records provenance only after a personal-library Zotio
+// scan returns the keys. Existing pre-v13 links remain scope-unknown and are
+// deliberately ineligible for personal exception-tag writes until observed.
+func (s *Service) observePersonalItems(ctx context.Context, items []MissingPDFItem) error {
+	if len(items) == 0 {
+		return nil
+	}
+	now := s.now().UTC().Format(time.RFC3339Nano)
+	tx, err := s.Store.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	for _, item := range items {
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO zotio_item_scope(item_key, scope, observed_at) VALUES (?, 'personal', ?)
+			ON CONFLICT(item_key) DO UPDATE SET scope = excluded.scope, observed_at = excluded.observed_at`,
+			item.Key, now); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("recording personal Zotero item scope: %w", err)
+		}
+		// A key that exists in the current missing-PDF scan is no longer a
+		// permanent 404; let the reconciler attempt it again.
+		if _, err := tx.ExecContext(ctx, `DELETE FROM zotio_tag_state WHERE item_key = ? AND status = 'missing'`, item.Key); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("resetting missing Zotero tag target: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("committing personal Zotero item scope: %w", err)
+	}
+	return nil
 }
 
 // liveJobForRequest reports a non-terminal job already carrying requestID, so

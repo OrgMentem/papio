@@ -3,10 +3,12 @@ package zotio
 
 import (
 	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"sort"
-	"strings"
 	"time"
 
 	"papio/internal/job"
@@ -18,39 +20,50 @@ import (
 // self-indicating (the attachment appears) and transient states have no
 // reader inside Zotero. See zotio dev/adr/0004.
 const (
-	// TagNeedsAction marks an item whose acquisition parked on a human
-	// action (SSO login, terms consent, identity review).
 	TagNeedsAction = "papio:needs-action"
-	// TagUnavailable marks an item papio exhausted OA and institutional
-	// routes for, as of the last attempt. Backfill re-checks it after the
-	// configured cool-down, so the tag self-clears when access appears.
 	TagUnavailable = "papio:unavailable"
 
-	// tagsMinimumZotioVersion is the first zotio release whose
-	// `items tags add` supports --automatic (Zotero automatic-type tags).
+	// First zotio release with --automatic and --automatic-only.
 	tagsMinimumZotioVersion = "0.13.0"
+	tagBatchSize            = 50
+	tagErrorLogInterval     = 15 * time.Minute
 
-	// tagBatchSize bounds item keys per zotio invocation, well under
-	// zotio's per-mutation change cap and any argv limit.
-	tagBatchSize = 50
-
-	// tagErrorLogInterval throttles repeated identical reconcile failures in
-	// the minutely maintenance loop.
-	tagErrorLogInterval = 15 * time.Minute
+	tagStatusPending = "pending"
+	tagStatusOwned   = "owned"
+	tagStatusForeign = "foreign"
+	tagStatusMissing = "missing"
 )
 
 // TagReconcileResult is stable machine output for `papio zotio tags reconcile`.
 type TagReconcileResult struct {
-	// Checked is the number of Zotero items considered (items with any
-	// papio job history or a previously applied exception tag).
 	Checked int `json:"checked"`
 	Added   int `json:"added"`
 	Removed int `json:"removed"`
 }
 
-// desiredTag maps one job state to the exception tag the linked item should
-// carry. Pure by design: tags are a function of current state, never of the
-// event history, so a lost write is repaired by the next pass.
+type missingPDFKeyReader interface {
+	MissingPDFKeys(context.Context, []string) ([]MissingPDFItem, error)
+}
+
+type tagLedgerState struct {
+	Tag    string
+	Status string
+}
+
+type tagMutationReason struct {
+	TagTypes map[string]int `json:"tag_types"`
+}
+
+type tagMutationEnvelope struct {
+	Result *struct {
+		Items []struct {
+			Key    string          `json:"key"`
+			Status string          `json:"status"`
+			Reason json.RawMessage `json:"reason"`
+		} `json:"items"`
+	} `json:"result"`
+}
+
 func desiredTag(state string) string {
 	switch state {
 	case job.StateAwaitingHuman, job.StateNeedsReview:
@@ -58,109 +71,162 @@ func desiredTag(state string) string {
 	case job.StateUnavailable:
 		return TagUnavailable
 	default:
-		// Live states clear the tag ("papio is working on it"), ready and
-		// imported are self-indicating, and failed/cancelled are papio's or
-		// the user's own doing — none of them is the user's cue to act.
 		return ""
 	}
 }
 
-// ReconcileTags converges the exception tags on linked Zotero items with the
-// current job states. It computes deltas against the applied-state ledger
-// (zotio_tag_state) first and invokes zotio only when something changed, so
-// the steady-state pass costs one SQLite query and zero subprocesses.
+// ReconcileTags converges personal-library exception tags with current job and
+// Zotero attachment state. The mutex covers snapshot -> remote mutation ->
+// ledger update, so the scheduler and on-demand RPC cannot interleave passes.
+// A pending row is written before an add; if the process dies after the remote
+// write, the next pass can safely recover with zotio's idempotent operations.
 func (s *Service) ReconcileTags(ctx context.Context) (*TagReconcileResult, error) {
 	if s == nil || s.CLI == nil || s.Store == nil {
 		return nil, fmt.Errorf("Zotio integration is not configured")
 	}
+	s.tagMu.Lock()
+	defer s.tagMu.Unlock()
+
 	desired, considered, err := s.desiredTags(ctx)
 	if err != nil {
 		return nil, err
 	}
-	applied, err := s.appliedTags(ctx)
+	if !s.ExceptionTags {
+		desired = map[string]string{}
+	} else if desired, err = s.keepMissingPDFs(ctx, desired); err != nil {
+		return nil, err
+	}
+	ledger, err := s.tagLedger(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	removals := map[string][]string{} // tag -> item keys
-	additions := map[string][]string{}
-	keys := make(map[string]struct{}, len(desired)+len(applied))
+	keys := make(map[string]struct{}, len(desired)+len(ledger))
 	for key := range desired {
 		keys[key] = struct{}{}
 	}
-	for key := range applied {
+	for key := range ledger {
 		keys[key] = struct{}{}
-		if _, seen := considered[key]; !seen {
-			considered[key] = struct{}{}
+		considered[key] = struct{}{}
+	}
+	ordered := make([]string, 0, len(keys))
+	for key := range keys {
+		ordered = append(ordered, key)
+	}
+	sort.Strings(ordered)
+	result := &TagReconcileResult{Checked: len(considered)}
+
+	if reconcileNeedsRemote(ordered, desired, ledger) {
+		preflight, err := s.CLI.Preflight(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if compareVersion(preflight.Version, tagsMinimumZotioVersion) < 0 {
+			return nil, fmt.Errorf("zotio %s does not support automatic exception tags (requires >= %s) — update zotio, or disable zotio.exception_tags", preflight.Version, tagsMinimumZotioVersion)
 		}
 	}
-	result := &TagReconcileResult{Checked: len(considered)}
-	for key := range keys {
-		want, have := desired[key], applied[key]
-		if want == have {
+
+	var reconcileErrs []error
+	for _, key := range ordered {
+		want := desired[key]
+		have, tracked := ledger[key]
+
+		if tracked && have.Tag != want {
+			switch have.Status {
+			case tagStatusOwned, tagStatusPending:
+				outcome, runErr := s.mutateTag(ctx, false, key, have.Tag)
+				if outcome == "applied" {
+					result.Removed++
+				}
+				if outcome == "applied" || outcome == "no_op" || isZotioNotFound(runErr) {
+					if err := s.deleteTagState(ctx, key); err != nil {
+						reconcileErrs = append(reconcileErrs, err)
+						continue
+					}
+					tracked = false
+				} else {
+					reconcileErrs = append(reconcileErrs, fmt.Errorf("removing %s from %s: %w", have.Tag, key, runErr))
+					continue
+				}
+				if runErr != nil {
+					reconcileErrs = append(reconcileErrs, runErr)
+				}
+			default: // foreign or missing: papio owns no remote tag to remove.
+				if err := s.deleteTagState(ctx, key); err != nil {
+					reconcileErrs = append(reconcileErrs, err)
+					continue
+				}
+				tracked = false
+			}
+		}
+		if want == "" {
 			continue
 		}
-		if have != "" {
-			removals[have] = append(removals[have], key)
+		if tracked && have.Tag == want && have.Status != tagStatusPending {
+			continue
 		}
-		if want != "" {
-			additions[want] = append(additions[want], key)
-		}
-	}
-	if len(removals) == 0 && len(additions) == 0 {
-		return result, nil
-	}
 
-	preflight, err := s.CLI.Preflight(ctx)
-	if err != nil {
-		return nil, err
-	}
-	if compareVersion(preflight.Version, tagsMinimumZotioVersion) < 0 {
-		return nil, fmt.Errorf("zotio %s does not support automatic exception tags (requires >= %s) — update zotio, or disable zotio.exception_tags", preflight.Version, tagsMinimumZotioVersion)
-	}
-
-	// Removals first: a tag transition (needs-action -> unavailable) must
-	// never leave both tags on an item, even across a crash between batches.
-	for _, tag := range sortedTagKeys(removals) {
-		for _, batch := range batchKeys(removals[tag]) {
-			// Explicitly mark the persistent flag as changed with an empty
-			// value, so zotio ignores an inherited ZOTERO_GROUP and writes
-			// papio's personal access verdict only to My Library.
-			args := append([]string{"--agent", "--yes", "--group=", "items", "tags", "remove", "--tag", tag}, batch...)
-			if _, err := s.CLI.RunJSON(ctx, args...); err != nil {
-				return result, fmt.Errorf("removing %s from %d items: %w", tag, len(batch), err)
+		wasPending := tracked && have.Tag == want && have.Status == tagStatusPending
+		if err := s.upsertTagState(ctx, key, want, tagStatusPending); err != nil {
+			reconcileErrs = append(reconcileErrs, err)
+			continue
+		}
+		outcome, reason, runErr := s.mutateTagWithReason(ctx, true, key, want)
+		switch outcome {
+		case "applied":
+			if err := s.upsertTagState(ctx, key, want, tagStatusOwned); err != nil {
+				reconcileErrs = append(reconcileErrs, err)
+				continue
 			}
-			if err := s.deleteTagState(ctx, batch); err != nil {
-				return result, err
+			result.Added++
+		case "no_op":
+			status := tagStatusForeign
+			// A pending retry seeing the requested automatic type is recovery
+			// from an ambiguous prior add, not ownership of a pre-existing tag.
+			if wasPending && reason.TagTypes[want] == 1 {
+				status = tagStatusOwned
 			}
-			result.Removed += len(batch)
+			if err := s.upsertTagState(ctx, key, want, status); err != nil {
+				reconcileErrs = append(reconcileErrs, err)
+				continue
+			}
+		default:
+			if isZotioNotFound(runErr) {
+				if err := s.upsertTagState(ctx, key, want, tagStatusMissing); err != nil {
+					reconcileErrs = append(reconcileErrs, err)
+				}
+			}
+		}
+		if runErr != nil {
+			reconcileErrs = append(reconcileErrs, fmt.Errorf("adding %s to %s: %w", want, key, runErr))
 		}
 	}
-	for _, tag := range sortedTagKeys(additions) {
-		for _, batch := range batchKeys(additions[tag]) {
-			// See removal above: exception state is personal, never shared
-			// into a Zotero group library.
-			args := append([]string{"--agent", "--yes", "--group=", "items", "tags", "add", "--automatic", "--tag", tag}, batch...)
-			if _, err := s.CLI.RunJSON(ctx, args...); err != nil {
-				return result, fmt.Errorf("adding %s to %d items: %w", tag, len(batch), err)
-			}
-			if err := s.upsertTagState(ctx, batch, tag); err != nil {
-				return result, err
-			}
-			result.Added += len(batch)
-		}
-	}
-	return result, nil
+	return result, errors.Join(reconcileErrs...)
 }
 
-// desiredTags returns item key -> wanted tag, derived from the most recent
-// job of each Zotero-linked work request, plus the full set of item keys
-// considered (including those whose latest state wants no tag).
+func reconcileNeedsRemote(keys []string, desired map[string]string, ledger map[string]tagLedgerState) bool {
+	for _, key := range keys {
+		want := desired[key]
+		have, tracked := ledger[key]
+		if tracked && have.Tag != want && (have.Status == tagStatusOwned || have.Status == tagStatusPending) {
+			return true
+		}
+		if want != "" && (!tracked || have.Tag != want || have.Status == tagStatusPending) {
+			return true
+		}
+	}
+	return false
+}
+
+// desiredTags considers only links whose key was observed by a personal Zotio
+// scan after schema v14. Zotero keys are library-local; pre-existing/group links
+// without provenance must never be interpreted in My Library.
 func (s *Service) desiredTags(ctx context.Context) (map[string]string, map[string]struct{}, error) {
 	rows, err := s.Store.DB().QueryContext(ctx, `
 		SELECT w.zotio_item_key, j.state
 		FROM jobs j
 		JOIN work_requests w ON w.id = j.work_request_id
+		JOIN zotio_item_scope z ON z.item_key = w.zotio_item_key AND z.scope = 'personal'
 		WHERE w.zotio_item_key IS NOT NULL AND w.zotio_item_key != ''
 		ORDER BY j.created_at DESC, j.id DESC`)
 	if err != nil {
@@ -173,10 +239,9 @@ func (s *Service) desiredTags(ctx context.Context) (map[string]string, map[strin
 		if err := rows.Scan(&key, &state); err != nil {
 			return nil, nil, err
 		}
-		if _, seen := latest[key]; seen {
-			continue // newest job already decided this item
+		if _, seen := latest[key]; !seen {
+			latest[key] = state
 		}
-		latest[key] = state
 	}
 	if err := rows.Err(); err != nil {
 		return nil, nil, err
@@ -192,59 +257,121 @@ func (s *Service) desiredTags(ctx context.Context) (map[string]string, map[strin
 	return desired, considered, nil
 }
 
-// appliedTags returns the applied-state ledger: item key -> tag papio
-// believes is currently written.
-func (s *Service) appliedTags(ctx context.Context) (map[string]string, error) {
-	rows, err := s.Store.DB().QueryContext(ctx, `SELECT item_key, tag FROM zotio_tag_state`)
-	if err != nil {
-		return nil, fmt.Errorf("reading applied tag state: %w", err)
+// keepMissingPDFs removes desired tags for items that now have an attachment
+// (including a PDF supplied manually outside papio). The exact-key lookup is a
+// bounded personal-library read; no remote writes occur when state is stable.
+func (s *Service) keepMissingPDFs(ctx context.Context, desired map[string]string) (map[string]string, error) {
+	if len(desired) == 0 {
+		return desired, nil
 	}
-	defer rows.Close()
-	applied := map[string]string{}
-	for rows.Next() {
-		var key, tag string
-		if err := rows.Scan(&key, &tag); err != nil {
-			return nil, err
+	reader, ok := s.CLI.(missingPDFKeyReader)
+	if !ok {
+		return nil, fmt.Errorf("configured Zotio client cannot inspect linked item attachments")
+	}
+	keys := make([]string, 0, len(desired))
+	for key := range desired {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	missing := make(map[string]struct{}, len(keys))
+	for _, batch := range batchKeys(keys) {
+		items, err := reader.MissingPDFKeys(ctx, batch)
+		if err != nil {
+			return nil, fmt.Errorf("checking linked Zotero attachments: %w", err)
 		}
-		applied[key] = tag
+		for _, item := range items {
+			missing[item.Key] = struct{}{}
+		}
 	}
-	return applied, rows.Err()
+	filtered := make(map[string]string, len(missing))
+	for key, tag := range desired {
+		if _, ok := missing[key]; ok {
+			filtered[key] = tag
+		}
+	}
+	return filtered, nil
 }
 
-func (s *Service) deleteTagState(ctx context.Context, keys []string) error {
-	placeholders := strings.Repeat("?,", len(keys))
-	args := make([]any, len(keys))
-	for i, key := range keys {
-		args[i] = key
-	}
-	_, err := s.Store.DB().ExecContext(ctx,
-		"DELETE FROM zotio_tag_state WHERE item_key IN ("+placeholders[:len(placeholders)-1]+")", args...)
+func (s *Service) tagLedger(ctx context.Context) (map[string]tagLedgerState, error) {
+	rows, err := s.Store.DB().QueryContext(ctx, `SELECT item_key, tag, status FROM zotio_tag_state`)
 	if err != nil {
-		return fmt.Errorf("clearing applied tag state: %w", err)
+		return nil, fmt.Errorf("reading tag ledger: %w", err)
+	}
+	defer rows.Close()
+	ledger := map[string]tagLedgerState{}
+	for rows.Next() {
+		var key string
+		var state tagLedgerState
+		if err := rows.Scan(&key, &state.Tag, &state.Status); err != nil {
+			return nil, err
+		}
+		ledger[key] = state
+	}
+	return ledger, rows.Err()
+}
+
+func (s *Service) deleteTagState(ctx context.Context, key string) error {
+	if _, err := s.Store.DB().ExecContext(ctx, `DELETE FROM zotio_tag_state WHERE item_key = ?`, key); err != nil {
+		return fmt.Errorf("clearing tag ledger: %w", err)
 	}
 	return nil
 }
 
-func (s *Service) upsertTagState(ctx context.Context, keys []string, tag string) error {
-	now := s.now().UTC().Format(time.RFC3339)
-	tx, err := s.Store.DB().BeginTx(ctx, nil)
+func (s *Service) upsertTagState(ctx context.Context, key, tag, status string) error {
+	_, err := s.Store.DB().ExecContext(ctx, `
+		INSERT INTO zotio_tag_state(item_key, tag, status, updated_at) VALUES (?, ?, ?, ?)
+		ON CONFLICT(item_key) DO UPDATE SET tag = excluded.tag, status = excluded.status, updated_at = excluded.updated_at`,
+		key, tag, status, s.now().UTC().Format(time.RFC3339Nano))
 	if err != nil {
-		return err
+		return fmt.Errorf("recording tag ledger: %w", err)
 	}
-	for _, key := range keys {
-		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO zotio_tag_state(item_key, tag, updated_at) VALUES (?, ?, ?)
-			ON CONFLICT(item_key) DO UPDATE SET tag = excluded.tag, updated_at = excluded.updated_at`,
-			key, tag, now); err != nil {
-			_ = tx.Rollback()
-			return fmt.Errorf("recording applied tag state: %w", err)
+	return nil
+}
+
+func (s *Service) mutateTag(ctx context.Context, add bool, key, tag string) (string, error) {
+	outcome, _, err := s.mutateTagWithReason(ctx, add, key, tag)
+	return outcome, err
+}
+
+func (s *Service) mutateTagWithReason(ctx context.Context, add bool, key, tag string) (string, tagMutationReason, error) {
+	args := []string{"--agent", "--yes", "--group=", "items", "tags"}
+	if add {
+		args = append(args, "add", "--automatic")
+	} else {
+		args = append(args, "remove", "--automatic-only")
+	}
+	args = append(args, "--tag", tag, key)
+	raw, runErr := s.CLI.RunJSON(ctx, args...)
+	var envelope tagMutationEnvelope
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, &envelope); err != nil && runErr == nil {
+			return "", tagMutationReason{}, fmt.Errorf("decoding zotio tag mutation: %w", err)
 		}
 	}
-	return tx.Commit()
+	var reason tagMutationReason
+	if envelope.Result != nil && len(envelope.Result.Items) == 1 {
+		item := envelope.Result.Items[0]
+		if item.Key == key {
+			if len(item.Reason) > 0 {
+				_ = json.Unmarshal(item.Reason, &reason)
+			}
+			if item.Status != "applied" && item.Status != "no_op" && runErr == nil {
+				runErr = fmt.Errorf("zotio tag mutation returned status %q", item.Status)
+			}
+			return item.Status, reason, runErr
+		}
+	}
+	if runErr == nil {
+		runErr = errors.New("zotio tag mutation returned no item result")
+	}
+	return "", reason, runErr
+}
+
+func isZotioNotFound(err error) bool {
+	return err != nil && ErrorInfoFrom(err).HTTPStatus == 404
 }
 
 func batchKeys(keys []string) [][]string {
-	sort.Strings(keys) // deterministic invocations for tests and logs
 	batches := make([][]string, 0, (len(keys)+tagBatchSize-1)/tagBatchSize)
 	for len(keys) > tagBatchSize {
 		batches = append(batches, keys[:tagBatchSize])
@@ -256,34 +383,30 @@ func batchKeys(keys []string) [][]string {
 	return batches
 }
 
-func sortedTagKeys(m map[string][]string) []string {
-	out := make([]string, 0, len(m))
-	for tag := range m {
-		out = append(out, tag)
-	}
-	sort.Strings(out)
-	return out
-}
-
 // TagReconciler adapts ReconcileTags to the daemon's maintenance seam with
-// throttled error logging (maintenance discards returned errors by design).
+// throttled error logging. Disabled configurations keep a runner only while
+// ledger state remains to clean, so the default-off path adds no maintenance
+// work and an off transition still converges.
 type TagReconciler struct {
 	service    *Service
 	lastErr    string
 	lastErrLog time.Time
 }
 
-// TagReconciler returns the maintenance runner, or nil when the exception-tag
-// ledger is disabled or zotio is not configured.
 func (s *Service) TagReconciler() *TagReconciler {
-	if s == nil || s.CLI == nil || s.Store == nil || !s.ExceptionTags {
+	if s == nil || s.CLI == nil || s.Store == nil {
 		return nil
+	}
+	if !s.ExceptionTags {
+		var exists int
+		err := s.Store.DB().QueryRow(`SELECT 1 FROM zotio_tag_state LIMIT 1`).Scan(&exists)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
 	}
 	return &TagReconciler{service: s}
 }
 
-// RunDue performs one reconcile pass. Errors are logged (throttled) and
-// returned; the scheduler treats maintenance as best-effort.
 func (r *TagReconciler) RunDue(ctx context.Context) error {
 	if r == nil {
 		return nil

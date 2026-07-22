@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"regexp"
 	"strconv"
@@ -338,6 +339,10 @@ func (c *Client) run(ctx context.Context, args ...string) ([]byte, error) {
 		return nil, fmt.Errorf("locating %q: %w", c.Executable, err)
 	}
 	cmd := exec.CommandContext(ctx, path, args...)
+	// papio's Zotio boundary is intentionally personal-library scoped. Group
+	// IDs are library-local and cannot safely round-trip through a bare item
+	// key; never let an ambient shell setting redirect reads or writes.
+	cmd.Env = withoutEnv(os.Environ(), "ZOTERO_GROUP")
 	var stdout, stderr boundedBuffer
 	stdout.max = maxStdoutBytes
 	stderr.max = maxStderrBytes
@@ -369,6 +374,17 @@ func (c *Client) run(ctx context.Context, args ...string) ([]byte, error) {
 		return stdout.Bytes(), fmt.Errorf("zotio %s: %s", commandName(args), detail)
 	}
 	return stdout.Bytes(), nil
+}
+
+func withoutEnv(environ []string, name string) []string {
+	prefix := name + "="
+	filtered := make([]string, 0, len(environ))
+	for _, entry := range environ {
+		if !strings.HasPrefix(entry, prefix) {
+			filtered = append(filtered, entry)
+		}
+	}
+	return filtered
 }
 
 type boundedBuffer struct {
