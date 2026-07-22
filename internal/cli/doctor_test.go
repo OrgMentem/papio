@@ -16,6 +16,7 @@ import (
 	"papio/internal/browser"
 	"papio/internal/config"
 	"papio/internal/doctor"
+	"papio/internal/ipc"
 	"papio/internal/zotio"
 )
 
@@ -178,5 +179,19 @@ func writeDoctorManifest(t *testing.T, path string, manifest nativeHostManifest)
 	}
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// Doctor decodes ping strictly; the daemon adds update fields to ping once
+// its daily check has results. Regression: v0.9.1 `papio doctor` FAILed
+// against its own daemon with `unknown field "update_available"`.
+func TestDoctorDaemonStatusAcceptsUpdateFields(t *testing.T) {
+	payload := json.RawMessage(`{"status":"ok","version":"0.9.1","extension_connected":true,"extension_version":"0.5.0","pending_browser_sessions":0,"browser_session_denied":0,"update_available":true,"latest_version":"0.9.2","zotio_update_available":false,"zotio_latest_version":"0.12.0"}`)
+	var status doctor.DaemonStatus
+	if err := ipc.DecodeResult(payload, &status); err != nil {
+		t.Fatalf("decode ping with update fields: %v", err)
+	}
+	if status.Version != "0.9.1" || status.UpdateAvailable == nil || !*status.UpdateAvailable || status.LatestVersion != "0.9.2" {
+		t.Fatalf("status = %+v", status)
 	}
 }

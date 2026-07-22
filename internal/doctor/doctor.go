@@ -196,6 +196,10 @@ func DefaultWorkerPath() string {
 }
 
 // DaemonStatus is the daemon information returned by the ping status RPC.
+// It must accept every field ping can emit: the CLI decodes strictly, and a
+// missing field here turns an optional ping addition (update availability)
+// into a doctor FAIL. Regression: v0.9.1 doctor failed against its own
+// daemon once the update checker had populated update_available.
 type DaemonStatus struct {
 	Status                 string `json:"status"`
 	Version                string `json:"version"`
@@ -203,6 +207,10 @@ type DaemonStatus struct {
 	ExtensionVersion       string `json:"extension_version"`
 	PendingBrowserSessions int    `json:"pending_browser_sessions"`
 	BrowserSessionDenied   int    `json:"browser_session_denied"`
+	UpdateAvailable        *bool  `json:"update_available,omitempty"`
+	LatestVersion          string `json:"latest_version,omitempty"`
+	ZotioUpdateAvailable   *bool  `json:"zotio_update_available,omitempty"`
+	ZotioLatestVersion     string `json:"zotio_latest_version,omitempty"`
 }
 
 // IntegrationDependencies supplies the local integration checks. The functions

@@ -8,6 +8,14 @@ so older sections below include extension entries. The initial release entry
 is synthesized from the complete `papio` and `zotio` Git histories and the
 execution records in `notes/acquisition-stack-plan.md`.
 
+## [0.9.2] - 2026-07-22
+
+### Fixed
+
+- `papio doctor` no longer fails against a healthy daemon whose daily update
+  check has results: the strict ping decode now accepts the optional
+  `update_available`/`latest_version` fields (and their zotio counterparts).
+
 ## [0.9.1] - 2026-07-22
 
 ### Changed
