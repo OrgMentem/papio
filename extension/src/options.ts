@@ -1,7 +1,7 @@
 // Copyright 2026 OrgMentem. Licensed under MIT. See LICENSE.
 // Options page: source and library-resolver host permission grant/revoke. The
 // button click is the user gesture chrome.permissions.request requires.
-// Selecting the daemon's `maximal` access mode never grants a Chrome permission
+// Selecting the daemon's `delegated` access mode never grants a Chrome permission
 // by itself — that only happens here, explicitly.
 
 import { chromeBackend, type StoreShape } from "./state";

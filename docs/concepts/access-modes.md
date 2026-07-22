@@ -15,11 +15,11 @@ PDF. See [Browser handoff](../concepts/browser-handoff.md) for the browser-side 
 | --- | --- |
 | `conservative` | Uses OA repositories and enabled licensed APIs only. *papio* can emit institutional or document-delivery actions, but does not open them. |
 | `assisted` | Opens OpenURL in the user's ordinary browser. You log in and download the file; *papio* then adopts and validates the selected file. |
-| `maximal` | Opens OpenURL, but login, MFA, and CAPTCHA remain human actions. After you return to a granted provider host, a verified adapter can navigate and initiate the one requested download. An unknown or changed UI falls back to assisted behavior. |
+| `delegated` | Opens OpenURL; login, MFA, and CAPTCHA remain human actions. After you return to a granted provider host, a verified adapter may perform the one delegated download click. Unknown or changed UI falls back to assisted behavior. |
 
 Licensed and text-and-data-mining adapters are separate, per-source capabilities.
 They require their own explicit credentials, terms acknowledgement, rate and cost
-budgets, and allowed uses; `maximal` does not grant them permission.
+budgets, and allowed uses; `delegated` does not grant them permission.
 
 ## Safety contract
 
@@ -29,7 +29,7 @@ journal issue; only OA and API sources process batches, and each batch is capped
 
 !!! warning "Never automate around access controls"
 
-    Maximal automation operates only inside legitimate, user-authorized access.
+    Delegated automation operates only inside legitimate, user-authorized access.
     *papio* never bypasses access controls, captures credentials, solves CAPTCHAs,
     evades anti-bot measures, circumvents paywalls, automates MFA, or accepts
     publisher or library terms. Terms acceptance is always a human action.

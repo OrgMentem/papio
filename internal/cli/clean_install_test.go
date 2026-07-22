@@ -94,8 +94,8 @@ func TestCleanInstallBootstrapsAndAcceptsWork(t *testing.T) {
 	if !doctorReport.OK {
 		t.Fatalf("fresh-profile doctor report is unhealthy: %+v", doctorReport)
 	}
-	if !strings.Contains(output, "SQLite integrity ok; schema version 11") {
-		t.Fatalf("init doctor output does not report schema 11:\n%s", output)
+	if !strings.Contains(output, "SQLite integrity ok; schema version 12") {
+		t.Fatalf("init doctor output does not report schema 12:\n%s", output)
 	}
 
 	cfg, err := config.Load(configPath)
@@ -118,8 +118,8 @@ func TestCleanInstallBootstrapsAndAcceptsWork(t *testing.T) {
 		t.Fatal("daemon bootstrap did not construct a scheduler")
 	}
 	version, err := system.Store.UserVersion(ctx)
-	if err != nil || version != 11 {
-		t.Fatalf("fresh schema version = %d, %v; want 11", version, err)
+	if err != nil || version != 12 {
+		t.Fatalf("fresh schema version = %d, %v; want 12", version, err)
 	}
 
 	stub := &cleanInstallResolver{}

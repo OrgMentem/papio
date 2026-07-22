@@ -118,7 +118,7 @@ Do not revisit languages because an adapter is inconvenient.
 
 1. One explicit work request per subscription-provider job. OA/API sources may process bounded batches; the broker never crawls a subscription database or journal issue.
 2. OA and explicitly licensed APIs run before institutional access.
-3. Maximal automation means maximal automation **inside legitimate, user-authorized access**. It never means bypass, credential capture, CAPTCHA solving, anti-bot evasion, paywall circumvention, automated MFA, or automated acceptance of publisher/library terms; terms remain a human action.
+3. Delegated automation means one delegated download click **inside legitimate, user-authorized access**. It never means bypass, credential capture, CAPTCHA solving, anti-bot evasion, paywall circumvention, automated MFA, or automated acceptance of publisher/library terms; terms remain a human action.
 4. Human login occurs in a visible ordinary Chrome profile. The extension has no `cookies` or `debugger` permission and no host permissions for Example University/OpenAthens/identity-provider domains. During authentication it compares origins locally and sends no IdP URL, path, title, query, or fragment across native messaging.
 5. Per-source enablement and optional host permissions; never `<all_urls>`. Permission grant requires an explicit user gesture in the extension UI, and revocation immediately returns that source to assisted behavior.
 6. Core policy is authoritative. Browser messages describe observations/outcomes; they cannot authorize a disallowed transition or source.
@@ -132,15 +132,15 @@ Do not revisit languages because an adapter is inconvenient.
 
 ## Access profiles
 
-Configuration requires an explicit first-run choice; no silent automation default. This user's profile is set to `maximal`.
+Configuration requires an explicit first-run choice; no silent automation default. This user's profile is set to `delegated`.
 
 | Mode | Behavior |
 |---|---|
 | `conservative` | OA repositories and enabled licensed APIs only. Institutional/document-delivery actions are emitted but not opened. |
 | `assisted` | OpenURL opens in ordinary Chrome; user performs login and download; broker adopts and validates the selected file. |
-| `maximal` | OpenURL opens; login/MFA/CAPTCHA stays human; after return to a granted provider host, a verified adapter navigates and initiates the one requested download. Unknown or changed UI falls back to assisted mode. |
+| `delegated` | OpenURL opens; login/MFA/CAPTCHA stays human; after return to a granted provider host, a verified adapter performs the one delegated download click. Unknown or changed UI falls back to assisted mode. |
 
-Licensed/TDM adapters are separate per-source capabilities with explicit credentials, terms acknowledgement, rate/cost budgets, and allowed uses. They do not inherit permission from `maximal`.
+Licensed/TDM adapters are separate per-source capabilities with explicit credentials, terms acknowledgement, rate/cost budgets, and allowed uses. They do not inherit permission from `delegated`.
 
 ## Process architecture
 
@@ -188,7 +188,7 @@ Responsibilities:
 
 The MV3 service worker may be stopped. It persists only minimal tab/job correlation in `chrome.storage`, reconnects to the native host, and asks the daemon for authoritative state.
 
-The options/popup surface shows each supported source, current optional-host permission, grant/revoke controls, and the active job. Selecting `maximal` in the daemon config never grants a Chrome permission by itself.
+The options/popup surface shows each supported source, current optional-host permission, grant/revoke controls, and the active job. Selecting `delegated` in the daemon config never grants a Chrome permission by itself.
 
 ### Optional Apple Events adapter
 
@@ -543,12 +543,12 @@ Pin `go.mod`/`go.sum`; run vulnerability and license checks. Do not link Poppler
 1. Install and verify the dedicated `native-host` entrypoint and daemon bridge.
 2. Build the minimal MV3 extension with least-privilege optional permissions and versioned, correlated, bounded protocol messages.
 3. Implement extension options/popup source grants and revocation, broker-owned tab lifecycle, OpenURL navigation, human-auth state, job-specific download adoption, extension/service-worker restart recovery, and cancellation.
-4. Implement access modes and configure this user's daemon profile as `maximal`; provider permissions remain separate explicit browser grants.
+4. Implement access modes and configure this user's daemon profile as `delegated`; provider permissions remain separate explicit browser grants.
 5. Keep unknown providers manual; do not ship generic selector guessing.
 
 **Gate:** Example University OpenURL opens in the user's ordinary Chrome, pauses without reading credential fields or IdP DOM, resumes after human authentication, and adopts one explicitly job-correlated manual download while a simultaneous unrelated download is ignored. A sentinel secret in the IdP query/fragment never enters a native message, log, or SQLite. Unrelated tabs/profile/session remain untouched, permission revocation falls back to assisted behavior, and CDP is not running.
 
-### Phase 3 — verified maximal provider adapters
+### Phase 3 — verified delegated provider adapters
 
 Implement one provider at a time in this order, based on live evidence:
 
@@ -584,7 +584,7 @@ After the behavior gates above pass:
 3. Archive the instsci fork as reference; do not delete it without explicit user approval. Remove it from active workflows.
 4. Publish the first release only after the full macOS acceptance matrix passes.
 
-**Gate:** With `doctor`-declared external PDF/OCR prerequisites installed, a fresh macOS user profile install, upgrade from the previous test schema, uninstall/rollback, OA run, assisted run, maximal run, and zotio apply all pass from documented commands with no repository checkout or development runtime.
+**Gate:** With `doctor`-declared external PDF/OCR prerequisites installed, a fresh macOS user profile install, upgrade from the previous test schema, uninstall/rollback, OA run, assisted run, delegated run, and zotio apply all pass from documented commands with no repository checkout or development runtime.
 
 ### Phase 6 — deliberate expansion, not release blockers
 
@@ -665,11 +665,11 @@ None of these weaken the first-release access or validation invariants.
 
 - Implemented at papio commit `b31d178`: native-host bridge (`internal/nativehost`) with LE-framed stdio, origin validation against `browser.extension_id`, hello-first/monotonic-seq/256 KiB enforcement, best-effort error frames, 2 s idle polling, and symlink-safe daemon autostart (resolves `EvalSymlinks(os.Executable())` so the `papio-native-host` link never respawns itself).
 - Daemon bridge (`internal/browser` + `browser.sync` RPC): hello/hello_ack sessions, one `job_offer` per hello-session for `awaiting_human` jobs with open `openurl_handoff` actions, Z39.88 KEV OpenURL construction, timing-only auth events, provider-outcome mapping, daemon→extension cancel, and download adoption strictly confined to `<adoption_root>/<job_id>/` (symlink/irregular/path-escape rejected) feeding the existing quarantine/validation pipeline under a held lease. Four additive `awaiting_human` resume edges added to the job state machine.
-- Access-mode routing: candidate exhaustion now routes to institutional handoff (`assisted`/`maximal` + configured `browser.openurl_base_url`), emits `openurl_available` without opening in `conservative`, and stays `unavailable` otherwise. New `[browser]` config: `extension_id`, `openurl_base_url`, `download_adoption_root`, `action_expiry_seconds`.
+- Access-mode routing: candidate exhaustion now routes to institutional handoff (`assisted`/`delegated` + configured `browser.openurl_base_url`), emits `openurl_available` without opening in `conservative`, and stays `unavailable` otherwise. New `[browser]` config: `extension_id`, `openurl_base_url`, `download_adoption_root`, `action_expiry_seconds`.
 - `papio native-host install|uninstall|status`: symlink under `<config-dir>/bin/`, atomic `com.orgmentem.papio.json` manifest with single fixed `allowed_origins`, per-OS Chrome dirs, idempotent, smoke-verified.
 - MV3 extension: background service worker (connectNative, offer→one visible tab→accept, tracked-tab-only origin watching with `auth_pending`/`auth_returned` timing-only frames, job-tab-correlated download reporting with basename-only filenames, restart recovery via re-hello without duplicating live tabs), options grant/revoke per provider host, popup with cancel. Permissions unchanged: no cookies/debugger/webRequest/`<all_urls>`/IdP hosts.
 - Verification: `go test ./...` and `-race` (26 packages), vet, golangci-lint 0 issues; extension `bun test` 16/16, `tsc --noEmit` clean, build emits dist bundles; live smoke — installed symlinked host invoked Chrome-style with origin argument autostarted the real daemon and returned a framed `hello_ack`; wrong-origin invocation refused before any read; sentinel-secret invariant asserted across outbound frames, events, and all durable rows in tests.
-- Live Example University acceptance executed 2026-07-13/14 with the user's ordinary Chrome (unpacked extension ID `ehhfplhmddankkocjpldplaokajlbmah`, real `[browser]` config, `access_mode = "maximal"`, adoption root `~/Downloads/papio`): OA exhaustion routed Lee & See (`10.1518/hfes.46.1.50_30392`) to `awaiting_human`; the extension accepted the offer and opened one resolver tab; SSO stayed human with timing-only `auth_pending` (empty detail, verified in durable events); the ProQuest PDF was adopted from `Downloads/papio/<job_id>/`, OCR'd, identity-passed, and reached `ready` (SHA-256 `2944a5…`, 31 pages, 18,410 OCR chars) while unrelated simultaneous downloads were ignored; CDP was never used.
+- Live Example University acceptance executed 2026-07-13/14 with the user's ordinary Chrome (unpacked extension ID `ehhfplhmddankkocjpldplaokajlbmah`, real `[browser]` config, `access_mode = "delegated"`, adoption root `~/Downloads/papio`): OA exhaustion routed Lee & See (`10.1518/hfes.46.1.50_30392`) to `awaiting_human`; the extension accepted the offer and opened one resolver tab; SSO stayed human with timing-only `auth_pending` (empty detail, verified in durable events); the ProQuest PDF was adopted from `Downloads/papio/<job_id>/`, OCR'd, identity-passed, and reached `ready` (SHA-256 `2944a5…`, 31 pages, 18,410 OCR chars) while unrelated simultaneous downloads were ignored; CDP was never used.
 - Field defects found by the live run, all fixed and committed (`ead5bcb`, `0bb3842`): daemon-side `RunSweeper` makes directory adoption self-driving (was extension-poll-dependent); post-auth tab close no longer cancels a job; offers advertise verified provider hosts so the post-SSO landing is recognized; rejected adoptions move to `rejected/<job_id>/` ending the re-adopt/re-reject loop; adoption failures are non-fatal deferral events; correlated downloads are steered to `Downloads/papio/<job_id>/` via `onDeterminingFilename`; and the OCR fallback now gates on distinct text signal, not raw volume (watermark-only ProQuest scans OCR instead of failing identity).
 - Remaining deferred item: generate/preserve the Web Store signing key and re-pin the packed extension ID (the unpacked dev ID works today; rerun `papio native-host install` after packing).
 
@@ -966,7 +966,7 @@ Public-release UX push. All changes isolated to `internal/{config,protocol,brows
 - **Provider adapters (fixture-backed):** Wiley (`method:"url"` → `/doi/pdfdirect/<doi>?download=true`, **live-verified end-to-end → real 1.15 MB PDF → ready**), SAGE (`method:"href"`, classify on `publication_doi` + `a#downloadPdfUrl`; classify verified, download not live-exercised). ProQuest gained a `login` classify rule for the "Find your institution" wall.
 - **ProQuest institutional access:** the real unlock is the **account-id append** — config `[browser] proquest_account_id`, protocol `proquest_account_id`, adapter `accountIdParam:"accountid"`, bridge `maybeAppendAccountId` (latched, tried before the federated route). **Live-verified**: appends `?accountid=<id>` cold → wall clears with "Access provided by EXAMPLE UNIVERSITY", no sign-in. Federated login-routing (`shibboleth_entity_id` → adapter `federatedLogin` → skip WAYF) also shipped and auto-SSOs, but the accountid path is preferred because the Shibboleth-DS route authenticates only ProQuest's main context, not the openurl handler. Deferred: full download on a ProQuest-*held* non-OA title (Example University holdings gap in the dev set).
 - **Per-institution access profiles:** `[browser.resolvers.<name>]` are now full institution tables (`config.Institution{OpenURLBase, ShibbolethEntityID, ProquestAccountID}`); `InstitutionFor(resolver)` drives `offer()` so each job routes its own login identity and a named profile never inherits the default institution's. `Institution.UnmarshalText` keeps the pre-1.0 bare-string shorthand (`name = "https://…"`) valid, so existing configs load without migration. Lifts the earlier "default profile only" limitation on federated routing / accountid.
-- **Actionable error categories:** new shared `internal/errcat` package (`Explain`, `WaitGuidance`) maps the daemon's snake_case transition reasons → a stable category + one-line next step; config-aware (`institution_not_configured` when assisted/maximal mode found no copy and no institution is configured, pointing at `papio init`). Surfaced in `papio status`, `papio acquire --wait`, the desktop human-action notification ("run papio status to see why"), and the MCP `papio_status` tool (`category`/`guidance` fields). One catalog, no drift.
+- **Actionable error categories:** new shared `internal/errcat` package (`Explain`, `WaitGuidance`) maps the daemon's snake_case transition reasons → a stable category + one-line next step; config-aware (`institution_not_configured` when assisted/delegated mode found no copy and no institution is configured, pointing at `papio init`). Surfaced in `papio status`, `papio acquire --wait`, the desktop human-action notification ("run papio status to see why"), and the MCP `papio_status` tool (`category`/`guidance` fields). One catalog, no drift.
 - **Guided onboarding (`papio init`):** an Institution step (OpenURL base + optional entityID + a ProQuest accountid step that extracts `accountid=` from a pasted resolver URL) and a Browser-extension step that captures the Chrome/Firefox extension IDs (Firefox defaults to the fixed `papio@orgmentem.com`) so the native host installs on the first run instead of failing on an unset `extension_id`. Flags: `--openurl-base`, `--shibboleth-entity-id`, `--proquest-account-id`, `--extension-id`, `--firefox-extension-id`.
 - Verified: `go build ./...` + vet clean; `go test ./internal/{config,browser,cli,nativehost,notify,errcat,mcpserver}` and the extension suite green; `papio status`, `acquire --wait` guidance, and the interactive `init` flow smoke-verified against the live daemon.
 - **Deferred (unchanged):** the packed-ID re-pin (still parked on the unpacked dev id while live jobs are parked); T&F/PsycNet adapters (entitlement/metadata); per-institution Example Institute entityID/accountid (only Example University default wired); Firefox fixture-capture path (popup tool is Chrome-only).

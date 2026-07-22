@@ -25,7 +25,7 @@ Every request becomes a job. `papio` ranks the possible sources and tries them i
 | **Validation** | Local PDF structure + identity + OCR (Poppler, Tesseract) | No |
 | **Zotero writes** | `zotio` — preview (`plan`) then confirmed `apply` | No — `papio` never stores Zotero credentials |
 
-`papio` runs in one of three access modes — `conservative`, `assisted`, or `maximal`. A fresh `papio init` chooses `conservative`; institutional handoff opens a browser only under `assisted`/`maximal`, and even then automation stays inside legitimate, user-authorized access.
+`papio` runs in one of three access modes — `conservative`, `assisted`, or `delegated`. A fresh `papio init` chooses `conservative`; institutional handoff opens a browser only under `assisted`/`delegated`, and even then automation stays inside legitimate, user-authorized access.
 
 ## Quickstart
 
@@ -49,7 +49,7 @@ New here? Start with the [user guide](guide/user-guide.md), then tune policy in 
 - **[Getting started](guide/getting-started.md)** — prerequisites, `papio init`, and your first acquisition end to end.
 - **[User guide](guide/user-guide.md)** — the research workflow: discover, acquire in batches, follow jobs, complete a browser pass, and resolve identity reviews.
 - **[Use in a coding agent](guide/agent-skill.md)** — drive *papio* over MCP (`papio mcp`): the canonical acquisition loop and its safety semantics.
-- **[Access modes & safety](concepts/access-modes.md)** — `conservative` / `assisted` / `maximal` and the non-negotiable product and safety boundaries.
+- **[Access modes & safety](concepts/access-modes.md)** — `conservative` / `assisted` / `delegated` and the non-negotiable product and safety boundaries.
 - **[Acquisition pipeline](concepts/acquisition-pipeline.md)** — the order *papio* tries sources, how candidates are ranked, job states, and download limits.
 - **[Browser handoff](concepts/browser-handoff.md)** — the ordinary-browser extension, its local connector, the minimized work window, and why *papio* never uses an automated browser.
 - **[Validation & provenance](concepts/validation-and-provenance.md)** — PDF structure, identity, OCR gates, and the permanent acquisition bundle.

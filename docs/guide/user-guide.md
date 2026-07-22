@@ -140,7 +140,7 @@ unavailable, or retry-wait job.
 
 ## 5. Complete one browser pass when required
 
-When no usable direct candidate remains, assisted and maximal access modes can
+When no usable direct candidate remains, assisted and delegated access modes can
 park a job for the ordinary Chrome extension. First inspect the queue without
 opening a browser:
 

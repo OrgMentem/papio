@@ -76,7 +76,7 @@ func openActionKinds(t *testing.T, jobs *job.Store, jobID string) map[string]boo
 }
 
 func TestExhaustedCandidatesRouteToInstitutionalHandoff(t *testing.T) {
-	for _, mode := range []string{config.ModeAssisted, config.ModeMaximal} {
+	for _, mode := range []string{config.ModeAssisted, config.ModeDelegated} {
 		t.Run(mode, func(t *testing.T) {
 			svc, jobs := exhaustingService(t, mode, "https://openurl.example.edu/resolve")
 			row := processToEnd(t, svc, jobs, "wr_handoff_"+mode)
@@ -93,7 +93,7 @@ func TestExhaustedCandidatesRouteToInstitutionalHandoff(t *testing.T) {
 func TestBotBlockedOACandidateRoutesToBrowserHandoff(t *testing.T) {
 	const oaURL = "https://oa.example.org/articles/blocked-paper.pdf"
 	svc, jobs := newTestService(t)
-	svc.Config.AccessMode = config.ModeMaximal
+	svc.Config.AccessMode = config.ModeDelegated
 	svc.Config.Browser.OpenURLBase = "https://openurl.example.edu/resolve"
 	svc.Resolvers = []ResolverEntry{{
 		Adapter: &fakeResolver{name: "openalex", cands: []resolver.Candidate{{
@@ -129,7 +129,7 @@ func TestBotBlockedOACandidateRoutesToBrowserHandoff(t *testing.T) {
 
 func TestForbiddenNonOACandidateKeepsInstitutionalHandoff(t *testing.T) {
 	svc, jobs := newTestService(t)
-	svc.Config.AccessMode = config.ModeMaximal
+	svc.Config.AccessMode = config.ModeDelegated
 	svc.Config.Browser.OpenURLBase = "https://openurl.example.edu/resolve"
 	svc.Resolvers = []ResolverEntry{{
 		Adapter: &fakeResolver{name: "licensed", cands: []resolver.Candidate{{
@@ -177,7 +177,7 @@ func TestExhaustedCandidatesConservativeRecordsActionButStaysUnavailable(t *test
 }
 
 func TestExhaustedCandidatesWithoutOpenURLBaseStaysUnavailable(t *testing.T) {
-	svc, jobs := exhaustingService(t, config.ModeMaximal, "")
+	svc, jobs := exhaustingService(t, config.ModeDelegated, "")
 	row := processToEnd(t, svc, jobs, "wr_nobase")
 	if row.State != job.StateUnavailable {
 		t.Fatalf("state = %s, want unavailable", row.State)
@@ -191,7 +191,7 @@ func parkAwaitingHuman(t *testing.T, jobs *job.Store, reqID string) string {
 	t.Helper()
 	ctx := context.Background()
 	id, err := jobs.CreateRequest(ctx, reqID, work.Work{DOI: "10.1002/example"}, "", "",
-		job.Policy{AccessMode: config.ModeMaximal, DesiredVersion: "any", FetchMaxBytes: 1 << 20}, nil)
+		job.Policy{AccessMode: config.ModeDelegated, DesiredVersion: "any", FetchMaxBytes: 1 << 20}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -255,7 +255,7 @@ func TestAdoptDownloadValidatesAndPromotes(t *testing.T) {
 func TestAcceptedAdoptionReviewReusesExactContentOverride(t *testing.T) {
 	svc, jobs := newTestService(t)
 	svc.Config.Browser.OpenURLBase = "https://resolver.example.edu/openurl"
-	svc.Config.AccessMode = config.ModeMaximal
+	svc.Config.AccessMode = config.ModeDelegated
 	svc.Fetch = func(context.Context, resolver.Candidate, string) (fetch.Result, error) {
 		return fetch.Result{}, context.Canceled
 	}

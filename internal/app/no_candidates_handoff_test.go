@@ -5,16 +5,17 @@ import (
 	"context"
 	"testing"
 
+	"papio/internal/config"
 	"papio/internal/job"
 	"papio/internal/protocol"
 )
 
 // A work with ZERO legal candidates (not merely exhausted fetches) must still
-// route to the institutional handoff in assisted/maximal: the browser plane is
-// exactly for works OA cannot see. Regression for the Tyler-1989 live gap.
+// route to the institutional handoff in assisted/delegated: the browser plane
+// is exactly for works OA cannot see. Regression for the Tyler-1989 live gap.
 func TestNoCandidatesRoutesToInstitutionalHandoff(t *testing.T) {
 	svc, jobs := newTestService(t)
-	svc.Config.AccessMode = "maximal"
+	svc.Config.AccessMode = config.ModeDelegated
 	svc.Config.Browser.OpenURLBase = "https://resolver.example.edu/openurl"
 	svc.Resolvers = nil // no resolver returns anything
 	fetches := 0

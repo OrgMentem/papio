@@ -51,7 +51,7 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, capability pdf
 	}
 
 	if _, err := cfg.RequireAccessMode(); err != nil {
-		add("access_mode", Fail, "no explicit access mode is configured", "set access_mode to conservative, assisted, or maximal")
+		add("access_mode", Fail, "no explicit access mode is configured", "set access_mode to conservative, assisted, or delegated")
 	} else {
 		add("access_mode", Pass, "explicit access mode configured", "")
 	}

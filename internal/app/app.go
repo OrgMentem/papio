@@ -708,7 +708,7 @@ func (s *Service) retryBudgetExhausted(ctx context.Context, jobID string) bool {
 func (s *Service) exhaustedCandidates(ctx context.Context, row *job.Row, from, reason, terminal, oaBrowserURL string) error {
 	mode := s.Config.AccessMode
 	switch mode {
-	case config.ModeAssisted, config.ModeMaximal:
+	case config.ModeAssisted, config.ModeDelegated:
 		if oaBrowserURL != "" {
 			if _, err := s.Jobs.OpenHumanAction(ctx, row.ID, "openurl_handoff", OABrowserHandoffActionDetail(oaBrowserURL), job.WithAccessClassification(false, "anti_bot")); err != nil {
 				return err

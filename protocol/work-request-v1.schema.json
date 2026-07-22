@@ -36,7 +36,7 @@
     "zotio_item_key": { "type": "string", "pattern": "^[A-Za-z0-9]{1,32}$" },
     "collection": { "type": "string", "maxLength": 200 },
     "desired_version": { "enum": ["published", "accepted", "preprint", "any"] },
-    "access_mode_override": { "enum": ["conservative", "assisted", "maximal"] },
+    "access_mode_override": { "enum": ["conservative", "assisted", "delegated"] },
     "max_cost_usd": { "type": "number", "minimum": 0 },
     "sources_allow": { "type": "array", "items": { "type": "string", "maxLength": 100 }, "maxItems": 50 },
     "sources_deny": { "type": "array", "items": { "type": "string", "maxLength": 100 }, "maxItems": 50 }

@@ -36,10 +36,12 @@ func TestOpenRollsForwardSchemaOneWithoutLosingDurableRows(t *testing.T) {
 		t.Fatalf("set schema version one: %v", err)
 	}
 	if _, err := raw.ExecContext(ctx, `
-		INSERT INTO work_requests(id, created_at, requester, title, authors_json, year, desired_version)
-		VALUES ('migration-request-0001', '2026-07-15T00:00:00Z', 'cli', 'Representative work', '["Ada Author"]', 2026, 'any');
+		INSERT INTO work_requests(id, created_at, requester, title, authors_json, year, desired_version, access_mode_override)
+		VALUES ('migration-request-0001', '2026-07-15T00:00:00Z', 'cli', 'Representative work', '["Ada Author"]', 2026, 'any', 'maximal');
 		INSERT INTO jobs(id, work_request_id, state, policy_json, created_at, updated_at)
 		VALUES ('migration-job-0001', 'migration-request-0001', 'resolving', '{"access_mode":"conservative","desired_version":"any","fetch_max_bytes":1048576}', '2026-07-15T00:00:00Z', '2026-07-15T00:00:00Z');
+		INSERT INTO jobs(id, work_request_id, state, policy_json, created_at, updated_at)
+		VALUES ('migration-job-delegated-0001', 'migration-request-0001', 'ready', '{"access_mode":"maximal","desired_version":"any","fetch_max_bytes":1048576}', '2026-07-15T00:00:00Z', '2026-07-15T00:00:00Z');
 		INSERT INTO candidates(job_id, source, url_redacted, url_key, version, access_basis, reuse_license, created_at)
 		VALUES ('migration-job-0001', 'browser', 'https://example.test/<redacted>', 'migration-candidate-key', 'published', 'subscription', 'unknown', '2026-07-15T00:00:00Z');
 		INSERT INTO human_actions(job_id, kind, detail, created_at)
@@ -63,8 +65,8 @@ func TestOpenRollsForwardSchemaOneWithoutLosingDurableRows(t *testing.T) {
 	}
 	defer migrated.Close()
 	version, err := migrated.UserVersion(ctx)
-	if err != nil || version != 11 {
-		t.Fatalf("user_version = %d, %v; want 11", version, err)
+	if err != nil || version != 12 {
+		t.Fatalf("user_version = %d, %v; want 12", version, err)
 	}
 
 	var jobs, actions, exports int
@@ -77,8 +79,24 @@ func TestOpenRollsForwardSchemaOneWithoutLosingDurableRows(t *testing.T) {
 	if err := migrated.DB().QueryRowContext(ctx, "SELECT COUNT(*) FROM exports").Scan(&exports); err != nil {
 		t.Fatalf("count exports: %v", err)
 	}
-	if jobs != 1 || actions != 3 || exports != 1 {
-		t.Fatalf("migrated durable rows jobs=%d actions=%d exports=%d, want 1/3/1", jobs, actions, exports)
+	if jobs != 2 || actions != 3 || exports != 1 {
+		t.Fatalf("migrated durable rows jobs=%d actions=%d exports=%d, want 2/3/1", jobs, actions, exports)
+	}
+
+	var delegatedPolicy, delegatedOverride string
+	if err := migrated.DB().QueryRowContext(ctx,
+		"SELECT policy_json FROM jobs WHERE id = 'migration-job-delegated-0001'").Scan(&delegatedPolicy); err != nil {
+		t.Fatalf("read delegated policy migration: %v", err)
+	}
+	if delegatedPolicy != `{"access_mode":"delegated","desired_version":"any","fetch_max_bytes":1048576}` {
+		t.Fatalf("delegated policy = %q", delegatedPolicy)
+	}
+	if err := migrated.DB().QueryRowContext(ctx,
+		"SELECT access_mode_override FROM work_requests WHERE id = 'migration-request-0001'").Scan(&delegatedOverride); err != nil {
+		t.Fatalf("read delegated override migration: %v", err)
+	}
+	if delegatedOverride != "delegated" {
+		t.Fatalf("delegated override = %q", delegatedOverride)
 	}
 
 	// 0011 backfill: legacy detail markers become structured classification.

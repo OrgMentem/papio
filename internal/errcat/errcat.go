@@ -77,7 +77,7 @@ func Explain(state, reason, resolver, accessMode string, cfg config.Config) Expl
 // current config says whether an institution is now configurable to fix it.
 func explainNoAccess(resolver, accessMode string, cfg config.Config) Explanation {
 	switch accessMode {
-	case config.ModeAssisted, config.ModeMaximal:
+	case config.ModeAssisted, config.ModeDelegated:
 		if _, ok := cfg.InstitutionFor(resolver); !ok {
 			return Explanation{"institution_not_configured",
 				"No institution is configured, so institutional access was never attempted. Run `papio init` and set your library's OpenURL resolver base (Institution step)."}
@@ -86,7 +86,7 @@ func explainNoAccess(resolver, accessMode string, cfg config.Config) Explanation
 			"No open-access copy exists and your institution's OpenURL resolver returned no entitled full text."}
 	case config.ModeConservative:
 		return Explanation{"no_access_conservative",
-			"Conservative mode only checks open sources. Set access_mode to \"assisted\" or \"maximal\" to route this work through your institution."}
+			"Conservative mode only checks open sources. Set access_mode to \"assisted\" or \"delegated\" to route this work through your institution."}
 	}
 	return Explanation{"no_access", "No legally accessible copy was found for this work."}
 }

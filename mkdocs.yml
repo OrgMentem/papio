@@ -95,6 +95,7 @@ nav:
       - Access modes & safety: concepts/access-modes.md
       - Acquisition pipeline: concepts/acquisition-pipeline.md
       - Browser handoff: concepts/browser-handoff.md
+      - Provider compatibility: concepts/provider-compatibility.md
       - Validation & provenance: concepts/validation-and-provenance.md
   - Reference:
       - Commands: reference/commands.md

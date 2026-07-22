@@ -310,9 +310,9 @@ func TestAuthPayloadRejectsURLFields(t *testing.T) {
 }
 
 func TestJobOfferLoginEntityIDValidation(t *testing.T) {
-	const withoutEntityID = `{"protocol":"papio-browser/1","type":"job_offer","msg_id":"offer-msg-1","job_id":"job_offer_1","seq":1,"payload":{"openurl":"https://resolver.example.edu/openurl","provider_hosts":["example.edu"],"access_mode":"maximal","expires_at":"2026-07-17T12:00:00Z"}}`
-	const withEntityID = `{"protocol":"papio-browser/1","type":"job_offer","msg_id":"offer-msg-2","job_id":"job_offer_2","seq":2,"payload":{"openurl":"https://resolver.example.edu/openurl","provider_hosts":["example.edu"],"access_mode":"maximal","login_entity_id":"https://idp.example.edu/entity","expires_at":"2026-07-17T12:00:00Z"}}`
-	const nonHTTPS = `{"protocol":"papio-browser/1","type":"job_offer","msg_id":"offer-msg-3","job_id":"job_offer_3","seq":3,"payload":{"openurl":"https://resolver.example.edu/openurl","provider_hosts":["example.edu"],"access_mode":"maximal","login_entity_id":"http://idp.example.edu/entity","expires_at":"2026-07-17T12:00:00Z"}}`
+	const withoutEntityID = `{"protocol":"papio-browser/1","type":"job_offer","msg_id":"offer-msg-1","job_id":"job_offer_1","seq":1,"payload":{"openurl":"https://resolver.example.edu/openurl","provider_hosts":["example.edu"],"access_mode":"delegated","expires_at":"2026-07-17T12:00:00Z"}}`
+	const withEntityID = `{"protocol":"papio-browser/1","type":"job_offer","msg_id":"offer-msg-2","job_id":"job_offer_2","seq":2,"payload":{"openurl":"https://resolver.example.edu/openurl","provider_hosts":["example.edu"],"access_mode":"delegated","login_entity_id":"https://idp.example.edu/entity","expires_at":"2026-07-17T12:00:00Z"}}`
+	const nonHTTPS = `{"protocol":"papio-browser/1","type":"job_offer","msg_id":"offer-msg-3","job_id":"job_offer_3","seq":3,"payload":{"openurl":"https://resolver.example.edu/openurl","provider_hosts":["example.edu"],"access_mode":"delegated","login_entity_id":"http://idp.example.edu/entity","expires_at":"2026-07-17T12:00:00Z"}}`
 
 	msg, err := DecodeBrowserMessage([]byte(withEntityID))
 	if err != nil {
@@ -330,9 +330,9 @@ func TestJobOfferLoginEntityIDValidation(t *testing.T) {
 }
 
 func TestJobOfferProquestAccountIDValidation(t *testing.T) {
-	const withoutAccountID = `{"protocol":"papio-browser/1","type":"job_offer","msg_id":"offer-msg-1","job_id":"job_offer_1","seq":1,"payload":{"openurl":"https://resolver.example.edu/openurl","provider_hosts":["example.edu"],"access_mode":"maximal","expires_at":"2026-07-17T12:00:00Z"}}`
-	const withAccountID = `{"protocol":"papio-browser/1","type":"job_offer","msg_id":"offer-msg-2","job_id":"job_offer_2","seq":2,"payload":{"openurl":"https://resolver.example.edu/openurl","provider_hosts":["example.edu"],"access_mode":"maximal","proquest_account_id":"12345","expires_at":"2026-07-17T12:00:00Z"}}`
-	const nonDigits = `{"protocol":"papio-browser/1","type":"job_offer","msg_id":"offer-msg-3","job_id":"job_offer_3","seq":3,"payload":{"openurl":"https://resolver.example.edu/openurl","provider_hosts":["example.edu"],"access_mode":"maximal","proquest_account_id":"12345x","expires_at":"2026-07-17T12:00:00Z"}}`
+	const withoutAccountID = `{"protocol":"papio-browser/1","type":"job_offer","msg_id":"offer-msg-1","job_id":"job_offer_1","seq":1,"payload":{"openurl":"https://resolver.example.edu/openurl","provider_hosts":["example.edu"],"access_mode":"delegated","expires_at":"2026-07-17T12:00:00Z"}}`
+	const withAccountID = `{"protocol":"papio-browser/1","type":"job_offer","msg_id":"offer-msg-2","job_id":"job_offer_2","seq":2,"payload":{"openurl":"https://resolver.example.edu/openurl","provider_hosts":["example.edu"],"access_mode":"delegated","proquest_account_id":"12345","expires_at":"2026-07-17T12:00:00Z"}}`
+	const nonDigits = `{"protocol":"papio-browser/1","type":"job_offer","msg_id":"offer-msg-3","job_id":"job_offer_3","seq":3,"payload":{"openurl":"https://resolver.example.edu/openurl","provider_hosts":["example.edu"],"access_mode":"delegated","proquest_account_id":"12345x","expires_at":"2026-07-17T12:00:00Z"}}`
 
 	msg, err := DecodeBrowserMessage([]byte(withAccountID))
 	if err != nil {

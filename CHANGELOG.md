@@ -28,6 +28,9 @@ execution records in `notes/acquisition-stack-plan.md`.
 - **Standard bibliographic ingestion for `acquire --batch`**: RIS, BibTeX,
   CSL-JSON, and MEDLINE/NBIB use one robust interchange pipeline for reference
   managers, database exports, and systematic-review tools.
+- **Provider compatibility matrix**: a hand-maintained page records the
+  individually live-verified provider routes, adapter status, and limitations
+  without inventing aggregate success rates.
 
 ### Changed
 
@@ -41,6 +44,9 @@ execution records in `notes/acquisition-stack-plan.md`.
   Store install as the default path; unpacked loading moved under a
   development-install tab. Firefox remains a temporary add-on until the AMO
   listing clears review.
+- **BREAKING:** Access mode `maximal` is now `delegated` in the config value,
+  `--access-mode`, and wire enum. Existing configs must be updated by hand;
+  stored job policies migrate automatically.
 
 ## [0.8.0] - 2026-07-21
 

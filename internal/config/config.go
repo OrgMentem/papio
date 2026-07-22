@@ -24,7 +24,7 @@ import (
 const (
 	ModeConservative = "conservative"
 	ModeAssisted     = "assisted"
-	ModeMaximal      = "maximal"
+	ModeDelegated    = "delegated"
 )
 
 // Source names used across config, budgets, and resolver registry.
@@ -271,7 +271,7 @@ func Default() Config {
 type ErrAccessModeUnset struct{ Path string }
 
 func (e *ErrAccessModeUnset) Error() string {
-	return fmt.Sprintf("access_mode is not set in %s: choose conservative, assisted, or maximal (explicit first-run decision; no silent automation default)", e.Path)
+	return fmt.Sprintf("access_mode is not set in %s: choose conservative, assisted, or delegated (explicit first-run decision; no silent automation default)", e.Path)
 }
 
 // Load reads path (or the default location when path is empty), layering the
@@ -322,9 +322,9 @@ func expandHome(p string) string {
 
 func (c *Config) validate() error {
 	switch c.AccessMode {
-	case "", ModeConservative, ModeAssisted, ModeMaximal:
+	case "", ModeConservative, ModeAssisted, ModeDelegated:
 	default:
-		return fmt.Errorf("invalid access_mode %q (conservative, assisted, or maximal)", c.AccessMode)
+		return fmt.Errorf("invalid access_mode %q (conservative, assisted, or delegated)", c.AccessMode)
 	}
 	if c.Fetch.MaxBytes < 1<<20 {
 		return fmt.Errorf("fetch.max_bytes %d below 1 MiB floor", c.Fetch.MaxBytes)

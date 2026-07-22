@@ -7,7 +7,7 @@
   "payload": {
     "openurl": "https://resolver.example/openurl",
     "provider_hosts": ["example.com"],
-    "access_mode": "maximal",
+    "access_mode": "delegated",
     "expires_at": "2026-02-30T00:00:00Z"
   }
 }

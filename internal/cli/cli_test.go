@@ -87,7 +87,7 @@ func TestConfigInitWritesPrivateStructuredConfig(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.toml")
 	var stdout, stderr bytes.Buffer
 	root := NewRoot(&stdout, &stderr)
-	root.SetArgs([]string{"--config", path, "--json", "config", "init", "--access-mode", "maximal", "--email", "reader@example.test"})
+	root.SetArgs([]string{"--config", path, "--json", "config", "init", "--access-mode", "delegated", "--email", "reader@example.test"})
 	if err := root.Execute(); err != nil {
 		t.Fatalf("config init: %v (%s)", err, stderr.String())
 	}
@@ -95,7 +95,7 @@ func TestConfigInitWritesPrivateStructuredConfig(t *testing.T) {
 	if err := json.Unmarshal(stdout.Bytes(), &output); err != nil {
 		t.Fatalf("JSON output: %v (%q)", err, stdout.String())
 	}
-	if output["access_mode"] != "maximal" || output["config_path"] != path {
+	if output["access_mode"] != "delegated" || output["config_path"] != path {
 		t.Fatalf("output = %v", output)
 	}
 	info, err := os.Stat(path)
@@ -106,7 +106,7 @@ func TestConfigInitWritesPrivateStructuredConfig(t *testing.T) {
 		t.Fatalf("config mode = %v", info.Mode().Perm())
 	}
 	cfg, err := config.Load(path)
-	if err != nil || cfg.AccessMode != config.ModeMaximal || cfg.Email != "reader@example.test" {
+	if err != nil || cfg.AccessMode != config.ModeDelegated || cfg.Email != "reader@example.test" {
 		t.Fatalf("loaded config = %+v, %v", cfg, err)
 	}
 }

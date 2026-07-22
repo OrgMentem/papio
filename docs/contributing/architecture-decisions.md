@@ -30,9 +30,9 @@
 
 **Context:** Open access, licensed APIs, and institutional browser handoff have different authorization and automation limits.
 
-**Decision:** Require an explicit access-mode choice; never silently enable automation. `conservative`, `assisted`, and `maximal` define the allowed behavior, and licensed/TDM adapters remain separately enabled capabilities.
+**Decision:** Require an explicit access-mode choice; never silently enable automation. `conservative`, `assisted`, and `delegated` define the allowed behavior, and licensed/TDM adapters remain separately enabled capabilities.
 
-**Why:** Maximal automation is still limited to legitimate, user-authorized access: login, MFA, CAPTCHA, and publisher/library terms remain human actions. Unknown or changed provider UI falls back to assisted behavior rather than guessing. See [Access modes](../concepts/access-modes.md).
+**Why:** Delegated automation is still limited to legitimate, user-authorized access: login, MFA, CAPTCHA, and publisher/library terms remain human actions. Unknown or changed provider UI falls back to assisted behavior rather than guessing. See [Access modes](../concepts/access-modes.md).
 
 ## Daemon-owned durable state
 
@@ -49,3 +49,11 @@
 **Decision:** Reconsider the core language only before the final browser protocol v1 lock after Phase 3, and only under the plan's concrete triggers. A TypeScript core requires 2–3 real adapters showing that more than 70% of core changes necessarily co-change extension code, the cross-language protocol causes more demonstrated defects than it contains, and clean-machine Node/Bun packaging on every supported target for two release cycles. A Rust core requires in-process hostile-document/archive work at parallel scale, a security requirement for a memory-safe native daemon, or a remote multi-user service, with acceptance of the Rust/Pdfium/toolchain burden.
 
 **Why:** Those conditions would change the product's risk profile; routine provider or adapter churn does not. The browser alternative that may be promoted is the optional macOS Apple Events adapter, and only when named required providers repeatedly fail through the extension but succeed through Apple Events. It never becomes a cross-platform architecture or a hidden CDP/stealth path.
+
+## Handoff offers do not hard-expire
+
+**Context:** Browser handoffs need a fresh resolver link when an institution rejects an old authentication request, but the daemon already reissues that link whenever a user opens actions or the inbox.
+
+**Decision:** *papio* keeps the fresh-link-per-open model: every `papio actions open` or inbox open mints a fresh handoff link. The wire `expires_at` remains advisory; there is no daemon-side expiry sweeper, and `human_actions.expires_at` remains unenforced.
+
+**Why:** Offers are local-only, so there is no confidentiality window to enforce. Reissuing on open already handles stale links, while hard expiry would add a user-visible failure mode without a safety benefit.

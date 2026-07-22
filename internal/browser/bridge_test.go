@@ -46,7 +46,7 @@ func newBridge(t *testing.T) (*Bridge, *job.Store, config.Config, string) {
 		t.Fatal(err)
 	}
 	cfg := config.Default()
-	cfg.AccessMode = config.ModeMaximal
+	cfg.AccessMode = config.ModeDelegated
 	cfg.DataDir = data
 	cfg.Browser.ExtensionID = strings.Repeat("a", 32)
 	cfg.Browser.OpenURLBase = "https://openurl.example.edu/resolve"
@@ -82,7 +82,7 @@ func park(t *testing.T, jobs *job.Store, reqID string, w work.Work) string {
 	t.Helper()
 	ctx := context.Background()
 	id, err := jobs.CreateRequest(ctx, reqID, w, "", "",
-		job.Policy{AccessMode: config.ModeMaximal, DesiredVersion: "any", FetchMaxBytes: 1 << 20}, nil)
+		job.Policy{AccessMode: config.ModeDelegated, DesiredVersion: "any", FetchMaxBytes: 1 << 20}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -409,7 +409,7 @@ func TestReviewPreviewAndResolveNeverLeakQuarantinePath(t *testing.T) {
 	const sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	id, err := jobs.CreateRequest(context.Background(), "wr_browser_review",
 		work.Work{DOI: "10.1000/review", Title: "Review"}, "", "",
-		job.Policy{AccessMode: config.ModeMaximal, DesiredVersion: "any", FetchMaxBytes: 1 << 20}, nil)
+		job.Policy{AccessMode: config.ModeDelegated, DesiredVersion: "any", FetchMaxBytes: 1 << 20}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -503,7 +503,7 @@ func TestHumanActionResolveDismissClosesNonReviewAction(t *testing.T) {
 	b, jobs, _, _ := newBridge(t)
 	id, err := jobs.CreateRequest(context.Background(), "wr_browser_dismiss",
 		work.Work{DOI: "10.1000/dismiss", Title: "Dismiss me"}, "", "",
-		job.Policy{AccessMode: config.ModeMaximal, DesiredVersion: "any", FetchMaxBytes: 1 << 20}, nil)
+		job.Policy{AccessMode: config.ModeDelegated, DesiredVersion: "any", FetchMaxBytes: 1 << 20}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

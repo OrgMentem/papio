@@ -1,7 +1,7 @@
 # Browser handoff
 
 Browser handoff is *papio*'s institutional-access plane. When an eligible job has
-exhausted direct acquisition, [assisted and maximal access modes](access-modes.md)
+exhausted direct acquisition, [assisted and delegated access modes](access-modes.md)
 can route it to the user's existing browser session. Conservative mode records
 institutional OpenURL availability without opening a handoff.
 
@@ -131,7 +131,7 @@ The extension requests only these regular permissions:
 Provider domains are declared in `optional_host_permissions` and are granted
 per source through the extension UI. *papio* does not request `<all_urls>`,
 `cookies`, or `debugger`; it does not request access to identity-provider hosts.
-Selecting maximal mode does not grant a browser permission.
+Selecting delegated mode does not grant a browser permission.
 
 The link to the browser carries metadata only, within *papio*'s fixed message-size limit.
 PDF bytes, cookies, credentials, page contents, screenshots, and secret- or

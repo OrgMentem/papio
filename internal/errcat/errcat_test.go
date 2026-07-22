@@ -11,7 +11,7 @@ import (
 
 func TestExplainCategoriesAndGuidance(t *testing.T) {
 	withInstitution := config.Config{
-		AccessMode: config.ModeMaximal,
+		AccessMode: config.ModeDelegated,
 		Browser:    config.Browser{OpenURLBase: "https://library.example.edu/openurl"},
 	}
 	for _, test := range []struct {
@@ -30,12 +30,12 @@ func TestExplainCategoriesAndGuidance(t *testing.T) {
 		{name: "retrying", state: "retry_wait", reason: "resolver_temporarily_unavailable", wantCategory: "retrying"},
 		{
 			name: "no institution configured", state: "unavailable", reason: "no_legal_candidates",
-			accessMode: config.ModeMaximal, cfg: config.Config{AccessMode: config.ModeMaximal},
+			accessMode: config.ModeDelegated, cfg: config.Config{AccessMode: config.ModeDelegated},
 			wantCategory: "institution_not_configured",
 		},
 		{
 			name: "institution configured but no entitlement", state: "unavailable", reason: "candidates_exhausted",
-			accessMode: config.ModeMaximal, cfg: withInstitution,
+			accessMode: config.ModeDelegated, cfg: withInstitution,
 			wantCategory: "no_access",
 		},
 		{
@@ -73,7 +73,7 @@ func TestExplainNoAccessNamedProfileNotConfigured(t *testing.T) {
 }
 
 func TestWaitGuidance(t *testing.T) {
-	cfg := config.Config{AccessMode: config.ModeMaximal}
+	cfg := config.Config{AccessMode: config.ModeDelegated}
 	// Success and non-actionable states produce no guidance block.
 	if g := WaitGuidance("ready", "", "", "", cfg); g != "" {
 		t.Fatalf("ready guidance = %q, want empty", g)
@@ -87,7 +87,7 @@ func TestWaitGuidance(t *testing.T) {
 		t.Fatalf("awaiting_human guidance = %q", g)
 	}
 	// The config-aware no-access case reaches acquire --wait output too.
-	g = WaitGuidance("unavailable", "no_legal_candidates", "", config.ModeMaximal, cfg)
+	g = WaitGuidance("unavailable", "no_legal_candidates", "", config.ModeDelegated, cfg)
 	if !strings.Contains(g, "[institution_not_configured]") {
 		t.Fatalf("unavailable guidance = %q", g)
 	}

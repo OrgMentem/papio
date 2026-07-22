@@ -201,7 +201,7 @@ papio config init [flags]
 
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
-| `--access-mode` | `string` |  | required: conservative, assisted, or maximal |
+| `--access-mode` | `string` |  | required: conservative, assisted, or delegated |
 | `--data-dir` | `string` |  | artifact and database directory |
 | `--email` | `string` |  | contact email for polite APIs |
 | `--force` | `bool` | `false` | replace an existing config |

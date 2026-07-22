@@ -269,7 +269,7 @@ func newConfigCommand(opt *options) *cobra.Command {
 			return opt.printResult(map[string]string{"config_path": path, "access_mode": mode}, "Wrote %s (access_mode=%s)", path, mode)
 		},
 	}
-	initCommand.Flags().StringVar(&mode, "access-mode", "", "required: conservative, assisted, or maximal")
+	initCommand.Flags().StringVar(&mode, "access-mode", "", "required: conservative, assisted, or delegated")
 	initCommand.Flags().StringVar(&email, "email", "", "contact email for polite APIs")
 	initCommand.Flags().StringVar(&dataDir, "data-dir", "", "artifact and database directory")
 	initCommand.Flags().BoolVar(&force, "force", false, "replace an existing config")

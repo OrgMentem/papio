@@ -118,8 +118,8 @@ it finds:
 | **Zotero writes** | `zotio` — preview (`plan`) then confirmed `apply` | No — `papio` never stores Zotero credentials |
 
 `papio` runs in one of three access modes — `conservative`, `assisted`, or
-`maximal`. A fresh `papio init` chooses `conservative`; institutional handoff
-opens a browser only under `assisted`/`maximal`, and even then automation stays
+`delegated`. A fresh `papio init` chooses `conservative`; institutional handoff
+opens a browser only under `assisted`/`delegated`, and even then automation stays
 inside legitimate, user-authorized access
 ([access modes & safety](https://orgmentem.github.io/papio/concepts/access-modes/)).
 

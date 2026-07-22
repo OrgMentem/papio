@@ -894,7 +894,7 @@ function offer(
     payload: {
       openurl: OPENURL,
       provider_hosts: providerHosts,
-      access_mode: "maximal",
+      access_mode: "delegated",
       expires_at: EXPIRES,
       ...(expected !== undefined ? { expected } : {}),
       ...(loginEntityID !== undefined ? { login_entity_id: loginEntityID } : {}),

@@ -371,7 +371,7 @@
                   "title": { "type": "string", "maxLength": 500 }
                 }
               },
-              "access_mode": { "enum": ["assisted", "maximal"] },
+              "access_mode": { "enum": ["assisted", "delegated"] },
               "login_entity_id": { "type": "string", "format": "uri", "maxLength": 4000, "pattern": "^https://" },
               "proquest_account_id": { "type": "string", "maxLength": 64, "pattern": "^[0-9]+$" },
               "requires_auth": { "type": "boolean" },

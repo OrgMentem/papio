@@ -212,7 +212,7 @@ func (wr *WorkRequest) Validate() error {
 	if err := enumOK("desired_version", wr.DesiredVersion, "published", "accepted", "preprint", "any"); err != nil {
 		return err
 	}
-	if err := enumOK("access_mode_override", wr.AccessModeOverride, "conservative", "assisted", "maximal"); err != nil {
+	if err := enumOK("access_mode_override", wr.AccessModeOverride, "conservative", "assisted", "delegated"); err != nil {
 		return err
 	}
 	if wr.MaxCostUSD != nil && *wr.MaxCostUSD < 0 {
@@ -1098,7 +1098,7 @@ func (p *JobOfferPayload) validate() error {
 			return fmt.Errorf("invalid provider host %q", h)
 		}
 	}
-	if err := enumRequired("access_mode", p.AccessMode, "assisted", "maximal"); err != nil {
+	if err := enumRequired("access_mode", p.AccessMode, "assisted", "delegated"); err != nil {
 		return err
 	}
 	if !rfc3339RE.MatchString(p.ExpiresAt) {

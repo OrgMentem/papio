@@ -32,7 +32,7 @@ func writeTestConfig(t *testing.T, extensionID, firefoxExtensionID string) (stri
 	configDir := t.TempDir()
 	t.Setenv("PAPIO_CONFIG_DIR", configDir)
 	cfg := config.Default()
-	cfg.AccessMode = config.ModeMaximal
+	cfg.AccessMode = config.ModeDelegated
 	cfg.Browser.ExtensionID = extensionID
 	cfg.Browser.FirefoxExtensionID = firefoxExtensionID
 	if err := config.Save(cfg, ""); err != nil {
@@ -282,7 +282,7 @@ func TestNativeHostInstallMultipleChromiumIDs(t *testing.T) {
 	configDir := t.TempDir()
 	t.Setenv("PAPIO_CONFIG_DIR", configDir)
 	cfg := config.Default()
-	cfg.AccessMode = config.ModeMaximal
+	cfg.AccessMode = config.ModeDelegated
 	cfg.Browser.ExtensionID = primary
 	cfg.Browser.ExtensionIDs = []string{secondary}
 	if err := config.Save(cfg, ""); err != nil {

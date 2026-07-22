@@ -75,7 +75,7 @@ export interface JobOfferPayload {
   openurl: string;
   provider_hosts: string[];
   expected?: JobOfferExpected;
-  access_mode: "assisted" | "maximal";
+  access_mode: "assisted" | "delegated";
   expires_at: string;
   /** The institution's Shibboleth IdP entityID, when the daemon knows it.
    * Lets an adapter's federated-login route auto-select the institution on a
@@ -657,7 +657,7 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
         if (typeof h !== "string" || !HOST_RE.test(h)) fail(`invalid provider host ${JSON.stringify(h)}`);
       }
       const mode = str(p, "access_mode", "job_offer", 20);
-      if (mode !== "assisted" && mode !== "maximal") fail(`invalid access_mode ${JSON.stringify(mode)}`);
+      if (mode !== "assisted" && mode !== "delegated") fail(`invalid access_mode ${JSON.stringify(mode)}; expected "assisted" or "delegated"`);
       const expires = str(p, "expires_at", "job_offer", 64);
       if (!isRFC3339(expires)) fail("job_offer.expires_at must be RFC3339");
       if ("expected" in p) {
