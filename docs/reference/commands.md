@@ -95,6 +95,22 @@ papio actions resolve <action-id> [flags]
 | `--accept` | `bool` | `false` | accept the identity review |
 | `--reject` | `bool` | `false` | reject the identity review |
 
+## `papio adapter`
+
+Inspect provider and adapter interactions
+
+```
+papio adapter
+```
+
+### `papio adapter diagnose`
+
+Build a sanitized support report for a job
+
+```
+papio adapter diagnose <job-id>
+```
+
 ## `papio artifacts`
 
 Inspect validated immutable artifacts

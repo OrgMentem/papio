@@ -12,6 +12,9 @@ execution records in `notes/acquisition-stack-plan.md`.
 
 ### Added
 
+- **`papio adapter diagnose <job-id>`** — sanitized, paste-safe support report
+  for provider/adapter failures (job policy, actions, redacted event timeline,
+  extension connectivity).
 - **Library-completeness line in `papio status`**: when zotio is configured,
   status leads with `Library: N item(s) missing PDFs — papio acquire
   --from-zotio fills them` (or `Library: complete`), backed by a new
