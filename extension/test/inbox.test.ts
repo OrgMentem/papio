@@ -417,10 +417,11 @@ test("backend identifiers collapse into a details section and the citation carri
   expect(citation?.textContent).toBe("LeCun, Y., Bengio, Y., & Hinton, G. (2015). https://doi.org/10.1038/nature14539");
   expect(citation?.querySelector("a")?.href).toBe("https://doi.org/10.1038/nature14539");
 
-  // The backend strip is hidden by default; its trigger trails the actionable
-  // detail text and exposes item/job/revision as three peer columns.
+  // The backend strip is hidden by default; its down-chevron trigger trails
+  // the actionable detail text and exposes item/job/revision as peers.
   const debug = row?.querySelector<HTMLDListElement>(".item-debug");
   const debugToggle = row?.querySelector<HTMLButtonElement>(".item-detail .item-debug-toggle");
+  expect(debugToggle?.textContent).toBe("⌄");
   expect(debugToggle?.getAttribute("aria-label")).toBe("Backend details");
   expect(debugToggle?.getAttribute("aria-expanded")).toBe("false");
   expect(debug?.hidden).toBe(true);

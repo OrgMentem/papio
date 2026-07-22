@@ -522,9 +522,9 @@ function statusMeta(item: TriageSnapshotItem): { key: string; glyph: string; lab
   return { key: "unknown", glyph: "•", label: key.replaceAll("_", " ") };
 }
 
-// Backend identifiers remain out of the ordinary triage flow. A compact
-// button lives beside the title; its three-column strip is revealed only on
-// demand, preserving native button keyboard semantics and state.
+// Backend identifiers remain out of the ordinary triage flow. Their compact
+// disclosure sits beside the action/status text and preserves native button
+// keyboard semantics and state.
 function renderDebug(item: TriageSnapshotItem): { toggle: HTMLButtonElement; list: HTMLDListElement } {
   const rows: Array<[string, string]> = [["item", item.id]];
   const job = factText(item, "Job");
@@ -545,7 +545,7 @@ function renderDebug(item: TriageSnapshotItem): { toggle: HTMLButtonElement; lis
     list.append(field);
   }
 
-  const toggle = element("button", "⋯");
+  const toggle = element("button", "⌄");
   toggle.className = "item-debug-toggle";
   toggle.type = "button";
   toggle.dataset.label = "Backend details";

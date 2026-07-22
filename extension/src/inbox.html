@@ -576,7 +576,7 @@
       }
 
       /* This remains a real button for keyboard users, but reads as an
-         inline active ellipsis rather than a second control in the row. */
+         inline active chevron rather than a second control in the row. */
       .item-debug-toggle {
         appearance: none;
         background: transparent;
@@ -592,13 +592,21 @@
         padding: 0;
         position: relative;
         vertical-align: baseline;
+        transition: none;
       }
 
       .item-debug-toggle:hover,
-      .item-debug-toggle[aria-expanded="true"] {
+      .item-debug-toggle:focus-visible {
         background: transparent;
         border: 0;
         color: var(--color-primary-solid-hover);
+      }
+
+      @media (prefers-color-scheme: dark) {
+        .item-debug-toggle:hover,
+        .item-debug-toggle:focus-visible {
+          color: #fff;
+        }
       }
 
       .item-debug {
