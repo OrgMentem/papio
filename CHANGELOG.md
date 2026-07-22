@@ -12,6 +12,9 @@ execution records in `notes/acquisition-stack-plan.md`.
 
 ### Added
 
+- **Institution discovery in `papio init`**: paste a library discovery URL or
+  use the resolver configured in Zotero to derive the OpenURL base; scripted
+  setup supports `--institution-url`.
 - **`papio adapter diagnose <job-id>`** — sanitized, paste-safe support report
   for provider/adapter failures (job policy, actions, redacted event timeline,
   extension connectivity).

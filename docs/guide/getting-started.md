@@ -124,11 +124,16 @@ The interactive setup asks for:
    Chrome Web Store package's fixed ID; only unpacked development builds need
    a different one) and the Firefox add-on ID, which defaults to the built
    add-on's fixed ID, `papio@orgmentem.com`.
-5. Institution settings when browser integration is enabled: a library OpenURL
-   resolver base URL; if that URL is set, an optional Shibboleth IdP entityID
-   for auto login-routing and a ProQuest account ID. For ProQuest, paste either
-   the numeric ID or a ProQuest URL containing `accountid=`; *papio* extracts the
-   account ID from the URL.
+5. Institution settings when browser integration is enabled: paste your library's
+   discovery or search URL (Primo, SFX, WorldCat, or EBSCO) or the OpenURL base
+   directly; *papio* derives the resolver base and, when present, the ProQuest
+   account ID. If Zotero is installed with a resolver already configured,
+   `papio init` offers it as the default. For scripted setup, use
+   `--institution-url`.
+
+```sh
+papio init --institution-url "https://university.primo.exlibrisgroup.com/discovery/search?vid=UNIV:LIBRARY"
+```
 
 For an unattended setup, `--non-interactive` retains existing values unless a
 flag overrides them. Use `--skip-browser` to omit Chrome/Firefox and browser-connector

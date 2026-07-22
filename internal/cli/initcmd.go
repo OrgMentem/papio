@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/mail"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -20,6 +21,7 @@ import (
 	"papio/internal/bootstrap"
 	"papio/internal/config"
 	"papio/internal/doctor"
+	"papio/internal/institution"
 )
 
 const zotioVersionTimeout = 5 * time.Second
@@ -62,7 +64,7 @@ func newInitCommand(opt *options) *cobra.Command {
 func newInitCommandWithDependencies(opt *options, deps initDependencies) *cobra.Command {
 	var checkUpdates, nonInteractive, skipBrowser bool
 	var email, zotioPath, attachmentMode string
-	var openurlBase, shibbolethEntityID, proquestAccountID string
+	var institutionURL, openurlBase, shibbolethEntityID, proquestAccountID string
 	var extensionID, firefoxExtensionID string
 
 	command := &cobra.Command{
@@ -80,6 +82,7 @@ func newInitCommandWithDependencies(opt *options, deps initDependencies) *cobra.
 				email:              email,
 				zotioPath:          zotioPath,
 				attachmentMode:     attachmentMode,
+				institutionURL:     institutionURL,
 				openurlBase:        openurlBase,
 				shibbolethEntityID: shibbolethEntityID,
 				proquestAccountID:  proquestAccountID,
@@ -89,6 +92,7 @@ func newInitCommandWithDependencies(opt *options, deps initDependencies) *cobra.
 				emailSet:           cmd.Flags().Changed("email"),
 				zotioPathSet:       cmd.Flags().Changed("zotio-path"),
 				attachmentSet:      cmd.Flags().Changed("attachment-mode"),
+				institutionURLSet:  cmd.Flags().Changed("institution-url"),
 				openurlBaseSet:     cmd.Flags().Changed("openurl-base"),
 				entityIDSet:        cmd.Flags().Changed("shibboleth-entity-id"),
 				proquestSet:        cmd.Flags().Changed("proquest-account-id"),
@@ -102,6 +106,7 @@ func newInitCommandWithDependencies(opt *options, deps initDependencies) *cobra.
 	command.Flags().StringVar(&email, "email", "", "contact email for polite API pools")
 	command.Flags().StringVar(&zotioPath, "zotio-path", "", "zotio executable path")
 	command.Flags().StringVar(&attachmentMode, "attachment-mode", "", "zotio attachment mode: stored or linked-file")
+	command.Flags().StringVar(&institutionURL, "institution-url", "", "library discovery or resolver URL; papio derives the OpenURL base")
 	command.Flags().StringVar(&openurlBase, "openurl-base", "", "institution OpenURL resolver base URL")
 	command.Flags().StringVar(&shibbolethEntityID, "shibboleth-entity-id", "", "Shibboleth IdP entityID for federated login-routing")
 	command.Flags().StringVar(&proquestAccountID, "proquest-account-id", "", "ProQuest account id, or a ProQuest URL containing accountid=")
@@ -118,6 +123,7 @@ type initOptions struct {
 	email              string
 	zotioPath          string
 	attachmentMode     string
+	institutionURL     string
 	openurlBase        string
 	shibbolethEntityID string
 	proquestAccountID  string
@@ -127,6 +133,7 @@ type initOptions struct {
 	emailSet           bool
 	zotioPathSet       bool
 	attachmentSet      bool
+	institutionURLSet  bool
 	openurlBaseSet     bool
 	entityIDSet        bool
 	proquestSet        bool
@@ -217,6 +224,9 @@ func initConfig(path string) (config.Config, bool, error) {
 func applyInitConfig(cmd *cobra.Command, out io.Writer, cfg *config.Config, exists bool, input *initOptions) error {
 	if input.attachmentSet && input.attachmentMode != "stored" && input.attachmentMode != "linked-file" {
 		return fmt.Errorf("--attachment-mode must be stored or linked-file")
+	}
+	if input.institutionURLSet && input.openurlBaseSet {
+		return fmt.Errorf("--institution-url and --openurl-base cannot be used together")
 	}
 
 	reader := bufio.NewReader(cmd.InOrStdin())
@@ -311,18 +321,65 @@ func applyInitConfig(cmd *cobra.Command, out io.Writer, cfg *config.Config, exis
 		}
 	}
 
-	// Institution: which library's OpenURL resolver and optional federated-login
-	// identity to route jobs through. Prompted only when browser integration is
-	// active. The ProQuest step accepts a pasted resolver URL and extracts the
-	// account id, so a user who does not know the numeric id can still set it.
+	// Institution: derive a library's OpenURL resolver and optional ProQuest
+	// account id from either an explicit discovery URL or guided input.
+	if input.institutionURLSet {
+		discovery, err := institution.Discover(input.institutionURL)
+		if err != nil {
+			return err
+		}
+		if discovery.OpenURLBase == "" {
+			return fmt.Errorf("%s", discovery.Note)
+		}
+		cfg.Browser.OpenURLBase = discovery.OpenURLBase
+		if !input.proquestSet && cfg.Browser.ProquestAccountID == "" && discovery.ProquestAccountID != "" {
+			cfg.Browser.ProquestAccountID = discovery.ProquestAccountID
+		}
+		initLine(out, true, "Institution", discovery.Note)
+	}
+
 	if !input.nonInteractive && !input.skipBrowser {
 		fmt.Fprintln(out, "Institution")
-		if !input.openurlBaseSet {
-			value, err := initPrompt(reader, out, "Library OpenURL resolver base URL (blank to skip)", cfg.Browser.OpenURLBase)
+		if !input.openurlBaseSet && !input.institutionURLSet {
+			defaultValue := cfg.Browser.OpenURLBase
+			if defaultValue == "" {
+				if resolver, ok := institution.ZoteroResolver(); ok {
+					defaultValue = resolver
+					initLine(out, true, "Institution", "found an OpenURL resolver in your Zotero settings")
+				}
+			}
+			value, err := initPrompt(reader, out, "Library OpenURL resolver base, or paste your library's discovery/search URL (blank to skip)", defaultValue)
 			if err != nil {
 				return err
 			}
-			cfg.Browser.OpenURLBase = value
+			if value != "" {
+				discovery, err := institution.Discover(value)
+				if err == nil && discovery.OpenURLBase != "" {
+					if discovery.OpenURLBase != value {
+						initLine(out, true, "Institution", discovery.Note)
+					}
+					cfg.Browser.OpenURLBase = discovery.OpenURLBase
+					if !input.proquestSet && cfg.Browser.ProquestAccountID == "" && discovery.ProquestAccountID != "" {
+						cfg.Browser.ProquestAccountID = discovery.ProquestAccountID
+					}
+				} else {
+					guidance := discovery.Note
+					if err != nil {
+						guidance = err.Error()
+					}
+					retry, err := initPrompt(reader, out, guidance, "")
+					if err != nil {
+						return err
+					}
+					if retry == "" {
+						cfg.Browser.OpenURLBase = ""
+					} else if !isHTTPSURL(retry) {
+						return fmt.Errorf("%s", guidance)
+					} else {
+						cfg.Browser.OpenURLBase = retry
+					}
+				}
+			}
 		}
 		if cfg.Browser.OpenURLBase != "" {
 			if !input.entityIDSet {
@@ -408,6 +465,11 @@ func initUpdateCheckPrompt(reader *bufio.Reader, out io.Writer) (bool, error) {
 	default:
 		return false, fmt.Errorf("update check choice must be yes or no")
 	}
+}
+
+func isHTTPSURL(raw string) bool {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	return err == nil && strings.EqualFold(parsed.Scheme, "https") && parsed.Host != ""
 }
 
 // accountIDParamRE captures an accountid=<digits> query parameter from anywhere

@@ -297,6 +297,7 @@ papio init [flags]
 | `--email` | `string` |  | contact email for polite API pools |
 | `--extension-id` | `string` |  | Chrome extension ID allowed to reach the native host |
 | `--firefox-extension-id` | `string` |  | Firefox add-on ID allowed to reach the native host |
+| `--institution-url` | `string` |  | library discovery or resolver URL; papio derives the OpenURL base |
 | `--non-interactive` | `bool` | `false` | do not prompt; retain existing values unless a flag overrides them |
 | `--openurl-base` | `string` |  | institution OpenURL resolver base URL |
 | `--proquest-account-id` | `string` |  | ProQuest account id, or a ProQuest URL containing accountid= |

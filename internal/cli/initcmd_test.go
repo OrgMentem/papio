@@ -15,6 +15,7 @@ import (
 	"papio/internal/bootstrap"
 	"papio/internal/config"
 	"papio/internal/doctor"
+	"papio/internal/institution"
 	"papio/internal/store"
 )
 
@@ -221,6 +222,65 @@ func TestInitInstitutionFlagsExtractAccountIDFromPastedURL(t *testing.T) {
 	}
 }
 
+func TestInitInstitutionURLDerivesPrimoVEBase(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	path := filepath.Join(home, ".config", "papio", "config.toml")
+	const discoveryURL = "https://university.primo.exlibrisgroup.com/discovery/search?vid=UNIV:Main&rft.title=An+Article&rft.au=Author&accountid=24680"
+	const wantBase = "https://university.primo.exlibrisgroup.com/discovery/openurl?institution=UNIV&vid=UNIV%3AMain"
+
+	out, err := runInitForTest(t, path, initTestDependencies(t),
+		"--non-interactive", "--email", "reader@example.test", "--skip-browser",
+		"--institution-url", discoveryURL)
+	if err != nil {
+		t.Fatalf("init: %v\n%s", err, out)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if cfg.Browser.OpenURLBase != wantBase {
+		t.Fatalf("openurl base = %q, want %q", cfg.Browser.OpenURLBase, wantBase)
+	}
+	if cfg.Browser.ProquestAccountID != "24680" {
+		t.Fatalf("proquest account id = %q, want captured account id", cfg.Browser.ProquestAccountID)
+	}
+}
+
+func TestInitInstitutionURLConflictsWithOpenURLBase(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	path := filepath.Join(home, ".config", "papio", "config.toml")
+
+	_, err := runInitForTest(t, path, initTestDependencies(t),
+		"--non-interactive", "--institution-url", "https://university.primo.exlibrisgroup.com/discovery/search?vid=UNIV:Main",
+		"--openurl-base", "https://resolver.example.edu/openurl")
+	if err == nil || !strings.Contains(err.Error(), "--institution-url and --openurl-base cannot be used together") {
+		t.Fatalf("init error = %v, want mutually exclusive flag error", err)
+	}
+}
+
+func TestInitInstitutionURLRejectsUnderivableDiscoveryURL(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	path := filepath.Join(home, ".config", "papio", "config.toml")
+	const discoveryURL = "https://catalog.example.edu/search?query=climate"
+	discovery, err := institution.Discover(discoveryURL)
+	if err != nil {
+		t.Fatalf("discover test URL: %v", err)
+	}
+	if discovery.OpenURLBase != "" {
+		t.Fatalf("test URL derived unexpected base %q", discovery.OpenURLBase)
+	}
+
+	_, err = runInitForTest(t, path, initTestDependencies(t),
+		"--non-interactive", "--email", "reader@example.test", "--skip-browser",
+		"--institution-url", discoveryURL)
+	if err == nil || !strings.Contains(err.Error(), discovery.Note) {
+		t.Fatalf("init error = %v, want discovery note %q", err, discovery.Note)
+	}
+}
+
 func runInitStdin(t *testing.T, path string, deps initDependencies, stdin string) (string, error) {
 	t.Helper()
 	var out, errOut bytes.Buffer
@@ -297,6 +357,87 @@ func TestInitInteractiveCapturesExtensionIDsAndInstalls(t *testing.T) {
 	// The captured Chrome ID reaches the native-host install in the same run.
 	if installedID != "abcdefghijklmnopabcdefghijklmnop" {
 		t.Fatalf("native host installed with extension_id %q", installedID)
+	}
+}
+
+func TestInitInteractiveInstitutionURLDerivesPrimoVEBase(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	path := filepath.Join(home, ".config", "papio", "config.toml")
+	deps := initTestDependencies(t)
+	deps.InstallNative = func(config.Config) error { return nil }
+	const discoveryURL = "https://university.primo.exlibrisgroup.com/discovery/search?vid=UNIV:Main"
+	const wantBase = "https://university.primo.exlibrisgroup.com/discovery/openurl?institution=UNIV&vid=UNIV%3AMain"
+
+	answers := strings.Join([]string{
+		"reader@example.test",
+		"zotio",
+		"stored",
+		"yes",
+		"",
+		"",
+		discoveryURL,
+		"",
+		"",
+		"",
+	}, "\n") + "\n"
+	out, err := runInitStdin(t, path, deps, answers)
+	if err != nil {
+		t.Fatalf("init: %v\n%s", err, out)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if cfg.Browser.OpenURLBase != wantBase {
+		t.Fatalf("openurl base = %q, want derived %q", cfg.Browser.OpenURLBase, wantBase)
+	}
+}
+
+func TestInitInteractiveInstitutionPromptUsesExistingBaseDefault(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	path := filepath.Join(home, ".config", "papio", "config.toml")
+	const existingBase = "https://resolver.example.edu/openurl"
+	cfg := config.Default()
+	cfg.Email = "reader@example.test"
+	cfg.AccessMode = config.ModeConservative
+	cfg.Browser.OpenURLBase = existingBase
+	if err := config.Save(cfg, path); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+	deps := initTestDependencies(t)
+	deps.InstallNative = func(config.Config) error { return nil }
+
+	answers := strings.Join([]string{
+		"",
+		"",
+		"",
+		"yes",
+		"",
+		"",
+		"",
+		"",
+		"",
+		"",
+	}, "\n") + "\n"
+	out, err := runInitStdin(t, path, deps, answers)
+	if err != nil {
+		t.Fatalf("init: %v\n%s", err, out)
+	}
+	got, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if got.Browser.OpenURLBase != existingBase {
+		t.Fatalf("openurl base = %q, want existing %q", got.Browser.OpenURLBase, existingBase)
+	}
+	wantPrompt := "Library OpenURL resolver base, or paste your library's discovery/search URL (blank to skip) [" + existingBase + "]:"
+	if !strings.Contains(out, wantPrompt) {
+		t.Fatalf("institution prompt = %q, want default prompt %q", out, wantPrompt)
+	}
+	if strings.Contains(out, "found an OpenURL resolver in your Zotero settings") {
+		t.Fatalf("unexpected Zotero resolver lookup note: %q", out)
 	}
 }
 

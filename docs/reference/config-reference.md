@@ -47,6 +47,10 @@ with `~/` are expanded when *papio* loads them.
 | `download_adoption_root` | path string | empty | Root for browser-download adoption. When empty, the effective value is `<data_dir>/adoptions`; adoption is confined to a job subdirectory beneath this root. |
 | `action_expiry_seconds` | integer seconds | `1800` | Maximum open time for one browser handoff. It must not be negative. |
 
+
+`papio init` can derive `openurl_base_url` from a pasted library discovery URL
+(`--institution-url`) or from the resolver configured in Zotero.
+
 The browser path uses the user's ordinary Chrome session. It is not configured
 with passwords, MFA, CAPTCHA tokens, or publisher credentials.
 
