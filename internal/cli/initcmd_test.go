@@ -83,7 +83,7 @@ func TestInitFreshWritesConfigAndAppliesMigrations(t *testing.T) {
 	if err != nil || version == 0 {
 		t.Fatalf("schema version = %d, %v; want a nonzero applied migration", version, err)
 	}
-	if !strings.Contains(out, "✓ Configuration:") || !strings.Contains(out, "✓ Data:") || !strings.Contains(out, "PASS  database") {
+	if !strings.Contains(out, "✓ Configuration:") || !strings.Contains(out, "✓ Data:") || !strings.Contains(out, "doctor: ") {
 		t.Fatalf("init output does not render setup and doctor findings:\n%s", out)
 	}
 }
@@ -136,7 +136,7 @@ func TestInitZotioWarningAndRequiredFailureExitContract(t *testing.T) {
 	if err != nil {
 		t.Fatalf("zotio warning must not fail init: %v\n%s", err, out)
 	}
-	if !strings.Contains(out, "✗ Zotio:") || !strings.Contains(out, "Zotero features are disabled") {
+	if !strings.Contains(out, "✗ zotio:") || !strings.Contains(out, "Zotero features are disabled") {
 		t.Fatalf("zotio warning missing from output:\n%s", out)
 	}
 
@@ -432,7 +432,7 @@ func TestInitInteractiveInstitutionPromptUsesExistingBaseDefault(t *testing.T) {
 	if got.Browser.OpenURLBase != existingBase {
 		t.Fatalf("openurl base = %q, want existing %q", got.Browser.OpenURLBase, existingBase)
 	}
-	wantPrompt := "Library OpenURL resolver base, or paste your library's discovery/search URL (blank to skip) [" + existingBase + "]:"
+	wantPrompt := "› resolver [" + existingBase + "]:"
 	if !strings.Contains(out, wantPrompt) {
 		t.Fatalf("institution prompt = %q, want default prompt %q", out, wantPrompt)
 	}
@@ -471,7 +471,7 @@ func TestInitUpdateCheckPromptWritesBothAnswers(t *testing.T) {
 			if cfg.Updates.Check != test.want {
 				t.Fatalf("updates.check = %t, want %t", cfg.Updates.Check, test.want)
 			}
-			if !strings.Contains(out, "Check for papio and zotio updates once a day? Queries GitHub releases only; nothing else is sent. [Y/n]") {
+			if !strings.Contains(out, "Queries GitHub releases only; nothing else is sent.") || !strings.Contains(out, "› Check for papio and zotio updates once a day? [Y/n]") {
 				t.Fatalf("update prompt missing from output: %q", out)
 			}
 		})

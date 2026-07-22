@@ -15,6 +15,11 @@ execution records in `notes/acquisition-stack-plan.md`.
 - Doctor's extension check is floor-aware: a connected extension below the
   daemon's minimum version now WARNs with the exact skew and remediation
   instead of reporting a bare `connected` PASS while every handoff refuses.
+- `papio init`'s guided flow was redesigned: numbered step sections with
+  one-line explanations, one question per prompt, a single `[Y/n]` grammar,
+  middle-ellipsized long defaults, per-browser setup instructions, a doctor
+  summary that shows only checks needing attention, and a closing `Next:`
+  action. Behavior and flags are unchanged.
 
 ## [0.9.0] - 2026-07-22
 

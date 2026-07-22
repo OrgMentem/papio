@@ -161,6 +161,9 @@ func runInit(cmd *cobra.Command, opt *options, deps initDependencies, input init
 	if err != nil {
 		return initRequiredFailure(opt.out, "Configuration", err)
 	}
+	if !input.nonInteractive {
+		fmt.Fprintln(opt.out)
+	}
 	initLine(opt.out, true, "Configuration", "wrote "+cfg.Path)
 
 	system, err := deps.Bootstrap(cmd.Context(), cfg)
@@ -173,35 +176,75 @@ func runInit(cmd *cobra.Command, opt *options, deps initDependencies, input init
 	initLine(opt.out, true, "Data", "created "+cfg.DataDir+" and applied migrations")
 
 	if err := deps.CheckZotio(cmd.Context(), cfg.Zotio.Executable); err != nil {
-		initLine(opt.out, false, "Zotio", fmt.Sprintf("%v; Zotero features are disabled", err))
+		initLine(opt.out, false, "zotio", fmt.Sprintf("%v; Zotero features are disabled", err))
 	} else {
-		initLine(opt.out, true, "Zotio", "available at "+cfg.Zotio.Executable)
+		initLine(opt.out, true, "zotio", "available at "+cfg.Zotio.Executable)
 	}
 
 	if input.skipBrowser {
 		initLine(opt.out, true, "Browser", "skipped")
 	} else if err := deps.InstallNative(cfg); err != nil {
 		initLine(opt.out, false, "Browser", fmt.Sprintf("native-host install: %v", err))
-		writeBrowserInstructions(opt.out)
+		writeBrowserInstructions(opt.out, cfg)
 	} else {
 		initLine(opt.out, true, "Browser", "native messaging host installed")
-		writeBrowserInstructions(opt.out)
+		writeBrowserInstructions(opt.out, cfg)
 	}
 
 	report, err := deps.RunDoctor(cmd.Context(), opt)
 	if err != nil {
 		initLine(opt.out, false, "Daemon and doctor", fmt.Sprintf("%v", err))
+		fmt.Fprintln(opt.out, "\nNext: papio doctor --start")
+		return nil
+	}
+	if report.OK {
+		initLine(opt.out, true, "Daemon and doctor", "daemon autostarted")
 	} else {
-		if !report.OK {
-			initLine(opt.out, false, "Daemon and doctor", "daemon autostarted; doctor reported failures")
-		} else {
-			initLine(opt.out, true, "Daemon and doctor", "daemon autostarted")
+		initLine(opt.out, false, "Daemon and doctor", "daemon autostarted; doctor reported failures")
+	}
+	// Init already succeeded or failed step by step above; the full PASS table
+	// is noise here. Summarize, show only what needs attention, and point at
+	// `papio doctor` for the rest.
+	writeInitDoctorSummary(opt.out, report)
+	fmt.Fprintln(opt.out, "\nNext: "+initNextAction(input, report))
+	return nil
+}
+
+// writeInitDoctorSummary prints one summary line plus any non-PASS checks.
+func writeInitDoctorSummary(out io.Writer, report doctor.Report) {
+	passed, attention := 0, make([]doctor.Check, 0, 4)
+	for _, check := range report.Checks {
+		if check.Status == doctor.Pass {
+			passed++
+			continue
 		}
-		if err := renderDoctorReport(opt.out, report); err != nil {
-			return err
+		attention = append(attention, check)
+	}
+	fmt.Fprintf(out, "doctor: %d checks passed", passed)
+	if len(attention) == 0 {
+		fmt.Fprintln(out, "")
+		return
+	}
+	fmt.Fprintf(out, ", %d need attention (full table: papio doctor)\n", len(attention))
+	for _, check := range attention {
+		fmt.Fprintf(out, "  %-4s %s — %s\n", strings.ToUpper(check.Status), check.Name, check.Detail)
+		if check.Remediation != "" {
+			fmt.Fprintf(out, "       fix: %s\n", check.Remediation)
 		}
 	}
-	return nil
+}
+
+// initNextAction picks exactly one suggested next step from the end state.
+func initNextAction(input initOptions, report doctor.Report) string {
+	if input.skipBrowser {
+		return `papio acquire "<doi>" --wait   (OA-only until browser integration is set up)`
+	}
+	for _, check := range report.Checks {
+		if check.Name == "extension" && check.Status != doctor.Pass {
+			return "install the papio extension (see Browser setup above), then: papio doctor"
+		}
+	}
+	return `papio acquire "<doi>" --wait   (or: papio status)`
 }
 
 func initConfig(path string) (config.Config, bool, error) {
@@ -230,10 +273,11 @@ func applyInitConfig(cmd *cobra.Command, out io.Writer, cfg *config.Config, exis
 	}
 
 	reader := bufio.NewReader(cmd.InOrStdin())
+	sections := newInitSections(out, input.skipBrowser)
 	if !input.nonInteractive {
-		fmt.Fprintln(out, "Configuration")
+		sections.header("Contact", "Used for polite API pools (Unpaywall, OpenAlex).")
 		if !input.emailSet {
-			value, err := initPrompt(reader, out, "Contact email for polite API pools", cfg.Email)
+			value, err := initPrompt(reader, out, "email", cfg.Email)
 			if err != nil {
 				return err
 			}
@@ -251,7 +295,7 @@ func applyInitConfig(cmd *cobra.Command, out io.Writer, cfg *config.Config, exis
 	}
 
 	if !input.nonInteractive {
-		fmt.Fprintln(out, "Zotio")
+		sections.header("zotio", "The Zotero boundary: imports are previewed and confirmed there.")
 		if !input.zotioPathSet {
 			value, err := initPrompt(reader, out, "zotio executable", cfg.Zotio.Executable)
 			if err != nil {
@@ -260,7 +304,7 @@ func applyInitConfig(cmd *cobra.Command, out io.Writer, cfg *config.Config, exis
 			cfg.Zotio.Executable = value
 		}
 		if !input.attachmentSet {
-			value, err := initPrompt(reader, out, "Attachment mode (stored or linked-file)", cfg.Zotio.AttachmentMode)
+			value, err := initPrompt(reader, out, "attachment mode (stored/linked-file)", cfg.Zotio.AttachmentMode)
 			if err != nil {
 				return err
 			}
@@ -275,16 +319,13 @@ func applyInitConfig(cmd *cobra.Command, out io.Writer, cfg *config.Config, exis
 	}
 
 	if !input.nonInteractive && !input.skipBrowser {
-		value, err := initPrompt(reader, out, "Install browser integration (yes/no)", "yes")
+		sections.header("Browser", "Institutional access runs in your own signed-in browser.")
+		yes, err := initYesNo(reader, out, "Install browser integration?", true)
 		if err != nil {
 			return err
 		}
-		switch strings.ToLower(value) {
-		case "yes", "y":
-		case "no", "n":
+		if !yes {
 			input.skipBrowser = true
-		default:
-			return fmt.Errorf("browser integration choice must be yes or no")
 		}
 	}
 
@@ -296,13 +337,14 @@ func applyInitConfig(cmd *cobra.Command, out io.Writer, cfg *config.Config, exis
 	// the one shown at chrome://extensions (or pass --extension-id) in that
 	// case. An empty value leaves that browser's bridge disabled.
 	if !input.nonInteractive && !input.skipBrowser {
-		fmt.Fprintln(out, "Browser extension")
+		_, dim := initStyle(out)
+		fmt.Fprintf(out, "  %s\n", dim("Web Store installs use the default ID; unpacked builds: paste the ID from chrome://extensions."))
 		if !input.extensionIDSet {
 			chromeDefault := cfg.Browser.ExtensionID
 			if chromeDefault == "" {
 				chromeDefault = defaultChromeExtensionID
 			}
-			value, err := initPrompt(reader, out, "Chrome extension ID (Web Store install uses the default; unpacked builds: paste the ID from chrome://extensions)", chromeDefault)
+			value, err := initPrompt(reader, out, "Chrome extension ID", chromeDefault)
 			if err != nil {
 				return err
 			}
@@ -339,7 +381,7 @@ func applyInitConfig(cmd *cobra.Command, out io.Writer, cfg *config.Config, exis
 	}
 
 	if !input.nonInteractive && !input.skipBrowser {
-		fmt.Fprintln(out, "Institution")
+		sections.header("Institution", "Paste your library's discovery/search URL — papio derives the resolver. Blank to skip.")
 		if !input.openurlBaseSet && !input.institutionURLSet {
 			defaultValue := cfg.Browser.OpenURLBase
 			if defaultValue == "" {
@@ -348,7 +390,7 @@ func applyInitConfig(cmd *cobra.Command, out io.Writer, cfg *config.Config, exis
 					initLine(out, true, "Institution", "found an OpenURL resolver in your Zotero settings")
 				}
 			}
-			value, err := initPrompt(reader, out, "Library OpenURL resolver base, or paste your library's discovery/search URL (blank to skip)", defaultValue)
+			value, err := initPrompt(reader, out, "resolver", defaultValue)
 			if err != nil {
 				return err
 			}
@@ -383,14 +425,14 @@ func applyInitConfig(cmd *cobra.Command, out io.Writer, cfg *config.Config, exis
 		}
 		if cfg.Browser.OpenURLBase != "" {
 			if !input.entityIDSet {
-				value, err := initPrompt(reader, out, "Shibboleth IdP entityID for auto login-routing (blank to skip)", cfg.Browser.ShibbolethEntityID)
+				value, err := initPrompt(reader, out, "Shibboleth IdP entityID (blank to skip)", cfg.Browser.ShibbolethEntityID)
 				if err != nil {
 					return err
 				}
 				cfg.Browser.ShibbolethEntityID = value
 			}
 			if !input.proquestSet {
-				raw, err := initPrompt(reader, out, "ProQuest account id, or paste a ProQuest URL with accountid= (blank to skip)", cfg.Browser.ProquestAccountID)
+				raw, err := initPrompt(reader, out, "ProQuest account id or URL with accountid= (blank to skip)", cfg.Browser.ProquestAccountID)
 				if err != nil {
 					return err
 				}
@@ -424,7 +466,8 @@ func applyInitConfig(cmd *cobra.Command, out io.Writer, cfg *config.Config, exis
 	if input.nonInteractive || input.checkUpdatesSet {
 		cfg.Updates.Check = input.checkUpdates
 	} else {
-		enabled, err := initUpdateCheckPrompt(reader, out)
+		sections.header("Updates", "Queries GitHub releases only; nothing else is sent.")
+		enabled, err := initYesNo(reader, out, "Check for papio and zotio updates once a day?", true)
 		if err != nil {
 			return err
 		}
@@ -433,8 +476,67 @@ func applyInitConfig(cmd *cobra.Command, out io.Writer, cfg *config.Config, exis
 	return nil
 }
 
+// initStyle returns ANSI wrappers when out is an interactive terminal and
+// NO_COLOR is unset; otherwise both are identity. Tests write to buffers and
+// therefore always see plain text.
+func initStyle(out io.Writer) (bold, dim func(string) string) {
+	plain := func(s string) string { return s }
+	bold, dim = plain, plain
+	f, ok := out.(*os.File)
+	if !ok || os.Getenv("NO_COLOR") != "" {
+		return bold, dim
+	}
+	if st, err := f.Stat(); err != nil || st.Mode()&os.ModeCharDevice == 0 {
+		return bold, dim
+	}
+	bold = func(s string) string { return "\x1b[1m" + s + "\x1b[0m" }
+	dim = func(s string) string { return "\x1b[2m" + s + "\x1b[0m" }
+	return bold, dim
+}
+
+// initSections numbers the guided steps. The total is computed from the flags
+// at entry; a mid-flow opt-out (declining browser integration) skips numbers
+// rather than renumbering what was already printed.
+type initSections struct {
+	out   io.Writer
+	index int
+	total int
+}
+
+func newInitSections(out io.Writer, skipBrowser bool) *initSections {
+	total := 5 // Contact, zotio, Browser, Institution, Updates
+	if skipBrowser {
+		total = 3
+	}
+	return &initSections{out: out, total: total}
+}
+
+// header prints a numbered section header with an optional one-line
+// explanation beneath it, separated from the previous section by a blank line.
+func (s *initSections) header(title, explain string) {
+	bold, dim := initStyle(s.out)
+	s.index++
+	fmt.Fprintf(s.out, "\n%s\n", bold(fmt.Sprintf("[%d/%d] %s", s.index, s.total, title)))
+	if explain != "" {
+		fmt.Fprintf(s.out, "  %s\n", dim(explain))
+	}
+}
+
+// initDisplayDefault renders a prompt default. Long values (stored resolver
+// URLs) are middle-ellipsized so the question stays readable; the full value
+// is still what a blank answer keeps.
+func initDisplayDefault(value string) string {
+	const max = 48
+	trimmed := strings.TrimPrefix(value, "https://")
+	if len(trimmed) <= max {
+		return value
+	}
+	return "keep current: " + trimmed[:28] + "…" + trimmed[len(trimmed)-16:]
+}
+
 func initPrompt(reader *bufio.Reader, out io.Writer, label, defaultValue string) (string, error) {
-	if _, err := fmt.Fprintf(out, "%s [%s]: ", label, defaultValue); err != nil {
+	display := initDisplayDefault(defaultValue)
+	if _, err := fmt.Fprintf(out, "  › %s [%s]: ", label, display); err != nil {
 		return "", err
 	}
 	value, err := reader.ReadString('\n')
@@ -448,22 +550,29 @@ func initPrompt(reader *bufio.Reader, out io.Writer, label, defaultValue string)
 	return value, nil
 }
 
-func initUpdateCheckPrompt(reader *bufio.Reader, out io.Writer) (bool, error) {
-	const prompt = "Check for papio and zotio updates once a day? Queries GitHub releases only; nothing else is sent. [Y/n]"
-	if _, err := fmt.Fprint(out, prompt+" "); err != nil {
+// initYesNo is the single yes/no grammar for the guided flow: [Y/n] or [y/N],
+// blank keeps the default, anything else is an error.
+func initYesNo(reader *bufio.Reader, out io.Writer, label string, defaultYes bool) (bool, error) {
+	hint := "[Y/n]"
+	if !defaultYes {
+		hint = "[y/N]"
+	}
+	if _, err := fmt.Fprintf(out, "  › %s %s: ", label, hint); err != nil {
 		return false, err
 	}
 	value, err := reader.ReadString('\n')
 	if err != nil && len(value) == 0 {
-		return false, fmt.Errorf("reading update check choice: %w", err)
+		return false, fmt.Errorf("reading %s: %w", strings.ToLower(label), err)
 	}
 	switch strings.ToLower(strings.TrimSpace(value)) {
-	case "", "y", "yes":
+	case "":
+		return defaultYes, nil
+	case "y", "yes":
 		return true, nil
 	case "n", "no":
 		return false, nil
 	default:
-		return false, fmt.Errorf("update check choice must be yes or no")
+		return false, fmt.Errorf("%s must be yes or no", strings.ToLower(label))
 	}
 }
 
@@ -545,10 +654,16 @@ const defaultChromeExtensionID = "npccengdhjmpojpjmjoeeclpdhcjelhf"
 // without the user discovering an ID.
 const defaultFirefoxExtensionID = "papio@orgmentem.com"
 
-func writeBrowserInstructions(out io.Writer) {
-	extensionPath, err := filepath.Abs("extension")
-	if err != nil {
-		extensionPath = "extension"
+// writeBrowserInstructions prints one line per browser the config actually
+// enables. Store install is the path; development builds live in the docs.
+func writeBrowserInstructions(out io.Writer, cfg config.Config) {
+	fmt.Fprintln(out, "Browser setup:")
+	if cfg.Browser.ExtensionID == defaultChromeExtensionID {
+		fmt.Fprintf(out, "  Chrome: install papio — https://chromewebstore.google.com/detail/papio/%s — then grant host permissions on its Details page for publisher sites you use.\n", defaultChromeExtensionID)
+	} else if cfg.Browser.ExtensionID != "" {
+		fmt.Fprintln(out, "  Chrome: development build configured — load it unpacked from chrome://extensions (docs: guide/getting-started).")
 	}
-	_, _ = fmt.Fprintf(out, "Browser setup:\n  Chrome:\n    1. Install papio from the Chrome Web Store: https://chromewebstore.google.com/detail/papio/%s\n       (unpacked development builds instead: chrome://extensions -> Developer mode -> Load unpacked -> %s, then re-run: papio init --extension-id <id shown on the card>).\n    2. Open papio's Details page and grant optional host permissions only for publisher sites you use.\n  Firefox:\n    1. Open about:debugging#/runtime/this-firefox and click Load Temporary Add-on (AMO listing pending review).\n    2. Select %s/firefox/manifest.json (its add-on ID %s is set by default).\n    3. On papio's options page, grant the Library resolver access permission.\n", defaultChromeExtensionID, extensionPath, extensionPath, defaultFirefoxExtensionID)
+	if cfg.Browser.FirefoxExtensionID != "" {
+		fmt.Fprintln(out, "  Firefox: about:debugging#/runtime/this-firefox → Load Temporary Add-on → extension/firefox/manifest.json, then grant resolver access on the options page (AMO review pending).")
+	}
 }

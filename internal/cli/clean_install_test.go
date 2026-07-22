@@ -94,8 +94,8 @@ func TestCleanInstallBootstrapsAndAcceptsWork(t *testing.T) {
 	if !doctorReport.OK {
 		t.Fatalf("fresh-profile doctor report is unhealthy: %+v", doctorReport)
 	}
-	if !strings.Contains(output, "SQLite integrity ok; schema version 12") {
-		t.Fatalf("init doctor output does not report schema 12:\n%s", output)
+	if !strings.Contains(output, "doctor: ") || !strings.Contains(output, "checks passed") {
+		t.Fatalf("init output missing doctor summary:\n%s", output)
 	}
 
 	cfg, err := config.Load(configPath)
