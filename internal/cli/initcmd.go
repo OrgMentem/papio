@@ -52,9 +52,19 @@ func defaultInitDependencies() initDependencies {
 			return err
 		},
 		RunDoctor: func(ctx context.Context, opt *options) (doctor.Report, error) {
+			// The daemon RPC covers readiness checks only; the extension,
+			// native-host, and zotio checks the summary and gating rely on
+			// come from the CLI-side integration pass. opt.call above has
+			// already autostarted the daemon, so the existing-daemon probe
+			// used by the integration dependencies succeeds.
 			var report doctor.Report
-			err := opt.call(ctx, "doctor.run", struct{}{}, &report)
-			return report, err
+			if err := opt.call(ctx, "doctor.run", struct{}{}, &report); err != nil {
+				return report, err
+			}
+			integration := doctor.RunIntegration(ctx, defaultDoctorDependencies(opt))
+			report.Checks = append(report.Checks, integration.Checks...)
+			report.OK = report.OK && integration.OK
+			return report, nil
 		},
 	}
 }
@@ -233,22 +243,35 @@ func initExtensionHealthy(report doctor.Report) bool {
 	return false
 }
 
-// writeInitDoctorSummary prints one summary line plus any non-PASS checks.
+// writeInitDoctorSummary prints one summary line plus any WARN/FAIL checks.
+// SKIPs are deliberate states (optional integrations, disabled update
+// checks), so they are counted but never presented as needing attention.
 func writeInitDoctorSummary(out io.Writer, report doctor.Report) {
-	passed, attention := 0, make([]doctor.Check, 0, 4)
+	passed, skipped := 0, 0
+	attention := make([]doctor.Check, 0, 4)
 	for _, check := range report.Checks {
-		if check.Status == doctor.Pass {
+		switch check.Status {
+		case doctor.Pass:
 			passed++
-			continue
+		case doctor.Skip:
+			skipped++
+		default:
+			attention = append(attention, check)
 		}
-		attention = append(attention, check)
 	}
 	fmt.Fprintf(out, "doctor: %d checks passed", passed)
-	if len(attention) == 0 {
+	if skipped > 0 {
+		fmt.Fprintf(out, ", %d skipped", skipped)
+	}
+	switch len(attention) {
+	case 0:
 		fmt.Fprintln(out, "")
 		return
+	case 1:
+		fmt.Fprint(out, ", 1 check needs attention (full table: papio doctor)\n")
+	default:
+		fmt.Fprintf(out, ", %d checks need attention (full table: papio doctor)\n", len(attention))
 	}
-	fmt.Fprintf(out, ", %d need attention (full table: papio doctor)\n", len(attention))
 	for _, check := range attention {
 		fmt.Fprintf(out, "  %-4s %s — %s\n", strings.ToUpper(check.Status), check.Name, check.Detail)
 		if check.Remediation != "" {
@@ -257,15 +280,30 @@ func writeInitDoctorSummary(out io.Writer, report doctor.Report) {
 	}
 }
 
-// initNextAction picks exactly one suggested next step from the end state.
+// initNextAction picks exactly one suggested next step, in order of what the
+// report proves: failures trump everything, a healthy extension means
+// acquisition works regardless of how this run was invoked, a missing or
+// unhealthy extension routes to setup, and only then does --skip-browser
+// imply an OA-only footing.
 func initNextAction(input initOptions, report doctor.Report) string {
-	if input.skipBrowser {
-		return `papio acquire "<doi>" --wait   (OA-only until browser integration is set up)`
-	}
+	extension := ""
 	for _, check := range report.Checks {
-		if check.Name == "extension" && check.Status != doctor.Pass {
-			return "install the papio extension (see Browser setup above), then: papio doctor"
+		if check.Status == doctor.Fail {
+			return "papio doctor"
 		}
+		if check.Name == "extension" {
+			extension = check.Status
+		}
+	}
+	switch {
+	case extension == doctor.Pass:
+		return `papio acquire "<doi>" --wait   (or: papio status)`
+	case input.skipBrowser:
+		return `papio acquire "<doi>" --wait   (OA-only until browser integration is set up)`
+	case extension != "":
+		return "install the papio extension (see Browser setup above), then: papio doctor"
+	case input.skipBrowser:
+		return `papio acquire "<doi>" --wait   (OA-only until browser integration is set up)`
 	}
 	return `papio acquire "<doi>" --wait   (or: papio status)`
 }
@@ -318,7 +356,7 @@ func applyInitConfig(cmd *cobra.Command, out io.Writer, cfg *config.Config, exis
 	}
 
 	if !input.nonInteractive {
-		sections.header("zotio", "The Zotero boundary: imports are previewed and confirmed there. stored copies PDFs into Zotero; linked-file references papio's copy on disk.")
+		sections.header("zotio", "The Zotero boundary: imports are previewed and confirmed there. The stored mode copies PDFs into Zotero; linked-file mode references papio's copy on disk.")
 		if !input.zotioPathSet {
 			zotioDefault, zotioSource := cfg.Zotio.Executable, ""
 			// A bare command name is autodiscovered so the prompt shows the
@@ -354,8 +392,8 @@ func applyInitConfig(cmd *cobra.Command, out io.Writer, cfg *config.Config, exis
 	}
 
 	if !input.nonInteractive && !input.skipBrowser {
-		explain := "Institutional access runs in your own signed-in browser — any Chromium browser (Chrome, Edge, Brave, Vivaldi) or Firefox."
-		if detected := detectBrowsers(); len(detected) > 0 {
+		explain := "Institutional access runs in a supported signed-in browser: Chrome, Edge, Brave, Vivaldi, Opera, Chromium, or Firefox."
+		if detected := detectBrowsersBounded(300 * time.Millisecond); len(detected) > 0 {
 			explain += " Detected: " + strings.Join(detected, ", ") + "."
 		}
 		sections.header("Browser", explain)
@@ -365,6 +403,9 @@ func applyInitConfig(cmd *cobra.Command, out io.Writer, cfg *config.Config, exis
 		}
 		if !yes {
 			input.skipBrowser = true
+			// The Institution section is skipped with the browser; advance
+			// its slot so the final section still renders [5/5].
+			sections.index++
 		}
 	}
 
@@ -634,13 +675,25 @@ func chromeUnpackedID(dir string) string {
 	return string(id)
 }
 
-// resolveChromeExtensionID turns prompt/flag input into an extension ID:
-// a folder path (absolute, ~-prefixed, or containing a separator) yields the
-// computed unpacked ID; anything else passes through as a literal ID.
+// chromeExtensionIDRE is the only shape a literal Chromium extension ID can
+// have: 32 characters, a-p (hex nibbles mapped into the a-p alphabet).
+var chromeExtensionIDRE = regexp.MustCompile(`^[a-p]{32}$`)
+
+// resolveChromeExtensionID turns prompt/flag input into an extension ID.
+// A well-formed literal ID passes through; anything else is treated as an
+// unpacked extension folder (absolute, relative, or ~-prefixed) and must be
+// a directory containing manifest.json — classification is by validity, not
+// punctuation, so `--extension-id extension` works from a checkout.
 func resolveChromeExtensionID(raw string) (id string, computedFrom string, err error) {
 	value := strings.TrimSpace(raw)
-	if value == "" || !strings.ContainsAny(value, "/\\~") {
+	if value == "" || chromeExtensionIDRE.MatchString(value) {
 		return value, "", nil
+	}
+	if runtime.GOOS == "windows" {
+		// Chromium hashes the normalized UTF-16 path on Windows; hashing the
+		// UTF-8 string would yield a plausible-looking but wrong ID and a
+		// native-host allowlist no extension can match. Fail loud instead.
+		return "", "", fmt.Errorf("%q is not a valid extension ID; on Windows paste the literal ID from chrome://extensions (folder-path computation is not supported)", value)
 	}
 	if strings.HasPrefix(value, "~") {
 		home, err := os.UserHomeDir()
@@ -653,10 +706,30 @@ func resolveChromeExtensionID(raw string) (id string, computedFrom string, err e
 	if err != nil {
 		return "", "", fmt.Errorf("resolving %q: %w", value, err)
 	}
-	if _, err := os.Stat(absolute); err != nil {
-		return "", "", fmt.Errorf("extension folder %s: %w", absolute, err)
+	info, err := os.Stat(absolute)
+	if err != nil {
+		return "", "", fmt.Errorf("%q is neither a 32-character extension ID nor an extension folder: %w", raw, err)
+	}
+	if !info.IsDir() {
+		return "", "", fmt.Errorf("extension path %s is not a directory", absolute)
+	}
+	if _, err := os.Stat(filepath.Join(absolute, "manifest.json")); err != nil {
+		return "", "", fmt.Errorf("%s does not contain manifest.json; point at the folder Chrome loads", absolute)
 	}
 	return chromeUnpackedID(absolute), absolute, nil
+}
+
+// detectBrowsersBounded caps detection latency: the result is decorative,
+// and a stat against a wedged network mount must not stall the prompt flow.
+func detectBrowsersBounded(timeout time.Duration) []string {
+	result := make(chan []string, 1)
+	go func() { result <- detectBrowsers() }()
+	select {
+	case found := <-result:
+		return found
+	case <-time.After(timeout):
+		return nil
+	}
 }
 
 // detectBrowsers names installed browsers, best-effort, for the Browser

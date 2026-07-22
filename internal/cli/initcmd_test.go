@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -487,10 +488,31 @@ func TestChromeUnpackedIDMatchesChromeAlgorithm(t *testing.T) {
 }
 
 func TestResolveChromeExtensionID(t *testing.T) {
-	dir := t.TempDir()
+	if runtime.GOOS == "windows" {
+		if _, _, err := resolveChromeExtensionID("./extension"); err == nil {
+			t.Fatal("windows must reject folder input")
+		}
+		return
+	}
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "manifest.json"), []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	id, from, err := resolveChromeExtensionID(dir)
 	if err != nil || from != dir || id != chromeUnpackedID(dir) {
 		t.Fatalf("path input = %q %q %v", id, from, err)
+	}
+	// A relative separator-free name that IS a real extension folder must be
+	// classified as a folder, not a literal ID.
+	parent, base := filepath.Dir(dir), filepath.Base(dir)
+	restore := mustChdir(t, parent)
+	relID, relFrom, err := resolveChromeExtensionID(base)
+	restore()
+	if err != nil || relFrom != dir || relID != chromeUnpackedID(dir) {
+		t.Fatalf("relative input = %q %q %v", relID, relFrom, err)
 	}
 	literal, from, err := resolveChromeExtensionID("abcdefghijklmnopabcdefghijklmnop")
 	if err != nil || from != "" || literal != "abcdefghijklmnopabcdefghijklmnop" {
@@ -498,6 +520,25 @@ func TestResolveChromeExtensionID(t *testing.T) {
 	}
 	if _, _, err := resolveChromeExtensionID(dir + "/missing"); err == nil {
 		t.Fatal("missing folder must error")
+	}
+	if _, _, err := resolveChromeExtensionID(t.TempDir()); err == nil {
+		t.Fatal("folder without manifest.json must error")
+	}
+}
+
+func mustChdir(t *testing.T, dir string) func() {
+	t.Helper()
+	previous, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	return func() {
+		if err := os.Chdir(previous); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 

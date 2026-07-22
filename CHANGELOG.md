@@ -14,11 +14,12 @@ execution records in `notes/acquisition-stack-plan.md`.
 
 - `papio init` autodiscovers more of its own answers: the zotio executable is
   resolved from PATH and labeled with its source, prompt defaults name where
-  they came from (`keep current` vs `from Zotero`), the Browser step lists
-  the browsers detected on the machine, the Chrome extension ID prompt and
-  `--extension-id` accept an unpacked extension *folder path* and compute
-  the ID from it, and the browser setup instructions print only when the
-  extension is not already connected.
+  they came from (`keep current` vs `from Zotero`), the Browser step names
+  the supported browsers and lists those detected on the machine, the Chrome
+  extension ID prompt and `--extension-id` accept an unpacked extension
+  *folder path* and compute the ID from it (macOS/Linux; Windows requires
+  the literal ID), and the browser setup instructions are suppressed when
+  doctor reports a healthy, current extension connection.
 
 ## [0.9.2] - 2026-07-22
 
