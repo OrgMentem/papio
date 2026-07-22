@@ -545,7 +545,14 @@ function renderDebug(item: TriageSnapshotItem): { toggle: HTMLButtonElement; lis
     list.append(field);
   }
 
-  const toggle = element("button", "⌄");
+  const toggle = element("button");
+  const icon = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  icon.setAttribute("aria-hidden", "true");
+  icon.setAttribute("viewBox", "0 0 16 16");
+  const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+  path.setAttribute("d", "m4 6 4 4 4-4");
+  icon.append(path);
+  toggle.append(icon);
   toggle.className = "item-debug-toggle";
   toggle.type = "button";
   toggle.dataset.label = "Backend details";

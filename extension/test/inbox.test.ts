@@ -421,7 +421,7 @@ test("backend identifiers collapse into a details section and the citation carri
   // the actionable detail text and exposes item/job/revision as peers.
   const debug = row?.querySelector<HTMLDListElement>(".item-debug");
   const debugToggle = row?.querySelector<HTMLButtonElement>(".item-detail .item-debug-toggle");
-  expect(debugToggle?.textContent).toBe("⌄");
+  expect(debugToggle?.querySelector("svg")).not.toBeNull();
   expect(debugToggle?.getAttribute("aria-label")).toBe("Backend details");
   expect(debugToggle?.getAttribute("aria-expanded")).toBe("false");
   expect(debug?.hidden).toBe(true);

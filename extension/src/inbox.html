@@ -578,21 +578,35 @@
       /* This remains a real button for keyboard users, but reads as an
          inline active chevron rather than a second control in the row. */
       .item-debug-toggle {
+        align-items: center;
         appearance: none;
         background: transparent;
         border: 0;
         color: var(--color-primary);
         cursor: pointer;
-        display: inline;
+        display: inline-flex;
         font: inherit;
-        font-weight: 700;
-        line-height: inherit;
+        height: 1em;
+        justify-content: center;
+        line-height: 1;
         margin-inline-start: var(--space-1);
         min-height: 0;
         padding: 0;
         position: relative;
-        vertical-align: baseline;
         transition: none;
+        vertical-align: middle;
+        width: 1em;
+      }
+
+      .item-debug-toggle svg {
+        display: block;
+        fill: none;
+        height: 100%;
+        stroke: currentColor;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+        stroke-width: 2;
+        width: 100%;
       }
 
       .item-debug-toggle:hover,
