@@ -21,8 +21,9 @@ import (
 const statusRecentWindow = 24 * time.Hour
 
 type statusSnapshot struct {
-	GeneratedAt string        `json:"generated_at"`
-	Groups      []statusGroup `json:"groups"`
+	GeneratedAt        string        `json:"generated_at"`
+	LibraryMissingPDFs *int          `json:"library_missing_pdfs,omitempty"`
+	Groups             []statusGroup `json:"groups"`
 }
 
 type statusGroup struct {
@@ -50,11 +51,15 @@ func newStatusCommand(opt *options) *cobra.Command {
 		Annotations: map[string]string{"mcp:read-only": "true"},
 		Args:        cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			// Fetched once per invocation, not per --follow tick: the count
+			// shells out to zotio's mirror and is stable on a 2s horizon.
+			libraryMissing := loadLibraryMissing(cmd.Context(), opt)
 			refresh := func() error {
 				snapshot, err := loadStatusSnapshot(cmd.Context(), opt, time.Now())
 				if err != nil {
 					return err
 				}
+				snapshot.LibraryMissingPDFs = libraryMissing
 				if opt.jsonOutput {
 					return opt.printJSON(snapshot)
 				}
@@ -82,6 +87,19 @@ func newStatusCommand(opt *options) *cobra.Command {
 	}
 	command.Flags().BoolVar(&follow, "follow", false, "refresh every 2 seconds")
 	return command
+}
+
+// loadLibraryMissing best-effort reads zotio's missing-PDF count for the
+// library-completeness line. nil (no line) when zotio is not configured or
+// the read fails — status must never break on the optional integration.
+func loadLibraryMissing(ctx context.Context, opt *options) *int {
+	var result struct {
+		Missing int `json:"missing"`
+	}
+	if err := opt.call(ctx, "zotio.missing_count", map[string]string{}, &result); err != nil {
+		return nil
+	}
+	return &result.Missing
 }
 
 func loadStatusSnapshot(ctx context.Context, opt *options, now time.Time) (statusSnapshot, error) {
@@ -274,6 +292,16 @@ func renderStatusRefresh(out io.Writer, snapshot statusSnapshot, terminal bool) 
 	}
 	if _, err := fmt.Fprintf(out, "papio status  %s\n", snapshot.GeneratedAt); err != nil {
 		return err
+	}
+	if snapshot.LibraryMissingPDFs != nil {
+		missing := *snapshot.LibraryMissingPDFs
+		line := "Library: complete — no items missing PDFs\n"
+		if missing > 0 {
+			line = fmt.Sprintf("Library: %d item(s) missing PDFs — papio acquire --from-zotio fills them\n", missing)
+		}
+		if _, err := fmt.Fprint(out, line); err != nil {
+			return err
+		}
 	}
 	if len(snapshot.Groups) == 0 {
 		_, err := fmt.Fprintln(out, "No active or recent jobs.")

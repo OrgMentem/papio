@@ -267,6 +267,20 @@ func (s *Service) findParentItemKeys(ctx context.Context, identifier lookupIdent
 	return keys, nil
 }
 
+// MissingPDFCount reports how many library items (optionally within one
+// collection) lack a PDF attachment, per Zotio's synced missing-PDF queue.
+// It reads the local mirror only — no jobs are created.
+func (s *Service) MissingPDFCount(ctx context.Context, collection string) (int, error) {
+	if s == nil || s.CLI == nil {
+		return 0, fmt.Errorf("Zotio integration is not configured")
+	}
+	items, err := s.CLI.MissingPDF(ctx, strings.TrimSpace(collection), 0)
+	if err != nil {
+		return 0, err
+	}
+	return len(items), nil
+}
+
 // QueueMissingPDF preflights Zotio, scans its complete missing-PDF queue, and
 // submits at most options.Limit deterministic papio requests. Re-running it
 // returns existing live jobs.

@@ -142,6 +142,9 @@ func RouterWithShutdown(system *bootstrap.System, shutdown context.CancelFunc) i
 		"zotio.queue": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return zotioQueue(ctx, raw, system)
 		},
+		"zotio.missing_count": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return zotioMissingCount(ctx, raw, system)
+		},
 		"zotio.lookup_works": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return zotioLookupWorks(ctx, raw, system)
 		},
@@ -354,6 +357,23 @@ func zotioQueue(ctx context.Context, raw json.RawMessage, system *bootstrap.Syst
 		return nil, &ipc.RPCError{Code: "precondition_failed", Message: safeMessage(err, "Zotio queue failed")}
 	}
 	return marshal(result)
+}
+
+func zotioMissingCount(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
+	var params struct {
+		Collection string `json:"collection"`
+	}
+	if err := ipc.DecodeParams(raw, &params); err != nil {
+		return badParams(err)
+	}
+	if system.Zotio == nil {
+		return nil, &ipc.RPCError{Code: "precondition_failed", Message: "Zotio integration is not configured"}
+	}
+	count, err := system.Zotio.MissingPDFCount(ctx, params.Collection)
+	if err != nil {
+		return nil, &ipc.RPCError{Code: "precondition_failed", Message: safeMessage(err, "Zotio missing-PDF count failed")}
+	}
+	return marshal(map[string]int{"missing": count})
 }
 
 func zotioLookupWorks(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {

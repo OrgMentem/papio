@@ -109,3 +109,34 @@ func TestRenderStatusRefreshShowsCategoryAndGuidance(t *testing.T) {
 		t.Fatalf("guidance sub-line not rendered: %q", got)
 	}
 }
+func TestRenderStatusRefreshShowsLibraryCompleteness(t *testing.T) {
+	missing := 87
+	snapshot := statusSnapshot{GeneratedAt: "2026-07-22T00:00:00Z", LibraryMissingPDFs: &missing}
+	var out bytes.Buffer
+	if err := renderStatusRefresh(&out, snapshot, false); err != nil {
+		t.Fatal(err)
+	}
+	if got := out.String(); !strings.Contains(got, "Library: 87 item(s) missing PDFs — papio acquire --from-zotio fills them") {
+		t.Fatalf("library line missing: %q", got)
+	}
+
+	complete := 0
+	snapshot.LibraryMissingPDFs = &complete
+	out.Reset()
+	if err := renderStatusRefresh(&out, snapshot, false); err != nil {
+		t.Fatal(err)
+	}
+	if got := out.String(); !strings.Contains(got, "Library: complete — no items missing PDFs") {
+		t.Fatalf("complete line missing: %q", got)
+	}
+
+	// Without zotio the line is absent entirely.
+	snapshot.LibraryMissingPDFs = nil
+	out.Reset()
+	if err := renderStatusRefresh(&out, snapshot, false); err != nil {
+		t.Fatal(err)
+	}
+	if got := out.String(); strings.Contains(got, "Library:") {
+		t.Fatalf("library line rendered without zotio: %q", got)
+	}
+}
