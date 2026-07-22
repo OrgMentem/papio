@@ -65,8 +65,8 @@ func TestOpenRollsForwardSchemaOneWithoutLosingDurableRows(t *testing.T) {
 	}
 	defer migrated.Close()
 	version, err := migrated.UserVersion(ctx)
-	if err != nil || version != 12 {
-		t.Fatalf("user_version = %d, %v; want 12", version, err)
+	if err != nil || version != 13 {
+		t.Fatalf("user_version = %d, %v; want 13", version, err)
 	}
 
 	var jobs, actions, exports int

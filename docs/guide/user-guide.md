@@ -243,7 +243,32 @@ papio watch add --kind backfill --cadence daily --limit-per-run 10 \
   --collection "AI reading"
 ```
 
-Re-runs are idempotent: already-queued or since-completed items are skipped.
+Re-runs are idempotent: already-queued or since-completed items are skipped,
+and items whose last attempt ended `unavailable` rest for
+`zotio.unavailable_recheck_days` (default 14) before being re-checked —
+open-access availability drifts upward, so yesterday's "unavailable" is not
+forever.
+
+### See exception state inside Zotero
+
+With `zotio.exception_tags = true` (requires zotio ≥ 0.13.0), the daemon
+maintains two automatic tags on linked items in your personal library, so the
+question "is this coming, or is it mine now?" is answered where you plan your
+reading:
+
+- `papio:needs-action` — acquisition is parked on you (SSO login, terms
+  consent, identity review). Open your browser; the extension shows the
+  prompt.
+- `papio:unavailable` — every OA and institutional route failed as of the
+  last attempt. A saved search on this tag is your inter-library-loan /
+  chase-it-yourself worklist; the tag clears itself if a later re-check
+  succeeds.
+
+Nothing else is ever tagged: a clean acquisition's only trace is the attached
+PDF. Tags converge with job state on the daemon's maintenance cadence;
+`papio zotio tags reconcile` forces one pass. Both are automatic-type tags,
+so Zotero's tag selector can hide the whole namespace, and colors are yours
+to assign (many people make `papio:needs-action` red).
 
 ### Triage failures
 

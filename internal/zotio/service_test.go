@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"papio/internal/protocol"
 	"papio/internal/store"
@@ -328,5 +329,70 @@ func TestQueueMissingPDFBoundsSkippedOutputWhileScanning(t *testing.T) {
 	}
 	if len(submitter.requests) != 1 || submitter.requests[0].ZotioItemKey != "QUEUEKEY1" {
 		t.Fatalf("submitted = %+v, want only QUEUEKEY1", submitter.requests)
+	}
+}
+
+// Unavailable outcomes park an item for the configured recheck window instead
+// of retrying every backfill cadence (availability drifts upward: green-OA
+// deposits, holdings changes, new adapters). A stale verdict re-queues; a
+// disabled window (zero) preserves the historical retry-every-run behavior.
+func TestQueueMissingPDFUnavailableCooldown(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+	now := time.Date(2026, 7, 23, 12, 0, 0, 0, time.UTC)
+	seed := func(requestID, jobID string, decided time.Time) {
+		t.Helper()
+		if _, err := st.DB().ExecContext(ctx,
+			`INSERT INTO work_requests (id, created_at) VALUES (?, '2026-07-01T00:00:00Z')`, requestID); err != nil {
+			t.Fatalf("seed request: %v", err)
+		}
+		if _, err := st.DB().ExecContext(ctx,
+			`INSERT INTO jobs (id, work_request_id, state, policy_json, created_at, updated_at)
+			 VALUES (?, ?, 'unavailable', '{}', '2026-07-01T00:00:00Z', ?)`,
+			jobID, requestID, decided.Format(time.RFC3339)); err != nil {
+			t.Fatalf("seed job: %v", err)
+		}
+	}
+	seed("request_zotio_FRESHKEY1", "job_fresh", now.Add(-24*time.Hour))
+	seed("request_zotio_STALEKEY1", "job_stale", now.Add(-30*24*time.Hour))
+
+	cli := &fakeCLI{items: []MissingPDFItem{
+		{Key: "FRESHKEY1", Title: "Fresh verdict", DOI: "10.1000/fresh"},
+		{Key: "STALEKEY1", Title: "Stale verdict", DOI: "10.1000/stale"},
+	}}
+	submitter := &fakeSubmitter{}
+	service := &Service{
+		CLI: cli, Submitter: submitter, Store: st,
+		UnavailableRecheck: 14 * 24 * time.Hour,
+		Now:                func() time.Time { return now },
+	}
+
+	result, err := service.QueueMissingPDF(ctx, QueueOptions{Limit: 5})
+	if err != nil {
+		t.Fatalf("QueueMissingPDF: %v", err)
+	}
+	if len(result.Queued) != 1 || result.Queued[0].ZotioItemKey != "STALEKEY1" {
+		t.Fatalf("queued = %+v, want only the stale verdict", result.Queued)
+	}
+	if len(result.Skipped) != 1 || result.Skipped[0].ZotioItemKey != "FRESHKEY1" {
+		t.Fatalf("skipped = %+v, want only the fresh verdict", result.Skipped)
+	}
+	if want := "unavailable as of last attempt; recheck in 13d"; result.Skipped[0].Reason != want {
+		t.Fatalf("skip reason = %q, want %q", result.Skipped[0].Reason, want)
+	}
+
+	// A zero window disables the cool-down entirely.
+	submitter.requests = nil
+	service.UnavailableRecheck = 0
+	result, err = service.QueueMissingPDF(ctx, QueueOptions{Limit: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Queued) != 2 || len(result.Skipped) != 0 {
+		t.Fatalf("disabled cool-down result = %+v", result)
 	}
 }

@@ -71,6 +71,33 @@ func TestSaveAllowsEmptyZotioExecutableUnlessAutoImport(t *testing.T) {
 	}
 }
 
+func TestSaveValidatesExceptionTagsAndRecheckWindow(t *testing.T) {
+	cfg := Default()
+	cfg.AccessMode = ModeConservative
+	if cfg.Zotio.ExceptionTags {
+		t.Fatal("default zotio.exception_tags = true, want false")
+	}
+	if cfg.Zotio.UnavailableRecheckDays != 14 {
+		t.Fatalf("default zotio.unavailable_recheck_days = %d, want 14", cfg.Zotio.UnavailableRecheckDays)
+	}
+	cfg.Zotio.Executable = ""
+	cfg.Zotio.ExceptionTags = true
+	err := Save(cfg, filepath.Join(t.TempDir(), "config.toml"))
+	if err == nil || !strings.Contains(err.Error(), "zotio.exception_tags requires zotio.executable") {
+		t.Fatalf("exception_tags without executable err = %v", err)
+	}
+	cfg.Zotio.Executable = "zotio"
+	cfg.Zotio.UnavailableRecheckDays = 0
+	err = Save(cfg, filepath.Join(t.TempDir(), "config.toml"))
+	if err == nil || !strings.Contains(err.Error(), "zotio.unavailable_recheck_days must be in 1..365") {
+		t.Fatalf("recheck range err = %v", err)
+	}
+	cfg.Zotio.UnavailableRecheckDays = 30
+	if err := Save(cfg, filepath.Join(t.TempDir(), "config.toml")); err != nil {
+		t.Fatalf("valid exception-tag config rejected: %v", err)
+	}
+}
+
 func TestSaveValidatesHooksTimeoutOnlyWhenOnReadySet(t *testing.T) {
 	cfg := Default()
 	cfg.AccessMode = ModeConservative

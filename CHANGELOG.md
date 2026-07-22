@@ -10,6 +10,25 @@ execution records in `notes/acquisition-stack-plan.md`.
 
 ## [Unreleased]
 
+### Added
+
+- **Zotero exception-tag ledger** (`zotio.exception_tags`, off by default):
+  the daemon now answers "is this item coming, or is it mine now?" inside
+  Zotero itself by maintaining two reconciled automatic tags on linked items —
+  `papio:needs-action` (acquisition parked on a human action) and
+  `papio:unavailable` (OA and institutional routes exhausted, as of the last
+  attempt). Tags are a pure function of each item's newest job state,
+  converged on the maintenance cadence and repaired rather than replayed
+  (schema v13 adds the applied-state ledger); success stays untagged because
+  the attachment itself is the signal. `papio zotio tags reconcile` runs one
+  pass on demand. Requires zotio ≥ 0.13.0 (`items tags add --automatic`);
+  personal library only. Design record: zotio `dev/adr/0004`.
+- Backfill re-checks `unavailable` items after a cool-down
+  (`zotio.unavailable_recheck_days`, default 14) instead of retrying them on
+  every watch cadence — availability drifts upward (green-OA deposits,
+  holdings changes, new adapters), and a `papio:unavailable` saved search
+  doubles as an ILL/manual worklist only if it neither rots nor flaps.
+
 ### Changed
 
 - `papio init` autodiscovers more of its own answers: the zotio executable is

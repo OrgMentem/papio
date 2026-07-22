@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"papio/internal/bundle"
+	"papio/internal/job"
 	"papio/internal/protocol"
 	"papio/internal/store"
 	"papio/internal/work"
@@ -40,7 +41,13 @@ type Service struct {
 	DataDir        string
 	AttachmentMode string
 	AutoEnrich     bool
-	Now            func() time.Time
+	// ExceptionTags enables the reconciled exception-tag ledger on linked
+	// Zotero items (config zotio.exception_tags).
+	ExceptionTags bool
+	// UnavailableRecheck is how long an unavailable outcome parks an item
+	// before QueueMissingPDF re-checks it. Zero disables the cool-down.
+	UnavailableRecheck time.Duration
+	Now                func() time.Time
 }
 
 // QueueOptions configures one bounded import of Zotio's missing-PDF queue.
@@ -335,6 +342,12 @@ func (s *Service) QueueMissingPDF(ctx context.Context, options QueueOptions) (*Q
 				appendSkipped(row, "already queued as "+existing)
 				continue
 			}
+			if remaining, lerr := s.unavailableCooldown(ctx, request.RequestID); lerr != nil {
+				return nil, fmt.Errorf("checking unavailable cool-down for Zotio item %s: %w", row.Key, lerr)
+			} else if remaining > 0 {
+				appendSkipped(row, fmt.Sprintf("unavailable as of last attempt; recheck in %s", formatCooldown(remaining)))
+				continue
+			}
 		}
 		jobID, err := s.Submitter.Submit(ctx, request)
 		if err != nil {
@@ -366,6 +379,55 @@ func (s *Service) liveJobForRequest(ctx context.Context, requestID string) (stri
 		return "", err
 	}
 	return jobID, nil
+}
+
+// unavailableCooldown returns how long an item's unavailable outcome still
+// parks it. Unavailability decays — green-OA copies appear months after
+// publication, holdings change, adapters gain providers — so backfill
+// re-checks after the configured window instead of retrying every cadence or
+// never. Only the newest job counts: a newer failed/cancelled attempt means
+// someone already chose to retry, and the cool-down must not resurrect the
+// older verdict.
+func (s *Service) unavailableCooldown(ctx context.Context, requestID string) (time.Duration, error) {
+	if s.UnavailableRecheck <= 0 {
+		return 0, nil
+	}
+	var state, updatedAt string
+	err := s.Store.DB().QueryRowContext(ctx,
+		`SELECT state, updated_at FROM jobs WHERE work_request_id = ? ORDER BY created_at DESC, id DESC LIMIT 1`,
+		requestID,
+	).Scan(&state, &updatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	if state != job.StateUnavailable {
+		return 0, nil
+	}
+	decided, err := time.Parse(time.RFC3339, updatedAt)
+	if err != nil {
+		// An unparseable timestamp must not permanently wall off the item.
+		return 0, nil
+	}
+	remaining := s.UnavailableRecheck - s.now().UTC().Sub(decided)
+	if remaining < 0 {
+		return 0, nil
+	}
+	return remaining, nil
+}
+
+// formatCooldown renders a human skip reason without sub-hour noise.
+func formatCooldown(d time.Duration) string {
+	const day = 24 * time.Hour
+	if d >= day {
+		return fmt.Sprintf("%dd", int((d+day-1)/day))
+	}
+	if d >= time.Hour {
+		return fmt.Sprintf("%dh", int((d+time.Hour-1)/time.Hour))
+	}
+	return "under an hour"
 }
 
 func (s *Service) requestForQueueItem(ctx context.Context, row MissingPDFItem, options QueueOptions) (protocol.WorkRequest, string) {

@@ -156,6 +156,15 @@ type Zotio struct {
 	AttachmentMode string `toml:"attachment_mode"`
 	AutoImport     bool   `toml:"auto_import"`
 	AutoEnrich     bool   `toml:"auto_enrich"`
+	// ExceptionTags enables the reconciled Zotero exception-tag ledger:
+	// papio:needs-action / papio:unavailable written as automatic tags on
+	// linked items in the user's personal library. Off by default because it
+	// mutates the user's library beyond attaching requested PDFs.
+	ExceptionTags bool `toml:"exception_tags"`
+	// UnavailableRecheckDays is how long an unavailable outcome parks an item
+	// before backfill re-checks it (OA availability drifts upward). Range
+	// 1..365, default 14.
+	UnavailableRecheckDays int `toml:"unavailable_recheck_days"`
 }
 
 // Notify configures best-effort notifications from the daemon: local desktop
@@ -250,7 +259,7 @@ func Default() Config {
 		Fetch:   Fetch{MaxBytes: 100 << 20, TimeoutSeconds: 120},
 		PDF:     PDF{OCREnabled: true, MinTextChars: 400, MaxOCRPages: 4, TitleMatchThreshold: 0.6},
 		Browser: Browser{ActionExpirySeconds: 1800},
-		Zotio:   Zotio{Executable: "zotio", TimeoutSeconds: 120, AttachmentMode: "stored", AutoImport: false, AutoEnrich: true},
+		Zotio:   Zotio{Executable: "zotio", TimeoutSeconds: 120, AttachmentMode: "stored", AutoImport: false, AutoEnrich: true, UnavailableRecheckDays: 14},
 		Notify:  Notify{Enabled: true},
 		Hooks:   Hooks{TimeoutSeconds: 120},
 		Sources: map[string]Source{
@@ -386,6 +395,12 @@ func (c *Config) validate() error {
 	}
 	if c.Zotio.AttachmentMode != "stored" && c.Zotio.AttachmentMode != "linked-file" {
 		return fmt.Errorf("zotio.attachment_mode must be stored or linked-file")
+	}
+	if c.Zotio.UnavailableRecheckDays < 1 || c.Zotio.UnavailableRecheckDays > 365 {
+		return fmt.Errorf("zotio.unavailable_recheck_days must be in 1..365")
+	}
+	if strings.TrimSpace(c.Zotio.Executable) == "" && c.Zotio.ExceptionTags {
+		return fmt.Errorf("zotio.exception_tags requires zotio.executable")
 	}
 	for name, s := range c.Sources {
 		if s.BaseURLForDev != "" && !strings.HasPrefix(s.BaseURLForDev, "http://127.0.0.1") && !strings.HasPrefix(s.BaseURLForDev, "http://localhost") {

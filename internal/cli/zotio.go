@@ -66,7 +66,26 @@ func newZotioCommand(opt *options) *cobra.Command {
 	apply.Flags().StringVar(&confirmation, "confirm-sha256", "", "Exact confirmation SHA-256 printed by `papio zotio plan`")
 	_ = apply.MarkFlagRequired("confirm-sha256")
 
+	tags := &cobra.Command{
+		Use:   "tags",
+		Short: "Manage the exception-tag ledger on linked Zotero items",
+	}
+	reconcile := &cobra.Command{
+		Use:   "reconcile",
+		Short: "Converge papio:needs-action / papio:unavailable tags with current job states",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			var result zotio.TagReconcileResult
+			if err := opt.call(cmd.Context(), "zotio.tags.reconcile", struct{}{}, &result); err != nil {
+				return err
+			}
+			return opt.printResult(result, "Tags reconciled: %d checked, %d added, %d removed", result.Checked, result.Added, result.Removed)
+		},
+	}
+	tags.AddCommand(reconcile)
+
 	command.AddCommand(plan, apply)
 	command.AddCommand(preflight)
+	command.AddCommand(tags)
 	return command
 }

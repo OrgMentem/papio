@@ -154,6 +154,9 @@ func RouterWithShutdown(system *bootstrap.System, shutdown context.CancelFunc) i
 		"zotio.apply": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return zotioApply(ctx, raw, system)
 		},
+		"zotio.tags.reconcile": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return zotioTagsReconcile(ctx, raw, system)
+		},
 		"browser.sync": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return browserSync(ctx, raw, system)
 		},
@@ -658,6 +661,18 @@ func zotioPlan(ctx context.Context, raw json.RawMessage, system *bootstrap.Syste
 		return zotioFailure(err)
 	}
 	return marshal(map[string]any{"plans": plans})
+}
+
+func zotioTagsReconcile(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
+	var params struct{}
+	if err := ipc.DecodeParams(raw, &params); err != nil {
+		return badParams(err)
+	}
+	result, err := system.Zotio.ReconcileTags(ctx)
+	if err != nil {
+		return zotioFailure(err)
+	}
+	return marshal(result)
 }
 
 func zotioApply(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {

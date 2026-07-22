@@ -218,6 +218,8 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 		Submitter: service,
 		Bundle:    bundleExporter, Store: db, DataDir: cfg.DataDir,
 		AttachmentMode: cfg.Zotio.AttachmentMode, AutoEnrich: cfg.Zotio.AutoEnrich,
+		ExceptionTags:      cfg.Zotio.ExceptionTags,
+		UnavailableRecheck: time.Duration(cfg.Zotio.UnavailableRecheckDays) * 24 * time.Hour,
 	}
 	if strings.TrimSpace(cfg.Zotio.Executable) != "" {
 		// zotio is optional: an empty executable disables the deep Zotero
@@ -248,6 +250,9 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 		triageService.RegisterSource(retractions)
 	}
 	maintenance := daemon.MaintenanceRunners{watchRunner, service.ImportRetrier(), retractions}
+	if reconciler := zotioService.TagReconciler(); reconciler != nil {
+		maintenance = append(maintenance, reconciler)
+	}
 	scheduler, err := daemon.NewScheduler(jobs, service, daemon.SchedulerConfig{
 		Owner:               job.NewID("daemon"),
 		Workers:             3,
