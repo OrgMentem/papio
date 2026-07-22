@@ -575,37 +575,30 @@
         overflow-wrap: anywhere;
       }
 
-      /* Backend identifiers remain available without adding another visual
-         line: their dots button follows the actionable status text. */
-
+      /* This remains a real button for keyboard users, but reads as an
+         inline active ellipsis rather than a second control in the row. */
       .item-debug-toggle {
-        align-items: flex-end;
+        appearance: none;
         background: transparent;
-        border: 1px solid transparent;
-        border-radius: var(--radius-pill);
-        color: var(--color-muted);
+        border: 0;
+        color: var(--color-primary);
         cursor: pointer;
-        display: inline-flex;
-        flex: none;
+        display: inline;
         font: inherit;
         font-weight: 700;
-        height: 18px;
-        justify-content: center;
-        line-height: 1;
+        line-height: inherit;
         margin-inline-start: var(--space-1);
-        vertical-align: text-bottom;
+        min-height: 0;
+        padding: 0;
         position: relative;
-        width: 26px;
+        vertical-align: baseline;
       }
 
       .item-debug-toggle:hover,
       .item-debug-toggle[aria-expanded="true"] {
-        background: var(--color-surface-hover);
-        border-color: var(--color-control-border);
-      }
-
-      .item-debug-toggle[aria-expanded="true"] {
-        color: var(--color-context);
+        background: transparent;
+        border: 0;
+        color: var(--color-primary-solid-hover);
       }
 
       .item-debug {
