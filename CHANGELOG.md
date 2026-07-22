@@ -8,6 +8,14 @@ so older sections below include extension entries. The initial release entry
 is synthesized from the complete `papio` and `zotio` Git histories and the
 execution records in `notes/acquisition-stack-plan.md`.
 
+## [Unreleased]
+
+### Changed
+
+- Doctor's extension check is floor-aware: a connected extension below the
+  daemon's minimum version now WARNs with the exact skew and remediation
+  instead of reporting a bare `connected` PASS while every handoff refuses.
+
 ## [0.9.0] - 2026-07-22
 
 ### Added

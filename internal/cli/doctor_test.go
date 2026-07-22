@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"papio/internal/api"
+	"papio/internal/browser"
 	"papio/internal/config"
 	"papio/internal/doctor"
 	"papio/internal/zotio"
@@ -72,6 +73,22 @@ func TestDoctorExtensionNotConnectedWarnsWithSetupFix(t *testing.T) {
 	got := report.Checks[2]
 	if got.Name != "extension" || got.Status != doctor.Warn || got.Detail != "extension has not connected since daemon start" || !strings.Contains(got.Remediation, "browser extension") || !strings.Contains(got.Remediation, "papio init") {
 		t.Fatalf("extension check = %#v", got)
+	}
+}
+func TestDoctorExtensionBelowFloorWarnsWithSkew(t *testing.T) {
+	cfg := config.Default()
+	cfg.Path = filepath.Join(t.TempDir(), "config.toml")
+	status := doctor.DaemonStatus{Status: "ok", Version: api.Version, ExtensionConnected: true, ExtensionVersion: "0.4.3"}
+	report := doctor.RunIntegration(context.Background(), testDoctorDependencies(t, cfg, status))
+	got := report.Checks[2]
+	if got.Name != "extension" || got.Status != doctor.Warn {
+		t.Fatalf("extension check = %#v", got)
+	}
+	if !strings.Contains(got.Detail, "v0.4.3") || !strings.Contains(got.Detail, "below the daemon's minimum "+browser.MinExtensionVersion) {
+		t.Fatalf("detail = %q, want named skew", got.Detail)
+	}
+	if !strings.Contains(got.Remediation, "update the papio extension") {
+		t.Fatalf("remediation = %q", got.Remediation)
 	}
 }
 

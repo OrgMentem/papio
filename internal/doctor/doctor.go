@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 
+	"papio/internal/browser"
 	"papio/internal/config"
 	"papio/internal/pdf"
 	"papio/internal/store"
@@ -289,7 +290,17 @@ func RunIntegration(ctx context.Context, deps IntegrationDependencies) Report {
 				fix = "another browser competed for the papio session; run 'papio browser sessions' to inspect"
 			}
 		}
-		add("extension", Pass, detail, fix)
+		// Connectivity alone is not health: a connected extension below the
+		// daemon's floor holds the session but every handoff will refuse.
+		// Name the exact skew here instead of letting the user find it at
+		// first use.
+		if status.ExtensionVersion != "" && semverLess(status.ExtensionVersion, browser.MinExtensionVersion) {
+			add("extension", Warn,
+				detail+fmt.Sprintf("; below the daemon's minimum %s — handoffs are refused until it updates", browser.MinExtensionVersion),
+				"update the papio extension (store installs update automatically once the new version clears review; unpacked builds: load the new dist/)")
+		} else {
+			add("extension", Pass, detail, fix)
+		}
 	} else {
 		add("extension", Warn, "extension has not connected since daemon start", "install and enable the browser extension, then run papio init to install the native-host manifest")
 	}
@@ -447,6 +458,27 @@ func containsString(values []string, want string) bool {
 	for _, value := range values {
 		if value == want {
 			return true
+		}
+	}
+	return false
+}
+
+// semverLess reports a < b for dotted numeric versions (pre-release/build
+// suffixes are ignored segment-wise; malformed segments compare as 0). Kept
+// deliberately simple: it guards a WARN, not an enforcement decision — the
+// bridge owns the authoritative floor check.
+func semverLess(a, b string) bool {
+	as, bs := strings.Split(a, "."), strings.Split(b, ".")
+	for i := 0; i < 3; i++ {
+		av, bv := 0, 0
+		if i < len(as) {
+			fmt.Sscanf(strings.TrimSpace(as[i]), "%d", &av)
+		}
+		if i < len(bs) {
+			fmt.Sscanf(strings.TrimSpace(bs[i]), "%d", &bv)
+		}
+		if av != bv {
+			return av < bv
 		}
 	}
 	return false
