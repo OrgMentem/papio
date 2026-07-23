@@ -307,8 +307,10 @@ papio actions resolve <action-id> --reject
 ```
 
 `--accept` states that you opened the quarantined PDF and confirmed it is the
-work you wanted. It requeues the candidate; the result is recorded as
-`user_confirmed`, not as an automatic match. `--reject` records that it is not
+work you wanted. The daemon imports that same file — no second download — and
+records the result as `user_confirmed`, not as an automatic match. If the
+quarantined file has since been removed or altered, the candidate is fetched
+again instead. `--reject` records that it is not
 the right work and cancels the review. Resolution
 applies only to an open `verify_identity` action; it does not waive explicit
 wrong-work, encrypted, or active-content rejection.

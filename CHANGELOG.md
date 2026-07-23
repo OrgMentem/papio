@@ -8,6 +8,30 @@ so older sections below include extension entries. The initial release entry
 is synthesized from the complete `papio` and `zotio` Git histories and the
 execution records in `notes/acquisition-stack-plan.md`.
 
+## [Unreleased]
+
+### Fixed
+
+- Accepting an identity review now promotes the exact quarantined PDF you
+  verified instead of discarding it, re-resolving, and downloading the work
+  again — a flow that could silently drop the acceptance when a resolver did
+  not re-offer the same URL. The reviewed file is hash-checked against the
+  recorded review binding before promotion; a missing or altered file still
+  falls back to a fresh fetch.
+- The CORE and Crossref TDM resolvers work again: both rejected the daemon's
+  hardened HTTP client as unsafe and had failed every request since that
+  client was introduced.
+- `papio ping` and triage RPCs no longer stall behind background network work:
+  the daily update check and the retraction sweep both released their caches'
+  locks only after their HTTP requests finished.
+- A single failed DOI lookup no longer aborts the whole retraction sweep; the
+  failed DOI keeps its previous notices and the sweep commits partial results.
+- A transient `accept` error (such as running out of file descriptors) no
+  longer shuts down the daemon IPC server and severs active CLI connections;
+  accepts now retry with bounded backoff.
+- Coalesced notifications delayed into a later window are no longer dropped:
+  the flush timer detached from the request context that scheduled it.
+
 ## [0.10.1] - 2026-07-23
 
 ### Fixed

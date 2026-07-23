@@ -56,8 +56,10 @@ papio actions resolve <action-id> --reject
 ```
 
 `--accept` states that you verified the quarantined PDF is the requested work.
-It requeues the candidate, and its identity result is recorded as
-`user_confirmed`, not as a machine pass. `--reject` records that it is not the
+The daemon promotes that same quarantined file — its identity result recorded as
+`user_confirmed`, not as a machine pass — without downloading it again; only if
+the file has since disappeared or changed is the candidate refetched.
+`--reject` records that it is not the
 requested work and cancels the review. Neither option can override an explicit
 wrong-work, encrypted, or active-content rejection.
 
