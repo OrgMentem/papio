@@ -6,7 +6,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"reflect"
+	"strings"
 	"testing"
 
 	"papio/internal/app"
@@ -90,6 +92,62 @@ func TestActionURLsSelectAwaitingActionsMostRecentAndDryRun(t *testing.T) {
 	}
 	if got := out.String(); got != want[0]+"\n"+want[1]+"\n"+want[2]+"\n" {
 		t.Fatalf("dry-run output = %q", got)
+	}
+}
+
+func TestOpenActionURLsReportsActionableBrowserFailure(t *testing.T) {
+	runErr := errors.New("open: exit status 1")
+	err := openActionURLs(context.Background(), []string{"https://resolver.example.test/open"}, false, &bytes.Buffer{}, func(context.Context, string, ...string) error {
+		return runErr
+	})
+	if !errors.Is(err, runErr) {
+		t.Fatalf("open error = %v, want wrapped runner error", err)
+	}
+	for _, fragment := range []string{"browser handoff could not open", "papio extension enabled", "papio doctor"} {
+		if !strings.Contains(err.Error(), fragment) {
+			t.Fatalf("open error = %q, missing %q", err, fragment)
+		}
+	}
+}
+
+func TestCommandGroupsRejectUnknownVerbs(t *testing.T) {
+	var out, errOut bytes.Buffer
+	root := NewInProcessRoot(&out, &errOut, config.Config{}, func(context.Context, string, any, any) error {
+		t.Fatal("unknown command must not call the daemon")
+		return nil
+	})
+	root.SetArgs([]string{"--json", "jobs", "show", "job_01"})
+
+	err := root.ExecuteContext(context.Background())
+	if err == nil {
+		t.Fatal("jobs show succeeded, want an unknown-verb error")
+	}
+	for _, fragment := range []string{`unknown jobs command "show"`, "valid verbs:", "get"} {
+		if !strings.Contains(err.Error(), fragment) {
+			t.Fatalf("jobs show error = %q, missing %q", err, fragment)
+		}
+	}
+	if out.Len() != 0 || errOut.Len() != 0 {
+		t.Fatalf("unknown verb wrote output: stdout=%q stderr=%q", out.String(), errOut.String())
+	}
+}
+
+func TestBareCommandGroupPrintsHelpNotSilence(t *testing.T) {
+	// Regression: the unknown-verb validator installs a RunE on non-runnable
+	// groups; a no-op there made bare `papio jobs` exit 0 with no output —
+	// the same silent class the validator exists to kill.
+	var out, errOut bytes.Buffer
+	root := NewInProcessRoot(&out, &errOut, config.Config{}, func(context.Context, string, any, any) error {
+		t.Fatal("bare group must not call the daemon")
+		return nil
+	})
+	root.SetArgs([]string{"jobs"})
+
+	if err := root.ExecuteContext(context.Background()); err != nil {
+		t.Fatalf("bare jobs = %v, want help output with nil error", err)
+	}
+	if !strings.Contains(out.String()+errOut.String(), "Usage:") {
+		t.Fatalf("bare jobs printed no help: stdout=%q stderr=%q", out.String(), errOut.String())
 	}
 }
 

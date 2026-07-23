@@ -252,15 +252,13 @@ papio daemon stop
 
 ## `papio doctor`
 
-Check acquisition readiness and local integrations
+Check acquisition readiness and local integrations. Autostarts the daemon like
+other papio commands; when the daemon cannot start, the dependent extension,
+native-host, zotio, and database checks collapse into a single skipped line.
 
 ```
-papio doctor [flags]
+papio doctor
 ```
-
-| Flag | Type | Default | Description |
-| --- | --- | --- | --- |
-| `--start` | `bool` | `false` | autostart the daemon before integration checks instead of diagnosing a stopped one |
 
 ## `papio inbox`
 

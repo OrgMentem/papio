@@ -330,7 +330,7 @@ func openActionURLs(ctx context.Context, urls []string, dryRun bool, out io.Writ
 		err := run(bounded, "open", "-b", chromeBundleID, target)
 		cancel()
 		if err != nil {
-			return fmt.Errorf("opening %s: %w (check 'papio doctor' if the browser or extension is not set up)", target, err)
+			return fmt.Errorf("browser handoff could not open — open your browser with the papio extension enabled (papio doctor), then retry: %w", err)
 		}
 	}
 	return nil

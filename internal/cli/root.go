@@ -96,7 +96,48 @@ func newRoot(opt *options) *cobra.Command {
 		newMCPCommand(opt),
 		newVersionCommand(opt),
 	)
+	for _, command := range root.Commands() {
+		configureCommandGroups(command)
+	}
 	return root
+}
+
+// configureCommandGroups makes every command with subcommands reject an
+// unrecognized verb consistently. Cobra otherwise resolves an unknown child as
+// a positional argument to its parent; command groups with no RunE then
+// succeed silently.
+func configureCommandGroups(command *cobra.Command) {
+	children := command.Commands()
+	if len(children) == 0 {
+		return
+	}
+
+	wasRunnable := command.Runnable()
+	originalArgs := command.Args
+	command.Args = func(cmd *cobra.Command, args []string) error {
+		if len(args) > 0 {
+			verbs := make([]string, 0, len(children))
+			for _, child := range children {
+				if !child.Hidden {
+					verbs = append(verbs, child.Name())
+				}
+			}
+			return fmt.Errorf("unknown %s command %q; valid verbs: %s", cmd.Name(), args[0], strings.Join(verbs, ", "))
+		}
+		if originalArgs != nil {
+			return originalArgs(cmd, args)
+		}
+		return nil
+	}
+	if !wasRunnable {
+		// Cobra returns help before validating Args for a non-runnable command.
+		// A help-printing RunE keeps the bare invocation informative while
+		// letting the shared Args validator above report unknown verbs.
+		command.RunE = func(cmd *cobra.Command, _ []string) error { return cmd.Help() }
+	}
+	for _, child := range children {
+		configureCommandGroups(child)
+	}
 }
 
 func (o *options) loadConfig() (config.Config, error) {

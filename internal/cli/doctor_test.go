@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -15,6 +16,7 @@ import (
 	"papio/internal/api"
 	"papio/internal/browser"
 	"papio/internal/config"
+	"papio/internal/daemon"
 	"papio/internal/doctor"
 	"papio/internal/ipc"
 	"papio/internal/zotio"
@@ -102,18 +104,78 @@ func TestDoctorDaemonDownCollapsesIntegrationSkips(t *testing.T) {
 	}
 	report := doctor.RunIntegration(context.Background(), deps)
 	daemonCheck := report.Checks[1]
-	if daemonCheck.Name != "daemon" || daemonCheck.Status != doctor.Fail || !strings.Contains(daemonCheck.Detail, "not running or unreachable") || !strings.Contains(daemonCheck.Remediation, "--start") {
+	if daemonCheck.Name != "daemon" || daemonCheck.Status != doctor.Fail || !strings.Contains(daemonCheck.Detail, "not running or unreachable") || !strings.Contains(daemonCheck.Remediation, "retry 'papio doctor'") {
 		t.Fatalf("daemon check = %#v", daemonCheck)
 	}
 	got := report.Checks[2]
-	if got.Name != "integrations" || got.Status != doctor.Skip || got.Detail != "skipped: daemon is unreachable (extension, native hosts, zotio)" {
+	if got.Name != "integrations" || got.Status != doctor.Skip || got.Detail != "skipped: daemon is unreachable (extension, native hosts, zotio, database)" {
 		t.Fatalf("integrations check = %#v", got)
 	}
-	// The single collapsed skip replaces the old four-line cascade.
-	for _, check := range report.Checks {
-		if check.Status == doctor.Skip && check.Name != "integrations" && !strings.HasPrefix(check.Name, "updates") {
-			t.Fatalf("unexpected extra skip check %#v", check)
+	// The single collapsed skip replaces the old daemon-dependent cascade.
+	if len(report.Checks) != 3 {
+		t.Fatalf("daemon-down checks = %#v, want config, daemon, integrations", report.Checks)
+	}
+}
+
+func TestDoctorUsesOrdinaryDaemonAutostartPath(t *testing.T) {
+	cfg := config.Default()
+	cfg.Path = filepath.Join(t.TempDir(), "config.toml")
+	cfg.DataDir = t.TempDir()
+	cfg.Updates.Check = false
+
+	var out bytes.Buffer
+	started := false
+	var calls []string
+	command := newDoctorCommand(&options{
+		out:          &out,
+		configLoader: func(string) (config.Config, error) { return cfg, nil },
+		newAutostarter: func(socket string) *daemon.Autostarter {
+			return &daemon.Autostarter{
+				SocketPath: socket,
+				Ready: func(context.Context, string) error {
+					if started {
+						return nil
+					}
+					return errors.New("daemon not ready")
+				},
+				Executable: func() (string, error) { return "papio", nil },
+				Start: func(context.Context, *exec.Cmd) error {
+					started = true
+					return nil
+				},
+			}
+		},
+		rpcCall: func(_ context.Context, _ string, method string, _ any, result any) error {
+			calls = append(calls, method)
+			switch method {
+			case "doctor.run":
+				*result.(*doctor.Report) = doctor.Report{OK: true, Checks: []doctor.Check{{Name: "database", Status: doctor.Pass, Detail: "SQLite integrity ok"}}}
+			case "ping":
+				*result.(*doctor.DaemonStatus) = doctor.DaemonStatus{Status: "ok", Version: api.Version}
+			default:
+				t.Fatalf("RPC method = %q", method)
+			}
+			return nil
+		},
+	})
+	if err := command.ExecuteContext(context.Background()); err != nil {
+		t.Fatalf("doctor: %v", err)
+	}
+	if !started {
+		t.Fatal("doctor did not start an unavailable daemon through the autostarter")
+	}
+	foundReadiness := false
+	for _, method := range calls {
+		if method == "doctor.run" {
+			foundReadiness = true
+			break
 		}
+	}
+	if !foundReadiness {
+		t.Fatalf("RPC calls = %#v, want daemon-backed doctor.run", calls)
+	}
+	if !strings.Contains(out.String(), "PASS  database") {
+		t.Fatalf("doctor output = %q, want daemon database result", out.String())
 	}
 }
 

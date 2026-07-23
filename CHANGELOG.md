@@ -27,6 +27,16 @@ execution records in `notes/acquisition-stack-plan.md`.
 
 ### Fixed
 
+- `papio actions open` no longer fails with a bare "exit status 1" when the
+  browser cannot be launched: the error now says the browser handoff could not
+  open and points at enabling the extension and `papio doctor`.
+- `papio doctor` autostarts the daemon like every other papio command and runs
+  its database integrity check through the daemon, so a stopped daemon no
+  longer produces a FAIL/WARN/SKIP cascade — a genuinely unstartable daemon is
+  one failure line plus one collapsed skip.
+- Unknown verbs under command groups (for example `papio jobs show`) now fail
+  with the list of valid verbs instead of silently printing nothing, and a
+  bare command group still prints its help.
 - Accepting an identity review now promotes the exact quarantined PDF you
   verified instead of discarding it, re-resolving, and downloading the work
   again — a flow that could silently drop the acceptance when a resolver did

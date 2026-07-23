@@ -44,7 +44,8 @@ type Report struct {
 }
 
 // Run evaluates config, filesystem, database, executable, source credentials,
-// and PDF helper capabilities. A nil store skips DB checks with a warning.
+// and PDF helper capabilities. A nil store means database integrity is checked
+// by the daemon-backed doctor command instead.
 func Run(ctx context.Context, cfg config.Config, db *store.Store, capability pdf.Capability, workerBinary string) Report {
 	var checks []Check
 	add := func(name, status, detail, remediation string) {
@@ -82,7 +83,7 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, capability pdf
 	}
 
 	if db == nil {
-		add("database", Warn, "database not opened for this doctor run", "run doctor through the daemon for integrity status")
+		add("database", Skip, "database integrity is checked by the daemon", "")
 	} else if err := db.IntegrityCheck(ctx); err != nil {
 		add("database", Fail, "SQLite integrity check failed", "restore from a verified backup before acquisition")
 	} else {
@@ -264,15 +265,13 @@ func RunIntegration(ctx context.Context, deps IntegrationDependencies) Report {
 
 	status, err := deps.DaemonStatus(ctx, cfg)
 	if err != nil {
-		add("daemon", Fail, "not running or unreachable ("+err.Error()+")", "papio doctor --start (any other papio command also autostarts it)")
-		add("integrations", Skip, "skipped: daemon is unreachable (extension, native hosts, zotio)", "")
-		runUpdateChecks(ctx, cfg, deps, nil, add)
+		add("daemon", Fail, "not running or unreachable ("+err.Error()+")", "check the daemon log, then retry 'papio doctor'")
+		add("integrations", Skip, "skipped: daemon is unreachable (extension, native hosts, zotio, database)", "")
 		return report
 	}
 	if status.Status != "ok" || strings.TrimSpace(status.Version) == "" {
 		add("daemon", Fail, fmt.Sprintf("unexpected daemon status %q (version %q)", status.Status, status.Version), "papio daemon stop, then rerun doctor")
-		add("integrations", Skip, "skipped: daemon status is invalid (extension, native hosts, zotio)", "")
-		runUpdateChecks(ctx, cfg, deps, nil, add)
+		add("integrations", Skip, "skipped: daemon status is invalid (extension, native hosts, zotio, database)", "")
 		return report
 	}
 	if status.Version != deps.CLIVersion {

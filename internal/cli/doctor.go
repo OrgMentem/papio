@@ -16,7 +16,6 @@ import (
 
 	"papio/internal/config"
 	"papio/internal/doctor"
-	"papio/internal/pdf"
 	"papio/internal/update"
 	"papio/internal/zotio"
 )
@@ -30,10 +29,8 @@ func defaultDoctorDependencies(opt *options) doctor.IntegrationDependencies {
 		CLIVersion: api.Version,
 		LoadConfig: opt.loadConfig,
 		DaemonStatus: func(ctx context.Context, _ config.Config) (doctor.DaemonStatus, error) {
-			// callExisting deliberately avoids daemon.NewAutostarter: doctor must
-			// diagnose a stopped daemon, not hide it by starting one.
 			var status doctor.DaemonStatus
-			if err := opt.callExisting(ctx, "ping", struct{}{}, &status); err != nil {
+			if err := opt.call(ctx, "ping", struct{}{}, &status); err != nil {
 				return doctor.DaemonStatus{}, err
 			}
 			return status, nil
@@ -57,32 +54,30 @@ func defaultDoctorDependencies(opt *options) doctor.IntegrationDependencies {
 	}
 }
 
-func runReadinessDoctor(ctx context.Context, cfg config.Config) doctor.Report {
-	// Opening the store here could create or migrate the database. Doctor should
-	// inspect a local installation without mutating it, so Run emits its
-	// established database warning instead.
-	return doctor.Run(ctx, cfg, nil, pdf.DetectCapability(), doctor.DefaultWorkerPath())
+func daemonReadinessDoctor(opt *options, daemonErr *error) doctorReadinessRunner {
+	return func(ctx context.Context, _ config.Config) doctor.Report {
+		var report doctor.Report
+		if err := opt.call(ctx, "doctor.run", struct{}{}, &report); err != nil {
+			// RunIntegration will render the daemon failure and its single
+			// dependent-check skip. Do not add local checks that would obscure it.
+			*daemonErr = err
+			return doctor.Report{OK: true}
+		}
+		return report
+	}
 }
 
 func newDoctorCommand(opt *options) *cobra.Command {
-	var start bool
 	deps := defaultDoctorDependencies(opt)
 	diagnose := deps.DaemonStatus
+	var readinessErr error
 	deps.DaemonStatus = func(ctx context.Context, cfg config.Config) (doctor.DaemonStatus, error) {
-		if !start {
-			return diagnose(ctx, cfg)
+		if readinessErr != nil {
+			return doctor.DaemonStatus{}, readinessErr
 		}
-		// --start opts into the same autostart every ordinary command uses, so
-		// a first-run doctor can bring the daemon up instead of reporting it down.
-		var status doctor.DaemonStatus
-		if err := opt.call(ctx, "ping", struct{}{}, &status); err != nil {
-			return doctor.DaemonStatus{}, err
-		}
-		return status, nil
+		return diagnose(ctx, cfg)
 	}
-	command := newDoctorCommandWithDependencies(opt, deps, runReadinessDoctor)
-	command.Flags().BoolVar(&start, "start", false, "autostart the daemon before integration checks instead of diagnosing a stopped one")
-	return command
+	return newDoctorCommandWithDependencies(opt, deps, daemonReadinessDoctor(opt, &readinessErr))
 }
 
 func newDoctorCommandWithDependencies(opt *options, deps doctor.IntegrationDependencies, readiness doctorReadinessRunner) *cobra.Command {
