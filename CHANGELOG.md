@@ -10,6 +10,16 @@ execution records in `notes/acquisition-stack-plan.md`.
 
 ## [Unreleased]
 
+### Added
+
+- When the institutional OpenURL route reports no entitlement (or only
+  document delivery), the daemon now re-enters resolving once and lets the
+  existing sibling discovery look for an open-access copy of an alternate
+  version before giving up. A durable `browser.no_entitlement_requeue` job
+  event guards the retry: a route that already proved empty is never offered
+  again, and the job then parks `unavailable` with terminal reason
+  `no_entitlement` and the honest no-access guidance.
+
 ### Fixed
 
 - Accepting an identity review now promotes the exact quarantined PDF you

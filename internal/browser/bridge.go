@@ -1057,9 +1057,25 @@ func (b *Bridge) outcome(ctx context.Context, jobID string, p *protocol.Provider
 
 	case "no_entitlement", "document_delivery_available":
 		if fellBack, err := b.fallbackOAHandoff(ctx, jobID, p.Outcome); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return nil
+			}
 			return err
 		} else if fellBack {
 			return nil
+		}
+		requeued, err := b.institutionalRouteRequeued(ctx, jobID)
+		if err != nil {
+			return err
+		}
+		if !requeued {
+			if err := b.jobs.RecordEvent(ctx, jobID, "browser.no_entitlement_requeue", map[string]any{"outcome": p.Outcome}); err != nil {
+				return err
+			}
+			if err := b.resolveHandoff(ctx, jobID, "resolved"); err != nil {
+				return err
+			}
+			return b.leaveHandoff(ctx, jobID, job.StateResolving, "no_entitlement_rediscovery")
 		}
 		if err := b.resolveHandoff(ctx, jobID, "resolved"); err != nil {
 			return err
@@ -1090,11 +1106,30 @@ func (b *Bridge) outcome(ctx context.Context, jobID string, p *protocol.Provider
 	}
 }
 
+// institutionalRouteRequeued reports whether this job already left an
+// institutional handoff for an OA rediscovery pass. The event is the durable
+// one-shot guard shared with app.exhaustedCandidates.
+func (b *Bridge) institutionalRouteRequeued(ctx context.Context, jobID string) (bool, error) {
+	events, err := b.jobs.Events(ctx, jobID)
+	if err != nil {
+		return false, err
+	}
+	for _, event := range events {
+		if kind, _ := event["kind"].(string); kind == "browser.no_entitlement_requeue" {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // leaveHandoff transitions a parked handoff job out of awaiting_human. It is
 // idempotent: if the job already left awaiting_human, it does nothing.
 func (b *Bridge) leaveHandoff(ctx context.Context, jobID, to, reason string) error {
 	row, err := b.jobs.Get(ctx, jobID)
 	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
 		return err
 	}
 	if row.State != job.StateAwaitingHuman {
@@ -1108,7 +1143,13 @@ func (b *Bridge) leaveHandoff(ctx context.Context, jobID, to, reason string) err
 	case job.StateRetryWait:
 		opts = append(opts, job.WithRetryAt(b.now().Add(b.actionExpiry())))
 	}
-	return b.jobs.Transition(ctx, jobID, job.StateAwaitingHuman, to, detail, opts...)
+	if err := b.jobs.Transition(ctx, jobID, job.StateAwaitingHuman, to, detail, opts...); err != nil {
+		if errors.Is(err, job.ErrConflict) {
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 // adopt resolves the reported download strictly under the job's adoption

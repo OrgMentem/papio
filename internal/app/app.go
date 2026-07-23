@@ -767,6 +767,24 @@ func (s *Service) retryBudgetExhausted(ctx context.Context, jobID string) bool {
 	return n >= maxRetryAttempts
 }
 
+// institutionalRouteExhausted reports whether an institutional OpenURL route
+// has already conclusively reported no entitlement for this job. The event is
+// durable so a rediscovery pass after a daemon restart cannot offer that route
+// again. A read error is deliberately non-escalating, like retryBudgetExhausted:
+// another institutional offer is safer than falsely hiding available access.
+func (s *Service) institutionalRouteExhausted(ctx context.Context, jobID string) bool {
+	events, err := s.Jobs.Events(ctx, jobID)
+	if err != nil {
+		return false
+	}
+	for _, event := range events {
+		if kind, _ := event["kind"].(string); kind == "browser.no_entitlement_requeue" {
+			return true
+		}
+	}
+	return false
+}
+
 // exhaustedCandidates handles the terminal "no direct candidate" boundary —
 // either resolving produced zero legal candidates or fetching exhausted them
 // all without an artifact. A bot-blocked open-access candidate gets one
@@ -784,12 +802,16 @@ func (s *Service) exhaustedCandidates(ctx context.Context, row *job.Row, from, r
 			return s.park(ctx, row.ID, from, job.StateAwaitingHuman,
 				map[string]any{"reason": "open_access_browser_handoff"})
 		}
-		if base, ok := s.Config.OpenURLBaseFor(row.Policy.Resolver); ok && base != "" {
+		institutionalExhausted := s.institutionalRouteExhausted(ctx, row.ID)
+		if base, ok := s.Config.OpenURLBaseFor(row.Policy.Resolver); ok && base != "" && !institutionalExhausted {
 			if _, err := s.Jobs.OpenHumanAction(ctx, row.ID, "openurl_handoff", InstitutionalOpenURLHandoffDetail, job.WithAccessClassification(true, "paywall")); err != nil {
 				return err
 			}
 			return s.park(ctx, row.ID, from, job.StateAwaitingHuman,
 				map[string]any{"reason": "institutional_handoff"})
+		}
+		if institutionalExhausted {
+			terminal = "no_entitlement"
 		}
 	case config.ModeConservative:
 		if base, ok := s.Config.OpenURLBaseFor(row.Policy.Resolver); ok && base != "" {

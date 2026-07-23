@@ -1210,6 +1210,11 @@ func TestProviderOutcomeMappings(t *testing.T) {
 			b, jobs, _, _ := newBridge(t)
 			ctx := context.Background()
 			id := park(t, jobs, "wr_"+outcome, handoffWork())
+			if outcome == "no_entitlement" || outcome == "document_delivery_available" {
+				if err := jobs.RecordEvent(ctx, id, "browser.no_entitlement_requeue", map[string]any{"outcome": outcome}); err != nil {
+					t.Fatal(err)
+				}
+			}
 			runSync(t, b, hello())
 			runSync(t, b, inFrame(t, protocol.MsgProviderOutcome, id, map[string]any{"outcome": outcome}))
 
@@ -1246,6 +1251,83 @@ func TestProviderOutcomeMappings(t *testing.T) {
 			}
 			if want.extraAction != "" && !extraOpen {
 				t.Fatalf("expected an open %s action", want.extraAction)
+			}
+		})
+	}
+}
+
+func TestInstitutionalNoEntitlementRequeuesExactlyOnce(t *testing.T) {
+	for _, outcome := range []string{"no_entitlement", "document_delivery_available"} {
+		t.Run(outcome, func(t *testing.T) {
+			b, jobs, _, _ := newBridge(t)
+			ctx := context.Background()
+			id := park(t, jobs, "wr_requeue_"+outcome, handoffWork())
+			runSync(t, b, hello())
+
+			runSync(t, b, inFrame(t, protocol.MsgProviderOutcome, id, map[string]any{"outcome": outcome}))
+			row, err := jobs.Get(ctx, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if row.State != job.StateResolving {
+				t.Fatalf("state after first %s = %s, want resolving", outcome, row.State)
+			}
+
+			events, err := jobs.Events(ctx, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			requeues := 0
+			for _, event := range events {
+				if event["kind"] != "browser.no_entitlement_requeue" {
+					continue
+				}
+				requeues++
+				detail, ok := event["detail"].(map[string]any)
+				if !ok || detail["outcome"] != outcome {
+					t.Fatalf("requeue detail = %#v, want outcome %q", event["detail"], outcome)
+				}
+			}
+			if requeues != 1 {
+				t.Fatalf("requeue events = %d, want 1", requeues)
+			}
+
+			actions, err := jobs.ListHumanActions(ctx, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(actions) != 1 || actions[0].Status != "resolved" {
+				t.Fatalf("first institutional action = %+v, want resolved", actions)
+			}
+
+			if _, err := jobs.OpenHumanAction(ctx, id, handoffActionKind, "handoff available"); err != nil {
+				t.Fatal(err)
+			}
+			if err := jobs.Transition(ctx, id, job.StateResolving, job.StateAwaitingHuman,
+				map[string]any{"reason": "institutional_handoff"}); err != nil {
+				t.Fatal(err)
+			}
+			runSync(t, b, inFrame(t, protocol.MsgProviderOutcome, id, map[string]any{"outcome": outcome}))
+
+			row, err = jobs.Get(ctx, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if row.State != job.StateUnavailable || row.TerminalReason != outcome {
+				t.Fatalf("state/reason after second %s = %s/%q, want unavailable/%q", outcome, row.State, row.TerminalReason, outcome)
+			}
+			events, err = jobs.Events(ctx, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			requeues = 0
+			for _, event := range events {
+				if event["kind"] == "browser.no_entitlement_requeue" {
+					requeues++
+				}
+			}
+			if requeues != 1 {
+				t.Fatalf("second %s recorded %d requeue events, want 1", outcome, requeues)
 			}
 		})
 	}
