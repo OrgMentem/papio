@@ -57,6 +57,17 @@ func (f *fakeEnricher) Enrich(context.Context, work.Work) (work.Work, bool, erro
 	return f.result, f.matched, f.err
 }
 
+type fakeWorkLookup struct {
+	result discovery.DiscoveredWork
+	err    error
+	calls  int
+}
+
+func (f *fakeWorkLookup) LookupWork(context.Context, string) (discovery.DiscoveredWork, error) {
+	f.calls++
+	return f.result, f.err
+}
+
 func newTestService(t *testing.T) (*Service, *job.Store) {
 	t.Helper()
 	ctx := context.Background()
@@ -146,6 +157,106 @@ func TestResolveContinuesAfterTemporaryEnrichmentFailure(t *testing.T) {
 	}
 	if len(adapter.requested) != 1 || adapter.requested[0].DOI != "" {
 		t.Fatalf("resolver received %+v, want original title-only work", adapter.requested)
+	}
+}
+
+func TestResolveEnrichesDOIOnlyWorkFromDiscovery(t *testing.T) {
+	svc, jobs := newTestService(t)
+	lookup := &fakeWorkLookup{result: discovery.DiscoveredWork{Work: work.Work{
+		DOI: "10.1002/example", Title: "Discovered title", Authors: []string{"Ada Lovelace"}, Year: 2024,
+	}}}
+	adapter := &fakeResolver{name: "fixture"}
+	svc.Discovery = lookup
+	svc.Resolvers = []ResolverEntry{{Adapter: adapter, Policy: config.Source{Enabled: true}}}
+
+	id, err := svc.Submit(context.Background(), doiRequest("wr_lookup_0001"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, err := jobs.Get(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := svc.resolve(context.Background(), row); err != nil {
+		t.Fatal(err)
+	}
+	if got := row.Work; got.Title != "Discovered title" || strings.Join(got.Authors, ", ") != "Ada Lovelace" || got.Year != 2024 {
+		t.Fatalf("in-memory work = %+v", got)
+	}
+	persisted, err := jobs.Get(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := persisted.Work; got.Title != "Discovered title" || strings.Join(got.Authors, ", ") != "Ada Lovelace" || got.Year != 2024 {
+		t.Fatalf("persisted work = %+v", got)
+	}
+	var title, authorsJSON string
+	var year int
+	if err := jobs.S.DB().QueryRowContext(context.Background(),
+		`SELECT title, authors_json, year FROM work_requests WHERE id = ?`, row.WorkRequestID,
+	).Scan(&title, &authorsJSON, &year); err != nil {
+		t.Fatal(err)
+	}
+	if title != "Discovered title" || authorsJSON != `["Ada Lovelace"]` || year != 2024 {
+		t.Fatalf("work request metadata = %q, %q, %d", title, authorsJSON, year)
+	}
+	if len(adapter.requested) != 1 || adapter.requested[0].Title != "Discovered title" {
+		t.Fatalf("resolver received %+v, want discovered work", adapter.requested)
+	}
+
+	if _, _, err := svc.resolve(context.Background(), persisted); err != nil {
+		t.Fatal(err)
+	}
+	if lookup.calls != 1 {
+		t.Fatalf("discovery lookups = %d, want 1 after rediscovery", lookup.calls)
+	}
+}
+
+func TestResolveSkipsDiscoveryLookupForTitledWork(t *testing.T) {
+	svc, jobs := newTestService(t)
+	lookup := &fakeWorkLookup{}
+	adapter := &fakeResolver{name: "fixture"}
+	svc.Discovery = lookup
+	svc.Resolvers = []ResolverEntry{{Adapter: adapter, Policy: config.Source{Enabled: true}}}
+
+	request := doiRequest("wr_lookup_0002")
+	request.Title = "Request-supplied title"
+	id, err := svc.Submit(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, err := jobs.Get(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := svc.resolve(context.Background(), row); err != nil {
+		t.Fatal(err)
+	}
+	if lookup.calls != 0 {
+		t.Fatalf("discovery lookups = %d, want 0", lookup.calls)
+	}
+}
+
+func TestResolveContinuesAfterDiscoveryLookupFailure(t *testing.T) {
+	svc, jobs := newTestService(t)
+	lookup := &fakeWorkLookup{err: errors.New("rate limited")}
+	adapter := &fakeResolver{name: "fixture"}
+	svc.Discovery = lookup
+	svc.Resolvers = []ResolverEntry{{Adapter: adapter, Policy: config.Source{Enabled: true}}}
+
+	id, err := svc.Submit(context.Background(), doiRequest("wr_lookup_0003"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, err := jobs.Get(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := svc.resolve(context.Background(), row); err != nil {
+		t.Fatal(err)
+	}
+	if lookup.calls != 1 || len(adapter.requested) != 1 || adapter.requested[0].Title != "" {
+		t.Fatalf("lookup/resolver = %d/%+v", lookup.calls, adapter.requested)
 	}
 }
 

@@ -8,6 +8,8 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -743,7 +745,7 @@ func TestResolveHumanActionRequiresOpenAction(t *testing.T) {
 	}
 }
 
-func TestDismissHumanActionClosesActionAndCancelsJob(t *testing.T) {
+func TestDismissHumanActionCancelsNeedsReviewVerifyIdentity(t *testing.T) {
 	js := testStore(t)
 	ctx := context.Background()
 	id, _, actionID := parkIdentityReview(t, js, "wr_dismiss")
@@ -761,6 +763,85 @@ func TestDismissHumanActionClosesActionAndCancelsJob(t *testing.T) {
 	}
 	if _, err := js.DismissHumanAction(ctx, actionID, 1); !errors.Is(err, ErrConflict) {
 		t.Fatalf("replayed dismiss error = %v, want ErrConflict", err)
+	}
+}
+
+func TestDismissHumanActionClosesStaleHandoffWithoutCancellingNeedsReview(t *testing.T) {
+	js := testStore(t)
+	ctx := context.Background()
+	id, _, reviewID := parkIdentityReview(t, js, "wr_dismiss_stale_handoff")
+	quarantine := filepath.Join(t.TempDir(), "quarantine.pdf")
+	if err := os.WriteFile(quarantine, []byte("quarantined bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := js.S.DB().ExecContext(ctx, `
+		UPDATE human_actions SET quarantine_path = ?, quarantine_sha256 = ?
+		WHERE id = ?`,
+		quarantine, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", reviewID); err != nil {
+		t.Fatal(err)
+	}
+	handoffID, err := js.OpenHumanAction(ctx, id, "openurl_handoff", "stale handoff")
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobID, err := js.DismissHumanAction(ctx, handoffID, 1)
+	if err != nil || jobID != id {
+		t.Fatalf("DismissHumanAction() = %q, %v; want %q, nil", jobID, err, id)
+	}
+	row, err := js.Get(ctx, id)
+	if err != nil || row.State != StateNeedsReview || row.TerminalReason != "" {
+		t.Fatalf("stale handoff dismiss changed job = %+v, %v", row, err)
+	}
+	if _, err := os.Stat(quarantine); err != nil {
+		t.Fatalf("stale handoff dismiss removed quarantine file: %v", err)
+	}
+	actions, err := js.ListHumanActions(ctx, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var handoff, review *HumanAction
+	for i := range actions {
+		action := &actions[i]
+		switch action.ID {
+		case handoffID:
+			handoff = action
+		case reviewID:
+			review = action
+		}
+	}
+	if handoff == nil || handoff.Status != "cancelled" {
+		t.Fatalf("handoff action = %+v, want cancelled", handoff)
+	}
+	if review == nil || review.Status != "open" {
+		t.Fatalf("verify_identity action = %+v, want open", review)
+	}
+}
+
+func TestDismissHumanActionCancelsAwaitingHandoff(t *testing.T) {
+	js := testStore(t)
+	ctx := context.Background()
+	id, err := js.CreateRequest(ctx, "wr_dismiss_awaiting_handoff", testWork(), "", "", testPolicy(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, edge := range [][2]string{
+		{StateQueued, StateResolving},
+		{StateResolving, StateAwaitingHuman},
+	} {
+		if err := js.Transition(ctx, id, edge[0], edge[1], nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	actionID, err := js.OpenHumanAction(ctx, id, "openurl_handoff", "institutional handoff")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := js.DismissHumanAction(ctx, actionID, 1); err != nil {
+		t.Fatal(err)
+	}
+	row, err := js.Get(ctx, id)
+	if err != nil || row.State != StateCancelled || row.TerminalReason != "user_dismissed" {
+		t.Fatalf("awaiting handoff dismiss = %+v, %v", row, err)
 	}
 }
 

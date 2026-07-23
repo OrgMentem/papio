@@ -268,6 +268,67 @@ func TestAdoptDownloadValidatesAndPromotes(t *testing.T) {
 	}
 }
 
+func TestAdoptDownloadResolvesSatisfiedHandoffActions(t *testing.T) {
+	svc, jobs := newTestService(t)
+	svc.Validate = func(context.Context, string, string, work.Work) (pdf.ValidationReport, error) {
+		return pdf.ValidationReport{
+			Payload:    pdf.PayloadReport{OK: true},
+			Structural: pdf.StructuralReport{Valid: true, Pages: 2},
+			Text:       pdf.TextReport{Chars: 2000},
+			Identity:   pdf.IdentityDecision{Result: pdf.IdentityReview},
+		}, nil
+	}
+	ctx := context.Background()
+	id := parkAwaitingHuman(t, jobs, "wr_adopt_resolves_handoff")
+	handoffID, err := jobs.OpenHumanAction(ctx, id, "openurl_handoff", "institutional handoff")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(svc.Config.EffectiveAdoptionRoot(), id)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "paper.pdf")
+	if err := os.WriteFile(path, pdfBytes("handoff satisfied"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.AdoptDownload(ctx, id, path); err != nil {
+		t.Fatalf("adopt: %v", err)
+	}
+	row, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.State != job.StateNeedsReview {
+		t.Fatalf("adopted job state = %s, want needs_review", row.State)
+	}
+	actions, err := jobs.ListHumanActions(ctx, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var handoff, review *job.HumanAction
+	for i := range actions {
+		action := &actions[i]
+		if action.JobID != id {
+			continue
+		}
+		switch action.ID {
+		case handoffID:
+			handoff = action
+		default:
+			if action.Kind == "verify_identity" {
+				review = action
+			}
+		}
+	}
+	if handoff == nil || handoff.Status != "resolved" {
+		t.Fatalf("handoff action = %+v, want resolved", handoff)
+	}
+	if review == nil || review.Status != "open" {
+		t.Fatalf("verify_identity action = %+v, want open", review)
+	}
+}
+
 func TestAcceptedAdoptionReviewReusesExactContentOverride(t *testing.T) {
 	svc, jobs := newTestService(t)
 	svc.Config.Browser.OpenURLBase = "https://resolver.example.edu/openurl"

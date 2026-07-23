@@ -166,6 +166,14 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 
 	entries := resolverEntries(cfg, metadataClient)
 	service := app.New(cfg, jobs, artifacts, budgets)
+	discoveryBackends := discoverySources(cfg)
+	discoveryClient := discovery.NewMulti(discoveryBackends...)
+	for _, backend := range discoveryBackends {
+		if lookup, ok := backend.(app.WorkLookup); ok {
+			service.Discovery = lookup
+			break
+		}
+	}
 	var senders []notify.Sender
 	if cfg.Notify.Enabled {
 		senders = append(senders, notify.NewMacOS())
@@ -232,7 +240,6 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 		Command: cfg.Hooks.OnReady,
 		Timeout: time.Duration(cfg.Hooks.TimeoutSeconds) * time.Second,
 	}
-	discoveryClient := discovery.NewMulti(discoverySources(cfg)...)
 	watches := watch.NewStore(db)
 	watchRunner := &watch.Runner{
 		Store: watches, Discovery: discoveryClient, Lookup: zotioService, Submitter: service,

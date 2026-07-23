@@ -24,9 +24,22 @@ execution records in `notes/acquisition-stack-plan.md`.
   stranded by a crash mid-transition: an `awaiting_human` job with no open
   action, or one still offering an institutional route its own event history
   already disproved, is sent back to resolving to finish honestly.
+- DOI-only submissions now get their title, authors, and year backfilled from
+  one bounded OpenAlex lookup at resolve time, so inbox rows — especially
+  identity-verification prompts — show what the paper is supposed to be
+  instead of a bare DOI.
 
 ### Fixed
 
+- Adopting a browser download now resolves the handoff action it satisfied.
+  Previously the "sign in to your institution" row lingered beside the
+  verification prompt for the same paper, and dismissing that stale row
+  cancelled the whole job — deleting the quarantined PDF that was waiting for
+  human review.
+- Dismissing a human action cancels its job only when the job is actually
+  parked on that action (`awaiting_human` for handoff/manual-download rows,
+  `needs_review` for identity verification). A stale action from an earlier
+  state is closed without disturbing the job's live work.
 - `papio actions open` no longer fails with a bare "exit status 1" when the
   browser cannot be launched: the error now says the browser handoff could not
   open and points at enabling the extension and `papio doctor`.

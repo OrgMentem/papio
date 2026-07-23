@@ -1493,13 +1493,11 @@ func normalizeReviewBusy(err error) error {
 	return err
 }
 
-// DismissHumanAction atomically closes any open human action (compare-and-swap
-// on revision) and cancels its job. Unlike ResolveReviewCAS this is not
-// restricted to verify_identity — it is the generic "give up on this" escape
-// hatch for every action kind (manual_download, openurl_handoff, an orphaned
-// verify_identity with no usable quarantine binding, ...). Cancel is its own
-// idempotent, retry-safe operation, so a job that is already terminal for
-// some other reason is left untouched; only the stale action needs closing.
+// DismissHumanAction atomically closes an open human action (compare-and-swap
+// on revision). It cancels the job only when that job is currently parked on
+// the dismissed action: awaiting_human for openurl_handoff, manual_download,
+// or openurl_available; or needs_review for verify_identity. A stale action
+// from another state is closed without disturbing the job's live work.
 func (js *Store) DismissHumanAction(ctx context.Context, actionID, expectedRevision int64) (jobID string, err error) {
 	if actionID <= 0 || expectedRevision <= 0 {
 		return "", errors.New("dismiss requires a positive action ID and revision")
@@ -1510,7 +1508,12 @@ func (js *Store) DismissHumanAction(ctx context.Context, actionID, expectedRevis
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	if err := tx.QueryRowContext(ctx, `SELECT job_id FROM human_actions WHERE id = ?`, actionID).Scan(&jobID); err != nil {
+	var actionKind, state string
+	if err := tx.QueryRowContext(ctx, `
+		SELECT human_actions.job_id, human_actions.kind, jobs.state
+		FROM human_actions
+		JOIN jobs ON jobs.id = human_actions.job_id
+		WHERE human_actions.id = ?`, actionID).Scan(&jobID, &actionKind, &state); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return "", fmt.Errorf("%w: human action %d does not exist", ErrConflict, actionID)
 		}
@@ -1540,7 +1543,21 @@ func (js *Store) DismissHumanAction(ctx context.Context, actionID, expectedRevis
 	if err := tx.Commit(); err != nil {
 		return "", normalizeReviewBusy(err)
 	}
-	return jobID, js.Cancel(ctx, jobID, "user_dismissed")
+	if dismissalCancelsParkedJob(actionKind, state) {
+		return jobID, js.Cancel(ctx, jobID, "user_dismissed")
+	}
+	return jobID, nil
+}
+
+func dismissalCancelsParkedJob(actionKind, state string) bool {
+	switch state {
+	case StateAwaitingHuman:
+		return actionKind == "openurl_handoff" || actionKind == "manual_download" || actionKind == "openurl_available"
+	case StateNeedsReview:
+		return actionKind == "verify_identity"
+	default:
+		return false
+	}
 }
 
 // HumanAction is one pending or resolved human step.

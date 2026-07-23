@@ -117,6 +117,45 @@ func TestSearchMapsRecordedOpenAlexWorks(t *testing.T) {
 	}
 }
 
+func TestLookupWorkMapsDOISeedFixture(t *testing.T) {
+	fixture, err := os.ReadFile("testdata/openalex_work_by_doi.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var gotPath string
+	var gotQuery url.Values
+	var gotUserAgent string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotQuery = r.URL.Query()
+		gotUserAgent = r.UserAgent()
+		_, _ = w.Write(fixture)
+	}))
+	defer server.Close()
+
+	client := NewWithOptions(Options{
+		Client: http.DefaultClient, ContactEmail: "researcher@example.org", BaseURL: server.URL + "/works",
+		Version: "9.8.7",
+	})
+	got, err := client.LookupWork(context.Background(), "https://doi.org/10.1000/example.doi")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotPath != "/works/doi:10.1000/example.doi" {
+		t.Fatalf("lookup path = %q", gotPath)
+	}
+	if gotQuery.Get("mailto") != "researcher@example.org" {
+		t.Fatalf("mailto = %q", gotQuery.Get("mailto"))
+	}
+	if gotUserAgent != "papio/9.8.7 (mailto:researcher@example.org)" {
+		t.Fatalf("User-Agent = %q", gotUserAgent)
+	}
+	if got.Work.DOI != "10.1000/example.doi" || got.Work.Title != "A resilient discovery paper" ||
+		got.OpenAlexID != "https://openalex.org/W2741809807" || got.Source != "openalex" {
+		t.Fatalf("discovered work = %+v", got)
+	}
+}
+
 func TestSearchSlimSelectsOnlyWatchFields(t *testing.T) {
 	var query url.Values
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

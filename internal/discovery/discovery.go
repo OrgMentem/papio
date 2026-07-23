@@ -165,6 +165,43 @@ func (c *Client) Search(ctx context.Context, params SearchParams) ([]DiscoveredW
 	return works, nil
 }
 
+// LookupWork retrieves one OpenAlex work by DOI using the same bounded,
+// polite request path as Search.
+func (c *Client) LookupWork(ctx context.Context, doi string) (DiscoveredWork, error) {
+	if c == nil || c.client == nil {
+		return DiscoveredWork{}, errors.New("discovery: HTTP client is not configured")
+	}
+	if c.email == "" {
+		return DiscoveredWork{}, errors.New("discovery: contact email is required for the OpenAlex polite pool")
+	}
+	normalized, err := work.NormalizeDOI(doi)
+	if err != nil {
+		return DiscoveredWork{}, fmt.Errorf("discovery: invalid DOI: %w", err)
+	}
+	requestCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	endpoint, err := c.seedURL(normalized)
+	if err != nil {
+		return DiscoveredWork{}, err
+	}
+	resp, err := c.do(requestCtx, endpoint)
+	if err != nil {
+		return DiscoveredWork{}, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode == http.StatusNotFound {
+		return DiscoveredWork{}, fmt.Errorf("discovery: OpenAlex DOI %q was not found", normalized)
+	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return DiscoveredWork{}, fmt.Errorf("discovery: OpenAlex returned HTTP %d looking up DOI %q", resp.StatusCode, normalized)
+	}
+	var record workRecord
+	if err := decodeBoundedJSON(resp.Body, c.maxBody, &record); err != nil {
+		return DiscoveredWork{}, fmt.Errorf("discovery: invalid OpenAlex work response: %w", err)
+	}
+	return discoveredWork(record), nil
+}
+
 func (c *Client) do(ctx context.Context, endpoint *url.URL) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
 	if err != nil {

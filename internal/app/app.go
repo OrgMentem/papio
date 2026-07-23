@@ -22,6 +22,7 @@ import (
 	"papio/internal/artifact"
 	"papio/internal/budget"
 	"papio/internal/config"
+	"papio/internal/discovery"
 	"papio/internal/fetch"
 	"papio/internal/hook"
 	"papio/internal/job"
@@ -49,6 +50,11 @@ type AutoImporter interface {
 // resolvers use those identifiers to find acquisition candidates.
 type MetadataEnricher interface {
 	Enrich(context.Context, work.Work) (work.Work, bool, error)
+}
+
+// WorkLookup retrieves discovery metadata for a requested DOI.
+type WorkLookup interface {
+	LookupWork(context.Context, string) (discovery.DiscoveredWork, error)
 }
 
 // classifiedAutoImportError is implemented by the bootstrap decorator. It
@@ -82,6 +88,7 @@ type Service struct {
 	Budgets      *budget.Manager
 	Resolvers    []ResolverEntry
 	Enricher     MetadataEnricher
+	Discovery    WorkLookup
 	Fetch        FetchFunc
 	Validate     ValidateFunc
 	AutoImporter AutoImporter
@@ -349,6 +356,9 @@ func reviewedFetchResult(binding *job.HumanActionBinding) (fetch.Result, bool) {
 }
 
 func (s *Service) resolve(ctx context.Context, row *job.Row) (map[string]resolver.Candidate, time.Time, error) {
+	if err := s.enrichDOIWork(ctx, row); err != nil {
+		return nil, time.Time{}, err
+	}
 	if err := s.Jobs.ResetCandidates(ctx, row.ID); err != nil {
 		return nil, time.Time{}, err
 	}
@@ -531,6 +541,32 @@ func (s *Service) resolveSiblings(ctx context.Context, row *job.Row) []resolver.
 		if len(valid) > 0 {
 			return valid
 		}
+	}
+	return nil
+}
+
+func (s *Service) enrichDOIWork(ctx context.Context, row *job.Row) error {
+	if s.Discovery == nil || strings.TrimSpace(row.Work.Title) != "" || strings.TrimSpace(row.Work.DOI) == "" {
+		return nil
+	}
+	discovered, err := s.Discovery.LookupWork(ctx, row.Work.DOI)
+	if err != nil {
+		return nil
+	}
+	changed, err := s.Jobs.EnrichWorkRequestMetadata(
+		ctx, row.WorkRequestID, discovered.Work.Title, discovered.Work.Authors, discovered.Work.Year,
+	)
+	if err != nil || !changed {
+		return err
+	}
+	if strings.TrimSpace(row.Work.Title) == "" {
+		row.Work.Title = discovered.Work.Title
+	}
+	if len(row.Work.Authors) == 0 {
+		row.Work.Authors = append([]string(nil), discovered.Work.Authors...)
+	}
+	if row.Work.Year == 0 {
+		row.Work.Year = discovered.Work.Year
 	}
 	return nil
 }
