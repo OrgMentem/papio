@@ -762,29 +762,23 @@
         margin-right: var(--space-2);
       }
 
-      #access-legend {
-        align-items: baseline;
-        display: flex;
-        flex: 1 1 100%;
-        flex-wrap: wrap;
-        gap: var(--space-1) var(--space-3);
-      }
-
-      #access-legend b {
-        color: var(--color-context);
-        font-weight: 600;
-      }
-
-      footer .footer-label {
-        color: var(--color-brand-accent);
-        font-weight: 700;
-        letter-spacing: 0.04em;
-        text-transform: uppercase;
-      }
-
       #shortcut-help {
         flex: 1 1 auto;
         min-width: 0;
+        white-space: nowrap;
+      }
+
+      #shortcut-help kbd {
+        background: var(--color-surface);
+        border: 1px solid var(--color-border);
+        border-radius: var(--radius-control);
+        display: inline-block;
+        font-family: inherit;
+        font-size: var(--font-size-label);
+        line-height: 1.4;
+        min-width: 1.4em;
+        padding: 0 var(--space-1);
+        text-align: center;
       }
 
       #generated-at {
@@ -917,15 +911,9 @@
         <span class="item-status" data-status="watch_hit" aria-hidden="true">✶</span><span>watch hit</span>
         <span class="item-status" data-status="retraction" aria-hidden="true">!</span><span>retraction</span>
       </p>
-      <p id="access-legend">
-        <strong class="footer-label">Access:</strong>
-        <span><b>open access</b> — no login needed</span>
-        <span><b>institutional</b> — sign in to your institution first</span>
-      </p>
       <p id="shortcut-help">
-        <strong class="footer-label">Keyboard:</strong> j/k select · a acts on the selected item (accept, acquire, or
-        open — whichever applies) · d dismisses or rejects · o opens it. Paused while typing
-        or a dialog is open.
+        <kbd>j</kbd>/<kbd>k</kbd> select · <kbd>a</kbd> act · <kbd>d</kbd> dismiss ·
+        <kbd>o</kbd> open
       </p>
       <time id="generated-at">generated at —</time>
     </footer>
