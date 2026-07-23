@@ -16,6 +16,36 @@ import (
 	"papio/internal/work"
 )
 
+func TestAccessHintClassifiesOpenAndInstitutionalAccess(t *testing.T) {
+	tests := []struct {
+		name   string
+		action job.HumanAction
+		want   string
+	}{
+		{
+			name:   "open access",
+			action: job.HumanAction{RequiresAuth: false, BlockedBy: "anti_bot"},
+			want:   "\topen access — no login needed",
+		},
+		{
+			name:   "institutional",
+			action: job.HumanAction{RequiresAuth: true, BlockedBy: "paywall"},
+			want:   "\tsign in to your institution first, then 'papio actions open'",
+		},
+		{
+			name: "unclassified",
+			want: "",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := accessHint(test.action); got != test.want {
+				t.Fatalf("access hint = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
 func TestActionURLsSelectAwaitingActionsMostRecentAndDryRun(t *testing.T) {
 	base := "https://openurl.example.test/resolve"
 	instituteBase := "https://institute.example.test/resolve"

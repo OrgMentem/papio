@@ -83,9 +83,19 @@ func TestExhaustedCandidatesRouteToInstitutionalHandoff(t *testing.T) {
 			if row.State != job.StateAwaitingHuman {
 				t.Fatalf("state = %s, want awaiting_human", row.State)
 			}
-			if !openActionKinds(t, jobs, row.ID)["openurl_handoff"] {
-				t.Fatal("no open openurl_handoff action")
+			actions, err := jobs.ListHumanActions(context.Background(), true)
+			if err != nil {
+				t.Fatal(err)
 			}
+			for _, action := range actions {
+				if action.JobID == row.ID && action.Kind == "openurl_handoff" {
+					if !action.RequiresAuth || action.BlockedBy != "paywall" {
+						t.Fatalf("handoff access = requires_auth %t, blocked_by %q, want true/paywall", action.RequiresAuth, action.BlockedBy)
+					}
+					return
+				}
+			}
+			t.Fatal("missing institutional handoff")
 		})
 	}
 }
@@ -121,6 +131,9 @@ func TestBotBlockedOACandidateRoutesToBrowserHandoff(t *testing.T) {
 			if action.Detail != OABrowserHandoffActionDetail(oaURL) {
 				t.Fatalf("handoff detail = %q, want OA browser marker and URL", action.Detail)
 			}
+			if action.RequiresAuth || action.BlockedBy != "anti_bot" {
+				t.Fatalf("handoff access = requires_auth %t, blocked_by %q, want false/anti_bot", action.RequiresAuth, action.BlockedBy)
+			}
 			return
 		}
 	}
@@ -154,6 +167,9 @@ func TestForbiddenNonOACandidateKeepsInstitutionalHandoff(t *testing.T) {
 		if action.JobID == row.ID && action.Kind == "openurl_handoff" {
 			if action.Detail != InstitutionalOpenURLHandoffDetail {
 				t.Fatalf("handoff detail = %q, want institutional marker", action.Detail)
+			}
+			if !action.RequiresAuth || action.BlockedBy != "paywall" {
+				t.Fatalf("handoff access = requires_auth %t, blocked_by %q, want true/paywall", action.RequiresAuth, action.BlockedBy)
 			}
 			return
 		}

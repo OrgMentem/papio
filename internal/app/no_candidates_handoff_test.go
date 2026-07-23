@@ -45,6 +45,9 @@ func TestNoCandidatesRoutesToInstitutionalHandoff(t *testing.T) {
 	for _, a := range actions {
 		if a.JobID == id && a.Kind == "openurl_handoff" {
 			found = true
+			if !a.RequiresAuth || a.BlockedBy != "paywall" {
+				t.Fatalf("handoff access = requires_auth %t, blocked_by %q, want true/paywall", a.RequiresAuth, a.BlockedBy)
+			}
 		}
 	}
 	if !found {
