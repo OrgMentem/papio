@@ -1056,19 +1056,22 @@ func (b *Bridge) outcome(ctx context.Context, jobID string, p *protocol.Provider
 		return b.jobs.Cancel(ctx, jobID, "browser_cancelled")
 
 	case "no_entitlement", "document_delivery_available":
-		if fellBack, err := b.fallbackOAHandoff(ctx, jobID, p.Outcome); err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return nil
-			}
-			return err
-		} else if fellBack {
-			return nil
-		}
 		requeued, err := b.institutionalRouteRequeued(ctx, jobID)
 		if err != nil {
 			return err
 		}
 		if !requeued {
+			// The institutional route has not been disproven yet: an OA
+			// browser action still earns its one institutional fallback,
+			// and an institutional action earns one rediscovery pass.
+			if fellBack, err := b.fallbackOAHandoff(ctx, jobID, p.Outcome); err != nil {
+				if errors.Is(err, sql.ErrNoRows) {
+					return nil
+				}
+				return err
+			} else if fellBack {
+				return nil
+			}
 			if err := b.jobs.RecordEvent(ctx, jobID, "browser.no_entitlement_requeue", map[string]any{"outcome": p.Outcome}); err != nil {
 				return err
 			}
@@ -1077,6 +1080,9 @@ func (b *Bridge) outcome(ctx context.Context, jobID string, p *protocol.Provider
 			}
 			return b.leaveHandoff(ctx, jobID, job.StateResolving, "no_entitlement_rediscovery")
 		}
+		// The route already proved empty. Never convert a rediscovered OA
+		// action back to that institutional route and never requeue again:
+		// resolve whatever handoff reported this and park terminally.
 		if err := b.resolveHandoff(ctx, jobID, "resolved"); err != nil {
 			return err
 		}

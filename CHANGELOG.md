@@ -16,9 +16,14 @@ execution records in `notes/acquisition-stack-plan.md`.
   document delivery), the daemon now re-enters resolving once and lets the
   existing sibling discovery look for an open-access copy of an alternate
   version before giving up. A durable `browser.no_entitlement_requeue` job
-  event guards the retry: a route that already proved empty is never offered
-  again, and the job then parks `unavailable` with terminal reason
-  `no_entitlement` and the honest no-access guidance.
+  event guards the retry: once the route proved empty, later no-entitlement
+  reports — including from a rediscovered open-access handoff — park the job
+  `unavailable` with terminal reason `no_entitlement` and the honest
+  no-access guidance instead of offering that route again.
+- A maintenance pass (run at startup and once a minute) heals handoff parks
+  stranded by a crash mid-transition: an `awaiting_human` job with no open
+  action, or one still offering an institutional route its own event history
+  already disproved, is sent back to resolving to finish honestly.
 
 ### Fixed
 

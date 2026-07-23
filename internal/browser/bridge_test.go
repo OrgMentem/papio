@@ -1333,6 +1333,75 @@ func TestInstitutionalNoEntitlementRequeuesExactlyOnce(t *testing.T) {
 	}
 }
 
+func TestRequeuedRouteNeverConvertsOAHandoffBackToInstitution(t *testing.T) {
+	const oaURL = "https://oa.example.org/articles/alternate-version.pdf"
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	id := park(t, jobs, "wr_oa_after_requeue", handoffWork())
+	runSync(t, b, hello())
+
+	// The institutional route proves empty and earns its one rediscovery pass.
+	runSync(t, b, inFrame(t, protocol.MsgProviderOutcome, id, map[string]any{"outcome": "no_entitlement"}))
+	row, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.State != job.StateResolving {
+		t.Fatalf("state after first no_entitlement = %s, want resolving", row.State)
+	}
+
+	// Rediscovery finds a bot-blocked OA alternate and re-parks with an OA action.
+	if _, err := jobs.OpenHumanAction(ctx, id, handoffActionKind, app.OABrowserHandoffActionDetail(oaURL)); err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.Transition(ctx, id, job.StateResolving, job.StateAwaitingHuman,
+		map[string]any{"reason": "open_access_browser_handoff"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The OA alternate also reports no_entitlement. The proven-empty
+	// institutional route must not be resurrected via the OA fallback.
+	msgs, _ := runSync(t, b, inFrame(t, protocol.MsgProviderOutcome, id, map[string]any{"outcome": "no_entitlement"}))
+	if countType(msgs, protocol.MsgJobOffer) != 0 {
+		t.Fatal("proven-empty institutional route was offered again")
+	}
+	row, err = jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.State != job.StateUnavailable || row.TerminalReason != "no_entitlement" {
+		t.Fatalf("state/reason = %s/%q, want unavailable/no_entitlement", row.State, row.TerminalReason)
+	}
+	actions, err := jobs.ListHumanActions(ctx, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, action := range actions {
+		if action.Status == "open" {
+			t.Fatalf("action %d (%s) left open after terminal no_entitlement: %+v", action.ID, action.Kind, action)
+		}
+	}
+	events, err := jobs.Events(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requeues, fallbacks := 0, 0
+	for _, event := range events {
+		switch event["kind"] {
+		case "browser.no_entitlement_requeue":
+			requeues++
+		case "browser.oa_handoff_fallback":
+			fallbacks++
+		}
+	}
+	if requeues != 1 {
+		t.Fatalf("requeue events = %d, want 1", requeues)
+	}
+	if fallbacks != 0 {
+		t.Fatalf("OA action fell back to the proven-empty institutional route %d times, want 0", fallbacks)
+	}
+}
+
 func TestJobRejectEndsHandoffUnavailable(t *testing.T) {
 	b, jobs, _, _ := newBridge(t)
 	ctx := context.Background()
