@@ -488,11 +488,53 @@ func TestRetryableFetchParksJobAndPersistsNoURL(t *testing.T) {
 	}
 }
 
-func TestLandingOnlyRequiresHumanAction(t *testing.T) {
+func TestOALandingRoutesToBrowserHandoff(t *testing.T) {
 	svc, jobs := newTestService(t)
+	svc.Config.AccessMode = config.ModeDelegated
+	const landing = "https://example.test/landing"
 	svc.Resolvers = []ResolverEntry{{Adapter: &fakeResolver{name: "fixture", cands: []resolver.Candidate{{
-		Source: "fixture", URL: "https://example.test/landing", Version: resolver.VersionPublished,
+		Source: "fixture", URL: landing, Version: resolver.VersionPublished,
 		AccessBasis: resolver.AccessOpen, ReuseLicense: "unknown", Direct: false, IdentityConfidence: 1,
+	}}}, Policy: config.Source{Enabled: true}}}
+	fetches := 0
+	svc.Fetch = fakeDownload(&fetches)
+	svc.Validate = passValidation()
+	id, _ := svc.Submit(context.Background(), protocol.WorkRequest{
+		SchemaVersion: protocol.WorkRequestSchemaVersion, RequestID: "wr_oa_landing_001",
+		Identifiers: &protocol.Identifiers{DOI: "10.1002/example"}, Title: "Example", Authors: []string{"A"}, Year: 2024,
+	})
+	row, _ := jobs.ClaimNext(context.Background(), "w", time.Minute)
+	if err := svc.Process(context.Background(), row); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := jobs.Get(context.Background(), id)
+	// The daemon never fetches a landing page server-side; the extension's
+	// provider adapters resolve the file from the open-access page.
+	if got.State != job.StateAwaitingHuman || fetches != 0 {
+		t.Fatalf("oa landing result = %+v fetches=%d", got, fetches)
+	}
+	actions, _ := jobs.ListHumanActions(context.Background(), true)
+	if len(actions) != 1 || actions[0].JobID != id || actions[0].Kind != "openurl_handoff" {
+		t.Fatalf("actions = %+v, want one openurl_handoff", actions)
+	}
+	// The handoff must carry the OA browser URL (no login) so the bridge opens
+	// the page itself rather than constructing an institutional resolver link.
+	if actions[0].Detail != OABrowserHandoffActionDetail(landing) {
+		t.Fatalf("handoff detail = %q, want OA browser handoff for %q", actions[0].Detail, landing)
+	}
+	if actions[0].RequiresAuth {
+		t.Fatalf("OA browser handoff must not require auth: %+v", actions[0])
+	}
+}
+
+func TestPaywalledLandingRequiresManualDownload(t *testing.T) {
+	svc, jobs := newTestService(t)
+	// No institutional OpenURL base: a non-OA landing page cannot be browser-
+	// fetched (no adapter path) nor handed to a resolver, so it stays a manual
+	// download rather than opening a tab that cannot resolve to a file.
+	svc.Resolvers = []ResolverEntry{{Adapter: &fakeResolver{name: "fixture", cands: []resolver.Candidate{{
+		Source: "fixture", URL: "https://paywall.test/landing", Version: resolver.VersionPublished,
+		AccessBasis: resolver.AccessInstitutional, ReuseLicense: "unknown", Direct: false, IdentityConfidence: 1,
 	}}}, Policy: config.Source{Enabled: true}}}
 	fetches := 0
 	svc.Fetch = fakeDownload(&fetches)

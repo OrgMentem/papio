@@ -31,6 +31,14 @@ execution records in `notes/acquisition-stack-plan.md`.
 
 ### Fixed
 
+- Open-access works whose only candidate is a landing page (the publisher's
+  DOI page rather than a direct PDF) now route to the browser handoff instead
+  of a dead-end manual download. The daemon cannot fetch an HTML landing page
+  as a file, but the extension's provider adapters resolve the PDF from that
+  page — so an open-access landing on a supported provider is handed to the
+  browser (no login) and downloaded automatically. Paywalled landing pages
+  still park as a manual download or take the institutional handoff.
+
 - Single-word author names (bare family names and mononyms) no longer sink
   metadata corroboration: Europe PMC and OpenAlex title-search matching and
   Crossref enrichment now compare them by name instead of rejecting the whole

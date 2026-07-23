@@ -660,6 +660,16 @@ func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[st
 		}
 		if !candidate.Direct {
 			manual = true
+			// A non-direct candidate is a landing page the daemon cannot fetch
+			// as a file. When it is open access (no institutional login), the
+			// extension's provider adapters can still resolve the PDF from the
+			// page — so keep the first such URL as the browser-eligible OA URL
+			// and route it to the OA browser handoff below instead of a
+			// dead-end manual_download. Paywalled landing pages keep the manual
+			// route (or the institutional handoff exhaustedCandidates builds).
+			if oaBrowserURL == "" && candidate.AccessBasis == resolver.AccessOpen && strings.HasPrefix(candidate.URL, "https://") {
+				oaBrowserURL = candidate.URL
+			}
 			_ = s.Jobs.MarkCandidate(ctx, stored.ID, "skipped")
 			continue
 		}
@@ -746,7 +756,7 @@ func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[st
 		// Rejection returned the job to fetching to try the next candidate.
 	}
 
-	if manual {
+	if manual && oaBrowserURL == "" {
 		if _, err := s.Jobs.OpenHumanAction(ctx, row.ID, "manual_download", "a resolver returned a landing page but no verified direct PDF", job.WithAccessClassification(false, "landing_page")); err != nil {
 			return err
 		}
