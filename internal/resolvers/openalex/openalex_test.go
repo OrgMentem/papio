@@ -234,6 +234,22 @@ func TestSameAuthorMatchesMononyms(t *testing.T) {
 	}
 }
 
+// Sibling matching is deliberately surname-only (see sharesAuthorSurname); a
+// mononym contributes its name as a surname so a mononym-authored work can
+// sibling-match on its sole author. The exact-title and ±3-year gates in
+// ResolveSiblings bound the looseness.
+func TestSharesAuthorSurnameIncludesMononyms(t *testing.T) {
+	if !sharesAuthorSurname([]string{"Madonna"}, []string{"Madonna"}) {
+		t.Fatal("mononym surname overlap not detected")
+	}
+	if !sharesAuthorSurname([]string{"Madonna"}, []string{"John Madonna"}) {
+		t.Fatal("mononym must key as a surname under surname-only matching")
+	}
+	if sharesAuthorSurname([]string{"Madonna"}, []string{"John Smith"}) {
+		t.Fatal("unrelated authors reported as overlapping")
+	}
+}
+
 // The OpenAlex works API is free in the polite pool: a contact email is the
 // only requirement and the api_key parameter is optional premium capacity —
 // the same stance as the discovery client.
