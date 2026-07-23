@@ -16,6 +16,8 @@ for the full pre-split extension history.
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-07-23
+
 ### Fixed
 
 - **ACM Digital Library articles now download autonomously and paywalled ACM

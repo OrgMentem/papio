@@ -252,9 +252,7 @@ papio daemon stop
 
 ## `papio doctor`
 
-Check acquisition readiness and local integrations. Autostarts the daemon like
-other papio commands; when the daemon cannot start, the dependent extension,
-native-host, zotio, and database checks collapse into a single skipped line.
+Check acquisition readiness and local integrations
 
 ```
 papio doctor
