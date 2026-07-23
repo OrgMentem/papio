@@ -382,7 +382,7 @@ def release_manifest(args: argparse.Namespace) -> None:
             },
             "zotio": {
                 "commit": args.zotio_commit,
-                "version": args.version,
+                "version": args.zotio_version,
                 "version_injected": True,
                 "version_ldflag": "zotio/internal/cli.version",
                 "artifact": "zotio-darwin-arm64",
@@ -484,6 +484,7 @@ def parser() -> argparse.ArgumentParser:
     metadata.add_argument("--papio-commit", required=True)
     metadata.add_argument("--papio-version", required=True)
     metadata.add_argument("--zotio-commit", required=True)
+    metadata.add_argument("--zotio-version", required=True)
     metadata.add_argument("--extension-version", required=True)
     metadata.add_argument("--extension-id", default="")
     metadata.add_argument("--license-method", required=True)

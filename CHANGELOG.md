@@ -8,6 +8,13 @@ so older sections below include extension entries. The initial release entry
 is synthesized from the complete `papio` and `zotio` Git histories and the
 execution records in `notes/acquisition-stack-plan.md`.
 
+## [0.10.1] - 2026-07-23
+
+### Fixed
+
+- Direct-distribution release manifests now record the bundled zotio version,
+  rather than incorrectly repeating the papio release version.
+
 ## [0.10.0] - 2026-07-23
 
 ### Added

@@ -250,6 +250,7 @@ generate_release_manifest() {
     --papio-commit "$PAPIO_COMMIT" \
     --papio-version "$PAPIO_VERSION" \
     --zotio-commit "$ZOTIO_COMMIT" \
+    --zotio-version "$ZOTIO_VERSION" \
     --extension-version "$EXTENSION_VERSION" \
     --extension-id "$PINNED_EXTENSION_ID" \
     --license-method "$LICENSE_METHOD"
