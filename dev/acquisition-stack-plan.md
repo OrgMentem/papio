@@ -894,6 +894,17 @@ Live-verified: JSTOR delivered 2 papers end-to-end (attached to Zotero, no gestu
 - **Identity confirmation for opaque filenames**: EBSCO's generic `retrieve.pdf` gives the identity gate nothing to match, forcing `needs_review`. Consider confirming identity from the job's known metadata (title/DOI) or the PDF's embedded text so entitled api downloads can auto-import.
 - **EBSCO record-page path**: `download.method` is now `api` (viewer). A record-page `article` landing can't api-download (idPattern is viewer-only) and would stay assisted; harmless since the live flow lands on the viewer, but worth confirming the resolver always routes to the viewer.
 
+**Follow-up status (2026-07-23):** the adoption binding was fixed the same day
+in `a4aeab3` (download ID bound to its job synchronously in `onDownloadCreated`
+before any await, so `onDeterminingFilename` relocates cross-origin
+content-disposition renames into `papio/<job>/` by ID); a regression test now
+pins the exact EBSCO shape (tabless cross-origin item, `retrieve.pdf` rename,
+`download_complete` reporting the steered basename). The "identity confirmation
+for opaque filenames" item was a misdiagnosis: PDF identity matches front-matter
+text only and never reads the filename — the observed `needs_review` came from
+the misfiled download's empty artifact, not the name. Remaining: one live EBSCO
+re-verification in a real session, and the record-page routing confirmation.
+
 ## Release UX shape: headless-most operation, browser plane, detection posture (2026-07-17)
 
 Feasibility analysis for the public-release UX ("do most work invisibly, surface only when the user is needed"). Grounded in current code; decisions locked below.

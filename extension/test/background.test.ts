@@ -1327,6 +1327,69 @@ test("Firefox adapter API downloads remain filename-controlled and report normal
   expect(h.frames().some((frame) => frame.type === "download_complete" && frame.job_id === "job_0004_firefox_api")).toBe(true);
 });
 
+test("a cross-origin api download with a content-disposition rename steers into papio/<job>/ by ID", async () => {
+  // Regression for the EBSCO shape (research.ebsco.com -> content.ebscohost.com):
+  // the provider redirect changes origin before onDeterminingFilename, the item
+  // carries no tabId, and the server renames the file (retrieve.pdf). Steering
+  // must come from the creation-bound download ID, never tab/URL heuristics.
+  const h = makeHarness();
+  const crossOriginPDF = "https://content.aggregator.example/cds/retrieve?db=a9h";
+  const apiAdapter: AdapterSpec = {
+    ...PROVIDER_ADAPTER,
+    download: {
+      selector: "meta[name='citation_pdf_url']",
+      requireKind: "article",
+      method: "api",
+      urlTemplate: `https://${PROVIDER_HOST}/api/article`,
+      jsonField: "pdf_url",
+    },
+  };
+  h.deps.adapterSpecs.push(apiAdapter);
+  h.deps.permissions.contains = async () => true;
+  h.deps.scripting.executeScript = async (injection) =>
+    injection.func === interpret ? [{ result: { kind: "article" } }] : [{ result: crossOriginPDF }];
+  await h.bridge.start();
+  await h.port.inbound(jobOffer("job_0004b_xorigin_api"));
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  const articleURL = `https://${PROVIDER_HOST}/stable/article`;
+  await h.tabs.onUpdated.emit(tabID, { url: articleURL, status: "complete" }, { id: tabID, url: articleURL });
+
+  expect(h.downloads.started).toEqual([
+    {
+      url: crossOriginPDF,
+      filename: "papio/job_0004b_xorigin_api/paper.pdf",
+      conflictAction: "uniquify",
+      saveAs: false,
+    },
+  ]);
+
+  // Chrome fires onCreated (still the requested URL), then onDeterminingFilename
+  // with the server's content-disposition name and no tab correlation.
+  await h.downloads.onCreated.emit({ id: 901, url: crossOriginPDF, state: "in_progress" });
+  const suggestions: { filename: string; conflictAction: string }[] = [];
+  await h.downloads.onDeterminingFilename.emit(
+    { id: 901, url: crossOriginPDF, filename: "retrieve.pdf", state: "in_progress" },
+    (s) => suggestions.push(s),
+  );
+  expect(suggestions).toEqual([
+    { filename: "papio/job_0004b_xorigin_api/retrieve.pdf", conflictAction: "uniquify" },
+  ]);
+
+  h.downloads.items.set(901, {
+    id: 901,
+    filename: "/Users/x/Downloads/papio/job_0004b_xorigin_api/retrieve.pdf",
+    fileSize: 2_100_000,
+    mime: "application/pdf",
+    state: "complete",
+  });
+  await h.downloads.onChanged.emit({ id: 901, state: { current: "complete" } });
+
+  const complete = h.frames().find(
+    (frame) => frame.type === "download_complete" && frame.job_id === "job_0004b_xorigin_api",
+  );
+  expect(complete?.payload["filename"]).toBe("retrieve.pdf");
+});
+
 test("a PDF-viewer tab starts one download and closes after the adopted file completes", async () => {
   const h = makeHarness();
   await h.bridge.start();
