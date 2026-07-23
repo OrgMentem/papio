@@ -135,6 +135,27 @@ function manualAction(id: string, rank: number, title: string): TriageSnapshotIt
   };
 }
 
+function handoffAction(id: string, rank: number, requiresAuth: boolean): TriageSnapshotItem {
+  return {
+    kind: "human_action",
+    id,
+    rank,
+    title: "Browser handoff article",
+    facts: [{ label: "Action", text: "browser handoff ready" }],
+    links: [{ rel: "doi", url: "https://doi.org/10.1234/handoff" }],
+    ops: ["open"],
+    action_id: 19,
+    job_id: `job_handoff_${id.replace("action:", "")}`,
+    action_kind: "openurl_handoff",
+    job_state: "needs_review",
+    revision: 1,
+    sha256: "",
+    size_bytes: 0,
+    requires_auth: requiresAuth,
+    blocked_by: requiresAuth ? "paywall" : "anti_bot",
+  };
+}
+
 function retraction(id: string, rank: number, title: string): TriageSnapshotItem {
   return {
     kind: "retraction",
@@ -254,6 +275,109 @@ test("keyboard navigation moves rows and verify_identity is preview-gated and co
     expected_revision: 4,
     expected_sha256: sha256,
   });
+});
+
+test("institutional handoff Open uses the broker rather than its canonical DOI", async () => {
+  const item = handoffAction("action:institutional", 1, true);
+  const fixture = snapshot([item], {
+    counts: counts({ pending_total: 1, actions: 1, watch_hits: 0, retractions: 0 }),
+  });
+  const page = await inboxDocument((message) => {
+    if (message.type === "papio.handoff.open") return { ok: true, opened: true };
+    return snapshotReply(fixture, message);
+  });
+
+  expect(page.document.querySelector("[data-triage-item-id='action:institutional'] .item-citation a")?.getAttribute("href"))
+    .toBe("https://doi.org/10.1234/handoff");
+  page.document.querySelector<HTMLButtonElement>("[data-triage-item-id='action:institutional'] [data-operation='open']")?.click();
+  await settle();
+
+  expect(page.requests.filter((request) => request.type === "papio.handoff.open")).toEqual([{
+    type: "papio.handoff.open",
+    request: { job_id: "job_handoff_institutional" },
+  }]);
+  expect(page.opened).toEqual([]);
+  expect(page.document.getElementById("operation-status")?.textContent).toBe("Browser handoff opened.");
+});
+
+test("keyboard o sends an OA browser handoff through the broker", async () => {
+  const item = handoffAction("action:open-access", 1, false);
+  const fixture = snapshot([item], {
+    counts: counts({ pending_total: 1, actions: 1, watch_hits: 0, retractions: 0 }),
+  });
+  const page = await inboxDocument((message) => {
+    if (message.type === "papio.handoff.open") return { ok: true, opened: true };
+    return snapshotReply(fixture, message);
+  });
+
+  page.document.querySelector<HTMLElement>("[data-triage-item-id='action:open-access']")?.focus();
+  key(page.document, "o");
+  await settle();
+
+  expect(page.requests.filter((request) => request.type === "papio.handoff.open")).toEqual([{
+    type: "papio.handoff.open",
+    request: { job_id: "job_handoff_open-access" },
+  }]);
+  expect(page.opened).toEqual([]);
+});
+
+test("a handoff missing its job identifier is disabled and never falls back to its DOI", async () => {
+  const item = handoffAction("action:missing-job", 1, true);
+  delete item.job_id;
+  const fixture = snapshot([item], {
+    counts: counts({ pending_total: 1, actions: 1, watch_hits: 0, retractions: 0 }),
+  });
+  const page = await inboxDocument((message) => snapshotReply(fixture, message));
+  const open = page.document.querySelector<HTMLButtonElement>("[data-triage-item-id='action:missing-job'] [data-operation='open']");
+
+  expect(open?.disabled).toBe(true);
+  page.document.querySelector<HTMLElement>("[data-triage-item-id='action:missing-job']")?.focus();
+  key(page.document, "o");
+  await settle();
+
+  expect(page.requests.filter((request) => request.type === "papio.handoff.open")).toHaveLength(0);
+  expect(page.opened).toEqual([]);
+  expect(page.document.querySelector("[data-triage-item-id='action:missing-job'] .item-result")?.textContent)
+    .toBe("This browser handoff is missing its job identifier.");
+});
+
+test("a broker handoff rejection stays inline and leaves the action available", async () => {
+  const item = handoffAction("action:rejected", 1, true);
+  const failure = "Handoff could not be opened ".repeat(12);
+  const fixture = snapshot([item], {
+    counts: counts({ pending_total: 1, actions: 1, watch_hits: 0, retractions: 0 }),
+  });
+  const page = await inboxDocument((message) => {
+    if (message.type === "papio.handoff.open") return { ok: false, error: { code: "handoff_unavailable", message: failure } };
+    return snapshotReply(fixture, message);
+  });
+
+  page.document.querySelector<HTMLButtonElement>("[data-triage-item-id='action:rejected'] [data-operation='open']")?.click();
+  await settle();
+
+  const result = page.document.querySelector<HTMLElement>("[data-triage-item-id='action:rejected'] .item-result");
+  expect(result?.textContent).toBe(`${failure.slice(0, 237)}…`);
+  expect(result?.dataset.tone).toBe("error");
+  expect(page.document.querySelector("[data-triage-item-id='action:rejected']")).not.toBeNull();
+  expect(page.document.querySelector<HTMLButtonElement>("[data-triage-item-id='action:rejected'] [data-operation='open']")?.disabled).toBe(false);
+});
+
+test("ordinary manual and watch links still open directly", async () => {
+  const manual = manualAction("action:manual-open", 1, "Manual link");
+  manual.links = [{ rel: "landing", url: "https://example.test/manual" }];
+  manual.ops = ["open"];
+  const hit = watchHit("hit:open", 2, "Watch link", [{ rel: "doi", url: "https://doi.org/10.1234/watch" }]);
+  const fixture = snapshot([manual, hit], {
+    counts: counts({ pending_total: 2, actions: 1, watch_hits: 1, retractions: 0 }),
+  });
+  const page = await inboxDocument((message) => snapshotReply(fixture, message));
+
+  page.document.querySelector<HTMLButtonElement>("[data-triage-item-id='action:manual-open'] [data-operation='open']")?.click();
+  page.document.querySelector<HTMLElement>("[data-triage-item-id='hit:open']")?.focus();
+  key(page.document, "o");
+
+  expect(page.opened).toEqual(["https://example.test/manual", "https://doi.org/10.1234/watch"]);
+  expect(page.requests.filter((request) => request.type === "papio.handoff.open")).toHaveLength(0);
 });
 
 test("a conflict leaves an inline refresh result and re-requests the snapshot", async () => {

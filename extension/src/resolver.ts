@@ -3,6 +3,7 @@
 /** Result of inspecting an institutional resolver page. */
 export type ResolverRoute =
   | { kind: "routed"; service: string }
+  | { kind: "no_entitlement" }
   | { kind: "no_service" };
 
 /**
@@ -37,6 +38,22 @@ export async function routeResolverService(
       }
     });
 
+  const hasNoEntitlementMarker = (): boolean => {
+    const normalizedText = (element: Element): string =>
+      (element.textContent ?? "").replace(/\s+/g, " ").trim();
+    return (
+      Array.from(page.querySelectorAll("li")).some(
+        (element) => normalizedText(element) === "No full text available",
+      ) ||
+      Array.from(
+        page.querySelectorAll("[data-qa='full_display_links_online_links']"),
+      ).some(
+        (element) =>
+          normalizedText(element) === "No links are available for this record",
+      )
+    );
+  };
+
   let selected = firstService();
   const waitMs = renderWaitMs ?? (input === null ? 12_000 : 0);
   if (!selected && waitMs > 0) {
@@ -59,7 +76,9 @@ export async function routeResolverService(
       const timer = view.setTimeout(() => finish(undefined), waitMs);
     });
   }
-  if (!selected) return { kind: "no_service" };
+  if (!selected) {
+    return hasNoEntitlementMarker() ? { kind: "no_entitlement" } : { kind: "no_service" };
+  }
 
   const service = (selected.getAttribute("aria-label") ?? selected.textContent ?? "full text")
     .replace(/\s+/g, " ")

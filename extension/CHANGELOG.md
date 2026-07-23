@@ -14,6 +14,21 @@ History before 0.3.1 was recorded in the root `CHANGELOG.md` (the extension
 and daemon shared a version stream through 0.3.0); see its `[0.3.0]` section
 for the full pre-split extension history.
 
+## [Unreleased]
+
+### Fixed
+
+- **Inbox browser handoffs now open the broker-owned tab**, rather than opening
+  the paper's canonical DOI in an untracked tab. The background service keeps
+  the resolver or OA URL private, releases queued handoffs through the existing
+  work-window choreography, and focuses the exact tab already correlated with
+  the job.
+- **Explicit zero-electronic-holdings resolver results now stop the handoff**:
+  Alma “No full text available” and Primo NDE “No links are available for this
+  record” pages report the existing `no_entitlement` outcome once. Inconclusive
+  empty or slow resolver pages remain assisted, and no page text or URL leaves
+  the browser.
+
 ## [0.5.0] - 2026-07-22
 
 ### Added

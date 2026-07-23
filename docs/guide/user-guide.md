@@ -173,6 +173,13 @@ full text**. It never chooses physical-item, scan, interlibrary-loan, or
 terms-acceptance options — those stay your decisions. If your library's resolver
 is on a domain the extension isn't preapproved for, that step stays assisted.
 
+Opening a browser-handoff row from the inbox focuses that job's tracked
+resolver tab; it does not open the DOI in a separate, untracked tab. If Alma or
+Primo explicitly reports that no electronic full text or online link exists,
+the extension marks the route unavailable instead of sending you through the
+same institutional-login loop again. An empty or still-loading resolver page
+remains assisted rather than being treated as proof of no access.
+
 Grant optional extension host permissions only for publisher sites you use.
 While handoff jobs are still open, the extension keeps one pinned, muted tab and
 reloads it now and then to keep your session alive. If it detects that your

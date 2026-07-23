@@ -43,9 +43,24 @@ class FakePort implements NativePort {
   readonly posted: object[] = [];
   readonly onMessage = new FakeEmitter<[unknown]>();
   readonly onDisconnect = new FakeEmitter<[]>();
+  private readonly frameWaiters = new Set<(message: object) => void>();
   disconnected = false;
   postMessage(msg: object): void {
     this.posted.push(msg);
+    for (const waiter of this.frameWaiters) waiter(msg);
+  }
+  async waitForFrame(type: BrowserMessage["type"]): Promise<BrowserMessage> {
+    const existing = this.posted.map(parseBrowserMessage).find((frame) => frame.type === type);
+    if (existing !== undefined) return existing;
+    return new Promise<BrowserMessage>((resolve) => {
+      const waiter = (message: object) => {
+        const frame = parseBrowserMessage(message);
+        if (frame.type !== type) return;
+        this.frameWaiters.delete(waiter);
+        resolve(frame);
+      };
+      this.frameWaiters.add(waiter);
+    });
   }
   disconnect(): void {
     this.disconnected = true;
@@ -834,6 +849,45 @@ test("a tracked resolver landing routes its electronic service only with origin 
     { id: deniedTabID, url: OPENURL },
   );
   expect(injectedWithoutPermission).toBe(false);
+});
+
+test("a resolver no-entitlement route emits once and short-circuits provider classification", async () => {
+  const h = makeHarness();
+  const injections: Parameters<BridgeDeps["scripting"]["executeScript"]>[0][] = [];
+  h.deps.permissions.contains = async () => true;
+  h.deps.adapterSpecs.push({ ...PROVIDER_ADAPTER, id: "resolver-provider", hosts: ["resolver.example.edu"] });
+  h.deps.scripting.executeScript = async (injection) => {
+    injections.push(injection);
+    return [{ result: { kind: "no_entitlement" } }];
+  };
+
+  await h.bridge.start();
+  await h.port.inbound(jobOffer("job_0001a_resolver_no_entitlement"));
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  await h.tabs.onUpdated.emit(tabID, { url: OPENURL, status: "complete" }, { id: tabID, url: OPENURL });
+  await h.tabs.onUpdated.emit(tabID, { url: OPENURL, status: "complete" }, { id: tabID, url: OPENURL });
+
+  const outcomes = h.frames().filter(
+    (frame) => frame.type === "provider_outcome" && frame.payload["outcome"] === "no_entitlement",
+  );
+  expect(outcomes).toHaveLength(1);
+  expect(outcomes[0]?.payload).toEqual({ outcome: "no_entitlement" });
+  expect(injections).toHaveLength(2);
+  expect(injections.every((injection) => injection.func === routeResolverService)).toBe(true);
+});
+
+test("a resolver no-service route stays assisted without an outcome", async () => {
+  const h = makeHarness();
+  h.deps.permissions.contains = async () => true;
+  h.deps.scripting.executeScript = async () => [{ result: { kind: "no_service" } }];
+
+  await h.bridge.start();
+  await h.port.inbound(jobOffer("job_0001a_resolver_no_service"));
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  await h.tabs.onUpdated.emit(tabID, { url: OPENURL, status: "complete" }, { id: tabID, url: OPENURL });
+
+  expect(h.frames().some((frame) => frame.type === "provider_outcome")).toBe(false);
+  expect(h.frames().some((frame) => frame.type === "auth_pending")).toBe(false);
 });
 
 test("a registered adapter host classifies even when absent from the offer's provider_hosts", async () => {
@@ -1819,6 +1873,99 @@ test("open inbox runtime request focuses the singleton or creates it from the po
       urls,
     ),
   ).resolves.toMatchObject({ ok: false, error: { code: "unauthorized" } });
+});
+
+test("inbox handoff runtime opening focuses the live offered tab without returning its URL", async () => {
+  const h = makeHarness(undefined, { windows: true });
+  const urls = {
+    runtimeID: "papio-test-id",
+    inboxURL: "chrome-extension://papio-test-id/inbox.html",
+    popupURL: "chrome-extension://papio-test-id/popup.html",
+  };
+  await h.bridge.start();
+  await h.port.inbound(jobOffer("job_0001a_inbox_open"));
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+
+  await expect(
+    handleInboxRuntimeMessage(
+      h.bridge,
+      { type: "papio.handoff.open", request: { job_id: "job_0001a_inbox_open" } },
+      { id: urls.runtimeID, url: urls.inboxURL },
+      urls,
+    ),
+  ).resolves.toEqual({ ok: true, opened: true });
+  expect(h.tabs.activated).toEqual([tabID]);
+  const liveTab = h.tabs.live.get(tabID);
+  if (liveTab?.windowId === undefined) throw new Error("The offered tab has no live window");
+  expect(h.windows?.updated).toContainEqual({
+    windowID: liveTab.windowId,
+    props: { focused: true, state: "normal" },
+  });
+
+  await expect(
+    handleInboxRuntimeMessage(
+      h.bridge,
+      { type: "papio.handoff.open", request: { job_id: "", unexpected: true } },
+      { id: urls.runtimeID, url: urls.inboxURL },
+      urls,
+    ),
+  ).resolves.toEqual({
+    ok: false,
+    error: { code: "invalid_request", message: "Invalid handoff open request" },
+  });
+  await expect(
+    handleInboxRuntimeMessage(
+      h.bridge,
+      { type: "papio.handoff.open", request: { job_id: "job_0001a_inbox_open" } },
+      { id: urls.runtimeID, url: urls.popupURL },
+      urls,
+    ),
+  ).resolves.toEqual({
+    ok: false,
+    error: { code: "unauthorized", message: "This sender cannot access the inbox broker" },
+  });
+});
+
+test("queued inbox handoff force-releases exactly one live tab under racing opens", async () => {
+  const h = makeHarness(undefined, { windows: true });
+  await h.bridge.start();
+  await h.port.inbound(jobOffer("job_0001a_handoff_active"));
+  await h.port.inbound(jobOffer("job_0001a_handoff_queued"));
+
+  const queuedID = "job_0001a_handoff_queued";
+  expect(h.backend.store.activeJobs.find((job) => job.job_id === queuedID)?.status).toBe("queued");
+  const [first, second] = await Promise.all([h.bridge.openHandoff(queuedID), h.bridge.openHandoff(queuedID)]);
+  const released = h.backend.store.activeJobs.find((job) => job.job_id === queuedID);
+  const releasedTabID = released?.tab_id ?? -1;
+
+  expect(first).toEqual({ ok: true, opened: true });
+  expect(second).toEqual({ ok: true, opened: true });
+  expect(releasedTabID).toBeGreaterThanOrEqual(100);
+  expect(h.tabs.created).toHaveLength(2);
+  expect(h.tabs.activated).toContain(releasedTabID);
+  expect(h.windows?.updated.some((update) => update.windowID === h.tabs.live.get(releasedTabID)?.windowId)).toBe(true);
+});
+
+test("an unknown inbox handoff makes one counts refresh before failing unavailable", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ daemon_version: "0.9.0", features: ["triage_snapshot_v1"] }));
+
+  const pending = h.bridge.openHandoff("job_0001a_not_offered");
+  const refresh = await h.port.waitForFrame("triage_counts_request");
+  const refreshes = h.frames().filter((frame) => frame.type === "triage_counts_request");
+  const requestID = refresh.payload["request_id"];
+  expect(refreshes).toHaveLength(1);
+  expect(typeof requestID).toBe("string");
+  await h.port.inbound(
+    nativeResult("triage_counts_response", { request_id: requestID as string, counts: triageCounts() }),
+  );
+
+  await expect(pending).resolves.toEqual({
+    ok: false,
+    error: { code: "handoff_unavailable", message: "The requested handoff is not available" },
+  });
+  expect(h.frames().filter((frame) => frame.type === "triage_counts_request")).toHaveLength(1);
 });
 
 test("triage native replies correlate by request_id even when they arrive out of order", async () => {

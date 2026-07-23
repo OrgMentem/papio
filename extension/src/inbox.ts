@@ -242,6 +242,20 @@ function hasViewedPreview(item: TriageSnapshotItem): boolean {
 function hasOperation(item: TriageSnapshotItem, operation: TriageOperation): boolean {
   return item.ops.includes(operation);
 }
+function handoffJobID(item: TriageSnapshotItem): string | null {
+  if (item.kind !== "human_action" || item.action_kind !== "openurl_handoff" || typeof item.job_id !== "string") return null;
+  return /^[A-Za-z0-9_-]{8,128}$/.test(item.job_id) ? item.job_id : null;
+}
+
+function boundedHandoffFailure(value: unknown): string {
+  const message = errorFromResponse(value).replace(/\s+/g, " ").trim();
+  return message.length <= 240 ? message : `${message.slice(0, 237)}…`;
+}
+
+function handoffFailure(item: TriageSnapshotItem, value: unknown, tone: "error" | "offline" = "error"): void {
+  operationMessage(item.id, boundedHandoffFailure(value), tone);
+  render();
+}
 
 function isMutation(operation: TriageOperation): boolean {
   return operation === "acquire" || operation === "dismiss" || operation === "accept" || operation === "reject";
@@ -432,7 +446,8 @@ function operationButton(item: TriageSnapshotItem, operation: TriageOperation): 
   button.dataset.operation = operation;
 
   const needsPreview = operation === "accept" && item.action_kind === "verify_identity";
-  const unavailable = operation === "retry" || (operation === "open" && firstSafeLink(item) === null);
+  const handoff = item.kind === "human_action" && item.action_kind === "openurl_handoff";
+  const unavailable = operation === "retry" || (operation === "open" && (handoff ? handoffJobID(item) === null : firstSafeLink(item) === null));
   button.disabled =
     state.pending.has(item.id) ||
     unavailable ||
@@ -1035,6 +1050,30 @@ async function requestPreview(item: TriageSnapshotItem): Promise<void> {
   }
 }
 
+async function requestHandoffOpen(item: TriageSnapshotItem): Promise<void> {
+  const jobID = handoffJobID(item);
+  if (jobID === null) {
+    handoffFailure(item, { error: { message: "This browser handoff is missing its job identifier." } });
+    return;
+  }
+  if (!beginMutation(item)) return;
+  try {
+    const response = await runtimeMessage("papio.handoff.open", { job_id: jobID });
+    state.pending.delete(item.id);
+    if (!isRecord(response) || response["ok"] !== true || response["opened"] !== true) {
+      handoffFailure(item, response);
+      return;
+    }
+    announce("Browser handoff opened.");
+    render();
+  } catch (error) {
+    state.pending.delete(item.id);
+    const message = error instanceof Error ? error.message : "The daemon is unavailable.";
+    setConnection(false, message);
+    handoffFailure(item, { error: { message } }, "offline");
+  }
+}
+
 function activateOperation(item: TriageSnapshotItem, operation: TriageOperation): void {
   switch (operation) {
     case "acquire":
@@ -1049,6 +1088,10 @@ function activateOperation(item: TriageSnapshotItem, operation: TriageOperation)
       requestConfirmation(item, operation);
       return;
     case "open": {
+      if (item.kind === "human_action" && item.action_kind === "openurl_handoff") {
+        void requestHandoffOpen(item);
+        return;
+      }
       const url = firstSafeLink(item);
       if (url === null) {
         operationMessage(item.id, "This item has no safe link to open.", "error");
@@ -1120,11 +1163,7 @@ function handleKeyboard(event: KeyboardEvent): void {
     case "o":
       if (current >= 0) {
         event.preventDefault();
-        const url = firstSafeLink(items[current]!);
-        if (url !== null) {
-          openNewTab(url);
-          announce("Opened the first link in a new tab.");
-        }
+        activateOperation(items[current]!, "open");
       }
       return;
     default:

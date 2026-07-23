@@ -593,6 +593,10 @@ export class Bridge {
   /** Jobs that already reported a given handoff failure outcome, so one bad
    * IdP page does not spam the daemon. Cleared on job removal. */
   private readonly handoffOutcomeSent = new Set<string>();
+  /** Resolver pages that conclusively show zero electronic holdings are terminal
+   * for this offer. Keep this worker-local debounce until the job is removed so
+   * reloads and SPA completion events cannot report the same outcome repeatedly. */
+  private readonly resolverNoEntitlementSent = new Set<string>();
   /** Authentication observed during this service-worker lifetime. */
   private authReturnedThisWorker = false;
   /** Keepalive has observed its resolver tab return from authentication. */
@@ -600,6 +604,9 @@ export class Bridge {
   /** Atomically reserves the one visible handoff while tabs.create is in flight. */
   private handoffOpening = false;
   private drainingQueuedHandoffs = false;
+  /** Callers that arrive while the single queue drain is opening a tab wait for
+   * that drain to settle before inspecting the job's resulting tab. */
+  private readonly queuedHandoffDrainWaiters = new Set<() => void>();
   /** Latest resolver URL from an offer, retained for the keepalive manager. */
   private latestOfferOpenURL: string | undefined;
   /** Pending fallback-release timers, keyed by queued job. Worker-local only. */
@@ -981,6 +988,69 @@ export class Bridge {
       return;
     }
     await this.deps.tabs.create({ url: inboxURL, active: true });
+  }
+
+  /**
+   * Surface the browser-owned handoff already offered for an inbox row. This
+   * boundary accepts only a job id: provider/resolver URLs remain local to the
+   * extension and are never returned to the caller.
+   */
+  async openHandoff(jobID: string): Promise<BrokerReply<{ opened: true }>> {
+    await this.ready;
+    let job = findByJob(this.store, jobID);
+    if (job === undefined || !this.offerURLs.has(jobID)) {
+      // A just-acquired inbox item can race the native job_offer. Counts is a
+      // safe read that prompts the daemon to flush its already-queued frames;
+      // perform it at most once, then wait for the inbound FIFO before retrying.
+      if (this.hasCurrentHello() && (this.store.daemonFeatures ?? []).includes(TRIAGE_SNAPSHOT_FEATURE)) {
+        try {
+          await this.requestTriageCounts();
+        } catch {
+          // A refresh failure is indistinguishable from no offer at this local
+          // boundary; the bounded retry below returns the actionable result.
+        }
+      }
+      await this.inboundChain;
+      job = findByJob(this.store, jobID);
+    }
+    if (job === undefined || !this.offerURLs.has(jobID)) {
+      return this.failure("handoff_unavailable", "The requested handoff is not available");
+    }
+
+    if (job.status === "queued") {
+      // releaseQueuedHandoffs owns the cross-event drain latch. Calling any
+      // lower-level opener here would let concurrent inbox clicks create two
+      // tabs for the same queued offer.
+      await this.releaseQueuedHandoffs(jobID);
+      job = findByJob(this.store, jobID);
+    }
+    if (job === undefined || !this.offerURLs.has(jobID) || job.tab_id < 0) {
+      return this.failure("handoff_open_failed", "The offered handoff could not be opened");
+    }
+
+    let tab: TabInfo;
+    try {
+      tab = await this.deps.tabs.get(job.tab_id);
+    } catch {
+      return this.failure("handoff_open_failed", "The offered handoff tab is no longer available");
+    }
+    if (tab.id !== job.tab_id || this.deps.tabs.update === undefined) {
+      return this.failure("handoff_open_failed", "The offered handoff tab could not be focused");
+    }
+
+    try {
+      await this.deps.tabs.update(tab.id, { active: true });
+      if (this.deps.windows !== undefined && tab.windowId !== undefined) {
+        const win = await this.deps.windows.get(tab.windowId);
+        await this.deps.windows.update(tab.windowId, {
+          focused: true,
+          ...(win.state === "minimized" ? { state: "normal" as const } : {}),
+        });
+      }
+    } catch {
+      return this.failure("handoff_open_failed", "The offered handoff tab could not be focused");
+    }
+    return { ok: true, opened: true };
   }
 
   private failure(code: string, message: string): BrokerFailure {
@@ -1498,6 +1568,7 @@ export class Bridge {
     this.federatedReDriven.delete(jobID);
     this.handoffOutcomeSent.delete(`${jobID}:stale_sso`);
     this.handoffOutcomeSent.delete(`${jobID}:auth_error`);
+    this.resolverNoEntitlementSent.delete(jobID);
     this.proquestAccountIDs.delete(jobID);
     this.accountIdAppended.delete(jobID);
     await this.update((s) => {
@@ -1609,10 +1680,11 @@ export class Bridge {
 
   private async releaseQueuedHandoffs(fallbackJobID?: string): Promise<void> {
     if (fallbackJobID !== undefined) this.pendingForcedReleases.add(fallbackJobID);
-    if (
-      (!this.hasAuthEvidence() && this.pendingForcedReleases.size === 0) ||
-      this.drainingQueuedHandoffs
-    ) {
+    if (!this.hasAuthEvidence() && this.pendingForcedReleases.size === 0) {
+      return;
+    }
+    if (this.drainingQueuedHandoffs) {
+      await new Promise<void>((resolve) => this.queuedHandoffDrainWaiters.add(resolve));
       return;
     }
     this.drainingQueuedHandoffs = true;
@@ -1669,6 +1741,8 @@ export class Bridge {
       }
     } finally {
       this.drainingQueuedHandoffs = false;
+      for (const resolve of this.queuedHandoffDrainWaiters) resolve();
+      this.queuedHandoffDrainWaiters.clear();
     }
   }
 
@@ -2351,7 +2425,20 @@ export class Bridge {
         args: [null],
       });
       const result = results[0]?.result as ResolverRoute | undefined;
-      return result?.kind === "routed";
+      if (result?.kind === "routed") return true;
+      if (result?.kind === "no_entitlement") {
+        if (!this.resolverNoEntitlementSent.has(job.job_id)) {
+          // Deliberately omit adapter metadata and all page/URL data: the
+          // resolver's exact zero-holdings marker is sufficient to terminate
+          // this institutional attempt.
+          if (this.send("provider_outcome", { outcome: "no_entitlement" }, job.job_id)) {
+            this.resolverNoEntitlementSent.add(job.job_id);
+          }
+        }
+        return true;
+      }
+      // `no_service` is inconclusive: retain the existing assisted behavior.
+      return false;
     } catch (e) {
       console.error("papio: resolver routing failed; staying assisted", e);
       return false;
@@ -2998,7 +3085,8 @@ type InboxRuntimeReply =
   | BrokerReply<{ snapshot: Record<string, unknown> }>
   | BrokerReply<{ counts: Record<string, unknown>; generated_at: string }>
   | BrokerReply<{ outcome: string; detail?: string }>
-  | BrokerReply<{ preview: Record<string, unknown> }>;
+  | BrokerReply<{ preview: Record<string, unknown> }>
+  | BrokerReply<{ opened: true }>;
 
 function isObjectRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -3085,6 +3173,16 @@ function isPreviewRuntimeRequest(value: unknown): value is { action_id: number }
   return isObjectRecord(value) && hasOnlyKeys(value, ["action_id"]) && isPositiveSafeInteger(value["action_id"]);
 }
 
+function isHandoffOpenRuntimeRequest(value: unknown): value is { job_id: string } {
+  return (
+    isObjectRecord(value) &&
+    hasOnlyKeys(value, ["job_id"]) &&
+    typeof value["job_id"] === "string" &&
+    value["job_id"].length > 0 &&
+    value["job_id"].length <= 1024
+  );
+}
+
 /**
  * The inbox's finite, validated runtime boundary. Only the extension page may
  * make daemon-backed requests; the popup may only ask to open that page.
@@ -3112,7 +3210,8 @@ export async function handleInboxRuntimeMessage(
     type !== "papio.triage.counts" &&
     type !== "papio.triage.decide" &&
     type !== "papio.action.resolve" &&
-    type !== "papio.preview"
+    type !== "papio.preview" &&
+    type !== "papio.handoff.open"
   ) {
     return undefined;
   }
@@ -3144,6 +3243,10 @@ export async function handleInboxRuntimeMessage(
       return isPreviewRuntimeRequest(request)
         ? bridge.requestPreview(request)
         : runtimeFailure("invalid_request", "Invalid preview request");
+    case "papio.handoff.open":
+      return isHandoffOpenRuntimeRequest(request)
+        ? bridge.openHandoff(request.job_id)
+        : runtimeFailure("invalid_request", "Invalid handoff open request");
     default:
       return undefined;
   }
@@ -3282,7 +3385,8 @@ if (typeof chrome !== "undefined" && chrome.runtime?.id) {
         message["type"] === "papio.triage.counts" ||
         message["type"] === "papio.triage.decide" ||
         message["type"] === "papio.action.resolve" ||
-        message["type"] === "papio.preview")
+        message["type"] === "papio.preview" ||
+        message["type"] === "papio.handoff.open")
     ) {
       void handleInboxRuntimeMessage(bridge, message, _sender, inboxRuntimeURLs).then((reply) => {
         sendResponse(reply);
