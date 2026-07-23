@@ -417,11 +417,11 @@ test("startup clears a stale badge when persisted daemon health is connected", a
 test("hello acknowledgment persists daemon version, features, and connected status", async () => {
   const h = makeHarness();
   await h.bridge.start();
-  await h.port.inbound(helloAck({ daemon_version: "0.1.0", features: ["browser-v1", "direct-download"] }));
+  await h.port.inbound(helloAck({ daemon_version: "0.9.0", features: ["browser-v1", "direct-download"] }));
 
   expect(h.backend.store).toMatchObject({
     connectionStatus: "connected",
-    daemonVersion: "0.1.0",
+    daemonVersion: "0.9.0",
     daemonFeatures: ["browser-v1", "direct-download"],
     daemonUpdateHint: false,
   });
@@ -432,7 +432,7 @@ test("a restarted worker clears persisted page-acquire capability before hello_a
   const h = makeHarness({
     ...emptyStore(),
     connectionStatus: "connected",
-    daemonVersion: "0.1.0",
+    daemonVersion: "0.9.0",
     daemonUpdateHint: true,
     daemonFeatures: ["page_acquire"],
     resolverOrigins: ["https://onesearch.library.example.edu"],
@@ -461,7 +461,7 @@ test("a restarted worker clears persisted page-acquire capability before hello_a
 test("relays page acquisition and routes its acknowledgement to the popup", async () => {
   const h = makeHarness();
   await h.bridge.start();
-  await h.port.inbound(helloAck({ daemon_version: "0.1.0", features: ["page_acquire"] }));
+  await h.port.inbound(helloAck({ daemon_version: "0.9.0", features: ["page_acquire"] }));
 
   const acknowledgement = h.bridge.requestPageAcquire({
     url: "https://publisher.example.edu/article/42",
@@ -491,7 +491,7 @@ test("relays page acquisition and routes its acknowledgement to the popup", asyn
 test("refuses a DOI-less page acquisition without sending a frame", async () => {
   const h = makeHarness();
   await h.bridge.start();
-  await h.port.inbound(helloAck({ daemon_version: "0.1.0", features: ["page_acquire"] }));
+  await h.port.inbound(helloAck({ daemon_version: "0.9.0", features: ["page_acquire"] }));
 
   let response: unknown;
   void h.bridge.requestPageAcquire({
@@ -543,15 +543,15 @@ test("a stale connected badge sync cannot mask a disconnected state", async () =
 });
 
 test("hello acknowledgment persists an informational update hint without changing health", async () => {
-  Object.assign(globalThis, { __PAPIO_DAEMON_VERSION__: "0.2.0" });
+  Object.assign(globalThis, { __PAPIO_DAEMON_VERSION__: "1.0.0" });
   try {
     const h = makeHarness();
     await h.bridge.start();
-    await h.port.inbound(helloAck({ daemon_version: "0.1.0" }));
+    await h.port.inbound(helloAck({ daemon_version: "0.9.0" }));
 
     expect(h.backend.store).toMatchObject({
       connectionStatus: "connected",
-      daemonVersion: "0.1.0",
+      daemonVersion: "0.9.0",
       daemonUpdateHint: true,
     });
     expect(h.action.texts.at(-1)).toBe("");
@@ -1777,7 +1777,7 @@ test("inbox runtime messages validate the exact extension sender", async () => {
   }
 
   await h.bridge.start();
-  await h.port.inbound(helloAck({ daemon_version: "0.1.0", features: [] }));
+  await h.port.inbound(helloAck({ daemon_version: "0.9.0", features: [] }));
   await expect(handleInboxRuntimeMessage(h.bridge, message, { id: urls.runtimeID, url: urls.inboxURL }, urls)).resolves
     .toEqual({
       ok: false,
@@ -1826,7 +1826,7 @@ test("triage native replies correlate by request_id even when they arrive out of
   await h.bridge.start();
   await h.port.inbound(
     helloAck({
-      daemon_version: "0.1.0",
+      daemon_version: "0.9.0",
       features: ["triage_snapshot_v1", "triage_mutations_v1", "review_preview_v1"],
     }),
   );
@@ -1851,10 +1851,12 @@ test("triage native replies correlate by request_id even when they arrive out of
 test("triage snapshot uses schema 2 only after the daemon advertises it", async () => {
   const h = makeHarness();
   await h.bridge.start();
-  await h.port.inbound(helloAck({
-    daemon_version: "0.1.0",
-    features: ["triage_snapshot_v1", "triage_snapshot_schema_v2"],
-  }));
+  await h.port.inbound(
+    helloAck({
+      daemon_version: "0.9.0",
+      features: ["triage_snapshot_v1", "triage_snapshot_schema_v2"],
+    }),
+  );
 
   const pending = h.bridge.requestTriageSnapshot({ schema_versions: [1] });
   await Promise.resolve();
@@ -1869,7 +1871,7 @@ test("triage snapshot uses schema 2 only after the daemon advertises it", async 
 test("triage requests time out and late echoes are dropped", async () => {
   const h = makeHarness();
   await h.bridge.start();
-  await h.port.inbound(helloAck({ daemon_version: "0.1.0", features: ["triage_snapshot_v1"] }));
+  await h.port.inbound(helloAck({ daemon_version: "0.9.0", features: ["triage_snapshot_v1"] }));
   const pending = h.bridge.requestTriageCounts();
   await Promise.resolve();
   await Promise.resolve();
@@ -1906,7 +1908,7 @@ test("a user-visible triage request forces reconnect and waits for a fresh hello
   expect(h.ports).toHaveLength(2);
   const reconnected = h.ports[1];
   expect(reconnected).toBeDefined();
-  await reconnected?.inbound(helloAck({ daemon_version: "0.1.0", features: ["triage_snapshot_v1"] }));
+  await reconnected?.inbound(helloAck({ daemon_version: "0.9.0", features: ["triage_snapshot_v1"] }));
   await Promise.resolve();
   const request = h.frames().find((frame) => frame.type === "triage_snapshot_request");
   const requestID = request?.payload["request_id"];
@@ -1920,7 +1922,7 @@ test("heartbeat counts obey disconnected, permission, then pending badge precede
   await h.bridge.start();
   await h.port.inbound(
     helloAck({
-      daemon_version: "0.1.0",
+      daemon_version: "0.9.0",
       features: ["triage_snapshot_v1"],
       resolver_origins: ["https://resolver.example.edu"],
     }),

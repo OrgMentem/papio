@@ -719,6 +719,7 @@ func identifiersByWorkRequest(ctx context.Context, tx *sql.Tx, workRequestIDs []
 		placeholders = append(placeholders, "?")
 		args = append(args, id)
 	}
+	//nolint:gosec // only generated "?" placeholders enter the query text; IDs remain bound arguments.
 	rows, err := tx.QueryContext(ctx,
 		`SELECT work_request_id, kind, value FROM identifiers WHERE work_request_id IN (`+strings.Join(placeholders, ",")+`)`,
 		args...)

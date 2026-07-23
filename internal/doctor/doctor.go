@@ -480,10 +480,14 @@ func semverLess(a, b string) bool {
 	for i := 0; i < 3; i++ {
 		av, bv := 0, 0
 		if i < len(as) {
-			fmt.Sscanf(strings.TrimSpace(as[i]), "%d", &av)
+			if _, err := fmt.Sscanf(strings.TrimSpace(as[i]), "%d", &av); err != nil {
+				av = 0
+			}
 		}
 		if i < len(bs) {
-			fmt.Sscanf(strings.TrimSpace(bs[i]), "%d", &bv)
+			if _, err := fmt.Sscanf(strings.TrimSpace(bs[i]), "%d", &bv); err != nil {
+				bv = 0
+			}
 		}
 		if av != bv {
 			return av < bv

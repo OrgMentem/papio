@@ -49,6 +49,7 @@ func zoteroResolverIn(roots []string) (string, bool) {
 }
 
 func zoteroResolverFile(path string) (string, bool) {
+	//nolint:gosec // path is built internally from fixed Zotero profile roots.
 	file, err := os.Open(path)
 	if err != nil {
 		return "", false

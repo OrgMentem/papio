@@ -575,3 +575,19 @@ Verify the configured zotio version and capabilities
 papio zotio preflight
 ```
 
+### `papio zotio tags`
+
+Manage the exception-tag ledger on linked Zotero items
+
+```
+papio zotio tags
+```
+
+#### `papio zotio tags reconcile`
+
+Converge papio:needs-action / papio:unavailable tags with current job states
+
+```
+papio zotio tags reconcile
+```
+

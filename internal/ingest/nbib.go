@@ -146,7 +146,7 @@ func splitNBIBField(line string) (tag, value string, ok bool) {
 		return "", "", false
 	}
 	for _, char := range tag {
-		if !((char >= 'A' && char <= 'Z') || (char >= '0' && char <= '9')) {
+		if (char < 'A' || char > 'Z') && (char < '0' || char > '9') {
 			return "", "", false
 		}
 	}
