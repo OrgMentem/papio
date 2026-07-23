@@ -1056,7 +1056,14 @@ async function requestHandoffOpen(item: TriageSnapshotItem): Promise<void> {
     handoffFailure(item, { error: { message: "This browser handoff is missing its job identifier." } });
     return;
   }
-  if (!beginMutation(item)) return;
+  // Unlike daemon mutations, the broker open is local to the extension: the
+  // background worker owns the native session, waits for hydration itself,
+  // and returns a structured failure when it truly cannot open. Gating on the
+  // inbox's (possibly lagging) connectivity view would block usable handoffs
+  // during auto-reconnect backoff, so only deduplicate concurrent requests.
+  if (state.pending.has(item.id)) return;
+  state.pending.add(item.id);
+  render();
   try {
     const response = await runtimeMessage("papio.handoff.open", { job_id: jobID });
     state.pending.delete(item.id);
@@ -1064,7 +1071,7 @@ async function requestHandoffOpen(item: TriageSnapshotItem): Promise<void> {
       handoffFailure(item, response);
       return;
     }
-    announce("Browser handoff opened.");
+    operationMessage(item.id, "Browser handoff opened.", "info");
     render();
   } catch (error) {
     state.pending.delete(item.id);

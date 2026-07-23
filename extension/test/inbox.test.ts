@@ -362,6 +362,69 @@ test("a broker handoff rejection stays inline and leaves the action available", 
   expect(page.document.querySelector<HTMLButtonElement>("[data-triage-item-id='action:rejected'] [data-operation='open']")?.disabled).toBe(false);
 });
 
+test("a handoff opens while the inbox believes the daemon is reconnecting", async () => {
+  // Regression: requestHandoffOpen used to run through beginMutation, whose
+  // !state.connected gate blocked broker opens outright. The broker call is
+  // local to the extension — the background owns the native session — so a
+  // lagging inbox connectivity view must not stop it.
+  const item = handoffAction("action:offline-open", 1, true);
+  const fixture = snapshot([item], {
+    counts: counts({ pending_total: 1, actions: 1, watch_hits: 0, retractions: 0 }),
+  });
+  let available = true;
+  const page = await inboxDocument((message) => {
+    if (message.type === "papio.handoff.open") return { ok: true, opened: true };
+    if (!available) return { ok: false, error: { code: "disconnected", message: "Native host is down" } };
+    return snapshotReply(fixture, message);
+  });
+
+  available = false;
+  page.document.getElementById("refresh-inbox")?.click();
+  await settle();
+  expect(page.document.getElementById("connection-status")?.textContent).toContain("Disconnected");
+
+  page.document.querySelector<HTMLButtonElement>("[data-triage-item-id='action:offline-open'] [data-operation='open']")?.click();
+  await settle();
+
+  expect(page.requests.filter((request) => request.type === "papio.handoff.open")).toEqual([{
+    type: "papio.handoff.open",
+    request: { job_id: "job_handoff_offline-open" },
+  }]);
+  expect(page.opened).toEqual([]);
+  expect(page.document.getElementById("operation-status")?.textContent).toBe("Browser handoff opened.");
+});
+
+test("a successful handoff retry clears the prior inline failure", async () => {
+  const item = handoffAction("action:retry-clear", 1, true);
+  const fixture = snapshot([item], {
+    counts: counts({ pending_total: 1, actions: 1, watch_hits: 0, retractions: 0 }),
+  });
+  let attempts = 0;
+  const page = await inboxDocument((message) => {
+    if (message.type === "papio.handoff.open") {
+      attempts += 1;
+      if (attempts === 1) return { ok: false, error: { code: "handoff_unavailable", message: "No live tab for this job." } };
+      return { ok: true, opened: true };
+    }
+    return snapshotReply(fixture, message);
+  });
+
+  const open = (): void =>
+    page.document.querySelector<HTMLButtonElement>("[data-triage-item-id='action:retry-clear'] [data-operation='open']")?.click();
+  open();
+  await settle();
+  const failed = page.document.querySelector<HTMLElement>("[data-triage-item-id='action:retry-clear'] .item-result");
+  expect(failed?.textContent).toBe("No live tab for this job.");
+  expect(failed?.dataset.tone).toBe("error");
+
+  open();
+  await settle();
+  const result = page.document.querySelector<HTMLElement>("[data-triage-item-id='action:retry-clear'] .item-result");
+  expect(result?.textContent).toBe("Browser handoff opened.");
+  expect(result?.dataset.tone).toBe("info");
+  expect(attempts).toBe(2);
+});
+
 test("ordinary manual and watch links still open directly", async () => {
   const manual = manualAction("action:manual-open", 1, "Manual link");
   manual.links = [{ rel: "landing", url: "https://example.test/manual" }];
