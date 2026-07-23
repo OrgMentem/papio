@@ -1,7 +1,8 @@
 // Copyright 2026 OrgMentem. Licensed under MIT. See LICENSE.
-// ACM Digital Library adapter against a sanitized live entitled capture. The
-// entitled download anchor is a direct PDF href; non-entitled ACM pages have no
-// isolated capture and stay assisted (classify unknown).
+// ACM Digital Library adapter against sanitized live captures. The "PDF/eReader"
+// toolbar control is the entitlement signal; a paywalled "Get Access" page still
+// carries the a#downloadPdfUrl anchor (no-entitlement fixture) and MUST stay
+// unknown so the daemon never fetches an HTML access page.
 
 import { expect, test } from "bun:test";
 
@@ -26,26 +27,38 @@ function fixture(scenario: string): Document {
 }
 
 test.skipIf(!fixtureExists("acm", "success"))(
-  "matching ACM article exposes the declared direct PDF href",
+  "entitled ACM article classifies via the eReader control and builds the direct PDF endpoint",
   () => {
     const doc = fixture("success");
     const verdict = interpret(doc, spec, TRUST_PAPER);
     expect(verdict.kind).toBe("article");
     expect(verdict.adapter_id).toBe("acm");
-    const link = doc.querySelector(spec.download?.selector ?? "") as HTMLAnchorElement | null;
-    expect(link).not.toBeNull();
-    expect(link?.getAttribute("href")).toContain("/doi/pdf/");
-    expect(spec.download?.method).toBe("href");
+    // The entitlement signal is the eReader toolbar control, not the anchor.
+    expect(doc.querySelector(spec.download?.selector ?? "")).not.toBeNull();
+    expect(spec.download?.method).toBe("url");
+    // The deterministic PDF endpoint is built from the DOI in the page URL.
+    const doi = TRUST_PAPER.expected.doi;
+    const m = `https://dl.acm.org/doi/${doi}`.match(new RegExp(spec.download?.idPattern ?? ""));
+    expect(m?.[1]).toBe(doi);
+    const built = (spec.download?.urlTemplate ?? "").replace("{1}", m?.[1] ?? "");
+    expect(built).toBe(`https://dl.acm.org/doi/pdf/${doi}?download=true`);
     // Evidence must never leak the requested identity or a secret token.
     for (const item of verdict.evidence) expect(item).not.toMatch(/who should i trust/i);
   },
 );
 
-test.skipIf(!fixtureExists("acm", "drift"))(
-  "renamed ACM download anchor fails closed to unknown",
+test.skipIf(!fixtureExists("acm", "no-entitlement"))(
+  "paywalled ACM page with the download anchor but no eReader control stays unknown",
   () => {
-    // publication_doi still present, but the download anchor id changed: the
-    // article rule requires both, so it must not false-positive.
+    // The a#downloadPdfUrl anchor is present on "Get Access" pages, so the
+    // article rule must depend on the eReader entitlement control instead.
+    expect(interpret(fixture("no-entitlement"), spec, TRUST_PAPER).kind).toBe("unknown");
+  },
+);
+
+test.skipIf(!fixtureExists("acm", "drift"))(
+  "renamed ACM download anchor with no eReader control fails closed to unknown",
+  () => {
     expect(interpret(fixture("drift"), spec, TRUST_PAPER).kind).toBe("unknown");
   },
 );

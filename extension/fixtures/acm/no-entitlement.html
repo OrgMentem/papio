@@ -1,0 +1,1890 @@
+<!-- papio-fixture provider="acm" scenario="no-entitlement" origin="https://dl.acm.org/doi/10.1145/3186728.3164144" captured="2026-07-23T00:00:00.000Z" -->
+
+
+
+
+
+<!DOCTYPE html>
+
+
+
+
+
+
+    
+
+
+
+
+
+
+
+
+
+
+<html lang="en" class="pb-page" data-request-id="">
+
+    
+        <head data-pb-dropzone="head">
+            
+
+<meta charset="UTF-8">
+
+
+
+
+
+
+    
+        
+            
+        
+    
+        
+            
+        
+    
+        
+            
+        
+    
+        
+            
+                
+                
+<title>Lusail: a system for querying linked data at scale: Proceedings of the VLDB Endowment: Vol 11, No 4</title>
+
+
+
+
+
+                
+            
+        
+    
+        
+            
+        
+    
+
+
+
+
+
+
+
+    
+        
+            
+        
+    
+        
+            
+        
+    
+        
+            
+                
+                
+
+
+
+                
+            
+        
+    
+        
+            
+        
+    
+        
+            
+        
+    
+
+
+
+
+
+
+
+
+
+
+    <link rel="stylesheet" href="/products/acm/releasedAssets/css/TOKEN.css"/><link rel="stylesheet" href="/products/acm/releasedAssets/css/TOKEN.css" media="print"/>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    
+        
+            
+                
+                
+                
+                    
+                    <link rel="schema.DC" href="https://purl.org/DC/elements/1.0/"></link><meta name="citation_journal_title" content="Proceedings of the VLDB Endowment"></meta><meta name="dc.Title" content="Lusail"></meta><meta name="dc.Title.Subtitle" content="a system for querying linked data at scale"></meta><meta name="dc.Creator" content="AbdelazizIbrahim "></meta><meta name="dc.Creator" content="MansourEssam "></meta><meta name="dc.Creator" content="OuzzaniMourad "></meta><meta name="dc.Creator" content="AboulnagaAshraf "></meta><meta name="dc.Creator" content="KalnisPanos "></meta><meta name="dc.Description" content="The RDF data model allows publishing interlinked RDF datasets, where each dataset is independently maintained and is queryable via a SPARQL endpoint. Many applications would benefit from querying t..."></meta><meta name="Description" content="The RDF data model allows publishing interlinked RDF datasets, where each dataset is independently maintained and is queryable via a SPARQL endpoint. Many applications would benefit from querying t..."></meta><meta name="dc.Publisher" content="VLDB EndowmentPUB4722"></meta><meta name="dc.Date" scheme="WTN8601" content="2017-12-01"></meta><meta name="dc.Type" content="research-article"></meta><meta name="dc.Format" content="text/HTML"></meta><meta name="dc.Identifier" scheme="acm-id" content="3164144"></meta><meta name="dc.Identifier" scheme="doi" content="10.1145/3186728.3164144"></meta><meta name="dc.Language" content="EN"></meta><meta name="dc.Coverage" content="world"></meta>
+
+
+
+
+<link rel="meta" type="application/atom+xml" href="https://doi.org/10.1145%2F3186728.3164144"></link>
+<link rel="meta" type="application/rdf+json" href="https://doi.org/10.1145%2F3186728.3164144"></link>
+<link rel="meta" type="application/unixref+xml" href="https://doi.org/10.1145%2F3186728.3164144"></link>
+
+
+                    
+                
+            
+        
+    
+        
+            
+                
+                
+                
+                    
+                    
+
+<style id="pb-theme"></style>
+                    
+                
+            
+        
+    
+        
+            
+                
+                
+                
+                
+                
+            
+        
+    
+        
+            
+                
+                
+                
+                
+                
+            
+        
+    
+        
+            
+                
+                
+                
+                    
+                    <meta name="robots" content="noarchive"/>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    
+        
+            <meta property="og:title" content="Lusail: a system for querying linked data at scale: Proceedings of the VLDB Endowment: Vol 11, No 4"/>
+        
+        
+    
+
+    
+        
+            <meta property="og:type" content="Article"/>
+        
+        
+    
+
+    
+        
+            <meta property="og:url" content="https://dl.acm.org/doi/10.1145/3186728.3164144"/>
+        
+        
+    
+
+    
+        
+            <meta property="og:site_name" content="Proceedings of the VLDB Endowment"/>
+        
+        
+    
+
+
+
+    
+        
+        
+            <meta property="og:image:width" content="302"/>
+            <meta property="og:image:height" content="392"/>
+        
+    
+    
+
+
+
+    
+        <meta property="og:description" content="
+		The RDF data model allows publishing interlinked RDF datasets, where each dataset
+is independently maintained and is queryable via a SPARQL endpoint. Many applications
+would benefit from querying the resulting large, decentralized, geo-distributed graph
+..."/>
+    
+    
+
+
+
+<meta name="viewport" content="width=device-width,initial-scale=1"><meta name="publication_doi" content="10.1145/3186728.3164144"/>
+
+
+
+    
+
+
+
+
+
+
+
+
+
+
+
+
+                    
+                
+            
+        
+    
+
+
+
+
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<link rel="stylesheet" href="/pb-assets/styles/TOKEN.css">
+<link rel="stylesheet" href="/pb-assets/styles/TOKEN.css">
+<link rel="stylesheet" href="/pb-assets/styles/TOKEN.css">
+<link rel="stylesheet" href="/pb-assets/styles/TOKEN.css">
+<link rel="stylesheet" href="/pb-assets/styles/TOKEN.css">
+<script defer src="https://scholar.google.com/scholar_js/casa.js" async nonce=""></script>
+<script id="Cookiebot" src="https://consent.cookiebot.com/uc.js" data-cbid="TOKEN" data-blockingmode="auto" type="text/javascript" nonce=""></script>
+<link rel="apple-touch-icon" sizes="180x180" href="/pb-assets/head-metadata/TOKEN.png">
+<link rel="icon" type="image/png" sizes="32x32" href="/pb-assets/head-metadata/TOKEN.png">
+<link rel="icon" type="image/png" sizes="16x16" href="/pb-assets/head-metadata/TOKEN.png">
+<link rel="manifest" href="/pb-assets/head-metadata/site-1574252171130.webmanifest" crossorigin="use-credentials">
+<link rel="mask-icon" href="/pb-assets/head-metadata/TOKEN.svg" color="#5bbad5">
+<meta name="msapplication-TileColor" content="#00a300">
+<meta name="theme-color" content="#ffffff">
+<script defer src="https://static.cloudflareinsights.com/beacon.min.js/TOKEN" integrity="TOKEN==" data-cf-beacon="{"rayId":"6e539318ac0a38db","token":"TOKEN","version":"2021.12.0","si":100}" crossorigin="anonymous" nonce=""></script>
+<script defer src="https://static.cloudflareinsights.com/beacon.min.js/TOKEN" integrity="TOKEN==" data-cf-beacon="{"rayId":"7f51c78ba8dacf41","token":"TOKEN","version":"2023.8.0","si":100}" crossorigin="anonymous" nonce=""></script>
+<!---->
+    <script nonce=""></script>
+    <!---->
+
+
+
+
+
+
+<meta name="pbContext" content=";requestedJournal:journal:pvldb;article:article:doi\:10.1145/3186728.3164144;wgroup:string:ACM Publication Websites;groupTopic:topic:acm-pubtype&gt;journal;subPage:string:Basic Abstract;csubtype:string:Journal;issue:issue:doi\:10.5555/3186728;serialTopic:topic:acm-pubtype&gt;journal;page:string:Article/Chapter View;ctype:string:Journal Content;website:website:dl-site;taxonomy:taxonomy:acm-pubtype;pageGroup:string:Publication Pages;journal:journal:pvldb">
+        </head>
+    
+
+    
+
+
+
+    
+        
+        
+        
+            <body class="pb-ui website-dl-site">
+            
+
+
+
+
+
+
+    
+    
+        
+
+<!---->
+    <noscript></noscript>
+    <!---->
+
+
+
+
+
+
+
+
+
+<a href="" class="sr-only-focusable">skip to main content</a>
+
+        <div id="pb-page-content" data-ng-non-bindable>
+                
+            <div data-pb-dropzone="main" data-pb-dropzone-name="Main">
+                
+                    
+                        
+
+
+
+        
+        
+
+
+
+        
+        
+
+
+
+
+
+    
+
+    
+
+
+
+
+
+
+        
+        
+
+
+
+
+
+<div class="smart-layout">
+    
+        
+
+            
+            
+            
+            
+
+            
+                <div class="smart-layout_dropzone-container">
+
+                    
+
+                    
+                    <div data-pb-dropzone="TOKEN">
+                        
+
+
+
+        
+        <style></style>
+
+                    </div>
+                </div>
+            
+
+        
+
+            
+            
+            
+            
+
+            
+
+        
+    
+</div>
+
+
+
+
+
+
+
+
+
+
+
+    
+    
+        <header data-widget-def="ux3-layout-widget" data-widget-id="TOKEN" class="header base pvldb">
+        
+
+
+
+        
+        <div class="header__fixed-items fixed fixed-element">
+
+
+
+
+
+
+
+
+
+    
+    
+        <div data-widget-def="ux3-layout-widget" data-widget-id="TOKEN" class="container header--first-row">
+        
+
+
+
+        
+        <nav class="pull-left">
+
+
+
+        
+        <ul class="rlist--inline">
+    <li class="header__logo1">
+        <a href="/" title="">
+            <img alt="ACM Digital Library home" src="/specs/products/acm/releasedAssets/images/TOKEN.png" loading="eager">
+        </a>
+    </li>
+    <li class="header__logo2 hidden-xs hidden-md">
+        <a href="https://www.acm.org" title="external site link">
+            <img alt="ACM - Association for Computing Machinery" src="/specs/products/acm/releasedAssets/images/TOKEN.png" loading="eager">
+        </a>
+    </li>
+</ul> 
+</nav><div class="pull-right">
+
+
+
+        
+        <style></style>
+
+
+
+
+
+
+
+
+
+
+    
+    
+        <div data-widget-def="ux3SmartLayout" data-widget-id="TOKEN" class="hidden-xs">
+        
+
+
+
+        
+        
+
+
+
+
+
+<div class="smart-layout">
+    
+        
+
+            
+            
+            
+            
+
+            
+
+        
+
+            
+            
+            
+            
+
+            
+                <div class="smart-layout_dropzone-container">
+
+                    
+
+                    
+                    <div data-pb-dropzone="TOKEN">
+                        
+
+
+
+        
+        <div class="edition-badge-wrapper"><a href="/premium" title="Basic Edition, Upgrade"><img src="/pb-assets/images/TOKEN.png" aria-hidden="true" class="edition-badge__logo"></a></div>
+
+                    </div>
+                </div>
+            
+
+        
+    
+</div>
+
+
+        </div>
+    
+
+
+
+
+
+
+
+
+
+
+
+    
+    
+        <div data-widget-def="ux3SmartLayout" data-widget-id="TOKEN" class="hidden-sm hidden-xs institution-banner-border">
+        
+
+
+
+        
+        
+
+
+
+
+
+<div class="smart-layout">
+    
+        
+
+            
+            
+            
+            
+
+            
+
+        
+
+            
+            
+            
+            
+
+            
+
+        
+    
+</div>
+
+
+        </div>
+    
+
+
+
+
+
+
+
+
+
+
+
+    
+    
+        <nav data-widget-def="ux3-layout-widget" data-widget-id="TOKEN" class="header__quick-menu text-onDark">
+        
+
+
+
+        
+        <div class="login-list">
+
+
+
+        
+        
+
+
+
+
+    
+
+
+
+
+
+
+
+
+    
+    
+        
+
+
+
+
+
+
+
+
+
+
+
+
+<div class="loginBar login-open">
+    
+        
+        
+            <ul class="rlist--inline">
+                <li class="login-link">
+                    
+                        
+                        
+                            <a href="/action/showLogin">
+                                Sign in
+                            </a>
+                        
+                    
+                </li>
+                
+                    <li class="register-link">
+                        <a href="https://accounts.acm.org" class="btn" title="Register">
+                            Register
+                        </a>
+                    </li>
+                
+            </ul>
+        
+    
+</div>
+    
+
+
+</div>
+
+        </nav>
+    
+
+</div>
+
+        </div>
+    
+
+
+
+
+
+
+
+
+
+
+
+    
+    
+        <div data-widget-def="menuWidget" data-widget-id="TOKEN" class="container header--second-row">
+        
+
+
+
+        
+        <div class="responsive-menu-container clearfix"><div class="left-section pull-left"></div><div class="menu-section"><div class="main-nav responsive-menu-nav"><a href="" data-target="global-menu" data-toggle="nav" title="menu drawer"><span class="drawer__icons-box"><span class="drawer__icons-controls"></span></span></a><nav role="navigation" id="global-menu" data-ctrl-res="screen-sm" aria-label="Main Navigation" class="drawer__nav container gutterless hidden-sm hidden-xs"><div class="menu-login-items hidden-md hidden-lg"></div><ul id="menubar" class="menubar rlist--inline"><li id="menu-item-global-menu-0" class="menu-item mobile-menu-item hide-basic"><a href="/search/advanced"><span>Advanced Search</span></a></li><li id="menu-item-global-menu-1" class="menu-item"><a href="/journals"><span>Journals</span></a></li><li id="menu-item-global-menu-2" class="menu-item"><a href="/magazines"><span>Magazines</span></a></li><li id="menu-item-global-menu-3" class="menu-item"><a href="/proceedings"><span>Proceedings</span></a></li><li id="menu-item-global-menu-4" class="menu-item"><a href="/acmbooks"><span>Books</span></a></li><li id="menu-item-global-menu-5" class="menu-item"><a href="/sigs"><span>SIGs</span></a></li><li id="menu-item-global-menu-6" class="menu-item"><a href="/conferences"><span>Conferences</span></a></li><li id="menu-item-global-menu-7" class="menu-item"><a href="/institutions"><span>Institutions</span></a></li><li id="menu-item-global-menu-8" class="menu-item"><a href="/people"><span>People</span></a></li><li class="hidden-lg hidden-md"><div data-toggle="transplant" data-target-class="hidden-xs hidden-sm" data-target=".header__quick-menu .show-on-mobile" data-direction="from" data-transplant="self"></div></li><li aria-haspopup="true" aria-label="More" class="dropdown-more hidden dropdown menu-parent"><a href="" title="More" data-toggle="dropdown" class="dropdown__toggle"><span>More</span><i aria-hidden="true" class="icon-section_arrow_d pull-right hidden-sm hidden-xs"></i></a><ul aria-labelledby="main0-1" aria-hidden="true" class="rlist dropdown__menu"></ul></li><li class="menubar__extra-mob-links">
+
+
+
+        
+        <script nonce=""></script>
+
+
+
+
+        
+        
+
+
+
+
+
+<div class="smart-layout">
+    
+        
+
+            
+            
+            
+            
+
+            
+
+        
+
+            
+            
+            
+            
+
+            
+                <div class="smart-layout_dropzone-container">
+
+                    
+
+                    
+                    <div data-pb-dropzone="TOKEN">
+                        
+
+
+
+        
+        <style></style>
+
+<div class="edition-badge-wrapper"><a href="/premium" title="Basic Edition, Upgrade"><img src="/pb-assets/images/TOKEN.png" aria-hidden="true" class="edition-badge__logo"></a></div>
+
+                    </div>
+                </div>
+            
+
+        
+    
+</div>
+
+
+
+
+
+        
+        <style></style>
+
+
+
+
+        
+        <div class="quickSearchFormContainer"><div class="quick-search"><div aria-live="assertive" class="advanced-search__autocomplete__announcer sr-only"></div><form action="/action/doSearch" name="defaultQuickSearch" method="get" title="Quick Search" class="c-hero__form"><div class="quick-search--input"><div class="input-group option-0"><input aria-label="Search" type="search" name="AllField" placeholder="Search" data-auto-complete-max-words="7" data-auto-complete-max-chars="32" data-contributors-conf="3" data-topics-conf="3" data-publication-titles-conf="3" data-history-items-conf="3" data-group-titles-conf="3" value="" class="auto-complete quick-search__input"/><button type="submit" title="Search" aria-label="Search" class="btn quick-search__button icon-Icon_Search"><span class="sr-only">Search</span><span>Search</span></button></div></div></form><div class="pb-dropzone" data-pb-dropzone="quickSearchDropZone" title="quickSearchDropZone"></div></div></div>
+</li></ul></nav><div id="menu-quick-search" data-db-target-of="menu-quick-search" class="hidden-md hidden-lg"><div class="menu-quick-search__wrapper"><div data-toggle="transplant" data-target-class="hidden-xs hidden-sm" data-target=".header--second-row .quick-search--form" data-direction="from" data-transplant="self" class="quick-search-mobile"></div></div></div></div></div><div class="right-section pull-right">
+
+
+
+        
+        <div class="quickSearchFormContainer"><div class="quick-search"><div aria-live="assertive" class="advanced-search__autocomplete__announcer sr-only"></div><div class="clearfix quick-search__clearfix"><form action="/action/doSearch" name="defaultQuickSearch" method="get" title="Quick Search" class="quick-search--form"><div class="quick-search--input"><div class="input-group option-0"><label for="TOKEN" class="sr-only">Search ACM Digital Library</label><input type="search" id="TOKEN" name="AllField" placeholder="Search ACM Digital Library" data-auto-complete-max-words="7" data-auto-complete-max-chars="32" data-contributors-conf="3" data-topics-conf="3" data-publication-titles-conf="3" data-history-items-conf="3" data-group-titles-conf="3" value="" class="auto-complete quick-search__input"/></div></div><div class="quick-search--button"><button type="submit" title="Search" aria-label="Search" class="btn quick-search__button icon-Icon_Search"><span class="sr-only">Search</span><span>Search</span></button></div></form></div>
+
+
+
+        
+        <div data-title="To use advanced search, you must have Premium access." data-title-alt="Advanced Search (Premium feature)" data-customClass="simple-tooltip__basic" data-learn-more-link="/about/upgrade" data-learn-more-link-text="Learn more" data-sign-in-link="https://dl.acm.org/action/showLogin" data-sign-in-link-text="Sign in" tabindex="0" class="simple-tooltip__block--TOKEN simple-tooltip__mobile simple-tooltip__basic-wrapper transparent-bg"><span class="sr-only">Advanced Search (Premium feature)</span><div inert><a title="link to Advanced Search form" href="/search/advanced" class="quick-search__advancedHeader">Advanced Search</a></div></div>
+</div></div>
+</div></div><div class="header__dropzone"></div>
+
+        </div>
+    
+
+
+
+
+
+        
+        <div class="sub-nav fixed-element"><a href="" data-db-target-for="sub-nav__items" class="sub-nav__toggle hidden-lg"><span>Proceedings of the VLDB Endowment</span></a><div class="sub-nav__container"><div class="container"><div data-ctrl-res="screen-md" class="responsive-menu-container"><div class="left-section pull-left"></div><div class="menu-section"><div style="" class="responsive-menu-nav"><nav id="sub-nav__items" aria-label="secondary navigation" data-db-target-of="sub-nav__items" class="sub-nav__holder drawer__nav"><ul class="rlist--inline menubar"><li><a title="Journal Home" href="/journal/pvldb" class="sub-nav__item">Journal Home</a></li><li title="Coming soon"><a title="Coming soon" class="sub-nav__item disabled">Just Accepted</a></li><li title="Latest Issue"><a title="Latest Issue" href="/toc/pvldb/current" class="sub-nav__item">Latest Issue</a></li>
+
+
+
+        
+        <li style=""></li>
+<li title="Archive"><a title="Archive" href="/loi/pvldb" class="sub-nav__item">Archive</a></li><li><a title="Author List" href="/journal/pvldb/authors" class="sub-nav__item">Author List</a></li><li><a title="Affiliations" href="/journal/pvldb/affiliations" class="sub-nav__item">Affiliations</a></li><li><a title="Award Winners" href="/journal/pvldb/award-winners" class="sub-nav__item">Award Winners</a></li><li aria-haspopup="true" aria-label="More" class="dropdown-more hidden dropdown menu-parent"><a href="" title="More" class="dropdown__toggle hidden-md hidden-sm hidden-xs"><span>More</span><i aria-hidden="true" class="icon-section_arrow_d"></i></a><ul aria-labelledby="main0-1" aria-hidden="true" class="rlist dropdown__menu visible-md visible-sm visible-xs"></ul></li></ul></nav></div></div><div class="right-section hidden-md hidden-sm hidden-xs"></div></div></div>
+
+
+
+        
+        <div id="temp-prog" class="hidden-xs hidden-sm">
+    <div class="progress-bar--wrapper">
+        <div style="" class="progress-bar"></div>
+    </div>
+</div>
+
+<script nonce=""></script>
+</div></div>
+</div><div></div><div class="banner"></div><div class="header-breadcrumb"></div>
+
+        </header>
+    
+
+
+
+
+                    
+                        
+
+
+
+
+
+
+
+
+
+    
+    
+        <div data-widget-def="ux3-layout-widget" data-widget-id="TOKEN" id="skip-to-main-content">
+        
+
+
+
+        
+        <main class="content pvldb loi-page no-margin">
+
+
+
+        
+        <div role="dialog" aria-labelledby="exportCitationsPopup" class="ux-modal-container"><div id="exportCitation" class="modal"><div class="modal__dialog"><div class="modal__header"><button type="button" data-dismiss="modal" class="close"><i aria-hidden="true" aria-label="close popup" class="icon-close_thin"></i></button><h2 id="exportCitationsPopup">Export Citations</h2></div><div class="modal__body"><div class="exportCitation__tabs"><div class="tab"><ul role="tablist" class="rlist tab__nav"></ul></div><div class="csl-wrapper copy__text-wrapper"><form action="/action/exportCiteProcCitation" method="post" target="_blank"><input type="hidden" name="content" value=""/><input type="hidden" name="dois" value=""/><input type="hidden" name="format" value=""/><fieldset class="input-group"><label for="citation-format" class="visibility-hidden">Select Citation format</label><select id="citation-format" data-csl-doi="10.1145/3186728.3164144" aria-label="Select Citation format"><option value="" data-format="bibTex">BibTeX</option><option value="" data-format="endNote">EndNote</option><option value="" data-format="text">ACM Ref</option></select><span class="select-arrow"><i class="icon-bottom-arrow"></i></span></fieldset><ul class="rlist tab__content"><li id="allResultstab" aria-labelledby="allResults" role="tabpanel" class="tab__pane"><div class="all-results-tab-container"><div class="hidden warning-message mb-2">Please download or close your previous search result export first before starting a new bulk export.</div><div class="desc-text"><div class="bold">Preview is not available.</div>By clicking download,<b class="ml-1">a status dialog</b> will open to start the export process. The process may take<b class="ml-1">a few minutes</b> but once it finishes a file will be downloadable from your browser. You may continue to browse the DL while the export process is in progress.</div></div></li><li id="selectedTab" aria-labelledby="selected" role="tabpanel" class="tab__pane active"><div class="csl-wrapper copy__text-wrapper"><pre class="copy__text csl-response"></pre><div id="export-warning"></div><div class="pull-right"><ul role="menu" class="rlist--inline separator"><li><a href="javascript:void(0)" role="menuitem" title="Download citation" class="download__btn disabled"><label class="visibility-hidden">Download citation</label><i aria-hidden="true" class="icon-Icon_Download"></i></a></li><li><input type="hidden" id="doisLimitNumber" value=""/><a href="javascript:void(0)" role="menuitem" title="Copy citation" class="copy__btn disabled"><label class="visibility-hidden">Copy citation</label><i aria-hidden="true" class="icon-pages"></i></a></li></ul></div></div></li></ul></form></div></div></div></div></div></div>
+
+
+
+
+        
+        <link id="build-style-article" rel="stylesheet" type="text/css" href="/products/acm/releasedAssets/css/TOKEN.css"/><div xmlns="http://www.w3.org/1999/xhtml" id="get-premium-access" class="sr-only"><div class="core-description">Several features on this page require Premium Access.</div><div class="core-links"><a href="/about/upgrade">Learn more</a><a href="/action/showLogin" class="signIn">Sign in</a></div></div><article xmlns="http://www.w3.org/1999/xhtml" data-design="basic" data-has="right-rail" data-theme="article" data-type="research-article" vocab="http://schema.org/" typeof="ScholarlyArticle" lang="en" dir="ltr"><header data-extent="frontmatter"><div class="core-container">
+
+
+
+        
+        <style></style>
+
+
+
+
+        
+        <nav aria-label="Breadcrumbs" class="article__breadcrumbs separator"><ul><li><a href="https://dl.acm.org/" class="article__tocHeading">Home</a></li><li><a href="/collections" class="article__tocHeading">Collections</a></li><li><a href="/affils" class="article__tocHeading">Hosted Content</a></li><li><a href="/journal/pvldb" class="article__tocHeading">Proceedings of the VLDB Endowment</a></li><li><a href="/toc/pvldb/2017/11/4" class="article__tocHeading">Vol. 11, No. 4</a></li><li><a href="/doi/10.1145/3186728.3164144" aria-current="page" class="article__tocHeading">Lusail: a system for querying linked data at scale</a></li></ul></nav>
+
+
+
+
+        
+        
+
+
+
+
+
+    
+
+    
+
+
+<div data-article-access="no" data-article-access-type="other" class="meta-panel"><div class="meta-panel__left-content"><div class="meta-panel__type"><span>research-article</span></div></div><div class="meta-panel__right-content"><div class="meta-panel__share">
+
+
+
+        
+        <!----><script type="text/javascript" defer="defer" src="https://static.addtoany.com/menu/page.js"></script><div class="share"><div class="share__block share__inline-links"><div class="pb-dropzone" data-pb-dropzone="shareBlock" title="shareBlock"></div><span class="sr-only">Share on</span><ul class="rlist--inline a2a a2a_kit a2a_kit_size_32"><li class="a2a_listitem_custom"><a role="link" title="share on X" class="a2a_button_x"><i aria-hidden="true" class="at-icon-wrapper icon-x"></i></a></li><li class="a2a_listitem_custom"><a role="link" title="share on LinkedIn" class="a2a_button_linkedin"><i aria-hidden="true" class="at-icon-wrapper icon-linkedin"></i></a></li><li class="a2a_listitem_custom"><a role="link" title="share on Reddit" class="a2a_button_reddit"><i aria-hidden="true" class="at-icon-wrapper icon-riddit-filled"></i></a></li><li class="a2a_listitem_custom"><a role="link" title="share on Facebook" class="a2a_button_facebook"><i aria-hidden="true" class="at-icon-wrapper icon-Icon_Facebook"></i></a></li><li class="a2a_listitem_custom"><a role="link" title="share via email" class="a2a_button_email"><i aria-hidden="true" class="at-icon-wrapper icon-Icon_mail"></i></a></li><div class="pb-dropzone" data-pb-dropzone="share-additional-links" title="share-additional-links"></div></ul></div></div>
+</div></div></div><h1 property="name">Lusail: <span class="subtitle">a system for querying linked data at scale</span></h1><div class="core-relations my-3"></div><div class="contributors"><span class="authors"><span class="heading">Authors</span>: <span role="list"><span property="author" typeof="Person" role="listitem"><a href=""><img src="/pb-assets/icons/DOs/TOKEN.svg" class="core-profile-image" role="presentation"/><span property="givenName">Ibrahim</span> <span property="familyName">Abdelaziz</span></a></span>, <span property="author" typeof="Person" role="listitem"><a href=""><img src="/action/showDoPubAsset" class="core-profile-image" role="presentation"/><span property="givenName">Essam</span> <span property="familyName">Mansour</span></a></span>, <span property="author" typeof="Person" role="listitem"><a href=""><img src="/action/showDoPubAsset" class="core-profile-image" role="presentation"/><span property="givenName">Mourad</span> <span property="familyName">Ouzzani</span></a></span>, <span property="author" typeof="Person" role="listitem"><a href=""><img src="/action/showDoPubAsset" class="core-profile-image" role="presentation"/><span property="givenName">Ashraf</span> <span property="familyName">Aboulnaga</span></a></span>, <span property="author" typeof="Person" role="listitem"><a href=""><img src="/pb-assets/icons/DOs/TOKEN.svg" class="core-profile-image" role="presentation"/><span property="givenName">Panos</span> <span property="familyName">Kalnis</span></a></span></span></span><a href="" class="to-authors-affiliations" data-id="article-authors-viewall">Authors Info &amp; Claims</a></div><div class="core-self-citation"><div class="core-enumeration"><a href="/toc/pvldb/2017/11/4"><span property="isPartOf" typeof="Periodical"><span property="name">Proceedings of the VLDB Endowment</span></span>, <span property="isPartOf" typeof="PublicationVolume">Volume <span property="volumeNumber">11</span></span><span class="delimiter">, </span><span property="isPartOf" typeof="PublicationIssue">Issue <span property="issueNumber">4</span></span></a></div><div property="pagination">Pages <span property="pageStart">485</span> - <span property="pageEnd">498</span></div><div class="doi"><a href="https://doi.org/10.1145/3186728.3164144" property="sameAs">https://doi.org/10.1145/3186728.3164144</a></div></div><div class="core-published"><span class="label">Published</span>: <span class="core-date-published">01 December 2017</span> <a href="">Publication History</a></div><div class="core-related-do"></div><div class="info-panel"><div class="info-panel__left-content"><div class="info-panel__metrics info-panel__item">
+
+
+
+        
+        <div data-title="To view additional metrics, you must have Premium access." data-title-alt="Additional metrics (Premium feature)" data-customClass="simple-tooltip__basic" data-learn-more-link="/about/upgrade" data-learn-more-link-text="Learn more" data-sign-in-link="https://dl.acm.org/action/showLogin" data-sign-in-link-text="Sign in" aria-label="Additional metrics (Premium feature)" tabindex="0" class="simple-tooltip__block--TOKEN simple-tooltip__mobile simple-tooltip__basic-wrapper transparent-bg"><div inert="inert"><div class="pub-metrics"><div class="issue-item__footer-info"><button tabindex="0" aria-haspopup="dialog" aria-expanded="false" aria-controls="TOKEN" title="Click to stay open" class="tooltip metrics-toggle"><span class="citation"><i aria-hidden="true" class="icon-quote"></i><span>19</span><span class="sr-only">citation</span></span><span class="metric"><i aria-hidden="true" class="icon-metric"></i><span>98</span><span class="sr-only">Downloads</span></span></button></div></div></div></div>
+</div><div class="info-panel__altmetrics info-panel__item">
+
+
+
+        
+        
+
+
+
+
+
+<div class="smart-layout">
+    
+        
+
+            
+            
+            
+            
+
+            
+
+        
+    
+</div>
+
+</div></div><div class="info-panel__right-content"><div class="info-panel__article_tools info-panel__item">
+
+
+
+        
+        <a href="" role="button" data-title="Get Citation Alerts (Premium feature)" aria-label="Get Citation Alerts (Premium feature)" class="btn btn--icon simple-tooltip__block--TOKEN btn--slim citation-alerts"><i aria-hidden="true" class="icon-Icon_Alerts"></i></a><div role="dialog" aria-labelledby="TOKEN" class="ux-modal-container"><div id="manageAlert" class="modal"><div class="modal__dialog"><div class="modal__dialog--success hidden"><div class="modal__header"><button type="button" data-dismiss="modal" aria-label="close popup" class="close"><i aria-hidden="true" class="icon-close_thin"></i></button><a id="id-hatemile-navigation-TOKEN" name="id-hatemile-navigation-TOKEN" data-headinganchorfor="TOKEN" class="heading-anchor"></a><h2 id="id-hatemile-navigation-TOKEN">New Citation Alert added!</h2></div><div class="modal__body"><p>This alert has been successfully added and will be sent to:<span class="email"></span></p><p>You will be notified whenever a record that you have chosen has been cited.</p></div><div class="modal__footer"><p>To manage your alert preferences, click on the button below.</p><a href="/action/showPreferences" title="Manage my Alerts" id="id-hatemile-display-TOKEN" class="btn blue big stretched manageAlert__btn"><span data-attributetitleof="TOKEN" class="force-read-before">Manage my Alerts</span></a></div></div><div class="modal__dialog--error hidden"><div class="modal__header"><button type="button" data-dismiss="modal" aria-label="close popup" class="close"><i aria-hidden="true" class="icon-close_thin"></i></button><a id="id-hatemile-navigation-TOKEN" name="id-hatemile-navigation-TOKEN" data-headinganchorfor="TOKEN" class="heading-anchor"></a><h2 id="id-hatemile-navigation-TOKEN">Add a Citation Alert</h2></div><div class="modal__body"><p>To add a citation alert, please <a href="/action/showLogin" title="Sign In" class="link">log in to your account</a></p></div></div></div></div></div>
+</div><div class="info-panel__binder info-panel__item"><a href="" class="btn btn--icon simple-tooltip__block--TOKEN btn--slim binder" aria-label="Save to Binder (Premium feature)"><i aria-hidden="true" class="icon-add-folder"></i></a></div><div class="info-panel__citations info-panel__item"><button data-target="#exportCitation" data-toggle="modal" aria-label="Export Citation" class="article-actionbar__btn btn btn--icon simple-tooltip__block--TOKEN btn--slim citations"><i aria-hidden="true" class="icon-quote"></i><input type="hidden" name="doiVal" value=""/></button></div><div class="info-panel__formats info-panel__item"><a href="" class="btn simple-tooltip__block--TOKEN btn--access" aria-label="Go to purchase options"><i aria-hidden="true" class="icon-get-access"></i><span class="link-text">Get Access</span></a></div></div></div></div></header><div data-core-nav="header" data-extent="frontmatter"><div class="core-nav-wrapper core-container" role="navigation" aria-label="Article navigation"><div><button aria-controls="article_sections_menu" aria-expanded="false" aria-label="Toggle section navigation menu"><i class="icon-burger" aria-hidden="true"></i><span>Contents</span></button><nav id="article_sections_menu" aria-label="Contents" data-core-nav="article"><header><div class="core-self-citation"><div property="isPartOf" typeof="Periodical"><span property="name">Proceedings of the VLDB Endowment</span></div><div class="core-enumeration"><a href="/toc/pvldb/2017/11/4"><span property="isPartOf" typeof="PublicationVolume">Volume <span property="volumeNumber">11</span></span><span class="delimiter">, </span><span property="isPartOf" typeof="PublicationIssue">Issue <span property="issueNumber">4</span></span></a></div></div><div class="content-navigation"><a href="/doi/10.1145/3186728.3164143" aria-label="Previous article" aria-disabled="false" class="content-navigation__prev"><div aria-hidden="true" class="content-navigation__hint"><div class="content-navigation__hint__content"><h6>PREVIOUS ARTICLE</h6><div>Clustering uncertain graphs</div></div></div><i aria-hidden="true" class="icon-Arrow-Stroke"></i><span>Previous</span></a><a href="/doi/10.1145/3186728.3164145" aria-label="Next article" aria-disabled="false" class="content-navigation__next"><div aria-hidden="true" class="content-navigation__hint"><div class="content-navigation__hint__content"><h6>NEXT ARTICLE</h6><div>Cardinality estimation</div></div></div><span>Next</span><i aria-hidden="true" class="icon-Arrow-Stroke"></i></a></div></header><ul><li><a href="">Abstract</a></li><li><a href="">References</a></li></ul><footer>
+
+
+
+        
+        <div class="logo">
+    <img alt="ACM Digital Library" src="/specs/products/acm/releasedAssets/images/TOKEN.png" height="26" width="110" loading="eager">
+</div>
+</footer></nav></div><nav id="article_collateral_menu"><ul class="collateral-pill" data-core-nav="collateral"><li><a href="" aria-controls="core-collateral-info" aria-disabled="true" disabled="true" title="Information & Contributors"><i aria-hidden="true" class="icon-Icon_Information"></i><span class="sr-only">Information & Contributors</span></a></li><li><a href="" aria-controls="core-collateral-metrics" aria-disabled="true" disabled="true" title="Bibliometrics & Citations"><i aria-hidden="true" class="icon-metric"></i><span class="sr-only">Bibliometrics & Citations</span></a></li><li><a href="" aria-controls="TOKEN" aria-disabled="true" disabled="true"><i aria-hidden="true" class="icon-get-access"></i><span class="sr-only">Get Access</span></a></li><li><a href="" class="references pill-item simple-tooltip__inline--TOKEN inline--l" aria-controls="get-premium-access" aria-disabled="true" disabled="true"><i aria-hidden="true" class="icon-Icon_Links-References"></i><span class="sr-only">References</span></a></li><li><a href="" class="figures pill-item simple-tooltip__inline--TOKEN inline--l" aria-controls="get-premium-access" aria-disabled="true" disabled="true"><i aria-hidden="true" class="icon-Icon_Images"></i><span class="sr-only">Figures</span></a></li><li><a href="" class="tables pill-item simple-tooltip__inline--TOKEN inline--l" aria-controls="get-premium-access" aria-disabled="true" disabled="true"><i aria-hidden="true" class="icon-table"></i><span class="sr-only">Tables</span></a></li><li><a href="" class="media pill-item simple-tooltip__inline--TOKEN inline--l" aria-controls="get-premium-access" aria-disabled="true" disabled="true"><i aria-hidden="true" class="icon-play_circle_filled"></i><span class="sr-only">Media</span></a></li><li><a href="" aria-controls="core-collateral-share" aria-disabled="true" disabled="true"><i aria-hidden="true" class="icon-share"></i><span class="sr-only">Share</span></a></li></ul></nav></div></div><div data-core-wrapper="content"><div id="abstracts" data-extent="frontmatter"><div class="core-container"><section id="abstract" data-type="main" property="abstract" typeof="Text" role="doc-abstract"><h2 property="name">Abstract</h2><div role="paragraph">The RDF data model allows publishing interlinked RDF datasets, where each dataset is independently maintained and is queryable via a SPARQL endpoint. Many applications would benefit from querying the resulting large, decentralized, geo-distributed graph through a federated SPARQL query processor. A crucial factor for good performance in federated query processing is pushing as much computation as possible to the local endpoints. Surprisingly, existing federated SPARQL engines are not effective at this task since they rely only on schema information. Consequently, they cause unnecessary data retrieval and communication, leading to poor scalability and response time. This paper addresses these limitations and presents <i>Lusail</i>, a scalable and efficient federated SPARQL system for querying large RDF graphs that are geo-distributed on different endpoints. Lusail uses a novel query rewriting algorithm to push computation to the local endpoints by relying on information about the RDF instances and not only the schema. The query rewriting algorithm has the additional advantage of exposing parallelism in query processing, which Lusail exploits through advanced scheduling at query run time. Our experiments on billions of triples of real and synthetic data show that Lusail outperforms state-of-the-art systems by orders of magnitude in terms of scalability and response time.</div></section></div></div><section id="bodymatter" data-extent="bodymatter" property="articleBody" typeof="Text"><div class="core-container"><div id="purchase-access">
+
+
+
+        
+        
+
+
+
+        
+        <div class="get__access"><div class="mb-4"><h4>Login options</h4><div class="get__access__login pt-3 pb-4"><p class="info--text">Check if you have access through your login credentials or your institution to get full access on this article.</p><a title="Sign in" href="/action/showLogin" class="btn big btn--inverse">Sign in</a></div></div><div><h4>Full Access</h4><div class="get__access__full__access py-3"><a href="/action/publisherEcommerceHelper" title="Get this Article" class="btn blue big false">Get this Article</a></div></div></div>
+
+</div></div></section><section id="backmatter" data-extent="backmatter"><div class="core-container"><section id="bibliography" role="doc-bibliography"><h2>References</h2><div class="bibliolist"><div class="biblioentry" data-has="label"><div class="label">[1]</div><div id="ref-00001" class="citations"><div class="citation"><div class="citation-content">I. Abdelaziz, M. R. Al-Harbi, S. Salihoglu, and P. Kalnis. Combining Vertex-centric Graph Processing with SPARQL for Large-scale RDF Data Analytics. <i>IEEE Transactions on Parallel and Distributed Systems (TPDS)</i>, 28(12):3374--3388, 2017.</div><div class="external-links"><div class="core-xlink-digital-library"><a href="/doi/10.1109/TPDS.2017.2720174">Digital Library</a></div><div class="core-xlink-google-scholar"><a href="https://scholar.google.com/scholar_lookup">Google Scholar</a></div></div></div></div></div><div class="biblioentry" data-has="label"><div class="label">[2]</div><div id="ref-00002" class="citations"><div class="citation"><div class="citation-content">I. Abdelaziz, R. Harbi, Z. Khayyat, and P. Kalnis. A Survey and Experimental Comparison of Distributed SPARQL Engines for Very Large RDF Data. <i>PVLDB</i>, 10(13):2049--2060, 2017.</div><div class="external-links"><div class="core-xlink-digital-library"><a href="/doi/10.14778/3151106.3151109">Digital Library</a></div><div class="core-xlink-google-scholar"><a href="https://scholar.google.com/scholar_lookup">Google Scholar</a></div></div></div></div></div><div class="biblioentry" data-has="label"><div class="label">[3]</div><div id="ref-00003" class="citations"><div class="citation"><div class="citation-content">I. Abdelaziz, E. Mansour, M. Ouzzani, A. Aboulnaga, and P. Kalnis. Lusail: A System for Querying Linked Data at Scale (Extended Version). <i>CoRR</i>, 2017.</div><div class="external-links"><div class="core-xlink-google-scholar"><a href="https://scholar.google.com/scholar">Google Scholar</a></div></div></div></div></div><div class="biblioentry" data-has="label"><div class="label">[4]</div><div id="ref-00004" class="citations"><div class="citation"><div class="citation-content">I. Abdelaziz, E. Mansour, M. Ouzzani, A. Aboulnaga, and P. Kalnis. Query optimizations over decentralized RDF graphs. In <i>Proceedings of International Conference on Data Engineering (ICDE)</i>, pages 139--142, 2017.</div><div class="external-links"><div class="core-xlink-crossref"><a href="https://doi.org/10.1109/ICDE.2017.59">Crossref</a></div><div class="core-xlink-google-scholar"><a href="https://scholar.google.com/scholar_lookup">Google Scholar</a></div></div></div></div></div><div class="biblioentry" data-has="label"><div class="label">[5]</div><div id="ref-00005" class="citations"><div class="citation"><div class="citation-content">M. Acosta, M.-E. Vidal, T. Lampo, J. Castillo, and E. Ruckhaus. ANAPSID: an adaptive query processing engine for SPARQL endpoints. In <i>Proceedings of International Semantic Web Conference (ISWC)</i>, pages 18--34, 2011.</div><div class="external-links"><div class="core-xlink-digital-library"><a href="/doi/10.5555/2063016.2063019">Digital Library</a></div><div class="core-xlink-google-scholar"><a href="https://scholar.google.com/scholar_lookup">Google Scholar</a></div></div></div></div></div><div class="biblioentry" data-has="label"><div class="label">[6]</div><div id="ref-00006" class="citations"><div class="citation"><div class="citation-content">J. L. Ambite and C. A. Knoblock. Flexible and scalable query planning in distributed and heterogeneous environments. In <i>Proceedings of International Conference on Artificial Intelligence Planning Systems (AIPS)</i>, pages 3--10, 1998.</div><div class="external-links"><div class="core-xlink-digital-library"><a href="/doi/10.5555/3090522.3090524">Digital Library</a></div><div class="core-xlink-google-scholar"><a href="https://scholar.google.com/scholar_lookup">Google Scholar</a></div></div></div></div></div><div class="biblioentry" data-has="label"><div class="label">[7]</div><div id="ref-00007" class="citations"><div class="citation"><div class="citation-content">L. Bol'shev and M. Ubaidullaeva. Chauvenet's test in the classical theory of errors. <i>Theory of Probability &amp; Its Applications</i>, 19(4):683--692, 1975.</div><div class="external-links"><div class="core-xlink-crossref"><a href="https://doi.org/10.1137/1119078">Crossref</a></div><div class="core-xlink-google-scholar"><a href="https://scholar.google.com/scholar_lookup">Google Scholar</a></div></div></div></div></div><div class="biblioentry" data-has="label"><div class="label">[8]</div><div id="ref-00008" class="citations"><div class="citation"><div class="citation-content">A. Bonifati, E. Chang, T. Ho, L. V. Lakshmanan, R. Pottinger, and Y. Chung. Schema mapping and query translation in heterogeneous P2P XML databases. <i>The VLDB Journal</i>, 19(2):231--256, 2010.</div><div class="external-links"><div class="core-xlink-digital-library"><a href="/doi/10.1007/s00778-009-0159-9">Digital Library</a></div><div class="core-xlink-google-scholar"><a href="https://scholar.google.com/scholar_lookup">Google Scholar</a></div></div></div></div></div><div class="biblioentry" data-has="label"><div class="label">[9]</div><div id="ref-00009" class="citations"><div class="citation"><div class="citation-content">O. M. Duschka and M. R. Genesereth. Query planning in InfoMaster. In <i>Proceedings ACM Symposium on Applied Computing (SAC)</i>, pages 109--111, 1997.</div><div class="external-links"><div class="core-xlink-digital-library"><a href="/doi/10.1145/331697.331719">Digital Library</a></div><div class="core-xlink-google-scholar"><a href="https://scholar.google.com/scholar_lookup">Google Scholar</a></div></div></div></div></div><div class="biblioentry" data-has="label"><div class="label">[10]</div><div id="ref-00010" class="citations"><div class="citation"><div class="citation-content">O. Erling and I. Mikhailov. RDF support in the Virtuoso DBMS. In <i>Networked Knowledge-Networked Media</i>, pages 7--24. Springer, 2009.</div><div class="external-links"><div class="core-xlink-crossref"><a href="https://doi.org/10.1007/978-3-642-02184-8_2">Crossref</a></div><div class="core-xlink-google-scholar"><a href="https://scholar.google.com/scholar_lookup">Google Scholar</a></div></div></div></div></div><div class="biblioentry" data-has="label"><div class="label">[11]</div><div id="ref-00011" class="citations"><div class="citation"><div class="citation-content">E. Franconi, G. Kuper, A. Lopatenko, and I. Zaihrayeu. Queries and updates in the coDB peer to peer database system. In <i>Proceedings of International Conference on Very Large Data Bases (VLDB)</i>, pages 1277--1280, 2004.</div><div class="external-links"><div class="core-xlink-digital-library"><a href="/doi/10.5555/1316689.1316813">Digital Library</a></div><div class="core-xlink-google-scholar"><a href="https://scholar.google.com/scholar_lookup">Google Scholar</a></div></div></div></div></div><div class="biblioentry" data-has="label"><div class="label">[12]</div><div id="ref-00012" class="citations"><div class="citation"><div class="citation-content">M. A. Gallego, J. D. Fernández, M. A. Martínez-Prieto, and P. de la Fuente. An empirical study of real-world SPARQL queries. In <i>1st International Workshop on Usage Analysis and the Web of Data (USEWOD) at Proceedings World Wide Web Conference (WWW)</i>, 2011.</div><div class="external-links"><div class="core-xlink-google-scholar"><a href="https://scholar.google.com/scholar">Google Scholar</a></div></div></div></div></div><div class="biblioentry" data-has="label"><div class="label">[13]</div><div id="ref-00013" class="citations"><div class="citation"><div class="citation-content">O. Görlitz and S. Staab. SPLENDID: SPARQL endpoint federation exploiting VOID descriptions. In <i>Proceedings Workshop on Consuming Linked Data (COLD) at (ISWC)</i>, 2011.</div><div class="external-links"><div class="core-xlink-google-scholar"><a href="https://scholar.google.com/scholar">Google Scholar</a></div></div></div></div></div><div class="biblioentry" data-has="label"><div class="label">[14]</div><div id="ref-00014" class="citations"><div class="citation"><div class="citation-content">Y. Guo, Z. Pan, and J. Heflin. LUBM: A benchmark for OWL knowledge base systems. <i>Web Semantics</i>, 3(2--3), 2005.</div><div class="external-links"><div class="core-xlink-digital-library"><a href="/doi/10.1016/j.websem.2005.06.005">Digital Library</a></div><div class="core-xlink-google-scholar"><a href="https://scholar.google.com/scholar_lookup">Google Scholar</a></div></div></div></div></div><div class="biblioentry" data-has="label"><div class="label">[15]</div><div id="ref-00015" class="citations"><div class="citation"><div class="citation-content">S. Gurajada, S. Seufert, I. Miliaraki, and M. Theobald. TriAD: A Distributed Shared-nothing RDF Engine Based on Asynchronous Message Passing. In <i>Proceedings of International Conference on Management of Data (SIGMOD)</i>, 2014.</div><div class="external-links"><div class="core-xlink-digital-library"><a href="/doi/10.1145/2588555.2610511">Digital Library</a></div><div class="core-xlink-google-scholar"><a href="https://scholar.google.com/scholar_lookup">Google Scholar</a></div></div></div></div></div><div class="biblioentry" data-has="label"><div class="label">[16]</div><div id="ref-00016" class="citations"><div class="citation"><div class="citation-content">A. Y. Halevy, Z. G. Ives, P. Mork, and I. Tatarinov. Piazza: Data management infrastructure for semantic Web applications. In <i>Proceedings of International Conference on World Wide Web</i>, WWW, pages 556--567, 2003.</div><div class="external-links"><div class="core-xlink-digital-library"><a href="/doi/10.1145/775152.775231">Digital Library</a></div><div class="core-xlink-google-scholar"><a href="https://scholar.google.com/scholar_lookup">Google Scholar</a></div></div></div></div></div><div class="biblioentry" data-has="label"><div class="label">[17]</div><div id="ref-00017" class="citations"><div class="citation"><div class="citation-content">R. Harbi, I. Abdelaziz, P. Kalnis, N. Mamoulis, Y. Ebrahim, and M. Sahli. Accelerating SPARQL queries by exploiting hash-based locality and adaptive partitioning. <i>The VLDB Journal</i>, pages 1--26, 2016.</div><div class="external-links"><div class="core-xlink-digital-library"><a href="/doi/10.1007/s00778-016-0420-y">Digital Library</a></div><div class="core-xlink-google-scholar"><a href="https://scholar.google.com/scholar_lookup">Google Scholar</a></div></div></div></div></div><div class="biblioentry" data-has="label"><div class="label">[18]</div><div id="ref-00018" class="citations"><div class="citation"><div class="citation-content">J. Huang, D. Abadi, and K. Ren. Scalable SPARQL Querying of Large RDF Graphs. <i>PVLDB</i>, 4(11):1123--1134, 2011.</div><div class="external-links"><div class="core-xlink-google-scholar"><a href="https://scholar.google.com/scholar">Google Scholar</a></div></div></div></div></div><div class="biblioentry" data-has="label"><div class="label">[19]</div><div id="ref-00019" class="citations"><div class="citation"><div class="citation-content">K. Lee and L. Liu. Scaling Queries over Big RDF Graphs with Semantic Hash Partitioning. <i>PVLDB</i>, 6(14):1894--1905, 2013.</div><div class="external-links"><div class="core-xlink-digital-library"><a href="/doi/10.14778/2556549.2556571">Digital Library</a></div><div class="core-xlink-google-scholar"><a href="https://scholar.google.com/scholar_lookup">Google Scholar</a></div></div></div></div></div><div class="biblioentry" data-has="label"><div class="label">[20]</div><div id="ref-00020" class="citations"><div class="citation"><div class="citation-content">E. Mansour, I. Abdelaziz, M. Ouzzani, A. Aboulnaga, and P. Kalnis. A demonstration of Lusail: Querying linked data at scale. In <i>Proceedings of International Conference on Management of Data (SIGMOD)</i>, pages 1603--1606, 2017.</div><div class="external-links"><div class="core-xlink-digital-library"><a href="/doi/10.1145/3035918.3058731">Digital Library</a></div><div class="core-xlink-google-scholar"><a href="https://scholar.google.com/scholar_lookup">Google Scholar</a></div></div></div></div></div><div class="biblioentry" data-has="label"><div class="label">[21]</div><div id="ref-00021" class="citations"><div class="citation"><div class="citation-content">G. Moerkotte and T. Neumann. Analysis of two existing and one new dynamic programming algorithm for the generation of optimal bushy join trees without cross products. In <i>Proceedings of International Conference on Very Large Data Bases (VLDB)</i>, pages 930--941, 2006.</div><div class="external-links"><div class="core-xlink-digital-library"><a href="/doi/10.5555/1182635.1164207">Digital Library</a></div><div class="core-xlink-google-scholar"><a href="https://scholar.google.com/scholar_lookup">Google Scholar</a></div></div></div></div></div><div class="biblioentry" data-has="label"><div class="label">[22]</div><div id="ref-00022" class="citations"><div class="citation"><div class="citation-content">G. Moerkotte, T. Neumann, and G. Steidl. Preventing bad plans by bounding the impact of cardinality estimation errors. <i>PVLDB</i>, 2(1):982--993, 2009.</div><div class="external-links"><div class="core-xlink-digital-library"><a href="/doi/10.14778/1687627.1687738">Digital Library</a></div><div class="core-xlink-google-scholar"><a href="https://scholar.google.com/scholar_lookup">Google Scholar</a></div></div></div></div></div><div class="biblioentry" data-has="label"><div class="label">[23]</div><div id="ref-00023" class="citations"><div class="citation"><div class="citation-content">T. Neumann and G. Weikum. The RDF-3X engine for scalable management of RDF data. <i>The VLDB Journal</i>, 19(1):91--113, 2010.</div><div class="external-links"><div class="core-xlink-digital-library"><a href="/doi/10.1007/s00778-009-0165-y">Digital Library</a></div><div class="core-xlink-google-scholar"><a href="https://scholar.google.com/scholar_lookup">Google Scholar</a></div></div></div></div></div><div class="biblioentry" data-has="label"><div class="label">[24]</div><div id="ref-00024" class="citations"><div class="citation"><div class="citation-content">M. Ouzzani and A. Bouguettaya. Query processing and optimization on the web. <i>Distributed and Parallel Databases</i>, 15(3):187--218, 2004.</div><div class="external-links"><div class="core-xlink-digital-library"><a href="/doi/10.1023/B:DAPD.0000018574.71588.06">Digital Library</a></div><div class="core-xlink-google-scholar"><a href="https://scholar.google.com/scholar_lookup">Google Scholar</a></div></div></div></div></div><div class="biblioentry" data-has="label"><div class="label">[25]</div><div id="ref-00025" class="citations"><div class="citation"><div class="citation-content">M. T. Özsu. A survey of RDF Data Management Systems. <i>Frontiers of Computer Science</i>, 10(3):418--432, 2016.</div><div class="external-links"><div class="core-xlink-digital-library"><a href="/doi/10.1007/s11704-016-5554-y">Digital Library</a></div><div class="core-xlink-google-scholar"><a href="https://scholar.google.com/scholar_lookup">Google Scholar</a></div></div></div></div></div><div class="biblioentry" data-has="label"><div class="label">[26]</div><div id="ref-00026" class="citations"><div class="citation"><div class="citation-content">N. A. Rakhmawati, M. Saleem, S. Lalithsena, and S. Decker. QFed: Query set for federated SPARQL query benchmark. In <i>Proceedings of International Conference on Info. Integration and Web-based App. (iiWAS))</i>, pages 207--211, 2014.</div><div class="external-links"><div class="core-xlink-digital-library"><a href="/doi/10.1145/2684200.2684321">Digital Library</a></div><div class="core-xlink-google-scholar"><a href="https://scholar.google.com/scholar_lookup">Google Scholar</a></div></div></div></div></div><div class="biblioentry" data-has="label"><div class="label">[27]</div><div id="ref-00027" class="citations"><div class="citation"><div class="citation-content">M. T. Roth and P. M. Schwarz. Don't scrap it, wrap it! a wrapper architecture for legacy data sources. In <i>Proceedings of International Conference on Very Large Data Bases (VLDB)</i>, volume 97, pages 25--29, 1997.</div><div class="external-links"><div class="core-xlink-digital-library"><a href="/doi/10.5555/645923.670992">Digital Library</a></div><div class="core-xlink-google-scholar"><a href="https://scholar.google.com/scholar_lookup">Google Scholar</a></div></div></div></div></div><div class="biblioentry" data-has="label"><div class="label">[28]</div><div id="ref-00028" class="citations"><div class="citation"><div class="citation-content">M. Sahli, E. Mansour, T. Alturkestani, and P. Kalnis. Automatic tuning of bag-of-tasks application. In <i>Proceedings of International Conference on Data Engineering (ICDE)</i>, pages 843--854, 2015.</div><div class="external-links"><div class="core-xlink-crossref"><a href="https://doi.org/10.1109/ICDE.2015.7113338">Crossref</a></div><div class="core-xlink-google-scholar"><a href="https://scholar.google.com/scholar_lookup">Google Scholar</a></div></div></div></div></div><div class="biblioentry" data-has="label"><div class="label">[29]</div><div id="ref-00029" class="citations"><div class="citation"><div class="citation-content">M. Saleem, A. Hasnainb, and A.-C. Ngonga Ngomo. LargeRDFBench: A billion triples benchmark for sparql endpoint federation (submitted). In <i>Journal of Web Semantics (JWS)</i>, 2017.</div><div class="external-links"><div class="core-xlink-google-scholar"><a href="https://scholar.google.com/scholar">Google Scholar</a></div></div></div></div></div><div class="biblioentry" data-has="label"><div class="label">[30]</div><div id="ref-00030" class="citations"><div class="citation"><div class="citation-content">M. Saleem, Y. Khan, A. Hasnain, I. Ermilov, and A.-C. Ngonga Ngomo. A fine-grained evaluation of SPARQL endpoint federation systems. <i>Semantic Web Journal</i>, 7(5):493--518, 2015.</div><div class="external-links"><div class="core-xlink-digital-library"><a href="/doi/10.3233/SW-150186">Digital Library</a></div><div class="core-xlink-google-scholar"><a href="https://scholar.google.com/scholar_lookup">Google Scholar</a></div></div></div></div></div><div class="biblioentry" data-has="label"><div class="label">[31]</div><div id="ref-00031" class="citations"><div class="citation"><div class="citation-content">M. Saleem and A. N. Ngomo. HiBISCuS: Hypergraph-based source selection for SPARQL endpoint federation. In <i>Proceedings Extended Semantic Web Conference (ESWC)</i>, pages 176--191, 2014.</div><div class="external-links"><div class="core-xlink-crossref"><a href="https://doi.org/10.1007/978-3-319-07443-6_13">Crossref</a></div><div class="core-xlink-google-scholar"><a href="https://scholar.google.com/scholar_lookup">Google Scholar</a></div></div></div></div></div><div class="biblioentry" data-has="label"><div class="label">[32]</div><div id="ref-00032" class="citations"><div class="citation"><div class="citation-content">M. Schmachtenberg, C. Bizer, and H. Paulheim. Adoption of the linked data best practices in different topical domains. In <i>Proceedings of International Semantic Web Conference (ISWC)</i>, pages 245--260, 2014.</div><div class="external-links"><div class="core-xlink-digital-library"><a href="/doi/10.1007/978-3-319-11964-9_16">Digital Library</a></div><div class="core-xlink-google-scholar"><a href="https://scholar.google.com/scholar_lookup">Google Scholar</a></div></div></div></div></div><div class="biblioentry" data-has="label"><div class="label">[33]</div><div id="ref-00033" class="citations"><div class="citation"><div class="citation-content">M. Schmidt, O. Görlitz, P. Haase, G. Ladwig, A. Schwarte, and T. Tran. FedBench: A benchmark suite for federated semantic data query processing. In <i>Proceedings of International Semantic Web Conference (ISWC)</i>, pages 585--600, 2011.</div><div class="external-links"><div class="core-xlink-digital-library"><a href="/doi/10.5555/2063016.2063054">Digital Library</a></div><div class="core-xlink-google-scholar"><a href="https://scholar.google.com/scholar_lookup">Google Scholar</a></div></div></div></div></div><div class="biblioentry" data-has="label"><div class="label">[34]</div><div id="ref-00034" class="citations"><div class="citation"><div class="citation-content">A. Schwarte, P. Haase, K. Hose, R. Schenkel, and M. Schmidt. FedX: Optimization techniques for federated query processing on linked data. In <i>Proceedings of International Semantic Web Conference (ISWC)</i>, pages 601--616, 2011.</div><div class="external-links"><div class="core-xlink-digital-library"><a href="/doi/10.5555/2063016.2063055">Digital Library</a></div><div class="core-xlink-google-scholar"><a href="https://scholar.google.com/scholar_lookup">Google Scholar</a></div></div></div></div></div><div class="biblioentry" data-has="label"><div class="label">[35]</div><div id="ref-00035" class="citations"><div class="citation"><div class="citation-content">A. Tomasic, L. Raschid, and P. Valduriez. Scaling heterogeneous databases and the design of Disco. In <i>Proceedings of International Conference on Distributed Computing Systems (ICDCS)</i>, pages 449--457, 1996.</div><div class="external-links"><div class="core-xlink-digital-library"><a href="/doi/10.5555/846217.847143">Digital Library</a></div><div class="core-xlink-google-scholar"><a href="https://scholar.google.com/scholar_lookup">Google Scholar</a></div></div></div></div></div><div class="biblioentry" data-has="label"><div class="label">[36]</div><div id="ref-00036" class="citations"><div class="citation"><div class="citation-content">K. Zeng, J. Yang, H. Wang, B. Shao, and Z. Wang. A Distributed Graph Engine for Web Scale RDF Data. <i>PVLDB</i>, 6(4):265--276, 2013.</div><div class="external-links"><div class="core-xlink-digital-library"><a href="/doi/10.14778/2535570.2488333">Digital Library</a></div><div class="core-xlink-google-scholar"><a href="https://scholar.google.com/scholar_lookup">Google Scholar</a></div></div></div></div></div></div></section>
+
+
+
+
+
+
+
+
+
+    
+    
+        <div data-widget-def="ux3-layout-widget" data-widget-id="TOKEN" id="ACM_widgets">
+        
+
+
+
+        
+        <div>
+
+
+
+        
+        <div>
+
+
+
+
+
+
+
+
+
+    
+    
+        <div data-widget-def="UX3CitedByWidget" data-widget-id="TOKEN" class="cited-by__article-body">
+        
+
+
+
+        
+        <section class="cited-by"><div class="cited-by__wrapper"><div class="flex justify-between mb-2 align-items-c colored-block__title"><h2 class="cited-by__title left-bordered-title">Cited By</h2><a href="/action/ajaxShowCitedBy" target="_blank" title="View all cited by in new tab" class="downloadAll btn blue">View all<i class="icon-export"></i></a></div><div id="cited-by__content" data-source="/pb/widgets/citedBy?page=1&amp;widgetId=TOKEN&amp;pbContext=%3BrequestedJournal%3Ajournal%3Apvldb%3Barticle%3Aarticle%3Adoi%5C%3A10.1145%2F3186728.3164144%3Bwgroup%3Astring%TOKEN%3BgroupTopic%3Atopic%3Aacm-pubtype%26gt%3Bjournal%3BsubPage%3Astring%3ABasic+Abstract%3Bcsubtype%3Astring%3AJournal%3Bissue%3Aissue%3Adoi%5C%3A10.5555%2F3186728%3BserialTopic%3Atopic%3Aacm-pubtype%26gt%3Bjournal%3Bpage%3Astring%3AArticle%2FChapter+View%3Bctype%3Astring%3AJournal+Content%3Bwebsite%3Awebsite%3Adl-site%3Btaxonomy%3Ataxonomy%3Aacm-pubtype%3BpageGroup%3Astring%3APublication+Pages%3Bjournal%3Ajournal%3Apvldb" class="cited-by__content"></div><ul data-pageSize="3" data-more="Show More Cited By" data-total="19" class="rlist separator cited-by__list"><li class="citedByEntry"><span class="entryAuthor"><span class="comma-separator">Yao Y</span><span class="comma-separator">Zhang Y</span></span><span class="pub-date dot-after">(2025)</span><span>Semantic Data Federated Query Optimization Based on Decomposition of Block-Level Subqueries</span><span class="seriesTitle">Future Internet</span><span class="doi">10.3390/fi17110531</span><span><b class="volume bold">17</b><span class="issue">:11</span></span><span class="page-range">(531)</span><span class="pub-date">Online publication date: 20-Nov-2025</span><div class="extra-links pt-3"><a href="https://doi.org/10.3390/fi17110531" target="_blank" class="link">https://doi.org/10.3390/fi17110531</a></div></li><li class="citedByEntry"><span class="entryAuthor"><span class="comma-separator">Aimonier-Davat J</span><span class="comma-separator">Nédelec B</span><span class="comma-separator">Dang M</span><span class="comma-separator">Molli P</span><span class="comma-separator">Skaf-Molli H</span><span class="comma-separator">Chua T</span><span class="comma-separator">Ngo C</span><span class="comma-separator">Ka-Wei Lee R</span><span class="comma-separator">Kumar R</span><span class="comma-separator">Lauw H</span></span><span class="pub-date dot-after">(2024)</span><span>FedUP: Querying Large-Scale Federations of SPARQL Endpoints</span><span class="seriesTitle">Proceedings of the ACM Web Conference 2024</span><span class="doi">10.1145/3589334.3645704</span><span class="page-range">(2315-2324)</span><span class="pub-date">Online publication date: 13-May-2024</span><div class="extra-links pt-3"><a href="https://dl.acm.org/doi/10.1145/3589334.3645704" target="_blank" class="link">https://dl.acm.org/doi/10.1145/3589334.3645704</a></div></li><li class="citedByEntry"><span class="entryAuthor"><span class="comma-separator">Gu Z</span><span class="comma-separator">Corcoglioniti F</span><span class="comma-separator">Lanti D</span><span class="comma-separator">Mosca A</span><span class="comma-separator">Xiao G</span><span class="comma-separator">Xiong J</span><span class="comma-separator">Calvanese D</span></span><span class="pub-date dot-after">(2024)</span><span>A systematic overview of data federation systems</span><span class="seriesTitle">Semantic Web</span><span class="doi">10.3233/SW-223201</span><span><b class="volume bold">15</b><span class="issue">:1</span></span><span class="page-range">(107-165)</span><span class="pub-date">Online publication date: 12-Jan-2024</span><div class="extra-links pt-3"><a href="https://doi.org/10.3233/SW-223201" target="_blank" class="link">https://doi.org/10.3233/SW-223201</a></div></li><li class="citedByEntry seeMoreWrapper"><a href="javascript:void(0)" data-source="/pb/widgets/citedBy?page=1&amp;widgetId=TOKEN&amp;pbContext=%3BrequestedJournal%3Ajournal%3Apvldb%3Barticle%3Aarticle%3Adoi%5C%3A10.1145%2F3186728.3164144%3Bwgroup%3Astring%TOKEN%3BgroupTopic%3Atopic%3Aacm-pubtype%26gt%3Bjournal%3BsubPage%3Astring%3ABasic+Abstract%3Bcsubtype%3Astring%3AJournal%3Bissue%3Aissue%3Adoi%5C%3A10.5555%2F3186728%3BserialTopic%3Atopic%3Aacm-pubtype%26gt%3Bjournal%3Bpage%3Astring%3AArticle%2FChapter+View%3Bctype%3Astring%3AJournal+Content%3Bwebsite%3Awebsite%3Adl-site%3Btaxonomy%3Ataxonomy%3Aacm-pubtype%3BpageGroup%3Astring%3APublication+Pages%3Bjournal%3Ajournal%3Apvldb" class="cited-by__see-more btn btn--inverse">Show More Cited By</a></li></ul></div></section>
+
+        </div>
+    
+
+</div>
+
+
+
+
+
+
+
+
+
+
+    
+    
+        <section data-widget-def="ux3-layout-widget" data-widget-id="TOKEN" id="sec-terms">
+        
+
+
+
+        
+        <div>
+
+
+
+
+
+
+
+
+
+    
+    
+        <div data-widget-def="UX3TagWidget" data-widget-id="TOKEN" class="citation article__section article__index-terms">
+        
+
+
+
+        
+        
+
+
+
+        
+        <h2>Index Terms</h2>
+<div data-title="To interact with this section, you must have Premium access." data-title-alt="Index Terms (Premium feature)" data-customClass="simple-tooltip__basic" data-learn-more-link="/about/upgrade" data-learn-more-link-text="Learn more" data-sign-in-link="https://dl.acm.org/action/showLogin" data-sign-in-link-text="Sign in" aria-label="Index Terms (Premium feature)" tabindex="0" class="simple-tooltip__block--TOKEN simple-tooltip__mobile simple-tooltip__basic-wrapper tooltip-section"><div inert="inert"><ol class="rlist organizational-chart"><li><div id="organizational-chart__title">Lusail: a system for querying linked data at scale</div><ol class="rlist level-1  ch-3 hasNodes"><li><div data-background="#F5F5F5" style=""><p><a href="/topic/ccs2012/10003120">Human-centered computing</a></p></div><ol class="rlist level-2 ch-1 hasNodes"><li><div data-background="#F5F5F5" style=""><p><a href="/topic/ccs2012/10003120.10003145">Visualization</a></p></div><ol class="rlist level-3 ch-1 hasNodes"><li><div data-background="#F5F5F5" style=""><p><a href="/topic/ccs2012/10003120.10003145.10003147">Visualization application domains</a></p></div><ol class="rlist level-4 ch-1 hasNodes"><li><div data-background="#F5F5F5" style=""><p><a href="/topic/ccs2012/10003120.10003145.10003147.10010887">Geographic visualization</a></p></div><ol class="rlist level-5 ch-0"></ol></li></ol></li></ol></li></ol></li><li><div data-background="#737373" style=""><p><a href="/topic/ccs2012/10002951">Information systems</a></p></div><ol class="rlist level-2 ch-2 hasNodes"><li><div data-background="#F5F5F5" style=""><p><a href="/topic/ccs2012/10002951.10002952">Data management systems</a></p></div><ol class="rlist level-3 ch-1 hasNodes"><li><div data-background="#F5F5F5" style=""><p><a href="/topic/ccs2012/10002951.10002952.10003190">Database management system engines</a></p></div><ol class="rlist level-4 ch-2 hasNodes"><li><div data-background="#F5F5F5" style=""><p><a href="/topic/ccs2012/10002951.10002952.10003190.10003192">Database query processing</a></p></div><ol class="rlist level-5 ch-0"></ol></li><li><div data-background="#F5F5F5" style=""><p><a href="/topic/ccs2012/10002951.10002952.10003190.10003195">Parallel and distributed DBMSs</a></p></div><ol class="rlist level-6 ch-0"></ol></li></ol></li></ol></li><li><div data-background="#737373" style=""><p><a href="/topic/ccs2012/10002951.10003227">Information systems applications</a></p></div><ol class="rlist level-4 ch-1 hasNodes"><li><div data-background="#737373" style=""><p><a href="/topic/ccs2012/10002951.10003227.10003236">Spatial-temporal systems</a></p></div><ol class="rlist level-5 ch-0"></ol></li></ol></li></ol></li><li><div data-background="#F5F5F5" style=""><p><a href="/topic/ccs2012/10003752">Theory of computation</a></p></div><ol class="rlist level-2 ch-1 hasNodes"><li><div data-background="#F5F5F5" style=""><p><a href="/topic/ccs2012/10003752.10010070">Theory and algorithms for application domains</a></p></div><ol class="rlist level-3 ch-1 hasNodes"><li><div data-background="#F5F5F5" style=""><p><a href="/topic/ccs2012/10003752.10010070.10010111">Database theory</a></p></div><ol class="rlist level-4 ch-1 hasNodes"><li><div data-background="#F5F5F5" style=""><p><a href="/topic/ccs2012/10003752.10010070.10010111.10011711">Database query processing and optimization (theory)</a></p></div><ol class="rlist level-5 ch-0"></ol></li></ol></li></ol></li></ol></li></ol></li></ol></div></div>
+
+        </div>
+    
+
+
+
+
+
+
+
+
+
+
+
+    
+    
+        <div data-widget-def="graphQueryWidget" data-widget-id="TOKEN" class="disclaimer">
+        
+
+
+
+        
+        <span> Index terms have been assigned to the content through auto-classification.</span>
+
+        </div>
+    
+
+</div>
+
+        </section>
+    
+
+
+
+
+
+
+
+
+
+
+
+    
+    
+        <section data-widget-def="ux3-layout-widget" data-widget-id="TOKEN" id="sec-recommendations">
+        
+
+
+
+        
+        <div>
+
+
+
+        
+        <h2>Recommendations</h2> 
+
+
+
+
+        
+        <div class="show-recommended"><div data-title="To interact with this section, you must have Premium access." data-title-alt="Recommendations (Premium feature)" data-customClass="simple-tooltip__basic" data-learn-more-link="/about/upgrade" data-learn-more-link-text="Learn more" data-sign-in-link="https://dl.acm.org/action/showLogin" data-sign-in-link-text="Sign in" aria-label="Recommendations (Premium feature)" tabindex="0" class="simple-tooltip__block--TOKEN simple-tooltip__mobile simple-tooltip__basic-wrapper tooltip-section"><div inert="inert"><div data-exp-type="" data-query-id="10.1145/3186728.3164144" class="recommended-articles__content"><ul class="rlist lot"><li class="grid-item"><div class="creative-work"><a href="/doi/10.1145/3035918.3058731" title="A Demonstration of Lusail: Querying Linked Data at Scale"><h3 data-lines="2" class="creative-work__title truncate-text-css">A Demonstration of Lusail: Querying Linked Data at Scale</h3></a><div class="creative-work__sub-title mb-3 mt-1">SIGMOD '17: Proceedings of the 2017 ACM International Conference on Management of Data  </div><div class="description"><div class="issue-item__abstract truncate-text-css" data-lines="4">
+   		
+   <p>There has been a proliferation of datasets available as interlinked RDF data accessible
+      through SPARQL endpoints. This has led to the emergence of various applications in
+      life science, distributed social networks, and Internet of Things that need to ...</p>
+   <p><em></em><em></em></p>
+</div></div><div class="readMore"><a href="/doi/10.1145/3035918.3058731" title="Read More" aria-hidden="true" tabindex="-1">Read More</a></div></div></li><li class="grid-item"><div class="creative-work"><a href="/doi/10.5555/887226" title="Atmospheric Boundary Layer Wind Data During the Period January 1, 1998 Through January 31, 1999 at the Dallas-Fort Worth Airport: Volume 2 - Data and Processing"><h3 data-lines="2" class="creative-work__title truncate-text-css">Atmospheric Boundary Layer Wind Data During the Period January 1, 1998 Through January 31, 1999 at the Dallas-Fort Worth Airport: Volume 2 - Data and Processing</h3></a><div class="readMore"><a href="/doi/10.5555/887226" title="Read More" aria-hidden="true" tabindex="-1">Read More</a></div></div></li><li class="grid-item"><div class="creative-work"><a href="/doi/10.1145/1135777.1135930" title="A pruning-based approach for supporting Top-K join queries"><h3 data-lines="2" class="creative-work__title truncate-text-css">A pruning-based approach for supporting Top-K join queries</h3></a><div class="creative-work__sub-title mb-3 mt-1">WWW '06: Proceedings of the 15th international conference on World Wide Web  </div><div class="description"><div class="issue-item__abstract truncate-text-css" data-lines="4">
+   		
+   <p>An important issue arising from large scale data integration is how to efficiently
+      select the top-K ranking answers from multiple sources while minimizing the transmission
+      cost. This paper resolves this issue by proposing an efficient pruning-based ...</p>
+</div></div><div class="readMore"><a href="/doi/10.1145/1135777.1135930" title="Read More" aria-hidden="true" tabindex="-1">Read More</a></div></div></li></ul></div></div></div></div>
+</div>
+
+        </section>
+    
+
+
+
+
+
+
+
+
+
+
+
+    
+    
+        <section data-widget-def="ux3-layout-widget" data-widget-id="TOKEN" id="sec-comments">
+        
+
+
+
+        
+        <div>
+
+
+
+        
+        <h2>Comments</h2>
+
+
+
+
+        
+        <div data-title="To interact with this section, you must have Premium access." data-title-alt="Comments (Premium feature)" data-customClass="simple-tooltip__basic" data-learn-more-link="/about/upgrade" data-learn-more-link-text="Learn more" data-sign-in-link="https://dl.acm.org/action/showLogin" data-sign-in-link-text="Sign in" aria-label="Comments (Premium feature)" tabindex="0" class="simple-tooltip__block--TOKEN simple-tooltip__mobile simple-tooltip__basic-wrapper tooltip-section"><div inert="inert"><div id="disqus_thread" data-page-identifier="10.1145/3186728.3164144" data-remote-auth="" data-api-key="TOKEN" data-forum-shortname="acm-prod"></div><a href="https://dl.acm.org/doi/10.1145/3186728.3164144" class="disqus-count hidden"></a><noscript></noscript></div></div>
+</div>
+
+        </section>
+    
+
+</div>
+
+        </div>
+    
+
+</div></section></div><div class="core-collateral" role="dialog" aria-modal="true"><div id="core-collateral-info" data-active-pane="false"><header><h2><i class="icon-Icon_Information" aria-hidden="true"></i>Information &amp; Contributors</h2></header><section id="tab-information" role="tabpanel"><h3>Information</h3><section class="core-self-citation"><h4>Published In</h4>
+
+
+
+        
+        <div class="cover-image"><div class="cover-image__image"><img src="/specs/products/acm/releasedAssets/images/TOKEN.svg" data-src="/cms/asset/TOKEN/3186728.cover.jpg" alt="cover image Proceedings of the VLDB Endowment" height="392" width="302" class="lazy"/></div><div class="cover-image__details"><div class="journal-meta"><span class="serial-title">Proceedings of the VLDB Endowment</span>&nbsp;<span class="serial-info"> Volume 11, Issue 4</span></div><div class="cover-date">December 2017</div><div class="cover-pages">133  pages</div><div class="cover-image__details-extra"><div class="flex-container"><span class="bold">ISSN:</span><span class="space">2150-8097</span></div><div class="flex-container"><div><ul class="rlist--inline loa truncate-list" title="list of authors" data-lines="2"><li class="label"><b>Editors: </b></li><li><a href="/profile/99659209901" title="Jian Pei"><img class="author-picture" src="/pb-assets/icons/DOs/TOKEN.svg" width="24" height="24" alt="Author Picture" aria-hidden="true"/><span>Jian Pei</span></a><span>,</span></li><li><a href="/profile/81100419641" title="Sihem Amer-Yahia"><img class="author-picture" src="/action/showDoPubAsset" width="24" height="24" alt="Author Picture" aria-hidden="true"/><span>Sihem Amer-Yahia</span></a></li></ul></div></div><a href="/toc/pvldb/2017/11/4" class="toc--link">Issue’s Table of Contents</a></div><div class="pb-dropzone" data-pb-dropzone="metadataDisplayExtra" title="metadataDisplayExtra"></div></div></div>
+</section><section class="core-publisher"><h4>Publisher</h4><div class="section__content"><div class="publisher__details"><p class="publisher__name">VLDB Endowment</p></div></div></section><section id="core-history" class="core-history"><h4>Publication History</h4><div><b class="core-label">Published</b>: 01 December 2017</div><div class="core-enumeration">Published in PVLDB <span property="isPartOf" typeof="PublicationVolume">Volume <span property="volumeNumber">11</span></span>, <span property="isPartOf" typeof="PublicationIssue">Issue <span property="issueNumber">4</span></span></div></section><section class="core-qualifiers"><h4>Qualifiers</h4><ul><li>Research-article</li></ul></section></section><section id="tab-contributors" role="tabpanel"><h3>Contributors</h3>
+
+
+
+
+
+
+
+
+
+    
+    
+        <div data-widget-def="TOKEN" data-widget-id="TOKEN" class="expandable-accordion">
+        
+
+
+
+        
+        <div class="publication-contribs-contianer"><input id="ContribsAjax" type="hidden" data-ajax="/pb/widgets/getContribs?widgetId=TOKEN&amp;pbContext=%3BrequestedJournal%3Ajournal%3Apvldb%3Barticle%3Aarticle%3Adoi%5C%3A10.1145%2F3186728.3164144%3Bwgroup%3Astring%TOKEN%3BgroupTopic%3Atopic%3Aacm-pubtype%26gt%3Bjournal%3BsubPage%3Astring%3ABasic+Abstract%3Bcsubtype%3Astring%3AJournal%3Bissue%3Aissue%3Adoi%5C%3A10.5555%2F3186728%3BserialTopic%3Atopic%3Aacm-pubtype%26gt%3Bjournal%3Bpage%3Astring%3AArticle%2FChapter+View%3Bctype%3Astring%3AJournal+Content%3Bwebsite%3Awebsite%3Adl-site%3Btaxonomy%3Ataxonomy%3Aacm-pubtype%3BpageGroup%3Astring%3APublication+Pages%3Bjournal%3Ajournal%3Apvldb"/><div class="loader"><img src="/specs/products/acm/releasedAssets/images/TOKEN.gif"/></div></div>
+
+        </div>
+    
+
+<section><h4 class="left-bordered-title">Other Metrics</h4><div class="otherMetrics__section__content"><a href="" data-tab="TOKEN" data-label="Bibliometrics &amp; Citations" class="btn btn--inverse tab-link stretched">View Article Metrics</a></div></section></section></div><div id="core-collateral-metrics" data-active-pane="false"><header><h2><i class="icon-metric" aria-hidden="true"></i>Bibliometrics &amp; Citations</h2></header><section id="tab-metrics-inner" role="tabpanel"><h3>Bibliometrics</h3><section>
+
+
+
+        
+            <h4 class="">
+                Article Metrics
+            </h4>
+        
+        <div class="pill-bibliometrics__content"><div class="section__content"><ul class="rlist--inline article-metrics"><li><div class="article-metric citation"><div class="metric-value"><span>19</span></div>Total Citations</div><a href="" class="primary-blue-color tab-link slide-active pill-content">View Citations</a></li><li><div class="article-metric download"><div class="metric-value"><span>98</span></div>Total Downloads</div></li></ul><ul class="rlist metrics__list"><li><span class="metric-name">Downloads (Last 12 months)</span><span data-title="To view advanced metrics, you must have Premium access." data-title-alt="Advanced metrics (Premium feature)" data-customClass="simple-tooltip__basic" data-learn-more-link="/about/upgrade" data-learn-more-link-text="Learn more" data-sign-in-link="https://dl.acm.org/action/showLogin" data-sign-in-link-text="Sign in" aria-label="Advanced metrics (Premium feature)" tabindex="0" class="simple-tooltip__block--TOKEN simple-tooltip__mobile simple-tooltip__basic-wrapper inline transparent-bg"><span inert="inert">...</span></span></li><li><span class="metric-name">Downloads (Last 6 weeks)   </span><span data-title="To view advanced metrics, you must have Premium access." data-title-alt="Advanced metrics (Premium feature)" data-customClass="simple-tooltip__basic" data-learn-more-link="/about/upgrade" data-learn-more-link-text="Learn more" data-sign-in-link="https://dl.acm.org/action/showLogin" data-sign-in-link-text="Sign in" aria-label="Advanced metrics (Premium feature)" tabindex="0" class="simple-tooltip__block--TOKEN simple-tooltip__mobile simple-tooltip__basic-wrapper inline transparent-bg"><span inert="inert">...</span></span></li></ul><div class="metric-update"><span class="metric-update__date">Reflects downloads up to 20 Jul 2026</span></div></div></div>
+
+
+
+
+        
+        
+
+
+
+
+
+<div class="smart-layout">
+    
+        
+
+            
+            
+            
+            
+
+            
+
+        
+
+            
+            
+            
+            
+
+            
+                <div class="smart-layout_dropzone-container">
+
+                    
+
+                    
+                    <div data-pb-dropzone="TOKEN">
+                        
+                    </div>
+                </div>
+            
+
+        
+    
+</div>
+
+</section><section>
+
+
+
+        
+        
+
+
+
+
+
+<div class="smart-layout">
+    
+        
+
+            
+            
+            
+            
+
+            
+
+        
+
+            
+            
+            
+            
+
+            
+                <div class="smart-layout_dropzone-container">
+
+                    
+
+                    
+                    <div data-pb-dropzone="TOKEN">
+                        
+
+
+
+
+
+
+
+
+
+    
+    
+        <div data-widget-def="graphQueryWidget" data-widget-id="TOKEN" class="mt-3 mb-3">
+        
+
+
+
+        
+        <div data-title="To view Altmetrics details, you must have Premium access." data-title-alt="Altmetrics (Premium feature)" data-customClass="simple-tooltip__basic" data-learn-more-link="/about/upgrade" data-learn-more-link-text="Learn more" data-sign-in-link="https://dl.acm.org/action/showLogin" data-sign-in-link-text="Sign in" aria-label="Altmetrics (Premium feature)" tabindex="0" data-top-offset="55px" class="simple-tooltip__block--TOKEN simple-tooltip__mobile simple-tooltip__basic-wrapper tooltip-section dynamic-content gray-out"><div inert><script nonce="" async type="text/javascript" src="https://embed.altmetric.com/assets/embed.js"></script><div data-badge-type="medium-donut" data-doi="10.1145/3186728.3164144" data-no-score="true" data-hide-no-mentions="false" data-link-target="_blank" style="" class="altmetric-embed"></div></div></div>
+
+        </div>
+    
+
+
+                    </div>
+                </div>
+            
+
+        
+    
+</div>
+
+</section><section><h4 class="left-bordered-title">Other Metrics</h4><div class="otherMetrics__section__content"><a href="" data-tab="pill-authors__content" data-label="Information &amp; Authors" class="btn btn--inverse tab-link stretched">View Author Metrics</a></div></section></section><section id="tab-citations" role="tabpanel"><h3>Citations</h3><section></section><section>
+
+
+
+        
+        <section class="cited-by"><div class="cited-by__wrapper"><div class="flex justify-between mb-2 align-items-c colored-block__title"><h2 class="cited-by__title left-bordered-title">Cited By</h2><a href="/action/ajaxShowCitedBy" target="_blank" title="View all cited by in new tab" class="downloadAll btn blue">View all<i class="icon-export"></i></a></div><div id="cited-by__content" data-source="/pb/widgets/citedBy?page=1&amp;widgetId=TOKEN&amp;pbContext=%3BrequestedJournal%3Ajournal%3Apvldb%3Barticle%3Aarticle%3Adoi%5C%3A10.1145%2F3186728.3164144%3Bwgroup%3Astring%TOKEN%3BgroupTopic%3Atopic%3Aacm-pubtype%26gt%3Bjournal%3BsubPage%3Astring%3ABasic+Abstract%3Bcsubtype%3Astring%3AJournal%3Bissue%3Aissue%3Adoi%5C%3A10.5555%2F3186728%3BserialTopic%3Atopic%3Aacm-pubtype%26gt%3Bjournal%3Bpage%3Astring%3AArticle%2FChapter+View%3Bctype%3Astring%3AJournal+Content%3Bwebsite%3Awebsite%3Adl-site%3Btaxonomy%3Ataxonomy%3Aacm-pubtype%3BpageGroup%3Astring%3APublication+Pages%3Bjournal%3Ajournal%3Apvldb" class="cited-by__content"></div><ul data-pageSize="10" data-more="Show More Cited By" data-total="19" class="rlist separator cited-by__list"><li class="citedByEntry"><span class="entryAuthor"><span class="comma-separator">Yao Y</span><span class="comma-separator">Zhang Y</span></span><span class="pub-date dot-after">(2025)</span><span>Semantic Data Federated Query Optimization Based on Decomposition of Block-Level Subqueries</span><span class="seriesTitle">Future Internet</span><span class="doi">10.3390/fi17110531</span><span><b class="volume bold">17</b><span class="issue">:11</span></span><span class="page-range">(531)</span><span class="pub-date">Online publication date: 20-Nov-2025</span><div class="extra-links pt-3"><a href="https://doi.org/10.3390/fi17110531" target="_blank" class="link">https://doi.org/10.3390/fi17110531</a></div></li><li class="citedByEntry"><span class="entryAuthor"><span class="comma-separator">Aimonier-Davat J</span><span class="comma-separator">Nédelec B</span><span class="comma-separator">Dang M</span><span class="comma-separator">Molli P</span><span class="comma-separator">Skaf-Molli H</span><span class="comma-separator">Chua T</span><span class="comma-separator">Ngo C</span><span class="comma-separator">Ka-Wei Lee R</span><span class="comma-separator">Kumar R</span><span class="comma-separator">Lauw H</span></span><span class="pub-date dot-after">(2024)</span><span>FedUP: Querying Large-Scale Federations of SPARQL Endpoints</span><span class="seriesTitle">Proceedings of the ACM Web Conference 2024</span><span class="doi">10.1145/3589334.3645704</span><span class="page-range">(2315-2324)</span><span class="pub-date">Online publication date: 13-May-2024</span><div class="extra-links pt-3"><a href="https://dl.acm.org/doi/10.1145/3589334.3645704" target="_blank" class="link">https://dl.acm.org/doi/10.1145/3589334.3645704</a></div></li><li class="citedByEntry"><span class="entryAuthor"><span class="comma-separator">Gu Z</span><span class="comma-separator">Corcoglioniti F</span><span class="comma-separator">Lanti D</span><span class="comma-separator">Mosca A</span><span class="comma-separator">Xiao G</span><span class="comma-separator">Xiong J</span><span class="comma-separator">Calvanese D</span></span><span class="pub-date dot-after">(2024)</span><span>A systematic overview of data federation systems</span><span class="seriesTitle">Semantic Web</span><span class="doi">10.3233/SW-223201</span><span><b class="volume bold">15</b><span class="issue">:1</span></span><span class="page-range">(107-165)</span><span class="pub-date">Online publication date: 12-Jan-2024</span><div class="extra-links pt-3"><a href="https://doi.org/10.3233/SW-223201" target="_blank" class="link">https://doi.org/10.3233/SW-223201</a></div></li><li class="citedByEntry"><span class="entryAuthor"><span class="comma-separator">DAMERON O</span><span class="comma-separator">Froidevaux C</span><span class="comma-separator">Martin‐Magniette M</span><span class="comma-separator">Rigaill G</span></span><span class="pub-date dot-after">(2023)</span><span>Semantic Web Methods for Data Integration in Life Sciences</span><span class="seriesTitle">Biological Data Integration</span><span class="doi">10.1002/9781394257317.ch2</span><span class="page-range">(25-51)</span><span class="pub-date">Online publication date: 8-Dec-2023</span><div class="extra-links pt-3"><a href="https://doi.org/10.1002/9781394257317.ch2" target="_blank" class="link">https://doi.org/10.1002/9781394257317.ch2</a></div></li><li class="citedByEntry"><span class="entryAuthor"><span class="comma-separator">Zeimetz T</span><span class="comma-separator">Hose K</span><span class="comma-separator">Schenkel R</span></span><span class="pub-date dot-after">(2023)</span><span>Tunable Query Optimizer for Web APIs and User Preferences</span><span class="seriesTitle">Proceedings of the 12th Knowledge Capture Conference 2023</span><span class="doi">10.1145/3587259.3627542</span><span class="page-range">(92-100)</span><span class="pub-date">Online publication date: 5-Dec-2023</span><div class="extra-links pt-3"><a href="https://dl.acm.org/doi/10.1145/3587259.3627542" target="_blank" class="link">https://dl.acm.org/doi/10.1145/3587259.3627542</a></div></li><li class="citedByEntry"><span class="entryAuthor"><span class="comma-separator">Dang M</span><span class="comma-separator">Aimonier-Davat J</span><span class="comma-separator">Molli P</span><span class="comma-separator">Hartig O</span><span class="comma-separator">Skaf-Molli H</span><span class="comma-separator">Le Crom Y</span></span><span class="pub-date dot-after">(2023)</span><span>FedShop: A Benchmark for Testing the Scalability of SPARQL Federation Engines</span><span class="seriesTitle">The Semantic Web – ISWC 2023</span><span class="doi">10.TOKEN</span><span class="page-range">(285-301)</span><span class="pub-date">Online publication date: 6-Nov-2023</span><div class="extra-links pt-3"><a href="https://dl.acm.org/doi/10.1007/978-3-031-47243-5_16" target="_blank" class="link">https://dl.acm.org/doi/10.TOKEN</a></div></li><li class="citedByEntry"><span class="entryAuthor"><span class="comma-separator">Li M</span><span class="comma-separator">Peng P</span><span class="comma-separator">Tian Z</span><span class="comma-separator">Qin Z</span><span class="comma-separator">Huang Z</span><span class="comma-separator">Liu Y</span></span><span class="pub-date dot-after">(2023)</span><span>Optimizing Keyword Search Over Federated RDF Systems</span><span class="seriesTitle">IEEE Transactions on Big Data</span><span class="doi">10.1109/TBDATA.2022.3224749</span><span><b class="volume bold">9</b><span class="issue">:3</span></span><span class="page-range">(918-935)</span><span class="pub-date">Online publication date: 1-Jun-2023</span><div class="extra-links pt-3"><a href="https://doi.org/10.1109/TBDATA.2022.3224749" target="_blank" class="link">https://doi.org/10.1109/TBDATA.2022.3224749</a></div></li><li class="citedByEntry"><span class="entryAuthor"><span class="comma-separator">Omar R</span><span class="comma-separator">Dhall I</span><span class="comma-separator">Kalnis P</span><span class="comma-separator">Mansour E</span></span><span class="pub-date dot-after">(2023)</span><span>A Universal Question-Answering Platform for Knowledge Graphs</span><span class="seriesTitle">Proceedings of the ACM on Management of Data</span><span class="doi">10.1145/3588911</span><span><b class="volume bold">1</b><span class="issue">:1</span></span><span class="page-range">(1-25)</span><span class="pub-date">Online publication date: 30-May-2023</span><div class="extra-links pt-3"><a href="https://dl.acm.org/doi/10.1145/3588911" target="_blank" class="link">https://dl.acm.org/doi/10.1145/3588911</a></div></li><li class="citedByEntry"><span class="entryAuthor"><span class="comma-separator">Yang F</span><span class="comma-separator">Crainiceanu A</span><span class="comma-separator">Chen Z</span><span class="comma-separator">Needham D</span></span><span class="pub-date dot-after">(2023)</span><span>Cluster-Based Joins for Federated SPARQL Queries</span><span class="seriesTitle">IEEE Transactions on Knowledge and Data Engineering</span><span class="doi">10.1109/TKDE.2021.3135507</span><span><b class="volume bold">35</b><span class="issue">:4</span></span><span class="page-range">(3525-3539)</span><span class="pub-date">Online publication date: 1-Apr-2023</span><div class="extra-links pt-3"><a href="https://dl.acm.org/doi/10.1109/TKDE.2021.3135507" target="_blank" class="link">https://dl.acm.org/doi/10.1109/TKDE.2021.3135507</a></div></li><li class="citedByEntry"><span class="entryAuthor"><span class="comma-separator">Cheng S</span><span class="comma-separator">Hartig O</span></span><span class="pub-date dot-after">(2022)</span><span>Towards Query Processing over Heterogeneous Federations of RDF Data Sources</span><span class="seriesTitle">The Semantic Web: ESWC 2022 Satellite Events</span><span class="doi">10.TOKEN</span><span class="page-range">(57-62)</span><span class="pub-date">Online publication date: 29-May-2022</span><div class="extra-links pt-3"><a href="https://dl.acm.org/doi/10.1007/978-3-031-11609-4_11" target="_blank" class="link">https://dl.acm.org/doi/10.TOKEN</a></div></li><li class="citedByEntry seeMoreWrapper"><a href="javascript:void(0)" data-source="/pb/widgets/citedBy?page=1&amp;widgetId=TOKEN&amp;pbContext=%3BrequestedJournal%3Ajournal%3Apvldb%3Barticle%3Aarticle%3Adoi%5C%3A10.1145%2F3186728.3164144%3Bwgroup%3Astring%TOKEN%3BgroupTopic%3Atopic%3Aacm-pubtype%26gt%3Bjournal%3BsubPage%3Astring%3ABasic+Abstract%3Bcsubtype%3Astring%3AJournal%3Bissue%3Aissue%3Adoi%5C%3A10.5555%2F3186728%3BserialTopic%3Atopic%3Aacm-pubtype%26gt%3Bjournal%3Bpage%3Astring%3AArticle%2FChapter+View%3Bctype%3Astring%3AJournal+Content%3Bwebsite%3Awebsite%3Adl-site%3Btaxonomy%3Ataxonomy%3Aacm-pubtype%3BpageGroup%3Astring%3APublication+Pages%3Bjournal%3Ajournal%3Apvldb" class="cited-by__see-more btn btn--inverse">Show More Cited By</a></li></ul></div></section>
+</section></section></div><div id="core-collateral-share" data-active-pane="false"><header><h2><i class="icon-Icon_Share" aria-hidden="true"></i>Share</h2></header><h3>Share</h3><div class="section--wrapper"><section><h4>Share this Publication link</h4><div id="share-self"><p class="share-self__source"></p><button aria-label="Copy the content Link" class="share-self__action btn btn--inverse"><i aria-hidden="true" class="icon-pages"></i><span>Copy Link</span></button><div aria-live="polite" class="share-self__status"><p class="share-self__success"><i aria-hidden="true" class="icon-check_circle"></i><span>Copied!</span></p><p class="share-self__failed"><i aria-hidden="true" class="icon-x_btnclose"></i><span>Copying failed.</span></p></div></div></section><section><h4>Share on social media</h4><div class="share-buttons a2a a2a_kit"><a href="" aria-label="Share on X" data-id="article-share-twitter" rel="nofollow noopener" role="link" target="_blank" title="Share on X" class="btn btn--twitter a2a_button_twitter"><i aria-hidden="true" class="icon-x"></i><span>X</span></a><a href="" aria-label="Share on LinkedIn" data-id="article-share-linkedin" rel="nofollow noopener" role="link" target="_blank" title="Share on LinkedIn" class="btn btn--linkedin a2a_button_linkedin"><i aria-hidden="true" class="icon-linkedin"></i><span>LinkedIn</span></a><a href="" aria-label="Share on Reddit" data-id="article-share-reddit" rel="nofollow noopener" role="link" target="_blank" title="Share on Reddit" class="btn btn--reddit a2a_button_reddit"><i aria-hidden="true" class="icon-reddit-filled"></i><span>Reddit</span></a><a href="" aria-label="Share on Facebook" data-id="article-share-facebook" rel="nofollow noopener" role="link" target="_blank" title="Share on Facebook" class="btn btn--facebook a2a_button_facebook"><i aria-hidden="true" class="icon-Icon_Facebook"></i><span>Facebook</span></a><a href="" aria-label="Share on email" data-id="article-share-email" rel="nofollow noopener" role="link" target="_blank" title="Share on email" class="btn btn--email a2a_button_email"><i aria-hidden="true" class="icon-Icon_mail"></i><span>email</span></a></div></section></div></div></div><aside data-core-aside="right-rail">
+
+
+
+
+
+
+
+
+
+    
+    
+        <div data-widget-def="ux3-layout-widget" data-widget-id="TOKEN" class="right-rail-ads">
+        
+
+
+
+        
+        <div class="col-md-12 col-sm-6">
+
+
+
+
+
+
+
+
+
+    
+    
+        <div data-widget-def="literatumAd" data-widget-id="TOKEN" class="pb-las">
+        
+
+
+
+        
+        
+
+
+
+
+
+    
+        <a href="/action/clickThrough"><img src="/sda/108290/inroads-dl-sky-ad.png" alt="Inroads Sky Ad"/></a>
+
+        
+    
+
+    
+
+
+
+        </div>
+    
+
+
+
+
+
+
+
+
+
+
+
+    
+    
+        <div data-widget-def="literatumAd" data-widget-id="TOKEN" class="pb-las">
+        
+
+
+
+        
+        
+
+
+
+
+
+    
+        <a href="/action/clickThrough">
+<img src="/sda/108193/taisap-new-dl-sky-ad.png" alt="Taisap Ad"/></a>
+        
+    
+
+    
+
+
+
+        </div>
+    
+
+
+
+
+
+
+
+
+
+
+
+    
+    
+        <div data-widget-def="literatumAd" data-widget-id="TOKEN" class="pb-las">
+        
+
+
+
+        
+        
+
+
+
+
+
+    
+        <a href="/action/clickThrough"><img src="/sda/108245/Allemang_250x300.jpg" alt="ACM Books Allemang Med Box Ad"/></a>
+
+
+        
+    
+
+    
+
+
+
+        </div>
+    
+
+</div>
+
+        </div>
+    
+
+</aside><div class="contributors-with-details" style=""><section class="core-authors"><h4>Affiliations</h4><div id="artseq-00001" property="author" typeof="Person" data-doi="10.TOKEN"><div class="heading"><img src="/pb-assets/icons/DOs/TOKEN.svg" class="core-profile-image" role="presentation"/><div property="name"><span property="givenName">Ibrahim</span> <span property="familyName">Abdelaziz</span></div></div><div class="content"><div class="affiliations"><div property="affiliation" typeof="Organization"><span property="name">King Abdullah University of Science &amp; Technology</span></div></div><div class="core-author-link"><a href="/profile/99658749134" rel="nofollow" class="profile-link">View Profile</a></div></div></div><div id="artseq-00002" property="author" typeof="Person" data-doi="10.TOKEN"><div class="heading"><img src="/action/showDoPubAsset" class="core-profile-image" role="presentation"/><div property="name"><span property="givenName">Essam</span> <span property="familyName">Mansour</span></div></div><div class="content"><div class="affiliations"><div property="affiliation" typeof="Organization"><span property="name">Qatar Computing Research Institute, HBKU</span></div></div><div class="core-author-link"><a href="/profile/81100029928" rel="nofollow" class="profile-link">View Profile</a></div></div></div><div id="artseq-00003" property="author" typeof="Person" data-doi="10.TOKEN"><div class="heading"><img src="/action/showDoPubAsset" class="core-profile-image" role="presentation"/><div property="name"><span property="givenName">Mourad</span> <span property="familyName">Ouzzani</span></div></div><div class="content"><div class="affiliations"><div property="affiliation" typeof="Organization"><span property="name">Qatar Computing Research Institute, HBKU</span></div></div><div class="core-author-link"><a href="/profile/81100529934" rel="nofollow" class="profile-link">View Profile</a></div></div></div><div id="artseq-00004" property="author" typeof="Person" data-doi="10.TOKEN"><div class="heading"><img src="/action/showDoPubAsset" class="core-profile-image" role="presentation"/><div property="name"><span property="givenName">Ashraf</span> <span property="familyName">Aboulnaga</span></div></div><div class="content"><div class="affiliations"><div property="affiliation" typeof="Organization"><span property="name">Qatar Computing Research Institute, HBKU</span></div></div><div class="core-author-link"><a href="/profile/81100138515" rel="nofollow" class="profile-link">View Profile</a></div></div></div><div id="artseq-00005" property="author" typeof="Person" data-doi="10.TOKEN"><div class="heading"><img src="/pb-assets/icons/DOs/TOKEN.svg" class="core-profile-image" role="presentation"/><div property="name"><span property="givenName">Panos</span> <span property="familyName">Kalnis</span></div></div><div class="content"><div class="affiliations"><div property="affiliation" typeof="Organization"><span property="name">King Abdullah University of Science &amp; Technology</span></div></div><div class="core-author-link"><a href="/profile/81100367783" rel="nofollow" class="profile-link">View Profile</a></div></div></div></section></div></article><div data-extent="article-wrapper"><div class="core-container"></div><div class="after-credits"><div class="core-container"><a href="/doi/pdf/10.1145/3186728.3164144" id="downloadPdfUrl" aria-hidden="true" data-doi="10.1145/3186728.3164144"><span>Download PDF</span></a></div></div></div><script id="axel-publication-metadata" type="application/json"></script><script type="text/javascript" data-ot-ignore="data-ot-ignore" defer="defer" src="https://static.addtoany.com/menu/page.js" class="optanon-category-C0004 ot-vscat-C0004"></script><template id="core_texts_template" data-goto="Go to ##" data-gotographic="Go to Figure" data-gototable="Go to Table" data-gotomedia="Go to Media" data-openall="Open all in viewer" data-openspecific="Open ## in Viewer" data-opengeneric="Open in Viewer" data-citations-goto="Go to Citation" data-citations-toggle="Toggle citations menu" data-citations-links="Citations links" data-citations-hide="Hide Citations" data-citations-show="Show Citations" data-footnotes-goto="Return to text" data-footnotes-toggle="Toggle footnotes menu" data-footnotes-links="Footnotes links" data-footnotes-hide="Hide Footnotes" data-footnotes-show="Show Footnotes" data-backtofigure="Go to this figure within the text" data-backtoimage="Go to this image within the text" data-backtotable="Go to this table within the text" data-backtomedia="Go to this media within the text"></template><div role="navigation" aria-label="Sticky Navigation" class="st-header-acm"><div class="st-header__track"><div id="progress-tracker" class="st-header__tracker"></div></div></div><template id="fv_skeleton_template" data-overlay="View figure"><div role="dialog" aria-modal="true" aria-label="Figure Viewer" hidden="hidden" class="core-fv"><div role="region" hidden="hidden" class="core-fv__directory"><header aria-label="Category Tabs Toolbar" class="core-fv__toolbar"><div role="tablist" aria-label="Figure Viewer Category Tabs"><button role="tab" aria-selected="false" aria-controls="core-fv-panel_graphic" id="core-fv__graphic-tab" class="core-fv__btn"><span>Figures</span></button><button role="tab" aria-selected="false" aria-controls="core-fv-panel_table" id="core-fv__table-tab" class="core-fv__btn"><span>Tables</span></button></div><button role="button" class="core-fv__close core-fv__btn" title="Close"><i aria-hidden="true" class="icon-close_thin"></i><span class="sr-only">Close figure viewer</span></button></header><main aria-label="Selected Category Content" class="core-fv__content"><div role="tabpanel" id="core-fv-panel_graphic" aria-labelledby="core-fv__graphic-tab"></div><div role="tabpanel" id="core-fv-panel_table" aria-labelledby="core-fv__table-tab"></div></main></div><div role="region" data-zoomed="false" hidden="hidden" class="core-fv__lightbox"><header aria-label="Figure Viewer Toolbar" class="core-fv__toolbar"><button role="button" class="core-fv__close core-fv__btn"><i aria-hidden="true" class="icon-arrow_l"></i><span>Back to article</span></button><div id="core-fv__toolbar__info" class="core-fv__toolbar__info">Figure title goes here</div><div class="core-fv__toolbar__holster"><div data-visible-on="graphic table"><button role="button" class="core-fv__zoom  core-fv__btn" title="Change zoom level"><i data-zoom="in" aria-hidden="true" class="icon-zoom-in"></i><i data-zoom="out" aria-hidden="true" class="icon-zoom-out"></i><span class="sr-only">Change zoom level</span></button></div><div data-visible-on="graphic table media"><a href="" class="core-fv__back core-fv__back-to-original core-fv__btn" title="Go to this figure within the text"><i aria-hidden="true" class="icon-go-to-original"></i><span class="sr-only">Go to this figure within the text</span></a></div><div data-visible-on="graphic table"><a href="" class="core-fv__download_figure  core-fv__btn" title="Download figure"><i aria-hidden="true" class="icon-Icon_Download"></i><span class="sr-only">Download figure</span></a></div><div data-visible-on="graphic table media"><button role="button" class="core-fv__share  core-fv__btn" aria-controls="core-fv__share" aria-expanded="false" title="Toggle share panel"><i aria-hidden="true" class="icon-Icon_Share"></i><span class="sr-only">Toggle share panel</span></button><div id="core-fv__share" aria-label="share pane options" aria-hidden="true" class="core-fv__aside__share core-fv-hidden"><div class="core-fv__panel__header"></div><div class="core-fv__panel__content"><div class="core-fv__panel__title">Share on social media</div><div class="core-fv__panel__text"></div></div></div></div><div data-visible-on="graphic table media"><button role="button" class="core-fv__info  core-fv__btn" aria-controls="core-fv__info" aria-expanded="false" title="Toggle information panel"><i aria-hidden="true" class="icon-Icon_Information"></i><span class="sr-only">Toggle information panel</span></button><div id="core-fv__info" aria-label="info pane options" aria-hidden="true" class="core-fv__aside__info core-fv-hidden"><div class="core-fv__panel__header"></div><div class="core-fv__panel__content"><div class="core-fv__panel__title"></div><div class="core-fv__panel__text"></div></div></div></div></div></header><div class="core-fv__content"><div data-type="graphic" aria-roledescription="carousel"><button type="button" disabled="disabled" title="Go to previous graphic" data-type="graphic" class="core-fv-carousel_control previous"><i aria-hidden="true" class="icon-arrow_l"></i><span class="sr-only">Go to previous graphic</span></button><div id="core-fv-carousel_graphic" aria-live="polite" aria-atomic="false" aria-label="Displayed graphic" class="core-fv-carousel"></div><button type="button" disabled="disabled" title="Go to next graphic" data-type="graphic" class="core-fv-carousel_control next"><i aria-hidden="true" class="icon-arrow_r"></i><span class="sr-only">Go to next graphic</span></button></div><div data-type="table" aria-roledescription="carousel"><button type="button" disabled="disabled" title="Go to previous table" data-type="table" class="core-fv-carousel_control previous"><i aria-hidden="true" class="icon-arrow_l"></i><span class="sr-only">Go to previous table</span></button><div id="core-fv-carousel_table" aria-live="polite" aria-atomic="false" aria-label="Displayed table" class="core-fv-carousel"></div><button type="button" disabled="disabled" title="Go to next table" data-type="table" class="core-fv-carousel_control next"><i aria-hidden="true" class="icon-arrow_r"></i><span class="sr-only">Go to next table</span></button></div></div><div class="core-fv__filmstrip core-fv-hidden"><button title="View all" aria-expanded="false" aria-controls="core-fv__filmstrip" class="core-fv__filmstrip__tongue core-fv__btn"><svg width="207" height="42" viewBox="0 0 207 42"></svg></button><div id="core-fv__filmstrip"><nav aria-label="Figure Viewer extra controls" data-type="graphic" class="core-fv__filmstrip__content"><div class="core-fv__filmstrip__nav"><button type="button" disabled="disabled" title="Go to previous graphic" data-type="graphic" class="core-fv-carousel_control previous"><i aria-hidden="true" class="icon-arrow_l"></i><span class="sr-only">Go to previous graphic</span></button><div id="core-fv-filmstrip_graphic" aria-live="polite" aria-label="Figure Navigation" role="tablist" class="figures-group"></div><button type="button" disabled="disabled" title="Go to next graphic" data-type="graphic" class="core-fv-carousel_control next"><i aria-hidden="true" class="icon-arrow_r"></i><span class="sr-only">Go to next graphic</span></button><button data-target="core-fv-panel_graphic" data-open="viewer" title="Go to all figures directory" aria-controls="core-fv-panel_graphic" class="core-fv__openDirectory"><i aria-hidden="true" class="icon-grid-3"></i><span>All figures</span></button></div></nav><nav aria-label="Figure Viewer extra controls" data-type="table" class="core-fv__filmstrip__content"><div class="core-fv__filmstrip__nav"><button type="button" disabled="disabled" title="Go to previous table" data-type="table" class="core-fv-carousel_control previous"><i aria-hidden="true" class="icon-arrow_l"></i><span class="sr-only">Go to previous table</span></button><div id="core-fv-filmstrip_table" aria-live="polite" aria-label="Figure Navigation" role="tablist" class="figures-group"></div><button type="button" disabled="disabled" title="Go to next table" data-type="table" class="core-fv-carousel_control next"><i aria-hidden="true" class="icon-arrow_r"></i><span class="sr-only">Go to next table</span></button><button data-target="core-fv-panel_table" data-open="viewer" title="Go to all figures directory" aria-controls="core-fv-panel_table" class="core-fv__openDirectory"><i aria-hidden="true" class="icon-grid-3"></i><span>All tables</span></button></div></nav></div></div></div></div></template><template id="toCitationLink" data-citation="xrefBack.types.citation" data-footnote="xrefBack.types.footnote"><div class="to-citation__wrapper"><a class="to-citation"><i aria-hidden="true" class="icon-subdirectory_arrow_left"></i><span>xrefBack.goTo</span></a></div></template><template id="toCitationButton" data-citation="xrefBack.types.citation" data-footnote="xrefBack.types.footnote"><div class="to-citation__wrapper"><button class="to-citation"><i aria-hidden="true" class="icon-subdirectory_arrow_left"></i><span>xrefBack.goTo</span></button></div></template><template id="toCitationAccordion" data-collapse-citation="xrefBack.types.hideCitation" data-expand-citation="xrefBack.types.showCitation" data-collapse-footnote="xrefBack.types.hideFootnote" data-expand-footnote="xrefBack.types.showFootnote"><div class="to-citation__wrapper"><button aria-controls="aria-controls" aria-expanded="false" aria-label="xrefBack.ariaLabel" class="to-citation__toggle"><i aria-hidden="true" class="icon-plus-light"></i><span data-expand-title="data-expand-title" data-collapsed-title="data-collapsed-title" class="accordion__toggle__title"></span></button><div role="menu" aria-label="xrefBack.links" class="to-citation__accordion no-separator"><ul></ul></div></div></template><template id="toCitationAccordionItem"><li><a class="to-citation"><i aria-hidden="true" class="icon-subdirectory_arrow_left"></i><span></span></a></li></template><template id="collateral_texts_template" data-references="References" data-more="More"><span>Request permissions</span></template><template id="collapsible_authors_template"><button data-expanded="false" data-expandable="all" data-label-expand="Expand All" data-label-collapse="Collapse All" class="collateral-contributors-control"><span>Expand All</span></button></template>
+<template id="collapsible_tables_collapse_template"><div class="collapsible-figure-btn__wrapper expanded"><button aria-expanded="true" class="btn collapsible-figure-btn btn--inverse"><i aria-hidden="true" class="icon-arrow-up"></i><span class="text-uppercase">Collapse</span></button></div></template>
+<template id="collapsible_tables_expand_template"><div class="collapsible-figure-btn__wrapper collapsed"><button aria-expanded="false" class="btn collapsible-figure-btn btn--inverse"><i aria-hidden="true" class="icon-arrow-down"></i><span class="text-uppercase">Expand Table</span></button></div></template>
+<template id="citations_truncate_template"><div class="truncation-wrapper"><button data-label-expand="Show all references" data-label-collapse="Show fewer references" data-label-remaining="references remaining" data-trigger="collapse" class="btn btn--inverse">Show all references</button></div></template><template id="coreProducts_truncate_template"><div class="truncation-wrapper"><button data-label-expand="SHOW ALL BOOKS" data-label-collapse="Show fewer references" data-label-remaining="books remaining" data-trigger="collapse" class="btn btn--inverse">SHOW ALL BOOKS</button></div></template><template id="authorsAffiliationsLink"><a href="" class="to-authors-affiliations">Authors Info & Affiliations</a></template>
+
+
+
+
+        
+        <div class="separated-block--dashed align-center"><a href="/toc/pvldb/2017/11/4" class="btn btn--inverse big">View Issue’s Table of Contents</a></div>
+
+
+
+
+        
+        
+
+
+
+
+
+<div class="smart-layout">
+    
+        
+
+            
+            
+            
+            
+
+            
+
+        
+    
+</div>
+
+</main>
+
+        </div>
+    
+
+
+                    
+                        
+
+
+
+        
+        <footer class="footer">
+
+
+
+        
+        <h2 class="sr-only" tabindex="0">Footer</h2>
+
+
+
+
+        
+        <button type="button" class="back-to-top clearfix improved" style="" aria-label="Back to top">
+    <i class="icon-arrow_u_p" aria-hidden="true"></i>
+</button>
+
+
+
+
+        
+        <div class="footer-top">
+
+
+
+
+
+
+
+
+
+    
+    
+        <div data-widget-def="ux3-layout-widget" data-widget-id="TOKEN" class="container">
+        
+
+
+
+        
+        <div class="row sitemap">
+
+
+
+        
+        <div class="col-sm-2 col-xs-6 sitemap__column">
+
+
+
+
+
+
+
+
+
+    
+    
+        <div data-widget-def="UX3HTMLWidget" data-widget-id="TOKEN" class="sitemap__data">
+        
+
+
+
+        
+        <h3 style="">Categories</h3>
+<ul class="rlist">
+    <li><a href="/journals" title="Browse a listing of ACM’s Journals">Journals</a></li>
+    <li><a href="/magazines" title="Browse ACM's Magazines">Magazines</a></li>
+    <li><a href="/acmbooks" title="Browse new Releases of ACM Books">Books</a></li>
+    <li><a href="/proceedings" title="Browse the ACM Proceedings">Proceedings</a></li>
+    <li><a href="/sigs" title="Browse the Special Interest Groups">SIGs</a></li>
+    <li><a href="/conferences" title="Browse the Conferences">Conferences</a></li>
+    <li><a href="/collections" title="Browse the Special Collections">Collections</a></li>
+    <li><a href="/people" title="Discover ACM’s community of authors">People</a></li>
+</ul>
+
+        </div>
+    
+
+</div><div class="col-sm-4 col-xs-6 sitemap__column">
+
+
+
+
+
+
+
+
+
+    
+    
+        <div data-widget-def="UX3HTMLWidget" data-widget-id="TOKEN" class="sitemap__data">
+        
+
+
+
+        
+        <h3 style="">About</h3>
+<ul class="rlist">
+    <li><a href="/about">About ACM Digital Library</a></li>
+    <li><a href="/about/dlboard" title="ACM DL Board - Governance and Support Staff">ACM Digital Library Board</a></li>
+    <li><a href="https://www.acm.org/publications/authors/information-for-authors" title="Information for Authors">Author Guidelines</a></li>
+    <li><a href="/about/content">All Holdings within the ACM Digital Library</a></li>
+    <li><a href="/ccs" title="Classify publications using ACM's Computing Classification System">ACM Computing Classification System</a></li>
+    <li><a href="/about/accessibility" title="Digital Library Accessibility">Accessibility Statement</a></li>
+</ul>
+
+        </div>
+    
+
+</div><div class="col-sm-3 col-xs-6 sitemap__column">
+
+
+
+
+
+
+
+
+
+    
+    
+        <div data-widget-def="UX3HTMLWidget" data-widget-id="TOKEN" class="sitemap__data">
+        
+
+
+
+        
+        <h3 style="">Join</h3>
+<ul class="rlist">
+    <li><a href="https://www.acm.org/membership/join">Join ACM</a></li>
+    <li><a href="https://www.acm.org/special-interest-groups/join">Join SIGs</a></li>
+    <li><a href="https://www.acm.org/publications/subscribe">Subscribe to Publications</a></li>
+    <li><a href="https://libraries.acm.org/">Institutions and Libraries</a></li>
+</ul>
+
+        </div>
+    
+
+</div><div class="col-sm-3 col-xs-6 sitemap__column">
+
+
+
+
+
+
+
+
+
+    
+    
+        <div data-widget-def="UX3HTMLWidget" data-widget-id="TOKEN" class="sitemap__data">
+        
+
+
+
+        
+        <h3 style="">Connect</h3>
+<ul class="rlist social-media__connect">
+    <li><a href="/cdn-cgi/l/email-protection"><i class="icon-Icon_mail" aria-hidden="true"></i><span>Contact us via email</span></a></li>
+    <li><a href="https://www.facebook.com/AssociationForComputingMachinery/"><i class="icon-facebook" aria-hidden="true"></i><span>ACM on Facebook</span></a></li>
+    <li><a href="https://x.com/acmdl"><i class="icon-x" aria-hidden="true"></i><span>ACM DL on X</span></a></li>
+    <li><a href="https://www.linkedin.com/company/association-for-computing-machinery/"><i class="icon-linkedin" aria-hidden="true"></i><span>ACM on Linkedin</span></a></li>
+    <!---->
+    <li><a onclick="srv.openModal(true,'TOKEN')"><i class="icon-Icon_Information" aria-hidden="true"></i><span>Send Feedback</span></a></li>
+    <li><a onclick="srv.openModal(true,'TOKEN')"><i class="icon-Icon_Information" aria-hidden="true"></i><span>Submit a Bug Report</span></a></li>
+</ul>
+
+        </div>
+    
+
+</div>
+</div>
+
+        </div>
+    
+
+</div>
+
+
+
+
+
+
+
+
+
+
+    
+    
+        <div data-widget-def="ux3-layout-widget" data-widget-id="TOKEN" class="footer-bottom text-onDark">
+        
+
+
+
+        
+        <div class="container"><div class="row"><div class="col-md-8 col-sm-6 footer__copyright-wrapper">
+
+
+
+        
+        <div class="copyright">The ACM Digital Library is published by the Association for Computing Machinery. Copyright © 2026 ACM, Inc.</div>
+<ul class="rlist--inline">
+    <li><a class="link-nocolor-nounderline" href="https://libraries.acm.org/digital-library/policies">Terms of Usage</a></li>
+    <li><a class="link-nocolor-nounderline" href="https://www.acm.org/about-acm/privacy-policy">Privacy Policy</a></li>
+    <li><a class="link-nocolor-nounderline" href="https://www.acm.org/code-of-ethics">Code of Ethics</a></li>
+</ul>
+</div><div class="col-md-4 col-sm-6 footer__logos-wrapper">
+
+
+
+        
+        <div class="logos">
+
+
+
+
+
+
+
+
+
+    
+    
+        <div data-widget-def="ux3-general-image" data-widget-id="TOKEN" class="footer__logo1">
+        
+
+
+
+        
+        <a href="/" title=""><img id="" alt="ACM Digital Library home" src="/specs/products/acm/releasedAssets/images/TOKEN.png" loading="eager"/></a>
+
+        </div>
+    
+
+
+
+
+
+
+
+
+
+
+
+    
+    
+        <div data-widget-def="ux3-general-image" data-widget-id="TOKEN" class="footer__logo2">
+        
+
+
+
+        
+        <a href="https://www.acm.org" title="external site link"><img id="" alt="ACM - Association for Computing Machinery" src="/specs/products/acm/releasedAssets/images/TOKEN.png" loading="eager"/></a>
+
+        </div>
+    
+
+</div>
+</div></div></div>
+
+        </div>
+    
+
+
+
+
+
+        
+        <!----><script data-cfasync="false" src="/cdn-cgi/scripts/5c5dd728/cloudflare-static/email-decode.min.js"></script><script type="text/javascript" nonce=""></script><!---->
+</footer>
+
+                    
+                        
+
+
+
+        
+        <script type="text/javascript" nonce=""></script>
+
+                    
+                        
+
+
+
+        
+        <script type="text/javascript" nonce=""></script>
+
+                    
+                        
+
+
+
+        
+        <div role="region" aria-label="notification" class="affs-popup"><input id="deleteCookie" type="hidden" name="deleteCookie" value=""/></div>
+
+                    
+                        
+
+
+
+        
+        
+
+                    
+                        
+
+
+
+        
+        <div id="exportDownloadNotReady" role="region" aria-label="notification" class="searchCiteExport-popup hidden"><div class="searchCiteExport-popup__header"><i aria-hidden="true" class="icon-info"></i><span aria-label="Your Search Results Download Request" class="searchCiteExport-popup__title">Your Search Results Download Request</span><i aria-hidden="true" tabindex="0" class="icon-cancel-bold"> </i></div><div aria-label="Search Results Popup Body" class="searchCiteExport-popup__body clearfix"><p>We are preparing your search results for download ...</p><p>We will inform you here when the file is ready.</p><a href="" disabled="disabled" class="btn blue pull-right">Download now!</a></div></div><div id="exportDownloadReady" role="region" aria-label="notification" class="searchCiteExport-popup hidden"><div class="searchCiteExport-popup__header"><i aria-hidden="true" class="icon-info"></i><span aria-label="Your Search Results Download Request" class="searchCiteExport-popup__title">Your Search Results Download Request</span><i aria-hidden="true" tabindex="0" class="icon-cancel-bold"></i></div><div aria-label="Search Results Popup Body" class="searchCiteExport-popup__body clearfix"><div class="csl-all-response hidden"></div><p>Your file of search results citations is now ready.</p><a href="" class="btn blue searchCiteExport-popup__close pull-right">Download now!</a></div></div><div id="exportDownloadExpired" role="region" aria-label="notification" class="searchCiteExport-popup hidden"><div class="searchCiteExport-popup__header"><i aria-hidden="true" class="icon-info"></i><span aria-label="Your Search Results Download Request" class="searchCiteExport-popup__title">Your Search Results Download Request</span><i aria-hidden="true" tabindex="0" class="icon-cancel-bold"></i></div><div aria-label="Search Results Popup Body" class="searchCiteExport-popup__body clearfix"><p>Your search export query has expired. Please try again.</p></div></div>
+
+                    
+                        
+
+
+
+        
+        
+
+                    
+                        
+                    
+                        
+
+
+
+        
+        
+
+
+
+
+
+    
+
+    
+
+
+
+                    
+                
+            </div>
+        </div>
+        
+
+
+    <script nonce=""></script><script src="/products/acm/releasedAssets/js/main.TOKEN.js" nonce=""></script><script nonce=""></script>
+    <script type="text/javascript" src="/wro/TOKEN~product.js" nonce=""></script>
+    <script type="text/javascript" nonce=""></script>
+
+
+
+
+
+
+
+
+
+
+
+
+    
+
+    
+    
+
+    
+    
+    
+    
+
+
+
+
+
+
+    
+
+
+            <script type="module" src="https://static.cloudflareinsights.com/beacon.min.js/TOKEN" integrity="TOKEN==" data-cf-beacon="{"version":"2024.11.0","token":"TOKEN"}" crossorigin="anonymous"></script>
+</body>
+        
+        
+    
+
+</html>

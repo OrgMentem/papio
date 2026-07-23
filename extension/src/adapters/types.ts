@@ -439,25 +439,33 @@ export const adapters: AdapterSpec[] = [
     },
   },
   {
-    // Verified live 2026-07-16 against an entitled ACM Digital Library article
-    // (fixtures/acm/success.html). The download anchor's id + data-doi are
-    // stable and its href is the direct entitled PDF (?download=true), fetched
-    // via the browser cookie jar. No isolated no-entitlement capture was
-    // available at build time, so non-entitled ACM pages classify unknown and
-    // stay assisted rather than risk a wrong verdict.
+    // Verified live 2026-07-23 against ACM Digital Library (fixtures/acm/
+    // success.html entitled, no-entitlement.html paywalled). The "PDF/eReader"
+    // toolbar control (a.btn--eReader -> /doi/epdf/) is the entitlement signal:
+    // it renders only when THIS session can read the PDF (open/free access or
+    // an entitled institution). The bottom-of-document a#downloadPdfUrl anchor
+    // is NOT an entitlement signal — ACM emits it even on paywalled "Get
+    // Access" pages, so keying on it false-positived and fetched an HTML access
+    // page instead of the file. Download builds the deterministic
+    // /doi/pdf/<doi>?download=true endpoint from the DOI in the page URL, gated
+    // on the eReader control; the privileged downloads API returns %PDF via the
+    // session cookie jar. No publisher terms gate.
     id: "acm",
-    version: "0.1.0",
+    version: "0.2.0",
     hosts: ["dl.acm.org"],
+    settleTimeoutMs: 5000,
     classify: [
       {
         kind: "article",
-        all: ["meta[name='publication_doi']", "a#downloadPdfUrl[data-doi][href*='/doi/pdf/']"],
+        all: ["meta[name='publication_doi']", "a.btn--eReader[href*='/doi/epdf/']"],
       },
     ],
     download: {
-      selector: "a#downloadPdfUrl[data-doi][href*='/doi/pdf/']",
+      selector: "a.btn--eReader[href*='/doi/epdf/']",
       requireKind: "article",
-      method: "href",
+      method: "url",
+      idPattern: "/doi/(?:abs/|full/|epdf/|pdf/)?(10\\.[0-9]+/[^?#]+)",
+      urlTemplate: "https://dl.acm.org/doi/pdf/{1}?download=true",
     },
   },
   {

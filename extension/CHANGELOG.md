@@ -18,6 +18,16 @@ for the full pre-split extension history.
 
 ### Fixed
 
+- **ACM Digital Library articles now download autonomously and paywalled ACM
+  pages stay assisted.** The adapter keyed the `article` verdict (and its PDF
+  href) on the bottom-of-document `a#downloadPdfUrl` anchor, but ACM emits that
+  anchor even on non-entitled "Get Access" pages — so an accessible free/entitled
+  article was often left as a manual-download handoff, while a paywalled one
+  risked fetching an HTML access page. The adapter now keys on the "PDF/eReader"
+  toolbar control (the real entitlement signal, present only when this session
+  can read the PDF) and builds the deterministic `/doi/pdf/<doi>?download=true`
+  endpoint from the DOI in the page URL, fetched through the session cookie jar.
+
 - **The sticky inbox footer is decluttered to two slim rows.** The access
   legend is gone — every item already states its access requirement inline —
   and the keyboard help shrank from a paragraph to key-chip pairs
