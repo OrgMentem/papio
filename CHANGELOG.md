@@ -44,6 +44,11 @@ execution records in `notes/acquisition-stack-plan.md`.
   the literal ID), and the browser setup instructions are suppressed when
   doctor reports a healthy, current extension connection.
 
+### Fixed
+
+- Upgraded `golang.org/x/text` to 0.39.0, fixing GO-2026-5970 (an infinite
+  loop on invalid normalization input reachable through PDF inspection).
+
 ## [0.9.2] - 2026-07-22
 
 ### Fixed
