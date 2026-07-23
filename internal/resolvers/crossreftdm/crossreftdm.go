@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"papio/internal/config"
+	"papio/internal/fetch"
 	"papio/internal/resolver"
 	"papio/internal/work"
 )
@@ -160,27 +161,30 @@ func (r *Resolver) lookup(ctx context.Context, doi string) (response, error) {
 	return payload, nil
 }
 
-// do uses a redirect policy rooted at the original service URL. This keeps
-// the Plus API token stripped for every later hop after a foreign redirect.
-// Opaque HTTPClient implementations are rejected because their redirects
-// cannot be inspected safely.
+// do permits only clients that protect the Plus API token across cross-origin
+// redirects. fetch.SecureHTTPClient clears all caller-supplied headers outside
+// the origin, while http.Client is copied with a redirect policy that strips
+// the token; opaque HTTPClient implementations are rejected.
 func (r *Resolver) do(req *http.Request) (*http.Response, error) {
-	client, ok := r.client.(*http.Client)
-	if !ok {
+	switch client := r.client.(type) {
+	case *fetch.SecureHTTPClient:
+		return client.Do(req)
+	case *http.Client:
+		copyClient := *client
+		previous := client.CheckRedirect
+		copyClient.CheckRedirect = func(next *http.Request, via []*http.Request) error {
+			if !sameAuthority(next.URL, req.URL) {
+				next.Header.Del("Crossref-Plus-API-Token")
+			}
+			if previous != nil {
+				return previous(next, via)
+			}
+			return nil
+		}
+		return copyClient.Do(req)
+	default:
 		return nil, errUnsafeHTTPClient
 	}
-	copyClient := *client
-	previous := client.CheckRedirect
-	copyClient.CheckRedirect = func(next *http.Request, via []*http.Request) error {
-		if !sameAuthority(next.URL, req.URL) {
-			next.Header.Del("Crossref-Plus-API-Token")
-		}
-		if previous != nil {
-			return previous(next, via)
-		}
-		return nil
-	}
-	return copyClient.Do(req)
 }
 
 func sameAuthority(left, right *url.URL) bool {

@@ -1090,6 +1090,30 @@ type HumanActionBinding struct {
 	QuarantineSHA256 string
 }
 
+// AcceptedReviewBinding returns the pending candidate and quarantined file
+// preserved by the latest accepted identity review, if it remains reusable.
+func (js *Store) AcceptedReviewBinding(ctx context.Context, jobID string) (*HumanActionBinding, error) {
+	var binding HumanActionBinding
+	err := js.S.DB().QueryRowContext(ctx, `
+		SELECT ha.candidate_id, ha.quarantine_path, ha.quarantine_sha256
+		FROM human_actions ha
+		JOIN candidates c ON c.id = ha.candidate_id AND c.job_id = ha.job_id
+		WHERE ha.job_id = ?
+		  AND ha.kind = 'verify_identity'
+		  AND ha.status = 'resolved'
+		  AND c.review_override = 1
+		  AND c.status = 'pending'
+		ORDER BY ha.resolved_at DESC, ha.id DESC
+		LIMIT 1`, jobID).Scan(&binding.CandidateID, &binding.QuarantinePath, &binding.QuarantineSHA256)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("loading accepted review binding: %w", err)
+	}
+	return &binding, nil
+}
+
 type openHumanActionOptions struct {
 	binding      *HumanActionBinding
 	requiresAuth bool

@@ -11,6 +11,12 @@ import (
 	"time"
 )
 
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return f(request)
+}
+
 func TestCheckFetchesFreshReleaseAndCachesETag(t *testing.T) {
 	now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -104,6 +110,77 @@ func TestCheckMalformedResponseSoftFailsToCachedInfo(t *testing.T) {
 	}
 	if info == nil || info.LatestVersion != "1.2.2" || !info.CheckedAt.Equal(now.Add(-checkEvery)) {
 		t.Fatalf("info = %#v", info)
+	}
+}
+
+func TestCachedReturnsWhileRefreshIsInFlight(t *testing.T) {
+	now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		close(entered)
+		<-release
+		return &http.Response{StatusCode: http.StatusServiceUnavailable, Body: http.NoBody}, nil
+	})}
+	checker := NewWithOptions(Options{
+		DataDir: t.TempDir(), ReleasesURL: "https://example.test/releases", Client: client,
+		Now: func() time.Time { return now },
+	})
+	if err := checker.writeCache(cache{
+		LatestVersion: "1.2.3",
+		URL:           "https://example.test/releases/v1.2.3",
+		CheckedAt:     now.Add(-checkEvery),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	checkDone := make(chan struct{})
+	checkErr := make(chan error, 1)
+	go func() {
+		_, err := checker.Check(context.Background())
+		checkErr <- err
+		close(checkDone)
+	}()
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+		select {
+		case <-checkDone:
+		case <-time.After(time.Second):
+			t.Error("Check did not finish after releasing fake client")
+		}
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("Check did not reach fake client")
+	}
+
+	cached := make(chan *Info, 1)
+	go func() {
+		cached <- checker.Cached()
+	}()
+	select {
+	case info := <-cached:
+		if info == nil || info.LatestVersion != "1.2.3" {
+			t.Fatalf("Cached() = %#v", info)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("Cached blocked on refresh request")
+	}
+
+	close(release)
+	select {
+	case <-checkDone:
+		if err := <-checkErr; err != nil {
+			t.Fatalf("Check: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Check did not return after fake client was released")
 	}
 }
 

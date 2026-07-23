@@ -298,18 +298,14 @@ func TestAcceptedAdoptionReviewReusesExactContentOverride(t *testing.T) {
 		t.Fatalf("accept review = %q, %v", state, err)
 	}
 
-	// The scheduler cannot retain a live browser candidate, so it re-resolves
-	// and returns to the institutional handoff. The unchanged source file is
-	// then adopted again by the directory sweep.
+	// The accepted binding points at the quarantined adopted bytes, so Process
+	// validates and promotes them without requiring a second directory sweep.
 	row, err := jobs.ClaimNext(ctx, "review-worker", time.Minute)
 	if err != nil || row == nil || row.ID != id {
 		t.Fatalf("claim accepted review = %+v, %v", row, err)
 	}
 	if err := svc.Process(ctx, row); err != nil {
-		t.Fatalf("re-resolve accepted review: %v", err)
-	}
-	if err := svc.AdoptDownload(ctx, id, path); err != nil {
-		t.Fatalf("second adopt: %v", err)
+		t.Fatalf("reuse accepted review: %v", err)
 	}
 	ready, err := jobs.Get(ctx, id)
 	if err != nil {

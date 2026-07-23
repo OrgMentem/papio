@@ -137,8 +137,11 @@ func (c *Coalescer) notify(ctx context.Context, kind string, message func(int) s
 					time.AfterFunc(duration, callback)
 				}
 			}
+			// The timer outlives the request that scheduled it; detach
+			// cancellation but keep values so the delayed flush still sends.
+			flushCtx := context.WithoutCancel(ctx)
 			after(interval-now.Sub(last), func() {
-				c.flush(ctx, kind, message, sequence)
+				c.flush(flushCtx, kind, message, sequence)
 			})
 		}
 		c.mu.Unlock()

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -123,15 +124,42 @@ func (s *Server) ServeListener(ctx context.Context, listener net.Listener) error
 	defer close(done)
 	defer conns.Wait()
 
+	var tempDelay time.Duration
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			closeAll()
 			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
+				closeAll()
 				return nil
 			}
+			if transientAcceptError(err) {
+				if tempDelay == 0 {
+					tempDelay = 5 * time.Millisecond
+				} else {
+					tempDelay *= 2
+					if maxDelay := time.Second; tempDelay > maxDelay {
+						tempDelay = maxDelay
+					}
+				}
+				timer := time.NewTimer(tempDelay)
+				select {
+				case <-ctx.Done():
+					if !timer.Stop() {
+						select {
+						case <-timer.C:
+						default:
+						}
+					}
+					closeAll()
+					return nil
+				case <-timer.C:
+					continue
+				}
+			}
+			closeAll()
 			return fmt.Errorf("accept ipc connection: %w", err)
 		}
+		tempDelay = 0
 		connMu.Lock()
 		if ctx.Err() != nil {
 			connMu.Unlock()
@@ -152,6 +180,17 @@ func (s *Server) ServeListener(ctx context.Context, listener net.Listener) error
 			s.serveConn(ctx, conn)
 		}(conn)
 	}
+}
+
+func transientAcceptError(err error) bool {
+	if errors.Is(err, syscall.EMFILE) ||
+		errors.Is(err, syscall.ENFILE) ||
+		errors.Is(err, syscall.ECONNABORTED) ||
+		errors.Is(err, syscall.ECONNRESET) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
 }
 
 func (s *Server) serveConn(ctx context.Context, conn net.Conn) {

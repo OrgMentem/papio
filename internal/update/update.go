@@ -49,7 +49,11 @@ type Checker struct {
 	releasesURL string
 	client      *http.Client
 	now         func() time.Time
-	mu          sync.Mutex
+	// mu guards cache file access. It is never held while a refresh is in flight.
+	mu sync.Mutex
+	// refreshMu serializes stale-cache refreshes, including the HTTP request.
+	// Check takes refreshMu only after releasing mu.
+	refreshMu sync.Mutex
 }
 
 type cache struct {
@@ -116,13 +120,29 @@ func (c *Checker) Check(ctx context.Context) (*Info, error) {
 		return nil, nil
 	}
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	cached := c.readCache()
 	now := c.now().UTC()
 	if checkedRecently(cached.CheckedAt, now) {
-		return cached.info(), nil
+		info := cached.info()
+		c.mu.Unlock()
+		return info, nil
 	}
+	c.mu.Unlock()
+
+	c.refreshMu.Lock()
+	defer c.refreshMu.Unlock()
+
+	// Another Check may have refreshed the cache before this one obtained the
+	// refresh lock, so avoid issuing a duplicate request.
+	c.mu.Lock()
+	cached = c.readCache()
+	now = c.now().UTC()
+	if checkedRecently(cached.CheckedAt, now) {
+		info := cached.info()
+		c.mu.Unlock()
+		return info, nil
+	}
+	c.mu.Unlock()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.releasesURL, nil)
 	if err != nil {
@@ -142,9 +162,13 @@ func (c *Checker) Check(ctx context.Context) (*Info, error) {
 		if cached.info() == nil {
 			return nil, nil
 		}
+		c.mu.Lock()
+		cached = c.readCache()
 		cached.CheckedAt = now
 		_ = c.writeCache(cached)
-		return cached.info(), nil
+		info := cached.info()
+		c.mu.Unlock()
+		return info, nil
 	}
 	if response.StatusCode != http.StatusOK {
 		return cached.info(), nil
@@ -158,12 +182,16 @@ func (c *Checker) Check(ctx context.Context) (*Info, error) {
 	if latest.TagName == "" || latest.HTMLURL == "" {
 		return cached.info(), nil
 	}
+	c.mu.Lock()
+	cached = c.readCache()
 	cached.ETag = response.Header.Get("ETag")
 	cached.LatestVersion = latest.TagName
 	cached.URL = latest.HTMLURL
 	cached.CheckedAt = now
 	_ = c.writeCache(cached)
-	return cached.info(), nil
+	info := cached.info()
+	c.mu.Unlock()
+	return info, nil
 }
 
 // TryMarkNagged atomically records a displayed update prompt when none has

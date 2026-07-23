@@ -196,6 +196,183 @@ func TestSweepTemporaryAndMalformedResponsesFailClosed(t *testing.T) {
 	}
 }
 
+func TestSweepCommitsPartialResultsAndRetainsFailedDOI(t *testing.T) {
+	ctx := context.Background()
+	jobs := testStore(t)
+	addReadyDOI(t, jobs, "10.1234/failing", 1)
+	addReadyDOI(t, jobs, "10.1234/fresh", 2)
+	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
+	previous := Finding{
+		DOI: "10.1234/failing", Nature: NatureRetraction, NoticeDOI: "10.2000/previous",
+		NoticedAt: now.Add(-48 * time.Hour),
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/10.1234/failing" {
+			http.Error(w, "unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		_, _ = w.Write([]byte(`{"message":{"update-to":[{"DOI":"10.2000/fresh","updated":"correction"}]}}`))
+	}))
+	defer server.Close()
+	notifier := &recordingNotifier{}
+	sentinel := New(Options{
+		Store: jobs, Budgets: &recordingBudget{}, Policy: config.Source{Enabled: true},
+		Client: server.Client(), BaseURL: server.URL, DataDir: t.TempDir(), Notifier: notifier,
+		Now: func() time.Time { return now },
+	})
+	sentinel.mu.Lock()
+	err := sentinel.writeCache(cache{
+		Version: cacheVersion, CheckedAt: now.Add(-sweepEvery), Notices: map[string]Finding{
+			findingKey(previous): previous,
+		},
+	})
+	sentinel.mu.Unlock()
+	if err != nil {
+		t.Fatalf("seed cache: %v", err)
+	}
+
+	if err := sentinel.RunDue(ctx); err != nil {
+		t.Fatalf("partial sweep: %v", err)
+	}
+
+	sentinel.mu.Lock()
+	persisted, ok := sentinel.readCache()
+	sentinel.mu.Unlock()
+	if !ok || len(persisted.Notices) != 2 {
+		t.Fatalf("cache = %#v, valid = %v", persisted, ok)
+	}
+	if got := persisted.Notices[findingKey(previous)]; got != previous {
+		t.Fatalf("carried finding = %#v, want %#v", got, previous)
+	}
+	fresh := Finding{DOI: "10.1234/fresh", Nature: NatureCorrection, NoticeDOI: "10.2000/fresh", NoticedAt: now}
+	if got := persisted.Notices[findingKey(fresh)]; got != fresh {
+		t.Fatalf("fresh finding = %#v, want %#v", got, fresh)
+	}
+	if len(notifier.events) != 1 || notifier.events[0].Message != noticeMessage(fresh) {
+		t.Fatalf("events = %#v", notifier.events)
+	}
+}
+
+func TestSweepAllLookupFailuresLeaveCacheUntouched(t *testing.T) {
+	ctx := context.Background()
+	jobs := testStore(t)
+	addReadyDOI(t, jobs, "10.1234/first", 1)
+	addReadyDOI(t, jobs, "10.1234/second", 2)
+	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
+	previous := Finding{
+		DOI: "10.1234/first", Nature: NatureRetraction, NoticeDOI: "10.2000/previous",
+		NoticedAt: now.Add(-48 * time.Hour),
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "unavailable", http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+	dataDir := t.TempDir()
+	sentinel := New(Options{
+		Store: jobs, Budgets: &recordingBudget{}, Policy: config.Source{Enabled: true},
+		Client: server.Client(), BaseURL: server.URL, DataDir: dataDir, Now: func() time.Time { return now },
+	})
+	sentinel.mu.Lock()
+	err := sentinel.writeCache(cache{
+		Version: cacheVersion, CheckedAt: now.Add(-sweepEvery), Notices: map[string]Finding{
+			findingKey(previous): previous,
+		},
+	})
+	sentinel.mu.Unlock()
+	if err != nil {
+		t.Fatalf("seed cache: %v", err)
+	}
+	before, err := os.ReadFile(filepath.Join(dataDir, cacheFileName))
+	if err != nil {
+		t.Fatalf("read initial cache: %v", err)
+	}
+
+	if err := sentinel.RunDue(ctx); err == nil {
+		t.Fatal("all-failed sweep succeeded")
+	}
+
+	after, err := os.ReadFile(filepath.Join(dataDir, cacheFileName))
+	if err != nil {
+		t.Fatalf("read final cache: %v", err)
+	}
+	if string(after) != string(before) {
+		t.Fatalf("cache changed after total failure:\n before = %s\n after = %s", before, after)
+	}
+}
+
+func TestSnapshotItemsDoesNotWaitForSweepLookup(t *testing.T) {
+	ctx := context.Background()
+	jobs := testStore(t)
+	addReadyDOI(t, jobs, "10.1234/blocked", 1)
+	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
+	previous := Finding{
+		DOI: "10.1234/blocked", Nature: NatureRetraction, NoticeDOI: "10.2000/previous",
+		NoticedAt: now.Add(-48 * time.Hour),
+	}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case started <- struct{}{}:
+		case <-r.Context().Done():
+			return
+		}
+		select {
+		case <-release:
+			_, _ = w.Write([]byte(`{"message":{"update-to":[]}}`))
+		case <-r.Context().Done():
+		}
+	}))
+	defer server.Close()
+	sentinel := New(Options{
+		Store: jobs, Budgets: &recordingBudget{}, Policy: config.Source{Enabled: true},
+		Client: server.Client(), BaseURL: server.URL, DataDir: t.TempDir(), Now: func() time.Time { return now },
+	})
+	sentinel.mu.Lock()
+	err := sentinel.writeCache(cache{
+		Version: cacheVersion, CheckedAt: now.Add(-sweepEvery), Notices: map[string]Finding{
+			findingKey(previous): previous,
+		},
+	})
+	sentinel.mu.Unlock()
+	if err != nil {
+		t.Fatalf("seed cache: %v", err)
+	}
+
+	sweepDone := make(chan error, 1)
+	go func() { sweepDone <- sentinel.RunDue(ctx) }()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("sweep did not begin lookup")
+	}
+
+	type snapshotResult struct {
+		items int
+		err   error
+	}
+	snapshotDone := make(chan snapshotResult, 1)
+	go func() {
+		items, err := sentinel.SnapshotItems(ctx, nil)
+		snapshotDone <- snapshotResult{items: len(items), err: err}
+	}()
+	select {
+	case result := <-snapshotDone:
+		if result.err != nil || result.items != 1 {
+			t.Fatalf("snapshot while sweeping = %+v", result)
+		}
+	case <-time.After(time.Second):
+		close(release)
+		<-sweepDone
+		<-snapshotDone
+		t.Fatal("snapshot waited for lookup")
+	}
+	close(release)
+	if err := <-sweepDone; err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+}
+
 func TestSweepRespectsDisabledPolicyAndBudget(t *testing.T) {
 	ctx := context.Background()
 	jobs := testStore(t)

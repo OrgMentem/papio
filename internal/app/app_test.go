@@ -663,8 +663,12 @@ func TestAcceptedIdentityReviewResumesAndRecordsOverride(t *testing.T) {
 		actions[0].CandidateID <= 0 || actions[0].QuarantinePath == "" || len(actions[0].QuarantineSHA256) != 64 || actions[0].Revision != 1 {
 		t.Fatalf("review action = %+v, %v", actions, err)
 	}
-	if _, state, err := jobs.ResolveReview(context.Background(), actions[0].ID, "accept"); err != nil || state != job.StateFetching {
-		t.Fatalf("accept review = %q, %v", state, err)
+	resolution, err := jobs.ResolveReviewCAS(context.Background(), job.ResolveReviewInput{
+		ActionID: actions[0].ID, Verdict: "accept", ExpectedRevision: actions[0].Revision,
+		ExpectedSHA256: actions[0].QuarantineSHA256,
+	})
+	if err != nil || resolution.Outcome != job.ReviewApplied || resolution.State != job.StateFetching {
+		t.Fatalf("accept review = %+v, %v", resolution, err)
 	}
 	row, err = jobs.ClaimNext(context.Background(), "second-worker", time.Minute)
 	if err != nil || row == nil || row.ID != id {
@@ -674,7 +678,7 @@ func TestAcceptedIdentityReviewResumesAndRecordsOverride(t *testing.T) {
 		t.Fatal(err)
 	}
 	ready, _ := jobs.Get(context.Background(), id)
-	if ready.State != job.StateReady || ready.ArtifactSHA256 == "" || fetches != 2 {
+	if ready.State != job.StateReady || ready.ArtifactSHA256 != actions[0].QuarantineSHA256 || fetches != 1 {
 		t.Fatalf("review-resumed result = %+v; fetches=%d", ready, fetches)
 	}
 	artifact, err := jobs.GetArtifact(context.Background(), ready.ArtifactSHA256)
@@ -691,6 +695,59 @@ func TestAcceptedIdentityReviewResumesAndRecordsOverride(t *testing.T) {
 	}
 	if !foundOverride {
 		t.Fatalf("events missing human_identity_override: %+v", events)
+	}
+}
+
+func TestAcceptedIdentityReviewRedownloadsWhenQuarantineIsMissing(t *testing.T) {
+	svc, jobs := newTestService(t)
+	adapter := &fakeResolver{name: "fixture", cands: []resolver.Candidate{{
+		Source: "fixture", URL: "https://example.test/review-missing.pdf", Version: resolver.VersionPublished,
+		AccessBasis: resolver.AccessOpen, ReuseLicense: "unknown", Direct: true, IdentityConfidence: 1,
+	}}}
+	svc.Resolvers = []ResolverEntry{{Adapter: adapter, Policy: config.Source{Enabled: true}}}
+	fetches := 0
+	svc.Fetch = fakeDownload(&fetches)
+	svc.Validate = func(context.Context, string, string, work.Work) (pdf.ValidationReport, error) {
+		return pdf.ValidationReport{
+			Payload: pdf.PayloadReport{OK: true}, Structural: pdf.StructuralReport{Valid: true, Pages: 2},
+			Text: pdf.TextReport{Chars: 2000}, Identity: pdf.IdentityDecision{Result: pdf.IdentityReview},
+		}, nil
+	}
+	id, err := svc.Submit(context.Background(), doiRequest("wr_review_missing"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, err := jobs.ClaimNext(context.Background(), "first-worker", time.Minute)
+	if err != nil || row == nil {
+		t.Fatalf("first claim = %+v, %v", row, err)
+	}
+	if err := svc.Process(context.Background(), row); err != nil {
+		t.Fatal(err)
+	}
+	actions, err := jobs.ListHumanActions(context.Background(), true)
+	if err != nil || len(actions) != 1 {
+		t.Fatalf("review action = %+v, %v", actions, err)
+	}
+	if err := os.Remove(actions[0].QuarantinePath); err != nil {
+		t.Fatal(err)
+	}
+	resolution, err := jobs.ResolveReviewCAS(context.Background(), job.ResolveReviewInput{
+		ActionID: actions[0].ID, Verdict: "accept", ExpectedRevision: actions[0].Revision,
+		ExpectedSHA256: actions[0].QuarantineSHA256,
+	})
+	if err != nil || resolution.Outcome != job.ReviewApplied || resolution.State != job.StateFetching {
+		t.Fatalf("accept review = %+v, %v", resolution, err)
+	}
+	row, err = jobs.ClaimNext(context.Background(), "second-worker", time.Minute)
+	if err != nil || row == nil || row.ID != id {
+		t.Fatalf("resumed claim = %+v, %v", row, err)
+	}
+	if err := svc.Process(context.Background(), row); err != nil {
+		t.Fatal(err)
+	}
+	ready, err := jobs.Get(context.Background(), id)
+	if err != nil || ready.State != job.StateReady || fetches != 2 {
+		t.Fatalf("missing-review-file result = %+v; fetches=%d, err=%v", ready, fetches, err)
 	}
 }
 

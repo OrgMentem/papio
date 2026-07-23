@@ -689,6 +689,35 @@ func TestResolveReviewCASOutcomes(t *testing.T) {
 	}
 }
 
+func TestAcceptedReviewBindingRequiresPendingOverriddenCandidate(t *testing.T) {
+	const sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	js := testStore(t)
+	ctx := context.Background()
+	id, candidateID, actionID := parkIdentityReview(t, js, "wr_review_binding")
+
+	binding, err := js.AcceptedReviewBinding(ctx, id)
+	if err != nil || binding != nil {
+		t.Fatalf("open review binding = %+v, %v; want nil, nil", binding, err)
+	}
+	if resolution, err := js.ResolveReviewCAS(ctx, ResolveReviewInput{
+		ActionID: actionID, Verdict: "accept", ExpectedRevision: 1, ExpectedSHA256: sha,
+	}); err != nil || resolution.Outcome != ReviewApplied {
+		t.Fatalf("ResolveReviewCAS() = %+v, %v", resolution, err)
+	}
+	binding, err = js.AcceptedReviewBinding(ctx, id)
+	if err != nil || binding == nil ||
+		binding.CandidateID != candidateID || binding.QuarantinePath != "/tmp/paper.pdf" || binding.QuarantineSHA256 != sha {
+		t.Fatalf("accepted review binding = %+v, %v", binding, err)
+	}
+	if err := js.MarkCandidate(ctx, candidateID, "accepted"); err != nil {
+		t.Fatal(err)
+	}
+	binding, err = js.AcceptedReviewBinding(ctx, id)
+	if err != nil || binding != nil {
+		t.Fatalf("completed candidate binding = %+v, %v; want nil, nil", binding, err)
+	}
+}
+
 func TestResolveHumanActionRequiresOpenAction(t *testing.T) {
 	js := testStore(t)
 	ctx := context.Background()

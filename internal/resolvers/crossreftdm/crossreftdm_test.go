@@ -2,14 +2,18 @@ package crossreftdm
 
 import (
 	"context"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"net/url"
 	"strings"
 	"testing"
 	"time"
 
 	"papio/internal/config"
+	"papio/internal/fetch"
 	"papio/internal/resolver"
 	"papio/internal/work"
 )
@@ -125,6 +129,67 @@ func TestResolveRejectsMalformedOversizedAndCrossHostCredentialRedirect(t *testi
 type tdmRoundTrip func(*http.Request) (*http.Response, error)
 
 func (f tdmRoundTrip) Do(r *http.Request) (*http.Response, error) { return f(r) }
+
+type tdmTransportFunc func(*http.Request) (*http.Response, error)
+
+func (f tdmTransportFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+type secureClientTestResolver struct{}
+
+func (secureClientTestResolver) LookupNetIP(context.Context, string, string) ([]netip.Addr, error) {
+	return []netip.Addr{netip.MustParseAddr("93.184.216.34")}, nil
+}
+
+func TestDoAcceptsSecureHTTPClientAndRejectsOpaqueClient(t *testing.T) {
+	secureClient, err := fetch.NewSecureHTTPClient(fetch.Policy{
+		MaxBytes:       1024,
+		Timeout:        time.Second,
+		ConnectTimeout: time.Second,
+		HeaderTimeout:  time.Second,
+		BodyTimeout:    time.Second,
+	}, secureClientTestResolver{}, tdmTransportFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{}`)),
+		}, nil
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequest(http.MethodGet, "https://metadata.example/works", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name       string
+		client     HTTPClient
+		wantUnsafe bool
+	}{
+		{name: "secure client", client: secureClient},
+		{name: "opaque client", client: tdmRoundTrip(func(*http.Request) (*http.Response, error) { return nil, errors.New("must not call") }), wantUnsafe: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resp, err := (&Resolver{client: tc.client}).do(req.Clone(context.Background()))
+			if got := errors.Is(err, errUnsafeHTTPClient); got != tc.wantUnsafe {
+				t.Fatalf("errUnsafeHTTPClient = %v, err = %v", got, err)
+			}
+			if tc.wantUnsafe {
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if resp == nil {
+				t.Fatal("secure client returned nil response")
+			}
+			if err := resp.Body.Close(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
 
 func TestResolveEscapesDOIAndScopesCredentialHeaders(t *testing.T) {
 	var escapedPath string

@@ -93,7 +93,8 @@ type Sentinel struct {
 	notifier notify.Sender
 	now      func() time.Time
 
-	mu sync.Mutex
+	mu      sync.Mutex
+	sweepMu sync.Mutex
 }
 
 // New constructs a sentinel with production defaults.
@@ -122,8 +123,8 @@ func New(options Options) *Sentinel {
 }
 
 // RunDue performs a daily metadata sweep when the configured source policy is
-// enabled. A failed sweep is returned to the scheduler as a temporary or
-// ordinary error and never replaces the last known-good cache.
+// enabled. Partial sweep results are committed; a failed DOI keeps its last
+// known notices. A total sweep failure leaves the last known-good cache intact.
 func (s *Sentinel) RunDue(ctx context.Context) error {
 	if s == nil || !s.policy.Enabled {
 		return nil
@@ -135,12 +136,15 @@ func (s *Sentinel) RunDue(ctx context.Context) error {
 		return errors.New("retraction: budget manager is required")
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.sweepMu.Lock()
+	defer s.sweepMu.Unlock()
 
 	now := s.now().UTC()
+	s.mu.Lock()
 	cached, ok := s.readCache()
-	if ok && !cached.CheckedAt.IsZero() && now.Sub(cached.CheckedAt) < sweepEvery {
+	fresh := ok && !cached.CheckedAt.IsZero() && now.Sub(cached.CheckedAt) < sweepEvery
+	s.mu.Unlock()
+	if fresh {
 		return nil
 	}
 
@@ -150,13 +154,29 @@ func (s *Sentinel) RunDue(ctx context.Context) error {
 	}
 	previous := validNotices(cached.Notices)
 	current := make(map[string]Finding)
+	addCurrent := func(finding Finding) {
+		if prior, exists := current[finding.DOI]; !exists || prefer(finding, prior) {
+			current[finding.DOI] = finding
+		}
+	}
+	var firstLookupErr error
+	failedLookups := 0
 	for _, doi := range dois {
 		if err := s.budgets.Acquire(ctx, config.SourceRetractionWatch, s.policy, 0); err != nil {
 			return fmt.Errorf("retraction: acquire Crossref budget: %w", err)
 		}
 		updates, err := s.lookup(ctx, doi)
 		if err != nil {
-			return err
+			failedLookups++
+			if firstLookupErr == nil {
+				firstLookupErr = err
+			}
+			for _, finding := range previous {
+				if finding.DOI == doi {
+					addCurrent(finding)
+				}
+			}
+			continue
 		}
 		for _, update := range updates {
 			finding := Finding{DOI: doi, Nature: update.Nature, NoticeDOI: update.NoticeDOI}
@@ -166,10 +186,11 @@ func (s *Sentinel) RunDue(ctx context.Context) error {
 			} else {
 				finding.NoticedAt = now
 			}
-			if prior, exists := current[doi]; !exists || prefer(finding, prior) {
-				current[doi] = finding
-			}
+			addCurrent(finding)
 		}
+	}
+	if len(dois) > 0 && failedLookups == len(dois) {
+		return firstLookupErr
 	}
 
 	findings := make([]Finding, 0, len(current))
@@ -184,7 +205,10 @@ func (s *Sentinel) RunDue(ctx context.Context) error {
 	for _, finding := range findings {
 		notices[findingKey(finding)] = finding
 	}
+
+	s.mu.Lock()
 	if err := s.writeCache(cache{Version: cacheVersion, CheckedAt: now, Notices: notices}); err != nil {
+		s.mu.Unlock()
 		return fmt.Errorf("retraction: write cache: %w", err)
 	}
 	seenNotices := make(map[string]bool, len(previous))
@@ -203,6 +227,7 @@ func (s *Sentinel) RunDue(ctx context.Context) error {
 			Count:   1,
 		})
 	}
+	s.mu.Unlock()
 	return nil
 }
 
@@ -436,6 +461,8 @@ func (s *Sentinel) cachePath() string {
 	return filepath.Join(s.dataDir, cacheFileName)
 }
 
+// readCache requires the caller to hold s.mu so readers cannot observe a cache
+// replacement in progress.
 func (s *Sentinel) readCache() (cache, bool) {
 	data, err := os.ReadFile(s.cachePath())
 	if err != nil || int64(len(data)) > defaultMaxBody {
@@ -450,6 +477,8 @@ func (s *Sentinel) readCache() (cache, bool) {
 	return cached, true
 }
 
+// writeCache requires the caller to hold s.mu so replacement is atomic to
+// SnapshotItems readers.
 func (s *Sentinel) writeCache(cached cache) error {
 	data, err := json.Marshal(cached)
 	if err != nil {

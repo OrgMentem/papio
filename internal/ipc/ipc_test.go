@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -350,6 +352,110 @@ func TestServeListenerClosesIdleClientsWhenListenerCloses(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("ServeListener did not stop after listener close with idle client")
+	}
+}
+
+type acceptResult struct {
+	conn net.Conn
+	err  error
+}
+
+type scriptedListener struct {
+	mu      sync.Mutex
+	results []acceptResult
+	accepts chan struct{}
+	closed  chan struct{}
+	once    sync.Once
+}
+
+func newScriptedListener(results ...acceptResult) *scriptedListener {
+	return &scriptedListener{
+		results: results,
+		accepts: make(chan struct{}, len(results)+1),
+		closed:  make(chan struct{}),
+	}
+}
+
+func (l *scriptedListener) Accept() (net.Conn, error) {
+	l.mu.Lock()
+	if len(l.results) > 0 {
+		result := l.results[0]
+		l.results = l.results[1:]
+		l.mu.Unlock()
+		l.accepts <- struct{}{}
+		return result.conn, result.err
+	}
+	l.mu.Unlock()
+	l.accepts <- struct{}{}
+	<-l.closed
+	return nil, net.ErrClosed
+}
+
+func (l *scriptedListener) Close() error {
+	l.once.Do(func() { close(l.closed) })
+	return nil
+}
+
+func (l *scriptedListener) Addr() net.Addr {
+	return &net.UnixAddr{Name: "scripted-listener", Net: "unix"}
+}
+
+func TestServeListenerRetriesTransientAcceptErrors(t *testing.T) {
+	firstServer, firstClient := net.Pipe()
+	t.Cleanup(func() { _ = firstClient.Close() })
+	secondServer, secondClient := net.Pipe()
+	t.Cleanup(func() { _ = secondClient.Close() })
+	listener := newScriptedListener(
+		acceptResult{conn: firstServer},
+		acceptResult{err: fmt.Errorf("fd pressure: %w", syscall.EMFILE)},
+		acceptResult{conn: secondServer},
+	)
+	server := &Server{Handler: HandlerFunc(func(context.Context, Request) ([]byte, *RPCError) {
+		return []byte(`{}`), nil
+	})}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- server.ServeListener(ctx, listener) }()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Errorf("ServeListener: %v", err)
+			}
+		case <-time.After(time.Second):
+			t.Error("ServeListener did not stop after cancellation")
+		}
+	})
+
+	for range 4 {
+		select {
+		case <-listener.accepts:
+		case <-time.After(time.Second):
+			t.Fatal("ServeListener did not continue accepting after transient error")
+		}
+	}
+
+	if err := firstClient.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	_, err := firstClient.Read(make([]byte, 1))
+	var netErr net.Error
+	if !errors.As(err, &netErr) || !netErr.Timeout() {
+		t.Fatalf("first client read error = %v, want timeout while connection remains open", err)
+	}
+}
+
+func TestServeListenerReturnsPermanentAcceptError(t *testing.T) {
+	permanent := errors.New("listener failed")
+	listener := newScriptedListener(acceptResult{err: permanent})
+	server := &Server{Handler: HandlerFunc(func(context.Context, Request) ([]byte, *RPCError) {
+		return []byte(`{}`), nil
+	})}
+
+	err := server.ServeListener(context.Background(), listener)
+	if !errors.Is(err, permanent) {
+		t.Fatalf("ServeListener error = %v, want wrapped %v", err, permanent)
 	}
 }
 

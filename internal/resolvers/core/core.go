@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"papio/internal/config"
+	"papio/internal/fetch"
 	"papio/internal/resolver"
 	"papio/internal/work"
 )
@@ -165,27 +166,30 @@ func (r *Resolver) search(ctx context.Context, query string) ([]record, error) {
 	return payload.Results, nil
 }
 
-// do prevents CORE's bearer credential from following an API redirect to a
-// different host. An opaque HTTPClient cannot provide this guarantee, so only
-// an http.Client (whose redirect policy we can control) may be used for an
-// authenticated request.
+// do permits only clients that protect CORE's bearer credential across
+// cross-origin redirects. fetch.SecureHTTPClient clears all caller-supplied
+// headers outside the origin, while http.Client is copied with a redirect policy
+// that strips Authorization; opaque HTTPClient implementations are rejected.
 func (r *Resolver) do(req *http.Request) (*http.Response, error) {
-	client, ok := r.client.(*http.Client)
-	if !ok {
+	switch client := r.client.(type) {
+	case *fetch.SecureHTTPClient:
+		return client.Do(req)
+	case *http.Client:
+		copyClient := *client
+		previous := client.CheckRedirect
+		copyClient.CheckRedirect = func(next *http.Request, via []*http.Request) error {
+			if !sameAuthority(next.URL, req.URL) {
+				next.Header.Del("Authorization")
+			}
+			if previous != nil {
+				return previous(next, via)
+			}
+			return nil
+		}
+		return copyClient.Do(req)
+	default:
 		return nil, errUnsafeHTTPClient
 	}
-	copyClient := *client
-	previous := client.CheckRedirect
-	copyClient.CheckRedirect = func(next *http.Request, via []*http.Request) error {
-		if !sameAuthority(next.URL, req.URL) {
-			next.Header.Del("Authorization")
-		}
-		if previous != nil {
-			return previous(next, via)
-		}
-		return nil
-	}
-	return copyClient.Do(req)
 }
 
 func sameAuthority(left, right *url.URL) bool {

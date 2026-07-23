@@ -6,8 +6,11 @@ package app
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -217,7 +220,16 @@ func (s *Service) Process(ctx context.Context, row *job.Row) error {
 		}
 	case job.StateResolving:
 		// Normal after startup recovery.
-	case job.StateFetching, job.StateValidating:
+	case job.StateFetching:
+		reused, err := s.reuseAcceptedReview(ctx, row)
+		if err != nil {
+			return err
+		}
+		if reused {
+			return nil
+		}
+		fallthrough
+	case job.StateValidating:
 		// A caller that skipped startup recovery cannot safely reuse a bearer URL.
 		if err := s.Jobs.Transition(ctx, row.ID, row.State, job.StateResolving,
 			map[string]any{"reason": "missing_live_candidate_after_recovery"}); err != nil {
@@ -230,9 +242,9 @@ func (s *Service) Process(ctx context.Context, row *job.Row) error {
 	default:
 		return nil // terminal and parked human states are not runnable
 	}
-	// Runnable jobs cannot retain a user-review file: those states are not
-	// claimed by the scheduler. Any contents here belong to a crashed attempt
-	// that recovery has rewound before issuing fresh resolver URLs.
+	// Runnable jobs cannot retain a user-review file unless an accepted identity
+	// review still binds a verified quarantined PDF for promotion. All other
+	// contents belong to a crashed attempt rewound before fresh resolver URLs.
 	if err := s.Artifacts.CleanQuarantine(row.ID); err != nil {
 		return err
 	}
@@ -278,6 +290,62 @@ func (s *Service) Process(ctx context.Context, row *job.Row) error {
 		return err
 	}
 	return s.fetchCandidates(ctx, row, live, retryAt)
+}
+
+// reuseAcceptedReview promotes the exact bytes a human accepted, rather than
+// issuing a fresh resolver URL that may no longer identify the same candidate.
+func (s *Service) reuseAcceptedReview(ctx context.Context, row *job.Row) (bool, error) {
+	binding, err := s.Jobs.AcceptedReviewBinding(ctx, row.ID)
+	if err != nil {
+		return false, err
+	}
+	if binding == nil {
+		return false, nil
+	}
+	result, ok := reviewedFetchResult(binding)
+	if !ok {
+		return false, nil
+	}
+	stored, err := s.Jobs.GetCandidate(ctx, binding.CandidateID)
+	if err != nil {
+		return false, err
+	}
+	if err := s.Jobs.Transition(ctx, row.ID, job.StateFetching, job.StateValidating,
+		map[string]any{"reason": "review_accepted_reuse", "candidate_id": stored.ID, "source": stored.Source},
+		job.WithCandidate(stored.ID)); err != nil {
+		return false, err
+	}
+	accepted, parked, err := s.validateCandidate(ctx, row, stored, result)
+	if err != nil {
+		return false, err
+	}
+	return accepted || parked, nil
+}
+
+// reviewedFetchResult verifies the review binding without loading a PDF into
+// memory before it is passed to the normal validation and promotion path.
+func reviewedFetchResult(binding *job.HumanActionBinding) (fetch.Result, bool) {
+	info, err := os.Stat(binding.QuarantinePath)
+	if err != nil || !info.Mode().IsRegular() {
+		return fetch.Result{}, false
+	}
+	file, err := os.Open(binding.QuarantinePath)
+	if err != nil {
+		return fetch.Result{}, false
+	}
+	defer func() { _ = file.Close() }()
+
+	sum := sha256.New()
+	if _, err := io.Copy(sum, file); err != nil {
+		return fetch.Result{}, false
+	}
+	if !strings.EqualFold(hex.EncodeToString(sum.Sum(nil)), binding.QuarantineSHA256) {
+		return fetch.Result{}, false
+	}
+	return fetch.Result{
+		TempPath: binding.QuarantinePath, SHA256: binding.QuarantineSHA256, SizeBytes: info.Size(),
+		SniffedMIME: "application/pdf", ContentType: "application/pdf",
+	}, true
 }
 
 func (s *Service) resolve(ctx context.Context, row *job.Row) (map[string]resolver.Candidate, time.Time, error) {

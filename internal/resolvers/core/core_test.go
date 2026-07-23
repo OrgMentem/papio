@@ -4,13 +4,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"strings"
 	"testing"
 	"time"
 
 	"papio/internal/config"
+	"papio/internal/fetch"
 	"papio/internal/resolver"
 	"papio/internal/work"
 )
@@ -187,6 +190,63 @@ func TestResolveAcceptsParameterizedPDFAndRejectsUnsafeClient(t *testing.T) {
 type transportFunc func(*http.Request) (*http.Response, error)
 
 func (f transportFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+type secureClientTestResolver struct{}
+
+func (secureClientTestResolver) LookupNetIP(context.Context, string, string) ([]netip.Addr, error) {
+	return []netip.Addr{netip.MustParseAddr("93.184.216.34")}, nil
+}
+
+func TestDoAcceptsSecureHTTPClientAndRejectsOpaqueClient(t *testing.T) {
+	secureClient, err := fetch.NewSecureHTTPClient(fetch.Policy{
+		MaxBytes:       1024,
+		Timeout:        time.Second,
+		ConnectTimeout: time.Second,
+		HeaderTimeout:  time.Second,
+		BodyTimeout:    time.Second,
+	}, secureClientTestResolver{}, transportFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{}`)),
+		}, nil
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequest(http.MethodGet, "https://metadata.example/works", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name       string
+		client     HTTPClient
+		wantUnsafe bool
+	}{
+		{name: "secure client", client: secureClient},
+		{name: "opaque client", client: roundTripFunc(func(*http.Request) (*http.Response, error) { return nil, errors.New("must not call") }), wantUnsafe: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resp, err := (&Resolver{client: tc.client}).do(req.Clone(context.Background()))
+			if got := errors.Is(err, errUnsafeHTTPClient); got != tc.wantUnsafe {
+				t.Fatalf("errUnsafeHTTPClient = %v, err = %v", got, err)
+			}
+			if tc.wantUnsafe {
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if resp == nil {
+				t.Fatal("secure client returned nil response")
+			}
+			if err := resp.Body.Close(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
 
 func TestResolveClassifiesNetworkAndDeadlineFailuresAsTemporary(t *testing.T) {
 	networkClient := &http.Client{Transport: transportFunc(func(*http.Request) (*http.Response, error) {
