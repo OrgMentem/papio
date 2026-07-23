@@ -762,12 +762,20 @@
         margin-right: var(--space-2);
       }
 
-      #status-legend .access-legend {
-        color: var(--color-context);
-        margin-inline-start: auto;
+      #access-legend {
+        align-items: baseline;
+        display: flex;
+        flex: 1 1 100%;
+        flex-wrap: wrap;
+        gap: var(--space-1) var(--space-3);
       }
 
-      #status-legend .access-legend strong {
+      #access-legend b {
+        color: var(--color-context);
+        font-weight: 600;
+      }
+
+      footer .footer-label {
         color: var(--color-brand-accent);
         font-weight: 700;
         letter-spacing: 0.04em;
@@ -908,13 +916,14 @@
         <span class="item-status" data-status="verify_identity" aria-hidden="true">?</span><span>verify identity</span>
         <span class="item-status" data-status="watch_hit" aria-hidden="true">✶</span><span>watch hit</span>
         <span class="item-status" data-status="retraction" aria-hidden="true">!</span><span>retraction</span>
-        <span class="access-legend">
-          <strong>Access:</strong> open access — no login needed · institutional access — sign in to
-          your institution first
-        </span>
+      </p>
+      <p id="access-legend">
+        <strong class="footer-label">Access:</strong>
+        <span><b>open access</b> — no login needed</span>
+        <span><b>institutional</b> — sign in to your institution first</span>
       </p>
       <p id="shortcut-help">
-        <strong>Keyboard:</strong> j/k select · a acts on the selected item (accept, acquire, or
+        <strong class="footer-label">Keyboard:</strong> j/k select · a acts on the selected item (accept, acquire, or
         open — whichever applies) · d dismisses or rejects · o opens it. Paused while typing
         or a dialog is open.
       </p>

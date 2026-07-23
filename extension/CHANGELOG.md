@@ -18,6 +18,10 @@ for the full pre-split extension history.
 
 ### Fixed
 
+- **The inbox footer's access legend reads as a legend again.** It sat crammed
+  at the end of the status-glyph row as one dash-and-middot run-on sentence;
+  it now gets its own row with an `ACCESS:` label (styled like `KEYBOARD:`)
+  and two clearly separated term–definition pairs.
 - **Dismissing a human action from the inbox works again.** The inbox and the
   native protocol both speak verdict `dismiss`, but the background broker's
   request guard only accepted `accept`/`reject`, so every dismiss died as
