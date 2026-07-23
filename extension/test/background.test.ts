@@ -1989,6 +1989,52 @@ test("inbox handoff runtime opening focuses the live offered tab without returni
   });
 });
 
+test("an inbox dismiss relays verdict dismiss through the native resolve", async () => {
+  // Regression: the inbox and the native protocol both speak verdict
+  // "dismiss" (Go enumRequired and protocol.ts both allow it), but the
+  // broker's isResolveRuntimeRequest guard only accepted accept/reject, so
+  // every human-action dismiss died as "Invalid action resolution request".
+  const h = makeHarness();
+  const urls = {
+    runtimeID: "papio-test-id",
+    inboxURL: "chrome-extension://papio-test-id/inbox.html",
+    popupURL: "chrome-extension://papio-test-id/popup.html",
+  };
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ daemon_version: "0.9.0", features: ["triage_mutations_v1"] }));
+
+  const pending = handleInboxRuntimeMessage(
+    h.bridge,
+    { type: "papio.action.resolve", request: { action_id: 142, verdict: "dismiss", expected_revision: 1 } },
+    { id: urls.runtimeID, url: urls.inboxURL },
+    urls,
+  );
+  const frame = await h.port.waitForFrame("human_action_resolve");
+  expect(frame.payload["verdict"]).toBe("dismiss");
+  expect(frame.payload["action_id"]).toBe(142);
+  expect(frame.payload["expected_revision"]).toBe(1);
+  expect(frame.payload["expected_sha256"]).toBeUndefined();
+
+  await h.port.inbound(nativeResult("human_action_resolve_result", {
+    request_id: frame.payload["request_id"],
+    outcome: "applied",
+  }));
+  await expect(pending).resolves.toEqual({ ok: true, outcome: "applied" });
+
+  // A genuinely unknown verdict must still be rejected with the exact error.
+  await expect(
+    handleInboxRuntimeMessage(
+      h.bridge,
+      { type: "papio.action.resolve", request: { action_id: 142, verdict: "cancel", expected_revision: 1 } },
+      { id: urls.runtimeID, url: urls.inboxURL },
+      urls,
+    ),
+  ).resolves.toEqual({
+    ok: false,
+    error: { code: "invalid_request", message: "Invalid action resolution request" },
+  });
+});
+
 test("queued inbox handoff force-releases exactly one live tab under racing opens", async () => {
   const h = makeHarness(undefined, { windows: true });
   await h.bridge.start();

@@ -545,6 +545,42 @@ test("dismissing a human_action item confirms and calls papio.action.resolve, no
   expect(page.document.querySelector("[data-triage-item-id='action:manual']")).toBeNull();
 });
 
+test("a structured broker rejection renders inline and never fakes a disconnect", async () => {
+  // Regression: a stale worker rejected dismisses with invalid_request and
+  // the inbox rendered it as "Disconnected: … Reconnecting automatically",
+  // hiding the real error and lying about connectivity. A structured reply
+  // proves the messaging path is alive; only a thrown call is a disconnect.
+  const fixture = snapshot([manualAction("action:manual", 1, "Manual action")], {
+    counts: counts({ pending_total: 1, actions: 1, watch_hits: 0, retractions: 0 }),
+  });
+  let throwNow = false;
+  const page = await inboxDocument((message) => {
+    if (message.type === "papio.action.resolve") {
+      if (throwNow) throw new Error("The message port closed before a response was received.");
+      return { ok: false, error: { code: "invalid_request", message: "Invalid action resolution request" } };
+    }
+    return snapshotReply(fixture, message);
+  });
+  page.document.querySelector<HTMLButtonElement>("[data-operation='dismiss']")?.click();
+  await settle();
+  page.document.getElementById("confirm-submit")?.dispatchEvent(new Event("click", { bubbles: true }));
+  await settle();
+
+  const row = page.document.querySelector<HTMLElement>("[data-triage-item-id='action:manual'] .item-result");
+  expect(row?.textContent).toBe("Invalid action resolution request");
+  expect(row?.dataset.tone).toBe("error");
+  expect(page.document.querySelector("[data-triage-item-id='action:manual']")).not.toBeNull();
+  expect(page.document.getElementById("connection-status")?.textContent).toContain("Connected");
+
+  // A thrown runtime call is a real transport failure and does disconnect.
+  throwNow = true;
+  page.document.querySelector<HTMLButtonElement>("[data-operation='dismiss']")?.click();
+  await settle();
+  page.document.getElementById("confirm-submit")?.dispatchEvent(new Event("click", { bubbles: true }));
+  await settle();
+  expect(page.document.getElementById("connection-status")?.textContent).toContain("Disconnected");
+});
+
 test("the filter narrows visible items, keeps counts intact, and reports a distinct empty state", async () => {
   const fixture = snapshot([
     watchHit("hit:one", 1, "Attention and memory"),

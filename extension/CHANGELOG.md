@@ -18,6 +18,13 @@ for the full pre-split extension history.
 
 ### Fixed
 
+- **Dismissing a human action from the inbox works again.** The inbox and the
+  native protocol both speak verdict `dismiss`, but the background broker's
+  request guard only accepted `accept`/`reject`, so every dismiss died as
+  "Invalid action resolution request".
+- **A structured broker rejection no longer masquerades as a daemon
+  disconnect.** It renders inline on the affected row; only a genuinely
+  failed runtime call flips the connection banner.
 - **Inbox browser handoffs now open the broker-owned tab**, rather than opening
   the paper's canonical DOI in an untracked tab. The background service keeps
   the resolver or OA URL private, releases queued handoffs through the existing

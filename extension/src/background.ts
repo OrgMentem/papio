@@ -1250,7 +1250,7 @@ export class Bridge {
   }
 
   async requestActionResolve(
-    request: { action_id: number; verdict: "accept" | "reject"; expected_revision: number; expected_sha256?: string },
+    request: { action_id: number; verdict: "accept" | "reject" | "dismiss"; expected_revision: number; expected_sha256?: string },
   ): Promise<BrokerReply<{ outcome: string; detail?: string }>> {
     const result = await this.requestNative(
       "human_action_resolve",
@@ -3152,7 +3152,7 @@ function isDecisionRuntimeRequest(
 
 function isResolveRuntimeRequest(
   value: unknown,
-): value is { action_id: number; verdict: "accept" | "reject"; expected_revision: number; expected_sha256?: string } {
+): value is { action_id: number; verdict: "accept" | "reject" | "dismiss"; expected_revision: number; expected_sha256?: string } {
   if (!isObjectRecord(value) || !hasOnlyKeys(value, ["action_id", "verdict", "expected_revision", "expected_sha256"])) {
     return false;
   }
@@ -3161,7 +3161,7 @@ function isResolveRuntimeRequest(
   if (
     !isPositiveSafeInteger(value["action_id"]) ||
     !isPositiveSafeInteger(value["expected_revision"]) ||
-    (verdict !== "accept" && verdict !== "reject")
+    (verdict !== "accept" && verdict !== "reject" && verdict !== "dismiss")
   ) {
     return false;
   }

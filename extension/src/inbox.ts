@@ -878,12 +878,24 @@ function beginMutation(item: TriageSnapshotItem): boolean {
   return true;
 }
 
+// failMutationOffline handles a thrown runtime call — the broker/worker was
+// unreachable, which IS a connectivity problem.
+function failMutationOffline(item: TriageSnapshotItem, error: unknown): void {
+  state.pending.delete(item.id);
+  const message = error instanceof Error ? error.message : "The daemon is unavailable.";
+  setConnection(false, message);
+  operationMessage(item.id, message, "offline");
+  render();
+}
+
 async function finishMutation(item: TriageSnapshotItem, response: unknown): Promise<void> {
   const result = resultForMutation(response);
   state.pending.delete(item.id);
   if (!result.ok) {
-    setConnection(false, result.message);
-    operationMessage(item.id, result.message, "offline");
+    // A structured broker rejection proves the messaging path is alive —
+    // render it on the row instead of faking a daemon disconnect. Genuine
+    // transport failures go through failMutationOffline.
+    operationMessage(item.id, result.message, "error");
     render();
     return;
   }
@@ -919,7 +931,7 @@ async function decide(item: TriageSnapshotItem, operation: "acquire" | "dismiss"
     });
     await finishMutation(item, response);
   } catch (error) {
-    await finishMutation(item, { ok: false, error: { message: error instanceof Error ? error.message : "The daemon is unavailable." } });
+    failMutationOffline(item, error);
   }
 }
 
@@ -989,7 +1001,7 @@ async function resolveConfirmation(): Promise<void> {
     await finishMutation(item, response);
   } catch (error) {
     closeDialog(false);
-    await finishMutation(item, { ok: false, error: { message: error instanceof Error ? error.message : "The daemon is unavailable." } });
+    failMutationOffline(item, error);
   }
 }
 
