@@ -179,6 +179,70 @@ func TestDoctorUsesOrdinaryDaemonAutostartPath(t *testing.T) {
 	}
 }
 
+func TestDoctorRecoversAfterTransientReadinessFailure(t *testing.T) {
+	// Regression: the readiness closure cached a failed doctor.run across
+	// executions of the same command tree, so a recovered daemon still
+	// rendered a stale FAIL on the next run.
+	cfg := config.Default()
+	cfg.DataDir = t.TempDir()
+	var out bytes.Buffer
+	fail := true
+	command := newDoctorCommand(&options{
+		out:          &out,
+		configLoader: func(string) (config.Config, error) { return cfg, nil },
+		newAutostarter: func(socket string) *daemon.Autostarter {
+			return &daemon.Autostarter{
+				SocketPath: socket,
+				Ready:      func(context.Context, string) error { return nil },
+				Executable: func() (string, error) { return "papio", nil },
+				Start:      func(context.Context, *exec.Cmd) error { return nil },
+			}
+		},
+		rpcCall: func(_ context.Context, _ string, method string, _ any, result any) error {
+			switch method {
+			case "doctor.run":
+				if fail {
+					return errors.New("dial ipc daemon: connection refused")
+				}
+				*result.(*doctor.Report) = doctor.Report{OK: true, Checks: []doctor.Check{{Name: "database", Status: doctor.Pass, Detail: "SQLite integrity ok"}}}
+			case "ping":
+				// Both the version handshake (daemonPingResult) and the doctor
+				// daemon check (doctor.DaemonStatus) ride the ping method.
+				switch r := result.(type) {
+				case *daemonPingResult:
+					r.Status, r.Version = "ok", api.Version
+				case *doctor.DaemonStatus:
+					*r = doctor.DaemonStatus{Status: "ok", Version: api.Version}
+				default:
+					t.Fatalf("unexpected ping result type %T", result)
+				}
+			default:
+				t.Fatalf("RPC method = %q", method)
+			}
+			return nil
+		},
+	})
+
+	if err := command.ExecuteContext(context.Background()); err == nil {
+		t.Fatal("first doctor run succeeded, want daemon failure")
+	}
+	if !strings.Contains(out.String(), "FAIL  daemon") {
+		t.Fatalf("first run output = %q, want daemon failure", out.String())
+	}
+
+	fail = false
+	out.Reset()
+	if err := command.ExecuteContext(context.Background()); err != nil {
+		t.Fatalf("second doctor run after recovery: %v", err)
+	}
+	if strings.Contains(out.String(), "FAIL  daemon") {
+		t.Fatalf("second run output = %q, stale daemon failure survived recovery", out.String())
+	}
+	if !strings.Contains(out.String(), "PASS  database") {
+		t.Fatalf("second run output = %q, want daemon database result", out.String())
+	}
+}
+
 func TestDoctorConfigFailureSkipsDaemon(t *testing.T) {
 	daemonCalled := false
 	deps := testDoctorDependencies(t, config.Config{}, doctor.DaemonStatus{})

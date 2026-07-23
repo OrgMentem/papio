@@ -439,7 +439,10 @@ func isReadOnly(cmd *cobra.Command) bool {
 }
 
 func isMirrorable(cmd *cobra.Command) bool {
-	return cmd != nil && cmd.Runnable() && !isHidden(cmd)
+	// mcp:help-only marks a command group whose injected RunE merely prints
+	// help (see cli.configureCommandGroups): runnable for the terminal, but
+	// not a real tool. Unlike mcp:hidden it must not prune the subtree.
+	return cmd != nil && cmd.Runnable() && !isHidden(cmd) && cmd.Annotations["mcp:help-only"] != "true"
 }
 
 func commandTakesArgs(cmd *cobra.Command) bool {

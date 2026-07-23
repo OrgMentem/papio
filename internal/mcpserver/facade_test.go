@@ -103,6 +103,19 @@ func TestFacadeSearchHidesLifecycleAndMarksReadOnly(t *testing.T) {
 			t.Errorf("facade should hide %q", hidden)
 		}
 	}
+	// Help-only command groups carry an injected help RunE for the terminal
+	// (cli.configureCommandGroups) but must not surface as tools, while their
+	// real verbs stay exposed.
+	for _, group := range []string{"jobs", "actions", "watch", "zotio"} {
+		if present[group] {
+			t.Errorf("facade should hide help-only group %q", group)
+		}
+	}
+	for _, verb := range []string{"jobs get", "jobs list", "actions list", "watch digest"} {
+		if !present[verb] {
+			t.Errorf("facade should expose %q despite its help-only parent; got %v", verb, present)
+		}
+	}
 	if !readOnly["status"] || !readOnly["search"] || !readOnly["version"] {
 		t.Errorf("read-only commands mismarked: %v", readOnly)
 	}

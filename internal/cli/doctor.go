@@ -56,6 +56,9 @@ func defaultDoctorDependencies(opt *options) doctor.IntegrationDependencies {
 
 func daemonReadinessDoctor(opt *options, daemonErr *error) doctorReadinessRunner {
 	return func(ctx context.Context, _ config.Config) doctor.Report {
+		// A reused command tree (the in-process MCP root) runs doctor many
+		// times; a transient failure must not outlive its own run.
+		*daemonErr = nil
 		var report doctor.Report
 		if err := opt.call(ctx, "doctor.run", struct{}{}, &report); err != nil {
 			// RunIntegration will render the daemon failure and its single

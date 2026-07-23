@@ -70,7 +70,19 @@ func testFactory() RootFactory {
 		}
 		parent.AddCommand(child)
 
-		root.AddCommand(visible, fail, hidden, parent)
+		helpOnly := &cobra.Command{
+			Use:         "helponly",
+			Short:       "Help-only group",
+			Annotations: map[string]string{"mcp:help-only": "true"},
+			RunE:        func(cmd *cobra.Command, _ []string) error { return cmd.Help() },
+		}
+		helpOnly.AddCommand(&cobra.Command{
+			Use:   "leaf",
+			Short: "Runnable leaf under a help-only group",
+			RunE:  func(_ *cobra.Command, _ []string) error { return nil },
+		})
+
+		root.AddCommand(visible, fail, hidden, parent, helpOnly)
 		return root
 	}
 }
@@ -93,12 +105,12 @@ func TestListCommandsExcludesHiddenSubtree(t *testing.T) {
 		names[c.Name] = true
 		readOnly[c.Name] = c.ReadOnly
 	}
-	for _, want := range []string{"visible", "fail", "parent child"} {
+	for _, want := range []string{"visible", "fail", "parent child", "helponly leaf"} {
 		if !names[want] {
 			t.Errorf("listCommands missing %q; got %v", want, names)
 		}
 	}
-	for _, unwant := range []string{"hidden", "hidden secret", "parent"} {
+	for _, unwant := range []string{"hidden", "hidden secret", "parent", "helponly"} {
 		if names[unwant] {
 			t.Errorf("listCommands should not include %q", unwant)
 		}

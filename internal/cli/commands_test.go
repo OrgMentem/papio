@@ -151,6 +151,28 @@ func TestBareCommandGroupPrintsHelpNotSilence(t *testing.T) {
 	}
 }
 
+func TestRunnableParentKeepsPositionalArgs(t *testing.T) {
+	// Regression: the unknown-verb validator must not touch runnable parents.
+	// `watch digest <id>` owns the `clear` subcommand AND takes a positional
+	// id; rejecting its argument as an unknown verb broke the documented read.
+	probe := errors.New("digest rpc reached")
+	var method string
+	var out, errOut bytes.Buffer
+	root := NewInProcessRoot(&out, &errOut, config.Config{}, func(_ context.Context, m string, _, _ any) error {
+		method = m
+		return probe
+	})
+	root.SetArgs([]string{"watch", "digest", "7"})
+
+	err := root.ExecuteContext(context.Background())
+	if !errors.Is(err, probe) {
+		t.Fatalf("watch digest 7 = %v, want the probe RPC error (dispatch to RunE)", err)
+	}
+	if method != "watch.digest" {
+		t.Fatalf("RPC method = %q, want watch.digest", method)
+	}
+}
+
 func TestJobsFailuresCommandOutputsGroups(t *testing.T) {
 	want := jobsFailuresResult{
 		Failures: []job.FailureGroup{{Count: 2, State: job.StateFailed, Provider: "api.example.test", Reason: "timeout", Sample: "job_01"}},

@@ -102,20 +102,22 @@ func newRoot(opt *options) *cobra.Command {
 	return root
 }
 
-// configureCommandGroups makes every command with subcommands reject an
+// configureCommandGroups makes every non-runnable command group reject an
 // unrecognized verb consistently. Cobra otherwise resolves an unknown child as
-// a positional argument to its parent; command groups with no RunE then
-// succeed silently.
+// a positional argument to its parent; groups with no RunE then succeed
+// silently. Runnable parents (for example `watch digest <id>`, which also
+// owns `watch digest clear`) keep their own Args contract untouched.
 func configureCommandGroups(command *cobra.Command) {
 	children := command.Commands()
 	if len(children) == 0 {
 		return
 	}
 
-	wasRunnable := command.Runnable()
-	originalArgs := command.Args
-	command.Args = func(cmd *cobra.Command, args []string) error {
-		if len(args) > 0 {
+	if !command.Runnable() {
+		command.Args = func(cmd *cobra.Command, args []string) error {
+			if len(args) == 0 {
+				return nil
+			}
 			verbs := make([]string, 0, len(children))
 			for _, child := range children {
 				if !child.Hidden {
@@ -124,16 +126,16 @@ func configureCommandGroups(command *cobra.Command) {
 			}
 			return fmt.Errorf("unknown %s command %q; valid verbs: %s", cmd.Name(), args[0], strings.Join(verbs, ", "))
 		}
-		if originalArgs != nil {
-			return originalArgs(cmd, args)
-		}
-		return nil
-	}
-	if !wasRunnable {
 		// Cobra returns help before validating Args for a non-runnable command.
-		// A help-printing RunE keeps the bare invocation informative while
-		// letting the shared Args validator above report unknown verbs.
+		// A help-printing RunE keeps the bare invocation informative while the
+		// Args validator above reports unknown verbs. The group stays help-only:
+		// mcp:help-only excludes this node from the MCP command mirror without
+		// hiding its children (mcp:hidden would prune the whole subtree).
 		command.RunE = func(cmd *cobra.Command, _ []string) error { return cmd.Help() }
+		if command.Annotations == nil {
+			command.Annotations = map[string]string{}
+		}
+		command.Annotations["mcp:help-only"] = "true"
 	}
 	for _, child := range children {
 		configureCommandGroups(child)
