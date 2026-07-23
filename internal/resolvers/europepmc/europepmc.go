@@ -405,8 +405,13 @@ func canonicalAuthor(value string) (string, rune, bool) {
 	}
 
 	parts := strings.Fields(normalizeTitle(value))
-	if len(parts) < 2 {
+	switch len(parts) {
+	case 0:
 		return "", 0, false
+	case 1:
+		// Mononymous authors ("Madonna") carry no separate initial; match on
+		// the bare name so a valid single-name author cannot sink the list.
+		return parts[0], 0, true
 	}
 	if isAuthorInitial(parts[len(parts)-1]) {
 		initial, ok := firstAuthorRune(parts[len(parts)-1])

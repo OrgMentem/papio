@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -92,6 +93,20 @@ func TestActionURLsSelectAwaitingActionsMostRecentAndDryRun(t *testing.T) {
 	}
 	if got := out.String(); got != want[0]+"\n"+want[1]+"\n"+want[2]+"\n" {
 		t.Fatalf("dry-run output = %q", got)
+	}
+}
+
+func TestBrowserOpenCommandCarriesTargetOnEveryPlatform(t *testing.T) {
+	const target = "https://resolver.example.test/open"
+	name, args := browserOpenCommand(target)
+	if name == "" {
+		t.Fatal("browserOpenCommand returned empty launcher")
+	}
+	if len(args) == 0 || args[len(args)-1] != target {
+		t.Fatalf("browserOpenCommand args = %v, want target last", args)
+	}
+	if runtime.GOOS == "darwin" && (name != "open" || args[0] != "-b" || args[1] != chromeBundleID) {
+		t.Fatalf("darwin launcher = %s %v, want Chrome-pinned open", name, args)
 	}
 }
 

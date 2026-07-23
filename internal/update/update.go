@@ -244,6 +244,11 @@ func compareVersion(left, right string) int {
 		var parts [3]int
 		value = strings.TrimPrefix(value, "v")
 		for i, raw := range strings.SplitN(value, ".", 3) {
+			// Drop pre-release/build suffixes ("3-dev", "3+build") so dev
+			// builds compare by their numeric core, as documented on IsNewer.
+			if cut := strings.IndexFunc(raw, func(r rune) bool { return r < '0' || r > '9' }); cut >= 0 {
+				raw = raw[:cut]
+			}
 			parts[i], _ = strconv.Atoi(raw)
 		}
 		return parts

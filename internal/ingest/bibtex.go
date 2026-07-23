@@ -196,7 +196,9 @@ func splitBibTeXAuthors(value string) []string {
 				depth--
 			}
 		default:
-			if depth == 0 && pos > start && isBibTeXSpace(value[pos-1]) && strings.HasPrefix(value[pos:], "and") && pos+3 < len(value) && isBibTeXSpace(value[pos+3]) {
+			// BibTeX treats the name separator case-insensitively ("and",
+			// "AND", "And" all delimit).
+			if depth == 0 && pos > start && isBibTeXSpace(value[pos-1]) && pos+3 < len(value) && strings.EqualFold(value[pos:pos+3], "and") && isBibTeXSpace(value[pos+3]) {
 				authors = append(authors, value[start:pos])
 				pos += 3
 				start = pos + 1

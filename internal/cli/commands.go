@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/url"
 	"os/exec"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -325,9 +326,8 @@ func openActionURLs(ctx context.Context, urls []string, dryRun bool, out io.Writ
 			continue
 		}
 		bounded, cancel := context.WithTimeout(ctx, openURLTimeout)
-		// The papio extension lives in Chrome; the OS default browser may not.
-		// Handoff tabs must open where the extension can adopt their downloads.
-		err := run(bounded, "open", "-b", chromeBundleID, target)
+		name, args := browserOpenCommand(target)
+		err := run(bounded, name, args...)
 		cancel()
 		if err != nil {
 			return fmt.Errorf("browser handoff could not open — open your browser with the papio extension enabled (papio doctor), then retry: %w", err)
@@ -336,7 +336,22 @@ func openActionURLs(ctx context.Context, urls []string, dryRun bool, out io.Writ
 	return nil
 }
 
-// chromeBundleID pins handoff tabs to the browser hosting the papio
+// browserOpenCommand returns the platform launcher for a handoff URL. macOS
+// pins Chrome — the papio extension lives there and handoff tabs must open
+// where the extension can adopt their downloads. Other platforms hand the URL
+// to the default browser; papio doctor verifies the extension host.
+func browserOpenCommand(target string) (string, []string) {
+	switch runtime.GOOS {
+	case "darwin":
+		return "open", []string{"-b", chromeBundleID, target}
+	case "windows":
+		return "rundll32", []string{"url.dll,FileProtocolHandler", target}
+	default:
+		return "xdg-open", []string{target}
+	}
+}
+
+// chromeBundleID pins macOS handoff tabs to the browser hosting the papio
 // extension. The native-messaging host manifests are Chrome-scoped today; if
 // other Chromium channels are ever supported this becomes configuration.
 const chromeBundleID = "com.google.Chrome"

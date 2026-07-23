@@ -216,6 +216,18 @@ func TestSameAuthorRejectsDistinctUTF8Initials(t *testing.T) {
 	}
 }
 
+func TestSameAuthorMatchesMononyms(t *testing.T) {
+	if !sameAuthor("Madonna", "Madonna") {
+		t.Fatal("sameAuthor rejected identical mononyms")
+	}
+	if sameAuthor("Madonna", "Prince") {
+		t.Fatal("sameAuthor accepted distinct mononyms")
+	}
+	if sameAuthor("Madonna", "John Smith") {
+		t.Fatal("sameAuthor accepted mononym against full name")
+	}
+}
+
 func TestLandingOnlyWhenNoPDF(t *testing.T) {
 	body := `{"hitCount":1,"resultList":{"result":[{
       "id":"PMC9","source":"PMC","doi":"10.1000/only-html","title":"HTML Only","isOpenAccess":"Y",

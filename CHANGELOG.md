@@ -31,6 +31,19 @@ execution records in `notes/acquisition-stack-plan.md`.
 
 ### Fixed
 
+- Single-word author names (bare family names and mononyms) no longer sink
+  metadata corroboration: Europe PMC and OpenAlex title-search matching and
+  Crossref enrichment now compare them by name instead of rejecting the whole
+  author list, so title-only requests with such authors can resolve.
+- BibTeX/BibLaTeX imports now split authors separated by uppercase or
+  mixed-case `AND`, matching BibTeX's case-insensitive separator, instead of
+  ingesting them as one concatenated name.
+- `papio actions open` launches the browser on Windows and Linux (default
+  browser via `rundll32`/`xdg-open`) instead of failing on the macOS-only
+  `open -b` command; macOS still pins Chrome.
+- Development and pre-release builds (`X.Y.Z-dev`) no longer trigger false
+  "update available" nudges: version comparison strips pre-release/build
+  suffixes instead of parsing the component as 0.
 - Adopting a browser download now resolves the handoff action it satisfied.
   Previously the "sign in to your institution" row lingered beside the
   verification prompt for the same paper, and dismissing that stale row

@@ -222,6 +222,18 @@ func TestSameAuthorRejectsDistinctUTF8Initials(t *testing.T) {
 	}
 }
 
+func TestSameAuthorMatchesMononyms(t *testing.T) {
+	if !sameAuthor("Madonna", "Madonna") {
+		t.Fatal("sameAuthor rejected identical mononyms")
+	}
+	if sameAuthor("Madonna", "Prince") {
+		t.Fatal("sameAuthor accepted distinct mononyms")
+	}
+	if sameAuthor("Madonna", "John Smith") {
+		t.Fatal("sameAuthor accepted mononym against full name")
+	}
+}
+
 // The OpenAlex works API is free in the polite pool: a contact email is the
 // only requirement and the api_key parameter is optional premium capacity —
 // the same stance as the discovery client.

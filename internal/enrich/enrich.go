@@ -224,8 +224,13 @@ func authorFamily(value string) string {
 		return normalizeTitle(value[:comma])
 	}
 	parts := strings.Fields(normalizeTitle(value))
-	if len(parts) < 2 {
+	if len(parts) == 0 {
 		return ""
+	}
+	if len(parts) == 1 {
+		// A single-word author is a bare family name or mononym; corroborate
+		// on it directly instead of silently skipping the author check.
+		return parts[0]
 	}
 	if isAuthorInitial(parts[len(parts)-1]) {
 		return strings.Join(parts[:len(parts)-1], " ")

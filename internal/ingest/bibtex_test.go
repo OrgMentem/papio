@@ -15,7 +15,7 @@ const bibTeXFixture = `@article{garcia2024,
 
 @inproceedings{doe2023,
   title = "Quoted   title -- result",
-  author = "Doe, Jane and Roe, Richard",
+  author = "Doe, Jane AND Roe, Richard",
   year = "Published 2023",
 }
 `

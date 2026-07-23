@@ -103,3 +103,15 @@ func TestEnrichResponseFailures(t *testing.T) {
 		})
 	}
 }
+
+func TestAuthorFamilyAcceptsSingleWordAuthors(t *testing.T) {
+	if got := authorFamily("Smith"); got != "smith" {
+		t.Fatalf("authorFamily(Smith) = %q, want smith", got)
+	}
+	if got := authorFamily("  "); got != "" {
+		t.Fatalf("authorFamily(blank) = %q, want empty", got)
+	}
+	if got := authorFamily("John Smith"); got != "smith" {
+		t.Fatalf("authorFamily(John Smith) = %q, want smith", got)
+	}
+}

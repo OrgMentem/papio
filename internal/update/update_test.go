@@ -202,6 +202,9 @@ func TestVersionAndUpgradeHints(t *testing.T) {
 	if !IsNewer("v1.2.3", "1.2.2") || IsNewer("1.2.3", "1.2.3") {
 		t.Fatal("unexpected version comparison")
 	}
+	if IsNewer("1.2.2", "1.2.3-dev") || !IsNewer("1.2.3", "1.2.2-dev") || IsNewer("1.2.3", "1.2.3+build") {
+		t.Fatal("pre-release/build suffixes must not affect version comparison")
+	}
 	if got := UpgradeHint("/opt/homebrew/bin/papio", "https://example.test/releases"); got != "brew upgrade papio" {
 		t.Fatalf("homebrew hint = %q", got)
 	}
