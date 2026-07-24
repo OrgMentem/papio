@@ -122,6 +122,9 @@ func TestDoctorUsesOrdinaryDaemonAutostartPath(t *testing.T) {
 	cfg.Path = filepath.Join(t.TempDir(), "config.toml")
 	cfg.DataDir = t.TempDir()
 	cfg.Updates.Check = false
+	// zotio is an optional integration; skip it so the real preflight is not run
+	// against the host (it is absent on CI runners, which would fail the check).
+	cfg.Zotio.Executable = ""
 
 	var out bytes.Buffer
 	started := false
@@ -185,6 +188,10 @@ func TestDoctorRecoversAfterTransientReadinessFailure(t *testing.T) {
 	// rendered a stale FAIL on the next run.
 	cfg := config.Default()
 	cfg.DataDir = t.TempDir()
+	cfg.Updates.Check = false
+	// Optional zotio integration off: keep this readiness test deterministic
+	// without the zotio binary (absent on CI runners).
+	cfg.Zotio.Executable = ""
 	var out bytes.Buffer
 	fail := true
 	command := newDoctorCommand(&options{
