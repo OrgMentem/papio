@@ -113,10 +113,10 @@ func TestConfigInitWritesPrivateStructuredConfig(t *testing.T) {
 
 func TestDaemonPingResultDecodesFullStatus(t *testing.T) {
 	var result daemonPingResult
-	if err := ipc.DecodeResult(json.RawMessage(`{"status":"ok","version":"1.2.3","extension_connected":true,"extension_version":"4.5.6","update_available":true,"latest_version":"1.2.4","zotio_update_available":true,"zotio_latest_version":"5.6.7"}`), &result); err != nil {
+	if err := ipc.DecodeResult(json.RawMessage(`{"status":"ok","version":"1.2.3","extension_connected":true,"extension_version":"4.5.6","pending_browser_sessions":2,"browser_session_denied":3,"update_available":true,"latest_version":"1.2.4","zotio_update_available":true,"zotio_latest_version":"5.6.7"}`), &result); err != nil {
 		t.Fatalf("decode ping result: %v", err)
 	}
-	if result.Status != "ok" || result.Version != "1.2.3" || !result.ExtensionConnected || result.ExtensionVersion != "4.5.6" || !result.UpdateAvailable || result.LatestVersion != "1.2.4" || !result.ZotioUpdateAvailable || result.ZotioLatestVersion != "5.6.7" {
+	if result.Status != "ok" || result.Version != "1.2.3" || !result.ExtensionConnected || result.ExtensionVersion != "4.5.6" || result.PendingBrowserSessions != 2 || result.BrowserSessionDenied != 3 || !result.UpdateAvailable || result.LatestVersion != "1.2.4" || !result.ZotioUpdateAvailable || result.ZotioLatestVersion != "5.6.7" {
 		t.Fatalf("ping result = %+v", result)
 	}
 }

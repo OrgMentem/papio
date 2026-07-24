@@ -201,14 +201,16 @@ func callSocket(ctx context.Context, socket, method string, params, result any) 
 }
 
 type daemonPingResult struct {
-	Status               string `json:"status"`
-	Version              string `json:"version"`
-	ExtensionConnected   bool   `json:"extension_connected"`
-	ExtensionVersion     string `json:"extension_version,omitempty"`
-	UpdateAvailable      bool   `json:"update_available"`
-	LatestVersion        string `json:"latest_version,omitempty"`
-	ZotioUpdateAvailable bool   `json:"zotio_update_available"`
-	ZotioLatestVersion   string `json:"zotio_latest_version,omitempty"`
+	Status                 string `json:"status"`
+	Version                string `json:"version"`
+	ExtensionConnected     bool   `json:"extension_connected"`
+	ExtensionVersion       string `json:"extension_version,omitempty"`
+	PendingBrowserSessions int    `json:"pending_browser_sessions,omitempty"`
+	BrowserSessionDenied   int    `json:"browser_session_denied,omitempty"`
+	UpdateAvailable        bool   `json:"update_available"`
+	LatestVersion          string `json:"latest_version,omitempty"`
+	ZotioUpdateAvailable   bool   `json:"zotio_update_available"`
+	ZotioLatestVersion     string `json:"zotio_latest_version,omitempty"`
 }
 
 func (o *options) warnDaemonVersion(ctx context.Context, socket string, cfg config.Config) error {
