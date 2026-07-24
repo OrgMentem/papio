@@ -16,6 +16,22 @@ for the full pre-split extension history.
 
 ## [Unreleased]
 
+### Added
+
+- **Tab-group handoff on Firefox.** The collapsed "papio" tab group now works
+  on Firefox 139+ (which added the `tabGroups` WebExtensions API), not just
+  Chrome. Older Firefox still falls back to the background work window
+  automatically. The handoff group is now coloured orange.
+
+### Fixed
+
+- Reloading the extension no longer creates a second "papio" tab group: the
+  existing group is rediscovered by title first. (An extension reload clears the
+  in-memory group id but leaves the physical group in the window.)
+- The inbox popup now closes after you click **Open inbox** on Firefox, instead
+  of staying on "Opening inbox…". Chrome already dismissed the popup when the
+  new tab took focus; Firefox does not, so it is now closed explicitly.
+
 ## [0.6.0] - 2026-07-24
 
 ### Added
