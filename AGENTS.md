@@ -43,6 +43,21 @@ The extension has **zero runtime deps** — both bundles are plain browser JS. `
   the first leaves browsers spawning the OLD native host (daemon shows a `legacy`
   browser session). After replacing it, kill the running `papio-native-host` process;
   Chrome respawns it from the new binary within seconds.
+- **Use `make dev-deploy` for local daemon changes — don't hand-roll the dance.**
+  It builds a version-stamped binary, installs it to a stable `~/.local/bin/papio`,
+  repoints the native-host symlink there, restarts the host + daemon, and runs
+  `doctor`. Doing it by hand and skipping the `native-host install` step leaves the
+  extension talking to a stale (or dead) host.
+- **`brew upgrade` can dangle the native-host symlink → "Could not establish a
+  current daemon session".** `papio native-host install` now pins the symlink to
+  the *invocation path* (e.g. the brew-stable `/opt/homebrew/bin/papio`, relinked on
+  upgrade), not the resolved `…/Caskroom/papio/<ver>/papio` — brew deletes the old
+  versioned dir on upgrade, which used to leave the host pointing at nothing. If a
+  session still won't connect, run `papio native-host status` (`target_exists`) or
+  `papio doctor` (now fails on a missing host executable) and re-run `native-host
+  install`. On a dev box, prefer a single papio: put `~/.local/bin` ahead of
+  `/opt/homebrew/bin` in PATH (bare `papio` = your dev build; autostart is then
+  unambiguous) and/or `brew pin papio` so it can't silently upgrade mid-session.
 - **Never `cp` over an existing papio binary on macOS** — overwriting the inode of a
   previously-executed signed binary poisons the kernel's signature cache and the next
   exec dies with SIGKILL (exit 137). Use `mv` or `rm` first so the copy gets a fresh

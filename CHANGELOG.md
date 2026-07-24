@@ -39,6 +39,15 @@ execution records in `notes/acquisition-stack-plan.md`.
   browser (no login) and downloaded automatically. Paywalled landing pages
   still park as a manual download or take the institutional handoff.
 
+- `papio native-host install` now pins the browser native-messaging host to the
+  invocation path (e.g. Homebrew's stable `/opt/homebrew/bin/papio`) instead of
+  the fully symlink-resolved `…/Caskroom/papio/<version>/papio`. A `brew upgrade`
+  deletes the old versioned directory, which previously dangled the host symlink
+  and disconnected the extension ("could not establish a current daemon
+  session"); pinning the stable launcher survives upgrades. `papio doctor` now
+  also fails when the host executable a manifest points at is missing, with the
+  exact remediation, instead of only validating the manifest JSON.
+
 - Single-word author names (bare family names and mononyms) no longer sink
   metadata corroboration: Europe PMC and OpenAlex title-search matching and
   Crossref enrichment now compare them by name instead of rejecting the whole

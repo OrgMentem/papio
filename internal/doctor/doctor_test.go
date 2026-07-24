@@ -150,6 +150,49 @@ func TestRunIntegrationReportsVersionSkewAndSkipsUnconfiguredManifests(t *testin
 	}
 }
 
+func TestRunIntegrationFailsOnDanglingHostExecutable(t *testing.T) {
+	const extID = "abcdefghijklmnopabcdefghijklmnop"
+	cfg := config.Default()
+	cfg.Path = filepath.Join(t.TempDir(), "config.toml")
+	cfg.Browser.ExtensionID = extID
+	manifestDir := t.TempDir()
+	manifest := `{"name":"com.orgmentem.papio","path":"/gone/papio-native-host","type":"stdio",` +
+		`"allowed_origins":["chrome-extension://` + extID + `/"]}`
+	if err := os.WriteFile(filepath.Join(manifestDir, "com.orgmentem.papio.json"), []byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	report := RunIntegration(context.Background(), IntegrationDependencies{
+		CLIVersion: "v1",
+		LoadConfig: func() (config.Config, error) { return cfg, nil },
+		DaemonStatus: func(context.Context, config.Config) (DaemonStatus, error) {
+			return DaemonStatus{Status: "ok", Version: "v1"}, nil
+		},
+		ManifestDir: func(config.Config) (string, error) { return manifestDir, nil },
+		FirefoxDir:  func(config.Config) (string, error) { return t.TempDir(), nil },
+		ReadFile:    os.ReadFile,
+		// The host symlink points at a binary a brew upgrade removed.
+		HostExecutableResolves: func(string) bool { return false },
+		ZotioPreflight: func(context.Context, config.Config) (*zotio.PreflightResult, error) {
+			return &zotio.PreflightResult{Version: "1.2.3"}, nil
+		},
+	})
+	var chrome Check
+	for _, c := range report.Checks {
+		if c.Name == "native host (Chrome)" {
+			chrome = c
+		}
+	}
+	if chrome.Status != Fail || !strings.Contains(chrome.Detail, "dangling") {
+		t.Fatalf("Chrome host check = %#v, want Fail mentioning dangling", chrome)
+	}
+	if chrome.Remediation != "papio native-host install" {
+		t.Fatalf("remediation = %q, want papio native-host install", chrome.Remediation)
+	}
+	if report.OK {
+		t.Fatalf("report must fail when the host executable is missing: %+v", report)
+	}
+}
+
 func TestRunIntegrationUpdates(t *testing.T) {
 	baseConfig := func() config.Config {
 		cfg := config.Default()

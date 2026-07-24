@@ -218,15 +218,20 @@ type DaemonStatus struct {
 // are deliberately independent of command-line plumbing so other callers can
 // reuse RunIntegration.
 type IntegrationDependencies struct {
-	CLIVersion        string
-	LoadConfig        func() (config.Config, error)
-	DaemonStatus      func(context.Context, config.Config) (DaemonStatus, error)
-	ManifestDir       func(config.Config) (string, error)
-	FirefoxDir        func(config.Config) (string, error)
-	ReadFile          func(string) ([]byte, error)
-	ZotioPreflight    func(context.Context, config.Config) (*zotio.PreflightResult, error)
-	CheckUpdates      func(context.Context, config.Config) (*update.Info, error)
-	CheckZotioUpdates func(context.Context, config.Config) (*update.Info, error)
+	CLIVersion   string
+	LoadConfig   func() (config.Config, error)
+	DaemonStatus func(context.Context, config.Config) (DaemonStatus, error)
+	ManifestDir  func(config.Config) (string, error)
+	FirefoxDir   func(config.Config) (string, error)
+	ReadFile     func(string) ([]byte, error)
+	// HostExecutableResolves reports whether the native-host executable a
+	// manifest points at actually exists (following the symlink). Optional: when
+	// nil the check is skipped. Catches a dangling host symlink — e.g. a brew
+	// upgrade deleting the versioned binary the symlink was pinned to.
+	HostExecutableResolves func(execPath string) bool
+	ZotioPreflight         func(context.Context, config.Config) (*zotio.PreflightResult, error)
+	CheckUpdates           func(context.Context, config.Config) (*update.Info, error)
+	CheckZotioUpdates      func(context.Context, config.Config) (*update.Info, error)
 }
 
 // RunIntegration checks the daemon, browser extension, native-host manifests,
@@ -406,22 +411,23 @@ func integrationDependenciesComplete(deps IntegrationDependencies) bool {
 }
 
 func runManifestChecks(cfg config.Config, deps IntegrationDependencies, add func(string, string, string, string)) {
-	runManifestCheck("native host (Chrome)", cfg.Browser.ChromiumExtensionIDs(), "chrome-extension://", cfg, deps.ManifestDir, deps.ReadFile, add)
+	runManifestCheck("native host (Chrome)", cfg.Browser.ChromiumExtensionIDs(), "chrome-extension://", cfg, deps.ManifestDir, deps.ReadFile, deps.HostExecutableResolves, add)
 	var firefoxIDs []string
 	if cfg.Browser.FirefoxExtensionID != "" {
 		firefoxIDs = []string{cfg.Browser.FirefoxExtensionID}
 	}
-	runManifestCheck("native host (Firefox)", firefoxIDs, "", cfg, deps.FirefoxDir, deps.ReadFile, add)
+	runManifestCheck("native host (Firefox)", firefoxIDs, "", cfg, deps.FirefoxDir, deps.ReadFile, deps.HostExecutableResolves, add)
 }
 
 const nativeHostManifestName = "com.orgmentem.papio"
 
 type nativeHostManifest struct {
+	Path              string   `json:"path"`
 	AllowedOrigins    []string `json:"allowed_origins"`
 	AllowedExtensions []string `json:"allowed_extensions"`
 }
 
-func runManifestCheck(name string, extensionIDs []string, originPrefix string, cfg config.Config, manifestDir func(config.Config) (string, error), readFile func(string) ([]byte, error), add func(string, string, string, string)) {
+func runManifestCheck(name string, extensionIDs []string, originPrefix string, cfg config.Config, manifestDir func(config.Config) (string, error), readFile func(string) ([]byte, error), resolves func(string) bool, add func(string, string, string, string)) {
 	if len(extensionIDs) == 0 {
 		add(name, Skip, "skipped: extension ID is not configured", "")
 		return
@@ -457,6 +463,10 @@ func runManifestCheck(name string, extensionIDs []string, originPrefix string, c
 			add(name, Fail, "manifest does not allow "+extensionID, "papio native-host install")
 			return
 		}
+	}
+	if resolves != nil && manifest.Path != "" && !resolves(manifest.Path) {
+		add(name, Fail, "native-host executable is missing at "+manifest.Path+" (dangling symlink? a package upgrade may have removed it)", "papio native-host install")
+		return
 	}
 	add(name, Pass, "manifest allows configured extension", "")
 }

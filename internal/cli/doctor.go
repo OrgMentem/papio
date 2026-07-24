@@ -42,6 +42,11 @@ func defaultDoctorDependencies(opt *options) doctor.IntegrationDependencies {
 			return defaultFirefoxManifestDir()
 		},
 		ReadFile: os.ReadFile,
+		// Follows the symlink; false when the host executable it points at is gone.
+		HostExecutableResolves: func(execPath string) bool {
+			_, err := os.Stat(execPath)
+			return err == nil
+		},
 		ZotioPreflight: func(ctx context.Context, cfg config.Config) (*zotio.PreflightResult, error) {
 			return zotio.New(cfg.Zotio).Preflight(ctx)
 		},

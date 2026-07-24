@@ -38,12 +38,11 @@ func writeTestConfig(t *testing.T, extensionID, firefoxExtensionID string) (stri
 	if err := config.Save(cfg, ""); err != nil {
 		t.Fatalf("save config: %v", err)
 	}
+	// Install pins the host symlink to the invocation path (not the fully
+	// symlink-resolved path), so the expected target is os.Executable() as-is.
 	exe, err := os.Executable()
 	if err != nil {
 		t.Fatalf("executable: %v", err)
-	}
-	if resolved, rErr := filepath.EvalSymlinks(exe); rErr == nil {
-		exe = resolved
 	}
 	return configDir, exe
 }

@@ -284,12 +284,16 @@ func installNativeHost(cfg config.Config, manifestDir, firefoxManifestDir string
 		return nativeHostInstallResult{}, fmt.Errorf("browser.extension_id is not set in %s: set it before installing the native host (32 chars a-p; the fixed Chrome extension ID)", cfg.Path)
 	}
 
+	// Pin the host symlink to the path this binary was invoked as, NOT the fully
+	// symlink-resolved path. Resolving all the way turns a stable launcher (e.g.
+	// Homebrew's /opt/homebrew/bin/papio, relinked on every upgrade) into a
+	// versioned Caskroom path that `brew upgrade` later deletes, dangling the
+	// host symlink and disconnecting the extension. The host's own launch-time
+	// resolution (resolveExecutablePath) canonicalizes to the real binary, so
+	// pinning the stable invocation path is both correct and upgrade-proof.
 	exe, err := os.Executable()
 	if err != nil {
 		return nativeHostInstallResult{}, err
-	}
-	if resolved, rErr := filepath.EvalSymlinks(exe); rErr == nil {
-		exe = resolved
 	}
 
 	hostPath, err := nativehost.InstallExecutable(exe)
