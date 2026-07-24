@@ -10,6 +10,8 @@ execution records in `notes/acquisition-stack-plan.md`.
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-07-24
+
 ### Added
 
 - When the institutional OpenURL route reports no entitlement (or only
