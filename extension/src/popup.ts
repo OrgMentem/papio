@@ -244,13 +244,16 @@ export function wireInboxLauncher(
   button.addEventListener("click", () => {
     button.disabled = true;
     if (status) status.textContent = "Opening inbox…";
-    void onOpen().catch(
-      (error: unknown) => {
+    void onOpen()
+      .then(() => {
+        // Chrome dismisses the popup when the new tab takes focus; Firefox
+        // keeps it open, so close it explicitly once the inbox is open.
+        window.close();
+      })
+      .catch((error: unknown) => {
         if (status) status.textContent = error instanceof Error ? error.message : "Could not open inbox";
-      },
-    ).finally(() => {
-      button.disabled = false;
-    });
+        button.disabled = false;
+      });
   });
 }
 

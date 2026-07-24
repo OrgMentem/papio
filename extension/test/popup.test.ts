@@ -249,18 +249,22 @@ test("opens the singleton inbox through the broker when it acknowledges", async 
 test("falls back to a direct inbox tab when the broker does not answer", async () => {
   const doc = popupDocument();
   const created: unknown[] = [];
+  let closed = 0;
+  const { promise: dismissed, resolve: onClose } = Promise.withResolvers<void>();
   Object.assign(globalThis, {
     chrome: {
       runtime: { sendMessage: async () => undefined },
       tabs: { create: async (options: unknown) => { created.push(options); } },
     },
+    window: { close: () => { closed += 1; onClose(); } },
   });
   wireInboxLauncher(doc);
 
   (doc.getElementById("open-inbox-btn") as HTMLButtonElement).click();
-  await Promise.resolve();
-  await Promise.resolve();
+  await dismissed;
   expect(created).toEqual([{ url: "dist/inbox.html" }]);
+  // The popup dismisses itself once the inbox is open (Firefox keeps it open otherwise).
+  expect(closed).toBe(1);
 });
 
 test("Enter invokes the primary acquisition action", async () => {
