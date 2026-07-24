@@ -121,6 +121,48 @@ func TestRunWarnsWhenOCRExplicitlyDisabled(t *testing.T) {
 	}
 }
 
+func TestRunWarnsOnRawAlmaResolverBase(t *testing.T) {
+	cfg := config.Default()
+	cfg.AccessMode = config.ModeConservative
+	cfg.DataDir = t.TempDir()
+	cfg.Email = "a@b.test"
+	cfg.Browser.OpenURLBase = "https://une.alma.exlibrisgroup.com/view/uresolver/61UNE_INST/openurl"
+	cfg.Browser.Resolvers = map[string]config.Institution{
+		"primo": {OpenURLBase: "https://une.primo.exlibrisgroup.com/nde/openurl?vid=61UNE_INST:61UNE_NDE"},
+		"alma":  {OpenURLBase: "https://x.alma.exlibrisgroup.com/view/uresolver/61X_INST/openurl?svc_dat=viewit"},
+	}
+	tool := executable(t)
+	report := Run(context.Background(), cfg, nil, pdf.Capability{PDFToText: tool}, tool)
+	byName := map[string]Check{}
+	for _, c := range report.Checks {
+		byName[c.Name] = c
+	}
+	if got := byName["resolver_base"]; got.Status != Warn {
+		t.Fatalf("default resolver_base = %+v; want warn", got)
+	}
+	if got := byName["resolver_base:alma"]; got.Status != Warn {
+		t.Fatalf("resolver_base:alma = %+v; want warn", got)
+	}
+	if _, ok := byName["resolver_base:primo"]; ok {
+		t.Fatalf("primo profile should not warn: %+v", report.Checks)
+	}
+}
+
+func TestRunPassesOnPrimoResolverBase(t *testing.T) {
+	cfg := config.Default()
+	cfg.AccessMode = config.ModeConservative
+	cfg.DataDir = t.TempDir()
+	cfg.Email = "a@b.test"
+	cfg.Browser.OpenURLBase = "https://une.primo.exlibrisgroup.com/nde/openurl?vid=61UNE_INST:61UNE_NDE"
+	tool := executable(t)
+	report := Run(context.Background(), cfg, nil, pdf.Capability{PDFToText: tool}, tool)
+	for _, c := range report.Checks {
+		if c.Name == "resolver_base" && c.Status != Pass {
+			t.Fatalf("resolver_base = %+v; want pass", c)
+		}
+	}
+}
+
 func TestRunIntegrationReportsVersionSkewAndSkipsUnconfiguredManifests(t *testing.T) {
 	cfg := config.Default()
 	cfg.Path = filepath.Join(t.TempDir(), "config.toml")

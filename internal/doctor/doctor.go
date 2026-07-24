@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -123,6 +124,7 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, capability pdf
 	}
 
 	checkSourceCredentials(cfg, add)
+	checkResolverBases(cfg, add)
 	sort.SliceStable(checks, func(i, j int) bool { return checks[i].Name < checks[j].Name })
 	out := Report{OK: true, Checks: checks}
 	for _, c := range checks {
@@ -153,6 +155,50 @@ func checkDataDir(path string) error {
 		return err
 	}
 	return os.Remove(name)
+}
+
+// checkResolverBases warns when an OpenURL base points at a raw Alma uresolver
+// (…/view/uresolver/…). That deep link sends an unauthenticated patron to the
+// Alma staff login (…/mng/login), which patrons cannot complete. The patron
+// path is the institution's Primo OpenURL endpoint (…/discovery/openurl or
+// …/nde/openurl?vid=…), which routes sign-in through the IdP.
+func checkResolverBases(cfg config.Config, add func(string, string, string, string)) {
+	const remediation = "point openurl_base_url at the institution's Primo OpenURL endpoint " +
+		"(…/discovery/openurl or …/nde/openurl?vid=…) instead of the raw …/view/uresolver/ link"
+	if isRawAlmaResolver(cfg.Browser.OpenURLBase) {
+		add("resolver_base", Warn,
+			"default OpenURL base is a raw Alma uresolver; unauthenticated patrons are sent to the Alma staff login (/mng/login)",
+			remediation)
+	} else if strings.TrimSpace(cfg.Browser.OpenURLBase) != "" {
+		add("resolver_base", Pass, "default OpenURL base uses a patron discovery endpoint", "")
+	}
+	names := make([]string, 0, len(cfg.Browser.Resolvers))
+	for name := range cfg.Browser.Resolvers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		if isRawAlmaResolver(cfg.Browser.Resolvers[name].OpenURLBase) {
+			add("resolver_base:"+name, Warn,
+				"OpenURL base is a raw Alma uresolver; unauthenticated patrons are sent to the Alma staff login (/mng/login)",
+				remediation)
+		}
+	}
+}
+
+// isRawAlmaResolver reports whether base is an Alma link-resolver deep link
+// (host *.alma.exlibrisgroup.com with a /view/uresolver/ path), the shape that
+// bounces patrons to the Alma staff console instead of Primo/IdP sign-in.
+func isRawAlmaResolver(base string) bool {
+	if strings.TrimSpace(base) == "" {
+		return false
+	}
+	u, err := url.Parse(base)
+	if err != nil {
+		return false
+	}
+	return strings.HasSuffix(strings.ToLower(u.Host), ".alma.exlibrisgroup.com") &&
+		strings.Contains(strings.ToLower(u.Path), "/view/uresolver/")
 }
 
 func checkSourceCredentials(cfg config.Config, add func(string, string, string, string)) {
