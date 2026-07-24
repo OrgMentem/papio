@@ -16,6 +16,14 @@ for the full pre-split extension history.
 
 ## [Unreleased]
 
+### Fixed
+
+- **The background work window no longer accumulates.** papio's dedicated
+  handoff window is now closed automatically once no handoff owns a tab in it,
+  instead of lingering (or multiplying) across acquisitions. A pinned keepalive
+  session tab keeps the window alive; a stale window id left by a manual close
+  is dropped so the next handoff opens exactly one fresh window.
+
 ## [0.5.1] - 2026-07-23
 
 ### Fixed

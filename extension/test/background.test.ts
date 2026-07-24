@@ -151,6 +151,7 @@ class FakeTabs {
 class FakeWindows {
   readonly created: { url: string; focused: boolean; state: string }[] = [];
   readonly updated: { windowID: number; props: { focused?: boolean; state?: string } }[] = [];
+  readonly removed: number[] = [];
   readonly live = new Map<number, { id: number; state: string }>();
   nextId = 500;
   constructor(private readonly tabs: FakeTabs) {}
@@ -165,10 +166,10 @@ class FakeWindows {
     const tab = await this.tabs.create({ url: props.url, active: false, windowId: id });
     return { id, state: props.state, tabs: [tab] };
   }
-  async get(windowID: number): Promise<{ id: number; state: string }> {
+  async get(windowID: number): Promise<{ id: number; state: string; tabs: TabInfo[] }> {
     const win = this.live.get(windowID);
     if (!win) throw new Error("no such window");
-    return win;
+    return { ...win, tabs: [...this.tabs.live.values()].filter((tab) => tab.windowId === windowID) };
   }
   async update(
     windowID: number,
@@ -178,6 +179,14 @@ class FakeWindows {
     const win = this.live.get(windowID);
     if (win && props.state !== undefined) win.state = props.state;
     return win ?? {};
+  }
+  /** Programmatic close: drops the window and any tabs still parked in it. */
+  async remove(windowID: number): Promise<void> {
+    this.removed.push(windowID);
+    for (const tab of [...this.tabs.live.values()].filter((tab) => tab.windowId === windowID)) {
+      if (tab.id !== undefined) this.tabs.live.delete(tab.id);
+    }
+    this.live.delete(windowID);
   }
   /** Simulate the user closing the work window. */
   close(windowID: number): void {
@@ -1805,6 +1814,40 @@ test("work window is reused across offers and recreated after the user closes it
   await h.port.inbound(jobOffer("job_ww_c"));
   expect(h.windows?.created.length).toBe(2);
   expect(h.backend.store.workWindowID).toBe(501);
+});
+
+test("the work window closes once the last handoff releases its tab", async () => {
+  const h = makeHarness(undefined, { windows: true });
+  await h.bridge.start();
+  await h.port.inbound(jobOffer("job_ww_idle"));
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  expect(h.backend.store.workWindowID).toBe(500);
+  // The user closes the handoff tab before download: the job cancels and, with
+  // no papio tab left in the work window, the window is reaped rather than left
+  // to accumulate across handoffs.
+  await h.tabs.onRemoved.emit(tabID, { isWindowClosing: false });
+  expect(h.backend.store.activeJobs.length).toBe(0);
+  expect(h.windows?.removed).toEqual([500]);
+  expect(h.backend.store.workWindowID).toBeUndefined();
+});
+
+test("a keepalive-pinned tab keeps the work window alive when handoffs drain", async () => {
+  const h = makeHarness(undefined, { windows: true });
+  await h.bridge.start();
+  await h.port.inbound(jobOffer("job_ww_keepalive"));
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  // Keepalive pins its resolver session tab in the shared work window; draining
+  // the last handoff must not evict it.
+  h.tabs.live.set(9001, {
+    id: 9001,
+    url: "https://resolver.example.edu/keepalive",
+    windowId: 500,
+    pinned: true,
+  });
+  await h.tabs.onRemoved.emit(tabID, { isWindowClosing: false });
+  expect(h.backend.store.activeJobs.length).toBe(0);
+  expect(h.windows?.removed).toEqual([]);
+  expect(h.backend.store.workWindowID).toBe(500);
 });
 
 test("IdP navigation surfaces the work-window tab: activate + restore + focus", async () => {

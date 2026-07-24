@@ -119,6 +119,9 @@ export interface TabInfo {
    * tab back to the tracked handoff tab that spawned it. */
   windowId?: number | undefined;
   openerTabId?: number | undefined;
+  /** Chrome marks the keepalive resolver tab pinned; papio's broker tabs never
+   * are. Lets the idle-close check keep a keepalive-pinned work window alive. */
+  pinned?: boolean | undefined;
 }
 
 export interface TabChangeInfo {
@@ -190,6 +193,9 @@ export interface BridgeDeps {
       windowID: number,
       props: { focused?: boolean; state?: "normal" | "minimized" },
     ): Promise<unknown>;
+    /** Close papio's dedicated work window once it holds no papio tabs, so the
+     * background window never accumulates across handoffs. */
+    remove(windowID: number): Promise<void>;
   };
   downloads: {
     search(query: { id: number }): Promise<DownloadItemLike[]>;
@@ -1575,6 +1581,43 @@ export class Bridge {
       const offerURLs = { ...(s.offerURLs ?? {}) };
       delete offerURLs[jobID];
       return { ...removeJob(s, jobID), offerURLs };
+    });
+    await this.closeWorkWindowIfIdle();
+  }
+
+  /** Close papio's dedicated work window once no handoff owns a broker tab in
+   * it, so the background window does not accumulate across handoffs. A pinned
+   * tab (the keepalive resolver session) keeps the window alive; anything else
+   * left over is an orphaned broker tab and closing the window reaps it too.
+   * No-op when work-window mode is off or the platform lacks the windows API. */
+  private async closeWorkWindowIfIdle(): Promise<void> {
+    const windows = this.deps.windows;
+    const windowID = this.store.workWindowID;
+    if (windows === undefined || windowID === undefined) return;
+    if (this.store.activeJobs.some((job) => job.tab_id >= 0)) return;
+    let win: WindowInfo | undefined;
+    try {
+      win = await windows.get(windowID);
+    } catch {
+      // Already gone (user closed it): drop the stale id so the next handoff
+      // creates a fresh window rather than reusing a dead one.
+      await this.update((s) => {
+        const next = { ...s };
+        delete next.workWindowID;
+        return next;
+      });
+      return;
+    }
+    if ((win.tabs ?? []).some((tab) => tab.pinned === true)) return;
+    try {
+      await windows.remove(windowID);
+    } catch {
+      // Raced a manual close; the id is cleared below regardless.
+    }
+    await this.update((s) => {
+      const next = { ...s };
+      delete next.workWindowID;
+      return next;
     });
   }
 
@@ -3286,9 +3329,12 @@ function realDeps(): BridgeDeps {
           windows: {
             create: (props: { url: string; focused: boolean; state: "minimized" | "normal" }) =>
               chrome.windows.create(props) as Promise<WindowInfo>,
-            get: (windowID: number) => chrome.windows.get(windowID) as Promise<WindowInfo>,
+            // populate:true so the idle-close check can see a keepalive-pinned tab.
+            get: (windowID: number) =>
+              chrome.windows.get(windowID, { populate: true }) as Promise<WindowInfo>,
             update: (windowID: number, props: { focused?: boolean; state?: "normal" }) =>
               chrome.windows.update(windowID, props),
+            remove: (windowID: number) => chrome.windows.remove(windowID),
           },
         }
       : {}),
