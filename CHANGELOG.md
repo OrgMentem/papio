@@ -10,6 +10,24 @@ execution records in `notes/acquisition-stack-plan.md`.
 
 ## [Unreleased]
 
+### Added
+
+- `papio doctor` now warns when an OpenURL resolver base — the default
+  `[browser] openurl_base_url` or any named `[browser.resolvers.*]` profile —
+  points at a raw Alma link resolver (`…/view/uresolver/…`). That deep link
+  sends an unauthenticated patron to the Alma *staff* login (`…/mng/login`),
+  which patrons cannot complete; the check recommends the institution's Primo
+  OpenURL endpoint (`…/discovery/openurl` or `…/nde/openurl?vid=…`) instead.
+
+### Fixed
+
+- `papio daemon status`, `papio browser sessions`, and `papio browser use` no
+  longer fail with `unknown field "pending_browser_sessions"` when more than
+  one browser is connected. The CLI's daemon-ping decoder was missing the
+  browser-session-arbitration fields (added to the daemon in 0.8.0), so the
+  strict version-check pre-hook rejected any ping that reported waiting or
+  denied sessions.
+
 ## [0.11.0] - 2026-07-24
 
 ### Added
