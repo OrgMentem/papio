@@ -16,6 +16,8 @@ for the full pre-split extension history.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-07-24
+
 ### Added
 
 - **Tab-group handoff mode.** A new "Where papio opens tabs" setting lets you
@@ -29,6 +31,8 @@ for the full pre-split extension history.
   controls are now toggle switches, and the handoff-tab location is a
   highlighted button group, for a clearer at-a-glance view of what is granted
   and where handoffs open.
+- **Popup and settings UX polish.** The inbox popup and options surfaces were
+  refreshed for clearer status, actions, and at-a-glance state.
 
 ### Fixed
 
