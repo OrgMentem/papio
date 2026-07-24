@@ -20,8 +20,8 @@ import { chromeBackend, type ActiveJob, type StoreShape, TERMS_CONSENT_KEY } fro
 import { renderPapio } from "./dom";
 
 
-/** Render daemon problems near the actions and keep the connected daemon
- * version in the muted diagnostic footer. */
+/** Render actionable daemon problems near the popup actions. Routine version
+ * diagnostics live behind the settings page's collapsed disclosure. */
 export function renderDaemonStatus(
   doc: Document,
   status: Pick<StoreShape, "connectionStatus" | "daemonVersion" | "daemonUpdateHint">,
@@ -29,19 +29,14 @@ export function renderDaemonStatus(
   const card = doc.getElementById("daemon-status");
   const message = doc.getElementById("daemon-status-message");
   const hint = doc.getElementById("daemon-status-hint");
-  const footer = doc.getElementById("daemon-footer");
-  if (!card || !message || !hint || !footer) return;
+  if (!card || !message || !hint) return;
 
   let line = "";
   let action = "";
-  let diagnostic = "";
   switch (status.connectionStatus ?? "disconnected") {
     case "connected": {
       const stampedVersion =
         typeof __PAPIO_DAEMON_VERSION__ === "string" ? __PAPIO_DAEMON_VERSION__ : "";
-      if (typeof status.daemonVersion === "string" && status.daemonVersion.length > 0) {
-        diagnostic = `papio daemon v${status.daemonVersion}`;
-      }
       if (
         status.daemonUpdateHint === true &&
         stampedVersion !== "" &&
@@ -69,8 +64,6 @@ export function renderDaemonStatus(
   card.hidden = line.length === 0;
   renderPapio(message, line);
   hint.textContent = action;
-  footer.hidden = diagnostic.length === 0;
-  renderPapio(footer, diagnostic);
 }
 
 
@@ -296,49 +289,72 @@ export function renderPageAcquire(
   doc: Document,
   onAcquire: () => Promise<PageAcquireResponse> = acquireCurrentPage,
 ): void {
-  const section = doc.getElementById("page-acquire");
   const button = doc.getElementById("page-acquire-btn");
   const status = doc.getElementById("page-acquire-status");
-  if (!(section instanceof HTMLElement) || !(button instanceof HTMLButtonElement) || !status) return;
-  section.hidden = false;
+  if (!(button instanceof HTMLButtonElement) || !status) return;
   if (button.dataset.wired) return;
   button.dataset.wired = "1";
   let noDOIFound = false;
+  let queued = false;
   button.addEventListener("click", () => {
     button.disabled = true;
+    button.textContent = "Acquiring…";
     status.textContent = "Acquiring…";
     void onAcquire().then(
       (response) => {
         noDOIFound = response.error === NO_DOI_FOUND;
+        queued = typeof response.job_id === "string" && response.job_id.length > 0;
+        button.textContent = queued
+          ? response.duplicate === true
+            ? "Already queued"
+            : "Queued"
+          : "Acquire this page";
         status.textContent = pageAcquireStatus(response);
       },
       (error: unknown) => {
+        queued = false;
+        button.textContent = "Acquire this page";
         status.textContent = error instanceof Error ? error.message : "Could not acquire this page";
       },
     ).finally(() => {
-      button.disabled = noDOIFound;
+      button.disabled = noDOIFound || queued;
     });
   });
 }
 
 export function renderPageContext(doc: Document, page: PageMetadata | undefined, jobs: ActiveJob[]): void {
+  const section = doc.getElementById("page-acquire");
   const detected = doc.getElementById("page-acquire-doi");
   const state = doc.getElementById("page-acquire-context");
   const button = doc.getElementById("page-acquire-btn");
-  if (!detected || !state || !(button instanceof HTMLButtonElement)) return;
-  if (!page?.doi) {
-    detected.textContent = "No DOI detected on this page";
-    state.textContent = "";
-    button.disabled = true;
+  if (
+    !(section instanceof HTMLElement) ||
+    !detected ||
+    !state ||
+    !(button instanceof HTMLButtonElement)
+  ) {
     return;
   }
-  detected.textContent = `Detected DOI: ${page.doi}`;
-  button.disabled = false;
+  section.hidden = false;
+  if (!page?.doi) {
+    detected.textContent = "No DOI detected on this page";
+    detected.hidden = false;
+    state.textContent = "";
+    button.textContent = "Acquire this page";
+    button.disabled = true;
+    button.hidden = true;
+    return;
+  }
+  detected.textContent = "";
+  detected.hidden = true;
+  button.hidden = false;
   const normalizedDOI = page.doi.trim().toLowerCase().replace(/^doi:\s*/, "");
   const inFlight = jobs.some(
     (job) => job.expected?.doi?.trim().toLowerCase().replace(/^doi:\s*/, "") === normalizedDOI,
   );
   state.textContent = inFlight ? "An acquisition for this DOI is already in progress." : "";
+  button.textContent = inFlight ? "Acquisition in progress" : "Acquire this page";
+  button.disabled = inFlight;
 }
 
 export function wirePrimaryShortcut(doc: Document = document): void {

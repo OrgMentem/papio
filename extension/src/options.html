@@ -294,10 +294,28 @@
 
       footer {
         border-top: 1px solid var(--color-border);
+        margin-top: 32px;
+        padding-top: 8px;
+      }
+
+      .diagnostics {
         color: var(--color-muted);
         font-size: 12px;
-        margin-top: 32px;
-        padding-top: 12px;
+      }
+
+      .diagnostics summary {
+        border-radius: var(--radius-control);
+        cursor: pointer;
+        padding: 4px 0;
+        width: max-content;
+      }
+
+      .diagnostics summary:hover {
+        color: var(--color-ink);
+      }
+
+      #daemon-footer {
+        margin-top: 8px;
       }
     </style>
   </head>
@@ -420,7 +438,12 @@
       </div>
     </section>
 
-    <footer id="daemon-footer"></footer>
+    <footer>
+      <details class="diagnostics">
+        <summary>About &amp; diagnostics</summary>
+        <div id="daemon-footer"></div>
+      </details>
+    </footer>
     <script src="./options.js" type="module"></script>
   </body>
 </html>

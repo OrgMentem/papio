@@ -3,9 +3,11 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>papio</title>
     <style>
       :root {
+        color-scheme: light dark;
         --color-ink: #182231;
         --color-brand-ink: #2b2d42;
         --color-brand-accent: #d94f3d;
@@ -13,18 +15,24 @@
         --color-context: #426789;
         --color-border: #dce3ea;
         --color-control-border: #b8c5d1;
+        --color-page: #f4f7f9;
         --color-surface: #fdfefe;
-        --color-surface-hover: #f4f7f9;
+        --color-surface-hover: #eef3f6;
         --color-primary: #12549b;
         --color-primary-border: #8db9eb;
         --color-primary-surface: #eaf3ff;
         --color-primary-hover: #dcecff;
         --color-warning: #6d4316;
         --color-warning-border: #a15c17;
+        --color-warning-surface: #fff7ed;
+        --color-primary-solid: #12549b;
+        --color-primary-solid-hover: #0d447f;
+        --color-on-primary: #fdfefe;
         --font-size-label: 11px;
         --font-size-small: 12px;
-        --font-size-body: 13px;
-        --font-size-brand: 14px;
+        --font-size-body: 14px;
+        --font-size-title: 22px;
+        --font-size-item-title: 16px;
         --space-1: 4px;
         --space-2: 8px;
         --space-3: 12px;
@@ -33,166 +41,129 @@
         --space-8: 32px;
         --radius-control: 6px;
         --radius-card: 8px;
-        --popup-width: 360px;
-        --control-height: 32px;
-        --brand-mark-size: 22px;
+        --radius-pill: 999px;
+        --control-height: 36px;
+        --action-height: 44px;
+        --inbox-row-height: 80px;
+        --brand-mark-size: 32px;
         --settings-mark-size: 18px;
+        --popup-width: 380px;
+        --focus-width: 2px;
+        --focus-offset: 2px;
         --transition-fast: 140ms ease-out;
+        accent-color: var(--color-primary);
         color: var(--color-ink);
         font-family:
           ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
           sans-serif;
       }
+
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --color-ink: #e5edf4;
+          --color-brand-ink: #f0edf3;
+          --color-brand-accent: #ef6a57;
+          --color-muted: #a2b1be;
+          --color-context: #aecbe4;
+          --color-border: #3e4f61;
+          --color-control-border: #526579;
+          --color-page: #141b23;
+          --color-surface: #1c2631;
+          --color-surface-hover: #263340;
+          --color-primary: #a8d0ff;
+          --color-primary-border: #4f85bc;
+          --color-primary-surface: #183956;
+          --color-primary-hover: #214967;
+          --color-warning: #f1c183;
+          --color-warning-border: #b97833;
+          --color-warning-surface: #33291e;
+          --color-primary-solid: #75b5f5;
+          --color-primary-solid-hover: #91c5fb;
+          --color-on-primary: #101a24;
+        }
+      }
+
       * {
         box-sizing: border-box;
       }
+
       [hidden] {
         display: none !important;
       }
+
+      html {
+        background: var(--color-page);
+      }
+
       body {
-        background: var(--color-surface);
+        background: var(--color-page);
+        color: var(--color-ink);
         font-size: var(--font-size-body);
-        line-height: 1.4;
+        line-height: 1.45;
         margin: 0;
         padding: var(--space-4);
         width: var(--popup-width);
       }
+
       header {
-        padding-right: var(--space-8);
-        position: relative;
+        align-items: center;
+        display: flex;
+        justify-content: space-between;
+        margin-bottom: var(--space-3);
       }
+
       h2,
       p {
         margin: 0;
       }
+
       h2 {
-        color: var(--color-muted);
-        font-size: var(--font-size-label);
+        color: var(--color-brand-ink);
+        font-size: var(--font-size-body);
         font-weight: 700;
-        letter-spacing: 0.07em;
-        text-transform: uppercase;
+        line-height: 1.3;
       }
+
       .brand {
         align-items: center;
         display: flex;
-        gap: var(--space-2);
-        margin-bottom: var(--space-4);
+        gap: var(--space-3);
       }
+
       .brand svg {
+        flex: none;
         height: var(--brand-mark-size);
         width: var(--brand-mark-size);
       }
+
       .brand-name {
         color: var(--color-brand-ink);
-        font-size: var(--font-size-brand);
+        font-size: var(--font-size-title);
         font-weight: 700;
         letter-spacing: 0.01em;
+        line-height: 1.2;
       }
-      .settings-btn {
-        background: transparent;
-        border: 0;
-        color: var(--color-muted);
-        line-height: 0;
-        padding: var(--space-1);
-        position: absolute;
-        right: 0;
-        top: 0;
+
+      .brand-name em {
+        text-decoration-color: var(--color-brand-accent);
+        text-decoration-line: underline;
+        text-decoration-thickness: 2px;
+        text-underline-offset: var(--space-1);
       }
-      .settings-btn:hover {
-        background: var(--color-surface-hover);
-        color: var(--color-ink);
-      }
-      .settings-btn svg {
-        display: block;
-        height: var(--settings-mark-size);
-        width: var(--settings-mark-size);
-      }
-      .daemon-status {
-        border-left: var(--space-1) solid var(--color-warning-border);
-        color: var(--color-warning);
-        font-size: var(--font-size-small);
-        margin-bottom: var(--space-4);
-        padding-left: var(--space-3);
-      }
-      .daemon-status-message {
-        font-weight: 600;
-      }
-      .daemon-status-hint {
-        margin-top: var(--space-1);
-      }
-      .launcher {
-        border: 1px solid var(--color-border);
-        border-radius: var(--radius-card);
-        display: grid;
-        overflow: hidden;
-      }
-      .launcher-action {
-        align-items: stretch;
-        display: flex;
-        flex-direction: column;
-        gap: var(--space-2);
-        padding: var(--space-3);
-      }
-      .launcher-action + .launcher-action {
-        border-top: 1px solid var(--color-border);
-      }
-      .launcher-action > button {
-        align-self: flex-end;
-      }
-      .launcher-action p,
-      .capture-status {
-        color: var(--color-muted);
-        font-size: var(--font-size-small);
-      }
-      .page-acquire-context {
-        color: var(--color-context);
-      }
-      .capture-status {
-        word-break: break-word;
-      }
-      .capture-status:empty {
-        display: none;
-      }
-      .resolver-grant,
-      .terms-consent,
-      .capture {
-        border-top: 1px solid var(--color-border);
-        margin-top: var(--space-4);
-        padding-top: var(--space-3);
-      }
-      .resolver-grant,
-      .terms-consent {
-        display: grid;
-        gap: var(--space-2);
-      }
-      .terms-consent-controls {
-        display: flex;
-        flex-wrap: wrap;
-        gap: var(--space-2);
-        justify-content: flex-end;
-      }
-      .capture .row {
-        display: flex;
-        gap: var(--space-2);
-        margin: var(--space-2) 0;
-      }
-      .capture select {
-        background: var(--color-surface);
-        border: 1px solid var(--color-control-border);
-        border-radius: var(--radius-control);
-        color: var(--color-ink);
-        flex: 1;
+
+      button,
+      select,
+      summary {
         font: inherit;
-        min-height: var(--control-height);
-        padding: var(--space-1) var(--space-2);
       }
+
       button {
+        appearance: none;
         background: var(--color-surface);
         border: 1px solid var(--color-control-border);
         border-radius: var(--radius-control);
         color: var(--color-ink);
         cursor: pointer;
-        font: inherit;
         font-size: var(--font-size-small);
         min-height: var(--control-height);
         padding: var(--space-1) var(--space-3);
@@ -201,44 +172,296 @@
           border-color var(--transition-fast),
           color var(--transition-fast);
       }
+
       button:hover:not(:disabled) {
         background: var(--color-surface-hover);
       }
-      button.primary {
-        background: var(--color-primary-surface);
-        border-color: var(--color-primary-border);
-        color: var(--color-primary);
-        font-weight: 600;
-      }
-      button.primary:hover:not(:disabled) {
-        background: var(--color-primary-hover);
-      }
+
       button:focus-visible,
-      select:focus-visible {
-        outline: 2px solid var(--color-primary);
-        outline-offset: 2px;
+      select:focus-visible,
+      summary:focus-visible {
+        outline: var(--focus-width) solid var(--color-primary);
+        outline-offset: var(--focus-offset);
       }
+
       button:disabled {
         cursor: not-allowed;
         opacity: 0.55;
       }
-      .daemon-footer {
+
+      .settings-btn {
+        align-items: center;
+        background: var(--color-surface);
+        border-color: var(--color-border);
+        border-radius: var(--radius-pill);
+        color: var(--color-muted);
+        display: inline-flex;
+        flex: none;
+        justify-content: center;
+        padding: 0;
+        width: var(--control-height);
+      }
+
+      .settings-btn:hover:not(:disabled) {
+        border-color: var(--color-control-border);
+        color: var(--color-ink);
+      }
+
+      .settings-btn svg {
+        display: block;
+        height: var(--settings-mark-size);
+        width: var(--settings-mark-size);
+      }
+
+      main {
+        display: grid;
+        gap: var(--space-3);
+      }
+
+      .daemon-status {
+        background: var(--color-warning-surface);
+        border: 1px solid var(--color-warning-border);
+        border-radius: var(--radius-card);
+        color: var(--color-warning);
+        display: grid;
+        font-size: var(--font-size-small);
+        gap: var(--space-1);
+        margin-bottom: var(--space-3);
+        padding: var(--space-3);
+      }
+
+      .daemon-status-message {
+        font-weight: 700;
+      }
+
+      .daemon-status-hint {
+        overflow-wrap: anywhere;
+      }
+
+      .launcher {
+        display: grid;
+        gap: var(--space-3);
+      }
+
+      .launcher-action {
+        background: var(--color-surface);
+        border: 1px solid var(--color-border);
+        border-radius: var(--radius-card);
+        display: grid;
+        gap: var(--space-2);
+        min-width: 0;
+        padding: var(--space-3);
+      }
+
+      #page-acquire-doi {
+        color: var(--color-ink);
+        font-weight: 700;
+        line-height: 1.35;
+        overflow-wrap: anywhere;
+      }
+
+      .page-acquire-context,
+      .launcher-action > p,
+      .capture-status {
+        color: var(--color-muted);
+        font-size: var(--font-size-small);
+      }
+
+      .page-acquire-context {
+        color: var(--color-context);
+      }
+
+      .capture-status {
+        color: var(--color-context);
+        font-weight: 600;
+        overflow-wrap: anywhere;
+      }
+
+      .capture-status:empty {
+        display: none;
+      }
+
+      .launcher-action > button {
+        min-height: var(--action-height);
+        width: 100%;
+      }
+
+      button.primary {
+        background: var(--color-primary-solid);
+        border-color: var(--color-primary-solid);
+        color: var(--color-on-primary);
+        font-weight: 700;
+      }
+
+      button.primary:hover:not(:disabled) {
+        background: var(--color-primary-solid-hover);
+        border-color: var(--color-primary-solid-hover);
+      }
+
+      button.primary:disabled {
+        background: var(--color-surface-hover);
+        border-color: var(--color-control-border);
+        color: var(--color-muted);
+        opacity: 1;
+      }
+
+      .inbox-action {
+        min-height: var(--inbox-row-height);
+        padding: 0;
+        position: relative;
+      }
+
+      #open-inbox-btn {
+        align-items: flex-start;
+        background: transparent;
+        border: 0;
+        border-radius: var(--radius-card);
+        display: flex;
+        font-size: var(--font-size-body);
+        font-weight: 700;
+        inset: 0;
+        padding: var(--space-3) var(--space-8) var(--space-3) var(--space-3);
+        position: absolute;
+        text-align: left;
+        width: 100%;
+        z-index: 0;
+      }
+
+      #open-inbox-btn::after {
+        content: "→";
+        font-size: var(--font-size-item-title);
+        position: absolute;
+        right: var(--space-3);
+        top: calc(50% - var(--space-3));
+      }
+
+      .inbox-action > p,
+      .inbox-action > .capture-status {
+        pointer-events: none;
+        position: relative;
+        z-index: 1;
+      }
+
+      .inbox-action > p {
+        margin: calc(var(--space-8) + var(--space-1)) var(--space-8) var(--space-3) var(--space-3);
+      }
+
+      .inbox-action > .capture-status {
+        margin: calc(-1 * var(--space-2)) var(--space-8) var(--space-3) var(--space-3);
+      }
+
+      .resolver-grant,
+      .terms-consent {
+        border: 1px solid var(--color-primary-border);
+        border-radius: var(--radius-card);
+        display: grid;
+        gap: var(--space-2);
+        padding: var(--space-3);
+      }
+
+      .resolver-grant {
+        background: var(--color-primary-surface);
+        color: var(--color-context);
+      }
+
+      .resolver-grant > p,
+      .terms-consent > p {
+        font-size: var(--font-size-small);
+      }
+
+      .resolver-grant > button {
+        border-color: var(--color-primary-border);
+        color: var(--color-primary);
+        font-weight: 700;
+        min-height: var(--action-height);
+        width: 100%;
+      }
+
+      .terms-consent {
+        background: var(--color-warning-surface);
+        border-color: var(--color-warning-border);
+        color: var(--color-warning);
+      }
+
+      .terms-consent h2 {
+        color: var(--color-warning);
+      }
+
+      .terms-consent-controls {
+        display: grid;
+        gap: var(--space-2);
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        margin-top: var(--space-1);
+      }
+
+      .terms-consent-controls button {
+        min-height: var(--action-height);
+        padding-inline: var(--space-2);
+      }
+
+      .capture {
         border-top: 1px solid var(--color-border);
         color: var(--color-muted);
-        font-size: var(--font-size-label);
-        margin-top: var(--space-4);
-        padding-top: var(--space-3);
+        font-size: var(--font-size-small);
+        margin-top: var(--space-1);
+        padding-top: var(--space-2);
+      }
+
+      .capture summary {
+        border-radius: var(--radius-control);
+        cursor: pointer;
+        min-height: var(--control-height);
+        padding: var(--space-2);
+      }
+
+      .capture summary:hover {
+        background: var(--color-surface-hover);
+        color: var(--color-ink);
+      }
+
+      .capture-body {
+        background: var(--color-surface);
+        border: 1px solid var(--color-border);
+        border-radius: var(--radius-card);
+        display: grid;
+        gap: var(--space-2);
+        margin-top: var(--space-2);
+        padding: var(--space-3);
+      }
+
+      .capture .row {
+        display: grid;
+        gap: var(--space-2);
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+
+      .capture select {
+        background: var(--color-surface);
+        border: 1px solid var(--color-control-border);
+        border-radius: var(--radius-control);
+        color: var(--color-ink);
+        min-height: var(--control-height);
+        min-width: 0;
+        padding: var(--space-1) var(--space-2);
+        width: 100%;
+      }
+
+      .capture button {
+        justify-self: start;
+      }
+
+
+      @media (prefers-reduced-motion: reduce) {
+        *,
+        *::before,
+        *::after {
+          transition-duration: 0.01ms !important;
+        }
       }
     </style>
   </head>
   <body>
     <header>
-      <button id="settings-btn" class="settings-btn" type="button" title="Settings" aria-label="Settings">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-          <circle cx="12" cy="12" r="3"/>
-          <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09A1.65 1.65 0 0 0 19.4 15z"/>
-        </svg>
-      </button>
       <div class="brand">
         <svg viewBox="0 0 512 512" aria-hidden="true">
           <path d="M 95.0 374.6 A 200 200 0 1 1 243.7 455.6" fill="none" stroke="var(--color-brand-ink)" stroke-width="46" stroke-linecap="round"/>
@@ -250,6 +473,12 @@
         </svg>
         <span class="brand-name"><em>papio</em></span>
       </div>
+      <button id="settings-btn" class="settings-btn" type="button" title="Settings" aria-label="Settings">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <circle cx="12" cy="12" r="3"/>
+          <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09A1.65 1.65 0 0 0 19.4 15z"/>
+        </svg>
+      </button>
     </header>
     <div id="daemon-status" class="daemon-status" role="status" aria-live="polite" hidden>
       <div id="daemon-status-message" class="daemon-status-message"></div>
@@ -258,14 +487,25 @@
     <main>
       <section class="launcher" aria-label="Paper actions">
         <div id="page-acquire" class="launcher-action" hidden>
-          <button id="page-acquire-btn" class="primary" type="button" disabled>Acquire this page</button>
           <p id="page-acquire-doi">Detecting DOI…</p>
           <p id="page-acquire-context" class="page-acquire-context"></p>
           <div id="page-acquire-status" class="capture-status" aria-live="polite"></div>
+          <button
+            id="page-acquire-btn"
+            class="primary"
+            type="button"
+            aria-describedby="page-acquire-context page-acquire-status"
+            disabled
+            hidden
+          >Acquire this page</button>
         </div>
-        <div class="launcher-action">
-          <button id="open-inbox-btn" type="button">Open inbox</button>
-          <p>Review papers and actions that need your attention.</p>
+        <div class="launcher-action inbox-action">
+          <button
+            id="open-inbox-btn"
+            type="button"
+            aria-describedby="open-inbox-description open-inbox-status"
+          >Open inbox</button>
+          <p id="open-inbox-description">Review papers and actions that need your attention.</p>
           <div id="open-inbox-status" class="capture-status" aria-live="polite"></div>
         </div>
       </section>
@@ -285,17 +525,18 @@
         </div>
       </section>
 
-      <section class="capture" hidden>
-        <h2>Capture fixture (dev)</h2>
-        <div class="row">
-          <select id="capture-provider" aria-label="Provider"></select>
-          <select id="capture-scenario" aria-label="Scenario"></select>
+      <details class="capture" hidden>
+        <summary>Capture fixture (dev)</summary>
+        <div class="capture-body">
+          <div class="row">
+            <select id="capture-provider" aria-label="Provider"></select>
+            <select id="capture-scenario" aria-label="Scenario"></select>
+          </div>
+          <button id="capture-btn" type="button">Capture active tab</button>
+          <div id="capture-status" class="capture-status" aria-live="polite"></div>
         </div>
-        <button id="capture-btn" type="button">Capture active tab</button>
-        <div id="capture-status" class="capture-status" aria-live="polite"></div>
-      </section>
+      </details>
     </main>
-    <footer id="daemon-footer" class="daemon-footer" aria-live="polite" hidden></footer>
 
     <script src="./popup.js" type="module"></script>
   </body>

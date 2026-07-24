@@ -83,3 +83,10 @@ test("bulk provider grant and revoke use the derived origin set", async () => {
   await Promise.resolve();
   expect(permissionRemovals).toEqual([providerOrigins]);
 });
+
+test("keeps version diagnostics collapsed in settings", () => {
+  const diagnostics = document.querySelector("details.diagnostics");
+  expect(diagnostics).not.toBeNull();
+  expect(diagnostics?.hasAttribute("open")).toBe(false);
+  expect(diagnostics?.contains(document.getElementById("daemon-footer"))).toBe(true);
+});

@@ -49,7 +49,7 @@ function job(overrides: Partial<ActiveJob> = {}): ActiveJob {
   };
 }
 
-test("renders one card with two verbs and no redundant launcher headings", () => {
+test("renders distinct acquisition and inbox actions without redundant headings", () => {
   const doc = popupDocument();
   const launcher = doc.querySelector(".launcher");
 
@@ -58,6 +58,9 @@ test("renders one card with two verbs and no redundant launcher headings", () =>
   expect(launcher?.querySelector("h2")).toBeNull();
   expect(doc.getElementById("page-acquire-btn")?.textContent).toBe("Acquire this page");
   expect(doc.getElementById("page-acquire-doi")?.textContent).toBe("Detecting DOI…");
+  expect(doc.getElementById("page-acquire")?.hidden).toBe(true);
+  expect(doc.getElementById("page-acquire-btn")?.hidden).toBe(true);
+  expect(doc.getElementById("daemon-footer")).toBeNull();
   expect(doc.getElementById("open-inbox-btn")?.textContent).toBe("Open inbox");
   expect(doc.getElementById("needs-you-section")).toBeNull();
   expect(doc.getElementById("terms-consent")).not.toBeNull();
@@ -93,6 +96,9 @@ test("shows capture tools only for unpacked Chrome manifests", () => {
   wireDevTools(unpacked);
   expect(unpacked.querySelector<HTMLElement>(".capture")?.hidden).toBe(false);
   expect(unpacked.querySelectorAll("#capture-provider option")).toHaveLength(PROVIDERS.length);
+  const capture = unpacked.querySelector<HTMLElement>(".capture");
+  expect(capture?.tagName).toBe("DETAILS");
+  expect(capture?.hasAttribute("open")).toBe(false);
 
   const firefox = popupDocument();
   Object.assign(globalThis, {
@@ -106,12 +112,10 @@ test("shows capture tools only for unpacked Chrome manifests", () => {
   expect(firefox.querySelector<HTMLElement>(".capture")?.hidden).toBe(true);
 });
 
-test("renders daemon problems by the actions and the version in the footer", () => {
+test("renders actionable daemon problems without routine version diagnostics", () => {
   const doc = popupDocument();
   renderDaemonStatus(doc, { connectionStatus: "connected", daemonVersion: "0.1.0" });
   expect(doc.getElementById("daemon-status")?.hidden).toBe(true);
-  expect(doc.getElementById("daemon-footer")?.hidden).toBe(false);
-  expect(doc.getElementById("daemon-footer")?.textContent).toBe("papio daemon v0.1.0");
 
   Object.assign(globalThis, { __PAPIO_DAEMON_VERSION__: "0.2.0" });
   renderDaemonStatus(doc, {
@@ -123,13 +127,12 @@ test("renders daemon problems by the actions and the version in the footer", () 
   expect(doc.getElementById("daemon-status-message")?.textContent).toBe(
     "papio 0.2.0 is available — daemon is v0.1.0",
   );
-  expect(doc.getElementById("daemon-footer")?.textContent).toBe("papio daemon v0.1.0");
   delete (globalThis as Record<string, unknown>).__PAPIO_DAEMON_VERSION__;
 
   renderDaemonStatus(doc, { connectionStatus: "disconnected" });
   expect(doc.getElementById("daemon-status")?.textContent).toContain("papio daemon isn't reachable");
   expect(doc.getElementById("daemon-status-hint")?.textContent).toBe("run: papio daemon status");
-  expect(doc.getElementById("daemon-footer")?.hidden).toBe(true);
+  expect(doc.getElementById("daemon-footer")).toBeNull();
 });
 
 test("keeps acquisition available with a detected DOI even without a negotiated daemon", async () => {
@@ -145,6 +148,8 @@ test("keeps acquisition available with a detected DOI even without a negotiated 
   const button = doc.getElementById("page-acquire-btn") as HTMLButtonElement;
   expect(section?.hidden).toBe(false);
   expect(button.disabled).toBe(false);
+  expect(button.hidden).toBe(false);
+  expect(doc.getElementById("page-acquire-doi")?.hidden).toBe(true);
   button.click();
   await Promise.resolve();
   await Promise.resolve();
@@ -153,7 +158,22 @@ test("keeps acquisition available with a detected DOI even without a negotiated 
   expect(doc.getElementById("page-acquire-status")?.textContent).toBe("papio daemon isn't reachable");
 });
 
-test("disables page acquisition when the current page has no DOI", () => {
+test("keeps a successfully queued acquisition disabled", async () => {
+  const doc = popupDocument();
+  renderPageAcquire(doc, async () => ({ job_id: "job_page_acquire_001" }));
+  renderPageContext(doc, { url: "https://doi.org/10.1000/example", doi: "10.1000/example" }, []);
+
+  const button = doc.getElementById("page-acquire-btn") as HTMLButtonElement;
+  button.click();
+  await Promise.resolve();
+  await Promise.resolve();
+
+  expect(button.disabled).toBe(true);
+  expect(button.textContent).toBe("Queued");
+  expect(doc.getElementById("page-acquire-status")?.textContent).toBe("Queued: job_page_acquire_001");
+});
+
+test("shows only the no-DOI message when the current page has no DOI", () => {
   const doc = popupDocument();
   let calls = 0;
   renderPageAcquire(doc, async () => {
@@ -164,6 +184,8 @@ test("disables page acquisition when the current page has no DOI", () => {
 
   const button = doc.getElementById("page-acquire-btn") as HTMLButtonElement;
   expect(button.disabled).toBe(true);
+  expect(button.hidden).toBe(true);
+  expect(doc.getElementById("page-acquire-doi")?.hidden).toBe(false);
   expect(doc.getElementById("page-acquire-doi")?.textContent).toBe("No DOI detected on this page");
   button.click();
   expect(calls).toBe(0);
@@ -193,16 +215,20 @@ test("does not send a DOI-less scraped page to the daemon", async () => {
   expect(messages).toBe(0);
 });
 
-test("shows the detected DOI and a local in-flight acquisition", () => {
+test("shows only a disabled action for a local in-flight acquisition", () => {
   const doc = popupDocument();
   renderPageContext(doc, { url: "https://doi.org/10.1000/example", doi: "10.1000/example" }, [
     job({ expected: { doi: "doi:10.1000/example" } }),
   ]);
 
-  expect(doc.getElementById("page-acquire-doi")?.textContent).toBe("Detected DOI: 10.1000/example");
+  expect(doc.getElementById("page-acquire-doi")?.hidden).toBe(true);
   expect(doc.getElementById("page-acquire-context")?.textContent).toBe(
     "An acquisition for this DOI is already in progress.",
   );
+  const button = doc.getElementById("page-acquire-btn") as HTMLButtonElement;
+  expect(button.disabled).toBe(true);
+  expect(button.hidden).toBe(false);
+  expect(button.textContent).toBe("Acquisition in progress");
 });
 
 test("opens the singleton inbox through the broker when it acknowledges", async () => {
