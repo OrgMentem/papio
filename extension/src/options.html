@@ -121,20 +121,20 @@
       </div>
     </div>
 
-    <h1 style="margin-top: 28px">Background work window</h1>
+    <h1 style="margin-top: 28px">Where <em>papio</em> opens tabs</h1>
     <p class="lede">
-      <em>papio</em> does its browsing in one dedicated minimized window instead of your tab strip, and only
-      brings a tab forward when you are needed (for example institutional sign-in). Turn this off to
-      open <em>papio</em> tabs in your current window instead.
+      <em>papio</em> opens a browser tab to fetch each paper and only brings it forward when you are
+      needed (for example institutional sign-in). Choose where those handoff tabs live.
     </p>
-    <div id="work-window-row" style="display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 0; border-top: 1px solid #e3e3e3">
+    <div id="handoff-surface-row" style="display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 0; border-top: 1px solid #e3e3e3">
       <div>
-        <div class="source-label">Keep <em>papio</em> tabs in a background window</div>
-        <div class="source-host" id="work-window-status">On</div>
+        <div class="source-label">Handoff tab location</div>
+        <div class="source-host" id="handoff-surface-status">Background window</div>
       </div>
       <div style="display: flex; gap: 8px">
-        <button id="work-window-on" type="button">Enable</button>
-        <button id="work-window-off" type="button">Disable</button>
+        <button id="handoff-tab-group" type="button">Tab group</button>
+        <button id="handoff-work-window" type="button">Background window</button>
+        <button id="handoff-in-window" type="button">Current window</button>
       </div>
     </div>
     <footer id="daemon-footer"></footer>

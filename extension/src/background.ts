@@ -37,6 +37,8 @@ import {
   type TermsConsent,
   TERMS_CONSENT_KEY,
   WORK_WINDOW_KEY,
+  HANDOFF_SURFACE_KEY,
+  type HandoffSurface,
 } from "./state";
 import {
   adapters,
@@ -180,6 +182,9 @@ export interface BridgeDeps {
     /** Used only for the singleton inbox tab. */
     query?(query: { url: string }): Promise<TabInfo[]>;
     onRemoved: Listenable<[number, { isWindowClosing: boolean }]>;
+    /** Optional (Chrome): add tabs to a group, creating one when groupId is
+     * omitted. Returns the group id. Absent on platforms without tab groups. */
+    group?(opts: { tabIds: number[]; groupId?: number }): Promise<number>;
   };
   /** chrome.windows seam. When present (and the user setting allows), broker
    * tabs use one dedicated minimized "work window" instead of the user's tab
@@ -196,6 +201,16 @@ export interface BridgeDeps {
     /** Close papio's dedicated work window once it holds no papio tabs, so the
      * background window never accumulates across handoffs. */
     remove(windowID: number): Promise<void>;
+  };
+  /** chrome.tabGroups seam (Chrome). Present only when tab-group handoff mode is
+   * available; absent on Firefox and older Chromium, where tab-group mode falls
+   * back to the work window. */
+  tabGroups?: {
+    get(groupID: number): Promise<{ id: number; collapsed: boolean; title?: string }>;
+    update(
+      groupID: number,
+      props: { collapsed?: boolean; title?: string; color?: string },
+    ): Promise<unknown>;
   };
   downloads: {
     search(query: { id: number }): Promise<DownloadItemLike[]>;
@@ -244,8 +259,11 @@ export interface BridgeDeps {
   settings: {
     getTermsConsent(): Promise<TermsConsent>;
     setTermsConsent(value: Exclude<TermsConsent, undefined>): Promise<void>;
-    /** Optional; absent means enabled. Only consulted when `windows` exists. */
+    /** Optional; absent means enabled. Legacy boolean, still honored. */
     getWorkWindowEnabled?(): Promise<boolean>;
+    /** Optional tri-state surface choice; when present it overrides the legacy
+     * boolean. `tab-group` degrades to `work-window` if tabGroups is absent. */
+    getHandoffSurface?(): Promise<HandoffSurface>;
   };
   /** Toolbar badge for connection health. Kept injectable so bridge logic has
    * no dependency on a particular browser global. */
@@ -651,17 +669,35 @@ export class Bridge {
     return this.store.activeJobs.length;
   }
 
-  /** Work-window mode is on when the platform has a windows API and the user
-   * has not disabled the setting (absent getter or absent value = enabled). */
-  private async workWindowActive(): Promise<boolean> {
-    if (this.deps.windows === undefined) return false;
-    const get = this.deps.settings.getWorkWindowEnabled;
-    if (get === undefined) return true;
-    try {
-      return await get();
-    } catch {
-      return true;
+  /** Resolve where handoffs open. A tri-state setting (if present) wins; else
+   * the legacy boolean maps true/absent -> work-window, false -> in-window.
+   * `tab-group` degrades to `work-window` when the platform lacks tab groups,
+   * and any window-backed mode degrades to `in-window` without a windows API. */
+  private async handoffSurface(): Promise<HandoffSurface> {
+    let surface: HandoffSurface | undefined;
+    const getSurface = this.deps.settings.getHandoffSurface;
+    if (getSurface !== undefined) {
+      try {
+        surface = await getSurface();
+      } catch {
+        surface = undefined;
+      }
     }
+    if (surface === undefined) {
+      const getEnabled = this.deps.settings.getWorkWindowEnabled;
+      let enabled = true;
+      if (getEnabled !== undefined) {
+        try {
+          enabled = await getEnabled();
+        } catch {
+          enabled = true;
+        }
+      }
+      surface = enabled ? "work-window" : "in-window";
+    }
+    if (surface === "tab-group" && this.deps.tabs.group === undefined) surface = "work-window";
+    if (surface === "work-window" && this.deps.windows === undefined) surface = "in-window";
+    return surface;
   }
 
   /** Open a broker tab. Work-window tabs stay unfocused and minimized unless a
@@ -669,7 +705,8 @@ export class Bridge {
    * legacy rule applies and `surfaceFallback` decides whether the tab takes
    * focus. Never throws — returns undefined on failure, matching callers. */
   private async openBrokerTab(url: string, surfaceFallback: boolean): Promise<number | undefined> {
-    if (await this.workWindowActive()) {
+    const surface = await this.handoffSurface();
+    if (surface === "work-window") {
       let targetAdapter: AdapterSpec | undefined;
       try {
         const host = new URL(url).hostname;
@@ -688,12 +725,70 @@ export class Bridge {
         return undefined;
       }
     }
+    if (surface === "tab-group") {
+      // Serialize like the work window so concurrent offers share one group.
+      const opened = this.workTabChain.then(() => this.openTabGroupTab(url));
+      this.workTabChain = opened.catch(() => undefined);
+      try {
+        return await opened;
+      } catch (e) {
+        console.error("papio: tab-group creation failed", e);
+        return undefined;
+      }
+    }
     try {
       return (await this.deps.tabs.create({ url, active: surfaceFallback })).id;
     } catch (e) {
       console.error("papio: tab creation failed", e);
       return undefined;
     }
+  }
+
+  /** Create the handoff tab in the user's current window and fold it into the
+   * collapsed "papio" tab group, reusing the group across handoffs. The group
+   * lives in the user's window; Chrome removes it automatically once empty. */
+  private async openTabGroupTab(url: string): Promise<number | undefined> {
+    const tab = await this.deps.tabs.create({ url, active: false });
+    if (tab.id === undefined) return undefined;
+    await this.foldIntoHandoffGroup(tab.id);
+    return tab.id;
+  }
+
+  /** Add a tab to the collapsed "papio" group, reusing the group across
+   * handoffs (and the keepalive tab) or creating it collapsed on first use.
+   * No-op when the platform lacks tab grouping. */
+  private async foldIntoHandoffGroup(tabID: number): Promise<void> {
+    const group = this.deps.tabs.group;
+    const tabGroups = this.deps.tabGroups;
+    if (group === undefined) return;
+    const existing = this.store.handoffGroupID;
+    if (existing !== undefined) {
+      try {
+        if (tabGroups !== undefined) await tabGroups.get(existing);
+        await group({ tabIds: [tabID], groupId: existing });
+        return;
+      } catch {
+        // Group closed by the user: fall through and create a fresh one.
+      }
+    }
+    const groupID = await group({ tabIds: [tabID] });
+    if (tabGroups !== undefined) {
+      try {
+        await tabGroups.update(groupID, { title: "papio", collapsed: true, color: "grey" });
+      } catch {
+        // Styling is cosmetic; the group still brokers correctly.
+      }
+    }
+    await this.update((s) => ({ ...s, handoffGroupID: groupID }));
+  }
+
+  /** Fold the keepalive resolver tab into the "papio" group when tab-group mode
+   * is active, keeping papio's whole footprint in one collapsed group. In
+   * work-window mode keepalive already places its tab in the work window. */
+  async foldKeepaliveTab(tabID: number): Promise<void> {
+    await this.ready;
+    if ((await this.handoffSurface()) !== "tab-group") return;
+    await this.foldIntoHandoffGroup(tabID);
   }
 
   /** Create the tab inside the dedicated work window, keeping a directly
@@ -752,10 +847,25 @@ export class Bridge {
     }
   }
 
-  /** Bring a work-window tab to the human: activate it and restore/focus the
-   * work window. No-op outside work-window mode (legacy tabs are already
-   * visible) and best-effort throughout — auth proceeds regardless. */
+  /** Bring the handoff tab to the human for authentication. In work-window mode
+   * this activates the tab and restores/focuses the window; in tab-group mode it
+   * expands the collapsed "papio" group and activates the tab. No-op for legacy
+   * in-window tabs (already visible). Best-effort — auth proceeds regardless. */
   private async surfaceWorkTab(tabID: number): Promise<void> {
+    const groupID = this.store.handoffGroupID;
+    if (groupID !== undefined && this.deps.tabGroups !== undefined) {
+      try {
+        await this.deps.tabGroups.update(groupID, { collapsed: false });
+      } catch {
+        // Group gone; activating the tab below still surfaces it.
+      }
+      try {
+        await this.deps.tabs.update?.(tabID, { active: true });
+      } catch {
+        // The tab may already be gone; the badge/notification remain the signal.
+      }
+      return;
+    }
     const windowID = this.store.workWindowID;
     const windows = this.deps.windows;
     if (windowID === undefined || windows === undefined) return;
@@ -772,6 +882,18 @@ export class Bridge {
       });
     } catch {
       // Window gone; the popup badge and notification remain the signal.
+    }
+  }
+
+  /** Re-collapse the "papio" group after the human finishes authentication so it
+   * folds back out of the way. No-op outside tab-group mode. Best-effort. */
+  private async recollapseHandoffGroup(): Promise<void> {
+    const groupID = this.store.handoffGroupID;
+    if (groupID === undefined || this.deps.tabGroups === undefined) return;
+    try {
+      await this.deps.tabGroups.update(groupID, { collapsed: true });
+    } catch {
+      // Group gone or already collapsed; nothing to recover.
     }
   }
 
@@ -1583,6 +1705,7 @@ export class Bridge {
       return { ...removeJob(s, jobID), offerURLs };
     });
     await this.closeWorkWindowIfIdle();
+    await this.dropStaleHandoffGroup();
   }
 
   /** Close papio's dedicated work window once no handoff owns a broker tab in
@@ -1617,6 +1740,28 @@ export class Bridge {
     await this.update((s) => {
       const next = { ...s };
       delete next.workWindowID;
+      return next;
+    });
+  }
+
+  /** Drop the stored "papio" group id once no handoff owns a tab and Chrome has
+   * removed the (now-empty) group. A keepalive tab folded into the group keeps
+   * it live, so the id is retained for reuse. No-op outside tab-group mode. */
+  private async dropStaleHandoffGroup(): Promise<void> {
+    const groupID = this.store.handoffGroupID;
+    if (groupID === undefined) return;
+    if (this.store.activeJobs.some((job) => job.tab_id >= 0)) return;
+    if (this.deps.tabGroups !== undefined) {
+      try {
+        await this.deps.tabGroups.get(groupID);
+        return; // still exists (e.g. a keepalive tab) -> reuse it next handoff
+      } catch {
+        // Group gone: fall through and clear the stale id.
+      }
+    }
+    await this.update((s) => {
+      const next = { ...s };
+      delete next.handoffGroupID;
       return next;
     });
   }
@@ -2288,6 +2433,8 @@ export class Bridge {
         lastAuthReturnedAt: now,
       }));
       this.send("auth_returned", { elapsed_ms: elapsed }, job.job_id);
+      // The human is past authentication; fold the "papio" group back away.
+      await this.recollapseHandoffGroup();
       if (firstAuthReturn) {
         await this.releaseQueuedHandoffs();
         await this.reloadAuthenticationHandoffs();
@@ -3322,6 +3469,9 @@ function realDeps(): BridgeDeps {
       query: (query) => chrome.tabs.query(query),
       onUpdated: { addListener: (cb) => chrome.tabs.onUpdated.addListener(cb) },
       onRemoved: { addListener: (cb) => chrome.tabs.onRemoved.addListener(cb) },
+      ...(typeof chrome.tabs.group === "function"
+        ? { group: (opts: { tabIds: number[]; groupId?: number }) => chrome.tabs.group(opts as chrome.tabs.GroupOptions) }
+        : {}),
     },
     // chrome.windows is present in every Chromium; guarded for other runtimes.
     ...(typeof chrome.windows !== "undefined"
@@ -3335,6 +3485,17 @@ function realDeps(): BridgeDeps {
             update: (windowID: number, props: { focused?: boolean; state?: "normal" }) =>
               chrome.windows.update(windowID, props),
             remove: (windowID: number) => chrome.windows.remove(windowID),
+          },
+        }
+      : {}),
+    // chrome.tabGroups is Chrome-only; absent on Firefox and older Chromium.
+    ...(typeof chrome.tabGroups !== "undefined"
+      ? {
+          tabGroups: {
+            get: (groupID: number) =>
+              chrome.tabGroups.get(groupID) as Promise<{ id: number; collapsed: boolean; title?: string }>,
+            update: (groupID: number, props: { collapsed?: boolean; title?: string; color?: string }) =>
+              chrome.tabGroups.update(groupID, props as chrome.tabGroups.UpdateProperties),
           },
         }
       : {}),
@@ -3387,6 +3548,17 @@ function realDeps(): BridgeDeps {
           return got[WORK_WINDOW_KEY] !== false;
         } catch {
           return true;
+        }
+      },
+      async getHandoffSurface(): Promise<HandoffSurface> {
+        try {
+          const got = await chrome.storage.local.get([HANDOFF_SURFACE_KEY, WORK_WINDOW_KEY]);
+          const v = got[HANDOFF_SURFACE_KEY];
+          if (v === "in-window" || v === "work-window" || v === "tab-group") return v;
+          // No explicit choice: honor the legacy boolean so upgrades are seamless.
+          return got[WORK_WINDOW_KEY] === false ? "in-window" : "work-window";
+        } catch {
+          return "work-window";
         }
       },
     },
@@ -3474,6 +3646,7 @@ if (typeof chrome !== "undefined" && chrome.runtime?.id) {
       trackedJobCount: () => bridge.trackedJobCount(),
       latestOpenURL: () => bridge.latestOpenURL(),
       workWindowID: () => bridge.workWindowIDForKeepalive(),
+      onTabPlaced: (tabID) => bridge.foldKeepaliveTab(tabID),
       onAuthenticationChanged: (authenticated) => {
         void bridge.setKeepaliveAuthenticated(authenticated);
       },

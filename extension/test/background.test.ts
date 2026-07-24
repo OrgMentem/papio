@@ -112,6 +112,9 @@ class FakeTabs {
   readonly live = new Map<number, TabInfo>();
   nextId = 100;
   failCreate = false;
+  /** Records tabs.group calls; assigned by makeHarness only in tab-group mode. */
+  readonly grouped: { tabIds: number[]; groupId?: number }[] = [];
+  group?: (opts: { tabIds: number[]; groupId?: number }) => Promise<number>;
   async update(tabID: number, props: { active?: boolean; url?: string }): Promise<TabInfo> {
     if (props.active) this.activated.push(tabID);
     const tab = this.live.get(tabID);
@@ -194,6 +197,33 @@ class FakeWindows {
   }
 }
 
+class FakeTabGroups {
+  readonly updated: { groupID: number; props: { collapsed?: boolean; title?: string; color?: string } }[] =
+    [];
+  readonly live = new Map<number, { id: number; collapsed: boolean; title?: string }>();
+  async get(groupID: number): Promise<{ id: number; collapsed: boolean; title?: string }> {
+    const group = this.live.get(groupID);
+    if (!group) throw new Error("no such group");
+    return group;
+  }
+  async update(
+    groupID: number,
+    props: { collapsed?: boolean; title?: string; color?: string },
+  ): Promise<unknown> {
+    this.updated.push({ groupID, props });
+    const group = this.live.get(groupID);
+    if (group) {
+      if (props.collapsed !== undefined) group.collapsed = props.collapsed;
+      if (props.title !== undefined) group.title = props.title;
+    }
+    return group ?? {};
+  }
+  /** Simulate Chrome removing an emptied group (or the user closing it). */
+  close(groupID: number): void {
+    this.live.delete(groupID);
+  }
+}
+
 class FakeDownloads {
   readonly onCreated = new FakeEmitter<[DownloadItemLike]>();
   readonly onChanged = new FakeEmitter<[DownloadDeltaLike]>();
@@ -251,6 +281,7 @@ interface Harness {
   downloads: FakeDownloads;
   action: FakeAction;
   windows?: FakeWindows;
+  tabGroups?: FakeTabGroups;
   clock: { now: number };
   timers: { fn: () => void | Promise<void>; ms: number }[];
   frames(): BrowserMessage[];
@@ -260,7 +291,13 @@ interface Harness {
 
 function makeHarness(
   seed?: StoreShape,
-  opts?: { windows?: boolean; workWindowEnabled?: boolean; firefox?: boolean },
+  opts?: {
+    windows?: boolean;
+    workWindowEnabled?: boolean;
+    firefox?: boolean;
+    tabGroups?: boolean;
+    handoffSurface?: "in-window" | "work-window" | "tab-group";
+  },
 ): Harness {
   const port = new FakePort();
   const ports = [port];
@@ -271,6 +308,15 @@ function makeHarness(
   const downloads = new FakeDownloads();
   if (opts?.firefox === true) Reflect.deleteProperty(downloads, "onDeterminingFilename");
   const windows = opts?.windows === true ? new FakeWindows(tabs) : undefined;
+  const tabGroups = opts?.tabGroups === true ? new FakeTabGroups() : undefined;
+  if (tabGroups !== undefined) {
+    tabs.group = async ({ tabIds, groupId }) => {
+      tabs.grouped.push(groupId === undefined ? { tabIds } : { tabIds, groupId });
+      const id = groupId ?? 700 + tabGroups.live.size;
+      if (!tabGroups.live.has(id)) tabGroups.live.set(id, { id, collapsed: false });
+      return id;
+    };
+  }
   const clock = { now: 1_700_000_000_000 };
   const timers: { fn: () => void | Promise<void>; ms: number }[] = [];
   const action = new FakeAction();
@@ -303,8 +349,12 @@ function makeHarness(
       ...(opts?.workWindowEnabled !== undefined
         ? { getWorkWindowEnabled: async () => opts.workWindowEnabled === true }
         : {}),
+      ...(opts?.handoffSurface !== undefined
+        ? { getHandoffSurface: async () => opts.handoffSurface! }
+        : {}),
     },
     ...(windows !== undefined ? { windows } : {}),
+    ...(tabGroups !== undefined ? { tabGroups } : {}),
     action,
     alarms: { create: (name) => alarms.create(name), onAlarm: alarms.onAlarm },
   };
@@ -318,6 +368,7 @@ function makeHarness(
     downloads,
     action,
     ...(windows !== undefined ? { windows } : {}),
+    ...(tabGroups !== undefined ? { tabGroups } : {}),
     clock,
     timers,
     alarms,
@@ -1848,6 +1899,83 @@ test("a keepalive-pinned tab keeps the work window alive when handoffs drain", a
   expect(h.backend.store.activeJobs.length).toBe(0);
   expect(h.windows?.removed).toEqual([]);
   expect(h.backend.store.workWindowID).toBe(500);
+});
+
+test("tab-group mode opens the handoff in a collapsed papio group in the current window", async () => {
+  const h = makeHarness(undefined, { tabGroups: true, handoffSurface: "tab-group" });
+  await h.bridge.start();
+  await h.port.inbound(jobOffer("job_tg_first"));
+
+  // The tab opens in the user's current window (no windowId), not a new window.
+  expect(h.tabs.created).toEqual([{ url: OPENURL, active: false }]);
+  expect(h.tabs.grouped).toEqual([{ tabIds: [100] }]);
+  const groupID = h.backend.store.handoffGroupID;
+  expect(groupID).toBeDefined();
+  expect(h.tabGroups?.live.get(groupID!)?.collapsed).toBe(true);
+  expect(h.tabGroups?.updated).toEqual([
+    { groupID: groupID!, props: { title: "papio", collapsed: true, color: "grey" } },
+  ]);
+});
+
+test("tab-group handoffs reuse one papio group", async () => {
+  const h = makeHarness(
+    { ...emptyStore(), lastAuthReturnedAt: 1_700_000_000_000 },
+    { tabGroups: true, handoffSurface: "tab-group" },
+  );
+  await h.bridge.start();
+  await h.port.inbound(jobOffer("job_tg_a"));
+  const groupID = h.backend.store.handoffGroupID!;
+  await h.port.inbound(jobOffer("job_tg_b"));
+
+  // Second handoff joins the same group rather than creating another.
+  expect(h.tabs.grouped).toEqual([{ tabIds: [100] }, { tabIds: [101], groupId: groupID }]);
+  expect(h.backend.store.handoffGroupID).toBe(groupID);
+  expect(h.tabGroups?.live.size).toBe(1);
+});
+
+test("IdP auth expands the papio group and re-collapses when auth returns", async () => {
+  const h = makeHarness(undefined, { tabGroups: true, handoffSurface: "tab-group" });
+  await h.bridge.start();
+  await h.port.inbound(jobOffer("job_tg_auth"));
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  const groupID = h.backend.store.handoffGroupID!;
+
+  const idpURL = "https://idp.example.edu/sso?SAMLRequest=x";
+  await h.tabs.onUpdated.emit(tabID, { url: idpURL }, { id: tabID, url: idpURL });
+  expect(h.frames().some((f) => f.type === "auth_pending")).toBe(true);
+  expect(h.tabs.activated).toEqual([tabID]);
+  expect(h.tabGroups?.live.get(groupID)?.collapsed).toBe(false);
+
+  // Auth returns to a provider host: the job advances and the group folds away.
+  const providerURL = `https://${PROVIDER_HOST}/stable/123`;
+  await h.tabs.onUpdated.emit(tabID, { url: providerURL, status: "complete" }, { id: tabID, url: providerURL });
+  expect(h.frames().some((f) => f.type === "auth_returned")).toBe(true);
+  expect(h.tabGroups?.live.get(groupID)?.collapsed).toBe(true);
+});
+
+test("an emptied papio group's id is dropped so the next handoff regroups", async () => {
+  const h = makeHarness(undefined, { tabGroups: true, handoffSurface: "tab-group" });
+  await h.bridge.start();
+  await h.port.inbound(jobOffer("job_tg_idle"));
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  const groupID = h.backend.store.handoffGroupID!;
+  // Chrome removes the group once its last tab is gone.
+  h.tabGroups?.close(groupID);
+  await h.tabs.onRemoved.emit(tabID, { isWindowClosing: false });
+  expect(h.backend.store.activeJobs.length).toBe(0);
+  expect(h.backend.store.handoffGroupID).toBeUndefined();
+});
+
+test("a live papio group (keepalive folded in) is retained when handoffs drain", async () => {
+  const h = makeHarness(undefined, { tabGroups: true, handoffSurface: "tab-group" });
+  await h.bridge.start();
+  await h.port.inbound(jobOffer("job_tg_keepalive"));
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  const groupID = h.backend.store.handoffGroupID!;
+  // The group still exists (e.g. a keepalive tab folded in); keep the id.
+  await h.tabs.onRemoved.emit(tabID, { isWindowClosing: false });
+  expect(h.backend.store.activeJobs.length).toBe(0);
+  expect(h.backend.store.handoffGroupID).toBe(groupID);
 });
 
 test("IdP navigation surfaces the work-window tab: activate + restore + focus", async () => {

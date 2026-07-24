@@ -17,8 +17,18 @@ export type TermsConsent = "accept" | "manual" | undefined;
 export const TERMS_CONSENT_KEY = "papio_terms_consent_v1";
 
 /** Durable user choice for the dedicated background work window. `false`
- * disables routing and restores legacy in-window tabs; absent means enabled. */
+ * disables routing and restores legacy in-window tabs; absent means enabled.
+ * Retained for backward compatibility; new installs use HANDOFF_SURFACE_KEY. */
 export const WORK_WINDOW_KEY = "papio_work_window_v1";
+
+/** Where papio opens handoff tabs.
+ * - `in-window`: in the user's current window (legacy visible tabs).
+ * - `work-window`: one dedicated minimized background window.
+ * - `tab-group`: a collapsed "papio" tab group in the user's current window.
+ * Absent = derive from WORK_WINDOW_KEY (true/absent -> work-window, false ->
+ * in-window) so existing installs keep their behavior. */
+export type HandoffSurface = "in-window" | "work-window" | "tab-group";
+export const HANDOFF_SURFACE_KEY = "papio_handoff_surface_v1";
 
 /** Native-daemon compatibility as last reported by the bridge. `undefined`
  * remains valid for state persisted by earlier extension versions. */
@@ -75,6 +85,10 @@ export interface StoreShape {
    * has created one this browser session. Window ids are session-scoped, never
    * sensitive. Verified live (and recreated) before every reuse. */
   workWindowID?: number;
+  /** Id of papio's collapsed "papio" tab group in the user's window, when
+   * tab-group mode has created one this browser session. Group ids are
+   * session-scoped, never sensitive. Verified live (and recreated) before reuse. */
+  handoffGroupID?: number;
   /** Native-daemon connection and capability data, refreshed by hello_ack.
    * Version is null when an older daemon does not report one. */
   connectionStatus?: DaemonConnectionStatus;

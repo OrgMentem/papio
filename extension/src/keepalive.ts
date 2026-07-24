@@ -58,6 +58,9 @@ export interface KeepaliveOptions {
   /** Id of papio's dedicated background work window, when one exists. The
    * keepalive tab is created there so it stays out of the user's tab strip. */
   workWindowID?(): number | undefined;
+  /** Called after the keepalive tab is (re)created, so tab-group mode can fold
+   * it into papio's collapsed group. Best-effort; keepalive proceeds regardless. */
+  onTabPlaced?(tabID: number): Promise<void>;
   /** Brings a reauth-parked keepalive tab's window to the front. Needed when
    * the tab lives in the minimized work window; tabs.update alone cannot
    * surface it. Best-effort. */
@@ -234,6 +237,7 @@ export class KeepaliveManager {
       this.tabID = tab.id;
       this.reauthPaused = false;
       this.setAuthenticated(false);
+      await this.options.onTabPlaced?.(tab.id);
     } catch {
       // Browser policy may reject background tabs. Observe and try again later.
     }

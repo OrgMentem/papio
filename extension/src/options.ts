@@ -183,34 +183,46 @@ function wireTermsConsent(): void {
 }
 
 const WORK_WINDOW_KEY = "papio_work_window_v1";
+const HANDOFF_SURFACE_KEY = "papio_handoff_surface_v1";
+type HandoffSurface = "in-window" | "work-window" | "tab-group";
 
-async function renderWorkWindow(): Promise<void> {
-  const statusEl = document.getElementById("work-window-status");
-  if (!statusEl) return;
-  let enabled = true;
+async function currentHandoffSurface(): Promise<HandoffSurface> {
   try {
-    const got = await chrome.storage.local.get(WORK_WINDOW_KEY);
-    enabled = got[WORK_WINDOW_KEY] !== false;
+    const got = await chrome.storage.local.get([HANDOFF_SURFACE_KEY, WORK_WINDOW_KEY]);
+    const v = got[HANDOFF_SURFACE_KEY];
+    if (v === "in-window" || v === "work-window" || v === "tab-group") return v;
+    return got[WORK_WINDOW_KEY] === false ? "in-window" : "work-window";
   } catch {
-    enabled = true;
+    return "work-window";
   }
-  const text = enabled
-    ? "On — papio tabs stay in a minimized background window"
-    : "Off — papio tabs open in your current window";
-  renderPapio(statusEl, text);
 }
 
-function wireWorkWindow(): void {
-  const on = document.getElementById("work-window-on");
-  const off = document.getElementById("work-window-off");
-  if (on instanceof HTMLButtonElement) {
-    on.addEventListener("click", () => {
-      void chrome.storage.local.set({ [WORK_WINDOW_KEY]: true }).then(renderWorkWindow);
-    });
-  }
-  if (off instanceof HTMLButtonElement) {
-    off.addEventListener("click", () => {
-      void chrome.storage.local.set({ [WORK_WINDOW_KEY]: false }).then(renderWorkWindow);
+const HANDOFF_SURFACE_TEXT: Record<HandoffSurface, string> = {
+  "tab-group": "Tab group — papio tabs live in a collapsed group in your current window",
+  "work-window": "Background window — papio tabs stay in a minimized background window",
+  "in-window": "Current window — papio tabs open in your current window",
+};
+
+async function renderHandoffSurface(): Promise<void> {
+  const statusEl = document.getElementById("handoff-surface-status");
+  if (!statusEl) return;
+  renderPapio(statusEl, HANDOFF_SURFACE_TEXT[await currentHandoffSurface()]);
+}
+
+function wireHandoffSurface(): void {
+  const choices: Record<string, HandoffSurface> = {
+    "handoff-tab-group": "tab-group",
+    "handoff-work-window": "work-window",
+    "handoff-in-window": "in-window",
+  };
+  for (const [id, surface] of Object.entries(choices)) {
+    const btn = document.getElementById(id);
+    if (!(btn instanceof HTMLButtonElement)) continue;
+    btn.addEventListener("click", () => {
+      // Keep the legacy boolean in sync so an older bridge build still honors it.
+      void chrome.storage.local
+        .set({ [HANDOFF_SURFACE_KEY]: surface, [WORK_WINDOW_KEY]: surface !== "in-window" })
+        .then(renderHandoffSurface);
     });
   }
 }
@@ -304,6 +316,6 @@ if (libraryResolverList instanceof HTMLUListElement) {
 void renderConfiguredResolvers();
 wireTermsConsent();
 void renderTermsConsent();
-wireWorkWindow();
-void renderWorkWindow();
+wireHandoffSurface();
+void renderHandoffSurface();
 void renderDaemonFooter();

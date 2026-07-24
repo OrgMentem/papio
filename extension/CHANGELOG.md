@@ -16,6 +16,16 @@ for the full pre-split extension history.
 
 ## [Unreleased]
 
+### Added
+
+- **Tab-group handoff mode.** A new "Where papio opens tabs" setting lets you
+  put handoffs in a collapsed "papio" tab group in your current window instead
+  of a separate background window (or inline, as before). The group folds away
+  when idle, expands and focuses the tab only when you are needed for sign-in,
+  then re-collapses; the keepalive session tab joins the same group. Chrome
+  only (adds the `tabGroups` permission); Firefox falls back to the background
+  work window. Your existing on/off choice is preserved.
+
 ### Fixed
 
 - **The background work window no longer accumulates.** papio's dedicated
