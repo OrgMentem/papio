@@ -122,6 +122,15 @@ The extension has **zero runtime deps** — both bundles are plain browser JS. `
   disabled on Firefox — only exact `downloads.download`-started files are owned, and click
   adapters stay human-assisted there by design. Don't "fix" a Firefox click adapter by
   widening correlation; the daemon would acknowledge a file it can never adopt.
+- **Tab-group handoff now runs on Firefox 139+ (`tabGroups` API), not just Chrome.**
+  `build.ts` keeps the `tabGroups` permission in `firefox/manifest.json`; the bridge
+  is dep-driven (`chrome.tabGroups`/`chrome.tabs.group` runtime-detected), never gated
+  on Chrome. `strict_min_version` stays **`128.0`** on purpose — Firefox 128 is the ESR
+  papio's institutional/library users run, and on FF < 139 `handoffSurface()` degrades
+  tab-group mode to the work window at runtime. **Don't bump the min-version to silence
+  `web-ext lint`'s `INCOMPATIBLE_API` warnings for `tabs.group`/`tabGroups.*`** — those
+  are expected (static analysis can't see the runtime guard), lint still exits 0
+  (0 errors), and bumping would drop every ESR user to no tab-group handoff.
 
 ### Automation detection (this is load-bearing — papio's whole value is "real human browser")
 - **Never drive the user's browser via WebDriver/BiDi for real work.** Firefox BiDi sets

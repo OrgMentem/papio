@@ -79,11 +79,10 @@ async function buildAll(): Promise<void> {
   // extension_pages CSP already prohibits inline and remotely hosted scripts.
   const chromeManifest = JSON.parse(await readFile("manifest.json", "utf8")) as Record<string, unknown>;
   const { minimum_chrome_version: _, ...firefoxManifest } = chromeManifest;
-  // tabGroups is a Chrome-only permission; tab-group handoff mode falls back to
-  // the work window on Firefox, so drop it to keep the Firefox manifest clean.
-  if (Array.isArray(firefoxManifest.permissions)) {
-    firefoxManifest.permissions = firefoxManifest.permissions.filter((p) => p !== "tabGroups");
-  }
+  // tabGroups (Firefox 139+) enables the same collapsed "papio" tab-group
+  // handoff on Firefox as on Chrome. Keep the permission; on Firefox < 139 the
+  // API is absent and handoffSurface() degrades tab-group mode to the work
+  // window at runtime, so a lower strict_min_version stays compatible.
   firefoxManifest.background = { scripts: ["dist/background.js"] };
   firefoxManifest.browser_specific_settings = {
     gecko: {

@@ -206,6 +206,9 @@ class FakeTabGroups {
     if (!group) throw new Error("no such group");
     return group;
   }
+  async query(props: { title?: string }): Promise<{ id: number; collapsed: boolean; title?: string }[]> {
+    return [...this.live.values()].filter((g) => props.title === undefined || g.title === props.title);
+  }
   async update(
     groupID: number,
     props: { collapsed?: boolean; title?: string; color?: string },
@@ -1913,8 +1916,22 @@ test("tab-group mode opens the handoff in a collapsed papio group in the current
   expect(groupID).toBeDefined();
   expect(h.tabGroups?.live.get(groupID!)?.collapsed).toBe(true);
   expect(h.tabGroups?.updated).toEqual([
-    { groupID: groupID!, props: { title: "papio", collapsed: true, color: "grey" } },
+    { groupID: groupID!, props: { title: "papio", collapsed: true, color: "orange" } },
   ]);
+});
+
+test("tab-group handoff works on Firefox 139+ (no onDeterminingFilename)", async () => {
+  // Firefox has no downloads.onDeterminingFilename, but Firefox 139+ ships the
+  // tabGroups API. Tab-group handoff is dep-driven, never gated on Chrome.
+  const h = makeHarness(undefined, { firefox: true, tabGroups: true, handoffSurface: "tab-group" });
+  await h.bridge.start();
+  await h.port.inbound(jobOffer("job_tg_firefox"));
+
+  expect(h.tabs.created).toEqual([{ url: OPENURL, active: false }]);
+  expect(h.tabs.grouped).toEqual([{ tabIds: [100] }]);
+  const groupID = h.backend.store.handoffGroupID;
+  expect(groupID).toBeDefined();
+  expect(h.tabGroups?.live.get(groupID!)?.collapsed).toBe(true);
 });
 
 test("tab-group handoffs reuse one papio group", async () => {
@@ -1931,6 +1948,28 @@ test("tab-group handoffs reuse one papio group", async () => {
   expect(h.tabs.grouped).toEqual([{ tabIds: [100] }, { tabIds: [101], groupId: groupID }]);
   expect(h.backend.store.handoffGroupID).toBe(groupID);
   expect(h.tabGroups?.live.size).toBe(1);
+});
+
+test("tab-group mode rediscovers an orphaned papio group after an extension reload", async () => {
+  const h = makeHarness(undefined, { tabGroups: true, handoffSurface: "tab-group" });
+  await h.bridge.start();
+  await h.port.inbound(jobOffer("job_tg_reload_a"));
+  const groupID = h.backend.store.handoffGroupID;
+  expect(groupID).toBeDefined();
+  expect(h.tabGroups?.live.size).toBe(1);
+
+  // Simulate an extension reload: chrome.storage.session is wiped (the in-memory
+  // group id is lost) but the physical "papio" group survives in the window.
+  h.backend.store = emptyStore();
+  const reloaded = new Bridge(h.deps);
+  await reloaded.start();
+  await h.ports[h.ports.length - 1]!.inbound(jobOffer("job_tg_reload_b"));
+
+  // The reload rediscovers the orphaned group by title rather than creating a
+  // second group (and a duplicate SSO tab).
+  expect(h.tabGroups?.live.size).toBe(1);
+  expect(h.backend.store.handoffGroupID).toBe(groupID);
+  expect(h.tabs.grouped).toEqual([{ tabIds: [100] }, { tabIds: [101], groupId: groupID! }]);
 });
 
 test("IdP auth expands the papio group and re-collapses when auth returns", async () => {

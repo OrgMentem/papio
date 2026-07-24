@@ -92,6 +92,11 @@ const REVIEW_PREVIEW_FEATURE = "review_preview_v1";
 // Fallback for a manifest without an action popup; both build targets ship
 // the pages under dist/ (see build.ts) and the manifest is the source of truth.
 const POPUP_PAGE_PATH = "dist/popup.html";
+/** Title of papio's collapsed handoff tab group. Used both to style the group
+ * and to rediscover an orphaned group by title after an extension reload wipes
+ * the in-memory group id (session storage is cleared, but the physical group
+ * survives in the window). Keep the create-title and the query-title identical. */
+const HANDOFF_GROUP_TITLE = "papio";
 
 /** Whether this adapter's SPA must render outside the minimized work window. */
 export function needsVisibleWindow(spec: AdapterSpec | undefined): boolean {
@@ -202,15 +207,19 @@ export interface BridgeDeps {
      * background window never accumulates across handoffs. */
     remove(windowID: number): Promise<void>;
   };
-  /** chrome.tabGroups seam (Chrome). Present only when tab-group handoff mode is
-   * available; absent on Firefox and older Chromium, where tab-group mode falls
-   * back to the work window. */
+  /** chrome.tabGroups seam. Present when tab-group handoff mode is available:
+   * Chrome, and Firefox 139+ with the tabGroups permission. Absent on Firefox
+   * < 139 and older Chromium, where tab-group mode falls back to the work
+   * window. */
   tabGroups?: {
     get(groupID: number): Promise<{ id: number; collapsed: boolean; title?: string }>;
     update(
       groupID: number,
       props: { collapsed?: boolean; title?: string; color?: string },
     ): Promise<unknown>;
+    /** Find groups by title. Used to rediscover papio's orphaned handoff group
+     * after an extension reload clears the in-memory id but leaves the group. */
+    query(props: { title?: string }): Promise<{ id: number; collapsed: boolean; title?: string }[]>;
   };
   downloads: {
     search(query: { id: number }): Promise<DownloadItemLike[]>;
@@ -768,13 +777,29 @@ export class Bridge {
         await group({ tabIds: [tabID], groupId: existing });
         return;
       } catch {
-        // Group closed by the user: fall through and create a fresh one.
+        // Group closed by the user: fall through and rediscover/create.
+      }
+    }
+    // No valid in-memory group id — an extension reload clears session storage
+    // but leaves the physical "papio" group in the window. Rediscover it by
+    // title before creating a duplicate group (and duplicate SSO tab).
+    if (tabGroups !== undefined) {
+      try {
+        const found = await tabGroups.query({ title: HANDOFF_GROUP_TITLE });
+        const reuse = found[0];
+        if (reuse !== undefined) {
+          await group({ tabIds: [tabID], groupId: reuse.id });
+          await this.update((s) => ({ ...s, handoffGroupID: reuse.id }));
+          return;
+        }
+      } catch {
+        // Query unsupported/failed: fall through and create a fresh group.
       }
     }
     const groupID = await group({ tabIds: [tabID] });
     if (tabGroups !== undefined) {
       try {
-        await tabGroups.update(groupID, { title: "papio", collapsed: true, color: "grey" });
+        await tabGroups.update(groupID, { title: HANDOFF_GROUP_TITLE, collapsed: true, color: "orange" });
       } catch {
         // Styling is cosmetic; the group still brokers correctly.
       }
@@ -3488,7 +3513,8 @@ function realDeps(): BridgeDeps {
           },
         }
       : {}),
-    // chrome.tabGroups is Chrome-only; absent on Firefox and older Chromium.
+    // chrome.tabGroups: Chrome and Firefox 139+ (with the tabGroups permission);
+    // absent on Firefox < 139 and older Chromium. Runtime-detected either way.
     ...(typeof chrome.tabGroups !== "undefined"
       ? {
           tabGroups: {
@@ -3496,6 +3522,10 @@ function realDeps(): BridgeDeps {
               chrome.tabGroups.get(groupID) as Promise<{ id: number; collapsed: boolean; title?: string }>,
             update: (groupID: number, props: { collapsed?: boolean; title?: string; color?: string }) =>
               chrome.tabGroups.update(groupID, props as chrome.tabGroups.UpdateProperties),
+            query: (props: { title?: string }) =>
+              chrome.tabGroups.query(props) as Promise<
+                { id: number; collapsed: boolean; title?: string }[]
+              >,
           },
         }
       : {}),
