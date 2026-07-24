@@ -1,4 +1,4 @@
-.PHONY: build test vet docs-gen docs-build docs-serve ext-bump hooks dev-deploy
+.PHONY: build test vet docs-gen docs-build docs-serve ext-bump hooks dev-deploy store-assets
 
 build:
 	go build ./...
@@ -62,3 +62,9 @@ dev-deploy:
 	@# Autostarts the new daemon, runs migrations, and verifies the whole chain.
 	-$(DEV_BIN) doctor
 	@echo "dev-deploy: $(DEV_VERSION) -> $(DEV_BIN) (host symlink repointed)"
+
+# Regenerate every Chrome Web Store visual asset (3 screenshots + 2 promo tiles)
+# from the real extension UI. Outputs to extension/web-ext-artifacts/store-assets/
+# (git-ignored). Requires system Chrome and ImageMagick. Run after UI changes.
+store-assets:
+	cd extension && bun run capture:store

@@ -66,13 +66,33 @@ Docs: https://orgmentem.github.io/papio/
 | Optional host permissions (publisher domains) | Access a publisher site only when a job needs its licensed PDF; requested at runtime, not at install. |
 | Remote code use | None. All code is bundled and shipped in the package; no remote code is loaded. |
 
-## Screenshots (1280x800 or 640x400)
+## Store visuals (screenshots + promo tiles)
 
-Reuse the shot list in `amo-listing.md`:
-1. Toolbar popup — healthy (version line, clear badge).
-2. Toolbar popup — attention state (`!` badge).
-3. Options page (versions + host-permission controls).
-4. Handoff tab in progress.
+Regenerate every visual asset from the *real* extension UI in one command:
+
+```
+bun run capture:store      # or: make store-assets (from repo root)
+```
+
+Outputs land in `web-ext-artifacts/store-assets/` (git-ignored). It builds
+`dist/`, serves it over http, renders the shipped `popup/options/inbox` pages in
+headless Chrome with a stubbed `chrome.*` (real pixels, mock daemon data), then
+Lanczos-downscales from 2x for crisp text. Requires system Chrome (or
+`$PAPIO_CHROME`) and ImageMagick.
+
+Screenshots (1280x800, upload 3–5):
+- `screenshot-popup.png` — toolbar popup, connected + DOI detected.
+- `screenshot-popup-attention.png` — toolbar popup, daemon-unreachable warning.
+- `screenshot-options.png` — options page, host-permission grant controls.
+- `screenshot-inbox.png` — triage inbox, human actions + watch hits.
+
+Promo tiles (24-bit PNG, no alpha):
+- `promo-small.png` — 440x280 small promo tile.
+- `promo-marquee.png` — 1400x560 marquee promo tile.
+
+Edit the sample data or promo copy/branding at the top of
+`scripts/capture-store-assets.ts`. One shot still needs a live daemon and isn't
+scripted: the handoff tab in progress — capture it by hand if wanted.
 
 ## Obtaining Chrome Web Store API credentials
 
