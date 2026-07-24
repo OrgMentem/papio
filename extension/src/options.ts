@@ -82,33 +82,32 @@ function render(list: HTMLUListElement, sources: Source[]): void {
     host.textContent = source.origin;
     meta.append(label, host);
 
-    const controls = document.createElement("div");
-    const status = document.createElement("span");
-    status.className = "status";
-    const button = document.createElement("button");
-    button.disabled = true;
-    controls.append(status, document.createTextNode(" "), button);
+    // A switch button: aria-checked drives the CSS visuals, no status text.
+    const toggle = document.createElement("button");
+    toggle.type = "button";
+    toggle.className = "switch";
+    toggle.setAttribute("role", "switch");
+    toggle.setAttribute("aria-checked", "false");
+    toggle.setAttribute("aria-label", `Access to ${source.label} (${source.origin})`);
+    toggle.disabled = true;
 
-    item.append(meta, controls);
+    item.append(meta, toggle);
     list.append(item);
 
     let granted = false;
     const paint = (next: boolean): void => {
       granted = next;
-      status.classList.toggle("granted", granted);
-      status.classList.toggle("revoked", !granted);
-      status.textContent = granted ? "granted" : "not granted";
-      button.textContent = granted ? "Revoke" : "Grant";
-      button.disabled = false;
+      toggle.setAttribute("aria-checked", granted ? "true" : "false");
+      toggle.disabled = false;
     };
 
     void chrome.permissions.contains({ origins: [source.origin] }).then(paint);
 
-    button.addEventListener("click", () => {
+    toggle.addEventListener("click", () => {
       // permissions.request must be invoked directly in the trusted click
       // callback. Awaiting contains() first loses Chrome's user gesture.
       const wasGranted = granted;
-      button.disabled = true;
+      toggle.disabled = true;
       const change = wasGranted
         ? chrome.permissions.remove({ origins: [source.origin] })
         : chrome.permissions.request({ origins: [source.origin] });
@@ -147,10 +146,12 @@ function wireProviderBulk(list: HTMLUListElement, sources: Source[]): void {
 
 const TERMS_CONSENT_KEY = "papio_terms_consent_v1";
 
+/** Reflect the stored consent on the switch; the hint row shows only while the
+ * choice is still unset (a two-state switch can't express "ask on first use"). */
 async function renderTermsConsent(): Promise<void> {
-  const statusEl = document.getElementById("terms-consent-status");
-  if (!statusEl) return;
-  let consent: string | undefined;
+  const toggle = document.getElementById("terms-consent-toggle");
+  if (!(toggle instanceof HTMLButtonElement)) return;
+  let consent: "accept" | "manual" | undefined;
   try {
     const got = await chrome.storage.local.get(TERMS_CONSENT_KEY);
     const v = got[TERMS_CONSENT_KEY];
@@ -158,28 +159,23 @@ async function renderTermsConsent(): Promise<void> {
   } catch {
     consent = undefined;
   }
-  const text =
-    consent === "accept"
-      ? "On — papio accepts publisher terms automatically"
-      : consent === "manual"
-        ? "Off — you accept terms yourself"
-        : "Ask on first download";
-  renderPapio(statusEl, text);
+  toggle.setAttribute("aria-checked", consent === "accept" ? "true" : "false");
+  toggle.disabled = false;
+  const hint = document.getElementById("terms-consent-hint");
+  if (hint instanceof HTMLElement) hint.hidden = consent !== undefined;
 }
 
 function wireTermsConsent(): void {
-  const on = document.getElementById("terms-consent-on");
-  const off = document.getElementById("terms-consent-off");
-  if (on instanceof HTMLButtonElement) {
-    on.addEventListener("click", () => {
-      void chrome.storage.local.set({ [TERMS_CONSENT_KEY]: "accept" }).then(renderTermsConsent);
+  const toggle = document.getElementById("terms-consent-toggle");
+  if (!(toggle instanceof HTMLButtonElement)) return;
+  toggle.addEventListener("click", () => {
+    // Turning the switch off is an explicit "manual" choice, not back to unset.
+    const next = toggle.getAttribute("aria-checked") === "true" ? "manual" : "accept";
+    toggle.disabled = true;
+    void chrome.storage.local.set({ [TERMS_CONSENT_KEY]: next }).then(renderTermsConsent, () => {
+      toggle.disabled = false;
     });
-  }
-  if (off instanceof HTMLButtonElement) {
-    off.addEventListener("click", () => {
-      void chrome.storage.local.set({ [TERMS_CONSENT_KEY]: "manual" }).then(renderTermsConsent);
-    });
-  }
+  });
 }
 
 const WORK_WINDOW_KEY = "papio_work_window_v1";
@@ -197,25 +193,26 @@ async function currentHandoffSurface(): Promise<HandoffSurface> {
   }
 }
 
-const HANDOFF_SURFACE_TEXT: Record<HandoffSurface, string> = {
-  "tab-group": "Tab group — papio tabs live in a collapsed group in your current window",
-  "work-window": "Background window — papio tabs stay in a minimized background window",
-  "in-window": "Current window — papio tabs open in your current window",
+const HANDOFF_SURFACE_BUTTONS: Record<HandoffSurface, string> = {
+  "tab-group": "handoff-tab-group",
+  "work-window": "handoff-work-window",
+  "in-window": "handoff-in-window",
 };
 
 async function renderHandoffSurface(): Promise<void> {
-  const statusEl = document.getElementById("handoff-surface-status");
-  if (!statusEl) return;
-  renderPapio(statusEl, HANDOFF_SURFACE_TEXT[await currentHandoffSurface()]);
+  const current = await currentHandoffSurface();
+  for (const [surface, id] of Object.entries(HANDOFF_SURFACE_BUTTONS)) {
+    const btn = document.getElementById(id);
+    if (!(btn instanceof HTMLButtonElement)) continue;
+    btn.setAttribute("aria-pressed", surface === current ? "true" : "false");
+  }
 }
 
 function wireHandoffSurface(): void {
-  const choices: Record<string, HandoffSurface> = {
-    "handoff-tab-group": "tab-group",
-    "handoff-work-window": "work-window",
-    "handoff-in-window": "in-window",
-  };
-  for (const [id, surface] of Object.entries(choices)) {
+  for (const [surface, id] of Object.entries(HANDOFF_SURFACE_BUTTONS) as [
+    HandoffSurface,
+    string,
+  ][]) {
     const btn = document.getElementById(id);
     if (!(btn instanceof HTMLButtonElement)) continue;
     btn.addEventListener("click", () => {

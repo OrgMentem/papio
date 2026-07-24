@@ -25,6 +25,10 @@ for the full pre-split extension history.
   then re-collapses; the keepalive session tab joins the same group. Chrome
   only (adds the `tabGroups` permission); Firefox falls back to the background
   work window. Your existing on/off choice is preserved.
+- **Options page redesign.** Per-host library access and publisher-terms
+  controls are now toggle switches, and the handoff-tab location is a
+  highlighted button group, for a clearer at-a-glance view of what is granted
+  and where handoffs open.
 
 ### Fixed
 

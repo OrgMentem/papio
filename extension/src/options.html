@@ -4,139 +4,422 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>papio — provider access</title>
+    <title>papio — settings</title>
     <style>
+      :root {
+        color-scheme: light dark;
+        --color-ink: #182231;
+        --color-brand-ink: #2b2d42;
+        --color-brand-accent: #d94f3d;
+        --color-muted: #607080;
+        --color-border: #dce3ea;
+        --color-control-border: #b8c5d1;
+        --color-page: #f4f7f9;
+        --color-surface: #fdfefe;
+        --color-surface-hover: #eef3f6;
+        --color-primary: #12549b;
+        --color-primary-surface: #eaf3ff;
+        --color-primary-solid: #12549b;
+        --color-on-primary: #fdfefe;
+        --color-tooltip-bg: #182231;
+        --color-tooltip-ink: #f4f7f9;
+        --radius-control: 6px;
+        --radius-card: 10px;
+        --radius-pill: 999px;
+        --transition-fast: 140ms ease-out;
+        accent-color: var(--color-primary);
+      }
+
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --color-ink: #e5edf4;
+          --color-brand-ink: #f0edf3;
+          --color-brand-accent: #ef6a57;
+          --color-muted: #a2b1be;
+          --color-border: #3e4f61;
+          --color-control-border: #526579;
+          --color-page: #141b23;
+          --color-surface: #1c2631;
+          --color-surface-hover: #263340;
+          --color-primary: #a8d0ff;
+          --color-primary-surface: #183956;
+          --color-primary-solid: #75b5f5;
+          --color-on-primary: #101a24;
+          --color-tooltip-bg: #e5edf4;
+          --color-tooltip-ink: #141b23;
+        }
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      [hidden] {
+        display: none !important;
+      }
+
       body {
-        font: 14px/1.5 system-ui, sans-serif;
-        margin: 0;
-        padding: 20px;
-        max-width: 560px;
-        color: #1a1a1a;
+        background: var(--color-page);
+        color: var(--color-ink);
+        font:
+          14px/1.5 ui-sans-serif,
+          system-ui,
+          -apple-system,
+          BlinkMacSystemFont,
+          "Segoe UI",
+          sans-serif;
+        margin: 0 auto;
+        max-width: 640px;
+        padding: 32px 24px 48px;
       }
-      h1 {
-        font-size: 18px;
-        margin: 0 0 4px;
+
+      .brand {
+        align-items: center;
+        display: flex;
+        gap: 12px;
+        margin: 0 0 24px;
       }
+
+      .brand svg {
+        flex: 0 0 auto;
+        height: 32px;
+        width: 32px;
+      }
+
+      .brand-name {
+        color: var(--color-brand-ink);
+        font-size: 22px;
+        font-weight: 700;
+        letter-spacing: 0.01em;
+        line-height: 1.2;
+      }
+
+      .brand-name em {
+        text-decoration-color: var(--color-brand-accent);
+        text-decoration-line: underline;
+        text-decoration-thickness: 2px;
+        text-underline-offset: 4px;
+      }
+
+      .page-name {
+        color: var(--color-muted);
+        font-weight: 500;
+      }
+
+      h2 {
+        font-size: 16px;
+        font-weight: 650;
+        margin: 32px 0 4px;
+      }
+
       p.lede {
-        color: #555;
-        margin: 0 0 20px;
+        color: var(--color-muted);
+        margin: 0 0 12px;
       }
-      ul {
+
+      .card {
+        background: var(--color-surface);
+        border: 1px solid var(--color-border);
+        border-radius: var(--radius-card);
+      }
+
+      .card-toolbar {
+        border-bottom: 1px solid var(--color-border);
+        display: flex;
+        gap: 8px;
+        padding: 10px 16px;
+      }
+
+      ul.rows {
         list-style: none;
         margin: 0;
         padding: 0;
       }
-      li {
-        display: flex;
+
+      ul.rows li,
+      .row {
         align-items: center;
+        display: flex;
+        gap: 16px;
         justify-content: space-between;
-        gap: 12px;
-        padding: 12px 0;
-        border-top: 1px solid #e3e3e3;
+        padding: 12px 16px;
       }
+
+      ul.rows li + li {
+        border-top: 1px solid var(--color-border);
+      }
+
       .source-label {
         font-weight: 600;
       }
+
       .source-host {
-        color: #777;
+        color: var(--color-muted);
+        font-size: 12px;
+        overflow-wrap: anywhere;
+      }
+
+      .hint {
+        color: var(--color-muted);
         font-size: 12px;
       }
-      .status {
-        font-size: 12px;
-        padding: 2px 8px;
-        border-radius: 999px;
-      }
-      .status.granted {
-        background: #e4f5e9;
-        color: #1a7f3c;
-      }
-      .status.revoked {
-        background: #f1f1f1;
-        color: #777;
-      }
+
       button {
         font: inherit;
-        padding: 6px 14px;
-        border-radius: 6px;
-        border: 1px solid #bbb;
-        background: #fff;
+      }
+
+      button:focus-visible {
+        outline: 2px solid var(--color-primary);
+        outline-offset: 2px;
+      }
+
+      .btn {
+        background: var(--color-surface);
+        border: 1px solid var(--color-control-border);
+        border-radius: var(--radius-control);
+        color: var(--color-ink);
         cursor: pointer;
+        padding: 5px 12px;
       }
-      button:hover {
-        background: #f5f5f5;
+
+      .btn:hover {
+        background: var(--color-surface-hover);
       }
-      footer {
-        color: #777;
+
+      /* Toggle switch: a button with role="switch"; aria-checked drives the visuals. */
+      .switch {
+        background: var(--color-control-border);
+        border: none;
+        border-radius: var(--radius-pill);
+        cursor: pointer;
+        flex: none;
+        height: 24px;
+        padding: 0;
+        position: relative;
+        transition: background var(--transition-fast);
+        width: 40px;
+      }
+
+      .switch::before {
+        background: var(--color-on-primary);
+        border-radius: 50%;
+        box-shadow: 0 1px 2px rgb(0 0 0 / 25%);
+        content: "";
+        height: 18px;
+        left: 3px;
+        position: absolute;
+        top: 3px;
+        transition: transform var(--transition-fast);
+        width: 18px;
+      }
+
+      .switch[aria-checked="true"] {
+        background: var(--color-primary-solid);
+      }
+
+      .switch[aria-checked="true"]::before {
+        transform: translateX(16px);
+      }
+
+      .switch:disabled {
+        cursor: default;
+        opacity: 0.45;
+      }
+
+      /* Segmented control for the handoff-surface choice. */
+      .seg {
+        border: 1px solid var(--color-control-border);
+        border-radius: var(--radius-control);
+        display: inline-flex;
+      }
+
+      .seg button {
+        background: transparent;
+        border: none;
+        color: var(--color-muted);
+        cursor: pointer;
+        padding: 6px 14px;
+        position: relative;
+      }
+
+      .seg button + button {
+        border-left: 1px solid var(--color-control-border);
+      }
+
+      .seg button:first-child {
+        border-radius: calc(var(--radius-control) - 1px) 0 0 calc(var(--radius-control) - 1px);
+      }
+
+      .seg button:last-child {
+        border-radius: 0 calc(var(--radius-control) - 1px) calc(var(--radius-control) - 1px) 0;
+      }
+
+      .seg button:hover {
+        background: var(--color-surface-hover);
+        color: var(--color-ink);
+      }
+
+      .seg button[aria-pressed="true"] {
+        background: var(--color-primary-surface);
+        color: var(--color-primary);
+        font-weight: 600;
+      }
+
+      /* Instant tooltip (no delay, unlike native title). */
+      [data-tip]::after {
+        background: var(--color-tooltip-bg);
+        border-radius: var(--radius-control);
+        bottom: calc(100% + 8px);
+        color: var(--color-tooltip-ink);
+        content: attr(data-tip);
         font-size: 12px;
-        margin-top: 28px;
+        font-weight: 400;
+        line-height: 1.4;
+        opacity: 0;
+        padding: 6px 10px;
+        pointer-events: none;
+        position: absolute;
+        right: 0;
+        text-align: left;
+        white-space: normal;
+        width: max-content;
+        max-width: 260px;
+        z-index: 1;
+      }
+
+      [data-tip]:hover::after,
+      [data-tip]:focus-visible::after {
+        opacity: 1;
+      }
+
+      footer {
+        border-top: 1px solid var(--color-border);
+        color: var(--color-muted);
+        font-size: 12px;
+        margin-top: 32px;
         padding-top: 12px;
-        border-top: 1px solid #e3e3e3;
       }
     </style>
   </head>
   <body>
-    <h1><em>papio</em> provider access</h1>
-    <p class="lede">
-      Grant access per source. Access is only used to complete one explicitly requested download after
-      you have signed in yourself. Login, MFA, and CAPTCHAs always stay with you. Revoking returns the
-      source to assisted behaviour immediately.
-    </p>
-    <div id="provider-bulk" style="display: flex; gap: 8px; margin-bottom: 4px">
-      <button id="grant-all" type="button">Grant all providers</button>
-      <button id="revoke-all" type="button">Revoke all</button>
-    </div>
-    <ul id="sources"></ul>
+    <h1 class="brand">
+      <svg viewBox="0 0 512 512" aria-hidden="true">
+        <path d="M 95.0 374.6 A 200 200 0 1 1 243.7 455.6" fill="none" stroke="var(--color-brand-ink)" stroke-width="46" stroke-linecap="round"/>
+        <g transform="translate(264 244) skewX(-10)">
+          <circle cx="0" cy="0" r="68" fill="none" stroke="var(--color-brand-accent)" stroke-width="42"/>
+        </g>
+        <path d="M 208.0 176.0 L 163.2 430.0" fill="none" stroke="var(--color-brand-accent)" stroke-width="42" stroke-linecap="round"/>
+        <path d="M 115.7 416.0 L 215.7 416.0 L 152.6 490.0 Z" fill="var(--color-brand-accent)" stroke="var(--color-brand-accent)" stroke-width="10" stroke-linejoin="round"/>
+      </svg>
+      <span class="brand-name"><em>papio</em> <span class="page-name">settings</span></span>
+    </h1>
 
-    <h1 style="margin-top: 28px">Library resolver access</h1>
-    <p class="lede">
-      Firefox asks you to grant this access at runtime; Chrome grants it when the extension is installed.
-      <em>papio</em> uses it to resolve your library's links when completing an explicitly requested download.
-    </p>
-    <ul id="library-resolvers"></ul>
-
-    <section id="configured-resolvers-section" hidden>
-      <h1 style="margin-top: 28px">Your library</h1>
+    <section>
+      <h2>Where <em>papio</em> opens tabs</h2>
       <p class="lede">
-        These resolver hosts come from your <em>papio</em> configuration and aren't covered by the generic
-        Ex Libris hosts above. Grant access so <em>papio</em> can follow your library's "full text" link
-        automatically instead of leaving it for you to click.
+        <em>papio</em> opens a browser tab to fetch each paper and only brings it forward when you are
+        needed (for example institutional sign-in). Choose where those handoff tabs live.
       </p>
-      <ul id="configured-resolvers"></ul>
+      <div class="card">
+        <div class="row" id="handoff-surface-row">
+          <div class="source-label">Handoff tab location</div>
+          <div class="seg" role="group" aria-label="Handoff tab location">
+            <button
+              id="handoff-tab-group"
+              type="button"
+              aria-pressed="false"
+              data-tip="Tabs live in a collapsed “papio” tab group in your current window."
+            >
+              Tab group
+            </button>
+            <button
+              id="handoff-work-window"
+              type="button"
+              aria-pressed="false"
+              data-tip="Tabs stay in a minimized background window, out of your way."
+            >
+              Background window
+            </button>
+            <button
+              id="handoff-in-window"
+              type="button"
+              aria-pressed="false"
+              data-tip="Tabs open as normal tabs in your current window."
+            >
+              Current window
+            </button>
+          </div>
+        </div>
+      </div>
     </section>
 
-    <h1 style="margin-top: 28px">Publisher terms &amp; conditions</h1>
-    <p class="lede">
-      Some publishers require accepting their terms &amp; conditions before a download. When enabled,
-      <em>papio</em> accepts these automatically on your behalf. This is a legal agreement to each publisher's
-      terms; leave it off to accept them yourself in the browser.
-    </p>
-    <div id="terms-consent-row" style="display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 0; border-top: 1px solid #e3e3e3">
-      <div>
-        <div class="source-label">Auto-accept publisher terms</div>
-        <div class="source-host" id="terms-consent-status">Ask on first download</div>
+    <section>
+      <h2>Publisher terms &amp; conditions</h2>
+      <p class="lede">
+        Some publishers require accepting their terms &amp; conditions before a download. When enabled,
+        <em>papio</em> accepts these automatically on your behalf. This is a legal agreement to each publisher's
+        terms; leave it off to accept them yourself in the browser.
+      </p>
+      <div class="card">
+        <div class="row" id="terms-consent-row">
+          <div>
+            <div class="source-label">Auto-accept publisher terms</div>
+            <div class="hint" id="terms-consent-hint" hidden>
+              Not set yet — <em>papio</em> asks on your first download.
+            </div>
+          </div>
+          <button
+            id="terms-consent-toggle"
+            class="switch"
+            type="button"
+            role="switch"
+            aria-checked="false"
+            aria-label="Auto-accept publisher terms"
+            disabled
+          ></button>
+        </div>
       </div>
-      <div style="display: flex; gap: 8px">
-        <button id="terms-consent-on" type="button">Enable</button>
-        <button id="terms-consent-off" type="button">Disable</button>
-      </div>
-    </div>
+    </section>
 
-    <h1 style="margin-top: 28px">Where <em>papio</em> opens tabs</h1>
-    <p class="lede">
-      <em>papio</em> opens a browser tab to fetch each paper and only brings it forward when you are
-      needed (for example institutional sign-in). Choose where those handoff tabs live.
-    </p>
-    <div id="handoff-surface-row" style="display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 0; border-top: 1px solid #e3e3e3">
-      <div>
-        <div class="source-label">Handoff tab location</div>
-        <div class="source-host" id="handoff-surface-status">Background window</div>
+    <section id="configured-resolvers-section" hidden>
+      <h2>Your library</h2>
+      <p class="lede">
+        These resolver hosts come from your <em>papio</em> configuration and aren't covered by the generic
+        Ex Libris hosts below. Grant access so <em>papio</em> can follow your library's "full text" link
+        automatically instead of leaving it for you to click.
+      </p>
+      <div class="card">
+        <ul id="configured-resolvers" class="rows"></ul>
       </div>
-      <div style="display: flex; gap: 8px">
-        <button id="handoff-tab-group" type="button">Tab group</button>
-        <button id="handoff-work-window" type="button">Background window</button>
-        <button id="handoff-in-window" type="button">Current window</button>
+    </section>
+
+    <section>
+      <h2>Library resolver access</h2>
+      <p class="lede">
+        Firefox asks you to grant this access at runtime; Chrome grants it when the extension is installed.
+        <em>papio</em> uses it to resolve your library's links when completing an explicitly requested download.
+      </p>
+      <div class="card">
+        <ul id="library-resolvers" class="rows"></ul>
       </div>
-    </div>
+    </section>
+
+    <section>
+      <h2>Provider access</h2>
+      <p class="lede">
+        Grant access per source. Access is only used to complete one explicitly requested download after
+        you have signed in yourself. Login, MFA, and CAPTCHAs always stay with you. Revoking returns the
+        source to assisted behaviour immediately.
+      </p>
+      <div class="card">
+        <div class="card-toolbar" id="provider-bulk">
+          <button id="grant-all" class="btn" type="button">Grant all providers</button>
+          <button id="revoke-all" class="btn" type="button">Revoke all</button>
+        </div>
+        <ul id="sources" class="rows"></ul>
+      </div>
+    </section>
+
     <footer id="daemon-footer"></footer>
     <script src="./options.js" type="module"></script>
   </body>

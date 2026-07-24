@@ -48,7 +48,7 @@ const { PROVIDER_SOURCES } = await import("../src/options");
 const sourceList = document.getElementById("sources") as HTMLUListElement;
 const providerOrigins = PROVIDER_SOURCES.map((source) => source.origin);
 
-test("renders a grant control for every registered adapter host", async () => {
+test("renders an ungranted switch for every registered adapter host", async () => {
   await Promise.resolve();
 
   for (const adapter of adapters) {
@@ -58,7 +58,9 @@ test("renders a grant control for every registered adapter host", async () => {
         item.textContent?.includes(origin),
       );
       expect(row).toBeDefined();
-      expect(row?.querySelector("button")?.textContent).toBe("Grant");
+      const toggle = row?.querySelector("button[role='switch']");
+      expect(toggle).toBeDefined();
+      expect(toggle?.getAttribute("aria-checked")).toBe("false");
     }
   }
 });
