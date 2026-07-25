@@ -368,16 +368,22 @@ new package replaces only the code.
   can mean 0.3.0 is live and 0.4.3 is an unpublished draft. The public listing
   page (`chromewebstore.google.com/detail/<item-id>`) shows the real live
   version.
-- **AMO's first listed approval is the slow one, and the public page 404s until
-  it lands** (looks "unlisted"; the dev hub's "Listed Version … Awaiting
-  Review" is the true state). `nativeMessaging` excludes papio from
-  auto-approval, so a human reviews it: expect days (observed: CWS same-day,
-  AMO first listing submitted 0.5.0 on 2026-07-22, approved 2026-07-25 — three
-  days). Fill the per-version **Notes to Reviewer** with companion-daemon
-  install/test instructions — reviewers cannot exercise papio without the
-  daemon and bounce the review with questions otherwise. That first approval
-  is now done: <https://addons.mozilla.org/firefox/addon/papio/> is public and
-  every later upload is a version update, so the install docs (README,
+- **AMO's first listed approval is the slow one — and only that one.** The
+  public page 404s until it lands (looks "unlisted"; the dev hub's "Listed
+  Version … Awaiting Review" is the true state). `nativeMessaging` excludes
+  papio from auto-approval *for a new listing*, so a human reviews it: AMO
+  first listing submitted 0.5.0 on 2026-07-22, approved 2026-07-25 — three
+  days. Fill that first submission's **Notes to Reviewer** with
+  companion-daemon install/test instructions; a reviewer cannot exercise
+  papio without the daemon and bounces the review with questions otherwise.
+  **Version updates are a different animal: they auto-approve in minutes**,
+  with no human in the loop and no reviewer note needed — 0.7.0 was submitted
+  and public within two minutes on 2026-07-25, *including* its new
+  `tabGroups` permission, so a permission change does not by itself force a
+  manual review. Do not budget days for an update or block on writing
+  reviewer notes for one. That first approval is now done:
+  <https://addons.mozilla.org/firefox/addon/papio/> is public and every later
+  upload is a version update, so the install docs (README,
   `docs/guide/getting-started.md`, `docs/concepts/browser-handoff.md`, and
   `papio init`'s printed hint) link the listing instead of `about:debugging`.
 - **The popup's daemon-update hint goes stale under decoupled cadences.** The
