@@ -53,16 +53,37 @@ func newSearchCommand(opt *options) *cobra.Command {
 				rows, truncated := agentjson.Capped(works, limit)
 				return opt.printPage("works", rows, truncated)
 			}
+			var anyConfident, anyTitleJudged bool
 			for _, discovered := range works {
-				if _, err := fmt.Fprintf(opt.out, "%d | %s | %s | %s | %s | %d citations%s\n",
+				if _, err := fmt.Fprintf(opt.out, "%d | %s | %s | %s | %s | %s | %d citations%s\n",
 					discovered.Work.Year,
 					firstAuthor(discovered.Work.Authors),
 					discovered.Work.Title,
 					emptyMarker(discovered.Work.DOI),
 					oaMarker(discovered.IsOA),
+					matchMarker(discovered.MatchKind),
 					discovered.CitedBy,
 					ownedSuffix(discovered.Owned),
 				); err != nil {
+					return err
+				}
+				switch {
+				case discovery.Confident(discovered.MatchKind):
+					anyConfident = true
+				case discovered.MatchKind != discovery.MatchUnscored:
+					anyTitleJudged = true
+				}
+			}
+			// A free-text query whose title got judged (at least one row scored
+			// beyond unscored) but never reached a confident kind is the L3 field
+			// report failure mode: the tool found rows and returned them without
+			// signaling that none of them look like the title asked for. A
+			// citation snowball or a short keyword query never sets
+			// anyTitleJudged (every row stays MatchUnscored), so this stays quiet
+			// for the searches where "no confident title" is not a meaningful
+			// statement.
+			if query != "" && !anyConfident && anyTitleJudged {
+				if _, err := fmt.Fprintf(opt.out, "no confident title match for %q — showing the closest results anyway\n", query); err != nil {
 					return err
 				}
 			}
@@ -113,6 +134,25 @@ func oaMarker(isOA bool) string {
 		return "OA"
 	}
 	return "—"
+}
+
+// matchMarker renders why a row ranked where it did. unscored (the default)
+// stays as quiet as emptyMarker's placeholder: keyword and citation-snowball
+// searches leave every row unscored, and a loud marker on every line of an
+// ordinary search would be noise. See discovery.Confident for the policy.
+func matchMarker(kind string) string {
+	switch kind {
+	case discovery.MatchExactTitle:
+		return "EXACT"
+	case discovery.MatchTitlePhrase:
+		return "PHRASE"
+	case discovery.MatchTitleTokens:
+		return "TOKENS"
+	case discovery.MatchWeak:
+		return "WEAK"
+	default:
+		return "—"
+	}
 }
 
 func newWorksOnly(works []discovery.DiscoveredWork) []discovery.DiscoveredWork {

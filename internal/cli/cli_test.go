@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 
@@ -18,6 +19,7 @@ import (
 	"papio/internal/daemon"
 	"papio/internal/discovery"
 	"papio/internal/ipc"
+	"papio/internal/work"
 )
 
 func TestNormalizeIdentifiersAcceptsCommonDOIAndArXivForms(t *testing.T) {
@@ -62,6 +64,120 @@ func TestSearchCommandAllowsSnowballWithoutQuery(t *testing.T) {
 	}
 	if got := command.Flags().Lookup("cited-by").Usage; !strings.Contains(got, "backward references") || !strings.Contains(got, "cited_by:") {
 		t.Fatalf("cited-by help = %q", got)
+	}
+}
+
+func TestSearchCommandRendersConfidentMatchMarker(t *testing.T) {
+	var out, errOut bytes.Buffer
+	root := NewInProcessRoot(&out, &errOut, config.Config{}, func(_ context.Context, method string, _ any, result any) error {
+		if method != "discovery.search" {
+			t.Fatalf("method = %q, want discovery.search", method)
+		}
+		*result.(*[]discovery.DiscoveredWork) = []discovery.DiscoveredWork{{
+			Work:       work.Work{Year: 2024, Authors: []string{"Ada Lovelace"}, Title: "Attention Is All You Need"},
+			CitedBy:    10,
+			MatchScore: 1,
+			MatchKind:  discovery.MatchExactTitle,
+		}}
+		return nil
+	})
+	root.SetArgs([]string{"search", "Attention Is All You Need"})
+	if err := root.ExecuteContext(context.Background()); err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	got := out.String()
+	if !strings.Contains(got, " | EXACT | ") {
+		t.Fatalf("output missing EXACT match marker: %q", got)
+	}
+	if strings.Contains(got, "no confident title match") {
+		t.Fatalf("banner printed despite a confident row: %q", got)
+	}
+}
+
+func TestSearchCommandPrintsNoConfidentMatchBanner(t *testing.T) {
+	var out, errOut bytes.Buffer
+	root := NewInProcessRoot(&out, &errOut, config.Config{}, func(_ context.Context, _ string, _ any, result any) error {
+		*result.(*[]discovery.DiscoveredWork) = []discovery.DiscoveredWork{
+			{Work: work.Work{Year: 2019, Title: "A Survey of Deep Learning Methods"}, MatchKind: discovery.MatchWeak},
+			{Work: work.Work{Year: 2020, Title: "Another Unrelated Review Paper"}, MatchKind: discovery.MatchWeak},
+		}
+		return nil
+	})
+	root.SetArgs([]string{"search", "Attention Is All You Need"})
+	if err := root.ExecuteContext(context.Background()); err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	got := out.String()
+	if !strings.Contains(got, " | WEAK | ") {
+		t.Fatalf("output missing WEAK match marker: %q", got)
+	}
+	want := `no confident title match for "Attention Is All You Need" — showing the closest results anyway` + "\n"
+	if !strings.HasSuffix(got, want) {
+		t.Fatalf("output = %q, want it to end with banner %q", got, want)
+	}
+}
+
+func TestSearchCommandCitationSnowballSuppressesBannerAndLoudMarkers(t *testing.T) {
+	var out, errOut bytes.Buffer
+	root := NewInProcessRoot(&out, &errOut, config.Config{}, func(_ context.Context, _ string, _ any, result any) error {
+		*result.(*[]discovery.DiscoveredWork) = []discovery.DiscoveredWork{
+			{Work: work.Work{Year: 2021, Title: "Some Citing Paper"}, MatchKind: discovery.MatchUnscored},
+		}
+		return nil
+	})
+	root.SetArgs([]string{"search", "--cites", "10.1000/seed"})
+	if err := root.ExecuteContext(context.Background()); err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	got := out.String()
+	if strings.Contains(got, "no confident title match") {
+		t.Fatalf("banner printed for a citation snowball with no query: %q", got)
+	}
+	if strings.Contains(got, "EXACT") || strings.Contains(got, "PHRASE") || strings.Contains(got, "TOKENS") || strings.Contains(got, "WEAK") {
+		t.Fatalf("loud match marker printed for an unscored row: %q", got)
+	}
+	if !strings.Contains(got, " | — | ") {
+		t.Fatalf("output missing quiet unscored marker: %q", got)
+	}
+}
+
+func TestSearchCommandJSONIncludesMatchFields(t *testing.T) {
+	var out, errOut bytes.Buffer
+	root := NewInProcessRoot(&out, &errOut, config.Config{}, func(_ context.Context, _ string, _ any, result any) error {
+		*result.(*[]discovery.DiscoveredWork) = []discovery.DiscoveredWork{
+			{Work: work.Work{Year: 2024, Title: "Attention Is All You Need"}, MatchScore: 1, MatchKind: discovery.MatchExactTitle},
+		}
+		return nil
+	})
+	root.SetArgs([]string{"--json", "search", "Attention Is All You Need"})
+	if err := root.ExecuteContext(context.Background()); err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	var page map[string]any
+	if err := json.Unmarshal(out.Bytes(), &page); err != nil {
+		t.Fatalf("decode JSON: %v (%q)", err, out.String())
+	}
+	keys := make([]string, 0, len(page))
+	for k := range page {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	if len(keys) != 2 || keys[0] != "truncated" || keys[1] != "works" {
+		t.Fatalf("page keys = %v, want exactly [truncated works]", keys)
+	}
+	rows, ok := page["works"].([]any)
+	if !ok || len(rows) != 1 {
+		t.Fatalf("works = %#v", page["works"])
+	}
+	row, ok := rows[0].(map[string]any)
+	if !ok {
+		t.Fatalf("row = %#v", rows[0])
+	}
+	if row["match_kind"] != discovery.MatchExactTitle {
+		t.Fatalf("match_kind = %v, want %q", row["match_kind"], discovery.MatchExactTitle)
+	}
+	if score, ok := row["match_score"].(float64); !ok || score != 1 {
+		t.Fatalf("match_score = %v", row["match_score"])
 	}
 }
 
