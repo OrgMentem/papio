@@ -43,7 +43,7 @@ func (m *Multi) Search(ctx context.Context, params SearchParams) ([]DiscoveredWo
 				if err != nil {
 					return nil, err
 				}
-				return mergeWorks([][]DiscoveredWork{withSource(works, source.Name())}, params.Limit), nil
+				return finalize([][]DiscoveredWork{withSource(works, source.Name())}, params), nil
 			}
 		}
 		return nil, fmt.Errorf("unknown discovery source %q", params.Source)
@@ -66,7 +66,7 @@ func (m *Multi) Search(ctx context.Context, params SearchParams) ([]DiscoveredWo
 	if len(results) == 0 {
 		return nil, errors.Join(failures...)
 	}
-	return mergeWorks(results, params.Limit), nil
+	return finalize(results, params), nil
 }
 
 func withSource(works []DiscoveredWork, name string) []DiscoveredWork {
@@ -84,7 +84,25 @@ func withSource(works []DiscoveredWork, name string) []DiscoveredWork {
 	return works
 }
 
-func mergeWorks(results [][]DiscoveredWork, limit int) []DiscoveredWork {
+// finalize turns per-backend results into the answer: dedupe, judge each title
+// against the query, promote confident matches, then cut to the limit.
+//
+// The order matters. Truncating during the merge — as this did before ranking
+// existed — discards rows the backend ranked low, which is exactly where a
+// buried title match sits. Scoring has to see everything that was fetched or it
+// cannot promote anything.
+func finalize(results [][]DiscoveredWork, params SearchParams) []DiscoveredWork {
+	merged := mergeWorks(results)
+	rank(merged, params.Query)
+	if params.Limit > 0 && len(merged) > params.Limit {
+		return merged[:params.Limit]
+	}
+	return merged
+}
+
+// mergeWorks concatenates backend results in preference order, keeping the first
+// copy of any work two backends both returned.
+func mergeWorks(results [][]DiscoveredWork) []DiscoveredWork {
 	capacity := 0
 	for _, works := range results {
 		capacity += len(works)
@@ -101,9 +119,6 @@ func mergeWorks(results [][]DiscoveredWork, limit int) []DiscoveredWork {
 				seen[key] = struct{}{}
 			}
 			merged = append(merged, discovered)
-			if limit > 0 && len(merged) >= limit {
-				return merged
-			}
 		}
 	}
 	return merged

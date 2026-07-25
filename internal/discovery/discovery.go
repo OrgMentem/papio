@@ -71,6 +71,10 @@ func (params SearchParams) HasCitationSnowball() bool {
 
 // DiscoveredWork is the durable, acquisition-neutral description returned by
 // a discovery search. It intentionally contains no request credentials.
+//
+// MatchScore and MatchKind are always present, including as a zero and
+// MatchUnscored when no title judgement applied, so the shape never varies by
+// invocation.
 type DiscoveredWork struct {
 	Work         work.Work `json:"work"`
 	OpenAlexID   string    `json:"openalex_id"`
@@ -81,6 +85,11 @@ type DiscoveredWork struct {
 	Owned        bool      `json:"owned"`
 	OwnedItemKey string    `json:"owned_item_key,omitempty"`
 	Source       string    `json:"source,omitempty"`
+	// MatchScore is how well this work's title answers the query, 0..1.
+	MatchScore float64 `json:"match_score"`
+	// MatchKind explains the score: see the Match* constants. Confident
+	// reports which kinds mean the work is very likely the one asked for.
+	MatchKind string `json:"match_kind"`
 }
 
 // Client searches OpenAlex works.
