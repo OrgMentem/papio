@@ -10,7 +10,7 @@ deferred-work note stand as originally written; this ADR does not amend either
 
 The inbox, the toolbar badge, and the acquisition-history page all need to
 notice daemon-side change. Before this ADR every one of them polled: the badge
-on the extension's one-minute keepalive alarm, the inbox on an eight-second
+on the extension's one-minute keepalive alarm, the inbox on a ten-second
 visibility-gated counts request, the history page not at all.
 
 Three facts about the existing transport shaped the decision, all verified
@@ -177,7 +177,7 @@ discovered:
    the whole time. This was measured directly: setting the inbox's backstop
    poll to 60s (intending it as a pure backstop, since push was supposedly
    covering freshness) silently starved the worker between polls and dropped
-   effective freshness from a guaranteed 8s to a best-effort 60s. Push was
+   effective freshness from a guaranteed 10s to a best-effort 60s. Push was
    never a second, independent mechanism; it was a second mechanism riding on
    the first one's exhaust, for the price of a genuinely new failure mode.
 4. **The fingerprint obligation is a silent-failure tax.** "A fingerprint must

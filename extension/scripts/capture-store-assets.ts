@@ -92,6 +92,7 @@ const contentType = (path: string): string => {
 function startServer() {
   return Bun.serve({
     port: 0,
+    hostname: "127.0.0.1",
     async fetch(req) {
       const path = new URL(req.url).pathname.replace(/^\/+/, "");
       const file = Bun.file(join(distDir, path || "index.html"));

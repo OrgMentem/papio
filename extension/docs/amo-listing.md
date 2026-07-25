@@ -73,12 +73,17 @@ that manifest key is honored from Firefox 140, `web-ext lint` emits a benign
 | `nativeMessaging` | Required | The extension's only channel: it connects to the local `com.orgmentem.papio` daemon to receive a job and report the download result. There is no other network activity. |
 | `downloads` | Required | Performs the single, explicitly requested PDF download for each acquisition job. |
 | `tabs` / `activeTab` | Required | Opens and manages the one handoff tab for a job, and correlates the download with the job. |
+| `tabGroups` | Required | *(New in 0.7.0 — the first version requesting this permission.)* Firefox 139+ only capability: groups the handoff tab into a collapsed "papio" tab group in the user's own window, so a provider sign-in/download flow stays visually separate from their own tabs (mirrors the tab-group mode already shipped on Chrome in 0.6.0). Runtime-detected: on Firefox < 139 — including the 128.0 ESR line `strict_min_version` targets — the API is simply absent and handoffs silently fall back to the background work window instead. |
 | `scripting` | Required | Runs a small content routine on the provider page to locate the requested paper's download link (per-provider adapters). It reads only what is needed to find that one link. |
 | `storage` | Required | Stores extension settings and short-lived job/tab correlation state that must survive the MV3 event page being suspended. |
 | `alarms` | Required | Schedules reconnect backoff to the local daemon without keeping the event page awake continuously. |
 | `host_permissions`: `*.alma.exlibrisgroup.com`, `*.primo.exlibrisgroup.com` | Required host access | The library discovery/resolver surfaces *papio* must read to route a job to the right licensed source. |
 | `optional_host_permissions`: jstor.org, proquest.com, ebsco, springer, sciencedirect, dl.acm.org, wiley, tandfonline, sagepub, psycnet.apa.org | Optional host access (runtime opt-in) | Publisher/provider sites where a licensed PDF may live. Firefox prompts for each domain only when a job actually needs it; none are granted at install. |
 | `optional_host_permissions`: `https://*/*` | Optional host access (runtime opt-in) | Some libraries run their OpenURL resolver on a custom domain (e.g. `onesearch.library.<uni>.edu.au`) outside the Ex Libris hosts above. This pattern is **never granted at install and never requested in bulk**: *papio* only ever calls `permissions.request` for the exact resolver origin the user configured in their local daemon (`[browser] openurl_base_url`), so the effective grant is that one host. It exists so any institution works without hard-coding its domain in the extension. |
+
+**Note to reviewer (0.7.0):** this is the first version to request `tabGroups`
+(see the row above); every other permission has already been reviewed and
+approved in a prior version.
 
 ## Reviewer notes and build instructions
 
