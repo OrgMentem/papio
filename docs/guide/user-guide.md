@@ -48,6 +48,18 @@ upper publication-year limit. Search output marks a result already found in the
 local zotio library as `[in library]`; JSON output exposes the same state as
 `owned` and, when available, `owned_item_key`.
 
+Search results lead with confident title matches: when a result's title
+clearly answers the query — an exact match, a phrase match, or most of the
+query's words — it moves to the front of the list, best match first. Every
+other result keeps the order the backend returned, since ranking by abstract,
+concepts, and citation graph is what a discovery backend does better than
+title comparison can. Each result reports how well it matched (`match_score`
+and `match_kind` in `--json` output), and text output says so plainly when
+nothing in the result set matched strongly, instead of returning the closest
+unrelated papers as if they were right. A query under three words is treated
+as a keyword search and left in the backend's own order, as is a
+citation-snowball search below.
+
 Use `--new-only` when you want the result set to omit library-owned works:
 
 ```sh

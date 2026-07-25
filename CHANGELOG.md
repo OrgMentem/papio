@@ -46,6 +46,21 @@ execution records in `notes/acquisition-stack-plan.md`.
   denied sessions.
 - `papio --version` now works alongside the existing `papio version`
   subcommand, printing identical output.
+- `papio search` no longer buries an exact-title match behind unrelated
+  higher-cited papers. Results are annotated with `match_score` (0..1) and
+  `match_kind` (`exact_title`, `title_phrase`, `title_tokens`, `weak`,
+  `unscored`) so it's clear why a row ranked where it did; confident title
+  matches are promoted to the front, best score first, and every other row
+  keeps the order the backend gave it — a discovery backend weighs the
+  abstract, concepts, and citation graph better than title comparison can on
+  a keyword search, so *papio* only refuses to bury an obvious title match,
+  never tries to out-rank the backend generally. Ranking now happens before
+  `--limit` is applied, so a match the backend ranked low can still surface.
+  A short-token query or a citation-snowball search (`--cites`/`--cited-by`/
+  `--related-to` with no query) is reported `unscored` and deliberately left
+  unreordered. The human-readable output now says so plainly when nothing in
+  the result set matched strongly, instead of silently returning the closest
+  unrelated papers.
 
 ## [0.11.0] - 2026-07-24
 
