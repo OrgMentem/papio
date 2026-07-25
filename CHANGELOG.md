@@ -22,8 +22,10 @@ execution records in `notes/acquisition-stack-plan.md`.
   The daemon answers a new `stats_request` frame with lifetime acquisition
   aggregates: works acquired, works failed, how many needed a human handoff,
   a breakdown by access route (open access / institutional / licensed API /
-  other), and a 12-week weekly series. Counts only — the daemon reports facts
-  and never a "time saved" figure. Read-only; no schema migration.
+  other), and a 12-week weekly series bucketed by when each work was actually
+  acquired rather than when its row was last touched. Counts only — the
+  daemon reports facts and never a "time saved" figure. Read-only; the one
+  schema change is an index, no table or column touched.
 - `papio doctor` now reports discovery backend health. A backend that failed
   during a recent search is surfaced as a warning naming the backend and the
   cause, so thin search results can be told apart from a broken backend; a
@@ -38,8 +40,9 @@ execution records in `notes/acquisition-stack-plan.md`.
   list`, `actions list`, `actions open`, `watch list`, and `watch digest` now
   return `{"<name>": [...], "truncated": bool}` envelopes — the same shape
   the MCP resources (`papio://jobs` and friends) already used — instead of a
-  bare top-level array. `truncated` reports whether the row cap or `--limit`
-  hid rows; an empty result is `[]`, never `null`. `jobs failures` was
+  bare top-level array. `truncated` means the page filled its row cap — the
+  default or a `--limit` bound — so more rows may exist; it is not proof that
+  they do. An empty result is `[]`, never `null`. `jobs failures` was
   already an object (`{"failures": [...], "since": ...}`), never a bare
   array; its breaking change is narrower — the `since` metadata key is no
   longer re-emitted in the `--json` output (the daemon reply still carries
@@ -81,6 +84,14 @@ execution records in `notes/acquisition-stack-plan.md`.
   unreordered. The human-readable output now says so plainly when nothing in
   the result set matched strongly, instead of silently returning the closest
   unrelated papers.
+- A failed inbox-counts or acquisition-stats query no longer disconnects the
+  browser extension. Both handlers returned a raw error, and the native host
+  treats any error out of a browser-bridge handler as a dead connection, so
+  one failed aggregate tore down page acquire, the triage inbox, and the
+  handoff flow along with it. They now answer with an ordinary error frame —
+  the extension already renders that as a muted "unavailable" state — and log
+  the cause for the operator. The stats query that was most likely to fail no
+  longer scans `human_actions` in full once per acquired work either.
 
 ## [0.11.0] - 2026-07-24
 

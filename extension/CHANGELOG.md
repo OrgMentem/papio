@@ -45,6 +45,11 @@ for the full pre-split extension history.
 - The inbox popup now closes after you click **Open inbox** on Firefox, instead
   of staying on "Opening inbox…". Chrome already dismissed the popup when the
   new tab took focus; Firefox does not, so it is now closed explicitly.
+- A daemon-side inbox or stats query that fails no longer disconnects the
+  extension. The daemon used to treat it as a dead connection and drop the
+  whole native-messaging session, taking page acquire, the triage inbox and
+  the handoff flow down with it; it now replies with an error the extension
+  renders as the muted "unavailable" state. Needs a daemon carrying the fix.
 
 ## [0.6.0] - 2026-07-24
 
