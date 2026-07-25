@@ -312,7 +312,15 @@ new package replaces only the code.
 - **AMO version numbers are unique across channels.** "Version X already exists"
   means it was uploaded before — even as an unlisted/self-distributed signed
   build — so bump the version and resubmit. Cross-store version skew (e.g. CWS
-  0.3.0, AMO 0.3.1) is fine; the listings are independent.
+  0.3.0, AMO 0.3.1) is fine; the listings are independent. `bun run
+  status:firefox` (`extension/scripts/amo-status.ts` → AMO v5
+  `/addons/addon/<guid>/versions/?filter=all_with_unlisted`) checks this before
+  a submission, and `submit-firefox.sh` preflights it and stops before building
+  on a duplicate. **The two stores block on different things**: AMO reviews per
+  *version*, so a version sitting in its queue does NOT stop a new upload —
+  only the reused version number does. CWS locks the whole *item* during
+  review. So `status:firefox` gates on the duplicate and merely reports the
+  queue; `status:chrome` gates on the open review.
 - **CWS locks the item while a submission is in review, and the error wording
   varies.** A second *upload* fails with "You may not edit or publish an item
   that is in review"; a *publish* attempted against a review-locked item can

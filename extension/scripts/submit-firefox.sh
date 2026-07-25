@@ -15,6 +15,11 @@
 # (an AMO requirement for processed sources). See docs/amo-listing.md for the
 # listing text and reviewer build instructions.
 #
+# A version number AMO has already seen — on either channel, listed or
+# unlisted — is rejected outright, so this script asks scripts/amo-status.ts
+# first and stops before building; run `bun run status:firefox` any time to see
+# the listing's versions and what is still in AMO's review queue.
+#
 # AMO API credentials come from extension/.env:
 #   WEB_EXT_API_KEY     JWT issuer   (addons.mozilla.org -> Manage API Keys)
 #   WEB_EXT_API_SECRET  JWT secret
@@ -44,6 +49,26 @@ if [[ -z "${WEB_EXT_API_KEY:-}" || -z "${WEB_EXT_API_SECRET:-}" ]]; then
   echo "       generate a key at https://addons.mozilla.org/developers/addon/api/key/" >&2
   exit 1
 fi
+
+# Preflight: AMO rejects a version number that was ever uploaded on either
+# channel, and web-ext only discovers that after building, packaging the
+# reviewer source archive, and signing. Ask AMO first.
+echo "==> checking AMO listing status"
+set +e
+bun run "$SCRIPT_DIR/amo-status.ts" --gate
+status_exit=$?
+set -e
+case $status_exit in
+  0) ;;
+  3)
+    echo "error: this version already exists on AMO; bump the version and re-run" >&2
+    exit 1
+    ;;
+  *)
+    echo "error: could not read the AMO listing status (exit $status_exit)" >&2
+    exit 1
+    ;;
+esac
 
 VERSION=$(python3 -c "import json; print(json.load(open('manifest.json'))['version'])")
 

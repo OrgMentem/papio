@@ -15,7 +15,8 @@
     "lint:firefox": "bun run build && web-ext lint --source-dir=firefox",
     "submit:firefox": "scripts/submit-firefox.sh",
     "submit:chrome": "scripts/submit-chrome.sh",
-    "status:chrome": "bun run scripts/cws-status.ts"
+    "status:chrome": "bun run scripts/cws-status.ts",
+    "status:firefox": "bun run scripts/amo-status.ts"
   },
   "devDependencies": {
     "@types/bun": "^1.3.14",

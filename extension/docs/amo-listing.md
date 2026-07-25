@@ -119,9 +119,13 @@ action — it has no standalone behavior to test.
 The listing exists and is approved, so every later run is a version update.
 
 1. `bun run lint:firefox` — web-ext lint the built `firefox/` with no errors.
-2. Confirm `extension/manifest.json` version is the intended release version
-   and has never been uploaded to AMO before — AMO rejects a duplicate version
-   number across every channel, listed or unlisted.
+2. `bun run status:firefox` — prints the listing's latest listed version and
+   state, anything still in AMO's review queue, and whether the manifest
+   version is already taken. AMO rejects a duplicate version number across
+   every channel, listed or unlisted, so this is the check that matters; a
+   version awaiting review does not block a new upload (AMO reviews per
+   version). `submit:firefox` runs it as a preflight and stops before building
+   on a duplicate.
 3. `bun run submit:firefox listed` — signs and submits the new version for
    review. `amo-metadata.json` supplies `version.license` (`MIT`) and
    `categories` (`["other"]`). The script passes `--approval-timeout=0`, so it
