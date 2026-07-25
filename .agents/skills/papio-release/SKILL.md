@@ -313,11 +313,31 @@ new package replaces only the code.
   means it was uploaded before — even as an unlisted/self-distributed signed
   build — so bump the version and resubmit. Cross-store version skew (e.g. CWS
   0.3.0, AMO 0.3.1) is fine; the listings are independent.
-- **CWS locks the item while a submission is in review** — every upload fails
-  with "You may not edit or publish an item that is in review". An `ext-v*` tag
-  pushed during a pending CWS review fails at the Chrome step (build and AMO
-  are unaffected); wait for review to clear, then `gh run rerun <id>` or
-  re-dispatch. Don't stack extension releases while one is in review.
+- **CWS locks the item while a submission is in review, and the error wording
+  varies.** A second *upload* fails with "You may not edit or publish an item
+  that is in review"; a *publish* attempted against a review-locked item can
+  instead come back as the generic "Your submission does not meet the
+  requirements to be published in the store" — which reads like a listing
+  defect and is not one. Observed 2026-07-24: run `30067523675` uploaded
+  `papio-chrome-0.6.0.zip` fine, then `--publish` died with that message,
+  because CI had published 0.5.1 for review ~12h earlier. **CI can now see
+  this coming**: `submit-chrome.sh` preflights `bun run status:chrome`
+  (`extension/scripts/cws-status.ts` → v2 `publishers.items.fetchStatus`) and
+  aborts before building when `submittedItemRevisionStatus.state` is
+  `PENDING_REVIEW`, naming the lock instead of failing at the publish call.
+  Run `status:chrome` yourself before tagging: it prints the live version and
+  state, the submitted version and state (`PENDING_REVIEW` locked, `STAGED`
+  approved-awaiting-publish, `REJECTED`), and any takedown/warning. It needs
+  `CWS_PUBLISHER_ID`; the v1 fallback path has no equivalent endpoint. Wait
+  for review to clear, then `gh run rerun <id>` or re-dispatch. Don't stack
+  extension releases while one is in review.
+- **A failed `--publish` after a successful upload still leaves a good draft.**
+  `submit-chrome.sh` is two API calls; the job goes red on the second one, but
+  the uploaded package is already the item's draft. Do **not** re-upload to
+  "fix" it — click **Submit for review** in the dashboard once the previous
+  review clears (that is how 0.6.0 went live on 2026-07-25 after CI's publish
+  step failed the day before). Check the public listing page before assuming a
+  red run means nothing shipped.
 - **The CWS Items row conflates draft and live.** It shows the *item* status
   beside the *latest uploaded* version — "Published - public" + "Version 0.4.3"
   can mean 0.3.0 is live and 0.4.3 is an unpublished draft. The public listing
@@ -327,9 +347,14 @@ new package replaces only the code.
   it lands** (looks "unlisted"; the dev hub's "Listed Version … Awaiting
   Review" is the true state). `nativeMessaging` excludes papio from
   auto-approval, so a human reviews it: expect days (observed: CWS same-day,
-  AMO multi-day). Fill the per-version **Notes to Reviewer** with
-  companion-daemon install/test instructions — reviewers cannot exercise papio
-  without the daemon and bounce the review with questions otherwise.
+  AMO first listing submitted 0.5.0 on 2026-07-22, approved 2026-07-25 — three
+  days). Fill the per-version **Notes to Reviewer** with companion-daemon
+  install/test instructions — reviewers cannot exercise papio without the
+  daemon and bounce the review with questions otherwise. That first approval
+  is now done: <https://addons.mozilla.org/firefox/addon/papio/> is public and
+  every later upload is a version update, so the install docs (README,
+  `docs/guide/getting-started.md`, `docs/concepts/browser-handoff.md`, and
+  `papio init`'s printed hint) link the listing instead of `about:debugging`.
 - **The popup's daemon-update hint goes stale under decoupled cadences.** The
   extension compares the daemon's reported version against
   `__PAPIO_DAEMON_VERSION__` stamped at extension *build* time — daemon

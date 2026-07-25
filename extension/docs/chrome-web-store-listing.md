@@ -59,6 +59,7 @@ Docs: https://orgmentem.github.io/papio/
 | `nativeMessaging` | Sole communication channel: connects to the local `com.orgmentem.papio` daemon to receive a job and report the download result. |
 | `downloads` | Performs the single requested PDF download per acquisition job. |
 | `tabs` / `activeTab` | Opens and manages the one handoff tab and correlates the download with the job. |
+| `tabGroups` | Groups the handoff tab into a collapsed "papio" tab group in the user's own window, so a provider sign-in/download flow stays visually separate from their own tabs. |
 | `scripting` | Runs a small routine on the provider page to locate the requested paper's download link. |
 | `storage` | Stores extension settings and short-lived job/tab state across service-worker suspension. |
 | `alarms` | Schedules reconnect backoff to the local daemon without a persistently awake service worker. |
@@ -121,6 +122,17 @@ OAuth2 client and refresh token with the Chrome Web Store API enabled:
 3. Fill the listing with the name, description, category, screenshots, privacy
    practices, per-permission justifications, and privacy-policy URL above.
 4. Subsequent versions: `bun run submit:chrome` (uploads a draft) or
-   `bun run submit:chrome --publish` (uploads and submits for review).
-5. Wait for CWS review. Store-installed users auto-update once approved; never
-   gate the daemon release on store approval.
+   `bun run submit:chrome --publish` (uploads and submits for review). Both
+   preflight the item's review state and abort before building if a previous
+   submission is still under review — the Web Store locks the item and rejects
+   the publish with a misleading "does not meet the requirements to be
+   published" instead of naming the lock.
+5. `bun run status:chrome` answers "is a review open?" on its own, from the v2
+   `publishers.items.fetchStatus` endpoint: the live version and state, the
+   submitted version and state (`PENDING_REVIEW` = locked, `STAGED` = approved
+   and waiting to be published, `REJECTED`), and any policy takedown/warning.
+   It needs `CWS_PUBLISHER_ID`; the retiring v1 API has no equivalent.
+6. Wait for CWS review. Store-installed users auto-update once approved; never
+   gate the daemon release on store approval. A red submission run does not
+   mean nothing shipped — if the upload succeeded and only the publish failed,
+   the package is the item's draft and can be submitted from the dashboard.

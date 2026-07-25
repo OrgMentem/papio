@@ -12,6 +12,9 @@
 # hand in the Chrome Web Store Developer Dashboard (the API cannot create the
 # initial listing). After that, this script drives version updates. Chrome Web
 # Store review can take days; store-installed users auto-update once approved.
+# A submission is refused while a previous one is still in review, so this
+# script asks scripts/cws-status.ts first and stops before building; run
+# `bun run status:chrome` any time to see the item's live and submitted state.
 #
 # Credentials come from extension/.env (see docs/chrome-web-store-listing.md):
 #   CWS_CLIENT_ID       OAuth2 client id
@@ -70,6 +73,29 @@ else
   fi
   CLI_VERSION=3.5.0
   echo "warning: CWS_PUBLISHER_ID missing; using CWS API v1 fallback (retires 2026-10-15)" >&2
+fi
+
+# Preflight: a review-locked item refuses the upload/publish, and the API's
+# rejection message ("does not meet the requirements to be published") does not
+# say so. Ask fetchStatus first and stop before building anything. v2 only —
+# the v1 fallback above has no equivalent endpoint.
+if [[ -n "${CWS_PUBLISHER_ID:-}" ]]; then
+  echo "==> checking Chrome Web Store item status"
+  set +e
+  bun run "$SCRIPT_DIR/cws-status.ts" --gate
+  status_exit=$?
+  set -e
+  case $status_exit in
+    0) ;;
+    3)
+      echo "error: the Web Store item is in review; wait for it to clear, then re-run" >&2
+      exit 1
+      ;;
+    *)
+      echo "error: could not read the Web Store item status (exit $status_exit)" >&2
+      exit 1
+      ;;
+  esac
 fi
 echo "==> building extension (Chrome dist/ + Firefox firefox/)"
 bun run build

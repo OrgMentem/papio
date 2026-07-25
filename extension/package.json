@@ -14,7 +14,8 @@
     "capture:store": "bun run scripts/capture-store-assets.ts",
     "lint:firefox": "bun run build && web-ext lint --source-dir=firefox",
     "submit:firefox": "scripts/submit-firefox.sh",
-    "submit:chrome": "scripts/submit-chrome.sh"
+    "submit:chrome": "scripts/submit-chrome.sh",
+    "status:chrome": "bun run scripts/cws-status.ts"
   },
   "devDependencies": {
     "@types/bun": "^1.3.14",
