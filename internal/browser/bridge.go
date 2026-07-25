@@ -706,11 +706,11 @@ func triageCountsPayload(counts triage.Counts) protocol.TriageCounts {
 
 func (b *Bridge) triageCounts(ctx context.Context, request *protocol.TriageCountsRequestPayload) ([]json.RawMessage, error) {
 	if b.triage == nil {
-		return nil, errors.New("triage service is not configured")
+		return b.triageUnavailable(nil)
 	}
 	counts, err := b.triage.Counts(ctx)
 	if err != nil {
-		return nil, err
+		return b.triageUnavailable(err)
 	}
 	frame, err := b.frame(protocol.MsgTriageCountsResponse, "", protocol.TriageCountsResponsePayload{
 		RequestID: request.RequestID, Counts: triageCountsPayload(counts),
@@ -719,6 +719,35 @@ func (b *Bridge) triageCounts(ctx context.Context, request *protocol.TriageCount
 		return nil, err
 	}
 	return []json.RawMessage{frame}, nil
+}
+
+// unavailable reports a routine read-model failure (no triage service
+// configured, or the query failed) as an ordinary error frame instead of a
+// raw Go error. Neither TriageCountsResponsePayload nor StatsResponsePayload
+// has an outcome/detail field and neither may gain one: both protocol
+// decoders fail closed on unknown fields, so a new field on an existing
+// message breaks every already-shipped extension. This mirrors
+// sessionBusy/helloRequired/extensionOutdatedError instead. A raw Go error
+// here would reach the native host's fatal path (internal/nativehost/host.go
+// treats any browser.sync error as a dead connection), turning one failed
+// query into a disconnect that also kills page_acquire and the handoff flow.
+// The cause is logged rather than sent: the extension gets a stable code it
+// can render as "temporarily unavailable", the operator keeps the diagnosis.
+func (b *Bridge) unavailable(code, message, surface string, cause error) ([]json.RawMessage, error) {
+	if cause != nil {
+		log.Printf("papio: %s unavailable: %v", surface, cause)
+	} else {
+		log.Printf("papio: %s unavailable: no triage service configured", surface)
+	}
+	frame, err := b.frame(protocol.MsgError, "", protocol.ErrorPayload{Code: code, Message: message})
+	if err != nil {
+		return nil, err
+	}
+	return []json.RawMessage{frame}, nil
+}
+
+func (b *Bridge) triageUnavailable(cause error) ([]json.RawMessage, error) {
+	return b.unavailable("triage_unavailable", "the triage inbox is temporarily unavailable", "triage counts", cause)
 }
 
 func statsPayload(requestID string, generatedAt string, stats triage.Stats) protocol.StatsResponsePayload {
@@ -742,11 +771,11 @@ func statsPayload(requestID string, generatedAt string, stats triage.Stats) prot
 
 func (b *Bridge) stats(ctx context.Context, request *protocol.StatsRequestPayload) ([]json.RawMessage, error) {
 	if b.triage == nil {
-		return nil, errors.New("triage service is not configured")
+		return b.statsUnavailable(nil)
 	}
 	stats, err := b.triage.Stats(ctx)
 	if err != nil {
-		return nil, err
+		return b.statsUnavailable(err)
 	}
 	frame, err := b.frame(protocol.MsgStatsResponse, "",
 		statsPayload(request.RequestID, b.now().UTC().Format(time.RFC3339), stats))
@@ -754,6 +783,10 @@ func (b *Bridge) stats(ctx context.Context, request *protocol.StatsRequestPayloa
 		return nil, err
 	}
 	return []json.RawMessage{frame}, nil
+}
+
+func (b *Bridge) statsUnavailable(cause error) ([]json.RawMessage, error) {
+	return b.unavailable("stats_unavailable", "acquisition stats are temporarily unavailable", "acquisition stats", cause)
 }
 
 func (b *Bridge) triageDecide(ctx context.Context, request *protocol.TriageDecidePayload) ([]json.RawMessage, error) {

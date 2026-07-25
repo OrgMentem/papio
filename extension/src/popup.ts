@@ -264,9 +264,19 @@ export function wireInboxLauncher(
   });
 }
 
-/** The history page ships beside the popup under dist/ (see build.ts); the
- * background broker derives the same URL when authorizing stats senders. */
-export const HISTORY_PAGE_PATH = "dist/history.html";
+/**
+ * The history page ships as dist/history.html, beside the popup (see
+ * build.ts). Derived from the manifest's declared popup path — mirroring
+ * background.ts's own inboxRuntimeURLs derivation, which authorizes this
+ * same URL as a stats sender — rather than hardcoded, so a future page
+ * relocation cannot silently desync the two. Computed lazily (not at module
+ * load) since chrome.runtime is only available once a real popup document,
+ * or a test that mocks it, is in play.
+ */
+function historyPagePath(): string {
+  const declaredPopup = chrome.runtime.getManifest().action?.default_popup ?? "dist/popup.html";
+  return declaredPopup.replace(/[^/]*$/, "history.html");
+}
 
 /**
  * Fill the "Your papio impact" summary, or hide the whole section when stats
@@ -308,7 +318,7 @@ export function wireHistoryLauncher(doc: Document = document): void {
   if (!(button instanceof HTMLButtonElement) || button.dataset.wired) return;
   button.dataset.wired = "1";
   button.addEventListener("click", () => {
-    void chrome.tabs.create({ url: chrome.runtime.getURL(HISTORY_PAGE_PATH) }).then(() => {
+    void chrome.tabs.create({ url: chrome.runtime.getURL(historyPagePath()) }).then(() => {
       // Chrome dismisses the popup when the new tab takes focus; Firefox
       // keeps it open, so close it explicitly once the tab exists.
       window.close();

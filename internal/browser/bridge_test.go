@@ -368,6 +368,59 @@ func TestTriageCountsResponseEchoesRequestID(t *testing.T) {
 	}
 }
 
+// breakTriage rewires b's triage service onto an already-closed database, so
+// any Counts/Stats query it issues fails, without touching the healthy jobs
+// database that poll() and the rest of Sync depend on.
+func breakTriage(t *testing.T, b *Bridge) {
+	t.Helper()
+	brokenDB, err := store.Open(context.Background(), t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobs := &job.Store{S: brokenDB}
+	b.triage = triage.New(brokenDB, watch.NewStore(brokenDB), jobs)
+	if err := brokenDB.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A raw Go error from triageCounts would propagate through Sync into the
+// native host's fatal error path (internal/nativehost/host.go), tearing down
+// the whole native-messaging session over a routine, recoverable failure.
+func TestTriageCountsUnconfiguredReportsErrorFrameNotFatal(t *testing.T) {
+	b, _, _, _ := newBridge(t)
+	b.triage = nil
+	msgs, _ := runSync(t, b, hello(), inFrame(t, protocol.MsgTriageCountsRequest, "",
+		protocol.TriageCountsRequestPayload{RequestID: "request-count-002"}))
+	errFrame := firstOfType(msgs, protocol.MsgError)
+	if errFrame == nil {
+		t.Fatalf("no error frame for unconfigured triage service: %v", msgs)
+	}
+	if countType(msgs, protocol.MsgTriageCountsResponse) != 0 {
+		t.Fatalf("triage_counts_response emitted despite unconfigured triage service: %v", msgs)
+	}
+	if poll, _ := runSync(t, b); firstOfType(poll, protocol.MsgError) != nil {
+		t.Fatalf("session did not survive an unconfigured triage_counts_request: %v", poll)
+	}
+}
+
+func TestTriageCountsQueryFailureReportsErrorFrameNotFatal(t *testing.T) {
+	b, _, _, _ := newBridge(t)
+	breakTriage(t, b)
+	msgs, _ := runSync(t, b, hello(), inFrame(t, protocol.MsgTriageCountsRequest, "",
+		protocol.TriageCountsRequestPayload{RequestID: "request-count-003"}))
+	errFrame := firstOfType(msgs, protocol.MsgError)
+	if errFrame == nil {
+		t.Fatalf("no error frame for a failing triage counts query: %v", msgs)
+	}
+	if countType(msgs, protocol.MsgTriageCountsResponse) != 0 {
+		t.Fatalf("triage_counts_response emitted despite a failing query: %v", msgs)
+	}
+	if poll, _ := runSync(t, b); firstOfType(poll, protocol.MsgError) != nil {
+		t.Fatalf("session did not survive a failing triage_counts_request: %v", poll)
+	}
+}
+
 // statsAcquiredJob drives a fresh job to ready with an accepted candidate at
 // accessBasis, optionally passing through an awaiting_human handoff first —
 // the shape browser stats' HandoffsRequired counts.
@@ -471,6 +524,43 @@ func TestStatsResponseReflectsAcquisitionAggregates(t *testing.T) {
 	}
 	if total != 1 {
 		t.Fatalf("series total = %d, want 1", total)
+	}
+}
+
+// A raw Go error from stats would propagate through Sync into the native
+// host's fatal error path (internal/nativehost/host.go), tearing down the
+// whole native-messaging session over a routine, recoverable failure.
+func TestStatsUnconfiguredReportsErrorFrameNotFatal(t *testing.T) {
+	b, _, _, _ := newBridge(t)
+	b.triage = nil
+	msgs, _ := runSync(t, b, hello(), inFrame(t, protocol.MsgStatsRequest, "",
+		protocol.StatsRequestPayload{RequestID: "request-stats-002"}))
+	errFrame := firstOfType(msgs, protocol.MsgError)
+	if errFrame == nil {
+		t.Fatalf("no error frame for unconfigured triage service: %v", msgs)
+	}
+	if countType(msgs, protocol.MsgStatsResponse) != 0 {
+		t.Fatalf("stats_response emitted despite unconfigured triage service: %v", msgs)
+	}
+	if poll, _ := runSync(t, b); firstOfType(poll, protocol.MsgError) != nil {
+		t.Fatalf("session did not survive an unconfigured stats_request: %v", poll)
+	}
+}
+
+func TestStatsQueryFailureReportsErrorFrameNotFatal(t *testing.T) {
+	b, _, _, _ := newBridge(t)
+	breakTriage(t, b)
+	msgs, _ := runSync(t, b, hello(), inFrame(t, protocol.MsgStatsRequest, "",
+		protocol.StatsRequestPayload{RequestID: "request-stats-003"}))
+	errFrame := firstOfType(msgs, protocol.MsgError)
+	if errFrame == nil {
+		t.Fatalf("no error frame for a failing stats query: %v", msgs)
+	}
+	if countType(msgs, protocol.MsgStatsResponse) != 0 {
+		t.Fatalf("stats_response emitted despite a failing query: %v", msgs)
+	}
+	if poll, _ := runSync(t, b); firstOfType(poll, protocol.MsgError) != nil {
+		t.Fatalf("session did not survive a failing stats_request: %v", poll)
 	}
 }
 

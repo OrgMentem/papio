@@ -400,13 +400,34 @@ func acceptCandidate(t *testing.T, jobs *job.Store, jobID, urlKey, accessBasis s
 }
 
 // setJobUpdatedAt overrides a job's updated_at directly, since Transition
-// always stamps the real wall clock; Stats' weekly series needs a
-// deterministic terminal-transition time to assert against.
+// always stamps the real wall clock. Stats no longer buckets its weekly
+// series by this column (see setReadyTransitionAt below); this now exists
+// only to prove the series ignores it, by deliberately conflicting with the
+// same job's ready-transition time.
 func setJobUpdatedAt(t *testing.T, jobs *job.Store, jobID string, at time.Time) {
 	t.Helper()
 	if _, err := jobs.S.DB().ExecContext(context.Background(),
 		`UPDATE jobs SET updated_at = ? WHERE id = ?`, at.UTC().Format(time.RFC3339Nano), jobID); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// setReadyTransitionAt overrides the timestamp of a job's ready-transition
+// event — the timestamp Stats' weekly series buckets by — since Transition
+// always stamps the real wall clock and the series needs a deterministic
+// acquisition time to assert against.
+func setReadyTransitionAt(t *testing.T, jobs *job.Store, jobID string, at time.Time) {
+	t.Helper()
+	result, err := jobs.S.DB().ExecContext(context.Background(),
+		`UPDATE events SET at = ? WHERE job_id = ? AND kind = 'job.transition' AND json_extract(detail_json, '$.to') = 'ready'`,
+		at.UTC().Format(time.RFC3339Nano), jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := result.RowsAffected(); err != nil {
+		t.Fatal(err)
+	} else if changed != 1 {
+		t.Fatalf("setReadyTransitionAt %s: matched %d ready-transition events, want 1", jobID, changed)
 	}
 }
 
@@ -418,22 +439,27 @@ func TestStats(t *testing.T) {
 	// handoff before reaching ready.
 	handoffJob := createHandoffAcquiredJob(t, jobs, "stats-handoff")
 	acceptCandidate(t, jobs, handoffJob, "handoff-candidate", resolver.AccessOpen)
-	setJobUpdatedAt(t, jobs, handoffJob, time.Date(2026, 7, 20, 10, 0, 0, 0, time.UTC))
+	setReadyTransitionAt(t, jobs, handoffJob, time.Date(2026, 7, 20, 10, 0, 0, 0, time.UTC))
 
-	// Oldest-window-week acquired (imported) job: institutional candidate.
+	// Oldest-window-week acquired job that is imported much later: the
+	// series must bucket it by its ready transition, not by updated_at
+	// (which the later ready -> imported transition moves to the same week
+	// as handoffJob's ready transition — bucketing by updated_at would drop
+	// this job from series[0], and double-count series[11] instead).
 	importedJob := createStatsJob(t, jobs, "stats-imported", job.StateImported)
 	acceptCandidate(t, jobs, importedJob, "imported-candidate", resolver.AccessInstitutional)
-	setJobUpdatedAt(t, jobs, importedJob, time.Date(2026, 5, 4, 9, 0, 0, 0, time.UTC))
+	setReadyTransitionAt(t, jobs, importedJob, time.Date(2026, 5, 4, 9, 0, 0, 0, time.UTC))
+	setJobUpdatedAt(t, jobs, importedJob, time.Date(2026, 7, 20, 11, 0, 0, 0, time.UTC))
 
 	// Acquired job outside the 12-week series window: licensed-API candidate.
 	// Counts toward totals and access but must not land in any bucket.
 	outsideJob := createStatsJob(t, jobs, "stats-outside", job.StateReady)
 	acceptCandidate(t, jobs, outsideJob, "outside-candidate", resolver.AccessLicensedAPI)
-	setJobUpdatedAt(t, jobs, outsideJob, time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+	setReadyTransitionAt(t, jobs, outsideJob, time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
 
 	// Acquired job with no accepted candidate -> Other; mid-window week.
 	noCandidateJob := createStatsJob(t, jobs, "stats-no-candidate", job.StateReady)
-	setJobUpdatedAt(t, jobs, noCandidateJob, time.Date(2026, 6, 15, 0, 0, 0, 0, time.UTC))
+	setReadyTransitionAt(t, jobs, noCandidateJob, time.Date(2026, 6, 15, 0, 0, 0, 0, time.UTC))
 
 	createStatsJob(t, jobs, "stats-failed", job.StateFailed)
 	createStatsJob(t, jobs, "stats-unavailable", job.StateUnavailable)
@@ -459,12 +485,16 @@ func TestStats(t *testing.T) {
 	if len(stats.Series) != 12 {
 		t.Fatalf("series length = %d, want 12", len(stats.Series))
 	}
+	// importedJob lands here by its ready transition, not its later,
+	// conflicting updated_at.
 	if got, want := stats.Series[0], (StatsBucket{PeriodStart: time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC), Acquired: 1}); !got.PeriodStart.Equal(want.PeriodStart) || got.Acquired != want.Acquired {
 		t.Fatalf("series[0] = %+v, want %+v", got, want)
 	}
 	if got, want := stats.Series[6], (StatsBucket{PeriodStart: time.Date(2026, 6, 15, 0, 0, 0, 0, time.UTC), Acquired: 1}); !got.PeriodStart.Equal(want.PeriodStart) || got.Acquired != want.Acquired {
 		t.Fatalf("series[6] = %+v, want %+v", got, want)
 	}
+	// handoffJob's ready transition only: importedJob's conflicting
+	// updated_at in this same week must not also land here.
 	if got, want := stats.Series[11], (StatsBucket{PeriodStart: time.Date(2026, 7, 20, 0, 0, 0, 0, time.UTC), Acquired: 1}); !got.PeriodStart.Equal(want.PeriodStart) || got.Acquired != want.Acquired {
 		t.Fatalf("series[11] = %+v, want %+v", got, want)
 	}
@@ -474,5 +504,37 @@ func TestStats(t *testing.T) {
 	}
 	if total != 3 {
 		t.Fatalf("series total = %d, want 3 (outside-window job excluded)", total)
+	}
+}
+
+// TestStatsFallsBackToUpdatedAtWhenReadyEventIsMissing pins the deliberate
+// degrade for AGENTS.md's documented class of surprise: a long-running dev
+// papio.db can hold rows that predate a later behavior change. If a
+// ready/imported job's ready-transition event is missing (an old row from
+// before event logging covered that transition, not reachable through any
+// current code path), Stats must not fail outright and must not drop the
+// job from the series — it falls back to updated_at, the exact signal the
+// pre-fix query used for every row.
+func TestStatsFallsBackToUpdatedAtWhenReadyEventIsMissing(t *testing.T) {
+	service, _, jobs := triageTestService(t)
+	ctx := context.Background()
+
+	legacyJob := createStatsJob(t, jobs, "stats-legacy", job.StateReady)
+	if _, err := jobs.S.DB().ExecContext(ctx,
+		`DELETE FROM events WHERE job_id = ? AND kind = 'job.transition' AND json_extract(detail_json, '$.to') = 'ready'`,
+		legacyJob); err != nil {
+		t.Fatal(err)
+	}
+	setJobUpdatedAt(t, jobs, legacyJob, time.Date(2026, 6, 15, 0, 0, 0, 0, time.UTC))
+
+	stats, err := service.Stats(ctx)
+	if err != nil {
+		t.Fatalf("Stats must not fail for a job missing its ready-transition event: %v", err)
+	}
+	if stats.AcquiredTotal != 1 {
+		t.Fatalf("acquired_total = %d, want 1 (the legacy job must still count)", stats.AcquiredTotal)
+	}
+	if got, want := stats.Series[6], (StatsBucket{PeriodStart: time.Date(2026, 6, 15, 0, 0, 0, 0, time.UTC), Acquired: 1}); !got.PeriodStart.Equal(want.PeriodStart) || got.Acquired != want.Acquired {
+		t.Fatalf("series[6] = %+v, want %+v (falls back to updated_at)", got, want)
 	}
 }

@@ -10,13 +10,16 @@ import {
   collectPageMetadata,
   OPEN_INBOX_MESSAGE,
   openInbox,
+  refreshImpactSummary,
   renderDaemonStatus,
+  renderImpactSummary,
   renderPageAcquire,
   renderPageContext,
   renderResolverGrants,
   renderTermsConsent,
   wireCapture,
   wireDevTools,
+  wireHistoryLauncher,
   wireInboxLauncher,
   wirePrimaryShortcut,
   wireSettings,
@@ -264,6 +267,98 @@ test("falls back to a direct inbox tab when the broker does not answer", async (
   await dismissed;
   expect(created).toEqual([{ url: "dist/inbox.html" }]);
   // The popup dismisses itself once the inbox is open (Firefox keeps it open otherwise).
+  expect(closed).toBe(1);
+});
+
+test("renderImpactSummary fills the impact card with real values", () => {
+  const doc = popupDocument();
+  renderImpactSummary(doc, { acquired_total: 42, failed_total: 14 });
+
+  expect(doc.getElementById("impact-summary")?.hidden).toBe(false);
+  // 42 acquired x 20 min ~= 14 h; 42 of 56 finished jobs succeeded.
+  expect(doc.getElementById("impact-acquired")?.textContent).toBe("42");
+  expect(doc.getElementById("impact-time-saved")?.textContent).toBe("14 h");
+  expect(doc.getElementById("impact-success-rate")?.textContent).toBe("75%");
+});
+
+test("renderImpactSummary hides the impact card when stats are unavailable", () => {
+  const doc = popupDocument();
+  // Force it visible first so hiding it is a real assertion, not a no-op
+  // against popup.html's default hidden state.
+  (doc.getElementById("impact-summary") as HTMLElement).hidden = false;
+
+  renderImpactSummary(doc, null);
+
+  expect(doc.getElementById("impact-summary")?.hidden).toBe(true);
+});
+
+test("refreshImpactSummary populates the impact card from a daemon stats reply", async () => {
+  const doc = popupDocument();
+  Object.assign(globalThis, {
+    chrome: {
+      runtime: {
+        sendMessage: async () => ({
+          ok: true,
+          stats: {
+            generated_at: "2026-07-25T08:00:00Z",
+            acquired_total: 42,
+            failed_total: 14,
+            handoffs_required: 9,
+            access: { open_access: 18, institutional: 20, licensed_api: 3, other: 1 },
+            series: [],
+          },
+        }),
+      },
+    },
+  });
+
+  await refreshImpactSummary(doc);
+
+  expect(doc.getElementById("impact-summary")?.hidden).toBe(false);
+  expect(doc.getElementById("impact-acquired")?.textContent).toBe("42");
+  expect(doc.getElementById("impact-success-rate")?.textContent).toBe("75%");
+});
+
+test("refreshImpactSummary hides the impact card when the daemon cannot serve stats", async () => {
+  const doc = popupDocument();
+  (doc.getElementById("impact-summary") as HTMLElement).hidden = false;
+  Object.assign(globalThis, {
+    chrome: {
+      runtime: {
+        sendMessage: async () => ({ ok: false, error: { code: "timeout", message: "no reply" } }),
+      },
+    },
+  });
+
+  await refreshImpactSummary(doc);
+
+  expect(doc.getElementById("impact-summary")?.hidden).toBe(true);
+});
+
+test("history launcher opens the manifest-derived history page and closes the popup", async () => {
+  const doc = popupDocument();
+  const created: unknown[] = [];
+  let closed = 0;
+  const { promise: dismissed, resolve: onClose } = Promise.withResolvers<void>();
+  Object.assign(globalThis, {
+    chrome: {
+      runtime: {
+        // A relocated popup page (not the dist/popup.html default) proves the
+        // history URL is derived from the manifest and not a hardcoded
+        // sibling literal: pre-fix code always opened "dist/history.html"
+        // regardless of where the manifest actually declares the popup.
+        getManifest: () => ({ action: { default_popup: "dist/ui/popup.html" } }),
+        getURL: (path: string) => path,
+      },
+      tabs: { create: async (options: unknown) => { created.push(options); } },
+    },
+    window: { close: () => { closed += 1; onClose(); } },
+  });
+  wireHistoryLauncher(doc);
+
+  (doc.getElementById("view-history-btn") as HTMLButtonElement).click();
+  await dismissed;
+  expect(created).toEqual([{ url: "dist/ui/history.html" }]);
   expect(closed).toBe(1);
 });
 

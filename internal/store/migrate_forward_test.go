@@ -32,6 +32,9 @@ func TestOpenRollsForwardSchemaThirteenTagLedger(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := raw.ExecContext(ctx, schemaV1); err != nil {
+		t.Fatalf("apply schema v1: %v", err)
+	}
 	if _, err := raw.ExecContext(ctx, schemaV13); err != nil {
 		t.Fatalf("apply schema v13: %v", err)
 	}
@@ -52,8 +55,8 @@ func TestOpenRollsForwardSchemaThirteenTagLedger(t *testing.T) {
 	}
 	defer migrated.Close()
 	version, err := migrated.UserVersion(ctx)
-	if err != nil || version != 14 {
-		t.Fatalf("user_version = %d, %v; want 14", version, err)
+	if err != nil || version != 15 {
+		t.Fatalf("user_version = %d, %v; want 15", version, err)
 	}
 	var status string
 	if err := migrated.DB().QueryRowContext(ctx,
@@ -117,8 +120,8 @@ func TestOpenRollsForwardSchemaOneWithoutLosingDurableRows(t *testing.T) {
 	}
 	defer migrated.Close()
 	version, err := migrated.UserVersion(ctx)
-	if err != nil || version != 14 {
-		t.Fatalf("user_version = %d, %v; want 14", version, err)
+	if err != nil || version != 15 {
+		t.Fatalf("user_version = %d, %v; want 15", version, err)
 	}
 
 	var jobs, actions, exports int

@@ -376,8 +376,33 @@ func (s *Service) Stats(ctx context.Context) (Stats, error) {
 	seriesStart := weeks[0]
 	seriesEnd := weeks[len(weeks)-1].AddDate(0, 0, 7)
 
+	// Acquired jobs are bucketed by the timestamp of their ready transition
+	// (recorded in the events table), not jobs.updated_at: reaching ready is
+	// the acquisition itself, while updated_at is overwritten again by the
+	// separate, manually-triggered ready -> imported transition (`papio
+	// zotio apply`, internal/zotio/plan.go's markImported), which can land
+	// weeks after the paper was actually acquired and would otherwise move
+	// an old acquisition into a recent bucket. Every transition logs exactly
+	// one job.transition event carrying its target state in
+	// detail_json->>'to' (job.go's transition() unconditionally sets
+	// detail["to"] before marshaling, for every route into a state); ORDER
+	// BY seq (events_by_job is keyed (job_id, seq), so this is an index seek,
+	// not a sort) picks the FIRST such event, so even a hypothetical future
+	// edge that re-enters ready still resolves to the original acquisition
+	// moment rather than an arbitrary matching row. AGENTS.md documents that
+	// a long-running dev papio.db can hold rows that predate a later
+	// behavior change (job.WithHumanActionBinding is the known precedent);
+	// a ready/imported job whose event log predates this convention and so
+	// has no matching row falls back to updated_at, the exact pre-fix
+	// signal, rather than failing the whole query over one legacy row.
 	rows, err := tx.QueryContext(ctx, `
-		SELECT j.updated_at,
+		SELECT COALESCE(
+		         (SELECT e.at FROM events e
+		            WHERE e.job_id = j.id AND e.kind = 'job.transition'
+		              AND json_extract(e.detail_json, '$.to') = 'ready'
+		            ORDER BY e.seq LIMIT 1),
+		         j.updated_at
+		       ),
 		       (SELECT c.access_basis FROM candidates c
 		          WHERE c.job_id = j.id AND c.status = 'accepted' LIMIT 1),
 		       EXISTS(SELECT 1 FROM human_actions ha WHERE ha.job_id = j.id)
@@ -388,10 +413,10 @@ func (s *Service) Stats(ctx context.Context) (Stats, error) {
 	}
 	defer func() { _ = rows.Close() }()
 	for rows.Next() {
-		var updatedAtRaw string
+		var acquiredAtRaw string
 		var accessBasis sql.NullString
 		var handoff int
-		if err := rows.Scan(&updatedAtRaw, &accessBasis, &handoff); err != nil {
+		if err := rows.Scan(&acquiredAtRaw, &accessBasis, &handoff); err != nil {
 			return Stats{}, err
 		}
 		stats.AcquiredTotal++
@@ -408,14 +433,14 @@ func (s *Service) Stats(ctx context.Context) (Stats, error) {
 		default:
 			stats.Access.Other++
 		}
-		updatedAt, err := time.Parse(time.RFC3339Nano, updatedAtRaw)
+		acquiredAt, err := time.Parse(time.RFC3339Nano, acquiredAtRaw)
 		if err != nil {
 			return Stats{}, err
 		}
-		if updatedAt.Before(seriesStart) || !updatedAt.Before(seriesEnd) {
+		if acquiredAt.Before(seriesStart) || !acquiredAt.Before(seriesEnd) {
 			continue
 		}
-		buckets[weekStart(updatedAt).Unix()]++
+		buckets[weekStart(acquiredAt).Unix()]++
 	}
 	if err := rows.Err(); err != nil {
 		return Stats{}, err
