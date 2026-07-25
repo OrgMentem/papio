@@ -5,6 +5,10 @@ ADR-0002 (quarantined-PDF preview), resolved within the same build.
 Review: GPT-5 Pro design review via oracle, 2026-07-21 (verdict:
 accept-with-changes; all amendments below adopted). Key factual claims were
 verified against the codebase before acceptance.
+A subscription mechanism for live daemon push — the item this ADR defers below
+under *Background broker obligations* — was evaluated in ADR-0005 and
+rejected; the *solicited only* rule and the deferred-work note both stand
+unamended.
 
 ## Context
 
