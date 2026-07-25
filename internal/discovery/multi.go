@@ -7,20 +7,31 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
+	"time"
 
 	"papio/internal/work"
 )
 
 // Multi searches its sources in preference order and merges their results.
+//
+// It is the daemon's long-lived discovery source, so it is also the natural
+// owner of per-backend health: failures observed during a search are retained
+// here for diagnostics rather than discarded.
 type Multi struct {
 	sources []Source
+
+	mu       sync.Mutex
+	failures map[string]BackendFailure
+	// now is injectable so failure timestamps are deterministic under test.
+	now func() time.Time
 }
 
 // NewMulti returns a Source that fans a search across backends in preference
 // order and merges results. With no explicit source parameter, the supplied
 // sources are searched in their given order.
 func NewMulti(sources ...Source) *Multi {
-	return &Multi{sources: sources}
+	return &Multi{sources: sources, failures: make(map[string]BackendFailure, len(sources))}
 }
 
 // Name identifies the composed backend.
@@ -28,12 +39,26 @@ func (m *Multi) Name() string {
 	return "multi"
 }
 
-// Search queries selected backends sequentially so each backend remains
-// independently bounded. A usable backend result is returned even when another
-// configured source is unavailable.
+// Search satisfies Source. It reports usable results and hard failures only;
+// callers wanting to know that a backend broke while another answered use
+// SearchPartial.
 func (m *Multi) Search(ctx context.Context, params SearchParams) ([]DiscoveredWork, error) {
+	works, _, err := m.SearchPartial(ctx, params)
+	return works, err
+}
+
+// SearchPartial queries selected backends sequentially so each remains
+// independently bounded, and returns any usable result together with the
+// failures of the backends that did not answer.
+//
+// Those failures used to be discarded whenever at least one backend succeeded,
+// which made a broken backend invisible: results looked merely thin. They are
+// returned here for the caller to report, and retained on the Multi for
+// diagnostics. A backend that answers successfully has its retained failure
+// cleared, so a transient outage does not linger.
+func (m *Multi) SearchPartial(ctx context.Context, params SearchParams) ([]DiscoveredWork, []BackendFailure, error) {
 	if m == nil || len(m.sources) == 0 {
-		return nil, errors.New("discovery: no discovery sources are configured")
+		return nil, nil, errors.New("discovery: no discovery sources are configured")
 	}
 	params = normalizeParams(params)
 	if params.Source != "" {
@@ -41,32 +66,38 @@ func (m *Multi) Search(ctx context.Context, params SearchParams) ([]DiscoveredWo
 			if source != nil && source.Name() == params.Source {
 				works, err := source.Search(ctx, params)
 				if err != nil {
-					return nil, err
+					// An explicitly named source failing is a hard error, but it
+					// is still a backend failure worth remembering.
+					return nil, []BackendFailure{m.recordFailure(source.Name(), err)}, err
 				}
-				return finalize([][]DiscoveredWork{withSource(works, source.Name())}, params), nil
+				m.clearFailure(source.Name())
+				return finalize([][]DiscoveredWork{withSource(works, source.Name())}, params), nil, nil
 			}
 		}
-		return nil, fmt.Errorf("unknown discovery source %q", params.Source)
+		return nil, nil, fmt.Errorf("unknown discovery source %q", params.Source)
 	}
 
 	results := make([][]DiscoveredWork, 0, len(m.sources))
-	failures := make([]error, 0, len(m.sources))
+	failures := make([]BackendFailure, 0, len(m.sources))
+	hard := make([]error, 0, len(m.sources))
 	for _, source := range m.sources {
 		if source == nil {
-			failures = append(failures, errors.New("discovery: configured source is nil"))
+			hard = append(hard, errors.New("discovery: configured source is nil"))
 			continue
 		}
 		works, err := source.Search(ctx, params)
 		if err != nil {
-			failures = append(failures, fmt.Errorf("%s: %w", source.Name(), err))
+			failures = append(failures, m.recordFailure(source.Name(), err))
+			hard = append(hard, fmt.Errorf("%s: %w", source.Name(), err))
 			continue
 		}
+		m.clearFailure(source.Name())
 		results = append(results, withSource(works, source.Name()))
 	}
 	if len(results) == 0 {
-		return nil, errors.Join(failures...)
+		return nil, failures, errors.Join(hard...)
 	}
-	return finalize(results, params), nil
+	return finalize(results, params), failures, nil
 }
 
 func withSource(works []DiscoveredWork, name string) []DiscoveredWork {

@@ -759,9 +759,18 @@ func searchDiscovery(ctx context.Context, raw json.RawMessage, system *bootstrap
 	if system == nil || system.Discovery == nil {
 		return nil, &ipc.RPCError{Code: "precondition_failed", Message: "discovery is not configured"}
 	}
-	works, err := system.Discovery.Search(ctx, params)
+	works, partial, err := searchWithPartialFailures(ctx, system.Discovery, params)
 	if err != nil {
-		return nil, &ipc.RPCError{Code: "precondition_failed", Message: safeMessage(err, "discovery search failed")}
+		// safeMessage bounds length but does not redact: a transport failure's
+		// text embeds the request URL, carrying the contact email and any API
+		// key, so the backend error is sanitized before it reaches the caller.
+		return nil, &ipc.RPCError{Code: "precondition_failed", Message: safeMessage(errors.New(discovery.SanitizeError(err)), "discovery search failed")}
+	}
+	// A backend that broke while another answered used to vanish here, leaving a
+	// user unable to tell a dead backend from an unindexed work. The messages are
+	// already sanitized by discovery; papio doctor reports the same state.
+	for _, failure := range partial {
+		log.Printf("warning: discovery backend %s failed: %s", failure.Source, failure.Message)
 	}
 	var lookup discovery.OwnershipLookup
 	if system.Zotio != nil {
@@ -771,6 +780,18 @@ func searchDiscovery(ctx context.Context, raw json.RawMessage, system *bootstrap
 		log.Printf("warning: %s", warning)
 	}
 	return marshal(works)
+}
+
+// searchWithPartialFailures prefers the partial-aware search when the configured
+// discovery source supports it, so a backend that failed alongside a successful
+// one can still be reported. A source that does not (a single backend, or a test
+// double) keeps the plain path.
+func searchWithPartialFailures(ctx context.Context, source discovery.Source, params discovery.SearchParams) ([]discovery.DiscoveredWork, []discovery.BackendFailure, error) {
+	if partial, ok := source.(discovery.PartialSearcher); ok {
+		return partial.SearchPartial(ctx, params)
+	}
+	works, err := source.Search(ctx, params)
+	return works, nil, err
 }
 
 func marshal(value any) ([]byte, *ipc.RPCError) {
