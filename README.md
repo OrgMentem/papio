@@ -22,6 +22,14 @@
     src="https://github.com/OrgMentem/papio/actions/workflows/docs.yml/badge.svg"
     alt="Docs"
   /></a>
+  <a href="https://chromewebstore.google.com/detail/papio/npccengdhjmpojpjmjoeeclpdhcjelhf"><img
+    src="https://img.shields.io/chrome-web-store/v/npccengdhjmpojpjmjoeeclpdhcjelhf?logo=googlechrome&logoColor=white&label=chrome"
+    alt="Chrome Web Store version"
+  /></a>
+  <a href="https://addons.mozilla.org/firefox/addon/papio/"><img
+    src="https://img.shields.io/amo/v/papio?logo=firefoxbrowser&logoColor=white&label=firefox"
+    alt="Firefox Add-ons version"
+  /></a>
   <a href="https://go.dev/"><img
     src="https://img.shields.io/badge/Go-1.26-00ADD8?logo=go&logoColor=white"
     alt="Go 1.26"
