@@ -25,6 +25,17 @@ execution records in `notes/acquisition-stack-plan.md`.
   other), and a 12-week weekly series. Counts only — the daemon reports facts
   and never a "time saved" figure. Read-only; no schema migration.
 
+### Changed
+
+- **BREAKING for anyone parsing `--json` as a bare array:** `search`, `jobs
+  list`, `jobs failures`, `actions list`, `actions open`, `watch list`, and
+  `watch digest` now return `{"<name>": [...], "truncated": bool}` envelopes
+  — the same shape the MCP resources (`papio://jobs` and friends) already
+  used — instead of a bare top-level array. `truncated` reports whether the
+  row cap or `--limit` hid rows; an empty result is `[]`, never `null`.
+  Commands returning a single structured record (`jobs get`, `doctor`,
+  `status`, `report`, `zotio plan`, `inbox list`) are unchanged.
+
 ### Fixed
 
 - `papio daemon status`, `papio browser sessions`, and `papio browser use` no
@@ -33,6 +44,8 @@ execution records in `notes/acquisition-stack-plan.md`.
   browser-session-arbitration fields (added to the daemon in 0.8.0), so the
   strict version-check pre-hook rejected any ping that reported waiting or
   denied sessions.
+- `papio --version` now works alongside the existing `papio version`
+  subcommand, printing identical output.
 
 ## [0.11.0] - 2026-07-24
 

@@ -71,6 +71,8 @@ func renderCommands(root *cobra.Command) []byte {
 	b.WriteString("# Command reference\n\n")
 	b.WriteString("Every `papio` command, generated directly from the binary. Pass `--json` to any command for structured output; see the [user guide](../guide/user-guide.md) for the operational workflow and the [configuration reference](config-reference.md) for policy.\n\n")
 
+	writeJSONContract(&b)
+
 	if gf := flagRows(root.PersistentFlags()); len(gf) > 0 {
 		b.WriteString("## Global flags\n\n")
 		b.WriteString("These flags are available on every command.\n\n")
@@ -82,6 +84,17 @@ func renderCommands(root *cobra.Command) []byte {
 		writeCommand(&b, c, 2)
 	}
 	return b.Bytes()
+}
+
+// writeJSONContract documents the one machine-readable output shape shared by
+// every command's `--json` and the MCP resources (papio://jobs and friends);
+// see internal/agentjson for the Go-level contract this describes.
+func writeJSONContract(b *bytes.Buffer) {
+	b.WriteString("## JSON output contract\n\n")
+	b.WriteString("Every list-shaped `--json` payload is a JSON object with exactly two keys, rows first: a named array and `truncated` (bool) — never a bare top-level array. An empty result is `[]`, never `null`. `truncated: true` means the row cap or `--limit` hid rows; raise `--limit` or paginate to see the rest.\n\n")
+	b.WriteString("This is the same envelope the MCP resources (`papio://jobs` and friends) already return, so one parser handles both surfaces:\n\n")
+	b.WriteString("```json\n{\"jobs\": [...], \"truncated\": false}\n```\n\n")
+	b.WriteString("Commands that return a single structured record — `papio jobs get`, `papio doctor`, `papio status`, `papio report`, `papio zotio plan`, `papio inbox list` — return that object directly; they are not list envelopes and carry no `truncated` key.\n\n")
 }
 
 func writeCommand(b *bytes.Buffer, c *cobra.Command, level int) {

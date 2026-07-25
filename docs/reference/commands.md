@@ -3,6 +3,18 @@
 
 Every `papio` command, generated directly from the binary. Pass `--json` to any command for structured output; see the [user guide](../guide/user-guide.md) for the operational workflow and the [configuration reference](config-reference.md) for policy.
 
+## JSON output contract
+
+Every list-shaped `--json` payload is a JSON object with exactly two keys, rows first: a named array and `truncated` (bool) — never a bare top-level array. An empty result is `[]`, never `null`. `truncated: true` means the row cap or `--limit` hid rows; raise `--limit` or paginate to see the rest.
+
+This is the same envelope the MCP resources (`papio://jobs` and friends) already return, so one parser handles both surfaces:
+
+```json
+{"jobs": [...], "truncated": false}
+```
+
+Commands that return a single structured record — `papio jobs get`, `papio doctor`, `papio status`, `papio report`, `papio zotio plan`, `papio inbox list` — return that object directly; they are not list envelopes and carry no `truncated` key.
+
 ## Global flags
 
 These flags are available on every command.

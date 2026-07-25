@@ -91,6 +91,14 @@ Bump the pinned zensical version in `docs/requirements.txt` deliberately; CI ins
   Check row/job `created_at` and whether the schema/validation predates it before assuming a
   "shouldn't happen" state is a live bug.
 
+### CLI & MCP JSON output
+- **Machine-readable output has ONE contract.** `internal/agentjson`
+  (`Envelope`/`Truncate`/`Capped`) is shared by every CLI `--json` payload and the MCP
+  resources — a list-shaped result is always `{"<name>": [...], "truncated": bool}`, never a
+  bare array. A new list-shaped command must build its payload through
+  `options.printPage`/`agentjson.Envelope`, not marshal a bare slice; `internal/cli/
+  conformance_test.go` walks the whole command tree and fails one that skips it.
+
 ### Protocol (dual Go/TS)
 - The protocol is validated **twice** — `internal/protocol/protocol.go` (emit + decode +
   `validate()`) and `extension/src/protocol.ts` (`parseBrowserMessage`). A new offer field
