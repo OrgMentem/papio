@@ -186,37 +186,47 @@ per-permission rationale, and privacy disclosures live in
 ### Automated submission (`extension-submit.yml`)
 
 Bump `extension/manifest.json`, push an **`ext-v<version>`** tag (must match the
-manifest), or run the workflow manually. The **`store-submit` GitHub Environment**
-gates the job behind a required-reviewer approval — that approval IS the "human
-authorizes publication" step. Chrome uploads a **draft** by default; going live
-is a second act — click **Submit for review** in the dashboard (CWS then
-**auto-publishes when review passes**, unless deferred publishing is enabled)
-or pass `chrome_publish=true` to submit from CI. Firefox signs + submits the
-listed version to AMO (`--upload-source-code` is required — the bundle is
-bun-processed). Manual `workflow_dispatch` runs **skip the AMO step** unless
-`firefox=true` (safe for Chrome-only retries/verification) and build the chosen
+manifest), or run the workflow manually. **The trigger is the authorization** —
+there is no reviewer prompt (see below). Chrome uploads a **draft** by default;
+going live is a second act — click **Submit for review** in the dashboard (CWS
+then **auto-publishes when review passes**, unless deferred publishing is
+enabled) or pass `chrome_publish=true` to submit from CI. Firefox signs +
+submits the listed version to AMO (`--upload-source-code` is required — the
+bundle is bun-processed). A manual `workflow_dispatch` builds the chosen
 `--ref` — pass the `ext-v*` tag, not `main`, if `main` has moved past the
 release commit. Local equivalents: `cd extension && bun run
 submit:chrome [--publish]` / `bun run submit:firefox listed`.
 
+**The stores are asymmetric, and the dispatch defaults encode it.** A Chrome
+draft upload is reversible — replace it and nothing was public. An AMO
+submission is not: it permanently consumes the version number (even if you
+cancel) and auto-publishes to every installed user once review passes. So on
+`workflow_dispatch`, `chrome` defaults **true** (draft only) and `firefox`
+defaults **false** — AMO is opt-in. A **tag push runs both**, because the tag
+is the deliberate release act. Residual asymmetry on the tag path: Chrome
+stops at a draft you must click, AMO goes all the way into review.
+
 ### The `store-submit` environment
 
-Required-reviewer gate on the submission job. Config that bit us this session:
+Deployment record plus ref policies; **no required reviewers** (removed
+2026-07-25). The gate was theatre under agentic releases: a human gate an agent
+clears is latency, not safety. Protection is mechanical instead — the
+tag/manifest match step, the two store preflights (`status:chrome` /
+`status:firefox`), and the opt-in AMO default above.
 - **Deployment ref rules must allow both `ext-v*` (tag) AND `main` (branch).** The
   tag rule alone blocks manual `workflow_dispatch` runs (they execute on `main`),
   which then fail *instantly with zero steps* — the deploy ref is rejected before
   the job starts, which looks baffling until you check the environment rules.
-- Keep **"Prevent self-review" OFF** for a solo maintainer, or you can never
-  approve your own run.
-- **No environment secrets needed** — the org/repo secrets are visible to the
-  gated job.
-- **Every `ext-v*` run parks at `waiting` here until approved** — a bare
-  "watch all runs for HEAD" therefore blocks forever on extension releases.
-  Approve first, then watch specific run IDs.
-- Approve in the Actions UI, or self-contained:
-  `envid=$(gh api repos/OWNER/REPO/actions/runs/<run>/pending_deployments --jq '.[0].environment.id')`
-  then `gh api --method POST repos/OWNER/REPO/actions/runs/<run>/pending_deployments
-  -F "environment_ids[]=$envid" -f state=approved -f comment='…'`.
+  Removing the reviewers via `PUT /repos/{o}/{r}/environments/store-submit` wipes
+  the ref policies unless the body repeats
+  `deployment_branch_policy: {protected_branches: false, custom_branch_policies: true}`;
+  the named policies themselves survive.
+- **No environment secrets needed** — the org/repo secrets are visible to the job.
+- **A failed submission leaves the environment page red** and it stays red until
+  the next successful deployment supersedes it. It gates nothing; no protection
+  rule keys off a previous deployment's outcome. Retire one early with
+  `gh api --method POST repos/{o}/{r}/deployments/<id>/statuses -f state=inactive`.
+- Runs no longer park at `waiting`, so watching an `ext-v*` run works normally.
 
 ### One-time setup (per store — cannot be automated)
 

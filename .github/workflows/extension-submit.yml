@@ -7,17 +7,22 @@ name: extension-submit
 # resubmitted when it changes. Trigger this by pushing an `ext-v<version>` tag
 # that matches manifest.json, or run it manually from the Actions tab.
 #
-# The `store-submit` GitHub Environment gates the job: configure it with
-# required reviewers so a human approves each submission (the release runbook's
-# "the human authorizes publication" rule) and attach the store credentials as
-# environment secrets:
+# The `store-submit` GitHub Environment carries the deployment record and the
+# ref policies (branch `main`, tag `ext-v*`); the store credentials are org and
+# repo secrets, visible to the job without being environment secrets:
 #   Chrome Web Store: CWS_CLIENT_ID, CWS_CLIENT_SECRET, CWS_REFRESH_TOKEN, CWS_EXTENSION_ID, CWS_PUBLISHER_ID
 #   Firefox AMO:      WEB_EXT_API_KEY, WEB_EXT_API_SECRET
 #
+# Authorization is the trigger itself, not a reviewer prompt: pushing an
+# `ext-v*` tag is the deliberate act. The two stores are not symmetric, so the
+# manual-dispatch defaults are the least committal action each one offers —
+# Chrome uploads a DRAFT (reversible; `chrome_publish=true` submits it for
+# review), and AMO does nothing unless `firefox=true`, because an AMO
+# submission permanently consumes the version number and auto-publishes to
+# every installed user once review passes.
+#
 # First-time only: the Chrome Web Store item must be created by hand once (the
 # API cannot create the initial listing); afterward this drives version updates.
-# Chrome defaults to a draft upload (a human clicks Publish in the dashboard);
-# set chrome_publish=true to also submit for review.
 
 on:
   push:
@@ -34,9 +39,9 @@ on:
         type: boolean
         default: false
       firefox:
-        description: 'Firefox: sign + submit the listed version to AMO'
+        description: 'Firefox: sign + submit the listed version to AMO (irreversible — burns the version number)'
         type: boolean
-        default: true
+        default: false
 
 permissions:
   contents: read
