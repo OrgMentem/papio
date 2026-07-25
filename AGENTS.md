@@ -98,6 +98,15 @@ Bump the pinned zensical version in `docs/requirements.txt` deliberately; CI ins
   bare array. A new list-shaped command must build its payload through
   `options.printPage`/`agentjson.Envelope`, not marshal a bare slice; `internal/cli/
   conformance_test.go` walks the whole command tree and fails one that skips it.
+- **The daemon IPC layer is fail-closed too, so nothing on the wire is additive.**
+  `internal/ipc`'s `decodeStrict`/`decodeJSON` both call `DisallowUnknownFields()`, and that
+  covers the `Response` **envelope**, not just method params. Adding a field to `Response`
+  (a tempting home for warnings) or changing any method's result shape therefore makes an
+  older `papio` CLI reject *every* response from a newer daemon — and since one binary is
+  CLI, daemon, and native host, skew is real whenever two copies are installed (see the brew
+  vs `~/.local/bin` note above). Carry new daemon-side information either out of band (a log,
+  or a new element in a list an existing result already contains — a `papio doctor` check is
+  the cheap one) or behind a new method name; do not widen an existing result.
 
 ### Protocol (dual Go/TS)
 - The protocol is validated **twice** — `internal/protocol/protocol.go` (emit + decode +

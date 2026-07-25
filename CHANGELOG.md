@@ -24,6 +24,13 @@ execution records in `notes/acquisition-stack-plan.md`.
   a breakdown by access route (open access / institutional / licensed API /
   other), and a 12-week weekly series. Counts only — the daemon reports facts
   and never a "time saved" figure. Read-only; no schema migration.
+- `papio doctor` now reports discovery backend health. A backend that failed
+  during a recent search is surfaced as a warning naming the backend and the
+  cause, so thin search results can be told apart from a broken backend; a
+  backend that has since answered is cleared automatically. Previously a
+  backend could fail on every search with nothing said anywhere, because a
+  partial failure was discarded whenever another backend answered — the daemon
+  now logs it too.
 
 ### Changed
 
@@ -46,6 +53,11 @@ execution records in `notes/acquisition-stack-plan.md`.
   denied sessions.
 - `papio --version` now works alongside the existing `papio version`
   subcommand, printing identical output.
+- A failed discovery search no longer risks echoing the request URL — and with
+  it the configured contact email and any backend API key — into the error
+  message or the daemon log. Backend errors are now redacted to
+  scheme/host/path before being reported, keeping search failures inside the
+  same rule that already governs stored URLs.
 - `papio search` no longer buries an exact-title match behind unrelated
   higher-cited papers. Results are annotated with `match_score` (0..1) and
   `match_kind` (`exact_title`, `title_phrase`, `title_tokens`, `weak`,
