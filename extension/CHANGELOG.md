@@ -16,6 +16,8 @@ for the full pre-split extension history.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-07-25
+
 ### Added
 
 - **Tab-group handoff on Firefox.** The collapsed "papio" tab group now works
