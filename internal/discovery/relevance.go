@@ -88,11 +88,18 @@ func normalizeText(value string) string {
 // kind explaining it. The kind is the useful half: it tells a reader *why* a row
 // ranked where it did, which a bare number cannot.
 func score(query, title string) (float64, string) {
-	normalizedQuery, normalizedTitle := normalizeText(query), normalizeText(title)
+	normalizedQuery := normalizeText(query)
+	return scoreNormalized(normalizedQuery, strings.Fields(normalizedQuery), title)
+}
+
+// scoreNormalized is score with the query's normalization and tokenization
+// already done. rank judges every row against the same query, so it computes
+// those once and calls this directly instead of paying for them per row.
+func scoreNormalized(normalizedQuery string, queryTokens []string, title string) (float64, string) {
+	normalizedTitle := normalizeText(title)
 	if normalizedQuery == "" || normalizedTitle == "" {
 		return 0, MatchUnscored
 	}
-	queryTokens := strings.Fields(normalizedQuery)
 	if len(queryTokens) < minQueryTokens {
 		return 0, MatchUnscored
 	}
@@ -100,13 +107,16 @@ func score(query, title string) (float64, string) {
 		return 1, MatchExactTitle
 	}
 	// Containment either way: the query is a fragment of the title, or the user
-	// pasted a title plus extra context. Coverage decides how much of the other
-	// string the match accounted for, so a query matching most of a title
-	// outranks one matching a few words of a long one.
-	if strings.Contains(normalizedTitle, normalizedQuery) {
+	// pasted a title plus extra context. Both sides are padded with a boundary
+	// space so containment only fires on whole words — otherwise a short title
+	// like "Trust" would match as a mere substring of an unrelated query word
+	// like "mistrust". Coverage decides how much of the other string the match
+	// accounted for, so a query matching most of a title outranks one matching
+	// a few words of a long one.
+	if strings.Contains(" "+normalizedTitle+" ", " "+normalizedQuery+" ") {
 		return phraseScore(len(normalizedQuery), len(normalizedTitle)), MatchTitlePhrase
 	}
-	if strings.Contains(normalizedQuery, normalizedTitle) {
+	if strings.Contains(" "+normalizedQuery+" ", " "+normalizedTitle+" ") {
 		return phraseScore(len(normalizedTitle), len(normalizedQuery)), MatchTitlePhrase
 	}
 	// Out-of-order overlap is scaled into the band below phraseFloor. Contiguity
@@ -171,8 +181,10 @@ func tokenOverlap(queryTokens, titleTokens []string) float64 {
 // confident title matches first, best score first, and every non-confident row
 // keeps the order the backend gave it.
 func rank(works []DiscoveredWork, query string) {
+	normalizedQuery := normalizeText(query)
+	queryTokens := strings.Fields(normalizedQuery)
 	for i := range works {
-		works[i].MatchScore, works[i].MatchKind = score(query, works[i].Work.Title)
+		works[i].MatchScore, works[i].MatchKind = scoreNormalized(normalizedQuery, queryTokens, works[i].Work.Title)
 	}
 	sort.SliceStable(works, func(i, j int) bool {
 		left, right := Confident(works[i].MatchKind), Confident(works[j].MatchKind)

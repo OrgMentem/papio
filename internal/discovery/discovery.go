@@ -27,6 +27,17 @@ const (
 	maxAbstractWords = 20_000
 )
 
+// DefaultLimit and MaxLimit are normalizeParams's own effective-limit clamp
+// bounds, exported as aliases (not a second definition) so a caller outside
+// this package — internal/cli's truncation-honesty computation — can compute
+// the same effective limit discovery.search will actually use instead of
+// duplicating these numbers and risking drift. See internal/agentjson.Capped
+// and its callers.
+const (
+	DefaultLimit = defaultLimit
+	MaxLimit     = maxLimit
+)
+
 const slimFields = "id,doi,title,display_name,publication_year,authorships,primary_location,open_access,cited_by_count"
 
 // HTTPClient is the injected HTTP dependency used to call OpenAlex.
@@ -428,6 +439,12 @@ func discoveredWork(record workRecord) DiscoveredWork {
 		CitedBy:    record.CitedByCount,
 		Abstract:   invertAbstract(record.AbstractInvertedIndex),
 		Source:     "openalex",
+		// MatchScore/MatchKind are not judged here — Search and LookupWork
+		// return this straight to the caller without going through rank, so
+		// this is the only place their zero value is set. MatchUnscored keeps
+		// the DiscoveredWork.MatchKind invariant true unconditionally, instead
+		// of just for rows rank has touched.
+		MatchKind: MatchUnscored,
 	}
 }
 

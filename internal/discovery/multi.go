@@ -27,6 +27,17 @@ type Multi struct {
 	now func() time.Time
 }
 
+// Compile-time assertions that *Multi satisfies the optional interfaces its
+// two consumers — internal/api's discovery.search handler and papio doctor's
+// discovery check — reach only by runtime type-assertion. Without these, a
+// signature drift here would silently downgrade both to their degraded
+// fallback path (plain Search, no partial results or health reporting)
+// instead of failing the build.
+var (
+	_ PartialSearcher = (*Multi)(nil)
+	_ BackendHealth   = (*Multi)(nil)
+)
+
 // NewMulti returns a Source that fans a search across backends in preference
 // order and merges results. With no explicit source parameter, the supplied
 // sources are searched in their given order.
@@ -66,8 +77,19 @@ func (m *Multi) SearchPartial(ctx context.Context, params SearchParams) ([]Disco
 			if source != nil && source.Name() == params.Source {
 				works, err := source.Search(ctx, params)
 				if err != nil {
-					// An explicitly named source failing is a hard error, but it
-					// is still a backend failure worth remembering.
+					// An explicitly named source failing is a hard error, and
+					// still worth remembering — unless the caller is the one
+					// who gave up: a cancelled outer context says nothing
+					// about this backend's health, so recording it would
+					// leave a bogus failure for a backend that never got a
+					// real chance to answer. Checking ctx.Err() rather than
+					// errors.Is on err distinguishes that from the backend's
+					// own internal deadline expiring independently of the
+					// caller, which is real signal and must still be
+					// recorded.
+					if ctx.Err() != nil {
+						return nil, nil, err
+					}
 					return nil, []BackendFailure{m.recordFailure(source.Name(), err)}, err
 				}
 				m.clearFailure(source.Name())
@@ -87,7 +109,12 @@ func (m *Multi) SearchPartial(ctx context.Context, params SearchParams) ([]Disco
 		}
 		works, err := source.Search(ctx, params)
 		if err != nil {
-			failures = append(failures, m.recordFailure(source.Name(), err))
+			// See the identical ctx.Err() guard in the named-source branch
+			// above: a cancelled caller must not be recorded as this
+			// backend's failure.
+			if ctx.Err() == nil {
+				failures = append(failures, m.recordFailure(source.Name(), err))
+			}
 			hard = append(hard, fmt.Errorf("%s: %w", source.Name(), err))
 			continue
 		}

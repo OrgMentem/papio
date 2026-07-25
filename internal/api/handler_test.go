@@ -3,9 +3,11 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -18,6 +20,7 @@ import (
 	"papio/internal/batch"
 	"papio/internal/bootstrap"
 	"papio/internal/config"
+	"papio/internal/discovery"
 	"papio/internal/ipc"
 	"papio/internal/job"
 	"papio/internal/protocol"
@@ -736,5 +739,87 @@ func TestParseFailuresSinceRejectsNegativeLookbacks(t *testing.T) {
 				t.Fatalf("parseFailuresSince(%q) error = %q", value, err)
 			}
 		})
+	}
+}
+
+// fakeDiscoverySource is a minimal discovery.Source double local to this
+// package: discovery's own fakeSource is unexported and lives in a
+// different package, so a handler-level test needs its own.
+type fakeDiscoverySource struct {
+	name  string
+	works []discovery.DiscoveredWork
+	err   error
+}
+
+func (f fakeDiscoverySource) Name() string { return f.name }
+
+func (f fakeDiscoverySource) Search(context.Context, discovery.SearchParams) ([]discovery.DiscoveredWork, error) {
+	return f.works, f.err
+}
+
+// The regression: the per-source log loop only ran on the partial-success
+// branch, so a backend that failed on every request logged nothing at all —
+// backwards from what an operator needs — and the top-level RPC error named
+// only whichever backend errors.As found first inside the joined error,
+// silently dropping the rest even though every backend failed.
+func TestDiscoverySearchLogsAndNamesEveryBackendOnTotalFailure(t *testing.T) {
+	system := testSystem(t)
+	system.Discovery = discovery.NewMulti(
+		fakeDiscoverySource{name: "openalex", err: errors.New("boom one")},
+		fakeDiscoverySource{name: "semanticscholar", err: errors.New("boom two")},
+	)
+	router := Router(system)
+
+	orig := log.Writer()
+	var logged bytes.Buffer
+	log.SetOutput(&logged)
+	t.Cleanup(func() { log.SetOutput(orig) })
+
+	rpcErr := callMethod(t, router, "discovery.search", map[string]any{"query": "anything"}, nil)
+	if rpcErr == nil {
+		t.Fatal("expected a hard error when every discovery backend fails")
+	}
+	output := logged.String()
+	if !strings.Contains(output, "openalex") || !strings.Contains(output, "boom one") {
+		t.Fatalf("total failure did not log the openalex backend: %s", output)
+	}
+	if !strings.Contains(output, "semanticscholar") || !strings.Contains(output, "boom two") {
+		t.Fatalf("total failure did not log the semanticscholar backend: %s", output)
+	}
+	if !strings.Contains(rpcErr.Message, "openalex") || !strings.Contains(rpcErr.Message, "boom one") {
+		t.Fatalf("top-level error dropped the openalex cause: %s", rpcErr.Message)
+	}
+	if !strings.Contains(rpcErr.Message, "semanticscholar") || !strings.Contains(rpcErr.Message, "boom two") {
+		t.Fatalf("top-level error dropped the semanticscholar cause: %s", rpcErr.Message)
+	}
+}
+
+// The partial-success branch already logged one line per failed backend
+// before this fix; this pins that it still does, alongside a healthy
+// sibling, and does not also log the healthy backend.
+func TestDiscoverySearchLogsPerSourceOnPartialFailure(t *testing.T) {
+	system := testSystem(t)
+	system.Discovery = discovery.NewMulti(
+		fakeDiscoverySource{name: "openalex", works: []discovery.DiscoveredWork{
+			{Work: work.Work{Title: "a usable result", DOI: "10.1000/usable-result"}},
+		}},
+		fakeDiscoverySource{name: "semanticscholar", err: errors.New("boom semanticscholar")},
+	)
+	router := Router(system)
+
+	orig := log.Writer()
+	var logged bytes.Buffer
+	log.SetOutput(&logged)
+	t.Cleanup(func() { log.SetOutput(orig) })
+
+	if rpcErr := callMethod(t, router, "discovery.search", map[string]any{"query": "a usable result"}, nil); rpcErr != nil {
+		t.Fatalf("discovery.search returned a hard error despite a usable backend: %+v", rpcErr)
+	}
+	output := logged.String()
+	if !strings.Contains(output, "semanticscholar") || !strings.Contains(output, "boom semanticscholar") {
+		t.Fatalf("partial failure did not log the broken backend: %s", output)
+	}
+	if strings.Contains(output, "warning: discovery backend openalex") {
+		t.Fatalf("partial failure logged the healthy backend as failed too: %s", output)
 	}
 }

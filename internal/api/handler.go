@@ -760,17 +760,30 @@ func searchDiscovery(ctx context.Context, raw json.RawMessage, system *bootstrap
 		return nil, &ipc.RPCError{Code: "precondition_failed", Message: "discovery is not configured"}
 	}
 	works, partial, err := searchWithPartialFailures(ctx, system.Discovery, params)
-	if err != nil {
-		// safeMessage bounds length but does not redact: a transport failure's
-		// text embeds the request URL, carrying the contact email and any API
-		// key, so the backend error is sanitized before it reaches the caller.
-		return nil, &ipc.RPCError{Code: "precondition_failed", Message: safeMessage(errors.New(discovery.SanitizeError(err)), "discovery search failed")}
-	}
-	// A backend that broke while another answered used to vanish here, leaving a
-	// user unable to tell a dead backend from an unindexed work. The messages are
-	// already sanitized by discovery; papio doctor reports the same state.
+	// A backend that broke while another answered used to vanish here, leaving
+	// a user unable to tell a dead backend from an unindexed work; a backend
+	// that broke on every request used to log nothing at all, which is
+	// backwards from what an operator needs. Both cases get the same
+	// per-source log line here, unconditionally, before the error branch below
+	// even runs. The messages are already sanitized by discovery; papio doctor
+	// reports the same state.
 	for _, failure := range partial {
 		log.Printf("warning: discovery backend %s failed: %s", failure.Source, failure.Message)
+	}
+	if err != nil {
+		// safeMessage bounds length but does not redact; the message built
+		// below is already sanitized. SummarizeFailures names every backend
+		// that broke — errors.As on a joined error only surfaces whichever
+		// cause it finds first, which named one backend even when every
+		// backend failed. partial is empty only when the configured source
+		// does not implement PartialSearcher (a single backend, or a test
+		// double), so SanitizeError on the raw error is still the right
+		// fallback there.
+		message := discovery.SummarizeFailures(partial)
+		if message == "" {
+			message = discovery.SanitizeError(err)
+		}
+		return nil, &ipc.RPCError{Code: "precondition_failed", Message: safeMessage(errors.New(message), "discovery search failed")}
 	}
 	var lookup discovery.OwnershipLookup
 	if system.Zotio != nil {
