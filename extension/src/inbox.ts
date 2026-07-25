@@ -865,6 +865,65 @@ async function refreshInbox(append = false): Promise<void> {
 function requestRefresh(): void {
   void refreshInbox();
 }
+// Inbox freshness. The poll is visibility-gated and only refetches the full
+// snapshot when the counts signature changes, keeping steady-state traffic to
+// a lightweight counts request. refresh-on-return covers coming back to the
+// tab. Auto-refresh (poll and return alike) is suppressed while the user is
+// mid-action so it never reorders the list under a decision.
+const COUNTS_POLL_INTERVAL_MS = 10000;
+let countsPollTimer: number | Timer | undefined;
+
+function countsSignature(counts: TriageCounts | null): string {
+  if (counts === null) return "";
+  return [
+    counts.pending_total,
+    counts.watch_hits,
+    counts.actions,
+    counts.retractions,
+    counts.jobs_working,
+    counts.jobs_needs_review,
+    counts.failure_groups_7d,
+  ].join(":");
+}
+
+function autoRefreshAllowed(): boolean {
+  if (!state.connected || state.loading) return false;
+  if (state.confirmation !== null || state.pending.size > 0) return false;
+  return typeof document === "undefined" || document.visibilityState === "visible";
+}
+
+async function pollCounts(): Promise<void> {
+  if (!autoRefreshAllowed()) return;
+  const before = countsSignature(state.counts);
+  const result = await runtimeMessage("papio.triage.counts", {})
+    .then((response) => responseValue<TriageCounts>(response, "counts"))
+    .catch(() => ({ ok: false as const, message: "" }));
+  // A failed counts poll means the port is healing; the background worker and
+  // refreshInbox's own reconnect already own that recovery, so stay quiet.
+  if (!result.ok) return;
+  // The user may have started interacting during the await; re-check before
+  // pulling a full snapshot out from under them.
+  if (!autoRefreshAllowed()) return;
+  if (countsSignature(result.value) !== before) {
+    await refreshInbox();
+  } else {
+    state.counts = result.value;
+    renderCounts();
+  }
+}
+
+function scheduleCountsPoll(): void {
+  clearTimeout(countsPollTimer);
+  countsPollTimer = setTimeout(() => {
+    void pollCounts().finally(scheduleCountsPoll);
+  }, COUNTS_POLL_INTERVAL_MS);
+}
+
+function refreshOnReturn(): void {
+  if (typeof document !== "undefined" && document.visibilityState !== "visible") return;
+  if (state.loading) return;
+  void refreshInbox();
+}
 
 function beginMutation(item: TriageSnapshotItem): boolean {
   if (!state.connected) {
@@ -1287,8 +1346,11 @@ function bootstrap(): void {
   });
   document.addEventListener("keydown", handleKeyboard);
   document.addEventListener("keydown", trapDialogFocus);
+  document.addEventListener("visibilitychange", refreshOnReturn);
+  window.addEventListener("focus", refreshOnReturn);
   render();
   void refreshInbox();
+  scheduleCountsPoll();
 }
 
 if (typeof document !== "undefined") {

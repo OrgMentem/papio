@@ -62,7 +62,11 @@ async function inboxDocument(
   // Each fixture needs a fresh page module because its UI state is intentionally module-local.
   await import(`../src/inbox.ts?inbox-test=${importSerial}`);
   await settle();
-  return { document: window.document as unknown as Document, requests, opened };
+  return {
+    document: window.document as unknown as Document,
+    requests,
+    opened,
+  };
 }
 
 function counts(overrides: Partial<TriageCounts> = {}): TriageCounts {
@@ -457,6 +461,17 @@ test("a conflict leaves an inline refresh result and re-requests the snapshot", 
   expect(page.document.querySelector(".item-result")?.textContent).toBe("changed elsewhere — refreshed");
   expect(page.requests.filter((request) => request.type === "papio.triage.snapshot")).toHaveLength(2);
 });
+test("returning to the tab re-requests the snapshot so the inbox stays fresh", async () => {
+  const fixture = snapshot([watchHit("hit:one", 1, "Fresh on return")], {
+    counts: counts({ pending_total: 1, watch_hits: 1, actions: 0, retractions: 0 }),
+  });
+  const page = await inboxDocument((message) => snapshotReply(fixture, message));
+  expect(page.requests.filter((request) => request.type === "papio.triage.snapshot")).toHaveLength(1);
+  page.document.dispatchEvent(new Event("visibilitychange", { bubbles: true }));
+  await settle();
+  expect(page.requests.filter((request) => request.type === "papio.triage.snapshot")).toHaveLength(2);
+});
+
 
 test("a daemon-down refresh leaves the page rendered, shows reconnect, and disables mutations", async () => {
   const fixture = snapshot([watchHit("hit:one", 1, "Still visible")], {
