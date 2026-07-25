@@ -206,7 +206,7 @@ func TestOpenRollsForwardSchemaOneWithoutLosingDurableRows(t *testing.T) {
 		PDFInfo:   worker,
 		PDFToPPM:  worker,
 		Tesseract: worker,
-	}, worker)
+	}, worker, nil)
 	if !report.OK {
 		t.Fatalf("doctor after roll-forward is unhealthy: %+v", report)
 	}

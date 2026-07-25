@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"papio/internal/config"
+	"papio/internal/discovery"
 	"papio/internal/pdf"
 	"papio/internal/store"
 	"papio/internal/update"
@@ -51,7 +52,7 @@ func TestRunReadyProfilePassesWithoutLeakingSecrets(t *testing.T) {
 	tool := executable(t)
 	report := Run(ctx, cfg, db, pdf.Capability{
 		PDFCPU: true, PDFInfo: tool, PDFToText: tool, PDFToPPM: tool, Tesseract: tool,
-	}, tool)
+	}, tool, nil)
 	if !report.OK {
 		t.Fatalf("ready report failed: %+v", report)
 	}
@@ -78,7 +79,7 @@ func TestRunReportsMissingModeCredentialsToolsAndUnsafeConfig(t *testing.T) {
 	if err := os.WriteFile(cfg.Path, []byte("secret"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	report := Run(context.Background(), cfg, nil, pdf.Capability{}, "")
+	report := Run(context.Background(), cfg, nil, pdf.Capability{}, "", nil)
 	if report.OK {
 		t.Fatalf("unsafe profile passed: %+v", report)
 	}
@@ -109,7 +110,7 @@ func TestRunWarnsWhenOCRExplicitlyDisabled(t *testing.T) {
 	cfg.Sources[config.SourceOpenAlex] = config.Source{Enabled: false}
 	cfg.PDF.OCREnabled = false
 	tool := executable(t)
-	report := Run(context.Background(), cfg, nil, pdf.Capability{PDFToText: tool}, tool)
+	report := Run(context.Background(), cfg, nil, pdf.Capability{PDFToText: tool}, tool, nil)
 	var warned bool
 	for _, c := range report.Checks {
 		if c.Name == "ocr" && c.Status == Warn {
@@ -132,7 +133,7 @@ func TestRunWarnsOnRawAlmaResolverBase(t *testing.T) {
 		"alma":  {OpenURLBase: "https://x.alma.exlibrisgroup.com/view/uresolver/61X_INST/openurl?svc_dat=viewit"},
 	}
 	tool := executable(t)
-	report := Run(context.Background(), cfg, nil, pdf.Capability{PDFToText: tool}, tool)
+	report := Run(context.Background(), cfg, nil, pdf.Capability{PDFToText: tool}, tool, nil)
 	byName := map[string]Check{}
 	for _, c := range report.Checks {
 		byName[c.Name] = c
@@ -155,7 +156,7 @@ func TestRunPassesOnPrimoResolverBase(t *testing.T) {
 	cfg.Email = "a@b.test"
 	cfg.Browser.OpenURLBase = "https://une.primo.exlibrisgroup.com/nde/openurl?vid=61UNE_INST:61UNE_NDE"
 	tool := executable(t)
-	report := Run(context.Background(), cfg, nil, pdf.Capability{PDFToText: tool}, tool)
+	report := Run(context.Background(), cfg, nil, pdf.Capability{PDFToText: tool}, tool, nil)
 	for _, c := range report.Checks {
 		if c.Name == "resolver_base" && c.Status != Pass {
 			t.Fatalf("resolver_base = %+v; want pass", c)
@@ -383,4 +384,117 @@ func TestRunIntegrationSkipsZotioWhenUnconfigured(t *testing.T) {
 	if zotioUpdates.Status != Skip || zotioUpdates.Detail != "skipped: zotio is not configured" {
 		t.Fatalf("zotio updates check = %#v", zotioUpdates)
 	}
+}
+
+// fakeDiscoveryHealth is a discovery.Source that also implements
+// discovery.BackendHealth, so the discovery check can be exercised without a
+// real discovery.Multi and its network-backed backends.
+type fakeDiscoveryHealth struct {
+	failures []discovery.BackendFailure
+}
+
+func (fakeDiscoveryHealth) Name() string { return "fake" }
+
+func (fakeDiscoveryHealth) Search(context.Context, discovery.SearchParams) ([]discovery.DiscoveredWork, error) {
+	return nil, nil
+}
+
+func (f fakeDiscoveryHealth) LastFailures() []discovery.BackendFailure { return f.failures }
+
+// fakeDiscoverySourceNoHealth implements discovery.Source only, exercising
+// the check's Skip path for a source that cannot report backend health.
+type fakeDiscoverySourceNoHealth struct{}
+
+func (fakeDiscoverySourceNoHealth) Name() string { return "fake" }
+
+func (fakeDiscoverySourceNoHealth) Search(context.Context, discovery.SearchParams) ([]discovery.DiscoveredWork, error) {
+	return nil, nil
+}
+
+func TestRunReportsDiscoveryBackendFailure(t *testing.T) {
+	cfg := config.Default()
+	cfg.DataDir = t.TempDir()
+	source := fakeDiscoveryHealth{failures: []discovery.BackendFailure{
+		{Source: "semanticscholar", Message: "GET https://api.semanticscholar.org/...: connection refused"},
+	}}
+	report := Run(context.Background(), cfg, nil, pdf.Capability{}, "", source)
+	var got Check
+	for _, c := range report.Checks {
+		if c.Name == "discovery" {
+			got = c
+		}
+	}
+	if got.Status != Warn {
+		t.Fatalf("discovery check = %#v, want Warn", got)
+	}
+	if !strings.Contains(got.Detail, "semanticscholar") || !strings.Contains(got.Detail, "connection refused") {
+		t.Fatalf("discovery detail = %q, want the failing backend name and its message", got.Detail)
+	}
+	if got.Remediation == "" {
+		t.Fatalf("discovery check = %#v, want a remediation", got)
+	}
+	if report.OK {
+		t.Fatalf("a Warn-only report must still be OK: %+v", report)
+	}
+
+	multiple := fakeDiscoveryHealth{failures: []discovery.BackendFailure{
+		{Source: "openalex", Message: "timeout"},
+		{Source: "semanticscholar", Message: "connection refused"},
+	}}
+	report = Run(context.Background(), cfg, nil, pdf.Capability{}, "", multiple)
+	for _, c := range report.Checks {
+		if c.Name == "discovery" {
+			got = c
+		}
+	}
+	if !strings.Contains(got.Detail, "openalex") || !strings.Contains(got.Detail, "semanticscholar") {
+		t.Fatalf("discovery detail with two failures = %q, want both backend names", got.Detail)
+	}
+}
+
+func TestRunReportsDiscoveryHealthyWhenNoFailures(t *testing.T) {
+	cfg := config.Default()
+	cfg.DataDir = t.TempDir()
+	cfg.Discovery.Sources = []string{config.SourceOpenAlex, config.SourceSemanticScholar}
+	report := Run(context.Background(), cfg, nil, pdf.Capability{}, "", fakeDiscoveryHealth{})
+	var got Check
+	for _, c := range report.Checks {
+		if c.Name == "discovery" {
+			got = c
+		}
+	}
+	if got.Status != Pass || got.Detail != "2 discovery backend(s) configured; all healthy" {
+		t.Fatalf("discovery check = %#v, want Pass naming 2 backends", got)
+	}
+}
+
+func TestRunSkipsDiscoveryWhenHealthIsUnavailable(t *testing.T) {
+	cfg := config.Default()
+	cfg.DataDir = t.TempDir()
+
+	t.Run("no discovery source wired", func(t *testing.T) {
+		report := Run(context.Background(), cfg, nil, pdf.Capability{}, "", nil)
+		var got Check
+		for _, c := range report.Checks {
+			if c.Name == "discovery" {
+				got = c
+			}
+		}
+		if got.Status != Skip {
+			t.Fatalf("discovery check = %#v, want Skip", got)
+		}
+	})
+
+	t.Run("source cannot report health", func(t *testing.T) {
+		report := Run(context.Background(), cfg, nil, pdf.Capability{}, "", fakeDiscoverySourceNoHealth{})
+		var got Check
+		for _, c := range report.Checks {
+			if c.Name == "discovery" {
+				got = c
+			}
+		}
+		if got.Status != Skip {
+			t.Fatalf("discovery check = %#v, want Skip", got)
+		}
+	})
 }

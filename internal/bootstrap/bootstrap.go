@@ -322,7 +322,7 @@ func (s *System) Close() error {
 // DoctorReport runs readiness checks against this live system without exposing
 // credentials or opening a second database connection.
 func (s *System) DoctorReport(ctx context.Context) doctor.Report {
-	return doctor.Run(ctx, s.Config, s.Store, s.PDFCapability, s.WorkerBinary)
+	return doctor.Run(ctx, s.Config, s.Store, s.PDFCapability, s.WorkerBinary, s.Discovery)
 }
 
 func resolverEntries(cfg config.Config, client *fetch.SecureHTTPClient) []app.ResolverEntry {

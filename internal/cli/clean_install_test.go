@@ -76,7 +76,7 @@ func TestCleanInstallBootstrapsAndAcceptsWork(t *testing.T) {
 				PDFInfo:   worker,
 				PDFToPPM:  worker,
 				Tesseract: worker,
-			}, worker)
+			}, worker, system.Discovery)
 			return doctorReport, nil
 		},
 	}

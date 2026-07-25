@@ -16,6 +16,7 @@ import (
 
 	"papio/internal/browser"
 	"papio/internal/config"
+	"papio/internal/discovery"
 	"papio/internal/pdf"
 	"papio/internal/store"
 	"papio/internal/update"
@@ -45,9 +46,10 @@ type Report struct {
 }
 
 // Run evaluates config, filesystem, database, executable, source credentials,
-// and PDF helper capabilities. A nil store means database integrity is checked
-// by the daemon-backed doctor command instead.
-func Run(ctx context.Context, cfg config.Config, db *store.Store, capability pdf.Capability, workerBinary string) Report {
+// discovery backend health, and PDF helper capabilities. A nil store means
+// database integrity is checked by the daemon-backed doctor command instead;
+// a nil discoverySource means discovery backend health is checked there too.
+func Run(ctx context.Context, cfg config.Config, db *store.Store, capability pdf.Capability, workerBinary string, discoverySource discovery.Source) Report {
 	var checks []Check
 	add := func(name, status, detail, remediation string) {
 		checks = append(checks, Check{Name: name, Status: status, Detail: detail, Remediation: remediation})
@@ -125,6 +127,7 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, capability pdf
 
 	checkSourceCredentials(cfg, add)
 	checkResolverBases(cfg, add)
+	checkDiscoveryHealth(cfg, discoverySource, add)
 	sort.SliceStable(checks, func(i, j int) bool { return checks[i].Name < checks[j].Name })
 	out := Report{OK: true, Checks: checks}
 	for _, c := range checks {
@@ -230,6 +233,49 @@ func checkSourceCredentials(cfg config.Config, add func(string, string, string, 
 			add(name, Pass, source+" credential configured", "")
 		}
 	}
+}
+
+// checkDiscoveryHealth reports the state of the configured discovery
+// backends. A backend that started failing used to be invisible: search
+// still returned the survivor's results, so a user seeing thin results
+// could not tell a dead backend from a work that simply is not indexed.
+//
+// A nil discoverySource, or one that does not implement BackendHealth,
+// means backend health cannot be observed from here — mirrored as Skip,
+// the same convention the database check uses for a nil store.
+func checkDiscoveryHealth(cfg config.Config, source discovery.Source, add func(string, string, string, string)) {
+	if source == nil {
+		add("discovery", Skip, "discovery source is checked by the daemon", "")
+		return
+	}
+	health, ok := source.(discovery.BackendHealth)
+	if !ok {
+		add("discovery", Skip, "configured discovery source does not report backend health", "")
+		return
+	}
+	failures := health.LastFailures()
+	if len(failures) == 0 {
+		add("discovery", Pass, fmt.Sprintf("%d discovery backend(s) configured; all healthy", discoveryBackendCount(cfg)), "")
+		return
+	}
+	names := make([]string, len(failures))
+	for i, f := range failures {
+		names[i] = f.Source
+	}
+	detail := fmt.Sprintf("%s: %s", failures[0].Source, failures[0].Message)
+	if len(failures) > 1 {
+		detail = fmt.Sprintf("%s failing; first error (%s): %s", strings.Join(names, ", "), failures[0].Source, failures[0].Message)
+	}
+	add("discovery", Warn, detail, "search results may be incomplete; check network connectivity and credentials for the named backend(s)")
+}
+
+// discoveryBackendCount mirrors bootstrap's discoverySources default: an
+// empty [discovery] sources list still searches OpenAlex alone.
+func discoveryBackendCount(cfg config.Config) int {
+	if len(cfg.Discovery.Sources) == 0 {
+		return 1
+	}
+	return len(cfg.Discovery.Sources)
 }
 
 // DefaultWorkerPath resolves the current executable for pdf worker re-exec.
