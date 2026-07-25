@@ -23,12 +23,18 @@ import (
 	"papio/internal/job"
 )
 
-// jobsFailuresResult decodes the daemon reply. Only the rows are re-emitted:
-// the page shape is supplied by printPage, and a metadata key that appears only
-// on some invocations (the daemon also returns the resolved `since` window) is
-// exactly the shape drift the one-envelope contract exists to remove.
+// jobsFailuresResult decodes the daemon reply. internal/api/failures.go sends
+// `since` whenever the caller supplied a resolvable window, so the field must
+// be here for ipc.DecodeResult's DisallowUnknownFields to accept the payload
+// at all — deleting it does not remove the key from the wire, it just makes
+// every `--since`-bearing call fail with "unknown field \"since\"" before
+// either renderer runs. It is deliberately NOT re-emitted on the OUTPUT side:
+// the page shape is supplied by printPage, and a metadata key that appears
+// only on some invocations is exactly the shape drift the one-envelope
+// contract exists to remove.
 type jobsFailuresResult struct {
 	Failures []job.FailureGroup `json:"failures"`
+	Since    string             `json:"since,omitempty"`
 }
 
 func newJobsCommand(opt *options) *cobra.Command {
@@ -41,13 +47,14 @@ func newJobsCommand(opt *options) *cobra.Command {
 		Annotations: map[string]string{"mcp:read-only": "true"},
 		Args:        cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			effective := effectiveLimit(limit, job.ListLimitMax, job.ListLimitDefault)
 			var rows []job.Row
-			if err := opt.call(cmd.Context(), "jobs.list", map[string]any{"state": state, "limit": limit}, &rows); err != nil {
+			if err := opt.call(cmd.Context(), "jobs.list", map[string]any{"state": state, "limit": effective}, &rows); err != nil {
 				return err
 			}
 			if opt.jsonOutput {
-				capped, truncated := agentjson.Capped(rows, limit)
-				return opt.printPage("jobs", capped, truncated)
+				capped, truncated := agentjson.Capped(rows, effective)
+				return printPage(opt, "jobs", capped, truncated)
 			}
 			for _, row := range rows {
 				if _, err := fmt.Fprintf(opt.out, "%s\t%s\t%s\n", row.ID, row.State, row.Work.Describe()); err != nil {
@@ -129,13 +136,14 @@ func newJobsCommand(opt *options) *cobra.Command {
 		Annotations: map[string]string{"mcp:read-only": "true"},
 		Args:        cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			effective := effectiveLimitFloored(failuresLimit, job.FailuresLimitMax, job.FailuresLimitDefault)
 			var result jobsFailuresResult
-			if err := opt.call(cmd.Context(), "jobs.failures", map[string]any{"since": failuresSince, "limit": failuresLimit}, &result); err != nil {
+			if err := opt.call(cmd.Context(), "jobs.failures", map[string]any{"since": failuresSince, "limit": effective}, &result); err != nil {
 				return err
 			}
 			if opt.jsonOutput {
-				rows, truncated := agentjson.Capped(result.Failures, failuresLimit)
-				return opt.printPage("failures", rows, truncated)
+				rows, truncated := agentjson.Capped(result.Failures, effective)
+				return printPage(opt, "failures", rows, truncated)
 			}
 			for _, group := range result.Failures {
 				if _, err := fmt.Fprintf(opt.out, "%d | %s | %s | %s (sample: %s)\n", group.Count, group.State, group.Provider, group.Reason, group.Sample); err != nil {
@@ -167,7 +175,7 @@ func newActionsCommand(opt *options) *cobra.Command {
 				return err
 			}
 			if opt.jsonOutput {
-				return opt.printPage("actions", actions, false)
+				return printPage(opt, "actions", actions, false)
 			}
 			for _, action := range actions {
 				if _, err := fmt.Fprintf(opt.out, "%d\t%s\t%s\t%s%s\n", action.ID, action.JobID, action.Kind, action.Status, accessHint(action)); err != nil {
@@ -225,11 +233,12 @@ func newActionsCommand(opt *options) *cobra.Command {
 				return err
 			}
 			var rows []job.Row
-			if err := opt.call(cmd.Context(), "jobs.list", map[string]any{"limit": 500}, &rows); err != nil {
+			if err := opt.call(cmd.Context(), "jobs.list", map[string]any{"state": job.StateAwaitingHuman, "limit": job.ListLimitMax}, &rows); err != nil {
 				return err
 			}
-			urls := actionURLs(actions, rows, cfg.OpenURLBaseFor, limit)
+			urls, droppedForMissingJob := actionURLs(actions, rows, cfg.OpenURLBaseFor, limit)
 			urls, urlsTruncated := agentjson.Capped(urls, limit)
+			truncated := urlsTruncated || droppedForMissingJob > 0
 			if len(urls) == 0 && len(actions) > 0 && !opt.jsonOutput {
 				if _, err := fmt.Fprintf(opt.out, "%d open action(s), none openable from here — run 'papio actions list' for details\n", len(actions)); err != nil {
 					return err
@@ -237,13 +246,13 @@ func newActionsCommand(opt *options) *cobra.Command {
 				return nil
 			}
 			if dryRun && opt.jsonOutput {
-				return opt.printPage("urls", urls, urlsTruncated)
+				return printPage(opt, "urls", urls, truncated)
 			}
 			if err := openActionURLs(cmd.Context(), urls, dryRun, opt.out, commandExec); err != nil {
 				return err
 			}
 			if opt.jsonOutput {
-				return opt.printPage("urls", urls, urlsTruncated)
+				return printPage(opt, "urls", urls, truncated)
 			}
 			return nil
 		},
@@ -273,15 +282,30 @@ const openURLTimeout = 5 * time.Second
 
 type commandRunner func(context.Context, string, ...string) error
 
-func actionURLs(actions []job.HumanAction, rows []job.Row, baseFor func(string) (string, bool), limit int) []string {
+// actionURLs resolves the openable handoff URLs for currently open actions,
+// newest actions first, up to limit (0 = unbounded). droppedForMissingJob
+// counts open actions whose job id was not present in rows: either the job
+// has moved past awaiting_human since the action was recorded (a routine,
+// self-resolving race the caller cannot act on) or rows itself was bounded
+// and omitted a still-awaiting_human job. Both mean the caller cannot see
+// the complete open-action picture, so a nonzero count should fold into the
+// caller's own `truncated` signal.
+func actionURLs(actions []job.HumanAction, rows []job.Row, baseFor func(string) (string, bool), limit int) (urls []string, droppedForMissingJob int) {
 	jobs := make(map[string]job.Row, len(rows))
 	for _, row := range rows {
 		jobs[row.ID] = row
 	}
-	urls := make([]string, 0, len(actions))
+	urls = make([]string, 0, len(actions))
 	for _, action := range actions {
+		if action.Status != "open" {
+			continue
+		}
 		row, ok := jobs[action.JobID]
-		if !ok || action.Status != "open" || row.State != job.StateAwaitingHuman {
+		if !ok {
+			droppedForMissingJob++
+			continue
+		}
+		if row.State != job.StateAwaitingHuman {
 			continue
 		}
 		target, ok := actionURL(action, row, baseFor)
@@ -293,7 +317,7 @@ func actionURLs(actions []job.HumanAction, rows []job.Row, baseFor func(string) 
 			break
 		}
 	}
-	return urls
+	return urls, droppedForMissingJob
 }
 
 func actionURL(action job.HumanAction, row job.Row, baseFor func(string) (string, bool)) (string, bool) {

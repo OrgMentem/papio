@@ -104,7 +104,7 @@ func newWatchListCommand(opt *options) *cobra.Command {
 				return err
 			}
 			if opt.jsonOutput {
-				return opt.printPage("watches", watches, false)
+				return printPage(opt, "watches", watches, false)
 			}
 			for _, item := range watches {
 				state := "enabled"
@@ -136,16 +136,17 @@ func newWatchDigestCommand(opt *options) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			effective := effectiveLimit(limit, watch.DigestLimitMax, watch.DigestLimitDefault)
 			var result struct {
 				WatchID int64               `json:"watch_id"`
 				Entries []watch.DigestEntry `json:"entries"`
 			}
-			if err := opt.call(cmd.Context(), "watch.digest", map[string]any{"id": id, "limit": limit}, &result); err != nil {
+			if err := opt.call(cmd.Context(), "watch.digest", map[string]any{"id": id, "limit": effective}, &result); err != nil {
 				return err
 			}
 			if opt.jsonOutput {
-				rows, truncated := agentjson.Capped(result.Entries, limit)
-				return opt.printPage("entries", rows, truncated)
+				rows, truncated := agentjson.Capped(result.Entries, effective)
+				return printPage(opt, "entries", rows, truncated)
 			}
 			for _, entry := range result.Entries {
 				if _, err := fmt.Fprintf(

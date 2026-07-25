@@ -35,13 +35,17 @@ execution records in `notes/acquisition-stack-plan.md`.
 ### Changed
 
 - **BREAKING for anyone parsing `--json` as a bare array:** `search`, `jobs
-  list`, `jobs failures`, `actions list`, `actions open`, `watch list`, and
-  `watch digest` now return `{"<name>": [...], "truncated": bool}` envelopes
-  — the same shape the MCP resources (`papio://jobs` and friends) already
-  used — instead of a bare top-level array. `truncated` reports whether the
-  row cap or `--limit` hid rows; an empty result is `[]`, never `null`.
+  list`, `actions list`, `actions open`, `watch list`, and `watch digest` now
+  return `{"<name>": [...], "truncated": bool}` envelopes — the same shape
+  the MCP resources (`papio://jobs` and friends) already used — instead of a
+  bare top-level array. `truncated` reports whether the row cap or `--limit`
+  hid rows; an empty result is `[]`, never `null`. `jobs failures` was
+  already an object (`{"failures": [...], "since": ...}`), never a bare
+  array; its breaking change is narrower — the `since` metadata key is no
+  longer re-emitted in the `--json` output (the daemon reply still carries
+  it and the CLI still decodes it, so `--since` itself keeps working).
   Commands returning a single structured record (`jobs get`, `doctor`,
-  `status`, `report`, `zotio plan`, `inbox list`) are unchanged.
+  `status`, `batch report`, `zotio plan`, `inbox`) are unchanged.
 - `papio init` now points Firefox users at the published add-on listing
   (`https://addons.mozilla.org/firefox/addon/papio/`) instead of the
   temporary `about:debugging` load it recommended while the listing was in

@@ -35,8 +35,11 @@ type Page struct {
 }
 
 // Envelope pairs rows with the key they appear under. key names the collection
-// ("jobs", "works", "watches"), matching the command that produced it.
-func Envelope(key string, rows any, truncated bool) Page {
+// ("jobs", "works", "watches"), matching the command that produced it. rows is
+// generic over the row type rather than `any` so a caller can no longer hand
+// it a non-slice value (a single struct, a map) by mistake — every envelope
+// page is a list of something, by construction.
+func Envelope[T any](key string, rows []T, truncated bool) Page {
 	return Page{key: key, rows: rows, truncated: truncated}
 }
 

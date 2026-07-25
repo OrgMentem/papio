@@ -5,7 +5,7 @@ Every `papio` command, generated directly from the binary. Pass `--json` to any 
 
 ## JSON output contract
 
-Every list-shaped `--json` payload is a JSON object with exactly two keys, rows first: a named array and `truncated` (bool) — never a bare top-level array. An empty result is `[]`, never `null`. `truncated: true` means the row cap or `--limit` hid rows; raise `--limit` or paginate to see the rest.
+Every list-shaped `--json` payload is a JSON object with exactly two keys, rows first: a named array and `truncated` (bool) — never a bare top-level array. An empty result is `[]`, never `null`. `truncated: true` means the page filled its row cap (the default or `--limit` bound), so more rows may exist; it is not proof there are more — raise `--limit` or paginate to check.
 
 This is the same envelope the MCP resources (`papio://jobs` and friends) already return, so one parser handles both surfaces:
 
@@ -13,7 +13,7 @@ This is the same envelope the MCP resources (`papio://jobs` and friends) already
 {"jobs": [...], "truncated": false}
 ```
 
-Commands that return a single structured record — `papio jobs get`, `papio doctor`, `papio status`, `papio report`, `papio zotio plan`, `papio inbox list` — return that object directly; they are not list envelopes and carry no `truncated` key.
+Commands that return a single structured record — `papio jobs get`, `papio doctor`, `papio status`, `papio batch report`, `papio zotio plan`, `papio inbox` — return that object directly; they are not list envelopes and carry no `truncated` key.
 
 ## Global flags
 
@@ -23,6 +23,7 @@ These flags are available on every command.
 | --- | --- | --- | --- |
 | `--config` | `string` |  | config TOML path |
 | `--json` | `bool` | `false` | emit structured JSON |
+| `-v, --version` | `bool` | `false` | version for papio |
 
 ## `papio acquire`
 

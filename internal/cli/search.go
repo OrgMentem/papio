@@ -38,20 +38,24 @@ func newSearchCommand(opt *options) *cobra.Command {
 			if len(args) == 1 {
 				query = strings.TrimSpace(args[0])
 			}
+			effective := effectiveLimitFloored(limit, discovery.MaxLimit, discovery.DefaultLimit)
 			params := discovery.SearchParams{
-				Query: query, Limit: limit, YearFrom: yearFrom, YearTo: yearTo, OAOnly: oaOnly,
+				Query: query, Limit: effective, YearFrom: yearFrom, YearTo: yearTo, OAOnly: oaOnly,
 				Cites: cites, CitedBy: citedBy, RelatedTo: relatedTo, Source: source,
 			}
 			var works []discovery.DiscoveredWork
 			if err := opt.call(cmd.Context(), "discovery.search", params, &works); err != nil {
 				return sourceRequiresCurrentDaemon(source, err)
 			}
+			// truncated reflects the pre-filter fetched page against the
+			// daemon's own effective limit: --new-only removing owned rows
+			// below must not turn a capped page into a falsely-complete one.
+			_, truncated := agentjson.Capped(works, effective)
 			if newOnly {
 				works = newWorksOnly(works)
 			}
 			if opt.jsonOutput {
-				rows, truncated := agentjson.Capped(works, limit)
-				return opt.printPage("works", rows, truncated)
+				return printPage(opt, "works", works, truncated)
 			}
 			var anyConfident, anyTitleJudged bool
 			for _, discovered := range works {

@@ -73,7 +73,7 @@ func renderCommands(root *cobra.Command) []byte {
 
 	writeJSONContract(&b)
 
-	if gf := flagRows(root.PersistentFlags()); len(gf) > 0 {
+	if gf := globalFlagRows(root); len(gf) > 0 {
 		b.WriteString("## Global flags\n\n")
 		b.WriteString("These flags are available on every command.\n\n")
 		writeFlagTable(&b, gf)
@@ -91,10 +91,10 @@ func renderCommands(root *cobra.Command) []byte {
 // see internal/agentjson for the Go-level contract this describes.
 func writeJSONContract(b *bytes.Buffer) {
 	b.WriteString("## JSON output contract\n\n")
-	b.WriteString("Every list-shaped `--json` payload is a JSON object with exactly two keys, rows first: a named array and `truncated` (bool) — never a bare top-level array. An empty result is `[]`, never `null`. `truncated: true` means the row cap or `--limit` hid rows; raise `--limit` or paginate to see the rest.\n\n")
+	b.WriteString("Every list-shaped `--json` payload is a JSON object with exactly two keys, rows first: a named array and `truncated` (bool) — never a bare top-level array. An empty result is `[]`, never `null`. `truncated: true` means the page filled its row cap (the default or `--limit` bound), so more rows may exist; it is not proof there are more — raise `--limit` or paginate to check.\n\n")
 	b.WriteString("This is the same envelope the MCP resources (`papio://jobs` and friends) already return, so one parser handles both surfaces:\n\n")
 	b.WriteString("```json\n{\"jobs\": [...], \"truncated\": false}\n```\n\n")
-	b.WriteString("Commands that return a single structured record — `papio jobs get`, `papio doctor`, `papio status`, `papio report`, `papio zotio plan`, `papio inbox list` — return that object directly; they are not list envelopes and carry no `truncated` key.\n\n")
+	b.WriteString("Commands that return a single structured record — `papio jobs get`, `papio doctor`, `papio status`, `papio batch report`, `papio zotio plan`, `papio inbox` — return that object directly; they are not list envelopes and carry no `truncated` key.\n\n")
 }
 
 func writeCommand(b *bytes.Buffer, c *cobra.Command, level int) {
@@ -143,24 +143,43 @@ func visibleSubcommands(c *cobra.Command) []*cobra.Command {
 
 type flagRow struct{ name, typ, def, usage string }
 
+func flagRowFor(f *pflag.Flag) flagRow {
+	name := "--" + f.Name
+	if f.Shorthand != "" {
+		name = "-" + f.Shorthand + ", " + name
+	}
+	return flagRow{
+		name:  name,
+		typ:   f.Value.Type(),
+		def:   f.DefValue,
+		usage: strings.ReplaceAll(f.Usage, "|", "\\|"),
+	}
+}
+
 func flagRows(fs *pflag.FlagSet) []flagRow {
 	var rows []flagRow
 	fs.VisitAll(func(f *pflag.Flag) {
 		if f.Hidden {
 			return
 		}
-		name := "--" + f.Name
-		if f.Shorthand != "" {
-			name = "-" + f.Shorthand + ", " + name
-		}
-		rows = append(rows, flagRow{
-			name:  name,
-			typ:   f.Value.Type(),
-			def:   f.DefValue,
-			usage: strings.ReplaceAll(f.Usage, "|", "\\|"),
-		})
+		rows = append(rows, flagRowFor(f))
 	})
 	sort.Slice(rows, func(i, j int) bool { return rows[i].name < rows[j].name })
+	return rows
+}
+
+// globalFlagRows is flagRows(root.PersistentFlags()) plus --version: cobra
+// registers the version flag lazily inside Command.execute(), so it never
+// reaches root.PersistentFlags() (or even root.Flags(), until forced) even
+// though `papio --version` is real and documented — see
+// Command.InitDefaultVersionFlag in the cobra source.
+func globalFlagRows(root *cobra.Command) []flagRow {
+	rows := flagRows(root.PersistentFlags())
+	root.InitDefaultVersionFlag()
+	if v := root.Flags().Lookup("version"); v != nil && !v.Hidden {
+		rows = append(rows, flagRowFor(v))
+		sort.Slice(rows, func(i, j int) bool { return rows[i].name < rows[j].name })
+	}
 	return rows
 }
 

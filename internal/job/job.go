@@ -839,10 +839,21 @@ func (j *jsonScanner) Scan(src any) error {
 	}
 }
 
+// ListLimitMax and ListLimitDefault bound Store.List's limit parameter: a
+// caller-supplied limit outside (0, ListLimitMax] resets to ListLimitDefault.
+// Exported so internal/cli can compute the same effective limit the daemon
+// will actually use instead of comparing a returned row count against the
+// raw --limit flag (which is a different number whenever it is out of
+// range) — see internal/agentjson.Capped and its callers.
+const (
+	ListLimitMax     = 500
+	ListLimitDefault = 100
+)
+
 // List returns jobs, optionally filtered by state, newest first.
 func (js *Store) List(ctx context.Context, state string, limit int) ([]Row, error) {
-	if limit <= 0 || limit > 500 {
-		limit = 100
+	if limit <= 0 || limit > ListLimitMax {
+		limit = ListLimitDefault
 	}
 	q := `SELECT id FROM jobs`
 	args := []any{}

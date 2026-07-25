@@ -39,42 +39,151 @@ func nilRPC(context.Context, string, any, any) error { return nil }
 // page struct therefore will NOT be caught by this test; keep pages to rows plus
 // truncated and put anything else outside the page.
 
-// TestJSONListCommandsUseTheAgentJSONEnvelope is the enforcement half of the
-// L1 fix: every pure-list `--json` payload must be a two-key envelope object
-// — {"<rowKey>": [...], "truncated": bool} — never a bare top-level array
-// (or, as several of these commands emit today, a literal `null`). Row keys
-// below follow the names internal/agentjson's own doc comment and the
-// existing MCP resource envelopes already use ("jobs", "works", "watches"),
-// or the field name the command's own result struct already picked
-// ("failures", "entries").
-func TestJSONListCommandsUseTheAgentJSONEnvelope(t *testing.T) {
-	for _, tc := range []struct {
-		name   string
-		args   []string
-		rowKey string
-	}{
-		{name: "search", args: []string{"search", "conformance probe"}, rowKey: "works"},
-		{name: "jobs list", args: []string{"jobs", "list"}, rowKey: "jobs"},
-		{name: "jobs failures", args: []string{"jobs", "failures"}, rowKey: "failures"},
-		{name: "actions list", args: []string{"actions", "list"}, rowKey: "actions"},
-		{name: "actions open --dry-run", args: []string{"actions", "open", "--dry-run"}, rowKey: "urls"},
-		{name: "watch list", args: []string{"watch", "list"}, rowKey: "watches"},
-		// watch digest also owns a "digest clear" subcommand; ExactArgs(1) on
-		// "digest" itself accepts a bare watch id, so no daemon state is needed
-		// to reach its --json path.
-		{name: "watch digest", args: []string{"watch", "digest", "1"}, rowKey: "entries"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			var out, errOut bytes.Buffer
-			root := NewInProcessRoot(&out, &errOut, config.Config{}, nilRPC)
-			root.SetArgs(append([]string{"--json"}, tc.args...))
-			label := "papio " + strings.Join(tc.args, " ")
-			if err := root.ExecuteContext(context.Background()); err != nil {
-				t.Fatalf("%s: %v (stderr: %s)", label, err, errOut.String())
+// commandKind classifies how a runnable command's `--json` output is shaped.
+type commandKind int
+
+const (
+	// kindEnvelope commands emit a two-key internal/agentjson.Envelope page.
+	kindEnvelope commandKind = iota
+	// kindStructured commands emit a single structured JSON record — possibly
+	// containing arrays of its own, like `browser sessions`'s denied/takeover
+	// counts or `acquire --from-zotio`'s queued/skipped lists — that is not a
+	// list-shaped result and carries no `truncated` key. Legitimately exempt
+	// from the envelope contract; never force-converted.
+	kindStructured
+	// kindNone commands have no distinct `--json` output: help-only command
+	// groups (configureCommandGroups in root.go gives every non-runnable
+	// group with children a RunE that only ever calls cmd.Help(), never
+	// JSON) and foreground daemon processes (`papio daemon`, `papio init`,
+	// `papio mcp`) that this test must never invoke.
+	kindNone
+)
+
+// commandClass is one commandClassification entry. rowKey and args matter
+// only for kindEnvelope: rowKey is the envelope's row key, and args are the
+// extra arguments (after the command path) needed to reach the --json branch
+// without daemon state, exactly as the old hardcoded table specified them.
+type commandClass struct {
+	kind   commandKind
+	rowKey string
+	args   []string
+}
+
+// commandClassification names how every runnable command in the tree emits
+// `--json`, keyed by cmd.CommandPath() ("papio jobs list"). It is the single
+// source of truth TestJSONCommandTreeConformsToItsClassification walks the
+// live command tree against: a runnable command missing from this map fails
+// the test, so a future addition can no longer slip past the envelope
+// contract undetected — exactly what happened to `browser sessions` and
+// `acquire --from-zotio`, both real commands whose non-envelope JSON no
+// prior test classified at all.
+var commandClassification = map[string]commandClass{
+	"papio init":         {kind: kindNone},
+	"papio config":       {kind: kindNone},
+	"papio config init":  {kind: kindStructured},
+	"papio acquire":      {kind: kindStructured},
+	"papio batch":        {kind: kindNone},
+	"papio batch report": {kind: kindStructured},
+	"papio search":       {kind: kindEnvelope, rowKey: "works", args: []string{"conformance probe"}},
+	"papio watch":        {kind: kindNone},
+	"papio watch add":    {kind: kindStructured},
+	"papio watch list":   {kind: kindEnvelope, rowKey: "watches"},
+	// watch digest also owns a "digest clear" subcommand; ExactArgs(1) on
+	// "digest" itself accepts a bare watch id, so no daemon state is needed
+	// to reach its --json path.
+	"papio watch digest":          {kind: kindEnvelope, rowKey: "entries", args: []string{"1"}},
+	"papio watch digest clear":    {kind: kindStructured},
+	"papio watch remove":          {kind: kindStructured},
+	"papio watch run":             {kind: kindStructured},
+	"papio jobs":                  {kind: kindNone},
+	"papio jobs list":             {kind: kindEnvelope, rowKey: "jobs"},
+	"papio jobs get":              {kind: kindStructured},
+	"papio jobs cancel":           {kind: kindStructured},
+	"papio jobs retry":            {kind: kindStructured},
+	"papio jobs failures":         {kind: kindEnvelope, rowKey: "failures"},
+	"papio adapter":               {kind: kindNone},
+	"papio adapter diagnose":      {kind: kindStructured},
+	"papio status":                {kind: kindStructured},
+	"papio actions":               {kind: kindNone},
+	"papio actions list":          {kind: kindEnvelope, rowKey: "actions"},
+	"papio actions resolve":       {kind: kindStructured},
+	"papio actions open":          {kind: kindEnvelope, rowKey: "urls", args: []string{"--dry-run"}},
+	"papio browser":               {kind: kindNone},
+	"papio browser sessions":      {kind: kindStructured},
+	"papio browser use":           {kind: kindStructured},
+	"papio inbox":                 {kind: kindStructured},
+	"papio inbox counts":          {kind: kindStructured},
+	"papio artifacts":             {kind: kindNone},
+	"papio artifacts get":         {kind: kindStructured},
+	"papio bundle":                {kind: kindNone},
+	"papio bundle export":         {kind: kindStructured},
+	"papio doctor":                {kind: kindStructured},
+	"papio zotio":                 {kind: kindNone},
+	"papio zotio preflight":       {kind: kindStructured},
+	"papio zotio plan":            {kind: kindStructured},
+	"papio zotio apply":           {kind: kindStructured},
+	"papio zotio tags":            {kind: kindNone},
+	"papio zotio tags reconcile":  {kind: kindStructured},
+	"papio daemon":                {kind: kindNone},
+	"papio daemon stop":           {kind: kindStructured},
+	"papio daemon status":         {kind: kindStructured},
+	"papio native-host":           {kind: kindNone},
+	"papio native-host install":   {kind: kindStructured},
+	"papio native-host uninstall": {kind: kindStructured},
+	"papio native-host status":    {kind: kindStructured},
+	"papio mcp":                   {kind: kindNone},
+	"papio version":               {kind: kindStructured},
+}
+
+// TestJSONCommandTreeConformsToItsClassification is the enforcement half of
+// the L1 fix, and — unlike the fixed table it replaces — a genuine walk of
+// the live command tree: every runnable command (leaf or not; `watch digest`
+// is both) must appear in commandClassification, and every kindEnvelope
+// command must emit the two-key internal/agentjson.Envelope shape —
+// {"<rowKey>": [...], "truncated": bool} — never a bare top-level array (or,
+// as several of these commands emitted before internal/agentjson existed, a
+// literal `null`).
+func TestJSONCommandTreeConformsToItsClassification(t *testing.T) {
+	root := NewInProcessRoot(&bytes.Buffer{}, &bytes.Buffer{}, config.Config{}, nilRPC)
+	root.InitDefaultHelpCmd()
+	root.InitDefaultCompletionCmd()
+
+	var walk func(parent *cobra.Command, args []string)
+	walk = func(parent *cobra.Command, args []string) {
+		for _, cmd := range parent.Commands() {
+			if cmd.Name() == "help" || cmd.Name() == "completion" {
+				continue
 			}
-			assertEnvelope(t, label, tc.rowKey, out.Bytes())
-		})
+			path := cmd.CommandPath()
+			childArgs := append(append([]string{}, args...), cmd.Name())
+			if cmd.RunE != nil || cmd.Run != nil {
+				class, ok := commandClassification[path]
+				if !ok {
+					t.Errorf("%s: runnable command has no commandClassification entry — classify it kindEnvelope, kindStructured, or kindNone", path)
+				} else if class.kind == kindEnvelope {
+					t.Run(path, func(t *testing.T) {
+						assertJSONEnvelopeCommand(t, path, childArgs, class)
+					})
+				}
+			}
+			walk(cmd, childArgs)
+		}
 	}
+	walk(root, nil)
+}
+
+// assertJSONEnvelopeCommand invokes one kindEnvelope command against a fresh
+// nilRPC-backed root and asserts its --json payload is a conformant
+// internal/agentjson.Envelope page.
+func assertJSONEnvelopeCommand(t *testing.T, path string, args []string, class commandClass) {
+	t.Helper()
+	var out, errOut bytes.Buffer
+	root := NewInProcessRoot(&out, &errOut, config.Config{}, nilRPC)
+	root.SetArgs(append([]string{"--json"}, append(args, class.args...)...))
+	if err := root.ExecuteContext(context.Background()); err != nil {
+		t.Fatalf("%s: %v (stderr: %s)", path, err, errOut.String())
+	}
+	assertEnvelope(t, path, class.rowKey, out.Bytes())
 }
 
 // TestJSONStructuredCommandsStayPlainObjects documents the boundary

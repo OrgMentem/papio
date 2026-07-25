@@ -268,8 +268,42 @@ func (o *options) printJSON(value any) error {
 
 // printPage emits rows through the shared agentjson envelope so every list
 // command produces the same two-key shape: {"<key>": [...], "truncated": bool}.
-func (o *options) printPage(key string, rows any, truncated bool) error {
+// A standalone generic function rather than a method: Go does not allow type
+// parameters on methods, and agentjson.Envelope's row type must stay generic
+// so a non-slice value can never reach it by mistake.
+func printPage[T any](o *options, key string, rows []T, truncated bool) error {
 	return o.printJSON(agentjson.Envelope(key, rows, truncated))
+}
+
+// effectiveLimit reproduces a daemon store's own "limit outside (0, max]
+// resets to def" clamp client-side (job.Store.List, job.Store.Failures's
+// zero case, watch.Store.Digest), so a CLI command can pass the very value
+// the daemon will actually use to both the RPC call and agentjson.Capped.
+// Comparing a returned row count against the raw --limit flag instead is
+// how `truncated` lies whenever --limit is out of the daemon's range: the
+// daemon silently substitutes def, but Capped kept comparing against the
+// original request.
+func effectiveLimit(requested, max, def int) int {
+	if requested <= 0 || requested > max {
+		return def
+	}
+	return requested
+}
+
+// effectiveLimitFloored is effectiveLimit for the daemon stores that floor a
+// negative limit at 1 instead of resetting it to def (job.Store.Failures,
+// discovery.normalizeParams): only an exact zero resets to def.
+func effectiveLimitFloored(requested, max, def int) int {
+	switch {
+	case requested == 0:
+		return def
+	case requested < 0:
+		return 1
+	case requested > max:
+		return max
+	default:
+		return requested
+	}
 }
 
 func (o *options) printResult(value any, prose string, args ...any) error {

@@ -12,11 +12,15 @@ import (
 	"time"
 )
 
+// FailuresLimitMax and FailuresLimitDefault bound Store.Failures's limit
+// parameter (see the clamp below). Exported so internal/cli can compute the
+// same effective limit the daemon will actually use — see
+// internal/agentjson.Capped and its callers.
 const (
-	failureDefaultLimit = 50
-	failureMaxLimit     = 200
-	failureReasonLimit  = 80
-	failureCutoffPad    = 5 * time.Second
+	FailuresLimitDefault = 50
+	FailuresLimitMax     = 200
+	failureReasonLimit   = 80
+	failureCutoffPad     = 5 * time.Second
 )
 
 // FailureGroup describes a recurring acquisition outcome and a recent example.
@@ -31,11 +35,11 @@ type FailureGroup struct {
 // Failures groups jobs that did not complete without intervention.
 func (js *Store) Failures(ctx context.Context, since time.Time, limit int) ([]FailureGroup, error) {
 	if limit == 0 {
-		limit = failureDefaultLimit
+		limit = FailuresLimitDefault
 	} else if limit < 1 {
 		limit = 1
-	} else if limit > failureMaxLimit {
-		limit = failureMaxLimit
+	} else if limit > FailuresLimitMax {
+		limit = FailuresLimitMax
 	}
 
 	query := `

@@ -133,23 +133,23 @@ func TestFailures(t *testing.T) {
 		{
 			name: "clamps the result limit",
 			setup: func(t *testing.T, js *Store) []string {
-				for i := range failureMaxLimit + 1 {
+				for i := range FailuresLimitMax + 1 {
 					createFailure(t, js, fmt.Sprintf("failures-limit-%03d", i), StateFailed, fmt.Sprintf("reason-%03d", i), nil, false)
 				}
 				return nil
 			},
-			limit:     failureMaxLimit + 1,
-			wantCount: failureMaxLimit,
+			limit:     FailuresLimitMax + 1,
+			wantCount: FailuresLimitMax,
 		},
 		{
 			name: "defaults an omitted limit to fifty groups",
 			setup: func(t *testing.T, js *Store) []string {
-				for i := range failureDefaultLimit + 1 {
+				for i := range FailuresLimitDefault + 1 {
 					createFailure(t, js, fmt.Sprintf("failures-default-%03d", i), StateFailed, fmt.Sprintf("reason-%03d", i), nil, false)
 				}
 				return nil
 			},
-			wantCount: failureDefaultLimit,
+			wantCount: FailuresLimitDefault,
 		},
 	}
 

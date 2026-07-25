@@ -30,6 +30,16 @@ const (
 	ModeAlert     = "alert"
 )
 
+// DigestLimitMax and DigestLimitDefault bound Store.Digest's limit parameter:
+// a caller-supplied limit outside (0, DigestLimitMax] resets to
+// DigestLimitDefault. Exported so internal/cli can compute the same effective
+// limit the daemon will actually use — see internal/agentjson.Capped and its
+// callers.
+const (
+	DigestLimitMax     = 500
+	DigestLimitDefault = 100
+)
+
 // Filters is the persisted subset of discovery search filters that a watch may
 // apply. Query and limit live on Watch so the search is always bounded by its
 // per-run cap.
@@ -322,8 +332,8 @@ func (s *Store) Digest(ctx context.Context, watchID int64, limit int) ([]DigestE
 	if _, err := s.Get(ctx, watchID); err != nil {
 		return nil, err
 	}
-	if limit <= 0 || limit > 500 {
-		limit = 100
+	if limit <= 0 || limit > DigestLimitMax {
+		limit = DigestLimitDefault
 	}
 	rows, err := s.S.DB().QueryContext(ctx, `
 		SELECT work_key, title, authors, authors_json, year, doi, is_oa, abstract, first_seen_at, identifiers_json

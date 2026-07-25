@@ -95,9 +95,12 @@ Bump the pinned zensical version in `docs/requirements.txt` deliberately; CI ins
 - **Machine-readable output has ONE contract.** `internal/agentjson`
   (`Envelope`/`Truncate`/`Capped`) is shared by every CLI `--json` payload and the MCP
   resources — a list-shaped result is always `{"<name>": [...], "truncated": bool}`, never a
-  bare array. A new list-shaped command must build its payload through
-  `options.printPage`/`agentjson.Envelope`, not marshal a bare slice; `internal/cli/
-  conformance_test.go` walks the whole command tree and fails one that skips it.
+  bare array. A new list-shaped command must build its payload through the
+  `printPage` helper (`agentjson.Envelope`), not marshal a bare slice.
+  `internal/cli/conformance_test.go` walks the whole command tree against an
+  explicit `commandClassification` registry (envelope/structured/none); a
+  runnable command missing from that registry fails the test, so a new
+  command cannot silently skip the envelope contract.
 - **The daemon IPC layer is fail-closed too, so nothing on the wire is additive.**
   `internal/ipc`'s `decodeStrict`/`decodeJSON` both call `DisallowUnknownFields()`, and that
   covers the `Response` **envelope**, not just method params. Adding a field to `Response`
