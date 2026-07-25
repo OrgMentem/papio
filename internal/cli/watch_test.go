@@ -170,11 +170,14 @@ func TestWatchListJSONIncludesCitationFilters(t *testing.T) {
 	if err := root.Execute(); err != nil {
 		t.Fatalf("watch list --json: %v (%s)", err, stderr.String())
 	}
-	var listed []watch.Watch
+	var listed struct {
+		Watches   []watch.Watch `json:"watches"`
+		Truncated bool          `json:"truncated"`
+	}
 	if err := json.Unmarshal(stdout.Bytes(), &listed); err != nil {
 		t.Fatal(err)
 	}
-	if len(listed) != 1 || listed[0].Filters.CitedBy != "10.1000/seed" {
+	if len(listed.Watches) != 1 || listed.Watches[0].Filters.CitedBy != "10.1000/seed" || listed.Truncated {
 		t.Fatalf("JSON watch list = %+v, want cited_by filter", listed)
 	}
 }

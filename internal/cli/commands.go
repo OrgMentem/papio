@@ -16,15 +16,19 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"papio/internal/agentjson"
 	"papio/internal/api"
 	"papio/internal/app"
 	"papio/internal/browser"
 	"papio/internal/job"
 )
 
+// jobsFailuresResult decodes the daemon reply. Only the rows are re-emitted:
+// the page shape is supplied by printPage, and a metadata key that appears only
+// on some invocations (the daemon also returns the resolved `since` window) is
+// exactly the shape drift the one-envelope contract exists to remove.
 type jobsFailuresResult struct {
 	Failures []job.FailureGroup `json:"failures"`
-	Since    string             `json:"since,omitempty"`
 }
 
 func newJobsCommand(opt *options) *cobra.Command {
@@ -42,7 +46,8 @@ func newJobsCommand(opt *options) *cobra.Command {
 				return err
 			}
 			if opt.jsonOutput {
-				return opt.printJSON(rows)
+				capped, truncated := agentjson.Capped(rows, limit)
+				return opt.printPage("jobs", capped, truncated)
 			}
 			for _, row := range rows {
 				if _, err := fmt.Fprintf(opt.out, "%s\t%s\t%s\n", row.ID, row.State, row.Work.Describe()); err != nil {
@@ -129,7 +134,8 @@ func newJobsCommand(opt *options) *cobra.Command {
 				return err
 			}
 			if opt.jsonOutput {
-				return opt.printJSON(result)
+				rows, truncated := agentjson.Capped(result.Failures, failuresLimit)
+				return opt.printPage("failures", rows, truncated)
 			}
 			for _, group := range result.Failures {
 				if _, err := fmt.Fprintf(opt.out, "%d | %s | %s | %s (sample: %s)\n", group.Count, group.State, group.Provider, group.Reason, group.Sample); err != nil {
@@ -161,7 +167,7 @@ func newActionsCommand(opt *options) *cobra.Command {
 				return err
 			}
 			if opt.jsonOutput {
-				return opt.printJSON(actions)
+				return opt.printPage("actions", actions, false)
 			}
 			for _, action := range actions {
 				if _, err := fmt.Fprintf(opt.out, "%d\t%s\t%s\t%s%s\n", action.ID, action.JobID, action.Kind, action.Status, accessHint(action)); err != nil {
@@ -223,6 +229,7 @@ func newActionsCommand(opt *options) *cobra.Command {
 				return err
 			}
 			urls := actionURLs(actions, rows, cfg.OpenURLBaseFor, limit)
+			urls, urlsTruncated := agentjson.Capped(urls, limit)
 			if len(urls) == 0 && len(actions) > 0 && !opt.jsonOutput {
 				if _, err := fmt.Fprintf(opt.out, "%d open action(s), none openable from here — run 'papio actions list' for details\n", len(actions)); err != nil {
 					return err
@@ -230,13 +237,13 @@ func newActionsCommand(opt *options) *cobra.Command {
 				return nil
 			}
 			if dryRun && opt.jsonOutput {
-				return opt.printJSON(urls)
+				return opt.printPage("urls", urls, urlsTruncated)
 			}
 			if err := openActionURLs(cmd.Context(), urls, dryRun, opt.out, commandExec); err != nil {
 				return err
 			}
 			if opt.jsonOutput {
-				return opt.printJSON(urls)
+				return opt.printPage("urls", urls, urlsTruncated)
 			}
 			return nil
 		},

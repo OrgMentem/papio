@@ -24,6 +24,7 @@ import (
 	mcplib "github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 
+	"papio/internal/agentjson"
 	"papio/internal/api"
 	"papio/internal/batch"
 	"papio/internal/bootstrap"
@@ -287,23 +288,13 @@ func addJSONResource(s *server.MCPServer, system *bootstrap.System, uri, name, d
 
 const resourceRowCap = 100
 
-type jobsResourceEnvelope struct {
-	Jobs      []job.Row `json:"jobs"`
-	Truncated bool      `json:"truncated"`
-}
-
 func jobsResource(ctx context.Context, system *bootstrap.System) (any, error) {
 	rows, err := system.Jobs.List(ctx, "", resourceRowCap+1)
 	if err != nil {
 		return nil, err
 	}
-	jobs, truncated := truncate(rows, resourceRowCap)
-	return jobsResourceEnvelope{Jobs: jobs, Truncated: truncated}, nil
-}
-
-type artifactsResourceEnvelope struct {
-	Artifacts []job.Artifact `json:"artifacts"`
-	Truncated bool           `json:"truncated"`
+	jobs, truncated := agentjson.Truncate(rows, resourceRowCap)
+	return agentjson.Envelope("jobs", jobs, truncated), nil
 }
 
 func artifactsResource(ctx context.Context, system *bootstrap.System) (any, error) {
@@ -327,7 +318,7 @@ func artifactsResource(ctx context.Context, system *bootstrap.System) (any, erro
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	hashes, truncated := truncate(hashes, resourceRowCap)
+	hashes, truncated := agentjson.Truncate(hashes, resourceRowCap)
 	artifacts := make([]job.Artifact, 0, len(hashes))
 	for _, sha := range hashes {
 		artifact, err := system.Jobs.GetArtifact(ctx, sha)
@@ -338,7 +329,7 @@ func artifactsResource(ctx context.Context, system *bootstrap.System) (any, erro
 			artifacts = append(artifacts, *artifact)
 		}
 	}
-	return artifactsResourceEnvelope{Artifacts: artifacts, Truncated: truncated}, nil
+	return agentjson.Envelope("artifacts", artifacts, truncated), nil
 }
 
 type exportRecord struct {
@@ -349,21 +340,6 @@ type exportRecord struct {
 	Path           string          `json:"path,omitempty"`
 	Result         json.RawMessage `json:"result,omitempty"`
 	CreatedAt      string          `json:"created_at"`
-}
-
-type exportsResourceEnvelope struct {
-	Exports   []exportRecord `json:"exports"`
-	Truncated bool           `json:"truncated"`
-}
-
-type bundlesResourceEnvelope struct {
-	Bundles   []exportRecord `json:"bundles"`
-	Truncated bool           `json:"truncated"`
-}
-
-type zotioPlansResourceEnvelope struct {
-	Plans     []exportRecord `json:"plans"`
-	Truncated bool           `json:"truncated"`
 }
 
 func exportsResource(ctx context.Context, system *bootstrap.System, kind string) (any, error) {
@@ -398,23 +374,13 @@ func exportsResource(ctx context.Context, system *bootstrap.System, kind string)
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	records, truncated := truncate(records, resourceRowCap)
+	records, truncated := agentjson.Truncate(records, resourceRowCap)
 	switch kind {
 	case "bundle":
-		return bundlesResourceEnvelope{Bundles: records, Truncated: truncated}, nil
+		return agentjson.Envelope("bundles", records, truncated), nil
 	case "zotio_plan":
-		return zotioPlansResourceEnvelope{Plans: records, Truncated: truncated}, nil
+		return agentjson.Envelope("plans", records, truncated), nil
 	default:
-		return exportsResourceEnvelope{Exports: records, Truncated: truncated}, nil
+		return agentjson.Envelope("exports", records, truncated), nil
 	}
-}
-
-func truncate[T any](rows []T, cap int) ([]T, bool) {
-	if len(rows) <= cap {
-		if rows == nil {
-			return []T{}, false
-		}
-		return rows, false
-	}
-	return rows[:cap], true
 }

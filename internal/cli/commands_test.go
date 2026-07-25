@@ -5,7 +5,6 @@ package cli
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"reflect"
 	"runtime"
@@ -191,7 +190,6 @@ func TestRunnableParentKeepsPositionalArgs(t *testing.T) {
 func TestJobsFailuresCommandOutputsGroups(t *testing.T) {
 	want := jobsFailuresResult{
 		Failures: []job.FailureGroup{{Count: 2, State: job.StateFailed, Provider: "api.example.test", Reason: "timeout", Sample: "job_01"}},
-		Since:    "2026-01-01T00:00:00Z",
 	}
 	tests := []struct {
 		name string
@@ -224,12 +222,13 @@ func TestJobsFailuresCommandOutputsGroups(t *testing.T) {
 				t.Fatalf("params = %#v", gotParams)
 			}
 			if tc.json {
-				var got jobsFailuresResult
-				if err := json.Unmarshal(out.Bytes(), &got); err != nil {
-					t.Fatalf("decode output: %v", err)
-				}
-				if !reflect.DeepEqual(got, want) {
-					t.Fatalf("JSON = %#v, want %#v", got, want)
+				// Compare the exact document. Decoding back into the result
+				// struct is what let a stray `since,omitempty` key ride along
+				// unnoticed: a struct decode ignores keys it has no field for,
+				// so it cannot see the page shape a consumer actually receives.
+				const wantJSON = `{"failures":[{"state":"failed","provider":"api.example.test","reason":"timeout","count":2,"sample":"job_01"}],"truncated":false}` + "\n"
+				if got := out.String(); got != wantJSON {
+					t.Fatalf("JSON = %s, want %s", got, wantJSON)
 				}
 				return
 			}

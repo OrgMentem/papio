@@ -65,6 +65,30 @@ func TestSearchCommandAllowsSnowballWithoutQuery(t *testing.T) {
 	}
 }
 
+func TestVersionFlagMatchesVersionCommand(t *testing.T) {
+	var flagOut, flagErr bytes.Buffer
+	flagRoot := NewRoot(&flagOut, &flagErr)
+	flagRoot.SetArgs([]string{"--version"})
+	if err := flagRoot.Execute(); err != nil {
+		t.Fatalf("--version: %v (%s)", err, flagErr.String())
+	}
+
+	var cmdOut, cmdErr bytes.Buffer
+	cmdRoot := NewRoot(&cmdOut, &cmdErr)
+	cmdRoot.SetArgs([]string{"version"})
+	if err := cmdRoot.Execute(); err != nil {
+		t.Fatalf("version: %v (%s)", err, cmdErr.String())
+	}
+
+	if flagOut.String() != cmdOut.String() {
+		t.Fatalf("--version output = %q, version command output = %q, want identical", flagOut.String(), cmdOut.String())
+	}
+	want := "papio " + api.Version + "\n"
+	if flagOut.String() != want {
+		t.Fatalf("--version output = %q, want %q", flagOut.String(), want)
+	}
+}
+
 func TestNewWorksOnlyFiltersOwnedResultsWithoutRefetching(t *testing.T) {
 	works := []discovery.DiscoveredWork{
 		{OpenAlexID: "one"},

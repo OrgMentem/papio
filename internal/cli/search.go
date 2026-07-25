@@ -9,6 +9,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"papio/internal/agentjson"
 	"papio/internal/discovery"
 	"papio/internal/ipc"
 )
@@ -49,7 +50,8 @@ func newSearchCommand(opt *options) *cobra.Command {
 				works = newWorksOnly(works)
 			}
 			if opt.jsonOutput {
-				return opt.printJSON(works)
+				rows, truncated := agentjson.Capped(works, limit)
+				return opt.printPage("works", rows, truncated)
 			}
 			for _, discovered := range works {
 				if _, err := fmt.Fprintf(opt.out, "%d | %s | %s | %s | %s | %d citations%s\n",

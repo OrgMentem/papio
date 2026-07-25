@@ -9,6 +9,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"papio/internal/agentjson"
 	"papio/internal/watch"
 )
 
@@ -103,7 +104,7 @@ func newWatchListCommand(opt *options) *cobra.Command {
 				return err
 			}
 			if opt.jsonOutput {
-				return opt.printJSON(watches)
+				return opt.printPage("watches", watches, false)
 			}
 			for _, item := range watches {
 				state := "enabled"
@@ -143,7 +144,8 @@ func newWatchDigestCommand(opt *options) *cobra.Command {
 				return err
 			}
 			if opt.jsonOutput {
-				return opt.printJSON(result.Entries)
+				rows, truncated := agentjson.Capped(result.Entries, limit)
+				return opt.printPage("entries", rows, truncated)
 			}
 			for _, entry := range result.Entries {
 				if _, err := fmt.Fprintf(

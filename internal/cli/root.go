@@ -16,6 +16,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"papio/internal/agentjson"
 	"papio/internal/api"
 	"papio/internal/config"
 	"papio/internal/daemon"
@@ -67,9 +68,11 @@ func newRoot(opt *options) *cobra.Command {
 	root := &cobra.Command{
 		Use:           "papio",
 		Short:         "Legitimate paper-acquisition broker",
+		Version:       api.Version,
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}
+	root.SetVersionTemplate("papio {{.Version}}\n")
 	root.SetOut(opt.out)
 	root.SetErr(opt.errOut)
 	root.PersistentFlags().StringVar(&opt.configPath, "config", "", "config TOML path")
@@ -261,6 +264,12 @@ func (o *options) printJSON(value any) error {
 	encoder := json.NewEncoder(o.out)
 	encoder.SetEscapeHTML(false)
 	return encoder.Encode(value)
+}
+
+// printPage emits rows through the shared agentjson envelope so every list
+// command produces the same two-key shape: {"<key>": [...], "truncated": bool}.
+func (o *options) printPage(key string, rows any, truncated bool) error {
+	return o.printJSON(agentjson.Envelope(key, rows, truncated))
 }
 
 func (o *options) printResult(value any, prose string, args ...any) error {
