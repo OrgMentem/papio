@@ -81,13 +81,11 @@ Install `zotio` and put it on your `PATH` when you want *papio* to import finish
 
 === "Firefox"
 
-    The add-on is awaiting review on Firefox Add-ons (AMO); until it is published, load the built add-on temporarily:
+    1. Install [**papio** from Firefox Add-ons](https://addons.mozilla.org/firefox/addon/papio/). The signed add-on carries the fixed ID `papio@orgmentem.com`, which `papio init` allows by default, so there is nothing to copy.
+    2. On *papio*'s options page, grant the Library resolver access permission — Firefox treats host access as a runtime opt-in, so nothing is granted at install time.
+    3. Grant the per-publisher host permissions for the sites you use, on the same page.
 
-    1. Open `about:debugging#/runtime/this-firefox` and choose **Load Temporary Add-on**.
-    2. Select `extension/firefox/manifest.json` (from a release bundle or a local `bun run build`).
-    3. On *papio*'s options page, grant the Library resolver access permission.
-
-    Temporary add-ons do not persist across Firefox restarts. The built add-on uses the fixed ID `papio@orgmentem.com` by default; pass `--firefox-extension-id` to `papio init` only when the allowed add-on ID must differ.
+    Store-installed add-ons update automatically. Pass `--firefox-extension-id` to `papio init` only when the allowed add-on ID must differ — for example a locally built or self-signed copy. To load a development build instead, open `about:debugging#/runtime/this-firefox`, choose **Load Temporary Add-on**, and select `extension/firefox/manifest.json`; temporary add-ons do not persist across Firefox restarts.
 
 === "Development install (unpacked)"
 

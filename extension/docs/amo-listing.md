@@ -1,9 +1,12 @@
 # *papio* — Firefox Add-ons (AMO) listing kit
 
-Paste-ready copy and reviewer notes for submitting the *papio* extension to
+Paste-ready copy and reviewer notes for the *papio* extension on
 addons.mozilla.org. Submission is driven by `scripts/submit-firefox.sh`
 (`bun run submit:firefox`); final publication is a human step after AMO review.
 
+- Public listing: <https://addons.mozilla.org/firefox/addon/papio/> (first
+  listed version 0.5.0, approved 2026-07-25 — later uploads are version
+  updates against the existing listing, not new listings)
 - Extension ID (gecko): `papio@orgmentem.com`
 - Minimum Firefox: 128.0
 - Version source of truth: `extension/manifest.json`
@@ -111,19 +114,23 @@ action — it has no standalone behavior to test.
 4. **Handoff in progress:** a provider tab opened for a job, with the popup
    reflecting the in-flight download.
 
-## Launch checklist
+## Release checklist (version update)
+
+The listing exists and is approved, so every later run is a version update.
 
 1. `bun run lint:firefox` — web-ext lint the built `firefox/` with no errors.
-2. Confirm `extension/manifest.json` version is the intended release version.
-3. `bun run submit:firefox listed` — signs and submits for AMO review, creating
-   the listing on first run. `amo-metadata.json` supplies the two fields AMO
-   requires up front for a listed version: `version.license` (`MIT`) and
+2. Confirm `extension/manifest.json` version is the intended release version
+   and has never been uploaded to AMO before — AMO rejects a duplicate version
+   number across every channel, listed or unlisted.
+3. `bun run submit:firefox listed` — signs and submits the new version for
+   review. `amo-metadata.json` supplies `version.license` (`MIT`) and
    `categories` (`["other"]`). The script passes `--approval-timeout=0`, so it
    returns once the version is in the review queue rather than blocking on the
    multi-day human review.
-4. In the AMO Developer Hub, complete the listing that the submission created:
-   paste the summary, full description, tags, and privacy/data-collection
-   disclosure above, and upload the screenshots. (The API submission sets only
-   name, license, and category; the rest is completed here before approval.)
-5. Wait for AMO review. Store-installed users auto-update once approved; never
-   gate the daemon release on store approval.
+4. In the AMO Developer Hub, paste this version's `extension/CHANGELOG.md`
+   entry into the per-version **Release Notes** field (the API cannot set it),
+   and refresh the screenshots if the UI changed. The listing copy above is
+   preserved across uploads — only re-paste it when this file changes.
+5. Wait for AMO review. `nativeMessaging` keeps *papio* out of auto-approval,
+   so a human reviews every version; installed users auto-update once it is
+   approved. Never gate a daemon release on store approval.

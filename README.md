@@ -268,10 +268,10 @@ git clone https://github.com/OrgMentem/papio && cd papio && go build ./cmd/papio
   `brew install poppler tesseract` (or disable OCR in the
   [config](https://orgmentem.github.io/papio/reference/config-reference/)).
 - **Chrome or Firefox with the *papio* extension** for human-authenticated
-  institutional access — Chrome installs it from the
-  [Chrome Web Store](https://chromewebstore.google.com/detail/papio/npccengdhjmpojpjmjoeeclpdhcjelhf);
-  Firefox loads the built `extension/firefox/` via `about:debugging` until the
-  AMO listing clears review. `papio init` prints the exact steps; skip with
+  institutional access — install it from the
+  [Chrome Web Store](https://chromewebstore.google.com/detail/papio/npccengdhjmpojpjmjoeeclpdhcjelhf)
+  or [Firefox Add-ons](https://addons.mozilla.org/firefox/addon/papio/).
+  `papio init` prints the exact steps; skip with
   `papio init --skip-browser` for OA-only headless use.
 - **[zotio](https://github.com/OrgMentem/zotio)** on `PATH` (or
   `[zotio] executable` in the config) for Zotero import; optional — without it

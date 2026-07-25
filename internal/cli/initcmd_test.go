@@ -320,6 +320,35 @@ func TestInitExtensionIDFlags(t *testing.T) {
 	}
 }
 
+func TestBrowserInstructionsPointAtEachStoreListing(t *testing.T) {
+	var out bytes.Buffer
+	cfg := config.Config{}
+	cfg.Browser.ExtensionID = defaultChromeExtensionID
+	cfg.Browser.FirefoxExtensionID = defaultFirefoxExtensionID
+	writeBrowserInstructions(&out, cfg)
+	got := out.String()
+	for _, want := range []string{
+		"https://chromewebstore.google.com/detail/papio/" + defaultChromeExtensionID,
+		"https://addons.mozilla.org/firefox/addon/papio/",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("store install line missing %q:\n%s", want, got)
+		}
+	}
+
+	out.Reset()
+	cfg.Browser.ExtensionID = "abcdefghijklmnopabcdefghijklmnop"
+	cfg.Browser.FirefoxExtensionID = "papio-dev@example.test"
+	writeBrowserInstructions(&out, cfg)
+	got = out.String()
+	if strings.Contains(got, "chromewebstore.google.com") || strings.Contains(got, "addons.mozilla.org") {
+		t.Fatalf("non-default extension IDs must get the development-build hint, not a store link:\n%s", got)
+	}
+	if !strings.Contains(got, "chrome://extensions") || !strings.Contains(got, "about:debugging") {
+		t.Fatalf("development hints missing:\n%s", got)
+	}
+}
+
 func TestInitInteractiveCapturesExtensionIDsAndInstalls(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)

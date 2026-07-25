@@ -78,11 +78,12 @@ connector for each browser, and the connector checks each caller: Chrome
 supplies the configured extension ID; Firefox supplies the configured add-on ID.
 Leaving a browser's extension ID empty turns off that browser's connection.
 
-Firefox is a day-one target. Its built add-on ID is fixed as
-`papio@orgmentem.com`; the Firefox connector is set to allow that ID. Firefox
-treats host access as opt-in at runtime,
-so the extension options page includes a resolver-access grant alongside the
-per-provider grants.
+The Firefox add-on is published on
+[Firefox Add-ons](https://addons.mozilla.org/firefox/addon/papio/). Its add-on
+ID is fixed as `papio@orgmentem.com`; the Firefox connector is set to allow
+that ID. Firefox treats host access as opt-in at runtime, so the extension
+options page includes a resolver-access grant alongside the per-provider
+grants.
 
 ## One browser holds the session
 

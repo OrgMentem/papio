@@ -881,7 +881,9 @@ func writeBrowserInstructions(out io.Writer, cfg config.Config) {
 	} else if cfg.Browser.ExtensionID != "" {
 		fmt.Fprintln(out, "  Chrome: development build configured — load it unpacked from chrome://extensions (docs: guide/getting-started).")
 	}
-	if cfg.Browser.FirefoxExtensionID != "" {
-		fmt.Fprintln(out, "  Firefox: about:debugging#/runtime/this-firefox → Load Temporary Add-on → extension/firefox/manifest.json, then grant resolver access on the options page (AMO review pending).")
+	if cfg.Browser.FirefoxExtensionID == defaultFirefoxExtensionID {
+		fmt.Fprintln(out, "  Firefox: install papio — https://addons.mozilla.org/firefox/addon/papio/ — then grant resolver and publisher access on its options page.")
+	} else if cfg.Browser.FirefoxExtensionID != "" {
+		fmt.Fprintln(out, "  Firefox: non-default add-on ID configured — load the build via about:debugging (docs: guide/getting-started).")
 	}
 }

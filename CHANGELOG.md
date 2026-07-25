@@ -42,6 +42,10 @@ execution records in `notes/acquisition-stack-plan.md`.
   row cap or `--limit` hid rows; an empty result is `[]`, never `null`.
   Commands returning a single structured record (`jobs get`, `doctor`,
   `status`, `report`, `zotio plan`, `inbox list`) are unchanged.
+- `papio init` now points Firefox users at the published add-on listing
+  (`https://addons.mozilla.org/firefox/addon/papio/`) instead of the
+  temporary `about:debugging` load it recommended while the listing was in
+  review. A non-default add-on ID still gets the development-build hint.
 
 ### Fixed
 
