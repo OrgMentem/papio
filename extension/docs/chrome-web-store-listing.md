@@ -121,8 +121,11 @@ OAuth2 client and refresh token with the Chrome Web Store API enabled:
    from `scripts/release.sh`.
 3. Fill the listing with the name, description, category, screenshots, privacy
    practices, per-permission justifications, and privacy-policy URL above.
-4. Subsequent versions: `bun run submit:chrome` (uploads a draft) or
-   `bun run submit:chrome --publish` (uploads and submits for review). Both
+4. Subsequent versions: pushing an `ext-v<version>` tag runs
+   `bun run submit:chrome --publish` — it uploads and submits for review, and
+   CWS auto-publishes when review passes, so nothing is left waiting on a
+   dashboard click. A manual dispatch (or a bare `bun run submit:chrome`)
+   uploads a **draft** instead, which is the reversible staging path. Both
    preflight the item's review state and abort before building if a previous
    submission is still under review — the Web Store locks the item and rejects
    the publish with a misleading "does not meet the requirements to be

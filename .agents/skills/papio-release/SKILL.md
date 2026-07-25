@@ -187,24 +187,31 @@ per-permission rationale, and privacy disclosures live in
 
 Bump `extension/manifest.json`, push an **`ext-v<version>`** tag (must match the
 manifest), or run the workflow manually. **The trigger is the authorization** —
-there is no reviewer prompt (see below). Chrome uploads a **draft** by default;
-going live is a second act — click **Submit for review** in the dashboard (CWS
-then **auto-publishes when review passes**, unless deferred publishing is
-enabled) or pass `chrome_publish=true` to submit from CI. Firefox signs +
-submits the listed version to AMO (`--upload-source-code` is required — the
-bundle is bun-processed). A manual `workflow_dispatch` builds the chosen
-`--ref` — pass the `ext-v*` tag, not `main`, if `main` has moved past the
-release commit. Local equivalents: `cd extension && bun run
+there is no reviewer prompt (see below).
+
+**A tag push submits for review on BOTH stores.** CWS and AMO each auto-publish
+once their own review passes, so `ext-v<version>` means "release this version",
+with no dashboard step left dangling. Before 2026-07-25 the Chrome half stopped
+at a draft while AMO went all the way — which is how 0.6.0 sat unpublished for
+a day after a red run, live only because someone clicked it by hand.
+
+**A manual `workflow_dispatch` is the staging path**, and its defaults are the
+least committal action each store offers, because the stores are asymmetric. A
+Chrome draft upload is reversible — replace it and nothing was public. An AMO
+submission is not: it permanently consumes the version number (even if you
+cancel) and reaches every installed user once review passes. So `chrome`
+defaults **true** (draft only), `chrome_publish` **false**, `firefox`
+**false**. A dispatch also builds the chosen `--ref` — pass the `ext-v*` tag,
+not `main`, if `main` has moved past the release commit.
+
+Firefox signs + submits the listed version (`--upload-source-code` is required
+— the bundle is bun-processed). Local equivalents: `cd extension && bun run
 submit:chrome [--publish]` / `bun run submit:firefox listed`.
 
-**The stores are asymmetric, and the dispatch defaults encode it.** A Chrome
-draft upload is reversible — replace it and nothing was public. An AMO
-submission is not: it permanently consumes the version number (even if you
-cancel) and auto-publishes to every installed user once review passes. So on
-`workflow_dispatch`, `chrome` defaults **true** (draft only) and `firefox`
-defaults **false** — AMO is opt-in. A **tag push runs both**, because the tag
-is the deliberate release act. Residual asymmetry on the tag path: Chrome
-stops at a draft you must click, AMO goes all the way into review.
+Publishing straight from a tag makes the CWS review lock load-bearing: a tag
+pushed while the item is in review would fail at the publish call. That is what
+`submit-chrome.sh`'s `status:chrome` preflight now catches, before anything is
+built or uploaded.
 
 ### The `store-submit` environment
 

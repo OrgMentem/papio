@@ -14,12 +14,14 @@ name: extension-submit
 #   Firefox AMO:      WEB_EXT_API_KEY, WEB_EXT_API_SECRET
 #
 # Authorization is the trigger itself, not a reviewer prompt: pushing an
-# `ext-v*` tag is the deliberate act. The two stores are not symmetric, so the
-# manual-dispatch defaults are the least committal action each one offers —
-# Chrome uploads a DRAFT (reversible; `chrome_publish=true` submits it for
-# review), and AMO does nothing unless `firefox=true`, because an AMO
-# submission permanently consumes the version number and auto-publishes to
-# every installed user once review passes.
+# `ext-v*` tag is the deliberate act, and it submits the version for review on
+# BOTH stores — CWS and AMO each auto-publish once their review passes.
+#
+# A manual dispatch is the staging path, and its defaults are the least
+# committal action each store offers: Chrome uploads a DRAFT (reversible;
+# `chrome_publish=true` submits it for review), and AMO does nothing unless
+# `firefox=true`, because an AMO submission permanently consumes the version
+# number and reaches every installed user once review passes.
 #
 # First-time only: the Chrome Web Store item must be created by hand once (the
 # API cannot create the initial listing); afterward this drives version updates.
@@ -35,7 +37,7 @@ on:
         type: boolean
         default: true
       chrome_publish:
-        description: 'Chrome: also submit for review (else upload a draft only)'
+        description: 'Chrome: also submit for review, auto-live on approval (tag pushes always do)'
         type: boolean
         default: false
       firefox:
@@ -83,9 +85,14 @@ jobs:
           CWS_REFRESH_TOKEN: ${{ secrets.CWS_REFRESH_TOKEN }}
           CWS_EXTENSION_ID: ${{ secrets.CWS_EXTENSION_ID }}
           CWS_PUBLISHER_ID: ${{ secrets.CWS_PUBLISHER_ID }}
+          # A tag is the release act, so it submits for review on BOTH stores —
+          # otherwise the Chrome half stops at a draft nobody clicks while AMO
+          # goes all the way (how 0.6.0 sat unpublished for a day). A manual
+          # dispatch still defaults to a draft.
+          CHROME_PUBLISH: ${{ startsWith(github.ref, 'refs/tags/ext-v') || github.event.inputs.chrome_publish == 'true' }}
         run: |
           set -euo pipefail
-          if [ "${{ github.event.inputs.chrome_publish }}" = "true" ]; then
+          if [ "$CHROME_PUBLISH" = "true" ]; then
             bun run submit:chrome --publish
           else
             bun run submit:chrome
