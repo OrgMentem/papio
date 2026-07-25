@@ -10,6 +10,8 @@ execution records in `notes/acquisition-stack-plan.md`.
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-07-25
+
 ### Added
 
 - `papio doctor` now warns when an OpenURL resolver base — the default
