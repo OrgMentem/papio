@@ -2089,6 +2089,7 @@ test("inbox runtime messages validate the exact extension sender", async () => {
     runtimeID: "papio-test-id",
     inboxURL: "chrome-extension://papio-test-id/inbox.html",
     popupURL: "chrome-extension://papio-test-id/popup.html",
+    historyURL: "chrome-extension://papio-test-id/history.html",
   };
   const message = { type: "papio.triage.counts", request: {} };
 
@@ -2115,12 +2116,88 @@ test("inbox runtime messages validate the exact extension sender", async () => {
     });
 });
 
+test("papio.stats from any papio page routes to the bridge stats request", async () => {
+  const h = makeHarness();
+  const urls = {
+    runtimeID: "papio-test-id",
+    inboxURL: "chrome-extension://papio-test-id/inbox.html",
+    popupURL: "chrome-extension://papio-test-id/popup.html",
+    historyURL: "chrome-extension://papio-test-id/history.html",
+  };
+  const statsReply: Awaited<ReturnType<Bridge["requestStats"]>> = {
+    ok: true,
+    stats: {
+      generated_at: "2026-07-25T08:00:00Z",
+      acquired_total: 3,
+      failed_total: 1,
+      handoffs_required: 2,
+      access: { open_access: 1, institutional: 2, licensed_api: 0, other: 0 },
+      series: [{ period_start: "2026-07-20T00:00:00Z", acquired: 3 }],
+    },
+  };
+  let statsCalls = 0;
+  h.bridge.requestStats = async () => {
+    statsCalls += 1;
+    return statsReply;
+  };
+
+  // The popup summary, the history page, and the inbox all read stats.
+  for (const url of [urls.popupURL, urls.historyURL, urls.inboxURL]) {
+    await expect(
+      handleInboxRuntimeMessage(h.bridge, { type: "papio.stats", request: {} }, { id: urls.runtimeID, url }, urls),
+    ).resolves.toBe(statsReply);
+  }
+  expect(statsCalls).toBe(3);
+});
+
+test("papio.stats rejects foreign senders and malformed requests without touching the bridge", async () => {
+  const h = makeHarness();
+  const urls = {
+    runtimeID: "papio-test-id",
+    inboxURL: "chrome-extension://papio-test-id/inbox.html",
+    popupURL: "chrome-extension://papio-test-id/popup.html",
+    historyURL: "chrome-extension://papio-test-id/history.html",
+  };
+  let statsCalls = 0;
+  h.bridge.requestStats = async (): ReturnType<Bridge["requestStats"]> => {
+    statsCalls += 1;
+    return { ok: false, error: { code: "unexpected", message: "the bridge must not be reached" } };
+  };
+
+  for (const sender of [
+    { id: urls.runtimeID, url: "chrome-extension://papio-test-id/options.html" },
+    { id: urls.runtimeID, url: "https://provider.example/article" },
+    { id: "other-extension", url: urls.historyURL },
+  ]) {
+    await expect(
+      handleInboxRuntimeMessage(h.bridge, { type: "papio.stats", request: {} }, sender, urls),
+    ).resolves.toEqual({
+      ok: false,
+      error: { code: "unauthorized", message: "This sender cannot access papio stats" },
+    });
+  }
+
+  const sender = { id: urls.runtimeID, url: urls.popupURL };
+  for (const message of [
+    { type: "papio.stats", request: { unexpected: true } },
+    { type: "papio.stats" },
+    { type: "papio.stats", request: {}, extra: 1 },
+  ]) {
+    await expect(handleInboxRuntimeMessage(h.bridge, message, sender, urls)).resolves.toEqual({
+      ok: false,
+      error: { code: "invalid_request", message: "Invalid stats request" },
+    });
+  }
+  expect(statsCalls).toBe(0);
+});
+
 test("open inbox runtime request focuses the singleton or creates it from the popup", async () => {
   const h = makeHarness(undefined, { windows: true });
   const urls = {
     runtimeID: "papio-test-id",
     inboxURL: "chrome-extension://papio-test-id/inbox.html",
     popupURL: "chrome-extension://papio-test-id/popup.html",
+    historyURL: "chrome-extension://papio-test-id/history.html",
   };
   h.tabs.live.set(88, { id: 88, url: urls.inboxURL, windowId: 600 });
   h.windows?.live.set(600, { id: 600, state: "minimized" });
@@ -2154,6 +2231,7 @@ test("inbox handoff runtime opening focuses the live offered tab without returni
     runtimeID: "papio-test-id",
     inboxURL: "chrome-extension://papio-test-id/inbox.html",
     popupURL: "chrome-extension://papio-test-id/popup.html",
+    historyURL: "chrome-extension://papio-test-id/history.html",
   };
   await h.bridge.start();
   await h.port.inbound(jobOffer("job_0001a_inbox_open"));
@@ -2209,6 +2287,7 @@ test("an inbox dismiss relays verdict dismiss through the native resolve", async
     runtimeID: "papio-test-id",
     inboxURL: "chrome-extension://papio-test-id/inbox.html",
     popupURL: "chrome-extension://papio-test-id/popup.html",
+    historyURL: "chrome-extension://papio-test-id/history.html",
   };
   await h.bridge.start();
   await h.port.inbound(helloAck({ daemon_version: "0.9.0", features: ["triage_mutations_v1"] }));

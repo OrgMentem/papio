@@ -20,6 +20,7 @@ import (
 
 	"papio/internal/job"
 	"papio/internal/protocol"
+	"papio/internal/resolver"
 	"papio/internal/store"
 	"papio/internal/watch"
 	"papio/internal/work"
@@ -309,6 +310,144 @@ func (s *Service) Snapshot(ctx context.Context, request SnapshotRequest) (Snapsh
 func (s *Service) Counts(ctx context.Context) (Counts, error) {
 	_, counts, _, _, err := s.collect(ctx)
 	return counts, err
+}
+
+// statsSeriesWeeks bounds the browser stats weekly time series, well under
+// the wire cap of 60 buckets (protocol.validateStatsResponse).
+const statsSeriesWeeks = 12
+
+// Stats is the daemon-owned acquisition value read model behind the browser
+// extension's stats_request RPC. Acquired jobs are terminal ready/imported
+// jobs; failed jobs are terminal failed/unavailable jobs (cancelled jobs
+// count toward neither, since the user - not the acquisition pipeline -
+// decided the outcome).
+type Stats struct {
+	AcquiredTotal    int
+	FailedTotal      int
+	HandoffsRequired int
+	Access           StatsAccess
+	Series           []StatsBucket
+}
+
+// StatsAccess breaks AcquiredTotal down by the access basis of each
+// acquired job's accepted candidate. Other captures manual acquisitions and
+// acquired jobs with no accepted candidate (stale rows predating candidate
+// recording), so the buckets need not sum to AcquiredTotal-exact parity with
+// any single source.
+type StatsAccess struct {
+	OpenAccess    int
+	Institutional int
+	LicensedAPI   int
+	Other         int
+}
+
+// StatsBucket is one weekly bucket of the acquisition series: jobs acquired
+// in the ISO week (Monday-Sunday, UTC) beginning PeriodStart.
+type StatsBucket struct {
+	PeriodStart time.Time
+	Acquired    int
+}
+
+// Stats returns lifetime acquisition value metrics for the browser
+// extension's stats surface. It reads from the same store as Counts but is
+// independent of the paginated triage inbox.
+func (s *Service) Stats(ctx context.Context) (Stats, error) {
+	if s == nil || s.Store == nil {
+		return Stats{}, errors.New("triage service is not configured")
+	}
+	tx, err := s.Store.DB().BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return Stats{}, fmt.Errorf("starting triage stats: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var stats Stats
+	if err := tx.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM jobs WHERE state IN ('failed', 'unavailable')`,
+	).Scan(&stats.FailedTotal); err != nil {
+		return Stats{}, err
+	}
+
+	weeks := seriesWeeks(s.now(), statsSeriesWeeks)
+	buckets := make(map[int64]int, len(weeks))
+	for _, week := range weeks {
+		buckets[week.Unix()] = 0
+	}
+	seriesStart := weeks[0]
+	seriesEnd := weeks[len(weeks)-1].AddDate(0, 0, 7)
+
+	rows, err := tx.QueryContext(ctx, `
+		SELECT j.updated_at,
+		       (SELECT c.access_basis FROM candidates c
+		          WHERE c.job_id = j.id AND c.status = 'accepted' LIMIT 1),
+		       EXISTS(SELECT 1 FROM human_actions ha WHERE ha.job_id = j.id)
+		FROM jobs j
+		WHERE j.state IN ('ready', 'imported')`)
+	if err != nil {
+		return Stats{}, err
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var updatedAtRaw string
+		var accessBasis sql.NullString
+		var handoff int
+		if err := rows.Scan(&updatedAtRaw, &accessBasis, &handoff); err != nil {
+			return Stats{}, err
+		}
+		stats.AcquiredTotal++
+		if handoff != 0 {
+			stats.HandoffsRequired++
+		}
+		switch accessBasis.String {
+		case resolver.AccessOpen:
+			stats.Access.OpenAccess++
+		case resolver.AccessInstitutional:
+			stats.Access.Institutional++
+		case resolver.AccessLicensedAPI:
+			stats.Access.LicensedAPI++
+		default:
+			stats.Access.Other++
+		}
+		updatedAt, err := time.Parse(time.RFC3339Nano, updatedAtRaw)
+		if err != nil {
+			return Stats{}, err
+		}
+		if updatedAt.Before(seriesStart) || !updatedAt.Before(seriesEnd) {
+			continue
+		}
+		buckets[weekStart(updatedAt).Unix()]++
+	}
+	if err := rows.Err(); err != nil {
+		return Stats{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return Stats{}, fmt.Errorf("committing triage stats: %w", err)
+	}
+
+	stats.Series = make([]StatsBucket, len(weeks))
+	for i, week := range weeks {
+		stats.Series[i] = StatsBucket{PeriodStart: week, Acquired: buckets[week.Unix()]}
+	}
+	return stats, nil
+}
+
+// weekStart returns the Monday UTC midnight beginning t's ISO week.
+func weekStart(t time.Time) time.Time {
+	t = t.UTC()
+	midnight := time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)
+	daysSinceMonday := (int(midnight.Weekday()) + 6) % 7 // Monday=0 .. Sunday=6
+	return midnight.AddDate(0, 0, -daysSinceMonday)
+}
+
+// seriesWeeks returns n consecutive weekly bucket starts, oldest first,
+// ending with the week containing now.
+func seriesWeeks(now time.Time, n int) []time.Time {
+	current := weekStart(now)
+	weeks := make([]time.Time, n)
+	for i := range weeks {
+		weeks[i] = current.AddDate(0, 0, -7*(n-1-i))
+	}
+	return weeks
 }
 
 // FindWatchHit resolves an item ID against the full current inbox. The returned

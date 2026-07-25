@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"papio/internal/job"
+	"papio/internal/resolver"
 	"papio/internal/store"
 	"papio/internal/watch"
 	"papio/internal/work"
@@ -301,5 +302,177 @@ func TestSnapshotCursorPaginationAndCounts(t *testing.T) {
 	}
 	if counts.PendingTotal != 3 || counts.WatchHits != 3 || counts.JobsWorking != 1 || counts.FailureGroups7d != 1 {
 		t.Fatalf("counts = %+v", counts)
+	}
+}
+
+// createStatsJob drives a fresh job request straight to targetState via the
+// shortest legal transition path, for browser-stats aggregation tests that
+// only care about the terminal state and its updated_at.
+func createStatsJob(t *testing.T, jobs *job.Store, requestID, targetState string) string {
+	t.Helper()
+	ctx := context.Background()
+	id, err := jobs.CreateRequest(ctx, requestID,
+		work.Work{DOI: "10.1000/" + requestID, Title: "Stats work"}, "", "",
+		job.Policy{AccessMode: "conservative", DesiredVersion: "any", Resolver: "fixture", FetchMaxBytes: 1 << 20}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transition := func(from, to string) {
+		t.Helper()
+		if err := jobs.Transition(ctx, id, from, to, nil); err != nil {
+			t.Fatalf("%s->%s: %v", from, to, err)
+		}
+	}
+	switch targetState {
+	case job.StateReady:
+		transition(job.StateQueued, job.StateResolving)
+		transition(job.StateResolving, job.StateReady)
+	case job.StateImported:
+		transition(job.StateQueued, job.StateResolving)
+		transition(job.StateResolving, job.StateReady)
+		transition(job.StateReady, job.StateImported)
+	case job.StateFailed:
+		transition(job.StateQueued, job.StateResolving)
+		transition(job.StateResolving, job.StateFailed)
+	case job.StateUnavailable:
+		transition(job.StateQueued, job.StateResolving)
+		transition(job.StateResolving, job.StateUnavailable)
+	case job.StateCancelled:
+		transition(job.StateQueued, job.StateCancelled)
+	default:
+		t.Fatalf("unsupported stats test target state %q", targetState)
+	}
+	return id
+}
+
+// createHandoffAcquiredJob parks a job in awaiting_human, opens a human
+// action against it (exactly as an institutional handoff does), then lets it
+// reach ready — the shape handoffs_required counts.
+func createHandoffAcquiredJob(t *testing.T, jobs *job.Store, requestID string) string {
+	t.Helper()
+	ctx := context.Background()
+	id, err := jobs.CreateRequest(ctx, requestID,
+		work.Work{DOI: "10.1000/" + requestID, Title: "Stats handoff work"}, "", "",
+		job.Policy{AccessMode: "conservative", DesiredVersion: "any", Resolver: "fixture", FetchMaxBytes: 1 << 20}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, step := range [][2]string{
+		{job.StateQueued, job.StateResolving},
+		{job.StateResolving, job.StateAwaitingHuman},
+	} {
+		if err := jobs.Transition(ctx, id, step[0], step[1], nil); err != nil {
+			t.Fatalf("%s->%s: %v", step[0], step[1], err)
+		}
+	}
+	if _, err := jobs.OpenHumanAction(ctx, id, "openurl_handoff", "handoff available"); err != nil {
+		t.Fatal(err)
+	}
+	for _, step := range [][2]string{
+		{job.StateAwaitingHuman, job.StateResolving},
+		{job.StateResolving, job.StateReady},
+	} {
+		if err := jobs.Transition(ctx, id, step[0], step[1], nil); err != nil {
+			t.Fatalf("%s->%s: %v", step[0], step[1], err)
+		}
+	}
+	return id
+}
+
+// acceptCandidate inserts and accepts one candidate for jobID, the shape
+// Stats reads back as the job's access basis.
+func acceptCandidate(t *testing.T, jobs *job.Store, jobID, urlKey, accessBasis string) {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := jobs.InsertCandidates(ctx, jobID, []job.Candidate{{
+		Source: "fixture", URLRedacted: "https://example.test/" + urlKey, URLKey: urlKey,
+		Version: resolver.VersionPublished, AccessBasis: accessBasis, ReuseLicense: "unknown",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	candidate, err := jobs.NextPendingCandidate(ctx, jobID)
+	if err != nil || candidate == nil {
+		t.Fatalf("next pending candidate for %s: %+v, %v", jobID, candidate, err)
+	}
+	if err := jobs.MarkCandidate(ctx, candidate.ID, "accepted"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// setJobUpdatedAt overrides a job's updated_at directly, since Transition
+// always stamps the real wall clock; Stats' weekly series needs a
+// deterministic terminal-transition time to assert against.
+func setJobUpdatedAt(t *testing.T, jobs *job.Store, jobID string, at time.Time) {
+	t.Helper()
+	if _, err := jobs.S.DB().ExecContext(context.Background(),
+		`UPDATE jobs SET updated_at = ? WHERE id = ?`, at.UTC().Format(time.RFC3339Nano), jobID); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestStats(t *testing.T) {
+	service, _, jobs := triageTestService(t)
+	ctx := context.Background()
+
+	// Current-week acquired job: open-access candidate plus a human-action
+	// handoff before reaching ready.
+	handoffJob := createHandoffAcquiredJob(t, jobs, "stats-handoff")
+	acceptCandidate(t, jobs, handoffJob, "handoff-candidate", resolver.AccessOpen)
+	setJobUpdatedAt(t, jobs, handoffJob, time.Date(2026, 7, 20, 10, 0, 0, 0, time.UTC))
+
+	// Oldest-window-week acquired (imported) job: institutional candidate.
+	importedJob := createStatsJob(t, jobs, "stats-imported", job.StateImported)
+	acceptCandidate(t, jobs, importedJob, "imported-candidate", resolver.AccessInstitutional)
+	setJobUpdatedAt(t, jobs, importedJob, time.Date(2026, 5, 4, 9, 0, 0, 0, time.UTC))
+
+	// Acquired job outside the 12-week series window: licensed-API candidate.
+	// Counts toward totals and access but must not land in any bucket.
+	outsideJob := createStatsJob(t, jobs, "stats-outside", job.StateReady)
+	acceptCandidate(t, jobs, outsideJob, "outside-candidate", resolver.AccessLicensedAPI)
+	setJobUpdatedAt(t, jobs, outsideJob, time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+
+	// Acquired job with no accepted candidate -> Other; mid-window week.
+	noCandidateJob := createStatsJob(t, jobs, "stats-no-candidate", job.StateReady)
+	setJobUpdatedAt(t, jobs, noCandidateJob, time.Date(2026, 6, 15, 0, 0, 0, 0, time.UTC))
+
+	createStatsJob(t, jobs, "stats-failed", job.StateFailed)
+	createStatsJob(t, jobs, "stats-unavailable", job.StateUnavailable)
+	createStatsJob(t, jobs, "stats-cancelled", job.StateCancelled)
+
+	stats, err := service.Stats(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.AcquiredTotal != 4 {
+		t.Fatalf("acquired_total = %d, want 4", stats.AcquiredTotal)
+	}
+	if stats.FailedTotal != 2 {
+		t.Fatalf("failed_total = %d, want 2", stats.FailedTotal)
+	}
+	if stats.HandoffsRequired != 1 {
+		t.Fatalf("handoffs_required = %d, want 1", stats.HandoffsRequired)
+	}
+	wantAccess := StatsAccess{OpenAccess: 1, Institutional: 1, LicensedAPI: 1, Other: 1}
+	if stats.Access != wantAccess {
+		t.Fatalf("access = %+v, want %+v", stats.Access, wantAccess)
+	}
+	if len(stats.Series) != 12 {
+		t.Fatalf("series length = %d, want 12", len(stats.Series))
+	}
+	if got, want := stats.Series[0], (StatsBucket{PeriodStart: time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC), Acquired: 1}); !got.PeriodStart.Equal(want.PeriodStart) || got.Acquired != want.Acquired {
+		t.Fatalf("series[0] = %+v, want %+v", got, want)
+	}
+	if got, want := stats.Series[6], (StatsBucket{PeriodStart: time.Date(2026, 6, 15, 0, 0, 0, 0, time.UTC), Acquired: 1}); !got.PeriodStart.Equal(want.PeriodStart) || got.Acquired != want.Acquired {
+		t.Fatalf("series[6] = %+v, want %+v", got, want)
+	}
+	if got, want := stats.Series[11], (StatsBucket{PeriodStart: time.Date(2026, 7, 20, 0, 0, 0, 0, time.UTC), Acquired: 1}); !got.PeriodStart.Equal(want.PeriodStart) || got.Acquired != want.Acquired {
+		t.Fatalf("series[11] = %+v, want %+v", got, want)
+	}
+	total := 0
+	for _, bucket := range stats.Series {
+		total += bucket.Acquired
+	}
+	if total != 3 {
+		t.Fatalf("series total = %d, want 3 (outside-window job excluded)", total)
 	}
 }

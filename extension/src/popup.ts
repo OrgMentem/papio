@@ -18,6 +18,13 @@ import {
 } from "./capture";
 import { chromeBackend, type ActiveJob, type StoreShape, TERMS_CONSENT_KEY } from "./state";
 import { renderPapio } from "./dom";
+import {
+  EST_MINUTES_SAVED_PER_PAPER,
+  formatHoursSaved,
+  formatShare,
+  parseStatsReply,
+  type AcquisitionStats,
+} from "./stats";
 
 
 /** Render actionable daemon problems near the popup actions. Routine version
@@ -254,6 +261,58 @@ export function wireInboxLauncher(
         if (status) status.textContent = error instanceof Error ? error.message : "Could not open inbox";
         button.disabled = false;
       });
+  });
+}
+
+/** The history page ships beside the popup under dist/ (see build.ts); the
+ * background broker derives the same URL when authorizing stats senders. */
+export const HISTORY_PAGE_PATH = "dist/history.html";
+
+/**
+ * Fill the "Your papio impact" summary, or hide the whole section when stats
+ * are unavailable (daemon offline or too old) — the popup stays a launcher,
+ * never an error surface.
+ */
+export function renderImpactSummary(
+  doc: Document,
+  stats: Pick<AcquisitionStats, "acquired_total" | "failed_total"> | null,
+): void {
+  const section = doc.getElementById("impact-summary");
+  const acquired = doc.getElementById("impact-acquired");
+  const timeSaved = doc.getElementById("impact-time-saved");
+  const successRate = doc.getElementById("impact-success-rate");
+  if (!section || !acquired || !timeSaved || !successRate) return;
+  if (stats === null) {
+    section.hidden = true;
+    return;
+  }
+  acquired.textContent = String(stats.acquired_total);
+  timeSaved.textContent = formatHoursSaved(stats.acquired_total * EST_MINUTES_SAVED_PER_PAPER);
+  successRate.textContent = formatShare(stats.acquired_total, stats.acquired_total + stats.failed_total);
+  section.hidden = false;
+}
+
+export async function refreshImpactSummary(doc: Document = document): Promise<void> {
+  let stats: AcquisitionStats | null;
+  try {
+    const reply = parseStatsReply(await chrome.runtime.sendMessage({ type: "papio.stats", request: {} }));
+    stats = reply.ok ? reply.stats : null;
+  } catch {
+    stats = null;
+  }
+  renderImpactSummary(doc, stats);
+}
+
+export function wireHistoryLauncher(doc: Document = document): void {
+  const button = doc.getElementById("view-history-btn");
+  if (!(button instanceof HTMLButtonElement) || button.dataset.wired) return;
+  button.dataset.wired = "1";
+  button.addEventListener("click", () => {
+    void chrome.tabs.create({ url: chrome.runtime.getURL(HISTORY_PAGE_PATH) }).then(() => {
+      // Chrome dismisses the popup when the new tab takes focus; Firefox
+      // keeps it open, so close it explicitly once the tab exists.
+      window.close();
+    });
   });
 }
 
@@ -502,9 +561,13 @@ if (typeof document !== "undefined" && typeof chrome !== "undefined") {
   wireDevTools();
   wireSettings();
   wireInboxLauncher();
+  wireHistoryLauncher();
   wirePrimaryShortcut();
   // The initial refresh must not float: a popup opened before storage is
   // reachable (or a test importing this module) would otherwise surface an
   // unhandled rejection. Later refreshes re-render; this one is best-effort.
   refresh().catch((e) => console.debug("papio: initial popup refresh failed", e));
+  // Stats are additive: refreshImpactSummary resolves to a hidden section on
+  // any failure, so the launcher renders identically with or without a daemon.
+  void refreshImpactSummary();
 }

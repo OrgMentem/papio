@@ -450,6 +450,58 @@
         justify-self: start;
       }
 
+      .impact {
+        background: var(--color-surface);
+        border: 1px solid var(--color-border);
+        border-radius: var(--radius-card);
+        display: grid;
+        gap: var(--space-2);
+        padding: var(--space-3);
+      }
+
+      .impact > h2 {
+        color: var(--color-muted);
+        font-size: var(--font-size-label);
+        font-weight: 700;
+        letter-spacing: 0.07em;
+        text-transform: uppercase;
+      }
+
+      .impact-metrics {
+        display: grid;
+        gap: var(--space-2);
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        margin: 0;
+      }
+
+      .impact-metric dt {
+        color: var(--color-muted);
+        font-size: var(--font-size-label);
+      }
+
+      .impact-metric dd {
+        color: var(--color-brand-ink);
+        font-size: var(--font-size-item-title);
+        font-variant-numeric: tabular-nums;
+        font-weight: 700;
+        margin: 0;
+      }
+
+      .impact > button {
+        background: transparent;
+        border-color: transparent;
+        color: var(--color-primary);
+        font-weight: 600;
+        justify-self: start;
+        padding-inline: 0;
+      }
+
+      .impact > button:hover:not(:disabled) {
+        background: transparent;
+        color: var(--color-primary-solid-hover);
+        text-decoration: underline;
+      }
+
 
       @media (prefers-reduced-motion: reduce) {
         *,
@@ -508,6 +560,25 @@
           <p id="open-inbox-description">Review papers and actions that need your attention.</p>
           <div id="open-inbox-status" class="capture-status" aria-live="polite"></div>
         </div>
+      </section>
+
+      <section id="impact-summary" class="impact" hidden aria-label="Your papio impact">
+        <h2>Your <em>papio</em> impact</h2>
+        <dl class="impact-metrics">
+          <div class="impact-metric">
+            <dt>Papers acquired</dt>
+            <dd id="impact-acquired">—</dd>
+          </div>
+          <div class="impact-metric">
+            <dt>Est. time saved</dt>
+            <dd id="impact-time-saved">—</dd>
+          </div>
+          <div class="impact-metric">
+            <dt>Success rate</dt>
+            <dd id="impact-success-rate">—</dd>
+          </div>
+        </dl>
+        <button id="view-history-btn" type="button">View history →</button>
       </section>
       <section id="resolver-grant" class="resolver-grant" hidden></section>
 

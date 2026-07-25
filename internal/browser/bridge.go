@@ -48,6 +48,7 @@ const (
 	triageSnapshotSchema2Feature = "triage_snapshot_schema_v2"
 	triageMutationsFeature       = "triage_mutations_v1"
 	reviewPreviewFeature         = "review_preview_v1"
+	statsFeature                 = "browser_stats_v1"
 	previewCapabilityTTL         = 10 * time.Minute
 )
 
@@ -124,13 +125,17 @@ const pendingExpireAfter = 5 * time.Minute
 // NewBridge constructs the bridge. It is cheap and always constructed; whether
 // any job is ever offered depends on config (extension_id / openurl base).
 func NewBridge(jobs *job.Store, svc *app.Service, triageService *triage.Service, watchRunner *watch.Runner, previewServer *preview.Server, cfg config.Config, version string, features []string) *Bridge {
+	required := []string{
+		pageAcquireFeature, triageSnapshotFeature, triageSnapshotSchema2Feature, triageMutationsFeature, reviewPreviewFeature, statsFeature,
+	}
 	return &Bridge{
 		jobs: jobs, svc: svc, triage: triageService, watchRunner: watchRunner, preview: previewServer, cfg: cfg,
-		Version: version,
-		Features: appendFeatures(features,
-			pageAcquireFeature, triageSnapshotFeature, triageSnapshotSchema2Feature, triageMutationsFeature, reviewPreviewFeature),
-		offered: map[string]bool{}, cancelSent: map[string]bool{}, pending: map[string]*browserSession{},
-		now: time.Now,
+		Version:    version,
+		Features:   appendFeatures(features, required...),
+		offered:    map[string]bool{},
+		cancelSent: map[string]bool{},
+		pending:    map[string]*browserSession{},
+		now:        time.Now,
 	}
 }
 
@@ -411,7 +416,7 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 	if b.holder == nil || b.holder.ID != sessionID {
 		switch msg.Type {
 		case protocol.MsgPageAcquire, protocol.MsgTriageSnapshotRequest, protocol.MsgTriageCountsRequest,
-			protocol.MsgTriageDecide, protocol.MsgHumanActionResolve, protocol.MsgReviewPreviewRequest:
+			protocol.MsgTriageDecide, protocol.MsgHumanActionResolve, protocol.MsgReviewPreviewRequest, protocol.MsgStatsRequest:
 			// Stateless request/response traffic works from any browser —
 			// even an outdated one; every frame is protocol-validated
 			// regardless of version. "Acquire this page" and the inbox must
@@ -446,6 +451,9 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 
 	case protocol.MsgReviewPreviewRequest:
 		return b.reviewPreview(ctx, msg.Payload.(*protocol.ReviewPreviewRequestPayload))
+
+	case protocol.MsgStatsRequest:
+		return b.stats(ctx, msg.Payload.(*protocol.StatsRequestPayload))
 
 	case protocol.MsgJobAccept:
 		return nil, b.jobs.S.AppendEvent(ctx, msg.JobID, "browser.job_accept", nil)
@@ -707,6 +715,41 @@ func (b *Bridge) triageCounts(ctx context.Context, request *protocol.TriageCount
 	frame, err := b.frame(protocol.MsgTriageCountsResponse, "", protocol.TriageCountsResponsePayload{
 		RequestID: request.RequestID, Counts: triageCountsPayload(counts),
 	})
+	if err != nil {
+		return nil, err
+	}
+	return []json.RawMessage{frame}, nil
+}
+
+func statsPayload(requestID string, generatedAt string, stats triage.Stats) protocol.StatsResponsePayload {
+	series := make([]protocol.StatsBucket, len(stats.Series))
+	for i, bucket := range stats.Series {
+		series[i] = protocol.StatsBucket{
+			PeriodStart: bucket.PeriodStart.UTC().Format(time.RFC3339), Acquired: int64(bucket.Acquired),
+		}
+	}
+	return protocol.StatsResponsePayload{
+		RequestID: requestID, GeneratedAt: generatedAt,
+		AcquiredTotal: int64(stats.AcquiredTotal), FailedTotal: int64(stats.FailedTotal),
+		HandoffsRequired: int64(stats.HandoffsRequired),
+		Access: protocol.StatsAccess{
+			OpenAccess: int64(stats.Access.OpenAccess), Institutional: int64(stats.Access.Institutional),
+			LicensedAPI: int64(stats.Access.LicensedAPI), Other: int64(stats.Access.Other),
+		},
+		Series: series,
+	}
+}
+
+func (b *Bridge) stats(ctx context.Context, request *protocol.StatsRequestPayload) ([]json.RawMessage, error) {
+	if b.triage == nil {
+		return nil, errors.New("triage service is not configured")
+	}
+	stats, err := b.triage.Stats(ctx)
+	if err != nil {
+		return nil, err
+	}
+	frame, err := b.frame(protocol.MsgStatsResponse, "",
+		statsPayload(request.RequestID, b.now().UTC().Format(time.RFC3339), stats))
 	if err != nil {
 		return nil, err
 	}

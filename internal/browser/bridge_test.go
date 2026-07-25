@@ -22,6 +22,7 @@ import (
 	"papio/internal/pdf"
 	"papio/internal/preview"
 	"papio/internal/protocol"
+	"papio/internal/resolver"
 	"papio/internal/store"
 	"papio/internal/triage"
 	"papio/internal/watch"
@@ -198,7 +199,7 @@ func TestHelloAckAnnouncesDaemonVersion(t *testing.T) {
 		t.Fatalf("daemon_version = %q, want 0.1.0-test", payload.DaemonVersion)
 	}
 	if !slices.Equal(payload.Features, []string{
-		"browser_handoff", pageAcquireFeature, triageSnapshotFeature, triageSnapshotSchema2Feature, triageMutationsFeature, reviewPreviewFeature,
+		"browser_handoff", pageAcquireFeature, triageSnapshotFeature, triageSnapshotSchema2Feature, triageMutationsFeature, reviewPreviewFeature, statsFeature,
 	}) {
 		t.Fatalf("features = %v, want required bridge feature set", payload.Features)
 	}
@@ -218,8 +219,8 @@ func TestHelloAckFeatureCapReservesMandatoryFeatures(t *testing.T) {
 		t.Fatalf("no hello_ack in %v", msgs)
 	}
 	got := ack.Payload.(*protocol.HelloAckPayload).Features
-	want := append(append([]string(nil), features[:27]...),
-		pageAcquireFeature, triageSnapshotFeature, triageSnapshotSchema2Feature, triageMutationsFeature, reviewPreviewFeature)
+	want := append(append([]string(nil), features[:26]...),
+		pageAcquireFeature, triageSnapshotFeature, triageSnapshotSchema2Feature, triageMutationsFeature, reviewPreviewFeature, statsFeature)
 	if !slices.Equal(got, want) {
 		t.Fatalf("features = %v, want %v", got, want)
 	}
@@ -364,6 +365,112 @@ func TestTriageCountsResponseEchoesRequestID(t *testing.T) {
 	}
 	if payload := result.Payload.(*protocol.TriageCountsResponsePayload); payload.RequestID != "request-count-001" {
 		t.Fatalf("counts response request_id = %q", payload.RequestID)
+	}
+}
+
+// statsAcquiredJob drives a fresh job to ready with an accepted candidate at
+// accessBasis, optionally passing through an awaiting_human handoff first —
+// the shape browser stats' HandoffsRequired counts.
+func statsAcquiredJob(t *testing.T, jobs *job.Store, requestID, accessBasis string, handoff bool) string {
+	t.Helper()
+	ctx := context.Background()
+	id, err := jobs.CreateRequest(ctx, requestID,
+		work.Work{DOI: "10.1000/" + requestID, Title: "Stats work"}, "", "",
+		job.Policy{AccessMode: "conservative", DesiredVersion: "any", Resolver: "fixture", FetchMaxBytes: 1 << 20}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if handoff {
+		for _, step := range [][2]string{
+			{job.StateQueued, job.StateResolving},
+			{job.StateResolving, job.StateAwaitingHuman},
+		} {
+			if err := jobs.Transition(ctx, id, step[0], step[1], nil); err != nil {
+				t.Fatalf("%s->%s: %v", step[0], step[1], err)
+			}
+		}
+		if _, err := jobs.OpenHumanAction(ctx, id, "openurl_handoff", "handoff available"); err != nil {
+			t.Fatal(err)
+		}
+		if err := jobs.Transition(ctx, id, job.StateAwaitingHuman, job.StateResolving, nil); err != nil {
+			t.Fatal(err)
+		}
+	} else if err := jobs.Transition(ctx, id, job.StateQueued, job.StateResolving, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.Transition(ctx, id, job.StateResolving, job.StateReady, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := jobs.InsertCandidates(ctx, id, []job.Candidate{{
+		Source: "fixture", URLRedacted: "https://example.test/" + requestID, URLKey: requestID,
+		Version: resolver.VersionPublished, AccessBasis: accessBasis, ReuseLicense: "unknown",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	candidate, err := jobs.NextPendingCandidate(ctx, id)
+	if err != nil || candidate == nil {
+		t.Fatalf("next pending candidate for %s: %+v, %v", id, candidate, err)
+	}
+	if err := jobs.MarkCandidate(ctx, candidate.ID, "accepted"); err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+// statsFailedJob drives a fresh job to failed, the shape browser stats'
+// FailedTotal counts.
+func statsFailedJob(t *testing.T, jobs *job.Store, requestID string) string {
+	t.Helper()
+	ctx := context.Background()
+	id, err := jobs.CreateRequest(ctx, requestID,
+		work.Work{DOI: "10.1000/" + requestID, Title: "Stats failed work"}, "", "",
+		job.Policy{AccessMode: "conservative", DesiredVersion: "any", Resolver: "fixture", FetchMaxBytes: 1 << 20}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.Transition(ctx, id, job.StateQueued, job.StateResolving, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.Transition(ctx, id, job.StateResolving, job.StateFailed, nil); err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+func TestStatsResponseReflectsAcquisitionAggregates(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	statsAcquiredJob(t, jobs, "stats-acquired-001", resolver.AccessOpen, true)
+	statsFailedJob(t, jobs, "stats-failed-001")
+
+	msgs, _ := runSync(t, b, hello(), inFrame(t, protocol.MsgStatsRequest, "",
+		protocol.StatsRequestPayload{RequestID: "request-stats-001"}))
+	result := firstOfType(msgs, protocol.MsgStatsResponse)
+	if result == nil {
+		t.Fatalf("stats response missing: %v", msgs)
+	}
+	payload := result.Payload.(*protocol.StatsResponsePayload)
+	if payload.RequestID != "request-stats-001" {
+		t.Fatalf("stats response request_id = %q", payload.RequestID)
+	}
+	if _, err := time.Parse(time.RFC3339, payload.GeneratedAt); err != nil {
+		t.Fatalf("generated_at not RFC3339: %q (%v)", payload.GeneratedAt, err)
+	}
+	if payload.AcquiredTotal != 1 || payload.FailedTotal != 1 || payload.HandoffsRequired != 1 {
+		t.Fatalf("stats totals = %+v", payload)
+	}
+	wantAccess := protocol.StatsAccess{OpenAccess: 1}
+	if payload.Access != wantAccess {
+		t.Fatalf("access = %+v, want %+v", payload.Access, wantAccess)
+	}
+	if len(payload.Series) != 12 {
+		t.Fatalf("series length = %d, want 12", len(payload.Series))
+	}
+	total := int64(0)
+	for _, bucket := range payload.Series {
+		total += bucket.Acquired
+	}
+	if total != 1 {
+		t.Fatalf("series total = %d, want 1", total)
 	}
 }
 

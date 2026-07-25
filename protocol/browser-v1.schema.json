@@ -35,7 +35,9 @@
         "human_action_resolve",
         "human_action_resolve_result",
         "review_preview_request",
-        "review_preview_result"
+        "review_preview_result",
+        "stats_request",
+        "stats_response"
       ]
     },
     "msg_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,64}$" },
@@ -56,6 +58,26 @@
         "jobs_working": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
         "jobs_needs_review": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
         "failure_groups_7d": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
+      }
+    },
+    "stats_access": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["open_access", "institutional", "licensed_api", "other"],
+      "properties": {
+        "open_access": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "institutional": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "licensed_api": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "other": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
+      }
+    },
+    "stats_bucket": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["period_start", "acquired"],
+      "properties": {
+        "period_start": { "type": "string", "format": "date-time" },
+        "acquired": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
       }
     },
     "fact": {
@@ -670,6 +692,42 @@
                 }
               }
             ]
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "stats_request" } } },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["request_id"],
+            "properties": {
+              "request_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,64}$" }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "stats_response" } } },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["request_id", "generated_at", "acquired_total", "failed_total", "handoffs_required", "access", "series"],
+            "properties": {
+              "request_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,64}$" },
+              "generated_at": { "type": "string", "format": "date-time" },
+              "acquired_total": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+              "failed_total": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+              "handoffs_required": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+              "access": { "$ref": "#/$defs/stats_access" },
+              "series": { "type": "array", "maxItems": 60, "items": { "$ref": "#/$defs/stats_bucket" } }
+            }
           }
         }
       }

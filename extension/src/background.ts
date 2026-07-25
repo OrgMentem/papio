@@ -89,6 +89,7 @@ const TRIAGE_SNAPSHOT_FEATURE = "triage_snapshot_v1";
 const TRIAGE_SNAPSHOT_SCHEMA_2_FEATURE = "triage_snapshot_schema_v2";
 const TRIAGE_MUTATIONS_FEATURE = "triage_mutations_v1";
 const REVIEW_PREVIEW_FEATURE = "review_preview_v1";
+const STATS_FEATURE = "browser_stats_v1";
 // Fallback for a manifest without an action popup; both build targets ship
 // the pages under dist/ (see build.ts) and the manifest is the source of truth.
 const POPUP_PAGE_PATH = "dist/popup.html";
@@ -1383,6 +1384,20 @@ export class Bridge {
     };
   }
 
+  async requestStats(): Promise<BrokerReply<{ stats: Record<string, unknown> }>> {
+    const result = await this.requestNative(
+      "stats_request",
+      {},
+      "stats_response",
+      STATS_FEATURE,
+      false,
+    );
+    if (result.kind !== "response" || result.payload === undefined) return this.nativeFailure(result);
+    if (result.code !== undefined) return this.failure(result.code, result.message ?? "The request is unavailable");
+    const { request_id: _requestID, ...stats } = result.payload;
+    return { ok: true, stats };
+  }
+
   async requestTriageDecision(
     request: { item_id: string; op: "acquire" | "dismiss"; watch_scope?: "all" | number[] },
   ): Promise<BrokerReply<{ outcome: string; detail?: string }>> {
@@ -2085,7 +2100,7 @@ export class Bridge {
       case "triage_counts_response":
       case "triage_decide_result":
       case "human_action_resolve_result":
-      case "review_preview_result":
+      case "stats_response":
         this.resolveNativeResponse(msg);
         return;
       case "ack":
@@ -3292,6 +3307,7 @@ interface InboxRuntimeURLs {
   runtimeID: string;
   inboxURL: string;
   popupURL: string;
+  historyURL: string;
 }
 
 type InboxRuntimeReply =
@@ -3300,8 +3316,8 @@ type InboxRuntimeReply =
   | BrokerReply<{ snapshot: Record<string, unknown> }>
   | BrokerReply<{ counts: Record<string, unknown>; generated_at: string }>
   | BrokerReply<{ outcome: string; detail?: string }>
-  | BrokerReply<{ preview: Record<string, unknown> }>
-  | BrokerReply<{ opened: true }>;
+  | BrokerReply<{ opened: true }>
+  | BrokerReply<{ stats: Record<string, unknown> }>;
 
 function isObjectRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -3321,6 +3337,14 @@ function isInboxSender(sender: InboxRuntimeSender, urls: InboxRuntimeURLs): bool
 
 function isOpenInboxSender(sender: InboxRuntimeSender, urls: InboxRuntimeURLs): boolean {
   return sender.id === urls.runtimeID && (sender.url === urls.inboxURL || sender.url === urls.popupURL);
+}
+
+// Stats is a read consumed by the popup summary and the history page as well
+// as the inbox, so it accepts any of papio's own extension pages — never a
+// content script or a foreign extension.
+function isStatsSender(sender: InboxRuntimeSender, urls: InboxRuntimeURLs): boolean {
+  return sender.id === urls.runtimeID &&
+    (sender.url === urls.inboxURL || sender.url === urls.popupURL || sender.url === urls.historyURL);
 }
 
 function runtimeFailure(code: string, message: string): BrokerFailure {
@@ -3419,6 +3443,13 @@ export async function handleInboxRuntimeMessage(
     } catch {
       return runtimeFailure("open_failed", "Could not open the inbox");
     }
+  }
+  if (type === "papio.stats") {
+    if (!isStatsSender(sender, urls)) return runtimeFailure("unauthorized", "This sender cannot access papio stats");
+    if (!hasOnlyKeys(message, ["type", "request"])) return runtimeFailure("invalid_request", "Invalid stats request");
+    return isCountsRuntimeRequest(message["request"])
+      ? bridge.requestStats()
+      : runtimeFailure("invalid_request", "Invalid stats request");
   }
   if (
     type !== "papio.triage.snapshot" &&
@@ -3617,6 +3648,7 @@ if (typeof chrome !== "undefined" && chrome.runtime?.id) {
     runtimeID: chrome.runtime.id,
     inboxURL: chrome.runtime.getURL(declaredPopup.replace(/[^/]*$/, "inbox.html")),
     popupURL: chrome.runtime.getURL(declaredPopup),
+    historyURL: chrome.runtime.getURL(declaredPopup.replace(/[^/]*$/, "history.html")),
   };
   // Top-level registrations give Chrome a reason to start this worker at
   // browser launch and after install/update. Without them a cold-started
@@ -3634,7 +3666,8 @@ if (typeof chrome !== "undefined" && chrome.runtime?.id) {
         message["type"] === "papio.triage.decide" ||
         message["type"] === "papio.action.resolve" ||
         message["type"] === "papio.preview" ||
-        message["type"] === "papio.handoff.open")
+        message["type"] === "papio.handoff.open" ||
+        message["type"] === "papio.stats")
     ) {
       void handleInboxRuntimeMessage(bridge, message, _sender, inboxRuntimeURLs).then((reply) => {
         sendResponse(reply);

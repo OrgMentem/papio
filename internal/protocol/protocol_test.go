@@ -437,6 +437,8 @@ func TestTriageFixturePayloadRoundTrips(t *testing.T) {
 		"browser-human-action-resolve-result.json": MsgHumanActionResolveResult,
 		"browser-review-preview-request.json":      MsgReviewPreviewRequest,
 		"browser-review-preview-result.json":       MsgReviewPreviewResult,
+		"browser-stats-request.json":               MsgStatsRequest,
+		"browser-stats-response.json":              MsgStatsResponse,
 	}
 	for name, wantType := range cases {
 		t.Run(name, func(t *testing.T) {

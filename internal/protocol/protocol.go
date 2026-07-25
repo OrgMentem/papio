@@ -426,6 +426,8 @@ const (
 	MsgHumanActionResolveResult = "human_action_resolve_result"
 	MsgReviewPreviewRequest     = "review_preview_request"
 	MsgReviewPreviewResult      = "review_preview_result"
+	MsgStatsRequest             = "stats_request"
+	MsgStatsResponse            = "stats_response"
 )
 
 // jobScoped lists the types that must carry a job_id.
@@ -689,6 +691,41 @@ type ReviewPreviewResultPayload struct {
 	SHA256    string `json:"sha256,omitempty"`
 	SizeBytes int64  `json:"size_bytes,omitempty"`
 	ExpiresAt string `json:"expires_at,omitempty"`
+}
+
+// StatsRequestPayload asks for the daemon's lifetime acquisition statistics.
+type StatsRequestPayload struct {
+	RequestID string `json:"request_id"`
+}
+
+// StatsAccess breaks acquired works down by the access basis of the accepted
+// candidate. Other captures manual and unclassified sources so the buckets and
+// AcquiredTotal need not agree on stale rows predating candidate recording.
+type StatsAccess struct {
+	OpenAccess    int64 `json:"open_access"`
+	Institutional int64 `json:"institutional"`
+	LicensedAPI   int64 `json:"licensed_api"`
+	Other         int64 `json:"other"`
+}
+
+// StatsBucket is one time-series bucket: works acquired in the week beginning
+// PeriodStart (RFC3339, midnight UTC).
+type StatsBucket struct {
+	PeriodStart string `json:"period_start"`
+	Acquired    int64  `json:"acquired"`
+}
+
+// StatsResponsePayload reports lifetime acquisition value metrics plus a bounded
+// weekly time series. All counts are non-negative; the extension derives
+// success rate, handoff rate, and estimated time saved from these facts.
+type StatsResponsePayload struct {
+	RequestID        string        `json:"request_id"`
+	GeneratedAt      string        `json:"generated_at"`
+	AcquiredTotal    int64         `json:"acquired_total"`
+	FailedTotal      int64         `json:"failed_total"`
+	HandoffsRequired int64         `json:"handoffs_required"`
+	Access           StatsAccess   `json:"access"`
+	Series           []StatsBucket `json:"series"`
 }
 
 // BrowserMessage is one decoded native-messaging envelope. Payload holds the
@@ -1003,6 +1040,21 @@ func DecodeBrowserMessage(data []byte) (*BrowserMessage, error) {
 		p := &ReviewPreviewResultPayload{}
 		err = decodeTriagePayload(env.Payload, payloadFields, "review_preview_result",
 			[]string{"request_id", "outcome"}, p)
+		if err == nil {
+			err = p.validate()
+		}
+		msg.Payload = p
+	case MsgStatsRequest:
+		p := &StatsRequestPayload{}
+		err = decodeTriagePayload(env.Payload, payloadFields, "stats_request", []string{"request_id"}, p)
+		if err == nil {
+			err = validateCorrelationID("stats_request.request_id", p.RequestID)
+		}
+		msg.Payload = p
+	case MsgStatsResponse:
+		p := &StatsResponsePayload{}
+		err = decodeTriagePayload(env.Payload, payloadFields, "stats_response",
+			[]string{"request_id", "generated_at", "acquired_total", "failed_total", "handoffs_required", "access", "series"}, p)
 		if err == nil {
 			err = p.validate()
 		}
@@ -1703,4 +1755,34 @@ func (p *ReviewPreviewResultPayload) validate() error {
 		return fmt.Errorf("review_preview_result.size_bytes must be in range 0..%d", MaxBrowserInteger)
 	}
 	return validateTriageTime("review_preview_result.expires_at", p.ExpiresAt)
+}
+
+func (p *StatsResponsePayload) validate() error {
+	if err := validateCorrelationID("stats_response.request_id", p.RequestID); err != nil {
+		return err
+	}
+	if err := validateTriageTime("stats_response.generated_at", p.GeneratedAt); err != nil {
+		return err
+	}
+	counts := []int64{
+		p.AcquiredTotal, p.FailedTotal, p.HandoffsRequired,
+		p.Access.OpenAccess, p.Access.Institutional, p.Access.LicensedAPI, p.Access.Other,
+	}
+	for _, value := range counts {
+		if value < 0 || value > MaxBrowserInteger {
+			return fmt.Errorf("stats_response counts must be in range 0..%d", MaxBrowserInteger)
+		}
+	}
+	if len(p.Series) > 60 {
+		return fmt.Errorf("stats_response.series capped at 60 buckets")
+	}
+	for _, bucket := range p.Series {
+		if err := validateTriageTime("stats_response.series.period_start", bucket.PeriodStart); err != nil {
+			return err
+		}
+		if bucket.Acquired < 0 || bucket.Acquired > MaxBrowserInteger {
+			return fmt.Errorf("stats_response.series.acquired must be in range 0..%d", MaxBrowserInteger)
+		}
+	}
+	return nil
 }

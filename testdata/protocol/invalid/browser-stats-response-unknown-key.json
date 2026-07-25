@@ -1,0 +1,1 @@
+{"protocol":"papio-browser/1","type":"stats_response","msg_id":"stats-res-0002","seq":8,"payload":{"request_id":"request-0003","generated_at":"2026-07-25T12:00:00Z","acquired_total":42,"failed_total":3,"handoffs_required":9,"access":{"open_access":20,"institutional":15,"licensed_api":5,"other":2},"series":[],"unexpected":true}}

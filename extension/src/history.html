@@ -1,0 +1,547 @@
+<!doctype html>
+<!-- Copyright 2026 OrgMentem. Licensed under MIT. See LICENSE. -->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>papio — history</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --color-ink: #182231;
+        --color-brand-ink: #2b2d42;
+        --color-brand-accent: #d94f3d;
+        --color-muted: #607080;
+        --color-context: #426789;
+        --color-border: #dce3ea;
+        --color-control-border: #b8c5d1;
+        --color-page: #f4f7f9;
+        --color-surface: #fdfefe;
+        --color-surface-hover: #eef3f6;
+        --color-primary: #12549b;
+        --color-primary-border: #8db9eb;
+        --color-primary-surface: #eaf3ff;
+        --color-primary-hover: #dcecff;
+        --color-warning: #6d4316;
+        --color-warning-border: #a15c17;
+        --color-warning-surface: #fff7ed;
+        --color-ok: #245e45;
+        --color-ok-border: #78aa8f;
+        --color-ok-surface: #edf7f1;
+        --color-primary-solid: #12549b;
+        --color-primary-solid-hover: #0d447f;
+        --color-on-primary: #fdfefe;
+        --font-size-label: 11px;
+        --font-size-small: 12px;
+        --font-size-body: 14px;
+        --font-size-title: 22px;
+        --font-size-item-title: 16px;
+        --font-size-stat: 32px;
+        --space-1: 4px;
+        --space-2: 8px;
+        --space-3: 12px;
+        --space-4: 16px;
+        --space-6: 24px;
+        --space-8: 32px;
+        --radius-control: 6px;
+        --radius-card: 8px;
+        --radius-pill: 999px;
+        --control-height: 36px;
+        --brand-mark-size: 32px;
+        --focus-width: 2px;
+        --focus-offset: 2px;
+        --page-max-width: 64rem;
+        --chart-height: 160px;
+        --transition-fast: 140ms ease-out;
+        accent-color: var(--color-primary);
+        color: var(--color-ink);
+        font-family:
+          ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+          sans-serif;
+      }
+
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --color-ink: #e5edf4;
+          --color-brand-ink: #f0edf3;
+          --color-brand-accent: #ef6a57;
+          --color-muted: #a2b1be;
+          --color-context: #aecbe4;
+          --color-border: #3e4f61;
+          --color-control-border: #526579;
+          --color-page: #141b23;
+          --color-surface: #1c2631;
+          --color-surface-hover: #263340;
+          --color-primary: #a8d0ff;
+          --color-primary-border: #4f85bc;
+          --color-primary-surface: #183956;
+          --color-primary-hover: #214967;
+          --color-warning: #f1c183;
+          --color-warning-border: #b97833;
+          --color-warning-surface: #33291e;
+          --color-ok: #b3ddc2;
+          --color-ok-border: #568f6d;
+          --color-ok-surface: #1d3329;
+          --color-primary-solid: #75b5f5;
+          --color-primary-solid-hover: #91c5fb;
+          --color-on-primary: #101a24;
+        }
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      [hidden] {
+        display: none !important;
+      }
+
+      html {
+        min-height: 100%;
+      }
+
+      body {
+        background: var(--color-page);
+        color: var(--color-ink);
+        font-size: var(--font-size-body);
+        line-height: 1.5;
+        margin: 0 auto;
+        max-width: var(--page-max-width);
+        min-height: 100vh;
+        padding: var(--space-8) var(--space-6) 0;
+      }
+
+      header {
+        border-bottom: 1px solid var(--color-border);
+        display: grid;
+        gap: var(--space-3);
+        grid-template-columns: minmax(0, 1fr) auto;
+        padding-bottom: var(--space-4);
+      }
+
+      h1,
+      h2,
+      p,
+      ul {
+        margin: 0;
+      }
+
+      .brand {
+        align-items: center;
+        display: flex;
+        gap: var(--space-3);
+        grid-column: 1;
+        grid-row: 1;
+        margin-bottom: var(--space-1);
+      }
+
+      .brand svg {
+        flex: 0 0 auto;
+        height: var(--brand-mark-size);
+        width: var(--brand-mark-size);
+      }
+
+      .brand-name {
+        color: var(--color-brand-ink);
+        font-size: var(--font-size-title);
+        font-weight: 700;
+        letter-spacing: 0.01em;
+        line-height: 1.2;
+      }
+
+      .brand-name em {
+        text-decoration-color: var(--color-brand-accent);
+        text-decoration-line: underline;
+        text-decoration-thickness: 2px;
+        text-underline-offset: var(--space-1);
+      }
+
+      .page-name {
+        color: var(--color-muted);
+        font-weight: 500;
+      }
+
+      #connection-status {
+        align-items: center;
+        color: var(--color-muted);
+        display: flex;
+        font-size: var(--font-size-small);
+        gap: var(--space-2);
+        grid-column: 2;
+        grid-row: 1;
+        justify-self: end;
+      }
+
+      #connection-status::before {
+        background: var(--color-control-border);
+        border-radius: 50%;
+        content: "";
+        flex: 0 0 auto;
+        height: 8px;
+        width: 8px;
+      }
+
+      #connection-status[data-state="connected"] {
+        color: var(--color-ok);
+      }
+
+      #connection-status[data-state="connected"]::before {
+        background: var(--color-ok-border);
+      }
+
+      #connection-status[data-state="disconnected"] {
+        background: var(--color-warning-surface);
+        border: 1px solid var(--color-warning-border);
+        border-radius: var(--radius-control);
+        color: var(--color-warning);
+        font-weight: 600;
+        padding: var(--space-2) var(--space-3);
+      }
+
+      #connection-status[data-state="disconnected"]::before {
+        background: var(--color-warning-border);
+      }
+
+      #history-lede {
+        align-self: center;
+        color: var(--color-muted);
+        font-size: var(--font-size-small);
+        grid-column: 1;
+        grid-row: 2;
+      }
+
+      .toolbar {
+        align-items: center;
+        display: flex;
+        gap: var(--space-2);
+        grid-column: 2;
+        grid-row: 2;
+        justify-content: flex-end;
+      }
+
+      button {
+        appearance: none;
+        background: var(--color-surface);
+        border: 1px solid var(--color-control-border);
+        border-radius: var(--radius-control);
+        color: var(--color-ink);
+        cursor: pointer;
+        font: inherit;
+        font-size: var(--font-size-small);
+        min-height: var(--control-height);
+        padding: var(--space-1) var(--space-3);
+        transition:
+          background-color var(--transition-fast),
+          border-color var(--transition-fast),
+          color var(--transition-fast);
+      }
+
+      button:hover:not(:disabled) {
+        background: var(--color-surface-hover);
+      }
+
+      button:focus-visible {
+        outline: var(--focus-width) solid var(--color-primary);
+        outline-offset: var(--focus-offset);
+      }
+
+      button:disabled {
+        cursor: not-allowed;
+        opacity: 0.55;
+      }
+
+      main {
+        display: grid;
+        gap: var(--space-6);
+        padding-block: var(--space-8);
+      }
+
+      /* One shared surface, three divided cells — the headline reads as a
+         single statement, not a grid of identical cards. */
+      .headline {
+        background: var(--color-surface);
+        border: 1px solid var(--color-border);
+        border-radius: var(--radius-card);
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+      }
+
+      .headline > div {
+        display: grid;
+        align-content: start;
+        gap: var(--space-1);
+        min-width: 0;
+        padding: var(--space-4);
+      }
+
+      .headline > div + div {
+        border-left: 1px solid var(--color-border);
+      }
+
+      .stat-value {
+        color: var(--color-brand-ink);
+        font-size: var(--font-size-stat);
+        font-variant-numeric: tabular-nums;
+        font-weight: 700;
+        line-height: 1.1;
+      }
+
+      .stat-label {
+        color: var(--color-muted);
+        font-size: var(--font-size-label);
+        font-weight: 700;
+        letter-spacing: 0.07em;
+        text-transform: uppercase;
+      }
+
+      .stat-note {
+        color: var(--color-context);
+        font-size: var(--font-size-small);
+      }
+
+      .panel {
+        background: var(--color-surface);
+        border: 1px solid var(--color-border);
+        border-radius: var(--radius-card);
+        display: grid;
+        gap: var(--space-3);
+        min-width: 0;
+        padding: var(--space-4);
+      }
+
+      .panel > h2 {
+        color: var(--color-muted);
+        font-size: var(--font-size-small);
+        font-weight: 700;
+        letter-spacing: 0.07em;
+        text-transform: uppercase;
+      }
+
+      .panel-row {
+        display: grid;
+        gap: var(--space-6);
+        grid-template-columns: minmax(0, 3fr) minmax(0, 2fr);
+      }
+
+      .chart-peak {
+        color: var(--color-muted);
+        font-size: var(--font-size-label);
+        font-variant-numeric: tabular-nums;
+        justify-self: end;
+        margin-bottom: calc(-1 * var(--space-2));
+      }
+
+      #weekly-chart {
+        align-items: end;
+        border-bottom: 1px solid var(--color-border);
+        display: grid;
+        gap: var(--space-1);
+        grid-auto-columns: minmax(0, 1fr);
+        grid-auto-flow: column;
+        height: var(--chart-height);
+      }
+
+      .chart-col {
+        align-items: end;
+        display: grid;
+        height: 100%;
+        min-width: 0;
+      }
+
+      .chart-bar {
+        background: var(--color-primary-solid);
+        border-radius: 2px 2px 0 0;
+        width: 100%;
+      }
+
+      .chart-axis {
+        color: var(--color-muted);
+        display: flex;
+        font-size: var(--font-size-label);
+        font-variant-numeric: tabular-nums;
+        justify-content: space-between;
+      }
+
+      .panel-empty {
+        color: var(--color-muted);
+        font-size: var(--font-size-small);
+      }
+
+      .access-list {
+        display: grid;
+        gap: var(--space-2);
+        list-style: none;
+        padding: 0;
+      }
+
+      .access-row {
+        align-items: center;
+        display: grid;
+        gap: var(--space-2);
+        grid-template-columns: minmax(8rem, 10rem) minmax(0, 1fr) auto;
+      }
+
+      .access-label {
+        color: var(--color-ink);
+        font-size: var(--font-size-small);
+      }
+
+      .access-meter {
+        background: var(--color-surface-hover);
+        border-radius: var(--radius-pill);
+        display: block;
+        height: 8px;
+        overflow: hidden;
+      }
+
+      .access-fill {
+        background: var(--color-primary-solid);
+        border-radius: var(--radius-pill);
+        display: block;
+        height: 100%;
+      }
+
+      .access-count {
+        color: var(--color-context);
+        font-size: var(--font-size-small);
+        font-variant-numeric: tabular-nums;
+        text-align: right;
+        white-space: nowrap;
+      }
+
+      #stats-unavailable {
+        color: var(--color-muted);
+        padding: var(--space-8) 0;
+        text-align: center;
+      }
+
+      footer {
+        border-top: 1px solid var(--color-border);
+        color: var(--color-muted);
+        display: flex;
+        font-size: var(--font-size-label);
+        justify-content: flex-end;
+        padding-block: var(--space-3);
+      }
+
+      #generated-at {
+        overflow-wrap: anywhere;
+        text-align: right;
+      }
+
+      @media (max-width: 44rem) {
+        body {
+          padding: var(--space-6) var(--space-4) 0;
+        }
+
+        header {
+          grid-template-columns: minmax(0, 1fr);
+        }
+
+        .brand,
+        #connection-status,
+        #history-lede,
+        .toolbar {
+          grid-column: 1;
+          grid-row: auto;
+        }
+
+        #connection-status {
+          justify-self: start;
+        }
+
+        .toolbar {
+          justify-content: flex-start;
+        }
+
+        .headline,
+        .panel-row {
+          grid-template-columns: minmax(0, 1fr);
+        }
+
+        .headline > div + div {
+          border-left: 0;
+          border-top: 1px solid var(--color-border);
+        }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        *,
+        *::before,
+        *::after {
+          transition-duration: 0.01ms !important;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1 class="brand">
+        <svg viewBox="0 0 512 512" aria-hidden="true">
+          <path d="M 95.0 374.6 A 200 200 0 1 1 243.7 455.6" fill="none" stroke="var(--color-brand-ink)" stroke-width="46" stroke-linecap="round"/>
+          <g transform="translate(264 244) skewX(-10)">
+            <circle cx="0" cy="0" r="68" fill="none" stroke="var(--color-brand-accent)" stroke-width="42"/>
+          </g>
+          <path d="M 208.0 176.0 L 163.2 430.0" fill="none" stroke="var(--color-brand-accent)" stroke-width="42" stroke-linecap="round"/>
+          <path d="M 115.7 416.0 L 215.7 416.0 L 152.6 490.0 Z" fill="var(--color-brand-accent)" stroke="var(--color-brand-accent)" stroke-width="10" stroke-linejoin="round"/>
+        </svg>
+        <span class="brand-name"><em>papio</em> <span class="page-name">history</span></span>
+      </h1>
+      <p id="connection-status" role="status" aria-live="polite">Connecting to daemon…</p>
+      <p id="history-lede">The papers <em>papio</em> fetched for you, and the chasing it spared you.</p>
+      <div class="toolbar" aria-label="History controls">
+        <button id="refresh-history" type="button">Refresh</button>
+        <button id="reconnect-daemon" type="button" hidden>Reconnect</button>
+      </div>
+    </header>
+    <main id="stats-main" aria-label="Acquisition history" hidden>
+      <section class="headline" aria-label="Headline impact">
+        <div>
+          <p class="stat-value" id="stat-acquired">0</p>
+          <p class="stat-label">Papers acquired</p>
+          <p class="stat-note">Delivered ready to read or imported into your library.</p>
+        </div>
+        <div>
+          <p class="stat-value" id="stat-time-saved">0 h</p>
+          <p class="stat-label">Estimated time saved</p>
+          <p class="stat-note" id="stat-time-note"></p>
+        </div>
+        <div>
+          <p class="stat-value" id="stat-success-rate">—</p>
+          <p class="stat-label">Success rate</p>
+          <p class="stat-note" id="stat-success-detail">No finished acquisitions yet.</p>
+        </div>
+      </section>
+      <section class="panel" aria-labelledby="chart-heading">
+        <h2 id="chart-heading">Weekly acquisitions</h2>
+        <p class="chart-peak" id="chart-peak" hidden></p>
+        <div id="weekly-chart" role="img" aria-label="Weekly acquisitions chart"></div>
+        <div class="chart-axis" aria-hidden="true">
+          <span id="chart-start">—</span>
+          <span id="chart-end">—</span>
+        </div>
+        <p class="panel-empty" id="chart-empty" hidden>
+          Nothing acquired in the last 12 weeks — new papers will chart here week by week.
+        </p>
+      </section>
+      <div class="panel-row">
+        <section class="panel" aria-labelledby="access-heading">
+          <h2 id="access-heading">How your papers were reached</h2>
+          <ul id="access-list" class="access-list"></ul>
+        </section>
+        <section class="panel" aria-labelledby="handoff-heading">
+          <h2 id="handoff-heading">Needed a hand from you</h2>
+          <p class="stat-value" id="stat-handoff-rate">—</p>
+          <p class="stat-note" id="stat-handoff-detail">No acquired papers yet.</p>
+        </section>
+      </div>
+    </main>
+    <p id="stats-unavailable" hidden>
+      Stats are unavailable — connect the <em>papio</em> daemon to see your acquisition history.
+    </p>
+    <footer>
+      <time id="generated-at">generated at —</time>
+    </footer>
+    <script src="./history.js" type="module"></script>
+  </body>
+</html>

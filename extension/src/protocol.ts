@@ -37,7 +37,9 @@ export type BrowserMessageType =
   | "human_action_resolve"
   | "human_action_resolve_result"
   | "review_preview_request"
-  | "review_preview_result";
+  | "review_preview_result"
+  | "stats_request"
+  | "stats_response";
 
 export interface HelloPayload {
   extension_version: string;
@@ -247,6 +249,32 @@ export interface ReviewPreviewResultPayload {
   expires_at?: string;
 }
 
+export interface StatsRequestPayload {
+  request_id: string;
+}
+
+export interface StatsAccess {
+  open_access: number;
+  institutional: number;
+  licensed_api: number;
+  other: number;
+}
+
+export interface StatsBucket {
+  period_start: string;
+  acquired: number;
+}
+
+export interface StatsResponsePayload {
+  request_id: string;
+  generated_at: string;
+  acquired_total: number;
+  failed_total: number;
+  handoffs_required: number;
+  access: StatsAccess;
+  series: StatsBucket[];
+}
+
 export interface BrowserMessage {
   protocol: typeof BROWSER_PROTOCOL_VERSION;
   type: BrowserMessageType;
@@ -287,6 +315,8 @@ const MSG_TYPES: Record<string, true> = {
   human_action_resolve_result: true,
   review_preview_request: true,
   review_preview_result: true,
+  stats_request: true,
+  stats_response: true,
 };
 
 const JOB_SCOPED: Record<string, true> = {
@@ -876,6 +906,34 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
       }
       int(p, "size_bytes", "review_preview_result", 0);
       triageTime(p, "expires_at", "review_preview_result");
+      break;
+    }
+    case "stats_request": {
+      requireKeys(p, "stats_request", ["request_id"]);
+      correlationID(p, "request_id", "stats_request");
+      break;
+    }
+    case "stats_response": {
+      requireKeys(p, "stats_response",
+        ["request_id", "generated_at", "acquired_total", "failed_total", "handoffs_required", "access", "series"]);
+      correlationID(p, "request_id", "stats_response");
+      triageTime(p, "generated_at", "stats_response");
+      int(p, "acquired_total", "stats_response", 0);
+      int(p, "failed_total", "stats_response", 0);
+      int(p, "handoffs_required", "stats_response", 0);
+      const access = asRecord(p["access"], "stats_response.access");
+      requireKeys(access, "stats_response.access", ["open_access", "institutional", "licensed_api", "other"]);
+      for (const key of ["open_access", "institutional", "licensed_api", "other"]) {
+        int(access, key, "stats_response.access", 0);
+      }
+      const series = p["series"];
+      if (!Array.isArray(series) || series.length > 60) fail("stats_response.series must have at most 60 entries");
+      for (const rawBucket of series) {
+        const bucket = asRecord(rawBucket, "stats_response.series");
+        requireKeys(bucket, "stats_response.series", ["period_start", "acquired"]);
+        triageTime(bucket, "period_start", "stats_response.series");
+        int(bucket, "acquired", "stats_response.series", 0);
+      }
       break;
     }
     case "ack":
