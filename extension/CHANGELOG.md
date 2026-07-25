@@ -22,6 +22,20 @@ for the full pre-split extension history.
   on Firefox 139+ (which added the `tabGroups` WebExtensions API), not just
   Chrome. Older Firefox still falls back to the background work window
   automatically. The handoff group is now coloured orange.
+- **Acquisition history and impact stats.** The popup now shows a compact
+  "Your papio impact" summary — papers acquired, estimated time saved (at a
+  rough 20 minutes of manual chasing per paper), and success rate — with a
+  **View history** control that opens a new full-tab history page. The page
+  charts weekly acquisitions over the last 12 weeks and breaks down success
+  rate, access routes (open access / institutional / licensed API / other),
+  and how often an acquisition needed a human handoff. Needs a daemon with
+  the `browser_stats_v1` feature; without one the popup hides the summary and
+  the history page shows a muted "stats unavailable" note instead of an error.
+- **The inbox keeps itself current.** It now refreshes the moment you return to
+  the tab, and checks in on its own periodically while the tab stays open, so a
+  new or resolved job doesn't wait for a manual Refresh. An auto-refresh never
+  reorders the list while a confirmation dialog is open or an action is still
+  in flight — it waits until you are done.
 
 ### Fixed
 

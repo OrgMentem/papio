@@ -103,6 +103,22 @@ others wait, visibly, instead of silently taking over:
 Clicking **Acquire this page** and using the inbox work from any connected
 browser regardless of which one holds the handoff flow.
 
+## The inbox stays current
+
+The inbox refreshes the moment you return to its tab, so a job that finished
+while you were away is never stale by the time you look. While the tab stays
+open, it also checks in on its own every so often, so you don't need to leave
+and come back just to notice a new job land.
+
+The toolbar badge keeps up on the extension's own wake cycle — its existing
+one-minute keepalive alarm — whether or not a *papio* tab is open. With
+nothing open, the browser decides how often a sleeping extension is woken; no
+design on this transport can beat that.
+
+An auto-refresh never reorders the list while a confirmation dialog is open
+or an action is still in flight — it waits until you're finished before
+applying what it learned.
+
 ## Browser configuration
 
 `[browser]` binds each installed browser and defines the default institution:
@@ -135,11 +151,11 @@ Selecting delegated mode does not grant a browser permission.
 
 The link to the browser carries metadata only, within *papio*'s fixed message-size limit.
 PDF bytes, cookies, credentials, page contents, screenshots, and secret- or
-signed-URL values never cross that link. For a selected download, the
-extension reports metadata such as the download item and final filename; the
-file itself lands under `<download_adoption_root>/<job_id>/` for adoption and
-validation. See [Configuration reference](../reference/config-reference.md)
-for `download_adoption_root` and the effective default.
+signed-URL values never cross that link. For a selected download, the extension reports metadata such as
+the download item and final filename; the file itself lands under
+`<download_adoption_root>/<job_id>/` for adoption and validation. See
+[Configuration reference](../reference/config-reference.md) for
+`download_adoption_root` and the effective default.
 
 ## Institution-specific routing
 

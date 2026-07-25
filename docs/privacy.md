@@ -1,6 +1,6 @@
 # Privacy policy
 
-_Last updated: 2026-07-19_
+_Last updated: 2026-07-25_
 
 *papio* is a **local** paper-acquisition tool. It runs on your own machine and, for
 the institutional handoff, inside your own browser. This policy covers both the
@@ -11,7 +11,9 @@ the institutional handoff, inside your own browser. This policy covers both the
 **_papio_ collects no personal data. Nothing is sent to OrgMentem or any third
 party.** The extension talks only to the *papio* application running locally on
 your computer, over the browser's native-messaging channel. There is no *papio*
-server, no account, no telemetry, and no analytics.
+server, no account, no telemetry, and no analytics. The extension's acquisition-history
+and impact figures are aggregates computed locally from your own job records and shown
+only to you — see [What is stored, and where](#what-is-stored-and-where).
 
 ## What the extension does and does not do
 
@@ -37,6 +39,13 @@ server, no account, no telemetry, and no analytics.
   with their metadata and job records, in its local data directory. These files
   stay on your machine (and go only to your own Zotero library if you enable that
   integration).
+- **Acquisition-history and impact figures:** the numbers the extension shows you —
+  papers acquired, an estimated time saved, success rate, weekly acquisition trend,
+  access-route breakdown, and human-handoff rate — are aggregates computed locally
+  from those same job records, on demand, for display to you alone. No new data is
+  collected to produce them, they are never transmitted anywhere, and this remains
+  true to the "no telemetry, no analytics" statement above: nothing about your
+  activity is sent to us or to any third party.
 
 ## Permissions
 

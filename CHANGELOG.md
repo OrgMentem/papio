@@ -18,6 +18,12 @@ execution records in `notes/acquisition-stack-plan.md`.
   sends an unauthenticated patron to the Alma *staff* login (`…/mng/login`),
   which patrons cannot complete; the check recommends the institution's Primo
   OpenURL endpoint (`…/discovery/openurl` or `…/nde/openurl?vid=…`) instead.
+- **Acquisition-history stats over the browser bridge** (`browser_stats_v1`).
+  The daemon answers a new `stats_request` frame with lifetime acquisition
+  aggregates: works acquired, works failed, how many needed a human handoff,
+  a breakdown by access route (open access / institutional / licensed API /
+  other), and a 12-week weekly series. Counts only — the daemon reports facts
+  and never a "time saved" figure. Read-only; no schema migration.
 
 ### Fixed
 

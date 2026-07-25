@@ -157,6 +157,10 @@ own browser lets the extension finish the download — validated, filed, and
 imported like any other PDF
 ([browser handoff](https://orgmentem.github.io/papio/concepts/browser-handoff/)).
 
+The extension's inbox keeps itself current on its own — no manual refresh
+needed — and its popup adds a compact acquisition-history and impact
+summary, with a one-click, 12-week history view.
+
 ---
 
 ## Validated, provenance-tracked PDFs

@@ -160,6 +160,13 @@ sections. Use its Focus control only when authentication or a provider-owned
 decision is required. `papio actions open` always targets Chrome, where the
 extension and your institutional session live.
 
+The inbox keeps itself current without a manual refresh: it updates as soon
+as you return to the tab, and checks in on its own every so often while the
+tab stays open, so a new or resolved job doesn't wait for you to notice. The
+toolbar badge keeps pace on the extension's own wake cycle — its existing
+one-minute keepalive alarm — whether or not a *papio* tab is open, since the
+browser decides how often a sleeping extension is woken.
+
 The popup also reports the background service's health: it shows a version line
 when all is well, and clear warnings when the service is unreachable or the two sides are out of date.
 The toolbar badge shows `!` when attention is needed, and the options-page
@@ -277,7 +284,7 @@ PDF. Tags converge with job state on the daemon's maintenance cadence;
 so Zotero's tag selector can hide the whole namespace, and colors are yours
 to assign (many people make `papio:needs-action` red).
 
-Papio never retypes or removes a same-name manual tag. Before uninstalling,
+*papio* never retypes or removes a same-name manual tag. Before uninstalling,
 disable the feature, restart the daemon so it reloads that setting, then force
 the cleanup pass:
 
@@ -321,6 +328,23 @@ again instead. `--reject` records that it is not
 the right work and cancels the review. Resolution
 applies only to an open `verify_identity` action; it does not waive explicit
 wrong-work, encrypted, or active-content rejection.
+
+## See your acquisition history and impact
+
+The extension popup shows a compact **Your papio impact** summary — papers
+acquired, an estimated time saved, and your success rate — with a **View
+history** link that opens a full-tab history page. The time-saved figure is
+a rough estimate (about 20 minutes of manual chasing per acquired paper) that
+the extension itself computes; *papio* does not measure how long anything
+actually took you.
+
+The history page adds a 12-week chart of weekly acquisitions, your success
+rate (acquired vs. failed), a breakdown by access route (open access /
+institutional / licensed API / other), and how often an acquisition needed a
+human handoff. Every figure is an aggregate computed locally from your own
+job history — nothing is sent anywhere to produce it. Against an older
+daemon that doesn't support the feature, the popup hides the summary and the
+history page shows a muted "stats unavailable" note instead of an error.
 
 ## Why a batch parks
 
