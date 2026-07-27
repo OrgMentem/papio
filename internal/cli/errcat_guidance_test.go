@@ -8,6 +8,8 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -57,15 +59,22 @@ func TestErrcatGuidanceQuotesOnlyRealCommands(t *testing.T) {
 // are not what a user is told to type.
 func backtickedPapioCommands(t *testing.T, dir string) []string {
 	t.Helper()
-	fset := token.NewFileSet()
-	pkgs, err := parser.ParseDir(fset, dir, nil, 0)
+	entries, err := os.ReadDir(dir)
 	if err != nil {
-		t.Fatalf("parse %s: %v", dir, err)
+		t.Fatalf("read %s: %v", dir, err)
 	}
+	fset := token.NewFileSet()
 	seen := map[string]bool{}
 	var snippets []string
-	for _, pkg := range pkgs {
-		ast.Inspect(pkg, func(node ast.Node) bool {
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".go") {
+			continue
+		}
+		file, err := parser.ParseFile(fset, filepath.Join(dir, entry.Name()), nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", entry.Name(), err)
+		}
+		ast.Inspect(file, func(node ast.Node) bool {
 			lit, ok := node.(*ast.BasicLit)
 			if !ok || lit.Kind != token.STRING {
 				return true

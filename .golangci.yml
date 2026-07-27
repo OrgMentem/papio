@@ -28,6 +28,16 @@ linters:
       - linters:
           - gosec
         path: '_test\.go'
+      # G202: internal/job builds every statement from literals. The only
+      # dynamic fragment in the file is a "?," placeholder run sized to a
+      # []int64 argument list; the ids themselves travel as bound parameters,
+      # so no caller data can reach the SQL text. A newer gosec started
+      # flagging the one occurrence written inline in the Exec call. G202
+      # stays armed everywhere else.
+      - linters:
+          - gosec
+        text: 'G202:'
+        path: 'internal/job/job\.go'
     paths:
       - third_party$
       - builtin$
