@@ -120,7 +120,14 @@ func (r *ActionReminder) RunDue(ctx context.Context) error {
 		due[batch] = true
 	}
 
-	for _, class := range []actionReminderClass{institutionalReminder, openHandoffReminder, reviewReminder} {
+	for _, class := range []actionReminderClass{
+		institutionalReminder,
+		openHandoffReminder,
+		manualDownloadAfterLoginReminder,
+		manualDownloadReminder,
+		loginReminder,
+		reviewReminder,
+	} {
 		if !due[class] {
 			continue
 		}
@@ -213,6 +220,9 @@ type actionReminderClass int
 const (
 	institutionalReminder actionReminderClass = iota
 	openHandoffReminder
+	manualDownloadAfterLoginReminder
+	manualDownloadReminder
+	loginReminder
 	reviewReminder
 	actionReminderClassCount
 )
@@ -233,13 +243,21 @@ func (b *actionReminderBatch) add(jobID string, age time.Duration) {
 }
 
 func reminderBatchIndex(action job.HumanAction) actionReminderClass {
-	if action.Kind == "human_auth_required" || action.RequiresAuth {
+	next := HumanActionNextStepFor(action)
+	switch {
+	case next.Instruction != "" && next.RequiresInstitutionalLogin:
+		return manualDownloadAfterLoginReminder
+	case next.Instruction != "":
+		return manualDownloadReminder
+	case next.Command == actionsOpenCommand && next.RequiresInstitutionalLogin:
 		return institutionalReminder
-	}
-	if action.Kind == "openurl_handoff" {
+	case next.Command == actionsOpenCommand:
 		return openHandoffReminder
+	case next.RequiresInstitutionalLogin:
+		return loginReminder
+	default:
+		return reviewReminder
 	}
-	return reviewReminder
 }
 
 func (b actionReminderBatch) message(class actionReminderClass) string {
@@ -251,14 +269,36 @@ func (b actionReminderBatch) message(class actionReminderClass) string {
 	recovery, command := "for your review", "papio actions list"
 	switch class {
 	case institutionalReminder:
-		recovery, command = "for your institution sign-in", "papio actions open"
+		recovery, command = "for your institution sign-in", actionsOpenCommand
 	case openHandoffReminder:
-		recovery, command = "for you to open it", "papio actions open"
+		recovery, command = "for you to open it", actionsOpenCommand
 		if count != 1 {
 			recovery = "for you to open them"
 		}
+	case manualDownloadAfterLoginReminder:
+		recovery, command = manualDownloadReminderRecovery(count, true), ""
+	case manualDownloadReminder:
+		recovery, command = manualDownloadReminderRecovery(count, false), ""
+	case loginReminder:
+		recovery, command = "for you to sign in to your institution", ""
+	}
+	if command == "" {
+		return fmt.Sprintf("%d %s %s been waiting %s %s", count, paper, verb, actionReminderAge(b.oldestAge), recovery)
 	}
 	return fmt.Sprintf("%d %s %s been waiting %s %s — run: %s", count, paper, verb, actionReminderAge(b.oldestAge), recovery, command)
+}
+
+func manualDownloadReminderRecovery(count int, requiresInstitutionalLogin bool) string {
+	if count == 1 {
+		if requiresInstitutionalLogin {
+			return "for you to sign in to your institution, then download the PDF yourself — papio will adopt it"
+		}
+		return "for you to download the PDF yourself — papio will adopt it"
+	}
+	if requiresInstitutionalLogin {
+		return "for you to sign in to your institution, then download the PDFs yourself — papio will adopt them"
+	}
+	return "for you to download the PDFs yourself — papio will adopt them"
 }
 
 func actionReminderAge(age time.Duration) string {

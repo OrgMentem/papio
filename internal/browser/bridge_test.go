@@ -102,6 +102,32 @@ func park(t *testing.T, jobs *job.Store, reqID string, w work.Work) string {
 	return id
 }
 
+func parkInstitutional(t *testing.T, jobs *job.Store, reqID string, w work.Work, resolverProfile string) string {
+	t.Helper()
+	ctx := context.Background()
+	id, err := jobs.CreateRequest(ctx, reqID, w, "", "",
+		job.Policy{
+			AccessMode: config.ModeDelegated, DesiredVersion: "any", Resolver: resolverProfile, FetchMaxBytes: 1 << 20,
+		}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, step := range [][2]string{
+		{job.StateQueued, job.StateResolving},
+		{job.StateResolving, job.StateFetching},
+		{job.StateFetching, job.StateAwaitingHuman},
+	} {
+		if err := jobs.Transition(ctx, id, step[0], step[1], map[string]any{"reason": "institutional_handoff"}); err != nil {
+			t.Fatalf("%s->%s: %v", step[0], step[1], err)
+		}
+	}
+	if _, err := jobs.OpenHumanAction(ctx, id, handoffActionKind, "handoff available",
+		job.WithAccessClassification(true, "paywall")); err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
 var inSeq int64
 
 func inFrame(t *testing.T, typ, jobID string, payload any) json.RawMessage {
@@ -1348,6 +1374,119 @@ func TestSentinelSecretNeverEntersMessagesOrDurableRows(t *testing.T) {
 	}
 }
 
+func TestAuthReturnedReoffersEligibleInstitutionalSiblingsOnce(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	b.cfg.Browser.Resolvers = map[string]config.Institution{
+		"other": {OpenURLBase: "https://other-openurl.example.edu/resolve"},
+	}
+
+	source := parkInstitutional(t, jobs, "wr_auth_source", handoffWork(), "")
+	sibling := parkInstitutional(t, jobs, "wr_auth_sibling", handoffWork(), "")
+	provenEmpty := parkInstitutional(t, jobs, "wr_auth_empty", handoffWork(), "")
+	leased := parkInstitutional(t, jobs, "wr_auth_leased", handoffWork(), "")
+	otherProfile := parkInstitutional(t, jobs, "wr_auth_other", handoffWork(), "other")
+	if err := jobs.RecordEvent(ctx, provenEmpty, "browser.no_entitlement_requeue",
+		map[string]any{"outcome": "no_entitlement"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := jobs.S.DB().ExecContext(ctx,
+		`UPDATE jobs SET lease_owner = ?, lease_expires_at = ? WHERE id = ?`,
+		"adopt-in-progress", time.Now().Add(time.Minute).UTC().Format(time.RFC3339Nano), leased); err != nil {
+		t.Fatal(err)
+	}
+
+	initial, _ := runSync(t, b, hello())
+	if got := countType(initial, protocol.MsgJobOffer); got != 5 {
+		t.Fatalf("initial job offers = %d, want 5", got)
+	}
+	msgs, _ := runSync(t, b, inFrame(t, protocol.MsgAuthReturned, source, map[string]any{"elapsed_ms": 10}))
+	if got := countType(msgs, protocol.MsgJobOffer); got != 1 {
+		t.Fatalf("post-auth job offers = %d, want exactly one sibling", got)
+	}
+	offer := firstOfType(msgs, protocol.MsgJobOffer)
+	if offer == nil || offer.JobID != sibling {
+		t.Fatalf("post-auth offer = %#v, want sibling %s", offer, sibling)
+	}
+	for _, untouched := range []string{provenEmpty, leased, otherProfile} {
+		if !b.offered[untouched] {
+			t.Fatalf("ineligible job %s was marked for re-offer", untouched)
+		}
+	}
+
+	events, err := jobs.Events(ctx, sibling)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reoffers := 0
+	for _, event := range events {
+		if event["kind"] != "browser.handoff_reoffered" {
+			continue
+		}
+		reoffers++
+		detail, ok := event["detail"].(map[string]any)
+		if !ok || detail["reason"] != "institutional_session_live" {
+			t.Fatalf("re-offer detail = %#v, want institutional session reason", event["detail"])
+		}
+	}
+	if reoffers != 1 {
+		t.Fatalf("sibling re-offer events = %d, want 1", reoffers)
+	}
+	for _, untouched := range []string{provenEmpty, leased, otherProfile} {
+		events, err := jobs.Events(ctx, untouched)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, event := range events {
+			if event["kind"] == "browser.handoff_reoffered" {
+				t.Fatalf("ineligible job %s was re-offered: %#v", untouched, event)
+			}
+		}
+	}
+
+	for _, frames := range [][]json.RawMessage{
+		nil,
+		{inFrame(t, protocol.MsgAuthReturned, sibling, map[string]any{"elapsed_ms": 11})},
+	} {
+		msgs, _ := runSync(t, b, frames...)
+		if got := countType(msgs, protocol.MsgJobOffer); got != 0 {
+			t.Fatalf("sibling was re-offered %d additional times", got)
+		}
+	}
+}
+
+func TestAuthReturnedDoesNotReofferWithoutLiveHolder(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	source := parkInstitutional(t, jobs, "wr_auth_stale_source", handoffWork(), "")
+	sibling := parkInstitutional(t, jobs, "wr_auth_stale_sibling", handoffWork(), "")
+	runSync(t, b, hello())
+
+	b.mu.Lock()
+	b.holder.LastSyncAt = b.now().Add(-sessionStaleAfter - time.Second)
+	err := b.recordAuth(ctx, &protocol.BrowserMessage{
+		Type:    protocol.MsgAuthReturned,
+		JobID:   source,
+		Payload: &protocol.AuthPayload{},
+	})
+	b.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !b.offered[sibling] {
+		t.Fatal("stale holder marked sibling for re-offer")
+	}
+	events, err := jobs.Events(ctx, sibling)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range events {
+		if event["kind"] == "browser.handoff_reoffered" {
+			t.Fatalf("stale holder re-offered sibling: %#v", event)
+		}
+	}
+}
+
 func writeFixturePDF(t *testing.T, path string) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
@@ -1724,6 +1863,46 @@ func TestProviderOutcomeMappings(t *testing.T) {
 						t.Fatalf("manual_download requires_auth = %t, want %t", extraOpen[0].RequiresAuth, classification.requiresAuth)
 					}
 				})
+			}
+		})
+	}
+}
+
+func TestProviderOutcomeRecordsAdapterDiagnostics(t *testing.T) {
+	for _, outcome := range []string{"wrong_work", "ui_changed"} {
+		t.Run(outcome, func(t *testing.T) {
+			b, jobs, _, _ := newBridge(t)
+			ctx := context.Background()
+			id := park(t, jobs, "wr_provider_diagnostics_"+outcome, handoffWork())
+			runSync(t, b, hello())
+			runSync(t, b, inFrame(t, protocol.MsgProviderOutcome, id, map[string]any{
+				"outcome":         outcome,
+				"adapter_version": "sage-2026.07.27",
+				"detail":          "download control was absent after provider landing",
+			}))
+
+			events, err := jobs.Events(ctx, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			diagnostics := 0
+			for _, event := range events {
+				if event["kind"] != "browser.provider_outcome" {
+					continue
+				}
+				diagnostics++
+				detail, ok := event["detail"].(map[string]any)
+				if !ok {
+					t.Fatalf("provider outcome detail = %#v, want map", event["detail"])
+				}
+				if detail["outcome"] != outcome ||
+					detail["adapter_version"] != "sage-2026.07.27" ||
+					detail["detail"] != "download control was absent after provider landing" {
+					t.Fatalf("provider diagnostics = %#v", detail)
+				}
+			}
+			if diagnostics != 1 {
+				t.Fatalf("provider diagnostic events = %d, want 1", diagnostics)
 			}
 		})
 	}

@@ -283,27 +283,26 @@ func newActionsCommand(opt *options) *cobra.Command {
 	return command
 }
 
-// accessHint renders the auth classification as the user's actual next step, so
-// a row in `papio actions list` is self-contained — that listing has no detail
-// column, so this line is the whole instruction.
+// accessHint renders the access classification as the user's actual next step,
+// so a row in `papio actions list` is self-contained — that listing has no
+// detail column, so this line is the whole instruction.
 //
-// It must stay keyed on the action KIND as well as the classification. The
-// wording once assumed every auth-requiring action was an openurl_handoff and
-// told the user to run 'papio actions open'; once manual_download actions began
-// inheriting the sign-in requirement of the handoff they replace, eight rows on
-// one machine named a command that cannot open them, and `papio actions open`
-// silently did nothing for every one.
+// It uses app.HumanActionNextStepFor so a replacement manual-download action
+// cannot inherit its old handoff's command just because both require a login.
 func accessHint(action job.HumanAction) string {
 	if action.BlockedBy == "" {
 		return ""
 	}
+	next := app.HumanActionNextStepFor(action)
 	switch {
-	case action.Kind == "manual_download" && action.RequiresAuth:
-		return "\tsign in to your institution, then download the PDF yourself — papio will adopt it"
-	case action.Kind == "manual_download":
-		return "\tdownload the PDF yourself — papio will adopt it; no login needed"
-	case action.RequiresAuth:
-		return "\tsign in to your institution first, then 'papio actions open'"
+	case next.Instruction != "" && next.RequiresInstitutionalLogin:
+		return "\tsign in to your institution, then " + next.Instruction
+	case next.Instruction != "":
+		return "\t" + next.Instruction + "; no login needed"
+	case next.RequiresInstitutionalLogin && next.Command != "":
+		return "\tsign in to your institution first, then '" + next.Command + "'"
+	case next.RequiresInstitutionalLogin:
+		return "\tsign in to your institution first"
 	default:
 		return "\topen access — no login needed"
 	}
@@ -374,7 +373,7 @@ func actionURL(action job.HumanAction, row job.Row, baseFor func(string) (string
 	if detail := strings.TrimSpace(action.Detail); validOpenURL(detail) {
 		return detail, true
 	}
-	if action.Kind != "openurl_handoff" {
+	if app.HumanActionNextStepFor(action).Command == "" {
 		return "", false
 	}
 	// Honor the job's resolver profile: a Example Institute-routed job must never open the

@@ -30,6 +30,47 @@ execution records in `notes/acquisition-stack-plan.md`.
 
 ### Fixed
 
+- **papio was abandoning handoffs while the provider was still verifying the
+  browser.** Nine of ten real handoffs on one machine ended `ui_changed`,
+  reported as "the provider's UI changed" and parked as a manual download. The
+  pages papio captured at those moments were Cloudflare interstitials — one of
+  them reading *"Verification successful. Waiting for journals.sagepub.com to
+  respond"*. The challenge was passing; papio's two-unknown-verdicts-5s-apart
+  escalation was simply faster than the challenge, so it gave up seconds before
+  the article would have loaded and told the user to fetch by hand a PDF that
+  was already on its way. A bot check is now recognised as the transient state
+  it is: escalation is deferred, the unknown streak cleared, and classification
+  retried for up to a minute; only if it never clears is the job reported
+  blocked by a bot check rather than mislabelled as adapter rot. A genuinely
+  unreadable provider page with no challenge present still escalates exactly as
+  before, so real adapter rot stays visible. The detector was validated against
+  all 25 pages papio had captured from live failures, matching both Cloudflare
+  variants on every affected host and none of the 15 ordinary pages.
+- **papio asked users to sign in for items their library had already said it
+  does not have.** The institutional resolver answers "No full text available"
+  on its own page, but no adapter covered the resolver host, so that terminal
+  answer classified as unknown and became a manual-download park — complete
+  with advice to sign in first. A resolver adapter now reads that answer as
+  `no_entitlement`, which papio already knows how to handle.
+- **A reminder told users to run a command that cannot act on their action.**
+  `papio actions open` cannot open a `manual_download`, yet the escalating
+  reminder named it for every auth-requiring action. This was the third
+  appearance of one defect: three separate places derived "what should the user
+  do next" from an action's kind and sign-in requirement, each written when only
+  handoffs carried that requirement. They now share one authority, and a new
+  conformance test asserts that any command named for an action can actually act
+  on it — the earlier guard only checked that the command existed, which is why
+  it passed all three times.
+- **One sign-in now releases the batch.** Jobs parked on the same institutional
+  route are re-offered when a session becomes live, instead of each waiting for
+  its own handoff and eventually being reported as needing a manual download.
+  Bounded by the usual guards: same resolver profile, live holder, never a route
+  already proven empty, and never a job an adoption is mid-flight on.
+- **Provider outcomes now record why they happened.** `adapter_version` and
+  `detail` already crossed the bridge, validated and bounded, and the daemon
+  discarded both — so nine failed handoffs left an audit trail that said only
+  that they had failed. `papio jobs get` now shows which adapter version saw
+  what, which is how the Cloudflare diagnosis above was possible at all.
 - **A handoff whose provider page papio could not drive became a dead end.**
   When the extension reported `wrong_work` or `ui_changed`, the daemon resolved
   the job's only open action and parked it in `needs_review` — a state whose

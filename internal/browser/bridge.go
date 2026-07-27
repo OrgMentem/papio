@@ -93,6 +93,8 @@ type Bridge struct {
 	epoch      uint64
 	offered    map[string]bool // handoff jobs offered to the current holder
 	cancelSent map[string]bool // jobs a daemon-side cancel was already announced for
+	// A replayed auth return must not make the same holder open duplicate tabs.
+	authReleased map[int64]bool
 	// Focus requests survive a holder change so the replacement holder can
 	// receive its offer before it is asked to surface the handoff.
 	focusPending map[string]bool
@@ -142,6 +144,7 @@ func NewBridge(jobs *job.Store, svc *app.Service, triageService *triage.Service,
 		Features:     appendFeatures(features, required...),
 		offered:      map[string]bool{},
 		cancelSent:   map[string]bool{},
+		authReleased: map[int64]bool{},
 		focusPending: map[string]bool{},
 		pending:      map[string]*browserSession{},
 		now:          time.Now,
@@ -316,6 +319,7 @@ func (b *Bridge) promote(session *browserSession, reason string) {
 	b.epoch++
 	b.offered = map[string]bool{}
 	b.cancelSent = map[string]bool{}
+	b.authReleased = map[int64]bool{}
 	b.takeovers++
 	log.Printf("papio: browser session %s (v%s) now holds the bridge: %s", shortSession(session.ID), session.ExtensionVersion, reason)
 }
@@ -616,6 +620,7 @@ func (b *Bridge) handleHello(sessionID string, p *protocol.HelloPayload) ([]json
 	b.holder = session
 	b.offered = map[string]bool{}
 	b.cancelSent = map[string]bool{}
+	b.authReleased = map[int64]bool{}
 	if session.Outdated {
 		return b.extensionOutdatedError()
 	}
@@ -1171,11 +1176,113 @@ func (b *Bridge) recordAuth(ctx context.Context, msg *protocol.BrowserMessage) e
 	if p := msg.Payload.(*protocol.AuthPayload); p.ElapsedMS != nil {
 		detail["elapsed_ms"] = *p.ElapsedMS
 	}
-	return b.jobs.S.AppendEvent(ctx, msg.JobID, kind, detail)
+	if err := b.jobs.S.AppendEvent(ctx, msg.JobID, kind, detail); err != nil {
+		return err
+	}
+	if msg.Type != protocol.MsgAuthReturned {
+		return nil
+	}
+	return b.reofferInstitutionalSiblings(ctx, msg.JobID)
+}
+
+// reofferInstitutionalSiblings lets poll reopen only the handoffs that a
+// returned institutional session can actually unlock. The caller holds b.mu.
+func (b *Bridge) reofferInstitutionalSiblings(ctx context.Context, sourceJobID string) error {
+	if b.holder == nil || b.now().Sub(b.holder.LastSyncAt) > sessionStaleAfter {
+		return nil
+	}
+
+	source, err := b.jobs.Get(ctx, sourceJobID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if source.State != job.StateAwaitingHuman {
+		return nil
+	}
+	sourceActions, err := b.jobs.ListOpenHumanActionsForJobs(ctx, []string{sourceJobID})
+	if err != nil {
+		return err
+	}
+	var sourceActionID int64
+	for _, action := range sourceActions {
+		if action.Kind == handoffActionKind && action.RequiresAuth {
+			sourceActionID = action.ID
+			break
+		}
+	}
+	if sourceActionID == 0 || b.authReleased[sourceActionID] ||
+		b.holder == nil || b.now().Sub(b.holder.LastSyncAt) > sessionStaleAfter {
+		return nil
+	}
+	b.authReleased[sourceActionID] = true
+
+	offeredIDs := make([]string, 0, len(b.offered))
+	for jobID, offered := range b.offered {
+		if offered && jobID != sourceJobID {
+			offeredIDs = append(offeredIDs, jobID)
+		}
+	}
+	for start := 0; start < len(offeredIDs); start += 200 {
+		end := min(start+200, len(offeredIDs))
+		actions, err := b.jobs.ListOpenHumanActionsForJobs(ctx, offeredIDs[start:end])
+		if err != nil {
+			return err
+		}
+		for _, action := range actions {
+			if action.Kind != handoffActionKind || !action.RequiresAuth || b.authReleased[action.ID] {
+				continue
+			}
+			row, err := b.jobs.Get(ctx, action.JobID)
+			if errors.Is(err, sql.ErrNoRows) {
+				continue
+			}
+			if err != nil {
+				return err
+			}
+			if row.State != job.StateAwaitingHuman ||
+				resolverProfileKey(row.Policy.Resolver) != resolverProfileKey(source.Policy.Resolver) ||
+				row.LeaseActive(b.now()) {
+				continue
+			}
+			requeued, err := b.institutionalRouteRequeued(ctx, row.ID)
+			if err != nil {
+				return err
+			}
+			if requeued || b.holder == nil || b.now().Sub(b.holder.LastSyncAt) > sessionStaleAfter {
+				continue
+			}
+			if err := b.jobs.RecordEvent(ctx, row.ID, "browser.handoff_reoffered",
+				map[string]any{"reason": "institutional_session_live"}); err != nil {
+				return err
+			}
+			delete(b.offered, row.ID)
+			b.authReleased[action.ID] = true
+		}
+	}
+	return nil
+}
+
+// resolverProfileKey keeps the two configured spellings of the default
+// institution from being treated as separate authenticated sessions.
+func resolverProfileKey(profile string) string {
+	if profile == "" || profile == "default" {
+		return "default"
+	}
+	return profile
 }
 
 // outcome maps a terminal provider observation onto a policy-legal transition.
 func (b *Bridge) outcome(ctx context.Context, jobID string, p *protocol.ProviderOutcomePayload) error {
+	if err := b.jobs.RecordEvent(ctx, jobID, "browser.provider_outcome", map[string]any{
+		"outcome":         p.Outcome,
+		"adapter_version": p.AdapterVersion,
+		"detail":          p.Detail,
+	}); err != nil {
+		return err
+	}
 	switch p.Outcome {
 	case "cancelled":
 		if err := b.resolveHandoff(ctx, jobID, "cancelled"); err != nil {

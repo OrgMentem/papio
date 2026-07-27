@@ -4,9 +4,12 @@
 // emitter awaits the handler promises it triggers, so the flow is deterministic.
 
 import { expect, test } from "bun:test";
+import { Window } from "happy-dom";
+
 
 import { parseBrowserMessage, type BrowserMessage } from "../src/protocol";
 import { emptyStore, type StateBackend, type StoreShape } from "../src/state";
+import { sanitizeFixture } from "../src/capture";
 import type { AdapterSpec } from "../src/adapters/types";
 import { interpret } from "../src/adapters/types";
 import {
@@ -14,6 +17,7 @@ import {
   hasDaemonUpdateHint,
   handleInboxRuntimeMessage,
   needsVisibleWindow,
+  isBotChallenge,
   type BridgeDeps,
   type DownloadDeltaLike,
   type DownloadItemLike,
@@ -411,6 +415,39 @@ const PROVIDER_ADAPTER: AdapterSpec = {
   hosts: [PROVIDER_HOST],
   classify: [],
 };
+
+function sanitizedObservedChallenge(html: string): Document {
+  const window = new Window({ url: "https://fixture.local/" });
+  window.document.write(
+    sanitizeFixture(html, {
+      provider: "observed",
+      scenario: "observed",
+      originNoQuery: "https://fixture.local/challenge",
+      capturedISO: "2026-07-22T07:18:34.092Z",
+    }),
+  );
+  return window.document as unknown as Document;
+}
+
+function useUnknownProviderClassifier(h: Harness, challenge: () => boolean): void {
+  h.deps.adapterSpecs.push(PROVIDER_ADAPTER);
+  h.deps.permissions.contains = async () => true;
+  h.deps.scripting.executeScript = async (injection) => {
+    if (injection.func === interpret) return [{ result: { kind: "unknown" } }];
+    if (injection.func === isBotChallenge) return [{ result: challenge() }];
+    return [];
+  };
+}
+
+async function classifyProviderUnknown(h: Harness, jobID: string): Promise<number> {
+  await h.bridge.start();
+  await h.port.inbound(jobOffer(jobID));
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  const url = `https://${PROVIDER_HOST}/stable/challenge`;
+  h.tabs.live.set(tabID, { id: tabID, url });
+  await h.tabs.onUpdated.emit(tabID, { url, status: "complete" }, { id: tabID, url });
+  return tabID;
+}
 
 function helloRequiredError(): unknown {
   return {
@@ -1111,6 +1148,100 @@ test("a registered adapter host classifies even when absent from the offer's pro
   );
 
   expect(injections.some((i) => i.func === interpret && i.target.tabId === tabID)).toBe(true);
+});
+
+test("Cloudflare challenge detection survives the observed marker sanitization", () => {
+  // SAGE, ACM, and the newer ScienceDirect captures share these widget markers;
+  // their script bodies are intentionally absent from committed fixtures.
+  const widgetChallenge = sanitizedObservedChallenge(`
+    <html><head>
+      <script src="/cdn-cgi/challenge-platform/h/b/orchestrate/chl_page/v1">discarded body</script>
+      <script src="https://challenges.cloudflare.com/turnstile/v0/b/3104729c556c/api.js">discarded body</script>
+    </head><body>
+      <input type="hidden" name="cf-turnstile-response" id="cf-chl-widget-TOKEN_response">
+    </body></html>
+  `);
+  // The older 21 KiB ScienceDirect capture has no surviving cf-chl/script
+  // marker, but its non-script captcha stage remains after sanitization.
+  const legacyScienceDirectChallenge = sanitizedObservedChallenge(`
+    <html><head><title>Verificación en curso</title></head><body>
+      <div id="captcha-box"><div class="main-wrapper" role="main"></div></div>
+    </body></html>
+  `);
+  const translatedTitleOnly = sanitizedObservedChallenge(`
+    <html><head><title>Un momento...</title></head><body><main></main></body></html>
+  `);
+
+  expect(isBotChallenge(widgetChallenge)).toBe(true);
+  expect(isBotChallenge(legacyScienceDirectChallenge)).toBe(true);
+  expect(isBotChallenge(translatedTitleOnly)).toBe(false);
+});
+
+test("a Cloudflare challenge clears an earlier unknown streak instead of escalating it", async () => {
+  let challenge = false;
+  const h = makeHarness();
+  useUnknownProviderClassifier(h, () => challenge);
+  const tabID = await classifyProviderUnknown(h, "job_challenge_clears_unknown");
+
+  expect(h.backend.store.activeJobs[0]?.unknown_count).toBe(1);
+  challenge = true;
+  h.clock.now += 5_000;
+  const url = `https://${PROVIDER_HOST}/stable/challenge`;
+  await h.tabs.onUpdated.emit(tabID, { url, status: "complete" }, { id: tabID, url });
+
+  expect(h.backend.store.activeJobs[0]?.unknown_count ?? 0).toBe(0);
+  expect(
+    h.frames().filter((frame) => frame.type === "provider_outcome" && frame.payload["outcome"] === "ui_changed"),
+  ).toHaveLength(0);
+  expect(h.timers.at(-1)?.ms).toBe(2_500);
+});
+
+test("a cleared Cloudflare challenge returns to the ordinary stale-adapter path", async () => {
+  let challenge = true;
+  const h = makeHarness();
+  useUnknownProviderClassifier(h, () => challenge);
+  await classifyProviderUnknown(h, "job_challenge_clears");
+
+  challenge = false;
+  for (let step = 0; step < 3; step += 1) {
+    const timer = h.timers.at(-1);
+    expect(timer).toBeDefined();
+    h.clock.now += 2_500;
+    await timer!.fn();
+  }
+
+  const outcomes = h.frames().filter((frame) => frame.type === "provider_outcome");
+  expect(outcomes).toHaveLength(1);
+  expect(outcomes[0]?.payload).toMatchObject({
+    outcome: "ui_changed",
+    adapter_version: PROVIDER_ADAPTER.version,
+  });
+});
+
+test("a bot check that never clears reaches a bounded anti-bot retry", async () => {
+  const h = makeHarness();
+  useUnknownProviderClassifier(h, () => true);
+  const tabID = await classifyProviderUnknown(h, "job_challenge_bounded");
+
+  // The initial probe schedules the first retry; the 24th re-check reports
+  // the anti-bot condition rather than silently leaving the handoff alive.
+  for (let retry = 0; retry < 24; retry += 1) {
+    const timer = h.timers.at(-1);
+    expect(timer).toBeDefined();
+    h.clock.now += 2_500;
+    await timer!.fn();
+  }
+  const url = `https://${PROVIDER_HOST}/stable/challenge`;
+  await h.tabs.onUpdated.emit(tabID, { url, status: "complete" }, { id: tabID, url });
+
+  const outcomes = h.frames().filter((frame) => frame.type === "provider_outcome");
+  expect(outcomes).toHaveLength(1);
+  expect(outcomes[0]?.payload).toEqual({
+    outcome: "rate_limited",
+    adapter_version: PROVIDER_ADAPTER.version,
+    detail: "blocked by a Cloudflare bot check",
+  });
+  expect(h.timers).toHaveLength(24);
 });
 
 test("a unique manual Chrome download from a registry-only host is correlated", async () => {

@@ -15,7 +15,10 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"papio/internal/app"
 	"papio/internal/config"
+	"papio/internal/job"
+	"papio/internal/work"
 )
 
 // internal/errcat is the one catalog `papio status`, `papio acquire --wait`,
@@ -115,5 +118,49 @@ func TestGuidanceResolverRejectsTheFlagThatShipped(t *testing.T) {
 	root := NewInProcessRoot(&bytes.Buffer{}, &bytes.Buffer{}, config.Config{}, nilRPC)
 	if err := resolveGuidanceCommand(root, "papio actions --open"); err == nil {
 		t.Fatal("`papio actions --open` accepted, so the catalog scan cannot catch the bug it exists for")
+	}
+}
+
+// TestActionGuidanceCommandsApplyToEveryActionKind exercises the kinds the
+// daemon can actually record. A resolvable cobra path is not enough: an
+// `actions open` recommendation must produce a browser target for that action.
+func TestActionGuidanceCommandsApplyToEveryActionKind(t *testing.T) {
+	row := job.Row{Work: work.Work{DOI: "10.1000/action-guidance"}}
+	baseFor := func(string) (string, bool) {
+		return "https://resolver.example.test/openurl", true
+	}
+	kinds := []string{
+		"openurl_handoff",
+		"manual_download",
+		"verify_identity",
+		"human_auth_required",
+		"terms_acceptance_required",
+		"openurl_available",
+	}
+	for _, kind := range kinds {
+		for _, requiresAuth := range []bool{false, true} {
+			authName := "false"
+			if requiresAuth {
+				authName = "true"
+			}
+			t.Run(kind+"/requires_auth="+authName, func(t *testing.T) {
+				action := job.HumanAction{Kind: kind, RequiresAuth: requiresAuth}
+				next := app.HumanActionNextStepFor(action)
+				hintAction := action
+				hintAction.BlockedBy = "paywall"
+				if got, want := strings.Contains(accessHint(hintAction), "papio actions open"), next.RequiresInstitutionalLogin && next.Command == "papio actions open"; got != want {
+					t.Fatalf("access hint names `papio actions open` = %t, want %t", got, want)
+				}
+				switch command := next.Command; command {
+				case "":
+				case "papio actions open":
+					if _, ok := actionURL(action, row, baseFor); !ok {
+						t.Fatalf("%q cannot act on %s with requires_auth=%t", command, kind, requiresAuth)
+					}
+				default:
+					t.Fatalf("no applicability check for next-step command %q", command)
+				}
+			})
+		}
 	}
 }

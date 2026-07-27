@@ -51,6 +51,33 @@ function ctx(title?: string): AdapterContext {
   return { expected: title === undefined ? {} : { title } };
 }
 
+function fixtureScenarioForRule(kind: AdapterSpec["classify"][number]["kind"]): string {
+  switch (kind) {
+    case "article":
+      return "success";
+    case "login":
+      return "login-return";
+    case "terms":
+      return "terms";
+    case "no_entitlement":
+      return "no-entitlement";
+    case "wrong_work_check":
+      return "wrong-work";
+    case "unknown":
+      throw new Error("unknown is the classifier fallback, not a fixture-backed rule");
+  }
+}
+
+function expectFixtureBackedRules(
+  specs: readonly AdapterSpec[],
+  exists: (provider: string, scenario: string) => boolean = fixtureExists,
+): void {
+  for (const spec of specs) {
+    const scenarios = new Set(spec.classify.map((rule) => fixtureScenarioForRule(rule.kind)));
+    for (const scenario of scenarios) expect(exists(spec.id, scenario)).toBe(true);
+  }
+}
+
 // --- Contract 1/2: interpret --------------------------------------------------
 
 test("every registered adapter is fixture-backed, versioned, and host-scoped", () => {
@@ -59,12 +86,36 @@ test("every registered adapter is fixture-backed, versioned, and host-scoped", (
     expect(spec.version).toMatch(/^\d+\.\d+\.\d+$/);
     expect(spec.hosts.length).toBeGreaterThan(0);
     expect(spec.classify.length).toBeGreaterThan(0);
-    // The plan forbids specs without captured evidence: at least the success
-    // fixture must be committed for every registered provider.
-    expect(fixtureExists(spec.id, "success")).toBe(true);
+    // Rules need captured evidence for their own verdict: `article` owes
+    // `success` and `no_entitlement` owes `no-entitlement`. Ex Libris Primo
+    // has no success capture because that terminal result never downloads here.
+    expectFixtureBackedRules([spec]);
     if (spec.download) expect(spec.download.requireKind).toBe("article");
   }
   expect(adapters.map((a) => a.id)).toContain("proquest");
+});
+
+test("fixture backing rejects an adapter with no fixture directory", () => {
+  const spec: AdapterSpec = {
+    id: "fixtureless",
+    version: "0.1.0",
+    hosts: ["fixtureless.example"],
+    classify: [{ kind: "article", all: ["main"] }],
+  };
+  expect(() => expectFixtureBackedRules([spec])).toThrow();
+});
+
+test("fixture backing rejects a rule without its matching fixture", () => {
+  const spec: AdapterSpec = {
+    id: "partially-fixtured",
+    version: "0.1.0",
+    hosts: ["partially-fixtured.example"],
+    classify: [
+      { kind: "article", all: ["main"] },
+      { kind: "no_entitlement", all: ["aside"] },
+    ],
+  };
+  expect(() => expectFixtureBackedRules([spec], (_provider, scenario) => scenario === "success")).toThrow();
 });
 
 test("registered adapters leave work-window visibility at the default", () => {
@@ -304,6 +355,27 @@ test("HAL records without a deposited document stay unknown", () => {
   const page = parseHTML(
     "<html><head><meta name='citation_title' content='Metadata-only record'>" +
       "<meta name='citation_doi' content='10.1000/no-file'></head></html>",
+  );
+  expect(interpret(page, spec, ctx()).kind).toBe("unknown");
+});
+
+const exLibrisPrimoNoEntitlement = loadFixture("exlibris-primo", "no-entitlement");
+test.skipIf(exLibrisPrimoNoEntitlement === null)(
+  "captured Ex Libris Alma resolver with no full text classifies as no entitlement",
+  () => {
+    const spec = adapters.find((a) => a.id === "exlibris-primo") as AdapterSpec;
+    const verdict = interpret(exLibrisPrimoNoEntitlement as Document, spec, ctx());
+    expect(verdict.kind).toBe("no_entitlement");
+    expect(verdict.adapter_id).toBe("exlibris-primo");
+  },
+);
+
+test("Alma resolver boilerplate terms footer without the no-full-text marker stays unknown", () => {
+  const spec = adapters.find((a) => a.id === "exlibris-primo") as AdapterSpec;
+  const page = parseHTML(
+    "<html><body><form name='uResolverViewItForm'><div id='repDataLong'></div>" +
+      "<c id='showAllLine'>0 - 0 of 0</c><h1>Additional services</h1>" +
+      "<a>By continuing, you agree to our access Terms and Policies</a></form></body></html>",
   );
   expect(interpret(page, spec, ctx()).kind).toBe("unknown");
 });

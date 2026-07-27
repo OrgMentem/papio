@@ -69,6 +69,10 @@ const QUEUED_HANDOFF_RELEASE_MS = 45_000;
 // schedule so a slow render still reaches a decisive verdict.
 const CLASSIFY_RETRY_MS = 2_500;
 const MAX_CLASSIFY_RETRIES = 8;
+// A completed bot check can take longer than the ordinary render race. Giving
+// it a minute avoids converting a passing challenge into a manual-download
+// handoff while still releasing a page that never returns.
+const MAX_BOT_CHALLENGE_RETRIES = 24;
 // A job whose warm SSO session cannot complete human authentication would
 // otherwise be re-driven on every daemon re-offer and worker spin-up forever,
 // thrashing the provider (repeat navigations trip bot walls) and burning the
@@ -113,6 +117,26 @@ const HANDOFF_GROUP_TITLE_MAX_TITLE_LENGTH = 72;
 /** Whether this adapter's SPA must render outside the minimized work window. */
 export function needsVisibleWindow(spec: AdapterSpec | undefined): boolean {
   return spec?.requiresVisible === true;
+}
+
+/**
+ * Keep bot-check detection structural: Cloudflare localizes its copy, while
+ * these live-page markers survive both translation and fixture sanitization.
+ *
+ * SERIALIZATION CONTRACT: this must remain self-contained because
+ * chrome.scripting serializes it into the provider page.
+ */
+export function isBotChallenge(doc: Document | null): boolean {
+  const root: Document = doc ?? document;
+  return (
+    root.querySelector(
+      'script[src*="/cdn-cgi/challenge-platform/"], ' +
+        'script[src*="challenges.cloudflare.com/turnstile/"], ' +
+        'input[name="cf-turnstile-response"], ' +
+        '[id^="cf-chl-"], ' +
+        '#captcha-box .main-wrapper[role="main"]',
+    ) !== null
+  );
 }
 
 
@@ -263,9 +287,8 @@ export interface BridgeDeps {
   /** Registered declarative provider adapters. Injected so hello's
    * adapter_versions map and the classifier are unit-testable. */
   adapterSpecs: AdapterSpec[];
-  /** chrome.scripting seam. Only ever used to inject the single self-contained
-   * `interpret` function (and the one-line download click) on the tracked tab
-   * of a granted provider host. */
+  /** Inject only serializable DOM probes into tracked, granted provider tabs so
+   * page inspection cannot escape the host-permission boundary. */
   scripting: {
     executeScript(injection: {
       target: { tabId: number };
@@ -327,6 +350,13 @@ interface NativeRequestResult {
 interface PendingNativeRequest {
   expectedType: BrowserMessageType;
   resolve(result: NativeRequestResult): void;
+}
+
+type ClassifyRetryKind = "unknown" | "bot_challenge";
+
+interface ClassifyRetry {
+  kind: ClassifyRetryKind;
+  attempts: number;
 }
 
 interface BrokerFailure {
@@ -675,9 +705,13 @@ export class Bridge {
   /** Forced job IDs awaiting release; consumed by the single active drain so
    * overlapping fallback timers cannot drop each other's requests. */
   private readonly pendingForcedReleases = new Set<string>();
-  /** Per-job bounded reclassification attempts while a provider page renders.
-   * Worker-local; cleared on a decisive verdict, download, or job removal. */
-  private readonly classifyRetries = new Map<string, number>();
+  /** One retry budget tracks the current transient phase. Switching from a bot
+   * check to an ordinary render race must start cleanly, or a cleared challenge
+   * could manufacture a stale-adapter result. */
+  private readonly classifyRetries = new Map<string, ClassifyRetry>();
+  /** Once the bounded wait has told the daemon to retry later, further complete
+   * events from that same interstitial must not restart the expired budget. */
+  private readonly botChallengeReported = new Set<string>();
   /** Broker-tab ids whose auth attempt is already counted, so the SSO redirect
    * dance within one drive increments the budget only once. Worker-local. */
   private readonly authCountedTabs = new Set<number>();
@@ -1841,6 +1875,7 @@ export class Bridge {
     this.offerURLs.delete(jobID);
     this.queuedHandoffTimers.delete(jobID);
     this.classifyRetries.delete(jobID);
+    this.botChallengeReported.delete(jobID);
     this.loginEntityIDs.delete(jobID);
     this.federatedLoginRouted.delete(jobID);
     this.federatedReDriven.delete(jobID);
@@ -3007,6 +3042,23 @@ export class Bridge {
       return;
     }
     if (!verdict) return;
+    if (verdict.kind === "unknown") {
+      try {
+        const results = await this.deps.scripting.executeScript({
+          target: { tabId: job.tab_id },
+          func: isBotChallenge,
+          args: [null],
+        });
+        if (results[0]?.result === true) {
+          await this.waitForBotChallenge(job, spec.version);
+          return;
+        }
+      } catch (e) {
+        // A failed probe must retain the existing stale-adapter path rather
+        // than silently make an unreadable provider page immortal.
+        console.error("papio: bot-challenge detection failed; classifying normally", e);
+      }
+    }
     await this.applyVerdict(jobID, spec, verdict, host);
     // A decisive verdict ends the render race; `unknown` may just be an
     // un-upgraded page, so retry on a bounded schedule. A latched download-click
@@ -3028,14 +3080,52 @@ export class Bridge {
     }
   }
 
+  /** A Cloudflare interstitial replaces the provider document while its
+   * verification is still in flight. Forget an earlier render race so it
+   * cannot be mistaken for two independent unreadable provider pages. */
+  private async waitForBotChallenge(job: ActiveJob, adapterVersion: string): Promise<void> {
+    if (this.botChallengeReported.has(job.job_id)) return;
+    if ((job.unknown_count ?? 0) !== 0) {
+      await this.update((s) => patchJob(s, job.job_id, { unknown_count: 0 }));
+    }
+    this.scheduleBotChallengeRetry(job.job_id, adapterVersion);
+  }
+
   private scheduleClassifyRetry(jobID: string): void {
-    const attempts = this.classifyRetries.get(jobID) ?? 0;
+    const retry = this.classifyRetries.get(jobID);
+    const attempts = retry?.kind === "unknown" ? retry.attempts : 0;
     if (attempts >= MAX_CLASSIFY_RETRIES) {
       this.classifyRetries.delete(jobID);
       return;
     }
-    this.classifyRetries.set(jobID, attempts + 1);
-    this.deps.setTimeout(() => this.retryClassify(jobID), CLASSIFY_RETRY_MS);
+    const next: ClassifyRetry = { kind: "unknown", attempts: attempts + 1 };
+    this.classifyRetries.set(jobID, next);
+    this.deps.setTimeout(() => this.retryClassify(jobID, next), CLASSIFY_RETRY_MS);
+  }
+
+  private scheduleBotChallengeRetry(jobID: string, adapterVersion: string): void {
+    const retry = this.classifyRetries.get(jobID);
+    const attempts = retry?.kind === "bot_challenge" ? retry.attempts : 0;
+    if (attempts >= MAX_BOT_CHALLENGE_RETRIES) {
+      this.classifyRetries.delete(jobID);
+      if (
+        this.send(
+          "provider_outcome",
+          {
+            outcome: "rate_limited",
+            adapter_version: adapterVersion,
+            detail: "blocked by a Cloudflare bot check",
+          },
+          jobID,
+        )
+      ) {
+        this.botChallengeReported.add(jobID);
+      }
+      return;
+    }
+    const next: ClassifyRetry = { kind: "bot_challenge", attempts: attempts + 1 };
+    this.classifyRetries.set(jobID, next);
+    this.deps.setTimeout(() => this.retryClassify(jobID, next), CLASSIFY_RETRY_MS);
   }
 
   /** Auto-select the institution on a provider login wall: navigate the handoff
@@ -3094,8 +3184,9 @@ export class Bridge {
     }
   }
 
-  private async retryClassify(jobID: string): Promise<void> {
+  private async retryClassify(jobID: string, expected?: ClassifyRetry): Promise<void> {
     await this.ready;
+    if (expected !== undefined && this.classifyRetries.get(jobID) !== expected) return;
     const job = findByJob(this.store, jobID);
     // Stop once the job is gone or an actual download is tracked. The guard is
     // the tracked download, NOT download_initiated: a click that latched to open

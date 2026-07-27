@@ -4,6 +4,7 @@ package app
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -96,6 +97,52 @@ func TestActionReminderNotifiesAtThreshold(t *testing.T) {
 	}
 	if got := eventInt64(detail["age_seconds"]); got != int64((30*time.Minute)/time.Second) {
 		t.Fatalf("reminder age_seconds = %d, want %d", got, int64((30*time.Minute)/time.Second))
+	}
+}
+
+func TestActionReminderManualDownloadNamesManualStep(t *testing.T) {
+	now := time.Date(2026, 7, 26, 12, 0, 0, 0, time.UTC)
+	svc, jobs, sink := newReminderTestService(t, &now)
+	openReminderActionKind(t, svc, jobs, "wr_reminder_manual_download", now.Add(-30*time.Minute),
+		job.StateAwaitingHuman, "manual_download", true)
+
+	if err := svc.ActionReminder().RunDue(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	want := "1 paper has been waiting 30m for you to sign in to your institution, then download the PDF yourself — papio will adopt it"
+	if len(sink.reminders) != 1 || sink.reminders[0] != want {
+		t.Fatalf("reminders = %q, want %q", sink.reminders, want)
+	}
+}
+
+// TestActionReminderNamesOpenOnlyForOpenableActions protects against an
+// inherited access classification turning a manual replacement into an
+// openable handoff in a reminder.
+func TestActionReminderNamesOpenOnlyForOpenableActions(t *testing.T) {
+	kinds := []string{
+		"openurl_handoff",
+		"manual_download",
+		"verify_identity",
+		"human_auth_required",
+		"terms_acceptance_required",
+		"openurl_available",
+	}
+	for _, kind := range kinds {
+		for _, requiresAuth := range []bool{false, true} {
+			authName := "false"
+			if requiresAuth {
+				authName = "true"
+			}
+			t.Run(kind+"/requires_auth="+authName, func(t *testing.T) {
+				action := job.HumanAction{Kind: kind, RequiresAuth: requiresAuth}
+				message := (actionReminderBatch{
+					jobs: map[string]struct{}{"job": {}}, oldestAge: time.Hour,
+				}).message(reminderBatchIndex(action))
+				if got, want := strings.Contains(message, actionsOpenCommand), HumanActionNextStepFor(action).Command == actionsOpenCommand; got != want {
+					t.Fatalf("reminder names %q = %t, want %t: %q", actionsOpenCommand, got, want, message)
+				}
+			})
+		}
 	}
 }
 

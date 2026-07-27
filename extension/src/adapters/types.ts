@@ -985,4 +985,23 @@ export const adapters: AdapterSpec[] = [
       metaName: "citation_pdf_url",
     },
   },
+  {
+    // The seven captured Alma View It pages all expose this terminal empty-results
+    // state. Resolver pages with holdings forward elsewhere, so their success
+    // shape is not evidenced here and must remain assisted.
+    id: "exlibris-primo",
+    version: "0.1.0",
+    hosts: ["alma.exlibrisgroup.com"],
+    classify: [
+      {
+        kind: "no_entitlement",
+        all: [
+          "form[name='uResolverViewItForm']",
+          "#repDataLong",
+          "#showAllLine",
+        ],
+        textAny: ["no full text available"],
+      },
+    ],
+  },
 ];
