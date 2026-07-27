@@ -10,6 +10,8 @@ execution records in `notes/acquisition-stack-plan.md`.
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-07-27
+
 ### Added
 
 - **Diagnostic page captures no longer land in your Downloads.** They travelled

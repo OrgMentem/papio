@@ -16,6 +16,8 @@ for the full pre-split extension history.
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-07-27
+
 ### Added
 
 - **Captures travel over the native-messaging bridge instead of your Downloads
