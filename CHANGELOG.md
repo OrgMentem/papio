@@ -32,6 +32,18 @@ execution records in `notes/acquisition-stack-plan.md`.
   existing. Bounded to one retry per job per upgrade, only with a live holder
   session, and never touching a leased job, a route already proven empty, or a
   `verify_identity` awaiting your decision.
+- **Re-submitting a paper that is already in flight no longer queues a
+  duplicate.** Four separate jobs for one DOI had accumulated on one machine,
+  because the underlying handoff kept failing and re-submitting was the only
+  recourse. `papio acquire` now returns the live job and says so, naming
+  `--force` for a genuinely fresh attempt. Terminal jobs never block a new
+  submission — `ready`, `failed`, `unavailable` and `no_identifier` are all
+  finished, and re-queueing after adding a missing DOI is the documented
+  remedy. Works identified only by title are deliberately never merged: a title
+  describes rather than identifies, and an erratum or a preprint can share one
+  with the paper the user actually wants. Delivered through a new
+  `acquire.submit_v2` method with a fallback to the old one, rather than
+  widening a result an older CLI would reject.
 
 - **Durable escalating reminders for stranded human actions.** The daemon now
   re-notifies the configured desktop and webhook sinks after

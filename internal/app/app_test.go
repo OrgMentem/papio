@@ -93,6 +93,191 @@ func newTestService(t *testing.T) (*Service, *job.Store) {
 	return svc, svc.Jobs
 }
 
+func submitDedupRequest(requestID string) protocol.WorkRequest {
+	return protocol.WorkRequest{
+		SchemaVersion: protocol.WorkRequestSchemaVersion,
+		RequestID:     requestID,
+		Identifiers:   &protocol.Identifiers{DOI: "10.1000/live-dedup"},
+	}
+}
+
+func TestSubmitReusesLiveCanonicalWork(t *testing.T) {
+	svc, jobs := newTestService(t)
+	ctx := context.Background()
+	first, err := svc.SubmitWithOptions(ctx, submitDedupRequest("request_dedup_0001"), SubmitOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Existing {
+		t.Fatalf("first submission = %+v, want newly created job", first)
+	}
+	second, err := svc.SubmitWithOptions(ctx, submitDedupRequest("request_dedup_0002"), SubmitOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !second.Existing || second.JobID != first.JobID {
+		t.Fatalf("second submission = %+v, want existing job %q", second, first.JobID)
+	}
+	rows, err := jobs.List(ctx, "", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("jobs = %+v, want one live job", rows)
+	}
+}
+
+func TestSubmitDoesNotMergeTitleOnlyRequests(t *testing.T) {
+	svc, jobs := newTestService(t)
+	ctx := context.Background()
+	request := protocol.WorkRequest{
+		SchemaVersion: protocol.WorkRequestSchemaVersion,
+		Title:         "Shared title",
+		Authors:       []string{"Ada Lovelace"},
+		Year:          2024,
+	}
+	request.RequestID = "request_title_0001"
+	first, err := svc.SubmitWithOptions(ctx, request, SubmitOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.RequestID = "request_title_0002"
+	second, err := svc.SubmitWithOptions(ctx, request, SubmitOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Existing || second.Existing || first.JobID == second.JobID {
+		t.Fatalf("title-only submissions = %+v, %+v; want distinct jobs", first, second)
+	}
+	rows, err := jobs.List(ctx, "", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("jobs = %+v, want distinct title-only jobs", rows)
+	}
+}
+
+func TestSubmitAllowsFreshJobAfterEveryTerminalState(t *testing.T) {
+	for _, state := range []string{
+		job.StateReady,
+		job.StateImported,
+		job.StateFailed,
+		job.StateUnavailable,
+		job.StateCancelled,
+	} {
+		t.Run(state, func(t *testing.T) {
+			svc, jobs := newTestService(t)
+			ctx := context.Background()
+			first, err := svc.SubmitWithOptions(ctx, submitDedupRequest("request_terminal_0001"), SubmitOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			terminalizeSubmitDedupJob(t, jobs, first.JobID, state)
+			second, err := svc.SubmitWithOptions(ctx, submitDedupRequest("request_terminal_0001"), SubmitOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if second.Existing || second.JobID == first.JobID {
+				t.Fatalf("second submission = %+v, want fresh job after %s", second, state)
+			}
+			rows, err := jobs.List(ctx, "", 10)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(rows) != 2 {
+				t.Fatalf("jobs after %s = %+v, want prior terminal and fresh job", state, rows)
+			}
+		})
+	}
+}
+
+func TestSubmitAllowsNoIdentifierRetryAfterDOIAdded(t *testing.T) {
+	svc, jobs := newTestService(t)
+	ctx := context.Background()
+	request := protocol.WorkRequest{
+		SchemaVersion: protocol.WorkRequestSchemaVersion,
+		RequestID:     "request_no_identifier_retry",
+		Title:         "A printed monograph",
+		Authors:       []string{"A. Author"},
+		Year:          1999,
+	}
+	first, err := svc.SubmitWithOptions(ctx, request, SubmitOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminalizeSubmitDedupJob(t, jobs, first.JobID, job.StateUnavailable)
+	request.Identifiers = &protocol.Identifiers{DOI: "10.1000/now-identified"}
+	second, err := svc.SubmitWithOptions(ctx, request, SubmitOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Existing || second.JobID == first.JobID {
+		t.Fatalf("identified retry = %+v, want fresh job", second)
+	}
+	row, err := jobs.Get(ctx, second.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.Work.DOI != "10.1000/now-identified" {
+		t.Fatalf("retry work = %+v, want added DOI", row.Work)
+	}
+}
+
+func TestSubmitForceCreatesFreshLiveJob(t *testing.T) {
+	svc, jobs := newTestService(t)
+	ctx := context.Background()
+	first, err := svc.SubmitWithOptions(ctx, submitDedupRequest("request_force_0001"), SubmitOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := svc.SubmitWithOptions(ctx, submitDedupRequest("request_force_0001"), SubmitOptions{Force: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Existing || second.JobID == first.JobID {
+		t.Fatalf("forced submission = %+v, want fresh job after %q", second, first.JobID)
+	}
+	rows, err := jobs.List(ctx, "", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("jobs = %+v, want two concurrent jobs after --force", rows)
+	}
+}
+
+func terminalizeSubmitDedupJob(t *testing.T, jobs *job.Store, id, state string) {
+	t.Helper()
+	if state == job.StateCancelled {
+		if err := jobs.Transition(context.Background(), id, job.StateQueued, state, nil); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+	if err := jobs.Transition(context.Background(), id, job.StateQueued, job.StateResolving, nil); err != nil {
+		t.Fatal(err)
+	}
+	if state == job.StateImported {
+		if err := jobs.Transition(context.Background(), id, job.StateResolving, job.StateReady, nil); err != nil {
+			t.Fatal(err)
+		}
+		if err := jobs.Transition(context.Background(), id, job.StateReady, state, nil); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+	if state == job.StateUnavailable {
+		if err := jobs.Transition(context.Background(), id, job.StateResolving, state, nil, job.WithTerminalReason("no_identifier")); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+	if err := jobs.Transition(context.Background(), id, job.StateResolving, state, nil); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestResolveEnrichesTitleOnlyWorkBeforeResolvers(t *testing.T) {
 	svc, jobs := newTestService(t)
 	enricher := &fakeEnricher{result: work.Work{
@@ -267,6 +452,16 @@ func doiRequest(id string) protocol.WorkRequest {
 		Identifiers:    &protocol.Identifiers{DOI: "10.1002/example"},
 		DesiredVersion: "any",
 	}
+}
+
+// doiRequestFor derives a DISTINCT DOI per request id, for fixtures that need
+// several concurrent jobs. doiRequest deliberately keeps one fixed DOI so tests
+// about a single work stay readable, but submission now dedups against a live
+// job for the same canonical work, so reusing it for several jobs yields one.
+func doiRequestFor(id string) protocol.WorkRequest {
+	request := doiRequest(id)
+	request.Identifiers = &protocol.Identifiers{DOI: "10.1002/example-" + strings.ToLower(id)}
+	return request
 }
 
 func pdfBytes(label string) []byte {
@@ -1191,7 +1386,10 @@ func TestSubmitWithAutoImportOverrideBeatsConfigDefault(t *testing.T) {
 	svc, jobs := newTestService(t)
 	svc.Config.Zotio.AutoImport = true
 	disabled := false
-	id, err := svc.SubmitWithAutoImport(context.Background(), doiRequest("wr_auto_import_off"), &disabled)
+	// Two DISTINCT works. Each half asserts a property of NEW-job creation, and
+	// re-submitting one work would dedup into the first job and read back its
+	// policy rather than the one under test.
+	id, err := svc.SubmitWithAutoImport(context.Background(), doiRequestFor("wr_auto_import_off"), &disabled)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1202,7 +1400,7 @@ func TestSubmitWithAutoImportOverrideBeatsConfigDefault(t *testing.T) {
 	if row.Policy.AutoImport {
 		t.Fatal("explicit --auto-import=false did not override config")
 	}
-	id, err = svc.SubmitWithAutoImport(context.Background(), doiRequest("wr_auto_import_cfg"), nil)
+	id, err = svc.SubmitWithAutoImport(context.Background(), doiRequestFor("wr_auto_import_cfg"), nil)
 	if err != nil {
 		t.Fatal(err)
 	}

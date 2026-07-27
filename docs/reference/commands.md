@@ -44,6 +44,7 @@ papio acquire [identifier] [flags]
 | `--deny-source` | `stringSlice` | `[]` | deny this source (repeatable) |
 | `--desired-version` | `string` | `any` | published, accepted, preprint, or any |
 | `--doi` | `string` |  | DOI |
+| `--force` | `bool` | `false` | create a fresh job even when this work is already in flight |
 | `--from-digest` | `int64` | `0` | queue pending entries from an alert watch |
 | `--from-zotio` | `bool` | `false` | queue zotio items missing an attached PDF |
 | `--include-owned` | `bool` | `false` | with --batch, submit works already carrying a PDF in zotio |

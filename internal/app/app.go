@@ -105,6 +105,20 @@ type Service struct {
 	Now        func() time.Time
 }
 
+// SubmitOptions keeps explicit retry intent at the application boundary so
+// callers cannot accidentally create parallel live acquisition attempts.
+type SubmitOptions struct {
+	AutoImport *bool
+	Force      bool
+}
+
+// SubmitResult lets callers distinguish a newly queued job from an in-flight
+// job that already owns the requested work.
+type SubmitResult struct {
+	JobID    string
+	Existing bool
+}
+
 // New constructs a service and applies safe timing defaults.
 func New(cfg config.Config, jobs *job.Store, artifacts *artifact.Store, budgets *budget.Manager) *Service {
 	return &Service{
@@ -113,38 +127,52 @@ func New(cfg config.Config, jobs *job.Store, artifacts *artifact.Store, budgets 
 	}
 }
 
-// Submit strictly validates and canonicalizes a WorkRequest before creating its
-// durable queued job. Config access_mode is always required; an optional
+// Submit strictly validates and canonicalizes a WorkRequest before creating or
+// reusing its durable job. Config access_mode is always required; an optional
 // request override is then snapshotted explicitly.
 func (s *Service) Submit(ctx context.Context, wr protocol.WorkRequest) (string, error) {
-	return s.SubmitWithAutoImport(ctx, wr, nil)
+	result, err := s.SubmitWithOptions(ctx, wr, SubmitOptions{})
+	if err != nil {
+		return "", err
+	}
+	return result.JobID, nil
 }
 
 // SubmitWithAutoImport behaves like Submit while applying an optional per-job
 // auto-import override. A nil override preserves the config default.
 func (s *Service) SubmitWithAutoImport(ctx context.Context, wr protocol.WorkRequest, autoImport *bool) (string, error) {
-	if err := wr.Validate(); err != nil {
+	result, err := s.SubmitWithOptions(ctx, wr, SubmitOptions{AutoImport: autoImport})
+	if err != nil {
 		return "", err
+	}
+	return result.JobID, nil
+}
+
+// SubmitWithOptions returns Existing when an in-flight job already owns the
+// canonical work. Force deliberately creates a fresh request instead.
+func (s *Service) SubmitWithOptions(ctx context.Context, wr protocol.WorkRequest, options SubmitOptions) (SubmitResult, error) {
+	if err := wr.Validate(); err != nil {
+		return SubmitResult{}, err
 	}
 	mode, err := s.Config.RequireAccessMode()
 	if err != nil {
-		return "", err
+		return SubmitResult{}, err
 	}
 	if wr.AccessModeOverride != "" {
 		mode = wr.AccessModeOverride
 	}
 	w, raw, err := canonicalWork(wr)
 	if err != nil {
-		return "", err
+		return SubmitResult{}, err
 	}
 	resolverName := strings.TrimSpace(wr.Resolver)
 	if resolverName != "" {
 		if _, ok := s.Config.OpenURLBaseFor(resolverName); !ok {
 			names := s.Config.ResolverNames()
 			if len(names) == 0 {
-				return "", fmt.Errorf("unknown resolver %q (configured profiles: none)", resolverName)
+				return SubmitResult{}, fmt.Errorf("unknown resolver %q (configured profiles: none)", resolverName)
 			}
-			return "", fmt.Errorf("unknown resolver %q (configured profiles: %s)", resolverName, strings.Join(names, ", "))
+			return SubmitResult{}, fmt.Errorf("unknown resolver %q (configured profiles: %s)", resolverName, strings.Join(names, ", "))
 		}
 	}
 	desired := wr.DesiredVersion
@@ -152,8 +180,8 @@ func (s *Service) SubmitWithAutoImport(ctx context.Context, wr protocol.WorkRequ
 		desired = "any"
 	}
 	auto := s.Config.Zotio.AutoImport
-	if autoImport != nil {
-		auto = *autoImport
+	if options.AutoImport != nil {
+		auto = *options.AutoImport
 	}
 	pol := job.Policy{
 		AccessMode: mode, DesiredVersion: desired, Resolver: resolverName, MaxCostUSD: wr.MaxCostUSD,
@@ -163,7 +191,11 @@ func (s *Service) SubmitWithAutoImport(ctx context.Context, wr protocol.WorkRequ
 		AutoImport:    auto,
 		Collection:    strings.TrimSpace(wr.Collection),
 	}
-	return s.Jobs.CreateRequest(ctx, wr.RequestID, w, wr.ZotioItemKey, wr.Collection, pol, raw)
+	created, err := s.Jobs.CreateRequestForWork(ctx, wr.RequestID, w, wr.ZotioItemKey, wr.Collection, pol, raw, options.Force)
+	if err != nil {
+		return SubmitResult{}, err
+	}
+	return SubmitResult{JobID: created.JobID, Existing: created.Existing}, nil
 }
 
 func canonicalWork(wr protocol.WorkRequest) (work.Work, map[string]string, error) {

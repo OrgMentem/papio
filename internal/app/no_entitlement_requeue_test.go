@@ -9,10 +9,15 @@ import (
 	"papio/internal/job"
 )
 
+// resolvingExhaustionJob mints a job whose work is DISTINCT per request id.
+// Submission now dedups against a live job for the same canonical work, so
+// helpers that build several fixture jobs must vary the identifier or they
+// collapse into one job and the second transition fails. These callers want
+// several distinct jobs, not several submissions of one paper.
 func resolvingExhaustionJob(t *testing.T, svc *Service, jobs *job.Store, requestID string) *job.Row {
 	t.Helper()
 	ctx := context.Background()
-	id, err := svc.Submit(ctx, doiRequest(requestID))
+	id, err := svc.Submit(ctx, doiRequestFor(requestID))
 	if err != nil {
 		t.Fatal(err)
 	}

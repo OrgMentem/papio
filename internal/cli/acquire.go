@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -21,6 +22,7 @@ import (
 	"papio/internal/batch"
 	"papio/internal/errcat"
 	"papio/internal/ingest"
+	"papio/internal/ipc"
 	"papio/internal/job"
 	"papio/internal/protocol"
 	"papio/internal/work"
@@ -33,7 +35,7 @@ func newAcquireCommand(opt *options) *cobra.Command {
 	var authors, allowSources, denySources []string
 	var year, queueLimit int
 	var maxCost float64
-	var wait, fromZotio, autoImport, includeOwned bool
+	var wait, fromZotio, autoImport, includeOwned, force bool
 	var fromDigest int64
 	var batchPath string
 	var digestKeys []string
@@ -77,7 +79,7 @@ func newAcquireCommand(opt *options) *cobra.Command {
 					}
 				}
 				for _, name := range []string{
-					"wait", "auto-import", "collection", "desired-version", "access-mode", "resolver", "max-cost", "source", "deny-source", "limit", "include-owned", "label",
+					"wait", "auto-import", "collection", "desired-version", "access-mode", "resolver", "max-cost", "source", "deny-source", "limit", "include-owned", "label", "force",
 				} {
 					if cmd.Flags().Changed(name) {
 						return fmt.Errorf("--%s is not supported with --from-digest", name)
@@ -115,6 +117,9 @@ func newAcquireCommand(opt *options) *cobra.Command {
 				}
 				if cmd.Flags().Changed("resolver") {
 					return fmt.Errorf("--resolver is not supported with --from-zotio")
+				}
+				if cmd.Flags().Changed("force") {
+					return fmt.Errorf("--force is not supported with --from-zotio")
 				}
 				options := zotio.QueueOptions{
 					Collection:         strings.TrimSpace(collection),
@@ -158,11 +163,14 @@ func newAcquireCommand(opt *options) *cobra.Command {
 			if cmd.Flags().Changed("max-cost") {
 				request.MaxCostUSD = &maxCost
 			}
-			var submitted api.SubmitResult
-			if err := submitAcquire(cmd.Context(), opt, request, autoImportOverride, &submitted); err != nil {
+			var submitted api.SubmitV2Result
+			if err := submitAcquire(cmd.Context(), opt, request, autoImportOverride, force, &submitted); err != nil {
 				return err
 			}
 			if !wait {
+				if submitted.Existing {
+					return opt.printResult(submitted, "Matched existing in-flight job %s; use --force to queue a fresh attempt", submitted.JobID)
+				}
 				return opt.printResult(submitted, "Queued %s", submitted.JobID)
 			}
 			detail, err := waitForJob(cmd.Context(), opt, submitted.JobID)
@@ -170,6 +178,13 @@ func newAcquireCommand(opt *options) *cobra.Command {
 				return err
 			}
 			prose := fmt.Sprintf("%s: %s", detail.Job.ID, detail.Job.State)
+			if submitted.Existing {
+				// Name the consequence, not just the match: a user who passed
+				// --auto-import or --collection on this call needs to know the
+				// in-flight job keeps its own settings, or they will assume the
+				// options took effect and be surprised at import time.
+				prose = fmt.Sprintf("Matched existing in-flight job %s, which keeps the settings it was queued with; use --force to queue a fresh attempt\n%s", submitted.JobID, prose)
+			}
 			if !opt.jsonOutput {
 				cfg, _ := opt.loadConfig()
 				reason := transitionReason(detail.Events, detail.Job.State)
@@ -177,7 +192,7 @@ func newAcquireCommand(opt *options) *cobra.Command {
 					prose += "\n" + g
 				}
 			}
-			return opt.printResult(detail, "%s", prose)
+			return opt.printResult(acquireWaitResult{JobDetail: detail, Existing: submitted.Existing}, "%s", prose)
 		},
 	}
 	flags := command.Flags()
@@ -207,6 +222,7 @@ func newAcquireCommand(opt *options) *cobra.Command {
 	flags.BoolVar(&includeOwned, "include-owned", false, "with --batch, submit works already carrying a PDF in zotio")
 	flags.StringVar(&label, "label", "", "query context; also the default target collection when --collection is unset")
 	flags.BoolVar(&autoImport, "auto-import", false, "plan and apply zotio import automatically when ready")
+	flags.BoolVar(&force, "force", false, "create a fresh job even when this work is already in flight")
 	return command
 }
 
@@ -289,6 +305,17 @@ type acquireSubmitParams struct {
 	AutoImport *bool                `json:"auto_import,omitempty"`
 }
 
+type acquireSubmitV2Params struct {
+	Request    protocol.WorkRequest `json:"request"`
+	AutoImport *bool                `json:"auto_import,omitempty"`
+	Force      bool                 `json:"force,omitempty"`
+}
+
+type acquireWaitResult struct {
+	*api.JobDetail
+	Existing bool `json:"existing,omitempty"`
+}
+
 type batchSubmission struct {
 	JobID string `json:"job_id"`
 	State string `json:"state"`
@@ -323,7 +350,7 @@ func validateBatchFlags(cmd *cobra.Command, args []string, fromZotio, wait bool)
 	for _, name := range []string{
 		"doi", "pmid", "arxiv", "isbn", "openalex", "title", "author", "year",
 		"request-id", "zotio-item-key", "desired-version", "access-mode",
-		"max-cost", "source", "deny-source", "limit",
+		"max-cost", "source", "deny-source", "limit", "force",
 	} {
 		if cmd.Flags().Changed(name) {
 			return fmt.Errorf("--batch cannot be combined with --%s; put per-work values in JSONL", name)
@@ -399,12 +426,29 @@ func batchRequestID(ids *protocol.Identifiers, title string, authors []string, y
 	return batch.InitialRequestID(ids, title, authors, year)
 }
 
-func submitAcquire(ctx context.Context, opt *options, request protocol.WorkRequest, autoImport *bool, result *api.SubmitResult) error {
+func submitAcquire(ctx context.Context, opt *options, request protocol.WorkRequest, autoImport *bool, force bool, result *api.SubmitV2Result) error {
+	v2Params := acquireSubmitV2Params{Request: request, AutoImport: autoImport, Force: force}
+	err := opt.call(ctx, "acquire.submit_v2", v2Params, result)
+	if err == nil {
+		return nil
+	}
+	var remote *ipc.RemoteError
+	if !errors.As(err, &remote) || remote.Code != "unknown_method" {
+		return err
+	}
+	if force {
+		request.RequestID = job.NewID("request")
+	}
+	var legacy api.SubmitResult
 	var params any = request
 	if autoImport != nil {
 		params = acquireSubmitParams{Request: request, AutoImport: autoImport}
 	}
-	return opt.call(ctx, "acquire.submit", params, result)
+	if err := opt.call(ctx, "acquire.submit", params, &legacy); err != nil {
+		return err
+	}
+	*result = api.SubmitV2Result{JobID: legacy.JobID}
+	return nil
 }
 
 type socketBatchCaller struct {

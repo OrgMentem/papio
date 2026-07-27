@@ -63,6 +63,15 @@ func (f *fakeSubmitter) Submit(_ context.Context, request protocol.WorkRequest) 
 	return "job_" + request.ZotioItemKey, nil
 }
 
+type existingJobSubmitter struct {
+	calls int
+}
+
+func (s *existingJobSubmitter) Submit(context.Context, protocol.WorkRequest) (string, error) {
+	s.calls++
+	return "job_existing_live", nil
+}
+
 func TestQueueMissingPDFSubmitsDeterministicRequestsAndSkipsUnidentified(t *testing.T) {
 	cli := &fakeCLI{
 		items: []MissingPDFItem{
@@ -107,6 +116,22 @@ func TestQueueMissingPDFSubmitsDeterministicRequestsAndSkipsUnidentified(t *test
 	}
 	if result.Skipped[0].ZotioItemKey != "JK90LM12" || result.Skipped[0].Reason == "" {
 		t.Fatalf("skipped = %+v", result.Skipped)
+	}
+}
+
+func TestQueueMissingPDFTreatsDeduplicatedJobAsSuccess(t *testing.T) {
+	cli := &fakeCLI{
+		items: []MissingPDFItem{{
+			Key: "AB12CD34", Title: "Queued elsewhere", DOI: "10.1000/queued-elsewhere",
+		}},
+	}
+	submitter := &existingJobSubmitter{}
+	result, err := (&Service{CLI: cli, Submitter: submitter}).QueueMissingPDF(context.Background(), QueueOptions{Limit: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if submitter.calls != 1 || len(result.Queued) != 1 || result.Queued[0].JobID != "job_existing_live" {
+		t.Fatalf("deduplicated queue result = %+v calls=%d", result, submitter.calls)
 	}
 }
 

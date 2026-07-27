@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"papio/internal/app"
 	"papio/internal/batch"
 	"papio/internal/bootstrap"
 	"papio/internal/browser"
@@ -32,6 +33,13 @@ var Version = "0.1.0-dev"
 
 type SubmitResult struct {
 	JobID string `json:"job_id"`
+}
+
+// SubmitV2Result preserves the legacy SubmitResult wire shape while exposing
+// whether a live job already owned this acquisition.
+type SubmitV2Result struct {
+	JobID    string `json:"job_id"`
+	Existing bool   `json:"existing"`
 }
 
 // ActionsOpenParams names the parked handoffs the CLI wants the extension to
@@ -88,6 +96,9 @@ func RouterWithShutdown(system *bootstrap.System, shutdown context.CancelFunc) i
 		},
 		"acquire.submit": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return submit(ctx, raw, system)
+		},
+		"acquire.submit_v2": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return submitV2(ctx, raw, system)
 		},
 		"acquire.report": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return acquireReport(ctx, raw, system)
@@ -288,6 +299,31 @@ func ping(ctx context.Context, raw json.RawMessage, system *bootstrap.System, up
 type acquireSubmitParams struct {
 	Request    protocol.WorkRequest `json:"request"`
 	AutoImport *bool                `json:"auto_import,omitempty"`
+}
+
+type acquireSubmitV2Params struct {
+	Request    protocol.WorkRequest `json:"request"`
+	AutoImport *bool                `json:"auto_import,omitempty"`
+	Force      bool                 `json:"force,omitempty"`
+}
+
+func submitV2(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
+	var params acquireSubmitV2Params
+	if err := ipc.DecodeParams(raw, &params); err != nil {
+		return badParams(err)
+	}
+	result, err := system.App.SubmitWithOptions(ctx, params.Request, app.SubmitOptions{
+		AutoImport: params.AutoImport,
+		Force:      params.Force,
+	})
+	if err != nil {
+		var unset *config.ErrAccessModeUnset
+		if errors.As(err, &unset) {
+			return nil, &ipc.RPCError{Code: "configuration_required", Message: unset.Error()}
+		}
+		return nil, &ipc.RPCError{Code: "invalid_argument", Message: "invalid acquisition request"}
+	}
+	return marshal(SubmitV2Result{JobID: result.JobID, Existing: result.Existing})
 }
 
 func submit(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {

@@ -12,6 +12,7 @@ import (
 
 	"papio/internal/api"
 	"papio/internal/config"
+	"papio/internal/ipc"
 	"papio/internal/job"
 	"papio/internal/protocol"
 	"papio/internal/zotio"
@@ -192,8 +193,8 @@ func TestAcquireWaitUsesCurrentOpenActionGuidance(t *testing.T) {
 	root := NewInProcessRoot(&out, &errOut, config.Config{AccessMode: config.ModeDelegated},
 		func(_ context.Context, method string, _ any, result any) error {
 			switch method {
-			case "acquire.submit":
-				*result.(*api.SubmitResult) = api.SubmitResult{JobID: detail.Job.ID}
+			case "acquire.submit_v2":
+				*result.(*api.SubmitV2Result) = api.SubmitV2Result{JobID: detail.Job.ID}
 			case "jobs.get":
 				*result.(*api.JobDetail) = detail
 			default:
@@ -213,5 +214,78 @@ func TestAcquireWaitUsesCurrentOpenActionGuidance(t *testing.T) {
 	}
 	if strings.Contains(got, "papio actions open") {
 		t.Fatalf("output names an inapplicable handoff command: %q", got)
+	}
+}
+
+func TestAcquireReportsExistingInFlightJob(t *testing.T) {
+	var out, errOut bytes.Buffer
+	root := NewInProcessRoot(&out, &errOut, config.Config{}, func(_ context.Context, method string, params, result any) error {
+		if method != "acquire.submit_v2" {
+			return fmt.Errorf("unexpected method %q", method)
+		}
+		got, ok := params.(acquireSubmitV2Params)
+		if !ok || got.Force {
+			t.Fatalf("submit params = %#v, want non-forced v2 request", params)
+		}
+		*result.(*api.SubmitV2Result) = api.SubmitV2Result{JobID: "job_existing", Existing: true}
+		return nil
+	})
+	root.SetArgs([]string{"acquire", "--doi", "10.1000/existing"})
+	if err := root.ExecuteContext(context.Background()); err != nil {
+		t.Fatalf("acquire: %v (%s)", err, errOut.String())
+	}
+	if got := out.String(); !strings.Contains(got, "Matched existing in-flight job job_existing") {
+		t.Fatalf("output = %q, want visible existing-job result", got)
+	}
+}
+
+func TestAcquireForceRequestsFreshJob(t *testing.T) {
+	var out, errOut bytes.Buffer
+	root := NewInProcessRoot(&out, &errOut, config.Config{}, func(_ context.Context, method string, params, result any) error {
+		if method != "acquire.submit_v2" {
+			return fmt.Errorf("unexpected method %q", method)
+		}
+		got, ok := params.(acquireSubmitV2Params)
+		if !ok || !got.Force {
+			t.Fatalf("submit params = %#v, want forced v2 request", params)
+		}
+		*result.(*api.SubmitV2Result) = api.SubmitV2Result{JobID: "job_fresh"}
+		return nil
+	})
+	root.SetArgs([]string{"acquire", "--doi", "10.1000/force", "--force"})
+	if err := root.ExecuteContext(context.Background()); err != nil {
+		t.Fatalf("acquire --force: %v (%s)", err, errOut.String())
+	}
+	if got := out.String(); got != "Queued job_fresh\n" {
+		t.Fatalf("output = %q, want fresh queue result", got)
+	}
+}
+
+func TestAcquireSubmitFallsBackToLegacyDaemon(t *testing.T) {
+	var out, errOut bytes.Buffer
+	const requestedID = "request_force_legacy_01"
+	var fallbackID string
+	root := NewInProcessRoot(&out, &errOut, config.Config{}, func(_ context.Context, method string, params, result any) error {
+		switch method {
+		case "acquire.submit_v2":
+			return &ipc.RemoteError{Code: "unknown_method", Message: "unknown method"}
+		case "acquire.submit":
+			request, ok := params.(protocol.WorkRequest)
+			if !ok {
+				t.Fatalf("legacy params = %#v, want work request", params)
+			}
+			fallbackID = request.RequestID
+			*result.(*api.SubmitResult) = api.SubmitResult{JobID: "job_legacy"}
+			return nil
+		default:
+			return fmt.Errorf("unexpected method %q", method)
+		}
+	})
+	root.SetArgs([]string{"acquire", "--doi", "10.1000/legacy", "--force", "--request-id", requestedID})
+	if err := root.ExecuteContext(context.Background()); err != nil {
+		t.Fatalf("acquire fallback: %v (%s)", err, errOut.String())
+	}
+	if fallbackID == "" || fallbackID == requestedID {
+		t.Fatalf("legacy forced request ID = %q, want fresh id distinct from %q", fallbackID, requestedID)
 	}
 }

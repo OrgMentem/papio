@@ -11,7 +11,6 @@ import (
 
 	"papio/internal/api"
 	"papio/internal/config"
-	"papio/internal/protocol"
 	"papio/internal/watch"
 	"papio/internal/zotio"
 )
@@ -270,17 +269,22 @@ func TestAcquireSingleLabelDefaultsCollection(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
 			root := NewInProcessRoot(&stdout, &stderr, config.Config{}, func(_ context.Context, method string, params any, result any) error {
-				if method != "acquire.submit" {
-					t.Fatalf("method = %q, want acquire.submit", method)
+				// acquire now submits through acquire.submit_v2, which reports
+				// whether the request matched a live job. The legacy method is
+				// still reachable as the older-daemon fallback and is covered
+				// by the dedup tests; this one only asserts collection seeding.
+				if method != "acquire.submit_v2" {
+					t.Fatalf("method = %q, want acquire.submit_v2", method)
 				}
-				request, ok := params.(protocol.WorkRequest)
+				submit, ok := params.(acquireSubmitV2Params)
 				if !ok {
-					t.Fatalf("params = %T, want protocol.WorkRequest", params)
+					t.Fatalf("params = %T, want acquireSubmitV2Params", params)
 				}
+				request := submit.Request
 				if request.Collection != test.wantCollection {
 					t.Fatalf("collection = %q, want %q", request.Collection, test.wantCollection)
 				}
-				*result.(*api.SubmitResult) = api.SubmitResult{JobID: "job_test_0001"}
+				*result.(*api.SubmitV2Result) = api.SubmitV2Result{JobID: "job_test_0001"}
 				return nil
 			})
 			root.SetArgs(test.args)

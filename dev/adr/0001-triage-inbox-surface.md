@@ -7,8 +7,9 @@ accept-with-changes; all amendments below adopted). Key factual claims were
 verified against the codebase before acceptance.
 A subscription mechanism for live daemon push — the item this ADR defers below
 under *Background broker obligations* — was evaluated in ADR-0005 and
-rejected; the *solicited only* rule and the deferred-work note both stand
-unamended.
+rejected; the deferred-work note stands unamended. ADR-0006 amends only the
+unexpressible daemon-to-extension direction of the *solicited only* rule; its
+feature-gated extension-to-daemon rule remains unchanged.
 
 ## Context
 

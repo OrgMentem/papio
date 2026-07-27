@@ -207,46 +207,76 @@ func NewID(prefix string) string {
 	return prefix + "_" + hex.EncodeToString(b[:])
 }
 
+// CreateResult preserves convergence information so callers can distinguish
+// a reused live job from a new queue entry.
+type CreateResult struct {
+	JobID    string
+	Existing bool
+}
+
 // CreateRequest inserts a work request, its identifiers, and a queued job in
-// one transaction. Resubmitting the same requestID returns the existing live
-// job (idempotent submission).
+// one transaction. Resubmitting the same requestID returns its existing live
+// job; terminal attempts permit a new job.
 func (js *Store) CreateRequest(ctx context.Context, requestID string, w work.Work, zotioKey, collection string, pol Policy, rawIDs map[string]string) (string, error) {
-	if requestID == "" {
+	result, err := js.createRequest(ctx, requestID, w, zotioKey, collection, pol, rawIDs, false, false)
+	if err != nil {
+		return "", err
+	}
+	return result.JobID, nil
+}
+
+// CreateRequestForWork creates a job or returns a live job with the same
+// work.Work.Describe identity. It deliberately excludes title-only matching:
+// titles describe works rather than assert identity, so merging on one could
+// silently discard a distinct acquisition.
+func (js *Store) CreateRequestForWork(ctx context.Context, requestID string, w work.Work, zotioKey, collection string, pol Policy, rawIDs map[string]string, force bool) (CreateResult, error) {
+	return js.createRequest(ctx, requestID, w, zotioKey, collection, pol, rawIDs, force, true)
+}
+
+func (js *Store) createRequest(ctx context.Context, requestID string, w work.Work, zotioKey, collection string, pol Policy, rawIDs map[string]string, force, deduplicateWork bool) (CreateResult, error) {
+	if requestID == "" || force {
+		// A force request needs its own work_request row so the live-job
+		// invariant cannot collapse the explicitly requested fresh attempt.
 		requestID = NewID("wr")
 	}
-	db := js.S.DB()
-
-	// Idempotent resubmission: return the live job for this request if any.
-	var existing string
-	err := db.QueryRowContext(ctx,
-		`SELECT id FROM jobs WHERE work_request_id = ? AND state NOT IN ('failed','cancelled','unavailable') ORDER BY created_at DESC LIMIT 1`,
-		requestID).Scan(&existing)
-	if err == nil {
-		return existing, nil
+	tx, err := js.S.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return CreateResult{}, err
 	}
-	if !errors.Is(err, sql.ErrNoRows) {
-		return "", err
+	defer func() { _ = tx.Rollback() }()
+
+	if !force {
+		existing, err := liveJobForRequest(ctx, tx, requestID)
+		if err != nil {
+			return CreateResult{}, err
+		}
+		if existing != "" {
+			return CreateResult{JobID: existing, Existing: true}, nil
+		}
+		if deduplicateWork {
+			existing, err = liveJobForCanonicalWork(ctx, tx, w)
+			if err != nil {
+				return CreateResult{}, err
+			}
+			if existing != "" {
+				return CreateResult{JobID: existing, Existing: true}, nil
+			}
+		}
 	}
 
 	polJSON, err := json.Marshal(pol)
 	if err != nil {
-		return "", err
+		return CreateResult{}, err
 	}
 	authorsJSON, _ := json.Marshal(w.Authors)
 	now := store.Now()
 	jobID := NewID("job")
 
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		return "", err
-	}
-	defer func() { _ = tx.Rollback() }()
-
 	if _, err := tx.ExecContext(ctx,
 		`INSERT OR IGNORE INTO work_requests (id, created_at, requester, zotio_item_key, collection_key, title, authors_json, year, desired_version, max_cost_usd)
 		 VALUES (?, ?, 'cli', ?, ?, ?, ?, ?, ?, ?)`,
 		requestID, now, nullable(zotioKey), nullable(collection), nullable(w.Title), string(authorsJSON), nullableInt(w.Year), pol.DesiredVersion, pol.MaxCostUSD); err != nil {
-		return "", fmt.Errorf("inserting work request: %w", err)
+		return CreateResult{}, fmt.Errorf("inserting work request: %w", err)
 	}
 	for kind, value := range map[string]string{"doi": w.DOI, "pmid": w.PMID, "arxiv": w.ArXiv, "isbn": w.ISBN, "openalex": w.OpenAlex} {
 		if value == "" {
@@ -259,23 +289,66 @@ func (js *Store) CreateRequest(ctx context.Context, requestID string, w work.Wor
 		if _, err := tx.ExecContext(ctx,
 			`INSERT OR REPLACE INTO identifiers (work_request_id, kind, value, raw) VALUES (?, ?, ?, ?)`,
 			requestID, kind, value, raw); err != nil {
-			return "", fmt.Errorf("inserting identifier %s: %w", kind, err)
+			return CreateResult{}, fmt.Errorf("inserting identifier %s: %w", kind, err)
 		}
 	}
 	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO jobs (id, work_request_id, state, policy_json, created_at, updated_at) VALUES (?, ?, 'queued', ?, ?, ?)`,
 		jobID, requestID, string(polJSON), now, now); err != nil {
-		return "", fmt.Errorf("inserting job: %w", err)
+		return CreateResult{}, fmt.Errorf("inserting job: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO events (job_id, at, kind, detail_json) VALUES (?, ?, 'job.created', ?)`,
 		jobID, now, fmt.Sprintf(`{"request_id":%q,"work":%q}`, requestID, w.Describe())); err != nil {
-		return "", err
+		return CreateResult{}, err
 	}
 	if err := tx.Commit(); err != nil {
+		return CreateResult{}, err
+	}
+	return CreateResult{JobID: jobID}, nil
+}
+
+func liveJobForRequest(ctx context.Context, tx *sql.Tx, requestID string) (string, error) {
+	return firstLiveJob(ctx, tx,
+		`SELECT id, state FROM jobs WHERE work_request_id = ? ORDER BY created_at DESC`, requestID)
+}
+
+func liveJobForCanonicalWork(ctx context.Context, tx *sql.Tx, w work.Work) (string, error) {
+	kind, value, ok := strings.Cut(w.Describe(), ":")
+	if !ok {
+		return "", nil
+	}
+	switch kind {
+	case "doi", "pmid", "arxiv", "isbn", "openalex":
+	default:
+		return "", nil
+	}
+	return firstLiveJob(ctx, tx, `
+		SELECT j.id, j.state FROM jobs j
+		JOIN identifiers i ON i.work_request_id = j.work_request_id
+		WHERE i.kind = ? AND i.value = ?
+		ORDER BY j.created_at DESC`, kind, value)
+}
+
+func firstLiveJob(ctx context.Context, tx *sql.Tx, query string, args ...any) (string, error) {
+	rows, err := tx.QueryContext(ctx, query, args...)
+	if err != nil {
 		return "", err
 	}
-	return jobID, nil
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var id, state string
+		if err := rows.Scan(&id, &state); err != nil {
+			return "", err
+		}
+		if !Terminal(state) {
+			return id, nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return "", err
+	}
+	return "", nil
 }
 
 // FillWorkMetadata fills fields absent from the original request using

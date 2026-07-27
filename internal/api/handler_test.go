@@ -169,6 +169,45 @@ func TestRouterSubmitListGetAndCancel(t *testing.T) {
 	}
 }
 
+func TestRouterSubmitV2ReportsExistingAndHonorsForce(t *testing.T) {
+	system := testSystem(t)
+	router := Router(system)
+	request := protocol.WorkRequest{
+		SchemaVersion: protocol.WorkRequestSchemaVersion,
+		RequestID:     "request_api_dedup_01",
+		Identifiers:   &protocol.Identifiers{DOI: "10.1000/api-dedup"},
+	}
+	var first SubmitV2Result
+	if rpcErr := callMethod(t, router, "acquire.submit_v2", map[string]any{"request": request}, &first); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	if first.JobID == "" || first.Existing {
+		t.Fatalf("first submission = %+v, want new job", first)
+	}
+	request.RequestID = "request_api_dedup_02"
+	var existing SubmitV2Result
+	if rpcErr := callMethod(t, router, "acquire.submit_v2", map[string]any{"request": request}, &existing); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	if !existing.Existing || existing.JobID != first.JobID {
+		t.Fatalf("deduplicated submission = %+v, want existing job %q", existing, first.JobID)
+	}
+	var forced SubmitV2Result
+	if rpcErr := callMethod(t, router, "acquire.submit_v2", map[string]any{"request": request, "force": true}, &forced); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	if forced.Existing || forced.JobID == first.JobID {
+		t.Fatalf("forced submission = %+v, want fresh job", forced)
+	}
+	rows, err := system.Jobs.List(context.Background(), "", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("jobs = %+v, want two jobs after force", rows)
+	}
+}
+
 func TestRouterSubmitEnvelopeAutoImportOverride(t *testing.T) {
 	system := testSystem(t)
 	system.App.Config.Zotio.AutoImport = true
