@@ -14,10 +14,9 @@ type HumanActionNextStep struct {
 }
 
 // HumanActionNextStepFor is the one authority for the next step implied by a
-// human action's Kind and RequiresAuth fields. It deliberately does not serve
-// errcat: errcat is keyed on job state and transition reason rather than a
-// HumanAction, so folding those axes together would make state guidance invent
-// an action kind and repeat the wrong-command failure this prevents.
+// human action's Kind and RequiresAuth fields. Every surface with the current
+// action must use it, so a replacement action cannot inherit a command from
+// the transition that created the action it replaced.
 func HumanActionNextStepFor(action job.HumanAction) HumanActionNextStep {
 	next := HumanActionNextStep{RequiresInstitutionalLogin: action.RequiresAuth}
 	switch action.Kind {

@@ -113,6 +113,12 @@ const POPUP_PAGE_PATH = "dist/popup.html";
  * rediscover the group without retaining page state. */
 const HANDOFF_GROUP_TITLE = "papio";
 const HANDOFF_GROUP_TITLE_MAX_TITLE_LENGTH = 72;
+/** Paper labels are transient; the stable prefix is the ownership marker that
+ * lets a reloaded worker find the physical group again. */
+function isHandoffGroupTitle(title: string | undefined): boolean {
+  return title === HANDOFF_GROUP_TITLE || title?.startsWith(`${HANDOFF_GROUP_TITLE} — `) === true;
+}
+
 
 /** Whether this adapter's SPA must render outside the minimized work window. */
 export function needsVisibleWindow(spec: AdapterSpec | undefined): boolean {
@@ -162,6 +168,8 @@ export interface TabInfo {
    * "download" that opens the PDF in a new viewer tab). Correlates the viewer
    * tab back to the tracked handoff tab that spawned it. */
   windowId?: number | undefined;
+  /** Chrome's group membership id; -1 means the tab is not grouped. */
+  groupId?: number | undefined;
   openerTabId?: number | undefined;
   /** Chrome marks the keepalive resolver tab pinned; papio's broker tabs never
    * are. Lets the idle-close check keep a keepalive-pinned work window alive. */
@@ -185,6 +193,16 @@ export interface WindowInfo {
   /** Populated by windows.create when the window is created with a URL. */
   tabs?: TabInfo[] | undefined;
 }
+
+export interface TabGroupInfo {
+  id: number;
+  collapsed: boolean;
+  title?: string | undefined;
+  /** Groups are scoped to a browser window, so this must agree with every tab
+   * moved into the group. */
+  windowId?: number | undefined;
+}
+
 
 export interface DownloadItemLike {
   id: number;
@@ -226,7 +244,7 @@ export interface BridgeDeps {
     update?(tabID: number, props: { active?: boolean; url?: string }): Promise<unknown>;
     onUpdated: Listenable<[number, TabChangeInfo, TabInfo]>;
     /** Used only for the singleton inbox tab. */
-    query?(query: { url: string }): Promise<TabInfo[]>;
+    query?(query: { url?: string; groupId?: number }): Promise<TabInfo[]>;
     onRemoved: Listenable<[number, { isWindowClosing: boolean }]>;
     /** Optional (Chrome): add tabs to a group, creating one when groupId is
      * omitted. Returns the group id. Absent on platforms without tab groups. */
@@ -253,14 +271,14 @@ export interface BridgeDeps {
    * < 139 and older Chromium, where tab-group mode falls back to the work
    * window. */
   tabGroups?: {
-    get(groupID: number): Promise<{ id: number; collapsed: boolean; title?: string }>;
+    get(groupID: number): Promise<TabGroupInfo>;
     update(
       groupID: number,
       props: { collapsed?: boolean; title?: string; color?: string },
     ): Promise<unknown>;
     /** Find groups by title. Used to rediscover papio's orphaned handoff group
      * after an extension reload clears the in-memory id but leaves the group. */
-    query(props: { title?: string }): Promise<{ id: number; collapsed: boolean; title?: string }[]>;
+    query(props: { title?: string }): Promise<TabGroupInfo[]>;
   };
   downloads: {
     search(query: { id: number }): Promise<DownloadItemLike[]>;
@@ -725,6 +743,12 @@ export class Bridge {
   /** Serializes work-window creation so concurrent offers cannot race two
    * dedicated windows into existence. Worker-local only. */
   private workTabChain: Promise<unknown> = Promise.resolve();
+  /** The broker-tab chain does not cover keepalive placement, so group adoption
+   * needs its own gate to prevent two first folds from both creating a group. */
+  private handoffGroupChain: Promise<void> = Promise.resolve();
+  /** A persisted id can name only one window; retain the other live groups for
+   * this worker so window-local handoffs do not overwrite each other. */
+  private readonly handoffGroupIDsByWindow = new Map<number, number>();
   /** Native port messages may await storage, tabs, or downloads. Preserve wire
    * receipt order across those awaits so state transitions never interleave. */
   private inboundChain: Promise<void> = Promise.resolve();
@@ -921,56 +945,187 @@ export class Bridge {
   private async openTabGroupTab(url: string): Promise<number | undefined> {
     const tab = await this.deps.tabs.create({ url, active: false });
     if (tab.id === undefined) return undefined;
-    await this.foldIntoHandoffGroup(tab.id);
+    await this.foldIntoHandoffGroup(tab.id, tab.windowId);
     return tab.id;
+  }
+
+  /** Queue every create-or-adopt decision because keepalive placement can race
+   * broker-tab creation outside the work-tab chain. */
+  private async inHandoffGroupChain<T>(work: () => Promise<T>): Promise<T> {
+    const queued = this.handoffGroupChain.then(work);
+    this.handoffGroupChain = queued.then(
+      () => undefined,
+      () => undefined,
+    );
+    return queued;
+  }
+
+
+  private async windowIDForTab(tabID: number, knownWindowID?: number): Promise<number | undefined> {
+    if (knownWindowID !== undefined) return knownWindowID;
+    try {
+      return (await this.deps.tabs.get(tabID)).windowId;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async knownHandoffGroup(
+    groupID: number,
+    windowID: number | undefined,
+  ): Promise<TabGroupInfo | undefined> {
+    const tabGroups = this.deps.tabGroups;
+    if (tabGroups === undefined) return undefined;
+    try {
+      const found = await tabGroups.get(groupID);
+      return isHandoffGroupTitle(found.title) && (windowID === undefined || found.windowId === windowID)
+        ? found
+        : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async findHandoffGroups(windowID?: number): Promise<TabGroupInfo[] | undefined> {
+    const tabGroups = this.deps.tabGroups;
+    if (tabGroups === undefined) return undefined;
+    try {
+      return (await tabGroups.query({})).filter(
+        (candidate) =>
+          isHandoffGroupTitle(candidate.title) && (windowID === undefined || candidate.windowId === windowID),
+      );
+    } catch {
+      return undefined;
+    }
+  }
+
+  private preferredHandoffGroup(
+    candidates: TabGroupInfo[],
+    windowID: number | undefined,
+  ): TabGroupInfo | undefined {
+    const remembered = windowID === undefined ? undefined : this.handoffGroupIDsByWindow.get(windowID);
+    return (
+      candidates.find((candidate) => candidate.id === remembered) ??
+      candidates.find((candidate) => candidate.id === this.store.handoffGroupID) ??
+      candidates.find((candidate) => candidate.collapsed === false) ??
+      candidates[0]
+    );
+  }
+
+  /** Merge legacy duplicates before another tab is added, so adoption repairs
+   * old reload races instead of merely avoiding the next one. */
+  private async foldDuplicateHandoffGroups(
+    primary: TabGroupInfo,
+    candidates: TabGroupInfo[],
+    windowID: number | undefined,
+  ): Promise<void> {
+    const tabs = this.deps.tabs;
+    if (tabs.group === undefined || tabs.query === undefined) return;
+    for (const duplicate of candidates) {
+      if (duplicate.id === primary.id) continue;
+      try {
+        const tabIDs = (await tabs.query({ groupId: duplicate.id }))
+          .filter((tab) => tab.id !== undefined && (windowID === undefined || tab.windowId === windowID))
+          .map((tab) => tab.id!);
+        if (tabIDs.length > 0) await tabs.group({ tabIds: tabIDs, groupId: primary.id });
+      } catch {
+        // A user can close a tab or group while startup is repairing it; the
+        // remaining groups are still safe to reconcile.
+      }
+    }
+  }
+
+  private async rememberHandoffGroup(groupID: number, windowID: number | undefined): Promise<void> {
+    if (windowID !== undefined) this.handoffGroupIDsByWindow.set(windowID, groupID);
+    if (this.store.handoffGroupID === groupID) return;
+    await this.update((s) => ({ ...s, handoffGroupID: groupID }));
   }
 
   /** Add a tab to the collapsed "papio" group, reusing the group across
    * handoffs (and the keepalive tab) or creating it collapsed on first use.
    * No-op when the platform lacks tab grouping. */
-  private async foldIntoHandoffGroup(tabID: number): Promise<void> {
-    const group = this.deps.tabs.group;
+  private async foldIntoHandoffGroup(tabID: number, knownWindowID?: number): Promise<void> {
+    await this.inHandoffGroupChain(() => this.foldIntoHandoffGroupUnlocked(tabID, knownWindowID));
+  }
+
+  private async foldIntoHandoffGroupUnlocked(tabID: number, knownWindowID?: number): Promise<void> {
+    const tabs = this.deps.tabs;
     const tabGroups = this.deps.tabGroups;
-    if (group === undefined) return;
-    const existing = this.store.handoffGroupID;
-    if (existing !== undefined) {
-      try {
-        if (tabGroups !== undefined) await tabGroups.get(existing);
-        await group({ tabIds: [tabID], groupId: existing });
-        return;
-      } catch {
-        // Group closed by the user: fall through and rediscover/create.
-      }
+    if (tabs.group === undefined) return;
+    const windowID = await this.windowIDForTab(tabID, knownWindowID);
+    const remembered = windowID === undefined ? undefined : this.handoffGroupIDsByWindow.get(windowID);
+    let reuse =
+      remembered === undefined
+        ? undefined
+        : await this.knownHandoffGroup(remembered, windowID);
+    if (reuse === undefined && this.store.handoffGroupID !== undefined) {
+      reuse = await this.knownHandoffGroup(this.store.handoffGroupID, windowID);
     }
-    // No valid in-memory group id — an extension reload clears session storage
-    // but leaves the physical "papio" group in the window. Rediscover it by
-    // title before creating a duplicate group (and duplicate SSO tab).
-    if (tabGroups !== undefined) {
-      try {
-        const found = await tabGroups.query({});
-        const reuse = found.find(
-          (candidate) =>
-            candidate.title === HANDOFF_GROUP_TITLE ||
-            candidate.title?.startsWith(`${HANDOFF_GROUP_TITLE} — `) === true,
-        );
-        if (reuse !== undefined) {
-          await group({ tabIds: [tabID], groupId: reuse.id });
-          await this.update((s) => ({ ...s, handoffGroupID: reuse.id }));
-          return;
-        }
-      } catch {
-        // Query unsupported/failed: fall through and create a fresh group.
-      }
+    const found = await this.findHandoffGroups(windowID);
+    if (found !== undefined) {
+      reuse = this.preferredHandoffGroup(found, windowID) ?? reuse;
     }
-    const groupID = await group({ tabIds: [tabID] });
+    if (reuse !== undefined) {
+      if (found !== undefined) await this.foldDuplicateHandoffGroups(reuse, found, windowID);
+      await tabs.group({ tabIds: [tabID], groupId: reuse.id });
+      await this.rememberHandoffGroup(reuse.id, windowID);
+      return;
+    }
+    const groupID = await tabs.group({ tabIds: [tabID] });
     if (tabGroups !== undefined) {
       try {
         await tabGroups.update(groupID, { title: HANDOFF_GROUP_TITLE, collapsed: true, color: "orange" });
       } catch {
-        // Styling is cosmetic; the group still brokers correctly.
+        // A grouped tab remains usable even if the browser declines its display update.
       }
     }
-    await this.update((s) => ({ ...s, handoffGroupID: groupID }));
+    await this.rememberHandoffGroup(groupID, windowID);
+  }
+
+  private async handoffGroupWindowID(group: TabGroupInfo): Promise<number | undefined> {
+    if (group.windowId !== undefined) return group.windowId;
+    const tabs = this.deps.tabs;
+    if (tabs.query === undefined) return undefined;
+    try {
+      return (await tabs.query({ groupId: group.id })).find((tab) => tab.windowId !== undefined)?.windowId;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Recover all groups left by prior worker lifetimes before a new fold can
+   * multiply them again. */
+  private async reconcileHandoffGroups(): Promise<void> {
+    await this.inHandoffGroupChain(() => this.reconcileHandoffGroupsUnlocked());
+  }
+
+  private async reconcileHandoffGroupsUnlocked(): Promise<void> {
+    const candidates = await this.findHandoffGroups();
+    if (candidates === undefined || candidates.length === 0) return;
+    const byWindow = new Map<number, TabGroupInfo[]>();
+    for (const candidate of candidates) {
+      const windowID = await this.handoffGroupWindowID(candidate);
+      if (windowID === undefined) continue;
+      const groups = byWindow.get(windowID);
+      if (groups === undefined) {
+        byWindow.set(windowID, [candidate]);
+      } else {
+        groups.push(candidate);
+      }
+    }
+    const selected: { group: TabGroupInfo; windowID: number }[] = [];
+    for (const [windowID, groups] of byWindow) {
+      const primary = this.preferredHandoffGroup(groups, windowID);
+      if (primary === undefined) continue;
+      await this.foldDuplicateHandoffGroups(primary, groups, windowID);
+      this.handoffGroupIDsByWindow.set(windowID, primary.id);
+      selected.push({ group: primary, windowID });
+    }
+    const persisted =
+      selected.find((candidate) => candidate.group.id === this.store.handoffGroupID) ?? selected[0];
+    if (persisted !== undefined) {
+      await this.rememberHandoffGroup(persisted.group.id, persisted.windowID);
+    }
   }
 
   /** Fold the keepalive resolver tab into the "papio" group when tab-group mode
@@ -1050,12 +1205,44 @@ export class Bridge {
     return `${HANDOFF_GROUP_TITLE} — ${shortTitle}`;
   }
 
+  /** The persisted singleton can name another window, so Chrome's membership
+   * data is the authority when a handoff needs to be surfaced or folded away. */
+  private async handoffGroupIDForTab(tabID: number): Promise<number | undefined> {
+    const tabGroups = this.deps.tabGroups;
+    if (tabGroups === undefined) return undefined;
+    try {
+      const tab = await this.deps.tabs.get(tabID);
+      const windowID = tab.windowId;
+      if (tab.groupId !== undefined && tab.groupId >= 0) {
+        const group = await this.knownHandoffGroup(tab.groupId, windowID);
+        if (group !== undefined) {
+          if (windowID !== undefined) this.handoffGroupIDsByWindow.set(windowID, group.id);
+          return group.id;
+        }
+      }
+      const remembered = windowID === undefined ? undefined : this.handoffGroupIDsByWindow.get(windowID);
+      if (remembered !== undefined) {
+        const group = await this.knownHandoffGroup(remembered, windowID);
+        if (group !== undefined) return group.id;
+      }
+      if (this.store.handoffGroupID !== undefined) {
+        const group = await this.knownHandoffGroup(this.store.handoffGroupID, windowID);
+        if (group !== undefined) return group.id;
+      }
+      const found = await this.findHandoffGroups(windowID);
+      return found === undefined ? undefined : this.preferredHandoffGroup(found, windowID)?.id;
+    } catch {
+      // A disappearing tab must not prevent the native handoff from progressing.
+      return undefined;
+    }
+  }
+
   /** Bring the handoff tab to the human for authentication. In work-window mode
    * this activates the tab and restores/focuses the window; in tab-group mode it
    * expands the collapsed "papio" group and activates the tab. No-op for legacy
    * in-window tabs (already visible). Best-effort — auth proceeds regardless. */
   private async surfaceWorkTab(tabID: number): Promise<void> {
-    const groupID = this.store.handoffGroupID;
+    const groupID = await this.handoffGroupIDForTab(tabID);
     if (groupID !== undefined && this.deps.tabGroups !== undefined) {
       try {
         await this.deps.tabGroups.update(groupID, { title: this.handoffGroupTitle(tabID), collapsed: false });
@@ -1090,8 +1277,8 @@ export class Bridge {
   }
 
   /** A missing group id must not be reused after the physical group disappeared. */
-  private async recollapseHandoffGroup(): Promise<boolean> {
-    const groupID = this.store.handoffGroupID;
+  private async recollapseHandoffGroup(tabID?: number): Promise<boolean> {
+    const groupID = tabID === undefined ? this.store.handoffGroupID : await this.handoffGroupIDForTab(tabID);
     if (groupID === undefined || this.deps.tabGroups === undefined) return false;
     try {
       await this.deps.tabGroups.get(groupID);
@@ -1231,6 +1418,7 @@ export class Bridge {
     // worker itself). Idempotent: re-creating the same alarm just resets it.
     this.deps.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: KEEPALIVE_ALARM_MINUTES });
     await this.ready;
+    await this.reconcileHandoffGroups();
     await this.syncConnectionBadge();
     await this.reconcileTabs();
     await this.redrivePendingTermsGates();
@@ -2849,7 +3037,7 @@ export class Bridge {
       await this.update((s) => patchJob(s, job.job_id, { status: "awaiting_download" }));
       this.send("auth_returned", { elapsed_ms: elapsed }, job.job_id);
       // The human is past authentication; fold the "papio" group back away.
-      await this.recollapseHandoffGroup();
+      await this.recollapseHandoffGroup(tabID);
       const institutionalSession = await this.recordInstitutionalSession(job, url, now);
       if (!institutionalSession) await this.recordOpenAccessLanding(job);
       // If we routed this job through federated login, the return lands on the
@@ -4050,14 +4238,10 @@ function realDeps(): BridgeDeps {
     ...(typeof chrome.tabGroups !== "undefined"
       ? {
           tabGroups: {
-            get: (groupID: number) =>
-              chrome.tabGroups.get(groupID) as Promise<{ id: number; collapsed: boolean; title?: string }>,
+            get: (groupID: number) => chrome.tabGroups.get(groupID) as Promise<TabGroupInfo>,
             update: (groupID: number, props: { collapsed?: boolean; title?: string; color?: string }) =>
               chrome.tabGroups.update(groupID, props as chrome.tabGroups.UpdateProperties),
-            query: (props: { title?: string }) =>
-              chrome.tabGroups.query(props) as Promise<
-                { id: number; collapsed: boolean; title?: string }[]
-              >,
+            query: (props: { title?: string }) => chrome.tabGroups.query(props) as Promise<TabGroupInfo[]>,
           },
         }
       : {}),

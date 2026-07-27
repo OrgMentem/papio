@@ -4,12 +4,17 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"fmt"
-	"papio/internal/protocol"
-	"papio/internal/zotio"
 	"reflect"
 	"strings"
 	"testing"
+
+	"papio/internal/api"
+	"papio/internal/config"
+	"papio/internal/job"
+	"papio/internal/protocol"
+	"papio/internal/zotio"
 )
 
 const batchJSONLFixture = `{"doi":"10.1000/Bare","title":"Bare work","authors":["Ada"],"year":2024,"desired_version":"published"}
@@ -166,5 +171,47 @@ func TestBatchAcceptsResolverFlag(t *testing.T) {
 	}
 	if err := validateBatchFlags(command, nil, false, false); err != nil {
 		t.Fatalf("--batch rejected --resolver: %v", err)
+	}
+}
+
+func TestAcquireWaitUsesCurrentOpenActionGuidance(t *testing.T) {
+	var out, errOut bytes.Buffer
+	detail := api.JobDetail{
+		Job: &job.Row{
+			ID:     "doi:10.1177/0018720814547570",
+			State:  job.StateAwaitingHuman,
+			Policy: job.Policy{AccessMode: config.ModeDelegated},
+		},
+		Events: []map[string]any{{"kind": "job.transition", "detail": map[string]any{
+			"to": job.StateAwaitingHuman, "reason": "login_required",
+		}}},
+		Actions: []job.HumanAction{{
+			ID: 228, JobID: "doi:10.1177/0018720814547570", Kind: "manual_download", Status: "open", RequiresAuth: true, BlockedBy: "landing_page",
+		}},
+	}
+	root := NewInProcessRoot(&out, &errOut, config.Config{AccessMode: config.ModeDelegated},
+		func(_ context.Context, method string, _ any, result any) error {
+			switch method {
+			case "acquire.submit":
+				*result.(*api.SubmitResult) = api.SubmitResult{JobID: detail.Job.ID}
+			case "jobs.get":
+				*result.(*api.JobDetail) = detail
+			default:
+				return fmt.Errorf("unexpected method %q", method)
+			}
+			return nil
+		})
+	root.SetArgs([]string{"acquire", "--doi", "10.1177/0018720814547570", "--wait"})
+	if err := root.ExecuteContext(context.Background()); err != nil {
+		t.Fatalf("acquire --wait: %v (%s)", err, errOut.String())
+	}
+	got := out.String()
+	for _, want := range []string{"[manual_download]", "Sign in at your institution", "download the PDF yourself"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("output = %q, want %q", got, want)
+		}
+	}
+	if strings.Contains(got, "papio actions open") {
+		t.Fatalf("output names an inapplicable handoff command: %q", got)
 	}
 }

@@ -17,6 +17,7 @@ import (
 
 	"papio/internal/app"
 	"papio/internal/config"
+	"papio/internal/errcat"
 	"papio/internal/job"
 	"papio/internal/work"
 )
@@ -162,5 +163,72 @@ func TestActionGuidanceCommandsApplyToEveryActionKind(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// TestCurrentErrcatGuidanceCommandsApplyToActions exercises the emitted
+// state/reason branches as well as the source literals. A replacement action
+// can make a once-valid handoff command inapplicable after the job parks.
+func TestCurrentErrcatGuidanceCommandsApplyToActions(t *testing.T) {
+	root := NewInProcessRoot(&bytes.Buffer{}, &bytes.Buffer{}, config.Config{}, nilRPC)
+	root.InitDefaultHelpCmd()
+	root.InitDefaultCompletionCmd()
+	row := job.Row{Work: work.Work{DOI: "10.1000/current-guidance"}}
+	baseFor := func(string) (string, bool) {
+		return "https://resolver.example.test/openurl", true
+	}
+	cases := []struct {
+		name     string
+		state    string
+		reason   string
+		actions  []job.HumanAction
+		action   job.HumanAction
+		wantOpen bool
+	}{
+		{
+			name:     "historical institutional handoff",
+			state:    job.StateAwaitingHuman,
+			reason:   "institutional_handoff",
+			action:   job.HumanAction{Kind: "openurl_handoff", RequiresAuth: true},
+			wantOpen: true,
+		},
+		{
+			name:     "historical open access handoff",
+			state:    job.StateAwaitingHuman,
+			reason:   "open_access_browser_handoff",
+			action:   job.HumanAction{Kind: "openurl_handoff"},
+			wantOpen: true,
+		},
+		{
+			name:   "manual replacement of login-required park",
+			state:  job.StateAwaitingHuman,
+			reason: "login_required",
+			actions: []job.HumanAction{{
+				ID: 228, Kind: "manual_download", Status: "open", RequiresAuth: true, BlockedBy: "landing_page",
+			}},
+			action:   job.HumanAction{Kind: "manual_download", RequiresAuth: true},
+			wantOpen: false,
+		},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			exp := errcat.ExplainWithOpenAction(test.state, test.reason, "", "", test.actions, config.Config{})
+			opens := strings.Contains(exp.Guidance, "`papio actions open`")
+			if opens != test.wantOpen {
+				t.Fatalf("guidance names `papio actions open` = %t, want %t: %q", opens, test.wantOpen, exp.Guidance)
+			}
+			for _, match := range papioCommandInBackticks.FindAllStringSubmatch(exp.Guidance, -1) {
+				snippet := match[1]
+				if err := resolveGuidanceCommand(root, snippet); err != nil {
+					t.Fatal(err)
+				}
+				if snippet != "papio actions open" {
+					continue
+				}
+				if _, ok := actionURL(test.action, row, baseFor); !ok {
+					t.Fatalf("%q cannot act on current %s action", snippet, test.action.Kind)
+				}
+			}
+		})
 	}
 }

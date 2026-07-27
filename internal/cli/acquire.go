@@ -173,7 +173,7 @@ func newAcquireCommand(opt *options) *cobra.Command {
 			if !opt.jsonOutput {
 				cfg, _ := opt.loadConfig()
 				reason := transitionReason(detail.Events, detail.Job.State)
-				if g := errcat.WaitGuidance(detail.Job.State, reason, detail.Job.Policy.Resolver, detail.Job.Policy.AccessMode, cfg); g != "" {
+				if g := errcat.WaitGuidanceWithOpenAction(detail.Job.State, reason, detail.Job.Policy.Resolver, detail.Job.Policy.AccessMode, detail.Actions, cfg); g != "" {
 					prose += "\n" + g
 				}
 			}

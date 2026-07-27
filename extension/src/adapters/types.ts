@@ -529,32 +529,25 @@ export const adapters: AdapterSpec[] = [
     },
   },
   {
-    // Classify fixture-verified 2026-07-17 against a live Example University-authenticated SAGE
-    // article captured via CDP (fixtures/sage/success.html). SAGE sits behind
-    // Cloudflare and emits no Highwire citation_* metas; it exposes
-    // publication_doi plus a "Download PDF" anchor (id downloadPdfUrl, same shape
-    // as ACM) whose live href is the direct /doi/pdf/<doi>?download=true file.
-    // The sanitizer strips the ?download=true query from the captured fixture, so
-    // the selector keys on the stable id/path/data-doi and the href method reads
-    // the live anchor href at download time.
-    // NOTE: end-to-end download NOT yet live-exercised — Example University's resolver routed
-    // the SAGE test title (10.1177/0018720814547570) to ProQuest, not sagepub, so
-    // the flow never landed on a SAGE page. Adapter fires when the resolver routes
-    // a title to journals.sagepub.com; download method mirrors ACM's proven href.
+    // The eReader link is an access affordance, not a PDF. SAGE's documented
+    // direct route is derived only after its semantic PDF/EPUB section appears,
+    // avoiding generic button styling and a viewer-specific href as evidence.
     id: "sage",
-    version: "0.1.0",
+    version: "0.2.0",
     hosts: ["journals.sagepub.com"],
     settleTimeoutMs: 5000,
     classify: [
       {
         kind: "article",
-        all: ["meta[name='publication_doi']", "a#downloadPdfUrl[data-doi][href*='/doi/pdf/']"],
+        all: ["meta[name='publication_doi']", "section.format--pdf_epub"],
       },
     ],
     download: {
-      selector: "a#downloadPdfUrl[data-doi][href*='/doi/pdf/']",
+      selector: "section.format--pdf_epub",
       requireKind: "article",
-      method: "href",
+      method: "url",
+      idPattern: "/doi/(?:[a-z]+/)?(10\\.[^?#]+)",
+      urlTemplate: "https://journals.sagepub.com/doi/pdf/{1}?download=true",
     },
   },
   {

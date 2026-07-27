@@ -119,6 +119,7 @@ class FakeTabs {
   readonly live = new Map<number, TabInfo>();
   nextId = 100;
   failCreate = false;
+  currentWindowID = 1;
   /** Records tabs.group calls; assigned by makeHarness only in tab-group mode. */
   readonly grouped: { tabIds: number[]; groupId?: number }[] = [];
   group?: (opts: { tabIds: number[]; groupId?: number }) => Promise<number>;
@@ -135,16 +136,16 @@ class FakeTabs {
     this.created.push(props);
     if (this.failCreate) throw new Error("tab creation blocked");
     const id = this.nextId++;
-    const tab: TabInfo = {
-      id,
-      url: props.url,
-      ...(props.windowId !== undefined ? { windowId: props.windowId } : {}),
-    };
+    const tab: TabInfo = { id, url: props.url, windowId: props.windowId ?? this.currentWindowID };
     this.live.set(id, tab);
     return tab;
   }
-  async query(query: { url: string }): Promise<TabInfo[]> {
-    return [...this.live.values()].filter((tab) => tab.url === query.url);
+  async query(query: { url?: string; groupId?: number }): Promise<TabInfo[]> {
+    return [...this.live.values()].filter(
+      (tab) =>
+        (query.url === undefined || tab.url === query.url) &&
+        (query.groupId === undefined || tab.groupId === query.groupId),
+    );
   }
   async get(tabID: number): Promise<TabInfo> {
     const tab = this.live.get(tabID);
@@ -213,13 +214,16 @@ class FakeWindows {
 class FakeTabGroups {
   readonly updated: { groupID: number; props: { collapsed?: boolean; title?: string; color?: string } }[] =
     [];
-  readonly live = new Map<number, { id: number; collapsed: boolean; title?: string }>();
-  async get(groupID: number): Promise<{ id: number; collapsed: boolean; title?: string }> {
+  readonly live = new Map<number, { id: number; collapsed: boolean; title?: string; windowId?: number }>();
+  nextID = 700;
+  async get(groupID: number): Promise<{ id: number; collapsed: boolean; title?: string; windowId?: number }> {
     const group = this.live.get(groupID);
     if (!group) throw new Error("no such group");
     return group;
   }
-  async query(props: { title?: string }): Promise<{ id: number; collapsed: boolean; title?: string }[]> {
+  async query(props: {
+    title?: string;
+  }): Promise<{ id: number; collapsed: boolean; title?: string; windowId?: number }[]> {
     return [...this.live.values()].filter((g) => props.title === undefined || g.title === props.title);
   }
   async update(
@@ -327,9 +331,35 @@ function makeHarness(
   const tabGroups = opts?.tabGroups === true ? new FakeTabGroups() : undefined;
   if (tabGroups !== undefined) {
     tabs.group = async ({ tabIds, groupId }) => {
+      const id = groupId ?? tabGroups.nextID++;
+      const target = tabGroups.live.get(id);
+      const windowID = target?.windowId ?? tabs.live.get(tabIds[0]!)?.windowId;
+      if (
+        windowID !== undefined &&
+        tabIds.some((tabID) => tabs.live.get(tabID)?.windowId !== windowID)
+      ) {
+        throw new Error("tabs from different windows cannot share a group");
+      }
+      if (target === undefined) {
+        tabGroups.live.set(id, {
+          id,
+          collapsed: false,
+          ...(windowID === undefined ? {} : { windowId: windowID }),
+        });
+      }
       tabs.grouped.push(groupId === undefined ? { tabIds } : { tabIds, groupId });
-      const id = groupId ?? 700 + tabGroups.live.size;
-      if (!tabGroups.live.has(id)) tabGroups.live.set(id, { id, collapsed: false });
+      const emptied = new Set<number>();
+      for (const tabID of tabIds) {
+        const tab = tabs.live.get(tabID);
+        if (tab === undefined) throw new Error("no such tab");
+        if (tab.groupId !== undefined && tab.groupId >= 0 && tab.groupId !== id) emptied.add(tab.groupId);
+        tab.groupId = id;
+      }
+      for (const formerGroupID of emptied) {
+        if (![...tabs.live.values()].some((tab) => tab.groupId === formerGroupID)) {
+          tabGroups.close(formerGroupID);
+        }
+      }
       return id;
     };
   }
@@ -2362,26 +2392,82 @@ test("tab-group handoffs reuse one papio group", async () => {
   expect(h.tabGroups?.live.size).toBe(1);
 });
 
-test("tab-group mode rediscovers an orphaned papio group after an extension reload", async () => {
+test("concurrent tab-group folds create exactly one papio group", async () => {
+  const h = makeHarness(undefined, { tabGroups: true, handoffSurface: "tab-group" });
+  await h.bridge.start();
+  const first = await h.tabs.create({ url: `${OPENURL}&keepalive=first`, active: false });
+  const second = await h.tabs.create({ url: `${OPENURL}&keepalive=second`, active: false });
+
+  await Promise.all([h.bridge.foldKeepaliveTab(first.id!), h.bridge.foldKeepaliveTab(second.id!)]);
+
+  expect(h.tabGroups?.live.size).toBe(1);
+  expect(h.tabs.grouped).toEqual([{ tabIds: [100] }, { tabIds: [101], groupId: 700 }]);
+});
+
+test("tab-group folds do not reuse a stored group from another window", async () => {
+  const h = makeHarness(
+    { ...emptyStore(), handoffGroupID: 700 },
+    { tabGroups: true, handoffSurface: "tab-group" },
+  );
+  const existing = await h.tabs.create({ url: `${OPENURL}&window=one`, active: false, windowId: 1 });
+  h.tabs.live.get(existing.id!)!.groupId = 700;
+  h.tabGroups?.live.set(700, { id: 700, collapsed: true, title: "papio", windowId: 1 });
+  h.tabGroups!.nextID = 701;
+  h.tabs.currentWindowID = 2;
+
+  await h.bridge.start();
+  await h.port.inbound(jobOffer("job_tg_second_window"));
+
+  expect(h.tabGroups?.live.size).toBe(2);
+  expect(h.tabGroups?.live.get(700)?.windowId).toBe(1);
+  expect(h.tabGroups?.live.get(701)?.windowId).toBe(2);
+  expect(h.tabs.grouped).toEqual([{ tabIds: [101] }]);
+});
+
+test("tab-group mode rediscovers a renamed papio group after session storage clears", async () => {
   const h = makeHarness(undefined, { tabGroups: true, handoffSurface: "tab-group" });
   await h.bridge.start();
   await h.port.inbound(jobOffer("job_tg_reload_a"));
   const groupID = h.backend.store.handoffGroupID;
   expect(groupID).toBeDefined();
   expect(h.tabGroups?.live.size).toBe(1);
+  await h.tabGroups!.update(groupID!, {
+    title: "papio — A paper still awaiting institutional access",
+    collapsed: false,
+  });
 
-  // Simulate an extension reload: chrome.storage.session is wiped (the in-memory
-  // group id is lost) but the physical "papio" group survives in the window.
+  // Simulate an extension reload: chrome.storage.session is wiped while the
+  // physical group remains labeled with the paper that needs attention.
   h.backend.store = emptyStore();
   const reloaded = new Bridge(h.deps);
   await reloaded.start();
   await h.ports[h.ports.length - 1]!.inbound(jobOffer("job_tg_reload_b"));
 
-  // The reload rediscovers the orphaned group by title rather than creating a
-  // second group (and a duplicate SSO tab).
   expect(h.tabGroups?.live.size).toBe(1);
   expect(h.backend.store.handoffGroupID).toBe(groupID);
   expect(h.tabs.grouped).toEqual([{ tabIds: [100] }, { tabIds: [101], groupId: groupID! }]);
+  expect(h.tabGroups?.live.get(groupID!)?.title).toBe("papio — A paper still awaiting institutional access");
+});
+
+test("startup consolidates three papio groups in one window", async () => {
+  const h = makeHarness(undefined, { tabGroups: true, handoffSurface: "tab-group" });
+  for (const groupID of [700, 701, 702]) {
+    const tab = await h.tabs.create({ url: `${OPENURL}&group=${groupID}`, active: false });
+    h.tabs.live.get(tab.id!)!.groupId = groupID;
+    h.tabGroups!.live.set(groupID, {
+      id: groupID,
+      collapsed: groupID !== 700,
+      title: "papio",
+      windowId: 1,
+    });
+  }
+  h.tabGroups!.nextID = 703;
+
+  await h.bridge.start();
+
+  expect(h.tabs.grouped).toEqual([{ tabIds: [101], groupId: 700 }, { tabIds: [102], groupId: 700 }]);
+  expect([...h.tabs.live.values()].map((tab) => tab.groupId)).toEqual([700, 700, 700]);
+  expect(h.tabGroups?.live.size).toBe(1);
 });
 
 test("IdP auth expands the papio group and re-collapses when auth returns", async () => {

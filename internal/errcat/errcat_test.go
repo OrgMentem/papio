@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"papio/internal/config"
+	"papio/internal/job"
 )
 
 func TestExplainCategoriesAndGuidance(t *testing.T) {
@@ -90,6 +91,59 @@ func TestWaitGuidance(t *testing.T) {
 	g = WaitGuidance("unavailable", "no_legal_candidates", "", config.ModeDelegated, cfg)
 	if !strings.Contains(g, "[institution_not_configured]") {
 		t.Fatalf("unavailable guidance = %q", g)
+	}
+}
+
+func TestExplainWithOpenActionUsesReplacementManualDownload(t *testing.T) {
+	cfg := config.Config{AccessMode: config.ModeDelegated}
+	actions := []job.HumanAction{
+		{ID: 227, Kind: "openurl_handoff", Status: "resolved", RequiresAuth: true},
+		{ID: 228, Kind: "manual_download", Status: "open", RequiresAuth: true, BlockedBy: "landing_page"},
+	}
+	got := ExplainWithOpenAction("awaiting_human", "login_required", "", config.ModeDelegated, actions, cfg)
+
+	if got.Category != "manual_download" {
+		t.Fatalf("category = %q, want manual_download", got.Category)
+	}
+	for _, want := range []string{"Sign in at your institution", "download the PDF yourself"} {
+		if !strings.Contains(got.Guidance, want) {
+			t.Fatalf("guidance = %q, want %q", got.Guidance, want)
+		}
+	}
+	if strings.Contains(got.Guidance, "papio actions open") {
+		t.Fatalf("manual-download guidance names an inapplicable command: %q", got.Guidance)
+	}
+
+	wait := WaitGuidanceWithOpenAction("awaiting_human", "login_required", "", config.ModeDelegated, actions, cfg)
+	if !strings.Contains(wait, "[manual_download]") || strings.Contains(wait, "papio actions open") {
+		t.Fatalf("wait guidance = %q", wait)
+	}
+}
+
+func TestExplainWithOpenActionKeepsTerminalExplanationsWithoutOpenAction(t *testing.T) {
+	cfg := config.Config{
+		AccessMode: config.ModeDelegated,
+		Browser:    config.Browser{OpenURLBase: "https://library.example.edu/openurl"},
+	}
+	cases := []struct {
+		name       string
+		state      string
+		reason     string
+		accessMode string
+	}{
+		{name: "no identifier", state: "unavailable", reason: "no_identifier", accessMode: config.ModeDelegated},
+		{name: "no entitlement", state: "unavailable", reason: "candidates_exhausted", accessMode: config.ModeDelegated},
+		{name: "failed", state: "failed", reason: "unexpected_error"},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			want := Explain(test.state, test.reason, "", test.accessMode, cfg)
+			got := ExplainWithOpenAction(test.state, test.reason, "", test.accessMode,
+				[]job.HumanAction{{ID: 228, Kind: "manual_download", Status: "resolved", RequiresAuth: true}}, cfg)
+			if got != want {
+				t.Fatalf("explanation = %#v, want %#v", got, want)
+			}
+		})
 	}
 }
 

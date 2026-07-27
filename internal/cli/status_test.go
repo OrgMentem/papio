@@ -10,6 +10,7 @@ import (
 
 	"papio/internal/api"
 	"papio/internal/config"
+	"papio/internal/errcat"
 	"papio/internal/job"
 	"papio/internal/work"
 )
@@ -62,6 +63,70 @@ func TestBuildStatusSnapshotGroupsRecentJobsAndDetails(t *testing.T) {
 				t.Fatal("old ready job appeared in status")
 			}
 		}
+	}
+}
+
+func TestBuildStatusSnapshotUsesCurrentOpenActionGuidance(t *testing.T) {
+	now := time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC)
+	rows := []job.Row{{
+		ID: "doi:10.1177/0018720814547570", State: job.StateAwaitingHuman,
+		UpdatedAt: now.Add(-time.Minute).Format(time.RFC3339Nano), Work: work.Work{Title: "Current action wins"},
+	}}
+	details := map[string]api.JobDetail{
+		rows[0].ID: {
+			Events: []map[string]any{{"kind": "job.transition", "detail": map[string]any{
+				"to": job.StateAwaitingHuman, "reason": "login_required",
+			}}},
+			Actions: []job.HumanAction{{
+				ID: 228, JobID: rows[0].ID, Kind: "manual_download", Status: "open", RequiresAuth: true, BlockedBy: "landing_page",
+			}},
+		},
+	}
+
+	snapshot := buildStatusSnapshot(rows, details, now, config.Config{AccessMode: config.ModeDelegated})
+	if len(snapshot.Groups) != 1 || len(snapshot.Groups[0].Jobs) != 1 {
+		t.Fatalf("snapshot = %#v", snapshot)
+	}
+	item := snapshot.Groups[0].Jobs[0]
+	if item.Reason != "login_required" {
+		t.Fatalf("reason = %q, want historical login_required", item.Reason)
+	}
+	if item.Category != "manual_download" {
+		t.Fatalf("category = %q, want manual_download", item.Category)
+	}
+	for _, want := range []string{"Sign in at your institution", "download the PDF yourself"} {
+		if !strings.Contains(item.Guidance, want) {
+			t.Fatalf("guidance = %q, want %q", item.Guidance, want)
+		}
+	}
+	if strings.Contains(item.Guidance, "papio actions open") {
+		t.Fatalf("guidance names an inapplicable handoff command: %q", item.Guidance)
+	}
+}
+
+func TestBuildStatusSnapshotKeepsTerminalGuidanceWithoutOpenAction(t *testing.T) {
+	now := time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC)
+	row := job.Row{
+		ID: "terminal-no-identifier", State: job.StateUnavailable,
+		UpdatedAt: now.Add(-time.Minute).Format(time.RFC3339Nano), Policy: job.Policy{AccessMode: config.ModeDelegated},
+		Work: work.Work{Title: "No identifier"},
+	}
+	detail := api.JobDetail{
+		Events: []map[string]any{{"kind": "job.transition", "detail": map[string]any{
+			"to": job.StateUnavailable, "reason": "no_identifier",
+		}}},
+		Actions: []job.HumanAction{{ID: 228, JobID: row.ID, Kind: "manual_download", Status: "resolved", RequiresAuth: true}},
+	}
+	cfg := config.Config{AccessMode: config.ModeDelegated}
+
+	snapshot := buildStatusSnapshot([]job.Row{row}, map[string]api.JobDetail{row.ID: detail}, now, cfg)
+	if len(snapshot.Groups) != 1 || len(snapshot.Groups[0].Jobs) != 1 {
+		t.Fatalf("snapshot = %#v", snapshot)
+	}
+	got := snapshot.Groups[0].Jobs[0]
+	want := errcat.Explain(row.State, "no_identifier", row.Policy.Resolver, row.Policy.AccessMode, cfg)
+	if got.Category != want.Category || got.Guidance != want.Guidance {
+		t.Fatalf("terminal explanation = %q / %q, want %q / %q", got.Category, got.Guidance, want.Category, want.Guidance)
 	}
 }
 

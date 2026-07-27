@@ -318,23 +318,37 @@ test("wiley download builds the /doi/pdfdirect endpoint from the DOI in the page
   );
 });
 
-// SAGE Journals: captured 2026-07-17 via CDP from a Example University-authenticated article
-// (fixtures/sage/success.html). No Highwire metas; classifies on publication_doi
-// + the downloadPdfUrl anchor, downloads that anchor's href (method href).
+// SAGE's View Options section signals entitled PDF access; its reader link is
+// deliberately not treated as a file endpoint.
 const sageArticle = loadFixture("sage", "success");
 test.skipIf(sageArticle === null)(
-  "captured sage article fixture classifies as article via publication_doi + pdf anchor",
-  () => {
+  "captured sage article classifies via PDF/EPUB marker and derives its direct PDF URL",
+  async () => {
     const spec = adapters.find((a) => a.id === "sage") as AdapterSpec;
     const verdict = interpret(sageArticle as Document, spec, ctx());
     expect(verdict.kind).toBe("article");
     expect(verdict.adapter_id).toBe("sage");
+
+    const rule = spec.download as DownloadRule;
+    expect(rule.method).toBe("url");
+    const href = "https://journals.sagepub.com/doi/full/10.1177/0018720814547570";
+    const prev = { document: globalThis.document, location: globalThis.location };
+    Object.assign(globalThis, { document: sageArticle, location: { href } });
+    try {
+      expect(
+        await resolveDownloadURL(rule.selector, rule.idPattern ?? null, rule.urlTemplate ?? null, null),
+      ).toBe("https://journals.sagepub.com/doi/pdf/10.1177/0018720814547570?download=true");
+    } finally {
+      Object.assign(globalThis, prev);
+    }
   },
 );
 
-test("sage stays unknown without the publication_doi + downloadPdfUrl signals", () => {
+test("sage stays unknown when its PDF/EPUB marker is absent", () => {
   const spec = adapters.find((a) => a.id === "sage") as AdapterSpec;
-  const page = parseHTML("<!doctype html><html><head><title>SAGE Journals</title></head><body><h1>Journal home</h1></body></html>");
+  const page = parseHTML(
+    "<!doctype html><html><head><meta name='publication_doi' content='10.1177/0018720814547570'></head><body><a class='btn btn--pdf' href='/doi/reader/10.1177/0018720814547570'>View PDF/EPUB</a></body></html>",
+  );
   expect(interpret(page, spec, ctx()).kind).toBe("unknown");
 });
 

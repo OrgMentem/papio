@@ -1,13 +1,17 @@
 // Copyright 2026 OrgMentem. Licensed under MIT. See LICENSE.
 
-// Package errcat turns the daemon's internal job transition reasons into
-// actionable, user-facing categories and next steps. It is shared by every
-// surface that reports why a job is parked or settled without a file — the CLI
-// (`papio status`, `papio acquire --wait`) and the MCP `papio_status` tool — so
-// humans and agents get the same diagnosis from one catalog.
+// Package errcat turns job status into actionable, user-facing categories and
+// next steps. It is shared by every surface that reports why a job is parked
+// or settled without a file — the CLI (`papio status`, `papio acquire --wait`)
+// and the MCP `papio_status` tool — so humans and agents get the same
+// diagnosis from one catalog.
 package errcat
 
-import "papio/internal/config"
+import (
+	"papio/internal/app"
+	"papio/internal/config"
+	"papio/internal/job"
+)
 
 // Explanation is an actionable interpretation of a job's state: a short, stable
 // category plus one concrete next step the user or agent can take.
@@ -76,6 +80,75 @@ func Explain(state, reason, resolver, accessMode string, cfg config.Config) Expl
 	return Explanation{}
 }
 
+// ExplainWithOpenAction gives a current open human action precedence over the
+// transition that first parked the job. Handoff maintenance may replace that
+// action later, so the transition reason can no longer safely describe what
+// the user can do now.
+func ExplainWithOpenAction(state, reason, resolver, accessMode string, actions []job.HumanAction, cfg config.Config) Explanation {
+	if action, ok := latestOpenAction(actions); ok {
+		return explainOpenAction(action)
+	}
+	return Explain(state, reason, resolver, accessMode, cfg)
+}
+
+func latestOpenAction(actions []job.HumanAction) (job.HumanAction, bool) {
+	var current job.HumanAction
+	found := false
+	for _, action := range actions {
+		if action.Status != "open" || (found && action.ID <= current.ID) {
+			continue
+		}
+		current = action
+		found = true
+	}
+	return current, found
+}
+
+func explainOpenAction(action job.HumanAction) Explanation {
+	next := app.HumanActionNextStepFor(action)
+	switch action.Kind {
+	case "openurl_handoff":
+		if next.Command == "" {
+			break
+		}
+		if next.RequiresInstitutionalLogin {
+			return Explanation{"login_required",
+				"Sign in at your institution in the browser, then run `" + next.Command + "` to launch the handoff tab. If the sign-in page reports a stale or expired request, run it again — every open mints a fresh link."}
+		}
+		return Explanation{"browser_fetch_pending",
+			"An open-access copy needs a browser fetch; run `" + next.Command + "` to complete it. No login is required."}
+	case "manual_download":
+		if next.Instruction == "" {
+			break
+		}
+		if next.RequiresInstitutionalLogin {
+			return Explanation{"manual_download",
+				"Sign in at your institution in the browser, then " + next.Instruction + "."}
+		}
+		return Explanation{"manual_download", "You need to " + next.Instruction + ". No login is required."}
+	case "validation_error":
+		return Explanation{"validation_incomplete",
+			"PDF validation could not finish within its bounds; inspect the quarantined file, then re-run or override."}
+	case "unsafe_pdf":
+		return Explanation{"unsafe_pdf",
+			"The PDF is encrypted or carries active/embedded content; review it before adopting."}
+	case "verify_identity":
+		return Explanation{"identity_review",
+			"Confirm the downloaded PDF is the requested paper; approve it to finish, or reject to try another source."}
+	case "terms_acceptance_required":
+		return Explanation{"terms_acceptance_required",
+			"Review and accept the provider's terms in the browser, then retry the acquisition."}
+	case "openurl_available":
+		return Explanation{"openurl_available",
+			"An institutional OpenURL route is available; set access_mode to \"assisted\" or \"delegated\" and retry the acquisition."}
+	}
+	if next.RequiresInstitutionalLogin {
+		return Explanation{"login_required",
+			"Sign in at your institution in the browser, then complete the requested human action."}
+	}
+	return Explanation{"action_required", "This job is waiting on a human action; see `papio actions list` for details."}
+}
+
 // explainNoAccess distinguishes the reasons a job found no accessible copy. The
 // highest-value case for a new user is that no institution is configured, so
 // institutional access was never attempted — a fixable setup gap, not a dead
@@ -99,17 +172,26 @@ func explainNoAccess(resolver, accessMode string, cfg config.Config) Explanation
 
 // WaitGuidance renders a category and next-step block for a job that
 // `papio acquire --wait` settled into a parked or no-file terminal state, or ""
-// for success and states that need no user action. It is the acquire-side twin
-// of the status dashboard's per-job guidance.
+// for success and states that need no user action. It preserves the historical
+// reason-only path for callers that do not have a current action.
 func WaitGuidance(state, reason, resolver, accessMode string, cfg config.Config) string {
+	return renderWaitGuidance(state, Explain(state, reason, resolver, accessMode, cfg))
+}
+
+// WaitGuidanceWithOpenAction is the acquire-side form for a job detail, where
+// a live action supersedes the reason recorded when the job first parked.
+func WaitGuidanceWithOpenAction(state, reason, resolver, accessMode string, actions []job.HumanAction, cfg config.Config) string {
+	return renderWaitGuidance(state, ExplainWithOpenAction(state, reason, resolver, accessMode, actions, cfg))
+}
+
+func renderWaitGuidance(state string, exp Explanation) string {
 	switch state {
 	case "awaiting_human", "needs_review", "unavailable", "failed", "cancelled":
 	default:
 		return ""
 	}
-	exp := Explain(state, reason, resolver, accessMode, cfg)
 	if exp.Category == "" {
 		return ""
 	}
-	return "  [" + exp.Category + "]\n    \u2192 " + exp.Guidance
+	return "  [" + exp.Category + "]\n    → " + exp.Guidance
 }

@@ -30,6 +30,19 @@ execution records in `notes/acquisition-stack-plan.md`.
 
 ### Fixed
 
+- **Guidance for a parked job now comes from its current action, not a frozen
+  reason.** A job that parked long ago as `login_required` and later had its
+  handoff replaced by a `manual_download` still displayed the original advice:
+  sign in, then run `papio actions open` — a command that cannot open a manual
+  download. The reason was a historical transition record and never updated
+  when the action changed. Where a job has an open action, that action is now
+  the source of truth for what the user is told, across `papio status`,
+  `papio acquire --wait` and the MCP status surface; jobs with no open action,
+  such as terminal `no_identifier` or `no_entitlement`, are explained exactly as
+  before. This was the fourth surface to carry the same defect, so the
+  conformance guard was extended to the state-driven path as well — each earlier
+  guard only covered the surface it was written for, which is precisely how it
+  kept reappearing.
 - **papio was abandoning handoffs while the provider was still verifying the
   browser.** Nine of ten real handoffs on one machine ended `ui_changed`,
   reported as "the provider's UI changed" and parked as a manual download. The

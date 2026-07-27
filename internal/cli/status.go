@@ -153,7 +153,7 @@ func buildStatusSnapshot(rows []job.Row, details map[string]api.JobDetail, now t
 		}
 		if group == "awaiting_human" || group == "needs_review" || group == "failed_unavailable" {
 			item.Reason = transitionReason(detail.Events, row.State)
-			exp := errcat.Explain(row.State, item.Reason, row.Policy.Resolver, row.Policy.AccessMode, cfg)
+			exp := errcat.ExplainWithOpenAction(row.State, item.Reason, row.Policy.Resolver, row.Policy.AccessMode, detail.Actions, cfg)
 			item.Category = exp.Category
 			item.Guidance = exp.Guidance
 		}

@@ -44,6 +44,22 @@ for the full pre-split extension history.
 
 ### Fixed
 
+- **SAGE article pages had become unreadable.** The adapter keyed on
+  `a#downloadPdfUrl[data-doi]`, an element SAGE no longer renders — the page now
+  offers a `View PDF/EPUB` link to an eReader route inside a `View Options`
+  panel. Six of nine failed handoffs on one machine were SAGE, every one
+  reported as "the provider's UI changed" and parked for manual download. The
+  adapter now keys on the semantic `section.format--pdf_epub` panel and derives
+  the download from the DOI rather than following the eReader link, which is a
+  viewer rather than a file. Captured from a real authenticated page and
+  committed as its fixture.
+- **Only one `papio` tab group again.** Group rediscovery matched the title
+  exactly, so once a group was renamed to carry the paper being worked on it
+  became invisible to its own lookup and a fresh group was created beside it —
+  three had accumulated on one machine. Adoption is now window-aware and
+  serialised so concurrent folds converge, a renamed group is still recognised,
+  and existing duplicates are merged on startup rather than left for the user
+  to tidy up.
 - **The options page reported permissions it did not have, and "revoke all"
   silently did nothing.** `https://*/*` is offered as an escape hatch for
   unlisted providers but appeared in no list the page rendered, so once granted

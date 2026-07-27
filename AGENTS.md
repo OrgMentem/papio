@@ -223,7 +223,7 @@ Bump the pinned zensical version in `docs/requirements.txt` deliberately; CI ins
   Capture the authenticated page, run it through `sanitizeFixture` (`src/capture.ts`), commit,
   then add the spec + `adapters.test.ts` cases. Do **not** hand-guess selectors.
 - **`sanitizeFixture` strips URL query strings** (privacy). So classify selectors must key on
-  **stable id/path/data-attrs, not `?...` params** (e.g. SAGE keys on `a#downloadPdfUrl[data-doi]`,
+  **stable id/path/data-attrs, not `?...` params** (e.g. SAGE keys on `section.format--pdf_epub`,
   not `[href*='download=true']`). `method: "href"` reads the **live** anchor href (with query)
   at download time, so runtime downloads still get the full URL.
 - **`fetch()` from the page 403s on many provider PDF endpoints** (bot-gated) but
