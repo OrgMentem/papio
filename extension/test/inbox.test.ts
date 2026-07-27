@@ -703,10 +703,30 @@ test("renders access hints only when the daemon classifies a human action", asyn
   const page = await inboxDocument((message) => snapshotReply(fixture, message));
 
   expect(page.document.querySelector("[data-triage-item-id='action:open-access'] .access-hint")?.textContent)
-    .toBe("open access — no login needed");
+    .toBe("no login needed");
   expect(page.document.querySelector("[data-triage-item-id='action:institutional'] .access-hint")?.textContent)
-    .toBe("sign in to your institution first");
+    .toBe("needs your institution sign-in");
   expect(page.document.querySelector("[data-triage-item-id='action:unclassified'] .access-hint")).toBeNull();
+});
+
+// The hint sits directly above the action's detail, which for a manual_download
+// tells the user to fetch the PDF themselves. When the hint also read as an
+// instruction ("sign in to your institution first") the pair looked like two
+// contradictory demands. It must state a precondition and never a verb the
+// detail contradicts.
+test("the access hint states a precondition rather than competing with the detail", async () => {
+  const item = manualAction("action:manual-auth", 1, "Paywalled manual download");
+  item.requires_auth = true;
+  item.blocked_by = "paywall";
+  item.facts = [{ label: "Detail", text: "the browser handoff did not produce a file; download the requested PDF yourself and papio will adopt it" }];
+  const page = await inboxDocument((message) =>
+    snapshotReply(snapshot([item], { counts: counts({ pending_total: 1, actions: 1, watch_hits: 0, retractions: 0 }) }), message));
+
+  const hint = page.document.querySelector("[data-triage-item-id='action:manual-auth'] .access-hint")?.textContent ?? "";
+  expect(hint).toBe("needs your institution sign-in");
+  for (const verb of ["sign in to", "then run", "actions open", "download the"]) {
+    expect(hint.toLowerCase()).not.toContain(verb);
+  }
 });
 
 test("an author suffix duplicated in the title is stripped for display", async () => {

@@ -34,9 +34,22 @@ func TestAccessHintClassifiesOpenAndInstitutionalAccess(t *testing.T) {
 			want:   "\topen access — no login needed",
 		},
 		{
-			name:   "institutional",
-			action: job.HumanAction{RequiresAuth: true, BlockedBy: "paywall"},
+			name:   "institutional handoff",
+			action: job.HumanAction{Kind: "openurl_handoff", RequiresAuth: true, BlockedBy: "paywall"},
 			want:   "\tsign in to your institution first, then 'papio actions open'",
+		},
+		{
+			// `papio actions open` cannot open a manual_download — actionURL
+			// rejects the kind — so naming it here sent the user to a command
+			// that silently did nothing for eight rows on one machine.
+			name:   "manual download behind a paywall",
+			action: job.HumanAction{Kind: "manual_download", RequiresAuth: true, BlockedBy: "paywall"},
+			want:   "\tsign in to your institution, then download the PDF yourself — papio will adopt it",
+		},
+		{
+			name:   "manual download, open access",
+			action: job.HumanAction{Kind: "manual_download", RequiresAuth: false, BlockedBy: "landing_page"},
+			want:   "\tdownload the PDF yourself — papio will adopt it; no login needed",
 		},
 		{
 			name: "unclassified",

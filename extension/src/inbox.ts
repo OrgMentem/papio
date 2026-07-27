@@ -540,11 +540,18 @@ function statusMeta(item: TriageSnapshotItem): { key: string; glyph: string; lab
 // Access classification is optional so snapshots from older daemons retain
 // their existing presentation. Newer daemon snapshots distinguish an action
 // that merely needs opening from one that first needs institutional sign-in.
+//
+// Phrased as a PRECONDITION, never as an instruction. The detail line directly
+// below already tells the user what to do, and it varies by action kind — a
+// manual_download says to fetch the PDF yourself. When this line also read as
+// an instruction ("sign in to your institution first") the two looked like
+// contradictory demands: sign in, or download? It states only whether a login
+// stands in the way, and lets the detail own the verb.
 function accessHint(item: TriageSnapshotItem): HTMLElement | null {
   if (item.kind !== "human_action" || (item.blocked_by === undefined && item.requires_auth === undefined)) return null;
   const hint = element("p", item.requires_auth === true
-    ? "sign in to your institution first"
-    : "open access — no login needed");
+    ? "needs your institution sign-in"
+    : "no login needed");
   hint.className = "access-hint";
   return hint;
 }
