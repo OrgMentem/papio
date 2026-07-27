@@ -722,6 +722,42 @@
         margin-bottom: var(--space-6);
       }
 
+      /* The undo bar is the entire safety net for dismissal: the row leaves
+         the list at once and the daemon call is held until the window closes,
+         so Undo is exact rather than a reversal the daemon cannot perform (a
+         dismissed action can cancel its job, and a cancelled job cannot be
+         retried). It floats above the sticky footer instead of joining the
+         flow so a dismissal never reflows the list under the pointer. */
+      #undo-bar {
+        align-items: center;
+        background: var(--color-surface);
+        border: 1px solid var(--color-control-border);
+        border-radius: var(--radius-pill);
+        bottom: calc(var(--space-12) + var(--space-4));
+        box-shadow: var(--shadow-dialog);
+        display: flex;
+        gap: var(--space-3);
+        left: 50%;
+        max-width: min(48rem, calc(100% - var(--space-8)));
+        padding: var(--space-2) var(--space-2) var(--space-2) var(--space-4);
+        position: fixed;
+        transform: translateX(-50%);
+        width: max-content;
+        z-index: 2;
+      }
+
+      #undo-message {
+        font-size: var(--font-size-small);
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      #undo-dismiss {
+        border-radius: var(--radius-pill);
+        flex: 0 0 auto;
+      }
+
       /* The footer (status legend + keyboard help) sticks to the viewport
          bottom so the glyph vocabulary is always in view; it settles into
          normal flow once the list is scrolled to its end. */
@@ -903,6 +939,10 @@
     <main id="item-list" aria-label="Triage items"></main>
     <p id="operation-status" role="status" aria-live="polite"></p>
     <button id="load-more" type="button" hidden>Load more</button>
+    <div id="undo-bar" hidden>
+      <p id="undo-message"></p>
+      <button id="undo-dismiss" type="button">Undo</button>
+    </div>
     <footer>
       <p id="status-legend">
         <span class="item-status" data-status="manual_download" aria-hidden="true">↓</span><span>manual download</span>
@@ -913,7 +953,7 @@
       </p>
       <p id="shortcut-help">
         <kbd>j</kbd>/<kbd>k</kbd> select · <kbd>a</kbd> act · <kbd>d</kbd> dismiss ·
-        <kbd>o</kbd> open
+        <kbd>u</kbd> undo · <kbd>o</kbd> open
       </p>
       <time id="generated-at">generated at —</time>
     </footer>

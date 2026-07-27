@@ -29,7 +29,7 @@ async function settle(): Promise<void> {
 
 async function inboxDocument(
   reply: (message: RuntimeRequest) => unknown | Promise<unknown>,
-): Promise<{ document: Document; requests: RuntimeRequest[]; opened: string[] }> {
+): Promise<{ document: Document; window: Window; requests: RuntimeRequest[]; opened: string[] }> {
   const window = new Window();
   window.document.write(readFileSync(new URL("../src/inbox.html", import.meta.url), "utf8"));
   const requests: RuntimeRequest[] = [];
@@ -64,6 +64,7 @@ async function inboxDocument(
   await settle();
   return {
     document: window.document as unknown as Document,
+    window,
     requests,
     opened,
   };
@@ -195,6 +196,12 @@ function snapshotReply(fixture: FixtureSnapshot, message: RuntimeRequest): unkno
 
 function key(document: Document, value: string): void {
   document.dispatchEvent(new KeyboardEvent("keydown", { key: value, bubbles: true }));
+}
+
+// Leaving the page commits whatever is still inside its undo window; tests use
+// it to reach the daemon call without waiting out the real timer.
+function flush(window: Window): void {
+  window.dispatchEvent(new window.Event("pagehide"));
 }
 
 test("renders rank-ordered bands, label:text facts, and only safe HTTPS links", async () => {
@@ -458,6 +465,8 @@ test("a conflict leaves an inline refresh result and re-requests the snapshot", 
   page.document.querySelector<HTMLElement>("[data-triage-item-id='hit:one']")?.focus();
   key(page.document, "d");
   await settle();
+  flush(page.window);
+  await settle();
   expect(page.document.querySelector(".item-result")?.textContent).toBe("changed elsewhere — refreshed");
   expect(page.requests.filter((request) => request.type === "papio.triage.snapshot")).toHaveLength(2);
 });
@@ -531,8 +540,35 @@ test("an acknowledged removal focuses the next triage row", async () => {
   expect(page.document.activeElement?.getAttribute("data-triage-item-id")).toBe("hit:second");
 });
 
-test("dismissing a human_action item confirms and calls papio.action.resolve, not triage.decide", async () => {
-  // Regression: humanActionItems now offers "dismiss" for non-review kinds
+test("a dismissal removes the row at once, holds the daemon call, and undo puts it back", async () => {
+  // Dismissal is deferred rather than confirmed: the modal protected nothing
+  // (the daemon cannot un-cancel a job) while costing a click per row, so the
+  // undo window is the safety net and no dialog may appear.
+  const fixture = snapshot([manualAction("action:manual", 1, "Manual action")], {
+    counts: counts({ pending_total: 1, actions: 1, watch_hits: 0, retractions: 0 }),
+  });
+  const page = await inboxDocument((message) => {
+    if (message.type === "papio.action.resolve") return { ok: true, outcome: "applied" };
+    return snapshotReply(fixture, message);
+  });
+  page.document.querySelector<HTMLButtonElement>("[data-operation='dismiss']")?.click();
+  await settle();
+  expect(page.document.getElementById("confirm-dialog")?.hidden).toBe(true);
+  expect(page.document.querySelector("[data-triage-item-id='action:manual']")).toBeNull();
+  expect(page.document.getElementById("undo-bar")?.hidden).toBe(false);
+  expect(page.document.getElementById("inbox-counts")?.textContent).toContain("0 pending");
+  expect(page.requests.filter((request) => request.type === "papio.action.resolve")).toHaveLength(0);
+
+  page.document.getElementById("undo-dismiss")?.dispatchEvent(new Event("click", { bubbles: true }));
+  await settle();
+  expect(page.document.querySelector("[data-triage-item-id='action:manual']")).not.toBeNull();
+  expect(page.document.getElementById("undo-bar")?.hidden).toBe(true);
+  expect(page.document.getElementById("inbox-counts")?.textContent).toContain("1 pending");
+  expect(page.requests.filter((request) => request.type === "papio.action.resolve")).toHaveLength(0);
+});
+
+test("a committed human_action dismissal calls papio.action.resolve, not triage.decide", async () => {
+  // Regression: humanActionItems offers "dismiss" for non-review kinds
   // (manual_download, openurl_handoff), but the client's dismiss handler was
   // written only for watch_hit's papio.triage.decide RPC. Routing a
   // human_action dismiss through that path would silently no-op (the
@@ -547,17 +583,48 @@ test("dismissing a human_action item confirms and calls papio.action.resolve, no
   });
   page.document.querySelector<HTMLButtonElement>("[data-operation='dismiss']")?.click();
   await settle();
-  expect(page.document.getElementById("confirm-dialog")?.hidden).toBe(false);
-  expect(page.document.getElementById("confirm-dialog-message")?.textContent).toContain("Dismiss");
-  expect(page.requests.filter((request) => request.type === "papio.triage.decide")).toHaveLength(0);
-  page.document.getElementById("confirm-submit")?.dispatchEvent(new Event("click", { bubbles: true }));
+  flush(page.window);
   await settle();
+  expect(page.requests.filter((request) => request.type === "papio.triage.decide")).toHaveLength(0);
   expect(page.requests.find((request) => request.type === "papio.action.resolve")?.request).toEqual({
     action_id: 18,
     verdict: "dismiss",
     expected_revision: 1,
   });
   expect(page.document.querySelector("[data-triage-item-id='action:manual']")).toBeNull();
+  expect(page.document.getElementById("undo-bar")?.hidden).toBe(true);
+});
+
+test("the undo bar names a cancelled acquisition only when the job is parked on the action", async () => {
+  // Mirrors dismissalCancelsParkedJob in internal/job/job.go: dismissing an
+  // action a job is parked on cancels that job, while a leftover action on a
+  // job that moved on just closes a dead row. The wording must not threaten
+  // cancellation for the second case — that is the whole reason the blanket
+  // confirmation was wrong.
+  const parked = manualAction("action:parked", 1, "Parked download");
+  parked.job_state = "awaiting_human";
+  const stale = manualAction("action:stale", 2, "Stale residue");
+  stale.action_id = 20;
+  stale.job_state = "resolving";
+  const fixture = snapshot([parked, stale], {
+    counts: counts({ pending_total: 2, actions: 2, watch_hits: 0, retractions: 0 }),
+  });
+  const page = await inboxDocument((message) => {
+    if (message.type === "papio.action.resolve") return { ok: true, outcome: "applied" };
+    return snapshotReply(fixture, message);
+  });
+  page.document.querySelector<HTMLButtonElement>("[data-triage-item-id='action:parked'] [data-operation='dismiss']")?.click();
+  await settle();
+  expect(page.document.getElementById("undo-message")?.textContent).toContain("cancelled its acquisition");
+
+  page.document.querySelector<HTMLButtonElement>("[data-triage-item-id='action:stale'] [data-operation='dismiss']")?.click();
+  await settle();
+  expect(page.document.getElementById("undo-message")?.textContent).toBe("Dismissed 2 items — 1 cancelled an acquisition.");
+
+  flush(page.window);
+  await settle();
+  expect(page.requests.filter((request) => request.type === "papio.action.resolve").map((request) => request.request["action_id"]))
+    .toEqual([18, 20]);
 });
 
 test("a structured broker rejection renders inline and never fakes a disconnect", async () => {
@@ -578,7 +645,7 @@ test("a structured broker rejection renders inline and never fakes a disconnect"
   });
   page.document.querySelector<HTMLButtonElement>("[data-operation='dismiss']")?.click();
   await settle();
-  page.document.getElementById("confirm-submit")?.dispatchEvent(new Event("click", { bubbles: true }));
+  flush(page.window);
   await settle();
 
   const row = page.document.querySelector<HTMLElement>("[data-triage-item-id='action:manual'] .item-result");
@@ -591,7 +658,7 @@ test("a structured broker rejection renders inline and never fakes a disconnect"
   throwNow = true;
   page.document.querySelector<HTMLButtonElement>("[data-operation='dismiss']")?.click();
   await settle();
-  page.document.getElementById("confirm-submit")?.dispatchEvent(new Event("click", { bubbles: true }));
+  flush(page.window);
   await settle();
   expect(page.document.getElementById("connection-status")?.textContent).toContain("Disconnected");
 });

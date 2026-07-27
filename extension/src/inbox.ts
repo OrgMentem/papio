@@ -4,7 +4,7 @@ import type { TriageCounts, TriageSnapshotItem, TriageSnapshotResponsePayload } 
 
 type Snapshot = Omit<TriageSnapshotResponsePayload, "request_id">;
 type TriageOperation = TriageSnapshotItem["ops"][number];
-type Verdict = "accept" | "reject" | "dismiss";
+type Verdict = "accept" | "reject";
 
 type CitationStyle = "apa" | "mla" | "chicago";
 
@@ -43,12 +43,22 @@ interface PageElements {
   dialogCancel: HTMLButtonElement;
   dialogConfirm: HTMLButtonElement;
   citationStyle: HTMLSelectElement;
+  undoBar: HTMLElement;
+  undoMessage: HTMLElement;
+  undoButton: HTMLButtonElement;
 }
 
 interface Confirmation {
   itemID: string;
   verdict: Verdict;
   returnFocus: HTMLElement | null;
+}
+
+// One dismissal waiting out its undo window. The item is kept whole so an undo
+// can put the exact row back without a round trip.
+interface PendingDismissal {
+  item: TriageSnapshotItem;
+  cancelsJob: boolean;
 }
 
 interface PageState {
@@ -62,6 +72,8 @@ interface PageState {
   previewed: Set<string>;
   itemMessages: Map<string, { text: string; tone: "info" | "error" | "offline" }>;
   confirmation: Confirmation | null;
+  dismissals: PendingDismissal[];
+  undoDeadline: number | null;
   focusSelectionAfterRender: boolean;
   loading: boolean;
   filterQuery: string;
@@ -79,6 +91,8 @@ const state: PageState = {
   previewed: new Set(),
   itemMessages: new Map(),
   confirmation: null,
+  dismissals: [],
+  undoDeadline: null,
   focusSelectionAfterRender: false,
   loading: false,
   filterQuery: "",
@@ -728,12 +742,10 @@ function renderDialog(): void {
     elements.dialogMessage.textContent = `Accept this PDF as ${item.title}? It leaves quarantine.`;
   } else if (confirmation.verdict === "reject") {
     elements.dialogMessage.textContent = `Reject ${item.title}? It cancels the job.`;
-  } else if (confirmation.verdict === "dismiss") {
-    elements.dialogMessage.textContent = `Dismiss ${item.title}? It cancels the job and closes this action.`;
   } else {
     elements.dialogMessage.textContent = `Accept ${item.title}?`;
   }
-  elements.dialogConfirm.textContent = confirmation.verdict === "accept" ? "Accept" : confirmation.verdict === "reject" ? "Reject" : "Dismiss";
+  elements.dialogConfirm.textContent = confirmation.verdict === "accept" ? "Accept" : "Reject";
   elements.dialogConfirm.disabled = state.pending.has(item.id);
   elements.dialogCancel.disabled = state.pending.has(item.id);
   elements.dialog.hidden = false;
@@ -788,22 +800,23 @@ function render(): void {
   }
 
   renderDialog();
+  renderUndoBar();
   if (state.focusSelectionAfterRender) {
     state.focusSelectionAfterRender = false;
     if (state.selectedID !== null) rowForItem(state.selectedID)?.focus();
   }
 }
 
-function decrementCounts(item: TriageSnapshotItem): void {
+function adjustCounts(item: TriageSnapshotItem, delta: number): void {
   const counts = state.counts;
   if (counts === null) return;
-  const decrease = (value: number): number => Math.max(0, value - 1);
+  const shift = (value: number): number => Math.max(0, value + delta);
   state.counts = {
     ...counts,
-    pending_total: decrease(counts.pending_total),
-    watch_hits: item.kind === "watch_hit" ? decrease(counts.watch_hits) : counts.watch_hits,
-    actions: item.kind === "human_action" ? decrease(counts.actions) : counts.actions,
-    retractions: item.kind === "retraction" ? decrease(counts.retractions) : counts.retractions,
+    pending_total: shift(counts.pending_total),
+    watch_hits: item.kind === "watch_hit" ? shift(counts.watch_hits) : counts.watch_hits,
+    actions: item.kind === "human_action" ? shift(counts.actions) : counts.actions,
+    retractions: item.kind === "retraction" ? shift(counts.retractions) : counts.retractions,
   };
 }
 
@@ -816,12 +829,20 @@ function removeItem(itemID: string): void {
   const remaining = state.snapshot.items.filter((item) => item.id !== itemID);
   state.snapshot = { ...state.snapshot, items: remaining };
   state.itemMessages.delete(itemID);
-  decrementCounts(removed);
+  adjustCounts(removed, -1);
   if (state.selectedID === itemID) {
     const next = items[index + 1] ?? items[index - 1] ?? null;
     state.selectedID = next?.id ?? null;
     state.focusSelectionAfterRender = true;
   }
+}
+
+// restoreItem puts an optimistically removed row back. orderedItems re-sorts
+// by kind and rank, so appending restores its original position.
+function restoreItem(item: TriageSnapshotItem): void {
+  if (state.snapshot === null || state.snapshot.items.some((existing) => existing.id === item.id)) return;
+  state.snapshot = { ...state.snapshot, items: [...state.snapshot.items, item] };
+  adjustCounts(item, 1);
 }
 
 function resultForMutation(value: unknown): { ok: true; outcome: "applied" | "already_applied" | "conflict" | "error"; detail?: string } | { ok: false; message: string } {
@@ -869,8 +890,11 @@ async function refreshInbox(append = false): Promise<void> {
   render();
 }
 
+// An explicit refresh commits any queued dismissal first: the incoming
+// snapshot still contains those rows, and resurrecting a row the user just
+// dismissed would be worse than losing the undo window early.
 function requestRefresh(): void {
-  void refreshInbox();
+  void commitDismissals().then(() => refreshInbox());
 }
 // Inbox freshness. The poll is visibility-gated and only refetches the full
 // snapshot when the counts signature changes, keeping steady-state traffic to
@@ -903,7 +927,7 @@ function countsSignature(counts: TriageCounts | null): string {
 function autoRefreshAllowed(): boolean {
   if (boundDocument !== undefined && globalThis.document !== boundDocument) return false;
   if (!state.connected || state.loading) return false;
-  if (state.confirmation !== null || state.pending.size > 0) return false;
+  if (state.confirmation !== null || state.pending.size > 0 || state.dismissals.length > 0) return false;
   return typeof document === "undefined" || document.visibilityState === "visible";
 }
 
@@ -993,21 +1017,197 @@ async function finishMutation(item: TriageSnapshotItem, response: unknown): Prom
   }
 }
 
-// decide drives the watch_hit-only triage-decide RPC (acquire/dismiss a
-// watch digest entry). human_action dismiss goes through requestConfirmation
-// + papio.action.resolve instead — it cancels a job, not a watch entry.
-async function decide(item: TriageSnapshotItem, operation: "acquire" | "dismiss"): Promise<void> {
+// acquire drives the watch_hit-only triage-decide RPC. Dismissal of any kind
+// goes through the deferred queue below instead.
+async function acquire(item: TriageSnapshotItem): Promise<void> {
   if (!beginMutation(item)) return;
   try {
-    const response = await runtimeMessage("papio.triage.decide", {
-      item_id: item.id,
-      op: operation,
-      ...(operation === "dismiss" ? { watch_scope: "all" } : {}),
-    });
+    const response = await runtimeMessage("papio.triage.decide", { item_id: item.id, op: "acquire" });
     await finishMutation(item, response);
   } catch (error) {
     failMutationOffline(item, error);
   }
+}
+
+// Dismissal is a deferred, undoable batch: the row leaves the list at once and
+// the daemon call is held for UNDO_WINDOW_MS, so Undo is exact — nothing has
+// happened yet. That ordering is what makes a confirmation dialog unnecessary.
+// The daemon cannot reverse a dismissal (DismissHumanAction cancels the parked
+// job, and Retry refuses a cancelled job), so the modal bought no recovery at
+// all — only a second click on every single row.
+const UNDO_WINDOW_MS = 6000;
+const UNDO_TICK_MS = 250;
+let undoTimer: number | Timer | undefined;
+
+// Mirrors dismissalCancelsParkedJob in internal/job/job.go: a dismiss cancels
+// work only when the job is parked on THIS action. Everything else — advisory
+// openurl_available rows, actions left behind on a job that moved on, watch
+// hits — just closes a dead row. The snapshot already carries both inputs, so
+// the consequence is known client-side without a protocol change. A human
+// action whose job_state is missing counts as destructive.
+function dismissCancelsJob(item: TriageSnapshotItem): boolean {
+  if (item.kind !== "human_action") return false;
+  switch (item.job_state) {
+    case "awaiting_human":
+      return item.action_kind === "openurl_handoff" || item.action_kind === "manual_download" || item.action_kind === "openurl_available";
+    case "needs_review":
+      return item.action_kind === "verify_identity";
+    case undefined:
+      return true;
+    default:
+      return false;
+  }
+}
+
+function boundedTitle(item: TriageSnapshotItem): string {
+  const text = displayTitle(item).text;
+  return text.length <= 60 ? `“${text}”` : `“${text.slice(0, 59)}…”`;
+}
+
+function undoSummary(): string {
+  const entries = state.dismissals;
+  const first = entries[0];
+  if (entries.length === 1 && first !== undefined) {
+    const title = boundedTitle(first.item);
+    return first.cancelsJob ? `Dismissed ${title} and cancelled its acquisition.` : `Dismissed ${title}.`;
+  }
+  const cancelled = entries.filter((entry) => entry.cancelsJob).length;
+  if (cancelled === 0) return `Dismissed ${entries.length} items.`;
+  return `Dismissed ${entries.length} items — ${cancelled} cancelled an acquisition.`;
+}
+
+function renderUndoBar(): void {
+  if (elements === null) return;
+  if (state.dismissals.length === 0) {
+    elements.undoBar.hidden = true;
+    return;
+  }
+  const remaining = Math.max(0, Math.ceil(((state.undoDeadline ?? 0) - Date.now()) / 1000));
+  elements.undoMessage.textContent = undoSummary();
+  elements.undoButton.textContent = `Undo (${remaining})`;
+  elements.undoBar.hidden = false;
+}
+
+function scheduleUndoTick(): void {
+  clearTimeout(undoTimer);
+  if (boundDocument !== undefined && globalThis.document !== boundDocument) return;
+  undoTimer = setTimeout(() => {
+    if (state.dismissals.length === 0) return;
+    if (state.undoDeadline !== null && Date.now() >= state.undoDeadline) {
+      void commitDismissals();
+      return;
+    }
+    renderUndoBar();
+    scheduleUndoTick();
+  }, UNDO_TICK_MS);
+}
+
+function scheduleDismissal(item: TriageSnapshotItem): void {
+  if (!state.connected) {
+    operationMessage(item.id, "Daemon unavailable — reconnecting automatically.", "offline");
+    render();
+    return;
+  }
+  if (state.pending.has(item.id) || state.dismissals.some((entry) => entry.item.id === item.id)) return;
+  if (item.kind === "human_action" && (typeof item.action_id !== "number" || typeof item.revision !== "number")) {
+    operationMessage(item.id, "This action is missing its revision and cannot be changed.", "error");
+    render();
+    return;
+  }
+  state.dismissals.push({ item, cancelsJob: dismissCancelsJob(item) });
+  removeItem(item.id);
+  state.undoDeadline = Date.now() + UNDO_WINDOW_MS;
+  scheduleUndoTick();
+  announce(`${undoSummary()} Press u to undo.`);
+  render();
+}
+
+// takeDismissals empties the queue before anything can await, so the window
+// timer, a refresh, and a page-hide flush can never commit or restore the same
+// entry twice.
+function takeDismissals(): PendingDismissal[] {
+  const entries = state.dismissals;
+  state.dismissals = [];
+  state.undoDeadline = null;
+  clearTimeout(undoTimer);
+  if (elements !== null && document.activeElement === elements.undoButton) state.focusSelectionAfterRender = true;
+  renderUndoBar();
+  return entries;
+}
+
+function undoDismissals(): void {
+  const entries = takeDismissals();
+  const first = entries[0];
+  if (first === undefined) return;
+  for (const entry of entries) restoreItem(entry.item);
+  state.selectedID = first.item.id;
+  state.focusSelectionAfterRender = true;
+  announce(entries.length === 1 ? "Dismissal undone." : `${entries.length} dismissals undone.`);
+  render();
+}
+
+async function commitDismissals(): Promise<void> {
+  const entries = takeDismissals();
+  if (entries.length === 0) return;
+  let applied = 0;
+  let conflicted = false;
+  for (const entry of entries) {
+    const outcome = await sendDismissal(entry.item);
+    if (outcome === "applied") applied += 1;
+    if (outcome === "conflict") conflicted = true;
+  }
+  if (applied === entries.length) announce(applied === 1 ? "Dismissal applied." : `${applied} dismissals applied.`);
+  render();
+  if (conflicted) await refreshInbox();
+}
+
+// A failed dismissal puts its row back rather than vanishing silently: the
+// daemon still holds the item, so the inbox must too.
+async function sendDismissal(item: TriageSnapshotItem): Promise<"applied" | "conflict" | "failed"> {
+  try {
+    const response = item.kind === "human_action"
+      ? await runtimeMessage("papio.action.resolve", {
+        action_id: item.action_id,
+        verdict: "dismiss",
+        expected_revision: item.revision,
+      })
+      : await runtimeMessage("papio.triage.decide", { item_id: item.id, op: "dismiss", watch_scope: "all" });
+    const result = resultForMutation(response);
+    if (!result.ok) {
+      restoreItem(item);
+      operationMessage(item.id, result.message, "error");
+      return "failed";
+    }
+    switch (result.outcome) {
+      case "applied":
+      case "already_applied":
+        return "applied";
+      case "conflict":
+        restoreItem(item);
+        operationMessage(item.id, "changed elsewhere — refreshed", "info");
+        return "conflict";
+      case "error":
+        restoreItem(item);
+        operationMessage(item.id, result.detail ?? "The daemon could not dismiss this item.", "error");
+        return "failed";
+    }
+  } catch (error) {
+    restoreItem(item);
+    failMutationOffline(item, error);
+    return "failed";
+  }
+}
+
+// A hidden or unloading page can be discarded before the window closes, and a
+// queued dismissal is the user's expressed intent — commit it instead of
+// dropping it. Leaving the page waives the undo, which is the exception.
+function flushDismissals(): void {
+  void commitDismissals();
+}
+
+function flushDismissalsWhenHidden(): void {
+  if (typeof document !== "undefined" && document.visibilityState === "visible") return;
+  flushDismissals();
 }
 
 function closeDialog(restoreFocus: boolean): void {
@@ -1171,11 +1371,10 @@ async function requestHandoffOpen(item: TriageSnapshotItem): Promise<void> {
 function activateOperation(item: TriageSnapshotItem, operation: TriageOperation): void {
   switch (operation) {
     case "acquire":
-      void decide(item, operation);
+      void acquire(item);
       return;
     case "dismiss":
-      if (item.kind === "human_action") requestConfirmation(item, "dismiss");
-      else void decide(item, operation);
+      scheduleDismissal(item);
       return;
     case "accept":
     case "reject":
@@ -1205,7 +1404,7 @@ function activateOperation(item: TriageSnapshotItem, operation: TriageOperation)
 
 function activatePrimary(item: TriageSnapshotItem): void {
   if (item.kind === "watch_hit" && hasOperation(item, "acquire")) {
-    void decide(item, "acquire");
+    void acquire(item);
     return;
   }
   if (item.kind === "human_action" && hasOperation(item, "accept")) {
@@ -1246,14 +1445,19 @@ function handleKeyboard(event: KeyboardEvent): void {
       }
       return;
     case "d": {
-      const current_ = items[current];
-      if (current >= 0 && current_ !== undefined && hasOperation(current_, "dismiss")) {
+      const target = items[current];
+      if (current >= 0 && target !== undefined && hasOperation(target, "dismiss")) {
         event.preventDefault();
-        if (current_.kind === "human_action") requestConfirmation(current_, "dismiss");
-        else void decide(current_, "dismiss");
+        scheduleDismissal(target);
       }
       return;
     }
+    case "u":
+      if (state.dismissals.length > 0) {
+        event.preventDefault();
+        undoDismissals();
+      }
+      return;
     case "o":
       if (current >= 0) {
         event.preventDefault();
@@ -1304,6 +1508,9 @@ function bootstrap(): void {
   const dialogCancel = document.getElementById("confirm-cancel");
   const dialogConfirm = document.getElementById("confirm-submit");
   const citationStyle = document.getElementById("citation-style");
+  const undoBar = document.getElementById("undo-bar");
+  const undoMessage = document.getElementById("undo-message");
+  const undoButton = document.getElementById("undo-dismiss");
   if (
     !(connection instanceof HTMLElement) ||
     !(counts instanceof HTMLElement) ||
@@ -1318,7 +1525,10 @@ function bootstrap(): void {
     !(dialog instanceof HTMLElement) ||
     !(dialogMessage instanceof HTMLElement) ||
     !(dialogCancel instanceof HTMLButtonElement) ||
-    !(dialogConfirm instanceof HTMLButtonElement)
+    !(dialogConfirm instanceof HTMLButtonElement) ||
+    !(undoBar instanceof HTMLElement) ||
+    !(undoMessage instanceof HTMLElement) ||
+    !(undoButton instanceof HTMLButtonElement)
   ) {
     return;
   }
@@ -1337,6 +1547,9 @@ function bootstrap(): void {
     dialogMessage,
     dialogCancel,
     dialogConfirm,
+    undoBar,
+    undoMessage,
+    undoButton,
   };
   refresh.addEventListener("click", requestRefresh);
   reconnect.addEventListener("click", requestRefresh);
@@ -1354,8 +1567,9 @@ function bootstrap(): void {
     render();
   });
   loadMore.addEventListener("click", () => {
-    void refreshInbox(true);
+    void commitDismissals().then(() => refreshInbox(true));
   });
+  undoButton.addEventListener("click", undoDismissals);
   dialogCancel.addEventListener("click", () => closeDialog(true));
   dialogConfirm.addEventListener("click", () => {
     void resolveConfirmation();
@@ -1364,6 +1578,8 @@ function bootstrap(): void {
   document.addEventListener("keydown", trapDialogFocus);
   document.addEventListener("visibilitychange", refreshOnReturn);
   window.addEventListener("focus", refreshOnReturn);
+  window.addEventListener("pagehide", flushDismissals);
+  document.addEventListener("visibilitychange", flushDismissalsWhenHidden);
   boundDocument = document;
   render();
   void refreshInbox();

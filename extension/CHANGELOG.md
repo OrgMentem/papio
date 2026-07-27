@@ -51,6 +51,19 @@ for the full pre-split extension history.
   from 20. The old figure implied hours saved after a handful of papers and
   read as marketing; the headline is still a rough estimate the extension
   computes from counts, never a measurement.
+- **Dismissing an inbox item no longer asks first.** The row leaves the list
+  immediately and the daemon call is held for six seconds behind an **Undo**
+  bar (keyboard `u`); dismissing several rows in a row batches them into one
+  undo. The confirmation dialog it replaces protected nothing — the daemon
+  cannot un-cancel a job, so clicking through it committed the same
+  irreversible change, one extra click per row. Leaving or hiding the page
+  commits whatever is still waiting. Accepting or rejecting a quarantined PDF
+  still asks.
+- **The inbox says what a dismissal actually costs.** It mirrors the daemon's
+  own rule (a dismissal cancels the job only when the job is parked on that
+  action) and names the cancelled acquisition only in that case. Advisory
+  `openurl_available` rows and actions left behind on a job that moved on are
+  reported as what they are: a closed dead row.
 
 ### Fixed
 

@@ -122,9 +122,20 @@ one-minute keepalive alarm — whether or not a *papio* tab is open. With
 nothing open, the browser decides how often a sleeping extension is woken; no
 design on this transport can beat that.
 
-An auto-refresh never reorders the list while a confirmation dialog is open
-or an action is still in flight — it waits until you're finished before
-applying what it learned.
+An auto-refresh never reorders the list while a confirmation dialog is open,
+an action is still in flight, or a dismissal is still inside its undo
+window — it waits until you're finished before applying what it learned.
+
+## Dismissing takes effect after you stop looking at it
+
+Dismissing an inbox item removes it at once and holds the daemon call for a
+few seconds behind an **Undo** bar (keyboard `u`); dismiss several rows and
+they share one undo. Nothing has reached the daemon until that window closes,
+which is what makes the undo exact — the daemon itself cannot reverse a
+dismissal, because dismissing an action a job is parked on cancels that job
+and a cancelled job cannot be retried. The bar says which of the two happened:
+a cancelled acquisition, or a leftover row closed without touching live work.
+Refreshing, or leaving the page, commits whatever is still waiting.
 
 ## Browser configuration
 
