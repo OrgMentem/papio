@@ -44,6 +44,30 @@ for the full pre-split extension history.
 
 ### Fixed
 
+- **The options page reported permissions it did not have, and "revoke all"
+  silently did nothing.** `https://*/*` is offered as an escape hatch for
+  unlisted providers but appeared in no list the page rendered, so once granted
+  it made every specific origin report as granted, and revoking a specific
+  origin resolved successfully while changing nothing — the toggle snapped
+  straight back. Underneath, the UI painted from the return value of
+  `permissions.request`/`remove` rather than re-reading the resulting state, so
+  it could claim a change that never took effect. The page now paints from a
+  fresh `permissions.getAll()` snapshot, shows all-sites coverage as coverage
+  rather than as a broken toggle, makes the all-sites grant itself visible and
+  revocable, and either removes it as part of "revoke all" or says plainly why
+  access remains.
+- **papio no longer blames the adapter when it was never allowed to look.**
+  Every page read goes through `chrome.scripting`, so a provider whose host
+  permission is not granted is unreadable — and that was reported as the same
+  "the provider's UI changed" as a stale adapter, with no indication anywhere.
+  A blocked host is now named exactly in the outcome detail, surfaced on the
+  toolbar and in the popup with a route to the grant control, and deduplicated
+  so a standing condition reports once rather than once per tab update.
+- **A single handoff no longer reports the same outcome seven times.** The
+  classify retry loop re-emitted `ui_changed` on every second unknown verdict,
+  up to the retry cap. It was invisible until the daemon began recording
+  provider outcomes; the report is now latched once per drive and released when
+  a genuinely new drive begins.
 - **The inbox "View PDF" control never worked in any shipped version.**
   `requestNative` named `review_preview_result` as the reply it waits for, but
   `onInbound`'s correlation switch enumerated the other five result types and

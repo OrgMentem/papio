@@ -12,7 +12,7 @@ import {
   OPEN_INBOX_MESSAGE,
   openInbox,
   refreshImpactSummary,
-  renderAuthPending,
+  renderNeedsAttention,
   renderDaemonStatus,
   renderImpactSummary,
   renderPageAcquire,
@@ -251,7 +251,7 @@ test("lists an institutional sign-in by paper title and focuses its existing han
     },
   });
 
-  renderAuthPending(doc, [
+  renderNeedsAttention(doc, [
     job({
       status: "auth_pending",
       expected: { title: "A paper awaiting institutional access", doi: "10.1000/example" },
@@ -272,17 +272,47 @@ test("lists an institutional sign-in by paper title and focuses its existing han
 
 test("uses a DOI then job id when an awaiting sign-in has no paper title", () => {
   const doc = popupDocument();
-  renderAuthPending(
+  renderNeedsAttention(
     doc,
     [
       job({ job_id: "job-with-doi", status: "auth_pending", expected: { doi: "10.1000/fallback" } }),
       job({ job_id: "job-without-identity", status: "auth_pending" }),
     ],
+    [],
     async () => {},
   );
 
   const labels = Array.from(doc.querySelectorAll(".needs-you-paper")).map((paper) => paper.textContent);
   expect(labels).toEqual(["10.1000/fallback", "job-without-identity"]);
+});
+
+test("surfaces each blocked provider host once and routes the remedy to Options", async () => {
+  const doc = popupDocument();
+  let openedOptions = 0;
+  renderNeedsAttention(
+    doc,
+    [],
+    ["journals.sagepub.com", "JOURNALS.SAGEPUB.COM", "www.sciencedirect.com"],
+    async () => {},
+    async () => {
+      openedOptions += 1;
+    },
+  );
+
+  const section = doc.getElementById("needs-you-section");
+  expect(section?.hidden).toBe(false);
+  expect(doc.getElementById("needs-you-heading")?.textContent).toBe("Allow provider access");
+  expect(doc.getElementById("needs-you-message")?.textContent).toContain("Grant all sources");
+  expect(Array.from(section?.querySelectorAll(".needs-you-paper") ?? []).map((item) => item.textContent)).toEqual([
+    "journals.sagepub.com",
+    "www.sciencedirect.com",
+  ]);
+  const optionsButton = Array.from(section?.querySelectorAll("button") ?? []).find(
+    (button) => button.textContent === "Open Options",
+  ) as HTMLButtonElement;
+  optionsButton.click();
+  await Promise.resolve();
+  expect(openedOptions).toBe(1);
 });
 
 test("opens the singleton inbox through the broker when it acknowledges", async () => {

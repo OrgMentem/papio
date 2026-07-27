@@ -670,8 +670,9 @@ export class Bridge {
   /** Jobs whose openurl was re-driven once after federated login returned, so a
    * still-walled page doesn't loop. Cleared on job removal. */
   private readonly federatedReDriven = new Set<string>();
-  /** Jobs that already reported a given handoff failure outcome, so one bad
-   * IdP page does not spam the daemon. Cleared on job removal. */
+  /** Jobs that already reported a given terminal handoff or provider outcome,
+   * so retries of one drive do not spam the daemon. Cleared for a fresh drive
+   * and on job removal. */
   private readonly handoffOutcomeSent = new Set<string>();
   /** Jobs whose work window was already raised for a detected IdP failure this
    * worker lifetime, so a bounded re-drive loop cannot yank focus repeatedly.
@@ -709,6 +710,9 @@ export class Bridge {
    * check to an ordinary render race must start cleanly, or a cleared challenge
    * could manufacture a stale-adapter result. */
   private readonly classifyRetries = new Map<string, ClassifyRetry>();
+  /** Effective provider access is stable between permission changes, so retries
+   * and repeated tab updates do not repeatedly ask Chrome about the same host. */
+  private readonly providerAccessByHost = new Map<string, boolean>();
   /** Once the bounded wait has told the daemon to retry later, further complete
    * events from that same interstitial must not restart the expired budget. */
   private readonly botChallengeReported = new Set<string>();
@@ -746,6 +750,94 @@ export class Bridge {
     return this.store.activeJobs.filter(
       (job) => job.status === "auth_pending" || (job.status === "queued" && job.requires_auth === true),
     ).length;
+  }
+
+  private currentBlockedProviderHosts(): string[] {
+    return [...new Set(this.store.blockedProviderHosts ?? [])];
+  }
+
+  /** A new broker tab is a new provider attempt, so terminal classification
+   * observations from its predecessor must not suppress this drive. */
+  private beginProviderDrive(jobID: string): void {
+    this.classifyRetries.delete(jobID);
+    this.botChallengeReported.delete(jobID);
+    this.handoffOutcomeSent.delete(`${jobID}:ui_changed`);
+  }
+
+  /** Chrome answers this origin query from effective access: an all-sites grant
+   * is sufficient to read a provider page even when no host-specific grant exists. */
+  private async hasEffectiveProviderAccess(host: string): Promise<boolean | undefined> {
+    const cached = this.providerAccessByHost.get(host);
+    if (cached !== undefined) return cached;
+    try {
+      const allowed = await this.deps.permissions.contains({ origins: [`https://${host}/*`] });
+      this.providerAccessByHost.set(host, allowed);
+      return allowed;
+    } catch (error) {
+      // A failed permission query is not proof of a missing grant, so keep the
+      // handoff assisted instead of claiming a diagnosis we cannot establish.
+      console.error("papio: provider access check failed; staying assisted", error);
+      return undefined;
+    }
+  }
+
+  /** Remember the standing host-level blocker separately from the per-job
+   * daemon transition, so repeated pages do not create duplicate attention. */
+  private async reportBlockedProviderHost(jobID: string, host: string): Promise<void> {
+    if (!this.currentBlockedProviderHosts().includes(host)) {
+      await this.update((store) => ({
+        ...store,
+        blockedProviderHosts: [...new Set([...(store.blockedProviderHosts ?? []), host])],
+      }));
+      await this.syncConnectionBadge();
+    }
+
+    const job = findByJob(this.store, jobID);
+    const outcomeKey = `${jobID}:ui_changed`;
+    if (job === undefined || this.handoffOutcomeSent.has(outcomeKey)) return;
+    this.handoffOutcomeSent.add(outcomeKey);
+    // The protocol has no browser-permission outcome. `ui_changed` is the
+    // existing terminal provider path that preserves manual recovery; this
+    // explicit detail prevents it from diagnosing an adapter that never ran.
+    if (
+      !this.send(
+        "provider_outcome",
+        {
+          outcome: "ui_changed",
+          detail: `Papio cannot read ${host}: browser access for this provider is not enabled. Open Papio Options and grant this source, or use Grant all sources.`,
+        },
+        jobID,
+      )
+    ) {
+      this.handoffOutcomeSent.delete(outcomeKey);
+      return;
+    }
+    await this.update((store) => patchJob(store, jobID, { blocked_provider_host: host }));
+  }
+
+  private async clearBlockedProviderHost(host: string): Promise<boolean> {
+    const hasMarker = this.store.activeJobs.some((job) => job.blocked_provider_host === host);
+    if (!hasMarker && !this.currentBlockedProviderHosts().includes(host)) return false;
+    await this.update((store) => ({
+      ...store,
+      activeJobs: store.activeJobs.map((job) => {
+        if (job.blocked_provider_host !== host) return job;
+        const { blocked_provider_host: _blockedProviderHost, ...unblocked } = job;
+        return unblocked;
+      }),
+      blockedProviderHosts: (store.blockedProviderHosts ?? []).filter((blockedHost) => blockedHost !== host),
+    }));
+    return true;
+  }
+
+  /** Permission changes invalidate the cache before repainting the durable
+   * host-level signal, so an Options-page grant clears it without a page reload. */
+  async onPermissionsChanged(): Promise<void> {
+    this.providerAccessByHost.clear();
+    for (const host of this.currentBlockedProviderHosts()) {
+      if ((await this.hasEffectiveProviderAccess(host)) === true) await this.clearBlockedProviderHost(host);
+    }
+    await this.syncConnectionBadge();
   }
 
   /** Resolve where handoffs open. A tri-state setting (if present) wins; else
@@ -1030,9 +1122,10 @@ export class Bridge {
   }
 
   /** Keep the persistent daemon-health state visible without interrupting the
-   * user. A badge failure is non-fatal: native bridging must keep recovering. */
-  /** Badge precedence is semantic, not color-only: disconnected, sign-in
-   * blockers, permission blockers, then the last daemon-reported pending triage count. */
+   * user. A badge failure is non-fatal: native bridging must keep recovering.
+   * Precedence is disconnected, sign-in, a live provider-access block, resolver
+   * setup, then triage: a blocked handoff outranks background work, but a dead
+   * daemon or a sign-in the user can complete remains more immediate. */
   async syncConnectionBadge(status = this.store.connectionStatus): Promise<void> {
     try {
       if (status !== "connected") {
@@ -1047,13 +1140,16 @@ export class Bridge {
       // unproven SAML exchange. Count it here so disabled keepalive cannot hide
       // the only sign-in signal while that preflight waits.
       const signInBlockersBeforePermissions = this.signInBlockerCount();
-      let ungranted = 0;
-      if (signInBlockersBeforePermissions === 0) {
+      const blockedProviderHosts = this.currentBlockedProviderHosts();
+      let ungrantedResolverOrigins = 0;
+      if (signInBlockersBeforePermissions === 0 && blockedProviderHosts.length === 0) {
         for (const origin of this.store.resolverOrigins ?? []) {
           try {
-            if (!(await this.deps.permissions.contains({ origins: [`${origin}/*`] }))) ungranted += 1;
+            if (!(await this.deps.permissions.contains({ origins: [`${origin}/*`] }))) {
+              ungrantedResolverOrigins += 1;
+            }
           } catch {
-            ungranted += 1;
+            ungrantedResolverOrigins += 1;
           }
         }
       }
@@ -1072,12 +1168,22 @@ export class Bridge {
         ]);
         return;
       }
-      if (ungranted > 0) {
+      if (blockedProviderHosts.length > 0) {
+        const hostLabel =
+          blockedProviderHosts.length === 1 ? blockedProviderHosts[0] : `${blockedProviderHosts.length} provider hosts`;
         await Promise.all([
-          this.deps.action.setBadgeText({ text: String(ungranted) }),
+          this.deps.action.setBadgeText({ text: String(blockedProviderHosts.length) }),
+          this.deps.action.setBadgeBackgroundColor({ color: "#b06000" }),
+          this.deps.action.setTitle?.({ title: `Papio: ${hostLabel} need${blockedProviderHosts.length === 1 ? "s" : ""} browser access` }),
+        ]);
+        return;
+      }
+      if (ungrantedResolverOrigins > 0) {
+        await Promise.all([
+          this.deps.action.setBadgeText({ text: String(ungrantedResolverOrigins) }),
           this.deps.action.setBadgeBackgroundColor({ color: "#1a73e8" }),
           this.deps.action.setTitle?.({
-            title: `Papio: ${ungranted} provider permission${ungranted === 1 ? "" : "s"} need attention`,
+            title: `Papio: ${ungrantedResolverOrigins} library resolver permission${ungrantedResolverOrigins === 1 ? "" : "s"} need attention`,
           }),
         ]);
         return;
@@ -1177,8 +1283,14 @@ export class Bridge {
         await this.removeJobWithOffer(job.job_id);
         continue;
       }
+      this.beginProviderDrive(job.job_id);
       await this.update((s) =>
-        patchJob(s, job.job_id, { tab_id: -1, status: "queued", download_initiated: false }),
+        patchJob(s, job.job_id, {
+          tab_id: -1,
+          status: "queued",
+          download_initiated: false,
+          unknown_count: 0,
+        }),
       );
       this.scheduleQueuedHandoffRelease(job.job_id);
     }
@@ -1881,6 +1993,7 @@ export class Bridge {
     this.federatedReDriven.delete(jobID);
     this.handoffOutcomeSent.delete(`${jobID}:stale_sso`);
     this.handoffOutcomeSent.delete(`${jobID}:auth_error`);
+    this.handoffOutcomeSent.delete(`${jobID}:ui_changed`);
     this.authFailureSurfaced.delete(jobID);
     this.staleRecoveryEpochs.delete(jobID);
     this.staleRecoveryAttemptedEpochs.delete(jobID);
@@ -2166,11 +2279,13 @@ export class Bridge {
           await this.removeJobWithOffer(queued.job_id);
           continue;
         }
+        this.beginProviderDrive(queued.job_id);
         await this.update((s) =>
           patchJob(s, queued.job_id, {
             tab_id: tabID,
             status: "accepted",
             download_initiated: false,
+            unknown_count: 0,
           }),
         );
         if (forceSurface) await this.surfaceWorkTab(tabID);
@@ -2480,6 +2595,7 @@ export class Bridge {
       this.send("job_reject", {}, jobID);
       return;
     }
+    this.beginProviderDrive(jobID);
     await this.upsertJobWithOffer(makeJob(tabID), openurl);
     this.send("job_accept", {}, jobID);
   }
@@ -2572,8 +2688,14 @@ export class Bridge {
       await this.removeJobWithOffer(jobID);
       return;
     }
+    this.beginProviderDrive(jobID);
     await this.update((s) =>
-      patchJob(s, jobID, { tab_id: tabID, status: "accepted", download_initiated: false }),
+      patchJob(s, jobID, {
+        tab_id: tabID,
+        status: "accepted",
+        download_initiated: false,
+        unknown_count: 0,
+      }),
     );
   }
 
@@ -3002,10 +3124,10 @@ export class Bridge {
 
   /**
    * Classify the tracked tab's current provider page with the single injected
-   * `interpret` function, then act on the verdict. No-ops (staying assisted)
-   * when there is no registered adapter for the host or the host is not granted
-   * via optional_host_permissions. Adapter execution never touches a tab we do
-   * not own for this job.
+   * `interpret` function, then act on the verdict. A registered provider is
+   * diagnosed before injection when the browser cannot effectively read it;
+   * all-sites access is effective access. Adapter execution never touches a tab
+   * we do not own for this job.
    */
   private async maybeClassify(jobID: string, host: string): Promise<void> {
     const job = findByJob(this.store, jobID);
@@ -3017,15 +3139,16 @@ export class Bridge {
       return; // no declarative adapter for this verified host
     }
     await this.restoreWorkWindowForAdapter(spec);
-    let granted = false;
-    try {
-      granted = await this.deps.permissions.contains({ origins: [`https://${host}/*`] });
-    } catch {
-      granted = false;
+    const access = await this.hasEffectiveProviderAccess(host);
+    if (access !== true) {
+      if (access === false) await this.reportBlockedProviderHost(jobID, host);
+      return;
     }
-    if (!granted) return; // host not granted -> stay assisted
+    if (await this.clearBlockedProviderHost(host)) await this.syncConnectionBadge();
+    const currentJob = findByJob(this.store, jobID);
+    if (!currentJob || (currentJob.status !== "accepted" && currentJob.status !== "awaiting_download")) return;
 
-    const ctx: AdapterContext = { expected: { ...(job.expected ?? {}) } };
+    const ctx: AdapterContext = { expected: { ...(currentJob.expected ?? {}) } };
     let verdict: PageVerdict | undefined;
     try {
       const results = await this.deps.scripting.executeScript({
@@ -3232,8 +3355,15 @@ export class Bridge {
     const count = job.unknown_count ?? 0;
     const last = job.last_unknown_ms ?? 0;
     if (count >= 1 && now - last >= 5000) {
-      // Second unknown, at least 5s after the first: the UI has changed.
-      this.send("provider_outcome", { outcome: "ui_changed", adapter_version: adapterVersion }, job.job_id);
+      // Retries wait for one document to render; they are not independent
+      // provider failures, so one broker drive gets one terminal observation.
+      const outcomeKey = `${job.job_id}:ui_changed`;
+      if (!this.handoffOutcomeSent.has(outcomeKey)) {
+        this.handoffOutcomeSent.add(outcomeKey);
+        if (!this.send("provider_outcome", { outcome: "ui_changed", adapter_version: adapterVersion }, job.job_id)) {
+          this.handoffOutcomeSent.delete(outcomeKey);
+        }
+      }
       await this.update((s) => patchJob(s, job.job_id, { unknown_count: 0 }));
     } else if (count === 0) {
       await this.update((s) => patchJob(s, job.job_id, { unknown_count: 1, last_unknown_ms: now }));
@@ -4063,13 +4193,13 @@ if (typeof chrome !== "undefined" && chrome.runtime?.id) {
     }
     return false;
   });
-  // A grant/revoke from the popup or options page changes what papio can steer;
-  // reflect it in the toolbar badge without waiting for the next hello_ack.
+  // A grant/revoke changes both resolver setup and whether a recorded provider
+  // blocker remains effective; clear the cached answer before repainting.
   chrome.permissions?.onAdded?.addListener(() => {
-    void bridge.syncConnectionBadge();
+    void bridge.onPermissionsChanged();
   });
   chrome.permissions?.onRemoved?.addListener(() => {
-    void bridge.syncConnectionBadge();
+    void bridge.onPermissionsChanged();
   });
   // KEEPALIVE INTEGRATION
   void bridge.start().then(() =>

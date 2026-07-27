@@ -268,19 +268,46 @@ function handoffPaperLabel(job: ActiveJob): string {
   return doi || job.job_id;
 }
 
-/** Render every handoff that needs a human institutional sign-in. This durable
- * list identifies an otherwise ambiguous SSO tab after a one-shot focus was missed. */
-export function renderAuthPending(
+/** Render the durable browser actions that cannot safely be completed from the
+ * service worker: institutional sign-in and granting provider access in Options. */
+export function renderNeedsAttention(
   doc: Document,
   jobs: ActiveJob[],
+  blockedProviderHosts: readonly string[] = [],
   onFocus: (jobID: string) => Promise<void> = openHandoff,
+  onOpenOptions: () => Promise<void> = openOptions,
 ): void {
   const section = doc.getElementById("needs-you-section");
+  const heading = doc.getElementById("needs-you-heading");
+  const message = doc.getElementById("needs-you-message");
   const list = doc.getElementById("needs-you-list");
-  if (!(section instanceof HTMLElement) || !(list instanceof HTMLElement)) return;
+  if (
+    !(section instanceof HTMLElement) ||
+    !(heading instanceof HTMLElement) ||
+    !(message instanceof HTMLElement) ||
+    !(list instanceof HTMLElement)
+  ) {
+    return;
+  }
   const pending = jobs.filter((job) => job.status === "auth_pending");
-  section.hidden = pending.length === 0;
+  const blocked = [
+    ...new Set(blockedProviderHosts.map((host) => host.trim().toLowerCase()).filter((host) => host.length > 0)),
+  ];
+  section.hidden = pending.length === 0 && blocked.length === 0;
   list.replaceChildren();
+  if (section.hidden) return;
+
+  if (pending.length > 0 && blocked.length > 0) {
+    heading.textContent = "Needs your attention";
+    message.textContent = "Finish your institutional sign-in and allow browser access for the listed provider pages.";
+  } else if (pending.length > 0) {
+    heading.textContent = "Sign in to continue";
+    message.textContent = "Finish your institutional sign-in to continue these papers.";
+  } else {
+    heading.textContent = "Allow provider access";
+    message.textContent = "Papio cannot read the listed provider pages. Open Options and enable a source, or use Grant all sources.";
+  }
+
   for (const job of pending) {
     const row = doc.createElement("div");
     row.className = "needs-you-item";
@@ -305,6 +332,27 @@ export function renderAuthPending(
       );
     });
     row.append(paper, button);
+    list.append(row);
+  }
+
+  for (const host of blocked) {
+    const row = doc.createElement("div");
+    row.className = "needs-you-item";
+    const provider = doc.createElement("p");
+    provider.className = "needs-you-paper";
+    provider.textContent = host;
+    const button = doc.createElement("button");
+    button.type = "button";
+    button.textContent = "Open Options";
+    button.addEventListener("click", () => {
+      button.disabled = true;
+      button.textContent = "Opening…";
+      void onOpenOptions().catch(() => {
+        button.disabled = false;
+        button.textContent = "Try again";
+      });
+    });
+    row.append(provider, button);
     list.append(row);
   }
 }
@@ -523,7 +571,7 @@ export async function refresh(): Promise<void> {
   } catch {
     renderPageContext(document, undefined, store.activeJobs);
   }
-  renderAuthPending(document, store.activeJobs);
+  renderNeedsAttention(document, store.activeJobs, store.blockedProviderHosts);
   let consent: "accept" | "manual" | undefined;
   try {
     const got = await chrome.storage.local.get(TERMS_CONSENT_KEY);
@@ -609,14 +657,19 @@ export function wireCapture(doc: Document = document): void {
   });
 }
 
+export async function openOptions(): Promise<void> {
+  const opened = chrome.runtime.openOptionsPage();
+  window.close();
+  await opened;
+}
+
 export function wireSettings(doc: Document = document): void {
   const button = doc.getElementById("settings-btn");
   if (!(button instanceof HTMLButtonElement)) {
     return;
   }
   button.addEventListener("click", () => {
-    void chrome.runtime.openOptionsPage();
-    window.close();
+    void openOptions();
   });
 }
 

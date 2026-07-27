@@ -164,6 +164,12 @@
         font-size: 12px;
       }
 
+      .permission-message {
+        border-bottom: 1px solid var(--color-border);
+        margin: 0;
+        padding: 8px 16px;
+      }
+
       button {
         font: inherit;
       }
@@ -423,17 +429,30 @@
     </section>
 
     <section>
+      <h2>All-sites access</h2>
+      <p class="lede">
+        This is the broadest permission: it lets <em>papio</em> reach any HTTPS site, including unlisted
+        providers. It covers every provider below; turn it off to manage sources individually.
+      </p>
+      <div class="card">
+        <ul id="all-sites-access" class="rows"></ul>
+      </div>
+    </section>
+
+    <section>
       <h2>Provider access</h2>
       <p class="lede">
         Grant access per source. Access is only used to complete one explicitly requested download after
         you have signed in yourself. Login, MFA, and CAPTCHAs always stay with you. Revoking returns the
-        source to assisted behaviour immediately.
+        source to assisted behaviour immediately. Revoke all provider access also removes all-sites access
+        when it is enabled.
       </p>
       <div class="card">
         <div class="card-toolbar" id="provider-bulk">
           <button id="grant-all" class="btn" type="button">Grant all providers</button>
-          <button id="revoke-all" class="btn" type="button">Revoke all</button>
+          <button id="revoke-all" class="btn" type="button">Revoke all provider access</button>
         </div>
+        <p id="provider-permission-message" class="permission-message hint" role="status" hidden></p>
         <ul id="sources" class="rows"></ul>
       </div>
     </section>

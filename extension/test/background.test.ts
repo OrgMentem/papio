@@ -1150,6 +1150,118 @@ test("a registered adapter host classifies even when absent from the offer's pro
   expect(injections.some((i) => i.func === interpret && i.target.tabId === tabID)).toBe(true);
 });
 
+test("all-sites browser access counts as effective provider access", async () => {
+  const h = makeHarness();
+  h.deps.adapterSpecs.push(PROVIDER_ADAPTER);
+  const permissionQueries: string[][] = [];
+  const injections: Parameters<BridgeDeps["scripting"]["executeScript"]>[0][] = [];
+  h.deps.permissions.contains = async ({ origins }) => {
+    permissionQueries.push(origins);
+    // Chrome answers true for this exact-origin query when the user granted
+    // optional https://*/* access; no host-specific grant is required to read it.
+    return true;
+  };
+  h.deps.scripting.executeScript = async (injection) => {
+    injections.push(injection);
+    if (injection.func === interpret) return [{ result: { kind: "unknown" } }];
+    if (injection.func === isBotChallenge) return [{ result: false }];
+    return [];
+  };
+
+  await h.bridge.start();
+  await h.port.inbound(jobOffer("job_all_sites_provider_access"));
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  const articleURL = `https://${PROVIDER_HOST}/stable/article`;
+  await h.tabs.onUpdated.emit(
+    tabID,
+    { url: articleURL, status: "complete" },
+    { id: tabID, url: articleURL },
+  );
+
+  expect(permissionQueries).toEqual([[`https://${PROVIDER_HOST}/*`]]);
+  expect(injections.some((injection) => injection.func === interpret)).toBe(true);
+  expect(h.backend.store.blockedProviderHosts).toBeUndefined();
+});
+
+test("missing provider access reports the exact host instead of a bare adapter failure", async () => {
+  const h = makeHarness();
+  h.deps.adapterSpecs.push(PROVIDER_ADAPTER);
+  const injections: Parameters<BridgeDeps["scripting"]["executeScript"]>[0][] = [];
+  h.deps.permissions.contains = async () => false;
+  h.deps.scripting.executeScript = async (injection) => {
+    injections.push(injection);
+    return [];
+  };
+
+  await h.bridge.start();
+  await h.port.inbound(helloAck());
+  await h.port.inbound(jobOffer("job_missing_provider_access"));
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  const articleURL = `https://${PROVIDER_HOST}/stable/article`;
+  await h.tabs.onUpdated.emit(
+    tabID,
+    { url: articleURL, status: "complete" },
+    { id: tabID, url: articleURL },
+  );
+
+  const outcomes = h.frames().filter((frame) => frame.type === "provider_outcome");
+  expect(outcomes).toHaveLength(1);
+  expect(outcomes[0]?.payload["outcome"]).toBe("ui_changed");
+  expect(outcomes[0]?.payload["detail"]).toContain(PROVIDER_HOST);
+  expect(outcomes[0]?.payload["detail"]).toContain("Open Papio Options");
+  expect(outcomes[0]?.payload["adapter_version"]).toBeUndefined();
+  expect(injections).toEqual([]);
+  expect(h.backend.store.blockedProviderHosts).toEqual([PROVIDER_HOST]);
+  expect(h.action.backgroundColors.at(-1)).toBe("#b06000");
+  expect(h.action.titles.at(-1)).toContain(PROVIDER_HOST);
+});
+
+test("one blocked provider host stays a single indication across repeated updates", async () => {
+  const h = makeHarness();
+  h.deps.adapterSpecs.push(PROVIDER_ADAPTER);
+  let permissionChecks = 0;
+  h.deps.permissions.contains = async () => {
+    permissionChecks += 1;
+    return false;
+  };
+
+  await h.bridge.start();
+  await h.port.inbound(helloAck());
+  await h.port.inbound(jobOffer("job_deduplicated_provider_access"));
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  const articleURL = `https://${PROVIDER_HOST}/stable/article`;
+  for (let update = 0; update < 3; update += 1) {
+    await h.tabs.onUpdated.emit(
+      tabID,
+      { url: articleURL, status: "complete" },
+      { id: tabID, url: articleURL },
+    );
+  }
+
+  expect(permissionChecks).toBe(1);
+  expect(h.frames().filter((frame) => frame.type === "provider_outcome")).toHaveLength(1);
+  expect(h.backend.store.blockedProviderHosts).toEqual([PROVIDER_HOST]);
+  expect(h.action.titles.filter((title) => title.includes(PROVIDER_HOST))).toHaveLength(1);
+});
+
+test("a stored provider blocker remains visible until effective access changes", async () => {
+  const h = makeHarness({
+    ...emptyStore(),
+    connectionStatus: "connected",
+    blockedProviderHosts: [PROVIDER_HOST],
+  });
+  let granted = false;
+  h.deps.permissions.contains = async () => granted;
+
+  await h.bridge.start();
+  expect(h.action.titles.at(-1)).toContain(PROVIDER_HOST);
+
+  granted = true;
+  await h.bridge.onPermissionsChanged();
+  expect(h.backend.store.blockedProviderHosts).toEqual([]);
+  expect(h.action.titles.at(-1)).toBe("Papio: connected");
+});
+
 test("Cloudflare challenge detection survives the observed marker sanitization", () => {
   // SAGE, ACM, and the newer ScienceDirect captures share these widget markers;
   // their script bodies are intentionally absent from committed fixtures.
@@ -1216,6 +1328,49 @@ test("a cleared Cloudflare challenge returns to the ordinary stale-adapter path"
     outcome: "ui_changed",
     adapter_version: PROVIDER_ADAPTER.version,
   });
+});
+
+test("unknown retries report ui_changed once per drive and again for a re-offered tab", async () => {
+  const jobID = "job_unknown_outcome_drive";
+  const h = makeHarness();
+  useUnknownProviderClassifier(h, () => false);
+  const firstTabID = await classifyProviderUnknown(h, jobID);
+
+  // The bounded retries revisit one document while it renders. Before the
+  // latch, every second retry pair emitted another identical terminal outcome.
+  for (let retry = 0; retry < 8; retry += 1) {
+    const timer = h.timers.at(-1);
+    expect(timer).toBeDefined();
+    h.clock.now += 2_500;
+    await timer!.fn();
+  }
+  expect(
+    h.frames().filter((frame) => frame.type === "provider_outcome" && frame.payload["outcome"] === "ui_changed"),
+  ).toHaveLength(1);
+
+  // A re-offer whose previous tab is gone creates a genuinely new provider
+  // drive, which may legitimately produce its own terminal observation.
+  h.tabs.live.delete(firstTabID);
+  await h.port.inbound(jobOffer(jobID));
+  const secondTabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  expect(secondTabID).not.toBe(firstTabID);
+  const articleURL = `https://${PROVIDER_HOST}/stable/challenge`;
+  h.tabs.live.set(secondTabID, { id: secondTabID, url: articleURL });
+  await h.tabs.onUpdated.emit(
+    secondTabID,
+    { url: articleURL, status: "complete" },
+    { id: secondTabID, url: articleURL },
+  );
+  for (let retry = 0; retry < 2; retry += 1) {
+    const timer = h.timers.at(-1);
+    expect(timer).toBeDefined();
+    h.clock.now += 2_500;
+    await timer!.fn();
+  }
+
+  expect(
+    h.frames().filter((frame) => frame.type === "provider_outcome" && frame.payload["outcome"] === "ui_changed"),
+  ).toHaveLength(2);
 });
 
 test("a bot check that never clears reaches a bounded anti-bot retry", async () => {

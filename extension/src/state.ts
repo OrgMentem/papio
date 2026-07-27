@@ -67,6 +67,10 @@ export interface ActiveJob {
    * not yet recorded a consent choice, so the popup can surface the one-time
    * informed-consent prompt. Cleared once consent is decided. */
   needs_terms_consent?: boolean;
+  /** Exact provider host where a tracked handoff could not be read because the
+   * browser lacks effective host access. It contains no path, query, or IdP
+   * data and lets the report debounce survive an MV3 worker restart. */
+  blocked_provider_host?: string;
 }
 
 export interface StoreShape {
@@ -104,6 +108,10 @@ export interface StoreShape {
    * steer that resolver's menu. Not sensitive: these are the user's own library
    * discovery hosts, the same origins already carried in every job offer. */
   resolverOrigins?: string[];
+  /** Exact provider hosts currently blocking a tracked handoff because the
+   * browser lacks effective access. Kept after a job finishes so the popup and
+   * badge describe the standing condition until access changes. */
+  blockedProviderHosts?: string[];
 }
 
 /** Async key/value seam. The real implementation wraps chrome.storage; tests

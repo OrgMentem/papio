@@ -13,6 +13,14 @@ export interface Source {
   origin: string;
 }
 
+export const ALL_SITES_ORIGIN = "https://*/*";
+const ALL_SITES_SOURCE: Source = {
+  label: "All sites (covers every site)",
+  origin: ALL_SITES_ORIGIN,
+};
+const ALL_SITES_SOURCES: readonly Source[] = [ALL_SITES_SOURCE];
+const ALL_SITES_PATTERNS: readonly string[] = [ALL_SITES_ORIGIN];
+
 const ADAPTER_LABELS: Readonly<Record<string, string>> = {
   acm: "ACM Digital Library",
   annualreviews: "Annual Reviews",
@@ -68,7 +76,16 @@ const LIBRARY_RESOLVERS: Source[] = [
   { label: "Ex Libris Primo", origin: "https://*.primo.exlibrisgroup.com/*" },
 ];
 
-function render(list: HTMLUListElement, sources: Source[]): void {
+type PermissionSnapshot = {
+  origins: readonly string[];
+  allSitesGranted: boolean;
+};
+
+function render(
+  list: HTMLUListElement,
+  sources: readonly Source[],
+  permissionSnapshot: PermissionSnapshot,
+): void {
   list.replaceChildren();
   for (const source of sources) {
     const item = document.createElement("li");
@@ -82,63 +99,71 @@ function render(list: HTMLUListElement, sources: Source[]): void {
     host.textContent = source.origin;
     meta.append(label, host);
 
-    // A switch button: aria-checked drives the CSS visuals, no status text.
+    const specificallyGranted = permissionSnapshot.origins.includes(source.origin);
+    const coveredByAllSites =
+      source.origin !== ALL_SITES_ORIGIN &&
+      !specificallyGranted &&
+      coveredByAllSitesGrant(source.origin, permissionSnapshot.allSitesGranted);
+    if (coveredByAllSites) {
+      const coverage = document.createElement("div");
+      coverage.className = "hint";
+      coverage.textContent = "Covered by all-sites access. Turn it off above to control this provider separately.";
+      meta.append(coverage);
+      item.append(meta);
+      list.append(item);
+      continue;
+    }
+
     const toggle = document.createElement("button");
     toggle.type = "button";
     toggle.className = "switch";
     toggle.setAttribute("role", "switch");
-    toggle.setAttribute("aria-checked", "false");
+    toggle.setAttribute("aria-checked", specificallyGranted ? "true" : "false");
     toggle.setAttribute("aria-label", `Access to ${source.label} (${source.origin})`);
-    toggle.disabled = true;
-
-    item.append(meta, toggle);
-    list.append(item);
-
-    let granted = false;
-    const paint = (next: boolean): void => {
-      granted = next;
-      toggle.setAttribute("aria-checked", granted ? "true" : "false");
-      toggle.disabled = false;
-    };
-
-    void chrome.permissions.contains({ origins: [source.origin] }).then(paint);
 
     toggle.addEventListener("click", () => {
       // permissions.request must be invoked directly in the trusted click
-      // callback. Awaiting contains() first loses Chrome's user gesture.
-      const wasGranted = granted;
+      // callback. Awaiting a state read first loses Chrome's user gesture.
       toggle.disabled = true;
-      const change = wasGranted
+      const change = specificallyGranted
         ? chrome.permissions.remove({ origins: [source.origin] })
         : chrome.permissions.request({ origins: [source.origin] });
-      void change.then(
-        (ok) => paint(ok ? !wasGranted : wasGranted),
-        () => paint(wasGranted),
-      );
+      const refresh = (): void => {
+        void renderPermissionLists().then(() => {
+          if (toggle.isConnected) toggle.disabled = false;
+        });
+      };
+      void change.then(refresh, refresh);
     });
+
+    item.append(meta, toggle);
+    list.append(item);
   }
 }
 
-// Bulk grant/revoke for every provider source. permissions.request accepts all
-// origins in one call, so a single click yields one Firefox doorhanger listing
-// them all — the gesture must reach request() with no await before it.
-function wireProviderBulk(list: HTMLUListElement, sources: Source[]): void {
+// Bulk grants keep Firefox's one-click prompt. Revocation includes the broad
+// optional origin so its label remains true when that grant is active.
+function wireProviderBulk(sources: readonly Source[]): void {
   const origins = sources.map((source) => source.origin);
+  const revokeOrigins = [...origins, ALL_SITES_ORIGIN];
   const grantAll = document.getElementById("grant-all");
   const revokeAll = document.getElementById("revoke-all");
   if (grantAll instanceof HTMLButtonElement) {
     grantAll.addEventListener("click", () => {
-      void chrome.permissions.request({ origins }).then(
-        () => render(list, sources),
-        () => {},
+      // permissions.request must reach Chrome before any await.
+      const change = chrome.permissions.request({ origins });
+      void change.then(
+        () => void renderPermissionLists(),
+        () => void renderPermissionLists(),
       );
     });
   }
   if (revokeAll instanceof HTMLButtonElement) {
     revokeAll.addEventListener("click", () => {
-      void chrome.permissions.remove({ origins }).then(
-        () => render(list, sources),
-        () => {},
+      const change = chrome.permissions.remove({ origins: revokeOrigins });
+      void change.then(
+        () => void renderPermissionLists(true),
+        () => void renderPermissionLists(true),
       );
     });
   }
@@ -268,27 +293,44 @@ async function renderDaemonFooter(): Promise<void> {
   }
 }
 
-// Match an origin against the static host_permissions wildcards so the
-// configured-resolver section lists only custom domains that still need a grant;
-// cloud Ex Libris resolvers are already covered by those wildcards.
-function coveredByManifest(origin: string): boolean {
+// Keep static and dynamic wildcard coverage on identical match semantics so
+// the options page cannot disagree about whether an origin is already usable.
+function coveredByPatterns(origin: string, patterns: readonly string[]): boolean {
   let host: string;
   try {
     host = new URL(origin).host;
   } catch {
     return false;
   }
-  return (chrome.runtime.getManifest().host_permissions ?? []).some((pattern: string) => {
+  return patterns.some((pattern) => {
+    if (pattern === ALL_SITES_ORIGIN) return true;
     const m = /^https:\/\/(\*\.)?([^/*]+)\/\*$/.exec(pattern);
     if (!m) return false;
     return m[1] ? host === m[2] || host.endsWith(`.${m[2]}`) : host === m[2];
   });
 }
 
+function coveredByManifest(origin: string): boolean {
+  const patterns = chrome.runtime.getManifest().host_permissions ?? [];
+  return coveredByPatterns(origin, patterns);
+}
+
+function coveredByAllSitesGrant(origin: string, allSitesGranted: boolean): boolean {
+  if (!allSitesGranted) return false;
+  return coveredByPatterns(origin, ALL_SITES_PATTERNS);
+}
+
+function setProviderPermissionNotice(message: string | null): void {
+  const notice = document.getElementById("provider-permission-message");
+  if (!(notice instanceof HTMLElement)) return;
+  notice.hidden = message === null;
+  notice.textContent = message ?? "";
+}
+
 // Render the user's configured resolver origins (from the daemon, via hello_ack)
 // that aren't already covered by a static wildcard. Each is grantable exactly
 // like a provider source, so institution identity stays in config, not code.
-async function renderConfiguredResolvers(): Promise<void> {
+async function renderConfiguredResolvers(permissionSnapshot: PermissionSnapshot): Promise<void> {
   const list = document.getElementById("configured-resolvers");
   if (!(list instanceof HTMLUListElement)) return;
   const store: StoreShape = await chromeBackend(chrome.storage).load();
@@ -298,19 +340,53 @@ async function renderConfiguredResolvers(): Promise<void> {
   render(
     list,
     custom.map((origin) => ({ label: origin.replace(/^https:\/\//, ""), origin: `${origin}/*` })),
+    permissionSnapshot,
   );
 }
 
+const allSitesList = document.getElementById("all-sites-access");
 const sourceList = document.getElementById("sources");
-if (sourceList instanceof HTMLUListElement) {
-  render(sourceList, PROVIDER_SOURCES);
-  wireProviderBulk(sourceList, PROVIDER_SOURCES);
-}
 const libraryResolverList = document.getElementById("library-resolvers");
-if (libraryResolverList instanceof HTMLUListElement) {
-  render(libraryResolverList, LIBRARY_RESOLVERS);
+
+async function renderPermissionLists(reportAllSitesStillActive = false): Promise<void> {
+  let origins: readonly string[];
+  try {
+    const permissions = await chrome.permissions.getAll();
+    origins = permissions.origins ?? [];
+  } catch {
+    if (reportAllSitesStillActive) {
+      setProviderPermissionNotice(
+        "Papio could not confirm that all-sites access was revoked. Turn it off with the All-sites access control above.",
+      );
+    }
+    return;
+  }
+
+  const permissionSnapshot: PermissionSnapshot = {
+    origins,
+    allSitesGranted: origins.includes(ALL_SITES_ORIGIN),
+  };
+  if (allSitesList instanceof HTMLUListElement) {
+    render(allSitesList, ALL_SITES_SOURCES, permissionSnapshot);
+  }
+  if (sourceList instanceof HTMLUListElement) {
+    render(sourceList, PROVIDER_SOURCES, permissionSnapshot);
+  }
+  if (libraryResolverList instanceof HTMLUListElement) {
+    render(libraryResolverList, LIBRARY_RESOLVERS, permissionSnapshot);
+  }
+  void renderConfiguredResolvers(permissionSnapshot);
+  setProviderPermissionNotice(
+    reportAllSitesStillActive && permissionSnapshot.allSitesGranted
+      ? "All-sites access is still active. Turn it off with the All-sites access control above to manage providers separately."
+      : null,
+  );
 }
-void renderConfiguredResolvers();
+
+if (sourceList instanceof HTMLUListElement) {
+  wireProviderBulk(PROVIDER_SOURCES);
+}
+void renderPermissionLists();
 wireTermsConsent();
 void renderTermsConsent();
 wireHandoffSurface();
