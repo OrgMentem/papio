@@ -414,6 +414,7 @@ const (
 	MsgDownloadComplete         = "download_complete"
 	MsgProviderOutcome          = "provider_outcome"
 	MsgCancel                   = "cancel"
+	MsgHandoffFocus             = "handoff_focus"
 	MsgAck                      = "ack"
 	MsgError                    = "error"
 	MsgTriageSnapshotRequest    = "triage_snapshot_request"
@@ -435,7 +436,7 @@ var jobScoped = map[string]bool{
 	MsgJobOffer: true, MsgJobAccept: true, MsgJobReject: true, MsgHandoffOutcome: true,
 	MsgAuthPending: true, MsgAuthReturned: true,
 	MsgDownloadStarted: true, MsgDownloadComplete: true,
-	MsgProviderOutcome: true, MsgCancel: true,
+	MsgProviderOutcome: true, MsgCancel: true, MsgHandoffFocus: true,
 }
 
 // HelloPayload announces the extension and its adapter versions.
@@ -535,7 +536,7 @@ type ErrorPayload struct {
 }
 
 // EmptyPayload is used by types that carry no data (ack, job_accept,
-// job_reject, cancel).
+// job_reject, cancel, handoff_focus).
 type EmptyPayload struct{}
 
 // TriageSnapshotRequestPayload requests one immutable inbox page. Schema
@@ -1059,7 +1060,7 @@ func DecodeBrowserMessage(data []byte) (*BrowserMessage, error) {
 			err = p.validate()
 		}
 		msg.Payload = p
-	case MsgAck, MsgJobAccept, MsgJobReject, MsgCancel:
+	case MsgAck, MsgJobAccept, MsgJobReject, MsgCancel, MsgHandoffFocus:
 		p := &EmptyPayload{}
 		err = strictDecode(env.Payload, p)
 		msg.Payload = p

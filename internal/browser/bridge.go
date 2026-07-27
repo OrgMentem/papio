@@ -52,6 +52,11 @@ const (
 	previewCapabilityTTL         = 10 * time.Minute
 )
 
+// HandoffFocusMinExtensionVersion is the first extension that parses
+// handoff_focus. An older extension fails closed on an unknown type and
+// disconnects the whole session, so the frame is withheld below this floor.
+const HandoffFocusMinExtensionVersion = "0.8.0"
+
 // ErrInvalidFrame marks a client-side protocol violation (a frame that fails
 // strict decode, arrives before hello, or is not a legal inbound type). The RPC
 // layer maps it to invalid_argument; other Sync errors are internal.
@@ -88,7 +93,10 @@ type Bridge struct {
 	epoch      uint64
 	offered    map[string]bool // handoff jobs offered to the current holder
 	cancelSent map[string]bool // jobs a daemon-side cancel was already announced for
-	now        func() time.Time
+	// Focus requests survive a holder change so the replacement holder can
+	// receive its offer before it is asked to surface the handoff.
+	focusPending map[string]bool
+	now          func() time.Time
 }
 
 // browserSession is one native-host connection that said hello.
@@ -130,12 +138,13 @@ func NewBridge(jobs *job.Store, svc *app.Service, triageService *triage.Service,
 	}
 	return &Bridge{
 		jobs: jobs, svc: svc, triage: triageService, watchRunner: watchRunner, preview: previewServer, cfg: cfg,
-		Version:    version,
-		Features:   appendFeatures(features, required...),
-		offered:    map[string]bool{},
-		cancelSent: map[string]bool{},
-		pending:    map[string]*browserSession{},
-		now:        time.Now,
+		Version:      version,
+		Features:     appendFeatures(features, required...),
+		offered:      map[string]bool{},
+		cancelSent:   map[string]bool{},
+		focusPending: map[string]bool{},
+		pending:      map[string]*browserSession{},
+		now:          time.Now,
 	}
 }
 
@@ -177,6 +186,50 @@ func (b *Bridge) SessionInfo() (extensionVersion string, adapterCount int, hello
 		return "", 0, false
 	}
 	return b.holder.ExtensionVersion, len(b.holder.AdapterVersions), true
+}
+
+// FocusHandoffs queues compatible holder sessions to surface tracked handoffs.
+// A missing, stale, legacy, or pre-handoff_focus holder is a normal fallback
+// condition: callers must use the OS launcher rather than treating a routine
+// browser absence as a bridge failure.
+func (b *Bridge) FocusHandoffs(ctx context.Context, jobIDs []string) (queued int, sessionLive bool, err error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.holder == nil ||
+		b.holder.ID == legacySessionID ||
+		b.now().Sub(b.holder.LastSyncAt) > sessionStaleAfter ||
+		compareVersion(b.holder.ExtensionVersion, HandoffFocusMinExtensionVersion) < 0 {
+		return 0, false, nil
+	}
+
+	actions, err := b.jobs.ListHumanActions(ctx, true)
+	if err != nil {
+		return 0, true, err
+	}
+	handoff := make(map[string]bool, len(actions))
+	for _, action := range actions {
+		if action.Kind == handoffActionKind {
+			handoff[action.JobID] = true
+		}
+	}
+	for _, jobID := range jobIDs {
+		if jobID == "" || b.focusPending[jobID] || !handoff[jobID] {
+			continue
+		}
+		row, getErr := b.jobs.Get(ctx, jobID)
+		switch {
+		case errors.Is(getErr, sql.ErrNoRows):
+			continue
+		case getErr != nil:
+			return queued, true, getErr
+		case row.State != job.StateAwaitingHuman:
+			continue
+		}
+		b.focusPending[jobID] = true
+		queued++
+	}
+	return queued, true, nil
 }
 
 // SessionSummary is one connected browser session for status/CLI surfaces.
@@ -1177,9 +1230,21 @@ func (b *Bridge) outcome(ctx context.Context, jobID string, p *protocol.Provider
 		return b.leaveHandoff(ctx, jobID, job.StateRetryWait, p.Outcome)
 
 	case "human_auth_required", "terms_acceptance_required":
+		row, err := b.jobs.Get(ctx, jobID)
+		if err != nil {
+			return err
+		}
+		if !row.Work.HasFetchableIdentifier() {
+			// An OA anti-bot offer can still download a title-matched work, but
+			// an auth wall cannot turn a missing identifier into fetchable work.
+			if err := b.resolveHandoff(ctx, jobID, "resolved"); err != nil {
+				return err
+			}
+			return b.leaveHandoff(ctx, jobID, job.StateUnavailable, "no_identifier")
+		}
 		// Still legitimately in progress: keep the job parked and add the
 		// specific human action the extension observed.
-		_, err := b.jobs.OpenHumanAction(ctx, jobID, p.Outcome,
+		_, err = b.jobs.OpenHumanAction(ctx, jobID, p.Outcome,
 			"the provider requires a human step before the download can proceed")
 		return err
 
@@ -1416,8 +1481,8 @@ func (b *Bridge) RunSweeper(ctx context.Context, interval time.Duration) error {
 	}
 }
 
-// poll offers outstanding handoff jobs (once per hello-session) and announces a
-// daemon-side cancel for any offered job the user has since cancelled.
+// poll offers outstanding handoff jobs (once per hello-session), announces
+// daemon-side cancels, and drains focus requests for the current holder.
 func (b *Bridge) poll(ctx context.Context) ([]json.RawMessage, error) {
 	awaiting, err := b.jobs.List(ctx, job.StateAwaitingHuman, 200)
 	if err != nil {
@@ -1498,6 +1563,51 @@ func (b *Bridge) poll(ctx context.Context) ([]json.RawMessage, error) {
 		}
 		out = append(out, frame)
 		b.cancelSent[id] = true
+	}
+	if b.epoch != epoch {
+		return out, nil
+	}
+	if b.holder != nil && b.holder.ID != legacySessionID && compareVersion(b.holder.ExtensionVersion, HandoffFocusMinExtensionVersion) >= 0 {
+		ids := make([]string, 0, len(b.focusPending))
+		for id := range b.focusPending {
+			ids = append(ids, id)
+		}
+		sort.Strings(ids)
+		for _, id := range ids {
+			if _, ok := handoff[id]; !ok {
+				delete(b.focusPending, id)
+				continue
+			}
+			row, getErr := b.jobs.Get(ctx, id)
+			switch {
+			case errors.Is(getErr, sql.ErrNoRows):
+				delete(b.focusPending, id)
+				continue
+			case getErr != nil:
+				return nil, getErr
+			case row.State != job.StateAwaitingHuman:
+				delete(b.focusPending, id)
+				continue
+			}
+			if !b.offered[id] {
+				offer, offerErr := b.offer(*row, handoff[id])
+				if offerErr != nil {
+					return nil, offerErr
+				}
+				if err := b.jobs.S.AppendEvent(ctx, id, "browser.handoff_offered",
+					map[string]any{"requires_auth": handoff[id].RequiresAuth}); err != nil {
+					return nil, err
+				}
+				out = append(out, offer)
+				b.offered[id] = true
+			}
+			frame, frameErr := b.frame(protocol.MsgHandoffFocus, id, protocol.EmptyPayload{})
+			if frameErr != nil {
+				return nil, frameErr
+			}
+			out = append(out, frame)
+			delete(b.focusPending, id)
+		}
 	}
 	return out, nil
 }
@@ -1589,6 +1699,18 @@ func (b *Bridge) fallbackOAHandoff(ctx context.Context, jobID, failure string) (
 		}
 		if _, ok := app.OABrowserHandoffURL(action.Detail); !ok {
 			return false, nil
+		}
+		if !row.Work.HasFetchableIdentifier() {
+			// The OA URL can still be offered directly, but a failed OA fetch
+			// cannot become an institutional request without identity the
+			// resolver can consume.
+			if err := b.resolveHandoff(ctx, jobID, "resolved"); err != nil {
+				return false, err
+			}
+			if err := b.leaveHandoff(ctx, jobID, job.StateUnavailable, "no_identifier"); err != nil {
+				return false, err
+			}
+			return true, nil
 		}
 		if _, err := b.jobs.OpenHumanAction(ctx, jobID, handoffActionKind, app.InstitutionalOpenURLHandoffDetail, job.WithAccessClassification(true, "paywall")); err != nil {
 			return false, err

@@ -1,0 +1,8 @@
+{
+  "protocol": "papio-browser/1",
+  "type": "handoff_focus",
+  "msg_id": "daemon-focus-001",
+  "job_id": "job_focus_001",
+  "seq": 1,
+  "payload": {}
+}

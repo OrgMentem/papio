@@ -946,3 +946,43 @@ func TestResolveReviewAcceptResumesCandidateAndClearsTerminalFields(t *testing.T
 		t.Fatalf("accepted review was not immediately claimable: %+v, %v", claimed, err)
 	}
 }
+
+func TestListOldestRotatesPastPriorMaintenancePage(t *testing.T) {
+	js := testStore(t)
+	ctx := context.Background()
+	const pageSize = 2
+	ids := make([]string, 0, pageSize+1)
+	start := time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC)
+	for i := range pageSize + 1 {
+		id, err := js.CreateRequest(ctx, NewID("wr_list_oldest"), testWork(), "", "", testPolicy(), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := js.S.DB().ExecContext(ctx,
+			`UPDATE jobs SET state = ?, created_at = ? WHERE id = ?`,
+			StateAwaitingHuman, start.Add(time.Duration(i)*time.Second).Format(time.RFC3339Nano), id); err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, id)
+	}
+
+	first, err := js.ListOldest(ctx, []string{StateAwaitingHuman}, pageSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range first {
+		if row.ID == ids[pageSize] {
+			t.Fatalf("first page included later job %q: %+v", ids[pageSize], first)
+		}
+	}
+	second, err := js.ListOldest(ctx, []string{StateAwaitingHuman}, pageSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range second {
+		if row.ID == ids[pageSize] {
+			return
+		}
+	}
+	t.Fatalf("later job %q was not reached after the first page: %+v", ids[pageSize], second)
+}

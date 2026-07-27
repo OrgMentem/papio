@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"papio/internal/artifact"
@@ -160,6 +161,8 @@ type Row struct {
 	UpdatedAt           string    `json:"updated_at"`
 	Work                work.Work `json:"work"`
 	ZotioItemKey        string    `json:"zotio_item_key,omitempty"`
+	LeaseOwner          string    `json:"-"`
+	LeaseExpiresAt      string    `json:"-"`
 }
 
 // Candidate is one ranked acquisition option. URL is never stored; only the
@@ -185,7 +188,17 @@ type Candidate struct {
 }
 
 // Store layers job semantics over the shared SQLite store.
-type Store struct{ S *store.Store }
+type Store struct {
+	S *store.Store
+
+	oldestMu      sync.Mutex
+	oldestCursors map[string]oldestListCursor
+}
+
+type oldestListCursor struct {
+	createdAt string
+	id        string
+}
 
 // NewID returns a 26-hex-char random identifier with a type prefix.
 func NewID(prefix string) string {
@@ -502,6 +515,102 @@ func (js *Store) transition(ctx context.Context, jobID, from, to string, detail 
 	return tx.Commit()
 }
 
+// RepairAwaitingHuman atomically resolves a repair snapshot's open actions and
+// returns an unleased parked job to resolving. The lease predicate must share
+// this transaction: adoption can acquire its awaiting_human lease after
+// maintenance read the page, and closing that handoff would lose the browser
+// download that lease protects.
+func (js *Store) RepairAwaitingHuman(ctx context.Context, jobID string, actionIDs []int64, detail map[string]any) error {
+	expected := make(map[int64]struct{}, len(actionIDs))
+	for _, actionID := range actionIDs {
+		if _, duplicate := expected[actionID]; duplicate {
+			return fmt.Errorf("%w: duplicate human action %d", ErrConflict, actionID)
+		}
+		expected[actionID] = struct{}{}
+	}
+	if detail == nil {
+		detail = map[string]any{}
+	}
+	detail["from"], detail["to"] = StateAwaitingHuman, StateResolving
+	detailJSON, err := json.Marshal(detail)
+	if err != nil {
+		return err
+	}
+	now := store.Now()
+	tx, err := js.S.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	res, err := tx.ExecContext(ctx, `
+		UPDATE jobs SET state = ?, updated_at = ?, retry_at = NULL,
+		        lease_owner = NULL, lease_expires_at = NULL
+		 WHERE id = ? AND state = ?
+		   AND (lease_owner IS NULL OR lease_expires_at < ?)`,
+		StateResolving, now, jobID, StateAwaitingHuman, now)
+	if err != nil {
+		return err
+	}
+	if changed, _ := res.RowsAffected(); changed != 1 {
+		return fmt.Errorf("%w: job %s is not an unleased awaiting_human job", ErrConflict, jobID)
+	}
+
+	openRows, err := tx.QueryContext(ctx,
+		`SELECT id FROM human_actions WHERE job_id = ? AND status = 'open'`, jobID)
+	if err != nil {
+		return err
+	}
+	open := make(map[int64]struct{}, len(expected))
+	for openRows.Next() {
+		var actionID int64
+		if err := openRows.Scan(&actionID); err != nil {
+			_ = openRows.Close()
+			return err
+		}
+		if _, expectedAction := expected[actionID]; !expectedAction {
+			_ = openRows.Close()
+			return fmt.Errorf("%w: open actions changed for job %s", ErrConflict, jobID)
+		}
+		open[actionID] = struct{}{}
+	}
+	if err := openRows.Err(); err != nil {
+		_ = openRows.Close()
+		return err
+	}
+	if err := openRows.Close(); err != nil {
+		return err
+	}
+	if len(open) != len(expected) {
+		return fmt.Errorf("%w: open actions changed for job %s", ErrConflict, jobID)
+	}
+
+	if len(actionIDs) != 0 {
+		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(actionIDs)), ",")
+		args := make([]any, 0, len(actionIDs)+2)
+		args = append(args, now, jobID)
+		for _, actionID := range actionIDs {
+			args = append(args, actionID)
+		}
+		res, err = tx.ExecContext(ctx,
+			`UPDATE human_actions SET status = 'resolved', resolved_at = ?
+			 WHERE job_id = ? AND status = 'open' AND id IN (`+placeholders+`)`,
+			args...)
+		if err != nil {
+			return err
+		}
+		if changed, _ := res.RowsAffected(); changed != int64(len(actionIDs)) {
+			return fmt.Errorf("%w: open actions changed for job %s", ErrConflict, jobID)
+		}
+	}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO events (job_id, at, kind, detail_json) VALUES (?, ?, 'job.transition', ?)`,
+		jobID, now, string(detailJSON)); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 type transitionCfg struct {
 	retryAt        string
 	terminalReason string
@@ -778,11 +887,12 @@ func (js *Store) Get(ctx context.Context, jobID string) (*Row, error) {
 	err := db.QueryRowContext(ctx, `
 		SELECT j.id, j.work_request_id, j.state, j.policy_json, j.artifact_sha256, j.selected_candidate_id,
 		       j.spent_usd, j.terminal_reason, j.retry_at, j.created_at, j.updated_at,
+		       COALESCE(j.lease_owner,''), COALESCE(j.lease_expires_at,''),
 		       COALESCE(w.title,''), COALESCE(w.authors_json,'[]'), COALESCE(w.year,0), COALESCE(w.zotio_item_key,'')
 		FROM jobs j JOIN work_requests w ON w.id = j.work_request_id
 		WHERE j.id = ?`, jobID).Scan(
 		&r.ID, &r.WorkRequestID, &r.State, &polJSON, &artifact, &selected, &r.SpentUSD, &terminal, &retryAt, &r.CreatedAt, &r.UpdatedAt,
-		&r.Work.Title, &jsonScanner{&r.Work.Authors}, &r.Work.Year, &r.ZotioItemKey)
+		&r.LeaseOwner, &r.LeaseExpiresAt, &r.Work.Title, &jsonScanner{&r.Work.Authors}, &r.Work.Year, &r.ZotioItemKey)
 	if err != nil {
 		return nil, err
 	}
@@ -821,6 +931,17 @@ func (js *Store) Get(ctx context.Context, jobID string) (*Row, error) {
 		return nil, err
 	}
 	return &r, nil
+}
+
+// LeaseActive reports whether the row is still protected from a competing
+// state transition. A malformed persisted lease is treated as active so repair
+// code cannot discard a browser download while ownership is uncertain.
+func (r Row) LeaseActive(now time.Time) bool {
+	if r.LeaseOwner == "" {
+		return false
+	}
+	expires, err := time.Parse(time.RFC3339Nano, r.LeaseExpiresAt)
+	return err != nil || !expires.Before(now)
 }
 
 // jsonScanner scans a JSON array column into a []string.
@@ -890,6 +1011,86 @@ func (js *Store) List(ctx context.Context, state string, limit int) ([]Row, erro
 			return nil, err
 		}
 		out = append(out, *r)
+	}
+	return out, nil
+}
+
+// ListOldest returns the next bounded maintenance page in stable oldest-first
+// order. It resumes after the prior page for the same state set and wraps only
+// after reaching the end, so permanently parked jobs cannot hide every newer
+// repair or reminder.
+func (js *Store) ListOldest(ctx context.Context, states []string, limit int) ([]Row, error) {
+	if len(states) == 0 {
+		return nil, nil
+	}
+	if limit <= 0 || limit > ListLimitMax {
+		limit = ListLimitDefault
+	}
+	key := strings.Join(states, "\x00")
+	js.oldestMu.Lock()
+	defer js.oldestMu.Unlock()
+	if js.oldestCursors == nil {
+		js.oldestCursors = make(map[string]oldestListCursor)
+	}
+	cursor := js.oldestCursors[key]
+	out, err := js.listOldestAfter(ctx, states, limit, cursor)
+	if err != nil {
+		return nil, err
+	}
+	if len(out) == 0 && cursor.createdAt != "" {
+		delete(js.oldestCursors, key)
+		out, err = js.listOldestAfter(ctx, states, limit, oldestListCursor{})
+		if err != nil {
+			return nil, err
+		}
+	}
+	if len(out) != 0 {
+		last := out[len(out)-1]
+		js.oldestCursors[key] = oldestListCursor{createdAt: last.CreatedAt, id: last.ID}
+	}
+	return out, nil
+}
+
+func (js *Store) listOldestAfter(ctx context.Context, states []string, limit int, after oldestListCursor) ([]Row, error) {
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(states)), ",")
+	args := make([]any, 0, len(states)+4)
+	for _, state := range states {
+		args = append(args, state)
+	}
+	q := `SELECT id FROM jobs WHERE state IN (` + placeholders + `)`
+	if after.createdAt != "" {
+		q += ` AND (created_at > ? OR (created_at = ? AND id > ?))`
+		args = append(args, after.createdAt, after.createdAt, after.id)
+	}
+	q += ` ORDER BY created_at ASC, id ASC LIMIT ?`
+	args = append(args, limit)
+	rows, err := js.S.DB().QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	out := make([]Row, 0, len(ids))
+	for _, id := range ids {
+		row, err := js.Get(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *row)
 	}
 	return out, nil
 }
@@ -1589,14 +1790,39 @@ type HumanAction struct {
 
 // ListHumanActions returns actions, optionally only open ones.
 func (js *Store) ListHumanActions(ctx context.Context, openOnly bool) ([]HumanAction, error) {
+	return js.listHumanActions(ctx, openOnly, nil)
+}
+
+// ListOpenHumanActionsForJobs returns open actions for the supplied bounded job
+// page. Maintenance callers use it rather than materializing every historic
+// open action, including terminal advisory rows.
+func (js *Store) ListOpenHumanActionsForJobs(ctx context.Context, jobIDs []string) ([]HumanAction, error) {
+	if len(jobIDs) == 0 {
+		return nil, nil
+	}
+	return js.listHumanActions(ctx, true, jobIDs)
+}
+
+func (js *Store) listHumanActions(ctx context.Context, openOnly bool, jobIDs []string) ([]HumanAction, error) {
 	q := `SELECT id, job_id, kind, status, COALESCE(detail,''), requires_auth, blocked_by, created_at,
 		COALESCE(candidate_id, 0), quarantine_path, quarantine_sha256, revision
 		FROM human_actions`
+	var where []string
+	var args []any
 	if openOnly {
-		q += ` WHERE status = 'open'`
+		where = append(where, `status = 'open'`)
+	}
+	if jobIDs != nil {
+		where = append(where, `job_id IN (`+strings.TrimSuffix(strings.Repeat("?,", len(jobIDs)), ",")+`)`)
+		for _, id := range jobIDs {
+			args = append(args, id)
+		}
+	}
+	if len(where) != 0 {
+		q += ` WHERE ` + strings.Join(where, ` AND `)
 	}
 	q += ` ORDER BY id DESC`
-	rows, err := js.S.DB().QueryContext(ctx, q)
+	rows, err := js.S.DB().QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}

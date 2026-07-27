@@ -32,21 +32,32 @@ func (s *Service) HandoffRepairer() *HandoffRepairer { return &HandoffRepairer{s
 // actions are resolved and the job re-enters resolving, where exhaustion
 // observes the event and parks it unavailable with terminal no_entitlement.
 //
-// Both transitions race the bridge and CLI benignly: Transition rejects a
-// stale from-state with job.ErrConflict, which a repair pass skips.
+// Rule 3 (unfetchable park): a job whose only open actions are institutional
+// handoffs but whose work carries no fetchable identifier is asking for a
+// sign-in that cannot produce a PDF. Such parks predate the identifier gate in
+// exhaustedCandidates and would otherwise sit in the queue forever, drawing an
+// escalating reminder each time. Same shape as rule 2: resolve the actions and
+// re-enter resolving, where the one gate that owns this decision classifies it.
+//
+// The transactional repair rejects a state/action snapshot that has gone
+// stale, including an adoption lease acquired after its page read.
 func (r *HandoffRepairer) RunDue(ctx context.Context) error {
 	if r == nil {
 		return nil
 	}
 	s := r.svc
-	rows, err := s.Jobs.List(ctx, job.StateAwaitingHuman, 500)
+	rows, err := s.Jobs.ListOldest(ctx, []string{job.StateAwaitingHuman}, job.ListLimitMax)
 	if err != nil {
 		return err
 	}
 	if len(rows) == 0 {
 		return nil
 	}
-	actions, err := s.Jobs.ListHumanActions(ctx, true)
+	ids := make([]string, 0, len(rows))
+	for _, row := range rows {
+		ids = append(ids, row.ID)
+	}
+	actions, err := s.Jobs.ListOpenHumanActionsForJobs(ctx, ids)
 	if err != nil {
 		return err
 	}
@@ -64,25 +75,26 @@ func (r *HandoffRepairer) RunDue(ctx context.Context) error {
 		row := &rows[i]
 		open := openByJob[row.ID]
 		if len(open) == 0 {
-			record(s.Jobs.Transition(ctx, row.ID, job.StateAwaitingHuman, job.StateResolving,
+			record(s.Jobs.RepairAwaitingHuman(ctx, row.ID, nil,
 				map[string]any{"reason": "orphaned_handoff_repair"}))
 			continue
 		}
-		if !allInstitutionalHandoffs(open) || !s.institutionalRouteExhausted(ctx, row.ID) {
+		if !allInstitutionalHandoffs(open) {
 			continue
 		}
-		resolved := true
+		repair := "proven_empty_route_repair"
+		switch {
+		case !row.Work.HasFetchableIdentifier():
+			repair = "unfetchable_handoff_repair"
+		case !s.institutionalRouteExhausted(ctx, row.ID):
+			continue
+		}
+		actionIDs := make([]int64, 0, len(open))
 		for _, action := range open {
-			if err := s.Jobs.ResolveHumanAction(ctx, action.ID, "resolved"); err != nil {
-				record(err)
-				resolved = false
-			}
+			actionIDs = append(actionIDs, action.ID)
 		}
-		if !resolved {
-			continue
-		}
-		record(s.Jobs.Transition(ctx, row.ID, job.StateAwaitingHuman, job.StateResolving,
-			map[string]any{"reason": "proven_empty_route_repair"}))
+		record(s.Jobs.RepairAwaitingHuman(ctx, row.ID, actionIDs,
+			map[string]any{"reason": repair}))
 	}
 	return firstErr
 }

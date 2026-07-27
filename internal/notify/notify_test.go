@@ -66,6 +66,18 @@ func TestCoalescerSummarizesEachNotificationClass(t *testing.T) {
 	}
 }
 
+func TestCoalescerDeliversActionReminderVerbatim(t *testing.T) {
+	recorded := &recordingSender{}
+	coalescer := NewCoalescer(recorded)
+	message := "2 papers have been waiting 8h for your institution sign-in — run: papio actions open"
+
+	coalescer.HumanActionReminder(context.Background(), message)
+
+	if !reflect.DeepEqual(recorded.messages, []string{message}) {
+		t.Fatalf("messages = %#v, want %#v", recorded.messages, []string{message})
+	}
+}
+
 func TestCoalescerFlushesPendingNotificationsWhenWindowCloses(t *testing.T) {
 	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
 	recorded := &recordingSender{}

@@ -40,14 +40,43 @@ func DefaultSemanticOptions() SemanticOptions {
 	}
 }
 
+// toolSearchPath lists the package-manager prefixes a GUI-launched process does
+// not inherit. macOS hands a launchd child PATH=/usr/local/bin:/usr/bin:/bin:
+// /usr/sbin:/sbin, so a daemon autostarted by the browser's native-messaging
+// host cannot see Homebrew at all. Detection that trusted PATH alone therefore
+// made text extraction depend on WHO started the daemon: from a shell it works,
+// from the browser every PDF fails semantic extraction and is staged for human
+// review. PATH still wins; these are only consulted when it comes up empty.
+var toolSearchPath = []string{
+	"/opt/homebrew/bin", // Homebrew on Apple silicon
+	"/usr/local/bin",    // Homebrew on Intel macOS, common manual installs
+	"/opt/local/bin",    // MacPorts
+	"/home/linuxbrew/.linuxbrew/bin",
+	"/usr/bin",
+	"/snap/bin",
+}
+
 // DetectCapability finds optional local helpers. It makes no network calls.
 func DetectCapability() Capability {
 	c := Capability{PDFCPU: true}
-	c.PDFInfo, _ = exec.LookPath("pdfinfo")
-	c.PDFToText, _ = exec.LookPath("pdftotext")
-	c.PDFToPPM, _ = exec.LookPath("pdftoppm")
-	c.Tesseract, _ = exec.LookPath("tesseract")
+	c.PDFInfo = lookTool("pdfinfo")
+	c.PDFToText = lookTool("pdftotext")
+	c.PDFToPPM = lookTool("pdftoppm")
+	c.Tesseract = lookTool("tesseract")
 	return c
+}
+
+func lookTool(name string) string {
+	if found, err := exec.LookPath(name); err == nil {
+		return found
+	}
+	for _, dir := range toolSearchPath {
+		candidate := filepath.Join(dir, name)
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() && info.Mode().Perm()&0o111 != 0 {
+			return candidate
+		}
+	}
+	return ""
 }
 
 // ExtractText invokes pdftotext in a bounded subprocess, then uses a bounded

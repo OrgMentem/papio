@@ -82,9 +82,14 @@ type MissingPDFItem struct {
 
 // Item is the bibliographic subset used when a queue row has no identifier.
 type Item struct {
-	Key         string
-	Title       string
-	DOI         string
+	Key   string
+	Title string
+	DOI   string
+	// ISBN travels so an institutional OpenURL for a monograph can be built as
+	// a book rather than as an article with a bare title. No resolver consumes
+	// it — see work.HasFetchableIdentifier.
+	ISBN        string
+	ItemType    string
 	Authors     []string
 	Year        int
 	Collections []string
@@ -96,6 +101,8 @@ type itemEnvelope struct {
 			Key         string    `json:"key"`
 			Title       string    `json:"title"`
 			DOI         string    `json:"DOI"`
+			ISBN        string    `json:"ISBN"`
+			ItemType    string    `json:"itemType"`
 			Date        string    `json:"date"`
 			Creators    []creator `json:"creators"`
 			Collections []string  `json:"collections"`
@@ -248,6 +255,8 @@ func (c *Client) GetItem(ctx context.Context, key string) (*Item, error) {
 		Key:         strings.TrimSpace(data.Key),
 		Title:       strings.TrimSpace(data.Title),
 		DOI:         strings.TrimSpace(data.DOI),
+		ISBN:        strings.TrimSpace(data.ISBN),
+		ItemType:    strings.TrimSpace(data.ItemType),
 		Collections: append([]string(nil), data.Collections...),
 	}
 	if item.Key == "" {

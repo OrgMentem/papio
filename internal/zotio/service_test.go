@@ -344,25 +344,27 @@ func TestQueueMissingPDFUnavailableCooldown(t *testing.T) {
 	}
 	t.Cleanup(func() { st.Close() })
 	now := time.Date(2026, 7, 23, 12, 0, 0, 0, time.UTC)
-	seed := func(requestID, jobID string, decided time.Time) {
+	seed := func(requestID, jobID, terminalReason string, decided time.Time) {
 		t.Helper()
 		if _, err := st.DB().ExecContext(ctx,
 			`INSERT INTO work_requests (id, created_at) VALUES (?, '2026-07-01T00:00:00Z')`, requestID); err != nil {
 			t.Fatalf("seed request: %v", err)
 		}
 		if _, err := st.DB().ExecContext(ctx,
-			`INSERT INTO jobs (id, work_request_id, state, policy_json, created_at, updated_at)
-			 VALUES (?, ?, 'unavailable', '{}', '2026-07-01T00:00:00Z', ?)`,
-			jobID, requestID, decided.Format(time.RFC3339)); err != nil {
+			`INSERT INTO jobs (id, work_request_id, state, policy_json, terminal_reason, created_at, updated_at)
+			 VALUES (?, ?, 'unavailable', '{}', ?, '2026-07-01T00:00:00Z', ?)`,
+			jobID, requestID, terminalReason, decided.Format(time.RFC3339)); err != nil {
 			t.Fatalf("seed job: %v", err)
 		}
 	}
-	seed("request_zotio_FRESHKEY1", "job_fresh", now.Add(-24*time.Hour))
-	seed("request_zotio_STALEKEY1", "job_stale", now.Add(-30*24*time.Hour))
+	seed("request_zotio_FRESHKEY1", "job_fresh", "", now.Add(-24*time.Hour))
+	seed("request_zotio_STALEKEY1", "job_stale", "", now.Add(-30*24*time.Hour))
+	seed("request_zotio_NOIDKEY01", "job_no_identifier", "no_identifier", now.Add(-24*time.Hour))
 
 	cli := &fakeCLI{items: []MissingPDFItem{
 		{Key: "FRESHKEY1", Title: "Fresh verdict", DOI: "10.1000/fresh"},
 		{Key: "STALEKEY1", Title: "Stale verdict", DOI: "10.1000/stale"},
+		{Key: "NOIDKEY01", Title: "Corrected identifier", DOI: "10.1000/corrected"},
 	}}
 	submitter := &fakeSubmitter{}
 	service := &Service{
@@ -375,11 +377,15 @@ func TestQueueMissingPDFUnavailableCooldown(t *testing.T) {
 	if err != nil {
 		t.Fatalf("QueueMissingPDF: %v", err)
 	}
-	if len(result.Queued) != 1 || result.Queued[0].ZotioItemKey != "STALEKEY1" {
-		t.Fatalf("queued = %+v, want only the stale verdict", result.Queued)
+	queued := make(map[string]bool, len(result.Queued))
+	for _, row := range result.Queued {
+		queued[row.ZotioItemKey] = true
+	}
+	if len(queued) != 2 || !queued["STALEKEY1"] || !queued["NOIDKEY01"] {
+		t.Fatalf("queued = %+v, want stale and corrected no_identifier items", result.Queued)
 	}
 	if len(result.Skipped) != 1 || result.Skipped[0].ZotioItemKey != "FRESHKEY1" {
-		t.Fatalf("skipped = %+v, want only the fresh verdict", result.Skipped)
+		t.Fatalf("skipped = %+v, want only the fresh plain unavailable verdict", result.Skipped)
 	}
 	if want := "unavailable as of last attempt; recheck in 13d"; result.Skipped[0].Reason != want {
 		t.Fatalf("skip reason = %q, want %q", result.Skipped[0].Reason, want)
@@ -392,7 +398,7 @@ func TestQueueMissingPDFUnavailableCooldown(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(result.Queued) != 2 || len(result.Skipped) != 0 {
+	if len(result.Queued) != 3 || len(result.Skipped) != 0 {
 		t.Fatalf("disabled cool-down result = %+v", result)
 	}
 }

@@ -34,6 +34,19 @@ type SubmitResult struct {
 	JobID string `json:"job_id"`
 }
 
+// ActionsOpenParams names the parked handoffs the CLI wants the extension to
+// surface instead of duplicating their resolver tabs through the OS.
+type ActionsOpenParams struct {
+	JobIDs []string `json:"job_ids"`
+}
+
+// ActionsOpenResult distinguishes a usable compatible holder from the normal
+// fallback path, while Queued reports how many focus requests reached it.
+type ActionsOpenResult struct {
+	Queued      int  `json:"queued"`
+	SessionLive bool `json:"session_live"`
+}
+
 // AcquireReportParams names one persisted batch manifest, or "latest".
 type AcquireReportParams struct {
 	BatchID string `json:"batch_id"`
@@ -123,6 +136,9 @@ func RouterWithShutdown(system *bootstrap.System, shutdown context.CancelFunc) i
 		},
 		"actions.list": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return listActions(ctx, raw, system)
+		},
+		"actions.open": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return openActions(ctx, raw, system)
 		},
 		"actions.resolve": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return resolveAction(ctx, raw, system)
@@ -589,6 +605,21 @@ func listActions(ctx context.Context, raw json.RawMessage, system *bootstrap.Sys
 		return failure(err)
 	}
 	return marshal(actions)
+}
+
+func openActions(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
+	var params ActionsOpenParams
+	if err := ipc.DecodeParams(raw, &params); err != nil {
+		return badParams(err)
+	}
+	if system == nil || system.Browser == nil {
+		return marshal(ActionsOpenResult{})
+	}
+	queued, sessionLive, err := system.Browser.FocusHandoffs(ctx, params.JobIDs)
+	if err != nil {
+		return failure(err)
+	}
+	return marshal(ActionsOpenResult{Queued: queued, SessionLive: sessionLive})
 }
 
 func getArtifact(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {

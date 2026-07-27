@@ -15,18 +15,34 @@ import (
 // which provider is entitled; papio only hands the identified work to it.
 //
 // The strong identifier (DOI, else PMID) is carried as rft_id; title, first
-// author, and year travel as descriptive hints. All values are URL-escaped.
+// author, and year travel as descriptive hints.
+//
+// A work carrying only an ISBN is described as a book: rft.isbn plus
+// rft.btitle under the book metadata format. Sending a monograph's title in
+// rft.atitle asks the resolver to find an *article* by that name, which is how
+// printed books used to reach the catalogue as an unmatchable article query.
+// All values are URL-escaped.
 func OpenURL(base string, w work.Work) string {
 	v := url.Values{}
 	v.Set("url_ver", "Z39.88-2004")
+	book := w.DOI == "" && w.PMID == "" && w.ISBN != ""
 	switch {
 	case w.DOI != "":
 		v.Set("rft_id", "info:doi/"+w.DOI)
 	case w.PMID != "":
 		v.Set("rft_id", "info:pmid/"+w.PMID)
 	}
+	if book {
+		v.Set("rft_val_fmt", "info:ofi/fmt:kev:mtx:book")
+		v.Set("rft.genre", "book")
+		v.Set("rft.isbn", w.ISBN)
+	}
 	if w.Title != "" {
-		v.Set("rft.atitle", w.Title)
+		if book {
+			v.Set("rft.btitle", w.Title)
+		} else {
+			v.Set("rft.atitle", w.Title)
+		}
 	}
 	if len(w.Authors) > 0 && w.Authors[0] != "" {
 		v.Set("rft.au", w.Authors[0])

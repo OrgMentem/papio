@@ -100,7 +100,8 @@ type Browser struct {
 	// the daemon rejects reported paths outside <root>/<job_id>/.
 	// Default: <data_dir>/adoptions.
 	AdoptionRoot string `toml:"download_adoption_root,omitempty"`
-	// ActionExpirySeconds bounds how long one browser handoff stays open.
+	// ActionExpirySeconds sets browser-offer expiry and the first human-action
+	// reminder threshold. Subsequent reminders back off independently per action.
 	ActionExpirySeconds int `toml:"action_expiry_seconds,omitempty"`
 }
 

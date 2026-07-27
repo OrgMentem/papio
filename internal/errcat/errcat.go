@@ -27,10 +27,10 @@ func Explain(state, reason, resolver, accessMode string, cfg config.Config) Expl
 	switch reason {
 	case "institutional_handoff":
 		return Explanation{"login_required",
-			"Sign in at your institution in the browser, then run `papio actions --open` to launch the handoff tab."}
+			"Sign in at your institution in the browser, then run `papio actions open` to launch the handoff tab. If the sign-in page reports a stale or expired request, run it again — every open mints a fresh link."}
 	case "open_access_browser_handoff":
 		return Explanation{"browser_fetch_pending",
-			"An open-access copy needs a browser fetch; run `papio actions --open` to complete it."}
+			"An open-access copy needs a browser fetch; run `papio actions open` to complete it. No login is required."}
 	case "landing_page_only":
 		return Explanation{"manual_download",
 			"The link resolved to a landing page, not a PDF; open the handoff and download the PDF manually."}
@@ -46,6 +46,12 @@ func Explain(state, reason, resolver, accessMode string, cfg config.Config) Expl
 	case "resolver_temporarily_unavailable", "candidate_temporarily_unavailable":
 		return Explanation{"retrying",
 			"A source was temporarily unavailable; papio will retry automatically. No action needed."}
+	case "no_identifier":
+		// The single most expensive wrong answer papio can give is "sign in" for
+		// a work no login can deliver. Name what is missing and the one remedy
+		// that closes the loop, and say plainly that authenticating will not help.
+		return Explanation{"no_identifier",
+			"No DOI, PMID, or arXiv id could be confirmed for this title — books, chapters, reports, and theses usually have none. An institutional sign-in cannot make an identifier-less request fetchable. Find a DOI and re-submit with `papio acquire --doi <doi>`; for a Zotero item, apply `zotio --yes items enrich --missing-doi` then re-run `papio acquire --from-zotio`."}
 	case "candidates_exhausted", "no_legal_candidates":
 		return explainNoAccess(resolver, accessMode, cfg)
 	}
@@ -55,7 +61,7 @@ func Explain(state, reason, resolver, accessMode string, cfg config.Config) Expl
 	switch state {
 	case "awaiting_human":
 		return Explanation{"action_required",
-			"This job is waiting on a browser action; run `papio actions --open`."}
+			"This job is waiting on a browser action; run `papio actions open`."}
 	case "needs_review":
 		return Explanation{"review_required",
 			"This job needs human review; see `papio actions` and approve or reject it."}

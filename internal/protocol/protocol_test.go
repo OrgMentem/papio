@@ -201,6 +201,44 @@ func TestHelloAckPayloadRoundTripAndBounds(t *testing.T) {
 	}
 }
 
+func TestHandoffFocusPayloadRoundTripAndScope(t *testing.T) {
+	frame := func(jobID string, payload any) []byte {
+		t.Helper()
+		env := map[string]any{
+			"protocol": BrowserProtocolVersion,
+			"type":     MsgHandoffFocus,
+			"msg_id":   "daemon-focus-001",
+			"seq":      1,
+			"payload":  payload,
+		}
+		if jobID != "" {
+			env["job_id"] = jobID
+		}
+		data, err := json.Marshal(env)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return data
+	}
+
+	msg, err := DecodeBrowserMessage(frame("job_focus_001", EmptyPayload{}))
+	if err != nil {
+		t.Fatalf("decode handoff_focus: %v", err)
+	}
+	if msg.Type != MsgHandoffFocus || msg.JobID != "job_focus_001" {
+		t.Fatalf("handoff_focus envelope = %#v", msg)
+	}
+	if _, ok := msg.Payload.(*EmptyPayload); !ok {
+		t.Fatalf("handoff_focus payload = %T, want *EmptyPayload", msg.Payload)
+	}
+	if _, err := DecodeBrowserMessage(frame("", EmptyPayload{})); err == nil {
+		t.Fatal("handoff_focus without job_id was accepted")
+	}
+	if _, err := DecodeBrowserMessage(frame("job_focus_001", map[string]bool{"unexpected": true})); err == nil {
+		t.Fatal("handoff_focus with non-empty payload was accepted")
+	}
+}
+
 func TestPageAcquirePayloadRoundTripAndValidation(t *testing.T) {
 	frame := func(typ string, payload any) []byte {
 		t.Helper()

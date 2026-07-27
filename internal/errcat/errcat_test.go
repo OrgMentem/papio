@@ -92,3 +92,39 @@ func TestWaitGuidance(t *testing.T) {
 		t.Fatalf("unavailable guidance = %q", g)
 	}
 }
+
+// The most expensive wrong answer papio can give is "sign in" for a work no
+// login can deliver: the user spends an SSO round trip, the job parks forever,
+// and the action reminder pass then nags them about it on a schedule. This
+// pins that the no-identifier explanation is distinct from the handoff one and
+// never asks for authentication.
+func TestNoIdentifierGuidanceNeverAsksForASignIn(t *testing.T) {
+	cfg := config.Config{AccessMode: config.ModeDelegated}
+	got := Explain("unavailable", "no_identifier", "", config.ModeDelegated, cfg)
+
+	if got.Category != "no_identifier" {
+		t.Fatalf("category = %q, want no_identifier", got.Category)
+	}
+	lower := strings.ToLower(got.Guidance)
+	for _, forbidden := range []string{"sign in", "log in", "login", "actions open"} {
+		if strings.Contains(lower, forbidden) {
+			t.Fatalf("guidance offers %q for a work no login can deliver: %q", forbidden, got.Guidance)
+		}
+	}
+	// It must give both a direct re-submit path and the Zotero queue path, and
+	// enrichment must apply metadata rather than only preview its proposed DOI.
+	for _, remedy := range []string{
+		"DOI",
+		"`papio acquire --doi <doi>`",
+		"`zotio --yes items enrich --missing-doi`",
+		"`papio acquire --from-zotio`",
+	} {
+		if !strings.Contains(got.Guidance, remedy) {
+			t.Fatalf("guidance omits working remedy %q: %q", remedy, got.Guidance)
+		}
+	}
+	// And it must be reachable from acquire --wait, not just the dashboard.
+	if g := WaitGuidance("unavailable", "no_identifier", "", config.ModeDelegated, cfg); !strings.Contains(g, "[no_identifier]") {
+		t.Fatalf("wait guidance = %q", g)
+	}
+}

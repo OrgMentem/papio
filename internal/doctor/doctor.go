@@ -106,9 +106,14 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, capability pdf
 		add("pdf_worker", Pass, "isolated pdfcpu worker is runnable", "")
 	}
 	if capability.PDFToText == "" {
-		add("pdftotext", Fail, "Poppler pdftotext is unavailable", "install poppler")
+		// Worth a blunt detail: without semantic extraction every validated PDF
+		// fails identity and is staged for human review, which presents as
+		// "papio stopped trusting anything" rather than as a missing tool.
+		add("pdftotext", Fail,
+			"Poppler pdftotext is unavailable, so every PDF will be staged for human review",
+			"install poppler; if it is already installed, this daemon cannot see it — stop it with `papio daemon stop` so the next command restarts it from your shell")
 	} else {
-		add("pdftotext", Pass, "Poppler semantic extraction available", "")
+		add("pdftotext", Pass, "Poppler semantic extraction available at "+capability.PDFToText, "")
 	}
 	if capability.PDFInfo == "" {
 		add("pdfinfo", Warn, "Poppler pdfinfo cross-check is unavailable", "install poppler for independent page-count checks")

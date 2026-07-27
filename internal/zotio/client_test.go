@@ -158,6 +158,45 @@ func TestGetItemBuildsTitleAuthorYearFallback(t *testing.T) {
 	}
 }
 
+// A Zotero book row reaches papio with no DOI, so its ISBN is the only thing
+// that lets the institutional OpenURL describe it as a book rather than query
+// the catalogue for an article with that title. Publishers routinely put
+// several editions in the one field, which work.NormalizeISBN rejects whole.
+func TestGetItemCarriesISBNAndItemType(t *testing.T) {
+	client := &Client{Executable: "zotio", Exec: func(_ context.Context, _ ...string) ([]byte, error) {
+		return []byte(`{"results":{"data":{
+			"key":"AB12CD34","title":"Evaluating training programs","itemType":"book",
+			"ISBN":"978-1-57675-348-4 9781576753491","date":"2012"}}}`), nil
+	}}
+	item, err := client.GetItem(context.Background(), "AB12CD34")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if item.ItemType != "book" {
+		t.Fatalf("item type = %q", item.ItemType)
+	}
+	if got := normalizedISBN(item.ISBN); got != "9781576753484" {
+		t.Fatalf("normalized isbn = %q, want the first parseable entry", got)
+	}
+}
+
+func TestNormalizedISBNRejectsJunkWithoutSwallowingRealEntries(t *testing.T) {
+	for raw, want := range map[string]string{
+		"9781576753484":                    "9781576753484",
+		"0-471-27288-4":                    "0471272884",
+		"978 1 57675 348 4":                "9781576753484",
+		"n/a; 9781576753484":               "9781576753484",
+		"978 1 57675 348 4; 0 471 27288 4": "9781576753484",
+		"":                                 "",
+		"no isbn recorded":                 "",
+		"12345":                            "",
+	} {
+		if got := normalizedISBN(raw); got != want {
+			t.Fatalf("normalizedISBN(%q) = %q, want %q", raw, got, want)
+		}
+	}
+}
+
 func TestRunJSONPreservesStructuredOutputFromNonzeroCommand(t *testing.T) {
 	client := &Client{Executable: "zotio", Exec: func(_ context.Context, _ ...string) ([]byte, error) {
 		return []byte(`{"ok":false,"mode":"apply","result":{"summary":{"failed":1}}}`), errors.New("exit status 1")

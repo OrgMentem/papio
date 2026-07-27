@@ -94,6 +94,15 @@ func (c *Coalescer) HumanAction(ctx context.Context) {
 	})
 }
 
+// HumanActionReminder delivers an already-formed action reminder directly so
+// its age and recovery guidance survive the count-based coalescing path.
+func (c *Coalescer) HumanActionReminder(ctx context.Context, message string) {
+	if c == nil || c.Sender == nil {
+		return
+	}
+	c.Sender.Send(ctx, message)
+}
+
 // Imported records a job whose automatic Zotio import was applied.
 func (c *Coalescer) Imported(ctx context.Context) {
 	c.notify(ctx, "imported", func(count int) string {

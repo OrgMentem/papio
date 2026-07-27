@@ -28,6 +28,19 @@ func (w Work) HasIdentifier() bool {
 	return w.DOI != "" || w.PMID != "" || w.ArXiv != "" || w.ISBN != "" || w.OpenAlex != ""
 }
 
+// HasFetchableIdentifier reports whether this work carries an identifier some
+// acquisition route can actually resolve to full text.
+//
+// ISBN is deliberately excluded even though HasIdentifier counts it. No
+// resolver consumes an ISBN — every one of them keys on DOI, PMID, or arXiv id
+// — and an institutional OpenURL built from an ISBN reaches a catalogue record
+// or a DRM'd ebook reader, never a PDF papio can validate and file. Treating an
+// ISBN as fetchable is what routed printed monographs into an institutional
+// sign-in handoff that no login could ever complete.
+func (w Work) HasFetchableIdentifier() bool {
+	return w.DOI != "" || w.PMID != "" || w.ArXiv != "" || w.OpenAlex != ""
+}
+
 // Describe renders a short human label for logs/CLI (never secret-bearing).
 func (w Work) Describe() string {
 	switch {

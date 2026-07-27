@@ -146,3 +146,30 @@ func TestNormalizePMID(t *testing.T) {
 		}
 	}
 }
+
+// ISBN satisfies HasIdentifier but no resolver consumes it, so the two
+// predicates must disagree exactly there. Conflating them is what routed
+// printed monographs into an institutional sign-in no login could complete.
+func TestHasFetchableIdentifierExcludesISBNOnly(t *testing.T) {
+	for name, test := range map[string]struct {
+		w                 Work
+		identifier, fetch bool
+	}{
+		"empty":         {Work{Title: "T"}, false, false},
+		"doi":           {Work{DOI: "10.1/x"}, true, true},
+		"pmid":          {Work{PMID: "1"}, true, true},
+		"arxiv":         {Work{ArXiv: "2401.00001"}, true, true},
+		"openalex":      {Work{OpenAlex: "W123"}, true, true},
+		"isbn only":     {Work{ISBN: "9781576753484"}, true, false},
+		"isbn plus doi": {Work{ISBN: "9781576753484", DOI: "10.1/x"}, true, true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := test.w.HasIdentifier(); got != test.identifier {
+				t.Fatalf("HasIdentifier = %t, want %t", got, test.identifier)
+			}
+			if got := test.w.HasFetchableIdentifier(); got != test.fetch {
+				t.Fatalf("HasFetchableIdentifier = %t, want %t", got, test.fetch)
+			}
+		})
+	}
+}

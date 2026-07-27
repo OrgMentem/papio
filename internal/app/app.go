@@ -70,6 +70,7 @@ type classifiedAutoImportError interface {
 // job state transitions.
 type NotificationSink interface {
 	HumanAction(context.Context)
+	HumanActionReminder(context.Context, string)
 	Imported(context.Context)
 }
 
@@ -834,7 +835,9 @@ func (s *Service) institutionalRouteExhausted(ctx context.Context, jobID string)
 // exhaustedCandidates handles the terminal "no direct candidate" boundary —
 // either resolving produced zero legal candidates or fetching exhausted them
 // all without an artifact. A bot-blocked open-access candidate gets one
-// browser-native attempt before the ordinary institutional OpenURL handoff.
+// browser-native attempt before the identifier gate because its PDF can still
+// be fetched without a DOI; an authentication wall on that offer is settled by
+// the bridge as no_identifier rather than becoming an institutional handoff.
 // The action detail carries the live OA URL solely for the browser bridge; it
 // is never copied into job events or protocol metadata.
 func (s *Service) exhaustedCandidates(ctx context.Context, row *job.Row, from, reason, terminal, oaBrowserURL string) error {
@@ -849,22 +852,35 @@ func (s *Service) exhaustedCandidates(ctx context.Context, row *job.Row, from, r
 				map[string]any{"reason": "open_access_browser_handoff"})
 		}
 		institutionalExhausted := s.institutionalRouteExhausted(ctx, row.ID)
-		if base, ok := s.Config.OpenURLBaseFor(row.Policy.Resolver); ok && base != "" && !institutionalExhausted {
+		base, hasBase := s.Config.OpenURLBaseFor(row.Policy.Resolver)
+		switch {
+		// A work with no fetchable identifier must never be routed to an
+		// institutional sign-in. The resolver would be handed a bare title, and
+		// the destination for a printed monograph or a report is a catalogue
+		// record — no login produces a PDF, so a handoff here spends the user's
+		// SSO round trip, parks forever, and (since human actions are now
+		// re-notified on a schedule) nags them about impossible work.
+		case !row.Work.HasFetchableIdentifier():
+			reason, terminal = "no_identifier", "no_identifier"
+		case hasBase && base != "" && !institutionalExhausted:
 			if _, err := s.Jobs.OpenHumanAction(ctx, row.ID, "openurl_handoff", InstitutionalOpenURLHandoffDetail, job.WithAccessClassification(true, "paywall")); err != nil {
 				return err
 			}
 			return s.park(ctx, row.ID, from, job.StateAwaitingHuman,
 				map[string]any{"reason": "institutional_handoff"})
-		}
-		if institutionalExhausted {
+		case institutionalExhausted:
 			terminal = "no_entitlement"
 		}
 	case config.ModeConservative:
-		if base, ok := s.Config.OpenURLBaseFor(row.Policy.Resolver); ok && base != "" {
+		// Same gate: an OpenURL built from a bare title is not worth surfacing.
+		if base, ok := s.Config.OpenURLBaseFor(row.Policy.Resolver); ok && base != "" && row.Work.HasFetchableIdentifier() {
 			if _, err := s.Jobs.OpenHumanAction(ctx, row.ID, "openurl_available",
 				"no direct candidates; institutional OpenURL available but not opened in conservative mode"); err != nil {
 				return err
 			}
+		}
+		if !row.Work.HasFetchableIdentifier() {
+			reason, terminal = "no_identifier", "no_identifier"
 		}
 	}
 	return s.Jobs.Transition(ctx, row.ID, from, job.StateUnavailable,

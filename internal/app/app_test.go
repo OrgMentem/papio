@@ -1267,10 +1267,14 @@ func TestSubmitResolverProfileAndUnknownValidation(t *testing.T) {
 
 type fakeNotificationSink struct {
 	human, imported int
+	reminders       []string
 }
 
 func (f *fakeNotificationSink) HumanAction(context.Context) { f.human++ }
-func (f *fakeNotificationSink) Imported(context.Context)    { f.imported++ }
+func (f *fakeNotificationSink) HumanActionReminder(_ context.Context, message string) {
+	f.reminders = append(f.reminders, message)
+}
+func (f *fakeNotificationSink) Imported(context.Context) { f.imported++ }
 
 func TestParkNotifiesAfterSuccessfulTransition(t *testing.T) {
 	svc, jobs := newTestService(t)

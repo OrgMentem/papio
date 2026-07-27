@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"papio/internal/app"
 	"papio/internal/batch"
 	"papio/internal/bootstrap"
 	"papio/internal/config"
@@ -466,6 +467,100 @@ func TestRouterBrowserSyncHandshakeAndInvalidFrame(t *testing.T) {
 	rpcErr := callMethod(t, router, "browser.sync", map[string]any{"messages": []json.RawMessage{bad}}, nil)
 	if rpcErr == nil || rpcErr.Code != "invalid_argument" {
 		t.Fatalf("invalid frame error = %+v, want invalid_argument", rpcErr)
+	}
+}
+
+func TestRouterActionsOpenQueuesCompatibleHandoff(t *testing.T) {
+	ctx := context.Background()
+	cfg := config.Default()
+	cfg.AccessMode = config.ModeDelegated
+	cfg.DataDir = t.TempDir()
+	system, err := bootstrap.New(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = system.Close() })
+	id, err := system.Jobs.CreateRequest(ctx, "request_api_focus", work.Work{DOI: "10.1000/focus"}, "", "", job.Policy{
+		AccessMode: config.ModeDelegated, DesiredVersion: "any",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, edge := range [][2]string{
+		{job.StateQueued, job.StateResolving},
+		{job.StateResolving, job.StateFetching},
+		{job.StateFetching, job.StateAwaitingHuman},
+	} {
+		if err := system.Jobs.Transition(ctx, id, edge[0], edge[1], nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := system.Jobs.OpenHumanAction(ctx, id, "openurl_handoff", app.OABrowserHandoffActionDetail("https://oa.example.test/focus.pdf")); err != nil {
+		t.Fatal(err)
+	}
+	router := Router(system)
+
+	var unavailable ActionsOpenResult
+	if rpcErr := callMethod(t, router, "actions.open", map[string]any{"job_ids": []string{id}}, &unavailable); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	if unavailable.SessionLive || unavailable.Queued != 0 {
+		t.Fatalf("no-session result = %+v, want queued:0 session_live:false", unavailable)
+	}
+
+	// A legacy native host (no session_id) is indistinguishable from any other
+	// legacy host, and they all share one session identity — so a stale
+	// pre-0.8.0 host can be the caller behind a newer host's version metadata.
+	// Its parser fails closed on an unknown type and drops the whole session,
+	// so handoff_focus must never be queued for a legacy session.
+	legacyHello := json.RawMessage(`{"protocol":"papio-browser/1","type":"hello","msg_id":"client-focus-000","seq":0,"payload":{"extension_version":"0.8.0"}}`)
+	if rpcErr := callMethod(t, router, "browser.sync", map[string]any{"messages": []json.RawMessage{legacyHello}}, nil); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	var legacy ActionsOpenResult
+	if rpcErr := callMethod(t, router, "actions.open", map[string]any{"job_ids": []string{id}}, &legacy); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	if legacy.SessionLive || legacy.Queued != 0 {
+		t.Fatalf("legacy-session result = %+v, want queued:0 session_live:false so the CLI takes the OS fallback", legacy)
+	}
+	var legacyPolled struct {
+		Outbound []json.RawMessage `json:"outbound"`
+	}
+	if rpcErr := callMethod(t, router, "browser.sync", map[string]any{}, &legacyPolled); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	for _, raw := range legacyPolled.Outbound {
+		if msg, err := protocol.DecodeBrowserMessage(raw); err == nil && msg.Type == protocol.MsgHandoffFocus {
+			t.Fatal("legacy holder received handoff_focus; its parser would drop the whole session")
+		}
+	}
+
+	const sessionID = "aaaabbbbccccddddeeeeffff00001111"
+	hello := json.RawMessage(`{"protocol":"papio-browser/1","type":"hello","msg_id":"client-focus-001","seq":0,"payload":{"extension_version":"0.8.0"}}`)
+	if rpcErr := callMethod(t, router, "browser.sync",
+		map[string]any{"session_id": sessionID, "messages": []json.RawMessage{hello}}, nil); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	var queued ActionsOpenResult
+	if rpcErr := callMethod(t, router, "actions.open", map[string]any{"job_ids": []string{id}}, &queued); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	if !queued.SessionLive || queued.Queued != 1 {
+		t.Fatalf("compatible-session result = %+v, want queued:1 session_live:true", queued)
+	}
+	var polled struct {
+		Outbound []json.RawMessage `json:"outbound"`
+	}
+	if rpcErr := callMethod(t, router, "browser.sync", map[string]any{"session_id": sessionID}, &polled); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	if len(polled.Outbound) != 1 {
+		t.Fatalf("poll outbound = %d frames, want one handoff_focus", len(polled.Outbound))
+	}
+	msg, err := protocol.DecodeBrowserMessage(polled.Outbound[0])
+	if err != nil || msg.Type != protocol.MsgHandoffFocus || msg.JobID != id {
+		t.Fatalf("focus outbound = %+v, %v", msg, err)
 	}
 }
 

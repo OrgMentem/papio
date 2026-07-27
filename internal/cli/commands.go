@@ -20,6 +20,7 @@ import (
 	"papio/internal/api"
 	"papio/internal/app"
 	"papio/internal/browser"
+	"papio/internal/ipc"
 	"papio/internal/job"
 )
 
@@ -236,7 +237,18 @@ func newActionsCommand(opt *options) *cobra.Command {
 			if err := opt.call(cmd.Context(), "jobs.list", map[string]any{"state": job.StateAwaitingHuman, "limit": job.ListLimitMax}, &rows); err != nil {
 				return err
 			}
-			urls, droppedForMissingJob := actionURLs(actions, rows, cfg.OpenURLBaseFor, limit)
+			targets, droppedForMissingJob := actionHandoffTargets(actions, rows, cfg.OpenURLBaseFor, limit)
+			urls := make([]string, 0, len(targets))
+			untrackedURLs := make([]string, 0, len(targets))
+			jobIDs := make([]string, 0, len(targets))
+			for _, target := range targets {
+				urls = append(urls, target.URL)
+				if target.Tracked {
+					jobIDs = append(jobIDs, target.JobID)
+				} else {
+					untrackedURLs = append(untrackedURLs, target.URL)
+				}
+			}
 			urls, urlsTruncated := agentjson.Capped(urls, limit)
 			truncated := urlsTruncated || droppedForMissingJob > 0
 			if len(urls) == 0 && len(actions) > 0 && !opt.jsonOutput {
@@ -248,7 +260,13 @@ func newActionsCommand(opt *options) *cobra.Command {
 			if dryRun && opt.jsonOutput {
 				return printPage(opt, "urls", urls, truncated)
 			}
-			if err := openActionURLs(cmd.Context(), urls, dryRun, opt.out, commandExec); err != nil {
+			if err := focusOrOpenActionURLs(cmd.Context(), urls, untrackedURLs, jobIDs, dryRun, opt.out, func(ctx context.Context, ids []string) (api.ActionsOpenResult, error) {
+				var result api.ActionsOpenResult
+				if err := opt.call(ctx, "actions.open", map[string]any{"job_ids": ids}, &result); err != nil {
+					return api.ActionsOpenResult{}, err
+				}
+				return result, nil
+			}, commandExec); err != nil {
 				return err
 			}
 			if opt.jsonOutput {
@@ -282,7 +300,7 @@ const openURLTimeout = 5 * time.Second
 
 type commandRunner func(context.Context, string, ...string) error
 
-// actionURLs resolves the openable handoff URLs for currently open actions,
+// actionHandoffTargets resolves the openable handoffs and retains their job IDs
 // newest actions first, up to limit (0 = unbounded). droppedForMissingJob
 // counts open actions whose job id was not present in rows: either the job
 // has moved past awaiting_human since the action was recorded (a routine,
@@ -290,12 +308,18 @@ type commandRunner func(context.Context, string, ...string) error
 // and omitted a still-awaiting_human job. Both mean the caller cannot see
 // the complete open-action picture, so a nonzero count should fold into the
 // caller's own `truncated` signal.
-func actionURLs(actions []job.HumanAction, rows []job.Row, baseFor func(string) (string, bool), limit int) (urls []string, droppedForMissingJob int) {
+type actionHandoffTarget struct {
+	JobID   string
+	URL     string
+	Tracked bool
+}
+
+func actionHandoffTargets(actions []job.HumanAction, rows []job.Row, baseFor func(string) (string, bool), limit int) (targets []actionHandoffTarget, droppedForMissingJob int) {
 	jobs := make(map[string]job.Row, len(rows))
 	for _, row := range rows {
 		jobs[row.ID] = row
 	}
-	urls = make([]string, 0, len(actions))
+	targets = make([]actionHandoffTarget, 0, len(actions))
 	for _, action := range actions {
 		if action.Status != "open" {
 			continue
@@ -312,10 +336,20 @@ func actionURLs(actions []job.HumanAction, rows []job.Row, baseFor func(string) 
 		if !ok {
 			continue
 		}
-		urls = append(urls, target)
-		if limit > 0 && len(urls) >= limit {
+		targets = append(targets, actionHandoffTarget{JobID: action.JobID, URL: target, Tracked: action.Kind == "openurl_handoff"})
+		if limit > 0 && len(targets) >= limit {
 			break
 		}
+	}
+	return targets, droppedForMissingJob
+}
+
+// actionURLs preserves the URL-only helper used by dry-run and JSON rendering.
+func actionURLs(actions []job.HumanAction, rows []job.Row, baseFor func(string) (string, bool), limit int) (urls []string, droppedForMissingJob int) {
+	targets, droppedForMissingJob := actionHandoffTargets(actions, rows, baseFor, limit)
+	urls = make([]string, 0, len(targets))
+	for _, target := range targets {
+		urls = append(urls, target.URL)
 	}
 	return urls, droppedForMissingJob
 }
@@ -346,6 +380,30 @@ func validOpenURL(value string) bool {
 	}
 	parsed, err := url.ParseRequestURI(value)
 	return err == nil && parsed.Scheme == "https" && parsed.Host != ""
+}
+
+type focusHandoffs func(context.Context, []string) (api.ActionsOpenResult, error)
+
+func focusOrOpenActionURLs(ctx context.Context, urls, untrackedURLs, jobIDs []string, dryRun bool, out io.Writer, focus focusHandoffs, run commandRunner) error {
+	if dryRun {
+		return openActionURLs(ctx, urls, true, out, run)
+	}
+	if len(jobIDs) == 0 {
+		return openActionURLs(ctx, urls, false, out, run)
+	}
+	result, err := focus(ctx, jobIDs)
+	if err == nil && result.SessionLive {
+		return openActionURLs(ctx, untrackedURLs, false, out, run)
+	}
+	if err != nil {
+		var remote *ipc.RemoteError
+		if !errors.As(err, &remote) || remote.Code != "unknown_method" {
+			return err
+		}
+		// A newer CLI can meet an older daemon that predates this additive RPC;
+		// fall back rather than making that ordinary skew strand the handoff.
+	}
+	return openActionURLs(ctx, urls, false, out, run)
 }
 
 func openActionURLs(ctx context.Context, urls []string, dryRun bool, out io.Writer, run commandRunner) error {

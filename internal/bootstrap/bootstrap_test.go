@@ -11,7 +11,9 @@ import (
 	"testing"
 	"time"
 
+	"papio/internal/app"
 	"papio/internal/config"
+	"papio/internal/daemon"
 	"papio/internal/zotio"
 )
 
@@ -50,6 +52,20 @@ func TestNewWiresResolverOrderAndCoreServices(t *testing.T) {
 	}
 	if system.App.Fetch == nil || system.App.Validate == nil || system.App.Enricher == nil || system.Scheduler == nil || system.Bundle == nil {
 		t.Fatal("bootstrap left a core service unwired")
+	}
+	maintenance, ok := system.Scheduler.Config.Maintenance.(daemon.MaintenanceRunners)
+	if !ok {
+		t.Fatalf("maintenance = %T, want daemon.MaintenanceRunners", system.Scheduler.Config.Maintenance)
+	}
+	foundReminder := false
+	for _, runner := range maintenance {
+		if _, ok := runner.(*app.ActionReminder); ok {
+			foundReminder = true
+			break
+		}
+	}
+	if !foundReminder {
+		t.Fatal("bootstrap did not register the action reminder")
 	}
 	if system.Zotio.AutoEnrich {
 		t.Fatal("bootstrap ignored zotio.auto_enrich=false")

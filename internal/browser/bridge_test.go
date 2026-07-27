@@ -1007,6 +1007,213 @@ func TestHandoffJobOfferedExactlyOncePerHelloSession(t *testing.T) {
 	}
 }
 
+func TestFocusHandoffsWithholdsBelowExtensionFloor(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	advance := settableClock(b)
+	id := park(t, jobs, "wr_focus_old", handoffWork())
+	runSyncAs(t, b, sessA, helloAs(HandoffFocusMinExtensionVersion))
+
+	queued, sessionLive, err := b.FocusHandoffs(context.Background(), []string{id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sessionLive || queued != 1 {
+		t.Fatalf("compatible focus result = queued:%d live:%t, want 1,true", queued, sessionLive)
+	}
+
+	// The request was queued for a compatible holder, then that holder went
+	// away before polling. The new holder parses normal handoffs but not this
+	// frame, so this is the shipped-extension disconnect guard.
+	advance(sessionStaleAfter + time.Second)
+	msgs, _ := runSyncAs(t, b, sessB, helloAs("0.7.9"))
+	if got := countType(msgs, protocol.MsgHandoffFocus); got != 0 {
+		t.Fatalf("below-floor holder received %d handoff_focus frames", got)
+	}
+	queued, sessionLive, err = b.FocusHandoffs(context.Background(), []string{id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sessionLive || queued != 0 {
+		t.Fatalf("below-floor focus result = queued:%d live:%t, want 0,false", queued, sessionLive)
+	}
+	if _, err := b.Sync(context.Background(), sessB, true, nil); err != nil {
+		t.Fatal(err)
+	}
+	msgs, _ = runSyncAs(t, b, sessA, helloAs(HandoffFocusMinExtensionVersion))
+	if got := countType(msgs, protocol.MsgHandoffFocus); got != 1 {
+		t.Fatalf("compatible replacement holder received %d handoff_focus frames, want 1", got)
+	}
+}
+
+func TestFocusHandoffsTreatsLegacySessionAsFallback(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	id := park(t, jobs, "wr_focus_legacy_fallback", handoffWork())
+	runSyncAs(t, b, "", helloAs(HandoffFocusMinExtensionVersion))
+
+	queued, sessionLive, err := b.FocusHandoffs(context.Background(), []string{id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if queued != 0 || sessionLive {
+		t.Fatalf("legacy focus result = queued:%d live:%t, want 0,false", queued, sessionLive)
+	}
+	if b.focusPending[id] {
+		t.Fatalf("legacy session queued focus request: %#v", b.focusPending)
+	}
+}
+
+func TestPollNeverEmitsHandoffFocusForLegacySession(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	id := park(t, jobs, "wr_focus_legacy_drain", handoffWork())
+	runSyncAs(t, b, "", helloAs(HandoffFocusMinExtensionVersion))
+	b.mu.Lock()
+	b.focusPending[id] = true
+	b.offered[id] = true
+	b.mu.Unlock()
+
+	msgs, _ := runSyncAs(t, b, "")
+	if got := countType(msgs, protocol.MsgHandoffFocus); got != 0 {
+		t.Fatalf("legacy session received %d handoff_focus frames", got)
+	}
+}
+
+func TestFocusHandoffsTreatsStaleHolderAsFallback(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	advance := settableClock(b)
+	id := park(t, jobs, "wr_focus_stale", handoffWork())
+	runSync(t, b, inFrame(t, protocol.MsgHello, "", map[string]any{"extension_version": HandoffFocusMinExtensionVersion}))
+	advance(sessionStaleAfter + time.Second)
+
+	queued, sessionLive, err := b.FocusHandoffs(context.Background(), []string{id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sessionLive || queued != 0 {
+		t.Fatalf("stale holder focus result = queued:%d live:%t, want 0,false", queued, sessionLive)
+	}
+}
+
+func TestFocusHandoffsEmitsOnceAtAndAboveExtensionFloor(t *testing.T) {
+	for _, version := range []string{HandoffFocusMinExtensionVersion, "0.8.1"} {
+		t.Run(version, func(t *testing.T) {
+			b, jobs, _, _ := newBridge(t)
+			id := park(t, jobs, "wr_focus_"+strings.ReplaceAll(version, ".", "_"), handoffWork())
+			runSync(t, b, inFrame(t, protocol.MsgHello, "", map[string]any{"extension_version": version}))
+
+			queued, sessionLive, err := b.FocusHandoffs(context.Background(), []string{id})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !sessionLive || queued != 1 {
+				t.Fatalf("focus result = queued:%d live:%t, want 1,true", queued, sessionLive)
+			}
+			queued, sessionLive, err = b.FocusHandoffs(context.Background(), []string{id})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !sessionLive || queued != 0 {
+				t.Fatalf("duplicate focus result = queued:%d live:%t, want 0,true", queued, sessionLive)
+			}
+
+			msgs, _ := runSync(t, b)
+			focus := firstOfType(msgs, protocol.MsgHandoffFocus)
+			if focus == nil || focus.JobID != id {
+				t.Fatalf("focus frame = %#v, want job %q", focus, id)
+			}
+			if _, ok := focus.Payload.(*protocol.EmptyPayload); !ok {
+				t.Fatalf("focus payload = %T, want *protocol.EmptyPayload", focus.Payload)
+			}
+			if got := countType(msgs, protocol.MsgHandoffFocus); got != 1 {
+				t.Fatalf("focus frame count = %d, want 1", got)
+			}
+			msgs, _ = runSync(t, b)
+			if got := countType(msgs, protocol.MsgHandoffFocus); got != 0 {
+				t.Fatalf("focus re-emitted %d times after its request drained", got)
+			}
+		})
+	}
+}
+
+func TestFocusHandoffsOffersTargetOutsidePollPage(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	target := park(t, jobs, "wr_focus_outside_poll_page", handoffWork())
+	if _, err := jobs.S.DB().ExecContext(ctx, `UPDATE jobs SET created_at = ? WHERE id = ?`,
+		time.Now().UTC().Add(-48*time.Hour).Format(time.RFC3339Nano), target); err != nil {
+		t.Fatal(err)
+	}
+	for range 200 {
+		park(t, jobs, job.NewID("wr_focus_poll_page"), handoffWork())
+	}
+
+	runSync(t, b, hello())
+	if b.offered[target] {
+		t.Fatal("precondition: oldest handoff was included in the ordinary poll page")
+	}
+	queued, sessionLive, err := b.FocusHandoffs(ctx, []string{target})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sessionLive || queued != 1 {
+		t.Fatalf("focus result = queued:%d live:%t, want 1,true", queued, sessionLive)
+	}
+
+	msgs, _ := runSync(t, b)
+	var offered, focused bool
+	for _, msg := range msgs {
+		if msg.JobID != target {
+			continue
+		}
+		switch msg.Type {
+		case protocol.MsgJobOffer:
+			offered = true
+		case protocol.MsgHandoffFocus:
+			focused = true
+		}
+	}
+	if !offered || !focused {
+		t.Fatalf("outside-page focus frames offered:%t focused:%t, want both", offered, focused)
+	}
+}
+
+func TestFocusHandoffsDropsClosedOrUnparkedJobs(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	closedID := park(t, jobs, "wr_focus_closed", handoffWork())
+	cancelledID := park(t, jobs, "wr_focus_cancelled", work.Work{DOI: "10.1002/focus.cancelled"})
+	runSync(t, b, inFrame(t, protocol.MsgHello, "", map[string]any{"extension_version": HandoffFocusMinExtensionVersion}))
+
+	queued, sessionLive, err := b.FocusHandoffs(ctx, []string{closedID, cancelledID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sessionLive || queued != 2 {
+		t.Fatalf("focus result = queued:%d live:%t, want 2,true", queued, sessionLive)
+	}
+	actions, err := jobs.ListHumanActions(ctx, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, action := range actions {
+		if action.JobID == closedID && action.Kind == handoffActionKind {
+			if err := jobs.ResolveHumanAction(ctx, action.ID, "resolved"); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := jobs.Cancel(ctx, cancelledID, "test"); err != nil {
+		t.Fatal(err)
+	}
+
+	msgs, _ := runSync(t, b)
+	if got := countType(msgs, protocol.MsgHandoffFocus); got != 0 {
+		t.Fatalf("focus frames for closed or unparked jobs = %d, want 0", got)
+	}
+	if b.focusPending[closedID] || b.focusPending[cancelledID] {
+		t.Fatalf("invalid focus requests remained pending: %#v", b.focusPending)
+	}
+}
+
 func TestOABrowserHandoffOffersCandidateThenFallsBackToInstitution(t *testing.T) {
 	const oaURL = "https://oa.example.org/articles/blocked-paper.pdf"
 	b, jobs, cfg, _ := newBridge(t)
@@ -1485,6 +1692,124 @@ func TestProviderOutcomeMappings(t *testing.T) {
 	}
 }
 
+func TestOABrowserOfferWithoutIdentifierDoesNotEscalateAuth(t *testing.T) {
+	const oaURL = "https://oa.example.org/title-match.pdf"
+	for _, outcome := range []string{"human_auth_required", "terms_acceptance_required"} {
+		t.Run(outcome, func(t *testing.T) {
+			b, jobs, _, _ := newBridge(t)
+			ctx := context.Background()
+			id := park(t, jobs, "wr_oa_no_identifier_"+outcome, work.Work{
+				Title: "A title-matched report without an identifier",
+			})
+			if _, err := jobs.S.DB().ExecContext(ctx,
+				`UPDATE human_actions SET detail = ?, requires_auth = 0, blocked_by = 'anti_bot' WHERE job_id = ?`,
+				app.OABrowserHandoffActionDetail(oaURL), id); err != nil {
+				t.Fatal(err)
+			}
+
+			msgs, _ := runSync(t, b, hello())
+			offer := firstOfType(msgs, protocol.MsgJobOffer)
+			if offer == nil || offer.Payload.(*protocol.JobOfferPayload).OpenURL != oaURL {
+				t.Fatalf("OA offer = %#v, want retained URL %q", offer, oaURL)
+			}
+			runSync(t, b, inFrame(t, protocol.MsgProviderOutcome, id, map[string]any{"outcome": outcome}))
+
+			row, err := jobs.Get(ctx, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if row.State != job.StateUnavailable || row.TerminalReason != "no_identifier" {
+				t.Fatalf("auth escalation result = state:%s terminal:%q, want unavailable/no_identifier", row.State, row.TerminalReason)
+			}
+			actions, err := jobs.ListHumanActions(ctx, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(actions) != 0 {
+				t.Fatalf("open actions after no-identifier auth wall = %+v", actions)
+			}
+		})
+	}
+}
+
+func TestOAFallbackRequiresFetchableIdentifier(t *testing.T) {
+	const oaURL = "https://oa.example.org/title-match.pdf"
+	type testCase struct {
+		name         string
+		w            work.Work
+		messageType  string
+		payload      any
+		wantFallback bool
+	}
+	cases := []testCase{
+		{
+			name:        "no entitlement without identifier settles",
+			w:           work.Work{Title: "A title-matched report without an identifier"},
+			messageType: protocol.MsgProviderOutcome,
+			payload:     map[string]any{"outcome": "no_entitlement"},
+		},
+		{
+			name:        "browser rejection without identifier settles",
+			w:           work.Work{Title: "A title-matched report without an identifier"},
+			messageType: protocol.MsgJobReject,
+			payload:     map[string]any{},
+		},
+		{
+			name:         "identified OA handoff retains institutional fallback",
+			w:            handoffWork(),
+			messageType:  protocol.MsgProviderOutcome,
+			payload:      map[string]any{"outcome": "no_entitlement"},
+			wantFallback: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b, jobs, cfg, _ := newBridge(t)
+			ctx := context.Background()
+			id := park(t, jobs, job.NewID("wr_oa_fallback_gate"), tc.w)
+			if _, err := jobs.S.DB().ExecContext(ctx,
+				`UPDATE human_actions SET detail = ?, requires_auth = 0, blocked_by = 'anti_bot' WHERE job_id = ?`,
+				app.OABrowserHandoffActionDetail(oaURL), id); err != nil {
+				t.Fatal(err)
+			}
+
+			msgs, _ := runSync(t, b, hello())
+			offer := firstOfType(msgs, protocol.MsgJobOffer)
+			if offer == nil || offer.Payload.(*protocol.JobOfferPayload).OpenURL != oaURL || offer.Payload.(*protocol.JobOfferPayload).RequiresAuth {
+				t.Fatalf("OA anti-bot offer = %#v, want no-login URL %q", offer, oaURL)
+			}
+			msgs, _ = runSync(t, b, inFrame(t, tc.messageType, id, tc.payload))
+			row, err := jobs.Get(ctx, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !tc.wantFallback {
+				if row.State != job.StateUnavailable || row.TerminalReason != "no_identifier" {
+					t.Fatalf("identifier-less fallback result = state:%s terminal:%q, want unavailable/no_identifier", row.State, row.TerminalReason)
+				}
+				if countType(msgs, protocol.MsgJobOffer) != 0 {
+					t.Fatalf("identifier-less OA failure emitted an institutional offer: %+v", msgs)
+				}
+				actions, err := jobs.ListHumanActions(ctx, true)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(actions) != 0 {
+					t.Fatalf("identifier-less OA failure left actions open: %+v", actions)
+				}
+				return
+			}
+			if row.State != job.StateAwaitingHuman {
+				t.Fatalf("identified OA fallback state = %s, want awaiting_human", row.State)
+			}
+			fallback := firstOfType(msgs, protocol.MsgJobOffer)
+			if fallback == nil || !strings.HasPrefix(fallback.Payload.(*protocol.JobOfferPayload).OpenURL, cfg.Browser.OpenURLBase+"?") {
+				t.Fatalf("identified OA fallback offer = %#v, want institutional OpenURL", fallback)
+			}
+		})
+	}
+}
+
 func TestInstitutionalNoEntitlementRequeuesExactlyOnce(t *testing.T) {
 	for _, outcome := range []string{"no_entitlement", "document_delivery_available"} {
 		t.Run(outcome, func(t *testing.T) {
@@ -1743,6 +2068,57 @@ func TestOpenURLPMIDFallbackAndYear(t *testing.T) {
 	}
 	if q.Get("rft.date") != "2020" {
 		t.Fatalf("rft.date = %q", q.Get("rft.date"))
+	}
+}
+
+// A monograph's title in rft.atitle asks the resolver for an ARTICLE by that
+// name. Real libraries answer that query with nothing, or with a review of the
+// book — which is how printed books reached the catalogue as an unmatchable
+// article lookup. An ISBN-only work must be described as a book instead.
+func TestOpenURLDescribesAnISBNOnlyWorkAsABook(t *testing.T) {
+	got := OpenURL("https://openurl.example.edu/resolve", work.Work{
+		ISBN: "9781576753484", Title: "Evaluating training programs: the four levels",
+		Authors: []string{"Donald L. Kirkpatrick"}, Year: 2012,
+	})
+	u, err := url.Parse(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := u.Query()
+	if q.Get("rft.btitle") != "Evaluating training programs: the four levels" {
+		t.Fatalf("rft.btitle = %q", q.Get("rft.btitle"))
+	}
+	if q.Has("rft.atitle") {
+		t.Fatalf("book carries rft.atitle = %q; an article-title query is the bug", q.Get("rft.atitle"))
+	}
+	if q.Get("rft.isbn") != "9781576753484" {
+		t.Fatalf("rft.isbn = %q", q.Get("rft.isbn"))
+	}
+	if q.Get("rft_val_fmt") != "info:ofi/fmt:kev:mtx:book" || q.Get("rft.genre") != "book" {
+		t.Fatalf("book metadata format = %q genre = %q", q.Get("rft_val_fmt"), q.Get("rft.genre"))
+	}
+}
+
+// A chapter with a Springer DOI is fetchable and stays article-shaped, so the
+// book branch cannot swallow the case institutional access actually resolves.
+func TestOpenURLKeepsArticleShapeWhenAStrongIdentifierExists(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		w    work.Work
+	}{
+		{"doi wins over isbn", work.Work{DOI: "10.1007/978-1-4613-3087-5_2", ISBN: "9781461330875", Title: "Equity theory"}},
+		{"pmid wins over isbn", work.Work{PMID: "123456", ISBN: "9781461330875", Title: "Equity theory"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			u, err := url.Parse(OpenURL("https://openurl.example.edu/resolve", test.w))
+			if err != nil {
+				t.Fatal(err)
+			}
+			q := u.Query()
+			if q.Get("rft.atitle") != "Equity theory" || q.Has("rft.btitle") || q.Has("rft.isbn") {
+				t.Fatalf("identifier-bearing work rendered as a book: %v", q)
+			}
+		})
 	}
 }
 

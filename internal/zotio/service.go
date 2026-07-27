@@ -427,23 +427,24 @@ func (s *Service) liveJobForRequest(ctx context.Context, requestID string) (stri
 // re-checks after the configured window instead of retrying every cadence or
 // never. Only the newest job counts: a newer failed/cancelled attempt means
 // someone already chose to retry, and the cool-down must not resurrect the
-// older verdict.
+// older verdict. A no_identifier verdict is intentionally exempt because
+// editing the item's metadata can make it fetchable immediately.
 func (s *Service) unavailableCooldown(ctx context.Context, requestID string) (time.Duration, error) {
 	if s.UnavailableRecheck <= 0 {
 		return 0, nil
 	}
-	var state, updatedAt string
+	var state, terminalReason, updatedAt string
 	err := s.Store.DB().QueryRowContext(ctx,
-		`SELECT state, updated_at FROM jobs WHERE work_request_id = ? ORDER BY created_at DESC, id DESC LIMIT 1`,
+		`SELECT state, COALESCE(terminal_reason, ''), updated_at FROM jobs WHERE work_request_id = ? ORDER BY created_at DESC, id DESC LIMIT 1`,
 		requestID,
-	).Scan(&state, &updatedAt)
+	).Scan(&state, &terminalReason, &updatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return 0, nil
 	}
 	if err != nil {
 		return 0, err
 	}
-	if state != job.StateUnavailable {
+	if state != job.StateUnavailable || terminalReason == "no_identifier" {
 		return 0, nil
 	}
 	decided, err := time.Parse(time.RFC3339, updatedAt)
@@ -514,12 +515,39 @@ func (s *Service) requestForQueueItem(ctx context.Context, row MissingPDFItem, o
 				return protocol.WorkRequest{}, "invalid DOI from Zotio item: " + err.Error()
 			}
 			request.Identifiers = &protocol.Identifiers{DOI: doi}
+		} else if isbn := normalizedISBN(item.ISBN); isbn != "" {
+			// A monograph's ISBN cannot resolve full text, but carrying it lets
+			// the institutional OpenURL describe the work as a book instead of
+			// querying the catalogue for an article with that title. papio still
+			// classifies the job as unfetchable — see work.HasFetchableIdentifier.
+			request.Identifiers = &protocol.Identifiers{ISBN: isbn}
 		}
 	}
 	if err := request.Validate(); err != nil {
 		return protocol.WorkRequest{}, "insufficient Zotio identity: " + err.Error()
 	}
 	return request, ""
+}
+
+// normalizedISBN returns the first parseable ISBN in a Zotero ISBN field.
+// Edition separators must be handled before whitespace: otherwise one
+// semicolon makes a valid space-formatted edition fall through into digit
+// fragments that cannot be normalized.
+func normalizedISBN(raw string) string {
+	editions := strings.FieldsFunc(raw, func(r rune) bool {
+		return r == ',' || r == ';' || r == '\n' || r == '\r'
+	})
+	for _, edition := range editions {
+		if isbn, err := work.NormalizeISBN(edition); err == nil {
+			return isbn
+		}
+		for _, token := range strings.Fields(edition) {
+			if isbn, err := work.NormalizeISBN(token); err == nil {
+				return isbn
+			}
+		}
+	}
+	return ""
 }
 
 func defaultVersion(value string) string {

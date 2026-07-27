@@ -24,6 +24,7 @@
         "download_complete",
         "provider_outcome",
         "cancel",
+        "handoff_focus",
         "ack",
         "error",
         "triage_snapshot_request",
@@ -266,7 +267,7 @@
   },
   "allOf": [
     {
-      "if": { "properties": { "type": { "enum": ["job_offer", "handoff_outcome", "job_accept", "job_reject", "auth_pending", "auth_returned", "download_started", "download_complete", "provider_outcome", "cancel"] } } },
+      "if": { "properties": { "type": { "enum": ["job_offer", "handoff_outcome", "job_accept", "job_reject", "auth_pending", "auth_returned", "download_started", "download_complete", "provider_outcome", "cancel", "handoff_focus"] } } },
       "then": { "required": ["job_id"] }
     },
     {

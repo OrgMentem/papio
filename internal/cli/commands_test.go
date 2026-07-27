@@ -13,6 +13,7 @@ import (
 	"strings"
 	"testing"
 
+	"papio/internal/api"
 	"papio/internal/app"
 	"papio/internal/browser"
 	"papio/internal/config"
@@ -128,6 +129,132 @@ func TestOpenActionURLsReportsActionableBrowserFailure(t *testing.T) {
 		if !strings.Contains(err.Error(), fragment) {
 			t.Fatalf("open error = %q, missing %q", err, fragment)
 		}
+	}
+}
+
+func TestFocusOrOpenActionURLsPrefersLiveCompatibleHolder(t *testing.T) {
+	const target = "https://resolver.example.test/open"
+	var out bytes.Buffer
+	focusCalls := 0
+	openCalls := 0
+	err := focusOrOpenActionURLs(context.Background(), []string{target}, []string{}, []string{"job_focus_001"}, false, &out,
+		func(_ context.Context, ids []string) (api.ActionsOpenResult, error) {
+			focusCalls++
+			if !reflect.DeepEqual(ids, []string{"job_focus_001"}) {
+				t.Fatalf("focus job IDs = %v", ids)
+			}
+			return api.ActionsOpenResult{Queued: 1, SessionLive: true}, nil
+		},
+		func(context.Context, string, ...string) error {
+			openCalls++
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if focusCalls != 1 || openCalls != 0 {
+		t.Fatalf("focus/open calls = %d/%d, want 1/0", focusCalls, openCalls)
+	}
+
+	const manual = "https://manual.example.test/open"
+	focusCalls, openCalls = 0, 0
+	err = focusOrOpenActionURLs(context.Background(), []string{target, manual}, []string{manual}, []string{"job_focus_001"}, false, &out,
+		func(context.Context, []string) (api.ActionsOpenResult, error) {
+			focusCalls++
+			return api.ActionsOpenResult{Queued: 1, SessionLive: true}, nil
+		},
+		func(_ context.Context, _ string, args ...string) error {
+			openCalls++
+			if args[len(args)-1] != manual {
+				t.Fatalf("untracked fallback args = %v, want %q last", args, manual)
+			}
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if focusCalls != 1 || openCalls != 1 {
+		t.Fatalf("mixed focus/open calls = %d/%d, want 1/1", focusCalls, openCalls)
+	}
+
+	focusCalls, openCalls = 0, 0
+	err = focusOrOpenActionURLs(context.Background(), []string{target}, []string{}, []string{"job_focus_001"}, false, &out,
+		func(context.Context, []string) (api.ActionsOpenResult, error) {
+			focusCalls++
+			return api.ActionsOpenResult{}, nil
+		},
+		func(_ context.Context, name string, args ...string) error {
+			openCalls++
+			if name == "" || len(args) == 0 || args[len(args)-1] != target {
+				t.Fatalf("fallback command = %q %v", name, args)
+			}
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if focusCalls != 1 || openCalls != 1 {
+		t.Fatalf("no-session focus/open calls = %d/%d, want 1/1", focusCalls, openCalls)
+	}
+
+	out.Reset()
+	err = focusOrOpenActionURLs(context.Background(), []string{target}, []string{}, []string{"job_focus_001"}, true, &out,
+		func(context.Context, []string) (api.ActionsOpenResult, error) {
+			t.Fatal("dry-run must not request a browser focus")
+			return api.ActionsOpenResult{}, nil
+		},
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := out.String(); got != target+"\n" {
+		t.Fatalf("dry-run output = %q, want URL list unchanged", got)
+	}
+}
+
+func TestActionsOpenFocusesTrackedHandoffWithoutChangingJSONURLs(t *testing.T) {
+	const target = "https://oa.example.test/focus.pdf"
+	action := job.HumanAction{
+		ID: 1, JobID: "job_focus_001", Kind: "openurl_handoff", Status: "open",
+		Detail: app.OABrowserHandoffActionDetail(target),
+	}
+	row := job.Row{ID: action.JobID, State: job.StateAwaitingHuman}
+	var out, errOut bytes.Buffer
+	var focusParams map[string]any
+	root := NewInProcessRoot(&out, &errOut, config.Config{}, func(_ context.Context, method string, params any, result any) error {
+		switch method {
+		case "actions.list":
+			*result.(*[]job.HumanAction) = []job.HumanAction{action}
+		case "jobs.list":
+			*result.(*[]job.Row) = []job.Row{row}
+		case "actions.open":
+			focusParams = params.(map[string]any)
+			*result.(*api.ActionsOpenResult) = api.ActionsOpenResult{Queued: 1, SessionLive: true}
+		default:
+			t.Fatalf("unexpected method %q", method)
+		}
+		return nil
+	})
+	root.SetArgs([]string{"--json", "actions", "open"})
+	if err := root.ExecuteContext(context.Background()); err != nil {
+		t.Fatalf("actions open: %v (%s)", err, errOut.String())
+	}
+	if !reflect.DeepEqual(focusParams, map[string]any{"job_ids": []string{action.JobID}}) {
+		t.Fatalf("actions.open params = %#v", focusParams)
+	}
+	var page struct {
+		URLs      []string `json:"urls"`
+		Truncated bool     `json:"truncated"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &page); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(page.URLs, []string{target}) || page.Truncated {
+		t.Fatalf("JSON URLs = %+v, want [%q] without truncation", page, target)
 	}
 }
 
