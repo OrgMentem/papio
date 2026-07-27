@@ -351,7 +351,8 @@
       }
 
       .resolver-grant,
-      .terms-consent {
+      .terms-consent,
+      .needs-you {
         border: 1px solid var(--color-primary-border);
         border-radius: var(--radius-card);
         display: grid;
@@ -397,6 +398,50 @@
       .terms-consent-controls button {
         min-height: var(--action-height);
         padding-inline: var(--space-2);
+      }
+
+      .needs-you {
+        background: var(--color-warning-surface);
+        border-color: var(--color-warning-border);
+        color: var(--color-warning);
+      }
+
+      .needs-you h2 {
+        color: var(--color-warning);
+      }
+
+      .needs-you > p {
+        font-size: var(--font-size-small);
+      }
+
+      .needs-you-list {
+        display: grid;
+        gap: var(--space-2);
+      }
+
+      .needs-you-item {
+        align-items: center;
+        border-top: 1px solid var(--color-warning-border);
+        display: grid;
+        gap: var(--space-2);
+        grid-template-columns: minmax(0, 1fr) auto;
+        padding-top: var(--space-2);
+      }
+
+      .needs-you-paper {
+        font-size: var(--font-size-small);
+        font-weight: 700;
+        overflow-wrap: anywhere;
+      }
+
+      .needs-you-item > button {
+        border-color: var(--color-warning-border);
+        color: var(--color-warning);
+        font-weight: 700;
+      }
+
+      .needs-you-item > button:hover:not(:disabled) {
+        background: var(--color-surface-hover);
       }
 
       .capture {
@@ -560,6 +605,12 @@
           <p id="open-inbox-description">Review papers and actions that need your attention.</p>
           <div id="open-inbox-status" class="capture-status" aria-live="polite"></div>
         </div>
+      </section>
+
+      <section id="needs-you-section" class="needs-you" hidden aria-labelledby="needs-you-heading">
+        <h2 id="needs-you-heading">Sign in to continue</h2>
+        <p>Finish your institutional sign-in to continue these papers.</p>
+        <div id="needs-you-list" class="needs-you-list"></div>
       </section>
 
       <section id="impact-summary" class="impact" hidden aria-label="Your papio impact">

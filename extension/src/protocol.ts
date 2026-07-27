@@ -26,6 +26,7 @@ export type BrowserMessageType =
   | "download_complete"
   | "provider_outcome"
   | "cancel"
+  | "handoff_focus"
   | "ack"
   | "error"
   | "triage_snapshot_request"
@@ -303,6 +304,7 @@ const MSG_TYPES: Record<string, true> = {
   download_complete: true,
   provider_outcome: true,
   cancel: true,
+  handoff_focus: true,
   ack: true,
   error: true,
   triage_snapshot_request: true,
@@ -330,6 +332,7 @@ const JOB_SCOPED: Record<string, true> = {
   download_complete: true,
   provider_outcome: true,
   cancel: true,
+  handoff_focus: true,
 };
 
 const OUTCOMES: Record<string, true> = {
@@ -939,7 +942,8 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
     case "ack":
     case "job_accept":
     case "job_reject":
-    case "cancel": {
+    case "cancel":
+    case "handoff_focus": {
       requireKeys(p, type, []);
       break;
     }

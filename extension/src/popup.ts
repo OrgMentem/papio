@@ -240,6 +240,75 @@ export async function openInbox(): Promise<void> {
   await chrome.tabs.create({ url: "dist/inbox.html" });
 }
 
+export const OPEN_HANDOFF_MESSAGE = "papio.handoff.open";
+
+/** Ask the background broker to surface the tab it already owns for this job.
+ * The job id is the only handoff detail a popup may send; resolver URLs remain
+ * inside the extension so a popup cannot accidentally disclose a signed link. */
+export async function openHandoff(jobID: string): Promise<void> {
+  const response: unknown = await chrome.runtime.sendMessage({
+    type: OPEN_HANDOFF_MESSAGE,
+    request: { job_id: jobID },
+  });
+  if (
+    typeof response === "object" &&
+    response !== null &&
+    (response as Record<string, unknown>)["ok"] === true &&
+    (response as Record<string, unknown>)["opened"] === true
+  ) {
+    return;
+  }
+  throw new Error("Could not focus the institutional sign-in");
+}
+
+function handoffPaperLabel(job: ActiveJob): string {
+  const title = job.expected?.title?.trim();
+  if (title) return title;
+  const doi = job.expected?.doi?.trim();
+  return doi || job.job_id;
+}
+
+/** Render every handoff that needs a human institutional sign-in. This durable
+ * list identifies an otherwise ambiguous SSO tab after a one-shot focus was missed. */
+export function renderAuthPending(
+  doc: Document,
+  jobs: ActiveJob[],
+  onFocus: (jobID: string) => Promise<void> = openHandoff,
+): void {
+  const section = doc.getElementById("needs-you-section");
+  const list = doc.getElementById("needs-you-list");
+  if (!(section instanceof HTMLElement) || !(list instanceof HTMLElement)) return;
+  const pending = jobs.filter((job) => job.status === "auth_pending");
+  section.hidden = pending.length === 0;
+  list.replaceChildren();
+  for (const job of pending) {
+    const row = doc.createElement("div");
+    row.className = "needs-you-item";
+    const paper = doc.createElement("p");
+    paper.className = "needs-you-paper";
+    paper.textContent = handoffPaperLabel(job);
+    const button = doc.createElement("button");
+    button.type = "button";
+    button.textContent = "Focus";
+    button.addEventListener("click", () => {
+      button.disabled = true;
+      button.textContent = "Focusing…";
+      void onFocus(job.job_id).then(
+        () => {
+          button.disabled = false;
+          button.textContent = "Focus";
+        },
+        () => {
+          button.disabled = false;
+          button.textContent = "Try again";
+        },
+      );
+    });
+    row.append(paper, button);
+    list.append(row);
+  }
+}
+
 export function wireInboxLauncher(
   doc: Document = document,
   onOpen: () => Promise<void> = openInbox,
@@ -454,6 +523,7 @@ export async function refresh(): Promise<void> {
   } catch {
     renderPageContext(document, undefined, store.activeJobs);
   }
+  renderAuthPending(document, store.activeJobs);
   let consent: "accept" | "manual" | undefined;
   try {
     const got = await chrome.storage.local.get(TERMS_CONSENT_KEY);

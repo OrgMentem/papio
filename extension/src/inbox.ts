@@ -872,6 +872,13 @@ function requestRefresh(): void {
 // mid-action so it never reorders the list under a decision.
 const COUNTS_POLL_INTERVAL_MS = 10000;
 let countsPollTimer: number | Timer | undefined;
+/** The document this page bootstrapped against; the poll below stops once the
+ * live document is no longer it. The counts poll re-arms itself forever, so it
+ * must stop when its own page is gone. In a browser the timer dies with the
+ * page and this is always an identity match; a page module that outlives its
+ * document would otherwise keep polling the daemon against whatever document
+ * replaced it. */
+let boundDocument: Document | undefined;
 
 function countsSignature(counts: TriageCounts | null): string {
   if (counts === null) return "";
@@ -887,6 +894,7 @@ function countsSignature(counts: TriageCounts | null): string {
 }
 
 function autoRefreshAllowed(): boolean {
+  if (boundDocument !== undefined && globalThis.document !== boundDocument) return false;
   if (!state.connected || state.loading) return false;
   if (state.confirmation !== null || state.pending.size > 0) return false;
   return typeof document === "undefined" || document.visibilityState === "visible";
@@ -914,6 +922,7 @@ async function pollCounts(): Promise<void> {
 
 function scheduleCountsPoll(): void {
   clearTimeout(countsPollTimer);
+  if (boundDocument !== undefined && globalThis.document !== boundDocument) return;
   countsPollTimer = setTimeout(() => {
     void pollCounts().finally(scheduleCountsPoll);
   }, COUNTS_POLL_INTERVAL_MS);
@@ -1348,6 +1357,7 @@ function bootstrap(): void {
   document.addEventListener("keydown", trapDialogFocus);
   document.addEventListener("visibilitychange", refreshOnReturn);
   window.addEventListener("focus", refreshOnReturn);
+  boundDocument = document;
   render();
   void refreshInbox();
   scheduleCountsPoll();

@@ -16,6 +16,90 @@ for the full pre-split extension history.
 
 ## [Unreleased]
 
+### Added
+
+- **Institutional sign-ins now stay visible until you act.** A handoff waiting
+  at an identity provider gives the toolbar an amber count, draws attention to
+  its restored work window, names its paper while a tab group is expanded, and
+  appears in the popup with a **Focus** control. The signal no longer depends
+  on catching the first focus grab at the exact moment it happens.
+- **Cold institutional handoffs now preflight without disappearing.** An offer
+  that needs institutional access waits briefly for a live resolver or provider
+  return instead of minting an unattended SAML request. Its amber toolbar count
+  remains visible while it waits, and a bounded fallback presents the sign-in
+  tab even when session keepalive is disabled; open-access offers still open
+  immediately.
+- **`papio actions open` can now surface the tab papio already owns.**
+  Extension 0.8.0 accepts the job-scoped `handoff_focus` command and restores
+  the tracked handoff tab and its minimized work window instead of leaving the
+  CLI to open an untracked duplicate. Older extensions are version-gated so
+  their strict parser never receives an unknown native-messaging frame.
+
+### Changed
+
+- **The time-saved estimate is now a defensible 5 minutes per paper**, down
+  from 20. The old figure implied hours saved after a handful of papers and
+  read as marketing; the headline is still a rough estimate the extension
+  computes from counts, never a measurement.
+
+### Fixed
+
+- **The inbox "View PDF" control never worked in any shipped version.**
+  `requestNative` named `review_preview_result` as the reply it waits for, but
+  `onInbound`'s correlation switch enumerated the other five result types and
+  omitted that one — so the daemon issued the loopback preview capability, the
+  frame fell through to the ignore-echo default, and every click sat until the
+  request timed out reporting "The daemon did not respond in time". Correlated
+  replies now route from a single `CORRELATED_RESULT_TYPES` list, and
+  `requestNative` rejects an unrouted expected reply immediately regardless of
+  whether its caller uses a literal, variable, or helper wrapper.
+- **Recoverable institutional login pages are no longer navigated away from.**
+  A password-expiry or retry error still surfaces its handoff window, but only
+  a title-confirmed Shibboleth/OpenAthens **Stale Request** page is re-driven
+  through the resolver.
+- **Cancelled handoffs no longer leave a paper title on a live tab group.**
+  When a keepalive tab retains the collapsed "papio" group after its last
+  handoff closes, papio now resets the group title and collapse state first.
+- **A handoff stranded on a dead sign-in page now raises the work window.**
+  Stale-SSO recovery reported the failure and re-drove the tab through the
+  resolver, but did so *before* the code that surfaces the minimized work
+  window — so the one moment papio was certain a human was needed was the one
+  moment it stayed hidden. Handoffs could sit unnoticed on an expired
+  institutional sign-in for hours. The window is now restored and focused
+  first, once per job.
+- **Shibboleth "Stale Request" pages are no longer missed.** Some identity
+  providers serve the dead page at the *same URL* as the working login form —
+  only the document title differs — and detection ran solely on the tab's
+  `complete` event, which a browser can deliver before that title resolves.
+  Detection now also runs on title-only updates. It deliberately still
+  requires the title: a URL-only rule would reload the page out from under a
+  half-typed password on the live login form.
+- **The stale re-drive is now bounded across service-worker restarts.** Its
+  "once per outcome" latch lived in service-worker memory while the dead tab,
+  the parked job, and the user's next sign-in attempt all survived a restart,
+  so the resolver loop was effectively unbounded. The re-drive is charged to
+  the same durable per-job authentication budget as a normal handoff drive.
+  At the cap the tab is deliberately left on the failure page — the user needs
+  to see it — and the job is reported `human_auth_required`, which keeps it
+  parked daemon-side rather than silently looping.
+- **A closed inbox page no longer keeps polling the daemon.** The counts poll
+  re-armed itself unconditionally, so a page module that outlived its document
+  kept issuing triage requests against whatever page replaced it. It now stops
+  when the live document is no longer the one it bootstrapped against.
+- **The popup’s Focus control can now surface its institutional handoff.**
+  Its narrowly scoped broker permission is limited to that focus operation;
+  the popup still cannot make inbox or triage changes.
+- **`papio actions open` now refreshes an expired sign-in exchange.** A focus
+  request re-drives a tab only while it is on an authentication page or is
+  waiting for authentication, and otherwise leaves an active provider download
+  alone.
+- **One stale sign-in document now consumes one recovery attempt.** Browsers
+  can report its title and completion at the same time; duplicate callbacks no
+  longer exhaust the retry budget or send repeated resolver navigations.
+- **The badge returns to blue after institutional sign-in completes.** Pending
+  triage work no longer inherits the amber colour reserved for a sign-in
+  blocker.
+
 ## [0.7.0] - 2026-07-25
 
 ### Added

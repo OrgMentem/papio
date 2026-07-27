@@ -9,10 +9,10 @@ import type { StatsAccess, StatsBucket, StatsResponsePayload } from "./protocol"
 export type AcquisitionStats = Omit<StatsResponsePayload, "request_id">;
 
 /** Manually chasing one paywalled paper — resolver hops, login walls, and
- * downloading and filing the PDF — takes roughly 20 minutes. The "time saved"
+ * downloading and filing the PDF — takes roughly 5 minutes. The "time saved"
  * headline multiplies this rough estimate per acquired paper; the daemon
  * reports counts only and never a time figure. */
-export const EST_MINUTES_SAVED_PER_PAPER = 20;
+export const EST_MINUTES_SAVED_PER_PAPER = 5;
 
 export type StatsReply =
   | { ok: true; stats: AcquisitionStats }

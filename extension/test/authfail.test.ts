@@ -57,3 +57,19 @@ test("IdP page with no failure markers stays undefined", () => {
 test("malformed URL stays undefined", () => {
   expect(detectAuthFailure("not a url", "stale")).toBeUndefined();
 });
+
+// The reported real-world dead end. Its URL is byte-for-byte the URL of the
+// WORKING login form — only the title distinguishes them — so a URL-only
+// heuristic here would either miss every stale page or navigate the user away
+// from a login form they are typing into. Both directions are pinned.
+test("Shibboleth stale request is classified from the title alone", () => {
+  const staleURL = "https://idp.une.edu.au/idp/profile/SAML2/Redirect/SSO?execution=e1s2";
+  expect(
+    detectAuthFailure(staleURL, "University of New England Login Service - Stale Request"),
+  ).toBe("stale_sso");
+  // Same URL, live login form: must never classify, or the recovery re-drive
+  // would reload the page out from under a half-typed password.
+  expect(detectAuthFailure(staleURL, "University of New England Login Service")).toBeUndefined();
+  // No title yet (the update that races `complete`): stay silent, wait for it.
+  expect(detectAuthFailure(staleURL, undefined)).toBeUndefined();
+});

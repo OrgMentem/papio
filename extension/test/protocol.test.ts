@@ -25,6 +25,25 @@ test("valid browser corpus parses", () => {
   }
 });
 
+test("handoff_focus is an empty job-scoped frame listed by the shared schema", () => {
+  const text = readFileSync(join(corpusRoot, "valid", "browser-handoff-focus.json"), "utf8");
+  const msg = parseBrowserMessageBytes(text);
+  expect(msg.type).toBe("handoff_focus");
+  expect(msg.job_id).toBe("job_focus_001");
+  expect(msg.payload).toEqual({});
+
+  const schema = JSON.parse(readFileSync(join(import.meta.dir, "..", "..", "protocol", "browser-v1.schema.json"), "utf8")) as {
+    properties: { type: { enum: string[] } };
+  };
+  expect(schema.properties.type.enum).toContain("handoff_focus");
+
+  const frame = JSON.parse(text) as Record<string, unknown>;
+  const withoutJobID = { ...frame };
+  delete withoutJobID["job_id"];
+  expect(() => parseBrowserMessage(withoutJobID)).toThrow(ProtocolError);
+  expect(() => parseBrowserMessage({ ...frame, payload: { unexpected: true } })).toThrow(ProtocolError);
+});
+
 test("triage schema 1 keeps the locked action shape while schema 2 carries access classification", () => {
   const text = readFileSync(join(corpusRoot, "valid", "browser-triage-snapshot-response.json"), "utf8");
   expect(JSON.stringify(parseBrowserMessageBytes(text).payload))

@@ -90,19 +90,31 @@ const TRIAGE_SNAPSHOT_SCHEMA_2_FEATURE = "triage_snapshot_schema_v2";
 const TRIAGE_MUTATIONS_FEATURE = "triage_mutations_v1";
 const REVIEW_PREVIEW_FEATURE = "review_preview_v1";
 const STATS_FEATURE = "browser_stats_v1";
+/** Daemon replies that settle a correlated `requestNative` call. `requestNative`
+ * rejects any type outside this set before registering a wait, so wrappers and
+ * variables cannot create a request that only fails later by timing out. */
+const CORRELATED_RESULT_TYPES: ReadonlySet<BrowserMessageType> = new Set([
+  "triage_snapshot_response",
+  "triage_counts_response",
+  "triage_decide_result",
+  "human_action_resolve_result",
+  "review_preview_result",
+  "stats_response",
+]);
 // Fallback for a manifest without an action popup; both build targets ship
 // the pages under dist/ (see build.ts) and the manifest is the source of truth.
 const POPUP_PAGE_PATH = "dist/popup.html";
-/** Title of papio's collapsed handoff tab group. Used both to style the group
- * and to rediscover an orphaned group by title after an extension reload wipes
- * the in-memory group id (session storage is cleared, but the physical group
- * survives in the window). Keep the create-title and the query-title identical. */
+/** Stable base title for papio's handoff group. A surfaced paper temporarily
+ * appends its identity, but always returns to this title so a later worker can
+ * rediscover the group without retaining page state. */
 const HANDOFF_GROUP_TITLE = "papio";
+const HANDOFF_GROUP_TITLE_MAX_TITLE_LENGTH = 72;
 
 /** Whether this adapter's SPA must render outside the minimized work window. */
 export function needsVisibleWindow(spec: AdapterSpec | undefined): boolean {
   return spec?.requiresVisible === true;
 }
+
 
 export interface Listenable<A extends unknown[]> {
   addListener(cb: (...args: A) => void): void;
@@ -135,6 +147,10 @@ export interface TabInfo {
 export interface TabChangeInfo {
   url?: string | undefined;
   status?: string | undefined;
+  /** Chrome fires a title-only update when a document's title resolves after
+   * the load completes. Needed because some IdP failure pages are classifiable
+   * only by title (see onTabUpdated). */
+  title?: string | undefined;
 }
 
 export interface WindowInfo {
@@ -202,7 +218,7 @@ export interface BridgeDeps {
     get(windowID: number): Promise<WindowInfo>;
     update(
       windowID: number,
-      props: { focused?: boolean; state?: "normal" | "minimized" },
+      props: { focused?: boolean; state?: "normal" | "minimized"; drawAttention?: boolean },
     ): Promise<unknown>;
     /** Close papio's dedicated work window once it holds no papio tabs, so the
      * background window never accumulates across handoffs. */
@@ -627,12 +643,25 @@ export class Bridge {
   /** Jobs that already reported a given handoff failure outcome, so one bad
    * IdP page does not spam the daemon. Cleared on job removal. */
   private readonly handoffOutcomeSent = new Set<string>();
+  /** Jobs whose work window was already raised for a detected IdP failure this
+   * worker lifetime, so a bounded re-drive loop cannot yank focus repeatedly.
+   * Cleared on job removal. */
+  private readonly authFailureSurfaced = new Set<string>();
+  /** Chrome can dispatch a document's `complete` and title updates without
+   * awaiting either callback; their shared epoch prevents one stale page from
+   * consuming multiple recovery attempts. */
+  private readonly staleRecoveryEpochs = new Map<string, number>();
+  private readonly staleRecoveryAttemptedEpochs = new Map<string, number>();
+  private readonly staleRecoveryInFlightEpochs = new Map<string, number>();
   /** Resolver pages that conclusively show zero electronic holdings are terminal
    * for this offer. Keep this worker-local debounce until the job is removed so
    * reloads and SPA completion events cannot report the same outcome repeatedly. */
   private readonly resolverNoEntitlementSent = new Set<string>();
   /** Authentication observed during this service-worker lifetime. */
   private authReturnedThisWorker = false;
+  /** A completed OA landing can release only OA concurrency queues; it is never
+   * evidence that an institutional SSO session exists. */
+  private openAccessLandingObserved = false;
   /** Keepalive has observed its resolver tab return from authentication. */
   private keepaliveAuthenticated = false;
   /** Atomically reserves the one visible handoff while tabs.create is in flight. */
@@ -641,8 +670,6 @@ export class Bridge {
   /** Callers that arrive while the single queue drain is opening a tab wait for
    * that drain to settle before inspecting the job's resulting tab. */
   private readonly queuedHandoffDrainWaiters = new Set<() => void>();
-  /** Latest resolver URL from an offer, retained for the keepalive manager. */
-  private latestOfferOpenURL: string | undefined;
   /** Pending fallback-release timers, keyed by queued job. Worker-local only. */
   private readonly queuedHandoffTimers = new Map<string, object>();
   /** Forced job IDs awaiting release; consumed by the single active drain so
@@ -677,6 +704,14 @@ export class Bridge {
   constructor(private readonly deps: BridgeDeps) {}
   trackedJobCount(): number {
     return this.store.activeJobs.length;
+  }
+
+  /** A cold preflight has no tab yet; excluding it would hide the only sign-in
+   * signal when keepalive is disabled. */
+  private signInBlockerCount(): number {
+    return this.store.activeJobs.filter(
+      (job) => job.status === "auth_pending" || (job.status === "queued" && job.requires_auth === true),
+    ).length;
   }
 
   /** Resolve where handoffs open. A tri-state setting (if present) wins; else
@@ -786,8 +821,12 @@ export class Bridge {
     // title before creating a duplicate group (and duplicate SSO tab).
     if (tabGroups !== undefined) {
       try {
-        const found = await tabGroups.query({ title: HANDOFF_GROUP_TITLE });
-        const reuse = found[0];
+        const found = await tabGroups.query({});
+        const reuse = found.find(
+          (candidate) =>
+            candidate.title === HANDOFF_GROUP_TITLE ||
+            candidate.title?.startsWith(`${HANDOFF_GROUP_TITLE} — `) === true,
+        );
         if (reuse !== undefined) {
           await group({ tabIds: [tabID], groupId: reuse.id });
           await this.update((s) => ({ ...s, handoffGroupID: reuse.id }));
@@ -873,6 +912,18 @@ export class Bridge {
     }
   }
 
+  private handoffGroupTitle(tabID: number): string {
+    const jobs = this.store.activeJobs.filter((job) => job.tab_id >= 0);
+    if (jobs.length !== 1 || jobs[0]?.tab_id !== tabID) return HANDOFF_GROUP_TITLE;
+    const title = jobs[0].expected?.title?.replace(/\s+/g, " ").trim();
+    if (!title) return HANDOFF_GROUP_TITLE;
+    const shortTitle =
+      title.length <= HANDOFF_GROUP_TITLE_MAX_TITLE_LENGTH
+        ? title
+        : `${title.slice(0, HANDOFF_GROUP_TITLE_MAX_TITLE_LENGTH - 1).trimEnd()}…`;
+    return `${HANDOFF_GROUP_TITLE} — ${shortTitle}`;
+  }
+
   /** Bring the handoff tab to the human for authentication. In work-window mode
    * this activates the tab and restores/focuses the window; in tab-group mode it
    * expands the collapsed "papio" group and activates the tab. No-op for legacy
@@ -881,7 +932,7 @@ export class Bridge {
     const groupID = this.store.handoffGroupID;
     if (groupID !== undefined && this.deps.tabGroups !== undefined) {
       try {
-        await this.deps.tabGroups.update(groupID, { collapsed: false });
+        await this.deps.tabGroups.update(groupID, { title: this.handoffGroupTitle(tabID), collapsed: false });
       } catch {
         // Group gone; activating the tab below still surfaces it.
       }
@@ -904,6 +955,7 @@ export class Bridge {
       const win = await windows.get(windowID);
       await windows.update(windowID, {
         focused: true,
+        drawAttention: true,
         ...(win.state === "minimized" ? { state: "normal" as const } : {}),
       });
     } catch {
@@ -911,20 +963,30 @@ export class Bridge {
     }
   }
 
-  /** Re-collapse the "papio" group after the human finishes authentication so it
-   * folds back out of the way. No-op outside tab-group mode. Best-effort. */
-  private async recollapseHandoffGroup(): Promise<void> {
+  /** A missing group id must not be reused after the physical group disappeared. */
+  private async recollapseHandoffGroup(): Promise<boolean> {
     const groupID = this.store.handoffGroupID;
-    if (groupID === undefined || this.deps.tabGroups === undefined) return;
+    if (groupID === undefined || this.deps.tabGroups === undefined) return false;
     try {
-      await this.deps.tabGroups.update(groupID, { collapsed: true });
+      await this.deps.tabGroups.get(groupID);
+      await this.deps.tabGroups.update(groupID, { title: HANDOFF_GROUP_TITLE, collapsed: true });
+      return true;
     } catch {
-      // Group gone or already collapsed; nothing to recover.
+      // Group gone; its stored id must not be reused.
+      return false;
     }
   }
 
+  /** Keepalive must preserve an institutional session, not follow whichever
+   * open-access offer happened to arrive last. */
   latestOpenURL(): string | undefined {
-    return this.latestOfferOpenURL;
+    for (let index = this.store.activeJobs.length - 1; index >= 0; index -= 1) {
+      const job = this.store.activeJobs[index];
+      if (job === undefined || job.requires_auth !== true) continue;
+      const openurl = this.offerURLs.get(job.job_id);
+      if (openurl !== undefined) return openurl;
+    }
+    return undefined;
   }
 
   /** The keepalive manager pins its resolver tab inside the work window when
@@ -935,8 +997,8 @@ export class Bridge {
 
   /** Keep the persistent daemon-health state visible without interrupting the
    * user. A badge failure is non-fatal: native bridging must keep recovering. */
-  /** Badge precedence is semantic, not color-only: disconnected, permission
-   * blockers, then the last daemon-reported pending triage count. */
+  /** Badge precedence is semantic, not color-only: disconnected, sign-in
+   * blockers, permission blockers, then the last daemon-reported pending triage count. */
   async syncConnectionBadge(status = this.store.connectionStatus): Promise<void> {
     try {
       if (status !== "connected") {
@@ -947,18 +1009,35 @@ export class Bridge {
         ]);
         return;
       }
+      // A cold institutional offer is deliberately queued before opening an
+      // unproven SAML exchange. Count it here so disabled keepalive cannot hide
+      // the only sign-in signal while that preflight waits.
+      const signInBlockersBeforePermissions = this.signInBlockerCount();
       let ungranted = 0;
-      for (const origin of this.store.resolverOrigins ?? []) {
-        try {
-          if (!(await this.deps.permissions.contains({ origins: [`${origin}/*`] }))) ungranted += 1;
-        } catch {
-          ungranted += 1;
+      if (signInBlockersBeforePermissions === 0) {
+        for (const origin of this.store.resolverOrigins ?? []) {
+          try {
+            if (!(await this.deps.permissions.contains({ origins: [`${origin}/*`] }))) ungranted += 1;
+          } catch {
+            ungranted += 1;
+          }
         }
       }
       // The contains() calls above are async; if the port dropped meanwhile,
       // onPortDisconnect already painted "!" — don't overwrite it with a stale
       // connected-state badge.
       if (this.store.connectionStatus !== "connected") return;
+      const signInBlockers = this.signInBlockerCount();
+      if (signInBlockers > 0) {
+        await Promise.all([
+          this.deps.action.setBadgeText({ text: String(signInBlockers) }),
+          this.deps.action.setBadgeBackgroundColor({ color: "#b06000" }),
+          this.deps.action.setTitle?.({
+            title: `Papio: ${signInBlockers} paper${signInBlockers === 1 ? "" : "s"} waiting on your institution sign-in`,
+          }),
+        ]);
+        return;
+      }
       if (ungranted > 0) {
         await Promise.all([
           this.deps.action.setBadgeText({ text: String(ungranted) }),
@@ -972,6 +1051,7 @@ export class Bridge {
       const pending = this.triagePendingCount;
       await Promise.all([
         this.deps.action.setBadgeText({ text: pending !== undefined && pending > 0 ? String(pending) : "" }),
+        this.deps.action.setBadgeBackgroundColor({ color: "#1a73e8" }),
         this.deps.action.setTitle?.({
           title:
             pending === undefined
@@ -1001,7 +1081,6 @@ export class Bridge {
       for (const [jobID, url] of Object.entries(s.offerURLs ?? {})) {
         if (typeof url !== "string" || findByJob(s, jobID) === undefined) continue;
         this.offerURLs.set(jobID, url);
-        this.latestOfferOpenURL = url;
       }
       this.hydrated = true;
       await this.update((current) => current);
@@ -1207,6 +1286,30 @@ export class Bridge {
     return { ok: true, opened: true };
   }
 
+  /** A daemon-directed retry may refresh an expired authentication exchange;
+   * the inbox and popup retain focus-only behavior so they cannot disrupt a
+   * provider page that is already downloading. */
+  private async focusDaemonHandoff(jobID: string): Promise<void> {
+    await this.ready;
+    const job = findByJob(this.store, jobID);
+    const openurl = this.offerURLs.get(jobID);
+    if (job !== undefined && job.tab_id >= 0 && openurl !== undefined && this.deps.tabs.update !== undefined) {
+      try {
+        const tab = await this.deps.tabs.get(job.tab_id);
+        const needsFreshResolver =
+          job.status === "auth_pending" || (typeof tab.url === "string" && isAuthenticationURL(tab.url));
+        if (tab.id === job.tab_id && needsFreshResolver) {
+          // This is an explicit human retry, not an autonomous loop; charging it
+          // would let prior stale failures consume the fresh link they requested.
+          await this.deps.tabs.update(job.tab_id, { url: openurl });
+        }
+      } catch {
+        // The focus path below still returns the local missing-tab outcome.
+      }
+    }
+    await this.openHandoff(jobID);
+  }
+
   private failure(code: string, message: string): BrokerFailure {
     return { ok: false, error: { code, message } };
   }
@@ -1312,6 +1415,9 @@ export class Bridge {
     feature: string,
     mutation: boolean,
   ): Promise<NativeRequestResult> {
+    if (!CORRELATED_RESULT_TYPES.has(expectedType)) {
+      throw new Error(`papio: correlated request expects unrouted reply type ${expectedType}`);
+    }
     const attempts = mutation ? 1 : 2;
     for (let attempt = 0; attempt < attempts; attempt += 1) {
       if (!(await this.ensureConnected())) {
@@ -1588,6 +1694,7 @@ export class Bridge {
    * non-authoritative pending count when the negotiated schema supports it. */
   private async onKeepaliveAlarm(): Promise<void> {
     await this.ready;
+    await this.releaseExpiredQueuedHandoffs();
     if (this.port === null && !this.closingDeliberately) {
       this.reconnectAttempts = 0;
       this.connect();
@@ -1705,8 +1812,10 @@ export class Bridge {
   }
 
   private async update(fn: (store: StoreShape) => StoreShape): Promise<void> {
+    const signInBlockersBefore = this.signInBlockerCount();
     // Apply the transform synchronously so in-memory state stays in event order.
     this.store = fn(this.store);
+    const signInBlockersChanged = signInBlockersBefore !== this.signInBlockerCount();
     // Persist after any in-flight save settles, writing the latest snapshot so
     // reordered chrome.storage writes cannot resurrect an older one.
     const save = this.saveChain.then(() => this.deps.backend.save(this.store));
@@ -1714,6 +1823,7 @@ export class Bridge {
     // this caller still observes the real error below.
     this.saveChain = save.catch(() => {});
     await save;
+    if (signInBlockersChanged) await this.syncConnectionBadge();
   }
 
   private async upsertJobWithOffer(job: ActiveJob, offerURL: string): Promise<void> {
@@ -1736,6 +1846,10 @@ export class Bridge {
     this.federatedReDriven.delete(jobID);
     this.handoffOutcomeSent.delete(`${jobID}:stale_sso`);
     this.handoffOutcomeSent.delete(`${jobID}:auth_error`);
+    this.authFailureSurfaced.delete(jobID);
+    this.staleRecoveryEpochs.delete(jobID);
+    this.staleRecoveryAttemptedEpochs.delete(jobID);
+    this.staleRecoveryInFlightEpochs.delete(jobID);
     this.resolverNoEntitlementSent.delete(jobID);
     this.proquestAccountIDs.delete(jobID);
     this.accountIdAppended.delete(jobID);
@@ -1784,21 +1898,13 @@ export class Bridge {
     });
   }
 
-  /** Drop the stored "papio" group id once no handoff owns a tab and Chrome has
-   * removed the (now-empty) group. A keepalive tab folded into the group keeps
-   * it live, so the id is retained for reuse. No-op outside tab-group mode. */
+  /** A keepalive tab can outlive a cancellation, so clear its removed paper's
+   * title before retaining the group for reuse. */
   private async dropStaleHandoffGroup(): Promise<void> {
     const groupID = this.store.handoffGroupID;
     if (groupID === undefined) return;
     if (this.store.activeJobs.some((job) => job.tab_id >= 0)) return;
-    if (this.deps.tabGroups !== undefined) {
-      try {
-        await this.deps.tabGroups.get(groupID);
-        return; // still exists (e.g. a keepalive tab) -> reuse it next handoff
-      } catch {
-        // Group gone: fall through and clear the stale id.
-      }
-    }
+    if (await this.recollapseHandoffGroup()) return;
     await this.update((s) => {
       const next = { ...s };
       delete next.handoffGroupID;
@@ -1813,6 +1919,15 @@ export class Bridge {
    * across service-worker restarts within a browser session. */
   private async noteAuthAttempt(jobID: string, tabID: number): Promise<void> {
     if (this.authCountedTabs.has(tabID)) return;
+    await this.chargeAuthAttempt(jobID, tabID);
+  }
+
+  /** Spend one unit of a job's durable authentication budget and claim its tab.
+   * Claiming matters for the stale-IdP re-drive, which charges explicitly
+   * because it reuses the SAME tab (noteAuthAttempt's debounce would swallow
+   * it): the claim stops the ordinary auth_pending path, which this tab update
+   * falls through to next, from charging the same drive a second time. */
+  private async chargeAuthAttempt(jobID: string, tabID: number): Promise<void> {
     this.authCountedTabs.add(tabID);
     await this.update((s) => {
       const authAttempts = { ...(s.authAttempts ?? {}) };
@@ -1853,10 +1968,35 @@ export class Bridge {
     return this.authReturnedThisWorker || this.keepaliveAuthenticated || this.hasRecentAuthEvidence();
   }
 
-  /** Persist evidence from a usable resolver landing in the same durable stamp
-   * used by an auth return. The first observed signal also releases any cold
-   * queue and refreshes tabs still parked at an IdP. */
-  private async recordUsableSession(now: number): Promise<void> {
+  /** Keeps an OA landing from opening an institutional queue while preserving
+   * the existing one-visible-tab flow for ordinary offers. */
+  private hasHandoffReleaseEvidence(requiresAuth: boolean | undefined): boolean {
+    return this.hasAuthEvidence() || (requiresAuth !== true && this.openAccessLandingObserved);
+  }
+
+  /** A warm provider or resolver landing proves this job's institution has a
+   * session; an unrelated completed page must not unlock its queued peers. */
+  private isInstitutionalSessionLanding(job: ActiveJob, rawURL: string): boolean {
+    if (job.requires_auth !== true || isAuthenticationURL(rawURL)) return false;
+    const offered = this.offerURLs.get(job.job_id);
+    if (offered === undefined) return false;
+    try {
+      const landing = new URL(rawURL);
+      const offer = new URL(offered);
+      return (
+        landing.origin === offer.origin ||
+        hostMatches(landing.hostname, job.provider_hosts) ||
+        this.deps.adapterSpecs.some((adapter) => hostMatches(landing.hostname, adapter.hosts))
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  /** Persist only an institutional session proof, because an OA completion can
+   * otherwise mint an unattended SAML request for every waiting handoff. */
+  private async recordInstitutionalSession(job: ActiveJob, rawURL: string, now: number): Promise<boolean> {
+    if (!this.isInstitutionalSessionLanding(job, rawURL)) return false;
     const firstAuthEvidence = !this.authReturnedThisWorker;
     this.authReturnedThisWorker = true;
     await this.update((s) => ({ ...s, lastAuthReturnedAt: now }));
@@ -1864,21 +2004,48 @@ export class Bridge {
       await this.releaseQueuedHandoffs();
       await this.reloadAuthenticationHandoffs();
     }
+    return true;
   }
 
-  /** A queue must not become an invisible permanent sink when an already-warm
-   * SSO session never produces an IdP round trip. Timers are deliberately
-   * worker-local: startup independently checks durable evidence and live tabs. */
+  /** OA completions retain the ordinary queue flow without becoming evidence
+   * that it is safe to reload or open an institutional sign-in. */
+  private async recordOpenAccessLanding(job: ActiveJob): Promise<void> {
+    if (job.requires_auth === true) return;
+    const firstOpenAccessLanding = !this.openAccessLandingObserved;
+    this.openAccessLandingObserved = true;
+    await this.releaseQueuedHandoffs();
+    if (firstOpenAccessLanding) await this.reloadAuthenticationHandoffs(false);
+  }
+
+  /** Waiting briefly avoids an unattended SAML exchange; a bounded fallback
+   * prevents that safety check from parking a cold handoff forever. */
   private scheduleQueuedHandoffRelease(jobID: string): void {
+    const job = findByJob(this.store, jobID);
+    if (job === undefined || job.status !== "queued") {
+      this.queuedHandoffTimers.delete(jobID);
+      this.pendingForcedReleases.delete(jobID);
+      return;
+    }
     if (this.queuedHandoffTimers.has(jobID)) return;
     const token = {};
     this.queuedHandoffTimers.set(jobID, token);
+    const delay = Math.max(0, job.offered_at + QUEUED_HANDOFF_RELEASE_MS - this.deps.now());
     this.deps.setTimeout(async () => {
       if (this.queuedHandoffTimers.get(jobID) !== token) return;
       this.queuedHandoffTimers.delete(jobID);
       await this.ready;
       await this.releaseQueuedHandoffs(jobID);
-    }, QUEUED_HANDOFF_RELEASE_MS);
+    }, delay);
+  }
+
+  /** MV3 timers die with their worker. The periodic wake checks durable offer
+   * times so a cold queue cannot restart its fallback window forever on sleep. */
+  private async releaseExpiredQueuedHandoffs(): Promise<void> {
+    const deadline = this.deps.now() - QUEUED_HANDOFF_RELEASE_MS;
+    const dueJobIDs = this.store.activeJobs
+      .filter((job) => job.status === "queued" && job.offered_at <= deadline)
+      .map((job) => job.job_id);
+    for (const jobID of dueJobIDs) await this.releaseQueuedHandoffs(jobID);
   }
 
   /** Startup has no worker-local timer state. A tracked tab already settled
@@ -1888,8 +2055,12 @@ export class Bridge {
       if (job.tab_id < 0 || job.status === "queued") continue;
       try {
         const tab = await this.deps.tabs.get(job.tab_id);
+        const institutionalSession =
+          typeof tab.url === "string" &&
+          (await this.recordInstitutionalSession(job, tab.url, this.deps.now()));
+        if (institutionalSession) return;
         if (typeof tab.url === "string" && !isAuthenticationURL(tab.url)) {
-          await this.recordUsableSession(this.deps.now());
+          await this.recordOpenAccessLanding(job);
           return;
         }
       } catch {
@@ -1908,7 +2079,7 @@ export class Bridge {
 
   private async releaseQueuedHandoffs(fallbackJobID?: string): Promise<void> {
     if (fallbackJobID !== undefined) this.pendingForcedReleases.add(fallbackJobID);
-    if (!this.hasAuthEvidence() && this.pendingForcedReleases.size === 0) {
+    if (!this.hasAuthEvidence() && !this.openAccessLandingObserved && this.pendingForcedReleases.size === 0) {
       return;
     }
     if (this.drainingQueuedHandoffs) {
@@ -1917,14 +2088,13 @@ export class Bridge {
     }
     this.drainingQueuedHandoffs = true;
     try {
-      // One drain loop owns both auth-driven draining and every forced release,
+      // One drain loop owns evidence-driven draining and every forced release,
       // including those queued by overlapping fallback timers while it runs.
-      while (this.hasAuthEvidence() || this.pendingForcedReleases.size > 0) {
-        let selected = this.hasAuthEvidence()
-          ? this.store.activeJobs.find((job) => job.status === "queued")
-          : undefined;
-        const forcedJobID =
-          selected === undefined ? this.pendingForcedReleases.values().next().value : undefined;
+      while (this.hasAuthEvidence() || this.openAccessLandingObserved || this.pendingForcedReleases.size > 0) {
+        let selected = this.store.activeJobs.find(
+          (job) => job.status === "queued" && this.hasHandoffReleaseEvidence(job.requires_auth),
+        );
+        let forcedJobID = selected === undefined ? this.pendingForcedReleases.values().next().value : undefined;
         if (forcedJobID !== undefined) {
           this.pendingForcedReleases.delete(forcedJobID);
           selected = this.store.activeJobs.find(
@@ -1932,15 +2102,17 @@ export class Bridge {
           );
         }
         if (selected === undefined) {
-          // Auth evidence releases every queued job, so none remaining means
-          // any leftover forced IDs are moot; drop them and stop.
+          // Institutional evidence can drain every queue. OA evidence must
+          // leave institutional jobs parked until their own session is proven.
           if (this.hasAuthEvidence()) {
             this.pendingForcedReleases.clear();
             return;
           }
+          if (this.openAccessLandingObserved && this.pendingForcedReleases.size === 0) return;
           continue;
         }
         const queued = selected; // const so narrowing survives the update closure.
+        const forceSurface = forcedJobID === queued.job_id && queued.requires_auth === true;
         this.queuedHandoffTimers.delete(queued.job_id);
         const url = this.offerURLs.get(queued.job_id);
         if (url === undefined) {
@@ -1950,7 +2122,7 @@ export class Bridge {
         }
         let tabID: number | undefined;
         try {
-          tabID = await this.openBrokerTab(url, false);
+          tabID = await this.openBrokerTab(url, forceSurface);
         } catch (e) {
           console.error("papio: queued handoff tab creation failed", e);
         }
@@ -1966,6 +2138,7 @@ export class Bridge {
             download_initiated: false,
           }),
         );
+        if (forceSurface) await this.surfaceWorkTab(tabID);
       }
     } finally {
       this.drainingQueuedHandoffs = false;
@@ -1974,9 +2147,11 @@ export class Bridge {
     }
   }
 
-  private async reloadAuthenticationHandoffs(): Promise<void> {
+  private async reloadAuthenticationHandoffs(includeInstitutional = true): Promise<void> {
     for (const job of this.store.activeJobs) {
-      if (job.tab_id < 0 || job.status === "queued") continue;
+      if (job.tab_id < 0 || job.status === "queued" || (!includeInstitutional && job.requires_auth === true)) {
+        continue;
+      }
       try {
         const tab = await this.deps.tabs.get(job.tab_id);
         if (typeof tab.url === "string" && isAuthenticationURL(tab.url)) {
@@ -2053,12 +2228,30 @@ export class Bridge {
       return;
     }
     await this.ready;
+    // Every correlated daemon result is routed from ONE list. When the switch
+    // below enumerated these case-by-case, review_preview_result was simply
+    // absent: the daemon issued the preview capability, the frame fell through
+    // to the ignore-echo default, and every "View PDF" click sat until its
+    // request timed out reporting that the daemon had not responded. A reply
+    // type can no longer be named as a requestNative expectation and go
+    // unrouted here.
+    if (CORRELATED_RESULT_TYPES.has(msg.type)) {
+      this.resolveNativeResponse(msg);
+      return;
+    }
     switch (msg.type) {
       case "job_offer":
         await this.onJobOffer(msg);
         return;
       case "cancel":
         await this.onCancel(msg);
+        return;
+      case "handoff_focus":
+        if (msg.job_id !== undefined) {
+          // A missing handoff may refresh counts, whose reply is serialized on
+          // this FIFO; detach it so the correlated reply can be received.
+          void this.focusDaemonHandoff(msg.job_id);
+        }
         return;
       case "hello_ack": {
         const version = typeof msg.payload.daemon_version === "string" ? msg.payload.daemon_version : null;
@@ -2096,13 +2289,6 @@ export class Bridge {
         }
         return;
       }
-      case "triage_snapshot_response":
-      case "triage_counts_response":
-      case "triage_decide_result":
-      case "human_action_resolve_result":
-      case "stats_response":
-        this.resolveNativeResponse(msg);
-        return;
       case "ack":
         await this.closeAfterAdoption(msg.job_id);
         return;
@@ -2130,9 +2316,9 @@ export class Bridge {
     // Shape is already guaranteed by parseBrowserMessage; these narrow for TS.
     if (typeof openurl !== "string" || !Array.isArray(hostsRaw) || typeof expiresAt !== "string") return;
     const priorOfferURL = this.offerURLs.get(jobID);
-    this.latestOfferOpenURL = openurl;
     const providerHosts = hostsRaw.filter((h): h is string => typeof h === "string");
     const expected = parseExpected(p["expected"]);
+    const requiresAuth = typeof p["requires_auth"] === "boolean" ? p["requires_auth"] : undefined;
     const loginEntityID = p["login_entity_id"];
     if (typeof loginEntityID === "string" && loginEntityID.length > 0) {
       this.loginEntityIDs.set(jobID, loginEntityID);
@@ -2146,6 +2332,23 @@ export class Bridge {
     // without its durable offer URL cannot represent an in-flight download:
     // discard that stale record so this offer recreates the real browser work.
     const existing = findByJob(this.store, jobID);
+    if (existing !== undefined && existing.requires_auth !== requiresAuth) {
+      // A restored job can predate this field; its first re-offer must learn the
+      // requirement before a fallback can recreate an expired sign-in request.
+      if (requiresAuth === undefined) {
+        await this.update((s) => ({
+          ...s,
+          activeJobs: s.activeJobs.map((job) => {
+            if (job.job_id !== jobID) return job;
+            const next = { ...job };
+            delete next.requires_auth;
+            return next;
+          }),
+        }));
+      } else {
+        await this.update((s) => patchJob(s, jobID, { requires_auth: requiresAuth }));
+      }
+    }
     if (existing) {
       if (existing.tab_id < 0) {
         if (priorOfferURL === undefined) {
@@ -2153,7 +2356,10 @@ export class Bridge {
           await this.removeJobWithOffer(jobID);
         } else if (priorOfferURL === openurl) {
           this.send("job_accept", {}, jobID);
-          if (existing.status === "queued") await this.releaseQueuedHandoffs();
+          if (existing.status === "queued") {
+            this.scheduleQueuedHandoffRelease(jobID);
+            await this.releaseQueuedHandoffs();
+          }
           return;
         } else {
           this.downloads.delete(jobID);
@@ -2205,6 +2411,7 @@ export class Bridge {
       status,
       provider_hosts: providerHosts,
       ...(expected !== undefined ? { expected } : {}),
+      ...(requiresAuth !== undefined ? { requires_auth: requiresAuth } : {}),
     });
     if (isDirectFileOffer(openurl)) {
       await this.upsertJobWithOffer(makeJob(-1), openurl);
@@ -2214,8 +2421,9 @@ export class Bridge {
     }
 
     const queueHandoff =
-      !this.hasAuthEvidence() &&
-      (this.handoffOpening ||
+      !this.hasHandoffReleaseEvidence(requiresAuth) &&
+      (requiresAuth === true ||
+        this.handoffOpening ||
         this.store.activeJobs.some((job) => job.tab_id >= 0 && job.status !== "queued"));
     if (queueHandoff) {
       await this.upsertJobWithOffer(makeJob(-1, "queued"), openurl);
@@ -2299,8 +2507,9 @@ export class Bridge {
     const url = this.offerURLs.get(jobID);
     if (!job || job.tab_id >= 0 || url === undefined) return;
     const queueHandoff =
-      !this.hasAuthEvidence() &&
-      (this.handoffOpening ||
+      !this.hasHandoffReleaseEvidence(job.requires_auth) &&
+      (job.requires_auth === true ||
+        this.handoffOpening ||
         this.store.activeJobs.some((candidate) => candidate.tab_id >= 0 && candidate.status !== "queued"));
     if (queueHandoff) {
       await this.update((s) =>
@@ -2382,32 +2591,43 @@ export class Bridge {
     }
     const url = change.url ?? tab.url;
     if (url === undefined) return;
+    if (change.status === "loading") this.advanceStaleRecoveryEpoch(job.job_id);
+    const staleRecoveryEpoch = this.staleRecoveryEpochs.get(job.job_id) ?? 0;
     let host: string;
     try {
       host = new URL(url).hostname;
     } catch {
       return;
     }
-    if (change.status === "complete") {
+    // A title-only update counts: the UNE Shibboleth stale page is classifiable
+    // ONLY by its title ("… Login Service - Stale Request"); its URL is byte-for-byte
+    // the URL of the working login form. Chrome can deliver that title after the
+    // `complete` event, and detection used to run on `complete` alone — so the one
+    // page papio most needs to recognize was the one it could silently miss.
+    if (change.status === "complete" || change.title !== undefined) {
       const failure = detectAuthFailure(url, tab.title);
-      if (failure !== undefined && !this.handoffOutcomeSent.has(`${job.job_id}:${failure}`)) {
+      if (failure !== undefined) {
+        // Surface every recognized IdP failure. Only a terminal stale-request
+        // signature is safe to navigate away from; password recovery and retry
+        // forms must remain where the human can use them.
+        if (!this.authFailureSurfaced.has(job.job_id)) {
+          this.authFailureSurfaced.add(job.job_id);
+          await this.surfaceWorkTab(job.tab_id);
+        }
         // Mark only after a successful send: a dropped native port must not
         // permanently swallow the one report this job gets for this outcome.
-        if (this.send("handoff_outcome", { outcome: failure, final_host: host }, job.job_id)) {
+        if (
+          !this.handoffOutcomeSent.has(`${job.job_id}:${failure}`) &&
+          this.send("handoff_outcome", { outcome: failure, final_host: host }, job.job_id)
+        ) {
           this.handoffOutcomeSent.add(`${job.job_id}:${failure}`);
-          // The dead IdP page is not recoverable by waiting. Re-drive the
-          // tab through the retained resolver offer URL once: the resolver
-          // mints a fresh SAML exchange against the now-warmer session. The
-          // daemon only records the failure; recovery lives here.
-          const openurl = this.offerURLs.get(job.job_id);
-          if (openurl !== undefined && this.deps.tabs.update !== undefined) {
-            try {
-              await this.deps.tabs.update(job.tab_id, { url: openurl });
-              return;
-            } catch {
-              // Tab vanished mid-recovery; the normal removal path re-queues.
-            }
-          }
+        }
+        if (
+          failure === "stale_sso" &&
+          /\bstale\s+request\b/i.test(tab.title ?? "") &&
+          (await this.redriveStaleHandoff(job, staleRecoveryEpoch))
+        ) {
+          return;
         }
       }
     }
@@ -2419,7 +2639,10 @@ export class Bridge {
       await this.update((s) => patchJob(s, job.job_id, { adapter_id: adapter.id }));
     }
     const successfulLanding = change.status === "complete" && !isAuthenticationURL(url);
-    if (successfulLanding) await this.recordUsableSession(this.deps.now());
+    if (successfulLanding) {
+      const institutionalSession = await this.recordInstitutionalSession(job, url, this.deps.now());
+      if (!institutionalSession) await this.recordOpenAccessLanding(job);
+    }
     if (change.status === "complete" && (await this.maybeRouteResolver(job, url))) return;
     // The offer's provider_hosts list is capped by the protocol (20 entries);
     // the adapter registry is the authoritative host source for classification,
@@ -2466,19 +2689,12 @@ export class Bridge {
       const started = job.auth_started_ms ?? this.deps.now();
       const now = this.deps.now();
       const elapsed = Math.max(0, now - started);
-      const firstAuthReturn = !this.authReturnedThisWorker;
-      this.authReturnedThisWorker = true;
-      await this.update((s) => ({
-        ...patchJob(s, job.job_id, { status: "awaiting_download" }),
-        lastAuthReturnedAt: now,
-      }));
+      await this.update((s) => patchJob(s, job.job_id, { status: "awaiting_download" }));
       this.send("auth_returned", { elapsed_ms: elapsed }, job.job_id);
       // The human is past authentication; fold the "papio" group back away.
       await this.recollapseHandoffGroup();
-      if (firstAuthReturn) {
-        await this.releaseQueuedHandoffs();
-        await this.reloadAuthenticationHandoffs();
-      }
+      const institutionalSession = await this.recordInstitutionalSession(job, url, now);
+      if (!institutionalSession) await this.recordOpenAccessLanding(job);
       // If we routed this job through federated login, the return lands on the
       // provider's generic post-login page (the DS target), not the article.
       // Re-drive the original openurl once so the now-warm session resolves the
@@ -2505,6 +2721,62 @@ export class Bridge {
     if (change.status === "complete") {
       await this.maybeDownloadPDFViewer(job.job_id, url);
       await this.maybeClassify(job.job_id, host);
+    }
+  }
+
+  /** Chrome's loading signal is the boundary between stale documents: title and
+   * complete notifications for that document can run concurrently. */
+
+  private advanceStaleRecoveryEpoch(jobID: string): void {
+    this.staleRecoveryEpochs.set(jobID, (this.staleRecoveryEpochs.get(jobID) ?? 0) + 1);
+    this.staleRecoveryAttemptedEpochs.delete(jobID);
+    this.staleRecoveryInFlightEpochs.delete(jobID);
+  }
+
+  /**
+   * Re-drive a handoff tab stranded on a dead IdP page through its retained
+   * resolver offer URL, so the resolver mints a fresh SAML exchange against the
+   * now-warmer session. The daemon only records the failure; recovery lives here.
+   *
+   * Charged against the same durable per-job authentication budget as a
+   * broker-tab drive. The worker-local report debounce cannot bound this: a
+   * service-worker restart clears it while the dead tab, the parked job, and the
+   * user's next sign-in attempt all survive, so the old "once per outcome" latch
+   * degenerated into an unbounded resolver loop across restarts. Past the cap the
+   * tab is deliberately LEFT on the failure page — the user needs to see it — and
+   * the job is reported human_auth_required, which keeps it parked daemon-side.
+   *
+   * Returns true once this document is claimed, so another callback cannot
+   * fall through and spend a second entry in the same recovery budget.
+   */
+  private async redriveStaleHandoff(job: ActiveJob, recoveryEpoch: number): Promise<boolean> {
+    if ((this.staleRecoveryEpochs.get(job.job_id) ?? 0) !== recoveryEpoch) return true;
+    if (
+      this.staleRecoveryAttemptedEpochs.get(job.job_id) === recoveryEpoch ||
+      this.staleRecoveryInFlightEpochs.get(job.job_id) === recoveryEpoch
+    ) {
+      return true;
+    }
+    const openurl = this.offerURLs.get(job.job_id);
+    if (openurl === undefined || job.tab_id < 0 || this.deps.tabs.update === undefined) return false;
+    this.staleRecoveryAttemptedEpochs.set(job.job_id, recoveryEpoch);
+    this.staleRecoveryInFlightEpochs.set(job.job_id, recoveryEpoch);
+    try {
+      if (this.authAttemptsFor(job.job_id) >= MAX_AUTH_ATTEMPTS) {
+        this.reportAuthStalled(job.job_id);
+        return false;
+      }
+      await this.chargeAuthAttempt(job.job_id, job.tab_id);
+      if ((this.staleRecoveryEpochs.get(job.job_id) ?? 0) !== recoveryEpoch) return true;
+      await this.deps.tabs.update(job.tab_id, { url: openurl });
+      return true;
+    } catch {
+      // Tab vanished mid-recovery; the normal removal path re-queues.
+      return false;
+    } finally {
+      if (this.staleRecoveryInFlightEpochs.get(job.job_id) === recoveryEpoch) {
+        this.staleRecoveryInFlightEpochs.delete(job.job_id);
+      }
     }
   }
 
@@ -3335,7 +3607,7 @@ function isInboxSender(sender: InboxRuntimeSender, urls: InboxRuntimeURLs): bool
   return sender.id === urls.runtimeID && sender.url === urls.inboxURL;
 }
 
-function isOpenInboxSender(sender: InboxRuntimeSender, urls: InboxRuntimeURLs): boolean {
+function isInboxOrPopupSender(sender: InboxRuntimeSender, urls: InboxRuntimeURLs): boolean {
   return sender.id === urls.runtimeID && (sender.url === urls.inboxURL || sender.url === urls.popupURL);
 }
 
@@ -3423,8 +3695,8 @@ function isHandoffOpenRuntimeRequest(value: unknown): value is { job_id: string 
 }
 
 /**
- * The inbox's finite, validated runtime boundary. Only the extension page may
- * make daemon-backed requests; the popup may only ask to open that page.
+ * The inbox owns every daemon-backed mutation. The popup has only the narrow
+ * focus capability, validated against its exact extension page URL.
  */
 export async function handleInboxRuntimeMessage(
   bridge: Bridge,
@@ -3435,7 +3707,7 @@ export async function handleInboxRuntimeMessage(
   if (!isObjectRecord(message) || typeof message["type"] !== "string") return undefined;
   const type = message["type"];
   if (type === "papio.openInbox") {
-    if (!isOpenInboxSender(sender, urls)) return runtimeFailure("unauthorized", "This sender cannot open the inbox");
+    if (!isInboxOrPopupSender(sender, urls)) return runtimeFailure("unauthorized", "This sender cannot open the inbox");
     if (!hasOnlyKeys(message, ["type"])) return runtimeFailure("invalid_request", "Invalid inbox open request");
     try {
       await bridge.openInbox(urls.inboxURL);
@@ -3451,13 +3723,23 @@ export async function handleInboxRuntimeMessage(
       ? bridge.requestStats()
       : runtimeFailure("invalid_request", "Invalid stats request");
   }
+  if (type === "papio.handoff.open") {
+    if (!isInboxOrPopupSender(sender, urls)) {
+      return runtimeFailure("unauthorized", "This sender cannot access the inbox broker");
+    }
+    if (!hasOnlyKeys(message, ["type", "request"])) {
+      return runtimeFailure("invalid_request", "Invalid handoff open request");
+    }
+    return isHandoffOpenRuntimeRequest(message["request"])
+      ? bridge.openHandoff(message["request"].job_id)
+      : runtimeFailure("invalid_request", "Invalid handoff open request");
+  }
   if (
     type !== "papio.triage.snapshot" &&
     type !== "papio.triage.counts" &&
     type !== "papio.triage.decide" &&
     type !== "papio.action.resolve" &&
-    type !== "papio.preview" &&
-    type !== "papio.handoff.open"
+    type !== "papio.preview"
   ) {
     return undefined;
   }
@@ -3489,10 +3771,6 @@ export async function handleInboxRuntimeMessage(
       return isPreviewRuntimeRequest(request)
         ? bridge.requestPreview(request)
         : runtimeFailure("invalid_request", "Invalid preview request");
-    case "papio.handoff.open":
-      return isHandoffOpenRuntimeRequest(request)
-        ? bridge.openHandoff(request.job_id)
-        : runtimeFailure("invalid_request", "Invalid handoff open request");
     default:
       return undefined;
   }
@@ -3538,8 +3816,10 @@ function realDeps(): BridgeDeps {
             // populate:true so the idle-close check can see a keepalive-pinned tab.
             get: (windowID: number) =>
               chrome.windows.get(windowID, { populate: true }) as Promise<WindowInfo>,
-            update: (windowID: number, props: { focused?: boolean; state?: "normal" }) =>
-              chrome.windows.update(windowID, props),
+            update: (
+              windowID: number,
+              props: { focused?: boolean; state?: "normal" | "minimized"; drawAttention?: boolean },
+            ) => chrome.windows.update(windowID, props),
             remove: (windowID: number) => chrome.windows.remove(windowID),
           },
         }
@@ -3699,9 +3979,6 @@ if (typeof chrome !== "undefined" && chrome.runtime?.id) {
   });
   chrome.permissions?.onRemoved?.addListener(() => {
     void bridge.syncConnectionBadge();
-  });
-  chrome.notifications?.onClicked?.addListener(() => {
-    void bridge.openInbox(inboxRuntimeURLs.inboxURL);
   });
   // KEEPALIVE INTEGRATION
   void bridge.start().then(() =>

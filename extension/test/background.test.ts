@@ -109,6 +109,9 @@ class FakeTabs {
   readonly reloaded: number[] = [];
   /** Tab ids activated through tabs.update({active: true}). */
   readonly activated: number[] = [];
+  /** URL navigations are distinct from focus updates, so tests can prove that
+   * a handoff refreshes only when its current document is an auth page. */
+  readonly navigations: { tabID: number; url: string }[] = [];
   readonly live = new Map<number, TabInfo>();
   nextId = 100;
   failCreate = false;
@@ -118,7 +121,10 @@ class FakeTabs {
   async update(tabID: number, props: { active?: boolean; url?: string }): Promise<TabInfo> {
     if (props.active) this.activated.push(tabID);
     const tab = this.live.get(tabID);
-    if (tab && props.url !== undefined) tab.url = props.url;
+    if (props.url !== undefined) {
+      this.navigations.push({ tabID, url: props.url });
+      if (tab) tab.url = props.url;
+    }
     return tab ?? {};
   }
   async create(props: { url: string; active: boolean; windowId?: number }): Promise<TabInfo> {
@@ -153,7 +159,10 @@ class FakeTabs {
 
 class FakeWindows {
   readonly created: { url: string; focused: boolean; state: string }[] = [];
-  readonly updated: { windowID: number; props: { focused?: boolean; state?: string } }[] = [];
+  readonly updated: {
+    windowID: number;
+    props: { focused?: boolean; state?: "normal" | "minimized"; drawAttention?: boolean };
+  }[] = [];
   readonly removed: number[] = [];
   readonly live = new Map<number, { id: number; state: string }>();
   nextId = 500;
@@ -176,7 +185,7 @@ class FakeWindows {
   }
   async update(
     windowID: number,
-    props: { focused?: boolean; state?: "normal" },
+    props: { focused?: boolean; state?: "normal" | "minimized"; drawAttention?: boolean },
   ): Promise<unknown> {
     this.updated.push({ windowID, props });
     const win = this.live.get(windowID);
@@ -857,6 +866,120 @@ test("pre-auth handoffs queue behind one visible tab, then release after auth re
   expect(h.tabs.reloaded).toEqual([stuckTabID]);
 });
 
+test("a cold requires-auth handoff is signalled while queued and opens after its bounded fallback", async () => {
+  // No KeepaliveManager reports an authenticated session in this harness: this
+  // is the disabled-keepalive, no-evidence path that must still reach the user.
+  const h = makeHarness();
+  const offer = jobOffer("job_0001a_requires_auth") as { payload: Record<string, unknown> };
+  offer.payload["requires_auth"] = true;
+
+  await h.bridge.start();
+  await h.bridge.setKeepaliveAuthenticated(false);
+  await h.port.inbound(helloAck());
+  await h.port.inbound(offer);
+
+  expect(h.tabs.created).toEqual([]);
+  expect(h.bridge.trackedJobCount()).toBe(1);
+  expect(h.backend.store.activeJobs[0]).toMatchObject({
+    job_id: "job_0001a_requires_auth",
+    tab_id: -1,
+    status: "queued",
+    requires_auth: true,
+  });
+  expect(h.action.texts.at(-1)).toBe("1");
+  expect(h.action.backgroundColors.at(-1)).toBe("#b06000");
+
+  // Treat the worker-local timer as lost with MV3 worker suspension. The
+  // periodic wake must use the durable offer time to release the cold queue.
+  expect(h.timers.some((timer) => timer.ms === 45_000)).toBe(true);
+  h.clock.now += 60_000;
+  await h.alarms.onAlarm.emit({ name: "papio-keepalive" });
+
+  expect(h.tabs.created).toEqual([{ url: OPENURL, active: true }]);
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  expect(h.backend.store.activeJobs[0]).toMatchObject({ tab_id: tabID, status: "accepted" });
+
+  const idpURL = "https://idp.example.edu/sso";
+  await h.tabs.onUpdated.emit(tabID, { url: idpURL }, { id: tabID, url: idpURL });
+  expect(h.backend.store.activeJobs[0]?.status).toBe("auth_pending");
+  expect(h.frames().some((frame) => frame.type === "auth_pending")).toBe(true);
+});
+
+test("a re-offer records its auth requirement on a restored queued handoff", async () => {
+  const jobID = "job_0001a_restored_requires_auth";
+  const h = makeHarness({
+    ...emptyStore(),
+    activeJobs: [
+      {
+        job_id: jobID,
+        tab_id: -1,
+        offered_at: 1,
+        expires_at: 2,
+        status: "queued",
+        provider_hosts: [PROVIDER_HOST],
+      },
+    ],
+    offerURLs: { [jobID]: OPENURL },
+  });
+  const offer = jobOffer(jobID) as { payload: Record<string, unknown> };
+  offer.payload["requires_auth"] = true;
+
+  await h.bridge.start();
+  await h.port.inbound(offer);
+
+  expect(h.tabs.created).toEqual([]);
+  expect(h.backend.store.activeJobs[0]?.requires_auth).toBe(true);
+});
+
+test("open-access offers open immediately without institutional session evidence", async () => {
+  for (const requiresAuth of [undefined, false] as const) {
+    const h = makeHarness();
+    const offer = jobOffer(`job_0001a_open_access_${String(requiresAuth)}`) as {
+      payload: Record<string, unknown>;
+    };
+    if (requiresAuth !== undefined) offer.payload["requires_auth"] = requiresAuth;
+
+    await h.bridge.start();
+    await h.port.inbound(offer);
+
+    expect(h.tabs.created).toEqual([{ url: OPENURL, active: true }]);
+    expect(h.backend.store.activeJobs[0]).toMatchObject({ tab_id: 100, status: "accepted" });
+  }
+});
+
+test("an OA completion cannot release a queued institutional handoff", async () => {
+  const h = makeHarness();
+  const institutionalURL = "https://resolver.example.edu/openurl?ctx=institutional";
+  const openAccessURL = "https://oa.example.edu/article/123";
+  const institutional = jobOffer("job_0001a_institutional", institutionalURL) as {
+    payload: Record<string, unknown>;
+  };
+  institutional.payload["requires_auth"] = true;
+  const openAccess = jobOffer("job_0001a_open_access", openAccessURL) as {
+    payload: Record<string, unknown>;
+  };
+  openAccess.payload["requires_auth"] = false;
+
+  await h.bridge.start();
+  await h.port.inbound(institutional);
+  await h.port.inbound(openAccess);
+  const openAccessTabID = h.backend.store.activeJobs.find((job) => job.job_id === "job_0001a_open_access")?.tab_id ?? -1;
+  const providerURL = `https://${PROVIDER_HOST}/stable/open-access`;
+  await h.tabs.onUpdated.emit(
+    openAccessTabID,
+    { url: providerURL, status: "complete" },
+    { id: openAccessTabID, url: providerURL },
+  );
+
+  expect(h.tabs.created).toEqual([{ url: openAccessURL, active: true }]);
+  expect(h.bridge.latestOpenURL()).toBe(institutionalURL);
+  expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_0001a_institutional")).toMatchObject({
+    tab_id: -1,
+    status: "queued",
+  });
+  expect(h.backend.store.lastAuthReturnedAt).toBeUndefined();
+});
+
 test("a warm resolver landing releases queued handoffs without an auth event", async () => {
   const h = makeHarness();
   const jobIDs = ["job_0001a_warm_0", "job_0001a_warm_1", "job_0001a_warm_2"];
@@ -873,7 +996,7 @@ test("a warm resolver landing releases queued handoffs without an auth event", a
     { url: OPENURL, active: false },
   ]);
   expect(h.backend.store.activeJobs.filter((job) => job.status === "queued")).toEqual([]);
-  expect(h.backend.store.lastAuthReturnedAt).toBe(h.clock.now);
+  expect(h.backend.store.lastAuthReturnedAt).toBeUndefined();
   expect(h.frames().some((frame) => frame.type === "auth_returned")).toBe(false);
 });
 test("a tracked resolver landing routes its electronic service only with origin permission", async () => {
@@ -1125,7 +1248,7 @@ test("startup releases queued handoffs when a tracked tab is already on a non-Id
   await h.bridge.start();
 
   expect(h.tabs.created).toEqual([{ url: queuedURL, active: false }]);
-  expect(h.backend.store.lastAuthReturnedAt).toBe(h.clock.now);
+  expect(h.backend.store.lastAuthReturnedAt).toBeUndefined();
 });
 
 test("a recent auth return drains durable queued handoffs during startup", async () => {
@@ -1814,7 +1937,10 @@ test("work-window visibility follows the matched adapter requirement", async () 
   const cases: {
     adapterSpecs: AdapterSpec[];
     expectedState: string;
-    expectedUpdates: { windowID: number; props: { focused?: boolean; state?: string } }[];
+    expectedUpdates: {
+      windowID: number;
+      props: { focused?: boolean; state?: "normal" | "minimized"; drawAttention?: boolean };
+    }[];
   }[] = [
     {
       adapterSpecs: [{ ...PROVIDER_ADAPTER, requiresVisible: true }],
@@ -1975,7 +2101,9 @@ test("tab-group mode rediscovers an orphaned papio group after an extension relo
 test("IdP auth expands the papio group and re-collapses when auth returns", async () => {
   const h = makeHarness(undefined, { tabGroups: true, handoffSurface: "tab-group" });
   await h.bridge.start();
-  await h.port.inbound(jobOffer("job_tg_auth"));
+  const offer = jobOffer("job_tg_auth") as { payload: Record<string, unknown> };
+  offer.payload["expected"] = { title: "A paper awaiting institutional access" };
+  await h.port.inbound(offer);
   const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
   const groupID = h.backend.store.handoffGroupID!;
 
@@ -1984,12 +2112,34 @@ test("IdP auth expands the papio group and re-collapses when auth returns", asyn
   expect(h.frames().some((f) => f.type === "auth_pending")).toBe(true);
   expect(h.tabs.activated).toEqual([tabID]);
   expect(h.tabGroups?.live.get(groupID)?.collapsed).toBe(false);
+  expect(h.tabGroups?.live.get(groupID)?.title).toBe("papio — A paper awaiting institutional access");
 
   // Auth returns to a provider host: the job advances and the group folds away.
   const providerURL = `https://${PROVIDER_HOST}/stable/123`;
   await h.tabs.onUpdated.emit(tabID, { url: providerURL, status: "complete" }, { id: tabID, url: providerURL });
   expect(h.frames().some((f) => f.type === "auth_returned")).toBe(true);
   expect(h.tabGroups?.live.get(groupID)?.collapsed).toBe(true);
+  expect(h.tabGroups?.live.get(groupID)?.title).toBe("papio");
+});
+
+test("tab-group surfaces use the generic title when multiple jobs share the group", async () => {
+  const h = makeHarness(
+    { ...emptyStore(), lastAuthReturnedAt: 1_700_000_000_000 },
+    { tabGroups: true, handoffSurface: "tab-group" },
+  );
+  const first = jobOffer("job_tg_multiple_first") as { payload: Record<string, unknown> };
+  first.payload["expected"] = { title: "A paper that should not claim a shared group" };
+
+  await h.bridge.start();
+  await h.port.inbound(first);
+  await h.port.inbound(jobOffer("job_tg_multiple_second"));
+  const firstTabID = h.backend.store.activeJobs.find((job) => job.job_id === "job_tg_multiple_first")?.tab_id ?? -1;
+  const groupID = h.backend.store.handoffGroupID!;
+  const idpURL = "https://idp.example.edu/sso?SAMLRequest=x";
+
+  await h.tabs.onUpdated.emit(firstTabID, { url: idpURL }, { id: firstTabID, url: idpURL });
+
+  expect(h.tabGroups?.live.get(groupID)?.title).toBe("papio");
 });
 
 test("an emptied papio group's id is dropped so the next handoff regroups", async () => {
@@ -2005,16 +2155,27 @@ test("an emptied papio group's id is dropped so the next handoff regroups", asyn
   expect(h.backend.store.handoffGroupID).toBeUndefined();
 });
 
-test("a live papio group (keepalive folded in) is retained when handoffs drain", async () => {
+test("a live papio group keeps its generic collapsed title when the last handoff closes", async () => {
   const h = makeHarness(undefined, { tabGroups: true, handoffSurface: "tab-group" });
+  const offer = jobOffer("job_tg_keepalive") as { payload: Record<string, unknown> };
+  offer.payload["expected"] = { title: "Paper metadata must disappear on cancellation" };
   await h.bridge.start();
-  await h.port.inbound(jobOffer("job_tg_keepalive"));
+  await h.port.inbound(offer);
   const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
   const groupID = h.backend.store.handoffGroupID!;
-  // The group still exists (e.g. a keepalive tab folded in); keep the id.
+
+  const idpURL = "https://idp.example.edu/sso?SAMLRequest=x";
+  await h.tabs.onUpdated.emit(tabID, { url: idpURL }, { id: tabID, url: idpURL });
+  expect(h.tabGroups?.live.get(groupID)).toMatchObject({
+    collapsed: false,
+    title: "papio — Paper metadata must disappear on cancellation",
+  });
+
+  // The group still exists because a keepalive tab remains folded into it.
   await h.tabs.onRemoved.emit(tabID, { isWindowClosing: false });
   expect(h.backend.store.activeJobs.length).toBe(0);
   expect(h.backend.store.handoffGroupID).toBe(groupID);
+  expect(h.tabGroups?.live.get(groupID)).toMatchObject({ collapsed: true, title: "papio" });
 });
 
 test("IdP navigation surfaces the work-window tab: activate + restore + focus", async () => {
@@ -2029,7 +2190,7 @@ test("IdP navigation surfaces the work-window tab: activate + restore + focus", 
   expect(h.frames().some((f) => f.type === "auth_pending")).toBe(true);
   expect(h.tabs.activated).toEqual([tabID]);
   expect(h.windows?.updated).toEqual([
-    { windowID: 500, props: { focused: true, state: "normal" } },
+    { windowID: 500, props: { focused: true, drawAttention: true, state: "normal" } },
   ]);
 });
 
@@ -2271,10 +2432,97 @@ test("inbox handoff runtime opening focuses the live offered tab without returni
       { id: urls.runtimeID, url: urls.popupURL },
       urls,
     ),
+  ).resolves.toEqual({ ok: true, opened: true });
+  expect(h.tabs.activated).toEqual([tabID, tabID]);
+
+  for (const message of [
+    { type: "papio.triage.decide", request: { item_id: "item_001", op: "acquire" } },
+    { type: "papio.action.resolve", request: { action_id: 1, verdict: "reject", expected_revision: 1 } },
+    { type: "papio.preview", request: { action_id: 1 } },
+  ]) {
+    await expect(
+      handleInboxRuntimeMessage(h.bridge, message, { id: urls.runtimeID, url: urls.popupURL }, urls),
+    ).resolves.toEqual({
+      ok: false,
+      error: { code: "unauthorized", message: "This sender cannot access the inbox broker" },
+    });
+  }
+
+  await expect(
+    handleInboxRuntimeMessage(
+      h.bridge,
+      { type: "papio.handoff.open", request: { job_id: "job_0001a_inbox_open" } },
+      { id: urls.runtimeID, url: "chrome-extension://papio-test-id/options.html" },
+      urls,
+    ),
   ).resolves.toEqual({
     ok: false,
     error: { code: "unauthorized", message: "This sender cannot access the inbox broker" },
   });
+});
+
+test("handoff_focus surfaces the tracked work-window tab without creating another", async () => {
+  const h = makeHarness(undefined, { windows: true });
+  const jobID = "job_0001a_focus";
+  await h.bridge.start();
+  await h.port.inbound(jobOffer(jobID));
+  const tabID = h.backend.store.activeJobs.find((job) => job.job_id === jobID)?.tab_id ?? -1;
+  expect(tabID).toBeGreaterThanOrEqual(0);
+  expect(h.tabs.created).toHaveLength(1);
+
+  await h.port.inbound({
+    protocol: "papio-browser/1",
+    type: "handoff_focus",
+    msg_id: "focus_00000001",
+    job_id: jobID,
+    seq: 1,
+    payload: {},
+  });
+  for (
+    let i = 0;
+    i < 10 && !h.windows?.updated.some((update) => update.windowID === 500 && update.props.focused === true);
+    i += 1
+  ) {
+    await Promise.resolve();
+  }
+
+  expect(h.tabs.created).toHaveLength(1);
+  expect(h.tabs.activated).toContain(tabID);
+  expect(h.windows?.updated).toContainEqual({
+    windowID: 500,
+    props: { focused: true, state: "normal" },
+  });
+  expect(h.tabs.navigations).toEqual([]);
+});
+
+test("handoff_focus re-drives an auth-pending tab without charging the automatic retry budget", async () => {
+  const h = makeHarness(undefined, { windows: true });
+  const jobID = "job_0001a_focus_auth";
+  const idpURL = "https://idp.example.edu/sso";
+  await h.bridge.start();
+  await h.port.inbound(jobOffer(jobID));
+  const tabID = h.backend.store.activeJobs.find((job) => job.job_id === jobID)?.tab_id ?? -1;
+  const authTab = { id: tabID, url: idpURL, windowId: 500 };
+  h.tabs.live.set(tabID, authTab);
+  await h.tabs.onUpdated.emit(tabID, { url: idpURL }, authTab);
+  const attemptsBefore = h.backend.store.authAttempts?.[jobID];
+  h.tabs.navigations.splice(0);
+
+  await h.port.inbound({
+    protocol: "papio-browser/1",
+    type: "handoff_focus",
+    msg_id: "focus_00000002",
+    job_id: jobID,
+    seq: 2,
+    payload: {},
+  });
+  for (let i = 0; i < 10 && h.tabs.navigations.length === 0; i += 1) {
+    await Promise.resolve();
+  }
+
+  expect(h.tabs.navigations).toEqual([{ tabID, url: OPENURL }]);
+  expect(h.backend.store.authAttempts?.[jobID]).toBe(attemptsBefore);
+  expect(h.tabs.activated).toContain(tabID);
 });
 
 test("an inbox dismiss relays verdict dismiss through the native resolve", async () => {
@@ -2462,7 +2710,7 @@ test("a user-visible triage request forces reconnect and waits for a fresh hello
   await expect(pending).resolves.toMatchObject({ ok: true, snapshot: { counts: { pending_total: 1 } } });
 });
 
-test("heartbeat counts obey disconnected, permission, then pending badge precedence", async () => {
+test("heartbeat counts obey disconnected, sign-in, permission, then pending badge precedence", async () => {
   const h = makeHarness();
   await h.bridge.start();
   await h.port.inbound(
@@ -2473,6 +2721,13 @@ test("heartbeat counts obey disconnected, permission, then pending badge precede
     }),
   );
   h.deps.permissions.contains = async () => true;
+  await h.port.inbound(jobOffer("job_badge_auth"));
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  const idpURL = "https://idp.example.edu/sso";
+  await h.tabs.onUpdated.emit(tabID, { url: idpURL }, { id: tabID, url: idpURL });
+  expect(h.action.texts.at(-1)).toBe("1");
+  expect(h.action.backgroundColors.at(-1)).toBe("#b06000");
+  expect(h.action.titles.at(-1)).toBe("Papio: 1 paper waiting on your institution sign-in");
 
   const refresh = h.alarms.onAlarm.emit({ name: "papio-keepalive" });
   await Promise.resolve();
@@ -2486,17 +2741,41 @@ test("heartbeat counts obey disconnected, permission, then pending badge precede
     nativeResult("triage_counts_response", { request_id: requestID as string, counts: triageCounts(4) }),
   );
   await refresh;
-  expect(h.action.texts.at(-1)).toBe("4");
-  expect(h.action.titles.at(-1)).toBe("Papio: 4 pending triage items");
+  expect(h.action.texts.at(-1)).toBe("1");
+  expect(h.action.titles.at(-1)).toBe("Papio: 1 paper waiting on your institution sign-in");
 
   h.deps.permissions.contains = async () => false;
   await h.bridge.syncConnectionBadge();
   expect(h.action.texts.at(-1)).toBe("1");
-  expect(h.action.titles.at(-1)).toBe("Papio: 1 provider permission need attention");
+  expect(h.action.titles.at(-1)).toBe("Papio: 1 paper waiting on your institution sign-in");
+
+  h.deps.permissions.contains = async () => true;
+  const providerURL = `https://${PROVIDER_HOST}/stable/returned`;
+  await h.tabs.onUpdated.emit(tabID, { url: providerURL, status: "complete" }, { id: tabID, url: providerURL });
+  expect(h.action.texts.at(-1)).toBe("4");
+  expect(h.action.backgroundColors.at(-1)).toBe("#1a73e8");
+  expect(h.action.titles.at(-1)).toBe("Papio: 4 pending triage items");
 
   await h.port.emitDisconnect();
   expect(h.action.texts.at(-1)).toBe("!");
   expect(h.action.titles.at(-1)).toBe("Papio: daemon disconnected");
+});
+
+test("the sign-in badge clears when a handoff returns to its provider", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(helloAck());
+  await h.port.inbound(jobOffer("job_badge_auth_return"));
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  const idpURL = "https://idp.example.edu/sso";
+  await h.tabs.onUpdated.emit(tabID, { url: idpURL }, { id: tabID, url: idpURL });
+  expect(h.action.texts.at(-1)).toBe("1");
+
+  const providerURL = `https://${PROVIDER_HOST}/stable/returned`;
+  await h.tabs.onUpdated.emit(tabID, { url: providerURL, status: "complete" }, { id: tabID, url: providerURL });
+
+  expect(h.action.texts.at(-1)).toBe("");
+  expect(h.action.titles.at(-1)).toBe("Papio: connected");
 });
 
 test("inbound native handlers finish in receipt order across asynchronous awaits", async () => {
@@ -2513,4 +2792,212 @@ test("inbound native handlers finish in receipt order across asynchronous awaits
       .filter((frame) => frame.type === "job_accept")
       .map((frame) => frame.job_id),
   ).toEqual(["job_chain_first", "job_chain_second"]);
+});
+
+// The UNE Shibboleth dead end (idp.une.edu.au/idp/profile/SAML2/Redirect/SSO?execution=…)
+// is classifiable ONLY by its title: that exact URL also serves the working
+// login form. Chrome can deliver the title in a separate update after `complete`.
+const STALE_IDP_URL = "https://idp.une.edu.au/idp/profile/SAML2/Redirect/SSO?execution=e1s2";
+const STALE_IDP_TITLE = "University of New England Login Service - Stale Request";
+
+/** Offer a job into a work window and return its broker tab id. */
+async function offerIntoWorkWindow(h: Harness, jobID: string): Promise<number> {
+  await h.port.inbound(jobOffer(jobID));
+  const tabID = h.backend.store.activeJobs.find((j) => j.job_id === jobID)?.tab_id ?? -1;
+  expect(tabID).toBeGreaterThanOrEqual(0);
+  return tabID;
+}
+
+/** Land the broker tab on the dead Shibboleth page via a title-only update.
+ * Later failures include their loading boundary so they are distinct documents. */
+async function emitStaleIdPTitle(h: Harness, tabID: number, newDocument = false): Promise<void> {
+  const tab = { id: tabID, url: STALE_IDP_URL, title: STALE_IDP_TITLE, windowId: 500 };
+  h.tabs.live.set(tabID, tab);
+  if (newDocument) {
+    await h.tabs.onUpdated.emit(tabID, { url: STALE_IDP_URL }, tab);
+    await h.tabs.onUpdated.emit(tabID, { status: "loading" }, tab);
+  }
+  await h.tabs.onUpdated.emit(tabID, { title: STALE_IDP_TITLE }, tab);
+}
+
+test("a title-only stale IdP page is detected, raises the work window, and re-drives", async () => {
+  // The failure this pins: the handoff sat minimized on a dead sign-in page for
+  // hours. Detection ran only on `status: complete` (missing the late title),
+  // and the recovery re-drive returned before the surfacing code, so the one
+  // moment papio knew a human was required was the one moment it stayed hidden.
+  const h = makeHarness(undefined, { windows: true });
+  await h.bridge.start();
+  const tabID = await offerIntoWorkWindow(h, "job_stale_surface");
+  expect(h.windows?.live.get(500)?.state).toBe("minimized");
+
+  await emitStaleIdPTitle(h, tabID);
+
+  const outcome = h.frames().find((f) => f.type === "handoff_outcome");
+  expect(outcome?.job_id).toBe("job_stale_surface");
+  expect(outcome?.payload).toMatchObject({ outcome: "stale_sso", final_host: "idp.une.edu.au" });
+  // Surfaced: tab activated and the minimized window restored and focused.
+  expect(h.tabs.activated).toContain(tabID);
+  expect(h.windows?.updated).toContainEqual({
+    windowID: 500,
+    props: { focused: true, drawAttention: true, state: "normal" },
+  });
+  // ...and only then re-driven through the retained resolver link.
+  expect(h.tabs.live.get(tabID)?.url).toBe(OPENURL);
+  expect(h.backend.store.authAttempts?.["job_stale_surface"]).toBe(1);
+});
+
+test("recoverable IdP errors surface without navigating away from their forms", async () => {
+  for (const [title, outcome] of [
+    ["Password expired", "stale_sso"],
+    ["Login error", "auth_error"],
+  ] as const) {
+    const h = makeHarness(undefined, { windows: true });
+    await h.bridge.start();
+    const tabID = await offerIntoWorkWindow(h, `job_recoverable_${outcome}`);
+    const loginTab = { id: tabID, url: STALE_IDP_URL, title: "Institution sign-in", windowId: 500 };
+    h.tabs.live.set(tabID, loginTab);
+    await h.tabs.onUpdated.emit(tabID, { url: STALE_IDP_URL }, loginTab);
+    expect(h.backend.store.activeJobs[0]?.status).toBe("auth_pending");
+
+    const errorTab = { ...loginTab, title };
+    h.tabs.live.set(tabID, errorTab);
+    await h.tabs.onUpdated.emit(tabID, { title }, errorTab);
+
+    expect(h.frames().find((frame) => frame.type === "handoff_outcome")?.payload).toMatchObject({ outcome });
+    expect(h.tabs.navigations).toEqual([]);
+    expect(h.tabs.live.get(tabID)?.url).toBe(STALE_IDP_URL);
+    expect(h.tabs.activated).toContain(tabID);
+    expect(h.windows?.updated).toContainEqual({
+      windowID: 500,
+      props: { focused: true, drawAttention: true, state: "normal" },
+    });
+  }
+});
+
+test("concurrent stale-page title and complete events spend one recovery attempt", async () => {
+  const h = makeHarness(undefined, { windows: true });
+  await h.bridge.start();
+  const tabID = await offerIntoWorkWindow(h, "job_stale_concurrent");
+  const tab = { id: tabID, url: STALE_IDP_URL, title: STALE_IDP_TITLE, windowId: 500 };
+  h.tabs.live.set(tabID, tab);
+
+  await Promise.all([
+    h.tabs.onUpdated.emit(tabID, { url: STALE_IDP_URL, status: "complete" }, tab),
+    h.tabs.onUpdated.emit(tabID, { title: STALE_IDP_TITLE }, tab),
+  ]);
+
+  expect(h.backend.store.authAttempts?.["job_stale_concurrent"]).toBe(1);
+  expect(h.tabs.navigations).toEqual([{ tabID, url: OPENURL }]);
+});
+
+test("the stale re-drive is charged to the durable budget, not a worker-local latch", async () => {
+  // The re-drive reuses the SAME tab, so noteAuthAttempt's tab-id debounce
+  // cannot bound it, and the old worker-local `handoffOutcomeSent` latch was
+  // cleared by every service-worker restart — leaving the resolver loop
+  // unbounded across restarts. At the cap the tab must be LEFT on the failure
+  // page (the user needs to see it) and the job reported human_auth_required.
+  const h = makeHarness(undefined, { windows: true });
+  await h.bridge.start();
+  const tabID = await offerIntoWorkWindow(h, "job_stale_budget");
+
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    await emitStaleIdPTitle(h, tabID, attempt > 1);
+    expect(h.backend.store.authAttempts?.["job_stale_budget"]).toBe(attempt);
+    expect(h.tabs.live.get(tabID)?.url).toBe(OPENURL); // re-driven
+  }
+
+  await emitStaleIdPTitle(h, tabID, true);
+  expect(h.backend.store.authAttempts?.["job_stale_budget"]).toBe(3); // capped
+  expect(h.tabs.live.get(tabID)?.url).toBe(STALE_IDP_URL); // left for the human
+  const stalled = h.frames().filter((f) => f.type === "provider_outcome");
+  expect(stalled.length).toBe(1);
+  expect(stalled[0]?.payload).toMatchObject({ outcome: "human_auth_required" });
+});
+
+test("one dead IdP page reports once but a repeat page still re-raises nothing new", async () => {
+  // The daemon audit trail must not be spammed with identical handoff_failed
+  // events, and focus must not be yanked once per re-drive in a loop.
+  const h = makeHarness(undefined, { windows: true });
+  await h.bridge.start();
+  const tabID = await offerIntoWorkWindow(h, "job_stale_debounce");
+
+  await emitStaleIdPTitle(h, tabID);
+  await emitStaleIdPTitle(h, tabID);
+
+  expect(h.frames().filter((f) => f.type === "handoff_outcome").length).toBe(1);
+  expect(
+    h.windows?.updated.filter((u) => u.props.focused === true).length,
+  ).toBe(1);
+});
+
+
+// The inbox "View PDF" control on a verify_identity action. The daemon issues a
+// loopback capability URL promptly (confirmed against a live daemon), but the
+// reply type was absent from onInbound's correlation routing, so the frame was
+// dropped as an echo and every click failed with "The daemon did not respond in
+// time" after the full request timeout. This drives the whole path.
+test("a review preview capability reaches the caller that asked for it", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(
+    helloAck({ daemon_version: "0.12.0", features: ["review_preview_v1"] }),
+  );
+
+  const pending = h.bridge.requestPreview({ action_id: 213 });
+  await Promise.resolve();
+  await Promise.resolve();
+  const request = h.frames().filter((frame) => frame.type === "review_preview_request");
+  expect(request).toHaveLength(1);
+
+  await h.port.inbound({
+    protocol: "papio-browser/1",
+    type: "review_preview_result",
+    msg_id: "previewresult000000000000000001",
+    seq: 99,
+    payload: {
+      request_id: request[0]?.payload["request_id"],
+      outcome: "ok",
+      url: "http://127.0.0.1:50795/p/YD5r_87qRLi0Ut9XMwt8E4Cq-Bv7N4VvSoEyMsH7-Fs",
+      sha256: "434376057dbe6fc3e44d0fdb7268b56126e9b47ca9d6aa9e05cf2e738f72e81d",
+      size_bytes: 2570670,
+      expires_at: "2036-07-27T02:39:46.877077Z",
+    },
+  } as never);
+
+  await expect(pending).resolves.toMatchObject({
+    ok: true,
+    preview: { url: "http://127.0.0.1:50795/p/YD5r_87qRLi0Ut9XMwt8E4Cq-Bv7N4VvSoEyMsH7-Fs" },
+  });
+});
+
+// A structured refusal must surface as a named reason, not as another silent
+// timeout. The transport succeeded, so ok stays true and the inbox branches on
+// outcome — see the comment at inbox.ts around the preview click handler.
+test("a refused review preview reports the daemon's reason", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ daemon_version: "0.12.0", features: ["review_preview_v1"] }));
+
+  const pending = h.bridge.requestPreview({ action_id: 9999 });
+  await Promise.resolve();
+  await Promise.resolve();
+  const request = h.frames().filter((frame) => frame.type === "review_preview_request");
+
+  await h.port.inbound({
+    protocol: "papio-browser/1",
+    type: "review_preview_result",
+    msg_id: "previewresult000000000000000002",
+    seq: 100,
+    payload: {
+      request_id: request[0]?.payload["request_id"],
+      outcome: "error",
+      detail: "review action 9999 is unavailable",
+    },
+  } as never);
+
+  await expect(pending).resolves.toEqual({
+    ok: true,
+    outcome: "error",
+    detail: "review action 9999 is unavailable",
+  });
 });

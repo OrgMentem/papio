@@ -50,6 +50,9 @@ export interface ActiveJob {
    * AdapterContext for declarative classification. Resolver-declared hints
    * only — never an IdP value. */
   expected?: { title?: string; doi?: string };
+  /** True when the resolver says this offer needs a warm institutional session.
+   * Queued handoffs retain it so a fallback never mints a sign-in request early. */
+  requires_auth?: boolean;
   /** One-download-initiation-per-job latch. Once an adapter has clicked the
    * declared download target, it can never click again for this job. The
    * source-controlled adapter id allows concurrent provider downloads to be

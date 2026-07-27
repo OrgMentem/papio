@@ -79,10 +79,10 @@ test("renders every impact metric from a daemon stats reply", async () => {
   expect(document.getElementById("stats-unavailable")?.hidden).toBe(true);
   expect(document.getElementById("reconnect-daemon")?.hidden).toBe(true);
 
-  // 42 acquired × 20 min ≈ 14 h; 42 of 56 finished jobs succeeded.
+  // 42 acquired × 5 min ≈ 3.5 h; 42 of 56 finished jobs succeeded.
   expect(document.getElementById("stat-acquired")?.textContent).toBe("42");
-  expect(document.getElementById("stat-time-saved")?.textContent).toBe("14 h");
-  expect(document.getElementById("stat-time-note")?.textContent).toContain("20 minutes");
+  expect(document.getElementById("stat-time-saved")?.textContent).toBe("3.5 h");
+  expect(document.getElementById("stat-time-note")?.textContent).toContain("5 minutes");
   expect(document.getElementById("stat-success-rate")?.textContent).toBe("75%");
   expect(document.getElementById("stat-success-detail")?.textContent).toBe("42 acquired · 14 failed");
 

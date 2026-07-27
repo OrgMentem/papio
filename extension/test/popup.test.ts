@@ -8,9 +8,11 @@ import { Window } from "happy-dom";
 import {
   acquireCurrentPage,
   collectPageMetadata,
+  OPEN_HANDOFF_MESSAGE,
   OPEN_INBOX_MESSAGE,
   openInbox,
   refreshImpactSummary,
+  renderAuthPending,
   renderDaemonStatus,
   renderImpactSummary,
   renderPageAcquire,
@@ -65,7 +67,8 @@ test("renders distinct acquisition and inbox actions without redundant headings"
   expect(doc.getElementById("page-acquire-btn")?.hidden).toBe(true);
   expect(doc.getElementById("daemon-footer")).toBeNull();
   expect(doc.getElementById("open-inbox-btn")?.textContent).toBe("Open inbox");
-  expect(doc.getElementById("needs-you-section")).toBeNull();
+  expect(doc.getElementById("needs-you-section")).not.toBeNull();
+  expect(doc.getElementById("needs-you-section")?.hidden).toBe(true);
   expect(doc.getElementById("terms-consent")).not.toBeNull();
   expect(doc.getElementById("resolver-grant")).not.toBeNull();
 });
@@ -234,6 +237,54 @@ test("shows only a disabled action for a local in-flight acquisition", () => {
   expect(button.textContent).toBe("Acquisition in progress");
 });
 
+test("lists an institutional sign-in by paper title and focuses its existing handoff", async () => {
+  const doc = popupDocument();
+  const requests: unknown[] = [];
+  Object.assign(globalThis, {
+    chrome: {
+      runtime: {
+        sendMessage: async (message: unknown) => {
+          requests.push(message);
+          return { ok: true, opened: true };
+        },
+      },
+    },
+  });
+
+  renderAuthPending(doc, [
+    job({
+      status: "auth_pending",
+      expected: { title: "A paper awaiting institutional access", doi: "10.1000/example" },
+    }),
+  ]);
+
+  const section = doc.getElementById("needs-you-section");
+  expect(section?.hidden).toBe(false);
+  expect(section?.querySelector(".needs-you-paper")?.textContent).toBe("A paper awaiting institutional access");
+  const button = section?.querySelector("button") as HTMLButtonElement;
+  expect(button.textContent).toBe("Focus");
+  button.click();
+  await Promise.resolve();
+  await Promise.resolve();
+  expect(requests).toEqual([{ type: OPEN_HANDOFF_MESSAGE, request: { job_id: "job-1" } }]);
+  expect(button.textContent).toBe("Focus");
+});
+
+test("uses a DOI then job id when an awaiting sign-in has no paper title", () => {
+  const doc = popupDocument();
+  renderAuthPending(
+    doc,
+    [
+      job({ job_id: "job-with-doi", status: "auth_pending", expected: { doi: "10.1000/fallback" } }),
+      job({ job_id: "job-without-identity", status: "auth_pending" }),
+    ],
+    async () => {},
+  );
+
+  const labels = Array.from(doc.querySelectorAll(".needs-you-paper")).map((paper) => paper.textContent);
+  expect(labels).toEqual(["10.1000/fallback", "job-without-identity"]);
+});
+
 test("opens the singleton inbox through the broker when it acknowledges", async () => {
   const requests: unknown[] = [];
   const created: unknown[] = [];
@@ -275,9 +326,9 @@ test("renderImpactSummary fills the impact card with real values", () => {
   renderImpactSummary(doc, { acquired_total: 42, failed_total: 14 });
 
   expect(doc.getElementById("impact-summary")?.hidden).toBe(false);
-  // 42 acquired x 20 min ~= 14 h; 42 of 56 finished jobs succeeded.
+  // 42 acquired x 5 min ~= 3.5 h; 42 of 56 finished jobs succeeded.
   expect(doc.getElementById("impact-acquired")?.textContent).toBe("42");
-  expect(doc.getElementById("impact-time-saved")?.textContent).toBe("14 h");
+  expect(doc.getElementById("impact-time-saved")?.textContent).toBe("3.5 h");
   expect(doc.getElementById("impact-success-rate")?.textContent).toBe("75%");
 });
 
