@@ -45,6 +45,28 @@ func testSystem(t *testing.T) *bootstrap.System {
 	return system
 }
 
+func TestRouterCapturesDisabledReturnsEmptyResults(t *testing.T) {
+	system := testSystem(t)
+	system.Captures = nil
+	router := Router(system)
+
+	var rows []json.RawMessage
+	if rpcErr := callMethod(t, router, "adapter.captures.list", struct{}{}, &rows); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	if rows == nil || len(rows) != 0 {
+		t.Fatalf("capture list = %#v, want non-nil empty list", rows)
+	}
+
+	var purged CapturePurgeResult
+	if rpcErr := callMethod(t, router, "adapter.captures.purge", map[string]string{"host": "provider.example.com"}, &purged); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	if purged.Removed != 0 {
+		t.Fatalf("removed = %d, want 0", purged.Removed)
+	}
+}
+
 func callMethod(t *testing.T, router ipc.Router, method string, params any, result any) *ipc.RPCError {
 	t.Helper()
 	raw, err := json.Marshal(params)

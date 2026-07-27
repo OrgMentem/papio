@@ -38,6 +38,7 @@ const MaxBrowserInteger int64 = 1<<53 - 1
 
 var (
 	requestIDRE  = regexp.MustCompile(`^[A-Za-z0-9_-]{8,128}$`)
+	adapterIDRE  = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 	msgIDRE      = regexp.MustCompile(`^[A-Za-z0-9_-]{8,64}$`)
 	zoteroKeyRE  = regexp.MustCompile(`^[A-Za-z0-9]{1,32}$`)
 	doiRE        = regexp.MustCompile(`^10\.[0-9]{4,9}/\S{1,200}$`)
@@ -50,6 +51,7 @@ var (
 	hostRE       = regexp.MustCompile(`^[a-z0-9.-]{3,253}$`)
 	errorCodeRE  = regexp.MustCompile(`^[a-z0-9_]{2,50}$`)
 	filenameRE   = regexp.MustCompile(`^[^/\\]{1,255}$`)
+	base64RE     = regexp.MustCompile(`^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$`)
 	rfc3339RE    = regexp.MustCompile(`^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$`)
 )
 
@@ -404,6 +406,7 @@ const (
 	MsgHelloAck                 = "hello_ack"
 	MsgPageAcquire              = "page_acquire"
 	MsgPageAcquireAck           = "page_acquire_ack"
+	MsgPageCapture              = "page_capture"
 	MsgJobOffer                 = "job_offer"
 	MsgHandoffOutcome           = "handoff_outcome"
 	MsgJobAccept                = "job_accept"
@@ -474,6 +477,18 @@ type PageAcquireAckPayload struct {
 	JobID     string `json:"job_id,omitempty"`
 	Duplicate bool   `json:"duplicate,omitempty"`
 	Error     string `json:"error,omitempty"`
+}
+
+// PageCapturePayload confines diagnostic HTML to a single bounded frame so a
+// capture cannot turn native messaging into an unbounded transfer channel.
+type PageCapturePayload struct {
+	Host           string `json:"host"`
+	Scenario       string `json:"scenario"`
+	AdapterID      string `json:"adapter_id,omitempty"`
+	AdapterVersion string `json:"adapter_version,omitempty"`
+	Encoding       string `json:"encoding"`
+	Bytes          int64  `json:"bytes"`
+	Body           string `json:"body"`
 }
 
 // JobOfferPayload asks the extension to open one OpenURL-resolved job.
@@ -885,6 +900,23 @@ func DecodeBrowserMessage(data []byte) (*BrowserMessage, error) {
 			err = p.validate()
 		}
 		msg.Payload = p
+	case MsgPageCapture:
+		p := &PageCapturePayload{}
+		if err = browserRequireFields(payloadFields, "host", "scenario", "encoding", "bytes", "body"); err == nil {
+			err = browserRejectNullFields(payloadFields, "adapter_id", "adapter_version")
+		}
+		if err == nil {
+			err = strictDecode(env.Payload, p)
+		}
+		if err == nil {
+			if _, ok := payloadFields["adapter_id"]; ok && p.AdapterID == "" {
+				err = fmt.Errorf("page_capture.adapter_id must use the id charset (max 64)")
+			}
+		}
+		if err == nil {
+			err = p.validate()
+		}
+		msg.Payload = p
 	case MsgJobOffer:
 		p := &JobOfferPayload{}
 		if err = browserRequireFields(payloadFields, "openurl", "provider_hosts", "access_mode", "expires_at"); err == nil {
@@ -1174,6 +1206,32 @@ func (p *HandoffOutcomePayload) validate() error {
 	}
 	if p.FinalHost == "" || len(p.FinalHost) > 253 || !hostRE.MatchString(p.FinalHost) {
 		return fmt.Errorf("handoff_outcome.final_host must be a bounded hostname")
+	}
+	return nil
+}
+
+func (p *PageCapturePayload) validate() error {
+	if p.Host == "" || len(p.Host) > 253 || !hostRE.MatchString(p.Host) {
+		return fmt.Errorf("page_capture.host must be a bounded hostname")
+	}
+	if err := enumRequired("page_capture.scenario", p.Scenario,
+		"observed", "success", "login-return", "no-entitlement", "drift"); err != nil {
+		return err
+	}
+	if p.AdapterID != "" && !adapterIDRE.MatchString(p.AdapterID) {
+		return fmt.Errorf("page_capture.adapter_id must use the id charset (max 64)")
+	}
+	if browserTextLen(p.AdapterVersion) > 50 {
+		return fmt.Errorf("page_capture.adapter_version exceeds 50 chars")
+	}
+	if p.Encoding != "gzip+base64" {
+		return fmt.Errorf("page_capture.encoding must be gzip+base64")
+	}
+	if p.Bytes < 1 || p.Bytes > 2<<20 {
+		return fmt.Errorf("page_capture.bytes must be in range 1..%d", 2<<20)
+	}
+	if !base64RE.MatchString(p.Body) {
+		return fmt.Errorf("page_capture.body must be canonical base64")
 	}
 	return nil
 }

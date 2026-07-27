@@ -339,6 +339,84 @@ func TestPageAcquirePayloadRoundTripAndValidation(t *testing.T) {
 	}
 }
 
+func TestPageCapturePayloadRoundTripAndValidation(t *testing.T) {
+	frame := func(jobID string, payload any) []byte {
+		t.Helper()
+		env := map[string]any{
+			"protocol": BrowserProtocolVersion,
+			"type":     MsgPageCapture,
+			"msg_id":   "page-capture-001",
+			"seq":      1,
+			"payload":  payload,
+		}
+		if jobID != "" {
+			env["job_id"] = jobID
+		}
+		data, err := json.Marshal(env)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return data
+	}
+
+	valid := PageCapturePayload{
+		Host: "journals.sagepub.com", Scenario: "observed",
+		AdapterID: "sage", AdapterVersion: "0.2.0",
+		Encoding: "gzip+base64", Bytes: 56,
+		Body: "H4sIAAAAAAACE7NRTMlPLqksSFXIKMnNsbOBkEn5KZV2aZkVJaVFqQrJiQUg2kYfLGqjD1YCAN4m2uc4AAAA",
+	}
+	msg, err := DecodeBrowserMessage(frame("job_capture_001", valid))
+	if err != nil {
+		t.Fatalf("decode page_capture: %v", err)
+	}
+	if got := msg.Payload.(*PageCapturePayload); *got != valid {
+		t.Fatalf("round-trip payload = %#v, want %#v", got, valid)
+	}
+	if msg.JobID != "job_capture_001" {
+		t.Fatalf("page_capture job_id = %q", msg.JobID)
+	}
+	if _, err := DecodeBrowserMessage(frame("", valid)); err != nil {
+		t.Fatalf("unscoped page_capture rejected: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name    string
+		payload PageCapturePayload
+	}{
+		{name: "wrong encoding", payload: func() PageCapturePayload {
+			p := valid
+			p.Encoding = "base64"
+			return p
+		}()},
+		{name: "malformed base64", payload: func() PageCapturePayload {
+			p := valid
+			p.Body = "not base64!"
+			return p
+		}()},
+		{name: "oversize bytes", payload: func() PageCapturePayload {
+			p := valid
+			p.Bytes = 2<<20 + 1
+			return p
+		}()},
+		{name: "bad host", payload: func() PageCapturePayload {
+			p := valid
+			p.Host = "https://journals.sagepub.com"
+			return p
+		}()},
+		{name: "unknown scenario", payload: func() PageCapturePayload {
+			p := valid
+			p.Scenario = "unexpected"
+			return p
+		}()},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := DecodeBrowserMessage(frame("", tc.payload)); err == nil {
+				t.Fatal("page_capture was accepted")
+			}
+		})
+	}
+}
+
 // The IdP privacy invariant is structural: auth payloads cannot carry a URL.
 func TestAuthPayloadRejectsURLFields(t *testing.T) {
 	msg := []byte(`{"protocol":"papio-browser/1","type":"auth_returned","msg_id":"m_auth_ret1","job_id":"job_0002_tyler","seq":5,"payload":{"url":"https://idp.example.edu/sso?token=SECRET"}}`)

@@ -9,6 +9,8 @@
 package browser
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -18,6 +20,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -28,6 +31,7 @@ import (
 	"time"
 
 	"papio/internal/app"
+	"papio/internal/captures"
 	"papio/internal/config"
 	"papio/internal/job"
 	"papio/internal/preview"
@@ -49,6 +53,7 @@ const (
 	triageMutationsFeature       = "triage_mutations_v1"
 	reviewPreviewFeature         = "review_preview_v1"
 	statsFeature                 = "browser_stats_v1"
+	pageCaptureFeature           = "page_capture_v1"
 	previewCapabilityTTL         = 10 * time.Minute
 )
 
@@ -69,12 +74,13 @@ var ErrInvalidFrame = errors.New("invalid browser frame")
 // holder still resets the offered/cancelled bookkeeping, which is exactly the
 // recovery an MV3 service-worker restart needs.
 type Bridge struct {
-	jobs        *job.Store
-	svc         *app.Service
-	triage      *triage.Service
-	watchRunner *watch.Runner
-	preview     *preview.Server
-	cfg         config.Config
+	jobs         *job.Store
+	svc          *app.Service
+	triage       *triage.Service
+	watchRunner  *watch.Runner
+	preview      *preview.Server
+	captureStore *captures.Store
+	cfg          config.Config
 
 	// Version and Features are daemon capabilities announced in hello_ack.
 	Version  string
@@ -109,6 +115,9 @@ type browserSession struct {
 	HelloAt          time.Time
 	LastSyncAt       time.Time
 	Outdated         bool
+	// adapterUpgradeRepairPending lets a newly live holder repair parks once
+	// without turning each two-second browser poll into a maintenance sweep.
+	adapterUpgradeRepairPending bool
 	// needsAck makes the next Sync from this session deliver a hello_ack:
 	// a session promoted by claim or stale-takeover was denied its ack at
 	// hello time and must still receive one before offers mean anything.
@@ -134,12 +143,12 @@ const pendingExpireAfter = 5 * time.Minute
 
 // NewBridge constructs the bridge. It is cheap and always constructed; whether
 // any job is ever offered depends on config (extension_id / openurl base).
-func NewBridge(jobs *job.Store, svc *app.Service, triageService *triage.Service, watchRunner *watch.Runner, previewServer *preview.Server, cfg config.Config, version string, features []string) *Bridge {
+func NewBridge(jobs *job.Store, svc *app.Service, triageService *triage.Service, watchRunner *watch.Runner, previewServer *preview.Server, captureStore *captures.Store, cfg config.Config, version string, features []string) *Bridge {
 	required := []string{
-		pageAcquireFeature, triageSnapshotFeature, triageSnapshotSchema2Feature, triageMutationsFeature, reviewPreviewFeature, statsFeature,
+		pageAcquireFeature, triageSnapshotFeature, triageSnapshotSchema2Feature, triageMutationsFeature, reviewPreviewFeature, statsFeature, pageCaptureFeature,
 	}
 	return &Bridge{
-		jobs: jobs, svc: svc, triage: triageService, watchRunner: watchRunner, preview: previewServer, cfg: cfg,
+		jobs: jobs, svc: svc, triage: triageService, watchRunner: watchRunner, preview: previewServer, captureStore: captureStore, cfg: cfg,
 		Version:      version,
 		Features:     appendFeatures(features, required...),
 		offered:      map[string]bool{},
@@ -315,6 +324,9 @@ func (b *Bridge) promote(session *browserSession, reason string) {
 	}
 	delete(b.pending, session.ID)
 	session.needsAck = true
+	// A pending browser has not been allowed to offer work, so it must check
+	// upgrade repairs when it becomes the live holder.
+	session.adapterUpgradeRepairPending = len(session.AdapterVersions) != 0
 	b.holder = session
 	b.epoch++
 	b.offered = map[string]bool{}
@@ -415,11 +427,32 @@ func (b *Bridge) Sync(ctx context.Context, sessionID string, goodbye bool, frame
 		// Pending sessions poll but never receive offer/cancel traffic.
 		return out, nil
 	}
+	b.repairAdapterUpgradeParks(ctx)
 	polled, err := b.poll(ctx)
 	if err != nil {
 		return nil, err
 	}
 	return append(out, polled...), nil
+}
+
+// repairAdapterUpgradeParks keeps maintenance failures local to the daemon:
+// a repair read or write must not disconnect the user's native browser session.
+// The caller holds b.mu.
+func (b *Bridge) repairAdapterUpgradeParks(ctx context.Context) {
+	if b.holder == nil ||
+		b.holder.Outdated ||
+		!b.holder.adapterUpgradeRepairPending ||
+		len(b.holder.AdapterVersions) == 0 ||
+		b.now().Sub(b.holder.LastSyncAt) > sessionStaleAfter {
+		return
+	}
+	b.holder.adapterUpgradeRepairPending = false
+	if b.svc == nil {
+		return
+	}
+	if err := b.svc.HandoffRepairer().RepairAdapterUpgrade(ctx, b.holder.ExtensionVersion, extensionVersionNewer); err != nil {
+		log.Printf("papio: repairing provider parks after extension upgrade: %v", err)
+	}
 }
 
 // knownSession reports whether the session already completed a hello this
@@ -473,7 +506,7 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 	if b.holder == nil || b.holder.ID != sessionID {
 		switch msg.Type {
 		case protocol.MsgPageAcquire, protocol.MsgTriageSnapshotRequest, protocol.MsgTriageCountsRequest,
-			protocol.MsgTriageDecide, protocol.MsgHumanActionResolve, protocol.MsgReviewPreviewRequest, protocol.MsgStatsRequest:
+			protocol.MsgTriageDecide, protocol.MsgHumanActionResolve, protocol.MsgReviewPreviewRequest, protocol.MsgStatsRequest, protocol.MsgPageCapture:
 			// Stateless request/response traffic works from any browser —
 			// even an outdated one; every frame is protocol-validated
 			// regardless of version. "Acquire this page" and the inbox must
@@ -511,6 +544,10 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 
 	case protocol.MsgStatsRequest:
 		return b.stats(ctx, msg.Payload.(*protocol.StatsRequestPayload))
+
+	case protocol.MsgPageCapture:
+		b.pageCapture(ctx, msg.JobID, msg.Payload.(*protocol.PageCapturePayload))
+		return nil, nil
 
 	case protocol.MsgJobAccept:
 		return nil, b.jobs.S.AppendEvent(ctx, msg.JobID, "browser.job_accept", nil)
@@ -584,6 +621,65 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 	}
 }
 
+// pageCapture treats diagnostic content failures as local losses: disconnecting
+// the native session over a bad fixture would discard the handoff it was meant
+// to help diagnose.
+func (b *Bridge) pageCapture(ctx context.Context, jobID string, payload *protocol.PageCapturePayload) {
+	if !b.cfg.Captures.Enabled || b.captureStore == nil {
+		return
+	}
+	html, err := decodePageCapture(payload)
+	if err != nil {
+		log.Printf("papio: ignoring page capture from %s: %v", payload.Host, err)
+		return
+	}
+	path, err := b.captureStore.Store(ctx, payload.Host, payload.Scenario, payload.AdapterID, payload.AdapterVersion, html)
+	if err != nil {
+		log.Printf("papio: storing page capture from %s: %v", payload.Host, err)
+		return
+	}
+	if jobID == "" || b.jobs == nil {
+		return
+	}
+	if err := b.jobs.RecordEvent(ctx, jobID, "browser.page_capture", map[string]any{
+		"host":            payload.Host,
+		"scenario":        payload.Scenario,
+		"adapter_id":      payload.AdapterID,
+		"adapter_version": payload.AdapterVersion,
+		"path":            path,
+		"size_bytes":      len(html),
+	}); err != nil {
+		log.Printf("papio: recording page capture for job %s: %v", jobID, err)
+	}
+}
+
+func decodePageCapture(payload *protocol.PageCapturePayload) ([]byte, error) {
+	const maxPageCaptureBytes int64 = 2 << 20
+	if payload.Bytes < 1 || payload.Bytes > maxPageCaptureBytes {
+		return nil, fmt.Errorf("declared page capture size %d is out of range", payload.Bytes)
+	}
+	compressed, err := base64.StdEncoding.Strict().DecodeString(payload.Body)
+	if err != nil {
+		return nil, fmt.Errorf("decoding page capture body: %w", err)
+	}
+	reader, err := gzip.NewReader(bytes.NewReader(compressed))
+	if err != nil {
+		return nil, fmt.Errorf("opening page capture gzip body: %w", err)
+	}
+	html, err := io.ReadAll(io.LimitReader(reader, payload.Bytes+1))
+	if err != nil {
+		_ = reader.Close()
+		return nil, fmt.Errorf("reading page capture gzip body: %w", err)
+	}
+	if err := reader.Close(); err != nil {
+		return nil, fmt.Errorf("closing page capture gzip body: %w", err)
+	}
+	if int64(len(html)) != payload.Bytes {
+		return nil, fmt.Errorf("decoded page capture size %d does not match declared %d", len(html), payload.Bytes)
+	}
+	return html, nil
+}
+
 // handleHello arbitrates a hello from sessionID. The holder keeps the
 // session; a hello from another browser waits as pending unless the holder
 // has gone silent. Legacy hosts (no session_id) cannot be arbitrated and keep
@@ -591,12 +687,13 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 func (b *Bridge) handleHello(sessionID string, p *protocol.HelloPayload) ([]json.RawMessage, error) {
 	now := b.now()
 	session := &browserSession{
-		ID:               sessionID,
-		ExtensionVersion: p.ExtensionVersion,
-		AdapterVersions:  p.AdapterVersions,
-		HelloAt:          now,
-		LastSyncAt:       now,
-		Outdated:         compareVersion(p.ExtensionVersion, MinExtensionVersion) < 0,
+		ID:                          sessionID,
+		ExtensionVersion:            p.ExtensionVersion,
+		AdapterVersions:             p.AdapterVersions,
+		HelloAt:                     now,
+		LastSyncAt:                  now,
+		Outdated:                    compareVersion(p.ExtensionVersion, MinExtensionVersion) < 0,
+		adapterUpgradeRepairPending: len(p.AdapterVersions) != 0,
 	}
 	holderAlive := b.holder != nil && now.Sub(b.holder.LastSyncAt) <= sessionStaleAfter
 	sameSession := b.holder != nil && b.holder.ID == sessionID
@@ -1163,6 +1260,36 @@ func compareVersion(left, right string) int {
 	return 0
 }
 
+// extensionVersionNewer rejects malformed versions before using the legacy
+// comparison helper: an unparseable hello must never be treated as evidence
+// that a previously parked job's provider failure has been fixed.
+func extensionVersionNewer(previous, current string) bool {
+	return validExtensionVersion(previous) &&
+		validExtensionVersion(current) &&
+		compareVersion(previous, current) < 0
+}
+
+func validExtensionVersion(value string) bool {
+	parts := strings.Split(value, ".")
+	if len(parts) != 3 {
+		return false
+	}
+	for _, part := range parts {
+		if part == "" {
+			return false
+		}
+		for _, char := range part {
+			if char < '0' || char > '9' {
+				return false
+			}
+		}
+		if _, err := strconv.Atoi(part); err != nil {
+			return false
+		}
+	}
+	return true
+}
+
 // recordAuth appends a timing-only auth event. The AuthPayload structurally
 // cannot carry a URL, host, title, query, or fragment, so an identity-provider
 // address cannot enter the event stream through this path.
@@ -1276,10 +1403,15 @@ func resolverProfileKey(profile string) string {
 
 // outcome maps a terminal provider observation onto a policy-legal transition.
 func (b *Bridge) outcome(ctx context.Context, jobID string, p *protocol.ProviderOutcomePayload) error {
+	sourceExtensionVersion := ""
+	if b.holder != nil {
+		sourceExtensionVersion = b.holder.ExtensionVersion
+	}
 	if err := b.jobs.RecordEvent(ctx, jobID, "browser.provider_outcome", map[string]any{
-		"outcome":         p.Outcome,
-		"adapter_version": p.AdapterVersion,
-		"detail":          p.Detail,
+		"outcome":           p.Outcome,
+		"adapter_version":   p.AdapterVersion,
+		"detail":            p.Detail,
+		"extension_version": sourceExtensionVersion,
 	}); err != nil {
 		return err
 	}

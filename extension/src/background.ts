@@ -17,11 +17,14 @@
 
 import {
   BROWSER_PROTOCOL_VERSION,
+  MAX_BROWSER_MESSAGE_BYTES,
+  MsgPageCapture,
   parseBrowserMessage,
   type BrowserMessage,
   type BrowserMessageType,
   type PageAcquireAckPayload,
   type PageAcquirePayload,
+  type PageCapturePayload,
 } from "./protocol";
 import {
   chromeBackend,
@@ -47,8 +50,7 @@ import {
   type AdapterSpec,
   type PageVerdict,
 } from "./adapters/types";
-import { takePendingFixtureFilename } from "./capture";
-import { observeUnknown } from "./observe";
+import { observeUnknown, type ObserveChromeApi } from "./observe";
 import { chromeKeepaliveAPI, initKeepalive, isAuthenticationURL } from "./keepalive";
 import { routeResolverService, type ResolverRoute } from "./resolver";
 import { detectAuthFailure } from "./authfail";
@@ -94,6 +96,7 @@ const TRIAGE_SNAPSHOT_SCHEMA_2_FEATURE = "triage_snapshot_schema_v2";
 const TRIAGE_MUTATIONS_FEATURE = "triage_mutations_v1";
 const REVIEW_PREVIEW_FEATURE = "review_preview_v1";
 const STATS_FEATURE = "browser_stats_v1";
+const PAGE_CAPTURE_FEATURE = "page_capture_v1";
 /** Daemon replies that settle a correlated `requestNative` call. `requestNative`
  * rejects any type outside this set before registering a wait, so wrappers and
  * variables cannot create a request that only fails later by timing out. */
@@ -316,6 +319,9 @@ export interface BridgeDeps {
       args?: unknown[];
     }): Promise<{ result?: unknown }[]>;
   };
+  /** The observation path needs durable quota state but must not depend on a
+   * browser global, so tests can prove the capture frame reaches the bridge. */
+  captureStorage?: ObserveChromeApi["storage"];
   /** chrome.permissions seam. Adapter execution is gated on an explicit
    * optional-host-permission grant for the provider origin. */
   permissions: {
@@ -1512,6 +1518,13 @@ export class Bridge {
     );
   }
 
+  pageCaptureAvailable(): boolean {
+    return (
+      this.store.connectionStatus === "connected" &&
+      (this.store.daemonFeatures ?? []).includes(PAGE_CAPTURE_FEATURE)
+    );
+  }
+
   /** Forward an active-page acquisition request and await the daemon ack. */
   async requestPageAcquire(payload: PageAcquirePayload): Promise<PageAcquireAckPayload> {
     await this.ready;
@@ -1999,13 +2012,6 @@ export class Bridge {
       return this.onDownloadChanged(delta);
     });
     this.deps.downloads.onDeterminingFilename?.addListener((item, suggest) => {
-      // Fixture writes are data: URLs whose `filename` Chrome ignores; relocate
-      // them to the enqueued papio-fixtures path before any job correlation.
-      const fixtureName = takePendingFixtureFilename(item.url ?? "");
-      if (fixtureName) {
-        suggest({ filename: fixtureName, conflictAction: "uniquify" });
-        return;
-      }
       // The event can race on either side of downloads.download resolving:
       // use its exact returned ID after resolution, or the pending URL before.
       // Host fallback remains fail-closed when several jobs share a provider.
@@ -2501,10 +2507,14 @@ export class Bridge {
     }
   }
 
+  public sendPageCapture(payload: PageCapturePayload, jobID?: string): boolean {
+    return this.pageCaptureAvailable() && this.send(MsgPageCapture, payload, jobID);
+  }
+
   /** Build, self-validate, and post one outbound frame. Validation is a safety
    * net: a frame that would not survive the shared parser is dropped, never
    * emitted. */
-  private send(type: BrowserMessageType, payload: Record<string, unknown>, jobID?: string): boolean {
+  private send(type: BrowserMessageType, payload: object, jobID?: string): boolean {
     const port = this.port;
     if (!port) return false;
     const env: Record<string, unknown> = {
@@ -2515,6 +2525,15 @@ export class Bridge {
       payload,
     };
     if (jobID !== undefined) env.job_id = jobID;
+    try {
+      if (new TextEncoder().encode(JSON.stringify(env)).byteLength > MAX_BROWSER_MESSAGE_BYTES) {
+        console.error("papio: refusing to send frame over native message cap", type);
+        return false;
+      }
+    } catch (e) {
+      console.error("papio: refusing to encode outbound frame", type, e);
+      return false;
+    }
     try {
       parseBrowserMessage(env);
     } catch (e) {
@@ -3535,10 +3554,28 @@ export class Bridge {
   }
 
   /** Record a development capture for an unknown page without changing the
-   * assisted handoff semantics when this provider has no adapter at all. */
-  private async recordUnknown(job: ActiveJob, host: string, adapterVersion?: string): Promise<void> {
-    if (typeof chrome !== "undefined") await observeUnknown({ scripting: chrome.scripting, downloads: chrome.downloads, storage: chrome.storage }, job, host, () => new Date(this.deps.now()));
-    if (adapterVersion === undefined) return;
+   * assisted handoff semantics. */
+  private async recordUnknown(job: ActiveJob, host: string, adapter?: AdapterSpec): Promise<void> {
+    const captureStorage = this.deps.captureStorage;
+    if (captureStorage !== undefined && this.pageCaptureAvailable()) {
+      await observeUnknown(
+        {
+          scripting: this.deps.scripting as ObserveChromeApi["scripting"],
+          storage: captureStorage,
+          sendPageCapture: (payload, jobID) => this.sendPageCapture(payload, jobID),
+        },
+        job,
+        host,
+        {
+          verifiedHosts: adapter === undefined ? job.provider_hosts : [...job.provider_hosts, ...adapter.hosts],
+          ...(adapter === undefined
+            ? {}
+            : { adapterID: adapter.id, adapterVersion: adapter.version }),
+        },
+        () => new Date(this.deps.now()),
+      );
+    }
+    if (adapter === undefined) return;
     const now = this.deps.now();
     const count = job.unknown_count ?? 0;
     const last = job.last_unknown_ms ?? 0;
@@ -3548,7 +3585,7 @@ export class Bridge {
       const outcomeKey = `${job.job_id}:ui_changed`;
       if (!this.handoffOutcomeSent.has(outcomeKey)) {
         this.handoffOutcomeSent.add(outcomeKey);
-        if (!this.send("provider_outcome", { outcome: "ui_changed", adapter_version: adapterVersion }, job.job_id)) {
+        if (!this.send("provider_outcome", { outcome: "ui_changed", adapter_version: adapter.version }, job.job_id)) {
           this.handoffOutcomeSent.delete(outcomeKey);
         }
       }
@@ -3731,7 +3768,7 @@ export class Bridge {
         this.send("provider_outcome", { outcome: "wrong_work", adapter_version: av }, jobID);
         return;
       case "unknown":
-        await this.recordUnknown(job, host, av);
+        await this.recordUnknown(job, host, spec);
         return;
       }
   }
@@ -3994,6 +4031,7 @@ interface InboxRuntimeURLs {
 type InboxRuntimeReply =
   | BrokerFailure
   | { opened: true }
+  | { captured: true }
   | BrokerReply<{ snapshot: Record<string, unknown> }>
   | BrokerReply<{ counts: Record<string, unknown>; generated_at: string }>
   | BrokerReply<{ outcome: string; detail?: string }>
@@ -4103,9 +4141,27 @@ function isHandoffOpenRuntimeRequest(value: unknown): value is { job_id: string 
   );
 }
 
+function isPageCaptureRuntimeRequest(value: unknown): value is PageCapturePayload {
+  if (
+    !isObjectRecord(value) ||
+    !hasOnlyKeys(value, ["host", "scenario", "adapter_id", "adapter_version", "encoding", "bytes", "body"])
+  ) {
+    return false;
+  }
+  return (
+    typeof value["host"] === "string" &&
+    typeof value["scenario"] === "string" &&
+    (value["adapter_id"] === undefined || typeof value["adapter_id"] === "string") &&
+    (value["adapter_version"] === undefined || typeof value["adapter_version"] === "string") &&
+    typeof value["encoding"] === "string" &&
+    isPositiveSafeInteger(value["bytes"]) &&
+    typeof value["body"] === "string"
+  );
+}
+
 /**
- * The inbox owns every daemon-backed mutation. The popup has only the narrow
- * focus capability, validated against its exact extension page URL.
+ * Exact extension-page authorization prevents a content script from sending
+ * captured page material over native messaging.
  */
 export async function handleInboxRuntimeMessage(
   bridge: Bridge,
@@ -4115,6 +4171,18 @@ export async function handleInboxRuntimeMessage(
 ): Promise<InboxRuntimeReply | undefined> {
   if (!isObjectRecord(message) || typeof message["type"] !== "string") return undefined;
   const type = message["type"];
+  if (type === "papio.page_capture") {
+    if (sender.id !== urls.runtimeID || sender.url !== urls.popupURL) {
+      return runtimeFailure("unauthorized", "This sender cannot send page captures");
+    }
+    if (!hasOnlyKeys(message, ["type", "payload"]) || !isPageCaptureRuntimeRequest(message["payload"])) {
+      return runtimeFailure("invalid_request", "Invalid page capture request");
+    }
+    if (!bridge.pageCaptureAvailable()) return { captured: true };
+    return bridge.sendPageCapture(message["payload"])
+      ? { captured: true }
+      : runtimeFailure("capture_failed", "Could not send page capture");
+  }
   if (type === "papio.openInbox") {
     if (!isInboxOrPopupSender(sender, urls)) return runtimeFailure("unauthorized", "This sender cannot open the inbox");
     if (!hasOnlyKeys(message, ["type"])) return runtimeFailure("invalid_request", "Invalid inbox open request");
@@ -4272,6 +4340,12 @@ function realDeps(): BridgeDeps {
           injection as unknown as chrome.scripting.ScriptInjection<unknown[], unknown>,
         ),
     },
+    captureStorage: {
+      local: {
+        get: (key) => chrome.storage.local.get(key),
+        set: (items) => chrome.storage.local.set(items),
+      },
+    },
     permissions: {
       contains: (perm) => chrome.permissions.contains(perm),
     },
@@ -4346,6 +4420,7 @@ if (typeof chrome !== "undefined" && chrome.runtime?.id) {
     if (
       isObjectRecord(message) &&
       (message["type"] === "papio.openInbox" ||
+        message["type"] === "papio.page_capture" ||
         message["type"] === "papio.triage.snapshot" ||
         message["type"] === "papio.triage.counts" ||
         message["type"] === "papio.triage.decide" ||

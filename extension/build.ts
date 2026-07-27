@@ -16,6 +16,13 @@ import { watch as fsWatch } from "node:fs";
 const firefoxRoot = "firefox";
 const firefoxDist = `${firefoxRoot}/dist`;
 const buildDaemonVersion = process.env.PAPIO_DAEMON_VERSION ?? "0.0.0-dev";
+// AMO manifests cannot distinguish an unpacked extension from a shipped one,
+// so the developer-panel boundary is fixed before either browser bundle exists.
+const captureToolsInDevBuild =
+  process.env.PAPIO_CAPTURE_TOOLS === "1" ||
+  (process.env.PAPIO_CAPTURE_TOOLS === undefined && buildDaemonVersion === "0.0.0-dev");
+const capturePanel = /\n      <details class="capture" hidden>[\s\S]*?\n      <\/details>/;
+
 
 const extensionPageNames = ["history", "inbox", "options", "popup"] as const;
 
@@ -29,6 +36,24 @@ async function assertExtensionPages(outdir: string): Promise<void> {
       }
     }),
   );
+  const popup = await readFile(`${outdir}/popup.html`, "utf8");
+  if (popup.includes('class="capture"') !== captureToolsInDevBuild) {
+    throw new Error(`${outdir}/popup.html has the wrong developer capture panel for this build`);
+  }
+}
+
+async function copyExtensionPages(outdir: string): Promise<void> {
+  const popup = await readFile("src/popup.html", "utf8");
+  const builtPopup = captureToolsInDevBuild ? popup : popup.replace(capturePanel, "");
+  if (!captureToolsInDevBuild && builtPopup === popup) {
+    throw new Error("release build could not remove the developer capture panel");
+  }
+  await Promise.all([
+    cp("src/history.html", `${outdir}/history.html`),
+    cp("src/inbox.html", `${outdir}/inbox.html`),
+    cp("src/options.html", `${outdir}/options.html`),
+    writeFile(`${outdir}/popup.html`, builtPopup),
+  ]);
 }
 
 
@@ -41,6 +66,7 @@ async function build(entrypoints: string[], outdir: string, format: "esm" | "iif
     sourcemap: "none",
     define: {
       __PAPIO_DAEMON_VERSION__: JSON.stringify(buildDaemonVersion),
+      __PAPIO_DEV_CAPTURE__: JSON.stringify(captureToolsInDevBuild),
     },
   });
   if (!result.success) {
@@ -56,12 +82,7 @@ async function buildAll(): Promise<void> {
     "dist",
     "esm",
   );
-  await Promise.all([
-    cp("src/history.html", "dist/history.html"),
-    cp("src/inbox.html", "dist/inbox.html"),
-    cp("src/options.html", "dist/options.html"),
-    cp("src/popup.html", "dist/popup.html"),
-  ]);
+  await copyExtensionPages("dist");
   await assertExtensionPages("dist");
   console.log(`built Chrome: ${chromeBundles} bundles + 4 html shells into dist/`);
 
@@ -73,10 +94,7 @@ async function buildAll(): Promise<void> {
     "esm",
   );
   await Promise.all([
-    cp("src/history.html", `${firefoxDist}/history.html`),
-    cp("src/inbox.html", `${firefoxDist}/inbox.html`),
-    cp("src/options.html", `${firefoxDist}/options.html`),
-    cp("src/popup.html", `${firefoxDist}/popup.html`),
+    copyExtensionPages(firefoxDist),
     cp("icons", `${firefoxRoot}/icons`, { recursive: true }),
   ]);
   await assertExtensionPages(firefoxDist);

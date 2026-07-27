@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -428,5 +429,172 @@ func TestHandoffRepairerReachesOldestParkBeyondMaintenancePage(t *testing.T) {
 	}
 	if persisted.State != job.StateResolving {
 		t.Fatalf("oldest park state = %s, want resolving despite newer full page", persisted.State)
+	}
+}
+
+func providerUpgradePark(t *testing.T, svc *Service, jobs *job.Store, requestID, extensionVersion, adapterVersion string) *job.Row {
+	t.Helper()
+	ctx := context.Background()
+	row := parkedHandoffJob(t, svc, jobs, requestID)
+	if _, err := jobs.OpenHumanAction(ctx, row.ID, "manual_download", "download the requested PDF yourself"); err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.RecordEvent(ctx, row.ID, "browser.provider_outcome", map[string]any{
+		"outcome":           "ui_changed",
+		"adapter_version":   adapterVersion,
+		"extension_version": extensionVersion,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return row
+}
+
+func TestHandoffRepairerRepairsAdapterUpgradeParks(t *testing.T) {
+	ctx := context.Background()
+	newer := func(previous, current string) bool {
+		return previous == "0.7.0" && current == "0.8.0"
+	}
+
+	t.Run("retries once and records the extension upgrade", func(t *testing.T) {
+		svc, jobs := newTestService(t)
+		row := providerUpgradePark(t, svc, jobs, "request_adapter_upgrade_once", "0.7.0", "0.1.0")
+
+		if err := svc.HandoffRepairer().RepairAdapterUpgrade(ctx, "0.8.0", newer); err != nil {
+			t.Fatal(err)
+		}
+		persisted, err := jobs.Get(ctx, row.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if persisted.State != job.StateResolving {
+			t.Fatalf("state = %s, want resolving", persisted.State)
+		}
+		open, err := jobs.ListOpenHumanActionsForJobs(ctx, []string{row.ID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(open) != 0 {
+			t.Fatalf("manual action left open after repair: %+v", open)
+		}
+		events, err := jobs.Events(ctx, row.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var repairDetail map[string]any
+		for _, event := range events {
+			if event["kind"] != "job.transition" {
+				continue
+			}
+			detail, _ := event["detail"].(map[string]any)
+			if detail["reason"] == adapterUpgradeRepairReason {
+				repairDetail = detail
+			}
+		}
+		if repairDetail == nil ||
+			repairDetail["old_extension_version"] != "0.7.0" ||
+			repairDetail["new_extension_version"] != "0.8.0" ||
+			repairDetail["adapter_version"] != "0.1.0" {
+			t.Fatalf("adapter-upgrade repair event = %#v", repairDetail)
+		}
+
+		if err := jobs.Transition(ctx, row.ID, job.StateResolving, job.StateAwaitingHuman,
+			map[string]any{"reason": "provider_repark"}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := jobs.OpenHumanAction(ctx, row.ID, "manual_download", "download the requested PDF yourself"); err != nil {
+			t.Fatal(err)
+		}
+		if err := svc.HandoffRepairer().RepairAdapterUpgrade(ctx, "0.8.0", newer); err != nil {
+			t.Fatal(err)
+		}
+		persisted, err = jobs.Get(ctx, row.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if persisted.State != job.StateAwaitingHuman {
+			t.Fatalf("same extension upgrade retried again: state = %s", persisted.State)
+		}
+		open, err = jobs.ListOpenHumanActionsForJobs(ctx, []string{row.ID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(open) != 1 || open[0].Kind != "manual_download" {
+			t.Fatalf("same extension upgrade changed open actions: %+v", open)
+		}
+	})
+
+	for _, tc := range []struct {
+		name  string
+		setup func(t *testing.T, svc *Service, jobs *job.Store, row *job.Row)
+		kind  string
+	}{
+		{
+			name: "active adoption lease",
+			setup: func(t *testing.T, svc *Service, _ *job.Store, row *job.Row) {
+				t.Helper()
+				held, err := svc.leaseAwaitingHuman(ctx, row.ID, "adopt-in-progress", time.Minute)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !held {
+					t.Fatal("precondition: adoption lease was not acquired")
+				}
+			},
+			kind: "manual_download",
+		},
+		{
+			name: "proven-empty institutional route",
+			setup: func(t *testing.T, _ *Service, jobs *job.Store, row *job.Row) {
+				t.Helper()
+				if err := jobs.RecordEvent(ctx, row.ID, "browser.no_entitlement_requeue", map[string]any{"outcome": "no_entitlement"}); err != nil {
+					t.Fatal(err)
+				}
+			},
+			kind: "manual_download",
+		},
+		{
+			name: "identity review action",
+			setup: func(t *testing.T, _ *Service, jobs *job.Store, row *job.Row) {
+				t.Helper()
+				actions, err := jobs.ListOpenHumanActionsForJobs(ctx, []string{row.ID})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(actions) != 1 {
+					t.Fatalf("manual action count = %d, want 1", len(actions))
+				}
+				if err := jobs.ResolveHumanAction(ctx, actions[0].ID, "resolved"); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := jobs.OpenHumanAction(ctx, row.ID, "verify_identity", "inspect the quarantined download"); err != nil {
+					t.Fatal(err)
+				}
+			},
+			kind: "verify_identity",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, jobs := newTestService(t)
+			row := providerUpgradePark(t, svc, jobs, "request_adapter_upgrade_"+strings.ReplaceAll(tc.name, " ", "_"), "0.7.0", "0.1.0")
+			tc.setup(t, svc, jobs, row)
+
+			if err := svc.HandoffRepairer().RepairAdapterUpgrade(ctx, "0.8.0", newer); err != nil {
+				t.Fatal(err)
+			}
+			persisted, err := jobs.Get(ctx, row.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if persisted.State != job.StateAwaitingHuman {
+				t.Fatalf("state = %s, want awaiting_human", persisted.State)
+			}
+			open, err := jobs.ListOpenHumanActionsForJobs(ctx, []string{row.ID})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(open) != 1 || open[0].Kind != tc.kind {
+				t.Fatalf("open actions = %+v, want one %s", open, tc.kind)
+			}
+		})
 	}
 }

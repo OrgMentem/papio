@@ -25,6 +25,18 @@ with `~/` are expanded when *papio* loads them.
 | `timeout_seconds` | integer seconds | `120` | Fetch deadline. It must be at least 5 seconds. |
 | `allow_http_loopback` | boolean | `false` | Development and test override that permits HTTP loopback. Doctor warns while it is enabled; production policy is HTTPS-only. |
 
+## `[captures]`
+
+| Key | Type | Default | Effect and constraints |
+| --- | --- | --- | --- |
+| `enabled` | boolean | `true` | Stores sanitized diagnostic page captures received from the extension in the local data directory. Disable it to keep no diagnostic page HTML. |
+| `max_per_host` | integer | `10` | Maximum retained captures for each host. It must be between 1 and 1000; when the limit is exceeded, the oldest captures for that host are removed. |
+| `max_age_days` | integer days | `14` | Maximum capture age. It must be between 1 and 365; older captures are removed. |
+
+The `[captures]` section is strict-mode configuration: an older daemon rejects a
+config containing it. Deploy the binary that supports this section together with
+the configuration change.
+
 ## `[pdf]`
 
 | Key | Type | Default | Effect and constraints |

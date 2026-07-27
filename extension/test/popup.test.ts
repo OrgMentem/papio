@@ -82,40 +82,39 @@ test("capture selects offer every registered provider and scenario", () => {
   expect(values("capture-scenario")).toEqual([...SCENARIOS]);
 });
 
-test("shows capture tools only for unpacked Chrome manifests", () => {
-  const production = popupDocument();
-  Object.assign(globalThis, {
-    chrome: {
-      runtime: {
-        getManifest: () => ({ manifest_version: 3, update_url: "https://clients2.google.com/service/update2/crx" }),
-      },
-    },
-  });
-  wireDevTools(production);
-  expect(production.querySelector<HTMLElement>(".capture")?.hidden).toBe(true);
-  expect(production.querySelectorAll("#capture-provider option")).toHaveLength(0);
+test("build flag exposes capture tools only in developer builds on both browsers", () => {
+  const flag = "__PAPIO_DEV_CAPTURE__";
+  const descriptor = Object.getOwnPropertyDescriptor(globalThis, flag);
+  try {
+    Object.defineProperty(globalThis, flag, { configurable: true, value: false });
+    const shippedChrome = popupDocument();
+    wireDevTools(shippedChrome);
+    expect(shippedChrome.querySelector<HTMLElement>(".capture")?.hidden).toBe(true);
+    expect(shippedChrome.querySelectorAll("#capture-provider option")).toHaveLength(0);
 
-  const unpacked = popupDocument();
-  Object.assign(globalThis, {
-    chrome: { runtime: { getManifest: () => ({ manifest_version: 3 }) } },
-  });
-  wireDevTools(unpacked);
-  expect(unpacked.querySelector<HTMLElement>(".capture")?.hidden).toBe(false);
-  expect(unpacked.querySelectorAll("#capture-provider option")).toHaveLength(PROVIDERS.length);
-  const capture = unpacked.querySelector<HTMLElement>(".capture");
-  expect(capture?.tagName).toBe("DETAILS");
-  expect(capture?.hasAttribute("open")).toBe(false);
+    const shippedFirefox = popupDocument();
+    wireDevTools(shippedFirefox);
+    expect(shippedFirefox.querySelector<HTMLElement>(".capture")?.hidden).toBe(true);
 
-  const firefox = popupDocument();
-  Object.assign(globalThis, {
-    chrome: {
-      runtime: {
-        getManifest: () => ({ manifest_version: 3, browser_specific_settings: { gecko: { id: "papio@example.test" } } }),
-      },
-    },
-  });
-  wireDevTools(firefox);
-  expect(firefox.querySelector<HTMLElement>(".capture")?.hidden).toBe(true);
+    Object.defineProperty(globalThis, flag, { configurable: true, value: true });
+    const developerChrome = popupDocument();
+    wireDevTools(developerChrome);
+    expect(developerChrome.querySelector<HTMLElement>(".capture")?.hidden).toBe(false);
+    expect(developerChrome.querySelectorAll("#capture-provider option")).toHaveLength(PROVIDERS.length);
+    const capture = developerChrome.querySelector<HTMLElement>(".capture");
+    expect(capture?.tagName).toBe("DETAILS");
+    expect(capture?.hasAttribute("open")).toBe(false);
+
+    const developerFirefox = popupDocument();
+    wireDevTools(developerFirefox);
+    expect(developerFirefox.querySelector<HTMLElement>(".capture")?.hidden).toBe(false);
+  } finally {
+    if (descriptor !== undefined) {
+      Object.defineProperty(globalThis, flag, descriptor);
+    } else {
+      Reflect.deleteProperty(globalThis, flag);
+    }
+  }
 });
 
 test("renders actionable daemon problems without routine version diagnostics", () => {

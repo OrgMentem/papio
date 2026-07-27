@@ -1,8 +1,8 @@
 // Copyright 2026 OrgMentem. Licensed under MIT. See LICENSE.
 // Fixture capture for adapter development (Phase 3). The popup injects a tiny
 // serializer into the ACTIVE tab, then this module sanitizes the returned HTML
-// *in the popup* — never in the page — and the popup writes it to disk as a
-// versioned adapter fixture.
+// *in the popup* — never in the page — and sends it through papio's native
+// bridge for daemon-owned storage.
 //
 // Sanitization is dependency-free string processing so it runs identically in a
 // bun test and in the extension popup: a tolerant tag/text walk, no DOM, no
@@ -13,8 +13,15 @@
 // Privacy contract (Contract item 3): the fixture that leaves the tab carries
 // no secrets. Scripts/inline JS, query strings, fragments, form values, and any
 // token-shaped string are stripped or masked. The popup additionally REFUSES to
-// write a fixture whose sanitized form still contains a residual secret, so a
-// dirty capture fails closed rather than landing on disk.
+// emit a fixture whose sanitized form still contains a residual secret, so a
+// dirty capture cannot cross the bridge.
+
+import {
+  BROWSER_PROTOCOL_VERSION,
+  MAX_BROWSER_MESSAGE_BYTES,
+  MsgPageCapture,
+  type PageCapturePayload,
+} from "./protocol";
 
 /** Providers the capture tool can record fixtures for. Superset of the enabled
  * adapter set: a provider appears here as soon as fixture capture is wanted,
@@ -43,14 +50,8 @@ export type Provider =
   | "jamanetwork"
   | "lww";
 
-/** Adapter scenarios the capture UI can record; unreachable states stay assisted. */
-export type Scenario =
-  | "success"
-  | "login-return"
-  | "terms"
-  | "no-entitlement"
-  | "wrong-work"
-  | "drift";
+/** Scenarios that the daemon can retain as page-capture fixtures. */
+export type Scenario = "success" | "login-return" | "no-entitlement" | "drift";
 
 export const PROVIDERS: readonly Provider[] = [
   "proquest",
@@ -76,14 +77,7 @@ export const PROVIDERS: readonly Provider[] = [
   "jamanetwork",
   "lww",
 ];
-export const SCENARIOS: readonly Scenario[] = [
-  "success",
-  "login-return",
-  "terms",
-  "no-entitlement",
-  "wrong-work",
-  "drift",
-];
+export const SCENARIOS: readonly Scenario[] = ["success", "login-return", "no-entitlement", "drift"];
 
 export interface FixtureMeta {
   provider: Provider;
@@ -482,7 +476,7 @@ export function residualLeak(sanitized: string): string | null {
 }
 
 // ---------------------------------------------------------------------------
-// Popup capture wiring
+// Capture transport
 // ---------------------------------------------------------------------------
 
 /** Serializable snapshot returned by the injected page function. */
@@ -504,12 +498,102 @@ export function capturePage(): PageCapture {
   };
 }
 
-/** 8 MiB cap on the captured document; larger pages are refused with a clear
- * error rather than serialized into a data: URL. */
-export const MAX_CAPTURE_BYTES = 8 * 1024 * 1024;
+export const MAX_CAPTURE_DECODED_BYTES = 2 << 20;
+export const MAX_CAPTURE_FRAME_BYTES = MAX_BROWSER_MESSAGE_BYTES;
+const MAX_CAPTURE_FRAME_OVERHEAD_BYTES = 1024;
 
-/** Minimal chrome surface captureFixture needs. The real `chrome` satisfies it
- * structurally; tests inject a fake with scripting + downloads. */
+interface PageCaptureMeta {
+  host: string;
+  scenario: Scenario | "observed";
+  adapterID?: string;
+  adapterVersion?: string;
+  jobID?: string;
+}
+
+type EncodedCapture =
+  | { ok: true; payload: PageCapturePayload }
+  | { ok: false; error: string };
+
+function base64(bytes: Uint8Array): string {
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let start = 0; start < bytes.length; start += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(start, start + chunkSize));
+  }
+  return btoa(binary);
+}
+
+async function gzip(bytes: Uint8Array<ArrayBuffer>): Promise<Uint8Array | undefined> {
+  if (typeof CompressionStream !== "function") {
+    console.warn('papio: refusing page capture because CompressionStream("gzip") is unavailable');
+    return undefined;
+  }
+  let stream: CompressionStream;
+  try {
+    stream = new CompressionStream("gzip");
+  } catch (error) {
+    console.warn("papio: refusing page capture because gzip compression is unavailable", error);
+    return undefined;
+  }
+  const source = new ReadableStream<BufferSource>({
+    start(controller) {
+      controller.enqueue(bytes);
+      controller.close();
+    },
+  });
+  try {
+    return new Uint8Array(await new Response(source.pipeThrough(stream)).arrayBuffer());
+  } catch (error) {
+    console.warn("papio: refusing page capture because gzip compression failed", error);
+    return undefined;
+  }
+}
+
+function encodedFrameBytes(payload: PageCapturePayload, jobID: string | undefined): number {
+  const frame: Record<string, unknown> = {
+    protocol: BROWSER_PROTOCOL_VERSION,
+    type: MsgPageCapture,
+    msg_id: "x".repeat(64),
+    seq: Number.MAX_SAFE_INTEGER,
+    payload,
+  };
+  if (jobID !== undefined) frame["job_id"] = jobID;
+  return new TextEncoder().encode(JSON.stringify(frame)).byteLength;
+}
+
+/** Compress one already-sanitized capture for its single native frame. */
+export async function encodePageCapture(sanitized: string, meta: PageCaptureMeta): Promise<EncodedCapture> {
+  const decoded = new TextEncoder().encode(sanitized);
+  if (decoded.byteLength === 0 || decoded.byteLength > MAX_CAPTURE_DECODED_BYTES) {
+    return {
+      ok: false,
+      error: `sanitized page is ${decoded.byteLength} bytes; over the ${MAX_CAPTURE_DECODED_BYTES}-byte decoded capture cap`,
+    };
+  }
+
+  const compressed = await gzip(decoded);
+  if (compressed === undefined) return { ok: false, error: "gzip compression is unavailable" };
+  if (compressed.byteLength > Math.floor(((MAX_CAPTURE_FRAME_BYTES - MAX_CAPTURE_FRAME_OVERHEAD_BYTES) * 3) / 4)) {
+    return { ok: false, error: `compressed page exceeds the ${MAX_CAPTURE_FRAME_BYTES}-byte native frame cap` };
+  }
+
+  const payload: PageCapturePayload = {
+    host: meta.host,
+    scenario: meta.scenario,
+    ...(meta.adapterID === undefined ? {} : { adapter_id: meta.adapterID }),
+    ...(meta.adapterVersion === undefined ? {} : { adapter_version: meta.adapterVersion }),
+    encoding: "gzip+base64",
+    bytes: decoded.byteLength,
+    body: base64(compressed),
+  };
+  if (encodedFrameBytes(payload, meta.jobID) > MAX_CAPTURE_FRAME_BYTES) {
+    return { ok: false, error: `encoded page exceeds the ${MAX_CAPTURE_FRAME_BYTES}-byte native frame cap` };
+  }
+  return { ok: true, payload };
+}
+
+/** Minimal browser surface captureFixture needs. The real `chrome` satisfies it
+ * structurally; tests inject a fake with scripting plus the native-frame relay. */
 export interface ChromeCaptureApi {
   tabs: { query(info: { active: boolean; currentWindow: boolean }): Promise<Array<{ id?: number | undefined }>> };
   scripting: {
@@ -518,91 +602,14 @@ export interface ChromeCaptureApi {
       func: () => PageCapture;
     }): Promise<Array<{ result?: PageCapture | undefined }>>;
   };
-  downloads: {
-    download(options: {
-      url: string;
-      filename: string;
-      conflictAction: "uniquify";
-      saveAs: boolean;
-    }): Promise<number>;
-  };
+  sendPageCapture(payload: PageCapturePayload): Promise<boolean>;
 }
 
-/** Chrome ignores downloads.download's `filename` for `data:` URLs, so fixture
- * writes would land as `download (N).html`. downloadFixture enqueues the
- * intended relative path here; the background onDeterminingFilename listener
- * dequeues it to relocate the file. FIFO is safe because fixture writes are
- * serialized (observe queue) and manual capture is a discrete user gesture. */
-const fixtureFilenameReservationTTLMS = 60_000;
-
-type FixtureFilenameTimer = number | Timer;
-
-interface FixtureFilenameReservation {
-  filename: string;
-  timeout: FixtureFilenameTimer;
-}
-
-const pendingFixtureFilenames: FixtureFilenameReservation[] = [];
-
-function removePendingFixtureFilename(reservation: FixtureFilenameReservation): void {
-  const index = pendingFixtureFilenames.indexOf(reservation);
-  if (index !== -1) {
-    pendingFixtureFilenames.splice(index, 1);
-  }
-  clearTimeout(reservation.timeout);
-}
-
-/** Dequeue the intended path for a fixture `data:` download, for the
- * onDeterminingFilename listener. Non-fixture downloads pass through untouched. */
-export function takePendingFixtureFilename(url: string): string | undefined {
-  if (!url.startsWith("data:text/html")) return undefined;
-  const reservation = pendingFixtureFilenames.shift();
-  if (!reservation) return undefined;
-  clearTimeout(reservation.timeout);
-  return reservation.filename;
-}
-
-/** Write already-sanitized fixture HTML through Chrome's download manager. Both
- * manual captures and auto-observations use this exact final write path. */
-export async function downloadFixture(
-  api: Pick<ChromeCaptureApi, "downloads">,
-  filename: string,
-  sanitized: string,
-): Promise<{ downloadId: number; filename: string }> {
-  const url = `data:text/html;charset=utf-8,${encodeURIComponent(sanitized)}`;
-  const reservation: FixtureFilenameReservation = { filename, timeout: 0 };
-  pendingFixtureFilenames.push(reservation);
-  reservation.timeout = setTimeout(() => {
-    removePendingFixtureFilename(reservation);
-  }, fixtureFilenameReservationTTLMS);
-  if (typeof reservation.timeout === "object" && "unref" in reservation.timeout) {
-    reservation.timeout.unref();
-  }
-  try {
-    const downloadId = await api.downloads.download({
-      url,
-      filename,
-      conflictAction: "uniquify",
-      saveAs: false,
-    });
-    return { downloadId, filename };
-  } catch (err) {
-    removePendingFixtureFilename(reservation);
-    throw err;
-  }
-}
-
-export type CaptureResult =
-  | { ok: true; downloadId: number; filename: string }
-  | { ok: false; error: string };
+export type CaptureResult = { ok: true; bytes: number } | { ok: false; error: string };
 
 /**
- * Capture the active tab into an adapter fixture and download it. Requires a
- * user gesture upstream (the popup Capture button) so `activeTab` is usable.
- *
- * Fails closed at every boundary: no active tab, no injection result, oversized
- * payload, or a residual secret in the sanitized output all return an error
- * without writing anything.
+ * Capture the active tab into a daemon-owned fixture. Requires a user gesture
+ * upstream (the popup Capture button) so `activeTab` is usable.
  */
 export async function captureFixture(
   api: ChromeCaptureApi,
@@ -614,27 +621,56 @@ export async function captureFixture(
   const tabId = tab?.id;
   if (typeof tabId !== "number") return { ok: false, error: "no active tab to capture" };
 
-  const [injected] = await api.scripting.executeScript({ target: { tabId }, func: capturePage });
+  let injected: { result?: PageCapture | undefined } | undefined;
+  try {
+    [injected] = await api.scripting.executeScript({ target: { tabId }, func: capturePage });
+  } catch {
+    return { ok: false, error: "could not read the active tab (is it a restricted page?)" };
+  }
   const page = injected?.result;
-  if (!page || typeof page.html !== "string") {
+  if (
+    !page ||
+    typeof page.html !== "string" ||
+    typeof page.origin !== "string" ||
+    typeof page.path !== "string"
+  ) {
     return { ok: false, error: "could not read the active tab (is it a restricted page?)" };
   }
 
-  const bytes = new TextEncoder().encode(page.html).length;
-  if (bytes > MAX_CAPTURE_BYTES) {
-    return { ok: false, error: `page is ${bytes} bytes; over the ${MAX_CAPTURE_BYTES}-byte capture cap` };
+  let host: string;
+  try {
+    const origin = new URL(page.origin);
+    if (origin.protocol !== "http:" && origin.protocol !== "https:") throw new Error("non-web origin");
+    host = origin.hostname;
+  } catch {
+    return { ok: false, error: "could not determine the active tab host" };
   }
+  if (host === "") return { ok: false, error: "could not determine the active tab host" };
 
+  let capturedISO: string;
+  try {
+    capturedISO = now().toISOString();
+  } catch {
+    return { ok: false, error: "could not timestamp the capture" };
+  }
   const sanitized = sanitizeFixture(page.html, {
     provider,
     scenario,
     originNoQuery: `${page.origin}${page.path}`,
-    capturedISO: now().toISOString(),
+    capturedISO,
   });
 
   const leak = residualLeak(sanitized);
-  if (leak) return { ok: false, error: `refusing to write a dirty fixture: ${leak}` };
+  if (leak) return { ok: false, error: `refusing to emit a dirty fixture: ${leak}` };
 
-  const written = await downloadFixture(api, `papio-fixtures/${provider}/${scenario}.html`, sanitized);
-  return { ok: true, ...written };
+  const encoded = await encodePageCapture(sanitized, { host, scenario, adapterID: provider });
+  if (!encoded.ok) return encoded;
+  try {
+    if (!(await api.sendPageCapture(encoded.payload))) {
+      return { ok: false, error: "could not send the capture to papio" };
+    }
+  } catch {
+    return { ok: false, error: "could not send the capture to papio" };
+  }
+  return { ok: true, bytes: encoded.payload.bytes };
 }

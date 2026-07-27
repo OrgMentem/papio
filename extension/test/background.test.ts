@@ -9,7 +9,7 @@ import { Window } from "happy-dom";
 
 import { parseBrowserMessage, type BrowserMessage } from "../src/protocol";
 import { emptyStore, type StateBackend, type StoreShape } from "../src/state";
-import { sanitizeFixture } from "../src/capture";
+import { capturePage, encodePageCapture, sanitizeFixture } from "../src/capture";
 import type { AdapterSpec } from "../src/adapters/types";
 import { interpret } from "../src/adapters/types";
 import {
@@ -1143,19 +1143,33 @@ test("a resolver no-service route stays assisted without an outcome", async () =
   expect(h.frames().some((frame) => frame.type === "auth_pending")).toBe(false);
 });
 
-test("a registered adapter host classifies even when absent from the offer's provider_hosts", async () => {
-  // The protocol caps provider_hosts at 20 entries, so an offer cannot name
-  // every adapter family; the registry is the authoritative host source.
+test("a registry-only adapter host classifies and emits an observed capture", async () => {
+  // The offer list is capped while the source-controlled adapter registry is not;
+  // capture must use the same verified-host decision as classification.
   const h = makeHarness();
   h.deps.adapterSpecs.push(PROVIDER_ADAPTER);
   h.deps.permissions.contains = async () => true;
+  const stored: Record<string, unknown> = {};
+  h.deps.captureStorage = {
+    local: {
+      get: async (key) => ({ [key]: stored[key] }),
+      set: async (items) => {
+        Object.assign(stored, items);
+      },
+    },
+  };
   const injections: Parameters<BridgeDeps["scripting"]["executeScript"]>[0][] = [];
   h.deps.scripting.executeScript = async (injection) => {
     injections.push(injection);
-    return [{ result: { kind: "unknown" } }];
+    if (injection.func === interpret) return [{ result: { kind: "unknown" } }];
+    if (injection.func === capturePage) {
+      return [{ result: { html: `<main class="article">new provider shape</main>`, origin: `https://${PROVIDER_HOST}`, path: "/stable/article" } }];
+    }
+    return [{ result: false }];
   };
 
   await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["page_capture_v1"] }));
   await h.port.inbound({
     protocol: "papio-browser/1",
     type: "job_offer",
@@ -1178,6 +1192,15 @@ test("a registered adapter host classifies even when absent from the offer's pro
   );
 
   expect(injections.some((i) => i.func === interpret && i.target.tabId === tabID)).toBe(true);
+  const captures = h.frames().filter((frame) => frame.type === "page_capture");
+  expect(captures).toHaveLength(1);
+  expect(captures[0]?.job_id).toBe("job_0001a_registry_host");
+  expect(captures[0]?.payload).toMatchObject({
+    host: PROVIDER_HOST,
+    scenario: "observed",
+    adapter_id: PROVIDER_ADAPTER.id,
+  });
+  expect(h.downloads.started).toHaveLength(0);
 });
 
 test("all-sites browser access counts as effective provider access", async () => {
@@ -2614,6 +2637,66 @@ test("an HTML adapter download is refused, discarded, and reported as download_n
   });
   await h.downloads.onChanged.emit({ id: 8, state: { current: "complete" } });
   expect(h.frames().some((f) => f.type === "download_complete")).toBe(true);
+});
+
+test("popup capture relay emits page_capture only after the daemon advertises it", async () => {
+  const h = makeHarness();
+  const urls = {
+    runtimeID: "papio-test-id",
+    inboxURL: "chrome-extension://papio-test-id/inbox.html",
+    popupURL: "chrome-extension://papio-test-id/popup.html",
+    historyURL: "chrome-extension://papio-test-id/history.html",
+  };
+  const sanitized = sanitizeFixture(`<main class="article">Known structure</main>`, {
+    provider: "jstor",
+    scenario: "success",
+    originNoQuery: "https://www.jstor.org/stable/123",
+    capturedISO: "2026-07-27T10:11:12.000Z",
+  });
+  const encoded = await encodePageCapture(sanitized, {
+    host: "www.jstor.org",
+    scenario: "success",
+    adapterID: "jstor",
+  });
+  if (!encoded.ok) throw new Error(encoded.error);
+
+  await h.bridge.start();
+  await expect(
+    handleInboxRuntimeMessage(
+      h.bridge,
+      { type: "papio.page_capture", payload: encoded.payload },
+      { id: urls.runtimeID, url: urls.inboxURL },
+      urls,
+    ),
+  ).resolves.toEqual({
+    ok: false,
+    error: { code: "unauthorized", message: "This sender cannot send page captures" },
+  });
+  expect(h.frames().some((frame) => frame.type === "page_capture")).toBe(false);
+  await expect(
+    handleInboxRuntimeMessage(
+      h.bridge,
+      { type: "papio.page_capture", payload: encoded.payload },
+      { id: urls.runtimeID, url: urls.popupURL },
+      urls,
+    ),
+  ).resolves.toEqual({ captured: true });
+  expect(h.frames().some((frame) => frame.type === "page_capture")).toBe(false);
+  await h.port.inbound(helloAck({ features: ["page_capture_v1"] }));
+  await expect(
+    handleInboxRuntimeMessage(
+      h.bridge,
+      { type: "papio.page_capture", payload: encoded.payload },
+      { id: urls.runtimeID, url: urls.popupURL },
+      urls,
+    ),
+  ).resolves.toEqual({ captured: true });
+
+  const captures = h.frames().filter((frame) => frame.type === "page_capture");
+  expect(captures).toHaveLength(1);
+  expect(captures[0]?.payload).toEqual({ ...encoded.payload });
+  expect(captures[0]?.job_id).toBeUndefined();
+  expect(h.downloads.started).toHaveLength(0);
 });
 
 test("inbox runtime messages validate the exact extension sender", async () => {

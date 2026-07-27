@@ -12,6 +12,27 @@ execution records in `notes/acquisition-stack-plan.md`.
 
 ### Added
 
+- **Diagnostic page captures no longer land in your Downloads.** They travelled
+  via `chrome.downloads` because ordinary extensions have no filesystem access —
+  but papio has a native-messaging host and a daemon that already owns its data
+  directory. Captures now cross the bridge as a gzip-compressed `page_capture`
+  frame (the largest real capture is 40% of the frame budget, so one frame, no
+  chunking) and the daemon stores them under `<data dir>/captures/`, bounded to
+  10 per host and 14 days. `papio adapter captures` lists them and
+  `papio adapter captures purge` removes them. Enabled by default; set
+  `[captures] enabled = false` to turn it off. The old
+  `~/Downloads/papio-fixtures/` directory is no longer written and is safe to
+  delete. Gated behind the `page_capture_v1` feature per ADR-0001, so an
+  extension paired with an older daemon simply does not capture.
+- **A fixed adapter now retries what the broken one stranded.** Provider
+  outcomes record the extension version that produced them, and a job parked on
+  a manual download is re-offered once when the live browser reports a newer
+  version. Adapters ship inside the extension bundle, so an adapter fix is an
+  extension upgrade — precisely the moment a job's failure reason stops
+  existing. Bounded to one retry per job per upgrade, only with a live holder
+  session, and never touching a leased job, a route already proven empty, or a
+  `verify_identity` awaiting your decision.
+
 - **Durable escalating reminders for stranded human actions.** The daemon now
   re-notifies the configured desktop and webhook sinks after
   `[browser] action_expiry_seconds` (30 minutes by default), then doubles each

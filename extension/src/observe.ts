@@ -1,16 +1,16 @@
 // Copyright 2026 OrgMentem. Licensed under MIT. See LICENSE.
 // Automatic, rate-limited capture of unknown provider pages. This is strictly
 // development material: it is only reachable from a broker-owned handoff tab
-// after its current host has been verified against the original job offer.
+// whose host passed the same offer-or-registry gate as classification.
 
 import {
   capturePage,
-  downloadFixture,
-  MAX_CAPTURE_BYTES,
+  encodePageCapture,
   residualLeak,
   sanitizeFixture,
   type PageCapture,
 } from "./capture";
+import type { PageCapturePayload } from "./protocol";
 import type { ActiveJob } from "./state";
 
 const RATE_STORAGE_KEY = "papio_observed_capture_rate_v1";
@@ -49,20 +49,20 @@ export interface ObserveChromeApi {
       func: () => PageCapture;
     }): Promise<Array<{ result?: PageCapture | undefined }>>;
   };
-  downloads: {
-    download(options: {
-      url: string;
-      filename: string;
-      conflictAction: "uniquify";
-      saveAs: boolean;
-    }): Promise<number>;
-  };
   storage: {
     local: {
       get(key: string): Promise<Record<string, unknown>>;
       set(items: Record<string, unknown>): Promise<void>;
     };
   };
+  sendPageCapture(payload: PageCapturePayload, jobID: string): boolean | Promise<boolean>;
+}
+
+/** Sources that already authorized classification of this broker-owned tab. */
+export interface ObservationCaptureContext {
+  verifiedHosts: readonly string[];
+  adapterID?: string;
+  adapterVersion?: string;
 }
 
 interface ObservationRateState {
@@ -113,16 +113,17 @@ let observationQueue: Promise<void> = Promise.resolve();
  * Capture one unknown result from a tracked handoff tab. Calls are serialized
  * in the service worker so a burst of tab events cannot pass the persisted
  * quota concurrently. Every malformed snapshot, storage failure, changed
- * origin, oversize document, or residual leak fails closed without download.
+ * origin, oversized frame, or residual leak fails closed without emission.
  */
 export function observeUnknown(
   api: ObserveChromeApi,
   job: ActiveJob | undefined,
   host: string,
+  context: ObservationCaptureContext,
   now: () => Date = () => new Date(),
 ): Promise<void> {
   const run = observationQueue.then(async () => {
-    if (!job || !hostMatches(host, job.provider_hosts)) return;
+    if (!job || !hostMatches(host, context.verifiedHosts)) return;
     const hostKey = observedHostKey(host);
     if (!hostKey) return;
 
@@ -149,7 +150,6 @@ export function observeUnknown(
     }
     const page = injected?.result;
     if (!page || typeof page.html !== "string" || typeof page.origin !== "string" || typeof page.path !== "string") return;
-    if (new TextEncoder().encode(page.html).length > MAX_CAPTURE_BYTES) return;
 
     let pageHost: string;
     try {
@@ -157,7 +157,7 @@ export function observeUnknown(
     } catch {
       return;
     }
-    if (!hostMatches(pageHost, job.provider_hosts) || pageHost.toLowerCase() !== host.toLowerCase()) return;
+    if (!hostMatches(pageHost, context.verifiedHosts) || pageHost.toLowerCase() !== host.toLowerCase()) return;
 
     const sanitized = sanitizeFixture(page.html, {
       provider: hostKey,
@@ -171,8 +171,20 @@ export function observeUnknown(
       return;
     }
 
-    // Reserve the quota before downloading. A service-worker restart between a
-    // download starting and an afterward write must not permit a sixth capture.
+    const encoded = await encodePageCapture(sanitized, {
+      host: pageHost,
+      scenario: "observed",
+      ...(context.adapterID === undefined ? {} : { adapterID: context.adapterID }),
+      ...(context.adapterVersion === undefined ? {} : { adapterVersion: context.adapterVersion }),
+      jobID: job.job_id,
+    });
+    if (!encoded.ok) {
+      console.warn("papio: observed page capture could not be encoded; skipping", encoded.error);
+      return;
+    }
+
+    // Reserve quota before bridge emission so a worker restart during native
+    // transport cannot turn one observation into multiple captures.
     rates.total.push(timestamp);
     const hostRates = rates.byHost[hostKey] ?? [];
     hostRates.push(timestamp);
@@ -184,11 +196,12 @@ export function observeUnknown(
       return;
     }
 
-    const filename = `papio-fixtures/observed/${hostKey}/${capturedAt.toISOString().replace(/:/g, "-")}.html`;
     try {
-      await downloadFixture(api, filename, sanitized);
+      if (!(await api.sendPageCapture(encoded.payload, job.job_id))) {
+        console.warn("papio: observed page capture was not sent; skipping");
+      }
     } catch (error) {
-      console.warn("papio: observed fixture download failed; skipping", error);
+      console.warn("papio: observed page capture was not sent; skipping", error);
     }
   });
   observationQueue = run.catch(() => undefined);

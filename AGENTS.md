@@ -164,9 +164,10 @@ Bump the pinned zensical version in `docs/requirements.txt` deliberately; CI ins
   (`build.ts` bundles `--format=iife`; a top-level `export` breaks it, and the build asserts
   against that). Needs `browser_specific_settings.gecko.id`. `manifest.json` is the single
   source of truth; `firefox/manifest.json` is generated from it.
-- Firefox has **no `chrome.downloads.onDeterminingFilename`** — the download-path steering
-  and the **fixture-capture popup tool are Chrome-only**. On Firefox, `downloads.download({filename})`
-  honors sub-paths directly. The popup capture *hangs* on Firefox.
+- Firefox has **no `chrome.downloads.onDeterminingFilename`**, so download-path
++ steering is unavailable. Diagnostic page captures do not use the downloads API:
++ the extension sends the sanitized HTML over native messaging and the daemon stores it
++ under its data directory on both Chrome and Firefox.
 - Firefox treats MV3 `host_permissions` as **runtime opt-in** — the options page must let
   the user grant them (Chrome grants at install). Same gecko id (`papio@orgmentem.com`) as
   the Web Store build, so the native host `allowed_extensions` matches.
@@ -219,9 +220,10 @@ Bump the pinned zensical version in `docs/requirements.txt` deliberately; CI ins
 
 ### Adapters & fixtures
 - An adapter **cannot** enter `extension/src/adapters/types.ts` without a captured fixture —
-  the `every registered adapter is fixture-backed` test requires `fixtures/<id>/success.html`.
-  Capture the authenticated page, run it through `sanitizeFixture` (`src/capture.ts`), commit,
-  then add the spec + `adapters.test.ts` cases. Do **not** hand-guess selectors.
++ the `every registered adapter is fixture-backed` test requires `fixtures/<id>/success.html`.
++ Capture the authenticated page with the diagnostic page, then retrieve the daemon-stored
++ sanitized capture with `papio adapter captures` and commit it before adding the spec +
++ `adapters.test.ts` cases. Do **not** hand-guess selectors.
 - **`sanitizeFixture` strips URL query strings** (privacy). So classify selectors must key on
   **stable id/path/data-attrs, not `?...` params** (e.g. SAGE keys on `section.format--pdf_epub`,
   not `[href*='download=true']`). `method: "href"` reads the **live** anchor href (with query)

@@ -13,9 +13,9 @@ import { join } from "node:path";
 
 import { Window } from "happy-dom";
 
-/** Repo-relative read-root for captured fixtures. Capture downloads land in the
- * browser's Downloads folder under `papio-fixtures/`; the user moves the
- * sanitized files here under `<provider>/<scenario>.html`. */
+/** Repo-relative read-root for committed fixtures. Captures now travel over the
+ * native-messaging bridge into the daemon's data directory; retrieve one with
+ * `papio adapter captures` and commit it here as `<provider>/<scenario>.html`. */
 export const FIXTURE_ROOT = join(import.meta.dir, "..", "fixtures");
 
 export function fixturePath(provider: string, scenario: string): string {

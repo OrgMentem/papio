@@ -160,6 +160,29 @@ test("page_acquire messages parse strictly", () => {
     expect(() => parseBrowserMessage(frame("page_acquire_ack", payload))).toThrow(ProtocolError);
   }
 });
+
+test("page_capture messages parse strictly before echoed frames reach the inbound ignore path", () => {
+  // A valid echo must pass parsing so onInbound reaches its extension-only
+  // default instead of disconnecting the native session before it can ignore it.
+  const text = readFileSync(join(corpusRoot, "valid", "browser-page-capture.json"), "utf8");
+  const frame = JSON.parse(text) as Record<string, unknown>;
+  expect(parseBrowserMessage(frame).type).toBe("page_capture");
+
+  const unscoped = { ...frame };
+  delete unscoped["job_id"];
+  expect(parseBrowserMessage(unscoped).job_id).toBeUndefined();
+
+  const payload = frame["payload"] as Record<string, unknown>;
+  for (const invalid of [
+    { ...payload, encoding: "base64" },
+    { ...payload, bytes: 2 * 1024 * 1024 + 1 },
+    { ...payload, host: "https://journals.sagepub.com" },
+    { ...payload, scenario: "unexpected" },
+    { ...payload, body: "not base64!" },
+  ]) {
+    expect(() => parseBrowserMessage({ ...frame, payload: invalid })).toThrow(ProtocolError);
+  }
+});
 test("auth payloads structurally reject URLs", () => {
   expect(() =>
     parseBrowserMessage({

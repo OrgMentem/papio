@@ -14,6 +14,7 @@
         "hello_ack",
         "page_acquire",
         "page_acquire_ack",
+        "page_capture",
         "job_offer",
         "handoff_outcome",
         "job_accept",
@@ -365,6 +366,30 @@
               "job_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,128}$" },
               "duplicate": { "type": "boolean" },
               "error": { "type": "string", "minLength": 1, "maxLength": 1000, "pattern": "^[^\\u0000]+$" }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "page_capture" } } },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["host", "scenario", "encoding", "bytes", "body"],
+            "properties": {
+              "host": { "type": "string", "pattern": "^[a-z0-9.-]{3,253}$" },
+              "scenario": { "enum": ["observed", "success", "login-return", "no-entitlement", "drift"] },
+              "adapter_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$" },
+              "adapter_version": { "type": "string", "maxLength": 50 },
+              "encoding": { "const": "gzip+base64" },
+              "bytes": { "type": "integer", "minimum": 1, "maximum": 2097152 },
+              "body": {
+                "type": "string",
+                "pattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$"
+              }
             }
           }
         }

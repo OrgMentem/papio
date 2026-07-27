@@ -1,0 +1,1 @@
+{"protocol":"papio-browser/1","type":"page_capture","msg_id":"page-capture-001","job_id":"job_capture_001","seq":1,"payload":{"host":"journals.sagepub.com","scenario":"observed","adapter_id":"sage","adapter_version":"0.2.0","encoding":"gzip+base64","bytes":56,"body":"H4sIAAAAAAACE7NRTMlPLqksSFXIKMnNsbOBkEn5KZV2aZkVJaVFqQrJiQUg2kYfLGqjD1YCAN4m2uc4AAAA"}}

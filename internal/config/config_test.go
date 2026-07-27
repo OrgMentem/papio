@@ -97,6 +97,36 @@ func TestSaveValidatesExceptionTagsAndRecheckWindow(t *testing.T) {
 		t.Fatalf("valid exception-tag config rejected: %v", err)
 	}
 }
+func TestCapturesDefaultsAndValidation(t *testing.T) {
+	cfg := Default()
+	cfg.AccessMode = ModeConservative
+	if !cfg.Captures.Enabled || cfg.Captures.MaxPerHost != 10 || cfg.Captures.MaxAgeDays != 14 {
+		t.Fatalf("default captures = %+v, want enabled with 10 captures for 14 days", cfg.Captures)
+	}
+	cfg.Captures.MaxPerHost = 0
+	err := Save(cfg, filepath.Join(t.TempDir(), "config.toml"))
+	if err == nil || !strings.Contains(err.Error(), "captures.max_per_host must be in 1..1000") {
+		t.Fatalf("invalid captures.max_per_host err = %v", err)
+	}
+	cfg.Captures.MaxPerHost = 10
+	cfg.Captures.MaxAgeDays = 366
+	err = Save(cfg, filepath.Join(t.TempDir(), "config.toml"))
+	if err == nil || !strings.Contains(err.Error(), "captures.max_age_days must be in 1..365") {
+		t.Fatalf("invalid captures.max_age_days err = %v", err)
+	}
+
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(path, []byte("access_mode='conservative'\n[captures]\nenabled=false\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Captures.Enabled || loaded.Captures.MaxPerHost != 10 || loaded.Captures.MaxAgeDays != 14 {
+		t.Fatalf("loaded captures = %+v, want disabled with default retention", loaded.Captures)
+	}
+}
 
 func TestSaveValidatesHooksTimeoutOnlyWhenOnReadySet(t *testing.T) {
 	cfg := Default()

@@ -27,6 +27,8 @@ import {
 } from "./stats";
 
 
+declare const __PAPIO_DEV_CAPTURE__: boolean;
+
 /** Render actionable daemon problems near the popup actions. Routine version
  * diagnostics live behind the settings page's collapsed disclosure. */
 export function renderDaemonStatus(
@@ -606,7 +608,14 @@ const captureApi: ChromeCaptureApi = {
       return results.map((r) => ({ result: r.result ?? undefined }));
     },
   },
-  downloads: { download: (options) => chrome.downloads.download(options) },
+  sendPageCapture: async (payload) => {
+    const response: unknown = await chrome.runtime.sendMessage({ type: "papio.page_capture", payload });
+    return (
+      typeof response === "object" &&
+      response !== null &&
+      (response as Record<string, unknown>)["captured"] === true
+    );
+  },
 };
 
 export function wireCapture(doc: Document = document): void {
@@ -651,7 +660,7 @@ export function wireCapture(doc: Document = document): void {
     button.disabled = true;
     statusEl.textContent = "Capturing…";
     void captureFixture(captureApi, provider, scenario, () => new Date()).then((result) => {
-      statusEl.textContent = result.ok ? `Saved ${result.filename}` : result.error;
+      statusEl.textContent = result.ok ? `Sent ${result.bytes}-byte capture` : result.error;
       button.disabled = false;
     });
   });
@@ -673,17 +682,10 @@ export function wireSettings(doc: Document = document): void {
   });
 }
 
-// The capture-fixture panel is a Chrome-only developer tool. Chrome adds an
-// update_url to store installs; unpacked manifests omit it. Firefox manifests
-// carry browser_specific_settings and must not expose the Chrome capture tool.
+// The build removes this panel from shipped HTML; keep the bundle fail-closed
+// if extension assets from different builds are briefly mixed during an update.
 export function wireDevTools(doc: Document = document): void {
-  let manifest: chrome.runtime.Manifest & Record<string, unknown>;
-  try {
-    manifest = chrome.runtime.getManifest() as chrome.runtime.Manifest & Record<string, unknown>;
-  } catch {
-    return;
-  }
-  if ("browser_specific_settings" in manifest || "update_url" in manifest) return;
+  if (typeof __PAPIO_DEV_CAPTURE__ === "boolean" && !__PAPIO_DEV_CAPTURE__) return;
   const section = doc.querySelector<HTMLElement>(".capture");
   if (section) section.hidden = false;
   wireCapture(doc);

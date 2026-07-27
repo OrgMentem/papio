@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"papio/internal/api"
+	"papio/internal/captures"
 	"papio/internal/config"
 	"papio/internal/job"
 	"papio/internal/work"
@@ -94,6 +95,72 @@ func TestAdapterDiagnoseCommandRendersReport(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestAdapterCapturesCommandPrintsEnvelope(t *testing.T) {
+	var out, errOut bytes.Buffer
+	capture := captures.Capture{
+		Host:           "provider.example.com",
+		Scenario:       "success",
+		AdapterID:      "provider",
+		AdapterVersion: "1.2.3",
+		Timestamp:      time.Date(2026, time.July, 27, 12, 0, 0, 0, time.UTC),
+		Path:           "/data/captures/provider.example.com/2026-07-27T12:00:00Z-success.html",
+		Size:           128,
+	}
+	root := NewInProcessRoot(&out, &errOut, config.Config{}, func(_ context.Context, method string, params, result any) error {
+		if method != "adapter.captures.list" {
+			t.Fatalf("RPC method = %q, want adapter.captures.list", method)
+		}
+		if _, ok := params.(struct{}); !ok {
+			t.Fatalf("list params = %#v, want empty struct", params)
+		}
+		*result.(*[]captures.Capture) = []captures.Capture{capture}
+		return nil
+	})
+	root.SetArgs([]string{"--json", "adapter", "captures"})
+	if err := root.ExecuteContext(context.Background()); err != nil {
+		t.Fatalf("adapter captures: %v", err)
+	}
+
+	var page map[string]json.RawMessage
+	if err := json.Unmarshal(out.Bytes(), &page); err != nil {
+		t.Fatalf("decode output: %v", err)
+	}
+	if len(page) != 2 || page["captures"] == nil || page["truncated"] == nil {
+		t.Fatalf("page keys = %#v, want captures and truncated only", page)
+	}
+	var rows []captures.Capture
+	if err := json.Unmarshal(page["captures"], &rows); err != nil {
+		t.Fatalf("decode captures: %v", err)
+	}
+	if got := page["truncated"]; string(got) != "false" {
+		t.Fatalf("truncated = %s, want false", got)
+	}
+	if !reflect.DeepEqual(rows, []captures.Capture{capture}) {
+		t.Fatalf("captures = %#v, want %#v", rows, []captures.Capture{capture})
+	}
+}
+
+func TestAdapterCapturesPurgeReportsRemovedCount(t *testing.T) {
+	var out, errOut bytes.Buffer
+	root := NewInProcessRoot(&out, &errOut, config.Config{}, func(_ context.Context, method string, params, result any) error {
+		if method != "adapter.captures.purge" {
+			t.Fatalf("RPC method = %q, want adapter.captures.purge", method)
+		}
+		if got, want := params, map[string]string{"host": "provider.example.com"}; !reflect.DeepEqual(got, want) {
+			t.Fatalf("purge params = %#v, want %#v", got, want)
+		}
+		*result.(*api.CapturePurgeResult) = api.CapturePurgeResult{Removed: 2}
+		return nil
+	})
+	root.SetArgs([]string{"adapter", "captures", "purge", "--host", "provider.example.com"})
+	if err := root.ExecuteContext(context.Background()); err != nil {
+		t.Fatalf("adapter captures purge: %v", err)
+	}
+	if got, want := out.String(), "Purged 2 captures\n"; got != want {
+		t.Fatalf("purge output = %q, want %q", got, want)
 	}
 }
 

@@ -14,6 +14,8 @@ import (
 // treats its empty-action gap as durable.
 const strandedNeedsReviewMinAge = 5 * time.Minute
 
+const adapterUpgradeRepairReason = "adapter_upgrade_repair"
+
 // HandoffRepairer heals awaiting_human jobs stranded by a crash between the
 // browser bridge's non-transactional handoff mutations (requeue event, action
 // resolution, state transition). It runs as bounded best-effort maintenance,
@@ -51,6 +53,11 @@ func (s *Service) HandoffRepairer() *HandoffRepairer { return &HandoffRepairer{s
 // "to":"needs_review"} after their openurl_handoff had resolved, leaving no
 // artifact or action. Move it to awaiting_human with manual_download so the
 // user can supply a browser download for adoption.
+//
+// Rule 5 (provider upgrade): a manual-download park created by an adapter
+// outcome from an older extension bundle can retry when the live browser bridge
+// proves that bundle has been upgraded. The bridge supplies that live-only
+// version signal to RepairAdapterUpgrade; maintenance alone cannot infer it.
 //
 // The transactional repair rejects a state/action snapshot that has gone
 // stale, including an adoption lease acquired after its page read.
@@ -123,6 +130,134 @@ func (r *HandoffRepairer) RunDue(ctx context.Context) error {
 			map[string]any{"reason": repair}))
 	}
 	return firstErr
+}
+
+// RepairAdapterUpgrade returns manual-download parks to resolving when a live
+// browser session proves that the extension bundle which stranded them is older.
+// The bridge owns the live-session comparison because app must not depend on the
+// browser package; newer must decline malformed versions rather than guessing.
+//
+// The transition event is both the audit record and the durable one-shot latch:
+// a re-park without a fresh provider outcome cannot loop on the same upgrade.
+func (r *HandoffRepairer) RepairAdapterUpgrade(ctx context.Context, liveExtensionVersion string, newer func(previous, current string) bool) error {
+	if r == nil || r.svc == nil || r.svc.Jobs == nil || liveExtensionVersion == "" || newer == nil {
+		return nil
+	}
+	s := r.svc
+	rows, err := s.Jobs.ListOldest(ctx, []string{job.StateAwaitingHuman}, job.ListLimitMax)
+	if err != nil {
+		return err
+	}
+	if len(rows) == 0 {
+		return nil
+	}
+	ids := make([]string, 0, len(rows))
+	for _, row := range rows {
+		ids = append(ids, row.ID)
+	}
+	actions, err := s.Jobs.ListOpenHumanActionsForJobs(ctx, ids)
+	if err != nil {
+		return err
+	}
+	openByJob := make(map[string][]job.HumanAction, len(rows))
+	for _, action := range actions {
+		openByJob[action.JobID] = append(openByJob[action.JobID], action)
+	}
+
+	var firstErr error
+	record := func(err error) {
+		if err != nil && !errors.Is(err, job.ErrConflict) && firstErr == nil {
+			firstErr = err
+		}
+	}
+	for i := range rows {
+		row := &rows[i]
+		open := openByJob[row.ID]
+		if !allManualDownloads(open) {
+			continue
+		}
+		events, err := s.Jobs.Events(ctx, row.ID)
+		if err != nil {
+			record(err)
+			continue
+		}
+		previousExtensionVersion, adapterVersion, adapterOutcome := providerAdapterUpgradeSource(events)
+		if !adapterOutcome ||
+			providerRouteProvenEmpty(events) ||
+			adapterUpgradeAlreadyRepaired(events, previousExtensionVersion, liveExtensionVersion) ||
+			!newer(previousExtensionVersion, liveExtensionVersion) {
+			continue
+		}
+		actionIDs := make([]int64, 0, len(open))
+		for _, action := range open {
+			actionIDs = append(actionIDs, action.ID)
+		}
+		record(s.Jobs.RepairAwaitingHuman(ctx, row.ID, actionIDs, map[string]any{
+			"reason":                adapterUpgradeRepairReason,
+			"adapter_version":       adapterVersion,
+			"old_extension_version": previousExtensionVersion,
+			"new_extension_version": liveExtensionVersion,
+		}))
+	}
+	return firstErr
+}
+
+// allManualDownloads excludes every other human decision from an automated
+// retry: only a provider-driven manual download is invalidated by an upgrade.
+func allManualDownloads(actions []job.HumanAction) bool {
+	if len(actions) == 0 {
+		return false
+	}
+	for _, action := range actions {
+		if action.Kind != "manual_download" {
+			return false
+		}
+	}
+	return true
+}
+
+// providerAdapterUpgradeSource intentionally inspects only the latest provider
+// outcome. An older adapter observation cannot explain a later provider result.
+func providerAdapterUpgradeSource(events []map[string]any) (extensionVersion, adapterVersion string, ok bool) {
+	for i := len(events) - 1; i >= 0; i-- {
+		event := events[i]
+		if kind, _ := event["kind"].(string); kind != "browser.provider_outcome" {
+			continue
+		}
+		detail, _ := event["detail"].(map[string]any)
+		extensionVersion, _ = detail["extension_version"].(string)
+		adapterVersion, _ = detail["adapter_version"].(string)
+		return extensionVersion, adapterVersion, extensionVersion != "" && adapterVersion != ""
+	}
+	return "", "", false
+}
+
+func providerRouteProvenEmpty(events []map[string]any) bool {
+	for _, event := range events {
+		if kind, _ := event["kind"].(string); kind == "browser.no_entitlement_requeue" {
+			return true
+		}
+	}
+	return false
+}
+
+func adapterUpgradeAlreadyRepaired(events []map[string]any, previousExtensionVersion, liveExtensionVersion string) bool {
+	for _, event := range events {
+		if kind, _ := event["kind"].(string); kind != "job.transition" {
+			continue
+		}
+		detail, _ := event["detail"].(map[string]any)
+		if reason, _ := detail["reason"].(string); reason != adapterUpgradeRepairReason {
+			continue
+		}
+		if previous, _ := detail["old_extension_version"].(string); previous != previousExtensionVersion {
+			continue
+		}
+		if current, _ := detail["new_extension_version"].(string); current == liveExtensionVersion {
+			return true
+		}
+	}
+	return false
 }
 
 // allInstitutionalHandoffs reports whether every open action is an

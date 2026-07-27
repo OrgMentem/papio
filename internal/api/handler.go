@@ -80,6 +80,12 @@ func RouterWithShutdown(system *bootstrap.System, shutdown context.CancelFunc) i
 		"ping": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return ping(ctx, raw, system, &updateRefreshInFlight)
 		},
+		"adapter.captures.list": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return listCaptures(ctx, raw, system)
+		},
+		"adapter.captures.purge": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return purgeCaptures(ctx, raw, system)
+		},
 		"acquire.submit": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return submit(ctx, raw, system)
 		},
@@ -450,6 +456,45 @@ func listWatches(ctx context.Context, raw json.RawMessage, system *bootstrap.Sys
 		return failure(err)
 	}
 	return marshal(watches)
+}
+
+type CapturePurgeResult struct {
+	Removed int `json:"removed"`
+}
+
+func listCaptures(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
+	var params struct{}
+	if err := ipc.DecodeParams(raw, &params); err != nil {
+		return badParams(err)
+	}
+	if system == nil || system.Captures == nil {
+		return marshal([]any{})
+	}
+	rows, err := system.Captures.List(ctx)
+	if err != nil {
+		return failure(err)
+	}
+	if rows == nil {
+		return marshal([]any{})
+	}
+	return marshal(rows)
+}
+
+func purgeCaptures(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
+	var params struct {
+		Host string `json:"host"`
+	}
+	if err := ipc.DecodeParams(raw, &params); err != nil {
+		return badParams(err)
+	}
+	if system == nil || system.Captures == nil {
+		return marshal(CapturePurgeResult{})
+	}
+	removed, err := system.Captures.Purge(ctx, params.Host)
+	if err != nil {
+		return failure(err)
+	}
+	return marshal(CapturePurgeResult{Removed: removed})
 }
 
 func watchDigest(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {

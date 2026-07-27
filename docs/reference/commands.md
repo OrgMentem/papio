@@ -116,6 +116,26 @@ Inspect provider and adapter interactions
 papio adapter
 ```
 
+### `papio adapter captures`
+
+List stored diagnostic page captures
+
+```
+papio adapter captures
+```
+
+#### `papio adapter captures purge`
+
+Remove stored diagnostic page captures
+
+```
+papio adapter captures purge [flags]
+```
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--host` | `string` |  | purge captures for one host |
+
 ### `papio adapter diagnose`
 
 Build a sanitized support report for a job

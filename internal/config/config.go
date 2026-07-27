@@ -168,6 +168,20 @@ type Zotio struct {
 	UnavailableRecheckDays int `toml:"unavailable_recheck_days"`
 }
 
+// Captures keeps browser diagnostics in papio's own data directory so fixture
+// investigation does not scatter unexplained files through Downloads. Config
+// decoding is strict, so a config with this new table must deploy with a binary
+// that understands it; an older binary otherwise rejects every command.
+type Captures struct {
+	Enabled bool `toml:"enabled"`
+	// MaxPerHost keeps one broken provider page from crowding out every other
+	// diagnostic. Range 1..1000, default 10.
+	MaxPerHost int `toml:"max_per_host"`
+	// MaxAgeDays prevents diagnostic fixtures from silently consuming the
+	// volume long after they stop helping. Range 1..365, default 14.
+	MaxAgeDays int `toml:"max_age_days"`
+}
+
 // Notify configures best-effort notifications from the daemon: local desktop
 // notifications and an optional remote webhook. Both are fire-and-forget; a
 // delivery failure never fails the work that triggered it.
@@ -212,6 +226,7 @@ type Config struct {
 	Fetch      Fetch             `toml:"fetch"`
 	PDF        PDF               `toml:"pdf"`
 	Browser    Browser           `toml:"browser"`
+	Captures   Captures          `toml:"captures"`
 	Zotio      Zotio             `toml:"zotio"`
 	Notify     Notify            `toml:"notify"`
 	Hooks      Hooks             `toml:"hooks"`
@@ -256,13 +271,14 @@ func defaultDataDir() string {
 // callers that acquire must see ErrAccessModeUnset until the user chooses.
 func Default() Config {
 	return Config{
-		DataDir: defaultDataDir(),
-		Fetch:   Fetch{MaxBytes: 100 << 20, TimeoutSeconds: 120},
-		PDF:     PDF{OCREnabled: true, MinTextChars: 400, MaxOCRPages: 4, TitleMatchThreshold: 0.6},
-		Browser: Browser{ActionExpirySeconds: 1800},
-		Zotio:   Zotio{Executable: "zotio", TimeoutSeconds: 120, AttachmentMode: "stored", AutoImport: false, AutoEnrich: true, UnavailableRecheckDays: 14},
-		Notify:  Notify{Enabled: true},
-		Hooks:   Hooks{TimeoutSeconds: 120},
+		DataDir:  defaultDataDir(),
+		Fetch:    Fetch{MaxBytes: 100 << 20, TimeoutSeconds: 120},
+		PDF:      PDF{OCREnabled: true, MinTextChars: 400, MaxOCRPages: 4, TitleMatchThreshold: 0.6},
+		Browser:  Browser{ActionExpirySeconds: 1800},
+		Captures: Captures{Enabled: true, MaxPerHost: 10, MaxAgeDays: 14},
+		Zotio:    Zotio{Executable: "zotio", TimeoutSeconds: 120, AttachmentMode: "stored", AutoImport: false, AutoEnrich: true, UnavailableRecheckDays: 14},
+		Notify:   Notify{Enabled: true},
+		Hooks:    Hooks{TimeoutSeconds: 120},
 		Sources: map[string]Source{
 			SourceArXiv:            {Enabled: true, RatePerSec: 1, Burst: 1},
 			SourceEuropePMC:        {Enabled: true, RatePerSec: 2, Burst: 2},
@@ -387,6 +403,12 @@ func (c *Config) validate() error {
 	}
 	if c.Browser.ActionExpirySeconds < 0 {
 		return fmt.Errorf("browser.action_expiry_seconds must be >= 0")
+	}
+	if c.Captures.MaxPerHost < 1 || c.Captures.MaxPerHost > 1000 {
+		return fmt.Errorf("captures.max_per_host must be in 1..1000")
+	}
+	if c.Captures.MaxAgeDays < 1 || c.Captures.MaxAgeDays > 365 {
+		return fmt.Errorf("captures.max_age_days must be in 1..365")
 	}
 	if strings.TrimSpace(c.Zotio.Executable) == "" && c.Zotio.AutoImport {
 		return fmt.Errorf("zotio.auto_import requires zotio.executable")

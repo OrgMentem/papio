@@ -15,6 +15,7 @@ import (
 	"papio/internal/browser"
 	"papio/internal/budget"
 	"papio/internal/bundle"
+	"papio/internal/captures"
 	"papio/internal/config"
 	"papio/internal/daemon"
 	"papio/internal/discovery"
@@ -52,6 +53,7 @@ type System struct {
 	Store         *store.Store
 	Jobs          *job.Store
 	Artifacts     *artifact.Store
+	Captures      *captures.Store
 	Budgets       *budget.Manager
 	App           *app.Service
 	Scheduler     *daemon.Scheduler
@@ -145,6 +147,10 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 	if err != nil {
 		return nil, err
 	}
+	captureStore := captures.New(cfg.DataDir, captures.Retention{
+		MaxPerHost: cfg.Captures.MaxPerHost,
+		MaxAge:     time.Duration(cfg.Captures.MaxAgeDays) * 24 * time.Hour,
+	})
 	budgets := budget.New(db)
 
 	artifactPolicy := fetch.DefaultPolicy()
@@ -280,10 +286,10 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 	previewServer := preview.New()
 
 	system := &System{
-		Config: cfg, Store: db, Jobs: jobs, Artifacts: artifacts, Budgets: budgets,
+		Config: cfg, Store: db, Jobs: jobs, Artifacts: artifacts, Captures: captureStore, Budgets: budgets,
 		App: service, Scheduler: scheduler, Watches: watches, WatchRunner: watchRunner,
 		Bundle:        bundleExporter,
-		Browser:       browser.NewBridge(jobs, service, triageService, watchRunner, previewServer, cfg, version, nil),
+		Browser:       browser.NewBridge(jobs, service, triageService, watchRunner, previewServer, captureStore, cfg, version, nil),
 		Preview:       previewServer,
 		Discovery:     discoveryClient,
 		Zotio:         zotioService,

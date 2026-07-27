@@ -35,10 +35,17 @@ only to you — see [What is stored, and where](#what-is-stored-and-where).
 - **In your browser:** the extension keeps its own settings and short-lived job
   and tab state (via the `storage` API) so it can survive service-worker
   suspension and reconnect to the local app. This never leaves your browser.
-- **On your computer:** the *papio* application stores the papers it acquires, along
-  with their metadata and job records, in its local data directory. These files
-  stay on your machine (and go only to your own Zotero library if you enable that
-  integration).
+- **On your computer:** the *papio* application stores papers, metadata, and job
++ records in its local data directory. Validated PDFs live in `artifacts/` and
++ downloaded candidates awaiting validation live in `quarantine/`. Diagnostic page
+ captures live in `<data_dir>/captures/<host>/` as sanitized HTML from the authenticated
+ page in your browser session; they can still contain information visible on that page, so
+ treat them as private local data. Captures are retained for 14 days and up to 10 per host
+ by default (configurable in `[captures]`). Run `papio adapter captures purge`
++ to remove every capture, or `papio adapter captures purge --host <host>` for one host.
++ The extension no longer writes `~/Downloads/papio-fixtures/`; an existing directory
++ there is safe to delete. These files stay on your machine (and papers go only to your
++ own Zotero library if you enable that integration).
 - **Acquisition-history and impact figures:** the numbers the extension shows you —
   papers acquired, an estimated time saved, success rate, weekly acquisition trend,
   access-route breakdown, and human-handoff rate — are aggregates computed locally

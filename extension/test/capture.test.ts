@@ -1,22 +1,22 @@
 // Copyright 2026 OrgMentem. Licensed under MIT. See LICENSE.
-// Fixture-capture tests: sanitizeFixture must strip scripts/queries/fragments/
-// form values and mask token-shaped secrets deterministically, and captureFixture
-// must wire scripting -> sanitize -> downloads while failing closed on a dirty
-// result. No real chrome, no DOM — pure string checks and an injected fake API.
+// Fixture capture tests: sanitizeFixture must strip scripts/queries/fragments/
+// form values and mask token-shaped secrets deterministically. Capture transport
+// must emit one compressed native payload and fail closed before any bridge send.
 
 import { expect, test } from "bun:test";
+import { gunzipSync } from "node:zlib";
+
 
 import {
   captureFixture,
-  downloadFixture,
-  MAX_CAPTURE_BYTES,
+  MAX_CAPTURE_FRAME_BYTES,
   sanitizeFixture,
   residualLeak,
-  takePendingFixtureFilename,
   type ChromeCaptureApi,
   type FixtureMeta,
   type PageCapture,
 } from "../src/capture";
+import type { PageCapturePayload } from "../src/protocol";
 
 const TOKEN = "ABCDEFGHIJKLMNOPQRSTUVWXYZ012345"; // 32 URL-safe chars → token-shaped
 
@@ -279,116 +279,121 @@ const CLEAN_PAGE: PageCapture = {
 };
 
 function fakeChrome(page: PageCapture | undefined, tabId: number | null = 7) {
-  const downloads: Array<{ url: string; filename: string; conflictAction: string; saveAs: boolean }> = [];
+  const sent: PageCapturePayload[] = [];
   const api: ChromeCaptureApi = {
     tabs: { query: async () => [{ id: tabId ?? undefined }] },
     scripting: { executeScript: async () => [{ result: page }] },
-    downloads: {
-      download: async (options) => {
-        downloads.push(options);
-        return 42;
-      },
+    sendPageCapture: async (payload) => {
+      sent.push(payload);
+      return true;
     },
   };
-  return { api, downloads };
+  return { api, sent };
+}
+
+function gunzipBase64(body: string): string {
+  const compressed = Uint8Array.from(atob(body), (character) => character.charCodeAt(0));
+  return new TextDecoder().decode(gunzipSync(compressed));
+}
+
+function incompressibleText(groups: number): string {
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+  const chunks: string[] = [];
+  let state = 0x12345678;
+  for (let group = 0; group < groups; group += 1) {
+    let chunk = "";
+    for (let index = 0; index < 16; index += 1) {
+      state ^= state << 13;
+      state ^= state >>> 17;
+      state ^= state << 5;
+      chunk += alphabet[(state >>> 0) % alphabet.length]!;
+    }
+    chunks.push(chunk);
+  }
+  return chunks.join(" ");
 }
 
 const FIXED_NOW = (): Date => new Date("2026-07-14T00:00:00.000Z");
 
-test("capture downloads sanitized HTML at the versioned fixture path", async () => {
-  const { api, downloads } = fakeChrome(CLEAN_PAGE);
+test("capture emits one sanitized gzip page_capture payload without using downloads", async () => {
+  const { api, sent } = fakeChrome(CLEAN_PAGE);
   const result = await captureFixture(api, "proquest", "success", FIXED_NOW);
-
-  expect(result).toEqual({ ok: true, downloadId: 42, filename: "papio-fixtures/proquest/success.html" });
-  expect(downloads).toHaveLength(1);
-  const dl = downloads[0]!;
-  expect(dl.conflictAction).toBe("uniquify");
-  expect(dl.saveAs).toBe(false);
-
-  const comma = dl.url.indexOf(",");
-  const decoded = decodeURIComponent(dl.url.slice(comma + 1));
   const expected = sanitizeFixture(CLEAN_PAGE.html, {
     provider: "proquest",
     scenario: "success",
     originNoQuery: "https://www.proquest.com/docview/1",
     capturedISO: "2026-07-14T00:00:00.000Z",
   });
-  expect(decoded).toBe(expected);
-  expect(decoded).not.toContain("?tk="); // the download link's query is gone
-  expect(decoded.startsWith("<!-- papio-fixture ")).toBe(true);
+
+  expect(result).toEqual({ ok: true, bytes: new TextEncoder().encode(expected).byteLength });
+  expect(sent).toHaveLength(1);
+  const payload = sent[0];
+  expect(payload).toMatchObject({
+    host: "www.proquest.com",
+    scenario: "success",
+    adapter_id: "proquest",
+    encoding: "gzip+base64",
+    bytes: new TextEncoder().encode(expected).byteLength,
+  });
+  expect(gunzipBase64(payload?.body ?? "")).toBe(expected);
+  expect(gunzipBase64(payload?.body ?? "")).not.toContain("?tk=");
+  expect("downloads" in api).toBe(false);
 });
 
-test("fixture writes enqueue their path for onDeterminingFilename (data: URLs ignore filename)", async () => {
-  // Chrome ignores downloads.download's filename for data: URLs, so the intended
-  // path must be recoverable by the onDeterminingFilename listener.
-  // Drain any residue enqueued by other tests (module-level FIFO queue).
-  while (takePendingFixtureFilename("data:text/html") !== undefined) {
-    /* drain */
-  }
-  const { api } = fakeChrome(CLEAN_PAGE);
-  await downloadFixture(api, "papio-fixtures/observed/www.jstor.org/2026.html", "<p>x</p>");
-  const dataUrl = "data:text/html;charset=utf-8,%3Cp%3Ex%3C%2Fp%3E";
-
-  // A non-fixture (real) download is never relocated by the fixture queue.
-  expect(takePendingFixtureFilename("https://www.jstor.org/stable/pdf/1.pdf")).toBeUndefined();
-  // The fixture download's intended path is dequeued once, then drained.
-  expect(takePendingFixtureFilename(dataUrl)).toBe("papio-fixtures/observed/www.jstor.org/2026.html");
-  expect(takePendingFixtureFilename(dataUrl)).toBeUndefined();
-});
-
-test("a rejected fixture download does not leave a filename for the next download", async () => {
-  while (takePendingFixtureFilename("data:text/html") !== undefined) {
-    /* drain */
-  }
-  const rejected: Pick<ChromeCaptureApi, "downloads"> = {
-    downloads: {
-      download: async () => {
-        throw new Error("download rejected");
-      },
-    },
-  };
-  await expect(downloadFixture(rejected, "papio-fixtures/stale.html", "<p>stale</p>")).rejects.toThrow(
-    "download rejected",
-  );
-
-  const { api } = fakeChrome(CLEAN_PAGE);
-  await downloadFixture(api, "papio-fixtures/current.html", "<p>current</p>");
-  expect(takePendingFixtureFilename("data:text/html;charset=utf-8,%3Cp%3Ecurrent%3C%2Fp%3E")).toBe(
-    "papio-fixtures/current.html",
-  );
-});
-
-test("capture masks a token-shaped provider path before writing", async () => {
+test("capture masks a token-shaped provider path before emitting", async () => {
   const dynamicPath: PageCapture = {
     html: `<div class="record-details">x</div>`,
     origin: "https://www.jstor.org",
     path: `/stable/${TOKEN}`,
   };
-  const { api, downloads } = fakeChrome(dynamicPath);
+  const { api, sent } = fakeChrome(dynamicPath);
   const result = await captureFixture(api, "jstor", "drift", FIXED_NOW);
 
   expect(result.ok).toBe(true);
-  expect(downloads).toHaveLength(1);
-  const encoded = downloads[0]?.url.split(",", 2)[1];
-  expect(encoded).toBeDefined();
-  const decoded = decodeURIComponent(encoded ?? "");
-  expect(decoded).not.toContain(TOKEN);
-  expect(decoded).toContain(`origin="https://www.jstor.org/stable/TOKEN"`);
-  expect(residualLeak(decoded)).toBeNull();
+  expect(sent).toHaveLength(1);
+  const sanitized = gunzipBase64(sent[0]?.body ?? "");
+  expect(sanitized).not.toContain(TOKEN);
+  expect(sanitized).toContain(`origin="https://www.jstor.org/stable/TOKEN"`);
+  expect(residualLeak(sanitized)).toBeNull();
 });
 
-test("capture fails closed on a missing active tab", async () => {
-  const { api, downloads } = fakeChrome(CLEAN_PAGE, null);
-  const result = await captureFixture(api, "ebsco", "terms", FIXED_NOW);
+test("capture fails closed on a missing active tab without sending", async () => {
+  const { api, sent } = fakeChrome(CLEAN_PAGE, null);
+  const result = await captureFixture(api, "ebsco", "no-entitlement", FIXED_NOW);
   expect(result.ok).toBe(false);
-  expect(downloads).toHaveLength(0);
+  expect(sent).toHaveLength(0);
 });
 
-test("capture rejects an over-cap payload before serializing", async () => {
-  const huge: PageCapture = { html: "x".repeat(MAX_CAPTURE_BYTES + 1), origin: "https://x", path: "/" };
-  const { api, downloads } = fakeChrome(huge);
+test("capture fails closed when gzip compression is unavailable", async () => {
+  const descriptor = Object.getOwnPropertyDescriptor(globalThis, "CompressionStream");
+  const warn = console.warn;
+  console.warn = () => undefined;
+  Object.defineProperty(globalThis, "CompressionStream", { configurable: true, value: undefined });
+  try {
+    const { api, sent } = fakeChrome(CLEAN_PAGE);
+    const result = await captureFixture(api, "proquest", "success", FIXED_NOW);
+    expect(result).toEqual({ ok: false, error: "gzip compression is unavailable" });
+    expect(sent).toHaveLength(0);
+  } finally {
+    console.warn = warn;
+    if (descriptor !== undefined) {
+      Object.defineProperty(globalThis, "CompressionStream", descriptor);
+    } else {
+      Reflect.deleteProperty(globalThis, "CompressionStream");
+    }
+  }
+});
+
+test("capture rejects an encoded-frame oversize document without sending", async () => {
+  const huge: PageCapture = {
+    html: `<html><body>${incompressibleText(32_768)}</body></html>`,
+    origin: "https://www.springer.com",
+    path: "/article/1",
+  };
+  const { api, sent } = fakeChrome(huge);
   const result = await captureFixture(api, "springer", "no-entitlement", FIXED_NOW);
+
   expect(result.ok).toBe(false);
-  if (!result.ok) expect(result.error).toContain("cap");
-  expect(downloads).toHaveLength(0);
+  if (!result.ok) expect(result.error).toContain(`${MAX_CAPTURE_FRAME_BYTES}-byte native frame cap`);
+  expect(sent).toHaveLength(0);
 });

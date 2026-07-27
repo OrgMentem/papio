@@ -12,6 +12,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"papio/internal/api"
+	"papio/internal/captures"
 	"papio/internal/redact"
 )
 
@@ -94,7 +95,43 @@ func newAdapterCommand(opt *options) *cobra.Command {
 			return printDiagnoseReport(opt.out, report)
 		},
 	}
-	command.AddCommand(diagnose)
+	captureCommand := &cobra.Command{
+		Use:         "captures",
+		Short:       "List stored diagnostic page captures",
+		Annotations: map[string]string{"mcp:read-only": "true"},
+		Args:        cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			rows := make([]captures.Capture, 0)
+			if err := opt.call(cmd.Context(), "adapter.captures.list", struct{}{}, &rows); err != nil {
+				return err
+			}
+			if opt.jsonOutput {
+				return printPage(opt, "captures", rows, false)
+			}
+			for _, row := range rows {
+				if _, err := fmt.Fprintf(opt.out, "%s\t%s\t%s\t%s\t%s\t%d\t%s\n", row.Timestamp.Format(time.RFC3339), row.Host, row.Scenario, row.AdapterID, row.AdapterVersion, row.Size, row.Path); err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+	}
+	var host string
+	purge := &cobra.Command{
+		Use:   "purge",
+		Short: "Remove stored diagnostic page captures",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			var result api.CapturePurgeResult
+			if err := opt.call(cmd.Context(), "adapter.captures.purge", map[string]string{"host": host}, &result); err != nil {
+				return err
+			}
+			return opt.printResult(result, "Purged %d captures", result.Removed)
+		},
+	}
+	purge.Flags().StringVar(&host, "host", "", "purge captures for one host")
+	captureCommand.AddCommand(purge)
+	command.AddCommand(diagnose, captureCommand)
 	return command
 }
 

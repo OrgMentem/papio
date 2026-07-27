@@ -18,6 +18,16 @@ for the full pre-split extension history.
 
 ### Added
 
+- **Captures travel over the native-messaging bridge instead of your Downloads
+  folder.** Sanitized page HTML is gzipped and sent to the daemon, which stores
+  it in its own data directory. This works identically on Chrome and Firefox —
+  the old path depended on `downloads.onDeterminingFilename`, which is
+  Chrome-only and did not reliably fire even there, so a capture could land as
+  `download (1).html` or vanish silently. Gated on the daemon advertising
+  `page_capture_v1`. The capture panel is now a build-time developer
+  affordance, stripped from shipped Chrome and Firefox bundles rather than
+  hidden by a Chrome-only heuristic that left it visible on AMO.
+
 - **Institutional sign-ins now stay visible until you act.** A handoff waiting
   at an identity provider gives the toolbar an amber count, draws attention to
   its restored work window, names its paper while a tab group is expanded, and

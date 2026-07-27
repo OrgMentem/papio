@@ -10,12 +10,14 @@
 export const BROWSER_PROTOCOL_VERSION = "papio-browser/1";
 export const MAX_BROWSER_MESSAGE_BYTES = 256 * 1024;
 export const MAX_BROWSER_INTEGER = Number.MAX_SAFE_INTEGER;
+export const MsgPageCapture = "page_capture" as const;
 
 export type BrowserMessageType =
   | "hello"
   | "hello_ack"
   | "page_acquire"
   | "page_acquire_ack"
+  | "page_capture"
   | "job_offer"
   | "handoff_outcome"
   | "job_accept"
@@ -67,6 +69,16 @@ export interface PageAcquireAckPayload {
   job_id?: string;
   duplicate?: boolean;
   error?: string;
+}
+
+export interface PageCapturePayload {
+  host: string;
+  scenario: "observed" | "success" | "login-return" | "no-entitlement" | "drift";
+  adapter_id?: string;
+  adapter_version?: string;
+  encoding: "gzip+base64";
+  bytes: number;
+  body: string;
 }
 
 export interface JobOfferExpected {
@@ -294,6 +306,7 @@ const MSG_TYPES: Record<string, true> = {
   hello_ack: true,
   page_acquire: true,
   page_acquire_ack: true,
+  page_capture: true,
   job_offer: true,
   handoff_outcome: true,
   job_accept: true,
@@ -353,6 +366,7 @@ const ERROR_CODE_RE = /^[a-z0-9_]{2,50}$/;
 const FILENAME_RE = /^[^/\\]{1,255}$/u;
 const RFC3339_RE =
   /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(Z|([+-])(\d{2}):(\d{2}))$/;
+const BASE64_RE = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
 
 function fail(msg: string): never {
   throw new ProtocolError(msg);
@@ -676,6 +690,28 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
       if (duplicate === true && jobID === "") {
         fail("page_acquire_ack.duplicate requires job_id");
       }
+      break;
+    }
+    case "page_capture": {
+      requireKeys(p, "page_capture", ["host", "scenario", "encoding", "bytes", "body"], ["adapter_id", "adapter_version"]);
+      const host = str(p, "host", "page_capture", 253);
+      if (!HOST_RE.test(host)) fail("page_capture.host must be a hostname");
+      const scenario = str(p, "scenario", "page_capture", 50);
+      if (!["observed", "success", "login-return", "no-entitlement", "drift"].includes(scenario)) {
+        fail("page_capture.scenario is invalid");
+      }
+      if ("adapter_id" in p && !/^[A-Za-z0-9_-]{1,64}$/.test(str(p, "adapter_id", "page_capture", 64))) {
+        fail("page_capture.adapter_id must use the id charset");
+      }
+      if ("adapter_version" in p) str(p, "adapter_version", "page_capture", 50);
+      if (str(p, "encoding", "page_capture", 20) !== "gzip+base64") {
+        fail("page_capture.encoding must be gzip+base64");
+      }
+      if (int(p, "bytes", "page_capture", 1) > 2 * 1024 * 1024) {
+        fail("page_capture.bytes exceeds 2097152");
+      }
+      const body = str(p, "body", "page_capture", MAX_BROWSER_MESSAGE_BYTES);
+      if (!BASE64_RE.test(body)) fail("page_capture.body must be canonical base64");
       break;
     }
     case "job_offer": {

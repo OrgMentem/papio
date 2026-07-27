@@ -3,7 +3,10 @@
 package browser
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -17,6 +20,7 @@ import (
 
 	"papio/internal/app"
 	"papio/internal/artifact"
+	"papio/internal/captures"
 	"papio/internal/config"
 	"papio/internal/job"
 	"papio/internal/pdf"
@@ -61,6 +65,7 @@ func newBridge(t *testing.T) (*Bridge, *job.Store, config.Config, string) {
 			t.Errorf("close preview: %v", err)
 		}
 	})
+	captureStore := captures.New(data, captures.Retention{MaxPerHost: cfg.Captures.MaxPerHost, MaxAge: time.Duration(cfg.Captures.MaxAgeDays) * 24 * time.Hour})
 	svc := app.New(cfg, jobs, artifacts, nil)
 	svc.Validate = func(context.Context, string, string, work.Work) (pdf.ValidationReport, error) {
 		return pdf.ValidationReport{
@@ -70,7 +75,7 @@ func newBridge(t *testing.T) (*Bridge, *job.Store, config.Config, string) {
 			Identity:   pdf.IdentityDecision{Result: pdf.IdentityPass, Evidence: []string{"doi match"}},
 		}, nil
 	}
-	return NewBridge(jobs, svc, triageService, &watch.Runner{Store: watches}, previewServer, cfg, "0.1.0-test", []string{"browser_handoff"}), jobs, cfg, data
+	return NewBridge(jobs, svc, triageService, &watch.Runner{Store: watches}, previewServer, captureStore, cfg, "0.1.0-test", []string{"browser_handoff"}), jobs, cfg, data
 }
 
 func handoffWork() work.Work {
@@ -183,6 +188,14 @@ func hello() json.RawMessage {
 	return json.RawMessage(`{"protocol":"papio-browser/1","type":"hello","msg_id":"client-hello-1","seq":0,"payload":{"extension_version":"1.2.3"}}`)
 }
 
+func helloWithAdapterVersions(t *testing.T, extensionVersion string, adapterVersions map[string]string) json.RawMessage {
+	t.Helper()
+	return inFrame(t, protocol.MsgHello, "", map[string]any{
+		"extension_version": extensionVersion,
+		"adapter_versions":  adapterVersions,
+	})
+}
+
 func firstOfType(msgs []*protocol.BrowserMessage, typ string) *protocol.BrowserMessage {
 	for _, m := range msgs {
 		if m.Type == typ {
@@ -200,6 +213,121 @@ func countType(msgs []*protocol.BrowserMessage, typ string) int {
 		}
 	}
 	return n
+}
+
+func pageCapturePayload(t *testing.T, html []byte) protocol.PageCapturePayload {
+	t.Helper()
+	var compressed bytes.Buffer
+	writer := gzip.NewWriter(&compressed)
+	if _, err := writer.Write(html); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return protocol.PageCapturePayload{
+		Host:           "sagepub.com",
+		Scenario:       "observed",
+		AdapterID:      "sage",
+		AdapterVersion: "2026.07.27",
+		Encoding:       "gzip+base64",
+		Bytes:          int64(len(html)),
+		Body:           base64.StdEncoding.EncodeToString(compressed.Bytes()),
+	}
+}
+
+func TestPageCaptureDisabledDoesNotStore(t *testing.T) {
+	b, _, cfg, data := newBridge(t)
+	cfg.Captures.Enabled = false
+	b = NewBridge(b.jobs, b.svc, b.triage, b.watchRunner, b.preview, b.captureStore, cfg, b.Version, b.Features)
+	runSync(t, b, hello())
+	runSync(t, b, inFrame(t, protocol.MsgPageCapture, "", pageCapturePayload(t, []byte("<html>disabled</html>"))))
+
+	listed, err := b.captureStore.List(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listed) != 0 {
+		t.Fatalf("stored captures = %#v, want none when disabled", listed)
+	}
+	if _, err := os.Stat(filepath.Join(data, "captures")); !os.IsNotExist(err) {
+		t.Fatalf("disabled capture intake created a captures directory: %v", err)
+	}
+}
+
+func TestPageCaptureContentFailureKeepsSession(t *testing.T) {
+	cases := []struct {
+		name    string
+		payload protocol.PageCapturePayload
+	}{
+		{
+			name: "corrupt gzip",
+			payload: protocol.PageCapturePayload{
+				Host: "sagepub.com", Scenario: "observed", Encoding: "gzip+base64", Bytes: 7,
+				Body: base64.StdEncoding.EncodeToString([]byte("not-gzip")),
+			},
+		},
+		{
+			name: "length mismatch",
+			payload: func() protocol.PageCapturePayload {
+				payload := pageCapturePayload(t, []byte("<html>mismatch</html>"))
+				payload.Bytes++
+				return payload
+			}(),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b, _, _, _ := newBridge(t)
+			runSync(t, b, hello())
+			runSync(t, b, inFrame(t, protocol.MsgPageCapture, "", tc.payload))
+
+			runSync(t, b, inFrame(t, protocol.MsgPageCapture, "", pageCapturePayload(t, []byte("<html>survived</html>"))))
+			listed, err := b.captureStore.List(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(listed) != 1 || listed[0].Size != int64(len("<html>survived</html>")) {
+				t.Fatalf("captures after rejected content = %#v, want only follow-up capture", listed)
+			}
+		})
+	}
+}
+
+func TestJobScopedPageCaptureRecordsEvent(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	jobID := park(t, jobs, "wr_page_capture_event", handoffWork())
+	payload := pageCapturePayload(t, []byte("<html>fixture</html>"))
+	runSync(t, b, hello())
+	runSync(t, b, inFrame(t, protocol.MsgPageCapture, jobID, payload))
+
+	listed, err := b.captureStore.List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listed) != 1 {
+		t.Fatalf("stored captures = %#v, want one", listed)
+	}
+	events, err := jobs.Events(ctx, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var receipt map[string]any
+	for _, event := range events {
+		if event["kind"] == "browser.page_capture" {
+			receipt, _ = event["detail"].(map[string]any)
+			break
+		}
+	}
+	if receipt == nil {
+		t.Fatalf("job events = %#v, want page capture receipt", events)
+	}
+	if receipt["host"] != payload.Host || receipt["scenario"] != payload.Scenario ||
+		receipt["adapter_id"] != payload.AdapterID || receipt["adapter_version"] != payload.AdapterVersion ||
+		receipt["path"] != listed[0].Path || receipt["size_bytes"] != float64(len("<html>fixture</html>")) {
+		t.Fatalf("page capture receipt = %#v", receipt)
+	}
 }
 
 func TestHelloIsAcknowledged(t *testing.T) {
@@ -225,7 +353,7 @@ func TestHelloAckAnnouncesDaemonVersion(t *testing.T) {
 		t.Fatalf("daemon_version = %q, want 0.1.0-test", payload.DaemonVersion)
 	}
 	if !slices.Equal(payload.Features, []string{
-		"browser_handoff", pageAcquireFeature, triageSnapshotFeature, triageSnapshotSchema2Feature, triageMutationsFeature, reviewPreviewFeature, statsFeature,
+		"browser_handoff", pageAcquireFeature, triageSnapshotFeature, triageSnapshotSchema2Feature, triageMutationsFeature, reviewPreviewFeature, statsFeature, pageCaptureFeature,
 	}) {
 		t.Fatalf("features = %v, want required bridge feature set", payload.Features)
 	}
@@ -237,7 +365,7 @@ func TestHelloAckFeatureCapReservesMandatoryFeatures(t *testing.T) {
 	for i := range features {
 		features[i] = strings.Repeat("x", i+1)
 	}
-	b = NewBridge(b.jobs, b.svc, b.triage, b.watchRunner, b.preview, b.cfg, b.Version, features)
+	b = NewBridge(b.jobs, b.svc, b.triage, b.watchRunner, b.preview, b.captureStore, b.cfg, b.Version, features)
 
 	msgs, _ := runSync(t, b, hello())
 	ack := firstOfType(msgs, protocol.MsgHelloAck)
@@ -245,8 +373,8 @@ func TestHelloAckFeatureCapReservesMandatoryFeatures(t *testing.T) {
 		t.Fatalf("no hello_ack in %v", msgs)
 	}
 	got := ack.Payload.(*protocol.HelloAckPayload).Features
-	want := append(append([]string(nil), features[:26]...),
-		pageAcquireFeature, triageSnapshotFeature, triageSnapshotSchema2Feature, triageMutationsFeature, reviewPreviewFeature, statsFeature)
+	want := append(append([]string(nil), features[:25]...),
+		pageAcquireFeature, triageSnapshotFeature, triageSnapshotSchema2Feature, triageMutationsFeature, reviewPreviewFeature, statsFeature, pageCaptureFeature)
 	if !slices.Equal(got, want) {
 		t.Fatalf("features = %v, want %v", got, want)
 	}
@@ -951,7 +1079,7 @@ func TestDaemonRestartReturnsHelloRequired(t *testing.T) {
 	runSync(t, active, hello())
 
 	// A new daemon has the same durable jobs but no in-memory hello-session.
-	restarted := NewBridge(jobs, active.svc, active.triage, active.watchRunner, active.preview, cfg, active.Version, active.Features)
+	restarted := NewBridge(jobs, active.svc, active.triage, active.watchRunner, active.preview, active.captureStore, cfg, active.Version, active.Features)
 	msgs, _ := runSync(t, restarted)
 	if len(msgs) != 1 {
 		t.Fatalf("restart poll frames = %d, want 1", len(msgs))
@@ -1897,6 +2025,7 @@ func TestProviderOutcomeRecordsAdapterDiagnostics(t *testing.T) {
 				}
 				if detail["outcome"] != outcome ||
 					detail["adapter_version"] != "sage-2026.07.27" ||
+					detail["extension_version"] != "1.2.3" ||
 					detail["detail"] != "download control was absent after provider landing" {
 					t.Fatalf("provider diagnostics = %#v", detail)
 				}
@@ -1906,6 +2035,157 @@ func TestProviderOutcomeRecordsAdapterDiagnostics(t *testing.T) {
 			}
 		})
 	}
+}
+
+func manualProviderUpgradePark(t *testing.T, jobs *job.Store, requestID, extensionVersion string) string {
+	t.Helper()
+	ctx := context.Background()
+	id := park(t, jobs, requestID, handoffWork())
+	open, err := jobs.ListOpenHumanActionsForJobs(ctx, []string{id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(open) != 1 || open[0].Kind != handoffActionKind {
+		t.Fatalf("initial handoff actions = %+v", open)
+	}
+	if err := jobs.ResolveHumanAction(ctx, open[0].ID, "resolved"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := jobs.OpenHumanAction(ctx, id, "manual_download", "download the requested PDF yourself"); err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.RecordEvent(ctx, id, "browser.provider_outcome", map[string]any{
+		"outcome":           "ui_changed",
+		"adapter_version":   "0.1.0",
+		"extension_version": extensionVersion,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+func assertManualProviderPark(t *testing.T, jobs *job.Store, id string) {
+	t.Helper()
+	ctx := context.Background()
+	row, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.State != job.StateAwaitingHuman {
+		t.Fatalf("state = %s, want awaiting_human", row.State)
+	}
+	open, err := jobs.ListOpenHumanActionsForJobs(ctx, []string{id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(open) != 1 || open[0].Kind != "manual_download" {
+		t.Fatalf("open actions = %+v, want one manual_download", open)
+	}
+}
+
+func TestProviderAdapterUpgradeRequeuesOnceForLiveRegistry(t *testing.T) {
+	ctx := context.Background()
+	b, jobs, _, _ := newBridge(t)
+	id := park(t, jobs, "wr_provider_adapter_upgrade", handoffWork())
+
+	runSync(t, b, helloWithAdapterVersions(t, "0.7.0", map[string]string{"sage": "0.1.0"}))
+	runSync(t, b, inFrame(t, protocol.MsgProviderOutcome, id, map[string]any{
+		"outcome": "ui_changed", "adapter_version": "0.1.0",
+	}))
+	assertManualProviderPark(t, jobs, id)
+
+	runSync(t, b, helloWithAdapterVersions(t, "0.8.0", map[string]string{"sage": "0.2.0"}))
+	row, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.State != job.StateResolving {
+		t.Fatalf("upgraded adapter did not return job to resolving: %s", row.State)
+	}
+	open, err := jobs.ListOpenHumanActionsForJobs(ctx, []string{id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(open) != 0 {
+		t.Fatalf("upgrade repair left manual action open: %+v", open)
+	}
+
+	events, err := jobs.Events(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repairs := 0
+	for _, event := range events {
+		if event["kind"] != "job.transition" {
+			continue
+		}
+		detail, _ := event["detail"].(map[string]any)
+		if detail["reason"] != "adapter_upgrade_repair" {
+			continue
+		}
+		repairs++
+		if detail["old_extension_version"] != "0.7.0" ||
+			detail["new_extension_version"] != "0.8.0" ||
+			detail["adapter_version"] != "0.1.0" {
+			t.Fatalf("upgrade repair detail = %#v", detail)
+		}
+	}
+	if repairs != 1 {
+		t.Fatalf("adapter-upgrade repairs = %d, want 1", repairs)
+	}
+
+	if err := jobs.Transition(ctx, id, job.StateResolving, job.StateAwaitingHuman,
+		map[string]any{"reason": "provider_repark"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := jobs.OpenHumanAction(ctx, id, "manual_download", "download the requested PDF yourself"); err != nil {
+		t.Fatal(err)
+	}
+	runSync(t, b, helloWithAdapterVersions(t, "0.8.0", map[string]string{"sage": "0.2.0"}))
+	assertManualProviderPark(t, jobs, id)
+}
+
+func TestProviderAdapterUpgradeDeclinesUnprovenVersions(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		previous string
+		current  string
+	}{
+		{name: "equal", previous: "0.7.0", current: "0.7.0"},
+		{name: "older", previous: "0.7.0", current: "0.6.0"},
+		{name: "missing previous", previous: "", current: "0.8.0"},
+		{name: "malformed previous", previous: "not-a-version", current: "0.8.0"},
+		{name: "missing current", previous: "0.7.0", current: ""},
+		{name: "malformed current", previous: "0.7.0", current: "not-a-version"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b, jobs, _, _ := newBridge(t)
+			id := manualProviderUpgradePark(t, jobs, "wr_adapter_upgrade_"+strings.ReplaceAll(tc.name, " ", "_"), tc.previous)
+
+			if err := b.svc.HandoffRepairer().RepairAdapterUpgrade(context.Background(), tc.current, extensionVersionNewer); err != nil {
+				t.Fatal(err)
+			}
+			assertManualProviderPark(t, jobs, id)
+		})
+	}
+}
+
+func TestProviderAdapterUpgradeRequiresLiveAdapterRegistry(t *testing.T) {
+	t.Run("no live session", func(t *testing.T) {
+		b, jobs, _, _ := newBridge(t)
+		id := manualProviderUpgradePark(t, jobs, "wr_adapter_upgrade_no_session", "0.7.0")
+
+		runSync(t, b)
+		assertManualProviderPark(t, jobs, id)
+	})
+
+	t.Run("empty adapter registry", func(t *testing.T) {
+		b, jobs, _, _ := newBridge(t)
+		id := manualProviderUpgradePark(t, jobs, "wr_adapter_upgrade_no_registry", "0.7.0")
+
+		runSync(t, b, helloWithAdapterVersions(t, "0.8.0", map[string]string{}))
+		assertManualProviderPark(t, jobs, id)
+	})
 }
 
 func TestOABrowserOfferWithoutIdentifierDoesNotEscalateAuth(t *testing.T) {
@@ -2344,7 +2624,7 @@ func TestOpenURLUsesSelectedResolverProfileForPrimoNDEAndVE(t *testing.T) {
 	cfg.Browser.Resolvers = map[string]config.Institution{
 		"institute": {OpenURLBase: "https://onesearch.library.example-institute.edu/discovery/openurl?vid=61INS_INST:INS"},
 	}
-	b = NewBridge(b.jobs, b.svc, b.triage, b.watchRunner, b.preview, cfg, b.Version, b.Features)
+	b = NewBridge(b.jobs, b.svc, b.triage, b.watchRunner, b.preview, b.captureStore, cfg, b.Version, b.Features)
 	for _, test := range []struct {
 		name, resolver, wantPath, wantVID string
 	}{
@@ -2388,7 +2668,7 @@ func TestOfferLoginRoutingIsPerResolverProfile(t *testing.T) {
 		// ...and one without an identity gets none (no default leakage).
 		"bare": {OpenURLBase: "https://library.example.edu/openurl"},
 	}
-	b = NewBridge(b.jobs, b.svc, b.triage, b.watchRunner, b.preview, cfg, b.Version, b.Features)
+	b = NewBridge(b.jobs, b.svc, b.triage, b.watchRunner, b.preview, b.captureStore, cfg, b.Version, b.Features)
 
 	for _, test := range []struct {
 		name, resolver, wantEntityID, wantAccountID string
