@@ -169,7 +169,7 @@ func newAcquireCommand(opt *options) *cobra.Command {
 			}
 			if !wait {
 				if submitted.Existing {
-					return opt.printResult(submitted, "Matched existing in-flight job %s; use --force to queue a fresh attempt", submitted.JobID)
+					return opt.printResult(submitted, "Matched existing in-flight job %s, which keeps the settings it was queued with; use --force to queue a fresh attempt", submitted.JobID)
 				}
 				return opt.printResult(submitted, "Queued %s", submitted.JobID)
 			}
