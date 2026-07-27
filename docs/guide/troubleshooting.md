@@ -156,10 +156,17 @@ to automate authentication.
 Institutional sign-ins are time-boxed. If login plus a two-factor step takes
 long enough, the identity provider may reject the original handoff link with a
 "stale request" or "expired" page even though your session is now valid. Sign
-in first, then re-run `papio actions open` — every open generates a fresh
-resolver link. The extension recognizes the common OpenAthens/Shibboleth
-failure pages, records a `browser.handoff_failed` event on the job (visible in
-`papio jobs get <id>`), and retries the handoff tab once on its own.
+in first, then re-run `papio actions open`. A compatible extension re-drives
+the tracked tab through its retained resolver URL when it is on an authentication
+page or has been marked sign-in pending; it only focuses a provider page that is
+already progressing a download.
+
+The extension recognizes the common OpenAthens/Shibboleth failure pages. When
+it does, it brings the work window to the front so the dead page is visible,
+records a `browser.handoff_failed` event on the job (visible in
+`papio jobs get <id>`), and retries the handoff tab on its own. Retries are
+capped by the handoff's authentication budget; past it the tab is left on the
+failure page for you and the job stays parked.
 
 ## Two browsers fight over *papio*
 
@@ -245,6 +252,13 @@ Use the report reason to choose the next step:
   accept them.
 - `needs_review`: inspect the quarantine path in the open `verify_identity`
   action, then explicitly accept or reject it with `papio actions resolve`.
+- `no_identifier`: no DOI, PMID, or arXiv id could be confirmed, so the job
+  settled `unavailable` rather than opening an institutional handoff. Books,
+  chapters, reports, and theses usually land here — no sign-in makes an
+  identifier-less request fetchable. Find a DOI and re-submit a manual request
+  with `papio acquire --doi <doi>`; for a Zotero item, apply
+  `zotio --yes items enrich --missing-doi` and then re-run
+  `papio acquire --from-zotio`.
 
 The exact report reason is preferable to a blind `papio jobs retry`; browser and
 identity states are intentionally parked for a human decision.

@@ -169,8 +169,9 @@ papio actions open
 
 The extension popup groups jobs into **needs you**, in-flight, and completed
 sections. Use its Focus control only when authentication or a provider-owned
-decision is required. `papio actions open` always targets Chrome, where the
-extension and your institutional session live.
+decision is required. `papio actions open` asks a compatible extension to use
+the browser where its tracked session lives; without one, it opens the resolver
+URLs normally.
 
 The inbox keeps itself current without a manual refresh: it updates as soon
 as you return to the tab, and checks in on its own every so often while the
@@ -193,11 +194,15 @@ terms-acceptance options — those stay your decisions. If your library's resolv
 is on a domain the extension isn't preapproved for, that step stays assisted.
 
 Opening a browser-handoff row from the inbox focuses that job's tracked
-resolver tab; it does not open the DOI in a separate, untracked tab. If Alma or
-Primo explicitly reports that no electronic full text or online link exists,
-the extension marks the route unavailable instead of sending you through the
-same institutional-login loop again. An empty or still-loading resolver page
-remains assisted rather than being treated as proof of no access.
+resolver tab; it does not open the DOI in a separate, untracked tab. Re-running
+`papio actions open` behaves the same unless that tracked tab is on an
+authentication page (or awaiting authentication), when the extension re-drives
+its retained resolver URL for a fresh sign-in attempt. It never navigates a
+provider page that is already progressing a download. If Alma or Primo
+explicitly reports that no electronic full text or online link exists, the
+extension marks the route unavailable instead of sending you through the same
+institutional-login loop again. An empty or still-loading resolver page remains
+assisted rather than being treated as proof of no access.
 
 Grant optional extension host permissions only for publisher sites you use.
 While handoff jobs are still open, the extension keeps one pinned, muted tab and
@@ -346,7 +351,7 @@ wrong-work, encrypted, or active-content rejection.
 The extension popup shows a compact **Your papio impact** summary — papers
 acquired, an estimated time saved, and your success rate — with a **View
 history** link that opens a full-tab history page. The time-saved figure is
-a rough estimate (about 20 minutes of manual chasing per acquired paper) that
+a rough estimate (about 5 minutes of manual chasing per acquired paper) that
 the extension itself computes; *papio* does not measure how long anything
 actually took you.
 
@@ -372,3 +377,15 @@ A batch report labels `awaiting_human` work with one of these reasons:
 on a quarantined file. `openurl_available` is an advisory action in
 conservative mode; it records that institutional access exists but was not
 opened automatically.
+
+Work with **no fetchable identifier never parks for a sign-in at all**. If no
+DOI, PMID, or arXiv id can be confirmed — the usual case for books, chapters,
+reports, and theses — the job settles `unavailable` with the reason
+`no_identifier` instead of opening an institutional handoff. A library login
+or retrying the same identifier-less request cannot make it fetchable, so
+*papio* says so rather than spending your sign-in on it. Find a DOI and
+re-submit a manual request with `papio acquire --doi <doi>`; for a Zotero item,
+apply `zotio --yes items enrich --missing-doi` and re-run
+`papio acquire --from-zotio`. An ISBN alone is carried into the institutional
+link so a monograph is described as a book, but it is not enough to fetch full
+text.

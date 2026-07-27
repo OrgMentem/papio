@@ -45,7 +45,7 @@ with `~/` are expanded when *papio* loads them.
 | `shibboleth_entity_id` | string URL | empty | Default institution's Shibboleth IdP entityID (`https://`). When set, a provider login wall is auto-routed to this IdP (skipping the WAYF selector). Empty disables federated login-routing for the default profile. |
 | `proquest_account_id` | string digits | empty | Default institution's ProQuest account id (digits, max 64). When set, *papio* appends `?accountid=<id>` to unlock the institution's ProQuest link-resolver without a manual sign-in. Empty disables the append. During `papio init` you may paste a ProQuest URL containing `accountid=` instead of the bare id. |
 | `download_adoption_root` | path string | empty | Root for browser-download adoption. When empty, the effective value is `<data_dir>/adoptions`; adoption is confined to a job subdirectory beneath this root. |
-| `action_expiry_seconds` | integer seconds | `1800` | Maximum open time for one browser handoff. It must not be negative. |
+| `action_expiry_seconds` | integer seconds | `1800` | Browser-handoff expiry and the initial age before an open human action is reminded. Later reminders double their per-action interval through 24 hours. It must not be negative. |
 
 
 `papio init` can derive `openurl_base_url` from a pasted library discovery URL

@@ -65,11 +65,17 @@ Institutional sign-ins are time-boxed: if login plus MFA takes long enough,
 the identity provider can reject the original handoff with a "stale" or
 "expired request" page. That page is a dead end, not a failure of your
 session — sign in first, then re-run `papio actions open`; every open mints a
-fresh resolver link. The extension recognizes the common OpenAthens and
-Shibboleth failure pages itself, records the outcome on the job's audit trail
-(`papio jobs get <id>` shows it), and retries the handoff tab through the
-resolver once on your behalf. Only the outcome and the identity provider's
-hostname are reported — never the page's contents.
+fresh resolver link.
+
+The extension recognizes the common OpenAthens and Shibboleth failure pages
+itself. When it does, it **restores and focuses the work window** so the dead
+page is in front of you rather than hidden, records the outcome on the job's
+audit trail (`papio jobs get <id>` shows it), and retries the handoff tab
+through the resolver on your behalf. Retries share the handoff's
+authentication budget: after a few, the tab is deliberately left on the
+failure page and the job stays parked for you, rather than looping the
+resolver silently. Only the outcome and the identity provider's hostname are
+reported — never the page's contents.
 
 ## Chrome and Firefox
 

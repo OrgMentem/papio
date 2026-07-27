@@ -10,6 +10,124 @@ execution records in `notes/acquisition-stack-plan.md`.
 
 ## [Unreleased]
 
+### Added
+
+- **Durable escalating reminders for stranded human actions.** The daemon now
+  re-notifies the configured desktop and webhook sinks after
+  `[browser] action_expiry_seconds` (30 minutes by default), then doubles each
+  action's delay through 24 hours instead of repeating every maintenance pass.
+  Notices distinguish an institutional sign-in, an openable no-login handoff,
+  and a review decision; each names only actions whose own schedule is due.
+  Their per-action schedule is stored as an `action.reminder` event, so daemon
+  restarts do not reset it.
+- **`papio actions open` now reuses a live extension handoff.** With a
+  compatible browser holder, the CLI asks the daemon to focus the job-scoped
+  handoff tab instead of launching a second, untracked OpenURL tab through the
+  operating system. When that tab is stranded on authentication, reopening it
+  re-drives its retained resolver URL; provider pages mid-download are only
+  focused. No session, legacy native host, or older extension retains the
+  OS-launcher fallback.
+
+### Fixed
+
+- **The recovery command `papio status` recommended did not exist.** Every
+  parked browser handoff, open-access browser fetch, and generic
+  `awaiting_human` job was told to run `papio actions --open`, which exits 1
+  with `unknown flag: --open`; the real command is the subcommand
+  `papio actions open`. So the surface a stuck user actually reads pointed
+  them at a dead end — precisely when a stale institutional sign-in had
+  already cost them the handoff. The institutional guidance now also states
+  that re-running it mints a fresh resolver link, which is the recovery for a
+  "stale request" / "expired" sign-in page. A new test parses every backticked
+  `papio …` command out of the `internal/errcat` catalog and resolves it
+  against the live command tree, so guidance can no longer quote a command or
+  flag that does not exist.
+- **A daemon started by the browser could not find Poppler, so every PDF was
+  staged for human review.** macOS gives a launchd child
+  `PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`, and capability detection
+  trusted `PATH` alone — so a daemon autostarted by the browser's
+  native-messaging host saw no `pdftotext`, failed semantic extraction on
+  everything, and marked every document's identity unverifiable. Whether papio
+  could read a PDF at all depended on *who happened to start the daemon*: from
+  a shell it worked, from the browser nothing did. Detection now falls back to
+  the usual package-manager prefixes (Homebrew on both architectures, MacPorts,
+  Linuxbrew, snap) when `PATH` comes up empty, preferring `PATH` when it
+  resolves. `papio doctor` also states the consequence — "every PDF will be
+  staged for human review" — and, when the tool is installed but unreachable,
+  says to restart the daemon from a shell rather than telling you to install
+  software you already have.
+- **PDF identity verification accepted the wrong document roughly one time in
+  ten.** Title, author, and year evidence was matched against the *entire*
+  extracted text, and a paper's bibliography is several hundred other papers'
+  titles and thousands of their authors — so any long document satisfied almost
+  any other document's author and year. Measured over 1560 deliberately
+  mismatched document/metadata pairs drawn from one real 40-paper library, 155
+  (9.9%) were accepted as the wrong work, unlocked by given names such as
+  "david" and "john", by an organisational "the", and by any recent year
+  appearing in a citation. Identity evidence now comes from the byline window
+  at the top of page one, the author test requires a family name rather than
+  any name token, and the year is recorded as corroboration instead of gating
+  acceptance. The same corpus now yields no wrong-document acceptances, while
+  correct acceptances rose from 39/40 to 40/40.
+- **A printed DOI, arXiv id, or PMID now corroborates identity wherever it
+  appears.** The front-matter scan reads only the top of page one so a
+  reference-list DOI is never mistaken for the document's own, which also meant
+  it missed an identifier printed in a running footer or below the abstract —
+  17 of 40 real papers. Once a document clears the title gate, its own printed
+  identifier is accepted as proof, which also fixes reprints: the CACM edition
+  of a NIPS paper is catalogued under 2017 and contains no "2017" anywhere in
+  its text, so it was staged for human review despite printing the exact
+  requested DOI on page one.
+- **Identifiers are read even when the publisher letter-spaces them.** ACM
+  typesets a DOI as `DOI:10.1145/ 30 6 5 3 8 6`, which no regex could match.
+  Identifier corroboration now compares whitespace-insensitively.
+- **Line-break hyphenation and ligatures no longer cost title matches.**
+  Justified text yields `classifi-\ncation` and some producers keep `ﬁ`/`ﬂ`
+  codepoints; neither tokenized as the word the title contains. Superscript
+  affiliation markers glued to byline surnames (`Arrietaa`, `Tabikg`) are
+  tolerated too — one real 12-author paper had all twelve marked that way.
+  Document text is also tokenized once per decision rather than re-walked for
+  every candidate token.
+- **Work with no fetchable identifier no longer asks for an institutional
+  sign-in.** `exhaustedCandidates` asked only whether a resolver base was
+  configured, so a book, chapter, report, or thesis with no DOI parked as an
+  institutional OpenURL handoff — telling the user to spend an SSO round trip
+  on something a library can only return as a catalogue record. On one real
+  112-item backlog that was 27% of the queue, and each one parked forever.
+  Ordinary exhausted jobs now settle `unavailable` with the reason
+  `no_identifier`, with no institutional handoff, and explain the remedy for
+  either origin: re-submit a manual request with its DOI, or
+  apply Zotero DOI enrichment and re-queue. A metadata-corrected Zotero item
+  bypasses the ordinary unavailable cool-down, so that remedy works
+  immediately. The gate is a *fetchable* identifier — DOI, PMID, or arXiv id
+  — so a chapter with a publisher DOI keeps its handoff, while an ISBN alone
+  does not. A title-matched anti-bot page remains available even without an
+  identifier. If that OA offer reaches an auth or terms wall, reports no
+  entitlement, or is rejected, it settles `no_identifier` rather than falling
+  back to an institutional sign-in it cannot complete. Existing parks are healed
+  automatically: handoff maintenance now returns an unfetchable park to
+  `resolving`, where the same gate reclassifies it.
+- **Zotero ISBNs reach the resolver, and monographs are described as books.**
+  `--from-zotio` dropped the ISBN, and every OpenURL put the work's title in
+  `rft.atitle` — asking the library for an *article* by that name. A work with
+  an ISBN and no DOI is now sent as `rft.isbn` plus `rft.btitle` under the book
+  metadata format. Multi-edition fields now split on edition separators before
+  whitespace, so space-formatted ISBNs do not shatter into invalid digit groups.
+- **A completed browser download can no longer be lost to handoff repair.**
+  Repair now atomically checks the adoption lease before closing stale actions
+  or returning a parked job to resolution, so a just-completed download remains
+  on the adoption path instead of becoming eligible for cleanup.
+- **Handoff maintenance now rotates through the whole parked queue.** A
+  bounded pass no longer revisits the same first 500 awaiting jobs forever, so
+  newer stranded handoffs and reminder-eligible actions are eventually reached.
+- **Reminder backoff survives a backward wall-clock correction.** A future
+  reminder timestamp is rebased while retaining its escalation count, rather
+  than suppressing a stranded handoff until wall time catches up.
+- **`papio actions open` can focus handoffs outside the ordinary poll page.**
+  An explicit focus request now force-offers its parked job before asking the
+  extension to surface it, rather than suppressing the CLI's OS-launcher
+  fallback for a job the extension was never told about.
+
 ## [0.12.0] - 2026-07-25
 
 ### Added
