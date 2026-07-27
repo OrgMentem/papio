@@ -82,7 +82,7 @@ var allowed = map[string]map[string]bool{
 		StateValidating: true, StateUnavailable: true, StateNeedsReview: true, StateRetryWait: true,
 	},
 	StateRetryWait:   {StateResolving: true, StateFetching: true, StateCancelled: true, StateFailed: true},
-	StateNeedsReview: {StateResolving: true, StateFetching: true, StateCancelled: true},
+	StateNeedsReview: {StateResolving: true, StateFetching: true, StateAwaitingHuman: true, StateCancelled: true},
 	// A successful zotio apply files the artifact in Zotero; imported is the
 	// only edge out of ready and is itself fully terminal.
 	StateReady: {StateImported: true},
@@ -602,6 +602,154 @@ func (js *Store) RepairAwaitingHuman(ctx context.Context, jobID string, actionID
 		if changed, _ := res.RowsAffected(); changed != int64(len(actionIDs)) {
 			return fmt.Errorf("%w: open actions changed for job %s", ErrConflict, jobID)
 		}
+	}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO events (job_id, at, kind, detail_json) VALUES (?, ?, 'job.transition', ?)`,
+		jobID, now, string(detailJSON)); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// RepairParkWithAction atomically moves an unleased human park only when its
+// open actions still match the maintenance snapshot, then opens the replacement
+// human action. The lease and action predicates share one transaction so a
+// browser adopter that wins after maintenance reads cannot lose its download.
+func (js *Store) RepairParkWithAction(ctx context.Context, jobID, from, to string, actionIDs []int64,
+	actionKind, actionDetail string, detail map[string]any, opts ...OpenHumanActionOption,
+) error {
+	if !allowed[from][to] {
+		return fmt.Errorf("%w: %s -> %s not allowed", ErrConflict, from, to)
+	}
+	var options openHumanActionOptions
+	for _, option := range opts {
+		if option == nil {
+			continue
+		}
+		if err := option(&options); err != nil {
+			return err
+		}
+	}
+	if options.binding != nil && actionKind != "verify_identity" {
+		return errors.New("human action binding is only valid for verify_identity")
+	}
+	expected := make(map[int64]struct{}, len(actionIDs))
+	for _, actionID := range actionIDs {
+		if _, duplicate := expected[actionID]; duplicate {
+			return fmt.Errorf("%w: duplicate human action %d", ErrConflict, actionID)
+		}
+		expected[actionID] = struct{}{}
+	}
+	if detail == nil {
+		detail = map[string]any{}
+	}
+	detail["from"], detail["to"] = from, to
+	detailJSON, err := json.Marshal(detail)
+	if err != nil {
+		return err
+	}
+	now := store.Now()
+	tx, err := js.S.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	res, err := tx.ExecContext(ctx, `
+		UPDATE jobs SET state = ?, updated_at = ?, retry_at = NULL,
+		        lease_owner = NULL, lease_expires_at = NULL
+		 WHERE id = ? AND state = ?
+		   AND (lease_owner IS NULL OR lease_expires_at < ?)`,
+		to, now, jobID, from, now)
+	if err != nil {
+		return err
+	}
+	if changed, _ := res.RowsAffected(); changed != 1 {
+		return fmt.Errorf("%w: job %s is not an unleased %s job", ErrConflict, jobID, from)
+	}
+
+	openRows, err := tx.QueryContext(ctx,
+		`SELECT id FROM human_actions WHERE job_id = ? AND status = 'open'`, jobID)
+	if err != nil {
+		return err
+	}
+	open := make(map[int64]struct{}, len(expected))
+	for openRows.Next() {
+		var actionID int64
+		if err := openRows.Scan(&actionID); err != nil {
+			_ = openRows.Close()
+			return err
+		}
+		if _, expectedAction := expected[actionID]; !expectedAction {
+			_ = openRows.Close()
+			return fmt.Errorf("%w: open actions changed for job %s", ErrConflict, jobID)
+		}
+		open[actionID] = struct{}{}
+	}
+	if err := openRows.Err(); err != nil {
+		_ = openRows.Close()
+		return err
+	}
+	if err := openRows.Close(); err != nil {
+		return err
+	}
+	if len(open) != len(expected) {
+		return fmt.Errorf("%w: open actions changed for job %s", ErrConflict, jobID)
+	}
+
+	if options.inheritResolvedHandoffAuth {
+		err = tx.QueryRowContext(ctx, `
+			SELECT requires_auth FROM human_actions
+			 WHERE job_id = ? AND kind = 'openurl_handoff' AND status = 'resolved'
+			 ORDER BY resolved_at DESC, id DESC
+			 LIMIT 1`, jobID).Scan(&options.requiresAuth)
+		switch {
+		case err == nil:
+		case errors.Is(err, sql.ErrNoRows):
+			// A missing handoff cannot prove the work is open access, so do not
+			// send a user toward a provider page with false no-login guidance.
+			options.requiresAuth = true
+		default:
+			return err
+		}
+	}
+
+	var actionID int64
+	err = tx.QueryRowContext(ctx,
+		`SELECT id FROM human_actions
+		 WHERE job_id = ? AND kind = ? AND status = 'open'
+		 ORDER BY id ASC LIMIT 1`, jobID, actionKind).Scan(&actionID)
+	switch {
+	case err == nil:
+		if options.binding == nil {
+			_, err = tx.ExecContext(ctx,
+				`UPDATE human_actions SET detail = ?, requires_auth = ?, blocked_by = ?, revision = revision + 1 WHERE id = ?`,
+				nullable(actionDetail), options.requiresAuth, options.blockedBy, actionID)
+		} else {
+			_, err = tx.ExecContext(ctx, `
+				UPDATE human_actions
+				SET detail = ?, requires_auth = ?, blocked_by = ?, candidate_id = ?, quarantine_path = ?, quarantine_sha256 = ?,
+					revision = revision + 1
+				WHERE id = ?`,
+				nullable(actionDetail), options.requiresAuth, options.blockedBy, options.binding.CandidateID, options.binding.QuarantinePath,
+				options.binding.QuarantineSHA256, actionID)
+		}
+	case errors.Is(err, sql.ErrNoRows):
+		binding := options.binding
+		candidateID, path, sha := any(nil), "", ""
+		if binding != nil {
+			candidateID, path, sha = binding.CandidateID, binding.QuarantinePath, binding.QuarantineSHA256
+		}
+		_, err = tx.ExecContext(ctx, `
+			INSERT INTO human_actions
+				(job_id, kind, status, detail, requires_auth, blocked_by, candidate_id, quarantine_path, quarantine_sha256, revision, created_at)
+			VALUES (?, ?, 'open', ?, ?, ?, ?, ?, ?, 1, ?)`,
+			jobID, actionKind, nullable(actionDetail), options.requiresAuth, options.blockedBy, candidateID, path, sha, now)
+	default:
+		return err
+	}
+	if err != nil {
+		return err
 	}
 	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO events (job_id, at, kind, detail_json) VALUES (?, ?, 'job.transition', ?)`,
@@ -1327,9 +1475,10 @@ func (js *Store) AcceptedReviewBinding(ctx context.Context, jobID string) (*Huma
 }
 
 type openHumanActionOptions struct {
-	binding      *HumanActionBinding
-	requiresAuth bool
-	blockedBy    string
+	binding                    *HumanActionBinding
+	requiresAuth               bool
+	blockedBy                  string
+	inheritResolvedHandoffAuth bool
 }
 
 // OpenHumanActionOption configures one human action.
@@ -1367,6 +1516,23 @@ func WithAccessClassification(requiresAuth bool, blockedBy string) OpenHumanActi
 		}
 		options.requiresAuth = requiresAuth
 		options.blockedBy = blockedBy
+		return nil
+	}
+}
+
+// WithInheritedResolvedHandoffAccessClassification keeps replacement guidance
+// honest after a browser handoff has already closed. A landing page can block
+// papio differently than the paywall did, but it cannot establish that the
+// user's institutional sign-in is no longer needed.
+func WithInheritedResolvedHandoffAccessClassification(blockedBy string) OpenHumanActionOption {
+	return func(options *openHumanActionOptions) error {
+		switch blockedBy {
+		case "", "anti_bot", "paywall", "landing_page":
+		default:
+			return fmt.Errorf("invalid human action blocked_by %q", blockedBy)
+		}
+		options.blockedBy = blockedBy
+		options.inheritResolvedHandoffAuth = true
 		return nil
 	}
 }

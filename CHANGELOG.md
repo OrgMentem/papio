@@ -30,6 +30,20 @@ execution records in `notes/acquisition-stack-plan.md`.
 
 ### Fixed
 
+- **A handoff whose provider page papio could not drive became a dead end.**
+  When the extension reported `wrong_work` or `ui_changed`, the daemon resolved
+  the job's only open action and parked it in `needs_review` — a state whose
+  entire contract is that a human approves or rejects something — without
+  opening anything to approve or reject. `papio status` said "see `papio
+  actions` and approve or reject it" while `papio actions` was empty, and
+  `needs_review` is not retryable, so the job could be neither acted on nor
+  re-run. Nine jobs sat like that for nine days on one machine. Such outcomes
+  now park in `awaiting_human` with an open `manual_download` action, which is
+  actionable, visible to the reminder escalation, and still adoptable if the
+  user downloads the PDF themselves. Existing stranded jobs are healed by
+  handoff maintenance rather than needing manual cleanup, and the replacement
+  action inherits the sign-in requirement of the handoff it replaces so it
+  cannot advertise "no login needed" for a paywalled work.
 - **The recovery command `papio status` recommended did not exist.** Every
   parked browser handoff, open-access browser fetch, and generic
   `awaiting_human` job was told to run `papio actions --open`, which exits 1

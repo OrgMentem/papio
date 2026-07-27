@@ -1628,65 +1628,102 @@ func TestProviderOutcomeMappings(t *testing.T) {
 	type expect struct {
 		state        string
 		actionStatus string // status the openurl_handoff action should end in
-		extraAction  string // additional open action kind expected (human_auth/terms)
+		extraAction  string // additional open action kind expected
+		extraDetail  string // detail expected on the additional open action
 		terminal     string
 	}
 	cases := map[string]expect{
 		"cancelled":                   {state: job.StateCancelled, actionStatus: "cancelled"},
 		"no_entitlement":              {state: job.StateUnavailable, actionStatus: "resolved", terminal: "no_entitlement"},
 		"document_delivery_available": {state: job.StateUnavailable, actionStatus: "resolved", terminal: "document_delivery_available"},
-		"wrong_work":                  {state: job.StateNeedsReview, actionStatus: "resolved"},
-		"ui_changed":                  {state: job.StateNeedsReview, actionStatus: "resolved"},
-		"rate_limited":                {state: job.StateRetryWait, actionStatus: "resolved"},
-		"human_auth_required":         {state: job.StateAwaitingHuman, actionStatus: "open", extraAction: "human_auth_required"},
-		"terms_acceptance_required":   {state: job.StateAwaitingHuman, actionStatus: "open", extraAction: "terms_acceptance_required"},
+		"wrong_work": {
+			state: job.StateAwaitingHuman, actionStatus: "resolved", extraAction: "manual_download",
+			extraDetail: "papio reached a different work; find and download the requested PDF yourself",
+		},
+		"ui_changed": {
+			state: job.StateAwaitingHuman, actionStatus: "resolved", extraAction: "manual_download",
+			extraDetail: "papio could not drive the provider page; download the PDF yourself and papio will adopt it",
+		},
+		"rate_limited":              {state: job.StateRetryWait, actionStatus: "resolved"},
+		"human_auth_required":       {state: job.StateAwaitingHuman, actionStatus: "open", extraAction: "human_auth_required"},
+		"terms_acceptance_required": {state: job.StateAwaitingHuman, actionStatus: "open", extraAction: "terms_acceptance_required"},
 	}
 	for outcome, want := range cases {
 		t.Run(outcome, func(t *testing.T) {
-			b, jobs, _, _ := newBridge(t)
-			ctx := context.Background()
-			id := park(t, jobs, "wr_"+outcome, handoffWork())
-			if outcome == "no_entitlement" || outcome == "document_delivery_available" {
-				if err := jobs.RecordEvent(ctx, id, "browser.no_entitlement_requeue", map[string]any{"outcome": outcome}); err != nil {
-					t.Fatal(err)
+			classifications := []struct {
+				name         string
+				requiresAuth bool
+			}{{name: "default", requiresAuth: false}}
+			if want.extraAction == "manual_download" {
+				classifications = []struct {
+					name         string
+					requiresAuth bool
+				}{
+					{name: "handoff_requires_auth_false", requiresAuth: false},
+					{name: "handoff_requires_auth_true", requiresAuth: true},
 				}
 			}
-			runSync(t, b, hello())
-			runSync(t, b, inFrame(t, protocol.MsgProviderOutcome, id, map[string]any{"outcome": outcome}))
+			for _, classification := range classifications {
+				t.Run(classification.name, func(t *testing.T) {
+					b, jobs, _, _ := newBridge(t)
+					ctx := context.Background()
+					id := park(t, jobs, "wr_"+outcome, handoffWork())
+					if want.extraAction == "manual_download" {
+						if _, err := jobs.S.DB().ExecContext(ctx,
+							`UPDATE human_actions SET requires_auth = ? WHERE job_id = ? AND kind = ?`,
+							classification.requiresAuth, id, handoffActionKind); err != nil {
+							t.Fatal(err)
+						}
+					}
+					if outcome == "no_entitlement" || outcome == "document_delivery_available" {
+						if err := jobs.RecordEvent(ctx, id, "browser.no_entitlement_requeue", map[string]any{"outcome": outcome}); err != nil {
+							t.Fatal(err)
+						}
+					}
+					runSync(t, b, hello())
+					runSync(t, b, inFrame(t, protocol.MsgProviderOutcome, id, map[string]any{"outcome": outcome}))
 
-			row, err := jobs.Get(ctx, id)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if row.State != want.state {
-				t.Fatalf("state = %s, want %s", row.State, want.state)
-			}
-			if want.terminal != "" && row.TerminalReason != want.terminal {
-				t.Fatalf("terminal reason = %q, want %q", row.TerminalReason, want.terminal)
-			}
-			if want.state == job.StateRetryWait && row.RetryAt == "" {
-				t.Fatal("rate_limited did not schedule a retry_at")
-			}
+					row, err := jobs.Get(ctx, id)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if row.State != want.state {
+						t.Fatalf("state = %s, want %s", row.State, want.state)
+					}
+					if want.terminal != "" && row.TerminalReason != want.terminal {
+						t.Fatalf("terminal reason = %q, want %q", row.TerminalReason, want.terminal)
+					}
+					if want.state == job.StateRetryWait && row.RetryAt == "" {
+						t.Fatal("rate_limited did not schedule a retry_at")
+					}
 
-			actions, err := jobs.ListHumanActions(ctx, false)
-			if err != nil {
-				t.Fatal(err)
-			}
-			var handoffStatus string
-			extraOpen := false
-			for _, a := range actions {
-				if a.Kind == handoffActionKind {
-					handoffStatus = a.Status
-				}
-				if want.extraAction != "" && a.Kind == want.extraAction && a.Status == "open" {
-					extraOpen = true
-				}
-			}
-			if handoffStatus != want.actionStatus {
-				t.Fatalf("openurl_handoff status = %q, want %q", handoffStatus, want.actionStatus)
-			}
-			if want.extraAction != "" && !extraOpen {
-				t.Fatalf("expected an open %s action", want.extraAction)
+					actions, err := jobs.ListHumanActions(ctx, false)
+					if err != nil {
+						t.Fatal(err)
+					}
+					var handoffStatus string
+					var extraOpen []job.HumanAction
+					for _, a := range actions {
+						if a.Kind == handoffActionKind {
+							handoffStatus = a.Status
+						}
+						if want.extraAction != "" && a.Kind == want.extraAction && a.Status == "open" {
+							extraOpen = append(extraOpen, a)
+						}
+					}
+					if handoffStatus != want.actionStatus {
+						t.Fatalf("openurl_handoff status = %q, want %q", handoffStatus, want.actionStatus)
+					}
+					if want.extraAction != "" && len(extraOpen) != 1 {
+						t.Fatalf("open %s actions = %d, want 1", want.extraAction, len(extraOpen))
+					}
+					if want.extraDetail != "" && extraOpen[0].Detail != want.extraDetail {
+						t.Fatalf("%s detail = %q, want %q", want.extraAction, extraOpen[0].Detail, want.extraDetail)
+					}
+					if want.extraAction == "manual_download" && extraOpen[0].RequiresAuth != classification.requiresAuth {
+						t.Fatalf("manual_download requires_auth = %t, want %t", extraOpen[0].RequiresAuth, classification.requiresAuth)
+					}
+				})
 			}
 		})
 	}

@@ -4,9 +4,15 @@ package app
 import (
 	"context"
 	"errors"
+	"time"
 
 	"papio/internal/job"
 )
+
+// strandedNeedsReviewMinAge leaves five normal maintenance passes for a
+// legitimate action-resolution/state transition to settle before maintenance
+// treats its empty-action gap as durable.
+const strandedNeedsReviewMinAge = 5 * time.Minute
 
 // HandoffRepairer heals awaiting_human jobs stranded by a crash between the
 // browser bridge's non-transactional handoff mutations (requeue event, action
@@ -20,7 +26,7 @@ type HandoffRepairer struct {
 // parks. It satisfies daemon.MaintenanceRunner without importing that package.
 func (s *Service) HandoffRepairer() *HandoffRepairer { return &HandoffRepairer{svc: s} }
 
-// RunDue performs one repair pass over awaiting_human jobs.
+// RunDue performs one repair pass over human-park jobs.
 //
 // Rule 1 (orphaned park): a job in awaiting_human with no open human action
 // can never be resolved by anyone — every legitimate park pairs with an open
@@ -39,6 +45,13 @@ func (s *Service) HandoffRepairer() *HandoffRepairer { return &HandoffRepairer{s
 // escalating reminder each time. Same shape as rule 2: resolve the actions and
 // re-enter resolving, where the one gate that owns this decision classifies it.
 //
+// Rule 4 (unactionable review): an old needs_review job with no open action
+// cannot be approved, rejected, or retried. The nine observed strands each
+// recorded job.transition {"from":"awaiting_human","reason":"ui_changed",
+// "to":"needs_review"} after their openurl_handoff had resolved, leaving no
+// artifact or action. Move it to awaiting_human with manual_download so the
+// user can supply a browser download for adoption.
+//
 // The transactional repair rejects a state/action snapshot that has gone
 // stale, including an adoption lease acquired after its page read.
 func (r *HandoffRepairer) RunDue(ctx context.Context) error {
@@ -46,7 +59,7 @@ func (r *HandoffRepairer) RunDue(ctx context.Context) error {
 		return nil
 	}
 	s := r.svc
-	rows, err := s.Jobs.ListOldest(ctx, []string{job.StateAwaitingHuman}, job.ListLimitMax)
+	rows, err := s.Jobs.ListOldest(ctx, []string{job.StateAwaitingHuman, job.StateNeedsReview}, job.ListLimitMax)
 	if err != nil {
 		return err
 	}
@@ -65,6 +78,7 @@ func (r *HandoffRepairer) RunDue(ctx context.Context) error {
 	for _, action := range actions {
 		openByJob[action.JobID] = append(openByJob[action.JobID], action)
 	}
+	now := r.now()
 	var firstErr error
 	record := func(err error) {
 		if err != nil && !errors.Is(err, job.ErrConflict) && firstErr == nil {
@@ -74,6 +88,18 @@ func (r *HandoffRepairer) RunDue(ctx context.Context) error {
 	for i := range rows {
 		row := &rows[i]
 		open := openByJob[row.ID]
+		if row.State == job.StateNeedsReview {
+			if len(open) != 0 || !strandedNeedsReview(row, now) {
+				continue
+			}
+			// A page papio could not drive is the immediate blocker, but only the
+			// resolved handoff can tell us whether its institutional login remains needed.
+			record(s.Jobs.RepairParkWithAction(ctx, row.ID, job.StateNeedsReview, job.StateAwaitingHuman, nil,
+				"manual_download", "the browser handoff did not produce a file; download the requested PDF yourself and papio will adopt it",
+				map[string]any{"reason": "stranded_handoff_repair"},
+				job.WithInheritedResolvedHandoffAccessClassification("landing_page")))
+			continue
+		}
 		if len(open) == 0 {
 			record(s.Jobs.RepairAwaitingHuman(ctx, row.ID, nil,
 				map[string]any{"reason": "orphaned_handoff_repair"}))
@@ -109,4 +135,18 @@ func allInstitutionalHandoffs(actions []job.HumanAction) bool {
 		}
 	}
 	return true
+}
+
+// strandedNeedsReview declines malformed timestamps because their age cannot
+// be established safely.
+func strandedNeedsReview(row *job.Row, now time.Time) bool {
+	updated, err := time.Parse(time.RFC3339Nano, row.UpdatedAt)
+	return err == nil && !updated.Add(strandedNeedsReviewMinAge).After(now)
+}
+
+func (r *HandoffRepairer) now() time.Time {
+	if r != nil && r.svc != nil && r.svc.Now != nil {
+		return r.svc.Now()
+	}
+	return time.Now()
 }

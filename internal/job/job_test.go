@@ -598,6 +598,56 @@ func TestAwaitingHumanResumeEdgesForBrowserBridge(t *testing.T) {
 	}
 }
 
+func TestRepairParkWithActionLeavesLateLeaseUntouched(t *testing.T) {
+	ctx := context.Background()
+	js := testStore(t)
+	id, err := js.CreateRequest(ctx, "wr_repair_late_lease", testWork(), "", "", testPolicy(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := js.Transition(ctx, id, StateQueued, StateResolving, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := js.Transition(ctx, id, StateResolving, StateNeedsReview, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	snapshot, err := js.ListOpenHumanActionsForJobs(ctx, []string{id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot) != 0 {
+		t.Fatalf("open action snapshot = %+v, want none", snapshot)
+	}
+	now := time.Now().UTC()
+	if _, err := js.S.DB().ExecContext(ctx,
+		`UPDATE jobs SET lease_owner = ?, lease_expires_at = ? WHERE id = ?`,
+		"adopt-in-progress", now.Add(time.Minute).Format(time.RFC3339Nano), id); err != nil {
+		t.Fatal(err)
+	}
+
+	err = js.RepairParkWithAction(ctx, id, StateNeedsReview, StateAwaitingHuman, nil,
+		"manual_download", "download the requested PDF yourself",
+		map[string]any{"reason": "stranded_handoff_repair"},
+		WithAccessClassification(false, "landing_page"))
+	if !errors.Is(err, ErrConflict) {
+		t.Fatalf("repair after adoption lease = %v, want ErrConflict", err)
+	}
+	row, err := js.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.State != StateNeedsReview || row.LeaseOwner != "adopt-in-progress" || !row.LeaseActive(time.Now()) {
+		t.Fatalf("late lease did not protect review job: %+v", row)
+	}
+	actions, err := js.ListHumanActions(ctx, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(actions) != 0 {
+		t.Fatalf("late lease let repair change actions: %+v", actions)
+	}
+}
 func parkIdentityReview(t *testing.T, js *Store, requestID string) (string, int64, int64) {
 	t.Helper()
 	ctx := context.Background()

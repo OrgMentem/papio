@@ -22,6 +22,24 @@ func parkedHandoffJob(t *testing.T, svc *Service, jobs *job.Store, requestID str
 	return row
 }
 
+func strandedNeedsReviewJob(t *testing.T, svc *Service, jobs *job.Store, requestID string) *job.Row {
+	t.Helper()
+	row := resolvingExhaustionJob(t, svc, jobs, requestID)
+	if err := jobs.Transition(context.Background(), row.ID, job.StateResolving, job.StateNeedsReview,
+		map[string]any{"reason": "ui_changed"}); err != nil {
+		t.Fatal(err)
+	}
+	return row
+}
+
+func setHandoffRepairUpdatedAt(t *testing.T, jobs *job.Store, jobID string, at time.Time) {
+	t.Helper()
+	if _, err := jobs.S.DB().ExecContext(context.Background(), `UPDATE jobs SET updated_at = ? WHERE id = ?`,
+		at.UTC().Format(time.RFC3339Nano), jobID); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestHandoffRepairerHealsStrandedParks(t *testing.T) {
 	ctx := context.Background()
 
@@ -139,6 +157,171 @@ func TestHandoffRepairerHealsStrandedParks(t *testing.T) {
 	})
 }
 
+func TestHandoffRepairerHealsStrandedNeedsReview(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("old review with no action becomes an adoptable manual download", func(t *testing.T) {
+		svc, jobs := newTestService(t)
+		now := time.Now().UTC()
+		svc.Now = func() time.Time { return now }
+		row := strandedNeedsReviewJob(t, svc, jobs, "request_stranded_review")
+		setHandoffRepairUpdatedAt(t, jobs, row.ID, now.Add(-strandedNeedsReviewMinAge-time.Second))
+
+		if err := svc.HandoffRepairer().RunDue(ctx); err != nil {
+			t.Fatal(err)
+		}
+		persisted, err := jobs.Get(ctx, row.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if persisted.State != job.StateAwaitingHuman {
+			t.Fatalf("state = %s, want awaiting_human", persisted.State)
+		}
+		actions, err := jobs.ListOpenHumanActionsForJobs(ctx, []string{row.ID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(actions) != 1 || actions[0].Kind != "manual_download" || !actions[0].RequiresAuth {
+			t.Fatalf("open actions = %+v, want one auth-requiring manual_download", actions)
+		}
+	})
+
+	t.Run("replacement inherits the resolved handoff's sign-in requirement", func(t *testing.T) {
+		for _, requiresAuth := range []bool{true, false} {
+			t.Run(fmt.Sprintf("requires_auth_%t", requiresAuth), func(t *testing.T) {
+				svc, jobs := newTestService(t)
+				now := time.Now().UTC()
+				svc.Now = func() time.Time { return now }
+				row := resolvingExhaustionJob(t, svc, jobs, fmt.Sprintf("request_resolved_handoff_%t", requiresAuth))
+				olderHandoffID, err := jobs.OpenHumanAction(ctx, row.ID, "openurl_handoff", InstitutionalOpenURLHandoffDetail,
+					job.WithAccessClassification(!requiresAuth, "paywall"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := jobs.S.DB().ExecContext(ctx,
+					`UPDATE human_actions SET status = 'resolved', resolved_at = ? WHERE id = ?`,
+					now.Add(-time.Second).Format(time.RFC3339Nano), olderHandoffID); err != nil {
+					t.Fatal(err)
+				}
+				handoffID, err := jobs.OpenHumanAction(ctx, row.ID, "openurl_handoff", InstitutionalOpenURLHandoffDetail,
+					job.WithAccessClassification(requiresAuth, "paywall"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := jobs.S.DB().ExecContext(ctx,
+					`UPDATE human_actions SET status = 'resolved', resolved_at = ? WHERE id = ?`,
+					now.Format(time.RFC3339Nano), handoffID); err != nil {
+					t.Fatal(err)
+				}
+				if err := jobs.Transition(ctx, row.ID, job.StateResolving, job.StateNeedsReview,
+					map[string]any{"reason": "ui_changed"}); err != nil {
+					t.Fatal(err)
+				}
+				setHandoffRepairUpdatedAt(t, jobs, row.ID, now.Add(-strandedNeedsReviewMinAge-time.Second))
+
+				if err := svc.HandoffRepairer().RunDue(ctx); err != nil {
+					t.Fatal(err)
+				}
+				actions, err := jobs.ListOpenHumanActionsForJobs(ctx, []string{row.ID})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(actions) != 1 || actions[0].Kind != "manual_download" {
+					t.Fatalf("open actions = %+v, want one manual_download", actions)
+				}
+				if actions[0].RequiresAuth != requiresAuth {
+					t.Fatalf("manual_download requires_auth = %t, want %t", actions[0].RequiresAuth, requiresAuth)
+				}
+			})
+		}
+	})
+
+	t.Run("fresh review with no action is left alone", func(t *testing.T) {
+		svc, jobs := newTestService(t)
+		now := time.Now().UTC()
+		svc.Now = func() time.Time { return now }
+		row := strandedNeedsReviewJob(t, svc, jobs, "request_fresh_review")
+		setHandoffRepairUpdatedAt(t, jobs, row.ID, now.Add(-strandedNeedsReviewMinAge+time.Second))
+
+		if err := svc.HandoffRepairer().RunDue(ctx); err != nil {
+			t.Fatal(err)
+		}
+		persisted, err := jobs.Get(ctx, row.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if persisted.State != job.StateNeedsReview {
+			t.Fatalf("state = %s, want needs_review", persisted.State)
+		}
+		actions, err := jobs.ListOpenHumanActionsForJobs(ctx, []string{row.ID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(actions) != 0 {
+			t.Fatalf("fresh review gained actions: %+v", actions)
+		}
+	})
+
+	t.Run("identity review action holds the review park", func(t *testing.T) {
+		svc, jobs := newTestService(t)
+		now := time.Now().UTC()
+		svc.Now = func() time.Time { return now }
+		row := strandedNeedsReviewJob(t, svc, jobs, "request_identity_review")
+		setHandoffRepairUpdatedAt(t, jobs, row.ID, now.Add(-strandedNeedsReviewMinAge-time.Second))
+		if _, err := jobs.OpenHumanAction(ctx, row.ID, "verify_identity", "inspect the quarantined download"); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := svc.HandoffRepairer().RunDue(ctx); err != nil {
+			t.Fatal(err)
+		}
+		persisted, err := jobs.Get(ctx, row.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if persisted.State != job.StateNeedsReview {
+			t.Fatalf("state = %s, want needs_review", persisted.State)
+		}
+		actions, err := jobs.ListOpenHumanActionsForJobs(ctx, []string{row.ID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(actions) != 1 || actions[0].Kind != "verify_identity" {
+			t.Fatalf("open actions = %+v, want one verify_identity", actions)
+		}
+	})
+
+	t.Run("leased review is left alone", func(t *testing.T) {
+		svc, jobs := newTestService(t)
+		now := time.Now().UTC()
+		svc.Now = func() time.Time { return now }
+		row := strandedNeedsReviewJob(t, svc, jobs, "request_leased_review")
+		setHandoffRepairUpdatedAt(t, jobs, row.ID, now.Add(-strandedNeedsReviewMinAge-time.Second))
+		if _, err := jobs.S.DB().ExecContext(ctx,
+			`UPDATE jobs SET lease_owner = ?, lease_expires_at = ? WHERE id = ?`,
+			"adopt-in-progress", now.Add(time.Minute).Format(time.RFC3339Nano), row.ID); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := svc.HandoffRepairer().RunDue(ctx); err != nil {
+			t.Fatal(err)
+		}
+		persisted, err := jobs.Get(ctx, row.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if persisted.State != job.StateNeedsReview || !persisted.LeaseActive(now) {
+			t.Fatalf("leased review = %+v, want untouched needs_review job", persisted)
+		}
+		actions, err := jobs.ListOpenHumanActionsForJobs(ctx, []string{row.ID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(actions) != 0 {
+			t.Fatalf("leased review gained actions: %+v", actions)
+		}
+	})
+}
 func TestHandoffRepairerLeavesAnActivelyLeasedParkUntouched(t *testing.T) {
 	ctx := context.Background()
 	svc, jobs := newTestService(t)

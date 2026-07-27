@@ -1218,10 +1218,31 @@ func (b *Bridge) outcome(ctx context.Context, jobID string, p *protocol.Provider
 		return b.leaveHandoff(ctx, jobID, job.StateUnavailable, p.Outcome)
 
 	case "wrong_work", "ui_changed":
+		actions, err := b.jobs.ListOpenHumanActionsForJobs(ctx, []string{jobID})
+		if err != nil {
+			return err
+		}
+		// A missing handoff must not promise access: the user may still need to
+		// sign in, and a false open-access claim sends them to a paywall.
+		requiresAuth := true
+		for _, action := range actions {
+			if action.Kind == handoffActionKind {
+				requiresAuth = action.RequiresAuth
+				break
+			}
+		}
 		if err := b.resolveHandoff(ctx, jobID, "resolved"); err != nil {
 			return err
 		}
-		return b.leaveHandoff(ctx, jobID, job.StateNeedsReview, p.Outcome)
+		detail := "papio reached a different work; find and download the requested PDF yourself"
+		if p.Outcome == "ui_changed" {
+			detail = "papio could not drive the provider page; download the PDF yourself and papio will adopt it"
+		}
+		// The page, rather than the original paywall, now blocks papio; whether
+		// that page needs a sign-in remains the resolved handoff's classification.
+		_, err = b.jobs.OpenHumanAction(ctx, jobID, "manual_download", detail,
+			job.WithAccessClassification(requiresAuth, "landing_page"))
+		return err
 
 	case "rate_limited":
 		if err := b.resolveHandoff(ctx, jobID, "resolved"); err != nil {
