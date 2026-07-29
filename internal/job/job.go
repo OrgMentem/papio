@@ -1480,11 +1480,28 @@ func (js *Store) GetArtifact(ctx context.Context, sha string) (*Artifact, error)
 	return &a, nil
 }
 
-// FindCandidateByArtifact returns the original accepted candidate provenance
-// for an artifact, including when the current job completed from local cache.
-func (js *Store) FindCandidateByArtifact(ctx context.Context, sha string) (*Candidate, error) {
+// CandidateForArtifact returns the accepted candidate provenance for one job's
+// artifact. The job's own selected candidate is authoritative; the content-hash
+// scan is only a fallback for the local-cache completion path, which reaches
+// ready with an artifact but no candidate of its own (see Service.Process).
+//
+// Preferring the job's own row is load-bearing, not an optimization. artifacts
+// are content-addressed and shared, so two acquisitions can hold identical bytes
+// under different reuse licences and access bases; resolving provenance by hash
+// alone reports the earliest job's terms for every later one, which is
+// first-writer-wins rights attribution on a digest (ADR-0007).
+func (js *Store) CandidateForArtifact(ctx context.Context, jobID, sha string) (*Candidate, error) {
+	var own sql.NullInt64
+	err := js.S.DB().QueryRowContext(ctx,
+		`SELECT selected_candidate_id FROM jobs WHERE id = ?`, jobID).Scan(&own)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return nil, err
+	}
+	if own.Valid {
+		return js.GetCandidate(ctx, own.Int64)
+	}
 	var id sql.NullInt64
-	err := js.S.DB().QueryRowContext(ctx, `
+	err = js.S.DB().QueryRowContext(ctx, `
 		SELECT selected_candidate_id FROM jobs
 		WHERE artifact_sha256 = ? AND state IN ('ready','imported') AND selected_candidate_id IS NOT NULL
 		ORDER BY updated_at ASC LIMIT 1`, sha).Scan(&id)

@@ -474,3 +474,61 @@ func TestAdoptDownloadRejectedUnquarantinableGoesNeedsReview(t *testing.T) {
 		t.Fatalf("rejected file not preserved: %v", statErr)
 	}
 }
+
+// A browser-adopted download's version must always be `unknown`: adoption sees
+// bytes arrive from a human's browser and never learns which version that human
+// chose. Reporting the request's DesiredVersion *preference* as the obtained
+// fact would let a consumer act on papio's own guess (ADR-0007).
+func TestAdoptedCandidateVersionIsAlwaysUnknown(t *testing.T) {
+	for _, desired := range []string{"any", resolver.VersionAccepted, resolver.VersionPublished, resolver.VersionPreprint} {
+		t.Run("desired_"+desired, func(t *testing.T) {
+			svc, jobs := newTestService(t)
+			svc.Validate = passValidation()
+			ctx := context.Background()
+			id, err := jobs.CreateRequest(ctx, "wr_adopt_version_"+desired, work.Work{DOI: "10.1002/example"}, "", "",
+				job.Policy{AccessMode: config.ModeDelegated, DesiredVersion: desired, FetchMaxBytes: 1 << 20}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, step := range [][2]string{
+				{job.StateQueued, job.StateResolving},
+				{job.StateResolving, job.StateFetching},
+				{job.StateFetching, job.StateAwaitingHuman},
+			} {
+				if err := jobs.Transition(ctx, id, step[0], step[1], nil); err != nil {
+					t.Fatal(err)
+				}
+			}
+			dir := filepath.Join(svc.Config.EffectiveAdoptionRoot(), id)
+			if err := os.MkdirAll(dir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(dir, "paper.pdf")
+			if err := os.WriteFile(path, pdfBytes("adopted "+desired), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := svc.AdoptDownload(ctx, id, path); err != nil {
+				t.Fatalf("adopt: %v", err)
+			}
+			row, err := jobs.Get(ctx, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if row.SelectedCandidateID == 0 {
+				t.Fatalf("adopted job has no selected candidate (state %s)", row.State)
+			}
+			candidate, err := jobs.GetCandidate(ctx, row.SelectedCandidateID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if candidate.Version != resolver.VersionUnknown {
+				t.Fatalf("adopted version = %q, want %q", candidate.Version, resolver.VersionUnknown)
+			}
+			// The honest fields around it must not drift either.
+			if candidate.AccessBasis != resolver.AccessInstitutional || candidate.ReuseLicense != "unknown" {
+				t.Fatalf("adopted access/licence = %q/%q, want institutional/unknown",
+					candidate.AccessBasis, candidate.ReuseLicense)
+			}
+		})
+	}
+}

@@ -10,6 +10,27 @@ execution records in `notes/acquisition-stack-plan.md`.
 
 ## [Unreleased]
 
+### Fixed
+
+- **An acquisition no longer inherits another acquisition's licence.** Artifacts
+  are content-addressed and shared, so two jobs can hold identical bytes obtained
+  under different terms — an open-access mirror and an institutional copy of the
+  same file. Bundle export resolved provenance by content hash alone and picked
+  the *earliest* job holding that hash, so an institutionally-acquired job could
+  export the earlier job's `access_basis` and `reuse_license`: first-writer-wins
+  rights attribution on a digest. Export now reads the job's own accepted
+  candidate and falls back to the hash scan only for jobs completed from the
+  local cache, which legitimately have no candidate of their own. If you gate
+  retention or redistribution on a bundle's `reuse_license`, re-export any bundle
+  for a work you acquired more than once.
+- **A browser-adopted download no longer claims a version papio never observed.**
+  Adoption labelled the file `published`, or — worse — copied the request's
+  `desired_version` *preference* into the obtained *fact*, so asking for an
+  accepted manuscript produced a candidate asserting it had received one. papio
+  sees bytes arrive from your browser and never learns which version you chose,
+  so the adopted version is now always `unknown`. Its access basis
+  (`institutional`) and licence (`unknown`) were already honest and are unchanged.
+
 ## [0.13.0] - 2026-07-27
 
 ### Added

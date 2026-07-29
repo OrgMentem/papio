@@ -341,3 +341,99 @@ func TestExportRejectsNonReadyAndCorruptExistingTarget(t *testing.T) {
 		t.Fatal("reused a corrupt destination artifact")
 	}
 }
+
+// readyJobSharingArtifact adds a second acquisition that reached the same bytes
+// under different terms. Content addressing makes the artifact row shared, so the
+// bundle must still report THIS job's licence and access basis.
+func readyJobSharingArtifact(t *testing.T, jobs *job.Store, reqID, sha string, withOwnCandidate bool) string {
+	t.Helper()
+	ctx := context.Background()
+	id, err := jobs.CreateRequest(ctx, reqID, work.Work{
+		DOI: "10.1002/example-b", Title: "Example Paper", Authors: []string{"Ada Lovelace"}, Year: 2024,
+	}, "", "", job.Policy{AccessMode: "delegated", DesiredVersion: "any", FetchMaxBytes: 1 << 20}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts := []job.TransitionOpt{job.WithArtifact(sha)}
+	if withOwnCandidate {
+		if _, err := jobs.InsertCandidates(ctx, id, []job.Candidate{{
+			JobID: id, Source: "browser", URLRedacted: "browser://adopted-download", URLKey: "own-key",
+			Version: "unknown", AccessBasis: "institutional", ReuseLicense: "unknown",
+			ExpectedMIME: "application/pdf", Direct: true, IdentityConfidence: 0.5, Rank: 0,
+		}}); err != nil {
+			t.Fatal(err)
+		}
+		own, _ := jobs.NextPendingCandidate(ctx, id)
+		if own == nil {
+			t.Fatal("own candidate missing")
+		}
+		_ = jobs.MarkCandidate(ctx, own.ID, "accepted")
+		opts = append(opts, job.WithCandidate(own.ID))
+	}
+	for _, edge := range [][2]string{{job.StateQueued, job.StateResolving}, {job.StateResolving, job.StateFetching}, {job.StateFetching, job.StateValidating}} {
+		if err := jobs.Transition(ctx, id, edge[0], edge[1], nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := jobs.Transition(ctx, id, job.StateValidating, job.StateReady, nil, opts...); err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+// Two acquisitions can hold identical bytes under different terms. Resolving
+// provenance by content hash alone reported the EARLIEST job's licence for every
+// later one — first-writer-wins rights attribution on a digest (ADR-0007).
+func TestExportReportsThisJobsProvenanceNotAnotherJobsSharingTheArtifact(t *testing.T) {
+	exporter, first, sha := readyFixture(t)
+	ctx := context.Background()
+	second := readyJobSharingArtifact(t, exporter.Jobs, "wr_bundle_shared", sha, true)
+
+	_, firstBundle, err := exporter.Export(ctx, first, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstBundle.Candidate.AccessBasis != "open_access" || firstBundle.Candidate.ReuseLicense != "cc-by-4.0" {
+		t.Fatalf("first bundle candidate = %+v, want its own open_access/cc-by-4.0", firstBundle.Candidate)
+	}
+
+	_, secondBundle, err := exporter.Export(ctx, second, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if secondBundle.Candidate.AccessBasis != "institutional" {
+		t.Fatalf("second bundle access_basis = %q, want institutional (borrowed the earlier job's provenance)",
+			secondBundle.Candidate.AccessBasis)
+	}
+	if secondBundle.Candidate.ReuseLicense != "unknown" {
+		t.Fatalf("second bundle reuse_license = %q, want unknown: a licence must never be inherited from another acquisition",
+			secondBundle.Candidate.ReuseLicense)
+	}
+	if secondBundle.Candidate.Version != "unknown" || secondBundle.Candidate.Source != "browser" {
+		t.Fatalf("second bundle candidate = %+v, want its own browser/unknown", secondBundle.Candidate)
+	}
+}
+
+// The content-hash fallback stays, and is load-bearing: a job completed from the
+// local cache reaches ready with an artifact but no candidate of its own, so its
+// provenance legitimately comes from the acquisition that first fetched the bytes.
+func TestExportFallsBackToOriginalAcquisitionForCacheCompletedJob(t *testing.T) {
+	exporter, _, sha := readyFixture(t)
+	ctx := context.Background()
+	cached := readyJobSharingArtifact(t, exporter.Jobs, "wr_bundle_cached", sha, false)
+
+	row, err := exporter.Jobs.Get(ctx, cached)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.SelectedCandidateID != 0 {
+		t.Fatalf("cache-completed fixture has its own candidate %d; the fallback is not being exercised", row.SelectedCandidateID)
+	}
+	_, b, err := exporter.Export(ctx, cached, "")
+	if err != nil {
+		t.Fatalf("export cache-completed job: %v", err)
+	}
+	if b.Candidate.Source != "unpaywall" || b.Candidate.ReuseLicense != "cc-by-4.0" {
+		t.Fatalf("cache-completed bundle candidate = %+v, want the original unpaywall acquisition", b.Candidate)
+	}
+}

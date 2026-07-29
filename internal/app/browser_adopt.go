@@ -90,10 +90,14 @@ func (s *Service) AdoptDownload(ctx context.Context, jobID, path string) error {
 	// after review acceptance; a repeated adoption of the unchanged file must
 	// therefore recover the candidate's durable review_override instead of
 	// creating a fresh candidate and parking the same PDF forever.
-	version := resolver.VersionPublished
-	if v := row.Policy.DesiredVersion; v != "" && v != "any" {
-		version = v
-	}
+	//
+	// The version is `unknown` and must stay that way: adoption observes bytes
+	// arriving from a human's browser, never which version that human chose.
+	// `Policy.DesiredVersion` is a ranking *preference* for resolver candidates —
+	// echoing it back here would report the request as an obtained fact, and a
+	// consumer that gates an adverse finding on the version would act on papio's
+	// own guess (ADR-0007).
+	version := resolver.VersionUnknown
 	key := "browser-adopt:sha256:" + sha
 	if _, err := s.Jobs.InsertCandidates(ctx, jobID, []job.Candidate{{
 		JobID: jobID, Source: "browser", URLRedacted: "browser://adopted-download",

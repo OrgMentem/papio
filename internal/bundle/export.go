@@ -92,7 +92,7 @@ func (e *Exporter) Export(ctx context.Context, jobID, destination string) (strin
 	if err := e.Artifacts.Verify(art.SHA256); err != nil {
 		return "", nil, err
 	}
-	candidate, err := e.Jobs.FindCandidateByArtifact(ctx, art.SHA256)
+	candidate, err := e.Jobs.CandidateForArtifact(ctx, jobID, art.SHA256)
 	if err != nil {
 		return "", nil, err
 	}
