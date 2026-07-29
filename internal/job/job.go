@@ -232,6 +232,59 @@ type Row struct {
 	LeaseExpiresAt      string    `json:"-"`
 }
 
+// Principal returns the acquiring principal recorded for a job's work request.
+//
+// Deliberately NOT a field on Row: Row is the result body of jobs.get, and the
+// IPC envelope is decoded with DisallowUnknownFields, so widening it would make
+// every older papio reject a newer daemon's response. New facts reach consumers
+// through new methods (ADR-0007).
+func (js *Store) Principal(ctx context.Context, jobID string) (Principal, error) {
+	var principal sql.NullString
+	err := js.S.DB().QueryRowContext(ctx, `
+		SELECT wr.requester FROM jobs j
+		JOIN work_requests wr ON wr.id = j.work_request_id
+		WHERE j.id = ?`, jobID).Scan(&principal)
+	if err != nil {
+		return "", err
+	}
+	if principal.String == "" {
+		return PrincipalUnknown, nil
+	}
+	return Principal(principal.String), nil
+}
+
+// AttemptedTiers reports which access bases this job actually reached, in rank
+// order and deduplicated — the honest answer to "did we get as far as the
+// institutional route?" for a failed acquisition. Candidates that were only ever
+// ranked, never tried, are excluded: listing them would overstate what happened.
+func (js *Store) AttemptedTiers(ctx context.Context, jobID string) ([]string, error) {
+	rows, err := js.S.DB().QueryContext(ctx, `
+		SELECT access_basis FROM candidates
+		 WHERE job_id = ? AND status IN ('fetching','invalid','retryable','skipped','accepted')
+		 ORDER BY rank`, jobID)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var out []string
+	seen := map[string]bool{}
+	for rows.Next() {
+		var basis string
+		if err := rows.Scan(&basis); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		if !seen[basis] {
+			seen[basis] = true
+			out = append(out, basis)
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	return out, rows.Err()
+}
+
 // Candidate is one ranked acquisition option. URL is never stored; only the
 // redacted form persists, so a crash discards bearer URLs by construction.
 type Candidate struct {
@@ -642,6 +695,26 @@ func (js *Store) transition(ctx context.Context, jobID, from, to string, detail 
 		`INSERT INTO events (job_id, at, kind, detail_json) VALUES (?, ?, 'job.transition', ?)`,
 		jobID, now, string(detailJSON)); err != nil {
 		return err
+	}
+	// Record the acquisition edge whenever this transition attaches an artifact.
+	// Inside the same transaction, and reading identity_result here rather than
+	// from a caller argument, because artifacts.identity_result was just written
+	// by THIS job's validation: capturing it now is what stops a later
+	// acquisition of the same bytes from silently rewriting this job's finding
+	// (ADR-0007). role is 'main' — components other than the main file are
+	// recorded by AddComponent.
+	if cfg.artifactSHA != "" {
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO job_artifacts (job_id, artifact_sha256, role, candidate_id, identity_result, created_at)
+			SELECT ?, ?, 'main', j.selected_candidate_id, a.identity_result, ?
+			  FROM jobs j JOIN artifacts a ON a.sha256 = ?
+			 WHERE j.id = ?
+			ON CONFLICT(job_id, role, artifact_sha256) DO UPDATE SET
+			        candidate_id = excluded.candidate_id,
+			        identity_result = excluded.identity_result`,
+			jobID, cfg.artifactSHA, now, cfg.artifactSHA, jobID); err != nil {
+			return err
+		}
 	}
 	if Terminal(to) {
 		actionStatus := "cancelled"
@@ -1574,6 +1647,101 @@ func (js *Store) UpsertArtifact(ctx context.Context, a Artifact) error {
 		a.SHA256, a.SizeBytes, a.MIME, a.PageCount, a.TextChars, boolInt(a.OCRUsed), boolInt(a.Encrypted),
 		boolInt(a.HasActiveContent), nullable(a.IdentityResult), a.Path, store.Now())
 	return err
+}
+
+// Component roles. A role is acquisition-local: identical bytes can be one job's
+// main file and another job's supplement, so the role cannot live on the shared
+// artifacts row (ADR-0007).
+const (
+	ComponentMain         = "main"
+	ComponentHTMLFullText = "html_fulltext"
+	ComponentSupplement   = "supplement"
+	ComponentAppendix     = "appendix"
+)
+
+// Component is one artifact a job obtained, in the role it was obtained as, with
+// the identity finding THAT acquisition recorded. Identity lives here rather than
+// on the artifact because it is computed against a per-job target: on the shared
+// artifacts row it is last-writer-wins across every job holding the same digest.
+type Component struct {
+	Role           string `json:"role"`
+	SHA256         string `json:"sha256"`
+	CandidateID    int64  `json:"candidate_id,omitempty"`
+	IdentityResult string `json:"identity_result,omitempty"`
+	CreatedAt      string `json:"created_at"`
+}
+
+// AddComponent records a non-main component. The main component is written by
+// the state transition that attaches the artifact, so callers never race it.
+func (js *Store) AddComponent(ctx context.Context, jobID, sha, role string, candidateID int64, identityResult string) error {
+	switch role {
+	case ComponentHTMLFullText, ComponentSupplement, ComponentAppendix:
+	case ComponentMain:
+		return fmt.Errorf("%w: the main component is recorded by the artifact transition", ErrConflict)
+	default:
+		return fmt.Errorf("%w: unknown component role %q", ErrConflict, role)
+	}
+	var candidate any
+	if candidateID != 0 {
+		candidate = candidateID
+	}
+	_, err := js.S.DB().ExecContext(ctx, `
+		INSERT INTO job_artifacts (job_id, artifact_sha256, role, candidate_id, identity_result, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT(job_id, role, artifact_sha256) DO UPDATE SET
+		        candidate_id = excluded.candidate_id,
+		        identity_result = excluded.identity_result`,
+		jobID, sha, role, candidate, nullable(identityResult), store.Now())
+	return err
+}
+
+// Components lists everything one job obtained, main first. An empty result means
+// the job holds no artifact; it never means "unknown".
+func (js *Store) Components(ctx context.Context, jobID string) ([]Component, error) {
+	rows, err := js.S.DB().QueryContext(ctx, `
+		SELECT role, artifact_sha256, COALESCE(candidate_id, 0), COALESCE(identity_result, ''), created_at
+		  FROM job_artifacts WHERE job_id = ?
+		 ORDER BY CASE role WHEN 'main' THEN 0 ELSE 1 END, role, artifact_sha256`, jobID)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var out []Component
+	for rows.Next() {
+		var c Component
+		if err := rows.Scan(&c.Role, &c.SHA256, &c.CandidateID, &c.IdentityResult, &c.CreatedAt); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	return out, rows.Err()
+}
+
+// AcquisitionIdentity returns the identity finding this job's own acquisition of
+// its main component recorded, which is the only per-acquisition identity on
+// record. Falls back to the shared artifact row only when no edge exists, which
+// can only happen for a job whose artifact predates the acquisition edge and was
+// somehow missed by its backfill.
+func (js *Store) AcquisitionIdentity(ctx context.Context, jobID, sha string) (string, error) {
+	var identity sql.NullString
+	err := js.S.DB().QueryRowContext(ctx,
+		`SELECT identity_result FROM job_artifacts WHERE job_id = ? AND artifact_sha256 = ? AND role = 'main'`,
+		jobID, sha).Scan(&identity)
+	if err == nil {
+		return identity.String, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return "", err
+	}
+	artifact, err := js.GetArtifact(ctx, sha)
+	if err != nil || artifact == nil {
+		return "", err
+	}
+	return artifact.IdentityResult, nil
 }
 
 // GetArtifact loads one artifact row by hash.

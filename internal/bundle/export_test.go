@@ -19,6 +19,15 @@ import (
 )
 
 func readyFixture(t *testing.T) (*Exporter, string, string) {
+	return readyFixtureWithIdentity(t, "pass")
+}
+
+// readyFixtureWithIdentity builds a ready job whose acquisition recorded the
+// given identity finding. The identity must be on the artifact BEFORE the ready
+// transition, because that transition is what captures the acquisition edge —
+// which is the whole point: mutating the shared artifact row afterwards must not
+// change what this job's acquisition found.
+func readyFixtureWithIdentity(t *testing.T, identity string) (*Exporter, string, string) {
 	t.Helper()
 	ctx := context.Background()
 	data := t.TempDir()
@@ -70,7 +79,7 @@ func readyFixture(t *testing.T) (*Exporter, string, string) {
 	}
 	if err := jobs.UpsertArtifact(ctx, job.Artifact{
 		SHA256: sha, SizeBytes: int64(len(body)), MIME: "application/pdf", PageCount: 1,
-		TextChars: 1200, IdentityResult: "pass", Path: path,
+		TextChars: 1200, IdentityResult: identity, Path: path,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -243,16 +252,8 @@ func TestConcurrentFailedExportPreservesWinnerFiles(t *testing.T) {
 }
 
 func TestExportPreservesUserConfirmedIdentity(t *testing.T) {
-	exporter, id, sha := readyFixture(t)
+	exporter, id, _ := readyFixtureWithIdentity(t, "user_confirmed")
 	ctx := context.Background()
-	art, err := exporter.Jobs.GetArtifact(ctx, sha)
-	if err != nil || art == nil {
-		t.Fatalf("get artifact: %v", err)
-	}
-	art.IdentityResult = "user_confirmed"
-	if err := exporter.Jobs.UpsertArtifact(ctx, *art); err != nil {
-		t.Fatal(err)
-	}
 
 	path, b, err := exporter.Export(ctx, id, "")
 	if err != nil {
@@ -277,20 +278,38 @@ func TestExportPreservesUserConfirmedIdentity(t *testing.T) {
 func TestExportRefusesUnconfirmedIdentity(t *testing.T) {
 	for _, identity := range []string{"review", "reject"} {
 		t.Run(identity, func(t *testing.T) {
-			exporter, id, sha := readyFixture(t)
-			ctx := context.Background()
-			art, err := exporter.Jobs.GetArtifact(ctx, sha)
-			if err != nil || art == nil {
-				t.Fatalf("get artifact: %v", err)
-			}
-			art.IdentityResult = identity
-			if err := exporter.Jobs.UpsertArtifact(ctx, *art); err != nil {
-				t.Fatal(err)
-			}
-			if _, _, err := exporter.Export(ctx, id, ""); err == nil {
+			exporter, id, _ := readyFixtureWithIdentity(t, identity)
+			if _, _, err := exporter.Export(context.Background(), id, ""); err == nil {
 				t.Fatalf("exported %s identity artifact", identity)
 			}
 		})
+	}
+}
+
+// Identity is computed against a per-job target, so on the shared artifacts row
+// it is last-writer-wins: a later acquisition of the same bytes used to rewrite
+// an earlier job's recorded finding, and with it that job's exported validation
+// block. The acquisition edge makes each job's finding its own (ADR-0007).
+func TestExportIdentityIsNotRewrittenByALaterAcquisition(t *testing.T) {
+	exporter, id, sha := readyFixture(t)
+	ctx := context.Background()
+
+	// A second acquisition of the identical bytes decides the work is wrong.
+	art, err := exporter.Jobs.GetArtifact(ctx, sha)
+	if err != nil || art == nil {
+		t.Fatalf("get artifact: %v", err)
+	}
+	art.IdentityResult = "reject"
+	if err := exporter.Jobs.UpsertArtifact(ctx, *art); err != nil {
+		t.Fatal(err)
+	}
+
+	_, b, err := exporter.Export(ctx, id, "")
+	if err != nil {
+		t.Fatalf("export after another job rewrote the shared artifact identity: %v", err)
+	}
+	if b.Validation.Identity != "pass" {
+		t.Fatalf("bundle validation identity = %q, want the pass THIS acquisition recorded", b.Validation.Identity)
 	}
 }
 

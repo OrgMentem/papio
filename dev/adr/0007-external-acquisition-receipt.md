@@ -146,17 +146,34 @@ Option C.
   the verb (`internal/job/job.go:596-600`). No expiry, no relaxing `Retry`; ADR
   "handoff offers do not hard-expire" stands unchanged.
 - **Multi-component artifacts bind the same way, and are the largest item here —
-  not a store change.** Roles bind to the acquisition *and its candidate*: the
-  same bytes may be `main` in one job and `supplement` in another, so a
-  `(job, artifact, role)` association without a candidate would falsify provenance
-  as soon as components come from different candidates. The premise that resolvers
-  already emit components is **false**: Europe PMC emits an HTML candidate only
-  when no PDF candidate survived (`internal/resolvers/europepmc/europepmc.go:195`),
-  candidates are *alternatives* — the first accepted one transitions the job
-  straight to `ready` (`internal/app/app.go:1017-1024`) — and the artifact store
-  hardcodes `<sha>.pdf` (`internal/artifact/artifact.go:52-65`). Components
-  therefore need resolver semantics, an aggregation state before `ready`, and
-  non-PDF content-addressed storage plus validation before any schema helps.
+  not a store change.** Roles bind to the acquisition: the same bytes may be
+  `main` in one job and `supplement` in another, so neither the role nor the
+  identity finding can live on the shared `artifacts` row. `job_artifacts`
+  (job, artifact, role, candidate, identity) is that edge, and it carries the
+  per-acquisition identity finding as well, because that had exactly the same
+  last-writer-wins defect.
+  **`jobs.artifact_sha256` deliberately remains the main component.** It is read
+  by the frozen `PAPIO_PDF`/`PAPIO_SHA256` hook contract (ADR-0004), by zotio
+  attach, by the retraction sweep, and by bundle export; keeping it authoritative
+  adds the capability without rewriting those paths, and an older binary opening a
+  migrated database still reads a coherent main component.
+  **What is deliberately NOT built:**
+  *(i)* resolver-emitted components. The premise that resolvers already emit them
+  is false — Europe PMC emits an HTML candidate only when no PDF candidate
+  survived, and candidates are *alternatives*: the first accepted one ends the
+  job. Emitting both would need component-aware ranking and an aggregation state
+  before `ready`.
+  *(ii)* `html_fulltext` storage, which is refused with a named error rather than
+  accepted. Raw provider HTML is inherently active content, and the artifact
+  store's integrity model assumes bounded, validated, inert files — the PDF
+  pipeline exists to reject exactly what an HTML page is made of. Admitting it
+  needs a sanitization design, and a role string is not one.
+  So components are populated today through `AdoptComponent`: a human files a
+  supplement or appendix from the job's adoption root, validated by the ordinary
+  payload/structural gates. Identity is **not** asserted for a component — a
+  supplement is usually not the article and carries neither its title nor its DOI,
+  so requiring a match would reject every real supplement and asserting one would
+  be a lie.
   Component roles remain facts; completeness is a judgement and stays with the
   consumer, which accepts `unknown` where papio cannot enumerate.
 
@@ -217,13 +234,15 @@ than in a backlog.
    candidate), `TestLocalCacheCompletesWithoutResolverOrFetch`, and
    `TestExportFallsBackToOriginalAcquisitionForCacheCompletedJob`, which pins the
    fallback so it is not "simplified" away later.
-3. **`identity_result` is last-writer-wins across jobs sharing a digest**
-   (`internal/job` `UpsertArtifact`'s `ON CONFLICT … DO UPDATE`). **OPEN.**
-   Identity is computed against a per-job target, so a later acquisition rewrites
-   an earlier one's finding. Move it to the acquisition edge. Not yet load-bearing:
-   nothing published today reads it as a per-acquisition fact — the receipt would
-   be the first, so this must land before the receipt does, not before the contract
-   is agreed.
+3. **`identity_result` was last-writer-wins across jobs sharing a digest.**
+   **FIXED** — identity now lives on the `job_artifacts` acquisition edge, written
+   inside the same transaction that attaches the artifact, so it captures what
+   *this* job's validation found. Bundle export reads it from there, and the
+   shared `artifacts.identity_result` no longer decides whether a bundle is
+   exportable. Regression: `TestExportIdentityIsNotRewrittenByALaterAcquisition`,
+   which rewrites the shared artifact row to `reject` after the fact and asserts
+   the bundle still reports the `pass` this acquisition recorded — it fails on the
+   old read with the export refused outright.
 
 Items 1 and 2 were live defects in shipped output, independent of any consumer:
 item 2 mis-attributed reuse licences in exported bundles. Both were landed, then

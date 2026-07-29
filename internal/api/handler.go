@@ -100,6 +100,38 @@ type RepairResult struct {
 	State    string `json:"state,omitempty"`
 }
 
+// Receipt answers "what happened to this acquisition, and what exactly did it
+// obtain" for one job. It exists for the states `acquisition-bundle/1` cannot
+// describe — failures, which have no bundle — and deliberately does not restate
+// what a bundle already carries. For a successful job it reports the components
+// and points at the bundle rather than duplicating its candidate/validation
+// blocks, so the two can never disagree (ADR-0007).
+//
+// Every field is a fact papio observed. There is no completeness verdict, no
+// citation match, and no rights permission: those are judgements and belong to
+// the consumer.
+type Receipt struct {
+	JobID     string `json:"job_id"`
+	RequestID string `json:"request_id"`
+	State     string `json:"state"`
+	Terminal  bool   `json:"terminal"`
+	// TerminalReason is a member of the closed job.TerminalReason vocabulary;
+	// a value written by an older binary normalises to "unknown" rather than
+	// leaking free text into a typed field.
+	TerminalReason string `json:"terminal_reason,omitempty"`
+	// Principal is who requested the acquisition: whose entitlement obtained the
+	// bytes. "unknown" is honest, not a placeholder.
+	Principal string `json:"principal"`
+	// AttemptedTiers lists the access bases actually reached, in rank order —
+	// candidates that were only ranked and never tried are excluded.
+	AttemptedTiers []string `json:"attempted_tiers"`
+	// Components is what this job holds, main first. Empty for a failure.
+	Components []job.Component `json:"components"`
+	// BundleAvailable reports that bundle.export can produce the full provenance
+	// record — version, licence, access basis, validation — for this job.
+	BundleAvailable bool `json:"bundle_available"`
+}
+
 // Router returns the complete Phase 1 local RPC surface.
 func Router(system *bootstrap.System) ipc.Router {
 	return RouterWithShutdown(system, nil)
@@ -166,6 +198,12 @@ func RouterWithShutdown(system *bootstrap.System, shutdown context.CancelFunc) i
 		},
 		"jobs.list_v2": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return listJobsV2(ctx, raw, system)
+		},
+		"jobs.receipt": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return jobReceipt(ctx, raw, system)
+		},
+		"jobs.add_component": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return addComponent(ctx, raw, system)
 		},
 		"jobs.repair_awaiting_human": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return repairAwaitingHuman(ctx, raw, system)
@@ -707,6 +745,90 @@ func repairAwaitingHuman(ctx context.Context, raw json.RawMessage, system *boots
 		return failure(err)
 	}
 	return marshal(RepairResult{JobID: params.JobID, Repaired: true, Outcome: "repaired", State: job.StateResolving})
+}
+
+func jobReceipt(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
+	var params struct {
+		JobID string `json:"job_id"`
+	}
+	if err := ipc.DecodeParams(raw, &params); err != nil || strings.TrimSpace(params.JobID) == "" {
+		if err == nil {
+			err = errors.New("job_id is required")
+		}
+		return badParams(err)
+	}
+	row, err := system.Jobs.Get(ctx, params.JobID)
+	if err != nil {
+		return failure(err)
+	}
+	principal, err := system.Jobs.Principal(ctx, params.JobID)
+	if err != nil {
+		return failure(err)
+	}
+	tiers, err := system.Jobs.AttemptedTiers(ctx, params.JobID)
+	if err != nil {
+		return failure(err)
+	}
+	components, err := system.Jobs.Components(ctx, params.JobID)
+	if err != nil {
+		return failure(err)
+	}
+	if components == nil {
+		components = []job.Component{}
+	}
+	if tiers == nil {
+		tiers = []string{}
+	}
+	// An empty reason stays empty: a job that has not ended has no reason, which
+	// is not the same fact as "ended for an unrecognised reason".
+	var reason job.TerminalReason
+	if row.TerminalReason != "" {
+		reason = job.NormalizeTerminalReason(row.TerminalReason)
+	}
+	receipt := Receipt{
+		JobID:           row.ID,
+		RequestID:       row.WorkRequestID,
+		State:           row.State,
+		Terminal:        job.Terminal(row.State),
+		Principal:       string(principal),
+		TerminalReason:  string(reason),
+		AttemptedTiers:  tiers,
+		Components:      components,
+		BundleAvailable: row.State == job.StateReady || row.State == job.StateImported,
+	}
+	return marshal(receipt)
+}
+
+// addComponent files a supplement or appendix beside a job's main artifact. A
+// quotation absent from a main PDF may sit in a supplement, so a consumer that
+// reports "not found" without them would be making an accusation papio's own
+// evidence does not support (ADR-0007).
+func addComponent(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
+	var params struct {
+		JobID string `json:"job_id"`
+		Path  string `json:"path"`
+		Role  string `json:"role"`
+	}
+	if err := ipc.DecodeParams(raw, &params); err != nil {
+		return badParams(err)
+	}
+	if strings.TrimSpace(params.JobID) == "" || strings.TrimSpace(params.Path) == "" || strings.TrimSpace(params.Role) == "" {
+		return badParams(errors.New("job_id, path, and role are required"))
+	}
+	if system == nil || system.App == nil {
+		return nil, &ipc.RPCError{Code: "precondition_failed", Message: "acquisition service is not configured"}
+	}
+	if err := system.App.AdoptComponent(ctx, params.JobID, params.Path, params.Role); err != nil {
+		if errors.Is(err, app.ErrComponentRole) {
+			return badParams(err)
+		}
+		return failure(err)
+	}
+	components, err := system.Jobs.Components(ctx, params.JobID)
+	if err != nil {
+		return failure(err)
+	}
+	return marshal(agentjson.Envelope("components", components, false))
 }
 
 func getJob(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {

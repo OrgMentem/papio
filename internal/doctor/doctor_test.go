@@ -62,7 +62,7 @@ func TestRunReadyProfilePassesWithoutLeakingSecrets(t *testing.T) {
 	}
 	var dbPass bool
 	for _, c := range report.Checks {
-		if c.Name == "database" && c.Status == Pass && strings.Contains(c.Detail, "schema version 15") {
+		if c.Name == "database" && c.Status == Pass && strings.Contains(c.Detail, "schema version 16") {
 			dbPass = true
 		}
 	}

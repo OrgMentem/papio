@@ -99,8 +99,16 @@ func (e *Exporter) Export(ctx context.Context, jobID, destination string) (strin
 	if candidate == nil {
 		return "", nil, fmt.Errorf("artifact %s has no accepted candidate provenance", art.SHA256)
 	}
-	if art.IdentityResult != "pass" && art.IdentityResult != "user_confirmed" {
-		return "", nil, fmt.Errorf("artifact identity is %q, not exportable", art.IdentityResult)
+	// Identity is a per-acquisition finding: artifacts.identity_result is shared
+	// across every job holding the digest and is last-writer-wins, so a later
+	// acquisition would otherwise rewrite this bundle's validation block
+	// (ADR-0007).
+	identity, err := e.Jobs.AcquisitionIdentity(ctx, jobID, art.SHA256)
+	if err != nil {
+		return "", nil, err
+	}
+	if identity != "pass" && identity != "user_confirmed" {
+		return "", nil, fmt.Errorf("artifact identity is %q, not exportable", identity)
 	}
 
 	retrieved := art.CreatedAt
@@ -130,7 +138,7 @@ func (e *Exporter) Export(ctx context.Context, jobID, destination string) (strin
 			SHA256: art.SHA256, SizeBytes: art.SizeBytes, MIME: art.MIME, PageCount: art.PageCount,
 			TextChars: art.TextChars, OCRUsed: art.OCRUsed, Path: filepath.ToSlash(filepath.Join("artifacts", art.SHA256+".pdf")),
 		},
-		Validation:   protocol.BundleValidation{Structural: "pass", Identity: art.IdentityResult},
+		Validation:   protocol.BundleValidation{Structural: "pass", Identity: identity},
 		ZotioItemKey: row.ZotioItemKey,
 	}
 	b.ProvenanceDigest, err = digest(b)

@@ -12,6 +12,21 @@ execution records in `notes/acquisition-stack-plan.md`.
 
 ### Added
 
+- **`jobs.receipt`** reports what happened to one acquisition: its state, its
+  typed terminal reason, who requested it, which access tiers it actually reached,
+  and which components it holds. It exists for the outcomes an acquisition bundle
+  cannot describe — a failed job has no bundle — and deliberately does not restate
+  what a bundle already carries, so the two can never disagree. Successful jobs get
+  `bundle_available: true` and the bundle remains the full provenance record.
+- **A job can now hold supplements and appendices beside its main PDF**
+  (`jobs.add_component`). A quotation missing from a main PDF may simply live in a
+  supplement, so a tool that reports "not in the source" without them is making a
+  claim papio's own evidence does not support. Components are validated by the same
+  payload and structural gates as a main file; identity is not asserted, because a
+  supplement is usually not the article and carries neither its title nor its DOI.
+  `html_fulltext` is refused for now with a clear error: raw provider HTML is
+  inherently active content, and admitting it needs a sanitization design rather
+  than a new role name. No resolver emits components yet.
 - **`jobs.list_v2` and `actions.list_v2`, whose `truncated` is a proof.** The
   existing flag is inferred from a full page, so an exactly-full final page is
   indistinguishable from a partial one — fine for a human raising `--limit`, not
@@ -31,6 +46,12 @@ execution records in `notes/acquisition-stack-plan.md`.
 
 ### Fixed
 
+- **One job's identity check no longer overwrites another's.** Identity is decided
+  against the work *this* job asked for, but it was stored on the shared,
+  content-addressed artifact row, so a second acquisition of identical bytes
+  rewrote the first job's recorded finding — and with it that job's exported
+  validation block. Each acquisition now records its own finding, and bundle
+  export reads that rather than the shared row.
 - **An acquisition no longer inherits another acquisition's licence.** Artifacts
   are content-addressed and shared, so two jobs can hold identical bytes obtained
   under different terms — an open-access mirror and an institutional copy of the

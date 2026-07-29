@@ -1095,3 +1095,79 @@ func TestListV2ReportsTruncationAsAProof(t *testing.T) {
 		}
 	}
 }
+
+// The receipt exists for the states no bundle can describe. It must report a
+// failure's typed reason and the tiers actually reached, and must not claim a
+// bundle is available when none can be produced.
+func TestReceiptDescribesAFailedAcquisition(t *testing.T) {
+	system := testSystem(t)
+	router := Router(system)
+	ctx := context.Background()
+	id, err := system.Jobs.CreateRequest(ctx, "wr_receipt_fail", work.Work{DOI: "10.1000/receipt-fail"},
+		"", "", job.Policy{AccessMode: "conservative", DesiredVersion: "any", FetchMaxBytes: 1 << 20},
+		nil, job.PrincipalMCP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := system.Jobs.InsertCandidates(ctx, id, []job.Candidate{{
+		JobID: id, Source: "unpaywall", URLRedacted: "https://oa.example/p.pdf", URLKey: "oa",
+		Version: "published", AccessBasis: "open_access", ReuseLicense: "unknown", Rank: 0,
+	}, {
+		JobID: id, Source: "browser", URLRedacted: "https://publisher.example/p.pdf", URLKey: "inst",
+		Version: "unknown", AccessBasis: "institutional", ReuseLicense: "unknown", Rank: 1,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	// Only the open-access candidate was actually tried; the institutional one was
+	// ranked and never reached, so the receipt must not claim that tier.
+	tried, _ := system.Jobs.NextPendingCandidate(ctx, id)
+	if err := system.Jobs.MarkCandidate(ctx, tried.ID, job.CandidateInvalid); err != nil {
+		t.Fatal(err)
+	}
+	for _, edge := range [][2]string{{job.StateQueued, job.StateResolving}, {job.StateResolving, job.StateFailed}} {
+		opts := []job.TransitionOpt{}
+		if edge[1] == job.StateFailed {
+			opts = append(opts, job.WithTerminalReason(job.TerminalReasonCandidatesExhausted))
+		}
+		if err := system.Jobs.Transition(ctx, id, edge[0], edge[1], nil, opts...); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var receipt Receipt
+	if rpcErr := callMethod(t, router, "jobs.receipt", map[string]string{"job_id": id}, &receipt); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	if !receipt.Terminal || receipt.State != job.StateFailed {
+		t.Fatalf("receipt state = %q terminal %t, want failed/true", receipt.State, receipt.Terminal)
+	}
+	if receipt.TerminalReason != string(job.TerminalReasonCandidatesExhausted) {
+		t.Fatalf("receipt terminal reason = %q", receipt.TerminalReason)
+	}
+	if receipt.Principal != string(job.PrincipalMCP) {
+		t.Fatalf("receipt principal = %q, want %q", receipt.Principal, job.PrincipalMCP)
+	}
+	if len(receipt.AttemptedTiers) != 1 || receipt.AttemptedTiers[0] != "open_access" {
+		t.Fatalf("attempted tiers = %v, want only open_access — an untried candidate must not count", receipt.AttemptedTiers)
+	}
+	if receipt.BundleAvailable {
+		t.Fatal("receipt claims a bundle is available for a failed acquisition")
+	}
+	if len(receipt.Components) != 0 {
+		t.Fatalf("failed acquisition reported components: %+v", receipt.Components)
+	}
+}
+
+// html_fulltext is refused on purpose: raw provider HTML is inherently active
+// content and the artifact store assumes inert, validated files. A role string
+// is not a sanitization design.
+func TestAddComponentRefusesHTMLFullText(t *testing.T) {
+	system := testSystem(t)
+	router := Router(system)
+	rpcErr := callMethod(t, router, "jobs.add_component", map[string]string{
+		"job_id": "job_whatever", "path": "/tmp/x.html", "role": job.ComponentHTMLFullText,
+	}, nil)
+	if rpcErr == nil || rpcErr.Code != "invalid_argument" {
+		t.Fatalf("add_component html_fulltext = %+v, want invalid_argument", rpcErr)
+	}
+}
