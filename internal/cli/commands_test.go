@@ -242,8 +242,8 @@ func TestActionsOpenFocusesTrackedHandoffWithoutChangingJSONURLs(t *testing.T) {
 		switch method {
 		case "actions.list":
 			*result.(*[]job.HumanAction) = []job.HumanAction{action}
-		case "jobs.list":
-			*result.(*[]job.Row) = []job.Row{row}
+		case "jobs.list_v2":
+			*result.(*api.JobsPage) = api.JobsPage{Jobs: []job.Row{row}}
 		case "actions.open":
 			focusParams = params.(map[string]any)
 			*result.(*api.ActionsOpenResult) = api.ActionsOpenResult{Queued: 1, SessionLive: true}
@@ -429,32 +429,78 @@ func TestJobsFailuresDecodesTheDaemonsSinceField(t *testing.T) {
 	}
 }
 
-// TestJobsListLimitAboveDaemonMaxReportsHonestTruncation pins the
-// truncated-honesty fix: internal/job.Store.List silently resets any --limit
-// outside (0, ListLimitMax] to ListLimitDefault, so comparing the returned
-// row count against the raw --limit flag (as agentjson.Capped used to be
-// called) lies about whether more rows exist.
-func TestJobsListLimitAboveDaemonMaxReportsHonestTruncation(t *testing.T) {
+// TestJobsListReportsProvenTruncation pins the ADR-0007 contract: `truncated`
+// comes from the daemon, which reached one row past the limit to answer it, so a
+// full page is no longer assumed to be truncated. agentjson.Capped could not
+// express the second case — it infers truncation from a full page and so lies
+// about an exactly-full final page.
+func TestJobsListReportsProvenTruncation(t *testing.T) {
+	rows := make([]job.Row, job.ListLimitDefault)
+	for i := range rows {
+		rows[i] = job.Row{ID: fmt.Sprintf("job_%03d", i), State: job.StateQueued}
+	}
+	for _, daemonSaysTruncated := range []bool{true, false} {
+		t.Run(fmt.Sprintf("truncated_%t", daemonSaysTruncated), func(t *testing.T) {
+			var out, errOut bytes.Buffer
+			var gotLimit int
+			root := NewInProcessRoot(&out, &errOut, config.Config{}, func(_ context.Context, method string, params any, result any) error {
+				if method != "jobs.list_v2" {
+					t.Fatalf("method = %q, want jobs.list_v2", method)
+				}
+				gotLimit = params.(map[string]any)["limit"].(int)
+				*result.(*api.JobsPage) = api.JobsPage{Jobs: rows, Truncated: daemonSaysTruncated}
+				return nil
+			})
+			root.SetArgs([]string{"--json", "jobs", "list", "--limit", "5000"})
+			if err := root.ExecuteContext(context.Background()); err != nil {
+				t.Fatalf("jobs list --limit 5000: %v (%s)", err, errOut.String())
+			}
+			if gotLimit != job.ListLimitDefault {
+				t.Fatalf("limit param = %d, want the daemon-effective %d (an out-of-range limit is clamped)", gotLimit, job.ListLimitDefault)
+			}
+			var page struct {
+				Jobs      []job.Row `json:"jobs"`
+				Truncated bool      `json:"truncated"`
+			}
+			if err := json.Unmarshal(out.Bytes(), &page); err != nil {
+				t.Fatal(err)
+			}
+			if page.Truncated != daemonSaysTruncated {
+				t.Fatalf("truncated = %t with a full page of %d rows, want the daemon's proof %t",
+					page.Truncated, len(page.Jobs), daemonSaysTruncated)
+			}
+		})
+	}
+}
+
+// An older daemon predates jobs.list_v2. The CLI must fall back rather than
+// fail, degrading to Capped's "there may be more" — the remedy is the same.
+func TestJobsListFallsBackToV1AgainstOlderDaemon(t *testing.T) {
 	rows := make([]job.Row, job.ListLimitDefault)
 	for i := range rows {
 		rows[i] = job.Row{ID: fmt.Sprintf("job_%03d", i), State: job.StateQueued}
 	}
 	var out, errOut bytes.Buffer
-	var gotLimit int
-	root := NewInProcessRoot(&out, &errOut, config.Config{}, func(_ context.Context, method string, params any, result any) error {
-		if method != "jobs.list" {
-			t.Fatalf("method = %q, want jobs.list", method)
+	var sawV2, sawV1 bool
+	root := NewInProcessRoot(&out, &errOut, config.Config{}, func(_ context.Context, method string, _ any, result any) error {
+		switch method {
+		case "jobs.list_v2":
+			sawV2 = true
+			return &ipc.RemoteError{Code: "unknown_method", Message: "unknown method"}
+		case "jobs.list":
+			sawV1 = true
+			*result.(*[]job.Row) = rows
+			return nil
 		}
-		gotLimit = params.(map[string]any)["limit"].(int)
-		*result.(*[]job.Row) = rows
+		t.Fatalf("unexpected method %q", method)
 		return nil
 	})
-	root.SetArgs([]string{"--json", "jobs", "list", "--limit", "5000"})
+	root.SetArgs([]string{"--json", "jobs", "list"})
 	if err := root.ExecuteContext(context.Background()); err != nil {
-		t.Fatalf("jobs list --limit 5000: %v (%s)", err, errOut.String())
+		t.Fatalf("jobs list: %v (%s)", err, errOut.String())
 	}
-	if gotLimit != job.ListLimitDefault {
-		t.Fatalf("jobs.list limit param = %d, want the daemon-effective %d (Store.List resets any out-of-range limit)", gotLimit, job.ListLimitDefault)
+	if !sawV2 || !sawV1 {
+		t.Fatalf("v2 attempted = %t, v1 fallback used = %t; want both", sawV2, sawV1)
 	}
 	var page struct {
 		Jobs      []job.Row `json:"jobs"`
@@ -463,8 +509,8 @@ func TestJobsListLimitAboveDaemonMaxReportsHonestTruncation(t *testing.T) {
 	if err := json.Unmarshal(out.Bytes(), &page); err != nil {
 		t.Fatal(err)
 	}
-	if !page.Truncated {
-		t.Fatalf("truncated = false with %d rows at the daemon's own default cap %d — an out-of-range --limit must not silently report false completeness", len(page.Jobs), job.ListLimitDefault)
+	if len(page.Jobs) != len(rows) || !page.Truncated {
+		t.Fatalf("fallback page = %d rows truncated %t, want %d and the conservative true", len(page.Jobs), page.Truncated, len(rows))
 	}
 }
 
@@ -487,12 +533,12 @@ func TestActionsOpenFiltersJobsByStateAndFoldsDroppedRowsIntoTruncated(t *testin
 		case "actions.list":
 			*result.(*[]job.HumanAction) = []job.HumanAction{action}
 			return nil
-		case "jobs.list":
+		case "jobs.list_v2":
 			gotJobsListParams = params.(map[string]any)
 			// old_job's action is still "open", but its job row is absent
 			// from this state-filtered page — exactly the omission
 			// actionURLs must now surface via droppedForMissingJob.
-			*result.(*[]job.Row) = nil
+			*result.(*api.JobsPage) = api.JobsPage{}
 			return nil
 		default:
 			t.Fatalf("unexpected method %q", method)
@@ -504,7 +550,7 @@ func TestActionsOpenFiltersJobsByStateAndFoldsDroppedRowsIntoTruncated(t *testin
 		t.Fatalf("actions open --dry-run: %v (%s)", err, errOut.String())
 	}
 	if !reflect.DeepEqual(gotJobsListParams, map[string]any{"state": job.StateAwaitingHuman, "limit": job.ListLimitMax}) {
-		t.Fatalf("jobs.list params = %#v, want state=%q limit=%d", gotJobsListParams, job.StateAwaitingHuman, job.ListLimitMax)
+		t.Fatalf("jobs.list_v2 params = %#v, want state=%q limit=%d", gotJobsListParams, job.StateAwaitingHuman, job.ListLimitMax)
 	}
 	var page struct {
 		URLs      []string `json:"urls"`

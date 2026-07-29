@@ -50,9 +50,7 @@ func createTriageWatch(t *testing.T, watches *watch.Store, query string) *watch.
 
 func createTriageAction(t *testing.T, jobs *job.Store, requestID string) string {
 	t.Helper()
-	id, err := jobs.CreateRequest(context.Background(), requestID,
-		work.Work{DOI: "10.1000/" + requestID, Title: "Review work"}, "", "",
-		job.Policy{AccessMode: "conservative", DesiredVersion: "any", Resolver: "fixture", FetchMaxBytes: 1 << 20}, nil)
+	id, err := jobs.CreateRequest(context.Background(), requestID, work.Work{DOI: "10.1000/" + requestID, Title: "Review work"}, "", "", job.Policy{AccessMode: "conservative", DesiredVersion: "any", Resolver: "fixture", FetchMaxBytes: 1 << 20}, nil, job.PrincipalUnknown)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,9 +141,7 @@ func TestHumanActionItemsCarryWorkIdentityAndCorrectOps(t *testing.T) {
 
 	bound := createTriageAction(t, jobs, "wr_action_bound")
 
-	unbound, err := jobs.CreateRequest(ctx, "wr_action_unbound",
-		work.Work{DOI: "10.1000/wr_action_unbound", Title: "Unbound review work"}, "", "",
-		job.Policy{AccessMode: "conservative", DesiredVersion: "any", Resolver: "fixture", FetchMaxBytes: 1 << 20}, nil)
+	unbound, err := jobs.CreateRequest(ctx, "wr_action_unbound", work.Work{DOI: "10.1000/wr_action_unbound", Title: "Unbound review work"}, "", "", job.Policy{AccessMode: "conservative", DesiredVersion: "any", Resolver: "fixture", FetchMaxBytes: 1 << 20}, nil, job.PrincipalUnknown)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -156,9 +152,7 @@ func TestHumanActionItemsCarryWorkIdentityAndCorrectOps(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	manual, err := jobs.CreateRequest(ctx, "wr_action_manual",
-		work.Work{DOI: "10.1000/wr_action_manual", Title: "Manual download work"}, "", "",
-		job.Policy{AccessMode: "conservative", DesiredVersion: "any", Resolver: "fixture", FetchMaxBytes: 1 << 20}, nil)
+	manual, err := jobs.CreateRequest(ctx, "wr_action_manual", work.Work{DOI: "10.1000/wr_action_manual", Title: "Manual download work"}, "", "", job.Policy{AccessMode: "conservative", DesiredVersion: "any", Resolver: "fixture", FetchMaxBytes: 1 << 20}, nil, job.PrincipalUnknown)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -266,14 +260,14 @@ func TestSnapshotCursorPaginationAndCounts(t *testing.T) {
 	if _, err := watches.RecordDigest(context.Background(), watched.ID, now, entries); err != nil {
 		t.Fatal(err)
 	}
-	working, err := jobs.CreateRequest(context.Background(), "wr_triage_working", work.Work{DOI: "10.1000/working", Title: "Working"}, "", "", job.Policy{AccessMode: "conservative", DesiredVersion: "any", Resolver: "fixture", FetchMaxBytes: 1 << 20}, nil)
+	working, err := jobs.CreateRequest(context.Background(), "wr_triage_working", work.Work{DOI: "10.1000/working", Title: "Working"}, "", "", job.Policy{AccessMode: "conservative", DesiredVersion: "any", Resolver: "fixture", FetchMaxBytes: 1 << 20}, nil, job.PrincipalUnknown)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := jobs.Transition(context.Background(), working, job.StateQueued, job.StateResolving, nil); err != nil {
 		t.Fatal(err)
 	}
-	failed, err := jobs.CreateRequest(context.Background(), "wr_triage_failed", work.Work{DOI: "10.1000/failed", Title: "Failed"}, "", "", job.Policy{AccessMode: "conservative", DesiredVersion: "any", Resolver: "fixture", FetchMaxBytes: 1 << 20}, nil)
+	failed, err := jobs.CreateRequest(context.Background(), "wr_triage_failed", work.Work{DOI: "10.1000/failed", Title: "Failed"}, "", "", job.Policy{AccessMode: "conservative", DesiredVersion: "any", Resolver: "fixture", FetchMaxBytes: 1 << 20}, nil, job.PrincipalUnknown)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -311,9 +305,7 @@ func TestSnapshotCursorPaginationAndCounts(t *testing.T) {
 func createStatsJob(t *testing.T, jobs *job.Store, requestID, targetState string) string {
 	t.Helper()
 	ctx := context.Background()
-	id, err := jobs.CreateRequest(ctx, requestID,
-		work.Work{DOI: "10.1000/" + requestID, Title: "Stats work"}, "", "",
-		job.Policy{AccessMode: "conservative", DesiredVersion: "any", Resolver: "fixture", FetchMaxBytes: 1 << 20}, nil)
+	id, err := jobs.CreateRequest(ctx, requestID, work.Work{DOI: "10.1000/" + requestID, Title: "Stats work"}, "", "", job.Policy{AccessMode: "conservative", DesiredVersion: "any", Resolver: "fixture", FetchMaxBytes: 1 << 20}, nil, job.PrincipalUnknown)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -351,9 +343,7 @@ func createStatsJob(t *testing.T, jobs *job.Store, requestID, targetState string
 func createHandoffAcquiredJob(t *testing.T, jobs *job.Store, requestID string) string {
 	t.Helper()
 	ctx := context.Background()
-	id, err := jobs.CreateRequest(ctx, requestID,
-		work.Work{DOI: "10.1000/" + requestID, Title: "Stats handoff work"}, "", "",
-		job.Policy{AccessMode: "conservative", DesiredVersion: "any", Resolver: "fixture", FetchMaxBytes: 1 << 20}, nil)
+	id, err := jobs.CreateRequest(ctx, requestID, work.Work{DOI: "10.1000/" + requestID, Title: "Stats handoff work"}, "", "", job.Policy{AccessMode: "conservative", DesiredVersion: "any", Resolver: "fixture", FetchMaxBytes: 1 << 20}, nil, job.PrincipalUnknown)
 	if err != nil {
 		t.Fatal(err)
 	}

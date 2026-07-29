@@ -567,7 +567,7 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 		if err := b.resolveHandoff(ctx, msg.JobID, "cancelled"); err != nil {
 			return nil, err
 		}
-		return nil, b.leaveHandoff(ctx, msg.JobID, job.StateUnavailable, "browser_rejected")
+		return nil, b.leaveHandoff(ctx, msg.JobID, job.StateUnavailable, string(job.TerminalReasonBrowserRejected))
 
 	case protocol.MsgAuthPending, protocol.MsgAuthReturned:
 		return nil, b.recordAuth(ctx, msg)
@@ -608,7 +608,7 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 			return nil, err
 		}
 		b.cancelSent[msg.JobID] = true // we initiated nothing to echo back
-		return nil, b.jobs.Cancel(ctx, msg.JobID, "browser_cancelled")
+		return nil, b.jobs.Cancel(ctx, msg.JobID, job.TerminalReasonBrowserCancelled)
 
 	case protocol.MsgError:
 		// Only the normalized code is durable; the free-text message is
@@ -1144,7 +1144,10 @@ func (b *Bridge) pageAcquire(ctx context.Context, payload *protocol.PageAcquireP
 		}
 		return []json.RawMessage{ack}, nil
 	}
-	jobID, err := b.svc.Submit(ctx, request)
+	// The browser session ID is in-memory transport state, not durable user
+	// identity. Persist the explicit unknown principal until a durable,
+	// non-secret multi-user identity is available at this boundary.
+	jobID, err := b.svc.SubmitAs(ctx, job.PrincipalUnknown, request)
 	if err != nil {
 		return b.pageAcquireError(err)
 	}
@@ -1421,7 +1424,7 @@ func (b *Bridge) outcome(ctx context.Context, jobID string, p *protocol.Provider
 			return err
 		}
 		b.cancelSent[jobID] = true
-		return b.jobs.Cancel(ctx, jobID, "browser_cancelled")
+		return b.jobs.Cancel(ctx, jobID, job.TerminalReasonBrowserCancelled)
 
 	case "no_entitlement", "document_delivery_available":
 		requeued, err := b.institutionalRouteRequeued(ctx, jobID)
@@ -1500,7 +1503,7 @@ func (b *Bridge) outcome(ctx context.Context, jobID string, p *protocol.Provider
 			if err := b.resolveHandoff(ctx, jobID, "resolved"); err != nil {
 				return err
 			}
-			return b.leaveHandoff(ctx, jobID, job.StateUnavailable, "no_identifier")
+			return b.leaveHandoff(ctx, jobID, job.StateUnavailable, string(job.TerminalReasonNoIdentifier))
 		}
 		// Still legitimately in progress: keep the job parked and add the
 		// specific human action the extension observed.
@@ -1546,7 +1549,9 @@ func (b *Bridge) leaveHandoff(ctx context.Context, jobID, to, reason string) err
 	var opts []job.TransitionOpt
 	switch to {
 	case job.StateUnavailable:
-		opts = append(opts, job.WithTerminalReason(reason))
+		// Provider outcomes are dynamic; classify at this boundary while the
+		// original observation remains in the transition detail.
+		opts = append(opts, job.WithTerminalReason(job.NormalizeTerminalReason(reason)))
 	case job.StateRetryWait:
 		opts = append(opts, job.WithRetryAt(b.now().Add(b.actionExpiry())))
 	}
@@ -1967,7 +1972,7 @@ func (b *Bridge) fallbackOAHandoff(ctx context.Context, jobID, failure string) (
 			if err := b.resolveHandoff(ctx, jobID, "resolved"); err != nil {
 				return false, err
 			}
-			if err := b.leaveHandoff(ctx, jobID, job.StateUnavailable, "no_identifier"); err != nil {
+			if err := b.leaveHandoff(ctx, jobID, job.StateUnavailable, string(job.TerminalReasonNoIdentifier)); err != nil {
 				return false, err
 			}
 			return true, nil

@@ -131,7 +131,13 @@ func New(cfg config.Config, jobs *job.Store, artifacts *artifact.Store, budgets 
 // reusing its durable job. Config access_mode is always required; an optional
 // request override is then snapshotted explicitly.
 func (s *Service) Submit(ctx context.Context, wr protocol.WorkRequest) (string, error) {
-	result, err := s.SubmitWithOptions(ctx, wr, SubmitOptions{})
+	return s.SubmitAs(ctx, job.PrincipalUnknown, wr)
+}
+
+// SubmitAs creates or reuses a durable job while recording the principal whose
+// entitlement initiated the acquisition.
+func (s *Service) SubmitAs(ctx context.Context, principal job.Principal, wr protocol.WorkRequest) (string, error) {
+	result, err := s.SubmitWithOptionsAs(ctx, principal, wr, SubmitOptions{})
 	if err != nil {
 		return "", err
 	}
@@ -141,7 +147,7 @@ func (s *Service) Submit(ctx context.Context, wr protocol.WorkRequest) (string, 
 // SubmitWithAutoImport behaves like Submit while applying an optional per-job
 // auto-import override. A nil override preserves the config default.
 func (s *Service) SubmitWithAutoImport(ctx context.Context, wr protocol.WorkRequest, autoImport *bool) (string, error) {
-	result, err := s.SubmitWithOptions(ctx, wr, SubmitOptions{AutoImport: autoImport})
+	result, err := s.SubmitWithOptionsAs(ctx, job.PrincipalUnknown, wr, SubmitOptions{AutoImport: autoImport})
 	if err != nil {
 		return "", err
 	}
@@ -151,6 +157,11 @@ func (s *Service) SubmitWithAutoImport(ctx context.Context, wr protocol.WorkRequ
 // SubmitWithOptions returns Existing when an in-flight job already owns the
 // canonical work. Force deliberately creates a fresh request instead.
 func (s *Service) SubmitWithOptions(ctx context.Context, wr protocol.WorkRequest, options SubmitOptions) (SubmitResult, error) {
+	return s.SubmitWithOptionsAs(ctx, job.PrincipalUnknown, wr, options)
+}
+
+// SubmitWithOptionsAs is SubmitWithOptions with explicit durable provenance.
+func (s *Service) SubmitWithOptionsAs(ctx context.Context, principal job.Principal, wr protocol.WorkRequest, options SubmitOptions) (SubmitResult, error) {
 	if err := wr.Validate(); err != nil {
 		return SubmitResult{}, err
 	}
@@ -191,7 +202,7 @@ func (s *Service) SubmitWithOptions(ctx context.Context, wr protocol.WorkRequest
 		AutoImport:    auto,
 		Collection:    strings.TrimSpace(wr.Collection),
 	}
-	created, err := s.Jobs.CreateRequestForWork(ctx, wr.RequestID, w, wr.ZotioItemKey, wr.Collection, pol, raw, options.Force)
+	created, err := s.Jobs.CreateRequestForWork(ctx, wr.RequestID, w, wr.ZotioItemKey, wr.Collection, pol, raw, principal, options.Force)
 	if err != nil {
 		return SubmitResult{}, err
 	}
@@ -291,13 +302,23 @@ func (s *Service) Process(ctx context.Context, row *job.Row) error {
 
 	// Resolver order step 1: verified local content-addressed cache.
 	if row.Work.DOI != "" {
-		cached, err := s.Jobs.FindArtifactByDOI(ctx, row.Work.DOI)
+		cached, source, err := s.Jobs.FindArtifactByDOI(ctx, row.Work.DOI)
 		if err != nil {
 			return err
 		}
 		if cached != nil && s.Artifacts.Verify(cached.SHA256) == nil {
-			if err := s.Jobs.Transition(ctx, row.ID, job.StateResolving, job.StateReady,
-				map[string]any{"source": "cache", "sha256": cached.SHA256}, job.WithArtifact(cached.SHA256)); err != nil {
+			// Carry the source acquisition's candidate: these bytes are its
+			// bytes, so its licence and access basis are the honest provenance
+			// of this job's artifact. Recording it also replaces any stale
+			// selection this job carried in from a rejected earlier attempt,
+			// which a bare WithArtifact transition would preserve (ADR-0007).
+			detail := map[string]any{"source": "cache", "sha256": cached.SHA256}
+			opts := []job.TransitionOpt{job.WithArtifact(cached.SHA256)}
+			if source != nil {
+				detail["provenance_candidate_id"] = source.ID
+				opts = append(opts, job.WithCandidate(source.ID))
+			}
+			if err := s.Jobs.Transition(ctx, row.ID, job.StateResolving, job.StateReady, detail, opts...); err != nil {
 				return err
 			}
 			s.autoImportReady(ctx, row)
@@ -313,12 +334,12 @@ func (s *Service) Process(ctx context.Context, row *job.Row) error {
 	if len(live) == 0 {
 		if !retryAt.IsZero() {
 			if s.retryBudgetExhausted(ctx, row.ID) {
-				return s.exhaustedCandidates(ctx, row, job.StateResolving, "retry_budget_exhausted", "temporary source failures did not clear", "")
+				return s.exhaustedCandidates(ctx, row, job.StateResolving, "retry_budget_exhausted", job.TerminalReasonTemporarySourceFailuresDidNotClear, "")
 			}
 			return s.Jobs.Transition(ctx, row.ID, job.StateResolving, job.StateRetryWait,
 				map[string]any{"reason": "resolver_temporarily_unavailable"}, job.WithRetryAt(retryAt))
 		}
-		return s.exhaustedCandidates(ctx, row, job.StateResolving, "no_legal_candidates", "no legal candidates", "")
+		return s.exhaustedCandidates(ctx, row, job.StateResolving, "no_legal_candidates", job.TerminalReasonNoLegalCandidates, "")
 	}
 
 	if err := s.Jobs.Transition(ctx, row.ID, job.StateResolving, job.StateFetching,
@@ -349,6 +370,16 @@ func (s *Service) reuseAcceptedReview(ctx context.Context, row *job.Row) (bool, 
 	stored, err := s.Jobs.GetCandidate(ctx, binding.CandidateID)
 	if err != nil {
 		return false, err
+	}
+	// A browser-adopted candidate accepted before papio stopped synthesizing
+	// versions still carries that claim: the human confirmed the bytes are the
+	// right work, never which version they are (ADR-0007). Resolver candidates
+	// keep their version — theirs came from the source, not from a guess.
+	if stored.Source == "browser" && stored.Version != resolver.VersionUnknown {
+		if err := s.Jobs.MarkCandidateVersionUnobserved(ctx, stored.ID); err != nil {
+			return false, err
+		}
+		stored.Version = resolver.VersionUnknown
 	}
 	if err := s.Jobs.Transition(ctx, row.ID, job.StateFetching, job.StateValidating,
 		map[string]any{"reason": "review_accepted_reuse", "candidate_id": stored.ID, "source": stored.Source},
@@ -798,12 +829,12 @@ func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[st
 	}
 	if !retryAt.IsZero() {
 		if s.retryBudgetExhausted(ctx, row.ID) {
-			return s.exhaustedCandidates(ctx, row, job.StateFetching, "retry_budget_exhausted", "temporary candidate failures did not clear", oaBrowserURL)
+			return s.exhaustedCandidates(ctx, row, job.StateFetching, "retry_budget_exhausted", job.TerminalReasonTemporaryCandidateFailuresDidNotClear, oaBrowserURL)
 		}
 		return s.Jobs.Transition(ctx, row.ID, job.StateFetching, job.StateRetryWait,
 			map[string]any{"reason": "candidate_temporarily_unavailable"}, job.WithRetryAt(retryAt))
 	}
-	return s.exhaustedCandidates(ctx, row, job.StateFetching, "candidates_exhausted", "all candidates exhausted", oaBrowserURL)
+	return s.exhaustedCandidates(ctx, row, job.StateFetching, "candidates_exhausted", job.TerminalReasonCandidatesExhausted, oaBrowserURL)
 }
 
 func (s *Service) park(ctx context.Context, jobID, from, to string, detail map[string]any, opts ...job.TransitionOpt) error {
@@ -872,7 +903,7 @@ func (s *Service) institutionalRouteExhausted(ctx context.Context, jobID string)
 // the bridge as no_identifier rather than becoming an institutional handoff.
 // The action detail carries the live OA URL solely for the browser bridge; it
 // is never copied into job events or protocol metadata.
-func (s *Service) exhaustedCandidates(ctx context.Context, row *job.Row, from, reason, terminal, oaBrowserURL string) error {
+func (s *Service) exhaustedCandidates(ctx context.Context, row *job.Row, from, reason string, terminal job.TerminalReason, oaBrowserURL string) error {
 	mode := s.Config.AccessMode
 	switch mode {
 	case config.ModeAssisted, config.ModeDelegated:
@@ -893,7 +924,7 @@ func (s *Service) exhaustedCandidates(ctx context.Context, row *job.Row, from, r
 		// SSO round trip, parks forever, and (since human actions are now
 		// re-notified on a schedule) nags them about impossible work.
 		case !row.Work.HasFetchableIdentifier():
-			reason, terminal = "no_identifier", "no_identifier"
+			reason, terminal = "no_identifier", job.TerminalReasonNoIdentifier
 		case hasBase && base != "" && !institutionalExhausted:
 			if _, err := s.Jobs.OpenHumanAction(ctx, row.ID, "openurl_handoff", InstitutionalOpenURLHandoffDetail, job.WithAccessClassification(true, "paywall")); err != nil {
 				return err
@@ -901,7 +932,7 @@ func (s *Service) exhaustedCandidates(ctx context.Context, row *job.Row, from, r
 			return s.park(ctx, row.ID, from, job.StateAwaitingHuman,
 				map[string]any{"reason": "institutional_handoff"})
 		case institutionalExhausted:
-			terminal = "no_entitlement"
+			terminal = job.TerminalReasonNoEntitlement
 		}
 	case config.ModeConservative:
 		// Same gate: an OpenURL built from a bare title is not worth surfacing.
@@ -912,7 +943,7 @@ func (s *Service) exhaustedCandidates(ctx context.Context, row *job.Row, from, r
 			}
 		}
 		if !row.Work.HasFetchableIdentifier() {
-			reason, terminal = "no_identifier", "no_identifier"
+			reason, terminal = "no_identifier", job.TerminalReasonNoIdentifier
 		}
 	}
 	return s.Jobs.Transition(ctx, row.ID, from, job.StateUnavailable,

@@ -346,7 +346,7 @@ func seedResourceJobs(t *testing.T, system *bootstrap.System, count int) {
 	for i := range count {
 		if _, err := system.Jobs.CreateRequest(ctx, fmt.Sprintf("resource-job-%03d", i), work.Work{
 			DOI: fmt.Sprintf("10.1000/resource-job-%03d", i),
-		}, "", "", policy, nil); err != nil {
+		}, "", "", policy, nil, job.PrincipalUnknown); err != nil {
 			t.Fatal(err)
 		}
 	}

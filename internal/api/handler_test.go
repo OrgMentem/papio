@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"net/http/httptest"
@@ -238,7 +239,7 @@ func TestRouterSubmitEnvelopeAutoImportOverride(t *testing.T) {
 func TestRouterRetryAndStrictEmptyParams(t *testing.T) {
 	system := testSystem(t)
 	ctx := context.Background()
-	id, err := system.Jobs.CreateRequest(ctx, "request_api_retry", work.Work{DOI: "10.1000/retry"}, "", "", job.Policy{AccessMode: config.ModeConservative, DesiredVersion: "any"}, nil)
+	id, err := system.Jobs.CreateRequest(ctx, "request_api_retry", work.Work{DOI: "10.1000/retry"}, "", "", job.Policy{AccessMode: config.ModeConservative, DesiredVersion: "any"}, nil, job.PrincipalUnknown)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -543,7 +544,7 @@ func TestRouterActionsOpenQueuesCompatibleHandoff(t *testing.T) {
 	t.Cleanup(func() { _ = system.Close() })
 	id, err := system.Jobs.CreateRequest(ctx, "request_api_focus", work.Work{DOI: "10.1000/focus"}, "", "", job.Policy{
 		AccessMode: config.ModeDelegated, DesiredVersion: "any",
-	}, nil)
+	}, nil, job.PrincipalUnknown)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -659,7 +660,7 @@ func TestRouterResolveIdentityReviewAction(t *testing.T) {
 	ctx := context.Background()
 	id, err := system.Jobs.CreateRequest(ctx, "request_api_review", work.Work{DOI: "10.1000/review"}, "", "", job.Policy{
 		AccessMode: config.ModeConservative, DesiredVersion: "any",
-	}, nil)
+	}, nil, job.PrincipalUnknown)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -731,7 +732,7 @@ func TestRouterAcquireReportJoinsManifestAgainstLiveJobState(t *testing.T) {
 	ctx := context.Background()
 	id, err := system.Jobs.CreateRequest(ctx, "batch-dededededededededededededededede-11111111111111111111111111111111", work.Work{DOI: "10.1000/report"}, "", "Reading", job.Policy{
 		AccessMode: config.ModeConservative, DesiredVersion: "any", Collection: "Reading",
-	}, nil)
+	}, nil, job.PrincipalUnknown)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -977,5 +978,120 @@ func TestDiscoverySearchLogsPerSourceOnPartialFailure(t *testing.T) {
 	}
 	if strings.Contains(output, "warning: discovery backend openalex") {
 		t.Fatalf("partial failure logged the healthy backend as failed too: %s", output)
+	}
+}
+
+// jobs.repair_awaiting_human is the ONLY way a consumer can move an orphaned
+// parked job (jobs.retry refuses parked jobs; actions.open needs an open handoff
+// action). It must stay orphan-only: a job that still has an open action is
+// reported, never repaired, because the verb takes no action ids and so cannot
+// have read what it would be closing.
+func TestRepairAwaitingHumanIsOrphanOnly(t *testing.T) {
+	system := testSystem(t)
+	router := Router(system)
+	ctx := context.Background()
+
+	park := func(t *testing.T, requestID string) string {
+		t.Helper()
+		id, err := system.Jobs.CreateRequest(ctx, requestID, work.Work{DOI: "10.1000/" + requestID},
+			"", "", job.Policy{AccessMode: "conservative", DesiredVersion: "any", FetchMaxBytes: 1 << 20},
+			nil, job.PrincipalCLI)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, edge := range [][2]string{
+			{job.StateQueued, job.StateResolving},
+			{job.StateResolving, job.StateAwaitingHuman},
+		} {
+			if err := system.Jobs.Transition(ctx, id, edge[0], edge[1], nil); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return id
+	}
+
+	orphan := park(t, "repair_orphan")
+	var result RepairResult
+	if rpcErr := callMethod(t, router, "jobs.repair_awaiting_human", map[string]string{"job_id": orphan}, &result); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	if !result.Repaired || result.Outcome != "repaired" || result.State != job.StateResolving {
+		t.Fatalf("orphan repair = %+v, want repaired to resolving", result)
+	}
+	row, err := system.Jobs.Get(ctx, orphan)
+	if err != nil || row.State != job.StateResolving {
+		t.Fatalf("orphan job = %+v, %v; want resolving", row, err)
+	}
+
+	withAction := park(t, "repair_with_action")
+	if _, err := system.Jobs.OpenHumanAction(ctx, withAction, "openurl_handoff", "institutional handoff"); err != nil {
+		t.Fatal(err)
+	}
+	result = RepairResult{}
+	if rpcErr := callMethod(t, router, "jobs.repair_awaiting_human", map[string]string{"job_id": withAction}, &result); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	if result.Repaired || result.Outcome != "has_open_actions" {
+		t.Fatalf("repair with an open action = %+v, want has_open_actions and no repair", result)
+	}
+	if row, err := system.Jobs.Get(ctx, withAction); err != nil || row.State != job.StateAwaitingHuman {
+		t.Fatalf("job with an open action was disturbed: %+v, %v", row, err)
+	}
+
+	// A job that is not parked at all is reported, not errored: a consumer
+	// reconciling a cohort should not have to distinguish "already moved on"
+	// from a genuine failure.
+	result = RepairResult{}
+	if rpcErr := callMethod(t, router, "jobs.repair_awaiting_human", map[string]string{"job_id": orphan}, &result); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	if result.Repaired || result.Outcome != "not_parked" {
+		t.Fatalf("repair of an unparked job = %+v, want not_parked", result)
+	}
+}
+
+// The _v2 list methods exist for one reason: `truncated` must be a proof. A page
+// that exactly fills the limit with nothing behind it reports false.
+func TestListV2ReportsTruncationAsAProof(t *testing.T) {
+	system := testSystem(t)
+	router := Router(system)
+	ctx := context.Background()
+	for i := range 3 {
+		id, err := system.Jobs.CreateRequest(ctx, fmt.Sprintf("wr_page_%02d", i),
+			work.Work{DOI: fmt.Sprintf("10.1000/page-%02d", i)}, "", "",
+			job.Policy{AccessMode: "conservative", DesiredVersion: "any", FetchMaxBytes: 1 << 20},
+			nil, job.PrincipalCLI)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := system.Jobs.OpenHumanAction(ctx, id, "openurl_handoff", "handoff"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, tc := range []struct {
+		limit         int
+		wantJobs      int
+		wantTruncated bool
+	}{
+		{limit: 2, wantJobs: 2, wantTruncated: true},
+		{limit: 3, wantJobs: 3, wantTruncated: false},
+		{limit: 4, wantJobs: 3, wantTruncated: false},
+	} {
+		var jobsPage JobsPage
+		if rpcErr := callMethod(t, router, "jobs.list_v2", map[string]any{"limit": tc.limit}, &jobsPage); rpcErr != nil {
+			t.Fatal(rpcErr)
+		}
+		if len(jobsPage.Jobs) != tc.wantJobs || jobsPage.Truncated != tc.wantTruncated {
+			t.Fatalf("jobs.list_v2 limit %d = %d rows truncated %t, want %d/%t",
+				tc.limit, len(jobsPage.Jobs), jobsPage.Truncated, tc.wantJobs, tc.wantTruncated)
+		}
+		var actionsPage ActionsPage
+		if rpcErr := callMethod(t, router, "actions.list_v2", map[string]any{"limit": tc.limit}, &actionsPage); rpcErr != nil {
+			t.Fatal(rpcErr)
+		}
+		if len(actionsPage.Actions) != tc.wantJobs || actionsPage.Truncated != tc.wantTruncated {
+			t.Fatalf("actions.list_v2 limit %d = %d rows truncated %t, want %d/%t",
+				tc.limit, len(actionsPage.Actions), actionsPage.Truncated, tc.wantJobs, tc.wantTruncated)
+		}
 	}
 }

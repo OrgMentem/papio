@@ -38,6 +38,52 @@ type jobsFailuresResult struct {
 	Since    string             `json:"since,omitempty"`
 }
 
+// listJobsPage and listActionsPage prefer the _v2 methods, whose `truncated` is
+// a proof: the daemon reached one row past the limit to answer it. An older
+// daemon that predates them answers unknown_method, and the v1 fallback's flag
+// degrades to agentjson.Capped's "there may be more" — same remedy either way
+// (raise --limit), so the fallback is honest rather than absent. Same shape as
+// the acquire.submit_v2 fallback in acquire.go.
+func listJobsPage(ctx context.Context, opt *options, params map[string]any, effective int) ([]job.Row, bool, error) {
+	var page api.JobsPage
+	err := opt.call(ctx, "jobs.list_v2", params, &page)
+	if err == nil {
+		return page.Jobs, page.Truncated, nil
+	}
+	if !isUnknownMethod(err) {
+		return nil, false, err
+	}
+	var rows []job.Row
+	if err := opt.call(ctx, "jobs.list", params, &rows); err != nil {
+		return nil, false, err
+	}
+	capped, truncated := agentjson.Capped(rows, effective)
+	return capped, truncated, nil
+}
+
+func listActionsPage(ctx context.Context, opt *options, openOnly bool, limit int) ([]job.HumanAction, bool, error) {
+	var page api.ActionsPage
+	err := opt.call(ctx, "actions.list_v2", map[string]any{"open_only": openOnly, "limit": limit}, &page)
+	if err == nil {
+		return page.Actions, page.Truncated, nil
+	}
+	if !isUnknownMethod(err) {
+		return nil, false, err
+	}
+	// actions.list is unbounded, so an older daemon returns the complete set and
+	// there is nothing to be truncated against.
+	var actions []job.HumanAction
+	if err := opt.call(ctx, "actions.list", map[string]bool{"open_only": openOnly}, &actions); err != nil {
+		return nil, false, err
+	}
+	return actions, false, nil
+}
+
+func isUnknownMethod(err error) bool {
+	var remote *ipc.RemoteError
+	return errors.As(err, &remote) && remote.Code == "unknown_method"
+}
+
 func newJobsCommand(opt *options) *cobra.Command {
 	command := &cobra.Command{Use: "jobs", Short: "Inspect and control acquisition jobs"}
 	var state string
@@ -49,13 +95,12 @@ func newJobsCommand(opt *options) *cobra.Command {
 		Args:        cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			effective := effectiveLimit(limit, job.ListLimitMax, job.ListLimitDefault)
-			var rows []job.Row
-			if err := opt.call(cmd.Context(), "jobs.list", map[string]any{"state": state, "limit": effective}, &rows); err != nil {
+			rows, truncated, err := listJobsPage(cmd.Context(), opt, map[string]any{"state": state, "limit": effective}, effective)
+			if err != nil {
 				return err
 			}
 			if opt.jsonOutput {
-				capped, truncated := agentjson.Capped(rows, effective)
-				return printPage(opt, "jobs", capped, truncated)
+				return printPage(opt, "jobs", rows, truncated)
 			}
 			for _, row := range rows {
 				if _, err := fmt.Fprintf(opt.out, "%s\t%s\t%s\n", row.ID, row.State, row.Work.Describe()); err != nil {
@@ -164,6 +209,7 @@ func newJobsCommand(opt *options) *cobra.Command {
 func newActionsCommand(opt *options) *cobra.Command {
 	command := &cobra.Command{Use: "actions", Short: "Inspect required human actions"}
 	var all bool
+	var actionsLimit int
 	list := &cobra.Command{
 		Use:         "list",
 		Short:       "List open human actions",
@@ -171,12 +217,13 @@ func newActionsCommand(opt *options) *cobra.Command {
 		Args:        cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			openOnly := !all
-			var actions []job.HumanAction
-			if err := opt.call(cmd.Context(), "actions.list", map[string]bool{"open_only": openOnly}, &actions); err != nil {
+			effective := effectiveLimit(actionsLimit, job.ListLimitMax, job.ListLimitDefault)
+			actions, truncated, err := listActionsPage(cmd.Context(), opt, openOnly, effective)
+			if err != nil {
 				return err
 			}
 			if opt.jsonOutput {
-				return printPage(opt, "actions", actions, false)
+				return printPage(opt, "actions", actions, truncated)
 			}
 			for _, action := range actions {
 				if _, err := fmt.Fprintf(opt.out, "%d\t%s\t%s\t%s%s\n", action.ID, action.JobID, action.Kind, action.Status, accessHint(action)); err != nil {
@@ -187,6 +234,7 @@ func newActionsCommand(opt *options) *cobra.Command {
 		},
 	}
 	list.Flags().BoolVar(&all, "all", false, "include resolved actions")
+	list.Flags().IntVar(&actionsLimit, "limit", job.ListLimitDefault, "maximum rows (1-500)")
 
 	var accept, reject bool
 	resolve := &cobra.Command{
@@ -233,8 +281,9 @@ func newActionsCommand(opt *options) *cobra.Command {
 			if err := opt.call(cmd.Context(), "actions.list", map[string]bool{"open_only": true}, &actions); err != nil {
 				return err
 			}
-			var rows []job.Row
-			if err := opt.call(cmd.Context(), "jobs.list", map[string]any{"state": job.StateAwaitingHuman, "limit": job.ListLimitMax}, &rows); err != nil {
+			rows, rowsTruncated, err := listJobsPage(cmd.Context(), opt,
+				map[string]any{"state": job.StateAwaitingHuman, "limit": job.ListLimitMax}, job.ListLimitMax)
+			if err != nil {
 				return err
 			}
 			targets, droppedForMissingJob := actionHandoffTargets(actions, rows, cfg.OpenURLBaseFor, limit)
@@ -250,7 +299,7 @@ func newActionsCommand(opt *options) *cobra.Command {
 				}
 			}
 			urls, urlsTruncated := agentjson.Capped(urls, limit)
-			truncated := urlsTruncated || droppedForMissingJob > 0
+			truncated := urlsTruncated || droppedForMissingJob > 0 || rowsTruncated
 			if len(urls) == 0 && len(actions) > 0 && !opt.jsonOutput {
 				if _, err := fmt.Fprintf(opt.out, "%d open action(s), none openable from here — run 'papio actions list' for details\n", len(actions)); err != nil {
 					return err

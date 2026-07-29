@@ -99,7 +99,7 @@ func readyPlanService(t *testing.T, zotioKey string, cli CLI) (*Service, string)
 	}
 	jobID, err := jobs.CreateRequest(ctx, "request_plan_001", work.Work{
 		DOI: "10.1002/example", Title: "Example Paper", Authors: []string{"Ada Lovelace"}, Year: 2024,
-	}, zotioKey, "", job.Policy{AccessMode: "conservative", DesiredVersion: "any", FetchMaxBytes: 1 << 20}, nil)
+	}, zotioKey, "", job.Policy{AccessMode: "conservative", DesiredVersion: "any", FetchMaxBytes: 1 << 20}, nil, job.PrincipalUnknown)
 	if err != nil {
 		t.Fatal(err)
 	}

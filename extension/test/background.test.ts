@@ -438,6 +438,12 @@ function jobOffer(jobID: string, openurl = OPENURL): unknown {
     },
   };
 }
+function jobOfferForHosts(jobID: string, providerHosts: string[], openurl = OPENURL): unknown {
+  const offer = jobOffer(jobID, openurl) as { payload: Record<string, unknown> };
+  offer.payload["provider_hosts"] = providerHosts;
+  return offer;
+}
+
 
 const PROVIDER_ADAPTER: AdapterSpec = {
   id: "provider",
@@ -927,9 +933,9 @@ test("pre-auth handoffs queue behind one visible tab, then release after auth re
   const providerURL = `https://${PROVIDER_HOST}/stable/returned`;
   await h.tabs.onUpdated.emit(activeTabID, { url: providerURL }, { id: activeTabID, url: providerURL });
 
-  expect(h.tabs.created).toHaveLength(5);
-  expect(h.tabs.created.filter((tab) => !tab.active)).toHaveLength(4);
-  expect(h.backend.store.activeJobs.filter((job) => job.status === "queued")).toHaveLength(0);
+  expect(h.tabs.created).toHaveLength(2);
+  expect(h.tabs.created.filter((tab) => !tab.active)).toHaveLength(1);
+  expect(h.backend.store.activeJobs.filter((job) => job.status === "queued")).toHaveLength(3);
   expect(h.tabs.reloaded).toEqual([stuckTabID]);
 });
 
@@ -1060,9 +1066,8 @@ test("a warm resolver landing releases queued handoffs without an auth event", a
   expect(h.tabs.created).toEqual([
     { url: OPENURL, active: true },
     { url: OPENURL, active: false },
-    { url: OPENURL, active: false },
   ]);
-  expect(h.backend.store.activeJobs.filter((job) => job.status === "queued")).toEqual([]);
+  expect(h.backend.store.activeJobs.filter((job) => job.status === "queued")).toHaveLength(1);
   expect(h.backend.store.lastAuthReturnedAt).toBeUndefined();
   expect(h.frames().some((frame) => frame.type === "auth_returned")).toBe(false);
 });
@@ -1342,7 +1347,7 @@ test("Cloudflare challenge detection survives the observed marker sanitization",
   expect(isBotChallenge(translatedTitleOnly)).toBe(false);
 });
 
-test("a Cloudflare challenge clears an earlier unknown streak instead of escalating it", async () => {
+test("a Cloudflare challenge clears an earlier unknown streak and parks its provider", async () => {
   let challenge = false;
   const h = makeHarness();
   useUnknownProviderClassifier(h, () => challenge);
@@ -1355,19 +1360,25 @@ test("a Cloudflare challenge clears an earlier unknown streak instead of escalat
   await h.tabs.onUpdated.emit(tabID, { url, status: "complete" }, { id: tabID, url });
 
   expect(h.backend.store.activeJobs[0]?.unknown_count ?? 0).toBe(0);
-  expect(
-    h.frames().filter((frame) => frame.type === "provider_outcome" && frame.payload["outcome"] === "ui_changed"),
-  ).toHaveLength(0);
-  expect(h.timers.at(-1)?.ms).toBe(2_500);
+  expect(h.backend.store.providerDrainLeases).toEqual({
+    [PROVIDER_HOST]: {
+      providerKey: PROVIDER_HOST,
+      expiresAt: h.clock.now + 60_000,
+      parkedReason: "challenge",
+    },
+  });
+  expect(h.timers.at(-1)?.ms).toBe(60_000);
 });
 
 test("a cleared Cloudflare challenge returns to the ordinary stale-adapter path", async () => {
   let challenge = true;
   const h = makeHarness();
   useUnknownProviderClassifier(h, () => challenge);
-  await classifyProviderUnknown(h, "job_challenge_clears");
+  const tabID = await classifyProviderUnknown(h, "job_challenge_clears");
 
   challenge = false;
+  const url = `https://${PROVIDER_HOST}/stable/challenge`;
+  await h.tabs.onUpdated.emit(tabID, { url, status: "complete" }, { id: tabID, url });
   for (let step = 0; step < 3; step += 1) {
     const timer = h.timers.at(-1);
     expect(timer).toBeDefined();
@@ -1426,30 +1437,83 @@ test("unknown retries report ui_changed once per drive and again for a re-offere
   ).toHaveLength(2);
 });
 
-test("a bot check that never clears reaches a bounded anti-bot retry", async () => {
+test("a challenge parks only its provider and leaves another provider draining", async () => {
+  const otherProvider = "link.springer.com";
   const h = makeHarness();
   useUnknownProviderClassifier(h, () => true);
-  const tabID = await classifyProviderUnknown(h, "job_challenge_bounded");
+  await h.bridge.start();
+  await h.port.inbound(jobOffer("job_challenge_source"));
+  const sourceTabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  const challengeURL = `https://${PROVIDER_HOST}/stable/challenge`;
+  h.tabs.live.set(sourceTabID, { id: sourceTabID, url: challengeURL });
+  await h.tabs.onUpdated.emit(
+    sourceTabID,
+    { url: challengeURL, status: "complete" },
+    { id: sourceTabID, url: challengeURL },
+  );
 
-  // The initial probe schedules the first retry; the 24th re-check reports
-  // the anti-bot condition rather than silently leaving the handoff alive.
-  for (let retry = 0; retry < 24; retry += 1) {
-    const timer = h.timers.at(-1);
-    expect(timer).toBeDefined();
-    h.clock.now += 2_500;
-    await timer!.fn();
-  }
-  const url = `https://${PROVIDER_HOST}/stable/challenge`;
-  await h.tabs.onUpdated.emit(tabID, { url, status: "complete" }, { id: tabID, url });
+  const parked = jobOffer("job_challenge_parked") as { payload: Record<string, unknown> };
+  parked.payload["requires_auth"] = true;
+  const other = jobOfferForHosts("job_challenge_other", [otherProvider]) as { payload: Record<string, unknown> };
+  other.payload["requires_auth"] = true;
+  await h.port.inbound(parked);
+  await h.port.inbound(other);
+  await h.bridge.setKeepaliveAuthenticated(true);
 
-  const outcomes = h.frames().filter((frame) => frame.type === "provider_outcome");
-  expect(outcomes).toHaveLength(1);
-  expect(outcomes[0]?.payload).toEqual({
-    outcome: "rate_limited",
-    adapter_version: PROVIDER_ADAPTER.version,
-    detail: "blocked by a Cloudflare bot check",
+  expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_challenge_parked")).toMatchObject({
+    tab_id: -1,
+    status: "queued",
+    handoffAckPending: true,
   });
-  expect(h.timers).toHaveLength(24);
+  expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_challenge_other")).toMatchObject({
+    status: "accepted",
+  });
+  expect(
+    h.frames().filter((frame) => frame.type === "job_accept" && frame.job_id === "job_challenge_parked"),
+  ).toHaveLength(0);
+});
+
+test("an expired provider lease reclaims its queued handoff without a new offer", async () => {
+  const h = makeHarness();
+  useUnknownProviderClassifier(h, () => true);
+  await h.bridge.start();
+  await h.port.inbound(jobOffer("job_lease_source"));
+  const sourceTabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  const challengeURL = `https://${PROVIDER_HOST}/stable/challenge`;
+  h.tabs.live.set(sourceTabID, { id: sourceTabID, url: challengeURL });
+  await h.tabs.onUpdated.emit(
+    sourceTabID,
+    { url: challengeURL, status: "complete" },
+    { id: sourceTabID, url: challengeURL },
+  );
+
+  const queued = jobOffer("job_lease_reclaim") as { payload: Record<string, unknown> };
+  queued.payload["requires_auth"] = true;
+  await h.port.inbound(queued);
+  await h.bridge.setKeepaliveAuthenticated(true);
+  expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_lease_reclaim")).toMatchObject({
+    tab_id: -1,
+    status: "queued",
+    handoffAckPending: true,
+  });
+
+  const leaseExpiry = h.timers.find((timer) => timer.ms === 60_000);
+  expect(leaseExpiry).toBeDefined();
+  h.clock.now += 60_000;
+  await leaseExpiry!.fn();
+
+  expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_lease_reclaim")).toMatchObject({
+    status: "accepted",
+  });
+  expect(
+    h.frames().filter((frame) => frame.type === "job_accept" && frame.job_id === "job_lease_reclaim"),
+  ).toHaveLength(1);
+  expect(h.backend.store.providerDrainLeases).toEqual({
+    [PROVIDER_HOST]: {
+      providerKey: PROVIDER_HOST,
+      expiresAt: h.clock.now + 60_000,
+    },
+  });
 });
 
 test("a unique manual Chrome download from a registry-only host is correlated", async () => {
@@ -2146,7 +2210,28 @@ test("backoff exhaustion leaves the daemon-unavailable badge set", async () => {
   expect(h.action.backgroundColors.at(-1)).toBe("#777777");
 });
 
-test("concurrent fallback timers release every queued handoff", async () => {
+test("concurrent handoff triggers cannot double-drain one provider", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(jobOffer("job_provider_active"));
+  await h.port.inbound(jobOffer("job_provider_first"));
+  await h.port.inbound(jobOffer("job_provider_second"));
+
+  const [first, second] = await Promise.all([
+    h.bridge.openHandoff("job_provider_first"),
+    h.bridge.openHandoff("job_provider_second"),
+  ]);
+
+  expect(first).toEqual({ ok: true, opened: true });
+  expect(second).toMatchObject({ ok: false });
+  expect(h.tabs.created).toHaveLength(2);
+  expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_provider_second")).toMatchObject({
+    tab_id: -1,
+    status: "queued",
+  });
+});
+
+test("concurrent fallback timers retain same-provider handoffs behind one lease", async () => {
   const h = makeHarness();
   // First offer opens the one visible tab; the rest queue behind it, each with
   // its own worker-local fallback timer.
@@ -2159,14 +2244,13 @@ test("concurrent fallback timers release every queued handoff", async () => {
   const fallbacks = h.timers.filter((timer) => timer.ms === 45_000);
   expect(fallbacks).toHaveLength(3);
 
-  // Fire every fallback timer at once. Their drains overlap, so a single-flight
-  // guard that dropped concurrent forced releases would strand all but one job
-  // durably queued with tab_id -1. Every queued handoff must instead release.
+  // Racing fallback callbacks claim one provider lease. The remaining jobs
+  // stay queued instead of opening concurrent handoff tabs for the same host.
   await Promise.all(fallbacks.map((timer) => timer.fn()));
 
-  expect(h.backend.store.activeJobs.filter((job) => job.status === "queued")).toHaveLength(0);
-  expect(h.backend.store.activeJobs.every((job) => job.tab_id >= 0)).toBe(true);
-  expect(h.tabs.created.filter((tab) => !tab.active)).toHaveLength(3);
+  expect(h.backend.store.activeJobs.filter((job) => job.status === "queued")).toHaveLength(2);
+  expect(h.backend.store.activeJobs.filter((job) => job.tab_id >= 0)).toHaveLength(2);
+  expect(h.tabs.created.filter((tab) => !tab.active)).toHaveLength(1);
 });
 
 // OrderBackend records the peak number of saves in flight at once. Each save

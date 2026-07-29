@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"papio/internal/agentjson"
 	"papio/internal/app"
 	"papio/internal/batch"
 	"papio/internal/bootstrap"
@@ -73,6 +74,30 @@ type ArtifactResult struct {
 type BundleResult struct {
 	Path   string                      `json:"path"`
 	Bundle *protocol.AcquisitionBundle `json:"bundle"`
+}
+
+// JobsPage and ActionsPage decode the jobs.list_v2 / actions.list_v2 envelopes.
+// `Truncated` is a proof rather than a hint: the daemon reached one row past the
+// limit to answer it, so false means this is the complete list.
+type JobsPage struct {
+	Jobs      []job.Row `json:"jobs"`
+	Truncated bool      `json:"truncated"`
+}
+
+type ActionsPage struct {
+	Actions   []job.HumanAction `json:"actions"`
+	Truncated bool              `json:"truncated"`
+}
+
+// RepairResult reports what jobs.repair_awaiting_human did. Outcome is a closed
+// vocabulary — repaired, not_parked, has_open_actions, conflict — so a consumer
+// never has to parse an error message to tell "nothing to repair" from "I could
+// not repair it".
+type RepairResult struct {
+	JobID    string `json:"job_id"`
+	Repaired bool   `json:"repaired"`
+	Outcome  string `json:"outcome"`
+	State    string `json:"state,omitempty"`
 }
 
 // Router returns the complete Phase 1 local RPC surface.
@@ -139,6 +164,12 @@ func RouterWithShutdown(system *bootstrap.System, shutdown context.CancelFunc) i
 		"jobs.list": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return listJobs(ctx, raw, system)
 		},
+		"jobs.list_v2": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return listJobsV2(ctx, raw, system)
+		},
+		"jobs.repair_awaiting_human": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return repairAwaitingHuman(ctx, raw, system)
+		},
 		"jobs.failures": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return listFailures(ctx, raw, system)
 		},
@@ -153,6 +184,9 @@ func RouterWithShutdown(system *bootstrap.System, shutdown context.CancelFunc) i
 		},
 		"actions.list": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return listActions(ctx, raw, system)
+		},
+		"actions.list_v2": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return listActionsV2(ctx, raw, system)
 		},
 		"actions.open": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return openActions(ctx, raw, system)
@@ -217,9 +251,16 @@ func RouterWithShutdown(system *bootstrap.System, shutdown context.CancelFunc) i
 // without a socket. It backs the embedded MCP server and the CLI command
 // facade that server exposes, so both reach the same handlers the daemon
 // serves over IPC.
+//
+// Calls through here are tagged as the MCP principal: this is the agent-facing
+// entry point, and an acquisition's principal records whose entitlement obtained
+// the bytes. Socket callers stay on the CLI default (see PrincipalFrom) — papio
+// is single-user, so there is no durable per-user identity to source, and an
+// honest coarse principal beats a fabricated one (ADR-0007).
 func InProcessCaller(system *bootstrap.System) func(context.Context, string, any, any) error {
 	router := Router(system)
 	return func(ctx context.Context, method string, params, result any) error {
+		ctx = WithPrincipal(ctx, job.PrincipalMCP)
 		if router.Methods == nil {
 			return errors.New("papio RPC is not configured")
 		}
@@ -312,7 +353,7 @@ func submitV2(ctx context.Context, raw json.RawMessage, system *bootstrap.System
 	if err := ipc.DecodeParams(raw, &params); err != nil {
 		return badParams(err)
 	}
-	result, err := system.App.SubmitWithOptions(ctx, params.Request, app.SubmitOptions{
+	result, err := system.App.SubmitWithOptionsAs(ctx, PrincipalFrom(ctx), params.Request, app.SubmitOptions{
 		AutoImport: params.AutoImport,
 		Force:      params.Force,
 	})
@@ -343,7 +384,7 @@ func submit(ctx context.Context, raw json.RawMessage, system *bootstrap.System) 
 	} else if err := ipc.DecodeParams(raw, &request); err != nil {
 		return badParams(err)
 	}
-	id, err := system.App.SubmitWithAutoImport(ctx, request, autoImport)
+	submitted, err := system.App.SubmitWithOptionsAs(ctx, PrincipalFrom(ctx), request, app.SubmitOptions{AutoImport: autoImport})
 	if err != nil {
 		var unset *config.ErrAccessModeUnset
 		if errors.As(err, &unset) {
@@ -351,7 +392,7 @@ func submit(ctx context.Context, raw json.RawMessage, system *bootstrap.System) 
 		}
 		return nil, &ipc.RPCError{Code: "invalid_argument", Message: "invalid acquisition request"}
 	}
-	return marshal(SubmitResult{JobID: id})
+	return marshal(SubmitResult{JobID: submitted.JobID})
 }
 
 // BatchReport joins a persisted CLI batch manifest to the daemon's durable
@@ -603,6 +644,71 @@ func listJobs(ctx context.Context, raw json.RawMessage, system *bootstrap.System
 	return marshal(rows)
 }
 
+// listJobsV2 is jobs.list with the one thing a cohort-scale consumer cannot
+// derive for itself: whether the page it just read was the whole list. It is a
+// new method rather than a widened jobs.list result because the IPC envelope is
+// decoded with DisallowUnknownFields, so an added field would make every older
+// CLI reject a newer daemon's response.
+func listJobsV2(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
+	var params struct {
+		State string `json:"state,omitempty"`
+		Limit int    `json:"limit,omitempty"`
+	}
+	if err := ipc.DecodeParams(raw, &params); err != nil {
+		return badParams(err)
+	}
+	rows, truncated, err := system.Jobs.ListPage(ctx, params.State, params.Limit)
+	if err != nil {
+		return failure(err)
+	}
+	return marshal(agentjson.Envelope("jobs", rows, truncated))
+}
+
+// repairAwaitingHuman returns an ORPHANED parked job to resolving: one that is
+// awaiting_human with no open action left to act on, which no other verb can
+// reach (jobs.retry refuses parked jobs by design, and actions.open needs an
+// open handoff action). It is deliberately orphan-only and never accepts action
+// ids, so a consumer cannot close actions it never read; a job that still has
+// open actions is reported as such rather than repaired. This does not weaken
+// the "handoff offers do not hard-expire" decision: nothing expires here, and
+// the transactional lease predicate inside the store keeps an in-flight adoption
+// from losing its download.
+func repairAwaitingHuman(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
+	var params struct {
+		JobID string `json:"job_id"`
+	}
+	if err := ipc.DecodeParams(raw, &params); err != nil || strings.TrimSpace(params.JobID) == "" {
+		if err == nil {
+			err = errors.New("job_id is required")
+		}
+		return badParams(err)
+	}
+	row, err := system.Jobs.Get(ctx, params.JobID)
+	if err != nil {
+		return failure(err)
+	}
+	if row.State != job.StateAwaitingHuman {
+		return marshal(RepairResult{JobID: params.JobID, Outcome: "not_parked", State: row.State})
+	}
+	open, err := system.Jobs.ListOpenHumanActionsForJobs(ctx, []string{params.JobID})
+	if err != nil {
+		return failure(err)
+	}
+	if len(open) != 0 {
+		return marshal(RepairResult{JobID: params.JobID, Outcome: "has_open_actions", State: row.State})
+	}
+	err = system.Jobs.RepairAwaitingHuman(ctx, params.JobID, nil, map[string]any{"reason": "consumer_repair"})
+	switch {
+	case errors.Is(err, job.ErrConflict):
+		// The job was leased or left awaiting_human between the read above and
+		// the transaction. The store is authoritative; report the race.
+		return marshal(RepairResult{JobID: params.JobID, Outcome: "conflict", State: row.State})
+	case err != nil:
+		return failure(err)
+	}
+	return marshal(RepairResult{JobID: params.JobID, Repaired: true, Outcome: "repaired", State: job.StateResolving})
+}
+
 func getJob(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
 	var params struct {
 		JobID string `json:"job_id"`
@@ -686,6 +792,27 @@ func listActions(ctx context.Context, raw json.RawMessage, system *bootstrap.Sys
 		return failure(err)
 	}
 	return marshal(actions)
+}
+
+// listActionsV2 bounds actions.list, which is unbounded today, and reports
+// truncation as a proof. New method for the same wire reason as jobs.list_v2.
+func listActionsV2(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
+	var params struct {
+		OpenOnly *bool `json:"open_only,omitempty"`
+		Limit    int   `json:"limit,omitempty"`
+	}
+	if err := ipc.DecodeParams(raw, &params); err != nil {
+		return badParams(err)
+	}
+	openOnly := true
+	if params.OpenOnly != nil {
+		openOnly = *params.OpenOnly
+	}
+	actions, truncated, err := system.Jobs.ListHumanActionsPage(ctx, openOnly, params.Limit)
+	if err != nil {
+		return failure(err)
+	}
+	return marshal(agentjson.Envelope("actions", actions, truncated))
 }
 
 func openActions(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {

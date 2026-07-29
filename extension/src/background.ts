@@ -38,6 +38,7 @@ import {
   type StateBackend,
   type StoreShape,
   type TermsConsent,
+  type ProviderDrainLease,
   TERMS_CONSENT_KEY,
   WORK_WINDOW_KEY,
   HANDOFF_SURFACE_KEY,
@@ -71,10 +72,9 @@ const QUEUED_HANDOFF_RELEASE_MS = 45_000;
 // schedule so a slow render still reaches a decisive verdict.
 const CLASSIFY_RETRY_MS = 2_500;
 const MAX_CLASSIFY_RETRIES = 8;
-// A completed bot check can take longer than the ordinary render race. Giving
-// it a minute avoids converting a passing challenge into a manual-download
-// handoff while still releasing a page that never returns.
-const MAX_BOT_CHALLENGE_RETRIES = 24;
+// A challenge holds only its provider's queue for the same one minute the old
+// bounded challenge probe used, then a fresh drain can reclaim it.
+const PROVIDER_DRAIN_LEASE_MS = 24 * CLASSIFY_RETRY_MS;
 // A job whose warm SSO session cannot complete human authentication would
 // otherwise be re-driven on every daemon re-offer and worker spin-up forever,
 // thrashing the provider (repeat navigations trip bot walls) and burning the
@@ -376,7 +376,7 @@ interface PendingNativeRequest {
   resolve(result: NativeRequestResult): void;
 }
 
-type ClassifyRetryKind = "unknown" | "bot_challenge";
+type ClassifyRetryKind = "unknown";
 
 interface ClassifyRetry {
   kind: ClassifyRetryKind;
@@ -730,16 +730,17 @@ export class Bridge {
   /** Forced job IDs awaiting release; consumed by the single active drain so
    * overlapping fallback timers cannot drop each other's requests. */
   private readonly pendingForcedReleases = new Set<string>();
-  /** One retry budget tracks the current transient phase. Switching from a bot
-   * check to an ordinary render race must start cleanly, or a cleared challenge
-   * could manufacture a stale-adapter result. */
+  /** Ownership tokens never leave this worker. Durable lease metadata omits
+   * them, so a restarted worker waits only for the persisted expiry. */
+  private readonly providerDrainLeaseOwners = new Map<string, string>();
+  /** Lease-expiry wakeups are best-effort; startup and the keepalive alarm
+   * re-derive expiry from session state after MV3 discards these timers. */
+  private readonly providerDrainLeaseTimers = new Map<string, object>();
+  /** A bounded retry budget tracks only ordinary provider render races. */
   private readonly classifyRetries = new Map<string, ClassifyRetry>();
   /** Effective provider access is stable between permission changes, so retries
    * and repeated tab updates do not repeatedly ask Chrome about the same host. */
   private readonly providerAccessByHost = new Map<string, boolean>();
-  /** Once the bounded wait has told the daemon to retry later, further complete
-   * events from that same interstitial must not restart the expired budget. */
-  private readonly botChallengeReported = new Set<string>();
   /** Broker-tab ids whose auth attempt is already counted, so the SSO redirect
    * dance within one drive increments the budget only once. Worker-local. */
   private readonly authCountedTabs = new Set<number>();
@@ -790,7 +791,6 @@ export class Bridge {
    * observations from its predecessor must not suppress this drive. */
   private beginProviderDrive(jobID: string): void {
     this.classifyRetries.delete(jobID);
-    this.botChallengeReported.delete(jobID);
     this.handoffOutcomeSent.delete(`${jobID}:ui_changed`);
   }
 
@@ -1424,6 +1424,7 @@ export class Bridge {
     // worker itself). Idempotent: re-creating the same alarm just resets it.
     this.deps.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: KEEPALIVE_ALARM_MINUTES });
     await this.ready;
+    await this.restoreProviderDrainLeaseTimers();
     await this.reconcileHandoffGroups();
     await this.syncConnectionBadge();
     await this.reconcileTabs();
@@ -1601,7 +1602,7 @@ export class Bridge {
       // releaseQueuedHandoffs owns the cross-event drain latch. Calling any
       // lower-level opener here would let concurrent inbox clicks create two
       // tabs for the same queued offer.
-      await this.releaseQueuedHandoffs(jobID);
+      await this.releaseQueuedHandoffs(jobID, true);
       job = findByJob(this.store, jobID);
     }
     if (job === undefined || !this.offerURLs.has(jobID) || job.tab_id < 0) {
@@ -2178,10 +2179,11 @@ export class Bridge {
   }
 
   private async removeJobWithOffer(jobID: string): Promise<void> {
+    const job = findByJob(this.store, jobID);
+    const providerKey = job === undefined ? undefined : this.providerKeyForJob(job);
     this.offerURLs.delete(jobID);
     this.queuedHandoffTimers.delete(jobID);
     this.classifyRetries.delete(jobID);
-    this.botChallengeReported.delete(jobID);
     this.loginEntityIDs.delete(jobID);
     this.federatedLoginRouted.delete(jobID);
     this.federatedReDriven.delete(jobID);
@@ -2200,6 +2202,7 @@ export class Bridge {
       delete offerURLs[jobID];
       return { ...removeJob(s, jobID), offerURLs };
     });
+    if (providerKey !== undefined) await this.releaseProviderDrainWhenUnused(providerKey);
     await this.closeWorkWindowIfIdle();
     await this.dropStaleHandoffGroup();
   }
@@ -2315,6 +2318,212 @@ export class Bridge {
   private hasHandoffReleaseEvidence(requiresAuth: boolean | undefined): boolean {
     return this.hasAuthEvidence() || (requiresAuth !== true && this.openAccessLandingObserved);
   }
+  /** A provider's declared host set is the only local grouping information the
+   * bridge has. Canonicalizing it makes every re-offer use the same lease
+   * without retaining a resolver or provider URL. */
+  private providerKeyForHosts(providerHosts: string[]): string {
+    const hosts = [...new Set(providerHosts.map((host) => host.trim().toLowerCase()).filter(Boolean))].sort();
+    return hosts.length === 0 ? "unknown-provider" : hosts.join(",");
+  }
+
+  private providerKeyForJob(job: ActiveJob): string {
+    return this.providerKeyForHosts(job.provider_hosts);
+  }
+
+  private currentProviderDrainLease(providerKey: string): ProviderDrainLease | undefined {
+    const lease = this.store.providerDrainLeases?.[providerKey];
+    if (
+      lease === undefined ||
+      lease.providerKey !== providerKey ||
+      !Number.isFinite(lease.expiresAt) ||
+      lease.expiresAt <= this.deps.now()
+    ) {
+      return undefined;
+    }
+    return lease;
+  }
+
+  private hasActiveProviderDrainLease(job: ActiveJob): boolean {
+    return this.currentProviderDrainLease(this.providerKeyForJob(job)) !== undefined;
+  }
+
+  private isProviderDrainParked(job: ActiveJob): boolean {
+    return this.currentProviderDrainLease(this.providerKeyForJob(job))?.parkedReason === "challenge";
+  }
+
+  /** Discard stale or malformed persisted leases before a drain chooses work.
+   * The owner is intentionally absent from session storage, so an unexpired
+   * lease from a prior service worker is respected until this bounded expiry. */
+  private async expireProviderDrainLeases(): Promise<string[]> {
+    const now = this.deps.now();
+    const expired = Object.entries(this.store.providerDrainLeases ?? {})
+      .filter(
+        ([providerKey, lease]) =>
+          lease.providerKey !== providerKey || !Number.isFinite(lease.expiresAt) || lease.expiresAt <= now,
+      )
+      .map(([providerKey]) => providerKey);
+    if (expired.length === 0) return expired;
+    await this.update((store) => {
+      const providerDrainLeases = { ...(store.providerDrainLeases ?? {}) };
+      for (const providerKey of expired) delete providerDrainLeases[providerKey];
+      return { ...store, providerDrainLeases };
+    });
+    for (const providerKey of expired) {
+      this.providerDrainLeaseOwners.delete(providerKey);
+      this.providerDrainLeaseTimers.delete(providerKey);
+    }
+    return expired;
+  }
+
+  private scheduleProviderDrainLeaseExpiry(providerKey: string, expiresAt: number): void {
+    const token = {};
+    this.providerDrainLeaseTimers.set(providerKey, token);
+    this.deps.setTimeout(async () => {
+      if (this.providerDrainLeaseTimers.get(providerKey) !== token) return;
+      this.providerDrainLeaseTimers.delete(providerKey);
+      await this.ready;
+      const expired = await this.expireProviderDrainLeases();
+      if (!expired.includes(providerKey)) return;
+      await this.acknowledgePendingProviderHandoffs(providerKey);
+      await this.releaseQueuedHandoffs();
+    }, Math.max(0, expiresAt - this.deps.now()));
+  }
+
+  private async restoreProviderDrainLeaseTimers(): Promise<void> {
+    await this.expireProviderDrainLeases();
+    for (const [providerKey, lease] of Object.entries(this.store.providerDrainLeases ?? {})) {
+      if (this.currentProviderDrainLease(providerKey) !== undefined) {
+        this.scheduleProviderDrainLeaseExpiry(providerKey, lease.expiresAt);
+      }
+    }
+  }
+
+  /** Claim one provider while opening its next queued tab. A live claim from
+   * this or a prior worker blocks the candidate; callers continue with another
+   * provider rather than starting a second drain. */
+  private async claimProviderDrainLease(job: ActiveJob): Promise<string | undefined> {
+    await this.expireProviderDrainLeases();
+    const providerKey = this.providerKeyForJob(job);
+    if (this.currentProviderDrainLease(providerKey) !== undefined) return undefined;
+    const owner = this.deps.randomUUID();
+    const expiresAt = this.deps.now() + PROVIDER_DRAIN_LEASE_MS;
+    let claimed = false;
+    await this.update((store) => {
+      const current = store.providerDrainLeases?.[providerKey];
+      if (
+        current !== undefined &&
+        current.providerKey === providerKey &&
+        Number.isFinite(current.expiresAt) &&
+        current.expiresAt > this.deps.now()
+      ) {
+        return store;
+      }
+      claimed = true;
+      return {
+        ...store,
+        providerDrainLeases: {
+          ...(store.providerDrainLeases ?? {}),
+          [providerKey]: { providerKey, expiresAt },
+        },
+      };
+    });
+    if (!claimed) return undefined;
+    this.providerDrainLeaseOwners.set(providerKey, owner);
+    this.scheduleProviderDrainLeaseExpiry(providerKey, expiresAt);
+    return owner;
+  }
+
+  private async releaseProviderDrainLease(providerKey: string, owner: string): Promise<void> {
+    if (this.providerDrainLeaseOwners.get(providerKey) !== owner) return;
+    this.providerDrainLeaseOwners.delete(providerKey);
+    this.providerDrainLeaseTimers.delete(providerKey);
+    await this.update((store) => {
+      const lease = store.providerDrainLeases?.[providerKey];
+      if (lease === undefined || lease.parkedReason !== undefined) return store;
+      const providerDrainLeases = { ...(store.providerDrainLeases ?? {}) };
+      delete providerDrainLeases[providerKey];
+      return { ...store, providerDrainLeases };
+    });
+  }
+
+  /** A challenge remains human-visible in its existing tab. Its siblings stay
+   * queued and every new re-offer remains unaccepted until the lease clears. */
+  private async parkProviderDrain(job: ActiveJob): Promise<void> {
+    const providerKey = this.providerKeyForJob(job);
+    const owner = this.deps.randomUUID();
+    const expiresAt = this.deps.now() + PROVIDER_DRAIN_LEASE_MS;
+    this.providerDrainLeaseOwners.set(providerKey, owner);
+    await this.update((store) => ({
+      ...store,
+      providerDrainLeases: {
+        ...(store.providerDrainLeases ?? {}),
+        [providerKey]: { providerKey, expiresAt, parkedReason: "challenge" },
+      },
+    }));
+    this.scheduleProviderDrainLeaseExpiry(providerKey, expiresAt);
+  }
+  /** A non-challenge provider document proves this drain can advance. The next
+   * queued sibling may claim a fresh lease; a challenge instead replaces it
+   * with the parked form above. */
+  private async completeProviderDrainLease(providerKey: string): Promise<boolean> {
+    if (this.currentProviderDrainLease(providerKey) === undefined) return false;
+    this.providerDrainLeaseOwners.delete(providerKey);
+    this.providerDrainLeaseTimers.delete(providerKey);
+    await this.update((store) => {
+      const providerDrainLeases = { ...(store.providerDrainLeases ?? {}) };
+      delete providerDrainLeases[providerKey];
+      return { ...store, providerDrainLeases };
+    });
+    return true;
+  }
+
+
+  /** The only explicit resume is an existing human handoff-open request; a
+   * cleared challenge also calls this when its provider document returns. */
+  private async clearProviderDrainPark(providerKey: string): Promise<boolean> {
+    const lease = this.currentProviderDrainLease(providerKey);
+    if (lease?.parkedReason !== "challenge") return false;
+    this.providerDrainLeaseOwners.delete(providerKey);
+    this.providerDrainLeaseTimers.delete(providerKey);
+    await this.update((store) => {
+      const providerDrainLeases = { ...(store.providerDrainLeases ?? {}) };
+      delete providerDrainLeases[providerKey];
+      return { ...store, providerDrainLeases };
+    });
+    return true;
+  }
+
+  private async acknowledgePendingProviderHandoffs(providerKey: string): Promise<boolean> {
+    const pending = this.store.activeJobs.filter(
+      (job) => this.providerKeyForJob(job) === providerKey && job.handoffAckPending === true,
+    );
+    for (const job of pending) {
+      if (!this.send("job_accept", {}, job.job_id)) return false;
+    }
+    if (pending.length === 0) return true;
+    const acknowledged = new Set(pending.map((job) => job.job_id));
+    await this.update((store) => ({
+      ...store,
+      activeJobs: store.activeJobs.map((job) => {
+        if (!acknowledged.has(job.job_id)) return job;
+        const { handoffAckPending: _handoffAckPending, ...resumed } = job;
+        return resumed;
+      }),
+    }));
+    return true;
+  }
+
+  private async releaseProviderDrainWhenUnused(providerKey: string): Promise<void> {
+    if (this.store.activeJobs.some((job) => this.providerKeyForJob(job) === providerKey)) return;
+    this.providerDrainLeaseOwners.delete(providerKey);
+    this.providerDrainLeaseTimers.delete(providerKey);
+    await this.update((store) => {
+      if (store.providerDrainLeases?.[providerKey] === undefined) return store;
+      const providerDrainLeases = { ...(store.providerDrainLeases ?? {}) };
+      delete providerDrainLeases[providerKey];
+      return { ...store, providerDrainLeases };
+    });
+  }
 
   /** A warm provider or resolver landing proves this job's institution has a
    * session; an unrelated completed page must not unlock its queued peers. */
@@ -2419,8 +2628,12 @@ export class Bridge {
     await this.releaseQueuedHandoffs();
   }
 
-  private async releaseQueuedHandoffs(fallbackJobID?: string): Promise<void> {
+  private async releaseQueuedHandoffs(fallbackJobID?: string, forceProvider = false): Promise<void> {
     if (fallbackJobID !== undefined) this.pendingForcedReleases.add(fallbackJobID);
+    if (forceProvider && fallbackJobID !== undefined) {
+      const forced = findByJob(this.store, fallbackJobID);
+      if (forced !== undefined) await this.clearProviderDrainPark(this.providerKeyForJob(forced));
+    }
     if (!this.hasAuthEvidence() && !this.openAccessLandingObserved && this.pendingForcedReleases.size === 0) {
       return;
     }
@@ -2430,59 +2643,74 @@ export class Bridge {
     }
     this.drainingQueuedHandoffs = true;
     try {
-      // One drain loop owns evidence-driven draining and every forced release,
-      // including those queued by overlapping fallback timers while it runs.
+      await this.expireProviderDrainLeases();
+      // One loop opens at most one unclassified handoff per provider. A lease
+      // stays with that tab until it proves normal, becomes a challenge park,
+      // or expires, while other provider groups keep making progress.
       while (this.hasAuthEvidence() || this.openAccessLandingObserved || this.pendingForcedReleases.size > 0) {
         let selected = this.store.activeJobs.find(
-          (job) => job.status === "queued" && this.hasHandoffReleaseEvidence(job.requires_auth),
+          (job) =>
+            job.status === "queued" &&
+            this.hasHandoffReleaseEvidence(job.requires_auth) &&
+            !this.hasActiveProviderDrainLease(job),
         );
-        let forcedJobID = selected === undefined ? this.pendingForcedReleases.values().next().value : undefined;
-        if (forcedJobID !== undefined) {
-          this.pendingForcedReleases.delete(forcedJobID);
-          selected = this.store.activeJobs.find(
-            (job) => job.job_id === forcedJobID && job.status === "queued",
-          );
-        }
+        let forcedJobID: string | undefined;
         if (selected === undefined) {
-          // Institutional evidence can drain every queue. OA evidence must
-          // leave institutional jobs parked until their own session is proven.
-          if (this.hasAuthEvidence()) {
-            this.pendingForcedReleases.clear();
-            return;
+          for (const jobID of this.pendingForcedReleases) {
+            const candidate = this.store.activeJobs.find((job) => job.job_id === jobID && job.status === "queued");
+            if (candidate === undefined) {
+              this.pendingForcedReleases.delete(jobID);
+              continue;
+            }
+            if (this.hasActiveProviderDrainLease(candidate)) continue;
+            selected = candidate;
+            forcedJobID = jobID;
+            this.pendingForcedReleases.delete(jobID);
+            break;
           }
-          if (this.openAccessLandingObserved && this.pendingForcedReleases.size === 0) return;
-          continue;
         }
-        const queued = selected; // const so narrowing survives the update closure.
-        const forceSurface = forcedJobID === queued.job_id && queued.requires_auth === true;
-        this.queuedHandoffTimers.delete(queued.job_id);
-        const url = this.offerURLs.get(queued.job_id);
-        if (url === undefined) {
-          this.send("job_reject", {}, queued.job_id);
-          await this.removeJobWithOffer(queued.job_id);
-          continue;
-        }
-        let tabID: number | undefined;
+        if (selected === undefined) return;
+
+        const queued = selected;
+        const providerKey = this.providerKeyForJob(queued);
+        const owner = await this.claimProviderDrainLease(queued);
+        if (owner === undefined) continue;
+        let opened = false;
         try {
-          tabID = await this.openBrokerTab(url, forceSurface);
-        } catch (e) {
-          console.error("papio: queued handoff tab creation failed", e);
+          const forceSurface = forcedJobID === queued.job_id && queued.requires_auth === true;
+          this.queuedHandoffTimers.delete(queued.job_id);
+          const url = this.offerURLs.get(queued.job_id);
+          if (url === undefined) {
+            this.send("job_reject", {}, queued.job_id);
+            await this.removeJobWithOffer(queued.job_id);
+            continue;
+          }
+          if (!(await this.acknowledgePendingProviderHandoffs(providerKey))) return;
+          let tabID: number | undefined;
+          try {
+            tabID = await this.openBrokerTab(url, forceSurface);
+          } catch (e) {
+            console.error("papio: queued handoff tab creation failed", e);
+          }
+          if (tabID === undefined) {
+            this.send("job_reject", {}, queued.job_id);
+            await this.removeJobWithOffer(queued.job_id);
+            continue;
+          }
+          this.beginProviderDrive(queued.job_id);
+          await this.update((s) =>
+            patchJob(s, queued.job_id, {
+              tab_id: tabID,
+              status: "accepted",
+              download_initiated: false,
+              unknown_count: 0,
+            }),
+          );
+          opened = true;
+          if (forceSurface) await this.surfaceWorkTab(tabID);
+        } finally {
+          if (!opened) await this.releaseProviderDrainLease(providerKey, owner);
         }
-        if (tabID === undefined) {
-          this.send("job_reject", {}, queued.job_id);
-          await this.removeJobWithOffer(queued.job_id);
-          continue;
-        }
-        this.beginProviderDrive(queued.job_id);
-        await this.update((s) =>
-          patchJob(s, queued.job_id, {
-            tab_id: tabID,
-            status: "accepted",
-            download_initiated: false,
-            unknown_count: 0,
-          }),
-        );
-        if (forceSurface) await this.surfaceWorkTab(tabID);
       }
     } finally {
       this.drainingQueuedHandoffs = false;
@@ -2674,6 +2902,8 @@ export class Bridge {
     if (typeof openurl !== "string" || !Array.isArray(hostsRaw) || typeof expiresAt !== "string") return;
     const priorOfferURL = this.offerURLs.get(jobID);
     const providerHosts = hostsRaw.filter((h): h is string => typeof h === "string");
+    const providerKey = this.providerKeyForHosts(providerHosts);
+    const providerParked = this.currentProviderDrainLease(providerKey)?.parkedReason === "challenge";
     const expected = parseExpected(p["expected"]);
     const requiresAuth = typeof p["requires_auth"] === "boolean" ? p["requires_auth"] : undefined;
     const loginEntityID = p["login_entity_id"];
@@ -2712,7 +2942,16 @@ export class Bridge {
           this.downloads.delete(jobID);
           await this.removeJobWithOffer(jobID);
         } else if (priorOfferURL === openurl) {
-          this.send("job_accept", {}, jobID);
+          if (providerParked) {
+            await this.update((s) => patchJob(s, jobID, { handoffAckPending: true }));
+            this.scheduleQueuedHandoffRelease(jobID);
+            return;
+          }
+          if (existing.handoffAckPending === true) {
+            if (!(await this.acknowledgePendingProviderHandoffs(providerKey))) return;
+          } else {
+            this.send("job_accept", {}, jobID);
+          }
           if (existing.status === "queued") {
             this.scheduleQueuedHandoffRelease(jobID);
             await this.releaseQueuedHandoffs();
@@ -2731,7 +2970,15 @@ export class Bridge {
           live = false;
         }
         if (live && (priorOfferURL === undefined || priorOfferURL === openurl)) {
-          this.send("job_accept", {}, jobID);
+          if (providerParked) {
+            await this.update((s) => patchJob(s, jobID, { handoffAckPending: true }));
+            return;
+          }
+          if (existing.handoffAckPending === true) {
+            await this.acknowledgePendingProviderHandoffs(providerKey);
+          } else {
+            this.send("job_accept", {}, jobID);
+          }
           return;
         }
         if (live) {
@@ -2778,14 +3025,19 @@ export class Bridge {
     }
 
     const queueHandoff =
-      !this.hasHandoffReleaseEvidence(requiresAuth) &&
-      (requiresAuth === true ||
-        this.handoffOpening ||
-        this.store.activeJobs.some((job) => job.tab_id >= 0 && job.status !== "queued"));
+      providerParked ||
+      (!this.hasHandoffReleaseEvidence(requiresAuth) &&
+        (requiresAuth === true ||
+          this.handoffOpening ||
+          this.store.activeJobs.some((job) => job.tab_id >= 0 && job.status !== "queued")));
     if (queueHandoff) {
-      await this.upsertJobWithOffer(makeJob(-1, "queued"), openurl);
+      const queued = makeJob(-1, "queued");
+      await this.upsertJobWithOffer(
+        providerParked ? { ...queued, handoffAckPending: true } : queued,
+        openurl,
+      );
       this.scheduleQueuedHandoffRelease(jobID);
-      this.send("job_accept", {}, jobID);
+      if (!providerParked) this.send("job_accept", {}, jobID);
       return;
     }
 
@@ -3380,13 +3632,19 @@ export class Bridge {
           args: [null],
         });
         if (results[0]?.result === true) {
-          await this.waitForBotChallenge(job, spec.version);
+          await this.waitForBotChallenge(job);
           return;
         }
       } catch (e) {
         // A failed probe must retain the existing stale-adapter path rather
         // than silently make an unreadable provider page immortal.
         console.error("papio: bot-challenge detection failed; classifying normally", e);
+      }
+    }
+    const providerKey = this.providerKeyForJob(currentJob);
+    if (await this.completeProviderDrainLease(providerKey)) {
+      if (await this.acknowledgePendingProviderHandoffs(providerKey)) {
+        await this.releaseQueuedHandoffs();
       }
     }
     await this.applyVerdict(jobID, spec, verdict, host);
@@ -3410,15 +3668,15 @@ export class Bridge {
     }
   }
 
-  /** A Cloudflare interstitial replaces the provider document while its
-   * verification is still in flight. Forget an earlier render race so it
-   * cannot be mistaken for two independent unreadable provider pages. */
-  private async waitForBotChallenge(job: ActiveJob, adapterVersion: string): Promise<void> {
-    if (this.botChallengeReported.has(job.job_id)) return;
+  /** A challenge is a provider-wide human step, not a page retry. Keep its
+   * existing tab available and park only siblings with a bounded lease. */
+  private async waitForBotChallenge(job: ActiveJob): Promise<void> {
+    if (this.isProviderDrainParked(job)) return;
     if ((job.unknown_count ?? 0) !== 0) {
       await this.update((s) => patchJob(s, job.job_id, { unknown_count: 0 }));
     }
-    this.scheduleBotChallengeRetry(job.job_id, adapterVersion);
+    this.classifyRetries.delete(job.job_id);
+    await this.parkProviderDrain(job);
   }
 
   private scheduleClassifyRetry(jobID: string): void {
@@ -3433,30 +3691,6 @@ export class Bridge {
     this.deps.setTimeout(() => this.retryClassify(jobID, next), CLASSIFY_RETRY_MS);
   }
 
-  private scheduleBotChallengeRetry(jobID: string, adapterVersion: string): void {
-    const retry = this.classifyRetries.get(jobID);
-    const attempts = retry?.kind === "bot_challenge" ? retry.attempts : 0;
-    if (attempts >= MAX_BOT_CHALLENGE_RETRIES) {
-      this.classifyRetries.delete(jobID);
-      if (
-        this.send(
-          "provider_outcome",
-          {
-            outcome: "rate_limited",
-            adapter_version: adapterVersion,
-            detail: "blocked by a Cloudflare bot check",
-          },
-          jobID,
-        )
-      ) {
-        this.botChallengeReported.add(jobID);
-      }
-      return;
-    }
-    const next: ClassifyRetry = { kind: "bot_challenge", attempts: attempts + 1 };
-    this.classifyRetries.set(jobID, next);
-    this.deps.setTimeout(() => this.retryClassify(jobID, next), CLASSIFY_RETRY_MS);
-  }
 
   /** Auto-select the institution on a provider login wall: navigate the handoff
    * tab to the adapter's federated-login entry with the offer's entityID, once

@@ -84,48 +84,46 @@ Option C.
   does not decide whether an obtained version satisfies a citation. Two
   similar-but-different identity vocabularies across the boundary is the worst
   available outcome; papio declines to own one.
-- **`unknown` is a real value, not a default — and papio does not honour this
-  yet.** The promise stands as the contract; the code does not currently meet it,
-  and closing that gap is a **prerequisite** of the receipt, not a follow-up.
-  Browser adoption assigns `published` to a file nobody inspected and, worse,
-  copies the request's `desired_version` *preference* into the obtained *fact*
-  (`internal/app/browser_adopt.go:93-96`) — on the institutional path, which is
-  the only path this consumer uses papio for. That must become `unknown`:
-  adoption observes bytes arriving, never which version a human chose.
-  Two other inferences are defensible and stay: arXiv never claims `published`
-  and downgrades to `accepted` on a DOI/journal-ref (`arxiv.go:154-162`), and
-  Europe PMC's OA subset is the version of record by definition
-  (`europepmc.go:176`). Both err toward suppressing an adverse finding, which is
-  the safe direction. (The claim in an earlier draft that arXiv emits `unknown`
-  was simply wrong.)
+- **`unknown` is a real value, not a default.** papio does not synthesise a
+  version and never echoes a request's `desired_version` *preference* back as an
+  obtained *fact*. Browser adoption records `unknown` unconditionally
+  (`internal/app/browser_adopt.go`): it observes bytes arriving from a human's
+  browser and never learns which version that human chose. Because adoption keys
+  its candidate by content hash under `INSERT OR IGNORE`, a row written before
+  this rule existed is normalised on re-adoption and on review acceptance rather
+  than re-read with its old claim.
+  Two resolver inferences are defensible and stay: arXiv never claims `published`
+  and downgrades to `accepted` on a DOI/journal-ref (`internal/resolvers/arxiv`),
+  and Europe PMC's OA subset is the version of record by definition
+  (`internal/resolvers/europepmc`). Both err toward suppressing an adverse
+  finding, which is the safe direction. (An earlier draft of this ADR claimed
+  arXiv emits `unknown`; it does not, and the drafting error was mine.)
 - **The receipt is not a pure projection, and the "two new items" estimate was
-  wrong.** `SelectedCandidateID` is not an accepted-candidate pointer: it is
-  written before validation (`internal/app/app.go:776-777`), survives rejection
-  because the transition SQL `COALESCE`s it forward (`internal/job/job.go:557-558`),
-  and is zero for the cache-hit path, which reaches `ready` with only the artifact
-  hash (`internal/app/app.go:299-300`). So a *failed* receipt projecting it would
-  report the last **rejected** file's licence and version — the precise error class
-  this ADR exists to prevent. Two consequences, both binding:
-  **(a)** the receipt's candidate block is **absent unless an acquisition was
-  accepted**; it is never inferred from an attempt.
-  **(b)** the cache-hit path must carry the source acquisition's candidate
-  forward. Today the exporter recovers it by scanning for the *earliest* ready job
-  sharing that hash (`internal/job/job.go:1487-1490`), which borrows another job's
-  `access_basis` and `reuse_license` whenever identical bytes were obtained under
-  different terms. That is first-writer-wins rights attribution on a content hash
-  — the artifact-stamping error this ADR rejects, already live in the surface the
-  receipt depends on. Fix it before the receipt reads it.
-- **Identity findings cannot be projected from the artifact either.** Identity is
-  computed against a per-job target (`internal/pdf/pipeline.go:64-65`) but
-  `UpsertArtifact`'s `ON CONFLICT … DO UPDATE SET identity_result` overwrites it
-  for every job sharing the digest (`internal/job/job.go:1453-1456`), so a later
-  acquisition retroactively rewrites an earlier receipt. Identity belongs on the
-  acquisition edge, not the blob. Structured `pdf.ValidationReport` `Evidence`
-  stays **withdrawn**; note also that no artifact row exists for a failed
-  acquisition (`internal/app/app.go:933-937` deletes the file and keeps only a
-  coarse attempt detail), so failed receipts carry a coarse reason, not findings.
-  Consumers may describe papio's validation *findings*; they may not claim to
-  relay a full report.
+  wrong.** `selected_candidate_id` is not an accepted-candidate pointer: it is
+  written when a fetch starts, before validation, and the transition SQL
+  `COALESCE`s it forward, so a job can carry a **rejected** selection through
+  crash recovery or a scheduler retry. Reading provenance from it directly would
+  publish the licence and version of a file papio threw away. Three rules follow,
+  all now enforced in `internal/job`:
+  **(a)** provenance is read only from a candidate whose status is `accepted` and
+  which belongs to the job being described; the receipt's candidate block is
+  absent unless an acquisition was accepted, never inferred from an attempt.
+  **(b)** a job completing from the local cache records the **source
+  acquisition's** accepted candidate, because these are that acquisition's bytes.
+  The digest-keyed scan remains only as a fallback for rows written before that
+  rule, and it too now requires an accepted candidate.
+  **(c)** no provenance is ever recovered by picking "some job holding this
+  digest" — that is first-writer-wins rights attribution on a content hash, the
+  same error as stamping rights on the artifact.
+- **Identity findings cannot be projected from the artifact.** Identity is
+  computed against a per-job target, but `UpsertArtifact`'s
+  `ON CONFLICT … DO UPDATE SET identity_result` overwrites it for every job
+  sharing the digest, so a later acquisition retroactively rewrites an earlier
+  receipt. Identity belongs on the acquisition edge, not the blob. Structured
+  `pdf.ValidationReport` `Evidence` stays **withdrawn**; note also that no
+  artifact row exists for a failed acquisition, so failed receipts carry a coarse
+  terminal reason, not findings. Consumers may describe papio's validation
+  *findings*; they may not claim to relay a full report.
 - **List growth uses new methods carrying the `agentjson` `{name: [],
   truncated}` envelope**, never a widened existing result — but the envelope
   alone does not satisfy the consumer. `agentjson.Capped` documents its flag as
@@ -194,19 +192,33 @@ than in a backlog.
 1. **Browser adoption synthesised the obtained version.** **FIXED** — adoption now
    always records `unknown` (`internal/app/browser_adopt.go`); the request's
    `desired_version` is a ranking preference and is never echoed as an obtained
-   fact. Regression: `TestAdoptedCandidateVersionIsAlwaysUnknown` asserts `unknown`
-   across every `desired_version`, and fails on the old code with the request
-   echoed back (`accepted` in, `accepted` out).
+   fact. A review of the first fix found it incomplete: adoption keys its candidate
+   by content hash and `InsertCandidates` is `INSERT OR IGNORE`, so re-adopting the
+   same bytes re-read the pre-existing row and its old `published` claim survived —
+   as did a candidate parked for identity review before the fix. Both paths now
+   normalise through `Store.MarkCandidateVersionUnobserved`, which is deliberately
+   one-way: no setter can put a concrete version back, because no caller is
+   entitled to invent one. Resolver candidates keep their source-reported version.
+   Regressions: `TestAdoptedCandidateVersionIsAlwaysUnknown` (fails on the original
+   code with the request echoed back — `accepted` in, `accepted` out) and
+   `TestAdoptDownloadNormalizesAPreUpgradeSynthesizedVersion`.
 2. **Provenance was resolved by content hash, borrowing another job's candidate.**
-   **FIXED** — `Store.CandidateForArtifact(ctx, jobID, sha)` prefers the job's own
-   accepted candidate and keeps the hash scan only for cache-completed jobs, which
-   have no candidate of their own. Regressions:
-   `TestExportReportsThisJobsProvenanceNotAnotherJobsSharingTheArtifact` (fails on
-   the old lookup with `open_access` reported for an institutional acquisition) and
+   **FIXED** — `Store.CandidateForArtifact(ctx, jobID, sha)` reads the job's own
+   candidate, but only when it is `accepted` and belongs to that job; the
+   digest-keyed scan is a fallback and also requires an accepted candidate. The
+   same review found the first fix could newly prefer a *rejected* selection on a
+   cache-completed job, and that the fallback reconstructed provenance from the
+   earliest job holding the digest while `FindArtifactByDOI` had actually selected
+   the newest — so the cache path now carries the source acquisition's candidate
+   forward instead of leaving it to be guessed. Regressions:
+   `TestExportReportsThisJobsProvenanceNotAnotherJobsSharingTheArtifact`,
+   `TestExportIgnoresARejectedSelectionAndUsesTheAcceptedAcquisition` (fails
+   without the accepted check by publishing `all-rights-reserved` from a rejected
+   candidate), `TestLocalCacheCompletesWithoutResolverOrFetch`, and
    `TestExportFallsBackToOriginalAcquisitionForCacheCompletedJob`, which pins the
    fallback so it is not "simplified" away later.
 3. **`identity_result` is last-writer-wins across jobs sharing a digest**
-   (`internal/job/job.go` `UpsertArtifact`'s `ON CONFLICT … DO UPDATE`). **OPEN.**
+   (`internal/job` `UpsertArtifact`'s `ON CONFLICT … DO UPDATE`). **OPEN.**
    Identity is computed against a per-job target, so a later acquisition rewrites
    an earlier one's finding. Move it to the acquisition edge. Not yet load-bearing:
    nothing published today reads it as a per-acquisition fact — the receipt would
@@ -214,4 +226,8 @@ than in a backlog.
    is agreed.
 
 Items 1 and 2 were live defects in shipped output, independent of any consumer:
-item 2 mis-attributed reuse licences in exported bundles.
+item 2 mis-attributed reuse licences in exported bundles. Both were landed, then
+reviewed, and the review found further defects in each — including one the first
+fix introduced. Pre-fix bundles are **silently** wrong where they are wrong: the
+`provenance_digest` signs whatever candidate block was written, so a bundle cannot
+self-detect the mis-attribution.

@@ -12,7 +12,7 @@ import (
 func TestEnrichWorkRequestMetadataOnlyFillsEmptyFields(t *testing.T) {
 	js := testStore(t)
 	ctx := context.Background()
-	jobID, err := js.CreateRequest(ctx, "wr_enrich_store_01", work.Work{DOI: "10.1002/example"}, "", "", testPolicy(), nil)
+	jobID, err := js.CreateRequest(ctx, "wr_enrich_store_01", work.Work{DOI: "10.1002/example"}, "", "", testPolicy(), nil, PrincipalUnknown)
 	if err != nil {
 		t.Fatal(err)
 	}

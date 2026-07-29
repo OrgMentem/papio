@@ -118,7 +118,7 @@ func createJob(t *testing.T, jobs *job.Store, requestID, itemKey string, states 
 	ctx := context.Background()
 	jobID, err := jobs.CreateRequest(ctx, requestID, work.Work{
 		DOI: "10.1000/" + strings.ToLower(itemKey), Title: "Paper " + itemKey,
-	}, itemKey, "", job.Policy{AccessMode: "conservative", DesiredVersion: "any", FetchMaxBytes: 1 << 20}, nil)
+	}, itemKey, "", job.Policy{AccessMode: "conservative", DesiredVersion: "any", FetchMaxBytes: 1 << 20}, nil, job.PrincipalUnknown)
 	if err != nil {
 		t.Fatal(err)
 	}

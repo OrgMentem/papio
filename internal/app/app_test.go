@@ -616,6 +616,17 @@ func TestLocalCacheCompletesWithoutResolverOrFetch(t *testing.T) {
 	if fetches != 1 || adapter.calls != 1 {
 		t.Fatalf("cache repeated network: fetch=%d resolve=%d", fetches, adapter.calls)
 	}
+	// The cached job did no acquisition of its own: these are the first job's
+	// bytes, so the first job's accepted candidate is the honest provenance and
+	// must be recorded rather than reconstructed from the digest later (ADR-0007).
+	firstRow, _ := jobs.Get(context.Background(), first)
+	if cached.SelectedCandidateID == 0 {
+		t.Fatal("cache-completed job recorded no provenance candidate")
+	}
+	if cached.SelectedCandidateID != firstRow.SelectedCandidateID {
+		t.Fatalf("cache provenance candidate = %d, want the source acquisition's %d",
+			cached.SelectedCandidateID, firstRow.SelectedCandidateID)
+	}
 }
 
 func TestWrongPaperFallsThroughToNextCandidate(t *testing.T) {
@@ -836,7 +847,7 @@ func TestValidationPersistsArtifactMetadataBeforePromotion(t *testing.T) {
 	svc, jobs := newTestService(t)
 	id, err := jobs.CreateRequest(ctx, "wr_artifact_metadata_first", work.Work{DOI: "10.1002/example"}, "", "", job.Policy{
 		AccessMode: config.ModeConservative, DesiredVersion: "any",
-	}, nil)
+	}, nil, job.PrincipalUnknown)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -903,7 +914,7 @@ func TestValidationRemovesMetadataWhenPromotionFails(t *testing.T) {
 	svc, jobs := newTestService(t)
 	id, err := jobs.CreateRequest(ctx, "wr_promotion_rollback", work.Work{DOI: "10.1002/example"}, "", "", job.Policy{
 		AccessMode: config.ModeConservative, DesiredVersion: "any",
-	}, nil)
+	}, nil, job.PrincipalUnknown)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1117,7 +1128,7 @@ func TestReviewOverrideDoesNotBypassRejectOrUnsafePDF(t *testing.T) {
 			}
 			id, err := jobs.CreateRequest(context.Background(), "wr_override_"+name, work.Work{DOI: "10.1002/example"}, "", "", job.Policy{
 				AccessMode: config.ModeConservative, DesiredVersion: "any",
-			}, nil)
+			}, nil, job.PrincipalUnknown)
 			if err != nil {
 				t.Fatal(err)
 			}

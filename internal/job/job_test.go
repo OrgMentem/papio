@@ -42,11 +42,11 @@ func testWork() work.Work {
 func TestCreateRequestIsIdempotent(t *testing.T) {
 	js := testStore(t)
 	ctx := context.Background()
-	j1, err := js.CreateRequest(ctx, "wr_test_0001", testWork(), "", "", testPolicy(), nil)
+	j1, err := js.CreateRequest(ctx, "wr_test_0001", testWork(), "", "", testPolicy(), nil, PrincipalUnknown)
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	j2, err := js.CreateRequest(ctx, "wr_test_0001", testWork(), "", "", testPolicy(), nil)
+	j2, err := js.CreateRequest(ctx, "wr_test_0001", testWork(), "", "", testPolicy(), nil, PrincipalUnknown)
 	if err != nil {
 		t.Fatalf("resubmit: %v", err)
 	}
@@ -65,7 +65,7 @@ func TestCreateRequestIsIdempotent(t *testing.T) {
 func TestTransitionCASRejectsWrongFromState(t *testing.T) {
 	js := testStore(t)
 	ctx := context.Background()
-	id, _ := js.CreateRequest(ctx, "wr_test_0002", testWork(), "", "", testPolicy(), nil)
+	id, _ := js.CreateRequest(ctx, "wr_test_0002", testWork(), "", "", testPolicy(), nil, PrincipalUnknown)
 
 	if err := js.Transition(ctx, id, StateQueued, StateResolving, nil); err != nil {
 		t.Fatalf("queued->resolving: %v", err)
@@ -83,18 +83,18 @@ func TestTransitionCASRejectsWrongFromState(t *testing.T) {
 func TestTerminalTransitionRecordsReasonAndClearsLease(t *testing.T) {
 	js := testStore(t)
 	ctx := context.Background()
-	id, _ := js.CreateRequest(ctx, "wr_test_0003", testWork(), "", "", testPolicy(), nil)
+	id, _ := js.CreateRequest(ctx, "wr_test_0003", testWork(), "", "", testPolicy(), nil, PrincipalUnknown)
 	if _, err := js.ClaimNext(ctx, "owner1", time.Minute); err != nil {
 		t.Fatalf("claim: %v", err)
 	}
 	if err := js.Transition(ctx, id, StateQueued, StateResolving, nil); err != nil {
 		t.Fatalf("to resolving: %v", err)
 	}
-	if err := js.Transition(ctx, id, StateResolving, StateUnavailable, nil, WithTerminalReason("no candidates")); err != nil {
+	if err := js.Transition(ctx, id, StateResolving, StateUnavailable, nil, WithTerminalReason(TerminalReasonCandidatesExhausted)); err != nil {
 		t.Fatalf("to unavailable: %v", err)
 	}
 	row, _ := js.Get(ctx, id)
-	if row.TerminalReason != "no candidates" {
+	if row.TerminalReason != string(TerminalReasonCandidatesExhausted) {
 		t.Fatalf("terminal reason = %q", row.TerminalReason)
 	}
 	// Terminal jobs are not claimable.
@@ -107,7 +107,7 @@ func TestTerminalTransitionRecordsReasonAndClearsLease(t *testing.T) {
 func TestClaimNextHonorsLeasesAndRetryAt(t *testing.T) {
 	js := testStore(t)
 	ctx := context.Background()
-	id, _ := js.CreateRequest(ctx, "wr_test_0004", testWork(), "", "", testPolicy(), nil)
+	id, _ := js.CreateRequest(ctx, "wr_test_0004", testWork(), "", "", testPolicy(), nil, PrincipalUnknown)
 
 	got, err := js.ClaimNext(ctx, "owner1", time.Minute)
 	if err != nil || got == nil || got.ID != id {
@@ -143,7 +143,7 @@ func TestClaimNextHonorsLeasesAndRetryAt(t *testing.T) {
 func TestRecoverStaleRewindsMidflightToResolving(t *testing.T) {
 	js := testStore(t)
 	ctx := context.Background()
-	id, _ := js.CreateRequest(ctx, "wr_test_0005", testWork(), "", "", testPolicy(), nil)
+	id, _ := js.CreateRequest(ctx, "wr_test_0005", testWork(), "", "", testPolicy(), nil, PrincipalUnknown)
 
 	// Simulate a crashed daemon: job mid-fetch with an expired lease.
 	if _, err := js.ClaimNext(ctx, "dead-daemon", -time.Second); err != nil {
@@ -172,7 +172,7 @@ func TestRecoverStaleRewindsMidflightToResolving(t *testing.T) {
 func TestRecoveredResolvingJobIsImmediatelyClaimable(t *testing.T) {
 	js := testStore(t)
 	ctx := context.Background()
-	id, _ := js.CreateRequest(ctx, "wr_test_reclaim", testWork(), "", "", testPolicy(), nil)
+	id, _ := js.CreateRequest(ctx, "wr_test_reclaim", testWork(), "", "", testPolicy(), nil, PrincipalUnknown)
 	if _, err := js.ClaimNext(ctx, "dead-daemon", -time.Second); err != nil {
 		t.Fatal(err)
 	}
@@ -194,7 +194,7 @@ func TestRecoveredResolvingJobIsImmediatelyClaimable(t *testing.T) {
 func TestRetryReopensFailedJobOnlyByExplicitCommand(t *testing.T) {
 	js := testStore(t)
 	ctx := context.Background()
-	id, _ := js.CreateRequest(ctx, "wr_test_retry", testWork(), "", "", testPolicy(), nil)
+	id, _ := js.CreateRequest(ctx, "wr_test_retry", testWork(), "", "", testPolicy(), nil, PrincipalUnknown)
 	if err := js.Transition(ctx, id, StateQueued, StateResolving, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -219,7 +219,7 @@ func TestRetryReopensFailedJobOnlyByExplicitCommand(t *testing.T) {
 func TestCandidatesDedupeAndOrder(t *testing.T) {
 	js := testStore(t)
 	ctx := context.Background()
-	id, _ := js.CreateRequest(ctx, "wr_test_0006", testWork(), "", "", testPolicy(), nil)
+	id, _ := js.CreateRequest(ctx, "wr_test_0006", testWork(), "", "", testPolicy(), nil, PrincipalUnknown)
 
 	cands := []Candidate{
 		{JobID: id, Source: "unpaywall", URLRedacted: "https://x/1", URLKey: "k1", Version: "published", AccessBasis: "open_access", ReuseLicense: "unknown", Rank: 1},
@@ -253,7 +253,7 @@ func TestCandidatesDedupeAndOrder(t *testing.T) {
 func TestArtifactCacheByDOI(t *testing.T) {
 	js := testStore(t)
 	ctx := context.Background()
-	id, _ := js.CreateRequest(ctx, "wr_test_0007", testWork(), "", "", testPolicy(), nil)
+	id, _ := js.CreateRequest(ctx, "wr_test_0007", testWork(), "", "", testPolicy(), nil, PrincipalUnknown)
 
 	sha := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	if err := js.UpsertArtifact(ctx, Artifact{SHA256: sha, SizeBytes: 10, MIME: "application/pdf", PageCount: 3, Path: "/tmp/x.pdf", IdentityResult: "pass"}); err != nil {
@@ -277,21 +277,25 @@ func TestArtifactCacheByDOI(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	hit, err := js.FindArtifactByDOI(ctx, "10.1002/example")
+	hit, source, err := js.FindArtifactByDOI(ctx, "10.1002/example")
 	if err != nil || hit == nil || hit.SHA256 != sha {
 		t.Fatalf("cache lookup = %+v, %v; want artifact %s", hit, err, sha)
 	}
-	miss, err := js.FindArtifactByDOI(ctx, "10.9999/other")
-	if err != nil || miss != nil {
-		t.Fatalf("cache miss lookup = %+v, %v; want nil", miss, err)
+	// This fixture's source job reached ready with no candidate at all, so there
+	// is no provenance to carry: the lookup must say so rather than guess.
+	if source != nil {
+		t.Fatalf("cache lookup source candidate = %+v, want nil for a job with no selected candidate", source)
+	}
+	miss, missSource, err := js.FindArtifactByDOI(ctx, "10.9999/other")
+	if err != nil || miss != nil || missSource != nil {
+		t.Fatalf("cache miss lookup = %+v/%+v, %v; want nil", miss, missSource, err)
 	}
 }
 
 func TestFillWorkMetadataOnlyFillsMissingAndRejectsIdentifierConflict(t *testing.T) {
 	js := testStore(t)
 	ctx := context.Background()
-	id, err := js.CreateRequest(ctx, "wr_metadata_01",
-		work.Work{DOI: "10.1002/example", Title: "Requested Title"}, "", "", testPolicy(), nil)
+	id, err := js.CreateRequest(ctx, "wr_metadata_01", work.Work{DOI: "10.1002/example", Title: "Requested Title"}, "", "", testPolicy(), nil, PrincipalUnknown)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -316,7 +320,7 @@ func TestFillWorkMetadataOnlyFillsMissingAndRejectsIdentifierConflict(t *testing
 func TestReserveCostIsDurableAndAtomic(t *testing.T) {
 	js := testStore(t)
 	ctx := context.Background()
-	id, _ := js.CreateRequest(ctx, "wr_cost_0001", testWork(), "", "", testPolicy(), nil)
+	id, _ := js.CreateRequest(ctx, "wr_cost_0001", testWork(), "", "", testPolicy(), nil, PrincipalUnknown)
 	limit := 1.0
 	if err := js.ReserveCost(ctx, id, "paid", 0.6, &limit); err != nil {
 		t.Fatal(err)
@@ -338,19 +342,19 @@ func TestReserveCostIsDurableAndAtomic(t *testing.T) {
 func TestCancelIsIdempotentAndNeverOverwritesTerminalResult(t *testing.T) {
 	js := testStore(t)
 	ctx := context.Background()
-	id, _ := js.CreateRequest(ctx, "wr_cancel_001", testWork(), "", "", testPolicy(), nil)
-	if err := js.Cancel(ctx, id, "user request"); err != nil {
+	id, _ := js.CreateRequest(ctx, "wr_cancel_001", testWork(), "", "", testPolicy(), nil, PrincipalUnknown)
+	if err := js.Cancel(ctx, id, TerminalReasonCancelledByUser); err != nil {
 		t.Fatal(err)
 	}
-	if err := js.Cancel(ctx, id, "again"); err != nil {
+	if err := js.Cancel(ctx, id, TerminalReasonCancelledByUser); err != nil {
 		t.Fatalf("repeat cancel: %v", err)
 	}
 	row, _ := js.Get(ctx, id)
-	if row.State != StateCancelled || row.TerminalReason != "user request" {
+	if row.State != StateCancelled || row.TerminalReason != string(TerminalReasonCancelledByUser) {
 		t.Fatalf("cancelled row = %+v", row)
 	}
 
-	readyID, _ := js.CreateRequest(ctx, "wr_ready_term", testWork(), "", "", testPolicy(), nil)
+	readyID, _ := js.CreateRequest(ctx, "wr_ready_term", testWork(), "", "", testPolicy(), nil, PrincipalUnknown)
 	if err := js.Transition(ctx, readyID, StateQueued, StateResolving, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -369,7 +373,7 @@ func TestCancelIsIdempotentAndNeverOverwritesTerminalResult(t *testing.T) {
 func TestCancelClosesAllOpenHumanActions(t *testing.T) {
 	js := testStore(t)
 	ctx := context.Background()
-	id, err := js.CreateRequest(ctx, "wr_cancel_actions", testWork(), "", "", testPolicy(), nil)
+	id, err := js.CreateRequest(ctx, "wr_cancel_actions", testWork(), "", "", testPolicy(), nil, PrincipalUnknown)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -399,7 +403,7 @@ func TestCancelClosesAllOpenHumanActions(t *testing.T) {
 func TestReadyTransitionResolvesOpenHumanActions(t *testing.T) {
 	js := testStore(t)
 	ctx := context.Background()
-	id, err := js.CreateRequest(ctx, "wr_ready_actions", testWork(), "", "", testPolicy(), nil)
+	id, err := js.CreateRequest(ctx, "wr_ready_actions", testWork(), "", "", testPolicy(), nil, PrincipalUnknown)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -434,7 +438,7 @@ func TestCloseStaleHumanActionsClosesOnlyTerminalJobs(t *testing.T) {
 	terminalStates := []string{StateReady, StateImported, StateUnavailable, StateFailed, StateCancelled}
 	terminalIDs := make(map[string]bool, len(terminalStates))
 	for _, state := range terminalStates {
-		id, err := js.CreateRequest(ctx, "wr_stale_"+state, testWork(), "", "", testPolicy(), nil)
+		id, err := js.CreateRequest(ctx, "wr_stale_"+state, testWork(), "", "", testPolicy(), nil, PrincipalUnknown)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -457,7 +461,7 @@ func TestCloseStaleHumanActionsClosesOnlyTerminalJobs(t *testing.T) {
 		}
 		terminalIDs[id] = true
 	}
-	awaitingID, err := js.CreateRequest(ctx, "wr_stale_awaiting", testWork(), "", "", testPolicy(), nil)
+	awaitingID, err := js.CreateRequest(ctx, "wr_stale_awaiting", testWork(), "", "", testPolicy(), nil, PrincipalUnknown)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -497,7 +501,7 @@ func TestCloseStaleHumanActionsClosesOnlyTerminalJobs(t *testing.T) {
 func TestConservativeAdvisorySurvivesTerminalCloseAndSweep(t *testing.T) {
 	js := testStore(t)
 	ctx := context.Background()
-	id, err := js.CreateRequest(ctx, "wr_advisory", testWork(), "", "", testPolicy(), nil)
+	id, err := js.CreateRequest(ctx, "wr_advisory", testWork(), "", "", testPolicy(), nil, PrincipalUnknown)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -526,7 +530,7 @@ func TestConservativeAdvisorySurvivesTerminalCloseAndSweep(t *testing.T) {
 func TestOpenHumanActionRefreshesExistingOpenKind(t *testing.T) {
 	js := testStore(t)
 	ctx := context.Background()
-	id, err := js.CreateRequest(ctx, "wr_action_dedupe", testWork(), "", "", testPolicy(), nil)
+	id, err := js.CreateRequest(ctx, "wr_action_dedupe", testWork(), "", "", testPolicy(), nil, PrincipalUnknown)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -582,7 +586,7 @@ func TestAwaitingHumanResumeEdgesForBrowserBridge(t *testing.T) {
 	}
 	js := testStore(t)
 	ctx := context.Background()
-	id, _ := js.CreateRequest(ctx, "wr_awaiting_edges", testWork(), "", "", testPolicy(), nil)
+	id, _ := js.CreateRequest(ctx, "wr_awaiting_edges", testWork(), "", "", testPolicy(), nil, PrincipalUnknown)
 	if err := js.Transition(ctx, id, StateQueued, StateResolving, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -601,7 +605,7 @@ func TestAwaitingHumanResumeEdgesForBrowserBridge(t *testing.T) {
 func TestRepairParkWithActionLeavesLateLeaseUntouched(t *testing.T) {
 	ctx := context.Background()
 	js := testStore(t)
-	id, err := js.CreateRequest(ctx, "wr_repair_late_lease", testWork(), "", "", testPolicy(), nil)
+	id, err := js.CreateRequest(ctx, "wr_repair_late_lease", testWork(), "", "", testPolicy(), nil, PrincipalUnknown)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -651,7 +655,7 @@ func TestRepairParkWithActionLeavesLateLeaseUntouched(t *testing.T) {
 func parkIdentityReview(t *testing.T, js *Store, requestID string) (string, int64, int64) {
 	t.Helper()
 	ctx := context.Background()
-	id, err := js.CreateRequest(ctx, requestID, testWork(), "", "", testPolicy(), nil)
+	id, err := js.CreateRequest(ctx, requestID, testWork(), "", "", testPolicy(), nil, PrincipalUnknown)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -870,7 +874,7 @@ func TestDismissHumanActionClosesStaleHandoffWithoutCancellingNeedsReview(t *tes
 func TestDismissHumanActionCancelsAwaitingHandoff(t *testing.T) {
 	js := testStore(t)
 	ctx := context.Background()
-	id, err := js.CreateRequest(ctx, "wr_dismiss_awaiting_handoff", testWork(), "", "", testPolicy(), nil)
+	id, err := js.CreateRequest(ctx, "wr_dismiss_awaiting_handoff", testWork(), "", "", testPolicy(), nil, PrincipalUnknown)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -923,7 +927,7 @@ func TestDismissHumanActionMissingActionConflicts(t *testing.T) {
 func TestDismissHumanActionWorksWithoutQuarantineBinding(t *testing.T) {
 	js := testStore(t)
 	ctx := context.Background()
-	id, err := js.CreateRequest(ctx, "wr_dismiss_unbound", testWork(), "", "", testPolicy(), nil)
+	id, err := js.CreateRequest(ctx, "wr_dismiss_unbound", testWork(), "", "", testPolicy(), nil, PrincipalUnknown)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1004,7 +1008,7 @@ func TestListOldestRotatesPastPriorMaintenancePage(t *testing.T) {
 	ids := make([]string, 0, pageSize+1)
 	start := time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC)
 	for i := range pageSize + 1 {
-		id, err := js.CreateRequest(ctx, NewID("wr_list_oldest"), testWork(), "", "", testPolicy(), nil)
+		id, err := js.CreateRequest(ctx, NewID("wr_list_oldest"), testWork(), "", "", testPolicy(), nil, PrincipalUnknown)
 		if err != nil {
 			t.Fatal(err)
 		}

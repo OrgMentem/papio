@@ -10,6 +10,25 @@ execution records in `notes/acquisition-stack-plan.md`.
 
 ## [Unreleased]
 
+### Added
+
+- **`jobs.list_v2` and `actions.list_v2`, whose `truncated` is a proof.** The
+  existing flag is inferred from a full page, so an exactly-full final page is
+  indistinguishable from a partial one — fine for a human raising `--limit`, not
+  fine for a program reconciling a cohort of hundreds of works. The new methods
+  reach one row past the limit and report whether it was there. `papio jobs list`
+  and `papio actions list` use them and fall back to the old methods against an
+  older daemon; `papio actions list` gains `--limit` to go with it.
+- **`jobs.repair_awaiting_human`** returns an *orphaned* parked job — one
+  awaiting a human with no open action left to act on — to `resolving`. Nothing
+  else could: `jobs.retry` refuses parked jobs by design and `actions open` needs
+  an open handoff action, so the row was only recoverable by the daemon's own
+  background sweep. Deliberately orphan-only and it takes no action ids, so it
+  cannot close an action the caller never read. Handoff offers still never expire.
+- **Acquisitions record which principal requested them** (`cli`, `mcp`, or
+  `unknown`) instead of a hardcoded `cli`, and terminal reasons are now a closed
+  vocabulary rather than free text. Persisted values are unchanged.
+
 ### Fixed
 
 - **An acquisition no longer inherits another acquisition's licence.** Artifacts
@@ -18,11 +37,17 @@ execution records in `notes/acquisition-stack-plan.md`.
   same file. Bundle export resolved provenance by content hash alone and picked
   the *earliest* job holding that hash, so an institutionally-acquired job could
   export the earlier job's `access_basis` and `reuse_license`: first-writer-wins
-  rights attribution on a digest. Export now reads the job's own accepted
-  candidate and falls back to the hash scan only for jobs completed from the
-  local cache, which legitimately have no candidate of their own. If you gate
-  retention or redistribution on a bundle's `reuse_license`, re-export any bundle
-  for a work you acquired more than once.
+  rights attribution on a digest. Provenance now comes from the job's own
+  candidate, and only when that candidate was actually *accepted* — a job can
+  carry a rejected selection forward through crash recovery, and reading it would
+  have published the licence of a file papio threw away. A job completing from the
+  local cache now records the source acquisition's candidate rather than leaving it
+  to be reconstructed from the digest later.
+  **If you gate retention or redistribution on a bundle's `reuse_license`,
+  re-export any bundle written before this release whose PDF you acquired through
+  more than one job — including under different identifiers, since the affected
+  condition is a shared file, not a shared work record.** A wrong bundle cannot
+  self-detect: its `provenance_digest` signs whichever candidate block was written.
 - **A browser-adopted download no longer claims a version papio never observed.**
   Adoption labelled the file `published`, or — worse — copied the request's
   `desired_version` *preference* into the obtained *fact*, so asking for an
@@ -30,6 +55,8 @@ execution records in `notes/acquisition-stack-plan.md`.
   sees bytes arrive from your browser and never learns which version you chose,
   so the adopted version is now always `unknown`. Its access basis
   (`institutional`) and licence (`unknown`) were already honest and are unchanged.
+  Adopted candidates written before this release are normalised when the same
+  bytes are adopted again or an identity review of them is accepted.
 
 ## [0.13.0] - 2026-07-27
 

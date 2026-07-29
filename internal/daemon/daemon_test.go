@@ -283,7 +283,7 @@ func TestSchedulerRecoversExpiredLease(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = db.Close() })
 	jobs := &job.Store{S: db}
-	id, err := jobs.CreateRequest(ctx, "request_01", work.Work{DOI: "10.1000/example", Title: "Example", Year: 2020}, "", "", job.Policy{AccessMode: "conservative", DesiredVersion: "any", FetchMaxBytes: 1024}, nil)
+	id, err := jobs.CreateRequest(ctx, "request_01", work.Work{DOI: "10.1000/example", Title: "Example", Year: 2020}, "", "", job.Policy{AccessMode: "conservative", DesiredVersion: "any", FetchMaxBytes: 1024}, nil, job.PrincipalUnknown)
 	if err != nil {
 		t.Fatalf("CreateRequest: %v", err)
 	}

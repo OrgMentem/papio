@@ -194,7 +194,7 @@ func TestFailures(t *testing.T) {
 func createFailure(t *testing.T, js *Store, requestID, state, reason string, urls []string, selectFirst bool) string {
 	t.Helper()
 	ctx := context.Background()
-	id, err := js.CreateRequest(ctx, requestID, testWork(), "", "", testPolicy(), nil)
+	id, err := js.CreateRequest(ctx, requestID, testWork(), "", "", testPolicy(), nil, PrincipalUnknown)
 	if err != nil {
 		t.Fatalf("create %s: %v", requestID, err)
 	}
@@ -234,14 +234,14 @@ func createFailure(t *testing.T, js *Store, requestID, state, reason string, url
 func createFailureWithTerminalReason(t *testing.T, js *Store, requestID, state, reason string) {
 	t.Helper()
 	ctx := context.Background()
-	id, err := js.CreateRequest(ctx, requestID, testWork(), "", "", testPolicy(), nil)
+	id, err := js.CreateRequest(ctx, requestID, testWork(), "", "", testPolicy(), nil, PrincipalUnknown)
 	if err != nil {
 		t.Fatalf("create %s: %v", requestID, err)
 	}
 	if err := js.Transition(ctx, id, StateQueued, StateResolving, nil); err != nil {
 		t.Fatalf("to resolving: %v", err)
 	}
-	if err := js.Transition(ctx, id, StateResolving, state, nil, WithTerminalReason(reason)); err != nil {
+	if err := js.Transition(ctx, id, StateResolving, state, nil, WithTerminalReason(TerminalReason(reason))); err != nil {
 		t.Fatalf("to %s: %v", state, err)
 	}
 }

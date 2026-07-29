@@ -31,7 +31,7 @@ func TestSchedulerSweepsOnlyTerminalQuarantine(t *testing.T) {
 	policy := job.Policy{AccessMode: "conservative", DesiredVersion: "any", FetchMaxBytes: 1 << 20}
 	workItem := work.Work{DOI: "10.1000/scheduler-sweep", Title: "Scheduler sweep", Authors: []string{"A"}, Year: 2026}
 
-	terminalID, err := jobs.CreateRequest(ctx, "scheduler-sweep-terminal-0001", workItem, "", "", policy, nil)
+	terminalID, err := jobs.CreateRequest(ctx, "scheduler-sweep-terminal-0001", workItem, "", "", policy, nil, job.PrincipalUnknown)
 	if err != nil {
 		t.Fatalf("create terminal job: %v", err)
 	}
@@ -42,7 +42,7 @@ func TestSchedulerSweepsOnlyTerminalQuarantine(t *testing.T) {
 		t.Fatalf("terminal resolving->unavailable: %v", err)
 	}
 
-	reviewID, err := jobs.CreateRequest(ctx, "scheduler-sweep-review-0001", workItem, "", "", policy, nil)
+	reviewID, err := jobs.CreateRequest(ctx, "scheduler-sweep-review-0001", workItem, "", "", policy, nil, job.PrincipalUnknown)
 	if err != nil {
 		t.Fatalf("create review job: %v", err)
 	}

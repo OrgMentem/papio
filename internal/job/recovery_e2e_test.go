@@ -22,7 +22,7 @@ func TestRecoverStaleRewindsDurableBoundariesAndSweepsTerminalQuarantine(t *test
 
 	newInterrupted := func(requestID, state string) string {
 		t.Helper()
-		id, err := jobs.CreateRequest(ctx, requestID, testWork(), "", "", testPolicy(), nil)
+		id, err := jobs.CreateRequest(ctx, requestID, testWork(), "", "", testPolicy(), nil, PrincipalUnknown)
 		if err != nil {
 			t.Fatalf("create %s: %v", state, err)
 		}
@@ -69,7 +69,7 @@ func TestRecoverStaleRewindsDurableBoundariesAndSweepsTerminalQuarantine(t *test
 		t.Fatalf("record interrupted fetch attempt: %v", err)
 	}
 
-	needsReviewID, err := jobs.CreateRequest(ctx, "recover-review-0001", testWork(), "", "", testPolicy(), nil)
+	needsReviewID, err := jobs.CreateRequest(ctx, "recover-review-0001", testWork(), "", "", testPolicy(), nil, PrincipalUnknown)
 	if err != nil {
 		t.Fatalf("create needs-review job: %v", err)
 	}
@@ -83,7 +83,7 @@ func TestRecoverStaleRewindsDurableBoundariesAndSweepsTerminalQuarantine(t *test
 		t.Fatalf("open review action: %v", err)
 	}
 
-	awaitingID, err := jobs.CreateRequest(ctx, "recover-awaiting-0001", testWork(), "", "", testPolicy(), nil)
+	awaitingID, err := jobs.CreateRequest(ctx, "recover-awaiting-0001", testWork(), "", "", testPolicy(), nil, PrincipalUnknown)
 	if err != nil {
 		t.Fatalf("create awaiting-human job: %v", err)
 	}
@@ -97,7 +97,7 @@ func TestRecoverStaleRewindsDurableBoundariesAndSweepsTerminalQuarantine(t *test
 		t.Fatalf("open awaiting action: %v", err)
 	}
 
-	terminalID, err := jobs.CreateRequest(ctx, "recover-terminal-0001", testWork(), "", "", testPolicy(), nil)
+	terminalID, err := jobs.CreateRequest(ctx, "recover-terminal-0001", testWork(), "", "", testPolicy(), nil, PrincipalUnknown)
 	if err != nil {
 		t.Fatalf("create terminal job: %v", err)
 	}
@@ -164,7 +164,7 @@ func TestRecoverStaleRewindsDurableBoundariesAndSweepsTerminalQuarantine(t *test
 	if attempts != 1 {
 		t.Fatalf("recovery attempts = %d, want existing interrupted attempt only", attempts)
 	}
-	replayed, err := jobs.CreateRequest(ctx, "recover-fetching-0001", testWork(), "", "", testPolicy(), nil)
+	replayed, err := jobs.CreateRequest(ctx, "recover-fetching-0001", testWork(), "", "", testPolicy(), nil, PrincipalUnknown)
 	if err != nil || replayed != fetchingID {
 		t.Fatalf("resubmission after recovery = %q, %v; want live job %q", replayed, err, fetchingID)
 	}
@@ -205,7 +205,7 @@ func TestSweepTerminalQuarantineContinuesAfterCleanupError(t *testing.T) {
 
 	newTerminal := func(requestID string) string {
 		t.Helper()
-		id, err := jobs.CreateRequest(ctx, requestID, testWork(), "", "", testPolicy(), nil)
+		id, err := jobs.CreateRequest(ctx, requestID, testWork(), "", "", testPolicy(), nil, PrincipalUnknown)
 		if err != nil {
 			t.Fatalf("create terminal job: %v", err)
 		}

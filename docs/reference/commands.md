@@ -82,6 +82,7 @@ papio actions list [flags]
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
 | `--all` | `bool` | `false` | include resolved actions |
+| `--limit` | `int` | `100` | maximum rows (1-500) |
 
 ### `papio actions open`
 

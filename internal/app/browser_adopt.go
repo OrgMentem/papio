@@ -112,6 +112,14 @@ func (s *Service) AdoptDownload(ctx context.Context, jobID, path string) error {
 		_ = os.Remove(temp)
 		return err
 	}
+	// InsertCandidates is INSERT OR IGNORE on (job_id, url_key), so re-adopting
+	// the same bytes keeps whatever row already exists — including one written
+	// before papio stopped synthesizing the version. Normalize before reading it
+	// back, or the old `published` claim outlives the fix.
+	if err := s.Jobs.MarkCandidateVersionUnobserved(ctx, id); err != nil {
+		_ = os.Remove(temp)
+		return err
+	}
 	stored, err := s.Jobs.GetCandidate(ctx, id)
 	if err != nil {
 		_ = os.Remove(temp)

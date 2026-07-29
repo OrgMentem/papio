@@ -38,7 +38,7 @@ func readyFixture(t *testing.T) (*Exporter, string, string) {
 	}
 	id, err := jobs.CreateRequest(ctx, "wr_bundle_001", work.Work{
 		DOI: "10.1002/example", Title: "Example Paper", Authors: []string{"Ada Lovelace"}, Year: 2024,
-	}, "AB12CD34", "", job.Policy{AccessMode: "conservative", DesiredVersion: "any", FetchMaxBytes: 1 << 20}, nil)
+	}, "AB12CD34", "", job.Policy{AccessMode: "conservative", DesiredVersion: "any", FetchMaxBytes: 1 << 20}, nil, job.PrincipalUnknown)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -299,7 +299,7 @@ func TestCacheReadyJobReusesOriginalCandidateProvenance(t *testing.T) {
 	ctx := context.Background()
 	id, err := exporter.Jobs.CreateRequest(ctx, "wr_bundle_cache", work.Work{
 		DOI: "10.1002/example", Title: "Example Paper", Authors: []string{"Ada Lovelace"}, Year: 2024,
-	}, "", "", job.Policy{AccessMode: "conservative", DesiredVersion: "any"}, nil)
+	}, "", "", job.Policy{AccessMode: "conservative", DesiredVersion: "any"}, nil, job.PrincipalUnknown)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -323,7 +323,7 @@ func TestExportRejectsNonReadyAndCorruptExistingTarget(t *testing.T) {
 	ctx := context.Background()
 	queued, _ := exporter.Jobs.CreateRequest(ctx, "wr_notready_01", work.Work{
 		DOI: "10.1002/other", Title: "Other Paper", Authors: []string{"A"}, Year: 2020,
-	}, "", "", job.Policy{AccessMode: "conservative", DesiredVersion: "any"}, nil)
+	}, "", "", job.Policy{AccessMode: "conservative", DesiredVersion: "any"}, nil, job.PrincipalUnknown)
 	if _, _, err := exporter.Export(ctx, queued, t.TempDir()); err == nil {
 		t.Fatal("exported a queued job")
 	}
@@ -350,7 +350,7 @@ func readyJobSharingArtifact(t *testing.T, jobs *job.Store, reqID, sha string, w
 	ctx := context.Background()
 	id, err := jobs.CreateRequest(ctx, reqID, work.Work{
 		DOI: "10.1002/example-b", Title: "Example Paper", Authors: []string{"Ada Lovelace"}, Year: 2024,
-	}, "", "", job.Policy{AccessMode: "delegated", DesiredVersion: "any", FetchMaxBytes: 1 << 20}, nil)
+	}, "", "", job.Policy{AccessMode: "delegated", DesiredVersion: "any", FetchMaxBytes: 1 << 20}, nil, job.PrincipalUnknown)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -435,5 +435,67 @@ func TestExportFallsBackToOriginalAcquisitionForCacheCompletedJob(t *testing.T) 
 	}
 	if b.Candidate.Source != "unpaywall" || b.Candidate.ReuseLicense != "cc-by-4.0" {
 		t.Fatalf("cache-completed bundle candidate = %+v, want the original unpaywall acquisition", b.Candidate)
+	}
+}
+
+// A job can carry a REJECTED selected_candidate_id forward: it is written when a
+// fetch starts, before validation, and the transition SQL COALESCEs it through
+// crash recovery and scheduler retries. If that job then completes from the local
+// cache, provenance must not be read from the file papio threw away.
+func TestExportIgnoresARejectedSelectionAndUsesTheAcceptedAcquisition(t *testing.T) {
+	exporter, _, sha := readyFixture(t)
+	ctx := context.Background()
+	jobs := exporter.Jobs
+
+	id, err := jobs.CreateRequest(ctx, "wr_bundle_rejected", work.Work{
+		DOI: "10.1002/example-rejected", Title: "Example Paper", Authors: []string{"Ada Lovelace"}, Year: 2024,
+	}, "", "", job.Policy{AccessMode: "conservative", DesiredVersion: "any", FetchMaxBytes: 1 << 20}, nil, job.PrincipalCLI)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := jobs.InsertCandidates(ctx, id, []job.Candidate{{
+		JobID: id, Source: "sci-hub-lookalike", URLRedacted: "https://rejected.example/paper.pdf", URLKey: "rejected-key",
+		Version: "published", AccessBasis: "manual", ReuseLicense: "all-rights-reserved",
+		ExpectedMIME: "application/pdf", Direct: true, IdentityConfidence: 1, Rank: 0,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	rejected, _ := jobs.NextPendingCandidate(ctx, id)
+	if rejected == nil {
+		t.Fatal("rejected candidate missing")
+	}
+	if err := jobs.MarkCandidate(ctx, rejected.ID, job.CandidateInvalid); err != nil {
+		t.Fatal(err)
+	}
+	// Reach ready with the rejected candidate still selected, exactly as the
+	// fetch-then-reject-then-cache-hit sequence leaves it.
+	for _, edge := range [][2]string{{job.StateQueued, job.StateResolving}, {job.StateResolving, job.StateFetching}} {
+		if err := jobs.Transition(ctx, id, edge[0], edge[1], nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := jobs.Transition(ctx, id, job.StateFetching, job.StateValidating, nil, job.WithCandidate(rejected.ID)); err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.Transition(ctx, id, job.StateValidating, job.StateReady, nil, job.WithArtifact(sha)); err != nil {
+		t.Fatal(err)
+	}
+	row, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.SelectedCandidateID != rejected.ID {
+		t.Fatalf("fixture did not preserve the rejected selection (%d); this test would prove nothing", row.SelectedCandidateID)
+	}
+
+	_, b, err := exporter.Export(ctx, id, "")
+	if err != nil {
+		t.Fatalf("export: %v", err)
+	}
+	if b.Candidate.ReuseLicense == "all-rights-reserved" || b.Candidate.Source == "sci-hub-lookalike" {
+		t.Fatalf("bundle published the REJECTED candidate's provenance: %+v", b.Candidate)
+	}
+	if b.Candidate.Source != "unpaywall" || b.Candidate.ReuseLicense != "cc-by-4.0" {
+		t.Fatalf("bundle candidate = %+v, want the accepted unpaywall acquisition", b.Candidate)
 	}
 }

@@ -40,6 +40,73 @@ const (
 	StateCancelled     = "cancelled"
 )
 
+// Candidate statuses. Only CandidateAccepted asserts that these bytes were
+// fetched AND validated for the job that selected it, so it is the only status
+// provenance may be read from (ADR-0007).
+const (
+	CandidatePending   = "pending"
+	CandidateFetching  = "fetching"
+	CandidateRetryable = "retryable"
+	CandidateSkipped   = "skipped"
+	CandidateInvalid   = "invalid"
+	CandidateAccepted  = "accepted"
+)
+
+// TerminalReason is the closed, durable vocabulary for terminal acquisition
+// outcomes. Persisted values are intentionally stable: use the constants rather
+// than changing their text.
+type TerminalReason string
+
+const (
+	TerminalReasonUnknown                               TerminalReason = "unknown"
+	TerminalReasonNoLegalCandidates                     TerminalReason = "no legal candidates"
+	TerminalReasonTemporarySourceFailuresDidNotClear    TerminalReason = "temporary source failures did not clear"
+	TerminalReasonTemporaryCandidateFailuresDidNotClear TerminalReason = "temporary candidate failures did not clear"
+	TerminalReasonCandidatesExhausted                   TerminalReason = "all candidates exhausted"
+	TerminalReasonNoIdentifier                          TerminalReason = "no_identifier"
+	TerminalReasonNoEntitlement                         TerminalReason = "no_entitlement"
+	TerminalReasonBrowserRejected                       TerminalReason = "browser_rejected"
+	TerminalReasonDocumentDeliveryAvailable             TerminalReason = "document_delivery_available"
+	TerminalReasonCancelledByUser                       TerminalReason = "cancelled by user"
+	TerminalReasonBrowserCancelled                      TerminalReason = "browser_cancelled"
+	TerminalReasonUserDismissed                         TerminalReason = "user_dismissed"
+	TerminalReasonReviewRejected                        TerminalReason = "review_rejected"
+)
+
+// NormalizeTerminalReason converts a stored terminal reason to the durable
+// vocabulary. Unknown values remain in old databases but are exposed as
+// TerminalReasonUnknown rather than being re-persisted.
+func NormalizeTerminalReason(reason string) TerminalReason {
+	switch TerminalReason(reason) {
+	case TerminalReasonNoLegalCandidates,
+		TerminalReasonTemporarySourceFailuresDidNotClear,
+		TerminalReasonTemporaryCandidateFailuresDidNotClear,
+		TerminalReasonCandidatesExhausted,
+		TerminalReasonNoIdentifier,
+		TerminalReasonNoEntitlement,
+		TerminalReasonBrowserRejected,
+		TerminalReasonDocumentDeliveryAvailable,
+		TerminalReasonCancelledByUser,
+		TerminalReasonBrowserCancelled,
+		TerminalReasonUserDismissed,
+		TerminalReasonReviewRejected:
+		return TerminalReason(reason)
+	default:
+		return TerminalReasonUnknown
+	}
+}
+
+// Principal is the durable source whose entitlement initiated an acquisition.
+// It is intentionally an opaque string: user identities and browser session
+// identifiers are not available as durable, non-secret values.
+type Principal string
+
+const (
+	PrincipalUnknown Principal = "unknown"
+	PrincipalCLI     Principal = "cli"
+	PrincipalMCP     Principal = "mcp"
+)
+
 // Terminal reports whether a state ends the acquisition attempt. ready is the
 // acquisition terminal; imported additionally records a completed Zotero
 // export; other exports remain separate idempotent records.
@@ -217,8 +284,8 @@ type CreateResult struct {
 // CreateRequest inserts a work request, its identifiers, and a queued job in
 // one transaction. Resubmitting the same requestID returns its existing live
 // job; terminal attempts permit a new job.
-func (js *Store) CreateRequest(ctx context.Context, requestID string, w work.Work, zotioKey, collection string, pol Policy, rawIDs map[string]string) (string, error) {
-	result, err := js.createRequest(ctx, requestID, w, zotioKey, collection, pol, rawIDs, false, false)
+func (js *Store) CreateRequest(ctx context.Context, requestID string, w work.Work, zotioKey, collection string, pol Policy, rawIDs map[string]string, principal Principal) (string, error) {
+	result, err := js.createRequest(ctx, requestID, w, zotioKey, collection, pol, rawIDs, principal, false, false)
 	if err != nil {
 		return "", err
 	}
@@ -229,11 +296,14 @@ func (js *Store) CreateRequest(ctx context.Context, requestID string, w work.Wor
 // work.Work.Describe identity. It deliberately excludes title-only matching:
 // titles describe works rather than assert identity, so merging on one could
 // silently discard a distinct acquisition.
-func (js *Store) CreateRequestForWork(ctx context.Context, requestID string, w work.Work, zotioKey, collection string, pol Policy, rawIDs map[string]string, force bool) (CreateResult, error) {
-	return js.createRequest(ctx, requestID, w, zotioKey, collection, pol, rawIDs, force, true)
+func (js *Store) CreateRequestForWork(ctx context.Context, requestID string, w work.Work, zotioKey, collection string, pol Policy, rawIDs map[string]string, principal Principal, force bool) (CreateResult, error) {
+	return js.createRequest(ctx, requestID, w, zotioKey, collection, pol, rawIDs, principal, force, true)
 }
 
-func (js *Store) createRequest(ctx context.Context, requestID string, w work.Work, zotioKey, collection string, pol Policy, rawIDs map[string]string, force, deduplicateWork bool) (CreateResult, error) {
+func (js *Store) createRequest(ctx context.Context, requestID string, w work.Work, zotioKey, collection string, pol Policy, rawIDs map[string]string, principal Principal, force, deduplicateWork bool) (CreateResult, error) {
+	if principal == "" {
+		principal = PrincipalUnknown
+	}
 	if requestID == "" || force {
 		// A force request needs its own work_request row so the live-job
 		// invariant cannot collapse the explicitly requested fresh attempt.
@@ -274,8 +344,8 @@ func (js *Store) createRequest(ctx context.Context, requestID string, w work.Wor
 
 	if _, err := tx.ExecContext(ctx,
 		`INSERT OR IGNORE INTO work_requests (id, created_at, requester, zotio_item_key, collection_key, title, authors_json, year, desired_version, max_cost_usd)
-		 VALUES (?, ?, 'cli', ?, ?, ?, ?, ?, ?, ?)`,
-		requestID, now, nullable(zotioKey), nullable(collection), nullable(w.Title), string(authorsJSON), nullableInt(w.Year), pol.DesiredVersion, pol.MaxCostUSD); err != nil {
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		requestID, now, principal, nullable(zotioKey), nullable(collection), nullable(w.Title), string(authorsJSON), nullableInt(w.Year), pol.DesiredVersion, pol.MaxCostUSD); err != nil {
 		return CreateResult{}, fmt.Errorf("inserting work request: %w", err)
 	}
 	for kind, value := range map[string]string{"doi": w.DOI, "pmid": w.PMID, "arxiv": w.ArXiv, "isbn": w.ISBN, "openalex": w.OpenAlex} {
@@ -848,8 +918,8 @@ func WithRetryAt(t time.Time) TransitionOpt {
 }
 
 // WithTerminalReason records why a job ended.
-func WithTerminalReason(reason string) TransitionOpt {
-	return func(c *transitionCfg) { c.terminalReason = reason }
+func WithTerminalReason(reason TerminalReason) TransitionOpt {
+	return func(c *transitionCfg) { c.terminalReason = string(reason) }
 }
 
 // WithArtifact links the accepted artifact.
@@ -920,7 +990,7 @@ func (js *Store) Release(ctx context.Context, jobID, owner string) error {
 
 // Cancel moves a nonterminal job to cancelled. Repeated cancellation and
 // cancellation after any terminal result are idempotent no-ops.
-func (js *Store) Cancel(ctx context.Context, jobID, reason string) error {
+func (js *Store) Cancel(ctx context.Context, jobID string, reason TerminalReason) error {
 	for {
 		row, err := js.Get(ctx, jobID)
 		if err != nil {
@@ -930,7 +1000,7 @@ func (js *Store) Cancel(ctx context.Context, jobID, reason string) error {
 			return nil
 		}
 		err = js.transition(ctx, jobID, row.State, StateCancelled,
-			map[string]any{"reason": reason}, WithTerminalReason(reason))
+			map[string]any{"reason": string(reason)}, WithTerminalReason(reason))
 		if errors.Is(err, ErrConflict) {
 			continue
 		}
@@ -1117,7 +1187,10 @@ func (js *Store) Get(ctx context.Context, jobID string) (*Row, error) {
 	if err != nil {
 		return nil, err
 	}
-	r.ArtifactSHA256, r.SelectedCandidateID, r.TerminalReason, r.RetryAt = artifact.String, selected.Int64, terminal.String, retryAt.String
+	r.ArtifactSHA256, r.SelectedCandidateID, r.RetryAt = artifact.String, selected.Int64, retryAt.String
+	if terminal.Valid && terminal.String != "" {
+		r.TerminalReason = string(NormalizeTerminalReason(terminal.String))
+	}
 	if err := json.Unmarshal([]byte(polJSON), &r.Policy); err != nil {
 		return nil, fmt.Errorf("job %s policy: %w", jobID, err)
 	}
@@ -1194,8 +1267,35 @@ const (
 
 // List returns jobs, optionally filtered by state, newest first.
 func (js *Store) List(ctx context.Context, state string, limit int) ([]Row, error) {
+	rows, _, err := js.listJobs(ctx, state, EffectiveListLimit(limit), false)
+	return rows, err
+}
+
+// ListPage returns one bounded page of jobs and whether more rows exist behind
+// it. The flag is a proof, not an inference: the query reaches one row past the
+// limit and reports whether it was there, so a cohort-scale consumer can tell a
+// full page from a complete list (ADR-0007). Comparing len(rows) against the
+// requested limit cannot — an exactly-full final page is indistinguishable from
+// a truncated one.
+func (js *Store) ListPage(ctx context.Context, state string, limit int) ([]Row, bool, error) {
+	return js.listJobs(ctx, state, EffectiveListLimit(limit), true)
+}
+
+// EffectiveListLimit resolves a caller-supplied limit the way the store applies
+// it, so a caller never has to reimplement the clamp.
+func EffectiveListLimit(limit int) int {
 	if limit <= 0 || limit > ListLimitMax {
-		limit = ListLimitDefault
+		return ListLimitDefault
+	}
+	return limit
+}
+
+// listJobs fetches limit rows, or limit+1 when probing so the caller learns
+// whether the page is partial. limit must already be effective.
+func (js *Store) listJobs(ctx context.Context, state string, limit int, probe bool) ([]Row, bool, error) {
+	fetch := limit
+	if probe {
+		fetch++
 	}
 	q := `SELECT id FROM jobs`
 	args := []any{}
@@ -1204,36 +1304,40 @@ func (js *Store) List(ctx context.Context, state string, limit int) ([]Row, erro
 		args = append(args, state)
 	}
 	q += ` ORDER BY created_at DESC LIMIT ?`
-	args = append(args, limit)
+	args = append(args, fetch)
 	rows, err := js.S.DB().QueryContext(ctx, q, args...)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	defer func() { _ = rows.Close() }()
-	var out []Row
 	var idList []string
 	for rows.Next() {
 		var id string
 		if err := rows.Scan(&id); err != nil {
 			_ = rows.Close()
-			return nil, err
+			return nil, false, err
 		}
 		idList = append(idList, id)
 	}
 	if err := rows.Close(); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if err := rows.Err(); err != nil {
-		return nil, err
+		return nil, false, err
 	}
+	truncated := false
+	if len(idList) > limit {
+		idList, truncated = idList[:limit], true
+	}
+	out := make([]Row, 0, len(idList))
 	for _, id := range idList {
 		r, err := js.Get(ctx, id)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		out = append(out, *r)
 	}
-	return out, nil
+	return out, truncated, nil
 }
 
 // ListOldest returns the next bounded maintenance page in stable oldest-first
@@ -1380,6 +1484,19 @@ func (js *Store) MarkCandidate(ctx context.Context, id int64, status string) err
 	return err
 }
 
+// MarkCandidateVersionUnobserved records that nobody observed which version this
+// candidate's bytes are. It exists for browser adoption, whose candidate rows are
+// keyed by content hash and inserted with INSERT OR IGNORE: a row created before
+// papio stopped synthesizing versions survives re-adoption and would otherwise be
+// re-read with its old `published` claim (ADR-0007). Deliberately one-way — there
+// is no setter that can put a concrete version back, because no caller is ever
+// entitled to invent one.
+func (js *Store) MarkCandidateVersionUnobserved(ctx context.Context, id int64) error {
+	_, err := js.S.DB().ExecContext(ctx,
+		`UPDATE candidates SET version = 'unknown' WHERE id = ? AND version <> 'unknown'`, id)
+	return err
+}
+
 // GetCandidate loads one candidate by its durable ID.
 func (js *Store) GetCandidate(ctx context.Context, id int64) (*Candidate, error) {
 	row := js.S.DB().QueryRowContext(ctx, `
@@ -1481,15 +1598,22 @@ func (js *Store) GetArtifact(ctx context.Context, sha string) (*Artifact, error)
 }
 
 // CandidateForArtifact returns the accepted candidate provenance for one job's
-// artifact. The job's own selected candidate is authoritative; the content-hash
-// scan is only a fallback for the local-cache completion path, which reaches
-// ready with an artifact but no candidate of its own (see Service.Process).
+// artifact. The job's own selection wins, but only when it is genuinely
+// accepted; otherwise a content-hash scan recovers the acquisition that did
+// produce these bytes.
 //
 // Preferring the job's own row is load-bearing, not an optimization. artifacts
 // are content-addressed and shared, so two acquisitions can hold identical bytes
 // under different reuse licences and access bases; resolving provenance by hash
-// alone reports the earliest job's terms for every later one, which is
-// first-writer-wins rights attribution on a digest (ADR-0007).
+// alone reports some other job's terms, which is first-writer-wins rights
+// attribution on a digest (ADR-0007).
+//
+// The accepted check is equally load-bearing. selected_candidate_id is written
+// when a fetch starts, before validation, and the transition SQL COALESCEs it
+// forward — so a job can carry a REJECTED selection through crash recovery or a
+// scheduler retry and then complete from the local cache, whose transition only
+// records the artifact. Trusting the raw pointer would publish the licence of a
+// file papio actually threw away.
 func (js *Store) CandidateForArtifact(ctx context.Context, jobID, sha string) (*Candidate, error) {
 	var own sql.NullInt64
 	err := js.S.DB().QueryRowContext(ctx,
@@ -1498,13 +1622,20 @@ func (js *Store) CandidateForArtifact(ctx context.Context, jobID, sha string) (*
 		return nil, err
 	}
 	if own.Valid {
-		return js.GetCandidate(ctx, own.Int64)
+		candidate, err := js.GetCandidate(ctx, own.Int64)
+		if err != nil {
+			return nil, err
+		}
+		if candidate != nil && candidate.JobID == jobID && candidate.Status == CandidateAccepted {
+			return candidate, nil
+		}
 	}
 	var id sql.NullInt64
 	err = js.S.DB().QueryRowContext(ctx, `
-		SELECT selected_candidate_id FROM jobs
-		WHERE artifact_sha256 = ? AND state IN ('ready','imported') AND selected_candidate_id IS NOT NULL
-		ORDER BY updated_at ASC LIMIT 1`, sha).Scan(&id)
+		SELECT j.selected_candidate_id FROM jobs j
+		JOIN candidates c ON c.id = j.selected_candidate_id
+		WHERE j.artifact_sha256 = ? AND j.state IN ('ready','imported') AND c.status = ?
+		ORDER BY j.updated_at ASC LIMIT 1`, sha, CandidateAccepted).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -1514,22 +1645,44 @@ func (js *Store) CandidateForArtifact(ctx context.Context, jobID, sha string) (*
 	return js.GetCandidate(ctx, id.Int64)
 }
 
-// FindArtifactByDOI returns a prior validated artifact for the same DOI, if
-// any job with that DOI reached ready (resolver order step 1: local cache).
-func (js *Store) FindArtifactByDOI(ctx context.Context, doi string) (*Artifact, error) {
+// FindArtifactByDOI returns a prior validated artifact for the same DOI, if any
+// job with that DOI reached ready (resolver order step 1: local cache), together
+// with the accepted candidate of the acquisition that produced it. The caller
+// must record that candidate on the cache transition: the bytes are that
+// acquisition's, so its licence and access basis are the honest provenance, and
+// without it the completing job has no candidate of its own and provenance has
+// to be guessed from the digest later (ADR-0007).
+func (js *Store) FindArtifactByDOI(ctx context.Context, doi string) (*Artifact, *Candidate, error) {
 	var sha string
+	var candidateID sql.NullInt64
 	err := js.S.DB().QueryRowContext(ctx, `
-		SELECT j.artifact_sha256 FROM jobs j
+		SELECT j.artifact_sha256, j.selected_candidate_id FROM jobs j
 		JOIN identifiers i ON i.work_request_id = j.work_request_id
 		WHERE i.kind = 'doi' AND i.value = ? AND j.state IN ('ready','imported') AND j.artifact_sha256 IS NOT NULL
-		ORDER BY j.updated_at DESC LIMIT 1`, doi).Scan(&sha)
+		ORDER BY j.updated_at DESC LIMIT 1`, doi).Scan(&sha, &candidateID)
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil
+		return nil, nil, nil
 	}
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return js.GetArtifact(ctx, sha)
+	artifact, err := js.GetArtifact(ctx, sha)
+	if err != nil || artifact == nil {
+		return nil, nil, err
+	}
+	if !candidateID.Valid {
+		return artifact, nil, nil
+	}
+	candidate, err := js.GetCandidate(ctx, candidateID.Int64)
+	if err != nil {
+		return nil, nil, err
+	}
+	if candidate != nil && candidate.Status != CandidateAccepted {
+		// The source job carried a stale selection forward; its digest is still
+		// valid but its pointer is not provenance.
+		candidate = nil
+	}
+	return artifact, candidate, nil
 }
 
 // HumanActionBinding ties an identity-review action to the exact candidate and
@@ -1875,7 +2028,7 @@ func (js *Store) resolveReview(ctx context.Context, input ResolveReviewInput, le
 	}
 
 	to, reason := StateCancelled, "review_rejected"
-	terminalReason := "review_rejected"
+	terminalReason := TerminalReasonReviewRejected
 	if input.Verdict == "accept" {
 		candidateID := action.CandidateID
 		if candidateID == 0 {
@@ -1921,7 +2074,7 @@ func (js *Store) resolveReview(ctx context.Context, input ResolveReviewInput, le
 		UPDATE jobs SET state = ?, updated_at = ?, lease_owner = NULL, lease_expires_at = NULL,
 		        retry_at = NULL, terminal_reason = ?, selected_candidate_id = NULL, artifact_sha256 = NULL
 		WHERE id = ? AND state = ?`,
-		to, now, nullable(terminalReason), action.JobID, from)
+		to, now, nullable(string(terminalReason)), action.JobID, from)
 	if err != nil {
 		return ReviewResolution{}, normalizeReviewBusy(err)
 	}
@@ -2012,7 +2165,7 @@ func (js *Store) DismissHumanAction(ctx context.Context, actionID, expectedRevis
 		return "", normalizeReviewBusy(err)
 	}
 	if dismissalCancelsParkedJob(actionKind, state) {
-		return jobID, js.Cancel(ctx, jobID, "user_dismissed")
+		return jobID, js.Cancel(ctx, jobID, TerminalReasonUserDismissed)
 	}
 	return jobID, nil
 }
@@ -2044,9 +2197,17 @@ type HumanAction struct {
 	Revision         int64  `json:"revision"`
 }
 
-// ListHumanActions returns actions, optionally only open ones.
+// ListHumanActions returns actions, optionally only open ones. Unbounded: the
+// inbox and maintenance callers need the whole set.
 func (js *Store) ListHumanActions(ctx context.Context, openOnly bool) ([]HumanAction, error) {
-	return js.listHumanActions(ctx, openOnly, nil)
+	rows, _, err := js.listHumanActions(ctx, openOnly, nil, 0)
+	return rows, err
+}
+
+// ListHumanActionsPage returns one bounded page of actions and whether more
+// exist behind it, proven the same way as ListPage.
+func (js *Store) ListHumanActionsPage(ctx context.Context, openOnly bool, limit int) ([]HumanAction, bool, error) {
+	return js.listHumanActions(ctx, openOnly, nil, EffectiveListLimit(limit))
 }
 
 // ListOpenHumanActionsForJobs returns open actions for the supplied bounded job
@@ -2056,10 +2217,14 @@ func (js *Store) ListOpenHumanActionsForJobs(ctx context.Context, jobIDs []strin
 	if len(jobIDs) == 0 {
 		return nil, nil
 	}
-	return js.listHumanActions(ctx, true, jobIDs)
+	rows, _, err := js.listHumanActions(ctx, true, jobIDs, 0)
+	return rows, err
 }
 
-func (js *Store) listHumanActions(ctx context.Context, openOnly bool, jobIDs []string) ([]HumanAction, error) {
+// listHumanActions returns every matching action when limit is 0, otherwise one
+// page plus a proof of whether more exist: it fetches limit+1 rows and reports
+// whether the extra one was there.
+func (js *Store) listHumanActions(ctx context.Context, openOnly bool, jobIDs []string, limit int) ([]HumanAction, bool, error) {
 	q := `SELECT id, job_id, kind, status, COALESCE(detail,''), requires_auth, blocked_by, created_at,
 		COALESCE(candidate_id, 0), quarantine_path, quarantine_sha256, revision
 		FROM human_actions`
@@ -2078,9 +2243,13 @@ func (js *Store) listHumanActions(ctx context.Context, openOnly bool, jobIDs []s
 		q += ` WHERE ` + strings.Join(where, ` AND `)
 	}
 	q += ` ORDER BY id DESC`
+	if limit > 0 {
+		q += ` LIMIT ?`
+		args = append(args, limit+1)
+	}
 	rows, err := js.S.DB().QueryContext(ctx, q, args...)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	defer func() { _ = rows.Close() }()
 	var out []HumanAction
@@ -2091,14 +2260,21 @@ func (js *Store) listHumanActions(ctx context.Context, openOnly bool, jobIDs []s
 			&h.CandidateID, &h.QuarantinePath, &h.QuarantineSHA256, &h.Revision,
 		); err != nil {
 			_ = rows.Close()
-			return nil, err
+			return nil, false, err
 		}
 		out = append(out, h)
 	}
 	if err := rows.Close(); err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, false, err
+	}
+	truncated := false
+	if limit > 0 && len(out) > limit {
+		out, truncated = out[:limit], true
+	}
+	return out, truncated, nil
 }
 
 // RecordEvent appends a durable event to a job's ordered event stream.

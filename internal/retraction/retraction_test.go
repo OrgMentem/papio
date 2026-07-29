@@ -406,7 +406,7 @@ func testStore(t *testing.T) *store.Store {
 func addReadyDOI(t *testing.T, db *store.Store, doi string, index int) {
 	t.Helper()
 	jobs := &job.Store{S: db}
-	id, err := jobs.CreateRequest(context.Background(), fmt.Sprintf("wr_retraction_%02d", index), work.Work{DOI: doi, Title: "Library work"}, "", "", job.Policy{AccessMode: config.ModeConservative, DesiredVersion: "any", Resolver: "test", FetchMaxBytes: 1 << 20}, nil)
+	id, err := jobs.CreateRequest(context.Background(), fmt.Sprintf("wr_retraction_%02d", index), work.Work{DOI: doi, Title: "Library work"}, "", "", job.Policy{AccessMode: config.ModeConservative, DesiredVersion: "any", Resolver: "test", FetchMaxBytes: 1 << 20}, nil, job.PrincipalUnknown)
 	if err != nil {
 		t.Fatalf("create job: %v", err)
 	}

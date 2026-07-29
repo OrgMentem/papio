@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"papio/internal/artifact"
 	"papio/internal/config"
 	"papio/internal/fetch"
 	"papio/internal/job"
@@ -206,8 +207,7 @@ func TestExhaustedCandidatesWithoutOpenURLBaseStaysUnavailable(t *testing.T) {
 func parkAwaitingHuman(t *testing.T, jobs *job.Store, reqID string) string {
 	t.Helper()
 	ctx := context.Background()
-	id, err := jobs.CreateRequest(ctx, reqID, work.Work{DOI: "10.1002/example"}, "", "",
-		job.Policy{AccessMode: config.ModeDelegated, DesiredVersion: "any", FetchMaxBytes: 1 << 20}, nil)
+	id, err := jobs.CreateRequest(ctx, reqID, work.Work{DOI: "10.1002/example"}, "", "", job.Policy{AccessMode: config.ModeDelegated, DesiredVersion: "any", FetchMaxBytes: 1 << 20}, nil, job.PrincipalUnknown)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -485,8 +485,7 @@ func TestAdoptedCandidateVersionIsAlwaysUnknown(t *testing.T) {
 			svc, jobs := newTestService(t)
 			svc.Validate = passValidation()
 			ctx := context.Background()
-			id, err := jobs.CreateRequest(ctx, "wr_adopt_version_"+desired, work.Work{DOI: "10.1002/example"}, "", "",
-				job.Policy{AccessMode: config.ModeDelegated, DesiredVersion: desired, FetchMaxBytes: 1 << 20}, nil)
+			id, err := jobs.CreateRequest(ctx, "wr_adopt_version_"+desired, work.Work{DOI: "10.1002/example"}, "", "", job.Policy{AccessMode: config.ModeDelegated, DesiredVersion: desired, FetchMaxBytes: 1 << 20}, nil, job.PrincipalUnknown)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -530,5 +529,53 @@ func TestAdoptedCandidateVersionIsAlwaysUnknown(t *testing.T) {
 					candidate.AccessBasis, candidate.ReuseLicense)
 			}
 		})
+	}
+}
+
+// InsertCandidates is INSERT OR IGNORE on (job_id, url_key) and adoption keys by
+// content hash, so a candidate written before papio stopped synthesizing versions
+// survives re-adoption of the same bytes. Adoption must normalize it rather than
+// re-read the stale `published` claim.
+func TestAdoptDownloadNormalizesAPreUpgradeSynthesizedVersion(t *testing.T) {
+	svc, jobs := newTestService(t)
+	svc.Validate = passValidation()
+	ctx := context.Background()
+	id := parkAwaitingHuman(t, jobs, "wr_adopt_preupgrade")
+	dir := filepath.Join(svc.Config.EffectiveAdoptionRoot(), id)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "paper.pdf")
+	body := pdfBytes("pre-upgrade adoption")
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sha, _, err := artifact.HashFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Exactly the row an older papio wrote for these bytes.
+	if _, err := jobs.InsertCandidates(ctx, id, []job.Candidate{{
+		JobID: id, Source: "browser", URLRedacted: "browser://adopted-download",
+		URLKey: "browser-adopt:sha256:" + sha, Version: resolver.VersionPublished,
+		AccessBasis: resolver.AccessInstitutional, ReuseLicense: "unknown",
+		ExpectedMIME: "application/pdf", Direct: true, IdentityConfidence: 0.5, Rank: 0,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.AdoptDownload(ctx, id, path); err != nil {
+		t.Fatalf("adopt: %v", err)
+	}
+	row, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate, err := jobs.GetCandidate(ctx, row.SelectedCandidateID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if candidate.Version != resolver.VersionUnknown {
+		t.Fatalf("re-adopted candidate version = %q, want %q — the pre-upgrade claim outlived the fix",
+			candidate.Version, resolver.VersionUnknown)
 	}
 }

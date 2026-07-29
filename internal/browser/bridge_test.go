@@ -87,8 +87,7 @@ func handoffWork() work.Work {
 func park(t *testing.T, jobs *job.Store, reqID string, w work.Work) string {
 	t.Helper()
 	ctx := context.Background()
-	id, err := jobs.CreateRequest(ctx, reqID, w, "", "",
-		job.Policy{AccessMode: config.ModeDelegated, DesiredVersion: "any", FetchMaxBytes: 1 << 20}, nil)
+	id, err := jobs.CreateRequest(ctx, reqID, w, "", "", job.Policy{AccessMode: config.ModeDelegated, DesiredVersion: "any", FetchMaxBytes: 1 << 20}, nil, job.PrincipalUnknown)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,10 +109,9 @@ func park(t *testing.T, jobs *job.Store, reqID string, w work.Work) string {
 func parkInstitutional(t *testing.T, jobs *job.Store, reqID string, w work.Work, resolverProfile string) string {
 	t.Helper()
 	ctx := context.Background()
-	id, err := jobs.CreateRequest(ctx, reqID, w, "", "",
-		job.Policy{
-			AccessMode: config.ModeDelegated, DesiredVersion: "any", Resolver: resolverProfile, FetchMaxBytes: 1 << 20,
-		}, nil)
+	id, err := jobs.CreateRequest(ctx, reqID, w, "", "", job.Policy{
+		AccessMode: config.ModeDelegated, DesiredVersion: "any", Resolver: resolverProfile, FetchMaxBytes: 1 << 20,
+	}, nil, job.PrincipalUnknown)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -581,9 +579,7 @@ func TestTriageCountsQueryFailureReportsErrorFrameNotFatal(t *testing.T) {
 func statsAcquiredJob(t *testing.T, jobs *job.Store, requestID, accessBasis string, handoff bool) string {
 	t.Helper()
 	ctx := context.Background()
-	id, err := jobs.CreateRequest(ctx, requestID,
-		work.Work{DOI: "10.1000/" + requestID, Title: "Stats work"}, "", "",
-		job.Policy{AccessMode: "conservative", DesiredVersion: "any", Resolver: "fixture", FetchMaxBytes: 1 << 20}, nil)
+	id, err := jobs.CreateRequest(ctx, requestID, work.Work{DOI: "10.1000/" + requestID, Title: "Stats work"}, "", "", job.Policy{AccessMode: "conservative", DesiredVersion: "any", Resolver: "fixture", FetchMaxBytes: 1 << 20}, nil, job.PrincipalUnknown)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -629,9 +625,7 @@ func statsAcquiredJob(t *testing.T, jobs *job.Store, requestID, accessBasis stri
 func statsFailedJob(t *testing.T, jobs *job.Store, requestID string) string {
 	t.Helper()
 	ctx := context.Background()
-	id, err := jobs.CreateRequest(ctx, requestID,
-		work.Work{DOI: "10.1000/" + requestID, Title: "Stats failed work"}, "", "",
-		job.Policy{AccessMode: "conservative", DesiredVersion: "any", Resolver: "fixture", FetchMaxBytes: 1 << 20}, nil)
+	id, err := jobs.CreateRequest(ctx, requestID, work.Work{DOI: "10.1000/" + requestID, Title: "Stats failed work"}, "", "", job.Policy{AccessMode: "conservative", DesiredVersion: "any", Resolver: "fixture", FetchMaxBytes: 1 << 20}, nil, job.PrincipalUnknown)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -758,9 +752,7 @@ func TestTriageDismissConsumesSelectedWatchHit(t *testing.T) {
 func TestReviewPreviewAndResolveNeverLeakQuarantinePath(t *testing.T) {
 	b, jobs, _, data := newBridge(t)
 	const sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-	id, err := jobs.CreateRequest(context.Background(), "wr_browser_review",
-		work.Work{DOI: "10.1000/review", Title: "Review"}, "", "",
-		job.Policy{AccessMode: config.ModeDelegated, DesiredVersion: "any", FetchMaxBytes: 1 << 20}, nil)
+	id, err := jobs.CreateRequest(context.Background(), "wr_browser_review", work.Work{DOI: "10.1000/review", Title: "Review"}, "", "", job.Policy{AccessMode: config.ModeDelegated, DesiredVersion: "any", FetchMaxBytes: 1 << 20}, nil, job.PrincipalUnknown)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -849,9 +841,7 @@ func TestReviewPreviewOnMissingActionReturnsErrorOutcomeWithoutFailingSync(t *te
 // Dismiss must close the stale inbox row without cancelling the live job.
 func TestHumanActionResolveDismissClosesStaleNonReviewAction(t *testing.T) {
 	b, jobs, _, _ := newBridge(t)
-	id, err := jobs.CreateRequest(context.Background(), "wr_browser_dismiss",
-		work.Work{DOI: "10.1000/dismiss", Title: "Dismiss me"}, "", "",
-		job.Policy{AccessMode: config.ModeDelegated, DesiredVersion: "any", FetchMaxBytes: 1 << 20}, nil)
+	id, err := jobs.CreateRequest(context.Background(), "wr_browser_dismiss", work.Work{DOI: "10.1000/dismiss", Title: "Dismiss me"}, "", "", job.Policy{AccessMode: config.ModeDelegated, DesiredVersion: "any", FetchMaxBytes: 1 << 20}, nil, job.PrincipalUnknown)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -887,9 +877,7 @@ func TestHumanActionResolveDismissClosesStaleNonReviewAction(t *testing.T) {
 
 func TestHumanActionResolveDismissCancelsAwaitingHandoff(t *testing.T) {
 	b, jobs, _, _ := newBridge(t)
-	id, err := jobs.CreateRequest(context.Background(), "wr_browser_dismiss_awaiting",
-		work.Work{DOI: "10.1000/dismiss", Title: "Dismiss me"}, "", "",
-		job.Policy{AccessMode: config.ModeDelegated, DesiredVersion: "any", FetchMaxBytes: 1 << 20}, nil)
+	id, err := jobs.CreateRequest(context.Background(), "wr_browser_dismiss_awaiting", work.Work{DOI: "10.1000/dismiss", Title: "Dismiss me"}, "", "", job.Policy{AccessMode: config.ModeDelegated, DesiredVersion: "any", FetchMaxBytes: 1 << 20}, nil, job.PrincipalUnknown)
 	if err != nil {
 		t.Fatal(err)
 	}

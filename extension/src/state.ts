@@ -71,7 +71,19 @@ export interface ActiveJob {
    * browser lacks effective host access. It contains no path, query, or IdP
    * data and lets the report debounce survive an MV3 worker restart. */
   blocked_provider_host?: string;
+  /** A re-offered handoff held behind a parked provider has not yet been
+   * accepted. It is acknowledged only when that provider is resumed. */
+  handoffAckPending?: boolean;
 }
+/** A short, browser-session lease over one provider's queued handoffs. The
+ * owner token stays only in the service worker; session storage retains this
+ * non-secret recovery record so a restarted worker observes the same park. */
+export interface ProviderDrainLease {
+  providerKey: string;
+  expiresAt: number;
+  parkedReason?: "challenge";
+}
+
 
 export interface StoreShape {
   activeJobs: ActiveJob[];
@@ -88,6 +100,9 @@ export interface StoreShape {
    * download proves the session works. Bounds re-driving a job whose warm SSO
    * session cannot complete human authentication. */
   authAttempts?: Record<string, number>;
+  /** Per-provider drain leases. These contain only a canonical provider-host
+   * key, expiry, and optional park reason — never a resolver or identity URL. */
+  providerDrainLeases?: Record<string, ProviderDrainLease>;
   /** Id of papio's dedicated background work window, when work-window mode
    * has created one this browser session. Window ids are session-scoped, never
    * sensitive. Verified live (and recreated) before every reuse. */
