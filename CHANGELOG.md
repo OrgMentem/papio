@@ -40,6 +40,16 @@ execution records in `notes/acquisition-stack-plan.md`.
 - **`attempted_tiers` retains every tier a job genuinely attempted after an
   explicit retry.** It now reads append-only attempt records instead of current
   candidate status, which retry resets can erase.
+- **Attaching a supplement now says what to fix.** Every expected refusal from
+  `jobs.add_component` — the job holds no main artifact yet, the file sits outside
+  the job's adoption root, the file is not a readable PDF, the file carries active
+  content — arrived as `internal: operation failed`, because only an unrecognised
+  error was meant to collapse that way and none of these were classified. They now
+  return the condition and the remedy. The confinement case deliberately does not
+  echo the offending path: that belongs in the daemon log, not an RPC message.
+  Nothing here loosens a guard; the same files are refused, and now the operator
+  can tell which guard refused them. Found by exercising the new command against a
+  live daemon rather than a stub.
 
 ## [0.14.0] - 2026-07-30
 

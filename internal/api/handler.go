@@ -551,6 +551,15 @@ func zotioLookupWorks(ctx context.Context, raw json.RawMessage, system *bootstra
 // its old shape *and* its old semantics (ADR-0008 invariant 8).
 type LibraryLookupWorksRequest struct {
 	Works []ownership.Query `json:"works"`
+	// ExpectedFingerprint binds the lookup to the configuration that selected
+	// generic holdings. A daemon is reused per data_dir/socket, and --config may
+	// name a different config with the same data directory, so without this a
+	// stale or shared daemon would answer authoritatively against another
+	// client's library.sources — reporting an empty registry as a complete
+	// all-negative result, or suppressing a paper the caller's library does not
+	// hold. Safe to require because this method is new: no released caller omits
+	// it.
+	ExpectedFingerprint string `json:"expected_fingerprint"`
 }
 
 func libraryLookupWorks(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
@@ -558,7 +567,14 @@ func libraryLookupWorks(ctx context.Context, raw json.RawMessage, system *bootst
 	if err := ipc.DecodeParams(raw, &request); err != nil {
 		return badParams(err)
 	}
-	if system == nil || system.Holdings == nil || !system.Holdings.Enabled() {
+	if request.ExpectedFingerprint == "" || system == nil || request.ExpectedFingerprint != system.Config.LibraryFingerprint() {
+		return nil, &ipc.RPCError{Code: "precondition_failed", Message: "library configuration does not match caller"}
+	}
+	// The fingerprint proves the SOURCES match; it cannot prove this daemon chose
+	// to consult them. A daemon with the same library.sources but zotio enabled
+	// leaves the generic registry empty, and answering from it would be a
+	// complete-looking negative.
+	if system.Holdings == nil || !system.Holdings.Enabled() {
 		return nil, &ipc.RPCError{Code: "precondition_failed", Message: "generic library authority is not active"}
 	}
 	if len(request.Works) == 0 || len(request.Works) > 50 {
@@ -855,8 +871,21 @@ func addComponent(ctx context.Context, raw json.RawMessage, system *bootstrap.Sy
 		return nil, &ipc.RPCError{Code: "precondition_failed", Message: "acquisition service is not configured"}
 	}
 	if err := system.App.AdoptComponent(ctx, params.JobID, params.Path, params.Role); err != nil {
-		if errors.Is(err, app.ErrComponentRole) {
+		// Every case below is an ordinary operator mistake, not a daemon fault, so
+		// it must say what to change. The path sentinel deliberately does NOT echo
+		// the wrapped error: confinement failures carry the caller's filesystem
+		// path, and the daemon log is the place for that, not an RPC message.
+		switch {
+		case errors.Is(err, app.ErrComponentRole):
 			return badParams(err)
+		case errors.Is(err, app.ErrComponentPrecondition):
+			log.Printf("rpc add_component precondition: %v", err)
+			return nil, &ipc.RPCError{Code: "precondition_failed", Message: "the job holds no main artifact to attach a component to"}
+		case errors.Is(err, app.ErrComponentPath):
+			log.Printf("rpc add_component path rejected: %v", err)
+			return nil, &ipc.RPCError{Code: "invalid_argument", Message: "the file must be a regular file inside the job's adoption root"}
+		case errors.Is(err, app.ErrComponentRejected):
+			return nil, &ipc.RPCError{Code: "invalid_argument", Message: safeMessage(err, "component rejected")}
 		}
 		return failure(err)
 	}

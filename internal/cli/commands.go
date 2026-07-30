@@ -120,7 +120,14 @@ func newJobsCommand(opt *options) *cobra.Command {
 			if _, err := fmt.Fprintf(opt.out, "principal\t%s\n", receipt.Principal); err != nil {
 				return err
 			}
-			if _, err := fmt.Fprintf(opt.out, "attempted tiers\t%s\n", strings.Join(receipt.AttemptedTiers, ",")); err != nil {
+			// "none" rather than an empty column: for a job that never reached a
+			// source, the absence IS the finding, and a bare trailing tab reads
+			// like the value failed to render.
+			tiers := "none"
+			if len(receipt.AttemptedTiers) != 0 {
+				tiers = strings.Join(receipt.AttemptedTiers, ",")
+			}
+			if _, err := fmt.Fprintf(opt.out, "attempted tiers\t%s\n", tiers); err != nil {
 				return err
 			}
 			for _, component := range receipt.Components {

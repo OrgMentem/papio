@@ -16,6 +16,25 @@ import (
 // ErrComponentRole reports a role this entry point will not accept.
 var ErrComponentRole = errors.New("unsupported component role")
 
+// The remaining sentinels exist so the RPC layer can tell an operator what to
+// change. Every one of these is an ordinary, expected condition — the job has no
+// main file yet, the path is outside the adoption root, the file is not a usable
+// PDF — and collapsing them into a generic internal error, as an unclassified
+// error does, leaves the caller nothing to act on. The wrapped text stays
+// daemon-side for the log; the RPC layer emits a fixed safe message per sentinel
+// because the confinement errors wrap filesystem errors carrying the user's path.
+var (
+	// ErrComponentPrecondition reports a job that cannot take a component yet.
+	ErrComponentPrecondition = errors.New("job cannot take a component")
+	// ErrComponentPath reports a source outside the job's adoption root, or one
+	// that is not a regular file.
+	ErrComponentPath = errors.New("component path rejected")
+	// ErrComponentRejected reports a file that failed payload or structural
+	// validation. Identity is deliberately not part of this: a supplement is not
+	// the article.
+	ErrComponentRejected = errors.New("component rejected")
+)
+
 // AdoptComponent files a supplement or appendix alongside a job's main artifact:
 // the parts of a source that a quotation may legitimately live in, which a main
 // PDF alone would report as absent (ADR-0007).
@@ -54,7 +73,7 @@ func (s *Service) AdoptComponent(ctx context.Context, jobID, path, role string) 
 		return err
 	}
 	if row.ArtifactSHA256 == "" {
-		return fmt.Errorf("job %s holds no main artifact to attach a %s to", jobID, role)
+		return fmt.Errorf("%w: job %s holds no main artifact to attach a %s to", ErrComponentPrecondition, jobID, role)
 	}
 
 	// Same confinement as main adoption: ancestor symlinks resolve so mounts
@@ -62,15 +81,15 @@ func (s *Service) AdoptComponent(ctx context.Context, jobID, path, role string) 
 	// rejected rather than followed.
 	realRoot, err := filepath.EvalSymlinks(filepath.Join(s.Config.EffectiveAdoptionRoot(), jobID))
 	if err != nil {
-		return fmt.Errorf("adoption root unavailable: %w", err)
+		return fmt.Errorf("%w: adoption root unavailable: %w", ErrComponentPath, err)
 	}
 	realDir, err := filepath.EvalSymlinks(filepath.Dir(path))
 	if err != nil {
-		return fmt.Errorf("adoption path rejected: %w", err)
+		return fmt.Errorf("%w: %w", ErrComponentPath, err)
 	}
 	resolved := filepath.Join(realDir, filepath.Base(path))
 	if err := artifact.ConfineRegularFile(realRoot, resolved); err != nil {
-		return fmt.Errorf("adoption path rejected: %w", err)
+		return fmt.Errorf("%w: %w", ErrComponentPath, err)
 	}
 
 	qdir, err := s.Artifacts.QuarantineDir(jobID)
@@ -89,13 +108,13 @@ func (s *Service) AdoptComponent(ctx context.Context, jobID, path, role string) 
 	}
 	if !report.Payload.OK || !report.Structural.Valid {
 		_ = os.Remove(temp)
-		return fmt.Errorf("%s rejected: not a readable PDF", role)
+		return fmt.Errorf("%w: %s is not a readable PDF", ErrComponentRejected, role)
 	}
 	// Same active-content predicate as main validation: JavaScript or embedded
 	// files make a PDF a delivery vehicle rather than a document.
 	if report.Structural.Encrypted || report.Structural.HasJavaScript || report.Structural.HasEmbeddedFiles {
 		_ = os.Remove(temp)
-		return fmt.Errorf("%s rejected: encrypted or active content", role)
+		return fmt.Errorf("%w: %s is encrypted or carries active content", ErrComponentRejected, role)
 	}
 
 	dest, err := s.Artifacts.ArtifactPath(sha)

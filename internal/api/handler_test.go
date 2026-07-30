@@ -1330,13 +1330,16 @@ func TestLibraryLookupWorksRequiresActiveGenericAuthority(t *testing.T) {
 		Name: "test-library", Kind: config.LibraryKindFile, Path: "/tmp/test-library.bib",
 		Format: "bibtex", Claim: config.LibraryClaimPDFPresent,
 	}}
-	request := LibraryLookupWorksRequest{Works: []ownership.Query{{}}}
+	request := LibraryLookupWorksRequest{
+		Works:               []ownership.Query{{}},
+		ExpectedFingerprint: system.Config.LibraryFingerprint(),
+	}
 	raw, err := json.Marshal(request)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	t.Run("enabled registry succeeds", func(t *testing.T) {
+	t.Run("matching fingerprint with enabled registry succeeds", func(t *testing.T) {
 		provider := &libraryLookupProvider{}
 		system.Holdings = ownership.NewRegistry(provider)
 
@@ -1363,7 +1366,7 @@ func TestLibraryLookupWorksRequiresActiveGenericAuthority(t *testing.T) {
 		{name: "empty registry", holdings: ownership.NewRegistry()},
 		{name: "nil registry"},
 	} {
-		t.Run(tc.name+" fails", func(t *testing.T) {
+		t.Run("matching fingerprint with "+tc.name+" fails", func(t *testing.T) {
 			system.Holdings = tc.holdings
 
 			data, rpcErr := libraryLookupWorks(context.Background(), raw, system)
@@ -1376,13 +1379,68 @@ func TestLibraryLookupWorksRequiresActiveGenericAuthority(t *testing.T) {
 		})
 	}
 
+	t.Run("mismatched fingerprint fails", func(t *testing.T) {
+		provider := &libraryLookupProvider{}
+		system.Holdings = ownership.NewRegistry(provider)
+		mismatched := request
+		mismatched.ExpectedFingerprint = "mismatched"
+		mismatchedRaw, err := json.Marshal(mismatched)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		data, rpcErr := libraryLookupWorks(context.Background(), mismatchedRaw, system)
+		if rpcErr == nil || rpcErr.Code != "precondition_failed" {
+			t.Fatalf("library lookup RPC error = %+v, want precondition_failed", rpcErr)
+		}
+		if data != nil {
+			t.Fatalf("library lookup returned data on fingerprint mismatch: %s", data)
+		}
+		if provider.calls.Load() != 0 {
+			t.Fatalf("provider lookup calls = %d, want 0", provider.calls.Load())
+		}
+	})
+
+	// An omitted field decodes to the empty string, which is exactly how this
+	// binding was once lost: the field was deleted, every caller's value became
+	// invisible, and no test noticed because none asserted the empty case.
+	t.Run("empty fingerprint fails", func(t *testing.T) {
+		provider := &libraryLookupProvider{}
+		system.Holdings = ownership.NewRegistry(provider)
+		omitted, err := json.Marshal(struct {
+			Works []ownership.Query `json:"works"`
+		}{Works: []ownership.Query{{}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		data, rpcErr := libraryLookupWorks(context.Background(), omitted, system)
+		if rpcErr == nil || rpcErr.Code != "precondition_failed" {
+			t.Fatalf("library lookup RPC error = %+v, want precondition_failed", rpcErr)
+		}
+		if data != nil {
+			t.Fatalf("library lookup returned data without a fingerprint: %s", data)
+		}
+		if provider.calls.Load() != 0 {
+			t.Fatalf("provider lookup calls = %d, want 0", provider.calls.Load())
+		}
+	})
 }
 
 func TestLibraryLookupWorksBounds(t *testing.T) {
 	system := testSystem(t)
+	system.Config.Library.Sources = []config.LibrarySource{{
+		Name: "test-library", Kind: config.LibraryKindFile, Path: "/tmp/test-library.bib",
+		Format: "bibtex", Claim: config.LibraryClaimPDFPresent,
+	}}
 	system.Holdings = ownership.NewRegistry(&libraryLookupProvider{})
+	// The authority checks run first on purpose, so a bounds case must present a
+	// matching fingerprint to reach the bounds check at all.
 	for _, count := range []int{0, 51} {
-		raw, err := json.Marshal(LibraryLookupWorksRequest{Works: make([]ownership.Query, count)})
+		raw, err := json.Marshal(LibraryLookupWorksRequest{
+			Works:               make([]ownership.Query, count),
+			ExpectedFingerprint: system.Config.LibraryFingerprint(),
+		})
 		if err != nil {
 			t.Fatal(err)
 		}

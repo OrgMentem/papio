@@ -81,6 +81,9 @@ func newInboxCommand(opt *options) *cobra.Command {
 			}
 			var result triageDecision
 			if err := opt.call(cmd.Context(), "triage.decide", params, &result); err != nil {
+				if isUnknownMethod(err) {
+					return daemonUpgradeRequired("triage.decide")
+				}
 				return err
 			}
 			if opt.jsonOutput {
