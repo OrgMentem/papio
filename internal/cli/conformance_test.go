@@ -106,6 +106,7 @@ var commandClassification = map[string]commandClass{
 	"papio adapter captures":       {kind: kindEnvelope, rowKey: "captures"},
 	"papio adapter captures purge": {kind: kindStructured},
 	"papio status":                 {kind: kindStructured},
+	"papio stats":                  {kind: kindStructured},
 	"papio actions":                {kind: kindNone},
 	"papio actions list":           {kind: kindEnvelope, rowKey: "actions"},
 	"papio actions resolve":        {kind: kindStructured},

@@ -473,6 +473,14 @@ papio search [query] [flags]
 | `--year-from` | `int` | `0` | minimum publication year |
 | `--year-to` | `int` | `0` | maximum publication year |
 
+## `papio stats`
+
+Show lifetime acquisition totals by access basis
+
+```
+papio stats
+```
+
 ## `papio status`
 
 Show active and recent acquisition jobs

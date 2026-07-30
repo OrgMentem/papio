@@ -53,6 +53,25 @@ func triageCounts(ctx context.Context, raw json.RawMessage, system *bootstrap.Sy
 	return marshal(counts)
 }
 
+// triageStats exposes the acquisition value read model the browser extension
+// already reads over stats_request. Without it the CLI - and so the derived
+// MCP surface - is the only interface that cannot see what papio's
+// institutional access actually bought.
+func triageStats(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
+	var params struct{}
+	if err := ipc.DecodeParams(raw, &params); err != nil {
+		return badParams(err)
+	}
+	if system == nil || system.Triage == nil {
+		return nil, &ipc.RPCError{Code: "precondition_failed", Message: "triage inbox is not configured"}
+	}
+	stats, err := system.Triage.Stats(ctx)
+	if err != nil {
+		return failure(err)
+	}
+	return marshal(stats)
+}
+
 func triageDecide(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
 	var params struct {
 		ItemID     string          `json:"item_id"`

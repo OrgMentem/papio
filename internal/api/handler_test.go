@@ -125,6 +125,52 @@ func TestTriageSnapshotCountsAndDismiss(t *testing.T) {
 	}
 }
 
+// stats.get is the CLI's and MCP's only route to the acquisition value read
+// model the extension already reads over stats_request, so it must decode into
+// the same snake_case shape the rest of the JSON surface uses.
+func TestStatsGetReportsTheAcquisitionReadModel(t *testing.T) {
+	system := testSystem(t)
+	ctx := context.Background()
+	id, err := system.Jobs.CreateRequest(ctx, "wr_stats_api", work.Work{DOI: "10.1000/stats", Title: "Stats"}, "", "",
+		job.Policy{AccessMode: config.ModeConservative, DesiredVersion: "any", FetchMaxBytes: 1 << 20}, nil, job.PrincipalUnknown)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := system.Jobs.Transition(ctx, id, job.StateQueued, job.StateResolving, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := system.Jobs.Transition(ctx, id, job.StateResolving, job.StateReady, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	raw, rpcErr := Router(system).Handle(ctx, ipc.Request{Method: "stats.get", Params: json.RawMessage(`{}`)})
+	if rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	var wire struct {
+		AcquiredTotal int `json:"acquired_total"`
+		Access        struct {
+			Other int `json:"other"`
+		} `json:"access"`
+		Series []struct {
+			Acquired int `json:"acquired"`
+		} `json:"series"`
+	}
+	if err := json.Unmarshal(raw, &wire); err != nil {
+		t.Fatalf("decode stats: %v (%s)", err, raw)
+	}
+	if wire.AcquiredTotal != 1 {
+		t.Fatalf("acquired_total = %d, want 1 (%s)", wire.AcquiredTotal, raw)
+	}
+	// No accepted candidate was recorded, so the acquisition lands in other.
+	if wire.Access.Other != 1 {
+		t.Fatalf("access breakdown = %+v, want the job counted under other", wire.Access)
+	}
+	if len(wire.Series) == 0 {
+		t.Fatalf("series = %v, want weekly buckets", wire.Series)
+	}
+}
+
 // A retraction notice is not a watch hit, so triage.decide must route it to the
 // owning source instead of looking for a digest entry that will never exist.
 type stubRetractionSource struct {

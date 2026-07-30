@@ -190,6 +190,9 @@ func RouterWithShutdown(system *bootstrap.System, shutdown context.CancelFunc) i
 		"triage.counts": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return triageCounts(ctx, raw, system)
 		},
+		"stats.get": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return triageStats(ctx, raw, system)
+		},
 		"triage.decide": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return triageDecide(ctx, raw, system)
 		},

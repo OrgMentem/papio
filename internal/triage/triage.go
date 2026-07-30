@@ -359,11 +359,11 @@ const statsSeriesWeeks = 12
 // count toward neither, since the user - not the acquisition pipeline -
 // decided the outcome).
 type Stats struct {
-	AcquiredTotal    int
-	FailedTotal      int
-	HandoffsRequired int
-	Access           StatsAccess
-	Series           []StatsBucket
+	AcquiredTotal    int           `json:"acquired_total"`
+	FailedTotal      int           `json:"failed_total"`
+	HandoffsRequired int           `json:"handoffs_required"`
+	Access           StatsAccess   `json:"access"`
+	Series           []StatsBucket `json:"series"`
 }
 
 // StatsAccess breaks AcquiredTotal down by the access basis of each
@@ -372,17 +372,17 @@ type Stats struct {
 // recording), so the buckets need not sum to AcquiredTotal-exact parity with
 // any single source.
 type StatsAccess struct {
-	OpenAccess    int
-	Institutional int
-	LicensedAPI   int
-	Other         int
+	OpenAccess    int `json:"open_access"`
+	Institutional int `json:"institutional"`
+	LicensedAPI   int `json:"licensed_api"`
+	Other         int `json:"other"`
 }
 
 // StatsBucket is one weekly bucket of the acquisition series: jobs acquired
 // in the ISO week (Monday-Sunday, UTC) beginning PeriodStart.
 type StatsBucket struct {
-	PeriodStart time.Time
-	Acquired    int
+	PeriodStart time.Time `json:"period_start"`
+	Acquired    int       `json:"acquired"`
 }
 
 // Stats returns lifetime acquisition value metrics for the browser
