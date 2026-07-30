@@ -8,7 +8,7 @@ so older sections below include extension entries. The initial release entry
 is synthesized from the complete `papio` and `zotio` Git histories and the
 execution records in `notes/acquisition-stack-plan.md`.
 
-## [Unreleased]
+## [0.14.0] - 2026-07-30
 
 ### Added
 
@@ -31,8 +31,8 @@ execution records in `notes/acquisition-stack-plan.md`.
   source that holds nothing**. An unreadable or malformed export leaves the
   answer *incomplete*, so `--batch` creates no jobs and names the failing source
   rather than re-downloading the batch. An acquire watch fails the run and
-  resumes on its next cadence after the source is fixed; it has no
-  `--include-owned` override. That override is available only for
+  retries on cadence until the standard fifth-consecutive-failure auto-disable;
+  it has no `--include-owned` override. That override is available only for
   `papio acquire --batch`. During a transient provider failure, a fresh
   cached positive may still annotate `papio search` and raw lookup, but batch
   and watch acquisition remain fail-closed. The runtime last-known-good guard

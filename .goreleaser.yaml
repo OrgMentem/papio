@@ -86,7 +86,7 @@ homebrew_casks:
     # xattr — otherwise Gatekeeper blocks first run on macOS.
     directory: Casks
     homepage: "https://github.com/OrgMentem/papio"
-    description: "Autonomous scholarly-paper acquisition broker that files validated PDFs into Zotero via zotio"
+    description: "Acquire and validate scholarly PDFs for your reference library"
     binaries:
       - papio
     hooks:
@@ -105,7 +105,7 @@ scoops:
     directory: bucket
     commit_msg_template: "papio {{ .Tag }}"
     homepage: "https://github.com/OrgMentem/papio"
-    description: "Autonomous scholarly-paper acquisition broker that files validated PDFs into Zotero via zotio"
+    description: "Acquire and validate scholarly PDFs for your reference library"
     license: MIT
 # Windows: WinGet manifests, PR'd from a fork into microsoft/winget-pkgs.
 winget:
@@ -121,7 +121,7 @@ winget:
     publisher: OrgMentem
     license: MIT
     homepage: "https://github.com/OrgMentem/papio"
-    short_description: "Autonomous scholarly-paper acquisition broker that files validated PDFs into Zotero via zotio"
+    short_description: "Acquire and validate scholarly PDFs for your reference library"
     # Author winget commits as the CLA-signed account (not goreleaserbot), so
     # Microsoft's per-PR CLA check matches and doesn't re-flag Needs-CLA.
     commit_author:
@@ -152,6 +152,6 @@ nfpms:
       - apk
     maintainer: "OrgMentem <papio@orgmentem.com>"
     homepage: "https://github.com/OrgMentem/papio"
-    description: "Autonomous scholarly-paper acquisition broker that files validated PDFs into Zotero via zotio"
+    description: "Acquire and validate scholarly PDFs for your reference library"
     license: MIT
     bindir: /usr/bin
