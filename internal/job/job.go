@@ -1111,6 +1111,20 @@ func (js *Store) Retry(ctx context.Context, jobID string) error {
 	if changed, _ := result.RowsAffected(); changed != 1 {
 		return ErrConflict
 	}
+	// Every other open action is closed by the terminal transition itself, but
+	// the conservative-mode advisory is exempt there and in the startup sweep so
+	// its trace survives on a job that stayed unavailable. Retry is the only edge
+	// out of unavailable (the allowed table gives that state no outbound edge),
+	// and it is the user acting on exactly the advice the advisory gives - switch
+	// access mode and retry. Left open it outlives its own remedy and keeps
+	// telling the user to do the thing they just did, even once the job reaches
+	// ready. Re-exhausting in conservative mode opens it again.
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE human_actions SET status = 'cancelled', resolved_at = ?
+		  WHERE job_id = ? AND kind = ? AND status = 'open'`,
+		now, jobID, informationalActionKind); err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx,
 		`UPDATE candidates SET status = 'pending'
 		  WHERE job_id = ? AND status IN ('fetching','retryable')`, jobID); err != nil {

@@ -12,6 +12,16 @@ execution records in `notes/acquisition-stack-plan.md`.
 
 ### Added
 
+- **`papio stats`** reports what the pipeline has actually obtained: lifetime
+  acquired and failed totals, how many acquisitions needed a browser handoff, the
+  split of acquired works by access basis (open access / institutional /
+  licensed API / other), and a twelve-week series. The daemon has computed this
+  all along for the extension's stats view (`stats_request`), but no RPC or
+  command exposed it, so the CLI — and the MCP surface derived from it — was the
+  only interface that could not see whether institutional access was buying
+  anything. `stats.get` is a passthrough of that read model, not a second
+  aggregation: `papio status` still owns the live job board and
+  `papio jobs failures` the failure groups.
 - **`jobs.receipt`** reports what happened to one acquisition: its state, its
   typed terminal reason, who requested it, which access tiers it actually reached,
   and which components it holds. It exists for the outcomes an acquisition bundle
@@ -63,6 +73,15 @@ execution records in `notes/acquisition-stack-plan.md`.
 
 ### Fixed
 
+- **The conservative-mode OpenURL advisory no longer outlives its own remedy.**
+  `openurl_available` records that an institutional route existed and
+  conservative mode did not take it, and it is deliberately exempt from the
+  terminal-action close and the startup sweep so that trace survives on a job
+  that stayed unavailable. But its guidance is "switch access mode and retry" —
+  and `jobs.retry`, the only edge out of `unavailable`, never touched it. Taking
+  the advice therefore left the advisory sitting in the inbox on a job that had
+  since reached `ready`, still telling you to do the thing you just did. A retry
+  now clears it; re-exhausting in conservative mode raises it again.
 - **One job's identity check no longer overwrites another's.** Identity is decided
   against the work *this* job asked for, but it was stored on the shared,
   content-addressed artifact row, so a second acquisition of identical bytes

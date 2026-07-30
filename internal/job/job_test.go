@@ -527,6 +527,47 @@ func TestConservativeAdvisorySurvivesTerminalCloseAndSweep(t *testing.T) {
 	}
 }
 
+// A retry is the user taking the advisory's own advice, so the advisory must
+// not outlive it: the terminal sweep exempts the kind, and unavailable has no
+// other outbound edge, so Retry is the only place that can clear it.
+func TestRetryClearsTheConservativeAdvisory(t *testing.T) {
+	js := testStore(t)
+	ctx := context.Background()
+	id, err := js.CreateRequest(ctx, "wr_advisory_retry", testWork(), "", "", testPolicy(), nil, PrincipalUnknown)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := js.Transition(ctx, id, StateQueued, StateResolving, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := js.OpenHumanAction(ctx, id, "openurl_available", "not opened in conservative mode"); err != nil {
+		t.Fatal(err)
+	}
+	if err := js.Transition(ctx, id, StateResolving, StateUnavailable, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := js.Retry(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	open, err := js.ListHumanActions(ctx, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(open) != 0 {
+		t.Fatalf("open actions after retry = %+v, want the advisory cleared", open)
+	}
+	// The job now succeeds, and the advice it gave is not re-issued.
+	if err := js.Transition(ctx, id, StateResolving, StateReady, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := js.CloseStaleHumanActions(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if open, err := js.ListHumanActions(ctx, true); err != nil || len(open) != 0 {
+		t.Fatalf("open actions on the succeeded job = %+v, %v", open, err)
+	}
+}
+
 func TestOpenHumanActionRefreshesExistingOpenKind(t *testing.T) {
 	js := testStore(t)
 	ctx := context.Background()
