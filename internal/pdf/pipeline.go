@@ -8,11 +8,12 @@ import (
 	"papio/internal/work"
 )
 
-// ValidationInput accepts either a small in-memory Body (fixtures) or a Path
-// produced by the fetch layer. Path validation reads bounded windows; hostile
-// structural parsing stays exclusively in the re-exec worker.
+// ValidationInput names the file the fetch layer produced. Every stage reads
+// Path: the payload gate reads a bounded prefix, and hostile structural
+// parsing stays exclusively in the re-exec worker. Validating bytes already in
+// memory is ValidatePayload's job, not this pipeline's — the payload gate is
+// the only stage that can work without a file.
 type ValidationInput struct {
-	Body         []byte
 	DeclaredMIME string
 	Path         string
 	WorkerBinary string
@@ -41,15 +42,11 @@ type ValidationReport struct {
 // runs first; every structural parse is delegated to WorkerBinary.
 func Validate(ctx context.Context, in ValidationInput, opt ValidationOptions) (ValidationReport, error) {
 	var report ValidationReport
-	if in.Body != nil {
-		report.Payload = ValidatePayload(in.Body, in.DeclaredMIME)
-	} else {
-		payload, err := ValidatePayloadFile(in.Path, in.DeclaredMIME)
-		if err != nil {
-			return report, err
-		}
-		report.Payload = payload
+	payload, err := ValidatePayloadFile(in.Path, in.DeclaredMIME)
+	if err != nil {
+		return report, err
 	}
+	report.Payload = payload
 	if !report.Payload.OK {
 		return report, nil
 	}
@@ -79,13 +76,11 @@ func Validate(ctx context.Context, in ValidationInput, opt ValidationOptions) (V
 	return report, nil
 }
 
-// ValidateBytes is a convenient name for callers emphasizing the parent-side
-// byte gate. It rejects a nil WorkerBinary rather than ever parsing locally.
-// A filesystem in.Path is required: Body only satisfies the in-memory payload
-// gate, while structural validation and text extraction always read in.Path
-// from disk. Passing Body without Path fails once validation reaches those
-// stages.
-func ValidateBytes(ctx context.Context, in ValidationInput, opt ValidationOptions) (ValidationReport, error) {
+// ValidateFile is the production entrypoint: unlike Validate it refuses to run
+// at all without a worker binary, rather than reaching the structural stage and
+// failing there. Validate stays worker-optional so the cheap payload gate can
+// reject a file before any parse is attempted.
+func ValidateFile(ctx context.Context, in ValidationInput, opt ValidationOptions) (ValidationReport, error) {
 	if in.WorkerBinary == "" {
 		return ValidationReport{}, errors.New("pdf worker binary is required")
 	}

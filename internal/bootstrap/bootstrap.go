@@ -218,7 +218,7 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 	validationOptions.Semantic.MinChars = cfg.PDF.MinTextChars
 	validationOptions.Semantic.OCRPages = cfg.PDF.MaxOCRPages
 	service.Validate = func(ctx context.Context, path, declaredMIME string, target work.Work) (pdf.ValidationReport, error) {
-		return pdf.ValidateBytes(ctx, pdf.ValidationInput{
+		return pdf.ValidateFile(ctx, pdf.ValidationInput{
 			DeclaredMIME: declaredMIME,
 			Path:         path,
 			WorkerBinary: executable,

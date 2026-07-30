@@ -53,6 +53,19 @@ func TestValidateUsesPathGateWithoutWorkerForInvalidPayload(t *testing.T) {
 	}
 }
 
+// The only thing ValidateFile adds over Validate is refusing to start without
+// a worker, so that a missing worker is a configuration error rather than a
+// structural-stage failure on an otherwise valid file.
+func TestValidateFileRequiresAWorkerBinary(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "real.pdf")
+	if err := os.WriteFile(path, append([]byte("%PDF-1.7\n"), make([]byte, MinimumPayloadBytes)...), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ValidateFile(context.Background(), ValidationInput{Path: path, DeclaredMIME: "application/pdf"}, ValidationOptions{}); err == nil {
+		t.Fatal("validation ran without a worker binary")
+	}
+}
+
 func TestValidatePayloadFileRejectsDirectories(t *testing.T) {
 	if _, err := ValidatePayloadFile(t.TempDir(), "application/pdf"); err == nil {
 		t.Fatal("directory accepted as PDF payload")
