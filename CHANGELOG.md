@@ -9,6 +9,25 @@ is synthesized from the complete `papio` and `zotio` Git histories and the
 execution records in `notes/acquisition-stack-plan.md`.
 
 
+## [Unreleased]
+
+### Added
+
+- **The six-method consumer IPC contract is ratified and mechanically pinned.**
+  External tools can build against `jobs.list_v2`, `actions.list_v2`,
+  `actions.open`, `jobs.receipt`, `jobs.add_component`, and
+  `jobs.repair_awaiting_human` knowing their names and result shapes will not
+  drift. The receipt records typed job outcomes and component inventory where a
+  bundle cannot exist; an accepted main component's bundle remains the success
+  provenance document. `truncated` on the two paged methods is a proven fact
+  from reading one row past the page limit, not a hint that more may exist.
+
+### Changed
+
+- **`jobs.receipt`'s `principal` is request-origin classification, not a rights
+  input.** It cannot identify whose entitlement obtained the bytes, so consumers
+  must not use it as proof of entitlement.
+
 ## [0.15.0] - 2026-07-30
 
 ### Added
