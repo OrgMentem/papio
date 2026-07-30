@@ -226,18 +226,21 @@ func newAcquireCommand(opt *options) *cobra.Command {
 	return command
 }
 
+// normalizeIdentifiers accepts a positional identifier or any combination of
+// identifier flags. A work legitimately carries several identifiers at once
+// (protocol.Identifiers, the identifiers table, and the batch parsers all
+// model that), so several flags compose into one request; only mixing them
+// with the positional form is ambiguous.
 func normalizeIdentifiers(args []string, doi, pmid, arxivID, isbn, openalex string) (*protocol.Identifiers, error) {
-	explicit := 0
+	explicit := false
 	for _, value := range []string{doi, pmid, arxivID, isbn, openalex} {
 		if strings.TrimSpace(value) != "" {
-			explicit++
+			explicit = true
+			break
 		}
 	}
-	if len(args) != 0 && explicit != 0 {
+	if len(args) != 0 && explicit {
 		return nil, fmt.Errorf("use either the positional identifier or identifier flags, not both")
-	}
-	if explicit > 1 {
-		return nil, fmt.Errorf("only one identifier flag may be used per work request")
 	}
 	ids := &protocol.Identifiers{}
 	var err error
@@ -261,16 +264,23 @@ func normalizeIdentifiers(args []string, doi, pmid, arxivID, isbn, openalex stri
 			return nil, fmt.Errorf("cannot infer identifier type %q; use --doi, --arxiv, --pmid, --isbn, or --openalex", raw)
 		}
 	} else {
-		if doi != "" {
-			ids.DOI, err = work.NormalizeDOI(doi)
-		} else if pmid != "" {
-			ids.PMID, err = work.NormalizePMID(pmid)
-		} else if arxivID != "" {
-			ids.ArXiv, err = work.NormalizeArXiv(arxivID)
-		} else if isbn != "" {
-			ids.ISBN, err = work.NormalizeISBN(isbn)
-		} else if openalex != "" {
-			ids.OpenAlex, err = work.NormalizeOpenAlex(openalex)
+		for _, item := range []struct {
+			raw  string
+			dst  *string
+			norm func(string) (string, error)
+		}{
+			{doi, &ids.DOI, work.NormalizeDOI},
+			{pmid, &ids.PMID, work.NormalizePMID},
+			{arxivID, &ids.ArXiv, work.NormalizeArXiv},
+			{isbn, &ids.ISBN, work.NormalizeISBN},
+			{openalex, &ids.OpenAlex, work.NormalizeOpenAlex},
+		} {
+			if strings.TrimSpace(item.raw) == "" {
+				continue
+			}
+			if *item.dst, err = item.norm(item.raw); err != nil {
+				return nil, err
+			}
 		}
 	}
 	if err != nil {

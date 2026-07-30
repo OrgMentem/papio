@@ -33,12 +33,27 @@ func TestNormalizeIdentifiersAcceptsCommonDOIAndArXivForms(t *testing.T) {
 	}
 }
 
-func TestNormalizeIdentifiersRejectsAmbiguousOrMultipleInputs(t *testing.T) {
+func TestNormalizeIdentifiersRejectsAmbiguousOrMixedInputs(t *testing.T) {
 	if _, err := normalizeIdentifiers([]string{"not-an-id"}, "", "", "", "", ""); err == nil {
 		t.Fatal("ambiguous identifier accepted")
 	}
 	if _, err := normalizeIdentifiers([]string{"10.1000/example"}, "10.1000/other", "", "", "", ""); err == nil {
 		t.Fatal("positional plus explicit identifier accepted")
+	}
+}
+
+// A work carries several identifiers at once, and the daemon stores every one
+// it is given, so flags compose instead of excluding one another.
+func TestNormalizeIdentifiersComposesSeveralFlags(t *testing.T) {
+	ids, err := normalizeIdentifiers(nil, "https://doi.org/10.1000/Example", "12345", "arXiv:2601.12345v2", "", "W2741809807")
+	if err != nil {
+		t.Fatalf("multiple identifier flags rejected: %v", err)
+	}
+	if ids.DOI != "10.1000/example" || ids.PMID != "12345" || ids.ArXiv != "2601.12345v2" || ids.OpenAlex != "W2741809807" {
+		t.Fatalf("composed identifiers = %+v", ids)
+	}
+	if ids.ISBN != "" {
+		t.Fatalf("unset flag populated an identifier: %+v", ids)
 	}
 }
 

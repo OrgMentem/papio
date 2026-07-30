@@ -54,6 +54,12 @@ execution records in `notes/acquisition-stack-plan.md`.
   the daily sweep prunes acknowledgements whose notice is no longer current. The
   wire shape is unchanged, so an already-installed extension gains the button.
   Schema version 17.
+- **`papio acquire` accepts several identifier flags at once.** A work carries a
+  DOI *and* a PMID *and* an arXiv id, and `protocol.Identifiers`, the
+  `identifiers` table, and every batch parser have always modelled that — only the
+  CLI insisted on one, forcing callers to discard identifiers they already held.
+  Flags now compose; mixing them with the positional identifier is still refused,
+  because that one really is ambiguous.
 
 ### Fixed
 
