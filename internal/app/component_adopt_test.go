@@ -109,7 +109,7 @@ func TestAdoptComponentRecordsASupplementBesideTheMainArtifact(t *testing.T) {
 	}
 }
 
-func TestAdoptComponentRejectsUnsupportedRolesAndUnreadablePDFs(t *testing.T) {
+func TestAdoptComponentRejectsUnsupportedRolesAndUnsafePDFs(t *testing.T) {
 	svc, jobs := newTestService(t)
 	svc.Validate = passValidation()
 	svc.Fetch = fakeDownload(new(int))
@@ -125,14 +125,13 @@ func TestAdoptComponentRejectsUnsupportedRolesAndUnreadablePDFs(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := svc.AdoptComponent(ctx, id, path, job.ComponentHTMLFullText); !errors.Is(err, ErrComponentRole) {
-		t.Fatalf("html_fulltext = %v, want ErrComponentRole: raw provider HTML is active content", err)
-	}
-	if err := svc.AdoptComponent(ctx, id, path, "main"); !errors.Is(err, ErrComponentRole) {
-		t.Fatalf("main = %v, want ErrComponentRole: the main component is the transition's job", err)
-	}
-	if err := svc.AdoptComponent(ctx, id, path, "figures"); !errors.Is(err, ErrComponentRole) {
-		t.Fatalf("unknown role = %v, want ErrComponentRole", err)
+	for _, role := range []string{job.ComponentHTMLFullText, "main", "figures"} {
+		err := svc.AdoptComponent(ctx, id, path, role)
+		if !errors.Is(err, ErrComponentRole) {
+			t.Fatalf("%s = %v, want ErrComponentRole", role, err)
+		}
+		assertComponentCount(t, jobs, id, 1)
+		assertNoComponentTemp(t, svc, id)
 	}
 
 	// An active-content PDF is refused exactly as for a main file.
@@ -145,16 +144,7 @@ func TestAdoptComponentRejectsUnsupportedRolesAndUnreadablePDFs(t *testing.T) {
 		}, nil
 	}
 	err := svc.AdoptComponent(ctx, id, path, job.ComponentSupplement)
-	if err == nil || !strings.Contains(err.Error(), "active content") {
-		t.Fatalf("active-content supplement = %v, want rejection", err)
-	}
-	components, listErr := jobs.Components(ctx, id)
-	if listErr != nil {
-		t.Fatal(listErr)
-	}
-	if len(components) != 1 {
-		t.Fatalf("rejected component was recorded anyway: %+v", components)
-	}
+	assertComponentRefusal(t, svc, jobs, id, err, ErrComponentRejected)
 }
 
 // A job with no main artifact cannot carry components: a supplement is evidence
@@ -172,7 +162,247 @@ func TestAdoptComponentRequiresAMainArtifact(t *testing.T) {
 	if err := os.WriteFile(path, pdfBytes("orphan supplement"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := svc.AdoptComponent(ctx, id, path, job.ComponentSupplement); err == nil {
-		t.Fatal("filed a component against a job holding no main artifact")
+	err := svc.AdoptComponent(ctx, id, path, job.ComponentSupplement)
+	if !errors.Is(err, ErrComponentPrecondition) {
+		t.Fatalf("adopt component without main artifact = %v, want ErrComponentPrecondition", err)
 	}
+	assertComponentCount(t, jobs, id, 0)
+	assertNoComponentTemp(t, svc, id)
+}
+
+func readyComponentService(t *testing.T, reqID string) (*Service, *job.Store, string) {
+	t.Helper()
+	svc, jobs := newTestService(t)
+	svc.Validate = passValidation()
+	svc.Fetch = fakeDownload(new(int))
+	svc.Resolvers = []ResolverEntry{{Adapter: &fakeResolver{name: "fixture", cands: readyCandidate()}, Policy: config.Source{Enabled: true}}}
+	return svc, jobs, readyJobWithArtifact(t, svc, jobs, reqID)
+}
+
+func componentAdoptionDir(t *testing.T, svc *Service, id string) string {
+	t.Helper()
+	dir := filepath.Join(svc.Config.EffectiveAdoptionRoot(), id)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+func assertComponentCount(t *testing.T, jobs *job.Store, id string, want int) {
+	t.Helper()
+	components, err := jobs.Components(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(components) != want {
+		t.Fatalf("components = %+v, want %d", components, want)
+	}
+}
+
+func assertNoComponentTemp(t *testing.T, svc *Service, id string) {
+	t.Helper()
+	qdir, err := svc.Artifacts.QuarantineDir(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(qdir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.HasSuffix(entry.Name(), ".tmp") {
+			t.Fatalf("rejected component left quarantine temp %q", filepath.Join(qdir, entry.Name()))
+		}
+	}
+}
+
+func assertComponentRefusal(t *testing.T, svc *Service, jobs *job.Store, id string, err, want error) {
+	t.Helper()
+	if !errors.Is(err, want) {
+		t.Fatalf("adopt component = %v, want %v", err, want)
+	}
+	assertComponentCount(t, jobs, id, 1)
+	assertNoComponentTemp(t, svc, id)
+}
+
+func TestAdoptComponentClassifiesAdoptionRootAndCallerPathFailures(t *testing.T) {
+	t.Run("missing adoption root", func(t *testing.T) {
+		svc, jobs, id := readyComponentService(t, "wr_component_missing_root")
+		path := filepath.Join(svc.Config.EffectiveAdoptionRoot(), id, "supplement.pdf")
+
+		err := svc.AdoptComponent(context.Background(), id, path, job.ComponentSupplement)
+		assertComponentRefusal(t, svc, jobs, id, err, ErrComponentPrecondition)
+	})
+
+	t.Run("missing caller directory", func(t *testing.T) {
+		svc, jobs, id := readyComponentService(t, "wr_component_missing_dir")
+		dir := componentAdoptionDir(t, svc, id)
+		path := filepath.Join(dir, "missing", "supplement.pdf")
+
+		err := svc.AdoptComponent(context.Background(), id, path, job.ComponentSupplement)
+		assertComponentRefusal(t, svc, jobs, id, err, ErrComponentPath)
+	})
+}
+
+func TestAdoptComponentRejectsEscapesAndNonRegularFinalPaths(t *testing.T) {
+	t.Run("dot dot traversal", func(t *testing.T) {
+		svc, jobs, id := readyComponentService(t, "wr_component_dotdot")
+		dir := componentAdoptionDir(t, svc, id)
+		outside := filepath.Join(filepath.Dir(filepath.Dir(dir)), "outside.pdf")
+		if err := os.WriteFile(outside, pdfBytes("outside"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		err := svc.AdoptComponent(context.Background(), id, dir+"/../../outside.pdf", job.ComponentSupplement)
+		assertComponentRefusal(t, svc, jobs, id, err, ErrComponentPath)
+	})
+
+	t.Run("absolute path", func(t *testing.T) {
+		svc, jobs, id := readyComponentService(t, "wr_component_absolute")
+		componentAdoptionDir(t, svc, id)
+		outside := filepath.Join(t.TempDir(), "outside.pdf")
+		if err := os.WriteFile(outside, pdfBytes("outside"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		err := svc.AdoptComponent(context.Background(), id, outside, job.ComponentSupplement)
+		assertComponentRefusal(t, svc, jobs, id, err, ErrComponentPath)
+	})
+
+	t.Run("directory", func(t *testing.T) {
+		svc, jobs, id := readyComponentService(t, "wr_component_directory")
+		dir := componentAdoptionDir(t, svc, id)
+		path := filepath.Join(dir, "not-a-file.pdf")
+		if err := os.Mkdir(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+
+		err := svc.AdoptComponent(context.Background(), id, path, job.ComponentSupplement)
+		assertComponentRefusal(t, svc, jobs, id, err, ErrComponentPath)
+	})
+
+	t.Run("final symlink", func(t *testing.T) {
+		svc, jobs, id := readyComponentService(t, "wr_component_final_symlink")
+		dir := componentAdoptionDir(t, svc, id)
+		target := filepath.Join(dir, "target.pdf")
+		if err := os.WriteFile(target, pdfBytes("target"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(dir, "linked.pdf")
+		if err := os.Symlink("target.pdf", path); err != nil {
+			t.Fatal(err)
+		}
+
+		err := svc.AdoptComponent(context.Background(), id, path, job.ComponentSupplement)
+		assertComponentRefusal(t, svc, jobs, id, err, ErrComponentPath)
+	})
+}
+
+func TestAdoptComponentAcceptsFileThroughAncestorSymlink(t *testing.T) {
+	svc, jobs, id := readyComponentService(t, "wr_component_ancestor_symlink")
+	dir := componentAdoptionDir(t, svc, id)
+	physical := filepath.Join(dir, "physical")
+	if err := os.Mkdir(physical, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(physical, "supplement.pdf"), pdfBytes("through parent symlink"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("physical", filepath.Join(dir, "linked-parent")); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := svc.AdoptComponent(context.Background(), id, filepath.Join(dir, "linked-parent", "supplement.pdf"), job.ComponentAppendix); err != nil {
+		t.Fatalf("adopt through ancestor symlink: %v", err)
+	}
+	components, err := jobs.Components(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(components) != 2 || components[1].Role != job.ComponentAppendix {
+		t.Fatalf("components = %+v, want main plus appendix", components)
+	}
+}
+
+func TestAdoptComponentRejectsInvalidAndUnsafePDFs(t *testing.T) {
+	tests := []struct {
+		name   string
+		bytes  []byte
+		report pdf.ValidationReport
+	}{
+		{
+			name:  "invalid payload",
+			bytes: []byte("not a PDF"),
+			report: pdf.ValidationReport{
+				Payload:    pdf.PayloadReport{OK: false},
+				Structural: pdf.StructuralReport{Valid: false},
+			},
+		},
+		{
+			name:  "encrypted",
+			bytes: pdfBytes("encrypted"),
+			report: pdf.ValidationReport{
+				Payload:    pdf.PayloadReport{OK: true},
+				Structural: pdf.StructuralReport{Valid: true, Encrypted: true},
+			},
+		},
+		{
+			name:  "embedded files",
+			bytes: pdfBytes("embedded"),
+			report: pdf.ValidationReport{
+				Payload:    pdf.PayloadReport{OK: true},
+				Structural: pdf.StructuralReport{Valid: true, HasEmbeddedFiles: true},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc, jobs, id := readyComponentService(t, "wr_component_"+strings.ReplaceAll(tt.name, " ", "_"))
+			svc.Validate = func(context.Context, string, string, work.Work) (pdf.ValidationReport, error) {
+				return tt.report, nil
+			}
+			dir := componentAdoptionDir(t, svc, id)
+			path := filepath.Join(dir, "supplement.pdf")
+			if err := os.WriteFile(path, tt.bytes, 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			err := svc.AdoptComponent(context.Background(), id, path, job.ComponentSupplement)
+			assertComponentRefusal(t, svc, jobs, id, err, ErrComponentRejected)
+		})
+	}
+}
+
+func TestAdoptComponentLeavesOperationalRootFailureUnclassified(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses directory permissions")
+	}
+
+	svc, jobs, id := readyComponentService(t, "wr_component_unreadable_root")
+	root := svc.Config.EffectiveAdoptionRoot()
+	dir := componentAdoptionDir(t, svc, id)
+	path := filepath.Join(dir, "supplement.pdf")
+	if err := os.WriteFile(path, pdfBytes("unreadable root"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(root, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chmod(root, 0o700); err != nil {
+			t.Errorf("restore adoption root mode: %v", err)
+		}
+	})
+
+	err := svc.AdoptComponent(context.Background(), id, path, job.ComponentSupplement)
+	if err == nil {
+		t.Fatal("adopt component unexpectedly succeeded with unreadable adoption root")
+	}
+	for _, sentinel := range []error{ErrComponentRole, ErrComponentPrecondition, ErrComponentPath, ErrComponentRejected} {
+		if errors.Is(err, sentinel) {
+			t.Fatalf("unreadable adoption root = %v, must not match %v", err, sentinel)
+		}
+	}
+	assertComponentCount(t, jobs, id, 1)
+	assertNoComponentTemp(t, svc, id)
 }

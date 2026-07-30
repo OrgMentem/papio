@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 
@@ -79,15 +80,29 @@ func (s *Service) AdoptComponent(ctx context.Context, jobID, path, role string) 
 	// Same confinement as main adoption: ancestor symlinks resolve so mounts
 	// work, but the final component is Lstat-checked so a symlinked file is
 	// rejected rather than followed.
+	// Only an input-policy failure may be reported as one. An EACCES or EIO on the
+	// daemon's OWN adoption root is an operational fault, and telling the operator
+	// "the file must be inside the adoption root" would send them to inspect a path
+	// that is fine while hiding a broken data directory. Unexpected errors stay
+	// unclassified so the RPC layer reports them as internal.
 	realRoot, err := filepath.EvalSymlinks(filepath.Join(s.Config.EffectiveAdoptionRoot(), jobID))
 	if err != nil {
-		return fmt.Errorf("%w: adoption root unavailable: %w", ErrComponentPath, err)
+		if errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("%w: job %s has no adoption root to attach a %s from", ErrComponentPrecondition, jobID, role)
+		}
+		return fmt.Errorf("adoption root unavailable: %w", err)
 	}
 	realDir, err := filepath.EvalSymlinks(filepath.Dir(path))
 	if err != nil {
-		return fmt.Errorf("%w: %w", ErrComponentPath, err)
+		// A path the caller named that does not exist is the caller's mistake; any
+		// other failure reading it is not something they can act on.
+		if errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("%w: %w", ErrComponentPath, err)
+		}
+		return fmt.Errorf("resolving component directory: %w", err)
 	}
 	resolved := filepath.Join(realDir, filepath.Base(path))
+	// This one IS the policy check: escape, or a non-regular final component.
 	if err := artifact.ConfineRegularFile(realRoot, resolved); err != nil {
 		return fmt.Errorf("%w: %w", ErrComponentPath, err)
 	}

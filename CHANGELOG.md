@@ -9,7 +9,7 @@ is synthesized from the complete `papio` and `zotio` Git histories and the
 execution records in `notes/acquisition-stack-plan.md`.
 
 
-## [Unreleased]
+## [0.15.0] - 2026-07-30
 
 ### Added
 

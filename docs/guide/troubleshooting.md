@@ -262,3 +262,33 @@ Use the report reason to choose the next step:
 
 The exact report reason is preferable to a blind `papio jobs retry`; browser and
 identity states are intentionally parked for a human decision.
+
+
+If the report reason does not explain it, ask the job itself:
+
+```sh
+papio jobs receipt <job-id>
+```
+
+That names the typed terminal reason, which access tiers the job actually reached,
+and any components it holds. The attempted tiers are the useful part when a paper
+*should* have been available: `none` means no source was ever reached, and a list
+containing only `open_access` when you expected an institutional pass means the
+institutional route was never tried rather than tried and refused.
+
+### A parked job with no open action
+
+A job can sit in `awaiting_human` after the action it was waiting for is gone —
+resolved elsewhere, or cancelled. `papio actions list` shows nothing to do, so
+there is nothing to resolve, and a retry is the wrong instrument because the job
+is parked rather than failed. The background sweep clears these on its own
+schedule; to clear one immediately:
+
+```sh
+papio jobs repair-awaiting-human <job-id>
+```
+
+It returns the job to `resolving` and reports what it found, so an outcome of
+`not_parked` or `has_open_actions` means the job is not actually orphaned and the
+parked state is genuine — resolve the open action instead. It is deliberately
+narrow: it will not reopen a job that is legitimately waiting on you.
