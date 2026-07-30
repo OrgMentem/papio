@@ -284,15 +284,30 @@ selected --repos papio` uses a hidden prompt — never pass `--body` (shell hist
 Reuse account-wide settings (`WEB_EXT_*`, the CWS OAuth trio and publisher ID)
 by adding repos to `--repos`; keep `CWS_EXTENSION_ID` per-repo.
 
-### Screenshots
+### Screenshots and promo tiles
 
-CWS wants 1280×800 or 640×400. *Generating* them is scriptable (render
-`popup.html`/`options.html` with representative state via headless Chromium — no
-daemon needed; capture at 3× and downscale so text stays crisp), but *uploading*
-is **manual**: neither store exposes a listing-asset API. Listing metadata
-(description, screenshots, category, privacy) is dashboard-only and is
-**preserved when you upload a new package** — Save draft, then Package → Upload
-new package replaces only the code.
+CWS wants screenshots at 1280×800 or 640×400. *Generating* them is scriptable
+(render `popup.html`/`options.html` with representative state via headless
+Chromium — no daemon needed; capture at 3× and downscale so text stays crisp),
+but *uploading* is **manual**: neither store exposes a listing-asset API.
+Listing metadata (description, screenshots, category, privacy) is
+dashboard-only and is **preserved when you upload a new package** — Save draft,
+then Package → Upload new package replaces only the code.
+
+Promo tiles are listing assets too, and they are easy to forget because nothing
+in the repo tracks them: `bun run capture:store`
+(`extension/scripts/capture-store-assets.ts`) writes `promo-small` (440×280)
+and `promo-marquee` (1400×560) into `extension/web-ext-artifacts/store-assets/`,
+which is **gitignored** — the tiles are regenerated output, never committed, so
+there is no diff to remind you they changed. They are derived from
+`docs/assets/logo-wordmark.svg`, so any brand edit silently invalidates the
+live listing until someone re-uploads.
+
+Visuals can only be edited while a submission draft is open, so a tile refresh
+cannot be pushed standalone — it rides the next submission or it does not ship.
+**Outstanding:** the marquee now carries the peeking-baboon cameo; the live CWS
+listing still shows the pre-cameo tile. Re-run `capture:store` and upload
+`promo-marquee.png` during the next CWS submission.
 
 ### Footguns
 
