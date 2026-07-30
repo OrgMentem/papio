@@ -65,6 +65,12 @@ Option C.
   access basis, resolver tier, and acquiring principal are properties of *how
   these bytes were obtained*. The artifact store stays a pure byte store keyed
   by digest. No artifact schema change for rights or version — now or later.
+  **Correction D (2026-07-30, design review):** `principal` cannot identify whose
+  entitlement obtained the bytes. It reads the current job's work-request
+  requester; a generic socket caller is indistinguishable from the CLI, and a
+  cache-completed job carries provenance from the source acquisition while
+  `principal` reflects the current request. It therefore means request-origin
+  classification only and must not be used as a rights input.
 - **`acquisition-bundle/1` already *is* the success receipt; nothing is added to
   it.** A plan review found the bundle already carries `candidate.version` as a
   typed enum (`published`/`accepted`/`preprint`/`unknown`), `candidate.access_basis`,
@@ -79,6 +85,27 @@ Option C.
   the typed terminal reason lives. Bundle export is gated on `ready`/`imported`
   with a passing identity (`internal/bundle/export.go:82-104`), so this is not an
   edge case — it is half the consumer's use.
+  **Correction A (2026-07-30, design review):** “a new IPC method only” was a
+  WIRE-evolution rule: add a method rather than widen a result or add an
+  `acquisition-bundle/2` field. It was never a reachability exception and cannot
+  override ADR-0001: the CLI is the single source of truth for capabilities.
+  v0.14.0 consequently shipped `jobs.receipt`, `jobs.add_component`, and
+  `jobs.repair_awaiting_human` with no Cobra reachability, contrary to ADR-0001.
+  v0.15.0 adds typed CLI commands over those same methods with no wire change.
+  Going forward, a method may use a distinct TRANSPORT without a 1:1 CLI command,
+  but may not expose a domain fact or domain transition with no meaningful Cobra
+  reachability. `TestEveryDomainRPCIsReachableFromCLI` in `internal/cli` now
+  mechanically enforces that rule against a default-deny allowlist. ADR-0001 is
+  deliberately unchanged: its rule caught a real regression the first time it
+  fired.
+  **Correction B (2026-07-30, design review):** “already *is* the success
+  receipt” is too broad now that components exist. The no-duplication decision
+  stands, but the terminology does not: the frozen bundle is the canonical
+  provenance document for the accepted MAIN component, while the receipt is the
+  canonical job-outcome and component inventory for every state. They are
+  non-overlapping contracts, not rival provenance records. In prose and human
+  output, describe `bundle_available` as *main bundle available*; the frozen JSON
+  field remains unchanged.
 - **papio emits facts; the consumer judges identity.** papio does not model a
   `Manifestation`, does not decide whether a source package is complete, and
   does not decide whether an obtained version satisfies a citation. Two
@@ -124,6 +151,10 @@ Option C.
   artifact row exists for a failed acquisition, so failed receipts carry a coarse
   terminal reason, not findings. Consumers may describe papio's validation
   *findings*; they may not claim to relay a full report.
+  **Correction C (2026-07-30, design review):** `attempted_tiers` was implemented
+  by inferring an append-only fact from mutable candidate status, so an explicit
+  retry reset could erase evidence. v0.15.0 derives it from append-only attempt
+  records instead.
 - **List growth uses new methods carrying the `agentjson` `{name: [],
   truncated}` envelope**, never a widened existing result — but the envelope
   alone does not satisfy the consumer. `agentjson.Capped` documents its flag as

@@ -63,10 +63,18 @@ const (
 // only for kindEnvelope: rowKey is the envelope's row key, and args are the
 // extra arguments (after the command path) needed to reach the --json branch
 // without daemon state, exactly as the old hardcoded table specified them.
+//
+// rpcMethods names every daemon method this command can reach. It is the
+// other half of ADR-0001's rule — the CLI is the single source of truth for
+// capabilities, so no domain fact or transition may exist on the wire without
+// Cobra reachability. TestEveryDomainRPCIsReachableFromCLI walks the live
+// router against the union of these, which is why an entry that names a
+// method the router no longer serves is itself a failure.
 type commandClass struct {
-	kind   commandKind
-	rowKey string
-	args   []string
+	kind       commandKind
+	rowKey     string
+	args       []string
+	rpcMethods []string
 }
 
 // commandClassification names how every runnable command in the tree emits
@@ -81,61 +89,65 @@ var commandClassification = map[string]commandClass{
 	"papio init":         {kind: kindNone},
 	"papio config":       {kind: kindNone},
 	"papio config init":  {kind: kindStructured},
-	"papio acquire":      {kind: kindStructured},
+	"papio acquire":      {kind: kindStructured, rpcMethods: []string{"watch.digest_acquire", "zotio.queue", "acquire.submit_v2", "acquire.submit", "jobs.get", "zotio.lookup_works", "library.lookup_works"}},
 	"papio batch":        {kind: kindNone},
-	"papio batch report": {kind: kindStructured},
-	"papio search":       {kind: kindEnvelope, rowKey: "works", args: []string{"conformance probe"}},
+	"papio batch report": {kind: kindStructured, rpcMethods: []string{"acquire.report"}},
+	"papio search":       {kind: kindEnvelope, rowKey: "works", args: []string{"conformance probe"}, rpcMethods: []string{"discovery.search"}},
 	"papio watch":        {kind: kindNone},
-	"papio watch add":    {kind: kindStructured},
-	"papio watch list":   {kind: kindEnvelope, rowKey: "watches"},
+	"papio watch add":    {kind: kindStructured, rpcMethods: []string{"watch.add"}},
+	"papio watch list":   {kind: kindEnvelope, rowKey: "watches", rpcMethods: []string{"watch.list"}},
 	// watch digest also owns a "digest clear" subcommand; ExactArgs(1) on
 	// "digest" itself accepts a bare watch id, so no daemon state is needed
 	// to reach its --json path.
-	"papio watch digest":           {kind: kindEnvelope, rowKey: "entries", args: []string{"1"}},
-	"papio watch digest clear":     {kind: kindStructured},
-	"papio watch remove":           {kind: kindStructured},
-	"papio watch run":              {kind: kindStructured},
-	"papio jobs":                   {kind: kindNone},
-	"papio jobs list":              {kind: kindEnvelope, rowKey: "jobs"},
-	"papio jobs get":               {kind: kindStructured},
-	"papio jobs cancel":            {kind: kindStructured},
-	"papio jobs retry":             {kind: kindStructured},
-	"papio jobs failures":          {kind: kindEnvelope, rowKey: "failures"},
-	"papio adapter":                {kind: kindNone},
-	"papio adapter diagnose":       {kind: kindStructured},
-	"papio adapter captures":       {kind: kindEnvelope, rowKey: "captures"},
-	"papio adapter captures purge": {kind: kindStructured},
-	"papio status":                 {kind: kindStructured},
-	"papio stats":                  {kind: kindStructured},
-	"papio actions":                {kind: kindNone},
-	"papio actions list":           {kind: kindEnvelope, rowKey: "actions"},
-	"papio actions resolve":        {kind: kindStructured},
-	"papio actions open":           {kind: kindEnvelope, rowKey: "urls", args: []string{"--dry-run"}},
-	"papio browser":                {kind: kindNone},
-	"papio browser sessions":       {kind: kindStructured},
-	"papio browser use":            {kind: kindStructured},
-	"papio inbox":                  {kind: kindStructured},
-	"papio inbox counts":           {kind: kindStructured},
-	"papio artifacts":              {kind: kindNone},
-	"papio artifacts get":          {kind: kindStructured},
-	"papio bundle":                 {kind: kindNone},
-	"papio bundle export":          {kind: kindStructured},
-	"papio doctor":                 {kind: kindStructured},
-	"papio zotio":                  {kind: kindNone},
-	"papio zotio preflight":        {kind: kindStructured},
-	"papio zotio plan":             {kind: kindStructured},
-	"papio zotio apply":            {kind: kindStructured},
-	"papio zotio tags":             {kind: kindNone},
-	"papio zotio tags reconcile":   {kind: kindStructured},
-	"papio daemon":                 {kind: kindNone},
-	"papio daemon stop":            {kind: kindStructured},
-	"papio daemon status":          {kind: kindStructured},
-	"papio native-host":            {kind: kindNone},
-	"papio native-host install":    {kind: kindStructured},
-	"papio native-host uninstall":  {kind: kindStructured},
-	"papio native-host status":     {kind: kindStructured},
-	"papio mcp":                    {kind: kindNone},
-	"papio version":                {kind: kindStructured},
+	"papio watch digest":               {kind: kindEnvelope, rowKey: "entries", args: []string{"1"}, rpcMethods: []string{"watch.digest"}},
+	"papio watch digest clear":         {kind: kindStructured, rpcMethods: []string{"watch.digest_clear"}},
+	"papio watch remove":               {kind: kindStructured, rpcMethods: []string{"watch.remove"}},
+	"papio watch run":                  {kind: kindStructured, rpcMethods: []string{"watch.run"}},
+	"papio jobs":                       {kind: kindNone},
+	"papio jobs list":                  {kind: kindEnvelope, rowKey: "jobs", rpcMethods: []string{"jobs.list_v2", "jobs.list"}},
+	"papio jobs get":                   {kind: kindStructured, rpcMethods: []string{"jobs.get"}},
+	"papio jobs receipt":               {kind: kindStructured, rpcMethods: []string{"jobs.receipt"}},
+	"papio jobs add-component":         {kind: kindEnvelope, rowKey: "components", args: []string{"job_01", "/tmp/papio-conformance-supplement.pdf", "--role", "supplement"}, rpcMethods: []string{"jobs.add_component"}},
+	"papio jobs repair-awaiting-human": {kind: kindStructured, rpcMethods: []string{"jobs.repair_awaiting_human"}},
+	"papio jobs cancel":                {kind: kindStructured, rpcMethods: []string{"jobs.cancel"}},
+	"papio jobs retry":                 {kind: kindStructured, rpcMethods: []string{"jobs.retry"}},
+	"papio jobs failures":              {kind: kindEnvelope, rowKey: "failures", rpcMethods: []string{"jobs.failures"}},
+	"papio adapter":                    {kind: kindNone},
+	"papio adapter diagnose":           {kind: kindStructured, rpcMethods: []string{"jobs.get", "ping"}},
+	"papio adapter captures":           {kind: kindEnvelope, rowKey: "captures", rpcMethods: []string{"adapter.captures.list"}},
+	"papio adapter captures purge":     {kind: kindStructured, rpcMethods: []string{"adapter.captures.purge"}},
+	"papio status":                     {kind: kindStructured, rpcMethods: []string{"zotio.missing_count", "jobs.list", "jobs.get"}},
+	"papio stats":                      {kind: kindStructured, rpcMethods: []string{"stats.get"}},
+	"papio actions":                    {kind: kindNone},
+	"papio actions list":               {kind: kindEnvelope, rowKey: "actions", rpcMethods: []string{"actions.list_v2", "actions.list"}},
+	"papio actions resolve":            {kind: kindStructured, rpcMethods: []string{"actions.resolve"}},
+	"papio actions open":               {kind: kindEnvelope, rowKey: "urls", args: []string{"--dry-run"}, rpcMethods: []string{"actions.list", "jobs.list_v2", "jobs.list", "actions.open"}},
+	"papio browser":                    {kind: kindNone},
+	"papio browser sessions":           {kind: kindStructured, rpcMethods: []string{"browser.sessions"}},
+	"papio browser use":                {kind: kindStructured, rpcMethods: []string{"browser.sessions", "browser.claim"}},
+	"papio inbox":                      {kind: kindStructured, rpcMethods: []string{"triage.snapshot"}},
+	"papio inbox counts":               {kind: kindStructured, rpcMethods: []string{"triage.counts"}},
+	"papio inbox decide":               {kind: kindStructured, rpcMethods: []string{"triage.decide"}},
+	"papio artifacts":                  {kind: kindNone},
+	"papio artifacts get":              {kind: kindStructured, rpcMethods: []string{"artifacts.get"}},
+	"papio bundle":                     {kind: kindNone},
+	"papio bundle export":              {kind: kindStructured, rpcMethods: []string{"bundle.export"}},
+	"papio doctor":                     {kind: kindStructured, rpcMethods: []string{"ping", "doctor.run"}},
+	"papio zotio":                      {kind: kindNone},
+	"papio zotio preflight":            {kind: kindStructured, rpcMethods: []string{"zotio.preflight"}},
+	"papio zotio plan":                 {kind: kindStructured, rpcMethods: []string{"zotio.plan"}},
+	"papio zotio apply":                {kind: kindStructured, rpcMethods: []string{"zotio.apply"}},
+	"papio zotio tags":                 {kind: kindNone},
+	"papio zotio tags reconcile":       {kind: kindStructured, rpcMethods: []string{"zotio.tags.reconcile"}},
+	"papio daemon":                     {kind: kindNone},
+	"papio daemon stop":                {kind: kindStructured, rpcMethods: []string{"daemon.shutdown"}},
+	"papio daemon status":              {kind: kindStructured, rpcMethods: []string{"ping"}},
+	"papio native-host":                {kind: kindNone},
+	"papio native-host install":        {kind: kindStructured},
+	"papio native-host uninstall":      {kind: kindStructured},
+	"papio native-host status":         {kind: kindStructured},
+	"papio mcp":                        {kind: kindNone},
+	"papio version":                    {kind: kindStructured},
 }
 
 // TestJSONCommandTreeConformsToItsClassification is the enforcement half of

@@ -1081,3 +1081,136 @@ func TestListOldestRotatesPastPriorMaintenancePage(t *testing.T) {
 	}
 	t.Fatalf("later job %q was not reached after the first page: %+v", ids[pageSize], second)
 }
+
+func TestAttemptedTiers(t *testing.T) {
+	type testCase struct {
+		name  string
+		setup func(t *testing.T, js *Store, ctx context.Context, jobID string, add func(string, int) int64)
+		want  []string
+	}
+	cases := []testCase{
+		{
+			name: "ranked but never attempted is excluded",
+			setup: func(t *testing.T, js *Store, ctx context.Context, jobID string, add func(string, int) int64) {
+				add("institutional", 0)
+			},
+		},
+		{
+			name: "started attempt is included",
+			setup: func(t *testing.T, js *Store, ctx context.Context, jobID string, add func(string, int) int64) {
+				candidateID := add("institutional", 0)
+				if _, err := js.StartAttempt(ctx, jobID, candidateID, "fetch", "fixture"); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: []string{"institutional"},
+		},
+		{
+			name: "repeated attempts of one basis are deduplicated",
+			setup: func(t *testing.T, js *Store, ctx context.Context, jobID string, add func(string, int) int64) {
+				for _, candidateID := range []int64{add("open_access", 0), add("open_access", 1)} {
+					if _, err := js.StartAttempt(ctx, jobID, candidateID, "fetch", "fixture"); err != nil {
+						t.Fatal(err)
+					}
+				}
+			},
+			want: []string{"open_access"},
+		},
+		{
+			name: "attempt survives candidate reset",
+			setup: func(t *testing.T, js *Store, ctx context.Context, jobID string, add func(string, int) int64) {
+				candidateID := add("institutional", 0)
+				if _, err := js.StartAttempt(ctx, jobID, candidateID, "fetch", "fixture"); err != nil {
+					t.Fatal(err)
+				}
+				if err := js.MarkCandidate(ctx, candidateID, "retryable"); err != nil {
+					t.Fatal(err)
+				}
+				if err := js.ResetCandidates(ctx, jobID); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: []string{"institutional"},
+		},
+		{
+			name: "prior tier survives retry when new policy does not revisit it",
+			setup: func(t *testing.T, js *Store, ctx context.Context, jobID string, add func(string, int) int64) {
+				previous := add("institutional", 0)
+				if _, err := js.StartAttempt(ctx, jobID, previous, "fetch", "fixture"); err != nil {
+					t.Fatal(err)
+				}
+				if err := js.MarkCandidate(ctx, previous, "retryable"); err != nil {
+					t.Fatal(err)
+				}
+				if err := js.ResetCandidates(ctx, jobID); err != nil {
+					t.Fatal(err)
+				}
+				current := add("open_access", 1)
+				if _, err := js.StartAttempt(ctx, jobID, current, "fetch", "fixture"); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: []string{"institutional", "open_access"},
+		},
+		{
+			name: "skipped before I/O is excluded",
+			setup: func(t *testing.T, js *Store, ctx context.Context, jobID string, add func(string, int) int64) {
+				if err := js.MarkCandidate(ctx, add("institutional", 0), "skipped"); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "accepted is included without an attempt record",
+			setup: func(t *testing.T, js *Store, ctx context.Context, jobID string, add func(string, int) int64) {
+				if err := js.MarkCandidate(ctx, add("open_access", 0), "accepted"); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: []string{"open_access"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			js := testStore(t)
+			ctx := context.Background()
+			jobID, err := js.CreateRequest(ctx, "wr_attempted_tiers", testWork(), "", "", testPolicy(), nil, PrincipalUnknown)
+			if err != nil {
+				t.Fatal(err)
+			}
+			next := 0
+			add := func(accessBasis string, rank int) int64 {
+				t.Helper()
+				urlKey := jobID + "-" + string(rune('a'+next))
+				next++
+				if _, err := js.InsertCandidates(ctx, jobID, []Candidate{{
+					JobID: jobID, Source: "fixture", URLRedacted: "https://example.test/" + urlKey, URLKey: urlKey,
+					Version: "published", AccessBasis: accessBasis, ReuseLicense: "unknown", Rank: rank,
+				}}); err != nil {
+					t.Fatal(err)
+				}
+				var candidateID int64
+				if err := js.S.DB().QueryRowContext(ctx,
+					`SELECT id FROM candidates WHERE job_id = ? AND url_key = ?`, jobID, urlKey).Scan(&candidateID); err != nil {
+					t.Fatal(err)
+				}
+				return candidateID
+			}
+
+			tc.setup(t, js, ctx, jobID, add)
+			got, err := js.AttemptedTiers(ctx, jobID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(got) != len(tc.want) {
+				t.Fatalf("AttemptedTiers() = %q, want %q", got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Fatalf("AttemptedTiers() = %q, want %q", got, tc.want)
+				}
+			}
+		})
+	}
+}

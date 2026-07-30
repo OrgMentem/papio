@@ -120,8 +120,9 @@ type Receipt struct {
 	// a value written by an older binary normalises to "unknown" rather than
 	// leaking free text into a typed field.
 	TerminalReason string `json:"terminal_reason,omitempty"`
-	// Principal is who requested the acquisition: whose entitlement obtained the
-	// bytes. "unknown" is honest, not a placeholder.
+	// Principal classifies the request origin (cli, mcp, or unknown), not an
+	// authenticated identity or proof of whose entitlement obtained the bytes.
+	// Consumers must not use it as a rights or permission input.
 	Principal string `json:"principal"`
 	// AttemptedTiers lists the access bases actually reached, in rank order —
 	// candidates that were only ranked and never tried are excluded.
@@ -549,8 +550,7 @@ func zotioLookupWorks(ctx context.Context, raw json.RawMessage, system *bootstra
 // neutral holdings claims plus per-source completeness. zotio.lookup_works keeps
 // its old shape *and* its old semantics (ADR-0008 invariant 8).
 type LibraryLookupWorksRequest struct {
-	Works               []ownership.Query `json:"works"`
-	ExpectedFingerprint string            `json:"expected_fingerprint"`
+	Works []ownership.Query `json:"works"`
 }
 
 func libraryLookupWorks(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
@@ -558,10 +558,7 @@ func libraryLookupWorks(ctx context.Context, raw json.RawMessage, system *bootst
 	if err := ipc.DecodeParams(raw, &request); err != nil {
 		return badParams(err)
 	}
-	if request.ExpectedFingerprint == "" || request.ExpectedFingerprint != system.Config.LibraryFingerprint() {
-		return nil, &ipc.RPCError{Code: "precondition_failed", Message: "library configuration does not match caller"}
-	}
-	if system.Holdings == nil || !system.Holdings.Enabled() {
+	if system == nil || system.Holdings == nil || !system.Holdings.Enabled() {
 		return nil, &ipc.RPCError{Code: "precondition_failed", Message: "generic library authority is not active"}
 	}
 	if len(request.Works) == 0 || len(request.Works) > 50 {
@@ -774,7 +771,7 @@ func repairAwaitingHuman(ctx context.Context, raw json.RawMessage, system *boots
 	if len(open) != 0 {
 		return marshal(RepairResult{JobID: params.JobID, Outcome: "has_open_actions", State: row.State})
 	}
-	err = system.Jobs.RepairAwaitingHuman(ctx, params.JobID, nil, map[string]any{"reason": "consumer_repair"})
+	err = system.Jobs.RepairAwaitingHuman(ctx, params.JobID, nil, map[string]any{"reason": "orphan_repair"})
 	switch {
 	case errors.Is(err, job.ErrConflict):
 		// The job was leased or left awaiting_human between the read above and

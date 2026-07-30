@@ -313,6 +313,19 @@ Show complete triage inbox counts
 papio inbox counts
 ```
 
+### `papio inbox decide`
+
+Acquire or dismiss one triage inbox item
+
+```
+papio inbox decide <item-id> [flags]
+```
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--op` | `string` |  | acquire or dismiss |
+| `--watch-scope` | `string` | `all` | for dismiss: all, or a comma-separated list of watch IDs |
+
 ## `papio init`
 
 Set up papio for a first run
@@ -343,6 +356,18 @@ Inspect and control acquisition jobs
 ```
 papio jobs
 ```
+
+### `papio jobs add-component`
+
+Add a supplement or appendix to a job
+
+```
+papio jobs add-component <job-id> <path> [flags]
+```
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--role` | `string` |  | component role: supplement or appendix |
 
 ### `papio jobs cancel`
 
@@ -389,6 +414,22 @@ papio jobs list [flags]
 | --- | --- | --- | --- |
 | `--limit` | `int` | `100` | maximum rows (1-500) |
 | `--state` | `string` |  | filter by exact job state |
+
+### `papio jobs receipt`
+
+Show the outcome and component index for one job
+
+```
+papio jobs receipt <job-id>
+```
+
+### `papio jobs repair-awaiting-human`
+
+Return an orphaned awaiting-human job with no open actions to resolving
+
+```
+papio jobs repair-awaiting-human <job-id>
+```
 
 ### `papio jobs retry`
 

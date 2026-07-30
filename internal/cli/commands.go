@@ -84,8 +84,112 @@ func isUnknownMethod(err error) bool {
 	return errors.As(err, &remote) && remote.Code == "unknown_method"
 }
 
+func daemonUpgradeRequired(method string) error {
+	return fmt.Errorf("%s is unavailable because the running daemon predates it; upgrade or restart the daemon from the same installation as this CLI", method)
+}
+
 func newJobsCommand(opt *options) *cobra.Command {
 	command := &cobra.Command{Use: "jobs", Short: "Inspect and control acquisition jobs"}
+	receiptCommand := &cobra.Command{
+		Use:         "receipt <job-id>",
+		Short:       "Show the outcome and component index for one job",
+		Annotations: map[string]string{"mcp:read-only": "true"},
+		Args:        cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			var receipt api.Receipt
+			if err := opt.call(cmd.Context(), "jobs.receipt", map[string]string{"job_id": args[0]}, &receipt); err != nil {
+				if isUnknownMethod(err) {
+					return daemonUpgradeRequired("jobs.receipt")
+				}
+				return err
+			}
+			if opt.jsonOutput {
+				return opt.printJSON(receipt)
+			}
+			if _, err := fmt.Fprintf(opt.out, "%s\t%s", receipt.JobID, receipt.State); err != nil {
+				return err
+			}
+			if receipt.TerminalReason != "" {
+				if _, err := fmt.Fprintf(opt.out, "\t%s", receipt.TerminalReason); err != nil {
+					return err
+				}
+			}
+			if _, err := fmt.Fprintln(opt.out); err != nil {
+				return err
+			}
+			if _, err := fmt.Fprintf(opt.out, "principal\t%s\n", receipt.Principal); err != nil {
+				return err
+			}
+			if _, err := fmt.Fprintf(opt.out, "attempted tiers\t%s\n", strings.Join(receipt.AttemptedTiers, ",")); err != nil {
+				return err
+			}
+			for _, component := range receipt.Components {
+				if _, err := fmt.Fprintf(opt.out, "%s\t%s\n", component.Role, component.SHA256); err != nil {
+					return err
+				}
+			}
+			if receipt.BundleAvailable {
+				_, err := fmt.Fprintf(opt.out, "main-artifact provenance bundle: papio bundle export %s --output <dir>\n", receipt.JobID)
+				return err
+			}
+			return nil
+		},
+	}
+
+	repairAwaitingHuman := &cobra.Command{
+		Use:   "repair-awaiting-human <job-id>",
+		Short: "Return an orphaned awaiting-human job with no open actions to resolving",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			var result api.RepairResult
+			if err := opt.call(cmd.Context(), "jobs.repair_awaiting_human", map[string]string{"job_id": args[0]}, &result); err != nil {
+				if isUnknownMethod(err) {
+					return daemonUpgradeRequired("jobs.repair_awaiting_human")
+				}
+				return err
+			}
+			if opt.jsonOutput {
+				return opt.printJSON(result)
+			}
+			if result.State == "" {
+				_, err := fmt.Fprintf(opt.out, "%s\t%s\n", result.JobID, result.Outcome)
+				return err
+			}
+			_, err := fmt.Fprintf(opt.out, "%s\t%s\t%s\n", result.JobID, result.Outcome, result.State)
+			return err
+		},
+	}
+
+	var componentRole string
+	addComponent := &cobra.Command{
+		Use:   "add-component <job-id> <path>",
+		Short: "Add a supplement or appendix to a job",
+		Args:  cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			var result struct {
+				Components []job.Component `json:"components"`
+				Truncated  bool            `json:"truncated"`
+			}
+			if err := opt.call(cmd.Context(), "jobs.add_component", map[string]string{"job_id": args[0], "path": args[1], "role": componentRole}, &result); err != nil {
+				if isUnknownMethod(err) {
+					return daemonUpgradeRequired("jobs.add_component")
+				}
+				return err
+			}
+			if opt.jsonOutput {
+				return printPage(opt, "components", result.Components, result.Truncated)
+			}
+			for _, component := range result.Components {
+				if _, err := fmt.Fprintf(opt.out, "%s\t%s\n", component.Role, component.SHA256); err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+	}
+	addComponent.Flags().StringVar(&componentRole, "role", "", "component role: supplement or appendix")
+	_ = addComponent.MarkFlagRequired("role")
+
 	var state string
 	var limit int
 	list := &cobra.Command{
@@ -202,7 +306,7 @@ func newJobsCommand(opt *options) *cobra.Command {
 	failures.Flags().StringVar(&failuresSince, "since", "", "include jobs updated since a duration or RFC3339 timestamp")
 	failures.Flags().IntVar(&failuresLimit, "limit", 50, "maximum groups (1-200)")
 
-	command.AddCommand(list, get, cancel, retry, failures)
+	command.AddCommand(list, get, cancel, retry, failures, receiptCommand, repairAwaitingHuman, addComponent)
 	return command
 }
 

@@ -253,15 +253,26 @@ func (js *Store) Principal(ctx context.Context, jobID string) (Principal, error)
 	return Principal(principal.String), nil
 }
 
-// AttemptedTiers reports which access bases this job actually reached, in rank
-// order and deduplicated — the honest answer to "did we get as far as the
-// institutional route?" for a failed acquisition. Candidates that were only ever
-// ranked, never tried, are excluded: listing them would overstate what happened.
+// AttemptedTiers reports which access bases this job actually reached, in
+// candidate-rank order and deduplicated. It reads append-only attempt evidence,
+// rather than mutable candidate status, because ResetCandidates changes fetching
+// and retryable candidates back to pending and would otherwise erase a tier from
+// the lifetime record. Accepted candidates are also included: acceptance proves
+// their tier was reached even if an older path recorded no candidate attempt.
 func (js *Store) AttemptedTiers(ctx context.Context, jobID string) ([]string, error) {
 	rows, err := js.S.DB().QueryContext(ctx, `
-		SELECT access_basis FROM candidates
-		 WHERE job_id = ? AND status IN ('fetching','invalid','retryable','skipped','accepted')
-		 ORDER BY rank`, jobID)
+		SELECT c.access_basis
+		FROM candidates c
+		WHERE c.job_id = ?
+		  AND (
+			c.status = 'accepted'
+			OR EXISTS (
+				SELECT 1
+				FROM attempts a
+				WHERE a.job_id = c.job_id AND a.candidate_id = c.id
+			)
+		  )
+		ORDER BY c.rank ASC, c.id ASC`, jobID)
 	if err != nil {
 		return nil, err
 	}

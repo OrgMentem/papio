@@ -33,6 +33,13 @@ The default command surface contains these two tools:
 | `papio_command_search` | `query` (optional case-insensitive substring match over command names and summaries); `name` (optional exact, space-separated command path, such as `"zotio apply"`) | Returns JSON. Omit both parameters to list every runnable command. Supplying `name` returns that command's summary, `read_only`, `takes_args`, and command-local `flags` (each flag's name, type, default, and description). |
 | `papio_command_run` | `name` (required exact, space-separated command path, such as `"status"` or `"zotio apply"`); `flags` (optional object of command-local flags by name); `args` (optional string of positional arguments only) | Executes the command in-process against the same daemon, jobs, and zotio boundary as the CLI, and returns JSON. The server injects `--json`. Raw flag tokens in `args` are rejected. Inherited global `--config` and `--json` flags are never exposed and are rejected. |
 
+The facade therefore reaches `papio jobs receipt`, `papio jobs
+repair-awaiting-human`, `papio jobs add-component`, and `papio inbox decide` for
+MCP consumers through `papio_command_search` and `papio_command_run`; no
+per-method MCP tools exist.
+For an accepted main component, the bundle is the canonical provenance document;
+the receipt is the canonical job outcome and component inventory for every state.
+
 For example, applying a zotio plan uses the command facade rather than a
 standalone zotio tool:
 

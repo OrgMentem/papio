@@ -1138,6 +1138,23 @@ func TestRepairAwaitingHumanIsOrphanOnly(t *testing.T) {
 	if err != nil || row.State != job.StateResolving {
 		t.Fatalf("orphan job = %+v, %v; want resolving", row, err)
 	}
+	events, err := system.Jobs.Events(ctx, orphan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var repairEvent map[string]any
+	for _, event := range events {
+		if event["kind"] == "job.transition" {
+			detail, _ := event["detail"].(map[string]any)
+			if detail["reason"] == "orphan_repair" {
+				repairEvent = detail
+				break
+			}
+		}
+	}
+	if repairEvent == nil {
+		t.Fatalf("repair transition reason = orphan_repair, events = %#v", events)
+	}
 
 	withAction := park(t, "repair_with_action")
 	if _, err := system.Jobs.OpenHumanAction(ctx, withAction, "openurl_handoff", "institutional handoff"); err != nil {
@@ -1235,8 +1252,14 @@ func TestReceiptDescribesAFailedAcquisition(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Only the open-access candidate was actually tried; the institutional one was
-	// ranked and never reached, so the receipt must not claim that tier.
+	// ranked and never reached, so the receipt must not claim that tier. The
+	// attempt row is what makes it "tried": AttemptedTiers reads append-only
+	// attempt evidence rather than candidate status, because an explicit retry
+	// resets status and would otherwise erase the history.
 	tried, _ := system.Jobs.NextPendingCandidate(ctx, id)
+	if _, err := system.Jobs.StartAttempt(ctx, id, tried.ID, "fetch", "unpaywall"); err != nil {
+		t.Fatal(err)
+	}
 	if err := system.Jobs.MarkCandidate(ctx, tried.ID, job.CandidateInvalid); err != nil {
 		t.Fatal(err)
 	}
@@ -1307,16 +1330,13 @@ func TestLibraryLookupWorksRequiresActiveGenericAuthority(t *testing.T) {
 		Name: "test-library", Kind: config.LibraryKindFile, Path: "/tmp/test-library.bib",
 		Format: "bibtex", Claim: config.LibraryClaimPDFPresent,
 	}}
-	request := LibraryLookupWorksRequest{
-		Works:               []ownership.Query{{}},
-		ExpectedFingerprint: system.Config.LibraryFingerprint(),
-	}
+	request := LibraryLookupWorksRequest{Works: []ownership.Query{{}}}
 	raw, err := json.Marshal(request)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	t.Run("matching fingerprint with enabled registry succeeds", func(t *testing.T) {
+	t.Run("enabled registry succeeds", func(t *testing.T) {
 		provider := &libraryLookupProvider{}
 		system.Holdings = ownership.NewRegistry(provider)
 
@@ -1343,7 +1363,7 @@ func TestLibraryLookupWorksRequiresActiveGenericAuthority(t *testing.T) {
 		{name: "empty registry", holdings: ownership.NewRegistry()},
 		{name: "nil registry"},
 	} {
-		t.Run("matching fingerprint with "+tc.name+" fails", func(t *testing.T) {
+		t.Run(tc.name+" fails", func(t *testing.T) {
 			system.Holdings = tc.holdings
 
 			data, rpcErr := libraryLookupWorks(context.Background(), raw, system)
@@ -1356,25 +1376,18 @@ func TestLibraryLookupWorksRequiresActiveGenericAuthority(t *testing.T) {
 		})
 	}
 
-	t.Run("mismatched fingerprint fails", func(t *testing.T) {
-		provider := &libraryLookupProvider{}
-		system.Holdings = ownership.NewRegistry(provider)
-		mismatched := request
-		mismatched.ExpectedFingerprint = "mismatched"
-		mismatchedRaw, err := json.Marshal(mismatched)
+}
+
+func TestLibraryLookupWorksBounds(t *testing.T) {
+	system := testSystem(t)
+	system.Holdings = ownership.NewRegistry(&libraryLookupProvider{})
+	for _, count := range []int{0, 51} {
+		raw, err := json.Marshal(LibraryLookupWorksRequest{Works: make([]ownership.Query, count)})
 		if err != nil {
 			t.Fatal(err)
 		}
-
-		data, rpcErr := libraryLookupWorks(context.Background(), mismatchedRaw, system)
-		if rpcErr == nil || rpcErr.Code != "precondition_failed" {
-			t.Fatalf("library lookup RPC error = %+v, want precondition_failed", rpcErr)
+		if _, rpcErr := libraryLookupWorks(context.Background(), raw, system); rpcErr == nil || rpcErr.Code != "invalid_params" {
+			t.Fatalf("count %d: RPC error = %+v, want invalid_params", count, rpcErr)
 		}
-		if data != nil {
-			t.Fatalf("library lookup returned data on fingerprint mismatch: %s", data)
-		}
-		if provider.calls.Load() != 0 {
-			t.Fatalf("provider lookup calls = %d, want 0", provider.calls.Load())
-		}
-	})
+	}
 }

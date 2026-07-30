@@ -8,6 +8,39 @@ so older sections below include extension entries. The initial release entry
 is synthesized from the complete `papio` and `zotio` Git histories and the
 execution records in `notes/acquisition-stack-plan.md`.
 
+
+## [Unreleased]
+
+### Added
+
+- **`papio jobs receipt`, `papio jobs repair-awaiting-human`, and `papio jobs
+  add-component` are now available to operators and MCP agents.** The daemon
+  could already perform all three, but only a program dialling the socket could
+  ask: neither the CLI nor MCP agents could. The bundle remains the canonical
+  provenance document for an accepted main component; the receipt is the
+  canonical job outcome and component inventory for every state.
+- **`papio inbox decide` acts on a triage inbox item from the terminal.**
+  `papio inbox` and `papio inbox counts` could show the inbox, but only the
+  browser extension could answer an item — so acquiring or dismissing a watch
+  hit, or acknowledging a retraction notice, required the browser even for
+  someone working entirely in a terminal. `--op acquire|dismiss` with
+  `--watch-scope all` or an explicit watch-id list now does it, reporting the
+  daemon's own outcome (including `conflict` and `already_applied`) rather than
+  assuming the decision applied.
+
+### Changed
+
+- **Repair audit reasons and request origin no longer overstate who acted.**
+  Orphan repair now records `orphan_repair`, rather than naming a caller it cannot
+  identify. `principal` is documented as request-origin classification, not proof
+  of whose entitlement obtained the bytes; do not use it as a rights input.
+
+### Fixed
+
+- **`attempted_tiers` retains every tier a job genuinely attempted after an
+  explicit retry.** It now reads append-only attempt records instead of current
+  candidate status, which retry resets can erase.
+
 ## [0.14.0] - 2026-07-30
 
 ### Added
