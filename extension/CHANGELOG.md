@@ -16,6 +16,16 @@ for the full pre-split extension history.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A development daemon is no longer told to `brew upgrade`.** The popup's
+  version notice assumed every out-of-date daemon came from the cask, so a
+  source checkout — whose version carries a `dev` marker — was handed the one
+  remediation that cannot work on it, and following it would install a release
+  binary over the build under development. A `dev` daemon is now named as a
+  development build and pointed at `make dev-deploy`, which is what actually
+  rebuilds it, repoints the native-messaging host, and restarts both.
+
 ## [0.8.0] - 2026-07-27
 
 ### Added

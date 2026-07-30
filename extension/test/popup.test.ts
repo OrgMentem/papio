@@ -132,6 +132,18 @@ test("renders actionable daemon problems without routine version diagnostics", (
   expect(doc.getElementById("daemon-status-message")?.textContent).toBe(
     "papio 0.2.0 is available — daemon is v0.1.0",
   );
+
+  renderDaemonStatus(doc, {
+    connectionStatus: "connected",
+    daemonVersion: "0.1.0-dev.abc123",
+    daemonUpdateHint: true,
+  });
+  expect(doc.getElementById("daemon-status-message")?.textContent).toBe(
+    "papio 0.2.0 is available — your daemon is a development build (v0.1.0-dev.abc123)",
+  );
+  expect(doc.getElementById("daemon-status-hint")?.textContent).toBe(
+    "Update the source checkout, then run: make dev-deploy",
+  );
   delete (globalThis as Record<string, unknown>).__PAPIO_DAEMON_VERSION__;
 
   renderDaemonStatus(doc, { connectionStatus: "disconnected" });

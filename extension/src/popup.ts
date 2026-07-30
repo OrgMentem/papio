@@ -53,8 +53,15 @@ export function renderDaemonStatus(
         typeof status.daemonVersion === "string" &&
         status.daemonVersion.length > 0
       ) {
-        line = `papio ${stampedVersion} is available — daemon is v${status.daemonVersion}`;
-        action = "brew upgrade papio, then: papio daemon stop";
+        const developmentDaemon = /(?:^|[-.])dev(?:[.-]|$)/i.test(status.daemonVersion);
+        line = `papio ${stampedVersion} is available — ${
+          developmentDaemon
+            ? `your daemon is a development build (v${status.daemonVersion})`
+            : `daemon is v${status.daemonVersion}`
+        }`;
+        action = developmentDaemon
+          ? "Update the source checkout, then run: make dev-deploy"
+          : "brew upgrade papio, then: papio daemon stop";
       }
       break;
     }
