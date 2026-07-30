@@ -40,6 +40,10 @@ const (
 	KindWatchHit    = "watch_hit"
 	KindHumanAction = "human_action"
 	KindRetraction  = "retraction"
+
+	// RetractionIDPrefix opens the item ID of every retraction notice; the rest
+	// of the ID is the normalized DOI of the work the notice concerns.
+	RetractionIDPrefix = KindRetraction + ":"
 )
 
 // Fact is bounded display-only metadata for an inbox item.
@@ -247,6 +251,14 @@ type ItemSource interface {
 	SnapshotItems(context.Context, *sql.Tx) ([]Item, error)
 }
 
+// RetractionAcknowledger is an ItemSource that can clear one of the retraction
+// notices it contributes. Retraction notices are recomputed from an external
+// metadata source, so unlike a watch hit or a human action they never resolve
+// themselves; acknowledging one is the only way the inbox empties.
+type RetractionAcknowledger interface {
+	AcknowledgeRetraction(ctx context.Context, itemID string) (bool, error)
+}
+
 // Service composes the transactionally consistent inbox read model.
 type Service struct {
 	Store   *store.Store
@@ -272,6 +284,31 @@ func (s *Service) RegisterSource(source ItemSource) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.sources = append(s.sources, source)
+}
+
+// AcknowledgeRetraction clears the retraction notice named by itemID from the
+// inbox, reporting whether this call recorded the acknowledgement. No
+// registered source owning the item yields sql.ErrNoRows, which callers render
+// as the same conflict a vanished watch hit produces.
+func (s *Service) AcknowledgeRetraction(ctx context.Context, itemID string) (bool, error) {
+	if s == nil {
+		return false, errors.New("triage service is not configured")
+	}
+	s.mu.RLock()
+	sources := append([]ItemSource(nil), s.sources...)
+	s.mu.RUnlock()
+	for _, source := range sources {
+		acknowledger, ok := source.(RetractionAcknowledger)
+		if !ok {
+			continue
+		}
+		applied, err := acknowledger.AcknowledgeRetraction(ctx, itemID)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
+		return applied, err
+	}
+	return false, sql.ErrNoRows
 }
 
 // Snapshot returns one bounded page of a transactionally consistent inbox.
@@ -913,9 +950,9 @@ func normalizeRetractionItem(item *Item) error {
 		return fmt.Errorf("invalid retraction DOI: %w", err)
 	}
 	if item.ID == "" {
-		item.ID = "retraction:" + doi
+		item.ID = RetractionIDPrefix + doi
 	}
-	if item.ID != "retraction:"+doi {
+	if item.ID != RetractionIDPrefix+doi {
 		return errors.New("invalid retraction item ID")
 	}
 	if item.Retraction.Nature != "retraction" && item.Retraction.Nature != "correction" && item.Retraction.Nature != "concern" {

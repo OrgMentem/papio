@@ -27,6 +27,7 @@ import (
 	"papio/internal/preview"
 	"papio/internal/protocol"
 	"papio/internal/resolver"
+	"papio/internal/retraction"
 	"papio/internal/store"
 	"papio/internal/triage"
 	"papio/internal/watch"
@@ -748,6 +749,71 @@ func TestTriageDismissConsumesSelectedWatchHit(t *testing.T) {
 		t.Fatalf("dismissed snapshot = %+v, %v", after, err)
 	}
 }
+
+// The shipping path for a retraction dismissal: a real Crossref sweep fills the
+// sentinel, the inbox frame carries the notice, and the extension's existing
+// dismiss frame - watch_scope and all - clears it for good.
+func TestTriageDismissAcknowledgesRetractionNotice(t *testing.T) {
+	b, jobs, cfg, _ := newBridge(t)
+	ctx := context.Background()
+	id, err := jobs.CreateRequest(ctx, "wr_browser_retraction", work.Work{DOI: "10.1000/retracted", Title: "Retracted work"}, "", "",
+		job.Policy{AccessMode: config.ModeConservative, DesiredVersion: "any", FetchMaxBytes: 1 << 20}, nil, job.PrincipalUnknown)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	if err := jobs.UpsertArtifact(ctx, job.Artifact{SHA256: sha, SizeBytes: 1, MIME: "application/pdf", Path: filepath.Join(cfg.DataDir, "retracted.pdf"), IdentityResult: "pass"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, step := range [][2]string{{job.StateQueued, job.StateResolving}, {job.StateResolving, job.StateFetching}, {job.StateFetching, job.StateValidating}} {
+		if err := jobs.Transition(ctx, id, step[0], step[1], nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := jobs.Transition(ctx, id, job.StateValidating, job.StateReady, nil, job.WithArtifact(sha)); err != nil {
+		t.Fatal(err)
+	}
+	crossref := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"message":{"update-to":[{"DOI":"10.2000/notice","updated":"retraction"}]}}`))
+	}))
+	defer crossref.Close()
+	sentinel := retraction.New(retraction.Options{
+		Store: jobs.S, Budgets: unlimitedBudget{}, Policy: config.Source{Enabled: true},
+		Client: crossref.Client(), BaseURL: crossref.URL, DataDir: cfg.DataDir,
+	})
+	if err := sentinel.RunDue(ctx); err != nil {
+		t.Fatal(err)
+	}
+	b.triage.RegisterSource(sentinel)
+
+	snapshot, err := b.triage.Snapshot(ctx, triage.SnapshotRequest{Limit: 10})
+	if err != nil || len(snapshot.Items) != 1 || snapshot.Items[0].Kind != triage.KindRetraction {
+		t.Fatalf("initial snapshot = %+v, %v", snapshot, err)
+	}
+	if !slices.Contains(snapshot.Items[0].Ops, "dismiss") {
+		t.Fatalf("retraction ops = %v, want a dismiss operation", snapshot.Items[0].Ops)
+	}
+	msgs, _ := runSync(t, b, hello(), inFrame(t, protocol.MsgTriageDecide, "",
+		protocol.TriageDecidePayload{
+			RequestID: "request-retraction-001", ItemID: snapshot.Items[0].ID, Op: "dismiss",
+			WatchScope: json.RawMessage(`"all"`),
+		}))
+	result := firstOfType(msgs, protocol.MsgTriageDecideResult)
+	if result == nil {
+		t.Fatalf("triage decision response missing: %v", msgs)
+	}
+	if payload := result.Payload.(*protocol.TriageDecideResultPayload); payload.Outcome != "applied" {
+		t.Fatalf("retraction dismissal payload = %+v", payload)
+	}
+	after, err := b.triage.Snapshot(ctx, triage.SnapshotRequest{Limit: 10})
+	if err != nil || len(after.Items) != 0 || after.Counts.Retractions != 0 {
+		t.Fatalf("snapshot after acknowledgement = %+v, %v", after, err)
+	}
+}
+
+type unlimitedBudget struct{}
+
+func (unlimitedBudget) Acquire(context.Context, string, config.Source, float64) error { return nil }
 
 func TestReviewPreviewAndResolveNeverLeakQuarantinePath(t *testing.T) {
 	b, jobs, _, data := newBridge(t)

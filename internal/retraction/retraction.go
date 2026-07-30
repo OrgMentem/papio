@@ -211,6 +211,10 @@ func (s *Sentinel) RunDue(ctx context.Context) error {
 		s.mu.Unlock()
 		return fmt.Errorf("retraction: write cache: %w", err)
 	}
+	if err := s.pruneAcks(ctx, notices); err != nil {
+		s.mu.Unlock()
+		return err
+	}
 	seenNotices := make(map[string]bool, len(previous))
 	for _, finding := range previous {
 		seenNotices[noticeKey(finding)] = true
@@ -232,21 +236,29 @@ func (s *Sentinel) RunDue(ctx context.Context) error {
 }
 
 // SnapshotItems supplies the current retraction notices for one consistent
-// triage snapshot. The transaction is intentionally unused: this cache is an
-// external metadata snapshot, not SQLite state, and it is validated before
-// conversion to the triage model.
-func (s *Sentinel) SnapshotItems(_ context.Context, _ *sql.Tx) ([]triage.Item, error) {
+// triage snapshot, minus the ones the user has already acknowledged. The
+// notices themselves are an external metadata snapshot rather than SQLite
+// state, but the acknowledgements are daemon state, so they are read inside
+// the caller's snapshot transaction when one is supplied.
+func (s *Sentinel) SnapshotItems(ctx context.Context, tx *sql.Tx) ([]triage.Item, error) {
 	if s == nil {
 		return nil, nil
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	cached, ok := s.readCache()
+	s.mu.Unlock()
 	if !ok {
 		return nil, nil
 	}
+	acked, err := s.acknowledged(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
 	findings := make([]Finding, 0, len(cached.Notices))
 	for _, finding := range cached.Notices {
+		if acked[findingKey(finding)] {
+			continue
+		}
 		findings = append(findings, finding)
 	}
 	sort.Slice(findings, func(i, j int) bool { return findings[i].DOI < findings[j].DOI })
@@ -259,10 +271,11 @@ func (s *Sentinel) SnapshotItems(_ context.Context, _ *sql.Tx) ([]triage.Item, e
 		seenNotices[noticeKey(finding)] = true
 		items = append(items, triage.Item{
 			Kind:  triage.KindRetraction,
-			ID:    "retraction:" + finding.DOI,
+			ID:    triage.RetractionIDPrefix + finding.DOI,
 			Title: "Library update notice",
 			Facts: []triage.Fact{{Label: "Nature", Text: string(finding.Nature)}},
 			Links: []triage.Link{{Rel: "doi", URL: "https://doi.org/" + finding.DOI}},
+			Ops:   []string{"dismiss", "open"},
 			Retraction: &triage.Retraction{
 				DOI: finding.DOI, Nature: string(finding.Nature), NoticedAt: finding.NoticedAt,
 				NoticeDOI: finding.NoticeDOI,
@@ -270,6 +283,111 @@ func (s *Sentinel) SnapshotItems(_ context.Context, _ *sql.Tx) ([]triage.Item, e
 		})
 	}
 	return items, nil
+}
+
+// AcknowledgeRetraction clears one current notice from the inbox. It reports
+// whether this call was the one that recorded the acknowledgement; a repeat is
+// not an error. An unknown item, or a work with no current notice, reports
+// sql.ErrNoRows so callers can render the same conflict they render for a
+// vanished watch hit.
+func (s *Sentinel) AcknowledgeRetraction(ctx context.Context, itemID string) (bool, error) {
+	if s == nil || s.store == nil {
+		return false, sql.ErrNoRows
+	}
+	doi, ok := strings.CutPrefix(itemID, triage.RetractionIDPrefix)
+	if !ok || doi == "" {
+		return false, sql.ErrNoRows
+	}
+	s.mu.Lock()
+	cached, cacheOK := s.readCache()
+	s.mu.Unlock()
+	if !cacheOK {
+		return false, sql.ErrNoRows
+	}
+	var target Finding
+	found := false
+	for _, finding := range cached.Notices {
+		if finding.DOI != doi {
+			continue
+		}
+		if !found || prefer(finding, target) {
+			target, found = finding, true
+		}
+	}
+	if !found {
+		return false, sql.ErrNoRows
+	}
+	result, err := s.store.DB().ExecContext(ctx, `
+		INSERT OR IGNORE INTO retraction_acks (doi, nature, notice_doi, acked_at)
+		VALUES (?, ?, ?, ?)`,
+		target.DOI, string(target.Nature), target.NoticeDOI, s.now().UTC().Format(time.RFC3339Nano))
+	if err != nil {
+		return false, fmt.Errorf("retraction: acknowledge notice: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("retraction: acknowledge notice: %w", err)
+	}
+	return affected > 0, nil
+}
+
+// acknowledged reads the acknowledged notice keys. The snapshot transaction is
+// preferred so one inbox page cannot mix pre- and post-acknowledgement state;
+// callers outside a snapshot pass nil and read the writer connection.
+func (s *Sentinel) acknowledged(ctx context.Context, tx *sql.Tx) (map[string]bool, error) {
+	var query func(context.Context, string, ...any) (*sql.Rows, error)
+	switch {
+	case tx != nil:
+		query = tx.QueryContext
+	case s.store != nil:
+		query = s.store.DB().QueryContext
+	default:
+		return nil, nil
+	}
+	rows, err := query(ctx, `SELECT doi, nature, notice_doi FROM retraction_acks`)
+	if err != nil {
+		return nil, fmt.Errorf("retraction: read acknowledged notices: %w", err)
+	}
+	defer rows.Close()
+	acked := make(map[string]bool)
+	for rows.Next() {
+		var finding Finding
+		var nature string
+		if err := rows.Scan(&finding.DOI, &nature, &finding.NoticeDOI); err != nil {
+			return nil, err
+		}
+		finding.Nature = Nature(nature)
+		acked[findingKey(finding)] = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return acked, nil
+}
+
+// pruneAcks drops acknowledgements whose notice is no longer current, so the
+// table stays bounded by the live notice set and a reissued notice is shown
+// again rather than staying silently acknowledged forever.
+func (s *Sentinel) pruneAcks(ctx context.Context, current map[string]Finding) error {
+	acked, err := s.acknowledged(ctx, nil)
+	if err != nil {
+		return err
+	}
+	for key := range acked {
+		if _, live := current[key]; live {
+			continue
+		}
+		parts := strings.SplitN(key, "\x00", 3)
+		if len(parts) != 3 {
+			continue
+		}
+		if _, err := s.store.DB().ExecContext(ctx, `
+			DELETE FROM retraction_acks WHERE doi = ? AND nature = ? AND notice_doi = ?`,
+			parts[0], parts[1], parts[2]); err != nil {
+			return fmt.Errorf("retraction: prune acknowledged notices: %w", err)
+		}
+	}
+	return nil
 }
 
 func (s *Sentinel) readyDOIs(ctx context.Context) ([]string, error) {

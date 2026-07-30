@@ -948,6 +948,9 @@ func (b *Bridge) triageDecide(ctx context.Context, request *protocol.TriageDecid
 	if b.triage == nil || b.watchRunner == nil {
 		return b.triageDecisionResult(request.RequestID, "error", "triage mutations are not configured")
 	}
+	if strings.HasPrefix(request.ItemID, triage.RetractionIDPrefix) {
+		return b.acknowledgeRetraction(ctx, request)
+	}
 	hit, err := b.triage.FindWatchHit(ctx, request.ItemID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return b.triageDecisionResult(request.RequestID, "conflict", "")
@@ -982,6 +985,26 @@ func (b *Bridge) triageDecide(ctx context.Context, request *protocol.TriageDecid
 		}
 	}
 	return b.triageDecisionResult(request.RequestID, "applied", "")
+}
+
+// acknowledgeRetraction clears one Crossref update notice. A retraction notice
+// carries no watch digest to consume, so watch_scope is not consulted: the
+// notice itself is the unit of dismissal.
+func (b *Bridge) acknowledgeRetraction(ctx context.Context, request *protocol.TriageDecidePayload) ([]json.RawMessage, error) {
+	if request.Op != "dismiss" {
+		return b.triageDecisionResult(request.RequestID, "error", "retraction notices support only the dismiss operation")
+	}
+	applied, err := b.triage.AcknowledgeRetraction(ctx, request.ItemID)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return b.triageDecisionResult(request.RequestID, "conflict", "")
+	case err != nil:
+		return b.triageDecisionResult(request.RequestID, "error", err.Error())
+	case applied:
+		return b.triageDecisionResult(request.RequestID, "applied", "")
+	default:
+		return b.triageDecisionResult(request.RequestID, "already_applied", "")
+	}
 }
 
 func triageDismissScope(raw json.RawMessage, watches []triage.Watch) (map[int64]bool, error) {

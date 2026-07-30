@@ -4,6 +4,7 @@ package retraction
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -157,6 +159,78 @@ func TestSweepDeduplicatesReadyDOIAndPersistsNotice(t *testing.T) {
 	data, err := os.ReadFile(filepath.Join(dataDir, cacheFileName))
 	if err != nil || json.Unmarshal(data, &persisted) != nil || persisted.Version != cacheVersion || len(persisted.Notices) != 1 {
 		t.Fatalf("cache = %#v, read err = %v", persisted, err)
+	}
+}
+
+// A notice is recomputed from Crossref for as long as the work stays in the
+// library, so acknowledging one has to survive the next sweep — but only for
+// the notice that was acknowledged.
+func TestAcknowledgeHidesNoticeUntilTheNoticeChanges(t *testing.T) {
+	ctx := context.Background()
+	jobs := testStore(t)
+	addReadyDOI(t, jobs, "10.1234/original", 1)
+	now := time.Date(2026, 7, 21, 12, 0, 0, 0, time.UTC)
+	nature := "expression-of-concern"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"message":{"update-to":[{"DOI":"10.2000/notice","updated":"` + nature + `"}]}}`))
+	}))
+	defer server.Close()
+	sentinel := New(Options{
+		Store: jobs, Budgets: &recordingBudget{}, Policy: config.Source{Enabled: true},
+		Client: server.Client(), BaseURL: server.URL, DataDir: t.TempDir(),
+		Notifier: &recordingNotifier{}, Now: func() time.Time { return now },
+	})
+	if err := sentinel.RunDue(ctx); err != nil {
+		t.Fatal(err)
+	}
+	items, err := sentinel.SnapshotItems(ctx, nil)
+	if err != nil || len(items) != 1 {
+		t.Fatalf("initial items = %#v, %v", items, err)
+	}
+	if got := items[0].Ops; !slices.Contains(got, "dismiss") {
+		t.Fatalf("retraction ops = %v, want a dismiss operation", got)
+	}
+
+	applied, err := sentinel.AcknowledgeRetraction(ctx, items[0].ID)
+	if err != nil || !applied {
+		t.Fatalf("acknowledge = %v, %v; want true", applied, err)
+	}
+	if items, err := sentinel.SnapshotItems(ctx, nil); err != nil || len(items) != 0 {
+		t.Fatalf("items after acknowledge = %#v, %v; want none", items, err)
+	}
+	if applied, err := sentinel.AcknowledgeRetraction(ctx, items[0].ID); err != nil || applied {
+		t.Fatalf("repeat acknowledge = %v, %v; want false without an error", applied, err)
+	}
+	if _, err := sentinel.AcknowledgeRetraction(ctx, "retraction:10.1234/unknown"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("acknowledge of an unknown notice = %v, want sql.ErrNoRows", err)
+	}
+
+	// The same notice survives a re-sweep acknowledged.
+	now = now.Add(25 * time.Hour)
+	if err := sentinel.RunDue(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if items, err := sentinel.SnapshotItems(ctx, nil); err != nil || len(items) != 0 {
+		t.Fatalf("items after re-sweep = %#v, %v; want none", items, err)
+	}
+
+	// An escalated nature is a different notice and must surface again, and the
+	// superseded acknowledgement must not linger in the database.
+	nature = "retraction"
+	now = now.Add(25 * time.Hour)
+	if err := sentinel.RunDue(ctx); err != nil {
+		t.Fatal(err)
+	}
+	escalated, err := sentinel.SnapshotItems(ctx, nil)
+	if err != nil || len(escalated) != 1 || escalated[0].Retraction.Nature != "retraction" {
+		t.Fatalf("items after escalation = %#v, %v; want the retraction notice", escalated, err)
+	}
+	var acks int
+	if err := jobs.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM retraction_acks`).Scan(&acks); err != nil {
+		t.Fatal(err)
+	}
+	if acks != 0 {
+		t.Fatalf("acknowledgement rows = %d, want the superseded row pruned", acks)
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"strings"
 
 	"papio/internal/bootstrap"
 	"papio/internal/ipc"
@@ -67,6 +68,9 @@ func triageDecide(ctx context.Context, raw json.RawMessage, system *bootstrap.Sy
 	if system == nil || system.Triage == nil || system.WatchRunner == nil {
 		return nil, &ipc.RPCError{Code: "precondition_failed", Message: "triage inbox is not configured"}
 	}
+	if strings.HasPrefix(params.ItemID, triage.RetractionIDPrefix) {
+		return acknowledgeRetraction(ctx, params.ItemID, params.Op, system)
+	}
 	hit, err := system.Triage.FindWatchHit(ctx, params.ItemID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return marshal(triageDecideResult{Outcome: "conflict"})
@@ -102,6 +106,26 @@ func triageDecide(ctx context.Context, raw json.RawMessage, system *bootstrap.Sy
 		}
 	}
 	return marshal(triageDecideResult{Outcome: "applied"})
+}
+
+// acknowledgeRetraction clears one Crossref update notice. A retraction notice
+// carries no watch digest to consume, so watch_scope is not consulted: the
+// notice itself is the unit of dismissal.
+func acknowledgeRetraction(ctx context.Context, itemID, op string, system *bootstrap.System) ([]byte, *ipc.RPCError) {
+	if op != "dismiss" {
+		return badParams(errors.New("retraction notices support only the dismiss operation"))
+	}
+	applied, err := system.Triage.AcknowledgeRetraction(ctx, itemID)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return marshal(triageDecideResult{Outcome: "conflict"})
+	case err != nil:
+		return failure(err)
+	case applied:
+		return marshal(triageDecideResult{Outcome: "applied"})
+	default:
+		return marshal(triageDecideResult{Outcome: "already_applied"})
+	}
 }
 
 func triageDismissScope(raw json.RawMessage, watches []triage.Watch) (map[int64]bool, error) {

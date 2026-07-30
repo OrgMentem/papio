@@ -5,6 +5,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -120,6 +122,73 @@ func TestTriageSnapshotCountsAndDismiss(t *testing.T) {
 	}
 	if counts.PendingTotal != 0 || counts.WatchHits != 0 {
 		t.Fatalf("counts after dismiss = %+v", counts)
+	}
+}
+
+// A retraction notice is not a watch hit, so triage.decide must route it to the
+// owning source instead of looking for a digest entry that will never exist.
+type stubRetractionSource struct {
+	item    triage.Item
+	applied bool
+	err     error
+	acked   []string
+}
+
+func (s *stubRetractionSource) SnapshotItems(context.Context, *sql.Tx) ([]triage.Item, error) {
+	return []triage.Item{s.item}, nil
+}
+
+func (s *stubRetractionSource) AcknowledgeRetraction(_ context.Context, itemID string) (bool, error) {
+	s.acked = append(s.acked, itemID)
+	return s.applied, s.err
+}
+
+func TestTriageDecideAcknowledgesRetractionNotice(t *testing.T) {
+	system := testSystem(t)
+	source := &stubRetractionSource{item: triage.Item{
+		Kind: triage.KindRetraction, ID: triage.RetractionIDPrefix + "10.1000/retracted",
+		Title: "Library update notice", Ops: []string{"dismiss", "open"},
+		Retraction: &triage.Retraction{DOI: "10.1000/retracted", Nature: "retraction", NoticedAt: time.Now().UTC()},
+	}, applied: true}
+	system.Triage.RegisterSource(source)
+	router := Router(system)
+
+	var snapshot triage.Snapshot
+	if rpcErr := callMethod(t, router, "triage.snapshot", map[string]any{"limit": 100}, &snapshot); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	if len(snapshot.Items) != 1 || !slices.Contains(snapshot.Items[0].Ops, "dismiss") {
+		t.Fatalf("retraction snapshot = %+v, want a dismissable item", snapshot.Items)
+	}
+
+	var outcome triageDecideResult
+	if rpcErr := callMethod(t, router, "triage.decide", map[string]any{
+		"item_id": snapshot.Items[0].ID, "op": "dismiss", "watch_scope": "all",
+	}, &outcome); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	if outcome.Outcome != "applied" || len(source.acked) != 1 || source.acked[0] != snapshot.Items[0].ID {
+		t.Fatalf("dismiss outcome = %+v, acknowledged = %v", outcome, source.acked)
+	}
+
+	source.applied = false
+	if rpcErr := callMethod(t, router, "triage.decide", map[string]any{
+		"item_id": snapshot.Items[0].ID, "op": "dismiss", "watch_scope": "all",
+	}, &outcome); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	if outcome.Outcome != "already_applied" {
+		t.Fatalf("repeat dismiss outcome = %+v, want already_applied", outcome)
+	}
+
+	source.err = sql.ErrNoRows
+	if rpcErr := callMethod(t, router, "triage.decide", map[string]any{
+		"item_id": triage.RetractionIDPrefix + "10.1000/gone", "op": "dismiss", "watch_scope": "all",
+	}, &outcome); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	if outcome.Outcome != "conflict" {
+		t.Fatalf("vanished notice outcome = %+v, want conflict", outcome)
 	}
 }
 

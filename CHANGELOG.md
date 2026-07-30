@@ -43,6 +43,17 @@ execution records in `notes/acquisition-stack-plan.md`.
 - **Acquisitions record which principal requested them** (`cli`, `mcp`, or
   `unknown`) instead of a hardcoded `cli`, and terminal reasons are now a closed
   vocabulary rather than free text. Persisted values are unchanged.
+- **A retraction notice can be acknowledged.** The sentinel recomputes update
+  notices from Crossref for as long as the work stays in the library, so a notice
+  never resolved itself: it sat at the top of the inbox — above the actions that
+  still need work — for the life of the library copy. Retraction items now carry
+  `dismiss` (and `open`), and `triage.decide` routes a `retraction:` item to the
+  sentinel instead of looking for a watch digest that will never exist. The
+  acknowledgement is bound to the notice identity, so a nature that escalates
+  (concern → retraction) or a newly issued notice DOI surfaces the work again, and
+  the daily sweep prunes acknowledgements whose notice is no longer current. The
+  wire shape is unchanged, so an already-installed extension gains the button.
+  Schema version 17.
 
 ### Fixed
 
