@@ -68,7 +68,11 @@ func statUint(value reflect.Value, name string) (uint64, bool) {
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
 		return field.Uint(), true
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		return uint64(field.Int()), true
+		signed := field.Int()
+		if signed < 0 {
+			return 0, false
+		}
+		return uint64(signed), true
 	default:
 		return 0, false
 	}

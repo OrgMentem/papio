@@ -369,7 +369,6 @@ func normalizeDOI(value string) string {
 	for _, prefix := range []string{"https://doi.org/", "http://doi.org/", "https://dx.doi.org/", "doi:"} {
 		if strings.HasPrefix(lower, prefix) {
 			value = value[len(prefix):]
-			lower = strings.ToLower(value)
 			break
 		}
 	}

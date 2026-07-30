@@ -151,11 +151,10 @@ func (r revision) stableSince(other revision) bool {
 // snapshot is one successfully loaded index. It is immutable once published, so
 // concurrent readers can never observe a half-built index.
 type snapshot struct {
-	index       *ownership.Index
-	revision    revision
-	loadedAt    time.Time
-	entryCount  int
-	failureCode string
+	index      *ownership.Index
+	revision   revision
+	loadedAt   time.Time
+	entryCount int
 }
 
 type fileProvider struct {
