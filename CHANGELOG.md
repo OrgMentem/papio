@@ -12,6 +12,36 @@ execution records in `notes/acquisition-stack-plan.md`.
 
 ### Added
 
+- **De-duplication against a non-Zotero library** (`[[library.sources]]`, new
+  `library.lookup_works` method). Ownership lookup was a zotio capability, so
+  without Zotero `papio search` never marked a result `[in library]` and
+  `acquire --batch` happily re-acquired papers you already held. Point *papio* at
+  BibTeX/RIS/CSL-JSON/NBIB export of what you hold and it stops. Each source
+  declares what it asserts — `claim = "pdf_present"` may skip an acquisition,
+  `claim = "record_present"` only annotates search — because *papio* refuses to
+  infer PDF presence from per-manager attachment conventions and thereby skip a
+  paper the source never vouched for. Matching is exact on identifiers supported
+  by each format: BibTeX supports DOI, arXiv, and PMID; CSL-JSON and NBIB
+  support DOI and PMID; RIS supports DOI only. Titles are never matched and
+  ISBN is excluded, since an edited volume shares one ISBN with every chapter
+  in it. There is no supported-app list: anything that exports one of those
+  four formats works.
+
+  The load-bearing rule is that **a source unreadable to *papio* is not a
+  source that holds nothing**. An unreadable or malformed export leaves the
+  answer *incomplete*, so `--batch` creates no jobs and names the failing source
+  rather than re-downloading the batch. An acquire watch fails the run and
+  resumes on its next cadence after the source is fixed; it has no
+  `--include-owned` override. That override is available only for
+  `papio acquire --batch`. During a transient provider failure, a fresh
+  cached positive may still annotate `papio search` and raw lookup, but batch
+  and watch acquisition remain fail-closed. The runtime last-known-good guard
+  is not persisted across daemon restarts; restart establishes the current
+  export as the new baseline. Because a bibliographic export cannot say
+  *which* manifestation it holds, such a source never satisfies an explicit
+  `--desired-version published` request. `papio doctor` performs a fresh
+  one-shot source probe and reports that read's record count and outcome, not
+  daemon cached age, count-collapse, or retained failure state. See ADR-0008.
 - **`papio stats`** reports what the pipeline has actually obtained: lifetime
   acquired and failed totals, how many acquisitions needed a browser handoff, the
   split of acquired works by access basis (open access / institutional /
@@ -71,8 +101,39 @@ execution records in `notes/acquisition-stack-plan.md`.
   Flags now compose; mixing them with the positional identifier is still refused,
   because that one really is ambiguous.
 
+### Changed
+
+- **`papio init` accepts `none` for the zotio executable.** An empty answer means
+  "keep the default" at every init prompt, and the zotio default is the bare name
+  `zotio`, so someone who does not run Zotero had no way to decline it: init wrote
+  `zotio.executable = "zotio"` and `papio doctor` then *failed* on a binary that
+  was never wanted. Answering `none` clears the key — `doctor` reports zotio as
+  `not configured (optional)` — and the attachment-mode question, which only
+  describes how zotio files an attachment, is skipped. `--zotio-path ""` already
+  did this non-interactively.
+- **The README and docs no longer read as if Zotero were the only destination.**
+  The `on_ready` hook, standard-format batch input (RIS, BibTeX, CSL-JSON,
+  MEDLINE/NBIB), and a zotio-free `doctor` all shipped already, but every entry
+  point — README headline, docs landing page, getting-started, user guide, the
+  site description, and the pipeline diagram — described the Zotero path
+  exclusively, and the hooks page was missing from the landing page's own index.
+  Filing is now two paths (zotio → Zotero, or the hook into papis, a plain
+  folder, or your own script), getting-started ends in a filing step for
+  whichever one you use, and the de-duplication you give up without zotio is
+  stated rather than discovered.
+
 ### Fixed
 
+- **`papio acquire --batch` no longer reports a decode error after successfully
+  creating its jobs.** The batch client samples one field — the job state — out of
+  the `jobs.get` result, but declared a struct containing only that field while
+  `internal/ipc` rejects unknown fields on the whole envelope. So every batch
+  submitted its work, then failed decoding the daemon's reply on the first field
+  it did not know about (`job.id`), printed `decode ipc result: json: unknown
+  field "id"`, reported every state as `unknown`, and exited non-zero. It now
+  decodes the siblings it does not read as raw messages, which is the general rule
+  this violated: a caller that reads one field must not be coupled to the shape of
+  everything beside it. Found by smoke-testing the batch path end to end.
 - **The conservative-mode OpenURL advisory no longer outlives its own remedy.**
   `openurl_available` records that an institutional route existed and
   conservative mode did not take it, and it is deliberately exempt from the
@@ -114,6 +175,9 @@ execution records in `notes/acquisition-stack-plan.md`.
   (`institutional`) and licence (`unknown`) were already honest and are unchanged.
   Adopted candidates written before this release are normalised when the same
   bytes are adopted again or an identity review of them is accepted.
+- **The README architecture diagram's `alt` text is no longer truncated
+  mid-word.** The `<img>` attribute was cut off after "login, MFA, a" and left
+  unterminated, so the tag never closed.
 
 ## [0.13.0] - 2026-07-27
 

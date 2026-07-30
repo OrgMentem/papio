@@ -1,4 +1,4 @@
-package ingest
+package bibparse
 
 import (
 	"errors"
@@ -10,6 +10,10 @@ import (
 // parseBibTeX extracts acquisition identity from BibTeX and BibLaTeX entries.
 func parseBibTeX(data []byte) ([]Record, error) {
 	input := strings.TrimPrefix(string(data), "\ufeff")
+	if strings.TrimSpace(input) == "" {
+		return nil, noEntries("bibtex: no entries found")
+	}
+
 	var records []Record
 
 	for offset := 0; offset < len(input); {
@@ -25,8 +29,7 @@ func parseBibTeX(data []byte) ([]Record, error) {
 			typeEnd++
 		}
 		if typeEnd == typeStart {
-			offset = at + 1
-			continue
+			return nil, fmt.Errorf("bibtex: entry at byte %d: missing entry type", at)
 		}
 
 		open := typeEnd
@@ -34,8 +37,7 @@ func parseBibTeX(data []byte) ([]Record, error) {
 			open++
 		}
 		if open == len(input) || input[open] != '{' {
-			offset = typeEnd
-			continue
+			return nil, fmt.Errorf("bibtex: entry at byte %d: expected opening brace", at)
 		}
 
 		entry, next, err := bibTeXBraced(input, open)
@@ -57,18 +59,32 @@ func parseBibTeX(data []byte) ([]Record, error) {
 	}
 
 	if len(records) == 0 {
+		// Only truly empty input is a complete empty source. A non-empty source
+		// with no bibliographic entries leaves callers unable to distinguish
+		// metadata-only input from unsupported or malformed content.
 		return nil, errors.New("bibtex: no entries found")
 	}
 	return records, nil
 }
 
-func parseBibTeXEntry(entry string) (Record, error) {
+func parseBibTeXEntry(entry string) (record Record, err error) {
 	comma := bibTeXTopLevelComma(entry, 0)
 	if comma < 0 {
-		return Record{}, nil
+		return Record{}, errors.New("missing comma after citation key")
+	}
+	if equals := bibTeXTopLevelEquals(entry, 0); equals >= 0 && equals < comma {
+		return Record{}, errors.New("field assignment before citation key comma")
 	}
 
-	var record Record
+	// The eprint metadata is resolved on every successful exit, since the parse
+	// loop returns from several points and declarations may follow `eprint`.
+	var eprint bibTeXEprint
+	defer func() {
+		if err == nil {
+			resolveBibTeXEprint(&record, eprint)
+		}
+	}()
+
 	for pos := comma + 1; ; {
 		pos = skipBibTeXDelimiters(entry, pos)
 		if pos >= len(entry) {
@@ -88,7 +104,7 @@ func parseBibTeXEntry(entry string) (Record, error) {
 		if err != nil {
 			return Record{}, fmt.Errorf("field %q: %w", field, err)
 		}
-		applyBibTeXField(&record, field, value)
+		applyBibTeXField(&record, &eprint, field, value)
 
 		pos = skipBibTeXSpace(entry, next)
 		if pos == len(entry) {
@@ -142,10 +158,30 @@ func bibTeXValueAtom(entry string, pos int) (string, int, error) {
 	}
 }
 
-func applyBibTeXField(record *Record, field, value string) {
+// bibTeXEprint accumulates eprint metadata across one entry's fields, because
+// every archiveprefix and eprinttype declaration must be considered even when
+// the same field occurs more than once.
+type bibTeXEprint struct {
+	id             string
+	hasForeignType bool
+}
+
+func applyBibTeXField(record *Record, eprint *bibTeXEprint, field, value string) {
 	switch field {
 	case "doi":
 		record.DOI = normalizeBibTeXDOI(cleanBibTeXValue(value))
+	case "pmid":
+		record.PMID = cleanBibTeXValue(value)
+	case "arxiv":
+		// An explicit arxiv field names its archive; no prefix needed.
+		record.ArXiv = cleanBibTeXValue(value)
+	case "eprint":
+		eprint.id = cleanBibTeXValue(value)
+	case "archiveprefix", "eprinttype":
+		archive := cleanBibTeXValue(value)
+		if archive != "" && !strings.EqualFold(archive, "arxiv") {
+			eprint.hasForeignType = true
+		}
 	case "title":
 		record.Title = cleanBibTeXValue(value)
 	case "author":
@@ -157,6 +193,19 @@ func applyBibTeXField(record *Record, field, value string) {
 	case "year":
 		record.Year = bibTeXYear(cleanBibTeXValue(value))
 	}
+}
+
+// resolveBibTeXEprint promotes an eprint id to an arXiv id only when every
+// explicit archive declaration says arXiv, or neither declaration is present.
+// BibLaTeX's `eprint` is archive-agnostic — it also carries JSTOR, HAL, and
+// PubMed ids — so one foreign `archiveprefix` or `eprinttype` must prevent
+// promotion regardless of field order or duplicates. An explicit arxiv field,
+// already applied, wins.
+func resolveBibTeXEprint(record *Record, eprint bibTeXEprint) {
+	if record.ArXiv != "" || eprint.id == "" || eprint.hasForeignType {
+		return
+	}
+	record.ArXiv = eprint.id
 }
 
 func normalizeBibTeXDOI(value string) string {

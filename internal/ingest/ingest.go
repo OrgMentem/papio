@@ -1,122 +1,58 @@
-// Package ingest parses standard bibliographic interchange formats — RIS,
+// Copyright 2026 OrgMentem. Licensed under MIT. See LICENSE.
+// Package ingest converts standard bibliographic interchange formats — RIS,
 // BibTeX/BibLaTeX, CSL-JSON, and MEDLINE/NBIB — into the same canonical work
-// requests that `papio acquire --batch` builds from JSONL. One robust
-// standards pipeline connects reference managers, database exports, and
-// systematic-review tools without bespoke integrations.
+// requests that `papio acquire --batch` builds from JSONL. One robust standards
+// pipeline connects reference managers, database exports, and systematic-review
+// tools without bespoke integrations.
 //
-// Every record funnels through batch.ParseWork, so identifier
+// Decoding lives in internal/bibparse; this package owns only the acquisition
+// adapter. Every record funnels through batch.ParseWork, so identifier
 // normalization, deterministic request IDs, and validation are identical to
-// JSONL input by construction.
+// JSONL input by construction — which is also why the split exists: holdings
+// indexing (ADR-0008) must reuse the parsers without inheriting the dependency
+// on internal/batch, or the ownership graph inverts.
 package ingest
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
-	"path/filepath"
 	"strings"
 
 	"papio/internal/batch"
+	"papio/internal/bibparse"
 	"papio/internal/protocol"
 )
 
-// Format identifies a supported bibliographic input encoding.
-type Format string
-
-const (
-	// FormatJSONL is papio's native batch format; Detect returns it as the
-	// default so existing `--batch` invocations are unchanged.
-	FormatJSONL Format = "jsonl"
-	// FormatRIS covers RIS exports (EndNote, Zotero, Covidence, Rayyan, most
-	// databases): tagged `XX  - value` lines with `TY` opening and `ER`
-	// closing each record.
-	FormatRIS Format = "ris"
-	// FormatBibTeX covers BibTeX/BibLaTeX files: `@type{key, field = value}`.
-	FormatBibTeX Format = "bibtex"
-	// FormatCSLJSON covers CSL-JSON: a top-level JSON array of item objects.
-	FormatCSLJSON Format = "csl-json"
-	// FormatNBIB covers MEDLINE/PubMed .nbib exports: `TAG - value` lines
-	// with 4-character space-padded tags and indented continuations.
-	FormatNBIB Format = "nbib"
+// Format and Record are re-exported so existing callers keep one import.
+type (
+	Format = bibparse.Format
+	Record = bibparse.Record
 )
 
-// Record is one bibliographic entry extracted from an input file, restricted
-// to the fields papio's acquisition identity uses. Parsers leave fields they
-// cannot recover empty; conversion validates that enough identity remains.
-type Record struct {
-	DOI     string
-	PMID    string
-	ArXiv   string
-	ISBN    string
-	Title   string
-	Authors []string
-	Year    int
-}
+const (
+	FormatJSONL   = bibparse.FormatJSONL
+	FormatRIS     = bibparse.FormatRIS
+	FormatBibTeX  = bibparse.FormatBibTeX
+	FormatCSLJSON = bibparse.FormatCSLJSON
+	FormatNBIB    = bibparse.FormatNBIB
+)
 
-// Detect classifies batch input, extension first and content sniff second.
-// The zero-signal answer is FormatJSONL: papio's native format keeps working
-// for `-` stdin and extensionless paths that look like JSON objects.
-func Detect(path string, data []byte) Format {
-	switch strings.ToLower(filepath.Ext(path)) {
-	case ".ris":
-		return FormatRIS
-	case ".bib", ".bibtex":
-		return FormatBibTeX
-	case ".json":
-		// .json is CSL-JSON only when it is a top-level array; a JSON object
-		// per line is native JSONL regardless of extension.
-		if firstByte(data) == '[' {
-			return FormatCSLJSON
-		}
-		return FormatJSONL
-	case ".nbib":
-		return FormatNBIB
-	case ".jsonl", ".ndjson":
-		return FormatJSONL
-	}
-	return sniff(data)
-}
-
-// sniff classifies extensionless input (stdin, tempfiles) by leading content.
-func sniff(data []byte) Format {
-	trimmed := bytes.TrimLeft(data, " \t\r\n\ufeff")
-	switch {
-	case len(trimmed) == 0:
-		return FormatJSONL
-	case trimmed[0] == '[':
-		return FormatCSLJSON
-	case trimmed[0] == '{':
-		return FormatJSONL
-	case trimmed[0] == '@':
-		return FormatBibTeX
-	case bytes.HasPrefix(trimmed, []byte("TY  -")):
-		return FormatRIS
-	case bytes.HasPrefix(trimmed, []byte("PMID-")):
-		return FormatNBIB
-	}
-	return FormatJSONL
-}
+// Detect classifies batch input; see bibparse.Detect.
+func Detect(path string, data []byte) Format { return bibparse.Detect(path, data) }
 
 // Parse converts input in the given format into canonical work requests.
 // FormatJSONL is not handled here — the CLI's existing JSONL reader owns it —
 // and requesting it is a programming error surfaced as such.
+//
+// Parsing is strict on purpose: the first record that cannot become a valid
+// work request aborts the whole batch, because a user who asked to acquire
+// twenty papers should not silently receive nineteen. Holdings indexing wants
+// the opposite tolerance and therefore calls bibparse.ParseRecords directly.
 func Parse(format Format, data []byte) ([]protocol.WorkRequest, error) {
-	var records []Record
-	var err error
-	switch format {
-	case FormatRIS:
-		records, err = parseRIS(data)
-	case FormatBibTeX:
-		records, err = parseBibTeX(data)
-	case FormatCSLJSON:
-		records, err = parseCSLJSON(data)
-	case FormatNBIB:
-		records, err = parseNBIB(data)
-	case FormatJSONL:
+	if format == FormatJSONL {
 		return nil, fmt.Errorf("jsonl input is parsed by the batch reader, not ingest")
-	default:
-		return nil, fmt.Errorf("unsupported bibliographic format %q", format)
 	}
+	records, err := bibparse.ParseRecords(format, data)
 	if err != nil {
 		return nil, err
 	}
@@ -180,12 +116,4 @@ func nonempty(values []string) []string {
 		}
 	}
 	return out
-}
-
-func firstByte(data []byte) byte {
-	trimmed := bytes.TrimLeft(data, " \t\r\n\ufeff")
-	if len(trimmed) == 0 {
-		return 0
-	}
-	return trimmed[0]
 }

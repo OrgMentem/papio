@@ -7,7 +7,7 @@
 # Everything else in docs/ is authored by hand.
 
 site_name: papio
-site_description: A local paper-acquisition broker — searches scholarly works, creates bounded acquisition jobs, validates candidate PDFs, and hands ready artifacts to Zotero through Zotio.
+site_description: A local paper-acquisition broker — searches scholarly works, creates bounded acquisition jobs, validates candidate PDFs, and hands ready artifacts off for filing in your reference library — Zotero through zotio, or papis, a plain folder, or your own script through a best-effort hook.
 site_author: OrgMentem
 copyright: Copyright &copy; 2026 OrgMentem — MIT. papio is an independent project, not affiliated with or endorsed by Zotero.
 # Canonical URL (required for the sitemap that instant navigation relies on) + repo links.
@@ -88,8 +88,8 @@ nav:
   - Guide:
       - Getting started: guide/getting-started.md
       - User guide: guide/user-guide.md
+      - "Filing: Zotero, papis & more": guide/hooks.md
       - Use in a coding agent: guide/agent-skill.md
-      - Hooks (papis & more): guide/hooks.md
       - Troubleshooting: guide/troubleshooting.md
   - Concepts:
       - Access modes & safety: concepts/access-modes.md

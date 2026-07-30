@@ -27,6 +27,7 @@ import (
 	"papio/internal/discovery"
 	"papio/internal/ipc"
 	"papio/internal/job"
+	"papio/internal/ownership"
 	"papio/internal/protocol"
 	"papio/internal/triage"
 	"papio/internal/update"
@@ -1285,4 +1286,95 @@ func TestAddComponentRefusesHTMLFullText(t *testing.T) {
 	if rpcErr == nil || rpcErr.Code != "invalid_argument" {
 		t.Fatalf("add_component html_fulltext = %+v, want invalid_argument", rpcErr)
 	}
+}
+
+type libraryLookupProvider struct {
+	calls atomic.Int32
+}
+
+func (p *libraryLookupProvider) Name() string {
+	return "test-library"
+}
+
+func (p *libraryLookupProvider) Lookup(_ context.Context, queries []ownership.Query) ([][]ownership.Claim, ownership.SourceHealth) {
+	p.calls.Add(1)
+	return make([][]ownership.Claim, len(queries)), ownership.SourceHealth{Name: p.Name(), Complete: true}
+}
+
+func TestLibraryLookupWorksRequiresActiveGenericAuthority(t *testing.T) {
+	system := testSystem(t)
+	system.Config.Library.Sources = []config.LibrarySource{{
+		Name: "test-library", Kind: config.LibraryKindFile, Path: "/tmp/test-library.bib",
+		Format: "bibtex", Claim: config.LibraryClaimPDFPresent,
+	}}
+	request := LibraryLookupWorksRequest{
+		Works:               []ownership.Query{{}},
+		ExpectedFingerprint: system.Config.LibraryFingerprint(),
+	}
+	raw, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("matching fingerprint with enabled registry succeeds", func(t *testing.T) {
+		provider := &libraryLookupProvider{}
+		system.Holdings = ownership.NewRegistry(provider)
+
+		data, rpcErr := libraryLookupWorks(context.Background(), raw, system)
+		if rpcErr != nil {
+			t.Fatalf("library lookup RPC error = %+v", rpcErr)
+		}
+		if provider.calls.Load() != 1 {
+			t.Fatalf("provider lookup calls = %d, want 1", provider.calls.Load())
+		}
+		var result ownership.Result
+		if err := json.Unmarshal(data, &result); err != nil {
+			t.Fatalf("decode lookup result: %v", err)
+		}
+		if len(result.Works) != 1 || len(result.Sources) != 1 || !result.Sources[0].Complete {
+			t.Fatalf("lookup result = %+v, want one complete source result", result)
+		}
+	})
+
+	for _, tc := range []struct {
+		name     string
+		holdings *ownership.Registry
+	}{
+		{name: "empty registry", holdings: ownership.NewRegistry()},
+		{name: "nil registry"},
+	} {
+		t.Run("matching fingerprint with "+tc.name+" fails", func(t *testing.T) {
+			system.Holdings = tc.holdings
+
+			data, rpcErr := libraryLookupWorks(context.Background(), raw, system)
+			if rpcErr == nil || rpcErr.Code != "precondition_failed" {
+				t.Fatalf("library lookup RPC error = %+v, want precondition_failed", rpcErr)
+			}
+			if data != nil {
+				t.Fatalf("library lookup returned data on failed authority check: %s", data)
+			}
+		})
+	}
+
+	t.Run("mismatched fingerprint fails", func(t *testing.T) {
+		provider := &libraryLookupProvider{}
+		system.Holdings = ownership.NewRegistry(provider)
+		mismatched := request
+		mismatched.ExpectedFingerprint = "mismatched"
+		mismatchedRaw, err := json.Marshal(mismatched)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		data, rpcErr := libraryLookupWorks(context.Background(), mismatchedRaw, system)
+		if rpcErr == nil || rpcErr.Code != "precondition_failed" {
+			t.Fatalf("library lookup RPC error = %+v, want precondition_failed", rpcErr)
+		}
+		if data != nil {
+			t.Fatalf("library lookup returned data on fingerprint mismatch: %s", data)
+		}
+		if provider.calls.Load() != 0 {
+			t.Fatalf("provider lookup calls = %d, want 0", provider.calls.Load())
+		}
+	})
 }

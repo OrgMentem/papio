@@ -1,12 +1,14 @@
 # Getting started
 
 *papio* finds scholarly papers, checks each PDF is the paper you asked for, and
-hands finished PDFs to your Zotero library through `zotio` — which always shows
-you a preview before it writes anything.
+offers finished PDFs toward your reference library — into Zotero through
+`zotio`, which always shows you a preview before it writes anything, or toward
+papis, a plain folder, or your own script through a best-effort
+[`on_ready` hook](hooks.md). Hook failures never fail or retry the acquisition job.
 
 ## 1. Install
 
-*papio* has two parts: the **CLI & daemon** — it finds papers, validates each PDF, and files finished artifacts into Zotero through `zotio` — and a **browser extension** that hands off publisher-gated downloads from your logged-in browser. Install the CLI, load the extension, then wire them together with `papio init` ([step 2](#2-initialize-the-local-profile)).
+*papio* has two parts: the **CLI & daemon** — it finds papers, validates each PDF, and offers finished artifacts for your library (Zotero through `zotio`, anywhere else through a best-effort [hook](hooks.md) handoff) — and a **browser extension** that hands off publisher-gated downloads from your logged-in browser. Install the CLI, load the extension, then wire them together with `papio init` ([step 2](#2-initialize-the-local-profile)).
 
 ### The CLI & daemon
 
@@ -66,7 +68,7 @@ you a preview before it writes anything.
 
     Requires Poppler (and Tesseract for OCR) on your `PATH` — see the macOS / Linux / Windows tabs above.
 
-Install `zotio` and put it on your `PATH` when you want *papio* to import finished PDFs into Zotero.
+Install `zotio` and put it on your `PATH` when you want *papio* to import finished PDFs into Zotero. **Not a Zotero user?** Skip it — answer `none` at the zotio prompt (or pass `--zotio-path ""`) and use a best-effort [`on_ready` hook](hooks.md) handoff instead; hook failures never fail or retry the acquisition job.
 
 ### The browser extension
 
@@ -117,6 +119,9 @@ The interactive setup asks for:
 
 1. A contact email for polite API pools.
 2. The `zotio` executable and attachment mode (`stored` or `linked-file`).
+   Answer `none` for the executable if you don't use Zotero; the
+   attachment-mode question is then skipped and `papio doctor` reports zotio as
+   `not configured (optional)` rather than failing.
 3. Whether to install browser integration.
 4. Browser extension identities: the Chrome extension ID (defaults to the
    Chrome Web Store package's fixed ID; only unpacked development builds need
@@ -146,7 +151,7 @@ These flags set the corresponding setup values:
 | Flag | Value |
 | --- | --- |
 | `--email` | Contact email for polite API pools. |
-| `--zotio-path` | zotio executable path. |
+| `--zotio-path` | zotio executable path; `--zotio-path ""` disables Zotero integration. |
 | `--attachment-mode` | `stored` or `linked-file`. |
 | `--openurl-base` | Institution OpenURL resolver base URL. |
 | `--shibboleth-entity-id` | Shibboleth IdP entityID for federated login-routing. |
@@ -182,6 +187,45 @@ MEDLINE/NBIB—through `acquire --batch`:
 ```sh
 papio acquire --batch refs.ris --label "thesis background"
 ```
+
+A validated PDF is held in *papio*'s content-addressed artifact store. Choose
+where to offer it:
+
+=== "Zotero"
+
+    ```sh
+    papio zotio plan <job-id>                              # preview the exact changes
+    papio zotio apply <plan-id> --confirm-sha256 <sha256>   # applies exactly that preview
+    ```
+
+    `acquire --auto-import` routes through the same plan/apply machinery.
+
+=== "papis"
+
+    ```toml
+    [hooks]
+    on_ready = 'papis add --from doi "$PAPIO_DOI" "$PAPIO_PDF"'
+    ```
+
+    This is a best-effort handoff. If the hook fails, *papio* records the
+    failure without failing or retrying the acquisition job.
+
+=== "Plain folder"
+
+    ```toml
+    [hooks]
+    on_ready = 'cp "$PAPIO_PDF" "$HOME/Papers/"'
+    ```
+
+=== "Your own script"
+
+    ```toml
+    [hooks]
+    on_ready = '/usr/local/bin/file-paper.sh'
+    ```
+
+    The job's identity arrives in `PAPIO_DOI`, `PAPIO_TITLE`, `PAPIO_PDF`, and
+    `PAPIO_SHA256`; the full contract is in [filing & hooks](hooks.md).
 
 Next, choose an [access mode](../concepts/access-modes.md), follow the
 [User guide](user-guide.md) for discovery and browser handoffs, or review every

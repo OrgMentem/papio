@@ -1,9 +1,11 @@
 # User guide
 
 *papio* finds scholarly papers, checks each PDF is the paper you asked for, and
-hands finished PDFs to your Zotero library through `zotio`, which always shows you
-a preview first. It does not handle institution logins, two-factor codes,
-CAPTCHAs, or bulk-downloading from subscription databases.
+offers finished PDFs toward your reference library — into Zotero through
+`zotio`, which always shows you a preview first, or toward any other destination
+through a best-effort [`on_ready` hook](hooks.md). Hook failures never fail or
+retry the acquisition job. It does not handle institution logins,
+two-factor codes, CAPTCHAs, or bulk-downloading from subscription databases.
 
 Use [`config-reference.md`](../reference/config-reference.md) to change policy and
 [`troubleshooting.md`](troubleshooting.md) when a job needs attention.
@@ -44,9 +46,11 @@ papio search "appropriate reliance on AI" --limit 20 --year-from 2023
 ```
 
 `--oa-only` limits results to works marked open access. `--year-to` sets an
-upper publication-year limit. Search output marks a result already found in the
-local zotio library as `[in library]`; JSON output exposes the same state as
-`owned` and, when available, `owned_item_key`.
+upper publication-year limit. Search output marks a result already found by
+the local zotio library or a configured `library.sources` authority as
+`[in library]`; JSON output exposes the same state as `owned` and, when
+available, `owned_item_key`. Without either authority, results are
+unowned/unclassified.
 
 Search results lead with confident title matches: when a result's title
 clearly answers the query — an exact match, a phrase match, or most of the
@@ -60,15 +64,16 @@ unrelated papers as if they were right. A query under three words is treated
 as a keyword search and left in the backend's own order, as is a
 citation-snowball search below.
 
-Use `--new-only` when you want the result set to omit library-owned works:
+Use `--new-only` when you want the result set to omit works marked owned by
+zotio or a configured `library.sources` authority:
 
 ```sh
 papio search "appropriate reliance on AI" --limit 20 --new-only --json
 ```
 
 Ownership filtering happens after OpenAlex applies `--limit`, so a `--new-only`
-search can return fewer rows than its limit. If zotio ownership lookup is not
-available, discovery continues with all results treated as unowned.
+search can return fewer rows than its limit. Without zotio or a configured
+library source, ownership cannot be classified and results remain unowned.
 
 ### Grow from a seed paper
 
@@ -114,11 +119,23 @@ batch report and can be retried through the normal zotio preview flow.
 
 `--collection` carries the requested zotio collection with each work; the
 collection is created on demand by zotio, and importing the same work again is safe.
-`--label` is batch query context for later reports. *papio* first classifies batch
-works against your zotio library: works already owning a PDF are skipped, a known
-item without a PDF is queued on its existing-item attachment route, and other
-works are acquired as new items. Add `--include-owned` only when a batch should
-also submit works that already carry a zotio PDF.
+When zotio is configured, *papio* first classifies batch works against your zotio
+library: works already owning a PDF are skipped, a known item without a PDF is
+queued on its existing-item attachment route, and other works are acquired as new
+items. Add `--include-owned` only when a batch should also submit works that
+already carry a zotio PDF.
+
+Without zotio configured, the `--auto-import` and `--collection` behaviour above
+does not apply. A ready job's PDF receives a best-effort
+[`on_ready` hook](hooks.md) handoff instead. De-duplication still works if you
+configure a [library source](hooks.md#de-duplicating-against-a-non-zotero-library)
+— `--batch` then skips papers that source says you hold, and refuses to create
+any jobs at all if it cannot read the source, unless you explicitly use
+`papio acquire --batch --include-owned`. This batch-only override accepts
+ownership uncertainty and proceeds despite the unreadable source. With no
+library source configured, every work is treated as new and a batch will
+re-acquire a paper you already have. Hook failures never fail or retry the
+acquisition job.
 
 You can queue one work instead:
 

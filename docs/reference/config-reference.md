@@ -108,7 +108,7 @@ custom resolver origin stays in assisted mode.
 
 | Key | Type | Default | Effect and constraints |
 | --- | --- | --- | --- |
-| `executable` | path or command string | `zotio` | zotio executable *papio* invokes at the Zotero boundary. Optional: an empty value disables the deep Zotero integration (auto-import, plan/apply, queue); ownership lookup then classifies every work as not-owned. Required only when `auto_import = true`. |
+| `executable` | path or command string | `zotio` | zotio executable *papio* invokes at the Zotero boundary. Optional: an empty value disables the deep Zotero integration (auto-import, plan/apply, queue). When no generic `library.sources` authority is configured, ownership lookup then classifies every work as not-owned. Required only when `auto_import = true`. |
 | `timeout_seconds` | integer seconds | `120` | zotio command deadline. It must be between 5 and 600 seconds inclusive. |
 | `attachment_mode` | string | `stored` | zotio attachment mode. Allowed values are `stored` and `linked-file`. |
 | `auto_import` | boolean | `false` | Default acquisition policy for automatic zotio plan-and-apply after a job is ready. An `acquire --auto-import` request can opt in per job. |
@@ -126,6 +126,51 @@ mutation remains preview-first: `papio zotio plan` returns immutable plans and
 | --- | --- | --- | --- |
 | `on_ready` | shell command string | empty | When set, runs once via the system shell (`/bin/sh -c`; `cmd /C` on Windows) each time a job reaches `ready` (validated artifact). Job metadata arrives as `PAPIO_*` environment variables. Fire-and-forget: a failing hook is recorded as a `hook.on_ready` job event but never fails or retries the job. Empty disables it. See the [hooks guide](../guide/hooks.md). |
 | `timeout_seconds` | integer seconds | `120` | Deadline for one hook run. Validated (5..600) only when `on_ready` is set. |
+
+## `[[library.sources]]`
+
+Libraries *papio* consults to answer "do I already hold this paper?" for users
+who do not run Zotero. Repeat the table for each source (maximum 8 — every one is
+read on every search, batch, and discovery acquire-watch pass). Generic
+`library.sources` are ignored while `zotio.executable` is configured; otherwise
+they are the ownership authority for discovery acquire watches. Alert watches
+retain their historical zotio ownership path and do not consult generic sources.
+
+| Key | Type | Default | Effect and constraints |
+| --- | --- | --- | --- |
+| `name` | string | — | Required, unique, and must have no leading or trailing whitespace. Identifies the source in `papio doctor` output and in warnings. |
+| `kind` | string | — | Required. `file` is the only supported kind; anything else is rejected rather than ignored. |
+| `path` | string | — | Required for `kind = "file"`. The bibliographic export to read. `~` is expanded and the resulting path must be absolute. |
+| `format` | string | empty | `bibtex`, `ris`, `csl-json`, or `nbib`. Empty detects from the path and content. |
+| `claim` | string | — | Required, **no default**: `pdf_present` (entries whose full text you hold, so a match may skip acquisition) or `record_present` (citations only — annotates `papio search` but never skips). |
+
+Matching is exact on identifiers represented by the source format. No format
+supports every identifier, and titles are never matched. ISBN is excluded,
+because an edited volume shares one ISBN with every chapter in it. *papio* never
+infers PDF presence from per-manager attachment fields (BibTeX `file`, papis
+`files`) — the source declares it via `claim`.
+
+| Format | DOI | arXiv | PMID |
+| --- | --- | --- | --- |
+| BibTeX | yes | yes | yes |
+| CSL-JSON | yes | no | yes |
+| NBIB | yes | no | yes |
+| RIS | yes | no | no |
+
+A source unreadable to *papio* is reported as unreadable, not as holding
+nothing: `papio acquire --batch` then refuses to create jobs rather than
+re-downloading the whole batch. Before the fifth consecutive failure, each
+cadence attempts another run; a successful run resets the failure count. The
+fifth consecutive failure disables the watch; there is no re-enable command.
+After fixing the source, you may force-run it once with `papio watch run <id>`,
+but scheduled execution resumes only if you recreate the watch.
+`--include-owned` is available only for `papio acquire --batch`, meaning
+"proceed despite ownership uncertainty". Because a bibliographic export cannot
+say *which* manifestation it holds, such a source never satisfies an explicit
+`--desired-version published` request. `papio doctor` performs a fresh one-shot
+probe of each source and reports that read's record count and outcome; it does
+not report daemon cached age, count-collapse detection, or retained failure
+state. See the [filing guide](../guide/hooks.md).
 
 ## `[notify]`
 

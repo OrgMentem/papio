@@ -390,6 +390,57 @@ func TestInitInteractiveCapturesExtensionIDsAndInstalls(t *testing.T) {
 	}
 }
 
+func TestInitInteractiveZotioNoneClearsExecutableAndSkipsAttachment(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	path := filepath.Join(home, ".config", "papio", "config.toml")
+	deps := initTestDependencies(t)
+	deps.InstallNative = func(config.Config) error { return nil }
+	cfg := config.Default()
+	cfg.AccessMode = config.ModeConservative
+	cfg.Email = "reader@example.test"
+	cfg.Zotio.Executable = filepath.Join(home, "tools", "zotio")
+	cfg.Zotio.AutoImport = true
+	cfg.Zotio.ExceptionTags = true
+	if err := config.Save(cfg, path); err != nil {
+		t.Fatalf("seed existing zotio config: %v", err)
+	}
+	// email, zotio exec = none. Answering "none" also drops the attachment-mode
+	// question, so "yes" must land on the browser prompt and the Chrome ID on
+	// the one after it — misalignment here is the regression this guards.
+	answers := strings.Join([]string{
+		"reader@example.test",
+		"none",
+		"yes",
+		"abcdefghijklmnopabcdefghijklmnop",
+		"",
+		"",
+		"",
+	}, "\n") + "\n"
+	if _, err := runInitStdin(t, path, deps, answers); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Zotio.Executable != "" {
+		t.Fatalf("zotio.executable = %q, want empty after answering none", cfg.Zotio.Executable)
+	}
+	if cfg.Zotio.AutoImport {
+		t.Fatal("zotio.auto_import remains enabled after answering none")
+	}
+	if cfg.Zotio.ExceptionTags {
+		t.Fatal("zotio.exception_tags remains enabled after answering none")
+	}
+	if cfg.Zotio.AttachmentMode != "stored" {
+		t.Fatalf("attachment_mode = %q, want the untouched default", cfg.Zotio.AttachmentMode)
+	}
+	if cfg.Browser.ExtensionID != "abcdefghijklmnopabcdefghijklmnop" {
+		t.Fatalf("extension_id = %q; prompts shifted after skipping attachment mode", cfg.Browser.ExtensionID)
+	}
+}
+
 func TestInitInteractiveInstitutionURLDerivesPrimoVEBase(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)

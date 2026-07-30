@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1200" height="560" viewBox="0 0 1200 560" role="img" aria-labelledby="title description">
   <title id="title">Acquisition pipeline</title>
-  <desc id="description">You or an agent asks papio to queue a job. papio tries open sources first — arXiv, Unpaywall, PMC, and licensed APIs — or hands the request to your own browser via the papio extension (installed once, manually), where login, MFA, and CAPTCHA stay human. The paths converge, then the PDF is quarantined and validated as the right paper, a real PDF, and searchable, packaged as a validated bundle recording where it came from, previewed and applied through zotio, and added to the Zotero library.</desc>
+  <desc id="description">You or an agent asks papio to queue a job. papio tries open sources first — arXiv, Unpaywall, PMC, and licensed APIs — or hands the request to your own browser via the papio extension (installed once, manually), where login, MFA, and CAPTCHA stay human. The paths converge, then the PDF is quarantined and validated as the right paper, a real PDF, and searchable, packaged as a validated bundle recording where it came from, and filed into your library — into Zotero through zotio's preview-then-apply, or into papis, a plain folder, or your own script through the on_ready hook.</desc>
   <defs>
     <marker id="arrow-navy" viewBox="0 0 14 14" refX="14" refY="7" markerWidth="14" markerHeight="14" markerUnits="userSpaceOnUse" orient="auto">
       <path class="arrow-ink" d="M 0 0 L 14 7 L 0 14 Z"/>
@@ -92,21 +92,24 @@
       </text>
     </g>
 
-    <g aria-label="zotio — preview, then apply">
-      <rect class="node" x="300" y="420" width="240" height="82" rx="12"/>
-      <text class="node-label" x="420" y="456">
-        <tspan x="420" y="456">zotio</tspan>
-        <tspan class="node-sub" x="420" y="479">preview, then apply</tspan>
+    <g aria-label="Zotero — via zotio: preview, then apply">
+      <rect class="node" x="40" y="392" width="500" height="64" rx="12"/>
+      <text class="node-label" x="290" y="419">
+        <tspan x="290" y="419">Zotero</tspan>
+        <tspan class="node-sub" x="290" y="442">zotio: preview, then apply</tspan>
       </text>
     </g>
 
-    <g aria-label="Zotero library">
-      <rect class="node" x="30" y="420" width="200" height="82" rx="12"/>
-      <text class="node-label" x="130" y="462" dominant-baseline="middle">Zotero library</text>
+    <g aria-label="papis, a plain folder, or your own script — via the on_ready hook">
+      <rect class="node" x="40" y="476" width="500" height="64" rx="12"/>
+      <text class="node-label" x="290" y="503">
+        <tspan x="290" y="503">papis · plain folder · your own script</tspan>
+        <tspan class="node-sub" x="290" y="526">your on_ready hook</tspan>
+      </text>
     </g>
 
     <path d="M 940 461 H 870" class="flow" marker-end="url(#arrow-navy)"/>
-    <path d="M 610 461 H 540" class="flow" marker-end="url(#arrow-navy)"/>
-    <path d="M 300 461 H 230" class="flow" marker-end="url(#arrow-navy)"/>
+    <path d="M 610 461 H 592 Q 574 461 574 443 V 442 Q 574 424 556 424 H 540" class="flow" marker-end="url(#arrow-navy)"/>
+    <path d="M 610 461 H 592 Q 574 461 574 479 V 490 Q 574 508 556 508 H 540" class="flow" marker-end="url(#arrow-navy)"/>
   </g>
 </svg>

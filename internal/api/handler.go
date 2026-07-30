@@ -22,6 +22,7 @@ import (
 	"papio/internal/discovery"
 	"papio/internal/ipc"
 	"papio/internal/job"
+	"papio/internal/ownership"
 	"papio/internal/protocol"
 	"papio/internal/update"
 	"papio/internal/watch"
@@ -255,6 +256,9 @@ func RouterWithShutdown(system *bootstrap.System, shutdown context.CancelFunc) i
 		},
 		"zotio.lookup_works": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return zotioLookupWorks(ctx, raw, system)
+		},
+		"library.lookup_works": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return libraryLookupWorks(ctx, raw, system)
 		},
 		"zotio.plan": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return zotioPlan(ctx, raw, system)
@@ -532,6 +536,38 @@ func zotioLookupWorks(ctx context.Context, raw json.RawMessage, system *bootstra
 		return nil, &ipc.RPCError{Code: "precondition_failed", Message: safeMessage(err, "Zotio ownership lookup failed")}
 	}
 	return marshal(result)
+}
+
+// LibraryLookupWorksRequest asks the generic holdings providers about a bounded
+// batch of works.
+//
+// This is a new method rather than a widened zotio.lookup_works because nothing
+// on the wire is additive (internal/ipc rejects unknown fields on the whole
+// envelope) and, more importantly, because the two answer different questions:
+// zotio.lookup_works returns a Zotero routing decision whose owned_missing_pdf
+// status carries an item key callers act on, while this returns destination-
+// neutral holdings claims plus per-source completeness. zotio.lookup_works keeps
+// its old shape *and* its old semantics (ADR-0008 invariant 8).
+type LibraryLookupWorksRequest struct {
+	Works               []ownership.Query `json:"works"`
+	ExpectedFingerprint string            `json:"expected_fingerprint"`
+}
+
+func libraryLookupWorks(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
+	var request LibraryLookupWorksRequest
+	if err := ipc.DecodeParams(raw, &request); err != nil {
+		return badParams(err)
+	}
+	if request.ExpectedFingerprint == "" || request.ExpectedFingerprint != system.Config.LibraryFingerprint() {
+		return nil, &ipc.RPCError{Code: "precondition_failed", Message: "library configuration does not match caller"}
+	}
+	if system.Holdings == nil || !system.Holdings.Enabled() {
+		return nil, &ipc.RPCError{Code: "precondition_failed", Message: "generic library authority is not active"}
+	}
+	if len(request.Works) == 0 || len(request.Works) > 50 {
+		return nil, &ipc.RPCError{Code: "invalid_params", Message: "library lookup requires 1..50 works"}
+	}
+	return marshal(system.Holdings.Lookup(ctx, request.Works))
 }
 
 // WatchRemoveResult confirms removal of one scheduled watch.
@@ -1149,12 +1185,21 @@ func searchDiscovery(ctx context.Context, raw json.RawMessage, system *bootstrap
 		}
 		return nil, &ipc.RPCError{Code: "precondition_failed", Message: safeMessage(errors.New(message), "discovery search failed")}
 	}
-	var lookup discovery.OwnershipLookup
-	if system.Zotio != nil {
-		lookup = system.Zotio
-	}
-	if warning := discovery.ClassifyOwnership(ctx, works, lookup); warning != "" {
-		log.Printf("warning: %s", warning)
+	// Generic holdings sources answer only when zotio does not: mixed precedence
+	// is out of scope (ADR-0008), and when zotio is configured its classification
+	// stays exactly as it was.
+	if system.Holdings.Enabled() {
+		if warning := discovery.ClassifyHoldings(ctx, works, system.Holdings); warning != "" {
+			log.Printf("warning: %s", warning)
+		}
+	} else {
+		var lookup discovery.OwnershipLookup
+		if system.Zotio != nil {
+			lookup = system.Zotio
+		}
+		if warning := discovery.ClassifyOwnership(ctx, works, lookup); warning != "" {
+			log.Printf("warning: %s", warning)
+		}
 	}
 	return marshal(works)
 }

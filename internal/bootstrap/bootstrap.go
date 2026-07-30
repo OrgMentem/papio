@@ -8,6 +8,7 @@ package bootstrap
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"papio/internal/app"
@@ -25,6 +26,8 @@ import (
 	"papio/internal/hook"
 	"papio/internal/job"
 	"papio/internal/notify"
+	"papio/internal/ownership"
+	"papio/internal/ownershipsnapshot"
 	"papio/internal/pdf"
 	"papio/internal/preview"
 	"papio/internal/resolver"
@@ -66,9 +69,12 @@ type System struct {
 	Watches       *watch.Store
 	WatchRunner   *watch.Runner
 	Zotio         *zotio.Service
-	Updates       *update.Checker
-	Retractions   *retraction.Sentinel
-	Triage        *triage.Service
+	// Holdings answers ownership for users without zotio; empty when zotio owns
+	// the answer or no generic source is configured.
+	Holdings    *ownership.Registry
+	Updates     *update.Checker
+	Retractions *retraction.Sentinel
+	Triage      *triage.Service
 }
 
 const autoImportRetryBackoff = 2 * time.Second
@@ -235,12 +241,32 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 		ExceptionTags:      cfg.Zotio.ExceptionTags,
 		UnavailableRecheck: time.Duration(cfg.Zotio.UnavailableRecheckDays) * 24 * time.Hour,
 	}
+	holdings := ownership.NewRegistry()
 	if strings.TrimSpace(cfg.Zotio.Executable) != "" {
 		// zotio is optional: an empty executable disables the deep Zotero
-		// integration (auto-import, plan/apply, queue) while ownership lookup
-		// degrades to not-owned and hooks remain the generic hand-off seam.
+		// integration (auto-import, plan/apply, queue) while hooks remain the
+		// generic hand-off seam.
 		zotioService.CLI = zotio.New(cfg.Zotio)
 		service.AutoImporter = newSerialAutoImporter(zotioService)
+	} else {
+		// Generic holdings sources answer ownership only when zotio is absent.
+		// Mixing them is deliberately out of scope (ADR-0008): "make this Zotero
+		// item complete" and "do I hold a PDF anywhere?" are different questions,
+		// and without an explicit lookup purpose there is no correct way to
+		// reconcile a zotio parent that lacks a PDF with another library that has
+		// one. When zotio is configured, its behaviour is untouched.
+		providers := make([]ownership.Provider, 0, len(cfg.Library.Sources))
+		for _, source := range cfg.Library.Sources {
+			provider, err := ownershipsnapshot.NewProvider(source, time.Now)
+			if err != nil {
+				// Config validation already rejects unusable sources, so this is a
+				// programming error rather than user input; failing startup keeps a
+				// half-configured registry from silently answering lookups.
+				return nil, fmt.Errorf("library source %q: %w", source.Name, err)
+			}
+			providers = append(providers, provider)
+		}
+		holdings = ownership.NewRegistry(providers...)
 	}
 	service.ReadyHook = &hook.Runner{
 		Command: cfg.Hooks.OnReady,
@@ -250,6 +276,7 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 	watchRunner := &watch.Runner{
 		Store: watches, Discovery: discoveryClient, Lookup: zotioService, Submitter: service,
 		Backfill: zotioService, Notifier: watchNotifier, DataDir: cfg.DataDir,
+		Holdings: holdings,
 	}
 	var retractions *retraction.Sentinel
 	if policy := cfg.SourcePolicy(config.SourceRetractionWatch); policy.Enabled {
@@ -293,6 +320,7 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 		Preview:       previewServer,
 		Discovery:     discoveryClient,
 		Zotio:         zotioService,
+		Holdings:      holdings,
 		Updates:       updates,
 		Retractions:   retractions,
 		Triage:        triageService,

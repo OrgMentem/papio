@@ -496,8 +496,16 @@ func acquireBatch(ctx context.Context, cmd *cobra.Command, opt *options, path st
 	if err := starter.Ensure(ctx); err != nil {
 		return err
 	}
+	// The CLI decides which ownership authority applies, because only it has the
+	// config: generic holdings sources answer exactly when zotio does not.
+	useHoldings := strings.TrimSpace(cfg.Zotio.Executable) == "" && len(cfg.Library.Sources) > 0
+	libraryFingerprint := ""
+	if useHoldings {
+		libraryFingerprint = cfg.LibraryFingerprint()
+	}
 	output, submitErr := batch.Submit(ctx, socketBatchCaller{opt: opt, socket: socket}, cfg.DataDir, requests, batch.SubmitOptions{
 		AutoImport: autoImport, Collection: collection, Resolver: resolver, Label: label, IncludeOwned: includeOwned,
+		Holdings: useHoldings, LibraryFingerprint: libraryFingerprint,
 	})
 	if output == nil {
 		return submitErr

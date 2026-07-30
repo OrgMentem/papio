@@ -5,6 +5,9 @@
 package config
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/url"
@@ -16,6 +19,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"papio/internal/bibparse"
 
 	toml "github.com/pelletier/go-toml/v2"
 )
@@ -205,6 +210,53 @@ type Hooks struct {
 	TimeoutSeconds int `toml:"timeout_seconds"`
 }
 
+// Library declares the libraries papio may consult to answer "do I already hold
+// this paper?" for users who do not run Zotero. See ADR-0008: a source emits
+// only positive holdings claims, and a source papio cannot read makes the answer
+// *incomplete* rather than negative — suppressing an acquisition on a failed
+// lookup would silently withhold a paper the user asked for.
+type Library struct {
+	Sources []LibrarySource `toml:"sources"`
+}
+
+// LibrarySource is one holdings feed.
+type LibrarySource struct {
+	// Name identifies the source in health reporting and doctor output. It must
+	// be unique: it is the only handle a user has on one feed among several.
+	Name string `toml:"name"`
+	// Kind is "file" — the only v1 loader. A command loader and a PDF-folder
+	// scanner are planned (ADR-0008), so the field exists to keep the config
+	// shape final; unknown kinds are rejected rather than ignored.
+	Kind string `toml:"kind"`
+	// Path is the bibliographic export to read, for kind = "file".
+	Path string `toml:"path"`
+	// Format names the encoding: bibtex, ris, csl-json, or nbib. Empty means
+	// detect from the path and content.
+	Format string `toml:"format"`
+	// Claim is what this source asserts about every record it emits:
+	// "pdf_present" (entries whose full text you hold, so a match may suppress
+	// acquisition) or "record_present" (citations only, which may annotate search
+	// results but must never suppress). There is deliberately no default:
+	// guessing would let papio skip acquisitions a source never vouched for. papio
+	// also does not infer this from per-manager attachment fields (BibTeX `file`,
+	// papis `files`, CSL `note`) — that is manager convention knowledge this
+	// abstraction must not carry, and CSL `note` is free text, not a contract.
+	Claim string `toml:"claim"`
+}
+
+// Claim values for LibrarySource.Claim.
+const (
+	LibraryClaimPDFPresent    = "pdf_present"
+	LibraryClaimRecordPresent = "record_present"
+)
+
+// LibraryKindFile is the only source kind v1 implements.
+const LibraryKindFile = "file"
+
+// MaxLibrarySources bounds per-lookup work: every configured source is consulted
+// on every search, batch, and watch pass.
+const MaxLibrarySources = 8
+
 // Discovery selects which discovery backends serve search and watches, in
 // merge-preference order. Empty means OpenAlex only (the historical default).
 // Per-backend API keys and dev base URLs live in the existing [sources] map
@@ -230,12 +282,44 @@ type Config struct {
 	Zotio      Zotio             `toml:"zotio"`
 	Notify     Notify            `toml:"notify"`
 	Hooks      Hooks             `toml:"hooks"`
+	Library    Library           `toml:"library"`
 	Updates    Updates           `toml:"updates"`
 	Discovery  Discovery         `toml:"discovery"`
 	Sources    map[string]Source `toml:"sources"`
 
 	// Path this config was loaded from ("" for defaults).
 	Path string `toml:"-"`
+}
+
+// LibraryFingerprint identifies the normalized generic holdings sources. It is
+// stable across declaration order and changes whenever a source's semantics do.
+// An empty library has no generic source fingerprint.
+func (c Config) LibraryFingerprint() string {
+	if len(c.Library.Sources) == 0 {
+		return ""
+	}
+
+	sources := slices.Clone(c.Library.Sources)
+	slices.SortFunc(sources, func(a, b LibrarySource) int {
+		return strings.Compare(a.Name, b.Name)
+	})
+
+	hash := sha256.New()
+	var length [8]byte
+	for _, source := range sources {
+		for _, value := range [...]string{
+			source.Name,
+			source.Kind,
+			normalizeLibrarySourcePath(source.Path),
+			source.Format,
+			source.Claim,
+		} {
+			binary.BigEndian.PutUint64(length[:], uint64(len(value)))
+			_, _ = hash.Write(length[:])
+			_, _ = hash.Write([]byte(value))
+		}
+	}
+	return hex.EncodeToString(hash.Sum(nil))
 }
 
 // Dir returns the papio config directory, honoring PAPIO_CONFIG_DIR for tests.
@@ -346,6 +430,20 @@ func expandHome(p string) string {
 	return p
 }
 
+func normalizeLibrarySourcePath(path string) string {
+	if path == "~" {
+		if home, err := os.UserHomeDir(); err == nil {
+			return home
+		}
+		return path
+	}
+	path = expandHome(path)
+	if filepath.IsAbs(path) {
+		return filepath.Clean(path)
+	}
+	return path
+}
+
 func (c *Config) validate() error {
 	switch c.AccessMode {
 	case "", ModeConservative, ModeAssisted, ModeDelegated:
@@ -442,6 +540,9 @@ func (c *Config) validate() error {
 	if c.Hooks.OnReady != "" && (c.Hooks.TimeoutSeconds < 5 || c.Hooks.TimeoutSeconds > 600) {
 		return fmt.Errorf("hooks.timeout_seconds must be in 5..600")
 	}
+	if err := c.validateLibrary(); err != nil {
+		return err
+	}
 	seenDiscovery := map[string]bool{}
 	for _, name := range c.Discovery.Sources {
 		if name != SourceOpenAlex && name != SourceSemanticScholar {
@@ -451,6 +552,57 @@ func (c *Config) validate() error {
 			return fmt.Errorf("discovery.sources lists %q twice", name)
 		}
 		seenDiscovery[name] = true
+	}
+	return nil
+}
+
+// validateLibrary is fail-closed on every field. A misconfigured holdings source
+// must be a startup error, not a silently degraded one: the failure mode of a
+// source papio half-understands is suppressing an acquisition the user wanted.
+func (c *Config) validateLibrary() error {
+	if len(c.Library.Sources) > MaxLibrarySources {
+		return fmt.Errorf("library.sources lists %d sources, maximum %d", len(c.Library.Sources), MaxLibrarySources)
+	}
+	seen := make(map[string]bool, len(c.Library.Sources))
+	for i, source := range c.Library.Sources {
+		if source.Name == "" {
+			return fmt.Errorf("library.sources[%d].name is required", i)
+		}
+		if strings.TrimSpace(source.Name) != source.Name {
+			return fmt.Errorf("library.sources[%d].name must not have surrounding whitespace", i)
+		}
+		name := source.Name
+		if seen[name] {
+			return fmt.Errorf("library.sources lists name %q twice", name)
+		}
+		seen[name] = true
+		switch source.Kind {
+		case LibraryKindFile:
+			source.Path = normalizeLibrarySourcePath(source.Path)
+			c.Library.Sources[i].Path = source.Path
+			if strings.TrimSpace(source.Path) == "" {
+				return fmt.Errorf("library.sources[%q].path is required for kind %q", name, LibraryKindFile)
+			}
+			if !filepath.IsAbs(source.Path) {
+				return fmt.Errorf("library.sources[%q].path must be absolute", name)
+			}
+		case "":
+			return fmt.Errorf("library.sources[%q].kind is required (%q)", name, LibraryKindFile)
+		default:
+			return fmt.Errorf("library.sources[%q].kind %q is not supported (only %q in v1; command sources are planned for v1.1)", name, source.Kind, LibraryKindFile)
+		}
+		switch source.Format {
+		case "", string(bibparse.FormatBibTeX), string(bibparse.FormatRIS), string(bibparse.FormatCSLJSON), string(bibparse.FormatNBIB):
+		default:
+			return fmt.Errorf("library.sources[%q].format %q must be empty or one of %s, %s, %s, %s",
+				name, source.Format,
+				bibparse.FormatBibTeX, bibparse.FormatRIS, bibparse.FormatCSLJSON, bibparse.FormatNBIB)
+		}
+		switch source.Claim {
+		case LibraryClaimPDFPresent, LibraryClaimRecordPresent:
+		default:
+			return fmt.Errorf("library.sources[%q].claim must be %q or %q", name, LibraryClaimPDFPresent, LibraryClaimRecordPresent)
+		}
 	}
 	return nil
 }

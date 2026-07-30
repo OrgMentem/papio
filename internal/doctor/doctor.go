@@ -13,10 +13,12 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"papio/internal/browser"
 	"papio/internal/config"
 	"papio/internal/discovery"
+	"papio/internal/ownership"
 	"papio/internal/pdf"
 	"papio/internal/store"
 	"papio/internal/update"
@@ -329,6 +331,26 @@ type IntegrationDependencies struct {
 	ZotioPreflight         func(context.Context, config.Config) (*zotio.PreflightResult, error)
 	CheckUpdates           func(context.Context, config.Config) (*update.Info, error)
 	CheckZotioUpdates      func(context.Context, config.Config) (*update.Info, error)
+	// LibrarySources probes the configured generic holdings sources. A nil
+	// function is an unavailable probe facility, reported as a bounded Skip when
+	// sources are configured.
+	LibrarySources func(context.Context, config.Config) ([]LibrarySourceStatus, error)
+}
+
+// LibrarySourceStatus is one holdings source's standing state, as probed for
+// diagnostics.
+//
+// This is *only* diagnostics. Runtime completeness travels in the ownership
+// lookup result itself (ADR-0008 invariant 1), because a caller deciding whether
+// "no match" means "not held" needs the answer at decision time, not from a
+// command the user may never run. Do not delete the in-result health on the
+// grounds that doctor reports it.
+type LibrarySourceStatus struct {
+	Name        string
+	Complete    bool
+	EntryCount  int
+	LastSuccess time.Time
+	FailureCode string
 }
 
 // RunIntegration checks the daemon, browser extension, native-host manifests,
@@ -415,6 +437,8 @@ func RunIntegration(ctx context.Context, deps IntegrationDependencies) Report {
 	}
 
 	runManifestChecks(cfg, deps, add)
+
+	runLibraryChecks(ctx, cfg, deps, add)
 
 	if strings.TrimSpace(cfg.Zotio.Executable) == "" {
 		add("zotio", Skip, "not configured (optional — Zotero import disabled)", "")
@@ -505,6 +529,91 @@ func runZotioUpdateCheck(ctx context.Context, cfg config.Config, deps Integratio
 
 func integrationDependenciesComplete(deps IntegrationDependencies) bool {
 	return deps.CLIVersion != "" && deps.LoadConfig != nil && deps.DaemonStatus != nil && deps.ManifestDir != nil && deps.FirefoxDir != nil && deps.ReadFile != nil && deps.ZotioPreflight != nil
+}
+
+// runLibraryChecks reports one check per configured holdings source. It is the
+// wire-safe way to surface daemon-side state: a new doctor check adds an element
+// to a list an existing result already carries, where widening any RPC result
+// would make an older CLI reject every response.
+func runLibraryChecks(ctx context.Context, cfg config.Config, deps IntegrationDependencies, add func(string, string, string, string)) {
+	if len(cfg.Library.Sources) == 0 {
+		add("library", Skip, "not configured (optional — non-Zotero de-duplication disabled)", "")
+		return
+	}
+	if deps.LibrarySources == nil {
+		add("library", Skip,
+			"configured library sources were not probed because this doctor invocation has no library probe",
+			"run 'papio doctor' through the papio CLI; if it persists, reinstall papio")
+		return
+	}
+	statuses, err := deps.LibrarySources(ctx, cfg)
+	if err != nil {
+		add("library", Fail, "library source probe failed", "check library.sources in the configuration, then rerun papio doctor")
+		return
+	}
+	byName := make(map[string]LibrarySourceStatus, len(statuses))
+	for _, status := range statuses {
+		byName[status.Name] = status
+	}
+	for _, source := range cfg.Library.Sources {
+		name := "library_source:" + source.Name
+		status, ok := byName[source.Name]
+		if !ok {
+			add(name, Fail, "source was not probed", "rerun papio doctor; if it persists, report it")
+			continue
+		}
+		if !status.Complete {
+			detail := "could not be read: " + libraryFailureReason(status.FailureCode)
+			// A source that has never loaded cannot suppress anything, which is
+			// safe; say so, because the user's real question is "why is nothing
+			// being skipped?".
+			if status.LastSuccess.IsZero() {
+				detail += "; never loaded, so nothing is de-duplicated against it"
+			}
+			add(name, Fail, detail, "check the path and format of library.sources."+source.Name)
+			continue
+		}
+		entries := "entries"
+		if status.EntryCount == 1 {
+			entries = "entry"
+		}
+		detail := fmt.Sprintf("%d %s, claim %s", status.EntryCount, entries, source.Claim)
+		if !status.LastSuccess.IsZero() {
+			detail += fmt.Sprintf(", read %s ago", time.Since(status.LastSuccess).Round(time.Second))
+		}
+		if status.EntryCount == 0 {
+			// Valid and empty is a real state, distinct from unreadable; flag it
+			// as a warning because it is usually a mistargeted path.
+			add(name, Warn, detail+"; nothing to match against", "confirm this export is the library you meant")
+			continue
+		}
+		add(name, Pass, detail, "")
+	}
+}
+
+// libraryFailureReason turns a bounded failure code into something a user can
+// act on. The codes stay bounded on purpose: a provider inherits the daemon
+// environment, so its raw output can carry credentials and never reaches a
+// durable report.
+func libraryFailureReason(code string) string {
+	switch code {
+	case ownership.FailureUnreadable:
+		return "the file is missing or unreadable"
+	case ownership.FailureParse:
+		return "the file could not be parsed; the previous contents are still in use"
+	case ownership.FailureTruncated:
+		return "the file is larger than papio will read"
+	case ownership.FailureCountCollapse:
+		return "the entry count collapsed, which usually means a truncated write; the previous contents are still in use"
+	case ownership.FailureTimeout, ownership.FailureExit:
+		return "the source did not answer in time"
+	case ownership.FailureNotConfigured:
+		return "the source is not usable as configured"
+	case "":
+		return "no reason was reported"
+	default:
+		return code
+	}
 }
 
 func runManifestChecks(cfg config.Config, deps IntegrationDependencies, add func(string, string, string, string)) {

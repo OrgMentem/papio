@@ -1,21 +1,23 @@
 # *papio*
 
-**A local tool that finds scholarly papers and files validated PDFs into your Zotero library.** Search for works, queue them for acquisition, check every PDF is the paper you asked for, and hand it to your library — from the terminal or from a coding agent.
+**A local tool that finds scholarly papers and offers validated PDFs toward your reference library.** Search for works, queue them for acquisition, check every PDF is the paper you asked for, and offer it toward your library — from the terminal or from a coding agent.
 
-Finding a paper is easy; *legitimately getting* it and landing a validated PDF in your library is the tedious part. `papio` handles that: it finds works on OpenAlex, tries open-access and licensed sources first, falls back to a visible pass in your own browser only when needed, checks every candidate before you trust it, and writes to Zotero only through `zotio`, which shows you a preview first. It does **not** handle institution logins, two-factor codes, CAPTCHAs, or bulk-downloading from subscription databases — those stay your decisions in your ordinary browser.
+Zotero users get preview-first import through [zotio](https://github.com/OrgMentem/zotio). papis, Calibre, plain-folder, and roll-your-own-script users get a best-effort handoff through a one-line [`on_ready` hook](guide/hooks.md); hook failures never fail or retry the acquisition job.
+
+Finding a paper is easy; *legitimately getting* it and preparing a validated PDF for your library is the tedious part. `papio` handles that: it finds works on OpenAlex, tries open-access and licensed sources first, falls back to a visible pass in your own browser only when needed, checks every candidate before you trust it, and then offers what survives — into Zotero through `zotio`, which shows you a preview first, or elsewhere through a best-effort `on_ready` handoff. It does **not** handle institution logins, two-factor codes, CAPTCHAs, or bulk-downloading from subscription databases — those stay your decisions in your ordinary browser.
 
 ## How it works
 
 Every request becomes a job. `papio` ranks the possible sources and tries them in order — it never just grabs the first URL it finds:
 
-![papio acquisition pipeline: you or an agent drive papio's jobs; open sources run before your own browser via the papio extension (installed once), where login, MFA, and CAPTCHA stay human; both paths converge in quarantine and PDF validation, producing a validated bundle with provenance that reaches the Zotero library through zotio preview-then-apply](assets/architecture.svg#only-light)
-![papio acquisition pipeline: you or an agent drive papio's jobs; open sources run before your own browser via the papio extension (installed once), where login, MFA, and CAPTCHA stay human; both paths converge in quarantine and PDF validation, producing a validated bundle with provenance that reaches the Zotero library through zotio preview-then-apply](assets/architecture-dark.svg#only-dark)
+![papio acquisition pipeline: you or an agent drive papio's jobs; open sources run before your own browser via the papio extension (installed once), where login, MFA, and CAPTCHA stay human; both paths converge in quarantine and PDF validation, producing a validated bundle with provenance; Zotero uses zotio preview-then-apply, while other destinations receive a best-effort on_ready handoff](assets/architecture.svg#only-light)
+![papio acquisition pipeline: you or an agent drive papio's jobs; open sources run before your own browser via the papio extension (installed once), where login, MFA, and CAPTCHA stay human; both paths converge in quarantine and PDF validation, producing a validated bundle with provenance; Zotero uses zotio preview-then-apply, while other destinations receive a best-effort on_ready handoff](assets/architecture-dark.svg#only-dark)
 
-1. **Discover.** `papio search` returns read-only OpenAlex results and marks works already in your zotio library.
+1. **Discover.** `papio search` returns read-only OpenAlex results and, when zotio or a configured `library.sources` authority is available, marks works already in your library; without either, results are unowned/unclassified.
 2. **Acquire.** A batch (up to 50 works) or a single work becomes jobs, each with a stable ID, so running the same request again is safe and won't duplicate.
 3. **Find & download.** Open-access and licensed sources are tried before institutional access; each candidate is downloaded under strict size and time limits, then held in quarantine.
 4. **Validate.** Every PDF must pass checks on its structure, its identity, and — if needed — a text scan before it is trusted; anything ambiguous waits in `needs_review`.
-5. **Hand off.** Finished PDFs reach Zotero **only** through `zotio` — `papio zotio plan` shows you exactly what will change, and `papio zotio apply` only runs after you confirm it.
+5. **File.** Validated PDFs use Zotero's `zotio` preview-and-confirmation path. Filing anywhere else — papis, Calibre, a plain folder, your own script — is a best-effort [`on_ready` hook](guide/hooks.md) handoff; hook failures never fail or retry the acquisition job.
 
 | Stage | Source / tooling | Handles credentials? |
 |---|---|---|
@@ -23,7 +25,7 @@ Every request becomes a job. `papio` ranks the possible sources and tries them i
 | **Download — open** | arXiv · Europe PMC · Unpaywall · OpenAlex · CORE · Crossref TDM | No (API keys only where configured) |
 | **Download — institutional** | OpenURL handoff in your ordinary browser session | No — login/2FA/CAPTCHA stay human |
 | **Validation** | Local PDF structure + identity + OCR (Poppler, Tesseract) | No |
-| **Zotero writes** | `zotio` — preview (`plan`) then confirmed `apply` | No — `papio` never stores Zotero credentials |
+| **Library filing** | `zotio` — preview (`plan`) then confirmed `apply` for Zotero · best-effort `on_ready` handoff for papis, a folder, or your own script; hook failures never fail or retry the job | No — `papio` never stores Zotero credentials |
 
 `papio` runs in one of three access modes — `conservative`, `assisted`, or `delegated`. A fresh `papio init` chooses `conservative`; institutional handoff opens a browser only under `assisted`/`delegated`, and even then automation stays inside legitimate, user-authorized access.
 
@@ -34,6 +36,7 @@ papio init                                                   # guided setup: con
 papio doctor                                                 # verify readiness: sources, PDF tools, zotio
 papio search "appropriate reliance on AI" --limit 20 --year-from 2023
 papio acquire 10.1371/journal.pone.0262026 --auto-import --wait
+papio acquire --batch refs.bib                               # or RIS, CSL-JSON, NBIB — start from the library you already have
 papio status --follow                                        # working / awaiting-human / needs-review / ready / failed
 papio actions list                                           # open browser handoffs and identity reviews
 ```
@@ -48,6 +51,7 @@ New here? Start with the [user guide](guide/user-guide.md), then tune policy in 
 
 - **[Getting started](guide/getting-started.md)** — prerequisites, `papio init`, and your first acquisition end to end.
 - **[User guide](guide/user-guide.md)** — the research workflow: discover, acquire in batches, follow jobs, complete a browser pass, and resolve identity reviews.
+- **[Filing: Zotero, papis & more](guide/hooks.md)** — where validated PDFs are offered: the zotio/Zotero preview boundary, and the best-effort `on_ready` hook for papis, Calibre, a plain folder, or your own script.
 - **[Use in a coding agent](guide/agent-skill.md)** — drive *papio* over MCP (`papio mcp`): the canonical acquisition loop and its safety semantics.
 - **[Access modes & safety](concepts/access-modes.md)** — `conservative` / `assisted` / `delegated` and the non-negotiable product and safety boundaries.
 - **[Acquisition pipeline](concepts/acquisition-pipeline.md)** — the order *papio* tries sources, how candidates are ranked, job states, and download limits.

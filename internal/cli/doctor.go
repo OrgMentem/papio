@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -16,6 +17,7 @@ import (
 
 	"papio/internal/config"
 	"papio/internal/doctor"
+	"papio/internal/ownershipsnapshot"
 	"papio/internal/update"
 	"papio/internal/zotio"
 )
@@ -56,7 +58,36 @@ func defaultDoctorDependencies(opt *options) doctor.IntegrationDependencies {
 		CheckZotioUpdates: func(ctx context.Context, cfg config.Config) (*update.Info, error) {
 			return update.NewZotio(cfg.DataDir).Check(ctx)
 		},
+		LibrarySources: probeLibrarySources,
 	}
+}
+
+// probeLibrarySources reads each configured holdings source for diagnostics.
+// It builds throwaway providers rather than asking the daemon, because the
+// sources are local files and no existing RPC result can carry the answer
+// without breaking an older CLI (see AGENTS.md on the fail-closed IPC layer).
+// The cost is re-reading the exports, which is acceptable for a command a user
+// runs deliberately.
+func probeLibrarySources(ctx context.Context, cfg config.Config) ([]doctor.LibrarySourceStatus, error) {
+	statuses := make([]doctor.LibrarySourceStatus, 0, len(cfg.Library.Sources))
+	for _, source := range cfg.Library.Sources {
+		provider, err := ownershipsnapshot.NewProvider(source, time.Now)
+		if err != nil {
+			statuses = append(statuses, doctor.LibrarySourceStatus{Name: source.Name, FailureCode: "not_configured"})
+			continue
+		}
+		// A lookup with no queries still refreshes the index and reports health,
+		// which is exactly the diagnostic we want and costs no matching.
+		_, health := provider.Lookup(ctx, nil)
+		statuses = append(statuses, doctor.LibrarySourceStatus{
+			Name:        health.Name,
+			Complete:    health.Complete,
+			EntryCount:  health.EntryCount,
+			LastSuccess: health.LastSuccess,
+			FailureCode: health.FailureCode,
+		})
+	}
+	return statuses, nil
 }
 
 func daemonReadinessDoctor(opt *options, daemonErr *error) doctorReadinessRunner {

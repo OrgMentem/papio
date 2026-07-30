@@ -5,10 +5,13 @@ package batch
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"sync"
 	"testing"
 
+	"papio/internal/ipc"
+	"papio/internal/ownership"
 	"papio/internal/protocol"
 	"papio/internal/zotio"
 )
@@ -33,9 +36,7 @@ func (c resolverBatchCaller) Call(_ context.Context, method string, params, resu
 		}
 		result.(*submitResult).JobID = "job-resolver-profile"
 	case "jobs.get":
-		result.(*jobDetail).Job = &struct {
-			State string `json:"state"`
-		}{State: "queued"}
+		result.(*jobDetail).Job = json.RawMessage(`{"id":"job-x","state":"queued"}`)
 	default:
 		return fmt.Errorf("unexpected method %q", method)
 	}
@@ -78,13 +79,98 @@ func (c *collectionBatchCaller) Call(_ context.Context, method string, params, r
 		c.mu.Unlock()
 		result.(*submitResult).JobID = "job-collection-default"
 	case "jobs.get":
-		result.(*jobDetail).Job = &struct {
-			State string `json:"state"`
-		}{State: "queued"}
+		result.(*jobDetail).Job = json.RawMessage(`{"id":"job-x","state":"queued"}`)
 	default:
 		return fmt.Errorf("unexpected method %q", method)
 	}
 	return nil
+}
+
+type fingerprintBatchCaller struct {
+	mu                  sync.Mutex
+	expectedFingerprint string
+	lookupErr           error
+	methods             []string
+}
+
+func (c *fingerprintBatchCaller) Call(_ context.Context, method string, params, result any) error {
+	c.mu.Lock()
+	c.methods = append(c.methods, method)
+	c.mu.Unlock()
+
+	switch method {
+	case "library.lookup_works":
+		request := params.(libraryLookupParams)
+		if request.ExpectedFingerprint != c.expectedFingerprint {
+			return fmt.Errorf("expected fingerprint = %q, got %q", c.expectedFingerprint, request.ExpectedFingerprint)
+		}
+		if c.lookupErr != nil {
+			return c.lookupErr
+		}
+		result.(*ownership.Result).Works = make([]ownership.WorkResult, len(request.Works))
+	case "zotio.lookup_works":
+		request := params.(zotio.LookupWorksRequest)
+		result.(*zotio.LookupWorksResult).Works = make([]zotio.WorkOwnership, len(request.Works))
+		for i := range request.Works {
+			result.(*zotio.LookupWorksResult).Works[i].Status = zotio.OwnershipNotOwned
+		}
+	case "acquire.submit":
+		result.(*submitResult).JobID = "job-fingerprint"
+	case "jobs.get":
+		result.(*jobDetail).Job = json.RawMessage(`{"id":"job-fingerprint","state":"queued"}`)
+	default:
+		return fmt.Errorf("unexpected method %q", method)
+	}
+	return nil
+}
+
+func (c *fingerprintBatchCaller) called(method string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, called := range c.methods {
+		if called == method {
+			return true
+		}
+	}
+	return false
+}
+
+func TestSubmitBindsHoldingsLookupToFingerprint(t *testing.T) {
+	caller := &fingerprintBatchCaller{expectedFingerprint: "library-fingerprint"}
+	output, err := Submit(context.Background(), caller, t.TempDir(),
+		[]protocol.WorkRequest{doiWork("batch-fingerprint", "10.1000/fingerprint")},
+		SubmitOptions{Holdings: true, LibraryFingerprint: "library-fingerprint"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(output.Submitted) != 1 {
+		t.Fatalf("Submitted = %+v, want one job", output.Submitted)
+	}
+	if !caller.called("library.lookup_works") {
+		t.Fatal("generic holdings lookup was not called")
+	}
+}
+
+func TestSubmitDoesNotFallbackOnLibraryPreconditionFailure(t *testing.T) {
+	caller := &fingerprintBatchCaller{
+		expectedFingerprint: "library-fingerprint",
+		lookupErr:           &ipc.RemoteError{Code: "precondition_failed", Message: "library configuration does not match caller"},
+	}
+	output, err := Submit(context.Background(), caller, t.TempDir(),
+		[]protocol.WorkRequest{doiWork("batch-fingerprint-mismatch", "10.1000/fingerprint-mismatch")},
+		SubmitOptions{Holdings: true, LibraryFingerprint: "library-fingerprint"})
+	if err == nil {
+		t.Fatal("library precondition failure must stop the batch")
+	}
+	if output != nil {
+		t.Fatalf("output = %+v, want nil after precondition failure", output)
+	}
+	if caller.called("zotio.lookup_works") {
+		t.Fatal("a library precondition failure must not use the unknown-method fallback")
+	}
+	if caller.called("acquire.submit") {
+		t.Fatal("a library precondition failure must not create jobs")
+	}
 }
 
 func doiWork(requestID, doi string) protocol.WorkRequest {

@@ -1,4 +1,4 @@
-package ingest
+package bibparse
 
 import (
 	"fmt"
@@ -59,7 +59,7 @@ func parseNBIB(data []byte) ([]Record, error) {
 	flush()
 
 	if len(records) == 0 {
-		return nil, fmt.Errorf("nbib: no records found")
+		return nil, noEntries("nbib: no records found")
 	}
 	return records, nil
 }

@@ -1,6 +1,7 @@
-package ingest
+package bibparse
 
 import (
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
@@ -86,9 +87,10 @@ func TestParseCSLJSON(t *testing.T) {
 
 func TestParseCSLJSONErrors(t *testing.T) {
 	tests := []struct {
-		name string
-		data string
-		want string
+		name          string
+		data          string
+		want          string
+		wantNoEntries bool
 	}{
 		{
 			name: "top level object",
@@ -96,9 +98,35 @@ func TestParseCSLJSONErrors(t *testing.T) {
 			want: "csl-json: expected a top-level array of items",
 		},
 		{
-			name: "empty array",
-			data: "[]",
-			want: "csl-json: no items found",
+			name: "null is not an array",
+			data: "null",
+			want: "csl-json: expected a top-level array of items",
+		},
+		{
+			name: "scalar is not an array",
+			data: "true",
+			want: "csl-json: expected a top-level array of items",
+		},
+		{
+			name:          "empty array",
+			data:          "[]",
+			want:          "csl-json: no items found",
+			wantNoEntries: true,
+		},
+		{
+			name: "null array item is structural error",
+			data: "[null]",
+			want: "csl-json: item 0: expected an object",
+		},
+		{
+			name: "scalar array item is structural error",
+			data: `[1]`,
+			want: "csl-json: item 0: expected an object",
+		},
+		{
+			name: "mixed array is structural error",
+			data: `[{"title":"valid"}, null]`,
+			want: "csl-json: item 1: expected an object",
 		},
 		{
 			name: "malformed json",
@@ -115,6 +143,9 @@ func TestParseCSLJSONErrors(t *testing.T) {
 			}
 			if !strings.Contains(err.Error(), tt.want) {
 				t.Errorf("parseCSLJSON() error = %q, want substring %q", err, tt.want)
+			}
+			if got := errors.Is(err, ErrNoEntries); got != tt.wantNoEntries {
+				t.Errorf("errors.Is(err, ErrNoEntries) = %t, want %t", got, tt.wantNoEntries)
 			}
 		})
 	}

@@ -5,6 +5,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"reflect"
 	"strings"
@@ -172,6 +173,48 @@ func TestBatchAcceptsResolverFlag(t *testing.T) {
 	}
 	if err := validateBatchFlags(command, nil, false, false); err != nil {
 		t.Fatalf("--batch rejected --resolver: %v", err)
+	}
+}
+
+func TestAcquireBatchPassesLoadedLibraryFingerprint(t *testing.T) {
+	var out, errOut bytes.Buffer
+	cfg := config.Config{
+		DataDir: t.TempDir(),
+		Library: config.Library{Sources: []config.LibrarySource{{
+			Name: "papers", Kind: config.LibraryKindFile, Path: "/library/papers.bib", Claim: config.LibraryClaimPDFPresent,
+		}}},
+	}
+	var gotFingerprint string
+	root := NewInProcessRoot(&out, &errOut, cfg, func(_ context.Context, method string, params, result any) error {
+		switch method {
+		case "library.lookup_works":
+			data, err := json.Marshal(params)
+			if err != nil {
+				return err
+			}
+			var request struct {
+				ExpectedFingerprint string `json:"expected_fingerprint"`
+			}
+			if err := json.Unmarshal(data, &request); err != nil {
+				return err
+			}
+			gotFingerprint = request.ExpectedFingerprint
+			return json.Unmarshal([]byte(`{"works":[{}]}`), result)
+		case "acquire.submit":
+			return json.Unmarshal([]byte(`{"job_id":"job-library-fingerprint"}`), result)
+		case "jobs.get":
+			return json.Unmarshal([]byte(`{"job":{"state":"queued"}}`), result)
+		default:
+			return fmt.Errorf("unexpected method %q", method)
+		}
+	})
+	root.SetIn(strings.NewReader(`{"doi":"10.1000/library-fingerprint"}`))
+	root.SetArgs([]string{"acquire", "--batch", "-"})
+	if err := root.ExecuteContext(context.Background()); err != nil {
+		t.Fatalf("acquire --batch: %v (%s)", err, errOut.String())
+	}
+	if gotFingerprint != cfg.LibraryFingerprint() {
+		t.Fatalf("library lookup fingerprint = %q, want %q", gotFingerprint, cfg.LibraryFingerprint())
 	}
 }
 

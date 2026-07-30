@@ -8,9 +8,16 @@
 
 <p align="center">
   <strong>
-    Fill the missing PDFs in your
-    <a href="https://www.zotero.org/">Zotero</a> library — and keep it that way
+    Fill the missing PDFs in your reference library — and keep it that way
   </strong>
+</p>
+
+<p align="center">
+  <a href="https://www.zotero.org/">Zotero</a> via
+  <a href="https://github.com/OrgMentem/zotio">zotio</a>
+  &middot; <a href="https://github.com/papis/papis">papis</a>
+  &middot; a plain folder
+  &middot; your own script
 </p>
 
 <p align="center">
@@ -60,9 +67,10 @@
   visible institutional pass in your own browser only when needed. Watch a
   collection and new matches arrive with verified full text; or hand the loop
   to a research agent over MCP — without handing it your university
-  credentials. Every PDF is validated before it reaches Zotero through
-  <a href="https://github.com/OrgMentem/zotio">zotio</a>'s
-  preview-and-confirmation boundary.
+  credentials. Every PDF is validated before <code>papio</code> offers it for
+  filing: Zotero uses <a href="https://github.com/OrgMentem/zotio">zotio</a>'s
+  preview-and-confirmation boundary; other destinations receive a best-effort
+  handoff through a one-line <code>on_ready</code> hook.
 </p>
 
 ```bash
@@ -71,6 +79,7 @@ papio init                                                # guided setup: config
 papio doctor                                              # checks the whole chain, including the browser extension and zotio
 papio search "appropriate reliance on AI" --limit 20 --year-from 2023
 papio acquire 10.1371/journal.pone.0262026 --auto-import --wait
+papio acquire --batch refs.bib                            # or RIS, CSL-JSON, NBIB — start from the library you already have
 papio status --follow                                     # working / awaiting-human / needs-review / ready / failed
 papio actions list                                        # open browser handoffs and identity reviews
 ```
@@ -99,9 +108,12 @@ crossed.
   structure, identity, and an OCR fallback. Ambiguous identity parks in
   `needs_review` for a human verdict instead of silently importing the wrong
   paper.
-- **Zotero writes only through zotio.** `papio zotio plan` produces an
-  immutable preview; `papio zotio apply` requires that preview's exact
-  confirmation SHA-256. `papio` never touches Zotero credentials.
+- **Your library, your call.** Zotero gets the deepest path: `papio zotio plan`
+  produces an immutable preview, `papio zotio apply` requires that preview's
+  exact confirmation SHA-256, and `papio` never touches Zotero credentials.
+  Everywhere else — papis, a plain folder, your own script — gets a best-effort
+  handoff through the `on_ready` hook. Hook failures are recorded but never fail
+  or retry the acquisition job.
 
 ---
 
@@ -114,7 +126,7 @@ it finds:
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/architecture-dark.svg">
   <source media="(prefers-color-scheme: light)" srcset="docs/assets/architecture.svg">
-  <img alt="papio acquisition pipeline: you or an agent drive papio's jobs; open-access and licensed APIs run before your own browser via the papio extension (installed once), where login, MFA, a[...]
+  <img alt="papio acquisition pipeline: you or an agent drive papio's jobs; open-access and licensed APIs run before your own browser via the papio extension (installed once), where login, MFA, and CAPTCHA stay human; both paths converge in quarantine and PDF validation, producing a validated bundle with provenance; Zotero uses zotio's preview-then-apply, while other destinations receive a best-effort on_ready handoff" src="docs/assets/architecture.svg">
 </picture>
 
 | Stage | Source / tooling | Handles credentials? |
@@ -123,7 +135,7 @@ it finds:
 | **Download — open** | arXiv · Europe PMC · Unpaywall · OpenAlex · CORE · Crossref TDM | No (API keys only where configured) |
 | **Download — institutional** | OpenURL handoff in your ordinary browser session | No — login/2FA/CAPTCHA stay human |
 | **Validation** | Local PDF structure + identity + OCR (Poppler, Tesseract) | No |
-| **Zotero writes** | `zotio` — preview (`plan`) then confirmed `apply` | No — `papio` never stores Zotero credentials |
+| **Library filing** | `zotio` — preview (`plan`) then confirmed `apply` for Zotero · best-effort `on_ready` handoff for papis, a folder, or your own script; hook failures never fail or retry the job | No — `papio` never stores Zotero credentials |
 
 `papio` runs in one of three access modes — `conservative`, `assisted`, or
 `delegated`. A fresh `papio init` chooses `conservative`; institutional handoff
@@ -136,10 +148,10 @@ inside legitimate, user-authorized access
 ## The research loop
 
 Discover, acquire in bulk, watch progress, review the exceptions — then let
-the finished PDFs flow into Zotero:
+the finished PDFs flow into your library:
 
 ```bash
-# 1. Discover — read-only; marks works already in your zotio library
+# 1. Discover — read-only; marks works already in your library (with zotio or configured library.sources)
 papio search "trust in AI advice" --limit 20 --year-from 2022
 papio search --cites 10.1002/mar.21498          # citation snowball: who cites this paper?
 
@@ -158,11 +170,11 @@ papio doctor                          # whole-chain readiness when something loo
 # 5. Standing discovery — a watchlist that runs the same pipeline on a cadence
 papio watch add "appropriate reliance on AI" --cadence weekly
 ```
-
 A browser handoff is a normal job state, not a failure: the job parks as
 `awaiting_human`, `papio actions list` names it, and one sign-in pass in your
-own browser lets the extension finish the download — validated, filed, and
-imported like any other PDF
+own browser lets the extension finish the download. The validated result is
+then available for Zotero's zotio preview path or a best-effort generic hook
+handoff
 ([browser handoff](https://orgmentem.github.io/papio/concepts/browser-handoff/)).
 
 The extension's inbox keeps itself current on its own — no manual refresh
@@ -192,10 +204,12 @@ with `papio artifacts`.
 
 ---
 
-## Zotero writes only through zotio
+## Where the PDFs go
 
-`papio` acquires; [zotio](https://github.com/OrgMentem/zotio) imports. The
-handoff is explicit and verifiable:
+`papio`'s output is a validated bundle. Two ways to file it.
+
+**Zotero — the deepest path.** `papio` acquires;
+[zotio](https://github.com/OrgMentem/zotio) imports, explicitly and verifiably:
 
 ```bash
 papio zotio plan <job-id>       # preview of the exact changes + a confirmation code
@@ -203,8 +217,22 @@ papio zotio apply <plan-id> --confirm-sha256 <sha256>   # applies exactly that p
 ```
 
 `--auto-import` on `acquire` routes through the same plan/apply machinery.
-Without zotio installed, `papio` still works — it stops at validated bundles
-you can import however you like.
+
+**Everywhere else — the `on_ready` hook.** papis, Calibre, a plain folder, your
+own script: when a job's PDF passes validation, *papio* makes a best-effort
+handoff by running one command with the job's metadata in `PAPIO_*` environment
+variables. A hook failure is recorded but never fails or retries the acquisition
+job.
+
+```toml
+[hooks]
+on_ready = 'papis add --from doi "$PAPIO_DOI" "$PAPIO_PDF"'
+```
+
+zotio is optional: answer `none` at its `papio init` prompt and `papio doctor`
+reports it as `not configured (optional)` instead of failing — hooks are then
+the whole hand-off
+([filing & hooks](https://orgmentem.github.io/papio/guide/hooks/)).
 
 ---
 
@@ -227,8 +255,8 @@ you can import however you like.
 - **Read resources** — `papio://jobs`, `papio://artifacts`, `papio://bundles`,
   `papio://zotio/plans`, `papio://exports` — expose recent saved state
   without creating jobs or mutating anything.
-- **One writer.** `papio_command_run` with `zotio apply` is the only path that
-  writes to Zotero, and it demands the exact confirmation SHA-256 from
+- **One writer into Zotero.** `papio_command_run` with `zotio apply` is the only
+  path that writes to Zotero, and it demands the exact confirmation SHA-256 from
   `zotio plan`.
 
 Register it in an MCP host:
@@ -282,8 +310,10 @@ git clone https://github.com/OrgMentem/papio && cd papio && go build ./cmd/papio
   `papio init` prints the exact steps; skip with
   `papio init --skip-browser` for OA-only headless use.
 - **[zotio](https://github.com/OrgMentem/zotio)** on `PATH` (or
-  `[zotio] executable` in the config) for Zotero import; optional — without it
-  *papio* stops at validated bundles.
+  `[zotio] executable` in the config) for Zotero import — optional. **Not a
+  Zotero user?** Nothing extra to install: answer `none` at its prompt and point
+  `[hooks] on_ready` at papis, a folder, or your own script
+  ([filing & hooks](https://orgmentem.github.io/papio/guide/hooks/)).
 
 Then let the CLI walk you through setup — config, data directory, database,
 native-messaging host, and a first health check:
@@ -343,7 +373,9 @@ for Zotero that imports them preview-first — and audits, heals, and certifies
 the library they land in. If *papio* fills the gaps in your library, zotio makes
 sure the library stays fit to cite.
 
-*papio* also works without zotio, stopping at validated bundles.
+*papio* also works without zotio: it stops at validated bundles, and a
+best-effort `on_ready` hook handoff can offer them wherever else you keep
+papers. Hook failures are recorded but never fail or retry the acquisition job.
 
 ---
 

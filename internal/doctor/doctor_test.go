@@ -10,9 +10,11 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"papio/internal/config"
 	"papio/internal/discovery"
+	"papio/internal/ownership"
 	"papio/internal/pdf"
 	"papio/internal/store"
 	"papio/internal/update"
@@ -191,6 +193,119 @@ func TestRunIntegrationReportsVersionSkewAndSkipsUnconfiguredManifests(t *testin
 	if got := report.Checks[3]; got.Name != "native host (Chrome)" || got.Status != Skip {
 		t.Fatalf("Chrome manifest check = %#v", got)
 	}
+}
+
+func TestRunIntegrationReportsConfiguredLibrarySourcesWithoutProbe(t *testing.T) {
+	cfg := config.Default()
+	cfg.Path = filepath.Join(t.TempDir(), "config.toml")
+	cfg.Library.Sources = []config.LibrarySource{{
+		Name: "papis", Kind: config.LibraryKindFile, Path: "/library.bib", Claim: config.LibraryClaimPDFPresent,
+	}}
+	report := RunIntegration(context.Background(), IntegrationDependencies{
+		CLIVersion: "v1",
+		LoadConfig: func() (config.Config, error) { return cfg, nil },
+		DaemonStatus: func(context.Context, config.Config) (DaemonStatus, error) {
+			return DaemonStatus{Status: "ok", Version: "v1"}, nil
+		},
+		ManifestDir: func(config.Config) (string, error) { return t.TempDir(), nil },
+		FirefoxDir:  func(config.Config) (string, error) { return t.TempDir(), nil },
+		ReadFile:    os.ReadFile,
+		ZotioPreflight: func(context.Context, config.Config) (*zotio.PreflightResult, error) {
+			return &zotio.PreflightResult{Version: "1.2.3"}, nil
+		},
+	})
+	var library Check
+	for _, check := range report.Checks {
+		if check.Name == "library" {
+			library = check
+			break
+		}
+	}
+	if library.Status != Skip {
+		t.Fatalf("library check = %#v, want Skip", library)
+	}
+	if library.Detail != "configured library sources were not probed because this doctor invocation has no library probe" {
+		t.Fatalf("library check detail = %q", library.Detail)
+	}
+	if library.Remediation != "run 'papio doctor' through the papio CLI; if it persists, reinstall papio" {
+		t.Fatalf("library remediation = %q", library.Remediation)
+	}
+}
+
+func TestRunIntegrationLibrarySourceChecks(t *testing.T) {
+	baseDeps := func(cfg config.Config, probe func(context.Context, config.Config) ([]LibrarySourceStatus, error)) IntegrationDependencies {
+		return IntegrationDependencies{
+			CLIVersion: "v1",
+			LoadConfig: func() (config.Config, error) { return cfg, nil },
+			DaemonStatus: func(context.Context, config.Config) (DaemonStatus, error) {
+				return DaemonStatus{Status: "ok", Version: "v1"}, nil
+			},
+			ManifestDir:    func(config.Config) (string, error) { return t.TempDir(), nil },
+			FirefoxDir:     func(config.Config) (string, error) { return t.TempDir(), nil },
+			ReadFile:       os.ReadFile,
+			LibrarySources: probe,
+			ZotioPreflight: func(context.Context, config.Config) (*zotio.PreflightResult, error) {
+				return &zotio.PreflightResult{Version: "1.2.3"}, nil
+			},
+		}
+	}
+	libraryConfig := func() config.Config {
+		cfg := config.Default()
+		cfg.Path = filepath.Join(t.TempDir(), "config.toml")
+		cfg.Library.Sources = []config.LibrarySource{{
+			Name: "owned-pdfs", Kind: config.LibraryKindFile, Path: "/library.bib", Claim: config.LibraryClaimPDFPresent,
+		}}
+		return cfg
+	}
+	check := func(t *testing.T, report Report, name string) Check {
+		t.Helper()
+		for _, check := range report.Checks {
+			if check.Name == name {
+				return check
+			}
+		}
+		t.Fatalf("missing %s check in %#v", name, report.Checks)
+		return Check{}
+	}
+
+	t.Run("skip without sources", func(t *testing.T) {
+		cfg := libraryConfig()
+		cfg.Library.Sources = nil
+		report := RunIntegration(context.Background(), baseDeps(cfg, func(context.Context, config.Config) ([]LibrarySourceStatus, error) {
+			t.Fatal("library probe ran without configured sources")
+			return nil, nil
+		}))
+		got := check(t, report, "library")
+		if got.Status != Skip || !strings.Contains(got.Detail, "not configured (optional") {
+			t.Fatalf("library check = %#v, want optional Skip", got)
+		}
+	})
+
+	t.Run("pass after readable source", func(t *testing.T) {
+		cfg := libraryConfig()
+		report := RunIntegration(context.Background(), baseDeps(cfg, func(context.Context, config.Config) ([]LibrarySourceStatus, error) {
+			return []LibrarySourceStatus{{
+				Name: "owned-pdfs", Complete: true, EntryCount: 2, LastSuccess: time.Now().Add(-time.Minute),
+			}}, nil
+		}))
+		got := check(t, report, "library_source:owned-pdfs")
+		if got.Status != Pass || !strings.Contains(got.Detail, "2 entries") || !strings.Contains(got.Detail, "read ") {
+			t.Fatalf("library source check = %#v, want readable Pass", got)
+		}
+	})
+
+	t.Run("fail after unreadable source", func(t *testing.T) {
+		cfg := libraryConfig()
+		report := RunIntegration(context.Background(), baseDeps(cfg, func(context.Context, config.Config) ([]LibrarySourceStatus, error) {
+			return []LibrarySourceStatus{{
+				Name: "owned-pdfs", FailureCode: ownership.FailureUnreadable,
+			}}, nil
+		}))
+		got := check(t, report, "library_source:owned-pdfs")
+		if got.Status != Fail || !strings.Contains(got.Detail, "missing or unreadable") || !strings.Contains(got.Remediation, "check the path and format") {
+			t.Fatalf("library source check = %#v, want actionable Fail", got)
+		}
+	})
 }
 
 func TestRunIntegrationFailsOnDanglingHostExecutable(t *testing.T) {

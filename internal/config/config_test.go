@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -551,5 +552,164 @@ func TestSaveAcceptsMultipleExtensionIDs(t *testing.T) {
 	cfg.Browser.ExtensionIDs = []string{"ponmlkjihgfedcbaponmlkjihgfedcba"}
 	if err := Save(cfg, filepath.Join(t.TempDir(), "config.toml")); err != nil {
 		t.Fatalf("valid browser.extension_ids rejected: %v", err)
+	}
+}
+
+func TestLibrarySourceValidation(t *testing.T) {
+	valid := func() Config {
+		cfg := Default()
+		cfg.AccessMode = ModeConservative
+		cfg.Library.Sources = []LibrarySource{{
+			Name:   "owned-pdfs",
+			Kind:   LibraryKindFile,
+			Path:   "/tmp/owned.bib",
+			Format: "bibtex",
+			Claim:  LibraryClaimPDFPresent,
+		}}
+		return cfg
+	}
+
+	tooMany := make([]LibrarySource, MaxLibrarySources+1)
+	for i := range tooMany {
+		tooMany[i] = LibrarySource{
+			Name:  "source-" + strconv.Itoa(i),
+			Kind:  LibraryKindFile,
+			Path:  "/tmp/owned.bib",
+			Claim: LibraryClaimPDFPresent,
+		}
+	}
+
+	tests := []struct {
+		name string
+		cfg  Config
+		want string
+	}{
+		{
+			name: "missing name",
+			cfg: func() Config {
+				cfg := valid()
+				cfg.Library.Sources[0].Name = ""
+				return cfg
+			}(),
+			want: "name is required",
+		},
+		{
+			name: "duplicate name",
+			cfg: func() Config {
+				cfg := valid()
+				cfg.Library.Sources = append(cfg.Library.Sources, cfg.Library.Sources[0])
+				return cfg
+			}(),
+			want: "lists name \"owned-pdfs\" twice",
+		},
+		{
+			name: "unsupported kind",
+			cfg: func() Config {
+				cfg := valid()
+				cfg.Library.Sources[0].Kind = "command"
+				return cfg
+			}(),
+			want: "kind \"command\" is not supported",
+		},
+		{
+			name: "missing path",
+			cfg: func() Config {
+				cfg := valid()
+				cfg.Library.Sources[0].Path = " "
+				return cfg
+			}(),
+			want: "path is required",
+		},
+		{
+			name: "unsupported format",
+			cfg: func() Config {
+				cfg := valid()
+				cfg.Library.Sources[0].Format = "jsonl"
+				return cfg
+			}(),
+			want: "format \"jsonl\" must be empty or one of",
+		},
+		{
+			name: "missing claim",
+			cfg: func() Config {
+				cfg := valid()
+				cfg.Library.Sources[0].Claim = ""
+				return cfg
+			}(),
+			want: "claim must be",
+		},
+		{
+			name: "unsupported claim",
+			cfg: func() Config {
+				cfg := valid()
+				cfg.Library.Sources[0].Claim = "pdf_missing"
+				return cfg
+			}(),
+			want: "claim must be",
+		},
+		{
+			name: "too many sources",
+			cfg: func() Config {
+				cfg := valid()
+				cfg.Library.Sources = tooMany
+				return cfg
+			}(),
+			want: "maximum 8",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := Save(test.cfg, filepath.Join(t.TempDir(), "config.toml"))
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Save error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestLibrarySourcesRoundTrip(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := Default()
+	cfg.AccessMode = ModeConservative
+	cfg.Library.Sources = []LibrarySource{
+		{
+			Name:   "owned-pdfs",
+			Kind:   LibraryKindFile,
+			Path:   "~/library/owned.bib",
+			Format: "bibtex",
+			Claim:  LibraryClaimPDFPresent,
+		},
+		{
+			Name:   "citations",
+			Kind:   LibraryKindFile,
+			Path:   filepath.Join(t.TempDir(), "citations.ris"),
+			Format: "ris",
+			Claim:  LibraryClaimRecordPresent,
+		},
+	}
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := Save(cfg, path); err != nil {
+		t.Fatal(err)
+	}
+	got, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []LibrarySource{
+		{
+			Name:   "owned-pdfs",
+			Kind:   LibraryKindFile,
+			Path:   filepath.Join(home, "library", "owned.bib"),
+			Format: "bibtex",
+			Claim:  LibraryClaimPDFPresent,
+		},
+		cfg.Library.Sources[1],
+	}
+	if !reflect.DeepEqual(got.Library.Sources, want) {
+		t.Fatalf("library.sources = %#v, want %#v", got.Library.Sources, want)
 	}
 }

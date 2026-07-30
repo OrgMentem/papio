@@ -1121,6 +1121,7 @@ func (s *Service) runReadyHook(ctx context.Context, row *job.Row, sha string) {
 		"PAPIO_REQUEST_ID": row.WorkRequestID,
 		"PAPIO_DOI":        row.Work.DOI,
 		"PAPIO_ARXIV":      row.Work.ArXiv,
+		"PAPIO_PMID":       row.Work.PMID,
 		"PAPIO_TITLE":      row.Work.Title,
 		"PAPIO_SHA256":     sha,
 		"PAPIO_PDF":        pdfPath,

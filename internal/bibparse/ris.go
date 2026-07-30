@@ -1,7 +1,6 @@
-package ingest
+package bibparse
 
 import (
-	"errors"
 	"strings"
 )
 
@@ -60,7 +59,7 @@ func parseRIS(data []byte) ([]Record, error) {
 	return records, nil
 }
 
-var errRISNoRecords = errors.New("ris: no records found")
+var errRISNoRecords = noEntries("ris: no records found")
 
 type risValue uint8
 

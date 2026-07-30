@@ -1764,6 +1764,46 @@ func TestProcessReadyFiresOnReadyHookOnce(t *testing.T) {
 	}
 }
 
+func TestProcessReadyHookExposesPMIDOnlyWork(t *testing.T) {
+	svc, jobs := newTestService(t)
+	readyPipeline(svc)
+	envs := make(chan []string, 1)
+	svc.ReadyHook = &hook.Runner{
+		Command: "configured",
+		Exec: func(_ context.Context, _ string, env []string) hook.Result {
+			envs <- env
+			return hook.Result{Ran: true, ExitCode: 0}
+		},
+	}
+
+	id, err := svc.Submit(context.Background(), protocol.WorkRequest{
+		SchemaVersion: protocol.WorkRequestSchemaVersion,
+		RequestID:     "wr_hook_pmid_01",
+		Identifiers:   &protocol.Identifiers{PMID: "12345678"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, err := jobs.ClaimNext(context.Background(), "worker", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Process(context.Background(), row); err != nil {
+		t.Fatal(err)
+	}
+	if detail := waitForHookEvent(t, jobs, id); detail["status"] != "ok" {
+		t.Fatalf("hook detail = %#v, want status ok", detail)
+	}
+	byKey := map[string]string{}
+	for _, kv := range <-envs {
+		key, value, _ := strings.Cut(kv, "=")
+		byKey[key] = value
+	}
+	if byKey["PAPIO_DOI"] != "" || byKey["PAPIO_ARXIV"] != "" || byKey["PAPIO_PMID"] != "12345678" {
+		t.Fatalf("hook identifiers = DOI %q, arXiv %q, PMID %q", byKey["PAPIO_DOI"], byKey["PAPIO_ARXIV"], byKey["PAPIO_PMID"])
+	}
+}
+
 func TestOnReadyHookFailureLeavesJobReady(t *testing.T) {
 	svc, jobs := newTestService(t)
 	readyPipeline(svc)

@@ -189,7 +189,7 @@ func runInit(cmd *cobra.Command, opt *options, deps initDependencies, input init
 	initLine(opt.out, true, "Data", "created "+cfg.DataDir+" and applied migrations")
 
 	if err := deps.CheckZotio(cmd.Context(), cfg.Zotio.Executable); err != nil {
-		initLine(opt.out, false, "zotio", fmt.Sprintf("%v; Zotero features are disabled", err))
+		initLine(opt.out, false, "zotio", fmt.Sprintf("%v; Zotero features are disabled (the on_ready hook still files PDFs)", err))
 	} else {
 		initLine(opt.out, true, "zotio", "available at "+cfg.Zotio.Executable)
 	}
@@ -356,7 +356,7 @@ func applyInitConfig(cmd *cobra.Command, out io.Writer, cfg *config.Config, exis
 	}
 
 	if !input.nonInteractive {
-		sections.header("zotio", "The Zotero boundary: imports are previewed and confirmed there. The stored mode copies PDFs into Zotero; linked-file mode references papio's copy on disk.")
+		sections.header("zotio", "The Zotero boundary: imports are previewed and confirmed there. The stored mode copies PDFs into Zotero; linked-file mode references papio's copy on disk. Not a Zotero user? Answer none — ready PDFs are then filed by your on_ready hook (papis, a plain folder, your own script).")
 		if !input.zotioPathSet {
 			zotioDefault, zotioSource := cfg.Zotio.Executable, ""
 			// A bare command name is autodiscovered so the prompt shows the
@@ -370,13 +370,21 @@ func applyInitConfig(cmd *cobra.Command, out io.Writer, cfg *config.Config, exis
 					zotioDefault, zotioSource = resolved, "found on PATH"
 				}
 			}
-			value, err := initPromptSourced(reader, out, "zotio executable", zotioDefault, zotioSource)
+			value, err := initPromptSourced(reader, out, "zotio executable (or none)", zotioDefault, zotioSource)
 			if err != nil {
 				return err
 			}
-			cfg.Zotio.Executable = value
+			// An empty answer means "keep the default" for every init prompt, so
+			// "none" is the only way to decline a discovered zotio.
+			if strings.EqualFold(value, "none") {
+				cfg.Zotio.Executable = ""
+				cfg.Zotio.AutoImport = false
+				cfg.Zotio.ExceptionTags = false
+			} else {
+				cfg.Zotio.Executable = value
+			}
 		}
-		if !input.attachmentSet {
+		if !input.attachmentSet && strings.TrimSpace(cfg.Zotio.Executable) != "" {
 			value, err := initPrompt(reader, out, "attachment mode (stored/linked-file)", cfg.Zotio.AttachmentMode)
 			if err != nil {
 				return err

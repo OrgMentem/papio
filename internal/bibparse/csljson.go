@@ -1,4 +1,4 @@
-package ingest
+package bibparse
 
 import (
 	"bytes"
@@ -29,16 +29,27 @@ type cslJSONIssued struct {
 func parseCSLJSON(data []byte) ([]Record, error) {
 	data = bytes.TrimPrefix(data, []byte{0xef, 0xbb, 0xbf})
 	trimmed := bytes.TrimSpace(data)
-	if len(trimmed) > 0 && trimmed[0] == '{' {
+	if len(trimmed) > 0 && trimmed[0] != '[' {
 		return nil, fmt.Errorf("csl-json: expected a top-level array of items")
 	}
 
-	var items []cslJSONItem
-	if err := json.Unmarshal(data, &items); err != nil {
+	var rawItems []json.RawMessage
+	if err := json.Unmarshal(data, &rawItems); err != nil {
 		return nil, fmt.Errorf("csl-json: decode: %w", err)
 	}
-	if len(items) == 0 {
-		return nil, fmt.Errorf("csl-json: no items found")
+	if len(rawItems) == 0 {
+		return nil, noEntries("csl-json: no items found")
+	}
+
+	items := make([]cslJSONItem, len(rawItems))
+	for i, rawItem := range rawItems {
+		rawItem = bytes.TrimSpace(rawItem)
+		if len(rawItem) == 0 || rawItem[0] != '{' {
+			return nil, fmt.Errorf("csl-json: item %d: expected an object", i)
+		}
+		if err := json.Unmarshal(rawItem, &items[i]); err != nil {
+			return nil, fmt.Errorf("csl-json: item %d: decode: %w", i, err)
+		}
 	}
 
 	records := make([]Record, 0, len(items))
