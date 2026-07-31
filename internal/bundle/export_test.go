@@ -14,6 +14,7 @@ import (
 	"papio/internal/job"
 	"papio/internal/protocol"
 	"papio/internal/redact"
+	"papio/internal/resolver"
 	"papio/internal/store"
 	"papio/internal/work"
 )
@@ -516,5 +517,134 @@ func TestExportIgnoresARejectedSelectionAndUsesTheAcceptedAcquisition(t *testing
 	}
 	if b.Candidate.Source != "unpaywall" || b.Candidate.ReuseLicense != "cc-by-4.0" {
 		t.Fatalf("bundle candidate = %+v, want the accepted unpaywall acquisition", b.Candidate)
+	}
+}
+
+// TestEntitlementIsDerivedNeverInferred covers the acquisition-bundle/2
+// entitlement object. The consumer's gate accepts only a bare https origin, so
+// every case here is really asking one question: does papio emit a value the
+// consumer must reject? It must never do so — the sanitised-reference rule is
+// papio's obligation, enforced at emission and fail-closed.
+func TestEntitlementIsDerivedNeverInferred(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		candidate job.Candidate
+		want      *protocol.BundleEntitlement
+	}{
+		{
+			name: "open access keeps the origin and drops the signed query",
+			candidate: job.Candidate{
+				Source:      "unpaywall",
+				AccessBasis: resolver.AccessOpen,
+				URLRedacted: redact.URL("https://example.test/paper.pdf?signature=SECRET"),
+			},
+			want: &protocol.BundleEntitlement{Route: "https://example.test", AcquisitionMode: "open_access"},
+		},
+		{
+			name: "licensed api names the daemon credential in cleartext",
+			candidate: job.Candidate{
+				Source:      "crossref_tdm",
+				AccessBasis: resolver.AccessLicensedAPI,
+				URLRedacted: "https://api.crossref.org/works/10.1000/x",
+			},
+			want: &protocol.BundleEntitlement{
+				Route:           "https://api.crossref.org",
+				EntitlementRef:  "entitlement:source:crossref_tdm",
+				AcquisitionMode: "daemon_held_credential",
+			},
+		},
+		{
+			// The only writer of `institutional` is browser adoption, and it
+			// records that basis unconditionally — including for an open-access
+			// PDF handed to the browser because a provider's anti-bot wall
+			// refused papio's own fetch. Emitting operator_browser_session plus
+			// the library's OpenURL origin would assert an institutional route
+			// that acquisition never walked, so the object is omitted until
+			// adoption records what it actually observed.
+			name: "browser adoption asserts no route, because papio observed none",
+			candidate: job.Candidate{
+				Source:      "browser",
+				AccessBasis: resolver.AccessInstitutional,
+				URLRedacted: "browser://adopted-download",
+			},
+			want: nil,
+		},
+		{
+			name: "manual has no observed route and is never guessed",
+			candidate: job.Candidate{
+				Source:      "manual",
+				AccessBasis: "manual",
+				URLRedacted: "https://example.test/manual.pdf",
+			},
+			want: nil,
+		},
+		{
+			name: "an unparseable candidate URL omits the object rather than exporting a placeholder",
+			candidate: job.Candidate{
+				Source:      "unpaywall",
+				AccessBasis: resolver.AccessOpen,
+				URLRedacted: "not-a-url",
+			},
+			want: nil,
+		},
+		{
+			name: "a non-https candidate URL omits the object",
+			candidate: job.Candidate{
+				Source:      "unpaywall",
+				AccessBasis: resolver.AccessOpen,
+				URLRedacted: "http://insecure.example.test/paper.pdf",
+			},
+			want: nil,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := entitlementFor(&tc.candidate)
+			if tc.want == nil {
+				if got != nil {
+					t.Fatalf("entitlement = %+v, want omitted", got)
+				}
+				return
+			}
+			if got == nil {
+				t.Fatalf("entitlement omitted, want %+v", tc.want)
+			}
+			if *got != *tc.want {
+				t.Fatalf("entitlement = %+v, want %+v", *got, *tc.want)
+			}
+			// Whatever the derivation produced must survive the same gate the
+			// consumer applies; a route that fails here would be rejected there.
+			bundle := protocol.AcquisitionBundle{
+				SchemaVersion: protocol.AcquisitionBundleSchemaVersionV2,
+				Candidate:     protocol.BundleCandidate{Entitlement: got},
+			}
+			if err := bundle.Validate(); err != nil && strings.Contains(err.Error(), "entitlement") {
+				t.Fatalf("emitted entitlement fails papio's own gate: %v", err)
+			}
+		})
+	}
+}
+
+// TestExportedBundleIsV2AndCarriesTheEntitlement is the end-to-end half: the
+// fixture's candidate URL is bearer-signed, so this also proves the signed query
+// never reaches the route.
+func TestExportedBundleIsV2AndCarriesTheEntitlement(t *testing.T) {
+	exporter, id, _ := readyFixture(t)
+	_, b, err := exporter.Export(context.Background(), id, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b.SchemaVersion != protocol.AcquisitionBundleSchemaVersionV2 {
+		t.Fatalf("schema_version = %q, want %q", b.SchemaVersion, protocol.AcquisitionBundleSchemaVersionV2)
+	}
+	entitlement := b.Candidate.Entitlement
+	if entitlement == nil {
+		t.Fatal("exported bundle omitted the entitlement for an open-access acquisition")
+	}
+	want := protocol.BundleEntitlement{Route: "https://example.test", AcquisitionMode: "open_access"}
+	if *entitlement != want {
+		t.Fatalf("entitlement = %+v, want %+v", *entitlement, want)
+	}
+	if strings.Contains(entitlement.Route, "SECRET") || strings.ContainsAny(entitlement.Route, "?#") {
+		t.Fatalf("route %q leaked query data", entitlement.Route)
 	}
 }

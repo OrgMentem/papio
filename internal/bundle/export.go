@@ -14,6 +14,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -21,6 +22,8 @@ import (
 	"papio/internal/artifact"
 	"papio/internal/job"
 	"papio/internal/protocol"
+	"papio/internal/redact"
+	"papio/internal/resolver"
 )
 
 // Exporter materializes bundles from the durable job/artifact stores.
@@ -29,6 +32,94 @@ type Exporter struct {
 	Artifacts *artifact.Store
 	DataDir   string
 	Now       func() time.Time
+}
+
+// sourceRefRE bounds a resolver source name used as a cleartext entitlement
+// reference. papio's licensed-API sources ("core", "crossref_tdm") are lowercase
+// by construction; anything else omits the reference rather than emitting a
+// value the consumer would refuse.
+var sourceRefRE = regexp.MustCompile(`^[a-z0-9_]{1,64}$`)
+
+// acquisitionModeFor maps the accepted candidate's access basis onto the
+// acquisition-bundle/2 mode vocabulary. It is a derivation, not an inference:
+// every input is a validated enum value papio already recorded.
+//
+// Two bases deliberately have no mode:
+//
+// "manual" describes an artifact filed with no observed route at all.
+//
+// "institutional" is subtler and is why operator_browser_session currently has
+// no producer. Its only writer is browser adoption, which records the basis
+// unconditionally (internal/app/browser_adopt.go) — including for an
+// open-access PDF handed to the browser because a provider's anti-bot wall
+// refused papio's own fetch. That adoption never touched the institution, so
+// claiming operator_browser_session would invent entitlement evidence for a
+// route the operator never walked, and the adopted candidate URL is the
+// synthetic "browser://adopted-download", so papio has no observed route to
+// name either. Reconstructing one from the current OpenURL config would be
+// worse still: it is mutable, so re-exporting after an operator edits the
+// config would silently rewrite an already-published provenance record.
+// ADR-0007's asymmetry applies — a false positive invents rights evidence,
+// a false negative costs nothing but a field. Omit.
+//
+// Recording the true basis and route at adoption time is the fix that gives
+// this mode a producer; until then the enum value stays reserved.
+func acquisitionModeFor(accessBasis string) (string, bool) {
+	switch accessBasis {
+	case resolver.AccessOpen:
+		return "open_access", true
+	case resolver.AccessLicensedAPI:
+		// papio sent its own configured API credential (CORE's bearer token,
+		// Crossref's Plus token). That is a daemon-held credential by
+		// definition, not future work.
+		return "daemon_held_credential", true
+	default:
+		return "", false
+	}
+}
+
+// entitlementFor derives the v2 entitlement object, or nil when papio observed
+// no route. Nil is the honest and common answer; the object is never partially
+// filled.
+func entitlementFor(candidate *job.Candidate) *protocol.BundleEntitlement {
+	mode, ok := acquisitionModeFor(candidate.AccessBasis)
+	if !ok {
+		return nil
+	}
+	route, ok := entitlementRoute(candidate)
+	if !ok {
+		return nil
+	}
+	entitlement := &protocol.BundleEntitlement{Route: route, AcquisitionMode: mode}
+	// Only a daemon-held credential has an entitlement to name; open access
+	// needs none.
+	if mode == "daemon_held_credential" && sourceRefRE.MatchString(candidate.Source) {
+		entitlement.EntitlementRef = "entitlement:source:" + candidate.Source
+	}
+	return entitlement
+}
+
+// entitlementRoute produces a bare origin from what papio actually fetched, or
+// reports that none is available.
+//
+// redact.Host, never redact.URL: redact.URL deliberately appends "?<redacted>"
+// when it strips a query, which is right for an operator log and is query data
+// to a consumer. It also collapses an unparseable value to a placeholder rather
+// than failing, so that placeholder is treated here as "no route" — papio omits
+// the entitlement instead of shipping a string the consumer must reject.
+func entitlementRoute(candidate *job.Candidate) (string, bool) {
+	raw := candidate.URLRedacted
+	if raw == "" {
+		raw = candidate.LandingRedacted
+	}
+	if raw == "" {
+		return "", false
+	}
+	host := redact.Host(raw)
+	if !strings.HasPrefix(host, "https://") || strings.ContainsAny(host, "?#") {
+		return "", false
+	}
+	return host, true
 }
 
 var exportDestinationLocks = struct {
@@ -124,7 +215,7 @@ func (e *Exporter) Export(ctx context.Context, jobID, destination string) (strin
 		landing = "" // do not export a syntactically fake or secret-bearing URI
 	}
 	b := &protocol.AcquisitionBundle{
-		SchemaVersion: protocol.AcquisitionBundleSchemaVersion,
+		SchemaVersion: protocol.AcquisitionBundleSchemaVersionV2,
 		JobID:         jobID, RequestID: row.WorkRequestID,
 		Identity: protocol.BundleIdentity{
 			DOI: row.Work.DOI, Title: row.Work.Title, Authors: append([]string(nil), row.Work.Authors...), Year: row.Work.Year,
@@ -132,6 +223,7 @@ func (e *Exporter) Export(ctx context.Context, jobID, destination string) (strin
 		Candidate: protocol.BundleCandidate{
 			Source: candidate.Source, Version: candidate.Version, AccessBasis: candidate.AccessBasis,
 			ReuseLicense: candidate.ReuseLicense, LandingURL: landing,
+			Entitlement: entitlementFor(candidate),
 		},
 		RetrievedAt: retrieved,
 		Artifact: protocol.BundleArtifact{

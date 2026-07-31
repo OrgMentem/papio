@@ -72,6 +72,18 @@ type ArtifactResult struct {
 	Artifact *job.Artifact `json:"artifact"`
 }
 
+// BundleResult is the bundle.export result. Bundle is deliberately nil from
+// bundle.export and populated only by bundle.export_v2.
+//
+// The exported document became acquisition-bundle/2, which adds
+// candidate.entitlement. internal/ipc decodes results with
+// DisallowUnknownFields and encoding/json applies that recursively, so a bundle
+// body carrying an entitlement makes an older papio CLI reject the whole
+// bundle.export response — one binary is CLI, daemon, and native host, so that
+// skew is routine. Returning the body under a new method name is the same rule
+// the ratified list follows: additive evolution gets a new method, never a
+// widened result. The field stays declared so a NEW CLI can still decode an
+// OLD daemon's populated response on the unknown_method fallback path.
 type BundleResult struct {
 	Path   string                      `json:"path"`
 	Bundle *protocol.AcquisitionBundle `json:"bundle"`
@@ -242,6 +254,9 @@ func RouterWithShutdown(system *bootstrap.System, shutdown context.CancelFunc) i
 		},
 		"bundle.export": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return exportBundle(ctx, raw, system)
+		},
+		"bundle.export_v2": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return exportBundleV2(ctx, raw, system)
 		},
 		"doctor.run": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return runDoctor(ctx, raw, system)
@@ -1050,6 +1065,25 @@ func getArtifact(ctx context.Context, raw json.RawMessage, system *bootstrap.Sys
 }
 
 func exportBundle(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
+	// Body withheld: see BundleResult. The exported file at Path is the
+	// canonical document either way, so an older CLI still gets the export it
+	// asked for and reads the bundle from disk.
+	path, _, rpcErr := exportBundleFile(ctx, raw, system)
+	if rpcErr != nil {
+		return nil, rpcErr
+	}
+	return marshal(BundleResult{Path: path})
+}
+
+func exportBundleV2(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
+	path, result, rpcErr := exportBundleFile(ctx, raw, system)
+	if rpcErr != nil {
+		return nil, rpcErr
+	}
+	return marshal(BundleResult{Path: path, Bundle: result})
+}
+
+func exportBundleFile(ctx context.Context, raw json.RawMessage, system *bootstrap.System) (string, *protocol.AcquisitionBundle, *ipc.RPCError) {
 	var params struct {
 		JobID     string `json:"job_id"`
 		OutputDir string `json:"output_dir"`
@@ -1058,13 +1092,15 @@ func exportBundle(ctx context.Context, raw json.RawMessage, system *bootstrap.Sy
 		if err == nil {
 			err = errors.New("job_id and output_dir are required")
 		}
-		return badParams(err)
+		_, rpcErr := badParams(err)
+		return "", nil, rpcErr
 	}
 	path, result, err := system.Bundle.Export(ctx, params.JobID, params.OutputDir)
 	if err != nil {
-		return failure(err)
+		_, rpcErr := failure(err)
+		return "", nil, rpcErr
 	}
-	return marshal(BundleResult{Path: path, Bundle: result})
+	return path, result, nil
 }
 
 func runDoctor(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {

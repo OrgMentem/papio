@@ -669,8 +669,8 @@ func newBundleCommand(opt *options) *cobra.Command {
 			if strings.TrimSpace(outputDir) == "" {
 				return errors.New("--output is required")
 			}
-			var result api.BundleResult
-			if err := opt.call(cmd.Context(), "bundle.export", map[string]string{"job_id": args[0], "output_dir": outputDir}, &result); err != nil {
+			result, err := exportBundleResult(cmd.Context(), opt, args[0], outputDir)
+			if err != nil {
 				return err
 			}
 			return opt.printResult(result, "Exported %s", result.Path)
@@ -679,4 +679,27 @@ func newBundleCommand(opt *options) *cobra.Command {
 	export.Flags().StringVarP(&outputDir, "output", "o", "", "destination directory")
 	command.AddCommand(export)
 	return command
+}
+
+// exportBundleResult prefers bundle.export_v2, which carries the exported
+// document in its result. bundle.export deliberately withholds that body so an
+// older CLI can decode a newer daemon's response, so a newer CLI must ask for
+// it by name — and fall back when the daemon predates the method, exactly as
+// submitAcquire does for acquire.submit_v2.
+func exportBundleResult(ctx context.Context, opt *options, jobID, outputDir string) (api.BundleResult, error) {
+	params := map[string]string{"job_id": jobID, "output_dir": outputDir}
+	var result api.BundleResult
+	err := opt.call(ctx, "bundle.export_v2", params, &result)
+	if err == nil {
+		return result, nil
+	}
+	var remote *ipc.RemoteError
+	if !errors.As(err, &remote) || remote.Code != "unknown_method" {
+		return api.BundleResult{}, err
+	}
+	var legacy api.BundleResult
+	if err := opt.call(ctx, "bundle.export", params, &legacy); err != nil {
+		return api.BundleResult{}, err
+	}
+	return legacy, nil
 }

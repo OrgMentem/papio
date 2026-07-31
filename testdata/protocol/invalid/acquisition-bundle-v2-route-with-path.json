@@ -1,0 +1,35 @@
+{
+  "schema_version": "acquisition-bundle/2",
+  "job_id": "job_0006_route_path",
+  "request_id": "wr_job-0006-route-path",
+  "identity": {
+    "title": "Text and Data Mining Under Licence",
+    "authors": [
+      "Author, A."
+    ]
+  },
+  "candidate": {
+    "source": "crossref_tdm",
+    "version": "published",
+    "access_basis": "licensed_api",
+    "reuse_license": "unknown",
+    "entitlement": {
+      "route": "https://cdn.example.test/AbCdSIGNEDTOKEN/paper.pdf",
+      "acquisition_mode": "open_access"
+    }
+  },
+  "retrieved_at": "2026-07-31T10:00:00Z",
+  "artifact": {
+    "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "size_bytes": 204800,
+    "mime": "application/pdf",
+    "page_count": 18,
+    "ocr_used": false,
+    "path": "artifacts/ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff.pdf"
+  },
+  "validation": {
+    "structural": "pass",
+    "identity": "pass"
+  },
+  "provenance_digest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+}

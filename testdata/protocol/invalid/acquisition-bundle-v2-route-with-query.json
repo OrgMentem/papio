@@ -1,0 +1,35 @@
+{
+  "schema_version": "acquisition-bundle/2",
+  "job_id": "job_0003_route_query",
+  "request_id": "wr_route-query-2026",
+  "identity": {
+    "title": "A Route That Retained Its Query String",
+    "authors": [
+      "Author, A."
+    ]
+  },
+  "candidate": {
+    "source": "browser",
+    "version": "unknown",
+    "access_basis": "institutional",
+    "reuse_license": "unknown",
+    "entitlement": {
+      "route": "https://library.example.edu/discovery/openurl?<redacted>",
+      "acquisition_mode": "operator_browser_session"
+    }
+  },
+  "retrieved_at": "2026-07-31T10:00:00Z",
+  "artifact": {
+    "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "size_bytes": 4096,
+    "mime": "application/pdf",
+    "page_count": 2,
+    "ocr_used": false,
+    "path": "artifacts/cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc.pdf"
+  },
+  "validation": {
+    "structural": "pass",
+    "identity": "pass"
+  },
+  "provenance_digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+}

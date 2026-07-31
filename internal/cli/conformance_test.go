@@ -131,7 +131,7 @@ var commandClassification = map[string]commandClass{
 	"papio artifacts":                  {kind: kindNone},
 	"papio artifacts get":              {kind: kindStructured, rpcMethods: []string{"artifacts.get"}},
 	"papio bundle":                     {kind: kindNone},
-	"papio bundle export":              {kind: kindStructured, rpcMethods: []string{"bundle.export"}},
+	"papio bundle export":              {kind: kindStructured, rpcMethods: []string{"bundle.export_v2", "bundle.export"}},
 	"papio doctor":                     {kind: kindStructured, rpcMethods: []string{"ping", "doctor.run"}},
 	"papio zotio":                      {kind: kindNone},
 	"papio zotio preflight":            {kind: kindStructured, rpcMethods: []string{"zotio.preflight"}},

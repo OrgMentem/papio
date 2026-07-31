@@ -1,0 +1,36 @@
+{
+  "schema_version": "acquisition-bundle/2",
+  "job_id": "job_0007_empty_ref",
+  "request_id": "wr_job-0007-empty-ref",
+  "identity": {
+    "title": "Text and Data Mining Under Licence",
+    "authors": [
+      "Author, A."
+    ]
+  },
+  "candidate": {
+    "source": "crossref_tdm",
+    "version": "published",
+    "access_basis": "licensed_api",
+    "reuse_license": "unknown",
+    "entitlement": {
+      "route": "https://api.crossref.org",
+      "entitlement_ref": "",
+      "acquisition_mode": "daemon_held_credential"
+    }
+  },
+  "retrieved_at": "2026-07-31T10:00:00Z",
+  "artifact": {
+    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "size_bytes": 204800,
+    "mime": "application/pdf",
+    "page_count": 18,
+    "ocr_used": false,
+    "path": "artifacts/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.pdf"
+  },
+  "validation": {
+    "structural": "pass",
+    "identity": "pass"
+  },
+  "provenance_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+}

@@ -25,7 +25,12 @@ import (
 const (
 	WorkRequestSchemaVersion       = "work-request/1"
 	AcquisitionBundleSchemaVersion = "acquisition-bundle/1"
-	BrowserProtocolVersion         = "papio-browser/1"
+	// AcquisitionBundleSchemaVersionV2 adds candidate.entitlement. It is a new
+	// schema rather than an added v1 field because v1 sets
+	// additionalProperties:false and DecodeAcquisitionBundle rejects unknown
+	// fields recursively, so a v1 consumer would reject the whole document.
+	AcquisitionBundleSchemaVersionV2 = "acquisition-bundle/2"
+	BrowserProtocolVersion           = "papio-browser/1"
 )
 
 // MaxBrowserMessageBytes caps one encoded native-messaging frame well below
@@ -37,22 +42,28 @@ const MaxBrowserMessageBytes = 256 << 10
 const MaxBrowserInteger int64 = 1<<53 - 1
 
 var (
-	requestIDRE  = regexp.MustCompile(`^[A-Za-z0-9_-]{8,128}$`)
-	adapterIDRE  = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
-	msgIDRE      = regexp.MustCompile(`^[A-Za-z0-9_-]{8,64}$`)
-	zoteroKeyRE  = regexp.MustCompile(`^[A-Za-z0-9]{1,32}$`)
-	doiRE        = regexp.MustCompile(`^10\.[0-9]{4,9}/\S{1,200}$`)
-	pmidRE       = regexp.MustCompile(`^[0-9]{1,10}$`)
-	arxivRE      = regexp.MustCompile(`^([0-9]{4}\.[0-9]{4,5})(v[0-9]+)?$|^[a-z-]+(\.[A-Z]{2})?/[0-9]{7}$`)
-	isbnRE       = regexp.MustCompile(`^[0-9Xx-]{10,17}$`)
-	openalexRE   = regexp.MustCompile(`^W[0-9]{4,12}$`)
-	sha256RE     = regexp.MustCompile(`^[a-f0-9]{64}$`)
-	provenanceRE = regexp.MustCompile(`^sha256:[a-f0-9]{64}$`)
-	hostRE       = regexp.MustCompile(`^[a-z0-9.-]{3,253}$`)
-	errorCodeRE  = regexp.MustCompile(`^[a-z0-9_]{2,50}$`)
-	filenameRE   = regexp.MustCompile(`^[^/\\]{1,255}$`)
-	base64RE     = regexp.MustCompile(`^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$`)
-	rfc3339RE    = regexp.MustCompile(`^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$`)
+	requestIDRE = regexp.MustCompile(`^[A-Za-z0-9_-]{8,128}$`)
+	adapterIDRE = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
+	// entitlementRefRE mirrors the consumer's closed vocabulary. The cleartext
+	// source form is preferred: hashing a public constant like "crossref_tdm"
+	// buys no secrecy and destroys legibility in an audit trail whose whole
+	// value is knowing which entitlement obtained the work. The digest form is
+	// accepted so an opaque reference stays expressible.
+	entitlementRefRE = regexp.MustCompile(`^entitlement:(source:[a-z0-9_]{1,64}|sha256:[0-9a-f]{64})$`)
+	msgIDRE          = regexp.MustCompile(`^[A-Za-z0-9_-]{8,64}$`)
+	zoteroKeyRE      = regexp.MustCompile(`^[A-Za-z0-9]{1,32}$`)
+	doiRE            = regexp.MustCompile(`^10\.[0-9]{4,9}/\S{1,200}$`)
+	pmidRE           = regexp.MustCompile(`^[0-9]{1,10}$`)
+	arxivRE          = regexp.MustCompile(`^([0-9]{4}\.[0-9]{4,5})(v[0-9]+)?$|^[a-z-]+(\.[A-Z]{2})?/[0-9]{7}$`)
+	isbnRE           = regexp.MustCompile(`^[0-9Xx-]{10,17}$`)
+	openalexRE       = regexp.MustCompile(`^W[0-9]{4,12}$`)
+	sha256RE         = regexp.MustCompile(`^[a-f0-9]{64}$`)
+	provenanceRE     = regexp.MustCompile(`^sha256:[a-f0-9]{64}$`)
+	hostRE           = regexp.MustCompile(`^[a-z0-9.-]{3,253}$`)
+	errorCodeRE      = regexp.MustCompile(`^[a-z0-9_]{2,50}$`)
+	filenameRE       = regexp.MustCompile(`^[^/\\]{1,255}$`)
+	base64RE         = regexp.MustCompile(`^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$`)
+	rfc3339RE        = regexp.MustCompile(`^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$`)
 )
 
 // strictDecode unmarshals data into v, rejecting unknown fields and trailing input.
@@ -251,14 +262,35 @@ type BundleIdentity struct {
 	Evidence []string `json:"evidence,omitempty"`
 }
 
+// BundleEntitlement records the route by which access was obtained. It exists
+// only in acquisition-bundle/2.
+//
+// A route, never an identity: papio never authenticates a human and never holds
+// institutional credentials, so it can report how bytes were reached but not
+// who was entitled to them. Every value here is observed; nothing is inferred,
+// and the whole object is omitted rather than guessed (ADR-0009, ADR-0010).
+type BundleEntitlement struct {
+	// Route is a sanitised bare reference: scheme://host with no path, query,
+	// fragment, or userinfo. Enforced at emission and fail-closed, so papio
+	// never sends a value a consumer must reject.
+	Route string `json:"route"`
+	// EntitlementRef names WHICH entitlement, never a secret and never a
+	// credential instance. Rotating an API key does not change it; no rotation
+	// semantics may be built on this field.
+	EntitlementRef string `json:"entitlement_ref,omitempty"`
+	// AcquisitionMode is derived from the accepted candidate's access basis.
+	AcquisitionMode string `json:"acquisition_mode"`
+}
+
 // BundleCandidate records which source supplied the artifact and on what basis.
 type BundleCandidate struct {
-	Source         string `json:"source"`
-	Version        string `json:"version"`
-	AccessBasis    string `json:"access_basis"`
-	ReuseLicense   string `json:"reuse_license"`
-	LandingURL     string `json:"landing_url,omitempty"`
-	SourceRecordID string `json:"source_record_id,omitempty"`
+	Source         string             `json:"source"`
+	Version        string             `json:"version"`
+	AccessBasis    string             `json:"access_basis"`
+	ReuseLicense   string             `json:"reuse_license"`
+	LandingURL     string             `json:"landing_url,omitempty"`
+	SourceRecordID string             `json:"source_record_id,omitempty"`
+	Entitlement    *BundleEntitlement `json:"entitlement,omitempty"`
 }
 
 // BundleArtifact describes the immutable content-addressed file.
@@ -300,17 +332,71 @@ func DecodeAcquisitionBundle(data []byte) (*AcquisitionBundle, error) {
 	if err := strictDecode(data, &b); err != nil {
 		return nil, fmt.Errorf("acquisition bundle: %w", err)
 	}
+	if err := checkEntitlementWireShape(data); err != nil {
+		return nil, fmt.Errorf("acquisition bundle: %w", err)
+	}
 	if err := b.Validate(); err != nil {
 		return nil, fmt.Errorf("acquisition bundle: %w", err)
 	}
 	return &b, nil
 }
 
+// checkEntitlementWireShape closes the holes that declaring optional fields
+// opened. Both are cases where the decoded Go value cannot distinguish "absent"
+// from "explicitly empty", so Validate is structurally unable to see them and
+// the check has to look at the raw document.
+//
+// Before candidate.entitlement existed, v1's DisallowUnknownFields rejected the
+// key outright; now the key is known and JSON null decodes to a nil pointer, so
+// a v1 document carrying `"entitlement": null` would have passed and silently
+// widened a frozen schema. Likewise `"entitlement_ref": ""` decodes to the same
+// empty string as an omitted field, while the published schema requires any
+// present value to match the reference pattern.
+func checkEntitlementWireShape(data []byte) error {
+	var document struct {
+		Candidate map[string]json.RawMessage `json:"candidate"`
+	}
+	if err := json.Unmarshal(data, &document); err != nil {
+		return nil // strictDecode already rejected anything malformed
+	}
+	rawEntitlement, present := document.Candidate["entitlement"]
+	if !present {
+		return nil
+	}
+	if bytes.Equal(bytes.TrimSpace(rawEntitlement), []byte("null")) {
+		return fmt.Errorf("candidate.entitlement must be an object, not null")
+	}
+	var entitlement map[string]json.RawMessage
+	if err := json.Unmarshal(rawEntitlement, &entitlement); err != nil {
+		return nil
+	}
+	if rawRef, ok := entitlement["entitlement_ref"]; ok {
+		trimmed := bytes.TrimSpace(rawRef)
+		if bytes.Equal(trimmed, []byte("null")) || bytes.Equal(trimmed, []byte(`""`)) {
+			return fmt.Errorf("candidate.entitlement.entitlement_ref must be omitted rather than empty")
+		}
+	}
+	return nil
+}
+
 // Validate enforces the schema plus the cross-field invariant that the
 // artifact path is exactly its content address.
 func (b *AcquisitionBundle) Validate() error {
-	if b.SchemaVersion != AcquisitionBundleSchemaVersion {
-		return fmt.Errorf("schema_version %q, want %q", b.SchemaVersion, AcquisitionBundleSchemaVersion)
+	switch b.SchemaVersion {
+	case AcquisitionBundleSchemaVersion:
+		// v1 froze its shape with additionalProperties:false. Accepting an
+		// entitlement here would silently widen a published schema, so a v1
+		// document carrying one is a malformed v1 document, not a lenient v2.
+		if b.Candidate.Entitlement != nil {
+			return fmt.Errorf("candidate.entitlement requires schema_version %q", AcquisitionBundleSchemaVersionV2)
+		}
+	case AcquisitionBundleSchemaVersionV2:
+		if err := b.Candidate.Entitlement.validate(); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("schema_version %q, want %q or %q",
+			b.SchemaVersion, AcquisitionBundleSchemaVersion, AcquisitionBundleSchemaVersionV2)
 	}
 	if !requestIDRE.MatchString(b.JobID) {
 		return fmt.Errorf("invalid job_id %q", b.JobID)
@@ -385,6 +471,65 @@ func (b *AcquisitionBundle) Validate() error {
 	}
 	if b.ZotioItemKey != "" && !zoteroKeyRE.MatchString(b.ZotioItemKey) {
 		return fmt.Errorf("invalid zotio_item_key %q", b.ZotioItemKey)
+	}
+	return nil
+}
+
+// validate enforces the sanitised-reference rule at emission. A nil entitlement
+// is valid: the object is optional and omitted whenever papio did not observe a
+// route. papio fails closed here rather than shipping a value the consumer must
+// reject — the rule is papio's obligation, not a note about the consumer.
+func (e *BundleEntitlement) validate() error {
+	if e == nil {
+		return nil
+	}
+	if err := validateBareRoute(e.Route); err != nil {
+		return err
+	}
+	if e.EntitlementRef != "" && !entitlementRefRE.MatchString(e.EntitlementRef) {
+		return fmt.Errorf("invalid candidate.entitlement.entitlement_ref %q: want entitlement:source:<name> or entitlement:sha256:<64 hex>", e.EntitlementRef)
+	}
+	return enumRequired("candidate.entitlement.acquisition_mode", e.AcquisitionMode,
+		"open_access", "daemon_held_credential", "operator_browser_session")
+}
+
+// validateBareRoute admits only a bare origin: an https URL with a host and
+// nothing else — no path, query, fragment, or userinfo.
+//
+// It must agree exactly with the published schema's
+// `^https://[^/?#@]+$` + maxLength, because this project validates twice on
+// purpose and a validator laxer than its schema is a decoder disagreement
+// waiting to be exported. The path check earns its place: a path is where
+// signed tokens live in several CDN schemes, and redact.URL preserves the whole
+// path when the source URL had no query string — so an emitter that reached for
+// redact.URL instead of redact.Host would sail past a scheme/host-only check.
+//
+// The literal '?' and '#' checks are likewise not redundant with the parsed
+// fields: redact.URL returns "…?<redacted>" to mark that evidence was removed,
+// which is right for an operator log and fatal for a route, because the marker
+// IS query data.
+func validateBareRoute(route string) error {
+	if route == "" {
+		return fmt.Errorf("candidate.entitlement.route required")
+	}
+	if len(route) > 2000 {
+		return fmt.Errorf("candidate.entitlement.route length %d exceeds 2000", len(route))
+	}
+	if strings.ContainsAny(route, "?#") {
+		return fmt.Errorf("candidate.entitlement.route %q must not retain URL query or fragment data", route)
+	}
+	u, err := url.Parse(route)
+	if err != nil {
+		return fmt.Errorf("invalid candidate.entitlement.route %q", route)
+	}
+	if u.Scheme != "https" || u.Host == "" {
+		return fmt.Errorf("candidate.entitlement.route %q must be an https URL with a host", route)
+	}
+	if u.User != nil {
+		return fmt.Errorf("candidate.entitlement.route %q must not retain URL credentials", route)
+	}
+	if u.Path != "" || u.RawPath != "" || u.Opaque != "" {
+		return fmt.Errorf("candidate.entitlement.route %q must be a bare origin with no path", route)
 	}
 	return nil
 }
