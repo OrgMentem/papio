@@ -21,6 +21,42 @@ execution records in `notes/acquisition-stack-plan.md`.
   bundle cannot exist; an accepted main component's bundle remains the success
   provenance document. `truncated` on the two paged methods is a proven fact
   from reading one row past the page limit, not a hint that more may exist.
+- **`acquire.submit_v2` is ratified, so an external tool can now start an
+  acquisition.** The six ratified methods all read or act on a job that already
+  exists, so a consumer had no ratified way to ask *papio* for anything and
+  *papio*'s acquisition success rate was unmeasurable from the only side
+  counting it. One work per call — bulk submission, a generic reopen verb,
+  method aliases, and autonomous drain all remain unratified. Frozen: the
+  method name, the params `request` / `auto_import` / `force`, the result
+  `job_id` / `existing`, and the work-request identity subset plus
+  `access_mode_override`. Policy fields stay served but unratified so a
+  consumer cannot pin *papio*'s policy vocabulary. Note that `request_id` is a
+  live-job convergence key and not an idempotency key: a terminal job plus the
+  same `request_id` creates a new job, and `existing` means "a live job already
+  owns this work", so a consumer resuming a run must persist the returned
+  `job_id`. See ADR-0010.
+- **Bundles now emit `acquisition-bundle/2`, adding `candidate.entitlement`.**
+  It records the route by which access was obtained — `route`, an optional
+  `entitlement_ref`, and `acquisition_mode` — and it is a route, never an
+  identity: *papio* never authenticates a human and never holds institutional
+  credentials. `acquisition_mode` is derived from the accepted candidate's
+  existing `access_basis`, so nothing is inferred, and the whole object is
+  omitted whenever *papio* did not observe a route. `daemon_held_credential` is
+  not a future mode: CORE and Crossref TDM already acquire with *papio*'s own
+  configured API credential, and `entitlement_ref` names which one in cleartext
+  (`entitlement:source:crossref_tdm`) rather than hashing a public constant.
+  `operator_browser_session` is reserved and has no producer: browser adoption
+  records `institutional` for every adopted download, including an open-access
+  PDF handed to the browser only because a provider's anti-bot wall refused
+  *papio*'s own fetch, so claiming an institutional route would invent
+  entitlement evidence for a route nobody walked. v1 decoding is retained
+  indefinitely, and a v1 document carrying an entitlement — including an
+  explicit `null` — is rejected rather than silently accepted.
+- **`bundle.export_v2` carries the exported document; `bundle.export` returns
+  the path alone.** IPC results are decoded with unknown fields rejected, and
+  that applies to nested objects, so returning a v2 bundle body from the old
+  method would make an older CLI reject every export response from a newer
+  daemon. The new CLI prefers `bundle.export_v2` and falls back automatically.
 - **`papio acquire` accepts a bare arXiv id.** `papio acquire 2301.08745` and
   `papio acquire math/0211159` previously failed with "cannot infer identifier
   type" and needed an `arxiv:` prefix or `--arxiv`. Both forms are unambiguous
@@ -81,6 +117,39 @@ execution records in `notes/acquisition-stack-plan.md`.
 
 ### Fixed
 
+- **A per-request `access_mode_override` now actually governs the acquisition,
+  and can only narrow.** The override was validated, snapshotted into the job's
+  policy, and printed by `papio diagnose` — while the only code that decides
+  whether to open an institutional browser handoff read the daemon-wide
+  `access_mode` instead. Submitting one work as `conservative` against an
+  `assisted` or `delegated` daemon therefore opened a handoff anyway, and
+  reported that it had honoured the override. The job's own snapshot is now
+  authoritative at both decision points — the exhaustion gate and the
+  `access_mode` sent to the extension in a job offer. The daemon-wide value
+  remains the fallback for jobs recorded before policies carried a mode.
+  An override may now only *narrow*: the configured `access_mode` is the
+  operator's standing decision and the only brake papio has, so a submitter
+  cannot raise automation above it. Narrowing is what the override is for — a
+  cohort run asking for `conservative` on a delegated daemon records
+  `openurl_available` advisories and opens nothing, instead of parking hundreds
+  of handoffs that never expire.
+- **Widening `access_mode` and retrying a conservative job works again.** The
+  conservative advisory tells the operator to switch access mode and retry, but
+  a retry preserves the job's policy — so once the policy became authoritative
+  the job re-exhausted under its original mode and reopened the same advisory,
+  telling the operator to do the thing they had just done. Retry now releases
+  the pinned mode in the same step that cancels the advisory.
+- **A stale parked job can no longer disconnect the browser extension.** A job
+  whose access mode resolves to `conservative` cannot be expressed in a
+  `papio-browser/1` job offer, and any error out of the bridge is treated by
+  the native host as a dead connection — so one such row would have torn down
+  the whole native-messaging session instead of being skipped. It is now
+  skipped, and its siblings are still offered.
+- **`papio acquire --batch` works again against an older running daemon.** Batch
+  moved to `acquire.submit_v2` without the `unknown_method` fallback the
+  single-work path has carried since that method shipped, so every work in a
+  batch failed against a daemon older than 0.13.0 — a routine state, since one
+  binary serves as CLI, daemon, and native host.
 - **`update.Checker.Check` no longer returns an error it can never produce.**
   Its failure policy is deliberately soft — a GitHub outage must not make
   `papio doctor` noisy — so every path returned `nil`, leaving unreachable

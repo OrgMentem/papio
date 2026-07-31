@@ -2,6 +2,17 @@
 
 Status: Accepted (2026-07-30). Extends ADR-0007 and is governed by ADR-0001.
 
+**Amended by ADR-0010 (2026-07-31), in three places. Read them before acting on
+this document.** Decision 2's refusal of bulk `acquire.submit` stands, but the
+narrow single-work `acquire.submit_v2` is now ratified as a seventh method.
+Decision 4 names the wrong sanitiser: `redact.URL` appends a `?<redacted>`
+marker and therefore emits query data, so `redact.Host` is the emitter.
+Decision 5's worked example is invalid — the consumer's gate rejects both
+`resolver-profile:institutional-openurl` and
+`entitlement-profile:library-e-resource` — and its "Nothing is emitted yet" no
+longer holds: `acquisition-bundle/2` is cut and emitting, with
+`daemon_held_credential` a current mode rather than a future one.
+
 ## Context
 
 *papio*'s first external consumer arrived through the seam ADR-0004 anticipated.
