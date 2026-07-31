@@ -392,12 +392,8 @@ function makeHarness(
     settings: {
       getTermsConsent: async () => undefined,
       setTermsConsent: async () => {},
-      ...(opts?.workWindowEnabled !== undefined
-        ? { getWorkWindowEnabled: async () => opts.workWindowEnabled === true }
-        : {}),
-      ...(opts?.handoffSurface !== undefined
-        ? { getHandoffSurface: async () => opts.handoffSurface! }
-        : {}),
+      getHandoffSurface: async () =>
+        opts?.handoffSurface ?? (opts?.workWindowEnabled === false ? "in-window" : "work-window"),
     },
     ...(windows !== undefined ? { windows } : {}),
     ...(tabGroups !== undefined ? { tabGroups } : {}),
@@ -2307,7 +2303,11 @@ test("overlapping state writes persist serially so no stale snapshot wins", asyn
     adapterSpecs: [],
     scripting: { executeScript: async () => [] },
     permissions: { contains: async () => false },
-    settings: { getTermsConsent: async () => undefined, setTermsConsent: async () => {} },
+    settings: {
+      getTermsConsent: async () => undefined,
+      setTermsConsent: async () => {},
+      getHandoffSurface: async () => "work-window",
+    },
     action: {
       setBadgeText: async () => {},
       setBadgeBackgroundColor: async () => {},

@@ -4,7 +4,7 @@
 // Selecting the daemon's `delegated` access mode never grants a Chrome permission
 // by itself — that only happens here, explicitly.
 
-import { chromeBackend, type StoreShape } from "./state";
+import { chromeBackend, WORK_WINDOW_KEY, HANDOFF_SURFACE_KEY, type StoreShape } from "./state";
 import { renderPapio } from "./dom";
 import { adapters, type AdapterSpec } from "./adapters/types";
 
@@ -203,8 +203,6 @@ function wireTermsConsent(): void {
   });
 }
 
-const WORK_WINDOW_KEY = "papio_work_window_v1";
-const HANDOFF_SURFACE_KEY = "papio_handoff_surface_v1";
 type HandoffSurface = "in-window" | "work-window" | "tab-group";
 
 async function currentHandoffSurface(): Promise<HandoffSurface> {

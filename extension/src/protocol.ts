@@ -387,6 +387,19 @@ function requireKeys(obj: Record<string, unknown>, what: string, required: strin
   }
 }
 
+type FieldSpec<T> = { [K in keyof Required<T> & string]: "required" | "optional" };
+
+function requireFields<T>(obj: Record<string, unknown>, what: string, spec: FieldSpec<T>): void {
+  for (const key of Object.keys(obj)) {
+    if (!(key in spec)) fail(`${what}: unknown field ${JSON.stringify(key)} (fail closed)`);
+  }
+  for (const key of Object.keys(spec)) {
+    if (spec[key as keyof FieldSpec<T>] === "required" && !(key in obj)) {
+      fail(`${what}: missing required field ${JSON.stringify(key)}`);
+    }
+  }
+}
+
 function str(obj: Record<string, unknown>, key: string, what: string, max = 1000): string {
   const v = obj[key];
   if (typeof v !== "string") fail(`${what}.${key} must be a string`);
@@ -468,7 +481,15 @@ function triageCounts(raw: unknown, what: string): void {
     "jobs_needs_review",
     "failure_groups_7d",
   ];
-  requireKeys(counts, what, fields);
+  requireFields<TriageCounts>(counts, what, {
+    pending_total: "required",
+    watch_hits: "required",
+    actions: "required",
+    retractions: "required",
+    jobs_working: "required",
+    jobs_needs_review: "required",
+    failure_groups_7d: "required",
+  });
   const pending = int(counts, "pending_total", what, 0);
   const visible = int(counts, "watch_hits", what, 0) + int(counts, "actions", what, 0) + int(counts, "retractions", what, 0);
   for (const key of fields.slice(4)) int(counts, key, what, 0);
@@ -581,7 +602,7 @@ function triageItem(raw: unknown, schema: 1 | 2): void {
 }
 
 function triageResult(p: Record<string, unknown>, what: string): void {
-  requireKeys(p, what, ["request_id", "outcome"], ["detail"]);
+  requireFields<TriageDecideResultPayload>(p, what, { request_id: "required", outcome: "required", detail: "optional" });
   correlationID(p, "request_id", what);
   const outcome = triageText(p, "outcome", what, 50);
   if (!["applied", "already_applied", "conflict", "error"].includes(outcome)) fail(`${what}.outcome is invalid`);
@@ -637,7 +658,7 @@ export function parseBrowserMessageBytes(text: string): BrowserMessage {
 function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): void {
   switch (type) {
     case "hello": {
-      requireKeys(p, "hello", ["extension_version"], ["adapter_versions"]);
+      requireFields<HelloPayload>(p, "hello", { extension_version: "required", adapter_versions: "optional" });
       const v = str(p, "extension_version", "hello", 50);
       if (v.length === 0) fail("hello.extension_version required");
       if ("adapter_versions" in p) {
@@ -654,7 +675,7 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
       break;
     }
     case "page_acquire": {
-      requireKeys(p, "page_acquire", ["url"], ["doi", "title", "source"]);
+      requireFields<PageAcquirePayload>(p, "page_acquire", { url: "required", doi: "optional", title: "optional", source: "optional" });
       const pageURL = str(p, "url", "page_acquire", 4000);
       rejectNUL(pageURL, "page_acquire.url");
       let validURL = false;
@@ -671,7 +692,7 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
       break;
     }
     case "page_acquire_ack": {
-      requireKeys(p, "page_acquire_ack", [], ["job_id", "duplicate", "error"]);
+      requireFields<PageAcquireAckPayload>(p, "page_acquire_ack", { job_id: "optional", duplicate: "optional", error: "optional" });
       const jobID = "job_id" in p ? str(p, "job_id", "page_acquire_ack", 128) : "";
       if ("job_id" in p && jobID === "") fail("page_acquire_ack.job_id must be non-empty");
       if (jobID !== "" && !JOB_ID_RE.test(jobID)) {
@@ -693,7 +714,15 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
       break;
     }
     case "page_capture": {
-      requireKeys(p, "page_capture", ["host", "scenario", "encoding", "bytes", "body"], ["adapter_id", "adapter_version"]);
+      requireFields<PageCapturePayload>(p, "page_capture", {
+        host: "required",
+        scenario: "required",
+        adapter_id: "optional",
+        adapter_version: "optional",
+        encoding: "required",
+        bytes: "required",
+        body: "required",
+      });
       const host = str(p, "host", "page_capture", 253);
       if (!HOST_RE.test(host)) fail("page_capture.host must be a hostname");
       const scenario = str(p, "scenario", "page_capture", 50);
@@ -715,7 +744,16 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
       break;
     }
     case "job_offer": {
-      requireKeys(p, "job_offer", ["openurl", "provider_hosts", "access_mode", "expires_at"], ["expected", "login_entity_id", "proquest_account_id", "requires_auth"]);
+      requireFields<JobOfferPayload>(p, "job_offer", {
+        openurl: "required",
+        provider_hosts: "required",
+        expected: "optional",
+        access_mode: "required",
+        expires_at: "required",
+        login_entity_id: "optional",
+        proquest_account_id: "optional",
+        requires_auth: "optional",
+      });
       const openurl = str(p, "openurl", "job_offer", 4000);
       if (!openurl.startsWith("https://")) fail("job_offer.openurl must be https");
       const hosts = p["provider_hosts"];
@@ -731,7 +769,7 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
       if (!isRFC3339(expires)) fail("job_offer.expires_at must be RFC3339");
       if ("expected" in p) {
         const ex = asRecord(p["expected"], "job_offer.expected");
-        requireKeys(ex, "job_offer.expected", [], ["doi", "title"]);
+        requireFields<JobOfferExpected>(ex, "job_offer.expected", { doi: "optional", title: "optional" });
         if ("doi" in ex) str(ex, "doi", "job_offer.expected", 300);
         if ("title" in ex) str(ex, "title", "job_offer.expected", 500);
       }
@@ -749,7 +787,7 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
       break;
     }
     case "handoff_outcome": {
-      requireKeys(p, "handoff_outcome", ["outcome", "final_host"]);
+      requireFields<HandoffOutcomePayload>(p, "handoff_outcome", { outcome: "required", final_host: "required" });
       const outcome = str(p, "outcome", "handoff_outcome", 20);
       if (outcome !== "stale_sso" && outcome !== "auth_error") {
         fail(`invalid handoff outcome ${JSON.stringify(outcome)}`);
@@ -761,12 +799,12 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
     case "auth_pending":
     case "auth_returned": {
       // Structural privacy invariant: timing only.
-      requireKeys(p, type, [], ["elapsed_ms"]);
+      requireFields<AuthPayload>(p, type, { elapsed_ms: "optional" });
       if ("elapsed_ms" in p) int(p, "elapsed_ms", type, 0);
       break;
     }
     case "download_started": {
-      requireKeys(p, "download_started", ["download_id", "filename"]);
+      requireFields<DownloadStartedPayload>(p, "download_started", { download_id: "required", filename: "required" });
       int(p, "download_id", "download_started", 0);
       if (!FILENAME_RE.test(str(p, "filename", "download_started", 255))) {
         fail("download_started.filename must be a bare name without path separators");
@@ -774,7 +812,7 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
       break;
     }
     case "download_complete": {
-      requireKeys(p, "download_complete", ["download_id", "filename", "size_bytes"]);
+      requireFields<DownloadCompletePayload>(p, "download_complete", { download_id: "required", filename: "required", size_bytes: "required" });
       int(p, "download_id", "download_complete", 0);
       if (!FILENAME_RE.test(str(p, "filename", "download_complete", 255))) {
         fail("download_complete.filename must be a bare name without path separators");
@@ -783,7 +821,7 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
       break;
     }
     case "provider_outcome": {
-      requireKeys(p, "provider_outcome", ["outcome"], ["adapter_version", "detail"]);
+      requireFields<ProviderOutcomePayload>(p, "provider_outcome", { outcome: "required", adapter_version: "optional", detail: "optional" });
       const outcome = str(p, "outcome", "provider_outcome", 50);
       if (OUTCOMES[outcome] !== true) fail(`invalid outcome ${JSON.stringify(outcome)}`);
       if ("adapter_version" in p) str(p, "adapter_version", "provider_outcome", 50);
@@ -791,14 +829,14 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
       break;
     }
     case "error": {
-      requireKeys(p, "error", ["code", "message"]);
+      requireFields<ErrorPayload>(p, "error", { code: "required", message: "required" });
       if (!ERROR_CODE_RE.test(str(p, "code", "error", 50))) fail("invalid error code");
       const message = str(p, "message", "error", 1000);
       if (message.length === 0) fail("error.message required");
       break;
     }
     case "hello_ack": {
-      requireKeys(p, "hello_ack", [], ["daemon_version", "features", "resolver_origins"]);
+      requireFields<HelloAckPayload>(p, "hello_ack", { daemon_version: "optional", features: "optional", resolver_origins: "optional" });
       if ("daemon_version" in p) str(p, "daemon_version", "hello_ack", 50);
       if ("features" in p) {
         const features = p["features"];
@@ -832,7 +870,7 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
       break;
     }
     case "triage_snapshot_request": {
-      requireKeys(p, "triage_snapshot_request", ["request_id", "schema_versions"], ["limit", "cursor"]);
+      requireFields<TriageSnapshotRequestPayload>(p, "triage_snapshot_request", { request_id: "required", schema_versions: "required", limit: "optional", cursor: "optional" });
       correlationID(p, "request_id", "triage_snapshot_request");
       const versions = p["schema_versions"];
       if (!Array.isArray(versions) || versions.length !== 1 || (versions[0] !== 1 && versions[0] !== 2)) {
@@ -844,8 +882,16 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
       break;
     }
     case "triage_snapshot_response": {
-      requireKeys(p, "triage_snapshot_response",
-        ["request_id", "schema", "generated_at", "counts", "items", "has_more", "unsupported_items_count"], ["cursor"]);
+      requireFields<TriageSnapshotResponsePayload>(p, "triage_snapshot_response", {
+        request_id: "required",
+        schema: "required",
+        generated_at: "required",
+        counts: "required",
+        items: "required",
+        cursor: "optional",
+        has_more: "required",
+        unsupported_items_count: "required",
+      });
       correlationID(p, "request_id", "triage_snapshot_response");
       if (p["schema"] !== 1 && p["schema"] !== 2) fail("triage_snapshot_response.schema must be 1 or 2");
       const schema = p["schema"] as 1 | 2;
@@ -862,18 +908,18 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
       break;
     }
     case "triage_counts_request": {
-      requireKeys(p, "triage_counts_request", ["request_id"]);
+      requireFields<TriageCountsRequestPayload>(p, "triage_counts_request", { request_id: "required" });
       correlationID(p, "request_id", "triage_counts_request");
       break;
     }
     case "triage_counts_response": {
-      requireKeys(p, "triage_counts_response", ["request_id", "counts"]);
+      requireFields<TriageCountsResponsePayload>(p, "triage_counts_response", { request_id: "required", counts: "required" });
       correlationID(p, "request_id", "triage_counts_response");
       triageCounts(p["counts"], "triage_counts_response.counts");
       break;
     }
     case "triage_decide": {
-      requireKeys(p, "triage_decide", ["request_id", "item_id", "op"], ["watch_scope"]);
+      requireFields<TriageDecidePayload>(p, "triage_decide", { request_id: "required", item_id: "required", op: "required", watch_scope: "optional" });
       correlationID(p, "request_id", "triage_decide");
       if (triageText(p, "item_id", "triage_decide", 1024) === "") fail("triage_decide.item_id is required");
       const op = triageText(p, "op", "triage_decide", 20);
@@ -899,7 +945,7 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
       triageResult(p, "triage_decide_result");
       break;
     case "human_action_resolve": {
-      requireKeys(p, "human_action_resolve", ["request_id", "action_id", "verdict", "expected_revision"], ["expected_sha256"]);
+      requireFields<HumanActionResolvePayload>(p, "human_action_resolve", { request_id: "required", action_id: "required", verdict: "required", expected_revision: "required", expected_sha256: "optional" });
       correlationID(p, "request_id", "human_action_resolve");
       int(p, "action_id", "human_action_resolve", 1);
       int(p, "expected_revision", "human_action_resolve", 1);
@@ -916,13 +962,21 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
       triageResult(p, "human_action_resolve_result");
       break;
     case "review_preview_request": {
-      requireKeys(p, "review_preview_request", ["request_id", "action_id"]);
+      requireFields<ReviewPreviewRequestPayload>(p, "review_preview_request", { request_id: "required", action_id: "required" });
       correlationID(p, "request_id", "review_preview_request");
       int(p, "action_id", "review_preview_request", 1);
       break;
     }
     case "review_preview_result": {
-      requireKeys(p, "review_preview_result", ["request_id", "outcome"], ["detail", "url", "sha256", "size_bytes", "expires_at"]);
+      requireFields<ReviewPreviewResultPayload>(p, "review_preview_result", {
+        request_id: "required",
+        outcome: "required",
+        detail: "optional",
+        url: "optional",
+        sha256: "optional",
+        size_bytes: "optional",
+        expires_at: "optional",
+      });
       correlationID(p, "request_id", "review_preview_result");
       const outcome = triageText(p, "outcome", "review_preview_result", 10);
       if (outcome !== "ok" && outcome !== "error") fail("review_preview_result.outcome must be ok or error");
@@ -948,20 +1002,27 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
       break;
     }
     case "stats_request": {
-      requireKeys(p, "stats_request", ["request_id"]);
+      requireFields<StatsRequestPayload>(p, "stats_request", { request_id: "required" });
       correlationID(p, "request_id", "stats_request");
       break;
     }
     case "stats_response": {
-      requireKeys(p, "stats_response",
-        ["request_id", "generated_at", "acquired_total", "failed_total", "handoffs_required", "access", "series"]);
+      requireFields<StatsResponsePayload>(p, "stats_response", {
+        request_id: "required",
+        generated_at: "required",
+        acquired_total: "required",
+        failed_total: "required",
+        handoffs_required: "required",
+        access: "required",
+        series: "required",
+      });
       correlationID(p, "request_id", "stats_response");
       triageTime(p, "generated_at", "stats_response");
       int(p, "acquired_total", "stats_response", 0);
       int(p, "failed_total", "stats_response", 0);
       int(p, "handoffs_required", "stats_response", 0);
       const access = asRecord(p["access"], "stats_response.access");
-      requireKeys(access, "stats_response.access", ["open_access", "institutional", "licensed_api", "other"]);
+      requireFields<StatsAccess>(access, "stats_response.access", { open_access: "required", institutional: "required", licensed_api: "required", other: "required" });
       for (const key of ["open_access", "institutional", "licensed_api", "other"]) {
         int(access, key, "stats_response.access", 0);
       }
@@ -969,7 +1030,7 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
       if (!Array.isArray(series) || series.length > 60) fail("stats_response.series must have at most 60 entries");
       for (const rawBucket of series) {
         const bucket = asRecord(rawBucket, "stats_response.series");
-        requireKeys(bucket, "stats_response.series", ["period_start", "acquired"]);
+        requireFields<StatsBucket>(bucket, "stats_response.series", { period_start: "required", acquired: "required" });
         triageTime(bucket, "period_start", "stats_response.series");
         int(bucket, "acquired", "stats_response.series", 0);
       }

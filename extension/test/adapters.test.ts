@@ -941,6 +941,7 @@ function makeMapHarness(specs: AdapterSpec[] = [SPEC]): MapHarness {
       setTermsConsent: async (v) => {
         settings.consent = v;
       },
+      getHandoffSurface: async () => "work-window",
     },
     action: {
       setBadgeText: async () => {},

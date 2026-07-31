@@ -25,6 +25,24 @@ for the full pre-split extension history.
   binary over the build under development. A `dev` daemon is now named as a
   development build and pointed at `make dev-deploy`, which is what actually
   rebuilds it, repoints the native-messaging host, and restarts both.
+- **The legacy work-window flag is honored in exactly one place.** The
+  tri-state handoff-surface setting superseded the older boolean, but the
+  migration had been implemented twice — once in the settings getter and once as
+  a fallback in the bridge that could never execute. Anyone changing upgrade
+  behavior would have edited the unreachable copy and shipped nothing. The
+  surface a user gets is unchanged, including the Firefox 128 ESR degradation
+  from tab-group mode.
+
+### Changed
+
+- **The wire contract's TypeScript half is now compiler-enforced.** Eighteen
+  payload interfaces in `src/protocol.ts` were referenced by nothing, so a field
+  added to the daemon struct and the JSON schema but forgotten here produced no
+  typecheck error and no test failure. The parser's per-message field lists are
+  now typed against those interfaces in both directions: a field the interface
+  declares but the parser does not validate, and a field validated under a name
+  the interface does not have, are both build errors. No frame that was accepted
+  or rejected before changes status.
 
 ## [0.8.0] - 2026-07-27
 

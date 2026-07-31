@@ -332,11 +332,9 @@ export interface BridgeDeps {
   settings: {
     getTermsConsent(): Promise<TermsConsent>;
     setTermsConsent(value: Exclude<TermsConsent, undefined>): Promise<void>;
-    /** Optional; absent means enabled. Legacy boolean, still honored. */
-    getWorkWindowEnabled?(): Promise<boolean>;
-    /** Optional tri-state surface choice; when present it overrides the legacy
-     * boolean. `tab-group` degrades to `work-window` if tabGroups is absent. */
-    getHandoffSurface?(): Promise<HandoffSurface>;
+    /** Tri-state surface choice. `tab-group` degrades to `work-window` if
+     * tabGroups is absent. */
+    getHandoffSurface(): Promise<HandoffSurface>;
   };
   /** Toolbar badge for connection health. Kept injectable so bridge logic has
    * no dependency on a particular browser global. */
@@ -870,32 +868,11 @@ export class Bridge {
     await this.syncConnectionBadge();
   }
 
-  /** Resolve where handoffs open. A tri-state setting (if present) wins; else
-   * the legacy boolean maps true/absent -> work-window, false -> in-window.
-   * `tab-group` degrades to `work-window` when the platform lacks tab groups,
-   * and any window-backed mode degrades to `in-window` without a windows API. */
+  /** Resolve where handoffs open. `tab-group` degrades to `work-window` when
+   * the platform lacks tab groups, and any window-backed mode degrades to
+   * `in-window` without a windows API. */
   private async handoffSurface(): Promise<HandoffSurface> {
-    let surface: HandoffSurface | undefined;
-    const getSurface = this.deps.settings.getHandoffSurface;
-    if (getSurface !== undefined) {
-      try {
-        surface = await getSurface();
-      } catch {
-        surface = undefined;
-      }
-    }
-    if (surface === undefined) {
-      const getEnabled = this.deps.settings.getWorkWindowEnabled;
-      let enabled = true;
-      if (getEnabled !== undefined) {
-        try {
-          enabled = await getEnabled();
-        } catch {
-          enabled = true;
-        }
-      }
-      surface = enabled ? "work-window" : "in-window";
-    }
+    let surface = await this.deps.settings.getHandoffSurface();
     if (surface === "tab-group" && this.deps.tabs.group === undefined) surface = "work-window";
     if (surface === "work-window" && this.deps.windows === undefined) surface = "in-window";
     return surface;
@@ -4595,14 +4572,6 @@ function realDeps(): BridgeDeps {
       },
       async setTermsConsent(value) {
         await chrome.storage.local.set({ [TERMS_CONSENT_KEY]: value });
-      },
-      async getWorkWindowEnabled() {
-        try {
-          const got = await chrome.storage.local.get(WORK_WINDOW_KEY);
-          return got[WORK_WINDOW_KEY] !== false;
-        } catch {
-          return true;
-        }
       },
       async getHandoffSurface(): Promise<HandoffSurface> {
         try {
