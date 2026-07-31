@@ -84,12 +84,6 @@ func TestDurableRetryAfterGateSurvivesManager(t *testing.T) {
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("durable gate returned %v, want context deadline", err)
 	}
-	if err := m2.ClearDefer(context.Background(), "remote"); err != nil {
-		t.Fatal(err)
-	}
-	if err := m2.Acquire(context.Background(), "remote", config.Source{Enabled: true}, 0); err != nil {
-		t.Fatalf("cleared gate still blocked: %v", err)
-	}
 }
 
 func TestDeferNeverShortensExistingGate(t *testing.T) {

@@ -189,8 +189,8 @@ state. See the [filing guide](../guide/hooks.md).
 ## `[sources.<name>]`
 
 `[sources]` is a map of resolver policies. The supported built-in names are
-`arxiv`, `europepmc`, `unpaywall`, `openalex`, `openalex_content`, `core`,
-`crossref_tdm`, and `semanticscholar` (discovery-only; see `[discovery]`).
+`arxiv`, `europepmc`, `unpaywall`, `openalex`, `core`, `crossref_tdm`, and
+`semanticscholar` (discovery-only; see `[discovery]`).
 Each named section accepts these keys:
 
 | Key | Type | Default | Effect and constraints |
@@ -210,7 +210,6 @@ Each named section accepts these keys:
 | `europepmc` | `true` | 2 | 2 |
 | `unpaywall` | `true` | 1 | 1 |
 | `openalex` | `false` | 2 | 2 |
-| `openalex_content` | `false` | 0 | 0 |
 | `core` | `false` | 0.4 | 1 |
 | `crossref_tdm` | `false` | 1 | 1 |
 

@@ -76,19 +76,19 @@ func TestExplainNoAccessNamedProfileNotConfigured(t *testing.T) {
 func TestWaitGuidance(t *testing.T) {
 	cfg := config.Config{AccessMode: config.ModeDelegated}
 	// Success and non-actionable states produce no guidance block.
-	if g := WaitGuidance("ready", "", "", "", cfg); g != "" {
+	if g := WaitGuidanceWithOpenAction("ready", "", "", "", nil, cfg); g != "" {
 		t.Fatalf("ready guidance = %q, want empty", g)
 	}
-	if g := WaitGuidance("resolving", "", "", "", cfg); g != "" {
+	if g := WaitGuidanceWithOpenAction("resolving", "", "", "", nil, cfg); g != "" {
 		t.Fatalf("resolving guidance = %q, want empty", g)
 	}
 	// A parked job renders a bracketed category and an arrow next-step.
-	g := WaitGuidance("awaiting_human", "institutional_handoff", "", "", cfg)
+	g := WaitGuidanceWithOpenAction("awaiting_human", "institutional_handoff", "", "", nil, cfg)
 	if !strings.Contains(g, "[login_required]") || !strings.Contains(g, "\u2192") {
 		t.Fatalf("awaiting_human guidance = %q", g)
 	}
 	// The config-aware no-access case reaches acquire --wait output too.
-	g = WaitGuidance("unavailable", "no_legal_candidates", "", config.ModeDelegated, cfg)
+	g = WaitGuidanceWithOpenAction("unavailable", "no_legal_candidates", "", config.ModeDelegated, nil, cfg)
 	if !strings.Contains(g, "[institution_not_configured]") {
 		t.Fatalf("unavailable guidance = %q", g)
 	}
@@ -178,7 +178,7 @@ func TestNoIdentifierGuidanceNeverAsksForASignIn(t *testing.T) {
 		}
 	}
 	// And it must be reachable from acquire --wait, not just the dashboard.
-	if g := WaitGuidance("unavailable", "no_identifier", "", config.ModeDelegated, cfg); !strings.Contains(g, "[no_identifier]") {
+	if g := WaitGuidanceWithOpenAction("unavailable", "no_identifier", "", config.ModeDelegated, nil, cfg); !strings.Contains(g, "[no_identifier]") {
 		t.Fatalf("wait guidance = %q", g)
 	}
 }

@@ -52,10 +52,10 @@ func defaultDoctorDependencies(opt *options) doctor.IntegrationDependencies {
 		ZotioPreflight: func(ctx context.Context, cfg config.Config) (*zotio.PreflightResult, error) {
 			return zotio.New(cfg.Zotio).Preflight(ctx)
 		},
-		CheckUpdates: func(ctx context.Context, cfg config.Config) (*update.Info, error) {
+		CheckUpdates: func(ctx context.Context, cfg config.Config) *update.Info {
 			return update.New(cfg.DataDir).Check(ctx)
 		},
-		CheckZotioUpdates: func(ctx context.Context, cfg config.Config) (*update.Info, error) {
+		CheckZotioUpdates: func(ctx context.Context, cfg config.Config) *update.Info {
 			return update.NewZotio(cfg.DataDir).Check(ctx)
 		},
 		LibrarySources: probeLibrarySources,

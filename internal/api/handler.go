@@ -370,7 +370,7 @@ func ping(ctx context.Context, raw json.RawMessage, system *bootstrap.System, up
 			refreshCtx := context.WithoutCancel(ctx)
 			go func() {
 				defer updateRefreshInFlight.Store(false)
-				_, _ = checker.Check(refreshCtx)
+				_ = checker.Check(refreshCtx)
 			}()
 		}
 		zotioAvailable := false

@@ -143,14 +143,14 @@ const pendingExpireAfter = 5 * time.Minute
 
 // NewBridge constructs the bridge. It is cheap and always constructed; whether
 // any job is ever offered depends on config (extension_id / openurl base).
-func NewBridge(jobs *job.Store, svc *app.Service, triageService *triage.Service, watchRunner *watch.Runner, previewServer *preview.Server, captureStore *captures.Store, cfg config.Config, version string, features []string) *Bridge {
+func NewBridge(jobs *job.Store, svc *app.Service, triageService *triage.Service, watchRunner *watch.Runner, previewServer *preview.Server, captureStore *captures.Store, cfg config.Config, version string) *Bridge {
 	required := []string{
 		pageAcquireFeature, triageSnapshotFeature, triageSnapshotSchema2Feature, triageMutationsFeature, reviewPreviewFeature, statsFeature, pageCaptureFeature,
 	}
 	return &Bridge{
 		jobs: jobs, svc: svc, triage: triageService, watchRunner: watchRunner, preview: previewServer, captureStore: captureStore, cfg: cfg,
 		Version:      version,
-		Features:     appendFeatures(features, required...),
+		Features:     required,
 		offered:      map[string]bool{},
 		cancelSent:   map[string]bool{},
 		authReleased: map[int64]bool{},
@@ -158,36 +158,6 @@ func NewBridge(jobs *job.Store, svc *app.Service, triageService *triage.Service,
 		pending:      map[string]*browserSession{},
 		now:          time.Now,
 	}
-}
-
-func appendFeatures(features []string, required ...string) []string {
-	mandatory := make(map[string]bool, len(required))
-	orderedRequired := make([]string, 0, len(required))
-	for _, feature := range required {
-		if feature != "" && !mandatory[feature] {
-			mandatory[feature] = true
-			orderedRequired = append(orderedRequired, feature)
-		}
-	}
-	result := make([]string, 0, 32)
-	for _, feature := range features {
-		if len(result) == 32-len(orderedRequired) {
-			break
-		}
-		if feature != "" && !mandatory[feature] {
-			duplicate := false
-			for _, existing := range result {
-				if existing == feature {
-					duplicate = true
-					break
-				}
-			}
-			if !duplicate {
-				result = append(result, feature)
-			}
-		}
-	}
-	return append(result, orderedRequired...)
 }
 
 // SessionInfo returns a consistent snapshot of the holder hello-session.

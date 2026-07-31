@@ -38,13 +38,47 @@ const (
 	SourceEuropePMC        = "europepmc"
 	SourceUnpaywall        = "unpaywall"
 	SourceOpenAlex         = "openalex"
-	SourceOpenAlexContent  = "openalex_content"
 	SourceCORE             = "core"
 	SourceCrossrefTDM      = "crossref_tdm"
 	SourceCrossrefMetadata = "crossref_metadata"
 	SourceRetractionWatch  = "retraction_watch"
 	SourceSemanticScholar  = "semanticscholar"
 )
+
+// validSourceNames is the exhaustive set of [sources.*] keys papio
+// understands, kept adjacent to the constants above so it cannot drift from
+// them. validate() uses it to fail closed on a misspelled or reserved-but-
+// unimplemented source name instead of silently ignoring it (see the
+// discovery.sources and validateLibrary rationale below).
+var validSourceNames = map[string]bool{
+	SourceArXiv:            true,
+	SourceEuropePMC:        true,
+	SourceUnpaywall:        true,
+	SourceOpenAlex:         true,
+	SourceCORE:             true,
+	SourceCrossrefTDM:      true,
+	SourceCrossrefMetadata: true,
+	SourceRetractionWatch:  true,
+	SourceSemanticScholar:  true,
+}
+
+// removedSourceNames are names papio shipped in Default() at some point and no
+// longer implements. Every config written by `papio init` or `papio config
+// save` before the removal lists them, so rejecting one would make the whole
+// file unparseable on upgrade — for a name that was already an inert no-op.
+// They are therefore accepted and dropped on load, which preserves behaviour
+// exactly and lets the next `papio config save` rewrite the file without them.
+// Unknown names that were never ours stay a hard error: a silently ignored
+// typo suppresses an acquisition route the user asked for.
+var removedSourceNames = map[string]bool{
+	// Reserved end-to-end (const, defaults row, resolver priority rank, docs)
+	// but no adapter was ever written, so enabling it never did anything.
+	"openalex_content": true,
+}
+
+// validSourceNamesList renders validSourceNames for error messages, in the
+// same order as the const block above.
+const validSourceNamesList = "arxiv, europepmc, unpaywall, openalex, core, crossref_tdm, crossref_metadata, retraction_watch, semanticscholar"
 
 // Source is one resolver's policy knobs.
 type Source struct {
@@ -368,7 +402,6 @@ func Default() Config {
 			SourceEuropePMC:        {Enabled: true, RatePerSec: 2, Burst: 2},
 			SourceUnpaywall:        {Enabled: true, RatePerSec: 1, Burst: 1},
 			SourceOpenAlex:         {Enabled: false, RatePerSec: 2, Burst: 2},
-			SourceOpenAlexContent:  {Enabled: false},
 			SourceCORE:             {Enabled: false, RatePerSec: 0.4, Burst: 1},
 			SourceCrossrefTDM:      {Enabled: false, RatePerSec: 1, Burst: 1},
 			SourceCrossrefMetadata: {Enabled: true, RatePerSec: 1, Burst: 1},
@@ -414,6 +447,9 @@ func Load(path string) (Config, error) {
 	}
 	if err := cfg.validate(); err != nil {
 		return cfg, fmt.Errorf("config %s: %w", path, err)
+	}
+	for name := range removedSourceNames {
+		delete(cfg.Sources, name)
 	}
 	cfg.DataDir = expandHome(cfg.DataDir)
 	cfg.Browser.AdoptionRoot = expandHome(cfg.Browser.AdoptionRoot)
@@ -524,6 +560,13 @@ func (c *Config) validate() error {
 		return fmt.Errorf("zotio.exception_tags requires zotio.executable")
 	}
 	for name, s := range c.Sources {
+		// A misspelled or reserved-but-unimplemented [sources.*] name is
+		// otherwise accepted and silently does nothing, suppressing an
+		// acquisition route the user asked for — the same failure mode
+		// validateLibrary's doc comment argues must be a startup error.
+		if !validSourceNames[name] && !removedSourceNames[name] {
+			return fmt.Errorf("sources.%s is not a recognized source name (valid names: %s)", name, validSourceNamesList)
+		}
 		if s.BaseURLForDev != "" && !strings.HasPrefix(s.BaseURLForDev, "http://127.0.0.1") && !strings.HasPrefix(s.BaseURLForDev, "http://localhost") {
 			return fmt.Errorf("sources.%s.base_url_for_dev must be loopback", name)
 		}

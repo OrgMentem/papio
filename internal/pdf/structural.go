@@ -118,11 +118,6 @@ func ValidateStructural(ctx context.Context, binary, path string, opt Structural
 	return report, nil
 }
 
-// StructuralValidate is a concise alias for ValidateStructural.
-func StructuralValidate(ctx context.Context, binary, path string, opt StructuralOptions) (StructuralReport, error) {
-	return ValidateStructural(ctx, binary, path, opt)
-}
-
 func normalizedStructuralOptions(opt StructuralOptions) StructuralOptions {
 	d := DefaultStructuralOptions()
 	if opt.Timeout <= 0 {

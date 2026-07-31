@@ -76,7 +76,7 @@ func newBridge(t *testing.T) (*Bridge, *job.Store, config.Config, string) {
 			Identity:   pdf.IdentityDecision{Result: pdf.IdentityPass, Evidence: []string{"doi match"}},
 		}, nil
 	}
-	return NewBridge(jobs, svc, triageService, &watch.Runner{Store: watches}, previewServer, captureStore, cfg, "0.1.0-test", []string{"browser_handoff"}), jobs, cfg, data
+	return NewBridge(jobs, svc, triageService, &watch.Runner{Store: watches}, previewServer, captureStore, cfg, "0.1.0-test"), jobs, cfg, data
 }
 
 func handoffWork() work.Work {
@@ -238,7 +238,7 @@ func pageCapturePayload(t *testing.T, html []byte) protocol.PageCapturePayload {
 func TestPageCaptureDisabledDoesNotStore(t *testing.T) {
 	b, _, cfg, data := newBridge(t)
 	cfg.Captures.Enabled = false
-	b = NewBridge(b.jobs, b.svc, b.triage, b.watchRunner, b.preview, b.captureStore, cfg, b.Version, b.Features)
+	b = NewBridge(b.jobs, b.svc, b.triage, b.watchRunner, b.preview, b.captureStore, cfg, b.Version)
 	runSync(t, b, hello())
 	runSync(t, b, inFrame(t, protocol.MsgPageCapture, "", pageCapturePayload(t, []byte("<html>disabled</html>"))))
 
@@ -352,30 +352,9 @@ func TestHelloAckAnnouncesDaemonVersion(t *testing.T) {
 		t.Fatalf("daemon_version = %q, want 0.1.0-test", payload.DaemonVersion)
 	}
 	if !slices.Equal(payload.Features, []string{
-		"browser_handoff", pageAcquireFeature, triageSnapshotFeature, triageSnapshotSchema2Feature, triageMutationsFeature, reviewPreviewFeature, statsFeature, pageCaptureFeature,
+		pageAcquireFeature, triageSnapshotFeature, triageSnapshotSchema2Feature, triageMutationsFeature, reviewPreviewFeature, statsFeature, pageCaptureFeature,
 	}) {
 		t.Fatalf("features = %v, want required bridge feature set", payload.Features)
-	}
-}
-
-func TestHelloAckFeatureCapReservesMandatoryFeatures(t *testing.T) {
-	b, _, _, _ := newBridge(t)
-	features := make([]string, 32)
-	for i := range features {
-		features[i] = strings.Repeat("x", i+1)
-	}
-	b = NewBridge(b.jobs, b.svc, b.triage, b.watchRunner, b.preview, b.captureStore, b.cfg, b.Version, features)
-
-	msgs, _ := runSync(t, b, hello())
-	ack := firstOfType(msgs, protocol.MsgHelloAck)
-	if ack == nil {
-		t.Fatalf("no hello_ack in %v", msgs)
-	}
-	got := ack.Payload.(*protocol.HelloAckPayload).Features
-	want := append(append([]string(nil), features[:25]...),
-		pageAcquireFeature, triageSnapshotFeature, triageSnapshotSchema2Feature, triageMutationsFeature, reviewPreviewFeature, statsFeature, pageCaptureFeature)
-	if !slices.Equal(got, want) {
-		t.Fatalf("features = %v, want %v", got, want)
 	}
 }
 
@@ -1133,7 +1112,7 @@ func TestDaemonRestartReturnsHelloRequired(t *testing.T) {
 	runSync(t, active, hello())
 
 	// A new daemon has the same durable jobs but no in-memory hello-session.
-	restarted := NewBridge(jobs, active.svc, active.triage, active.watchRunner, active.preview, active.captureStore, cfg, active.Version, active.Features)
+	restarted := NewBridge(jobs, active.svc, active.triage, active.watchRunner, active.preview, active.captureStore, cfg, active.Version)
 	msgs, _ := runSync(t, restarted)
 	if len(msgs) != 1 {
 		t.Fatalf("restart poll frames = %d, want 1", len(msgs))
@@ -2678,7 +2657,7 @@ func TestOpenURLUsesSelectedResolverProfileForPrimoNDEAndVE(t *testing.T) {
 	cfg.Browser.Resolvers = map[string]config.Institution{
 		"institute": {OpenURLBase: "https://onesearch.library.example-institute.edu/discovery/openurl?vid=61INS_INST:INS"},
 	}
-	b = NewBridge(b.jobs, b.svc, b.triage, b.watchRunner, b.preview, b.captureStore, cfg, b.Version, b.Features)
+	b = NewBridge(b.jobs, b.svc, b.triage, b.watchRunner, b.preview, b.captureStore, cfg, b.Version)
 	for _, test := range []struct {
 		name, resolver, wantPath, wantVID string
 	}{
@@ -2722,7 +2701,7 @@ func TestOfferLoginRoutingIsPerResolverProfile(t *testing.T) {
 		// ...and one without an identity gets none (no default leakage).
 		"bare": {OpenURLBase: "https://library.example.edu/openurl"},
 	}
-	b = NewBridge(b.jobs, b.svc, b.triage, b.watchRunner, b.preview, b.captureStore, cfg, b.Version, b.Features)
+	b = NewBridge(b.jobs, b.svc, b.triage, b.watchRunner, b.preview, b.captureStore, cfg, b.Version)
 
 	for _, test := range []struct {
 		name, resolver, wantEntityID, wantAccountID string

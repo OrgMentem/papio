@@ -43,15 +43,6 @@ func TestNormalizeDOI(t *testing.T) {
 	}
 }
 
-func TestFindDOIInText(t *testing.T) {
-	if got := FindDOI("see https://doi.org/10.1111/dmcn.70356, cited above"); got != "10.1111/dmcn.70356" {
-		t.Errorf("FindDOI prose = %q", got)
-	}
-	if got := FindDOI("no identifier here"); got != "" {
-		t.Errorf("FindDOI none = %q", got)
-	}
-}
-
 func TestNormalizeArXiv(t *testing.T) {
 	cases := []struct {
 		in   string

@@ -120,14 +120,13 @@ func versionRank(desired, v string) int {
 // sourceReliability orders sources by demonstrated payload quality; lower is
 // better. Unlisted sources rank after listed ones, alphabetically stable.
 var sourceReliability = map[string]int{
-	"cache":            0,
-	"arxiv":            1,
-	"europepmc":        2,
-	"unpaywall":        3,
-	"openalex":         4,
-	"openalex_content": 5,
-	"core":             6,
-	"crossref_tdm":     7,
+	"cache":        0,
+	"arxiv":        1,
+	"europepmc":    2,
+	"unpaywall":    3,
+	"openalex":     4,
+	"core":         6,
+	"crossref_tdm": 7,
 }
 
 // licenseRank prefers explicit licenses over unknown.

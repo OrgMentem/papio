@@ -170,14 +170,6 @@ func explainNoAccess(resolver, accessMode string, cfg config.Config) Explanation
 	return Explanation{"no_access", "No legally accessible copy was found for this work."}
 }
 
-// WaitGuidance renders a category and next-step block for a job that
-// `papio acquire --wait` settled into a parked or no-file terminal state, or ""
-// for success and states that need no user action. It preserves the historical
-// reason-only path for callers that do not have a current action.
-func WaitGuidance(state, reason, resolver, accessMode string, cfg config.Config) string {
-	return renderWaitGuidance(state, Explain(state, reason, resolver, accessMode, cfg))
-}
-
 // WaitGuidanceWithOpenAction is the acquire-side form for a job detail, where
 // a live action supersedes the reason recorded when the job first parked.
 func WaitGuidanceWithOpenAction(state, reason, resolver, accessMode string, actions []job.HumanAction, cfg config.Config) string {

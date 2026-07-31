@@ -4,6 +4,7 @@ package update
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -32,10 +33,7 @@ func TestCheckFetchesFreshReleaseAndCachesETag(t *testing.T) {
 	defer server.Close()
 
 	checker := NewWithOptions(Options{DataDir: t.TempDir(), ReleasesURL: server.URL + "/releases/latest", Client: server.Client(), Now: func() time.Time { return now }})
-	info, err := checker.Check(context.Background())
-	if err != nil {
-		t.Fatalf("Check: %v", err)
-	}
+	info := checker.Check(context.Background())
 	if info == nil || info.LatestVersion != "1.2.3" || info.URL != "https://github.com/orgmentem/papio/releases/tag/v1.2.3" || !info.CheckedAt.Equal(now) {
 		t.Fatalf("info = %#v", info)
 	}
@@ -59,10 +57,7 @@ func TestCheckReusesCacheAfterNotModified(t *testing.T) {
 	if err := checker.writeCache(cache{ETag: `"release-1"`, LatestVersion: "1.2.3", URL: "https://example.test/release", CheckedAt: now.Add(-checkEvery)}); err != nil {
 		t.Fatal(err)
 	}
-	info, err := checker.Check(context.Background())
-	if err != nil {
-		t.Fatalf("Check: %v", err)
-	}
+	info := checker.Check(context.Background())
 	if info == nil || info.LatestVersion != "1.2.3" || !info.CheckedAt.Equal(now) {
 		t.Fatalf("info = %#v", info)
 	}
@@ -84,10 +79,7 @@ func TestCheckSkipsNetworkForFreshCache(t *testing.T) {
 	if err := checker.writeCache(cache{LatestVersion: "1.2.3", URL: "https://example.test/release", CheckedAt: now.Add(-time.Hour)}); err != nil {
 		t.Fatal(err)
 	}
-	info, err := checker.Check(context.Background())
-	if err != nil {
-		t.Fatalf("Check: %v", err)
-	}
+	info := checker.Check(context.Background())
 	if info == nil || info.LatestVersion != "1.2.3" || calls.Load() != 0 {
 		t.Fatalf("info = %#v; calls = %d", info, calls.Load())
 	}
@@ -104,10 +96,7 @@ func TestCheckMalformedResponseSoftFailsToCachedInfo(t *testing.T) {
 	if err := checker.writeCache(cache{LatestVersion: "1.2.2", URL: "https://example.test/release", CheckedAt: now.Add(-checkEvery)}); err != nil {
 		t.Fatal(err)
 	}
-	info, err := checker.Check(context.Background())
-	if err != nil {
-		t.Fatalf("Check: %v", err)
-	}
+	info := checker.Check(context.Background())
 	if info == nil || info.LatestVersion != "1.2.2" || !info.CheckedAt.Equal(now.Add(-checkEvery)) {
 		t.Fatalf("info = %#v", info)
 	}
@@ -135,10 +124,8 @@ func TestCachedReturnsWhileRefreshIsInFlight(t *testing.T) {
 	}
 
 	checkDone := make(chan struct{})
-	checkErr := make(chan error, 1)
 	go func() {
-		_, err := checker.Check(context.Background())
-		checkErr <- err
+		checker.Check(context.Background())
 		close(checkDone)
 	}()
 	defer func() {
@@ -176,9 +163,6 @@ func TestCachedReturnsWhileRefreshIsInFlight(t *testing.T) {
 	close(release)
 	select {
 	case <-checkDone:
-		if err := <-checkErr; err != nil {
-			t.Fatalf("Check: %v", err)
-		}
 	case <-time.After(time.Second):
 		t.Fatal("Check did not return after fake client was released")
 	}
@@ -243,12 +227,8 @@ func TestTargetsUseSeparateCachesAndRateLimits(t *testing.T) {
 		Client: server.Client(), Now: func() time.Time { return now },
 	})
 	for _, checker := range []*Checker{papio, zotio} {
-		if _, err := checker.Check(context.Background()); err != nil {
-			t.Fatalf("Check: %v", err)
-		}
-		if _, err := checker.Check(context.Background()); err != nil {
-			t.Fatalf("cached Check: %v", err)
-		}
+		checker.Check(context.Background())
+		checker.Check(context.Background())
 	}
 	if papioCalls.Load() != 1 || zotioCalls.Load() != 1 {
 		t.Fatalf("calls papio=%d zotio=%d", papioCalls.Load(), zotioCalls.Load())
@@ -266,5 +246,87 @@ func TestZotioCheckerPersistsInstalledVersionWithoutChecking(t *testing.T) {
 	}
 	if info := checker.Cached(); info != nil {
 		t.Fatalf("cached release = %#v", info)
+	}
+}
+
+func TestCheckTransportErrorSoftFailsToCachedInfo(t *testing.T) {
+	now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
+	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("connection refused")
+	})}
+	checker := NewWithOptions(Options{DataDir: t.TempDir(), ReleasesURL: "https://example.test/releases", Client: client, Now: func() time.Time { return now }})
+	if err := checker.writeCache(cache{LatestVersion: "1.2.3", URL: "https://example.test/release", CheckedAt: now.Add(-checkEvery)}); err != nil {
+		t.Fatal(err)
+	}
+	info := checker.Check(context.Background())
+	if info == nil || info.LatestVersion != "1.2.3" || info.URL != "https://example.test/release" {
+		t.Fatalf("info = %#v, want cached release preserved after transport error", info)
+	}
+}
+
+func TestCheckNonOKStatusSoftFailsToCachedInfo(t *testing.T) {
+	now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	checker := NewWithOptions(Options{DataDir: t.TempDir(), ReleasesURL: server.URL, Client: server.Client(), Now: func() time.Time { return now }})
+	if err := checker.writeCache(cache{LatestVersion: "1.2.3", URL: "https://example.test/release", CheckedAt: now.Add(-checkEvery)}); err != nil {
+		t.Fatal(err)
+	}
+	info := checker.Check(context.Background())
+	if info == nil || info.LatestVersion != "1.2.3" || info.URL != "https://example.test/release" {
+		t.Fatalf("info = %#v, want cached release preserved after 500 response", info)
+	}
+}
+
+func TestCheckColdCacheReturnsNilOnTransportError(t *testing.T) {
+	now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
+	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("connection refused")
+	})}
+	checker := NewWithOptions(Options{DataDir: t.TempDir(), ReleasesURL: "https://example.test/releases", Client: client, Now: func() time.Time { return now }})
+	if info := checker.Check(context.Background()); info != nil {
+		t.Fatalf("info = %#v, want nil with no prior cache", info)
+	}
+}
+
+func TestCheckColdCacheReturnsNilOnNotModified(t *testing.T) {
+	now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotModified)
+	}))
+	defer server.Close()
+
+	checker := NewWithOptions(Options{DataDir: t.TempDir(), ReleasesURL: server.URL, Client: server.Client(), Now: func() time.Time { return now }})
+	if info := checker.Check(context.Background()); info != nil {
+		t.Fatalf("info = %#v, want nil with no prior cache", info)
+	}
+}
+
+func TestCheckColdCacheReturnsNilOnNonOKStatus(t *testing.T) {
+	now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	checker := NewWithOptions(Options{DataDir: t.TempDir(), ReleasesURL: server.URL, Client: server.Client(), Now: func() time.Time { return now }})
+	if info := checker.Check(context.Background()); info != nil {
+		t.Fatalf("info = %#v, want nil with no prior cache", info)
+	}
+}
+
+func TestCheckColdCacheReturnsNilOnMalformedResponse(t *testing.T) {
+	now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"tag_name":`))
+	}))
+	defer server.Close()
+
+	checker := NewWithOptions(Options{DataDir: t.TempDir(), ReleasesURL: server.URL, Client: server.Client(), Now: func() time.Time { return now }})
+	if info := checker.Check(context.Background()); info != nil {
+		t.Fatalf("info = %#v, want nil with no prior cache", info)
 	}
 }

@@ -178,13 +178,6 @@ func (m *Manager) Defer(ctx context.Context, source string, until time.Time) err
 	return err
 }
 
-// ClearDefer removes a persisted Retry-After gate after an operator-approved
-// reset or successful call.
-func (m *Manager) ClearDefer(ctx context.Context, source string) error {
-	_, err := m.db.ExecContext(ctx, `UPDATE source_budgets SET next_allowed_at = NULL WHERE source = ?`, source)
-	return err
-}
-
 // Snapshot returns one source's durable counters. A missing row is zero state.
 func (m *Manager) Snapshot(ctx context.Context, source string) (Snapshot, error) {
 	var out Snapshot

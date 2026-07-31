@@ -162,11 +162,6 @@ func MatchIdentityWithThreshold(text string, target work.Work, titleThreshold fl
 	return pass(evidence...)
 }
 
-// IdentityMatch is an alias for MatchIdentity.
-func IdentityMatch(text string, target work.Work) IdentityDecision {
-	return MatchIdentity(text, target)
-}
-
 func normalizeDOI(v string) string {
 	n, err := work.NormalizeDOI(v)
 	if err != nil {

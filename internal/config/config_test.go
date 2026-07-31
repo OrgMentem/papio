@@ -174,6 +174,68 @@ func TestLoadRetainsDefaultCrossrefMetadataPolicyWhenSourceIsAbsent(t *testing.T
 	}
 }
 
+// A config written by an older `papio init`/`config save` lists every default
+// source, including the removed openalex_content. Upgrading must not make that
+// file unparseable, so the name is tolerated and dropped rather than rejected.
+func TestLoadToleratesAndDropsRemovedOpenAlexContentSource(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(path, []byte("access_mode='conservative'\n[sources.openalex_content]\nenabled=true\n[sources.unpaywall]\nenabled=true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("config listing the removed openalex_content source must still load: %v", err)
+	}
+	if _, ok := cfg.Sources["openalex_content"]; ok {
+		t.Error("removed source openalex_content survived Load; it must be dropped so the next config save rewrites without it")
+	}
+	if !cfg.Sources[SourceUnpaywall].Enabled {
+		t.Error("dropping the removed source must not disturb the sources beside it")
+	}
+}
+
+func TestLoadRejectsMisspelledSourceName(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(path, []byte("access_mode='conservative'\n[sources.unpaywal]\nenabled=true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("misspelled source name accepted")
+	}
+	if !strings.Contains(err.Error(), "sources.unpaywal") || !strings.Contains(err.Error(), "not a recognized source name") {
+		t.Fatalf("misspelled source rejection error = %q", err)
+	}
+}
+
+func TestLoadAcceptsSemanticScholarSourceForAPIKey(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(path, []byte("access_mode='conservative'\n[sources.semanticscholar]\napi_key='shh'\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("discovery-only semanticscholar source rejected: %v", err)
+	}
+	if got := cfg.SourcePolicy(SourceSemanticScholar); got.APIKey != "shh" {
+		t.Fatalf("semanticscholar policy = %+v", got)
+	}
+}
+
+func TestLoadAcceptsValidSourceKnob(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(path, []byte("access_mode='conservative'\n[sources.unpaywall]\nenabled=true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("valid sources.unpaywall config rejected: %v", err)
+	}
+	if got := cfg.SourcePolicy(SourceUnpaywall); !got.Enabled {
+		t.Fatalf("unpaywall policy = %+v", got)
+	}
+}
+
 func TestLoadExplainsUnknownBrowserField(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.toml")
 	if err := os.WriteFile(path, []byte("access_mode='conservative'\n[browser]\nbogus_option=true\n"), 0o600); err != nil {

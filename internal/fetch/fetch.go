@@ -59,11 +59,6 @@ func New(policy Policy, resolver Resolver, transport http.RoundTripper) (*Downlo
 	return d, nil
 }
 
-// NewDownloader is an explicit spelling of New.
-func NewDownloader(policy Policy, resolver Resolver, transport http.RoundTripper) (*Downloader, error) {
-	return New(policy, resolver, transport)
-}
-
 func validatePolicy(p Policy) error {
 	if p.MaxBytes <= 0 {
 		return fmt.Errorf("fetch policy MaxBytes must be positive")
@@ -165,11 +160,6 @@ func (d *Downloader) DownloadRequest(ctx context.Context, request *http.Request,
 
 		return d.saveResponse(overall, resp, current.URL, quarantinePath)
 	}
-}
-
-// FetchRequest is an alias for DownloadRequest.
-func (d *Downloader) FetchRequest(ctx context.Context, request *http.Request, quarantinePath string) (Result, error) {
-	return d.DownloadRequest(ctx, request, quarantinePath)
 }
 
 func (d *Downloader) roundTrip(overall context.Context, request *http.Request) (*http.Response, error) {

@@ -113,11 +113,11 @@ func NewWithOptions(options Options) *Checker {
 }
 
 // Check returns cached release metadata or refreshes it with one GET. Network,
-// cache, and decoding failures are intentionally soft: callers receive any
-// previously cached result (or nil) and no user-facing error.
-func (c *Checker) Check(ctx context.Context) (*Info, error) {
+// cache, and decoding failures are intentionally soft: the caller receives any
+// previously cached result, or nil.
+func (c *Checker) Check(ctx context.Context) *Info {
 	if c == nil {
-		return nil, nil
+		return nil
 	}
 	c.mu.Lock()
 	cached := c.readCache()
@@ -125,7 +125,7 @@ func (c *Checker) Check(ctx context.Context) (*Info, error) {
 	if checkedRecently(cached.CheckedAt, now) {
 		info := cached.info()
 		c.mu.Unlock()
-		return info, nil
+		return info
 	}
 	c.mu.Unlock()
 
@@ -140,13 +140,13 @@ func (c *Checker) Check(ctx context.Context) (*Info, error) {
 	if checkedRecently(cached.CheckedAt, now) {
 		info := cached.info()
 		c.mu.Unlock()
-		return info, nil
+		return info
 	}
 	c.mu.Unlock()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.releasesURL, nil)
 	if err != nil {
-		return cached.info(), nil
+		return cached.info()
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
 	if cached.ETag != "" {
@@ -154,13 +154,13 @@ func (c *Checker) Check(ctx context.Context) (*Info, error) {
 	}
 	response, err := c.client.Do(req)
 	if err != nil {
-		return cached.info(), nil
+		return cached.info()
 	}
 	defer response.Body.Close()
 
 	if response.StatusCode == http.StatusNotModified {
 		if cached.info() == nil {
-			return nil, nil
+			return nil
 		}
 		c.mu.Lock()
 		cached = c.readCache()
@@ -168,19 +168,19 @@ func (c *Checker) Check(ctx context.Context) (*Info, error) {
 		_ = c.writeCache(cached)
 		info := cached.info()
 		c.mu.Unlock()
-		return info, nil
+		return info
 	}
 	if response.StatusCode != http.StatusOK {
-		return cached.info(), nil
+		return cached.info()
 	}
 
 	var latest release
 	if err := json.NewDecoder(response.Body).Decode(&latest); err != nil {
-		return cached.info(), nil
+		return cached.info()
 	}
 	latest.TagName = strings.TrimPrefix(latest.TagName, "v")
 	if latest.TagName == "" || latest.HTMLURL == "" {
-		return cached.info(), nil
+		return cached.info()
 	}
 	c.mu.Lock()
 	cached = c.readCache()
@@ -191,7 +191,7 @@ func (c *Checker) Check(ctx context.Context) (*Info, error) {
 	_ = c.writeCache(cached)
 	info := cached.info()
 	c.mu.Unlock()
-	return info, nil
+	return info
 }
 
 // TryMarkNagged atomically records a displayed update prompt when none has

@@ -127,11 +127,6 @@ func ExtractText(ctx context.Context, path string, cap Capability, opt SemanticO
 	return report, nil
 }
 
-// SemanticExtract is an alias for ExtractText.
-func SemanticExtract(ctx context.Context, path string, cap Capability, opt SemanticOptions) (TextReport, error) {
-	return ExtractText(ctx, path, cap, opt)
-}
-
 func normalizedSemanticOptions(o SemanticOptions) SemanticOptions {
 	d := DefaultSemanticOptions()
 	if o.Timeout <= 0 {

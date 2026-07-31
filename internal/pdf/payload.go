@@ -131,12 +131,6 @@ func fileContains(f *os.File, needle []byte) (bool, error) {
 	}
 }
 
-// PayloadGate is an alias retained for call sites that name the pipeline
-// stage rather than its validation action.
-func PayloadGate(body []byte, declaredMIME string) PayloadReport {
-	return ValidatePayload(body, declaredMIME)
-}
-
 func hasTailEOF(body []byte) bool {
 	start := len(body) - eofSearchBytes
 	if start < 0 {

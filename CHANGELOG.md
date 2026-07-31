@@ -27,6 +27,48 @@ execution records in `notes/acquisition-stack-plan.md`.
 - **`jobs.receipt`'s `principal` is request-origin classification, not a rights
   input.** It cannot identify whose entitlement obtained the bytes, so consumers
   must not use it as proof of entitlement.
+- **A misspelled `[sources.*]` name is now a startup error instead of silence.**
+  Source names were never validated, so `[sources.unpaywal]` parsed cleanly and
+  did nothing — indistinguishable from "that source found nothing for your
+  paper". `papio` now fails closed on an unrecognized source name and lists the
+  valid ones. The removed `openalex_content` name is tolerated and dropped on
+  load, so a config written by an earlier `papio init`/`papio config save`
+  still parses; the next `papio config save` rewrites the file without it.
+
+### Removed
+
+- **`openalex_content` is gone from `[sources]`.** It was reserved end to end —
+  constant, default policy row, resolver priority rank, and published config
+  reference — but no adapter was ever written, so enabling it produced no
+  candidate, no warning, and no `papio doctor` complaint.
+- **Roughly 570 lines of unreachable code and its false coverage.** Removed
+  `store.Backup`/`Checkpoint` and their hard-link fallback subgraph (no command,
+  IPC method, or scheduled task ever called them), the orphaned
+  `internal/doctor/manifest.go` (a divergent duplicate of the live native-host
+  manifest paths in `internal/cli`), six exported alias wrappers in
+  `internal/pdf` and `internal/fetch`, `app.RequestForCandidate` and
+  `StableResolverNames`, `budget.ClearDefer`, `errcat.WaitGuidance` (superseded
+  by `WaitGuidanceWithOpenAction`, whose coverage now sits on the function
+  production calls), and `work.FindDOI` (a weaker duplicate of the live
+  multi-DOI scanner in `internal/pdf`). No behaviour changes.
+- **The dead caller-supplied feature seam in the browser bridge.** `NewBridge`'s
+  `features` parameter was always `nil` in production, so its merge, dedupe, and
+  32-entry cap could never run, while a test-only synthetic feature made the
+  hello-ack assertion describe a wire contract no extension ever received. The
+  daemon still advertises exactly the seven mandatory features, and the
+  fail-closed 32-feature bound in `internal/protocol` is unchanged. This also
+  removes both hardcoded `bridge_test.go` assertions flagged in `AGENTS.md`.
+
+### Fixed
+
+- **`update.Checker.Check` no longer returns an error it can never produce.**
+  Its failure policy is deliberately soft — a GitHub outage must not make
+  `papio doctor` noisy — so every path returned `nil`, leaving unreachable
+  error branches in the doctor integration checks and five test assertions that
+  could never fail. The signature now matches the contract, and the tests pin
+  the behaviour that matters: a transport error, a 304, a non-200, and a
+  malformed body each return the previously cached release, or `nil` on a cold
+  cache.
 
 ## [0.15.0] - 2026-07-30
 

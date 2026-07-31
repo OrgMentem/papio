@@ -316,7 +316,7 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 		Config: cfg, Store: db, Jobs: jobs, Artifacts: artifacts, Captures: captureStore, Budgets: budgets,
 		App: service, Scheduler: scheduler, Watches: watches, WatchRunner: watchRunner,
 		Bundle:        bundleExporter,
-		Browser:       browser.NewBridge(jobs, service, triageService, watchRunner, previewServer, captureStore, cfg, version, nil),
+		Browser:       browser.NewBridge(jobs, service, triageService, watchRunner, previewServer, captureStore, cfg, version),
 		Preview:       previewServer,
 		Discovery:     discoveryClient,
 		Zotio:         zotioService,

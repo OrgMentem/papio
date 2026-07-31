@@ -329,8 +329,8 @@ type IntegrationDependencies struct {
 	// upgrade deleting the versioned binary the symlink was pinned to.
 	HostExecutableResolves func(execPath string) bool
 	ZotioPreflight         func(context.Context, config.Config) (*zotio.PreflightResult, error)
-	CheckUpdates           func(context.Context, config.Config) (*update.Info, error)
-	CheckZotioUpdates      func(context.Context, config.Config) (*update.Info, error)
+	CheckUpdates           func(context.Context, config.Config) *update.Info
+	CheckZotioUpdates      func(context.Context, config.Config) *update.Info
 	// LibrarySources probes the configured generic holdings sources. A nil
 	// function is an unavailable probe facility, reported as a bounded Skip when
 	// sources are configured.
@@ -476,8 +476,8 @@ func runPapioUpdateCheck(ctx context.Context, cfg config.Config, deps Integratio
 		add("updates (papio)", Skip, "skipped: update checker is not configured", "")
 		return
 	}
-	info, err := deps.CheckUpdates(ctx, cfg)
-	if err != nil || info == nil {
+	info := deps.CheckUpdates(ctx, cfg)
+	if info == nil {
 		add("updates (papio)", Warn, "could not check for papio updates", "rerun papio doctor later")
 		return
 	}
@@ -510,8 +510,8 @@ func runZotioUpdateCheck(ctx context.Context, cfg config.Config, deps Integratio
 		add("updates (zotio)", Skip, "skipped: update checker is not configured", "")
 		return
 	}
-	info, err := deps.CheckZotioUpdates(ctx, cfg)
-	if err != nil || info == nil {
+	info := deps.CheckZotioUpdates(ctx, cfg)
+	if info == nil {
 		add("updates (zotio)", Warn, "could not check for zotio updates", "rerun papio doctor later")
 		return
 	}

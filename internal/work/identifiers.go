@@ -66,8 +66,6 @@ func (w Work) Describe() string {
 
 var (
 	doiCoreRE = regexp.MustCompile(`^10\.[0-9]{4,9}/\S{1,200}$`)
-	// doiFindRE locates a DOI inside surrounding text/URLs; stops at whitespace.
-	doiFindRE = regexp.MustCompile(`10\.[0-9]{4,9}/[^\s"'<>]+`)
 	pmidRE    = regexp.MustCompile(`^[0-9]{1,10}$`)
 	// arXiv new style: YYMM.NNNN(N) with optional version.
 	arxivNewRE = regexp.MustCompile(`^([0-9]{4}\.[0-9]{4,5})(v[0-9]+)?$`)
@@ -109,20 +107,6 @@ func NormalizeDOI(raw string) (string, error) {
 		return "", fmt.Errorf("invalid DOI %q", raw)
 	}
 	return s, nil
-}
-
-// FindDOI extracts the first DOI-shaped token from free text (page text,
-// filenames), applying the same trailing-punctuation trim. Returns "" when none.
-func FindDOI(text string) string {
-	m := doiFindRE.FindString(text)
-	if m == "" {
-		return ""
-	}
-	doi, err := NormalizeDOI(m)
-	if err != nil {
-		return ""
-	}
-	return doi
 }
 
 // NormalizeArXiv canonicalizes an arXiv ID: accepts arXiv:/arxiv: prefixes,

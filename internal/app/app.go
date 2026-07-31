@@ -14,7 +14,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -1303,29 +1302,4 @@ func fillMissing(base, observed work.Work) work.Work {
 		base.Year = observed.Year
 	}
 	return base
-}
-
-// RequestForCandidate constructs the ephemeral retrieval request. It exists in
-// app rather than resolver/job so neither durable layer needs net/http types.
-func RequestForCandidate(ctx context.Context, c resolver.Candidate) (*http.Request, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.URL, nil)
-	if err != nil {
-		return nil, err
-	}
-	for name, value := range c.RequestHeaders {
-		req.Header.Set(name, value)
-	}
-	return req, nil
-}
-
-// StableResolverNames returns the configured adapter names for doctor output.
-func (s *Service) StableResolverNames() []string {
-	names := make([]string, 0, len(s.Resolvers))
-	for _, r := range s.Resolvers {
-		if r.Adapter != nil {
-			names = append(names, r.Adapter.Name())
-		}
-	}
-	sort.Strings(names)
-	return names
 }
