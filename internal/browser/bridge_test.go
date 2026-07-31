@@ -2859,10 +2859,14 @@ func parkWithPolicyMode(t *testing.T, jobs *job.Store, reqID, doi, mode string) 
 }
 
 // TestJobOfferAdvertisesTheJobsOwnAccessMode pins the browser half of the
-// access_mode_override fix. The offer's access_mode is what the extension uses
-// to decide whether a verified adapter may download without the human, so
-// reading the daemon-wide config here let a job submitted as assisted be
-// handled by the extension as delegated, and vice versa.
+// access_mode_override fix: the daemon must not tell the extension something
+// false about the job in front of it.
+//
+// Note the shipped extension parses access_mode and never branches on it, so
+// this frame is not an enforcement point today — unattended-download capability
+// is gated by granted host permissions. The plumbing is still correct, and the
+// hard requirement is the one below: papio-browser/1 admits only assisted and
+// delegated, so a conservative job must never reach an offer at all.
 func TestJobOfferAdvertisesTheJobsOwnAccessMode(t *testing.T) {
 	b, jobs, cfg, _ := newBridge(t)
 	if cfg.AccessMode != config.ModeDelegated {
@@ -2908,5 +2912,30 @@ func TestStaleConservativeParkedJobIsSkippedInsteadOfKillingTheSession(t *testin
 	}
 	if slices.Contains(offered, stale) {
 		t.Fatalf("offered = %v, must not contain the conservative job %s", offered, stale)
+	}
+}
+
+// TestFocusHandoffsRefusesAnUnofferableJob covers the second offerability call
+// site. actions.open reports how many focus requests reached the extension, and
+// the CLI suppresses its own explicit-open fallback when a session is live — so
+// counting a job the offer loop will silently skip tells the user papio acted
+// when nothing happened and nothing will.
+func TestFocusHandoffsRefusesAnUnofferableJob(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	stale := parkWithPolicyMode(t, jobs, "wr_focus_stale", "10.1000/focus-stale", config.ModeConservative)
+	live := parkWithPolicyMode(t, jobs, "wr_focus_live", "10.1000/focus-live", config.ModeDelegated)
+	// A holder at or above the focus floor is required before focus is accepted.
+	runSync(t, b, hello())
+
+	queued, sessionLive, err := b.FocusHandoffs(ctx, []string{stale, live})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sessionLive {
+		t.Fatal("session not live; the fixture hello did not establish a holder")
+	}
+	if queued != 1 {
+		t.Fatalf("queued = %d, want 1: only the delegated job can actually be focused", queued)
 	}
 }

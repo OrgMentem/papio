@@ -208,6 +208,13 @@ func (b *Bridge) FocusHandoffs(ctx context.Context, jobIDs []string) (queued int
 		case row.State != job.StateAwaitingHuman:
 			continue
 		}
+		// A job the offer loop will skip must not be counted as queued. Doing so
+		// reports success for a focus that never happens — no frame, no event,
+		// nothing on screen — and suppresses the CLI's own explicit-open
+		// fallback, so the user is told papio acted and it did not.
+		if _, offerable := b.offerableAccessMode(*row); !offerable {
+			continue
+		}
 		b.focusPending[jobID] = true
 		queued++
 	}

@@ -1214,3 +1214,52 @@ func TestAttemptedTiers(t *testing.T) {
 		})
 	}
 }
+
+// TestRetryKeepsThePinnedAccessModeWithoutAConservativeAdvisory is the negative
+// half of the advisory-scoped policy clear. Retry releases a job's pinned
+// access mode so the conservative advisory's own remedy — widen access_mode and
+// retry — can work, but only for a job that actually carried that advisory.
+//
+// Without this, a regression that cleared the mode on every retry would pass
+// the whole suite: the positive test only exercises the advisory-present
+// branch, so nothing would notice an ordinary failed-job retry silently
+// discarding a deliberate narrowing.
+func TestRetryKeepsThePinnedAccessModeWithoutAConservativeAdvisory(t *testing.T) {
+	ctx := context.Background()
+	js := testStore(t)
+	id, err := js.CreateRequest(ctx, "wr_retry_keeps_mode", testWork(), "", "", testPolicy(), nil, PrincipalUnknown)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := js.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before.Policy.AccessMode == "" {
+		t.Fatal("fixture policy carries no access mode, so this test cannot detect a clear")
+	}
+	for _, step := range [][2]string{
+		{StateQueued, StateResolving},
+		{StateResolving, StateFetching},
+		{StateFetching, StateFailed},
+	} {
+		if err := js.Transition(ctx, id, step[0], step[1], nil); err != nil {
+			t.Fatalf("%s->%s: %v", step[0], step[1], err)
+		}
+	}
+	if err := js.Retry(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	after, err := js.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Policy.AccessMode != before.Policy.AccessMode {
+		t.Fatalf("access mode after an ordinary retry = %q, want it preserved as %q",
+			after.Policy.AccessMode, before.Policy.AccessMode)
+	}
+	// The rest of the policy must survive the retry untouched either way.
+	if after.Policy.DesiredVersion != before.Policy.DesiredVersion {
+		t.Fatalf("desired_version = %q, want %q", after.Policy.DesiredVersion, before.Policy.DesiredVersion)
+	}
+}

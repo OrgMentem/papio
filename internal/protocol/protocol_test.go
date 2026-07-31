@@ -9,8 +9,10 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func decodeByPrefix(t *testing.T, name string, data []byte) error {
@@ -634,5 +636,67 @@ func TestTriageSnapshotSchema1RejectsAccessFieldsButAllowsTheirAbsence(t *testin
 	}
 	if _, err := DecodeBrowserMessage(withAccessFields); err == nil || !strings.Contains(err.Error(), "schema 1") {
 		t.Fatalf("schema-1 snapshot with access fields err = %v, want rejection", err)
+	}
+}
+
+// TestEntitlementWireShapeIsCaseInsensitive pins the fail-open a review found
+// in the guard itself. encoding/json matches struct fields case-insensitively,
+// so `"Entitlement": null` populates the decoded struct — while a raw map
+// lookup is case-sensitive and would miss it, letting a v1 document carry a key
+// its frozen schema forbids.
+func TestEntitlementWireShapeIsCaseInsensitive(t *testing.T) {
+	base, err := os.ReadFile(filepath.Join(corpusDir(t, "valid"), "acquisition-bundle-v2-entitlement.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name string
+		from string
+		to   string
+	}{
+		{name: "null entitlement in v1", from: `"schema_version": "acquisition-bundle/2"`, to: `"schema_version": "acquisition-bundle/1"`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			doc := strings.Replace(string(base), tc.from, tc.to, 1)
+			doc = regexp.MustCompile(`(?s)"entitlement": \{.*?\}`).ReplaceAllString(doc, `"Entitlement": null`)
+			if _, err := DecodeAcquisitionBundle([]byte(doc)); err == nil {
+				t.Fatal("a v1 bundle carrying \"Entitlement\": null was accepted")
+			}
+		})
+	}
+
+	mixed := regexp.MustCompile(`"entitlement_ref": "[^"]*"`).ReplaceAllString(string(base), `"Entitlement_Ref": ""`)
+	if _, err := DecodeAcquisitionBundle([]byte(mixed)); err == nil {
+		t.Fatal("an empty \"Entitlement_Ref\" was accepted")
+	}
+}
+
+// TestBareRouteIsNeverLaxerThanThePublishedSchema keeps the Go validator at
+// least as strict as `^https://[^/?#@]+$`. url.Parse lowercases the scheme, so
+// a u.Scheme comparison silently accepted "HTTPS://host" that the published
+// pattern rejects — laxer than the contract, in the direction that matters.
+func TestBareRouteIsNeverLaxerThanThePublishedSchema(t *testing.T) {
+	pattern := regexp.MustCompile(`^https://[^/?#@]+$`)
+	for _, route := range []string{
+		"https://example.org",
+		"https://example.org:8443",
+		"https://[2001:db8::1]:443",
+		"HTTPS://example.org",
+		"HttpS://example.org",
+		"https://example.org/",
+		"https://example.org/paper.pdf",
+		"https://user:pass@example.org",
+		"https://example.org?a=b",
+		"https://example.org#f",
+		"http://example.org",
+		"https://",
+		"",
+		"https://" + strings.Repeat("a", 2100),
+	} {
+		goOK := validateBareRoute(route) == nil
+		schemaOK := pattern.MatchString(route) && utf8.RuneCountInString(route) <= 2000
+		if goOK && !schemaOK {
+			t.Errorf("route %q: Go accepts what the published schema rejects", route)
+		}
 	}
 }

@@ -68,7 +68,7 @@
               "type": "string",
               "pattern": "^https://[^/?#@]+$",
               "maxLength": 2000,
-              "description": "Bare origin only: scheme and host, with no path, query, fragment, or userinfo. landing_url is unsuitable because it retains its query string."
+              "description": "Bare origin only: scheme and host, with no path, query, fragment, or userinfo. This is the origin the artifact was retrieved FROM. It is not an assertion that papio sent a credential to that host — for a licensed API the credential may go to the API service while the file comes from the publisher. landing_url is unsuitable because it retains its query string."
             },
             "entitlement_ref": {
               "type": "string",
@@ -77,7 +77,7 @@
             },
             "acquisition_mode": {
               "enum": ["open_access", "daemon_held_credential", "operator_browser_session"],
-              "description": "Derived from access_basis: open_access -> open_access; licensed_api -> daemon_held_credential (papio sent its own configured API credential); institutional -> operator_browser_session (the operator's own browser session obtained access). A 'manual' access basis has no mode and omits the entitlement object."
+              "description": "Derived from access_basis: open_access -> open_access; licensed_api -> daemon_held_credential (the acquisition was authorised by an API credential papio holds). institutional and manual yield NO entitlement object at all, so operator_browser_session is currently a reserved value with no producer: the only writer of institutional is browser adoption, which records that basis for every adopted download including an open-access file the browser fetched, so asserting it would invent evidence for a route nobody walked."
             }
           }
         }

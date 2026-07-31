@@ -729,3 +729,48 @@ func TestRetryAfterWideningAccessModeEscalatesAConservativeJob(t *testing.T) {
 		t.Fatalf("open actions after retry = %v, want an institutional handoff", kinds)
 	}
 }
+
+// TestTighteningTheDaemonModeRestrainsAlreadySubmittedJobs is the other half of
+// the ceiling. Honouring the job's snapshot made the clamp apply only at
+// submit, so an operator revoking automation — delegated to conservative —
+// would not have stopped jobs already in the queue from opening the very
+// handoff tabs they had just revoked. The effective mode is therefore
+// re-clamped against the current configuration on every read, which can only
+// ever lower it.
+func TestTighteningTheDaemonModeRestrainsAlreadySubmittedJobs(t *testing.T) {
+	ctx := context.Background()
+	svc, jobs := exhaustingService(t, config.ModeDelegated, "https://openurl.example.edu/resolve")
+
+	id, err := svc.Submit(ctx, doiRequest("wr_tighten_after_submit"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, err := jobs.ClaimNext(ctx, "worker", time.Minute)
+	if err != nil || row == nil {
+		t.Fatalf("claim = %+v, %v", row, err)
+	}
+	if row.Policy.AccessMode != config.ModeDelegated {
+		t.Fatalf("policy snapshot = %q, want delegated so tightening has something to restrain", row.Policy.AccessMode)
+	}
+
+	// The operator revokes automation after the job was already recorded.
+	svc.Config.AccessMode = config.ModeConservative
+
+	if err := svc.Process(ctx, row); err != nil {
+		t.Fatal(err)
+	}
+	out, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.State != job.StateUnavailable {
+		t.Fatalf("state = %s, want unavailable; the revoked delegated snapshot still governed", out.State)
+	}
+	kinds := openActionKinds(t, jobs, id)
+	if kinds["openurl_handoff"] {
+		t.Fatalf("open actions = %v; a handoff was opened at a mode the operator had revoked", kinds)
+	}
+	if !kinds["openurl_available"] {
+		t.Fatalf("open actions = %v, want the conservative advisory", kinds)
+	}
+}

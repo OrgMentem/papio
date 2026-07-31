@@ -684,21 +684,29 @@ func (c *Config) RequireAccessMode() (string, error) {
 }
 
 // EffectiveAccessMode resolves the access mode governing one job, given that
-// job's snapshotted Policy.AccessMode. The snapshot is authoritative: Submit
-// records the mode in force for the job, including a per-request
-// access_mode_override, so a decision path that reads c.AccessMode directly
-// silently discards the override.
+// job's snapshotted Policy.AccessMode.
 //
-// That was a live defect. The override was validated, snapshotted, and printed
-// by status/diagnose while every code path that actually decided whether to
-// open an institutional handoff consulted the daemon-wide default instead. The
-// daemon-wide value survives here only as the fallback for a row written before
-// the policy carried a mode.
+// Two rules compose here, and both are needed.
+//
+// The snapshot is honoured, because Submit records the mode in force for the
+// job including a per-request access_mode_override, and a decision path that
+// read c.AccessMode directly silently discarded the override. That was a live
+// defect: the override was validated, snapshotted, and printed by diagnose
+// while every code path that actually decided whether to open an institutional
+// handoff consulted the daemon-wide default instead.
+//
+// The snapshot is also re-clamped against the current configuration, because
+// the daemon-wide mode is the operator's standing decision and must keep
+// restraining work already in the queue. Honouring the snapshot alone would
+// make the ceiling apply only at submit, so an operator tightening
+// delegated -> conservative would not stop jobs already recorded from opening
+// the handoff tabs they just revoked — inverting the invariant the clamp
+// exists to protect. Re-clamping is monotone: it can only ever lower the mode.
+//
+// A row written before policies carried a mode falls back to the configured
+// value, as does a job whose pinned mode Retry released.
 func (c *Config) EffectiveAccessMode(policyMode string) string {
-	if mode := strings.TrimSpace(policyMode); mode != "" {
-		return mode
-	}
-	return c.AccessMode
+	return c.NarrowAccessMode(c.AccessMode, strings.TrimSpace(policyMode))
 }
 
 // accessModeRank orders the modes by how much papio will do without a human.
@@ -724,12 +732,19 @@ func (c *Config) NarrowAccessMode(configured, override string) string {
 	if override == "" {
 		return configured
 	}
-	configuredRank, known := accessModeRank[configured]
-	if !known {
+	overrideRank, knownOverride := accessModeRank[override]
+	if !knownOverride {
 		return configured
 	}
-	overrideRank, known := accessModeRank[override]
-	if !known || overrideRank >= configuredRank {
+	configuredRank, knownConfigured := accessModeRank[configured]
+	if !knownConfigured {
+		// No ceiling to clamp against. Submit cannot reach this — Require-
+		// AccessMode refuses an unset mode before the override is applied — but
+		// EffectiveAccessMode also runs on read, where a zero Config must not
+		// silently discard the mode the job was actually recorded with.
+		return override
+	}
+	if overrideRank >= configuredRank {
 		return configured
 	}
 	return override

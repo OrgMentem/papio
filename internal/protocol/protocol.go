@@ -359,7 +359,7 @@ func checkEntitlementWireShape(data []byte) error {
 	if err := json.Unmarshal(data, &document); err != nil {
 		return nil // strictDecode already rejected anything malformed
 	}
-	rawEntitlement, present := document.Candidate["entitlement"]
+	rawEntitlement, present := lookupJSONKey(document.Candidate, "entitlement")
 	if !present {
 		return nil
 	}
@@ -370,13 +370,30 @@ func checkEntitlementWireShape(data []byte) error {
 	if err := json.Unmarshal(rawEntitlement, &entitlement); err != nil {
 		return nil
 	}
-	if rawRef, ok := entitlement["entitlement_ref"]; ok {
+	if rawRef, ok := lookupJSONKey(entitlement, "entitlement_ref"); ok {
 		trimmed := bytes.TrimSpace(rawRef)
 		if bytes.Equal(trimmed, []byte("null")) || bytes.Equal(trimmed, []byte(`""`)) {
 			return fmt.Errorf("candidate.entitlement.entitlement_ref must be omitted rather than empty")
 		}
 	}
 	return nil
+}
+
+// lookupJSONKey resolves a key the way encoding/json resolves a struct field:
+// exact match first, then case-insensitively. A raw map lookup is
+// case-SENSITIVE while the strict decode above is not, so `"Entitlement": null`
+// would populate the struct while slipping past a case-sensitive guard —
+// failing open on both invariants this function exists to enforce.
+func lookupJSONKey(object map[string]json.RawMessage, key string) (json.RawMessage, bool) {
+	if raw, ok := object[key]; ok {
+		return raw, true
+	}
+	for candidate, raw := range object {
+		if strings.EqualFold(candidate, key) {
+			return raw, true
+		}
+	}
+	return nil, false
 }
 
 // Validate enforces the schema plus the cross-field invariant that the
@@ -496,13 +513,22 @@ func (e *BundleEntitlement) validate() error {
 // validateBareRoute admits only a bare origin: an https URL with a host and
 // nothing else — no path, query, fragment, or userinfo.
 //
-// It must agree exactly with the published schema's
-// `^https://[^/?#@]+$` + maxLength, because this project validates twice on
-// purpose and a validator laxer than its schema is a decoder disagreement
-// waiting to be exported. The path check earns its place: a path is where
-// signed tokens live in several CDN schemes, and redact.URL preserves the whole
-// path when the source URL had no query string — so an emitter that reached for
-// redact.URL instead of redact.Host would sail past a scheme/host-only check.
+// It must never be laxer than the published schema's `^https://[^/?#@]+$` plus
+// maxLength, because this project validates twice on purpose and a validator
+// laxer than its own schema is a decoder disagreement waiting to be exported.
+// It is deliberately stricter in places — net/url rejects unbracketed IPv6,
+// percent-encoded and whitespace-bearing hosts that the bare character class
+// would admit — and stricter is the safe direction. The path check earns its
+// place: a path is where signed tokens live in several CDN schemes, and
+// redact.URL preserves the whole path when the source URL had no query string,
+// so an emitter that reached for redact.URL instead of redact.Host would sail
+// past a scheme/host-only check.
+//
+// The scheme is compared against the raw prefix rather than u.Scheme because
+// url.Parse lowercases the scheme, so "HTTPS://host" would satisfy a
+// u.Scheme == "https" test while the schema's case-sensitive pattern rejects
+// it — laxer than the published contract, in exactly the direction that
+// matters.
 //
 // The literal '?' and '#' checks are likewise not redundant with the parsed
 // fields: redact.URL returns "…?<redacted>" to mark that evidence was removed,
@@ -512,17 +538,21 @@ func validateBareRoute(route string) error {
 	if route == "" {
 		return fmt.Errorf("candidate.entitlement.route required")
 	}
-	if len(route) > 2000 {
-		return fmt.Errorf("candidate.entitlement.route length %d exceeds 2000", len(route))
+	// Code points, matching JSON Schema's maxLength, rather than bytes.
+	if utf8.RuneCountInString(route) > 2000 {
+		return fmt.Errorf("candidate.entitlement.route length %d exceeds 2000", utf8.RuneCountInString(route))
 	}
 	if strings.ContainsAny(route, "?#") {
 		return fmt.Errorf("candidate.entitlement.route %q must not retain URL query or fragment data", route)
+	}
+	if !strings.HasPrefix(route, "https://") {
+		return fmt.Errorf("candidate.entitlement.route %q must be an https URL with a host", route)
 	}
 	u, err := url.Parse(route)
 	if err != nil {
 		return fmt.Errorf("invalid candidate.entitlement.route %q", route)
 	}
-	if u.Scheme != "https" || u.Host == "" {
+	if u.Host == "" {
 		return fmt.Errorf("candidate.entitlement.route %q must be an https URL with a host", route)
 	}
 	if u.User != nil {

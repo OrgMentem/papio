@@ -125,12 +125,12 @@ execution records in `notes/acquisition-stack-plan.md`.
   `assisted` or `delegated` daemon therefore opened a handoff anyway, and
   reported that it had honoured the override. The job's own snapshot is now
   authoritative at both decision points — the exhaustion gate and the
-  `access_mode` sent to the extension in a job offer. The daemon-wide value
-  remains the fallback for jobs recorded before policies carried a mode.
-  An override may now only *narrow*: the configured `access_mode` is the
-  operator's standing decision and the only brake papio has, so a submitter
-  cannot raise automation above it. Narrowing is what the override is for — a
-  cohort run asking for `conservative` on a delegated daemon records
+  `access_mode` sent to the extension in a job offer. An override may now only
+  *narrow*: the configured `access_mode` is the operator's standing decision and
+  the only brake papio has, so a submitter cannot raise automation above it, and
+  the ceiling is re-applied on every read, so tightening `access_mode` restrains
+  jobs already queued rather than only new ones. Narrowing is what the override
+  is for — a cohort run asking for `conservative` on a delegated daemon records
   `openurl_available` advisories and opens nothing, instead of parking hundreds
   of handoffs that never expire.
 - **Widening `access_mode` and retrying a conservative job works again.** The

@@ -122,9 +122,13 @@ code that decides whether to open an institutional handoff read the daemon-wide
 that it worked. No test covered it: every mode test set the config.
 
 `Config.EffectiveAccessMode(policyMode)`
-(`internal/config/config.go:686-702`) now resolves the job's snapshot first and
-falls back to the daemon default only for rows written before the policy carried
-a mode. Both decision sites use it: the exhaustion gate
+(`internal/config/config.go:686-710`) now resolves the job's snapshot **and
+re-clamps it against the current configuration**, so the ceiling is continuous
+rather than applied only at submit. Honouring the snapshot alone was itself a
+regression, found in review: an operator tightening `delegated` to
+`conservative` would not have restrained jobs already recorded, which are
+exactly the jobs they were trying to stop. Re-clamping is monotone — it can only
+lower the mode. Both decision sites use it: the exhaustion gate
 (`internal/app/app.go:906`) and the `job_offer` frame
 (`internal/browser/bridge.go`).
 
@@ -229,6 +233,15 @@ itself was refused outright — a digest of a secret is secret-derived.
 `route` is `redact.Host` of the accepted candidate's URL. The whole object is
 omitted when no route resolves.
 
+**`route` names where the bytes came from, not where a credential went.** For a
+licensed API those can differ: Crossref's Plus token is metadata-only and its
+own code says publisher download URLs never receive it, so a `crossref_tdm`
+bundle carries the publisher's origin as `route` alongside
+`acquisition_mode: daemon_held_credential`. Both facts are true — the
+acquisition was authorised by a credential *papio* holds, and the file came from
+that origin — but read as "this host received our credential" the pair would be
+false, so the published schema states the narrower meaning explicitly.
+
 **`operator_browser_session` therefore has no producer yet, and that is
 deliberate.** The only writer of `institutional` is browser adoption
 (`internal/app/browser_adopt.go:103-105`), which records that basis
@@ -290,6 +303,12 @@ v1 decoding is retained indefinitely.
   returns the path alone and `bundle.export_v2` carries the body, with the CLI
   preferring v2 and falling back on `unknown_method`. Removing a field is safe
   for an old decoder; adding one is not.
+- `jobs.retry` releasing a job's pinned mode also discards a *submitter's*
+  deliberate narrowing, not just an operator's. It cannot exceed the ceiling —
+  the released job follows the current configuration, which is itself clamped —
+  but a consumer that narrows to `conservative` and later retries gets the
+  daemon default. `jobs.retry` is unratified and explicit; consumers relying on
+  a narrowing should resubmit rather than retry.
 
 Scope tripwire: if `entitlement` ever grows a field expressing a *judgement* —
 whether the terms permit an action, rather than which terms applied — stop. That

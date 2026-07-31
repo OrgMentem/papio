@@ -775,3 +775,45 @@ func TestLibrarySourcesRoundTrip(t *testing.T) {
 		t.Fatalf("library.sources = %#v, want %#v", got.Library.Sources, want)
 	}
 }
+
+// TestEffectiveAccessModeIsAMonotoneCeiling pins both halves of the access-mode
+// resolution, including the two cases a review caught after the first pass:
+// tightening the configuration must restrain jobs already recorded, and an
+// unset configuration must not silently discard the mode a job was recorded
+// with.
+func TestEffectiveAccessModeIsAMonotoneCeiling(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		configured string
+		policy     string
+		want       string
+	}{
+		{name: "no policy follows the configuration", configured: ModeAssisted, policy: "", want: ModeAssisted},
+		{name: "narrowing policy is honoured", configured: ModeDelegated, policy: ModeConservative, want: ModeConservative},
+		{name: "widening policy is refused", configured: ModeConservative, policy: ModeDelegated, want: ModeConservative},
+		{name: "equal policy is a no-op", configured: ModeAssisted, policy: ModeAssisted, want: ModeAssisted},
+		{
+			// The job was recorded under delegated; the operator has since
+			// revoked it. The revocation must reach work already queued.
+			name:       "tightening the configuration restrains an existing job",
+			configured: ModeConservative, policy: ModeDelegated, want: ModeConservative,
+		},
+		{
+			// Submit cannot produce this (RequireAccessMode refuses an unset
+			// mode), but the read path must not turn the job's own recorded
+			// mode into nothing.
+			name:       "an unset configuration falls back to the job's own mode",
+			configured: "", policy: ModeAssisted, want: ModeAssisted,
+		},
+		{name: "a garbage policy mode is ignored", configured: ModeAssisted, policy: "maximal", want: ModeAssisted},
+		{name: "surrounding whitespace is tolerated", configured: ModeDelegated, policy: "  conservative  ", want: ModeConservative},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Config{AccessMode: tc.configured}
+			if got := cfg.EffectiveAccessMode(tc.policy); got != tc.want {
+				t.Fatalf("EffectiveAccessMode(%q) with configured %q = %q, want %q",
+					tc.policy, tc.configured, got, tc.want)
+			}
+		})
+	}
+}
