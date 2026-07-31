@@ -1791,7 +1791,11 @@ func (b *Bridge) poll(ctx context.Context) ([]json.RawMessage, error) {
 		if b.offered[row.ID] {
 			continue
 		}
-		offer, err := b.offer(row, action)
+		accessMode, offerable := b.offerableAccessMode(row)
+		if !offerable {
+			continue
+		}
+		offer, err := b.offer(row, action, accessMode)
 		if err != nil {
 			return nil, err
 		}
@@ -1847,8 +1851,13 @@ func (b *Bridge) poll(ctx context.Context) ([]json.RawMessage, error) {
 				delete(b.focusPending, id)
 				continue
 			}
+			accessMode, offerable := b.offerableAccessMode(*row)
+			if !offerable {
+				delete(b.focusPending, id)
+				continue
+			}
 			if !b.offered[id] {
-				offer, offerErr := b.offer(*row, handoff[id])
+				offer, offerErr := b.offer(*row, handoff[id], accessMode)
 				if offerErr != nil {
 					return nil, offerErr
 				}
@@ -1870,10 +1879,30 @@ func (b *Bridge) poll(ctx context.Context) ([]json.RawMessage, error) {
 	return out, nil
 }
 
+// offerableAccessMode resolves the access mode to advertise for one handoff
+// offer, and reports whether the job may be offered at all.
+//
+// papio-browser/1 permits only assisted and delegated in a job_offer, because
+// conservative never opens an institutional handoff. A parked job that resolves
+// to conservative is therefore stale state: a row parked before the operator
+// tightened the daemon mode, or before per-request overrides were honoured.
+// Skipping it is the honest answer. Emitting it would fail the outbound
+// self-validation, and a non-nil error out of Sync tears down the entire
+// native-messaging session rather than dropping one offer.
+func (b *Bridge) offerableAccessMode(row job.Row) (string, bool) {
+	switch mode := b.cfg.EffectiveAccessMode(row.Policy.AccessMode); mode {
+	case config.ModeAssisted, config.ModeDelegated:
+		return mode, true
+	default:
+		return "", false
+	}
+}
+
 // offer builds a job_offer for one parked handoff job. OA browser handoffs
 // reuse the frozen OpenURL field with the candidate's public URL; institutional
-// handoffs still construct the regular OpenURL resolver link.
-func (b *Bridge) offer(row job.Row, action job.HumanAction) (json.RawMessage, error) {
+// handoffs still construct the regular OpenURL resolver link. accessMode comes
+// from offerableAccessMode, so this never has to re-derive it.
+func (b *Bridge) offer(row job.Row, action job.HumanAction, accessMode string) (json.RawMessage, error) {
 	inst, _ := b.cfg.InstitutionFor(row.Policy.Resolver)
 	offerURL := OpenURL(inst.OpenURLBase, row.Work)
 	if oaURL, ok := app.OABrowserHandoffURL(action.Detail); ok {
@@ -1892,7 +1921,7 @@ func (b *Bridge) offer(row job.Row, action job.HumanAction) (json.RawMessage, er
 		OpenURL:       offerURL,
 		ProviderHosts: hosts,
 		Expected:      expected,
-		AccessMode:    b.cfg.AccessMode,
+		AccessMode:    accessMode,
 		RequiresAuth:  action.RequiresAuth,
 		ExpiresAt:     b.now().Add(b.actionExpiry()).UTC().Format(time.RFC3339),
 	}

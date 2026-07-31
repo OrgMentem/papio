@@ -1130,11 +1130,33 @@ func (js *Store) Retry(ctx context.Context, jobID string) error {
 	// access mode and retry. Left open it outlives its own remedy and keeps
 	// telling the user to do the thing they just did, even once the job reaches
 	// ready. Re-exhausting in conservative mode opens it again.
-	if _, err := tx.ExecContext(ctx,
+	cancelled, err := tx.ExecContext(ctx,
 		`UPDATE human_actions SET status = 'cancelled', resolved_at = ?
 		  WHERE job_id = ? AND kind = ? AND status = 'open'`,
-		now, jobID, informationalActionKind); err != nil {
+		now, jobID, informationalActionKind)
+	if err != nil {
 		return err
+	}
+	advisories, err := cancelled.RowsAffected()
+	if err != nil {
+		return err
+	}
+	// Releasing the pinned access mode is the other half of cancelling that
+	// advisory, and without it the remedy the advisory names cannot work. The
+	// advisory says "a route exists; this mode will not take it", the operator
+	// widens access_mode and retries — but the job snapshots its mode at submit
+	// time and the decision path reads that snapshot, so the retry would
+	// re-exhaust under the same conservative mode and reopen the same advisory
+	// forever. Clearing it lets the job follow the operator's current
+	// configuration from here, which is precisely the decision they just made.
+	// Scoped to jobs that actually carry the advisory: an ordinary failed or
+	// retry-wait retry keeps whatever mode it was submitted with.
+	if advisories > 0 {
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE jobs SET policy_json = json_set(policy_json, '$.access_mode', '') WHERE id = ?`,
+			jobID); err != nil {
+			return err
+		}
 	}
 	if _, err := tx.ExecContext(ctx,
 		`UPDATE candidates SET status = 'pending'

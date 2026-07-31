@@ -683,6 +683,58 @@ func (c *Config) RequireAccessMode() (string, error) {
 	return c.AccessMode, nil
 }
 
+// EffectiveAccessMode resolves the access mode governing one job, given that
+// job's snapshotted Policy.AccessMode. The snapshot is authoritative: Submit
+// records the mode in force for the job, including a per-request
+// access_mode_override, so a decision path that reads c.AccessMode directly
+// silently discards the override.
+//
+// That was a live defect. The override was validated, snapshotted, and printed
+// by status/diagnose while every code path that actually decided whether to
+// open an institutional handoff consulted the daemon-wide default instead. The
+// daemon-wide value survives here only as the fallback for a row written before
+// the policy carried a mode.
+func (c *Config) EffectiveAccessMode(policyMode string) string {
+	if mode := strings.TrimSpace(policyMode); mode != "" {
+		return mode
+	}
+	return c.AccessMode
+}
+
+// accessModeRank orders the modes by how much papio will do without a human.
+var accessModeRank = map[string]int{ModeConservative: 0, ModeAssisted: 1, ModeDelegated: 2}
+
+// NarrowAccessMode returns whichever of the configured mode and a per-request
+// override does less without a human.
+//
+// A per-request override may narrow, never widen. The daemon-wide access_mode
+// is the operator's standing decision — first-run setup refuses to select one
+// silently — and it is also the only brake that exists: papio has no admission
+// control, no queue cap, and no drain, so under assisted or delegated an
+// exhausted work parks on a human action that never expires. If a submitter
+// could raise the mode, any process reaching the owner-only IPC socket,
+// including an agent driving the MCP surface, could mint unbounded handoff tabs
+// on a daemon whose operator deliberately opted out of opening any.
+//
+// Narrowing stays fully supported, which is what the override is actually for:
+// a cohort submitter asking for conservative on a delegated daemon gets
+// conservative. An operator who genuinely wants more automation edits their
+// configuration, which is a deliberate act rather than a request parameter.
+func (c *Config) NarrowAccessMode(configured, override string) string {
+	if override == "" {
+		return configured
+	}
+	configuredRank, known := accessModeRank[configured]
+	if !known {
+		return configured
+	}
+	overrideRank, known := accessModeRank[override]
+	if !known || overrideRank >= configuredRank {
+		return configured
+	}
+	return override
+}
+
 // FetchTimeout is Fetch.TimeoutSeconds as a duration.
 func (c *Config) FetchTimeout() time.Duration {
 	return time.Duration(c.Fetch.TimeoutSeconds) * time.Second

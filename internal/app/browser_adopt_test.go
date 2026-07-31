@@ -193,6 +193,99 @@ func TestExhaustedCandidatesConservativeRecordsActionButStaysUnavailable(t *test
 	}
 }
 
+// TestPerRequestAccessModeOverrideGovernsTheHandoffDecision pins the fix for a
+// defect where access_mode_override was validated, snapshotted into
+// job.Policy.AccessMode, and printed by status/diagnose while
+// exhaustedCandidates read the daemon-wide s.Config.AccessMode instead. The
+// override therefore looked like it worked and reported that it worked while
+// changing nothing.
+// Both directions are asserted deliberately, and they assert different things.
+// Narrowing must take effect; widening must not. Checking only one direction
+// would pass against a build that simply hardcoded that answer, which is how
+// the original defect hid.
+func TestPerRequestAccessModeOverrideGovernsTheHandoffDecision(t *testing.T) {
+	const base = "https://openurl.example.edu/resolve"
+	for _, tc := range []struct {
+		name       string
+		configMode string
+		override   string
+		wantMode   string
+		wantState  string
+		wantKind   string
+		denyKind   string
+	}{
+		{
+			name:       "conservative override narrows a delegated daemon and opens no handoff",
+			configMode: config.ModeDelegated,
+			override:   config.ModeConservative,
+			wantMode:   config.ModeConservative,
+			wantState:  job.StateUnavailable,
+			wantKind:   "openurl_available",
+			denyKind:   "openurl_handoff",
+		},
+		{
+			// The daemon-wide mode is a ceiling, not a default: a submitter
+			// cannot raise automation above what the operator configured.
+			name:       "delegated override cannot widen a conservative daemon",
+			configMode: config.ModeConservative,
+			override:   config.ModeDelegated,
+			wantMode:   config.ModeConservative,
+			wantState:  job.StateUnavailable,
+			wantKind:   "openurl_available",
+			denyKind:   "openurl_handoff",
+		},
+		{
+			name:       "assisted override narrows a delegated daemon and still hands off",
+			configMode: config.ModeDelegated,
+			override:   config.ModeAssisted,
+			wantMode:   config.ModeAssisted,
+			wantState:  job.StateAwaitingHuman,
+			wantKind:   "openurl_handoff",
+			denyKind:   "openurl_available",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, jobs := exhaustingService(t, tc.configMode, base)
+			request := doiRequest("wr_override_gate")
+			request.AccessModeOverride = tc.override
+
+			ctx := context.Background()
+			id, err := svc.Submit(ctx, request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			row, err := jobs.ClaimNext(ctx, "worker", time.Minute)
+			if err != nil || row == nil {
+				t.Fatalf("claim = %+v, %v", row, err)
+			}
+			// The snapshot is the input the decision path must consult, and it
+			// records the clamped mode rather than the requested one, so
+			// diagnose never reports an override the daemon declined to honour.
+			if row.Policy.AccessMode != tc.wantMode {
+				t.Fatalf("policy snapshot = %q, want %q", row.Policy.AccessMode, tc.wantMode)
+			}
+			if err := svc.Process(ctx, row); err != nil {
+				t.Fatalf("process: %v", err)
+			}
+			out, err := jobs.Get(ctx, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if out.State != tc.wantState {
+				t.Fatalf("state = %s, want %s; the daemon-wide %s mode governed instead of the override",
+					out.State, tc.wantState, tc.configMode)
+			}
+			kinds := openActionKinds(t, jobs, id)
+			if !kinds[tc.wantKind] {
+				t.Fatalf("open actions = %v, want %s", kinds, tc.wantKind)
+			}
+			if kinds[tc.denyKind] {
+				t.Fatalf("open actions = %v, must not contain %s", kinds, tc.denyKind)
+			}
+		})
+	}
+}
+
 func TestExhaustedCandidatesWithoutOpenURLBaseStaysUnavailable(t *testing.T) {
 	svc, jobs := exhaustingService(t, config.ModeDelegated, "")
 	row := processToEnd(t, svc, jobs, "wr_nobase")
@@ -577,5 +670,62 @@ func TestAdoptDownloadNormalizesAPreUpgradeSynthesizedVersion(t *testing.T) {
 	if candidate.Version != resolver.VersionUnknown {
 		t.Fatalf("re-adopted candidate version = %q, want %q — the pre-upgrade claim outlived the fix",
 			candidate.Version, resolver.VersionUnknown)
+	}
+}
+
+// TestRetryAfterWideningAccessModeEscalatesAConservativeJob pins the recovery
+// path the conservative advisory itself prescribes: "a route exists, this mode
+// will not take it" -> operator widens access_mode -> `papio jobs retry`.
+//
+// Making the job's policy snapshot authoritative broke this, because the
+// snapshot is immutable across a retry: the job would re-exhaust under its
+// original conservative mode and reopen the same advisory forever, telling the
+// operator to do the thing they had just done. Retry therefore releases the
+// pinned mode when it cancels the advisory.
+func TestRetryAfterWideningAccessModeEscalatesAConservativeJob(t *testing.T) {
+	const base = "https://openurl.example.edu/resolve"
+	ctx := context.Background()
+	svc, jobs := exhaustingService(t, config.ModeConservative, base)
+
+	id, err := svc.Submit(ctx, doiRequest("wr_escalate_after_retry"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, err := jobs.ClaimNext(ctx, "worker", time.Minute)
+	if err != nil || row == nil {
+		t.Fatalf("claim = %+v, %v", row, err)
+	}
+	if err := svc.Process(ctx, row); err != nil {
+		t.Fatal(err)
+	}
+	out, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.State != job.StateUnavailable || !openActionKinds(t, jobs, id)["openurl_available"] {
+		t.Fatalf("state = %s with actions %v, want unavailable plus the conservative advisory", out.State, openActionKinds(t, jobs, id))
+	}
+
+	// The operator takes the advisory's advice.
+	svc.Config.AccessMode = config.ModeDelegated
+	if err := jobs.Retry(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	row, err = jobs.ClaimNext(ctx, "worker", time.Minute)
+	if err != nil || row == nil {
+		t.Fatalf("claim after retry = %+v, %v", row, err)
+	}
+	if err := svc.Process(ctx, row); err != nil {
+		t.Fatal(err)
+	}
+	out, err = jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.State != job.StateAwaitingHuman {
+		t.Fatalf("state after widening access_mode and retrying = %s, want awaiting_human; the job stayed pinned to its original conservative snapshot", out.State)
+	}
+	if kinds := openActionKinds(t, jobs, id); !kinds["openurl_handoff"] {
+		t.Fatalf("open actions after retry = %v, want an institutional handoff", kinds)
 	}
 }

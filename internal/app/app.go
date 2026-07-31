@@ -168,9 +168,10 @@ func (s *Service) SubmitWithOptionsAs(ctx context.Context, principal job.Princip
 	if err != nil {
 		return SubmitResult{}, err
 	}
-	if wr.AccessModeOverride != "" {
-		mode = wr.AccessModeOverride
-	}
+	// Narrow-only: see config.NarrowAccessMode. The snapshot below therefore
+	// records the mode that will actually govern, so diagnose does not report an
+	// override that the daemon declined to honour.
+	mode = s.Config.NarrowAccessMode(mode, wr.AccessModeOverride)
 	w, raw, err := canonicalWork(wr)
 	if err != nil {
 		return SubmitResult{}, err
@@ -903,7 +904,7 @@ func (s *Service) institutionalRouteExhausted(ctx context.Context, jobID string)
 // The action detail carries the live OA URL solely for the browser bridge; it
 // is never copied into job events or protocol metadata.
 func (s *Service) exhaustedCandidates(ctx context.Context, row *job.Row, from, reason string, terminal job.TerminalReason, oaBrowserURL string) error {
-	mode := s.Config.AccessMode
+	mode := s.Config.EffectiveAccessMode(row.Policy.AccessMode)
 	switch mode {
 	case config.ModeAssisted, config.ModeDelegated:
 		if oaBrowserURL != "" {

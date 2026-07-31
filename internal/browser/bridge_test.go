@@ -2665,7 +2665,7 @@ func TestOpenURLUsesSelectedResolverProfileForPrimoNDEAndVE(t *testing.T) {
 		{name: "VE named", resolver: "institute", wantPath: "/discovery/openurl", wantVID: "61INS_INST:INS"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			raw, err := b.offer(job.Row{ID: "job-profile", Work: handoffWork(), Policy: job.Policy{Resolver: test.resolver}}, job.HumanAction{Kind: handoffActionKind, Detail: "institutional handoff", RequiresAuth: true})
+			raw, err := b.offer(job.Row{ID: "job-profile", Work: handoffWork(), Policy: job.Policy{Resolver: test.resolver}}, job.HumanAction{Kind: handoffActionKind, Detail: "institutional handoff", RequiresAuth: true}, config.ModeDelegated)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -2711,7 +2711,7 @@ func TestOfferLoginRoutingIsPerResolverProfile(t *testing.T) {
 		{name: "named without identity leaks nothing", resolver: "bare"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			raw, err := b.offer(job.Row{ID: "job-login-route", Work: handoffWork(), Policy: job.Policy{Resolver: test.resolver}}, job.HumanAction{Kind: handoffActionKind, Detail: "institutional handoff", RequiresAuth: true})
+			raw, err := b.offer(job.Row{ID: "job-login-route", Work: handoffWork(), Policy: job.Policy{Resolver: test.resolver}}, job.HumanAction{Kind: handoffActionKind, Detail: "institutional handoff", RequiresAuth: true}, config.ModeDelegated)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -2829,4 +2829,84 @@ func TestSweepTerminalAdoptionsRemovesOnlyTerminalDirs(t *testing.T) {
 	kept(awaitingID)    // non-terminal handoff may still receive a download
 	kept("rejected")    // user-facing rejected files are preserved
 	kept("job_stray_dir")
+}
+
+// parkWithPolicyMode parks a handoff-ready job carrying an explicit policy
+// access mode, so a test can make the job's mode differ from the daemon's.
+func parkWithPolicyMode(t *testing.T, jobs *job.Store, reqID, doi, mode string) string {
+	t.Helper()
+	ctx := context.Background()
+	id, err := jobs.CreateRequest(ctx, reqID, work.Work{DOI: doi}, "", "",
+		job.Policy{AccessMode: mode, DesiredVersion: "any", FetchMaxBytes: 1 << 20},
+		nil, job.PrincipalUnknown)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, step := range [][2]string{
+		{job.StateQueued, job.StateResolving},
+		{job.StateResolving, job.StateFetching},
+		{job.StateFetching, job.StateAwaitingHuman},
+	} {
+		if err := jobs.Transition(ctx, id, step[0], step[1], map[string]any{"reason": "institutional_handoff"}); err != nil {
+			t.Fatalf("%s->%s: %v", step[0], step[1], err)
+		}
+	}
+	if _, err := jobs.OpenHumanAction(ctx, id, handoffActionKind, "handoff available",
+		job.WithAccessClassification(true, "paywall")); err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+// TestJobOfferAdvertisesTheJobsOwnAccessMode pins the browser half of the
+// access_mode_override fix. The offer's access_mode is what the extension uses
+// to decide whether a verified adapter may download without the human, so
+// reading the daemon-wide config here let a job submitted as assisted be
+// handled by the extension as delegated, and vice versa.
+func TestJobOfferAdvertisesTheJobsOwnAccessMode(t *testing.T) {
+	b, jobs, cfg, _ := newBridge(t)
+	if cfg.AccessMode != config.ModeDelegated {
+		t.Fatalf("fixture daemon mode = %q, want delegated so the job policy can differ", cfg.AccessMode)
+	}
+	parkWithPolicyMode(t, jobs, "wr_offer_mode_assisted", "10.1000/offer-mode", config.ModeAssisted)
+
+	msgs, _ := runSync(t, b, hello())
+	offer := firstOfType(msgs, protocol.MsgJobOffer)
+	if offer == nil {
+		t.Fatal("missing job offer")
+	}
+	if got := offer.Payload.(*protocol.JobOfferPayload).AccessMode; got != config.ModeAssisted {
+		t.Fatalf("offer access_mode = %q, want the job's own %q; the daemon-wide %q leaked into the frame",
+			got, config.ModeAssisted, cfg.AccessMode)
+	}
+}
+
+// TestStaleConservativeParkedJobIsSkippedInsteadOfKillingTheSession covers the
+// hazard the policy-first read introduces. papio-browser/1 allows only assisted
+// and delegated in a job_offer, and a non-nil error out of Sync is treated by
+// the native host as a dead connection — so emitting a conservative offer would
+// disconnect the extension entirely rather than drop one row. A job that
+// resolves to conservative must be skipped silently, and its siblings must
+// still be offered.
+func TestStaleConservativeParkedJobIsSkippedInsteadOfKillingTheSession(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	stale := parkWithPolicyMode(t, jobs, "wr_offer_mode_stale", "10.1000/stale-conservative", config.ModeConservative)
+	live := parkWithPolicyMode(t, jobs, "wr_offer_mode_live", "10.1000/live-delegated", config.ModeDelegated)
+
+	// runSync fails the test on a Sync error, which is the tear-down this
+	// guards against: the native host treats any error out of Sync as a dead
+	// connection and drops the whole session.
+	msgs, _ := runSync(t, b, hello())
+	var offered []string
+	for _, msg := range msgs {
+		if msg.Type == protocol.MsgJobOffer {
+			offered = append(offered, msg.JobID)
+		}
+	}
+	if !slices.Contains(offered, live) {
+		t.Fatalf("offered = %v, want the delegated job %s", offered, live)
+	}
+	if slices.Contains(offered, stale) {
+		t.Fatalf("offered = %v, must not contain the conservative job %s", offered, stale)
+	}
 }
