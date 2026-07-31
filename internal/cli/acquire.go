@@ -252,16 +252,14 @@ func normalizeIdentifiers(args []string, doi, pmid, arxivID, isbn, openalex stri
 			ids.DOI, err = work.NormalizeDOI(raw)
 		case strings.HasPrefix(lower, "arxiv:"), strings.Contains(lower, "arxiv.org/"):
 			ids.ArXiv, err = work.NormalizeArXiv(raw)
-		case strings.HasPrefix(lower, "openalex:"), strings.Contains(lower, "openalex.org/"), strings.HasPrefix(strings.ToUpper(raw), "W"):
+		case strings.HasPrefix(lower, "openalex:"), strings.Contains(lower, "openalex.org/"):
 			ids.OpenAlex, err = work.NormalizeOpenAlex(raw)
 		case strings.HasPrefix(lower, "pmid:"):
 			ids.PMID, err = work.NormalizePMID(raw)
 		case strings.HasPrefix(lower, "isbn:"):
 			ids.ISBN, err = work.NormalizeISBN(strings.TrimSpace(raw[len("isbn:"):]))
-		case allDigits(raw) && len(raw) <= 9:
-			ids.PMID, err = work.NormalizePMID(raw)
 		default:
-			return nil, fmt.Errorf("cannot infer identifier type %q; use --doi, --arxiv, --pmid, --isbn, or --openalex", raw)
+			err = inferBareIdentifier(raw, ids)
 		}
 	} else {
 		for _, item := range []struct {
@@ -290,6 +288,53 @@ func normalizeIdentifiers(args []string, doi, pmid, arxivID, isbn, openalex stri
 		return nil, nil // a complete title/author/year tuple may identify the work
 	}
 	return ids, nil
+}
+
+// inferBareIdentifier classifies a positional argument that carries no scheme
+// prefix, setting exactly one field on ids. It infers only from shapes that
+// cannot name a different scheme, because a wrong guess here silently acquires
+// the wrong work; anything ambiguous is refused in favour of an explicit flag.
+//
+// This is the only bare-string identifier classifier in the tree. Every other
+// entry point — the identifier flags below, `papio batch`/MCP via
+// batch.ParseWork, and the daemon's protocol.Identifiers ingress — receives
+// named fields and normalizes each with the matching work.Normalize* function.
+func inferBareIdentifier(raw string, ids *protocol.Identifiers) error {
+	var err error
+	switch {
+	// A bare digit string is a PMID only below the ISBN-10 width. Ten digits is
+	// a valid ISBN-10 (work.isbnDigitsRE accepts `[0-9]{9}[0-9Xx]`) *and* a
+	// valid PMID (work.pmidRE accepts up to ten digits), so it names two
+	// schemes at once and must stay an error telling the user to disambiguate.
+	// Do not widen this to work.NormalizePMID's own regex: `--pmid` may take
+	// ten digits because the flag already states the scheme, but this path
+	// cannot. PMIDs are eight digits today, so nine leaves ample headroom.
+	case allDigits(raw) && len(raw) <= 9:
+		ids.PMID, err = work.NormalizePMID(raw)
+	// `W` plus digits. Checked by normalizing rather than by prefix so that an
+	// ordinary word beginning with W falls through to the actionable
+	// "cannot infer" error instead of an OpenAlex-specific one.
+	case isOpenAlexID(raw):
+		ids.OpenAlex, err = work.NormalizeOpenAlex(raw)
+	// `NNNN.NNNNN[vN]` or `archive[.SUB]/NNNNNNN[vN]`. Unambiguous against every
+	// other scheme: a DOI starts `10.` and contains `/`, a PMID has no dot or
+	// slash, and an ISBN has neither.
+	case isArXivID(raw):
+		ids.ArXiv, err = work.NormalizeArXiv(raw)
+	default:
+		return fmt.Errorf("cannot infer identifier type %q; use --doi, --arxiv, --pmid, --isbn, or --openalex", raw)
+	}
+	return err
+}
+
+func isOpenAlexID(raw string) bool {
+	_, err := work.NormalizeOpenAlex(raw)
+	return err == nil
+}
+
+func isArXivID(raw string) bool {
+	_, err := work.NormalizeArXiv(raw)
+	return err == nil
 }
 
 func allDigits(value string) bool {

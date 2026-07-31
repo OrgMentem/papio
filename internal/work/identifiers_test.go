@@ -84,32 +84,6 @@ func TestArXivFromDOI(t *testing.T) {
 	}
 }
 
-func TestClassifyIdentifier(t *testing.T) {
-	cases := []struct {
-		in        string
-		kind, val string
-	}{
-		{"10.1002/example", "doi", "10.1002/example"},
-		{"https://doi.org/10.1002/Example.", "doi", "10.1002/example"},
-		{"doi:10.48550/arXiv.2301.08745", "arxiv", "2301.08745"}, // arXiv DOI collapses to arXiv id
-		{"arXiv:2301.08745v2", "arxiv", "2301.08745v2"},
-		{"2301.08745", "arxiv", "2301.08745"},
-		{"pmid:15676839", "pmid", "15676839"},
-		{"15676839", "pmid", "15676839"},
-		{"isbn:978-1-4613-3087-5", "isbn", "9781461330875"},
-		{"W2036177018", "openalex", "W2036177018"},
-	}
-	for _, c := range cases {
-		kind, val, err := ClassifyIdentifier(c.in)
-		if err != nil || kind != c.kind || val != c.val {
-			t.Errorf("ClassifyIdentifier(%q) = %s %q %v; want %s %q", c.in, kind, val, err, c.kind, c.val)
-		}
-	}
-	if _, _, err := ClassifyIdentifier("gibberish!!"); err == nil {
-		t.Error("ClassifyIdentifier(gibberish) succeeded, want error")
-	}
-}
-
 func TestNormalizePMID(t *testing.T) {
 	cases := []struct {
 		in   string

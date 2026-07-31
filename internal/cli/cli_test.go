@@ -19,6 +19,7 @@ import (
 	"papio/internal/daemon"
 	"papio/internal/discovery"
 	"papio/internal/ipc"
+	"papio/internal/protocol"
 	"papio/internal/work"
 )
 
@@ -39,6 +40,57 @@ func TestNormalizeIdentifiersRejectsAmbiguousOrMixedInputs(t *testing.T) {
 	}
 	if _, err := normalizeIdentifiers([]string{"10.1000/example"}, "10.1000/other", "", "", "", ""); err == nil {
 		t.Fatal("positional plus explicit identifier accepted")
+	}
+}
+
+// The positional argument is the only place papio guesses which scheme the user
+// meant, so each accepted bare shape is pinned here, as is the refusal that
+// keeps a ten-digit string from silently becoming a PMID.
+func TestNormalizeIdentifiersInfersUnprefixedShapes(t *testing.T) {
+	for _, test := range []struct {
+		name, in string
+		want     protocol.Identifiers
+	}{
+		{"prefixed doi", "doi:10.1002/Example.", protocol.Identifiers{DOI: "10.1002/example"}},
+		{"prefixed pmid", "pmid:15676839", protocol.Identifiers{PMID: "15676839"}},
+		{"prefixed isbn", "isbn:978-1-4613-3087-5", protocol.Identifiers{ISBN: "9781461330875"}},
+		{"bare pmid", "15676839", protocol.Identifiers{PMID: "15676839"}},
+		{"bare openalex", "W2036177018", protocol.Identifiers{OpenAlex: "W2036177018"}},
+		{"bare arxiv new style", "2301.08745", protocol.Identifiers{ArXiv: "2301.08745"}},
+		{"bare arxiv with version", "2301.08745v2", protocol.Identifiers{ArXiv: "2301.08745v2"}},
+		{"bare arxiv old style", "math/0211159", protocol.Identifiers{ArXiv: "math/0211159"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ids, err := normalizeIdentifiers([]string{test.in}, "", "", "", "", "")
+			if err != nil {
+				t.Fatalf("normalizeIdentifiers(%q) = %v", test.in, err)
+			}
+			if *ids != test.want {
+				t.Fatalf("normalizeIdentifiers(%q) = %+v, want %+v", test.in, *ids, test.want)
+			}
+		})
+	}
+}
+
+// A ten-digit string is simultaneously a valid ISBN-10 and a valid PMID, so the
+// bare form must refuse it rather than pick one. Guarding this: widening the
+// PMID width here would silently acquire the wrong work for every bare ISBN-10.
+func TestNormalizeIdentifiersRefusesIdentifiersThatNameTwoSchemes(t *testing.T) {
+	for _, in := range []string{
+		"0306406152",    // ISBN-10 digits, also within PMID width
+		"1234567890",    // ten digits, scheme genuinely ambiguous
+		"Wnt",           // starts with W but is not an OpenAlex id
+		"9781461330875", // bare ISBN-13 still needs isbn:/--isbn
+		"not-an-id",
+	} {
+		ids, err := normalizeIdentifiers([]string{in}, "", "", "", "", "")
+		if err == nil {
+			t.Errorf("normalizeIdentifiers(%q) = %+v, want a cannot-infer error", in, ids)
+			continue
+		}
+		if !strings.Contains(err.Error(), "cannot infer identifier type") {
+			t.Errorf("normalizeIdentifiers(%q) error = %q, want the cannot-infer guidance", in, err)
+		}
 	}
 }
 

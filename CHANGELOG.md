@@ -21,6 +21,14 @@ execution records in `notes/acquisition-stack-plan.md`.
   bundle cannot exist; an accepted main component's bundle remains the success
   provenance document. `truncated` on the two paged methods is a proven fact
   from reading one row past the page limit, not a hint that more may exist.
+- **`papio acquire` accepts a bare arXiv id.** `papio acquire 2301.08745` and
+  `papio acquire math/0211159` previously failed with "cannot infer identifier
+  type" and needed an `arxiv:` prefix or `--arxiv`. Both forms are unambiguous
+  against every other scheme papio accepts — a DOI starts `10.` and contains a
+  slash, a PMID has no dot or slash, an ISBN has neither — so they are now
+  inferred. A bare ten-digit string is still refused on purpose: it is
+  simultaneously a valid ISBN-10 and a valid PMID, so it names two schemes at
+  once and the user is asked to disambiguate with a flag.
 
 ### Changed
 
@@ -34,6 +42,11 @@ execution records in `notes/acquisition-stack-plan.md`.
   valid ones. The removed `openalex_content` name is tolerated and dropped on
   load, so a config written by an earlier `papio init`/`papio config save`
   still parses; the next `papio config save` rewrites the file without it.
+- **An unrecognized positional identifier gives better guidance.** A bare
+  argument beginning with `W` was routed to the OpenAlex parser on the prefix
+  alone, so an ordinary word got an OpenAlex-specific complaint instead of the
+  actionable list of identifier flags. Scheme inference now checks the full
+  shape.
 
 ### Removed
 
@@ -41,6 +54,13 @@ execution records in `notes/acquisition-stack-plan.md`.
   constant, default policy row, resolver priority rank, and published config
   reference — but no adapter was ever written, so enabling it produced no
   candidate, no warning, and no `papio doctor` complaint.
+- **`work.ClassifyIdentifier`, a second identifier classifier that never ran.**
+  It duplicated the CLI's positional-argument inference and had already diverged
+  from it, carrying the more inviting name and a passing test suite that asserted
+  behaviour `papio acquire` did not have. Its disagreement on the ten-digit case
+  was a latent bug — it classified a bare ISBN-10 as a PMID. Bare-string
+  inference now lives only in `internal/cli`, where the sole caller is, and its
+  accepted shapes and refusals are pinned by tests against the live function.
 - **Roughly 570 lines of unreachable code and its false coverage.** Removed
   `store.Backup`/`Checkpoint` and their hard-link fallback subgraph (no command,
   IPC method, or scheduled task ever called them), the orphaned

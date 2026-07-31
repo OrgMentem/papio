@@ -364,6 +364,15 @@ func NormalizeIdentifier(id Identifier) (Identifier, bool) {
 // Key is the exact-match index key for a normalized identifier.
 func (i Identifier) Key() string { return i.Kind + ":" + i.Value }
 
+// The normalizers below deliberately implement a DIFFERENT equivalence relation
+// from internal/work's exported Normalize* functions, which serve acquisition.
+// Ownership asks "is this the same work?", so it collapses distinctions
+// acquisition must preserve — most visibly the arXiv version suffix (ADR-0008;
+// pinned by ownershipsnapshot's "matched across a version suffix" test). Do not
+// consolidate these into internal/work: routing acquisition through the
+// version-collapsing form would acquire the wrong version, and routing
+// ownership through the version-preserving form would stop v2 matching v1 and
+// silently break holdings deduplication.
 func normalizeDOI(value string) string {
 	lower := strings.ToLower(value)
 	for _, prefix := range []string{"https://doi.org/", "http://doi.org/", "https://dx.doi.org/", "doi:"} {
