@@ -200,8 +200,8 @@ func TestAcquireBatchPassesLoadedLibraryFingerprint(t *testing.T) {
 			}
 			gotFingerprint = request.ExpectedFingerprint
 			return json.Unmarshal([]byte(`{"works":[{}]}`), result)
-		case "acquire.submit":
-			return json.Unmarshal([]byte(`{"job_id":"job-library-fingerprint"}`), result)
+		case "acquire.submit_v2":
+			return json.Unmarshal([]byte(`{"job_id":"job-library-fingerprint","existing":false}`), result)
 		case "jobs.get":
 			return json.Unmarshal([]byte(`{"job":{"state":"queued"}}`), result)
 		default:

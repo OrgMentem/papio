@@ -29,8 +29,8 @@ func (c resolverBatchCaller) Call(_ context.Context, method string, params, resu
 		for i := range request.Works {
 			result.(*zotio.LookupWorksResult).Works[i].Status = zotio.OwnershipNotOwned
 		}
-	case "acquire.submit":
-		request := params.(protocol.WorkRequest)
+	case "acquire.submit_v2":
+		request := params.(submitParams).Request
 		if request.Resolver != c.resolver {
 			c.t.Errorf("resolver = %q, want %q", request.Resolver, c.resolver)
 		}
@@ -72,8 +72,8 @@ func (c *collectionBatchCaller) Call(_ context.Context, method string, params, r
 		for i := range request.Works {
 			result.(*zotio.LookupWorksResult).Works[i].Status = zotio.OwnershipNotOwned
 		}
-	case "acquire.submit":
-		request := params.(protocol.WorkRequest)
+	case "acquire.submit_v2":
+		request := params.(submitParams).Request
 		c.mu.Lock()
 		c.collections = append(c.collections, request.Collection)
 		c.mu.Unlock()
@@ -114,7 +114,7 @@ func (c *fingerprintBatchCaller) Call(_ context.Context, method string, params, 
 		for i := range request.Works {
 			result.(*zotio.LookupWorksResult).Works[i].Status = zotio.OwnershipNotOwned
 		}
-	case "acquire.submit":
+	case "acquire.submit_v2":
 		result.(*submitResult).JobID = "job-fingerprint"
 	case "jobs.get":
 		result.(*jobDetail).Job = json.RawMessage(`{"id":"job-fingerprint","state":"queued"}`)
@@ -168,7 +168,7 @@ func TestSubmitDoesNotFallbackOnLibraryPreconditionFailure(t *testing.T) {
 	if caller.called("zotio.lookup_works") {
 		t.Fatal("a library precondition failure must not use the unknown-method fallback")
 	}
-	if caller.called("acquire.submit") {
+	if caller.called("acquire.submit_v2") {
 		t.Fatal("a library precondition failure must not create jobs")
 	}
 }
@@ -243,5 +243,65 @@ func TestBatchRequestIDSeparatesLegacyPrefixCollision(t *testing.T) {
 	}
 	if len(firstID) != len("batch-")+batchIdentityHashBytes*2 {
 		t.Fatalf("batch request ID length = %d, want %d", len(firstID), len("batch-")+batchIdentityHashBytes*2)
+	}
+}
+
+// legacyDaemonCaller answers acquire.submit_v2 the way a pre-0.13.0 daemon
+// does, so the batch path has to reach the retained v1 method.
+type legacyDaemonCaller struct {
+	t          *testing.T
+	mu         sync.Mutex
+	sawBareReq bool
+}
+
+func (c *legacyDaemonCaller) Call(_ context.Context, method string, params, result any) error {
+	switch method {
+	case "zotio.lookup_works":
+		request := params.(zotio.LookupWorksRequest)
+		result.(*zotio.LookupWorksResult).Works = make([]zotio.WorkOwnership, len(request.Works))
+		for i := range request.Works {
+			result.(*zotio.LookupWorksResult).Works[i].Status = zotio.OwnershipNotOwned
+		}
+	case "acquire.submit_v2":
+		return &ipc.RemoteError{Code: "unknown_method", Message: "unknown method"}
+	case "acquire.submit":
+		// With no auto-import override the legacy method was always sent a bare
+		// WorkRequest; preserving that is part of speaking v1 correctly.
+		if _, ok := params.(protocol.WorkRequest); ok {
+			c.mu.Lock()
+			c.sawBareReq = true
+			c.mu.Unlock()
+		} else {
+			c.t.Errorf("legacy params = %#v, want a bare protocol.WorkRequest", params)
+		}
+		result.(*submitResult).JobID = "job-legacy"
+	case "jobs.get":
+		result.(*jobDetail).Job = json.RawMessage(`{"id":"job-legacy","state":"queued"}`)
+	default:
+		return fmt.Errorf("unexpected method %q", method)
+	}
+	return nil
+}
+
+// TestBatchFallsBackToLegacySubmitOnAnOlderDaemon pins the mixed-version case.
+// Without the fallback every work in the batch records submission_failed with
+// unknown_method, because one binary serves as CLI, daemon and native host and
+// a newer CLI routinely meets an older running daemon.
+func TestBatchFallsBackToLegacySubmitOnAnOlderDaemon(t *testing.T) {
+	caller := &legacyDaemonCaller{t: t}
+	request := protocol.WorkRequest{
+		SchemaVersion: protocol.WorkRequestSchemaVersion,
+		RequestID:     "wr_legacy_fallback",
+		Identifiers:   &protocol.Identifiers{DOI: "10.1000/legacy-fallback"},
+	}
+	output, err := Submit(context.Background(), caller, t.TempDir(), []protocol.WorkRequest{request}, SubmitOptions{})
+	if err != nil {
+		t.Fatalf("Submit = %v, want the legacy method used instead of a failure", err)
+	}
+	if len(output.Submitted) != 1 || output.Submitted[0].JobID != "job-legacy" {
+		t.Fatalf("submitted = %+v, want the job id the legacy method returned", output.Submitted)
+	}
+	if !caller.sawBareReq {
+		t.Fatal("legacy submit never received the bare WorkRequest form")
 	}
 }

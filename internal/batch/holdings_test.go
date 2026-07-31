@@ -48,7 +48,7 @@ func (c *holdingsCaller) Call(_ context.Context, method string, params, result a
 		for i := range request.Works {
 			out.Works[i].Status = zotio.OwnershipNotOwned
 		}
-	case "acquire.submit":
+	case "acquire.submit_v2":
 		id := c.submitID
 		if id == "" {
 			id = "job-holdings"
@@ -159,7 +159,7 @@ func TestSubmitAbortsWhenASourceIsUnreadable(t *testing.T) {
 	if !strings.Contains(err.Error(), "papis") || !strings.Contains(err.Error(), "--include-owned") {
 		t.Fatalf("error must name the source and the override, got %v", err)
 	}
-	if caller.called("acquire.submit") {
+	if caller.called("acquire.submit_v2") {
 		t.Fatal("no job may be created when ownership could not be verified")
 	}
 }

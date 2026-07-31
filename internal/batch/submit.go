@@ -239,8 +239,44 @@ type submitParams struct {
 	AutoImport *bool                `json:"auto_import,omitempty"`
 }
 
+// submitResult decodes acquire.submit_v2. Existing is declared because it must
+// be, not because batch reports it: internal/ipc decodes results with
+// DisallowUnknownFields, so a struct carrying only job_id would reject every
+// v2 response outright. Surfacing "this work was already in flight" in the
+// batch manifest is a separate, deliberate change.
 type submitResult struct {
-	JobID string `json:"job_id"`
+	JobID    string `json:"job_id"`
+	Existing bool   `json:"existing"`
+}
+
+// submitOne prefers acquire.submit_v2 and falls back to the retained v1 method
+// when the daemon predates it (v2 shipped in 0.13.0).
+//
+// The fallback is not optional. A batch is one goroutine per work against a
+// possibly older running daemon, and without it every work in a mixed-version
+// batch records submission_failed with unknown_method. The single-work CLI path
+// has carried this same fallback since v2 was introduced; batch must match it.
+func submitOne(ctx context.Context, caller Caller, request protocol.WorkRequest, autoImport *bool) (submitResult, error) {
+	var submitted submitResult
+	// v2 always takes the {request, ...} wrapper; v1 additionally accepts a
+	// bare WorkRequest, which is what it was sent before this fallback existed.
+	err := caller.Call(ctx, "acquire.submit_v2", submitParams{Request: request, AutoImport: autoImport}, &submitted)
+	if err == nil {
+		return submitted, nil
+	}
+	var remote *ipc.RemoteError
+	if !errors.As(err, &remote) || remote.Code != "unknown_method" {
+		return submitResult{}, err
+	}
+	var params any = request
+	if autoImport != nil {
+		params = submitParams{Request: request, AutoImport: autoImport}
+	}
+	var legacy submitResult
+	if err := caller.Call(ctx, "acquire.submit", params, &legacy); err != nil {
+		return submitResult{}, err
+	}
+	return legacy, nil
 }
 
 // jobDetail samples one field out of the jobs.get result. It decodes into raw
@@ -341,12 +377,8 @@ func Submit(ctx context.Context, caller Caller, dataDir string, requests []proto
 		group.Add(1)
 		go func(index int, request protocol.WorkRequest) {
 			defer group.Done()
-			params := any(request)
-			if options.AutoImport != nil {
-				params = submitParams{Request: request, AutoImport: options.AutoImport}
-			}
-			var submitted submitResult
-			if err := caller.Call(ctx, "acquire.submit", params, &submitted); err != nil {
+			submitted, err := submitOne(ctx, caller, request, options.AutoImport)
+			if err != nil {
 				errs[index] = err
 				return
 			}

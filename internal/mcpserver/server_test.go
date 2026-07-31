@@ -18,6 +18,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"papio/internal/api"
+	"papio/internal/app"
 	"papio/internal/batch"
 	"papio/internal/bootstrap"
 	"papio/internal/config"
@@ -69,10 +70,11 @@ func TestAcquireBatchCreatesReportableCLICompatibleManifest(t *testing.T) {
 				{Status: zotio.OwnershipOwnedWithPDF},
 				{Status: zotio.OwnershipOwnedMissingPDF, ItemKey: "EXIST001"},
 			}}, nil
-		case "acquire.submit":
+		case "acquire.submit_v2":
 			var input struct {
 				Request    protocol.WorkRequest `json:"request"`
 				AutoImport *bool                `json:"auto_import"`
+				Force      bool                 `json:"force"`
 			}
 			if err := json.Unmarshal(params, &input); err != nil {
 				return nil, err
@@ -80,13 +82,15 @@ func TestAcquireBatchCreatesReportableCLICompatibleManifest(t *testing.T) {
 			if input.AutoImport == nil || !*input.AutoImport {
 				return nil, fmt.Errorf("auto_import was not defaulted to true")
 			}
-			id, err := system.App.SubmitWithAutoImport(context.Background(), input.Request, input.AutoImport)
+			result, err := system.App.SubmitWithOptionsAs(context.Background(), job.PrincipalMCP, input.Request,
+				app.SubmitOptions{AutoImport: input.AutoImport, Force: input.Force})
 			if err != nil {
 				return nil, err
 			}
 			return struct {
-				JobID string `json:"job_id"`
-			}{JobID: id}, nil
+				JobID    string `json:"job_id"`
+				Existing bool   `json:"existing"`
+			}{JobID: result.JobID, Existing: result.Existing}, nil
 		case "jobs.get":
 			var input struct {
 				JobID string `json:"job_id"`

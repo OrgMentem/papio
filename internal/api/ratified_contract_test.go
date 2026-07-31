@@ -18,9 +18,11 @@ import (
 )
 
 // ratifiedConsumerMethods is the IPC surface promised to the first external
-// consumer by ADR-0009. Removing or renaming one breaks that consumer, so this
-// list is deliberately pinned to the live router rather than documentation.
+// consumer by ADR-0009, extended with acquire.submit_v2 by ADR-0010. Removing
+// or renaming one breaks that consumer, so this list is deliberately pinned to
+// the live router rather than documentation.
 var ratifiedConsumerMethods = []string{
+	"acquire.submit_v2",
 	"jobs.list_v2",
 	"actions.list_v2",
 	"actions.open",
@@ -147,6 +149,98 @@ func TestRatifiedConsumerContract(t *testing.T) {
 		assertRatifiedKeySet(t, object,
 			"job_id", "request_id", "state", "terminal", "terminal_reason", "principal",
 			"attempted_tiers", "components", "bundle_available")
+	})
+
+	// acquire.submit_v2 is the only ratified method that CREATES durable state,
+	// so its params are pinned as tightly as its result. The six prior methods
+	// take small parameter objects (job_id, limit, state, job_ids, path/role);
+	// this one embeds a whole work-request/1 document, and internal/ipc decodes
+	// params with DisallowUnknownFields — so a newer consumer sending a field an
+	// older daemon lacks has its entire call rejected, not just the field. Only
+	// the identity subset below plus access_mode_override is promised; the
+	// policy fields stay served but unratified so a consumer cannot pin papio's
+	// policy vocabulary.
+	//
+	// Every frozen value below is written as a WIRE LITERAL rather than read
+	// from a production constant. A pin that derives its expectation from the
+	// implementation stays green when the implementation is renamed in step
+	// with it, which is exactly the drift this suite exists to catch.
+	t.Run("submit_v2 accepts every ratified identity key", func(t *testing.T) {
+		for _, identifiers := range []map[string]any{
+			{"doi": "10.1000/ratified-submit"},
+			{"pmid": "31234567"},
+			{"arxiv": "2301.08745"},
+			{"isbn": "9780306406157"},
+			{"openalex": "W2741809807"},
+		} {
+			for key := range identifiers {
+				t.Run(key, func(t *testing.T) {
+					system := testSystem(t)
+					var result map[string]json.RawMessage
+					rpcErr := callMethod(t, Router(system), "acquire.submit_v2", map[string]any{
+						"request": map[string]any{
+							"schema_version": "work-request/1",
+							"request_id":     "wr_ratified_" + key,
+							"identifiers":    identifiers,
+						},
+					}, &result)
+					if rpcErr != nil {
+						t.Fatalf("acquire.submit_v2 with identifiers.%s = %+v, want accepted", key, rpcErr)
+					}
+					assertRatifiedKeySet(t, result, "job_id", "existing")
+				})
+			}
+		}
+	})
+
+	t.Run("submit_v2 accepts the ratified request shape", func(t *testing.T) {
+		for _, mode := range []string{"conservative", "assisted", "delegated"} {
+			t.Run(mode, func(t *testing.T) {
+				system := testSystem(t)
+				var result map[string]json.RawMessage
+				rpcErr := callMethod(t, Router(system), "acquire.submit_v2", map[string]any{
+					"request": map[string]any{
+						"schema_version":       "work-request/1",
+						"request_id":           "wr_ratified_" + mode,
+						"identifiers":          map[string]any{"doi": "10.1000/ratified-" + mode},
+						"title":                "A ratified submission",
+						"authors":              []string{"A. Author"},
+						"year":                 2026,
+						"access_mode_override": mode,
+					},
+					"auto_import": false,
+					"force":       false,
+				}, &result)
+				if rpcErr != nil {
+					t.Fatalf("acquire.submit_v2 with access_mode_override %q = %+v, want accepted", mode, rpcErr)
+				}
+				assertRatifiedKeySet(t, result, "job_id", "existing")
+
+				// `existing` carries no omitempty: a consumer distinguishing
+				// "queued" from "a live job already owns this work" must never
+				// have to treat an absent key as false.
+				var existing bool
+				if err := json.Unmarshal(result["existing"], &existing); err != nil {
+					t.Fatalf("decode existing: %v", err)
+				}
+				if existing {
+					t.Fatal("first submission reported existing = true")
+				}
+			})
+		}
+	})
+
+	t.Run("submit_v2 rejects an unknown param", func(t *testing.T) {
+		// Fail-closed params are half the contract: a typo in a consumer's
+		// payload must be an error, never a silently ignored field.
+		router := RouterWithShutdown(nil, func() {})
+		rpcErr := callMethod(t, router, "acquire.submit_v2", map[string]any{
+			"request":     map[string]any{"schema_version": "work-request/1", "request_id": "wr_ratified_bad"},
+			"idempotency": "not-a-papio-concept",
+		}, nil)
+		if rpcErr == nil || rpcErr.Code != "invalid_argument" {
+			t.Fatalf("unknown param = %+v, want invalid_argument", rpcErr)
+		}
 	})
 }
 
