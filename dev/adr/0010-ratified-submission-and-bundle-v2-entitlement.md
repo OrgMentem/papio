@@ -191,13 +191,26 @@ http/https URL with a host and no query or credentials, or a closed opaque
 has no scheme and fails. This is precisely the outcome the agreed migration
 ordering exists to produce — prove the gate before cutting the schema.
 
-`acquisition-bundle/2` is cut with this shape:
+`acquisition-bundle/2` is cut with this shape. The path is shown in full
+deliberately: `entitlement` hangs off the **accepted candidate**, never off the
+document root. A reader that looks top-level finds nothing and concludes *papio*
+emitted a v2 bundle carrying no rights information — wrong, and silent. That
+misreading has already been made once from an abbreviated example, and a
+consumer that refuses a bundle without an entitlement would have rejected every
+acquisition in a 43-work set on the strength of it.
 
 ```json
-"entitlement": {
-  "route": "https://api.crossref.org",
-  "entitlement_ref": "entitlement:source:crossref_tdm",
-  "acquisition_mode": "daemon_held_credential"
+{
+  "schema_version": "acquisition-bundle/2",
+  "candidate": {
+    "source": "crossref_tdm",
+    "access_basis": "licensed_api",
+    "entitlement": {
+      "route": "https://api.crossref.org",
+      "entitlement_ref": "entitlement:source:crossref_tdm",
+      "acquisition_mode": "daemon_held_credential"
+    }
+  }
 }
 ```
 

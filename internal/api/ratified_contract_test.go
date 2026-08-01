@@ -273,7 +273,7 @@ func TestRatifiedConsumerContract(t *testing.T) {
 	})
 
 	t.Run("bundle.document returns the document as text and writes nothing", func(t *testing.T) {
-		system, jobID := readyBundleSystem(t)
+		system, jobID, _ := readyBundleSystem(t)
 		bundles := filepath.Join(system.Config.DataDir, "bundles")
 		var result map[string]json.RawMessage
 		if rpcErr := callMethod(t, Router(system), "bundle.document",
@@ -306,13 +306,25 @@ func TestRatifiedConsumerContract(t *testing.T) {
 	})
 
 	t.Run("artifacts.locate omits the fields ADR-0007 forbids projecting", func(t *testing.T) {
-		system, jobID := readyBundleSystem(t)
-		var result map[string]json.RawMessage
+		system, jobID, want := readyBundleSystem(t)
+		var keys map[string]json.RawMessage
 		if rpcErr := callMethod(t, Router(system), "artifacts.locate",
-			map[string]string{"job_id": jobID}, &result); rpcErr != nil {
+			map[string]string{"job_id": jobID}, &keys); rpcErr != nil {
 			t.Fatalf("artifacts.locate = %+v", rpcErr)
 		}
-		assertRatifiedKeySet(t, result, "sha256", "size_bytes", "mime", "path")
+		assertRatifiedKeySet(t, keys, "sha256", "size_bytes", "mime", "path")
+
+		// Key presence alone would pass a handler that swapped, zeroed, or
+		// retyped every value, so the values are compared to the artifact the
+		// fixture actually promoted.
+		var got ArtifactLocation
+		if rpcErr := callMethod(t, Router(system), "artifacts.locate",
+			map[string]string{"job_id": jobID}, &got); rpcErr != nil {
+			t.Fatalf("artifacts.locate = %+v", rpcErr)
+		}
+		if got != want {
+			t.Fatalf("location = %+v, want %+v", got, want)
+		}
 	})
 }
 
@@ -320,7 +332,7 @@ func TestRatifiedConsumerContract(t *testing.T) {
 // be produced: an accepted candidate, a promoted artifact that verifies, and a
 // passing acquisition identity. The ratified readers are frozen forever, so
 // their contract test asserts against a real response rather than a stub.
-func readyBundleSystem(t *testing.T) (*bootstrap.System, string) {
+func readyBundleSystem(t *testing.T) (*bootstrap.System, string, ArtifactLocation) {
 	t.Helper()
 	ctx := context.Background()
 	system := testSystem(t)
@@ -353,7 +365,7 @@ func readyBundleSystem(t *testing.T) (*bootstrap.System, string) {
 	if err := os.WriteFile(temp, []byte("%PDF-1.4\nfixture\n%%EOF"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	sha, _, err := artifact.HashFile(temp)
+	sha, size, err := artifact.HashFile(temp)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -362,7 +374,7 @@ func readyBundleSystem(t *testing.T) (*bootstrap.System, string) {
 		t.Fatal(err)
 	}
 	if err := system.Jobs.UpsertArtifact(ctx, job.Artifact{
-		SHA256: sha, SizeBytes: 21, MIME: "application/pdf", PageCount: 1,
+		SHA256: sha, SizeBytes: size, MIME: "application/pdf", PageCount: 1,
 		Path: path, IdentityResult: "pass", CreatedAt: "2026-08-01T00:00:00Z",
 	}); err != nil {
 		t.Fatal(err)
@@ -374,7 +386,7 @@ func readyBundleSystem(t *testing.T) (*bootstrap.System, string) {
 		job.WithArtifact(sha), job.WithCandidate(candidate.ID)); err != nil {
 		t.Fatal(err)
 	}
-	return system, id
+	return system, id, ArtifactLocation{SHA256: sha, SizeBytes: size, MIME: "application/pdf", Path: path}
 }
 
 func assertRatifiedPage(t *testing.T, router ipc.Router, method, rowsKey string, limit, wantRows int, wantTruncated bool) {

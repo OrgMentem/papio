@@ -565,6 +565,18 @@ func focusOrOpenActionURLs(ctx context.Context, urls, untrackedURLs, jobIDs []st
 	}
 	result, err := focus(ctx, jobIDs)
 	if err == nil && result.SessionLive {
+		// The daemon skips a parked job whose access mode cannot be expressed
+		// as a handoff offer. Falling back to the OS browser for those would
+		// open exactly the institutional access the mode forbids, so they are
+		// reported instead. Silently opening nothing was the prior behaviour
+		// and it told the user papio had acted when it had not.
+		if skipped := len(jobIDs) - result.Queued; skipped > 0 {
+			if _, err := fmt.Fprintf(out,
+				"%d of %d handoffs were not opened: the job's access mode does not permit an institutional handoff\n",
+				skipped, len(jobIDs)); err != nil {
+				return err
+			}
+		}
 		return openActionURLs(ctx, untrackedURLs, false, out, run)
 	}
 	if err != nil {
@@ -662,6 +674,9 @@ func newArtifactsCommand(opt *options) *cobra.Command {
 			var result api.ArtifactLocation
 			if err := opt.call(cmd.Context(), "artifacts.locate",
 				map[string]string{"job_id": args[0]}, &result); err != nil {
+				if isUnknownMethod(err) {
+					return daemonUpgradeRequired("artifacts.locate")
+				}
 				return err
 			}
 			return opt.printResult(result, "%s\t%s\t%d bytes", result.SHA256, result.Path, result.SizeBytes)
@@ -699,12 +714,20 @@ func newBundleCommand(opt *options) *cobra.Command {
 			var result api.DocumentResult
 			if err := opt.call(cmd.Context(), "bundle.document",
 				map[string]string{"job_id": args[0]}, &result); err != nil {
+				if isUnknownMethod(err) {
+					return daemonUpgradeRequired("bundle.document")
+				}
 				return err
 			}
-			// The document is already the exact bytes bundle.json is written
-			// with; re-encoding it would hand the operator something that no
-			// longer matches the provenance digest inside it.
-			return opt.printResult(result, "%s", result.Document)
+			// The document already ends with the newline bundle.json is written
+			// with, so it is emitted verbatim rather than through printResult,
+			// which would append a second one. `papio bundle document <job> >
+			// bundle.json` must reproduce the exported file byte for byte.
+			if opt.jsonOutput {
+				return opt.printJSON(result)
+			}
+			_, err := io.WriteString(opt.out, result.Document)
+			return err
 		},
 	}
 	command.AddCommand(document)

@@ -729,20 +729,26 @@ var accessModeRank = map[string]int{ModeConservative: 0, ModeAssisted: 1, ModeDe
 // conservative. An operator who genuinely wants more automation edits their
 // configuration, which is a deliberate act rather than a request parameter.
 func (c *Config) NarrowAccessMode(configured, override string) string {
+	configuredRank, knownConfigured := accessModeRank[configured]
+	if !knownConfigured {
+		// No operator ceiling on record. RequireAccessMode refuses to submit in
+		// this state, so reaching it on a read means the mode was removed or
+		// corrupted after the job was recorded — and deleting access_mode is the
+		// most drastic tightening an operator can perform. Returning the job's
+		// own mode here would make that gesture the one setting that WIDENS,
+		// leaving already-recorded delegated jobs unrestrained. Fail closed.
+		return ModeConservative
+	}
 	if override == "" {
 		return configured
 	}
 	overrideRank, knownOverride := accessModeRank[override]
 	if !knownOverride {
-		return configured
-	}
-	configuredRank, knownConfigured := accessModeRank[configured]
-	if !knownConfigured {
-		// No ceiling to clamp against. Submit cannot reach this — Require-
-		// AccessMode refuses an unset mode before the override is applied — but
-		// EffectiveAccessMode also runs on read, where a zero Config must not
-		// silently discard the mode the job was actually recorded with.
-		return override
+		// An unreadable snapshot is not evidence of permission. Submit validates
+		// the enum, so a value that is not a known mode means corrupt or
+		// hand-edited policy_json, and resolving it to the daemon-wide default
+		// would let corruption raise a job to whatever the daemon allows.
+		return ModeConservative
 	}
 	if overrideRank >= configuredRank {
 		return configured

@@ -359,7 +359,10 @@ func checkEntitlementWireShape(data []byte) error {
 	if err := json.Unmarshal(data, &document); err != nil {
 		return nil // strictDecode already rejected anything malformed
 	}
-	rawEntitlement, present := lookupJSONKey(document.Candidate, "entitlement")
+	rawEntitlement, present, err := lookupJSONKey(document.Candidate, "entitlement")
+	if err != nil {
+		return err
+	}
 	if !present {
 		return nil
 	}
@@ -370,7 +373,11 @@ func checkEntitlementWireShape(data []byte) error {
 	if err := json.Unmarshal(rawEntitlement, &entitlement); err != nil {
 		return nil
 	}
-	if rawRef, ok := lookupJSONKey(entitlement, "entitlement_ref"); ok {
+	rawRef, present, err := lookupJSONKey(entitlement, "entitlement_ref")
+	if err != nil {
+		return err
+	}
+	if present {
 		trimmed := bytes.TrimSpace(rawRef)
 		if bytes.Equal(trimmed, []byte("null")) || bytes.Equal(trimmed, []byte(`""`)) {
 			return fmt.Errorf("candidate.entitlement.entitlement_ref must be omitted rather than empty")
@@ -379,21 +386,35 @@ func checkEntitlementWireShape(data []byte) error {
 	return nil
 }
 
-// lookupJSONKey resolves a key the way encoding/json resolves a struct field:
-// exact match first, then case-insensitively. A raw map lookup is
-// case-SENSITIVE while the strict decode above is not, so `"Entitlement": null`
-// would populate the struct while slipping past a case-sensitive guard —
-// failing open on both invariants this function exists to enforce.
-func lookupJSONKey(object map[string]json.RawMessage, key string) (json.RawMessage, bool) {
-	if raw, ok := object[key]; ok {
-		return raw, true
-	}
-	for candidate, raw := range object {
-		if strings.EqualFold(candidate, key) {
-			return raw, true
+// lookupJSONKey resolves one key the way encoding/json resolves a struct field,
+// and refuses to guess when it cannot.
+//
+// encoding/json matches field names case-insensitively, and when an object
+// carries several matching members the LAST one in document order wins. A raw
+// map cannot reproduce that: json.Unmarshal into map[string]json.RawMessage
+// keeps each distinct spelling under its own entry, and Go's map iteration has
+// no order. So a guard that picks the exact spelling can inspect a different
+// member than the decoder used. That is not theoretical — it let
+// `{"entitlement": {...}, "Entitlement": null}` carry an entitlement key
+// through a v1 document, because the decoder saw the trailing null and left the
+// field nil while the guard saw the leading object and passed.
+//
+// Replaying decoder order would mean re-tokenising the document. Colliding
+// spellings are ambiguous, papio never emits them, and every honest producer
+// has exactly one, so the guard refuses the document instead. Fail closed.
+func lookupJSONKey(object map[string]json.RawMessage, key string) (json.RawMessage, bool, error) {
+	var found json.RawMessage
+	matches := 0
+	for name, raw := range object {
+		if strings.EqualFold(name, key) {
+			matches++
+			found = raw
 		}
 	}
-	return nil, false
+	if matches > 1 {
+		return nil, false, fmt.Errorf("ambiguous %q: %d case-colliding keys", key, matches)
+	}
+	return found, matches == 1, nil
 }
 
 // Validate enforces the schema plus the cross-field invariant that the

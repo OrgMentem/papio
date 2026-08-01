@@ -566,3 +566,36 @@ func TestActionsOpenFiltersJobsByStateAndFoldsDroppedRowsIntoTruncated(t *testin
 		t.Fatal("truncated = false despite an open action whose job row was omitted from the state-filtered jobs.list page — want true")
 	}
 }
+
+// TestFocusReportsHandoffsTheDaemonWouldNotOpen covers the gap left when
+// FocusHandoffs became honest about its queued count. The daemon skips a parked
+// job whose access mode cannot be expressed as a handoff offer; the CLI used to
+// branch only on SessionLive, so those jobs produced no frame, no browser tab,
+// and no output — papio reporting success for something it had not done.
+//
+// The fallback must not open them either: they were skipped because their mode
+// forbids institutional access, so launching the URL would defeat the ceiling.
+func TestFocusReportsHandoffsTheDaemonWouldNotOpen(t *testing.T) {
+	var opened []string
+	var out bytes.Buffer
+	focus := func(context.Context, []string) (api.ActionsOpenResult, error) {
+		return api.ActionsOpenResult{Queued: 1, SessionLive: true}, nil
+	}
+	run := func(_ context.Context, _ string, args ...string) error {
+		opened = append(opened, args[len(args)-1])
+		return nil
+	}
+	err := focusOrOpenActionURLs(context.Background(),
+		[]string{"https://a.test", "https://b.test"}, nil,
+		[]string{"job_aaaaaaaaaaaaaaaaaaaaaaaaaa", "job_bbbbbbbbbbbbbbbbbbbbbbbbbb"},
+		false, &out, focus, run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(opened) != 0 {
+		t.Fatalf("opened %v; a skipped handoff must not be launched in the OS browser", opened)
+	}
+	if !strings.Contains(out.String(), "1 of 2 handoffs were not opened") {
+		t.Fatalf("output %q does not report the skipped handoff", out.String())
+	}
+}

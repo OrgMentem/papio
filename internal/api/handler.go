@@ -1151,10 +1151,10 @@ func locateArtifact(ctx context.Context, raw json.RawMessage, system *bootstrap.
 	if rpcErr != nil {
 		return nil, rpcErr
 	}
-	// Document already enforces that the job is ready and that its artifact
-	// verifies, so locate cannot hand back a path to bytes that failed
-	// validation or that no accepted candidate vouches for.
-	_, art, err := system.Bundle.Document(ctx, jobID)
+	// Locate, not Document: a ready job whose bytes hash correctly stays
+	// locatable even when bundle construction would fail for reasons that have
+	// nothing to do with finding the file.
+	art, err := system.Bundle.Locate(ctx, jobID)
 	if err != nil {
 		return failure(err)
 	}
@@ -1170,7 +1170,7 @@ func requireJobID(raw json.RawMessage) (string, *ipc.RPCError) {
 	var params struct {
 		JobID string `json:"job_id"`
 	}
-	if err := ipc.DecodeParams(raw, &params); err != nil || params.JobID == "" {
+	if err := ipc.DecodeParams(raw, &params); err != nil || strings.TrimSpace(params.JobID) == "" {
 		if err == nil {
 			err = errors.New("job_id is required")
 		}

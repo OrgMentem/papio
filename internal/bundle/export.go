@@ -171,10 +171,23 @@ func EncodeDocument(b *protocol.AcquisitionBundle) ([]byte, error) {
 	return append(encoded, '\n'), nil
 }
 
-// Document builds and validates the bundle for one ready job and returns it
-// without writing anything. bundle.export materialises; a ratified reader must
-// not, so the two phases are separated here rather than at the handler.
-func (e *Exporter) Document(ctx context.Context, jobID string) (*protocol.AcquisitionBundle, *job.Artifact, error) {
+// Locate resolves the verified artifact for one ready job: the prerequisites a
+// caller needs to open the bytes, and nothing about the bundle.
+//
+// Kept separate from Document deliberately. A ready job whose file hashes
+// correctly can still fail bundle construction — no accepted candidate
+// provenance, a per-acquisition identity that is not pass, or any other bundle
+// field failing validation — and none of that makes the bytes harder to find.
+// Routing artifacts.locate through Document would have made valid artifacts
+// unlocatable for reasons that have nothing to do with locating them.
+func (e *Exporter) Locate(ctx context.Context, jobID string) (*job.Artifact, error) {
+	_, art, err := e.locate(ctx, jobID)
+	return art, err
+}
+
+// locate also hands back the job row, so Document does not have to re-read it
+// and build the bundle from a second, unguarded snapshot.
+func (e *Exporter) locate(ctx context.Context, jobID string) (*job.Row, *job.Artifact, error) {
 	if e.Jobs == nil || e.Artifacts == nil {
 		return nil, nil, errors.New("bundle exporter missing stores")
 	}
@@ -183,7 +196,10 @@ func (e *Exporter) Document(ctx context.Context, jobID string) (*protocol.Acquis
 		return nil, nil, err
 	}
 	if (row.State != job.StateReady && row.State != job.StateImported) || row.ArtifactSHA256 == "" {
-		return nil, nil, fmt.Errorf("job %s is %s, not ready", jobID, row.State)
+		// A conflict, not an internal fault: "not collected yet" is the routine
+		// answer a consumer polling for readiness gets, and mapping it to
+		// `internal` both hides the reason and writes an error line per poll.
+		return nil, nil, fmt.Errorf("%w: job %s is %s, not ready", job.ErrConflict, jobID, row.State)
 	}
 	art, err := e.Jobs.GetArtifact(ctx, row.ArtifactSHA256)
 	if err != nil || art == nil {
@@ -192,7 +208,31 @@ func (e *Exporter) Document(ctx context.Context, jobID string) (*protocol.Acquis
 		}
 		return nil, nil, err
 	}
+	// Verify before handing over a path: a caller must never be pointed at
+	// bytes that no longer match the digest they are recorded under.
 	if err := e.Artifacts.Verify(art.SHA256); err != nil {
+		return nil, nil, err
+	}
+	// Return the path Verify actually hashed, not the stored column. Verify
+	// resolves ArtifactPath(sha) against the store's CURRENT data directory,
+	// while artifacts.path is first-writer-wins — UpsertArtifact's ON CONFLICT
+	// updates identity_result and never path — so it stays pinned to whichever
+	// data_dir first saw the digest. After a data_dir move the two diverge and
+	// the column names bytes this call never checked.
+	verified, err := e.Artifacts.ArtifactPath(art.SHA256)
+	if err != nil {
+		return nil, nil, err
+	}
+	art.Path = verified
+	return row, art, nil
+}
+
+// Document builds and validates the bundle for one ready job and returns it
+// without writing anything. bundle.export materialises; a ratified reader must
+// not, so the two phases are separated here rather than at the handler.
+func (e *Exporter) Document(ctx context.Context, jobID string) (*protocol.AcquisitionBundle, *job.Artifact, error) {
+	row, art, err := e.locate(ctx, jobID)
+	if err != nil {
 		return nil, nil, err
 	}
 	candidate, err := e.Jobs.CandidateForArtifact(ctx, jobID, art.SHA256)

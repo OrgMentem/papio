@@ -799,13 +799,19 @@ func TestEffectiveAccessModeIsAMonotoneCeiling(t *testing.T) {
 			configured: ModeConservative, policy: ModeDelegated, want: ModeConservative,
 		},
 		{
-			// Submit cannot produce this (RequireAccessMode refuses an unset
-			// mode), but the read path must not turn the job's own recorded
-			// mode into nothing.
-			name:       "an unset configuration falls back to the job's own mode",
-			configured: "", policy: ModeAssisted, want: ModeAssisted,
+			// Deleting access_mode is the most drastic tightening an operator
+			// can perform. Resolving to the job's own recorded mode would make
+			// that gesture the one setting that WIDENS, leaving already-recorded
+			// delegated jobs unrestrained, so an absent ceiling fails closed.
+			name:       "an unset configuration fails closed rather than trusting the job",
+			configured: "", policy: ModeDelegated, want: ModeConservative,
 		},
-		{name: "a garbage policy mode is ignored", configured: ModeAssisted, policy: "maximal", want: ModeAssisted},
+		{
+			// An unreadable snapshot is not evidence of permission: corrupt or
+			// hand-edited policy_json must not inherit whatever the daemon allows.
+			name:       "a garbage policy mode fails closed",
+			configured: ModeAssisted, policy: "maximal", want: ModeConservative,
+		},
 		{name: "surrounding whitespace is tolerated", configured: ModeDelegated, policy: "  conservative  ", want: ModeConservative},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
