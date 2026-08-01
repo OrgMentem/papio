@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"papio/internal/artifact"
+	"papio/internal/budget"
 	"papio/internal/config"
 	"papio/internal/discovery"
 	"papio/internal/fetch"
@@ -691,6 +692,57 @@ func TestRetryableFetchParksJobAndPersistsNoURL(t *testing.T) {
 	encoded, _ := json.Marshal(events)
 	if strings.Contains(string(encoded), secret) {
 		t.Fatalf("retry event leaked signed URL: %s", encoded)
+	}
+}
+
+// A source gated by a daily quota reset must park the job, not the worker.
+// OpenAlex answers an exhausted daily quota with a Retry-After pointing at the
+// next UTC midnight; budget.Acquire used to sleep that out inside Process,
+// which holds the scheduler's job claim while its heartbeat keeps renewing the
+// lease — three workers on three such rows froze a 309-job cohort for a day.
+// Process must return promptly with the job parked at the gate instead.
+func TestDailyQuotaGateParksTheJobNotTheWorker(t *testing.T) {
+	svc, jobs := newTestService(t)
+	ctx := context.Background()
+	svc.Budgets = budget.New(jobs.S)
+	gate := time.Now().UTC().Add(18 * time.Hour)
+	if err := svc.Budgets.Defer(ctx, "fixture", gate); err != nil {
+		t.Fatal(err)
+	}
+	adapter := &fakeResolver{name: "fixture", cands: []resolver.Candidate{{
+		Source: "fixture", URL: "https://example.test/p.pdf", Version: resolver.VersionPublished,
+		AccessBasis: resolver.AccessOpen, ReuseLicense: "unknown", Direct: true, IdentityConfidence: 1,
+	}}}
+	svc.Fetch = func(context.Context, resolver.Candidate, string) (fetch.Result, error) {
+		return fetch.Result{}, errors.New("fetch must not run: the only source is gated")
+	}
+	svc.Resolvers = []ResolverEntry{{Adapter: adapter, Policy: config.Source{Enabled: true}}}
+	svc.Validate = passValidation()
+	id, _ := svc.Submit(ctx, protocol.WorkRequest{
+		SchemaVersion: protocol.WorkRequestSchemaVersion, RequestID: "wr_quota_0001",
+		Identifiers: &protocol.Identifiers{DOI: "10.1002/example"}, Title: "Example", Authors: []string{"A"}, Year: 2024,
+	})
+	row, _ := jobs.ClaimNext(ctx, "w", time.Minute)
+	start := time.Now()
+	if err := svc.Process(ctx, row); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Fatalf("Process held the worker %v on a gated source; it must hand the wait to the scheduler", elapsed)
+	}
+	if adapter.calls != 0 {
+		t.Fatalf("gated adapter was called %d times, want 0", adapter.calls)
+	}
+	got, _ := jobs.Get(ctx, id)
+	if got.State != job.StateRetryWait || got.RetryAt == "" {
+		t.Fatalf("job state = %+v, want retry_wait parked at the gate", got)
+	}
+	parked, err := time.Parse(time.RFC3339Nano, got.RetryAt)
+	if err != nil {
+		t.Fatalf("retry_at %q: %v", got.RetryAt, err)
+	}
+	if parked.Sub(gate).Abs() > time.Minute {
+		t.Fatalf("retry_at = %s, want the source gate %s", parked, gate)
 	}
 }
 
@@ -1675,6 +1727,115 @@ func TestResolverRetryBudgetEscalatesAfterCap(t *testing.T) {
 	}
 	if row.State != job.StateUnavailable {
 		t.Fatalf("state after exhausting retry budget = %s, want unavailable (escalated, not retry_wait forever)", row.State)
+	}
+}
+
+// A pass that only met closed source gates made no request, so it must not
+// spend the bounded retry budget. Before this, a day-long OpenAlex quota gate
+// alongside ordinary thirty-second gates burned all eight attempts within
+// minutes and settled real jobs "temporary source failures did not clear" —
+// naming a source that had never been called. Observed live on 8 jobs of a
+// 309-job cohort.
+func TestSourceGateParksDoNotSpendTheRetryBudget(t *testing.T) {
+	ctx := context.Background()
+	svc, jobs := newTestService(t)
+	svc.Budgets = budget.New(jobs.S)
+	gate := time.Now().UTC().Add(18 * time.Hour)
+	if err := svc.Budgets.Defer(ctx, "fixture", gate); err != nil {
+		t.Fatal(err)
+	}
+	adapter := &fakeResolver{name: "fixture"}
+	svc.Resolvers = []ResolverEntry{{Adapter: adapter, Policy: config.Source{Enabled: true}}}
+	svc.Fetch = func(context.Context, resolver.Candidate, string) (fetch.Result, error) {
+		return fetch.Result{}, errors.New("fetch must not run: the only source is gated")
+	}
+	svc.Validate = passValidation()
+	id, err := svc.Submit(ctx, doiRequest("wr_gate_budget"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range maxRetryAttempts + 4 {
+		row, err := jobs.Get(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if row.State != job.StateQueued && row.State != job.StateRetryWait {
+			t.Fatalf("job left the retry cycle in %s; a closed gate is not a verdict", row.State)
+		}
+		if err := svc.Process(ctx, row); err != nil {
+			t.Fatal(err)
+		}
+	}
+	row, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.State != job.StateRetryWait {
+		t.Fatalf("state after %d gate parks = %s, want retry_wait", maxRetryAttempts+4, row.State)
+	}
+	if adapter.calls != 0 {
+		t.Fatalf("gated adapter was called %d times, want 0", adapter.calls)
+	}
+	parked, err := time.Parse(time.RFC3339Nano, row.RetryAt)
+	if err != nil {
+		t.Fatalf("retry_at %q: %v", row.RetryAt, err)
+	}
+	if parked.Sub(gate).Abs() > time.Minute {
+		t.Fatalf("retry_at = %s, want the source gate %s", parked, gate)
+	}
+}
+
+// The budget may legitimately run out on real temporary failures while a
+// source gate is still closed. The gated source has still never had its one
+// call, so a terminal verdict is unsupported: park until the gate opens.
+func TestPendingGateOutranksAnExhaustedRetryBudget(t *testing.T) {
+	ctx := context.Background()
+	svc, jobs := newTestService(t)
+	svc.Budgets = budget.New(jobs.S)
+	gate := time.Now().UTC().Add(18 * time.Hour)
+	if err := svc.Budgets.Defer(ctx, "gated", gate); err != nil {
+		t.Fatal(err)
+	}
+	svc.RetryDelay = time.Millisecond
+	flaky := &fakeResolver{name: "fixture", err: &resolver.TemporaryError{Err: errors.New("upstream blip")}}
+	svc.Resolvers = []ResolverEntry{
+		{Adapter: flaky, Policy: config.Source{Enabled: true}},
+		{Adapter: &fakeResolver{name: "gated"}, Policy: config.Source{Enabled: true}},
+	}
+	svc.Fetch = func(context.Context, resolver.Candidate, string) (fetch.Result, error) {
+		return fetch.Result{}, errors.New("no candidate should reach fetch")
+	}
+	svc.Validate = passValidation()
+	svc.Config.Sources["gated"] = config.Source{Enabled: true}
+	id, err := svc.Submit(ctx, doiRequest("wr_gate_outranks"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range maxRetryAttempts + 4 {
+		row, err := jobs.Get(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if row.State != job.StateQueued && row.State != job.StateRetryWait {
+			break
+		}
+		if err := svc.Process(ctx, row); err != nil {
+			t.Fatal(err)
+		}
+	}
+	row, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.State != job.StateRetryWait {
+		t.Fatalf("state = %s, want retry_wait: the gated source was never called, so no terminal verdict is supported", row.State)
+	}
+	parked, err := time.Parse(time.RFC3339Nano, row.RetryAt)
+	if err != nil {
+		t.Fatalf("retry_at %q: %v", row.RetryAt, err)
+	}
+	if parked.Sub(gate).Abs() > time.Minute {
+		t.Fatalf("retry_at = %s, want the pending gate %s once the temporary budget is spent", parked, gate)
 	}
 }
 

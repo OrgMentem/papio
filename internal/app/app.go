@@ -327,17 +327,14 @@ func (s *Service) Process(ctx context.Context, row *job.Row) error {
 		}
 	}
 
-	live, retryAt, err := s.resolve(ctx, row)
+	live, plan, err := s.resolve(ctx, row)
 	if err != nil {
 		return err
 	}
 	if len(live) == 0 {
-		if !retryAt.IsZero() {
-			if s.retryBudgetExhausted(ctx, row.ID) {
-				return s.exhaustedCandidates(ctx, row, job.StateResolving, "retry_budget_exhausted", job.TerminalReasonTemporarySourceFailuresDidNotClear, "")
-			}
-			return s.Jobs.Transition(ctx, row.ID, job.StateResolving, job.StateRetryWait,
-				map[string]any{"reason": "resolver_temporarily_unavailable"}, job.WithRetryAt(retryAt))
+		if !plan.IsZero() {
+			return s.parkForRetry(ctx, row, job.StateResolving, plan, "resolver_temporarily_unavailable",
+				job.TerminalReasonTemporarySourceFailuresDidNotClear, "")
 		}
 		return s.exhaustedCandidates(ctx, row, job.StateResolving, "no_legal_candidates", job.TerminalReasonNoLegalCandidates, "")
 	}
@@ -350,7 +347,7 @@ func (s *Service) Process(ctx context.Context, row *job.Row) error {
 	if err != nil {
 		return err
 	}
-	return s.fetchCandidates(ctx, row, live, retryAt)
+	return s.fetchCandidates(ctx, row, live, plan)
 }
 
 // reuseAcceptedReview promotes the exact bytes a human accepted, rather than
@@ -419,17 +416,17 @@ func reviewedFetchResult(binding *job.HumanActionBinding) (fetch.Result, bool) {
 	}, true
 }
 
-func (s *Service) resolve(ctx context.Context, row *job.Row) (map[string]resolver.Candidate, time.Time, error) {
+func (s *Service) resolve(ctx context.Context, row *job.Row) (map[string]resolver.Candidate, retryPlan, error) {
+	var plan retryPlan
 	if err := s.enrichDOIWork(ctx, row); err != nil {
-		return nil, time.Time{}, err
+		return nil, plan, err
 	}
 	if err := s.Jobs.ResetCandidates(ctx, row.ID); err != nil {
-		return nil, time.Time{}, err
+		return nil, plan, err
 	}
 	var all []resolver.Candidate
-	var retryAt time.Time
 	if err := s.enrich(ctx, row); err != nil {
-		return nil, time.Time{}, err
+		return nil, plan, err
 	}
 	for _, entry := range s.Resolvers {
 		if entry.Adapter == nil {
@@ -441,7 +438,7 @@ func (s *Service) resolve(ctx context.Context, row *job.Row) (map[string]resolve
 		}
 		attempt, err := s.Jobs.StartAttempt(ctx, row.ID, 0, "resolve", name)
 		if err != nil {
-			return nil, retryAt, err
+			return nil, plan, err
 		}
 		if s.Budgets != nil {
 			if err := s.Budgets.Acquire(ctx, name, entry.Policy, entry.EstimatedCost); err != nil {
@@ -450,17 +447,25 @@ func (s *Service) resolve(ctx context.Context, row *job.Row) (map[string]resolve
 				if errors.As(err, &exceeded) {
 					continue
 				}
-				return nil, retryAt, err
+				// The source is gated too far out to wait on (typically a daily
+				// quota reset). Skip it and let the job park until the gate
+				// lifts, instead of holding this worker's claim until then.
+				var deferred *budget.ErrDeferred
+				if errors.As(err, &deferred) {
+					plan.Gate = earlierTime(plan.Gate, deferred.Until)
+					continue
+				}
+				return nil, plan, err
 			}
 		}
 		cands, err := entry.Adapter.Resolve(ctx, row.Work)
 		if err != nil {
 			if ctx.Err() != nil {
-				return nil, retryAt, ctx.Err()
+				return nil, plan, ctx.Err()
 			}
 			if delay, temporary := resolver.Temporary(err); temporary {
 				sourceRetry := earlierRetry(time.Time{}, s.Now(), delay, s.RetryDelay)
-				retryAt = earlierTime(retryAt, sourceRetry)
+				plan.Temporary = earlierTime(plan.Temporary, sourceRetry)
 				if s.Budgets != nil {
 					_ = s.Budgets.Defer(ctx, name, sourceRetry)
 				}
@@ -485,7 +490,9 @@ func (s *Service) resolve(ctx context.Context, row *job.Row) (map[string]resolve
 	}
 
 	if len(all) == 0 && strings.TrimSpace(row.Work.DOI) != "" {
-		all = append(all, s.resolveSiblings(ctx, row)...)
+		siblings, siblingPlan := s.resolveSiblings(ctx, row)
+		all = append(all, siblings...)
+		plan.merge(siblingPlan)
 	}
 
 	ranked, evidence := resolver.Rank(row.Policy.DesiredVersion, all)
@@ -496,16 +503,16 @@ func (s *Service) resolve(ctx context.Context, row *job.Row) (map[string]resolve
 	if !sameWork(resolved, row.Work) {
 		updated, err := s.Jobs.FillWorkMetadata(ctx, row.ID, resolved)
 		if err != nil {
-			return nil, retryAt, err
+			return nil, plan, err
 		}
 		row.Work = updated.Work
 	}
 
 	persisted, live := candidateRows(row, ranked, evidence)
 	if _, err := s.Jobs.InsertCandidates(ctx, row.ID, persisted); err != nil {
-		return nil, retryAt, err
+		return nil, plan, err
 	}
-	return live, retryAt, nil
+	return live, plan, nil
 }
 
 // candidateRows converts ranked candidates into their persisted (redacted)
@@ -533,11 +540,12 @@ func candidateRows(row *job.Row, ranked []resolver.Candidate, evidence []string)
 // url_key, so a repeated hop (later Process re-entry, or hop candidates
 // themselves failing) inserts zero and the exhaustion verdict stands — no
 // loop is possible.
-func (s *Service) siblingHop(ctx context.Context, row *job.Row, live map[string]resolver.Candidate) bool {
+func (s *Service) siblingHop(ctx context.Context, row *job.Row, live map[string]resolver.Candidate, plan *retryPlan) bool {
 	if strings.TrimSpace(row.Work.DOI) == "" {
 		return false
 	}
-	cands := s.resolveSiblings(ctx, row)
+	cands, siblingPlan := s.resolveSiblings(ctx, row)
+	plan.merge(siblingPlan)
 	if len(cands) == 0 {
 		return false
 	}
@@ -567,7 +575,8 @@ type SiblingResolver interface {
 // skipped: strict title/author matching happened in the adapter, and PDF
 // semantic-identity validation against row.Work remains the acceptance gate.
 // Errors never fail resolution — the hop must not make an acquisition worse.
-func (s *Service) resolveSiblings(ctx context.Context, row *job.Row) []resolver.Candidate {
+func (s *Service) resolveSiblings(ctx context.Context, row *job.Row) ([]resolver.Candidate, retryPlan) {
+	var plan retryPlan
 	for _, entry := range s.Resolvers {
 		sibling, ok := entry.Adapter.(SiblingResolver)
 		if !ok {
@@ -581,16 +590,33 @@ func (s *Service) resolveSiblings(ctx context.Context, row *job.Row) []resolver.
 		// sibling pass is a resolve-stage attempt distinguished by its detail.
 		attempt, err := s.Jobs.StartAttempt(ctx, row.ID, 0, "resolve", name)
 		if err != nil {
-			return nil
+			return nil, plan
 		}
 		if s.Budgets != nil {
 			if err := s.Budgets.Acquire(ctx, name, entry.Policy, entry.EstimatedCost); err != nil {
 				_ = s.Jobs.FinishAttempt(ctx, attempt, "budget_blocked", 0, safeType(err))
+				var deferred *budget.ErrDeferred
+				if errors.As(err, &deferred) {
+					plan.Gate = earlierTime(plan.Gate, deferred.Until)
+				}
 				continue
 			}
 		}
 		cands, err := sibling.ResolveSiblings(ctx, row.Work)
 		if err != nil {
+			// A rate-limited sibling lookup is not a verdict. Recording it as
+			// a plain failure let a 429 here settle the whole job unavailable,
+			// because the hop runs at the exhaustion boundary where a missing
+			// retry time is the difference between parking and giving up.
+			if delay, temporary := resolver.Temporary(err); temporary {
+				sourceRetry := earlierRetry(time.Time{}, s.Now(), delay, s.RetryDelay)
+				plan.Temporary = earlierTime(plan.Temporary, sourceRetry)
+				if s.Budgets != nil {
+					_ = s.Budgets.Defer(ctx, name, sourceRetry)
+				}
+				_ = s.Jobs.FinishAttempt(ctx, attempt, "retryable", 0, safeType(err))
+				continue
+			}
 			_ = s.Jobs.FinishAttempt(ctx, attempt, "failed", 0, safeType(err))
 			continue
 		}
@@ -603,10 +629,10 @@ func (s *Service) resolveSiblings(ctx context.Context, row *job.Row) []resolver.
 		}
 		_ = s.Jobs.FinishAttempt(ctx, attempt, "success", 0, fmt.Sprintf("sibling_candidates=%d", len(valid)))
 		if len(valid) > 0 {
-			return valid
+			return valid, plan
 		}
 	}
-	return nil
+	return nil, plan
 }
 
 func (s *Service) enrichDOIWork(ctx context.Context, row *job.Row) error {
@@ -651,8 +677,12 @@ func (s *Service) enrich(ctx context.Context, row *job.Row) error {
 	if s.Budgets != nil {
 		if err := s.Budgets.Acquire(ctx, name, policy, 0); err != nil {
 			_ = s.Jobs.FinishAttempt(ctx, attempt, "budget_blocked", 0, safeType(err))
+			// Enrichment is optional metadata, so both a spent budget and a
+			// gated source (daily quota reset) just skip it; neither may fail
+			// the job or hold the worker until the gate lifts.
 			var exceeded *budget.ErrExceeded
-			if errors.As(err, &exceeded) {
+			var deferred *budget.ErrDeferred
+			if errors.As(err, &exceeded) || errors.As(err, &deferred) {
 				return nil
 			}
 			return err
@@ -690,7 +720,7 @@ func (s *Service) enrich(ctx context.Context, row *job.Row) error {
 	return nil
 }
 
-func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[string]resolver.Candidate, retryAt time.Time) error {
+func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[string]resolver.Candidate, plan retryPlan) error {
 	manual := false
 	// Candidate rows and events retain only redacted URLs. Keep the one
 	// browser-eligible OA URL only through this acquisition pass, then record
@@ -706,11 +736,13 @@ func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[st
 			// The pending queue drained. Before any terminal or parking
 			// verdict, try the OA sibling hop once — but never pre-empt an
 			// ordinary retry wait, where the primary candidates deserve
-			// their next attempt first.
+			// their next attempt first. A pure source gate is not an ordinary
+			// retry — no request was made — so it must not suppress a hop onto
+			// a sibling source that may not be gated at all.
 			if !hopTried {
 				hopTried = true
-				endsHere := manual || retryAt.IsZero() || s.retryBudgetExhausted(ctx, row.ID)
-				if endsHere && s.siblingHop(ctx, row, live) {
+				endsHere := manual || plan.Temporary.IsZero() || s.retryBudgetExhausted(ctx, row.ID)
+				if endsHere && s.siblingHop(ctx, row, live, &plan) {
 					continue
 				}
 			}
@@ -756,6 +788,15 @@ func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[st
 					_ = s.Jobs.MarkCandidate(ctx, stored.ID, "skipped")
 					continue
 				}
+				// A gated source (daily quota reset) is temporary, so the
+				// candidate stays retryable and the job parks until the gate
+				// lifts — never holding this worker's claim for the window.
+				var deferred *budget.ErrDeferred
+				if errors.As(err, &deferred) {
+					_ = s.Jobs.MarkCandidate(ctx, stored.ID, "retryable")
+					plan.Gate = earlierTime(plan.Gate, deferred.Until)
+					continue
+				}
 				return err
 			}
 		}
@@ -788,7 +829,7 @@ func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[st
 			case fetch.ClassRetryable:
 				_ = s.Jobs.MarkCandidate(ctx, stored.ID, "retryable")
 				sourceRetry := earlierRetry(time.Time{}, s.Now(), delay, s.RetryDelay)
-				retryAt = earlierTime(retryAt, sourceRetry)
+				plan.Temporary = earlierTime(plan.Temporary, sourceRetry)
 				if s.Budgets != nil {
 					_ = s.Budgets.Defer(ctx, stored.Source, sourceRetry)
 				}
@@ -827,14 +868,45 @@ func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[st
 		return s.park(ctx, row.ID, job.StateFetching, job.StateAwaitingHuman,
 			map[string]any{"reason": "landing_page_only"})
 	}
-	if !retryAt.IsZero() {
-		if s.retryBudgetExhausted(ctx, row.ID) {
-			return s.exhaustedCandidates(ctx, row, job.StateFetching, "retry_budget_exhausted", job.TerminalReasonTemporaryCandidateFailuresDidNotClear, oaBrowserURL)
-		}
-		return s.Jobs.Transition(ctx, row.ID, job.StateFetching, job.StateRetryWait,
-			map[string]any{"reason": "candidate_temporarily_unavailable"}, job.WithRetryAt(retryAt))
+	if !plan.IsZero() {
+		return s.parkForRetry(ctx, row, job.StateFetching, plan, "candidate_temporarily_unavailable",
+			job.TerminalReasonTemporaryCandidateFailuresDidNotClear, oaBrowserURL)
 	}
 	return s.exhaustedCandidates(ctx, row, job.StateFetching, "candidates_exhausted", job.TerminalReasonCandidatesExhausted, oaBrowserURL)
+}
+
+// parkForRetry schedules the next attempt, or gives up. Two rules keep the
+// bounded retry budget honest:
+//
+// A pass that only met closed source gates made no request, so it is recorded
+// as retryKindSourceGate and retryBudgetExhausted does not count it. Otherwise
+// a day-long provider gate alongside ordinary thirty-second gates spends all
+// eight attempts in minutes and settles the job with a "temporary failures did
+// not clear" reason naming a source that was never called.
+//
+// And when the budget really is spent but a gate is still pending, the gated
+// source has still never had its one call: park until it opens rather than
+// publish a terminal verdict the evidence does not support.
+func (s *Service) parkForRetry(ctx context.Context, row *job.Row, from string, plan retryPlan, reason string, exhaustedReason job.TerminalReason, oaBrowserURL string) error {
+	now := s.Now().UTC()
+	at := plan.At()
+	if s.retryBudgetExhausted(ctx, row.ID) {
+		if !plan.GatePending(now) {
+			return s.exhaustedCandidates(ctx, row, from, "retry_budget_exhausted", exhaustedReason, oaBrowserURL)
+		}
+		// Only the gate still justifies waiting. Waking at the shorter
+		// temporary time would re-claim, find the budget still spent, and
+		// park again — a spin at the temporary interval until the gate opens.
+		at = plan.Gate
+	}
+	if !at.After(now) {
+		// The gate elapsed while the rest of the pass ran. Persisting a past
+		// time makes the scheduler re-claim instantly and spend another
+		// attempt on a wait that already happened.
+		at = now.Add(s.RetryDelay)
+	}
+	return s.Jobs.Transition(ctx, row.ID, from, job.StateRetryWait,
+		map[string]any{"reason": reason, "retry_kind": plan.Kind()}, job.WithRetryAt(at))
 }
 
 func (s *Service) park(ctx context.Context, jobID, from, to string, detail map[string]any, opts ...job.TransitionOpt) error {
@@ -854,11 +926,14 @@ func (s *Service) park(ctx context.Context, jobID, from, to string, detail map[s
 // re-scheduling another attempt.
 const maxRetryAttempts = 8
 
-// retryBudgetExhausted reports whether a job has already cycled through
-// retry_wait at least maxRetryAttempts times. It counts durable transition
-// events into retry_wait so the bound survives daemon restarts. A read error
-// never escalates: best-effort maintenance prefers another retry to falsely
-// giving up on a job.
+// retryBudgetExhausted reports whether a job has already spent its bounded
+// attempts. It counts durable transition events into retry_wait so the bound
+// survives daemon restarts, but skips parks recorded as retryKindSourceGate:
+// waiting for a closed source gate consumed no attempt because no request was
+// made. Events written before that discriminator existed carry no retry_kind
+// and are counted, which preserves the original bound for existing jobs. A
+// read error never escalates: best-effort maintenance prefers another retry to
+// falsely giving up on a job.
 func (s *Service) retryBudgetExhausted(ctx context.Context, jobID string) bool {
 	events, err := s.Jobs.Events(ctx, jobID)
 	if err != nil {
@@ -870,9 +945,13 @@ func (s *Service) retryBudgetExhausted(ctx context.Context, jobID string) bool {
 			continue
 		}
 		detail, _ := event["detail"].(map[string]any)
-		if to, _ := detail["to"].(string); to == job.StateRetryWait {
-			n++
+		if to, _ := detail["to"].(string); to != job.StateRetryWait {
+			continue
 		}
+		if kind, _ := detail["retry_kind"].(string); kind == retryKindSourceGate {
+			continue
+		}
+		n++
 	}
 	return n >= maxRetryAttempts
 }
@@ -1236,6 +1315,53 @@ func autoImportErrorInfo(err error) (class, hint string, httpStatus int) {
 		httpStatus = classified.ErrorHTTPStatus()
 	}
 	return class, hint, httpStatus
+}
+
+// retryKind labels why a pass ended without a verdict. It is recorded on the
+// retry_wait transition so retryBudgetExhausted can tell the two apart.
+const (
+	retryKindTemporary  = "temporary"
+	retryKindSourceGate = "source_gate"
+)
+
+// retryPlan separates the two reasons an acquisition pass can end with no
+// verdict. Temporary means a request went out and failed, so retrying costs
+// the job one of its bounded attempts. Gate means a source was closed before
+// any request was made (budget.ErrDeferred), so the job learned nothing and
+// must not be charged for waiting: a day-long provider gate alongside ordinary
+// thirty-second gates would otherwise burn the whole retry budget within
+// minutes and settle the job "temporary source failures did not clear" — a
+// claim about a source that was never called.
+type retryPlan struct {
+	Temporary time.Time
+	Gate      time.Time
+}
+
+// merge folds another pass's plan in, keeping the earliest of each kind.
+func (p *retryPlan) merge(other retryPlan) {
+	p.Temporary = earlierTime(p.Temporary, other.Temporary)
+	p.Gate = earlierTime(p.Gate, other.Gate)
+}
+
+// At is when the job should wake: the earliest opportunity of either kind,
+// because a source that frees up sooner deserves its attempt sooner.
+func (p retryPlan) At() time.Time { return earlierTime(p.Temporary, p.Gate) }
+
+func (p retryPlan) IsZero() bool { return p.At().IsZero() }
+
+// Kind is source_gate only when no request was actually attempted this pass.
+func (p retryPlan) Kind() string {
+	if p.Temporary.IsZero() {
+		return retryKindSourceGate
+	}
+	return retryKindTemporary
+}
+
+// GatePending reports a source gate that has not yet elapsed. At the retry
+// exhaustion boundary this outranks a terminal verdict: the bounded attempts
+// are spent, but the gated source still deserves the one call it never got.
+func (p retryPlan) GatePending(now time.Time) bool {
+	return !p.Gate.IsZero() && p.Gate.After(now)
 }
 
 func earlierTime(current, candidate time.Time) time.Time {
