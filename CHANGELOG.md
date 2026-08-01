@@ -117,6 +117,73 @@ execution records in `notes/acquisition-stack-plan.md`.
 
 ### Fixed
 
+- **A source's daily quota no longer freezes the whole acquisition queue.**
+  Providers express an exhausted daily quota as a `Retry-After` pointing at the
+  next reset — OpenAlex answers with the next UTC midnight, up to a day out —
+  and `budget.Acquire` slept that out inline. The sleeping caller is an
+  acquisition worker holding a job claim whose scheduler heartbeat keeps
+  renewing the lease, so the claim never expires and the row can never be
+  reclaimed: with three workers, three quota-gated jobs stalled a 309-job
+  cohort at zero throughput for the rest of the day. `Acquire` now waits out
+  only short blips (`budget.MaxInlineWait`, five seconds) and returns
+  `*budget.ErrDeferred` for anything longer. Resolution skips the gated source
+  and parks the job in `retry_wait` at the gate; a gated fetch candidate stays
+  retryable; enrichment is simply skipped. The wait belongs to the scheduler,
+  which can run every other job meanwhile.
+
+- **Waiting for a closed source gate no longer spends a job's retry budget, and
+  never manufactures a terminal verdict about a source that was never called.**
+  `retryBudgetExhausted` counted every `retry_wait` transition alike, so once
+  gated sources began parking jobs instead of blocking workers, a day-long
+  OpenAlex quota gate alongside ordinary thirty-second gates burned all eight
+  attempts within minutes and settled the job `temporary source failures did
+  not clear` — naming a source that had never been asked. The retry accounting
+  now distinguishes the two reasons a pass can end without a verdict: a
+  *temporary* failure means a request went out and failed, and costs an
+  attempt; a *source gate* means no request was made, and costs nothing.
+  Transitions record which, and older events without the discriminator keep
+  the original bound. When the attempts genuinely are spent but a gate is still
+  closed, the job now parks until it opens — and parks at the *gate*, not at
+  the shorter temporary time it would only spin on. A retry time that elapsed
+  during the same pass is floored rather than persisted into the past, which
+  used to cause an instant re-claim.
+
+- **A rate-limited sibling lookup no longer settles the job `unavailable`.**
+  `resolveSiblings` recorded every error as a plain `failed`, never consulting
+  `resolver.Temporary`. The version hop runs at the exhaustion boundary, where
+  the presence of a retry time is precisely the difference between parking and
+  giving up, so a 429 during the hop turned a retryable job into a terminal
+  negative claim. Temporary sibling failures now defer the source and schedule
+  a retry like any other. A pure source gate also no longer suppresses the hop:
+  no request was made, and the sibling source may not be gated at all.
+
+- **A forced resubmission now withdraws the verdict it supersedes.** `Retry`
+  out of `unavailable` already cancelled the conservative `openurl_available`
+  advisory, because "left open it outlives its own remedy and keeps telling the
+  user to do the thing they just did". A `--force` submission withdraws a
+  verdict just as much, but created an unlinked fresh job and left the old
+  advisory open forever — and that advisory is deliberately exempt from both
+  the terminal transition and the startup sweep, so nothing would ever retire
+  it. Every resubmission therefore double-counted the work's institutional
+  opportunity against a job that no longer represented it. Superseded terminal
+  jobs for the same canonical work now have their advisory cancelled and record
+  a `job.superseded` event naming the replacement, so a consumer that cached
+  the old outcome can learn that a terminal papio record was not final.
+
+- **A trailing full stop no longer hides a work from Crossref title
+  enrichment.** APA and several other publishers deposit article titles with a
+  closing period; citations and reference managers almost never carry one.
+  Title matching normalised case and whitespace but compared for exact
+  equality, so a perfect Crossref hit was rejected on one character — and the
+  job then settled `no_identifier`, a claim that no identifier could be found
+  for a work whose DOI was sitting at rank 0 of the response with matching
+  authors and year. Terminal punctuation is now folded on both sides; year and
+  author corroboration still gate adoption, so nothing looser is accepted.
+
+- **The Crossref enricher now identifies itself to the polite pool.** It was
+  the one source client that sent no `mailto`, while every other client sends
+  one and `papio doctor` reports the contact identity as configured.
+
 - **A per-request `access_mode_override` now actually governs the acquisition,
   and can only narrow.** The override was validated, snapshotted into the job's
   policy, and printed by `papio diagnose` — while the only code that decides
