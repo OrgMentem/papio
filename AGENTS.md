@@ -116,6 +116,16 @@ Bump the pinned zensical version in `docs/requirements.txt` deliberately; CI ins
   function — consolidating them is a **bug**: routing acquisition through the collapsing form
   fetches the wrong version, and routing ownership through the preserving form stops `v2`
   matching `v1` and silently breaks holdings deduplication.
+- **The version axis is the ONLY axis. Both normalizers preserve slash runs, and
+  a repeated slash is not a typo.** `10.48612//monograph-2025-2` and
+  `10.48612/monograph-2025-2` are two separately registered DataCite works with
+  different titles by the same creators — verified against the live API, and
+  pinned as a pair in `ownership_test.go`'s `TestNormalizeIdentifier`. Collapsing runs merges two real
+  names, so it was tried and reverted (`5d1adce`). The blast radius is wider than
+  holdings: `liveJobForCanonicalWork` keys on `work.Describe()`, so collapsing in
+  the **work** normalizer would make `acquire.submit_v2` return `existing: true`
+  pointing a ratified consumer at a job for a **different work** (ADR-0010). Do
+  not add a second equivalence axis to this split without checking both.
 - **`papio acquire <arg>` is the ONLY bare-string identifier classifier in the tree**
   (`inferBareIdentifier` in `internal/cli/acquire.go`). Every other entry point — the
   identifier flags, `papio batch`/MCP via `batch.ParseWork`, the daemon's
