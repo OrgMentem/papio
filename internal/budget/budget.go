@@ -30,6 +30,31 @@ func (e *ErrExceeded) Error() string {
 	return fmt.Sprintf("source %s monthly budget exceeded: spent $%.2f + request $%.2f > limit $%.2f", e.Source, e.Spent, e.Attempt, e.Limit)
 }
 
+// MaxInlineWait bounds how long Acquire will block a caller on the durable
+// next_allowed_at gate. A source gate is set from a server Retry-After, and
+// providers routinely express a *daily quota reset* that way — OpenAlex
+// answers an exhausted daily quota with a Retry-After pointing at the next UTC
+// midnight, up to 24 hours out. Sleeping that out in the caller parks an
+// acquisition worker for the whole window while its scheduler heartbeat keeps
+// renewing the job lease, so the claim never expires and the row can never be
+// reclaimed: three workers on three gated jobs froze a 309-job cohort for a
+// day. Anything past this bound is the job scheduler's problem, not the
+// caller's; short blips are still absorbed inline so a two-second Retry-After
+// does not burn a resolver out of the chain.
+const MaxInlineWait = 5 * time.Second
+
+// ErrDeferred means the source is gated by a durable next_allowed_at further
+// out than MaxInlineWait. The caller must skip the source and park its work
+// until Until rather than wait.
+type ErrDeferred struct {
+	Source string
+	Until  time.Time
+}
+
+func (e *ErrDeferred) Error() string {
+	return fmt.Sprintf("source %s is deferred until %s", e.Source, e.Until.UTC().Format(time.RFC3339))
+}
+
 // Snapshot is safe diagnostic state; it never contains credentials.
 type Snapshot struct {
 	Source           string     `json:"source"`
@@ -64,6 +89,8 @@ func New(s *store.Store) *Manager {
 // Acquire waits for Retry-After and the in-memory token bucket, then atomically
 // reserves one request and estimatedCost in the current UTC calendar month.
 // A source with MaxCostUSD == 0 is unmetered monetarily; rate <= 0 is unthrottled.
+// A durable gate further out than MaxInlineWait returns *ErrDeferred instead of
+// blocking, so the caller can release its worker and park the work.
 func (m *Manager) Acquire(ctx context.Context, source string, policy config.Source, estimatedCost float64) error {
 	if source == "" {
 		return errors.New("source name is required")
@@ -75,15 +102,22 @@ func (m *Manager) Acquire(ctx context.Context, source string, policy config.Sour
 		return fmt.Errorf("source %s is disabled", source)
 	}
 
+	// One deadline for the whole loop: a gate that keeps being pushed out
+	// while we sleep must not extend the wait past a single MaxInlineWait.
+	deadline := m.now().UTC().Add(MaxInlineWait)
 	for {
 		snap, err := m.Snapshot(ctx, source)
 		if err != nil {
 			return err
 		}
-		if snap.NextAllowedAt == nil || !snap.NextAllowedAt.After(m.now().UTC()) {
+		now := m.now().UTC()
+		if snap.NextAllowedAt == nil || !snap.NextAllowedAt.After(now) {
 			break
 		}
-		if err := sleepContext(ctx, time.Until(*snap.NextAllowedAt)); err != nil {
+		if snap.NextAllowedAt.After(deadline) {
+			return &ErrDeferred{Source: source, Until: *snap.NextAllowedAt}
+		}
+		if err := sleepContext(ctx, snap.NextAllowedAt.Sub(now)); err != nil {
 			return err
 		}
 	}

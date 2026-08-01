@@ -78,11 +78,55 @@ func TestDurableRetryAfterGateSurvivesManager(t *testing.T) {
 	}
 	// A new manager over the same DB must still observe the gate.
 	m2 := &Manager{db: m.db, limiters: make(map[string]*tokenBucket), now: time.Now}
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
-	defer cancel()
-	err := m2.Acquire(ctx, "remote", config.Source{Enabled: true}, 0)
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("durable gate returned %v, want context deadline", err)
+	err := m2.Acquire(context.Background(), "remote", config.Source{Enabled: true}, 0)
+	var deferred *ErrDeferred
+	if !errors.As(err, &deferred) {
+		t.Fatalf("durable gate returned %T %v, want *ErrDeferred", err, err)
+	}
+	if deferred.Source != "remote" || deferred.Until.Sub(until).Abs() > time.Second {
+		t.Fatalf("deferred = %+v, want the persisted gate for remote at %s", deferred, until)
+	}
+}
+
+// A provider expresses an exhausted daily quota as a Retry-After pointing at
+// the next reset — up to a day out. Acquire must hand that back rather than
+// sleep, because the caller holds an acquisition worker whose lease heartbeat
+// would keep the job claimed for the whole window and stall the queue behind
+// it. Pins the bug that froze a 309-job cohort on three claimed rows.
+func TestAcquireReturnsRatherThanSleepingOnADailyQuotaGate(t *testing.T) {
+	m := testManager(t)
+	midnight := time.Now().UTC().Truncate(24 * time.Hour).Add(24 * time.Hour)
+	if err := m.Defer(context.Background(), "openalex", midnight); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	err := m.Acquire(context.Background(), "openalex", config.Source{Enabled: true, RatePerSec: 2, Burst: 2}, 0)
+	var deferred *ErrDeferred
+	if !errors.As(err, &deferred) {
+		t.Fatalf("Acquire = %T %v, want *ErrDeferred", err, err)
+	}
+	if elapsed := time.Since(start); elapsed > MaxInlineWait {
+		t.Fatalf("Acquire blocked %v on a far gate; it must return within %v", elapsed, MaxInlineWait)
+	}
+	// The gate must not be consumed: it is durable state the next caller reads.
+	snap, err := m.Snapshot(context.Background(), "openalex")
+	if err != nil || snap.NextAllowedAt == nil {
+		t.Fatalf("snapshot = %+v, %v; the deferral must survive a rejected Acquire", snap, err)
+	}
+	if snap.RequestsInWindow != 0 {
+		t.Fatalf("requests_in_window = %d, want 0: a deferred call never reached the source", snap.RequestsInWindow)
+	}
+}
+
+// The other half of the bound: a short Retry-After blip is still absorbed
+// inline, so a two-second gate does not drop a resolver out of the chain.
+func TestAcquireStillWaitsOutAShortGate(t *testing.T) {
+	m := testManager(t)
+	if err := m.Defer(context.Background(), "unpaywall", time.Now().UTC().Add(20*time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Acquire(context.Background(), "unpaywall", config.Source{Enabled: true}, 0); err != nil {
+		t.Fatalf("Acquire on a short gate = %v, want it waited and succeeded", err)
 	}
 }
 
