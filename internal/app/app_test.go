@@ -248,6 +248,58 @@ func TestSubmitForceCreatesFreshLiveJob(t *testing.T) {
 	}
 }
 
+// A force submission is the operator withdrawing a verdict this work already
+// received. The conservative advisory on the superseded job must not outlive
+// it: left open, every resubmission double-counts the work's institutional
+// opportunity against a job that no longer represents it. Observed live —
+// four fabricated `unavailable` verdicts each left a permanent advisory, and
+// the consumer's advisory count was inflated rather than its failure count,
+// so the corruption was invisible from that side.
+func TestForceSubmissionWithdrawsTheSupersededVerdict(t *testing.T) {
+	svc, jobs := newTestService(t)
+	ctx := context.Background()
+	first, err := svc.SubmitWithOptions(ctx, submitDedupRequest("request_supersede_0001"), SubmitOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminalizeSubmitDedupJob(t, jobs, first.JobID, job.StateUnavailable)
+	if _, err := jobs.OpenHumanAction(ctx, first.JobID, "openurl_available",
+		"no direct candidates; institutional OpenURL available but not opened in conservative mode"); err != nil {
+		t.Fatal(err)
+	}
+	second, err := svc.SubmitWithOptions(ctx, submitDedupRequest("request_supersede_0002"), SubmitOptions{Force: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Existing || second.JobID == first.JobID {
+		t.Fatalf("forced submission = %+v, want a fresh job", second)
+	}
+	actions, err := jobs.ListOpenHumanActionsForJobs(ctx, []string{first.JobID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, action := range actions {
+		if action.JobID == first.JobID {
+			t.Fatalf("advisory %d still open on superseded job %s; it outlives its own remedy and double-counts the work", action.ID, first.JobID)
+		}
+	}
+	events, err := jobs.Events(ctx, first.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := ""
+	for _, event := range events {
+		if kind, _ := event["kind"].(string); kind != "job.superseded" {
+			continue
+		}
+		detail, _ := event["detail"].(map[string]any)
+		found, _ = detail["superseded_by"].(string)
+	}
+	if found != second.JobID {
+		t.Fatalf("superseded_by = %q, want %q: a withdrawn verdict must say what replaced it", found, second.JobID)
+	}
+}
+
 func terminalizeSubmitDedupJob(t *testing.T, jobs *job.Store, id, state string) {
 	t.Helper()
 	if state == job.StateCancelled {

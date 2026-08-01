@@ -436,6 +436,35 @@ func (js *Store) createRequest(ctx context.Context, requestID string, w work.Wor
 		jobID, now, fmt.Sprintf(`{"request_id":%q,"work":%q}`, requestID, w.Describe())); err != nil {
 		return CreateResult{}, err
 	}
+	if force && deduplicateWork {
+		// A force submission is the operator withdrawing a verdict this work
+		// already received. Retry out of unavailable cancels the conservative
+		// advisory for the same reason (see Retry): left open it outlives its
+		// own remedy and keeps advising an action that has now been taken —
+		// here on a fresh job rather than the same one. Without this, every
+		// resubmission double-counts the work's institutional opportunity
+		// against a job that no longer represents it.
+		superseded, err := supersededJobsForCanonicalWork(ctx, tx, w)
+		if err != nil {
+			return CreateResult{}, err
+		}
+		for _, oldID := range superseded {
+			if _, err := tx.ExecContext(ctx,
+				`UPDATE human_actions SET status = 'cancelled', resolved_at = ?
+				  WHERE job_id = ? AND kind = ? AND status = 'open'`,
+				now, oldID, informationalActionKind); err != nil {
+				return CreateResult{}, err
+			}
+			// The durable trace that this verdict was withdrawn, and by what.
+			// A terminal papio record is not necessarily final, and a consumer
+			// that cached the old outcome has no other way to learn that.
+			if _, err := tx.ExecContext(ctx,
+				`INSERT INTO events (job_id, at, kind, detail_json) VALUES (?, ?, 'job.superseded', ?)`,
+				oldID, now, fmt.Sprintf(`{"superseded_by":%q,"work":%q}`, jobID, w.Describe())); err != nil {
+				return CreateResult{}, err
+			}
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return CreateResult{}, err
 	}
@@ -462,6 +491,41 @@ func liveJobForCanonicalWork(ctx context.Context, tx *sql.Tx, w work.Work) (stri
 		JOIN identifiers i ON i.work_request_id = j.work_request_id
 		WHERE i.kind = ? AND i.value = ?
 		ORDER BY j.created_at DESC`, kind, value)
+}
+
+// supersededJobsForCanonicalWork lists terminal jobs that already answered
+// this work. A force submission is a deliberate second opinion on a verdict
+// those jobs published, so their advisories must not outlive it.
+func supersededJobsForCanonicalWork(ctx context.Context, tx *sql.Tx, w work.Work) ([]string, error) {
+	kind, value, ok := strings.Cut(w.Describe(), ":")
+	if !ok {
+		return nil, nil
+	}
+	switch kind {
+	case "doi", "pmid", "arxiv", "isbn", "openalex":
+	default:
+		return nil, nil
+	}
+	rows, err := tx.QueryContext(ctx, `
+		SELECT j.id, j.state FROM jobs j
+		JOIN identifiers i ON i.work_request_id = j.work_request_id
+		WHERE i.kind = ? AND i.value = ?
+		ORDER BY j.created_at DESC`, kind, value)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var ids []string
+	for rows.Next() {
+		var id, state string
+		if err := rows.Scan(&id, &state); err != nil {
+			return nil, err
+		}
+		if Terminal(state) {
+			ids = append(ids, id)
+		}
+	}
+	return ids, rows.Err()
 }
 
 func firstLiveJob(ctx context.Context, tx *sql.Tx, query string, args ...any) (string, error) {
