@@ -100,6 +100,22 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, capability pdf
 		}
 	}
 
+	if db == nil {
+		add("uncollected_acquisitions", Skip, "uncollected acquisitions are checked by the daemon", "")
+	} else {
+		n, oldest, err := uncollectedAcquisitions(ctx, db)
+		switch {
+		case err != nil:
+			add("uncollected_acquisitions", Warn, "uncollected acquisitions could not be counted", "inspect database permissions")
+		case n == 0:
+			add("uncollected_acquisitions", Pass, "every acquisition older than the grace period has been collected", "")
+		default:
+			add("uncollected_acquisitions", Warn,
+				fmt.Sprintf("%d acquired full texts have never been exported; oldest settled %s ago", n, oldest.Round(time.Hour)),
+				"run `papio jobs list --state ready --limit 500` and export them, or cancel the jobs if the work is no longer wanted")
+		}
+	}
+
 	if workerBinary == "" {
 		add("pdf_worker", Fail, "papio worker executable path is missing", "run doctor from the papio binary")
 	} else if info, err := os.Stat(workerBinary); err != nil || info.IsDir() || info.Mode().Perm()&0o111 == 0 {
@@ -143,6 +159,53 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, capability pdf
 		}
 	}
 	return out
+}
+
+// uncollectedGracePeriod is how long an acquired full text may sit before it
+// reads as abandoned rather than simply not fetched yet. It is a constant, not
+// a setting: a new [pdf]-style config field would make an older binary reject
+// the whole config file, and nobody has yet needed a different number. Promote
+// it to a `papio doctor` flag at the first real request, not before.
+const uncollectedGracePeriod = 7 * 24 * time.Hour
+
+// uncollectedAcquisitions counts full texts papio acquired that nobody ever
+// exported, and how long the oldest has waited.
+//
+// This can only be answered here. A consumer sees the jobs it can still
+// address, but an acquisition is stranded precisely when the key that named it
+// stops being derivable — so the orphan is by definition the one the consumer
+// cannot ask about. papio knows the one fact it cannot reconstruct: this was
+// acquired and nobody came for it.
+//
+// Deliberately reports a count and an age rather than job ids. The human
+// running doctor is the only consumer today; anything programmatic needs a new
+// IPC method name, because widening a ratified result breaks older clients.
+// When that method arrives it must key on job id, not work key: the job id is
+// what survives an identity change on the consumer's side, and a work-shaped
+// answer would be useless for exactly the case it exists to catch.
+func uncollectedAcquisitions(ctx context.Context, db *store.Store) (int, time.Duration, error) {
+	// updated_at is when the job settled: nothing transitions a ready job after.
+	row := db.DB().QueryRowContext(ctx, `
+		SELECT COUNT(*), COALESCE(MIN(j.updated_at), '')
+		FROM jobs j
+		JOIN job_artifacts ja ON ja.job_id = j.id
+		WHERE j.state = 'ready'
+		  AND j.updated_at < ?
+		  AND NOT EXISTS (SELECT 1 FROM exports e WHERE e.job_id = j.id)`,
+		time.Now().UTC().Add(-uncollectedGracePeriod).Format(time.RFC3339Nano))
+	var n int
+	var oldest string
+	if err := row.Scan(&n, &oldest); err != nil {
+		return 0, 0, err
+	}
+	if n == 0 {
+		return 0, 0, nil
+	}
+	settled, err := time.Parse(time.RFC3339Nano, oldest)
+	if err != nil {
+		return n, 0, nil
+	}
+	return n, time.Since(settled), nil
 }
 
 func checkDataDir(path string) error {

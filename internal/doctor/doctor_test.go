@@ -73,6 +73,93 @@ func TestRunReadyProfilePassesWithoutLeakingSecrets(t *testing.T) {
 	}
 }
 
+// An acquisition nobody exported is the one thing a consumer structurally
+// cannot detect for itself: a job is stranded precisely when the key naming it
+// stops being derivable, so the orphan is the job the consumer can no longer
+// ask about. The grace period keeps a freshly acquired job from reading as
+// abandoned.
+func TestRunReportsAcquisitionsNobodyEverCollected(t *testing.T) {
+	ctx := context.Background()
+	data := t.TempDir()
+	db, err := store.Open(ctx, data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	seed := func(id, settled string, exported bool) {
+		t.Helper()
+		if _, err := db.DB().ExecContext(ctx, `
+			INSERT INTO work_requests (id, created_at, title) VALUES (?, ?, 'Example')`,
+			"wr_"+id, settled); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.DB().ExecContext(ctx, `
+			INSERT INTO jobs (id, work_request_id, state, policy_json, created_at, updated_at)
+			VALUES (?, ?, 'ready', '{}', ?, ?)`, id, "wr_"+id, settled, settled); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.DB().ExecContext(ctx, `
+			INSERT INTO artifacts (sha256, size_bytes, mime, path, created_at)
+			VALUES (?, 1, 'application/pdf', ?, ?)`, id+"sha", "/tmp/"+id, settled); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.DB().ExecContext(ctx, `
+			INSERT INTO job_artifacts (job_id, artifact_sha256, role, created_at)
+			VALUES (?, ?, 'main', ?)`, id, id+"sha", settled); err != nil {
+			t.Fatal(err)
+		}
+		if exported {
+			if _, err := db.DB().ExecContext(ctx, `
+				INSERT INTO exports (job_id, kind, idempotency_key, created_at)
+				VALUES (?, 'bundle', ?, ?)`, id, "idem_"+id, settled); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	old := time.Now().UTC().Add(-30 * 24 * time.Hour).Format(time.RFC3339Nano)
+	fresh := time.Now().UTC().Add(-time.Hour).Format(time.RFC3339Nano)
+	seed("job_stranded", old, false)
+	seed("job_collected", old, true)
+	seed("job_recent", fresh, false)
+
+	detail := uncollectedDetail(t, ctx, db, Warn)
+	if !strings.Contains(detail, "1 acquired full texts") {
+		t.Fatalf("detail = %q; want exactly the one stranded job — an exported job and one inside the grace period are not orphans", detail)
+	}
+}
+
+func TestRunPassesWhenEveryAcquisitionWasCollected(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	uncollectedDetail(t, ctx, db, Pass)
+}
+
+func uncollectedDetail(t *testing.T, ctx context.Context, db *store.Store, want string) string {
+	t.Helper()
+	cfg := config.Default()
+	cfg.AccessMode = config.ModeConservative
+	cfg.DataDir = t.TempDir()
+	tool := executable(t)
+	report := Run(ctx, cfg, db, pdf.Capability{
+		PDFCPU: true, PDFInfo: tool, PDFToText: tool, PDFToPPM: tool, Tesseract: tool,
+	}, tool, nil)
+	for _, c := range report.Checks {
+		if c.Name == "uncollected_acquisitions" {
+			if c.Status != want {
+				t.Fatalf("status = %q, want %q (detail %q)", c.Status, want, c.Detail)
+			}
+			return c.Detail
+		}
+	}
+	t.Fatalf("uncollected_acquisitions check missing: %+v", report.Checks)
+	return ""
+}
+
 func TestRunReportsMissingModeCredentialsToolsAndUnsafeConfig(t *testing.T) {
 	cfg := config.Default()
 	cfg.Sources[config.SourceOpenAlex] = config.Source{Enabled: true}
