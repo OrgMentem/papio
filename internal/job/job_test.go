@@ -8,8 +8,10 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -1261,5 +1263,162 @@ func TestRetryKeepsThePinnedAccessModeWithoutAConservativeAdvisory(t *testing.T)
 	// The rest of the policy must survive the retry untouched either way.
 	if after.Policy.DesiredVersion != before.Policy.DesiredVersion {
 		t.Fatalf("desired_version = %q, want %q", after.Policy.DesiredVersion, before.Policy.DesiredVersion)
+	}
+}
+
+// TestConcurrentSubmissionsOfOneWorkConvergeOnOneJob pins the guarantee
+// ADR-0010 makes to consumers: `existing: true` means a live job already owns
+// this work, and two submissions of the same work cannot both create one.
+//
+// createRequest reads (liveJobForCanonicalWork) and then writes in a DEFERRED
+// transaction, so a read-then-write window is at least arguable on paper. It
+// does not open in practice: sixteen simultaneous submissions of one work
+// produce one job and exactly one existing=false, under -race.
+//
+// What this test does NOT establish is WHICH mechanism closes the window.
+// store.Open sets db.SetMaxOpenConns(1), and database/sql then hands the single
+// connection to one transaction at a time — but raising that limit to 8 does
+// not make this test fail, so the pool setting is not demonstrably the thing
+// doing the work, and SQLite's own write locking may be sufficient. The claim
+// asserted here is therefore the observable guarantee ADR-0010 gives consumers,
+// not an explanation of it. Do not read this as coverage for the connection
+// limit; it is not.
+func TestConcurrentSubmissionsOfOneWorkConvergeOnOneJob(t *testing.T) {
+	ctx := context.Background()
+	js := testStore(t)
+	w := testWork()
+
+	const submissions = 16
+	var wg sync.WaitGroup
+	results := make([]CreateResult, submissions)
+	errs := make([]error, submissions)
+	start := make(chan struct{})
+	for i := range submissions {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			results[i], errs[i] = js.CreateRequestForWork(ctx,
+				fmt.Sprintf("wr_concurrent_%02d", i), w, "", "", testPolicy(), nil, PrincipalCLI, false)
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	created := map[string]int{}
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("submission %d: %v", i, err)
+		}
+		created[results[i].JobID]++
+	}
+	if len(created) != 1 {
+		t.Fatalf("%d concurrent submissions of one work produced %d distinct jobs, want 1: %v",
+			submissions, len(created), created)
+	}
+	fresh := 0
+	for _, r := range results {
+		if !r.Existing {
+			fresh++
+		}
+	}
+	if fresh != 1 {
+		t.Fatalf("%d submissions reported existing=false, want exactly 1", fresh)
+	}
+}
+
+// TestForcedSubmissionsDeliberatelyDoNotConverge is the other half. A duplicate
+// job for one work is reachable, but only when the caller asks: force skips both
+// dedup lookups (job.go:382). Nothing server-side sets it — the flag reaches
+// createRequest only from acquire.submit_v2's `force` param — so two live jobs
+// for identical identifiers is evidence the submitter forced, not evidence that
+// convergence raced.
+func TestForcedSubmissionsDeliberatelyDoNotConverge(t *testing.T) {
+	ctx := context.Background()
+	js := testStore(t)
+	w := testWork()
+
+	first, err := js.CreateRequestForWork(ctx, "wr_force_first", w, "", "", testPolicy(), nil, PrincipalCLI, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	forced, err := js.CreateRequestForWork(ctx, "wr_force_second", w, "", "", testPolicy(), nil, PrincipalCLI, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if forced.Existing || forced.JobID == first.JobID {
+		t.Fatalf("forced submission = %+v, want a distinct fresh job separate from %s", forced, first.JobID)
+	}
+	unforced, err := js.CreateRequestForWork(ctx, "wr_force_third", w, "", "", testPolicy(), nil, PrincipalCLI, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !unforced.Existing {
+		t.Fatal("an unforced submission after a forced one created a third job")
+	}
+}
+
+// TestEnrichmentRecordsADuplicateItCannotHaveCaughtAtSubmit reproduces the real
+// 2-in-309 case. Two citations for one paper: one carried a DOI, the other did
+// not because the consumer's own identity extraction was defeated. papio
+// deduplicates at submit, and a title-only request correctly matches nothing —
+// liveJobForCanonicalWork keys on strong identifiers only. Enrichment later
+// discovers the DOI, and at that instant the duplication becomes knowable.
+//
+// The assertion is that papio writes it down and changes nothing else. Both
+// jobs stay live and keep their handles: the consumer is polling both, so
+// silently merging would cost it a work it believes it is tracking, against a
+// duplicate fetch that content addressing already collapses to one file.
+func TestEnrichmentRecordsADuplicateItCannotHaveCaughtAtSubmit(t *testing.T) {
+	ctx := context.Background()
+	js := testStore(t)
+	const doi = "10.3389/fpsyg.2016.00079"
+
+	identified, err := js.CreateRequestForWork(ctx, "wr_dup_with_doi",
+		work.Work{DOI: doi, Title: "A Paper With A Clean Citation"}, "", "", testPolicy(), nil, PrincipalCLI, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The second citation yields no identifier, so submit has nothing to match.
+	titleOnly, err := js.CreateRequestForWork(ctx, "wr_dup_title_only",
+		work.Work{Title: "A Paper Whose Citation Defeated Extraction", Authors: []string{"A. Author"}, Year: 2016},
+		"", "", testPolicy(), nil, PrincipalCLI, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if titleOnly.Existing || titleOnly.JobID == identified.JobID {
+		t.Fatalf("title-only submission = %+v, want a distinct job: submit cannot know these match", titleOnly)
+	}
+
+	// Enrichment supplies the DOI, exactly as crossref_metadata does.
+	enriched, err := js.FillWorkMetadata(ctx, titleOnly.JobID, work.Work{DOI: doi})
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := js.RecordDuplicateWork(ctx, titleOnly.JobID, enriched.Work)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if other != identified.JobID {
+		t.Fatalf("duplicate_of = %q, want the live job %s that already held the DOI", other, identified.JobID)
+	}
+
+	// Recorded, not converged: both handles still resolve to their own live job.
+	for _, id := range []string{identified.JobID, titleOnly.JobID} {
+		row, err := js.Get(ctx, id)
+		if err != nil {
+			t.Fatalf("handle %s no longer resolves: %v", id, err)
+		}
+		if Terminal(row.State) {
+			t.Fatalf("job %s is %s; recording a duplicate must not end either job", id, row.State)
+		}
+	}
+
+	// And the note is idempotent enough to survive a second enrichment pass
+	// without inventing a self-reference.
+	if self, err := js.RecordDuplicateWork(ctx, identified.JobID, enriched.Work); err != nil {
+		t.Fatal(err)
+	} else if self == identified.JobID {
+		t.Fatal("a job was recorded as a duplicate of itself")
 	}
 }

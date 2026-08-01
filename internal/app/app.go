@@ -717,6 +717,14 @@ func (s *Service) enrich(ctx context.Context, row *job.Row) error {
 	}
 	row.Work = updated.Work
 	_ = s.Jobs.FinishAttempt(ctx, attempt, "success", 0, "metadata_enriched")
+	// Enrichment has just given this job a strong identifier, which is the
+	// first moment papio can know it duplicates a job it is already running:
+	// submit-time dedup correctly matched nothing, because a title-only request
+	// has no canonical key. The duplication is recorded and nothing is merged —
+	// see RecordDuplicateWork for why. Discarded like the attempt bookkeeping
+	// above: this is an advisory note, and failing a correct acquisition
+	// because a note could not be written would be the worse trade.
+	_, _ = s.Jobs.RecordDuplicateWork(ctx, row.ID, row.Work)
 	return nil
 }
 

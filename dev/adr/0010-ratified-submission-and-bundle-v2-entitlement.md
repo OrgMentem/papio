@@ -304,6 +304,28 @@ v1 decoding is retained indefinitely.
   `request_id` per work. This is documented rather than fixed: an idempotency
   key was offered and declined, because persisting the handle is the consumer's
   job and the honest contract is the one that says so.
+- **Deduplication happens at submit and nowhere else, so two live jobs can name
+  one work.** A title-only request correctly matches nothing, because
+  `liveJobForCanonicalWork` keys on strong identifiers. Enrichment
+  (`internal/app/app.go:714`) can supply a DOI much later, and at that instant
+  the duplication becomes knowable. Observed at 2 in 309 on the first real
+  cohort, where one citation of each pair carried a DOI and the other's
+  extraction had been defeated.
+
+  papio **records this and does not converge**. `existing` answers a question
+  asked at submit, about a handle issued at submit; consumers persist that
+  `job_id` on this ADR's instruction and poll it. Merging afterwards would
+  redefine a handle already in use — the consumer here was polling both, so a
+  silent merge costs it a work it believes it is tracking, against a duplicate
+  fetch that content addressing already collapses to one stored file. Same
+  asymmetry ADR-0007 and ADR-0008 turn on: the false merge is the expensive
+  error. `Store.RecordDuplicateWork` writes a `job.duplicate_work_detected`
+  event naming the other job, and changes nothing else.
+
+  That event is not yet on the ratified surface. `jobs.receipt` cannot gain a
+  field, so exposing it to consumers is a separate decision — and the pending
+  `jobs.status_by_ids` design is the natural place, now that there is evidence
+  a consumer wants it rather than a guess that one might.
 - Bundles now emit `acquisition-bundle/2`. Because `acquisition_mode` and
   `entitlement_ref` are both derivable from v1's required `access_basis` and
   `source` fields, an existing v1 corpus can be backfilled without re-export;

@@ -493,6 +493,60 @@ func liveJobForCanonicalWork(ctx context.Context, tx *sql.Tx, w work.Work) (stri
 		ORDER BY j.created_at DESC`, kind, value)
 }
 
+// RecordDuplicateWork notes that jobID now provably names the same work as
+// another job that is still live, and returns that job's id ("" if none).
+//
+// It records; it does not converge. papio deduplicates at submit, where a
+// title-only request correctly matches nothing because liveJobForCanonicalWork
+// keys on strong identifiers. Enrichment can discover a DOI much later, and at
+// that instant the duplication becomes knowable — but the handle was already
+// issued. ADR-0010 promises a consumer that `existing: true` answers a question
+// asked at submit, and consumers persist the returned job_id on that basis;
+// merging afterwards would redefine a handle they are already polling.
+//
+// The asymmetry decides it, the same one ADR-0007 and ADR-0008 turn on. A
+// duplicate costs one wasted fetch and, because artifacts are content
+// addressed, one stored file either way. A false merge breaks a live handle.
+// So the relationship is written down and left for a consumer to act on
+// knowingly, rather than acted on by papio behind their back.
+func (js *Store) RecordDuplicateWork(ctx context.Context, jobID string, w work.Work) (string, error) {
+	tx, err := js.S.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = tx.Rollback() }()
+	other, err := liveJobForCanonicalWorkExcept(ctx, tx, w, jobID)
+	if err != nil || other == "" {
+		return "", err
+	}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO events (job_id, at, kind, detail_json) VALUES (?, ?, 'job.duplicate_work_detected', ?)`,
+		jobID, store.Now(), fmt.Sprintf(`{"duplicate_of":%q,"work":%q}`, other, w.Describe())); err != nil {
+		return "", err
+	}
+	if err := tx.Commit(); err != nil {
+		return "", err
+	}
+	return other, nil
+}
+
+func liveJobForCanonicalWorkExcept(ctx context.Context, tx *sql.Tx, w work.Work, exclude string) (string, error) {
+	kind, value, ok := strings.Cut(w.Describe(), ":")
+	if !ok {
+		return "", nil
+	}
+	switch kind {
+	case "doi", "pmid", "arxiv", "isbn", "openalex":
+	default:
+		return "", nil
+	}
+	return firstLiveJob(ctx, tx, `
+		SELECT j.id, j.state FROM jobs j
+		JOIN identifiers i ON i.work_request_id = j.work_request_id
+		WHERE i.kind = ? AND i.value = ? AND j.id != ?
+		ORDER BY j.created_at DESC`, kind, value, exclude)
+}
+
 // supersededJobsForCanonicalWork lists terminal jobs that already answered this
 // work. A force submission is a deliberate second opinion on a verdict those
 // jobs published, so their advisories must not outlive it.

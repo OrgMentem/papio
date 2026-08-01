@@ -35,6 +35,16 @@ execution records in `notes/acquisition-stack-plan.md`.
   same `request_id` creates a new job, and `existing` means "a live job already
   owns this work", so a consumer resuming a run must persist the returned
   `job_id`. See ADR-0010.
+- **A duplicate discovered after submission is now recorded rather than
+  ignored.** *papio* deduplicates at submit, and a title-only request correctly
+  matches nothing because canonical convergence keys on strong identifiers.
+  Enrichment can supply a DOI much later, and at that moment the job provably
+  names the same work as one already running — two of 309 works on the first
+  real cohort. It is written down as a `job.duplicate_work_detected` event and
+  **not** merged: `existing` answers a question asked at submit about a handle
+  issued at submit, consumers poll that handle, and silently merging would cost
+  them a work they believe they are tracking against a duplicate fetch that
+  content addressing already collapses to one stored file. See ADR-0010.
 - **`bundle.document` and `artifacts.locate` are ratified, so a consumer can
   collect what it acquired.** No ratified method could produce a bundle or
   locate artifact bytes, leaving a consumer to call unratified names or read
