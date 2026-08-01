@@ -127,6 +127,12 @@ func (m *Manager) Acquire(ctx context.Context, source string, policy config.Sour
 	return m.reserve(ctx, source, policy.MaxCostUSD, estimatedCost)
 }
 
+// takeToken spends one token, waiting for the bucket to refill. Like the gate
+// loop in Acquire it is bounded by MaxInlineWait, and for the same reason: the
+// caller is usually a leased acquisition worker, and a slow refill would hold
+// its claim while the heartbeat renews the lease. Contention makes the bound
+// necessary rather than decorative — a waiter can lose each refilled token to
+// another goroutine and never converge on its own.
 func (m *Manager) takeToken(ctx context.Context, source string, rate float64, burst int) error {
 	if rate <= 0 {
 		return nil
@@ -142,6 +148,7 @@ func (m *Manager) takeToken(ctx context.Context, source string, rate float64, bu
 	}
 	m.mu.Unlock()
 
+	deadline := m.now().Add(MaxInlineWait)
 	for {
 		b.mu.Lock()
 		now := m.now()
@@ -155,8 +162,21 @@ func (m *Manager) takeToken(ctx context.Context, source string, rate float64, bu
 			b.mu.Unlock()
 			return nil
 		}
-		wait := time.Duration(math.Ceil((1 - b.tokens) / b.rate * float64(time.Second)))
+		// float64 nanoseconds overflow int64 at very low rates, which converted
+		// to a non-positive Duration and turned this into a busy spin.
+		seconds := (1 - b.tokens) / b.rate
+		wait := MaxInlineWait
+		if seconds < MaxInlineWait.Seconds() {
+			wait = time.Duration(math.Ceil(seconds * float64(time.Second)))
+		}
 		b.mu.Unlock()
+		if next := m.now().Add(wait); next.After(deadline) {
+			// Same verdict as a durable gate from the caller's side: this source
+			// cannot serve you now, release the worker and park. Deliberately
+			// never persisted through Defer — a token is process-local and
+			// advisory, and another caller may take it first.
+			return &ErrDeferred{Source: source, Until: next.UTC()}
+		}
 		if err := sleepContext(ctx, wait); err != nil {
 			return err
 		}

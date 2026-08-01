@@ -793,7 +793,14 @@ func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[st
 				// lifts — never holding this worker's claim for the window.
 				var deferred *budget.ErrDeferred
 				if errors.As(err, &deferred) {
-					_ = s.Jobs.MarkCandidate(ctx, stored.ID, "retryable")
+					// Unlike the branches around it this one reaches `continue`
+					// without a network call in between, so a swallowed failure
+					// here leaves the row pending and NextPendingCandidate hands
+					// back the same candidate on a tight loop — a hot spin
+					// holding the lease instead of parking.
+					if err := s.Jobs.MarkCandidate(ctx, stored.ID, "retryable"); err != nil {
+						return err
+					}
 					plan.Gate = earlierTime(plan.Gate, deferred.Until)
 					continue
 				}

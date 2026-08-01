@@ -493,39 +493,55 @@ func liveJobForCanonicalWork(ctx context.Context, tx *sql.Tx, w work.Work) (stri
 		ORDER BY j.created_at DESC`, kind, value)
 }
 
-// supersededJobsForCanonicalWork lists terminal jobs that already answered
-// this work. A force submission is a deliberate second opinion on a verdict
-// those jobs published, so their advisories must not outlive it.
+// supersededJobsForCanonicalWork lists terminal jobs that already answered this
+// work. A force submission is a deliberate second opinion on a verdict those
+// jobs published, so their advisories must not outlive it.
+//
+// Unlike liveJobForCanonicalWork this matches on EVERY strong identifier the
+// request carries, not just Describe's highest-priority one. A request may
+// supply several, so an older PMID-only job is invisible to a DOI-keyed lookup
+// when the replacement supplies both — and it would keep its advisory open with
+// no supersession recorded, which is the exact leak this function exists to
+// close. The breadth is safe here and not in the live-dedup path because the
+// stakes differ: merging two LIVE acquisitions can discard work in flight,
+// whereas this only retires an advisory on a job that already settled. Title is
+// still excluded — it describes a work rather than asserting its identity.
 func supersededJobsForCanonicalWork(ctx context.Context, tx *sql.Tx, w work.Work) ([]string, error) {
-	kind, value, ok := strings.Cut(w.Describe(), ":")
-	if !ok {
-		return nil, nil
+	identifiers := map[string]string{
+		"doi": w.DOI, "pmid": w.PMID, "arxiv": w.ArXiv, "isbn": w.ISBN, "openalex": w.OpenAlex,
 	}
-	switch kind {
-	case "doi", "pmid", "arxiv", "isbn", "openalex":
-	default:
-		return nil, nil
-	}
-	rows, err := tx.QueryContext(ctx, `
-		SELECT j.id, j.state FROM jobs j
-		JOIN identifiers i ON i.work_request_id = j.work_request_id
-		WHERE i.kind = ? AND i.value = ?
-		ORDER BY j.created_at DESC`, kind, value)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = rows.Close() }()
+	seen := make(map[string]bool)
 	var ids []string
-	for rows.Next() {
-		var id, state string
-		if err := rows.Scan(&id, &state); err != nil {
+	for kind, value := range identifiers {
+		if value == "" {
+			continue
+		}
+		rows, err := tx.QueryContext(ctx, `
+			SELECT j.id, j.state FROM jobs j
+			JOIN identifiers i ON i.work_request_id = j.work_request_id
+			WHERE i.kind = ? AND i.value = ?
+			ORDER BY j.created_at DESC`, kind, value)
+		if err != nil {
 			return nil, err
 		}
-		if Terminal(state) {
-			ids = append(ids, id)
+		for rows.Next() {
+			var id, state string
+			if err := rows.Scan(&id, &state); err != nil {
+				_ = rows.Close()
+				return nil, err
+			}
+			if Terminal(state) && !seen[id] {
+				seen[id] = true
+				ids = append(ids, id)
+			}
+		}
+		err = rows.Err()
+		_ = rows.Close()
+		if err != nil {
+			return nil, err
 		}
 	}
-	return ids, rows.Err()
+	return ids, nil
 }
 
 func firstLiveJob(ctx context.Context, tx *sql.Tx, query string, args ...any) (string, error) {

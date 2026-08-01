@@ -223,19 +223,23 @@ func matches(candidate record, requested work.Work) bool {
 	return false
 }
 
-// normalizeTitle folds the differences that never distinguish two works:
-// case, runs of whitespace, and terminal punctuation. The last one is not
+// normalizeTitle folds the differences that never distinguish two works: case,
+// runs of whitespace, and a single trailing full stop. The last one is not
 // cosmetic. APA and several other publishers deposit article titles with a
-// closing full stop ("...and well-being."), while citations and reference
-// managers almost never carry it, so an exact comparison rejected a perfect
-// match on one character. It cost Ryan & Deci 2000 — the most-cited work in
-// its literature — which papio reported as no_identifier despite Crossref
-// returning it at rank 0 with corroborating authors and year. Stripping is
-// applied to both sides, so it can only equate titles that were already
-// equal up to punctuation, and year plus author corroboration still gate the
-// adoption.
+// closing period ("...and well-being."), while citations and reference managers
+// almost never carry one, so an exact comparison rejected a perfect match on one
+// character. It cost Ryan & Deci 2000 — the most-cited work in its literature —
+// which papio reported as no_identifier despite Crossref returning it at rank 0
+// with corroborating authors and year.
+//
+// Only the period is folded. Replaying one cohort's twenty-six clean-title
+// failures showed every recoverable case was a deposited full stop, so folding
+// "?" or "!" too would buy nothing measurable while making "Who?" and "Who!"
+// equal — and matches() adopts on title alone when the request carries no
+// authors or year. This helper also normalizes author family names, so any
+// widening here loosens author corroboration as well.
 func normalizeTitle(value string) string {
-	return strings.TrimRight(strings.ToLower(strings.Join(strings.Fields(value), " ")), ".,;:!?")
+	return strings.TrimSuffix(strings.ToLower(strings.Join(strings.Fields(value), " ")), ".")
 }
 
 func authorFamily(value string) string {

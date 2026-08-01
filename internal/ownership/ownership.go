@@ -385,6 +385,18 @@ func normalizeDOI(value string) string {
 	if !strings.HasPrefix(strings.ToLower(value), "10.") {
 		return ""
 	}
+	// A doubled slash names the same work. Legacy publisher deposits carry it
+	// (APA registered both 10.1037//0003-066x.55.1.68 and 10.1037/0003-066x.55.1.68
+	// for one article, and Crossref returns both), so a library holding one form
+	// answered "not held" for the other. Collapsing belongs here and not in
+	// work.NormalizeDOI: both forms are separately registered and resolvable, so
+	// acquisition must keep fetching exactly what it was asked for, while
+	// ownership asks whether it is the same work — and it is. Runs are collapsed
+	// only after the 10. check, so this can never rescue a host-confusion string
+	// such as doi.org.attacker.example//10.x, which is already rejected above.
+	for strings.Contains(value, "//") {
+		value = strings.ReplaceAll(value, "//", "/")
+	}
 	// DOIs are case-insensitive; lowercase so an exported uppercase DOI still
 	// matches a resolver-supplied one.
 	return strings.ToLower(value)

@@ -177,12 +177,26 @@ execution records in `notes/acquisition-stack-plan.md`.
   equality, so a perfect Crossref hit was rejected on one character — and the
   job then settled `no_identifier`, a claim that no identifier could be found
   for a work whose DOI was sitting at rank 0 of the response with matching
-  authors and year. Terminal punctuation is now folded on both sides; year and
-  author corroboration still gate adoption, so nothing looser is accepted.
+  authors and year. Only the trailing period is folded, and on both sides:
+  replaying one cohort's twenty-six clean-title failures showed every
+  recoverable case was a deposited full stop, so folding `?` or `!` too would
+  buy nothing measurable while making `Who?` and `Who!` equal — and the same
+  helper normalises author family names, so any widening loosens author
+  corroboration as well.
 
 - **The Crossref enricher now identifies itself to the polite pool.** It was
   the one source client that sent no `mailto`, while every other client sends
   one and `papio doctor` reports the contact identity as configured.
+
+- **The per-source token bucket is bounded too, and can no longer busy-spin.**
+  `Acquire`'s durable-gate wait was bounded, but the rate-limiter loop beside
+  it was not: a slow refill held a leased acquisition worker, contention let a
+  waiter lose each refilled token without converging, and at a very low
+  configured rate the computed wait overflowed `int64` nanoseconds into a
+  non-positive duration, so the sleep returned immediately and the loop spun
+  hot. It now shares `MaxInlineWait` and returns `ErrDeferred` past it, so the
+  job parks like any other gated source. The wait is never persisted — a token
+  is process-local and advisory, and another caller may take it first.
 
 - **A per-request `access_mode_override` now actually governs the acquisition,
   and can only narrow.** The override was validated, snapshotted into the job's
