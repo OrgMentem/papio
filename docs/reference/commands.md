@@ -166,6 +166,14 @@ papio artifacts get <job-id-or-sha256> [flags]
 | --- | --- | --- | --- |
 | `--sha256` | `bool` | `false` | interpret argument as an artifact hash |
 
+### `papio artifacts locate`
+
+Print where one job's validated artifact bytes live
+
+```
+papio artifacts locate <job-id>
+```
+
 ## `papio batch`
 
 Inspect persisted acquisition batches
@@ -216,10 +224,18 @@ papio browser use [session-id] [flags]
 
 ## `papio bundle`
 
-Export validated acquisition bundles
+Read and export validated acquisition bundles
 
 ```
 papio bundle
+```
+
+### `papio bundle document`
+
+Print the acquisition bundle without writing it anywhere
+
+```
+papio bundle document <job-id>
 ```
 
 ### `papio bundle export`

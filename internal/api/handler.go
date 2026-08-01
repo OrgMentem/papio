@@ -18,6 +18,7 @@ import (
 	"papio/internal/batch"
 	"papio/internal/bootstrap"
 	"papio/internal/browser"
+	"papio/internal/bundle"
 	"papio/internal/config"
 	"papio/internal/discovery"
 	"papio/internal/ipc"
@@ -87,6 +88,40 @@ type ArtifactResult struct {
 type BundleResult struct {
 	Path   string                      `json:"path"`
 	Bundle *protocol.AcquisitionBundle `json:"bundle"`
+}
+
+// DocumentResult is the bundle.document result.
+//
+// Document is the bundle as JSON TEXT, not a decoded object, and that is the
+// point. Results decode with DisallowUnknownFields recursively, so returning
+// protocol.AcquisitionBundle inline — as BundleResult does — would mean a
+// ratified method could never gain a bundle field without a new method name,
+// defeating the schema_version the document already carries. As text the
+// bundle evolves under its own versioning while this contract holds still.
+// SchemaVersion is lifted out so a consumer can route to a decoder without
+// parsing first.
+type DocumentResult struct {
+	SchemaVersion string `json:"schema_version"`
+	Document      string `json:"document"`
+}
+
+// ArtifactLocation is the artifacts.locate result: enough to find and verify
+// the bytes, and deliberately nothing else.
+//
+// Not job.Artifact. That is the persistence struct, so freezing it would make
+// every future artifacts column a breaking change for older consumers — and it
+// carries identity_result, which is last-writer-wins across every job sharing
+// the digest (UpsertArtifact's ON CONFLICT DO UPDATE). ADR-0007 forbids
+// projecting identity from a content-addressed artifact for exactly that
+// reason, and internal/bundle already refuses to, reading AcquisitionIdentity
+// instead. A ratified reader must not hand a consumer the field the domain
+// says is unsafe to read. The rest of the artifact metadata lives in the
+// bundle's artifact block.
+type ArtifactLocation struct {
+	SHA256    string `json:"sha256"`
+	SizeBytes int64  `json:"size_bytes"`
+	MIME      string `json:"mime"`
+	Path      string `json:"path"`
 }
 
 // JobsPage and ActionsPage decode the jobs.list_v2 / actions.list_v2 envelopes.
@@ -251,6 +286,12 @@ func RouterWithShutdown(system *bootstrap.System, shutdown context.CancelFunc) i
 		},
 		"artifacts.get": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return getArtifact(ctx, raw, system)
+		},
+		"artifacts.locate": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return locateArtifact(ctx, raw, system)
+		},
+		"bundle.document": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return bundleDocument(ctx, raw, system)
 		},
 		"bundle.export": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return exportBundle(ctx, raw, system)
@@ -1081,6 +1122,62 @@ func exportBundleV2(ctx context.Context, raw json.RawMessage, system *bootstrap.
 		return nil, rpcErr
 	}
 	return marshal(BundleResult{Path: path, Bundle: result})
+}
+
+// bundleDocument is a pure read: it builds and validates the bundle and returns
+// it, writing nothing. bundle.export* materialises a directory as a side
+// effect, which is the wrong shape for a ratified reader whose caller wants the
+// document rather than a file it must then clean up.
+func bundleDocument(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
+	jobID, rpcErr := requireJobID(raw)
+	if rpcErr != nil {
+		return nil, rpcErr
+	}
+	document, _, err := system.Bundle.Document(ctx, jobID)
+	if err != nil {
+		return failure(err)
+	}
+	// The same bytes bundle.json is written with, so a consumer reading over
+	// IPC and one reading the exported file see an identical document.
+	encoded, err := bundle.EncodeDocument(document)
+	if err != nil {
+		return failure(err)
+	}
+	return marshal(DocumentResult{SchemaVersion: document.SchemaVersion, Document: string(encoded)})
+}
+
+func locateArtifact(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
+	jobID, rpcErr := requireJobID(raw)
+	if rpcErr != nil {
+		return nil, rpcErr
+	}
+	// Document already enforces that the job is ready and that its artifact
+	// verifies, so locate cannot hand back a path to bytes that failed
+	// validation or that no accepted candidate vouches for.
+	_, art, err := system.Bundle.Document(ctx, jobID)
+	if err != nil {
+		return failure(err)
+	}
+	return marshal(ArtifactLocation{
+		SHA256:    art.SHA256,
+		SizeBytes: art.SizeBytes,
+		MIME:      art.MIME,
+		Path:      art.Path,
+	})
+}
+
+func requireJobID(raw json.RawMessage) (string, *ipc.RPCError) {
+	var params struct {
+		JobID string `json:"job_id"`
+	}
+	if err := ipc.DecodeParams(raw, &params); err != nil || params.JobID == "" {
+		if err == nil {
+			err = errors.New("job_id is required")
+		}
+		_, rpcErr := badParams(err)
+		return "", rpcErr
+	}
+	return params.JobID, nil
 }
 
 func exportBundleFile(ctx context.Context, raw json.RawMessage, system *bootstrap.System) (string, *protocol.AcquisitionBundle, *ipc.RPCError) {

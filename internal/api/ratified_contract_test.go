@@ -10,17 +10,21 @@ import (
 	"path/filepath"
 	"testing"
 
+	"papio/internal/artifact"
+	"papio/internal/bootstrap"
 	"papio/internal/config"
 	"papio/internal/ipc"
 	"papio/internal/job"
 	"papio/internal/pdf"
+	"papio/internal/protocol"
 	"papio/internal/work"
 )
 
 // ratifiedConsumerMethods is the IPC surface promised to the first external
-// consumer by ADR-0009, extended with acquire.submit_v2 by ADR-0010. Removing
-// or renaming one breaks that consumer, so this list is deliberately pinned to
-// the live router rather than documentation.
+// consumer by ADR-0009, extended with acquire.submit_v2 by ADR-0010 and with
+// the two collection readers by ADR-0011. Removing or renaming one breaks that
+// consumer, so this list is deliberately pinned to the live router rather than
+// documentation.
 var ratifiedConsumerMethods = []string{
 	"acquire.submit_v2",
 	"jobs.list_v2",
@@ -29,6 +33,8 @@ var ratifiedConsumerMethods = []string{
 	"jobs.receipt",
 	"jobs.add_component",
 	"jobs.repair_awaiting_human",
+	"bundle.document",
+	"artifacts.locate",
 }
 
 func TestRatifiedConsumerContract(t *testing.T) {
@@ -242,6 +248,133 @@ func TestRatifiedConsumerContract(t *testing.T) {
 			t.Fatalf("unknown param = %+v, want invalid_argument", rpcErr)
 		}
 	})
+
+	// The collection readers are pure reads. bundle.export_v2 and artifacts.get
+	// were deliberately NOT ratified in their place: export_v2 requires
+	// output_dir and materialises a directory, and artifacts.get returns the
+	// job.Artifact persistence struct including identity_result, which is
+	// last-writer-wins across every job sharing a digest and which ADR-0007
+	// forbids projecting from an artifact.
+	t.Run("collection readers take job_id and reject unknown params", func(t *testing.T) {
+		for _, method := range []string{"bundle.document", "artifacts.locate"} {
+			t.Run(method, func(t *testing.T) {
+				router := RouterWithShutdown(nil, func() {})
+				if rpcErr := callMethod(t, router, method, map[string]any{}, nil); rpcErr == nil || rpcErr.Code != "invalid_argument" {
+					t.Fatalf("missing job_id = %+v, want invalid_argument", rpcErr)
+				}
+				rpcErr := callMethod(t, router, method, map[string]any{
+					"job_id": "job_ratified_reader", "output_dir": "/tmp/nope",
+				}, nil)
+				if rpcErr == nil || rpcErr.Code != "invalid_argument" {
+					t.Fatalf("unknown param = %+v, want invalid_argument", rpcErr)
+				}
+			})
+		}
+	})
+
+	t.Run("bundle.document returns the document as text and writes nothing", func(t *testing.T) {
+		system, jobID := readyBundleSystem(t)
+		bundles := filepath.Join(system.Config.DataDir, "bundles")
+		var result map[string]json.RawMessage
+		if rpcErr := callMethod(t, Router(system), "bundle.document",
+			map[string]string{"job_id": jobID}, &result); rpcErr != nil {
+			t.Fatalf("bundle.document = %+v", rpcErr)
+		}
+		assertRatifiedKeySet(t, result, "schema_version", "document")
+
+		// Text, not an object: the whole reason this method exists rather than
+		// bundle.export_v2 is that a nested bundle body would freeze the
+		// document's shape into the RPC contract forever.
+		var document string
+		if err := json.Unmarshal(result["document"], &document); err != nil {
+			t.Fatalf("document is not a JSON string: %v", err)
+		}
+		decoded, err := protocol.DecodeAcquisitionBundle([]byte(document))
+		if err != nil {
+			t.Fatalf("document does not decode as a bundle: %v", err)
+		}
+		var advertised string
+		if err := json.Unmarshal(result["schema_version"], &advertised); err != nil {
+			t.Fatal(err)
+		}
+		if advertised != decoded.SchemaVersion {
+			t.Fatalf("schema_version %q disagrees with the document's %q", advertised, decoded.SchemaVersion)
+		}
+		if _, err := os.Stat(bundles); !os.IsNotExist(err) {
+			t.Fatalf("a ratified reader materialised %s (stat err = %v)", bundles, err)
+		}
+	})
+
+	t.Run("artifacts.locate omits the fields ADR-0007 forbids projecting", func(t *testing.T) {
+		system, jobID := readyBundleSystem(t)
+		var result map[string]json.RawMessage
+		if rpcErr := callMethod(t, Router(system), "artifacts.locate",
+			map[string]string{"job_id": jobID}, &result); rpcErr != nil {
+			t.Fatalf("artifacts.locate = %+v", rpcErr)
+		}
+		assertRatifiedKeySet(t, result, "sha256", "size_bytes", "mime", "path")
+	})
+}
+
+// readyBundleSystem builds a system holding one job whose bundle can actually
+// be produced: an accepted candidate, a promoted artifact that verifies, and a
+// passing acquisition identity. The ratified readers are frozen forever, so
+// their contract test asserts against a real response rather than a stub.
+func readyBundleSystem(t *testing.T) (*bootstrap.System, string) {
+	t.Helper()
+	ctx := context.Background()
+	system := testSystem(t)
+	id, err := system.Jobs.CreateRequest(ctx, "wr_ratified_reader",
+		work.Work{DOI: "10.1000/ratified-reader", Title: "A Ratified Reader", Authors: []string{"Ada Lovelace"}, Year: 2026},
+		"", "", job.Policy{AccessMode: config.ModeConservative, DesiredVersion: "any", FetchMaxBytes: 1 << 20},
+		nil, job.PrincipalCLI)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := system.Jobs.InsertCandidates(ctx, id, []job.Candidate{{
+		JobID: id, Source: "unpaywall", URLRedacted: "https://example.test/paper.pdf", URLKey: "ratified-url-key",
+		LandingRedacted: "https://example.test/article", Version: "published", AccessBasis: "open_access",
+		ReuseLicense: "cc-by-4.0", ExpectedMIME: "application/pdf", Direct: true, IdentityConfidence: 1, Rank: 0,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	candidate, _ := system.Jobs.NextPendingCandidate(ctx, id)
+	if candidate == nil {
+		t.Fatal("candidate missing")
+	}
+	if err := system.Jobs.MarkCandidate(ctx, candidate.ID, "accepted"); err != nil {
+		t.Fatal(err)
+	}
+	quarantine, err := system.Artifacts.QuarantineDir(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	temp := filepath.Join(quarantine, "fixture.tmp")
+	if err := os.WriteFile(temp, []byte("%PDF-1.4\nfixture\n%%EOF"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sha, _, err := artifact.HashFile(temp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path, err := system.Artifacts.Promote(temp, sha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := system.Jobs.UpsertArtifact(ctx, job.Artifact{
+		SHA256: sha, SizeBytes: 21, MIME: "application/pdf", PageCount: 1,
+		Path: path, IdentityResult: "pass", CreatedAt: "2026-08-01T00:00:00Z",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := system.Jobs.Transition(ctx, id, job.StateQueued, job.StateResolving, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := system.Jobs.Transition(ctx, id, job.StateResolving, job.StateReady, nil,
+		job.WithArtifact(sha), job.WithCandidate(candidate.ID)); err != nil {
+		t.Fatal(err)
+	}
+	return system, id
 }
 
 func assertRatifiedPage(t *testing.T, router ipc.Router, method, rowsKey string, limit, wantRows int, wantTruncated bool) {

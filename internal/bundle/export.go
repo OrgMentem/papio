@@ -160,35 +160,47 @@ func lockExportDestination(destination string) func() {
 	}
 }
 
-// Export creates (or verifies and reuses) bundle.json and its relative
-// content-addressed artifact. An empty destination uses DataDir/bundles/<job>.
-func (e *Exporter) Export(ctx context.Context, jobID, destination string) (string, *protocol.AcquisitionBundle, error) {
+// EncodeDocument renders a bundle exactly as bundle.json is written to disk, so
+// a consumer reading bundle.document over IPC and a consumer reading the
+// exported file see byte-identical documents.
+func EncodeDocument(b *protocol.AcquisitionBundle) ([]byte, error) {
+	encoded, err := json.MarshalIndent(b, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	return append(encoded, '\n'), nil
+}
+
+// Document builds and validates the bundle for one ready job and returns it
+// without writing anything. bundle.export materialises; a ratified reader must
+// not, so the two phases are separated here rather than at the handler.
+func (e *Exporter) Document(ctx context.Context, jobID string) (*protocol.AcquisitionBundle, *job.Artifact, error) {
 	if e.Jobs == nil || e.Artifacts == nil {
-		return "", nil, errors.New("bundle exporter missing stores")
+		return nil, nil, errors.New("bundle exporter missing stores")
 	}
 	row, err := e.Jobs.Get(ctx, jobID)
 	if err != nil {
-		return "", nil, err
+		return nil, nil, err
 	}
 	if (row.State != job.StateReady && row.State != job.StateImported) || row.ArtifactSHA256 == "" {
-		return "", nil, fmt.Errorf("job %s is %s, not ready", jobID, row.State)
+		return nil, nil, fmt.Errorf("job %s is %s, not ready", jobID, row.State)
 	}
 	art, err := e.Jobs.GetArtifact(ctx, row.ArtifactSHA256)
 	if err != nil || art == nil {
 		if err == nil {
 			err = fmt.Errorf("job %s references missing artifact %s", jobID, row.ArtifactSHA256)
 		}
-		return "", nil, err
+		return nil, nil, err
 	}
 	if err := e.Artifacts.Verify(art.SHA256); err != nil {
-		return "", nil, err
+		return nil, nil, err
 	}
 	candidate, err := e.Jobs.CandidateForArtifact(ctx, jobID, art.SHA256)
 	if err != nil {
-		return "", nil, err
+		return nil, nil, err
 	}
 	if candidate == nil {
-		return "", nil, fmt.Errorf("artifact %s has no accepted candidate provenance", art.SHA256)
+		return nil, nil, fmt.Errorf("artifact %s has no accepted candidate provenance", art.SHA256)
 	}
 	// Identity is a per-acquisition finding: artifacts.identity_result is shared
 	// across every job holding the digest and is last-writer-wins, so a later
@@ -196,10 +208,10 @@ func (e *Exporter) Export(ctx context.Context, jobID, destination string) (strin
 	// (ADR-0007).
 	identity, err := e.Jobs.AcquisitionIdentity(ctx, jobID, art.SHA256)
 	if err != nil {
-		return "", nil, err
+		return nil, nil, err
 	}
 	if identity != "pass" && identity != "user_confirmed" {
-		return "", nil, fmt.Errorf("artifact identity is %q, not exportable", identity)
+		return nil, nil, fmt.Errorf("artifact identity is %q, not exportable", identity)
 	}
 
 	retrieved := art.CreatedAt
@@ -235,12 +247,21 @@ func (e *Exporter) Export(ctx context.Context, jobID, destination string) (strin
 	}
 	b.ProvenanceDigest, err = digest(b)
 	if err != nil {
-		return "", nil, err
+		return nil, nil, err
 	}
 	if err := b.Validate(); err != nil {
-		return "", nil, fmt.Errorf("bundle validation: %w", err)
+		return nil, nil, fmt.Errorf("bundle validation: %w", err)
 	}
+	return b, art, nil
+}
 
+// Export creates (or verifies and reuses) bundle.json and its relative
+// content-addressed artifact. An empty destination uses DataDir/bundles/<job>.
+func (e *Exporter) Export(ctx context.Context, jobID, destination string) (string, *protocol.AcquisitionBundle, error) {
+	b, art, err := e.Document(ctx, jobID)
+	if err != nil {
+		return "", nil, err
+	}
 	if destination == "" {
 		destination = filepath.Join(e.DataDir, "bundles", jobID)
 	}
@@ -277,11 +298,10 @@ func (e *Exporter) Export(ctx context.Context, jobID, destination string) (strin
 	if err != nil {
 		return rollback(err, false)
 	}
-	encoded, err := json.MarshalIndent(b, "", "  ")
+	encoded, err := EncodeDocument(b)
 	if err != nil {
 		return rollback(err, false)
 	}
-	encoded = append(encoded, '\n')
 	if err := atomicWrite(bundlePath, encoded, 0o600); err != nil {
 		return rollback(err, false)
 	}

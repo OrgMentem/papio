@@ -35,6 +35,22 @@ execution records in `notes/acquisition-stack-plan.md`.
   same `request_id` creates a new job, and `existing` means "a live job already
   owns this work", so a consumer resuming a run must persist the returned
   `job_id`. See ADR-0010.
+- **`bundle.document` and `artifacts.locate` are ratified, so a consumer can
+  collect what it acquired.** No ratified method could produce a bundle or
+  locate artifact bytes, leaving a consumer to call unratified names or read
+  *papio*'s data directory — which would make the on-disk layout a contract
+  nobody agreed to. Both are pure reads keyed on `job_id`. The two methods that
+  already existed were deliberately **not** the ones frozen: `artifacts.get`
+  returns the `job.Artifact` persistence struct including `identity_result`,
+  which is last-writer-wins across every job sharing a digest and which ADR-0007
+  forbids projecting from an artifact; and `bundle.export_v2` writes a directory
+  as a side effect and carries the bundle inline, which — because results reject
+  unknown fields recursively — would have frozen the document's shape into the
+  RPC contract and forced a new method name for every future bundle schema.
+  `bundle.document` returns the document as JSON text instead, byte-identical to
+  the exported `bundle.json`, so the bundle keeps evolving under its own
+  `schema_version`. Both remain served and unratified for existing callers. See
+  ADR-0011.
 - **Bundles now emit `acquisition-bundle/2`, adding `candidate.entitlement`.**
   It records the route by which access was obtained — `route`, an optional
   `entitlement_ref`, and `acquisition_mode` — and it is a route, never an

@@ -654,12 +654,26 @@ func newArtifactsCommand(opt *options) *cobra.Command {
 		},
 	}
 	get.Flags().BoolVar(&sha, "sha256", false, "interpret argument as an artifact hash")
+	locate := &cobra.Command{
+		Use:   "locate <job-id>",
+		Short: "Print where one job's validated artifact bytes live",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			var result api.ArtifactLocation
+			if err := opt.call(cmd.Context(), "artifacts.locate",
+				map[string]string{"job_id": args[0]}, &result); err != nil {
+				return err
+			}
+			return opt.printResult(result, "%s\t%s\t%d bytes", result.SHA256, result.Path, result.SizeBytes)
+		},
+	}
+	command.AddCommand(locate)
 	command.AddCommand(get)
 	return command
 }
 
 func newBundleCommand(opt *options) *cobra.Command {
-	command := &cobra.Command{Use: "bundle", Short: "Export validated acquisition bundles"}
+	command := &cobra.Command{Use: "bundle", Short: "Read and export validated acquisition bundles"}
 	var outputDir string
 	export := &cobra.Command{
 		Use:   "export <job-id>",
@@ -677,6 +691,23 @@ func newBundleCommand(opt *options) *cobra.Command {
 		},
 	}
 	export.Flags().StringVarP(&outputDir, "output", "o", "", "destination directory")
+	document := &cobra.Command{
+		Use:   "document <job-id>",
+		Short: "Print the acquisition bundle without writing it anywhere",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			var result api.DocumentResult
+			if err := opt.call(cmd.Context(), "bundle.document",
+				map[string]string{"job_id": args[0]}, &result); err != nil {
+				return err
+			}
+			// The document is already the exact bytes bundle.json is written
+			// with; re-encoding it would hand the operator something that no
+			// longer matches the provenance digest inside it.
+			return opt.printResult(result, "%s", result.Document)
+		},
+	}
+	command.AddCommand(document)
 	command.AddCommand(export)
 	return command
 }
