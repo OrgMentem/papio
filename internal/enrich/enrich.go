@@ -32,9 +32,11 @@ type HTTPClient interface {
 	Do(*http.Request) (*http.Response, error)
 }
 
-// Options configures an Enricher.
+// Options configures an Enricher. ContactEmail identifies papio to Crossref's
+// polite pool; it is the same address every other source client already sends.
 type Options struct {
 	Client           HTTPClient
+	ContactEmail     string
 	BaseURL          string
 	MaxResponseBytes int64
 }
@@ -43,6 +45,7 @@ type Options struct {
 // independently corroborated by the submitted work metadata.
 type Enricher struct {
 	client  HTTPClient
+	email   string
 	baseURL string
 	maxBody int64
 }
@@ -63,7 +66,10 @@ func NewWithOptions(opts Options) *Enricher {
 	if opts.MaxResponseBytes <= 0 {
 		opts.MaxResponseBytes = defaultMaxBody
 	}
-	return &Enricher{client: opts.Client, baseURL: strings.TrimRight(opts.BaseURL, "/"), maxBody: opts.MaxResponseBytes}
+	return &Enricher{
+		client: opts.Client, email: strings.TrimSpace(opts.ContactEmail),
+		baseURL: strings.TrimRight(opts.BaseURL, "/"), maxBody: opts.MaxResponseBytes,
+	}
 }
 
 // Enrich searches Crossref for a title-only work. It adopts only an exact
@@ -146,6 +152,9 @@ func (e *Enricher) searchURL(title string) (*url.URL, error) {
 	query := endpoint.Query()
 	query.Set("query.title", strings.TrimSpace(title))
 	query.Set("rows", "5")
+	if e.email != "" {
+		query.Set("mailto", e.email)
+	}
 	endpoint.RawQuery = query.Encode()
 	return endpoint, nil
 }
@@ -214,8 +223,19 @@ func matches(candidate record, requested work.Work) bool {
 	return false
 }
 
+// normalizeTitle folds the differences that never distinguish two works:
+// case, runs of whitespace, and terminal punctuation. The last one is not
+// cosmetic. APA and several other publishers deposit article titles with a
+// closing full stop ("...and well-being."), while citations and reference
+// managers almost never carry it, so an exact comparison rejected a perfect
+// match on one character. It cost Ryan & Deci 2000 — the most-cited work in
+// its literature — which papio reported as no_identifier despite Crossref
+// returning it at rank 0 with corroborating authors and year. Stripping is
+// applied to both sides, so it can only equate titles that were already
+// equal up to punctuation, and year plus author corroboration still gate the
+// adoption.
 func normalizeTitle(value string) string {
-	return strings.ToLower(strings.Join(strings.Fields(value), " "))
+	return strings.TrimRight(strings.ToLower(strings.Join(strings.Fields(value), " ")), ".,;:!?")
 }
 
 func authorFamily(value string) string {

@@ -201,7 +201,8 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 	service.Resolvers = entries
 	if cfg.SourcePolicy(config.SourceCrossrefMetadata).Enabled {
 		service.Enricher = enrich.NewWithOptions(enrich.Options{
-			Client: metadataClient, BaseURL: cfg.Sources[config.SourceCrossrefMetadata].BaseURLForDev,
+			Client: metadataClient, ContactEmail: cfg.Email,
+			BaseURL: cfg.Sources[config.SourceCrossrefMetadata].BaseURLForDev,
 		})
 	}
 	service.Fetch = func(ctx context.Context, candidate resolver.Candidate, path string) (fetch.Result, error) {
