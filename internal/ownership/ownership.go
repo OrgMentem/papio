@@ -385,18 +385,19 @@ func normalizeDOI(value string) string {
 	if !strings.HasPrefix(strings.ToLower(value), "10.") {
 		return ""
 	}
-	// A doubled slash names the same work. Legacy publisher deposits carry it
-	// (APA registered both 10.1037//0003-066x.55.1.68 and 10.1037/0003-066x.55.1.68
-	// for one article, and Crossref returns both), so a library holding one form
-	// answered "not held" for the other. Collapsing belongs here and not in
-	// work.NormalizeDOI: both forms are separately registered and resolvable, so
-	// acquisition must keep fetching exactly what it was asked for, while
-	// ownership asks whether it is the same work — and it is. Runs are collapsed
-	// only after the 10. check, so this can never rescue a host-confusion string
-	// such as doi.org.attacker.example//10.x, which is already rejected above.
-	for strings.Contains(value, "//") {
-		value = strings.ReplaceAll(value, "//", "/")
-	}
+	// A doubled slash is NOT a spelling of a single slash, however much it looks
+	// like one. DataCite holds 10.48612//monograph-2025-2 and
+	// 10.48612/monograph-2025-2 as two separately registered works with
+	// different titles by the same creators, so collapsing runs would merge two
+	// real names. That trade is not close: the duplicate acquisition it would
+	// prevent costs one wasted fetch, while a false merge answers "already held"
+	// for a work the library does not have and silently drops it — and, for a
+	// consumer verifying a citation, checks the claim against the wrong source.
+	// Some publishers do mint both forms for one article (APA deposited
+	// 10.1037//0003-066x.55.1.68 alongside 10.1037/0003-066x.55.1.68), so the
+	// duplicate is real; it is simply the cheaper error. Registry-level aliasing
+	// is the only sound way to tell the two cases apart, and papio does not do it.
+	//
 	// DOIs are case-insensitive; lowercase so an exported uppercase DOI still
 	// matches a resolver-supplied one.
 	return strings.ToLower(value)

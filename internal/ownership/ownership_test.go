@@ -7,6 +7,13 @@ import (
 	"time"
 )
 
+// A doubled slash survives normalization on purpose. DataCite holds
+// 10.48612//monograph-2025-2 and 10.48612/monograph-2025-2 as two separately
+// registered works with different titles, so collapsing runs merges two real
+// names — answering "already held" for a work the library does not have, and
+// pointing a citation check at the wrong source. Some publishers do mint both
+// forms for one article, so the duplicate this would prevent is real; it is
+// simply the far cheaper error. Verified against the live DataCite API.
 func TestNormalizeIdentifier(t *testing.T) {
 	cases := []struct {
 		name string
@@ -31,6 +38,8 @@ func TestNormalizeIdentifier(t *testing.T) {
 		{"isbn is not a matchable kind", Identifier{"isbn", "9780262035613"}, "", false},
 		{"unknown kind", Identifier{"openalex", "W123"}, "", false},
 		{"empty value", Identifier{KindDOI, "   "}, "", false},
+		{"doubled slash is a different registered work, never collapsed",
+			Identifier{KindDOI, "10.48612//monograph-2025-2"}, "doi:10.48612//monograph-2025-2", true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
