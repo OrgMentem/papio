@@ -57,7 +57,7 @@ func createTriageAction(t *testing.T, jobs *job.Store, requestID string) string 
 	if _, err := jobs.S.DB().ExecContext(context.Background(), `UPDATE jobs SET state = 'needs_review' WHERE id = ?`, id); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := jobs.OpenHumanAction(context.Background(), id, "verify_identity", "review the quarantined PDF",
+	if _, err := jobs.OpenHumanAction(context.Background(), id, "verify_identity", "review the quarantined PDF", job.Access(false, ""),
 		job.WithHumanActionBinding(job.HumanActionBinding{
 			CandidateID: 1, QuarantinePath: "/tmp/review.pdf",
 			QuarantineSHA256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -148,7 +148,7 @@ func TestHumanActionItemsCarryWorkIdentityAndCorrectOps(t *testing.T) {
 	if _, err := jobs.S.DB().ExecContext(ctx, `UPDATE jobs SET state = 'needs_review' WHERE id = ?`, unbound); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := jobs.OpenHumanAction(ctx, unbound, "verify_identity", "legacy row with no binding"); err != nil {
+	if _, err := jobs.OpenHumanAction(ctx, unbound, "verify_identity", "legacy row with no binding", job.Access(false, "")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -156,7 +156,7 @@ func TestHumanActionItemsCarryWorkIdentityAndCorrectOps(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := jobs.OpenHumanAction(ctx, manual, "manual_download", "a resolver returned a landing page"); err != nil {
+	if _, err := jobs.OpenHumanAction(ctx, manual, "manual_download", "a resolver returned a landing page", job.Access(false, "")); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := jobs.S.DB().ExecContext(ctx,
@@ -355,7 +355,7 @@ func createHandoffAcquiredJob(t *testing.T, jobs *job.Store, requestID string) s
 			t.Fatalf("%s->%s: %v", step[0], step[1], err)
 		}
 	}
-	if _, err := jobs.OpenHumanAction(ctx, id, "openurl_handoff", "handoff available"); err != nil {
+	if _, err := jobs.OpenHumanAction(ctx, id, "openurl_handoff", "handoff available", job.Access(false, "")); err != nil {
 		t.Fatal(err)
 	}
 	for _, step := range [][2]string{

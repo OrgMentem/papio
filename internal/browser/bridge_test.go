@@ -101,7 +101,7 @@ func park(t *testing.T, jobs *job.Store, reqID string, w work.Work) string {
 			t.Fatalf("%s->%s: %v", step[0], step[1], err)
 		}
 	}
-	if _, err := jobs.OpenHumanAction(ctx, id, handoffActionKind, "handoff available"); err != nil {
+	if _, err := jobs.OpenHumanAction(ctx, id, handoffActionKind, "handoff available", job.Access(false, "")); err != nil {
 		t.Fatal(err)
 	}
 	return id
@@ -126,7 +126,7 @@ func parkInstitutional(t *testing.T, jobs *job.Store, reqID string, w work.Work,
 		}
 	}
 	if _, err := jobs.OpenHumanAction(ctx, id, handoffActionKind, "handoff available",
-		job.WithAccessClassification(true, "paywall")); err != nil {
+		job.Access(true, "paywall")); err != nil {
 		t.Fatal(err)
 	}
 	return id
@@ -572,7 +572,7 @@ func statsAcquiredJob(t *testing.T, jobs *job.Store, requestID, accessBasis stri
 				t.Fatalf("%s->%s: %v", step[0], step[1], err)
 			}
 		}
-		if _, err := jobs.OpenHumanAction(ctx, id, "openurl_handoff", "handoff available"); err != nil {
+		if _, err := jobs.OpenHumanAction(ctx, id, "openurl_handoff", "handoff available", job.Access(false, "")); err != nil {
 			t.Fatal(err)
 		}
 		if err := jobs.Transition(ctx, id, job.StateAwaitingHuman, job.StateResolving, nil); err != nil {
@@ -808,7 +808,7 @@ func TestReviewPreviewAndResolveNeverLeakQuarantinePath(t *testing.T) {
 	if err := os.WriteFile(path, []byte("%PDF-preview"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	actionID, err := jobs.OpenHumanAction(context.Background(), id, "verify_identity", "review the PDF",
+	actionID, err := jobs.OpenHumanAction(context.Background(), id, "verify_identity", "review the PDF", job.Access(false, ""),
 		job.WithHumanActionBinding(job.HumanActionBinding{
 			CandidateID: 1, QuarantinePath: path, QuarantineSHA256: sha,
 		}))
@@ -890,7 +890,7 @@ func TestHumanActionResolveDismissClosesStaleNonReviewAction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	actionID, err := jobs.OpenHumanAction(context.Background(), id, "manual_download", "a resolver returned a landing page")
+	actionID, err := jobs.OpenHumanAction(context.Background(), id, "manual_download", "a resolver returned a landing page", job.Access(false, ""))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -932,7 +932,7 @@ func TestHumanActionResolveDismissCancelsAwaitingHandoff(t *testing.T) {
 	if err := jobs.Transition(context.Background(), id, job.StateResolving, job.StateAwaitingHuman, nil); err != nil {
 		t.Fatal(err)
 	}
-	actionID, err := jobs.OpenHumanAction(context.Background(), id, "manual_download", "a resolver returned a landing page")
+	actionID, err := jobs.OpenHumanAction(context.Background(), id, "manual_download", "a resolver returned a landing page", job.Access(false, ""))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1406,7 +1406,7 @@ func TestOABrowserHandoffOffersCandidateThenFallsBackToInstitution(t *testing.T)
 	b, jobs, cfg, _ := newBridge(t)
 	ctx := context.Background()
 	id := park(t, jobs, "wr_oa_fallback", handoffWork())
-	if _, err := jobs.OpenHumanAction(ctx, id, handoffActionKind, app.OABrowserHandoffActionDetail(oaURL)); err != nil {
+	if _, err := jobs.OpenHumanAction(ctx, id, handoffActionKind, app.OABrowserHandoffActionDetail(oaURL), job.Access(false, "")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -2084,7 +2084,7 @@ func manualProviderUpgradePark(t *testing.T, jobs *job.Store, requestID, extensi
 	if err := jobs.ResolveHumanAction(ctx, open[0].ID, "resolved"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := jobs.OpenHumanAction(ctx, id, "manual_download", "download the requested PDF yourself"); err != nil {
+	if _, err := jobs.OpenHumanAction(ctx, id, "manual_download", "download the requested PDF yourself", job.Access(false, "")); err != nil {
 		t.Fatal(err)
 	}
 	if err := jobs.RecordEvent(ctx, id, "browser.provider_outcome", map[string]any{
@@ -2171,7 +2171,7 @@ func TestProviderAdapterUpgradeRequeuesOnceForLiveRegistry(t *testing.T) {
 		map[string]any{"reason": "provider_repark"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := jobs.OpenHumanAction(ctx, id, "manual_download", "download the requested PDF yourself"); err != nil {
+	if _, err := jobs.OpenHumanAction(ctx, id, "manual_download", "download the requested PDF yourself", job.Access(false, "")); err != nil {
 		t.Fatal(err)
 	}
 	runSync(t, b, helloWithAdapterVersions(t, "0.8.0", map[string]string{"sage": "0.2.0"}))
@@ -2383,7 +2383,7 @@ func TestInstitutionalNoEntitlementRequeuesExactlyOnce(t *testing.T) {
 				t.Fatalf("first institutional action = %+v, want resolved", actions)
 			}
 
-			if _, err := jobs.OpenHumanAction(ctx, id, handoffActionKind, "handoff available"); err != nil {
+			if _, err := jobs.OpenHumanAction(ctx, id, handoffActionKind, "handoff available", job.Access(false, "")); err != nil {
 				t.Fatal(err)
 			}
 			if err := jobs.Transition(ctx, id, job.StateResolving, job.StateAwaitingHuman,
@@ -2434,7 +2434,7 @@ func TestRequeuedRouteNeverConvertsOAHandoffBackToInstitution(t *testing.T) {
 	}
 
 	// Rediscovery finds a bot-blocked OA alternate and re-parks with an OA action.
-	if _, err := jobs.OpenHumanAction(ctx, id, handoffActionKind, app.OABrowserHandoffActionDetail(oaURL)); err != nil {
+	if _, err := jobs.OpenHumanAction(ctx, id, handoffActionKind, app.OABrowserHandoffActionDetail(oaURL), job.Access(false, "")); err != nil {
 		t.Fatal(err)
 	}
 	if err := jobs.Transition(ctx, id, job.StateResolving, job.StateAwaitingHuman,
@@ -2852,7 +2852,7 @@ func parkWithPolicyMode(t *testing.T, jobs *job.Store, reqID, doi, mode string) 
 		}
 	}
 	if _, err := jobs.OpenHumanAction(ctx, id, handoffActionKind, "handoff available",
-		job.WithAccessClassification(true, "paywall")); err != nil {
+		job.Access(true, "paywall")); err != nil {
 		t.Fatal(err)
 	}
 	return id

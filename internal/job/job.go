@@ -977,12 +977,15 @@ func (js *Store) RepairAwaitingHuman(ctx context.Context, jobID string, actionID
 // human action. The lease and action predicates share one transaction so a
 // browser adopter that wins after maintenance reads cannot lose its download.
 func (js *Store) RepairParkWithAction(ctx context.Context, jobID, from, to string, actionIDs []int64,
-	actionKind, actionDetail string, detail map[string]any, opts ...OpenHumanActionOption,
+	actionKind, actionDetail string, detail map[string]any, access AccessClassification, opts ...OpenHumanActionOption,
 ) error {
 	if !allowed[from][to] {
 		return fmt.Errorf("%w: %s -> %s not allowed", ErrConflict, from, to)
 	}
 	var options openHumanActionOptions
+	if err := access.apply(&options); err != nil {
+		return err
+	}
 	for _, option := range opts {
 		if option == nil {
 			continue
@@ -2105,37 +2108,46 @@ func WithHumanActionBinding(binding HumanActionBinding) OpenHumanActionOption {
 	}
 }
 
-// WithAccessClassification records why the action exists: requiresAuth is
-// true when an authenticated institutional session is needed; blockedBy is
-// one of "anti_bot", "paywall", "landing_page", or "".
-func WithAccessClassification(requiresAuth bool, blockedBy string) OpenHumanActionOption {
-	return func(options *openHumanActionOptions) error {
-		switch blockedBy {
-		case "", "anti_bot", "paywall", "landing_page":
-		default:
-			return fmt.Errorf("invalid human action blocked_by %q", blockedBy)
-		}
-		options.requiresAuth = requiresAuth
-		options.blockedBy = blockedBy
-		return nil
-	}
+// AccessClassification records why a human action exists and whether finishing
+// it needs an authenticated institutional session.
+//
+// It is a required argument to OpenHumanAction rather than an option, and that
+// is the point of the type. As an option it was supplied at four of twelve call
+// sites; the rest silently took Go's zero value, which reads as "no sign-in
+// needed" — the one answer the access-mode safety check most needs to be right,
+// and it was wrong at two sites including the action the extension had
+// explicitly reported as auth-walled. Omission is now a compile error.
+type AccessClassification struct {
+	requiresAuth bool
+	blockedBy    string
+	inherit      bool
 }
 
-// WithInheritedResolvedHandoffAccessClassification keeps replacement guidance
-// honest after a browser handoff has already closed. A landing page can block
-// papio differently than the paywall did, but it cannot establish that the
-// user's institutional sign-in is no longer needed.
-func WithInheritedResolvedHandoffAccessClassification(blockedBy string) OpenHumanActionOption {
-	return func(options *openHumanActionOptions) error {
-		switch blockedBy {
-		case "", "anti_bot", "paywall", "landing_page":
-		default:
-			return fmt.Errorf("invalid human action blocked_by %q", blockedBy)
-		}
-		options.blockedBy = blockedBy
-		options.inheritResolvedHandoffAuth = true
-		return nil
+// Access states the classification outright. blockedBy is one of "anti_bot",
+// "paywall", "landing_page", or "".
+func Access(requiresAuth bool, blockedBy string) AccessClassification {
+	return AccessClassification{requiresAuth: requiresAuth, blockedBy: blockedBy}
+}
+
+// AccessInheritedFromResolvedHandoff keeps replacement guidance honest after a
+// browser handoff has already closed. A landing page can block papio
+// differently than the paywall did, but it cannot establish that the user's
+// institutional sign-in is no longer needed, so the prior handoff's answer is
+// carried forward and a missing one fails closed.
+func AccessInheritedFromResolvedHandoff(blockedBy string) AccessClassification {
+	return AccessClassification{blockedBy: blockedBy, inherit: true}
+}
+
+func (a AccessClassification) apply(options *openHumanActionOptions) error {
+	switch a.blockedBy {
+	case "", "anti_bot", "paywall", "landing_page":
+	default:
+		return fmt.Errorf("invalid human action blocked_by %q", a.blockedBy)
 	}
+	options.requiresAuth = a.requiresAuth
+	options.blockedBy = a.blockedBy
+	options.inheritResolvedHandoffAuth = a.inherit
+	return nil
 }
 
 func validSHA256(value string) bool {
@@ -2150,8 +2162,11 @@ func validSHA256(value string) bool {
 // OpenHumanAction records a required human step for a job. Re-parking the
 // same job and action kind refreshes the existing action rather than creating
 // another open prompt.
-func (js *Store) OpenHumanAction(ctx context.Context, jobID, kind, detail string, opts ...OpenHumanActionOption) (int64, error) {
+func (js *Store) OpenHumanAction(ctx context.Context, jobID, kind, detail string, access AccessClassification, opts ...OpenHumanActionOption) (int64, error) {
 	var options openHumanActionOptions
+	if err := access.apply(&options); err != nil {
+		return 0, err
+	}
 	for _, option := range opts {
 		if option == nil {
 			continue

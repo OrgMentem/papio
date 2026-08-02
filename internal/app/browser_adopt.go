@@ -176,14 +176,14 @@ func (s *Service) AdoptDownload(ctx context.Context, jobID, path string) error {
 		// adoption sweep never scans it — with an action telling the user to
 		// remove or replace the file so the loop cannot spin.
 		if _, err := s.Jobs.OpenHumanAction(ctx, jobID, "manual_download",
-			"the adopted download failed validation and could not be quarantined; remove or replace the file in the adoption directory"); err != nil {
+			"the adopted download failed validation and could not be quarantined; remove or replace the file in the adoption directory", job.Access(false, "")); err != nil {
 			return err
 		}
 		return s.park(ctx, jobID, job.StateFetching, job.StateNeedsReview,
 			map[string]any{"reason": "adopted_download_rejected_unquarantined"})
 	}
 	if _, err := s.Jobs.OpenHumanAction(ctx, jobID, "manual_download",
-		"the adopted download failed validation; please supply a different file"); err != nil {
+		"the adopted download failed validation; please supply a different file", job.Access(false, "")); err != nil {
 		return err
 	}
 	return s.park(ctx, jobID, job.StateFetching, job.StateAwaitingHuman,

@@ -673,7 +673,7 @@ func TestRouterActionsOpenQueuesCompatibleHandoff(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if _, err := system.Jobs.OpenHumanAction(ctx, id, "openurl_handoff", app.OABrowserHandoffActionDetail("https://oa.example.test/focus.pdf")); err != nil {
+	if _, err := system.Jobs.OpenHumanAction(ctx, id, "openurl_handoff", app.OABrowserHandoffActionDetail("https://oa.example.test/focus.pdf"), job.Access(false, "")); err != nil {
 		t.Fatal(err)
 	}
 	router := Router(system)
@@ -790,7 +790,7 @@ func TestRouterResolveIdentityReviewAction(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	actionID, err := system.Jobs.OpenHumanAction(ctx, id, "verify_identity", "local quarantine file: /tmp/review.pdf")
+	actionID, err := system.Jobs.OpenHumanAction(ctx, id, "verify_identity", "local quarantine file: /tmp/review.pdf", job.Access(false, ""))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -809,7 +809,7 @@ func TestRouterResolveIdentityReviewAction(t *testing.T) {
 		t.Fatalf("invalid verdict error = %+v", rpcErr)
 	}
 
-	wrongID, err := system.Jobs.OpenHumanAction(ctx, id, "manual_download", "not an identity review")
+	wrongID, err := system.Jobs.OpenHumanAction(ctx, id, "manual_download", "not an identity review", job.Access(false, ""))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1157,7 +1157,7 @@ func TestRepairAwaitingHumanIsOrphanOnly(t *testing.T) {
 	}
 
 	withAction := park(t, "repair_with_action")
-	if _, err := system.Jobs.OpenHumanAction(ctx, withAction, "openurl_handoff", "institutional handoff"); err != nil {
+	if _, err := system.Jobs.OpenHumanAction(ctx, withAction, "openurl_handoff", "institutional handoff", job.Access(false, "")); err != nil {
 		t.Fatal(err)
 	}
 	result = RepairResult{}
@@ -1197,7 +1197,7 @@ func TestListV2ReportsTruncationAsAProof(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := system.Jobs.OpenHumanAction(ctx, id, "openurl_handoff", "handoff"); err != nil {
+		if _, err := system.Jobs.OpenHumanAction(ctx, id, "openurl_handoff", "handoff", job.Access(false, "")); err != nil {
 			t.Fatal(err)
 		}
 	}

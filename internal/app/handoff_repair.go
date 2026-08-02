@@ -104,7 +104,7 @@ func (r *HandoffRepairer) RunDue(ctx context.Context) error {
 			record(s.Jobs.RepairParkWithAction(ctx, row.ID, job.StateNeedsReview, job.StateAwaitingHuman, nil,
 				"manual_download", "the browser handoff did not produce a file; download the requested PDF yourself and papio will adopt it",
 				map[string]any{"reason": "stranded_handoff_repair"},
-				job.WithInheritedResolvedHandoffAccessClassification("landing_page")))
+				job.AccessInheritedFromResolvedHandoff("landing_page")))
 			continue
 		}
 		if len(open) == 0 {

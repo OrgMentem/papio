@@ -52,7 +52,7 @@ func TestSchedulerSweepsOnlyTerminalQuarantine(t *testing.T) {
 	if err := jobs.Transition(ctx, reviewID, job.StateResolving, job.StateNeedsReview, nil); err != nil {
 		t.Fatalf("review resolving->needs_review: %v", err)
 	}
-	if _, err := jobs.OpenHumanAction(ctx, reviewID, "verify_identity", "inspect quarantine PDF"); err != nil {
+	if _, err := jobs.OpenHumanAction(ctx, reviewID, "verify_identity", "inspect quarantine PDF", job.Access(false, "")); err != nil {
 		t.Fatalf("open review action: %v", err)
 	}
 

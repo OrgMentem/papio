@@ -61,7 +61,7 @@ func TestRatifiedConsumerContract(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, err := system.Jobs.OpenHumanAction(ctx, id, "openurl_handoff", "handoff"); err != nil {
+			if _, err := system.Jobs.OpenHumanAction(ctx, id, "openurl_handoff", "handoff", job.Access(false, "")); err != nil {
 				t.Fatal(err)
 			}
 		}

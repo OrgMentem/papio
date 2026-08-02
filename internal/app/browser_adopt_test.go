@@ -373,7 +373,7 @@ func TestAdoptDownloadResolvesSatisfiedHandoffActions(t *testing.T) {
 	}
 	ctx := context.Background()
 	id := parkAwaitingHuman(t, jobs, "wr_adopt_resolves_handoff")
-	handoffID, err := jobs.OpenHumanAction(ctx, id, "openurl_handoff", "institutional handoff")
+	handoffID, err := jobs.OpenHumanAction(ctx, id, "openurl_handoff", "institutional handoff", job.Access(false, ""))
 	if err != nil {
 		t.Fatal(err)
 	}

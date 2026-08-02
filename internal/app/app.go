@@ -894,7 +894,7 @@ func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[st
 	if manual && oaBrowserURL == "" {
 		if _, err := s.Jobs.OpenHumanAction(ctx, row.ID, "manual_download",
 			"a resolver returned a landing page but no verified direct PDF",
-			job.WithAccessClassification(manualRequiresAuth, "landing_page")); err != nil {
+			job.Access(manualRequiresAuth, "landing_page")); err != nil {
 			return err
 		}
 		return s.park(ctx, row.ID, job.StateFetching, job.StateAwaitingHuman,
@@ -1044,7 +1044,7 @@ func (s *Service) exhaustedCandidates(ctx context.Context, row *job.Row, from, r
 	switch mode {
 	case config.ModeAssisted, config.ModeDelegated:
 		if oaBrowserURL != "" {
-			if _, err := s.Jobs.OpenHumanAction(ctx, row.ID, "openurl_handoff", OABrowserHandoffActionDetail(oaBrowserURL), job.WithAccessClassification(false, "anti_bot")); err != nil {
+			if _, err := s.Jobs.OpenHumanAction(ctx, row.ID, "openurl_handoff", OABrowserHandoffActionDetail(oaBrowserURL), job.Access(false, "anti_bot")); err != nil {
 				return err
 			}
 			return s.park(ctx, row.ID, from, job.StateAwaitingHuman,
@@ -1062,7 +1062,7 @@ func (s *Service) exhaustedCandidates(ctx context.Context, row *job.Row, from, r
 		case !row.Work.HasFetchableIdentifier():
 			reason, terminal = "no_identifier", job.TerminalReasonNoIdentifier
 		case hasBase && base != "" && !institutionalExhausted:
-			if _, err := s.Jobs.OpenHumanAction(ctx, row.ID, "openurl_handoff", InstitutionalOpenURLHandoffDetail, job.WithAccessClassification(true, "paywall")); err != nil {
+			if _, err := s.Jobs.OpenHumanAction(ctx, row.ID, "openurl_handoff", InstitutionalOpenURLHandoffDetail, job.Access(true, "paywall")); err != nil {
 				return err
 			}
 			return s.park(ctx, row.ID, from, job.StateAwaitingHuman,
@@ -1074,7 +1074,10 @@ func (s *Service) exhaustedCandidates(ctx context.Context, row *job.Row, from, r
 		// Same gate: an OpenURL built from a bare title is not worth surfacing.
 		if base, ok := s.Config.OpenURLBaseFor(row.Policy.Resolver); ok && base != "" && row.Work.HasFetchableIdentifier() {
 			if _, err := s.Jobs.OpenHumanAction(ctx, row.ID, "openurl_available",
-				"no direct candidates; institutional OpenURL available but not opened in conservative mode"); err != nil {
+				"no direct candidates; institutional OpenURL available but not opened in conservative mode",
+				// An advisory, not a sign-in prompt: it exists precisely to say
+				// that institutional access was NOT opened.
+				job.Access(false, "")); err != nil {
 				return err
 			}
 		}
@@ -1099,7 +1102,7 @@ func (s *Service) validateCandidate(ctx context.Context, row *job.Row, stored *j
 			return false, false, ctx.Err()
 		}
 		_ = s.Jobs.FinishAttempt(ctx, attempt, "needs_review", 0, safeType(validateErr))
-		_, _ = s.Jobs.OpenHumanAction(ctx, row.ID, "validation_error", "PDF validation could not complete within configured bounds")
+		_, _ = s.Jobs.OpenHumanAction(ctx, row.ID, "validation_error", "PDF validation could not complete within configured bounds", job.Access(false, ""))
 		if err := s.Jobs.MarkCandidate(ctx, stored.ID, "skipped"); err != nil {
 			return false, false, err
 		}
@@ -1118,7 +1121,7 @@ func (s *Service) validateCandidate(ctx context.Context, row *job.Row, stored *j
 	case report.Structural.Encrypted || active:
 		_ = s.Jobs.FinishAttempt(ctx, attempt, "needs_review", 0, "encrypted_or_active_content")
 		_ = s.Jobs.MarkCandidate(ctx, stored.ID, "skipped")
-		_, _ = s.Jobs.OpenHumanAction(ctx, row.ID, "unsafe_pdf", "PDF is encrypted or contains active/embedded content")
+		_, _ = s.Jobs.OpenHumanAction(ctx, row.ID, "unsafe_pdf", "PDF is encrypted or contains active/embedded content", job.Access(false, ""))
 		return false, true, s.park(ctx, row.ID, job.StateValidating, job.StateNeedsReview,
 			map[string]any{"reason": "encrypted_or_active_content"})
 	case needsIdentityReview && !stored.ReviewOverride:
@@ -1126,6 +1129,7 @@ func (s *Service) validateCandidate(ctx context.Context, row *job.Row, stored *j
 		_ = s.Jobs.MarkCandidate(ctx, stored.ID, "skipped")
 		if _, err := s.Jobs.OpenHumanAction(ctx, row.ID, "verify_identity",
 			fmt.Sprintf("PDF text or identity requires human verification; local quarantine file: %s", result.TempPath),
+			job.Access(false, ""),
 			job.WithHumanActionBinding(job.HumanActionBinding{
 				CandidateID: stored.ID, QuarantinePath: result.TempPath, QuarantineSHA256: result.SHA256,
 			}),

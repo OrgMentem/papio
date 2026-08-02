@@ -25,7 +25,7 @@ func openReminderActionKind(t *testing.T, svc *Service, jobs *job.Store, request
 		t.Fatal(err)
 	}
 	actionID, err := jobs.OpenHumanAction(ctx, row.ID, kind, "human action",
-		job.WithAccessClassification(requiresAuth, "paywall"))
+		job.Access(requiresAuth, "paywall"))
 	if err != nil {
 		t.Fatal(err)
 	}

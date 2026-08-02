@@ -380,7 +380,7 @@ func TestCancelClosesAllOpenHumanActions(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, kind := range []string{"openurl_handoff", "verify_identity"} {
-		if _, err := js.OpenHumanAction(ctx, id, kind, "pending"); err != nil {
+		if _, err := js.OpenHumanAction(ctx, id, kind, "pending", Access(false, "")); err != nil {
 			t.Fatalf("open %s action: %v", kind, err)
 		}
 	}
@@ -412,7 +412,7 @@ func TestReadyTransitionResolvesOpenHumanActions(t *testing.T) {
 	if err := js.Transition(ctx, id, StateQueued, StateResolving, nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := js.OpenHumanAction(ctx, id, "openurl_handoff", "pending"); err != nil {
+	if _, err := js.OpenHumanAction(ctx, id, "openurl_handoff", "pending", Access(false, "")); err != nil {
 		t.Fatal(err)
 	}
 	if err := js.Transition(ctx, id, StateResolving, StateReady, nil); err != nil {
@@ -458,7 +458,7 @@ func TestCloseStaleHumanActionsClosesOnlyTerminalJobs(t *testing.T) {
 		} else if err := js.Transition(ctx, id, StateResolving, state, nil); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := js.OpenHumanAction(ctx, id, "stale_"+state, "stale"); err != nil {
+		if _, err := js.OpenHumanAction(ctx, id, "stale_"+state, "stale", Access(false, "")); err != nil {
 			t.Fatal(err)
 		}
 		terminalIDs[id] = true
@@ -473,7 +473,7 @@ func TestCloseStaleHumanActionsClosesOnlyTerminalJobs(t *testing.T) {
 	if err := js.Transition(ctx, awaitingID, StateResolving, StateAwaitingHuman, nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := js.OpenHumanAction(ctx, awaitingID, "manual_download", "pending"); err != nil {
+	if _, err := js.OpenHumanAction(ctx, awaitingID, "manual_download", "pending", Access(false, "")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -511,7 +511,7 @@ func TestConservativeAdvisorySurvivesTerminalCloseAndSweep(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Conservative mode records the advisory, then ends the job unavailable.
-	if _, err := js.OpenHumanAction(ctx, id, "openurl_available", "not opened in conservative mode"); err != nil {
+	if _, err := js.OpenHumanAction(ctx, id, "openurl_available", "not opened in conservative mode", Access(false, "")); err != nil {
 		t.Fatal(err)
 	}
 	if err := js.Transition(ctx, id, StateResolving, StateUnavailable, nil); err != nil {
@@ -542,7 +542,7 @@ func TestRetryClearsTheConservativeAdvisory(t *testing.T) {
 	if err := js.Transition(ctx, id, StateQueued, StateResolving, nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := js.OpenHumanAction(ctx, id, "openurl_available", "not opened in conservative mode"); err != nil {
+	if _, err := js.OpenHumanAction(ctx, id, "openurl_available", "not opened in conservative mode", Access(false, "")); err != nil {
 		t.Fatal(err)
 	}
 	if err := js.Transition(ctx, id, StateResolving, StateUnavailable, nil); err != nil {
@@ -577,18 +577,18 @@ func TestOpenHumanActionRefreshesExistingOpenKind(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	firstID, err := js.OpenHumanAction(ctx, id, "terms_acceptance_required", "first detail")
+	firstID, err := js.OpenHumanAction(ctx, id, "terms_acceptance_required", "first detail", Access(false, ""))
 	if err != nil {
 		t.Fatal(err)
 	}
-	secondID, err := js.OpenHumanAction(ctx, id, "terms_acceptance_required", "latest detail")
+	secondID, err := js.OpenHumanAction(ctx, id, "terms_acceptance_required", "latest detail", Access(false, ""))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if secondID != firstID {
 		t.Fatalf("second action ID = %d, want existing ID %d", secondID, firstID)
 	}
-	otherID, err := js.OpenHumanAction(ctx, id, "openurl_handoff", "other detail")
+	otherID, err := js.OpenHumanAction(ctx, id, "openurl_handoff", "other detail", Access(false, ""))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -676,7 +676,7 @@ func TestRepairParkWithActionLeavesLateLeaseUntouched(t *testing.T) {
 	err = js.RepairParkWithAction(ctx, id, StateNeedsReview, StateAwaitingHuman, nil,
 		"manual_download", "download the requested PDF yourself",
 		map[string]any{"reason": "stranded_handoff_repair"},
-		WithAccessClassification(false, "landing_page"))
+		Access(false, "landing_page"))
 	if !errors.Is(err, ErrConflict) {
 		t.Fatalf("repair after adoption lease = %v, want ErrConflict", err)
 	}
@@ -732,7 +732,7 @@ func parkIdentityReview(t *testing.T, js *Store, requestID string) (string, int6
 	if err := js.MarkCandidate(ctx, candidate.ID, "skipped"); err != nil {
 		t.Fatal(err)
 	}
-	actionID, err := js.OpenHumanAction(ctx, id, "verify_identity", "local quarantine file: /tmp/paper.pdf",
+	actionID, err := js.OpenHumanAction(ctx, id, "verify_identity", "local quarantine file: /tmp/paper.pdf", Access(false, ""),
 		WithHumanActionBinding(HumanActionBinding{
 			CandidateID: candidate.ID, QuarantinePath: "/tmp/paper.pdf",
 			QuarantineSHA256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -877,7 +877,7 @@ func TestDismissHumanActionClosesStaleHandoffWithoutCancellingNeedsReview(t *tes
 		quarantine, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", reviewID); err != nil {
 		t.Fatal(err)
 	}
-	handoffID, err := js.OpenHumanAction(ctx, id, "openurl_handoff", "stale handoff")
+	handoffID, err := js.OpenHumanAction(ctx, id, "openurl_handoff", "stale handoff", Access(false, ""))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -929,7 +929,7 @@ func TestDismissHumanActionCancelsAwaitingHandoff(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	actionID, err := js.OpenHumanAction(ctx, id, "openurl_handoff", "institutional handoff")
+	actionID, err := js.OpenHumanAction(ctx, id, "openurl_handoff", "institutional handoff", Access(false, ""))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -977,7 +977,7 @@ func TestDismissHumanActionWorksWithoutQuarantineBinding(t *testing.T) {
 	if _, err := js.S.DB().ExecContext(ctx, `UPDATE jobs SET state = 'needs_review' WHERE id = ?`, id); err != nil {
 		t.Fatal(err)
 	}
-	actionID, err := js.OpenHumanAction(ctx, id, "verify_identity", "legacy row with no binding")
+	actionID, err := js.OpenHumanAction(ctx, id, "verify_identity", "legacy row with no binding", Access(false, ""))
 	if err != nil {
 		t.Fatal(err)
 	}

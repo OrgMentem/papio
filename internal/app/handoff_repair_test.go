@@ -67,7 +67,7 @@ func TestHandoffRepairerHealsStrandedParks(t *testing.T) {
 		svc.Config.Browser.OpenURLBase = "https://resolver.example.edu/openurl"
 		row := parkedHandoffJob(t, svc, jobs, "request_contradicted_park")
 		if _, err := jobs.OpenHumanAction(ctx, row.ID, "openurl_handoff", InstitutionalOpenURLHandoffDetail,
-			job.WithAccessClassification(true, "paywall")); err != nil {
+			job.Access(true, "paywall")); err != nil {
 			t.Fatal(err)
 		}
 		if err := jobs.RecordEvent(ctx, row.ID, "browser.no_entitlement_requeue", map[string]any{"outcome": "no_entitlement"}); err != nil {
@@ -111,7 +111,7 @@ func TestHandoffRepairerHealsStrandedParks(t *testing.T) {
 		svc.Config.AccessMode = config.ModeDelegated
 		row := parkedHandoffJob(t, svc, jobs, "request_fresh_park")
 		if _, err := jobs.OpenHumanAction(ctx, row.ID, "openurl_handoff", InstitutionalOpenURLHandoffDetail,
-			job.WithAccessClassification(true, "paywall")); err != nil {
+			job.Access(true, "paywall")); err != nil {
 			t.Fatal(err)
 		}
 
@@ -135,7 +135,7 @@ func TestHandoffRepairerHealsStrandedParks(t *testing.T) {
 		svc.Config.AccessMode = config.ModeDelegated
 		row := parkedHandoffJob(t, svc, jobs, "request_oa_park")
 		if _, err := jobs.OpenHumanAction(ctx, row.ID, "openurl_handoff", OABrowserHandoffActionDetail("https://oa.example.org/alt.pdf"),
-			job.WithAccessClassification(false, "anti_bot")); err != nil {
+			job.Access(false, "anti_bot")); err != nil {
 			t.Fatal(err)
 		}
 		if err := jobs.RecordEvent(ctx, row.ID, "browser.no_entitlement_requeue", map[string]any{"outcome": "no_entitlement"}); err != nil {
@@ -195,7 +195,7 @@ func TestHandoffRepairerHealsStrandedNeedsReview(t *testing.T) {
 				svc.Now = func() time.Time { return now }
 				row := resolvingExhaustionJob(t, svc, jobs, fmt.Sprintf("request_resolved_handoff_%t", requiresAuth))
 				olderHandoffID, err := jobs.OpenHumanAction(ctx, row.ID, "openurl_handoff", InstitutionalOpenURLHandoffDetail,
-					job.WithAccessClassification(!requiresAuth, "paywall"))
+					job.Access(!requiresAuth, "paywall"))
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -205,7 +205,7 @@ func TestHandoffRepairerHealsStrandedNeedsReview(t *testing.T) {
 					t.Fatal(err)
 				}
 				handoffID, err := jobs.OpenHumanAction(ctx, row.ID, "openurl_handoff", InstitutionalOpenURLHandoffDetail,
-					job.WithAccessClassification(requiresAuth, "paywall"))
+					job.Access(requiresAuth, "paywall"))
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -269,7 +269,7 @@ func TestHandoffRepairerHealsStrandedNeedsReview(t *testing.T) {
 		svc.Now = func() time.Time { return now }
 		row := strandedNeedsReviewJob(t, svc, jobs, "request_identity_review")
 		setHandoffRepairUpdatedAt(t, jobs, row.ID, now.Add(-strandedNeedsReviewMinAge-time.Second))
-		if _, err := jobs.OpenHumanAction(ctx, row.ID, "verify_identity", "inspect the quarantined download"); err != nil {
+		if _, err := jobs.OpenHumanAction(ctx, row.ID, "verify_identity", "inspect the quarantined download", job.Access(false, "")); err != nil {
 			t.Fatal(err)
 		}
 
@@ -352,7 +352,7 @@ func TestHandoffRepairerLeavesLateAdoptionLeaseUntouched(t *testing.T) {
 	svc, jobs := newTestService(t)
 	row := parkedHandoffJob(t, svc, jobs, "request_late_adoption_lease")
 	actionID, err := jobs.OpenHumanAction(ctx, row.ID, "openurl_handoff", InstitutionalOpenURLHandoffDetail,
-		job.WithAccessClassification(true, "paywall"))
+		job.Access(true, "paywall"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -411,7 +411,7 @@ func TestHandoffRepairerReachesOldestParkBeyondMaintenancePage(t *testing.T) {
 	for i := range job.ListLimitMax {
 		row := parkedHandoffJob(t, svc, jobs, fmt.Sprintf("request_newer_handoff_%03d", i))
 		if _, err := jobs.OpenHumanAction(ctx, row.ID, "openurl_handoff", InstitutionalOpenURLHandoffDetail,
-			job.WithAccessClassification(true, "paywall")); err != nil {
+			job.Access(true, "paywall")); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := jobs.S.DB().ExecContext(ctx, `UPDATE jobs SET created_at = ? WHERE id = ?`,
@@ -436,7 +436,7 @@ func providerUpgradePark(t *testing.T, svc *Service, jobs *job.Store, requestID,
 	t.Helper()
 	ctx := context.Background()
 	row := parkedHandoffJob(t, svc, jobs, requestID)
-	if _, err := jobs.OpenHumanAction(ctx, row.ID, "manual_download", "download the requested PDF yourself"); err != nil {
+	if _, err := jobs.OpenHumanAction(ctx, row.ID, "manual_download", "download the requested PDF yourself", job.Access(false, "")); err != nil {
 		t.Fatal(err)
 	}
 	if err := jobs.RecordEvent(ctx, row.ID, "browser.provider_outcome", map[string]any{
@@ -501,7 +501,7 @@ func TestHandoffRepairerRepairsAdapterUpgradeParks(t *testing.T) {
 			map[string]any{"reason": "provider_repark"}); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := jobs.OpenHumanAction(ctx, row.ID, "manual_download", "download the requested PDF yourself"); err != nil {
+		if _, err := jobs.OpenHumanAction(ctx, row.ID, "manual_download", "download the requested PDF yourself", job.Access(false, "")); err != nil {
 			t.Fatal(err)
 		}
 		if err := svc.HandoffRepairer().RepairAdapterUpgrade(ctx, "0.8.0", newer); err != nil {
@@ -566,7 +566,7 @@ func TestHandoffRepairerRepairsAdapterUpgradeParks(t *testing.T) {
 				if err := jobs.ResolveHumanAction(ctx, actions[0].ID, "resolved"); err != nil {
 					t.Fatal(err)
 				}
-				if _, err := jobs.OpenHumanAction(ctx, row.ID, "verify_identity", "inspect the quarantined download"); err != nil {
+				if _, err := jobs.OpenHumanAction(ctx, row.ID, "verify_identity", "inspect the quarantined download", job.Access(false, "")); err != nil {
 					t.Fatal(err)
 				}
 			},

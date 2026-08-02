@@ -158,7 +158,7 @@ func TestRepairHealsAPreExistingHandoffForAnUnfetchableWork(t *testing.T) {
 	// Reconstruct the pre-fix state: parked awaiting_human on an institutional
 	// handoff that no sign-in can complete.
 	if _, err := jobs.OpenHumanAction(ctx, id, "openurl_handoff", InstitutionalOpenURLHandoffDetail,
-		job.WithAccessClassification(true, "paywall")); err != nil {
+		job.Access(true, "paywall")); err != nil {
 		t.Fatal(err)
 	}
 	if err := jobs.Transition(ctx, id, job.StateQueued, job.StateResolving,

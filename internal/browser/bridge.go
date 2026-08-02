@@ -1483,7 +1483,7 @@ func (b *Bridge) outcome(ctx context.Context, jobID string, p *protocol.Provider
 		// The page, rather than the original paywall, now blocks papio; whether
 		// that page needs a sign-in remains the resolved handoff's classification.
 		_, err = b.jobs.OpenHumanAction(ctx, jobID, "manual_download", detail,
-			job.WithAccessClassification(requiresAuth, "landing_page"))
+			job.Access(requiresAuth, "landing_page"))
 		return err
 
 	case "rate_limited":
@@ -1520,7 +1520,7 @@ func (b *Bridge) outcome(ctx context.Context, jobID string, p *protocol.Provider
 		// is needed is what this field exists to prevent.
 		_, err = b.jobs.OpenHumanAction(ctx, jobID, p.Outcome,
 			"the provider requires a human step before the download can proceed",
-			job.WithAccessClassification(true, "paywall"))
+			job.Access(true, "paywall"))
 		return err
 
 	default:
@@ -2018,7 +2018,7 @@ func (b *Bridge) fallbackOAHandoff(ctx context.Context, jobID, failure string) (
 			}
 			return true, nil
 		}
-		if _, err := b.jobs.OpenHumanAction(ctx, jobID, handoffActionKind, app.InstitutionalOpenURLHandoffDetail, job.WithAccessClassification(true, "paywall")); err != nil {
+		if _, err := b.jobs.OpenHumanAction(ctx, jobID, handoffActionKind, app.InstitutionalOpenURLHandoffDetail, job.Access(true, "paywall")); err != nil {
 			return false, err
 		}
 		if err := b.jobs.RecordEvent(ctx, jobID, "browser.oa_handoff_fallback", map[string]any{"reason": failure}); err != nil {

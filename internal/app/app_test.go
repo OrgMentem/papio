@@ -264,7 +264,7 @@ func TestForceSubmissionWithdrawsTheSupersededVerdict(t *testing.T) {
 	}
 	terminalizeSubmitDedupJob(t, jobs, first.JobID, job.StateUnavailable)
 	if _, err := jobs.OpenHumanAction(ctx, first.JobID, "openurl_available",
-		"no direct candidates; institutional OpenURL available but not opened in conservative mode"); err != nil {
+		"no direct candidates; institutional OpenURL available but not opened in conservative mode", job.Access(false, "")); err != nil {
 		t.Fatal(err)
 	}
 	second, err := svc.SubmitWithOptions(ctx, submitDedupRequest("request_supersede_0002"), SubmitOptions{Force: true})

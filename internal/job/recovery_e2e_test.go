@@ -79,7 +79,7 @@ func TestRecoverStaleRewindsDurableBoundariesAndSweepsTerminalQuarantine(t *test
 	if err := jobs.Transition(ctx, needsReviewID, StateResolving, StateNeedsReview, nil); err != nil {
 		t.Fatalf("review resolving->needs_review: %v", err)
 	}
-	if _, err := jobs.OpenHumanAction(ctx, needsReviewID, "verify_identity", "inspect quarantine file"); err != nil {
+	if _, err := jobs.OpenHumanAction(ctx, needsReviewID, "verify_identity", "inspect quarantine file", Access(false, "")); err != nil {
 		t.Fatalf("open review action: %v", err)
 	}
 
@@ -93,7 +93,7 @@ func TestRecoverStaleRewindsDurableBoundariesAndSweepsTerminalQuarantine(t *test
 	if err := jobs.Transition(ctx, awaitingID, StateResolving, StateAwaitingHuman, nil); err != nil {
 		t.Fatalf("awaiting resolving->awaiting_human: %v", err)
 	}
-	if _, err := jobs.OpenHumanAction(ctx, awaitingID, "manual_download", "wait for user-selected file"); err != nil {
+	if _, err := jobs.OpenHumanAction(ctx, awaitingID, "manual_download", "wait for user-selected file", Access(false, "")); err != nil {
 		t.Fatalf("open awaiting action: %v", err)
 	}
 
