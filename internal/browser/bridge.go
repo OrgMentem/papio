@@ -1507,8 +1507,20 @@ func (b *Bridge) outcome(ctx context.Context, jobID string, p *protocol.Provider
 		}
 		// Still legitimately in progress: keep the job parked and add the
 		// specific human action the extension observed.
+		//
+		// Both outcomes classify as requiring authentication, but only one of
+		// them is knowable. human_auth_required is explicit — the extension has
+		// observed an auth wall — and recording it unclassified left the field
+		// meaning "no sign-in needed" for the one action that most certainly
+		// needs one. terms_acceptance_required is genuinely ambiguous: terms can
+		// sit behind institutional auth, on a public page, or behind a free
+		// account, and the payload carries nothing to tell them apart. It fails
+		// closed rather than becoming a third stored value, because wrongly
+		// asking a human to sign in costs a prompt while wrongly asserting none
+		// is needed is what this field exists to prevent.
 		_, err = b.jobs.OpenHumanAction(ctx, jobID, p.Outcome,
-			"the provider requires a human step before the download can proceed")
+			"the provider requires a human step before the download can proceed",
+			job.WithAccessClassification(true, "paywall"))
 		return err
 
 	default:

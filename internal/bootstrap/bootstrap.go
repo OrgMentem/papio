@@ -372,6 +372,22 @@ func resolverEntries(cfg config.Config, client *fetch.SecureHTTPClient) []app.Re
 	}
 }
 
+// discoveryPolicy is the budget policy for a discovery backend: the source's
+// pacing and spend ceiling, but always enabled.
+//
+// Selection in discovery.sources IS discovery's enablement. sources.<n>.enabled
+// governs the acquisition resolver chain, and the two are independent — the
+// shipped default has discovery falling back to OpenAlex while the OpenAlex
+// ACQUISITION source is disabled. Feeding that flag to Acquire vetoed every
+// discovery request on a default config, which is a backend built and then
+// silently refused. Pacing and cost still come from the source because they
+// describe the provider, which both callers share.
+func discoveryPolicy(cfg config.Config, name string) config.Source {
+	policy := cfg.SourcePolicy(name)
+	policy.Enabled = true
+	return policy
+}
+
 // discoverySources builds the discovery backends. Each is given the shared
 // secure HTTP client wrapped in its source's budget gate, so discovery is
 // accounted for, paced and paused exactly like the acquisition resolvers that
@@ -384,8 +400,7 @@ func discoverySources(cfg config.Config, budgets *budget.Manager, client sourceg
 	}
 	sources := make([]discovery.Source, 0, len(names))
 	for _, name := range names {
-		policy := cfg.SourcePolicy(name)
-		gated := sourcegate.New(budgets, name, policy, 0, client)
+		gated := sourcegate.New(budgets, name, discoveryPolicy(cfg, name), 0, client)
 		switch name {
 		case config.SourceOpenAlex:
 			sources = append(sources, discovery.NewWithOptions(discovery.Options{
