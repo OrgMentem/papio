@@ -38,6 +38,7 @@ import (
 	"papio/internal/resolvers/openalex"
 	"papio/internal/resolvers/unpaywall"
 	"papio/internal/retraction"
+	"papio/internal/sourcegate"
 	"papio/internal/store"
 	"papio/internal/triage"
 	"papio/internal/update"
@@ -178,7 +179,7 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 
 	entries := resolverEntries(cfg, metadataClient)
 	service := app.New(cfg, jobs, artifacts, budgets)
-	discoveryBackends := discoverySources(cfg)
+	discoveryBackends := discoverySources(cfg, budgets, metadataClient)
 	discoveryClient := discovery.NewMulti(discoveryBackends...)
 	for _, backend := range discoveryBackends {
 		if lookup, ok := backend.(app.WorkLookup); ok {
@@ -371,24 +372,31 @@ func resolverEntries(cfg config.Config, client *fetch.SecureHTTPClient) []app.Re
 	}
 }
 
-// discoverySources builds the configured discovery backends in merge-preference
-// order. An empty selection keeps the historical OpenAlex-only behavior.
-func discoverySources(cfg config.Config) []discovery.Source {
+// discoverySources builds the discovery backends. Each is given the shared
+// secure HTTP client wrapped in its source's budget gate, so discovery is
+// accounted for, paced and paused exactly like the acquisition resolvers that
+// hit the same providers. Left ungated it drew on the same provider quota
+// invisibly and ignored a durable gate that had already paused acquisition.
+func discoverySources(cfg config.Config, budgets *budget.Manager, client sourcegate.HTTPClient) []discovery.Source {
 	names := cfg.Discovery.Sources
 	if len(names) == 0 {
 		names = []string{config.SourceOpenAlex}
 	}
 	sources := make([]discovery.Source, 0, len(names))
 	for _, name := range names {
+		policy := cfg.SourcePolicy(name)
+		gated := sourcegate.New(budgets, name, policy, 0, client)
 		switch name {
 		case config.SourceOpenAlex:
 			sources = append(sources, discovery.NewWithOptions(discovery.Options{
+				Client:       gated,
 				ContactEmail: cfg.Email,
 				APIKey:       cfg.Sources[config.SourceOpenAlex].APIKey,
 				BaseURL:      cfg.Sources[config.SourceOpenAlex].BaseURLForDev,
 			}))
 		case config.SourceSemanticScholar:
 			sources = append(sources, discovery.NewSemanticScholarWithOptions(discovery.SemanticScholarOptions{
+				Client:  gated,
 				APIKey:  cfg.Sources[config.SourceSemanticScholar].APIKey,
 				BaseURL: cfg.Sources[config.SourceSemanticScholar].BaseURLForDev,
 			}))
