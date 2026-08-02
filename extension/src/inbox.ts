@@ -1,8 +1,9 @@
 // Copyright 2026 OrgMentem. Licensed under MIT.
 
-import type { TriageCounts, TriageSnapshotItem, TriageSnapshotResponsePayload } from "./protocol";
+import type { ActivityEntryPayload, TriageCounts, TriageSnapshotItem, TriageSnapshotResponsePayload } from "./protocol";
 
 type Snapshot = Omit<TriageSnapshotResponsePayload, "request_id">;
+type ActivityEntry = ActivityEntryPayload;
 type TriageOperation = TriageSnapshotItem["ops"][number];
 type Verdict = "accept" | "reject";
 
@@ -28,6 +29,25 @@ function persistCitationStyle(style: CitationStyle): void {
   }
 }
 
+const ACTIVITY_COLLAPSED_KEY = "papio_inbox_activity_collapsed_v1";
+
+function storedActivityCollapsed(): boolean {
+  try {
+    return window.localStorage.getItem(ACTIVITY_COLLAPSED_KEY) === "true";
+  } catch {
+    // Storage can be unavailable; show the feed by default.
+    return false;
+  }
+}
+
+function persistActivityCollapsed(collapsed: boolean): void {
+  try {
+    window.localStorage.setItem(ACTIVITY_COLLAPSED_KEY, String(collapsed));
+  } catch {
+    // Non-fatal: the choice simply resets on the next visit.
+  }
+}
+
 interface PageElements {
   connection: HTMLElement;
   counts: HTMLElement;
@@ -35,6 +55,9 @@ interface PageElements {
   refresh: HTMLButtonElement;
   reconnect: HTMLButtonElement;
   list: HTMLElement;
+  activityPanel: HTMLElement;
+  activityToggle: HTMLButtonElement;
+  activityList: HTMLElement;
   operationStatus: HTMLElement;
   generatedAt: HTMLTimeElement;
   loadMore: HTMLButtonElement;
@@ -78,6 +101,9 @@ interface PageState {
   loading: boolean;
   filterQuery: string;
   citationStyle: CitationStyle;
+  activityFeature: boolean;
+  activityEntries: ActivityEntry[];
+  activityCollapsed: boolean;
 }
 
 const state: PageState = {
@@ -97,6 +123,9 @@ const state: PageState = {
   loading: false,
   filterQuery: "",
   citationStyle: storedCitationStyle(),
+  activityFeature: false,
+  activityEntries: [],
+  activityCollapsed: storedActivityCollapsed(),
 };
 
 let elements: PageElements | null = null;
@@ -313,6 +342,128 @@ function rowForItem(itemID: string): HTMLElement | null {
     .find((row) => row.dataset.triageItemId === itemID) ?? null;
 }
 
+function isActivityEntry(value: unknown): value is ActivityEntry {
+  if (!isRecord(value)) return false;
+  return (
+    typeof value["seq"] === "number" &&
+    Number.isSafeInteger(value["seq"]) &&
+    typeof value["at"] === "string" &&
+    typeof value["kind"] === "string" &&
+    typeof value["text"] === "string" &&
+    (value["job_id"] === undefined || typeof value["job_id"] === "string") &&
+    (value["title"] === undefined || typeof value["title"] === "string")
+  );
+}
+
+function activityResponse(value: unknown): { feature: boolean; entries: ActivityEntry[] } | null {
+  if (!isRecord(value) || value["ok"] !== true || typeof value["feature"] !== "boolean") return null;
+  if (value["feature"] === false) return { feature: false, entries: [] };
+  const rawEntries = value["entries"];
+  if (!Array.isArray(rawEntries)) return null;
+  return { feature: true, entries: rawEntries.filter(isActivityEntry) };
+}
+
+function relativeActivityTime(at: string): string {
+  const timestamp = Date.parse(at);
+  if (!Number.isFinite(timestamp)) return at;
+  const seconds = Math.round((Date.now() - timestamp) / 1000);
+  if (seconds < -45) {
+    const minutes = Math.max(1, Math.round(-seconds / 60));
+    return `in ${minutes}m`;
+  }
+  if (seconds < 45) return "just now";
+  if (seconds < 90) return "1m ago";
+  if (seconds < 3600) return `${Math.round(seconds / 60)}m ago`;
+  if (seconds < 86400) return `${Math.round(seconds / 3600)}h ago`;
+  if (seconds < 172800) return "yesterday";
+  return `${Math.round(seconds / 86400)}d ago`;
+}
+
+function itemJobID(item: TriageSnapshotItem): string | null {
+  if (typeof item.job_id === "string" && item.job_id !== "") return item.job_id;
+  const job = factText(item, "Job");
+  return job === null ? null : job;
+}
+
+function activityStatusForJob(jobID: string): string | null {
+  const entries = state.activityEntries
+    .filter((entry) => entry.job_id === jobID)
+    .sort((left, right) => right.seq - left.seq);
+  for (const entry of entries) {
+    if (entry.kind === "browser.download_started") return "downloading…";
+    if (entry.kind === "browser.download_complete") return "adopted ✓ validating";
+    if (entry.kind !== "job.transition") continue;
+    const text = entry.text.toLowerCase();
+    if (text.includes("validat") || text.includes("adopt")) return "adopted ✓ validating";
+    if (text.includes("fetch") || text.includes("download")) return "downloading…";
+    return "working…";
+  }
+  return null;
+}
+
+function focusActivityJob(jobID: string): void {
+  const item = state.snapshot?.items.find((candidate) => itemJobID(candidate) === jobID);
+  if (item === undefined) {
+    announce(`No inbox item found for job ${jobID}.`);
+    return;
+  }
+  state.selectedID = item.id;
+  updateRovingTabIndex();
+  const row = rowForItem(item.id);
+  if (row === null) {
+    announce(`Inbox item for job ${jobID} is not visible with the current filter.`);
+    return;
+  }
+  row.classList.add("activity-highlight");
+  row.focus();
+  row.scrollIntoView?.({ behavior: "smooth", block: "center" });
+  announce(`Focused inbox item for job ${jobID}.`);
+}
+
+function renderActivityEntry(entry: ActivityEntry): HTMLElement {
+  const item = element("li");
+  item.className = "activity-entry";
+  const metadata = element("div");
+  metadata.className = "activity-meta";
+  const time = element("time", relativeActivityTime(entry.at));
+  time.className = "activity-time";
+  time.dateTime = entry.at;
+  metadata.append(time);
+  if (typeof entry.title === "string" && entry.title !== "") {
+    const title = element("span", entry.title);
+    title.className = "activity-title";
+    metadata.append(title);
+  }
+  const text = element("p", entry.text);
+  text.className = "activity-text";
+  item.append(metadata, text);
+  if (typeof entry.job_id === "string" && entry.job_id !== "") {
+    const job = element("button", `Job ${entry.job_id}`);
+    job.type = "button";
+    job.className = "activity-job activity-job-link";
+    job.dataset.jobId = entry.job_id;
+    job.setAttribute("aria-label", `Show inbox item for job ${entry.job_id}`);
+    job.addEventListener("click", () => focusActivityJob(entry.job_id!));
+    text.append(document.createTextNode(" · "), job);
+  }
+  return item;
+}
+
+function renderActivity(): void {
+  if (elements === null) return;
+  elements.activityPanel.hidden = !state.activityFeature;
+  if (!state.activityFeature) return;
+  elements.activityToggle.setAttribute("aria-expanded", String(!state.activityCollapsed));
+  elements.activityToggle.textContent = state.activityCollapsed ? "Show activity" : "Hide activity";
+  elements.activityList.hidden = state.activityCollapsed;
+  elements.activityList.replaceChildren();
+  if (state.activityEntries.length === 0) {
+    elements.activityList.append(element("li", "No recent activity."));
+    return;
+  }
+  for (const entry of state.activityEntries) elements.activityList.append(renderActivityEntry(entry));
+}
+
 function updateRovingTabIndex(): void {
   if (elements === null) return;
   for (const row of Array.from(elements.list.querySelectorAll<HTMLElement>("[data-triage-item-id]"))) {
@@ -454,21 +605,23 @@ function previewButton(item: TriageSnapshotItem): HTMLButtonElement | null {
   return button;
 }
 
-function operationButton(item: TriageSnapshotItem, operation: TriageOperation): HTMLButtonElement {
+function operationButton(item: TriageSnapshotItem, operation: TriageOperation): HTMLButtonElement | null {
+  // Retry is reserved for a newer inbox contract. Do not expose a dead,
+  // permanently disabled placeholder when the daemon includes it.
+  if (operation === "retry") return null;
   const button = element("button", operationLabel(operation));
   button.type = "button";
   button.dataset.operation = operation;
 
   const needsPreview = operation === "accept" && item.action_kind === "verify_identity";
   const handoff = item.kind === "human_action" && item.action_kind === "openurl_handoff";
-  const unavailable = operation === "retry" || (operation === "open" && (handoff ? handoffJobID(item) === null : firstSafeLink(item) === null));
+  const unavailable = operation === "open" && (handoff ? handoffJobID(item) === null : firstSafeLink(item) === null);
   button.disabled =
     state.pending.has(item.id) ||
     unavailable ||
     (isMutation(operation) && !state.connected) ||
     (needsPreview && !hasViewedPreview(item));
   if (needsPreview && !hasViewedPreview(item)) button.title = "View the PDF before accepting it.";
-  if (operation === "retry") button.title = "Retry is not available from this inbox version.";
   button.addEventListener("click", () => {
     activateOperation(item, operation);
   });
@@ -570,6 +723,42 @@ function accessHint(item: TriageSnapshotItem): HTMLElement | null {
   return hint;
 }
 
+function guidanceHint(item: TriageSnapshotItem): HTMLElement | null {
+  if (item.kind !== "human_action") return null;
+  let text: string | null = null;
+  switch (item.action_kind) {
+    case "manual_download":
+      text = "Sign in if needed and download the PDF — papio adopts anything saved to Downloads/papio/<job>. Tip: the papio toolbar button can send an open PDF directly.";
+      break;
+    case "openurl_handoff":
+      text = item.requires_auth === true
+        ? "Opens your library resolver — sign in once and papio drives the rest."
+        : "papio will drive this page automatically once opened.";
+      break;
+    case "verify_identity":
+      text = "View the PDF, then accept or reject — accept files it into your library.";
+      break;
+    default:
+      return null;
+  }
+  const hint = element("p", text);
+  hint.className = "item-guidance";
+  return hint;
+}
+
+function liveStatusChip(item: TriageSnapshotItem): HTMLElement | null {
+  if (item.kind !== "human_action") return null;
+  const jobID = itemJobID(item);
+  if (jobID === null) return null;
+  const status = activityStatusForJob(jobID);
+  if (status === null) return null;
+  const chip = element("span", status);
+  chip.className = "activity-live-status";
+  chip.setAttribute("role", "status");
+  chip.dataset.jobId = jobID;
+  return chip;
+}
+
 // Backend identifiers remain out of the ordinary triage flow. Their compact
 // disclosure sits beside the action/status text and preserves native button
 // keyboard semantics and state.
@@ -647,6 +836,10 @@ function renderItem(item: TriageSnapshotItem): HTMLElement {
   if (citation !== null) body.append(citation);
   const hint = accessHint(item);
   if (hint !== null) body.append(hint);
+  const guidance = guidanceHint(item);
+  if (guidance !== null) body.append(guidance);
+  const liveStatus = liveStatusChip(item);
+  if (liveStatus !== null) body.append(liveStatus);
 
   const leftovers = item.facts.filter((fact) => KNOWN_FACT_LABELS[fact.label] !== true);
   if (leftovers.length > 0) {
@@ -694,7 +887,10 @@ function renderItem(item: TriageSnapshotItem): HTMLElement {
   controls.setAttribute("aria-label", `Actions for ${title.text}`);
   const preview = previewButton(item);
   if (preview !== null) controls.append(preview);
-  for (const operation of item.ops) controls.append(operationButton(item, operation));
+  for (const operation of item.ops) {
+    const button = operationButton(item, operation);
+    if (button !== null) controls.append(button);
+  }
   if (controls.childElementCount > 0) card.append(controls);
 
   return card;
@@ -762,6 +958,7 @@ function render(): void {
   elements.refresh.disabled = state.loading;
   elements.reconnect.disabled = state.loading;
   renderCounts();
+  renderActivity();
 
   elements.list.replaceChildren();
   const items = orderedItems();
@@ -857,6 +1054,15 @@ function resultForMutation(value: unknown): { ok: true; outcome: "applied" | "al
   return detail === undefined ? { ok: true, outcome } : { ok: true, outcome, detail };
 }
 
+async function refreshActivity(): Promise<void> {
+  const result = await runtimeMessage("papio.activity", { limit: 50 })
+    .then(activityResponse)
+    .catch(() => null);
+  if (result === null) return;
+  state.activityFeature = result.feature;
+  state.activityEntries = result.entries;
+}
+
 async function refreshInbox(append = false): Promise<void> {
   const cursor = append ? state.snapshot?.cursor : undefined;
   if (append && (cursor === undefined || state.snapshot === null)) return;
@@ -887,6 +1093,7 @@ async function refreshInbox(append = false): Promise<void> {
     setConnection(false, snapshotResult.message);
   }
   if (countsResult.ok) state.counts = countsResult.value;
+  if (!append) await refreshActivity();
   render();
 }
 
@@ -901,7 +1108,7 @@ function requestRefresh(): void {
 // a lightweight counts request. refresh-on-return covers coming back to the
 // tab. Auto-refresh (poll and return alike) is suppressed while the user is
 // mid-action so it never reorders the list under a decision.
-const COUNTS_POLL_INTERVAL_MS = 10000;
+const COUNTS_POLL_INTERVAL_MS = 15000;
 let countsPollTimer: number | Timer | undefined;
 /** The document this page bootstrapped against; the poll below stops once the
  * live document is no longer it. The counts poll re-arms itself forever, so it
@@ -947,7 +1154,8 @@ async function pollCounts(): Promise<void> {
     await refreshInbox();
   } else {
     state.counts = result.value;
-    renderCounts();
+    await refreshActivity();
+    render();
   }
 }
 
@@ -1502,6 +1710,9 @@ function bootstrap(): void {
   const list = document.getElementById("item-list");
   const operationStatus = document.getElementById("operation-status");
   const generatedAt = document.getElementById("generated-at");
+  const activityPanel = document.getElementById("activity-panel");
+  const activityToggle = document.getElementById("activity-toggle");
+  const activityList = document.getElementById("activity-list");
   const loadMore = document.getElementById("load-more");
   const dialog = document.getElementById("confirm-dialog");
   const dialogMessage = document.getElementById("confirm-dialog-message");
@@ -1518,6 +1729,9 @@ function bootstrap(): void {
     !(refresh instanceof HTMLButtonElement) ||
     !(reconnect instanceof HTMLButtonElement) ||
     !(list instanceof HTMLElement) ||
+    !(activityPanel instanceof HTMLElement) ||
+    !(activityToggle instanceof HTMLButtonElement) ||
+    !(activityList instanceof HTMLElement) ||
     !(operationStatus instanceof HTMLElement) ||
     !(generatedAt instanceof HTMLTimeElement) ||
     !(loadMore instanceof HTMLButtonElement) ||
@@ -1539,6 +1753,9 @@ function bootstrap(): void {
     refresh,
     reconnect,
     list,
+    activityPanel,
+    activityToggle,
+    activityList,
     operationStatus,
     generatedAt,
     loadMore,
@@ -1553,6 +1770,11 @@ function bootstrap(): void {
   };
   refresh.addEventListener("click", requestRefresh);
   reconnect.addEventListener("click", requestRefresh);
+  activityToggle.addEventListener("click", () => {
+    state.activityCollapsed = !state.activityCollapsed;
+    persistActivityCollapsed(state.activityCollapsed);
+    render();
+  });
   citationStyle.value = state.citationStyle;
   citationStyle.addEventListener("change", () => {
     const value = citationStyle.value;

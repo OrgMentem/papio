@@ -11,6 +11,23 @@ execution records in `notes/acquisition-stack-plan.md`.
 
 ## [Unreleased]
 
+### Added
+
+- **`papio activity` exposes the daemon's recent operator activity.** The new
+  `activity.list` RPC and CLI command show a bounded, newest-first view of the
+  durable events table, with `--limit`, optional `--job` filtering, and the
+  usual `--json` page envelope.
+- **The browser activity feed is feature-gated and solicited.** The
+  `activity_request` / `activity_response` messages and `activity_feed_v1`
+  feature carry bounded display-only entries to an open inbox; this is a pull
+  view, not daemon push.
+- **Early browser delivery can adopt a PDF for a live job.** The extension
+  steers the browser download into `papio/<job-id>/`, and the daemon adopts it
+  through existing legal job transitions and the ordinary validation pipeline.
+  Queued, resolving, and fetching jobs no longer dead-end when the operator
+  already has the PDF in the browser; download races remain structured,
+  retryable outcomes.
+
 ### Fixed
 
 - **A rate-limit gate or request count earned under one set of credentials no

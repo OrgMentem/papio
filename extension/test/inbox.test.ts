@@ -191,6 +191,7 @@ function snapshot(items: TriageSnapshotItem[], options: Partial<FixtureSnapshot>
 function snapshotReply(fixture: FixtureSnapshot, message: RuntimeRequest): unknown {
   if (message.type === "papio.triage.snapshot") return { ok: true, snapshot: fixture };
   if (message.type === "papio.triage.counts") return { ok: true, counts: fixture.counts, generated_at: fixture.generated_at };
+  if (message.type === "papio.activity") return { ok: true, feature: false, entries: [] };
   return { ok: false, error: { code: "unexpected", message: "Unexpected message" } };
 }
 
@@ -809,4 +810,77 @@ test("an author suffix duplicated in the title is stripped for display", async (
   expect(page.document.querySelector("[data-triage-item-id='action:manual'] h3")?.textContent).toBe(
     "Trust Engineering for Human-AI Teams",
   );
+});
+
+test("activity panel renders trusted structure, live job status, and focuses matching inbox rows", async () => {
+  const item = manualAction("action:activity", 1, "Activity download");
+  const fixture = snapshot([item], {
+    counts: counts({ pending_total: 1, actions: 1, watch_hits: 0, retractions: 0 }),
+  });
+  const activity = {
+    seq: 42,
+    at: "2026-08-03T11:59:45Z",
+    job_id: "job-18",
+    kind: "browser.download_started",
+    text: "<downloaded> & pending",
+    title: "A paper title",
+  };
+  const page = await inboxDocument((message) => {
+    if (message.type === "papio.activity") return { ok: true, feature: true, entries: [activity] };
+    return snapshotReply(fixture, message);
+  });
+
+  const panel = page.document.getElementById("activity-panel");
+  expect(panel?.hidden).toBe(false);
+  expect(panel?.querySelector("h2")?.textContent).toBe("Activity");
+  expect(panel?.querySelector("#activity-list")?.getAttribute("aria-live")).toBe("polite");
+  expect(panel?.querySelector(".activity-entry")?.textContent).toContain("<downloaded> & pending");
+  expect(panel?.querySelector(".activity-title")?.textContent).toBe("A paper title");
+  expect(page.document.querySelector("[data-triage-item-id='action:activity'] .activity-live-status")?.textContent)
+    .toBe("downloading…");
+
+  panel?.querySelector<HTMLButtonElement>(".activity-job")?.click();
+  expect(page.document.activeElement?.getAttribute("data-triage-item-id")).toBe("action:activity");
+  expect(page.document.querySelector("[data-triage-item-id='action:activity']")?.classList.contains("activity-highlight")).toBe(true);
+});
+
+test("activity panel stays hidden when the daemon does not advertise the feed", async () => {
+  const fixture = snapshot([watchHit("hit:no-activity", 1, "No activity")]);
+  const page = await inboxDocument((message) => {
+    if (message.type === "papio.activity") return { ok: true, feature: false, entries: [] };
+    return snapshotReply(fixture, message);
+  });
+
+  expect(page.document.getElementById("activity-panel")?.hidden).toBe(true);
+  expect(page.document.querySelectorAll(".activity-entry")).toHaveLength(0);
+});
+
+test("human action guidance names the next step for each supported action kind", async () => {
+  const manual = manualAction("action:manual-guidance", 1, "Manual guidance");
+  const authHandoff = handoffAction("action:auth-guidance", 2, true);
+  const openHandoff = handoffAction("action:open-guidance", 3, false);
+  const verify = verifyIdentity("action:verify-guidance", 4);
+  const fixture = snapshot([manual, authHandoff, openHandoff, verify], {
+    counts: counts({ pending_total: 4, actions: 4, watch_hits: 0, retractions: 0 }),
+  });
+  const page = await inboxDocument((message) => snapshotReply(fixture, message));
+
+  expect(page.document.querySelector("[data-triage-item-id='action:manual-guidance'] .item-guidance")?.textContent)
+    .toBe("Sign in if needed and download the PDF — papio adopts anything saved to Downloads/papio/<job>. Tip: the papio toolbar button can send an open PDF directly.");
+  expect(page.document.querySelector("[data-triage-item-id='action:auth-guidance'] .item-guidance")?.textContent)
+    .toBe("Opens your library resolver — sign in once and papio drives the rest.");
+  expect(page.document.querySelector("[data-triage-item-id='action:open-guidance'] .item-guidance")?.textContent)
+    .toBe("papio will drive this page automatically once opened.");
+  expect(page.document.querySelector("[data-triage-item-id='action:verify-guidance'] .item-guidance")?.textContent)
+    .toBe("View the PDF, then accept or reject — accept files it into your library.");
+});
+
+test("retry operations declared by the daemon are not rendered", async () => {
+  const item = watchHit("hit:retry-placeholder", 1, "Retry placeholder");
+  item.ops = ["retry"];
+  const fixture = snapshot([item]);
+  const page = await inboxDocument((message) => snapshotReply(fixture, message));
+
+  expect(page.document.querySelector("[data-triage-item-id='hit:retry-placeholder'] [data-operation='retry']")).toBeNull();
+  expect(page.document.querySelector("[data-triage-item-id='hit:retry-placeholder'] .item-controls")).toBeNull();
 });

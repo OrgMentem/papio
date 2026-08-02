@@ -133,6 +133,19 @@ papio actions resolve <action-id> [flags]
 | `--accept` | `bool` | `false` | accept the identity review |
 | `--reject` | `bool` | `false` | reject the identity review |
 
+## `papio activity`
+
+Show recent daemon activity
+
+```
+papio activity [flags]
+```
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--job` | `string` |  | filter activity to one job ID |
+| `--limit` | `int` | `30` | maximum activity rows (1-200) |
+
 ## `papio adapter`
 
 Inspect provider and adapter interactions

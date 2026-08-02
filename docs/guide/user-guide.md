@@ -167,6 +167,27 @@ papio status --follow
 job list, and `papio jobs retry <job-id>` explicitly retries a failed,
 unavailable, or retry-wait job.
 
+For a compact event-oriented view of the daemon's durable work, run
+[`papio activity`](../reference/commands.md). It is newest-first and bounded;
+`--limit` changes the number of rows, `--job <job-id>` narrows the view, and
+`--json` gives the same page envelope used by other list commands. The command
+and the inbox activity panel read the same daemon events; the reference page is
+generated, so use it for the complete option list.
+
+### Use the inbox activity panel
+
+Open **Open inbox** in the extension popup when you want the browser-side
+triage view. Alongside jobs and human actions, the inbox can show a compact
+activity timeline: download started/completed, institutional sign-in returned,
+provider outcomes, adoption, and other recent daemon events. The panel is a
+solicited pull, not a live push stream. It refreshes while the inbox tab is
+open, and older daemons that do not advertise the activity-feed feature show a
+clear unavailable message rather than stale or guessed entries.
+
+When an inbox row says **manual download**, open the provider's PDF in the
+ordinary browser and use the popup's **Send PDF to papio** action. The activity
+panel then makes the download and adoption steps visible while validation runs.
+
 ## 5. Complete one browser pass when required
 
 When no usable direct candidate remains, assisted and delegated access modes can
@@ -228,6 +249,49 @@ institution's login page has taken over, it stops reloading, brings the tab
 forward, and flags a single sign-in request. Sign in normally there; once you're
 back, the extension resumes. This keeps you to one login per research session —
 it does not automate your credentials.
+
+### Watch the institution session
+
+The popup's **Institution session** card reports the browser-local resolver
+state: **Session warm**, **Signed out or expired**, **Sign-in needed - papio
+paused**, or **Keep-warm off**. **Sign in now** focuses the ordinary resolver
+tab when a library route is configured. Sign in, complete any MFA or other
+institution step yourself, and return to the provider page; *papio* never fills
+credentials or copies cookies.
+
+The **Options** page controls this browser-local behavior. **Keep-warm
+session** enables or pauses refreshes of the pinned resolver tab, and
+**Refresh interval** chooses how often it is refreshed (2–30 minutes). The
+card and the options controls describe this browser's session only; they do not
+change daemon access policy or send login details anywhere.
+
+### Send a PDF already open in the browser
+
+If a handoff or a provider page has reached a PDF, open the popup and choose
+**Send PDF to papio**. The popup recognizes a direct PDF URL and the built-in
+Chrome or Firefox PDF viewer, then queues the DOI or associates the current tab
+with its existing job. The extension starts a browser-managed download named
+`papio/<job-id>/paper.pdf`. With a browser download directory configured for
+the *papio* adoption root, that commonly appears as
+`Downloads/papio/<job-id>/`; *papio* adopts the file from that job-scoped
+location and runs the same validation used for a directly fetched PDF. Keep
+the browser directory aligned with the daemon's `download_adoption_root`;
+otherwise a file in an unrelated Downloads folder is not adoptable. The popup
+reports **Sending PDF to papio** and then **papio adopted (validating)**; the
+inbox and `papio activity` show the later outcome.
+
+The download path is deliberate: do not rename a file into another job's
+directory. If validation rejects the PDF, the job remains actionable so you can
+provide a different file. If the current tab is only a DOI or provider landing
+page, use **Acquire this page** or the browser handoff first; **Send PDF to
+papio** is for a PDF page.
+
+Firefox does not expose Chrome's `downloads.onDeterminingFilename` hook. The
+popup's direct **Send PDF to papio** download still uses its job-scoped
+filename, but a provider button that starts its own click download cannot be
+rerouted automatically and remains human-assisted. When that happens, wait
+until the PDF is open and use **Send PDF to papio** rather than assuming an
+unrelated file in `Downloads` will be adopted.
 
 ## 6. Read the batch outcome
 

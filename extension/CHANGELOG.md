@@ -16,6 +16,32 @@ for the full pre-split extension history.
 
 ## [Unreleased]
 
+### Added
+
+- **The popup can send the current PDF to *papio*.** It classifies the active tab
+  as a PDF, DOI page, or neither; for a PDF it queues or joins the matching
+  job, starts a browser-managed download under `papio/<job-id>/`, and reports
+  sending, adoption, validation, or a recoverable failure. Provider click
+  downloads remain human-assisted on Firefox, whose WebExtensions API has no
+  filename-routing hook.
+- **Institution sessions are visible at a glance.** The popup now shows the
+  local resolver session as warm, signed out, paused for sign-in, or keep-warm
+  disabled, with a **Sign in now** action. Options adds extension-local
+  keep-warm enable/disable and refresh-interval controls; credentials and
+  identity-provider hosts never enter the daemon protocol.
+- **The inbox adds an activity panel and operator guidance.** It pulls a
+  bounded activity timeline only when the daemon advertises
+  `activity_feed_v1`, and explains the unavailable state on older daemons
+  instead of implying that the timeline is live push.
+
+### Changed
+
+- **Badge precedence is explicit and centralized in the background broker.** A
+  broken or disconnected bridge shows `!` first, a blocking permission or
+  sign-in state takes the next slot, and the pending triage count is shown only
+  when higher-priority attention is clear. Popup and options surfaces continue
+  to expose the fuller status and version details.
+
 ## [0.8.1] - 2026-08-02
 
 ### Fixed

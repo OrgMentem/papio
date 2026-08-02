@@ -3227,7 +3227,7 @@ test("triage requests time out and late echoes are dropped", async () => {
   } finally {
     console.debug = originalDebug;
   }
-  expect(debugLines.some((line) => line.join(" ").includes("unknown or late triage response"))).toBe(true);
+  expect(debugLines.some((line) => line.join(" ").includes("unknown or late correlated response"))).toBe(true);
 });
 
 test("a user-visible triage request forces reconnect and waits for a fresh hello", async () => {
@@ -3333,11 +3333,11 @@ test("inbound native handlers finish in receipt order across asynchronous awaits
   ).toEqual(["job_chain_first", "job_chain_second"]);
 });
 
-// The UNE Shibboleth dead end (idp.une.edu.au/idp/profile/SAML2/Redirect/SSO?execution=…)
+// The the default institution Shibboleth dead end (idp.example.edu/idp/profile/SAML2/Redirect/SSO?execution=…)
 // is classifiable ONLY by its title: that exact URL also serves the working
 // login form. Chrome can deliver the title in a separate update after `complete`.
-const STALE_IDP_URL = "https://idp.une.edu.au/idp/profile/SAML2/Redirect/SSO?execution=e1s2";
-const STALE_IDP_TITLE = "University of New England Login Service - Stale Request";
+const STALE_IDP_URL = "https://idp.example.edu/idp/profile/SAML2/Redirect/SSO?execution=e1s2";
+const STALE_IDP_TITLE = "Example University Login Service - Stale Request";
 
 /** Offer a job into a work window and return its broker tab id. */
 async function offerIntoWorkWindow(h: Harness, jobID: string): Promise<number> {
@@ -3373,7 +3373,7 @@ test("a title-only stale IdP page is detected, raises the work window, and re-dr
 
   const outcome = h.frames().find((f) => f.type === "handoff_outcome");
   expect(outcome?.job_id).toBe("job_stale_surface");
-  expect(outcome?.payload).toMatchObject({ outcome: "stale_sso", final_host: "idp.une.edu.au" });
+  expect(outcome?.payload).toMatchObject({ outcome: "stale_sso", final_host: "idp.example.edu" });
   // Surfaced: tab activated and the minimized window restored and focused.
   expect(h.tabs.activated).toContain(tabID);
   expect(h.windows?.updated).toContainEqual({

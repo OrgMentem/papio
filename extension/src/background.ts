@@ -20,6 +20,7 @@ import {
   MAX_BROWSER_MESSAGE_BYTES,
   MsgPageCapture,
   parseBrowserMessage,
+  type ActivityEntryPayload,
   type BrowserMessage,
   type BrowserMessageType,
   type PageAcquireAckPayload,
@@ -102,6 +103,7 @@ const TRIAGE_SNAPSHOT_SCHEMA_2_FEATURE = "triage_snapshot_schema_v2";
 const TRIAGE_MUTATIONS_FEATURE = "triage_mutations_v1";
 const REVIEW_PREVIEW_FEATURE = "review_preview_v1";
 const STATS_FEATURE = "browser_stats_v1";
+const ACTIVITY_FEED_FEATURE = "activity_feed_v1";
 const PAGE_CAPTURE_FEATURE = "page_capture_v1";
 /** Daemon replies that settle a correlated `requestNative` call. `requestNative`
  * rejects any type outside this set before registering a wait, so wrappers and
@@ -113,6 +115,7 @@ const CORRELATED_RESULT_TYPES: ReadonlySet<BrowserMessageType> = new Set([
   "human_action_resolve_result",
   "review_preview_result",
   "stats_response",
+  "activity_response",
 ]);
 // Fallback for a manifest without an action popup; both build targets ship
 // the pages under dist/ (see build.ts) and the manifest is the source of truth.
@@ -2187,6 +2190,29 @@ export class Bridge {
     const { request_id: _requestID, ...stats } = result.payload;
     return { ok: true, stats };
   }
+  async requestActivity(limit?: number): Promise<BrokerReply<{ feature: boolean; entries: ActivityEntryPayload[] }>> {
+    // Do not even open/reconnect the native path for a daemon that has already
+    // advertised that it cannot serve the feed. The inbox treats this as a
+    // normal, feature-gated empty result rather than an error.
+    if (!(this.store.daemonFeatures ?? []).includes(ACTIVITY_FEED_FEATURE)) {
+      return { ok: true, feature: false, entries: [] };
+    }
+    const result = await this.requestNative(
+      "activity_request",
+      limit === undefined ? {} : { limit },
+      "activity_response",
+      ACTIVITY_FEED_FEATURE,
+      false,
+    );
+    if (result.kind !== "response") return this.nativeFailure(result);
+    if (result.code === "feature_unavailable") return { ok: true, feature: false, entries: [] };
+    if (result.code !== undefined) return this.failure(result.code, result.message ?? "The request is unavailable");
+    if (result.payload === undefined) return this.nativeFailure(result);
+    const entries = result.payload["entries"];
+    if (!Array.isArray(entries)) return this.failure("invalid_response", "The daemon returned invalid activity entries");
+    return { ok: true, feature: true, entries: entries as ActivityEntryPayload[] };
+  }
+
 
   async requestTriageDecision(
     request: { item_id: string; op: "acquire" | "dismiss"; watch_scope?: "all" | number[] },
@@ -3143,7 +3169,7 @@ export class Bridge {
     if (typeof requestID !== "string") return;
     const pending = this.pendingNativeRequests.get(requestID);
     if (pending === undefined || pending.expectedType !== msg.type) {
-      console.debug("papio: dropping unknown or late triage response", msg.type, requestID);
+      console.debug("papio: dropping unknown or late correlated response", msg.type, requestID);
       return;
     }
     this.pendingNativeRequests.delete(requestID);
@@ -4709,6 +4735,7 @@ type InboxRuntimeReply =
   | BrokerReply<{ outcome: string; detail?: string }>
   | BrokerReply<{ opened: true }>
   | BrokerReply<{ stats: Record<string, unknown> }>
+  | BrokerReply<{ feature: boolean; entries: ActivityEntryPayload[] }>
   | BrokerReply<{ state: BridgeSessionState }>
   | DeliveryReply;
 
@@ -4764,6 +4791,11 @@ function isSnapshotRuntimeRequest(
 
 function isCountsRuntimeRequest(value: unknown): value is Record<string, never> {
   return isObjectRecord(value) && Object.keys(value).length === 0;
+}
+
+function isActivityRuntimeRequest(value: unknown): value is { limit?: number } {
+  if (!isObjectRecord(value) || !hasOnlyKeys(value, ["limit"])) return false;
+  return value["limit"] === undefined || (isPositiveSafeInteger(value["limit"]) && value["limit"] <= 50);
 }
 
 function isDecisionRuntimeRequest(
@@ -4947,6 +4979,7 @@ export async function handleInboxRuntimeMessage(
     return { ok: true };
   }
   if (
+    type !== "papio.activity" &&
     type !== "papio.triage.snapshot" &&
     type !== "papio.triage.counts" &&
     type !== "papio.triage.decide" &&
@@ -4963,6 +4996,10 @@ export async function handleInboxRuntimeMessage(
   }
   const request = message["request"];
   switch (type) {
+    case "papio.activity":
+      return isActivityRuntimeRequest(request)
+        ? bridge.requestActivity(request.limit)
+        : runtimeFailure("invalid_request", "Invalid activity request");
     case "papio.triage.snapshot":
       return isSnapshotRuntimeRequest(request)
         ? bridge.requestTriageSnapshot(request)
@@ -5148,6 +5185,7 @@ if (typeof chrome !== "undefined" && chrome.runtime?.id) {
       isObjectRecord(message) &&
       (message["type"] === "papio.openInbox" ||
         message["type"] === "papio.page_capture" ||
+        message["type"] === "papio.activity" ||
         message["type"] === "papio.triage.snapshot" ||
         message["type"] === "papio.triage.counts" ||
         message["type"] === "papio.triage.decide" ||
