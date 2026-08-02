@@ -18,6 +18,26 @@ for the full pre-split extension history.
 
 ### Fixed
 
+- **A file-shaped link is no longer treated as permission to download without
+  you.** An offer whose URL looked like a PDF was downloaded straight away, on
+  the shape of the link alone, with no reference to whether the work sits behind
+  a sign-in. That was safe only by accident: the one kind of offer that carries
+  a file URL happens to be marked as needing no sign-in today, and nothing
+  prevented a future one from differing. It is also reachable through
+  configuration rather than code — an institutional offer carries whatever
+  resolver address the operator configured, and *papio* places no restriction on
+  its path, so a resolver whose address merely *looks* like a PDF would have
+  routed a sign-in-required work straight into a download with nobody present.
+  Whether a human must sign in is a property of the work, so it is now checked
+  where the download decision is made. Only an explicit "sign-in required"
+  refuses; everything else behaves exactly as before.
+- **Works behind an institutional paywall are now recognised as needing a
+  sign-in.** The daemon recorded several hand-offs as freely fetchable when they
+  were not, including ones where this extension had itself reported an
+  authentication wall. Those arrive correctly classified now, so such a work is
+  held for you to sign in rather than being treated as open access — visible
+  here as an amber sign-in count that was previously undercounted, and as work
+  correctly queued instead of attempted.
 - **A development daemon is no longer told to `brew upgrade`.** The popup's
   version notice assumed every out-of-date daemon came from the cask, so a
   source checkout — whose version carries a `dev` marker — was handed the one

@@ -11,6 +11,9 @@ execution records in `notes/acquisition-stack-plan.md`.
 
 ## [Unreleased]
 
+
+## [0.16.0] - 2026-08-02
+
 ### Added
 
 - **The six-method consumer IPC contract is ratified and mechanically pinned.**
@@ -92,6 +95,21 @@ execution records in `notes/acquisition-stack-plan.md`.
   simultaneously a valid ISBN-10 and a valid PMID, so it names two schemes at
   once and the user is asked to disambiguate with a flag.
 
+- **`papio actions dismiss` closes a stale human action without touching its
+  job.** An advisory on a terminal job previously had no supported way out:
+  cancel refuses a terminal job, resolve handles only identity review, and the
+  startup sweep deliberately spares informational advisories so a genuine trace
+  survives. Retiring one meant editing the database. `--revision` comes from
+  `papio actions list --json` so a stale listing cannot dismiss an action that
+  changed underneath it.
+
+- **`papio doctor` reports acquisitions nobody ever collected.** A full text
+  papio fetched and no one exported is the one thing a consumer cannot detect
+  for itself: a job is stranded exactly when the key naming it stops being
+  derivable, so the orphan is the job it can no longer ask about. Counted after
+  a grace period, so a freshly acquired work is not mistaken for an abandoned
+  one.
+
 ### Changed
 
 - **`jobs.receipt`'s `principal` is request-origin classification, not a rights
@@ -109,6 +127,20 @@ execution records in `notes/acquisition-stack-plan.md`.
   alone, so an ordinary word got an OpenAlex-specific complaint instead of the
   actionable list of identifier flags. Scheme inference now checks the full
   shape.
+
+- **`papio doctor` no longer passes cleanly when OpenAlex has no API key.** It
+  now warns and names the roughly tenfold difference between the anonymous
+  allowance and an account's. Passing read as fully configured, and that is
+  exactly how a real operator missed it: they measured the anonymous tier
+  against an unkeyed client and recorded multi-day cohort acquisition as a
+  property of the design.
+
+- **A negative `rate_per_sec`, `burst` or `max_cost_usd` is now rejected at
+  load.** A negative does not throttle harder, it removes the throttle: the
+  budget manager reads a rate at or below zero as unlimited and a cost ceiling
+  at or below zero as unmetered, so a typed minus sign silently deleted the
+  protection it appeared to configure. Zero keeps its documented meaning,
+  because no pacing and no ceiling is a choice someone can state.
 
 ### Removed
 
@@ -156,7 +188,24 @@ execution records in `notes/acquisition-stack-plan.md`.
   and parks the job in `retry_wait` at the gate; a gated fetch candidate stays
   retryable; enrichment is simply skipped. The wait belongs to the scheduler,
   which can run every other job meanwhile.
-
+- **A human action that needs an institutional sign-in now says so.** Whether
+  finishing an action requires authenticating is what the conservative access
+  mode is checked against, and it was recorded deliberately at only four of the
+  twelve places that open one — everywhere else it defaulted to "no sign-in
+  needed", and two of those defaults were wrong. The action opened when the
+  browser extension has *explicitly reported* an authentication wall claimed the
+  opposite, and every landing-page hand-off was recorded the same way including
+  paywalled ones, so a work behind an institutional paywall looked freely
+  fetchable. Both now record what was observed. A provider's terms-acceptance
+  step fails closed, because it can sit behind a sign-in, a free account, or
+  nothing at all and *papio* cannot tell which. The value is now a required
+  argument, so a future omission is a build failure rather than a silent "no".
+- **`papio jobs cancel` no longer reports a cancellation that did not happen.**
+  Cancelling is deliberately a no-op once a job has already finished, which is
+  right for repeat calls and scripting — but the command printed `Cancelled
+  <id>` regardless, so a job that completed a moment before the command ran was
+  reported as stopped. It now reads the state back and says what actually
+  happened, naming the state the job was already in.
 - **Waiting for a closed source gate no longer spends a job's retry budget, and
   never manufactures a terminal verdict about a source that was never called.**
   `retryBudgetExhausted` counted every `retry_wait` transition alike, so once
@@ -265,6 +314,33 @@ execution records in `notes/acquisition-stack-plan.md`.
   the behaviour that matters: a transport error, a 304, a non-200, and a
   malformed body each return the previously cached release, or `nil` on a cold
   cache.
+
+- **Asking for more rows no longer returns fewer.** A `--limit` above the
+  maximum reset to the *default*, so `--limit 600` yielded 100 rows where
+  `--limit 500` yielded 500 — silently, and in the direction of
+  under-reporting, which is the worst way to be wrong for the only people who
+  pass a large limit: the ones counting. Two separate consumers hit it on the
+  same day. Over-large now clamps down to the maximum; unspecified still means
+  the default. The same non-monotonic clamp existed in four places, including a
+  client-side copy that ran before the request and so decided the answer
+  regardless.
+
+- **Discovery's provider calls are accounted for and can be paused.** papio
+  reached OpenAlex through two clients and only one of them was budgeted: the
+  resolvers reserve at the job level, while search, MCP, watch digests and
+  DOI-only enrichment held a bare HTTP client. So papio under-reported its own
+  consumption by an unknown amount, and a durable gate that paused acquisition
+  did not pause discovery at all — it kept calling an API that had already said
+  stop. Discovery now reserves per request and reports a rate limit as one.
+  It also shares the resolvers' secure HTTP client, so its redirect and size
+  policy is the one `papio doctor` reports.
+
+- **A server cannot defer a source for longer than a day.** `Retry-After` was
+  honoured unconditionally and an existing gate was never shortened, so a clock
+  skew, a malformed header or a provider bug could park every job needing that
+  source for as long as it asked — recoverable only by editing the database.
+  Waits beyond the horizon are clamped; anything inside it is still honoured to
+  the second.
 
 ## [0.15.0] - 2026-07-30
 
