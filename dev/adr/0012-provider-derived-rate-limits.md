@@ -1,9 +1,13 @@
-# ADR-0012: Provider capacity is observed at runtime; operator policy may only narrow it
+# ADR-0012: Operator configuration is not evidence of provider headroom
 
-Status: **Draft — not accepted.** Blocked on the scoping change in "Blockers"
-below. An earlier revision of this file was briefly committed as `Accepted` by
-an over-broad `git add`; it was rejected in review and the reasoning it carried
-should not be relied on. See "What review corrected" for what changed and why.
+Status: Accepted (2026-08-02), shipped in v0.16.0. Governs what `internal/config`
+may express about a provider and how `internal/budget` treats a server
+`Retry-After`.
+
+**Scope.** This records a rule about configuration, which is decided and in
+force. It does *not* describe a system that learns provider capacity at
+runtime; papio has no such system, and the constraints on building one are
+recorded at the end rather than assumed away.
 
 ## Context
 
@@ -14,116 +18,137 @@ lease heartbeat kept the job claimed for the whole window. That bug is fixed
 elsewhere. What it exposed is the subject here: **papio did not know what its
 own limits were, and had no way to find out except by hitting them.**
 
-Three things were measured during the incident. All are reproducible; all
-constrain any design that follows.
+Three things were measured during the incident. All are reproducible.
 
 **The limit was not what anyone believed.** The first external consumer measured
 1000 requests/day and recorded multi-day cohort acquisition as a property of the
 design. 1000 is OpenAlex's *anonymous* allowance; an account is roughly ten
-times that, and papio's existing `api_key` field was empty. A real limit was
-measured against an unconfigured client and nearly written down as a fact about
-the world.
+times that, and papio's `api_key` field was empty. A real limit was measured
+against an unconfigured client and nearly written down as a fact about the
+world.
 
 **The quota is shared with consumers papio cannot enumerate.** Two probes an
 hour apart read `x-ratelimit-remaining` of 3 and then 0 while papio was provably
 idle — zero attempts, zero runnable jobs. The credits went to the consumer's own
-test suite, which had been calling OpenAlex on every unit run since it was
-written. The operator's browser hit the same wall the same hour.
+test suite, calling OpenAlex on every unit run since it was written. The
+operator's browser hit the same wall the same hour.
 
-**One source exposes multiple independent quota identities.** Measured at the
+**One source exposes several independent quota identities.** Measured at the
 same instant on the same machine: the anonymous pool read `remaining: 0` while
 an account key read `remaining: 9998`. An account is a *separate* budget, not a
 larger one.
 
-## The invariant
+## Decision
 
 **Operator configuration must never be treated as evidence of current provider
 headroom.**
 
-That is what the incident supports, and it is narrower than "operators may not
-configure limits". Configured values may constrain admission; they may never be
-represented, surfaced, or used as provider capacity. For comparable dimensions
-the effective gate is the intersection of provider capacity, operator policy,
-and a conservative fallback when capacity is unknown.
+This is narrower than "operators may not configure limits". Configured values
+may constrain admission; they may never be represented, surfaced, or relied on
+as provider capacity. Where both exist, the effective gate is the intersection —
+configuration can only make papio *more* conservative than the provider
+requires, never less.
 
 Four concepts, not two:
 
 | Concept | Examples | Authority |
 | --- | --- | --- |
-| Quota identity | anonymous IP pool, API-key account, institutional account | selected by credentials and request context |
-| Provider observation | `remaining`, `reset`, request cost, `Retry-After` | provider response or status endpoint |
-| Operator policy | pacing, concurrency, allocated share, maximum spend | configuration |
-| Local accounting | attempted calls, estimated cost, papio-attributed spend | papio |
+| Quota identity | anonymous IP pool, API-key account | selected by credentials |
+| Provider observation | `Retry-After`, `remaining`, `reset`, request cost | the provider's response |
+| Operator policy | `enabled`, `rate_per_sec`, `burst`, `max_cost_usd` | configuration |
+| Local accounting | requests papio made, cost papio estimated | papio's own records |
 
 A configured 2 rps means "papio will not exceed 2 rps", never "the provider
 permits 2 rps". `max_cost_usd` is operator *authorisation* — neither a
 credential nor provider capacity — and ADR-0010 already classifies it that way.
-The existence of a prepaid balance is not permission to spend it.
+A prepaid balance existing is not permission to spend it.
 
-## Blockers
+## What is already true
 
-This ADR cannot be accepted while any of these hold.
+Every claim here is checkable in the tree at v0.16.0.
 
-**Quota state is keyed by source name alone.** `budget.Manager` buckets and the
-`source_budgets` row are addressed by source, but the incident proved one source
-has several quota identities. Every learned field — remaining, reset, cost,
-`Retry-After`, local attribution — would be mis-scoped identically. Observations
-need something equivalent to `(source, quota_identity, provider_bucket)`, where
-the stored identity is a non-secret fingerprint, never the credential. Adding
-learned state before fixing this only makes the wrong answer more durable.
+`config.Source` carries `Enabled`, `APIKey`, `RatePerSec`, `Burst`,
+`MaxCostUSD` and a loopback dev override. **No field expresses a provider
+limit**, and none is to be added; the decision costs nothing to hold because
+there is nothing to remove.
 
-**Nothing currently learns.** `budget.Snapshot` exposes a local request count, a
-local spend estimate, a monthly window and `next_allowed_at`. There is no
-learned limit, remaining, reset, cost, or observation timestamp.
-`sourcegate.Reserver` exposes only `Acquire`; the client reserves before
-forwarding and returns the response untouched, so it cannot observe anything. It
-implements the accounting half only. Discovery converts any non-2xx into a
-generic error and sets no durable gate, so a 429 there is currently invisible.
+`budget.Defer` persists a server `Retry-After` and never shortens an existing
+gate, but never honours one beyond `budget.MaxDeferHorizon`. That constant is a
+**local safety policy**, not a claim about providers: papio will not let one
+unverified server value make a source unusable without a further observation.
+HTTP places no maximum on `Retry-After`, so this bound is papio's choice and is
+named as such.
 
-**Accounting is not structurally complete.** Only discovery clients are gated;
-resolvers and the Crossref enricher receive the bare shared client and reserve
-at the logical call level. `sourcegate.New` returns the unwrapped client when
-the reserver is nil, which is a silent bypass of the very invariant the package
-exists to hold.
+`papio doctor` warns rather than passing when `sources.openalex.api_key` is
+unset, naming the roughly tenfold difference. It detects an empty string; it
+does **not** verify the credential or query capacity.
 
-## What review corrected
+Negative `rate_per_sec`, `burst` and `max_cost_usd` are rejected at load,
+because the budget manager reads a rate at or below zero as unlimited and a cost
+ceiling at or below zero as unmetered — so a negative silently removed the
+protection it appeared to configure, which is configuration weakening a gate
+rather than narrowing it.
 
-Recorded because the errors are instructive, not to pad the file.
+## Why not a configured limit
 
-*"papio does not accept a rate limit as operator configuration"* was too strong,
-and the `rate_per_sec`-is-"courtesy" carve-out does not survive contact: a token
-bucket that delays requests is a rate limit whatever it is called. Legitimate
-operator-known constraints exist — a contractual ceiling, a share of an
-institutional account, a provider that publishes no headers, Crossref's separate
-concurrency limit, GitHub's undisclosed secondary limits.
+`max_requests_per_day` was considered and rejected on four grounds, ascending.
 
-*"Every real quota resets within a day"*, used to justify a 24-hour clamp, is
-exactly the kind of provider folklore this ADR condemns, derived from one
-incident. HTTP places no maximum on `Retry-After`, and manual blocks, sanctions
-and monthly allocations need not reset at midnight. The constant can survive as
-a **local safety policy** — papio will not let one unverified server value make
-a source unusable without another observation — but not as a fact about
-providers. `MaxTrustedRetryAfter` is the honest name, and clamping necessarily
-implies a bounded probe at the horizon, so "no automatic re-probe" was
-self-contradictory: the real choice is between a silent retry and an observable
-one.
+**It couples deployment.** Config decoding is strict, so a new `[sources.*]`
+field makes an older binary reject the whole file. Config and binary must then
+ship together, for a value the provider already sends.
 
-*"Absent capacity is reported"* overstated the doctor check, which detects an
-empty key string. It does not verify the credential or query capacity.
+**It cannot express the shape.** OpenAlex meters credits with per-request costs,
+a USD ceiling and a prepaid balance. One integer models none of that, and the
+model changed under us mid-incident.
 
-## Deferred deliberately
+**It cannot see the other consumers.** The number an operator would write is
+papio's share of a machine-wide budget, and that share depends on a test suite,
+a browser, and whatever else runs on the host.
 
-How learned capacity is *surfaced*. Widening a ratified result is forbidden by
-ADR-0009, so any external contract needs a new method regardless. Asked
-directly, the first external consumer said it would not poll a credits figure
-and would not schedule a marking loop against another system's accounting, but
-would use a **submit-time preflight**: one answer before a batch is committed —
-"N works, M credits, expect to park at roughly X%". Expectation-setting at the
-moment of decision rather than a gauge to monitor. Separate ADR.
+**And decisively: it records a belief, not a fact.** A configured limit encodes
+what someone once understood about a provider. That understanding is exactly
+what proved wrong here, and it changed twice within one day in both directions.
+A configured number institutionalises the error and makes it durable,
+authoritative-looking, and wrong.
 
-Whether `remaining: 0` should trigger a proactive defer is *not* safely
-deferred as a generic rule: OpenAlex exposes daily and prepaid pools separately
-and the prepaid pool can fund calls after the daily allowance is spent. A
-generic zero-means-blocked rule in shared code would be overconfident. The
-decision belongs to each source adapter, which alone knows its provider's
-zero and reset semantics.
+## Consequences
+
+papio has no advance knowledge of a source's headroom and discovers a limit by
+being told about it. That is accepted: an unknown that resolves on first contact
+is honest, where a configured number is confidently wrong at exactly the moments
+that matter.
+
+A credential change can invalidate a persisted `next_allowed_at` set under the
+old identity, which happened here when an account key arrived mid-incident.
+`MaxDeferHorizon` bounds the damage to a day. There is deliberately no automatic
+re-probe before the gate expires: papio does not second-guess a `Retry-After` it
+was given.
+
+## Not decided here
+
+**Learning provider capacity at runtime.** Nothing in papio observes a response:
+`budget.Snapshot` exposes only local accounting and the `Retry-After` gate, and
+`sourcegate` reserves before forwarding without inspecting what comes back. Two
+constraints are recorded so whoever builds it does not rederive them:
+
+- *Quota state is keyed by source name alone.* The evidence above shows one
+  source with several quota identities, so every learned field would be
+  mis-scoped. Observations need something like `(source, quota identity,
+  provider bucket)`, where the stored identity is a non-secret fingerprint,
+  never the credential. Adding learned state before this only makes the wrong
+  answer durable.
+- *Accounting is not structurally complete.* `sourcegate` has one call site —
+  discovery. Resolvers and the Crossref enricher reserve at the logical call
+  level instead, so a lookup issuing two requests is counted once.
+
+**Surfacing headroom.** Widening a ratified result is forbidden by ADR-0009, so
+any external contract needs a new method. Asked directly, the first external
+consumer said it would not poll a credits figure and would not schedule against
+another system's accounting, but would use a **submit-time preflight**: one
+answer before a batch is committed — "N works, M credits, expect to park at
+roughly X%". Expectation-setting at the moment of decision, not a gauge.
+
+**Proactive deferral on `remaining: 0`.** Not safe as a generic rule: OpenAlex
+exposes daily and prepaid pools separately and the prepaid pool can fund calls
+after the daily allowance is spent. The decision belongs to each source adapter,
+which alone knows its provider's zero and reset semantics.
