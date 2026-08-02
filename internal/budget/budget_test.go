@@ -130,6 +130,36 @@ func TestAcquireStillWaitsOutAShortGate(t *testing.T) {
 	}
 }
 
+// A provider with a clock bug or a malformed Retry-After could otherwise park
+// every job needing that source for as long as it asked, recoverable only by
+// editing the database. Every real quota resets within a day.
+func TestDeferIsClampedToADayEvenIfTheServerAsksForLonger(t *testing.T) {
+	m := testManager(t)
+	ctx := context.Background()
+	if err := m.Defer(ctx, "confused", time.Now().UTC().Add(365*24*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	snap, err := m.Snapshot(ctx, "confused")
+	if err != nil || snap.NextAllowedAt == nil {
+		t.Fatalf("snapshot = %+v, %v", snap, err)
+	}
+	if until := time.Until(*snap.NextAllowedAt); until > MaxDeferHorizon+time.Minute {
+		t.Fatalf("gate is %v out, want no more than %v", until, MaxDeferHorizon)
+	}
+	// A gate inside the horizon is still honoured exactly.
+	want := time.Now().UTC().Add(2 * time.Hour)
+	if err := m.Defer(ctx, "polite", want); err != nil {
+		t.Fatal(err)
+	}
+	snap, err = m.Snapshot(ctx, "polite")
+	if err != nil || snap.NextAllowedAt == nil {
+		t.Fatalf("snapshot = %+v, %v", snap, err)
+	}
+	if snap.NextAllowedAt.Sub(want).Abs() > time.Minute {
+		t.Fatalf("gate = %s, want the server's %s untouched", snap.NextAllowedAt, want)
+	}
+}
+
 func TestDeferNeverShortensExistingGate(t *testing.T) {
 	m := testManager(t)
 	later := time.Now().UTC().Add(2 * time.Hour)

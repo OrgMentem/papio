@@ -219,10 +219,24 @@ func (m *Manager) reserve(ctx context.Context, source string, limit, cost float6
 	return tx.Commit()
 }
 
+// MaxDeferHorizon bounds how far a server may push a source out. Every real
+// quota resets within a day — OpenAlex answers an exhausted daily allowance
+// with a Retry-After pointing at the next UTC midnight — so anything beyond
+// this is a clock skew, a malformed header or a bug, and papio believing it
+// would park every job needing that source for as long as the provider said,
+// with no way back except editing the database. Clamping costs one wasted
+// request when the gate turns out to still be closed; not clamping costs the
+// source until someone notices.
+const MaxDeferHorizon = 24 * time.Hour
+
 // Defer persists a server-requested next allowed time (usually Retry-After).
-// It never shortens an existing later gate.
+// It never shortens an existing later gate, and never honours one beyond
+// MaxDeferHorizon.
 func (m *Manager) Defer(ctx context.Context, source string, until time.Time) error {
 	until = until.UTC()
+	if horizon := m.now().UTC().Add(MaxDeferHorizon); until.After(horizon) {
+		until = horizon
+	}
 	_, err := m.db.ExecContext(ctx, `INSERT INTO source_budgets(source, window_start, next_allowed_at)
 		VALUES(?, ?, ?)
 		ON CONFLICT(source) DO UPDATE SET next_allowed_at =
