@@ -286,7 +286,14 @@ func checkSourceCredentials(cfg config.Config, add func(string, string, string, 
 		if strings.TrimSpace(cfg.Email) == "" {
 			add("source_openalex", Fail, "OpenAlex is enabled without a contact email", "set email (polite pool); sources.openalex.api_key is optional premium capacity")
 		} else if strings.TrimSpace(cfg.SourcePolicy(config.SourceOpenAlex).APIKey) == "" {
-			add("source_openalex", Pass, "OpenAlex polite-pool contact configured (no API key)", "")
+			// Passing cleanly here reads as fully configured, and that is how a
+			// real operator missed it: they measured the anonymous tier's 1000
+			// credits a day against an unkeyed client and recorded multi-day
+			// cohort acquisition as a property of the design. An account is
+			// free and roughly ten times the allowance, so the gap is worth a
+			// word even though nothing is broken.
+			add("source_openalex", Warn, "OpenAlex is on the anonymous allowance, roughly a tenth of an account's",
+				"set sources.openalex.api_key from a free openalex.org account; the anonymous quota is shared per-IP with every other tool on this machine")
 		} else {
 			add("source_openalex", Pass, "OpenAlex credentials configured", "")
 		}

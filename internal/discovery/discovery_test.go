@@ -17,6 +17,64 @@ import (
 	"papio/internal/zotio"
 )
 
+// Every request this client makes must present the account credential, or it
+// silently draws on OpenAlex's anonymous per-IP quota — shared with the
+// resolver, the browser and every other tool on the machine, and the budget a
+// 309-work cohort exhausted twice in one day. The seed lookup is the path that
+// gets forgotten: it builds its query separately from search, so a key wired
+// only into search leaves citation snowballing unauthenticated.
+func TestEveryRequestPathPresentsTheAPIKey(t *testing.T) {
+	seed, err := os.ReadFile("testdata/openalex_work_by_doi.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]string{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		kind := "search"
+		if strings.HasPrefix(r.URL.Path, "/works/doi:") {
+			kind = "seed"
+		}
+		seen[kind] = r.URL.Query().Get("api_key")
+		if kind == "seed" {
+			_, _ = w.Write(seed)
+			return
+		}
+		_, _ = w.Write([]byte(`{"results":[]}`))
+	}))
+	defer server.Close()
+
+	client := NewWithOptions(Options{
+		ContactEmail: "researcher@example.org", APIKey: "test-key", BaseURL: server.URL + "/works",
+	})
+	if _, err := client.Search(context.Background(), SearchParams{Cites: "10.1000/seed", Limit: 5}); err != nil {
+		t.Fatal(err)
+	}
+	for _, kind := range []string{"seed", "search"} {
+		if seen[kind] != "test-key" {
+			t.Fatalf("%s request sent api_key=%q, want the configured key", kind, seen[kind])
+		}
+	}
+}
+
+// An unconfigured key must not become an empty api_key parameter: OpenAlex
+// would reject that outright rather than falling back to the anonymous pool.
+func TestNoAPIKeyMeansNoAPIKeyParameter(t *testing.T) {
+	var present bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, present = r.URL.Query()["api_key"]
+		_, _ = w.Write([]byte(`{"results":[]}`))
+	}))
+	defer server.Close()
+
+	client := NewWithOptions(Options{ContactEmail: "researcher@example.org", BaseURL: server.URL + "/works"})
+	if _, err := client.Search(context.Background(), SearchParams{Query: "motivation", Limit: 5}); err != nil {
+		t.Fatal(err)
+	}
+	if present {
+		t.Fatal("api_key parameter was sent with no key configured")
+	}
+}
+
 func TestSearchMapsRecordedOpenAlexWorks(t *testing.T) {
 	fixture, err := os.ReadFile("testdata/openalex_works.json")
 	if err != nil {

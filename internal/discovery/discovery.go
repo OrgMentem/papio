@@ -46,11 +46,15 @@ type HTTPClient interface {
 }
 
 // Options configures a Client. ContactEmail is required for OpenAlex's polite
-// pool. BaseURL exists only for an explicitly configured loopback development
-// endpoint.
+// pool. APIKey is the account credential; without it this client stays on the
+// anonymous per-IP quota even when the resolver holds a key, which splits
+// papio's OpenAlex traffic across two budgets that the budget manager counts
+// as one source. BaseURL exists only for an explicitly configured loopback
+// development endpoint.
 type Options struct {
 	Client           HTTPClient
 	ContactEmail     string
+	APIKey           string
 	BaseURL          string
 	Version          string
 	MaxResponseBytes int64
@@ -107,6 +111,7 @@ type DiscoveredWork struct {
 type Client struct {
 	client  HTTPClient
 	email   string
+	apiKey  string
 	baseURL string
 	version string
 	maxBody int64
@@ -137,7 +142,8 @@ func NewWithOptions(opts Options) *Client {
 		client = &http.Client{Timeout: 10 * time.Second}
 	}
 	return &Client{
-		client: client, email: strings.TrimSpace(opts.ContactEmail), baseURL: baseURL,
+		client: client, email: strings.TrimSpace(opts.ContactEmail),
+		apiKey: strings.TrimSpace(opts.APIKey), baseURL: baseURL,
 		version: version, maxBody: maxBody,
 	}
 }
@@ -312,8 +318,19 @@ func (c *Client) seedURL(doi string) (*url.URL, error) {
 	base.RawPath = ""
 	values := base.Query()
 	values.Set("mailto", c.email)
+	c.authenticate(values)
 	base.RawQuery = values.Encode()
 	return base, nil
+}
+
+// authenticate presents the OpenAlex account credential. Every request this
+// client makes goes through here or it silently draws on the anonymous per-IP
+// quota, which is shared with every other tool on the machine and is the
+// budget a 309-work cohort exhausted twice in one day.
+func (c *Client) authenticate(values url.Values) {
+	if c.apiKey != "" {
+		values.Set("api_key", c.apiKey)
+	}
 }
 
 func openAlexWorkID(value string) string {
@@ -338,6 +355,7 @@ func (c *Client) searchURL(params SearchParams, query string, citationFilters []
 	}
 	values.Set("per-page", strconv.Itoa(normalized.Limit))
 	values.Set("mailto", c.email)
+	c.authenticate(values)
 	if normalized.Slim {
 		values.Set("select", slimFields)
 	}

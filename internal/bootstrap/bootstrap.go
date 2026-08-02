@@ -383,7 +383,9 @@ func discoverySources(cfg config.Config) []discovery.Source {
 		switch name {
 		case config.SourceOpenAlex:
 			sources = append(sources, discovery.NewWithOptions(discovery.Options{
-				ContactEmail: cfg.Email, BaseURL: cfg.Sources[config.SourceOpenAlex].BaseURLForDev,
+				ContactEmail: cfg.Email,
+				APIKey:       cfg.Sources[config.SourceOpenAlex].APIKey,
+				BaseURL:      cfg.Sources[config.SourceOpenAlex].BaseURLForDev,
 			}))
 		case config.SourceSemanticScholar:
 			sources = append(sources, discovery.NewSemanticScholarWithOptions(discovery.SemanticScholarOptions{
