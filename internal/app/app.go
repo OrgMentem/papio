@@ -730,6 +730,7 @@ func (s *Service) enrich(ctx context.Context, row *job.Row) error {
 
 func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[string]resolver.Candidate, plan retryPlan) error {
 	manual := false
+	manualRequiresAuth := false
 	// Candidate rows and events retain only redacted URLs. Keep the one
 	// browser-eligible OA URL only through this acquisition pass, then record
 	// it in the local handoff action if the job exhausts.
@@ -764,6 +765,13 @@ func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[st
 		}
 		if !candidate.Direct {
 			manual = true
+			// Whether that manual route needs a sign-in is decided here, where
+			// the candidate's access basis is still in hand; the park below has
+			// only the flag. An open-access landing page can be fetched by a
+			// human with no institution behind them, anything else cannot.
+			if candidate.AccessBasis != resolver.AccessOpen {
+				manualRequiresAuth = true
+			}
 			// A non-direct candidate is a landing page the daemon cannot fetch
 			// as a file. When it is open access (no institutional login), the
 			// extension's provider adapters can still resolve the PDF from the
@@ -876,8 +884,17 @@ func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[st
 		// Rejection returned the job to fetching to try the next candidate.
 	}
 
+	// Classification, not gating. Conservative is documented to "emit
+	// institutional or document-delivery actions, but not open them"
+	// (docs/concepts/access-modes.md), and emitting this park is exactly that —
+	// papio tells the operator what it found and drives no browser. So the park
+	// stays in every mode; what was wrong was the hardcoded false, which
+	// labelled a paywalled landing page as needing no sign-in and so lied to
+	// the one field the access-mode safety check reads.
 	if manual && oaBrowserURL == "" {
-		if _, err := s.Jobs.OpenHumanAction(ctx, row.ID, "manual_download", "a resolver returned a landing page but no verified direct PDF", job.WithAccessClassification(false, "landing_page")); err != nil {
+		if _, err := s.Jobs.OpenHumanAction(ctx, row.ID, "manual_download",
+			"a resolver returned a landing page but no verified direct PDF",
+			job.WithAccessClassification(manualRequiresAuth, "landing_page")); err != nil {
 			return err
 		}
 		return s.park(ctx, row.ID, job.StateFetching, job.StateAwaitingHuman,
