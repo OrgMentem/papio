@@ -276,17 +276,23 @@ func printPage[T any](o *options, key string, rows []T, truncated bool) error {
 	return o.printJSON(agentjson.Envelope(key, rows, truncated))
 }
 
-// effectiveLimit reproduces a daemon store's own "limit outside (0, max]
-// resets to def" clamp client-side (job.Store.List, job.Store.Failures's
-// zero case, watch.Store.Digest), so a CLI command can pass the very value
-// the daemon will actually use to both the RPC call and agentjson.Capped.
-// Comparing a returned row count against the raw --limit flag instead is
-// how `truncated` lies whenever --limit is out of the daemon's range: the
-// daemon silently substitutes def, but Capped kept comparing against the
-// original request.
+// effectiveLimit reproduces a daemon store's own clamp client-side
+// (job.EffectiveListLimit, watch.Store.Digest), so a CLI command can pass the
+// very value the daemon will actually use to both the RPC call and
+// agentjson.Capped. Comparing a returned row count against the raw --limit
+// flag instead is how `truncated` lies whenever --limit is out of range.
+//
+// It must stay in step with the stores: this is a fourth copy of that clamp,
+// and when the stores stopped resetting an over-large limit to the default,
+// leaving this one behind kept `--limit 600` returning 100 rows even though
+// the daemon would have served 500. The unit test passed; only running the
+// command showed it.
 func effectiveLimit(requested, max, def int) int {
-	if requested <= 0 || requested > max {
+	if requested <= 0 {
 		return def
+	}
+	if requested > max {
+		return max
 	}
 	return requested
 }

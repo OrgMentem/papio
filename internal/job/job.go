@@ -1613,9 +1613,7 @@ func (js *Store) ListOldest(ctx context.Context, states []string, limit int) ([]
 	if len(states) == 0 {
 		return nil, nil
 	}
-	if limit <= 0 || limit > ListLimitMax {
-		limit = ListLimitDefault
-	}
+	limit = EffectiveListLimit(limit)
 	key := strings.Join(states, "\x00")
 	js.oldestMu.Lock()
 	defer js.oldestMu.Unlock()

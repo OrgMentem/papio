@@ -31,8 +31,9 @@ const (
 )
 
 // DigestLimitMax and DigestLimitDefault bound Store.Digest's limit parameter:
-// a caller-supplied limit outside (0, DigestLimitMax] resets to
-// DigestLimitDefault. Exported so internal/cli can compute the same effective
+// an unspecified limit uses DigestLimitDefault and an over-large one clamps
+// down to DigestLimitMax, so asking for more never returns fewer.
+// Exported so internal/cli can compute the same effective
 // limit the daemon will actually use — see internal/agentjson.Capped and its
 // callers.
 const (
@@ -332,8 +333,11 @@ func (s *Store) Digest(ctx context.Context, watchID int64, limit int) ([]DigestE
 	if _, err := s.Get(ctx, watchID); err != nil {
 		return nil, err
 	}
-	if limit <= 0 || limit > DigestLimitMax {
+	if limit <= 0 {
 		limit = DigestLimitDefault
+	}
+	if limit > DigestLimitMax {
+		limit = DigestLimitMax
 	}
 	rows, err := s.S.DB().QueryContext(ctx, `
 		SELECT work_key, title, authors, authors_json, year, doi, is_oa, abstract, first_seen_at, identifiers_json

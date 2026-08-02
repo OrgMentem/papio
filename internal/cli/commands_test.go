@@ -455,8 +455,8 @@ func TestJobsListReportsProvenTruncation(t *testing.T) {
 			if err := root.ExecuteContext(context.Background()); err != nil {
 				t.Fatalf("jobs list --limit 5000: %v (%s)", err, errOut.String())
 			}
-			if gotLimit != job.ListLimitDefault {
-				t.Fatalf("limit param = %d, want the daemon-effective %d (an out-of-range limit is clamped)", gotLimit, job.ListLimitDefault)
+			if gotLimit != job.ListLimitMax {
+				t.Fatalf("limit param = %d, want the daemon-effective %d: an over-large limit clamps DOWN to the maximum, it does not reset to the default", gotLimit, job.ListLimitMax)
 			}
 			var page struct {
 				Jobs      []job.Row `json:"jobs"`
