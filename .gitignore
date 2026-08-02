@@ -1,6 +1,7 @@
 bin/
 dist/
 extension/firefox/
+extension/dev-unpacked/
 extension/web-ext-artifacts/
 extension/.ff-dev-profile/
 extension/.env
