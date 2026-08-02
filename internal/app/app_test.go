@@ -1837,9 +1837,13 @@ func TestSourceGateParksDoNotSpendTheRetryBudget(t *testing.T) {
 	}
 }
 
-// The budget may legitimately run out on real temporary failures while a
-// source gate is still closed. The gated source has still never had its one
-// call, so a terminal verdict is unsupported: park until the gate opens.
+// The budget may legitimately run out on real temporary failures while a source
+// gate is still closed. The gated source has never had its one call, so it gets
+// exactly ONE post-exhaustion wait — and no more. An unlimited wait is not a
+// safe generalisation: a temporary failure defers its own source, so a job
+// failing for real keeps refreshing the gate that excuses it. Seen live at 41
+// temporary transitions against a bound of 8, re-parking every thirty seconds
+// forever, on a job that should have settled 33 cycles earlier.
 func TestPendingGateOutranksAnExhaustedRetryBudget(t *testing.T) {
 	ctx := context.Background()
 	svc, jobs := newTestService(t)
@@ -1863,6 +1867,8 @@ func TestPendingGateOutranksAnExhaustedRetryBudget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Drive to exhaustion; the one allowed post-exhaustion wait parks at the gate.
+	var parkedAt string
 	for range maxRetryAttempts + 4 {
 		row, err := jobs.Get(ctx, id)
 		if err != nil {
@@ -1874,20 +1880,25 @@ func TestPendingGateOutranksAnExhaustedRetryBudget(t *testing.T) {
 		if err := svc.Process(ctx, row); err != nil {
 			t.Fatal(err)
 		}
+		if after, _ := jobs.Get(ctx, id); after != nil && after.State == job.StateRetryWait {
+			parkedAt = after.RetryAt
+		}
 	}
+	parked, err := time.Parse(time.RFC3339Nano, parkedAt)
+	if err != nil {
+		t.Fatalf("retry_at %q: %v", parkedAt, err)
+	}
+	if parked.Sub(gate).Abs() > time.Minute {
+		t.Fatalf("retry_at = %s, want the pending gate %s once the temporary budget is spent", parked, gate)
+	}
+	// A second post-exhaustion wait would mean the gate is being refreshed by
+	// the failures rather than waited out, so the job must settle instead.
 	row, err := jobs.Get(ctx, id)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if row.State != job.StateRetryWait {
-		t.Fatalf("state = %s, want retry_wait: the gated source was never called, so no terminal verdict is supported", row.State)
-	}
-	parked, err := time.Parse(time.RFC3339Nano, row.RetryAt)
-	if err != nil {
-		t.Fatalf("retry_at %q: %v", row.RetryAt, err)
-	}
-	if parked.Sub(gate).Abs() > time.Minute {
-		t.Fatalf("retry_at = %s, want the pending gate %s once the temporary budget is spent", parked, gate)
+	if !job.Terminal(row.State) {
+		t.Fatalf("state = %s; a gate the job's own failures keep refreshing must not defer the verdict forever", row.State)
 	}
 }
 

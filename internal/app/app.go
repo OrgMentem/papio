@@ -899,20 +899,26 @@ func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[st
 // eight attempts in minutes and settles the job with a "temporary failures did
 // not clear" reason naming a source that was never called.
 //
-// And when the budget really is spent but a gate is still pending, the gated
-// source has still never had its one call: park until it opens rather than
-// publish a terminal verdict the evidence does not support.
+// And when the budget really is spent, a pending gate buys the job exactly ONE
+// more wait, not an open-ended one. The rule exists so a source that never had
+// its one call still gets it — but a temporary failure also defers its own
+// source, so a job failing for real keeps manufacturing the very gate that
+// excuses it. Observed live at 41 temporary transitions against a bound of 8,
+// re-parking every thirty seconds indefinitely. One wait lets the gated source
+// answer; a second means the gate is being refreshed by the failures rather
+// than waited out, and the job settles.
 func (s *Service) parkForRetry(ctx context.Context, row *job.Row, from string, plan retryPlan, reason string, exhaustedReason job.TerminalReason, oaBrowserURL string) error {
 	now := s.Now().UTC()
 	at := plan.At()
+	kind := plan.Kind()
 	if s.retryBudgetExhausted(ctx, row.ID) {
-		if !plan.GatePending(now) {
+		if !plan.GatePending(now) || s.alreadyWaitedPastExhaustion(ctx, row.ID) {
 			return s.exhaustedCandidates(ctx, row, from, "retry_budget_exhausted", exhaustedReason, oaBrowserURL)
 		}
 		// Only the gate still justifies waiting. Waking at the shorter
 		// temporary time would re-claim, find the budget still spent, and
 		// park again — a spin at the temporary interval until the gate opens.
-		at = plan.Gate
+		at, kind = plan.Gate, retryKindExhaustedGate
 	}
 	if !at.After(now) {
 		// The gate elapsed while the rest of the pass ran. Persisting a past
@@ -921,7 +927,26 @@ func (s *Service) parkForRetry(ctx context.Context, row *job.Row, from string, p
 		at = now.Add(s.RetryDelay)
 	}
 	return s.Jobs.Transition(ctx, row.ID, from, job.StateRetryWait,
-		map[string]any{"reason": reason, "retry_kind": plan.Kind()}, job.WithRetryAt(at))
+		map[string]any{"reason": reason, "retry_kind": kind}, job.WithRetryAt(at))
+}
+
+// alreadyWaitedPastExhaustion reports whether this job has already spent its
+// one post-exhaustion wait on a pending gate.
+func (s *Service) alreadyWaitedPastExhaustion(ctx context.Context, jobID string) bool {
+	events, err := s.Jobs.Events(ctx, jobID)
+	if err != nil {
+		return true // fail closed: prefer settling to looping
+	}
+	for _, event := range events {
+		if kind, _ := event["kind"].(string); kind != "job.transition" {
+			continue
+		}
+		detail, _ := event["detail"].(map[string]any)
+		if kind, _ := detail["retry_kind"].(string); kind == retryKindExhaustedGate {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Service) park(ctx context.Context, jobID, from, to string, detail map[string]any, opts ...job.TransitionOpt) error {
@@ -1337,6 +1362,10 @@ func autoImportErrorInfo(err error) (class, hint string, httpStatus int) {
 const (
 	retryKindTemporary  = "temporary"
 	retryKindSourceGate = "source_gate"
+	// retryKindExhaustedGate marks the single wait a job is allowed after its
+	// retry budget is spent, so a second one can be refused. Not counted by
+	// retryBudgetExhausted: the budget is already spent by definition here.
+	retryKindExhaustedGate = "exhausted_gate"
 )
 
 // retryPlan separates the two reasons an acquisition pass can end with no
