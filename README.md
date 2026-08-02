@@ -64,13 +64,8 @@
   Finding citations is easy; <em>getting the PDFs, legitimately</em> is the tedious
   part. <code>papio</code> backfills the works in your library that lack full
   text, checking open-access and licensed sources first and falling back to a
-  visible institutional pass in your own browser only when needed. Watch a
-  collection and new matches arrive with verified full text; or hand the loop
-  to a research agent over MCP — without handing it your university
-  credentials. Every PDF is validated before <code>papio</code> offers it for
-  filing: Zotero uses <a href="https://github.com/OrgMentem/zotio">zotio</a>'s
-  preview-and-confirmation boundary; other destinations receive a best-effort
-  handoff through a one-line <code>on_ready</code> hook.
+  visible institutional pass in your own browser only when needed. Gives tools to 
+  research agents — without handing them your university credentials.
 </p>
 
 ```bash
