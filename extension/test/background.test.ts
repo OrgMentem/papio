@@ -3540,3 +3540,20 @@ test("a refused review preview reports the daemon's reason", async () => {
     detail: "review action 9999 is unavailable",
   });
 });
+
+test("a direct-file offer that requires a sign-in is queued, never downloaded", async () => {
+  // isDirectFileOffer matches on URL shape alone. An institutional offer's URL
+  // is the operator's configured OpenURL base, whose path papio does not
+  // constrain, so a pdf-shaped base would otherwise route a sign-in-required
+  // offer straight into chrome.downloads with no human present.
+  const h = makeHarness();
+  const offer = jobOffer("job_0091_auth_direct") as { payload: Record<string, unknown> };
+  offer.payload["openurl"] = "https://library.example.edu/openurl/pdf/10.1000-x";
+  offer.payload["requires_auth"] = true;
+  await h.bridge.start();
+  await h.port.inbound(offer);
+
+  expect(h.downloads.started).toEqual([]);
+  const job = h.backend.store.activeJobs.find((j) => j.job_id === "job_0091_auth_direct");
+  expect(job?.status).toBe("queued");
+});

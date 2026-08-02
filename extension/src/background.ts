@@ -2994,7 +2994,16 @@ export class Bridge {
       ...(expected !== undefined ? { expected } : {}),
       ...(requiresAuth !== undefined ? { requires_auth: requiresAuth } : {}),
     });
-    if (isDirectFileOffer(openurl)) {
+    // A direct-file URL is not permission to download unattended. The
+    // shape-matching above says only "this looks like a file"; whether a human
+    // must sign in is a property of the ACTION, and the daemon has already
+    // decided it. Checking it here rather than refusing to emit file-shaped
+    // URLs daemon-side keeps isDirectFileOffer's heuristic in one component:
+    // the offer URL for an institutional handoff is the operator's configured
+    // OpenURL base, whose path papio does not constrain, so a pdf-shaped base
+    // would otherwise route a sign-in-required offer straight to a download.
+    // Only an explicit true refuses; absent and false behave as before.
+    if (isDirectFileOffer(openurl) && requiresAuth !== true) {
       await this.upsertJobWithOffer(makeJob(-1), openurl);
       this.send("job_accept", {}, jobID);
       await this.startDirectOfferDownload(jobID, openurl);
