@@ -269,6 +269,25 @@ func newJobsCommand(opt *options) *cobra.Command {
 			if err := opt.call(cmd.Context(), "jobs.cancel", map[string]string{"job_id": args[0]}, &result); err != nil {
 				return err
 			}
+			// Store.Cancel is a documented idempotent no-op once a job is
+			// terminal, which is right for the API and a lie in this sentence:
+			// a job that finished a moment earlier reported "Cancelled" and an
+			// operator believed they had stopped it. Read the state back and
+			// say what actually happened. The result cannot carry the answer
+			// because jobs.cancel's shape is fixed for older CLIs.
+			// Decoded into the full api.JobDetail deliberately: IPC results
+			// reject unknown fields recursively, so a narrow ad-hoc struct
+			// declaring only what this line needs is rejected wholesale.
+			after := &api.JobDetail{}
+			if err := opt.call(cmd.Context(), "jobs.get", map[string]string{"job_id": args[0]}, after); err != nil {
+				return opt.printResult(result, "Cancel requested for %s", args[0])
+			}
+			if after.Job == nil {
+				return opt.printResult(result, "Cancel requested for %s", args[0])
+			}
+			if after.Job.State != string(job.StateCancelled) {
+				return opt.printResult(result, "%s was already %s; nothing to cancel", args[0], after.Job.State)
+			}
 			return opt.printResult(result, "Cancelled %s", args[0])
 		},
 	}
