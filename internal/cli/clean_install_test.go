@@ -118,8 +118,8 @@ func TestCleanInstallBootstrapsAndAcceptsWork(t *testing.T) {
 		t.Fatal("daemon bootstrap did not construct a scheduler")
 	}
 	version, err := system.Store.UserVersion(ctx)
-	if err != nil || version != 17 {
-		t.Fatalf("fresh schema version = %d, %v; want 17", version, err)
+	if err != nil || version != 18 {
+		t.Fatalf("fresh schema version = %d, %v; want 18", version, err)
 	}
 
 	stub := &cleanInstallResolver{}

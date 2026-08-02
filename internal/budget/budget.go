@@ -1,16 +1,20 @@
 // Copyright 2026 OrgMentem. Licensed under MIT. See LICENSE.
 // Package budget gates source calls with an in-memory token bucket plus a
-// durable monthly spend/retry window. The database is authoritative across
-// daemon restarts; tokens are deliberately process-local (a restart may grant
-// one fresh burst, never more than the configured monetary budget).
+// durable monthly spend/retry window keyed by (source, quota identity). The
+// database is authoritative across daemon restarts; tokens are deliberately
+// process-local (a restart may grant one fresh burst, never more than the
+// configured monetary budget).
 package budget
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"math"
+	"strings"
 	"sync"
 	"time"
 
@@ -20,14 +24,15 @@ import (
 
 // ErrExceeded means the configured monthly source budget would be crossed.
 type ErrExceeded struct {
-	Source  string
-	Spent   float64
-	Limit   float64
-	Attempt float64
+	Source   string
+	Identity string
+	Spent    float64
+	Limit    float64
+	Attempt  float64
 }
 
 func (e *ErrExceeded) Error() string {
-	return fmt.Sprintf("source %s monthly budget exceeded: spent $%.2f + request $%.2f > limit $%.2f", e.Source, e.Spent, e.Attempt, e.Limit)
+	return fmt.Sprintf("source %s (%s) monthly budget exceeded: spent $%.2f + request $%.2f > limit $%.2f", e.Source, e.Identity, e.Spent, e.Attempt, e.Limit)
 }
 
 // MaxInlineWait bounds how long Acquire will block a caller on the durable
@@ -48,16 +53,23 @@ const MaxInlineWait = 5 * time.Second
 // until Until rather than wait.
 type ErrDeferred struct {
 	Source string
-	Until  time.Time
+	// Identity is the account the deferred call was made under. A durable
+	// gate is stored against that account's row; a token-bucket deferral is
+	// source-wide and merely reports who it turned away.
+	Identity string
+	Until    time.Time
 }
 
 func (e *ErrDeferred) Error() string {
-	return fmt.Sprintf("source %s is deferred until %s", e.Source, e.Until.UTC().Format(time.RFC3339))
+	return fmt.Sprintf("source %s (%s) is deferred until %s", e.Source, e.Identity, e.Until.UTC().Format(time.RFC3339))
 }
 
-// Snapshot is safe diagnostic state; it never contains credentials.
+// Snapshot is safe diagnostic state; it never contains credentials. Identity
+// is a non-secret fingerprint of the credential the counters were earned
+// under, never the credential itself.
 type Snapshot struct {
 	Source           string     `json:"source"`
+	Identity         string     `json:"identity"`
 	WindowStart      string     `json:"window_start"`
 	RequestsInWindow int        `json:"requests_in_window"`
 	SpentUSD         float64    `json:"spent_usd"`
@@ -68,7 +80,12 @@ type Snapshot struct {
 type Manager struct {
 	db *sql.DB
 
-	mu       sync.Mutex
+	mu sync.Mutex
+	// limiters is keyed by source name alone, deliberately unlike the durable
+	// rows which are keyed by (source, identity). A token bucket is politeness
+	// toward a host, and that does not double because the operator happens to
+	// hold two credentials for it; the durable row tracks a provider quota,
+	// which the provider does meter per credential.
 	limiters map[string]*tokenBucket
 	now      func() time.Time
 }
@@ -86,6 +103,35 @@ func New(s *store.Store) *Manager {
 	return &Manager{db: s.DB(), limiters: make(map[string]*tokenBucket), now: time.Now}
 }
 
+// identityFor names the provider account a call is made under. A provider
+// meters by credential, not by source name: measured on one machine in the
+// same second, OpenAlex anonymous read remaining 0 while the same source with
+// an API key read 8792. Two budgets, so two rows.
+//
+// The fingerprint is a truncated SHA-256 of the credential and never the
+// credential itself, because it is written to the database and read back in
+// diagnostics. Sixty-four bits is far past collision range for the handful of
+// credentials one machine holds, and short enough to read in a log line.
+//
+// The hash is deliberately unsalted, which is safe only because every
+// credential papio accepts today is a high-entropy provider token: a bare
+// 64-bit digest of a *guessable* string is reversible by dictionary, and this
+// value is persisted and printed. A source whose "api_key" is low-entropy —
+// an email, a username, an institution id — would need a per-install salt
+// before it could be fingerprinted here.
+//
+// TrimSpace is not cosmetic: every client trims before deciding whether to
+// send the credential, so trimming here is what keeps a whitespace-only key
+// metered as the anonymous traffic it actually is.
+func identityFor(policy config.Source) string {
+	key := strings.TrimSpace(policy.APIKey)
+	if key == "" {
+		return "anonymous"
+	}
+	sum := sha256.Sum256([]byte(key))
+	return "key-" + hex.EncodeToString(sum[:8])
+}
+
 // Acquire waits for Retry-After and the in-memory token bucket, then atomically
 // reserves one request and estimatedCost in the current UTC calendar month.
 // A source with MaxCostUSD == 0 is unmetered monetarily; rate <= 0 is unthrottled.
@@ -101,12 +147,13 @@ func (m *Manager) Acquire(ctx context.Context, source string, policy config.Sour
 	if !policy.Enabled {
 		return fmt.Errorf("source %s is disabled", source)
 	}
+	identity := identityFor(policy)
 
 	// One deadline for the whole loop: a gate that keeps being pushed out
 	// while we sleep must not extend the wait past a single MaxInlineWait.
 	deadline := m.now().UTC().Add(MaxInlineWait)
 	for {
-		snap, err := m.Snapshot(ctx, source)
+		snap, err := m.Snapshot(ctx, source, policy)
 		if err != nil {
 			return err
 		}
@@ -115,16 +162,16 @@ func (m *Manager) Acquire(ctx context.Context, source string, policy config.Sour
 			break
 		}
 		if snap.NextAllowedAt.After(deadline) {
-			return &ErrDeferred{Source: source, Until: *snap.NextAllowedAt}
+			return &ErrDeferred{Source: source, Identity: identity, Until: *snap.NextAllowedAt}
 		}
 		if err := sleepContext(ctx, snap.NextAllowedAt.Sub(now)); err != nil {
 			return err
 		}
 	}
-	if err := m.takeToken(ctx, source, policy.RatePerSec, policy.Burst); err != nil {
+	if err := m.takeToken(ctx, source, identity, policy.RatePerSec, policy.Burst); err != nil {
 		return err
 	}
-	return m.reserve(ctx, source, policy.MaxCostUSD, estimatedCost)
+	return m.reserve(ctx, source, identity, policy.MaxCostUSD, estimatedCost)
 }
 
 // takeToken spends one token, waiting for the bucket to refill. Like the gate
@@ -133,7 +180,7 @@ func (m *Manager) Acquire(ctx context.Context, source string, policy config.Sour
 // its claim while the heartbeat renews the lease. Contention makes the bound
 // necessary rather than decorative — a waiter can lose each refilled token to
 // another goroutine and never converge on its own.
-func (m *Manager) takeToken(ctx context.Context, source string, rate float64, burst int) error {
+func (m *Manager) takeToken(ctx context.Context, source, identity string, rate float64, burst int) error {
 	if rate <= 0 {
 		return nil
 	}
@@ -175,7 +222,7 @@ func (m *Manager) takeToken(ctx context.Context, source string, rate float64, bu
 			// cannot serve you now, release the worker and park. Deliberately
 			// never persisted through Defer — a token is process-local and
 			// advisory, and another caller may take it first.
-			return &ErrDeferred{Source: source, Until: next.UTC()}
+			return &ErrDeferred{Source: source, Identity: identity, Until: next.UTC()}
 		}
 		if err := sleepContext(ctx, wait); err != nil {
 			return err
@@ -183,7 +230,7 @@ func (m *Manager) takeToken(ctx context.Context, source string, rate float64, bu
 	}
 }
 
-func (m *Manager) reserve(ctx context.Context, source string, limit, cost float64) error {
+func (m *Manager) reserve(ctx context.Context, source, identity string, limit, cost float64) error {
 	now := m.now().UTC()
 	month := now.Format("2006-01")
 
@@ -192,27 +239,27 @@ func (m *Manager) reserve(ctx context.Context, source string, limit, cost float6
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	if _, err := tx.ExecContext(ctx, `INSERT INTO source_budgets(source, window_start) VALUES(?, ?)
-		ON CONFLICT(source) DO NOTHING`, source, month); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO source_budgets(source, identity, window_start) VALUES(?, ?, ?)
+		ON CONFLICT(source, identity) DO NOTHING`, source, identity, month); err != nil {
 		return err
 	}
 	var window string
 	var requests int
 	var spent float64
 	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(window_start,''), requests_in_window, spent_usd
-		FROM source_budgets WHERE source = ?`, source).Scan(&window, &requests, &spent); err != nil {
+		FROM source_budgets WHERE source = ? AND identity = ?`, source, identity).Scan(&window, &requests, &spent); err != nil {
 		return err
 	}
 	if window != month {
 		window, requests, spent = month, 0, 0
 	}
 	if limit > 0 && spent+cost > limit+1e-9 {
-		return &ErrExceeded{Source: source, Spent: spent, Limit: limit, Attempt: cost}
+		return &ErrExceeded{Source: source, Identity: identity, Spent: spent, Limit: limit, Attempt: cost}
 	}
 	_, err = tx.ExecContext(ctx, `UPDATE source_budgets
 		SET window_start = ?, requests_in_window = ?, spent_usd = ?,
 		    next_allowed_at = CASE WHEN next_allowed_at <= ? THEN NULL ELSE next_allowed_at END
-		WHERE source = ?`, window, requests+1, spent+cost, store.Now(), source)
+		WHERE source = ? AND identity = ?`, window, requests+1, spent+cost, store.Now(), source, identity)
 	if err != nil {
 		return err
 	}
@@ -229,30 +276,33 @@ func (m *Manager) reserve(ctx context.Context, source string, limit, cost float6
 // source until someone notices.
 const MaxDeferHorizon = 24 * time.Hour
 
-// Defer persists a server-requested next allowed time (usually Retry-After).
-// It never shortens an existing later gate, and never honours one beyond
-// MaxDeferHorizon.
-func (m *Manager) Defer(ctx context.Context, source string, until time.Time) error {
+// Defer persists a server-requested next allowed time (usually Retry-After)
+// against the quota identity in policy, so a gate earned under one credential
+// never gates another. It never shortens an existing later gate, and never
+// honours one beyond MaxDeferHorizon.
+func (m *Manager) Defer(ctx context.Context, source string, policy config.Source, until time.Time) error {
 	until = until.UTC()
 	if horizon := m.now().UTC().Add(MaxDeferHorizon); until.After(horizon) {
 		until = horizon
 	}
-	_, err := m.db.ExecContext(ctx, `INSERT INTO source_budgets(source, window_start, next_allowed_at)
-		VALUES(?, ?, ?)
-		ON CONFLICT(source) DO UPDATE SET next_allowed_at =
+	_, err := m.db.ExecContext(ctx, `INSERT INTO source_budgets(source, identity, window_start, next_allowed_at)
+		VALUES(?, ?, ?, ?)
+		ON CONFLICT(source, identity) DO UPDATE SET next_allowed_at =
 		CASE WHEN next_allowed_at IS NULL OR next_allowed_at < excluded.next_allowed_at
 		     THEN excluded.next_allowed_at ELSE next_allowed_at END`,
-		source, m.now().UTC().Format("2006-01"), until.Format(time.RFC3339Nano))
+		source, identityFor(policy), m.now().UTC().Format("2006-01"), until.Format(time.RFC3339Nano))
 	return err
 }
 
-// Snapshot returns one source's durable counters. A missing row is zero state.
-func (m *Manager) Snapshot(ctx context.Context, source string) (Snapshot, error) {
+// Snapshot returns one source's durable counters for the quota identity in
+// policy. A missing row is zero state.
+func (m *Manager) Snapshot(ctx context.Context, source string, policy config.Source) (Snapshot, error) {
 	var out Snapshot
 	out.Source = source
+	out.Identity = identityFor(policy)
 	var next sql.NullString
 	err := m.db.QueryRowContext(ctx, `SELECT COALESCE(window_start,''), requests_in_window, spent_usd, next_allowed_at
-		FROM source_budgets WHERE source = ?`, source).Scan(&out.WindowStart, &out.RequestsInWindow, &out.SpentUSD, &next)
+		FROM source_budgets WHERE source = ? AND identity = ?`, source, out.Identity).Scan(&out.WindowStart, &out.RequestsInWindow, &out.SpentUSD, &next)
 	if errors.Is(err, sql.ErrNoRows) {
 		return out, nil
 	}
@@ -262,7 +312,7 @@ func (m *Manager) Snapshot(ctx context.Context, source string) (Snapshot, error)
 	if next.Valid && next.String != "" {
 		t, err := time.Parse(time.RFC3339Nano, next.String)
 		if err != nil {
-			return out, fmt.Errorf("source %s has invalid next_allowed_at: %w", source, err)
+			return out, fmt.Errorf("source %s (%s) has invalid next_allowed_at: %w", source, out.Identity, err)
 		}
 		out.NextAllowedAt = &t
 	}

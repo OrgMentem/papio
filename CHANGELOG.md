@@ -11,6 +11,24 @@ execution records in `notes/acquisition-stack-plan.md`.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A rate-limit gate or request count earned under one set of credentials no
+  longer applies to another.** Providers meter by credential, not by source
+  name: measured against OpenAlex from one machine in the same second, an
+  anonymous read reported 0 of 1,000 requests remaining while the same source
+  carrying an API key reported 8,792 of 10,000. *papio* kept a single
+  `source_budgets` row per source, so the two shared one budget. A 429 taken
+  anonymously wrote a `Retry-After` lasting until the next UTC midnight; adding
+  an API key opened a fresh 10,000-credit allowance, but the row still said
+  closed, and 95 jobs parked against a quota that had nothing to do with them
+  until it was cleared by editing the database by hand. Rate-limit state is now
+  keyed by source *and* a non-secret fingerprint of the credential in use
+  (`anonymous`, or `key-` followed by a truncated SHA-256 — never the
+  credential itself), so every account carries its own gate, request counter
+  and spend figure. Existing rows are preserved under the identity `legacy`:
+  which credential earned them is unknowable, and a `legacy` row can never gate
+  live traffic. Schema version 18.
 
 ## [0.16.0] - 2026-08-02
 

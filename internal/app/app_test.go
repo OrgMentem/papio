@@ -758,7 +758,7 @@ func TestDailyQuotaGateParksTheJobNotTheWorker(t *testing.T) {
 	ctx := context.Background()
 	svc.Budgets = budget.New(jobs.S)
 	gate := time.Now().UTC().Add(18 * time.Hour)
-	if err := svc.Budgets.Defer(ctx, "fixture", gate); err != nil {
+	if err := svc.Budgets.Defer(ctx, "fixture", config.Source{Enabled: true}, gate); err != nil {
 		t.Fatal(err)
 	}
 	adapter := &fakeResolver{name: "fixture", cands: []resolver.Candidate{{
@@ -1793,7 +1793,7 @@ func TestSourceGateParksDoNotSpendTheRetryBudget(t *testing.T) {
 	svc, jobs := newTestService(t)
 	svc.Budgets = budget.New(jobs.S)
 	gate := time.Now().UTC().Add(18 * time.Hour)
-	if err := svc.Budgets.Defer(ctx, "fixture", gate); err != nil {
+	if err := svc.Budgets.Defer(ctx, "fixture", config.Source{Enabled: true}, gate); err != nil {
 		t.Fatal(err)
 	}
 	adapter := &fakeResolver{name: "fixture"}
@@ -1849,7 +1849,7 @@ func TestPendingGateOutranksAnExhaustedRetryBudget(t *testing.T) {
 	svc, jobs := newTestService(t)
 	svc.Budgets = budget.New(jobs.S)
 	gate := time.Now().UTC().Add(18 * time.Hour)
-	if err := svc.Budgets.Defer(ctx, "gated", gate); err != nil {
+	if err := svc.Budgets.Defer(ctx, "gated", config.Source{Enabled: true}, gate); err != nil {
 		t.Fatal(err)
 	}
 	svc.RetryDelay = time.Millisecond

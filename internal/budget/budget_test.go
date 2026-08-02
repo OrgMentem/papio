@@ -5,6 +5,7 @@ package budget
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -40,7 +41,7 @@ func TestAcquireReservesMonthlyBudgetAtomically(t *testing.T) {
 			t.Fatalf("error = %T %v, want ErrExceeded", err, err)
 		}
 	}
-	snap, err := m.Snapshot(context.Background(), "paid")
+	snap, err := m.Snapshot(context.Background(), "paid", p)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,7 +65,7 @@ func TestAcquireTokenBucketHonorsBurstAndCancellation(t *testing.T) {
 	if err := m.Acquire(blocked, "limited", p, 0); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("third immediate token = %v, want context deadline", err)
 	}
-	snap, _ := m.Snapshot(ctx, "limited")
+	snap, _ := m.Snapshot(ctx, "limited", p)
 	if snap.RequestsInWindow != 2 {
 		t.Fatalf("cancelled wait reserved a request: %+v", snap)
 	}
@@ -73,7 +74,7 @@ func TestAcquireTokenBucketHonorsBurstAndCancellation(t *testing.T) {
 func TestDurableRetryAfterGateSurvivesManager(t *testing.T) {
 	m := testManager(t)
 	until := time.Now().UTC().Add(time.Hour)
-	if err := m.Defer(context.Background(), "remote", until); err != nil {
+	if err := m.Defer(context.Background(), "remote", config.Source{Enabled: true}, until); err != nil {
 		t.Fatal(err)
 	}
 	// A new manager over the same DB must still observe the gate.
@@ -95,12 +96,13 @@ func TestDurableRetryAfterGateSurvivesManager(t *testing.T) {
 // it. Pins the bug that froze a 309-job cohort on three claimed rows.
 func TestAcquireReturnsRatherThanSleepingOnADailyQuotaGate(t *testing.T) {
 	m := testManager(t)
+	p := config.Source{Enabled: true, RatePerSec: 2, Burst: 2}
 	midnight := time.Now().UTC().Truncate(24 * time.Hour).Add(24 * time.Hour)
-	if err := m.Defer(context.Background(), "openalex", midnight); err != nil {
+	if err := m.Defer(context.Background(), "openalex", p, midnight); err != nil {
 		t.Fatal(err)
 	}
 	start := time.Now()
-	err := m.Acquire(context.Background(), "openalex", config.Source{Enabled: true, RatePerSec: 2, Burst: 2}, 0)
+	err := m.Acquire(context.Background(), "openalex", p, 0)
 	var deferred *ErrDeferred
 	if !errors.As(err, &deferred) {
 		t.Fatalf("Acquire = %T %v, want *ErrDeferred", err, err)
@@ -109,7 +111,7 @@ func TestAcquireReturnsRatherThanSleepingOnADailyQuotaGate(t *testing.T) {
 		t.Fatalf("Acquire blocked %v on a far gate; it must return within %v", elapsed, MaxInlineWait)
 	}
 	// The gate must not be consumed: it is durable state the next caller reads.
-	snap, err := m.Snapshot(context.Background(), "openalex")
+	snap, err := m.Snapshot(context.Background(), "openalex", p)
 	if err != nil || snap.NextAllowedAt == nil {
 		t.Fatalf("snapshot = %+v, %v; the deferral must survive a rejected Acquire", snap, err)
 	}
@@ -122,7 +124,7 @@ func TestAcquireReturnsRatherThanSleepingOnADailyQuotaGate(t *testing.T) {
 // inline, so a two-second gate does not drop a resolver out of the chain.
 func TestAcquireStillWaitsOutAShortGate(t *testing.T) {
 	m := testManager(t)
-	if err := m.Defer(context.Background(), "unpaywall", time.Now().UTC().Add(20*time.Millisecond)); err != nil {
+	if err := m.Defer(context.Background(), "unpaywall", config.Source{Enabled: true}, time.Now().UTC().Add(20*time.Millisecond)); err != nil {
 		t.Fatal(err)
 	}
 	if err := m.Acquire(context.Background(), "unpaywall", config.Source{Enabled: true}, 0); err != nil {
@@ -136,10 +138,10 @@ func TestAcquireStillWaitsOutAShortGate(t *testing.T) {
 func TestDeferIsClampedToADayEvenIfTheServerAsksForLonger(t *testing.T) {
 	m := testManager(t)
 	ctx := context.Background()
-	if err := m.Defer(ctx, "confused", time.Now().UTC().Add(365*24*time.Hour)); err != nil {
+	if err := m.Defer(ctx, "confused", config.Source{}, time.Now().UTC().Add(365*24*time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	snap, err := m.Snapshot(ctx, "confused")
+	snap, err := m.Snapshot(ctx, "confused", config.Source{})
 	if err != nil || snap.NextAllowedAt == nil {
 		t.Fatalf("snapshot = %+v, %v", snap, err)
 	}
@@ -148,10 +150,10 @@ func TestDeferIsClampedToADayEvenIfTheServerAsksForLonger(t *testing.T) {
 	}
 	// A gate inside the horizon is still honoured exactly.
 	want := time.Now().UTC().Add(2 * time.Hour)
-	if err := m.Defer(ctx, "polite", want); err != nil {
+	if err := m.Defer(ctx, "polite", config.Source{}, want); err != nil {
 		t.Fatal(err)
 	}
-	snap, err = m.Snapshot(ctx, "polite")
+	snap, err = m.Snapshot(ctx, "polite", config.Source{})
 	if err != nil || snap.NextAllowedAt == nil {
 		t.Fatalf("snapshot = %+v, %v", snap, err)
 	}
@@ -163,13 +165,13 @@ func TestDeferIsClampedToADayEvenIfTheServerAsksForLonger(t *testing.T) {
 func TestDeferNeverShortensExistingGate(t *testing.T) {
 	m := testManager(t)
 	later := time.Now().UTC().Add(2 * time.Hour)
-	if err := m.Defer(context.Background(), "remote", later); err != nil {
+	if err := m.Defer(context.Background(), "remote", config.Source{}, later); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.Defer(context.Background(), "remote", time.Now().UTC().Add(time.Hour)); err != nil {
+	if err := m.Defer(context.Background(), "remote", config.Source{}, time.Now().UTC().Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	snap, err := m.Snapshot(context.Background(), "remote")
+	snap, err := m.Snapshot(context.Background(), "remote", config.Source{})
 	if err != nil || snap.NextAllowedAt == nil {
 		t.Fatalf("snapshot = %+v, %v", snap, err)
 	}
@@ -188,5 +190,182 @@ func TestDisabledAndInvalidRequestsFailBeforeMutation(t *testing.T) {
 	}
 	if err := m.Acquire(context.Background(), "", config.Source{Enabled: true}, 0); err == nil {
 		t.Fatal("empty source acquired")
+	}
+}
+
+// The production fault this key shape fixes. OpenAlex 429'd under the
+// anonymous identity with a Retry-After at the next UTC midnight, and papio
+// wrote it to the single `openalex` row. Adding an API key opened a separate
+// 10,000-credit budget, but the row still said closed: 95 jobs parked against
+// a quota that had nothing to do with them, cleared only by a raw UPDATE on
+// the live database.
+func TestGateUnderOneIdentityDoesNotGateAnother(t *testing.T) {
+	m := testManager(t)
+	ctx := context.Background()
+	anon := config.Source{Enabled: true}
+	keyed := config.Source{Enabled: true, APIKey: "k"}
+	if err := m.Defer(ctx, "openalex", anon, time.Now().UTC().Add(18*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Acquire(ctx, "openalex", keyed, 0); err != nil {
+		t.Fatalf("keyed Acquire = %v, want success: the gate was earned by the anonymous account", err)
+	}
+}
+
+// The other half of the same contract: separating the identities must not
+// disable the gate for the account that actually earned it.
+func TestGatedIdentityIsStillGated(t *testing.T) {
+	m := testManager(t)
+	ctx := context.Background()
+	anon := config.Source{Enabled: true}
+	if err := m.Defer(ctx, "openalex", anon, time.Now().UTC().Add(18*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	err := m.Acquire(ctx, "openalex", anon, 0)
+	var deferred *ErrDeferred
+	if !errors.As(err, &deferred) {
+		t.Fatalf("anonymous Acquire = %T %v, want *ErrDeferred", err, err)
+	}
+	if deferred.Identity != "anonymous" {
+		t.Fatalf("deferred identity = %q, want anonymous: the error must name the gated account", deferred.Identity)
+	}
+}
+
+// Counters are per-account too, not just gates: a provider meters each
+// credential's allowance separately, so spending one must not draw down the
+// other.
+func TestRequestCountersAreIndependentPerIdentity(t *testing.T) {
+	m := testManager(t)
+	ctx := context.Background()
+	anon := config.Source{Enabled: true}
+	keyed := config.Source{Enabled: true, APIKey: "k"}
+	for range 2 {
+		if err := m.Acquire(ctx, "openalex", anon, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := m.Acquire(ctx, "openalex", keyed, 0); err != nil {
+		t.Fatal(err)
+	}
+	anonSnap, err := m.Snapshot(ctx, "openalex", anon)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyedSnap, err := m.Snapshot(ctx, "openalex", keyed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if anonSnap.RequestsInWindow != 2 || keyedSnap.RequestsInWindow != 1 {
+		t.Fatalf("anonymous = %d, keyed = %d; want 2 and 1 counted against separate accounts",
+			anonSnap.RequestsInWindow, keyedSnap.RequestsInWindow)
+	}
+}
+
+// Identity is the credential, not the whole policy: two clients configured
+// with the same key share one budget even when their throttles differ. That is
+// what makes the OpenAlex resolver and the OpenAlex discovery client — which
+// read the same api_key through different policy paths — agree about one
+// provider account rather than inventing two.
+func TestSameKeyIsOneIdentityAcrossDifferingPolicies(t *testing.T) {
+	m := testManager(t)
+	ctx := context.Background()
+	first := config.Source{Enabled: true, APIKey: "shared", RatePerSec: 1}
+	second := config.Source{Enabled: true, APIKey: "shared", RatePerSec: 9, Burst: 3}
+	// Further out than MaxInlineWait, or Acquire waits instead of returning.
+	if err := m.Defer(ctx, "openalex", first, time.Now().UTC().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	err := m.Acquire(ctx, "openalex", second, 0)
+	var deferred *ErrDeferred
+	if !errors.As(err, &deferred) {
+		t.Fatalf("Acquire = %T %v, want *ErrDeferred: the same key is the same account", err, err)
+	}
+}
+
+// The identity is written to the database and read back in diagnostics, so it
+// has to be a fingerprint rather than the credential — Snapshot's contract is
+// that it never contains one. Checked on the durable surface too: the column
+// is what survives a crash, gets copied into bug reports, and outlives the
+// process that wrote it.
+func TestIdentityFingerprintNeverContainsTheCredential(t *testing.T) {
+	m := testManager(t)
+	ctx := context.Background()
+	const secret = "supersecret"
+	policy := config.Source{Enabled: true, APIKey: secret}
+	snap, err := m.Snapshot(ctx, "openalex", policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(snap.Identity, secret) {
+		t.Fatalf("identity %q leaks the credential", snap.Identity)
+	}
+	if !strings.HasPrefix(snap.Identity, "key-") {
+		t.Fatalf("identity = %q, want a key- fingerprint", snap.Identity)
+	}
+	if snap.Identity == identityFor(config.Source{}) {
+		t.Fatalf("keyed identity collided with the anonymous one: %q", snap.Identity)
+	}
+	// Persist a row, then read the stored column rather than the computed one.
+	if err := m.Acquire(ctx, "openalex", policy, 0); err != nil {
+		t.Fatal(err)
+	}
+	var stored string
+	if err := m.db.QueryRowContext(ctx,
+		`SELECT identity FROM source_budgets WHERE source = 'openalex'`).Scan(&stored); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(stored, secret) {
+		t.Fatalf("stored identity %q leaks the credential into the database", stored)
+	}
+	if stored != snap.Identity {
+		t.Fatalf("stored %q != reported %q; the durable key and the diagnostic must agree", stored, snap.Identity)
+	}
+}
+
+// identityFor trims before deciding, and every provider client trims before
+// deciding whether to send the credential. The two must agree: a whitespace-only
+// key sends anonymous traffic, so metering it as a distinct keyed account would
+// give that traffic its own budget and let it bypass the anonymous gate.
+func TestWhitespaceOnlyKeyIsAnonymous(t *testing.T) {
+	m := testManager(t)
+	ctx := context.Background()
+	blank := config.Source{Enabled: true, APIKey: "   \t\n "}
+	if got, want := identityFor(blank), identityFor(config.Source{Enabled: true}); got != want {
+		t.Fatalf("whitespace-only key = %q, want %q: it sends no credential", got, want)
+	}
+	if err := m.Defer(ctx, "openalex", config.Source{Enabled: true}, time.Now().UTC().Add(18*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	err := m.Acquire(ctx, "openalex", blank, 0)
+	var deferred *ErrDeferred
+	if !errors.As(err, &deferred) {
+		t.Fatalf("Acquire with a whitespace-only key = %T %v, want the anonymous gate to apply", err, err)
+	}
+}
+
+// A deferral from the token bucket must name the account too. The bucket is
+// shared per source rather than per identity, but the error is still the
+// caller's: leaving Identity unset here rendered "source openalex () is
+// deferred until ..." and handed callers reading ErrDeferred.Identity an empty
+// string even for keyed traffic.
+func TestTokenBucketDeferralNamesTheIdentity(t *testing.T) {
+	m := testManager(t)
+	ctx := context.Background()
+	// One token, then a refill far slower than MaxInlineWait, so the second
+	// call is turned away by the bucket rather than by a durable gate.
+	keyed := config.Source{Enabled: true, APIKey: "k", RatePerSec: 0.001, Burst: 1}
+	if err := m.Acquire(ctx, "openalex", keyed, 0); err != nil {
+		t.Fatal(err)
+	}
+	err := m.Acquire(ctx, "openalex", keyed, 0)
+	var deferred *ErrDeferred
+	if !errors.As(err, &deferred) {
+		t.Fatalf("second Acquire = %T %v, want *ErrDeferred from the token bucket", err, err)
+	}
+	if want := identityFor(keyed); deferred.Identity != want {
+		t.Fatalf("deferred identity = %q, want %q", deferred.Identity, want)
+	}
+	if strings.Contains(err.Error(), "()") {
+		t.Fatalf("error renders an empty identity: %s", err)
 	}
 }

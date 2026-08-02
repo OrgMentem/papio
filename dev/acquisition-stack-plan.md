@@ -209,9 +209,10 @@ Core tables:
 - `human_actions`: login, terms acceptance, manual download, document delivery, ambiguity review; status and expiry.
 - `events`: append-only sequenced transitions with redacted structured detail.
 - `exports`: acquisition bundle and zotio plan/apply result.
-- `source_budgets`: per-source rate, quota, monetary cost, and next-allowed time.
+- `source_budgets`: per-source rate, quota, monetary cost, and next-allowed time, keyed by source *and* quota identity — providers meter per credential, so a gate or counter earned under one account must not apply to another.
 
 No credentials, cookies, raw browser DOM, screenshots, or signed URL query values enter SQLite.
+The one credential-*derived* value is `source_budgets.identity`: a non-secret fingerprint (`anonymous`, or `key-` plus a truncated SHA-256) that names which account a budget row belongs to without storing the account's secret.
 Signed or otherwise secret-bearing URLs exist only in the active attempt's memory; after a crash or expiry, the daemon re-runs resolution instead of persisting a bearer URL.
 
 ### Job states

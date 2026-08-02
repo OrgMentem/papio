@@ -467,7 +467,7 @@ func (s *Service) resolve(ctx context.Context, row *job.Row) (map[string]resolve
 				sourceRetry := earlierRetry(time.Time{}, s.Now(), delay, s.RetryDelay)
 				plan.Temporary = earlierTime(plan.Temporary, sourceRetry)
 				if s.Budgets != nil {
-					_ = s.Budgets.Defer(ctx, name, sourceRetry)
+					_ = s.Budgets.Defer(ctx, name, entry.Policy, sourceRetry)
 				}
 				_ = s.Jobs.FinishAttempt(ctx, attempt, "retryable", 0, safeType(err))
 			} else {
@@ -612,7 +612,7 @@ func (s *Service) resolveSiblings(ctx context.Context, row *job.Row) ([]resolver
 				sourceRetry := earlierRetry(time.Time{}, s.Now(), delay, s.RetryDelay)
 				plan.Temporary = earlierTime(plan.Temporary, sourceRetry)
 				if s.Budgets != nil {
-					_ = s.Budgets.Defer(ctx, name, sourceRetry)
+					_ = s.Budgets.Defer(ctx, name, entry.Policy, sourceRetry)
 				}
 				_ = s.Jobs.FinishAttempt(ctx, attempt, "retryable", 0, safeType(err))
 				continue
@@ -695,7 +695,7 @@ func (s *Service) enrich(ctx context.Context, row *job.Row) error {
 		}
 		if delay, temporary := resolver.Temporary(err); temporary {
 			if s.Budgets != nil {
-				_ = s.Budgets.Defer(ctx, name, earlierRetry(time.Time{}, s.Now(), delay, s.RetryDelay))
+				_ = s.Budgets.Defer(ctx, name, policy, earlierRetry(time.Time{}, s.Now(), delay, s.RetryDelay))
 			}
 			_ = s.Jobs.FinishAttempt(ctx, attempt, "retryable", 0, safeType(err))
 		} else {
@@ -793,8 +793,11 @@ func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[st
 			}
 			return err
 		}
+		// One policy binding for the whole iteration: the Defer on a retryable
+		// fetch failure below must name the same quota identity the Acquire
+		// here reserved against, or the gate lands on a different row.
+		policy := s.Config.SourcePolicy(stored.Source)
 		if s.Budgets != nil {
-			policy := s.Config.SourcePolicy(stored.Source)
 			if err := s.Budgets.Acquire(ctx, stored.Source, policy, stored.CostUSD); err != nil {
 				if releaseErr := s.Jobs.ReleaseReservedCost(context.WithoutCancel(ctx), row.ID, stored.Source, stored.CostUSD); releaseErr != nil {
 					return releaseErr
@@ -854,7 +857,7 @@ func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[st
 				sourceRetry := earlierRetry(time.Time{}, s.Now(), delay, s.RetryDelay)
 				plan.Temporary = earlierTime(plan.Temporary, sourceRetry)
 				if s.Budgets != nil {
-					_ = s.Budgets.Defer(ctx, stored.Source, sourceRetry)
+					_ = s.Budgets.Defer(ctx, stored.Source, policy, sourceRetry)
 				}
 			case fetch.ClassBlocked:
 				_ = s.Jobs.MarkCandidate(ctx, stored.ID, "skipped")
