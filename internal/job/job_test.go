@@ -1044,6 +1044,30 @@ func TestResolveReviewAcceptResumesCandidateAndClearsTerminalFields(t *testing.T
 	}
 }
 
+// Asking for more rows must never return fewer. An over-large limit used to
+// reset to the default, so --limit 600 yielded 100 where --limit 500 yielded
+// 500 — silently, and in the direction of under-reporting, which is the worst
+// way to be wrong for the only people who pass a large limit: the ones
+// counting. Two separate consumers hit it on the same day.
+func TestEffectiveListLimitNeverReturnsFewerForMore(t *testing.T) {
+	if got := EffectiveListLimit(ListLimitMax + 100); got != ListLimitMax {
+		t.Fatalf("EffectiveListLimit(%d) = %d, want the maximum %d", ListLimitMax+100, got, ListLimitMax)
+	}
+	if got := EffectiveListLimit(0); got != ListLimitDefault {
+		t.Fatalf("unspecified limit = %d, want the default %d", got, ListLimitDefault)
+	}
+	if got := EffectiveListLimit(-5); got != ListLimitDefault {
+		t.Fatalf("negative limit = %d, want the default %d", got, ListLimitDefault)
+	}
+	prev := 0
+	for _, limit := range []int{1, 50, ListLimitDefault, ListLimitMax - 1, ListLimitMax, ListLimitMax + 1, 10000} {
+		got := EffectiveListLimit(limit)
+		if got < prev {
+			t.Fatalf("EffectiveListLimit(%d) = %d, below the previous %d: asking for more returned fewer", limit, got, prev)
+		}
+		prev = got
+	}
+}
 func TestListOldestRotatesPastPriorMaintenancePage(t *testing.T) {
 	js := testStore(t)
 	ctx := context.Background()

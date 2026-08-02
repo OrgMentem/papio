@@ -1537,9 +1537,20 @@ func (js *Store) ListPage(ctx context.Context, state string, limit int) ([]Row, 
 
 // EffectiveListLimit resolves a caller-supplied limit the way the store applies
 // it, so a caller never has to reimplement the clamp.
+//
+// An over-large limit clamps DOWN TO THE MAXIMUM rather than resetting to the
+// default. Resetting made the function non-monotonic — asking for 600 returned
+// 100, fewer rows than asking for 500 — and it did so silently, in the
+// direction of under-reporting, which is the worst way to be wrong for the
+// people who pass a large limit: they are counting. Two separate consumers
+// walked into it on the same day, each concluding the daemon held a fraction
+// of the jobs it actually held. Unspecified still means the default.
 func EffectiveListLimit(limit int) int {
-	if limit <= 0 || limit > ListLimitMax {
+	if limit <= 0 {
 		return ListLimitDefault
+	}
+	if limit > ListLimitMax {
+		return ListLimitMax
 	}
 	return limit
 }
