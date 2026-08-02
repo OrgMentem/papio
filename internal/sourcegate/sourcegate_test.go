@@ -73,7 +73,11 @@ func TestARefusedReservationNeverReachesTheProvider(t *testing.T) {
 	if cerr != nil {
 		t.Fatal(cerr)
 	}
-	_, err := client.Do(request(t, server.URL))
+	resp, err := client.Do(request(t, server.URL))
+	if resp != nil {
+		_ = resp.Body.Close()
+		t.Fatal("a refused reservation returned a response; nothing should have been sent")
+	}
 	if !errors.Is(err, refusal) {
 		t.Fatalf("err = %v, want the reservation error unwrapped so callers can classify a rate limit", err)
 	}
