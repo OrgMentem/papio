@@ -62,7 +62,7 @@ test("renders distinct acquisition and inbox actions without redundant headings"
   expect(launcher?.querySelectorAll(".launcher-action")).toHaveLength(2);
   expect(launcher?.querySelector("h2")).toBeNull();
   expect(doc.getElementById("page-acquire-btn")?.textContent).toBe("Acquire this page");
-  expect(doc.getElementById("page-acquire-doi")?.textContent).toBe("Detecting DOI…");
+  expect(doc.getElementById("page-acquire-doi")?.textContent).toBe("Detecting paper…");
   expect(doc.getElementById("page-acquire")?.hidden).toBe(true);
   expect(doc.getElementById("page-acquire-btn")?.hidden).toBe(true);
   expect(doc.getElementById("daemon-footer")).toBeNull();
@@ -190,7 +190,7 @@ test("keeps a successfully queued acquisition disabled", async () => {
   expect(doc.getElementById("page-acquire-status")?.textContent).toBe("Queued: job_page_acquire_001");
 });
 
-test("shows only the no-DOI message when the current page has no DOI", () => {
+test("shows only the no-paper message when the current page has no DOI", () => {
   const doc = popupDocument();
   let calls = 0;
   renderPageAcquire(doc, async () => {
@@ -203,9 +203,23 @@ test("shows only the no-DOI message when the current page has no DOI", () => {
   expect(button.disabled).toBe(true);
   expect(button.hidden).toBe(true);
   expect(doc.getElementById("page-acquire-doi")?.hidden).toBe(false);
-  expect(doc.getElementById("page-acquire-doi")?.textContent).toBe("No DOI detected on this page");
+  expect(doc.getElementById("page-acquire-doi")?.textContent).toBe("No paper detected on this page");
   button.click();
   expect(calls).toBe(0);
+});
+
+test("renders the send-PDF action with a short known job id", () => {
+  const doc = popupDocument();
+  renderPageAcquire(doc, async () => ({ error: "unused" }), async () => ({ state: "sending", job_id: "job_1234567890abcdef" }));
+  renderPageContext(
+    doc,
+    { url: "https://papers.example.edu/download/paper.pdf?download=1", kind: "pdf", tab_id: 17 },
+    [job({ job_id: "job_1234567890abcdef", tab_id: 17 })],
+  );
+  const button = doc.getElementById("page-acquire-btn") as HTMLButtonElement;
+  expect(button.textContent).toBe("Send PDF to papio (job job_12345678)");
+  expect(button.disabled).toBe(false);
+  button.click();
 });
 
 test("does not send a DOI-less scraped page to the daemon", async () => {

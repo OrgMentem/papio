@@ -628,6 +628,8 @@ const (
 	MsgReviewPreviewResult      = "review_preview_result"
 	MsgStatsRequest             = "stats_request"
 	MsgStatsResponse            = "stats_response"
+	MsgActivityRequest          = "activity_request"
+	MsgActivityResponse         = "activity_response"
 )
 
 // jobScoped lists the types that must carry a job_id.
@@ -938,6 +940,53 @@ type StatsResponsePayload struct {
 	HandoffsRequired int64         `json:"handoffs_required"`
 	Access           StatsAccess   `json:"access"`
 	Series           []StatsBucket `json:"series"`
+}
+
+// ActivityRequestPayload asks for a bounded page of recent daemon events.
+// Limit is optional on the wire; decoders apply the default of 20.
+type ActivityRequestPayload struct {
+	RequestID string `json:"request_id"`
+	Limit     int64  `json:"limit,omitempty"`
+}
+
+// ActivityEntryPayload is the display-only event shape sent to the browser.
+// Detail remains daemon-side so the bridge never exposes arbitrary event data.
+type ActivityEntryPayload struct {
+	Seq   int64  `json:"seq"`
+	At    string `json:"at"`
+	JobID string `json:"job_id,omitempty"`
+	Kind  string `json:"kind"`
+	Text  string `json:"text"`
+	Title string `json:"title,omitempty"`
+}
+
+// UnmarshalJSON keeps optional job_id fail-closed when it is present but
+// empty; a missing job_id is the only valid omission.
+func (entry *ActivityEntryPayload) UnmarshalJSON(data []byte) error {
+	fields, err := browserObjectFields(data, "activity_response.entry")
+	if err != nil {
+		return err
+	}
+	if err := browserRejectNullFields(fields, "job_id", "title"); err != nil {
+		return err
+	}
+	type plain ActivityEntryPayload
+	var decoded plain
+	if err := strictDecode(data, &decoded); err != nil {
+		return err
+	}
+	if _, present := fields["job_id"]; present && decoded.JobID == "" {
+		return fmt.Errorf("activity_response.entry.job_id must be non-empty")
+	}
+	*entry = ActivityEntryPayload(decoded)
+	return nil
+}
+
+// ActivityResponsePayload is a correlated bounded page of recent events.
+type ActivityResponsePayload struct {
+	RequestID   string                 `json:"request_id"`
+	GeneratedAt string                 `json:"generated_at"`
+	Entries     []ActivityEntryPayload `json:"entries"`
 }
 
 // BrowserMessage is one decoded native-messaging envelope. Payload holds the
@@ -1284,6 +1333,24 @@ func DecodeBrowserMessage(data []byte) (*BrowserMessage, error) {
 		p := &StatsResponsePayload{}
 		err = decodeTriagePayload(env.Payload, payloadFields, "stats_response",
 			[]string{"request_id", "generated_at", "acquired_total", "failed_total", "handoffs_required", "access", "series"}, p)
+		if err == nil {
+			err = p.validate()
+		}
+		msg.Payload = p
+	case MsgActivityRequest:
+		p := &ActivityRequestPayload{}
+		err = decodeTriagePayload(env.Payload, payloadFields, "activity_request", []string{"request_id"}, p)
+		if err == nil {
+			if _, ok := payloadFields["limit"]; !ok {
+				p.Limit = 20
+			}
+			err = p.validate()
+		}
+		msg.Payload = p
+	case MsgActivityResponse:
+		p := &ActivityResponsePayload{}
+		err = decodeTriagePayload(env.Payload, payloadFields, "activity_response",
+			[]string{"request_id", "generated_at", "entries"}, p)
 		if err == nil {
 			err = p.validate()
 		}
@@ -2037,6 +2104,52 @@ func (p *StatsResponsePayload) validate() error {
 		}
 		if bucket.Acquired < 0 || bucket.Acquired > MaxBrowserInteger {
 			return fmt.Errorf("stats_response.series.acquired must be in range 0..%d", MaxBrowserInteger)
+		}
+	}
+	return nil
+}
+
+func (p *ActivityRequestPayload) validate() error {
+	if err := validateCorrelationID("activity_request.request_id", p.RequestID); err != nil {
+		return err
+	}
+	if p.Limit < 1 || p.Limit > 50 {
+		return fmt.Errorf("activity_request.limit must be in range 1..50")
+	}
+	return nil
+}
+
+func (p *ActivityResponsePayload) validate() error {
+	if err := validateCorrelationID("activity_response.request_id", p.RequestID); err != nil {
+		return err
+	}
+	if err := validateTriageTime("activity_response.generated_at", p.GeneratedAt); err != nil {
+		return err
+	}
+	if len(p.Entries) > 50 {
+		return fmt.Errorf("activity_response.entries capped at 50")
+	}
+	for _, entry := range p.Entries {
+		if entry.Seq < 0 || entry.Seq > MaxBrowserInteger {
+			return fmt.Errorf("activity_response.entry.seq must be in range 0..%d", MaxBrowserInteger)
+		}
+		if err := validateTriageTime("activity_response.entry.at", entry.At); err != nil {
+			return err
+		}
+		if entry.JobID != "" && !requestIDRE.MatchString(entry.JobID) {
+			return fmt.Errorf("activity_response.entry.job_id is invalid")
+		}
+		if err := validateTriageText("activity_response.entry.kind", entry.Kind, 100); err != nil {
+			return err
+		}
+		if entry.Kind == "" {
+			return fmt.Errorf("activity_response.entry.kind is required")
+		}
+		if err := validateTriageText("activity_response.entry.text", entry.Text, 160); err != nil {
+			return err
+		}
+		if err := validateTriageText("activity_response.entry.title", entry.Title, 500); err != nil {
+			return err
 		}
 	}
 	return nil

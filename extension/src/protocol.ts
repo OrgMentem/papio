@@ -42,7 +42,9 @@ export type BrowserMessageType =
   | "review_preview_request"
   | "review_preview_result"
   | "stats_request"
-  | "stats_response";
+  | "stats_response"
+  | "activity_request"
+  | "activity_response";
 
 export interface HelloPayload {
   extension_version: string;
@@ -288,6 +290,26 @@ export interface StatsResponsePayload {
   series: StatsBucket[];
 }
 
+export interface ActivityRequestPayload {
+  request_id: string;
+  limit?: number;
+}
+
+export interface ActivityEntryPayload {
+  seq: number;
+  at: string;
+  job_id?: string;
+  kind: string;
+  text: string;
+  title?: string;
+}
+
+export interface ActivityResponsePayload {
+  request_id: string;
+  generated_at: string;
+  entries: ActivityEntryPayload[];
+}
+
 export interface BrowserMessage {
   protocol: typeof BROWSER_PROTOCOL_VERSION;
   type: BrowserMessageType;
@@ -332,6 +354,8 @@ const MSG_TYPES: Record<string, true> = {
   review_preview_result: true,
   stats_request: true,
   stats_response: true,
+  activity_request: true,
+  activity_response: true,
 };
 
 const JOB_SCOPED: Record<string, true> = {
@@ -1033,6 +1057,48 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
         requireFields<StatsBucket>(bucket, "stats_response.series", { period_start: "required", acquired: "required" });
         triageTime(bucket, "period_start", "stats_response.series");
         int(bucket, "acquired", "stats_response.series", 0);
+      }
+      break;
+    }
+    case "activity_request": {
+      requireFields<ActivityRequestPayload>(p, "activity_request", { request_id: "required", limit: "optional" });
+      correlationID(p, "request_id", "activity_request");
+      if ("limit" in p) {
+        const limit = int(p, "limit", "activity_request", 1);
+        if (limit > 50) fail("activity_request.limit must be <= 50");
+      }
+      break;
+    }
+    case "activity_response": {
+      requireFields<ActivityResponsePayload>(p, "activity_response", {
+        request_id: "required",
+        generated_at: "required",
+        entries: "required",
+      });
+      correlationID(p, "request_id", "activity_response");
+      triageTime(p, "generated_at", "activity_response");
+      const entries = p["entries"];
+      if (!Array.isArray(entries) || entries.length > 50) fail("activity_response.entries must have at most 50 entries");
+      for (const rawEntry of entries) {
+        const entry = asRecord(rawEntry, "activity_response.entry");
+        requireFields<ActivityEntryPayload>(entry, "activity_response.entry", {
+          seq: "required",
+          at: "required",
+          job_id: "optional",
+          kind: "required",
+          text: "required",
+          title: "optional",
+        });
+        int(entry, "seq", "activity_response.entry", 0);
+        triageTime(entry, "at", "activity_response.entry");
+        if ("job_id" in entry && !JOB_ID_RE.test(str(entry, "job_id", "activity_response.entry", 128))) {
+          fail("activity_response.entry.job_id is invalid");
+        }
+        if (triageText(entry, "kind", "activity_response.entry", 100) === "") {
+          fail("activity_response.entry.kind is required");
+        }
+        triageText(entry, "text", "activity_response.entry", 160);
+        if ("title" in entry) triageText(entry, "title", "activity_response.entry", 500);
       }
       break;
     }

@@ -557,6 +557,9 @@ func TestTriageFixturePayloadRoundTrips(t *testing.T) {
 		"browser-review-preview-result.json":       MsgReviewPreviewResult,
 		"browser-stats-request.json":               MsgStatsRequest,
 		"browser-stats-response.json":              MsgStatsResponse,
+		"browser-activity-request.json":            MsgActivityRequest,
+		"browser-activity-request-default.json":    MsgActivityRequest,
+		"browser-activity-response.json":           MsgActivityResponse,
 	}
 	for name, wantType := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -582,6 +585,21 @@ func TestTriageFixturePayloadRoundTrips(t *testing.T) {
 				t.Fatalf("round-trip decode: %v", err)
 			}
 		})
+	}
+}
+
+func TestActivityRequestDefaultsLimit(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join(corpusDir(t, "valid"), "browser-activity-request-default.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	message, err := DecodeBrowserMessage(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := message.Payload.(*ActivityRequestPayload)
+	if payload.Limit != 20 {
+		t.Fatalf("activity request limit = %d, want default 20", payload.Limit)
 	}
 }
 

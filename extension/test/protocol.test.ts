@@ -24,6 +24,32 @@ test("valid browser corpus parses", () => {
     expect(msg.protocol).toBe("papio-browser/1");
   }
 });
+test("activity request and response round-trip through the shared corpus", () => {
+  const request = parseBrowserMessageBytes(
+    readFileSync(join(corpusRoot, "valid", "browser-activity-request.json"), "utf8"),
+  );
+  expect(request.type).toBe("activity_request");
+  expect(request.payload).toEqual({ request_id: "request-activity-1", limit: 12 });
+  const defaultRequest = parseBrowserMessageBytes(
+    readFileSync(join(corpusRoot, "valid", "browser-activity-request-default.json"), "utf8"),
+  );
+  expect(defaultRequest.payload).toEqual({ request_id: "request-activity-2" });
+
+
+  const response = parseBrowserMessageBytes(
+    readFileSync(join(corpusRoot, "valid", "browser-activity-response.json"), "utf8"),
+  );
+  expect(response.type).toBe("activity_response");
+  expect((response.payload["entries"] as Array<Record<string, unknown>>)).toHaveLength(2);
+  expect((response.payload["entries"] as Array<Record<string, unknown>>)[0]?.["text"]).toBe(
+    "Download complete (paper.pdf, 1.2 MB)",
+  );
+
+  expect(() => parseBrowserMessageBytes(
+    readFileSync(join(corpusRoot, "invalid", "browser-activity-request-missing-request-id.json"), "utf8"),
+  )).toThrow(ProtocolError);
+});
+
 
 test("handoff_focus is an empty job-scoped frame listed by the shared schema", () => {
   const text = readFileSync(join(corpusRoot, "valid", "browser-handoff-focus.json"), "utf8");

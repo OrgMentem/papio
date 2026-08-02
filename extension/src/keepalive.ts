@@ -42,7 +42,22 @@ export interface KeepaliveAPI {
   tabs: KeepaliveTabs;
   storage: KeepaliveStorage;
   timers: KeepaliveTimers;
+  /** Retained for API compatibility with injected callers. Badge painting is
+   * owned by the bridge, so the manager never writes it directly. */
   action?: KeepaliveAction;
+}
+
+export interface KeepaliveSnapshot {
+  enabled: boolean;
+  intervalMinutes: number;
+  authenticated: boolean;
+  pausedForReauth: boolean;
+  lastCheckAt: number | null;
+  /** The configured resolver origin, never an authentication/IdP URL. */
+  resolverOrigin: string | null;
+  lastAuthReturnedAt: number | null;
+  queuedAuthJobs: number;
+  stalledAuthJobs: string[];
 }
 
 export interface KeepaliveOptions {
@@ -50,11 +65,19 @@ export interface KeepaliveOptions {
   trackedJobCount(): number;
   /** OpenURL from the most recently received job offer, kept in bridge memory. */
   latestOpenURL(): string | undefined;
+  /** Number of queued institutional handoffs waiting for auth evidence. */
+  queuedAuthJobs?(): number;
+  /** Job ids parked after the bounded authentication-drive budget. */
+  stalledAuthJobs?(): readonly string[];
+  /** Latest persisted institutional-session evidence timestamp. */
+  lastAuthReturnedAt?(): number | undefined;
   /** Reports when the keepalive tab has verified an authenticated resolver
    * return, or when that evidence is lost. */
   onAuthenticationChanged?(authenticated: boolean): void;
   /** Called once per detected login redirect, after the tab is made visible. */
   onReauthNeeded?(): void;
+  /** Keeps the central bridge badge in sync with the paused state. */
+  onReauthStateChanged?(paused: boolean): void;
   /** Id of papio's dedicated background work window, when one exists. The
    * keepalive tab is created there so it stays out of the user's tab strip. */
   workWindowID?(): number | undefined;
@@ -109,6 +132,34 @@ export class KeepaliveManager {
   private enabled = true;
   private reauthPaused = false;
   private authenticated = false;
+  private lastCheckAt: number | undefined;
+  
+  /** Browser-local session state for privileged extension surfaces. */
+  getSnapshot(): KeepaliveSnapshot {
+    const resolverOrigin =
+      this.resolver?.protocol === "https:" ? this.resolver.origin : undefined;
+    const lastAuthReturnedAt = this.options.lastAuthReturnedAt?.();
+    return {
+      enabled: this.enabled,
+      intervalMinutes: this.intervalMinutes,
+      authenticated: this.authenticated,
+      pausedForReauth: this.reauthPaused,
+      lastCheckAt: this.lastCheckAt ?? null,
+      resolverOrigin: resolverOrigin ?? null,
+      lastAuthReturnedAt:
+        typeof lastAuthReturnedAt === "number" && Number.isFinite(lastAuthReturnedAt)
+          ? lastAuthReturnedAt
+          : null,
+      queuedAuthJobs: Math.max(0, Math.trunc(this.options.queuedAuthJobs?.() ?? 0)),
+      stalledAuthJobs: [
+        ...new Set(
+          (this.options.stalledAuthJobs?.() ?? []).filter(
+            (jobID): jobID is string => typeof jobID === "string" && jobID.length > 0,
+          ),
+        ),
+      ],
+    };
+  }
   private started = false;
   private readonly observeMs: number;
   private readonly reloadSettleMs: number;
@@ -179,6 +230,38 @@ export class KeepaliveManager {
     this.schedule(this.intervalMs(), () => this.onReload());
   }
 
+  /** Focus the reauthentication tab on an explicit operator request. If the
+   * keepalive is disabled or has not observed a job yet, this still creates a
+   * resolver-origin tab from the latest institutional offer when possible. */
+  async openReauth(): Promise<boolean> {
+    await this.loadPreferences();
+    if (this.resolver === undefined) this.resolver = this.resolverFromLatestOffer();
+    if (this.resolver?.protocol !== "https:") return false;
+    if (this.tabID === undefined) await this.createTab();
+    const tabID = this.tabID;
+    if (tabID === undefined) return false;
+    if (this.authenticated && !this.reauthPaused) {
+      try {
+        await this.api.tabs.update(tabID, { active: true });
+        await this.options.surfaceReauthTab?.(tabID);
+      } catch {
+        return false;
+      }
+      return true;
+    }
+    if (!this.reauthPaused) {
+      await this.pauseForReauth();
+    } else {
+      try {
+        await this.api.tabs.update(tabID, { active: true, pinned: false, muted: false });
+        await this.options.surfaceReauthTab?.(tabID);
+      } catch {
+        return false;
+      }
+    }
+    return true;
+  }
+
   private resolverFromLatestOffer(): URL | undefined {
     const openurl = this.options.latestOpenURL();
     if (openurl === undefined) return undefined;
@@ -190,6 +273,7 @@ export class KeepaliveManager {
       return undefined;
     }
   }
+
   private setAuthenticated(authenticated: boolean): void {
     if (this.authenticated === authenticated) return;
     this.authenticated = authenticated;
@@ -246,13 +330,14 @@ export class KeepaliveManager {
   private async onObserve(): Promise<void> {
     await this.loadPreferences();
     const activeJobs = this.options.trackedJobCount() > 0;
-    if (!this.enabled || !activeJobs || this.resolverFromLatestOffer() === undefined) {
+    const resolver = this.resolverFromLatestOffer();
+    if (!this.enabled || !activeJobs || resolver === undefined) {
       await this.closeTab();
       this.schedule(this.observeMs, () => this.onObserve());
       return;
     }
 
-    this.resolver = this.resolverFromLatestOffer();
+    this.resolver = resolver;
     if (this.tabID === undefined) {
       await this.createTab();
       this.schedule(this.intervalMs(), () => this.onReload());
@@ -321,10 +406,13 @@ export class KeepaliveManager {
       tab = await this.api.tabs.get(this.tabID);
     } catch {
       this.tabID = undefined;
+      const wasPaused = this.reauthPaused;
       this.reauthPaused = false;
+      if (wasPaused) this.options.onReauthStateChanged?.(false);
       this.setAuthenticated(false);
       return;
     }
+    this.lastCheckAt = Date.now();
     if (typeof tab.url !== "string") return;
 
     let finalURL: URL;
@@ -355,26 +443,18 @@ export class KeepaliveManager {
     } catch {
       // The reauth callback/badge still gives the user a recoverable signal.
     }
-    try {
-      await this.api.action?.setBadgeText({ text: "!" });
-    } catch {
-      // A badge failure must not cause additional reloads during an auth flow.
-    }
+    this.options.onReauthStateChanged?.(true);
     this.options.onReauthNeeded?.();
   }
 
   private async resumeAfterReauth(): Promise<void> {
     if (this.tabID === undefined) return;
     this.reauthPaused = false;
+    this.options.onReauthStateChanged?.(false);
     try {
       await this.api.tabs.update(this.tabID, { pinned: true, muted: true });
     } catch {
       // The tab is still usable; retry normal keepalive on the next cycle.
-    }
-    try {
-      await this.api.action?.setBadgeText({ text: "" });
-    } catch {
-      // Badge state is cosmetic and must not block session recovery.
     }
   }
 
@@ -400,14 +480,8 @@ export class KeepaliveManager {
     const wasAwaitingReauth = this.reauthPaused;
     this.tabID = undefined;
     this.reauthPaused = false;
+    if (wasAwaitingReauth) this.options.onReauthStateChanged?.(false);
     this.setAuthenticated(false);
-    if (wasAwaitingReauth) {
-      try {
-        await this.api.action?.setBadgeText({ text: "" });
-      } catch {
-        // Badge state is cosmetic and must not block job cleanup.
-      }
-    }
     if (tabID === undefined) return;
     try {
       await this.api.tabs.remove(tabID);

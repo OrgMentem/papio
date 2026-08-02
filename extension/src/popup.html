@@ -360,6 +360,50 @@
         padding: var(--space-3);
       }
 
+      .institution-session {
+        background: var(--color-primary-surface);
+        border-color: var(--color-primary-border);
+        color: var(--color-context);
+      }
+
+      .institution-session h2 {
+        color: var(--color-brand-ink);
+      }
+
+      .institution-session-status {
+        font-weight: 700;
+      }
+
+      .institution-session-origin,
+      .institution-session-unblocked {
+        font-size: var(--font-size-small);
+        overflow-wrap: anywhere;
+      }
+
+      .institution-session-controls {
+        display: flex;
+        gap: var(--space-2);
+      }
+
+      .institution-session-controls button {
+        border-color: var(--color-primary-border);
+        color: var(--color-primary);
+        font-weight: 700;
+        min-height: var(--action-height);
+      }
+
+      .institution-session-unblocked {
+        align-items: center;
+        display: flex;
+        gap: var(--space-2);
+        justify-content: space-between;
+      }
+
+      .institution-session-unblocked button {
+        min-height: var(--control-height);
+        padding-inline: var(--space-2);
+      }
+
       .resolver-grant {
         background: var(--color-primary-surface);
         color: var(--color-context);
@@ -431,6 +475,17 @@
       .needs-you-paper {
         font-size: var(--font-size-small);
         font-weight: 700;
+        overflow-wrap: anywhere;
+      }
+      .needs-you-copy {
+        display: grid;
+        gap: var(--space-1);
+        min-width: 0;
+      }
+
+      .needs-you-reason {
+        color: var(--color-warning);
+        font-size: var(--font-size-small);
         overflow-wrap: anywhere;
       }
 
@@ -584,7 +639,7 @@
     <main>
       <section class="launcher" aria-label="Paper actions">
         <div id="page-acquire" class="launcher-action" hidden>
-          <p id="page-acquire-doi">Detecting DOI…</p>
+          <p id="page-acquire-doi">Detecting paper…</p>
           <p id="page-acquire-context" class="page-acquire-context"></p>
           <div id="page-acquire-status" class="capture-status" aria-live="polite"></div>
           <button
@@ -604,6 +659,19 @@
           >Open inbox</button>
           <p id="open-inbox-description">Review papers and actions that need your attention.</p>
           <div id="open-inbox-status" class="capture-status" aria-live="polite"></div>
+        </div>
+      </section>
+
+      <section id="institution-session" class="institution-session" hidden aria-labelledby="institution-session-heading">
+        <h2 id="institution-session-heading">Institution session</h2>
+        <p id="institution-session-status" class="institution-session-status" role="status" aria-live="polite"></p>
+        <p id="institution-session-origin" class="institution-session-origin"></p>
+        <div class="institution-session-controls">
+          <button id="institution-session-signin" type="button">Sign in now</button>
+        </div>
+        <div id="institution-session-unblocked" class="institution-session-unblocked" role="status" aria-live="polite" hidden>
+          <span></span>
+          <button id="institution-session-dismiss" type="button">Dismiss</button>
         </div>
       </section>
 

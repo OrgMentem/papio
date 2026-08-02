@@ -7,6 +7,7 @@
 import { chromeBackend, WORK_WINDOW_KEY, HANDOFF_SURFACE_KEY, type StoreShape } from "./state";
 import { renderPapio } from "./dom";
 import { adapters, type AdapterSpec } from "./adapters/types";
+import { clampKeepaliveInterval } from "./keepalive";
 
 export interface Source {
   label: string;
@@ -203,6 +204,58 @@ function wireTermsConsent(): void {
   });
 }
 
+export const KEEPALIVE_ENABLED_KEY = "keepalive.enabled";
+export const KEEPALIVE_INTERVAL_KEY = "keepalive.interval";
+
+/** Reflect keep-warm preferences from the same storage keys the background
+ * manager reads. The input is deliberately clamped before it is displayed. */
+export async function renderKeepalive(): Promise<void> {
+  const toggle = document.getElementById("keepalive-enabled");
+  const inputElement = document.getElementById("keepalive-interval");
+  if (!(toggle instanceof HTMLButtonElement) || !(inputElement instanceof HTMLElement) || inputElement.tagName !== "INPUT") {
+    return;
+  }
+  const input = inputElement as HTMLInputElement;
+  let values: Record<string, unknown> = {};
+  try {
+    values = await chrome.storage.local.get([KEEPALIVE_ENABLED_KEY, KEEPALIVE_INTERVAL_KEY]);
+  } catch {
+    // Use the manager's defaults when storage is temporarily unavailable.
+  }
+  toggle.setAttribute("aria-checked", values[KEEPALIVE_ENABLED_KEY] === false ? "false" : "true");
+  toggle.disabled = false;
+  input.value = String(clampKeepaliveInterval(values[KEEPALIVE_INTERVAL_KEY]));
+  input.disabled = false;
+}
+
+export function wireKeepalive(): void {
+  const toggle = document.getElementById("keepalive-enabled");
+  const inputElement = document.getElementById("keepalive-interval");
+  if (!(toggle instanceof HTMLButtonElement) || !(inputElement instanceof HTMLElement) || inputElement.tagName !== "INPUT") {
+    return;
+  }
+  const input = inputElement as HTMLInputElement;
+  toggle.addEventListener("click", () => {
+    const enabled = toggle.getAttribute("aria-checked") !== "true";
+    toggle.disabled = true;
+    void chrome.storage.local
+      .set({ [KEEPALIVE_ENABLED_KEY]: enabled })
+      .then(renderKeepalive, () => {
+        toggle.disabled = false;
+      });
+  });
+  input.addEventListener("change", () => {
+    const interval = clampKeepaliveInterval(Number.parseInt(input.value, 10));
+    input.value = String(interval);
+    input.disabled = true;
+    void chrome.storage.local
+      .set({ [KEEPALIVE_INTERVAL_KEY]: interval })
+      .then(renderKeepalive, () => {
+        input.disabled = false;
+      });
+  });
+}
+
 type HandoffSurface = "in-window" | "work-window" | "tab-group";
 
 async function currentHandoffSurface(): Promise<HandoffSurface> {
@@ -390,3 +443,5 @@ void renderTermsConsent();
 wireHandoffSurface();
 void renderHandoffSurface();
 void renderDaemonFooter();
+wireKeepalive();
+void renderKeepalive();

@@ -352,7 +352,7 @@ func TestHelloAckAnnouncesDaemonVersion(t *testing.T) {
 		t.Fatalf("daemon_version = %q, want 0.1.0-test", payload.DaemonVersion)
 	}
 	if !slices.Equal(payload.Features, []string{
-		pageAcquireFeature, triageSnapshotFeature, triageSnapshotSchema2Feature, triageMutationsFeature, reviewPreviewFeature, statsFeature, pageCaptureFeature,
+		pageAcquireFeature, triageSnapshotFeature, triageSnapshotSchema2Feature, triageMutationsFeature, reviewPreviewFeature, statsFeature, pageCaptureFeature, activityFeedFeature,
 	}) {
 		t.Fatalf("features = %v, want required bridge feature set", payload.Features)
 	}
@@ -1690,6 +1690,80 @@ func TestDownloadCompleteRejectsTraversalAndAdoptsValidFile(t *testing.T) {
 	}
 	if err := b.svc.Artifacts.Verify(row.ArtifactSHA256); err != nil {
 		t.Fatalf("artifact verify: %v", err)
+	}
+}
+
+func TestDownloadCompleteForLiveJobAdoptsAndAcks(t *testing.T) {
+	b, jobs, cfg, _ := newBridge(t)
+	ctx := context.Background()
+	runSync(t, b, hello())
+
+	for _, initial := range []string{job.StateQueued, job.StateResolving, job.StateFetching} {
+		t.Run(initial, func(t *testing.T) {
+			id, err := jobs.CreateRequest(ctx, "wr_live_download_"+initial, handoffWork(), "", "",
+				job.Policy{
+					AccessMode: config.ModeDelegated, DesiredVersion: "any", FetchMaxBytes: 1 << 20,
+				}, nil, job.PrincipalUnknown)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if initial == job.StateResolving || initial == job.StateFetching {
+				if err := jobs.Transition(ctx, id, job.StateQueued, job.StateResolving,
+					map[string]any{"reason": "test"}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if initial == job.StateFetching {
+				if err := jobs.Transition(ctx, id, job.StateResolving, job.StateFetching,
+					map[string]any{"reason": "test"}); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			started, _ := runSync(t, b, inFrame(t, protocol.MsgDownloadStarted, id,
+				map[string]any{"download_id": 9, "filename": "paper.pdf"}))
+			if len(started) != 0 {
+				t.Fatalf("download_started unexpectedly returned frames: %v", started)
+			}
+			writeFixturePDF(t, filepath.Join(cfg.EffectiveAdoptionRoot(), id, "paper.pdf"))
+			msgs, _ := runSync(t, b, inFrame(t, protocol.MsgDownloadComplete, id,
+				map[string]any{"download_id": 9, "filename": "paper.pdf", "size_bytes": 533}))
+			if firstOfType(msgs, protocol.MsgAck) == nil {
+				t.Fatalf("no structured ack for live download_complete: %v", msgs)
+			}
+
+			row, err := jobs.Get(ctx, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if row.State != job.StateReady || row.ArtifactSHA256 == "" {
+				t.Fatalf("live %s job was not adopted: %+v", initial, row)
+			}
+			var version string
+			if err := jobs.S.DB().QueryRowContext(ctx,
+				`SELECT version FROM candidates WHERE job_id = ? AND source = 'browser' ORDER BY id DESC LIMIT 1`,
+				id).Scan(&version); err != nil {
+				t.Fatalf("browser candidate version: %v", err)
+			}
+			if version != resolver.VersionUnknown {
+				t.Fatalf("browser adoption version = %q, want %q", version, resolver.VersionUnknown)
+			}
+			events, err := jobs.Events(ctx, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			seen := map[string]bool{}
+			for _, event := range events {
+				if kind, ok := event["kind"].(string); ok {
+					seen[kind] = true
+				}
+			}
+			for _, kind := range []string{"browser.download_started", "browser.download_complete"} {
+				if !seen[kind] {
+					t.Fatalf("missing %s event", kind)
+				}
+			}
+		})
 	}
 }
 

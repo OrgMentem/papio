@@ -232,6 +232,22 @@
         opacity: 0.45;
       }
 
+      .keepalive-interval {
+        align-items: center;
+        display: flex;
+        gap: 8px;
+      }
+
+      .keepalive-interval input {
+        background: var(--color-surface);
+        border: 1px solid var(--color-control-border);
+        border-radius: var(--radius-control);
+        color: var(--color-ink);
+        font: inherit;
+        padding: 5px 8px;
+        width: 78px;
+      }
+
       /* Segmented control for the handoff-surface choice. */
       .seg {
         border: 1px solid var(--color-control-border);
@@ -387,6 +403,7 @@
       <div class="card">
         <div class="row" id="terms-consent-row">
           <div>
+
             <div class="source-label">Auto-accept publisher terms</div>
             <div class="hint" id="terms-consent-hint" hidden>
               Not set yet — <em>papio</em> asks on your first download.
@@ -401,6 +418,40 @@
             aria-label="Auto-accept publisher terms"
             disabled
           ></button>
+        </div>
+      </div>
+    </section>
+    <section>
+      <h2>Keep your institution session warm</h2>
+      <p class="lede">
+        <em>papio</em> keeps your library session fresh by refreshing a pinned background tab.
+        Turn this off if you prefer to sign in manually for each handoff.
+      </p>
+      <div class="card">
+        <div class="row" id="keepalive-enabled-row">
+          <div>
+            <div class="source-label">Keep-warm session</div>
+            <div class="hint">Refresh a pinned resolver tab while institutional downloads are active.</div>
+          </div>
+          <button
+            id="keepalive-enabled"
+            class="switch"
+            type="button"
+            role="switch"
+            aria-checked="true"
+            aria-label="Keep-warm institution session"
+            disabled
+          ></button>
+        </div>
+        <div class="row" id="keepalive-interval-row">
+          <div>
+            <div class="source-label">Refresh interval</div>
+            <div class="hint">Choose how often the pinned tab refreshes (2–30 minutes).</div>
+          </div>
+          <label class="keepalive-interval">
+            <input id="keepalive-interval" type="number" min="2" max="30" step="1" value="4" disabled />
+            <span>minutes</span>
+          </label>
         </div>
       </div>
     </section>

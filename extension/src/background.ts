@@ -28,13 +28,17 @@ import {
 } from "./protocol";
 import {
   chromeBackend,
+  clearPendingDelivery,
+  emptyStore,
   findByJob,
   findByTab,
   patchJob,
   removeJob,
+  startPendingDelivery,
+  updatePendingDelivery,
   upsertJob,
-  emptyStore,
   type ActiveJob,
+  type PendingDelivery,
   type StateBackend,
   type StoreShape,
   type TermsConsent,
@@ -44,6 +48,7 @@ import {
   HANDOFF_SURFACE_KEY,
   type HandoffSurface,
 } from "./state";
+import { isPDFPage, pdfSourceURL } from "./deliver";
 import {
   adapters,
   interpret,
@@ -53,6 +58,7 @@ import {
 } from "./adapters/types";
 import { observeUnknown, type ObserveChromeApi } from "./observe";
 import { chromeKeepaliveAPI, initKeepalive, isAuthenticationURL } from "./keepalive";
+import type { KeepaliveManager, KeepaliveSnapshot } from "./keepalive";
 import { routeResolverService, type ResolverRoute } from "./resolver";
 import { detectAuthFailure } from "./authfail";
 
@@ -121,6 +127,83 @@ const HANDOFF_GROUP_TITLE_MAX_TITLE_LENGTH = 72;
 function isHandoffGroupTitle(title: string | undefined): boolean {
   return title === HANDOFF_GROUP_TITLE || title?.startsWith(`${HANDOFF_GROUP_TITLE} — `) === true;
 }
+
+export interface BadgeState {
+  connectionStatus: StoreShape["connectionStatus"];
+  reauthNeeded: boolean;
+  authBlockers: number;
+  blockedHosts: number | readonly string[];
+  ungrantedResolvers: number;
+  triageCount: number | undefined;
+}
+
+export interface BadgeResult {
+  text: string;
+  color: string;
+  tooltip: string;
+}
+
+/** Compute the one toolbar badge used by every background subsystem.
+ * Precedence is documented and intentional: disconnected daemon (gray) >
+ * reauthentication (orange) > sign-in blockers (orange) > blocked providers
+ * (orange) > resolver grants (blue) > triage (blue) > blank. */
+export function computeBadge(state: BadgeState): BadgeResult {
+  const blockedHostCount =
+    typeof state.blockedHosts === "number"
+      ? Math.max(0, Math.trunc(state.blockedHosts))
+      : state.blockedHosts.length;
+  const authBlockerCount = Math.max(0, Math.trunc(state.authBlockers));
+  const resolverCount = Math.max(0, Math.trunc(state.ungrantedResolvers));
+  const triageCount =
+    typeof state.triageCount === "number" && Number.isFinite(state.triageCount)
+      ? Math.max(0, Math.trunc(state.triageCount))
+      : undefined;
+  if (state.connectionStatus !== "connected") {
+    return { text: "!", color: "#777777", tooltip: "Papio: daemon disconnected" };
+  }
+  if (state.reauthNeeded) {
+    return { text: "!", color: "#b06000", tooltip: "Papio: institution sign-in needed" };
+  }
+  if (authBlockerCount > 0) {
+    return {
+      text: String(authBlockerCount),
+      color: "#b06000",
+      tooltip: `Papio: ${authBlockerCount} paper${authBlockerCount === 1 ? "" : "s"} waiting on your institution sign-in`,
+    };
+  }
+  if (blockedHostCount > 0) {
+    const host =
+      typeof state.blockedHosts === "number" ? undefined : state.blockedHosts[0];
+    const tooltip =
+      blockedHostCount === 1 && typeof host === "string"
+        ? `Papio: ${host} needs browser access`
+        : `Papio: ${blockedHostCount} provider hosts need browser access`;
+    return { text: String(blockedHostCount), color: "#b06000", tooltip };
+  }
+  if (resolverCount > 0) {
+    return {
+      text: String(resolverCount),
+      color: "#1a73e8",
+      tooltip: `Papio: ${resolverCount} library resolver permission${resolverCount === 1 ? "" : "s"} need attention`,
+    };
+  }
+  if (triageCount !== undefined && triageCount > 0) {
+    return {
+      text: String(triageCount),
+      color: "#1a73e8",
+      tooltip: `Papio: ${triageCount} pending triage item${triageCount === 1 ? "" : "s"}`,
+    };
+  }
+  return {
+    text: "",
+    color: "#1a73e8",
+    tooltip: triageCount === 0 ? "Papio: no pending triage items" : "Papio: connected",
+  };
+}
+export type BridgeSessionState = KeepaliveSnapshot & {
+  releasedAuthJobs: number;
+};
+
 
 
 /** Whether this adapter's SPA must render outside the minimized work window. */
@@ -353,11 +436,19 @@ export interface BridgeDeps {
 }
 
 interface DownloadTrack {
-
   ids: Set<number>;
   ambiguous: boolean;
   /** True only for a direct-file offer attempted before any broker tab opens. */
   directOffer: boolean;
+  /** True for an operator's explicit "Send PDF to papio" action. */
+  delivery?: boolean;
+}
+
+interface StalledAuthHandoff {
+  url: string;
+  providerHosts: string[];
+  expected?: { title?: string; doi?: string };
+  requiresAuth?: boolean;
 }
 
 type NativeRequestKind = "response" | "transport" | "timeout";
@@ -391,6 +482,22 @@ interface BrokerSuccess<T extends Record<string, unknown>> {
 }
 
 type BrokerReply<T extends Record<string, unknown>> = BrokerFailure | (BrokerSuccess<T> & T);
+
+interface DeliveryStartPayload {
+  tab_id: number;
+  url: string;
+  doi?: string;
+  title?: string;
+}
+
+type DeliveryState = "sending" | "downloaded" | "failed" | "adopted" | "idle";
+
+type DeliveryReply = BrokerReply<{
+  state: DeliveryState;
+  job_id?: string;
+  duplicate?: boolean;
+  message?: string;
+}>;
 
 function hostMatches(host: string, providerHosts: string[]): boolean {
   return providerHosts.some((h) => host === h || host.endsWith("." + h));
@@ -673,6 +780,12 @@ export class Bridge {
   /** A finished download keeps its broker tab open until the daemon has
    * acknowledged the adoption attempt for that job. */
   private readonly completedDownloadTabs = new Map<string, number>();
+  /** Jobs currently owned by the operator's direct PDF delivery. This
+   * worker-local marker prevents ack cleanup from closing the user's tab. */
+  private readonly deliveryJobs = new Set<string>();
+  private lastDeliveryState:
+    | { job_id: string; state: "adopted"; message: string; at: number }
+    | undefined;
   /** Resolver-provided offer URLs are cached here after storage hydration. */
   private readonly offerURLs = new Map<string, string>();
   /** Institution Shibboleth entityIDs from job offers (login_entity_id), used to
@@ -717,6 +830,14 @@ export class Bridge {
   private openAccessLandingObserved = false;
   /** Keepalive has observed its resolver tab return from authentication. */
   private keepaliveAuthenticated = false;
+  /** Current keepalive reauthentication pause, used by computeBadge. */
+  private keepaliveReauthNeeded = false;
+  /** Attached only after the bridge has hydrated and started. */
+  private keepaliveManager: KeepaliveManager | undefined;
+  /** Human-auth stalls and their resolver offers remain worker-local so an
+   * operator can explicitly reset and re-drive them without persistence. */
+  private readonly stalledAuthHandoffs = new Map<string, StalledAuthHandoff>();
+  private authUnblockedCount = 0;
   /** Atomically reserves the one visible handoff while tabs.create is in flight. */
   private handoffOpening = false;
   private drainingQueuedHandoffs = false;
@@ -771,6 +892,131 @@ export class Bridge {
   constructor(private readonly deps: BridgeDeps) {}
   trackedJobCount(): number {
     return this.store.activeJobs.length;
+  }
+
+  private queuedAuthJobCount(): number {
+    return this.store.activeJobs.filter(
+      (job) => job.status === "queued" && job.requires_auth === true,
+    ).length;
+  }
+  queuedAuthJobs(): number {
+    return this.queuedAuthJobCount();
+  }
+
+  lastAuthReturnedAt(): number | undefined {
+    return this.store.lastAuthReturnedAt;
+  }
+
+  stalledAuthJobIDs(): string[] {
+    return [...this.authStalledReported];
+  }
+
+  attachKeepalive(manager: KeepaliveManager): void {
+    this.keepaliveManager = manager;
+    this.keepaliveReauthNeeded = manager.getSnapshot().pausedForReauth;
+  }
+
+  setKeepaliveReauthNeeded(paused: boolean): void {
+    if (this.keepaliveReauthNeeded === paused) return;
+    this.keepaliveReauthNeeded = paused;
+    void this.syncConnectionBadge();
+  }
+
+  sessionState(): BridgeSessionState {
+    const fallback: KeepaliveSnapshot = {
+      enabled: true,
+      intervalMinutes: 4,
+      authenticated: this.keepaliveAuthenticated,
+      pausedForReauth: this.keepaliveReauthNeeded,
+      lastCheckAt: null,
+      resolverOrigin: null,
+      lastAuthReturnedAt: this.store.lastAuthReturnedAt ?? null,
+      queuedAuthJobs: this.queuedAuthJobCount(),
+      stalledAuthJobs: this.stalledAuthJobIDs(),
+    };
+    const snapshot = this.keepaliveManager?.getSnapshot() ?? fallback;
+    return {
+      ...snapshot,
+      pausedForReauth: this.keepaliveReauthNeeded || snapshot.pausedForReauth,
+      authenticated: this.keepaliveAuthenticated || snapshot.authenticated,
+      lastAuthReturnedAt: this.store.lastAuthReturnedAt ?? snapshot.lastAuthReturnedAt,
+      queuedAuthJobs: this.queuedAuthJobCount(),
+      stalledAuthJobs: this.stalledAuthJobIDs(),
+      releasedAuthJobs: this.authUnblockedCount,
+    };
+  }
+
+  async requestSessionSignIn(): Promise<BrokerReply<{ opened: true }>> {
+    const manager = this.keepaliveManager;
+    if (manager === undefined) return this.failure("session_unavailable", "The institution session is not ready");
+    try {
+      return (await manager.openReauth())
+        ? { ok: true, opened: true }
+        : this.failure("session_unavailable", "No configured institution resolver is available");
+    } catch {
+      return this.failure("session_open_failed", "Could not open the institution sign-in");
+    }
+  }
+
+  async retryAuthStalled(jobID: string): Promise<BrokerReply<{ opened: true }>> {
+    await this.ready;
+    const current = findByJob(this.store, jobID);
+    const saved =
+      this.stalledAuthHandoffs.get(jobID) ??
+      (current !== undefined && this.offerURLs.get(jobID) !== undefined
+        ? {
+            url: this.offerURLs.get(jobID)!,
+            providerHosts: [...current.provider_hosts],
+            ...(current.expected !== undefined ? { expected: current.expected } : {}),
+            ...(current.requires_auth !== undefined ? { requiresAuth: current.requires_auth } : {}),
+          }
+        : undefined);
+    if (saved === undefined || !this.authStalledReported.has(jobID)) {
+      return this.failure("handoff_unavailable", "This authentication stall is no longer available");
+    }
+    await this.update((s) => this.clearAuthAttempts(s, jobID));
+    let tabID: number | undefined = current !== undefined && current.tab_id >= 0 ? current.tab_id : undefined;
+    if (tabID !== undefined && this.deps.tabs.update !== undefined) {
+      try {
+        await this.deps.tabs.update(tabID, { url: saved.url, active: true });
+      } catch {
+        tabID = undefined;
+      }
+    } else if (tabID !== undefined) {
+      tabID = undefined;
+    }
+    if (tabID === undefined) {
+      try {
+        tabID = await this.openBrokerTab(saved.url, true);
+      } catch {
+        tabID = undefined;
+      }
+    }
+    if (tabID === undefined) {
+      return this.failure("handoff_open_failed", "Could not reopen the institutional handoff");
+    }
+    this.beginProviderDrive(jobID);
+    this.authStalledReported.delete(jobID);
+    const now = this.deps.now();
+    await this.upsertJobWithOffer(
+      {
+        job_id: jobID,
+        tab_id: tabID,
+        offered_at: now,
+        expires_at: now,
+        status: "accepted",
+        provider_hosts: [...saved.providerHosts],
+        ...(saved.requiresAuth !== undefined ? { requires_auth: saved.requiresAuth } : {}),
+      },
+      saved.url,
+    );
+    this.stalledAuthHandoffs.delete(jobID);
+    this.send("job_accept", {}, jobID);
+    return { ok: true, opened: true };
+  }
+
+  dismissSessionNotice(): void {
+    this.authUnblockedCount = 0;
   }
 
   /** A cold preflight has no tab yet; excluding it would hide the only sign-in
@@ -1298,21 +1544,10 @@ export class Bridge {
    * daemon or a sign-in the user can complete remains more immediate. */
   async syncConnectionBadge(status = this.store.connectionStatus): Promise<void> {
     try {
-      if (status !== "connected") {
-        await Promise.all([
-          this.deps.action.setBadgeText({ text: "!" }),
-          this.deps.action.setBadgeBackgroundColor({ color: "#777777" }),
-          this.deps.action.setTitle?.({ title: "Papio: daemon disconnected" }),
-        ]);
-        return;
-      }
-      // A cold institutional offer is deliberately queued before opening an
-      // unproven SAML exchange. Count it here so disabled keepalive cannot hide
-      // the only sign-in signal while that preflight waits.
-      const signInBlockersBeforePermissions = this.signInBlockerCount();
       const blockedProviderHosts = this.currentBlockedProviderHosts();
+      const signInBlockersBeforePermissions = this.signInBlockerCount();
       let ungrantedResolverOrigins = 0;
-      if (signInBlockersBeforePermissions === 0 && blockedProviderHosts.length === 0) {
+      if (status === "connected" && signInBlockersBeforePermissions === 0 && blockedProviderHosts.length === 0) {
         for (const origin of this.store.resolverOrigins ?? []) {
           try {
             if (!(await this.deps.permissions.contains({ origins: [`${origin}/*`] }))) {
@@ -1323,53 +1558,21 @@ export class Bridge {
           }
         }
       }
-      // The contains() calls above are async; if the port dropped meanwhile,
-      // onPortDisconnect already painted "!" — don't overwrite it with a stale
-      // connected-state badge.
-      if (this.store.connectionStatus !== "connected") return;
-      const signInBlockers = this.signInBlockerCount();
-      if (signInBlockers > 0) {
-        await Promise.all([
-          this.deps.action.setBadgeText({ text: String(signInBlockers) }),
-          this.deps.action.setBadgeBackgroundColor({ color: "#b06000" }),
-          this.deps.action.setTitle?.({
-            title: `Papio: ${signInBlockers} paper${signInBlockers === 1 ? "" : "s"} waiting on your institution sign-in`,
-          }),
-        ]);
-        return;
-      }
-      if (blockedProviderHosts.length > 0) {
-        const hostLabel =
-          blockedProviderHosts.length === 1 ? blockedProviderHosts[0] : `${blockedProviderHosts.length} provider hosts`;
-        await Promise.all([
-          this.deps.action.setBadgeText({ text: String(blockedProviderHosts.length) }),
-          this.deps.action.setBadgeBackgroundColor({ color: "#b06000" }),
-          this.deps.action.setTitle?.({ title: `Papio: ${hostLabel} need${blockedProviderHosts.length === 1 ? "s" : ""} browser access` }),
-        ]);
-        return;
-      }
-      if (ungrantedResolverOrigins > 0) {
-        await Promise.all([
-          this.deps.action.setBadgeText({ text: String(ungrantedResolverOrigins) }),
-          this.deps.action.setBadgeBackgroundColor({ color: "#1a73e8" }),
-          this.deps.action.setTitle?.({
-            title: `Papio: ${ungrantedResolverOrigins} library resolver permission${ungrantedResolverOrigins === 1 ? "" : "s"} need attention`,
-          }),
-        ]);
-        return;
-      }
-      const pending = this.triagePendingCount;
+      // contains() is asynchronous; never paint a connected result after the
+      // port has dropped while permission checks were in flight.
+      if (status === "connected" && this.store.connectionStatus !== "connected") return;
+      const badge = computeBadge({
+        connectionStatus: status,
+        reauthNeeded: this.keepaliveReauthNeeded,
+        authBlockers: this.signInBlockerCount(),
+        blockedHosts: blockedProviderHosts,
+        ungrantedResolvers: ungrantedResolverOrigins,
+        triageCount: this.triagePendingCount,
+      });
       await Promise.all([
-        this.deps.action.setBadgeText({ text: pending !== undefined && pending > 0 ? String(pending) : "" }),
-        this.deps.action.setBadgeBackgroundColor({ color: "#1a73e8" }),
-        this.deps.action.setTitle?.({
-          title:
-            pending === undefined
-              ? "Papio: connected"
-              : pending === 0
-                ? "Papio: no pending triage items"
-                : `Papio: ${pending} pending triage item${pending === 1 ? "" : "s"}`,
-        }),
+        this.deps.action.setBadgeText({ text: badge.text }),
+        this.deps.action.setBadgeBackgroundColor({ color: badge.color }),
+        this.deps.action.setTitle?.({ title: badge.tooltip }),
       ]);
     } catch {
       // Browser action APIs are advisory; do not make a healthy bridge fail.
@@ -1431,6 +1634,10 @@ export class Bridge {
         alive = false;
       }
       if (alive) continue;
+      if (this.store.pendingDelivery?.job_id === job.job_id && this.store.pendingDelivery.status !== "failed") {
+        await this.update((s) => patchJob(s, job.job_id, { tab_id: -1 }));
+        continue;
+      }
       if (job.status === "awaiting_download") {
         // Past auth: a download may have completed or be in flight into the
         // job's adoption dir, which the daemon's poll-scan adopts. Park it, as
@@ -1451,6 +1658,15 @@ export class Bridge {
         // Already failed to authenticate this job MAX_AUTH_ATTEMPTS times this
         // session: surface the human step and leave it parked instead of
         // re-queueing it into another doomed drive.
+        const offerURL = this.offerURLs.get(job.job_id);
+        if (offerURL !== undefined) {
+          this.rememberStalledAuthHandoff(job.job_id, {
+            url: offerURL,
+            providerHosts: job.provider_hosts,
+            ...(job.expected !== undefined ? { expected: job.expected } : {}),
+            ...(job.requires_auth !== undefined ? { requiresAuth: job.requires_auth } : {}),
+          });
+        }
         this.reportAuthStalled(job.job_id);
         await this.removeJobWithOffer(job.job_id);
         continue;
@@ -1485,6 +1701,8 @@ export class Bridge {
     }
     this.downloads.delete(jobID);
     this.completedDownloadTabs.delete(jobID);
+    this.authStalledReported.delete(jobID);
+    this.stalledAuthHandoffs.delete(jobID);
     await this.removeJobWithOffer(jobID);
   }
 
@@ -1525,6 +1743,147 @@ export class Bridge {
         resolve({ error: "Could not send page acquisition request" });
       }
     });
+  }
+
+  private deliveryJobForDOI(doi: string | undefined): ActiveJob | undefined {
+    if (doi === undefined || doi.trim() === "") return undefined;
+    const normalized = doi.trim().toLowerCase().replace(/^doi:\s*/, "");
+    return this.store.activeJobs.find(
+      (job) => job.expected?.doi?.trim().toLowerCase().replace(/^doi:\s*/, "") === normalized,
+    );
+  }
+
+  private async startDeliveryDownload(jobID: string, url: string): Promise<boolean> {
+    const job = findByJob(this.store, jobID);
+    if (job === undefined) return false;
+    this.deliveryJobs.add(jobID);
+    await this.update((s) => patchJob(s, jobID, { download_initiated: true }));
+    this.downloads.set(jobID, { ids: new Set<number>(), ambiguous: false, directOffer: false, delivery: true });
+    this.pendingDownloadURLs.set(url, jobID);
+    try {
+      const id = await this.deps.downloads.download({
+        url,
+        filename: `papio/${jobID}/paper.pdf`,
+        conflictAction: "uniquify",
+        saveAs: false,
+      });
+      const track = this.downloads.get(jobID);
+      if (track !== undefined) {
+        track.ids.add(id);
+        if (track.ids.size > 1) track.ambiguous = true;
+        this.downloads.set(jobID, track);
+      }
+      return true;
+    } catch {
+      this.downloads.delete(jobID);
+      this.deliveryJobs.delete(jobID);
+      await this.update((s) =>
+        updatePendingDelivery(
+          patchJob(s, jobID, { download_initiated: false }),
+          jobID,
+          { status: "failed", error: "Could not start the browser download" },
+        ),
+      );
+      return false;
+    } finally {
+      this.pendingDownloadURLs.delete(url);
+    }
+  }
+
+  async startPDFDelivery(payload: DeliveryStartPayload): Promise<DeliveryReply> {
+    await this.ready;
+    if (!Number.isSafeInteger(payload.tab_id) || payload.tab_id < 0 || payload.url.length === 0) {
+      return this.failure("invalid_request", "Invalid PDF delivery request");
+    }
+    let tab: TabInfo;
+    try {
+      tab = await this.deps.tabs.get(payload.tab_id);
+    } catch {
+      return this.failure("tab_unavailable", "The current PDF tab is no longer available");
+    }
+    const tabURL = typeof tab.url === "string" ? tab.url : payload.url;
+    const url = pdfSourceURL(payload.url || tabURL);
+    if (!isPDFPage(tabURL) && !isPDFPage(url)) {
+      return this.failure("not_pdf", "No PDF detected on this page");
+    }
+    const doi = payload.doi;
+    let job = findByTab(this.store, payload.tab_id) ?? this.deliveryJobForDOI(doi);
+    let duplicate = false;
+    if (job === undefined) {
+      if (doi === undefined || doi.trim() === "") {
+        return this.failure("no_doi", "This PDF has no DOI to queue");
+      }
+      const ack = await this.requestPageAcquire({
+        url,
+        doi,
+        ...(payload.title ? { title: payload.title } : {}),
+        source: "popup",
+      });
+      if (ack.error !== undefined) return this.failure("page_acquire", ack.error);
+      if (ack.job_id === undefined) return this.failure("page_acquire", "The daemon did not return a job");
+      duplicate = ack.duplicate === true;
+      await this.inboundChain;
+      job = findByJob(this.store, ack.job_id);
+      if (job === undefined && duplicate) {
+        return this.failure("duplicate_not_live", "That paper is already queued, but its job is not live in this browser");
+      }
+      if (job === undefined) {
+        const now = this.deps.now();
+        const synthetic: ActiveJob = {
+          job_id: ack.job_id,
+          tab_id: payload.tab_id,
+          offered_at: now,
+          expires_at: now + 24 * 60 * 60_000,
+          status: "accepted",
+          provider_hosts: [],
+          ...(payload.title || doi ? { expected: { ...(payload.title ? { title: payload.title } : {}), ...(doi ? { doi } : {}) } } : {}),
+        };
+        await this.update((s) => upsertJob(s, synthetic));
+        job = synthetic;
+      }
+    }
+    const pending = this.store.pendingDelivery;
+    if (pending !== undefined && pending.status !== "failed" && pending.job_id !== job.job_id) {
+      return this.failure("delivery_busy", "Another PDF is already being sent to papio");
+    }
+    if (pending?.job_id === job.job_id && pending.status !== "failed") {
+      return { ok: true, state: pending.status ?? "sending", job_id: job.job_id, ...(duplicate ? { duplicate: true } : {}) };
+    }
+    await this.update((s) =>
+      startPendingDelivery(s, {
+        job_id: job.job_id,
+        url,
+        initiated_at: this.deps.now(),
+        status: "sending",
+      }),
+    );
+    this.lastDeliveryState = undefined;
+    const started = await this.startDeliveryDownload(job.job_id, url);
+    if (!started) {
+      return this.failure("download_start", "Could not start the browser download");
+    }
+    return { ok: true, state: "sending", job_id: job.job_id, ...(duplicate ? { duplicate: true } : {}) };
+  }
+
+  deliveryState(): DeliveryReply {
+    const pending = this.store.pendingDelivery;
+    if (pending !== undefined) {
+      return {
+        ok: true,
+        state: pending.status ?? "sending",
+        job_id: pending.job_id,
+        ...(pending.error ? { message: pending.error } : {}),
+      };
+    }
+    if (this.lastDeliveryState !== undefined && this.deps.now() - this.lastDeliveryState.at < 10 * 60_000) {
+      return {
+        ok: true,
+        state: this.lastDeliveryState.state,
+        job_id: this.lastDeliveryState.job_id,
+        message: this.lastDeliveryState.message,
+      };
+    }
+    return { ok: true, state: "idle" };
   }
 
   private failPageAcquireWaiters(error: string): void {
@@ -2158,6 +2517,7 @@ export class Bridge {
   private async removeJobWithOffer(jobID: string): Promise<void> {
     const job = findByJob(this.store, jobID);
     const providerKey = job === undefined ? undefined : this.providerKeyForJob(job);
+    this.deliveryJobs.delete(jobID);
     this.offerURLs.delete(jobID);
     this.queuedHandoffTimers.delete(jobID);
     this.classifyRetries.delete(jobID);
@@ -2177,7 +2537,7 @@ export class Bridge {
     await this.update((s) => {
       const offerURLs = { ...(s.offerURLs ?? {}) };
       delete offerURLs[jobID];
-      return { ...removeJob(s, jobID), offerURLs };
+      return { ...clearPendingDelivery(removeJob(s, jobID), jobID), offerURLs };
     });
     if (providerKey !== undefined) await this.releaseProviderDrainWhenUnused(providerKey);
     await this.closeWorkWindowIfIdle();
@@ -2261,6 +2621,15 @@ export class Bridge {
   private authAttemptsFor(jobID: string): number {
     return (this.store.authAttempts ?? {})[jobID] ?? 0;
   }
+  private rememberStalledAuthHandoff(jobID: string, handoff: StalledAuthHandoff): void {
+    this.stalledAuthHandoffs.set(jobID, {
+      url: handoff.url,
+      providerHosts: [...handoff.providerHosts],
+      ...(handoff.expected !== undefined ? { expected: handoff.expected } : {}),
+      ...(handoff.requiresAuth !== undefined ? { requiresAuth: handoff.requiresAuth } : {}),
+    });
+  }
+
 
   /** Report the human authentication step for a capped job, at most once per
    * worker lifetime. human_auth_required is non-terminal daemon-side: the job
@@ -2602,6 +2971,7 @@ export class Bridge {
     this.keepaliveAuthenticated = authenticated;
     if (!authenticated) return;
     await this.ready;
+    await this.update((s) => ({ ...s, lastAuthReturnedAt: this.deps.now() }));
     await this.releaseQueuedHandoffs();
   }
 
@@ -2683,6 +3053,7 @@ export class Bridge {
               unknown_count: 0,
             }),
           );
+          if (queued.requires_auth === true) this.authUnblockedCount += 1;
           opened = true;
           if (forceSurface) await this.surfaceWorkTab(tabID);
         } finally {
@@ -2896,6 +3267,30 @@ export class Bridge {
     // without its durable offer URL cannot represent an in-flight download:
     // discard that stale record so this offer recreates the real browser work.
     const existing = findByJob(this.store, jobID);
+    const pendingDelivery = this.store.pendingDelivery;
+    if (pendingDelivery?.job_id === jobID && pendingDelivery.status !== "failed") {
+      const now = this.deps.now();
+      const expiresMs = Date.parse(expiresAt);
+      const deliveryJob: ActiveJob = existing ?? {
+        job_id: jobID,
+        tab_id: -1,
+        offered_at: now,
+        expires_at: Number.isNaN(expiresMs) ? now : expiresMs,
+        status: "accepted",
+        provider_hosts: providerHosts,
+      };
+      await this.upsertJobWithOffer(
+        {
+          ...deliveryJob,
+          provider_hosts: providerHosts,
+          ...(expected !== undefined ? { expected } : {}),
+          ...(requiresAuth !== undefined ? { requires_auth: requiresAuth } : {}),
+        },
+        openurl,
+      );
+      this.send("job_accept", {}, jobID);
+      return;
+    }
     if (existing !== undefined && existing.requires_auth !== requiresAuth) {
       // A restored job can predate this field; its first re-offer must learn the
       // requirement before a fallback can recreate an expired sign-in request.
@@ -2978,6 +3373,12 @@ export class Bridge {
       // complete it. Report the human step (once) and decline to open another
       // broker tab. No job_reject — that is terminal; the job stays parked and
       // is re-offered on a future launch with a fresh budget.
+      this.rememberStalledAuthHandoff(jobID, {
+        url: openurl,
+        providerHosts,
+        ...(expected !== undefined ? { expected } : {}),
+        ...(requiresAuth !== undefined ? { requiresAuth } : {}),
+      });
       this.reportAuthStalled(jobID);
       return;
     }
@@ -3082,6 +3483,19 @@ export class Bridge {
     await this.fallbackToOfferTab(jobID);
   }
 
+  private async failDelivery(jobID: string, downloadID: number, reason: string): Promise<void> {
+    await this.discardDownload(jobID, downloadID);
+    this.deliveryJobs.delete(jobID);
+    await this.update((s) =>
+      updatePendingDelivery(
+        patchJob(s, jobID, { download_initiated: false }),
+        jobID,
+        { status: "failed", error: reason },
+      ),
+    );
+    this.send("error", { code: "download_not_pdf", message: reason }, jobID);
+  }
+
   /** Erase a download we refuse to adopt: tracking, file, and history entry. */
   private async discardDownload(jobID: string, downloadID: number): Promise<void> {
     this.downloads.delete(jobID);
@@ -3167,6 +3581,20 @@ export class Bridge {
    * adoption. Close the broker-owned viewer then, never on a raw tab event. */
   private async closeAfterAdoption(jobID: string | undefined): Promise<void> {
     if (jobID === undefined) return;
+    const isDelivery = this.deliveryJobs.has(jobID) || this.store.pendingDelivery?.job_id === jobID;
+    if (isDelivery) {
+      this.completedDownloadTabs.delete(jobID);
+      this.deliveryJobs.delete(jobID);
+      this.lastDeliveryState = {
+        job_id: jobID,
+        state: "adopted",
+        message: "papio adopted v (validating)",
+        at: this.deps.now(),
+      };
+      await this.update((s) => clearPendingDelivery(s, jobID));
+      await this.removeJobWithOffer(jobID);
+      return;
+    }
     const tabID = this.completedDownloadTabs.get(jobID);
     if (tabID === undefined) return;
     this.completedDownloadTabs.delete(jobID);
@@ -3201,7 +3629,7 @@ export class Bridge {
     } catch {
       return;
     }
-    // A title-only update counts: the UNE Shibboleth stale page is classifiable
+    // A title-only update counts: the the default institution Shibboleth stale page is classifiable
     // ONLY by its title ("… Login Service - Stale Request"); its URL is byte-for-byte
     // the URL of the working login form. Chrome can deliver that title after the
     // `complete` event, and detection used to run on `complete` alone — so the one
@@ -3365,6 +3793,12 @@ export class Bridge {
     this.staleRecoveryInFlightEpochs.set(job.job_id, recoveryEpoch);
     try {
       if (this.authAttemptsFor(job.job_id) >= MAX_AUTH_ATTEMPTS) {
+        this.rememberStalledAuthHandoff(job.job_id, {
+          url: openurl,
+          providerHosts: job.provider_hosts,
+          ...(job.expected !== undefined ? { expected: job.expected } : {}),
+          ...(job.requires_auth !== undefined ? { requiresAuth: job.requires_auth } : {}),
+        });
         this.reportAuthStalled(job.job_id);
         return false;
       }
@@ -3999,11 +4433,16 @@ export class Bridge {
     if (this.closingTabs.delete(tabID)) return; // programmatic close, not a user cancel
     const job = findByTab(this.store, tabID);
     if (!job) return;
+    if (this.deliveryJobs.has(job.job_id) || this.store.pendingDelivery?.job_id === job.job_id) {
+      // The browser download is independent of the source tab. Keep its exact
+      // correlation and pending record alive when the operator closes the PDF.
+      await this.update((s) => patchJob(s, job.job_id, { tab_id: -1 }));
+      return;
+    }
     // Once the user is past authentication (awaiting_download), a closed tab is
     // NOT a cancel: a download may be in flight or already saved into the job's
-    // adoption directory, where the daemon's poll-time scan will adopt it. We
-    // drop our local tab correlation but leave the job parked daemon-side.
-    // Cancelling only stands while the handoff has not yet reached download.
+    // adoption directory, where the daemon's poll-scan adopts it. Park it, as
+    // onTabRemoved would have.
     if (job.status === "awaiting_download") {
       this.completedDownloadTabs.delete(job.job_id);
       await this.removeJobWithOffer(job.job_id);
@@ -4089,6 +4528,10 @@ export class Bridge {
       if (state === "interrupted") {
         for (const job of this.store.activeJobs) {
           const track = this.downloads.get(job.job_id);
+          if (track?.delivery === true && track.ids.has(delta.id)) {
+            await this.failDelivery(job.job_id, delta.id, "The PDF download was interrupted");
+            return;
+          }
           if (track?.directOffer === true && track.ids.has(delta.id)) {
             await this.discardDirectOffer(job.job_id, delta.id);
             return;
@@ -4109,11 +4552,15 @@ export class Bridge {
     }
     if (!owner || !track) return;
     if (track.ambiguous || track.ids.size !== 1) return; // zero or multiple matches: stay with the user
-
     const found = await this.deps.downloads.search({ id: delta.id });
     const item = found[0];
     const mime = item?.mime?.split(";", 1)[0]?.trim().toLowerCase();
-    if (track.directOffer) {
+    if (track.delivery === true) {
+      if (mime !== "application/pdf") {
+        await this.failDelivery(owner.job_id, delta.id, "Downloaded file was not a PDF — job stays in your inbox");
+        return;
+      }
+    } else if (track.directOffer) {
       if (mime !== "application/pdf") {
         await this.discardDirectOffer(owner.job_id, delta.id);
         return;
@@ -4138,10 +4585,14 @@ export class Bridge {
     const size = item.fileSize ?? item.totalBytes ?? item.bytesReceived ?? 0;
     if (filename.length === 0 || size < 1) return; // cannot form a valid frame; leave to the user
 
-    await this.update((s) =>
-      this.clearAuthAttempts(patchJob(s, owner.job_id, { status: "awaiting_download" }), owner.job_id),
-    );
+    await this.update((s) => {
+      const next = this.clearAuthAttempts(patchJob(s, owner.job_id, { status: "awaiting_download" }), owner.job_id);
+      return track.delivery === true
+        ? updatePendingDelivery(next, owner.job_id, { status: "downloaded" })
+        : next;
+    });
     this.authStalledReported.delete(owner.job_id);
+    this.stalledAuthHandoffs.delete(owner.job_id);
     this.send("download_started", { download_id: delta.id, filename }, owner.job_id);
     this.send("download_complete", { download_id: delta.id, filename, size_bytes: size }, owner.job_id);
     this.completedDownloadTabs.set(owner.job_id, owner.tab_id);
@@ -4252,11 +4703,14 @@ type InboxRuntimeReply =
   | BrokerFailure
   | { opened: true }
   | { captured: true }
+  | { ok: true }
   | BrokerReply<{ snapshot: Record<string, unknown> }>
   | BrokerReply<{ counts: Record<string, unknown>; generated_at: string }>
   | BrokerReply<{ outcome: string; detail?: string }>
   | BrokerReply<{ opened: true }>
-  | BrokerReply<{ stats: Record<string, unknown> }>;
+  | BrokerReply<{ stats: Record<string, unknown> }>
+  | BrokerReply<{ state: BridgeSessionState }>
+  | DeliveryReply;
 
 function isObjectRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -4274,6 +4728,10 @@ function isInboxSender(sender: InboxRuntimeSender, urls: InboxRuntimeURLs): bool
   return sender.id === urls.runtimeID && sender.url === urls.inboxURL;
 }
 
+
+function isPopupSender(sender: InboxRuntimeSender, urls: InboxRuntimeURLs): boolean {
+  return sender.id === urls.runtimeID && sender.url === urls.popupURL;
+}
 function isInboxOrPopupSender(sender: InboxRuntimeSender, urls: InboxRuntimeURLs): boolean {
   return sender.id === urls.runtimeID && (sender.url === urls.inboxURL || sender.url === urls.popupURL);
 }
@@ -4361,6 +4819,24 @@ function isHandoffOpenRuntimeRequest(value: unknown): value is { job_id: string 
   );
 }
 
+function isSessionRetryRuntimeRequest(value: unknown): value is { job_id: string } {
+  return isHandoffOpenRuntimeRequest(value);
+}
+
+function isDeliveryStartRuntimeRequest(value: unknown): value is DeliveryStartPayload {
+  if (!isObjectRecord(value) || !hasOnlyKeys(value, ["tab_id", "url", "doi", "title"])) return false;
+  return (
+    typeof value["tab_id"] === "number" &&
+    Number.isSafeInteger(value["tab_id"]) &&
+    value["tab_id"] >= 0 &&
+    typeof value["url"] === "string" &&
+    value["url"].length > 0 &&
+    value["url"].length <= 4000 &&
+    (value["doi"] === undefined || typeof value["doi"] === "string") &&
+    (value["title"] === undefined || typeof value["title"] === "string")
+  );
+}
+
 function isPageCaptureRuntimeRequest(value: unknown): value is PageCapturePayload {
   if (
     !isObjectRecord(value) ||
@@ -4430,6 +4906,45 @@ export async function handleInboxRuntimeMessage(
     return isHandoffOpenRuntimeRequest(message["request"])
       ? bridge.openHandoff(message["request"].job_id)
       : runtimeFailure("invalid_request", "Invalid handoff open request");
+  }
+  if (type === "papio.delivery.start") {
+    if (!isInboxOrPopupSender(sender, urls)) {
+      return runtimeFailure("unauthorized", "This sender cannot start PDF delivery");
+    }
+    if (!hasOnlyKeys(message, ["type", "request"]) || !isDeliveryStartRuntimeRequest(message["request"])) {
+      return runtimeFailure("invalid_request", "Invalid PDF delivery request");
+    }
+    return bridge.startPDFDelivery(message["request"]);
+  }
+  if (type === "papio.delivery.state") {
+    if (!isInboxOrPopupSender(sender, urls)) {
+      return runtimeFailure("unauthorized", "This sender cannot read PDF delivery state");
+    }
+    if (!hasOnlyKeys(message, ["type"])) return runtimeFailure("invalid_request", "Invalid PDF delivery state request");
+    return bridge.deliveryState();
+  }
+  if (type === "papio.session.state") {
+    if (!isPopupSender(sender, urls)) return runtimeFailure("unauthorized", "This sender cannot access institution session state");
+    if (!hasOnlyKeys(message, ["type"])) return runtimeFailure("invalid_request", "Invalid institution session request");
+    return { ok: true, state: bridge.sessionState() };
+  }
+  if (type === "papio.session.signin") {
+    if (!isPopupSender(sender, urls)) return runtimeFailure("unauthorized", "This sender cannot control institution sign-in");
+    if (!hasOnlyKeys(message, ["type"])) return runtimeFailure("invalid_request", "Invalid institution sign-in request");
+    return bridge.requestSessionSignIn();
+  }
+  if (type === "papio.session.retry") {
+    if (!isPopupSender(sender, urls)) return runtimeFailure("unauthorized", "This sender cannot retry institution handoffs");
+    if (!hasOnlyKeys(message, ["type", "request"]) || !isSessionRetryRuntimeRequest(message["request"])) {
+      return runtimeFailure("invalid_request", "Invalid institution handoff retry request");
+    }
+    return bridge.retryAuthStalled(message["request"].job_id);
+  }
+  if (type === "papio.session.dismiss") {
+    if (!isPopupSender(sender, urls)) return runtimeFailure("unauthorized", "This sender cannot dismiss institution notices");
+    if (!hasOnlyKeys(message, ["type"])) return runtimeFailure("invalid_request", "Invalid institution notice request");
+    bridge.dismissSessionNotice();
+    return { ok: true };
   }
   if (
     type !== "papio.triage.snapshot" &&
@@ -4639,6 +5154,12 @@ if (typeof chrome !== "undefined" && chrome.runtime?.id) {
         message["type"] === "papio.action.resolve" ||
         message["type"] === "papio.preview" ||
         message["type"] === "papio.handoff.open" ||
+        message["type"] === "papio.delivery.start" ||
+        message["type"] === "papio.delivery.state" ||
+        message["type"] === "papio.session.state" ||
+        message["type"] === "papio.session.signin" ||
+        message["type"] === "papio.session.retry" ||
+        message["type"] === "papio.session.dismiss" ||
         message["type"] === "papio.stats")
     ) {
       void handleInboxRuntimeMessage(bridge, message, _sender, inboxRuntimeURLs).then((reply) => {
@@ -4673,15 +5194,19 @@ if (typeof chrome !== "undefined" && chrome.runtime?.id) {
     void bridge.onPermissionsChanged();
   });
   // KEEPALIVE INTEGRATION
-  void bridge.start().then(() =>
-    initKeepalive(chromeKeepaliveAPI(chrome), {
+  void bridge.start().then(() => {
+    const manager = initKeepalive(chromeKeepaliveAPI(chrome), {
       trackedJobCount: () => bridge.trackedJobCount(),
       latestOpenURL: () => bridge.latestOpenURL(),
+      queuedAuthJobs: () => bridge.queuedAuthJobs(),
+      stalledAuthJobs: () => bridge.stalledAuthJobIDs(),
+      lastAuthReturnedAt: () => bridge.lastAuthReturnedAt(),
       workWindowID: () => bridge.workWindowIDForKeepalive(),
       onTabPlaced: (tabID) => bridge.foldKeepaliveTab(tabID),
       onAuthenticationChanged: (authenticated) => {
         void bridge.setKeepaliveAuthenticated(authenticated);
       },
+      onReauthStateChanged: (paused) => bridge.setKeepaliveReauthNeeded(paused),
       surfaceReauthTab: async (tabID) => {
         try {
           const tab = await chrome.tabs.get(tabID);
@@ -4695,6 +5220,7 @@ if (typeof chrome !== "undefined" && chrome.runtime?.id) {
           // Badge and popup remain the recoverable reauth signal.
         }
       },
-    }),
-  );
+    });
+    bridge.attachKeepalive(manager);
+  });
 }

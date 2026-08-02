@@ -54,6 +54,7 @@ const (
 	reviewPreviewFeature         = "review_preview_v1"
 	statsFeature                 = "browser_stats_v1"
 	pageCaptureFeature           = "page_capture_v1"
+	activityFeedFeature          = "activity_feed_v1"
 	previewCapabilityTTL         = 10 * time.Minute
 )
 
@@ -145,7 +146,7 @@ const pendingExpireAfter = 5 * time.Minute
 // any job is ever offered depends on config (extension_id / openurl base).
 func NewBridge(jobs *job.Store, svc *app.Service, triageService *triage.Service, watchRunner *watch.Runner, previewServer *preview.Server, captureStore *captures.Store, cfg config.Config, version string) *Bridge {
 	required := []string{
-		pageAcquireFeature, triageSnapshotFeature, triageSnapshotSchema2Feature, triageMutationsFeature, reviewPreviewFeature, statsFeature, pageCaptureFeature,
+		pageAcquireFeature, triageSnapshotFeature, triageSnapshotSchema2Feature, triageMutationsFeature, reviewPreviewFeature, statsFeature, pageCaptureFeature, activityFeedFeature,
 	}
 	return &Bridge{
 		jobs: jobs, svc: svc, triage: triageService, watchRunner: watchRunner, preview: previewServer, captureStore: captureStore, cfg: cfg,
@@ -483,7 +484,7 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 	if b.holder == nil || b.holder.ID != sessionID {
 		switch msg.Type {
 		case protocol.MsgPageAcquire, protocol.MsgTriageSnapshotRequest, protocol.MsgTriageCountsRequest,
-			protocol.MsgTriageDecide, protocol.MsgHumanActionResolve, protocol.MsgReviewPreviewRequest, protocol.MsgStatsRequest, protocol.MsgPageCapture:
+			protocol.MsgTriageDecide, protocol.MsgHumanActionResolve, protocol.MsgReviewPreviewRequest, protocol.MsgStatsRequest, protocol.MsgActivityRequest, protocol.MsgPageCapture:
 			// Stateless request/response traffic works from any browser —
 			// even an outdated one; every frame is protocol-validated
 			// regardless of version. "Acquire this page" and the inbox must
@@ -521,6 +522,8 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 
 	case protocol.MsgStatsRequest:
 		return b.stats(ctx, msg.Payload.(*protocol.StatsRequestPayload))
+	case protocol.MsgActivityRequest:
+		return b.activity(ctx, msg.Payload.(*protocol.ActivityRequestPayload))
 
 	case protocol.MsgPageCapture:
 		b.pageCapture(ctx, msg.JobID, msg.Payload.(*protocol.PageCapturePayload))
@@ -550,12 +553,14 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 		return nil, b.recordAuth(ctx, msg)
 
 	case protocol.MsgDownloadStarted:
-		return nil, b.jobs.S.AppendEvent(ctx, msg.JobID, "browser.download_started", nil)
+		p := msg.Payload.(*protocol.DownloadStartedPayload)
+		return nil, b.jobs.S.AppendEvent(ctx, msg.JobID, "browser.download_started",
+			map[string]any{"download_id": p.DownloadID, "filename": p.Filename})
 
 	case protocol.MsgDownloadComplete:
 		p := msg.Payload.(*protocol.DownloadCompletePayload)
 		if err := b.jobs.S.AppendEvent(ctx, msg.JobID, "browser.download_complete",
-			map[string]any{"filename": p.Filename, "size_bytes": p.SizeBytes}); err != nil {
+			map[string]any{"download_id": p.DownloadID, "filename": p.Filename, "size_bytes": p.SizeBytes}); err != nil {
 			return nil, err
 		}
 		if err := b.adoptOutsideSessionLock(ctx, msg.JobID, p.Filename); err != nil {
@@ -919,6 +924,178 @@ func (b *Bridge) stats(ctx context.Context, request *protocol.StatsRequestPayloa
 
 func (b *Bridge) statsUnavailable(cause error) ([]json.RawMessage, error) {
 	return b.unavailable("stats_unavailable", "acquisition stats are temporarily unavailable", "acquisition stats", cause)
+}
+
+// activity returns a bounded, display-only read model. A store read failure
+// is routine from the browser's point of view, so it is logged and represented
+// as an empty page rather than tearing down the native-messaging session.
+func (b *Bridge) activity(ctx context.Context, request *protocol.ActivityRequestPayload) ([]json.RawMessage, error) {
+	limit := request.Limit
+	if limit < 1 {
+		limit = 20
+	}
+	if limit > 50 {
+		limit = 50
+	}
+	entries := make([]protocol.ActivityEntryPayload, 0, limit)
+	if b.jobs != nil && b.jobs.S != nil {
+		recent, err := b.jobs.S.RecentEvents(int(limit), 0)
+		if err != nil {
+			log.Printf("papio: activity feed unavailable: %v", err)
+		} else {
+			for _, event := range recent {
+				entry := protocol.ActivityEntryPayload{
+					Seq:  event.Seq,
+					At:   event.At.UTC().Format(time.RFC3339),
+					Kind: activityKind(event.Kind),
+					Text: kindText(event.Kind, event.Detail),
+				}
+				if event.JobID != "" {
+					entry.JobID = event.JobID
+				}
+				if event.JobTitle != "" {
+					entry.Title = activityTitle(event.JobTitle)
+				}
+				entries = append(entries, entry)
+				if len(entries) == 50 {
+					break
+				}
+			}
+		}
+	}
+	frame, err := b.frame(protocol.MsgActivityResponse, "", protocol.ActivityResponsePayload{
+		RequestID:   request.RequestID,
+		GeneratedAt: b.now().UTC().Format(time.RFC3339),
+		Entries:     entries,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return []json.RawMessage{frame}, nil
+}
+
+func activityKind(value string) string {
+	value = strings.ReplaceAll(value, "\x00", "")
+	runes := []rune(value)
+	if len(runes) == 0 {
+		return "unknown"
+	}
+	if len(runes) > 100 {
+		return string(runes[:100])
+	}
+	return value
+}
+
+func kindText(kind string, detail map[string]any) string {
+	filename := activityDetailString(detail, "filename")
+	switch kind {
+	case "browser.download_started":
+		if filename != "" {
+			return activityText(fmt.Sprintf("Download started (%s)", filename))
+		}
+		return "Download started"
+	case "browser.download_complete":
+		if filename != "" {
+			if size, ok := activityDetailInt64(detail, "size_bytes"); ok {
+				return activityText(fmt.Sprintf("Download complete (%s, %s)", filename, formatActivityBytes(size)))
+			}
+			return activityText(fmt.Sprintf("Download complete (%s)", filename))
+		}
+		return "Download complete"
+	case "browser.adoption_deferred":
+		if filename != "" {
+			return activityText(fmt.Sprintf("Download needs attention (%s)", filename))
+		}
+		return "Download needs attention"
+	case "browser.auth_pending":
+		return "Institution login required"
+	case "browser.auth_returned":
+		return "Institution login returned"
+	case "browser.handoff_offered":
+		return "Institution access handoff offered"
+	case "browser.handoff_failed":
+		if outcome := activityDetailString(detail, "outcome"); outcome != "" {
+			return activityText(fmt.Sprintf("Institution handoff failed (%s)", outcome))
+		}
+		return "Institution handoff failed"
+	case "browser.job_accept":
+		return "Job accepted"
+	case "browser.job_reject":
+		return "Job rejected"
+	case "browser.oa_handoff_fallback":
+		return "Fell back to open-access handoff"
+	default:
+		return activityText(kind)
+	}
+}
+
+func activityDetailString(detail map[string]any, key string) string {
+	if detail == nil {
+		return ""
+	}
+	value, ok := detail[key]
+	if !ok {
+		return ""
+	}
+	text, ok := value.(string)
+	return strings.TrimSpace(text)
+}
+
+func activityDetailInt64(detail map[string]any, key string) (int64, bool) {
+	if detail == nil {
+		return 0, false
+	}
+	value, ok := detail[key]
+	if !ok {
+		return 0, false
+	}
+	switch number := value.(type) {
+	case int:
+		return int64(number), true
+	case int64:
+		return number, true
+	case float64:
+		if number >= 0 && number <= float64(^uint64(0)>>1) && number == float64(int64(number)) {
+			return int64(number), true
+		}
+	}
+	return 0, false
+}
+
+func formatActivityBytes(size int64) string {
+	if size < 0 {
+		return ""
+	}
+	const unit = 1024
+	value := float64(size)
+	units := []string{"B", "KB", "MB", "GB", "TB"}
+	index := 0
+	for value >= unit && index < len(units)-1 {
+		value /= unit
+		index++
+	}
+	if index == 0 {
+		return fmt.Sprintf("%d B", size)
+	}
+	return fmt.Sprintf("%.1f %s", value, units[index])
+}
+
+func activityText(value string) string {
+	value = strings.ReplaceAll(value, "\x00", "")
+	runes := []rune(value)
+	if len(runes) <= 160 {
+		return value
+	}
+	return string(runes[:157]) + "..."
+}
+
+func activityTitle(value string) string {
+	value = strings.ReplaceAll(value, "\x00", "")
+	runes := []rune(value)
+	if len(runes) <= 500 {
+		return value
+	}
+	return string(runes[:500])
 }
 
 func (b *Bridge) triageDecide(ctx context.Context, request *protocol.TriageDecidePayload) ([]json.RawMessage, error) {
@@ -1597,10 +1774,10 @@ func (b *Bridge) adopt(ctx context.Context, jobID, filename string) error {
 	return b.svc.AdoptDownload(ctx, jobID, full)
 }
 
-// scanAdoptionDir looks for exactly one settled candidate file in a parked
-// job's adoption directory. Dotfiles (.DS_Store) are invisible; any
-// .crdownload/.download marks an in-progress Chrome write and .part a Firefox
-// one; either defers the whole scan. A zero-byte file is the browser's
+// scanAdoptionDir looks for exactly one settled candidate file in an
+// adoptable job's adoption directory. Dotfiles (.DS_Store) are invisible; any
+// .crdownload/.download marks an in-progress Chrome write and .part a
+// Firefox one; either defers the whole scan. A zero-byte file is the browser's
 // placeholder target (Firefox creates the final name empty while streaming
 // into name.part), never a settled download, so it defers the scan too. More
 // than one visible file is ambiguous and adopts nothing. The returned name
@@ -1634,13 +1811,16 @@ func (b *Bridge) scanAdoptionDir(_ context.Context, jobID string) (string, bool)
 	return name, name != ""
 }
 
-// SweepAdoptions adopts any settled file sitting in a parked handoff job's
-// adoption directory, independently of whether the extension is connected or
-// has said hello. This makes directory adoption self-driving: the daemon owns
-// completion, the browser plane is only a delivery hint. It scans the adoption
-// root directly rather than the newest-N job list, so a settled download is
-// never missed behind a large handoff backlog. It never emits frames or opens
-// offers. Safe to call on a timer.
+// SweepAdoptions adopts any settled file sitting in an adoptable job's
+// adoption directory, independently of whether the extension is connected,
+// has said hello, or has an open handoff action. A browser download can arrive
+// while a page-acquired job is still live; the adoption path parks that job at
+// awaiting_human and this job-scoped directory is the durable pickup signal.
+// This makes directory adoption self-driving: the daemon owns completion, the
+// browser plane is only a delivery hint. It scans the adoption root directly
+// rather than the newest-N job list, so a settled download is never missed
+// behind a large handoff backlog. It never emits frames or opens offers. Safe
+// to call on a timer.
 func (b *Bridge) SweepAdoptions(ctx context.Context) error {
 	root := b.cfg.EffectiveAdoptionRoot()
 	entries, err := os.ReadDir(root)
@@ -1650,26 +1830,18 @@ func (b *Bridge) SweepAdoptions(ctx context.Context) error {
 		}
 		return err
 	}
-	actions, err := b.jobs.ListHumanActions(ctx, true)
-	if err != nil {
-		return err
-	}
-	handoff := map[string]bool{}
-	for _, a := range actions {
-		if a.Kind == handoffActionKind {
-			handoff[a.JobID] = true
-		}
-	}
 	for _, e := range entries {
 		if !e.IsDir() || e.Name() == "rejected" {
 			continue
 		}
 		jobID := e.Name()
-		if !handoff[jobID] {
-			continue // no open handoff action: not an adoptable handoff job
-		}
 		row, err := b.jobs.Get(ctx, jobID)
-		if err != nil || row == nil || row.State != job.StateAwaitingHuman {
+		if err != nil || row == nil {
+			continue
+		}
+		switch row.State {
+		case job.StateQueued, job.StateResolving, job.StateFetching, job.StateAwaitingHuman:
+		default:
 			continue
 		}
 		name, ok := b.scanAdoptionDir(ctx, jobID)
@@ -1784,10 +1956,6 @@ func (b *Bridge) poll(ctx context.Context) ([]json.RawMessage, error) {
 	for i := range awaiting {
 		row := awaiting[i]
 		present[row.ID] = true
-		action, ok := handoff[row.ID]
-		if !ok {
-			continue
-		}
 		// Directory-scan adoption: a file the user (or a steered Chrome
 		// download) placed in the job's adoption directory is the strongest
 		// job-scoped gesture available. Exactly one settled regular file
@@ -1806,6 +1974,10 @@ func (b *Bridge) poll(ctx context.Context) ([]json.RawMessage, error) {
 			} else {
 				continue // adopted; the job has left awaiting_human
 			}
+		}
+		action, ok := handoff[row.ID]
+		if !ok {
+			continue
 		}
 		if b.offered[row.ID] {
 			continue

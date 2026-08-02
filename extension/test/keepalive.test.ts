@@ -121,12 +121,14 @@ function makeHarness(interval: unknown = 4, workWindowID?: () => number | undefi
   timers: FakeTimers;
   badge: string[];
   reauths: { count: number };
+  reauthState: boolean[];
 } {
   const jobs = { count: 1 };
   const tabs = new FakeTabs();
   const timers = new FakeTimers();
   const badge: string[] = [];
   const reauths = { count: 0 };
+  const reauthState: boolean[] = [];
   const api: KeepaliveAPI = {
     tabs,
     timers,
@@ -140,10 +142,13 @@ function makeHarness(interval: unknown = 4, workWindowID?: () => number | undefi
     onReauthNeeded: () => {
       reauths.count += 1;
     },
+    onReauthStateChanged: (paused) => {
+      reauthState.push(paused);
+    },
     observeMs: 10,
     reloadSettleMs: 1,
   });
-  return { manager, jobs, tabs, timers, badge, reauths };
+  return { manager, jobs, tabs, timers, badge, reauths, reauthState };
 }
 
 test("creates one pinned resolver tab, reloads it, and closes it when jobs finish", async () => {
@@ -176,7 +181,7 @@ test("pauses after an IdP redirect, notifies the user, and resumes on resolver r
   await h.timers.runNext(); // bounded final-URL inspection
 
   expect(h.tabs.reloaded).toEqual([1]);
-  expect(h.badge).toEqual(["!"]);
+  expect(h.reauthState).toEqual([true]);
   expect(h.reauths.count).toBe(1);
   expect(h.tabs.updates).toEqual([{ id: 1, properties: { active: true, pinned: false, muted: false } }]);
   expect(h.timers.latestDelay()).toBe(10);
@@ -185,7 +190,7 @@ test("pauses after an IdP redirect, notifies the user, and resumes on resolver r
   h.tabs.live.get(1)!.url = RESOLVER_OPENURL; // Simulate the user's completed login.
   await h.timers.runNext();
 
-  expect(h.badge).toEqual(["!", ""]);
+  expect(h.reauthState).toEqual([true, false]);
   expect(h.tabs.updates).toEqual([
     { id: 1, properties: { active: true, pinned: false, muted: false } },
     { id: 1, properties: { pinned: true, muted: true } },
@@ -227,4 +232,26 @@ test("creates the keepalive tab inside the work window, falling back when it is 
     { url: "https://resolver.example.edu", active: false, pinned: true, muted: true, windowId: 500 },
     { url: "https://resolver.example.edu", active: false, pinned: true, muted: true },
   ]);
+});
+
+test("snapshot exposes session state without leaking an IdP host", async () => {
+  const h = makeHarness();
+  await h.manager.init();
+  let snapshot = h.manager.getSnapshot();
+  expect(snapshot).toMatchObject({
+    enabled: true,
+    intervalMinutes: 4,
+    authenticated: false,
+    pausedForReauth: false,
+    resolverOrigin: "https://resolver.example.edu",
+    queuedAuthJobs: 0,
+    stalledAuthJobs: [],
+  });
+  h.tabs.nextURL = "https://idp.example.edu/sso/login";
+  await h.timers.runNext();
+  await h.timers.runNext();
+  snapshot = h.manager.getSnapshot();
+  expect(snapshot.pausedForReauth).toBe(true);
+  expect(snapshot.resolverOrigin).toBe("https://resolver.example.edu");
+  expect(snapshot.resolverOrigin).not.toContain("idp.example.edu");
 });

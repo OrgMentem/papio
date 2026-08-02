@@ -4,11 +4,14 @@
 import { expect, test } from "bun:test";
 
 import {
+  clearPendingDelivery,
   emptyStore,
   findByJob,
   findByTab,
   patchJob,
   removeJob,
+  startPendingDelivery,
+  updatePendingDelivery,
   upsertJob,
   type ActiveJob,
 } from "../src/state";
@@ -51,4 +54,19 @@ test("removeJob drops exactly one record", () => {
   let store = upsertJob(emptyStore(), job());
   store = removeJob(store, "job_00000001");
   expect(store.activeJobs.length).toBe(0);
+});
+
+
+test("pending delivery reducers replace, patch, and clear only the matching job", () => {
+  const delivery = { job_id: "job_00000001", url: "https://papers.example/paper.pdf", initiated_at: 7 };
+  let store = startPendingDelivery(emptyStore(), delivery);
+  expect(store.pendingDelivery).toMatchObject({ ...delivery, status: "sending" });
+  store = updatePendingDelivery(store, "other-job", { status: "downloaded" });
+  expect(store.pendingDelivery?.status).toBe("sending");
+  store = updatePendingDelivery(store, delivery.job_id, { status: "downloaded" });
+  expect(store.pendingDelivery?.status).toBe("downloaded");
+  store = clearPendingDelivery(store, "other-job");
+  expect(store.pendingDelivery).toBeDefined();
+  store = clearPendingDelivery(store, delivery.job_id);
+  expect(store.pendingDelivery).toBeUndefined();
 });

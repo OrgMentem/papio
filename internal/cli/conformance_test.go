@@ -104,6 +104,7 @@ var commandClassification = map[string]commandClass{
 	"papio watch remove":               {kind: kindStructured, rpcMethods: []string{"watch.remove"}},
 	"papio watch run":                  {kind: kindStructured, rpcMethods: []string{"watch.run"}},
 	"papio jobs":                       {kind: kindNone},
+	"papio activity":                   {kind: kindEnvelope, rowKey: "entries", rpcMethods: []string{"activity.list"}},
 	"papio jobs list":                  {kind: kindEnvelope, rowKey: "jobs", rpcMethods: []string{"jobs.list_v2", "jobs.list"}},
 	"papio jobs get":                   {kind: kindStructured, rpcMethods: []string{"jobs.get"}},
 	"papio jobs receipt":               {kind: kindStructured, rpcMethods: []string{"jobs.receipt"}},

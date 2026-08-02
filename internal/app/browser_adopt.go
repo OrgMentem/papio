@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -19,19 +20,67 @@ import (
 	"papio/internal/resolver"
 )
 
+// parkForBrowserAdoption moves a live job onto the existing human-adoption
+// boundary. queued has no direct edge to awaiting_human, so it first follows
+// the legal queued -> resolving edge; a scheduler race is retried from the
+// durable state it won. No human action is opened because the browser
+// download itself is the operator gesture and directory sweeps use the
+// job-scoped adoption directory as the durable pickup signal.
+func (s *Service) parkForBrowserAdoption(ctx context.Context, jobID string) error {
+	const detailReason = "browser_download_adoption"
+	for range 4 {
+		row, err := s.Jobs.Get(ctx, jobID)
+		if err != nil {
+			return err
+		}
+		switch row.State {
+		case job.StateAwaitingHuman:
+			return nil
+		case job.StateQueued:
+			err = s.Jobs.Transition(ctx, jobID, job.StateQueued, job.StateResolving,
+				map[string]any{"reason": detailReason})
+		case job.StateResolving, job.StateFetching:
+			err = s.Jobs.Transition(ctx, jobID, row.State, job.StateAwaitingHuman,
+				map[string]any{"reason": detailReason})
+			if err == nil {
+				return nil
+			}
+		default:
+			return fmt.Errorf("job %s is not adoptable while in state %s", jobID, row.State)
+		}
+		if err == nil {
+			continue
+		}
+		if !errors.Is(err, job.ErrConflict) {
+			return err
+		}
+	}
+	return fmt.Errorf("job %s changed while preparing browser adoption", jobID)
+}
+
 // AdoptDownload ingests a browser-supplied download for a job parked in
-// awaiting_human. The reported path must be a confined regular file under the
-// job's adoption directory (Chrome bytes never cross native messaging; only the
-// path does). The file is copied into quarantine and run through the exact same
-// payload/structure/identity validation pipeline that fetched candidates use, so
-// an adopted PDF is held to the same bar as an OA download before it can become
-// a content-addressed artifact.
+// awaiting_human, or for a live queued/resolving/fetching job that the
+// browser has steered into its adoption directory. Live jobs are parked at
+// awaiting_human through existing legal edges before the same validation path
+// runs; no new acquisition state is needed. The reported path must be a
+// confined regular file under the job's adoption directory (Chrome bytes
+// never cross native messaging; only the path does). The file is copied into
+// quarantine and run through the exact same payload/structure/identity
+// validation pipeline that fetched candidates use, so an adopted PDF is held
+// to the same bar as an OA download before it can become a content-addressed
+// artifact.
+//
+// The live-job park is deliberately action-free: the browser's download
+// completion is already the human gesture, and the bridge's directory sweep
+// scans every awaiting_human adoption directory. If validation races the
+// browser rename, the parked job and landing file remain eligible for the
+// next poll.
 //
 // The job is briefly leased for the duration so neither the scheduler nor
 // RecoverStale can claim or rewind it while it sits in validating. Outcomes:
 // ready on acceptance, needs_review when validation parks it, and back to
-// awaiting_human (with a fresh manual_download action) when the file is rejected
-// so the human can supply a different one.
+// awaiting_human (with a fresh manual_download action) when the file is
+// rejected so the human can supply a different one.
 func (s *Service) AdoptDownload(ctx context.Context, jobID, path string) error {
 	if s.Validate == nil {
 		return fmt.Errorf("acquisition service is missing its validation dependency")
@@ -39,6 +88,15 @@ func (s *Service) AdoptDownload(ctx context.Context, jobID, path string) error {
 	row, err := s.Jobs.Get(ctx, jobID)
 	if err != nil {
 		return err
+	}
+	if row.State != job.StateAwaitingHuman {
+		if err := s.parkForBrowserAdoption(ctx, jobID); err != nil {
+			return err
+		}
+		row, err = s.Jobs.Get(ctx, jobID)
+		if err != nil {
+			return err
+		}
 	}
 	if row.State != job.StateAwaitingHuman {
 		return fmt.Errorf("job %s is not awaiting a human handoff (state %s)", jobID, row.State)

@@ -16,7 +16,9 @@ import {
   type Provider,
   type Scenario,
 } from "./capture";
-import { chromeBackend, type ActiveJob, type StoreShape, TERMS_CONSENT_KEY } from "./state";
+import { chromeBackend, type ActiveJob, type PendingDelivery, type StoreShape, TERMS_CONSENT_KEY } from "./state";
+import { classifyPage, isPDFPage, pdfSourceURL, sniffDOI, type PageKind } from "./deliver";
+import type { KeepaliveSnapshot } from "./keepalive";
 import { renderPapio } from "./dom";
 import {
   EST_MINUTES_SAVED_PER_PAPER,
@@ -147,17 +149,20 @@ export function renderResolverGrants(
   });
   container.append(heading, lede, button);
 }
-
 interface PageAcquireResponse {
   job_id?: string;
   duplicate?: boolean;
-  error?: string;
+  error?: string | { code?: string; message?: string };
+  state?: "sending" | "downloaded" | "failed" | "adopted";
+  message?: string;
 }
 
 interface PageMetadata {
   url: string;
   doi?: string;
   title?: string;
+  kind?: PageKind;
+  tab_id?: number;
 }
 
 const NO_DOI_FOUND = "no DOI found on this page";
@@ -177,6 +182,12 @@ export function collectPageMetadata(): PageMetadata {
   const clean = (value: string | null | undefined): string => (value ?? "").trim();
   const meta = (name: string): string =>
     clean(document.querySelector(`meta[name="${name}"]`)?.getAttribute("content"));
+  const firstDOI = (value: string): string => {
+    let decoded = value;
+    try { decoded = decodeURIComponent(value); } catch { /* keep raw */ }
+    const match = decoded.match(/\b10\.\d{4,9}\/[^\s"'<>?#]+/);
+    return match === null ? "" : match[0].replace(/[.,;:!?\]}>'"]+$/g, "");
+  };
   let doi = meta("citation_doi") || meta("publication_doi");
   if (!doi) {
     for (const el of Array.from(
@@ -191,16 +202,25 @@ export function collectPageMetadata(): PageMetadata {
     }
   }
   if (!doi) {
-    const doiInPath = (value: string): string => {
-      let decoded = value;
-      try { decoded = decodeURIComponent(value); } catch { /* keep raw */ }
-      const match = decoded.match(/10\.\d{4,9}\/[^\s?#]+/);
-      return match ? match[0] : "";
-    };
     doi =
-      doiInPath(location.pathname) ||
-      doiInPath(clean(document.querySelector('link[rel="canonical"]')?.getAttribute("href"))) ||
-      doiInPath(clean(document.querySelector('meta[property="og:url"]')?.getAttribute("content")));
+      firstDOI(location.href) ||
+      firstDOI(location.pathname) ||
+      firstDOI(clean(document.querySelector('link[rel="canonical"]')?.getAttribute("href"))) ||
+      firstDOI(clean(document.querySelector('meta[property="og:url"]')?.getAttribute("content")));
+  }
+  if (!doi) {
+    for (const link of Array.from(document.querySelectorAll("a[href]")).slice(0, 1000)) {
+      const hrefDOI = firstDOI(link.getAttribute("href") ?? "");
+      const textDOI = firstDOI(link.textContent ?? "");
+      doi = hrefDOI || textDOI;
+      if (doi) break;
+    }
+  }
+  if (!doi) {
+    const body = document.body?.cloneNode(true) as HTMLElement | null;
+    body?.querySelectorAll("script, style, noscript").forEach((el) => el.remove());
+    const text = (body?.textContent ?? "").slice(0, 200_000);
+    doi = firstDOI(text);
   }
   const title = meta("citation_title") || document.title.trim();
   return {
@@ -214,19 +234,42 @@ export function collectPageMetadata(): PageMetadata {
 export async function readCurrentPageMetadata(): Promise<PageMetadata> {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (tab?.id === undefined) throw new Error("No active tab");
-  const [injected] = await chrome.scripting.executeScript({
-    target: { tabId: tab.id },
-    func: collectPageMetadata,
-  });
-  const metadata = injected?.result;
-  if (
-    typeof metadata !== "object" ||
-    metadata === null ||
-    typeof (metadata as PageMetadata).url !== "string"
-  ) {
-    throw new Error("Could not read the current page");
+  const tabURL = typeof tab.url === "string" ? tab.url : "";
+  const contentType =
+    typeof (tab as unknown as Record<string, unknown>)["contentType"] === "string"
+      ? (tab as unknown as Record<string, unknown>)["contentType"] as string
+      : undefined;
+  const tabPDF = isPDFPage(tabURL, contentType);
+  let metadata: PageMetadata | undefined;
+  try {
+    const [injected] = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: collectPageMetadata,
+    });
+    const result = injected?.result;
+    if (typeof result === "object" && result !== null && typeof (result as PageMetadata).url === "string") {
+      metadata = result as PageMetadata;
+    }
+  } catch {
+    // PDF viewers and privileged pages reject scripting; their tab URL is
+    // enough to classify the page and start a browser-managed download.
   }
-  return metadata as PageMetadata;
+  const url = tabURL || metadata?.url;
+  if (url === undefined || url.length === 0) throw new Error("Could not read the current page");
+  const inferredDOI = metadata?.doi ?? sniffDOI(url);
+  const kind = tabPDF
+    ? "pdf"
+    : classifyPage(url, {
+        ...(inferredDOI ? { doi: inferredDOI } : {}),
+        ...(contentType ? { contentType } : {}),
+      }).kind;
+  return {
+    url,
+    ...(inferredDOI ? { doi: inferredDOI } : {}),
+    ...(metadata?.title || tab.title ? { title: metadata?.title || tab.title! } : {}),
+    kind,
+    tab_id: tab.id,
+  };
 }
 
 export const OPEN_INBOX_MESSAGE = "papio.openInbox";
@@ -269,6 +312,158 @@ export async function openHandoff(jobID: string): Promise<void> {
   }
   throw new Error("Could not focus the institutional sign-in");
 }
+export type PopupSessionState = KeepaliveSnapshot & {
+  releasedAuthJobs: number;
+};
+
+export const SESSION_STATE_MESSAGE = "papio.session.state";
+export const SESSION_SIGNIN_MESSAGE = "papio.session.signin";
+export const SESSION_RETRY_MESSAGE = "papio.session.retry";
+export const SESSION_DISMISS_MESSAGE = "papio.session.dismiss";
+
+function isSessionState(value: unknown): value is PopupSessionState {
+  if (typeof value !== "object" || value === null) return false;
+  const state = value as Record<string, unknown>;
+  const resolverOrigin = state["resolverOrigin"];
+  return (
+    typeof state["enabled"] === "boolean" &&
+    typeof state["intervalMinutes"] === "number" &&
+    typeof state["authenticated"] === "boolean" &&
+    typeof state["pausedForReauth"] === "boolean" &&
+    (state["lastCheckAt"] === null || typeof state["lastCheckAt"] === "number") &&
+    (resolverOrigin === null ||
+      (typeof resolverOrigin === "string" && /^https:\/\/[^/]+$/.test(resolverOrigin))) &&
+    (state["lastAuthReturnedAt"] === null || typeof state["lastAuthReturnedAt"] === "number") &&
+    typeof state["queuedAuthJobs"] === "number" &&
+    Array.isArray(state["stalledAuthJobs"]) &&
+    state["stalledAuthJobs"].every((jobID) => typeof jobID === "string") &&
+    typeof state["releasedAuthJobs"] === "number"
+  );
+}
+
+export async function requestSessionState(): Promise<PopupSessionState | undefined> {
+  try {
+    const response: unknown = await chrome.runtime.sendMessage({ type: SESSION_STATE_MESSAGE });
+    if (typeof response !== "object" || response === null) return undefined;
+    const state = (response as Record<string, unknown>)["state"];
+    return isSessionState(state) ? state : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export async function openInstitutionSignIn(): Promise<void> {
+  const response: unknown = await chrome.runtime.sendMessage({ type: SESSION_SIGNIN_MESSAGE });
+  if (
+    typeof response !== "object" ||
+    response === null ||
+    (response as Record<string, unknown>)["ok"] !== true ||
+    (response as Record<string, unknown>)["opened"] !== true
+  ) {
+    throw new Error("Could not open the institution sign-in");
+  }
+}
+
+export async function retryAuthStalled(jobID: string): Promise<void> {
+  const response: unknown = await chrome.runtime.sendMessage({
+    type: SESSION_RETRY_MESSAGE,
+    request: { job_id: jobID },
+  });
+  if (
+    typeof response !== "object" ||
+    response === null ||
+    (response as Record<string, unknown>)["ok"] !== true
+  ) {
+    throw new Error("Could not retry this handoff");
+  }
+}
+
+function dismissSessionNotice(): Promise<void> {
+  return chrome.runtime.sendMessage({ type: SESSION_DISMISS_MESSAGE }).then(() => undefined);
+}
+
+function formatLastCheck(lastCheckAt: number | null): string {
+  if (lastCheckAt === null || !Number.isFinite(lastCheckAt)) return "just now";
+  const elapsed = Math.max(0, Date.now() - lastCheckAt);
+  const minutes = Math.floor(elapsed / 60_000);
+  if (minutes < 1) return "just now";
+  return `${minutes} min ago`;
+}
+let sessionNoticeDismissed = false;
+
+
+export function renderInstitutionSession(
+  doc: Document,
+  state: PopupSessionState | undefined,
+  onSignIn: () => Promise<void> = openInstitutionSignIn,
+  onDismiss: () => Promise<void> = dismissSessionNotice,
+): void {
+  const card = doc.getElementById("institution-session");
+  const status = doc.getElementById("institution-session-status");
+  const origin = doc.getElementById("institution-session-origin");
+  const signIn = doc.getElementById("institution-session-signin");
+  const notice = doc.getElementById("institution-session-unblocked");
+  const dismiss = doc.getElementById("institution-session-dismiss");
+  if (
+    !(card instanceof HTMLElement) ||
+    !(status instanceof HTMLElement) ||
+    !(origin instanceof HTMLElement) ||
+    !(signIn instanceof HTMLButtonElement) ||
+    !(notice instanceof HTMLElement) ||
+    !(dismiss instanceof HTMLButtonElement)
+  ) {
+    return;
+  }
+  card.hidden = state === undefined;
+  if (state === undefined) return;
+  status.textContent = !state.enabled
+    ? "Keep-warm off"
+    : state.pausedForReauth
+      ? "Sign-in needed - papio paused"
+      : state.authenticated
+        ? `Session warm · last verified ${formatLastCheck(state.lastCheckAt)}`
+        : "Signed out or expired";
+  origin.textContent = state.resolverOrigin
+    ? `Applies to ${state.resolverOrigin}`
+    : "No institution resolver is active";
+  signIn.disabled = state.resolverOrigin === null;
+  if (!signIn.dataset.wired) {
+    signIn.dataset.wired = "1";
+    signIn.addEventListener("click", () => {
+      signIn.disabled = true;
+      signIn.textContent = "Opening…";
+      void onSignIn().then(
+        () => {
+          signIn.disabled = false;
+          signIn.textContent = "Sign in now";
+        },
+        () => {
+          signIn.disabled = false;
+          signIn.textContent = "Try again";
+        },
+      );
+    });
+  }
+  const released = Math.max(0, Math.trunc(state.releasedAuthJobs));
+  if (released === 0) {
+    sessionNoticeDismissed = false;
+    notice.hidden = true;
+  } else if (!sessionNoticeDismissed) {
+    notice.hidden = false;
+    notice.firstChild?.remove();
+    const message = doc.createElement("span");
+    message.textContent = `Sign-in unblocked ${released} item${released === 1 ? "" : "s"}`;
+    notice.prepend(message);
+  }
+  if (!dismiss.dataset.wired) {
+    dismiss.dataset.wired = "1";
+    dismiss.addEventListener("click", () => {
+      sessionNoticeDismissed = true;
+      notice.hidden = true;
+      void onDismiss();
+    });
+  }
+}
 
 function handoffPaperLabel(job: ActiveJob): string {
   const title = job.expected?.title?.trim();
@@ -285,6 +480,8 @@ export function renderNeedsAttention(
   blockedProviderHosts: readonly string[] = [],
   onFocus: (jobID: string) => Promise<void> = openHandoff,
   onOpenOptions: () => Promise<void> = openOptions,
+  authStalledJobs: readonly string[] = [],
+  onRetry: (jobID: string) => Promise<void> = retryAuthStalled,
 ): void {
   const section = doc.getElementById("needs-you-section");
   const heading = doc.getElementById("needs-you-heading");
@@ -302,13 +499,19 @@ export function renderNeedsAttention(
   const blocked = [
     ...new Set(blockedProviderHosts.map((host) => host.trim().toLowerCase()).filter((host) => host.length > 0)),
   ];
-  section.hidden = pending.length === 0 && blocked.length === 0;
+  const stalled = [
+    ...new Set(authStalledJobs.filter((jobID) => typeof jobID === "string" && jobID.length > 0)),
+  ];
+  section.hidden = pending.length === 0 && blocked.length === 0 && stalled.length === 0;
   list.replaceChildren();
   if (section.hidden) return;
 
   if (pending.length > 0 && blocked.length > 0) {
     heading.textContent = "Needs your attention";
     message.textContent = "Finish your institutional sign-in and allow browser access for the listed provider pages.";
+  } else if (stalled.length > 0 && pending.length === 0 && blocked.length === 0) {
+    heading.textContent = "Sign in, then retry";
+    message.textContent = "Sign-in didn't stick - sign in, then retry these papers.";
   } else if (pending.length > 0) {
     heading.textContent = "Sign in to continue";
     message.textContent = "Finish your institutional sign-in to continue these papers.";
@@ -341,6 +544,39 @@ export function renderNeedsAttention(
       );
     });
     row.append(paper, button);
+    list.append(row);
+  }
+
+  for (const jobID of stalled) {
+    const row = doc.createElement("div");
+    row.className = "needs-you-item";
+    const copy = doc.createElement("div");
+    copy.className = "needs-you-copy";
+    const paper = doc.createElement("p");
+    paper.className = "needs-you-paper";
+    const knownJob = jobs.find((job) => job.job_id === jobID);
+    paper.textContent = knownJob === undefined ? jobID : handoffPaperLabel(knownJob);
+    const reason = doc.createElement("p");
+    reason.textContent = "Sign-in didn't stick - sign in, then retry";
+    copy.append(paper, reason);
+    const button = doc.createElement("button");
+    button.type = "button";
+    button.textContent = "Retry now";
+    button.addEventListener("click", () => {
+      button.disabled = true;
+      button.textContent = "Retrying…";
+      void onRetry(jobID).then(
+        () => {
+          button.disabled = false;
+          button.textContent = "Retry now";
+        },
+        () => {
+          button.disabled = false;
+          button.textContent = "Try again";
+        },
+      );
+    });
+    row.append(copy, button);
     list.append(row);
   }
 
@@ -452,12 +688,33 @@ export function wireHistoryLauncher(doc: Document = document): void {
   });
 }
 
-function pageAcquireStatus(response: PageAcquireResponse): string {
+function responseErrorMessage(response: PageAcquireResponse): string {
   if (typeof response.error === "string" && response.error.length > 0) return response.error;
+  if (typeof response.error === "object" && response.error !== null && typeof response.error.message === "string") {
+    return response.error.message;
+  }
+  return "";
+}
+
+function pageAcquireStatus(response: PageAcquireResponse): string {
+  const error = responseErrorMessage(response);
+  if (error) return error;
+  if (typeof response.message === "string" && response.message.length > 0) return response.message;
   if (typeof response.job_id === "string" && response.job_id.length > 0) {
     return response.duplicate === true ? `Already queued: ${response.job_id}` : `Queued: ${response.job_id}`;
   }
   return "The daemon did not acknowledge this page.";
+}
+
+function deliveryStatusText(delivery: PendingDelivery | undefined): string {
+  if (delivery?.status === "failed") return delivery.error || "Could not deliver this PDF";
+  if (delivery?.status === "downloaded") return "papio adopted v (validating)";
+  if (delivery?.status === "sending") return "Sending PDF to papio…";
+  return "";
+}
+
+function shortJobID(jobID: string): string {
+  return jobID.length > 12 ? jobID.slice(0, 12) : jobID;
 }
 
 export async function acquireCurrentPage(): Promise<PageAcquireResponse> {
@@ -481,11 +738,67 @@ export async function acquireCurrentPage(): Promise<PageAcquireResponse> {
   return result as PageAcquireResponse;
 }
 
+/** Ask the broker to deliver the current PDF without opening another tab. */
+export async function sendCurrentPDF(): Promise<PageAcquireResponse> {
+  const page = await readCurrentPageMetadata();
+  if (page.kind !== "pdf" && !isPDFPage(page.url)) {
+    return { error: "No PDF detected on this page" };
+  }
+  const result: unknown = await chrome.runtime.sendMessage({
+
+    type: "papio.delivery.start",
+    request: {
+      tab_id: page.tab_id,
+      url: pdfSourceURL(page.url),
+      ...(page.doi ? { doi: page.doi } : {}),
+      ...(page.title ? { title: page.title } : {}),
+    },
+  });
+  if (typeof result !== "object" || result === null) {
+    throw new Error("Could not start PDF delivery");
+  }
+  return result as PageAcquireResponse;
+}
+
+type DeliveryFeedback = PendingDelivery & {
+  status: "sending" | "downloaded" | "failed";
+};
+
+async function readDeliveryFeedback(fallback: PendingDelivery | undefined): Promise<PendingDelivery | undefined> {
+  try {
+    const reply: unknown = await chrome.runtime.sendMessage({ type: "papio.delivery.state" });
+    if (
+      typeof reply === "object" &&
+      reply !== null &&
+      typeof (reply as Record<string, unknown>)["job_id"] === "string" &&
+      ((reply as Record<string, unknown>)["state"] === "sending" ||
+        (reply as Record<string, unknown>)["state"] === "downloaded" ||
+        (reply as Record<string, unknown>)["state"] === "failed")
+    ) {
+      const state = (reply as Record<string, unknown>)["state"] as DeliveryFeedback["status"];
+      const jobID = (reply as Record<string, unknown>)["job_id"] as string;
+      const message = (reply as Record<string, unknown>)["message"];
+      return {
+        job_id: jobID,
+        url: fallback?.url ?? "",
+        initiated_at: fallback?.initiated_at ?? 0,
+        status: state,
+        ...(typeof message === "string" ? { error: message } : {}),
+      };
+    }
+  } catch {
+    // The storage snapshot remains the fallback when the worker is asleep or
+    // an older worker does not know the delivery query.
+  }
+  return fallback;
+}
+
 /** Render a page-aware acquisition launcher. It remains available while the
  * daemon is down so its established error path stays actionable. */
 export function renderPageAcquire(
   doc: Document,
   onAcquire: () => Promise<PageAcquireResponse> = acquireCurrentPage,
+  onSendPDF: () => Promise<PageAcquireResponse> = sendCurrentPDF,
 ): void {
   const button = doc.getElementById("page-acquire-btn");
   const status = doc.getElementById("page-acquire-status");
@@ -494,13 +807,33 @@ export function renderPageAcquire(
   button.dataset.wired = "1";
   let noDOIFound = false;
   let queued = false;
+  let deliveryPending = false;
   button.addEventListener("click", () => {
+    const isPDF = button.dataset.mode === "pdf";
     button.disabled = true;
-    button.textContent = "Acquiring…";
-    status.textContent = "Acquiring…";
-    void onAcquire().then(
+    button.textContent = isPDF ? "Sending…" : "Acquiring…";
+    status.textContent = isPDF ? "Sending PDF to papio…" : "Acquiring…";
+    void (isPDF ? onSendPDF() : onAcquire()).then(
       (response) => {
-        noDOIFound = response.error === NO_DOI_FOUND;
+        if (isPDF) {
+          const state = response.state;
+          deliveryPending = state === "sending" || state === "downloaded";
+          button.textContent = deliveryPending
+            ? response.duplicate === true
+              ? "Send PDF for the existing job"
+              : "Sent to papio"
+            : "Send PDF to papio";
+          status.textContent =
+            state === "sending"
+              ? response.duplicate === true
+                ? "Sending PDF for the existing job"
+                : "Sending PDF to papio…"
+              : state === "downloaded"
+                ? "papio adopted v (validating)"
+                : responseErrorMessage(response) || response.message || "PDF delivery did not start.";
+          return;
+        }
+        noDOIFound = responseErrorMessage(response) === NO_DOI_FOUND;
         queued = typeof response.job_id === "string" && response.job_id.length > 0;
         button.textContent = queued
           ? response.duplicate === true
@@ -511,33 +844,63 @@ export function renderPageAcquire(
       },
       (error: unknown) => {
         queued = false;
-        button.textContent = "Acquire this page";
-        status.textContent = error instanceof Error ? error.message : "Could not acquire this page";
+        deliveryPending = false;
+        button.textContent = isPDF ? "Send PDF to papio" : "Acquire this page";
+        status.textContent = error instanceof Error ? error.message : isPDF ? "Could not send PDF to papio" : "Could not acquire this page";
       },
     ).finally(() => {
-      button.disabled = noDOIFound || queued;
+      button.disabled = isPDF ? deliveryPending : noDOIFound || queued;
     });
   });
 }
 
-export function renderPageContext(doc: Document, page: PageMetadata | undefined, jobs: ActiveJob[]): void {
+export function renderPageContext(
+  doc: Document,
+  page: PageMetadata | undefined,
+  jobs: ActiveJob[],
+  pendingDelivery?: PendingDelivery,
+): void {
   const section = doc.getElementById("page-acquire");
   const detected = doc.getElementById("page-acquire-doi");
   const state = doc.getElementById("page-acquire-context");
+  const status = doc.getElementById("page-acquire-status");
   const button = doc.getElementById("page-acquire-btn");
   if (
     !(section instanceof HTMLElement) ||
     !detected ||
     !state ||
+    !status ||
     !(button instanceof HTMLButtonElement)
   ) {
     return;
   }
   section.hidden = false;
+  const kind = page?.kind ?? (page ? classifyPage(page.url, page.doi ? { doi: page.doi } : {}).kind : "none");
+  if (kind === "pdf") {
+    const knownJob =
+      (page?.tab_id === undefined ? undefined : jobs.find((job) => job.tab_id === page.tab_id)) ??
+      (page?.doi === undefined
+        ? undefined
+        : jobs.find((job) => job.expected?.doi?.trim().toLowerCase().replace(/^doi:\s*/, "") === page.doi?.trim().toLowerCase().replace(/^doi:\s*/, "")));
+    const delivery = pendingDelivery?.status === "failed" || pendingDelivery?.job_id === knownJob?.job_id
+      ? pendingDelivery
+      : undefined;
+    detected.textContent = "";
+    detected.hidden = true;
+    state.textContent = "";
+    status.textContent = deliveryStatusText(delivery);
+    button.dataset.mode = "pdf";
+    button.hidden = false;
+    button.textContent = `Send PDF to papio${knownJob ? ` (job ${shortJobID(knownJob.job_id)})` : ""}`;
+    button.disabled = delivery?.status === "sending" || delivery?.status === "downloaded";
+    return;
+  }
   if (!page?.doi) {
-    detected.textContent = "No DOI detected on this page";
+    detected.textContent = "No paper detected on this page";
     detected.hidden = false;
     state.textContent = "";
+    status.textContent = "";
+    button.dataset.mode = "doi";
     button.textContent = "Acquire this page";
     button.disabled = true;
     button.hidden = true;
@@ -545,6 +908,8 @@ export function renderPageContext(doc: Document, page: PageMetadata | undefined,
   }
   detected.textContent = "";
   detected.hidden = true;
+  status.textContent = "";
+  button.dataset.mode = "doi";
   button.hidden = false;
   const normalizedDOI = page.doi.trim().toLowerCase().replace(/^doi:\s*/, "");
   const inFlight = jobs.some(
@@ -575,12 +940,23 @@ export async function refresh(): Promise<void> {
   const store = await chromeBackend(chrome.storage).load();
   renderDaemonStatus(document, store);
   renderPageAcquire(document);
+  const delivery = await readDeliveryFeedback(store.pendingDelivery);
   try {
-    renderPageContext(document, await readCurrentPageMetadata(), store.activeJobs);
+    renderPageContext(document, await readCurrentPageMetadata(), store.activeJobs, delivery);
   } catch {
-    renderPageContext(document, undefined, store.activeJobs);
+    renderPageContext(document, undefined, store.activeJobs, delivery);
   }
-  renderNeedsAttention(document, store.activeJobs, store.blockedProviderHosts);
+  const session = await requestSessionState();
+  renderInstitutionSession(document, session);
+  renderNeedsAttention(
+    document,
+    store.activeJobs,
+    store.blockedProviderHosts,
+    openHandoff,
+    openOptions,
+    session?.stalledAuthJobs ?? [],
+    retryAuthStalled,
+  );
   let consent: "accept" | "manual" | undefined;
   try {
     const got = await chrome.storage.local.get(TERMS_CONSENT_KEY);

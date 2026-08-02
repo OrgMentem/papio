@@ -25,6 +25,7 @@ import (
 	"papio/internal/job"
 	"papio/internal/ownership"
 	"papio/internal/protocol"
+	"papio/internal/store"
 	"papio/internal/update"
 	"papio/internal/watch"
 	"papio/internal/zotio"
@@ -137,6 +138,12 @@ type ActionsPage struct {
 	Truncated bool              `json:"truncated"`
 }
 
+// ActivityPage is the bounded activity.list read model.
+type ActivityPage struct {
+	Entries   []store.ActivityEntry `json:"entries"`
+	Truncated bool                  `json:"truncated"`
+}
+
 // RepairResult reports what jobs.repair_awaiting_human did. Outcome is a closed
 // vocabulary — repaired, not_parked, has_open_actions, conflict — so a consumer
 // never has to parse an error message to tell "nothing to repair" from "I could
@@ -244,6 +251,9 @@ func RouterWithShutdown(system *bootstrap.System, shutdown context.CancelFunc) i
 		},
 		"triage.decide": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return triageDecide(ctx, raw, system)
+		},
+		"activity.list": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return listActivity(ctx, raw, system)
 		},
 		"jobs.list": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return listJobs(ctx, raw, system)
@@ -791,6 +801,28 @@ func listJobs(ctx context.Context, raw json.RawMessage, system *bootstrap.System
 		return failure(err)
 	}
 	return marshal(rows)
+}
+
+// listActivity serves the durable activity feed. It is a new method rather than
+// widening an existing jobs result, keeping IPC readers fail-closed across
+// daemon/CLI versions.
+func listActivity(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
+	var params struct {
+		Limit     int    `json:"limit,omitempty"`
+		BeforeSeq int64  `json:"before_seq,omitempty"`
+		JobID     string `json:"job_id,omitempty"`
+	}
+	if err := ipc.DecodeParams(raw, &params); err != nil {
+		return badParams(err)
+	}
+	if system == nil || system.Store == nil {
+		return nil, &ipc.RPCError{Code: "precondition_failed", Message: "store is not configured"}
+	}
+	entries, truncated, err := system.Store.RecentEventsPage(params.Limit, params.BeforeSeq, strings.TrimSpace(params.JobID))
+	if err != nil {
+		return failure(err)
+	}
+	return marshal(ActivityPage{Entries: entries, Truncated: truncated})
 }
 
 // listJobsV2 is jobs.list with the one thing a cohort-scale consumer cannot

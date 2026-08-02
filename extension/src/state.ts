@@ -10,6 +10,18 @@
 
 export type JobStatus = "offered" | "queued" | "accepted" | "auth_pending" | "awaiting_download";
 
+/** Browser-managed delivery of an active PDF tab. The URL is intentionally
+ * retained only in this narrow record so a suspended worker can finish the
+ * exact download; it must never be copied into another persisted field. */
+export type PendingDeliveryStatus = "sending" | "downloaded" | "failed";
+export interface PendingDelivery {
+  job_id: string;
+  url: string;
+  initiated_at: number;
+  status?: PendingDeliveryStatus;
+  error?: string;
+}
+
 /** Durable, informed user choice for auto-accepting publisher terms &
  * conditions. `undefined` = never asked; `"accept"` = consented to papio
  * agreeing to publisher T&C on their behalf; `"manual"` = will accept manually. */
@@ -87,6 +99,9 @@ export interface ProviderDrainLease {
 
 export interface StoreShape {
   activeJobs: ActiveJob[];
+  /** The one operator-initiated PDF delivery currently awaiting daemon
+   * adoption. The URL is retained only here and is cleared after ack. */
+  pendingDelivery?: PendingDelivery;
   /** Resolver-provided offer URL by active job. This is needed to recreate a
    * broker handoff after a service-worker restart. */
   offerURLs?: Record<string, string>;
@@ -175,6 +190,29 @@ export function patchJob(
     ...store,
     activeJobs: store.activeJobs.map((j) => (j.job_id === jobID ? { ...j, ...patch } : j)),
   };
+}
+
+export function startPendingDelivery(store: StoreShape, delivery: PendingDelivery): StoreShape {
+  return { ...store, pendingDelivery: { ...delivery, status: delivery.status ?? "sending" } };
+}
+
+/** Patch only the currently tracked delivery; a late download event from an
+ * older job must not overwrite a newer operator action. */
+export function updatePendingDelivery(
+  store: StoreShape,
+  jobID: string,
+  patch: Partial<Omit<PendingDelivery, "job_id">>,
+): StoreShape {
+  const current = store.pendingDelivery;
+  if (current === undefined || current.job_id !== jobID) return store;
+  return { ...store, pendingDelivery: { ...current, ...patch } };
+}
+
+export function clearPendingDelivery(store: StoreShape, jobID?: string): StoreShape {
+  if (store.pendingDelivery === undefined || (jobID !== undefined && store.pendingDelivery.job_id !== jobID)) return store;
+  const next = { ...store };
+  delete next.pendingDelivery;
+  return next;
 }
 
 const STORAGE_KEY = "papio_state_v1";
