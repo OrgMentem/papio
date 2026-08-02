@@ -17,6 +17,7 @@ package sourcegate
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 
 	"papio/internal/config"
@@ -44,13 +45,20 @@ type Client struct {
 }
 
 // New wraps inner so each request reserves one call against source's budget.
-// A nil reserver returns inner unchanged, so a caller with no budget manager
-// keeps working rather than silently losing its transport.
-func New(reserve Reserver, source string, policy config.Source, costEach float64, inner HTTPClient) HTTPClient {
+//
+// A nil reserver is a programming error, not a supported mode. Returning inner
+// unwrapped would leave a provider client that works perfectly and is invisible
+// to accounting — the exact defect this package was written to end — so letting
+// a wiring mistake reproduce it silently would be self-defeating. Tests that
+// genuinely want no reservation pass a no-op Reserver and say so.
+func New(reserve Reserver, source string, policy config.Source, costEach float64, inner HTTPClient) (HTTPClient, error) {
 	if reserve == nil {
-		return inner
+		return nil, fmt.Errorf("sourcegate: %s has no reserver; every provider client must be accounted for", source)
 	}
-	return &Client{inner: inner, reserve: reserve, source: source, policy: policy, costEach: costEach}
+	if inner == nil {
+		return nil, fmt.Errorf("sourcegate: %s has no inner client", source)
+	}
+	return &Client{inner: inner, reserve: reserve, source: source, policy: policy, costEach: costEach}, nil
 }
 
 // Do reserves, then forwards. A refused reservation is returned unwrapped so

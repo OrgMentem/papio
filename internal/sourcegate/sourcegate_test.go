@@ -38,7 +38,10 @@ func TestEveryRequestReservesOnce(t *testing.T) {
 	defer server.Close()
 
 	reserve := &recorder{}
-	client := New(reserve, "openalex", config.Source{Enabled: true}, 0, server.Client())
+	client, err := New(reserve, "openalex", config.Source{Enabled: true}, 0, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
 	for range 3 {
 		resp, err := client.Do(request(t, server.URL))
 		if err != nil {
@@ -66,7 +69,10 @@ func TestARefusedReservationNeverReachesTheProvider(t *testing.T) {
 	defer server.Close()
 
 	refusal := errors.New("source openalex is deferred until tomorrow")
-	client := New(&recorder{err: refusal}, "openalex", config.Source{Enabled: true}, 0, server.Client())
+	client, cerr := New(&recorder{err: refusal}, "openalex", config.Source{Enabled: true}, 0, server.Client())
+	if cerr != nil {
+		t.Fatal(cerr)
+	}
 	_, err := client.Do(request(t, server.URL))
 	if !errors.Is(err, refusal) {
 		t.Fatalf("err = %v, want the reservation error unwrapped so callers can classify a rate limit", err)
@@ -76,12 +82,18 @@ func TestARefusedReservationNeverReachesTheProvider(t *testing.T) {
 	}
 }
 
-// A caller with no budget manager keeps its transport rather than silently
-// losing it, which would turn a missing dependency into a nil-pointer panic on
-// the first request.
-func TestNoReserverReturnsTheInnerClientUnchanged(t *testing.T) {
-	inner := http.DefaultClient
-	if got := New(nil, "openalex", config.Source{}, 0, inner); got != HTTPClient(inner) {
-		t.Fatalf("New with a nil reserver = %#v, want the inner client unchanged", got)
+// A missing reserver must be a construction error, not a silent bypass. This
+// test previously asserted the opposite -- that New returned the inner client
+// unwrapped -- which pinned the exact defect the package exists to prevent: a
+// provider client that works perfectly and is invisible to accounting.
+func TestAMissingReserverIsAConstructionError(t *testing.T) {
+	if _, err := New(nil, "openalex", config.Source{}, 0, http.DefaultClient); err == nil {
+		t.Fatal("New with no reserver succeeded; an unaccounted provider client must not be constructible")
+	}
+	if _, err := New(&recorder{}, "openalex", config.Source{}, 0, nil); err == nil {
+		t.Fatal("New with no inner client succeeded")
+	}
+	if _, err := New(&recorder{}, "openalex", config.Source{Enabled: true}, 0, http.DefaultClient); err != nil {
+		t.Fatalf("New with both dependencies = %v, want success", err)
 	}
 }

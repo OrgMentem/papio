@@ -179,7 +179,10 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 
 	entries := resolverEntries(cfg, metadataClient)
 	service := app.New(cfg, jobs, artifacts, budgets)
-	discoveryBackends := discoverySources(cfg, budgets, metadataClient)
+	discoveryBackends, err := discoverySources(cfg, budgets, metadataClient)
+	if err != nil {
+		return nil, err
+	}
 	discoveryClient := discovery.NewMulti(discoveryBackends...)
 	for _, backend := range discoveryBackends {
 		if lookup, ok := backend.(app.WorkLookup); ok {
@@ -393,14 +396,17 @@ func discoveryPolicy(cfg config.Config, name string) config.Source {
 // accounted for, paced and paused exactly like the acquisition resolvers that
 // hit the same providers. Left ungated it drew on the same provider quota
 // invisibly and ignored a durable gate that had already paused acquisition.
-func discoverySources(cfg config.Config, budgets *budget.Manager, client sourcegate.HTTPClient) []discovery.Source {
+func discoverySources(cfg config.Config, budgets *budget.Manager, client sourcegate.HTTPClient) ([]discovery.Source, error) {
 	names := cfg.Discovery.Sources
 	if len(names) == 0 {
 		names = []string{config.SourceOpenAlex}
 	}
 	sources := make([]discovery.Source, 0, len(names))
 	for _, name := range names {
-		gated := sourcegate.New(budgets, name, discoveryPolicy(cfg, name), 0, client)
+		gated, err := sourcegate.New(budgets, name, discoveryPolicy(cfg, name), 0, client)
+		if err != nil {
+			return nil, err
+		}
 		switch name {
 		case config.SourceOpenAlex:
 			sources = append(sources, discovery.NewWithOptions(discovery.Options{
@@ -417,5 +423,5 @@ func discoverySources(cfg config.Config, budgets *budget.Manager, client sourceg
 			}))
 		}
 	}
-	return sources
+	return sources, nil
 }

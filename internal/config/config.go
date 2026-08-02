@@ -570,6 +570,22 @@ func (c *Config) validate() error {
 		if s.BaseURLForDev != "" && !strings.HasPrefix(s.BaseURLForDev, "http://127.0.0.1") && !strings.HasPrefix(s.BaseURLForDev, "http://localhost") {
 			return fmt.Errorf("sources.%s.base_url_for_dev must be loopback", name)
 		}
+		// A negative value does not throttle harder, it removes the throttle:
+		// takeToken treats rate <= 0 as unlimited and reserve treats a limit
+		// <= 0 as unmetered. So a typed minus sign silently deletes the exact
+		// protection it appears to configure, and the operator has no way to
+		// tell from the outside. Zero keeps its documented meaning — no
+		// pacing, no ceiling — because that is a deliberate choice someone can
+		// state; a negative number never is.
+		if s.RatePerSec < 0 {
+			return fmt.Errorf("sources.%s.rate_per_sec must not be negative (0 disables pacing)", name)
+		}
+		if s.Burst < 0 {
+			return fmt.Errorf("sources.%s.burst must not be negative", name)
+		}
+		if s.MaxCostUSD < 0 {
+			return fmt.Errorf("sources.%s.max_cost_usd must not be negative (0 means unmetered)", name)
+		}
 	}
 	if c.Notify.WebhookURL != "" {
 		u, err := url.Parse(c.Notify.WebhookURL)

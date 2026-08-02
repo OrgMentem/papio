@@ -71,6 +71,29 @@ Inspect required human actions
 papio actions
 ```
 
+### `papio actions dismiss`
+
+Close a stale human action without touching its job
+
+Close a stale human action without touching its job.
+
+An advisory on a terminal job has no other way out: cancel refuses a
+terminal job, resolve is identity-review only, and the startup sweep
+deliberately leaves informational advisories alone so a real trace
+survives. Without this, retiring one meant editing the database or
+retrying the job purely to cancel it again.
+
+--revision guards against dismissing an action that changed after you
+listed it; take it from `papio actions list --json`.
+
+```
+papio actions dismiss <action-id> [flags]
+```
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--revision` | `int64` | `0` | revision the action had when you listed it |
+
 ### `papio actions list`
 
 List open human actions
