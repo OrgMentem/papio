@@ -374,6 +374,37 @@ func newActionsCommand(opt *options) *cobra.Command {
 	}
 	resolve.Flags().BoolVar(&accept, "accept", false, "accept the identity review")
 
+	var revision int64
+	dismiss := &cobra.Command{
+		Use:   "dismiss <action-id>",
+		Short: "Close a stale human action without touching its job",
+		Long: "Close a stale human action without touching its job.\n\n" +
+			"An advisory on a terminal job has no other way out: cancel refuses a\n" +
+			"terminal job, resolve is identity-review only, and the startup sweep\n" +
+			"deliberately leaves informational advisories alone so a real trace\n" +
+			"survives. Without this, retiring one meant editing the database or\n" +
+			"retrying the job purely to cancel it again.\n\n" +
+			"--revision guards against dismissing an action that changed after you\n" +
+			"listed it; take it from `papio actions list --json`.",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			actionID, err := strconv.ParseInt(args[0], 10, 64)
+			if err != nil || actionID <= 0 {
+				return errors.New("action-id must be a positive integer")
+			}
+			if revision <= 0 {
+				return errors.New("--revision is required; take it from `papio actions list --json`")
+			}
+			var result map[string]any
+			if err := opt.call(cmd.Context(), "actions.dismiss",
+				map[string]any{"action_id": actionID, "expected_revision": revision}, &result); err != nil {
+				return err
+			}
+			return opt.printResult(result, "dismissed action %d on %s", actionID, result["job_id"])
+		},
+	}
+	dismiss.Flags().Int64Var(&revision, "revision", 0, "revision the action had when you listed it")
+
 	var limit int
 	var dryRun bool
 	open := &cobra.Command{
@@ -439,7 +470,7 @@ func newActionsCommand(opt *options) *cobra.Command {
 	open.Flags().BoolVar(&dryRun, "dry-run", false, "print URLs without opening them")
 
 	resolve.Flags().BoolVar(&reject, "reject", false, "reject the identity review")
-	command.AddCommand(list, resolve, open)
+	command.AddCommand(list, resolve, dismiss, open)
 	return command
 }
 

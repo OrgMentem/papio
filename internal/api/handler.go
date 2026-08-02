@@ -284,6 +284,9 @@ func RouterWithShutdown(system *bootstrap.System, shutdown context.CancelFunc) i
 		"actions.resolve": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return resolveAction(ctx, raw, system)
 		},
+		"actions.dismiss": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return dismissAction(ctx, raw, system)
+		},
 		"artifacts.get": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return getArtifact(ctx, raw, system)
 		},
@@ -1017,6 +1020,34 @@ func retryJob(ctx context.Context, raw json.RawMessage, system *bootstrap.System
 
 func resolveAction(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
 	return resolveActionCAS(ctx, raw, system)
+}
+
+// dismissAction closes a stale human action without disturbing its job. A new
+// method rather than a widened actions.resolve, which is identity-review only:
+// an older CLI rejects an unknown field but tolerates an unknown method.
+//
+// It exists because an advisory on a TERMINAL job previously had no supported
+// way out. Cancel refuses a terminal job, resolve handles only identity review,
+// and CloseStaleHumanActions deliberately spares informational advisories so a
+// real conservative trace survives. Two operators hit that in one day: one
+// edited the database directly, the other retried a settled job purely to
+// cancel it again.
+func dismissAction(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
+	var params struct {
+		ActionID         int64 `json:"action_id"`
+		ExpectedRevision int64 `json:"expected_revision"`
+	}
+	if err := ipc.DecodeParams(raw, &params); err != nil {
+		return badParams(err)
+	}
+	if params.ActionID <= 0 || params.ExpectedRevision <= 0 {
+		return badParams(errors.New("action_id and expected_revision are required and must be positive"))
+	}
+	jobID, err := system.Jobs.DismissHumanAction(ctx, params.ActionID, params.ExpectedRevision)
+	if err != nil {
+		return failure(err)
+	}
+	return marshal(map[string]any{"job_id": jobID, "action_id": params.ActionID})
 }
 
 func listActions(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
