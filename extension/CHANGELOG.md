@@ -16,6 +16,8 @@ for the full pre-split extension history.
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-08-02
+
 ### Fixed
 
 - **A file-shaped link is no longer treated as permission to download without
