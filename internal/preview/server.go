@@ -696,6 +696,25 @@ const previewStyle = `
   color: var(--color-ink);
   font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 }
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --color-ink: #e5edf4;
+    --color-brand-ink: #f0edf3;
+    --color-brand-accent: #ef6a57;
+    --color-muted: #a2b1be;
+    --color-border: #3e4f61;
+    --color-control-border: #526579;
+    --color-page: #141b23;
+    --color-surface: #1c2631;
+    --color-surface-hover: #263340;
+    --color-primary: #a8d0ff;
+    --color-primary-border: #4f85bc;
+    --color-primary-surface: #183956;
+    --color-primary-hover: #214967;
+    --color-on-primary: #101a24;
+  }
+}
 * { box-sizing: border-box; }
 html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; background: var(--color-page); }
 .review-bar {
@@ -741,6 +760,7 @@ html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; background:
   font-size: .75rem;
   line-height: 1.25;
 }
+#status:empty { display: none; }
 .actions { display: flex; flex: none; gap: .5rem; }
 button {
   appearance: none;
