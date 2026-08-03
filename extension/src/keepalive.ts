@@ -29,7 +29,13 @@ export interface KeepaliveTabs {
   }): Promise<KeepaliveTab>;
   reload(tabID: number): Promise<unknown>;
   get(tabID: number): Promise<KeepaliveTab>;
-  query(query: { pinned?: boolean; muted?: boolean; url?: string[] }): Promise<KeepaliveTab[]>;
+  query(query: {
+    pinned?: boolean;
+    muted?: boolean;
+    url?: string[];
+    active?: boolean;
+    lastFocusedWindow?: boolean;
+  }): Promise<KeepaliveTab[]>;
   remove(tabID: number): Promise<void>;
   update(
     tabID: number,
@@ -528,7 +534,11 @@ export class KeepaliveManager {
   /** Probe the current resolver immediately. A slow browser API is bounded so
    * a foreground popup request never waits beyond the MV3 response budget. */
   async checkNow(budgetMs = ON_DEMAND_PROBE_BUDGET_MS): Promise<void> {
-    if (this.probePromise === undefined && !this.isSessionStale()) return;
+    // A completed probe that produced NO evidence (no tab inspected) must not
+    // latch: the operator may have just focused the library page, and serving
+    // the empty verdict for SESSION_STALE_MS reads as papio being blind.
+    const latchedEmpty = this.verdict === "unknown" && this.probeSource === "none";
+    if (this.probePromise === undefined && !this.isSessionStale() && !latchedEmpty) return;
     const probe = this.probePromise ?? this.startProbe();
     const boundedBudget = Math.min(1_500, Math.max(0, Math.trunc(budgetMs)));
     let timeout: ReturnType<typeof setTimeout> | undefined;
@@ -567,9 +577,18 @@ export class KeepaliveManager {
     }
     this.resolver = resolver;
 
+    // The focused tab is checked directly: when the operator is looking at
+    // the library page itself, the verdict must not depend on a URL-pattern
+    // query that can miss (12:43pm field report: active resolver tab, probe
+    // returned "no probe evidence").
     let liveTabs: KeepaliveTab[] = [];
     try {
-      liveTabs = await this.api.tabs.query({ url: [`${resolver.origin}/*`] });
+      liveTabs = await this.api.tabs.query({ active: true, lastFocusedWindow: true });
+    } catch {
+      // Fall through to the URL-pattern query.
+    }
+    try {
+      liveTabs = [...liveTabs, ...(await this.api.tabs.query({ url: [`${resolver.origin}/*`] }))];
     } catch {
       // The permission may have been revoked while the popup was open. The
       // manager-owned probe below remains useful when it is still available.

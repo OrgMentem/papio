@@ -68,6 +68,7 @@ class FakeTabs {
   readonly removed: number[] = [];
   readonly updates: { id: number; properties: { active?: boolean; pinned?: boolean; muted?: boolean } }[] = [];
   readonly resolverTabs: KeepaliveTab[] = [];
+  focusedTab: KeepaliveTab | undefined;
   queryCount = 0;
   readonly live = new Map<number, KeepaliveTab>();
   nextURL: string | undefined;
@@ -99,8 +100,11 @@ class FakeTabs {
     pinned?: boolean;
     muted?: boolean;
     url?: string[];
+    active?: boolean;
+    lastFocusedWindow?: boolean;
   }): Promise<KeepaliveTab[]> {
     this.queryCount += 1;
+    if (query.active === true) return this.focusedTab === undefined ? [] : [this.focusedTab];
     return query.url === undefined ? [] : [...this.resolverTabs];
   }
 
@@ -433,6 +437,45 @@ test("no resolver tab or probe evidence remains unknown instead of signed out", 
     probeSource: "none",
   });
   expect(h.manager.getSnapshot().lastVerdictAt).toEqual(expect.any(Number));
+});
+
+test("the focused resolver tab is inspected even when the URL-pattern query misses", async () => {
+  const h = makeHarness();
+  await h.manager.init();
+  h.resolverMarkers.splice(0, h.resolverMarkers.length, { text: "Sign out", label: "" });
+  const focused = { id: 77, url: "https://resolver.example.edu/account?fromLogin=true" };
+  h.tabs.live.set(focused.id, focused);
+  h.tabs.focusedTab = focused;
+  // Field report 12:43pm: pattern query returned nothing while the operator
+  // was looking at the signed-in library page in the active tab.
+
+  await h.manager.checkNow(100);
+
+  expect(h.manager.getSnapshot()).toMatchObject({
+    authenticated: true,
+    verdict: "in",
+    probeSource: "live_tab",
+  });
+});
+
+test("an evidence-free probe does not latch: the next popup open re-probes", async () => {
+  const h = makeHarness();
+  await h.manager.init();
+  h.jobs.count = 0;
+  await h.manager.sync();
+  await h.manager.checkNow(100);
+  expect(h.manager.getSnapshot()).toMatchObject({ verdict: "unknown", probeSource: "none" });
+
+  // The operator focuses the library page and reopens the popup well within
+  // SESSION_STALE_MS. The empty verdict must not be served from the latch.
+  h.resolverMarkers.splice(0, h.resolverMarkers.length, { text: "Sign out", label: "" });
+  const focused = { id: 78, url: "https://resolver.example.edu/account" };
+  h.tabs.live.set(focused.id, focused);
+  h.tabs.focusedTab = focused;
+
+  await h.manager.checkNow(100);
+
+  expect(h.manager.getSnapshot()).toMatchObject({ verdict: "in", probeSource: "live_tab" });
 });
 
 function syntheticJWT(payload: Record<string, unknown>): string {
