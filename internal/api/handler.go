@@ -781,7 +781,14 @@ func adapterCapture(ctx context.Context, raw json.RawMessage, system *bootstrap.
 	if system == nil || system.Browser == nil || system.Captures == nil || !system.Config.Captures.Enabled {
 		return marshal(AdapterCaptureResult{Outcome: "not_permitted", Detail: "page capture storage is disabled"})
 	}
-	waitCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
+	// The wait budget must scale with the requested settle: heavy provider
+	// pages (JSTOR) can take ~30s to reach "complete" before the settle even
+	// starts, and the result still rides a later sync frame.
+	wait := 60 * time.Second
+	if params.SettleMS != nil && *params.SettleMS > 0 {
+		wait += time.Duration(*params.SettleMS) * time.Millisecond
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, wait)
 	defer cancel()
 	result := system.Browser.Capture(waitCtx, browser.CaptureRequest{
 		URL: params.URL, Provider: params.Provider, Scenario: params.Scenario, SettleMS: params.SettleMS,
