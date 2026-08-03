@@ -154,6 +154,20 @@ Inspect provider and adapter interactions
 papio adapter
 ```
 
+### `papio adapter capture`
+
+Capture a provider page through the connected browser
+
+```
+papio adapter capture <url> [flags]
+```
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--provider` | `string` |  | provider adapter id |
+| `--scenario` | `string` |  | fixture scenario |
+| `--settle-ms` | `int64` | `0` | milliseconds to settle after page load (0-10000) |
+
 ### `papio adapter captures`
 
 List stored diagnostic page captures

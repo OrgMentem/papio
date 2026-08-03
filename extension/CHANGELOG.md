@@ -18,6 +18,26 @@ for the full pre-split extension history.
 
 ### Added
 
+- **Adapters for two more entitled routes.** Informit (`informit` 0.1.0):
+  the SAML terms wall classifies as `terms` with an explicit consent control
+  and the Atypon article page downloads via its captured PDF control. JSTOR
+  (`jstor` 0.3.0): article *record* pages wire the primary Download control to
+  a popup (`window.open` with `acceptTC=1`) that Chrome blocks for
+  gesture-less adapter clicks, so the download now derives the direct
+  `stable/pdf/<id>.pdf?acceptTC=1` endpoint from the tab URL — consent-gated,
+  because `acceptTC` accepts JSTOR's terms on your behalf.
+- **The daemon can request a page capture.** Under the
+  `page_capture_request_v1` feature, a solicited `page_capture_request`
+  directive (riding the ordinary sync cycle) opens a governed, ledger-tracked
+  tab, waits for load plus a bounded settle, runs the existing sanitized
+  capture pipeline, reports a structured outcome, and closes the tab. The
+  page is never interacted with.
+- **Acquire is a labelled header button.** "Acquire" / "Send PDF" render as a
+  primary text pill beside the inbox button (an icon proved too subtle); the
+  full DOI detail stays on hover. Inbox tab labels now carry the daemon's
+  totals instead of the loaded page size, operation feedback renders only on
+  the affected row (with a screen-reader announcer), and pagination controls
+  are panel-scoped.
 - **One session row per institution.** The popup's institution card renders a
   row for every config-derived resolver origin advertised in the daemon hello —
   never for a provider offer or a host-permission grant. Each row has its own

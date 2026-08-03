@@ -19,6 +19,19 @@ execution records in `notes/acquisition-stack-plan.md`.
   revision-and-SHA-bound review transition used by the browser inbox. PDF
   bytes remain capability-bound at the `/file` sibling, and each preview
   capability permits only one decisive verdict.
+  The review bar carries papio branding, follows the system light/dark
+  scheme, and a recorded verdict closes its tab automatically (with a
+  graceful "you can close this tab" fallback when the browser blocks it).
+- **`papio adapter capture <url>` captures a provider page through the live
+  browser session.** The new `adapter.capture_v1` RPC queues one solicited
+  capture directive per browser session; the extension opens a governed tab,
+  captures the sanitized DOM through the existing pipeline, and the CLI
+  returns the structured outcome and stored path. Fixture collection for
+  adapter work is now fully agent-drivable — no screenshots, no human clicks.
+- **`papio failures` aggregates terminal and parked failure reasons** by
+  reason (default) or provider (`--by-provider`) from each job's most recent
+  decisive events, via the new `failures.list_v1` RPC with the usual `--json`
+  envelope.
 - **`papio activity` exposes the daemon's recent operator activity.** The new
   `activity.list` RPC and CLI command show a bounded, newest-first view of the
   durable events table, with `--limit`, optional `--job` filtering, and the
