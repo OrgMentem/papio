@@ -3,7 +3,6 @@
 package cli
 
 import (
-	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -46,7 +45,7 @@ func newActivityCommand(opt *options) *cobra.Command {
 					shortID = shortActivityJobID(entry.JobID)
 				}
 				if _, err := fmt.Fprintf(opt.out, "%s  %s  %s  %s\n",
-					formatActivityAt(entry.At), shortID, entry.Kind, compactActivitySummary(entry)); err != nil {
+					formatActivityAt(entry.At), shortID, store.ActivityText(entry.Kind, entry.Detail), compactActivitySummary(entry)); err != nil {
 					return err
 				}
 			}
@@ -80,18 +79,12 @@ func formatActivityAt(at time.Time) string {
 	return at.Local().Format("15:04:05")
 }
 
+// compactActivitySummary names the job on the human line: title when known,
+// else current state. Raw detail stays on the --json branch — the friendly
+// text column already folds the interesting detail fields in.
 func compactActivitySummary(entry store.ActivityEntry) string {
-	parts := make([]string, 0, 2)
 	if title := strings.Join(strings.Fields(entry.JobTitle), " "); title != "" {
-		parts = append(parts, title)
-	}
-	if len(entry.Detail) != 0 {
-		if detail, err := json.Marshal(entry.Detail); err == nil && string(detail) != "{}" {
-			parts = append(parts, string(detail))
-		}
-	}
-	if len(parts) != 0 {
-		return strings.Join(parts, " ")
+		return title
 	}
 	if state := strings.TrimSpace(entry.JobState); state != "" {
 		return state
