@@ -864,27 +864,39 @@ function accessHint(item: TriageSnapshotItem): HTMLElement | null {
   return hint;
 }
 
-function guidanceHint(item: TriageSnapshotItem): HTMLElement | null {
+function guidanceText(item: TriageSnapshotItem): string | null {
   if (item.kind !== "human_action") return null;
-  let text: string | null = null;
   switch (item.action_kind) {
     case "manual_download":
-      text = "Sign in if needed and download the PDF — papio adopts anything saved to Downloads/papio/<job>. Tip: the papio toolbar button can send an open PDF directly.";
-      break;
+      return "Sign in if needed and download the PDF — papio adopts anything saved to Downloads/papio/<job>. Tip: the papio toolbar button can send an open PDF directly.";
     case "openurl_handoff":
-      text = item.requires_auth === true
+      return item.requires_auth === true
         ? "Opens your library resolver — sign in once and papio drives the rest."
         : "papio will drive this page automatically once opened.";
-      break;
     case "verify_identity":
-      text = "View the PDF, then accept or reject — accept files it into your library.";
-      break;
+      return "View the PDF, then accept or reject — accept files it into your library.";
     default:
       return null;
   }
-  const hint = element("p", text);
-  hint.className = "item-guidance";
-  return hint;
+}
+
+/** Keep daemon detail and extension guidance in one muted instruction row.
+ * The daemon's detail is the visible source of truth; the longer Downloads/
+ * papio hint stays available as a title rather than another repeated line. */
+function renderInstruction(item: TriageSnapshotItem): HTMLElement | null {
+  const detail = factText(item, "Detail");
+  const guidance = guidanceText(item);
+  if (detail === null && guidance === null) return null;
+  const instruction = element("p");
+  if (detail !== null) {
+    instruction.className = "item-instruction item-detail";
+    appendFactText(instruction, detail);
+    if (guidance !== null) instruction.title = guidance;
+  } else {
+    instruction.className = "item-instruction item-guidance";
+    instruction.textContent = guidance;
+  }
+  return instruction;
 }
 
 function liveStatusChip(item: TriageSnapshotItem): HTMLElement | null {
@@ -977,8 +989,8 @@ function renderItem(item: TriageSnapshotItem): HTMLElement {
   if (citation !== null) body.append(citation);
   const hint = accessHint(item);
   if (hint !== null) body.append(hint);
-  const guidance = guidanceHint(item);
-  if (guidance !== null) body.append(guidance);
+  const instruction = renderInstruction(item);
+  if (instruction !== null) body.append(instruction);
   const liveStatus = liveStatusChip(item);
   if (liveStatus !== null) body.append(liveStatus);
 
@@ -998,13 +1010,8 @@ function renderItem(item: TriageSnapshotItem): HTMLElement {
     body.append(facts);
   }
 
-  const detail = factText(item, "Detail");
-  if (detail !== null) {
-    const paragraph = element("p");
-    paragraph.className = "item-detail";
-    appendFactText(paragraph, detail);
-    paragraph.append(debug.toggle);
-    body.append(paragraph);
+  if (instruction !== null) {
+    instruction.append(debug.toggle);
   } else if (citation !== null) {
     // Non-action items have no instruction line; keep the disclosure at the
     // end of their metadata rather than creating a standalone controls row.
@@ -1037,11 +1044,11 @@ function renderItem(item: TriageSnapshotItem): HTMLElement {
   return card;
 }
 
-function renderGroup(kind: TriageSnapshotItem["kind"], heading: string, items: TriageSnapshotItem[]): HTMLElement | null {
+function renderGroup(kind: TriageSnapshotItem["kind"], heading: string | null, items: TriageSnapshotItem[]): HTMLElement | null {
   if (items.length === 0) return null;
   const section = element("section");
   section.className = `triage-group triage-group-${kind}`;
-  section.append(element("h2", `${heading} (${items.length})`));
+  if (heading !== null) section.append(element("h2", `${heading} (${items.length})`));
   for (const item of items) section.append(renderItem(item));
   return section;
 }
@@ -1113,11 +1120,11 @@ function render(): void {
   elements.list.replaceChildren();
   const actionGroups = [
     renderGroup("retraction", "Retractions", actionItems.filter((item) => item.kind === "retraction")),
-    renderGroup("human_action", "Human actions", actionItems.filter((item) => item.kind === "human_action")),
+    renderGroup("human_action", null, actionItems.filter((item) => item.kind === "human_action")),
   ];
   for (const group of actionGroups) if (group !== null) elements.list.append(group);
   elements.watchList.replaceChildren();
-  const watchGroup = renderGroup("watch_hit", "Watch hits", watchItems);
+  const watchGroup = renderGroup("watch_hit", null, watchItems);
   if (watchGroup !== null) elements.watchList.append(watchGroup);
 
   if (state.snapshot === null) {

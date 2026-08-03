@@ -27,6 +27,11 @@ export interface KeepaliveTabs {
 
 export interface KeepaliveStorage {
   get(keys: string[]): Promise<Record<string, unknown>>;
+  set?(values: Record<string, unknown>): Promise<void>;
+}
+
+export interface KeepalivePermissions {
+  getAll(): Promise<{ origins?: string[] }>;
 }
 
 export interface KeepaliveAction {
@@ -41,6 +46,7 @@ export interface KeepaliveTimers {
 export interface KeepaliveAPI {
   tabs: KeepaliveTabs;
   storage: KeepaliveStorage;
+  permissions?: KeepalivePermissions;
   timers: KeepaliveTimers;
   /** Retained for API compatibility with injected callers. Badge painting is
    * owned by the bridge, so the manager never writes it directly. */
@@ -51,6 +57,11 @@ export interface KeepaliveSnapshot {
   enabled: boolean;
   intervalMinutes: number;
   authenticated: boolean;
+  /** True while an on-demand session probe is still in flight. */
+  checking?: boolean;
+  /** A resolver-origin tab was observed while the probe was in flight. This
+   * is evidence only; `authenticated` remains the completed probe verdict. */
+  likelyAuthenticated?: boolean;
   pausedForReauth: boolean;
   lastCheckAt: number | null;
   /** The configured resolver origin, never an authentication/IdP URL. */
@@ -59,6 +70,7 @@ export interface KeepaliveSnapshot {
   queuedAuthJobs: number;
   stalledAuthJobs: string[];
 }
+
 
 export interface KeepaliveOptions {
   /** Number of currently non-terminal handoff jobs. */
@@ -116,6 +128,61 @@ export function clampKeepaliveInterval(value: unknown): number {
   if (typeof value !== "number" || !Number.isFinite(value)) return DEFAULT_INTERVAL_MINUTES;
   return Math.min(MAX_INTERVAL_MINUTES, Math.max(MIN_INTERVAL_MINUTES, Math.trunc(value)));
 }
+/** Durable browser-local resolver origin. This is an origin only, never an
+ * OpenURL path, query, fragment, or identity-provider URL. */
+export const KEEPALIVE_RESOLVER_ORIGIN_KEY = "keepalive.resolverOrigin";
+/** Session probes are needed after two minutes without a completed check. */
+export const SESSION_STALE_MS = 2 * 60_000;
+const ON_DEMAND_PROBE_BUDGET_MS = 1_400;
+
+function normalizeHttpsOrigin(raw: unknown, allowWildcardHost = false): string | undefined {
+  if (typeof raw !== "string" || raw.length === 0) return undefined;
+  try {
+    const url = new URL(raw);
+    if (url.protocol !== "https:" || url.username !== "" || url.password !== "") return undefined;
+    if (url.hostname === "*" || (url.hostname.includes("*") && !allowWildcardHost)) return undefined;
+    if (url.pathname !== "/" || url.search !== "" || url.hash !== "") return undefined;
+    return url.origin;
+  } catch {
+    return undefined;
+  }
+}
+function resolverURLMatches(raw: string, resolver: URL): boolean {
+  try {
+    const candidate = new URL(raw);
+    if (candidate.protocol !== resolver.protocol || candidate.port !== resolver.port) return false;
+    if (resolver.hostname.startsWith("*.")) {
+      const suffix = resolver.hostname.slice(2);
+      return candidate.hostname === suffix || candidate.hostname.endsWith(`.${suffix}`);
+    }
+    return candidate.origin === resolver.origin;
+  } catch {
+    return false;
+  }
+}
+
+
+/** Extract one exact or host-wildcard HTTPS origin from a Chrome permission
+ * pattern. Broad HTTPS all-host access is intentionally not a resolver. */
+export function resolverOriginFromPermissionPattern(raw: unknown): string | undefined {
+  if (typeof raw !== "string" || !/^https:\/\//i.test(raw)) return undefined;
+  const withoutScheme = raw.slice("https://".length);
+  const host = withoutScheme.split(/[/?#]/, 1)[0];
+  if (host === undefined || host === "" || host === "*" || !/^[*a-z0-9.-]+(?::\d+)?$/i.test(host)) {
+    return undefined;
+  }
+  return normalizeHttpsOrigin(`https://${host}`, true);
+}
+
+/** Normalize granted resolver permission patterns, preserving declaration
+ * order while removing duplicates and broad all-host grants. */
+export function resolverOriginsFromPermissionPatterns(
+  patterns: readonly string[] | undefined,
+): string[] {
+  if (!Array.isArray(patterns)) return [];
+  return [...new Set(patterns.map(resolverOriginFromPermissionPattern).filter((origin): origin is string => origin !== undefined))];
+}
+
 
 /**
  * Maintains at most one resolver-origin tab while active handoffs exist.
@@ -128,21 +195,30 @@ export class KeepaliveManager {
   private timer: unknown | undefined;
   private tabID: number | undefined;
   private resolver: URL | undefined;
+  private persistedResolverOrigin: string | undefined;
+  private grantedResolverOrigin: string | undefined;
   private intervalMinutes = DEFAULT_INTERVAL_MINUTES;
   private enabled = true;
   private reauthPaused = false;
   private authenticated = false;
   private lastCheckAt: number | undefined;
-  
+  private checking = false;
+  private likelyAuthenticated = false;
+  private probePromise: Promise<void> | undefined;
+
   /** Browser-local session state for privileged extension surfaces. */
   getSnapshot(): KeepaliveSnapshot {
     const resolverOrigin =
-      this.resolver?.protocol === "https:" ? this.resolver.origin : undefined;
+      this.resolver?.protocol === "https:"
+        ? this.resolver.origin
+        : this.persistedResolverOrigin ?? this.grantedResolverOrigin;
     const lastAuthReturnedAt = this.options.lastAuthReturnedAt?.();
     return {
       enabled: this.enabled,
       intervalMinutes: this.intervalMinutes,
       authenticated: this.authenticated,
+      checking: this.checking,
+      likelyAuthenticated: this.likelyAuthenticated,
       pausedForReauth: this.reauthPaused,
       lastCheckAt: this.lastCheckAt ?? null,
       resolverOrigin: resolverOrigin ?? null,
@@ -184,6 +260,90 @@ export class KeepaliveManager {
     await this.loadPreferences();
     await this.reconcile();
   }
+  /** Record a resolver as soon as a handoff arrives, even if the periodic
+   * keepalive observation has not run in this worker lifetime. */
+  learnResolver(openURL: string): void {
+    if (isAuthenticationURL(openURL)) return;
+    try {
+      const resolver = new URL(openURL);
+      if (resolver.protocol !== "https:") return;
+      this.resolver = resolver;
+      this.rememberResolverOrigin(resolver);
+    } catch {
+      // Invalid offers are rejected by the normal handoff parser.
+    }
+  }
+  /** True when no probe has completed or the completed result is older than
+   * the popup freshness budget. */
+  isSessionStale(now = Date.now()): boolean {
+    if (this.lastCheckAt === undefined || !Number.isFinite(this.lastCheckAt)) return true;
+    return now - this.lastCheckAt > SESSION_STALE_MS;
+  }
+
+  /** Probe the current resolver immediately. A slow browser API is bounded so
+   * a foreground popup request never waits beyond the MV3 response budget. */
+  async checkNow(budgetMs = ON_DEMAND_PROBE_BUDGET_MS): Promise<void> {
+    if (this.probePromise === undefined && !this.isSessionStale()) return;
+    const probe = this.probePromise ?? this.startProbe();
+    const boundedBudget = Math.min(1_500, Math.max(0, Math.trunc(budgetMs)));
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<void>((resolve) => {
+      timeout = setTimeout(resolve, boundedBudget);
+    });
+    try {
+      await Promise.race([probe, deadline]);
+    } finally {
+      if (timeout !== undefined) clearTimeout(timeout);
+    }
+  }
+
+  private startProbe(): Promise<void> {
+    this.checking = true;
+    this.likelyAuthenticated = false;
+    const probe = this.probeResolver();
+    const settled = probe.finally(() => {
+      this.checking = false;
+      this.likelyAuthenticated = false;
+      this.probePromise = undefined;
+    });
+    this.probePromise = settled;
+    return settled;
+  }
+
+  private async probeResolver(): Promise<void> {
+    await this.loadPreferences();
+    const resolver =
+      this.resolverFromLatestOffer() ?? this.configuredResolver() ?? this.resolver;
+    if (resolver === undefined || resolver.protocol !== "https:") {
+      this.lastCheckAt = Date.now();
+      this.setAuthenticated(false);
+      return;
+    }
+    this.resolver = resolver;
+
+    let liveTabs: KeepaliveTab[] = [];
+    try {
+      liveTabs = await this.api.tabs.query({ url: [`${resolver.origin}/*`] });
+    } catch {
+      // The permission may have been revoked while the popup was open. The
+      // manager-owned probe below remains useful when it is still available.
+    }
+    const liveTab = liveTabs.find(
+      (tab) => tab.id !== undefined && typeof tab.url === "string" && resolverURLMatches(tab.url, resolver),
+    );
+    this.likelyAuthenticated = liveTab !== undefined;
+    if (liveTab?.id !== undefined) {
+      await this.inspectTab(liveTab.id);
+      return;
+    }
+    if (this.tabID !== undefined) {
+      await this.inspectTab(this.tabID);
+      return;
+    }
+    this.lastCheckAt = Date.now();
+    this.setAuthenticated(false);
+  }
+
 
   /** Stop scheduling and remove the manager-owned tab. */
   async dispose(): Promise<void> {
@@ -192,20 +352,49 @@ export class KeepaliveManager {
   }
 
   private async loadPreferences(): Promise<void> {
+    let values: Record<string, unknown> = {};
+    let storageReadSucceeded = false;
     try {
-      const values = await this.api.storage.get(["keepalive.interval", "keepalive.enabled"]);
-      this.intervalMinutes = clampKeepaliveInterval(values["keepalive.interval"]);
-      this.enabled = values["keepalive.enabled"] !== false;
+      values = await this.api.storage.get([
+        "keepalive.interval",
+        "keepalive.enabled",
+        KEEPALIVE_RESOLVER_ORIGIN_KEY,
+      ]);
+      storageReadSucceeded = true;
     } catch {
       // Storage is advisory. A temporary failure must not stop an active batch.
-      this.intervalMinutes = DEFAULT_INTERVAL_MINUTES;
-      this.enabled = true;
+    }
+    this.intervalMinutes = clampKeepaliveInterval(values["keepalive.interval"]);
+    this.enabled = values["keepalive.enabled"] !== false;
+
+    if (storageReadSucceeded) {
+      this.persistedResolverOrigin = normalizeHttpsOrigin(values[KEEPALIVE_RESOLVER_ORIGIN_KEY]);
+    }
+    this.grantedResolverOrigin = undefined;
+    if (this.persistedResolverOrigin === undefined && this.api.permissions !== undefined) {
+      try {
+        const granted = await this.api.permissions.getAll();
+        this.grantedResolverOrigin = resolverOriginsFromPermissionPatterns(granted.origins)[0];
+      } catch {
+        // Optional permissions are advisory; the popup can still explain the
+        // missing resolver and an incoming handoff can seed storage later.
+      }
+    }
+  }
+
+  private configuredResolver(): URL | undefined {
+    const origin = this.persistedResolverOrigin ?? this.grantedResolverOrigin;
+    if (origin === undefined) return undefined;
+    try {
+      return new URL(origin);
+    } catch {
+      return undefined;
     }
   }
 
   private async reconcile(): Promise<void> {
     const activeJobs = this.options.trackedJobCount() > 0;
-    const resolver = activeJobs ? this.resolverFromLatestOffer() : undefined;
+    const resolver = this.resolverFromLatestOffer() ?? this.configuredResolver();
     if (!this.enabled || !activeJobs || resolver === undefined) {
       await this.closeTab();
       this.schedule(this.observeMs, () => this.onObserve());
@@ -235,7 +424,9 @@ export class KeepaliveManager {
    * resolver-origin tab from the latest institutional offer when possible. */
   async openReauth(): Promise<boolean> {
     await this.loadPreferences();
-    if (this.resolver === undefined) this.resolver = this.resolverFromLatestOffer();
+    if (this.resolver === undefined) {
+      this.resolver = this.resolverFromLatestOffer() ?? this.configuredResolver();
+    }
     if (this.resolver?.protocol !== "https:") return false;
     if (this.tabID === undefined) await this.createTab();
     const tabID = this.tabID;
@@ -264,14 +455,23 @@ export class KeepaliveManager {
 
   private resolverFromLatestOffer(): URL | undefined {
     const openurl = this.options.latestOpenURL();
-    if (openurl === undefined) return undefined;
+    if (openurl === undefined || isAuthenticationURL(openurl)) return undefined;
     try {
       const url = new URL(openurl);
-      if (url.protocol !== "https:" && url.protocol !== "http:") return undefined;
+      if (url.protocol !== "https:") return undefined;
+      this.rememberResolverOrigin(url);
       return url;
     } catch {
       return undefined;
     }
+  }
+
+  private rememberResolverOrigin(resolver: URL): void {
+    const origin = normalizeHttpsOrigin(resolver.origin);
+    if (origin === undefined || this.persistedResolverOrigin === origin) return;
+    this.persistedResolverOrigin = origin;
+    const save = this.api.storage.set?.({ [KEEPALIVE_RESOLVER_ORIGIN_KEY]: origin });
+    if (save !== undefined) void save.catch(() => {});
   }
 
   private setAuthenticated(authenticated: boolean): void {
@@ -330,7 +530,7 @@ export class KeepaliveManager {
   private async onObserve(): Promise<void> {
     await this.loadPreferences();
     const activeJobs = this.options.trackedJobCount() > 0;
-    const resolver = this.resolverFromLatestOffer();
+    const resolver = this.resolverFromLatestOffer() ?? this.configuredResolver();
     if (!this.enabled || !activeJobs || resolver === undefined) {
       await this.closeTab();
       this.schedule(this.observeMs, () => this.onObserve());
@@ -363,7 +563,7 @@ export class KeepaliveManager {
       return;
     }
 
-    this.resolver = this.resolverFromLatestOffer();
+    this.resolver = this.resolverFromLatestOffer() ?? this.configuredResolver();
     if (this.resolver === undefined) {
       await this.closeTab();
       this.schedule(this.observeMs, () => this.onObserve());
@@ -399,12 +599,14 @@ export class KeepaliveManager {
     );
   }
 
-  private async inspectTab(): Promise<void> {
-    if (this.tabID === undefined || this.resolver === undefined) return;
+  private async inspectTab(tabID = this.tabID): Promise<void> {
+    if (tabID === undefined || this.resolver === undefined) return;
+    const owned = tabID === this.tabID;
     let tab: KeepaliveTab;
     try {
-      tab = await this.api.tabs.get(this.tabID);
+      tab = await this.api.tabs.get(tabID);
     } catch {
+      if (!owned) return;
       this.tabID = undefined;
       const wasPaused = this.reauthPaused;
       this.reauthPaused = false;
@@ -415,20 +617,14 @@ export class KeepaliveManager {
     this.lastCheckAt = Date.now();
     if (typeof tab.url !== "string") return;
 
-    let finalURL: URL;
-    try {
-      finalURL = new URL(tab.url);
-    } catch {
-      return;
-    }
-    if (finalURL.hostname === this.resolver.hostname) {
+    if (resolverURLMatches(tab.url, this.resolver)) {
       this.setAuthenticated(true);
-      if (this.reauthPaused) await this.resumeAfterReauth();
+      if (owned && this.reauthPaused) await this.resumeAfterReauth();
       return;
     }
     if (isAuthenticationURL(tab.url)) {
       this.setAuthenticated(false);
-      await this.pauseForReauth();
+      if (owned) await this.pauseForReauth();
     }
   }
 
@@ -500,7 +696,7 @@ export function initKeepalive(api: KeepaliveAPI, options: KeepaliveOptions): Kee
 
 /** Build the production API while keeping Chrome globals out of manager logic. */
 export function chromeKeepaliveAPI(
-  chromeAPI: Pick<typeof chrome, "action" | "storage" | "tabs">,
+  chromeAPI: Pick<typeof chrome, "action" | "storage" | "tabs" | "permissions">,
 ): KeepaliveAPI {
   return {
     tabs: {
@@ -513,6 +709,10 @@ export function chromeKeepaliveAPI(
     },
     storage: {
       get: (keys) => chromeAPI.storage.local.get(keys),
+      set: (values) => chromeAPI.storage.local.set(values),
+    },
+    permissions: {
+      getAll: () => chromeAPI.permissions.getAll(),
     },
     timers: {
       setTimeout: (callback, delayMs) => setTimeout(callback, delayMs),

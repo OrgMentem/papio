@@ -264,6 +264,50 @@ export interface TabInfo {
    * are. Lets the idle-close check keep a keepalive-pinned work window alive. */
   pinned?: boolean | undefined;
 }
+/** Normalize only the fragment component for managed-tab dedupe. Chrome may
+ * canonicalize a URL while creating a tab, so use URL.href when possible and
+ * retain a conservative string fallback for malformed values. */
+export function normalizeManagedTabURL(rawURL: string): string {
+  try {
+    const url = new URL(rawURL);
+    url.hash = "";
+    return url.href;
+  } catch {
+    const fragment = rawURL.indexOf("#");
+    return fragment < 0 ? rawURL : rawURL.slice(0, fragment);
+  }
+}
+
+/** Return the live tab that should be reused for a managed open. A tracked job
+ * wins even when its current document has navigated away; otherwise exact URL
+ * equality (ignoring only fragments) prevents duplicate browser tabs. */
+export function findManagedTab(
+  candidates: readonly TabInfo[],
+  url: string,
+  trackedTabID?: number,
+): TabInfo | undefined {
+  if (trackedTabID !== undefined) {
+    const tracked = candidates.find((candidate) => candidate.id === trackedTabID);
+    if (tracked !== undefined) return tracked;
+  }
+  const normalized = normalizeManagedTabURL(url);
+  return candidates.find(
+    (candidate) => candidate.id !== undefined && candidate.url !== undefined && normalizeManagedTabURL(candidate.url) === normalized,
+  );
+}
+export type ManagedTabPurpose = "handoff" | "inbox-open" | "session-signin" | "redrive" | "reoffer";
+export interface OpenManagedTabOptions {
+  url: string;
+  jobId?: string;
+  purpose: ManagedTabPurpose;
+  /** Legacy in-window visibility for a new handoff; work-window placement
+   * still follows its adapter-driven visibility rules. */
+  surfaceFallback?: boolean;
+  /** Set false when the caller just surfaced the tab (e.g. stale-page
+   * recovery) and only needs managed URL reuse/navigation. */
+  focusExisting?: boolean;
+}
+
 
 export interface TabChangeInfo {
   url?: string | undefined;
@@ -866,6 +910,9 @@ export class Bridge {
   /** Broker-tab ids whose auth attempt is already counted, so the SSO redirect
    * dance within one drive increments the budget only once. Worker-local. */
   private readonly authCountedTabs = new Set<number>();
+  /** Serializes the complete managed-tab reuse/create decision, so concurrent
+   * inbox clicks or re-offers cannot both observe an empty candidate set. */
+  private managedTabChain: Promise<unknown> = Promise.resolve();
   /** Jobs already reported human_auth_required this worker lifetime, so a capped
    * job refreshes the daemon's human action at most once per spin-up. */
   private readonly authStalledReported = new Set<string>();
@@ -930,6 +977,8 @@ export class Bridge {
       enabled: true,
       intervalMinutes: 4,
       authenticated: this.keepaliveAuthenticated,
+      checking: false,
+      likelyAuthenticated: false,
       pausedForReauth: this.keepaliveReauthNeeded,
       lastCheckAt: null,
       resolverOrigin: null,
@@ -949,6 +998,15 @@ export class Bridge {
     };
   }
 
+  /** Refresh a stale/unknown keepalive verdict before replying to the popup.
+   * The manager bounds the wait and leaves `checking` true when browser APIs
+   * exceed the foreground budget. */
+  async refreshSessionState(): Promise<BridgeSessionState> {
+    await this.ready;
+    await this.keepaliveManager?.checkNow();
+    return this.sessionState();
+  }
+
   async requestSessionSignIn(): Promise<BrokerReply<{ opened: true }>> {
     await this.ready;
     const manager = this.keepaliveManager;
@@ -964,14 +1022,14 @@ export class Bridge {
     if (resolverOrigin === undefined) {
       return this.failure("resolver_unavailable", "No resolver configured yet — open a paper first");
     }
-    try {
-      const tab = await this.deps.tabs.create({ url: resolverOrigin, active: true });
-      return tab.id === undefined
-        ? this.failure("session_open_failed", "Could not open the institution sign-in")
-        : { ok: true, opened: true };
-    } catch {
-      return this.failure("session_open_failed", "Could not open the institution sign-in");
-    }
+    const tabID = await this.openManagedTab({
+      url: resolverOrigin,
+      purpose: "session-signin",
+    });
+    return tabID === undefined
+      ? this.failure("session_open_failed", "Could not open the institution sign-in")
+      : { ok: true, opened: true };
+
   }
 
   async retryAuthStalled(jobID: string): Promise<BrokerReply<{ opened: true }>> {
@@ -991,22 +1049,15 @@ export class Bridge {
       return this.failure("handoff_unavailable", "This authentication stall is no longer available");
     }
     await this.update((s) => this.clearAuthAttempts(s, jobID));
-    let tabID: number | undefined = current !== undefined && current.tab_id >= 0 ? current.tab_id : undefined;
-    if (tabID !== undefined && this.deps.tabs.update !== undefined) {
-      try {
-        await this.deps.tabs.update(tabID, { url: saved.url, active: true });
-      } catch {
-        tabID = undefined;
-      }
-    } else if (tabID !== undefined) {
+    let tabID: number | undefined;
+    try {
+      tabID = await this.openManagedTab({
+        url: saved.url,
+        jobId: jobID,
+        purpose: "redrive",
+      });
+    } catch {
       tabID = undefined;
-    }
-    if (tabID === undefined) {
-      try {
-        tabID = await this.openBrokerTab(saved.url, true);
-      } catch {
-        tabID = undefined;
-      }
     }
     if (tabID === undefined) {
       return this.failure("handoff_open_failed", "Could not reopen the institutional handoff");
@@ -1030,6 +1081,7 @@ export class Bridge {
     this.send("job_accept", {}, jobID);
     return { ok: true, opened: true };
   }
+
 
 
   /** A cold preflight has no tab yet; excluding it would hide the only sign-in
@@ -1180,6 +1232,124 @@ export class Bridge {
       return undefined;
     }
   }
+  /** Route every resolver/provider open through the selected handoff surface,
+   * reusing a live tracked job tab; jobless resolver opens use URL equality
+   * modulo fragment. Distinct jobs may legitimately share a resolver URL.
+   * The whole lookup/create sequence is serialized because Chrome can deliver
+   * two inbox clicks before the first create resolves. */
+  private async openManagedTab(options: OpenManagedTabOptions): Promise<number | undefined> {
+    const queued = this.managedTabChain.then(() => this.openManagedTabUnlocked(options));
+    this.managedTabChain = queued.then(
+      () => undefined,
+      () => undefined,
+    );
+    return queued;
+  }
+
+  private async openManagedTabUnlocked(options: OpenManagedTabOptions): Promise<number | undefined> {
+    const job = options.jobId === undefined ? undefined : findByJob(this.store, options.jobId);
+    const trackedTabID = job !== undefined && job.tab_id >= 0 ? job.tab_id : undefined;
+    const candidates: TabInfo[] = [];
+    const seen = new Set<number>();
+    const addCandidate = (candidate: TabInfo): void => {
+      if (candidate.id === undefined || seen.has(candidate.id)) return;
+      seen.add(candidate.id);
+      candidates.push(candidate);
+    };
+    if (trackedTabID !== undefined) {
+      try {
+        addCandidate(await this.deps.tabs.get(trackedTabID));
+      } catch {
+        // A stale persisted id is not proof that a matching tab is absent.
+      }
+    }
+    if (this.deps.tabs.query !== undefined && options.jobId === undefined) {
+      try {
+        for (const candidate of await this.deps.tabs.query({})) addCandidate(candidate);
+      } catch {
+        // URL dedupe is best-effort when a browser rejects an all-tabs query.
+      }
+    }
+    const reusable =
+      trackedTabID !== undefined || options.jobId === undefined
+        ? findManagedTab(candidates, options.url, trackedTabID)
+        : undefined;
+    if (reusable?.id !== undefined) {
+      const shouldNavigate =
+        (options.purpose === "redrive" || options.purpose === "reoffer") &&
+        (reusable.url === undefined ||
+          normalizeManagedTabURL(reusable.url) !== normalizeManagedTabURL(options.url));
+      try {
+        if (shouldNavigate && this.deps.tabs.update !== undefined) {
+          await this.deps.tabs.update(reusable.id, { url: options.url });
+        }
+        if (options.focusExisting !== false) {
+          await this.focusManagedTab(reusable.id, {
+            ...reusable,
+            ...(shouldNavigate ? { url: options.url } : {}),
+          });
+        }
+      } catch {
+        // A tab can disappear between lookup and focus; callers still retain
+        // the live id and the browser removal path will recover the job.
+      }
+      await this.recordManagedTab(options.jobId, reusable.id);
+      return reusable.id;
+    }
+
+    const tabID = await this.openBrokerTab(options.url, options.surfaceFallback ?? true);
+    if (tabID === undefined) return undefined;
+    await this.recordManagedTab(options.jobId, tabID);
+    if (options.purpose === "session-signin") {
+      try {
+        await this.focusManagedTab(tabID);
+      } catch {
+        // Sign-in remains available in the managed surface if focus is denied.
+      }
+    }
+    return tabID;
+  }
+
+  /** Keep the durable active-job tab id aligned whenever a managed open finds
+   * or creates a tab for an already-known job. Fresh offers upsert their full
+   * job record immediately after this helper returns. */
+  private async recordManagedTab(jobID: string | undefined, tabID: number): Promise<void> {
+    if (jobID === undefined) return;
+    const job = findByJob(this.store, jobID);
+    if (job === undefined || job.tab_id === tabID) return;
+    await this.update((s) => patchJob(s, jobID, { tab_id: tabID }));
+  }
+
+  /** Focus a managed tab and, when available, its papio group and containing
+   * window. This is intentionally best-effort: focusing is operator UX, not a
+   * prerequisite for the daemon handoff. */
+  private async focusManagedTab(tabID: number, knownTab?: TabInfo): Promise<void> {
+    const tab = knownTab ?? (await this.deps.tabs.get(tabID));
+    const groupID = await this.handoffGroupIDForTab(tabID);
+    if (groupID !== undefined && this.deps.tabGroups !== undefined) {
+      try {
+        await this.deps.tabGroups.update(groupID, {
+          title: this.handoffGroupTitle(tabID),
+          collapsed: false,
+        });
+      } catch {
+        // A vanished group is recreated by the next managed handoff.
+      }
+    }
+    await this.deps.tabs.update?.(tabID, { active: true });
+    if (tab.windowId !== undefined && this.deps.windows !== undefined) {
+      try {
+        const win = await this.deps.windows.get(tab.windowId);
+        await this.deps.windows.update(tab.windowId, {
+          focused: true,
+          ...(win.state === "minimized" ? { state: "normal" as const } : {}),
+        });
+      } catch {
+        // A closed work window is handled by the normal tab-removal path.
+      }
+    }
+  }
+
 
   /** Create the handoff tab in the user's current window and fold it into the
    * collapsed "papio" tab group, reusing the group across handoffs. The group
@@ -1966,34 +2136,32 @@ export class Bridge {
       // tabs for the same queued offer.
       await this.releaseQueuedHandoffs(jobID, true);
       job = findByJob(this.store, jobID);
+      if (job === undefined || !this.offerURLs.has(jobID) || job.tab_id < 0) {
+        return this.failure("handoff_open_failed", "The offered handoff could not be opened");
+      }
+      await this.focusManagedTab(job.tab_id);
+      return { ok: true, opened: true };
     }
-    if (job === undefined || !this.offerURLs.has(jobID) || job.tab_id < 0) {
+    if (job === undefined || !this.offerURLs.has(jobID)) {
       return this.failure("handoff_open_failed", "The offered handoff could not be opened");
     }
-
-    let tab: TabInfo;
+    const openurl = this.offerURLs.get(jobID);
+    if (openurl === undefined) {
+      return this.failure("handoff_open_failed", "The offered handoff could not be opened");
+    }
+    let tabID: number | undefined;
     try {
-      tab = await this.deps.tabs.get(job.tab_id);
+      tabID = await this.openManagedTab({
+        url: openurl,
+        jobId: jobID,
+        purpose: "inbox-open",
+      });
     } catch {
-      return this.failure("handoff_open_failed", "The offered handoff tab is no longer available");
+      tabID = undefined;
     }
-    if (tab.id !== job.tab_id || this.deps.tabs.update === undefined) {
-      return this.failure("handoff_open_failed", "The offered handoff tab could not be focused");
-    }
-
-    try {
-      await this.deps.tabs.update(tab.id, { active: true });
-      if (this.deps.windows !== undefined && tab.windowId !== undefined) {
-        const win = await this.deps.windows.get(tab.windowId);
-        await this.deps.windows.update(tab.windowId, {
-          focused: true,
-          ...(win.state === "minimized" ? { state: "normal" as const } : {}),
-        });
-      }
-    } catch {
-      return this.failure("handoff_open_failed", "The offered handoff tab could not be focused");
-    }
-    return { ok: true, opened: true };
+    return tabID === undefined
+      ? this.failure("handoff_open_failed", "The offered handoff tab could not be focused")
+      : { ok: true, opened: true };
   }
 
   /** A daemon-directed retry may refresh an expired authentication exchange;
@@ -2003,18 +2171,22 @@ export class Bridge {
     await this.ready;
     const job = findByJob(this.store, jobID);
     const openurl = this.offerURLs.get(jobID);
-    if (job !== undefined && job.tab_id >= 0 && openurl !== undefined && this.deps.tabs.update !== undefined) {
+    if (job !== undefined && job.tab_id >= 0 && openurl !== undefined) {
+      let needsFreshResolver = false;
       try {
         const tab = await this.deps.tabs.get(job.tab_id);
-        const needsFreshResolver =
+        needsFreshResolver =
           job.status === "auth_pending" || (typeof tab.url === "string" && isAuthenticationURL(tab.url));
-        if (tab.id === job.tab_id && needsFreshResolver) {
-          // This is an explicit human retry, not an autonomous loop; charging it
-          // would let prior stale failures consume the fresh link they requested.
-          await this.deps.tabs.update(job.tab_id, { url: openurl });
-        }
       } catch {
-        // The focus path below still returns the local missing-tab outcome.
+        // The focus path below returns the local missing-tab outcome.
+      }
+      if (needsFreshResolver) {
+        const reopened = await this.openManagedTab({
+          url: openurl,
+          jobId: jobID,
+          purpose: "redrive",
+        });
+        if (reopened !== undefined) return;
       }
     }
     await this.openHandoff(jobID);
@@ -2554,6 +2726,7 @@ export class Bridge {
 
   private async upsertJobWithOffer(job: ActiveJob, offerURL: string): Promise<void> {
     this.offerURLs.set(job.job_id, offerURL);
+    if (job.requires_auth === true) this.keepaliveManager?.learnResolver(offerURL);
     await this.update((s) => {
       const withJob = upsertJob(s, job);
       return {
@@ -3084,7 +3257,12 @@ export class Bridge {
           if (!(await this.acknowledgePendingProviderHandoffs(providerKey))) return;
           let tabID: number | undefined;
           try {
-            tabID = await this.openBrokerTab(url, forceSurface);
+            tabID = await this.openManagedTab({
+              url,
+              jobId: queued.job_id,
+              purpose: "handoff",
+              surfaceFallback: forceSurface,
+            });
           } catch (e) {
             console.error("papio: queued handoff tab creation failed", e);
           }
@@ -3402,6 +3580,53 @@ export class Bridge {
           }
           return;
         }
+        if (
+          live &&
+          !providerParked &&
+          !(isDirectFileOffer(openurl) && requiresAuth !== true)
+        ) {
+          if (this.authAttemptsFor(jobID) >= MAX_AUTH_ATTEMPTS) {
+            this.rememberStalledAuthHandoff(jobID, {
+              url: openurl,
+              providerHosts,
+              ...(expected !== undefined ? { expected } : {}),
+              ...(requiresAuth !== undefined ? { requiresAuth } : {}),
+            });
+            this.reportAuthStalled(jobID);
+            return;
+          }
+          const tabID = await this.openManagedTab({
+            url: openurl,
+            jobId: jobID,
+            purpose: "reoffer",
+          });
+          if (tabID === undefined) {
+            this.send("job_reject", {}, jobID);
+            return;
+          }
+          this.beginProviderDrive(jobID);
+          const expiresMs = Date.parse(expiresAt);
+          const refreshed: ActiveJob = {
+            ...existing,
+            tab_id: tabID,
+            offered_at: this.deps.now(),
+            expires_at: Number.isNaN(expiresMs) ? this.deps.now() : expiresMs,
+            status: "accepted",
+            provider_hosts: providerHosts,
+            ...(expected !== undefined ? { expected } : {}),
+            ...(requiresAuth !== undefined ? { requires_auth: requiresAuth } : {}),
+          };
+          if (expected === undefined) delete refreshed.expected;
+          if (requiresAuth === undefined) delete refreshed.requires_auth;
+          if (existing.handoffAckPending !== true) delete refreshed.handoffAckPending;
+          await this.upsertJobWithOffer(refreshed, openurl);
+          if (existing.handoffAckPending === true) {
+            await this.acknowledgePendingProviderHandoffs(providerKey);
+          } else {
+            this.send("job_accept", {}, jobID);
+          }
+          return;
+        }
         if (live) {
           this.closingTabs.add(existing.tab_id);
           try {
@@ -3480,7 +3705,11 @@ export class Bridge {
     this.handoffOpening = true;
     let tabID: number | undefined;
     try {
-      tabID = await this.openBrokerTab(openurl, true);
+      tabID = await this.openManagedTab({
+        url: openurl,
+        jobId: jobID,
+        purpose: "handoff",
+      });
     } catch (e) {
       console.error("papio: tab creation failed; rejecting job", e);
     } finally {
@@ -3585,7 +3814,11 @@ export class Bridge {
     this.handoffOpening = true;
     let tabID: number | undefined;
     try {
-      tabID = await this.openBrokerTab(url, true);
+      tabID = await this.openManagedTab({
+        url,
+        jobId: jobID,
+        purpose: "handoff",
+      });
     } catch (e) {
       console.error("papio: tab creation failed after direct-file download", e);
     } finally {
@@ -3780,9 +4013,14 @@ export class Bridge {
       // entitled page; the fresh navigation triggers classify below.
       if (this.federatedLoginRouted.has(job.job_id) && !this.federatedReDriven.has(job.job_id)) {
         const openurl = this.offerURLs.get(job.job_id);
-        if (openurl !== undefined && this.deps.tabs.update !== undefined) {
+        if (openurl !== undefined) {
           this.federatedReDriven.add(job.job_id);
-          await this.deps.tabs.update(job.tab_id, { url: openurl });
+          await this.openManagedTab({
+            url: openurl,
+            jobId: job.job_id,
+            purpose: "redrive",
+            focusExisting: false,
+          });
           return;
         }
       }
@@ -3837,7 +4075,7 @@ export class Bridge {
       return true;
     }
     const openurl = this.offerURLs.get(job.job_id);
-    if (openurl === undefined || job.tab_id < 0 || this.deps.tabs.update === undefined) return false;
+    if (openurl === undefined || job.tab_id < 0) return false;
     this.staleRecoveryAttemptedEpochs.set(job.job_id, recoveryEpoch);
     this.staleRecoveryInFlightEpochs.set(job.job_id, recoveryEpoch);
     try {
@@ -3853,8 +4091,13 @@ export class Bridge {
       }
       await this.chargeAuthAttempt(job.job_id, job.tab_id);
       if ((this.staleRecoveryEpochs.get(job.job_id) ?? 0) !== recoveryEpoch) return true;
-      await this.deps.tabs.update(job.tab_id, { url: openurl });
-      return true;
+      const tabID = await this.openManagedTab({
+        url: openurl,
+        jobId: job.job_id,
+        purpose: "redrive",
+        focusExisting: false,
+      });
+      return tabID !== undefined;
     } catch {
       // Tab vanished mid-recovery; the normal removal path re-queues.
       return false;
@@ -4981,7 +5224,7 @@ export async function handleInboxRuntimeMessage(
   if (type === "papio.session.state") {
     if (!isPopupSender(sender, urls)) return runtimeFailure("unauthorized", "This sender cannot access institution session state");
     if (!hasOnlyKeys(message, ["type"])) return runtimeFailure("invalid_request", "Invalid institution session request");
-    return { ok: true, state: bridge.sessionState() };
+    return { ok: true, state: await bridge.refreshSessionState() };
   }
   if (type === "papio.session.signin") {
     if (!isPopupSender(sender, urls)) return runtimeFailure("unauthorized", "This sender cannot control institution sign-in");

@@ -220,8 +220,6 @@ test("renders rank-ordered bands, label:text facts, and only safe HTTPS links", 
 
   expect(Array.from(page.document.querySelectorAll(".triage-group > h2"), (heading) => heading.textContent)).toEqual([
     "Retractions (1)",
-    "Human actions (2)",
-    "Watch hits (1)",
   ]);
   expect(Array.from(page.document.querySelectorAll(".triage-item h3"), (heading) => heading.firstChild?.textContent)).toEqual([
     "Retraction notice",
@@ -795,6 +793,24 @@ test("the access hint states a precondition rather than competing with the detai
   for (const verb of ["sign in to", "then run", "actions open", "download the"]) {
     expect(hint.toLowerCase()).not.toContain(verb);
   }
+});
+
+test("merges extension guidance into the daemon detail without repeating the hint", async () => {
+  const item = manualAction("action:dedup-guidance", 1, "Manual download with daemon detail");
+  item.facts = [
+    { label: "Action", text: "manual download" },
+    { label: "Detail", text: "Download the requested PDF and papio will adopt it." },
+  ];
+  const page = await inboxDocument((message) =>
+    snapshotReply(snapshot([item], { counts: counts({ pending_total: 1, actions: 1, watch_hits: 0, retractions: 0 }) }), message));
+
+  const row = page.document.querySelector("[data-triage-item-id='action:dedup-guidance']");
+  const guidance = "Sign in if needed and download the PDF — papio adopts anything saved to Downloads/papio/<job>. Tip: the papio toolbar button can send an open PDF directly.";
+  expect(row?.querySelectorAll(".item-instruction")).toHaveLength(1);
+  expect(row?.querySelector(".item-guidance")).toBeNull();
+  expect(row?.querySelector(".item-detail")?.textContent).toContain("Download the requested PDF");
+  expect(row?.querySelector(".item-detail")?.getAttribute("title")).toBe(guidance);
+  expect(row?.textContent?.includes("Downloads/papio")).toBe(false);
 });
 
 test("an author suffix duplicated in the title is stripped for display", async () => {

@@ -7,6 +7,7 @@ import { expect, test } from "bun:test";
 import {
   clampKeepaliveInterval,
   KeepaliveManager,
+  SESSION_STALE_MS,
   type KeepaliveAPI,
   type KeepaliveTab,
   type KeepaliveTimers,
@@ -60,6 +61,8 @@ class FakeTabs {
   readonly reloaded: number[] = [];
   readonly removed: number[] = [];
   readonly updates: { id: number; properties: { active?: boolean; pinned?: boolean; muted?: boolean } }[] = [];
+  readonly resolverTabs: KeepaliveTab[] = [];
+  queryCount = 0;
   readonly live = new Map<number, KeepaliveTab>();
   nextURL: string | undefined;
 
@@ -86,12 +89,13 @@ class FakeTabs {
     if (tab !== undefined && this.nextURL !== undefined) tab.url = this.nextURL;
   }
 
-  async query(_query: {
+  async query(query: {
     pinned?: boolean;
     muted?: boolean;
     url?: string[];
   }): Promise<KeepaliveTab[]> {
-    return [];
+    this.queryCount += 1;
+    return query.url === undefined ? [] : [...this.resolverTabs];
   }
 
   async get(id: number): Promise<KeepaliveTab> {
@@ -114,7 +118,17 @@ class FakeTabs {
   }
 }
 
-function makeHarness(interval: unknown = 4, workWindowID?: () => number | undefined): {
+interface HarnessResolver {
+  latestOpenURL?: string | undefined;
+  storedOrigin?: unknown;
+  grantedOrigins?: string[];
+}
+
+function makeHarness(
+  interval: unknown = 4,
+  workWindowID?: () => number | undefined,
+  resolverConfig?: HarnessResolver,
+): {
   manager: KeepaliveManager;
   jobs: { count: number };
   tabs: FakeTabs;
@@ -122,6 +136,7 @@ function makeHarness(interval: unknown = 4, workWindowID?: () => number | undefi
   badge: string[];
   reauths: { count: number };
   reauthState: boolean[];
+  storageValues: Record<string, unknown>;
 } {
   const jobs = { count: 1 };
   const tabs = new FakeTabs();
@@ -129,15 +144,29 @@ function makeHarness(interval: unknown = 4, workWindowID?: () => number | undefi
   const badge: string[] = [];
   const reauths = { count: 0 };
   const reauthState: boolean[] = [];
+  const storageValues: Record<string, unknown> = {
+    "keepalive.interval": interval,
+    "keepalive.enabled": true,
+    "keepalive.resolverOrigin": resolverConfig?.storedOrigin,
+  };
+  const latestOpenURL = resolverConfig === undefined ? RESOLVER_OPENURL : resolverConfig.latestOpenURL;
   const api: KeepaliveAPI = {
     tabs,
     timers,
-    storage: { get: async () => ({ "keepalive.interval": interval, "keepalive.enabled": true }) },
+    storage: {
+      get: async () => ({ ...storageValues }),
+      set: async (values) => {
+        Object.assign(storageValues, values);
+      },
+    },
+    permissions: {
+      getAll: async () => ({ origins: resolverConfig?.grantedOrigins ?? [] }),
+    },
     action: { setBadgeText: async ({ text }) => void badge.push(text) },
   };
   const manager = new KeepaliveManager(api, {
     trackedJobCount: () => jobs.count,
-    latestOpenURL: () => RESOLVER_OPENURL,
+    latestOpenURL: () => latestOpenURL,
     ...(workWindowID !== undefined ? { workWindowID } : {}),
     onReauthNeeded: () => {
       reauths.count += 1;
@@ -148,7 +177,7 @@ function makeHarness(interval: unknown = 4, workWindowID?: () => number | undefi
     observeMs: 10,
     reloadSettleMs: 1,
   });
-  return { manager, jobs, tabs, timers, badge, reauths, reauthState };
+  return { manager, jobs, tabs, timers, badge, reauths, reauthState, storageValues };
 }
 
 test("creates one pinned resolver tab, reloads it, and closes it when jobs finish", async () => {
@@ -254,4 +283,68 @@ test("snapshot exposes session state without leaking an IdP host", async () => {
   expect(snapshot.pausedForReauth).toBe(true);
   expect(snapshot.resolverOrigin).toBe("https://resolver.example.edu");
   expect(snapshot.resolverOrigin).not.toContain("idp.example.edu");
+});
+test("snapshot resolves a durable resolver before granted permission fallback", async () => {
+  const stored = makeHarness(4, undefined, {
+    latestOpenURL: undefined,
+    storedOrigin: "https://stored.resolver.example",
+    grantedOrigins: ["https://granted.resolver.example/*"],
+  });
+  await stored.manager.init();
+  expect(stored.manager.getSnapshot().resolverOrigin).toBe("https://stored.resolver.example");
+
+  const fallback = makeHarness(4, undefined, {
+    latestOpenURL: undefined,
+    grantedOrigins: ["https://granted.resolver.example/*"],
+  });
+  await fallback.manager.init();
+  expect(fallback.manager.getSnapshot().resolverOrigin).toBe("https://granted.resolver.example");
+});
+
+test("on-demand session checks run when unknown and after the freshness window", async () => {
+  const originalNow = Date.now;
+  let now = originalNow();
+  Date.now = () => now;
+  try {
+    const h = makeHarness();
+    await h.manager.init();
+    const initialQueries = h.tabs.queryCount;
+
+    await h.manager.checkNow(100);
+    expect(h.tabs.queryCount).toBeGreaterThan(initialQueries);
+    const firstCheck = h.manager.getSnapshot();
+    expect(firstCheck.lastCheckAt).toBe(now);
+    expect(firstCheck.authenticated).toBe(true);
+
+    const freshQueries = h.tabs.queryCount;
+    await h.manager.checkNow(100);
+    expect(h.tabs.queryCount).toBe(freshQueries);
+
+    now += SESSION_STALE_MS + 1;
+    h.tabs.live.get(1)!.url = "https://resolver.example.edu/account";
+    await h.manager.checkNow(100);
+    expect(h.tabs.queryCount).toBeGreaterThan(freshQueries);
+    expect(h.manager.getSnapshot().lastCheckAt).toBe(now);
+  } finally {
+    Date.now = originalNow;
+  }
+});
+
+test("a live resolver tab is evidence while its probe determines the verdict", async () => {
+  const h = makeHarness();
+  await h.manager.init();
+  const liveTab = { id: 42, url: "https://resolver.example.edu/account" };
+  h.tabs.live.set(liveTab.id, liveTab);
+  h.tabs.resolverTabs.push(liveTab);
+  const pending = h.manager.checkNow(100);
+  const during = h.manager.getSnapshot();
+  expect(during.checking).toBe(true);
+  // The fake browser resolves immediately, so the completed state is the
+  // authoritative resolver-origin verdict rather than the interim evidence.
+  await pending;
+  expect(h.manager.getSnapshot()).toMatchObject({
+    authenticated: true,
+    checking: false,
+    resolverOrigin: "https://resolver.example.edu",
+  });
 });

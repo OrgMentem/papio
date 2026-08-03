@@ -10,13 +10,15 @@ import { Window } from "happy-dom";
 import { parseBrowserMessage, type BrowserMessage } from "../src/protocol";
 import { emptyStore, type StateBackend, type StoreShape } from "../src/state";
 import { capturePage, encodePageCapture, sanitizeFixture } from "../src/capture";
-import type { AdapterSpec } from "../src/adapters/types";
-import { interpret } from "../src/adapters/types";
+import { KeepaliveManager, type KeepaliveAPI } from "../src/keepalive";
+import { interpret, type AdapterSpec } from "../src/adapters/types";
 import {
   Bridge,
+  findManagedTab,
   hasDaemonUpdateHint,
   handleInboxRuntimeMessage,
   needsVisibleWindow,
+  normalizeManagedTabURL,
   isBotChallenge,
   type BridgeDeps,
   type DownloadDeltaLike,
@@ -29,6 +31,18 @@ import { routeResolverService } from "../src/resolver";
 
 const OPENURL = "https://resolver.example.edu/openurl?ctx=abc";
 const PROVIDER_HOST = "www.jstor.org";
+test("managed tab dedupe ignores URL fragments and prioritizes a tracked tab", () => {
+  const candidates: TabInfo[] = [
+    { id: 100, url: "https://sage.example/article?download=1#section-a" },
+    { id: 101, url: "https://sage.example/other" },
+  ];
+  expect(normalizeManagedTabURL("https://sage.example/article?download=1#section-a")).toBe(
+    "https://sage.example/article?download=1",
+  );
+  expect(findManagedTab(candidates, "https://sage.example/article?download=1#section-b")?.id).toBe(100);
+  expect(findManagedTab(candidates, "https://sage.example/new#fragment", 101)?.id).toBe(101);
+});
+
 const EXPIRES = "2027-01-01T00:00:00Z";
 
 // Listeners are registered as promise-returning callbacks; emit awaits them all,
@@ -1700,7 +1714,7 @@ test("keepalive authentication evidence releases a restored queued handoff", asy
   expect(h.backend.store.activeJobs[0]?.status).toBe("accepted");
 });
 
-test("a changed re-offer replaces an OA browser tab with the institutional fallback", async () => {
+test("a changed re-offer reuses the live job tab for the institutional fallback", async () => {
   const h = makeHarness();
   const oaURL = "https://oa.example.org/blocked-paper";
   const institutionalURL = "https://resolver.example.edu/openurl?fallback=1";
@@ -1713,12 +1727,10 @@ test("a changed re-offer replaces an OA browser tab with the institutional fallb
   await h.port.inbound(oaOffer);
   await h.port.inbound(institutionalOffer);
 
-  expect(h.tabs.created).toEqual([
-    { url: oaURL, active: true },
-    { url: institutionalURL, active: true },
-  ]);
-  expect(h.tabs.removed).toEqual([100]);
-  expect(h.backend.store.activeJobs[0]?.tab_id).toBe(101);
+  expect(h.tabs.created).toEqual([{ url: oaURL, active: true }]);
+  expect(h.tabs.navigations).toEqual([{ tabID: 100, url: institutionalURL }]);
+  expect(h.tabs.removed).toEqual([]);
+  expect(h.backend.store.activeJobs[0]?.tab_id).toBe(100);
   expect(h.frames().filter((f) => f.type === "job_accept" && f.job_id === "job_0001b_fallback")).toHaveLength(2);
 });
 
@@ -3000,6 +3012,98 @@ test("inbox handoff runtime opening focuses the live offered tab without returni
     error: { code: "unauthorized", message: "This sender cannot access the inbox broker" },
   });
 });
+test("concurrent inbox opens reuse one managed tab and focus it once", async () => {
+  const jobID = "job_open_dedupe";
+  const h = makeHarness({
+    ...emptyStore(),
+    activeJobs: [
+      {
+        job_id: jobID,
+        tab_id: -1,
+        offered_at: 1_700_000_000_000,
+        expires_at: 1_800_000_000_000,
+        status: "accepted",
+        provider_hosts: [PROVIDER_HOST],
+      },
+    ],
+    offerURLs: { [jobID]: OPENURL },
+  });
+  await h.bridge.start();
+  const [first, second] = await Promise.all([h.bridge.openHandoff(jobID), h.bridge.openHandoff(jobID)]);
+
+  expect(first).toEqual({ ok: true, opened: true });
+  expect(second).toEqual({ ok: true, opened: true });
+  expect(h.tabs.created).toEqual([{ url: OPENURL, active: true }]);
+  expect(h.tabs.activated).toEqual([100]);
+});
+test("session state probes a live resolver tab before claiming signed out", async () => {
+  const h = makeHarness();
+  const urls = {
+    runtimeID: "papio-test-id",
+    inboxURL: "chrome-extension://papio-test-id/inbox.html",
+    popupURL: "chrome-extension://papio-test-id/popup.html",
+    historyURL: "chrome-extension://papio-test-id/history.html",
+  };
+  await h.bridge.start();
+  const keepaliveAPI: KeepaliveAPI = {
+    tabs: {
+      create: async (properties) =>
+        h.tabs.create({
+          url: properties.url,
+          active: properties.active,
+          ...(properties.windowId === undefined ? {} : { windowId: properties.windowId }),
+        }),
+      reload: (tabID) => h.tabs.reload(tabID),
+      get: (tabID) => h.tabs.get(tabID),
+      query: async (query) => {
+        const pattern = query.url?.[0];
+        if (pattern === undefined) return [];
+        const origin = pattern.endsWith("/*") ? pattern.slice(0, -2) : pattern;
+        return [...h.tabs.live.values()].filter((tab) => {
+          if (typeof tab.url !== "string") return false;
+          try {
+            return new URL(tab.url).origin === origin;
+          } catch {
+            return false;
+          }
+        });
+      },
+      remove: (tabID) => h.tabs.remove(tabID),
+      update: async (tabID) => h.tabs.get(tabID),
+    },
+    storage: {
+      get: async () => ({
+        "keepalive.interval": 4,
+        "keepalive.enabled": true,
+        "keepalive.resolverOrigin": "https://resolver.example.edu",
+      }),
+    },
+    permissions: { getAll: async () => ({ origins: [] }) },
+    timers: { setTimeout: () => 0, clearTimeout: () => {} },
+  };
+  const manager = new KeepaliveManager(keepaliveAPI, {
+    trackedJobCount: () => 0,
+    latestOpenURL: () => undefined,
+    onAuthenticationChanged: (authenticated) => {
+      void h.bridge.setKeepaliveAuthenticated(authenticated);
+    },
+  });
+  await manager.init();
+  h.tabs.live.set(777, { id: 777, url: "https://resolver.example.edu/account" });
+  h.bridge.attachKeepalive(manager);
+
+  await expect(
+    handleInboxRuntimeMessage(h.bridge, { type: "papio.session.state" }, { id: urls.runtimeID, url: urls.popupURL }, urls),
+  ).resolves.toMatchObject({
+    ok: true,
+    state: {
+      authenticated: true,
+      checking: false,
+      resolverOrigin: "https://resolver.example.edu",
+    },
+  });
+});
+
 test("session sign-in reports why it cannot open without a resolver", async () => {
   const h = makeHarness();
   const urls = {

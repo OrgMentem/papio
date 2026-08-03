@@ -17,8 +17,9 @@ import {
   type Scenario,
 } from "./capture";
 import { chromeBackend, type ActiveJob, type PendingDelivery, type StoreShape, TERMS_CONSENT_KEY } from "./state";
+import type { ActivityEntryPayload } from "./protocol";
 import { classifyPage, isPDFPage, pdfSourceURL, sniffDOI, type PageKind } from "./deliver";
-import type { KeepaliveSnapshot } from "./keepalive";
+import { SESSION_STALE_MS, type KeepaliveSnapshot } from "./keepalive";
 import { renderPapio } from "./dom";
 import {
   EST_MINUTES_SAVED_PER_PAPER,
@@ -352,6 +353,8 @@ function isSessionState(value: unknown): value is PopupSessionState {
     typeof state["enabled"] === "boolean" &&
     typeof state["intervalMinutes"] === "number" &&
     typeof state["authenticated"] === "boolean" &&
+    (state["checking"] === undefined || typeof state["checking"] === "boolean") &&
+    (state["likelyAuthenticated"] === undefined || typeof state["likelyAuthenticated"] === "boolean") &&
     typeof state["pausedForReauth"] === "boolean" &&
     (state["lastCheckAt"] === null || typeof state["lastCheckAt"] === "number") &&
     (resolverOrigin === null ||
@@ -420,8 +423,76 @@ function formatLastCheck(lastCheckAt: number | null): string {
   return `${minutes} min ago`;
 }
 
+export interface SessionCardState {
+  label: string;
+  detail: string;
+  action: "none" | "signin";
+}
+
+/** Convert a session snapshot into mutually exclusive card copy. In
+ * particular, a missing resolver never shares a card with signed-out copy. */
+export function deriveSessionCardState(state: PopupSessionState | undefined): SessionCardState {
+  if (state === undefined) {
+    return { label: "Checking session…", detail: "", action: "none" };
+  }
+  if (state.resolverOrigin === null) {
+    return {
+      label: "No resolver configured yet",
+      detail: "No resolver configured yet — open a paper first",
+      action: "none",
+    };
+  }
+  if (!state.enabled) {
+    return {
+      label: "Keep-warm off",
+      detail: `Applies to ${state.resolverOrigin}`,
+      action: "signin",
+    };
+  }
+  const checking = state.checking === true;
+  const lastCheckAt = state.lastCheckAt;
+  const stale =
+    lastCheckAt === null ||
+    !Number.isFinite(lastCheckAt) ||
+    Date.now() - lastCheckAt > SESSION_STALE_MS;
+  if (checking) {
+    return {
+      label: state.likelyAuthenticated === true ? "Likely signed in — verifying" : "Checking session…",
+      detail: `Applies to ${state.resolverOrigin}`,
+      action: "signin",
+    };
+  }
+  if (state.pausedForReauth) {
+    return {
+      label: "Sign-in needed - papio paused",
+      detail: `Applies to ${state.resolverOrigin}`,
+      action: "signin",
+    };
+  }
+  if (stale) {
+    return {
+      label: "Checking session…",
+      detail: `Applies to ${state.resolverOrigin}`,
+      action: "signin",
+    };
+  }
+  if (!state.authenticated) {
+    return {
+      label: "Signed out or expired",
+      detail: `Applies to ${state.resolverOrigin}`,
+      action: "signin",
+    };
+  }
+  return {
+    label: `Session warm · last verified ${formatLastCheck(lastCheckAt)}`,
+    detail: `Applies to ${state.resolverOrigin}`,
+    action: "signin",
+  };
+}
+
 let sessionNoticeFadeTimer: ReturnType<typeof setTimeout> | undefined;
 let sessionNoticeHideTimer: ReturnType<typeof setTimeout> | undefined;
+let sessionProbeRetryTimer: ReturnType<typeof setTimeout> | undefined;
 
 function clearSessionNoticeTimers(): void {
   clearTimeout(sessionNoticeFadeTimer);
@@ -429,6 +500,19 @@ function clearSessionNoticeTimers(): void {
   sessionNoticeFadeTimer = undefined;
   sessionNoticeHideTimer = undefined;
 }
+function scheduleSessionProbeRetry(state: PopupSessionState | undefined): void {
+  clearTimeout(sessionProbeRetryTimer);
+  sessionProbeRetryTimer = undefined;
+  if (state?.checking !== true) return;
+  sessionProbeRetryTimer = setTimeout(() => {
+    sessionProbeRetryTimer = undefined;
+    void requestSessionState().then((next) => {
+      if (next !== undefined) renderInstitutionSession(document, next);
+    });
+  }, 2_000);
+  (sessionProbeRetryTimer as unknown as { unref?: () => void }).unref?.();
+}
+
 
 export function renderInstitutionSession(
   doc: Document,
@@ -454,17 +538,10 @@ export function renderInstitutionSession(
     clearSessionNoticeTimers();
     return;
   }
-  status.textContent = !state.enabled
-    ? "Keep-warm off"
-    : state.pausedForReauth
-      ? "Sign-in needed - papio paused"
-      : state.authenticated
-        ? `Session warm · last verified ${formatLastCheck(state.lastCheckAt)}`
-        : "Signed out or expired";
-  origin.textContent = state.resolverOrigin
-    ? `Applies to ${state.resolverOrigin}`
-    : "No resolver configured yet — open a paper first";
-  signIn.disabled = state.resolverOrigin === null;
+  const cardState = deriveSessionCardState(state);
+  status.textContent = cardState.label;
+  origin.textContent = cardState.detail;
+  signIn.disabled = cardState.action === "none";
   if (!signIn.dataset.wired) {
     signIn.dataset.wired = "1";
     signIn.addEventListener("click", () => {
@@ -765,6 +842,230 @@ function deliveryStatusText(delivery: PendingDelivery | undefined): string {
 function shortJobID(jobID: string): string {
   return jobID.length > 12 ? jobID.slice(0, 12) : jobID;
 }
+const POPUP_REFRESH_INTERVAL_MS = 5_000;
+const STALL_THRESHOLD_MS = 10 * 60_000;
+
+/** Keep the activity feed best-effort: an older daemon may not advertise it,
+ * and an asleep worker may reject the request while the page remains useful. */
+function isPopupActivityEntry(value: unknown): value is ActivityEntryPayload {
+  if (typeof value !== "object" || value === null) return false;
+  const entry = value as Record<string, unknown>;
+  return (
+    typeof entry.seq === "number" &&
+    Number.isSafeInteger(entry.seq) &&
+    typeof entry.at === "string" &&
+    typeof entry.kind === "string" &&
+    typeof entry.text === "string" &&
+    (entry.job_id === undefined || typeof entry.job_id === "string") &&
+    (entry.title === undefined || typeof entry.title === "string")
+  );
+}
+
+function popupActivityEntries(value: unknown): ActivityEntryPayload[] | undefined {
+  if (typeof value !== "object" || value === null) return undefined;
+  const response = value as Record<string, unknown>;
+  if (response.ok !== true || typeof response.feature !== "boolean") return undefined;
+  if (response.feature === false) return [];
+  return Array.isArray(response.entries) ? response.entries.filter(isPopupActivityEntry) : undefined;
+}
+
+async function readPopupActivity(): Promise<ActivityEntryPayload[] | undefined> {
+  try {
+    const response = await chrome.runtime.sendMessage({
+      type: "papio.activity",
+      request: { limit: 50 },
+    });
+    return popupActivityEntries(response);
+  } catch {
+    return undefined;
+  }
+}
+
+function relativeAgeParts(timestamp: number, now = Date.now()): { display: string; compact: string; stale: boolean } {
+  if (!Number.isFinite(timestamp)) return { display: "just now", compact: "0m", stale: false };
+  const elapsed = Math.max(0, now - timestamp);
+  const seconds = Math.floor(elapsed / 1_000);
+  if (seconds < 45) return { display: "just now", compact: "0m", stale: false };
+  if (seconds < 90) return { display: "1m ago", compact: "1m", stale: false };
+  if (seconds < 3_600) {
+    const minutes = Math.round(seconds / 60);
+    return { display: `${minutes}m ago`, compact: `${minutes}m`, stale: elapsed > STALL_THRESHOLD_MS };
+  }
+  if (seconds < 86_400) {
+    const hours = Math.round(seconds / 3_600);
+    return { display: `${hours}h ago`, compact: `${hours}h`, stale: elapsed > STALL_THRESHOLD_MS };
+  }
+  const days = Math.round(seconds / 86_400);
+  return { display: `${days}d ago`, compact: `${days}d`, stale: elapsed > STALL_THRESHOLD_MS };
+}
+
+function popupActivityForJob(entries: readonly ActivityEntryPayload[], jobID: string): ActivityEntryPayload | undefined {
+  let latest: ActivityEntryPayload | undefined;
+  for (const entry of entries) {
+    if (entry.job_id !== jobID) continue;
+    if (
+      latest === undefined ||
+      entry.seq > latest.seq ||
+      (entry.seq === latest.seq && entry.at > latest.at)
+    ) {
+      latest = entry;
+    }
+  }
+  return latest;
+}
+
+function fallbackJobStatus(job: ActiveJob): string {
+  switch (String(job.status)) {
+    case "offered":
+      return "Institution access handoff offered";
+    case "queued":
+      return "Queued for acquisition";
+    case "accepted":
+      return "Acquisition accepted";
+    case "auth_pending":
+      return "Waiting on you to sign in";
+    case "awaiting_download":
+      return "Waiting for your PDF download";
+    case "awaiting_human":
+      return "Waiting on you to continue";
+    default:
+      return "Acquisition is active";
+  }
+}
+
+function liveStatusText(
+  job: ActiveJob,
+  activity: ActivityEntryPayload | undefined,
+  pendingDelivery: PendingDelivery | undefined,
+): { text: string; timestamp: number; stale: boolean } {
+  const now = Date.now();
+  const activityTimestamp = activity === undefined ? NaN : Date.parse(activity.at);
+  const fallbackTimestamp = Number.isFinite(job.offered_at) && job.offered_at > 0 ? job.offered_at : now;
+  let text = activity?.text.trim() || fallbackJobStatus(job);
+  let timestamp = Number.isFinite(activityTimestamp) ? activityTimestamp : fallbackTimestamp;
+
+  if (pendingDelivery !== undefined) {
+    const pendingText =
+      pendingDelivery.status === "failed"
+        ? pendingDelivery.error?.trim() || "PDF delivery needs attention"
+        : pendingDelivery.status === "downloaded"
+          ? "PDF received by papio"
+          : pendingDelivery.status === "sending"
+            ? "Sending PDF to papio"
+            : "";
+    if (pendingText !== "") {
+      const pendingTimestamp = Number.isFinite(pendingDelivery.initiated_at) && pendingDelivery.initiated_at > 0
+        ? pendingDelivery.initiated_at
+        : now;
+      if (!Number.isFinite(activityTimestamp) || pendingTimestamp >= activityTimestamp) {
+        text = pendingText;
+        timestamp = pendingTimestamp;
+      }
+    }
+  }
+
+  const waitingOnOperator = String(job.status) === "awaiting_human" ||
+    /awaiting[_ ]human|waiting on (the )?operator|still waiting on you/i.test(text);
+  if (waitingOnOperator && !/waiting on you|waiting for your/i.test(text)) {
+    text = `Waiting on you · ${text}`;
+  }
+  const age = relativeAgeParts(timestamp, now);
+  const activityAge = Number.isFinite(activityTimestamp) ? relativeAgeParts(activityTimestamp, now) : undefined;
+  const stalled = activityAge?.stale === true;
+  const stallAge = activityAge?.compact ?? age.compact;
+  return {
+    text: `${stalled ? `No progress for ${stallAge} · ` : ""}${text} · ${age.display}`,
+    timestamp,
+    stale: stalled,
+  };
+}
+
+export interface PopupLiveActions {
+  openInbox?: () => Promise<void>;
+  goToTab?: (jobID: string) => Promise<void>;
+}
+
+const liveActionHandlers = new WeakMap<HTMLButtonElement, () => Promise<void>>();
+
+function wireLiveAction(
+  button: HTMLButtonElement,
+  handler: () => Promise<void>,
+  label: string,
+): void {
+  liveActionHandlers.set(button, handler);
+  if (button.dataset.wired) return;
+  button.dataset.wired = "1";
+  button.addEventListener("click", () => {
+    const action = liveActionHandlers.get(button);
+    if (action === undefined) return;
+    button.disabled = true;
+    button.textContent = "Opening…";
+    void action().then(
+      () => {
+        button.disabled = false;
+        button.textContent = label;
+        if (typeof window !== "undefined") window.close();
+      },
+      (error: unknown) => {
+        button.disabled = false;
+        button.textContent = "Try again";
+        const status = button.closest(".launcher-action")?.querySelector<HTMLElement>(".page-acquire-live-status");
+        if (status !== null && status !== undefined) {
+          status.textContent = error instanceof Error ? error.message : "Could not open the requested papio page";
+        }
+      },
+    );
+  });
+}
+
+function renderLiveAcquisition(
+  doc: Document,
+  job: ActiveJob,
+  activityEntries: readonly ActivityEntryPayload[],
+  pendingDelivery: PendingDelivery | undefined,
+  actions: PopupLiveActions,
+): void {
+  const card = doc.getElementById("page-acquire-live");
+  const title = doc.getElementById("page-acquire-live-title");
+  const status = doc.getElementById("page-acquire-live-status");
+  const inbox = doc.getElementById("page-acquire-open-inbox");
+  const tab = doc.getElementById("page-acquire-go-tab");
+  if (
+    !(card instanceof HTMLElement) ||
+    !(title instanceof HTMLElement) ||
+    !(status instanceof HTMLElement) ||
+    !(inbox instanceof HTMLButtonElement) ||
+    !(tab instanceof HTMLButtonElement)
+  ) {
+    return;
+  }
+
+  const delivery = pendingDelivery?.job_id === job.job_id ? pendingDelivery : undefined;
+  const latest = popupActivityForJob(activityEntries, job.job_id);
+  const knownTitle = job.expected?.title?.trim() || latest?.title?.trim() || "";
+  title.textContent = knownTitle;
+  title.hidden = knownTitle === "";
+  const live = liveStatusText(job, latest, delivery);
+  status.textContent = live.text;
+  status.dataset.stalled = live.stale ? "true" : "false";
+  card.hidden = false;
+
+  wireLiveAction(inbox, actions.openInbox ?? openInbox, "Open inbox item");
+  inbox.dataset.jobId = job.job_id;
+
+  const handoffKind = latest?.kind === "browser.handoff_offered" ||
+    latest?.kind === "browser.handoff_reoffered" ||
+    latest?.kind === "browser.auth_pending";
+  const hasLiveHandoffTab = Number.isFinite(job.tab_id) && job.tab_id >= 0 &&
+    (job.requires_auth === true || String(job.status) === "auth_pending" || handoffKind);
+  tab.hidden = !hasLiveHandoffTab;
+  if (hasLiveHandoffTab) {
+    wireLiveAction(tab, () => (actions.goToTab ?? openHandoff)(job.job_id), "Go to tab");
+    tab.dataset.jobId = job.job_id;
+  } else {
+    tab.dataset.jobId = "";
+  }
+}
 
 export async function acquireCurrentPage(): Promise<PageAcquireResponse> {
   const page = await readCurrentPageMetadata();
@@ -908,12 +1209,15 @@ export function renderPageContext(
   page: PageMetadata | undefined,
   jobs: ActiveJob[],
   pendingDelivery?: PendingDelivery,
+  activityEntries: readonly ActivityEntryPayload[] = [],
+  liveActions: PopupLiveActions = {},
 ): void {
   const section = doc.getElementById("page-acquire");
   const detected = doc.getElementById("page-acquire-doi");
   const state = doc.getElementById("page-acquire-context");
   const status = doc.getElementById("page-acquire-status");
   const button = doc.getElementById("page-acquire-btn");
+  const liveCard = doc.getElementById("page-acquire-live");
   if (
     !(section instanceof HTMLElement) ||
     !detected ||
@@ -923,6 +1227,7 @@ export function renderPageContext(
   ) {
     return;
   }
+  if (liveCard instanceof HTMLElement) liveCard.hidden = true;
   section.hidden = false;
   const kind = page?.kind ?? (page ? classifyPage(page.url, page.doi ? { doi: page.doi } : {}).kind : "none");
   if (kind === "pdf") {
@@ -959,14 +1264,38 @@ export function renderPageContext(
   detected.hidden = true;
   status.textContent = "";
   button.dataset.mode = "doi";
-  button.hidden = false;
   const normalizedDOI = page.doi.trim().toLowerCase().replace(/^doi:\s*/, "");
-  const inFlight = jobs.some(
+  const inFlightJob = jobs.find(
     (job) => job.expected?.doi?.trim().toLowerCase().replace(/^doi:\s*/, "") === normalizedDOI,
   );
-  state.textContent = inFlight ? "An acquisition for this DOI is already in progress." : "";
-  button.textContent = inFlight ? "Acquisition in progress" : "Acquire this page";
-  button.disabled = inFlight;
+  if (inFlightJob === undefined) {
+    button.hidden = false;
+    button.textContent = "Acquire this page";
+    button.disabled = false;
+    state.textContent = "";
+    return;
+  }
+
+  // A duplicate/page_acquire-dup is not a reason to leave a disabled,
+  // unexplained button in the popup. The activity card is refreshed with the
+  // same job-id filter on each popup poll and always carries an age.
+  state.textContent = "";
+  button.hidden = true;
+  button.disabled = true;
+  button.textContent = "Acquire this page";
+  renderLiveAcquisition(doc, inFlightJob, activityEntries, pendingDelivery, liveActions);
+}
+
+let popupActivity: ActivityEntryPayload[] = [];
+let popupRefreshTimer: ReturnType<typeof setInterval> | undefined;
+
+function startPopupRefresh(): void {
+  if (popupRefreshTimer !== undefined) return;
+  popupRefreshTimer = setInterval(() => {
+    void refresh().catch((error: unknown) => {
+      console.debug("papio: popup refresh failed", error);
+    });
+  }, POPUP_REFRESH_INTERVAL_MS);
 }
 
 export function wirePrimaryShortcut(doc: Document = document): void {
@@ -989,14 +1318,17 @@ export async function refresh(): Promise<void> {
   const store = await chromeBackend(chrome.storage).load();
   renderDaemonStatus(document, store);
   renderPageAcquire(document);
+  const freshActivity = await readPopupActivity();
+  if (freshActivity !== undefined) popupActivity = freshActivity;
   const delivery = await readDeliveryFeedback(store.pendingDelivery);
   try {
-    renderPageContext(document, await readCurrentPageMetadata(), store.activeJobs, delivery);
+    renderPageContext(document, await readCurrentPageMetadata(), store.activeJobs, delivery, popupActivity);
   } catch {
-    renderPageContext(document, undefined, store.activeJobs, delivery);
+    renderPageContext(document, undefined, store.activeJobs, delivery, popupActivity);
   }
   const session = await requestSessionState();
   renderInstitutionSession(document, session);
+  scheduleSessionProbeRetry(session);
   renderNeedsAttention(
     document,
     store.activeJobs,
@@ -1137,4 +1469,7 @@ if (typeof document !== "undefined" && typeof chrome !== "undefined") {
   // Stats are additive: refreshImpactSummary resolves to a hidden section on
   // any failure, so the launcher renders identically with or without a daemon.
   void refreshImpactSummary();
+  // A popup can remain open while the daemon advances the duplicate job.
+  // Keep the live card honest without making the static launcher poll forever.
+  startPopupRefresh();
 }

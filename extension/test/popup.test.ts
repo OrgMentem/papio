@@ -249,20 +249,45 @@ test("does not send a DOI-less scraped page to the daemon", async () => {
   expect(messages).toBe(0);
 });
 
-test("shows only a disabled action for a local in-flight acquisition", () => {
+test("renders a live, honest status card for a local in-flight acquisition", () => {
   const doc = popupDocument();
-  renderPageContext(doc, { url: "https://doi.org/10.1000/example", doi: "10.1000/example" }, [
-    job({ expected: { doi: "doi:10.1000/example" } }),
-  ]);
+  const now = Date.now();
+  let openedInbox = 0;
+  let openedTab = 0;
+  renderPageContext(
+    doc,
+    { url: "https://doi.org/10.1000/example", doi: "10.1000/example" },
+    [job({ expected: { title: "A paper in progress", doi: "doi:10.1000/example" }, status: "auth_pending" })],
+    undefined,
+    [{
+      seq: 2,
+      at: new Date(now - 11 * 60_000).toISOString(),
+      job_id: "job-1",
+      kind: "browser.handoff_offered",
+      text: "Institution access handoff offered",
+      title: "A paper in progress",
+    }],
+    {
+      openInbox: async () => { openedInbox += 1; },
+      goToTab: async () => { openedTab += 1; },
+    },
+  );
 
   expect(doc.getElementById("page-acquire-doi")?.hidden).toBe(true);
-  expect(doc.getElementById("page-acquire-context")?.textContent).toBe(
-    "An acquisition for this DOI is already in progress.",
-  );
+  expect(doc.getElementById("page-acquire-context")?.textContent).toBe("");
   const button = doc.getElementById("page-acquire-btn") as HTMLButtonElement;
-  expect(button.disabled).toBe(true);
-  expect(button.hidden).toBe(false);
-  expect(button.textContent).toBe("Acquisition in progress");
+  expect(button.hidden).toBe(true);
+  expect(doc.getElementById("page-acquire-live")?.hidden).toBe(false);
+  expect(doc.getElementById("page-acquire-live-title")?.textContent).toBe("A paper in progress");
+  expect(doc.getElementById("page-acquire-live-status")?.textContent).toContain("No progress for 11m");
+  expect(doc.getElementById("page-acquire-live-status")?.textContent).toContain("Institution access handoff offered");
+  const inbox = doc.getElementById("page-acquire-open-inbox") as HTMLButtonElement;
+  const tab = doc.getElementById("page-acquire-go-tab") as HTMLButtonElement;
+  expect(tab.hidden).toBe(false);
+  inbox.click();
+  tab.click();
+  expect(openedInbox).toBe(1);
+  expect(openedTab).toBe(1);
 });
 
 test("lists an institutional sign-in by paper title and focuses its existing handoff", async () => {
