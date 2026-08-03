@@ -432,7 +432,7 @@ func newActionsCommand(opt *options) *cobra.Command {
 			"An action queued long enough to look abandoned is reported stale — " +
 			"`age_seconds` and `stale` in --json, a trailing marker in the text " +
 			"listing — against the configured actions.stale_after_seconds. " +
-			"Staleness is a label and nothing else: papio never cancels a handoff " +
+			"Staleness is a label and nothing else: no handoff is ever cancelled " +
 			"on a timer, because giving up on an acquisition is your call.",
 		Annotations: map[string]string{"mcp:read-only": "true"},
 		Args:        cobra.NoArgs,
@@ -853,9 +853,9 @@ func newArtifactsCommand(opt *options) *cobra.Command {
 			"that obtained the same bytes (ADR-0007). This is the per-job evidence:\n" +
 			"the payload gate, the structural parse, text extraction, and the\n" +
 			"identity decision, each with the reasons and capability evidence behind\n" +
-			"it, for the candidates papio kept AND the ones it rejected.\n\n" +
+			"it, for the candidates that were kept AND the ones that were rejected.\n\n" +
 			"Each report is a versioned document (validation-report/1). A job\n" +
-			"validated before papio began recording evidence lists no reports; that\n" +
+			"validated before this evidence was recorded lists no reports; that\n" +
 			"is an absence, not an empty verdict.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {

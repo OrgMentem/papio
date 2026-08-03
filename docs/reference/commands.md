@@ -101,7 +101,7 @@ List open human actions
 
 List open human actions.
 
-An action queued long enough to look abandoned is reported stale — `age_seconds` and `stale` in --json, a trailing marker in the text listing — against the configured actions.stale_after_seconds. Staleness is a label and nothing else: papio never cancels a handoff on a timer, because giving up on an acquisition is your call.
+An action queued long enough to look abandoned is reported stale — `age_seconds` and `stale` in --json, a trailing marker in the text listing — against the configured actions.stale_after_seconds. Staleness is a label and nothing else: no handoff is ever cancelled on a timer, because giving up on an acquisition is your call.
 
 ```
 papio actions list [flags]
@@ -224,10 +224,10 @@ which is all it can return, because an artifact belongs to every job
 that obtained the same bytes (ADR-0007). This is the per-job evidence:
 the payload gate, the structural parse, text extraction, and the
 identity decision, each with the reasons and capability evidence behind
-it, for the candidates papio kept AND the ones it rejected.
+it, for the candidates that were kept AND the ones that were rejected.
 
 Each report is a versioned document (validation-report/1). A job
-validated before papio began recording evidence lists no reports; that
+validated before this evidence was recorded lists no reports; that
 is an absence, not an empty verdict.
 
 ```
