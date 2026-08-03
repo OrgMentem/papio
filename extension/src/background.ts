@@ -75,7 +75,11 @@ const MIN_DAEMON_VERSION = "0.9.0";
 
 const AUTH_EVIDENCE_TTL_MS = 30 * 60_000;
 const QUEUED_HANDOFF_RELEASE_MS = 45_000;
-// A provider page can classify `unknown` transiently: its adapter selectors
+/** At most two papio-created handoff tabs may be driving at once. The queue
+ * below is intentionally worker-local: a service-worker restart may drop it,
+ * and daemon re-offers recover any accepted job that was waiting for a tab. */
+const HANDOFF_DRIVE_LIMIT = 2;
+const HANDOFF_DRIVE_TIMEOUT_MS = 3 * 60_000;
 // (custom elements, React roots) upgrade after the tab reports complete and
 // after the SSO landing. Re-drive the idempotent classify path on a bounded
 // schedule so a slow render still reaches a decisive verdict.
@@ -84,6 +88,39 @@ const MAX_CLASSIFY_RETRIES = 8;
 // A challenge holds only its provider's queue for the same one minute the old
 // bounded challenge probe used, then a fresh drain can reclaim it.
 const PROVIDER_DRAIN_LEASE_MS = 24 * CLASSIFY_RETRY_MS;
+/** Security checks and redirect-loop dead ends cool a provider for ten minutes
+ * so an automated re-offer cannot immediately trip the same hardening again. */
+const CHALLENGE_COOLDOWN_MS = 10 * 60_000;
+const PROVIDER_MULTI_LABEL_SUFFIXES: Record<string, true> = {
+  "ac.uk": true,
+  "co.uk": true,
+  "com.au": true,
+  "com.br": true,
+  "com.cn": true,
+  "com.mx": true,
+  "co.jp": true,
+  "co.nz": true,
+  "edu.au": true,
+  "gov.au": true,
+  "gov.uk": true,
+  "govt.nz": true,
+  "net.au": true,
+  "ne.jp": true,
+  "org.au": true,
+  "org.nz": true,
+  "or.jp": true,
+};
+
+export type ChallengeBlockKind = "cloudflare" | "redirect_loop";
+
+/** Canonical provider key: registrable hostname only, never a path or IdP. */
+export function registrableProviderHost(host: string): string | undefined {
+  const labels = host.toLowerCase().split(".").filter(Boolean);
+  if (labels.length < 2 || labels.some((label) => !/^[a-z0-9-]+$/.test(label))) return undefined;
+  const suffix = labels.slice(-2).join(".");
+  const count = PROVIDER_MULTI_LABEL_SUFFIXES[suffix] === true ? 3 : 2;
+  return labels.slice(-count).join(".");
+}
 // A job whose warm SSO session cannot complete human authentication would
 // otherwise be re-driven on every daemon re-offer and worker spin-up forever,
 // thrashing the provider (repeat navigations trip bot walls) and burning the
@@ -142,6 +179,8 @@ export interface BadgeState {
   connectionStatus: StoreShape["connectionStatus"];
   reauthNeeded: boolean;
   authBlockers: number;
+  /** Number of active jobs left on a provider security check/dead-end page. */
+  challengeBlocked?: number;
   blockedHosts: number | readonly string[];
   ungrantedResolvers: number;
   triageCount: number | undefined;
@@ -155,13 +194,16 @@ export interface BadgeResult {
 
 /** Compute the one toolbar badge used by every background subsystem.
  * Precedence is documented and intentional: disconnected daemon (gray) >
- * reauthentication (orange) > sign-in blockers (orange) > blocked providers
- * (orange) > resolver grants (blue) > triage (blue) > blank. */
+ * reauthentication (orange) > sign-in blockers (orange) > challenge-blocked
+ * jobs (orange) > blocked providers (orange) > resolver grants (blue) >
+ * triage (blue) > blank. */
 export function computeBadge(state: BadgeState): BadgeResult {
   const blockedHostCount =
     typeof state.blockedHosts === "number"
       ? Math.max(0, Math.trunc(state.blockedHosts))
       : state.blockedHosts.length;
+  const challengeBlockedCount =
+    typeof state.challengeBlocked === "number" ? Math.max(0, Math.trunc(state.challengeBlocked)) : 0;
   const authBlockerCount = Math.max(0, Math.trunc(state.authBlockers));
   const resolverCount = Math.max(0, Math.trunc(state.ungrantedResolvers));
   const triageCount =
@@ -179,6 +221,13 @@ export function computeBadge(state: BadgeState): BadgeResult {
       text: String(authBlockerCount),
       color: "#b06000",
       tooltip: `Papio: ${authBlockerCount} paper${authBlockerCount === 1 ? "" : "s"} waiting on your institution sign-in`,
+    };
+  }
+  if (challengeBlockedCount > 0) {
+    return {
+      text: String(challengeBlockedCount),
+      color: "#b06000",
+      tooltip: `Papio: ${challengeBlockedCount} security check${challengeBlockedCount === 1 ? "" : "s"} need your attention`,
     };
   }
   if (blockedHostCount > 0) {
@@ -223,24 +272,74 @@ export function needsVisibleWindow(spec: AdapterSpec | undefined): boolean {
   return spec?.requiresVisible === true;
 }
 
+export type DrivenPageAssessmentKind = "normal" | "challenge" | "redirect_loop";
+export interface DrivenPageAssessment {
+  kind: DrivenPageAssessmentKind;
+}
+
 /**
- * Keep bot-check detection structural: Cloudflare localizes its copy, while
- * these live-page markers survive both translation and fixture sanitization.
- *
- * SERIALIZATION CONTRACT: this must remain self-contained because
- * chrome.scripting serializes it into the provider page.
+ * Cloudflare/Turnstile marker probe. Keep this function self-contained:
+ * chrome.scripting serializes it into the provider page's isolated world.
+ * Only bounded structural markers and page-authored text are inspected; no
+ * page text is returned to the extension.
  */
 export function isBotChallenge(doc: Document | null): boolean {
   const root: Document = doc ?? document;
-  return (
+  const title = (root.title ?? "").trim().slice(0, 256);
+  const text = (root.body?.textContent ?? "").slice(0, 40_000);
+  const structural =
     root.querySelector(
       'script[src*="/cdn-cgi/challenge-platform/"], ' +
         'script[src*="challenges.cloudflare.com/turnstile/"], ' +
         'input[name="cf-turnstile-response"], ' +
-        '[id^="cf-chl-"], ' +
+        '#challenge-form, .cf-turnstile, [id*="cf-chl-"], [class*="cf-chl-"], ' +
         '#captcha-box .main-wrapper[role="main"]',
-    ) !== null
+    ) !== null;
+  return (
+    structural ||
+    /are\s+you\s+a\s+robot\??/i.test(title) ||
+    /verify\s+you\s+are\s+human/i.test(`${title}\n${text}`)
   );
+}
+
+/** OpenAthens and browser redirect-loop dead ends remain human-visible. */
+export function isRedirectLoopPage(doc: Document | null): boolean {
+  const root: Document = doc ?? document;
+  const title = (root.title ?? "").trim().slice(0, 256);
+  const text = (root.body?.textContent ?? "").slice(0, 40_000);
+  return /\btoo\s+many\s+redirects\b|\berr_too_many_redirects\b|\bredirect\s+loop\b/i.test(
+    `${title}\n${text}`,
+  );
+}
+
+/**
+ * Single bounded assessment injected before adapter interpretation. It keeps
+ * challenge/error pages from being mistaken for articles or login forms.
+ * Do not reference outer functions: this body is serialized by Chrome.
+ */
+export function assessDrivenPage(doc: Document | null): DrivenPageAssessment {
+  const root: Document = doc ?? document;
+  const title = (root.title ?? "").trim().slice(0, 256);
+  const text = (root.body?.textContent ?? "").slice(0, 40_000);
+  const structural =
+    root.querySelector(
+      'script[src*="/cdn-cgi/challenge-platform/"], ' +
+        'script[src*="challenges.cloudflare.com/turnstile/"], ' +
+        'input[name="cf-turnstile-response"], ' +
+        '#challenge-form, .cf-turnstile, [id*="cf-chl-"], [class*="cf-chl-"], ' +
+        '#captcha-box .main-wrapper[role="main"]',
+    ) !== null;
+  if (
+    structural ||
+    /are\s+you\s+a\s+robot\??/i.test(title) ||
+    /verify\s+you\s+are\s+human/i.test(`${title}\n${text}`)
+  ) {
+    return { kind: "challenge" };
+  }
+  if (/\btoo\s+many\s+redirects\b|\berr_too_many_redirects\b|\bredirect\s+loop\b/i.test(`${title}\n${text}`)) {
+    return { kind: "redirect_loop" };
+  }
+  return { kind: "normal" };
 }
 
 
@@ -408,10 +507,6 @@ export interface BridgeDeps {
      * background window never accumulates across handoffs. */
     remove(windowID: number): Promise<void>;
   };
-  /** chrome.tabGroups seam. Present when tab-group handoff mode is available:
-   * Chrome, and Firefox 139+ with the tabGroups permission. Absent on Firefox
-   * < 139 and older Chromium, where tab-group mode falls back to the work
-   * window. */
   tabGroups?: {
     get(groupID: number): Promise<TabGroupInfo>;
     update(
@@ -509,6 +604,17 @@ interface StalledAuthHandoff {
   providerHosts: string[];
   expected?: { title?: string; doi?: string };
   requiresAuth?: boolean;
+}
+interface QueuedHandoffDrive {
+  jobID: string;
+  purpose: ManagedTabPurpose;
+  surfaceFallback?: boolean;
+  focusExisting?: boolean;
+}
+
+interface HandoffDrive {
+  tabID: number;
+  token: object;
 }
 
 type NativeRequestKind = "response" | "transport" | "timeout";
@@ -869,6 +975,10 @@ export class Bridge {
    * so retries of one drive do not spam the daemon. Cleared for a fresh drive
    * and on job removal. */
   private readonly handoffOutcomeSent = new Set<string>();
+  /** Challenge/dead-end browser.error reports are once per active drive. */
+  private readonly challengeBlockedOutcomeSent = new Set<string>();
+  /** Worker-local wakeups complement durable cooldown expiry timestamps. */
+  private readonly challengeCooldownTimers = new Map<string, object>();
   /** Jobs whose work window was already raised for a detected IdP failure this
    * worker lifetime, so a bounded re-drive loop cannot yank focus repeatedly.
    * Cleared on job removal. */
@@ -905,6 +1015,20 @@ export class Bridge {
   private authUnblockedAt: number | null = null;
   /** Atomically reserves the one visible handoff while tabs.create is in flight. */
   private handoffOpening = false;
+  /** FIFO for accepted offers that are waiting only for a governor slot. */
+  private readonly handoffDriveQueue: QueuedHandoffDrive[] = [];
+  private readonly queuedDriveJobIDs = new Set<string>();
+  private readonly handoffDrives = new Map<string, HandoffDrive>();
+  private readonly handoffDriveTimeouts = new Map<string, object>();
+  private handoffDriveDrainChain: Promise<void> = Promise.resolve();
+  /** URLs papio has intentionally opened or navigated for each tracked job.
+   * Used only as a best-effort guard against closing a tab the user reused. */
+  private readonly managedTabURLs = new Map<string, Set<string>>();
+  /** Single reducer state for the papio tab-group's human-attention surface. */
+  private handoffGroupDesiredExpanded = false;
+  private handoffGroupLastStateChangeAt: number | undefined;
+  private handoffGroupUpdateToken: object | undefined;
+  private drainingHandoffDriveQueue = false;
   private drainingQueuedHandoffs = false;
   /** Callers that arrive while the single queue drain is opening a tab wait for
    * that drain to settle before inspecting the job's resulting tab. */
@@ -931,6 +1055,12 @@ export class Bridge {
   /** Serializes the complete managed-tab reuse/create decision, so concurrent
    * inbox clicks or re-offers cannot both observe an empty candidate set. */
   private managedTabChain: Promise<unknown> = Promise.resolve();
+  /** Coalesce concurrent inbox clicks for one job so one request owns the
+   * managed-tab focus/open choreography and all callers receive its result. */
+  private readonly openHandoffRequests = new Map<
+    string,
+    Promise<BrokerReply<{ opened: true }>>
+  >();
   /** Jobs already reported human_auth_required this worker lifetime, so a capped
    * job refreshes the daemon's human action at most once per spin-up. */
   private readonly authStalledReported = new Set<string>();
@@ -989,6 +1119,10 @@ export class Bridge {
 
   stalledAuthJobIDs(): string[] {
     return [...this.authStalledReported];
+  }
+
+  challengeBlockedJobCount(): number {
+    return this.store.activeJobs.filter((job) => job.challenge_blocked === true).length;
   }
 
   attachKeepalive(manager: KeepaliveManager): void {
@@ -1083,6 +1217,27 @@ export class Bridge {
       return this.failure("handoff_unavailable", "This authentication stall is no longer available");
     }
     await this.update((s) => this.clearAuthAttempts(s, jobID));
+    if (!this.handoffDrives.has(jobID) && this.handoffDrives.size >= HANDOFF_DRIVE_LIMIT) {
+      const now = this.deps.now();
+      await this.upsertJobWithOffer(
+        {
+          job_id: jobID,
+          tab_id: current?.tab_id ?? -1,
+          offered_at: now,
+          expires_at: now,
+          status: "accepted",
+          provider_hosts: [...saved.providerHosts],
+          ...(saved.requiresAuth !== undefined ? { requires_auth: saved.requiresAuth } : {}),
+        },
+        saved.url,
+      );
+      this.enqueueHandoffDrive({ jobID, purpose: "redrive", focusExisting: false });
+      this.authStalledReported.delete(jobID);
+      this.stalledAuthHandoffs.delete(jobID);
+      this.send("job_accept", {}, jobID);
+      await this.drainHandoffDriveQueue();
+      return { ok: true, opened: true };
+    }
     let tabID: number | undefined;
     try {
       tabID = await this.openManagedTab({
@@ -1097,20 +1252,20 @@ export class Bridge {
       return this.failure("handoff_open_failed", "Could not reopen the institutional handoff");
     }
     this.beginProviderDrive(jobID);
-    this.authStalledReported.delete(jobID);
-    const now = this.deps.now();
+    const openedAt = this.deps.now();
     await this.upsertJobWithOffer(
       {
         job_id: jobID,
         tab_id: tabID,
-        offered_at: now,
-        expires_at: now,
+        offered_at: openedAt,
+        expires_at: openedAt,
         status: "accepted",
         provider_hosts: [...saved.providerHosts],
         ...(saved.requiresAuth !== undefined ? { requires_auth: saved.requiresAuth } : {}),
       },
       saved.url,
     );
+    this.registerHandoffDrive(jobID, tabID);
     this.stalledAuthHandoffs.delete(jobID);
     this.send("job_accept", {}, jobID);
     return { ok: true, opened: true };
@@ -1135,6 +1290,7 @@ export class Bridge {
   private beginProviderDrive(jobID: string): void {
     this.classifyRetries.delete(jobID);
     this.handoffOutcomeSent.delete(`${jobID}:ui_changed`);
+    this.challengeBlockedOutcomeSent.delete(`${jobID}:challenge_blocked`);
   }
 
   /** Chrome answers this origin query from effective access: an all-sites grant
@@ -1186,6 +1342,7 @@ export class Bridge {
       return;
     }
     await this.update((store) => patchJob(store, jobID, { blocked_provider_host: host }));
+    await this.settleHandoffAfterOutcome(jobID);
   }
 
   private async clearBlockedProviderHost(host: string): Promise<boolean> {
@@ -1266,6 +1423,60 @@ export class Bridge {
       return undefined;
     }
   }
+  private rememberManagedTabURL(jobID: string | undefined, url: string | undefined): void {
+    if (jobID === undefined || url === undefined || url.length === 0) return;
+    const known = this.managedTabURLs.get(jobID) ?? new Set<string>();
+    known.add(normalizeManagedTabURL(url));
+    this.managedTabURLs.set(jobID, known);
+  }
+
+  /** A URL is closable only when it still resembles a page papio opened for
+   * this job. A different origin is treated as user navigation and left alone. */
+  private isManagedTabURL(job: ActiveJob, rawURL: string | undefined): boolean {
+    if (rawURL === undefined || rawURL.length === 0) return false;
+    const normalized = normalizeManagedTabURL(rawURL);
+    if (this.managedTabURLs.get(job.job_id)?.has(normalized)) return true;
+    const offered = this.offerURLs.get(job.job_id);
+    if (offered !== undefined && normalizeManagedTabURL(offered) === normalized) return true;
+    try {
+      const current = new URL(rawURL);
+      if (current.hostname === CHROME_PDF_VIEWER_HOST || isAuthenticationURL(rawURL)) return true;
+      if (offered !== undefined && new URL(offered).origin === current.origin) return true;
+      return hostMatches(current.hostname, job.provider_hosts) ||
+        this.deps.adapterSpecs.some((spec) => hostMatches(current.hostname, spec.hosts));
+    } catch {
+      return false;
+    }
+  }
+
+  private async closeManagedHandoffTab(job: ActiveJob, tabID: number): Promise<boolean> {
+    if (tabID < 0) return false;
+    let tab: TabInfo;
+    try {
+      tab = await this.deps.tabs.get(tabID);
+    } catch {
+      return false;
+    }
+    if (tab.id !== tabID || !this.isManagedTabURL(job, tab.url)) return false;
+    const surface = await this.handoffSurface();
+    if (surface === "work-window" && (this.store.workWindowID === undefined || tab.windowId !== this.store.workWindowID)) {
+      return false;
+    }
+    if (surface === "tab-group") {
+      const groupID = tab.groupId;
+      if (groupID === undefined || groupID < 0 || this.deps.tabGroups === undefined) return false;
+      if ((await this.knownHandoffGroup(groupID, tab.windowId)) === undefined) return false;
+    }
+    this.closingTabs.add(tabID);
+    try {
+      await this.deps.tabs.remove(tabID);
+      return true;
+    } catch {
+      this.closingTabs.delete(tabID);
+      return false;
+    }
+  }
+
   /** Route every resolver/provider open through the selected handoff surface,
    * reusing a live tracked job tab; jobless resolver opens use URL equality
    * modulo fragment. Distinct jobs may legitimately share a resolver URL.
@@ -1327,12 +1538,13 @@ export class Bridge {
         // A tab can disappear between lookup and focus; callers still retain
         // the live id and the browser removal path will recover the job.
       }
+      this.rememberManagedTabURL(options.jobId, options.url);
       await this.recordManagedTab(options.jobId, reusable.id);
       return reusable.id;
     }
-
     const tabID = await this.openBrokerTab(options.url, options.surfaceFallback ?? true);
     if (tabID === undefined) return undefined;
+    this.rememberManagedTabURL(options.jobId, options.url);
     await this.recordManagedTab(options.jobId, tabID);
     if (options.purpose === "session-signin") {
       try {
@@ -1353,23 +1565,64 @@ export class Bridge {
     if (job === undefined || job.tab_id === tabID) return;
     await this.update((s) => patchJob(s, jobID, { tab_id: tabID }));
   }
+  private handoffNeedsHumanNow(): boolean {
+    return this.store.activeJobs.some(
+      (job) => job.status === "auth_pending" || job.challenge_blocked === true,
+    );
+  }
+
+  /** Reduce all human-attention signals to one papio-group state. Updates are
+   * trailing-edge debounced so an auth redirect storm cannot thrash expand /
+   * collapse; the first transition is immediate and later transitions are
+   * limited to one browser update per five seconds. */
+  private async reduceHandoffGroupState(tabID?: number): Promise<void> {
+    const tabGroups = this.deps.tabGroups;
+    if (tabGroups === undefined) return;
+    const desiredExpanded = this.handoffNeedsHumanNow();
+    this.handoffGroupDesiredExpanded = desiredExpanded;
+    const groupID = tabID === undefined ? this.store.handoffGroupID : await this.handoffGroupIDForTab(tabID);
+    if (groupID === undefined) return;
+    let current: TabGroupInfo;
+    try {
+      current = await tabGroups.get(groupID);
+    } catch {
+      return;
+    }
+    const desiredCollapsed = !desiredExpanded;
+    if (current.collapsed === desiredCollapsed) return;
+    const elapsed =
+      this.handoffGroupLastStateChangeAt === undefined
+        ? HANDOFF_DRIVE_TIMEOUT_MS
+        : this.deps.now() - this.handoffGroupLastStateChangeAt;
+    if (elapsed < 5_000) {
+      if (this.handoffGroupUpdateToken !== undefined) return;
+      const token = {};
+      this.handoffGroupUpdateToken = token;
+      this.deps.setTimeout(async () => {
+        if (this.handoffGroupUpdateToken !== token) return;
+        this.handoffGroupUpdateToken = undefined;
+        await this.reduceHandoffGroupState(tabID);
+      }, 5_000 - Math.max(0, elapsed));
+      return;
+    }
+    try {
+      await tabGroups.update(groupID, {
+        title: desiredExpanded && tabID !== undefined ? this.handoffGroupTitle(tabID) : HANDOFF_GROUP_TITLE,
+        collapsed: desiredCollapsed,
+      });
+      this.handoffGroupLastStateChangeAt = this.deps.now();
+    } catch {
+      // A vanished group is recreated by the next managed handoff.
+    }
+  }
+
 
   /** Focus a managed tab and, when available, its papio group and containing
    * window. This is intentionally best-effort: focusing is operator UX, not a
    * prerequisite for the daemon handoff. */
   private async focusManagedTab(tabID: number, knownTab?: TabInfo): Promise<void> {
     const tab = knownTab ?? (await this.deps.tabs.get(tabID));
-    const groupID = await this.handoffGroupIDForTab(tabID);
-    if (groupID !== undefined && this.deps.tabGroups !== undefined) {
-      try {
-        await this.deps.tabGroups.update(groupID, {
-          title: this.handoffGroupTitle(tabID),
-          collapsed: false,
-        });
-      } catch {
-        // A vanished group is recreated by the next managed handoff.
-      }
-    }
+    await this.reduceHandoffGroupState(tabID);
     await this.deps.tabs.update?.(tabID, { active: true });
     if (tab.windowId !== undefined && this.deps.windows !== undefined) {
       try {
@@ -1690,11 +1943,7 @@ export class Bridge {
   private async surfaceWorkTab(tabID: number): Promise<void> {
     const groupID = await this.handoffGroupIDForTab(tabID);
     if (groupID !== undefined && this.deps.tabGroups !== undefined) {
-      try {
-        await this.deps.tabGroups.update(groupID, { title: this.handoffGroupTitle(tabID), collapsed: false });
-      } catch {
-        // Group gone; activating the tab below still surfaces it.
-      }
+      await this.reduceHandoffGroupState(tabID);
       try {
         await this.deps.tabs.update?.(tabID, { active: true });
       } catch {
@@ -1728,12 +1977,153 @@ export class Bridge {
     if (groupID === undefined || this.deps.tabGroups === undefined) return false;
     try {
       await this.deps.tabGroups.get(groupID);
-      await this.deps.tabGroups.update(groupID, { title: HANDOFF_GROUP_TITLE, collapsed: true });
+      await this.reduceHandoffGroupState(tabID);
       return true;
     } catch {
       // Group gone; its stored id must not be reused.
       return false;
     }
+  }
+
+  private enqueueHandoffDrive(request: QueuedHandoffDrive): void {
+    if (this.handoffDrives.has(request.jobID) || this.queuedDriveJobIDs.has(request.jobID)) return;
+    if (findByJob(this.store, request.jobID) === undefined) return;
+    this.queuedDriveJobIDs.add(request.jobID);
+    this.handoffDriveQueue.push(request);
+  }
+
+  private releaseHandoffDrive(jobID: string): void {
+    this.handoffDrives.delete(jobID);
+    this.handoffDriveTimeouts.delete(jobID);
+    if (!this.queuedDriveJobIDs.delete(jobID)) return;
+    const index = this.handoffDriveQueue.findIndex((request) => request.jobID === jobID);
+    if (index >= 0) this.handoffDriveQueue.splice(index, 1);
+  }
+
+  private registerHandoffDrive(jobID: string, tabID: number): void {
+    if (this.handoffDrives.has(jobID)) return;
+    const token = {};
+    this.handoffDrives.set(jobID, { tabID, token });
+    this.handoffDriveTimeouts.set(jobID, token);
+    this.deps.setTimeout(async () => {
+      if (this.handoffDriveTimeouts.get(jobID) !== token) return;
+      this.handoffDriveTimeouts.delete(jobID);
+      const current = findByJob(this.store, jobID);
+      if (current !== undefined && current.tab_id === tabID) {
+        await this.update((s) =>
+          patchJob(s, jobID, {
+            status: "auth_pending",
+            auth_started_ms: this.deps.now(),
+          }),
+        );
+        this.send("auth_pending", {}, jobID);
+        await this.closeManagedHandoffTab(current, tabID);
+        await this.update((s) => patchJob(s, jobID, { tab_id: -1 }));
+      }
+      await this.parkHandoffForManual(jobID);
+    }, HANDOFF_DRIVE_TIMEOUT_MS);
+  }
+
+  private async drainHandoffDriveQueueUnlocked(): Promise<void> {
+    while (this.handoffDrives.size < HANDOFF_DRIVE_LIMIT && this.handoffDriveQueue.length > 0) {
+      const request = this.handoffDriveQueue.shift();
+      if (request === undefined) return;
+      this.queuedDriveJobIDs.delete(request.jobID);
+      const job = findByJob(this.store, request.jobID);
+      if (job === undefined) continue;
+      let tabID = job.tab_id >= 0 ? job.tab_id : undefined;
+      if (tabID !== undefined) {
+        try {
+          const live = await this.deps.tabs.get(tabID);
+          if (live.id !== tabID) tabID = undefined;
+        } catch {
+          tabID = undefined;
+        }
+      }
+      const url = this.offerURLs.get(request.jobID);
+      if (tabID !== undefined && request.purpose === "redrive" && url !== undefined && this.deps.tabs.update !== undefined) {
+        try {
+          await this.deps.tabs.update(tabID, { url });
+        } catch {
+          tabID = undefined;
+        }
+      }
+      if (tabID === undefined && url === undefined) {
+        this.send("job_reject", {}, request.jobID);
+        await this.removeJobWithOffer(request.jobID);
+        continue;
+      }
+      if (tabID === undefined && url !== undefined) {
+        try {
+          tabID = await this.openManagedTab({
+            url,
+            jobId: request.jobID,
+            purpose: request.purpose,
+            ...(request.surfaceFallback !== undefined ? { surfaceFallback: request.surfaceFallback } : {}),
+            ...(request.focusExisting !== undefined ? { focusExisting: request.focusExisting } : {}),
+          });
+        } catch (error) {
+          console.error("papio: queued handoff tab creation failed", error);
+        }
+      }
+      if (tabID === undefined) {
+        this.send("job_reject", {}, request.jobID);
+        await this.removeJobWithOffer(request.jobID);
+        continue;
+      }
+      this.beginProviderDrive(request.jobID);
+      await this.update((s) =>
+        patchJob(s, request.jobID, {
+          tab_id: tabID,
+          status: "accepted",
+          download_initiated: false,
+          unknown_count: 0,
+        }),
+      );
+      this.registerHandoffDrive(request.jobID, tabID);
+      if (request.surfaceFallback === true) await this.surfaceWorkTab(tabID);
+    }
+  }
+
+  private async drainHandoffDriveQueue(): Promise<void> {
+    const queued = this.handoffDriveDrainChain.then(async () => {
+      this.drainingHandoffDriveQueue = true;
+      try {
+        await this.drainHandoffDriveQueueUnlocked();
+      } finally {
+        this.drainingHandoffDriveQueue = false;
+      }
+    });
+    this.handoffDriveDrainChain = queued.catch(() => undefined);
+    await queued;
+  }
+
+  /** A challenge/auth stall leaves the exact page available to the operator,
+   * but it is no longer an automated drive and therefore frees one governor
+   * slot. */
+  async parkHandoffForManual(jobID: string): Promise<void> {
+    await this.ready;
+    const job = findByJob(this.store, jobID);
+    this.releaseHandoffDrive(jobID);
+    if (job !== undefined && job.tab_id >= 0) await this.reduceHandoffGroupState(job.tab_id);
+    await this.drainHandoffDriveQueue();
+    await this.releaseQueuedHandoffs();
+  }
+
+  /** Reclaim a slot after the operator completes a challenge on the same tab.
+   * No navigation occurs here; the next page update drives normal assessment. */
+  async resumeHandoffAfterManual(jobID: string): Promise<void> {
+    await this.ready;
+    const job = findByJob(this.store, jobID);
+    if (job === undefined || job.tab_id < 0) return;
+    if (!this.handoffDrives.has(jobID)) {
+      if (this.handoffDrives.size >= HANDOFF_DRIVE_LIMIT) {
+        this.enqueueHandoffDrive({ jobID, purpose: "handoff", focusExisting: false });
+      } else {
+        this.registerHandoffDrive(jobID, job.tab_id);
+      }
+    }
+    await this.drainHandoffDriveQueue();
   }
 
   /** Keepalive must preserve an institutional session, not follow whichever
@@ -1795,6 +2185,7 @@ export class Bridge {
         connectionStatus: status,
         reauthNeeded: this.keepaliveReauthNeeded,
         authBlockers: this.signInBlockerCount(),
+        challengeBlocked: this.challengeBlockedJobCount(),
         blockedHosts: blockedProviderHosts,
         ungrantedResolvers: ungrantedResolverOrigins,
         triageCount: this.triagePendingCount,
@@ -1835,9 +2226,22 @@ export class Bridge {
     this.deps.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: KEEPALIVE_ALARM_MINUTES });
     await this.ready;
     await this.restoreProviderDrainLeaseTimers();
+    await this.restoreChallengeCooldownTimers();
+    // Reconcile persisted papio groups before any new fold can race the
+    // startup repair and multiply groups in the same browser window.
     await this.reconcileHandoffGroups();
     await this.syncConnectionBadge();
     await this.reconcileTabs();
+    for (const job of this.store.activeJobs) {
+      if (
+        this.handoffDrives.size >= HANDOFF_DRIVE_LIMIT ||
+        job.tab_id < 0 ||
+        (job.status !== "accepted" && job.status !== "auth_pending" && job.status !== "awaiting_download")
+      ) {
+        continue;
+      }
+      this.registerHandoffDrive(job.job_id, job.tab_id);
+    }
     await this.redrivePendingTermsGates();
     for (const job of this.store.activeJobs) {
       if (job.status === "queued") this.scheduleQueuedHandoffRelease(job.job_id);
@@ -1897,7 +2301,7 @@ export class Bridge {
             ...(job.requires_auth !== undefined ? { requiresAuth: job.requires_auth } : {}),
           });
         }
-        this.reportAuthStalled(job.job_id);
+        await this.reportAuthStalled(job.job_id);
         await this.removeJobWithOffer(job.job_id);
         continue;
       }
@@ -1922,12 +2326,9 @@ export class Bridge {
     if (!job) return;
     this.send("provider_outcome", { outcome: "cancelled" }, jobID);
     if (job.tab_id >= 0) {
-      this.closingTabs.add(job.tab_id);
-      try {
-        await this.deps.tabs.remove(job.tab_id);
-      } catch {
-        // Tab may already be gone; the outcome frame is what matters.
-      }
+      await this.closeManagedHandoffTab(job, job.tab_id);
+    } else {
+      this.releaseHandoffDrive(jobID);
     }
     this.downloads.delete(jobID);
     this.completedDownloadTabs.delete(jobID);
@@ -2136,13 +2537,24 @@ export class Bridge {
     }
     await this.deps.tabs.create({ url: inboxURL, active: true });
   }
-
-  /**
-   * Surface the browser-owned handoff already offered for an inbox row. This
+  /** Surface the browser-owned handoff already offered for an inbox row. This
    * boundary accepts only a job id: provider/resolver URLs remain local to the
-   * extension and are never returned to the caller.
-   */
+   * extension and are never returned to the caller. */
   async openHandoff(jobID: string): Promise<BrokerReply<{ opened: true }>> {
+    const pending = this.openHandoffRequests.get(jobID);
+    if (pending !== undefined) return pending;
+    const request = this.openHandoffUnlocked(jobID);
+    this.openHandoffRequests.set(jobID, request);
+    try {
+      return await request;
+    } finally {
+      if (this.openHandoffRequests.get(jobID) === request) {
+        this.openHandoffRequests.delete(jobID);
+      }
+    }
+  }
+
+  private async openHandoffUnlocked(jobID: string): Promise<BrokerReply<{ opened: true }>> {
     await this.ready;
     let job = findByJob(this.store, jobID);
     if (job === undefined || !this.offerURLs.has(jobID)) {
@@ -2176,8 +2588,15 @@ export class Bridge {
       await this.focusManagedTab(job.tab_id);
       return { ok: true, opened: true };
     }
-    if (job === undefined || !this.offerURLs.has(jobID)) {
-      return this.failure("handoff_open_failed", "The offered handoff could not be opened");
+    if (job.tab_id < 0) {
+      this.enqueueHandoffDrive({ jobID, purpose: "inbox-open" });
+      await this.drainHandoffDriveQueue();
+      job = findByJob(this.store, jobID);
+      if (job !== undefined && job.tab_id >= 0) {
+        await this.focusManagedTab(job.tab_id);
+        return { ok: true, opened: true };
+      }
+      return this.failure("handoff_queued", "The handoff is waiting for an available browser slot");
     }
     const openurl = this.offerURLs.get(jobID);
     if (openurl === undefined) {
@@ -2198,6 +2617,7 @@ export class Bridge {
       : { ok: true, opened: true };
   }
 
+
   /** A daemon-directed retry may refresh an expired authentication exchange;
    * the inbox and popup retain focus-only behavior so they cannot disrupt a
    * provider page that is already downloading. */
@@ -2212,7 +2632,7 @@ export class Bridge {
         needsFreshResolver =
           job.status === "auth_pending" || (typeof tab.url === "string" && isAuthenticationURL(tab.url));
       } catch {
-        // The focus path below returns the local missing-tab outcome.
+        // A missing tab is handled by the focus/open fallback below.
       }
       if (needsFreshResolver) {
         const reopened = await this.openManagedTab({
@@ -2220,7 +2640,12 @@ export class Bridge {
           jobId: jobID,
           purpose: "redrive",
         });
-        if (reopened !== undefined) return;
+        if (reopened !== undefined) {
+          if (!this.handoffDrives.has(jobID) && this.handoffDrives.size < HANDOFF_DRIVE_LIMIT) {
+            this.registerHandoffDrive(jobID, reopened);
+          }
+          return;
+        }
       }
     }
     await this.openHandoff(jobID);
@@ -2789,6 +3214,8 @@ export class Bridge {
   private async removeJobWithOffer(jobID: string): Promise<void> {
     const job = findByJob(this.store, jobID);
     const providerKey = job === undefined ? undefined : this.providerKeyForJob(job);
+    this.releaseHandoffDrive(jobID);
+    this.managedTabURLs.delete(jobID);
     this.deliveryJobs.delete(jobID);
     this.resolverRoutes.delete(jobID);
     this.deliverySessionEvidence.delete(jobID);
@@ -2801,6 +3228,7 @@ export class Bridge {
     this.handoffOutcomeSent.delete(`${jobID}:stale_sso`);
     this.handoffOutcomeSent.delete(`${jobID}:auth_error`);
     this.handoffOutcomeSent.delete(`${jobID}:ui_changed`);
+    this.challengeBlockedOutcomeSent.delete(`${jobID}:challenge_blocked`);
     this.authFailureSurfaced.delete(jobID);
     this.staleRecoveryEpochs.delete(jobID);
     this.staleRecoveryAttemptedEpochs.delete(jobID);
@@ -2816,6 +3244,7 @@ export class Bridge {
     if (providerKey !== undefined) await this.releaseProviderDrainWhenUnused(providerKey);
     await this.closeWorkWindowIfIdle();
     await this.dropStaleHandoffGroup();
+    if (!this.drainingHandoffDriveQueue) await this.drainHandoffDriveQueue();
   }
 
   /** Close papio's dedicated work window once no handoff owns a broker tab in
@@ -2842,6 +3271,12 @@ export class Bridge {
       return;
     }
     if ((win.tabs ?? []).some((tab) => tab.pinned === true)) return;
+    const trackedTabIDs = new Set(
+      this.store.activeJobs.filter((job) => job.tab_id >= 0).map((job) => job.tab_id),
+    );
+    if ((win.tabs ?? []).some((tab) => tab.id !== undefined && tab.pinned !== true && !trackedTabIDs.has(tab.id))) {
+      return;
+    }
     try {
       await windows.remove(windowID);
     } catch {
@@ -2908,10 +3343,12 @@ export class Bridge {
   /** Report the human authentication step for a capped job, at most once per
    * worker lifetime. human_auth_required is non-terminal daemon-side: the job
    * stays parked (awaiting_human) and is re-offered on a future warm launch. */
-  private reportAuthStalled(jobID: string): void {
-    if (this.authStalledReported.has(jobID)) return;
-    this.authStalledReported.add(jobID);
-    this.send("provider_outcome", { outcome: "human_auth_required" }, jobID);
+  private async reportAuthStalled(jobID: string): Promise<void> {
+    if (!this.authStalledReported.has(jobID)) {
+      this.authStalledReported.add(jobID);
+      this.send("provider_outcome", { outcome: "human_auth_required" }, jobID);
+    }
+    await this.parkHandoffForManual(jobID);
   }
 
   /** Clear a job's auth-failure budget once a real download proves the session
@@ -2949,6 +3386,148 @@ export class Bridge {
   private providerKeyForJob(job: ActiveJob): string {
     return this.providerKeyForHosts(job.provider_hosts);
   }
+  private challengeHostsFor(providerHosts: readonly string[]): string[] {
+    return [
+      ...new Set(
+        providerHosts
+          .map((host) => registrableProviderHost(host))
+          .filter((host): host is string => host !== undefined),
+      ),
+    ];
+  }
+
+  private challengeCooldownActiveForHosts(providerHosts: readonly string[]): boolean {
+    const now = this.deps.now();
+    return this.challengeHostsFor(providerHosts).some((host) => {
+      const expiresAt = this.store.challengeCooldowns?.[host];
+      return typeof expiresAt === "number" && Number.isFinite(expiresAt) && expiresAt > now;
+    });
+  }
+
+  private async expireChallengeCooldowns(): Promise<string[]> {
+    const now = this.deps.now();
+    const expired = Object.entries(this.store.challengeCooldowns ?? {})
+      .filter(([host, expiresAt]) => registrableProviderHost(host) !== host || !Number.isFinite(expiresAt) || expiresAt <= now)
+      .map(([host]) => host);
+    if (expired.length === 0) return expired;
+    await this.update((store) => {
+      const challengeCooldowns = { ...(store.challengeCooldowns ?? {}) };
+      for (const host of expired) delete challengeCooldowns[host];
+      return { ...store, challengeCooldowns };
+    });
+    for (const host of expired) this.challengeCooldownTimers.delete(host);
+    return expired;
+  }
+
+  private scheduleChallengeCooldownExpiry(host: string, expiresAt: number): void {
+    const token = {};
+    this.challengeCooldownTimers.set(host, token);
+    this.deps.setTimeout(async () => {
+      if (this.challengeCooldownTimers.get(host) !== token) return;
+      await this.ready;
+      const expired = await this.expireChallengeCooldowns();
+      if (!expired.includes(host)) return;
+      await this.releaseQueuedHandoffs();
+      await this.syncConnectionBadge();
+    }, Math.max(0, expiresAt - this.deps.now()));
+  }
+
+  private async restoreChallengeCooldownTimers(): Promise<void> {
+    await this.expireChallengeCooldowns();
+    for (const [host, expiresAt] of Object.entries(this.store.challengeCooldowns ?? {})) {
+      if (registrableProviderHost(host) === host && expiresAt > this.deps.now()) {
+        this.scheduleChallengeCooldownExpiry(host, expiresAt);
+      }
+    }
+  }
+  private challengeHostFor(job: ActiveJob, currentHost: string, currentURL?: string): string | undefined {
+    const declaredHosts = this.challengeHostsFor(job.provider_hosts);
+    if (currentURL !== undefined && isAuthenticationURL(currentURL)) return declaredHosts[0];
+    const current = registrableProviderHost(currentHost);
+    if (current === undefined) return declaredHosts[0];
+    if (
+      hostMatches(currentHost, job.provider_hosts) ||
+      this.deps.adapterSpecs.some((spec) => hostMatches(currentHost, spec.hosts))
+    ) {
+      return current;
+    }
+    return declaredHosts[0];
+  }
+
+  private async blockChallenge(
+    job: ActiveJob,
+    currentHost: string,
+    kind: ChallengeBlockKind,
+    currentURL?: string,
+  ): Promise<void> {
+    const providerHost = this.challengeHostFor(job, currentHost, currentURL);
+    if (providerHost === undefined) return;
+    const now = this.deps.now();
+    const alreadyBlocked =
+      job.challenge_blocked === true &&
+      job.challenge_host === providerHost &&
+      job.challenge_kind === kind;
+    const expiresAt = now + CHALLENGE_COOLDOWN_MS;
+    await this.update((store) => ({
+      ...patchJob(store, job.job_id, {
+        challenge_blocked: true,
+        challenge_host: providerHost,
+        challenge_kind: kind,
+        challenge_blocked_at: now,
+        unknown_count: 0,
+      }),
+      challengeCooldowns: {
+        ...(store.challengeCooldowns ?? {}),
+        [providerHost]: expiresAt,
+      },
+    }));
+    this.scheduleChallengeCooldownExpiry(providerHost, expiresAt);
+    const outcomeKey = `${job.job_id}:challenge_blocked`;
+    if (!alreadyBlocked && !this.challengeBlockedOutcomeSent.has(outcomeKey)) {
+      if (
+        this.send(
+          "error",
+          {
+            code: "challenge_blocked",
+            message: "Provider security check or redirect loop needs human attention",
+          },
+          job.job_id,
+        )
+      ) {
+        this.challengeBlockedOutcomeSent.add(outcomeKey);
+      }
+    }
+    if (!alreadyBlocked) await this.parkProviderDrain(job);
+    await this.parkHandoffForManual(job.job_id);
+    await this.syncConnectionBadge();
+  }
+
+  private async clearChallengeBlock(job: ActiveJob): Promise<void> {
+    if (job.challenge_blocked !== true) return;
+    const providerHost = job.challenge_host;
+    await this.update((store) => {
+      const activeJobs = store.activeJobs.map((candidate) => {
+        if (candidate.job_id !== job.job_id) return candidate;
+        const next = { ...candidate };
+        delete next.challenge_blocked;
+        delete next.challenge_host;
+        delete next.challenge_kind;
+        delete next.challenge_blocked_at;
+        return next;
+      });
+      const challengeCooldowns = { ...(store.challengeCooldowns ?? {}) };
+      if (providerHost !== undefined) delete challengeCooldowns[providerHost];
+      return { ...store, activeJobs, challengeCooldowns };
+    });
+    if (providerHost !== undefined) this.challengeCooldownTimers.delete(providerHost);
+    this.challengeBlockedOutcomeSent.delete(`${job.job_id}:challenge_blocked`);
+    await this.clearProviderDrainPark(this.providerKeyForJob(job));
+    await this.resumeHandoffAfterManual(job.job_id);
+    await this.releaseQueuedHandoffs();
+    await this.syncConnectionBadge();
+  }
+
+
 
   private currentProviderDrainLease(providerKey: string): ProviderDrainLease | undefined {
     const lease = this.store.providerDrainLeases?.[providerKey];
@@ -3315,6 +3894,7 @@ export class Bridge {
       const forced = findByJob(this.store, fallbackJobID);
       if (forced !== undefined) await this.clearProviderDrainPark(this.providerKeyForJob(forced));
     }
+    await this.drainHandoffDriveQueue();
     if (!this.hasAuthEvidence() && !this.openAccessLandingObserved && this.pendingForcedReleases.size === 0) {
       return;
     }
@@ -3325,14 +3905,18 @@ export class Bridge {
     this.drainingQueuedHandoffs = true;
     try {
       await this.expireProviderDrainLeases();
+      await this.expireChallengeCooldowns();
       // One loop opens at most one unclassified handoff per provider. A lease
       // stays with that tab until it proves normal, becomes a challenge park,
-      // or expires, while other provider groups keep making progress.
-      while (this.hasAuthEvidence() || this.openAccessLandingObserved || this.pendingForcedReleases.size > 0) {
+      while (
+        this.handoffDrives.size < HANDOFF_DRIVE_LIMIT &&
+        (this.hasAuthEvidence() || this.openAccessLandingObserved || this.pendingForcedReleases.size > 0)
+      ) {
         let selected = this.store.activeJobs.find(
           (job) =>
             job.status === "queued" &&
             this.hasHandoffReleaseEvidence(job.requires_auth) &&
+            !this.challengeCooldownActiveForHosts(job.provider_hosts) &&
             !this.hasActiveProviderDrainLease(job),
         );
         let forcedJobID: string | undefined;
@@ -3343,6 +3927,7 @@ export class Bridge {
               this.pendingForcedReleases.delete(jobID);
               continue;
             }
+            if (this.challengeCooldownActiveForHosts(candidate.provider_hosts)) continue;
             if (this.hasActiveProviderDrainLease(candidate)) continue;
             selected = candidate;
             forcedJobID = jobID;
@@ -3392,6 +3977,7 @@ export class Bridge {
               unknown_count: 0,
             }),
           );
+          this.registerHandoffDrive(queued.job_id, tabID);
           if (queued.requires_auth === true) {
             this.authUnblockedCount += 1;
             this.authUnblockedAt = this.deps.now();
@@ -3594,6 +4180,7 @@ export class Bridge {
     const providerHosts = hostsRaw.filter((h): h is string => typeof h === "string");
     const providerKey = this.providerKeyForHosts(providerHosts);
     const providerParked = this.currentProviderDrainLease(providerKey)?.parkedReason === "challenge";
+    const challengeCooldown = this.challengeCooldownActiveForHosts(providerHosts);
     const expected = parseExpected(p["expected"]);
     const requiresAuth = typeof p["requires_auth"] === "boolean" ? p["requires_auth"] : undefined;
     const loginEntityID = p["login_entity_id"];
@@ -3656,7 +4243,7 @@ export class Bridge {
           this.downloads.delete(jobID);
           await this.removeJobWithOffer(jobID);
         } else if (priorOfferURL === openurl) {
-          if (providerParked) {
+          if (providerParked || challengeCooldown) {
             await this.update((s) => patchJob(s, jobID, { handoffAckPending: true }));
             this.scheduleQueuedHandoffRelease(jobID);
             return;
@@ -3684,9 +4271,16 @@ export class Bridge {
           live = false;
         }
         if (live && (priorOfferURL === undefined || priorOfferURL === openurl)) {
-          if (providerParked) {
+          if (providerParked || challengeCooldown) {
             await this.update((s) => patchJob(s, jobID, { handoffAckPending: true }));
             return;
+          }
+          if (!this.handoffDrives.has(jobID)) {
+            if (this.handoffDrives.size >= HANDOFF_DRIVE_LIMIT) {
+              this.enqueueHandoffDrive({ jobID, purpose: "reoffer", focusExisting: false });
+            } else {
+              this.registerHandoffDrive(jobID, existing.tab_id);
+            }
           }
           if (existing.handoffAckPending === true) {
             await this.acknowledgePendingProviderHandoffs(providerKey);
@@ -3698,6 +4292,7 @@ export class Bridge {
         if (
           live &&
           !providerParked &&
+          !challengeCooldown &&
           !(isDirectFileOffer(openurl) && requiresAuth !== true)
         ) {
           if (this.authAttemptsFor(jobID) >= MAX_AUTH_ATTEMPTS) {
@@ -3707,7 +4302,25 @@ export class Bridge {
               ...(expected !== undefined ? { expected } : {}),
               ...(requiresAuth !== undefined ? { requiresAuth } : {}),
             });
-            this.reportAuthStalled(jobID);
+            await this.reportAuthStalled(jobID);
+            return;
+          }
+          if (this.handoffDrives.size >= HANDOFF_DRIVE_LIMIT && !this.handoffDrives.has(jobID)) {
+            await this.upsertJobWithOffer(
+              {
+                ...existing,
+                offered_at: this.deps.now(),
+                status: "accepted",
+                provider_hosts: providerHosts,
+              },
+              openurl,
+            );
+            this.enqueueHandoffDrive({ jobID, purpose: "reoffer", focusExisting: false });
+            if (existing.handoffAckPending === true) {
+              await this.acknowledgePendingProviderHandoffs(providerKey);
+            } else {
+              this.send("job_accept", {}, jobID);
+            }
             return;
           }
           const tabID = await this.openManagedTab({
@@ -3733,8 +4346,13 @@ export class Bridge {
           };
           if (expected === undefined) delete refreshed.expected;
           if (requiresAuth === undefined) delete refreshed.requires_auth;
+          delete refreshed.challenge_blocked;
+          delete refreshed.challenge_host;
+          delete refreshed.challenge_kind;
+          delete refreshed.challenge_blocked_at;
           if (existing.handoffAckPending !== true) delete refreshed.handoffAckPending;
           await this.upsertJobWithOffer(refreshed, openurl);
+          this.registerHandoffDrive(jobID, tabID);
           if (existing.handoffAckPending === true) {
             await this.acknowledgePendingProviderHandoffs(providerKey);
           } else {
@@ -3768,7 +4386,7 @@ export class Bridge {
         ...(expected !== undefined ? { expected } : {}),
         ...(requiresAuth !== undefined ? { requiresAuth } : {}),
       });
-      this.reportAuthStalled(jobID);
+      await this.reportAuthStalled(jobID);
       return;
     }
 
@@ -3793,27 +4411,40 @@ export class Bridge {
     // OpenURL base, whose path papio does not constrain, so a pdf-shaped base
     // would otherwise route a sign-in-required offer straight to a download.
     // Only an explicit true refuses; absent and false behave as before.
-    if (isDirectFileOffer(openurl) && requiresAuth !== true) {
+    if (isDirectFileOffer(openurl) && requiresAuth !== true && !challengeCooldown) {
       await this.upsertJobWithOffer(makeJob(-1), openurl);
       this.send("job_accept", {}, jobID);
       await this.startDirectOfferDownload(jobID, openurl);
       return;
     }
 
+    const governorQueued =
+      !providerParked &&
+      !challengeCooldown &&
+      this.hasHandoffReleaseEvidence(requiresAuth) &&
+      (this.handoffDrives.size >= HANDOFF_DRIVE_LIMIT || this.handoffDriveQueue.length > 0);
     const queueHandoff =
       providerParked ||
+      challengeCooldown ||
+      governorQueued ||
       (!this.hasHandoffReleaseEvidence(requiresAuth) &&
         (requiresAuth === true ||
           this.handoffOpening ||
           this.store.activeJobs.some((job) => job.tab_id >= 0 && job.status !== "queued")));
     if (queueHandoff) {
-      const queued = makeJob(-1, "queued");
+      const queued = makeJob(-1, governorQueued ? "accepted" : "queued");
       await this.upsertJobWithOffer(
-        providerParked ? { ...queued, handoffAckPending: true } : queued,
+        providerParked || challengeCooldown ? { ...queued, handoffAckPending: true } : queued,
         openurl,
       );
-      this.scheduleQueuedHandoffRelease(jobID);
-      if (!providerParked) this.send("job_accept", {}, jobID);
+      if (governorQueued) {
+        this.enqueueHandoffDrive({ jobID, purpose: "handoff" });
+        this.send("job_accept", {}, jobID);
+        await this.drainHandoffDriveQueue();
+      } else {
+        this.scheduleQueuedHandoffRelease(jobID);
+        if (!providerParked && !challengeCooldown) this.send("job_accept", {}, jobID);
+      }
       return;
     }
 
@@ -3836,6 +4467,7 @@ export class Bridge {
     }
     this.beginProviderDrive(jobID);
     await this.upsertJobWithOffer(makeJob(tabID), openurl);
+    this.registerHandoffDrive(jobID, tabID);
     this.send("job_accept", {}, jobID);
   }
 
@@ -3909,20 +4541,29 @@ export class Bridge {
     const job = findByJob(this.store, jobID);
     const url = this.offerURLs.get(jobID);
     if (!job || job.tab_id >= 0 || url === undefined) return;
+    const governorQueued =
+      this.hasHandoffReleaseEvidence(job.requires_auth) &&
+      (this.handoffDrives.size >= HANDOFF_DRIVE_LIMIT || this.handoffDriveQueue.length > 0);
     const queueHandoff =
-      !this.hasHandoffReleaseEvidence(job.requires_auth) &&
-      (job.requires_auth === true ||
-        this.handoffOpening ||
-        this.store.activeJobs.some((candidate) => candidate.tab_id >= 0 && candidate.status !== "queued"));
+      governorQueued ||
+      (!this.hasHandoffReleaseEvidence(job.requires_auth) &&
+        (job.requires_auth === true ||
+          this.handoffOpening ||
+          this.store.activeJobs.some((candidate) => candidate.tab_id >= 0 && candidate.status !== "queued")));
     if (queueHandoff) {
       await this.update((s) =>
         patchJob(s, jobID, {
-          status: "queued",
+          status: governorQueued ? "accepted" : "queued",
           tab_id: -1,
           download_initiated: false,
         }),
       );
-      this.scheduleQueuedHandoffRelease(jobID);
+      if (governorQueued) {
+        this.enqueueHandoffDrive({ jobID, purpose: "handoff" });
+        await this.drainHandoffDriveQueue();
+      } else {
+        this.scheduleQueuedHandoffRelease(jobID);
+      }
       return;
     }
 
@@ -3953,6 +4594,7 @@ export class Bridge {
         unknown_count: 0,
       }),
     );
+    this.registerHandoffDrive(jobID, tabID);
   }
 
   private async onCancel(msg: BrowserMessage): Promise<void> {
@@ -3961,13 +4603,9 @@ export class Bridge {
     const job = findByJob(this.store, jobID);
     if (!job) return;
     if (job.tab_id >= 0) {
-      // Broker-owned by construction (we only track tabs we created).
-      this.closingTabs.add(job.tab_id);
-      try {
-        await this.deps.tabs.remove(job.tab_id);
-      } catch {
-        // Tab already closed.
-      }
+      await this.closeManagedHandoffTab(job, job.tab_id);
+    } else {
+      this.releaseHandoffDrive(jobID);
     }
     this.downloads.delete(jobID);
     this.completedDownloadTabs.delete(jobID);
@@ -3995,14 +4633,9 @@ export class Bridge {
     const tabID = this.completedDownloadTabs.get(jobID);
     if (tabID === undefined) return;
     this.completedDownloadTabs.delete(jobID);
-    if (tabID >= 0) {
-      this.closingTabs.add(tabID);
-      try {
-        await this.deps.tabs.remove(tabID);
-      } catch {
-        // The viewer may already have closed itself after the download completed.
-      }
-    }
+    const job = findByJob(this.store, jobID);
+    if (job !== undefined && tabID >= 0) await this.closeManagedHandoffTab(job, tabID);
+    this.releaseHandoffDrive(jobID);
     await this.removeJobWithOffer(jobID);
   }
 
@@ -4075,8 +4708,34 @@ export class Bridge {
     // the adapter registry is the authoritative host source for classification,
     // so a tracked handoff landing on any registered family is on-provider.
     const onProvider = hostMatches(host, job.provider_hosts) || adapter !== undefined;
+    const shouldAssessBeforeRouting =
+      (change.status === "complete" || change.title !== undefined) &&
+      (onProvider || isAuthenticationURL(url));
+    if (shouldAssessBeforeRouting && (change.title !== undefined || !onProvider)) {
+      try {
+        const results = await this.deps.scripting.executeScript({
+          target: { tabId: job.tab_id },
+          func: assessDrivenPage,
+          args: [null],
+        });
+        const assessment = results[0]?.result as DrivenPageAssessment | undefined;
+        if (assessment?.kind === "challenge" || assessment?.kind === "redirect_loop") {
+          await this.blockChallenge(
+            job,
+            host,
+            assessment.kind === "challenge" ? "cloudflare" : "redirect_loop",
+            url,
+          );
+          return;
+        }
+        if (assessment?.kind === "normal" && job.challenge_blocked === true) {
+          await this.clearChallengeBlock(job);
+        }
+      } catch (e) {
+        console.error("papio: driven-page assessment failed; continuing handoff", e);
+      }
+    }
     if (!onProvider) {
-      // Chrome exposes its built-in PDF viewer as an internal extension URL.
       // Reuse the durable resolver-provided offer URL that produced that viewer.
       if (change.status === "complete" && host === CHROME_PDF_VIEWER_HOST) {
         const offeredURL = this.offerURLs.get(job.job_id);
@@ -4203,17 +4862,24 @@ export class Bridge {
           ...(job.expected !== undefined ? { expected: job.expected } : {}),
           ...(job.requires_auth !== undefined ? { requiresAuth: job.requires_auth } : {}),
         });
-        this.reportAuthStalled(job.job_id);
+        await this.reportAuthStalled(job.job_id);
         return false;
       }
       await this.chargeAuthAttempt(job.job_id, job.tab_id);
-      if ((this.staleRecoveryEpochs.get(job.job_id) ?? 0) !== recoveryEpoch) return true;
+      if (!this.handoffDrives.has(job.job_id) && this.handoffDrives.size >= HANDOFF_DRIVE_LIMIT) {
+        this.enqueueHandoffDrive({ jobID: job.job_id, purpose: "redrive", focusExisting: false });
+        await this.drainHandoffDriveQueue();
+        return true;
+      }
       const tabID = await this.openManagedTab({
         url: openurl,
         jobId: job.job_id,
         purpose: "redrive",
         focusExisting: false,
       });
+      if (tabID !== undefined && !this.handoffDrives.has(job.job_id)) {
+        this.registerHandoffDrive(job.job_id, tabID);
+      }
       return tabID !== undefined;
     } catch {
       // Tab vanished mid-recovery; the normal removal path re-queues.
@@ -4383,6 +5049,7 @@ export class Bridge {
           // this institutional attempt.
           if (this.send("provider_outcome", { outcome: "no_entitlement" }, job.job_id)) {
             this.resolverNoEntitlementSent.add(job.job_id);
+            await this.settleHandoffAfterOutcome(job.job_id);
           }
         }
         return true;
@@ -4439,6 +5106,32 @@ export class Bridge {
     const currentJob = findByJob(this.store, jobID);
     if (!currentJob || (currentJob.status !== "accepted" && currentJob.status !== "awaiting_download")) return;
 
+    let assessmentKind: DrivenPageAssessmentKind | undefined;
+    try {
+      const results = await this.deps.scripting.executeScript({
+        target: { tabId: currentJob.tab_id },
+        func: assessDrivenPage,
+        args: [null],
+      });
+      const result = results[0]?.result as DrivenPageAssessment | undefined;
+      if (result?.kind === "challenge" || result?.kind === "redirect_loop" || result?.kind === "normal") {
+        assessmentKind = result.kind;
+      }
+    } catch (e) {
+      console.error("papio: driven-page assessment failed; classifying normally", e);
+    }
+    if (assessmentKind === "challenge" || assessmentKind === "redirect_loop") {
+      await this.blockChallenge(
+        currentJob,
+        host,
+        assessmentKind === "challenge" ? "cloudflare" : "redirect_loop",
+      );
+      return;
+    }
+    if (assessmentKind === "normal" && currentJob.challenge_blocked === true) {
+      await this.clearChallengeBlock(currentJob);
+    }
+
     const ctx: AdapterContext = { expected: { ...(currentJob.expected ?? {}) } };
     let verdict: PageVerdict | undefined;
     try {
@@ -4457,6 +5150,7 @@ export class Bridge {
     }
     if (!verdict) return;
     if (verdict.kind === "unknown") {
+      let fallbackKind: ChallengeBlockKind | undefined;
       try {
         const results = await this.deps.scripting.executeScript({
           target: { tabId: job.tab_id },
@@ -4464,14 +5158,25 @@ export class Bridge {
           args: [null],
         });
         if (results[0]?.result === true) {
-          await this.waitForBotChallenge(job);
-          return;
+          fallbackKind = "cloudflare";
+        } else {
+          const redirectResults = await this.deps.scripting.executeScript({
+            target: { tabId: job.tab_id },
+            func: isRedirectLoopPage,
+            args: [null],
+          });
+          if (redirectResults[0]?.result === true) fallbackKind = "redirect_loop";
         }
       } catch (e) {
         // A failed probe must retain the existing stale-adapter path rather
         // than silently make an unreadable provider page immortal.
-        console.error("papio: bot-challenge detection failed; classifying normally", e);
+        console.error("papio: challenge detection failed; classifying normally", e);
       }
+      if (fallbackKind !== undefined) {
+        await this.waitForBotChallenge(currentJob, host, fallbackKind);
+        return;
+      }
+      if (currentJob.challenge_blocked === true) await this.clearChallengeBlock(currentJob);
     }
     const providerKey = this.providerKeyForJob(currentJob);
     if (await this.completeProviderDrainLease(providerKey)) {
@@ -4502,13 +5207,13 @@ export class Bridge {
 
   /** A challenge is a provider-wide human step, not a page retry. Keep its
    * existing tab available and park only siblings with a bounded lease. */
-  private async waitForBotChallenge(job: ActiveJob): Promise<void> {
-    if (this.isProviderDrainParked(job)) return;
-    if ((job.unknown_count ?? 0) !== 0) {
-      await this.update((s) => patchJob(s, job.job_id, { unknown_count: 0 }));
-    }
+  private async waitForBotChallenge(
+    job: ActiveJob,
+    host: string,
+    kind: ChallengeBlockKind = "cloudflare",
+  ): Promise<void> {
     this.classifyRetries.delete(job.job_id);
-    await this.parkProviderDrain(job);
+    await this.blockChallenge(job, host, kind);
   }
 
   private scheduleClassifyRetry(jobID: string): void {
@@ -4651,11 +5356,14 @@ export class Bridge {
       const outcomeKey = `${job.job_id}:ui_changed`;
       if (!this.handoffOutcomeSent.has(outcomeKey)) {
         this.handoffOutcomeSent.add(outcomeKey);
-        if (!this.send("provider_outcome", { outcome: "ui_changed", adapter_version: adapter.version }, job.job_id)) {
+        if (
+          !this.send("provider_outcome", { outcome: "ui_changed", adapter_version: adapter.version }, job.job_id)
+        ) {
           this.handoffOutcomeSent.delete(outcomeKey);
+        } else {
+          await this.settleHandoffAfterOutcome(job.job_id);
         }
       }
-      await this.update((s) => patchJob(s, job.job_id, { unknown_count: 0 }));
     } else if (count === 0) {
       await this.update((s) => patchJob(s, job.job_id, { unknown_count: 1, last_unknown_ms: now }));
     }
@@ -4664,6 +5372,14 @@ export class Bridge {
   /** Map a page verdict to a bridge action. See the safety contract: at most one
    * download initiation per job, ever; unknown only escalates after two spaced
    * observations; every other unknown keeps assisted behaviour. */
+  private async settleHandoffAfterOutcome(jobID: string): Promise<void> {
+    const job = findByJob(this.store, jobID);
+    if (job === undefined) return;
+    if (job.tab_id >= 0) await this.closeManagedHandoffTab(job, job.tab_id);
+    this.releaseHandoffDrive(jobID);
+    await this.removeJobWithOffer(jobID);
+  }
+
   private async applyVerdict(jobID: string, spec: AdapterSpec, verdict: PageVerdict, host: string): Promise<void> {
     const job = findByJob(this.store, jobID);
     if (!job) return;
@@ -4827,11 +5543,15 @@ export class Bridge {
         return;
       }
       case "no_entitlement":
-        this.send("provider_outcome", { outcome: "no_entitlement", adapter_version: av }, jobID);
+        if (this.send("provider_outcome", { outcome: "no_entitlement", adapter_version: av }, jobID)) {
+          await this.settleHandoffAfterOutcome(jobID);
+        }
         return;
       case "wrong_work":
       case "wrong_work_check":
-        this.send("provider_outcome", { outcome: "wrong_work", adapter_version: av }, jobID);
+        if (this.send("provider_outcome", { outcome: "wrong_work", adapter_version: av }, jobID)) {
+          await this.settleHandoffAfterOutcome(jobID);
+        }
         return;
       case "unknown":
         await this.recordUnknown(job, host, spec);
@@ -4842,9 +5562,13 @@ export class Bridge {
   private async onTabRemoved(tabID: number): Promise<void> {
     await this.ready;
     this.authCountedTabs.delete(tabID);
-    if (this.closingTabs.delete(tabID)) return; // programmatic close, not a user cancel
+    if (this.closingTabs.delete(tabID)) {
+      await this.drainHandoffDriveQueue();
+      return;
+    } // programmatic close, not a user cancel
     const job = findByTab(this.store, tabID);
     if (!job) return;
+    this.releaseHandoffDrive(job.job_id);
     if (this.deliveryJobs.has(job.job_id) || this.store.pendingDelivery?.job_id === job.job_id) {
       // The browser download is independent of the source tab. Keep its exact
       // correlation and pending record alive when the operator closes the PDF.

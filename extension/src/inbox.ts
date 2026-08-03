@@ -911,6 +911,23 @@ function liveStatusChip(item: TriageSnapshotItem): HTMLElement | null {
   chip.dataset.jobId = jobID;
   return chip;
 }
+function challengeAnnotation(item: TriageSnapshotItem): HTMLElement | null {
+  if (item.kind !== "human_action") return null;
+  const jobID = itemJobID(item);
+  if (jobID === null) return null;
+  const blocked = state.activityEntries.some(
+    (entry) =>
+      entry.job_id === jobID &&
+      entry.kind === "browser.error" &&
+      /\bchallenge[_ ]blocked\b/i.test(entry.text),
+  );
+  if (!blocked) return null;
+  const annotation = element("p");
+  annotation.className = "access-hint challenge-annotation";
+  annotation.textContent = "Security check needs you — complete it in the papio tab; papio resumes automatically.";
+  return annotation;
+}
+
 
 // Backend identifiers remain out of the ordinary triage flow. Their compact
 // disclosure sits beside the action/status text and preserves native button
@@ -989,6 +1006,8 @@ function renderItem(item: TriageSnapshotItem): HTMLElement {
   if (citation !== null) body.append(citation);
   const hint = accessHint(item);
   if (hint !== null) body.append(hint);
+  const challenge = challengeAnnotation(item);
+  if (challenge !== null) body.append(challenge);
   const instruction = renderInstruction(item);
   if (instruction !== null) body.append(instruction);
   const liveStatus = liveStatusChip(item);

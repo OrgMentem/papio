@@ -54,6 +54,16 @@ for the full pre-split extension history.
   the work window, matching the existing handoff surface), and repeated opens
   of the same item focus the existing tab instead of spawning duplicates —
   changed re-offers navigate the tab in place.
+- **Handoffs are governed, not flooded.** papio drives at most two handoff tabs
+  at a time (one until a sign-in is verified), queues the rest, closes tabs
+  whose job settled, times out stalled drives after three minutes, and updates
+  the papio tab group at most once per five seconds instead of thrashing it
+  per job.
+- **Security checks get attention instead of silence.** A Cloudflare/Turnstile
+  challenge or redirect loop on a driven page pauses that job (never solved
+  automatically), keeps its tab, cools the provider host down for ten minutes,
+  raises the badge, and appears in the popup and inbox with a Go-to-tab
+  action; solving it by hand resumes the drive automatically.
 
 ### Changed
 

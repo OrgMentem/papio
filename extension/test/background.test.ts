@@ -20,6 +20,9 @@ import {
   needsVisibleWindow,
   normalizeManagedTabURL,
   isBotChallenge,
+  isRedirectLoopPage,
+  assessDrivenPage,
+  registrableProviderHost,
   type BridgeDeps,
   type DownloadDeltaLike,
   type DownloadItemLike,
@@ -480,6 +483,7 @@ function useUnknownProviderClassifier(h: Harness, challenge: () => boolean): voi
   h.deps.permissions.contains = async () => true;
   h.deps.scripting.executeScript = async (injection) => {
     if (injection.func === interpret) return [{ result: { kind: "unknown" } }];
+    if (injection.func === assessDrivenPage) return [{ result: { kind: challenge() ? "challenge" : "normal" } }];
     if (injection.func === isBotChallenge) return [{ result: challenge() }];
     return [];
   };
@@ -1140,7 +1144,7 @@ test("a resolver no-entitlement route emits once and short-circuits provider cla
   );
   expect(outcomes).toHaveLength(1);
   expect(outcomes[0]?.payload).toEqual({ outcome: "no_entitlement" });
-  expect(injections).toHaveLength(2);
+  expect(injections).toHaveLength(1);
   expect(injections.every((injection) => injection.func === routeResolverService)).toBe(true);
 });
 
@@ -1364,11 +1368,26 @@ test("a Cloudflare challenge clears an earlier unknown streak and parks its prov
   const tabID = await classifyProviderUnknown(h, "job_challenge_clears_unknown");
 
   expect(h.backend.store.activeJobs[0]?.unknown_count).toBe(1);
+  await h.port.inbound(helloAck());
   challenge = true;
   h.clock.now += 5_000;
   const url = `https://${PROVIDER_HOST}/stable/challenge`;
   await h.tabs.onUpdated.emit(tabID, { url, status: "complete" }, { id: tabID, url });
 
+  expect(h.backend.store.activeJobs[0]).toMatchObject({
+    challenge_blocked: true,
+    challenge_host: "jstor.org",
+    challenge_kind: "cloudflare",
+  });
+  expect(h.backend.store.challengeCooldowns).toEqual({
+    "jstor.org": h.clock.now + 600_000,
+  });
+  expect(h.tabs.live.has(tabID)).toBe(true);
+  expect(
+    h.frames().find((frame) => frame.type === "error" && frame.payload["code"] === "challenge_blocked"),
+  ).toBeDefined();
+  expect(h.action.texts.at(-1)).toBe("1");
+  expect(h.action.backgroundColors.at(-1)).toBe("#b06000");
   expect(h.backend.store.activeJobs[0]?.unknown_count ?? 0).toBe(0);
   expect(h.backend.store.providerDrainLeases).toEqual({
     [PROVIDER_HOST]: {
@@ -1397,11 +1416,42 @@ test("a cleared Cloudflare challenge returns to the ordinary stale-adapter path"
   }
 
   const outcomes = h.frames().filter((frame) => frame.type === "provider_outcome");
+
   expect(outcomes).toHaveLength(1);
   expect(outcomes[0]?.payload).toMatchObject({
     outcome: "ui_changed",
     adapter_version: PROVIDER_ADAPTER.version,
   });
+  expect(h.backend.store.challengeCooldowns).toEqual({});
+  expect(h.backend.store.activeJobs[0]?.challenge_blocked).toBeUndefined();
+});
+test("driven-page assessment classifies challenge, redirect-loop, and normal fixtures", () => {
+  const fixture = (html: string): Document => {
+    const window = new Window({ url: "https://www.jstor.org/stable/paper" });
+    window.document.write(html);
+    return window.document as unknown as Document;
+  };
+  const challengeFixtures = [
+    "<html><head><title>Are you a robot?</title></head><body></body></html>",
+    "<form id=\"challenge-form\"></form>",
+    "<div class=\"cf-turnstile\"></div>",
+    "<div id=\"data-cf-chl-token\"></div>",
+    "<main>Verify you are human to continue</main>",
+  ];
+  for (const html of challengeFixtures) {
+    const doc = fixture(html);
+    expect(assessDrivenPage(doc).kind).toBe("challenge");
+    expect(isBotChallenge(doc)).toBe(true);
+  }
+  const loop = fixture("<html><head><title>OpenAthens</title></head><body>Too many redirects</body></html>");
+  expect(assessDrivenPage(loop).kind).toBe("redirect_loop");
+  expect(isRedirectLoopPage(loop)).toBe(true);
+  const normal = fixture("<html><head><title>Article</title></head><body><main>Abstract</main></body></html>");
+  expect(assessDrivenPage(normal)).toEqual({ kind: "normal" });
+  expect(isBotChallenge(normal)).toBe(false);
+  expect(isRedirectLoopPage(normal)).toBe(false);
+  expect(registrableProviderHost("www.sciencedirect.com")).toBe("sciencedirect.com");
+  expect(registrableProviderHost("journals.example.co.uk")).toBe("example.co.uk");
 });
 
 test("unknown retries report ui_changed once per drive and again for a re-offered tab", async () => {
@@ -1512,6 +1562,22 @@ test("an expired provider lease reclaims its queued handoff without a new offer"
   h.clock.now += 60_000;
   await leaseExpiry!.fn();
 
+  // A provider challenge now has a durable cooldown in addition to its short
+  // drain lease; expiry of the lease alone must not immediately re-drive it.
+  expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_lease_reclaim")).toMatchObject({
+    status: "queued",
+    tab_id: -1,
+  });
+  expect(
+    h.frames().filter((frame) => frame.type === "job_accept" && frame.job_id === "job_lease_reclaim"),
+  ).toHaveLength(1);
+  expect(h.backend.store.providerDrainLeases).toEqual({});
+
+  const cooldownExpiry = h.timers.find((timer) => timer.ms === 600_000);
+  expect(cooldownExpiry).toBeDefined();
+  h.clock.now += 540_000;
+  await cooldownExpiry!.fn();
+
   expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_lease_reclaim")).toMatchObject({
     status: "accepted",
   });
@@ -1529,6 +1595,7 @@ test("an expired provider lease reclaims its queued handoff without a new offer"
 test("a unique manual Chrome download from a registry-only host is correlated", async () => {
   const h = makeHarness();
   h.deps.adapterSpecs.push(PROVIDER_ADAPTER);
+  h.deps.permissions.contains = async () => true;
   await h.bridge.start();
   await h.port.inbound({
     protocol: "papio-browser/1",
@@ -1815,6 +1882,7 @@ test("Firefox keeps click adapters assisted and ignores their manual job-tab dow
   h.deps.permissions.contains = async () => true;
   h.deps.scripting.executeScript = async (injection) => {
     injections.push(injection);
+    if (injection.func === assessDrivenPage) return [{ result: { kind: "normal" } }];
     return [{ result: { kind: "article" } }];
   };
   await h.bridge.start();
@@ -1823,8 +1891,8 @@ test("Firefox keeps click adapters assisted and ignores their manual job-tab dow
   const articleURL = `https://${PROVIDER_HOST}/stable/article`;
   await h.tabs.onUpdated.emit(tabID, { url: articleURL, status: "complete" }, { id: tabID, url: articleURL });
 
-  expect(injections).toHaveLength(1);
-  expect(injections[0]?.func).toBe(interpret);
+  expect(injections).toHaveLength(2);
+  expect(injections.filter((injection) => injection.func === interpret)).toHaveLength(1);
   expect(h.backend.store.activeJobs[0]?.download_initiated).not.toBe(true);
   await h.downloads.onCreated.emit({
     id: 41,
@@ -1853,7 +1921,7 @@ test("Firefox ignores manual downloads from non-click adapters without exact own
     download: { selector: "a.download", requireKind: "article", method: "href" },
   };
   h.deps.adapterSpecs.push(hrefAdapter);
-  h.deps.permissions.contains = async () => false;
+  h.deps.permissions.contains = async () => true;
   await h.bridge.start();
   await h.port.inbound(jobOffer("job_0004_firefox_href"));
   const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
@@ -2171,7 +2239,7 @@ test("hello-required error reconnects once and does not duplicate a live tab", a
 
   expect(h.port.disconnected).toBe(true);
   expect(h.ports.length).toBe(2);
-  expect(h.timers.length).toBe(0);
+  expect(h.timers.filter((timer) => timer.ms === 1_000)).toHaveLength(0);
   expect(h.frames().filter((f) => f.type === "hello").length).toBe(2);
 
   // The fresh daemon re-offers the durable job; the tracked live tab is reused.
@@ -2388,6 +2456,7 @@ test("work-window visibility follows the matched adapter requirement", async () 
   for (const [index, c] of cases.entries()) {
     const h = makeHarness(undefined, { windows: true });
     h.deps.adapterSpecs = c.adapterSpecs;
+    h.deps.permissions.contains = async () => c.adapterSpecs.length > 0;
     await h.bridge.start();
     await h.port.inbound(jobOffer(`job_ww_visibility_${index}`));
     const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
@@ -2424,9 +2493,18 @@ test("work window is reused across offers and recreated after the user closes it
   expect(h.windows?.created.length).toBe(1);
   expect(h.tabs.created.map((t) => t.windowId)).toEqual([500, 500]);
 
-  // User closes the work window: the next offer recreates it.
+  // The governor queues a third drive while both warm slots are occupied.
   h.windows?.close(500);
   await h.port.inbound(jobOffer("job_ww_c"));
+  expect(h.windows?.created.length).toBe(1);
+  expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_ww_c")).toMatchObject({
+    status: "accepted",
+    tab_id: -1,
+  });
+
+  // Releasing one live drive lets the queued offer recreate the user-closed
+  // work window instead of trying to reuse its stale id.
+  await h.bridge.requestCancel("job_ww_a");
   expect(h.windows?.created.length).toBe(2);
   expect(h.backend.store.workWindowID).toBe(501);
 });
@@ -2440,6 +2518,7 @@ test("the work window closes once the last handoff releases its tab", async () =
   // The user closes the handoff tab before download: the job cancels and, with
   // no papio tab left in the work window, the window is reaped rather than left
   // to accumulate across handoffs.
+  h.tabs.live.delete(tabID);
   await h.tabs.onRemoved.emit(tabID, { isWindowClosing: false });
   expect(h.backend.store.activeJobs.length).toBe(0);
   expect(h.windows?.removed).toEqual([500]);
@@ -2608,6 +2687,10 @@ test("IdP auth expands the papio group and re-collapses when auth returns", asyn
   // Auth returns to a provider host: the job advances and the group folds away.
   const providerURL = `https://${PROVIDER_HOST}/stable/123`;
   await h.tabs.onUpdated.emit(tabID, { url: providerURL, status: "complete" }, { id: tabID, url: providerURL });
+  const recollapse = h.timers.find((timer) => timer.ms === 5_000);
+  expect(recollapse).toBeDefined();
+  h.clock.now += 5_000;
+  await recollapse!.fn();
   expect(h.frames().some((f) => f.type === "auth_returned")).toBe(true);
   expect(h.tabGroups?.live.get(groupID)?.collapsed).toBe(true);
   expect(h.tabGroups?.live.get(groupID)?.title).toBe("papio");
@@ -2663,7 +2746,12 @@ test("a live papio group keeps its generic collapsed title when the last handoff
   });
 
   // The group still exists because a keepalive tab remains folded into it.
+  h.tabs.live.delete(tabID);
   await h.tabs.onRemoved.emit(tabID, { isWindowClosing: false });
+  const collapse = h.timers.find((timer) => timer.ms === 5_000);
+  expect(collapse).toBeDefined();
+  h.clock.now += 5_000;
+  await collapse!.fn();
   expect(h.backend.store.activeJobs.length).toBe(0);
   expect(h.backend.store.handoffGroupID).toBe(groupID);
   expect(h.tabGroups?.live.get(groupID)).toMatchObject({ collapsed: true, title: "papio" });
@@ -3709,4 +3797,108 @@ test("a direct-file offer that requires a sign-in is queued, never downloaded", 
   expect(h.downloads.started).toEqual([]);
   const job = h.backend.store.activeJobs.find((j) => j.job_id === "job_0091_auth_direct");
   expect(job?.status).toBe("queued");
+});
+
+
+test("handoff governor keeps two drives, drains FIFO on settle and timeout", async () => {
+  const h = makeHarness({ ...emptyStore(), lastAuthReturnedAt: 1_700_000_000_000 });
+  await h.bridge.start();
+  const jobIDs = Array.from({ length: 5 }, (_, index) => `job_governor_${index}`);
+  for (const jobID of jobIDs) await h.port.inbound(jobOffer(jobID));
+
+  expect(h.tabs.live.size).toBe(2);
+  expect(h.tabs.created).toHaveLength(2);
+  expect(h.backend.store.activeJobs.filter((job) => job.tab_id < 0)).toHaveLength(3);
+  expect(h.frames().filter((frame) => frame.type === "job_accept")).toHaveLength(5);
+
+  const first = h.backend.store.activeJobs.find((job) => job.job_id === jobIDs[0]);
+  expect(first?.tab_id).toBeGreaterThanOrEqual(0);
+  await h.bridge.requestCancel(jobIDs[0]!);
+  expect(h.tabs.live.size).toBe(2);
+  expect(h.tabs.created).toHaveLength(3);
+
+  const timeout = h.timers.at(-1);
+  expect(timeout?.ms).toBe(180_000);
+  h.clock.now += 180_000;
+  await timeout?.fn();
+  expect(h.tabs.live.size).toBe(2);
+  expect(h.tabs.created).toHaveLength(4);
+  expect(h.backend.store.activeJobs.find((job) => job.job_id === jobIDs[2])?.status).toBe("auth_pending");
+});
+
+test("successful adoption closes a managed handoff while auth keeps its page", async () => {
+  const success = makeHarness();
+  await success.bridge.start();
+
+  await success.port.inbound(jobOffer("job_close_success"));
+  const successTab = success.backend.store.activeJobs[0]?.tab_id ?? -1;
+  await success.downloads.onCreated.emit({ id: 901, tabId: successTab, state: "in_progress" });
+  success.downloads.items.set(901, {
+    id: 901,
+    tabId: successTab,
+    filename: "/tmp/paper.pdf",
+    mime: "application/pdf",
+    fileSize: 100,
+    state: "complete",
+  });
+  await success.downloads.onChanged.emit({ id: 901, state: { current: "complete" } });
+  await success.port.inbound({
+    protocol: "papio-browser/1",
+    type: "ack",
+    msg_id: "ack_close_success",
+    job_id: "job_close_success",
+    seq: 1,
+    payload: {},
+  });
+  expect(success.tabs.removed).toEqual([successTab]);
+
+  const human = makeHarness();
+  await human.bridge.start();
+  await human.port.inbound(jobOffer("job_close_human"));
+  const humanTab = human.backend.store.activeJobs[0]?.tab_id ?? -1;
+  await human.tabs.onUpdated.emit(
+    humanTab,
+    { url: "https://idp.example.edu/login", status: "complete" },
+    { id: humanTab, url: "https://idp.example.edu/login" },
+  );
+  expect(human.tabs.removed).toEqual([]);
+  expect(human.tabs.live.has(humanTab)).toBe(true);
+});
+test("cold handoffs consolidate to one tab before warm evidence fills the second slot", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  const jobIDs = Array.from({ length: 5 }, (_, index) => `job_cold_governor_${index}`);
+  for (const jobID of jobIDs) await h.port.inbound(jobOffer(jobID));
+
+  expect(h.tabs.live.size).toBe(1);
+  expect(h.tabs.created).toHaveLength(1);
+  expect(h.backend.store.activeJobs.filter((job) => job.tab_id < 0)).toHaveLength(4);
+
+  await h.bridge.setKeepaliveAuthenticated(true);
+  expect(h.tabs.live.size).toBe(2);
+  expect(h.tabs.created).toHaveLength(2);
+  expect(h.backend.store.activeJobs.filter((job) => job.tab_id < 0)).toHaveLength(3);
+});
+
+test("handoff group reducer trails auth recollapse and stays quiet when collapsed", async () => {
+  const h = makeHarness(undefined, { tabGroups: true, handoffSurface: "tab-group" });
+  await h.bridge.start();
+  await h.port.inbound(jobOffer("job_group_debounce"));
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  const groupID = h.backend.store.handoffGroupID;
+  expect(groupID).toBeDefined();
+  const idpURL = "https://idp.example.edu/login";
+  const providerURL = `https://${PROVIDER_HOST}/stable/returned`;
+  await h.tabs.onUpdated.emit(tabID, { url: idpURL, status: "complete" }, { id: tabID, url: idpURL });
+  expect(h.tabGroups?.live.get(groupID!)?.collapsed).toBe(false);
+  await h.tabs.onUpdated.emit(tabID, { url: providerURL, status: "complete" }, { id: tabID, url: providerURL });
+  expect(h.tabGroups?.live.get(groupID!)?.collapsed).toBe(false);
+  const collapse = h.timers.find((timer) => timer.ms === 5_000);
+  expect(collapse).toBeDefined();
+  h.clock.now += 5_000;
+  await collapse?.fn();
+  expect(h.tabGroups?.live.get(groupID!)?.collapsed).toBe(true);
+  const updates = h.tabGroups?.updated.length ?? 0;
+  await h.tabs.onUpdated.emit(tabID, { url: providerURL, status: "complete" }, { id: tabID, url: providerURL });
+  expect(h.tabGroups?.updated.length).toBe(updates);
 });

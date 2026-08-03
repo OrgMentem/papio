@@ -18,6 +18,7 @@ import { parseBrowserMessage, type BrowserMessage } from "../src/protocol";
 import { emptyStore, type StateBackend, type StoreShape, type TermsConsent } from "../src/state";
 import {
   Bridge,
+  assessDrivenPage,
   clickTermsAccept,
   resolveDownloadURL,
   type BridgeDeps,
@@ -871,6 +872,9 @@ class FakeScripting {
     func: (...args: never[]) => unknown;
     args?: unknown[];
   }): Promise<{ result?: unknown }[]> {
+    // The driven-page challenge assessment shares this injection path; it is
+    // not an adapter extraction and must not pollute the recorded calls.
+    if (inj.func === assessDrivenPage) return [{ result: { kind: "normal" } }];
     const args = inj.args ?? [];
     if (args.length === 1) {
       this.extracted.push({ tabId: inj.target.tabId, selector: String(args[0]) });
@@ -1072,8 +1076,12 @@ test("a transiently unknown provider page is reclassified until it renders", asy
   expect(h.downloads.started.length).toBe(0);
   expect(h.timers.length).toBeGreaterThan(0);
 
-  // Drain the retry; the page now classifies as an article and downloads once.
-  for (const t of h.timers.splice(0)) await t.fn();
+  // The governor also owns a 3-minute drive timeout; execute only the 2.5s
+  // classifier retry here or the harness would time the job out before the
+  // late-rendering page gets its second assessment.
+  const retryTimers = h.timers.filter((timer) => timer.ms === 2_500);
+  h.timers.splice(0, h.timers.length, ...h.timers.filter((timer) => timer.ms !== 2_500));
+  for (const timer of retryTimers) await timer.fn();
   expect(h.scripting.interpretTabs.length).toBeGreaterThanOrEqual(2);
   expect(h.downloads.started.length).toBe(1);
   expect(h.tabs.live.get(tabID)?.url).toContain(PROVIDER);
@@ -1224,9 +1232,13 @@ test("a latched download-click keeps re-classifying until a late terms modal is 
   expect(h.scripting.termsAccepts.length).toBe(0); // modal not upgraded yet
   expect(h.timers.length).toBeGreaterThan(0); // retry scheduled despite the latch
 
-  // Drain retries: the late terms modal is caught and accepted.
-  for (let i = 0; i < 8 && h.scripting.termsAccepts.length === 0 && h.timers.length > 0; i++) {
-    for (const t of h.timers.splice(0)) await t.fn();
+  // Drain only classifier retries. The governor's 3-minute drive timeout is a
+  // separate lifecycle and must not win this synthetic race.
+  for (let i = 0; i < 8 && h.scripting.termsAccepts.length === 0; i++) {
+    const retryTimers = h.timers.filter((timer) => timer.ms === 2_500);
+    h.timers.splice(0, h.timers.length, ...h.timers.filter((timer) => timer.ms !== 2_500));
+    if (retryTimers.length === 0) break;
+    for (const timer of retryTimers) await timer.fn();
   }
   expect(h.scripting.termsAccepts.length).toBeGreaterThanOrEqual(1);
   expect(h.scripting.clicked.length).toBe(1); // retry never re-clicked the download

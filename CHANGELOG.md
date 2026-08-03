@@ -32,8 +32,33 @@ execution records in `notes/acquisition-stack-plan.md`.
   activity feed — raw kinds like `action.reminder` or `browser.error` no
   longer leak to either surface, and the CLI line view drops the raw detail
   JSON (still available under `--json`).
+- **A verified institution session now unblocks parked institutional work.**
+  The extension reports timing-only session evidence (`session_evidence_v1`),
+  and the daemon re-offers parked institutional handoffs from *any* prior
+  session — discovery is store-backed rather than limited to the current
+  connection's offers. Manual-download actions are never auto-driven.
+- **Keep-warm follows daemon demand.** Negotiated triage counts
+  (`triage_counts_schema_v2`) carry the number of open actions requiring
+  institution sign-in, so the browser keeps the session warm while parked
+  auth work exists — not only while a handoff tab is open.
+- **Adopted downloads record their true access route.** The extension attests
+  route (resolver/direct/open-access), a sanitized page host, and session
+  evidence per delivery (`delivery_context_v1`); candidates persist
+  `browser_route`/`session_evidence`, and `access_basis` is derived from
+  evidence — an uncontexted adoption is never marked institutional. This
+  gives ADR-0010's reserved `operator_browser_session` basis its producer.
+  Schema version 19.
+- **Institutional handoffs are paced.** The bridge keeps at most four
+  unsettled handoffs in flight per browser session regardless of backlog,
+  re-offers at most four parked jobs per cycle (oldest first), and records a
+  single `browser.offers_paced` event carrying how many are held back —
+  bulk-releasing a hundred parked jobs now drains as a trickle, not a flood.
 
 ### Fixed
+
+- **A failed adopted download no longer mislabels paywalled work as needing no
+  sign-in.** The replacement manual-download action inherits the resolved
+  handoff's authentication classification instead of a blank one.
 
 - **A rate-limit gate or request count earned under one set of credentials no
   longer applies to another.** Providers meter by credential, not by source

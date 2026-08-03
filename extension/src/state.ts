@@ -79,10 +79,18 @@ export interface ActiveJob {
    * not yet recorded a consent choice, so the popup can surface the one-time
    * informed-consent prompt. Cleared once consent is decided. */
   needs_terms_consent?: boolean;
-  /** Exact provider host where a tracked handoff could not be read because the
-   * browser lacks effective host access. It contains no path, query, or IdP
+  /** Exact provider host where a tracked handoff could not be read because
+   * the browser lacks effective access. It contains no path, query, or IdP
    * data and lets the report debounce survive an MV3 worker restart. */
   blocked_provider_host?: string;
+  /** True when the live broker tab is stopped on a provider security check or
+   * redirect-loop dead end. The tab remains open for the operator. */
+  challenge_blocked?: boolean;
+  /** Registrable provider host where the challenge was observed. Never an IdP
+   * host or a URL; retained only with the active job. */
+  challenge_host?: string;
+  challenge_kind?: "cloudflare" | "redirect_loop";
+  challenge_blocked_at?: number;
   /** A re-offered handoff held behind a parked provider has not yet been
    * accepted. It is acknowledged only when that provider is resumed. */
   handoffAckPending?: boolean;
@@ -142,6 +150,9 @@ export interface StoreShape {
    * browser lacks effective access. Kept after a job finishes so the popup and
    * badge describe the standing condition until access changes. */
   blockedProviderHosts?: string[];
+  /** Provider registrable-host cooldowns after a security check or redirect
+   * loop. Values are epoch milliseconds; no URL or IdP data is retained. */
+  challengeCooldowns?: Record<string, number>;
 }
 
 /** Async key/value seam. The real implementation wraps chrome.storage; tests

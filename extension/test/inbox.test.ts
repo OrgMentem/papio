@@ -965,3 +965,29 @@ test("retry operations declared by the daemon are not rendered", async () => {
   expect(page.document.querySelector("[data-triage-item-id='hit:retry-placeholder'] [data-operation='retry']")).toBeNull();
   expect(page.document.querySelector("[data-triage-item-id='hit:retry-placeholder'] .item-controls")).toBeNull();
 });
+
+test("annotates the Actions row when a provider security check blocks its browser job", async () => {
+  const fixture = snapshot([manualAction("action:challenge", 1, "Challenge paper")], {
+    counts: counts({ pending_total: 1, actions: 1, watch_hits: 0, retractions: 0 }),
+  });
+  const entries = [
+    {
+      seq: 3,
+      at: "2026-08-03T12:00:00Z",
+      job_id: "job-18",
+      kind: "browser.error",
+      text: "challenge_blocked: Provider security check needs human attention",
+    },
+  ];
+  const page = await inboxDocument((message) => {
+    if (message.type === "papio.activity") return { ok: true, feature: true, entries };
+    return snapshotReply(fixture, message);
+  });
+
+  const annotation = page.document.querySelector(
+    "[data-triage-item-id='action:challenge'] .challenge-annotation",
+  );
+  expect(annotation?.textContent).toBe(
+    "Security check needs you — complete it in the papio tab; papio resumes automatically.",
+  );
+});

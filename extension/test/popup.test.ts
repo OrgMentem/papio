@@ -339,6 +339,32 @@ test("uses a DOI then job id when an awaiting sign-in has no paper title", () =>
   const labels = Array.from(doc.querySelectorAll(".needs-you-paper")).map((paper) => paper.textContent);
   expect(labels).toEqual(["10.1000/fallback", "job-without-identity"]);
 });
+test("surfaces a blocked security check with a go-to-tab action", async () => {
+  const doc = popupDocument();
+  const focused: string[] = [];
+  renderNeedsAttention(
+    doc,
+    [job({ job_id: "job-challenge", challenge_blocked: true, challenge_host: "ScienceDirect.com" })],
+    [],
+    async (jobID) => {
+      focused.push(jobID);
+    },
+  );
+
+  const section = doc.getElementById("needs-you-section");
+  expect(section?.hidden).toBe(false);
+  expect(doc.getElementById("needs-you-heading")?.textContent).toBe("Security check needs you");
+  expect(section?.querySelector(".needs-you-paper")?.textContent).toBe(
+    "Security check needs you - sciencedirect.com",
+  );
+  const button = section?.querySelector("button") as HTMLButtonElement;
+  expect(button.textContent).toBe("Go-to-tab");
+  button.click();
+  await Promise.resolve();
+  await Promise.resolve();
+  expect(focused).toEqual(["job-challenge"]);
+});
+
 
 test("surfaces each blocked provider host once and routes the remedy to Options", async () => {
   const doc = popupDocument();

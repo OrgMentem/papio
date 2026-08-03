@@ -61,6 +61,8 @@ const (
 	previewCapabilityTTL         = 10 * time.Minute
 	sessionEvidenceThrottle      = 60 * time.Second
 	deliveryContextTTL           = 60 * time.Second
+	maxOutstandingOffers         = 4
+	maxInstitutionalReoffers     = 4
 )
 
 // HandoffFocusMinExtensionVersion is the first extension that parses
@@ -128,8 +130,18 @@ type Bridge struct {
 	cancelSent map[string]bool // jobs a daemon-side cancel was already announced for
 	// A replayed auth return must not make the same holder open duplicate tabs.
 	authReleased map[int64]bool
+	// reofferPending prioritizes jobs released by the institutional-session
+	// sweep when poll turns them back into job_offer frames.
+	reofferPending map[string]bool
+	// reofferSourceJobID and reofferProfile keep an authenticated institutional
+	// session alive across ordinary sync ticks, even after its source settles.
+	reofferSourceJobID string
+	reofferProfile     string
 	// Session evidence is timing-only and throttled per holder.
 	lastSessionEvidenceAt time.Time
+	// One reoffer sweep per sync cycle; the handler that triggered it lets poll
+	// finish the same cycle without immediately running a second burst.
+	reofferRanThisSync bool
 	// Completion metadata and delivery context arrive as adjacent extension
 	// frames. Keep both briefly so either frame order is safe across a native
 	// host RPC boundary; values are never durable and expire quickly.
@@ -188,6 +200,7 @@ func NewBridge(jobs *job.Store, svc *app.Service, triageService *triage.Service,
 		offered:          map[string]bool{},
 		cancelSent:       map[string]bool{},
 		authReleased:     map[int64]bool{},
+		reofferPending:   map[string]bool{},
 		pendingDownloads: map[browserDownloadKey]pendingBrowserDownload{},
 		deliveryContexts: map[browserDownloadKey]pendingDeliveryContext{},
 		focusPending:     map[string]bool{},
@@ -345,6 +358,9 @@ func (b *Bridge) promote(session *browserSession, reason string) {
 	b.offered = map[string]bool{}
 	b.cancelSent = map[string]bool{}
 	b.authReleased = map[int64]bool{}
+	b.reofferPending = map[string]bool{}
+	b.reofferSourceJobID = ""
+	b.reofferProfile = ""
 	b.lastSessionEvidenceAt = time.Time{}
 	b.takeovers++
 	log.Printf("papio: browser session %s (v%s) now holds the bridge: %s", shortSession(session.ID), session.ExtensionVersion, reason)
@@ -367,6 +383,7 @@ func shortSession(id string) string {
 // Every outbound frame is self-validated by the same decoder before it leaves.
 func (b *Bridge) Sync(ctx context.Context, sessionID string, goodbye bool, frames []json.RawMessage) ([]json.RawMessage, error) {
 	b.mu.Lock()
+	b.reofferRanThisSync = false
 	defer b.mu.Unlock()
 	if sessionID == "" {
 		sessionID = legacySessionID
@@ -486,6 +503,9 @@ func (b *Bridge) release(sessionID string) {
 		log.Printf("papio: browser session %s (v%s) disconnected", shortSession(sessionID), b.holder.ExtensionVersion)
 		b.holder = nil
 		b.epoch++
+		b.reofferSourceJobID = ""
+		b.reofferProfile = ""
+		b.reofferPending = map[string]bool{}
 	}
 }
 
@@ -750,6 +770,9 @@ func (b *Bridge) handleHello(sessionID string, p *protocol.HelloPayload) ([]json
 	b.offered = map[string]bool{}
 	b.cancelSent = map[string]bool{}
 	b.authReleased = map[int64]bool{}
+	b.reofferPending = map[string]bool{}
+	b.reofferSourceJobID = ""
+	b.reofferProfile = ""
 	if session.Outdated {
 		return b.extensionOutdatedError()
 	}
@@ -1520,7 +1543,12 @@ func (b *Bridge) sessionEvidence(ctx context.Context, _ *protocol.SessionEvidenc
 	if err := b.jobs.S.AppendEvent(ctx, "", "browser.session_evidence", nil); err != nil {
 		return err
 	}
-	return b.reofferInstitutionalSiblingsForEvidence(ctx)
+	if b.reofferRanThisSync {
+		return nil
+	}
+	err := b.reofferInstitutionalSiblingsForEvidence(ctx)
+	b.reofferRanThisSync = true
+	return err
 }
 
 // reofferInstitutionalSiblingsForEvidence chooses an open institutional
@@ -1528,6 +1556,9 @@ func (b *Bridge) sessionEvidence(ctx context.Context, _ *protocol.SessionEvidenc
 // already-offered source (the auth_returned shape), then fall back to any
 // parked institutional handoff so the normal poll can offer it and its peers.
 func (b *Bridge) reofferInstitutionalSiblingsForEvidence(ctx context.Context) error {
+	if b.reofferSourceJobID != "" {
+		return b.reofferInstitutionalSiblings(ctx, b.reofferSourceJobID)
+	}
 	actions, err := b.jobs.ListHumanActions(ctx, true)
 	if err != nil {
 		return err
@@ -1566,7 +1597,13 @@ func (b *Bridge) recordAuth(ctx context.Context, msg *protocol.BrowserMessage) e
 	if msg.Type != protocol.MsgAuthReturned {
 		return nil
 	}
-	return b.reofferInstitutionalSiblings(ctx, msg.JobID)
+	if b.reofferRanThisSync {
+		return nil
+	}
+	err := b.reofferInstitutionalSiblings(ctx, msg.JobID)
+	b.reofferRanThisSync = true
+	return err
+
 }
 
 // reofferInstitutionalSiblings lets poll reopen only the handoffs that a
@@ -1578,35 +1615,77 @@ func (b *Bridge) reofferInstitutionalSiblings(ctx context.Context, sourceJobID s
 
 	source, err := b.jobs.Get(ctx, sourceJobID)
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil
-	}
-	if err != nil {
+		if b.reofferSourceJobID != sourceJobID {
+			return nil
+		}
+		source = nil
+	} else if err != nil {
 		return err
 	}
-	if source.State != job.StateAwaitingHuman {
-		return nil
-	}
-	sourceActions, err := b.jobs.ListOpenHumanActionsForJobs(ctx, []string{sourceJobID})
-	if err != nil {
-		return err
-	}
+
+	profile := b.reofferProfile
 	var sourceActionID int64
-	for _, action := range sourceActions {
-		if action.Kind == handoffActionKind && action.RequiresAuth {
-			sourceActionID = action.ID
-			break
+	if source != nil && source.State == job.StateAwaitingHuman {
+		sourceActions, err := b.jobs.ListOpenHumanActionsForJobs(ctx, []string{sourceJobID})
+		if err != nil {
+			return err
+		}
+		for _, action := range sourceActions {
+			if action.Kind == handoffActionKind && action.RequiresAuth {
+				sourceActionID = action.ID
+				break
+			}
+		}
+		if sourceActionID != 0 {
+			if b.reofferSourceJobID != "" && b.reofferSourceJobID != sourceJobID {
+				return nil
+			}
+			if b.reofferSourceJobID == "" {
+				b.reofferSourceJobID = sourceJobID
+				b.reofferProfile = resolverProfileKey(source.Policy.Resolver)
+			}
+			profile = b.reofferProfile
+			b.authReleased[sourceActionID] = true
 		}
 	}
-	if sourceActionID == 0 || b.authReleased[sourceActionID] ||
-		b.holder == nil || b.now().Sub(b.holder.LastSyncAt) > sessionStaleAfter {
+	if b.reofferSourceJobID != sourceJobID || profile == "" {
 		return nil
 	}
-	b.authReleased[sourceActionID] = true
 
 	actions, err := b.jobs.ListHumanActions(ctx, true)
 	if err != nil {
 		return err
 	}
+	handoff := make(map[string]job.HumanAction)
+	rows := make(map[string]job.Row)
+	for _, action := range actions {
+		if action.Kind == handoffActionKind {
+			handoff[action.JobID] = action
+		}
+	}
+	for jobID := range handoff {
+		row, err := b.jobs.Get(ctx, jobID)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if row.State == job.StateAwaitingHuman {
+			rows[jobID] = *row
+		}
+	}
+
+	outstanding := outstandingOfferCount(b.offered, handoff, rows, b.pendingDownloads)
+	available := maxOutstandingOffers - outstanding
+	if available < 0 {
+		available = 0
+	}
+	type candidate struct {
+		action job.HumanAction
+		row    job.Row
+	}
+	candidates := make([]candidate, 0, len(actions))
 	for _, action := range actions {
 		if action.JobID == sourceJobID ||
 			action.Kind != handoffActionKind ||
@@ -1614,33 +1693,82 @@ func (b *Bridge) reofferInstitutionalSiblings(ctx context.Context, sourceJobID s
 			b.authReleased[action.ID] {
 			continue
 		}
-		row, err := b.jobs.Get(ctx, action.JobID)
-		if errors.Is(err, sql.ErrNoRows) {
-			continue
-		}
-		if err != nil {
-			return err
-		}
-		if row.State != job.StateAwaitingHuman ||
-			resolverProfileKey(row.Policy.Resolver) != resolverProfileKey(source.Policy.Resolver) ||
-			row.LeaseActive(b.now()) {
+		row, ok := rows[action.JobID]
+		if !ok ||
+			resolverProfileKey(row.Policy.Resolver) != profile ||
+			row.LeaseActive(b.now()) ||
+			hasSettledDownload(b.pendingDownloads, row.ID) {
 			continue
 		}
 		requeued, err := b.institutionalRouteRequeued(ctx, row.ID)
 		if err != nil {
 			return err
 		}
-		if requeued || b.holder == nil || b.now().Sub(b.holder.LastSyncAt) > sessionStaleAfter {
+		if requeued {
 			continue
 		}
-		if err := b.jobs.RecordEvent(ctx, row.ID, "browser.handoff_reoffered",
+		candidates = append(candidates, candidate{action: action, row: row})
+	}
+	sort.SliceStable(candidates, func(i, j int) bool {
+		if candidates[i].row.CreatedAt == candidates[j].row.CreatedAt {
+			return candidates[i].row.ID < candidates[j].row.ID
+		}
+		return candidates[i].row.CreatedAt < candidates[j].row.CreatedAt
+	})
+	released := 0
+	for _, candidate := range candidates {
+		if released >= maxInstitutionalReoffers ||
+			b.holder == nil ||
+			b.now().Sub(b.holder.LastSyncAt) > sessionStaleAfter {
+			break
+		}
+		if !b.offered[candidate.row.ID] && available <= 0 {
+			break
+		}
+		if b.offered[candidate.row.ID] {
+			delete(b.offered, candidate.row.ID)
+			delete(b.cancelSent, candidate.row.ID)
+		} else {
+			available--
+		}
+		b.reofferPending[candidate.row.ID] = true
+		b.authReleased[candidate.action.ID] = true
+		if err := b.jobs.RecordEvent(ctx, candidate.row.ID, "browser.handoff_reoffered",
 			map[string]any{"reason": "institutional_session_live"}); err != nil {
 			return err
 		}
-		delete(b.offered, row.ID)
-		b.authReleased[action.ID] = true
+		released++
 	}
 	return nil
+}
+
+func outstandingOfferCount(
+	offered map[string]bool,
+	actions map[string]job.HumanAction,
+	rows map[string]job.Row,
+	settled map[browserDownloadKey]pendingBrowserDownload,
+) int {
+	count := 0
+	for jobID := range offered {
+		action, ok := actions[jobID]
+		if !ok || action.Kind != handoffActionKind || hasSettledDownload(settled, jobID) {
+			continue
+		}
+		row, ok := rows[jobID]
+		if ok && row.State == job.StateAwaitingHuman {
+			count++
+		}
+	}
+	return count
+}
+
+func hasSettledDownload(settled map[browserDownloadKey]pendingBrowserDownload, jobID string) bool {
+	for key := range settled {
+		if key.JobID == jobID {
+			return true
+		}
+	}
+	return false
 }
 
 // resolverProfileKey keeps the two configured spellings of the default
@@ -2021,6 +2149,16 @@ func (b *Bridge) RunSweeper(ctx context.Context, interval time.Duration) error {
 // poll offers outstanding handoff jobs (once per hello-session), announces
 // daemon-side cancels, and drains focus requests for the current holder.
 func (b *Bridge) poll(ctx context.Context) ([]json.RawMessage, error) {
+	// Auth-return and session-evidence reoffers are deliberately bounded. Keep
+	// walking that queue on ordinary browser ticks once capacity is available;
+	// this is what drains a parked backlog without requiring another evidence
+	// frame.
+	if b.reofferSourceJobID != "" && !b.reofferRanThisSync {
+		if err := b.reofferInstitutionalSiblings(ctx, b.reofferSourceJobID); err != nil {
+			return nil, err
+		}
+		b.reofferRanThisSync = true
+	}
 	awaiting, err := b.jobs.List(ctx, job.StateAwaitingHuman, 200)
 	if err != nil {
 		return nil, err
@@ -2060,18 +2198,93 @@ func (b *Bridge) poll(ctx context.Context) ([]json.RawMessage, error) {
 					return nil, evErr
 				}
 			} else {
+				delete(b.offered, row.ID)
+				delete(b.reofferPending, row.ID)
+				delete(handoff, row.ID)
 				continue // adopted; the job has left awaiting_human
 			}
 		}
-		action, ok := handoff[row.ID]
-		if !ok {
+	}
+
+	// The ordinary job list is bounded for directory scans. Open handoff
+	// actions are unbounded, however, so offer pacing can drain backlogs larger
+	// than that page without silently starving older parked jobs.
+	rows := make(map[string]job.Row, len(handoff))
+	candidateIDs := make([]string, 0, len(handoff))
+	seen := make(map[string]bool, len(handoff))
+	addCandidate := func(row job.Row) {
+		if row.State != job.StateAwaitingHuman {
+			return
+		}
+		if _, ok := handoff[row.ID]; !ok || seen[row.ID] {
+			return
+		}
+		seen[row.ID] = true
+		rows[row.ID] = row
+		candidateIDs = append(candidateIDs, row.ID)
+	}
+	for i := range awaiting {
+		addCandidate(awaiting[i])
+	}
+	for _, action := range actions {
+		if action.Kind != handoffActionKind || seen[action.JobID] {
 			continue
 		}
-		if b.offered[row.ID] {
+		row, getErr := b.jobs.Get(ctx, action.JobID)
+		if errors.Is(getErr, sql.ErrNoRows) {
 			continue
 		}
+		if getErr != nil {
+			return nil, getErr
+		}
+		addCandidate(*row)
+	}
+	for id := range b.reofferPending {
+		if !seen[id] {
+			delete(b.reofferPending, id)
+		}
+	}
+	sort.SliceStable(candidateIDs, func(i, j int) bool {
+		priority := func(id string) int {
+			switch {
+			case b.reofferPending[id]:
+				return 0
+			case b.focusPending[id]:
+				return 1
+			default:
+				return 2
+			}
+		}
+		iPriority := priority(candidateIDs[i])
+		jPriority := priority(candidateIDs[j])
+		if iPriority != jPriority {
+			return iPriority < jPriority
+		}
+		if iPriority == 0 && rows[candidateIDs[i]].CreatedAt != rows[candidateIDs[j]].CreatedAt {
+			return rows[candidateIDs[i]].CreatedAt < rows[candidateIDs[j]].CreatedAt
+		}
+		return false
+	})
+	outstanding := outstandingOfferCount(b.offered, handoff, rows, b.pendingDownloads)
+	slots := maxOutstandingOffers - outstanding
+	if slots < 0 {
+		slots = 0
+	}
+	held := 0
+	heldIDs := make(map[string]bool)
+	for _, id := range candidateIDs {
+		if hasSettledDownload(b.pendingDownloads, id) || b.offered[id] {
+			continue
+		}
+		row := rows[id]
+		action := handoff[id]
 		accessMode, offerable := b.offerableAccessMode(row)
 		if !offerable {
+			continue
+		}
+		if slots <= 0 {
+			held++
+			heldIDs[id] = true
 			continue
 		}
 		offer, err := b.offer(row, action, accessMode)
@@ -2084,6 +2297,8 @@ func (b *Bridge) poll(ctx context.Context) ([]json.RawMessage, error) {
 		}
 		out = append(out, offer)
 		b.offered[row.ID] = true
+		delete(b.reofferPending, row.ID)
+		slots--
 	}
 	// Announce a cancel for any offered job that left awaiting_human because it
 	// was cancelled daemon-side (e.g. `papio jobs cancel`).
@@ -2130,12 +2345,23 @@ func (b *Bridge) poll(ctx context.Context) ([]json.RawMessage, error) {
 				delete(b.focusPending, id)
 				continue
 			}
+			if hasSettledDownload(b.pendingDownloads, id) {
+				delete(b.focusPending, id)
+				continue
+			}
 			accessMode, offerable := b.offerableAccessMode(*row)
 			if !offerable {
 				delete(b.focusPending, id)
 				continue
 			}
 			if !b.offered[id] {
+				if slots <= 0 {
+					if !heldIDs[id] {
+						held++
+						heldIDs[id] = true
+					}
+					continue
+				}
 				offer, offerErr := b.offer(*row, handoff[id], accessMode)
 				if offerErr != nil {
 					return nil, offerErr
@@ -2146,6 +2372,8 @@ func (b *Bridge) poll(ctx context.Context) ([]json.RawMessage, error) {
 				}
 				out = append(out, offer)
 				b.offered[id] = true
+				delete(b.reofferPending, id)
+				slots--
 			}
 			frame, frameErr := b.frame(protocol.MsgHandoffFocus, id, protocol.EmptyPayload{})
 			if frameErr != nil {
@@ -2153,6 +2381,11 @@ func (b *Bridge) poll(ctx context.Context) ([]json.RawMessage, error) {
 			}
 			out = append(out, frame)
 			delete(b.focusPending, id)
+		}
+	}
+	if held > 0 {
+		if err := b.jobs.S.AppendEvent(ctx, "", "browser.offers_paced", map[string]any{"held": held}); err != nil {
+			return nil, err
 		}
 	}
 	return out, nil

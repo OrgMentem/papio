@@ -1369,6 +1369,14 @@ func TestFocusHandoffsOffersTargetOutsidePollPage(t *testing.T) {
 	if !sessionLive || queued != 1 {
 		t.Fatalf("focus result = queued:%d live:%t, want 1,true", queued, sessionLive)
 	}
+	// The four ordinary offers fill the governor. Settle one before asking
+	// focus to open a target outside the bounded job page.
+	b.mu.Lock()
+	for id := range b.offered {
+		delete(b.offered, id)
+		break
+	}
+	b.mu.Unlock()
 
 	msgs, _ := runSync(t, b)
 	var offered, focused bool
@@ -1583,8 +1591,8 @@ func TestAuthReturnedReoffersEligibleInstitutionalSiblingsOnce(t *testing.T) {
 	}
 
 	initial, _ := runSync(t, b, hello())
-	if got := countType(initial, protocol.MsgJobOffer); got != 5 {
-		t.Fatalf("initial job offers = %d, want 5", got)
+	if got := countType(initial, protocol.MsgJobOffer); got != 4 {
+		t.Fatalf("initial job offers = %d, want 4", got)
 	}
 	msgs, _ := runSync(t, b, inFrame(t, protocol.MsgAuthReturned, source, map[string]any{"elapsed_ms": 10}))
 	if got := countType(msgs, protocol.MsgJobOffer); got != 1 {
@@ -1638,6 +1646,137 @@ func TestAuthReturnedReoffersEligibleInstitutionalSiblingsOnce(t *testing.T) {
 		if got := countType(msgs, protocol.MsgJobOffer); got != 0 {
 			t.Fatalf("sibling was re-offered %d additional times", got)
 		}
+	}
+}
+
+func pacedEventDetails(t *testing.T, jobs *job.Store) []map[string]any {
+	t.Helper()
+	rows, err := jobs.S.DB().Query(`SELECT detail_json FROM events WHERE kind = 'browser.offers_paced' ORDER BY seq`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var details []map[string]any
+	for rows.Next() {
+		var raw string
+		if err := rows.Scan(&raw); err != nil {
+			t.Fatal(err)
+		}
+		var detail map[string]any
+		if err := json.Unmarshal([]byte(raw), &detail); err != nil {
+			t.Fatal(err)
+		}
+		details = append(details, detail)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return details
+}
+
+func TestOfferPacingLimitsOutstandingHandoffsAndReportsHeld(t *testing.T) {
+	b, jobs, cfg, _ := newBridge(t)
+	ids := make([]string, 0, 20)
+	for range 20 {
+		ids = append(ids, park(t, jobs, job.NewID("paced"), handoffWork()))
+	}
+
+	initial, _ := runSync(t, b, hello())
+	if got := countType(initial, protocol.MsgJobOffer); got != maxOutstandingOffers {
+		t.Fatalf("initial job offers = %d, want %d", got, maxOutstandingOffers)
+	}
+	if got := len(b.offered); got != maxOutstandingOffers {
+		t.Fatalf("initial outstanding offers = %d, want %d", got, maxOutstandingOffers)
+	}
+	events := pacedEventDetails(t, jobs)
+	if len(events) != 1 || events[0]["held"] != float64(16) {
+		t.Fatalf("initial paced events = %#v, want one event held=16", events)
+	}
+
+	// Complete two offered downloads. Their actions close through adoption,
+	// freeing exactly two governor slots for the next poll.
+	var settled []json.RawMessage
+	downloadID := int64(1)
+	for id := range b.offered {
+		writeFixturePDF(t, filepath.Join(cfg.EffectiveAdoptionRoot(), id, "paper.pdf"))
+		settled = append(settled, inFrame(t, protocol.MsgDownloadComplete, id,
+			map[string]any{"download_id": downloadID, "filename": "paper.pdf", "size_bytes": 533}))
+		downloadID++
+		if len(settled) == 2 {
+			break
+		}
+	}
+	next, _ := runSync(t, b, settled...)
+	if got := countType(next, protocol.MsgJobOffer); got != 2 {
+		t.Fatalf("offers after two settlements = %d, want 2", got)
+	}
+	events = pacedEventDetails(t, jobs)
+	if len(events) != 2 || events[1]["held"] != float64(14) {
+		t.Fatalf("paced events after refill = %#v, want one new event held=14", events)
+	}
+}
+
+func TestInstitutionalReofferPacingReleasesOldestFourAndContinuesOnSync(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	ids := make([]string, 0, 10)
+	for i := range 10 {
+		id := parkInstitutional(t, jobs, job.NewID("reoffer"), handoffWork(), "")
+		ids = append(ids, id)
+		if _, err := jobs.S.DB().ExecContext(ctx, `UPDATE jobs SET created_at = ? WHERE id = ?`,
+			time.Now().UTC().Add(time.Duration(i)*time.Second).Format(time.RFC3339Nano), id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	runSync(t, b, hello())
+
+	// Make four governor slots available, then report an authenticated source.
+	b.mu.Lock()
+	b.offered = map[string]bool{}
+	b.mu.Unlock()
+	msgs, _ := runSync(t, b, inFrame(t, protocol.MsgAuthReturned, ids[0],
+		map[string]any{"elapsed_ms": 10}))
+	if got := countType(msgs, protocol.MsgJobOffer); got != maxInstitutionalReoffers {
+		t.Fatalf("initial reoffer burst = %d, want %d", got, maxInstitutionalReoffers)
+	}
+	for _, id := range ids[1 : 1+maxInstitutionalReoffers] {
+		if !b.offered[id] {
+			t.Fatalf("oldest sibling %s was not re-offered; offered=%#v", id, b.offered)
+		}
+	}
+	for _, id := range ids[1+maxInstitutionalReoffers:] {
+		if b.offered[id] {
+			t.Fatalf("newer sibling %s jumped ahead of oldest four", id)
+		}
+	}
+
+	// Ordinary sync ticks continue the same authenticated queue after slots
+	// free; no second evidence frame is required.
+	b.mu.Lock()
+	delete(b.offered, ids[1])
+	delete(b.offered, ids[2])
+	b.mu.Unlock()
+	msgs, _ = runSync(t, b)
+	if got := countType(msgs, protocol.MsgJobOffer); got != 2 {
+		t.Fatalf("continued reoffer burst = %d, want 2 governor slots", got)
+	}
+	if !b.offered[ids[5]] || !b.offered[ids[6]] {
+		t.Fatalf("continued reoffer did not choose oldest remaining siblings: %#v", b.offered)
+	}
+	reoffers := 0
+	for _, id := range ids[1:] {
+		events, err := jobs.Events(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, event := range events {
+			if event["kind"] == "browser.handoff_reoffered" {
+				reoffers++
+			}
+		}
+	}
+	if reoffers != 6 {
+		t.Fatalf("institutional reoffer events = %d, want six across two invocations", reoffers)
 	}
 }
 

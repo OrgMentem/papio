@@ -699,17 +699,28 @@ export function renderNeedsAttention(
     return;
   }
   const pending = jobs.filter((job) => job.status === "auth_pending");
+  const challengeJobs = jobs.filter(
+    (job) =>
+      job.challenge_blocked === true &&
+      typeof job.challenge_host === "string" &&
+      job.challenge_host.trim().length > 0 &&
+      job.tab_id >= 0,
+  );
   const blocked = [
     ...new Set(blockedProviderHosts.map((host) => host.trim().toLowerCase()).filter((host) => host.length > 0)),
   ];
   const stalled = [
     ...new Set(authStalledJobs.filter((jobID) => typeof jobID === "string" && jobID.length > 0)),
   ];
-  section.hidden = pending.length === 0 && blocked.length === 0 && stalled.length === 0;
+  section.hidden =
+    pending.length === 0 && challengeJobs.length === 0 && blocked.length === 0 && stalled.length === 0;
   list.replaceChildren();
   if (section.hidden) return;
 
-  if (pending.length > 0 && blocked.length > 0) {
+  if (challengeJobs.length > 0) {
+    heading.textContent = "Security check needs you";
+    message.textContent = "Complete the security check in the open provider tab. Papio resumes automatically when it clears.";
+  } else if (pending.length > 0 && blocked.length > 0) {
     heading.textContent = "Needs your attention";
     message.textContent = "Finish your institutional sign-in and allow browser access for the listed provider pages.";
   } else if (stalled.length > 0 && pending.length === 0 && blocked.length === 0) {
@@ -721,6 +732,40 @@ export function renderNeedsAttention(
   } else {
     heading.textContent = "Allow provider access";
     message.textContent = "Papio cannot read the listed provider pages. Open Options and enable a source, or use Grant all sources.";
+  }
+
+  for (const job of challengeJobs) {
+    const row = doc.createElement("div");
+    row.className = "needs-you-item";
+    const copy = doc.createElement("div");
+    copy.className = "needs-you-copy";
+    const provider = doc.createElement("p");
+    provider.className = "needs-you-paper";
+    provider.textContent = `Security check needs you - ${job.challenge_host!.trim().toLowerCase()}`;
+    const reason = doc.createElement("p");
+    reason.className = "needs-you-reason";
+    reason.textContent = "Complete it in the open tab; papio will resume without retrying the provider.";
+    copy.append(provider, reason);
+    const button = doc.createElement("button");
+    button.className = "ghost";
+    button.type = "button";
+    button.textContent = "Go-to-tab";
+    button.addEventListener("click", () => {
+      button.disabled = true;
+      button.textContent = "Opening…";
+      void onFocus(job.job_id).then(
+        () => {
+          button.disabled = false;
+          button.textContent = "Go-to-tab";
+        },
+        () => {
+          button.disabled = false;
+          button.textContent = "Try again";
+        },
+      );
+    });
+    row.append(copy, button);
+    list.append(row);
   }
 
   for (const job of pending) {
