@@ -1737,9 +1737,8 @@ func pacedEventDetails(t *testing.T, jobs *job.Store) []map[string]any {
 
 func TestOfferPacingLimitsOutstandingHandoffsAndReportsHeld(t *testing.T) {
 	b, jobs, cfg, _ := newBridge(t)
-	ids := make([]string, 0, 20)
 	for range 20 {
-		ids = append(ids, park(t, jobs, job.NewID("paced"), handoffWork()))
+		park(t, jobs, job.NewID("paced"), handoffWork())
 	}
 
 	initial, _ := runSync(t, b, hello())
