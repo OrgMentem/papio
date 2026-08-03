@@ -50,7 +50,9 @@ export type Provider =
   | "jamanetwork"
   | "lww"
   | "informit"
-  | "primo";
+  | "primo"
+  | "mdpi"
+  | "clinicalkey";
 
 /** Scenarios that the daemon can retain as page-capture fixtures. */
 export type Scenario = "success" | "login-return" | "no-entitlement" | "drift" | "terms";
@@ -80,6 +82,8 @@ export const PROVIDERS: readonly Provider[] = [
   "lww",
   "informit",
   "primo",
+  "mdpi",
+  "clinicalkey",
 ];
 export const SCENARIOS: readonly Scenario[] = ["success", "login-return", "no-entitlement", "drift", "terms"];
 
