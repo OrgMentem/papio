@@ -274,3 +274,10 @@ func documentSchemaVersion(document string) string {
 	}
 	return envelope.SchemaVersion
 }
+
+// handoffOpenedEvent records that a human handoff was driven onto the operator's
+// screen, with the owning consumer and the batch size. It is the audit trail
+// ADR-0014 Decision 6 relies on instead of a gate: "consumer X opened N human
+// actions in M minutes" is answerable from the event stream, and a rate limit
+// would have obstructed the operator it was meant to protect.
+const handoffOpenedEvent = "handoff.opened"

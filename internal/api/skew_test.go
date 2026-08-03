@@ -5,6 +5,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"testing"
 
 	"papio/internal/config"
@@ -406,5 +407,77 @@ func TestUnattributedJobOmitsTheConsumerKey(t *testing.T) {
 	}
 	if _, ok := page.Jobs[0]["id"]; !ok {
 		t.Fatalf("row lost its ratified keys: %v", page.Jobs[0])
+	}
+}
+
+// TestHandoffOpenAuditTrailNamesTheConsumer is the evidence ADR-0014 Decision 6
+// substitutes for a gate. Autonomous drain is unratified but deliberately not
+// enforced in code — a gate is theatre, since a script passes any flag a human
+// passes, and papio's principle is that an agent driving the CLI gets exactly
+// what a human gets. That trade is only honest if the prohibition is auditable,
+// so "consumer X opened N human actions in M minutes" has to be answerable from
+// the event stream.
+//
+// It exercises recordHandoffOpened directly: system.Browser is a concrete
+// *browser.Bridge, nil under test, so openActions returns before reaching the
+// audit write. openActions calls this helper only after FocusHandoffs succeeds —
+// papio does not claim to have opened a tab it failed to open.
+func TestHandoffOpenAuditTrailNamesTheConsumer(t *testing.T) {
+	system := testSystem(t)
+	router := Router(system)
+	ctx := context.Background()
+	attributed := attributedJob(t, router, "wr_audit_owned", "10.1000/audit-owned", "inscribi:project:psyc101")
+	bare := attributedJob(t, router, "wr_audit_bare", "10.1000/audit-bare", "")
+
+	recordHandoffOpened(ctx, system, []string{attributed, bare})
+
+	events, err := system.Jobs.Events(ctx, attributed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var opened map[string]any
+	for _, event := range events {
+		if event["kind"] == handoffOpenedEvent {
+			opened = event
+		}
+	}
+	if opened == nil {
+		t.Fatalf("no %s event recorded; the drain prohibition would be neither enforced nor observable", handoffOpenedEvent)
+	}
+	detail, ok := opened["detail"].(map[string]any)
+	if !ok {
+		t.Fatalf("event carries no detail: %+v", opened)
+	}
+	if detail["consumer"] != "inscribi:project:psyc101" {
+		t.Fatalf("detail = %+v, want the owning consumer named", detail)
+	}
+	// batch_size is what separates one deliberate selector call from a loop of
+	// them; without it a drain shows up as N events indistinguishable from one
+	// operator opening N rows at once.
+	if fmt.Sprint(detail["batch_size"]) != "2" {
+		t.Fatalf("detail = %+v, want batch_size 2", detail)
+	}
+	if detail["principal"] == "" || detail["principal"] == nil {
+		t.Fatalf("detail = %+v, want the transport principal recorded", detail)
+	}
+
+	// An unattributed job still gets an audit line: the absence of a consumer is
+	// not a reason to lose the fact that a handoff was opened.
+	bareEvents, err := system.Jobs.Events(ctx, bare)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var bareOpened map[string]any
+	for _, event := range bareEvents {
+		if event["kind"] == handoffOpenedEvent {
+			bareOpened = event
+		}
+	}
+	if bareOpened == nil {
+		t.Fatal("unattributed job recorded no handoff.opened event")
+	}
+	bareDetail := bareOpened["detail"].(map[string]any)
+	if _, present := bareDetail["consumer"]; present {
+		t.Fatalf("unattributed job claims a consumer: %+v", bareDetail)
 	}
 }

@@ -1155,7 +1155,52 @@ func openActions(ctx context.Context, raw json.RawMessage, system *bootstrap.Sys
 	if err != nil {
 		return failure(err)
 	}
+	recordHandoffOpened(ctx, system, params.JobIDs)
 	return marshal(ActionsOpenResult{Queued: queued, SessionLive: sessionLive})
+}
+
+// recordHandoffOpened leaves an auditable trace of who drove a human handoff onto
+// the operator's screen.
+//
+// ADR-0009 does not ratify autonomous drain: a background consumer must not open
+// human work on its own. ADR-0014 Decision 6 declines to enforce that with a gate
+// or an --operator-intent flag — scripts pass flags, and an agent driving the CLI
+// is meant to get exactly what a human gets — so the prohibition rests on being
+// auditable instead. Until this event existed it was neither enforced nor
+// observable, which is the one combination papio should never ship.
+//
+// It records the handoff's OWNER, not a self-declared opener. The owner was
+// recorded at submit and is a fact papio holds; an opener label would be an
+// unverifiable string supplied by the very caller under audit, and carrying it
+// would mean a new param on a ratified method. A consumer looping its own ranked
+// queue is opening its own jobs, so the burst is attributable either way — and
+// when an operator opens someone else's handoff, naming the owner is still a true
+// statement.
+//
+// A failed write is dropped: the tabs are already open, and losing an audit line
+// must not turn a completed handoff into a reported error.
+func recordHandoffOpened(ctx context.Context, system *bootstrap.System, jobIDs []string) {
+	if system.Jobs == nil || len(jobIDs) == 0 {
+		return
+	}
+	consumers, err := system.Jobs.ConsumersFor(ctx, jobIDs)
+	if err != nil {
+		return
+	}
+	principal := string(PrincipalFrom(ctx))
+	for _, jobID := range jobIDs {
+		detail := map[string]any{
+			"principal": principal,
+			// batch_size is what separates one deliberate selector call from a
+			// loop of them: the drain pattern is many single-job opens in quick
+			// succession, which looks nothing like an operator opening a queue.
+			"batch_size": len(jobIDs),
+		}
+		if consumer, ok := consumers[jobID]; ok {
+			detail["consumer"] = consumer
+		}
+		_ = system.Jobs.RecordEvent(ctx, jobID, handoffOpenedEvent, detail)
+	}
 }
 
 func getArtifact(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {

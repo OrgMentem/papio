@@ -229,11 +229,40 @@ so a consumer can say *"this is the one worth a human's attention now"*, which i
 the opposite of draining.
 
 This is a boundary on consumer behaviour that *papio* deliberately does not
-enforce in code. It could rate-limit `actions.open`, and does not: the daemon
-cannot distinguish an operator clicking through their own ranked queue from a
-script doing it, and a limit low enough to stop the script would obstruct the
-operator. The honest position is a documented boundary plus an unratified
-capability, not a guardrail that punishes the person it is meant to protect.
+enforce in code. A gate would be theatre: a script passes any flag a human
+passes, and an `--operator-intent` flag would break the principle that an agent
+driving the CLI gets exactly what a human gets. A rate limit is worse — the
+daemon cannot distinguish an operator clicking through their own ranked queue
+from a script doing it, so a limit low enough to stop the script obstructs the
+person it protects.
+
+**So the prohibition is made auditable instead.** `actions.open` records a
+`handoff.opened` event per job carrying the owning consumer, the transport
+principal, and the batch size, so "consumer X opened N human actions in M
+minutes" is answerable from the event stream and a drain shows up as an anomaly
+in `doctor` or the activity feed. Batch size is what makes it legible: the drain
+pattern is many single-job opens in quick succession, which looks nothing like
+one operator opening a queue. Until this event existed the boundary was neither
+enforced nor observable, which is the one combination *papio* should never ship —
+truthful evidence over a fake gate.
+
+The event names the handoff's **owner**, recorded at submit, not a self-declared
+opener: an opener label would be an unverifiable string supplied by the caller
+under audit, and carrying it would mean a new param on a ratified method. A
+consumer looping its own ranked queue is opening its own jobs, so the burst is
+attributable either way.
+
+The physical blast radius is separately bounded, and not by this decision: the
+browser bridge caps unsettled institutional handoffs per session and the
+extension drives a small fixed number of concurrent tabs, so a drain loop cannot
+flood a browser even unaudited. That is a happy accident of another design, not a
+licence — it bounds the damage, not the behaviour.
+
+**Tripwire.** If audit shows a background consumer looping the selector, the
+remedy is to ratify a proper consumer verb for what it is actually trying to do,
+or to revoke its access — **never** a rate limit. A limit would degrade the
+operator's own use of a ratified verb to punish a caller who should either be
+served properly or refused outright.
 
 ## Consequences
 

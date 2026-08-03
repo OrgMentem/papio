@@ -63,6 +63,17 @@ execution records in `notes/acquisition-stack-plan.md`.
   artifact — is satisfied rather than evaded by keying the evidence to the job
   and candidate. The accepted candidate's bundle remains the only success
   provenance document.
+- **`papio actions open` now leaves an audit trail.** Each opened handoff records
+  a `handoff.opened` event carrying the owning consumer, the transport principal,
+  and the batch size. ADR-0009 does not ratify autonomous drain — a background
+  consumer must not open human work on its own — and ADR-0014 Decision 6 declines
+  to enforce that with a gate, because a script passes any flag a human passes and
+  an agent driving the CLI is meant to get exactly what a human gets. That trade
+  is only honest if the boundary is observable: "consumer X opened N human actions
+  in M minutes" is now answerable from the event stream, and a drain reads as an
+  anomaly rather than as normal traffic. The event names the handoff's owner,
+  recorded at submit, rather than an unverifiable label supplied by the caller
+  under audit.
 - **An open human action that has waited too long is reported stale.** A
   handoff queued weeks ago sat in the queue indistinguishable from one queued
   this morning. `papio actions list` now reports `stale` and `age_seconds` per
