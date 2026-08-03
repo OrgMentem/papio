@@ -135,6 +135,11 @@ type Browser struct {
 	// library. The top-level OpenURLBase / ShibbolethEntityID /
 	// ProquestAccountID fields above are the implicit "default" profile.
 	Resolvers map[string]Institution `toml:"resolvers,omitempty"`
+	// DefaultResolver selects the named browser resolver profile when a request
+	// omits resolver. Empty preserves the historical default institution. Older
+	// strict-mode daemons reject this unknown field, so config writers should
+	// only emit it when talking to a daemon that supports resolver profiles.
+	DefaultResolver string `toml:"default_resolver,omitempty"`
 	// AdoptionRoot is the directory Chrome downloads into for adoption;
 	// the daemon rejects reported paths outside <root>/<job_id>/.
 	// Default: <data_dir>/adoptions.
@@ -535,6 +540,16 @@ func (c *Config) validate() error {
 			return fmt.Errorf("browser.resolvers.%s.proquest_account_id must be digits (max 64)", name)
 		}
 	}
+	if defaultResolver := strings.TrimSpace(c.Browser.DefaultResolver); defaultResolver != "" {
+		if _, ok := c.InstitutionFor(defaultResolver); !ok {
+			names := c.ResolverNames()
+			if len(names) == 0 {
+				return fmt.Errorf("browser.default_resolver %q is not configured (configured profiles: none)", defaultResolver)
+			}
+			return fmt.Errorf("browser.default_resolver %q is not configured (configured profiles: %s)", defaultResolver, strings.Join(names, ", "))
+		}
+		c.Browser.DefaultResolver = defaultResolver
+	}
 	if c.Browser.ActionExpirySeconds < 0 {
 		return fmt.Errorf("browser.action_expiry_seconds must be >= 0")
 	}
@@ -854,6 +869,7 @@ func (c *Config) ResolverOrigins() []string {
 			return
 		}
 		seen[origin] = struct{}{}
+
 		origins = append(origins, origin)
 	}
 	add(c.Browser.OpenURLBase)
@@ -866,6 +882,52 @@ func (c *Config) ResolverOrigins() []string {
 		origins = origins[:32]
 	}
 	return origins
+}
+
+// ResolverProfileForOrigin maps a validated resolver origin to its configured
+// profile. Matching includes the effective HTTPS port because two profiles on
+// the same hostname may legitimately use different resolver listeners. An
+// origin shared by multiple profiles is ambiguous and fails closed.
+func (c *Config) ResolverProfileForOrigin(origin string) (string, bool) {
+	u, err := url.Parse(strings.TrimSpace(origin))
+	if err != nil || u.Scheme != "https" || u.Hostname() == "" || u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
+		return "", false
+	}
+	originHost := strings.ToLower(u.Hostname())
+	originPort := u.Port()
+	if originPort == "" {
+		originPort = "443"
+	}
+	match := ""
+	for _, name := range c.ResolverNames() {
+		inst, ok := c.InstitutionFor(name)
+		if !ok || inst.OpenURLBase == "" {
+			continue
+		}
+		base, parseErr := url.Parse(inst.OpenURLBase)
+		if parseErr != nil || base.Scheme != "https" || base.Hostname() == "" {
+			continue
+		}
+		basePort := base.Port()
+		if basePort == "" {
+			basePort = "443"
+		}
+		if !strings.EqualFold(base.Hostname(), originHost) || basePort != originPort {
+			continue
+		}
+		if match != "" && match != name {
+			return "", false
+		}
+		match = resolverProfileName(name)
+	}
+	return match, match != ""
+}
+
+func resolverProfileName(name string) string {
+	if name == "" || name == "default" {
+		return "default"
+	}
+	return name
 }
 
 // Save validates and atomically writes cfg as a user-only TOML file. An empty

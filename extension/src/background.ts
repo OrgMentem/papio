@@ -62,7 +62,12 @@ import {
 } from "./adapters/types";
 import { observeUnknown, type ObserveChromeApi } from "./observe";
 import { chromeKeepaliveAPI, initKeepalive, isAuthenticationURL } from "./keepalive";
-import type { KeepaliveManager, KeepaliveProbeSource, KeepaliveSnapshot } from "./keepalive";
+import type {
+  KeepaliveManager,
+  KeepaliveOriginSnapshot,
+  KeepaliveProbeSource,
+  KeepaliveSnapshot,
+} from "./keepalive";
 import { routeResolverService, type ResolverRoute } from "./resolver";
 import { detectAuthFailure } from "./authfail";
 
@@ -578,7 +583,7 @@ export interface BridgeDeps {
    * with an extension reload, orphaning every tab papio opened in its previous
    * life; this ledger survives the reload so the popup can offer a one-click
    * cleanup instead of leaking those tabs forever. Optional: absent disables
-   * the ledger but the papio-group sweep still finds pre-ledger leftovers. */
+   * durable orphan ownership tracking. */
   tabLedger?: {
     load(): Promise<Record<string, number>>;
     save(entries: Record<string, number>): Promise<void>;
@@ -958,6 +963,8 @@ export class Bridge {
   private readonly closingTabs = new Set<number>();
   /** Lazily-loaded durable ledger of broker tabs this and prior extension
    * lives created. Keys are stringified tab ids, values open timestamps. */
+  /** Serializes every managed-tab ledger load/mutate/save transaction. */
+  private tabLedgerChain: Promise<void> = Promise.resolve();
   private tabLedgerCache: Record<string, number> | undefined;
   /** A finished download keeps its broker tab open until the daemon has
    * acknowledged the adoption attempt for that job. */
@@ -1152,6 +1159,48 @@ export class Bridge {
     void this.syncConnectionBadge();
   }
 
+  private resolverOriginHint(rawURL: string | undefined): string | undefined {
+    if (rawURL === undefined || isAuthenticationURL(rawURL)) return undefined;
+    try {
+      const parsed = new URL(rawURL);
+      const origin = `${parsed.protocol}//${parsed.host}`;
+      return isBareHTTPSOrigin(origin) ? origin : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  knownResolverOrigins(): readonly string[] {
+    const origins = new Set<string>();
+    const candidates = [...(this.store.resolverOrigins ?? []), ...this.offerURLs.values()];
+    for (const candidate of candidates) {
+      const origin = this.resolverOriginHint(candidate);
+      if (origin !== undefined) origins.add(origin);
+    }
+    return [...origins];
+  }
+
+  sessionOriginStates(): KeepaliveOriginSnapshot[] {
+    const manager = this.keepaliveManager;
+    if (manager !== undefined) return manager.getOriginSnapshots();
+    const state = this.sessionState();
+    return this.knownResolverOrigins().map((origin) => {
+      const isDefault = origin === state.resolverOrigin;
+      return {
+        origin,
+        authenticated: isDefault && state.authenticated,
+        verdict: isDefault ? (state.verdict ?? "unknown") : "unknown",
+        probeSource: isDefault ? (state.probeSource ?? "none") : "none",
+        ...(isDefault && state.scanOutcome !== undefined ? { scanOutcome: state.scanOutcome } : {}),
+        lastVerdictAt: isDefault ? (state.lastVerdictAt ?? null) : null,
+        checking: isDefault && state.checking === true,
+        likelyAuthenticated: isDefault && state.likelyAuthenticated === true,
+        pausedForReauth: isDefault && state.pausedForReauth,
+        lastCheckAt: isDefault ? state.lastCheckAt : null,
+      };
+    });
+  }
+
   sessionState(): BridgeSessionState {
     const fallback: KeepaliveSnapshot = {
       enabled: true,
@@ -1191,8 +1240,20 @@ export class Bridge {
     return this.sessionState();
   }
 
-  async requestSessionSignIn(): Promise<BrokerReply<{ opened: true }>> {
+  async requestSessionSignIn(origin?: string): Promise<BrokerReply<{ opened: true }>> {
     await this.ready;
+    if (origin !== undefined) {
+      if (!isBareHTTPSOrigin(origin)) {
+        return this.failure("resolver_unavailable", "No resolver configured yet — open a paper first");
+      }
+      const tabID = await this.openManagedTab({
+        url: origin,
+        purpose: "session-signin",
+      });
+      return tabID === undefined
+        ? this.failure("session_open_failed", "Could not open the institution sign-in")
+        : { ok: true, opened: true };
+    }
     const manager = this.keepaliveManager;
     let resolverOrigin = manager?.getSnapshot().resolverOrigin ?? this.latestResolverOrigin();
     if (manager !== undefined) {
@@ -1213,7 +1274,6 @@ export class Bridge {
     return tabID === undefined
       ? this.failure("session_open_failed", "Could not open the institution sign-in")
       : { ok: true, opened: true };
-
   }
 
   async retryAuthStalled(jobID: string): Promise<BrokerReply<{ opened: true }>> {
@@ -1583,23 +1643,43 @@ export class Bridge {
     await this.update((s) => patchJob(s, jobID, { tab_id: tabID }));
   }
 
-  private async loadTabLedger(): Promise<Record<string, number>> {
-    if (this.tabLedgerCache === undefined) {
-      try {
-        this.tabLedgerCache = (await this.deps.tabLedger?.load()) ?? {};
-      } catch {
-        this.tabLedgerCache = {};
-      }
-    }
-    return this.tabLedgerCache;
-  }
-
   private async saveTabLedger(ledger: Record<string, number>): Promise<void> {
+    const snapshot = { ...ledger };
     try {
-      await this.deps.tabLedger?.save(ledger);
+      await this.deps.tabLedger?.save(snapshot);
     } catch {
       // Best-effort durability: a failed write only degrades future cleanup.
     }
+  }
+
+  /** Load, mutate, and persist the managed-tab ledger as one serialized
+   * transaction. Every cache and storage value is a fresh snapshot so a later
+   * mutation cannot rewrite an earlier save's object in place. */
+  private runTabLedgerTransaction<T>(
+    transaction: (
+      ledger: Record<string, number>,
+    ) => Promise<{ value: T; changed: boolean }> | { value: T; changed: boolean },
+  ): Promise<T> {
+    const operation = this.tabLedgerChain.then(async () => {
+      let cached = this.tabLedgerCache;
+      if (cached === undefined) {
+        try {
+          cached = (await this.deps.tabLedger?.load()) ?? {};
+        } catch {
+          cached = {};
+        }
+      }
+      const ledger = { ...cached };
+      const result = await transaction(ledger);
+      this.tabLedgerCache = { ...ledger };
+      if (result.changed) await this.saveTabLedger(this.tabLedgerCache);
+      return result.value;
+    });
+    this.tabLedgerChain = operation.then(
+      () => undefined,
+      () => undefined,
+    );
+    return operation;
   }
 
   /** Record a broker tab papio CREATED. Reused tabs are deliberately never
@@ -1608,79 +1688,61 @@ export class Bridge {
    * a tab it did not open. */
   private async ledgerManagedTab(tabID: number): Promise<void> {
     if (this.deps.tabLedger === undefined) return;
-    const ledger = await this.loadTabLedger();
-    if (ledger[String(tabID)] !== undefined) return;
-    ledger[String(tabID)] = this.deps.now();
-    await this.saveTabLedger(ledger);
+    await this.runTabLedgerTransaction(async (ledger) => {
+      const key = String(tabID);
+      if (ledger[key] !== undefined) return { value: undefined, changed: false };
+      ledger[key] = this.deps.now();
+      return { value: undefined, changed: true };
+    });
   }
 
   private async forgetLedgeredTab(tabID: number): Promise<void> {
     if (this.deps.tabLedger === undefined) return;
-    const ledger = await this.loadTabLedger();
-    if (ledger[String(tabID)] === undefined) return;
-    delete ledger[String(tabID)];
-    await this.saveTabLedger(ledger);
+    await this.runTabLedgerTransaction(async (ledger) => {
+      const key = String(tabID);
+      if (ledger[key] === undefined) return { value: undefined, changed: false };
+      delete ledger[key];
+      return { value: undefined, changed: true };
+    });
   }
 
   /** Tabs papio opened but no longer tracks: ledgered tabs from a previous
-   * extension life plus pre-ledger leftovers still sitting in a papio-titled
-   * tab group. Excludes every currently tracked tab and any tab the user is
-   * actively viewing. Dead ledger entries are pruned as a side effect. */
+   * extension life. Excludes every currently tracked tab and any tab the user
+   * is actively viewing. Dead ledger entries are pruned as a side effect. */
   async orphanTabStatus(): Promise<{ count: number; tab_ids: number[] }> {
     await this.ready;
+    if (this.deps.tabLedger === undefined) return { count: 0, tab_ids: [] };
     const tracked = new Set<number>();
     for (const job of this.store.activeJobs) if (job.tab_id >= 0) tracked.add(job.tab_id);
     for (const id of this.completedDownloadTabs.values()) tracked.add(id);
     for (const id of this.closingTabs) tracked.add(id);
-    const orphans = new Set<number>();
-    const ledger = await this.loadTabLedger();
-    let pruned = false;
-    for (const key of Object.keys(ledger)) {
-      const tabID = Number(key);
-      if (!Number.isInteger(tabID) || tabID < 0) {
-        delete ledger[key];
-        pruned = true;
-        continue;
-      }
-      if (tracked.has(tabID)) continue;
-      let tab: TabInfo;
-      try {
-        tab = await this.deps.tabs.get(tabID);
-      } catch {
-        delete ledger[key];
-        pruned = true;
-        continue;
-      }
-      // Never the tab the user is looking at, and never the keepalive
-      // resolver tab — Chrome marks it pinned, and it is papio's session.
-      if (tab.active === true || tab.pinned === true) continue;
-      orphans.add(tabID);
-    }
-    if (pruned) await this.saveTabLedger(ledger);
-    const groups = await this.findHandoffGroups();
-    if (groups !== undefined && this.deps.tabs.query !== undefined) {
-      for (const group of groups) {
-        let members: TabInfo[];
-        try {
-          members = await this.deps.tabs.query({ groupId: group.id });
-        } catch {
+    return this.runTabLedgerTransaction(async (ledger) => {
+      const orphans = new Set<number>();
+      let changed = false;
+      for (const key of Object.keys(ledger)) {
+        const tabID = Number(key);
+        if (!Number.isInteger(tabID) || tabID < 0) {
+          delete ledger[key];
+          changed = true;
           continue;
         }
-        for (const tab of members) {
-          if (
-            tab.id === undefined ||
-            tracked.has(tab.id) ||
-            tab.active === true ||
-            tab.pinned === true
-          ) {
-            continue;
-          }
-          orphans.add(tab.id);
+        if (tracked.has(tabID)) continue;
+        let tab: TabInfo;
+        try {
+          tab = await this.deps.tabs.get(tabID);
+        } catch {
+          delete ledger[key];
+          changed = true;
+          continue;
         }
+        // Never the tab the user is looking at, and never the keepalive
+        // resolver tab — Chrome marks it pinned, and it is papio's session.
+        if (tab.active === true || tab.pinned === true) continue;
+        orphans.add(tabID);
       }
-    }
-    const tabIds = [...orphans].sort((a, b) => a - b);
-    return { count: tabIds.length, tab_ids: tabIds };
+      const tab_ids = [...orphans].sort((a, b) => a - b);
+      return { value: { count: tab_ids.length, tab_ids }, changed };
+    });
   }
 
   /** Operator-initiated: close every orphan the scan finds. Failures are
@@ -2246,11 +2308,12 @@ export class Bridge {
   }
 
   /** Reclaim a slot after the operator completes a challenge on the same tab.
-   * No navigation occurs here; the next page update drives normal assessment. */
-  async resumeHandoffAfterManual(jobID: string): Promise<void> {
+   * No navigation occurs here; the next page update drives normal assessment.
+   * Classification must wait when all governor slots remain occupied. */
+  async resumeHandoffAfterManual(jobID: string): Promise<boolean> {
     await this.ready;
     const job = findByJob(this.store, jobID);
-    if (job === undefined || job.tab_id < 0) return;
+    if (job === undefined || job.tab_id < 0) return false;
     if (!this.handoffDrives.has(jobID)) {
       if (this.handoffDrives.size >= HANDOFF_DRIVE_LIMIT) {
         this.enqueueHandoffDrive({ jobID, purpose: "handoff", focusExisting: false });
@@ -2259,6 +2322,7 @@ export class Bridge {
       }
     }
     await this.drainHandoffDriveQueue();
+    return this.handoffDrives.has(jobID);
   }
 
   /** Keepalive must preserve an institutional session, not follow whichever
@@ -3636,9 +3700,8 @@ export class Bridge {
     await this.parkHandoffForManual(job.job_id);
     await this.syncConnectionBadge();
   }
-
-  private async clearChallengeBlock(job: ActiveJob): Promise<void> {
-    if (job.challenge_blocked !== true) return;
+  private async clearChallengeBlock(job: ActiveJob): Promise<boolean> {
+    if (job.challenge_blocked !== true) return false;
     const providerHost = job.challenge_host;
     await this.update((store) => {
       const activeJobs = store.activeJobs.map((candidate) => {
@@ -3657,9 +3720,10 @@ export class Bridge {
     if (providerHost !== undefined) this.challengeCooldownTimers.delete(providerHost);
     this.challengeBlockedOutcomeSent.delete(`${job.job_id}:challenge_blocked`);
     await this.clearProviderDrainPark(this.providerKeyForJob(job));
-    await this.resumeHandoffAfterManual(job.job_id);
+    const resumed = await this.resumeHandoffAfterManual(job.job_id);
     await this.releaseQueuedHandoffs();
     await this.syncConnectionBadge();
+    return resumed;
   }
 
 
@@ -3986,7 +4050,7 @@ export class Bridge {
     }
   }
 
-  emitSessionEvidence(evidence: "warm_verified" | "auth_returned"): boolean {
+  emitSessionEvidence(evidence: "warm_verified" | "auth_returned", originHint?: string): boolean {
     const now = this.deps.now();
     const sentAt = this.sessionEvidenceSentAt;
     if (sentAt !== undefined) {
@@ -3994,41 +4058,45 @@ export class Bridge {
       if (age >= 0 && age < SESSION_EVIDENCE_THROTTLE_MS) return false;
     }
     if (!(this.store.daemonFeatures ?? []).includes(SESSION_EVIDENCE_FEATURE)) return false;
-    const originHint = this.keepaliveManager?.getSnapshot().resolverOrigin ?? this.latestResolverOrigin();
+    const candidateOrigin =
+      originHint ?? this.keepaliveManager?.getSnapshot().resolverOrigin ?? this.latestResolverOrigin();
     const payload: Record<string, unknown> = {
       evidence,
       at: new Date(now).toISOString(),
     };
-    if (originHint !== undefined) {
-      try {
-        const parsed = new URL(originHint);
-        if (parsed.protocol === "https:" && parsed.host !== "" && `${parsed.protocol}//${parsed.host}` === originHint) {
-          payload.origin_hint = originHint;
-        }
-      } catch {
-        // Origin hints are advisory and never block the timing signal.
-      }
-    }
+    if (isBareHTTPSOrigin(candidateOrigin)) payload.origin_hint = candidateOrigin;
     if (!this.send("session_evidence", payload)) return false;
     this.sessionEvidenceSentAt = now;
     return true;
   }
 
-  /** Called by keepalive only after its resolver tab has returned from login. */
-  async setKeepaliveAuthenticated(authenticated: boolean): Promise<void> {
+  /** Called by keepalive only after its resolver tab has returned from login.
+   * A per-origin warm verdict must not release another institution's queue. */
+  async setKeepaliveAuthenticated(authenticated: boolean, origin?: string): Promise<void> {
     this.keepaliveAuthenticated = authenticated;
     if (!authenticated) return;
     await this.ready;
     await this.update((s) => ({ ...s, lastAuthReturnedAt: this.deps.now() }));
-    await this.releaseQueuedHandoffs();
+    const warmOrigin = origin === undefined ? undefined : this.resolverOriginHint(origin) ?? null;
+    await this.releaseQueuedHandoffs(undefined, false, warmOrigin);
   }
 
-  private async releaseQueuedHandoffs(fallbackJobID?: string, forceProvider = false): Promise<void> {
+  private async releaseQueuedHandoffs(
+    fallbackJobID?: string,
+    forceProvider = false,
+    resolverOrigin?: string | null,
+  ): Promise<void> {
     if (fallbackJobID !== undefined) this.pendingForcedReleases.add(fallbackJobID);
     if (forceProvider && fallbackJobID !== undefined) {
       const forced = findByJob(this.store, fallbackJobID);
       if (forced !== undefined) await this.clearProviderDrainPark(this.providerKeyForJob(forced));
     }
+    const matchesOrigin =
+      resolverOrigin === undefined
+        ? (_job: ActiveJob) => true
+        : resolverOrigin === null
+          ? (_job: ActiveJob) => false
+          : (job: ActiveJob) => this.resolverOriginHint(this.offerURLs.get(job.job_id)) === resolverOrigin;
     await this.drainHandoffDriveQueue();
     if (!this.hasAuthEvidence() && !this.openAccessLandingObserved && this.pendingForcedReleases.size === 0) {
       return;
@@ -4049,6 +4117,7 @@ export class Bridge {
       ) {
         let selected = this.store.activeJobs.find(
           (job) =>
+            matchesOrigin(job) &&
             job.status === "queued" &&
             this.hasHandoffReleaseEvidence(job.requires_auth) &&
             !this.challengeCooldownActiveForHosts(job.provider_hosts) &&
@@ -4057,7 +4126,9 @@ export class Bridge {
         let forcedJobID: string | undefined;
         if (selected === undefined) {
           for (const jobID of this.pendingForcedReleases) {
-            const candidate = this.store.activeJobs.find((job) => job.job_id === jobID && job.status === "queued");
+            const candidate = this.store.activeJobs.find(
+              (job) => matchesOrigin(job) && job.job_id === jobID && job.status === "queued",
+            );
             if (candidate === undefined) {
               this.pendingForcedReleases.delete(jobID);
               continue;
@@ -4864,7 +4935,7 @@ export class Bridge {
           return;
         }
         if (assessment?.kind === "normal" && job.challenge_blocked === true) {
-          await this.clearChallengeBlock(job);
+          if (!(await this.clearChallengeBlock(job))) return;
         }
       } catch (e) {
         console.error("papio: driven-page assessment failed; continuing handoff", e);
@@ -4913,7 +4984,7 @@ export class Bridge {
       this.deliverySessionEvidence.set(job.job_id, "fresh_auth");
       await this.update((s) => patchJob(s, job.job_id, { status: "awaiting_download" }));
       this.send("auth_returned", { elapsed_ms: elapsed }, job.job_id);
-      this.emitSessionEvidence("auth_returned");
+      this.emitSessionEvidence("auth_returned", this.resolverOriginHint(this.offerURLs.get(job.job_id)));
       // The human is past authentication; fold the "papio" group back away.
       await this.recollapseHandoffGroup(tabID);
       const institutionalSession = await this.recordInstitutionalSession(job, url, now);
@@ -5264,7 +5335,7 @@ export class Bridge {
       return;
     }
     if (assessmentKind === "normal" && currentJob.challenge_blocked === true) {
-      await this.clearChallengeBlock(currentJob);
+      if (!(await this.clearChallengeBlock(currentJob))) return;
     }
 
     const ctx: AdapterContext = { expected: { ...(currentJob.expected ?? {}) } };
@@ -5546,6 +5617,11 @@ export class Bridge {
               return;
             }
           }
+          // Consent is an await boundary shared by concurrent classifications.
+          // Re-read the durable latch before this synchronous update claims the
+          // job, so only one classifier can initiate the download.
+          const latestJob = findByJob(this.store, jobID);
+          if (latestJob === undefined || latestJob.download_initiated === true) return;
           // Latch BEFORE resolving/downloading (persisted) so no
           // re-classification can ever initiate a second download for this
           // job. Failure falls back to assisted mode; the user can still use
@@ -5709,6 +5785,7 @@ export class Bridge {
       // The browser download is independent of the source tab. Keep its exact
       // correlation and pending record alive when the operator closes the PDF.
       await this.update((s) => patchJob(s, job.job_id, { tab_id: -1 }));
+      await this.drainHandoffDriveQueue();
       return;
     }
     // Once the user is past authentication (awaiting_download), a closed tab is
@@ -6016,11 +6093,29 @@ type InboxRuntimeReply =
   | BrokerReply<{ opened: true }>
   | BrokerReply<{ stats: Record<string, unknown> }>
   | BrokerReply<{ feature: boolean; entries: ActivityEntryPayload[] }>
-  | BrokerReply<{ state: BridgeSessionState }>
+  | BrokerReply<{ state: BridgeSessionState; origins: KeepaliveOriginSnapshot[] }>
   | DeliveryReply;
 
 function isObjectRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function isBareHTTPSOrigin(value: unknown): value is string {
+  if (typeof value !== "string" || value.length === 0 || value.length > 300) return false;
+  try {
+    const parsed = new URL(value);
+    return (
+      parsed.protocol === "https:" &&
+      parsed.username === "" &&
+      parsed.password === "" &&
+      parsed.pathname === "/" &&
+      parsed.search === "" &&
+      parsed.hash === "" &&
+      parsed.host !== "" &&
+      `${parsed.protocol}//${parsed.host}` === value
+    );
+  } catch {
+    return false;
+  }
 }
 
 function hasOnlyKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
@@ -6238,12 +6333,19 @@ export async function handleInboxRuntimeMessage(
   if (type === "papio.session.state") {
     if (!isPopupSender(sender, urls)) return runtimeFailure("unauthorized", "This sender cannot access institution session state");
     if (!hasOnlyKeys(message, ["type"])) return runtimeFailure("invalid_request", "Invalid institution session request");
-    return { ok: true, state: await bridge.refreshSessionState() };
+    return {
+      ok: true,
+      state: await bridge.refreshSessionState(),
+      origins: bridge.sessionOriginStates(),
+    };
   }
   if (type === "papio.session.signin") {
     if (!isPopupSender(sender, urls)) return runtimeFailure("unauthorized", "This sender cannot control institution sign-in");
-    if (!hasOnlyKeys(message, ["type"])) return runtimeFailure("invalid_request", "Invalid institution sign-in request");
-    return bridge.requestSessionSignIn();
+    if (!hasOnlyKeys(message, ["type", "origin"])) return runtimeFailure("invalid_request", "Invalid institution sign-in request");
+    const origin = message["origin"];
+    if (origin === undefined) return bridge.requestSessionSignIn();
+    if (!isBareHTTPSOrigin(origin)) return runtimeFailure("invalid_request", "Invalid institution sign-in request");
+    return bridge.requestSessionSignIn(origin);
   }
   if (type === "papio.session.retry") {
     if (!isPopupSender(sender, urls)) return runtimeFailure("unauthorized", "This sender cannot retry institution handoffs");
@@ -6262,7 +6364,9 @@ export async function handleInboxRuntimeMessage(
   ) {
     return undefined;
   }
-  if (!isInboxSender(sender, urls)) {
+  const senderAuthorized =
+    type === "papio.activity" ? isInboxOrPopupSender(sender, urls) : isInboxSender(sender, urls);
+  if (!senderAuthorized) {
     return runtimeFailure("unauthorized", "This sender cannot access the inbox broker");
   }
   if (!hasOnlyKeys(message, ["type", "request"])) {
@@ -6533,16 +6637,17 @@ if (typeof chrome !== "undefined" && chrome.runtime?.id) {
       trackedJobCount: () => bridge.trackedJobCount(),
       warmDemand: () => bridge.warmDemand(),
       latestOpenURL: () => bridge.latestOpenURL(),
+      knownResolverOrigins: () => bridge.knownResolverOrigins(),
       queuedAuthJobs: () => bridge.queuedAuthJobs(),
       stalledAuthJobs: () => bridge.stalledAuthJobIDs(),
       lastAuthReturnedAt: () => bridge.lastAuthReturnedAt(),
       workWindowID: () => bridge.workWindowIDForKeepalive(),
       onTabPlaced: (tabID) => bridge.foldKeepaliveTab(tabID),
-      onAuthenticationChanged: (authenticated) => {
-        void bridge.setKeepaliveAuthenticated(authenticated);
+      onAuthenticationChanged: (authenticated, origin?: string) => {
+        void bridge.setKeepaliveAuthenticated(authenticated, origin);
       },
-      onSessionEvidence: (_source: KeepaliveProbeSource) => {
-        bridge.emitSessionEvidence("warm_verified");
+      onSessionEvidence: (_source: KeepaliveProbeSource, origin?: string) => {
+        bridge.emitSessionEvidence("warm_verified", origin);
       },
       onReauthStateChanged: (paused) => bridge.setKeepaliveReauthNeeded(paused),
       surfaceReauthTab: async (tabID) => {

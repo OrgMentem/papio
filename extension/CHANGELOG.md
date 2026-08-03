@@ -18,14 +18,22 @@ for the full pre-split extension history.
 
 ### Added
 
+- **One session row per institution.** The popup's institution card renders a
+  row for every configured resolver origin — each with its own evidence-based
+  verdict, freshness, and a Sign in button that opens *that* institution —
+  and keep-warm tracks each origin separately. A warm session releases only
+  the queued work its institution can actually unlock.
+- **Session verdicts got stricter.** An auth-shaped URL alone never reads as
+  signed out (inspection evidence is required), expired identity tokens no
+  longer count as signed in, and sign-out markers are read only from real
+  controls and links — never from page scripts, styles, or aggregate text.
 - **Leftover tabs from a previous papio life get a one-click cleanup.** Broker
-  tabs papio creates are now recorded in a durable ledger, so after an
-  extension reload or update — which wipes papio's live tab tracking — the
-  popup offers "Leftover papio tabs · Close them" instead of leaking them
-  forever. The scan also recognizes pre-ledger tabs still sitting in a
-  papio-titled tab group, never touches a tab papio merely reused rather than
-  created, and never closes a tab the user is currently viewing or one an
-  active job still tracks.
+  tabs papio creates are recorded in a durable ledger, so after an extension
+  reload or update — which wipes papio's live tab tracking — the popup offers
+  "Leftover papio tabs · Close them" instead of leaking them forever. Only
+  ledger-owned tabs are ever closed: a tab papio merely reused, a tab the
+  user is viewing, a tab an active job still tracks, or a stranger tab that
+  merely sits in a papio-titled group is never touched.
 - **The popup can send the current PDF to *papio*.** It classifies the active tab
   as a PDF, DOI page, or neither; for a PDF it queues or joins the matching
   job, starts a browser-managed download under `papio/<job-id>/`, and reports

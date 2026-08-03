@@ -79,6 +79,20 @@ export interface KeepaliveAPI {
   action?: KeepaliveAction;
 }
 
+export interface KeepaliveOriginSnapshot {
+  /** The resolver origin this state belongs to; never an IdP URL. */
+  origin: string;
+  authenticated: boolean;
+  verdict: SessionVerdict;
+  probeSource: KeepaliveProbeSource;
+  scanOutcome?: ScanOutcome;
+  lastVerdictAt: number | null;
+  checking: boolean;
+  likelyAuthenticated: boolean;
+  pausedForReauth: boolean;
+  lastCheckAt: number | null;
+}
+
 export interface KeepaliveSnapshot {
   enabled: boolean;
   intervalMinutes: number;
@@ -105,7 +119,6 @@ export interface KeepaliveSnapshot {
   stalledAuthJobs: string[];
 }
 
-
 export interface KeepaliveOptions {
   /** Number of currently non-terminal handoff jobs. */
   trackedJobCount(): number;
@@ -113,6 +126,8 @@ export interface KeepaliveOptions {
   warmDemand?(): boolean;
   /** OpenURL from the most recently received job offer, kept in bridge memory. */
   latestOpenURL(): string | undefined;
+  /** Configured resolver origins from the daemon hello exchange. */
+  knownResolverOrigins?(): readonly string[];
   /** Number of queued institutional handoffs waiting for auth evidence. */
   queuedAuthJobs?(): number;
   /** Job ids parked after the bounded authentication-drive budget. */
@@ -121,10 +136,10 @@ export interface KeepaliveOptions {
   lastAuthReturnedAt?(): number | undefined;
   /** Reports a completed unknown/out -> in probe so the bridge can emit
    * session_evidence without exposing page details. */
-  onSessionEvidence?(source: "live_tab" | "keepalive_tab"): void;
+  onSessionEvidence?(source: "live_tab" | "keepalive_tab", origin?: string): void;
   /** Reports when the keepalive tab has verified an authenticated resolver
    * return, or when that evidence is lost. */
-  onAuthenticationChanged?(authenticated: boolean): void;
+  onAuthenticationChanged?(authenticated: boolean, origin?: string): void;
   /** Called once per detected login redirect, after the tab is made visible. */
   onReauthNeeded?(): void;
   /** Keeps the central bridge badge in sync with the paused state. */
@@ -144,6 +159,8 @@ export interface KeepaliveOptions {
   /** Overrides job/recovery observation cadence for deterministic tests. */
   observeMs?: number;
 }
+
+
 
 const DEFAULT_INTERVAL_MINUTES = 4;
 const MIN_INTERVAL_MINUTES = 2;
@@ -217,6 +234,15 @@ function decodeJWTPayload(raw: string): Record<string, unknown> | undefined {
 }
 
 
+/** A JWT's identity claims are evidence only while an explicit expiration is
+ * still in the future. Tokens without exp retain the resolver's legacy
+ * session semantics; malformed or expired exp claims are rejected. */
+function jwtPayloadIsUnexpired(payload: Record<string, unknown>): boolean {
+  const exp = payload["exp"];
+  if (exp === undefined) return true;
+  return typeof exp === "number" && Number.isFinite(exp) && exp > Date.now() / 1_000;
+}
+
 /** Classify JWT-shaped storage values without touching browser state.
  *
  * A bare `sub` claim is NOT identity: anonymous session tokens carry opaque
@@ -225,7 +251,7 @@ function decodeJWTPayload(raw: string): Record<string, unknown> | undefined {
 export function classifyResolverJWTIdentity(values: readonly string[]): "in" | "unknown" {
   for (const value of values) {
     const payload = decodeJWTPayload(value);
-    if (payload === undefined) continue;
+    if (payload === undefined || !jwtPayloadIsUnexpired(payload)) continue;
     const named = ["userName", "user_name", "preferred_username", "name", "email"].some((claim) => {
       const identity = payload[claim];
       return (
@@ -277,13 +303,28 @@ export function classifyResolverMarkers(markers: readonly ResolverMarker[]): Ses
 export function collectResolverMarkers(): ResolverMarker[] {
   const maxStorageValueLength = 8 * 1024;
   const elements = Array.from(
-    // Include every DOM element: closed details and hidden menu content is
-    // still useful sign-in evidence even when it is not rendered.
-    document.querySelectorAll("*"),
+    // Read only user-facing controls and their targets. Scanning every node
+    // would include script/style/template source and ancestor textContent that
+    // aggregates unrelated descendant labels.
+    document.querySelectorAll<HTMLElement>(
+      "a,button,input,select,textarea,form,summary,label,[role='button'],[role='link']",
+    ),
   );
+  const ignoredTextTags = new Set(["SCRIPT", "STYLE", "TEMPLATE"]);
+  const controlText = (node: Node): string => {
+    if (node.nodeType === 3) return node.nodeValue ?? "";
+    if (node.nodeType !== 1) return "";
+    const child = node as Element;
+    if (ignoredTextTags.has(child.tagName)) return "";
+    return Array.from(child.childNodes).map(controlText).join(" ");
+  };
   const markers: ResolverMarker[] = elements.map((element) => {
+    const value = element.getAttribute("value")?.trim() ?? "";
+    // A form's action is a target, not a page-sized text aggregate. Its
+    // controls are scanned independently below.
+    const text = element.tagName === "FORM" ? "" : controlText(element).trim();
     const marker: ResolverMarker = {
-      text: element.textContent?.trim() ?? "",
+      text: `${text} ${value}`.trim(),
       label: element.getAttribute("aria-label")?.trim() ?? "",
     };
     const href = element.getAttribute("href")?.trim();
@@ -337,8 +378,11 @@ export function collectResolverMarkers(): ResolverMarker[] {
         const binary = atob(padded);
         const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
         const payload: unknown = JSON.parse(new TextDecoder().decode(bytes));
-        if (typeof payload !== "object" || payload === null || Array.isArray(payload)) continue;
         const record = payload as Record<string, unknown>;
+        const exp = record["exp"];
+        if (exp !== undefined && (typeof exp !== "number" || !Number.isFinite(exp) || exp <= Date.now() / 1_000)) {
+          continue;
+        }
         const named = ["userName", "user_name", "preferred_username", "name", "email"].some(
           (claim) => {
             const identity = record[claim];
@@ -445,6 +489,8 @@ export class KeepaliveManager {
   private resolver: URL | undefined;
   private persistedResolverOrigin: string | undefined;
   private grantedResolverOrigin: string | undefined;
+  private grantedResolverOrigins: string[] = [];
+  private readonly originStates = new Map<string, KeepaliveOriginSnapshot>();
   private intervalMinutes = DEFAULT_INTERVAL_MINUTES;
   private enabled = true;
   private reauthPaused = false;
@@ -458,8 +504,73 @@ export class KeepaliveManager {
   private likelyAuthenticated = false;
   private probePromise: Promise<void> | undefined;
 
+  private originCandidates(): string[] {
+    const candidates: unknown[] = [];
+    try {
+      candidates.push(...(this.options.knownResolverOrigins?.() ?? []));
+    } catch {
+      // The bridge's negotiated-origin cache is advisory.
+    }
+    candidates.push(
+      ...this.grantedResolverOrigins,
+      this.persistedResolverOrigin,
+      this.resolver?.protocol === "https:" ? this.resolver.origin : undefined,
+    );
+    return [...new Set(
+      candidates
+        .map((candidate) => normalizeHttpsOrigin(candidate))
+        .filter((origin): origin is string => origin !== undefined),
+    )];
+  }
+
+  private defaultOriginSnapshot(origin: string): KeepaliveOriginSnapshot {
+    return {
+      origin,
+      authenticated: false,
+      verdict: "unknown",
+      probeSource: "none",
+      lastVerdictAt: null,
+      checking: false,
+      likelyAuthenticated: false,
+      pausedForReauth: false,
+      lastCheckAt: null,
+    };
+  }
+
+  private syncOriginStates(): void {
+    const origins = this.originCandidates();
+    const known = new Set(origins);
+    for (const origin of origins) {
+      if (!this.originStates.has(origin)) this.originStates.set(origin, this.defaultOriginSnapshot(origin));
+    }
+    for (const origin of this.originStates.keys()) {
+      if (!known.has(origin)) this.originStates.delete(origin);
+    }
+  }
+
+  /** Return one independently tracked verdict for every configured resolver. */
+  getOriginSnapshots(): KeepaliveOriginSnapshot[] {
+    this.syncOriginStates();
+    return [...this.originStates.values()].map((snapshot) => ({ ...snapshot }));
+  }
+  private updateOriginSnapshot(
+    origin: string | undefined,
+    patch: Partial<KeepaliveOriginSnapshot>,
+    clearScanOutcome = false,
+  ): void {
+    if (origin === undefined) return;
+    const normalized = normalizeHttpsOrigin(origin);
+    if (normalized === undefined) return;
+    const current = this.originStates.get(normalized) ?? this.defaultOriginSnapshot(normalized);
+    const next = { ...current, ...patch, origin: normalized };
+    if (clearScanOutcome) delete next.scanOutcome;
+    this.originStates.set(normalized, next);
+  }
+
+
   /** Browser-local session state for privileged extension surfaces. */
   getSnapshot(): KeepaliveSnapshot {
+    this.syncOriginStates();
     const resolverOrigin =
       this.resolver?.protocol === "https:"
         ? this.resolver.origin
@@ -503,7 +614,6 @@ export class KeepaliveManager {
     this.observeMs = Math.max(0, options.observeMs ?? DEFAULT_OBSERVE_MS);
     this.reloadSettleMs = Math.max(0, options.reloadSettleMs ?? DEFAULT_RELOAD_SETTLE_MS);
   }
-
   /** Load preferences and reconcile immediately. Safe to call more than once. */
   async init(): Promise<void> {
     if (this.started) return;
@@ -516,6 +626,8 @@ export class KeepaliveManager {
     await this.loadPreferences();
     await this.reconcile();
   }
+
+
   /** Record a resolver as soon as a handoff arrives, even if the periodic
    * keepalive observation has not run in this worker lifetime. */
   learnResolver(openURL: string): void {
@@ -525,6 +637,7 @@ export class KeepaliveManager {
       if (resolver.protocol !== "https:") return;
       this.resolver = resolver;
       this.rememberResolverOrigin(resolver);
+      this.syncOriginStates();
     } catch {
       // Invalid offers are rejected by the normal handoff parser.
     }
@@ -536,14 +649,29 @@ export class KeepaliveManager {
     return now - this.lastCheckAt > SESSION_STALE_MS;
   }
 
-  /** Probe the current resolver immediately. A slow browser API is bounded so
-   * a foreground popup request never waits beyond the MV3 response budget. */
+  private hasStaleOrigin(now = Date.now()): boolean {
+    this.syncOriginStates();
+    for (const snapshot of this.originStates.values()) {
+      if (snapshot.lastCheckAt === null || now - snapshot.lastCheckAt > SESSION_STALE_MS) return true;
+    }
+    return false;
+  }
+
+  /** Probe the known resolver origins immediately. A slow browser API is
+   * bounded so a foreground popup request never waits beyond the MV3 budget. */
   async checkNow(budgetMs = ON_DEMAND_PROBE_BUDGET_MS): Promise<void> {
     // A completed probe that produced NO evidence (no tab inspected) must not
     // latch: the operator may have just focused the library page, and serving
     // the empty verdict for SESSION_STALE_MS reads as papio being blind.
     const latchedEmpty = this.verdict === "unknown" && this.probeSource === "none";
-    if (this.probePromise === undefined && !this.isSessionStale() && !latchedEmpty) return;
+    if (
+      this.probePromise === undefined &&
+      !this.isSessionStale() &&
+      !this.hasStaleOrigin() &&
+      !latchedEmpty
+    ) {
+      return;
+    }
     const probe = this.probePromise ?? this.startProbe();
     const boundedBudget = Math.min(1_500, Math.max(0, Math.trunc(budgetMs)));
     let timeout: ReturnType<typeof setTimeout> | undefined;
@@ -558,12 +686,19 @@ export class KeepaliveManager {
   }
 
   private startProbe(): Promise<void> {
+    this.syncOriginStates();
     this.checking = true;
     this.likelyAuthenticated = false;
+    for (const origin of this.originStates.keys()) {
+      this.updateOriginSnapshot(origin, { checking: true, likelyAuthenticated: false });
+    }
     const probe = this.probeResolver();
     const settled = probe.finally(() => {
       this.checking = false;
       this.likelyAuthenticated = false;
+      for (const origin of this.originStates.keys()) {
+        this.updateOriginSnapshot(origin, { checking: false, likelyAuthenticated: false });
+      }
       this.probePromise = undefined;
     });
     this.probePromise = settled;
@@ -572,51 +707,85 @@ export class KeepaliveManager {
 
   private async probeResolver(): Promise<void> {
     await this.loadPreferences();
-    const resolver =
+    const configured =
       this.resolverFromLatestOffer() ?? this.configuredResolver() ?? this.resolver;
-    if (resolver === undefined || resolver.protocol !== "https:") {
+    if (configured !== undefined && configured.protocol === "https:") {
+      await this.selectResolver(configured);
+    }
+
+    const origins = this.originCandidates();
+    if (origins.length === 0) {
       const checkedAt = Date.now();
       this.lastCheckAt = checkedAt;
       this.setVerdict("unknown", "none", checkedAt);
       return;
     }
-    this.resolver = resolver;
+    if (this.resolver === undefined) {
+      try {
+        this.resolver = new URL(origins[0]!);
+      } catch {
+        const checkedAt = Date.now();
+        this.lastCheckAt = checkedAt;
+        this.setVerdict("unknown", "none", checkedAt);
+        return;
+      }
+    }
+    this.syncOriginStates();
 
     // The focused tab is checked directly: when the operator is looking at
     // the library page itself, the verdict must not depend on a URL-pattern
     // query that can miss (12:43pm field report: active resolver tab, probe
     // returned "no probe evidence").
-    let liveTabs: KeepaliveTab[] = [];
+    const queriedTabs = new Map<number, KeepaliveTab>();
     try {
-      liveTabs = await this.api.tabs.query({ active: true, lastFocusedWindow: true });
+      for (const tab of await this.api.tabs.query({ active: true, lastFocusedWindow: true })) {
+        if (tab.id !== undefined) queriedTabs.set(tab.id, tab);
+      }
     } catch {
-      // Fall through to the URL-pattern query.
+      // Fall through to the URL-pattern queries.
     }
-    try {
-      liveTabs = [...liveTabs, ...(await this.api.tabs.query({ url: [`${resolver.origin}/*`] }))];
-    } catch {
-      // The permission may have been revoked while the popup was open. The
-      // manager-owned probe below remains useful when it is still available.
+    for (const origin of origins) {
+      try {
+        for (const tab of await this.api.tabs.query({ url: [`${origin}/*`] })) {
+          if (tab.id !== undefined) queriedTabs.set(tab.id, tab);
+        }
+      } catch {
+        // A revoked host permission affects only this origin's scan.
+      }
     }
-    const resolverTabs = liveTabs.filter(
-      (tab) => tab.id !== undefined && typeof tab.url === "string" && resolverURLMatches(tab.url, resolver),
-    );
-    // A user's visible resolver tab carries the strongest, freshest evidence.
-    // Only inspect the manager-owned tab when no user tab is available.
-    const liveTab =
-      resolverTabs.find((tab) => tab.id !== this.tabID) ?? resolverTabs[0];
-    this.likelyAuthenticated = liveTab !== undefined;
-    if (liveTab?.id !== undefined) {
-      await this.inspectTab(liveTab.id);
-      return;
+
+    for (const origin of origins) {
+      const resolver = new URL(origin);
+      const resolverTabs = [...queriedTabs.values()].filter(
+        (tab) => typeof tab.url === "string" && resolverURLMatches(tab.url, resolver),
+      );
+      // A user's visible resolver tab carries the strongest, freshest
+      // evidence. Only inspect the manager-owned tab when no user tab exists.
+      const liveTab =
+        resolverTabs.find((tab) => tab.id !== this.tabID) ?? resolverTabs[0];
+      const isCurrent = this.resolver?.origin === origin;
+      if (isCurrent) this.likelyAuthenticated = liveTab !== undefined;
+      if (liveTab?.id !== undefined) {
+        await this.inspectTab(liveTab.id, resolver);
+        continue;
+      }
+      if (isCurrent && this.tabID !== undefined) {
+        await this.inspectTab(this.tabID, resolver);
+        continue;
+      }
+      const checkedAt = Date.now();
+      if (isCurrent) {
+        this.setVerdict("unknown", "none", checkedAt, undefined, origin);
+      } else {
+        this.updateOriginSnapshot(origin, {
+          verdict: "unknown",
+          authenticated: false,
+          probeSource: "none",
+          lastVerdictAt: checkedAt,
+          lastCheckAt: checkedAt,
+        }, true);
+      }
     }
-    if (this.tabID !== undefined) {
-      await this.inspectTab(this.tabID);
-      return;
-    }
-    const checkedAt = Date.now();
-    this.lastCheckAt = checkedAt;
-    this.setVerdict("unknown", "none", checkedAt);
   }
 
 
@@ -645,20 +814,23 @@ export class KeepaliveManager {
     if (storageReadSucceeded) {
       this.persistedResolverOrigin = normalizeHttpsOrigin(values[KEEPALIVE_RESOLVER_ORIGIN_KEY]);
     }
+    this.grantedResolverOrigins = [];
     this.grantedResolverOrigin = undefined;
-    if (this.persistedResolverOrigin === undefined && this.api.permissions !== undefined) {
+    if (this.api.permissions !== undefined) {
       try {
         const granted = await this.api.permissions.getAll();
-        this.grantedResolverOrigin = resolverOriginsFromPermissionPatterns(granted.origins)[0];
+        this.grantedResolverOrigins = resolverOriginsFromPermissionPatterns(granted.origins);
+        this.grantedResolverOrigin = this.grantedResolverOrigins[0];
       } catch {
         // Optional permissions are advisory; the popup can still explain the
         // missing resolver and an incoming handoff can seed storage later.
       }
     }
+    this.syncOriginStates();
   }
 
   private configuredResolver(): URL | undefined {
-    const origin = this.persistedResolverOrigin ?? this.grantedResolverOrigin;
+    const origin = this.persistedResolverOrigin ?? this.grantedResolverOrigin ?? this.originCandidates()[0];
     if (origin === undefined) return undefined;
     try {
       return new URL(origin);
@@ -671,6 +843,14 @@ export class KeepaliveManager {
     return this.options.trackedJobCount() > 0 || this.options.warmDemand?.() === true;
   }
 
+  private async selectResolver(resolver: URL): Promise<void> {
+    if (this.resolver?.origin !== resolver.origin && this.tabID !== undefined) {
+      await this.closeTab();
+    }
+    this.resolver = resolver;
+    this.syncOriginStates();
+  }
+
   private async reconcile(): Promise<void> {
     const warmDemand = this.hasWarmDemand();
     const resolver = this.resolverFromLatestOffer() ?? this.configuredResolver();
@@ -680,7 +860,7 @@ export class KeepaliveManager {
       return;
     }
 
-    this.resolver = resolver;
+    await this.selectResolver(resolver);
     if (this.tabID === undefined) {
       await this.createTab();
       this.schedule(this.intervalMs(), () => this.onReload());
@@ -701,16 +881,40 @@ export class KeepaliveManager {
   /** Focus the reauthentication tab on an explicit operator request. If the
    * keepalive is disabled or has not observed a job yet, this still creates a
    * resolver-origin tab from the latest institutional offer when possible. */
-  async openReauth(): Promise<boolean> {
+  async openReauth(originHint?: string): Promise<boolean> {
     await this.loadPreferences();
-    if (this.resolver === undefined) {
-      this.resolver = this.resolverFromLatestOffer() ?? this.configuredResolver();
+    let requested: URL | undefined;
+    if (originHint !== undefined) {
+      const normalized = normalizeHttpsOrigin(originHint);
+      if (normalized === undefined) return false;
+      try {
+        requested = new URL(normalized);
+      } catch {
+        return false;
+      }
     }
-    if (this.resolver?.protocol !== "https:") return false;
+    const target = requested ?? this.resolverFromLatestOffer() ?? this.configuredResolver() ?? this.resolver;
+    if (target?.protocol !== "https:") return false;
+    if (this.resolver?.origin !== target.origin && this.tabID !== undefined) {
+      const oldTabID = this.tabID;
+      const wasPaused = this.reauthPaused;
+      this.tabID = undefined;
+      this.reauthPaused = false;
+      this.updateOriginSnapshot(this.resolver?.origin, { pausedForReauth: false });
+      if (wasPaused) this.options.onReauthStateChanged?.(false);
+      try {
+        await this.api.tabs.remove(oldTabID);
+      } catch {
+        // A manually closed tab is already in the desired state.
+      }
+    }
+    this.resolver = target;
+    this.syncOriginStates();
     if (this.tabID === undefined) await this.createTab();
     const tabID = this.tabID;
     if (tabID === undefined) return false;
-    if (this.authenticated && !this.reauthPaused) {
+    const targetState = this.originStates.get(target.origin);
+    if (targetState?.authenticated === true && !this.reauthPaused) {
       try {
         await this.api.tabs.update(tabID, { active: true });
         await this.options.surfaceReauthTab?.(tabID);
@@ -786,22 +990,38 @@ export class KeepaliveManager {
     source: KeepaliveProbeSource,
     completedAt: number | null = Date.now(),
     scanOutcome: ScanOutcome | undefined = undefined,
+    resolverOrigin: string | undefined = this.resolver?.origin,
   ): void {
-    const wasAuthenticated = this.authenticated;
+    const normalizedOrigin = normalizeHttpsOrigin(resolverOrigin);
+    const prior = normalizedOrigin === undefined
+      ? this.authenticated
+      : this.originStates.get(normalizedOrigin)?.authenticated ?? false;
     const authenticated = verdict === "in";
-    const authenticationChanged = wasAuthenticated !== authenticated;
-    this.verdict = verdict;
-    this.probeSource = source;
-    this.scanOutcome = scanOutcome;
-    this.lastVerdictAt = completedAt === null ? undefined : completedAt;
-    this.authenticated = authenticated;
-    if (authenticationChanged) this.options.onAuthenticationChanged?.(authenticated);
+    const authenticationChanged = prior !== authenticated;
+    const isCurrent = normalizedOrigin === undefined || normalizedOrigin === this.resolver?.origin;
+    if (isCurrent) {
+      this.verdict = verdict;
+      this.probeSource = source;
+      this.scanOutcome = scanOutcome;
+      this.lastVerdictAt = completedAt === null ? undefined : completedAt;
+      this.authenticated = authenticated;
+    }
+    this.updateOriginSnapshot(normalizedOrigin, {
+      authenticated,
+      verdict,
+      probeSource: source,
+      ...(scanOutcome === undefined ? {} : { scanOutcome }),
+      lastVerdictAt: completedAt,
+      lastCheckAt: completedAt,
+      checking: false,
+      likelyAuthenticated: isCurrent ? this.likelyAuthenticated : false,
+    }, scanOutcome === undefined);
     if (
-      !wasAuthenticated &&
+      !prior &&
       authenticated &&
       (source === "live_tab" || source === "keepalive_tab")
     ) {
-      this.options.onSessionEvidence?.(source);
+      this.options.onSessionEvidence?.(source, normalizedOrigin);
     }
   }
 
@@ -862,7 +1082,7 @@ export class KeepaliveManager {
       return;
     }
 
-    this.resolver = resolver;
+    await this.selectResolver(resolver);
     if (this.tabID === undefined) {
       await this.createTab();
       this.schedule(this.intervalMs(), () => this.onReload());
@@ -888,12 +1108,13 @@ export class KeepaliveManager {
       return;
     }
 
-    this.resolver = this.resolverFromLatestOffer() ?? this.configuredResolver();
-    if (this.resolver === undefined) {
+    const resolver = this.resolverFromLatestOffer() ?? this.configuredResolver();
+    if (resolver === undefined) {
       await this.closeTab();
       this.schedule(this.observeMs, () => this.onObserve());
       return;
     }
+    await this.selectResolver(resolver);
     if (this.tabID === undefined) {
       await this.createTab();
       this.schedule(this.intervalMs(), () => this.onReload());
@@ -924,60 +1145,68 @@ export class KeepaliveManager {
     );
   }
 
-  private async inspectTab(tabID = this.tabID): Promise<void> {
-    if (tabID === undefined || this.resolver === undefined) return;
-    const owned = tabID === this.tabID;
+  private async inspectTab(
+    tabID = this.tabID,
+    resolverOverride: URL | undefined = this.resolver,
+  ): Promise<void> {
+    if (tabID === undefined || resolverOverride === undefined) return;
+    const resolver = resolverOverride;
+    const origin = resolver.origin;
+    const owned = tabID === this.tabID && this.resolver?.origin === origin;
     const source: KeepaliveProbeSource = owned ? "keepalive_tab" : "live_tab";
     let tab: KeepaliveTab;
     try {
       tab = await this.api.tabs.get(tabID);
     } catch {
       const checkedAt = Date.now();
-      this.lastCheckAt = checkedAt;
+      if (this.resolver?.origin === origin) this.lastCheckAt = checkedAt;
       if (!owned) {
-        this.setVerdict("unknown", source, checkedAt);
+        this.setVerdict("unknown", source, checkedAt, undefined, origin);
         return;
       }
       this.tabID = undefined;
       const wasPaused = this.reauthPaused;
       this.reauthPaused = false;
       if (wasPaused) this.options.onReauthStateChanged?.(false);
-      this.setVerdict("unknown", "none", checkedAt);
+      this.setVerdict("unknown", "none", checkedAt, undefined, origin);
       return;
     }
     const checkedAt = Date.now();
-    this.lastCheckAt = checkedAt;
+    if (this.resolver?.origin === origin) this.lastCheckAt = checkedAt;
     if (typeof tab.url !== "string") {
-      this.setVerdict("unknown", source, checkedAt);
+      this.setVerdict("unknown", source, checkedAt, undefined, origin);
       return;
     }
 
-    if (resolverURLMatches(tab.url, this.resolver)) {
+    if (resolverURLMatches(tab.url, resolver)) {
       const markerResult = await this.resolverMarkerVerdict(tabID);
-      // An auth-shaped resolver path remains a conservative signed-out
-      // fallback. A plain resolver URL has no affirmative URL evidence.
-      const verdict =
-        markerResult.verdict === "unknown"
-          ? isAuthenticationURL(tab.url)
-            ? "out"
-            : "unknown"
-          : markerResult.verdict;
-      this.setVerdict(verdict, source, Date.now(), markerResult.scanOutcome);
+      // A URL-shaped auth redirect carries no session verdict by itself.
+      // Keep unknown until marker inspection supplies affirmative evidence.
+      const verdict = markerResult.verdict;
+      this.setVerdict(verdict, source, Date.now(), markerResult.scanOutcome, origin);
       if (verdict === "in" && owned && this.reauthPaused) await this.resumeAfterReauth();
-      if (verdict === "out" && owned) await this.pauseForReauth();
+      if (
+        owned &&
+        (verdict === "out" || (verdict === "unknown" && isAuthenticationURL(tab.url)))
+      ) {
+        await this.pauseForReauth();
+      }
       return;
     }
     if (isAuthenticationURL(tab.url)) {
-      this.setVerdict("out", source, checkedAt);
+      // The IdP URL is intentionally not scanned and therefore cannot assert
+      // signed-out; it only drives the visible reauthentication affordance.
+      this.setVerdict("unknown", source, checkedAt, undefined, origin);
       if (owned) await this.pauseForReauth();
       return;
     }
-    this.setVerdict("unknown", source, checkedAt);
+    this.setVerdict("unknown", source, checkedAt, undefined, origin);
   }
 
   private async pauseForReauth(): Promise<void> {
     if (this.reauthPaused || this.tabID === undefined) return;
     this.reauthPaused = true;
+    this.updateOriginSnapshot(this.resolver?.origin, { pausedForReauth: true });
     try {
       await this.api.tabs.update(this.tabID, { active: true, pinned: false, muted: false });
       // In work-window mode the tab lives in a minimized window; bring it up.
@@ -992,6 +1221,7 @@ export class KeepaliveManager {
   private async resumeAfterReauth(): Promise<void> {
     if (this.tabID === undefined) return;
     this.reauthPaused = false;
+    this.updateOriginSnapshot(this.resolver?.origin, { pausedForReauth: false });
     this.options.onReauthStateChanged?.(false);
     try {
       await this.api.tabs.update(this.tabID, { pinned: true, muted: true });
@@ -999,6 +1229,7 @@ export class KeepaliveManager {
       // The tab is still usable; retry normal keepalive on the next cycle.
     }
   }
+
 
   private intervalMs(): number {
     return this.intervalMinutes * 60_000;
@@ -1019,11 +1250,13 @@ export class KeepaliveManager {
 
   private async closeTab(): Promise<void> {
     const tabID = this.tabID;
+    const origin = this.resolver?.origin;
     const wasAwaitingReauth = this.reauthPaused;
     this.tabID = undefined;
     this.reauthPaused = false;
+    this.updateOriginSnapshot(origin, { pausedForReauth: false });
     if (wasAwaitingReauth) this.options.onReauthStateChanged?.(false);
-    this.setVerdict("unknown", "none", null);
+    this.setVerdict("unknown", "none", null, undefined, origin);
     if (tabID === undefined) return;
     try {
       await this.api.tabs.remove(tabID);

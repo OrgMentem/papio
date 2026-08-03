@@ -659,8 +659,8 @@ func TestAdoptedCandidateVersionIsAlwaysUnknown(t *testing.T) {
 				t.Fatalf("adopted version = %q, want %q", candidate.Version, resolver.VersionUnknown)
 			}
 			// The honest fields around it must not drift either.
-			if candidate.AccessBasis != resolver.AccessInstitutional || candidate.ReuseLicense != "unknown" {
-				t.Fatalf("adopted access/licence = %q/%q, want institutional/unknown",
+			if candidate.AccessBasis != resolver.AccessManual || candidate.ReuseLicense != "unknown" {
+				t.Fatalf("adopted access/licence = %q/%q, want manual/unknown",
 					candidate.AccessBasis, candidate.ReuseLicense)
 			}
 		})

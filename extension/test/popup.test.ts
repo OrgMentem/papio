@@ -13,6 +13,7 @@ import {
   openInbox,
   openInstitutionSignIn,
   deriveSessionCardState,
+  deriveSessionRows,
   readCurrentPageMetadata,
   refreshImpactSummary,
   renderInstitutionSession,
@@ -858,6 +859,121 @@ test("session card matrix propagates marker scan outcomes", () => {
   expect(warm.action).toBe("none");
 });
 
+test("renders independent multi-origin session rows and targets each sign-in origin", async () => {
+  const now = Date.now();
+  const defaultOrigin = "https://example.primo.exlibrisgroup.com";
+  const uwaOrigin = "https://onesearch.library.example-college.edu";
+  const state = {
+    enabled: true,
+    intervalMinutes: 4,
+    authenticated: false,
+    verdict: "unknown" as const,
+    probeSource: "none" as const,
+    lastVerdictAt: now,
+    checking: false,
+    likelyAuthenticated: false,
+    pausedForReauth: false,
+    lastCheckAt: now,
+    resolverOrigin: defaultOrigin,
+    lastAuthReturnedAt: null,
+    queuedAuthJobs: 0,
+    stalledAuthJobs: [],
+    releasedAuthJobs: 0,
+    origins: [
+      {
+        origin: defaultOrigin,
+        authenticated: true,
+        verdict: "in" as const,
+        probeSource: "live_tab" as const,
+        scanOutcome: "markers" as const,
+        lastVerdictAt: now,
+        checking: false,
+        likelyAuthenticated: false,
+        pausedForReauth: false,
+        lastCheckAt: now,
+      },
+      {
+        origin: uwaOrigin,
+        authenticated: false,
+        verdict: "out" as const,
+        probeSource: "live_tab" as const,
+        scanOutcome: "markers" as const,
+        lastVerdictAt: now,
+        checking: false,
+        likelyAuthenticated: false,
+        pausedForReauth: false,
+        lastCheckAt: now,
+      },
+    ],
+  };
+  expect(deriveSessionRows(state)).toEqual([
+    expect.objectContaining({ origin: defaultOrigin, action: "none" }),
+    expect.objectContaining({ origin: uwaOrigin, label: "Signed out or expired", action: "signin" }),
+  ]);
+
+  const doc = popupDocument();
+  const targets: string[] = [];
+  renderInstitutionSession(doc, state, async (origin) => {
+    if (origin !== undefined) targets.push(origin);
+  });
+  const rows = doc.querySelectorAll(".institution-session-origin-row");
+  expect(rows).toHaveLength(2);
+  expect(rows[0]?.textContent).toContain("example.primo.exlibrisgroup.com");
+  expect(rows[1]?.textContent).toContain("onesearch.library.example-college.edu");
+  expect(doc.getElementById("institution-session-row")).toBeNull();
+  const buttons = Array.from(doc.querySelectorAll<HTMLButtonElement>(".institution-session-origin-row button"));
+  expect(buttons).toHaveLength(2);
+  expect(buttons[0]?.hidden).toBe(true);
+  expect(buttons[1]?.hidden).toBe(false);
+  expect(buttons[1]?.getAttribute("aria-describedby")).toBe("institution-session-status-1");
+  buttons[1]?.click();
+  await Promise.resolve();
+  expect(targets).toEqual([uwaOrigin]);
+});
+
+test("one configured origin keeps the existing institution session card", () => {
+  const now = Date.now();
+  const origin = "https://example.primo.exlibrisgroup.com";
+  const doc = popupDocument();
+  renderInstitutionSession(doc, {
+    enabled: true,
+    intervalMinutes: 4,
+    authenticated: true,
+    verdict: "in",
+    probeSource: "live_tab",
+    scanOutcome: "markers",
+    lastVerdictAt: now,
+    checking: false,
+    likelyAuthenticated: false,
+    pausedForReauth: false,
+    lastCheckAt: now,
+    resolverOrigin: origin,
+    lastAuthReturnedAt: null,
+    queuedAuthJobs: 0,
+    stalledAuthJobs: [],
+    releasedAuthJobs: 0,
+    origins: [{
+      origin,
+      authenticated: true,
+      verdict: "in",
+      probeSource: "live_tab",
+      scanOutcome: "markers",
+      lastVerdictAt: now,
+      checking: false,
+      likelyAuthenticated: false,
+      pausedForReauth: false,
+      lastCheckAt: now,
+    }],
+  });
+  expect(doc.getElementById("institution-session-rows")?.hidden).toBe(true);
+  expect(doc.querySelector(".institution-session-row")?.hasAttribute("hidden")).toBe(false);
+  expect(doc.getElementById("institution-session-origin")?.textContent).toBe(
+    "example.primo.exlibrisgroup.com",
+  );
+  expect(doc.getElementById("institution-session-status")?.textContent).toContain("Session warm");
+  expect(doc.getElementById("institution-session-signin")?.hidden).toBe(true);
+});
+
 test("leftover-tabs card stays hidden at zero and renders a pluralized count", () => {
   const doc = popupDocument();
   renderLeftoverTabs(doc, 0, async () => 0);
@@ -870,6 +986,23 @@ test("leftover-tabs card stays hidden at zero and renders a pluralized count", (
 
   renderLeftoverTabs(doc, 1, async () => 1);
   expect(doc.getElementById("leftover-tabs-message")?.textContent).toContain("1 untracked tab left");
+});
+
+test("leftover-tabs cleanup uses the latest callback after a rerender", async () => {
+  const doc = popupDocument();
+  const calls: string[] = [];
+  renderLeftoverTabs(doc, 1, async () => {
+    calls.push("old");
+    return 1;
+  });
+  renderLeftoverTabs(doc, 1, async () => {
+    calls.push("new");
+    return 1;
+  });
+  (doc.getElementById("leftover-tabs-cleanup") as HTMLButtonElement).click();
+  await Promise.resolve();
+  await Promise.resolve();
+  expect(calls).toEqual(["new"]);
 });
 
 test("leftover-tabs cleanup click closes the card and a failure re-arms the button", async () => {

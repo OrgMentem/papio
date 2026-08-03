@@ -209,7 +209,7 @@ export function sanitizePageHost(value: string): string | undefined {
   } catch {
     return undefined;
   }
-  if (url.protocol !== "https:" || isAuthenticationURL(value)) return undefined;
+  if (url.protocol !== "https:" || isAuthenticationURL(url.href)) return undefined;
   const host = url.hostname.toLowerCase();
   if (
     host.length < 3 ||

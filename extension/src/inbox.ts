@@ -92,9 +92,14 @@ interface PageState {
   citationStyle: CitationStyle;
   activeTab: InboxTab;
   activityFeature: boolean;
+  activityKnown: boolean;
   activityEntries: ActivityEntry[];
   activityExpanded: boolean;
 }
+
+type FocusTarget =
+  | { kind: "item"; itemID: string; control?: string }
+  | { kind: "activity"; jobID: string };
 
 const state: PageState = {
   snapshot: null,
@@ -115,6 +120,7 @@ const state: PageState = {
   citationStyle: storedCitationStyle(),
   activeTab: "actions",
   activityFeature: false,
+  activityKnown: false,
   activityEntries: [],
   activityExpanded: false,
 };
@@ -433,6 +439,45 @@ function focusActivityJob(jobID: string): void {
   row.scrollIntoView?.({ behavior: "smooth", block: "center" });
   announce(`Focused inbox item for job ${jobID}.`);
 }
+function captureFocusTarget(): FocusTarget | null {
+  if (elements === null || typeof document === "undefined") return null;
+  const active = document.activeElement;
+  if (!(active instanceof HTMLElement)) return null;
+  const itemRow = active.closest<HTMLElement>("[data-triage-item-id]");
+  if (itemRow !== null && itemRow.dataset.triageItemId !== undefined) {
+    const control = active instanceof HTMLButtonElement
+      ? active.dataset.operation ?? active.dataset.label
+      : undefined;
+    if (control === undefined) return { kind: "item", itemID: itemRow.dataset.triageItemId };
+    return { kind: "item", itemID: itemRow.dataset.triageItemId, control };
+  }
+  if (active instanceof HTMLButtonElement && active.classList.contains("activity-job-link")) {
+    const jobID = active.dataset.activityJobId;
+    if (jobID !== undefined) return { kind: "activity", jobID };
+  }
+  return null;
+}
+
+function restoreFocusTarget(target: FocusTarget | null): void {
+  if (target === null || elements === null) return;
+  if (target.kind === "activity") {
+    const chip = Array.from(elements.activityList.querySelectorAll<HTMLButtonElement>(".activity-job-link"))
+      .find((candidate) => candidate.dataset.activityJobId === target.jobID);
+    chip?.focus();
+    return;
+  }
+  const row = rowForItem(target.itemID);
+  if (row === null) return;
+  if (target.control !== undefined) {
+    const control = Array.from(row.querySelectorAll<HTMLButtonElement>("button"))
+      .find((candidate) => candidate.dataset.operation === target.control || candidate.dataset.label === target.control);
+    if (control !== undefined) {
+      control.focus();
+      return;
+    }
+  }
+  row.focus();
+}
 
 interface ActivityRow {
   entry: ActivityEntry;
@@ -508,6 +553,7 @@ function renderActivityGroup(group: ActivityGroup, rows: ActivityRow[]): HTMLEle
       const chip = element("button", suffix);
       chip.type = "button";
       chip.className = "activity-job-chip activity-job-link";
+      chip.dataset.activityJobId = group.jobID;
       chip.setAttribute("aria-label", "Show matching Actions item");
       chip.addEventListener("click", () => focusActivityJob(group.jobID!));
       heading.append(chip);
@@ -523,14 +569,18 @@ function renderActivityGroup(group: ActivityGroup, rows: ActivityRow[]): HTMLEle
 function renderActivity(): void {
   if (elements === null) return;
   elements.activityList.replaceChildren();
+  elements.activityShowMore.hidden = true;
+  if (!state.activityKnown) {
+    elements.activityList.append(element("p", "Checking activity availability…"));
+    return;
+  }
   if (!state.activityFeature) {
-    elements.activityShowMore.hidden = true;
+    elements.activityList.append(element("p", "Activity is unavailable with this daemon. Upgrade papio to see recent activity."));
     return;
   }
   const groups = activityGroups();
   if (groups.length === 0) {
     elements.activityList.append(element("p", "No recent activity."));
-    elements.activityShowMore.hidden = true;
     return;
   }
   const maxGroups = state.activityExpanded ? groups.length : 5;
@@ -551,14 +601,13 @@ function renderActivity(): void {
 
 function renderTabs(): void {
   if (elements === null) return;
-  if (!state.activityFeature && state.activeTab === "activity") state.activeTab = "actions";
-  const tabs = [elements.actionsTab, elements.watchTab];
-  if (state.activityFeature) tabs.push(elements.activityTab);
+  const tabs = [elements.actionsTab, elements.watchTab, elements.activityTab];
   const actionCount = itemsForTab("actions").length;
   const watchCount = itemsForTab("watch").length;
   elements.actionsTab.textContent = `Actions (${actionCount})`;
   elements.watchTab.textContent = `Watch hits (${watchCount})`;
-  elements.activityTab.hidden = !state.activityFeature;
+  elements.activityTab.textContent = state.activityKnown && !state.activityFeature ? "Activity (unavailable)" : "Activity";
+  elements.activityTab.hidden = false;
   for (const tab of tabs) {
     const selected = tab.dataset.tab === state.activeTab;
     tab.setAttribute("aria-selected", String(selected));
@@ -566,12 +615,11 @@ function renderTabs(): void {
   }
   elements.actionsPanel.hidden = state.activeTab !== "actions";
   elements.watchPanel.hidden = state.activeTab !== "watch";
-  elements.activityPanel.hidden = !state.activityFeature || state.activeTab !== "activity";
+  elements.activityPanel.hidden = state.activeTab !== "activity";
   elements.filterInput.disabled = state.activeTab === "activity";
 }
 
 function selectTab(tab: InboxTab, focus: boolean): void {
-  if (tab === "activity" && !state.activityFeature) tab = "actions";
   state.activeTab = tab;
   render();
   if (focus && elements !== null) {
@@ -584,8 +632,7 @@ function handleTabKeydown(event: KeyboardEvent): void {
   if (event.key !== "ArrowLeft" && event.key !== "ArrowRight" && event.key !== "Home" && event.key !== "End") return;
   const target = event.currentTarget;
   if (!(target instanceof HTMLButtonElement) || elements === null) return;
-  const tabs = [elements.actionsTab, elements.watchTab];
-  if (state.activityFeature) tabs.push(elements.activityTab);
+  const tabs = [elements.actionsTab, elements.watchTab, elements.activityTab];
   const current = tabs.indexOf(target);
   if (current < 0) return;
   let next = current;
@@ -1153,6 +1200,16 @@ function render(): void {
   } else if (actionItems.length === 0) {
     elements.list.append(element("p", `No items match "${state.filterQuery.trim()}".`));
   }
+  if (state.snapshot === null) {
+    elements.watchList.append(element("p", "No snapshot is available yet. Reconnect to retrieve the inbox."));
+  } else {
+    const snapshotWatchItems = state.snapshot.items.filter((item) => item.kind === "watch_hit");
+    if (snapshotWatchItems.length === 0) {
+      elements.watchList.append(element("p", "Your watch list is clear."));
+    } else if (watchItems.length === 0) {
+      elements.watchList.append(element("p", `No watch hits match "${state.filterQuery.trim()}".`));
+    }
+  }
   if (state.snapshot?.unsupported_items_count && state.snapshot.unsupported_items_count > 0) {
     elements.list.append(element("p", `${state.snapshot.unsupported_items_count} newer item(s) need a newer extension.`));
   }
@@ -1230,6 +1287,7 @@ async function refreshActivity(): Promise<void> {
     .then(activityResponse)
     .catch(() => null);
   if (result === null) return;
+  state.activityKnown = true;
   state.activityFeature = result.feature;
   state.activityEntries = result.entries;
 }
@@ -1324,9 +1382,11 @@ async function pollCounts(): Promise<void> {
   if (countsSignature(result.value) !== before) {
     await refreshInbox();
   } else {
+    const focused = captureFocusTarget();
     state.counts = result.value;
     await refreshActivity();
     render();
+    restoreFocusTarget(focused);
   }
 }
 

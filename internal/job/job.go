@@ -1807,10 +1807,11 @@ func BrowserAccessBasis(route, sessionEvidence string) (string, error) {
 	}
 }
 
-// ApplyBrowserDeliveryContext records route/session evidence on the newest
-// browser candidate for a job. It returns false when no browser candidate
-// exists yet (the bridge may retain the context briefly and retry).
-func (js *Store) ApplyBrowserDeliveryContext(ctx context.Context, jobID, route, sessionEvidence, landingRedacted string) (bool, error) {
+// ApplyBrowserDeliveryContextToCandidate records route/session evidence on the
+// candidate created by one browser adoption. The durable candidate ID is the
+// binding: a prior browser candidate for the same job can never receive a
+// later download's provenance.
+func (js *Store) ApplyBrowserDeliveryContextToCandidate(ctx context.Context, jobID string, candidateID int64, route, sessionEvidence, landingRedacted string) (bool, error) {
 	accessBasis, err := BrowserAccessBasis(route, sessionEvidence)
 	if err != nil {
 		return false, err
@@ -1823,16 +1824,20 @@ func (js *Store) ApplyBrowserDeliveryContext(ctx context.Context, jobID, route, 
 		UPDATE candidates
 		SET browser_route = ?, session_evidence = ?, access_basis = ?,
 		    landing_redacted = CASE WHEN ? IS NULL THEN landing_redacted ELSE ? END
-		WHERE id = (
-			SELECT id FROM candidates
-			WHERE job_id = ? AND source = 'browser'
-			ORDER BY id DESC LIMIT 1
-		)`, route, sessionEvidence, accessBasis, landing, landing, jobID)
+		WHERE id = ? AND job_id = ? AND source = 'browser'`,
+		route, sessionEvidence, accessBasis, landing, landing, candidateID, jobID)
 	if err != nil {
 		return false, err
 	}
 	n, err := res.RowsAffected()
 	return n == 1, err
+}
+
+// ApplyBrowserDeliveryContext is retained for callers compiled against the
+// pre-binding API, but deliberately fails closed: without the candidate ID it
+// cannot prove which download produced a browser row.
+func (js *Store) ApplyBrowserDeliveryContext(ctx context.Context, jobID, route, sessionEvidence, landingRedacted string) (bool, error) {
+	return false, nil
 }
 
 // ResetCandidates makes interrupted and retryable candidates runnable for a
@@ -2622,6 +2627,114 @@ type HumanAction struct {
 	QuarantinePath   string `json:"quarantine_path,omitempty"`
 	QuarantineSHA256 string `json:"quarantine_sha256,omitempty"`
 	Revision         int64  `json:"revision"`
+}
+
+// OpenHandoffJob binds one open institutional handoff action to its awaiting
+// job row. The bridge uses this joined view to drain arbitrarily large
+// handoff backlogs without one Get query per action.
+type OpenHandoffJob struct {
+	Row    Row
+	Action HumanAction
+}
+
+// ListOpenHandoffJobs returns all open institutional handoffs and their
+// awaiting-human jobs in one joined query. Identifiers are selected through
+// indexed scalar lookups so the returned rows remain complete without a
+// follow-up query per job.
+func (js *Store) ListOpenHandoffJobs(ctx context.Context) ([]OpenHandoffJob, error) {
+	rows, _, err := js.listOpenHandoffJobs(ctx, 0, false)
+	return rows, err
+}
+
+// ListOpenHandoffJobsPage returns one bounded oldest-first page of open
+// institutional handoffs and whether another page exists behind it.
+func (js *Store) ListOpenHandoffJobsPage(ctx context.Context, limit int) ([]OpenHandoffJob, bool, error) {
+	return js.listOpenHandoffJobs(ctx, EffectiveListLimit(limit), true)
+}
+
+func (js *Store) listOpenHandoffJobs(ctx context.Context, limit int, probe bool) ([]OpenHandoffJob, bool, error) {
+	fetch := limit
+	if probe && limit > 0 {
+		fetch++
+	}
+	query := `
+		SELECT j.id, j.work_request_id, j.state, j.policy_json,
+		       COALESCE(j.artifact_sha256,''), j.selected_candidate_id,
+		       j.spent_usd, COALESCE(j.terminal_reason,''), COALESCE(j.retry_at,''),
+		       j.created_at, j.updated_at, COALESCE(j.lease_owner,''), COALESCE(j.lease_expires_at,''),
+		       COALESCE(w.title,''), COALESCE(w.authors_json,'[]'), COALESCE(w.year,0), COALESCE(w.zotio_item_key,''),
+		       COALESCE((SELECT value FROM identifiers WHERE work_request_id = w.id AND kind = 'doi'),''),
+		       COALESCE((SELECT value FROM identifiers WHERE work_request_id = w.id AND kind = 'pmid'),''),
+		       COALESCE((SELECT value FROM identifiers WHERE work_request_id = w.id AND kind = 'arxiv'),''),
+		       COALESCE((SELECT value FROM identifiers WHERE work_request_id = w.id AND kind = 'isbn'),''),
+		       COALESCE((SELECT value FROM identifiers WHERE work_request_id = w.id AND kind = 'openalex'),''),
+		       ha.id, ha.job_id, ha.kind, ha.status, COALESCE(ha.detail,''), ha.requires_auth,
+		       COALESCE(ha.blocked_by,''), ha.created_at, COALESCE(ha.candidate_id,0),
+		       COALESCE(ha.quarantine_path,''), COALESCE(ha.quarantine_sha256,''), ha.revision
+		FROM human_actions ha
+		JOIN jobs j ON j.id = ha.job_id
+		JOIN work_requests w ON w.id = j.work_request_id
+		WHERE ha.status = 'open' AND ha.kind = 'openurl_handoff' AND j.state = 'awaiting_human'
+		ORDER BY j.created_at ASC, j.id ASC, ha.id ASC`
+	var args []any
+	if fetch > 0 {
+		query += ` LIMIT ?`
+		args = append(args, fetch)
+	}
+	result, err := js.S.DB().QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, false, err
+	}
+	defer func() { _ = result.Close() }()
+	var out []OpenHandoffJob
+	for result.Next() {
+		var item OpenHandoffJob
+		var policyJSON, authorsJSON string
+		var artifact sql.NullString
+		var selectedID sql.NullInt64
+		var doi, pmid, arxiv, isbn, openalex string
+		if err := result.Scan(
+			&item.Row.ID, &item.Row.WorkRequestID, &item.Row.State, &policyJSON,
+			&artifact, &selectedID, &item.Row.SpentUSD, &item.Row.TerminalReason, &item.Row.RetryAt,
+			&item.Row.CreatedAt, &item.Row.UpdatedAt, &item.Row.LeaseOwner, &item.Row.LeaseExpiresAt,
+			&item.Row.Work.Title, &authorsJSON, &item.Row.Work.Year, &item.Row.ZotioItemKey,
+			&doi, &pmid, &arxiv, &isbn, &openalex,
+			&item.Action.ID, &item.Action.JobID, &item.Action.Kind, &item.Action.Status,
+			&item.Action.Detail, &item.Action.RequiresAuth, &item.Action.BlockedBy,
+			&item.Action.CreatedAt, &item.Action.CandidateID, &item.Action.QuarantinePath,
+			&item.Action.QuarantineSHA256, &item.Action.Revision,
+		); err != nil {
+			_ = result.Close()
+			return nil, false, err
+		}
+		item.Row.ArtifactSHA256 = artifact.String
+		item.Row.SelectedCandidateID = selectedID.Int64
+		item.Row.Work.DOI, item.Row.Work.PMID, item.Row.Work.ArXiv = doi, pmid, arxiv
+		item.Row.Work.ISBN, item.Row.Work.OpenAlex = isbn, openalex
+		if err := json.Unmarshal([]byte(policyJSON), &item.Row.Policy); err != nil {
+			_ = result.Close()
+			return nil, false, fmt.Errorf("job %s policy: %w", item.Row.ID, err)
+		}
+		if err := json.Unmarshal([]byte(authorsJSON), &item.Row.Work.Authors); err != nil {
+			_ = result.Close()
+			return nil, false, fmt.Errorf("job %s authors: %w", item.Row.ID, err)
+		}
+		if item.Row.TerminalReason != "" {
+			item.Row.TerminalReason = string(NormalizeTerminalReason(item.Row.TerminalReason))
+		}
+		out = append(out, item)
+	}
+	if err := result.Close(); err != nil {
+		return nil, false, err
+	}
+	if err := result.Err(); err != nil {
+		return nil, false, err
+	}
+	more := false
+	if limit > 0 && len(out) > limit {
+		out, more = out[:limit], true
+	}
+	return out, more, nil
 }
 
 // ListHumanActions returns actions, optionally only open ones. Unbounded: the

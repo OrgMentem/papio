@@ -405,6 +405,26 @@
         gap: var(--space-2);
         justify-content: space-between;
       }
+      .institution-session-rows {
+        display: grid;
+        gap: var(--space-2);
+      }
+
+      .institution-session-origin-row {
+        align-items: center;
+        border-top: 1px solid var(--color-border);
+        display: flex;
+        gap: var(--space-2);
+        justify-content: space-between;
+        padding-top: var(--space-2);
+      }
+
+      .institution-session-origin-copy {
+        display: grid;
+        gap: var(--space-1);
+        min-width: 0;
+      }
+
 
       .institution-session-row button {
         flex: none;
@@ -697,8 +717,9 @@
         </div>
         <div class="institution-session-row">
           <p id="institution-session-status" class="institution-session-status" role="status" aria-live="polite"></p>
-          <button id="institution-session-signin" class="primary" type="button">Sign in</button>
+          <button id="institution-session-signin" class="primary" type="button" aria-describedby="institution-session-status">Sign in</button>
         </div>
+        <div id="institution-session-rows" class="institution-session-rows" hidden></div>
         <div id="institution-session-unblocked" class="institution-session-unblocked" role="status" aria-live="polite" hidden></div>
       </section>
 

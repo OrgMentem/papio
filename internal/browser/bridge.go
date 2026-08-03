@@ -63,6 +63,7 @@ const (
 	deliveryContextTTL           = 60 * time.Second
 	maxOutstandingOffers         = 4
 	maxInstitutionalReoffers     = 4
+	handoffPageLimit             = 500
 )
 
 // HandoffFocusMinExtensionVersion is the first extension that parses
@@ -87,10 +88,10 @@ type browserDownloadKey struct {
 }
 
 type pendingBrowserDownload struct {
-	Filename   string
-	ReceivedAt time.Time
+	Filename    string
+	CandidateID int64
+	ReceivedAt  time.Time
 }
-
 type pendingDeliveryContext struct {
 	Payload    protocol.DeliveryContextPayload
 	ReceivedAt time.Time
@@ -629,12 +630,14 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 		}
 		b.pruneDeliveryMetadata(b.now())
 		key := browserDownloadKey{JobID: msg.JobID, DownloadID: p.DownloadID}
-		b.pendingDownloads[key] = pendingBrowserDownload{Filename: p.Filename, ReceivedAt: b.now()}
+		pendingDownload := pendingBrowserDownload{Filename: p.Filename, ReceivedAt: b.now()}
+		b.pendingDownloads[key] = pendingDownload
 		var context *app.BrowserDeliveryContext
 		if pending, ok := b.deliveryContexts[key]; ok {
 			context = browserDeliveryContext(&pending.Payload)
 		}
-		if err := b.adoptOutsideSessionLock(ctx, msg.JobID, p.Filename, context); err != nil {
+		candidateID, err := b.adoptOutsideSessionLock(ctx, msg.JobID, p.Filename, context)
+		if err != nil {
 			// Environmental failure (file not there yet, Chrome rename race,
 			// user saved elsewhere) must not sever the bridge: record it, keep
 			// the job parked, and let the poll-time directory scan pick the
@@ -644,9 +647,13 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 				map[string]any{"filename": p.Filename, "reason": truncate(err.Error(), 200)}); evErr != nil {
 				return nil, evErr
 			}
-		} else if context != nil {
-			delete(b.deliveryContexts, key)
-			delete(b.pendingDownloads, key)
+		} else {
+			pendingDownload.CandidateID = candidateID
+			b.pendingDownloads[key] = pendingDownload
+			if context != nil {
+				delete(b.deliveryContexts, key)
+				delete(b.pendingDownloads, key)
+			}
 		}
 		ack, err := b.frame(protocol.MsgAck, msg.JobID, protocol.EmptyPayload{})
 		if err != nil {
@@ -767,8 +774,10 @@ func (b *Bridge) handleHello(sessionID string, p *protocol.HelloPayload) ([]json
 			shortSession(sessionID), session.ExtensionVersion, shortSession(b.holder.ID))
 	}
 	delete(b.pending, sessionID)
-	if b.holder == nil || b.holder.ID != session.ID {
+	holderChanged := b.holder == nil || b.holder.ID != session.ID
+	if holderChanged {
 		b.epoch++
+		b.lastSessionEvidenceAt = time.Time{}
 	}
 	b.holder = session
 	b.offered = map[string]bool{}
@@ -1418,16 +1427,25 @@ func (b *Bridge) deliveryContext(ctx context.Context, jobID string, payload *pro
 		return nil
 	}
 	provenance := browserDeliveryContext(payload)
-	applied, err := b.jobs.ApplyBrowserDeliveryContext(ctx, jobID, payload.Route, payload.SessionEvidence, pageHostURL(payload.PageHost))
-	if err != nil {
-		return err
-	}
-	if !applied {
-		if err := b.adoptOutsideSessionLock(ctx, jobID, pending.Filename, provenance); err != nil {
-			_ = b.jobs.S.AppendEvent(ctx, jobID, "browser.adoption_deferred",
-				map[string]any{"filename": pending.Filename, "reason": truncate(err.Error(), 200)})
+	if pending.CandidateID != 0 {
+		applied, err := b.jobs.ApplyBrowserDeliveryContextToCandidate(ctx, jobID, pending.CandidateID, payload.Route, payload.SessionEvidence, pageHostURL(payload.PageHost))
+		if err != nil {
+			return err
+		}
+		if !applied {
+			// The candidate binding disappeared; keep both frames briefly so a
+			// directory sweep can retry adoption instead of annotating a
+			// different browser candidate.
 			return nil
 		}
+		delete(b.deliveryContexts, key)
+		delete(b.pendingDownloads, key)
+		return nil
+	}
+	if _, err := b.adoptOutsideSessionLock(ctx, jobID, pending.Filename, provenance); err != nil {
+		_ = b.jobs.S.AppendEvent(ctx, jobID, "browser.adoption_deferred",
+			map[string]any{"filename": pending.Filename, "reason": truncate(err.Error(), 200)})
+		return nil
 	}
 	delete(b.deliveryContexts, key)
 	delete(b.pendingDownloads, key)
@@ -1445,7 +1463,7 @@ func pageHostURL(host string) string {
 // syncs. The adoption service leases the durable job state before validation,
 // so releasing the in-memory session lock cannot admit a competing adoption.
 // The caller must hold b.mu; it is held again before this method returns.
-func (b *Bridge) adoptOutsideSessionLock(ctx context.Context, jobID, filename string, provenance ...*app.BrowserDeliveryContext) error {
+func (b *Bridge) adoptOutsideSessionLock(ctx context.Context, jobID, filename string, provenance ...*app.BrowserDeliveryContext) (int64, error) {
 	b.mu.Unlock()
 	defer b.mu.Lock()
 	if len(provenance) > 0 && provenance[0] != nil {
@@ -1536,7 +1554,7 @@ func validExtensionVersion(value string) bool {
 // sessionEvidence records one timing-only institutional-session signal and
 // reuses the auth-return sibling reoffer path. Replays within the throttle
 // window are ignored before touching durable activity or job state.
-func (b *Bridge) sessionEvidence(ctx context.Context, _ *protocol.SessionEvidencePayload) error {
+func (b *Bridge) sessionEvidence(ctx context.Context, p *protocol.SessionEvidencePayload) error {
 	now := b.now()
 	if !b.lastSessionEvidenceAt.IsZero() {
 		age := now.Sub(b.lastSessionEvidenceAt)
@@ -1551,33 +1569,48 @@ func (b *Bridge) sessionEvidence(ctx context.Context, _ *protocol.SessionEvidenc
 	if b.reofferRanThisSync {
 		return nil
 	}
-	err := b.reofferInstitutionalSiblingsForEvidence(ctx)
+	err := b.reofferInstitutionalSiblingsForEvidence(ctx, p.OriginHint)
 	b.reofferRanThisSync = true
 	return err
 }
 
 // reofferInstitutionalSiblingsForEvidence chooses an open institutional
-// handoff as the source for the existing sibling reoffer routine. Prefer an
-// already-offered source (the auth_returned shape), then fall back to any
-// parked institutional handoff so the normal poll can offer it and its peers.
-func (b *Bridge) reofferInstitutionalSiblingsForEvidence(ctx context.Context) error {
-	if b.reofferSourceJobID != "" {
+// handoff as the source for the existing sibling reoffer routine. When the
+// extension supplies an origin hint, both the source and every candidate must
+// belong to the matching configured resolver profile; an unknown hint fails
+// closed. No hint preserves the historical source-selection behavior.
+func (b *Bridge) reofferInstitutionalSiblingsForEvidence(ctx context.Context, originHint string) error {
+	wantedProfile := ""
+	if strings.TrimSpace(originHint) != "" {
+		profile, ok := b.cfg.ResolverProfileForOrigin(originHint)
+		if !ok {
+			return nil
+		}
+		wantedProfile = resolverProfileKey(profile)
+	}
+	if wantedProfile != "" && b.reofferSourceJobID != "" && resolverProfileKey(b.reofferProfile) != wantedProfile {
+		b.reofferSourceJobID = ""
+		b.reofferProfile = ""
+	}
+	if b.reofferSourceJobID != "" &&
+		(wantedProfile == "" || resolverProfileKey(b.reofferProfile) == wantedProfile) {
 		return b.reofferInstitutionalSiblings(ctx, b.reofferSourceJobID)
 	}
-	actions, err := b.jobs.ListHumanActions(ctx, true)
+	handoffs, _, err := b.jobs.ListOpenHandoffJobsPage(ctx, handoffPageLimit)
 	if err != nil {
 		return err
 	}
 	var fallback string
-	for _, action := range actions {
-		if action.Kind != handoffActionKind || !action.RequiresAuth {
+	for _, item := range handoffs {
+		if !item.Action.RequiresAuth ||
+			(wantedProfile != "" && resolverProfileKey(item.Row.Policy.Resolver) != wantedProfile) {
 			continue
 		}
 		if fallback == "" {
-			fallback = action.JobID
+			fallback = item.Row.ID
 		}
-		if b.offered[action.JobID] {
-			return b.reofferInstitutionalSiblings(ctx, action.JobID)
+		if b.offered[item.Row.ID] {
+			return b.reofferInstitutionalSiblings(ctx, item.Row.ID)
 		}
 	}
 	if fallback == "" {
@@ -1618,67 +1651,49 @@ func (b *Bridge) reofferInstitutionalSiblings(ctx context.Context, sourceJobID s
 		return nil
 	}
 
-	source, err := b.jobs.Get(ctx, sourceJobID)
-	if errors.Is(err, sql.ErrNoRows) {
+	handoffJobs, _, err := b.jobs.ListOpenHandoffJobsPage(ctx, handoffPageLimit)
+	if err != nil {
+		return err
+	}
+	var source *job.Row
+	var sourceActionID int64
+	for i := range handoffJobs {
+		item := &handoffJobs[i]
+		if item.Row.ID == sourceJobID {
+			row := item.Row
+			source = &row
+			if item.Action.RequiresAuth {
+				sourceActionID = item.Action.ID
+			}
+			break
+		}
+	}
+	if source == nil {
 		if b.reofferSourceJobID != sourceJobID {
 			return nil
 		}
-		source = nil
-	} else if err != nil {
-		return err
-	}
-
-	profile := b.reofferProfile
-	var sourceActionID int64
-	if source != nil && source.State == job.StateAwaitingHuman {
-		sourceActions, err := b.jobs.ListOpenHumanActionsForJobs(ctx, []string{sourceJobID})
-		if err != nil {
-			return err
+	} else {
+		if b.reofferSourceJobID != "" && b.reofferSourceJobID != sourceJobID {
+			return nil
 		}
-		for _, action := range sourceActions {
-			if action.Kind == handoffActionKind && action.RequiresAuth {
-				sourceActionID = action.ID
-				break
-			}
+		if b.reofferSourceJobID == "" && sourceActionID != 0 {
+			b.reofferSourceJobID = sourceJobID
+			b.reofferProfile = resolverProfileKey(source.Policy.Resolver)
 		}
 		if sourceActionID != 0 {
-			if b.reofferSourceJobID != "" && b.reofferSourceJobID != sourceJobID {
-				return nil
-			}
-			if b.reofferSourceJobID == "" {
-				b.reofferSourceJobID = sourceJobID
-				b.reofferProfile = resolverProfileKey(source.Policy.Resolver)
-			}
-			profile = b.reofferProfile
 			b.authReleased[sourceActionID] = true
 		}
 	}
+	profile := b.reofferProfile
 	if b.reofferSourceJobID != sourceJobID || profile == "" {
 		return nil
 	}
 
-	actions, err := b.jobs.ListHumanActions(ctx, true)
-	if err != nil {
-		return err
-	}
-	handoff := make(map[string]job.HumanAction)
-	rows := make(map[string]job.Row)
-	for _, action := range actions {
-		if action.Kind == handoffActionKind {
-			handoff[action.JobID] = action
-		}
-	}
-	for jobID := range handoff {
-		row, err := b.jobs.Get(ctx, jobID)
-		if errors.Is(err, sql.ErrNoRows) {
-			continue
-		}
-		if err != nil {
-			return err
-		}
-		if row.State == job.StateAwaitingHuman {
-			rows[jobID] = *row
-		}
+	handoff := make(map[string]job.HumanAction, len(handoffJobs))
+	rows := make(map[string]job.Row, len(handoffJobs))
+	for _, item := range handoffJobs {
+		handoff[item.Row.ID] = item.Action
+		rows[item.Row.ID] = item.Row
 	}
 
 	outstanding := outstandingOfferCount(b.offered, handoff, rows, b.pendingDownloads)
@@ -1690,19 +1705,22 @@ func (b *Bridge) reofferInstitutionalSiblings(ctx context.Context, sourceJobID s
 		action job.HumanAction
 		row    job.Row
 	}
-	candidates := make([]candidate, 0, len(actions))
-	for _, action := range actions {
-		if action.JobID == sourceJobID ||
-			action.Kind != handoffActionKind ||
+	candidates := make([]candidate, 0, len(handoffJobs))
+	for _, item := range handoffJobs {
+		action := item.Action
+		if item.Row.ID == sourceJobID ||
 			!action.RequiresAuth ||
 			b.authReleased[action.ID] {
 			continue
 		}
-		row, ok := rows[action.JobID]
-		if !ok ||
-			resolverProfileKey(row.Policy.Resolver) != profile ||
+		row := item.Row
+		if resolverProfileKey(row.Policy.Resolver) != profile ||
 			row.LeaseActive(b.now()) ||
 			hasSettledDownload(b.pendingDownloads, row.ID) {
+			continue
+		}
+		if _, offerable := b.offerableAccessMode(row); !offerable {
+			delete(b.reofferPending, row.ID)
 			continue
 		}
 		requeued, err := b.institutionalRouteRequeued(ctx, row.ID)
@@ -1961,38 +1979,38 @@ func (b *Bridge) leaveHandoff(ctx context.Context, jobID, to, reason string) err
 // directory and hands it to the app for validation. The filename has already
 // passed protocol validation (no path separators); this adds IsLocal and a
 // symlink-resolved prefix guard before app-side confinement.
-func (b *Bridge) adopt(ctx context.Context, jobID, filename string) error {
+func (b *Bridge) adopt(ctx context.Context, jobID, filename string) (int64, error) {
 	if !filepath.IsLocal(filename) {
-		return fmt.Errorf("adoption filename %q is not a local name", filename)
+		return 0, fmt.Errorf("adoption filename %q is not a local name", filename)
 	}
 	root := filepath.Join(b.cfg.EffectiveAdoptionRoot(), jobID)
 	realRoot, err := filepath.EvalSymlinks(root)
 	if err != nil {
-		return fmt.Errorf("adoption root unavailable: %w", err)
+		return 0, fmt.Errorf("adoption root unavailable: %w", err)
 	}
 	full := filepath.Join(realRoot, filename)
 	rel, err := filepath.Rel(realRoot, full)
 	if err != nil || rel != filename || strings.Contains(rel, "..") {
-		return fmt.Errorf("adoption path escapes %s", realRoot)
+		return 0, fmt.Errorf("adoption path escapes %s", realRoot)
 	}
-	return b.svc.AdoptDownload(ctx, jobID, full)
+	return b.svc.AdoptDownloadCandidate(ctx, jobID, full)
 }
 
-func (b *Bridge) adoptWithContext(ctx context.Context, jobID, filename string, provenance *app.BrowserDeliveryContext) error {
+func (b *Bridge) adoptWithContext(ctx context.Context, jobID, filename string, provenance *app.BrowserDeliveryContext) (int64, error) {
 	if !filepath.IsLocal(filename) {
-		return fmt.Errorf("adoption filename %q is not a local name", filename)
+		return 0, fmt.Errorf("adoption filename %q is not a local name", filename)
 	}
 	root := filepath.Join(b.cfg.EffectiveAdoptionRoot(), jobID)
 	realRoot, err := filepath.EvalSymlinks(root)
 	if err != nil {
-		return fmt.Errorf("adoption root unavailable: %w", err)
+		return 0, fmt.Errorf("adoption root unavailable: %w", err)
 	}
 	full := filepath.Join(realRoot, filename)
 	rel, err := filepath.Rel(realRoot, full)
 	if err != nil || rel != filename || strings.Contains(rel, "..") {
-		return fmt.Errorf("adoption path escapes %s", realRoot)
+		return 0, fmt.Errorf("adoption path escapes %s", realRoot)
 	}
-	return b.svc.AdoptDownloadWithContext(ctx, jobID, full, provenance)
+	return b.svc.AdoptDownloadWithContextCandidate(ctx, jobID, full, provenance)
 }
 
 // scanAdoptionDir looks for exactly one settled candidate file in an
@@ -2069,7 +2087,7 @@ func (b *Bridge) SweepAdoptions(ctx context.Context) error {
 		if !ok {
 			continue
 		}
-		if err := b.adopt(ctx, jobID, name); err != nil {
+		if _, err := b.adopt(ctx, jobID, name); err != nil {
 			if evErr := b.jobs.S.AppendEvent(ctx, jobID, "browser.adoption_deferred",
 				map[string]any{"filename": name, "reason": truncate(err.Error(), 200)}); evErr != nil {
 				return evErr
@@ -2168,17 +2186,16 @@ func (b *Bridge) poll(ctx context.Context) ([]json.RawMessage, error) {
 	if err != nil {
 		return nil, err
 	}
-	actions, err := b.jobs.ListHumanActions(ctx, true)
+	handoffJobs, _, err := b.jobs.ListOpenHandoffJobsPage(ctx, handoffPageLimit)
 	if err != nil {
 		return nil, err
 	}
-	handoff := map[string]job.HumanAction{}
-	for _, a := range actions {
-		if a.Kind == handoffActionKind {
-			handoff[a.JobID] = a
-		}
-	}
+	handoff := make(map[string]job.HumanAction, len(handoffJobs))
 	present := map[string]bool{}
+	for _, item := range handoffJobs {
+		handoff[item.Row.ID] = item.Action
+		present[item.Row.ID] = true
+	}
 	// adoptOutsideSessionLock releases b.mu; a concurrent claim/takeover in
 	// that window must abort this poll — its offers would go to a demoted
 	// session and its bookkeeping would pollute the new holder's maps.
@@ -2193,7 +2210,7 @@ func (b *Bridge) poll(ctx context.Context) ([]json.RawMessage, error) {
 		// adopts; zero or several (or an in-progress .crdownload) waits —
 		// ambiguity stays with the user, per the fail-closed rule.
 		if name, ok := b.scanAdoptionDir(ctx, row.ID); ok {
-			err := b.adoptOutsideSessionLock(ctx, row.ID, name)
+			_, err := b.adoptOutsideSessionLock(ctx, row.ID, name)
 			if b.epoch != epoch {
 				return out, nil
 			}
@@ -2212,11 +2229,11 @@ func (b *Bridge) poll(ctx context.Context) ([]json.RawMessage, error) {
 	}
 
 	// The ordinary job list is bounded for directory scans. Open handoff
-	// actions are unbounded, however, so offer pacing can drain backlogs larger
-	// than that page without silently starving older parked jobs.
-	rows := make(map[string]job.Row, len(handoff))
-	candidateIDs := make([]string, 0, len(handoff))
-	seen := make(map[string]bool, len(handoff))
+	// actions are joined to their awaiting jobs in one query, so offer pacing
+	// can drain backlogs larger than that page without one Get per action.
+	rows := make(map[string]job.Row, len(handoffJobs))
+	candidateIDs := make([]string, 0, len(handoffJobs))
+	seen := make(map[string]bool, len(handoffJobs))
 	addCandidate := func(row job.Row) {
 		if row.State != job.StateAwaitingHuman {
 			return
@@ -2231,18 +2248,8 @@ func (b *Bridge) poll(ctx context.Context) ([]json.RawMessage, error) {
 	for i := range awaiting {
 		addCandidate(awaiting[i])
 	}
-	for _, action := range actions {
-		if action.Kind != handoffActionKind || seen[action.JobID] {
-			continue
-		}
-		row, getErr := b.jobs.Get(ctx, action.JobID)
-		if errors.Is(getErr, sql.ErrNoRows) {
-			continue
-		}
-		if getErr != nil {
-			return nil, getErr
-		}
-		addCandidate(*row)
+	for _, item := range handoffJobs {
+		addCandidate(item.Row)
 	}
 	for id := range b.reofferPending {
 		if !seen[id] {
@@ -2265,10 +2272,10 @@ func (b *Bridge) poll(ctx context.Context) ([]json.RawMessage, error) {
 		if iPriority != jPriority {
 			return iPriority < jPriority
 		}
-		if iPriority == 0 && rows[candidateIDs[i]].CreatedAt != rows[candidateIDs[j]].CreatedAt {
+		if rows[candidateIDs[i]].CreatedAt != rows[candidateIDs[j]].CreatedAt {
 			return rows[candidateIDs[i]].CreatedAt < rows[candidateIDs[j]].CreatedAt
 		}
-		return false
+		return candidateIDs[i] < candidateIDs[j]
 	})
 	outstanding := outstandingOfferCount(b.offered, handoff, rows, b.pendingDownloads)
 	slots := maxOutstandingOffers - outstanding
@@ -2285,6 +2292,7 @@ func (b *Bridge) poll(ctx context.Context) ([]json.RawMessage, error) {
 		action := handoff[id]
 		accessMode, offerable := b.offerableAccessMode(row)
 		if !offerable {
+			delete(b.reofferPending, id)
 			continue
 		}
 		if slots <= 0 {

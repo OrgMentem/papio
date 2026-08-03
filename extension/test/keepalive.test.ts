@@ -132,6 +132,7 @@ interface HarnessResolver {
   latestOpenURL?: string | undefined;
   storedOrigin?: unknown;
   grantedOrigins?: string[];
+  knownOrigins?: string[];
 }
 
 function makeHarness(
@@ -184,6 +185,9 @@ function makeHarness(
   const manager = new KeepaliveManager(api, {
     trackedJobCount: () => jobs.count,
     latestOpenURL: () => latestOpenURL,
+    ...(resolverConfig?.knownOrigins === undefined
+      ? {}
+      : { knownResolverOrigins: () => resolverConfig.knownOrigins ?? [] }),
     ...(warmDemand !== undefined ? { warmDemand } : {}),
     ...(workWindowID !== undefined ? { workWindowID } : {}),
     onReauthNeeded: () => {
@@ -605,4 +609,133 @@ test("marker scan outcome separates markers, no markers, and injection failure",
     verdict: "unknown",
     scanOutcome: "scan_failed",
   });
+});
+test("auth-shaped URL evidence stays unknown when marker inspection is empty", async () => {
+  const h = makeHarness();
+  h.resolverMarkers.splice(0, h.resolverMarkers.length);
+  await h.manager.init();
+  const liveTab = { id: 91, url: "https://resolver.example.edu/auth/login" };
+  h.tabs.live.set(liveTab.id, liveTab);
+  h.tabs.resolverTabs.push(liveTab);
+
+  await h.manager.checkNow(100);
+
+  expect(h.manager.getSnapshot()).toMatchObject({
+    verdict: "unknown",
+    authenticated: false,
+    scanOutcome: "no_markers",
+  });
+});
+
+test("an IdP URL surfaces reauthentication without asserting signed out", async () => {
+  const h = makeHarness();
+  await h.manager.init();
+  h.tabs.nextURL = "https://idp.example.edu/sso/login";
+
+  await h.timers.runNext();
+  await h.timers.runNext();
+
+  expect(h.manager.getSnapshot()).toMatchObject({
+    verdict: "unknown",
+    authenticated: false,
+    pausedForReauth: true,
+  });
+});
+
+test("JWT identity requires an unexpired exp claim", () => {
+  expect(
+    classifyResolverJWTIdentity([
+      syntheticJWT({ preferred_username: "jane", exp: Math.floor(Date.now() / 1_000) - 1 }),
+    ]),
+  ).toBe("unknown");
+  expect(
+    classifyResolverJWTIdentity([
+      syntheticJWT({ preferred_username: "jane", exp: Math.floor(Date.now() / 1_000) + 60 }),
+    ]),
+  ).toBe("in");
+});
+
+test("injected marker collection rejects an expired JWT identity", () => {
+  const window = new Window({ url: "https://resolver.example.edu/account" });
+  window.sessionStorage.setItem(
+    "primo-session",
+    syntheticJWT({ preferred_username: "jane", exp: Math.floor(Date.now() / 1_000) - 1 }),
+  );
+  const previous = {
+    document: globalThis.document,
+    localStorage: globalThis.localStorage,
+    sessionStorage: globalThis.sessionStorage,
+  };
+  Object.assign(globalThis, {
+    document: window.document,
+    localStorage: window.localStorage,
+    sessionStorage: window.sessionStorage,
+  });
+  try {
+    const markers = collectResolverMarkers();
+    expect(classifyResolverMarkers(markers)).toBe("unknown");
+    expect(markers.some((marker) => marker.storageIdentity === "in")).toBe(false);
+  } finally {
+    Object.assign(globalThis, previous);
+  }
+});
+
+test("marker collection ignores logout text in scripts, styles, templates, and ancestors", () => {
+  const window = new Window({ url: "https://resolver.example.edu/account" });
+  window.document.write(
+    "<html><head><style>.logout { content: 'logout'; }</style></head><body><script>const label = 'logout';</script><template>logout</template><main>logout</main></body></html>",
+  );
+  const previous = {
+    document: globalThis.document,
+    localStorage: globalThis.localStorage,
+    sessionStorage: globalThis.sessionStorage,
+  };
+  Object.assign(globalThis, {
+    document: window.document,
+    localStorage: window.localStorage,
+    sessionStorage: window.sessionStorage,
+  });
+  try {
+    expect(classifyResolverMarkers(collectResolverMarkers())).toBe("unknown");
+  } finally {
+    Object.assign(globalThis, previous);
+  }
+});
+
+test("known resolver origins retain independent verdicts and timestamps", async () => {
+  const defaultOrigin = "https://resolver.example.edu";
+  const uwaOrigin = "https://onesearch.library.example-college.edu";
+  const h = makeHarness(4, undefined, {
+    latestOpenURL: `${defaultOrigin}/openurl`,
+    knownOrigins: [defaultOrigin, uwaOrigin],
+  });
+  await h.manager.init();
+  const signedIn = { id: 42, url: `${defaultOrigin}/account` };
+  const signedOut = { id: 43, url: `${uwaOrigin}/login` };
+  h.tabs.live.set(signedIn.id, signedIn);
+  h.tabs.live.set(signedOut.id, signedOut);
+  h.tabs.resolverTabs.push(signedIn, signedOut);
+  h.api.scripting = {
+    executeScript: async ({ target }) => [{
+      result: target.tabId === signedIn.id
+        ? [{ text: "Sign out", label: "" }]
+        : [{ text: "Sign in", label: "" }],
+    }],
+  };
+
+  await h.manager.checkNow(100);
+
+  const states = h.manager.getOriginSnapshots();
+  expect(states).toHaveLength(2);
+  expect(states.find((snapshot) => snapshot.origin === defaultOrigin)).toMatchObject({
+    verdict: "in",
+    authenticated: true,
+    probeSource: "live_tab",
+  });
+  expect(states.find((snapshot) => snapshot.origin === uwaOrigin)).toMatchObject({
+    verdict: "out",
+    authenticated: false,
+    probeSource: "live_tab",
+  });
+  expect(states.every((snapshot) => typeof snapshot.lastCheckAt === "number")).toBe(true);
 });

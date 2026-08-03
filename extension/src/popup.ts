@@ -19,7 +19,11 @@ import {
 import { chromeBackend, type ActiveJob, type PendingDelivery, type StoreShape, TERMS_CONSENT_KEY } from "./state";
 import type { ActivityEntryPayload } from "./protocol";
 import { classifyPage, isPDFPage, pdfSourceURL, sniffDOI, type PageKind } from "./deliver";
-import { SESSION_STALE_MS, type KeepaliveSnapshot } from "./keepalive";
+import {
+  SESSION_STALE_MS,
+  type KeepaliveOriginSnapshot,
+  type KeepaliveSnapshot,
+} from "./keepalive";
 import { renderPapio } from "./dom";
 import {
   EST_MINUTES_SAVED_PER_PAPER,
@@ -337,20 +341,47 @@ export async function openHandoff(jobID: string): Promise<void> {
   }
   throw new Error("Could not focus the institutional sign-in");
 }
+
 export type PopupSessionState = KeepaliveSnapshot & {
   releasedAuthJobs: number;
   /** Epoch ms of the latest release event; the notice shows once per stamp. */
   releasedAuthJobsAt?: number | null;
+  /** One independently probed state for every configured resolver origin. */
+  origins?: KeepaliveOriginSnapshot[];
 };
 
 export const SESSION_STATE_MESSAGE = "papio.session.state";
 export const SESSION_SIGNIN_MESSAGE = "papio.session.signin";
 export const SESSION_RETRY_MESSAGE = "papio.session.retry";
 
+function isOriginSnapshot(value: unknown): value is KeepaliveOriginSnapshot {
+  if (typeof value !== "object" || value === null) return false;
+  const snapshot = value as Record<string, unknown>;
+  return (
+    typeof snapshot["origin"] === "string" &&
+    /^https:\/\/[^/]+$/.test(snapshot["origin"]) &&
+    typeof snapshot["authenticated"] === "boolean" &&
+    (snapshot["verdict"] === "in" || snapshot["verdict"] === "out" || snapshot["verdict"] === "unknown") &&
+    (snapshot["probeSource"] === "live_tab" ||
+      snapshot["probeSource"] === "keepalive_tab" ||
+      snapshot["probeSource"] === "none") &&
+    (snapshot["scanOutcome"] === undefined ||
+      snapshot["scanOutcome"] === "markers" ||
+      snapshot["scanOutcome"] === "no_markers" ||
+      snapshot["scanOutcome"] === "scan_failed") &&
+    (snapshot["lastVerdictAt"] === null || typeof snapshot["lastVerdictAt"] === "number") &&
+    typeof snapshot["checking"] === "boolean" &&
+    typeof snapshot["likelyAuthenticated"] === "boolean" &&
+    typeof snapshot["pausedForReauth"] === "boolean" &&
+    (snapshot["lastCheckAt"] === null || typeof snapshot["lastCheckAt"] === "number")
+  );
+}
+
 function isSessionState(value: unknown): value is PopupSessionState {
   if (typeof value !== "object" || value === null) return false;
   const state = value as Record<string, unknown>;
   const resolverOrigin = state["resolverOrigin"];
+  const origins = state["origins"];
   return (
     typeof state["enabled"] === "boolean" &&
     typeof state["authenticated"] === "boolean" &&
@@ -382,7 +413,8 @@ function isSessionState(value: unknown): value is PopupSessionState {
     typeof state["releasedAuthJobs"] === "number" &&
     (state["releasedAuthJobsAt"] === undefined ||
       state["releasedAuthJobsAt"] === null ||
-      typeof state["releasedAuthJobsAt"] === "number")
+      typeof state["releasedAuthJobsAt"] === "number") &&
+    (origins === undefined || (Array.isArray(origins) && origins.every(isOriginSnapshot)))
   );
 }
 
@@ -390,8 +422,14 @@ export async function requestSessionState(): Promise<PopupSessionState | undefin
   try {
     const response: unknown = await chrome.runtime.sendMessage({ type: SESSION_STATE_MESSAGE });
     if (typeof response !== "object" || response === null) return undefined;
-    const state = (response as Record<string, unknown>)["state"];
-    return isSessionState(state) ? state : undefined;
+    const envelope = response as Record<string, unknown>;
+    const state = envelope["state"];
+    if (!isSessionState(state)) return undefined;
+    const origins = envelope["origins"];
+    if (origins === undefined) return state;
+    return Array.isArray(origins) && origins.every(isOriginSnapshot)
+      ? { ...state, origins }
+      : state;
   } catch {
     return undefined;
   }
@@ -425,6 +463,8 @@ export async function cleanupOrphanTabs(): Promise<number> {
   }
 }
 
+const leftoverCleanupHandlers = new WeakMap<HTMLButtonElement, () => Promise<number>>();
+
 /** Offer a one-click close of tabs papio opened in a previous extension life
  * and can no longer track (reloads wipe the session store; the durable ledger
  * and the papio tab-group sweep still recognize them). Hidden at zero. */
@@ -452,14 +492,16 @@ export function renderLeftoverTabs(
     count === 1
       ? "1 untracked tab left from an earlier session."
       : `${count} untracked tabs left from an earlier session.`;
-  button.disabled = false;
   button.textContent = "Close them";
+  leftoverCleanupHandlers.set(button, onCleanup);
   if (!button.dataset.wired) {
     button.dataset.wired = "1";
     button.addEventListener("click", () => {
+      const cleanup = leftoverCleanupHandlers.get(button);
+      if (cleanup === undefined) return;
       button.disabled = true;
       button.textContent = "Closing…";
-      void onCleanup().then(
+      void cleanup().then(
         () => {
           section.hidden = true;
         },
@@ -471,9 +513,11 @@ export function renderLeftoverTabs(
     });
   }
 }
-
-export async function openInstitutionSignIn(): Promise<void> {
-  const response: unknown = await chrome.runtime.sendMessage({ type: SESSION_SIGNIN_MESSAGE });
+export async function openInstitutionSignIn(origin?: string): Promise<void> {
+  const response: unknown = await chrome.runtime.sendMessage({
+    type: SESSION_SIGNIN_MESSAGE,
+    ...(origin === undefined ? {} : { origin }),
+  });
   if (
     typeof response === "object" &&
     response !== null &&
@@ -644,6 +688,23 @@ export function deriveSessionCardState(state: PopupSessionState | undefined): Se
   };
 }
 
+export interface SessionRowState extends SessionCardState {
+  origin: string;
+}
+
+/** Convert every configured resolver snapshot into independent, pure row copy. */
+export function deriveSessionRows(state: PopupSessionState | undefined): SessionRowState[] {
+  if (state === undefined || state.origins === undefined) return [];
+  return state.origins.map((originState) => {
+    const card = deriveSessionCardState({
+      ...state,
+      ...originState,
+      resolverOrigin: originState.origin,
+    });
+    return { origin: originState.origin, ...card };
+  });
+}
+
 let sessionNoticeFadeTimer: ReturnType<typeof setTimeout> | undefined;
 let sessionNoticeHideTimer: ReturnType<typeof setTimeout> | undefined;
 let sessionProbeRetryTimer: ReturnType<typeof setTimeout> | undefined;
@@ -651,12 +712,78 @@ let sessionProbeRetryTimer: ReturnType<typeof setTimeout> | undefined;
  * re-delivered by every session poll must not resurrect a faded notice. */
 let sessionNoticeShownKey: string | undefined;
 
+const sessionSignInHandlers = new WeakMap<HTMLButtonElement, () => Promise<void>>();
+
 function clearSessionNoticeTimers(): void {
   clearTimeout(sessionNoticeFadeTimer);
   clearTimeout(sessionNoticeHideTimer);
   sessionNoticeFadeTimer = undefined;
   sessionNoticeHideTimer = undefined;
 }
+function sessionRowText(row: SessionRowState): string {
+  return row.detail === "" ? row.label : `${row.label} · ${row.detail}`;
+}
+
+function renderSessionRows(
+  doc: Document,
+  container: HTMLElement,
+  rows: readonly SessionRowState[],
+  onSignIn: (origin?: string) => Promise<void>,
+): void {
+  container.replaceChildren();
+  rows.forEach((row, index) => {
+    const item = doc.createElement("div");
+    item.className = "institution-session-origin-row";
+    const copy = doc.createElement("div");
+    copy.className = "institution-session-origin-copy";
+    const host = doc.createElement("span");
+    host.className = "institution-session-origin";
+    host.textContent = resolverHost(row.origin);
+    const status = doc.createElement("p");
+    status.className = "institution-session-status";
+    status.id = `institution-session-status-${index}`;
+    status.setAttribute("role", "status");
+    status.setAttribute("aria-live", "polite");
+    status.textContent = sessionRowText(row);
+    copy.append(host, status);
+    const signIn = doc.createElement("button");
+    signIn.className = "primary";
+    signIn.type = "button";
+    signIn.textContent = "Sign in";
+    signIn.setAttribute("aria-label", `Sign in to ${resolverHost(row.origin)}`);
+    signIn.setAttribute("aria-describedby", status.id);
+    signIn.hidden = row.action === "none";
+    signIn.disabled = row.action === "none";
+    sessionSignInHandlers.set(signIn, () => onSignIn(row.origin));
+    signIn.dataset.origin = row.origin;
+    if (!signIn.dataset.wired) {
+      signIn.dataset.wired = "1";
+      signIn.addEventListener("click", () => {
+        const action = sessionSignInHandlers.get(signIn);
+        if (action === undefined) return;
+        signIn.disabled = true;
+        signIn.textContent = "Opening…";
+        void action().then(
+          () => {
+            signIn.disabled = false;
+            signIn.textContent = "Sign in";
+          },
+          (error: unknown) => {
+            signIn.disabled = false;
+            signIn.textContent = "Sign in";
+            status.textContent =
+              error instanceof Error && error.message.length > 0
+                ? error.message
+                : "Could not open the institution sign-in";
+          },
+        );
+      });
+    }
+    item.append(copy, signIn);
+    container.append(item);
+  });
+}
+
 function scheduleSessionProbeRetry(state: PopupSessionState | undefined): void {
   clearTimeout(sessionProbeRetryTimer);
   sessionProbeRetryTimer = undefined;
@@ -674,12 +801,14 @@ function scheduleSessionProbeRetry(state: PopupSessionState | undefined): void {
 export function renderInstitutionSession(
   doc: Document,
   state: PopupSessionState | undefined,
-  onSignIn: () => Promise<void> = openInstitutionSignIn,
+  onSignIn: (origin?: string) => Promise<void> = openInstitutionSignIn,
 ): void {
   const card = doc.getElementById("institution-session");
   const status = doc.getElementById("institution-session-status");
   const origin = doc.getElementById("institution-session-origin");
   const signIn = doc.getElementById("institution-session-signin");
+  const legacyRow = doc.querySelector<HTMLElement>("#institution-session .institution-session-row");
+  const rowsContainer = doc.getElementById("institution-session-rows");
   const notice = doc.getElementById("institution-session-unblocked");
   if (
     !(card instanceof HTMLElement) ||
@@ -692,36 +821,63 @@ export function renderInstitutionSession(
   }
   card.hidden = state === undefined;
   if (state === undefined) {
+    rowsContainer?.replaceChildren();
+    if (rowsContainer instanceof HTMLElement) rowsContainer.hidden = true;
     clearSessionNoticeTimers();
     return;
   }
-  const cardState = deriveSessionCardState(state);
-  status.textContent =
-    cardState.detail === "" ? cardState.label : `${cardState.label} · ${cardState.detail}`;
-  origin.textContent = resolverHost(state.resolverOrigin);
-  signIn.disabled = cardState.action === "none";
-  signIn.hidden = cardState.action === "none";
-  if (!signIn.dataset.wired) {
-    signIn.dataset.wired = "1";
-    signIn.addEventListener("click", () => {
-      signIn.disabled = true;
-      signIn.textContent = "Opening…";
-      void onSignIn().then(
-        () => {
-          signIn.disabled = false;
-          signIn.textContent = "Sign in";
-        },
-        (error: unknown) => {
-          signIn.disabled = state.resolverOrigin === null;
-          signIn.textContent = "Sign in";
-          status.textContent =
-            error instanceof Error && error.message.length > 0
-              ? error.message
-              : "Could not open the institution sign-in";
-        },
-      );
-    });
+
+  const rows = deriveSessionRows(state);
+  const multiOrigin = rows.length > 1 && rowsContainer instanceof HTMLElement;
+  if (multiOrigin) {
+    if (legacyRow instanceof HTMLElement) legacyRow.hidden = true;
+    origin.textContent = "";
+    rowsContainer.hidden = false;
+    renderSessionRows(doc, rowsContainer, rows, onSignIn);
+  } else {
+    if (rowsContainer instanceof HTMLElement) {
+      rowsContainer.hidden = true;
+      rowsContainer.replaceChildren();
+    }
+    if (legacyRow instanceof HTMLElement) legacyRow.hidden = false;
+    const singleOrigin = rows.length === 1 ? rows[0]?.origin : undefined;
+    const displayState =
+      state.resolverOrigin === null && singleOrigin !== undefined && state.origins?.[0] !== undefined
+        ? { ...state, ...state.origins[0], resolverOrigin: singleOrigin }
+        : state;
+    const cardState = deriveSessionCardState(displayState);
+    status.textContent =
+      cardState.detail === "" ? cardState.label : `${cardState.label} · ${cardState.detail}`;
+    origin.textContent = resolverHost(displayState.resolverOrigin);
+    signIn.disabled = cardState.action === "none";
+    signIn.hidden = cardState.action === "none";
+    signIn.setAttribute("aria-describedby", status.id);
+    sessionSignInHandlers.set(signIn, () => onSignIn(displayState.resolverOrigin ?? undefined));
+    if (!signIn.dataset.wired) {
+      signIn.dataset.wired = "1";
+      signIn.addEventListener("click", () => {
+        const action = sessionSignInHandlers.get(signIn);
+        if (action === undefined) return;
+        signIn.disabled = true;
+        signIn.textContent = "Opening…";
+        void action().then(
+          () => {
+            signIn.disabled = false;
+            signIn.textContent = "Sign in";
+          },
+          (error: unknown) => {
+            signIn.disabled = false;
+            signIn.textContent = "Sign in";
+            status.textContent =
+              error instanceof Error && error.message.length > 0
+                ? error.message
+                : "Could not open the institution sign-in";
+          },
+        );
+      });
+    }
   }
+
   const released = Math.max(0, Math.trunc(state.releasedAuthJobs));
   if (released === 0) {
     clearSessionNoticeTimers();
@@ -1336,10 +1492,11 @@ async function readDeliveryFeedback(fallback: PendingDelivery | undefined): Prom
       const state = (reply as Record<string, unknown>)["state"] as DeliveryFeedback["status"];
       const jobID = (reply as Record<string, unknown>)["job_id"] as string;
       const message = (reply as Record<string, unknown>)["message"];
+      const sameJob = fallback?.job_id === jobID ? fallback : undefined;
       return {
         job_id: jobID,
-        url: fallback?.url ?? "",
-        initiated_at: fallback?.initiated_at ?? 0,
+        url: sameJob?.url ?? "",
+        initiated_at: sameJob?.initiated_at ?? 0,
         status: state,
         ...(typeof message === "string" ? { error: message } : {}),
       };
@@ -1412,6 +1569,17 @@ export function renderPageAcquire(
   });
 }
 
+function normalizedPDFURL(value: string | undefined): string | undefined {
+  if (typeof value !== "string" || value.trim() === "") return undefined;
+  try {
+    const url = new URL(pdfSourceURL(value));
+    url.hash = "";
+    return url.href;
+  } catch {
+    return value.trim();
+  }
+}
+
 export function renderPageContext(
   doc: Document,
   page: PageMetadata | undefined,
@@ -1444,9 +1612,12 @@ export function renderPageContext(
       (page?.doi === undefined
         ? undefined
         : jobs.find((job) => job.expected?.doi?.trim().toLowerCase().replace(/^doi:\s*/, "") === page.doi?.trim().toLowerCase().replace(/^doi:\s*/, "")));
-    const delivery = pendingDelivery?.status === "failed" || pendingDelivery?.job_id === knownJob?.job_id
-      ? pendingDelivery
-      : undefined;
+    const currentPDFURL = normalizedPDFURL(page?.url);
+    const pendingPDFURL = normalizedPDFURL(pendingDelivery?.url);
+    const deliveryMatchesJob = pendingDelivery?.job_id === knownJob?.job_id;
+    const deliveryMatchesURL =
+      currentPDFURL !== undefined && pendingPDFURL !== undefined && currentPDFURL === pendingPDFURL;
+    const delivery = deliveryMatchesJob || deliveryMatchesURL ? pendingDelivery : undefined;
     detected.textContent = "";
     detected.hidden = true;
     state.textContent = "";

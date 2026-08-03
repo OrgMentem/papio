@@ -177,6 +177,9 @@ func (s *Service) SubmitWithOptionsAs(ctx context.Context, principal job.Princip
 		return SubmitResult{}, err
 	}
 	resolverName := strings.TrimSpace(wr.Resolver)
+	if resolverName == "" {
+		resolverName = strings.TrimSpace(s.Config.Browser.DefaultResolver)
+	}
 	if resolverName != "" {
 		if _, ok := s.Config.OpenURLBaseFor(resolverName); !ok {
 			names := s.Config.ResolverNames()

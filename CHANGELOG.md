@@ -32,6 +32,19 @@ execution records in `notes/acquisition-stack-plan.md`.
   activity feed — raw kinds like `action.reminder` or `browser.error` no
   longer leak to either surface, and the CLI line view drops the raw detail
   JSON (still available under `--json`).
+- **Two institutions no longer share one session.** Browser session evidence
+  carries the resolver origin that produced it, and the daemon re-offers only
+  the matching profile's blocked work — a the second institution sign-in never releases the default institution's
+  queue, and vice versa. Named `[browser.resolvers.*]` profiles now send their
+  own `shibboleth_entity_id` / `proquest_account_id` on handoffs (previously
+  default-profile only), and a new `browser.default_resolver` key selects
+  which profile bare acquisitions use.
+- **Contextless browser adoptions are recorded as `manual` access**, matching
+  migration 0019's reclassification, and delivery context binds to the exact
+  candidate its download created instead of whichever candidate existed.
+- **Offer pacing is strictly oldest-first** across ordinary offers (not only
+  re-offers), and the two-second browser poll uses one paginated joined query
+  instead of one query per open handoff.
 - **A verified institution session now unblocks parked institutional work.**
   The extension reports timing-only session evidence (`session_evidence_v1`),
   and the daemon re-offers parked institutional handoffs from *any* prior

@@ -157,9 +157,12 @@ func (s *Service) AdoptDownload(ctx context.Context, jobID, path string) error {
 	// own guess (ADR-0007).
 	version := resolver.VersionUnknown
 	key := "browser-adopt:sha256:" + sha
+	if result, ok := ctx.Value(adoptionCandidateResultKey{}).(*adoptionCandidateResult); ok {
+		result.Key = key
+	}
 	if _, err := s.Jobs.InsertCandidates(ctx, jobID, []job.Candidate{{
 		JobID: jobID, Source: "browser", URLRedacted: "browser://adopted-download",
-		URLKey: key, Version: version, AccessBasis: resolver.AccessInstitutional, ReuseLicense: "unknown",
+		URLKey: key, Version: version, AccessBasis: resolver.AccessManual, ReuseLicense: "unknown",
 		ExpectedMIME: "application/pdf", Direct: true, IdentityConfidence: 0.5, Rank: 0,
 	}}); err != nil {
 		_ = os.Remove(temp)
@@ -182,6 +185,9 @@ func (s *Service) AdoptDownload(ctx context.Context, jobID, path string) error {
 	if err != nil {
 		_ = os.Remove(temp)
 		return err
+	}
+	if result, ok := ctx.Value(adoptionCandidateResultKey{}).(*adoptionCandidateResult); ok {
+		result.ID = stored.ID
 	}
 
 	result := fetch.Result{
@@ -249,6 +255,31 @@ func (s *Service) AdoptDownload(ctx context.Context, jobID, path string) error {
 		map[string]any{"reason": "adopted_download_rejected"})
 }
 
+type adoptionCandidateResultKey struct{}
+
+type adoptionCandidateResult struct {
+	ID  int64
+	Key string
+}
+
+// AdoptDownloadCandidate adopts a browser file and returns the durable
+// candidate created or reused for that file. The existing adoption API keeps
+// its error-only shape for callers that do not need provenance correlation.
+func (s *Service) AdoptDownloadCandidate(ctx context.Context, jobID, path string) (int64, error) {
+	result := new(adoptionCandidateResult)
+	adoptErr := s.AdoptDownload(context.WithValue(ctx, adoptionCandidateResultKey{}, result), jobID, path)
+	if adoptErr != nil {
+		if result.ID == 0 && result.Key != "" {
+			result.ID, _ = s.candidateIDByKey(ctx, jobID, result.Key)
+		}
+		return result.ID, adoptErr
+	}
+	if result.ID == 0 {
+		return 0, fmt.Errorf("browser adoption created no candidate for job %s", jobID)
+	}
+	return result.ID, nil
+}
+
 // BrowserDeliveryContext is the bounded, non-secret provenance observed by
 // the extension for one browser download. It is intentionally separate from
 // the download bytes and from the synthetic adopted URL.
@@ -260,39 +291,50 @@ type BrowserDeliveryContext struct {
 
 // AdoptDownloadWithContext preserves the legacy adoption path while attaching
 // a context that arrived with the browser delivery. The context is applied
-// after validation so a candidate exists even when adoption is resumed from a
-// prior download-complete frame.
+// after validation to the candidate created by this file's content hash.
 func (s *Service) AdoptDownloadWithContext(ctx context.Context, jobID, path string, context *BrowserDeliveryContext) error {
+	_, err := s.AdoptDownloadWithContextCandidate(ctx, jobID, path, context)
+	return err
+}
+
+// AdoptDownloadWithContextCandidate adopts one browser file and applies its
+// validated delivery context only to the candidate bound to that file.
+func (s *Service) AdoptDownloadWithContextCandidate(ctx context.Context, jobID, path string, context *BrowserDeliveryContext) (int64, error) {
 	if context == nil {
-		return s.AdoptDownload(ctx, jobID, path)
+		return s.AdoptDownloadCandidate(ctx, jobID, path)
 	}
 	if _, err := job.BrowserAccessBasis(context.Route, context.SessionEvidence); err != nil {
-		return err
+		return 0, err
 	}
-	if err := s.AdoptDownload(ctx, jobID, path); err != nil {
-		return err
+	candidateID, err := s.AdoptDownloadCandidate(ctx, jobID, path)
+	if err != nil {
+		return candidateID, err
 	}
 	landing := ""
 	if context.PageHost != "" {
 		landing = "https://" + context.PageHost
 	}
-	if _, err := s.Jobs.ApplyBrowserDeliveryContext(ctx, jobID, context.Route, context.SessionEvidence, landing); err != nil {
-		return err
+	applied, err := s.Jobs.ApplyBrowserDeliveryContextToCandidate(ctx, jobID, candidateID, context.Route, context.SessionEvidence, landing)
+	if err != nil {
+		return candidateID, err
 	}
-	return nil
+	if !applied {
+		return candidateID, fmt.Errorf("browser delivery candidate %d is unavailable for job %s", candidateID, jobID)
+	}
+	return candidateID, nil
 }
 
 // resolveAdoptedHandoffActions closes the handoff actions satisfied by a
 // browser download. This is best-effort cleanup: validation must continue even
 // if an already-stale action cannot be resolved.
 func (s *Service) resolveAdoptedHandoffActions(ctx context.Context, jobID string) {
-	actions, err := s.Jobs.ListHumanActions(context.WithoutCancel(ctx), true)
+	actions, err := s.Jobs.ListOpenHumanActionsForJobs(context.WithoutCancel(ctx), []string{jobID})
 	if err != nil {
 		log.Printf("papio: listing browser handoff actions for adopted job %s: %v", jobID, err)
 		return
 	}
 	for _, action := range actions {
-		if action.JobID != jobID || (action.Kind != "openurl_handoff" && action.Kind != "manual_download") {
+		if action.Kind != "openurl_handoff" && action.Kind != "manual_download" {
 			continue
 		}
 		if err := s.Jobs.ResolveHumanAction(context.WithoutCancel(ctx), action.ID, "resolved"); err != nil {
@@ -305,13 +347,13 @@ func (s *Service) resolveAdoptedHandoffActions(ctx context.Context, jobID string
 // that supplied the browser download before resolveAdoptedHandoffActions closes
 // it. A missing action fails closed through the job-level inheritance helper.
 func (s *Service) adoptionReplacementAccess(ctx context.Context, jobID string) job.AccessClassification {
-	actions, err := s.Jobs.ListHumanActions(ctx, false)
+	actions, err := s.Jobs.ListOpenHumanActionsForJobs(ctx, []string{jobID})
 	if err != nil {
 		return job.AccessInheritedFromResolvedHandoff("")
 	}
 	for _, kind := range []string{"openurl_handoff", "manual_download"} {
 		for _, action := range actions {
-			if action.JobID == jobID && action.Kind == kind {
+			if action.Kind == kind {
 				return job.Access(action.RequiresAuth, action.BlockedBy)
 			}
 		}

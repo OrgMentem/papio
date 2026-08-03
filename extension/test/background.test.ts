@@ -1425,6 +1425,42 @@ test("a cleared Cloudflare challenge returns to the ordinary stale-adapter path"
   expect(h.backend.store.challengeCooldowns).toEqual({});
   expect(h.backend.store.activeJobs[0]?.challenge_blocked).toBeUndefined();
 });
+test("challenge resume queues without a governor slot before classifying", async () => {
+  let challenge = true;
+  const h = makeHarness();
+  useUnknownProviderClassifier(h, () => challenge);
+  const challengeTabID = await classifyProviderUnknown(h, "job_challenge_resume_queued");
+  await h.port.inbound(jobOfferForHosts("job_resume_slot_a", ["link.springer.com"]));
+  await h.port.inbound(jobOfferForHosts("job_resume_slot_b", ["link.springer.com"]));
+  expect(h.tabs.live.size).toBe(3);
+
+  const spec = h.deps.adapterSpecs[0]!;
+  spec.download = {
+    selector: "a",
+    requireKind: "article",
+    method: "url",
+    idPattern: ".*",
+    urlTemplate: "https://download.example/paper.pdf",
+  };
+  h.deps.settings.getTermsConsent = async () => "accept";
+  h.deps.scripting.executeScript = async (injection) => {
+    if (injection.func === assessDrivenPage) return [{ result: { kind: "normal" } }];
+    if (injection.func === interpret) {
+      return [{ result: { kind: "article", adapter_id: spec.id, adapter_version: spec.version, evidence: [] } }];
+    }
+    return [{ result: "https://download.example/paper.pdf" }];
+  };
+
+  challenge = false;
+  const url = `https://${PROVIDER_HOST}/stable/challenge`;
+  await h.tabs.onUpdated.emit(challengeTabID, { url, status: "complete" }, { id: challengeTabID, url });
+
+  expect(h.downloads.started).toHaveLength(0);
+  const resumed = h.backend.store.activeJobs.find((job) => job.job_id === "job_challenge_resume_queued");
+  expect(resumed).toMatchObject({ tab_id: challengeTabID, status: "accepted" });
+  expect(resumed?.challenge_blocked).toBeUndefined();
+  expect(h.tabs.live.size).toBe(3);
+});
 test("driven-page assessment classifies challenge, redirect-loop, and normal fixtures", () => {
   const fixture = (html: string): Document => {
     const window = new Window({ url: "https://www.jstor.org/stable/paper" });
@@ -1675,6 +1711,58 @@ test("a manual registry-host download with two matching jobs remains unowned", a
 
   expect(h.frames().some((frame) => frame.type === "download_complete")).toBe(false);
   expect(h.backend.store.activeJobs.every((job) => job.download_initiated !== true)).toBe(true);
+});
+test("concurrent classifications after accepted terms initiate exactly one download", async () => {
+  const h = makeHarness();
+  const adapter: AdapterSpec = {
+    id: "terms-race",
+    version: "1.0.0",
+    hosts: [PROVIDER_HOST],
+    classify: [{ kind: "article", any: ["article"] }],
+    download: {
+      selector: "a.download",
+      requireKind: "article",
+      method: "url",
+      idPattern: "stable/([^/]+)",
+      urlTemplate: "https://download.example/{1}.pdf",
+      requiresTermsConsent: true,
+    },
+  };
+  h.deps.adapterSpecs.push(adapter);
+  h.deps.permissions.contains = async () => true;
+  h.deps.scripting.executeScript = async (injection) => {
+    if (injection.func === assessDrivenPage) return [{ result: { kind: "normal" } }];
+    if (injection.func === interpret) {
+      return [{ result: { kind: "article", adapter_id: adapter.id, adapter_version: adapter.version, evidence: [] } }];
+    }
+    return [{ result: "https://download.example/paper.pdf" }];
+  };
+  let consentCalls = 0;
+  let gateEnabled = false;
+  let releaseConsent!: () => void;
+  const consentGate = new Promise<"accept">((resolve) => {
+    releaseConsent = () => resolve("accept");
+  });
+  h.deps.settings.getTermsConsent = async () => {
+    if (!gateEnabled) return "accept";
+    consentCalls += 1;
+    return consentGate;
+  };
+
+  await h.bridge.start();
+  gateEnabled = true;
+  await h.port.inbound(jobOffer("job_terms_race"));
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  const url = `https://${PROVIDER_HOST}/stable/article`;
+  const first = h.tabs.onUpdated.emit(tabID, { url, status: "complete" }, { id: tabID, url });
+  const second = h.tabs.onUpdated.emit(tabID, { url, status: "complete" }, { id: tabID, url });
+  for (let attempt = 0; attempt < 20 && consentCalls < 2; attempt += 1) await Promise.resolve();
+  releaseConsent();
+  await Promise.all([first, second]);
+
+  expect(consentCalls).toBe(2);
+  expect(h.downloads.started).toHaveLength(1);
+  expect(h.backend.store.activeJobs[0]?.download_initiated).toBe(true);
 });
 
 
@@ -2915,6 +3003,43 @@ test("inbox runtime messages validate the exact extension sender", async () => {
       },
     });
 });
+test("papio.activity accepts popup senders while triage remains inbox-only", async () => {
+  const h = makeHarness();
+  const urls = {
+    runtimeID: "papio-test-id",
+    inboxURL: "chrome-extension://papio-test-id/inbox.html",
+    popupURL: "chrome-extension://papio-test-id/popup.html",
+    historyURL: "chrome-extension://papio-test-id/history.html",
+  };
+  const reply = {
+    ok: true as const,
+    feature: true,
+    entries: [{ seq: 1, at: "2026-08-03T00:00:00Z", kind: "download_complete", text: "Ready" }],
+  };
+  let requestedLimit: number | undefined;
+  h.bridge.requestActivity = async (limit) => {
+    requestedLimit = limit;
+    return reply;
+  };
+
+  await expect(
+    handleInboxRuntimeMessage(
+      h.bridge,
+      { type: "papio.activity", request: { limit: 10 } },
+      { id: urls.runtimeID, url: urls.popupURL },
+      urls,
+    ),
+  ).resolves.toBe(reply);
+  expect(requestedLimit).toBe(10);
+  await expect(
+    handleInboxRuntimeMessage(
+      h.bridge,
+      { type: "papio.triage.counts", request: {} },
+      { id: urls.runtimeID, url: urls.popupURL },
+      urls,
+    ),
+  ).resolves.toMatchObject({ ok: false, error: { code: "unauthorized" } });
+});
 
 test("papio.stats from any papio page routes to the bridge stats request", async () => {
   const h = makeHarness();
@@ -3193,6 +3318,37 @@ test("session state probes a live resolver tab before claiming signed out", asyn
       resolverOrigin: "https://resolver.example.edu",
     },
   });
+});
+test("session state reports each known resolver and sign-in targets its origin", async () => {
+  const h = makeHarness();
+  const urls = {
+    runtimeID: "papio-test-id",
+    inboxURL: "chrome-extension://papio-test-id/inbox.html",
+    popupURL: "chrome-extension://papio-test-id/popup.html",
+    historyURL: "chrome-extension://papio-test-id/history.html",
+  };
+  const uwaOrigin = "https://onesearch.library.example-college.edu";
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ resolver_origins: ["https://resolver.example.edu", uwaOrigin] }));
+
+  await expect(
+    handleInboxRuntimeMessage(h.bridge, { type: "papio.session.state" }, { id: urls.runtimeID, url: urls.popupURL }, urls),
+  ).resolves.toMatchObject({
+    ok: true,
+    origins: [
+      { origin: "https://resolver.example.edu", verdict: "unknown" },
+      { origin: uwaOrigin, verdict: "unknown" },
+    ],
+  });
+  await expect(
+    handleInboxRuntimeMessage(
+      h.bridge,
+      { type: "papio.session.signin", origin: uwaOrigin },
+      { id: urls.runtimeID, url: urls.popupURL },
+      urls,
+    ),
+  ).resolves.toEqual({ ok: true, opened: true });
+  expect(h.tabs.created).toContainEqual({ url: uwaOrigin, active: true });
 });
 
 test("session sign-in reports why it cannot open without a resolver", async () => {
@@ -3879,6 +4035,34 @@ test("cold handoffs consolidate to one tab before warm evidence fills the second
   expect(h.tabs.created).toHaveLength(2);
   expect(h.backend.store.activeJobs.filter((job) => job.tab_id < 0)).toHaveLength(3);
 });
+test("keepalive warmth releases only the matching resolver queue", async () => {
+  const h = makeHarness();
+  const uwaOrigin = "https://onesearch.library.example-college.edu";
+  const uwaOpenURL = `${uwaOrigin}/openurl?ctx=uwa`;
+  const defaultOffer = jobOfferForHosts("job_default_origin_queue", [PROVIDER_HOST]) as {
+    payload: Record<string, unknown>;
+  };
+  defaultOffer.payload["requires_auth"] = true;
+  const uwaOffer = jobOfferForHosts("job_uwa_origin_queue", ["link.springer.com"], uwaOpenURL) as {
+    payload: Record<string, unknown>;
+  };
+  uwaOffer.payload["requires_auth"] = true;
+
+  await h.bridge.start();
+  await h.port.inbound(defaultOffer);
+  await h.port.inbound(uwaOffer);
+  await h.bridge.setKeepaliveAuthenticated(true, uwaOrigin);
+
+  expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_default_origin_queue")).toMatchObject({
+    status: "queued",
+    tab_id: -1,
+  });
+  expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_uwa_origin_queue")).toMatchObject({
+    status: "accepted",
+    tab_id: 100,
+  });
+  expect(h.tabs.created).toEqual([{ url: uwaOpenURL, active: false }]);
+});
 
 test("handoff group reducer trails auth recollapse and stays quiet when collapsed", async () => {
   const h = makeHarness(undefined, { tabGroups: true, handoffSurface: "tab-group" });
@@ -3903,7 +4087,7 @@ test("handoff group reducer trails auth recollapse and stays quiet when collapse
   expect(h.tabGroups?.updated.length).toBe(updates);
 });
 
-test("orphan scan flags ledgered and papio-group leftovers but never tracked or active tabs", async () => {
+test("orphan scan flags only ledger-owned tabs and never tracked or active tabs", async () => {
   const h = makeHarness(undefined, { tabGroups: true });
   let ledger: Record<string, number> = { "300": 1, "301": 1, "999": 1 };
   h.deps.tabLedger = {
@@ -3920,7 +4104,7 @@ test("orphan scan flags ledgered and papio-group leftovers but never tracked or 
   // looking at it right now. 999: ledger entry whose tab is already gone.
   h.tabs.live.set(300, { id: 300, url: "https://provider.example.org/a" });
   h.tabs.live.set(301, { id: 301, url: "https://provider.example.org/b", active: true });
-  // 302: pre-ledger leftover still sitting in a papio-titled group.
+  // 302: an unledgered tab in a papio-titled group is not owned by papio.
   h.tabs.live.set(302, { id: 302, url: "https://provider.example.org/c", groupId: 700 });
   h.tabGroups!.live.set(700, { id: 700, collapsed: true, title: "papio", windowId: 1 });
   // 303: the pinned keepalive resolver tab folded into the papio group —
@@ -3928,14 +4112,14 @@ test("orphan scan flags ledgered and papio-group leftovers but never tracked or 
   h.tabs.live.set(303, { id: 303, url: "https://resolver.example.edu/keepalive", groupId: 700, pinned: true });
 
   const status = await h.bridge.orphanTabStatus();
-  expect(status).toEqual({ count: 2, tab_ids: [300, 302] });
+  expect(status).toEqual({ count: 1, tab_ids: [300] });
   // The dead entry is pruned from the durable ledger as a scan side effect.
   expect(ledger["999"]).toBeUndefined();
 
   const { closed } = await h.bridge.cleanupOrphanTabs();
-  expect(closed).toBe(2);
-  expect(h.tabs.removed).toEqual([300, 302]);
-  expect(h.tabs.live.has(trackedTab)).toBe(true);
+  expect(closed).toBe(1);
+  expect(h.tabs.removed).toEqual([300]);
+  expect(h.tabs.live.has(302)).toBe(true);
   expect(h.tabs.live.has(301)).toBe(true);
   expect(ledger["300"]).toBeUndefined();
   // Closing an orphan is programmatic: no cancel frame may reach the daemon.

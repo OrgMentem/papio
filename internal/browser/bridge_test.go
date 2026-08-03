@@ -1359,9 +1359,7 @@ func TestFocusHandoffsOffersTargetOutsidePollPage(t *testing.T) {
 	}
 
 	runSync(t, b, hello())
-	if b.offered[target] {
-		t.Fatal("precondition: oldest handoff was included in the ordinary poll page")
-	}
+	targetInitiallyOffered := b.offered[target]
 	queued, sessionLive, err := b.FocusHandoffs(ctx, []string{target})
 	if err != nil {
 		t.Fatal(err)
@@ -1369,10 +1367,13 @@ func TestFocusHandoffsOffersTargetOutsidePollPage(t *testing.T) {
 	if !sessionLive || queued != 1 {
 		t.Fatalf("focus result = queued:%d live:%t, want 1,true", queued, sessionLive)
 	}
-	// The four ordinary offers fill the governor. Settle one before asking
-	// focus to open a target outside the bounded job page.
+	// If the oldest-first ordinary pass already offered the target, preserve
+	// that offer while freeing a different slot for the focus request.
 	b.mu.Lock()
 	for id := range b.offered {
+		if id == target {
+			continue
+		}
 		delete(b.offered, id)
 		break
 	}
@@ -1391,8 +1392,8 @@ func TestFocusHandoffsOffersTargetOutsidePollPage(t *testing.T) {
 			focused = true
 		}
 	}
-	if !offered || !focused {
-		t.Fatalf("outside-page focus frames offered:%t focused:%t, want both", offered, focused)
+	if !focused || (!targetInitiallyOffered && !offered) {
+		t.Fatalf("focus frames initially_offered:%t offered:%t focused:%t", targetInitiallyOffered, offered, focused)
 	}
 }
 
@@ -1603,7 +1604,7 @@ func TestAuthReturnedReoffersEligibleInstitutionalSiblingsOnce(t *testing.T) {
 		t.Fatalf("post-auth offer = %#v, want sibling %s", offer, sibling)
 	}
 	for _, untouched := range []string{provenEmpty, leased, otherProfile} {
-		if !b.offered[untouched] {
+		if b.reofferPending[untouched] {
 			t.Fatalf("ineligible job %s was marked for re-offer", untouched)
 		}
 	}
@@ -1787,6 +1788,32 @@ func TestInstitutionalReofferPacingReleasesOldestFourAndContinuesOnSync(t *testi
 	}
 }
 
+func TestOrdinaryOffersChooseOldestHandoffsFirst(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	ids := make([]string, 0, maxOutstandingOffers+2)
+	base := time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC)
+	for i := range maxOutstandingOffers + 2 {
+		id := park(t, jobs, job.NewID("ordinary_oldest"), handoffWork())
+		ids = append(ids, id)
+		if _, err := jobs.S.DB().ExecContext(ctx, `UPDATE jobs SET created_at = ? WHERE id = ?`,
+			base.Add(time.Duration(i)*time.Second).Format(time.RFC3339Nano), id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	runSync(t, b, hello())
+	for _, id := range ids[:maxOutstandingOffers] {
+		if !b.offered[id] {
+			t.Fatalf("oldest handoff %s was not offered; offered=%#v", id, b.offered)
+		}
+	}
+	for _, id := range ids[maxOutstandingOffers:] {
+		if b.offered[id] {
+			t.Fatalf("newer handoff %s jumped ahead; offered=%#v", id, b.offered)
+		}
+	}
+}
+
 func TestSessionEvidenceReoffersParkedOpenURLHandoffsNotManualDownloads(t *testing.T) {
 	b, jobs, _, _ := newBridge(t)
 	ctx := context.Background()
@@ -1850,6 +1877,64 @@ func TestSessionEvidenceReoffersParkedOpenURLHandoffsNotManualDownloads(t *testi
 			t.Fatalf("manual download was re-offered: %#v", event)
 		}
 	}
+}
+
+func TestSessionEvidenceOriginScopesReoffersToMatchingProfile(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	b.cfg.Browser.Resolvers = map[string]config.Institution{
+		"alpha": {OpenURLBase: "https://alpha.example.edu/openurl"},
+		"beta":  {OpenURLBase: "https://beta.example.edu/openurl"},
+	}
+	sourceAlpha := parkInstitutional(t, jobs, "wr_origin_alpha_source", handoffWork(), "alpha")
+	siblingAlpha := parkInstitutional(t, jobs, "wr_origin_alpha_sibling", handoffWork(), "alpha")
+	sourceBeta := parkInstitutional(t, jobs, "wr_origin_beta_source", handoffWork(), "beta")
+	siblingBeta := parkInstitutional(t, jobs, "wr_origin_beta_sibling", handoffWork(), "beta")
+	runSync(t, b, hello())
+	b.mu.Lock()
+	b.offered = map[string]bool{sourceBeta: true}
+	b.cancelSent = map[string]bool{}
+	b.reofferPending = map[string]bool{}
+	b.reofferSourceJobID = ""
+	b.reofferProfile = ""
+	b.mu.Unlock()
+
+	msgs, _ := runSync(t, b, inFrame(t, protocol.MsgSessionEvidence, "",
+		map[string]any{
+			"evidence":    "warm_verified",
+			"origin_hint": "https://beta.example.edu",
+			"at":          "2026-08-03T12:00:00Z",
+		}))
+	offer := firstOfType(msgs, protocol.MsgJobOffer)
+	if offer == nil || offer.JobID != siblingBeta {
+		t.Fatalf("origin-scoped offer = %#v, want beta sibling %s", offer, siblingBeta)
+	}
+	alphaEvents, err := jobs.Events(context.Background(), siblingAlpha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range alphaEvents {
+		if event["kind"] == "browser.handoff_reoffered" {
+			t.Fatalf("alpha sibling was released by beta evidence: %#v", event)
+		}
+	}
+	betaEvents, err := jobs.Events(context.Background(), siblingBeta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundBetaReoffer := false
+	for _, event := range betaEvents {
+		if event["kind"] == "browser.handoff_reoffered" {
+			foundBetaReoffer = true
+			break
+		}
+	}
+	if !foundBetaReoffer {
+		t.Fatalf("beta sibling was not released: %#v", betaEvents)
+	}
+	if !b.offered[siblingBeta] {
+		t.Fatalf("beta sibling was not offered: %#v", b.offered)
+	}
+	_ = sourceAlpha
 }
 
 func TestAuthReturnedDoesNotReofferWithoutLiveHolder(t *testing.T) {
@@ -1926,6 +2011,52 @@ func TestDownloadCompleteRejectsTraversalAndAdoptsValidFile(t *testing.T) {
 	}
 	if err := b.svc.Artifacts.Verify(row.ArtifactSHA256); err != nil {
 		t.Fatalf("artifact verify: %v", err)
+	}
+}
+
+func TestDeliveryContextAnnotatesTheMatchingDownloadCandidate(t *testing.T) {
+	b, jobs, cfg, _ := newBridge(t)
+	ctx := context.Background()
+	id := park(t, jobs, "wr_delivery_binding", handoffWork())
+	if _, err := jobs.InsertCandidates(ctx, id, []job.Candidate{{
+		JobID: id, Source: "browser", URLRedacted: "browser://older",
+		URLKey: "browser-adopt:older", Version: resolver.VersionUnknown,
+		AccessBasis: resolver.AccessManual, ReuseLicense: "unknown",
+		ExpectedMIME: "application/pdf", Direct: true, IdentityConfidence: 0.5,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	var olderID int64
+	if err := jobs.S.DB().QueryRowContext(ctx,
+		`SELECT id FROM candidates WHERE job_id = ? AND url_key = 'browser-adopt:older'`, id).Scan(&olderID); err != nil {
+		t.Fatal(err)
+	}
+	runSync(t, b, hello())
+	writeFixturePDF(t, filepath.Join(cfg.EffectiveAdoptionRoot(), id, "paper.pdf"))
+	runSync(t, b, inFrame(t, protocol.MsgDownloadComplete, id,
+		map[string]any{"download_id": 11, "filename": "paper.pdf", "size_bytes": 533}))
+	row, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.SelectedCandidateID == 0 || row.SelectedCandidateID == olderID {
+		t.Fatalf("selected candidate = %d, want the newly adopted candidate (older=%d)", row.SelectedCandidateID, olderID)
+	}
+	runSync(t, b, inFrame(t, protocol.MsgDeliveryContext, id,
+		map[string]any{"download_id": 11, "route": "resolver", "session_evidence": "warm", "page_host": "provider.example.edu"}))
+	older, err := jobs.GetCandidate(ctx, olderID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newer, err := jobs.GetCandidate(ctx, row.SelectedCandidateID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if older.BrowserRoute != "" || older.SessionEvidence != "" || older.AccessBasis != resolver.AccessManual {
+		t.Fatalf("older candidate received delivery context: %+v", older)
+	}
+	if newer.BrowserRoute != "resolver" || newer.SessionEvidence != "warm" || newer.AccessBasis != resolver.AccessInstitutional {
+		t.Fatalf("new candidate provenance = %+v", newer)
 	}
 }
 

@@ -924,16 +924,68 @@ test("activity initially shows at most five groups and fifteen rows, then reveal
   expect(showMore.hidden).toBe(true);
 });
 
-test("activity tab stays absent when the daemon does not advertise the feed", async () => {
+test("activity tab explains when the daemon does not advertise the feed", async () => {
   const fixture = snapshot([watchHit("hit:no-activity", 1, "No activity")]);
   const page = await inboxDocument((message) => {
     if (message.type === "papio.activity") return { ok: true, feature: false, entries: [] };
     return snapshotReply(fixture, message);
   });
 
-  expect(page.document.getElementById("activity-tab")?.hidden).toBe(true);
+  const activityTab = page.document.getElementById("activity-tab");
+  expect(activityTab?.hidden).toBe(false);
   expect(page.document.getElementById("activity-panel")?.hidden).toBe(true);
+  activityTab?.click();
+  expect(page.document.getElementById("activity-panel")?.hidden).toBe(false);
+  expect(page.document.getElementById("activity-panel")?.textContent).toContain("Activity is unavailable");
   expect(page.document.querySelectorAll(".activity-entry")).toHaveLength(0);
+});
+test("the Watch panel reports both a clear list and a filter miss", async () => {
+  const emptyPage = await inboxDocument((message) =>
+    snapshotReply(snapshot([manualAction("action:no-watch", 1, "Action only")], {
+      counts: counts({ pending_total: 1, actions: 1, watch_hits: 0, retractions: 0 }),
+    }), message));
+  emptyPage.document.getElementById("watch-tab")?.click();
+  expect(emptyPage.document.getElementById("watch-list")?.textContent).toContain("Your watch list is clear.");
+
+  const filteredPage = await inboxDocument((message) =>
+    snapshotReply(snapshot([watchHit("hit:filtered", 1, "Visible watch hit")], {
+      counts: counts({ pending_total: 1, actions: 0, watch_hits: 1, retractions: 0 }),
+    }), message));
+  const filter = filteredPage.document.getElementById("item-filter") as HTMLInputElement;
+  filter.value = "not-found";
+  filter.dispatchEvent(new Event("input", { bubbles: true }));
+  filteredPage.document.getElementById("watch-tab")?.click();
+  expect(filteredPage.document.getElementById("watch-list")?.textContent).toContain("No watch hits match");
+});
+test("an unchanged counts poll preserves the focused inbox control", async () => {
+  const originalSetTimeout = globalThis.setTimeout;
+  const polls: Array<() => void> = [];
+  globalThis.setTimeout = ((callback: () => void, delay?: number) => {
+    if (delay === 15_000) {
+      polls.push(callback);
+      return 0;
+    }
+    return originalSetTimeout(callback, delay);
+  }) as typeof globalThis.setTimeout;
+  try {
+    const fixture = snapshot([manualAction("action:poll-focus", 1, "Poll focus")], {
+      counts: counts({ pending_total: 1, actions: 1, watch_hits: 0, retractions: 0 }),
+    });
+    const page = await inboxDocument((message) => snapshotReply(fixture, message));
+    const dismiss = page.document.querySelector<HTMLButtonElement>(
+      "[data-triage-item-id='action:poll-focus'] [data-operation='dismiss']",
+    );
+    expect(dismiss).not.toBeNull();
+    dismiss?.focus();
+    expect(polls).toHaveLength(1);
+    polls.shift()?.();
+    await settle();
+    expect(page.document.activeElement?.getAttribute("data-operation")).toBe("dismiss");
+    expect(page.document.activeElement?.closest("[data-triage-item-id]")?.getAttribute("data-triage-item-id"))
+      .toBe("action:poll-focus");
+  } finally {
+    globalThis.setTimeout = originalSetTimeout;
+  }
 });
 
 test("human action guidance names the next step for each supported action kind", async () => {

@@ -1565,6 +1565,20 @@ func TestSubmitResolverProfileAndUnknownValidation(t *testing.T) {
 	if row.Policy.Resolver != "institute" {
 		t.Fatalf("resolver policy = %q", row.Policy.Resolver)
 	}
+	svc.Config.Browser.DefaultResolver = "institute"
+	request.RequestID = "wr_default_resolver"
+	request.Resolver = ""
+	defaultID, err := svc.Submit(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defaultRow, err := jobs.Get(context.Background(), defaultID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if defaultRow.Policy.Resolver != "institute" {
+		t.Fatalf("default resolver policy = %q, want institute", defaultRow.Policy.Resolver)
+	}
 	request.RequestID = "wr_unknown_resolver"
 	request.Resolver = "missing"
 	_, err = svc.Submit(context.Background(), request)

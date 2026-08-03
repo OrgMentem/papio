@@ -462,6 +462,45 @@ proquest_account_id = "67890"
 	}
 }
 
+func TestBrowserDefaultResolverValidatesAndMatchesOrigin(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	data := []byte(`access_mode = "conservative"
+[browser]
+openurl_base_url = "https://example.primo.exlibrisgroup.com/nde/openurl"
+default_resolver = "uwa"
+
+[browser.resolvers.uwa]
+openurl_base_url = "https://onesearch.library.example-college.edu/discovery/openurl"
+`)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Browser.DefaultResolver != "uwa" {
+		t.Fatalf("default_resolver = %q, want uwa", cfg.Browser.DefaultResolver)
+	}
+	if profile, ok := cfg.ResolverProfileForOrigin("https://onesearch.library.example-college.edu"); !ok || profile != "uwa" {
+		t.Fatalf("origin profile = %q, %t, want uwa", profile, ok)
+	}
+	if profile, ok := cfg.ResolverProfileForOrigin("https://example.primo.exlibrisgroup.com"); !ok || profile != "default" {
+		t.Fatalf("default origin profile = %q, %t, want default", profile, ok)
+	}
+}
+
+func TestBrowserDefaultResolverRejectsUnknownProfile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	data := []byte("access_mode = \"conservative\"\n[browser]\ndefault_resolver = \"missing\"\n")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("unknown browser.default_resolver accepted")
+	}
+}
+
 func TestBrowserResolverProfilesRejectInvalidNameAndURL(t *testing.T) {
 	for _, test := range []struct {
 		name, profile, base string
