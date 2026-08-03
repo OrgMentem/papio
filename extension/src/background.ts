@@ -49,6 +49,7 @@ import {
   TERMS_CONSENT_KEY,
   WORK_WINDOW_KEY,
   HANDOFF_SURFACE_KEY,
+  MANAGED_TAB_LEDGER_KEY,
   type HandoffSurface,
 } from "./state";
 import { isPDFPage, pdfSourceURL, sanitizePageHost } from "./deliver";
@@ -371,6 +372,9 @@ export interface TabInfo {
   /** Chrome marks the keepalive resolver tab pinned; papio's broker tabs never
    * are. Lets the idle-close check keep a keepalive-pinned work window alive. */
   pinned?: boolean | undefined;
+  /** Whether the tab is the selected tab in its window. Orphan cleanup never
+   * closes a tab the user is actively looking at. */
+  active?: boolean | undefined;
 }
 /** Normalize only the fragment component for managed-tab dedupe. Chrome may
  * canonicalize a URL while creating a tab, so use URL.href when possible and
@@ -569,6 +573,15 @@ export interface BridgeDeps {
     /** Tri-state surface choice. `tab-group` degrades to `work-window` if
      * tabGroups is absent. */
     getHandoffSurface(): Promise<HandoffSurface>;
+  };
+  /** Durable managed-tab ledger (chrome.storage.local). The session store dies
+   * with an extension reload, orphaning every tab papio opened in its previous
+   * life; this ledger survives the reload so the popup can offer a one-click
+   * cleanup instead of leaking those tabs forever. Optional: absent disables
+   * the ledger but the papio-group sweep still finds pre-ledger leftovers. */
+  tabLedger?: {
+    load(): Promise<Record<string, number>>;
+    save(entries: Record<string, number>): Promise<void>;
   };
   /** Toolbar badge for connection health. Kept injectable so bridge logic has
    * no dependency on a particular browser global. */
@@ -943,6 +956,9 @@ export class Bridge {
   /** Tabs we are intentionally closing, so onRemoved does not emit a spurious
    * cancelled outcome for a programmatic close. */
   private readonly closingTabs = new Set<number>();
+  /** Lazily-loaded durable ledger of broker tabs this and prior extension
+   * lives created. Keys are stringified tab ids, values open timestamps. */
+  private tabLedgerCache: Record<string, number> | undefined;
   /** A finished download keeps its broker tab open until the daemon has
    * acknowledged the adoption attempt for that job. */
   private readonly completedDownloadTabs = new Map<string, number>();
@@ -1546,6 +1562,7 @@ export class Bridge {
     if (tabID === undefined) return undefined;
     this.rememberManagedTabURL(options.jobId, options.url);
     await this.recordManagedTab(options.jobId, tabID);
+    await this.ledgerManagedTab(tabID);
     if (options.purpose === "session-signin") {
       try {
         await this.focusManagedTab(tabID);
@@ -1564,6 +1581,115 @@ export class Bridge {
     const job = findByJob(this.store, jobID);
     if (job === undefined || job.tab_id === tabID) return;
     await this.update((s) => patchJob(s, jobID, { tab_id: tabID }));
+  }
+
+  private async loadTabLedger(): Promise<Record<string, number>> {
+    if (this.tabLedgerCache === undefined) {
+      try {
+        this.tabLedgerCache = (await this.deps.tabLedger?.load()) ?? {};
+      } catch {
+        this.tabLedgerCache = {};
+      }
+    }
+    return this.tabLedgerCache;
+  }
+
+  private async saveTabLedger(ledger: Record<string, number>): Promise<void> {
+    try {
+      await this.deps.tabLedger?.save(ledger);
+    } catch {
+      // Best-effort durability: a failed write only degrades future cleanup.
+    }
+  }
+
+  /** Record a broker tab papio CREATED. Reused tabs are deliberately never
+   * ledgered: a URL-matched reuse can be the user's own tab, and the ledger
+   * exists to authorize closing — papio must never earn that authority over
+   * a tab it did not open. */
+  private async ledgerManagedTab(tabID: number): Promise<void> {
+    if (this.deps.tabLedger === undefined) return;
+    const ledger = await this.loadTabLedger();
+    if (ledger[String(tabID)] !== undefined) return;
+    ledger[String(tabID)] = this.deps.now();
+    await this.saveTabLedger(ledger);
+  }
+
+  private async forgetLedgeredTab(tabID: number): Promise<void> {
+    if (this.deps.tabLedger === undefined) return;
+    const ledger = await this.loadTabLedger();
+    if (ledger[String(tabID)] === undefined) return;
+    delete ledger[String(tabID)];
+    await this.saveTabLedger(ledger);
+  }
+
+  /** Tabs papio opened but no longer tracks: ledgered tabs from a previous
+   * extension life plus pre-ledger leftovers still sitting in a papio-titled
+   * tab group. Excludes every currently tracked tab and any tab the user is
+   * actively viewing. Dead ledger entries are pruned as a side effect. */
+  async orphanTabStatus(): Promise<{ count: number; tab_ids: number[] }> {
+    await this.ready;
+    const tracked = new Set<number>();
+    for (const job of this.store.activeJobs) if (job.tab_id >= 0) tracked.add(job.tab_id);
+    for (const id of this.completedDownloadTabs.values()) tracked.add(id);
+    for (const id of this.closingTabs) tracked.add(id);
+    const orphans = new Set<number>();
+    const ledger = await this.loadTabLedger();
+    let pruned = false;
+    for (const key of Object.keys(ledger)) {
+      const tabID = Number(key);
+      if (!Number.isInteger(tabID) || tabID < 0) {
+        delete ledger[key];
+        pruned = true;
+        continue;
+      }
+      if (tracked.has(tabID)) continue;
+      let tab: TabInfo;
+      try {
+        tab = await this.deps.tabs.get(tabID);
+      } catch {
+        delete ledger[key];
+        pruned = true;
+        continue;
+      }
+      if (tab.active === true) continue;
+      orphans.add(tabID);
+    }
+    if (pruned) await this.saveTabLedger(ledger);
+    const groups = await this.findHandoffGroups();
+    if (groups !== undefined && this.deps.tabs.query !== undefined) {
+      for (const group of groups) {
+        let members: TabInfo[];
+        try {
+          members = await this.deps.tabs.query({ groupId: group.id });
+        } catch {
+          continue;
+        }
+        for (const tab of members) {
+          if (tab.id === undefined || tracked.has(tab.id) || tab.active === true) continue;
+          orphans.add(tab.id);
+        }
+      }
+    }
+    const tabIds = [...orphans].sort((a, b) => a - b);
+    return { count: tabIds.length, tab_ids: tabIds };
+  }
+
+  /** Operator-initiated: close every orphan the scan finds. Failures are
+   * skipped, never retried — the next popup open rescans from live truth. */
+  async cleanupOrphanTabs(): Promise<{ closed: number }> {
+    const { tab_ids } = await this.orphanTabStatus();
+    let closed = 0;
+    for (const tabID of tab_ids) {
+      this.closingTabs.add(tabID);
+      try {
+        await this.deps.tabs.remove(tabID);
+        closed++;
+      } catch {
+        this.closingTabs.delete(tabID);
+      }
+      await this.forgetLedgeredTab(tabID);
+    }
+    return { closed };
   }
   private handoffNeedsHumanNow(): boolean {
     return this.store.activeJobs.some(
@@ -5562,6 +5688,7 @@ export class Bridge {
   private async onTabRemoved(tabID: number): Promise<void> {
     await this.ready;
     this.authCountedTabs.delete(tabID);
+    void this.forgetLedgeredTab(tabID);
     if (this.closingTabs.delete(tabID)) {
       await this.drainHandoffDriveQueue();
       return;
@@ -5838,6 +5965,22 @@ function isTermsConsentRequest(message: unknown): message is TermsConsentRequest
     message.action === "terms_consent" &&
     "value" in message &&
     (message.value === "accept" || message.value === "manual")
+  );
+}
+
+interface OrphanTabsRequest {
+  channel: "papio";
+  action: "orphan_tabs_status" | "orphan_tabs_cleanup";
+}
+
+function isOrphanTabsRequest(message: unknown): message is OrphanTabsRequest {
+  return (
+    typeof message === "object" &&
+    message !== null &&
+    "channel" in message &&
+    message.channel === "papio" &&
+    "action" in message &&
+    (message.action === "orphan_tabs_status" || message.action === "orphan_tabs_cleanup")
   );
 }
 
@@ -6240,6 +6383,21 @@ function realDeps(): BridgeDeps {
         set: (items) => chrome.storage.local.set(items),
       },
     },
+    tabLedger: {
+      load: async () => {
+        const got = await chrome.storage.local.get(MANAGED_TAB_LEDGER_KEY);
+        const v = got[MANAGED_TAB_LEDGER_KEY];
+        if (typeof v !== "object" || v === null || Array.isArray(v)) return {};
+        const entries: Record<string, number> = {};
+        for (const [key, value] of Object.entries(v as Record<string, unknown>)) {
+          if (typeof value === "number") entries[key] = value;
+        }
+        return entries;
+      },
+      save: async (entries) => {
+        await chrome.storage.local.set({ [MANAGED_TAB_LEDGER_KEY]: entries });
+      },
+    },
     permissions: {
       contains: (perm) => chrome.permissions.contains(perm),
     },
@@ -6340,6 +6498,14 @@ if (typeof chrome !== "undefined" && chrome.runtime?.id) {
     }
     if (isTermsConsentRequest(message)) {
       void bridge.requestTermsConsent(message.value).then(() => sendResponse({ ok: true }));
+      return true; // async sendResponse
+    }
+    if (isOrphanTabsRequest(message)) {
+      if (message.action === "orphan_tabs_status") {
+        void bridge.orphanTabStatus().then(sendResponse);
+      } else {
+        void bridge.cleanupOrphanTabs().then(sendResponse);
+      }
       return true; // async sendResponse
     }
     return false;

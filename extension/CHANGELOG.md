@@ -18,6 +18,14 @@ for the full pre-split extension history.
 
 ### Added
 
+- **Leftover tabs from a previous papio life get a one-click cleanup.** Broker
+  tabs papio creates are now recorded in a durable ledger, so after an
+  extension reload or update — which wipes papio's live tab tracking — the
+  popup offers "Leftover papio tabs · Close them" instead of leaking them
+  forever. The scan also recognizes pre-ledger tabs still sitting in a
+  papio-titled tab group, never touches a tab papio merely reused rather than
+  created, and never closes a tab the user is currently viewing or one an
+  active job still tracks.
 - **The popup can send the current PDF to *papio*.** It classifies the active tab
   as a PDF, DOI page, or neither; for a PDF it queues or joins the matching
   job, starts a browser-managed download under `papio/<job-id>/`, and reports

@@ -397,6 +397,81 @@ export async function requestSessionState(): Promise<PopupSessionState | undefin
   }
 }
 
+export async function requestOrphanTabCount(): Promise<number> {
+  try {
+    const response: unknown = await chrome.runtime.sendMessage({
+      channel: "papio",
+      action: "orphan_tabs_status",
+    });
+    if (typeof response !== "object" || response === null) return 0;
+    const count = (response as Record<string, unknown>)["count"];
+    return typeof count === "number" && count > 0 ? count : 0;
+  } catch {
+    return 0;
+  }
+}
+
+export async function cleanupOrphanTabs(): Promise<number> {
+  try {
+    const response: unknown = await chrome.runtime.sendMessage({
+      channel: "papio",
+      action: "orphan_tabs_cleanup",
+    });
+    if (typeof response !== "object" || response === null) return 0;
+    const closed = (response as Record<string, unknown>)["closed"];
+    return typeof closed === "number" ? closed : 0;
+  } catch {
+    return 0;
+  }
+}
+
+/** Offer a one-click close of tabs papio opened in a previous extension life
+ * and can no longer track (reloads wipe the session store; the durable ledger
+ * and the papio tab-group sweep still recognize them). Hidden at zero. */
+export function renderLeftoverTabs(
+  doc: Document,
+  count: number,
+  onCleanup: () => Promise<number> = cleanupOrphanTabs,
+): void {
+  const section = doc.getElementById("leftover-tabs");
+  const message = doc.getElementById("leftover-tabs-message");
+  const button = doc.getElementById("leftover-tabs-cleanup");
+  if (
+    !(section instanceof HTMLElement) ||
+    !(message instanceof HTMLElement) ||
+    !(button instanceof HTMLButtonElement)
+  ) {
+    return;
+  }
+  if (count <= 0) {
+    section.hidden = true;
+    return;
+  }
+  section.hidden = false;
+  message.textContent =
+    count === 1
+      ? "1 tab from an earlier papio session is still open. papio no longer tracks it."
+      : `${count} tabs from an earlier papio session are still open. papio no longer tracks them.`;
+  button.disabled = false;
+  button.textContent = "Close them";
+  if (!button.dataset.wired) {
+    button.dataset.wired = "1";
+    button.addEventListener("click", () => {
+      button.disabled = true;
+      button.textContent = "Closing…";
+      void onCleanup().then(
+        () => {
+          section.hidden = true;
+        },
+        () => {
+          button.disabled = false;
+          button.textContent = "Close them";
+        },
+      );
+    });
+  }
+}
+
 export async function openInstitutionSignIn(): Promise<void> {
   const response: unknown = await chrome.runtime.sendMessage({ type: SESSION_SIGNIN_MESSAGE });
   if (
@@ -1453,6 +1528,7 @@ export async function refresh(): Promise<void> {
   const session = await requestSessionState();
   renderInstitutionSession(document, session);
   scheduleSessionProbeRetry(session);
+  renderLeftoverTabs(document, await requestOrphanTabCount());
   renderNeedsAttention(
     document,
     store.activeJobs,

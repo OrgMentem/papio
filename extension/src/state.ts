@@ -42,6 +42,12 @@ export const WORK_WINDOW_KEY = "papio_work_window_v1";
 export type HandoffSurface = "in-window" | "work-window" | "tab-group";
 export const HANDOFF_SURFACE_KEY = "papio_handoff_surface_v1";
 
+/** Durable ledger of broker tabs papio created (chrome.storage.local):
+ * stringified tab id -> opened-at ms. The session store is wiped by an
+ * extension reload; this ledger is what lets the next life recognize —
+ * and offer to close — tabs it can no longer track. */
+export const MANAGED_TAB_LEDGER_KEY = "papio_managed_tabs_v1";
+
 /** Native-daemon compatibility as last reported by the bridge. `undefined`
  * remains valid for state persisted by earlier extension versions. */
 export type DaemonConnectionStatus = "connected" | "disconnected" | "daemon_outdated" | "extension_outdated";

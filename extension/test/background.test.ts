@@ -3902,3 +3902,59 @@ test("handoff group reducer trails auth recollapse and stays quiet when collapse
   await h.tabs.onUpdated.emit(tabID, { url: providerURL, status: "complete" }, { id: tabID, url: providerURL });
   expect(h.tabGroups?.updated.length).toBe(updates);
 });
+
+test("orphan scan flags ledgered and papio-group leftovers but never tracked or active tabs", async () => {
+  const h = makeHarness(undefined, { tabGroups: true });
+  let ledger: Record<string, number> = { "300": 1, "301": 1, "999": 1 };
+  h.deps.tabLedger = {
+    load: async () => ({ ...ledger }),
+    save: async (entries) => {
+      ledger = { ...entries };
+    },
+  };
+  await h.bridge.start();
+  await h.port.inbound(jobOffer("job_orphan_live"));
+  const trackedTab = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  expect(trackedTab).toBeGreaterThanOrEqual(0);
+  // 300: ledgered orphan from a prior life. 301: ledgered but the user is
+  // looking at it right now. 999: ledger entry whose tab is already gone.
+  h.tabs.live.set(300, { id: 300, url: "https://provider.example.org/a" });
+  h.tabs.live.set(301, { id: 301, url: "https://provider.example.org/b", active: true });
+  // 302: pre-ledger leftover still sitting in a papio-titled group.
+  h.tabs.live.set(302, { id: 302, url: "https://provider.example.org/c", groupId: 700 });
+  h.tabGroups!.live.set(700, { id: 700, collapsed: true, title: "papio", windowId: 1 });
+
+  const status = await h.bridge.orphanTabStatus();
+  expect(status).toEqual({ count: 2, tab_ids: [300, 302] });
+  // The dead entry is pruned from the durable ledger as a scan side effect.
+  expect(ledger["999"]).toBeUndefined();
+
+  const { closed } = await h.bridge.cleanupOrphanTabs();
+  expect(closed).toBe(2);
+  expect(h.tabs.removed).toEqual([300, 302]);
+  expect(h.tabs.live.has(trackedTab)).toBe(true);
+  expect(h.tabs.live.has(301)).toBe(true);
+  expect(ledger["300"]).toBeUndefined();
+  // Closing an orphan is programmatic: no cancel frame may reach the daemon.
+  expect(h.frames().filter((frame) => frame.type === "cancel")).toHaveLength(0);
+});
+
+test("created broker tabs are ledgered durably and forgotten once they close", async () => {
+  const h = makeHarness();
+  let ledger: Record<string, number> = {};
+  h.deps.tabLedger = {
+    load: async () => ({ ...ledger }),
+    save: async (entries) => {
+      ledger = { ...entries };
+    },
+  };
+  await h.bridge.start();
+  await h.port.inbound(jobOffer("job_ledgered"));
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  expect(tabID).toBeGreaterThanOrEqual(0);
+  expect(ledger[String(tabID)]).toBeDefined();
+
+  h.tabs.live.delete(tabID);
+  await h.tabs.onRemoved.emit(tabID, { isWindowClosing: false });
+  expect(ledger[String(tabID)]).toBeUndefined();
+});

@@ -448,6 +448,11 @@
         opacity: 0;
       }
 
+      .leftover-tabs-message {
+        color: var(--color-muted);
+        font-size: var(--font-size-small);
+      }
+
       .resolver-grant {
         background: var(--color-primary-surface);
         color: var(--color-context);
@@ -718,6 +723,12 @@
           <button id="institution-session-signin" class="primary" type="button">Sign in now</button>
         </div>
         <div id="institution-session-unblocked" class="institution-session-unblocked" role="status" aria-live="polite" hidden></div>
+      </section>
+
+      <section id="leftover-tabs" class="launcher-action leftover-tabs" hidden aria-labelledby="leftover-tabs-heading">
+        <h2 id="leftover-tabs-heading">Leftover papio tabs</h2>
+        <p id="leftover-tabs-message" class="leftover-tabs-message"></p>
+        <button id="leftover-tabs-cleanup" type="button">Close them</button>
       </section>
 
       <section id="needs-you-section" class="needs-you" hidden aria-labelledby="needs-you-heading">

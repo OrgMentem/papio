@@ -29,6 +29,7 @@ import {
   wireInboxLauncher,
   wirePrimaryShortcut,
   wireSettings,
+  renderLeftoverTabs,
 } from "../src/popup";
 import type { ActiveJob } from "../src/state";
 import { PROVIDERS, SCENARIOS } from "../src/capture";
@@ -850,4 +851,45 @@ test("session card matrix propagates marker scan outcomes", () => {
   expect(warm.detail).toMatch(/via your open library tab · \d{1,2}:\d{2} (am|pm)$/);
   // A warm session offers no sign-in action — the button is hidden, not dead.
   expect(warm.action).toBe("none");
+});
+
+test("leftover-tabs card stays hidden at zero and renders a pluralized count", () => {
+  const doc = popupDocument();
+  renderLeftoverTabs(doc, 0, async () => 0);
+  const section = doc.getElementById("leftover-tabs");
+  expect(section?.hasAttribute("hidden")).toBe(true);
+
+  renderLeftoverTabs(doc, 3, async () => 3);
+  expect(section?.hasAttribute("hidden")).toBe(false);
+  expect(doc.getElementById("leftover-tabs-message")?.textContent).toContain("3 tabs");
+
+  renderLeftoverTabs(doc, 1, async () => 1);
+  expect(doc.getElementById("leftover-tabs-message")?.textContent).toContain("1 tab from");
+});
+
+test("leftover-tabs cleanup click closes the card and a failure re-arms the button", async () => {
+  const doc = popupDocument();
+  let calls = 0;
+  renderLeftoverTabs(doc, 2, async () => {
+    calls += 1;
+    if (calls === 1) throw new Error("cleanup blocked");
+    return 2;
+  });
+  const section = doc.getElementById("leftover-tabs");
+  const button = doc.getElementById("leftover-tabs-cleanup") as HTMLButtonElement;
+
+  button.click();
+  expect(button.disabled).toBe(true);
+  await Promise.resolve();
+  await Promise.resolve();
+  // First attempt failed: the card persists and the button re-arms.
+  expect(section?.hasAttribute("hidden")).toBe(false);
+  expect(button.disabled).toBe(false);
+  expect(button.textContent).toBe("Close them");
+
+  button.click();
+  await Promise.resolve();
+  await Promise.resolve();
+  expect(calls).toBe(2);
+  expect(section?.hasAttribute("hidden")).toBe(true);
 });
