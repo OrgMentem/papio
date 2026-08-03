@@ -432,7 +432,11 @@ function normalizeHttpsOrigin(raw: unknown, allowWildcardHost = false): string |
   try {
     const url = new URL(raw);
     if (url.protocol !== "https:" || url.username !== "" || url.password !== "") return undefined;
-    if (url.hostname === "*" || (url.hostname.includes("*") && !allowWildcardHost)) return undefined;
+    const hostname = url.hostname.toLowerCase();
+    // Chrome percent-encodes `*` when a permission PATTERN is parsed as a
+    // URL; an encoded wildcard is still a pattern, never an origin.
+    if (hostname === "*" || hostname === "%2a") return undefined;
+    if ((hostname.includes("*") || hostname.includes("%2a")) && !allowWildcardHost) return undefined;
     if (url.pathname !== "/" || url.search !== "" || url.hash !== "") return undefined;
     return url.origin;
   } catch {
@@ -511,8 +515,12 @@ export class KeepaliveManager {
     } catch {
       // The bridge's negotiated-origin cache is advisory.
     }
+    // The row universe is the CONFIGURED institutions (daemon hello), with
+    // the persisted/current resolver as pre-hello fallbacks. Permission
+    // grants are deliberately excluded: "Grant all sources" hands papio
+    // dozens of provider-host patterns, and every one of them rendered as a
+    // phantom institution row.
     candidates.push(
-      ...this.grantedResolverOrigins,
       this.persistedResolverOrigin,
       this.resolver?.protocol === "https:" ? this.resolver.origin : undefined,
     );

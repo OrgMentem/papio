@@ -739,3 +739,24 @@ test("known resolver origins retain independent verdicts and timestamps", async 
   });
   expect(states.every((snapshot) => typeof snapshot.lastCheckAt === "number")).toBe(true);
 });
+
+test("granted provider permission patterns never mint institution rows", async () => {
+  const defaultOrigin = "https://resolver.example.edu";
+  const h = makeHarness(4, undefined, {
+    latestOpenURL: `${defaultOrigin}/openurl`,
+    knownOrigins: [defaultOrigin, "https://onesearch.library.example-college.edu"],
+    grantedOrigins: [
+      "https://*.academic.oup.com/*",
+      "https://*.cambridge.org/*",
+      "https://www.jstor.org/*",
+      `${defaultOrigin}/*`,
+    ],
+  });
+  await h.manager.init();
+
+  const origins = h.manager.getOriginSnapshots().map((snapshot) => snapshot.origin);
+  expect(origins.sort()).toEqual([
+    "https://onesearch.library.example-college.edu",
+    "https://resolver.example.edu",
+  ]);
+});
