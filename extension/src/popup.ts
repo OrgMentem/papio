@@ -676,7 +676,7 @@ export function deriveSessionCardState(state: PopupSessionState | undefined): Se
   }
   if (verdict === "in" && state.authenticated) {
     return {
-      label: `Session warm · verified ${formatAgo(lastCheckAt)}`,
+      label: "Session warm",
       detail,
       action: "none",
     };
@@ -693,16 +693,29 @@ export interface SessionRowState extends SessionCardState {
 }
 
 /** Convert every configured resolver snapshot into independent, pure row copy. */
+/** A warm, freshly-verified session with nothing to do is the assumed steady
+ * state — rendering it is noise. Rows appear only when the operator can act
+ * (sign in) or should doubt the verdict (stale evidence). */
+const SESSION_ROW_FRESH_MS = 10 * 60 * 1000;
+
 export function deriveSessionRows(state: PopupSessionState | undefined): SessionRowState[] {
-  if (state === undefined || state.origins === undefined) return [];
-  return state.origins.map((originState) => {
-    const card = deriveSessionCardState({
-      ...state,
-      ...originState,
-      resolverOrigin: originState.origin,
+  if (state === undefined || !Array.isArray(state.origins)) return [];
+  return state.origins
+    .map((originState) => {
+      const card = deriveSessionCardState({
+        ...state,
+        ...originState,
+        resolverOrigin: originState.origin,
+      });
+      return { origin: originState.origin, ...card };
+    })
+    .filter((row) => {
+      if (row.action !== "none") return true;
+      const verifiedAt = state.origins?.find((o) => o.origin === row.origin)?.lastVerdictAt;
+      return (
+        typeof verifiedAt !== "number" || Date.now() - verifiedAt > SESSION_ROW_FRESH_MS
+      );
     });
-    return { origin: originState.origin, ...card };
-  });
 }
 
 let sessionNoticeFadeTimer: ReturnType<typeof setTimeout> | undefined;
@@ -839,31 +852,60 @@ export function renderInstitutionSession(
     return;
   }
 
-  const rows = deriveSessionRows(state);
+  // Legacy states (no per-origin snapshots) synthesize one row so the calm
+  // filter and render paths treat every shape identically.
+  const rows =
+    state.origins === undefined || state.origins.length === 0
+      ? (() => {
+          const legacy = deriveSessionCardState(state);
+          const fresh =
+            typeof state.lastVerdictAt === "number" &&
+            Date.now() - state.lastVerdictAt <= SESSION_ROW_FRESH_MS;
+          return legacy.action === "none" && fresh
+            ? []
+            : [{ origin: state.resolverOrigin ?? "", ...legacy }];
+        })()
+      : deriveSessionRows(state);
+  const waitingVisible = waiting instanceof HTMLElement && waiting.hidden === false;
+  const noticeVisible = Math.max(0, Math.trunc(state.releasedAuthJobs)) > 0;
+  // Calm steady state — every session warm and fresh, nothing waiting, no
+  // notice — renders NO card at all: quiet means live.
+  if (rows.length === 0 && !waitingVisible && !noticeVisible) {
+    card.hidden = true;
+    clearSessionNoticeTimers();
+    return;
+  }
+  card.hidden = false;
   const multiOrigin = rows.length > 1 && rowsContainer instanceof HTMLElement;
   if (multiOrigin) {
     if (legacyRow instanceof HTMLElement) legacyRow.hidden = true;
     origin.textContent = "";
     rowsContainer.hidden = false;
     renderSessionRows(doc, rowsContainer, rows, onSignIn);
+  } else if (rows.length === 0) {
+    // Only the waiting list or a release notice justifies the card.
+    if (legacyRow instanceof HTMLElement) legacyRow.hidden = true;
+    origin.textContent = "";
+    status.textContent = "";
+    signIn.hidden = true;
+    signIn.disabled = true;
+    if (rowsContainer instanceof HTMLElement) {
+      rowsContainer.hidden = true;
+      rowsContainer.replaceChildren();
+    }
   } else {
     if (rowsContainer instanceof HTMLElement) {
       rowsContainer.hidden = true;
       rowsContainer.replaceChildren();
     }
     if (legacyRow instanceof HTMLElement) legacyRow.hidden = false;
-    const singleOrigin = rows.length === 1 ? rows[0]?.origin : undefined;
-    const displayState =
-      state.resolverOrigin === null && singleOrigin !== undefined && state.origins?.[0] !== undefined
-        ? { ...state, ...state.origins[0], resolverOrigin: singleOrigin }
-        : state;
-    const cardState = deriveSessionCardState(displayState);
-    status.textContent = sessionRowText(cardState);
-    origin.textContent = resolverHost(displayState.resolverOrigin);
-    signIn.disabled = cardState.action === "none";
-    signIn.hidden = cardState.action === "none";
+    const row = rows[0] as SessionRowState;
+    status.textContent = sessionRowText(row);
+    origin.textContent = resolverHost(row.origin);
+    signIn.disabled = row.action === "none";
+    signIn.hidden = row.action === "none";
     signIn.setAttribute("aria-describedby", status.id);
-    sessionSignInHandlers.set(signIn, () => onSignIn(displayState.resolverOrigin ?? undefined));
+    sessionSignInHandlers.set(signIn, () => onSignIn(row.origin ?? undefined));
     if (!signIn.dataset.wired) {
       signIn.dataset.wired = "1";
       signIn.addEventListener("click", () => {
@@ -1427,6 +1469,8 @@ function renderLiveAcquisition(
   activityEntries: readonly ActivityEntryPayload[],
   pendingDelivery: PendingDelivery | undefined,
   actions: PopupLiveActions,
+  currentTabID?: number,
+  sessionWarm = false,
 ): void {
   const card = doc.getElementById("page-acquire-live");
   const title = doc.getElementById("page-acquire-live-title");
@@ -1448,8 +1492,17 @@ function renderLiveAcquisition(
   const knownTitle = job.expected?.title?.trim() || latest?.title?.trim() || "";
   title.textContent = knownTitle;
   title.hidden = knownTitle === "";
+  const onJobTab =
+    currentTabID !== undefined && Number.isFinite(job.tab_id) && job.tab_id === currentTabID;
   const live = liveStatusText(job, latest, delivery);
-  status.textContent = live.text;
+  // A verified-warm session outranks a stale auth_pending echo, and the user
+  // standing ON the job's tab needs page truth, not a Go-to-tab loop.
+  status.textContent =
+    sessionWarm && latest?.kind === "browser.auth_pending"
+      ? onJobTab
+        ? "Signed in — a download from this tab is adopted automatically"
+        : "Signed in — papio retries this shortly"
+      : live.text;
   status.dataset.stalled = live.stale ? "true" : "false";
   card.hidden = false;
 
@@ -1461,7 +1514,7 @@ function renderLiveAcquisition(
     latest?.kind === "browser.auth_pending";
   const hasLiveHandoffTab = Number.isFinite(job.tab_id) && job.tab_id >= 0 &&
     (job.requires_auth === true || String(job.status) === "auth_pending" || handoffKind);
-  tab.hidden = !hasLiveHandoffTab;
+  tab.hidden = !hasLiveHandoffTab || onJobTab;
   if (hasLiveHandoffTab) {
     wireLiveAction(tab, () => (actions.goToTab ?? openHandoff)(job.job_id), "Go to tab");
     tab.dataset.jobId = job.job_id;
@@ -1680,6 +1733,7 @@ export function renderPageContext(
   pendingDelivery?: PendingDelivery,
   activityEntries: readonly ActivityEntryPayload[] = [],
   liveActions: PopupLiveActions = {},
+  sessionWarm = false,
 ): void {
   const section = doc.getElementById("page-acquire");
   const status = doc.getElementById("page-acquire-status");
@@ -1713,7 +1767,15 @@ export function renderPageContext(
     const disabled = delivery?.status === "sending" || delivery?.status === "downloaded";
     setAcquireButton(button, "Send this PDF to papio", disabled);
     if (knownJob !== undefined) {
-      renderLiveAcquisition(doc, knownJob, activityEntries, delivery, liveActions);
+      renderLiveAcquisition(
+        doc,
+        knownJob,
+        activityEntries,
+        delivery,
+        liveActions,
+        page?.tab_id,
+        sessionWarm,
+      );
       section.hidden = false;
     } else {
       const deliveryStatus = deliveryStatusText(delivery);
@@ -1741,7 +1803,15 @@ export function renderPageContext(
   }
 
   setAcquireButton(button, `Acquisition in progress · ${normalizedDOI}`, true);
-  renderLiveAcquisition(doc, inFlightJob, activityEntries, pendingDelivery, liveActions);
+  renderLiveAcquisition(
+    doc,
+    inFlightJob,
+    activityEntries,
+    pendingDelivery,
+    liveActions,
+    page?.tab_id,
+    sessionWarm,
+  );
   section.hidden = false;
 }
 
@@ -1810,7 +1880,22 @@ export async function refresh(): Promise<void> {
       })(),
     ]);
   if (freshActivity !== undefined) popupActivity = freshActivity;
-  renderPageContext(document, pageMetadata, store.activeJobs, delivery, popupActivity);
+  const sessionWarm =
+    (session?.origins ?? []).some(
+      (o) =>
+        o.verdict === "in" &&
+        typeof o.lastVerdictAt === "number" &&
+        Date.now() - o.lastVerdictAt <= SESSION_ROW_FRESH_MS,
+    ) || session?.authenticated === true;
+  renderPageContext(
+    document,
+    pageMetadata,
+    store.activeJobs,
+    delivery,
+    popupActivity,
+    {},
+    sessionWarm,
+  );
   renderInstitutionSession(document, session);
   scheduleSessionProbeRetry(session);
   renderLeftoverTabs(document, orphanCount);

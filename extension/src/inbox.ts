@@ -1210,7 +1210,18 @@ function render(): void {
     elements.watchList.append(element("p", "No snapshot is available yet. Reconnect to retrieve the inbox."));
   } else {
     const snapshotWatchItems = state.snapshot.items.filter((item) => item.kind === "watch_hit");
-    if (snapshotWatchItems.length === 0) {
+    const daemonWatchTotal = state.counts?.watch_hits ?? snapshotWatchItems.length;
+    if (snapshotWatchItems.length === 0 && daemonWatchTotal > 0) {
+      // The daemon holds watch hits the snapshot page hasn't streamed yet:
+      // claiming a clear list while the tab says (5) is a lie. Name the gap
+      // and leave Load more visible to fetch them.
+      elements.watchList.append(
+        element(
+          "p",
+          `${daemonWatchTotal} watch hit${daemonWatchTotal === 1 ? "" : "s"} yet to load — use Load more below.`,
+        ),
+      );
+    } else if (snapshotWatchItems.length === 0) {
       elements.watchList.append(element("p", "Your watch list is clear."));
     } else if (watchItems.length === 0) {
       elements.watchList.append(element("p", `No watch hits match "${state.filterQuery.trim()}".`));
@@ -1220,11 +1231,14 @@ function render(): void {
     elements.list.append(element("p", `${state.snapshot.unsupported_items_count} newer item(s) need a newer extension.`));
   }
 
-  // Pagination is panel-scoped: an empty Watch panel (or the Activity tab,
-  // which pages itself) renders without the snapshot's Load more control.
+  // Pagination is panel-scoped: the Activity tab pages itself, and a Watch
+  // panel with nothing loaded suppresses Load more ONLY when the daemon
+  // agrees there is nothing to fetch.
   const snapshotHasWatch = (state.snapshot?.items ?? []).some((item) => item.kind === "watch_hit");
+  const watchPending = (state.counts?.watch_hits ?? 0) > 0;
   const loadMoreSuppressed =
-    state.activeTab === "activity" || (state.activeTab === "watch" && !snapshotHasWatch);
+    state.activeTab === "activity" ||
+    (state.activeTab === "watch" && !snapshotHasWatch && !watchPending);
   elements.loadMore.hidden = state.snapshot?.has_more !== true || loadMoreSuppressed;
   elements.loadMore.disabled = state.loading || !state.connected;
   if (state.generatedAt === null) {

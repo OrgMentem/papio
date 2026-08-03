@@ -982,11 +982,11 @@ test("renders independent multi-origin session rows and targets each sign-in ori
     origins: [
       {
         origin: defaultOrigin,
-        authenticated: true,
-        verdict: "in" as const,
-        probeSource: "live_tab" as const,
-        scanOutcome: "markers" as const,
-        lastVerdictAt: now,
+        authenticated: false,
+        verdict: "unknown" as const,
+        probeSource: "none" as const,
+        scanOutcome: "no_markers" as const,
+        lastVerdictAt: null,
         checking: false,
         likelyAuthenticated: false,
         pausedForReauth: false,
@@ -1006,8 +1006,9 @@ test("renders independent multi-origin session rows and targets each sign-in ori
       },
     ],
   };
+  // The warm-and-fresh steady state is filtered; only actionable rows render.
   expect(deriveSessionRows(state)).toEqual([
-    expect.objectContaining({ origin: defaultOrigin, action: "none" }),
+    expect.objectContaining({ origin: defaultOrigin, action: "signin" }),
     expect.objectContaining({ origin: uwaOrigin, label: "Signed out or expired", action: "signin" }),
   ]);
 
@@ -1023,7 +1024,7 @@ test("renders independent multi-origin session rows and targets each sign-in ori
   expect(doc.getElementById("institution-session-row")).toBeNull();
   const buttons = Array.from(doc.querySelectorAll<HTMLButtonElement>(".institution-session-origin-row button"));
   expect(buttons).toHaveLength(2);
-  expect(buttons[0]?.hidden).toBe(true);
+  expect(buttons[0]?.hidden).toBe(false);
   expect(buttons[1]?.hidden).toBe(false);
   expect(buttons[1]?.getAttribute("aria-describedby")).toBe("institution-session-status-1");
   buttons[1]?.click();
@@ -1031,7 +1032,7 @@ test("renders independent multi-origin session rows and targets each sign-in ori
   expect(targets).toEqual([uwaOrigin]);
 });
 
-test("one configured origin keeps the existing institution session card", () => {
+test("a calm warm session renders no institution card at all", () => {
   const now = Date.now();
   const origin = "https://example.primo.exlibrisgroup.com";
   const doc = popupDocument();
@@ -1065,13 +1066,44 @@ test("one configured origin keeps the existing institution session card", () => 
       lastCheckAt: now,
     }],
   });
-  expect(doc.getElementById("institution-session-rows")?.hidden).toBe(true);
-  expect(doc.querySelector(".institution-session-row")?.hasAttribute("hidden")).toBe(false);
-  expect(doc.getElementById("institution-session-origin")?.textContent).toBe(
-    "example.primo.exlibrisgroup.com",
-  );
-  expect(doc.getElementById("institution-session-status")?.textContent).toContain("Session warm");
-  expect(doc.getElementById("institution-session-signin")?.hidden).toBe(true);
+  // Quiet means live: a warm, freshly-verified session with nothing waiting
+  // is the assumed steady state and earns zero pixels.
+  expect(doc.getElementById("institution-session")?.hidden).toBe(true);
+
+  // The same session gone stale earns the card back.
+  const staleDoc = popupDocument();
+  const stale = 11 * 60 * 1000;
+  renderInstitutionSession(staleDoc, {
+    enabled: true,
+    intervalMinutes: 4,
+    authenticated: true,
+    verdict: "in",
+    probeSource: "live_tab",
+    scanOutcome: "markers",
+    lastVerdictAt: now - stale,
+    checking: false,
+    likelyAuthenticated: false,
+    pausedForReauth: false,
+    lastCheckAt: now - stale,
+    resolverOrigin: origin,
+    lastAuthReturnedAt: null,
+    queuedAuthJobs: 0,
+    stalledAuthJobs: [],
+    releasedAuthJobs: 0,
+    origins: [{
+      origin,
+      authenticated: true,
+      verdict: "in",
+      probeSource: "live_tab",
+      scanOutcome: "markers",
+      lastVerdictAt: now - stale,
+      checking: false,
+      likelyAuthenticated: false,
+      pausedForReauth: false,
+      lastCheckAt: now - stale,
+    }],
+  });
+  expect(staleDoc.getElementById("institution-session")?.hidden).toBe(false);
 });
 
 test("leftover-tabs card stays hidden at zero and renders a pluralized count", () => {
