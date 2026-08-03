@@ -41,10 +41,12 @@ test.skipIf(!fixtureExists("jstor", "success"))(
     expect(verdict.kind).toBe("article");
     expect(verdict.adapter_id).toBe("jstor");
     expect(doc.querySelector(spec.download?.selector ?? "")).not.toBeNull();
-    // No citation_pdf_url/meta/anchor URL exists in the capture: the download
-    // is a click on the primary custom control's shadow button.
-    expect(spec.download?.method).toBe("click");
-    expect(spec.download?.shadowSelector).toBe("#button-element");
+    // No citation_pdf_url/meta/anchor URL exists in the capture, and the
+    // record-page variant of the same control window.open()s (popup-blocked
+    // for gesture-less clicks): the download derives the direct endpoint from
+    // the tab URL, consent-gated because acceptTC=1 accepts JSTOR's terms.
+    expect(spec.download?.method).toBe("url");
+    expect(spec.download?.requiresTermsConsent).toBe(true);
     for (const item of verdict.evidence) expect(item).not.toMatch(/strength model/i);
   },
 );
