@@ -12,6 +12,7 @@ import {
   OPEN_INBOX_MESSAGE,
   openInbox,
   openInstitutionSignIn,
+  deriveSessionCardState,
   readCurrentPageMetadata,
   refreshImpactSummary,
   renderInstitutionSession,
@@ -685,6 +686,38 @@ test("institution session uses the shared card/button styles and explains missin
   expect(doc.getElementById("institution-session-dismiss")).toBeNull();
 });
 
+test("unblocked notice shows once per release stamp and does not resurrect on polls", async () => {
+  const doc = popupDocument();
+  const state = {
+    enabled: true,
+    intervalMinutes: 4,
+    authenticated: true,
+    pausedForReauth: false,
+    lastCheckAt: Date.now(),
+    resolverOrigin: "https://example.primo.exlibrisgroup.com",
+    lastAuthReturnedAt: Date.now(),
+    queuedAuthJobs: 0,
+    stalledAuthJobs: [],
+    releasedAuthJobs: 1,
+    releasedAuthJobsAt: 1_754_200_000_000,
+  };
+  renderInstitutionSession(doc, state);
+  const notice = doc.getElementById("institution-session-unblocked");
+  expect(notice?.hidden).toBe(false);
+  expect(notice?.textContent).toBe("Sign-in unblocked 1 item");
+
+  // Simulate the fade timer having hidden the notice, then a 5s session poll
+  // re-delivering the same cumulative snapshot: it must stay hidden.
+  if (notice instanceof HTMLElement) notice.hidden = true;
+  renderInstitutionSession(doc, { ...state });
+  expect(notice?.hidden).toBe(true);
+
+  // A NEW release event (fresh stamp) re-announces.
+  renderInstitutionSession(doc, { ...state, releasedAuthJobs: 2, releasedAuthJobsAt: 1_754_200_060_000 });
+  expect(notice?.hidden).toBe(false);
+  expect(notice?.textContent).toBe("Sign-in unblocked 2 items");
+});
+
 test("institution sign-in errors return to a working sign-in button with the reason", async () => {
   const doc = popupDocument();
   let attempts = 0;
@@ -717,4 +750,51 @@ test("institution sign-in errors return to a working sign-in button with the rea
   expect(doc.getElementById("institution-session-status")?.textContent).toBe(
     "Could not open the institution sign-in",
   );
+});
+test("session card matrix distinguishes unknown from signed-out DOM evidence", () => {
+  const now = Date.now();
+  const base = {
+    enabled: true,
+    intervalMinutes: 4,
+    pausedForReauth: false,
+    checking: false,
+    likelyAuthenticated: false,
+    lastCheckAt: now,
+    resolverOrigin: "https://example.primo.exlibrisgroup.com",
+    lastAuthReturnedAt: null,
+    queuedAuthJobs: 0,
+    stalledAuthJobs: [],
+    releasedAuthJobs: 0,
+  };
+
+  const unknown = deriveSessionCardState({
+    ...base,
+    authenticated: false,
+    verdict: "unknown",
+    probeSource: "none",
+    lastVerdictAt: now,
+  });
+  expect(unknown.label).toBe("Session unknown — open your library page to verify");
+  expect(unknown.action).toBe("signin");
+  expect(unknown.detail).toContain("via no probe evidence");
+
+  const signedOut = deriveSessionCardState({
+    ...base,
+    authenticated: false,
+    verdict: "out",
+    probeSource: "live_tab",
+    lastVerdictAt: now,
+  });
+  expect(signedOut.label).toBe("Signed out or expired");
+  expect(signedOut.detail).toContain("via your open library tab");
+
+  const warm = deriveSessionCardState({
+    ...base,
+    authenticated: true,
+    verdict: "in",
+    probeSource: "live_tab",
+    lastVerdictAt: now,
+  });
+  expect(warm.label).toContain("Session warm");
+  expect(warm.detail).toMatch(/via your open library tab · \d{1,2}:\d{2} (am|pm)$/);
 });

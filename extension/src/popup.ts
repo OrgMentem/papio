@@ -339,6 +339,8 @@ export async function openHandoff(jobID: string): Promise<void> {
 }
 export type PopupSessionState = KeepaliveSnapshot & {
   releasedAuthJobs: number;
+  /** Epoch ms of the latest release event; the notice shows once per stamp. */
+  releasedAuthJobsAt?: number | null;
 };
 
 export const SESSION_STATE_MESSAGE = "papio.session.state";
@@ -353,6 +355,17 @@ function isSessionState(value: unknown): value is PopupSessionState {
     typeof state["enabled"] === "boolean" &&
     typeof state["intervalMinutes"] === "number" &&
     typeof state["authenticated"] === "boolean" &&
+    (state["verdict"] === undefined ||
+      state["verdict"] === "in" ||
+      state["verdict"] === "out" ||
+      state["verdict"] === "unknown") &&
+    (state["probeSource"] === undefined ||
+      state["probeSource"] === "live_tab" ||
+      state["probeSource"] === "keepalive_tab" ||
+      state["probeSource"] === "none") &&
+    (state["lastVerdictAt"] === undefined ||
+      state["lastVerdictAt"] === null ||
+      typeof state["lastVerdictAt"] === "number") &&
     (state["checking"] === undefined || typeof state["checking"] === "boolean") &&
     (state["likelyAuthenticated"] === undefined || typeof state["likelyAuthenticated"] === "boolean") &&
     typeof state["pausedForReauth"] === "boolean" &&
@@ -363,7 +376,10 @@ function isSessionState(value: unknown): value is PopupSessionState {
     typeof state["queuedAuthJobs"] === "number" &&
     Array.isArray(state["stalledAuthJobs"]) &&
     state["stalledAuthJobs"].every((jobID) => typeof jobID === "string") &&
-    typeof state["releasedAuthJobs"] === "number"
+    typeof state["releasedAuthJobs"] === "number" &&
+    (state["releasedAuthJobsAt"] === undefined ||
+      state["releasedAuthJobsAt"] === null ||
+      typeof state["releasedAuthJobsAt"] === "number")
   );
 }
 
@@ -423,6 +439,27 @@ function formatLastCheck(lastCheckAt: number | null): string {
   return `${minutes} min ago`;
 }
 
+function sessionEvidenceDetail(state: PopupSessionState): string {
+  const source =
+    state.probeSource === "live_tab"
+      ? "via your open library tab"
+      : state.probeSource === "keepalive_tab"
+        ? "via papio's keepalive tab"
+        : "via no probe evidence";
+  const rawTimestamp = state.lastVerdictAt;
+  if (typeof rawTimestamp !== "number" || !Number.isFinite(rawTimestamp)) {
+    return `Applies to ${state.resolverOrigin} · ${source}`;
+  }
+  const timestamp = new Date(rawTimestamp);
+  if (!Number.isFinite(timestamp.getTime())) {
+    return `Applies to ${state.resolverOrigin} · ${source}`;
+  }
+  const hour = timestamp.getHours() % 12 || 12;
+  const minute = String(timestamp.getMinutes()).padStart(2, "0");
+  const period = timestamp.getHours() >= 12 ? "pm" : "am";
+  return `Applies to ${state.resolverOrigin} · ${source} · ${hour}:${minute} ${period}`;
+}
+
 export interface SessionCardState {
   label: string;
   detail: string;
@@ -442,10 +479,11 @@ export function deriveSessionCardState(state: PopupSessionState | undefined): Se
       action: "none",
     };
   }
+  const detail = sessionEvidenceDetail(state);
   if (!state.enabled) {
     return {
       label: "Keep-warm off",
-      detail: `Applies to ${state.resolverOrigin}`,
+      detail,
       action: "signin",
     };
   }
@@ -458,34 +496,51 @@ export function deriveSessionCardState(state: PopupSessionState | undefined): Se
   if (checking) {
     return {
       label: state.likelyAuthenticated === true ? "Likely signed in — verifying" : "Checking session…",
-      detail: `Applies to ${state.resolverOrigin}`,
+      detail,
       action: "signin",
     };
   }
   if (state.pausedForReauth) {
     return {
       label: "Sign-in needed - papio paused",
-      detail: `Applies to ${state.resolverOrigin}`,
+      detail,
+      action: "signin",
+    };
+  }
+  const verdict = state.verdict ?? (state.authenticated ? "in" : "unknown");
+  if (verdict === "unknown") {
+    return {
+      label: "Session unknown — open your library page to verify",
+      detail,
       action: "signin",
     };
   }
   if (stale) {
     return {
       label: "Checking session…",
-      detail: `Applies to ${state.resolverOrigin}`,
+      detail,
       action: "signin",
     };
   }
-  if (!state.authenticated) {
+  const completedVerdict =
+    typeof state.lastVerdictAt === "number" && Number.isFinite(state.lastVerdictAt);
+  if (verdict === "out" && !state.authenticated && completedVerdict) {
     return {
       label: "Signed out or expired",
-      detail: `Applies to ${state.resolverOrigin}`,
+      detail,
+      action: "signin",
+    };
+  }
+  if (verdict === "in" && state.authenticated) {
+    return {
+      label: `Session warm · last verified ${formatLastCheck(lastCheckAt)}`,
+      detail,
       action: "signin",
     };
   }
   return {
-    label: `Session warm · last verified ${formatLastCheck(lastCheckAt)}`,
-    detail: `Applies to ${state.resolverOrigin}`,
+    label: "Session unknown — open your library page to verify",
+    detail,
     action: "signin",
   };
 }
@@ -493,6 +548,9 @@ export function deriveSessionCardState(state: PopupSessionState | undefined): Se
 let sessionNoticeFadeTimer: ReturnType<typeof setTimeout> | undefined;
 let sessionNoticeHideTimer: ReturnType<typeof setTimeout> | undefined;
 let sessionProbeRetryTimer: ReturnType<typeof setTimeout> | undefined;
+/** The release-event stamp the notice last animated for. A cumulative count
+ * re-delivered by every session poll must not resurrect a faded notice. */
+let sessionNoticeShownKey: string | undefined;
 
 function clearSessionNoticeTimers(): void {
   clearTimeout(sessionNoticeFadeTimer);
@@ -566,12 +624,15 @@ export function renderInstitutionSession(
   const released = Math.max(0, Math.trunc(state.releasedAuthJobs));
   if (released === 0) {
     clearSessionNoticeTimers();
+    sessionNoticeShownKey = undefined;
     notice.classList.remove("is-expiring");
     notice.hidden = true;
     return;
   }
+  const noticeKey = `${state.releasedAuthJobsAt ?? 0}:${released}`;
+  if (noticeKey === sessionNoticeShownKey) return;
+  sessionNoticeShownKey = noticeKey;
   const noticeText = `Sign-in unblocked ${released} item${released === 1 ? "" : "s"}`;
-  if (!notice.hidden && notice.textContent === noticeText) return;
   clearSessionNoticeTimers();
   notice.classList.remove("is-expiring");
   notice.hidden = false;

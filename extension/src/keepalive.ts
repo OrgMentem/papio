@@ -7,6 +7,13 @@ export interface KeepaliveTab {
   url?: string | undefined;
 }
 
+export type SessionVerdict = "in" | "out" | "unknown";
+export type KeepaliveProbeSource = "live_tab" | "keepalive_tab" | "none";
+export interface ResolverMarker {
+  text: string;
+  label: string;
+}
+
 export interface KeepaliveTabs {
   create(properties: {
     url: string;
@@ -47,6 +54,14 @@ export interface KeepaliveAPI {
   tabs: KeepaliveTabs;
   storage: KeepaliveStorage;
   permissions?: KeepalivePermissions;
+  /** Optional in tests and browsers where page scripting is unavailable. */
+  scripting?: {
+    executeScript(injection: {
+      target: { tabId: number };
+      func: (...args: never[]) => unknown;
+      args?: unknown[];
+    }): Promise<{ result?: unknown }[]>;
+  };
   timers: KeepaliveTimers;
   /** Retained for API compatibility with injected callers. Badge painting is
    * owned by the bridge, so the manager never writes it directly. */
@@ -57,6 +72,12 @@ export interface KeepaliveSnapshot {
   enabled: boolean;
   intervalMinutes: number;
   authenticated: boolean;
+  /** Completed DOM/URL verdict. Older callers may omit this field. */
+  verdict?: SessionVerdict;
+  /** Branch that produced the current verdict. */
+  probeSource?: KeepaliveProbeSource;
+  /** Epoch milliseconds when the current verdict completed. */
+  lastVerdictAt?: number | null;
   /** True while an on-demand session probe is still in flight. */
   checking?: boolean;
   /** A resolver-origin tab was observed while the probe was in flight. This
@@ -112,16 +133,54 @@ const MAX_INTERVAL_MINUTES = 30;
 const DEFAULT_OBSERVE_MS = 15_000;
 const DEFAULT_RELOAD_SETTLE_MS = 1_000;
 const LOGIN_ROUTE = /login|auth|sso|idp|shibboleth|signon/i;
+const AUTH_HOST_SEGMENTS: Record<string, true> = {
+  idp: true,
+  sso: true,
+  login: true,
+  signin: true,
+  auth: true,
+  shibboleth: true,
+  openathens: true,
+};
 
 /** Shared conservative detector for login/IdP routes. */
 export function isAuthenticationURL(rawURL: string): boolean {
   try {
     const url = new URL(rawURL);
-    return LOGIN_ROUTE.test(url.pathname + url.search);
+    const hostnameHasAuthSegment = url.hostname
+      .toLowerCase()
+      .split(".")
+      .some((segment) => AUTH_HOST_SEGMENTS[segment] === true);
+    return LOGIN_ROUTE.test(url.pathname) || hostnameHasAuthSegment;
   } catch {
     return false;
   }
 }
+
+const SIGN_OUT_MARKER = /sign\s*out|log\s*out|logout|my account/i;
+const SIGN_IN_MARKER = /sign\s*in|log\s*in|login/i;
+
+/** Classify bounded resolver-page marker data without touching browser state. */
+export function classifyResolverMarkers(markers: readonly ResolverMarker[]): SessionVerdict {
+  let signIn = false;
+  for (const marker of markers) {
+    if (typeof marker?.text !== "string" || typeof marker?.label !== "string") continue;
+    const value = `${marker.text} ${marker.label}`;
+    if (SIGN_OUT_MARKER.test(value)) return "in";
+    if (SIGN_IN_MARKER.test(value)) signIn = true;
+  }
+  return signIn ? "out" : "unknown";
+}
+
+/** Serializable page function used by chrome.scripting.executeScript. */
+export function collectResolverMarkers(): ResolverMarker[] {
+  const elements = Array.from(document.querySelectorAll("a,button,[role='button']")).slice(0, 100);
+  return elements.map((element) => ({
+    text: element.textContent?.trim() ?? "",
+    label: element.getAttribute("aria-label")?.trim() ?? "",
+  }));
+}
+
 
 /** Clamp an untrusted storage value to the supported interval range. */
 export function clampKeepaliveInterval(value: unknown): number {
@@ -201,6 +260,9 @@ export class KeepaliveManager {
   private enabled = true;
   private reauthPaused = false;
   private authenticated = false;
+  private verdict: SessionVerdict = "unknown";
+  private probeSource: KeepaliveProbeSource = "none";
+  private lastVerdictAt: number | undefined;
   private lastCheckAt: number | undefined;
   private checking = false;
   private likelyAuthenticated = false;
@@ -217,6 +279,9 @@ export class KeepaliveManager {
       enabled: this.enabled,
       intervalMinutes: this.intervalMinutes,
       authenticated: this.authenticated,
+      verdict: this.verdict,
+      probeSource: this.probeSource,
+      lastVerdictAt: this.lastVerdictAt ?? null,
       checking: this.checking,
       likelyAuthenticated: this.likelyAuthenticated,
       pausedForReauth: this.reauthPaused,
@@ -315,8 +380,9 @@ export class KeepaliveManager {
     const resolver =
       this.resolverFromLatestOffer() ?? this.configuredResolver() ?? this.resolver;
     if (resolver === undefined || resolver.protocol !== "https:") {
-      this.lastCheckAt = Date.now();
-      this.setAuthenticated(false);
+      const checkedAt = Date.now();
+      this.lastCheckAt = checkedAt;
+      this.setVerdict("unknown", "none", checkedAt);
       return;
     }
     this.resolver = resolver;
@@ -328,9 +394,13 @@ export class KeepaliveManager {
       // The permission may have been revoked while the popup was open. The
       // manager-owned probe below remains useful when it is still available.
     }
-    const liveTab = liveTabs.find(
+    const resolverTabs = liveTabs.filter(
       (tab) => tab.id !== undefined && typeof tab.url === "string" && resolverURLMatches(tab.url, resolver),
     );
+    // A user's visible resolver tab carries the strongest, freshest evidence.
+    // Only inspect the manager-owned tab when no user tab is available.
+    const liveTab =
+      resolverTabs.find((tab) => tab.id !== this.tabID) ?? resolverTabs[0];
     this.likelyAuthenticated = liveTab !== undefined;
     if (liveTab?.id !== undefined) {
       await this.inspectTab(liveTab.id);
@@ -340,8 +410,9 @@ export class KeepaliveManager {
       await this.inspectTab(this.tabID);
       return;
     }
-    this.lastCheckAt = Date.now();
-    this.setAuthenticated(false);
+    const checkedAt = Date.now();
+    this.lastCheckAt = checkedAt;
+    this.setVerdict("unknown", "none", checkedAt);
   }
 
 
@@ -474,10 +545,36 @@ export class KeepaliveManager {
     if (save !== undefined) void save.catch(() => {});
   }
 
-  private setAuthenticated(authenticated: boolean): void {
-    if (this.authenticated === authenticated) return;
+  private async resolverMarkerVerdict(tabID: number): Promise<SessionVerdict> {
+    const executeScript = this.api.scripting?.executeScript;
+    if (executeScript === undefined) return "unknown";
+    try {
+      const [injection] = await executeScript({
+        target: { tabId: tabID },
+        func: collectResolverMarkers,
+      });
+      const markers = injection?.result;
+      if (!Array.isArray(markers)) return "unknown";
+      return classifyResolverMarkers(markers as ResolverMarker[]);
+    } catch {
+      // Privileged pages, revoked host permission, and closed tabs all degrade
+      // to an unknown verdict; URL shape remains only a conservative fallback.
+      return "unknown";
+    }
+  }
+
+  private setVerdict(
+    verdict: SessionVerdict,
+    source: KeepaliveProbeSource,
+    completedAt: number | null = Date.now(),
+  ): void {
+    const authenticated = verdict === "in";
+    const authenticationChanged = this.authenticated !== authenticated;
+    this.verdict = verdict;
+    this.probeSource = source;
+    this.lastVerdictAt = completedAt === null ? undefined : completedAt;
     this.authenticated = authenticated;
-    this.options.onAuthenticationChanged?.(authenticated);
+    if (authenticationChanged) this.options.onAuthenticationChanged?.(authenticated);
   }
 
   private async createTab(): Promise<void> {
@@ -492,7 +589,7 @@ export class KeepaliveManager {
       if (tabID !== undefined) {
         this.tabID = tabID;
         this.reauthPaused = false;
-        this.setAuthenticated(false);
+        this.setVerdict("unknown", "none", null);
         return;
       }
     } catch {
@@ -520,7 +617,7 @@ export class KeepaliveManager {
       if (tab.id === undefined) return;
       this.tabID = tab.id;
       this.reauthPaused = false;
-      this.setAuthenticated(false);
+      this.setVerdict("unknown", "none", null);
       await this.options.onTabPlaced?.(tab.id);
     } catch {
       // Browser policy may reject background tabs. Observe and try again later.
@@ -602,34 +699,55 @@ export class KeepaliveManager {
   private async inspectTab(tabID = this.tabID): Promise<void> {
     if (tabID === undefined || this.resolver === undefined) return;
     const owned = tabID === this.tabID;
+    const source: KeepaliveProbeSource = owned ? "keepalive_tab" : "live_tab";
     let tab: KeepaliveTab;
     try {
       tab = await this.api.tabs.get(tabID);
     } catch {
-      if (!owned) return;
+      const checkedAt = Date.now();
+      this.lastCheckAt = checkedAt;
+      if (!owned) {
+        this.setVerdict("unknown", source, checkedAt);
+        return;
+      }
       this.tabID = undefined;
       const wasPaused = this.reauthPaused;
       this.reauthPaused = false;
       if (wasPaused) this.options.onReauthStateChanged?.(false);
-      this.setAuthenticated(false);
+      this.setVerdict("unknown", "none", checkedAt);
       return;
     }
-    this.lastCheckAt = Date.now();
-    if (typeof tab.url !== "string") return;
+    const checkedAt = Date.now();
+    this.lastCheckAt = checkedAt;
+    if (typeof tab.url !== "string") {
+      this.setVerdict("unknown", source, checkedAt);
+      return;
+    }
 
     if (resolverURLMatches(tab.url, this.resolver)) {
-      this.setAuthenticated(true);
-      if (owned && this.reauthPaused) await this.resumeAfterReauth();
+      const markerVerdict = await this.resolverMarkerVerdict(tabID);
+      // An auth-shaped resolver path remains a conservative signed-out
+      // fallback. A plain resolver URL has no affirmative URL evidence.
+      const verdict =
+        markerVerdict === "unknown"
+          ? isAuthenticationURL(tab.url)
+            ? "out"
+            : "unknown"
+          : markerVerdict;
+      this.setVerdict(verdict, source, Date.now());
+      if (verdict === "in" && owned && this.reauthPaused) await this.resumeAfterReauth();
+      if (verdict === "out" && owned) await this.pauseForReauth();
       return;
     }
     if (isAuthenticationURL(tab.url)) {
-      this.setAuthenticated(false);
+      this.setVerdict("out", source, checkedAt);
       if (owned) await this.pauseForReauth();
+      return;
     }
+    this.setVerdict("unknown", source, checkedAt);
   }
 
   private async pauseForReauth(): Promise<void> {
-    this.setAuthenticated(false);
     if (this.reauthPaused || this.tabID === undefined) return;
     this.reauthPaused = true;
     try {
@@ -677,7 +795,7 @@ export class KeepaliveManager {
     this.tabID = undefined;
     this.reauthPaused = false;
     if (wasAwaitingReauth) this.options.onReauthStateChanged?.(false);
-    this.setAuthenticated(false);
+    this.setVerdict("unknown", "none", null);
     if (tabID === undefined) return;
     try {
       await this.api.tabs.remove(tabID);
@@ -696,7 +814,9 @@ export function initKeepalive(api: KeepaliveAPI, options: KeepaliveOptions): Kee
 
 /** Build the production API while keeping Chrome globals out of manager logic. */
 export function chromeKeepaliveAPI(
-  chromeAPI: Pick<typeof chrome, "action" | "storage" | "tabs" | "permissions">,
+  chromeAPI: Pick<typeof chrome, "action" | "storage" | "tabs" | "permissions"> & {
+    scripting?: Pick<typeof chrome.scripting, "executeScript">;
+  },
 ): KeepaliveAPI {
   return {
     tabs: {
@@ -714,6 +834,17 @@ export function chromeKeepaliveAPI(
     permissions: {
       getAll: () => chromeAPI.permissions.getAll(),
     },
+    ...(chromeAPI.scripting === undefined
+      ? {}
+      : {
+          scripting: {
+            executeScript: (injection: {
+              target: { tabId: number };
+              func: (...args: never[]) => unknown;
+              args?: unknown[];
+            }) => chromeAPI.scripting!.executeScript(injection),
+          },
+        }),
     timers: {
       setTimeout: (callback, delayMs) => setTimeout(callback, delayMs),
       clearTimeout: (handle) => clearTimeout(handle as number),

@@ -5,12 +5,15 @@
 import { expect, test } from "bun:test";
 
 import {
+  classifyResolverMarkers,
   clampKeepaliveInterval,
+  isAuthenticationURL,
   KeepaliveManager,
   SESSION_STALE_MS,
   type KeepaliveAPI,
   type KeepaliveTab,
   type KeepaliveTimers,
+  type ResolverMarker,
 } from "../src/keepalive";
 
 const RESOLVER_OPENURL = "https://resolver.example.edu/openurl?genre=article";
@@ -137,6 +140,7 @@ function makeHarness(
   reauths: { count: number };
   reauthState: boolean[];
   storageValues: Record<string, unknown>;
+  resolverMarkers: ResolverMarker[];
 } {
   const jobs = { count: 1 };
   const tabs = new FakeTabs();
@@ -150,6 +154,7 @@ function makeHarness(
     "keepalive.resolverOrigin": resolverConfig?.storedOrigin,
   };
   const latestOpenURL = resolverConfig === undefined ? RESOLVER_OPENURL : resolverConfig.latestOpenURL;
+  const resolverMarkers: ResolverMarker[] = [{ text: "Sign out", label: "" }];
   const api: KeepaliveAPI = {
     tabs,
     timers,
@@ -161,6 +166,9 @@ function makeHarness(
     },
     permissions: {
       getAll: async () => ({ origins: resolverConfig?.grantedOrigins ?? [] }),
+    },
+    scripting: {
+      executeScript: async () => [{ result: resolverMarkers }],
     },
     action: { setBadgeText: async ({ text }) => void badge.push(text) },
   };
@@ -177,7 +185,17 @@ function makeHarness(
     observeMs: 10,
     reloadSettleMs: 1,
   });
-  return { manager, jobs, tabs, timers, badge, reauths, reauthState, storageValues };
+  return {
+    manager,
+    jobs,
+    tabs,
+    timers,
+    badge,
+    reauths,
+    reauthState,
+    storageValues,
+    resolverMarkers,
+  };
 }
 
 test("creates one pinned resolver tab, reloads it, and closes it when jobs finish", async () => {
@@ -347,4 +365,67 @@ test("a live resolver tab is evidence while its probe determines the verdict", a
     checking: false,
     resolverOrigin: "https://resolver.example.edu",
   });
+});
+test("authentication URL detection ignores query strings and uses exact hostname segments", () => {
+  expect(
+    isAuthenticationURL(
+      "https://example.primo.exlibrisgroup.com/nde/account/overview?vid=61EXU_INST:61EXU_NDE&lang=en&fromLogin=true",
+    ),
+  ).toBe(false);
+  expect(isAuthenticationURL("https://resolver.example.edu/account?next=login")).toBe(false);
+  expect(isAuthenticationURL("https://idp.example.edu/saml/return")).toBe(true);
+  expect(isAuthenticationURL("https://login.example.edu/")).toBe(true);
+  expect(isAuthenticationURL("https://example.edu/auth/callback")).toBe(true);
+  expect(isAuthenticationURL("https://notidp.example.edu/account")).toBe(false);
+});
+
+test("resolver marker classifier prioritizes sign-out and handles Primo-shaped account markup", () => {
+  expect(
+    classifyResolverMarkers([
+      { text: "Jane Doe", label: "" },
+      { text: "My account", label: "" },
+      { text: "Sign out", label: "Account menu" },
+    ]),
+  ).toBe("in");
+  expect(classifyResolverMarkers([{ text: "Search", label: "" }, { text: "", label: "Sign in" }])).toBe("out");
+  expect(classifyResolverMarkers([{ text: "Search", label: "" }])).toBe("unknown");
+  expect(
+    classifyResolverMarkers([
+      { text: "Sign in", label: "" },
+      { text: "Sign out", label: "" },
+    ]),
+  ).toBe("in");
+});
+test("resolver-origin marker verdicts are evidence-based and do not pause a live user tab", async () => {
+  const h = makeHarness();
+  await h.manager.init();
+  h.resolverMarkers.splice(0, h.resolverMarkers.length, { text: "Sign in", label: "" });
+  const liveTab = { id: 42, url: "https://resolver.example.edu/account" };
+  h.tabs.live.set(liveTab.id, liveTab);
+  h.tabs.resolverTabs.push(liveTab);
+
+  await h.manager.checkNow(100);
+
+  expect(h.manager.getSnapshot()).toMatchObject({
+    authenticated: false,
+    verdict: "out",
+    probeSource: "live_tab",
+  });
+  expect(h.reauthState).toEqual([]);
+});
+
+test("no resolver tab or probe evidence remains unknown instead of signed out", async () => {
+  const h = makeHarness();
+  await h.manager.init();
+  h.jobs.count = 0;
+  await h.manager.sync();
+
+  await h.manager.checkNow(100);
+
+  expect(h.manager.getSnapshot()).toMatchObject({
+    authenticated: false,
+    verdict: "unknown",
+    probeSource: "none",
+  });
+  expect(h.manager.getSnapshot().lastVerdictAt).toEqual(expect.any(Number));
 });

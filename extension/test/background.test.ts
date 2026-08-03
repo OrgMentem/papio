@@ -3079,6 +3079,9 @@ test("session state probes a live resolver tab before claiming signed out", asyn
       }),
     },
     permissions: { getAll: async () => ({ origins: [] }) },
+    scripting: {
+      executeScript: async () => [{ result: [{ text: "Sign out", label: "" }] }],
+    },
     timers: { setTimeout: () => 0, clearTimeout: () => {} },
   };
   const manager = new KeepaliveManager(keepaliveAPI, {

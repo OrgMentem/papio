@@ -205,6 +205,8 @@ export function computeBadge(state: BadgeState): BadgeResult {
 }
 export type BridgeSessionState = KeepaliveSnapshot & {
   releasedAuthJobs: number;
+  /** Epoch ms of the most recent release; keys once-per-event popup notices. */
+  releasedAuthJobsAt: number | null;
 };
 
 
@@ -885,6 +887,7 @@ export class Bridge {
    * operator can explicitly reset and re-drive them without persistence. */
   private readonly stalledAuthHandoffs = new Map<string, StalledAuthHandoff>();
   private authUnblockedCount = 0;
+  private authUnblockedAt: number | null = null;
   /** Atomically reserves the one visible handoff while tabs.create is in flight. */
   private handoffOpening = false;
   private drainingQueuedHandoffs = false;
@@ -977,6 +980,9 @@ export class Bridge {
       enabled: true,
       intervalMinutes: 4,
       authenticated: this.keepaliveAuthenticated,
+      verdict: this.keepaliveAuthenticated ? "in" : "unknown",
+      probeSource: this.keepaliveAuthenticated ? "keepalive_tab" : "none",
+      lastVerdictAt: null,
       checking: false,
       likelyAuthenticated: false,
       pausedForReauth: this.keepaliveReauthNeeded,
@@ -990,11 +996,12 @@ export class Bridge {
     return {
       ...snapshot,
       pausedForReauth: this.keepaliveReauthNeeded || snapshot.pausedForReauth,
-      authenticated: this.keepaliveAuthenticated || snapshot.authenticated,
+      authenticated: snapshot.authenticated,
       lastAuthReturnedAt: this.store.lastAuthReturnedAt ?? snapshot.lastAuthReturnedAt,
       queuedAuthJobs: this.queuedAuthJobCount(),
       stalledAuthJobs: this.stalledAuthJobIDs(),
       releasedAuthJobs: this.authUnblockedCount,
+      releasedAuthJobsAt: this.authUnblockedAt,
     };
   }
 
@@ -3280,7 +3287,10 @@ export class Bridge {
               unknown_count: 0,
             }),
           );
-          if (queued.requires_auth === true) this.authUnblockedCount += 1;
+          if (queued.requires_auth === true) {
+            this.authUnblockedCount += 1;
+            this.authUnblockedAt = this.deps.now();
+          }
           opened = true;
           if (forceSurface) await this.surfaceWorkTab(tabID);
         } finally {
