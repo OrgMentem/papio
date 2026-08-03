@@ -733,7 +733,7 @@ function renderSessionRows(
   container.replaceChildren();
   rows.forEach((row, index) => {
     const item = doc.createElement("div");
-    item.className = "institution-session-origin-row";
+    item.className = "action-row institution-session-origin-row";
     const copy = doc.createElement("div");
     copy.className = "institution-session-origin-copy";
     const host = doc.createElement("span");

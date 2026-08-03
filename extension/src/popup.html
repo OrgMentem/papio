@@ -400,23 +400,29 @@
         overflow-wrap: anywhere;
       }
 
-      .institution-session-row {
+      /* One convention for a single-action row: text left, compact button
+       * right — never a full-width button under a description. */
+      .action-row {
         align-items: center;
         display: flex;
         gap: var(--space-2);
         justify-content: space-between;
       }
+
+      .action-row > button {
+        flex: none;
+        min-height: var(--control-height);
+        padding: 0 var(--space-3);
+        width: auto;
+      }
+
       .institution-session-rows {
         display: grid;
         gap: var(--space-2);
       }
 
       .institution-session-origin-row {
-        align-items: center;
         border-top: 1px solid var(--color-border);
-        display: flex;
-        gap: var(--space-2);
-        justify-content: space-between;
         padding-top: var(--space-2);
       }
 
@@ -424,14 +430,6 @@
         display: grid;
         gap: var(--space-1);
         min-width: 0;
-      }
-
-
-      .institution-session-row button {
-        flex: none;
-        min-height: var(--control-height);
-        padding: 0 var(--space-3);
-        width: auto;
       }
 
       .institution-session-unblocked {
@@ -716,7 +714,7 @@
           <h2 id="institution-session-heading">Institution session</h2>
           <span id="institution-session-origin" class="institution-session-origin"></span>
         </div>
-        <div class="institution-session-row">
+        <div class="action-row institution-session-row">
           <p id="institution-session-status" class="institution-session-status" role="status" aria-live="polite"></p>
           <button id="institution-session-signin" class="primary" type="button" aria-describedby="institution-session-status">Sign in</button>
         </div>
@@ -726,8 +724,10 @@
 
       <section id="leftover-tabs" class="launcher-action leftover-tabs" hidden aria-labelledby="leftover-tabs-heading">
         <h2 id="leftover-tabs-heading">Leftover papio tabs</h2>
-        <p id="leftover-tabs-message" class="leftover-tabs-message"></p>
-        <button id="leftover-tabs-cleanup" type="button">Close them</button>
+        <div class="action-row">
+          <p id="leftover-tabs-message" class="leftover-tabs-message"></p>
+          <button id="leftover-tabs-cleanup" type="button">Close them</button>
+        </div>
       </section>
 
       <section id="needs-you-section" class="needs-you" hidden aria-labelledby="needs-you-heading">
