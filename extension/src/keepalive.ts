@@ -9,9 +9,14 @@ export interface KeepaliveTab {
 
 export type SessionVerdict = "in" | "out" | "unknown";
 export type KeepaliveProbeSource = "live_tab" | "keepalive_tab" | "none";
+export type ScanOutcome = "markers" | "no_markers" | "scan_failed";
 export interface ResolverMarker {
   text: string;
   label: string;
+  href?: string;
+  formAction?: string;
+  action?: string;
+  storageIdentity?: "in";
 }
 
 export interface KeepaliveTabs {
@@ -76,6 +81,8 @@ export interface KeepaliveSnapshot {
   verdict?: SessionVerdict;
   /** Branch that produced the current verdict. */
   probeSource?: KeepaliveProbeSource;
+  /** Result of the most recent page marker scan, when one ran. */
+  scanOutcome?: ScanOutcome;
   /** Epoch milliseconds when the current verdict completed. */
   lastVerdictAt?: number | null;
   /** True while an on-demand session probe is still in flight. */
@@ -157,28 +164,178 @@ export function isAuthenticationURL(rawURL: string): boolean {
   }
 }
 
-const SIGN_OUT_MARKER = /sign\s*out|log\s*out|logout|my account/i;
+const SIGN_OUT_MARKER = /sign\s*out|log\s*out|logout|signout|sign-out|log-out|my account/i;
 const SIGN_IN_MARKER = /sign\s*in|log\s*in|login/i;
+const MAX_STORAGE_VALUE_LENGTH = 8 * 1024;
+const JWT_SEGMENT = /^[A-Za-z0-9_-]+$/;
+
+function decodeJWTPart(part: string): string | undefined {
+  if (part.length === 0 || !JWT_SEGMENT.test(part) || part.length % 4 === 1) return undefined;
+  const normalized = part.replace(/-/g, "+").replace(/_/g, "/");
+  const padded = normalized + "=".repeat((4 - (normalized.length % 4)) % 4);
+  try {
+    const binary = atob(padded);
+    const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+    return new TextDecoder().decode(bytes);
+  } catch {
+    return undefined;
+  }
+}
+
+function decodeJWTPayload(raw: string): Record<string, unknown> | undefined {
+  if (typeof raw !== "string" || raw.length >= MAX_STORAGE_VALUE_LENGTH) return undefined;
+  const parts = raw.trim().split(".");
+  if (
+    parts.length !== 3 ||
+    parts.some((part) => part.length === 0 || part.length % 4 === 1 || !JWT_SEGMENT.test(part))
+  ) {
+    return undefined;
+  }
+  const payloadPart = parts[1];
+  if (payloadPart === undefined) return undefined;
+  const payloadText = decodeJWTPart(payloadPart);
+  if (payloadText === undefined) return undefined;
+  try {
+    const payload: unknown = JSON.parse(payloadText);
+    return typeof payload === "object" && payload !== null && !Array.isArray(payload)
+      ? payload as Record<string, unknown>
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+
+/** Classify JWT-shaped storage values without touching browser state. */
+export function classifyResolverJWTIdentity(values: readonly string[]): "in" | "unknown" {
+  for (const value of values) {
+    const payload = decodeJWTPayload(value);
+    if (payload === undefined) continue;
+    const hasIdentity = ["userName", "user_name", "preferred_username", "sub"].some((claim) => {
+      const identity = payload[claim];
+      return (
+        (typeof identity === "string" && identity.trim().length > 0) ||
+        (typeof identity === "number" && Number.isFinite(identity))
+      );
+    });
+    const userGroup = payload["userGroup"] ?? payload["user_group"];
+    if (hasIdentity && userGroup !== "GUEST") return "in";
+  }
+  return "unknown";
+}
 
 /** Classify bounded resolver-page marker data without touching browser state. */
 export function classifyResolverMarkers(markers: readonly ResolverMarker[]): SessionVerdict {
   let signIn = false;
+  let storageIdentity = false;
   for (const marker of markers) {
-    if (typeof marker?.text !== "string" || typeof marker?.label !== "string") continue;
-    const value = `${marker.text} ${marker.label}`;
+    if (
+      typeof marker?.text !== "string" ||
+      typeof marker?.label !== "string"
+    ) {
+      continue;
+    }
+    if (marker.storageIdentity === "in") storageIdentity = true;
+    const value = [
+      marker.text,
+      marker.label,
+      marker.href,
+      marker.formAction,
+      marker.action,
+    ]
+      .filter((part): part is string => typeof part === "string")
+      .join(" ");
     if (SIGN_OUT_MARKER.test(value)) return "in";
     if (SIGN_IN_MARKER.test(value)) signIn = true;
   }
+  if (storageIdentity) return "in";
   return signIn ? "out" : "unknown";
 }
 
 /** Serializable page function used by chrome.scripting.executeScript. */
 export function collectResolverMarkers(): ResolverMarker[] {
-  const elements = Array.from(document.querySelectorAll("a,button,[role='button']")).slice(0, 100);
-  return elements.map((element) => ({
-    text: element.textContent?.trim() ?? "",
-    label: element.getAttribute("aria-label")?.trim() ?? "",
-  }));
+  const maxStorageValueLength = 8 * 1024;
+  const elements = Array.from(
+    // Include every DOM element: closed details and hidden menu content is
+    // still useful sign-in evidence even when it is not rendered.
+    document.querySelectorAll("*"),
+  );
+  const markers: ResolverMarker[] = elements.map((element) => {
+    const marker: ResolverMarker = {
+      text: element.textContent?.trim() ?? "",
+      label: element.getAttribute("aria-label")?.trim() ?? "",
+    };
+    const href = element.getAttribute("href")?.trim();
+    if (href !== undefined && href.length > 0) marker.href = href;
+    const formAction = element.getAttribute("formaction")?.trim();
+    if (formAction !== undefined && formAction.length > 0) marker.formAction = formAction;
+    const action = element.getAttribute("action")?.trim();
+    if (action !== undefined && action.length > 0) marker.action = action;
+    return marker;
+  });
+
+  const storageValues: string[] = [];
+  const readStorage = (storage: Storage): void => {
+    try {
+      for (let index = 0; index < Math.min(storage.length, 50); index += 1) {
+        const value = storage.getItem(storage.key(index) ?? "");
+        if (typeof value === "string" && value.length < maxStorageValueLength) {
+          storageValues.push(value);
+        }
+      }
+    } catch {
+      // Some privileged pages expose DOM but deny storage access.
+    }
+  };
+  try {
+    readStorage(localStorage);
+  } catch {
+    // Storage access can throw before the object is passed to readStorage.
+  }
+  try {
+    readStorage(sessionStorage);
+  } catch {
+    // Storage access can throw before the object is passed to readStorage.
+  }
+
+  // Keep this helper self-contained: executeScript serializes only the
+  // injected function, not its module-level dependencies.
+  const hasStorageIdentity = (values: readonly string[]): boolean => {
+    for (const value of values) {
+      if (typeof value !== "string" || value.length >= maxStorageValueLength) continue;
+      const parts = value.trim().split(".");
+      if (
+        parts.length !== 3 ||
+        parts.some((part) => part.length === 0 || part.length % 4 === 1 || !/^[A-Za-z0-9_-]+$/.test(part))
+      ) {
+        continue;
+      }
+      try {
+        const normalized = parts[1]!.replace(/-/g, "+").replace(/_/g, "/");
+        const padded = normalized + "=".repeat((4 - (normalized.length % 4)) % 4);
+        const binary = atob(padded);
+        const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+        const payload: unknown = JSON.parse(new TextDecoder().decode(bytes));
+        if (typeof payload !== "object" || payload === null || Array.isArray(payload)) continue;
+        const record = payload as Record<string, unknown>;
+        const hasIdentity = ["userName", "user_name", "preferred_username", "sub"].some((claim) => {
+          const identity = record[claim];
+          return (
+            (typeof identity === "string" && identity.trim().length > 0) ||
+            (typeof identity === "number" && Number.isFinite(identity))
+          );
+        });
+        if (hasIdentity && (record["userGroup"] ?? record["user_group"]) !== "GUEST") return true;
+      } catch {
+        // Ordinary storage values and malformed JWTs are not identity evidence.
+      }
+    }
+    return false;
+  };
+  if (hasStorageIdentity(storageValues)) {
+    markers.push({ text: "", label: "", storageIdentity: "in" });
+  }
+  return markers;
 }
 
 
@@ -262,6 +419,7 @@ export class KeepaliveManager {
   private authenticated = false;
   private verdict: SessionVerdict = "unknown";
   private probeSource: KeepaliveProbeSource = "none";
+  private scanOutcome: ScanOutcome | undefined;
   private lastVerdictAt: number | undefined;
   private lastCheckAt: number | undefined;
   private checking = false;
@@ -281,6 +439,7 @@ export class KeepaliveManager {
       authenticated: this.authenticated,
       verdict: this.verdict,
       probeSource: this.probeSource,
+      ...(this.scanOutcome === undefined ? {} : { scanOutcome: this.scanOutcome }),
       lastVerdictAt: this.lastVerdictAt ?? null,
       checking: this.checking,
       likelyAuthenticated: this.likelyAuthenticated,
@@ -545,21 +704,31 @@ export class KeepaliveManager {
     if (save !== undefined) void save.catch(() => {});
   }
 
-  private async resolverMarkerVerdict(tabID: number): Promise<SessionVerdict> {
+  private async resolverMarkerVerdict(
+    tabID: number,
+  ): Promise<{ verdict: SessionVerdict; scanOutcome: ScanOutcome }> {
     const executeScript = this.api.scripting?.executeScript;
-    if (executeScript === undefined) return "unknown";
+    if (executeScript === undefined) {
+      return { verdict: "unknown", scanOutcome: "scan_failed" };
+    }
     try {
       const [injection] = await executeScript({
         target: { tabId: tabID },
         func: collectResolverMarkers,
       });
       const markers = injection?.result;
-      if (!Array.isArray(markers)) return "unknown";
-      return classifyResolverMarkers(markers as ResolverMarker[]);
+      if (!Array.isArray(markers)) {
+        return { verdict: "unknown", scanOutcome: "scan_failed" };
+      }
+      const verdict = classifyResolverMarkers(markers as ResolverMarker[]);
+      return {
+        verdict,
+        scanOutcome: verdict === "unknown" ? "no_markers" : "markers",
+      };
     } catch {
-      // Privileged pages, revoked host permission, and closed tabs all degrade
-      // to an unknown verdict; URL shape remains only a conservative fallback.
-      return "unknown";
+      // Privileged pages, revoked host permission, and closed tabs expose a
+      // distinct scan failure so the popup can explain the missing access.
+      return { verdict: "unknown", scanOutcome: "scan_failed" };
     }
   }
 
@@ -567,11 +736,13 @@ export class KeepaliveManager {
     verdict: SessionVerdict,
     source: KeepaliveProbeSource,
     completedAt: number | null = Date.now(),
+    scanOutcome: ScanOutcome | undefined = undefined,
   ): void {
     const authenticated = verdict === "in";
     const authenticationChanged = this.authenticated !== authenticated;
     this.verdict = verdict;
     this.probeSource = source;
+    this.scanOutcome = scanOutcome;
     this.lastVerdictAt = completedAt === null ? undefined : completedAt;
     this.authenticated = authenticated;
     if (authenticationChanged) this.options.onAuthenticationChanged?.(authenticated);
@@ -725,16 +896,16 @@ export class KeepaliveManager {
     }
 
     if (resolverURLMatches(tab.url, this.resolver)) {
-      const markerVerdict = await this.resolverMarkerVerdict(tabID);
+      const markerResult = await this.resolverMarkerVerdict(tabID);
       // An auth-shaped resolver path remains a conservative signed-out
       // fallback. A plain resolver URL has no affirmative URL evidence.
       const verdict =
-        markerVerdict === "unknown"
+        markerResult.verdict === "unknown"
           ? isAuthenticationURL(tab.url)
             ? "out"
             : "unknown"
-          : markerVerdict;
-      this.setVerdict(verdict, source, Date.now());
+          : markerResult.verdict;
+      this.setVerdict(verdict, source, Date.now(), markerResult.scanOutcome);
       if (verdict === "in" && owned && this.reauthPaused) await this.resumeAfterReauth();
       if (verdict === "out" && owned) await this.pauseForReauth();
       return;

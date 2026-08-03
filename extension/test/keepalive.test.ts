@@ -3,10 +3,13 @@
 // a wall-clock interval or a Chrome API.
 
 import { expect, test } from "bun:test";
+import { Window } from "happy-dom";
 
 import {
+  classifyResolverJWTIdentity,
   classifyResolverMarkers,
   clampKeepaliveInterval,
+  collectResolverMarkers,
   isAuthenticationURL,
   KeepaliveManager,
   SESSION_STALE_MS,
@@ -133,6 +136,7 @@ function makeHarness(
   resolverConfig?: HarnessResolver,
 ): {
   manager: KeepaliveManager;
+  api: KeepaliveAPI;
   jobs: { count: number };
   tabs: FakeTabs;
   timers: FakeTimers;
@@ -187,6 +191,7 @@ function makeHarness(
   });
   return {
     manager,
+    api,
     jobs,
     tabs,
     timers,
@@ -428,4 +433,112 @@ test("no resolver tab or probe evidence remains unknown instead of signed out", 
     probeSource: "none",
   });
   expect(h.manager.getSnapshot().lastVerdictAt).toEqual(expect.any(Number));
+});
+
+function syntheticJWT(payload: Record<string, unknown>): string {
+  const encode = (value: string): string =>
+    btoa(value).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+  return `${encode('{"alg":"none"}')}.${encode(JSON.stringify(payload))}.${encode("sig")}`;
+}
+
+test("JWT identity classifier ignores guests, malformed values, and oversized storage", () => {
+  const cases: readonly [string, readonly string[], "in" | "unknown"][] = [
+    ["guest group", [syntheticJWT({ userName: "Jane Doe", userGroup: "GUEST" })], "unknown"],
+    ["named user", [syntheticJWT({ userName: "Jane Doe", userGroup: "STUDENT" })], "in"],
+    ["snake case identity", [syntheticJWT({ user_name: "jane", user_group: "STAFF" })], "in"],
+    ["malformed segments", ["not.a.jwt!"], "unknown"],
+    ["oversized value", ["a".repeat(8 * 1024)], "unknown"],
+  ];
+  for (const [name, values, expected] of cases) {
+    expect(classifyResolverJWTIdentity(values), name).toBe(expected);
+  }
+});
+
+test("resolver marker classifier recognizes logout hrefs and form actions", () => {
+  expect(classifyResolverMarkers([{ text: "", label: "", href: "/account/signout" }])).toBe("in");
+  expect(classifyResolverMarkers([{ text: "", label: "", formAction: "/log-out" }])).toBe("in");
+  expect(
+    classifyResolverMarkers([
+      { text: "Sign in", label: "", storageIdentity: "in" },
+    ]),
+  ).toBe("in");
+});
+
+test("marker collection scans logout links inside closed and hidden menus", () => {
+  const window = new Window({ url: "https://resolver.example.edu/account" });
+  window.document.write(
+    "<html><body><details><div hidden><span><a href='/logout'>Exit</a></span></div></details></body></html>",
+  );
+  const previous = {
+    document: globalThis.document,
+    localStorage: globalThis.localStorage,
+    sessionStorage: globalThis.sessionStorage,
+  };
+  Object.assign(globalThis, {
+    document: window.document,
+    localStorage: window.localStorage,
+    sessionStorage: window.sessionStorage,
+  });
+  try {
+    expect(classifyResolverMarkers(collectResolverMarkers())).toBe("in");
+  } finally {
+    Object.assign(globalThis, previous);
+  }
+});
+
+test("Primo-shaped account page with a non-guest session JWT is signed in without sign-out UI", () => {
+  const window = new Window({ url: "https://example.primo.exlibrisgroup.com/nde/account/overview" });
+  window.document.write(
+    "<html><body><main><h1>Jane Doe</h1><details><summary>Account</summary><div hidden>Profile</div></details></main></body></html>",
+  );
+  window.sessionStorage.setItem(
+    "primo-session",
+    syntheticJWT({ preferred_username: "jane", userGroup: "STUDENT" }),
+  );
+  const previous = {
+    document: globalThis.document,
+    localStorage: globalThis.localStorage,
+    sessionStorage: globalThis.sessionStorage,
+  };
+  Object.assign(globalThis, {
+    document: window.document,
+    localStorage: window.localStorage,
+    sessionStorage: window.sessionStorage,
+  });
+  try {
+    const markers = collectResolverMarkers();
+    expect(classifyResolverMarkers(markers)).toBe("in");
+    expect(markers.some((marker) => marker.storageIdentity === "in")).toBe(true);
+  } finally {
+    Object.assign(globalThis, previous);
+  }
+});
+
+test("marker scan outcome separates markers, no markers, and injection failure", async () => {
+  const markers = makeHarness();
+  await markers.manager.init();
+  await markers.manager.checkNow(100);
+  expect(markers.manager.getSnapshot().scanOutcome).toBe("markers");
+
+  const noMarkers = makeHarness();
+  noMarkers.resolverMarkers.splice(0, noMarkers.resolverMarkers.length);
+  await noMarkers.manager.init();
+  await noMarkers.manager.checkNow(100);
+  expect(noMarkers.manager.getSnapshot()).toMatchObject({
+    verdict: "unknown",
+    scanOutcome: "no_markers",
+  });
+
+  const failed = makeHarness();
+  failed.api.scripting = {
+    executeScript: async () => {
+      throw new Error("missing host grant");
+    },
+  };
+  await failed.manager.init();
+  await failed.manager.checkNow(100);
+  expect(failed.manager.getSnapshot()).toMatchObject({
+    verdict: "unknown",
+    scanOutcome: "scan_failed",
+  });
 });

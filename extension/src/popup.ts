@@ -353,7 +353,6 @@ function isSessionState(value: unknown): value is PopupSessionState {
   const resolverOrigin = state["resolverOrigin"];
   return (
     typeof state["enabled"] === "boolean" &&
-    typeof state["intervalMinutes"] === "number" &&
     typeof state["authenticated"] === "boolean" &&
     (state["verdict"] === undefined ||
       state["verdict"] === "in" ||
@@ -363,6 +362,10 @@ function isSessionState(value: unknown): value is PopupSessionState {
       state["probeSource"] === "live_tab" ||
       state["probeSource"] === "keepalive_tab" ||
       state["probeSource"] === "none") &&
+    (state["scanOutcome"] === undefined ||
+      state["scanOutcome"] === "markers" ||
+      state["scanOutcome"] === "no_markers" ||
+      state["scanOutcome"] === "scan_failed") &&
     (state["lastVerdictAt"] === undefined ||
       state["lastVerdictAt"] === null ||
       typeof state["lastVerdictAt"] === "number") &&
@@ -508,16 +511,30 @@ export function deriveSessionCardState(state: PopupSessionState | undefined): Se
     };
   }
   const verdict = state.verdict ?? (state.authenticated ? "in" : "unknown");
-  if (verdict === "unknown") {
+  if (stale) {
     return {
-      label: "Session unknown — open your library page to verify",
+      label: "Checking session…",
       detail,
       action: "signin",
     };
   }
-  if (stale) {
+  if (state.scanOutcome === "no_markers") {
     return {
-      label: "Checking session…",
+      label: "Signed-in state unclear on this page",
+      detail: "papio inspected your library tab but found no sign-in indicators",
+      action: "signin",
+    };
+  }
+  if (state.scanOutcome === "scan_failed") {
+    return {
+      label: "papio couldn't read the library page — check site access in Options",
+      detail,
+      action: "signin",
+    };
+  }
+  if (verdict === "unknown") {
+    return {
+      label: "Session unknown — open your library page to verify",
       detail,
       action: "signin",
     };

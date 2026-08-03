@@ -751,7 +751,7 @@ test("institution sign-in errors return to a working sign-in button with the rea
     "Could not open the institution sign-in",
   );
 });
-test("session card matrix distinguishes unknown from signed-out DOM evidence", () => {
+test("session card matrix propagates marker scan outcomes", () => {
   const now = Date.now();
   const base = {
     enabled: true,
@@ -766,6 +766,29 @@ test("session card matrix distinguishes unknown from signed-out DOM evidence", (
     stalledAuthJobs: [],
     releasedAuthJobs: 0,
   };
+
+  const noMarkers = deriveSessionCardState({
+    ...base,
+    authenticated: false,
+    verdict: "unknown",
+    probeSource: "live_tab",
+    scanOutcome: "no_markers",
+    lastVerdictAt: now,
+  });
+  expect(noMarkers.label).toBe("Signed-in state unclear on this page");
+  expect(noMarkers.detail).toBe("papio inspected your library tab but found no sign-in indicators");
+  expect(noMarkers.action).toBe("signin");
+
+  const failed = deriveSessionCardState({
+    ...base,
+    authenticated: false,
+    verdict: "unknown",
+    probeSource: "live_tab",
+    scanOutcome: "scan_failed",
+    lastVerdictAt: now,
+  });
+  expect(failed.label).toBe("papio couldn't read the library page — check site access in Options");
+  expect(failed.detail).toContain("via your open library tab");
 
   const unknown = deriveSessionCardState({
     ...base,
@@ -783,6 +806,7 @@ test("session card matrix distinguishes unknown from signed-out DOM evidence", (
     authenticated: false,
     verdict: "out",
     probeSource: "live_tab",
+    scanOutcome: "markers",
     lastVerdictAt: now,
   });
   expect(signedOut.label).toBe("Signed out or expired");
@@ -793,6 +817,7 @@ test("session card matrix distinguishes unknown from signed-out DOM evidence", (
     authenticated: true,
     verdict: "in",
     probeSource: "live_tab",
+    scanOutcome: "markers",
     lastVerdictAt: now,
   });
   expect(warm.label).toContain("Session warm");
