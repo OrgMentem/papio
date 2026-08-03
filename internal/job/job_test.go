@@ -1323,7 +1323,7 @@ func TestConcurrentSubmissionsOfOneWorkConvergeOnOneJob(t *testing.T) {
 			defer wg.Done()
 			<-start
 			results[i], errs[i] = js.CreateRequestForWork(ctx,
-				fmt.Sprintf("wr_concurrent_%02d", i), w, "", "", testPolicy(), nil, PrincipalCLI, false)
+				fmt.Sprintf("wr_concurrent_%02d", i), w, "", "", testPolicy(), nil, Attribution{Principal: PrincipalCLI}, false)
 		}()
 	}
 	close(start)
@@ -1362,18 +1362,18 @@ func TestForcedSubmissionsDeliberatelyDoNotConverge(t *testing.T) {
 	js := testStore(t)
 	w := testWork()
 
-	first, err := js.CreateRequestForWork(ctx, "wr_force_first", w, "", "", testPolicy(), nil, PrincipalCLI, false)
+	first, err := js.CreateRequestForWork(ctx, "wr_force_first", w, "", "", testPolicy(), nil, Attribution{Principal: PrincipalCLI}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	forced, err := js.CreateRequestForWork(ctx, "wr_force_second", w, "", "", testPolicy(), nil, PrincipalCLI, true)
+	forced, err := js.CreateRequestForWork(ctx, "wr_force_second", w, "", "", testPolicy(), nil, Attribution{Principal: PrincipalCLI}, true)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if forced.Existing || forced.JobID == first.JobID {
 		t.Fatalf("forced submission = %+v, want a distinct fresh job separate from %s", forced, first.JobID)
 	}
-	unforced, err := js.CreateRequestForWork(ctx, "wr_force_third", w, "", "", testPolicy(), nil, PrincipalCLI, false)
+	unforced, err := js.CreateRequestForWork(ctx, "wr_force_third", w, "", "", testPolicy(), nil, Attribution{Principal: PrincipalCLI}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1399,14 +1399,14 @@ func TestEnrichmentRecordsADuplicateItCannotHaveCaughtAtSubmit(t *testing.T) {
 	const doi = "10.3389/fpsyg.2016.00079"
 
 	identified, err := js.CreateRequestForWork(ctx, "wr_dup_with_doi",
-		work.Work{DOI: doi, Title: "A Paper With A Clean Citation"}, "", "", testPolicy(), nil, PrincipalCLI, false)
+		work.Work{DOI: doi, Title: "A Paper With A Clean Citation"}, "", "", testPolicy(), nil, Attribution{Principal: PrincipalCLI}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	// The second citation yields no identifier, so submit has nothing to match.
 	titleOnly, err := js.CreateRequestForWork(ctx, "wr_dup_title_only",
 		work.Work{Title: "A Paper Whose Citation Defeated Extraction", Authors: []string{"A. Author"}, Year: 2016},
-		"", "", testPolicy(), nil, PrincipalCLI, false)
+		"", "", testPolicy(), nil, Attribution{Principal: PrincipalCLI}, false)
 	if err != nil {
 		t.Fatal(err)
 	}

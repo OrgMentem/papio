@@ -41,7 +41,10 @@ type SubmitOptions struct {
 	// selected them, preventing a shared daemon from answering against another
 	// client's sources.
 	LibraryFingerprint string
-	Now                time.Time
+	// Consumer names the submitting consumer on every work in the batch. One
+	// name for the whole batch, because a batch is one caller's submission.
+	Consumer string
+	Now      time.Time
 }
 
 // Submission records one successfully created acquisition job.
@@ -237,6 +240,7 @@ func ApplyOwnership(requests []protocol.WorkRequest, ownership zotio.LookupWorks
 type submitParams struct {
 	Request    protocol.WorkRequest `json:"request"`
 	AutoImport *bool                `json:"auto_import,omitempty"`
+	Consumer   string               `json:"consumer,omitempty"`
 }
 
 // submitResult decodes acquire.submit_v2. Existing is declared because it must
@@ -256,17 +260,22 @@ type submitResult struct {
 // possibly older running daemon, and without it every work in a mixed-version
 // batch records submission_failed with unknown_method. The single-work CLI path
 // has carried this same fallback since v2 was introduced; batch must match it.
-func submitOne(ctx context.Context, caller Caller, request protocol.WorkRequest, autoImport *bool) (submitResult, error) {
+func submitOne(ctx context.Context, caller Caller, request protocol.WorkRequest, autoImport *bool, consumer string) (submitResult, error) {
 	var submitted submitResult
 	// v2 always takes the {request, ...} wrapper; v1 additionally accepts a
 	// bare WorkRequest, which is what it was sent before this fallback existed.
-	err := caller.Call(ctx, "acquire.submit_v2", submitParams{Request: request, AutoImport: autoImport}, &submitted)
+	err := caller.Call(ctx, "acquire.submit_v2", submitParams{Request: request, AutoImport: autoImport, Consumer: consumer}, &submitted)
 	if err == nil {
 		return submitted, nil
 	}
 	var remote *ipc.RemoteError
 	if !errors.As(err, &remote) || remote.Code != "unknown_method" {
 		return submitResult{}, err
+	}
+	if consumer != "" {
+		// Dropping the attribution to reach an older daemon would record the
+		// batch as nobody's work; say so instead.
+		return submitResult{}, fmt.Errorf("consumer attribution requires a daemon that records it; upgrade or restart the daemon from the same installation as this CLI")
 	}
 	var params any = request
 	if autoImport != nil {
@@ -377,7 +386,7 @@ func Submit(ctx context.Context, caller Caller, dataDir string, requests []proto
 		group.Add(1)
 		go func(index int, request protocol.WorkRequest) {
 			defer group.Done()
-			submitted, err := submitOne(ctx, caller, request, options.AutoImport)
+			submitted, err := submitOne(ctx, caller, request, options.AutoImport, options.Consumer)
 			if err != nil {
 				errs[index] = err
 				return

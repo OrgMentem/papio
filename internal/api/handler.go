@@ -251,6 +251,9 @@ func RouterWithShutdown(system *bootstrap.System, shutdown context.CancelFunc) i
 		"jobs.list_v2": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return listJobsV2(ctx, raw, system)
 		},
+		"jobs.list_v3": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return listJobsV3(ctx, raw, system)
+		},
 		"jobs.receipt": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return jobReceipt(ctx, raw, system)
 		},
@@ -266,6 +269,9 @@ func RouterWithShutdown(system *bootstrap.System, shutdown context.CancelFunc) i
 		"jobs.get": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return getJob(ctx, raw, system)
 		},
+		"jobs.get_v2": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return getJobV2(ctx, raw, system)
+		},
 		"jobs.cancel": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return cancelJob(ctx, raw, system)
 		},
@@ -277,6 +283,9 @@ func RouterWithShutdown(system *bootstrap.System, shutdown context.CancelFunc) i
 		},
 		"actions.list_v2": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return listActionsV2(ctx, raw, system)
+		},
+		"actions.list_v3": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return listActionsV3(ctx, raw, system)
 		},
 		"actions.open": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return openActions(ctx, raw, system)
@@ -292,6 +301,9 @@ func RouterWithShutdown(system *bootstrap.System, shutdown context.CancelFunc) i
 		},
 		"artifacts.locate": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return locateArtifact(ctx, raw, system)
+		},
+		"artifacts.validation": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return validationReports(ctx, raw, system)
 		},
 		"bundle.document": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return bundleDocument(ctx, raw, system)
@@ -451,6 +463,14 @@ type acquireSubmitV2Params struct {
 	Request    protocol.WorkRequest `json:"request"`
 	AutoImport *bool                `json:"auto_import,omitempty"`
 	Force      bool                 `json:"force,omitempty"`
+	// Consumer names the submitting consumer for a shared daemon's accounting.
+	// A sibling of Request, not a WorkRequest field: work-request/1 describes
+	// the WORK, and the same work submitted by two consumers is one work. It is
+	// also why this is a new param rather than a new method — params are decoded
+	// fail-closed too, so an older daemon rejects the call outright instead of
+	// silently dropping the attribution, which the CLI reports as the version
+	// skew it is.
+	Consumer string `json:"consumer,omitempty"`
 }
 
 func submitV2(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
@@ -461,6 +481,7 @@ func submitV2(ctx context.Context, raw json.RawMessage, system *bootstrap.System
 	result, err := system.App.SubmitWithOptionsAs(ctx, PrincipalFrom(ctx), params.Request, app.SubmitOptions{
 		AutoImport: params.AutoImport,
 		Force:      params.Force,
+		Consumer:   params.Consumer,
 	})
 	if err != nil {
 		var unset *config.ErrAccessModeUnset
