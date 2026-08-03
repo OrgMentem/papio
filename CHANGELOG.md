@@ -11,6 +11,8 @@ execution records in `notes/acquisition-stack-plan.md`.
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-08-03
+
 ### Added
 
 - **Quarantined PDF previews now include the decision at the point of

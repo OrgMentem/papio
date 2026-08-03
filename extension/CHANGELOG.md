@@ -16,6 +16,8 @@ for the full pre-split extension history.
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-08-03
+
 ### Added
 
 - **Adapters for two more entitled routes.** Informit (`informit` 0.1.0):
