@@ -208,7 +208,7 @@ test("shows only the no-paper message when the current page has no DOI", () => {
   expect(button.disabled).toBe(true);
   expect(button.hidden).toBe(true);
   expect(doc.getElementById("page-acquire-doi")?.hidden).toBe(false);
-  expect(doc.getElementById("page-acquire-doi")?.textContent).toBe("No paper detected on this page");
+  expect(doc.getElementById("page-acquire-doi")?.textContent).toBe("No paper on this page");
   button.click();
   expect(calls).toBe(0);
 });
@@ -708,7 +708,7 @@ test("institution session uses the shared card/button styles and explains missin
   expect(doc.getElementById("institution-session")?.classList.contains("launcher-action")).toBe(true);
   expect(doc.getElementById("institution-session-signin")?.classList.contains("primary")).toBe(true);
   expect(doc.getElementById("institution-session-origin")?.textContent).toBe(
-    "No resolver configured yet — open a paper first",
+    "Open a paper first",
   );
   expect(doc.getElementById("institution-session-dismiss")).toBeNull();
 });
@@ -861,10 +861,10 @@ test("leftover-tabs card stays hidden at zero and renders a pluralized count", (
 
   renderLeftoverTabs(doc, 3, async () => 3);
   expect(section?.hasAttribute("hidden")).toBe(false);
-  expect(doc.getElementById("leftover-tabs-message")?.textContent).toContain("3 tabs");
+  expect(doc.getElementById("leftover-tabs-message")?.textContent).toContain("3 untracked tabs");
 
   renderLeftoverTabs(doc, 1, async () => 1);
-  expect(doc.getElementById("leftover-tabs-message")?.textContent).toContain("1 tab from");
+  expect(doc.getElementById("leftover-tabs-message")?.textContent).toContain("1 untracked tab left");
 });
 
 test("leftover-tabs cleanup click closes the card and a failure re-arms the button", async () => {

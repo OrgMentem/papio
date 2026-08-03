@@ -450,8 +450,8 @@ export function renderLeftoverTabs(
   section.hidden = false;
   message.textContent =
     count === 1
-      ? "1 tab from an earlier papio session is still open. papio no longer tracks it."
-      : `${count} tabs from an earlier papio session are still open. papio no longer tracks them.`;
+      ? "1 untracked tab left from an earlier session."
+      : `${count} untracked tabs left from an earlier session.`;
   button.disabled = false;
   button.textContent = "Close them";
   if (!button.dataset.wired) {
@@ -524,18 +524,24 @@ function sessionEvidenceDetail(state: PopupSessionState): string {
       : state.probeSource === "keepalive_tab"
         ? "via papio's keepalive tab"
         : "via no probe evidence";
+  let host = state.resolverOrigin ?? "";
+  try {
+    host = new URL(state.resolverOrigin ?? "").host;
+  } catch {
+    // A non-URL origin is still worth naming verbatim.
+  }
   const rawTimestamp = state.lastVerdictAt;
   if (typeof rawTimestamp !== "number" || !Number.isFinite(rawTimestamp)) {
-    return `Applies to ${state.resolverOrigin} · ${source}`;
+    return `${host} · ${source}`;
   }
   const timestamp = new Date(rawTimestamp);
   if (!Number.isFinite(timestamp.getTime())) {
-    return `Applies to ${state.resolverOrigin} · ${source}`;
+    return `${host} · ${source}`;
   }
   const hour = timestamp.getHours() % 12 || 12;
   const minute = String(timestamp.getMinutes()).padStart(2, "0");
   const period = timestamp.getHours() >= 12 ? "pm" : "am";
-  return `Applies to ${state.resolverOrigin} · ${source} · ${hour}:${minute} ${period}`;
+  return `${host} · ${source} · ${hour}:${minute} ${period}`;
 }
 
 export interface SessionCardState {
@@ -553,7 +559,7 @@ export function deriveSessionCardState(state: PopupSessionState | undefined): Se
   if (state.resolverOrigin === null) {
     return {
       label: "No resolver configured yet",
-      detail: "No resolver configured yet — open a paper first",
+      detail: "Open a paper first",
       action: "none",
     };
   }
@@ -794,20 +800,21 @@ export function renderNeedsAttention(
 
   if (challengeJobs.length > 0) {
     heading.textContent = "Security check needs you";
-    message.textContent = "Complete the security check in the open provider tab. Papio resumes automatically when it clears.";
+    message.textContent = "Solve it in the open tab — papio resumes automatically.";
   } else if (pending.length > 0 && blocked.length > 0) {
     heading.textContent = "Needs your attention";
-    message.textContent = "Finish your institutional sign-in and allow browser access for the listed provider pages.";
+    message.textContent = "Sign in and allow provider access below.";
   } else if (stalled.length > 0 && pending.length === 0 && blocked.length === 0) {
     heading.textContent = "Sign in, then retry";
-    message.textContent = "Sign-in didn't stick - sign in, then retry these papers.";
+    message.textContent = "Sign-in didn't stick — retry these papers.";
   } else if (pending.length > 0) {
     heading.textContent = "Sign in to continue";
-    message.textContent = "Finish your institutional sign-in to continue these papers.";
+    message.textContent = "";
   } else {
     heading.textContent = "Allow provider access";
-    message.textContent = "Papio cannot read the listed provider pages. Open Options and enable a source, or use Grant all sources.";
+    message.textContent = "Enable these sources in Options, or use Grant all sources.";
   }
+  message.hidden = message.textContent === "";
 
   for (const job of challengeJobs) {
     const row = doc.createElement("div");
@@ -1449,7 +1456,7 @@ export function renderPageContext(
     return;
   }
   if (!page?.doi) {
-    detected.textContent = "No paper detected on this page";
+    detected.textContent = "No paper on this page";
     detected.hidden = false;
     state.textContent = "";
     status.textContent = "";
@@ -1514,21 +1521,46 @@ export function wirePrimaryShortcut(doc: Document = document): void {
 
 
 export async function refresh(): Promise<void> {
+  // Wave 1: store-derived sections paint immediately (one storage read),
+  // before the user can aim at anything.
   const store = await chromeBackend(chrome.storage).load();
   renderDaemonStatus(document, store);
   renderPageAcquire(document);
-  const freshActivity = await readPopupActivity();
+  // Wave 2: every slow input is gathered in parallel and painted in ONE
+  // synchronous pass. Sections revealing one by one over the next seconds
+  // shift later cards mid-aim — a live mis-click hit "Focus" where
+  // "Close them" had been a moment earlier.
+  const [freshActivity, delivery, pageMetadata, session, orphanCount, consent, ungranted] =
+    await Promise.all([
+      readPopupActivity(),
+      readDeliveryFeedback(store.pendingDelivery),
+      readCurrentPageMetadata().catch(() => undefined),
+      requestSessionState(),
+      requestOrphanTabCount(),
+      chrome.storage.local.get(TERMS_CONSENT_KEY).then(
+        (got) => {
+          const v = got[TERMS_CONSENT_KEY];
+          return v === "accept" || v === "manual" ? v : undefined;
+        },
+        () => undefined,
+      ),
+      (async () => {
+        const pending: string[] = [];
+        for (const origin of store.resolverOrigins ?? []) {
+          try {
+            if (!(await chrome.permissions.contains({ origins: [`${origin}/*`] }))) pending.push(origin);
+          } catch {
+            pending.push(origin);
+          }
+        }
+        return pending;
+      })(),
+    ]);
   if (freshActivity !== undefined) popupActivity = freshActivity;
-  const delivery = await readDeliveryFeedback(store.pendingDelivery);
-  try {
-    renderPageContext(document, await readCurrentPageMetadata(), store.activeJobs, delivery, popupActivity);
-  } catch {
-    renderPageContext(document, undefined, store.activeJobs, delivery, popupActivity);
-  }
-  const session = await requestSessionState();
+  renderPageContext(document, pageMetadata, store.activeJobs, delivery, popupActivity);
   renderInstitutionSession(document, session);
   scheduleSessionProbeRetry(session);
-  renderLeftoverTabs(document, await requestOrphanTabCount());
+  renderLeftoverTabs(document, orphanCount);
   renderNeedsAttention(
     document,
     store.activeJobs,
@@ -1538,25 +1570,9 @@ export async function refresh(): Promise<void> {
     session?.stalledAuthJobs ?? [],
     retryAuthStalled,
   );
-  let consent: "accept" | "manual" | undefined;
-  try {
-    const got = await chrome.storage.local.get(TERMS_CONSENT_KEY);
-    const v = got[TERMS_CONSENT_KEY];
-    consent = v === "accept" || v === "manual" ? v : undefined;
-  } catch {
-    consent = undefined;
-  }
   renderTermsConsent(document, store.activeJobs, consent, (value) => {
     void sendTermsConsent(value).then(() => refresh());
   });
-  const ungranted: string[] = [];
-  for (const origin of store.resolverOrigins ?? []) {
-    try {
-      if (!(await chrome.permissions.contains({ origins: [`${origin}/*`] }))) ungranted.push(origin);
-    } catch {
-      ungranted.push(origin);
-    }
-  }
   renderResolverGrants(document, ungranted, (toGrant) => {
     void chrome.permissions.request({ origins: toGrant.map((origin) => `${origin}/*`) }).then(() => refresh());
   });

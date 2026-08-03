@@ -101,7 +101,7 @@
         font-size: var(--font-size-body);
         line-height: 1.45;
         margin: 0;
-        padding: var(--space-4);
+        padding: var(--space-3);
         width: var(--popup-width);
       }
 
@@ -109,7 +109,7 @@
         align-items: center;
         display: flex;
         justify-content: space-between;
-        margin-bottom: var(--space-3);
+        margin-bottom: var(--space-2);
       }
 
       h2,
@@ -215,7 +215,7 @@
 
       main {
         display: grid;
-        gap: var(--space-3);
+        gap: var(--space-2);
       }
 
       .daemon-status {
@@ -240,7 +240,7 @@
 
       .launcher {
         display: grid;
-        gap: var(--space-3);
+        gap: var(--space-2);
       }
 
       .launcher-action {
@@ -708,9 +708,8 @@
           <button
             id="open-inbox-btn"
             type="button"
-            aria-describedby="open-inbox-description open-inbox-status"
+            aria-describedby="open-inbox-status"
           >Open inbox</button>
-          <p id="open-inbox-description">Review papers and actions that need your attention.</p>
           <div id="open-inbox-status" class="capture-status" aria-live="polite"></div>
         </div>
       </section>
