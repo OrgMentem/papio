@@ -1580,7 +1580,7 @@ regression test where behavior changed):
   docview → download) still needs a live pass.
 
 - SAGE Journals adapter (`journals.sagepub.com`), fixture-backed
-  (`fixtures/sage/success.html`, captured live via CDP from a Example University-authenticated
+  (`fixtures/sage/success.html`, captured live via CDP from an institutionally authenticated
   article). SAGE emits no Highwire metas; classifies on `publication_doi` + the
   `downloadPdfUrl` anchor (same shape as ACM) and downloads that anchor's
   `/doi/pdf/<doi>?download=true` href. Classify is fixture-verified; the
@@ -1589,7 +1589,7 @@ regression test where behavior changed):
   title routes to journals.sagepub.com).
 
 - Wiley Online Library adapter (`onlinelibrary.wiley.com`), fixture-backed
-  (`fixtures/wiley/success.html`, captured from a Example University-authenticated article).
+  (`fixtures/wiley/success.html`, captured from an institutionally authenticated article).
   Classifies via the Highwire `citation_pdf_url`/`citation_title` metas, then
   builds and fetches Wiley's direct `/doi/pdfdirect/<doi>?download=true` file
   through the privileged downloads API — `citation_pdf_url` (`/doi/pdf/`) and

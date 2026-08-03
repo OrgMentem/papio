@@ -591,7 +591,7 @@ func actionURL(action job.HumanAction, row job.Row, baseFor func(string) (string
 	if app.HumanActionNextStepFor(action).Command == "" {
 		return "", false
 	}
-	// Honor the job's resolver profile: a Example Institute-routed job must never open the
+	// Honor the job's resolver profile: an Example Institute-routed job must never open the
 	// default (Example University) resolver.
 	base, ok := baseFor(row.Policy.Resolver)
 	if !ok || base == "" {

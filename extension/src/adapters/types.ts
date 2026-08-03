@@ -448,7 +448,31 @@ export const adapters: AdapterSpec[] = [
     },
   },
   {
-    // Verified live 2026-07-14 against a Example University-authenticated EBSCOhost record
+    // Captured 2026-08-04 from an institutionally entitled ClinicalKey
+    // full-text article (fixtures/clinicalkey/success.html). The SPA renders
+    // a stable download anchor - a[data-testid="pdf-download-link"] with an
+    // href to /service/content/pdf/watermarked/<pii>.pdf - so method "href"
+    // rides the site's own watermarked-PDF endpoint with session cookies.
+    // Evidence covers the .com.au front; clinicalkey.com joins with its own
+    // capture.
+    id: "clinicalkey",
+    version: "0.1.0",
+    hosts: ["clinicalkey.com.au"],
+    settleTimeoutMs: 8000,
+    classify: [
+      {
+        kind: "article",
+        all: ["a[data-testid='pdf-download-link'][href*='/service/content/pdf/']"],
+      },
+    ],
+    download: {
+      selector: "a[data-testid='pdf-download-link'][href*='/service/content/pdf/']",
+      requireKind: "article",
+      method: "href",
+    },
+  },
+  {
+    // Verified live 2026-07-14 against an institutionally authenticated EBSCOhost record
     // and its provider-owned download-format modal (fixtures/ebsco/success.html).
     id: "ebsco",
     version: "0.2.0",
@@ -579,7 +603,7 @@ export const adapters: AdapterSpec[] = [
     },
   },
   {
-    // Verified live 2026-07-17 against a Example University-authenticated Wiley Online Library
+    // Verified live 2026-07-17 against an institutionally authenticated Wiley Online Library
     // article (fixtures/wiley/success.html). The page's citation_pdf_url meta
     // points at /doi/pdf/<doi>, but that path returns an HTML viewer wrapper —
     // the actual file is Wiley's /doi/pdfdirect/<doi>?download=true endpoint

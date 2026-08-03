@@ -2128,3 +2128,32 @@ test.skipIf(primoRecord === null)(
     expect(interpret(stripped, spec, ctx()).kind).not.toBe("article");
   },
 );
+
+// ClinicalKey's SPA renders a stable watermarked-PDF download anchor on
+// entitled full-text articles; method href rides the site's own endpoint
+// with session cookies.
+const clinicalKeyArticle = loadFixture("clinicalkey", "success");
+test.skipIf(clinicalKeyArticle === null)(
+  "captured ClinicalKey article classifies on its watermarked PDF anchor",
+  () => {
+    const article = clinicalKeyArticle as Document;
+    const spec = adapters.find((a) => a.id === "clinicalkey") as AdapterSpec;
+    expect(interpret(article, spec, ctx()).kind).toBe("article");
+    const rule = spec.download as DownloadRule;
+    expect(rule.method).toBe("href");
+    const anchor = article.querySelector(rule.selector);
+    expect(anchor?.getAttribute("href") ?? "").toMatch(
+      /\/service\/content\/pdf\/watermarked\/.+\.pdf$/,
+    );
+  },
+);
+test.skipIf(clinicalKeyArticle === null)(
+  "a ClinicalKey page without the download anchor stays assisted",
+  () => {
+    const article = clinicalKeyArticle as Document;
+    const spec = adapters.find((a) => a.id === "clinicalkey") as AdapterSpec;
+    const stripped = article.cloneNode(true) as Document;
+    for (const el of stripped.querySelectorAll("a[data-testid='pdf-download-link']")) el.remove();
+    expect(interpret(stripped, spec, ctx()).kind).not.toBe("article");
+  },
+);
