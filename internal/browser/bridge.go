@@ -142,6 +142,9 @@ type Bridge struct {
 	// One reoffer sweep per sync cycle; the handler that triggered it lets poll
 	// finish the same cycle without immediately running a second burst.
 	reofferRanThisSync bool
+	// lastPacedHeld deduplicates the operator-visible pacing event while a
+	// backlog remains unchanged across the native host's two-second polls.
+	lastPacedHeld int
 	// Completion metadata and delivery context arrive as adjacent extension
 	// frames. Keep both briefly so either frame order is safe across a native
 	// host RPC boundary; values are never durable and expire quickly.
@@ -362,6 +365,7 @@ func (b *Bridge) promote(session *browserSession, reason string) {
 	b.reofferSourceJobID = ""
 	b.reofferProfile = ""
 	b.lastSessionEvidenceAt = time.Time{}
+	b.lastPacedHeld = 0
 	b.takeovers++
 	log.Printf("papio: browser session %s (v%s) now holds the bridge: %s", shortSession(session.ID), session.ExtensionVersion, reason)
 }
@@ -773,6 +777,7 @@ func (b *Bridge) handleHello(sessionID string, p *protocol.HelloPayload) ([]json
 	b.reofferPending = map[string]bool{}
 	b.reofferSourceJobID = ""
 	b.reofferProfile = ""
+	b.lastPacedHeld = 0
 	if session.Outdated {
 		return b.extensionOutdatedError()
 	}
@@ -2383,10 +2388,15 @@ func (b *Bridge) poll(ctx context.Context) ([]json.RawMessage, error) {
 			delete(b.focusPending, id)
 		}
 	}
-	if held > 0 {
+	if held == 0 {
+		// A future backlog is a new pacing episode and deserves a fresh event,
+		// even when it happens to hold the same number of jobs.
+		b.lastPacedHeld = 0
+	} else if held != b.lastPacedHeld {
 		if err := b.jobs.S.AppendEvent(ctx, "", "browser.offers_paced", map[string]any{"held": held}); err != nil {
 			return nil, err
 		}
+		b.lastPacedHeld = held
 	}
 	return out, nil
 }

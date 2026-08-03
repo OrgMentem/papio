@@ -1693,6 +1693,13 @@ func TestOfferPacingLimitsOutstandingHandoffsAndReportsHeld(t *testing.T) {
 		t.Fatalf("initial paced events = %#v, want one event held=16", events)
 	}
 
+	// The browser polls every two seconds. An unchanged backlog is still the
+	// same pacing episode and must not append an activity row per poll.
+	runSync(t, b)
+	if events = pacedEventDetails(t, jobs); len(events) != 1 {
+		t.Fatalf("unchanged backlog produced duplicate paced events: %#v", events)
+	}
+
 	// Complete two offered downloads. Their actions close through adoption,
 	// freeing exactly two governor slots for the next poll.
 	var settled []json.RawMessage
