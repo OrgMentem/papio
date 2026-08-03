@@ -56,3 +56,24 @@ A deliberately minimal HTTP listener in the daemon:
 
 Pending: run the option-A spike; adopt option B if the spike fails its
 "unreasonable user setup" bar on either browser.
+
+## Addendum: in-page review verdict (2026-08-03)
+
+The capability URL now renders a minimal review shell rather than returning
+PDF bytes directly. A fixed citation bar asks whether the quarantined file is
+the requested work; the PDF remains available at the capability-bound
+`/p/<token>/file` sibling with the original inline, range, and no-store
+semantics.
+
+Accept and reject may be recorded from that bar through
+`POST /p/<token>/verdict`. This is not a parallel review API: the handler calls
+the same revision-and-SHA-bound `ResolveReviewCAS` transition as the extension
+inbox, and a capability permits only one decisive verdict. The token remains
+the sole capability; the listener remains literal IPv4 loopback with exact
+Host validation, no cookies or CORS, and neither the shell nor its assets
+expose the quarantine path. The script is capability-bound and served
+separately under a restrictive CSP.
+
+This narrowly supersedes Option B's GET/HEAD-only and native-messaging-only
+verdict constraints. It does not create sessions, a general JSON API, or a
+daemon web application, so the scope-creep tripwire remains in force.

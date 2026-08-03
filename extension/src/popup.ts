@@ -814,6 +814,7 @@ export function renderInstitutionSession(
   const signIn = doc.getElementById("institution-session-signin");
   const legacyRow = doc.querySelector<HTMLElement>("#institution-session .institution-session-row");
   const rowsContainer = doc.getElementById("institution-session-rows");
+  const waiting = doc.getElementById("institution-session-waiting");
   const notice = doc.getElementById("institution-session-unblocked");
   if (
     !(card instanceof HTMLElement) ||
@@ -824,8 +825,14 @@ export function renderInstitutionSession(
   ) {
     return;
   }
-  card.hidden = state === undefined;
+  card.dataset.hasSession = state === undefined ? "false" : "true";
+  card.hidden = state === undefined && waiting?.hidden !== false;
   if (state === undefined) {
+    if (legacyRow instanceof HTMLElement) legacyRow.hidden = true;
+    origin.textContent = "";
+    status.textContent = "";
+    signIn.hidden = true;
+    signIn.disabled = true;
     rowsContainer?.replaceChildren();
     if (rowsContainer instanceof HTMLElement) rowsContainer.hidden = true;
     clearSessionNoticeTimers();
@@ -918,6 +925,65 @@ function handoffPaperLabel(job: ActiveJob): string {
   return doi || job.job_id;
 }
 
+function renderWaitingOnSignIn(
+  doc: Document,
+  jobs: readonly ActiveJob[],
+  onFocus: (jobID: string) => Promise<void>,
+): void {
+  const card = doc.getElementById("institution-session");
+  const waiting = doc.getElementById("institution-session-waiting");
+  const list = doc.getElementById("institution-session-waiting-list");
+  if (
+    !(card instanceof HTMLElement) ||
+    !(waiting instanceof HTMLElement) ||
+    !(list instanceof HTMLElement)
+  ) {
+    return;
+  }
+
+  list.replaceChildren();
+  waiting.hidden = jobs.length === 0;
+  if (jobs.length === 0) {
+    if (card.dataset.hasSession !== "true") card.hidden = true;
+    return;
+  }
+  card.hidden = false;
+  if (card.dataset.hasSession !== "true") {
+    const legacyRow = card.querySelector<HTMLElement>(".institution-session-row");
+    const rows = doc.getElementById("institution-session-rows");
+    if (legacyRow instanceof HTMLElement) legacyRow.hidden = true;
+    if (rows instanceof HTMLElement) rows.hidden = true;
+  }
+
+  for (const job of jobs) {
+    const row = doc.createElement("div");
+    row.className = "action-row institution-session-waiting-row";
+    const paper = doc.createElement("p");
+    paper.className = "institution-session-waiting-title";
+    paper.textContent = handoffPaperLabel(job);
+    const button = doc.createElement("button");
+    button.className = "ghost";
+    button.type = "button";
+    button.textContent = "Focus";
+    button.addEventListener("click", () => {
+      button.disabled = true;
+      button.textContent = "Focusing…";
+      void onFocus(job.job_id).then(
+        () => {
+          button.disabled = false;
+          button.textContent = "Focus";
+        },
+        () => {
+          button.disabled = false;
+          button.textContent = "Try again";
+        },
+      );
+    });
+    row.append(paper, button);
+    list.append(row);
+  }
+}
+
 /** Render the durable browser actions that cannot safely be completed from the
  * service worker: institutional sign-in and granting provider access in Options. */
 export function renderNeedsAttention(
@@ -941,7 +1007,10 @@ export function renderNeedsAttention(
   ) {
     return;
   }
-  const pending = jobs.filter((job) => job.status === "auth_pending");
+  const pending = jobs.filter(
+    (job) => job.status === "auth_pending" && job.challenge_blocked !== true,
+  );
+  renderWaitingOnSignIn(doc, pending, onFocus);
   const challengeJobs = jobs.filter(
     (job) =>
       job.challenge_blocked === true &&
@@ -955,23 +1024,19 @@ export function renderNeedsAttention(
   const stalled = [
     ...new Set(authStalledJobs.filter((jobID) => typeof jobID === "string" && jobID.length > 0)),
   ];
-  section.hidden =
-    pending.length === 0 && challengeJobs.length === 0 && blocked.length === 0 && stalled.length === 0;
+  section.hidden = challengeJobs.length === 0 && blocked.length === 0 && stalled.length === 0;
   list.replaceChildren();
   if (section.hidden) return;
 
   if (challengeJobs.length > 0) {
     heading.textContent = "Security check needs you";
     message.textContent = "Solve it in the open tab — papio resumes automatically.";
-  } else if (pending.length > 0 && blocked.length > 0) {
+  } else if (stalled.length > 0 && blocked.length > 0) {
     heading.textContent = "Needs your attention";
-    message.textContent = "Sign in and allow provider access below.";
-  } else if (stalled.length > 0 && pending.length === 0 && blocked.length === 0) {
+    message.textContent = "Sign in again and allow provider access below.";
+  } else if (stalled.length > 0) {
     heading.textContent = "Sign in, then retry";
     message.textContent = "Sign-in didn't stick — retry these papers.";
-  } else if (pending.length > 0) {
-    heading.textContent = "Sign in to continue";
-    message.textContent = "";
   } else {
     heading.textContent = "Allow provider access";
     message.textContent = "Enable these sources in Options, or use Grant all sources.";
@@ -1012,33 +1077,6 @@ export function renderNeedsAttention(
     list.append(row);
   }
 
-  for (const job of pending) {
-    const row = doc.createElement("div");
-    row.className = "needs-you-item";
-    const paper = doc.createElement("p");
-    paper.className = "needs-you-paper";
-    paper.textContent = handoffPaperLabel(job);
-    const button = doc.createElement("button");
-    button.className = "ghost";
-    button.type = "button";
-    button.textContent = "Focus";
-    button.addEventListener("click", () => {
-      button.disabled = true;
-      button.textContent = "Focusing…";
-      void onFocus(job.job_id).then(
-        () => {
-          button.disabled = false;
-          button.textContent = "Focus";
-        },
-        () => {
-          button.disabled = false;
-          button.textContent = "Try again";
-        },
-      );
-    });
-    row.append(paper, button);
-    list.append(row);
-  }
 
   for (const jobID of stalled) {
     const row = doc.createElement("div");
@@ -1207,9 +1245,6 @@ function deliveryStatusText(delivery: PendingDelivery | undefined): string {
   return "";
 }
 
-function shortJobID(jobID: string): string {
-  return jobID.length > 12 ? jobID.slice(0, 12) : jobID;
-}
 const POPUP_REFRESH_INTERVAL_MS = 5_000;
 const STALL_THRESHOLD_MS = 10 * 60_000;
 
@@ -1377,7 +1412,7 @@ function wireLiveAction(
       (error: unknown) => {
         button.disabled = false;
         button.textContent = "Try again";
-        const status = button.closest(".launcher-action")?.querySelector<HTMLElement>(".page-acquire-live-status");
+        const status = button.closest("#page-acquire")?.querySelector<HTMLElement>(".page-acquire-live-status");
         if (status !== null && status !== undefined) {
           status.textContent = error instanceof Error ? error.message : "Could not open the requested papio page";
         }
@@ -1512,6 +1547,24 @@ async function readDeliveryFeedback(fallback: PendingDelivery | undefined): Prom
   return fallback;
 }
 
+function setAcquireButton(
+  button: HTMLButtonElement,
+  label: string,
+  disabled: boolean,
+  hidden = false,
+): void {
+  button.title = label;
+  button.setAttribute("aria-label", label);
+  button.setAttribute("aria-disabled", String(disabled));
+  button.disabled = disabled;
+  button.hidden = hidden;
+}
+
+function showAcquireFeedback(section: HTMLElement, status: HTMLElement, text: string): void {
+  status.textContent = text;
+  section.hidden = false;
+}
+
 /** Render a page-aware acquisition launcher. It remains available while the
  * daemon is down so its established error path stays actionable. */
 export function renderPageAcquire(
@@ -1519,56 +1572,79 @@ export function renderPageAcquire(
   onAcquire: () => Promise<PageAcquireResponse> = acquireCurrentPage,
   onSendPDF: () => Promise<PageAcquireResponse> = sendCurrentPDF,
 ): void {
+  const section = doc.getElementById("page-acquire");
   const button = doc.getElementById("page-acquire-btn");
   const status = doc.getElementById("page-acquire-status");
-  if (!(button instanceof HTMLButtonElement) || !status) return;
+  if (
+    !(section instanceof HTMLElement) ||
+    !(button instanceof HTMLButtonElement) ||
+    !(status instanceof HTMLElement)
+  ) {
+    return;
+  }
   if (button.dataset.wired) return;
   button.dataset.wired = "1";
-  let noDOIFound = false;
   let queued = false;
   let deliveryPending = false;
   button.addEventListener("click", () => {
     const isPDF = button.dataset.mode === "pdf";
-    button.disabled = true;
-    button.textContent = isPDF ? "Sending…" : "Acquiring…";
-    status.textContent = isPDF ? "Sending PDF to papio…" : "Acquiring…";
+    setAcquireButton(button, isPDF ? "Sending PDF to papio…" : "Acquiring this page…", true);
+    showAcquireFeedback(section, status, isPDF ? "Sending PDF to papio…" : "Acquiring…");
     void (isPDF ? onSendPDF() : onAcquire()).then(
       (response) => {
         if (isPDF) {
           const state = response.state;
           deliveryPending = state === "sending" || state === "downloaded";
-          button.textContent = deliveryPending
+          const label = deliveryPending
             ? response.duplicate === true
-              ? "Send PDF for the existing job"
-              : "Sent to papio"
-            : "Send PDF to papio";
-          status.textContent =
+              ? "Sending PDF for the existing job"
+              : "PDF sent to papio"
+            : "Send this PDF to papio";
+          setAcquireButton(button, label, deliveryPending);
+          showAcquireFeedback(
+            section,
+            status,
             state === "sending"
               ? response.duplicate === true
                 ? "Sending PDF for the existing job"
                 : "Sending PDF to papio…"
               : state === "downloaded"
                 ? "papio adopted v (validating)"
-                : responseErrorMessage(response) || response.message || "PDF delivery did not start.";
+                : responseErrorMessage(response) || response.message || "PDF delivery did not start.",
+          );
           return;
         }
-        noDOIFound = responseErrorMessage(response) === NO_DOI_FOUND;
         queued = typeof response.job_id === "string" && response.job_id.length > 0;
-        button.textContent = queued
+        const label = queued
           ? response.duplicate === true
             ? "Already queued"
             : "Queued"
-          : "Acquire this page";
-        status.textContent = pageAcquireStatus(response);
+          : button.dataset.idleLabel ?? "Acquire this page";
+        setAcquireButton(button, label, queued);
+        showAcquireFeedback(section, status, pageAcquireStatus(response));
       },
       (error: unknown) => {
         queued = false;
         deliveryPending = false;
-        button.textContent = isPDF ? "Send PDF to papio" : "Acquire this page";
-        status.textContent = error instanceof Error ? error.message : isPDF ? "Could not send PDF to papio" : "Could not acquire this page";
+        setAcquireButton(
+          button,
+          isPDF ? "Send this PDF to papio" : button.dataset.idleLabel ?? "Acquire this page",
+          false,
+        );
+        showAcquireFeedback(
+          section,
+          status,
+          error instanceof Error
+            ? error.message
+            : isPDF
+              ? "Could not send PDF to papio"
+              : "Could not acquire this page",
+        );
       },
     ).finally(() => {
-      button.disabled = isPDF ? deliveryPending : noDOIFound || queued;
+      const disabled = isPDF ? deliveryPending : queued;
+      button.disabled = disabled;
+      button.setAttribute("aria-disabled", String(disabled));
     });
   });
 }
@@ -1593,22 +1669,19 @@ export function renderPageContext(
   liveActions: PopupLiveActions = {},
 ): void {
   const section = doc.getElementById("page-acquire");
-  const detected = doc.getElementById("page-acquire-doi");
-  const state = doc.getElementById("page-acquire-context");
   const status = doc.getElementById("page-acquire-status");
   const button = doc.getElementById("page-acquire-btn");
   const liveCard = doc.getElementById("page-acquire-live");
   if (
     !(section instanceof HTMLElement) ||
-    !detected ||
-    !state ||
-    !status ||
+    !(status instanceof HTMLElement) ||
     !(button instanceof HTMLButtonElement)
   ) {
     return;
   }
   if (liveCard instanceof HTMLElement) liveCard.hidden = true;
-  section.hidden = false;
+  section.hidden = true;
+  status.textContent = "";
   const kind = page?.kind ?? (page ? classifyPage(page.url, page.doi ? { doi: page.doi } : {}).kind : "none");
   if (kind === "pdf") {
     const knownJob =
@@ -1622,53 +1695,41 @@ export function renderPageContext(
     const deliveryMatchesURL =
       currentPDFURL !== undefined && pendingPDFURL !== undefined && currentPDFURL === pendingPDFURL;
     const delivery = deliveryMatchesJob || deliveryMatchesURL ? pendingDelivery : undefined;
-    detected.textContent = "";
-    detected.hidden = true;
-    state.textContent = "";
-    status.textContent = deliveryStatusText(delivery);
     button.dataset.mode = "pdf";
-    button.hidden = false;
-    button.textContent = `Send PDF to papio${knownJob ? ` (job ${shortJobID(knownJob.job_id)})` : ""}`;
-    button.disabled = delivery?.status === "sending" || delivery?.status === "downloaded";
+    button.dataset.idleLabel = "Send this PDF to papio";
+    const disabled = delivery?.status === "sending" || delivery?.status === "downloaded";
+    setAcquireButton(button, "Send this PDF to papio", disabled);
+    if (knownJob !== undefined) {
+      renderLiveAcquisition(doc, knownJob, activityEntries, delivery, liveActions);
+      section.hidden = false;
+    } else {
+      const deliveryStatus = deliveryStatusText(delivery);
+      if (deliveryStatus !== "") showAcquireFeedback(section, status, deliveryStatus);
+    }
     return;
   }
   if (!page?.doi) {
-    // No paper, no card: an announcement of absence is dead popup space.
-    section.hidden = true;
-    detected.textContent = "";
-    detected.hidden = true;
-    state.textContent = "";
-    status.textContent = "";
     button.dataset.mode = "doi";
-    button.textContent = "Acquire this page";
-    button.disabled = true;
-    button.hidden = true;
+    button.dataset.idleLabel = "Acquire this page";
+    setAcquireButton(button, "Acquire this page", true, true);
     return;
   }
-  detected.textContent = "";
-  detected.hidden = true;
-  status.textContent = "";
+
   button.dataset.mode = "doi";
   const normalizedDOI = page.doi.trim().toLowerCase().replace(/^doi:\s*/, "");
+  const idleLabel = `Acquire this page · ${normalizedDOI}`;
+  button.dataset.idleLabel = idleLabel;
   const inFlightJob = jobs.find(
     (job) => job.expected?.doi?.trim().toLowerCase().replace(/^doi:\s*/, "") === normalizedDOI,
   );
   if (inFlightJob === undefined) {
-    button.hidden = false;
-    button.textContent = "Acquire this page";
-    button.disabled = false;
-    state.textContent = "";
+    setAcquireButton(button, idleLabel, false);
     return;
   }
 
-  // A duplicate/page_acquire-dup is not a reason to leave a disabled,
-  // unexplained button in the popup. The activity card is refreshed with the
-  // same job-id filter on each popup poll and always carries an age.
-  state.textContent = "";
-  button.hidden = true;
-  button.disabled = true;
-  button.textContent = "Acquire this page";
+  setAcquireButton(button, `Acquisition in progress · ${normalizedDOI}`, true);
   renderLiveAcquisition(doc, inFlightJob, activityEntries, pendingDelivery, liveActions);
+  section.hidden = false;
 }
 
 let popupActivity: ActivityEntryPayload[] = [];

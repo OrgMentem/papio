@@ -315,7 +315,7 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 		updates = update.New(cfg.DataDir)
 	}
 
-	previewServer := preview.New()
+	previewServer := preview.New(jobs)
 
 	system := &System{
 		Config: cfg, Store: db, Jobs: jobs, Artifacts: artifacts, Captures: captureStore, Budgets: budgets,

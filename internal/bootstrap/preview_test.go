@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"papio/internal/config"
+	"papio/internal/preview"
 )
 
 func TestSystemWiresAndClosesPreviewServer(t *testing.T) {
@@ -36,7 +37,10 @@ func TestSystemWiresAndClosesPreviewServer(t *testing.T) {
 		t.Fatal(err)
 	}
 	sum := sha256.Sum256(pdf)
-	capabilityURL, err := system.Preview.Issue(1, path, hex.EncodeToString(sum[:]), int64(len(pdf)), time.Minute)
+	capabilityURL, err := system.Preview.Issue(preview.IssueInput{
+		ActionID: 1, Path: path, SHA256: hex.EncodeToString(sum[:]), Size: int64(len(pdf)),
+		ExpectedRevision: 1, TTL: time.Minute,
+	})
 	if err != nil {
 		_ = system.Close()
 		t.Fatal(err)

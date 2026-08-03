@@ -60,20 +60,23 @@ function job(overrides: Partial<ActiveJob> = {}): ActiveJob {
   };
 }
 
-test("renders the acquisition card, header inbox launcher, and no redundant headings", () => {
+test("places the acquire icon before inbox and keeps idle feedback hidden", () => {
   const doc = popupDocument();
   const launcher = doc.querySelector(".launcher");
+  const headerActions = doc.querySelector(".header-actions");
 
   expect(doc.querySelector("h1")).toBeNull();
-  expect(launcher?.querySelectorAll(".launcher-action")).toHaveLength(1);
+  expect(launcher?.querySelectorAll(".launcher-action")).toHaveLength(0);
   expect(launcher?.querySelector("h2")).toBeNull();
-  expect(doc.getElementById("page-acquire-btn")?.textContent).toBe("Acquire this page");
-  expect(doc.getElementById("page-acquire-doi")?.textContent).toBe("Detecting paper…");
   expect(doc.getElementById("page-acquire")?.hidden).toBe(true);
+  expect(doc.getElementById("page-acquire-doi")).toBeNull();
+  expect(doc.getElementById("page-acquire-context")).toBeNull();
+  expect(headerActions?.children[0]?.id).toBe("page-acquire-btn");
+  expect(headerActions?.children[1]?.id).toBe("open-inbox-btn");
+  expect(doc.getElementById("page-acquire-btn")?.closest("header")).not.toBeNull();
+  expect(doc.getElementById("page-acquire-btn")?.querySelector("svg")).not.toBeNull();
   expect(doc.getElementById("page-acquire-btn")?.hidden).toBe(true);
   expect(doc.getElementById("daemon-footer")).toBeNull();
-  // The inbox launcher lives in the header as an icon button, labelled for AT.
-  expect(doc.getElementById("open-inbox-btn")?.closest("header")).not.toBeNull();
   expect(doc.getElementById("open-inbox-btn")?.getAttribute("aria-label")).toBe("Open inbox");
   expect(doc.getElementById("needs-you-section")).not.toBeNull();
   expect(doc.getElementById("needs-you-section")?.hidden).toBe(true);
@@ -157,7 +160,7 @@ test("renders actionable daemon problems without routine version diagnostics", (
   expect(doc.getElementById("daemon-footer")).toBeNull();
 });
 
-test("keeps acquisition available with a detected DOI even without a negotiated daemon", async () => {
+test("shows the DOI acquire icon with its tooltip even without a negotiated daemon", async () => {
   const doc = popupDocument();
   let calls = 0;
   renderPageAcquire(doc, async () => {
@@ -168,15 +171,18 @@ test("keeps acquisition available with a detected DOI even without a negotiated 
 
   const section = doc.getElementById("page-acquire");
   const button = doc.getElementById("page-acquire-btn") as HTMLButtonElement;
-  expect(section?.hidden).toBe(false);
+  expect(section?.hidden).toBe(true);
   expect(button.disabled).toBe(false);
   expect(button.hidden).toBe(false);
-  expect(doc.getElementById("page-acquire-doi")?.hidden).toBe(true);
+  expect(button.title).toBe("Acquire this page · 10.1000/example");
+  expect(button.getAttribute("aria-label")).toBe("Acquire this page · 10.1000/example");
+  expect(button.getAttribute("aria-disabled")).toBe("false");
   button.click();
   await Promise.resolve();
   await Promise.resolve();
   expect(calls).toBe(1);
   expect(button.disabled).toBe(false);
+  expect(section?.hidden).toBe(false);
   expect(doc.getElementById("page-acquire-status")?.textContent).toBe("papio daemon isn't reachable");
 });
 
@@ -191,11 +197,12 @@ test("keeps a successfully queued acquisition disabled", async () => {
   await Promise.resolve();
 
   expect(button.disabled).toBe(true);
-  expect(button.textContent).toBe("Queued");
+  expect(button.title).toBe("Queued");
+  expect(button.getAttribute("aria-disabled")).toBe("true");
   expect(doc.getElementById("page-acquire-status")?.textContent).toBe("Queued: job_page_acquire_001");
 });
 
-test("shows only the no-paper message when the current page has no DOI", () => {
+test("hides the header acquire action when the current page has no paper", () => {
   const doc = popupDocument();
   let calls = 0;
   renderPageAcquire(doc, async () => {
@@ -207,13 +214,13 @@ test("shows only the no-paper message when the current page has no DOI", () => {
   const button = doc.getElementById("page-acquire-btn") as HTMLButtonElement;
   expect(button.disabled).toBe(true);
   expect(button.hidden).toBe(true);
-  expect(doc.getElementById("page-acquire")?.hasAttribute("hidden")).toBe(true);
-  expect(doc.getElementById("page-acquire-doi")?.textContent).toBe("");
+  expect(button.getAttribute("aria-disabled")).toBe("true");
+  expect(doc.getElementById("page-acquire")?.hidden).toBe(true);
   button.click();
   expect(calls).toBe(0);
 });
 
-test("renders the send-PDF action with a short known job id", () => {
+test("shows the PDF acquire icon with the PDF tooltip", () => {
   const doc = popupDocument();
   renderPageAcquire(doc, async () => ({ error: "unused" }), async () => ({ state: "sending", job_id: "job_1234567890abcdef" }));
   renderPageContext(
@@ -222,7 +229,9 @@ test("renders the send-PDF action with a short known job id", () => {
     [job({ job_id: "job_1234567890abcdef", tab_id: 17 })],
   );
   const button = doc.getElementById("page-acquire-btn") as HTMLButtonElement;
-  expect(button.textContent).toBe("Send PDF to papio (job job_12345678)");
+  expect(button.hidden).toBe(false);
+  expect(button.title).toBe("Send this PDF to papio");
+  expect(button.getAttribute("aria-label")).toBe("Send this PDF to papio");
   expect(button.disabled).toBe(false);
   button.click();
 });
@@ -275,10 +284,11 @@ test("renders a live, honest status card for a local in-flight acquisition", () 
     },
   );
 
-  expect(doc.getElementById("page-acquire-doi")?.hidden).toBe(true);
-  expect(doc.getElementById("page-acquire-context")?.textContent).toBe("");
   const button = doc.getElementById("page-acquire-btn") as HTMLButtonElement;
-  expect(button.hidden).toBe(true);
+  expect(button.hidden).toBe(false);
+  expect(button.disabled).toBe(true);
+  expect(button.getAttribute("aria-disabled")).toBe("true");
+  expect(doc.getElementById("page-acquire")?.hidden).toBe(false);
   expect(doc.getElementById("page-acquire-live")?.hidden).toBe(false);
   expect(doc.getElementById("page-acquire-live-title")?.textContent).toBe("A paper in progress");
   expect(doc.getElementById("page-acquire-live-status")?.textContent).toContain("No progress for 11m");
@@ -292,7 +302,7 @@ test("renders a live, honest status card for a local in-flight acquisition", () 
   expect(openedTab).toBe(1);
 });
 
-test("lists an institutional sign-in by paper title and focuses its existing handoff", async () => {
+test("merges auth-pending paper rows into the institution session card", async () => {
   const doc = popupDocument();
   const requests: unknown[] = [];
   Object.assign(globalThis, {
@@ -313,16 +323,27 @@ test("lists an institutional sign-in by paper title and focuses its existing han
     }),
   ]);
 
-  const section = doc.getElementById("needs-you-section");
-  expect(section?.hidden).toBe(false);
-  expect(section?.querySelector(".needs-you-paper")?.textContent).toBe("A paper awaiting institutional access");
-  const button = section?.querySelector("button") as HTMLButtonElement;
+  const session = doc.getElementById("institution-session");
+  const waiting = doc.getElementById("institution-session-waiting");
+  expect(session?.hidden).toBe(false);
+  expect(waiting?.hidden).toBe(false);
+  expect(doc.getElementById("institution-session-waiting-heading")?.textContent).toBe(
+    "Waiting on your sign-in",
+  );
+  expect(waiting?.querySelector(".institution-session-waiting-title")?.textContent).toBe(
+    "A paper awaiting institutional access",
+  );
+  expect(doc.getElementById("needs-you-section")?.hidden).toBe(true);
+  const button = waiting?.querySelector("button") as HTMLButtonElement;
   expect(button.textContent).toBe("Focus");
   button.click();
   await Promise.resolve();
   await Promise.resolve();
   expect(requests).toEqual([{ type: OPEN_HANDOFF_MESSAGE, request: { job_id: "job-1" } }]);
   expect(button.textContent).toBe("Focus");
+  renderNeedsAttention(doc, []);
+  expect(waiting?.hidden).toBe(true);
+  expect(session?.hidden).toBe(true);
 });
 
 test("uses a DOI then job id when an awaiting sign-in has no paper title", () => {
@@ -337,7 +358,9 @@ test("uses a DOI then job id when an awaiting sign-in has no paper title", () =>
     async () => {},
   );
 
-  const labels = Array.from(doc.querySelectorAll(".needs-you-paper")).map((paper) => paper.textContent);
+  const labels = Array.from(doc.querySelectorAll(".institution-session-waiting-title")).map(
+    (paper) => paper.textContent,
+  );
   expect(labels).toEqual(["10.1000/fallback", "job-without-identity"]);
 });
 test("surfaces a blocked security check with a go-to-tab action", async () => {
@@ -345,7 +368,7 @@ test("surfaces a blocked security check with a go-to-tab action", async () => {
   const focused: string[] = [];
   renderNeedsAttention(
     doc,
-    [job({ job_id: "job-challenge", challenge_blocked: true, challenge_host: "ScienceDirect.com" })],
+    [job({ job_id: "job-challenge", status: "auth_pending", challenge_blocked: true, challenge_host: "ScienceDirect.com" })],
     [],
     async (jobID) => {
       focused.push(jobID);
@@ -354,6 +377,7 @@ test("surfaces a blocked security check with a go-to-tab action", async () => {
 
   const section = doc.getElementById("needs-you-section");
   expect(section?.hidden).toBe(false);
+  expect(doc.getElementById("institution-session-waiting")?.hidden).toBe(true);
   expect(doc.getElementById("needs-you-heading")?.textContent).toBe("Security check needs you");
   expect(section?.querySelector(".needs-you-paper")?.textContent).toBe(
     "Security check needs you - sciencedirect.com",
@@ -441,6 +465,15 @@ test("renderImpactSummary fills the impact card with real values", () => {
   expect(doc.getElementById("impact-acquired")?.textContent).toBe("42");
   expect(doc.getElementById("impact-time-saved")?.textContent).toBe("3.5 h");
   expect(doc.getElementById("impact-success-rate")?.textContent).toBe("75%");
+});
+
+test("keeps the impact title and history link in one header row", () => {
+  const doc = popupDocument();
+  const header = doc.getElementById("impact-header");
+  expect(header?.classList.contains("impact-header")).toBe(true);
+  expect(header?.querySelector("h2")?.textContent).toBe("Your papio impact");
+  expect(doc.getElementById("view-history-btn")?.parentElement).toBe(header);
+  expect(doc.getElementById("impact-summary")?.querySelector(":scope > #view-history-btn")).toBeNull();
 });
 
 test("renderImpactSummary hides the impact card when stats are unavailable", () => {

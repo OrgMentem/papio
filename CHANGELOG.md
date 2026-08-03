@@ -13,6 +13,12 @@ execution records in `notes/acquisition-stack-plan.md`.
 
 ### Added
 
+- **Quarantined PDF previews now include the decision at the point of
+  inspection.** The loopback capability URL renders a citation-aware review
+  bar above the PDF and records accept or reject through the same durable,
+  revision-and-SHA-bound review transition used by the browser inbox. PDF
+  bytes remain capability-bound at the `/file` sibling, and each preview
+  capability permits only one decisive verdict.
 - **`papio activity` exposes the daemon's recent operator activity.** The new
   `activity.list` RPC and CLI command show a bounded, newest-first view of the
   durable events table, with `--limit`, optional `--job` filtering, and the

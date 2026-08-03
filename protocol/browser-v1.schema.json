@@ -412,7 +412,7 @@
             "required": ["host", "scenario", "encoding", "bytes", "body"],
             "properties": {
               "host": { "type": "string", "pattern": "^[a-z0-9.-]{3,253}$" },
-              "scenario": { "enum": ["observed", "success", "login-return", "no-entitlement", "drift"] },
+              "scenario": { "enum": ["observed", "success", "login-return", "no-entitlement", "drift", "terms"] },
               "adapter_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$" },
               "adapter_version": { "type": "string", "maxLength": 50 },
               "encoding": { "const": "gzip+base64" },

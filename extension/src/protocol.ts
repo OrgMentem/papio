@@ -77,7 +77,7 @@ export interface PageAcquireAckPayload {
 
 export interface PageCapturePayload {
   host: string;
-  scenario: "observed" | "success" | "login-return" | "no-entitlement" | "drift";
+  scenario: "observed" | "success" | "login-return" | "no-entitlement" | "drift" | "terms";
   adapter_id?: string;
   adapter_version?: string;
   encoding: "gzip+base64";
@@ -777,7 +777,7 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
       const host = str(p, "host", "page_capture", 253);
       if (!HOST_RE.test(host)) fail("page_capture.host must be a hostname");
       const scenario = str(p, "scenario", "page_capture", 50);
-      if (!["observed", "success", "login-return", "no-entitlement", "drift"].includes(scenario)) {
+      if (!["observed", "success", "login-return", "no-entitlement", "drift", "terms"].includes(scenario)) {
         fail("page_capture.scenario is invalid");
       }
       if ("adapter_id" in p && !/^[A-Za-z0-9_-]{1,64}$/.test(str(p, "adapter_id", "page_capture", 64))) {

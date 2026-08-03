@@ -321,7 +321,7 @@ func parseCaptureName(name string) (time.Time, string, bool) {
 
 func validScenario(scenario string) bool {
 	switch scenario {
-	case "observed", "success", "login-return", "no-entitlement", "drift":
+	case "observed", "success", "login-return", "no-entitlement", "drift", "terms":
 		return true
 	default:
 		return false

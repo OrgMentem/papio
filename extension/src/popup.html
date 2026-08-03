@@ -254,33 +254,29 @@
         padding: var(--space-3);
       }
 
-      #page-acquire-doi {
-        color: var(--color-ink);
-        font-weight: 700;
-        line-height: 1.35;
-        overflow-wrap: anywhere;
-      }
-
-      .page-acquire-context,
-      .launcher-action > p,
-      .capture-status {
-        color: var(--color-muted);
-        font-size: var(--font-size-small);
-      }
-      .page-acquire-live {
-        background: var(--color-primary-surface);
-        border: 1px solid var(--color-primary-border);
-        border-radius: var(--radius-control);
+      .page-acquire-feedback {
+        background: var(--color-surface);
+        border: 1px solid var(--color-border);
+        border-radius: var(--radius-card);
         display: grid;
         gap: var(--space-2);
-        padding: var(--space-3);
+        padding: var(--space-2) var(--space-3);
+      }
+
+      .page-acquire-live {
+        display: grid;
+        gap: var(--space-2);
       }
 
       .page-acquire-live-title {
         color: var(--color-ink);
+        display: -webkit-box;
         font-size: var(--font-size-body);
         font-weight: 700;
+        overflow: hidden;
         overflow-wrap: anywhere;
+        -webkit-box-orient: vertical;
+        -webkit-line-clamp: 2;
       }
 
       .page-acquire-live-status {
@@ -304,11 +300,6 @@
         flex: 1 1 8rem;
       }
 
-
-      .page-acquire-context {
-        color: var(--color-context);
-      }
-
       .capture-status {
         color: var(--color-context);
         font-weight: 600;
@@ -319,10 +310,6 @@
         display: none;
       }
 
-      .launcher-action > button {
-        min-height: var(--action-height);
-        width: 100%;
-      }
 
       button.primary {
         background: var(--color-primary-solid);
@@ -430,6 +417,35 @@
         display: grid;
         gap: var(--space-1);
         min-width: 0;
+      }
+      .institution-session-waiting {
+        border-top: 1px solid var(--color-border);
+        display: grid;
+        gap: var(--space-2);
+        padding-top: var(--space-2);
+      }
+
+      .institution-session-waiting-heading {
+        color: var(--color-muted);
+        font-size: var(--font-size-label);
+        font-weight: 700;
+        letter-spacing: 0.04em;
+      }
+
+      .institution-session-waiting-list {
+        display: grid;
+        gap: var(--space-2);
+      }
+
+      .institution-session-waiting-title {
+        display: -webkit-box;
+        font-size: var(--font-size-small);
+        font-weight: 600;
+        min-width: 0;
+        overflow: hidden;
+        overflow-wrap: anywhere;
+        -webkit-box-orient: vertical;
+        -webkit-line-clamp: 2;
       }
 
       .institution-session-unblocked {
@@ -599,7 +615,14 @@
         padding: var(--space-3);
       }
 
-      .impact > h2 {
+      .impact-header {
+        align-items: baseline;
+        display: flex;
+        gap: var(--space-2);
+        justify-content: space-between;
+      }
+
+      .impact-header > h2 {
         color: var(--color-muted);
         font-size: var(--font-size-label);
         font-weight: 700;
@@ -627,16 +650,16 @@
         margin: 0;
       }
 
-      .impact > button {
+      .impact-header > button {
         background: transparent;
         border-color: transparent;
         color: var(--color-primary);
         font-weight: 600;
-        justify-self: start;
-        padding-inline: 0;
+        min-height: 0;
+        padding: 0;
       }
 
-      .impact > button:hover:not(:disabled) {
+      .impact-header > button:hover:not(:disabled) {
         background: transparent;
         color: var(--color-primary-solid-hover);
         text-decoration: underline;
@@ -665,6 +688,24 @@
         <span class="brand-name"><em>papio</em></span>
       </div>
       <div class="header-actions">
+        <button
+          id="page-acquire-btn"
+          class="settings-btn"
+          type="button"
+          title="Acquire this page"
+          aria-label="Acquire this page"
+          aria-describedby="page-acquire-status"
+          aria-disabled="true"
+          disabled
+          hidden
+        >
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+            <polyline points="14 2 14 8 20 8"/>
+            <line x1="12" y1="18" x2="12" y2="12"/>
+            <line x1="9" y1="15" x2="15" y2="15"/>
+          </svg>
+        </button>
         <button id="open-inbox-btn" class="settings-btn" type="button" title="Open inbox" aria-label="Open inbox" aria-describedby="open-inbox-status">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/>
@@ -686,10 +727,8 @@
     <div id="open-inbox-status" class="capture-status" aria-live="polite"></div>
     <main>
       <section class="launcher" aria-label="Paper actions">
-        <div id="page-acquire" class="launcher-action" hidden>
-          <p id="page-acquire-doi">Detecting paper…</p>
-          <p id="page-acquire-context" class="page-acquire-context"></p>
-          <div id="page-acquire-status" class="capture-status" aria-live="polite"></div>
+        <div id="page-acquire" class="page-acquire-feedback" hidden>
+          <div id="page-acquire-status" class="capture-status" role="status" aria-live="polite"></div>
           <div id="page-acquire-live" class="page-acquire-live" role="status" aria-live="polite" hidden>
             <p id="page-acquire-live-title" class="page-acquire-live-title" hidden></p>
             <p id="page-acquire-live-status" class="page-acquire-live-status"></p>
@@ -698,14 +737,6 @@
               <button id="page-acquire-go-tab" class="ghost" type="button" hidden>Go to tab</button>
             </div>
           </div>
-          <button
-            id="page-acquire-btn"
-            class="primary"
-            type="button"
-            aria-describedby="page-acquire-context page-acquire-status"
-            disabled
-            hidden
-          >Acquire this page</button>
         </div>
       </section>
 
@@ -719,6 +750,10 @@
           <button id="institution-session-signin" class="primary" type="button" aria-describedby="institution-session-status">Sign in</button>
         </div>
         <div id="institution-session-rows" class="institution-session-rows" hidden></div>
+        <div id="institution-session-waiting" class="institution-session-waiting" hidden>
+          <p id="institution-session-waiting-heading" class="institution-session-waiting-heading">Waiting on your sign-in</p>
+          <div id="institution-session-waiting-list" class="institution-session-waiting-list"></div>
+        </div>
         <div id="institution-session-unblocked" class="institution-session-unblocked" role="status" aria-live="polite" hidden></div>
       </section>
 
@@ -731,13 +766,16 @@
       </section>
 
       <section id="needs-you-section" class="needs-you" hidden aria-labelledby="needs-you-heading">
-        <h2 id="needs-you-heading">Sign in to continue</h2>
-        <p id="needs-you-message">Finish your institutional sign-in to continue these papers.</p>
+        <h2 id="needs-you-heading">Needs your attention</h2>
+        <p id="needs-you-message"></p>
         <div id="needs-you-list" class="needs-you-list"></div>
       </section>
 
       <section id="impact-summary" class="impact" hidden aria-label="Your papio impact">
-        <h2>Your <em>papio</em> impact</h2>
+        <div id="impact-header" class="impact-header">
+          <h2>Your <em>papio</em> impact</h2>
+          <button id="view-history-btn" type="button">View history →</button>
+        </div>
         <dl class="impact-metrics">
           <div class="impact-metric">
             <dt>Papers acquired</dt>
@@ -752,7 +790,6 @@
             <dd id="impact-success-rate">—</dd>
           </div>
         </dl>
-        <button id="view-history-btn" type="button">View history →</button>
       </section>
       <section id="resolver-grant" class="resolver-grant" hidden></section>
 

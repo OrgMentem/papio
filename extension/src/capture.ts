@@ -48,10 +48,11 @@ export type Provider =
   | "bmj"
   | "psychiatryonline"
   | "jamanetwork"
-  | "lww";
+  | "lww"
+  | "informit";
 
 /** Scenarios that the daemon can retain as page-capture fixtures. */
-export type Scenario = "success" | "login-return" | "no-entitlement" | "drift";
+export type Scenario = "success" | "login-return" | "no-entitlement" | "drift" | "terms";
 
 export const PROVIDERS: readonly Provider[] = [
   "proquest",
@@ -76,8 +77,9 @@ export const PROVIDERS: readonly Provider[] = [
   "psychiatryonline",
   "jamanetwork",
   "lww",
+  "informit",
 ];
-export const SCENARIOS: readonly Scenario[] = ["success", "login-return", "no-entitlement", "drift"];
+export const SCENARIOS: readonly Scenario[] = ["success", "login-return", "no-entitlement", "drift", "terms"];
 
 export interface FixtureMeta {
   provider: Provider;

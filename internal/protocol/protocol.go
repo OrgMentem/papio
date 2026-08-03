@@ -1532,7 +1532,7 @@ func (p *PageCapturePayload) validate() error {
 		return fmt.Errorf("page_capture.host must be a bounded hostname")
 	}
 	if err := enumRequired("page_capture.scenario", p.Scenario,
-		"observed", "success", "login-return", "no-entitlement", "drift"); err != nil {
+		"observed", "success", "login-return", "no-entitlement", "drift", "terms"); err != nil {
 		return err
 	}
 	if p.AdapterID != "" && !adapterIDRE.MatchString(p.AdapterID) {

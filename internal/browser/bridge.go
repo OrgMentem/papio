@@ -1259,7 +1259,16 @@ func (b *Bridge) reviewPreview(ctx context.Context, request *protocol.ReviewPrev
 	if err != nil || !info.Mode().IsRegular() {
 		return b.reviewPreviewError(request.RequestID, fmt.Sprintf("review action %d preview is unavailable", request.ActionID))
 	}
-	url, err := b.preview.Issue(action.ID, action.QuarantinePath, action.QuarantineSHA256, info.Size(), previewCapabilityTTL)
+	row, err := b.jobs.Get(ctx, action.JobID)
+	if err != nil {
+		return b.reviewPreviewError(request.RequestID, fmt.Sprintf("review action %d preview is unavailable", request.ActionID))
+	}
+	url, err := b.preview.Issue(preview.IssueInput{
+		ActionID: action.ID, Path: action.QuarantinePath, SHA256: action.QuarantineSHA256, Size: info.Size(),
+		ExpectedRevision: action.Revision,
+		Citation:         preview.Citation{Title: row.Work.Title, Authors: row.Work.Authors, Year: row.Work.Year},
+		TTL:              previewCapabilityTTL,
+	})
 	if err != nil {
 		return b.reviewPreviewError(request.RequestID, "preview could not be issued")
 	}

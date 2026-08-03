@@ -60,7 +60,7 @@ func newBridge(t *testing.T) (*Bridge, *job.Store, config.Config, string) {
 	jobs := &job.Store{S: db}
 	watches := watch.NewStore(db)
 	triageService := triage.New(db, watches, jobs)
-	previewServer := preview.New()
+	previewServer := preview.New(jobs)
 	t.Cleanup(func() {
 		if err := previewServer.Shutdown(context.Background()); err != nil {
 			t.Errorf("close preview: %v", err)

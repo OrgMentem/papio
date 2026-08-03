@@ -88,6 +88,14 @@ for the full pre-split extension history.
 
 ### Changed
 
+- **The popup puts actions where operators look for them.** The current-page
+  acquire action is now a paper-plus icon beside Inbox and leaves behind only
+  live progress or delivery feedback; idle pages no longer consume a card.
+  Papers waiting at institution sign-in sit under the institution session
+  rows instead of in a separate amber card, while security challenges retain
+  their own attention card. The impact heading and history link now share one
+  compact row.
+
 - **Badge precedence is explicit and centralized in the background broker.** A
   broken or disconnected bridge shows `!` first, a blocking permission or
   sign-in state takes the next slot, and the pending triage count is shown only
