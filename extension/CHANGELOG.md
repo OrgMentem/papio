@@ -61,7 +61,10 @@ for the full pre-split extension history.
   never from page scripts, styles, or aggregate text. Earned verdicts stand
   until new evidence replaces them: closing a library tab, opening a fresh
   probe tab, or a service-worker nap no longer resets a warm session to
-  "unknown" (per-origin state now survives worker restarts).
+  "unknown" (per-origin state now survives worker restarts). And because a
+  tab loaded before sign-in keeps rendering signed-out while the browser's
+  cookies are signed in, the probe now checks sibling library tabs too — any
+  tab evidencing a live session outranks one stale render.
 - **papio owns its surfaces — leftover tabs clean themselves up.** Broker tabs
   papio creates are recorded in a durable ledger that survives extension
   reloads. Shortly after startup, ledger-owned leftovers still sitting in the
