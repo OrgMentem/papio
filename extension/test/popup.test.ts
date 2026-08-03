@@ -822,4 +822,6 @@ test("session card matrix propagates marker scan outcomes", () => {
   });
   expect(warm.label).toContain("Session warm");
   expect(warm.detail).toMatch(/via your open library tab · \d{1,2}:\d{2} (am|pm)$/);
+  // A warm session offers no sign-in action — the button is hidden, not dead.
+  expect(warm.action).toBe("none");
 });

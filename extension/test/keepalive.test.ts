@@ -448,6 +448,13 @@ test("JWT identity classifier ignores guests, malformed values, and oversized st
     ["snake case identity", [syntheticJWT({ user_name: "jane", user_group: "STAFF" })], "in"],
     ["malformed segments", ["not.a.jwt!"], "unknown"],
     ["oversized value", ["a".repeat(8 * 1024)], "unknown"],
+    // Anonymous session tokens carry opaque subs on many platforms — a bare
+    // sub without a group claim must NOT read as signed in (cross-institution
+    // safety; only the Ex Libris-style non-guest group disambiguates a sub).
+    ["bare sub, no group claim", [syntheticJWT({ sub: "a81bc81b-dead-4e5d" })], "unknown"],
+    ["sub with non-guest group", [syntheticJWT({ sub: "u123", userGroup: "STAFF" })], "in"],
+    ["sub with empty group", [syntheticJWT({ sub: "u123", userGroup: "" })], "unknown"],
+    ["named user without group claim", [syntheticJWT({ preferred_username: "jane" })], "in"],
   ];
   for (const [name, values, expected] of cases) {
     expect(classifyResolverJWTIdentity(values), name).toBe(expected);

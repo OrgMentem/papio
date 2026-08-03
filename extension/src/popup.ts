@@ -552,7 +552,7 @@ export function deriveSessionCardState(state: PopupSessionState | undefined): Se
     return {
       label: `Session warm · last verified ${formatLastCheck(lastCheckAt)}`,
       detail,
-      action: "signin",
+      action: "none",
     };
   }
   return {
@@ -617,6 +617,7 @@ export function renderInstitutionSession(
   status.textContent = cardState.label;
   origin.textContent = cardState.detail;
   signIn.disabled = cardState.action === "none";
+  signIn.hidden = cardState.action === "none";
   if (!signIn.dataset.wired) {
     signIn.dataset.wired = "1";
     signIn.addEventListener("click", () => {

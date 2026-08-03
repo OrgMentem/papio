@@ -206,20 +206,30 @@ function decodeJWTPayload(raw: string): Record<string, unknown> | undefined {
 }
 
 
-/** Classify JWT-shaped storage values without touching browser state. */
+/** Classify JWT-shaped storage values without touching browser state.
+ *
+ * A bare `sub` claim is NOT identity: anonymous session tokens carry opaque
+ * subs on many platforms. Signed-in requires either a named-user claim, or
+ * an Ex Libris-style explicit group claim that is not GUEST alongside a sub. */
 export function classifyResolverJWTIdentity(values: readonly string[]): "in" | "unknown" {
   for (const value of values) {
     const payload = decodeJWTPayload(value);
     if (payload === undefined) continue;
-    const hasIdentity = ["userName", "user_name", "preferred_username", "sub"].some((claim) => {
+    const named = ["userName", "user_name", "preferred_username", "name", "email"].some((claim) => {
       const identity = payload[claim];
       return (
         (typeof identity === "string" && identity.trim().length > 0) ||
         (typeof identity === "number" && Number.isFinite(identity))
       );
     });
-    const userGroup = payload["userGroup"] ?? payload["user_group"];
-    if (hasIdentity && userGroup !== "GUEST") return "in";
+    const group = payload["userGroup"] ?? payload["user_group"];
+    if (group === "GUEST") continue;
+    if (named) return "in";
+    const sub = payload["sub"];
+    const subPresent =
+      (typeof sub === "string" && sub.trim().length > 0) ||
+      (typeof sub === "number" && Number.isFinite(sub));
+    if (subPresent && typeof group === "string" && group.trim().length > 0) return "in";
   }
   return "unknown";
 }
@@ -318,14 +328,25 @@ export function collectResolverMarkers(): ResolverMarker[] {
         const payload: unknown = JSON.parse(new TextDecoder().decode(bytes));
         if (typeof payload !== "object" || payload === null || Array.isArray(payload)) continue;
         const record = payload as Record<string, unknown>;
-        const hasIdentity = ["userName", "user_name", "preferred_username", "sub"].some((claim) => {
-          const identity = record[claim];
-          return (
-            (typeof identity === "string" && identity.trim().length > 0) ||
-            (typeof identity === "number" && Number.isFinite(identity))
-          );
-        });
-        if (hasIdentity && (record["userGroup"] ?? record["user_group"]) !== "GUEST") return true;
+        const named = ["userName", "user_name", "preferred_username", "name", "email"].some(
+          (claim) => {
+            const identity = record[claim];
+            return (
+              (typeof identity === "string" && identity.trim().length > 0) ||
+              (typeof identity === "number" && Number.isFinite(identity))
+            );
+          },
+        );
+        const group = record["userGroup"] ?? record["user_group"];
+        if (group === "GUEST") continue;
+        if (named) return true;
+        const sub = record["sub"];
+        const subPresent =
+          (typeof sub === "string" && sub.trim().length > 0) ||
+          (typeof sub === "number" && Number.isFinite(sub));
+        if (subPresent && typeof group === "string" && group.trim().length > 0) {
+          return true;
+        }
       } catch {
         // Ordinary storage values and malformed JWTs are not identity evidence.
       }
