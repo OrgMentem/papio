@@ -1089,3 +1089,27 @@ test("an empty watch panel renders without the snapshot's Load more control", as
   expect(page.document.getElementById("watch-panel")?.hidden).toBe(false);
   expect(page.document.getElementById("load-more")?.hidden).toBe(true);
 });
+
+test("watch hits load themselves when the count says they exist", async () => {
+  const first = snapshot([manualAction("action:first", 1, "First page action")], {
+    counts: counts({ pending_total: 2, actions: 1, watch_hits: 1, retractions: 0 }),
+    has_more: true,
+    cursor: "page-2",
+  });
+  const second = snapshot([watchHit("watch:auto", 2, "Automatically loaded hit")], {
+    counts: counts({ pending_total: 2, actions: 1, watch_hits: 1, retractions: 0 }),
+    has_more: false,
+  });
+  const page = await inboxDocument((message) => {
+    if (message.type === "papio.triage.snapshot") {
+      return snapshotReply(message.request["cursor"] === "page-2" ? second : first, message);
+    }
+    return snapshotReply(first, message);
+  });
+  await settle();
+  await settle();
+  // Nobody clicked Load more: the second page arrived on its own and the
+  // watch row renders.
+  expect(page.document.querySelector("[data-triage-item-id='watch:auto']")).not.toBeNull();
+  expect(page.document.getElementById("watch-panel")?.textContent).not.toContain("Loading 1 watch hit");
+});

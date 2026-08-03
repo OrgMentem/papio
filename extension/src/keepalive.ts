@@ -17,6 +17,13 @@ export interface ResolverMarker {
   formAction?: string;
   action?: string;
   storageIdentity?: "in";
+  /** Whether the control is actually rendered for the user. Sign-OUT
+   * affordances legitimately hide inside closed account menus, so hidden
+   * markers may prove "in" — but a signed-out page puts its sign-in prompt
+   * front and center, so only a VISIBLE sign-in affordance may assert "out".
+   * A page whose only sign-in markers are buried in drawer templates (Primo
+   * NDE keeps one there permanently, signed in or not) stays unknown. */
+  visible?: boolean;
 }
 
 export interface KeepaliveTabs {
@@ -293,7 +300,7 @@ export function classifyResolverMarkers(markers: readonly ResolverMarker[]): Ses
       .filter((part): part is string => typeof part === "string")
       .join(" ");
     if (SIGN_OUT_MARKER.test(value)) return "in";
-    if (SIGN_IN_MARKER.test(value)) signIn = true;
+    if (SIGN_IN_MARKER.test(value) && marker.visible !== false) signIn = true;
   }
   if (storageIdentity) return "in";
   return signIn ? "out" : "unknown";
@@ -323,9 +330,11 @@ export function collectResolverMarkers(): ResolverMarker[] {
     // A form's action is a target, not a page-sized text aggregate. Its
     // controls are scanned independently below.
     const text = element.tagName === "FORM" ? "" : controlText(element).trim();
+    const rect = element.getClientRects();
     const marker: ResolverMarker = {
       text: `${text} ${value}`.trim(),
       label: element.getAttribute("aria-label")?.trim() ?? "",
+      visible: rect.length > 0 && element.checkVisibility?.() !== false,
     };
     const href = element.getAttribute("href")?.trim();
     if (href !== undefined && href.length > 0) marker.href = href;
@@ -423,6 +432,9 @@ export function clampKeepaliveInterval(value: unknown): number {
 /** Durable browser-local resolver origin. This is an origin only, never an
  * OpenURL path, query, fragment, or identity-provider URL. */
 export const KEEPALIVE_RESOLVER_ORIGIN_KEY = "keepalive.resolverOrigin";
+/** Per-origin session snapshots survive service-worker naps here: an origin's
+ * warm verdict must not decay to "unknown" just because the worker slept. */
+export const KEEPALIVE_ORIGIN_STATES_KEY = "keepalive.originStates";
 /** Session probes are needed after two minutes without a completed check. */
 export const SESSION_STALE_MS = 2 * 60_000;
 const ON_DEMAND_PROBE_BUDGET_MS = 1_400;
@@ -573,6 +585,36 @@ export class KeepaliveManager {
     const next = { ...current, ...patch, origin: normalized };
     if (clearScanOutcome) delete next.scanOutcome;
     this.originStates.set(normalized, next);
+    this.persistOriginStates();
+  }
+
+  /** Guards the persist path during startup: an early snapshot update must
+   * not overwrite stored evidence before loadPreferences has restored it. */
+  private originStatesRestored = false;
+
+  private persistOriginStates(): void {
+    if (!this.originStatesRestored) return;
+    const save = this.api.storage.set?.({
+      [KEEPALIVE_ORIGIN_STATES_KEY]: [...this.originStates.values()],
+    });
+    if (save !== undefined) void save.catch(() => {});
+  }
+
+  private restoreOriginStates(raw: unknown): void {
+    if (!Array.isArray(raw)) return;
+    for (const entry of raw) {
+      if (typeof entry !== "object" || entry === null) continue;
+      const snapshot = entry as KeepaliveOriginSnapshot;
+      const origin = normalizeHttpsOrigin(snapshot.origin);
+      if (origin === undefined) continue;
+      // A pre-seeded default (no completed check) is not evidence — restored
+      // state wins over it, but never over a live probe's result.
+      const existing = this.originStates.get(origin);
+      if (existing !== undefined && existing.lastCheckAt !== null) continue;
+      // Restored evidence keeps its original timestamps: freshness gates in
+      // the popup decide how much to trust it, never a worker restart.
+      this.originStates.set(origin, { ...snapshot, origin, checking: false });
+    }
   }
 
 
@@ -811,6 +853,7 @@ export class KeepaliveManager {
         "keepalive.interval",
         "keepalive.enabled",
         KEEPALIVE_RESOLVER_ORIGIN_KEY,
+        KEEPALIVE_ORIGIN_STATES_KEY,
       ]);
       storageReadSucceeded = true;
     } catch {
@@ -821,7 +864,9 @@ export class KeepaliveManager {
 
     if (storageReadSucceeded) {
       this.persistedResolverOrigin = normalizeHttpsOrigin(values[KEEPALIVE_RESOLVER_ORIGIN_KEY]);
+      this.restoreOriginStates(values[KEEPALIVE_ORIGIN_STATES_KEY]);
     }
+    this.originStatesRestored = true;
     this.grantedResolverOrigins = [];
     this.grantedResolverOrigin = undefined;
     if (this.api.permissions !== undefined) {
@@ -1073,7 +1118,11 @@ export class KeepaliveManager {
       if (tab.id === undefined) return;
       this.tabID = tab.id;
       this.reauthPaused = false;
-      this.setVerdict("unknown", "none", null);
+      // Opening the probe tab is not evidence of anything: the reset that
+      // lived here erased restored or previously earned session state before
+      // the first inspection could run. A genuinely new origin already sits
+      // at "unknown"; the next completed inspection updates the verdict on
+      // its own authority.
       await this.options.onTabPlaced?.(tab.id);
     } catch {
       // Browser policy may reject background tabs. Observe and try again later.

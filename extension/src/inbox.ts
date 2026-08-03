@@ -1212,13 +1212,12 @@ function render(): void {
     const snapshotWatchItems = state.snapshot.items.filter((item) => item.kind === "watch_hit");
     const daemonWatchTotal = state.counts?.watch_hits ?? snapshotWatchItems.length;
     if (snapshotWatchItems.length === 0 && daemonWatchTotal > 0) {
-      // The daemon holds watch hits the snapshot page hasn't streamed yet:
-      // claiming a clear list while the tab says (5) is a lie. Name the gap
-      // and leave Load more visible to fetch them.
+      // Hits exist daemon-side but the snapshot pages haven't streamed them
+      // yet; autoLoadWatchHits pages forward on its own.
       elements.watchList.append(
         element(
           "p",
-          `${daemonWatchTotal} watch hit${daemonWatchTotal === 1 ? "" : "s"} yet to load — use Load more below.`,
+          `Loading ${daemonWatchTotal} watch hit${daemonWatchTotal === 1 ? "" : "s"}…`,
         ),
       );
     } else if (snapshotWatchItems.length === 0) {
@@ -1349,6 +1348,28 @@ async function refreshInbox(append = false): Promise<void> {
   if (countsResult.ok) state.counts = countsResult.value;
   if (!append) await refreshActivity();
   render();
+  autoLoadWatchHits();
+}
+
+/** Watch hits stream behind actions in the snapshot pages, so the daemon can
+ * know hits exist while none are loaded yet. Nobody should have to click
+ * Load more to see a list the tab already counts — page forward automatically,
+ * bounded so a count/stream disagreement can never loop forever. */
+const AUTO_WATCH_PAGE_LIMIT = 8;
+let autoWatchPagesUsed = 0;
+
+function autoLoadWatchHits(): void {
+  const snapshot = state.snapshot;
+  if (snapshot === null || state.loading || !state.connected) return;
+  const wanted = (state.counts?.watch_hits ?? 0) > 0;
+  const loaded = snapshot.items.some((item) => item.kind === "watch_hit");
+  if (!wanted || loaded) {
+    autoWatchPagesUsed = 0;
+    return;
+  }
+  if (snapshot.has_more !== true || autoWatchPagesUsed >= AUTO_WATCH_PAGE_LIMIT) return;
+  autoWatchPagesUsed += 1;
+  void refreshInbox(true);
 }
 
 // An explicit refresh commits any queued dismissal first: the incoming

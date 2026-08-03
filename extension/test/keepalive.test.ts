@@ -133,6 +133,7 @@ interface HarnessResolver {
   storedOrigin?: unknown;
   grantedOrigins?: string[];
   knownOrigins?: string[];
+  storageValues?: Record<string, unknown>;
 }
 
 function makeHarness(
@@ -162,6 +163,7 @@ function makeHarness(
     "keepalive.interval": interval,
     "keepalive.enabled": true,
     "keepalive.resolverOrigin": resolverConfig?.storedOrigin,
+    ...(resolverConfig?.storageValues ?? {}),
   };
   const latestOpenURL = resolverConfig === undefined ? RESOLVER_OPENURL : resolverConfig.latestOpenURL;
   const resolverMarkers: ResolverMarker[] = [{ text: "Sign out", label: "" }];
@@ -755,4 +757,59 @@ test("granted provider permission patterns never mint institution rows", async (
     "https://onesearch.library.example-college.edu",
     "https://resolver.example.edu",
   ]);
+});
+
+test("hidden sign-in markers never assert signed out; visible ones do", () => {
+  // Primo NDE keeps a sign-in href in a closed drawer permanently — signed in
+  // or not. A hidden prompt is not evidence of a signed-out session.
+  expect(
+    classifyResolverMarkers([
+      { text: "Sign in", label: "", href: "/nde/login", visible: false },
+    ]),
+  ).toBe("unknown");
+  // A signed-out page puts the prompt front and center.
+  expect(
+    classifyResolverMarkers([
+      { text: "Sign in", label: "", href: "/nde/login", visible: true },
+    ]),
+  ).toBe("out");
+  // Markers predating the visibility flag keep their old meaning.
+  expect(classifyResolverMarkers([{ text: "Sign in", label: "" }])).toBe("out");
+  // Sign-out affordances count from inside closed menus, hidden or not.
+  expect(
+    classifyResolverMarkers([
+      { text: "Sign out", label: "", href: "/logout", visible: false },
+      { text: "Sign in", label: "", href: "/nde/login", visible: true },
+    ]),
+  ).toBe("in");
+});
+
+test("per-origin verdicts survive a service-worker restart", async () => {
+  const origin = "https://onesearch.library.example-college.edu";
+  const stored: Record<string, unknown> = {
+    "keepalive.originStates": [
+      {
+        origin,
+        authenticated: true,
+        verdict: "in",
+        probeSource: "live_tab",
+        scanOutcome: "markers",
+        lastVerdictAt: Date.now() - 60_000,
+        checking: true,
+        likelyAuthenticated: false,
+        pausedForReauth: false,
+        lastCheckAt: Date.now() - 60_000,
+      },
+    ],
+  };
+  const h = makeHarness(4, undefined, {
+    knownOrigins: [origin],
+    storageValues: stored,
+  });
+  await h.manager.init();
+  const snapshot = h.manager.getOriginSnapshots().find((s) => s.origin === origin);
+  expect(snapshot?.verdict).toBe("in");
+  expect(snapshot?.authenticated).toBe(true);
+  // Restored evidence is settled state, never a stuck in-flight probe.
+  expect(snapshot?.checking).toBe(false);
 });
