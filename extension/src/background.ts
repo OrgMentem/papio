@@ -1172,7 +1172,11 @@ export class Bridge {
 
   knownResolverOrigins(): readonly string[] {
     const origins = new Set<string>();
-    const candidates = [...(this.store.resolverOrigins ?? []), ...this.offerURLs.values()];
+    // Institutions are the daemon's CONFIG-derived resolver origins from the
+    // hello ack — never offer traffic. OA/direct offers carry provider URLs,
+    // and folding those in turned every provider that ever offered a job into
+    // a phantom "institution" row in the popup session card.
+    const candidates = [...(this.store.resolverOrigins ?? [])];
     for (const candidate of candidates) {
       const origin = this.resolverOriginHint(candidate);
       if (origin !== undefined) origins.add(origin);

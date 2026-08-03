@@ -3351,6 +3351,35 @@ test("session state reports each known resolver and sign-in targets its origin",
   expect(h.tabs.created).toContainEqual({ url: uwaOrigin, active: true });
 });
 
+test("provider and OA offer URLs never mint institution session rows", async () => {
+  const h = makeHarness();
+  const urls = {
+    runtimeID: "papio-test-id",
+    inboxURL: "chrome-extension://papio-test-id/inbox.html",
+    popupURL: "chrome-extension://papio-test-id/popup.html",
+    historyURL: "chrome-extension://papio-test-id/history.html",
+  };
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ resolver_origins: ["https://resolver.example.edu"] }));
+  // Direct/OA offers land on provider hosts; each used to become a phantom
+  // "institution" in the popup session card.
+  await h.port.inbound(jobOffer("job_provider_a", "https://www.sciencedirect.com/science/article/pii/1"));
+  await h.port.inbound(jobOffer("job_provider_b", "https://direct.mit.edu/reco/article/1"));
+
+  expect(h.bridge.knownResolverOrigins()).toEqual(["https://resolver.example.edu"]);
+  await expect(
+    handleInboxRuntimeMessage(
+      h.bridge,
+      { type: "papio.session.state" },
+      { id: urls.runtimeID, url: urls.popupURL },
+      urls,
+    ),
+  ).resolves.toMatchObject({
+    ok: true,
+    origins: [{ origin: "https://resolver.example.edu" }],
+  });
+});
+
 test("session sign-in reports why it cannot open without a resolver", async () => {
   const h = makeHarness();
   const urls = {
