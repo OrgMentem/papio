@@ -23,6 +23,8 @@ import {
   type ActivityEntryPayload,
   type BrowserMessage,
   type BrowserMessageType,
+  type DeliveryRoute,
+  type DeliverySessionEvidence,
   type PageAcquireAckPayload,
   type PageAcquirePayload,
   type PageCapturePayload,
@@ -49,7 +51,7 @@ import {
   HANDOFF_SURFACE_KEY,
   type HandoffSurface,
 } from "./state";
-import { isPDFPage, pdfSourceURL } from "./deliver";
+import { isPDFPage, pdfSourceURL, sanitizePageHost } from "./deliver";
 import {
   adapters,
   interpret,
@@ -59,7 +61,7 @@ import {
 } from "./adapters/types";
 import { observeUnknown, type ObserveChromeApi } from "./observe";
 import { chromeKeepaliveAPI, initKeepalive, isAuthenticationURL } from "./keepalive";
-import type { KeepaliveManager, KeepaliveSnapshot } from "./keepalive";
+import type { KeepaliveManager, KeepaliveProbeSource, KeepaliveSnapshot } from "./keepalive";
 import { routeResolverService, type ResolverRoute } from "./resolver";
 import { detectAuthFailure } from "./authfail";
 
@@ -100,11 +102,16 @@ const TRIAGE_REQUEST_TIMEOUT_MS = 15_000;
 const HELLO_WAIT_TIMEOUT_MS = 5_000;
 const TRIAGE_SNAPSHOT_FEATURE = "triage_snapshot_v1";
 const TRIAGE_SNAPSHOT_SCHEMA_2_FEATURE = "triage_snapshot_schema_v2";
+const TRIAGE_COUNTS_SCHEMA_2_FEATURE = "triage_counts_schema_v2";
+const SESSION_EVIDENCE_FEATURE = "session_evidence_v1";
+const DELIVERY_CONTEXT_FEATURE = "delivery_context_v1";
 const TRIAGE_MUTATIONS_FEATURE = "triage_mutations_v1";
 const REVIEW_PREVIEW_FEATURE = "review_preview_v1";
 const STATS_FEATURE = "browser_stats_v1";
 const ACTIVITY_FEED_FEATURE = "activity_feed_v1";
 const PAGE_CAPTURE_FEATURE = "page_capture_v1";
+const TRIAGE_COUNTS_FRESH_MS = 3 * KEEPALIVE_ALARM_MINUTES * 60_000;
+const SESSION_EVIDENCE_THROTTLE_MS = 60_000;
 /** Daemon replies that settle a correlated `requestNative` call. `requestNative`
  * rejects any type outside this set before registering a wait, so wrappers and
  * variables cannot create a request that only fails later by timing out. */
@@ -491,6 +498,10 @@ interface DownloadTrack {
   directOffer: boolean;
   /** True for an operator's explicit "Send PDF to papio" action. */
   delivery?: boolean;
+  /** Route observed before the completed download. */
+  route?: DeliveryRoute;
+  /** Session evidence available to the same browser drive. */
+  sessionEvidence?: DeliverySessionEvidence;
 }
 
 interface StalledAuthHandoff {
@@ -874,6 +885,10 @@ export class Bridge {
   private readonly resolverNoEntitlementSent = new Set<string>();
   /** Authentication observed during this service-worker lifetime. */
   private authReturnedThisWorker = false;
+  /** Route traversal evidence observed for each active handoff. */
+  private readonly resolverRoutes = new Set<string>();
+  /** Per-job auth evidence used for the next completed browser delivery. */
+  private readonly deliverySessionEvidence = new Map<string, DeliverySessionEvidence>();
   /** A completed OA landing can release only OA concurrency queues; it is never
    * evidence that an institutional SSO session exists. */
   private openAccessLandingObserved = false;
@@ -941,10 +956,22 @@ export class Bridge {
   private requestIDSequence = 0;
   /** Best-effort display cache only, refreshed from daemon counts or snapshots. */
   private triagePendingCount: number | undefined;
+  /** Durable institutional demand from the most recent negotiated counts poll. */
+  private triageActionsRequiresAuth: number | undefined;
+  private triageActionsRequiresAuthAt: number | undefined;
+  private sessionEvidenceSentAt: number | undefined;
 
   constructor(private readonly deps: BridgeDeps) {}
   trackedJobCount(): number {
     return this.store.activeJobs.length;
+  }
+
+  warmDemand(): boolean {
+    const count = this.triageActionsRequiresAuth;
+    const receivedAt = this.triageActionsRequiresAuthAt;
+    if (count === undefined || receivedAt === undefined || count <= 0) return false;
+    const age = this.deps.now() - receivedAt;
+    return age >= 0 && age <= TRIAGE_COUNTS_FRESH_MS;
   }
 
   private queuedAuthJobCount(): number {
@@ -2356,9 +2383,12 @@ export class Bridge {
   }
 
   async requestTriageCounts(): Promise<BrokerReply<{ counts: Record<string, unknown>; generated_at: string }>> {
+    const payload = (this.store.daemonFeatures ?? []).includes(TRIAGE_COUNTS_SCHEMA_2_FEATURE)
+      ? { schema_versions: [2] }
+      : {};
     const result = await this.requestNative(
       "triage_counts_request",
-      {},
+      payload,
       "triage_counts_response",
       TRIAGE_SNAPSHOT_FEATURE,
       false,
@@ -2367,14 +2397,24 @@ export class Bridge {
     if (result.code !== undefined) return this.failure(result.code, result.message ?? "The request is unavailable");
     const counts = result.payload["counts"];
     if (typeof counts !== "object" || counts === null) return this.failure("invalid_response", "The daemon returned invalid counts");
-    const pending = (counts as Record<string, unknown>)["pending_total"];
+    const record = counts as Record<string, unknown>;
+    const pending = record["pending_total"];
     if (typeof pending === "number") {
       this.triagePendingCount = pending;
       await this.syncConnectionBadge();
     }
+    const actionsRequiresAuth = record["actions_requires_auth"];
+    if (typeof actionsRequiresAuth === "number") {
+      this.triageActionsRequiresAuth = actionsRequiresAuth;
+      this.triageActionsRequiresAuthAt = this.deps.now();
+    } else {
+      this.triageActionsRequiresAuth = undefined;
+      this.triageActionsRequiresAuthAt = undefined;
+    }
+    await this.keepaliveManager?.sync();
     return {
       ok: true,
-      counts: counts as Record<string, unknown>,
+      counts: record,
       generated_at: new Date(this.deps.now()).toISOString(),
     };
   }
@@ -2628,6 +2668,9 @@ export class Bridge {
     this.helloAckGeneration = -1;
     this.helloSentGeneration = -1;
     this.triagePendingCount = undefined;
+    this.triageActionsRequiresAuth = undefined;
+    this.triageActionsRequiresAuthAt = undefined;
+    this.sessionEvidenceSentAt = undefined;
     port.onMessage.addListener((msg) => {
       if (this.port !== port) return;
       this.reconnectAttempts = 0;
@@ -2747,6 +2790,8 @@ export class Bridge {
     const job = findByJob(this.store, jobID);
     const providerKey = job === undefined ? undefined : this.providerKeyForJob(job);
     this.deliveryJobs.delete(jobID);
+    this.resolverRoutes.delete(jobID);
+    this.deliverySessionEvidence.delete(jobID);
     this.offerURLs.delete(jobID);
     this.queuedHandoffTimers.delete(jobID);
     this.classifyRetries.delete(jobID);
@@ -3143,6 +3188,38 @@ export class Bridge {
     if (firstOpenAccessLanding) await this.reloadAuthenticationHandoffs(false);
   }
 
+  private deliveryRouteFor(job: ActiveJob, track: DownloadTrack): DeliveryRoute {
+    if (track.delivery === true) return "direct";
+    if (track.route !== undefined) return track.route;
+    if (this.resolverRoutes.has(job.job_id)) return "resolver";
+    return job.requires_auth === false ? "oa" : "direct";
+  }
+
+  private deliveryEvidenceFor(job: ActiveJob, track: DownloadTrack, route: DeliveryRoute): DeliverySessionEvidence {
+    if (route === "oa") return "none";
+    if (track.sessionEvidence !== undefined) return track.sessionEvidence;
+    const perJob = this.deliverySessionEvidence.get(job.job_id);
+    if (perJob !== undefined) return perJob;
+    const lastAuth = this.store.lastAuthReturnedAt;
+    if (typeof lastAuth === "number") {
+      const age = this.deps.now() - lastAuth;
+      if (age >= 0 && age <= AUTH_EVIDENCE_TTL_MS) return "fresh_auth";
+    }
+    return this.keepaliveAuthenticated || this.authReturnedThisWorker ? "warm" : "none";
+  }
+
+  private async deliveryPageHost(owner: ActiveJob, item: DownloadItemLike): Promise<string | undefined> {
+    const tabID = typeof item.tabId === "number" && item.tabId >= 0 ? item.tabId : owner.tab_id;
+    if (tabID < 0) return undefined;
+    try {
+      const tab = await this.deps.tabs.get(tabID);
+      if (typeof tab.url !== "string") return undefined;
+      return sanitizePageHost(tab.url);
+    } catch {
+      return undefined;
+    }
+  }
+
   /** Waiting briefly avoids an unattended SAML exchange; a bounded fallback
    * prevents that safety check from parking a cold handoff forever. */
   private scheduleQueuedHandoffRelease(jobID: string): void {
@@ -3193,6 +3270,34 @@ export class Bridge {
         // A closed tab is handled by the normal tab-removal path.
       }
     }
+  }
+
+  emitSessionEvidence(evidence: "warm_verified" | "auth_returned"): boolean {
+    const now = this.deps.now();
+    const sentAt = this.sessionEvidenceSentAt;
+    if (sentAt !== undefined) {
+      const age = now - sentAt;
+      if (age >= 0 && age < SESSION_EVIDENCE_THROTTLE_MS) return false;
+    }
+    if (!(this.store.daemonFeatures ?? []).includes(SESSION_EVIDENCE_FEATURE)) return false;
+    const originHint = this.keepaliveManager?.getSnapshot().resolverOrigin ?? this.latestResolverOrigin();
+    const payload: Record<string, unknown> = {
+      evidence,
+      at: new Date(now).toISOString(),
+    };
+    if (originHint !== undefined) {
+      try {
+        const parsed = new URL(originHint);
+        if (parsed.protocol === "https:" && parsed.host !== "" && `${parsed.protocol}//${parsed.host}` === originHint) {
+          payload.origin_hint = originHint;
+        }
+      } catch {
+        // Origin hints are advisory and never block the timing signal.
+      }
+    }
+    if (!this.send("session_evidence", payload)) return false;
+    this.sessionEvidenceSentAt = now;
+    return true;
   }
 
   /** Called by keepalive only after its resolver tab has returned from login. */
@@ -4011,8 +4116,10 @@ export class Bridge {
       const started = job.auth_started_ms ?? this.deps.now();
       const now = this.deps.now();
       const elapsed = Math.max(0, now - started);
+      this.deliverySessionEvidence.set(job.job_id, "fresh_auth");
       await this.update((s) => patchJob(s, job.job_id, { status: "awaiting_download" }));
       this.send("auth_returned", { elapsed_ms: elapsed }, job.job_id);
+      this.emitSessionEvidence("auth_returned");
       // The human is past authentication; fold the "papio" group back away.
       await this.recollapseHandoffGroup(tabID);
       const institutionalSession = await this.recordInstitutionalSession(job, url, now);
@@ -4265,7 +4372,10 @@ export class Bridge {
         args: [null],
       });
       const result = results[0]?.result as ResolverRoute | undefined;
-      if (result?.kind === "routed") return true;
+      if (result?.kind === "routed") {
+        this.resolverRoutes.add(job.job_id);
+        return true;
+      }
       if (result?.kind === "no_entitlement") {
         if (!this.resolverNoEntitlementSent.has(job.job_id)) {
           // Deliberately omit adapter metadata and all page/URL data: the
@@ -4895,8 +5005,26 @@ export class Bridge {
     });
     this.authStalledReported.delete(owner.job_id);
     this.stalledAuthHandoffs.delete(owner.job_id);
+    const route = this.deliveryRouteFor(owner, track);
+    const sessionEvidence = this.deliveryEvidenceFor(owner, track, route);
+    const pageHost = await this.deliveryPageHost(owner, item);
     this.send("download_started", { download_id: delta.id, filename }, owner.job_id);
     this.send("download_complete", { download_id: delta.id, filename, size_bytes: size }, owner.job_id);
+    if (
+      this.store.connectionStatus === "connected" &&
+      (this.store.daemonFeatures ?? []).includes(DELIVERY_CONTEXT_FEATURE)
+    ) {
+      this.send(
+        "delivery_context",
+        {
+          download_id: delta.id,
+          route,
+          session_evidence: sessionEvidence,
+          ...(pageHost !== undefined ? { page_host: pageHost } : {}),
+        },
+        owner.job_id,
+      );
+    }
     this.completedDownloadTabs.set(owner.job_id, owner.tab_id);
     this.downloads.delete(owner.job_id);
   }
@@ -5504,6 +5632,7 @@ if (typeof chrome !== "undefined" && chrome.runtime?.id) {
   void bridge.start().then(() => {
     const manager = initKeepalive(chromeKeepaliveAPI(chrome), {
       trackedJobCount: () => bridge.trackedJobCount(),
+      warmDemand: () => bridge.warmDemand(),
       latestOpenURL: () => bridge.latestOpenURL(),
       queuedAuthJobs: () => bridge.queuedAuthJobs(),
       stalledAuthJobs: () => bridge.stalledAuthJobIDs(),
@@ -5512,6 +5641,9 @@ if (typeof chrome !== "undefined" && chrome.runtime?.id) {
       onTabPlaced: (tabID) => bridge.foldKeepaliveTab(tabID),
       onAuthenticationChanged: (authenticated) => {
         void bridge.setKeepaliveAuthenticated(authenticated);
+      },
+      onSessionEvidence: (_source: KeepaliveProbeSource) => {
+        bridge.emitSessionEvidence("warm_verified");
       },
       onReauthStateChanged: (paused) => bridge.setKeepaliveReauthNeeded(paused),
       surfaceReauthTab: async (tabID) => {

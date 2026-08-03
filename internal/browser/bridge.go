@@ -55,7 +55,12 @@ const (
 	statsFeature                 = "browser_stats_v1"
 	pageCaptureFeature           = "page_capture_v1"
 	activityFeedFeature          = "activity_feed_v1"
+	triageCountsSchema2Feature   = "triage_counts_schema_v2"
+	sessionEvidenceFeature       = "session_evidence_v1"
+	deliveryContextFeature       = "delivery_context_v1"
 	previewCapabilityTTL         = 10 * time.Minute
+	sessionEvidenceThrottle      = 60 * time.Second
+	deliveryContextTTL           = 60 * time.Second
 )
 
 // HandoffFocusMinExtensionVersion is the first extension that parses
@@ -67,6 +72,27 @@ const HandoffFocusMinExtensionVersion = "0.8.0"
 // strict decode, arrives before hello, or is not a legal inbound type). The RPC
 // layer maps it to invalid_argument; other Sync errors are internal.
 var ErrInvalidFrame = errors.New("invalid browser frame")
+
+// Bridge is the per-daemon-run browser bridge. Sessions are tracked in
+// memory: each native-host process carries a session_id, exactly one session
+// holds the offer/handoff flow, and later hellos from other browsers wait as
+// pending instead of silently stealing the session. A fresh hello from the
+// holder still resets the offered/cancelled bookkeeping, which is exactly the
+// recovery an MV3 service-worker restart needs.
+type browserDownloadKey struct {
+	JobID      string
+	DownloadID int64
+}
+
+type pendingBrowserDownload struct {
+	Filename   string
+	ReceivedAt time.Time
+}
+
+type pendingDeliveryContext struct {
+	Payload    protocol.DeliveryContextPayload
+	ReceivedAt time.Time
+}
 
 // Bridge is the per-daemon-run browser bridge. Sessions are tracked in
 // memory: each native-host process carries a session_id, exactly one session
@@ -95,13 +121,20 @@ type Bridge struct {
 	takeovers    int
 	// epoch increments whenever holder identity changes. Code that releases
 	// b.mu mid-flight (adoption windows inside poll) re-checks it afterwards:
-	// a concurrent claim/takeover must not let a resumed poll send offers to
-	// a demoted session or pollute the new holder's bookkeeping.
+	// a concurrent claim/takeover must not let a resumed poll send offers to a
+	// demoted session or pollute the new holder's bookkeeping.
 	epoch      uint64
 	offered    map[string]bool // handoff jobs offered to the current holder
 	cancelSent map[string]bool // jobs a daemon-side cancel was already announced for
 	// A replayed auth return must not make the same holder open duplicate tabs.
 	authReleased map[int64]bool
+	// Session evidence is timing-only and throttled per holder.
+	lastSessionEvidenceAt time.Time
+	// Completion metadata and delivery context arrive as adjacent extension
+	// frames. Keep both briefly so either frame order is safe across a native
+	// host RPC boundary; values are never durable and expire quickly.
+	pendingDownloads map[browserDownloadKey]pendingBrowserDownload
+	deliveryContexts map[browserDownloadKey]pendingDeliveryContext
 	// Focus requests survive a holder change so the replacement holder can
 	// receive its offer before it is asked to surface the handoff.
 	focusPending map[string]bool
@@ -146,18 +179,20 @@ const pendingExpireAfter = 5 * time.Minute
 // any job is ever offered depends on config (extension_id / openurl base).
 func NewBridge(jobs *job.Store, svc *app.Service, triageService *triage.Service, watchRunner *watch.Runner, previewServer *preview.Server, captureStore *captures.Store, cfg config.Config, version string) *Bridge {
 	required := []string{
-		pageAcquireFeature, triageSnapshotFeature, triageSnapshotSchema2Feature, triageMutationsFeature, reviewPreviewFeature, statsFeature, pageCaptureFeature, activityFeedFeature,
+		pageAcquireFeature, triageSnapshotFeature, triageSnapshotSchema2Feature, triageMutationsFeature, reviewPreviewFeature, statsFeature, pageCaptureFeature, activityFeedFeature, triageCountsSchema2Feature, sessionEvidenceFeature, deliveryContextFeature,
 	}
 	return &Bridge{
 		jobs: jobs, svc: svc, triage: triageService, watchRunner: watchRunner, preview: previewServer, captureStore: captureStore, cfg: cfg,
-		Version:      version,
-		Features:     required,
-		offered:      map[string]bool{},
-		cancelSent:   map[string]bool{},
-		authReleased: map[int64]bool{},
-		focusPending: map[string]bool{},
-		pending:      map[string]*browserSession{},
-		now:          time.Now,
+		Version:          version,
+		Features:         required,
+		offered:          map[string]bool{},
+		cancelSent:       map[string]bool{},
+		authReleased:     map[int64]bool{},
+		pendingDownloads: map[browserDownloadKey]pendingBrowserDownload{},
+		deliveryContexts: map[browserDownloadKey]pendingDeliveryContext{},
+		focusPending:     map[string]bool{},
+		pending:          map[string]*browserSession{},
+		now:              time.Now,
 	}
 }
 
@@ -310,6 +345,7 @@ func (b *Bridge) promote(session *browserSession, reason string) {
 	b.offered = map[string]bool{}
 	b.cancelSent = map[string]bool{}
 	b.authReleased = map[int64]bool{}
+	b.lastSessionEvidenceAt = time.Time{}
 	b.takeovers++
 	log.Printf("papio: browser session %s (v%s) now holds the bridge: %s", shortSession(session.ID), session.ExtensionVersion, reason)
 }
@@ -552,6 +588,10 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 	case protocol.MsgAuthPending, protocol.MsgAuthReturned:
 		return nil, b.recordAuth(ctx, msg)
 
+	case protocol.MsgSessionEvidence:
+		return nil, b.sessionEvidence(ctx, msg.Payload.(*protocol.SessionEvidencePayload))
+	case protocol.MsgDeliveryContext:
+		return nil, b.deliveryContext(ctx, msg.JobID, msg.Payload.(*protocol.DeliveryContextPayload))
 	case protocol.MsgDownloadStarted:
 		p := msg.Payload.(*protocol.DownloadStartedPayload)
 		return nil, b.jobs.S.AppendEvent(ctx, msg.JobID, "browser.download_started",
@@ -563,7 +603,14 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 			map[string]any{"download_id": p.DownloadID, "filename": p.Filename, "size_bytes": p.SizeBytes}); err != nil {
 			return nil, err
 		}
-		if err := b.adoptOutsideSessionLock(ctx, msg.JobID, p.Filename); err != nil {
+		b.pruneDeliveryMetadata(b.now())
+		key := browserDownloadKey{JobID: msg.JobID, DownloadID: p.DownloadID}
+		b.pendingDownloads[key] = pendingBrowserDownload{Filename: p.Filename, ReceivedAt: b.now()}
+		var context *app.BrowserDeliveryContext
+		if pending, ok := b.deliveryContexts[key]; ok {
+			context = browserDeliveryContext(&pending.Payload)
+		}
+		if err := b.adoptOutsideSessionLock(ctx, msg.JobID, p.Filename, context); err != nil {
 			// Environmental failure (file not there yet, Chrome rename race,
 			// user saved elsewhere) must not sever the bridge: record it, keep
 			// the job parked, and let the poll-time directory scan pick the
@@ -573,6 +620,9 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 				map[string]any{"filename": p.Filename, "reason": truncate(err.Error(), 200)}); evErr != nil {
 				return nil, evErr
 			}
+		} else if context != nil {
+			delete(b.deliveryContexts, key)
+			delete(b.pendingDownloads, key)
 		}
 		ack, err := b.frame(protocol.MsgAck, msg.JobID, protocol.EmptyPayload{})
 		if err != nil {
@@ -841,6 +891,13 @@ func triageCountsPayload(counts triage.Counts) protocol.TriageCounts {
 	}
 }
 
+func triageCountsPayloadV2(counts triage.Counts) protocol.TriageCounts {
+	payload := triageCountsPayload(counts)
+	auth := int64(counts.ActionsRequiresAuth)
+	payload.ActionsRequiresAuth = &auth
+	return payload
+}
+
 func (b *Bridge) triageCounts(ctx context.Context, request *protocol.TriageCountsRequestPayload) ([]json.RawMessage, error) {
 	if b.triage == nil {
 		return b.triageUnavailable(nil)
@@ -849,8 +906,12 @@ func (b *Bridge) triageCounts(ctx context.Context, request *protocol.TriageCount
 	if err != nil {
 		return b.triageUnavailable(err)
 	}
+	payload := triageCountsPayload(counts)
+	if len(request.SchemaVersions) == 1 && request.SchemaVersions[0] == 2 {
+		payload = triageCountsPayloadV2(counts)
+	}
 	frame, err := b.frame(protocol.MsgTriageCountsResponse, "", protocol.TriageCountsResponsePayload{
-		RequestID: request.RequestID, Counts: triageCountsPayload(counts),
+		RequestID: request.RequestID, Counts: payload,
 	})
 	if err != nil {
 		return nil, err
@@ -1281,13 +1342,87 @@ func (b *Bridge) pageAcquireError(err error) ([]json.RawMessage, error) {
 	return []json.RawMessage{ack}, nil
 }
 
+// pruneDeliveryMetadata drops unpaired frames after the short handoff window.
+// The maps carry only job/download correlation and bounded route evidence.
+func (b *Bridge) pruneDeliveryMetadata(now time.Time) {
+	for key, pending := range b.pendingDownloads {
+		if now.Sub(pending.ReceivedAt) > deliveryContextTTL {
+			delete(b.pendingDownloads, key)
+		}
+	}
+	for key, pending := range b.deliveryContexts {
+		if now.Sub(pending.ReceivedAt) > deliveryContextTTL {
+			delete(b.deliveryContexts, key)
+		}
+	}
+}
+
+func browserDeliveryContext(payload *protocol.DeliveryContextPayload) *app.BrowserDeliveryContext {
+	if payload == nil {
+		return nil
+	}
+	return &app.BrowserDeliveryContext{
+		Route:           payload.Route,
+		PageHost:        payload.PageHost,
+		SessionEvidence: payload.SessionEvidence,
+	}
+}
+
+// deliveryContext records the job/download-scoped route and, when the
+// completion frame has already arrived, applies it to the browser candidate.
+func (b *Bridge) deliveryContext(ctx context.Context, jobID string, payload *protocol.DeliveryContextPayload) error {
+	b.pruneDeliveryMetadata(b.now())
+	key := browserDownloadKey{JobID: jobID, DownloadID: payload.DownloadID}
+	detail := map[string]any{
+		"download_id":      payload.DownloadID,
+		"route":            payload.Route,
+		"session_evidence": payload.SessionEvidence,
+	}
+	if payload.PageHost != "" {
+		detail["page_host"] = payload.PageHost
+	}
+	if err := b.jobs.S.AppendEvent(ctx, jobID, "browser.delivery_context", detail); err != nil {
+		return err
+	}
+	b.deliveryContexts[key] = pendingDeliveryContext{Payload: *payload, ReceivedAt: b.now()}
+	pending, ok := b.pendingDownloads[key]
+	if !ok {
+		return nil
+	}
+	provenance := browserDeliveryContext(payload)
+	applied, err := b.jobs.ApplyBrowserDeliveryContext(ctx, jobID, payload.Route, payload.SessionEvidence, pageHostURL(payload.PageHost))
+	if err != nil {
+		return err
+	}
+	if !applied {
+		if err := b.adoptOutsideSessionLock(ctx, jobID, pending.Filename, provenance); err != nil {
+			_ = b.jobs.S.AppendEvent(ctx, jobID, "browser.adoption_deferred",
+				map[string]any{"filename": pending.Filename, "reason": truncate(err.Error(), 200)})
+			return nil
+		}
+	}
+	delete(b.deliveryContexts, key)
+	delete(b.pendingDownloads, key)
+	return nil
+}
+
+func pageHostURL(host string) string {
+	if host == "" {
+		return ""
+	}
+	return "https://" + host
+}
+
 // adoptOutsideSessionLock runs validation without blocking unrelated browser
 // syncs. The adoption service leases the durable job state before validation,
 // so releasing the in-memory session lock cannot admit a competing adoption.
 // The caller must hold b.mu; it is held again before this method returns.
-func (b *Bridge) adoptOutsideSessionLock(ctx context.Context, jobID, filename string) error {
+func (b *Bridge) adoptOutsideSessionLock(ctx context.Context, jobID, filename string, provenance ...*app.BrowserDeliveryContext) error {
 	b.mu.Unlock()
 	defer b.mu.Lock()
+	if len(provenance) > 0 && provenance[0] != nil {
+		return b.adoptWithContext(ctx, jobID, filename, provenance[0])
+	}
 	return b.adopt(ctx, jobID, filename)
 }
 
@@ -1370,6 +1505,51 @@ func validExtensionVersion(value string) bool {
 // recordAuth appends a timing-only auth event. The AuthPayload structurally
 // cannot carry a URL, host, title, query, or fragment, so an identity-provider
 // address cannot enter the event stream through this path.
+// sessionEvidence records one timing-only institutional-session signal and
+// reuses the auth-return sibling reoffer path. Replays within the throttle
+// window are ignored before touching durable activity or job state.
+func (b *Bridge) sessionEvidence(ctx context.Context, _ *protocol.SessionEvidencePayload) error {
+	now := b.now()
+	if !b.lastSessionEvidenceAt.IsZero() {
+		age := now.Sub(b.lastSessionEvidenceAt)
+		if age >= 0 && age < sessionEvidenceThrottle {
+			return nil
+		}
+	}
+	b.lastSessionEvidenceAt = now
+	if err := b.jobs.S.AppendEvent(ctx, "", "browser.session_evidence", nil); err != nil {
+		return err
+	}
+	return b.reofferInstitutionalSiblingsForEvidence(ctx)
+}
+
+// reofferInstitutionalSiblingsForEvidence chooses an open institutional
+// handoff as the source for the existing sibling reoffer routine. Prefer an
+// already-offered source (the auth_returned shape), then fall back to any
+// parked institutional handoff so the normal poll can offer it and its peers.
+func (b *Bridge) reofferInstitutionalSiblingsForEvidence(ctx context.Context) error {
+	actions, err := b.jobs.ListHumanActions(ctx, true)
+	if err != nil {
+		return err
+	}
+	var fallback string
+	for _, action := range actions {
+		if action.Kind != handoffActionKind || !action.RequiresAuth {
+			continue
+		}
+		if fallback == "" {
+			fallback = action.JobID
+		}
+		if b.offered[action.JobID] {
+			return b.reofferInstitutionalSiblings(ctx, action.JobID)
+		}
+	}
+	if fallback == "" {
+		return nil
+	}
+	return b.reofferInstitutionalSiblings(ctx, fallback)
+}
+
 func (b *Bridge) recordAuth(ctx context.Context, msg *protocol.BrowserMessage) error {
 	kind := "browser.auth_pending"
 	if msg.Type == protocol.MsgAuthReturned {
@@ -1423,48 +1603,42 @@ func (b *Bridge) reofferInstitutionalSiblings(ctx context.Context, sourceJobID s
 	}
 	b.authReleased[sourceActionID] = true
 
-	offeredIDs := make([]string, 0, len(b.offered))
-	for jobID, offered := range b.offered {
-		if offered && jobID != sourceJobID {
-			offeredIDs = append(offeredIDs, jobID)
-		}
+	actions, err := b.jobs.ListHumanActions(ctx, true)
+	if err != nil {
+		return err
 	}
-	for start := 0; start < len(offeredIDs); start += 200 {
-		end := min(start+200, len(offeredIDs))
-		actions, err := b.jobs.ListOpenHumanActionsForJobs(ctx, offeredIDs[start:end])
+	for _, action := range actions {
+		if action.JobID == sourceJobID ||
+			action.Kind != handoffActionKind ||
+			!action.RequiresAuth ||
+			b.authReleased[action.ID] {
+			continue
+		}
+		row, err := b.jobs.Get(ctx, action.JobID)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
 		if err != nil {
 			return err
 		}
-		for _, action := range actions {
-			if action.Kind != handoffActionKind || !action.RequiresAuth || b.authReleased[action.ID] {
-				continue
-			}
-			row, err := b.jobs.Get(ctx, action.JobID)
-			if errors.Is(err, sql.ErrNoRows) {
-				continue
-			}
-			if err != nil {
-				return err
-			}
-			if row.State != job.StateAwaitingHuman ||
-				resolverProfileKey(row.Policy.Resolver) != resolverProfileKey(source.Policy.Resolver) ||
-				row.LeaseActive(b.now()) {
-				continue
-			}
-			requeued, err := b.institutionalRouteRequeued(ctx, row.ID)
-			if err != nil {
-				return err
-			}
-			if requeued || b.holder == nil || b.now().Sub(b.holder.LastSyncAt) > sessionStaleAfter {
-				continue
-			}
-			if err := b.jobs.RecordEvent(ctx, row.ID, "browser.handoff_reoffered",
-				map[string]any{"reason": "institutional_session_live"}); err != nil {
-				return err
-			}
-			delete(b.offered, row.ID)
-			b.authReleased[action.ID] = true
+		if row.State != job.StateAwaitingHuman ||
+			resolverProfileKey(row.Policy.Resolver) != resolverProfileKey(source.Policy.Resolver) ||
+			row.LeaseActive(b.now()) {
+			continue
 		}
+		requeued, err := b.institutionalRouteRequeued(ctx, row.ID)
+		if err != nil {
+			return err
+		}
+		if requeued || b.holder == nil || b.now().Sub(b.holder.LastSyncAt) > sessionStaleAfter {
+			continue
+		}
+		if err := b.jobs.RecordEvent(ctx, row.ID, "browser.handoff_reoffered",
+			map[string]any{"reason": "institutional_session_live"}); err != nil {
+			return err
+		}
+		delete(b.offered, row.ID)
+		b.authReleased[action.ID] = true
 	}
 	return nil
 }
@@ -1669,6 +1843,23 @@ func (b *Bridge) adopt(ctx context.Context, jobID, filename string) error {
 		return fmt.Errorf("adoption path escapes %s", realRoot)
 	}
 	return b.svc.AdoptDownload(ctx, jobID, full)
+}
+
+func (b *Bridge) adoptWithContext(ctx context.Context, jobID, filename string, provenance *app.BrowserDeliveryContext) error {
+	if !filepath.IsLocal(filename) {
+		return fmt.Errorf("adoption filename %q is not a local name", filename)
+	}
+	root := filepath.Join(b.cfg.EffectiveAdoptionRoot(), jobID)
+	realRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return fmt.Errorf("adoption root unavailable: %w", err)
+	}
+	full := filepath.Join(realRoot, filename)
+	rel, err := filepath.Rel(realRoot, full)
+	if err != nil || rel != filename || strings.Contains(rel, "..") {
+		return fmt.Errorf("adoption path escapes %s", realRoot)
+	}
+	return b.svc.AdoptDownloadWithContext(ctx, jobID, full, provenance)
 }
 
 // scanAdoptionDir looks for exactly one settled candidate file in an

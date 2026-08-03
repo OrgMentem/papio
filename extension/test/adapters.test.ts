@@ -147,7 +147,7 @@ test("interpret waits for late-upgraded custom elements when settleTimeoutMs is 
     const verdict = interpret(null, jstor as AdapterSpec, ctx());
     win.document.body.insertAdjacentHTML(
       "beforeend",
-      "<mfe-download-pharos-button data-qa=\"download-pdf\" data-doi=\"10.2307/259290\"></mfe-download-pharos-button>",
+      "<mfe-download-pharos-button data-qa=\"download-pdf\" data-doi=\"10.2307/259290\" data-sc=\"but click:pdf download\" variant=\"primary\"></mfe-download-pharos-button>",
     );
     expect((await verdict).kind).toBe("article");
   } finally {
@@ -274,6 +274,34 @@ const liveArticle = loadFixture("proquest", "article");
 test.skipIf(liveArticle === null)("captured proquest article fixture classifies as article", () => {
   expect(interpret(liveArticle as Document, SPEC, ctx(EXPECTED_TITLE)).kind).toBe("article");
 });
+
+// JSTOR's entitled capture renders the PDF in its in-page viewer and offers
+// only a custom-element Download control. There is no stable anchor/meta URL;
+// the adapter must click that provider control rather than synthesize the
+// /stable/pdf/<id>.pdf endpoint.
+const jstorArticle = loadFixture("jstor", "success");
+test.skipIf(jstorArticle === null)(
+  "captured JSTOR entitled page classifies on its primary PDF control",
+  () => {
+    const article = jstorArticle as Document;
+    const spec = adapters.find((a) => a.id === "jstor") as AdapterSpec;
+    const verdict = interpret(article, spec, ctx());
+    expect(verdict.kind).toBe("article");
+    expect(verdict.adapter_id).toBe("jstor");
+    expect(article.querySelector("#pdf-viewer .page[data-page-number]")).not.toBeNull();
+
+    const rule = spec.download as DownloadRule;
+    expect(rule.method).toBe("click");
+    expect(rule.shadowSelector).toBe("#button-element");
+    expect(rule.idPattern).toBeUndefined();
+    expect(rule.urlTemplate).toBeUndefined();
+    const control = article.querySelector(rule.selector);
+    expect(control).not.toBeNull();
+    expect(control?.getAttribute("data-doi")).toBe("20183234");
+    expect(article.querySelector("meta[name='citation_pdf_url']")).toBeNull();
+    expect(article.querySelector("a[href*='/stable/pdf/']")).toBeNull();
+  },
+);
 
 // Wiley Online Library: captured 2026-07-17 from a Example University-authenticated article
 // (fixtures/wiley/success.html). The article page carries the Highwire

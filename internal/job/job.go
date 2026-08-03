@@ -305,6 +305,8 @@ type Candidate struct {
 	URLRedacted        string  `json:"url_redacted"`
 	URLKey             string  `json:"url_key"`
 	LandingRedacted    string  `json:"landing_redacted,omitempty"`
+	BrowserRoute       string  `json:"browser_route,omitempty"`
+	SessionEvidence    string  `json:"session_evidence,omitempty"`
 	Version            string  `json:"version"`
 	AccessBasis        string  `json:"access_basis"`
 	ReuseLicense       string  `json:"reuse_license"`
@@ -1699,11 +1701,11 @@ func (js *Store) InsertCandidates(ctx context.Context, jobID string, cands []Can
 	for _, c := range cands {
 		res, err := tx.ExecContext(ctx, `
 			INSERT OR IGNORE INTO candidates
-			  (job_id, source, url_redacted, url_key, landing_redacted, version, access_basis, reuse_license,
+			  (job_id, source, url_redacted, url_key, landing_redacted, browser_route, session_evidence, version, access_basis, reuse_license,
 			   expected_mime, cost_usd, direct, identity_confidence, rank_evidence, rank, status, review_override, created_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
-			jobID, c.Source, c.URLRedacted, c.URLKey, nullable(c.LandingRedacted), c.Version, c.AccessBasis,
-			c.ReuseLicense, nullable(c.ExpectedMIME), c.CostUSD, boolInt(c.Direct), c.IdentityConfidence,
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
+			jobID, c.Source, c.URLRedacted, c.URLKey, nullable(c.LandingRedacted), nullable(c.BrowserRoute), nullable(c.SessionEvidence),
+			c.Version, c.AccessBasis, c.ReuseLicense, nullable(c.ExpectedMIME), c.CostUSD, boolInt(c.Direct), c.IdentityConfidence,
 			nullable(c.RankEvidence), c.Rank, boolInt(c.ReviewOverride), now)
 		if err != nil {
 			return 0, err
@@ -1725,14 +1727,14 @@ func boolInt(b bool) int {
 // NextPendingCandidate returns the best-ranked candidate still pending, or nil.
 func (js *Store) NextPendingCandidate(ctx context.Context, jobID string) (*Candidate, error) {
 	row := js.S.DB().QueryRowContext(ctx, `
-		SELECT id, job_id, source, url_redacted, url_key, COALESCE(landing_redacted,''), version, access_basis,
+		SELECT id, job_id, source, url_redacted, url_key, COALESCE(landing_redacted,''), COALESCE(browser_route,''), COALESCE(session_evidence,''), version, access_basis,
 		       reuse_license, COALESCE(expected_mime,''), cost_usd, direct, identity_confidence,
 		       COALESCE(rank_evidence,''), COALESCE(rank,0), status, review_override
 		FROM candidates WHERE job_id = ? AND status = 'pending' ORDER BY rank ASC, id ASC LIMIT 1`, jobID)
 	var c Candidate
 	var direct, override int
-	err := row.Scan(&c.ID, &c.JobID, &c.Source, &c.URLRedacted, &c.URLKey, &c.LandingRedacted, &c.Version,
-		&c.AccessBasis, &c.ReuseLicense, &c.ExpectedMIME, &c.CostUSD, &direct, &c.IdentityConfidence,
+	err := row.Scan(&c.ID, &c.JobID, &c.Source, &c.URLRedacted, &c.URLKey, &c.LandingRedacted, &c.BrowserRoute,
+		&c.SessionEvidence, &c.Version, &c.AccessBasis, &c.ReuseLicense, &c.ExpectedMIME, &c.CostUSD, &direct, &c.IdentityConfidence,
 		&c.RankEvidence, &c.Rank, &c.Status, &override)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -1766,19 +1768,71 @@ func (js *Store) MarkCandidateVersionUnobserved(ctx context.Context, id int64) e
 // GetCandidate loads one candidate by its durable ID.
 func (js *Store) GetCandidate(ctx context.Context, id int64) (*Candidate, error) {
 	row := js.S.DB().QueryRowContext(ctx, `
-		SELECT id, job_id, source, url_redacted, url_key, COALESCE(landing_redacted,''), version, access_basis,
+		SELECT id, job_id, source, url_redacted, url_key, COALESCE(landing_redacted,''), COALESCE(browser_route,''), COALESCE(session_evidence,''), version, access_basis,
 		       reuse_license, COALESCE(expected_mime,''), cost_usd, direct, identity_confidence,
 		       COALESCE(rank_evidence,''), COALESCE(rank,0), status, review_override
 		FROM candidates WHERE id = ?`, id)
 	var c Candidate
 	var direct, override int
-	if err := row.Scan(&c.ID, &c.JobID, &c.Source, &c.URLRedacted, &c.URLKey, &c.LandingRedacted, &c.Version,
-		&c.AccessBasis, &c.ReuseLicense, &c.ExpectedMIME, &c.CostUSD, &direct, &c.IdentityConfidence,
+	if err := row.Scan(&c.ID, &c.JobID, &c.Source, &c.URLRedacted, &c.URLKey, &c.LandingRedacted, &c.BrowserRoute,
+		&c.SessionEvidence, &c.Version, &c.AccessBasis, &c.ReuseLicense, &c.ExpectedMIME, &c.CostUSD, &direct, &c.IdentityConfidence,
 		&c.RankEvidence, &c.Rank, &c.Status, &override); err != nil {
 		return nil, err
 	}
 	c.Direct, c.ReviewOverride = direct == 1, override == 1
 	return &c, nil
+}
+
+// BrowserAccessBasis derives the conservative access claim from observed
+// browser-delivery provenance. Missing or incomplete context is deliberately
+// manual: an adopted file must never become institutional on an inference.
+func BrowserAccessBasis(route, sessionEvidence string) (string, error) {
+	switch route {
+	case "oa":
+		if sessionEvidence != "none" {
+			return "", fmt.Errorf("oa browser delivery requires session_evidence none")
+		}
+		return "open_access", nil
+	case "resolver", "direct":
+		switch sessionEvidence {
+		case "fresh_auth", "warm":
+			return "institutional", nil
+		case "none":
+			return "manual", nil
+		default:
+			return "", fmt.Errorf("invalid browser session_evidence %q", sessionEvidence)
+		}
+	default:
+		return "", fmt.Errorf("invalid browser route %q", route)
+	}
+}
+
+// ApplyBrowserDeliveryContext records route/session evidence on the newest
+// browser candidate for a job. It returns false when no browser candidate
+// exists yet (the bridge may retain the context briefly and retry).
+func (js *Store) ApplyBrowserDeliveryContext(ctx context.Context, jobID, route, sessionEvidence, landingRedacted string) (bool, error) {
+	accessBasis, err := BrowserAccessBasis(route, sessionEvidence)
+	if err != nil {
+		return false, err
+	}
+	var landing any
+	if landingRedacted != "" {
+		landing = landingRedacted
+	}
+	res, err := js.S.DB().ExecContext(ctx, `
+		UPDATE candidates
+		SET browser_route = ?, session_evidence = ?, access_basis = ?,
+		    landing_redacted = CASE WHEN ? IS NULL THEN landing_redacted ELSE ? END
+		WHERE id = (
+			SELECT id FROM candidates
+			WHERE job_id = ? AND source = 'browser'
+			ORDER BY id DESC LIMIT 1
+		)`, route, sessionEvidence, accessBasis, landing, landing, jobID)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n == 1, err
 }
 
 // ResetCandidates makes interrupted and retryable candidates runnable for a

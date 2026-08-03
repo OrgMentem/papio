@@ -1,5 +1,6 @@
 // Copyright 2026 OrgMentem. Licensed under MIT. See LICENSE.
 
+import { isAuthenticationURL } from "./keepalive";
 /** DOI-shaped identifiers are deliberately conservative: the daemon remains the
  * authority, while the popup only needs a useful first candidate. */
 export const DOI_PATTERN = /\b10\.\d{4,9}\/[^\s"'<>?#]+/;
@@ -195,4 +196,31 @@ export function classifyPage(
       ...(options.text !== undefined ? { bodyText: options.text } : {}),
     });
   return doi === undefined ? { kind: "none" } : { kind: "doi", doi };
+}
+
+
+/** Return a privacy-safe HTTPS hostname for a completed PDF tab. Paths,
+ * queries, fragments, browser-internal URLs, and authentication/IdP pages are
+ * intentionally discarded rather than sent to the daemon. */
+export function sanitizePageHost(value: string): string | undefined {
+  let url: URL;
+  try {
+    url = new URL(pdfSourceURL(value));
+  } catch {
+    return undefined;
+  }
+  if (url.protocol !== "https:" || isAuthenticationURL(value)) return undefined;
+  const host = url.hostname.toLowerCase();
+  if (
+    host.length < 3 ||
+    host.length > 128 ||
+    !/^[a-z0-9.-]+$/.test(host) ||
+    host.includes("..") ||
+    host.startsWith(".") ||
+    host.endsWith(".") ||
+    host.split(".").length < 2
+  ) {
+    return undefined;
+  }
+  return host;
 }

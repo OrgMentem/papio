@@ -21,9 +21,10 @@
         "job_reject",
         "auth_pending",
         "auth_returned",
+        "session_evidence",
         "download_started",
         "download_complete",
-        "provider_outcome",
+        "delivery_context",
         "cancel",
         "handoff_focus",
         "ack",
@@ -58,6 +59,21 @@
         "pending_total": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
         "watch_hits": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
         "actions": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "retractions": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "jobs_working": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "jobs_needs_review": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "failure_groups_7d": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
+      }
+    },
+    "counts_v2": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pending_total", "watch_hits", "actions", "actions_requires_auth", "retractions", "jobs_working", "jobs_needs_review", "failure_groups_7d"],
+      "properties": {
+        "pending_total": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "watch_hits": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "actions": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "actions_requires_auth": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
         "retractions": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
         "jobs_working": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
         "jobs_needs_review": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
@@ -283,7 +299,7 @@
   },
   "allOf": [
     {
-      "if": { "properties": { "type": { "enum": ["job_offer", "handoff_outcome", "job_accept", "job_reject", "auth_pending", "auth_returned", "download_started", "download_complete", "provider_outcome", "cancel", "handoff_focus"] } } },
+      "if": { "properties": { "type": { "enum": ["job_offer", "handoff_outcome", "job_accept", "job_reject", "auth_pending", "auth_returned", "download_started", "download_complete", "delivery_context", "provider_outcome", "cancel", "handoff_focus"] } } },
       "then": { "required": ["job_id"] }
     },
     {
@@ -475,6 +491,23 @@
       }
     },
     {
+      "if": { "properties": { "type": { "const": "session_evidence" } } },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["evidence", "at"],
+            "properties": {
+              "evidence": { "enum": ["warm_verified", "auth_returned"] },
+              "origin_hint": { "type": "string", "maxLength": 300, "pattern": "^https://[a-z0-9.-]{3,253}(:[0-9]{1,5})?$" },
+              "at": { "type": "string", "format": "date-time" }
+            }
+          }
+        }
+      }
+    },
+    {
       "if": { "properties": { "type": { "const": "download_started" } } },
       "then": {
         "properties": {
@@ -503,6 +536,30 @@
               "filename": { "type": "string", "pattern": "^[^/\\\\]{1,255}$" },
               "size_bytes": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 }
             }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "delivery_context" } } },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["download_id", "route", "session_evidence"],
+            "properties": {
+              "download_id": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+              "route": { "enum": ["resolver", "direct", "oa"] },
+              "page_host": { "type": "string", "maxLength": 128, "pattern": "^[a-z0-9.-]{3,128}$" },
+              "session_evidence": { "enum": ["fresh_auth", "warm", "none"] }
+            },
+            "allOf": [
+              {
+                "if": { "properties": { "route": { "const": "oa" } }, "required": ["route"] },
+                "then": { "properties": { "session_evidence": { "const": "none" } } }
+              }
+            ]
           }
         }
       }
@@ -604,7 +661,10 @@
             "type": "object",
             "additionalProperties": false,
             "required": ["request_id"],
-            "properties": { "request_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,64}$" } }
+            "properties": {
+              "request_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,64}$" },
+              "schema_versions": { "type": "array", "minItems": 1, "maxItems": 1, "items": { "enum": [1, 2] } }
+            }
           }
         }
       }
@@ -619,7 +679,12 @@
             "required": ["request_id", "counts"],
             "properties": {
               "request_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,64}$" },
-              "counts": { "$ref": "#/$defs/counts" }
+              "counts": {
+                "oneOf": [
+                  { "$ref": "#/$defs/counts" },
+                  { "$ref": "#/$defs/counts_v2" }
+                ]
+              }
             }
           }
         }

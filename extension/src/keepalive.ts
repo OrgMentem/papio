@@ -109,6 +109,8 @@ export interface KeepaliveSnapshot {
 export interface KeepaliveOptions {
   /** Number of currently non-terminal handoff jobs. */
   trackedJobCount(): number;
+  /** Durable daemon-side institutional work demand. */
+  warmDemand?(): boolean;
   /** OpenURL from the most recently received job offer, kept in bridge memory. */
   latestOpenURL(): string | undefined;
   /** Number of queued institutional handoffs waiting for auth evidence. */
@@ -117,6 +119,9 @@ export interface KeepaliveOptions {
   stalledAuthJobs?(): readonly string[];
   /** Latest persisted institutional-session evidence timestamp. */
   lastAuthReturnedAt?(): number | undefined;
+  /** Reports a completed unknown/out -> in probe so the bridge can emit
+   * session_evidence without exposing page details. */
+  onSessionEvidence?(source: "live_tab" | "keepalive_tab"): void;
   /** Reports when the keepalive tab has verified an authenticated resolver
    * return, or when that evidence is lost. */
   onAuthenticationChanged?(authenticated: boolean): void;
@@ -662,10 +667,14 @@ export class KeepaliveManager {
     }
   }
 
+  private hasWarmDemand(): boolean {
+    return this.options.trackedJobCount() > 0 || this.options.warmDemand?.() === true;
+  }
+
   private async reconcile(): Promise<void> {
-    const activeJobs = this.options.trackedJobCount() > 0;
+    const warmDemand = this.hasWarmDemand();
     const resolver = this.resolverFromLatestOffer() ?? this.configuredResolver();
-    if (!this.enabled || !activeJobs || resolver === undefined) {
+    if (!this.enabled || !warmDemand || resolver === undefined) {
       await this.closeTab();
       this.schedule(this.observeMs, () => this.onObserve());
       return;
@@ -778,14 +787,22 @@ export class KeepaliveManager {
     completedAt: number | null = Date.now(),
     scanOutcome: ScanOutcome | undefined = undefined,
   ): void {
+    const wasAuthenticated = this.authenticated;
     const authenticated = verdict === "in";
-    const authenticationChanged = this.authenticated !== authenticated;
+    const authenticationChanged = wasAuthenticated !== authenticated;
     this.verdict = verdict;
     this.probeSource = source;
     this.scanOutcome = scanOutcome;
     this.lastVerdictAt = completedAt === null ? undefined : completedAt;
     this.authenticated = authenticated;
     if (authenticationChanged) this.options.onAuthenticationChanged?.(authenticated);
+    if (
+      !wasAuthenticated &&
+      authenticated &&
+      (source === "live_tab" || source === "keepalive_tab")
+    ) {
+      this.options.onSessionEvidence?.(source);
+    }
   }
 
   private async createTab(): Promise<void> {
@@ -837,9 +854,9 @@ export class KeepaliveManager {
 
   private async onObserve(): Promise<void> {
     await this.loadPreferences();
-    const activeJobs = this.options.trackedJobCount() > 0;
+    const warmDemand = this.hasWarmDemand();
     const resolver = this.resolverFromLatestOffer() ?? this.configuredResolver();
-    if (!this.enabled || !activeJobs || resolver === undefined) {
+    if (!this.enabled || !warmDemand || resolver === undefined) {
       await this.closeTab();
       this.schedule(this.observeMs, () => this.onObserve());
       return;
@@ -865,7 +882,7 @@ export class KeepaliveManager {
 
   private async onReload(): Promise<void> {
     await this.loadPreferences();
-    if (!this.enabled || this.options.trackedJobCount() <= 0) {
+    if (!this.enabled || !this.hasWarmDemand()) {
       await this.closeTab();
       this.schedule(this.observeMs, () => this.onObserve());
       return;

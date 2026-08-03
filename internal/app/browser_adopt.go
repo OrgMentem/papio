@@ -194,6 +194,7 @@ func (s *Service) AdoptDownload(ctx context.Context, jobID, path string) error {
 		_ = os.Remove(temp)
 		return err
 	}
+	replacementAccess := s.adoptionReplacementAccess(ctx, jobID)
 	s.resolveAdoptedHandoffActions(ctx, jobID)
 
 	accepted, parked, err := s.validateCandidate(ctx, row, stored, result)
@@ -234,18 +235,51 @@ func (s *Service) AdoptDownload(ctx context.Context, jobID, path string) error {
 		// adoption sweep never scans it — with an action telling the user to
 		// remove or replace the file so the loop cannot spin.
 		if _, err := s.Jobs.OpenHumanAction(ctx, jobID, "manual_download",
-			"the adopted download failed validation and could not be quarantined; remove or replace the file in the adoption directory", job.Access(false, "")); err != nil {
+			"the adopted download failed validation and could not be quarantined; remove or replace the file in the adoption directory", replacementAccess); err != nil {
 			return err
 		}
 		return s.park(ctx, jobID, job.StateFetching, job.StateNeedsReview,
 			map[string]any{"reason": "adopted_download_rejected_unquarantined"})
 	}
 	if _, err := s.Jobs.OpenHumanAction(ctx, jobID, "manual_download",
-		"the adopted download failed validation; please supply a different file", job.Access(false, "")); err != nil {
+		"the adopted download failed validation; please supply a different file", replacementAccess); err != nil {
 		return err
 	}
 	return s.park(ctx, jobID, job.StateFetching, job.StateAwaitingHuman,
 		map[string]any{"reason": "adopted_download_rejected"})
+}
+
+// BrowserDeliveryContext is the bounded, non-secret provenance observed by
+// the extension for one browser download. It is intentionally separate from
+// the download bytes and from the synthetic adopted URL.
+type BrowserDeliveryContext struct {
+	Route           string
+	PageHost        string
+	SessionEvidence string
+}
+
+// AdoptDownloadWithContext preserves the legacy adoption path while attaching
+// a context that arrived with the browser delivery. The context is applied
+// after validation so a candidate exists even when adoption is resumed from a
+// prior download-complete frame.
+func (s *Service) AdoptDownloadWithContext(ctx context.Context, jobID, path string, context *BrowserDeliveryContext) error {
+	if context == nil {
+		return s.AdoptDownload(ctx, jobID, path)
+	}
+	if _, err := job.BrowserAccessBasis(context.Route, context.SessionEvidence); err != nil {
+		return err
+	}
+	if err := s.AdoptDownload(ctx, jobID, path); err != nil {
+		return err
+	}
+	landing := ""
+	if context.PageHost != "" {
+		landing = "https://" + context.PageHost
+	}
+	if _, err := s.Jobs.ApplyBrowserDeliveryContext(ctx, jobID, context.Route, context.SessionEvidence, landing); err != nil {
+		return err
+	}
+	return nil
 }
 
 // resolveAdoptedHandoffActions closes the handoff actions satisfied by a
@@ -265,6 +299,24 @@ func (s *Service) resolveAdoptedHandoffActions(ctx context.Context, jobID string
 			log.Printf("papio: resolving browser handoff action %d for adopted job %s: %v", action.ID, jobID, err)
 		}
 	}
+}
+
+// adoptionReplacementAccess snapshots the access classification of the handoff
+// that supplied the browser download before resolveAdoptedHandoffActions closes
+// it. A missing action fails closed through the job-level inheritance helper.
+func (s *Service) adoptionReplacementAccess(ctx context.Context, jobID string) job.AccessClassification {
+	actions, err := s.Jobs.ListHumanActions(ctx, false)
+	if err != nil {
+		return job.AccessInheritedFromResolvedHandoff("")
+	}
+	for _, kind := range []string{"openurl_handoff", "manual_download"} {
+		for _, action := range actions {
+			if action.JobID == jobID && action.Kind == kind {
+				return job.Access(action.RequiresAuth, action.BlockedBy)
+			}
+		}
+	}
+	return job.AccessInheritedFromResolvedHandoff("")
 }
 
 // leaseAwaitingHuman CAS-acquires a lease on a job that is parked in

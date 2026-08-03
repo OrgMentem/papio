@@ -328,15 +328,18 @@ export const adapters: AdapterSpec[] = [
       "https://shibboleth-sp.prod.proquest.com/Shibboleth.sso/DS?entityID={entityID}&target=https://shibboleth-sp.prod.proquest.com/ONE_SEARCH/PRODWWW",
   },
   {
-    // Verified live 2026-07-14 against Example University-authenticated and isolated
-    // logged-out JSTOR pages (fixtures/jstor/*.html). Terms is first because
-    // JSTOR overlays it on the still article-shaped page. settleTimeoutMs waits
-    // for JSTOR's `mfe-*` custom elements to upgrade: the tracked tab's post-SSO
-    // landing fires `complete` before they render, so a single-shot classify
-    // would see no download button, return unknown, and never retry (SPA: no
-    // second complete).
+    // Captured 2026-08-03 from the institutionally entitled JSTOR stable/20183234 page
+    // (fixtures/jstor/success.html). The page renders the PDF in its viewer and
+    // exposes the download only as a custom-element control: there is no
+    // citation_pdf_url/meta, anchor href, or embedded PDF URL to fetch. Keep
+    // classification tied to the primary PDF control (secondary recommendation
+    // controls use the same data-qa/data-doi shape) and invoke that control
+    // instead of synthesizing /stable/pdf/<id>.pdf, which can return a terms or
+    // viewer HTML interstitial rather than the PDF. A terms modal may appear
+    // after this click; the terms rule remains first so the consented
+    // termsAccept path can handle it, otherwise the page stays assisted.
     id: "jstor",
-    version: "0.1.0",
+    version: "0.2.0",
     hosts: ["jstor.org"],
     settleTimeoutMs: 5000,
     classify: [
@@ -352,16 +355,17 @@ export const adapters: AdapterSpec[] = [
       },
       {
         kind: "article",
-        all: ["mfe-download-pharos-button[data-qa='download-pdf'][data-doi]"],
+        all: [
+          "mfe-download-pharos-button[data-qa='download-pdf'][data-doi][data-sc='but click:pdf download'][variant='primary']",
+        ],
       },
     ],
     download: {
-      selector: "mfe-download-pharos-button[data-qa='download-pdf'][data-doi]",
+      selector:
+        "mfe-download-pharos-button[data-qa='download-pdf'][data-doi][data-sc='but click:pdf download'][variant='primary']",
       requireKind: "article",
-      method: "url",
-      idPattern: "/stable/([^?#]+)",
-      urlTemplate: "https://www.jstor.org/stable/pdf/{id}.pdf",
-      requiresTermsConsent: true,
+      method: "click",
+      shadowSelector: "#button-element",
     },
     termsAccept: {
       modalSelector: "mfe-download-pharos-modal.terms-and-conditions[open]",

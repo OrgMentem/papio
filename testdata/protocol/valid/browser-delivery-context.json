@@ -1,0 +1,13 @@
+{
+  "protocol": "papio-browser/1",
+  "type": "delivery_context",
+  "msg_id": "delivery-ctx-001",
+  "job_id": "job-delivery-001",
+  "seq": 4,
+  "payload": {
+    "download_id": 17,
+    "route": "resolver",
+    "page_host": "publisher.example.edu",
+    "session_evidence": "warm"
+  }
+}

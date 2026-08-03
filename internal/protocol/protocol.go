@@ -609,8 +609,10 @@ const (
 	MsgJobReject                = "job_reject"
 	MsgAuthPending              = "auth_pending"
 	MsgAuthReturned             = "auth_returned"
+	MsgSessionEvidence          = "session_evidence"
 	MsgDownloadStarted          = "download_started"
 	MsgDownloadComplete         = "download_complete"
+	MsgDeliveryContext          = "delivery_context"
 	MsgProviderOutcome          = "provider_outcome"
 	MsgCancel                   = "cancel"
 	MsgHandoffFocus             = "handoff_focus"
@@ -636,7 +638,7 @@ const (
 var jobScoped = map[string]bool{
 	MsgJobOffer: true, MsgJobAccept: true, MsgJobReject: true, MsgHandoffOutcome: true,
 	MsgAuthPending: true, MsgAuthReturned: true,
-	MsgDownloadStarted: true, MsgDownloadComplete: true,
+	MsgDownloadStarted: true, MsgDownloadComplete: true, MsgDeliveryContext: true,
 	MsgProviderOutcome: true, MsgCancel: true, MsgHandoffFocus: true,
 }
 
@@ -721,6 +723,15 @@ type AuthPayload struct {
 	ElapsedMS *int64 `json:"elapsed_ms,omitempty"`
 }
 
+// SessionEvidencePayload reports timing-only evidence that the institutional
+// resolver session is available. origin_hint is a bare resolver origin and
+// never carries an IdP path or query.
+type SessionEvidencePayload struct {
+	Evidence   string `json:"evidence"`
+	OriginHint string `json:"origin_hint,omitempty"`
+	At         string `json:"at"`
+}
+
 // DownloadStartedPayload reports a Chrome download the adapter initiated or
 // the user selected for this job.
 type DownloadStartedPayload struct {
@@ -733,6 +744,15 @@ type DownloadCompletePayload struct {
 	DownloadID int64  `json:"download_id"`
 	Filename   string `json:"filename"`
 	SizeBytes  int64  `json:"size_bytes"`
+}
+
+// DeliveryContextPayload records the observed route and browser-session
+// evidence for one completed download. PageHost is optional and hostname-only.
+type DeliveryContextPayload struct {
+	DownloadID      int64  `json:"download_id"`
+	Route           string `json:"route"`
+	PageHost        string `json:"page_host,omitempty"`
+	SessionEvidence string `json:"session_evidence"`
 }
 
 // ProviderOutcomePayload is the adapter's terminal observation for a job.
@@ -762,15 +782,18 @@ type TriageSnapshotRequestPayload struct {
 	Cursor         string  `json:"cursor,omitempty"`
 }
 
-// TriageCounts contains complete, unpaginated inbox counts.
+// TriageCounts contains complete, unpaginated inbox counts. The optional
+// ActionsRequiresAuth field is populated only for the negotiated counts
+// response schema v2; snapshots and legacy counts responses omit it.
 type TriageCounts struct {
-	PendingTotal    int64 `json:"pending_total"`
-	WatchHits       int64 `json:"watch_hits"`
-	Actions         int64 `json:"actions"`
-	Retractions     int64 `json:"retractions"`
-	JobsWorking     int64 `json:"jobs_working"`
-	JobsNeedsReview int64 `json:"jobs_needs_review"`
-	FailureGroups7d int64 `json:"failure_groups_7d"`
+	PendingTotal        int64  `json:"pending_total"`
+	WatchHits           int64  `json:"watch_hits"`
+	Actions             int64  `json:"actions"`
+	ActionsRequiresAuth *int64 `json:"actions_requires_auth,omitempty"`
+	Retractions         int64  `json:"retractions"`
+	JobsWorking         int64  `json:"jobs_working"`
+	JobsNeedsReview     int64  `json:"jobs_needs_review"`
+	FailureGroups7d     int64  `json:"failure_groups_7d"`
 }
 
 // TriageFact is bounded display text attached to an inbox item.
@@ -846,8 +869,10 @@ type TriageSnapshotResponsePayload struct {
 }
 
 // TriageCountsRequestPayload asks for complete counts without a snapshot page.
+// Legacy extensions omit SchemaVersions and receive the locked v1 shape.
 type TriageCountsRequestPayload struct {
-	RequestID string `json:"request_id"`
+	RequestID      string  `json:"request_id"`
+	SchemaVersions []int64 `json:"schema_versions,omitempty"`
 }
 
 // TriageCountsResponsePayload is the correlated complete-count response.
@@ -1199,6 +1224,18 @@ func DecodeBrowserMessage(data []byte) (*BrowserMessage, error) {
 			err = fmt.Errorf("elapsed_ms must be in range 0..%d", MaxBrowserInteger)
 		}
 		msg.Payload = p
+	case MsgSessionEvidence:
+		p := &SessionEvidencePayload{}
+		if err = browserRequireFields(payloadFields, "evidence", "at"); err == nil {
+			err = browserRejectNullFields(payloadFields, "origin_hint")
+		}
+		if err == nil {
+			err = strictDecode(env.Payload, p)
+		}
+		if err == nil {
+			err = p.validate()
+		}
+		msg.Payload = p
 	case MsgDownloadStarted:
 		p := &DownloadStartedPayload{}
 		if err = browserRequireFields(payloadFields, "download_id", "filename"); err == nil {
@@ -1206,6 +1243,18 @@ func DecodeBrowserMessage(data []byte) (*BrowserMessage, error) {
 		}
 		if err == nil {
 			err = validateDownload(p.DownloadID, p.Filename)
+		}
+		msg.Payload = p
+	case MsgDeliveryContext:
+		p := &DeliveryContextPayload{}
+		if err = browserRequireFields(payloadFields, "download_id", "route", "session_evidence"); err == nil {
+			err = browserRejectNullFields(payloadFields, "page_host")
+		}
+		if err == nil {
+			err = strictDecode(env.Payload, p)
+		}
+		if err == nil {
+			err = p.validate()
 		}
 		msg.Payload = p
 	case MsgDownloadComplete:
@@ -1263,9 +1312,14 @@ func DecodeBrowserMessage(data []byte) (*BrowserMessage, error) {
 		msg.Payload = p
 	case MsgTriageCountsRequest:
 		p := &TriageCountsRequestPayload{}
-		err = decodeTriagePayload(env.Payload, payloadFields, "triage_counts_request", []string{"request_id"}, p)
+		if err = browserRequireFields(payloadFields, "request_id"); err == nil {
+			err = browserRejectNullFields(payloadFields, "schema_versions")
+		}
 		if err == nil {
-			err = validateCorrelationID("triage_counts_request.request_id", p.RequestID)
+			err = decodeTriagePayload(env.Payload, payloadFields, "triage_counts_request", []string{"request_id"}, p)
+		}
+		if err == nil {
+			err = p.validate()
 		}
 		msg.Payload = p
 	case MsgTriageCountsResponse:
@@ -1558,6 +1612,28 @@ func validateDownload(id int64, filename string) error {
 	return nil
 }
 
+func (p *DeliveryContextPayload) validate() error {
+	if p.DownloadID < 0 || p.DownloadID > MaxBrowserInteger {
+		return fmt.Errorf("delivery_context.download_id must be in range 0..%d", MaxBrowserInteger)
+	}
+	if err := enumRequired("delivery_context.route", p.Route, "resolver", "direct", "oa"); err != nil {
+		return err
+	}
+	if err := enumRequired("delivery_context.session_evidence", p.SessionEvidence, "fresh_auth", "warm", "none"); err != nil {
+		return err
+	}
+	if p.Route == "oa" && p.SessionEvidence != "none" {
+		return fmt.Errorf("delivery_context.route oa requires session_evidence none")
+	}
+	if p.PageHost != "" {
+		if browserTextLen(p.PageHost) > 128 || !hostRE.MatchString(p.PageHost) ||
+			strings.Contains(p.PageHost, "..") || strings.HasPrefix(p.PageHost, ".") || strings.HasSuffix(p.PageHost, ".") {
+			return fmt.Errorf("delivery_context.page_host must be a bounded lowercase registrable hostname")
+		}
+	}
+	return nil
+}
+
 func decodeTriagePayload(data []byte, fields map[string]json.RawMessage, what string, required []string, target any) error {
 	if err := browserRequireFields(fields, required...); err != nil {
 		return err
@@ -1629,6 +1705,37 @@ func validateTriageTime(what, value string) error {
 	return nil
 }
 
+func (p *SessionEvidencePayload) validate() error {
+	if err := enumRequired("session_evidence.evidence", p.Evidence, "warm_verified", "auth_returned"); err != nil {
+		return err
+	}
+	if err := validateTriageTime("session_evidence.at", p.At); err != nil {
+		return err
+	}
+	if p.OriginHint != "" {
+		if utf8.RuneCountInString(p.OriginHint) > 300 {
+			return fmt.Errorf("session_evidence.origin_hint exceeds 300 chars")
+		}
+		if err := validateBareRoute(p.OriginHint); err != nil {
+			return fmt.Errorf("session_evidence.origin_hint: %w", err)
+		}
+	}
+	return nil
+}
+
+func (p *TriageCountsRequestPayload) validate() error {
+	if err := validateCorrelationID("triage_counts_request.request_id", p.RequestID); err != nil {
+		return err
+	}
+	if len(p.SchemaVersions) == 0 {
+		return nil
+	}
+	if len(p.SchemaVersions) != 1 || (p.SchemaVersions[0] != 1 && p.SchemaVersions[0] != 2) {
+		return fmt.Errorf("triage_counts_request.schema_versions must be [1] or [2]")
+	}
+	return nil
+}
+
 func (p *TriageSnapshotRequestPayload) validate() error {
 	if err := validateCorrelationID("triage_snapshot_request.request_id", p.RequestID); err != nil {
 		return err
@@ -1646,6 +1753,9 @@ func (counts TriageCounts) validate() error {
 	values := []int64{
 		counts.PendingTotal, counts.WatchHits, counts.Actions, counts.Retractions,
 		counts.JobsWorking, counts.JobsNeedsReview, counts.FailureGroups7d,
+	}
+	if counts.ActionsRequiresAuth != nil {
+		values = append(values, *counts.ActionsRequiresAuth)
 	}
 	for _, value := range values {
 		if value < 0 || value > MaxBrowserInteger {
@@ -1919,6 +2029,9 @@ func (p *TriageSnapshotResponsePayload) validate() error {
 	}
 	if err := p.Counts.validate(); err != nil {
 		return err
+	}
+	if p.Counts.ActionsRequiresAuth != nil {
+		return fmt.Errorf("triage_snapshot_response.counts cannot include actions_requires_auth")
 	}
 	if len(p.Items) > 100 {
 		return fmt.Errorf("triage_snapshot_response.items capped at 100")

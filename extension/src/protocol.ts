@@ -24,8 +24,10 @@ export type BrowserMessageType =
   | "job_reject"
   | "auth_pending"
   | "auth_returned"
+  | "session_evidence"
   | "download_started"
   | "download_complete"
+  | "delivery_context"
   | "provider_outcome"
   | "cancel"
   | "handoff_focus"
@@ -120,6 +122,14 @@ export interface AuthPayload {
   elapsed_ms?: number;
 }
 
+/** Timing-only evidence that an institutional resolver session is available.
+ * origin_hint is a bare resolver origin and never an IdP path or query. */
+export interface SessionEvidencePayload {
+  evidence: "warm_verified" | "auth_returned";
+  origin_hint?: string;
+  at: string;
+}
+
 export interface DownloadStartedPayload {
   download_id: number;
   filename: string;
@@ -129,6 +139,16 @@ export interface DownloadCompletePayload {
   download_id: number;
   filename: string;
   size_bytes: number;
+}
+
+export type DeliveryRoute = "resolver" | "direct" | "oa";
+export type DeliverySessionEvidence = "fresh_auth" | "warm" | "none";
+
+export interface DeliveryContextPayload {
+  download_id: number;
+  route: DeliveryRoute;
+  page_host?: string;
+  session_evidence: DeliverySessionEvidence;
 }
 
 export type ProviderOutcome =
@@ -156,6 +176,8 @@ export interface TriageCounts {
   pending_total: number;
   watch_hits: number;
   actions: number;
+  /** Present only in the negotiated triage counts response schema v2. */
+  actions_requires_auth?: number;
   retractions: number;
   jobs_working: number;
   jobs_needs_review: number;
@@ -219,6 +241,7 @@ export interface TriageSnapshotItem {
 
 export interface TriageCountsRequestPayload {
   request_id: string;
+  schema_versions?: [1] | [2];
 }
 
 export interface TriageCountsResponsePayload {
@@ -335,8 +358,10 @@ const MSG_TYPES: Record<string, true> = {
   job_reject: true,
   auth_pending: true,
   auth_returned: true,
+  session_evidence: true,
   download_started: true,
   download_complete: true,
+  delivery_context: true,
   provider_outcome: true,
   cancel: true,
   handoff_focus: true,
@@ -367,6 +392,7 @@ const JOB_SCOPED: Record<string, true> = {
   auth_returned: true,
   download_started: true,
   download_complete: true,
+  delivery_context: true,
   provider_outcome: true,
   cancel: true,
   handoff_focus: true,
@@ -410,8 +436,7 @@ function requireKeys(obj: Record<string, unknown>, what: string, required: strin
     if (!(key in obj)) fail(`${what}: missing required field ${JSON.stringify(key)}`);
   }
 }
-
-type FieldSpec<T> = { [K in keyof Required<T> & string]: "required" | "optional" };
+type FieldSpec<T> = { [K in keyof T & string]?: "required" | "optional" };
 
 function requireFields<T>(obj: Record<string, unknown>, what: string, spec: FieldSpec<T>): void {
   for (const key of Object.keys(obj)) {
@@ -494,7 +519,7 @@ function triageURL(value: string, what: string, scheme: "http:" | "https:"): URL
   }
 }
 
-function triageCounts(raw: unknown, what: string): void {
+function triageCounts(raw: unknown, what: string, allowAuth = false): void {
   const counts = asRecord(raw, what);
   const fields = [
     "pending_total",
@@ -509,6 +534,7 @@ function triageCounts(raw: unknown, what: string): void {
     pending_total: "required",
     watch_hits: "required",
     actions: "required",
+    ...(allowAuth ? { actions_requires_auth: "optional" as const } : {}),
     retractions: "required",
     jobs_working: "required",
     jobs_needs_review: "required",
@@ -517,6 +543,7 @@ function triageCounts(raw: unknown, what: string): void {
   const pending = int(counts, "pending_total", what, 0);
   const visible = int(counts, "watch_hits", what, 0) + int(counts, "actions", what, 0) + int(counts, "retractions", what, 0);
   for (const key of fields.slice(4)) int(counts, key, what, 0);
+  if (allowAuth && "actions_requires_auth" in counts) int(counts, "actions_requires_auth", what, 0);
   if (pending !== visible) fail(`${what}.pending_total must equal visible item counts`);
 }
 
@@ -827,6 +854,31 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
       if ("elapsed_ms" in p) int(p, "elapsed_ms", type, 0);
       break;
     }
+    case "session_evidence": {
+      requireFields<SessionEvidencePayload>(p, "session_evidence", {
+        evidence: "required",
+        origin_hint: "optional",
+        at: "required",
+      });
+      const evidence = str(p, "evidence", "session_evidence", 20);
+      if (evidence !== "warm_verified" && evidence !== "auth_returned") {
+        fail(`session_evidence.evidence is invalid: ${JSON.stringify(evidence)}`);
+      }
+      triageTime(p, "at", "session_evidence");
+      if ("origin_hint" in p) {
+        const origin = str(p, "origin_hint", "session_evidence", 300);
+        try {
+          const parsed = new URL(origin);
+          if (parsed.protocol !== "https:" || parsed.host === "" || `${parsed.protocol}//${parsed.host}` !== origin) {
+            fail("session_evidence.origin_hint must be a bare https origin");
+          }
+        } catch (e) {
+          if (e instanceof ProtocolError) throw e;
+          fail("session_evidence.origin_hint must be a bare https origin");
+        }
+      }
+      break;
+    }
     case "download_started": {
       requireFields<DownloadStartedPayload>(p, "download_started", { download_id: "required", filename: "required" });
       int(p, "download_id", "download_started", 0);
@@ -842,6 +894,33 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
         fail("download_complete.filename must be a bare name without path separators");
       }
       int(p, "size_bytes", "download_complete", 1);
+      break;
+    }
+    case "delivery_context": {
+      requireFields<DeliveryContextPayload>(p, "delivery_context", {
+        download_id: "required",
+        route: "required",
+        page_host: "optional",
+        session_evidence: "required",
+      });
+      int(p, "download_id", "delivery_context", 0);
+      const route = str(p, "route", "delivery_context", 20);
+      if (route !== "resolver" && route !== "direct" && route !== "oa") {
+        fail(`delivery_context.route is invalid: ${JSON.stringify(route)}`);
+      }
+      const evidence = str(p, "session_evidence", "delivery_context", 20);
+      if (evidence !== "fresh_auth" && evidence !== "warm" && evidence !== "none") {
+        fail(`delivery_context.session_evidence is invalid: ${JSON.stringify(evidence)}`);
+      }
+      if (route === "oa" && evidence !== "none") {
+        fail("delivery_context.route oa requires session_evidence none");
+      }
+      if ("page_host" in p) {
+        const pageHost = str(p, "page_host", "delivery_context", 128);
+        if (!HOST_RE.test(pageHost) || pageHost.includes("..") || pageHost.startsWith(".") || pageHost.endsWith(".")) {
+          fail("delivery_context.page_host must be a bounded lowercase registrable hostname");
+        }
+      }
       break;
     }
     case "provider_outcome": {
@@ -932,14 +1011,23 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
       break;
     }
     case "triage_counts_request": {
-      requireFields<TriageCountsRequestPayload>(p, "triage_counts_request", { request_id: "required" });
+      requireFields<TriageCountsRequestPayload>(p, "triage_counts_request", {
+        request_id: "required",
+        schema_versions: "optional",
+      });
       correlationID(p, "request_id", "triage_counts_request");
+      if ("schema_versions" in p) {
+        const versions = p["schema_versions"];
+        if (!Array.isArray(versions) || versions.length !== 1 || (versions[0] !== 1 && versions[0] !== 2)) {
+          fail("triage_counts_request.schema_versions must be [1] or [2]");
+        }
+      }
       break;
     }
     case "triage_counts_response": {
       requireFields<TriageCountsResponsePayload>(p, "triage_counts_response", { request_id: "required", counts: "required" });
       correlationID(p, "request_id", "triage_counts_response");
-      triageCounts(p["counts"], "triage_counts_response.counts");
+      triageCounts(p["counts"], "triage_counts_response.counts", true);
       break;
     }
     case "triage_decide": {

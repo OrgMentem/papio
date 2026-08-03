@@ -64,7 +64,7 @@ func TestRunReadyProfilePassesWithoutLeakingSecrets(t *testing.T) {
 	}
 	var dbPass bool
 	for _, c := range report.Checks {
-		if c.Name == "database" && c.Status == Pass && strings.Contains(c.Detail, "schema version 18") {
+		if c.Name == "database" && c.Status == Pass && strings.Contains(c.Detail, "schema version 19") {
 			dbPass = true
 		}
 	}
@@ -216,9 +216,9 @@ func TestRunWarnsOnRawAlmaResolverBase(t *testing.T) {
 	cfg.AccessMode = config.ModeConservative
 	cfg.DataDir = t.TempDir()
 	cfg.Email = "a@b.test"
-	cfg.Browser.OpenURLBase = "https://une.alma.exlibrisgroup.com/view/uresolver/61UNE_INST/openurl"
+	cfg.Browser.OpenURLBase = "https://example.alma.exlibrisgroup.com/view/uresolver/61EXU_INST/openurl"
 	cfg.Browser.Resolvers = map[string]config.Institution{
-		"primo": {OpenURLBase: "https://une.primo.exlibrisgroup.com/nde/openurl?vid=61UNE_INST:61UNE_NDE"},
+		"primo": {OpenURLBase: "https://example.primo.exlibrisgroup.com/nde/openurl?vid=61EXU_INST:61EXU_NDE"},
 		"alma":  {OpenURLBase: "https://x.alma.exlibrisgroup.com/view/uresolver/61X_INST/openurl?svc_dat=viewit"},
 	}
 	tool := executable(t)
@@ -243,7 +243,7 @@ func TestRunPassesOnPrimoResolverBase(t *testing.T) {
 	cfg.AccessMode = config.ModeConservative
 	cfg.DataDir = t.TempDir()
 	cfg.Email = "a@b.test"
-	cfg.Browser.OpenURLBase = "https://une.primo.exlibrisgroup.com/nde/openurl?vid=61UNE_INST:61UNE_NDE"
+	cfg.Browser.OpenURLBase = "https://example.primo.exlibrisgroup.com/nde/openurl?vid=61EXU_INST:61EXU_NDE"
 	tool := executable(t)
 	report := Run(context.Background(), cfg, nil, pdf.Capability{PDFToText: tool}, tool, nil)
 	for _, c := range report.Checks {

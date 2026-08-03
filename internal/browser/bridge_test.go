@@ -352,7 +352,7 @@ func TestHelloAckAnnouncesDaemonVersion(t *testing.T) {
 		t.Fatalf("daemon_version = %q, want 0.1.0-test", payload.DaemonVersion)
 	}
 	if !slices.Equal(payload.Features, []string{
-		pageAcquireFeature, triageSnapshotFeature, triageSnapshotSchema2Feature, triageMutationsFeature, reviewPreviewFeature, statsFeature, pageCaptureFeature, activityFeedFeature,
+		pageAcquireFeature, triageSnapshotFeature, triageSnapshotSchema2Feature, triageMutationsFeature, reviewPreviewFeature, statsFeature, pageCaptureFeature, activityFeedFeature, triageCountsSchema2Feature, sessionEvidenceFeature, deliveryContextFeature,
 	}) {
 		t.Fatalf("features = %v, want required bridge feature set", payload.Features)
 	}
@@ -497,6 +497,31 @@ func TestTriageCountsResponseEchoesRequestID(t *testing.T) {
 	}
 	if payload := result.Payload.(*protocol.TriageCountsResponsePayload); payload.RequestID != "request-count-001" {
 		t.Fatalf("counts response request_id = %q", payload.RequestID)
+	}
+}
+
+func TestTriageCountsNegotiatesAuthField(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	parkInstitutional(t, jobs, "wr_counts_auth", handoffWork(), "")
+
+	legacy, _ := runSync(t, b, hello(), inFrame(t, protocol.MsgTriageCountsRequest, "",
+		protocol.TriageCountsRequestPayload{RequestID: "request-count-v1"}))
+	v1 := firstOfType(legacy, protocol.MsgTriageCountsResponse)
+	if v1 == nil {
+		t.Fatalf("legacy counts response missing: %v", legacy)
+	}
+	if got := v1.Payload.(*protocol.TriageCountsResponsePayload).Counts.ActionsRequiresAuth; got != nil {
+		t.Fatalf("legacy counts unexpectedly included auth count: %v", *got)
+	}
+
+	negotiated, _ := runSync(t, b, inFrame(t, protocol.MsgTriageCountsRequest, "",
+		protocol.TriageCountsRequestPayload{RequestID: "request-count-v2", SchemaVersions: []int64{2}}))
+	v2 := firstOfType(negotiated, protocol.MsgTriageCountsResponse)
+	if v2 == nil {
+		t.Fatalf("schema-2 counts response missing: %v", negotiated)
+	}
+	if got := v2.Payload.(*protocol.TriageCountsResponsePayload).Counts.ActionsRequiresAuth; got == nil || *got != 1 {
+		t.Fatalf("schema-2 auth count = %v, want 1", got)
 	}
 }
 
@@ -1612,6 +1637,71 @@ func TestAuthReturnedReoffersEligibleInstitutionalSiblingsOnce(t *testing.T) {
 		msgs, _ := runSync(t, b, frames...)
 		if got := countType(msgs, protocol.MsgJobOffer); got != 0 {
 			t.Fatalf("sibling was re-offered %d additional times", got)
+		}
+	}
+}
+
+func TestSessionEvidenceReoffersParkedOpenURLHandoffsNotManualDownloads(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	source := parkInstitutional(t, jobs, "wr_evidence_source", handoffWork(), "")
+	sibling := parkInstitutional(t, jobs, "wr_evidence_sibling", handoffWork(), "")
+	manual := parkInstitutional(t, jobs, "wr_evidence_manual", handoffWork(), "")
+	if _, err := jobs.S.DB().ExecContext(ctx,
+		`UPDATE human_actions SET kind = 'manual_download' WHERE job_id = ?`, manual); err != nil {
+		t.Fatal(err)
+	}
+	runSync(t, b, hello())
+	if !b.offered[source] {
+		t.Fatal("source handoff was not initially offered")
+	}
+	b.mu.Lock()
+	delete(b.offered, sibling)
+	delete(b.offered, manual)
+	b.mu.Unlock()
+
+	msgs, _ := runSync(t, b, inFrame(t, protocol.MsgSessionEvidence, "",
+		map[string]any{"evidence": "warm_verified", "at": "2026-08-03T12:00:00Z"}))
+	if got := countType(msgs, protocol.MsgJobOffer); got != 1 {
+		t.Fatalf("parked openurl reoffers = %d, want one", got)
+	}
+	offer := firstOfType(msgs, protocol.MsgJobOffer)
+	if offer == nil || offer.JobID != sibling {
+		t.Fatalf("re-offered job = %#v, want %s", offer, sibling)
+	}
+	repeat, _ := runSync(t, b, inFrame(t, protocol.MsgSessionEvidence, "",
+		map[string]any{"evidence": "warm_verified", "at": "2026-08-03T12:00:01Z"}))
+	if got := countType(repeat, protocol.MsgJobOffer); got != 0 {
+		t.Fatalf("throttled evidence emitted %d offers", got)
+	}
+	var evidenceEvents int
+	if err := jobs.S.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM events WHERE kind = 'browser.session_evidence'`).Scan(&evidenceEvents); err != nil {
+		t.Fatal(err)
+	}
+	if evidenceEvents != 1 {
+		t.Fatalf("session evidence events = %d, want one", evidenceEvents)
+	}
+	events, err := jobs.Events(ctx, sibling)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, event := range events {
+		if event["kind"] == "browser.handoff_reoffered" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("missing reoffer event for parked sibling: %#v", events)
+	}
+	events, err = jobs.Events(ctx, manual)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range events {
+		if event["kind"] == "browser.handoff_reoffered" {
+			t.Fatalf("manual download was re-offered: %#v", event)
 		}
 	}
 }

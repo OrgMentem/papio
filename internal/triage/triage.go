@@ -218,13 +218,14 @@ func (item *Item) UnmarshalJSON(data []byte) error {
 
 // Counts is complete even when Snapshot.Items is paginated.
 type Counts struct {
-	PendingTotal    int `json:"pending_total"`
-	WatchHits       int `json:"watch_hits"`
-	Actions         int `json:"actions"`
-	Retractions     int `json:"retractions"`
-	JobsWorking     int `json:"jobs_working"`
-	JobsNeedsReview int `json:"jobs_needs_review"`
-	FailureGroups7d int `json:"failure_groups_7d"`
+	PendingTotal        int `json:"pending_total"`
+	WatchHits           int `json:"watch_hits"`
+	Actions             int `json:"actions"`
+	ActionsRequiresAuth int `json:"actions_requires_auth"`
+	Retractions         int `json:"retractions"`
+	JobsWorking         int `json:"jobs_working"`
+	JobsNeedsReview     int `json:"jobs_needs_review"`
+	FailureGroups7d     int `json:"failure_groups_7d"`
 }
 
 // SnapshotRequest controls a bounded view into a complete snapshot ordering.
@@ -628,6 +629,11 @@ func (s *Service) collect(ctx context.Context) ([]Item, Counts, int, string, err
 
 func snapshotCounts(ctx context.Context, tx *sql.Tx, watchHits, actions int, jobs *job.Store) (Counts, error) {
 	counts := Counts{WatchHits: watchHits, Actions: actions}
+	if err := tx.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM human_actions
+		WHERE status = 'open' AND requires_auth = 1`).Scan(&counts.ActionsRequiresAuth); err != nil {
+		return Counts{}, err
+	}
 	if err := tx.QueryRowContext(ctx, `
 		SELECT COUNT(*) FROM jobs
 		WHERE state IN ('queued', 'resolving', 'fetching', 'validating', 'awaiting_human', 'retry_wait')`).Scan(&counts.JobsWorking); err != nil {

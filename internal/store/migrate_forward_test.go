@@ -55,8 +55,8 @@ func TestOpenRollsForwardSchemaThirteenTagLedger(t *testing.T) {
 	}
 	defer migrated.Close()
 	version, err := migrated.UserVersion(ctx)
-	if err != nil || version != 18 {
-		t.Fatalf("user_version = %d, %v; want 18", version, err)
+	if err != nil || version != 19 {
+		t.Fatalf("user_version = %d, %v; want 19", version, err)
 	}
 	var status string
 	if err := migrated.DB().QueryRowContext(ctx,
@@ -98,7 +98,7 @@ func TestOpenRollsForwardSchemaOneWithoutLosingDurableRows(t *testing.T) {
 		INSERT INTO jobs(id, work_request_id, state, policy_json, created_at, updated_at)
 		VALUES ('migration-job-delegated-0001', 'migration-request-0001', 'ready', '{"access_mode":"maximal","desired_version":"any","fetch_max_bytes":1048576}', '2026-07-15T00:00:00Z', '2026-07-15T00:00:00Z');
 		INSERT INTO candidates(job_id, source, url_redacted, url_key, version, access_basis, reuse_license, created_at)
-		VALUES ('migration-job-0001', 'browser', 'https://example.test/<redacted>', 'migration-candidate-key', 'published', 'subscription', 'unknown', '2026-07-15T00:00:00Z');
+		VALUES ('migration-job-0001', 'browser', 'https://example.test/<redacted>', 'migration-candidate-key', 'published', 'institutional', 'unknown', '2026-07-15T00:00:00Z');
 		INSERT INTO human_actions(job_id, kind, detail, created_at)
 		VALUES ('migration-job-0001', 'verify_identity', 'inspect local copy', '2026-07-15T00:00:00Z');
 		INSERT INTO human_actions(job_id, kind, detail, created_at)
@@ -120,8 +120,8 @@ func TestOpenRollsForwardSchemaOneWithoutLosingDurableRows(t *testing.T) {
 	}
 	defer migrated.Close()
 	version, err := migrated.UserVersion(ctx)
-	if err != nil || version != 18 {
-		t.Fatalf("user_version = %d, %v; want 18", version, err)
+	if err != nil || version != 19 {
+		t.Fatalf("user_version = %d, %v; want 19", version, err)
 	}
 
 	var jobs, actions, exports int
@@ -180,13 +180,14 @@ func TestOpenRollsForwardSchemaOneWithoutLosingDurableRows(t *testing.T) {
 		t.Fatalf("jobs.spent_usd = %v, want migration default 0", spent)
 	}
 	var accessBasis string
+	var browserRoute, sessionEvidence sql.NullString
 	var reviewOverride int
 	if err := migrated.DB().QueryRowContext(ctx,
-		"SELECT access_basis, review_override FROM candidates WHERE job_id = 'migration-job-0001'").Scan(&accessBasis, &reviewOverride); err != nil {
+		"SELECT access_basis, browser_route, session_evidence, review_override FROM candidates WHERE job_id = 'migration-job-0001'").Scan(&accessBasis, &browserRoute, &sessionEvidence, &reviewOverride); err != nil {
 		t.Fatalf("read migrated candidate: %v", err)
 	}
-	if accessBasis != "institutional" || reviewOverride != 0 {
-		t.Fatalf("candidate after migration = access_basis %q review_override %d, want institutional and 0", accessBasis, reviewOverride)
+	if accessBasis != "manual" || browserRoute.Valid || sessionEvidence.Valid || reviewOverride != 0 {
+		t.Fatalf("candidate after migration = access_basis %q browser_route=%v session_evidence=%v review_override %d, want manual, NULL, NULL, 0", accessBasis, browserRoute, sessionEvidence, reviewOverride)
 	}
 	var watchCount int
 	if err := migrated.DB().QueryRowContext(ctx, "SELECT COUNT(*) FROM watches").Scan(&watchCount); err != nil {

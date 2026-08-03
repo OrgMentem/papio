@@ -50,6 +50,34 @@ test("activity request and response round-trip through the shared corpus", () =>
   )).toThrow(ProtocolError);
 });
 
+test("counts schema negotiation and session evidence round-trip", () => {
+  const v1 = parseBrowserMessageBytes(
+    readFileSync(join(corpusRoot, "valid", "browser-triage-counts-response.json"), "utf8"),
+  );
+  expect(v1.payload["counts"]).not.toHaveProperty("actions_requires_auth");
+  const requestV2 = parseBrowserMessageBytes(
+    readFileSync(join(corpusRoot, "valid", "browser-triage-counts-request-v2.json"), "utf8"),
+  );
+  expect(requestV2.payload).toEqual({ request_id: "request-0003", schema_versions: [2] });
+  const v2 = parseBrowserMessageBytes(
+    readFileSync(join(corpusRoot, "valid", "browser-triage-counts-response-v2.json"), "utf8"),
+  );
+  expect((v2.payload["counts"] as Record<string, unknown>)["actions_requires_auth"]).toBe(1);
+  const evidence = parseBrowserMessageBytes(
+    readFileSync(join(corpusRoot, "valid", "browser-session-evidence.json"), "utf8"),
+  );
+  expect(evidence.payload).toEqual({
+    evidence: "warm_verified",
+    origin_hint: "https://resolver.example.edu",
+    at: "2026-08-03T12:00:00Z",
+  });
+  expect(() =>
+    parseBrowserMessageBytes(
+      readFileSync(join(corpusRoot, "invalid", "browser-session-evidence-missing-evidence.json"), "utf8"),
+    ),
+  ).toThrow(ProtocolError);
+});
+
 
 test("handoff_focus is an empty job-scoped frame listed by the shared schema", () => {
   const text = readFileSync(join(corpusRoot, "valid", "browser-handoff-focus.json"), "utf8");

@@ -422,6 +422,48 @@ func TestAdoptDownloadResolvesSatisfiedHandoffActions(t *testing.T) {
 	}
 }
 
+func TestAdoptDownloadValidationFailurePreservesHandoffAccess(t *testing.T) {
+	svc, jobs := newTestService(t)
+	svc.Validate = func(context.Context, string, string, work.Work) (pdf.ValidationReport, error) {
+		return pdf.ValidationReport{
+			Payload:    pdf.PayloadReport{OK: true},
+			Structural: pdf.StructuralReport{Valid: true, Pages: 2},
+			Text:       pdf.TextReport{Chars: 2000},
+			Identity:   pdf.IdentityDecision{Result: pdf.IdentityReject},
+		}, nil
+	}
+	ctx := context.Background()
+	id := parkAwaitingHuman(t, jobs, "wr_adopt_reject_access")
+	if _, err := jobs.OpenHumanAction(ctx, id, "openurl_handoff", InstitutionalOpenURLHandoffDetail,
+		job.Access(true, "paywall")); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(svc.Config.EffectiveAdoptionRoot(), id)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "paper.pdf")
+	if err := os.WriteFile(path, pdfBytes("rejected"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.AdoptDownload(ctx, id, path); err != nil {
+		t.Fatalf("adopt: %v", err)
+	}
+	actions, err := jobs.ListHumanActions(ctx, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, action := range actions {
+		if action.JobID == id && action.Kind == "manual_download" {
+			if !action.RequiresAuth || action.BlockedBy != "paywall" {
+				t.Fatalf("replacement access = requires_auth %t, blocked_by %q, want true/paywall", action.RequiresAuth, action.BlockedBy)
+			}
+			return
+		}
+	}
+	t.Fatal("missing replacement manual_download action")
+}
+
 func TestAcceptedAdoptionReviewReusesExactContentOverride(t *testing.T) {
 	svc, jobs := newTestService(t)
 	svc.Config.Browser.OpenURLBase = "https://resolver.example.edu/openurl"

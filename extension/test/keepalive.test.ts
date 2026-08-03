@@ -138,6 +138,7 @@ function makeHarness(
   interval: unknown = 4,
   workWindowID?: () => number | undefined,
   resolverConfig?: HarnessResolver,
+  warmDemand?: () => boolean,
 ): {
   manager: KeepaliveManager;
   api: KeepaliveAPI;
@@ -183,6 +184,7 @@ function makeHarness(
   const manager = new KeepaliveManager(api, {
     trackedJobCount: () => jobs.count,
     latestOpenURL: () => latestOpenURL,
+    ...(warmDemand !== undefined ? { warmDemand } : {}),
     ...(workWindowID !== undefined ? { workWindowID } : {}),
     onReauthNeeded: () => {
       reauths.count += 1;
@@ -224,6 +226,18 @@ test("creates one pinned resolver tab, reloads it, and closes it when jobs finis
   expect(h.timers.latestDelay()).toBe(4 * 60_000);
 
   h.jobs.count = 0;
+  await h.manager.sync();
+
+  expect(h.tabs.removed).toEqual([1]);
+});
+test("daemon warm demand keeps the resolver tab and closes after demand expires", async () => {
+  let demand = true;
+  const h = makeHarness(4, undefined, undefined, () => demand);
+  h.jobs.count = 0;
+  await h.manager.init();
+  expect(h.tabs.created).toHaveLength(1);
+
+  demand = false;
   await h.manager.sync();
   expect(h.tabs.removed).toEqual([1]);
 });

@@ -37,6 +37,15 @@ func ActivityText(kind string, detail map[string]any) string {
 		return "Institution login required"
 	case "browser.auth_returned":
 		return "Institution login returned"
+	case "browser.session_evidence":
+		return "Institution session verified — re-offering blocked work"
+	case "browser.delivery_context":
+		route := activityDetailString(detail, "route")
+		evidence := strings.ReplaceAll(activityDetailString(detail, "session_evidence"), "_", " ")
+		if route != "" && evidence != "" {
+			return clampActivityText(fmt.Sprintf("Access route recorded (%s, %s session)", route, evidence))
+		}
+		return "Access route recorded"
 	case "browser.handoff_offered":
 		return "Institution access handoff offered"
 	case "browser.handoff_failed":
