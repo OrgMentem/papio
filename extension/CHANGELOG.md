@@ -36,8 +36,9 @@ for the full pre-split extension history.
   primary text pill beside the inbox button (an icon proved too subtle); the
   full DOI detail stays on hover. Inbox tab labels now carry the daemon's
   totals instead of the loaded page size, operation feedback renders only on
-  the affected row (with a screen-reader announcer), and pagination controls
-  are panel-scoped.
+  the affected row (with a screen-reader announcer), pagination controls are
+  panel-scoped, and watch hits load themselves when the daemon count says
+  they exist — no Load more click required.
 - **One session row per institution.** The popup's institution card renders a
   row for every config-derived resolver origin advertised in the daemon hello —
   never for a provider offer or a host-permission grant. Each row has its own
@@ -45,11 +46,20 @@ for the full pre-split extension history.
   institution, and keep-warm tracks each origin separately. Warm evidence
   releases only that origin's queued extension handoffs and daemon-side sibling
   re-offers; another institution's queue remains parked.
-- **Session verdicts got stricter.** An auth-shaped URL alone never reads as
-  signed out (inspection evidence is required), expired identity tokens no
-  longer count as signed in, and sign-out markers are read only from real
-  controls, links, and forms — never from page scripts, styles, or aggregate
-  text.
+  A warm, freshly verified session earns zero pixels: rows render only when
+  the operator can act or the evidence has gone stale, so a quiet popup
+  means everything is live.
+- **Session verdicts got stricter — and evidence is never erased.** An
+  auth-shaped URL alone never reads as signed out (inspection evidence is
+  required); asserting "signed out" requires a *visible* sign-in affordance,
+  because Ex Libris platforms keep one buried in a closed drawer permanently
+  (sign-out affordances still count from inside closed menus, which is where
+  signed-in pages keep them); expired identity tokens no longer count as
+  signed in; and markers are read only from real controls, links, and forms —
+  never from page scripts, styles, or aggregate text. Earned verdicts stand
+  until new evidence replaces them: closing a library tab, opening a fresh
+  probe tab, or a service-worker nap no longer resets a warm session to
+  "unknown" (per-origin state now survives worker restarts).
 - **papio owns its surfaces — leftover tabs clean themselves up.** Broker tabs
   papio creates are recorded in a durable ledger that survives extension
   reloads. Shortly after startup, ledger-owned leftovers still sitting in the
@@ -77,14 +87,19 @@ for the full pre-split extension history.
   platforms (a bare `sub` claim never counts: anonymous tokens carry one).
   papio never asserts "signed out" without a completed inspection saying so,
   an inspection failure is reported distinctly from a clean miss, and an
-  evidence-free probe never latches. A warm session offers no sign-in button;
-  "Sign-in unblocked N items" announces once per release event. Options adds
+  evidence-free probe never latches. A warm session offers no sign-in button,
+  and freshness reads as relative age ("just now", "3m ago") rather than a
+  wall-clock time; "Sign-in unblocked N items" announces once per release
+  event. Options adds
   extension-local keep-warm enable/disable and refresh-interval controls;
   credentials and identity-provider hosts never enter the daemon protocol.
 - **Pages with an acquisition already in flight show live progress, not a dead
   button.** The popup renders the job's latest activity with its age, an
   honest "No progress for <time>" prefix when stalled, waiting-on-you wording
-  for parked jobs, and Open-inbox-item / Go-to-tab actions.
+  for parked jobs, and Open-inbox-item / Go-to-tab actions. A verified-warm
+  session outranks a stale login-required echo, and Go-to-tab hides when you
+  are already on the job's tab — a download from that tab is adopted
+  automatically.
 - **The inbox separates concerns into Actions, Watch hits, and Activity tabs**,
   with actionable items first and keyboard-accessible tab navigation. The
   Activity tab groups a bounded timeline by job, collapses repeats, and

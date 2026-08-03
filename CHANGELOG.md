@@ -28,10 +28,17 @@ execution records in `notes/acquisition-stack-plan.md`.
   captures the sanitized DOM through the existing pipeline, and the CLI
   returns the structured outcome and stored path. Fixture collection for
   adapter work is now fully agent-drivable — no screenshots, no human clicks.
+  The capture vocabulary gains the `informit` provider and a `terms` scenario
+  for consent-wall fixtures, validated on both sides of the wire.
 - **`papio failures` aggregates terminal and parked failure reasons** by
   reason (default) or provider (`--by-provider`) from each job's most recent
   decisive events, via the new `failures.list_v1` RPC with the usual `--json`
   envelope.
+- **The CLI explains itself at three former dead ends.** `papio actions open`
+  without a connected browser session prints what is missing and how to check
+  (`papio doctor`) instead of a bare exit code; `papio doctor` names the exact
+  remedy for a stopped daemon rather than only diagnosing it; and `papio jobs
+  show <id>` is an exact alias of `jobs get` instead of a silent no-op.
 - **`papio activity` exposes the daemon's recent operator activity.** The new
   `activity.list` RPC and CLI command show a bounded, newest-first view of the
   durable events table, with `--limit`, optional `--job` filtering, and the
