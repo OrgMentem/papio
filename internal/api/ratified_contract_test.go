@@ -21,20 +21,28 @@ import (
 )
 
 // ratifiedConsumerMethods is the IPC surface promised to the first external
-// consumer by ADR-0009, extended with acquire.submit_v2 by ADR-0010 and with
-// the two collection readers by ADR-0011. Removing or renaming one breaks that
+// consumer by ADR-0009, extended with acquire.submit_v2 by ADR-0010, with
+// the two collection readers by ADR-0011, and with the four attribution and
+// evidence readers by ADR-0013. Removing or renaming one breaks that
 // consumer, so this list is deliberately pinned to the live router rather than
 // documentation.
+//
+// acquire.submit_v3 is deliberately absent: ratifying params is the heavier
+// promise ADR-0010 describes, and nobody has asked for that one to be frozen.
 var ratifiedConsumerMethods = []string{
 	"acquire.submit_v2",
 	"jobs.list_v2",
+	"jobs.list_v3",
+	"jobs.get_v2",
 	"actions.list_v2",
+	"actions.list_v3",
 	"actions.open",
 	"jobs.receipt",
 	"jobs.add_component",
 	"jobs.repair_awaiting_human",
 	"bundle.document",
 	"artifacts.locate",
+	"artifacts.validation",
 }
 
 func TestRatifiedConsumerContract(t *testing.T) {
@@ -247,6 +255,51 @@ func TestRatifiedConsumerContract(t *testing.T) {
 		if rpcErr == nil || rpcErr.Code != "invalid_argument" {
 			t.Fatalf("unknown param = %+v, want invalid_argument", rpcErr)
 		}
+	})
+
+	// ADR-0010 Decision 1 freezes acquire.submit_v2's params at exactly
+	// `request` / `auto_import` / `force`, and reasons that param widening is the
+	// WORSE direction of skew: a newer consumer sending a key an older daemon
+	// lacks has its whole call rejected, not just the key. The subtest above
+	// proves one arbitrary unknown key is refused, which is not the same promise
+	// — it stays green while a fourth key is quietly added, and it did: consumer
+	// attribution was first built as a `consumer` param here before this pin
+	// existed. Each name below must be refused BY THIS METHOD, whatever else
+	// papio grows.
+	t.Run("submit_v2 params stay frozen at the ratified three", func(t *testing.T) {
+		for _, key := range []string{"consumer", "principal", "collection", "resolver", "idempotency_key"} {
+			t.Run(key, func(t *testing.T) {
+				router := RouterWithShutdown(nil, func() {})
+				rpcErr := callMethod(t, router, "acquire.submit_v2", map[string]any{
+					"request": map[string]any{"schema_version": "work-request/1", "request_id": "wr_frozen_" + key},
+					key:       "any-value",
+				}, nil)
+				if rpcErr == nil || rpcErr.Code != "invalid_argument" {
+					t.Fatalf("acquire.submit_v2 accepted param %q (= %+v); ADR-0010 froze its params at request/auto_import/force — additive evolution takes a new method name", key, rpcErr)
+				}
+			})
+		}
+	})
+
+	// The unratified successor that carries attribution. Pinned here only so the
+	// pair is visible in one place: submit_v3 is deliberately NOT in
+	// ratifiedConsumerMethods, because ratifying params is the heavier promise
+	// ADR-0010 describes and nobody has asked for this one to be frozen yet.
+	t.Run("submit_v3 carries consumer attribution", func(t *testing.T) {
+		system := testSystem(t)
+		var result map[string]json.RawMessage
+		rpcErr := callMethod(t, Router(system), "acquire.submit_v3", map[string]any{
+			"request": map[string]any{
+				"schema_version": "work-request/1",
+				"request_id":     "wr_v3_consumer",
+				"identifiers":    map[string]any{"doi": "10.1000/ratified-v3"},
+			},
+			"consumer": "a-consumer",
+		}, &result)
+		if rpcErr != nil {
+			t.Fatalf("acquire.submit_v3 with a consumer = %+v, want accepted", rpcErr)
+		}
+		assertRatifiedKeySet(t, result, "job_id", "existing")
 	})
 
 	// The collection readers are pure reads. bundle.export_v2 and artifacts.get

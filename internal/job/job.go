@@ -423,9 +423,9 @@ func (js *Store) createRequest(ctx context.Context, requestID string, w work.Wor
 	jobID := NewID("job")
 
 	if _, err := tx.ExecContext(ctx,
-		`INSERT OR IGNORE INTO work_requests (id, created_at, requester, consumer, zotio_item_key, collection_key, title, authors_json, year, desired_version, max_cost_usd)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		requestID, now, who.Principal, nullable(who.Consumer), nullable(zotioKey), nullable(collection), nullable(w.Title), string(authorsJSON), nullableInt(w.Year), pol.DesiredVersion, pol.MaxCostUSD); err != nil {
+		`INSERT OR IGNORE INTO work_requests (id, created_at, requester, zotio_item_key, collection_key, title, authors_json, year, desired_version, max_cost_usd)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		requestID, now, who.Principal, nullable(zotioKey), nullable(collection), nullable(w.Title), string(authorsJSON), nullableInt(w.Year), pol.DesiredVersion, pol.MaxCostUSD); err != nil {
 		return CreateResult{}, fmt.Errorf("inserting work request: %w", err)
 	}
 	for kind, value := range map[string]string{"doi": w.DOI, "pmid": w.PMID, "arxiv": w.ArXiv, "isbn": w.ISBN, "openalex": w.OpenAlex} {
@@ -442,9 +442,15 @@ func (js *Store) createRequest(ctx context.Context, requestID string, w work.Wor
 			return CreateResult{}, fmt.Errorf("inserting identifier %s: %w", kind, err)
 		}
 	}
+	// consumer is written here, on the job, rather than on the work_request the
+	// INSERT OR IGNORE above may have reused: the submitter asked for THIS
+	// acquisition. A resubmitted request id whose earlier jobs are terminal
+	// creates a new job, and it must carry the name of whoever resubmitted it
+	// rather than inheriting the first submitter's.
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO jobs (id, work_request_id, state, policy_json, created_at, updated_at) VALUES (?, ?, 'queued', ?, ?, ?)`,
-		jobID, requestID, string(polJSON), now, now); err != nil {
+		`INSERT INTO jobs (id, work_request_id, state, policy_json, consumer, created_at, updated_at)
+		 VALUES (?, ?, 'queued', ?, ?, ?, ?)`,
+		jobID, requestID, string(polJSON), nullable(who.Consumer), now, now); err != nil {
 		return CreateResult{}, fmt.Errorf("inserting job: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx,
@@ -1592,22 +1598,21 @@ func (js *Store) listJobs(ctx context.Context, state, consumer string, limit int
 	if probe {
 		fetch++
 	}
-	q := `SELECT j.id FROM jobs j`
+	q := `SELECT id FROM jobs`
 	args := []any{}
 	var where []string
 	if state != "" {
-		where = append(where, `j.state = ?`)
+		where = append(where, `state = ?`)
 		args = append(args, state)
 	}
 	if consumer != "" {
-		q += ` JOIN work_requests wr ON wr.id = j.work_request_id`
-		where = append(where, `wr.consumer = ?`)
+		where = append(where, `consumer = ?`)
 		args = append(args, consumer)
 	}
 	if len(where) != 0 {
 		q += ` WHERE ` + strings.Join(where, ` AND `)
 	}
-	q += ` ORDER BY j.created_at DESC LIMIT ?`
+	q += ` ORDER BY created_at DESC LIMIT ?`
 	args = append(args, fetch)
 	rows, err := js.S.DB().QueryContext(ctx, q, args...)
 	if err != nil {
@@ -2678,15 +2683,14 @@ func bareActions(rows []AttributedAction) []HumanAction {
 // page plus a proof of whether more exist: it fetches limit+1 rows and reports
 // whether the extra one was there.
 //
-// The work_requests reach is a LEFT JOIN on purpose: an action whose parent rows
-// have gone must still be listed and closable, so a missing attribution can
-// never make an open action disappear from the inbox.
+// The jobs reach is a LEFT JOIN on purpose: an action whose parent job row has
+// gone must still be listed and closable, so a missing attribution can never make
+// an open action disappear from the inbox.
 func (js *Store) listHumanActions(ctx context.Context, openOnly bool, jobIDs []string, consumer string, limit int) ([]AttributedAction, bool, error) {
 	q := `SELECT a.id, a.job_id, a.kind, a.status, COALESCE(a.detail,''), a.requires_auth, a.blocked_by, a.created_at,
-		COALESCE(a.candidate_id, 0), a.quarantine_path, a.quarantine_sha256, a.revision, wr.consumer
+		COALESCE(a.candidate_id, 0), a.quarantine_path, a.quarantine_sha256, a.revision, j.consumer
 		FROM human_actions a
-		LEFT JOIN jobs j ON j.id = a.job_id
-		LEFT JOIN work_requests wr ON wr.id = j.work_request_id`
+		LEFT JOIN jobs j ON j.id = a.job_id`
 	var where []string
 	var args []any
 	if openOnly {
@@ -2699,7 +2703,7 @@ func (js *Store) listHumanActions(ctx context.Context, openOnly bool, jobIDs []s
 		}
 	}
 	if consumer != "" {
-		where = append(where, `wr.consumer = ?`)
+		where = append(where, `j.consumer = ?`)
 		args = append(args, consumer)
 	}
 	if len(where) != 0 {

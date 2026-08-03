@@ -8,8 +8,18 @@
 -- submitted before this column existed, or by a caller that named no consumer,
 -- has no attribution, and inventing one ('', 'unknown', 'cli') would be a
 -- fabricated fact rather than an absent one.
-ALTER TABLE work_requests ADD COLUMN consumer TEXT;
-CREATE INDEX work_requests_by_consumer ON work_requests(consumer) WHERE consumer IS NOT NULL;
+--
+-- It lives on jobs, NOT on work_requests, because a submitter asks for an
+-- ACQUISITION and a job is the acquisition. One work_request row outlives many
+-- jobs: `INSERT OR IGNORE` reuses it whenever a request id is resubmitted, so a
+-- consumer column there would make a fresh job silently inherit the previous
+-- submitter's name once the earlier jobs went terminal — B's acquisition
+-- reported and billed as A's. On jobs each acquisition carries its own
+-- submitter, live convergence returns the original job with its original
+-- attribution untouched, and a terminal resubmission is attributed to whoever
+-- actually resubmitted it.
+ALTER TABLE jobs ADD COLUMN consumer TEXT;
+CREATE INDEX jobs_by_consumer ON jobs(consumer) WHERE consumer IS NOT NULL;
 
 -- validation_reports keeps every stage's evidence from internal/pdf's
 -- ValidationReport, which until now was computed, branched on, and discarded:

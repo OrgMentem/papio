@@ -172,7 +172,13 @@ func WorkerMain(in io.Reader, out io.Writer) error { return RunStructuralWorker(
 func inspectWithPDFCPU(req workerRequest) StructuralReport {
 	f, err := os.Open(req.Path)
 	if err != nil {
-		return StructuralReport{Reason: "open PDF: " + err.Error()}
+		// The path is deliberately absent from the reason. This string is now
+		// durable (validation-report/1) and reachable through an MCP tool, and
+		// os.Open's error always embeds the absolute quarantine path — which
+		// tells a reader nothing the job and candidate ids do not already say.
+		// Same discipline as app.safeType: report the category, never the
+		// upstream text.
+		return StructuralReport{Reason: "open PDF failed"}
 	}
 	defer func() { _ = f.Close() }()
 

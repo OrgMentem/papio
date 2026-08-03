@@ -113,7 +113,7 @@ func TestJobsListV3EnvelopeAndAttributionRowShape(t *testing.T) {
 func TestJobsListV3HonoursConsumerFilter(t *testing.T) {
 	system := testSystem(t)
 	want := map[string]bool{}
-	for i := 0; i < 2; i++ {
+	for i := range 2 {
 		id := createAPIAttributionTestJob(t, system.Jobs, fmt.Sprintf("api-list-v3-filter-a-%d", i),
 			fmt.Sprintf("10.1000/api-list-v3-filter-a-%d", i), "A")
 		want[id] = true
@@ -141,6 +141,77 @@ func TestJobsListV3HonoursConsumerFilter(t *testing.T) {
 		t.Fatalf("consumer A filter omitted jobs: %v", want)
 	}
 
+}
+
+func TestActionsListV3HonoursConsumerFilter(t *testing.T) {
+	system := testSystem(t)
+	ctx := context.Background()
+	want := map[int64]bool{}
+	for i := range 2 {
+		jobID := createAPIAttributionTestJob(t, system.Jobs, fmt.Sprintf("api-actions-v3-filter-a-%d", i),
+			fmt.Sprintf("10.1000/api-actions-v3-filter-a-%d", i), "A")
+		actionID, err := system.Jobs.OpenHumanAction(ctx, jobID, fmt.Sprintf("a_filter_%d", i), "A", job.Access(false, ""))
+		if err != nil {
+			t.Fatalf("open A action: %v", err)
+		}
+		want[actionID] = true
+	}
+	bJobID := createAPIAttributionTestJob(t, system.Jobs, "api-actions-v3-filter-b", "10.1000/api-actions-v3-filter-b", "B")
+	if _, err := system.Jobs.OpenHumanAction(ctx, bJobID, "b_filter", "B", job.Access(false, "")); err != nil {
+		t.Fatalf("open B action: %v", err)
+	}
+	noneJobID := createAPIAttributionTestJob(t, system.Jobs, "api-actions-v3-filter-none", "10.1000/api-actions-v3-filter-none", "")
+	noneActionID, err := system.Jobs.OpenHumanAction(ctx, noneJobID, "none_filter", "none", job.Access(false, ""))
+	if err != nil {
+		t.Fatalf("open unattributed action: %v", err)
+	}
+
+	var page ActionsPageV3
+	if rpcErr := callMethod(t, Router(system), "actions.list_v3", map[string]any{"consumer": "A", "limit": 10}, &page); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	if len(page.Actions) != len(want) || page.Truncated {
+		t.Fatalf("filtered actions page = %d rows truncated %t, want %d/false", len(page.Actions), page.Truncated, len(want))
+	}
+	for _, row := range page.Actions {
+		if !want[row.ID] {
+			t.Fatalf("consumer A filter returned action %d", row.ID)
+		}
+		if row.Consumer == nil || *row.Consumer != "A" {
+			t.Fatalf("filtered action %d consumer = %v, want A", row.ID, row.Consumer)
+		}
+		delete(want, row.ID)
+	}
+	if len(want) != 0 {
+		t.Fatalf("consumer A filter omitted actions: %v", want)
+	}
+
+	var unfiltered map[string]json.RawMessage
+	if rpcErr := callMethod(t, Router(system), "actions.list_v3", map[string]any{"open_only": true, "limit": 10}, &unfiltered); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	assertRatifiedKeySet(t, unfiltered, "actions", "truncated")
+	var rawActions []map[string]json.RawMessage
+	if err := json.Unmarshal(unfiltered["actions"], &rawActions); err != nil {
+		t.Fatalf("decode unfiltered actions: %v", err)
+	}
+	var foundUnattributed bool
+	for _, object := range rawActions {
+		var id int64
+		if err := json.Unmarshal(object["id"], &id); err != nil {
+			t.Fatalf("decode unfiltered action id: %v", err)
+		}
+		if id != noneActionID {
+			continue
+		}
+		foundUnattributed = true
+		if _, ok := object["consumer"]; ok {
+			t.Fatalf("unattributed action %d carried consumer key: %s", id, object["consumer"])
+		}
+	}
+	if !foundUnattributed {
+		t.Fatalf("unfiltered actions omitted unattributed action %d", noneActionID)
+	}
 }
 
 func TestActionsListV3ReportsOpenStalenessAndNeverStalesResolvedActions(t *testing.T) {
@@ -171,6 +242,10 @@ func TestActionsListV3ReportsOpenStalenessAndNeverStalesResolvedActions(t *testi
 		if _, err := system.Store.DB().ExecContext(ctx, `UPDATE human_actions SET created_at = ? WHERE id = ?`, old, actionID); err != nil {
 			t.Fatalf("age action %d: %v", actionID, err)
 		}
+	}
+	beforeOld, err := system.Jobs.Get(ctx, oldJobID)
+	if err != nil {
+		t.Fatalf("load old job before stale listings: %v", err)
 	}
 
 	var page ActionsPageV3
@@ -203,6 +278,28 @@ func TestActionsListV3ReportsOpenStalenessAndNeverStalesResolvedActions(t *testi
 			t.Fatalf("resolved action %d appeared in open queue", resolvedActionID)
 		}
 	}
+	afterOld, err := system.Jobs.Get(ctx, oldJobID)
+	if err != nil {
+		t.Fatalf("reload old job after stale listings: %v", err)
+	}
+	if afterOld.State != beforeOld.State || afterOld.TerminalReason != beforeOld.TerminalReason {
+		t.Fatalf("stale listing changed job: before state=%q terminal_reason=%q, after state=%q terminal_reason=%q",
+			beforeOld.State, beforeOld.TerminalReason, afterOld.State, afterOld.TerminalReason)
+	}
+	oldActions, err := system.Jobs.ListHumanActionsForJob(ctx, oldJobID)
+	if err != nil {
+		t.Fatalf("reload old actions after stale listings: %v", err)
+	}
+	var oldStillOpen bool
+	for _, attributed := range oldActions {
+		if attributed.Action.ID == oldActionID {
+			oldStillOpen = attributed.Action.Status == "open"
+			break
+		}
+	}
+	if !oldStillOpen {
+		t.Fatalf("stale action %d was not left open", oldActionID)
+	}
 }
 
 func TestJobsGetV2CarriesAttributionAndActionStaleness(t *testing.T) {
@@ -217,6 +314,10 @@ func TestJobsGetV2CarriesAttributionAndActionStaleness(t *testing.T) {
 	old := time.Now().UTC().Add(-time.Hour).Format(time.RFC3339Nano)
 	if _, err := system.Store.DB().ExecContext(ctx, `UPDATE human_actions SET created_at = ? WHERE id = ?`, old, actionID); err != nil {
 		t.Fatalf("age action: %v", err)
+	}
+	beforeJob, err := system.Jobs.Get(ctx, jobID)
+	if err != nil {
+		t.Fatalf("load job before jobs.get_v2: %v", err)
 	}
 
 	var rawDetail map[string]json.RawMessage
@@ -245,6 +346,21 @@ func TestJobsGetV2CarriesAttributionAndActionStaleness(t *testing.T) {
 	assertAPIAttributionJobRowShape(t, rawJob, *row, "inscribi")
 	if len(detail.Actions) != 1 || detail.Actions[0].ID != actionID || !detail.Actions[0].Stale || detail.Actions[0].AgeSeconds < 3600 {
 		t.Fatalf("job detail actions = %+v, want one stale old action", detail.Actions)
+	}
+	afterJob, err := system.Jobs.Get(ctx, jobID)
+	if err != nil {
+		t.Fatalf("reload job after jobs.get_v2: %v", err)
+	}
+	if afterJob.State != beforeJob.State || afterJob.TerminalReason != beforeJob.TerminalReason {
+		t.Fatalf("jobs.get_v2 changed job: before state=%q terminal_reason=%q, after state=%q terminal_reason=%q",
+			beforeJob.State, beforeJob.TerminalReason, afterJob.State, afterJob.TerminalReason)
+	}
+	actions, err := system.Jobs.ListHumanActionsForJob(ctx, jobID)
+	if err != nil {
+		t.Fatalf("reload action after jobs.get_v2: %v", err)
+	}
+	if len(actions) != 1 || actions[0].Action.ID != actionID || actions[0].Action.Status != "open" {
+		t.Fatalf("jobs.get_v2 changed stale action: %+v, want action %d open", actions, actionID)
 	}
 }
 

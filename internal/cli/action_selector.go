@@ -5,6 +5,7 @@ package cli
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -45,7 +46,14 @@ func (s actionSelector) active() bool { return s.jobID != "" || s.actionID > 0 }
 // apply keeps only the selected rows, preserving the caller's newest-first
 // order. An unmatched selector reports what it looked for rather than how many
 // rows it rejected: the caller already knows the id it passed, and needs to know
-// whether the row is gone, resolved, or never existed.
+// that the row is not in the open queue. It cannot say WHY — this input is the
+// open-action list, so a resolved row and a row that never existed are equally
+// absent, and papio does not guess between them.
+//
+// A --job selector that matches several open actions is refused rather than
+// resolved by picking one. A job may hold open actions of different kinds at
+// once (the store deduplicates only repeats of the same kind), and opening "one
+// of them" would make which one an accident of row order.
 func (s actionSelector) apply(actions []job.HumanAction) ([]job.HumanAction, error) {
 	if !s.active() {
 		return actions, nil
@@ -62,9 +70,17 @@ func (s actionSelector) apply(actions []job.HumanAction) ([]job.HumanAction, err
 	}
 	if len(out) == 0 {
 		if s.actionID > 0 {
-			return nil, fmt.Errorf("no open human action with id %d; it may have been resolved or dismissed — check 'papio actions list --all'", s.actionID)
+			return nil, fmt.Errorf("no open human action with id %d — check 'papio actions list --all', which also shows resolved and dismissed rows", s.actionID)
 		}
-		return nil, fmt.Errorf("no open human action for job %q; it may have been resolved or the job may have moved on — check 'papio jobs get %s'", s.jobID, s.jobID)
+		return nil, fmt.Errorf("no open human action for job %q — check 'papio jobs get %s', which shows the job's state and its actions", s.jobID, s.jobID)
+	}
+	if s.jobID != "" && len(out) > 1 {
+		ids := make([]string, 0, len(out))
+		for _, action := range out {
+			ids = append(ids, fmt.Sprintf("%d (%s)", action.ID, action.Kind))
+		}
+		return nil, fmt.Errorf("job %s has %d open actions — name the one you mean with --action: %s",
+			s.jobID, len(out), strings.Join(ids, ", "))
 	}
 	return out, nil
 }

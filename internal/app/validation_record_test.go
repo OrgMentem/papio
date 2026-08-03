@@ -102,6 +102,43 @@ func TestValidationVerdictMirrorsCandidateBranches(t *testing.T) {
 			want: validationIdentityReject,
 		},
 		{
+			name: "payload wins over structure and identity",
+			report: pdf.ValidationReport{
+				Payload:    pdf.PayloadReport{OK: false},
+				Structural: pdf.StructuralReport{Valid: false},
+				Identity:   pdf.IdentityDecision{Result: pdf.IdentityReject},
+			},
+			want: validationPayloadRejected,
+		},
+		{
+			name: "structure wins over encryption",
+			report: pdf.ValidationReport{
+				Payload:    pdf.PayloadReport{OK: true},
+				Structural: pdf.StructuralReport{Valid: false, Encrypted: true},
+				Identity:   pdf.IdentityDecision{Result: pdf.IdentityPass},
+			},
+			want: validationStructRejected,
+		},
+		{
+			name: "unsafe wins over identity review",
+			report: pdf.ValidationReport{
+				Payload:    pdf.PayloadReport{OK: true},
+				Structural: pdf.StructuralReport{Valid: true, Encrypted: true},
+				Identity:   pdf.IdentityDecision{Result: pdf.IdentityReview},
+			},
+			want: validationUnsafe,
+		},
+		{
+			name: "identity review wins over identity rejection",
+			report: pdf.ValidationReport{
+				Payload:    pdf.PayloadReport{OK: true},
+				Structural: pdf.StructuralReport{Valid: true},
+				Text:       pdf.TextReport{NeedsReview: true},
+				Identity:   pdf.IdentityDecision{Result: pdf.IdentityReject},
+			},
+			want: validationIdentityReview,
+		},
+		{
 			name: "pass",
 			report: pdf.ValidationReport{
 				Payload:    pdf.PayloadReport{OK: true},
@@ -152,7 +189,6 @@ func validationEvidenceReport(identityResult string) pdf.ValidationReport {
 			Result:   identityResult,
 			Evidence: []string{"identity evidence"},
 		},
-		Evidence: []string{"top-level validation evidence"},
 	}
 }
 
@@ -174,6 +210,24 @@ func validationPipelineService(t *testing.T, report pdf.ValidationReport, valida
 		return report, validateErr
 	}
 	return svc
+}
+
+func TestValidationPipelineDerivesUnsafeVerdictFromActiveContent(t *testing.T) {
+	ctx := context.Background()
+	report := validationEvidenceReport(pdf.IdentityPass)
+	report.Structural.HasJavaScript = true
+	svc := validationPipelineService(t, report, nil)
+	got := processOnce(t, svc, svc.Jobs, doiRequest("wr_validation_record_unsafe"))
+	if got.State != job.StateNeedsReview {
+		t.Fatalf("job state = %s, want needs_review", got.State)
+	}
+	records, err := svc.Jobs.ValidationReports(ctx, got.ID)
+	if err != nil {
+		t.Fatalf("ValidationReports: %v", err)
+	}
+	if len(records) != 1 || records[0].Outcome != validationUnsafe {
+		t.Fatalf("validation records = %+v, want one %q record", records, validationUnsafe)
+	}
 }
 
 func TestValidateCandidateRecordsPassingEvidence(t *testing.T) {
@@ -214,8 +268,7 @@ func TestValidateCandidateRecordsPassingEvidence(t *testing.T) {
 		document.Structural.Reason != report.Structural.Reason || document.Structural.Pages != report.Structural.Pages ||
 		document.Text.Chars != report.Text.Chars || !document.Text.OCRUsed || len(document.Text.Evidence) != 1 ||
 		document.Text.Evidence[0] != report.Text.Evidence[0] || document.Identity.Result != report.Identity.Result ||
-		len(document.Identity.Evidence) != 1 || document.Identity.Evidence[0] != report.Identity.Evidence[0] ||
-		len(document.Evidence) != 1 || document.Evidence[0] != report.Evidence[0] {
+		len(document.Identity.Evidence) != 1 || document.Identity.Evidence[0] != report.Identity.Evidence[0] {
 		t.Fatalf("validation evidence document = %+v, want evidence from stubbed report", document)
 	}
 }
@@ -278,8 +331,7 @@ func TestValidationErrorRecordsPartialEvidenceAndParksJob(t *testing.T) {
 	if err := json.Unmarshal([]byte(record.Document), &document); err != nil {
 		t.Fatalf("decode partial validation document: %v", err)
 	}
-	if document.Payload.Reason != report.Payload.Reason || len(document.Evidence) != 1 ||
-		document.Evidence[0] != report.Evidence[0] {
+	if document.Payload.Reason != report.Payload.Reason {
 		t.Fatalf("partial validation document = %+v, want stubbed partial evidence", document)
 	}
 }

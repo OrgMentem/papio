@@ -18,21 +18,29 @@ execution records in `notes/acquisition-stack-plan.md`.
   which is the wrong shape for a caller that ranks its own routes — one
   consumer ranking 164 queued institutional routes by script reach could only
   ever reach the newest. `--job <job-id>` and `--action <id>` open exactly that
-  row. A selector naming no open action is a clean error that says whether the
-  row was resolved or never existed: falling back to the head of the queue
+  row, and a job holding several open actions is refused with their ids rather
+  than resolved by picking one. A selector naming no open action is a clean
+  error naming where to look; it does not claim to know whether the row was
+  resolved or never existed, because the open-action list it reads cannot tell
+  those apart. What it never does is fall back to the head of the queue, which
   would open an unrelated institution's handoff and report success.
 - **Acquisitions can carry a consumer name, and listings can be partitioned by
   it.** `work_requests.requester` records the transport principal (`cli`,
   `mcp`, `unknown`), which answers "how did this arrive" and never "who asked
   for it", so a daemon shared between people produced one undifferentiated
   total. `papio acquire --consumer <name>` (also with `--batch`) records the
-  submitter; `papio jobs list --consumer`, `papio actions list --consumer`, and
-  the new `jobs.list_v3` / `actions.list_v3` / `jobs.get_v2` methods return and
-  filter it. Attribution is nullable with no backfill and no default: a request
-  that named no consumer has none, the key is absent rather than empty, and a
-  submission matching an in-flight job never rewrites the attribution that job
-  was queued with. A `--consumer` filter against a daemon that predates the
-  column is refused rather than answered with every consumer's rows. Schema
+  submitter through the new `acquire.submit_v3`; `papio jobs list --consumer`,
+  `papio actions list --consumer`, and the new `jobs.list_v3` /
+  `actions.list_v3` / `jobs.get_v2` methods return and filter it. Attribution is
+  nullable with no backfill and no default: a request that named no consumer has
+  none, the key is absent rather than empty, and a submission matching an
+  in-flight job never rewrites the attribution that job was queued with. It
+  binds to the job rather than the work request, so resubmitting a request id
+  whose earlier jobs are terminal attributes the new acquisition to whoever
+  resubmitted it. A `--consumer` filter against a daemon that predates the
+  column is refused rather than answered with every consumer's rows. It is a
+  caller's own accounting label: *papio* authenticates nobody, so it is not an
+  identity and must never be read as a rights input (ADR-0013). Schema
   version 19.
 - **`papio artifacts validation <job-id>` returns the complete validation
   report.** Every stage's evidence was computed and then discarded: only the
@@ -43,11 +51,18 @@ execution records in `notes/acquisition-stack-plan.md`.
   had to re-derive them from fragments. Each validation now persists a versioned
   `validation-report/1` document keyed to the job and candidate — for rejected
   candidates too, which is the set "why not this one?" is asked about. The
-  extracted text excerpt is deliberately not persisted. `artifacts.get` is
-  unchanged: it returns the shared, content-addressed artifact row, and
-  ADR-0007 forbids projecting one job's identity decision through it. Jobs
-  validated before this release list no reports; that is an absence, not an
-  empty verdict.
+  extracted text excerpt is deliberately not persisted, and every reason and
+  evidence line is bounded and stripped of control characters: several are a
+  third-party parser's stderr produced while reading a publisher-supplied file.
+  `artifacts.get` is unchanged: it returns the shared, content-addressed artifact
+  row, and ADR-0007 forbids projecting one job's identity decision through it.
+  Jobs validated before this release list no reports; that is an absence, not an
+  empty verdict. This reverses one clause of ADR-0007, which had withdrawn
+  structured validation evidence from the external surface; ADR-0013 records why
+  the reasoning behind that withdrawal — no per-job identity through a shared
+  artifact — is satisfied rather than evaded by keying the evidence to the job
+  and candidate. The accepted candidate's bundle remains the only success
+  provenance document.
 - **An open human action that has waited too long is reported stale.** A
   handoff queued weeks ago sat in the queue indistinguishable from one queued
   this morning. `papio actions list` now reports `stale` and `age_seconds` per
@@ -71,8 +86,10 @@ execution records in `notes/acquisition-stack-plan.md`.
   following that advice failed with `unknown field "request_id"` and left no
   working option. One flag cannot key many works: batch works get deterministic
   per-work request ids derived from the batch identity and the work identity, so
-  resubmitting the same works reproduces the same keys. The refusal now names
-  that instead.
+  resubmitting the same works on the same day reproduces the same keys — the
+  batch identity mixes in the calendar date. The refusal now names that instead,
+  and calls `request_id` what ADR-0010 calls it: a live-job convergence key, not
+  an idempotency key.
 - **A rate-limit gate or request count earned under one set of credentials no
   longer applies to another.** Providers meter by credential, not by source
   name: measured against OpenAlex from one machine in the same second, an

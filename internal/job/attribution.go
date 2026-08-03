@@ -11,8 +11,8 @@ import (
 	"papio/internal/store"
 )
 
-// Consumer returns the consumer name recorded for a job's work request and
-// whether one was recorded at all.
+// Consumer returns the consumer name recorded for a job and whether one was
+// recorded at all.
 //
 // The second return value is the whole point: a job with no attribution is a
 // different fact from a job attributed to the empty string, and a shared
@@ -20,12 +20,14 @@ import (
 // folding those rows into some default owner. Same reason it is not a Row field
 // as Principal is not: Row is the body of jobs.get, decoded with
 // DisallowUnknownFields, so new facts arrive by new method (ADR-0007).
+//
+// It reads jobs.consumer, not a work_request column: attribution belongs to the
+// acquisition, and one work_request row is reused across every resubmission of
+// its request id.
 func (js *Store) Consumer(ctx context.Context, jobID string) (string, bool, error) {
 	var consumer sql.NullString
-	err := js.S.DB().QueryRowContext(ctx, `
-		SELECT wr.consumer FROM jobs j
-		JOIN work_requests wr ON wr.id = j.work_request_id
-		WHERE j.id = ?`, jobID).Scan(&consumer)
+	err := js.S.DB().QueryRowContext(ctx,
+		`SELECT consumer FROM jobs WHERE id = ?`, jobID).Scan(&consumer)
 	if err != nil {
 		return "", false, err
 	}
@@ -40,14 +42,13 @@ func (js *Store) Consumer(ctx context.Context, jobID string) (string, bool, erro
 // empty value, so a caller cannot mistake "nobody claimed this" for a name.
 //
 // One query for the whole page: decorating a 500-row listing with a per-row
-// lookup would multiply the page's cost by its own length.
+// lookup would multiply the page's cost by its own length. The bound is
+// ListLimitMax parameters, well inside SQLite's variable limit.
 func (js *Store) ConsumersFor(ctx context.Context, jobIDs []string) (map[string]string, error) {
 	if len(jobIDs) == 0 {
 		return nil, nil
 	}
-	q := `SELECT j.id, wr.consumer FROM jobs j
-		JOIN work_requests wr ON wr.id = j.work_request_id
-		WHERE wr.consumer IS NOT NULL AND j.id IN (` +
+	q := `SELECT id, consumer FROM jobs WHERE consumer IS NOT NULL AND id IN (` +
 		strings.TrimSuffix(strings.Repeat("?,", len(jobIDs)), ",") + `)`
 	args := make([]any, 0, len(jobIDs))
 	for _, id := range jobIDs {

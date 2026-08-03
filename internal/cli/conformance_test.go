@@ -89,7 +89,7 @@ var commandClassification = map[string]commandClass{
 	"papio init":         {kind: kindNone},
 	"papio config":       {kind: kindNone},
 	"papio config init":  {kind: kindStructured},
-	"papio acquire":      {kind: kindStructured, rpcMethods: []string{"watch.digest_acquire", "zotio.queue", "acquire.submit_v2", "acquire.submit", "jobs.get", "zotio.lookup_works", "library.lookup_works"}},
+	"papio acquire":      {kind: kindStructured, rpcMethods: []string{"watch.digest_acquire", "zotio.queue", "acquire.submit_v3", "acquire.submit_v2", "acquire.submit", "jobs.get_v2", "jobs.get", "zotio.lookup_works", "library.lookup_works"}},
 	"papio batch":        {kind: kindNone},
 	"papio batch report": {kind: kindStructured, rpcMethods: []string{"acquire.report"}},
 	"papio search":       {kind: kindEnvelope, rowKey: "works", args: []string{"conformance probe"}, rpcMethods: []string{"discovery.search"}},

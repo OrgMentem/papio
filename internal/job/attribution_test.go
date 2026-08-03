@@ -70,12 +70,12 @@ func TestConsumersForOmitsUnattributedJobs(t *testing.T) {
 func TestListPageForFiltersBeforeLimitAndReportsFilteredTruncation(t *testing.T) {
 	js := testStore(t)
 	ctx := context.Background()
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		w := testWork()
 		w.DOI = fmt.Sprintf("10.1002/list-filter-a-%d", i)
 		createAttributionTestJob(t, js, fmt.Sprintf("wr_list_filter_a_%d", i), w, "A")
 	}
-	for i := 0; i < 2; i++ {
+	for i := range 2 {
 		w := testWork()
 		w.DOI = fmt.Sprintf("10.1002/list-filter-b-%d", i)
 		createAttributionTestJob(t, js, fmt.Sprintf("wr_list_filter_b_%d", i), w, "B")
@@ -173,5 +173,71 @@ func TestRecordValidationReportUpsertsByCandidateAndListsNewestFirst(t *testing.
 	}
 	if reports[1].CandidateID != 2 || reports[1].RecordedAt != "2026-01-01T00:00:02Z" || reports[1].Document != `{"schema_version":"validation-report/two"}` {
 		t.Fatalf("second report = %+v, want candidate 2", reports[1])
+	}
+}
+
+// TestTerminalResubmissionIsAttributedToWhoeverResubmitted is the regression for
+// a real misattribution: attribution first lived on work_requests, whose row is
+// reused by `INSERT OR IGNORE` for every resubmission of a request id. Once the
+// earlier jobs went terminal, a fresh submission by B created a new job that
+// silently inherited A's name — B's acquisition reported, filtered, and counted
+// as A's. Attribution now lives on the job, which is what a submitter actually
+// asked for.
+func TestTerminalResubmissionIsAttributedToWhoeverResubmitted(t *testing.T) {
+	ctx := context.Background()
+	js := testStore(t)
+	w := testWork()
+
+	first, err := js.CreateRequestForWork(ctx, "wr_attr_reused", w, "", "", testPolicy(), nil,
+		Attribution{Principal: PrincipalCLI, Consumer: "instructor-a"}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := js.Cancel(ctx, first.JobID, TerminalReasonCancelledByUser); err != nil {
+		t.Fatal(err)
+	}
+
+	second, err := js.CreateRequestForWork(ctx, "wr_attr_reused", w, "", "", testPolicy(), nil,
+		Attribution{Principal: PrincipalCLI, Consumer: "instructor-b"}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Existing || second.JobID == first.JobID {
+		t.Fatalf("resubmission after a terminal job = %+v, want a fresh job", second)
+	}
+
+	if got, ok, err := js.Consumer(ctx, second.JobID); err != nil || !ok || got != "instructor-b" {
+		t.Fatalf("new job consumer = %q ok=%t err=%v, want instructor-b — it must not inherit the reused work request's attribution", got, ok, err)
+	}
+	// The finished job keeps its own submitter: a later resubmission must not
+	// rewrite who asked for an acquisition that already happened.
+	if got, ok, err := js.Consumer(ctx, first.JobID); err != nil || !ok || got != "instructor-a" {
+		t.Fatalf("terminal job consumer = %q ok=%t err=%v, want instructor-a", got, ok, err)
+	}
+}
+
+// TestLiveConvergenceKeepsTheOriginalConsumer is the other half: a submission
+// that matches a job still in flight returns that job unchanged, so the second
+// caller does not acquire the first caller's work.
+func TestLiveConvergenceKeepsTheOriginalConsumer(t *testing.T) {
+	ctx := context.Background()
+	js := testStore(t)
+	w := testWork()
+
+	first, err := js.CreateRequestForWork(ctx, "wr_attr_live_one", w, "", "", testPolicy(), nil,
+		Attribution{Principal: PrincipalCLI, Consumer: "instructor-a"}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := js.CreateRequestForWork(ctx, "wr_attr_live_two", w, "", "", testPolicy(), nil,
+		Attribution{Principal: PrincipalCLI, Consumer: "instructor-b"}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !second.Existing || second.JobID != first.JobID {
+		t.Fatalf("live convergence = %+v, want the existing job %s", second, first.JobID)
+	}
+	if got, _, err := js.Consumer(ctx, first.JobID); err != nil || got != "instructor-a" {
+		t.Fatalf("consumer after convergence = %q (%v), want the original instructor-a", got, err)
 	}
 }

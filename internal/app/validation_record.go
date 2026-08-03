@@ -3,6 +3,9 @@ package app
 
 import (
 	"context"
+	"fmt"
+	"regexp"
+	"strings"
 
 	"papio/internal/job"
 	"papio/internal/pdf"
@@ -62,4 +65,29 @@ func (s *Service) recordValidation(ctx context.Context, jobID string, candidateI
 		JobID: jobID, CandidateID: candidateID, SHA256: sha,
 		Outcome: outcome, Document: string(document),
 	})
+}
+
+// consumerNameRE bounds the accounting label a caller may attach to its
+// submissions. It is deliberately narrow but not arbitrary: it admits the
+// namespaced form a real consumer uses (`inscribi:project:psyc101`) and refuses
+// the two shapes that actually cause harm — whitespace, which would forge a field
+// or record boundary in the tab-separated `jobs list` / `actions list` output, and
+// control characters, which a terminal or a log would act on.
+//
+// Rejected rather than sanitized: this value partitions accounting totals, and a
+// silently rewritten key attributes work to a name nobody asked for.
+var consumerNameRE = regexp.MustCompile(`^[A-Za-z0-9._:@/+-]{1,128}$`)
+
+// validConsumer normalizes and checks the caller-supplied consumer label. An
+// empty value stays empty — no attribution is a legitimate answer and the only
+// honest one for a caller that named none.
+func validConsumer(consumer string) (string, error) {
+	consumer = strings.TrimSpace(consumer)
+	if consumer == "" {
+		return "", nil
+	}
+	if !consumerNameRE.MatchString(consumer) {
+		return "", fmt.Errorf("consumer must be 1-128 characters of letters, digits, or . _ : @ / + -")
+	}
+	return consumer, nil
 }

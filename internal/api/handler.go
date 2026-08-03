@@ -206,6 +206,9 @@ func RouterWithShutdown(system *bootstrap.System, shutdown context.CancelFunc) i
 		"acquire.submit_v2": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return submitV2(ctx, raw, system)
 		},
+		"acquire.submit_v3": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return submitV3(ctx, raw, system)
+		},
 		"acquire.report": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return acquireReport(ctx, raw, system)
 		},
@@ -459,18 +462,33 @@ type acquireSubmitParams struct {
 	AutoImport *bool                `json:"auto_import,omitempty"`
 }
 
+// acquireSubmitV2Params is FROZEN by ADR-0010 Decision 1 at exactly these three
+// keys. Params are decoded with DisallowUnknownFields, and the ADR reasons at
+// length that param widening is the worse direction of skew: a newer consumer
+// sending a field an older daemon lacks has its whole call rejected. So a fourth
+// key here is not an additive change, it is a breaking one — attribution lives on
+// acquire.submit_v3 instead.
 type acquireSubmitV2Params struct {
 	Request    protocol.WorkRequest `json:"request"`
 	AutoImport *bool                `json:"auto_import,omitempty"`
 	Force      bool                 `json:"force,omitempty"`
-	// Consumer names the submitting consumer for a shared daemon's accounting.
-	// A sibling of Request, not a WorkRequest field: work-request/1 describes
-	// the WORK, and the same work submitted by two consumers is one work. It is
-	// also why this is a new param rather than a new method — params are decoded
-	// fail-closed too, so an older daemon rejects the call outright instead of
-	// silently dropping the attribution, which the CLI reports as the version
-	// skew it is.
-	Consumer string `json:"consumer,omitempty"`
+}
+
+// acquireSubmitV3Params adds consumer attribution. A new method rather than a
+// new param on v2, per ADR-0009 Decision 1's rule that additive evolution gets a
+// new method name — which applies to a ratified params object exactly as it
+// applies to a ratified result.
+//
+// Consumer is a sibling of Request, not a work-request/1 field: that document
+// describes the WORK, and one work submitted by two consumers is still one work.
+// It is a caller-supplied label for the caller's own accounting, NOT an
+// authenticated identity and NOT a rights input — the same refusal ADR-0009
+// Decision 3 places on Receipt.Principal. papio authenticates nobody.
+type acquireSubmitV3Params struct {
+	Request    protocol.WorkRequest `json:"request"`
+	AutoImport *bool                `json:"auto_import,omitempty"`
+	Force      bool                 `json:"force,omitempty"`
+	Consumer   string               `json:"consumer,omitempty"`
 }
 
 func submitV2(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
@@ -478,11 +496,26 @@ func submitV2(ctx context.Context, raw json.RawMessage, system *bootstrap.System
 	if err := ipc.DecodeParams(raw, &params); err != nil {
 		return badParams(err)
 	}
-	result, err := system.App.SubmitWithOptionsAs(ctx, PrincipalFrom(ctx), params.Request, app.SubmitOptions{
+	return submitted(ctx, system, params.Request, app.SubmitOptions{
+		AutoImport: params.AutoImport,
+		Force:      params.Force,
+	})
+}
+
+func submitV3(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
+	var params acquireSubmitV3Params
+	if err := ipc.DecodeParams(raw, &params); err != nil {
+		return badParams(err)
+	}
+	return submitted(ctx, system, params.Request, app.SubmitOptions{
 		AutoImport: params.AutoImport,
 		Force:      params.Force,
 		Consumer:   params.Consumer,
 	})
+}
+
+func submitted(ctx context.Context, system *bootstrap.System, request protocol.WorkRequest, options app.SubmitOptions) ([]byte, *ipc.RPCError) {
+	result, err := system.App.SubmitWithOptionsAs(ctx, PrincipalFrom(ctx), request, options)
 	if err != nil {
 		var unset *config.ErrAccessModeUnset
 		if errors.As(err, &unset) {

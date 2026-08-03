@@ -113,6 +113,12 @@ type SubmitOptions struct {
 	// attribution rather than a placeholder one, and a submission that matches
 	// an in-flight job does not overwrite the attribution that job was queued
 	// with.
+	//
+	// It is a label the caller supplies for itself. papio does not authenticate
+	// it, cannot verify it, and it is NOT a rights input: it must never be read
+	// as the entitlement holder or as an acquiring principal, the same refusal
+	// ADR-0009 Decision 3 places on the transport principal. papio authenticates
+	// nobody and holds no institutional credential.
 	Consumer string
 }
 
@@ -207,8 +213,12 @@ func (s *Service) SubmitWithOptionsAs(ctx context.Context, principal job.Princip
 		AutoImport:    auto,
 		Collection:    strings.TrimSpace(wr.Collection),
 	}
+	consumer, err := validConsumer(options.Consumer)
+	if err != nil {
+		return SubmitResult{}, err
+	}
 	created, err := s.Jobs.CreateRequestForWork(ctx, wr.RequestID, w, wr.ZotioItemKey, wr.Collection, pol, raw,
-		job.Attribution{Principal: principal, Consumer: strings.TrimSpace(options.Consumer)}, options.Force)
+		job.Attribution{Principal: principal, Consumer: consumer}, options.Force)
 	if err != nil {
 		return SubmitResult{}, err
 	}

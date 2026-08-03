@@ -12,23 +12,26 @@ import (
 	"github.com/spf13/cobra"
 
 	"papio/internal/api"
+	"papio/internal/app"
 	"papio/internal/config"
 	"papio/internal/ipc"
 	"papio/internal/job"
 )
 
-// TestAcquireSendsConsumerAttribution pins that --consumer reaches the daemon as
-// a submit parameter. Without it there is no way to partition a shared daemon's
-// totals between the people using it.
+// TestAcquireSendsConsumerAttribution pins that --consumer reaches the daemon,
+// and that it goes to acquire.submit_v3 rather than the ratified v2 whose params
+// ADR-0010 froze. Without attribution there is no way to partition a shared
+// daemon's totals between the people using it; without the method split, adding
+// it breaks every consumer pinned to v2's param set.
 func TestAcquireSendsConsumerAttribution(t *testing.T) {
 	var out, errOut bytes.Buffer
-	var got acquireSubmitV2Params
+	var got acquireSubmitV3Params
 	root := NewInProcessRoot(&out, &errOut, config.Config{AccessMode: config.ModeConservative},
 		func(_ context.Context, method string, params any, result any) error {
-			if method != "acquire.submit_v2" {
-				t.Fatalf("unexpected method %q", method)
+			if method != "acquire.submit_v3" {
+				t.Fatalf("method = %q, want acquire.submit_v3: attribution must not widen the ratified v2 params", method)
 			}
-			got = params.(acquireSubmitV2Params)
+			got = params.(acquireSubmitV3Params)
 			*result.(*api.SubmitV2Result) = api.SubmitV2Result{JobID: "job_consumer_01"}
 			return nil
 		})
@@ -38,6 +41,143 @@ func TestAcquireSendsConsumerAttribution(t *testing.T) {
 	}
 	if got.Consumer != "inscribi" {
 		t.Fatalf("submitted consumer = %q, want inscribi", got.Consumer)
+	}
+}
+
+func TestAcquireConsumerAttributionSerializesWireKey(t *testing.T) {
+	var out, errOut bytes.Buffer
+	var encoded []byte
+	root := NewInProcessRoot(&out, &errOut, config.Config{AccessMode: config.ModeConservative},
+		func(_ context.Context, method string, params any, result any) error {
+			if method != "acquire.submit_v3" {
+				t.Fatalf("method = %q, want acquire.submit_v3", method)
+			}
+			var err error
+			if encoded, err = json.Marshal(params); err != nil {
+				t.Fatalf("marshal acquire params: %v", err)
+			}
+			*result.(*api.SubmitV2Result) = api.SubmitV2Result{JobID: "job_consumer_wire"}
+			return nil
+		})
+	root.SetArgs([]string{"acquire", "--doi", "10.1000/attributed-wire", "--consumer", "inscribi"})
+	if err := root.ExecuteContext(context.Background()); err != nil {
+		t.Fatalf("acquire --consumer: %v (%s)", err, errOut.String())
+	}
+	var sent map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &sent); err != nil {
+		t.Fatalf("decode acquire params: %v", err)
+	}
+	raw, ok := sent["consumer"]
+	if !ok {
+		t.Fatalf("acquire params omitted consumer: %s", encoded)
+	}
+	var consumer string
+	if err := json.Unmarshal(raw, &consumer); err != nil {
+		t.Fatalf("decode consumer wire value: %v (%s)", err, encoded)
+	}
+	if consumer != "inscribi" {
+		t.Fatalf("wire consumer = %q, want inscribi", consumer)
+	}
+	if _, ok := sent["consumers"]; ok {
+		t.Fatalf("wire params used misspelled consumers key: %s", encoded)
+	}
+}
+
+func TestConsumerFiltersSerializeConsumerParam(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		args   []string
+		method string
+		set    func(any)
+	}{
+		{
+			name:   "jobs",
+			args:   []string{"jobs", "list", "--consumer", "inscribi"},
+			method: "jobs.list_v3",
+			set:    func(result any) { *result.(*api.JobsPageV3) = api.JobsPageV3{} },
+		},
+		{
+			name:   "actions",
+			args:   []string{"actions", "list", "--consumer", "inscribi"},
+			method: "actions.list_v3",
+			set:    func(result any) { *result.(*api.ActionsPageV3) = api.ActionsPageV3{} },
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var out, errOut bytes.Buffer
+			var encoded []byte
+			root := NewInProcessRoot(&out, &errOut, config.Config{},
+				func(_ context.Context, method string, params any, result any) error {
+					if method != tc.method {
+						t.Fatalf("method = %q, want %s", method, tc.method)
+					}
+					var err error
+					if encoded, err = json.Marshal(params); err != nil {
+						t.Fatalf("marshal %s params: %v", tc.name, err)
+					}
+					tc.set(result)
+					return nil
+				})
+			root.SetArgs(tc.args)
+			if err := root.ExecuteContext(context.Background()); err != nil {
+				t.Fatalf("%s: %v (%s)", tc.name, err, errOut.String())
+			}
+			var sent map[string]json.RawMessage
+			if err := json.Unmarshal(encoded, &sent); err != nil {
+				t.Fatalf("decode %s params: %v", tc.name, err)
+			}
+			var consumer string
+			raw, ok := sent["consumer"]
+			if !ok {
+				t.Fatalf("%s params omitted consumer: %s", tc.name, encoded)
+			}
+			if err := json.Unmarshal(raw, &consumer); err != nil {
+				t.Fatalf("decode %s consumer: %v", tc.name, err)
+			}
+			if consumer != "inscribi" {
+				t.Fatalf("%s consumer = %q, want inscribi", tc.name, consumer)
+			}
+		})
+	}
+}
+
+// TestAcquireWithoutConsumerStaysOnRatifiedSubmitV2: the ordinary path must not
+// move to a newer method just because one exists, or every unattributed
+// submission gains a failure mode against an older daemon for nothing.
+func TestAcquireWithoutConsumerStaysOnRatifiedSubmitV2(t *testing.T) {
+	var out, errOut bytes.Buffer
+	var seen string
+	root := NewInProcessRoot(&out, &errOut, config.Config{AccessMode: config.ModeConservative},
+		func(_ context.Context, method string, _ any, result any) error {
+			seen = method
+			*result.(*api.SubmitV2Result) = api.SubmitV2Result{JobID: "job_plain_01"}
+			return nil
+		})
+	root.SetArgs([]string{"acquire", "--doi", "10.1000/plain"})
+	if err := root.ExecuteContext(context.Background()); err != nil {
+		t.Fatalf("acquire: %v (%s)", err, errOut.String())
+	}
+	if seen != "acquire.submit_v2" {
+		t.Fatalf("method = %q, want the ratified acquire.submit_v2", seen)
+	}
+}
+
+// TestAcquireConsumerRefusesOlderDaemon: unknown_method on submit_v3 must be
+// reported, never retried against v2 without the attribution — recording the work
+// as nobody's is worse than failing.
+func TestAcquireConsumerRefusesOlderDaemon(t *testing.T) {
+	var out, errOut bytes.Buffer
+	root := NewInProcessRoot(&out, &errOut, config.Config{AccessMode: config.ModeConservative},
+		func(_ context.Context, method string, _ any, _ any) error {
+			if method != "acquire.submit_v3" {
+				t.Fatalf("CLI fell back to %q and dropped the attribution", method)
+			}
+			return &ipc.RemoteError{Code: "unknown_method", Message: "unknown method"}
+		})
+	root.SetArgs([]string{"acquire", "--doi", "10.1000/older", "--consumer", "inscribi"})
+	err := root.ExecuteContext(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "acquire.submit_v3") {
+		t.Fatalf("error = %v, want a refusal naming acquire.submit_v3", err)
 	}
 }
 
@@ -329,5 +469,40 @@ func TestArtifactsValidationNamesAnAbsenceHonestly(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "no validation evidence recorded") {
 		t.Fatalf("output = %q, want the absence named", out.String())
+	}
+}
+
+// TestActionsOpenRefusesAnAmbiguousJobSelector: a job may hold open actions of
+// different kinds at once, and "open one of them" would make which one an
+// accident of row order. The selector names a row; when a job names several, the
+// caller has to say which.
+func TestActionsOpenRefusesAnAmbiguousJobSelector(t *testing.T) {
+	target := app.OABrowserHandoffActionDetail("https://oa.example.test/ambiguous.pdf")
+	actions := []job.HumanAction{
+		{ID: 9, JobID: "job_two", Kind: "openurl_handoff", Status: "open", Detail: target},
+		{ID: 8, JobID: "job_two", Kind: "manual_download", Status: "open", Detail: target},
+	}
+	rows := []job.Row{{ID: "job_two", State: job.StateAwaitingHuman}}
+	var out, errOut bytes.Buffer
+	root := NewInProcessRoot(&out, &errOut, config.Config{}, func(_ context.Context, method string, _ any, result any) error {
+		switch method {
+		case "actions.list":
+			*result.(*[]job.HumanAction) = actions
+		case "jobs.list_v2":
+			*result.(*api.JobsPage) = api.JobsPage{Jobs: rows}
+		default:
+			t.Fatalf("unexpected method %q", method)
+		}
+		return nil
+	})
+	root.SetArgs([]string{"actions", "open", "--dry-run", "--job", "job_two"})
+	err := root.ExecuteContext(context.Background())
+	if err == nil {
+		t.Fatalf("ambiguous --job succeeded and emitted %q; it must name the candidates instead", out.String())
+	}
+	for _, want := range []string{"2 open actions", "--action", "9 (openurl_handoff)", "8 (manual_download)"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error = %q, want it to contain %q", err, want)
+		}
 	}
 }

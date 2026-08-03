@@ -7,7 +7,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -22,7 +21,6 @@ import (
 	"papio/internal/batch"
 	"papio/internal/errcat"
 	"papio/internal/ingest"
-	"papio/internal/ipc"
 	"papio/internal/job"
 	"papio/internal/protocol"
 	"papio/internal/work"
@@ -361,7 +359,15 @@ type acquireSubmitParams struct {
 	AutoImport *bool                `json:"auto_import,omitempty"`
 }
 
+// acquireSubmitV2Params mirrors the params ADR-0010 froze. Do not add a key: a
+// consumer-bearing submission uses acquireSubmitV3Params instead.
 type acquireSubmitV2Params struct {
+	Request    protocol.WorkRequest `json:"request"`
+	AutoImport *bool                `json:"auto_import,omitempty"`
+	Force      bool                 `json:"force,omitempty"`
+}
+
+type acquireSubmitV3Params struct {
 	Request    protocol.WorkRequest `json:"request"`
 	AutoImport *bool                `json:"auto_import,omitempty"`
 	Force      bool                 `json:"force,omitempty"`
@@ -404,18 +410,24 @@ func validateBatchFlags(cmd *cobra.Command, args []string, fromZotio, wait bool)
 	if wait {
 		return fmt.Errorf("--wait is not supported with --batch")
 	}
-	// --request-id names ONE work's idempotency key, and a batch has one key per
+	// --request-id names ONE work's convergence key, and a batch has one key per
 	// work, derived from the batch identity and that work's identity
 	// (batch.RequestID). So it is refused with the mechanism that replaces it,
 	// not with the old advice to "put it in JSONL": the JSONL work decoder is
 	// strict and has no request_id field, so following that suggestion produced
 	// `unknown field "request_id"` and left the caller with no working option at
-	// all. Resubmitting the same works on the same day reproduces the same keys,
-	// which is the idempotent resubmission the flag was being reached for.
+	// all.
+	//
+	// "convergence key", not "idempotency key" — ADR-0010 is explicit that a
+	// request id converges on a LIVE job and that a terminal job plus the same id
+	// creates a new one. And the reproduction is same-day only: batch.ID mixes in
+	// the local calendar date, so the identical work set submitted tomorrow gets
+	// different keys. Both qualifications are in the message, because a message
+	// that overstates its mechanism is the defect this refusal exists to fix.
 	if cmd.Flags().Changed("request-id") {
-		return fmt.Errorf("--request-id names a single work's idempotency key and cannot key a batch; " +
+		return fmt.Errorf("--request-id names a single work's convergence key and cannot key a batch; " +
 			"batch works get deterministic per-work request ids derived from the batch and the work, " +
-			"so resubmitting the same works reproduces them — see `papio batch report <batch-id>`")
+			"so resubmitting the same works on the same day reproduces them — see `papio batch report <batch-id>`")
 	}
 	for _, name := range []string{
 		"doi", "pmid", "arxiv", "isbn", "openalex", "title", "author", "year",
@@ -496,24 +508,36 @@ func batchRequestID(ids *protocol.Identifiers, title string, authors []string, y
 	return batch.InitialRequestID(ids, title, authors, year)
 }
 
+// submitAcquire prefers the narrowest method that can carry the request.
+//
+// A submission naming no consumer goes to the ratified acquire.submit_v2
+// unchanged, so the ordinary path gains no new failure mode. A consumer-bearing
+// submission needs acquire.submit_v3, and an older daemon answers unknown_method
+// — reported as skew rather than retried without the attribution, because
+// recording the batch as nobody's work is worse than failing.
+//
+// Keying the fallback on the METHOD name rather than on a rejected param also
+// removes an ambiguity: a daemon rejecting unknown params and a daemon rejecting
+// a genuinely invalid work request both answer invalid_argument, so param
+// sniffing could report a real validation error as a version problem.
 func submitAcquire(ctx context.Context, opt *options, request protocol.WorkRequest, autoImport *bool, force bool, consumer string, result *api.SubmitV2Result) error {
-	v2Params := acquireSubmitV2Params{Request: request, AutoImport: autoImport, Force: force, Consumer: consumer}
+	if consumer != "" {
+		params := acquireSubmitV3Params{Request: request, AutoImport: autoImport, Force: force, Consumer: consumer}
+		if err := opt.call(ctx, "acquire.submit_v3", params, result); err != nil {
+			if isUnknownMethod(err) {
+				return daemonUpgradeRequired("acquire.submit_v3 (--consumer attribution)")
+			}
+			return err
+		}
+		return nil
+	}
+	v2Params := acquireSubmitV2Params{Request: request, AutoImport: autoImport, Force: force}
 	err := opt.call(ctx, "acquire.submit_v2", v2Params, result)
 	if err == nil {
 		return nil
 	}
-	var remote *ipc.RemoteError
-	if !errors.As(err, &remote) || remote.Code != "unknown_method" {
-		// A daemon that predates --consumer rejects the parameter rather than
-		// dropping it, which is the fail-closed behaviour working: attribution
-		// silently discarded is worse than a call that says why it failed.
-		if consumer != "" && remote != nil && remote.Code == "invalid_argument" {
-			return fmt.Errorf("--consumer requires a daemon that records consumer attribution; upgrade or restart the daemon from the same installation as this CLI: %w", err)
-		}
+	if !isUnknownMethod(err) {
 		return err
-	}
-	if consumer != "" {
-		return daemonUpgradeRequired("acquire.submit_v2 with consumer attribution")
 	}
 	if force {
 		request.RequestID = job.NewID("request")
