@@ -198,19 +198,19 @@ func TestFocusOrOpenActionURLsPrefersLiveCompatibleHolder(t *testing.T) {
 			focusCalls++
 			return api.ActionsOpenResult{}, nil
 		},
-		func(_ context.Context, name string, args ...string) error {
+		func(context.Context, string, ...string) error {
 			openCalls++
-			if name == "" || len(args) == 0 || args[len(args)-1] != target {
-				t.Fatalf("fallback command = %q %v", name, args)
-			}
 			return nil
 		},
 	)
-	if err != nil {
-		t.Fatal(err)
+	if !errors.Is(err, errNoConnectedBrowserSession) {
+		t.Fatalf("no-session error = %v, want %q", err, errNoConnectedBrowserSession)
 	}
-	if focusCalls != 1 || openCalls != 1 {
-		t.Fatalf("no-session focus/open calls = %d/%d, want 1/1", focusCalls, openCalls)
+	if got, want := err.Error(), "no connected browser extension session - open Chrome with the papio extension enabled; check papio doctor"; got != want {
+		t.Fatalf("no-session error = %q, want %q", got, want)
+	}
+	if focusCalls != 1 || openCalls != 0 {
+		t.Fatalf("no-session focus/open calls = %d/%d, want 1/0", focusCalls, openCalls)
 	}
 
 	out.Reset()
@@ -277,15 +277,15 @@ func TestCommandGroupsRejectUnknownVerbs(t *testing.T) {
 		t.Fatal("unknown command must not call the daemon")
 		return nil
 	})
-	root.SetArgs([]string{"--json", "jobs", "show", "job_01"})
+	root.SetArgs([]string{"--json", "jobs", "frobnicate", "job_01"})
 
 	err := root.ExecuteContext(context.Background())
 	if err == nil {
-		t.Fatal("jobs show succeeded, want an unknown-verb error")
+		t.Fatal("unknown jobs verb succeeded, want an unknown-verb error")
 	}
-	for _, fragment := range []string{`unknown jobs command "show"`, "valid verbs:", "get"} {
+	for _, fragment := range []string{`unknown jobs command "frobnicate"`, "valid verbs:", "get", "show"} {
 		if !strings.Contains(err.Error(), fragment) {
-			t.Fatalf("jobs show error = %q, missing %q", err, fragment)
+			t.Fatalf("unknown jobs verb error = %q, missing %q", err, fragment)
 		}
 	}
 	if out.Len() != 0 || errOut.Len() != 0 {

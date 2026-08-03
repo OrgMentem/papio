@@ -720,8 +720,13 @@ function clearSessionNoticeTimers(): void {
   sessionNoticeFadeTimer = undefined;
   sessionNoticeHideTimer = undefined;
 }
-function sessionRowText(row: SessionRowState): string {
-  return row.detail === "" ? row.label : `${row.label} · ${row.detail}`;
+function sessionRowText(row: Pick<SessionCardState, "label" | "detail">): string {
+  const labelEndsWithEllipsis = /(?:…|\.{3})$/.test(row.label);
+  const hasNoProbeEvidence = row.detail === "no probe evidence" ||
+    row.detail.startsWith("no probe evidence · ");
+  return row.detail === "" || labelEndsWithEllipsis || hasNoProbeEvidence
+    ? row.label
+    : `${row.label} · ${row.detail}`;
 }
 
 function renderSessionRows(
@@ -846,8 +851,7 @@ export function renderInstitutionSession(
         ? { ...state, ...state.origins[0], resolverOrigin: singleOrigin }
         : state;
     const cardState = deriveSessionCardState(displayState);
-    status.textContent =
-      cardState.detail === "" ? cardState.label : `${cardState.label} · ${cardState.detail}`;
+    status.textContent = sessionRowText(cardState);
     origin.textContent = resolverHost(displayState.resolverOrigin);
     signIn.disabled = cardState.action === "none";
     signIn.hidden = cardState.action === "none";
@@ -1837,11 +1841,28 @@ export function wireSettings(doc: Document = document): void {
   });
 }
 
-// The build removes this panel from shipped HTML; keep the bundle fail-closed
-// if extension assets from different builds are briefly mixed during an update.
-export function wireDevTools(doc: Document = document): void {
-  if (typeof __PAPIO_DEV_CAPTURE__ === "boolean" && !__PAPIO_DEV_CAPTURE__) return;
+// Release builds remove this panel from their HTML. The runtime manifest check
+// also keeps a packed developer build from exposing fixture capture tools.
+export function wireDevTools(
+  doc: Document = document,
+  manifest?: { update_url?: string | undefined },
+): void {
   const section = doc.querySelector<HTMLElement>(".capture");
+  // Resolved lazily and defensively: test environments import this module
+  // with a partial chrome global, and a default-parameter call would throw
+  // at wiring time.
+  const resolved =
+    manifest ??
+    (typeof chrome !== "undefined" && typeof chrome.runtime?.getManifest === "function"
+      ? chrome.runtime.getManifest()
+      : {});
+  if (
+    resolved.update_url !== undefined ||
+    (typeof __PAPIO_DEV_CAPTURE__ === "boolean" && !__PAPIO_DEV_CAPTURE__)
+  ) {
+    if (section) section.hidden = true;
+    return;
+  }
   if (section) section.hidden = false;
   wireCapture(doc);
 }

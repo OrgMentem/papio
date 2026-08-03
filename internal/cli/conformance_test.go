@@ -105,8 +105,10 @@ var commandClassification = map[string]commandClass{
 	"papio watch run":                  {kind: kindStructured, rpcMethods: []string{"watch.run"}},
 	"papio jobs":                       {kind: kindNone},
 	"papio activity":                   {kind: kindEnvelope, rowKey: "entries", rpcMethods: []string{"activity.list"}},
+	"papio failures":                   {kind: kindEnvelope, rowKey: "failures", rpcMethods: []string{"failures.list_v1"}},
 	"papio jobs list":                  {kind: kindEnvelope, rowKey: "jobs", rpcMethods: []string{"jobs.list_v2", "jobs.list"}},
 	"papio jobs get":                   {kind: kindStructured, rpcMethods: []string{"jobs.get"}},
+	"papio jobs show":                  {kind: kindStructured, rpcMethods: []string{"jobs.get"}},
 	"papio jobs receipt":               {kind: kindStructured, rpcMethods: []string{"jobs.receipt"}},
 	"papio jobs add-component":         {kind: kindEnvelope, rowKey: "components", args: []string{"job_01", "/tmp/papio-conformance-supplement.pdf", "--role", "supplement"}, rpcMethods: []string{"jobs.add_component"}},
 	"papio jobs repair-awaiting-human": {kind: kindStructured, rpcMethods: []string{"jobs.repair_awaiting_human"}},
@@ -278,11 +280,11 @@ func TestCommandTreeHygiene(t *testing.T) {
 	walk(root)
 }
 
-// TestUnknownCommandsFailWithAnActionableMessage covers field-report finding
-// L2 ("papio jobs show silently does nothing" — the real verb is "jobs get")
-// and guards against finding H1's bare "papio: exit status 1" resurfacing on
-// the command-routing path: an unrecognized token must produce an error that
-// names the token, not an opaque process exit code.
+// TestUnknownCommandsFailWithAnActionableMessage guards against finding H1's
+// bare "papio: exit status 1" resurfacing on the command-routing path: an
+// unrecognized token must produce an error that names the token, not an opaque
+// process exit code. `papio jobs show` is now a supported alias and therefore
+// deliberately absent from these cases.
 func TestUnknownCommandsFailWithAnActionableMessage(t *testing.T) {
 	bareExitStatus := regexp.MustCompile(`^(papio: )?exit status \d+$`)
 	for _, tc := range []struct {
@@ -291,7 +293,7 @@ func TestUnknownCommandsFailWithAnActionableMessage(t *testing.T) {
 		mustName string
 	}{
 		{name: "unknown top-level command", args: []string{"frobnicate"}, mustName: "frobnicate"},
-		{name: "unknown subcommand", args: []string{"jobs", "show"}, mustName: "show"},
+		{name: "unknown subcommand", args: []string{"jobs", "frobnicate"}, mustName: "frobnicate"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var out, errOut bytes.Buffer

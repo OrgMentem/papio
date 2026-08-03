@@ -345,6 +345,19 @@ Check acquisition readiness and local integrations
 papio doctor
 ```
 
+## `papio failures`
+
+Aggregate unavailable and parked acquisition reasons
+
+```
+papio failures [flags]
+```
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--by-provider` | `bool` | `false` | group by provider host/source instead of reason |
+| `--limit` | `int` | `20` | maximum aggregate rows (1-200) |
+
 ## `papio inbox`
 
 Show the triage inbox
@@ -490,6 +503,18 @@ Explicitly retry a failed, unavailable, or retry-wait job
 ```
 papio jobs retry <job-id>
 ```
+
+### `papio jobs show`
+
+Show one job with events and actions
+
+```
+papio jobs show <job-id> [flags]
+```
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--wait` | `bool` | `false` | wait for completion or human action |
 
 ## `papio mcp`
 

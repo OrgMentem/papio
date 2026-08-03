@@ -144,6 +144,12 @@ type ActivityPage struct {
 	Truncated bool                  `json:"truncated"`
 }
 
+// FailuresPage is the bounded failures.list_v1 read model.
+type FailuresPage struct {
+	Failures  []store.FailureSummary `json:"failures"`
+	Truncated bool                   `json:"truncated"`
+}
+
 // RepairResult reports what jobs.repair_awaiting_human did. Outcome is a closed
 // vocabulary — repaired, not_parked, has_open_actions, conflict — so a consumer
 // never has to parse an error message to tell "nothing to repair" from "I could
@@ -254,6 +260,9 @@ func RouterWithShutdown(system *bootstrap.System, shutdown context.CancelFunc) i
 		},
 		"activity.list": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return listActivity(ctx, raw, system)
+		},
+		"failures.list_v1": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return listFailureSummaries(ctx, raw, system)
 		},
 		"jobs.list": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return listJobs(ctx, raw, system)
@@ -823,6 +832,26 @@ func listActivity(ctx context.Context, raw json.RawMessage, system *bootstrap.Sy
 		return failure(err)
 	}
 	return marshal(ActivityPage{Entries: entries, Truncated: truncated})
+}
+
+// listFailureSummaries is an additive read model: failures.list_v1 owns its
+// result shape rather than widening the older jobs.failures response.
+func listFailureSummaries(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
+	var params struct {
+		Limit      int  `json:"limit,omitempty"`
+		ByProvider bool `json:"by_provider,omitempty"`
+	}
+	if err := ipc.DecodeParams(raw, &params); err != nil {
+		return badParams(err)
+	}
+	if system == nil || system.Store == nil {
+		return nil, &ipc.RPCError{Code: "precondition_failed", Message: "store is not configured"}
+	}
+	failures, truncated, err := system.Store.FailureSummaries(ctx, params.Limit, params.ByProvider)
+	if err != nil {
+		return failure(err)
+	}
+	return marshal(FailuresPage{Failures: failures, Truncated: truncated})
 }
 
 // listJobsV2 is jobs.list with the one thing a cohort-scale consumer cannot

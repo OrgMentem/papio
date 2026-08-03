@@ -224,41 +224,46 @@ func newJobsCommand(opt *options) *cobra.Command {
 	list.Flags().StringVar(&state, "state", "", "filter by exact job state")
 	list.Flags().IntVar(&limit, "limit", 100, "maximum rows (1-500)")
 
-	var wait bool
-	get := &cobra.Command{
-		Use:         "get <job-id>",
-		Short:       "Show one job with events and actions",
-		Annotations: map[string]string{"mcp:read-only": "true"},
-		Args:        cobra.ExactArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			var detail *api.JobDetail
-			if wait {
-				var err error
-				detail, err = waitForJob(cmd.Context(), opt, args[0])
-				if err != nil {
+	newGetCommand := func(verb string) *cobra.Command {
+		var wait bool
+		command := &cobra.Command{
+			Use:         verb + " <job-id>",
+			Short:       "Show one job with events and actions",
+			Annotations: map[string]string{"mcp:read-only": "true"},
+			Args:        cobra.ExactArgs(1),
+			RunE: func(cmd *cobra.Command, args []string) error {
+				var detail *api.JobDetail
+				if wait {
+					var err error
+					detail, err = waitForJob(cmd.Context(), opt, args[0])
+					if err != nil {
+						return err
+					}
+				} else {
+					detail = &api.JobDetail{}
+					if err := opt.call(cmd.Context(), "jobs.get", map[string]string{"job_id": args[0]}, detail); err != nil {
+						return err
+					}
+				}
+				if opt.jsonOutput {
+					return opt.printJSON(detail)
+				}
+				if _, err := fmt.Fprintf(opt.out, "%s\t%s\t%s\n", detail.Job.ID, detail.Job.State, detail.Job.Work.Describe()); err != nil {
 					return err
 				}
-			} else {
-				detail = &api.JobDetail{}
-				if err := opt.call(cmd.Context(), "jobs.get", map[string]string{"job_id": args[0]}, detail); err != nil {
-					return err
+				for _, event := range detail.Events {
+					if _, err := fmt.Fprintf(opt.out, "  %v  %v\n", event["at"], event["kind"]); err != nil {
+						return err
+					}
 				}
-			}
-			if opt.jsonOutput {
-				return opt.printJSON(detail)
-			}
-			if _, err := fmt.Fprintf(opt.out, "%s\t%s\t%s\n", detail.Job.ID, detail.Job.State, detail.Job.Work.Describe()); err != nil {
-				return err
-			}
-			for _, event := range detail.Events {
-				if _, err := fmt.Fprintf(opt.out, "  %v  %v\n", event["at"], event["kind"]); err != nil {
-					return err
-				}
-			}
-			return nil
-		},
+				return nil
+			},
+		}
+		command.Flags().BoolVar(&wait, "wait", false, "wait for completion or human action")
+		return command
 	}
-	get.Flags().BoolVar(&wait, "wait", false, "wait for completion or human action")
+	get := newGetCommand("get")
+	show := newGetCommand("show")
 
 	cancel := &cobra.Command{
 		Use:   "cancel <job-id>",
@@ -332,7 +337,7 @@ func newJobsCommand(opt *options) *cobra.Command {
 	failures.Flags().StringVar(&failuresSince, "since", "", "include jobs updated since a duration or RFC3339 timestamp")
 	failures.Flags().IntVar(&failuresLimit, "limit", 50, "maximum groups (1-200)")
 
-	command.AddCommand(list, get, cancel, retry, failures, receiptCommand, repairAwaitingHuman, addComponent)
+	command.AddCommand(list, get, show, cancel, retry, failures, receiptCommand, repairAwaitingHuman, addComponent)
 	return command
 }
 
@@ -606,6 +611,8 @@ func validOpenURL(value string) bool {
 
 type focusHandoffs func(context.Context, []string) (api.ActionsOpenResult, error)
 
+var errNoConnectedBrowserSession = errors.New("no connected browser extension session - open Chrome with the papio extension enabled; check papio doctor")
+
 func focusOrOpenActionURLs(ctx context.Context, urls, untrackedURLs, jobIDs []string, dryRun bool, out io.Writer, focus focusHandoffs, run commandRunner) error {
 	if dryRun {
 		return openActionURLs(ctx, urls, true, out, run)
@@ -628,6 +635,9 @@ func focusOrOpenActionURLs(ctx context.Context, urls, untrackedURLs, jobIDs []st
 			}
 		}
 		return openActionURLs(ctx, untrackedURLs, false, out, run)
+	}
+	if err == nil {
+		return errNoConnectedBrowserSession
 	}
 	if err != nil {
 		var remote *ipc.RemoteError

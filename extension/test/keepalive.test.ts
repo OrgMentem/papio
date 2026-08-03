@@ -702,7 +702,7 @@ test("marker collection ignores logout text in scripts, styles, templates, and a
   }
 });
 
-test("known resolver origins retain independent verdicts and timestamps", async () => {
+test("popup check probes a live tab for a second known resolver origin", async () => {
   const defaultOrigin = "https://resolver.example.edu";
   const uwaOrigin = "https://onesearch.library.example-college.edu";
   const h = makeHarness(4, undefined, {
@@ -710,34 +710,30 @@ test("known resolver origins retain independent verdicts and timestamps", async 
     knownOrigins: [defaultOrigin, uwaOrigin],
   });
   await h.manager.init();
-  const signedIn = { id: 42, url: `${defaultOrigin}/account` };
-  const signedOut = { id: 43, url: `${uwaOrigin}/login` };
-  h.tabs.live.set(signedIn.id, signedIn);
-  h.tabs.live.set(signedOut.id, signedOut);
-  h.tabs.resolverTabs.push(signedIn, signedOut);
+  const uwaTab = { id: 43, url: `${uwaOrigin}/account` };
+  h.tabs.live.set(uwaTab.id, uwaTab);
+  h.tabs.resolverTabs.push(uwaTab);
+  const inspected: number[] = [];
   h.api.scripting = {
-    executeScript: async ({ target }) => [{
-      result: target.tabId === signedIn.id
-        ? [{ text: "Sign out", label: "" }]
-        : [{ text: "Sign in", label: "" }],
-    }],
+    executeScript: async ({ target }) => {
+      inspected.push(target.tabId);
+      return [{
+        result: target.tabId === uwaTab.id
+          ? [{ text: "Sign out", label: "" }]
+          : [],
+      }];
+    },
   };
 
   await h.manager.checkNow(100);
 
-  const states = h.manager.getOriginSnapshots();
-  expect(states).toHaveLength(2);
-  expect(states.find((snapshot) => snapshot.origin === defaultOrigin)).toMatchObject({
+  expect(inspected).toContain(uwaTab.id);
+  expect(h.manager.getOriginSnapshots().find((snapshot) => snapshot.origin === uwaOrigin)).toMatchObject({
     verdict: "in",
     authenticated: true,
     probeSource: "live_tab",
+    scanOutcome: "markers",
   });
-  expect(states.find((snapshot) => snapshot.origin === uwaOrigin)).toMatchObject({
-    verdict: "out",
-    authenticated: false,
-    probeSource: "live_tab",
-  });
-  expect(states.every((snapshot) => typeof snapshot.lastCheckAt === "number")).toBe(true);
 });
 
 test("granted provider permission patterns never mint institution rows", async () => {

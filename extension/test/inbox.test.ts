@@ -700,7 +700,7 @@ test("the action kind renders as a status glyph with an accessible label, not a 
   expect(page.document.querySelector("[data-triage-item-id='action:manual'] dd[data-fact='action']")).toBeNull();
 });
 
-test("backend identifiers collapse into a details section and the citation carries the DOI link", async () => {
+test("expandable details carry mechanism copy and backend identifiers", async () => {
   const item = manualAction("action:manual", 1, "Manual action");
 
   item.facts = [
@@ -722,28 +722,30 @@ test("backend identifiers collapse into a details section and the citation carri
   expect(citation?.textContent).toBe("LeCun, Y., Bengio, Y., & Hinton, G. (2015). https://doi.org/10.1038/nature14539");
   expect(citation?.querySelector("a")?.href).toBe("https://doi.org/10.1038/nature14539");
 
-  // The backend strip is hidden by default; its down-chevron trigger trails
-  // the actionable detail text and exposes item/job/revision as peers.
   const debug = row?.querySelector<HTMLDListElement>(".item-debug");
-  const debugToggle = row?.querySelector<HTMLButtonElement>(".item-detail .item-debug-toggle");
+  const debugToggle = row?.querySelector<HTMLButtonElement>(".item-guidance .item-debug-toggle");
   expect(debugToggle?.querySelector("svg")).not.toBeNull();
-  expect(debugToggle?.getAttribute("aria-label")).toBe("Backend details");
+  expect(debugToggle?.getAttribute("aria-label")).toBe("More details");
   expect(debugToggle?.getAttribute("aria-expanded")).toBe("false");
   expect(debug?.hidden).toBe(true);
+  expect(row?.querySelector(".item-guidance")?.textContent?.startsWith("Download the PDF yourself")).toBe(true);
+  expect(row?.querySelector(".item-mechanism")?.textContent).toContain(
+    "a resolver returned a landing page but no verified direct PDF",
+  );
+  expect(row?.querySelector(".item-mechanism")?.textContent).toContain(
+    "papio adopts PDFs saved to Downloads/papio/<job>",
+  );
   debugToggle?.click();
   expect(debugToggle?.getAttribute("aria-expanded")).toBe("true");
   expect(debug?.hidden).toBe(false);
   const debugFields = debug === null || debug === undefined ? [] : Array.from(debug.querySelectorAll(".item-debug-field"));
-  expect(debugFields.map((field) => field.textContent)).toEqual([
+  expect(debugFields.slice(1).map((field) => field.textContent)).toEqual([
     "itemaction:manual",
     "jobjob-18",
     "revision1",
   ]);
-  expect(row?.querySelector(".item-debug")?.previousElementSibling).toBe(row?.querySelector(".item-detail"));
+  expect(row?.querySelector(".item-debug")?.previousElementSibling).toBe(row?.querySelector(".item-guidance"));
   expect(row?.querySelector(".item-facts")).toBeNull();
-
-  // Detail remains unlabeled prose; the dots are a trailing affordance.
-  expect(row?.querySelector(".item-detail")?.textContent?.startsWith("a resolver returned a landing page but no verified direct PDF")).toBe(true);
 
   // Switching the style re-renders the citation in MLA.
   const select = page.document.getElementById("citation-style") as HTMLSelectElement;
@@ -755,32 +757,33 @@ test("backend identifiers collapse into a details section and the citation carri
   );
 });
 
-test("renders access hints only when the daemon classifies a human action", async () => {
-  const openAccess = manualAction("action:open-access", 1, "Open access action");
-  openAccess.requires_auth = false;
-  openAccess.blocked_by = "anti_bot";
-  const institutional = manualAction("action:institutional", 2, "Institutional action");
-  institutional.requires_auth = true;
-  institutional.blocked_by = "paywall";
-  const unclassified = verifyIdentity("action:unclassified", 3);
-  const fixture = snapshot([openAccess, institutional, unclassified], {
+test("access classification chooses one concise next action", async () => {
+  const openAccess = handoffAction("action:open-access", 1, false);
+  const institutional = handoffAction("action:institutional", 2, true);
+  const manual = manualAction("action:manual-auth", 3, "Paywalled manual download");
+  manual.requires_auth = true;
+  manual.blocked_by = "paywall";
+  const fixture = snapshot([openAccess, institutional, manual], {
     counts: counts({ pending_total: 3, actions: 3, watch_hits: 0, retractions: 0 }),
   });
   const page = await inboxDocument((message) => snapshotReply(fixture, message));
 
-  expect(page.document.querySelector("[data-triage-item-id='action:open-access'] .access-hint")?.textContent)
-    .toBe("no login needed");
-  expect(page.document.querySelector("[data-triage-item-id='action:institutional'] .access-hint")?.textContent)
-    .toBe("needs your institution sign-in");
-  expect(page.document.querySelector("[data-triage-item-id='action:unclassified'] .access-hint")).toBeNull();
+  expect(page.document.querySelector("[data-triage-item-id='action:open-access'] .item-guidance")?.textContent)
+    .toContain("Open the page");
+  expect(page.document.querySelector("[data-triage-item-id='action:institutional'] .item-guidance")?.textContent)
+    .toContain("Sign in to your institution");
+  expect(page.document.querySelector("[data-triage-item-id='action:manual-auth'] .item-guidance")?.textContent)
+    .toContain("Download the PDF yourself - papio adopts it");
+  expect(page.document.querySelector(".access-hint")).toBeNull();
+
+  for (const guidance of page.document.querySelectorAll<HTMLElement>(".item-guidance")) {
+    const copy = guidance.firstChild?.textContent ?? "";
+    expect(copy.length).toBeLessThanOrEqual(60);
+    expect(copy.trim().split(/\s+/).length).toBeLessThanOrEqual(8);
+  }
 });
 
-// The hint sits directly above the action's detail, which for a manual_download
-// tells the user to fetch the PDF themselves. When the hint also read as an
-// instruction ("sign in to your institution first") the pair looked like two
-// contradictory demands. It must state a precondition and never a verb the
-// detail contradicts.
-test("the access hint states a precondition rather than competing with the detail", async () => {
+test("manual download guidance does not compete with authentication metadata", async () => {
   const item = manualAction("action:manual-auth", 1, "Paywalled manual download");
   item.requires_auth = true;
   item.blocked_by = "paywall";
@@ -788,14 +791,18 @@ test("the access hint states a precondition rather than competing with the detai
   const page = await inboxDocument((message) =>
     snapshotReply(snapshot([item], { counts: counts({ pending_total: 1, actions: 1, watch_hits: 0, retractions: 0 }) }), message));
 
-  const hint = page.document.querySelector("[data-triage-item-id='action:manual-auth'] .access-hint")?.textContent ?? "";
-  expect(hint).toBe("needs your institution sign-in");
-  for (const verb of ["sign in to", "then run", "actions open", "download the"]) {
-    expect(hint.toLowerCase()).not.toContain(verb);
-  }
+  const row = page.document.querySelector("[data-triage-item-id='action:manual-auth']");
+  expect(row?.querySelector(".item-guidance")?.textContent).toContain(
+    "Download the PDF yourself - papio adopts it",
+  );
+  expect(row?.querySelector(".item-guidance")?.textContent).not.toContain("sign in");
+  expect(row?.querySelector<HTMLDListElement>(".item-debug")?.hidden).toBe(true);
+  expect(row?.querySelector(".item-mechanism")?.textContent).toContain(
+    "the browser handoff did not produce a file",
+  );
 });
 
-test("merges extension guidance into the daemon detail without repeating the hint", async () => {
+test("keeps daemon detail and mechanism copy out of the always-visible row", async () => {
   const item = manualAction("action:dedup-guidance", 1, "Manual download with daemon detail");
   item.facts = [
     { label: "Action", text: "manual download" },
@@ -805,12 +812,15 @@ test("merges extension guidance into the daemon detail without repeating the hin
     snapshotReply(snapshot([item], { counts: counts({ pending_total: 1, actions: 1, watch_hits: 0, retractions: 0 }) }), message));
 
   const row = page.document.querySelector("[data-triage-item-id='action:dedup-guidance']");
-  const guidance = "Sign in if needed and download the PDF — papio adopts anything saved to Downloads/papio/<job>. Tip: the papio toolbar button can send an open PDF directly.";
   expect(row?.querySelectorAll(".item-instruction")).toHaveLength(1);
-  expect(row?.querySelector(".item-guidance")).toBeNull();
-  expect(row?.querySelector(".item-detail")?.textContent).toContain("Download the requested PDF");
-  expect(row?.querySelector(".item-detail")?.getAttribute("title")).toBe(guidance);
-  expect(row?.textContent?.includes("Downloads/papio")).toBe(false);
+  expect(row?.querySelector(".item-guidance")?.firstChild?.textContent).toBe(
+    "Download the PDF yourself - papio adopts it",
+  );
+  expect(row?.querySelector(".item-detail")).toBeNull();
+  const details = row?.querySelector<HTMLDListElement>(".item-debug");
+  expect(details?.hidden).toBe(true);
+  expect(details?.textContent).toContain("Download the requested PDF and papio will adopt it.");
+  expect(details?.textContent).toContain("Downloads/papio/<job>");
 });
 
 test("an author suffix duplicated in the title is stripped for display", async () => {
@@ -988,24 +998,35 @@ test("an unchanged counts poll preserves the focused inbox control", async () =>
   }
 });
 
-test("human action guidance names the next step for each supported action kind", async () => {
+test("human action guidance names only the next step", async () => {
   const manual = manualAction("action:manual-guidance", 1, "Manual guidance");
   const authHandoff = handoffAction("action:auth-guidance", 2, true);
+  authHandoff.facts.push({
+    label: "Detail",
+    text: "A fresh link is generated on each open so an expired resolver URL is never reused.",
+  });
   const openHandoff = handoffAction("action:open-guidance", 3, false);
   const verify = verifyIdentity("action:verify-guidance", 4);
-  const fixture = snapshot([manual, authHandoff, openHandoff, verify], {
-    counts: counts({ pending_total: 4, actions: 4, watch_hits: 0, retractions: 0 }),
+  const unknown = manualAction("action:unknown-guidance", 5, "Unknown guidance");
+  unknown.action_kind = "future_action";
+  const fixture = snapshot([manual, authHandoff, openHandoff, verify, unknown], {
+    counts: counts({ pending_total: 5, actions: 5, watch_hits: 0, retractions: 0 }),
   });
   const page = await inboxDocument((message) => snapshotReply(fixture, message));
 
-  expect(page.document.querySelector("[data-triage-item-id='action:manual-guidance'] .item-guidance")?.textContent)
-    .toBe("Sign in if needed and download the PDF — papio adopts anything saved to Downloads/papio/<job>. Tip: the papio toolbar button can send an open PDF directly.");
-  expect(page.document.querySelector("[data-triage-item-id='action:auth-guidance'] .item-guidance")?.textContent)
-    .toBe("Opens your library resolver — sign in once and papio drives the rest.");
-  expect(page.document.querySelector("[data-triage-item-id='action:open-guidance'] .item-guidance")?.textContent)
-    .toBe("papio will drive this page automatically once opened.");
-  expect(page.document.querySelector("[data-triage-item-id='action:verify-guidance'] .item-guidance")?.textContent)
-    .toBe("View the PDF, then accept or reject — accept files it into your library.");
+  expect(page.document.querySelector("[data-triage-item-id='action:manual-guidance'] .item-guidance")?.firstChild?.textContent)
+    .toBe("Download the PDF yourself - papio adopts it");
+  expect(page.document.querySelector("[data-triage-item-id='action:auth-guidance'] .item-guidance")?.firstChild?.textContent)
+    .toBe("Sign in to your institution");
+  expect(page.document.querySelector("[data-triage-item-id='action:open-guidance'] .item-guidance")?.firstChild?.textContent)
+    .toBe("Open the page");
+  expect(page.document.querySelector("[data-triage-item-id='action:verify-guidance'] .item-guidance")?.firstChild?.textContent)
+    .toBe("Review the PDF, then accept or reject");
+  expect(page.document.querySelector("[data-triage-item-id='action:unknown-guidance'] .item-instruction")).toBeNull();
+
+  const authDetails = page.document.querySelector("[data-triage-item-id='action:auth-guidance'] .item-debug");
+  expect(authDetails?.textContent).toContain("A fresh link is generated on each open");
+  expect(authDetails?.textContent).toContain("papio continues automatically after the handoff");
 });
 
 test("retry operations declared by the daemon are not rendered", async () => {
@@ -1018,7 +1039,7 @@ test("retry operations declared by the daemon are not rendered", async () => {
   expect(page.document.querySelector("[data-triage-item-id='hit:retry-placeholder'] .item-controls")).toBeNull();
 });
 
-test("annotates the Actions row when a provider security check blocks its browser job", async () => {
+test("challenge-blocked rows show one concise action and hide the mechanism", async () => {
   const fixture = snapshot([manualAction("action:challenge", 1, "Challenge paper")], {
     counts: counts({ pending_total: 1, actions: 1, watch_hits: 0, retractions: 0 }),
   });
@@ -1036,10 +1057,13 @@ test("annotates the Actions row when a provider security check blocks its browse
     return snapshotReply(fixture, message);
   });
 
-  const annotation = page.document.querySelector(
-    "[data-triage-item-id='action:challenge'] .challenge-annotation",
-  );
-  expect(annotation?.textContent).toBe(
-    "Security check needs you — complete it in the papio tab; papio resumes automatically.",
+  const row = page.document.querySelector("[data-triage-item-id='action:challenge']");
+  const annotation = row?.querySelector(".challenge-annotation");
+  expect(annotation?.firstChild?.textContent).toBe("Solve the security check in its tab");
+  expect(row?.querySelectorAll(".item-guidance")).toHaveLength(1);
+  const details = row?.querySelector<HTMLDListElement>(".item-debug");
+  expect(details?.hidden).toBe(true);
+  expect(details?.textContent).toContain(
+    "papio resumes automatically after you solve the security check.",
   );
 });

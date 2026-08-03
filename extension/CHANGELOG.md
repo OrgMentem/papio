@@ -19,14 +19,17 @@ for the full pre-split extension history.
 ### Added
 
 - **One session row per institution.** The popup's institution card renders a
-  row for every configured resolver origin — each with its own evidence-based
-  verdict, freshness, and a Sign in button that opens *that* institution —
-  and keep-warm tracks each origin separately. A warm session releases only
-  the queued work its institution can actually unlock.
+  row for every config-derived resolver origin advertised in the daemon hello —
+  never for a provider offer or a host-permission grant. Each row has its own
+  evidence-based verdict, freshness, and a Sign in button that opens *that*
+  institution, and keep-warm tracks each origin separately. Warm evidence
+  releases only that origin's queued extension handoffs and daemon-side sibling
+  re-offers; another institution's queue remains parked.
 - **Session verdicts got stricter.** An auth-shaped URL alone never reads as
   signed out (inspection evidence is required), expired identity tokens no
   longer count as signed in, and sign-out markers are read only from real
-  controls and links — never from page scripts, styles, or aggregate text.
+  controls, links, and forms — never from page scripts, styles, or aggregate
+  text.
 - **papio owns its surfaces — leftover tabs clean themselves up.** Broker tabs
   papio creates are recorded in a durable ledger that survives extension
   reloads. Shortly after startup, ledger-owned leftovers still sitting in the

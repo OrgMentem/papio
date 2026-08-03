@@ -768,9 +768,9 @@ export class KeepaliveManager {
         (tab) => typeof tab.url === "string" && resolverURLMatches(tab.url, resolver),
       );
       // A user's visible resolver tab carries the strongest, freshest
-      // evidence. Only inspect the manager-owned tab when no user tab exists.
-      const liveTab =
-        resolverTabs.find((tab) => tab.id !== this.tabID) ?? resolverTabs[0];
+      // evidence. The manager-owned tab is eligible only for the current
+      // origin; a secondary origin is always live-tab evidence.
+      const liveTab = resolverTabs.find((tab) => tab.id !== this.tabID);
       const isCurrent = this.resolver?.origin === origin;
       if (isCurrent) this.likelyAuthenticated = liveTab !== undefined;
       if (liveTab?.id !== undefined) {

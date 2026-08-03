@@ -32,7 +32,7 @@ func defaultDoctorDependencies(opt *options) doctor.IntegrationDependencies {
 		LoadConfig: opt.loadConfig,
 		DaemonStatus: func(ctx context.Context, _ config.Config) (doctor.DaemonStatus, error) {
 			var status doctor.DaemonStatus
-			if err := opt.call(ctx, "ping", struct{}{}, &status); err != nil {
+			if err := opt.callExisting(ctx, "ping", struct{}{}, &status); err != nil {
 				return doctor.DaemonStatus{}, err
 			}
 			return status, nil
@@ -96,7 +96,7 @@ func daemonReadinessDoctor(opt *options, daemonErr *error) doctorReadinessRunner
 		// times; a transient failure must not outlive its own run.
 		*daemonErr = nil
 		var report doctor.Report
-		if err := opt.call(ctx, "doctor.run", struct{}{}, &report); err != nil {
+		if err := opt.callExisting(ctx, "doctor.run", struct{}{}, &report); err != nil {
 			// RunIntegration will render the daemon failure and its single
 			// dependent-check skip. Do not add local checks that would obscure it.
 			*daemonErr = err
@@ -151,6 +151,13 @@ func runDoctor(ctx context.Context, deps doctor.IntegrationDependencies, readine
 		}
 	}
 	integrationReport := doctor.RunIntegration(ctx, deps)
+	for i := range integrationReport.Checks {
+		check := &integrationReport.Checks[i]
+		if check.Name == "daemon" && check.Status == doctor.Fail &&
+			strings.Contains(check.Detail, "not running or unreachable") {
+			check.Remediation = "run 'papio jobs list' to start the daemon automatically, then retry 'papio doctor'"
+		}
+	}
 	return doctor.Report{
 		OK:     readinessReport.OK && integrationReport.OK,
 		Checks: append(readinessReport.Checks, integrationReport.Checks...),

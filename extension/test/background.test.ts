@@ -3766,6 +3766,25 @@ test("inbound native handlers finish in receipt order across asynchronous awaits
 // login form. Chrome can deliver the title in a separate update after `complete`.
 const STALE_IDP_URL = "https://idp.example.edu/idp/profile/SAML2/Redirect/SSO?execution=e1s2";
 const STALE_IDP_TITLE = "Example University Login Service - Stale Request";
+const OPENATHENS_ERROR_URL = "https://login.openathens.net/saml/2/sso/example.edu/redirect";
+const OPENATHENS_ERROR_TITLE = "Error | OpenAthens";
+
+function openAthensDocument(body: string, title = OPENATHENS_ERROR_TITLE): Document {
+  const window = new Window({ url: OPENATHENS_ERROR_URL });
+  window.document.write(`<html><head><title>${title}</title></head><body>${body}</body></html>`);
+  return window.document as unknown as Document;
+}
+
+const OPENATHENS_REDIRECT_BODY = `
+  <main>
+    <h1>Too many redirects</h1>
+    <p>Service provider redirecting to OpenAthens too many times</p>
+    <dl>
+      <dt>Entity ID</dt><dd>https://www.tandfonline.com/shibboleth</dd>
+      <dt>Error code</dt><dd>GA-AP-4021-06</dd>
+    </dl>
+  </main>
+`;
 
 /** Offer a job into a work window and return its broker tab id. */
 async function offerIntoWorkWindow(h: Harness, jobID: string): Promise<number> {
@@ -3786,6 +3805,126 @@ async function emitStaleIdPTitle(h: Harness, tabID: number, newDocument = false)
   }
   await h.tabs.onUpdated.emit(tabID, { title: STALE_IDP_TITLE }, tab);
 }
+test("OpenAthens redirect-loop error parks the job provider and retains its tab", async () => {
+  const h = makeHarness();
+  for (const marker of [
+    "Too many redirects",
+    "Service provider redirecting to OpenAthens",
+    "GA-AP-4021-06",
+    "OA-AP-4031-05",
+  ]) {
+    expect(assessDrivenPage(openAthensDocument(`<p>${marker}</p>`), true)).toEqual({
+      kind: "redirect_loop",
+    });
+  }
+  expect(
+    assessDrivenPage(openAthensDocument("<p>GA-AP-4021-06</p>", "Sign in | OpenAthens"), true),
+  ).toEqual({ kind: "normal" });
+  expect(assessDrivenPage(openAthensDocument("<p>GA-AP-4021-06</p>"), false)).toEqual({
+    kind: "normal",
+  });
+  const document = openAthensDocument(OPENATHENS_REDIRECT_BODY);
+  h.deps.scripting.executeScript = async (injection) => {
+    if (injection.func !== assessDrivenPage) return [];
+    return [{ result: assessDrivenPage(document, injection.args?.[1] === true) }];
+  };
+  await h.bridge.start();
+  await h.port.inbound(jobOfferForHosts("job_openathens_loop", ["www.tandfonline.com"]));
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  const tab = { id: tabID, url: OPENATHENS_ERROR_URL, title: OPENATHENS_ERROR_TITLE };
+  h.tabs.live.set(tabID, tab);
+
+  await h.tabs.onUpdated.emit(tabID, { title: OPENATHENS_ERROR_TITLE }, tab);
+
+  const relevantFrames = h.frames().filter(
+    (frame) =>
+      (frame.type === "handoff_outcome" && frame.payload["outcome"] === "auth_error") ||
+      (frame.type === "error" && frame.payload["code"] === "challenge_blocked"),
+  );
+  expect(
+    relevantFrames.map((frame) =>
+      frame.type === "handoff_outcome" ? frame.payload["outcome"] : frame.payload["code"],
+    ),
+  ).toEqual(["auth_error", "challenge_blocked"]);
+  expect(relevantFrames.filter((frame) => frame.type === "error")).toHaveLength(1);
+  expect(h.backend.store.activeJobs[0]).toMatchObject({
+    challenge_blocked: true,
+    challenge_host: "tandfonline.com",
+    challenge_kind: "redirect_loop",
+  });
+  expect(h.backend.store.challengeCooldowns).toEqual({
+    "tandfonline.com": h.clock.now + 600_000,
+  });
+  expect(h.backend.store.providerDrainLeases?.["www.tandfonline.com"]?.parkedReason).toBe("challenge");
+  expect(h.backend.store.challengeCooldowns?.["login.openathens.net"]).toBeUndefined();
+  expect(h.tabs.live.has(tabID)).toBe(true);
+  expect(h.tabs.navigations).toEqual([]);
+  expect(h.timers.filter((timer) => timer.ms === 1_500)).toHaveLength(1);
+});
+
+test("OpenAthens title-only error catches a late body in one bounded recheck", async () => {
+  const h = makeHarness();
+  let document = openAthensDocument("<main>Loading error details…</main>");
+  let assessments = 0;
+  h.deps.scripting.executeScript = async (injection) => {
+    if (injection.func !== assessDrivenPage) return [];
+    assessments += 1;
+    return [{ result: assessDrivenPage(document, injection.args?.[1] === true) }];
+  };
+  await h.bridge.start();
+  await h.port.inbound(jobOfferForHosts("job_openathens_late_body", ["www.tandfonline.com"]));
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  const tab = { id: tabID, url: OPENATHENS_ERROR_URL, title: OPENATHENS_ERROR_TITLE };
+  h.tabs.live.set(tabID, tab);
+
+  await h.tabs.onUpdated.emit(tabID, { title: OPENATHENS_ERROR_TITLE }, tab);
+  expect(h.frames().some((frame) => frame.type === "error" && frame.payload["code"] === "challenge_blocked")).toBe(false);
+  const rechecks = h.timers.filter((timer) => timer.ms === 1_500);
+  expect(rechecks).toHaveLength(1);
+
+  document = openAthensDocument(OPENATHENS_REDIRECT_BODY);
+  await rechecks[0]!.fn();
+  await rechecks[0]!.fn();
+
+  expect(assessments).toBe(2);
+  expect(
+    h.frames().filter((frame) => frame.type === "error" && frame.payload["code"] === "challenge_blocked"),
+  ).toHaveLength(1);
+  expect(h.backend.store.activeJobs[0]).toMatchObject({
+    challenge_blocked: true,
+    challenge_host: "tandfonline.com",
+    challenge_kind: "redirect_loop",
+  });
+  expect(h.backend.store.challengeCooldowns?.["tandfonline.com"]).toBe(h.clock.now + 600_000);
+  expect(h.tabs.live.has(tabID)).toBe(true);
+  expect(h.tabs.navigations).toEqual([]);
+});
+
+test("a normal OpenAthens sign-in page remains untouched", async () => {
+  const h = makeHarness();
+  const title = "Sign in | OpenAthens";
+  const document = openAthensDocument("<main><h1>Sign in</h1><form></form></main>", title);
+  h.deps.scripting.executeScript = async (injection) => {
+    if (injection.func !== assessDrivenPage) return [];
+    return [{ result: assessDrivenPage(document, injection.args?.[1] === true) }];
+  };
+  await h.bridge.start();
+  await h.port.inbound(jobOfferForHosts("job_openathens_sign_in", ["www.tandfonline.com"]));
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  const tab = { id: tabID, url: OPENATHENS_ERROR_URL, title };
+  h.tabs.live.set(tabID, tab);
+
+  await h.tabs.onUpdated.emit(tabID, { title }, tab);
+
+  expect(h.frames().some((frame) => frame.type === "handoff_outcome")).toBe(false);
+  expect(h.frames().some((frame) => frame.type === "error" && frame.payload["code"] === "challenge_blocked")).toBe(false);
+  expect(h.backend.store.activeJobs[0]?.challenge_blocked).toBeUndefined();
+  expect(h.backend.store.challengeCooldowns ?? {}).toEqual({});
+  expect(h.timers.filter((timer) => timer.ms === 1_500)).toHaveLength(0);
+  expect(h.tabs.live.has(tabID)).toBe(true);
+  expect(h.tabs.navigations).toEqual([]);
+});
+
 
 test("a title-only stale IdP page is detected, raises the work window, and re-drives", async () => {
   // The failure this pins: the handoff sat minimized on a dead sign-in page for

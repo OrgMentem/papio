@@ -33,9 +33,11 @@ execution records in `notes/acquisition-stack-plan.md`.
   longer leak to either surface, and the CLI line view drops the raw detail
   JSON (still available under `--json`).
 - **Two institutions no longer share one session.** Browser session evidence
-  carries the resolver origin that produced it, and the daemon re-offers only
-  the matching profile's blocked work — a the second institution sign-in never releases the default institution's
-  queue, and vice versa. Named `[browser.resolvers.*]` profiles now send their
+  carries the resolver origin that produced it. The extension releases only
+  queued handoffs for that origin, and the daemon maps the origin to a
+  configured resolver profile before re-offering only that profile's
+  store-backed siblings — one institution's sign-in never releases the other's queue on either
+  side, and vice versa. Named `[browser.resolvers.*]` profiles now send their
   own `shibboleth_entity_id` / `proquest_account_id` on handoffs (previously
   default-profile only), and a new `browser.default_resolver` key selects
   which profile bare acquisitions use.

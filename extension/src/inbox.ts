@@ -892,57 +892,63 @@ function statusMeta(item: TriageSnapshotItem): { key: string; glyph: string; lab
   return { key: "unknown", glyph: "•", label: key.replaceAll("_", " ") };
 }
 
-// Access classification is optional so snapshots from older daemons retain
-// their existing presentation. Newer daemon snapshots distinguish an action
-// that merely needs opening from one that first needs institutional sign-in.
-//
-// Phrased as a PRECONDITION, never as an instruction. The detail line directly
-// below already tells the user what to do, and it varies by action kind — a
-// manual_download says to fetch the PDF yourself. When this line also read as
-// an instruction ("sign in to your institution first") the two looked like
-// contradictory demands: sign in, or download? It states only whether a login
-// stands in the way, and lets the detail own the verb.
-function accessHint(item: TriageSnapshotItem): HTMLElement | null {
-  if (item.kind !== "human_action" || (item.blocked_by === undefined && item.requires_auth === undefined)) return null;
-  const hint = element("p", item.requires_auth === true
-    ? "needs your institution sign-in"
-    : "no login needed");
-  hint.className = "access-hint";
-  return hint;
+// Access classification chooses the next action instead of adding a second
+// always-visible precondition. Supporting mechanics and daemon detail live in
+// the row's disclosure below.
+function challengeBlocked(item: TriageSnapshotItem): boolean {
+  if (item.kind !== "human_action") return false;
+  const jobID = itemJobID(item);
+  if (jobID === null) return false;
+  return state.activityEntries.some(
+    (entry) =>
+      entry.job_id === jobID &&
+      entry.kind === "browser.error" &&
+      /\bchallenge[_ ]blocked\b/i.test(entry.text),
+  );
 }
 
-function guidanceText(item: TriageSnapshotItem): string | null {
+function guidanceText(item: TriageSnapshotItem, blockedByChallenge: boolean): string | null {
   if (item.kind !== "human_action") return null;
+  if (blockedByChallenge) return "Solve the security check in its tab";
   switch (item.action_kind) {
     case "manual_download":
-      return "Sign in if needed and download the PDF — papio adopts anything saved to Downloads/papio/<job>. Tip: the papio toolbar button can send an open PDF directly.";
+      return "Download the PDF yourself - papio adopts it";
     case "openurl_handoff":
       return item.requires_auth === true
-        ? "Opens your library resolver — sign in once and papio drives the rest."
-        : "papio will drive this page automatically once opened.";
+        ? "Sign in to your institution"
+        : "Open the page";
     case "verify_identity":
-      return "View the PDF, then accept or reject — accept files it into your library.";
+      return "Review the PDF, then accept or reject";
     default:
       return null;
   }
 }
 
-/** Keep daemon detail and extension guidance in one muted instruction row.
- * The daemon's detail is the visible source of truth; the longer Downloads/
- * papio hint stays available as a title rather than another repeated line. */
-function renderInstruction(item: TriageSnapshotItem): HTMLElement | null {
-  const detail = factText(item, "Detail");
-  const guidance = guidanceText(item);
-  if (detail === null && guidance === null) return null;
-  const instruction = element("p");
-  if (detail !== null) {
-    instruction.className = "item-instruction item-detail";
-    appendFactText(instruction, detail);
-    if (guidance !== null) instruction.title = guidance;
-  } else {
-    instruction.className = "item-instruction item-guidance";
-    instruction.textContent = guidance;
+function mechanismText(item: TriageSnapshotItem, blockedByChallenge: boolean): string | null {
+  if (item.kind !== "human_action") return null;
+  if (blockedByChallenge) {
+    return "papio resumes automatically after you solve the security check.";
   }
+  switch (item.action_kind) {
+    case "manual_download":
+      return "papio adopts PDFs saved to Downloads/papio/<job>. The toolbar button can also send an open PDF.";
+    case "openurl_handoff":
+      return "A fresh link is generated each time you open this action. papio continues automatically after the handoff.";
+    case "verify_identity":
+      return "papio files accepted PDFs into your library.";
+    default:
+      return null;
+  }
+}
+
+/** Render only the next action. Empty guidance takes no row space; daemon
+ * detail and mechanism explanations are kept in the disclosure. */
+function renderInstruction(item: TriageSnapshotItem, blockedByChallenge: boolean): HTMLElement | null {
+  const guidance = guidanceText(item, blockedByChallenge);
+  if (guidance === null || guidance.trim() === "") return null;
+  const instruction = element("p", guidance);
+  instruction.className = "item-instruction item-guidance";
+  if (blockedByChallenge) instruction.classList.add("challenge-annotation");
   return instruction;
 }
 
@@ -958,38 +964,35 @@ function liveStatusChip(item: TriageSnapshotItem): HTMLElement | null {
   chip.dataset.jobId = jobID;
   return chip;
 }
-function challengeAnnotation(item: TriageSnapshotItem): HTMLElement | null {
-  if (item.kind !== "human_action") return null;
-  const jobID = itemJobID(item);
-  if (jobID === null) return null;
-  const blocked = state.activityEntries.some(
-    (entry) =>
-      entry.job_id === jobID &&
-      entry.kind === "browser.error" &&
-      /\bchallenge[_ ]blocked\b/i.test(entry.text),
-  );
-  if (!blocked) return null;
-  const annotation = element("p");
-  annotation.className = "access-hint challenge-annotation";
-  annotation.textContent = "Security check needs you — complete it in the papio tab; papio resumes automatically.";
-  return annotation;
-}
 
+// Supporting explanation and backend identifiers share one compact disclosure,
+// preserving native button keyboard semantics and state.
+function renderDebug(
+  item: TriageSnapshotItem,
+  blockedByChallenge: boolean,
+): { toggle: HTMLButtonElement; list: HTMLDListElement } {
+  const list = element("dl");
+  list.className = "item-debug";
+  list.hidden = true;
+  list.id = `backend-details-${item.id}`;
 
-// Backend identifiers remain out of the ordinary triage flow. Their compact
-// disclosure sits beside the action/status text and preserves native button
-// keyboard semantics and state.
-function renderDebug(item: TriageSnapshotItem): { toggle: HTMLButtonElement; list: HTMLDListElement } {
+  const details = [factText(item, "Detail"), mechanismText(item, blockedByChallenge)]
+    .filter((value): value is string => value !== null && value.trim() !== "");
+  if (details.length > 0) {
+    const field = element("div");
+    field.className = "item-debug-field item-mechanism";
+    const valueElement = element("dd");
+    appendFactText(valueElement, details.join(" "));
+    field.append(element("dt", "details"), valueElement);
+    list.append(field);
+  }
+
   const rows: Array<[string, string]> = [["item", item.id]];
   const job = factText(item, "Job");
   if (job !== null) rows.push(["job", job]);
   if (item.kind === "human_action" && typeof item.revision === "number") {
     rows.push(["revision", String(item.revision)]);
   }
-  const list = element("dl");
-  list.className = "item-debug";
-  list.hidden = true;
-  list.id = `backend-details-${item.id}`;
   for (const [label, value] of rows) {
     const field = element("div");
     field.className = "item-debug-field";
@@ -1009,10 +1012,10 @@ function renderDebug(item: TriageSnapshotItem): { toggle: HTMLButtonElement; lis
   toggle.append(icon);
   toggle.className = "item-debug-toggle";
   toggle.type = "button";
-  toggle.dataset.label = "Backend details";
+  toggle.dataset.label = "More details";
   toggle.setAttribute("aria-controls", list.id);
   toggle.setAttribute("aria-expanded", "false");
-  toggle.setAttribute("aria-label", "Backend details");
+  toggle.setAttribute("aria-label", "More details");
   toggle.addEventListener("click", () => {
     const expanded = toggle.getAttribute("aria-expanded") === "true";
     toggle.setAttribute("aria-expanded", String(!expanded));
@@ -1046,16 +1049,13 @@ function renderItem(item: TriageSnapshotItem): HTMLElement {
 
   const headingText = element("h3", title.text);
   if (title.placeholder) headingText.classList.add("title-placeholder");
-  const debug = renderDebug(item);
+  const blockedByChallenge = challengeBlocked(item);
+  const debug = renderDebug(item, blockedByChallenge);
   body.append(headingText);
 
   const citation = renderCitation(item, title.placeholder ? title.text : null);
   if (citation !== null) body.append(citation);
-  const hint = accessHint(item);
-  if (hint !== null) body.append(hint);
-  const challenge = challengeAnnotation(item);
-  if (challenge !== null) body.append(challenge);
-  const instruction = renderInstruction(item);
+  const instruction = renderInstruction(item, blockedByChallenge);
   if (instruction !== null) body.append(instruction);
   const liveStatus = liveStatusChip(item);
   if (liveStatus !== null) body.append(liveStatus);

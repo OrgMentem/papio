@@ -97,6 +97,11 @@ const PROVIDER_DRAIN_LEASE_MS = 24 * CLASSIFY_RETRY_MS;
 /** Security checks and redirect-loop dead ends cool a provider for ten minutes
  * so an automated re-offer cannot immediately trip the same hardening again. */
 const CHALLENGE_COOLDOWN_MS = 10 * 60_000;
+/** A title-only OpenAthens error update can precede its body render. Recheck
+ * exactly once, late enough for the bounded DOM marker probe to see it. */
+const OPENATHENS_ERROR_RECHECK_MS = 1_500;
+const OPENATHENS_LOGIN_HOST = "login.openathens.net";
+const OPENATHENS_ERROR_TITLE = "Error | OpenAthens";
 const PROVIDER_MULTI_LABEL_SUFFIXES: Record<string, true> = {
   "ac.uk": true,
   "co.uk": true,
@@ -308,14 +313,25 @@ export function isBotChallenge(doc: Document | null): boolean {
   );
 }
 
-/** OpenAthens and browser redirect-loop dead ends remain human-visible. */
-export function isRedirectLoopPage(doc: Document | null): boolean {
+/** OpenAthens and browser redirect-loop dead ends remain human-visible.
+ * `openAthensHost` is supplied only after the tracked tab's origin is verified;
+ * keeping it explicit prevents an OpenAthens-looking provider page from
+ * triggering the origin-specific code/phrase markers. */
+export function isRedirectLoopPage(doc: Document | null, openAthensHost = false): boolean {
   const root: Document = doc ?? document;
   const title = (root.title ?? "").trim().slice(0, 256);
   const text = (root.body?.textContent ?? "").slice(0, 40_000);
-  return /\btoo\s+many\s+redirects\b|\berr_too_many_redirects\b|\bredirect\s+loop\b/i.test(
-    `${title}\n${text}`,
-  );
+  const genericLoop =
+    /\btoo\s+many\s+redirects\b|\berr_too_many_redirects\b|\bredirect\s+loop\b/i.test(
+      `${title}\n${text}`,
+    );
+  const openAthensLoop =
+    openAthensHost &&
+    title === "Error | OpenAthens" &&
+    /\btoo\s+many\s+redirects\b|\bservice\s+provider\s+redirecting\b|\b(?:GA|OA)-AP-\d{4}-\d{2}\b/i.test(
+      text,
+    );
+  return (!openAthensHost && genericLoop) || openAthensLoop;
 }
 
 /**
@@ -323,7 +339,7 @@ export function isRedirectLoopPage(doc: Document | null): boolean {
  * challenge/error pages from being mistaken for articles or login forms.
  * Do not reference outer functions: this body is serialized by Chrome.
  */
-export function assessDrivenPage(doc: Document | null): DrivenPageAssessment {
+export function assessDrivenPage(doc: Document | null, openAthensHost = false): DrivenPageAssessment {
   const root: Document = doc ?? document;
   const title = (root.title ?? "").trim().slice(0, 256);
   const text = (root.body?.textContent ?? "").slice(0, 40_000);
@@ -342,9 +358,17 @@ export function assessDrivenPage(doc: Document | null): DrivenPageAssessment {
   ) {
     return { kind: "challenge" };
   }
-  if (/\btoo\s+many\s+redirects\b|\berr_too_many_redirects\b|\bredirect\s+loop\b/i.test(`${title}\n${text}`)) {
-    return { kind: "redirect_loop" };
-  }
+  const genericLoop =
+    /\btoo\s+many\s+redirects\b|\berr_too_many_redirects\b|\bredirect\s+loop\b/i.test(
+      `${title}\n${text}`,
+    );
+  const openAthensLoop =
+    openAthensHost &&
+    title === "Error | OpenAthens" &&
+    /\btoo\s+many\s+redirects\b|\bservice\s+provider\s+redirecting\b|\b(?:GA|OA)-AP-\d{4}-\d{2}\b/i.test(
+      text,
+    );
+  if ((!openAthensHost && genericLoop) || openAthensLoop) return { kind: "redirect_loop" };
   return { kind: "normal" };
 }
 
@@ -1012,6 +1036,9 @@ export class Bridge {
   private readonly staleRecoveryEpochs = new Map<string, number>();
   private readonly staleRecoveryAttemptedEpochs = new Map<string, number>();
   private readonly staleRecoveryInFlightEpochs = new Map<string, number>();
+  /** Document epoch already given its one late OpenAthens body probe. Retaining
+   * the epoch after the timer fires prevents repeated title events from polling. */
+  private readonly openAthensErrorRecheckEpochs = new Map<string, number>();
   /** Resolver pages that conclusively show zero electronic holdings are terminal
    * for this offer. Keep this worker-local debounce until the job is removed so
    * reloads and SPA completion events cannot report the same outcome repeatedly. */
@@ -3476,6 +3503,7 @@ export class Bridge {
     this.staleRecoveryEpochs.delete(jobID);
     this.staleRecoveryAttemptedEpochs.delete(jobID);
     this.staleRecoveryInFlightEpochs.delete(jobID);
+    this.openAthensErrorRecheckEpochs.delete(jobID);
     this.resolverNoEntitlementSent.delete(jobID);
     this.proquestAccountIDs.delete(jobID);
     this.accountIdAppended.delete(jobID);
@@ -4889,6 +4917,69 @@ export class Bridge {
     await this.removeJobWithOffer(jobID);
   }
 
+  /** Run the bounded DOM probe for a tracked page and preserve the existing
+   * challenge-blocked contract. The boolean argument is origin evidence for
+   * OpenAthens-only body markers; page text never leaves the injected function. */
+  private async assessTrackedDrivenPage(
+    job: ActiveJob,
+    host: string,
+    url: string,
+  ): Promise<boolean> {
+    try {
+      const results = await this.deps.scripting.executeScript({
+        target: { tabId: job.tab_id },
+        func: assessDrivenPage,
+        args: [null, host === OPENATHENS_LOGIN_HOST],
+      });
+      const assessment = results[0]?.result as DrivenPageAssessment | undefined;
+      if (assessment?.kind === "challenge" || assessment?.kind === "redirect_loop") {
+        await this.blockChallenge(
+          job,
+          host,
+          assessment.kind === "challenge" ? "cloudflare" : "redirect_loop",
+          url,
+        );
+        return true;
+      }
+      if (assessment?.kind === "normal" && job.challenge_blocked === true) {
+        return !(await this.clearChallengeBlock(job));
+      }
+    } catch (e) {
+      console.error("papio: driven-page assessment failed; continuing handoff", e);
+    }
+    return false;
+  }
+
+  /** Chrome may publish the terminal OpenAthens title before React/body text.
+   * Give each document epoch exactly one late probe; it never navigates or
+   * retries the page and retains the terminal tab when the marker appears. */
+  private scheduleOpenAthensErrorRecheck(job: ActiveJob, epoch: number): void {
+    if (this.openAthensErrorRecheckEpochs.get(job.job_id) === epoch) return;
+    this.openAthensErrorRecheckEpochs.set(job.job_id, epoch);
+    this.deps.setTimeout(async () => {
+      await this.ready;
+      if (this.openAthensErrorRecheckEpochs.get(job.job_id) !== epoch) return;
+      if ((this.staleRecoveryEpochs.get(job.job_id) ?? 0) !== epoch) return;
+      const current = findByJob(this.store, job.job_id);
+      if (current === undefined || current.tab_id !== job.tab_id || current.challenge_blocked === true) return;
+      let tab: TabInfo;
+      try {
+        tab = await this.deps.tabs.get(current.tab_id);
+      } catch {
+        return;
+      }
+      if (tab.url === undefined || tab.title !== OPENATHENS_ERROR_TITLE) return;
+      let host: string;
+      try {
+        host = new URL(tab.url).hostname.toLowerCase();
+      } catch {
+        return;
+      }
+      if (host !== OPENATHENS_LOGIN_HOST) return;
+      await this.assessTrackedDrivenPage(current, host, tab.url);
+    }, OPENATHENS_ERROR_RECHECK_MS);
+  }
+
   private async onTabUpdated(tabID: number, change: TabChangeInfo, tab: TabInfo): Promise<void> {
     await this.ready;
     const job = findByTab(this.store, tabID);
@@ -4941,6 +5032,12 @@ export class Bridge {
         }
       }
     }
+    if (
+      host === OPENATHENS_LOGIN_HOST &&
+      change.title === OPENATHENS_ERROR_TITLE
+    ) {
+      this.scheduleOpenAthensErrorRecheck(job, staleRecoveryEpoch);
+    }
     const adapter = this.deps.adapterSpecs.find((candidate) => hostMatches(host, candidate.hosts));
     // The registry is source-controlled and may cover hosts omitted from the
     // capped offer list. Persist its identity before any permission-dependent
@@ -4961,29 +5058,12 @@ export class Bridge {
     const shouldAssessBeforeRouting =
       (change.status === "complete" || change.title !== undefined) &&
       (onProvider || isAuthenticationURL(url));
-    if (shouldAssessBeforeRouting && (change.title !== undefined || !onProvider)) {
-      try {
-        const results = await this.deps.scripting.executeScript({
-          target: { tabId: job.tab_id },
-          func: assessDrivenPage,
-          args: [null],
-        });
-        const assessment = results[0]?.result as DrivenPageAssessment | undefined;
-        if (assessment?.kind === "challenge" || assessment?.kind === "redirect_loop") {
-          await this.blockChallenge(
-            job,
-            host,
-            assessment.kind === "challenge" ? "cloudflare" : "redirect_loop",
-            url,
-          );
-          return;
-        }
-        if (assessment?.kind === "normal" && job.challenge_blocked === true) {
-          if (!(await this.clearChallengeBlock(job))) return;
-        }
-      } catch (e) {
-        console.error("papio: driven-page assessment failed; continuing handoff", e);
-      }
+    if (
+      shouldAssessBeforeRouting &&
+      (change.title !== undefined || !onProvider) &&
+      (await this.assessTrackedDrivenPage(job, host, url))
+    ) {
+      return;
     }
     if (!onProvider) {
       // Reuse the durable resolver-provided offer URL that produced that viewer.

@@ -26,7 +26,8 @@
   ],
   "host_permissions": [
     "https://*.alma.exlibrisgroup.com/*",
-    "https://*.primo.exlibrisgroup.com/*"
+    "https://*.primo.exlibrisgroup.com/*",
+    "https://login.openathens.net/*"
   ],
   "optional_host_permissions": [
     "https://www.jstor.org/*",

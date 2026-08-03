@@ -117,68 +117,40 @@ func TestDoctorDaemonDownCollapsesIntegrationSkips(t *testing.T) {
 	}
 }
 
-func TestDoctorUsesOrdinaryDaemonAutostartPath(t *testing.T) {
+func TestDoctorDoesNotAutostartAndNamesAutostartingRemedy(t *testing.T) {
 	cfg := config.Default()
 	cfg.Path = filepath.Join(t.TempDir(), "config.toml")
 	cfg.DataDir = t.TempDir()
 	cfg.Updates.Check = false
-	// zotio is an optional integration; skip it so the real preflight is not run
-	// against the host (it is absent on CI runners, which would fail the check).
-	cfg.Zotio.Executable = ""
 
 	var out bytes.Buffer
-	started := false
-	var calls []string
+	autostarterRequested := false
 	command := newDoctorCommand(&options{
 		out:          &out,
 		configLoader: func(string) (config.Config, error) { return cfg, nil },
 		newAutostarter: func(socket string) *daemon.Autostarter {
-			return &daemon.Autostarter{
-				SocketPath: socket,
-				Ready: func(context.Context, string) error {
-					if started {
-						return nil
-					}
-					return errors.New("daemon not ready")
-				},
-				Executable: func() (string, error) { return "papio", nil },
-				Start: func(context.Context, *exec.Cmd) error {
-					started = true
-					return nil
-				},
-			}
+			autostarterRequested = true
+			return &daemon.Autostarter{SocketPath: socket}
 		},
-		rpcCall: func(_ context.Context, _ string, method string, _ any, result any) error {
-			calls = append(calls, method)
-			switch method {
-			case "doctor.run":
-				*result.(*doctor.Report) = doctor.Report{OK: true, Checks: []doctor.Check{{Name: "database", Status: doctor.Pass, Detail: "SQLite integrity ok"}}}
-			case "ping":
-				*result.(*doctor.DaemonStatus) = doctor.DaemonStatus{Status: "ok", Version: api.Version}
-			default:
-				t.Fatalf("RPC method = %q", method)
-			}
-			return nil
+		rpcCall: func(context.Context, string, string, any, any) error {
+			return errors.New("dial ipc daemon: no such file or directory")
 		},
 	})
-	if err := command.ExecuteContext(context.Background()); err != nil {
-		t.Fatalf("doctor: %v", err)
+	err := command.ExecuteContext(context.Background())
+	if !errors.Is(err, errDoctorFailed) {
+		t.Fatalf("doctor error = %v, want errDoctorFailed", err)
 	}
-	if !started {
-		t.Fatal("doctor did not start an unavailable daemon through the autostarter")
+	if autostarterRequested {
+		t.Fatal("doctor requested the daemon autostarter")
 	}
-	foundReadiness := false
-	for _, method := range calls {
-		if method == "doctor.run" {
-			foundReadiness = true
-			break
+	got := out.String()
+	for _, want := range []string{
+		"FAIL  daemon",
+		"fix: run 'papio jobs list' to start the daemon automatically, then retry 'papio doctor'",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("doctor output = %q, missing %q", got, want)
 		}
-	}
-	if !foundReadiness {
-		t.Fatalf("RPC calls = %#v, want daemon-backed doctor.run", calls)
-	}
-	if !strings.Contains(out.String(), "PASS  database") {
-		t.Fatalf("doctor output = %q, want daemon database result", out.String())
 	}
 }
 

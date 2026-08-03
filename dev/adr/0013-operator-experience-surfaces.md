@@ -192,6 +192,34 @@ completed probe that inspected no tab never latches behind the freshness
 window. Hardening for further institutions follows the adapter fixture loop —
 a captured page pins the classifier in tests — not speculative vendor tables.
 
+#### Addendum (2026-08-03, later): ownership is ledgered and institution sessions are origin-scoped
+
+Later field validation exposed two places where a convenient browser-local
+signal had been mistaken for authority.
+
+**Managed-tab ownership is durable creation evidence, not group membership.**
+The broker records only tabs that *papio* created in a durable ledger; a reused
+tab is never ledgered. The papio-titled tab group and the dedicated work window
+are managed surfaces, not proofs of ownership. After startup has allowed the
+daemon to reclaim live work, delayed reconciliation passes automatically close
+untracked, ledger-owned leftovers that remain in either surface. Ledger-owned
+tabs that have strayed outside those surfaces are the only tabs shown in the
+operator cleanup card. Tracked, active, and pinned tabs remain protected, and
+an unledgered tab is never closed merely because it belongs to a papio-titled
+group.
+
+**Institution sessions are scoped by resolver origin end to end.** A field
+incident produced phantom institution rows because provider offer URLs, and
+then broad host-permission grants, were folded into the session-card origin
+set. The row universe now comes exclusively from the config-derived
+`hello_ack.resolver_origins`; offer traffic and permission grants never create
+an institution. Session evidence carries a bare `origin_hint`. The extension
+releases only queued handoffs whose resolver origin matches that evidence, and
+the daemon maps the hint back to a configured resolver profile before
+re-offering store-backed siblings from that same profile. An unknown hint fails
+closed. Evidence for one institution therefore cannot release either the
+extension queue or daemon-side parked work for another.
+
 ### Authentication retry is an explicit local budget reset
 
 When a handoff is auth-stalled, the popup/inbox **Retry** control is an explicit

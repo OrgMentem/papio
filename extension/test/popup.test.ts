@@ -90,32 +90,29 @@ test("capture selects offer every registered provider and scenario", () => {
   expect(values("capture-scenario")).toEqual([...SCENARIOS]);
 });
 
-test("build flag exposes capture tools only in developer builds on both browsers", () => {
+test("capture tools require a developer build and an unpacked manifest", () => {
   const flag = "__PAPIO_DEV_CAPTURE__";
   const descriptor = Object.getOwnPropertyDescriptor(globalThis, flag);
   try {
     Object.defineProperty(globalThis, flag, { configurable: true, value: false });
-    const shippedChrome = popupDocument();
-    wireDevTools(shippedChrome);
-    expect(shippedChrome.querySelector<HTMLElement>(".capture")?.hidden).toBe(true);
-    expect(shippedChrome.querySelectorAll("#capture-provider option")).toHaveLength(0);
-
-    const shippedFirefox = popupDocument();
-    wireDevTools(shippedFirefox);
-    expect(shippedFirefox.querySelector<HTMLElement>(".capture")?.hidden).toBe(true);
+    const releaseBuild = popupDocument();
+    wireDevTools(releaseBuild, {});
+    expect(releaseBuild.querySelector<HTMLElement>(".capture")?.hidden).toBe(true);
+    expect(releaseBuild.querySelectorAll("#capture-provider option")).toHaveLength(0);
 
     Object.defineProperty(globalThis, flag, { configurable: true, value: true });
-    const developerChrome = popupDocument();
-    wireDevTools(developerChrome);
-    expect(developerChrome.querySelector<HTMLElement>(".capture")?.hidden).toBe(false);
-    expect(developerChrome.querySelectorAll("#capture-provider option")).toHaveLength(PROVIDERS.length);
-    const capture = developerChrome.querySelector<HTMLElement>(".capture");
+    const packed = popupDocument();
+    wireDevTools(packed, { update_url: "https://clients2.google.com/service/update2/crx" });
+    expect(packed.querySelector<HTMLElement>(".capture")?.hidden).toBe(true);
+    expect(packed.querySelectorAll("#capture-provider option")).toHaveLength(0);
+
+    const unpacked = popupDocument();
+    wireDevTools(unpacked, {});
+    expect(unpacked.querySelector<HTMLElement>(".capture")?.hidden).toBe(false);
+    expect(unpacked.querySelectorAll("#capture-provider option")).toHaveLength(PROVIDERS.length);
+    const capture = unpacked.querySelector<HTMLElement>(".capture");
     expect(capture?.tagName).toBe("DETAILS");
     expect(capture?.hasAttribute("open")).toBe(false);
-
-    const developerFirefox = popupDocument();
-    wireDevTools(developerFirefox);
-    expect(developerFirefox.querySelector<HTMLElement>(".capture")?.hidden).toBe(false);
   } finally {
     if (descriptor !== undefined) {
       Object.defineProperty(globalThis, flag, descriptor);
@@ -857,6 +854,72 @@ test("session card matrix propagates marker scan outcomes", () => {
   expect(warm.detail).toMatch(/via your library tab · (just now|\d+m ago|\d+h ago)$/);
   // A warm session offers no sign-in action — the button is hidden, not dead.
   expect(warm.action).toBe("none");
+});
+
+test("session status lines omit degenerate probe detail and retain real evidence", () => {
+  const now = Date.now();
+  const defaultOrigin = "https://example.primo.exlibrisgroup.com";
+  const uwaOrigin = "https://onesearch.library.example-college.edu";
+  const base = {
+    enabled: true,
+    intervalMinutes: 4,
+    authenticated: false,
+    verdict: "unknown" as const,
+    probeSource: "none" as const,
+    lastVerdictAt: null,
+    checking: false,
+    likelyAuthenticated: false,
+    pausedForReauth: false,
+    lastCheckAt: null,
+    resolverOrigin: defaultOrigin,
+    lastAuthReturnedAt: null,
+    queuedAuthJobs: 0,
+    stalledAuthJobs: [],
+    releasedAuthJobs: 0,
+  };
+
+  const single = popupDocument();
+  renderInstitutionSession(single, {
+    ...base,
+    probeSource: "live_tab",
+    lastVerdictAt: now,
+  });
+  expect(single.getElementById("institution-session-status")?.textContent).toBe("Checking session…");
+
+  const multiple = popupDocument();
+  renderInstitutionSession(multiple, {
+    ...base,
+    origins: [
+      {
+        origin: defaultOrigin,
+        authenticated: false,
+        verdict: "unknown",
+        probeSource: "none",
+        lastVerdictAt: now,
+        checking: false,
+        likelyAuthenticated: false,
+        pausedForReauth: false,
+        lastCheckAt: now,
+      },
+      {
+        origin: uwaOrigin,
+        authenticated: false,
+        verdict: "out",
+        probeSource: "live_tab",
+        scanOutcome: "markers",
+        lastVerdictAt: now,
+        checking: false,
+        likelyAuthenticated: false,
+        pausedForReauth: false,
+        lastCheckAt: now,
+      },
+    ],
+  });
+  const statuses = multiple.querySelectorAll<HTMLElement>(
+    "#institution-session-rows .institution-session-status",
+  );
+  expect(statuses[0]?.textContent).toBe("Session unknown — open your library page to verify");
+  expect(statuses[1]?.textContent).toMatch(/^Signed out or expired · via your library tab · /);
 });
 
 test("renders independent multi-origin session rows and targets each sign-in origin", async () => {
