@@ -25,7 +25,7 @@ Overhauls the daemon, CLI, and browser operator surfaces:
 ## Live validation
 
 - **Flood and recovery:** Bulk release of 115 institutional handoffs opened dozens of tabs, thrashed the group, left roughly 100 tabs after the deploy, and triggered Cloudflare/OpenAthens hardening. The recovered path caps daemon offers and browser drives, parks challenges with a visible route back to the tab, closes settled tabs, and reconciles only ledger-owned leftovers.
-- **the default institution pipeline:** A browser-driven the default institution session and daemon event forensics exercised the signed-in-but-no-resume path. Warm evidence now reaches the daemon, finds parked handoffs from prior sessions, and re-offers them; the real institutionally entitled JSTOR capture also replaced the invalid synthesized PDF URL with the page's primary download control.
+- **Default-institution pipeline:** A browser-driven session at the default institution plus daemon event forensics exercised the signed-in-but-no-resume path. Warm evidence now reaches the daemon, finds parked handoffs from prior sessions, and re-offers them; a real entitled JSTOR capture also replaced the invalid synthesized PDF URL with the page's primary download control.
 - **Phantom rows:** Provider offer URLs first appeared as institutions, and an all-sites permission grant added a second set of wildcard-derived rows. Session rows now come only from config-derived `resolver_origins` in `hello_ack`; traffic and permission grants cannot add one.
 
 ## Config changes
