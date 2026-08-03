@@ -27,13 +27,15 @@ for the full pre-split extension history.
   signed out (inspection evidence is required), expired identity tokens no
   longer count as signed in, and sign-out markers are read only from real
   controls and links — never from page scripts, styles, or aggregate text.
-- **Leftover tabs from a previous papio life get a one-click cleanup.** Broker
-  tabs papio creates are recorded in a durable ledger, so after an extension
-  reload or update — which wipes papio's live tab tracking — the popup offers
-  "Leftover papio tabs · Close them" instead of leaking them forever. Only
-  ledger-owned tabs are ever closed: a tab papio merely reused, a tab the
-  user is viewing, a tab an active job still tracks, or a stranger tab that
-  merely sits in a papio-titled group is never touched.
+- **papio owns its surfaces — leftover tabs clean themselves up.** Broker tabs
+  papio creates are recorded in a durable ledger that survives extension
+  reloads. Shortly after startup, ledger-owned leftovers still sitting in the
+  papio tab group or work window are closed automatically; the popup's
+  "Leftover papio tabs · Close them" card appears only for ambiguous strays
+  outside those surfaces. Only ledger-owned tabs are ever closed: a tab papio
+  merely reused, a tab the user is viewing, a pinned keepalive tab, a tab an
+  active job tracks, or a stranger tab that merely sits in a papio-titled
+  group is never touched.
 - **The popup can send the current PDF to *papio*.** It classifies the active tab
   as a PDF, DOI page, or neither; for a PDF it queues or joins the matching
   job, starts a browser-managed download under `papio/<job-id>/`, and reports

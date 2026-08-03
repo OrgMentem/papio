@@ -1710,18 +1710,23 @@ export class Bridge {
     });
   }
 
-  /** Tabs papio opened but no longer tracks: ledgered tabs from a previous
-   * extension life. Excludes every currently tracked tab and any tab the user
-   * is actively viewing. Dead ledger entries are pruned as a side effect. */
-  async orphanTabStatus(): Promise<{ count: number; tab_ids: number[] }> {
+  /** Classify ledgered, untracked tabs. Tabs sitting in papio's OWN surfaces
+   * (the papio tab group or the dedicated work window) are unambiguously
+   * papio's to manage and are reconciled automatically; ledgered strays
+   * elsewhere (in-window fallbacks, tabs the user pulled out of the group)
+   * only ever close through the operator's popup card. Tracked, active,
+   * and pinned (keepalive) tabs are never candidates; dead ledger entries
+   * are pruned as a side effect. */
+  private async classifyLedgeredTabs(): Promise<{ auto: number[]; ask: number[] }> {
     await this.ready;
-    if (this.deps.tabLedger === undefined) return { count: 0, tab_ids: [] };
+    if (this.deps.tabLedger === undefined) return { auto: [], ask: [] };
     const tracked = new Set<number>();
     for (const job of this.store.activeJobs) if (job.tab_id >= 0) tracked.add(job.tab_id);
     for (const id of this.completedDownloadTabs.values()) tracked.add(id);
     for (const id of this.closingTabs) tracked.add(id);
     return this.runTabLedgerTransaction(async (ledger) => {
-      const orphans = new Set<number>();
+      const auto = new Set<number>();
+      const ask = new Set<number>();
       let changed = false;
       for (const key of Object.keys(ledger)) {
         const tabID = Number(key);
@@ -1742,19 +1747,39 @@ export class Bridge {
         // Never the tab the user is looking at, and never the keepalive
         // resolver tab — Chrome marks it pinned, and it is papio's session.
         if (tab.active === true || tab.pinned === true) continue;
-        orphans.add(tabID);
+        let ownedSurface = tab.windowId !== undefined && tab.windowId === this.store.workWindowID;
+        if (!ownedSurface && tab.groupId !== undefined && tab.groupId >= 0) {
+          ownedSurface = (await this.knownHandoffGroup(tab.groupId, tab.windowId)) !== undefined;
+        }
+        (ownedSurface ? auto : ask).add(tabID);
       }
-      const tab_ids = [...orphans].sort((a, b) => a - b);
-      return { value: { count: tab_ids.length, tab_ids }, changed };
+      return {
+        value: {
+          auto: [...auto].sort((a, b) => a - b),
+          ask: [...ask].sort((a, b) => a - b),
+        },
+        changed,
+      };
     });
   }
 
-  /** Operator-initiated: close every orphan the scan finds. Failures are
-   * skipped, never retried — the next popup open rescans from live truth. */
-  async cleanupOrphanTabs(): Promise<{ closed: number }> {
-    const { tab_ids } = await this.orphanTabStatus();
+  /** Popup card contents: only the strays papio will not touch on its own. */
+  async orphanTabStatus(): Promise<{ count: number; tab_ids: number[] }> {
+    const { ask } = await this.classifyLedgeredTabs();
+    return { count: ask.length, tab_ids: ask };
+  }
+
+  /** papio owns its surfaces: silently close ledgered tabs still sitting in
+   * the papio group or work window once the daemon has had time to reclaim
+   * live work. Runs shortly after startup — no operator step required. */
+  async reconcileOwnedTabs(): Promise<{ closed: number }> {
+    const { auto } = await this.classifyLedgeredTabs();
+    return { closed: await this.closeLedgeredTabs(auto) };
+  }
+
+  private async closeLedgeredTabs(tabIDs: readonly number[]): Promise<number> {
     let closed = 0;
-    for (const tabID of tab_ids) {
+    for (const tabID of tabIDs) {
       this.closingTabs.add(tabID);
       try {
         await this.deps.tabs.remove(tabID);
@@ -1764,7 +1789,13 @@ export class Bridge {
       }
       await this.forgetLedgeredTab(tabID);
     }
-    return { closed };
+    return closed;
+  }
+
+  /** Operator-initiated: close every stray the popup card offered. */
+  async cleanupOrphanTabs(): Promise<{ closed: number }> {
+    const { tab_ids } = await this.orphanTabStatus();
+    return { closed: await this.closeLedgeredTabs(tab_ids) };
   }
   private handoffNeedsHumanNow(): boolean {
     return this.store.activeJobs.some(
@@ -2451,6 +2482,15 @@ export class Bridge {
     }
     await this.releaseQueuedHandoffs();
     await this.releaseQueuedHandoffsForLiveLanding();
+    // papio owns its surfaces: after the daemon has had a moment to reclaim
+    // live work through fresh offers, silently close ledgered leftovers still
+    // sitting in the papio group or work window. Two passes: an early one for
+    // the common case and a late one for offers that reclaim tabs slowly.
+    for (const delay of [12_000, 90_000]) {
+      this.deps.setTimeout(() => {
+        void this.reconcileOwnedTabs();
+      }, delay);
+    }
   }
 
   /**

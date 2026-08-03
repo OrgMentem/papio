@@ -2343,12 +2343,14 @@ test("unplanned port death marks the badge unhealthy and reconnect clears it", a
   expect(h.action.texts.at(-1)).toBe("");
 
   await h.port.emitDisconnect();
-  expect(h.timers.length).toBe(1);
-  expect(h.timers[0]?.ms).toBe(1000);
+  // Startup schedules two owned-surface reconcile passes; only the reconnect
+  // backoff timer belongs to this disconnect.
+  const reconnects = h.timers.filter((timer) => timer.ms === 1000);
+  expect(reconnects).toHaveLength(1);
   expect(h.action.texts.at(-1)).toBe("!");
   expect(h.action.backgroundColors.at(-1)).toBe("#777777");
 
-  await h.timers[0]?.fn();
+  await reconnects[0]?.fn();
   await h.ports[1]?.inbound(helloAck());
   expect(h.action.texts.at(-1)).toBe("");
 
@@ -2369,7 +2371,7 @@ test("backoff exhaustion leaves the daemon-unavailable badge set", async () => {
     if (attempt < 8) await h.timers.at(-1)?.fn();
   }
 
-  expect(h.timers).toHaveLength(8);
+  expect(h.timers.filter((timer) => timer.ms !== 12_000 && timer.ms !== 90_000)).toHaveLength(8);
   expect(h.action.texts.at(-1)).toBe("!");
   expect(h.action.backgroundColors.at(-1)).toBe("#777777");
 });
@@ -4116,9 +4118,9 @@ test("handoff group reducer trails auth recollapse and stays quiet when collapse
   expect(h.tabGroups?.updated.length).toBe(updates);
 });
 
-test("orphan scan flags only ledger-owned tabs and never tracked or active tabs", async () => {
+test("papio reconciles its own surfaces automatically and asks only about strays", async () => {
   const h = makeHarness(undefined, { tabGroups: true });
-  let ledger: Record<string, number> = { "300": 1, "301": 1, "999": 1 };
+  let ledger: Record<string, number> = { "300": 1, "301": 1, "304": 1, "999": 1 };
   h.deps.tabLedger = {
     load: async () => ({ ...ledger }),
     save: async (entries) => {
@@ -4129,27 +4131,37 @@ test("orphan scan flags only ledger-owned tabs and never tracked or active tabs"
   await h.port.inbound(jobOffer("job_orphan_live"));
   const trackedTab = h.backend.store.activeJobs[0]?.tab_id ?? -1;
   expect(trackedTab).toBeGreaterThanOrEqual(0);
-  // 300: ledgered orphan from a prior life. 301: ledgered but the user is
-  // looking at it right now. 999: ledger entry whose tab is already gone.
+  // 300: ledgered stray in the user's window (in-window fallback) — ask.
   h.tabs.live.set(300, { id: 300, url: "https://provider.example.org/a" });
+  // 301: ledgered but the user is looking at it — never a candidate.
   h.tabs.live.set(301, { id: 301, url: "https://provider.example.org/b", active: true });
-  // 302: an unledgered tab in a papio-titled group is not owned by papio.
+  // 302: an unledgered tab in a papio-titled group — papio never created it.
   h.tabs.live.set(302, { id: 302, url: "https://provider.example.org/c", groupId: 700 });
+  // 304: ledgered AND still in papio's group — papio's surface, auto-closed.
+  h.tabs.live.set(304, { id: 304, url: "https://provider.example.org/d", groupId: 700 });
   h.tabGroups!.live.set(700, { id: 700, collapsed: true, title: "papio", windowId: 1 });
   // 303: the pinned keepalive resolver tab folded into the papio group —
   // papio's own session anchor, never an orphan.
   h.tabs.live.set(303, { id: 303, url: "https://resolver.example.edu/keepalive", groupId: 700, pinned: true });
 
+  // The popup card offers ONLY the ambiguous stray, not the group member.
   const status = await h.bridge.orphanTabStatus();
   expect(status).toEqual({ count: 1, tab_ids: [300] });
   // The dead entry is pruned from the durable ledger as a scan side effect.
   expect(ledger["999"]).toBeUndefined();
 
+  // Startup reconciliation closes the owned-surface leftover on its own.
+  const { closed: reconciled } = await h.bridge.reconcileOwnedTabs();
+  expect(reconciled).toBe(1);
+  expect(h.tabs.removed).toEqual([304]);
+  expect(ledger["304"]).toBeUndefined();
+
   const { closed } = await h.bridge.cleanupOrphanTabs();
   expect(closed).toBe(1);
-  expect(h.tabs.removed).toEqual([300]);
+  expect(h.tabs.removed).toEqual([304, 300]);
   expect(h.tabs.live.has(302)).toBe(true);
   expect(h.tabs.live.has(301)).toBe(true);
+  expect(h.tabs.live.has(trackedTab)).toBe(true);
   expect(ledger["300"]).toBeUndefined();
   // Closing an orphan is programmatic: no cancel frame may reach the daemon.
   expect(h.frames().filter((frame) => frame.type === "cancel")).toHaveLength(0);
