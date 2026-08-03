@@ -27,6 +27,11 @@ execution records in `notes/acquisition-stack-plan.md`.
   Queued, resolving, and fetching jobs no longer dead-end when the operator
   already has the PDF in the browser; download races remain structured,
   retryable outcomes.
+- **Activity summaries read the same everywhere.** `store.ActivityText` renders
+  one friendly line per event kind for both `papio activity` and the browser
+  activity feed — raw kinds like `action.reminder` or `browser.error` no
+  longer leak to either surface, and the CLI line view drops the raw detail
+  JSON (still available under `--json`).
 
 ### Fixed
 

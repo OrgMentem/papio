@@ -26,17 +26,34 @@ for the full pre-split extension history.
   links, a bounded page-text scan, and a JSTOR stable-page fallback
   (`10.2307/<id>`). Provider click downloads remain human-assisted on
   Firefox, whose WebExtensions API has no filename-routing hook.
-- **Institution sessions are visible at a glance.** The popup now shows the
-  local resolver session as warm, signed out, paused for sign-in, or keep-warm
-  disabled, with a **Sign in now** action. Options adds extension-local
-  keep-warm enable/disable and refresh-interval controls; credentials and
-  identity-provider hosts never enter the daemon protocol.
+- **Institution sessions are visible at a glance — and the verdict is
+  evidence-based.** The popup shows the resolver session as warm, signed out,
+  unclear, or keep-warm disabled, always naming its evidence source and time
+  ("via your open library tab · 12:38 pm"). The verdict comes from inspecting
+  a real resolver tab — the focused tab first — for sign-out affordances
+  (including inside closed menus, `href`/`formaction` targets, and ARIA
+  labels), with a web-storage JWT identity fallback for Ex Libris-style
+  platforms (a bare `sub` claim never counts: anonymous tokens carry one).
+  papio never asserts "signed out" without a completed inspection saying so,
+  an inspection failure is reported distinctly from a clean miss, and an
+  evidence-free probe never latches. A warm session offers no sign-in button;
+  "Sign-in unblocked N items" announces once per release event. Options adds
+  extension-local keep-warm enable/disable and refresh-interval controls;
+  credentials and identity-provider hosts never enter the daemon protocol.
+- **Pages with an acquisition already in flight show live progress, not a dead
+  button.** The popup renders the job's latest activity with its age, an
+  honest "No progress for <time>" prefix when stalled, waiting-on-you wording
+  for parked jobs, and Open-inbox-item / Go-to-tab actions.
 - **The inbox separates concerns into Actions, Watch hits, and Activity tabs**,
   with actionable items first and keyboard-accessible tab navigation. The
   Activity tab groups a bounded timeline by job, collapses repeats, and
   truncates behind **Show more**; it appears only when the daemon advertises
   `activity_feed_v1`, and older daemons get an explanation rather than an
   implied live push.
+- **Every job and resolver tab papio opens lands in the papio tab group** (or
+  the work window, matching the existing handoff surface), and repeated opens
+  of the same item focus the existing tab instead of spawning duplicates —
+  changed re-offers navigate the tab in place.
 
 ### Changed
 

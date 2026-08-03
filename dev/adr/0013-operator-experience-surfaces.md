@@ -166,6 +166,32 @@ a sign-in page, and brings that tab forward for the operator. It never fills a
 login form, copies cookies, or treats a successful timing frame as an identity
 assertion.
 
+#### Addendum (2026-08-03): the session verdict is evidence-based, tri-state, and introspectable
+
+Field testing on Primo NDE showed URL-shape heuristics asserting "signed out"
+at an operator who was looking at their signed-in library account page. The
+card's verdict is therefore grounded in ranked observations, never inferred
+from URL shape alone:
+
+1. **Explicit sign-out affordance** in the resolver tab's DOM (whole-document
+   scan: text, `href`/`formaction` targets, ARIA labels, closed menus) —
+   signed in. A sign-in prompt with no sign-out affordance — signed out.
+2. **Web-storage JWT identity** — an Ex Libris-style session token whose
+   payload carries a named-user claim, or a subject plus an explicit non-guest
+   group claim, is signed-in evidence. A bare `sub` claim is NOT identity:
+   anonymous session tokens carry opaque subjects on many platforms, and a
+   false "signed in" is the harmful direction.
+3. **Anything else is `unknown`, stated as such.** "No tab to inspect", "scan
+   found no indicators", and "could not read the page" are three different
+   honest answers with three different remedies, and the card names its
+   evidence source and time ("via your open library tab · 12:38 pm") so a
+   wrong verdict identifies the lying branch from a screenshot.
+
+Probes prefer the operator's focused tab over URL-pattern tab queries, and a
+completed probe that inspected no tab never latches behind the freshness
+window. Hardening for further institutions follows the adapter fixture loop —
+a captured page pins the classifier in tests — not speculative vendor tables.
+
 ### Authentication retry is an explicit local budget reset
 
 When a handoff is auth-stalled, the popup/inbox **Retry** control is an explicit
