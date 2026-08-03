@@ -9,6 +9,8 @@ import (
 	"encoding/json"
 	"errors"
 	"log"
+	"net/url"
+	"regexp"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -194,6 +196,12 @@ type Receipt struct {
 	BundleAvailable bool `json:"bundle_available"`
 }
 
+// AdapterCaptureResult is the structured adapter.capture_v1 result. Routine
+// browser conditions are outcomes, not RPC failures.
+type AdapterCaptureResult = browser.CaptureResult
+
+var adapterCaptureProviderRE = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
+
 // Router returns the complete Phase 1 local RPC surface.
 func Router(system *bootstrap.System) ipc.Router {
 	return RouterWithShutdown(system, nil)
@@ -212,6 +220,9 @@ func RouterWithShutdown(system *bootstrap.System, shutdown context.CancelFunc) i
 		},
 		"adapter.captures.purge": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return purgeCaptures(ctx, raw, system)
+		},
+		"adapter.capture_v1": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return adapterCapture(ctx, raw, system)
 		},
 		"acquire.submit": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return submit(ctx, raw, system)
@@ -740,6 +751,42 @@ func purgeCaptures(ctx context.Context, raw json.RawMessage, system *bootstrap.S
 		return failure(err)
 	}
 	return marshal(CapturePurgeResult{Removed: removed})
+}
+
+func adapterCapture(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
+	var params struct {
+		URL      string `json:"url"`
+		Provider string `json:"provider"`
+		Scenario string `json:"scenario"`
+		SettleMS *int64 `json:"settle_ms,omitempty"`
+	}
+	if err := ipc.DecodeParams(raw, &params); err != nil {
+		return badParams(err)
+	}
+	parsed, err := url.ParseRequestURI(params.URL)
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || len(params.URL) > 4000 {
+		return badParams(errors.New("url must be a bounded https URL"))
+	}
+	if !adapterCaptureProviderRE.MatchString(params.Provider) {
+		return badParams(errors.New("provider must use letters, digits, underscore, or hyphen (max 64)"))
+	}
+	switch params.Scenario {
+	case "success", "login-return", "no-entitlement", "drift", "terms":
+	default:
+		return badParams(errors.New("scenario must be success, login-return, no-entitlement, drift, or terms"))
+	}
+	if params.SettleMS != nil && (*params.SettleMS < 0 || *params.SettleMS > 10_000) {
+		return badParams(errors.New("settle_ms must be between 0 and 10000"))
+	}
+	if system == nil || system.Browser == nil || system.Captures == nil || !system.Config.Captures.Enabled {
+		return marshal(AdapterCaptureResult{Outcome: "not_permitted", Detail: "page capture storage is disabled"})
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
+	defer cancel()
+	result := system.Browser.Capture(waitCtx, browser.CaptureRequest{
+		URL: params.URL, Provider: params.Provider, Scenario: params.Scenario, SettleMS: params.SettleMS,
+	})
+	return marshal(result)
 }
 
 func watchDigest(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {

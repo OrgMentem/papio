@@ -117,6 +117,7 @@ var commandClassification = map[string]commandClass{
 	"papio jobs failures":              {kind: kindEnvelope, rowKey: "failures", rpcMethods: []string{"jobs.failures"}},
 	"papio adapter":                    {kind: kindNone},
 	"papio adapter diagnose":           {kind: kindStructured, rpcMethods: []string{"jobs.get", "ping"}},
+	"papio adapter capture":            {kind: kindStructured, args: []string{"https://provider.example/article", "--provider", "provider", "--scenario", "success"}, rpcMethods: []string{"adapter.capture_v1"}},
 	"papio adapter captures":           {kind: kindEnvelope, rowKey: "captures", rpcMethods: []string{"adapter.captures.list"}},
 	"papio adapter captures purge":     {kind: kindStructured, rpcMethods: []string{"adapter.captures.purge"}},
 	"papio status":                     {kind: kindStructured, rpcMethods: []string{"zotio.missing_count", "jobs.list", "jobs.get"}},

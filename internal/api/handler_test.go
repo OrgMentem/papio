@@ -71,6 +71,27 @@ func TestRouterCapturesDisabledReturnsEmptyResults(t *testing.T) {
 	}
 }
 
+func TestAdapterCaptureV1ReturnsStructuredRoutineOutcomes(t *testing.T) {
+	system := testSystem(t)
+	system.Captures = nil
+	router := Router(system)
+	params := map[string]any{
+		"url": "https://provider.example/article/42", "provider": "provider", "scenario": "success",
+	}
+	var result AdapterCaptureResult
+	if rpcErr := callMethod(t, router, "adapter.capture_v1", params, &result); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	if result.Outcome != "not_permitted" || result.Detail == "" {
+		t.Fatalf("capture result = %#v", result)
+	}
+
+	params["url"] = "http://provider.example/article/42"
+	if rpcErr := callMethod(t, router, "adapter.capture_v1", params, nil); rpcErr == nil || rpcErr.Code != "invalid_argument" {
+		t.Fatalf("invalid URL RPC error = %#v, want invalid_argument", rpcErr)
+	}
+}
+
 func callMethod(t *testing.T, router ipc.Router, method string, params any, result any) *ipc.RPCError {
 	t.Helper()
 	raw, err := json.Marshal(params)

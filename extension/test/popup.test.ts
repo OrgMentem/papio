@@ -74,7 +74,9 @@ test("places the acquire icon before inbox and keeps idle feedback hidden", () =
   expect(headerActions?.children[0]?.id).toBe("page-acquire-btn");
   expect(headerActions?.children[1]?.id).toBe("open-inbox-btn");
   expect(doc.getElementById("page-acquire-btn")?.closest("header")).not.toBeNull();
-  expect(doc.getElementById("page-acquire-btn")?.querySelector("svg")).not.toBeNull();
+  expect(doc.getElementById("page-acquire-btn")?.querySelector("svg")).toBeNull();
+  expect(doc.getElementById("page-acquire-btn")?.textContent).toBe("Acquire");
+  expect(doc.getElementById("page-acquire-btn")?.classList.contains("primary")).toBe(true);
   expect(doc.getElementById("page-acquire-btn")?.hidden).toBe(true);
   expect(doc.getElementById("daemon-footer")).toBeNull();
   expect(doc.getElementById("open-inbox-btn")?.getAttribute("aria-label")).toBe("Open inbox");
@@ -177,6 +179,7 @@ test("shows the DOI acquire icon with its tooltip even without a negotiated daem
   expect(button.title).toBe("Acquire this page · 10.1000/example");
   expect(button.getAttribute("aria-label")).toBe("Acquire this page · 10.1000/example");
   expect(button.getAttribute("aria-disabled")).toBe("false");
+  expect(button.textContent).toBe("Acquire");
   button.click();
   await Promise.resolve();
   await Promise.resolve();
@@ -232,6 +235,7 @@ test("shows the PDF acquire icon with the PDF tooltip", () => {
   expect(button.hidden).toBe(false);
   expect(button.title).toBe("Send this PDF to papio");
   expect(button.getAttribute("aria-label")).toBe("Send this PDF to papio");
+  expect(button.textContent).toBe("Send PDF");
   expect(button.disabled).toBe(false);
   button.click();
 });

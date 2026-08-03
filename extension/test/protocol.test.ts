@@ -50,6 +50,35 @@ test("activity request and response round-trip through the shared corpus", () =>
   )).toThrow(ProtocolError);
 });
 
+test("page capture request and result round-trip through the shared corpus", () => {
+  const request = parseBrowserMessageBytes(
+    readFileSync(join(corpusRoot, "valid", "browser-page-capture-request.json"), "utf8"),
+  );
+  expect(request.type).toBe("page_capture_request");
+  expect(request.payload).toEqual({
+    request_id: "capture-request-001",
+    url: "https://journals.example.org/article/42",
+    provider: "example_provider",
+    scenario: "success",
+    settle_ms: 2500,
+  });
+  const result = parseBrowserMessageBytes(
+    readFileSync(join(corpusRoot, "valid", "browser-page-capture-request-result.json"), "utf8"),
+  );
+  expect(result.type).toBe("page_capture_request_result");
+  expect(result.payload).toEqual({ request_id: "capture-request-001", outcome: "captured" });
+  expect(() =>
+    parseBrowserMessageBytes(
+      readFileSync(join(corpusRoot, "invalid", "browser-page-capture-request-http.json"), "utf8"),
+    ),
+  ).toThrow(ProtocolError);
+  expect(() =>
+    parseBrowserMessageBytes(
+      readFileSync(join(corpusRoot, "invalid", "browser-page-capture-request-result-outcome.json"), "utf8"),
+    ),
+  ).toThrow(ProtocolError);
+});
+
 test("counts schema negotiation and session evidence round-trip", () => {
   const v1 = parseBrowserMessageBytes(
     readFileSync(join(corpusRoot, "valid", "browser-triage-counts-response.json"), "utf8"),

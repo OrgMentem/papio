@@ -2973,6 +2973,121 @@ test("popup capture relay emits page_capture only after the daemon advertises it
   expect(h.downloads.started).toHaveLength(0);
 });
 
+test("page capture request opens a ledgered managed tab, captures, reports, and closes", async () => {
+  const h = makeHarness(undefined, { handoffSurface: "in-window" });
+  let ledger: Record<string, number> = {};
+  h.deps.tabLedger = {
+    load: async () => ({ ...ledger }),
+    save: async (entries) => {
+      ledger = { ...entries };
+    },
+  };
+  h.deps.permissions.contains = async () => true;
+  h.deps.scripting.executeScript = async (injection) => {
+    if (injection.func !== capturePage) return [];
+    return [{
+      result: {
+        html: `<html><body><main class="article">Captured structure</main></body></html>`,
+        origin: "https://www.jstor.org",
+        path: "/stable/123",
+      },
+    }];
+  };
+  await h.bridge.start();
+  await h.port.inbound(helloAck({
+    features: ["page_capture_v1", "page_capture_request_v1"],
+  }));
+  const pending = h.port.inbound({
+    protocol: "papio-browser/1",
+    type: "page_capture_request",
+    msg_id: "capture-request-frame",
+    seq: 2,
+    payload: {
+      request_id: "capture-request-001",
+      url: "https://www.jstor.org/stable/123",
+      provider: "jstor",
+      scenario: "success",
+    },
+  });
+  for (let attempt = 0; attempt < 20 && h.tabs.created.length === 0; attempt += 1) {
+    await Promise.resolve();
+  }
+  expect(h.tabs.created).toEqual([
+    { url: "https://www.jstor.org/stable/123", active: false },
+  ]);
+  const tabID = h.tabs.live.keys().next().value as number;
+  for (let attempt = 0; attempt < 20 && ledger[String(tabID)] === undefined; attempt += 1) {
+    await Promise.resolve();
+  }
+  expect(ledger[String(tabID)]).toBeDefined();
+  for (let attempt = 0; attempt < 20 && !h.timers.some((timer) => timer.ms === 30_000); attempt += 1) {
+    await Promise.resolve();
+  }
+  await h.tabs.onUpdated.emit(
+    tabID,
+    { status: "complete" },
+    { id: tabID, url: "https://www.jstor.org/stable/123" },
+  );
+  for (let attempt = 0; attempt < 20 && !h.timers.some((timer) => timer.ms === 3_000); attempt += 1) {
+    await Promise.resolve();
+  }
+  await h.timers.find((timer) => timer.ms === 3_000)?.fn();
+  await pending;
+
+  const capture = h.frames().find((frame) => frame.type === "page_capture");
+  expect(capture?.payload).toMatchObject({
+    host: "www.jstor.org",
+    scenario: "success",
+    adapter_id: "jstor",
+    encoding: "gzip+base64",
+  });
+  const result = h.frames().find((frame) => frame.type === "page_capture_request_result");
+  expect(result?.payload).toEqual({
+    request_id: "capture-request-001",
+    outcome: "captured",
+  });
+  expect(h.tabs.removed).toContain(tabID);
+  expect(h.tabs.live.has(tabID)).toBe(false);
+  expect(ledger[String(tabID)]).toBeUndefined();
+  expect(h.downloads.started).toHaveLength(0);
+});
+
+test("page capture request respects the two-drive handoff governor", async () => {
+  const h = makeHarness(
+    { ...emptyStore(), lastAuthReturnedAt: 1_700_000_000_000 },
+    { handoffSurface: "in-window" },
+  );
+  h.deps.permissions.contains = async () => true;
+  await h.bridge.start();
+  await h.port.inbound(helloAck({
+    features: ["page_capture_v1", "page_capture_request_v1"],
+  }));
+  await h.port.inbound(jobOffer("job_capture_governor_1"));
+  await h.port.inbound(jobOffer("job_capture_governor_2"));
+  expect(h.tabs.created).toHaveLength(2);
+
+  await h.port.inbound({
+    protocol: "papio-browser/1",
+    type: "page_capture_request",
+    msg_id: "capture-request-busy",
+    seq: 3,
+    payload: {
+      request_id: "capture-request-busy",
+      url: "https://www.jstor.org/stable/999",
+      provider: "jstor",
+      scenario: "drift",
+      settle_ms: 0,
+    },
+  });
+  expect(h.tabs.created).toHaveLength(2);
+  const result = h.frames().find(
+    (frame) =>
+      frame.type === "page_capture_request_result" &&
+      frame.payload["request_id"] === "capture-request-busy",
+  );
+  expect(result?.payload["outcome"]).toBe("busy");
+});
+
 test("inbox runtime messages validate the exact extension sender", async () => {
   const h = makeHarness();
   const urls = {

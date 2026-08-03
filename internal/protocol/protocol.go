@@ -603,6 +603,8 @@ const (
 	MsgPageAcquire              = "page_acquire"
 	MsgPageAcquireAck           = "page_acquire_ack"
 	MsgPageCapture              = "page_capture"
+	MsgPageCaptureRequest       = "page_capture_request"
+	MsgPageCaptureRequestResult = "page_capture_request_result"
 	MsgJobOffer                 = "job_offer"
 	MsgHandoffOutcome           = "handoff_outcome"
 	MsgJobAccept                = "job_accept"
@@ -689,6 +691,25 @@ type PageCapturePayload struct {
 	Encoding       string `json:"encoding"`
 	Bytes          int64  `json:"bytes"`
 	Body           string `json:"body"`
+}
+
+// PageCaptureRequestPayload directs the extension to capture one https page
+// through its ordinary browser session. SettleMS is optional on the wire; zero
+// means the extension's bounded default.
+type PageCaptureRequestPayload struct {
+	RequestID string `json:"request_id"`
+	URL       string `json:"url"`
+	Provider  string `json:"provider"`
+	Scenario  string `json:"scenario"`
+	SettleMS  *int64 `json:"settle_ms,omitempty"`
+}
+
+// PageCaptureRequestResultPayload reports the routine outcome of a requested
+// capture. The sanitized content itself remains the existing page_capture frame.
+type PageCaptureRequestResultPayload struct {
+	RequestID string `json:"request_id"`
+	Outcome   string `json:"outcome"`
+	Detail    string `json:"detail,omitempty"`
 }
 
 // JobOfferPayload asks the extension to open one OpenURL-resolved job.
@@ -1187,6 +1208,30 @@ func DecodeBrowserMessage(data []byte) (*BrowserMessage, error) {
 			err = p.validate()
 		}
 		msg.Payload = p
+	case MsgPageCaptureRequest:
+		p := &PageCaptureRequestPayload{}
+		if err = browserRequireFields(payloadFields, "request_id", "url", "provider", "scenario"); err == nil {
+			err = browserRejectNullFields(payloadFields, "settle_ms")
+		}
+		if err == nil {
+			err = strictDecode(env.Payload, p)
+		}
+		if err == nil {
+			err = p.validate()
+		}
+		msg.Payload = p
+	case MsgPageCaptureRequestResult:
+		p := &PageCaptureRequestResultPayload{}
+		if err = browserRequireFields(payloadFields, "request_id", "outcome"); err == nil {
+			err = browserRejectNullFields(payloadFields, "detail")
+		}
+		if err == nil {
+			err = strictDecode(env.Payload, p)
+		}
+		if err == nil {
+			err = p.validate()
+		}
+		msg.Payload = p
 	case MsgJobOffer:
 		p := &JobOfferPayload{}
 		if err = browserRequireFields(payloadFields, "openurl", "provider_hosts", "access_mode", "expires_at"); err == nil {
@@ -1551,6 +1596,39 @@ func (p *PageCapturePayload) validate() error {
 		return fmt.Errorf("page_capture.body must be canonical base64")
 	}
 	return nil
+}
+
+func (p *PageCaptureRequestPayload) validate() error {
+	if err := validateCorrelationID("page_capture_request.request_id", p.RequestID); err != nil {
+		return err
+	}
+	parsed, err := url.ParseRequestURI(p.URL)
+	if browserTextLen(p.URL) == 0 || browserTextLen(p.URL) > 4000 ||
+		err != nil || parsed.Scheme != "https" || parsed.Host == "" {
+		return fmt.Errorf("page_capture_request.url must be a bounded parseable https URL")
+	}
+	if !adapterIDRE.MatchString(p.Provider) {
+		return fmt.Errorf("page_capture_request.provider must use the id charset (max 64)")
+	}
+	if err := enumRequired("page_capture_request.scenario", p.Scenario,
+		"success", "login-return", "no-entitlement", "drift", "terms"); err != nil {
+		return err
+	}
+	if p.SettleMS != nil && (*p.SettleMS < 0 || *p.SettleMS > 10_000) {
+		return fmt.Errorf("page_capture_request.settle_ms must be in range 0..10000")
+	}
+	return nil
+}
+
+func (p *PageCaptureRequestResultPayload) validate() error {
+	if err := validateCorrelationID("page_capture_request_result.request_id", p.RequestID); err != nil {
+		return err
+	}
+	if err := enumRequired("page_capture_request_result.outcome", p.Outcome,
+		"captured", "nav_failed", "timeout", "not_permitted", "busy"); err != nil {
+		return err
+	}
+	return validateTriageText("page_capture_request_result.detail", p.Detail, 1000)
 }
 
 func (p *HelloAckPayload) validate() error {

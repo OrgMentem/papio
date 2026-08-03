@@ -1547,12 +1547,25 @@ async function readDeliveryFeedback(fallback: PendingDelivery | undefined): Prom
   return fallback;
 }
 
+/** The header pill shows a compact verb; the full label rides title/aria so
+ * the DOI and richer state stay one hover away. */
+function shortAcquireLabel(label: string): string {
+  if (label.startsWith("Acquiring")) return "Acquiring…";
+  if (label.startsWith("Acquire this page")) return "Acquire";
+  if (label.startsWith("Sending")) return "Sending…";
+  if (label.startsWith("Send this PDF")) return "Send PDF";
+  if (label.startsWith("PDF sent")) return "Sent";
+  if (label.startsWith("Already queued") || label.startsWith("Queued")) return "Queued";
+  return label.length > 12 ? `${label.slice(0, 11)}…` : label;
+}
+
 function setAcquireButton(
   button: HTMLButtonElement,
   label: string,
   disabled: boolean,
   hidden = false,
 ): void {
+  button.textContent = shortAcquireLabel(label);
   button.title = label;
   button.setAttribute("aria-label", label);
   button.setAttribute("aria-disabled", String(disabled));

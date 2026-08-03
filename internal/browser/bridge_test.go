@@ -293,6 +293,66 @@ func TestPageCaptureContentFailureKeepsSession(t *testing.T) {
 	}
 }
 
+func TestPageCaptureRequestDeliveredCorrelatedStoredAndBusy(t *testing.T) {
+	b, _, _, _ := newBridge(t)
+	runSync(t, b, hello())
+
+	resultCh := make(chan CaptureResult, 1)
+	go func() {
+		resultCh <- b.Capture(context.Background(), CaptureRequest{
+			URL: "https://sagepub.com/article/42", Provider: "sage", Scenario: "success",
+		})
+	}()
+	deadline := time.Now().Add(time.Second)
+	for {
+		b.mu.Lock()
+		queued := len(b.pendingCaptures) == 1
+		b.mu.Unlock()
+		if queued {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("capture request was not queued")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	msgs, _ := runSync(t, b)
+	directive := firstOfType(msgs, protocol.MsgPageCaptureRequest)
+	if directive == nil {
+		t.Fatal("sync did not deliver page_capture_request")
+	}
+	request := directive.Payload.(*protocol.PageCaptureRequestPayload)
+	if request.URL != "https://sagepub.com/article/42" || request.Provider != "sage" || request.Scenario != "success" {
+		t.Fatalf("directive payload = %#v", request)
+	}
+	if busy := b.Capture(context.Background(), CaptureRequest{
+		URL: "https://sagepub.com/other", Provider: "sage", Scenario: "drift",
+	}); busy.Outcome != "busy" {
+		t.Fatalf("second capture outcome = %q, want busy", busy.Outcome)
+	}
+
+	content := pageCapturePayload(t, []byte("<html>captured fixture</html>"))
+	content.Scenario = "success"
+	content.AdapterID = "sage"
+	runSync(t, b,
+		inFrame(t, protocol.MsgPageCapture, "", content),
+		inFrame(t, protocol.MsgPageCaptureRequestResult, "", protocol.PageCaptureRequestResultPayload{
+			RequestID: request.RequestID, Outcome: "captured",
+		}),
+	)
+	select {
+	case result := <-resultCh:
+		if result.Outcome != "captured" || result.RequestID != request.RequestID || result.Path == "" {
+			t.Fatalf("capture result = %#v", result)
+		}
+		if _, err := os.Stat(result.Path); err != nil {
+			t.Fatalf("stored capture path: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("capture result did not correlate")
+	}
+}
 func TestJobScopedPageCaptureRecordsEvent(t *testing.T) {
 	b, jobs, _, _ := newBridge(t)
 	ctx := context.Background()
@@ -352,7 +412,7 @@ func TestHelloAckAnnouncesDaemonVersion(t *testing.T) {
 		t.Fatalf("daemon_version = %q, want 0.1.0-test", payload.DaemonVersion)
 	}
 	if !slices.Equal(payload.Features, []string{
-		pageAcquireFeature, triageSnapshotFeature, triageSnapshotSchema2Feature, triageMutationsFeature, reviewPreviewFeature, statsFeature, pageCaptureFeature, activityFeedFeature, triageCountsSchema2Feature, sessionEvidenceFeature, deliveryContextFeature,
+		pageAcquireFeature, triageSnapshotFeature, triageSnapshotSchema2Feature, triageMutationsFeature, reviewPreviewFeature, statsFeature, pageCaptureFeature, pageCaptureRequestFeature, activityFeedFeature, triageCountsSchema2Feature, sessionEvidenceFeature, deliveryContextFeature,
 	}) {
 		t.Fatalf("features = %v, want required bridge feature set", payload.Features)
 	}

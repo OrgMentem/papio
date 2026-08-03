@@ -1,0 +1,1 @@
+{"protocol":"papio-browser/1","type":"page_capture_request","msg_id":"capture-request-frame","seq":12,"payload":{"request_id":"capture-request-001","url":"https://journals.example.org/article/42","provider":"example_provider","scenario":"success","settle_ms":2500}}

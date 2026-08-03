@@ -100,6 +100,9 @@ export interface AdapterSpec {
 export interface TermsAcceptRule {
   /** The open terms modal container (same selector as the `terms` classify rule). */
   modalSelector: string;
+  /** Optional fixture-backed accept control. When present, click it directly
+   * instead of inferring the control from accessible text. */
+  control?: string;
   /** Accessible-text needles identifying the accept-and-download control. */
   textAny: string[];
 }
@@ -370,6 +373,46 @@ export const adapters: AdapterSpec[] = [
     termsAccept: {
       modalSelector: "mfe-download-pharos-modal.terms-and-conditions[open]",
       textAny: ["accept and download"],
+    },
+  },
+  {
+    // Captured 2026-08-03 from the institutionally entitled Informit article record at
+    // https://search.informit.org/doi/10.3316/informit.TOKEN
+    // (fixtures/informit/success.html). Atypon exposes both reader and PDF
+    // anchors, but /doi/pdf can be bot-gated or return a viewer wrapper rather
+    // than PDF bytes. Invoke the captured PDF control so the browser's native
+    // click/download correlation supplies the evidence, instead of extracting
+    // or synthesizing an endpoint.
+    id: "informit",
+    version: "0.1.0",
+    hosts: ["search.informit.org"],
+    settleTimeoutMs: 5000,
+    classify: [
+      {
+        kind: "terms",
+        all: [
+          "form.saml__consent__form",
+          "form.saml__consent__form input.saml__consent__yes[type='submit']",
+        ],
+      },
+      {
+        kind: "article",
+        all: [
+          "[data-doi]",
+          "a[aria-label='View PDF'].main-link[href^='/doi/reader/']",
+          "a.pdf-button[href^='/doi/pdf/']",
+        ],
+      },
+    ],
+    download: {
+      selector: "a.pdf-button[href^='/doi/pdf/']",
+      requireKind: "article",
+      method: "click",
+    },
+    termsAccept: {
+      modalSelector: "form.saml__consent__form",
+      control: "input.saml__consent__yes",
+      textAny: ["i have read and agree to the terms and conditions"],
     },
   },
   {

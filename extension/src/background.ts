@@ -19,6 +19,7 @@ import {
   BROWSER_PROTOCOL_VERSION,
   MAX_BROWSER_MESSAGE_BYTES,
   MsgPageCapture,
+  MsgPageCaptureRequestResult,
   parseBrowserMessage,
   type ActivityEntryPayload,
   type BrowserMessage,
@@ -28,6 +29,8 @@ import {
   type PageAcquireAckPayload,
   type PageAcquirePayload,
   type PageCapturePayload,
+  type PageCaptureRequestPayload,
+  type PageCaptureRequestResultPayload,
 } from "./protocol";
 import {
   chromeBackend,
@@ -61,6 +64,15 @@ import {
   type PageVerdict,
 } from "./adapters/types";
 import { observeUnknown, type ObserveChromeApi } from "./observe";
+import {
+  capturePage,
+  encodePageCapture,
+  residualLeak,
+  sanitizeFixture,
+  type PageCapture,
+  type Provider,
+  type Scenario,
+} from "./capture";
 import { chromeKeepaliveAPI, initKeepalive, isAuthenticationURL } from "./keepalive";
 import type {
   KeepaliveManager,
@@ -158,6 +170,9 @@ const REVIEW_PREVIEW_FEATURE = "review_preview_v1";
 const STATS_FEATURE = "browser_stats_v1";
 const ACTIVITY_FEED_FEATURE = "activity_feed_v1";
 const PAGE_CAPTURE_FEATURE = "page_capture_v1";
+const PAGE_CAPTURE_REQUEST_FEATURE = "page_capture_request_v1";
+const PAGE_CAPTURE_DEFAULT_SETTLE_MS = 3_000;
+const PAGE_CAPTURE_NAV_TIMEOUT_MS = 30_000;
 const TRIAGE_COUNTS_FRESH_MS = 3 * KEEPALIVE_ALARM_MINUTES * 60_000;
 const SESSION_EVIDENCE_THROTTLE_MS = 60_000;
 /** Daemon replies that settle a correlated `requestNative` call. `requestNative`
@@ -388,6 +403,7 @@ export interface NativePort {
 export interface TabInfo {
   id?: number | undefined;
   url?: string | undefined;
+  status?: string | undefined;
   /** Page title when available; used only for local IdP failure-page
    * heuristics and never sent over the bridge. */
   title?: string | undefined;
@@ -436,7 +452,7 @@ export function findManagedTab(
     (candidate) => candidate.id !== undefined && candidate.url !== undefined && normalizeManagedTabURL(candidate.url) === normalized,
   );
 }
-export type ManagedTabPurpose = "handoff" | "inbox-open" | "session-signin" | "redrive" | "reoffer";
+export type ManagedTabPurpose = "handoff" | "inbox-open" | "session-signin" | "redrive" | "reoffer" | "capture";
 export interface OpenManagedTabOptions {
   url: string;
   jobId?: string;
@@ -863,13 +879,31 @@ export async function resolveDownloadURL(
   }
 }
 
-/** Self-contained click of a terms-and-conditions accept control, found by
- * accessible text inside an open modal (piercing shadow roots). Runs ONLY when
- * the user has recorded informed consent; the extension never guesses terms
- * controls otherwise. Returns whether a matching control was clicked. */
-export function clickTermsAccept(modalSelector: string, textAny: string[]): boolean {
+/** Self-contained click of a terms-and-conditions accept control, found by an
+ * explicit fixture-backed selector or accessible text inside an open modal
+ * (piercing shadow roots). Runs ONLY when the user has recorded informed
+ * consent; the extension never guesses terms controls otherwise. Returns
+ * whether a matching control was clicked. */
+export function clickTermsAccept(
+  modalSelector: string,
+  textAny: string[],
+  controlSelector: string | null = null,
+): boolean {
   const modal = document.querySelector(modalSelector);
   if (!modal) return false;
+  const click = (el: Element): boolean => {
+    const target = el as HTMLElement;
+    if (typeof target.click !== "function") return false;
+    const shadow = (target as HTMLElement & { shadowRoot?: ShadowRoot | null }).shadowRoot;
+    const inner = shadow?.querySelector<HTMLElement>("#button-element");
+    (inner ?? target).click();
+    return true;
+  };
+  if (controlSelector !== null) {
+    const control = modal.matches(controlSelector) ? modal : modal.querySelector(controlSelector);
+    return control === null ? false : click(control);
+  }
+
   const needles = textAny.map((t) => t.toLowerCase());
   const walk = (root: ParentNode): boolean => {
     for (const el of Array.from(root.querySelectorAll("*"))) {
@@ -879,19 +913,28 @@ export function clickTermsAccept(modalSelector: string, textAny: string[]): bool
       // real control is button-like (JSTOR's is an mfe-*-button with a shadow
       // #button-element).
       const tag = el.tagName.toLowerCase();
+      const submit = tag === "input" && el.getAttribute("type")?.toLowerCase() === "submit";
       const actionable =
         tag === "button" ||
         tag === "a" ||
+        submit ||
         el.getAttribute?.("role") === "button" ||
         tag.endsWith("-button");
       if (actionable) {
-        const label = ((el as HTMLElement).innerText ?? "") + " " + (el.getAttribute?.("aria-label") ?? "");
-        if (needles.some((n) => label.toLowerCase().includes(n))) {
-          const shadow = (el as HTMLElement & { shadowRoot?: ShadowRoot | null }).shadowRoot;
-          const inner = shadow?.querySelector<HTMLElement>("#button-element");
-          (inner ?? (el as HTMLElement)).click();
-          return true;
-        }
+        const value = submit ? (el.getAttribute("value") ?? "") : "";
+        const formContext =
+          submit && value.trim() === ""
+            ? ((el.closest("form") as HTMLElement | null)?.innerText ?? "")
+            : "";
+        const label =
+          ((el as HTMLElement).innerText ?? "") +
+          " " +
+          (el.getAttribute?.("aria-label") ?? "") +
+          " " +
+          value +
+          " " +
+          formContext;
+        if (needles.some((n) => label.toLowerCase().includes(n)) && click(el)) return true;
       }
       const sub = (el as HTMLElement & { shadowRoot?: ShadowRoot | null }).shadowRoot;
       if (sub && walk(sub)) return true;
@@ -985,6 +1028,9 @@ export class Bridge {
   /** Tabs we are intentionally closing, so onRemoved does not emit a spurious
    * cancelled outcome for a programmatic close. */
   private readonly closingTabs = new Set<number>();
+  /** Browser-driven fixture capture shares the two-slot handoff governor. */
+  private pageCaptureDriving = false;
+  private readonly pageCaptureLoadWaiters = new Map<number, (loaded: boolean) => void>();
   /** Lazily-loaded durable ledger of broker tabs this and prior extension
    * lives created. Keys are stringified tab ids, values open timestamps. */
   /** Serializes every managed-tab ledger load/mutate/save transaction. */
@@ -3257,14 +3303,17 @@ export class Bridge {
 
   /** Inject the consented terms-accept click on the tracked tab. Gated by the
    * caller on recorded consent; returns whether a control was clicked. */
-  private async acceptTerms(jobID: string, rule: { modalSelector: string; textAny: string[] }): Promise<boolean> {
+  private async acceptTerms(
+    jobID: string,
+    rule: { modalSelector: string; control?: string; textAny: string[] },
+  ): Promise<boolean> {
     const job = findByJob(this.store, jobID);
     if (!job || job.tab_id < 0) return false;
     try {
       const results = await this.deps.scripting.executeScript({
         target: { tabId: job.tab_id },
         func: clickTermsAccept,
-        args: [rule.modalSelector, rule.textAny],
+        args: [rule.modalSelector, rule.textAny, rule.control ?? null],
       });
       return results[0]?.result === true;
     } catch (e) {
@@ -4293,6 +4342,171 @@ export class Bridge {
     return this.pageCaptureAvailable() && this.send(MsgPageCapture, payload, jobID);
   }
 
+  private waitForPageCaptureLoad(tabID: number): Promise<boolean> {
+    return new Promise<boolean>((resolve) => {
+      let finished = false;
+      const finish = (loaded: boolean): void => {
+        if (finished) return;
+        finished = true;
+        if (this.pageCaptureLoadWaiters.get(tabID) === finish) {
+          this.pageCaptureLoadWaiters.delete(tabID);
+        }
+        resolve(loaded);
+      };
+      this.pageCaptureLoadWaiters.set(tabID, finish);
+      this.deps.setTimeout(() => finish(false), PAGE_CAPTURE_NAV_TIMEOUT_MS);
+    });
+  }
+
+  private async onPageCaptureRequest(msg: BrowserMessage): Promise<void> {
+    const request = msg.payload as unknown as PageCaptureRequestPayload;
+    const reply = (outcome: PageCaptureRequestResultPayload["outcome"], detail?: string): void => {
+      const payload: PageCaptureRequestResultPayload = {
+        request_id: request.request_id,
+        outcome,
+        ...(detail === undefined ? {} : { detail }),
+      };
+      this.send(MsgPageCaptureRequestResult, payload);
+    };
+    if (
+      !this.pageCaptureAvailable() ||
+      !(this.store.daemonFeatures ?? []).includes(PAGE_CAPTURE_REQUEST_FEATURE)
+    ) {
+      reply("not_permitted", "page capture is not available");
+      return;
+    }
+    let requested: URL;
+    try {
+      requested = new URL(request.url);
+    } catch {
+      reply("nav_failed", "the requested URL is invalid");
+      return;
+    }
+    try {
+      if (!(await this.deps.permissions.contains({ origins: [`${requested.origin}/*`] }))) {
+        reply("not_permitted", "provider host permission is not granted");
+        return;
+      }
+    } catch {
+      reply("not_permitted", "provider host permission could not be checked");
+      return;
+    }
+    if (this.pageCaptureDriving || this.handoffDrives.size >= HANDOFF_DRIVE_LIMIT) {
+      reply("busy", "browser handoff slots are occupied");
+      return;
+    }
+
+    this.pageCaptureDriving = true;
+    const managedKey = `capture_${request.request_id}`;
+    let tabID: number | undefined;
+    try {
+      tabID = await this.openManagedTab({
+        url: request.url,
+        jobId: managedKey,
+        purpose: "capture",
+        surfaceFallback: false,
+        focusExisting: false,
+      });
+      if (tabID === undefined) {
+        reply("nav_failed", "could not open the provider page");
+        return;
+      }
+      const load = this.waitForPageCaptureLoad(tabID);
+      try {
+        if ((await this.deps.tabs.get(tabID)).status === "complete") {
+          this.pageCaptureLoadWaiters.get(tabID)?.(true);
+        }
+      } catch {
+        this.pageCaptureLoadWaiters.get(tabID)?.(false);
+      }
+      if (!(await load)) {
+        reply("timeout", "provider page did not finish loading");
+        return;
+      }
+      const settleMS = request.settle_ms ?? PAGE_CAPTURE_DEFAULT_SETTLE_MS;
+      if (settleMS > 0) {
+        await new Promise<void>((resolve) => this.deps.setTimeout(resolve, settleMS));
+      }
+      let injected: { result?: unknown } | undefined;
+      try {
+        [injected] = await this.deps.scripting.executeScript({
+          target: { tabId: tabID },
+          func: capturePage,
+        });
+      } catch {
+        reply("not_permitted", "could not read the provider page");
+        return;
+      }
+      const page = injected?.result as PageCapture | undefined;
+      if (
+        page === undefined ||
+        typeof page.html !== "string" ||
+        typeof page.origin !== "string" ||
+        typeof page.path !== "string"
+      ) {
+        reply("nav_failed", "provider page capture returned no document");
+        return;
+      }
+      let finalOrigin: URL;
+      try {
+        finalOrigin = new URL(page.origin);
+      } catch {
+        reply("nav_failed", "provider page has an invalid origin");
+        return;
+      }
+      if (finalOrigin.protocol !== "https:" || finalOrigin.hostname === "") {
+        reply("nav_failed", "provider page did not finish on https");
+        return;
+      }
+      try {
+        if (!(await this.deps.permissions.contains({ origins: [`${finalOrigin.origin}/*`] }))) {
+          reply("not_permitted", "final provider host permission is not granted");
+          return;
+        }
+      } catch {
+        reply("not_permitted", "final provider host permission could not be checked");
+        return;
+      }
+      const sanitized = sanitizeFixture(page.html, {
+        provider: request.provider as Provider,
+        scenario: request.scenario as Scenario,
+        originNoQuery: `${page.origin}${page.path}`,
+        capturedISO: new Date(this.deps.now()).toISOString(),
+      });
+      const leak = residualLeak(sanitized);
+      if (leak !== null) {
+        reply("nav_failed", "sanitized page did not pass the privacy check");
+        return;
+      }
+      const encoded = await encodePageCapture(sanitized, {
+        host: finalOrigin.hostname,
+        scenario: request.scenario,
+        adapterID: request.provider,
+      });
+      if (!encoded.ok) {
+        reply("nav_failed", encoded.error);
+        return;
+      }
+      if (!this.sendPageCapture(encoded.payload)) {
+        reply("nav_failed", "could not send the sanitized page capture");
+        return;
+      }
+      reply("captured");
+    } finally {
+      this.pageCaptureDriving = false;
+      this.managedTabURLs.delete(managedKey);
+      if (tabID !== undefined) {
+        this.closingTabs.add(tabID);
+        try {
+          await this.deps.tabs.remove(tabID);
+        } catch {
+          this.closingTabs.delete(tabID);
+        }
+        await this.forgetLedgeredTab(tabID);
+      }
+    }
+  }
+
   /** Build, self-validate, and post one outbound frame. Validation is a safety
    * net: a frame that would not survive the shared parser is dropped, never
    * emitted. */
@@ -4379,6 +4593,9 @@ export class Bridge {
       return;
     }
     switch (msg.type) {
+      case "page_capture_request":
+        await this.onPageCaptureRequest(msg);
+        return;
       case "job_offer":
         await this.onJobOffer(msg);
         return;
@@ -4981,6 +5198,10 @@ export class Bridge {
   }
 
   private async onTabUpdated(tabID: number, change: TabChangeInfo, tab: TabInfo): Promise<void> {
+    const pageCaptureWaiter = this.pageCaptureLoadWaiters.get(tabID);
+    if (pageCaptureWaiter !== undefined && change.status === "complete") {
+      pageCaptureWaiter(true);
+    }
     await this.ready;
     const job = findByTab(this.store, tabID);
     if (!job) {
@@ -5896,6 +6117,8 @@ export class Bridge {
 
   private async onTabRemoved(tabID: number): Promise<void> {
     await this.ready;
+    const pageCaptureWaiter = this.pageCaptureLoadWaiters.get(tabID);
+    if (pageCaptureWaiter !== undefined) pageCaptureWaiter(false);
     this.authCountedTabs.delete(tabID);
     void this.forgetLedgeredTab(tabID);
     if (this.closingTabs.delete(tabID)) {

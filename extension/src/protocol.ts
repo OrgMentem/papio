@@ -11,6 +11,8 @@ export const BROWSER_PROTOCOL_VERSION = "papio-browser/1";
 export const MAX_BROWSER_MESSAGE_BYTES = 256 * 1024;
 export const MAX_BROWSER_INTEGER = Number.MAX_SAFE_INTEGER;
 export const MsgPageCapture = "page_capture" as const;
+export const MsgPageCaptureRequest = "page_capture_request" as const;
+export const MsgPageCaptureRequestResult = "page_capture_request_result" as const;
 
 export type BrowserMessageType =
   | "hello"
@@ -18,6 +20,8 @@ export type BrowserMessageType =
   | "page_acquire"
   | "page_acquire_ack"
   | "page_capture"
+  | "page_capture_request"
+  | "page_capture_request_result"
   | "job_offer"
   | "handoff_outcome"
   | "job_accept"
@@ -83,6 +87,20 @@ export interface PageCapturePayload {
   encoding: "gzip+base64";
   bytes: number;
   body: string;
+}
+
+export interface PageCaptureRequestPayload {
+  request_id: string;
+  url: string;
+  provider: string;
+  scenario: "success" | "login-return" | "no-entitlement" | "drift" | "terms";
+  settle_ms?: number;
+}
+
+export interface PageCaptureRequestResultPayload {
+  request_id: string;
+  outcome: "captured" | "nav_failed" | "timeout" | "not_permitted" | "busy";
+  detail?: string;
 }
 
 export interface JobOfferExpected {
@@ -352,6 +370,8 @@ const MSG_TYPES: Record<string, true> = {
   page_acquire: true,
   page_acquire_ack: true,
   page_capture: true,
+  page_capture_request: true,
+  page_capture_request_result: true,
   job_offer: true,
   handoff_outcome: true,
   job_accept: true,
@@ -792,6 +812,49 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
       }
       const body = str(p, "body", "page_capture", MAX_BROWSER_MESSAGE_BYTES);
       if (!BASE64_RE.test(body)) fail("page_capture.body must be canonical base64");
+      break;
+    }
+    case "page_capture_request": {
+      requireFields<PageCaptureRequestPayload>(p, "page_capture_request", {
+        request_id: "required",
+        url: "required",
+        provider: "required",
+        scenario: "required",
+        settle_ms: "optional",
+      });
+      correlationID(p, "request_id", "page_capture_request");
+      const pageURL = str(p, "url", "page_capture_request", 4000);
+      if (!pageURL.startsWith("https://")) fail("page_capture_request.url must be https");
+      try {
+        const parsed = new URL(pageURL);
+        if (parsed.protocol !== "https:" || parsed.host === "") fail("page_capture_request.url must be https");
+      } catch {
+        fail("page_capture_request.url must be https");
+      }
+      if (!/^[A-Za-z0-9_-]{1,64}$/.test(str(p, "provider", "page_capture_request", 64))) {
+        fail("page_capture_request.provider must use the id charset");
+      }
+      const scenario = str(p, "scenario", "page_capture_request", 50);
+      if (!["success", "login-return", "no-entitlement", "drift", "terms"].includes(scenario)) {
+        fail("page_capture_request.scenario is invalid");
+      }
+      if ("settle_ms" in p && int(p, "settle_ms", "page_capture_request", 0) > 10_000) {
+        fail("page_capture_request.settle_ms must be <= 10000");
+      }
+      break;
+    }
+    case "page_capture_request_result": {
+      requireFields<PageCaptureRequestResultPayload>(p, "page_capture_request_result", {
+        request_id: "required",
+        outcome: "required",
+        detail: "optional",
+      });
+      correlationID(p, "request_id", "page_capture_request_result");
+      const outcome = str(p, "outcome", "page_capture_request_result", 20);
+      if (!["captured", "nav_failed", "timeout", "not_permitted", "busy"].includes(outcome)) {
+        fail("page_capture_request_result.outcome is invalid");
+      }
+      if ("detail" in p) triageText(p, "detail", "page_capture_request_result", 1000);
       break;
     }
     case "job_offer": {

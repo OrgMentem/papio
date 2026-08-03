@@ -304,6 +304,65 @@ test.skipIf(jstorArticle === null)(
   },
 );
 
+// Informit is an Atypon platform. Its entitled record exposes reader and PDF
+// anchors but no citation PDF meta; the adapter clicks the captured PDF control
+// so the browser, rather than a fetch of /doi/pdf, owns the download.
+const informitArticle = loadFixture("informit", "success");
+test.skipIf(informitArticle === null)(
+  "captured Informit article classifies on its Atypon PDF controls",
+  () => {
+    expect(fixtureExists("informit", "success")).toBe(true);
+    const article = informitArticle as Document;
+    const spec = adapters.find((a) => a.id === "informit") as AdapterSpec;
+    const verdict = interpret(article, spec, ctx());
+    expect(verdict.kind).toBe("article");
+    expect(verdict.adapter_id).toBe("informit");
+    expect(article.querySelector("[data-doi='10.3316/informit.TOKEN']")).not.toBeNull();
+    expect(
+      article.querySelector("a[aria-label='View PDF'].main-link[href^='/doi/reader/']"),
+    ).not.toBeNull();
+    expect(article.querySelector("meta[name='citation_pdf_url']")).toBeNull();
+    expect(article.querySelector("meta[name='citation_title']")).toBeNull();
+
+    const rule = spec.download as DownloadRule;
+    expect(rule.method).toBe("click");
+    expect(rule.selector).toBe("a.pdf-button[href^='/doi/pdf/']");
+    const control = article.querySelector(rule.selector);
+    expect(control).not.toBeNull();
+    expect(control?.getAttribute("href")).toBe("/doi/pdf/10.3316/informit.TOKEN");
+  },
+);
+
+const informitTerms = loadFixture("informit", "terms");
+test.skipIf(informitTerms === null)(
+  "captured Informit SAML consent interstitial classifies as terms",
+  () => {
+    expect(fixtureExists("informit", "terms")).toBe(true);
+    const terms = informitTerms as Document;
+    const spec = adapters.find((a) => a.id === "informit") as AdapterSpec;
+    const verdict = interpret(terms, spec, ctx());
+    expect(verdict.kind).toBe("terms");
+    expect(verdict.adapter_id).toBe("informit");
+    expect(terms.querySelector("form.saml__consent__form")).not.toBeNull();
+    expect(
+      terms.querySelector("form.saml__consent__form input.saml__consent__yes[type='submit']"),
+    ).not.toBeNull();
+    expect(spec.termsAccept?.modalSelector).toBe("form.saml__consent__form");
+    expect(spec.termsAccept?.control).toBe("input.saml__consent__yes");
+    expect(spec.termsAccept?.textAny).toEqual([
+      "i have read and agree to the terms and conditions",
+    ]);
+  },
+);
+
+test.skipIf(informitArticle === null)(
+  "captured Informit article does not classify as terms",
+  () => {
+    const spec = adapters.find((a) => a.id === "informit") as AdapterSpec;
+    expect(interpret(informitArticle as Document, spec, ctx()).kind).not.toBe("terms");
+  },
+);
+
 // Wiley Online Library: captured 2026-07-17 from a Example University-authenticated article
 // (fixtures/wiley/success.html). The article page carries the Highwire
 // citation_pdf_url meta the adapter downloads through.
@@ -863,7 +922,7 @@ class FakeScripting {
     followupSelector?: string;
   }[] = [];
   readonly rawClickArgs: unknown[][] = [];
-  readonly termsAccepts: { tabId: number; modalSelector: string; textAny: unknown }[] = [];
+  readonly termsAccepts: { tabId: number; modalSelector: string; textAny: unknown; control: unknown }[] = [];
   readonly interpretTabs: number[] = [];
   constructedURL: string | null = "https://provider.example.edu/pdf/default.pdf";
   readonly constructedArgs: { tabId: number; selector: string; idPattern: unknown; urlTemplate: unknown; jsonField: unknown }[] = [];
@@ -880,8 +939,13 @@ class FakeScripting {
       this.extracted.push({ tabId: inj.target.tabId, selector: String(args[0]) });
       return [{ result: this.href }];
     }
-    if (args.length === 2) {
-      this.termsAccepts.push({ tabId: inj.target.tabId, modalSelector: String(args[0]), textAny: args[1] });
+    if (inj.func === clickTermsAccept) {
+      this.termsAccepts.push({
+        tabId: inj.target.tabId,
+        modalSelector: String(args[0]),
+        textAny: args[1],
+        control: args[2],
+      });
       return [{ result: true }];
     }
     if (args.length === 5) {
@@ -1277,6 +1341,45 @@ test("clickTermsAccept clicks the real accept control, not a wrapping container"
     // click then bubbles to .cta, which is fine — Cancel is never clicked.
     expect(clicks[0]).toBe("accept");
     expect(clicks).not.toContain("cancel");
+  } finally {
+    Object.assign(globalThis, { document: prev });
+  }
+});
+
+test("clickTermsAccept clicks an empty-value submit input through its explicit selector", () => {
+  const win = new Window();
+  const doc = win.document;
+  doc.body.innerHTML =
+    "<form class='saml__consent__form'>" +
+    "<p>I have read and agree to the Terms and Conditions</p>" +
+    "<input class='saml__consent__yes' type='submit' value=''>" +
+    "</form>";
+  const control = doc.querySelector("input.saml__consent__yes");
+  let clicks = 0;
+  control?.addEventListener("click", (event) => {
+    event.preventDefault();
+    clicks++;
+  });
+  const prev = globalThis.document;
+  Object.assign(globalThis, { document: doc });
+  try {
+    expect(
+      clickTermsAccept(
+        "form.saml__consent__form",
+        ["i have read and agree to the terms and conditions"],
+        "input.saml__consent__yes",
+      ),
+    ).toBe(true);
+    expect(clicks).toBe(1);
+
+    // With no explicit selector, empty submit values use the enclosing form's
+    // consent text rather than becoming invisible to accessible-text matching.
+    expect(
+      clickTermsAccept("form.saml__consent__form", [
+        "i have read and agree to the terms and conditions",
+      ]),
+    ).toBe(true);
+    expect(clicks).toBe(2);
   } finally {
     Object.assign(globalThis, { document: prev });
   }

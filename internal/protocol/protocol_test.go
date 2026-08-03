@@ -419,6 +419,74 @@ func TestPageCapturePayloadRoundTripAndValidation(t *testing.T) {
 	}
 }
 
+func TestPageCaptureRequestRoundTripAndValidation(t *testing.T) {
+	frame := func(typ string, payload any) []byte {
+		t.Helper()
+		data, err := json.Marshal(map[string]any{
+			"protocol": BrowserProtocolVersion,
+			"type":     typ,
+			"msg_id":   "capture-request-frame",
+			"seq":      2,
+			"payload":  payload,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return data
+	}
+	settle := int64(2500)
+	request := PageCaptureRequestPayload{
+		RequestID: "capture-request-001",
+		URL:       "https://journals.example.org/article/42",
+		Provider:  "example_provider",
+		Scenario:  "success",
+		SettleMS:  &settle,
+	}
+	msg, err := DecodeBrowserMessage(frame(MsgPageCaptureRequest, request))
+	if err != nil {
+		t.Fatalf("decode page_capture_request: %v", err)
+	}
+	gotRequest := msg.Payload.(*PageCaptureRequestPayload)
+	if gotRequest.RequestID != request.RequestID || gotRequest.URL != request.URL ||
+		gotRequest.Provider != request.Provider || gotRequest.Scenario != request.Scenario ||
+		gotRequest.SettleMS == nil || *gotRequest.SettleMS != settle {
+		t.Fatalf("round-trip request = %#v, want %#v", gotRequest, request)
+	}
+	result := PageCaptureRequestResultPayload{
+		RequestID: request.RequestID,
+		Outcome:   "captured",
+		Detail:    "stored",
+	}
+	msg, err = DecodeBrowserMessage(frame(MsgPageCaptureRequestResult, result))
+	if err != nil {
+		t.Fatalf("decode page_capture_request_result: %v", err)
+	}
+	if got := msg.Payload.(*PageCaptureRequestResultPayload); *got != result {
+		t.Fatalf("round-trip result = %#v, want %#v", got, result)
+	}
+
+	for _, payload := range []map[string]any{
+		{"request_id": request.RequestID, "url": "http://example.org/article", "provider": "example", "scenario": "success"},
+		{"request_id": request.RequestID, "url": request.URL, "provider": "bad provider", "scenario": "success"},
+		{"request_id": request.RequestID, "url": request.URL, "provider": "example", "scenario": "observed"},
+		{"request_id": request.RequestID, "url": request.URL, "provider": "example", "scenario": "success", "settle_ms": 10001},
+		{"request_id": request.RequestID, "url": request.URL, "provider": "example", "scenario": "success", "settle_ms": nil},
+	} {
+		if _, err := DecodeBrowserMessage(frame(MsgPageCaptureRequest, payload)); err == nil {
+			t.Fatalf("invalid page_capture_request payload %#v was accepted", payload)
+		}
+	}
+	for _, payload := range []map[string]any{
+		{"request_id": request.RequestID, "outcome": "unknown"},
+		{"request_id": request.RequestID, "outcome": "captured", "detail": nil},
+		{"request_id": "short", "outcome": "captured"},
+	} {
+		if _, err := DecodeBrowserMessage(frame(MsgPageCaptureRequestResult, payload)); err == nil {
+			t.Fatalf("invalid page_capture_request_result payload %#v was accepted", payload)
+		}
+	}
+}
+
 // The IdP privacy invariant is structural: auth payloads cannot carry a URL.
 func TestAuthPayloadRejectsURLFields(t *testing.T) {
 	msg := []byte(`{"protocol":"papio-browser/1","type":"auth_returned","msg_id":"m_auth_ret1","job_id":"job_0002_tyler","seq":5,"payload":{"url":"https://idp.example.edu/sso?token=SECRET"}}`)
