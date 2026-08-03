@@ -1028,8 +1028,8 @@ function renderWaitingOnSignIn(
   }
 }
 
-/** Render the durable browser actions that cannot safely be completed from the
- * service worker: institutional sign-in and granting provider access in Options. */
+/** Render durable browser actions that need a user gesture: institutional
+ * sign-in, provider permission grants, and security checks. */
 export function renderNeedsAttention(
   doc: Document,
   jobs: ActiveJob[],
@@ -1038,6 +1038,7 @@ export function renderNeedsAttention(
   onOpenOptions: () => Promise<void> = openOptions,
   authStalledJobs: readonly string[] = [],
   onRetry: (jobID: string) => Promise<void> = retryAuthStalled,
+  onGrantProvider: (host: string) => Promise<boolean> = grantProviderAccess,
 ): void {
   const section = doc.getElementById("needs-you-section");
   const heading = doc.getElementById("needs-you-heading");
@@ -1083,7 +1084,7 @@ export function renderNeedsAttention(
     message.textContent = "Sign-in didn't stick — retry these papers.";
   } else {
     heading.textContent = "Allow provider access";
-    message.textContent = "Enable these sources in Options, or use Grant all sources.";
+    message.textContent = "Grant the blocked source here, or manage all sources in Options.";
   }
   message.hidden = message.textContent === "";
 
@@ -1164,14 +1165,20 @@ export function renderNeedsAttention(
     const button = doc.createElement("button");
     button.className = "ghost";
     button.type = "button";
-    button.textContent = "Open Options";
+    button.textContent = "Allow";
     button.addEventListener("click", () => {
       button.disabled = true;
-      button.textContent = "Opening…";
-      void onOpenOptions().catch(() => {
-        button.disabled = false;
-        button.textContent = "Try again";
-      });
+      button.textContent = "Allowing…";
+      void onGrantProvider(host).then(
+        (granted) => {
+          button.disabled = false;
+          button.textContent = granted ? "Allowed" : "Try again";
+        },
+        () => {
+          button.disabled = false;
+          button.textContent = "Try again";
+        },
+      );
     });
     row.append(provider, button);
     list.append(row);
@@ -1909,6 +1916,11 @@ export async function refresh(): Promise<void> {
     openOptions,
     session?.stalledAuthJobs ?? [],
     retryAuthStalled,
+    async (host) => {
+      const granted = await grantProviderAccess(host);
+      if (granted) await refresh();
+      return granted;
+    },
   );
   renderTermsConsent(document, store.activeJobs, consent, (value) => {
     void sendTermsConsent(value).then(() => refresh());
@@ -1984,6 +1996,16 @@ export function wireCapture(doc: Document = document): void {
       button.disabled = false;
     });
   });
+}
+
+export async function grantProviderAccess(host: string): Promise<boolean> {
+  const normalized = host.trim().toLowerCase();
+  try {
+    if (new URL(`https://${normalized}/`).hostname !== normalized) return false;
+  } catch {
+    return false;
+  }
+  return chrome.permissions.request({ origins: [`https://${normalized}/*`] });
 }
 
 export async function openOptions(): Promise<void> {

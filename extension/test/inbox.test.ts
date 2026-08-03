@@ -757,6 +757,30 @@ test("expandable details carry mechanism copy and backend identifiers", async ()
   );
 });
 
+test("a missing adapter is named and its local diagnostic is explained", async () => {
+  const item = manualAction("action:missing-adapter", 1, "Unsupported provider article");
+  item.facts.push({
+    label: "Detail",
+    text:
+      "papio has no adapter for this provider yet; download the PDF yourself for now; " +
+      "a sanitized page diagnostic is saved locally; run 'papio adapter captures' to inspect it",
+  });
+  const fixture = snapshot([item], {
+    counts: counts({ pending_total: 1, actions: 1, watch_hits: 0, retractions: 0 }),
+  });
+  const page = await inboxDocument((message) => snapshotReply(fixture, message));
+  const row = page.document.querySelector<HTMLElement>(
+    "[data-triage-item-id='action:missing-adapter']",
+  );
+
+  expect(row?.querySelector(".item-guidance")?.textContent).toContain(
+    "No adapter yet - download this PDF manually",
+  );
+  expect(row?.querySelector(".item-mechanism")?.textContent).toContain(
+    "run papio adapter captures to find it",
+  );
+});
+
 test("access classification chooses one concise next action", async () => {
   const openAccess = handoffAction("action:open-access", 1, false);
   const institutional = handoffAction("action:institutional", 2, true);

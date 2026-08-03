@@ -2002,6 +2002,12 @@ func (b *Bridge) outcome(ctx context.Context, jobID string, p *protocol.Provider
 		detail := "papio reached a different work; find and download the requested PDF yourself"
 		if p.Outcome == "ui_changed" {
 			detail = "papio could not drive the provider page; download the PDF yourself and papio will adopt it"
+			if strings.HasPrefix(p.Detail, "No source-controlled adapter matched this provider page.") {
+				detail = "papio has no adapter for this provider yet; download the PDF yourself for now"
+				if strings.Contains(p.Detail, "A sanitized diagnostic was saved locally") {
+					detail += "; a sanitized page diagnostic is saved locally; run 'papio adapter captures' to inspect it"
+				}
+			}
 		}
 		// The page, rather than the original paywall, now blocks papio; whether
 		// that page needs a sign-in remains the resolved handoff's classification.

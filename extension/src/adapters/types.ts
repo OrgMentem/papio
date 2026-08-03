@@ -1082,6 +1082,32 @@ export const adapters: AdapterSpec[] = [
     },
   },
   {
+    // Verified 2026-08-04 against the live public MDPI article
+    // 10.3390/educsci12060369 (fixtures/mdpi/success.html). Require both the
+    // Highwire PDF metadata and MDPI's provider-owned download anchor so an
+    // article-shaped metadata shell cannot trigger a download. href reads the
+    // live URL, including the version query stripped from the fixture.
+    id: "mdpi",
+    version: "0.1.0",
+    hosts: ["mdpi.com"],
+    classify: [
+      {
+        kind: "article",
+        all: [
+          "meta[name='citation_journal_title']",
+          "meta[name='citation_doi']",
+          "meta[name='citation_pdf_url']",
+          "a.UD_ArticlePDF[href*='/pdf']",
+        ],
+      },
+    ],
+    download: {
+      selector: "a.UD_ArticlePDF[href*='/pdf']",
+      requireKind: "article",
+      method: "href",
+    },
+  },
+  {
     // The seven captured Alma View It pages all expose this terminal empty-results
     // state. Resolver pages with holdings forward elsewhere, so their success
     // shape is not evidenced here and must remain assisted.

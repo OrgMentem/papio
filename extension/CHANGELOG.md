@@ -16,6 +16,30 @@ for the full pre-split extension history.
 
 ## [Unreleased]
 
+### Added
+
+- **ClinicalKey full-text pages are autonomous.** The `clinicalkey` 0.1.0
+  adapter classifies an entitled SPA article on its stable
+  `pdf-download-link` anchor and downloads the provider's watermarked PDF
+  endpoint with the operator's session cookies. The `.com.au` front is
+  fixture-backed; other ClinicalKey fronts remain assisted until captured.
+- **MDPI article pages are autonomous.** The `mdpi` 0.1.0 adapter uses the
+  live page's Highwire PDF metadata plus its provider-owned download anchor,
+  then downloads the exact PDF URL with the operator's browser session.
+- **Coverage gaps explain the next step.** A blocked provider permission now
+  offers a one-click **Allow** action in the popup and resumes the exact
+  governed tab after the grant. A stable resolver landing outside the capped
+  provider list gets one bounded render window, attempts a sanitized local
+  diagnostic capture, then becomes a **No adapter yet** manual-download action
+  instead of spinning indefinitely.
+
+### Changed
+
+- **Solicited CLI fixture captures open visibly.** The explicit
+  `papio adapter capture` request restores the work window while it runs, so
+  visibility-dependent SPAs and consent managers can finish rendering; the
+  governed tab is still closed after capture.
+
 ## [0.9.0] - 2026-08-03
 
 ### Added

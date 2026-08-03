@@ -251,6 +251,40 @@ These are product ideas implemented independently under *papio*'s existing
 protocol, browser-permission, and provenance rules. Reusing Connector code would
 require the future, deliberate relicensing decision described above.
 
+### Adapter gaps are an explicit, local evidence loop
+
+A stable non-authentication landing in a governed resolver tab is provider
+evidence even when its host is absent from the protocol's capped legacy list
+and from the adapter registry. It gets one bounded render window. If no adapter
+appears, the extension attempts the existing sanitized `observed` capture,
+reports `ui_changed` over the existing negotiated message, and releases the
+browser-drive slot. The daemon turns that outcome into a `manual_download`
+action whose copy names the missing adapter and whether a local diagnostic was
+saved.
+
+A missing host permission remains a different, non-terminal condition: the
+popup names the provider host and requests that exact HTTPS origin from the
+operator's click. The governed tab and job remain live, and the permission
+change resumes classification on that exact tab.
+
+This is the low-effort contribution boundary:
+
+1. *papio* captures and retains diagnostic evidence locally; an operator or
+   agent can inspect it with `papio adapter captures`.
+2. A contributor supplies a capture reference, not guessed selectors. An agent
+   or maintainer turns that fixture into the declarative adapter spec and
+   observable tests.
+3. CI keeps the existing fixture-backed registry invariant: no adapter enters
+   the registry without captured evidence and matching classification/download
+   tests.
+
+There is deliberately no automatic upload, issue creation, telemetry, or
+community sharing. Sanitization removes secrets and unstable values; it does
+not prove that the remaining page text is appropriate to redistribute. A
+future `papio adapter contribute` command may prepare a minimal review bundle,
+but it must re-run the leak scanner, show the exact files and destination, let
+the operator remove page content, and require an explicit final publish action.
+
 ## Consequences
 
 Positive:

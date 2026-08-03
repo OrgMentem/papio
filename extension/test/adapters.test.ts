@@ -2157,3 +2157,31 @@ test.skipIf(clinicalKeyArticle === null)(
     expect(interpret(stripped, spec, ctx()).kind).not.toBe("article");
   },
 );
+
+
+const mdpiArticle = loadFixture("mdpi", "success");
+test.skipIf(mdpiArticle === null)(
+  "captured MDPI article classifies on its PDF metadata and download anchor",
+  () => {
+    const article = mdpiArticle as Document;
+    const spec = adapters.find((a) => a.id === "mdpi") as AdapterSpec;
+    const verdict = interpret(article, spec, ctx());
+    expect(verdict.kind).toBe("article");
+    expect(verdict.adapter_id).toBe("mdpi");
+    const rule = spec.download as DownloadRule;
+    expect(rule.method).toBe("href");
+    expect(article.querySelector(rule.selector)?.getAttribute("href")).toBe(
+      "/2227-7102/12/6/369/pdf",
+    );
+  },
+);
+
+test.skipIf(mdpiArticle === null)(
+  "an MDPI metadata shell without the provider download anchor stays assisted",
+  () => {
+    const article = (mdpiArticle as Document).cloneNode(true) as Document;
+    const spec = adapters.find((a) => a.id === "mdpi") as AdapterSpec;
+    for (const anchor of article.querySelectorAll("a.UD_ArticlePDF")) anchor.remove();
+    expect(interpret(article, spec, ctx()).kind).toBe("unknown");
+  },
+);

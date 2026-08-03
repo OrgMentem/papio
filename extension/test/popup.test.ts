@@ -18,6 +18,7 @@ import {
   refreshImpactSummary,
   renderInstitutionSession,
   renderNeedsAttention,
+  grantProviderAccess,
   renderDaemonStatus,
   renderImpactSummary,
   renderPageAcquire,
@@ -395,33 +396,56 @@ test("surfaces a blocked security check with a go-to-tab action", async () => {
 });
 
 
-test("surfaces each blocked provider host once and routes the remedy to Options", async () => {
+test("surfaces each blocked provider host once with a one-click grant", async () => {
   const doc = popupDocument();
-  let openedOptions = 0;
+  const granted: string[] = [];
   renderNeedsAttention(
     doc,
     [],
     ["journals.sagepub.com", "JOURNALS.SAGEPUB.COM", "www.sciencedirect.com"],
     async () => {},
-    async () => {
-      openedOptions += 1;
+    async () => {},
+    [],
+    async () => {},
+    async (host) => {
+      granted.push(host);
+      return true;
     },
   );
 
   const section = doc.getElementById("needs-you-section");
   expect(section?.hidden).toBe(false);
   expect(doc.getElementById("needs-you-heading")?.textContent).toBe("Allow provider access");
-  expect(doc.getElementById("needs-you-message")?.textContent).toContain("Grant all sources");
+  expect(doc.getElementById("needs-you-message")?.textContent).toContain("Grant the blocked source here");
   expect(Array.from(section?.querySelectorAll(".needs-you-paper") ?? []).map((item) => item.textContent)).toEqual([
     "journals.sagepub.com",
     "www.sciencedirect.com",
   ]);
-  const optionsButton = Array.from(section?.querySelectorAll("button") ?? []).find(
-    (button) => button.textContent === "Open Options",
-  ) as HTMLButtonElement;
-  optionsButton.click();
+  const buttons = Array.from(section?.querySelectorAll("button") ?? []) as HTMLButtonElement[];
+  expect(buttons.map((button) => button.textContent)).toEqual(["Allow", "Allow"]);
+  buttons[0]?.click();
   await Promise.resolve();
-  expect(openedOptions).toBe(1);
+  await Promise.resolve();
+  expect(granted).toEqual(["journals.sagepub.com"]);
+  expect(buttons[0]?.textContent).toBe("Allowed");
+});
+
+test("provider grant requests the exact normalized https origin and rejects paths", async () => {
+  const requested: unknown[] = [];
+  Object.assign(globalThis, {
+    chrome: {
+      permissions: {
+        request: async (permission: unknown) => {
+          requested.push(permission);
+          return true;
+        },
+      },
+    },
+  });
+
+  expect(await grantProviderAccess(" Journals.SAGEPUB.COM ")).toBe(true);
+  expect(await grantProviderAccess("journals.sagepub.com/redirect")).toBe(false);
+  expect(requested).toEqual([{ origins: ["https://journals.sagepub.com/*"] }]);
 });
 
 test("opens the singleton inbox through the broker when it acknowledges", async () => {

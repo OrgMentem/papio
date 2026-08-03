@@ -11,6 +11,22 @@ execution records in `notes/acquisition-stack-plan.md`.
 
 ## [Unreleased]
 
+### Changed
+
+- **Unsupported provider pages now become actionable instead of occupying a
+  browser-drive slot indefinitely.** A stable resolver landing outside the
+  capped provider list enters the same bounded evidence path. The extension
+  can send its existing sanitized diagnostic and `ui_changed` outcome; the
+  daemon creates a manual-download action that explicitly names the missing
+  adapter and whether local evidence was retained. A missing browser grant is
+  not terminal: the governed tab stays live and resumes after the operator
+  allows that exact provider origin.
+- **Provider-adapter evidence now has a documented contribution path.** The
+  guide starts with automatic local gap captures, `papio adapter captures`, and
+  `papio adapter diagnose`; it requires review and minimization before any
+  fixture is shared, then identifies the declarative spec and focused checks
+  needed for a code contribution.
+
 ## [0.17.0] - 2026-08-03
 
 ### Added

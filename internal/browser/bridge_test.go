@@ -2529,6 +2529,34 @@ func TestProviderOutcomeMappings(t *testing.T) {
 	}
 }
 
+func TestMissingAdapterOutcomeExplainsCaptureAndManualFallback(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	id := park(t, jobs, "wr_missing_adapter", handoffWork())
+	runSync(t, b, hello())
+	runSync(t, b, inFrame(t, protocol.MsgProviderOutcome, id, map[string]any{
+		"outcome": "ui_changed",
+		"detail": "No source-controlled adapter matched this provider page. " +
+			"A sanitized diagnostic was saved locally for adapter development.",
+	}))
+
+	actions, err := jobs.ListHumanActions(ctx, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, action := range actions {
+		if action.JobID == id && action.Kind == "manual_download" && action.Status == "open" {
+			want := "papio has no adapter for this provider yet; download the PDF yourself for now; " +
+				"a sanitized page diagnostic is saved locally; run 'papio adapter captures' to inspect it"
+			if action.Detail != want {
+				t.Fatalf("manual-download detail = %q, want %q", action.Detail, want)
+			}
+			return
+		}
+	}
+	t.Fatal("missing-adapter outcome did not open a manual-download action")
+}
+
 func TestProviderOutcomeRecordsAdapterDiagnostics(t *testing.T) {
 	for _, outcome := range []string{"wrong_work", "ui_changed"} {
 		t.Run(outcome, func(t *testing.T) {

@@ -1,6 +1,6 @@
 # Privacy policy
 
-_Last updated: 2026-07-25_
+_Last updated: 2026-08-04_
 
 *papio* is a **local** paper-acquisition tool. It runs on your own machine and, for
 the institutional handoff, inside your own browser. This policy covers both the
@@ -36,16 +36,23 @@ only to you — see [What is stored, and where](#what-is-stored-and-where).
   and tab state (via the `storage` API) so it can survive service-worker
   suspension and reconnect to the local app. This never leaves your browser.
 - **On your computer:** the *papio* application stores papers, metadata, and job
-+ records in its local data directory. Validated PDFs live in `artifacts/` and
-+ downloaded candidates awaiting validation live in `quarantine/`. Diagnostic page
- captures live in `<data_dir>/captures/<host>/` as sanitized HTML from the authenticated
- page in your browser session; they can still contain information visible on that page, so
- treat them as private local data. Captures are retained for 14 days and up to 10 per host
- by default (configurable in `[captures]`). Run `papio adapter captures purge`
-+ to remove every capture, or `papio adapter captures purge --host <host>` for one host.
-+ The extension no longer writes `~/Downloads/papio-fixtures/`; an existing directory
-+ there is safe to delete. These files stay on your machine (and papers go only to your
-+ own Zotero library if you enable that integration).
+  records in its local data directory. Validated PDFs live in `artifacts/` and
+  downloaded candidates awaiting validation live in `quarantine/`. Diagnostic page
+  captures live in `<data_dir>/captures/<host>/` as sanitized HTML from the authenticated
+  page in your browser session; they can still contain information visible on that page, so
+  treat them as private local data. Captures are retained for 14 days and up to 10 per host
+  by default (configurable in `[captures]`). Run `papio adapter captures purge`
+  to remove every capture, or `papio adapter captures purge --host <host>` for one host.
+  The extension no longer writes `~/Downloads/papio-fixtures/`; an existing directory
+  there is safe to delete. These files stay on your machine (and papers go only to your
+  own Zotero library if you enable that integration).
+- **Adapter evidence is local unless you explicitly share it.** Reaching a
+  provider that has no adapter can create a sanitized diagnostic capture, but
+  *papio* never uploads it, opens a public issue, or sends telemetry. Sanitized
+  HTML can still contain article text, account labels, or other page content.
+  Review and minimize a capture before contributing it; a future contribution
+  helper must show the exact files and destination and require a final publish
+  action.
 - **Acquisition-history and impact figures:** the numbers the extension shows you —
   papers acquired, an estimated time saved, success rate, weekly acquisition trend,
   access-route breakdown, and human-handoff rate — are aggregates computed locally

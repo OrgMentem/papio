@@ -913,12 +913,22 @@ function challengeBlocked(item: TriageSnapshotItem): boolean {
   );
 }
 
+function actionDetail(item: TriageSnapshotItem): string {
+  return item.facts.find((fact) => fact.label.toLowerCase() === "detail")?.text ?? "";
+}
+
+function missingAdapter(item: TriageSnapshotItem): boolean {
+  return item.action_kind === "manual_download" && /\bno adapter for this provider\b/i.test(actionDetail(item));
+}
+
 function guidanceText(item: TriageSnapshotItem, blockedByChallenge: boolean): string | null {
   if (item.kind !== "human_action") return null;
   if (blockedByChallenge) return "Solve the security check in its tab";
   switch (item.action_kind) {
     case "manual_download":
-      return "Download the PDF yourself - papio adopts it";
+      return missingAdapter(item)
+        ? "No adapter yet - download this PDF manually"
+        : "Download the PDF yourself - papio adopts it";
     case "openurl_handoff":
       return item.requires_auth === true
         ? "Sign in to your institution"
@@ -937,7 +947,9 @@ function mechanismText(item: TriageSnapshotItem, blockedByChallenge: boolean): s
   }
   switch (item.action_kind) {
     case "manual_download":
-      return "papio adopts PDFs saved to Downloads/papio/<job>. The toolbar button can also send an open PDF.";
+      return missingAdapter(item)
+        ? "A sanitized page diagnostic is saved locally; run papio adapter captures to find it. papio adopts PDFs saved to Downloads/papio/<job>."
+        : "papio adopts PDFs saved to Downloads/papio/<job>. The toolbar button can also send an open PDF.";
     case "openurl_handoff":
       return "A fresh link is generated each time you open this action. papio continues automatically after the handoff.";
     case "verify_identity":

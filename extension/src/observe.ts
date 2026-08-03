@@ -121,7 +121,8 @@ export function observeUnknown(
   host: string,
   context: ObservationCaptureContext,
   now: () => Date = () => new Date(),
-): Promise<void> {
+): Promise<boolean> {
+  let captured = false;
   const run = observationQueue.then(async () => {
     if (!job || !hostMatches(host, context.verifiedHosts)) return;
     const hostKey = observedHostKey(host);
@@ -197,7 +198,9 @@ export function observeUnknown(
     }
 
     try {
-      if (!(await api.sendPageCapture(encoded.payload, job.job_id))) {
+      if (await api.sendPageCapture(encoded.payload, job.job_id)) {
+        captured = true;
+      } else {
         console.warn("papio: observed page capture was not sent; skipping");
       }
     } catch (error) {
@@ -205,5 +208,5 @@ export function observeUnknown(
     }
   });
   observationQueue = run.catch(() => undefined);
-  return run;
+  return run.then(() => captured);
 }

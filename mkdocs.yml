@@ -102,6 +102,7 @@ nav:
       - MCP tools: reference/mcp-tools.md
       - Configuration: reference/config-reference.md
   - Contributing:
+      - Provider adapters: contributing/provider-adapters.md
       - Architecture decisions: contributing/architecture-decisions.md
   - Changelog:
       - Daemon & CLI: changelog/daemon.md

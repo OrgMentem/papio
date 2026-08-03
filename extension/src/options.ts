@@ -407,7 +407,7 @@ async function renderPermissionLists(reportAllSitesStillActive = false): Promise
   } catch {
     if (reportAllSitesStillActive) {
       setProviderPermissionNotice(
-        "Papio could not confirm that all-sites access was revoked. Turn it off with the All-sites access control above.",
+        "papio could not confirm that all-sites access was revoked. Turn it off with the All-sites access control above.",
       );
     }
     return;

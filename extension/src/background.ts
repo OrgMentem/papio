@@ -237,23 +237,23 @@ export function computeBadge(state: BadgeState): BadgeResult {
       ? Math.max(0, Math.trunc(state.triageCount))
       : undefined;
   if (state.connectionStatus !== "connected") {
-    return { text: "!", color: "#777777", tooltip: "Papio: daemon disconnected" };
+    return { text: "!", color: "#777777", tooltip: "papio: daemon disconnected" };
   }
   if (state.reauthNeeded) {
-    return { text: "!", color: "#b06000", tooltip: "Papio: institution sign-in needed" };
+    return { text: "!", color: "#b06000", tooltip: "papio: institution sign-in needed" };
   }
   if (authBlockerCount > 0) {
     return {
       text: String(authBlockerCount),
       color: "#b06000",
-      tooltip: `Papio: ${authBlockerCount} paper${authBlockerCount === 1 ? "" : "s"} waiting on your institution sign-in`,
+      tooltip: `papio: ${authBlockerCount} paper${authBlockerCount === 1 ? "" : "s"} waiting on your institution sign-in`,
     };
   }
   if (challengeBlockedCount > 0) {
     return {
       text: String(challengeBlockedCount),
       color: "#b06000",
-      tooltip: `Papio: ${challengeBlockedCount} security check${challengeBlockedCount === 1 ? "" : "s"} need your attention`,
+      tooltip: `papio: ${challengeBlockedCount} security check${challengeBlockedCount === 1 ? "" : "s"} need your attention`,
     };
   }
   if (blockedHostCount > 0) {
@@ -261,28 +261,28 @@ export function computeBadge(state: BadgeState): BadgeResult {
       typeof state.blockedHosts === "number" ? undefined : state.blockedHosts[0];
     const tooltip =
       blockedHostCount === 1 && typeof host === "string"
-        ? `Papio: ${host} needs browser access`
-        : `Papio: ${blockedHostCount} provider hosts need browser access`;
+        ? `papio: ${host} needs browser access`
+        : `papio: ${blockedHostCount} provider hosts need browser access`;
     return { text: String(blockedHostCount), color: "#b06000", tooltip };
   }
   if (resolverCount > 0) {
     return {
       text: String(resolverCount),
       color: "#1a73e8",
-      tooltip: `Papio: ${resolverCount} library resolver permission${resolverCount === 1 ? "" : "s"} need attention`,
+      tooltip: `papio: ${resolverCount} library resolver permission${resolverCount === 1 ? "" : "s"} need attention`,
     };
   }
   if (triageCount !== undefined && triageCount > 0) {
     return {
       text: String(triageCount),
       color: "#1a73e8",
-      tooltip: `Papio: ${triageCount} pending triage item${triageCount === 1 ? "" : "s"}`,
+      tooltip: `papio: ${triageCount} pending triage item${triageCount === 1 ? "" : "s"}`,
     };
   }
   return {
     text: "",
     color: "#1a73e8",
-    tooltip: triageCount === 0 ? "Papio: no pending triage items" : "Papio: connected",
+    tooltip: triageCount === 0 ? "papio: no pending triage items" : "papio: connected",
   };
 }
 export type BridgeSessionState = KeepaliveSnapshot & {
@@ -1463,8 +1463,8 @@ export class Bridge {
     }
   }
 
-  /** Remember the standing host-level blocker separately from the per-job
-   * daemon transition, so repeated pages do not create duplicate attention. */
+  /** Remember the standing host-level blocker and the exact governed job so
+   * repeated pages do not duplicate attention and a later grant can resume. */
   private async reportBlockedProviderHost(jobID: string, host: string): Promise<void> {
     if (!this.currentBlockedProviderHosts().includes(host)) {
       await this.update((store) => ({
@@ -1475,27 +1475,12 @@ export class Bridge {
     }
 
     const job = findByJob(this.store, jobID);
-    const outcomeKey = `${jobID}:ui_changed`;
-    if (job === undefined || this.handoffOutcomeSent.has(outcomeKey)) return;
-    this.handoffOutcomeSent.add(outcomeKey);
-    // The protocol has no browser-permission outcome. `ui_changed` is the
-    // existing terminal provider path that preserves manual recovery; this
-    // explicit detail prevents it from diagnosing an adapter that never ran.
-    if (
-      !this.send(
-        "provider_outcome",
-        {
-          outcome: "ui_changed",
-          detail: `Papio cannot read ${host}: browser access for this provider is not enabled. Open Papio Options and grant this source, or use Grant all sources.`,
-        },
-        jobID,
-      )
-    ) {
-      this.handoffOutcomeSent.delete(outcomeKey);
-      return;
+    if (job !== undefined && job.blocked_provider_host !== host) {
+      // Keep the governed tab and job live. The popup's user-gesture-bound
+      // permission grant can then resume this exact page instead of leaving a
+      // terminal manual-download action behind.
+      await this.update((store) => patchJob(store, jobID, { blocked_provider_host: host }));
     }
-    await this.update((store) => patchJob(store, jobID, { blocked_provider_host: host }));
-    await this.settleHandoffAfterOutcome(jobID);
   }
 
   private async clearBlockedProviderHost(host: string): Promise<boolean> {
@@ -1517,8 +1502,22 @@ export class Bridge {
    * host-level signal, so an Options-page grant clears it without a page reload. */
   async onPermissionsChanged(): Promise<void> {
     this.providerAccessByHost.clear();
+    const retryJobs = new Set<string>();
     for (const host of this.currentBlockedProviderHosts()) {
-      if ((await this.hasEffectiveProviderAccess(host)) === true) await this.clearBlockedProviderHost(host);
+      if ((await this.hasEffectiveProviderAccess(host)) !== true) continue;
+      for (const job of this.store.activeJobs) {
+        if (job.blocked_provider_host === host) retryJobs.add(job.job_id);
+      }
+      await this.clearBlockedProviderHost(host);
+    }
+    for (const jobID of retryJobs) {
+      try {
+        await this.reclassifyCurrentProviderPage(jobID, true);
+      } catch (error) {
+        // A tab can disappear between the browser permission callback and the
+        // retry. Normal tab-close recovery remains authoritative.
+        console.error("papio: provider access granted after its tab closed", error);
+      }
     }
     await this.syncConnectionBadge();
   }
@@ -4404,13 +4403,17 @@ export class Bridge {
         url: request.url,
         jobId: managedKey,
         purpose: "capture",
-        surfaceFallback: false,
+        surfaceFallback: true,
         focusExisting: false,
       });
       if (tabID === undefined) {
         reply("nav_failed", "could not open the provider page");
         return;
       }
+      // An explicit fixture-capture command may need a visible tab: heavy SPAs
+      // and consent managers routinely stop rendering in the minimized work
+      // window. The command itself is the operator's request to surface it.
+      await this.surfaceWorkTab(tabID);
       const load = this.waitForPageCaptureLoad(tabID);
       try {
         if ((await this.deps.tabs.get(tabID)).status === "complete") {
@@ -5310,6 +5313,13 @@ export class Bridge {
           return;
         }
       }
+      // A stable non-authentication landing outside the capped offer list is
+      // still the resolver's provider result. Give it the same bounded
+      // no-adapter evidence window instead of leaving a permanent spinner.
+      if (successfulLanding) {
+        await this.maybeClassify(job.job_id, host);
+        return;
+      }
       if (job.status !== "auth_pending" && !successfulLanding) {
         // Leaving every provider host for an IdP starts human authentication.
         // A completed non-IdP page is instead a usable resolver landing.
@@ -5644,8 +5654,45 @@ export class Bridge {
     if (job.status !== "accepted" && job.status !== "awaiting_download") return;
     const spec = this.deps.adapterSpecs.find((candidate) => hostMatches(host, candidate.hosts));
     if (!spec) {
-      await this.recordUnknown(job, host);
-      return; // no declarative adapter for this verified host
+      // Direct-PDF delivery does not need a page adapter. Otherwise verify that
+      // the extension can inspect this host, then give the page one bounded
+      // render window before declaring a durable coverage gap. Auth returns
+      // and provider SPAs can replace their document after the first complete
+      // event.
+      if (job.download_initiated === true || this.downloads.has(job.job_id)) return;
+      const access = await this.hasEffectiveProviderAccess(host);
+      if (access !== true) {
+        if (access === false) await this.reportBlockedProviderHost(jobID, host);
+        return;
+      }
+      if (await this.clearBlockedProviderHost(host)) await this.syncConnectionBadge();
+      const now = this.deps.now();
+      const firstUnknownAt = job.last_unknown_ms;
+      if (firstUnknownAt === undefined || now - firstUnknownAt < 5000) {
+        if (firstUnknownAt === undefined) {
+          await this.update((store) =>
+            patchJob(store, job.job_id, { unknown_count: 1, last_unknown_ms: now }),
+          );
+        }
+        this.scheduleClassifyRetry(job.job_id);
+        return;
+      }
+      const currentJob = findByJob(this.store, job.job_id);
+      if (currentJob === undefined) return;
+      const captured = await this.recordUnknown(currentJob, host);
+      const outcomeKey = `${job.job_id}:ui_changed`;
+      if (!this.handoffOutcomeSent.has(outcomeKey)) {
+        this.handoffOutcomeSent.add(outcomeKey);
+        const detail =
+          "No source-controlled adapter matched this provider page." +
+          (captured ? " A sanitized diagnostic was saved locally for adapter development." : "");
+        if (!this.send("provider_outcome", { outcome: "ui_changed", detail }, job.job_id)) {
+          this.handoffOutcomeSent.delete(outcomeKey);
+        } else {
+          await this.settleHandoffAfterOutcome(job.job_id);
+        }
+      }
+      return;
     }
     await this.restoreWorkWindowForAdapter(spec);
     const access = await this.hasEffectiveProviderAccess(host);
@@ -5857,11 +5904,11 @@ export class Bridge {
   }
 
 
-  private async reclassifyCurrentProviderPage(jobID: string): Promise<void> {
+  private async reclassifyCurrentProviderPage(jobID: string, allowUnregistered = false): Promise<void> {
     const job = findByJob(this.store, jobID);
     if (!job) return;
     const tab = await this.deps.tabs.get(job.tab_id);
-    if (tab.url === undefined) return;
+    if (tab.url === undefined || isAuthenticationURL(tab.url)) return;
     let host: string;
     try {
       host = new URL(tab.url).hostname;
@@ -5871,16 +5918,18 @@ export class Bridge {
     const onRegisteredProvider =
       hostMatches(host, job.provider_hosts) ||
       this.deps.adapterSpecs.some((candidate) => hostMatches(host, candidate.hosts));
-    if (!onRegisteredProvider) return;
+    const continuingUnregisteredLanding = allowUnregistered || job.last_unknown_ms !== undefined;
+    if (!onRegisteredProvider && !continuingUnregisteredLanding) return;
     await this.maybeClassify(jobID, host);
   }
 
-  /** Record a development capture for an unknown page without changing the
-   * assisted handoff semantics. */
-  private async recordUnknown(job: ActiveJob, host: string, adapter?: AdapterSpec): Promise<void> {
+  /** Record a development capture for an unknown page. The caller decides
+   * whether to remain assisted or report a terminal coverage gap. */
+  private async recordUnknown(job: ActiveJob, host: string, adapter?: AdapterSpec): Promise<boolean> {
+    let captured = false;
     const captureStorage = this.deps.captureStorage;
     if (captureStorage !== undefined && this.pageCaptureAvailable()) {
-      await observeUnknown(
+      captured = await observeUnknown(
         {
           scripting: this.deps.scripting as ObserveChromeApi["scripting"],
           storage: captureStorage,
@@ -5889,7 +5938,10 @@ export class Bridge {
         job,
         host,
         {
-          verifiedHosts: adapter === undefined ? job.provider_hosts : [...job.provider_hosts, ...adapter.hosts],
+          verifiedHosts:
+            adapter === undefined
+              ? [...job.provider_hosts, host]
+              : [...job.provider_hosts, ...adapter.hosts],
           ...(adapter === undefined
             ? {}
             : { adapterID: adapter.id, adapterVersion: adapter.version }),
@@ -5897,7 +5949,7 @@ export class Bridge {
         () => new Date(this.deps.now()),
       );
     }
-    if (adapter === undefined) return;
+    if (adapter === undefined) return captured;
     const now = this.deps.now();
     const count = job.unknown_count ?? 0;
     const last = job.last_unknown_ms ?? 0;
@@ -5918,6 +5970,7 @@ export class Bridge {
     } else if (count === 0) {
       await this.update((s) => patchJob(s, job.job_id, { unknown_count: 1, last_unknown_ms: now }));
     }
+    return captured;
   }
 
   /** Map a page verdict to a bridge action. See the safety contract: at most one

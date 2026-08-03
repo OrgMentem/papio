@@ -1162,6 +1162,66 @@ test("a resolver no-service route stays assisted without an outcome", async () =
   expect(h.frames().some((frame) => frame.type === "auth_pending")).toBe(false);
 });
 
+test("an unregistered provider captures evidence and exits with a missing-adapter outcome", async () => {
+  const h = makeHarness();
+  h.deps.permissions.contains = async () => true;
+  const stored: Record<string, unknown> = {};
+  h.deps.captureStorage = {
+    local: {
+      get: async (key) => ({ [key]: stored[key] }),
+      set: async (items) => {
+        Object.assign(stored, items);
+      },
+    },
+  };
+  h.deps.scripting.executeScript = async (injection) => {
+    if (injection.func === capturePage) {
+      return [{
+        result: {
+          html: "<main class=\"article\">unsupported provider shape</main>",
+          origin: `https://${PROVIDER_HOST}`,
+          path: "/stable/article",
+        },
+      }];
+    }
+    return [];
+  };
+
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["page_capture_v1"] }));
+  await h.port.inbound(jobOfferForHosts("job_missing_adapter", ["resolver.example.edu"]));
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  const articleURL = `https://${PROVIDER_HOST}/stable/article`;
+  h.tabs.live.set(tabID, { id: tabID, url: articleURL });
+  let nextTimer = h.timers.length;
+  await h.tabs.onUpdated.emit(
+    tabID,
+    { url: articleURL, status: "complete" },
+    { id: tabID, url: articleURL },
+  );
+  
+  for (let retry = 0; retry < 2; retry += 1) {
+    const relative = h.timers.slice(nextTimer).findIndex((timer) => timer.ms === 2_500);
+    expect(relative).toBeGreaterThanOrEqual(0);
+    nextTimer += relative;
+    const timer = h.timers[nextTimer]!;
+    nextTimer += 1;
+    h.clock.now += 2_500;
+    await timer.fn();
+  }
+
+  expect(h.frames().filter((frame) => frame.type === "page_capture")).toHaveLength(1);
+  const outcomes = h.frames().filter((frame) => frame.type === "provider_outcome");
+  expect(outcomes).toHaveLength(1);
+  expect(outcomes[0]?.payload).toMatchObject({
+    outcome: "ui_changed",
+    detail:
+      "No source-controlled adapter matched this provider page. " +
+      "A sanitized diagnostic was saved locally for adapter development.",
+  });
+  expect(h.backend.store.activeJobs).toHaveLength(0);
+});
+
 test("a registry-only adapter host classifies and emits an observed capture", async () => {
   // The offer list is capped while the source-controlled adapter registry is not;
   // capture must use the same verified-host decision as classification.
@@ -1255,11 +1315,12 @@ test("all-sites browser access counts as effective provider access", async () =>
   expect(h.backend.store.blockedProviderHosts).toBeUndefined();
 });
 
-test("missing provider access reports the exact host instead of a bare adapter failure", async () => {
+test("missing provider access stays actionable and resumes the exact tab after grant", async () => {
   const h = makeHarness();
   h.deps.adapterSpecs.push(PROVIDER_ADAPTER);
   const injections: Parameters<BridgeDeps["scripting"]["executeScript"]>[0][] = [];
-  h.deps.permissions.contains = async () => false;
+  let granted = false;
+  h.deps.permissions.contains = async () => granted;
   h.deps.scripting.executeScript = async (injection) => {
     injections.push(injection);
     return [];
@@ -1270,22 +1331,26 @@ test("missing provider access reports the exact host instead of a bare adapter f
   await h.port.inbound(jobOffer("job_missing_provider_access"));
   const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
   const articleURL = `https://${PROVIDER_HOST}/stable/article`;
+  h.tabs.live.set(tabID, { id: tabID, url: articleURL });
   await h.tabs.onUpdated.emit(
     tabID,
     { url: articleURL, status: "complete" },
     { id: tabID, url: articleURL },
   );
 
-  const outcomes = h.frames().filter((frame) => frame.type === "provider_outcome");
-  expect(outcomes).toHaveLength(1);
-  expect(outcomes[0]?.payload["outcome"]).toBe("ui_changed");
-  expect(outcomes[0]?.payload["detail"]).toContain(PROVIDER_HOST);
-  expect(outcomes[0]?.payload["detail"]).toContain("Open Papio Options");
-  expect(outcomes[0]?.payload["adapter_version"]).toBeUndefined();
+  expect(h.frames().filter((frame) => frame.type === "provider_outcome")).toHaveLength(0);
+  expect(h.backend.store.activeJobs).toHaveLength(1);
+  expect(h.backend.store.activeJobs[0]?.blocked_provider_host).toBe(PROVIDER_HOST);
   expect(injections).toEqual([]);
   expect(h.backend.store.blockedProviderHosts).toEqual([PROVIDER_HOST]);
   expect(h.action.backgroundColors.at(-1)).toBe("#b06000");
   expect(h.action.titles.at(-1)).toContain(PROVIDER_HOST);
+
+  granted = true;
+  await h.bridge.onPermissionsChanged();
+  expect(injections.some((injection) => injection.func === interpret)).toBe(true);
+  expect(h.backend.store.blockedProviderHosts).toEqual([]);
+  expect(h.backend.store.activeJobs[0]?.blocked_provider_host).toBeUndefined();
 });
 
 test("one blocked provider host stays a single indication across repeated updates", async () => {
@@ -1311,7 +1376,7 @@ test("one blocked provider host stays a single indication across repeated update
   }
 
   expect(permissionChecks).toBe(1);
-  expect(h.frames().filter((frame) => frame.type === "provider_outcome")).toHaveLength(1);
+  expect(h.frames().filter((frame) => frame.type === "provider_outcome")).toHaveLength(0);
   expect(h.backend.store.blockedProviderHosts).toEqual([PROVIDER_HOST]);
   expect(h.action.titles.filter((title) => title.includes(PROVIDER_HOST))).toHaveLength(1);
 });
@@ -1331,7 +1396,7 @@ test("a stored provider blocker remains visible until effective access changes",
   granted = true;
   await h.bridge.onPermissionsChanged();
   expect(h.backend.store.blockedProviderHosts).toEqual([]);
-  expect(h.action.titles.at(-1)).toBe("Papio: connected");
+  expect(h.action.titles.at(-1)).toBe("papio: connected");
 });
 
 test("Cloudflare challenge detection survives the observed marker sanitization", () => {
@@ -2973,8 +3038,8 @@ test("popup capture relay emits page_capture only after the daemon advertises it
   expect(h.downloads.started).toHaveLength(0);
 });
 
-test("page capture request opens a ledgered managed tab, captures, reports, and closes", async () => {
-  const h = makeHarness(undefined, { handoffSurface: "in-window" });
+test("page capture request visibly opens a ledgered managed tab, captures, reports, and closes", async () => {
+  const h = makeHarness(undefined, { windows: true, handoffSurface: "work-window" });
   let ledger: Record<string, number> = {};
   h.deps.tabLedger = {
     load: async () => ({ ...ledger }),
@@ -3012,9 +3077,19 @@ test("page capture request opens a ledgered managed tab, captures, reports, and 
   for (let attempt = 0; attempt < 20 && h.tabs.created.length === 0; attempt += 1) {
     await Promise.resolve();
   }
-  expect(h.tabs.created).toEqual([
-    { url: "https://www.jstor.org/stable/123", active: false },
+  for (let attempt = 0; attempt < 100 && (h.windows?.updated.length ?? 0) === 0; attempt += 1) {
+    await Promise.resolve();
+  }
+  expect(h.windows?.created).toEqual([
+    { url: "https://www.jstor.org/stable/123", focused: false, state: "minimized" },
   ]);
+  expect(h.tabs.created).toEqual([
+    { url: "https://www.jstor.org/stable/123", active: false, windowId: 500 },
+  ]);
+  expect(h.windows?.updated).toContainEqual({
+    windowID: 500,
+    props: { focused: true, drawAttention: true, state: "normal" },
+  });
   const tabID = h.tabs.live.keys().next().value as number;
   for (let attempt = 0; attempt < 20 && ledger[String(tabID)] === undefined; attempt += 1) {
     await Promise.resolve();
@@ -3809,7 +3884,7 @@ test("heartbeat counts obey disconnected, sign-in, permission, then pending badg
   await h.tabs.onUpdated.emit(tabID, { url: idpURL }, { id: tabID, url: idpURL });
   expect(h.action.texts.at(-1)).toBe("1");
   expect(h.action.backgroundColors.at(-1)).toBe("#b06000");
-  expect(h.action.titles.at(-1)).toBe("Papio: 1 paper waiting on your institution sign-in");
+  expect(h.action.titles.at(-1)).toBe("papio: 1 paper waiting on your institution sign-in");
 
   const refresh = h.alarms.onAlarm.emit({ name: "papio-keepalive" });
   await Promise.resolve();
@@ -3824,27 +3899,28 @@ test("heartbeat counts obey disconnected, sign-in, permission, then pending badg
   );
   await refresh;
   expect(h.action.texts.at(-1)).toBe("1");
-  expect(h.action.titles.at(-1)).toBe("Papio: 1 paper waiting on your institution sign-in");
+  expect(h.action.titles.at(-1)).toBe("papio: 1 paper waiting on your institution sign-in");
 
   h.deps.permissions.contains = async () => false;
   await h.bridge.syncConnectionBadge();
   expect(h.action.texts.at(-1)).toBe("1");
-  expect(h.action.titles.at(-1)).toBe("Papio: 1 paper waiting on your institution sign-in");
+  expect(h.action.titles.at(-1)).toBe("papio: 1 paper waiting on your institution sign-in");
 
   h.deps.permissions.contains = async () => true;
   const providerURL = `https://${PROVIDER_HOST}/stable/returned`;
   await h.tabs.onUpdated.emit(tabID, { url: providerURL, status: "complete" }, { id: tabID, url: providerURL });
   expect(h.action.texts.at(-1)).toBe("4");
   expect(h.action.backgroundColors.at(-1)).toBe("#1a73e8");
-  expect(h.action.titles.at(-1)).toBe("Papio: 4 pending triage items");
+  expect(h.action.titles.at(-1)).toBe("papio: 4 pending triage items");
 
   await h.port.emitDisconnect();
   expect(h.action.texts.at(-1)).toBe("!");
-  expect(h.action.titles.at(-1)).toBe("Papio: daemon disconnected");
+  expect(h.action.titles.at(-1)).toBe("papio: daemon disconnected");
 });
 
 test("the sign-in badge clears when a handoff returns to its provider", async () => {
   const h = makeHarness();
+  h.deps.permissions.contains = async () => true;
   await h.bridge.start();
   await h.port.inbound(helloAck());
   await h.port.inbound(jobOffer("job_badge_auth_return"));
@@ -3857,7 +3933,7 @@ test("the sign-in badge clears when a handoff returns to its provider", async ()
   await h.tabs.onUpdated.emit(tabID, { url: providerURL, status: "complete" }, { id: tabID, url: providerURL });
 
   expect(h.action.texts.at(-1)).toBe("");
-  expect(h.action.titles.at(-1)).toBe("Papio: connected");
+  expect(h.action.titles.at(-1)).toBe("papio: connected");
 });
 
 test("inbound native handlers finish in receipt order across asynchronous awaits", async () => {

@@ -86,10 +86,11 @@ test("unknown tracked provider page emits one sanitized observed page_capture fr
   const fake = fakeChrome(pageFor(host));
   const capturedAt = "2026-07-15T10:11:12.000Z";
 
-  await observeUnknown(fake.api, jobFor(host), host, verifiedHosts(host), fixedNow(capturedAt));
+  const captured = await observeUnknown(fake.api, jobFor(host), host, verifiedHosts(host), fixedNow(capturedAt));
 
   expect(fake.injections).toEqual([{ tabId: 17 }]);
   expect(fake.sent).toHaveLength(1);
+  expect(captured).toBe(true);
   const emitted = fake.sent[0];
   expect(emitted?.jobID).toBe("job_capture_17");
   expect(emitted?.payload).toMatchObject({
@@ -177,8 +178,14 @@ test("untracked and unverified pages are never injected or emitted", async () =>
   const providerHost = "www.jstor.org";
   const fake = fakeChrome(pageFor(providerHost));
 
-  await observeUnknown(fake.api, undefined, providerHost, verifiedHosts(providerHost), fixedNow("2026-07-15T10:00:00.000Z"));
-  await observeUnknown(
+  const untracked = await observeUnknown(
+    fake.api,
+    undefined,
+    providerHost,
+    verifiedHosts(providerHost),
+    fixedNow("2026-07-15T10:00:00.000Z"),
+  );
+  const unverified = await observeUnknown(
     fake.api,
     jobFor(providerHost),
     "login.example.edu",
@@ -188,6 +195,8 @@ test("untracked and unverified pages are never injected or emitted", async () =>
 
   expect(fake.injections).toHaveLength(0);
   expect(fake.sent).toHaveLength(0);
+  expect(untracked).toBe(false);
+  expect(unverified).toBe(false);
   expect(fake.stored[RATE_KEY]).toBeUndefined();
 });
 
@@ -199,7 +208,15 @@ test("a residual leak refuses the observed bridge frame", async () => {
   const warn = console.warn;
   console.warn = () => undefined;
   try {
-    await observeUnknown(fake.api, jobFor(host), host, verifiedHosts(host), fixedNow("2026-07-15T10:00:00.000Z"));
+    expect(
+      await observeUnknown(
+        fake.api,
+        jobFor(host),
+        host,
+        verifiedHosts(host),
+        fixedNow("2026-07-15T10:00:00.000Z"),
+      ),
+    ).toBe(false);
   } finally {
     console.warn = warn;
   }
