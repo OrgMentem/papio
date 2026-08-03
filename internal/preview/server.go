@@ -561,61 +561,234 @@ var shellTemplate = template.Must(template.New("preview").Parse(`<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>PDF identity review</title>
+<title>PDF identity review — papio</title>
 <link rel="stylesheet" href="{{.StylePath}}">
 </head>
 <body>
-<header>
+<header class="review-bar">
+<span class="brand-name" aria-label="papio"><em>papio</em></span>
+<div class="review-copy">
 {{if .Recorded}}
-<p class="recorded" role="status">Recorded — you can close this tab.</p>
-<div class="actions"><button disabled>Yes, correct file</button><button disabled>No, wrong file</button></div>
+<p class="confirmation" role="status"><span class="check" aria-hidden="true">✓</span><span class="confirmation-copy">Recorded — review complete</span></p>
+<p id="status">You can close this tab.</p>
 {{else}}
-<p>{{.Question}}</p>
-<div class="actions"><button type="button" data-verdict="accept">Yes, correct file</button><button type="button" data-verdict="reject">No, wrong file</button></div>
+<p class="question">{{.Question}}</p>
 <p id="status" role="status" aria-live="polite"></p>
 {{end}}
+</div>
+<div class="actions">
+{{if .Recorded}}
+<button class="primary" disabled>Yes, correct file</button><button disabled>No, wrong file</button>
+{{else}}
+<button class="primary" type="button" data-verdict="accept">Yes, correct file</button><button type="button" data-verdict="reject">No, wrong file</button>
+{{end}}
+</div>
 </header>
-{{if not .Recorded}}<embed src="{{.FilePath}}" type="application/pdf" title="Quarantined PDF preview">{{end}}
-{{if not .Recorded}}<script src="{{.ScriptPath}}" defer></script>{{end}}
+{{if .Recorded}}
+<main id="preview-area" class="preview-area preview-area--muted"><div class="fallback-panel">Review recorded. This preview is no longer interactive.</div></main>
+{{else}}
+<main id="preview-area" class="preview-area"><embed src="{{.FilePath}}" type="application/pdf" title="Quarantined PDF preview"></main>
+<script src="{{.ScriptPath}}" defer></script>
+{{end}}
 </body>
 </html>
 `))
 
 const previewScript = `(() => {
   const buttons = Array.from(document.querySelectorAll('[data-verdict]'));
-  const status = document.getElementById('status');
+  const reviewCopy = document.querySelector('.review-copy');
+  const previewArea = document.getElementById('preview-area');
   const setDisabled = disabled => buttons.forEach(button => { button.disabled = disabled; });
+
+  const showMessage = (message, hint, recorded) => {
+    const lead = document.createElement('p');
+    lead.className = recorded ? 'confirmation' : 'error';
+    lead.setAttribute('role', 'status');
+    if (recorded) {
+      const check = document.createElement('span');
+      check.className = 'check';
+      check.setAttribute('aria-hidden', 'true');
+      check.textContent = '✓';
+      lead.append(check);
+    }
+    const copy = document.createElement('span');
+    copy.className = 'confirmation-copy';
+    copy.textContent = message;
+    lead.append(copy);
+    const status = document.createElement('p');
+    status.id = 'status';
+    status.textContent = hint;
+    reviewCopy.replaceChildren(lead, status);
+  };
+
+  const responseMessage = async response => {
+    const body = (await response.text()).trim();
+    if (!body) return 'Could not record the verdict.';
+    if (response.headers.get('Content-Type')?.startsWith('text/html')) {
+      const document = new DOMParser().parseFromString(body, 'text/html');
+      return document.querySelector('.confirmation-copy')?.textContent?.trim() || 'Could not record the verdict.';
+    }
+    return body;
+  };
+
+  const showBlockedClose = () => {
+    const status = document.getElementById('status');
+    if (status) status.textContent = 'You can close this tab.';
+    previewArea.classList.add('preview-area--muted');
+    if (!previewArea.querySelector('.fallback-panel')) {
+      const panel = document.createElement('div');
+      panel.className = 'fallback-panel';
+      panel.textContent = 'Review recorded. This preview can now be closed.';
+      previewArea.append(panel);
+    }
+  };
+
   buttons.forEach(button => button.addEventListener('click', async () => {
+    const originalLabel = button.textContent;
     setDisabled(true);
-    status.textContent = 'Recording…';
+    button.textContent = 'Recording…';
     try {
       const response = await fetch(location.pathname + '/verdict', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({verdict: button.dataset.verdict})
       });
-      if (response.ok || response.status === 409) {
-        location.reload();
+      if (response.ok) {
+        const phrase = button.dataset.verdict === 'accept' ? 'marked correct' : 'marked wrong file';
+        button.textContent = originalLabel;
+        showMessage('Recorded — ' + phrase, 'Closing this tab…', true);
+        setTimeout(() => {
+          window.close();
+          setTimeout(showBlockedClose, 600);
+        }, 1200);
         return;
       }
-      status.textContent = response.status === 425 ? 'Wait for the PDF to load, then try again.' : 'Could not record the verdict. Try again.';
+      const message = await responseMessage(response);
+      button.textContent = originalLabel;
+      showMessage(message, response.status === 409 ? 'You can close this tab.' : '', response.status === 409);
     } catch (_) {
-      status.textContent = 'Could not record the verdict. Try again.';
+      button.textContent = originalLabel;
+      showMessage('Could not record the verdict.', '', false);
     }
-    setDisabled(false);
   }));
 })();
 `
 
 const previewStyle = `
-:root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+:root {
+  color-scheme: light;
+  --color-ink: #182231;
+  --color-brand-ink: #2b2d42;
+  --color-brand-accent: #d94f3d;
+  --color-muted: #607080;
+  --color-border: #dce3ea;
+  --color-control-border: #b8c5d1;
+  --color-page: #f4f7f9;
+  --color-surface: #fdfefe;
+  --color-surface-hover: #eef3f6;
+  --color-primary: #12549b;
+  --color-primary-border: #8db9eb;
+  --color-primary-surface: #eaf3ff;
+  --color-primary-hover: #dcecff;
+  --color-on-primary: #fdfefe;
+  --radius-control: 6px;
+  --radius-card: 8px;
+  color: var(--color-ink);
+  font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
 * { box-sizing: border-box; }
-html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; }
-header { position: fixed; inset: 0 0 auto 0; height: 4.5rem; z-index: 1; display: flex; align-items: center; gap: 1rem; padding: .65rem 1rem; background: Canvas; border-bottom: 1px solid GrayText; }
-header p { margin: 0; min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
-.actions { display: flex; flex: none; gap: .6rem; }
-button { padding: .55rem .8rem; font: inherit; }
-embed { position: fixed; inset: 4.5rem 0 0 0; width: 100%; height: calc(100% - 4.5rem); border: 0; }
-.recorded { text-align: center; }
-#status { max-width: 18rem; font-size: .85rem; font-weight: 400; }
+html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; background: var(--color-page); }
+.review-bar {
+  position: fixed;
+  inset: 0 0 auto 0;
+  z-index: 2;
+  min-height: 4.75rem;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 1rem;
+  padding: .65rem 1rem;
+  background: var(--color-surface);
+  border-bottom: 1px solid var(--color-border);
+}
+.brand-name {
+  color: var(--color-brand-ink);
+  font-size: 1.375rem;
+  font-weight: 700;
+  letter-spacing: .01em;
+  line-height: 1.2;
+}
+.brand-name em {
+  text-decoration-color: var(--color-brand-accent);
+  text-decoration-line: underline;
+  text-decoration-thickness: 2px;
+  text-underline-offset: 4px;
+}
+.review-copy { min-width: 0; }
+.review-copy p { margin: 0; }
+.question {
+  overflow: hidden;
+  color: var(--color-ink);
+  font-size: .875rem;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+#status {
+  min-height: 1rem;
+  margin-top: .15rem;
+  color: var(--color-muted);
+  font-size: .75rem;
+  line-height: 1.25;
+}
+.actions { display: flex; flex: none; gap: .5rem; }
+button {
+  appearance: none;
+  min-height: 36px;
+  padding: 4px 12px;
+  border: 1px solid var(--color-control-border);
+  border-radius: var(--radius-control);
+  background: var(--color-surface);
+  color: var(--color-ink);
+  cursor: pointer;
+  font: inherit;
+  font-size: .75rem;
+  white-space: nowrap;
+}
+button:hover:not(:disabled) { background: var(--color-surface-hover); }
+button:focus-visible { outline: 2px solid var(--color-primary); outline-offset: 2px; }
+button:disabled { cursor: not-allowed; opacity: .55; }
+button.primary {
+  border-color: var(--color-primary);
+  background: var(--color-primary);
+  color: var(--color-on-primary);
+}
+button.primary:hover:not(:disabled) {
+  border-color: var(--color-primary-hover);
+  background: var(--color-primary-hover);
+  color: var(--color-ink);
+}
+.confirmation { display: flex; align-items: center; gap: .45rem; color: var(--color-ink); font-size: .875rem; font-weight: 650; }
+.check { flex: none; color: var(--color-brand-accent); font-size: 1.1rem; font-weight: 800; }
+.error { color: var(--color-brand-accent); font-size: .875rem; font-weight: 650; }
+.preview-area {
+  position: fixed;
+  inset: 4.75rem 0 0 0;
+  background: var(--color-page);
+}
+.preview-area embed { width: 100%; height: 100%; border: 0; transition: opacity 180ms ease-out; }
+.preview-area--muted embed { opacity: .12; pointer-events: none; }
+.fallback-panel {
+  position: absolute;
+  inset: 1rem;
+  z-index: 1;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-card);
+  background: var(--color-primary-surface);
+  color: var(--color-muted);
+  font-size: .875rem;
+  text-align: center;
+}
 `

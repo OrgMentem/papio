@@ -67,10 +67,11 @@ func TestIssueServesCitationShellWithBoundPDFEmbed(t *testing.T) {
 		t.Fatalf("token length = %d, want 43 for 256 random bits in raw base64url", len(token))
 	}
 	for _, want := range []string{
+		`<span class="brand-name" aria-label="papio"><em>papio</em></span>`,
 		"Is this “A Useful Paper” (Ada Lovelace, Grace Hopper, 2026)?",
 		`src="/p/` + token + `/file"`,
-		">Yes, correct file</button>",
-		">No, wrong file</button>",
+		`class="primary" type="button" data-verdict="accept">Yes, correct file</button>`,
+		`data-verdict="reject">No, wrong file</button>`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("shell missing %q:\n%s", want, body)
@@ -88,6 +89,51 @@ func TestIssueServesCitationShellWithBoundPDFEmbed(t *testing.T) {
 	if strings.Contains(body, "<script>") {
 		t.Fatal("shell contained an inline script")
 	}
+
+	styleResponse, style := getResponse(t, capabilityURL+"/style.css")
+	defer styleResponse.Body.Close()
+	if styleResponse.StatusCode != http.StatusOK {
+		t.Fatalf("style status = %d, want %d", styleResponse.StatusCode, http.StatusOK)
+	}
+	for _, want := range []string{
+		"--color-ink: #182231",
+		"--color-brand-ink: #2b2d42",
+		"--color-brand-accent: #d94f3d",
+		"--color-muted: #607080",
+		"--color-border: #dce3ea",
+		"--color-page: #f4f7f9",
+		"--color-surface: #fdfefe",
+		"--color-primary: #12549b",
+		"--color-primary-surface: #eaf3ff",
+		"--color-primary-border: #8db9eb",
+		"font-family: ui-sans-serif, system-ui",
+		"white-space: nowrap",
+	} {
+		if !strings.Contains(style, want) {
+			t.Fatalf("style missing %q:\n%s", want, style)
+		}
+	}
+
+	scriptResponse, script := getResponse(t, capabilityURL+"/script.js")
+	defer scriptResponse.Body.Close()
+	if scriptResponse.StatusCode != http.StatusOK {
+		t.Fatalf("script status = %d, want %d", scriptResponse.StatusCode, http.StatusOK)
+	}
+	for _, want := range []string{
+		"button.textContent = 'Recording…'",
+		"'marked correct'",
+		"'marked wrong file'",
+		"'Closing this tab…'",
+		"window.close()",
+		"setTimeout(showBlockedClose, 600)",
+		"'You can close this tab.'",
+		"'Review recorded. This preview can now be closed.'",
+		"await response.text()",
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("script missing %q:\n%s", want, script)
+		}
+	}
 }
 
 func TestAcceptVerdictResolvesReviewExactlyOnceAndRecordsCapability(t *testing.T) {
@@ -101,7 +147,7 @@ func TestAcceptVerdictResolvesReviewExactlyOnceAndRecordsCapability(t *testing.T
 
 	response, body := postVerdict(t, capabilityURL, "accept")
 	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK || !strings.Contains(body, "Recorded — you can close this tab") {
+	if response.StatusCode != http.StatusOK || !strings.Contains(body, "Recorded — review complete") || !strings.Contains(body, "You can close this tab.") {
 		t.Fatalf("accept response = %d %q", response.StatusCode, body)
 	}
 	calls := resolver.inputs()
@@ -114,7 +160,7 @@ func TestAcceptVerdictResolvesReviewExactlyOnceAndRecordsCapability(t *testing.T
 
 	second, secondBody := postVerdict(t, capabilityURL, "reject")
 	defer second.Body.Close()
-	if second.StatusCode != http.StatusConflict || !strings.Contains(secondBody, "Recorded — you can close this tab") {
+	if second.StatusCode != http.StatusConflict || !strings.Contains(secondBody, "Recorded — review complete") || !strings.Contains(secondBody, "You can close this tab.") {
 		t.Fatalf("second response = %d %q", second.StatusCode, secondBody)
 	}
 	if calls := resolver.inputs(); len(calls) != 1 {
@@ -123,7 +169,7 @@ func TestAcceptVerdictResolvesReviewExactlyOnceAndRecordsCapability(t *testing.T
 
 	rendered, renderedBody := getResponse(t, capabilityURL)
 	defer rendered.Body.Close()
-	if rendered.StatusCode != http.StatusOK || !strings.Contains(renderedBody, "Recorded — you can close this tab") || !strings.Contains(renderedBody, "disabled") {
+	if rendered.StatusCode != http.StatusOK || !strings.Contains(renderedBody, "Recorded — review complete") || !strings.Contains(renderedBody, "You can close this tab.") || !strings.Contains(renderedBody, "disabled") || !strings.Contains(renderedBody, "fallback-panel") {
 		t.Fatalf("recorded shell = %d %q", rendered.StatusCode, renderedBody)
 	}
 }
@@ -138,7 +184,7 @@ func TestRejectVerdictUsesReviewResolutionPath(t *testing.T) {
 
 	response, body := postVerdict(t, capabilityURL, "reject")
 	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK || !strings.Contains(body, "Recorded — you can close this tab") {
+	if response.StatusCode != http.StatusOK || !strings.Contains(body, "Recorded — review complete") {
 		t.Fatalf("reject response = %d %q", response.StatusCode, body)
 	}
 	calls := resolver.inputs()
