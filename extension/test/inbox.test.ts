@@ -1067,3 +1067,25 @@ test("challenge-blocked rows show one concise action and hide the mechanism", as
     "papio resumes automatically after you solve the security check.",
   );
 });
+
+test("tab labels carry daemon totals, not the loaded page size", async () => {
+  const fixture = snapshot([manualAction("action:paged", 1, "First of many")], {
+    counts: counts({ pending_total: 119, actions: 109, watch_hits: 5, retractions: 5 }),
+    has_more: true,
+  });
+  const page = await inboxDocument((message) => snapshotReply(fixture, message));
+  expect(page.document.getElementById("actions-tab")?.textContent).toBe("Actions (114)");
+  expect(page.document.getElementById("watch-tab")?.textContent).toBe("Watch hits (5)");
+});
+
+test("an empty watch panel renders without the snapshot's Load more control", async () => {
+  const fixture = snapshot([manualAction("action:only", 1, "Only actions here")], {
+    counts: counts({ pending_total: 1, actions: 1, watch_hits: 0, retractions: 0 }),
+    has_more: true,
+  });
+  const page = await inboxDocument((message) => snapshotReply(fixture, message));
+  expect(page.document.getElementById("load-more")?.hidden).toBe(false);
+  (page.document.getElementById("watch-tab") as HTMLButtonElement).click();
+  expect(page.document.getElementById("watch-panel")?.hidden).toBe(false);
+  expect(page.document.getElementById("load-more")?.hidden).toBe(true);
+});

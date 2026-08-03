@@ -331,18 +331,22 @@ export const adapters: AdapterSpec[] = [
       "https://shibboleth-sp.prod.proquest.com/Shibboleth.sso/DS?entityID={entityID}&target=https://shibboleth-sp.prod.proquest.com/ONE_SEARCH/PRODWWW",
   },
   {
-    // Captured 2026-08-03 from the institutionally entitled JSTOR stable/20183234 page
-    // (fixtures/jstor/success.html). The page renders the PDF in its viewer and
-    // exposes the download only as a custom-element control: there is no
-    // citation_pdf_url/meta, anchor href, or embedded PDF URL to fetch. Keep
-    // classification tied to the primary PDF control (secondary recommendation
-    // controls use the same data-qa/data-doi shape) and invoke that control
-    // instead of synthesizing /stable/pdf/<id>.pdf, which can return a terms or
-    // viewer HTML interstitial rather than the PDF. A terms modal may appear
-    // after this click; the terms rule remains first so the consented
-    // termsAccept path can handle it, otherwise the page stays assisted.
+    // Captured 2026-08-03 from institutionally entitled JSTOR pages: the stable/ viewer
+    // (fixtures/jstor/success.html) and the article record page
+    // (fixtures/jstor/record.html, stable/45277272). Both render the same
+    // primary control (data-qa='download-pdf', data-doi, data-sc='but
+    // click:pdf download', variant='primary') but wire it differently: the
+    // viewer downloads on click while the record page calls window.open with
+    // ?acceptTC=1 — and a programmatic adapter click carries no user gesture,
+    // so Chrome's popup blocker eats it (live field report 2026-08-03). The
+    // download therefore derives the direct endpoint from the tab URL and
+    // fetches it with the privileged downloads API (cookie-authenticated, no
+    // popup, no gesture). acceptTC=1 IS JSTOR's terms acceptance — the bare
+    // endpoint returns a terms interstitial (verified 2026-07) — so the rule
+    // is consent-gated: without recorded auto-accept consent the page stays
+    // assisted and the human clicks through the terms modal themselves.
     id: "jstor",
-    version: "0.2.0",
+    version: "0.3.0",
     hosts: ["jstor.org"],
     settleTimeoutMs: 5000,
     classify: [
@@ -367,8 +371,10 @@ export const adapters: AdapterSpec[] = [
       selector:
         "mfe-download-pharos-button[data-qa='download-pdf'][data-doi][data-sc='but click:pdf download'][variant='primary']",
       requireKind: "article",
-      method: "click",
-      shadowSelector: "#button-element",
+      method: "url",
+      idPattern: "^https://www\\.jstor\\.org/stable/(?:pdf/)?(\\d+)",
+      urlTemplate: "https://www.jstor.org/stable/pdf/{id}.pdf?acceptTC=1",
+      requiresTermsConsent: true,
     },
     termsAccept: {
       modalSelector: "mfe-download-pharos-modal.terms-and-conditions[open]",

@@ -276,31 +276,60 @@ test.skipIf(liveArticle === null)("captured proquest article fixture classifies 
   expect(interpret(liveArticle as Document, SPEC, ctx(EXPECTED_TITLE)).kind).toBe("article");
 });
 
-// JSTOR's entitled capture renders the PDF in its in-page viewer and offers
-// only a custom-element Download control. There is no stable anchor/meta URL;
-// the adapter must click that provider control rather than synthesize the
-// /stable/pdf/<id>.pdf endpoint.
+// JSTOR renders the same primary Download control on the stable/ viewer AND
+// the article record page, but wires them differently: the viewer downloads
+// on click, the record page calls window.open(...acceptTC=1), which Chrome's
+// popup blocker eats for a gesture-less adapter click (field report
+// 2026-08-03). The adapter therefore derives the direct endpoint from the tab
+// URL, consent-gated because acceptTC=1 accepts JSTOR's terms.
 const jstorArticle = loadFixture("jstor", "success");
+const jstorRecord = loadFixture("jstor", "record");
+const jstorURLFor = (rule: DownloadRule, href: string): string | null => {
+  const m = href.match(new RegExp(rule.idPattern as string));
+  if (!m) return null;
+  return (rule.urlTemplate as string).replace(
+    /\{(\d+|id)\}/g,
+    (_, k: string) => m[k === "id" ? 1 : Number(k)] ?? "",
+  );
+};
 test.skipIf(jstorArticle === null)(
-  "captured JSTOR entitled page classifies on its primary PDF control",
+  "captured JSTOR viewer page classifies and derives its consent-gated endpoint",
   () => {
     const article = jstorArticle as Document;
     const spec = adapters.find((a) => a.id === "jstor") as AdapterSpec;
     const verdict = interpret(article, spec, ctx());
     expect(verdict.kind).toBe("article");
-    expect(verdict.adapter_id).toBe("jstor");
     expect(article.querySelector("#pdf-viewer .page[data-page-number]")).not.toBeNull();
 
     const rule = spec.download as DownloadRule;
-    expect(rule.method).toBe("click");
-    expect(rule.shadowSelector).toBe("#button-element");
-    expect(rule.idPattern).toBeUndefined();
-    expect(rule.urlTemplate).toBeUndefined();
-    const control = article.querySelector(rule.selector);
-    expect(control).not.toBeNull();
-    expect(control?.getAttribute("data-doi")).toBe("20183234");
-    expect(article.querySelector("meta[name='citation_pdf_url']")).toBeNull();
-    expect(article.querySelector("a[href*='/stable/pdf/']")).toBeNull();
+    expect(rule.method).toBe("url");
+    // The consent gate is load-bearing: acceptTC=1 accepts publisher terms.
+    expect(rule.requiresTermsConsent).toBe(true);
+    expect(article.querySelector(rule.selector)?.getAttribute("data-doi")).toBe("20183234");
+    expect(jstorURLFor(rule, "https://www.jstor.org/stable/pdf/20183234")).toBe(
+      "https://www.jstor.org/stable/pdf/20183234.pdf?acceptTC=1",
+    );
+  },
+);
+test.skipIf(jstorRecord === null)(
+  "captured JSTOR record page classifies and derives the endpoint from its stable id",
+  () => {
+    const record = jstorRecord as Document;
+    const spec = adapters.find((a) => a.id === "jstor") as AdapterSpec;
+    const verdict = interpret(record, spec, ctx());
+    expect(verdict.kind).toBe("article");
+    const rule = spec.download as DownloadRule;
+    // The record page's own control is the entitlement evidence the url
+    // method requires; its data-doi matches the id derived from the tab URL.
+    expect(record.querySelector(rule.selector)?.getAttribute("data-doi")).toBe("45277272");
+    // No anchor href exists on this page - the control window.open()s.
+    expect(record.querySelector("a[href*='/stable/pdf/']")).toBeNull();
+    expect(jstorURLFor(rule, "https://www.jstor.org/stable/45277272?seq=1")).toBe(
+      "https://www.jstor.org/stable/pdf/45277272.pdf?acceptTC=1",
+    );
+    // Related-work download controls (secondary variant) never satisfy the
+    // primary-control selector.
+    expect(record.querySelectorAll(rule.selector)).toHaveLength(1);
   },
 );
 

@@ -602,8 +602,14 @@ function renderActivity(): void {
 function renderTabs(): void {
   if (elements === null) return;
   const tabs = [elements.actionsTab, elements.watchTab, elements.activityTab];
-  const actionCount = itemsForTab("actions").length;
-  const watchCount = itemsForTab("watch").length;
+  // Tab labels carry the daemon's totals, not the loaded page size: the
+  // snapshot streams 50 rows at a time, and watch rows load lazily, so
+  // "Actions (50)" / "Watch hits (0)" both lied until now.
+  const actionCount =
+    state.counts === null
+      ? itemsForTab("actions").length
+      : state.counts.actions + state.counts.retractions;
+  const watchCount = state.counts === null ? itemsForTab("watch").length : state.counts.watch_hits;
   elements.actionsTab.textContent = `Actions (${actionCount})`;
   elements.watchTab.textContent = `Watch hits (${watchCount})`;
   elements.activityTab.textContent = state.activityKnown && !state.activityFeature ? "Activity (unavailable)" : "Activity";
@@ -1214,7 +1220,12 @@ function render(): void {
     elements.list.append(element("p", `${state.snapshot.unsupported_items_count} newer item(s) need a newer extension.`));
   }
 
-  elements.loadMore.hidden = state.snapshot?.has_more !== true;
+  // Pagination is panel-scoped: an empty Watch panel (or the Activity tab,
+  // which pages itself) renders without the snapshot's Load more control.
+  const snapshotHasWatch = (state.snapshot?.items ?? []).some((item) => item.kind === "watch_hit");
+  const loadMoreSuppressed =
+    state.activeTab === "activity" || (state.activeTab === "watch" && !snapshotHasWatch);
+  elements.loadMore.hidden = state.snapshot?.has_more !== true || loadMoreSuppressed;
   elements.loadMore.disabled = state.loading || !state.connected;
   if (state.generatedAt === null) {
     elements.generatedAt.textContent = "generated at —";

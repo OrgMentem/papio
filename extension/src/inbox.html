@@ -860,15 +860,17 @@
         text-align: center;
       }
 
+      /* Screen-reader announcer only: operation feedback renders visibly on
+       * the affected row (item-result); a visible global line went stale and
+       * leaked across panels ("PDF opened" inside the Watch empty state). */
       #operation-status {
-        color: var(--color-context);
-        font-size: var(--font-size-small);
-        font-weight: 600;
-        margin: var(--space-4) 0;
-      }
-
-      #operation-status:empty {
-        display: none;
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        margin: -1px;
+        clip-path: inset(50%);
+        overflow: hidden;
+        white-space: nowrap;
       }
 
       #load-more {
