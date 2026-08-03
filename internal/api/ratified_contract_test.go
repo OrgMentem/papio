@@ -23,7 +23,7 @@ import (
 // ratifiedConsumerMethods is the IPC surface promised to the first external
 // consumer by ADR-0009, extended with acquire.submit_v2 by ADR-0010, with
 // the two collection readers by ADR-0011, and with the four attribution and
-// evidence readers by ADR-0013. Removing or renaming one breaks that
+// evidence readers by ADR-0014. Removing or renaming one breaks that
 // consumer, so this list is deliberately pinned to the live router rather than
 // documentation.
 //

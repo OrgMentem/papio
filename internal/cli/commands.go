@@ -526,10 +526,16 @@ func newActionsCommand(opt *options) *cobra.Command {
 		Short: "Open the current browser handoff queue",
 		Long: "Open the current browser handoff queue.\n\n" +
 			"With no selector this opens the whole openable queue, newest first.\n" +
-			"--job or --action opens exactly one row instead, for a consumer that\n" +
-			"ranked the queue itself and wants the row it chose. A selector that\n" +
-			"names no open action is an error: falling back to the head of the queue\n" +
-			"would open somebody else's handoff and report success.",
+			"--job or --action opens exactly one row instead, for a caller that\n" +
+			"ranked the queue itself and wants the row it chose. A job holding\n" +
+			"several open actions is refused with their ids rather than resolved by\n" +
+			"picking one, and a selector naming no open action is an error: falling\n" +
+			"back to the head of the queue would open somebody else's handoff and\n" +
+			"report success.\n\n" +
+			"The selector is for choosing a row, not for iterating the queue. A\n" +
+			"background caller that loops it over every row has built the autonomous\n" +
+			"drain ADR-0009 does not ratify: your browser is one serial surface, and\n" +
+			"filling it with tabs nobody asked for is not acquisition progress.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if limit < 0 {

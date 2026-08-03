@@ -120,10 +120,17 @@ Open the current browser handoff queue
 Open the current browser handoff queue.
 
 With no selector this opens the whole openable queue, newest first.
---job or --action opens exactly one row instead, for a consumer that
-ranked the queue itself and wants the row it chose. A selector that
-names no open action is an error: falling back to the head of the queue
-would open somebody else's handoff and report success.
+--job or --action opens exactly one row instead, for a caller that
+ranked the queue itself and wants the row it chose. A job holding
+several open actions is refused with their ids rather than resolved by
+picking one, and a selector naming no open action is an error: falling
+back to the head of the queue would open somebody else's handoff and
+report success.
+
+The selector is for choosing a row, not for iterating the queue. A
+background caller that loops it over every row has built the autonomous
+drain ADR-0009 does not ratify: your browser is one serial surface, and
+filling it with tabs nobody asked for is not acquisition progress.
 
 ```
 papio actions open [flags]

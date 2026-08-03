@@ -1,9 +1,13 @@
-# ADR-0013: Consumer attribution, durable validation evidence, and the ADR-0007 clause this reverses
+# ADR-0014: Consumer attribution, durable validation evidence, and the ADR-0007 clause this reverses
 
 Status: Accepted (2026-08-03). Extends ADR-0009 and ADR-0010; governed by
 ADR-0001. **Reverses one clause of ADR-0007** (the withdrawal of structured
 `pdf.ValidationReport` evidence) with the reasoning that withdrawal was based on,
 and records why that reasoning no longer applies to the shape built here.
+
+Numbered after ADR-0013 but independent of it: the two were written the same day
+on separate branches, and this one neither depends on nor modifies the operator
+experience surfaces recorded there. The one place they meet is Decision 6.
 
 ## Context
 
@@ -198,6 +202,38 @@ The daemon evaluates the verdict so every consumer of one daemon agrees on which
 rows are abandoned instead of each inventing a threshold. `created_at` was
 already on every action row, so the age was always derivable; the shared policy
 is the new part.
+
+## Decision 6: The row selector narrows an operator's choice; it does not license a drain loop
+
+ADR-0009 lists **autonomous drain** as not ratified — "a background consumer must
+not resolve, open, or retry human work on its own: its view can be stale and the
+action is intentionally operator-mediated" — and ADR-0013 preserves that clause
+verbatim for the extension's Retry control. `actions.open` itself *is* ratified,
+so the boundary is not about who may call it; it is about a caller driving the
+queue unattended.
+
+`--job` / `--action` sit on the safe side of that line and in fact move toward it
+from the wrong side: before them, the only way to reach a chosen handoff was
+`papio actions open` with no selector, which opens every openable row up to
+`--limit`. The selector opens **one**, named deliberately, and adds no verb: it
+cannot resolve, dismiss, or retry anything, and a selector matching several open
+actions is refused rather than resolved by picking one.
+
+What the selector must not become is the inner statement of a loop. A consumer
+that ranks the queue and then calls `actions open --job` for each row in turn has
+built autonomous drain out of narrow parts, and the clause above still forbids it
+— not because the call is dangerous but because the operator's browser is a
+single serial surface and a machine filling it with tabs nobody asked for is the
+"uncontrolled producer" ADR-0009 refuses in every other form. The selector exists
+so a consumer can say *"this is the one worth a human's attention now"*, which is
+the opposite of draining.
+
+This is a boundary on consumer behaviour that *papio* deliberately does not
+enforce in code. It could rate-limit `actions.open`, and does not: the daemon
+cannot distinguish an operator clicking through their own ranked queue from a
+script doing it, and a limit low enough to stop the script would obstruct the
+operator. The honest position is a documented boundary plus an unratified
+capability, not a guardrail that punishes the person it is meant to protect.
 
 ## Consequences
 

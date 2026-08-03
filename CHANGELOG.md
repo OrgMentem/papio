@@ -40,7 +40,7 @@ execution records in `notes/acquisition-stack-plan.md`.
   resubmitted it. A `--consumer` filter against a daemon that predates the
   column is refused rather than answered with every consumer's rows. It is a
   caller's own accounting label: *papio* authenticates nobody, so it is not an
-  identity and must never be read as a rights input (ADR-0013). Schema
+  identity and must never be read as a rights input (ADR-0014). Schema
   version 19.
 - **`papio artifacts validation <job-id>` returns the complete validation
   report.** Every stage's evidence was computed and then discarded: only the
@@ -58,7 +58,7 @@ execution records in `notes/acquisition-stack-plan.md`.
   row, and ADR-0007 forbids projecting one job's identity decision through it.
   Jobs validated before this release list no reports; that is an absence, not an
   empty verdict. This reverses one clause of ADR-0007, which had withdrawn
-  structured validation evidence from the external surface; ADR-0013 records why
+  structured validation evidence from the external surface; ADR-0014 records why
   the reasoning behind that withdrawal — no per-job identity through a shared
   artifact — is satisfied rather than evaded by keying the evidence to the job
   and candidate. The accepted candidate's bundle remains the only success
