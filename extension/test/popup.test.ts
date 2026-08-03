@@ -59,19 +59,21 @@ function job(overrides: Partial<ActiveJob> = {}): ActiveJob {
   };
 }
 
-test("renders distinct acquisition and inbox actions without redundant headings", () => {
+test("renders the acquisition card, header inbox launcher, and no redundant headings", () => {
   const doc = popupDocument();
   const launcher = doc.querySelector(".launcher");
 
   expect(doc.querySelector("h1")).toBeNull();
-  expect(launcher?.querySelectorAll(".launcher-action")).toHaveLength(2);
+  expect(launcher?.querySelectorAll(".launcher-action")).toHaveLength(1);
   expect(launcher?.querySelector("h2")).toBeNull();
   expect(doc.getElementById("page-acquire-btn")?.textContent).toBe("Acquire this page");
   expect(doc.getElementById("page-acquire-doi")?.textContent).toBe("Detecting paper…");
   expect(doc.getElementById("page-acquire")?.hidden).toBe(true);
   expect(doc.getElementById("page-acquire-btn")?.hidden).toBe(true);
   expect(doc.getElementById("daemon-footer")).toBeNull();
-  expect(doc.getElementById("open-inbox-btn")?.textContent).toBe("Open inbox");
+  // The inbox launcher lives in the header as an icon button, labelled for AT.
+  expect(doc.getElementById("open-inbox-btn")?.closest("header")).not.toBeNull();
+  expect(doc.getElementById("open-inbox-btn")?.getAttribute("aria-label")).toBe("Open inbox");
   expect(doc.getElementById("needs-you-section")).not.toBeNull();
   expect(doc.getElementById("needs-you-section")?.hidden).toBe(true);
   expect(doc.getElementById("terms-consent")).not.toBeNull();
@@ -207,8 +209,8 @@ test("shows only the no-paper message when the current page has no DOI", () => {
   const button = doc.getElementById("page-acquire-btn") as HTMLButtonElement;
   expect(button.disabled).toBe(true);
   expect(button.hidden).toBe(true);
-  expect(doc.getElementById("page-acquire-doi")?.hidden).toBe(false);
-  expect(doc.getElementById("page-acquire-doi")?.textContent).toBe("No paper on this page");
+  expect(doc.getElementById("page-acquire")?.hasAttribute("hidden")).toBe(true);
+  expect(doc.getElementById("page-acquire-doi")?.textContent).toBe("");
   button.click();
   expect(calls).toBe(0);
 });
@@ -707,8 +709,11 @@ test("institution session uses the shared card/button styles and explains missin
   });
   expect(doc.getElementById("institution-session")?.classList.contains("launcher-action")).toBe(true);
   expect(doc.getElementById("institution-session-signin")?.classList.contains("primary")).toBe(true);
-  expect(doc.getElementById("institution-session-origin")?.textContent).toBe(
-    "Open a paper first",
+  // No resolver: the host slot stays empty and the status line carries the
+  // label plus the one actionable hint.
+  expect(doc.getElementById("institution-session-origin")?.textContent).toBe("");
+  expect(doc.getElementById("institution-session-status")?.textContent).toBe(
+    "No resolver configured yet · Open a paper first",
   );
   expect(doc.getElementById("institution-session-dismiss")).toBeNull();
 });
@@ -772,7 +777,7 @@ test("institution sign-in errors return to a working sign-in button with the rea
   await Promise.resolve();
   await Promise.resolve();
   expect(attempts).toBe(1);
-  expect(button.textContent).toBe("Sign in now");
+  expect(button.textContent).toBe("Sign in");
   expect(button.disabled).toBe(false);
   expect(doc.getElementById("institution-session-status")?.textContent).toBe(
     "Could not open the institution sign-in",
@@ -815,7 +820,7 @@ test("session card matrix propagates marker scan outcomes", () => {
     lastVerdictAt: now,
   });
   expect(failed.label).toBe("papio couldn't read the library page — check site access in Options");
-  expect(failed.detail).toContain("via your open library tab");
+  expect(failed.detail).toContain("via your library tab");
 
   const unknown = deriveSessionCardState({
     ...base,
@@ -826,7 +831,7 @@ test("session card matrix propagates marker scan outcomes", () => {
   });
   expect(unknown.label).toBe("Session unknown — open your library page to verify");
   expect(unknown.action).toBe("signin");
-  expect(unknown.detail).toContain("via no probe evidence");
+  expect(unknown.detail).toContain("no probe evidence");
 
   const signedOut = deriveSessionCardState({
     ...base,
@@ -837,7 +842,7 @@ test("session card matrix propagates marker scan outcomes", () => {
     lastVerdictAt: now,
   });
   expect(signedOut.label).toBe("Signed out or expired");
-  expect(signedOut.detail).toContain("via your open library tab");
+  expect(signedOut.detail).toContain("via your library tab");
 
   const warm = deriveSessionCardState({
     ...base,
@@ -848,7 +853,7 @@ test("session card matrix propagates marker scan outcomes", () => {
     lastVerdictAt: now,
   });
   expect(warm.label).toContain("Session warm");
-  expect(warm.detail).toMatch(/via your open library tab · \d{1,2}:\d{2} (am|pm)$/);
+  expect(warm.detail).toMatch(/via your library tab · (just now|\d+m ago|\d+h ago)$/);
   // A warm session offers no sign-in action — the button is hidden, not dead.
   expect(warm.action).toBe("none");
 });

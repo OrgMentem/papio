@@ -509,39 +509,40 @@ export async function retryAuthStalled(jobID: string): Promise<void> {
   }
 }
 
-function formatLastCheck(lastCheckAt: number | null): string {
-  if (lastCheckAt === null || !Number.isFinite(lastCheckAt)) return "just now";
-  const elapsed = Math.max(0, Date.now() - lastCheckAt);
+/** Short relative age: freshness at a glance beats a wall-clock time the
+ * reader must subtract from "now" themselves. */
+function formatAgo(timestamp: number | null): string {
+  if (timestamp === null || !Number.isFinite(timestamp)) return "just now";
+  const elapsed = Math.max(0, Date.now() - timestamp);
   const minutes = Math.floor(elapsed / 60_000);
   if (minutes < 1) return "just now";
-  return `${minutes} min ago`;
+  if (minutes < 60) return `${minutes}m ago`;
+  return `${Math.floor(minutes / 60)}h ago`;
+}
+
+/** Bare host for naming which institution a session (and its sign-in button)
+ * belongs to — the full origin URL is protocol noise in a 360px card. */
+export function resolverHost(origin: string | null): string {
+  if (origin === null) return "";
+  try {
+    return new URL(origin).host;
+  } catch {
+    return origin;
+  }
 }
 
 function sessionEvidenceDetail(state: PopupSessionState): string {
   const source =
     state.probeSource === "live_tab"
-      ? "via your open library tab"
+      ? "via your library tab"
       : state.probeSource === "keepalive_tab"
-        ? "via papio's keepalive tab"
-        : "via no probe evidence";
-  let host = state.resolverOrigin ?? "";
-  try {
-    host = new URL(state.resolverOrigin ?? "").host;
-  } catch {
-    // A non-URL origin is still worth naming verbatim.
-  }
+        ? "via keepalive tab"
+        : "no probe evidence";
   const rawTimestamp = state.lastVerdictAt;
   if (typeof rawTimestamp !== "number" || !Number.isFinite(rawTimestamp)) {
-    return `${host} · ${source}`;
+    return source;
   }
-  const timestamp = new Date(rawTimestamp);
-  if (!Number.isFinite(timestamp.getTime())) {
-    return `${host} · ${source}`;
-  }
-  const hour = timestamp.getHours() % 12 || 12;
-  const minute = String(timestamp.getMinutes()).padStart(2, "0");
-  const period = timestamp.getHours() >= 12 ? "pm" : "am";
-  return `${host} · ${source} · ${hour}:${minute} ${period}`;
+  return `${source} · ${formatAgo(rawTimestamp)}`;
 }
 
 export interface SessionCardState {
@@ -631,7 +632,7 @@ export function deriveSessionCardState(state: PopupSessionState | undefined): Se
   }
   if (verdict === "in" && state.authenticated) {
     return {
-      label: `Session warm · last verified ${formatLastCheck(lastCheckAt)}`,
+      label: `Session warm · verified ${formatAgo(lastCheckAt)}`,
       detail,
       action: "none",
     };
@@ -695,8 +696,9 @@ export function renderInstitutionSession(
     return;
   }
   const cardState = deriveSessionCardState(state);
-  status.textContent = cardState.label;
-  origin.textContent = cardState.detail;
+  status.textContent =
+    cardState.detail === "" ? cardState.label : `${cardState.label} · ${cardState.detail}`;
+  origin.textContent = resolverHost(state.resolverOrigin);
   signIn.disabled = cardState.action === "none";
   signIn.hidden = cardState.action === "none";
   if (!signIn.dataset.wired) {
@@ -707,11 +709,11 @@ export function renderInstitutionSession(
       void onSignIn().then(
         () => {
           signIn.disabled = false;
-          signIn.textContent = "Sign in now";
+          signIn.textContent = "Sign in";
         },
         (error: unknown) => {
           signIn.disabled = state.resolverOrigin === null;
-          signIn.textContent = "Sign in now";
+          signIn.textContent = "Sign in";
           status.textContent =
             error instanceof Error && error.message.length > 0
               ? error.message
@@ -1456,8 +1458,10 @@ export function renderPageContext(
     return;
   }
   if (!page?.doi) {
-    detected.textContent = "No paper on this page";
-    detected.hidden = false;
+    // No paper, no card: an announcement of absence is dead popup space.
+    section.hidden = true;
+    detected.textContent = "";
+    detected.hidden = true;
     state.textContent = "";
     status.textContent = "";
     button.dataset.mode = "doi";
