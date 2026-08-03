@@ -883,10 +883,12 @@ export function renderInstitutionSession(
     rowsContainer.hidden = false;
     renderSessionRows(doc, rowsContainer, rows, onSignIn);
   } else if (rows.length === 0) {
-    // Only the waiting list or a release notice justifies the card.
-    if (legacyRow instanceof HTMLElement) legacyRow.hidden = true;
+    // Only the waiting list or a release notice justifies the card — and a
+    // card with a bare heading reads as broken, so say WHY it is quiet:
+    // rows only filter out when every session is warm and fresh.
+    if (legacyRow instanceof HTMLElement) legacyRow.hidden = false;
     origin.textContent = "";
-    status.textContent = "";
+    status.textContent = "All sessions warm";
     signIn.hidden = true;
     signIn.disabled = true;
     if (rowsContainer instanceof HTMLElement) {

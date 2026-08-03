@@ -1163,3 +1163,46 @@ test("leftover-tabs cleanup click closes the card and a failure re-arms the butt
   expect(calls).toBe(2);
   expect(section?.hasAttribute("hidden")).toBe(true);
 });
+
+test("a release notice keeps the card with a warm summary, never a bare heading", () => {
+  const now = Date.now();
+  const origin = "https://example.primo.exlibrisgroup.com";
+  const doc = popupDocument();
+  renderInstitutionSession(doc, {
+    enabled: true,
+    intervalMinutes: 4,
+    authenticated: true,
+    verdict: "in",
+    probeSource: "live_tab",
+    scanOutcome: "markers",
+    lastVerdictAt: now,
+    checking: false,
+    likelyAuthenticated: false,
+    pausedForReauth: false,
+    lastCheckAt: now,
+    resolverOrigin: origin,
+    lastAuthReturnedAt: null,
+    queuedAuthJobs: 0,
+    stalledAuthJobs: [],
+    releasedAuthJobs: 1,
+    releasedAuthJobsAt: now,
+    origins: [{
+      origin,
+      authenticated: true,
+      verdict: "in",
+      probeSource: "live_tab",
+      scanOutcome: "markers",
+      lastVerdictAt: now,
+      checking: false,
+      likelyAuthenticated: false,
+      pausedForReauth: false,
+      lastCheckAt: now,
+    }],
+  });
+  expect(doc.getElementById("institution-session")?.hidden).toBe(false);
+  expect(doc.getElementById("institution-session-status")?.textContent).toBe("All sessions warm");
+  expect(doc.getElementById("institution-session-unblocked")?.textContent).toContain(
+    "Sign-in unblocked 1 item",
+  );
+  expect((doc.getElementById("institution-session-signin") as HTMLButtonElement).hidden).toBe(true);
+});
