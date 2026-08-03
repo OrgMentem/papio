@@ -2096,3 +2096,35 @@ test("cross-origin api download is relocated into papio/<job>/ via the ID bound 
     "/Users/test/Downloads/papio/job_xorigin_0001/out.pdf",
   );
 });
+
+// Primo NDE renders Ex Libris's own "Get PDF" delivery anchor on entitled and
+// Open Access full-display records; the language-independent key is the
+// /discovery/sourceRecord href, and the live anchor carries the delivery
+// query that sanitizeFixture strips from the stored capture.
+const primoRecord = loadFixture("primo", "success");
+test.skipIf(primoRecord === null)(
+  "captured Primo record classifies on its Get PDF delivery anchor",
+  () => {
+    const record = primoRecord as Document;
+    const spec = adapters.find((a) => a.id === "primo") as AdapterSpec;
+    const verdict = interpret(record, spec, ctx());
+    expect(verdict.kind).toBe("article");
+    const rule = spec.download as DownloadRule;
+    expect(rule.method).toBe("href");
+    const anchor = record.querySelector(rule.selector);
+    expect(anchor?.getAttribute("aria-label") ?? "").toContain("Get PDF");
+    expect(anchor?.getAttribute("href") ?? "").toContain("/discovery/sourceRecord");
+  },
+);
+test.skipIf(primoRecord === null)(
+  "a Primo page without the delivery anchor stays assisted",
+  () => {
+    const record = primoRecord as Document;
+    const spec = adapters.find((a) => a.id === "primo") as AdapterSpec;
+    const stripped = record.cloneNode(true) as Document;
+    for (const el of stripped.querySelectorAll("a.anchor-tag-style[href*='/discovery/sourceRecord']")) {
+      el.remove();
+    }
+    expect(interpret(stripped, spec, ctx()).kind).not.toBe("article");
+  },
+);

@@ -3444,9 +3444,9 @@ test("session state reports each known resolver and sign-in targets its origin",
     popupURL: "chrome-extension://papio-test-id/popup.html",
     historyURL: "chrome-extension://papio-test-id/history.html",
   };
-  const uwaOrigin = "https://onesearch.library.example-college.edu";
+  const collegeOrigin = "https://onesearch.library.example-college.edu";
   await h.bridge.start();
-  await h.port.inbound(helloAck({ resolver_origins: ["https://resolver.example.edu", uwaOrigin] }));
+  await h.port.inbound(helloAck({ resolver_origins: ["https://resolver.example.edu", collegeOrigin] }));
 
   await expect(
     handleInboxRuntimeMessage(h.bridge, { type: "papio.session.state" }, { id: urls.runtimeID, url: urls.popupURL }, urls),
@@ -3454,18 +3454,18 @@ test("session state reports each known resolver and sign-in targets its origin",
     ok: true,
     origins: [
       { origin: "https://resolver.example.edu", verdict: "unknown" },
-      { origin: uwaOrigin, verdict: "unknown" },
+      { origin: collegeOrigin, verdict: "unknown" },
     ],
   });
   await expect(
     handleInboxRuntimeMessage(
       h.bridge,
-      { type: "papio.session.signin", origin: uwaOrigin },
+      { type: "papio.session.signin", origin: collegeOrigin },
       { id: urls.runtimeID, url: urls.popupURL },
       urls,
     ),
   ).resolves.toEqual({ ok: true, opened: true });
-  expect(h.tabs.created).toContainEqual({ url: uwaOrigin, active: true });
+  expect(h.tabs.created).toContainEqual({ url: collegeOrigin, active: true });
 });
 
 test("provider and OA offer URLs never mint institution session rows", async () => {
@@ -4322,13 +4322,13 @@ test("cold handoffs consolidate to one tab before warm evidence fills the second
 });
 test("keepalive warmth releases only the matching resolver queue", async () => {
   const h = makeHarness();
-  const uwaOrigin = "https://onesearch.library.example-college.edu";
-  const uwaOpenURL = `${uwaOrigin}/openurl?ctx=uwa`;
+  const collegeOrigin = "https://onesearch.library.example-college.edu";
+  const collegeOpenURL = `${collegeOrigin}/openurl?ctx=college`;
   const defaultOffer = jobOfferForHosts("job_default_origin_queue", [PROVIDER_HOST]) as {
     payload: Record<string, unknown>;
   };
   defaultOffer.payload["requires_auth"] = true;
-  const uwaOffer = jobOfferForHosts("job_uwa_origin_queue", ["link.springer.com"], uwaOpenURL) as {
+  const uwaOffer = jobOfferForHosts("job_uwa_origin_queue", ["link.springer.com"], collegeOpenURL) as {
     payload: Record<string, unknown>;
   };
   uwaOffer.payload["requires_auth"] = true;
@@ -4336,7 +4336,7 @@ test("keepalive warmth releases only the matching resolver queue", async () => {
   await h.bridge.start();
   await h.port.inbound(defaultOffer);
   await h.port.inbound(uwaOffer);
-  await h.bridge.setKeepaliveAuthenticated(true, uwaOrigin);
+  await h.bridge.setKeepaliveAuthenticated(true, collegeOrigin);
 
   expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_default_origin_queue")).toMatchObject({
     status: "queued",
@@ -4346,7 +4346,7 @@ test("keepalive warmth releases only the matching resolver queue", async () => {
     status: "accepted",
     tab_id: 100,
   });
-  expect(h.tabs.created).toEqual([{ url: uwaOpenURL, active: false }]);
+  expect(h.tabs.created).toEqual([{ url: collegeOpenURL, active: false }]);
 });
 
 test("handoff group reducer trails auth recollapse and stays quiet when collapsed", async () => {

@@ -62,7 +62,7 @@ execution records in `notes/acquisition-stack-plan.md`.
   carries the resolver origin that produced it. The extension releases only
   queued handoffs for that origin, and the daemon maps the origin to a
   configured resolver profile before re-offering only that profile's
-  store-backed siblings — one institution's sign-in never releases the other's queue on either
+  store-backed siblings — a second-institution sign-in never releases the default institution's queue on either
   side, and vice versa. Named `[browser.resolvers.*]` profiles now send their
   own `shibboleth_entity_id` / `proquest_account_id` on handoffs (previously
   default-profile only), and a new `browser.default_resolver` key selects

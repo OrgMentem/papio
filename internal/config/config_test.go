@@ -467,9 +467,9 @@ func TestBrowserDefaultResolverValidatesAndMatchesOrigin(t *testing.T) {
 	data := []byte(`access_mode = "conservative"
 [browser]
 openurl_base_url = "https://example.primo.exlibrisgroup.com/nde/openurl"
-default_resolver = "uwa"
+default_resolver = "college"
 
-[browser.resolvers.uwa]
+[browser.resolvers.college]
 openurl_base_url = "https://onesearch.library.example-college.edu/discovery/openurl"
 `)
 	if err := os.WriteFile(path, data, 0o600); err != nil {
@@ -479,11 +479,11 @@ openurl_base_url = "https://onesearch.library.example-college.edu/discovery/open
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Browser.DefaultResolver != "uwa" {
-		t.Fatalf("default_resolver = %q, want uwa", cfg.Browser.DefaultResolver)
+	if cfg.Browser.DefaultResolver != "college" {
+		t.Fatalf("default_resolver = %q, want college", cfg.Browser.DefaultResolver)
 	}
-	if profile, ok := cfg.ResolverProfileForOrigin("https://onesearch.library.example-college.edu"); !ok || profile != "uwa" {
-		t.Fatalf("origin profile = %q, %t, want uwa", profile, ok)
+	if profile, ok := cfg.ResolverProfileForOrigin("https://onesearch.library.example-college.edu"); !ok || profile != "college" {
+		t.Fatalf("origin profile = %q, %t, want college", profile, ok)
 	}
 	if profile, ok := cfg.ResolverProfileForOrigin("https://example.primo.exlibrisgroup.com"); !ok || profile != "default" {
 		t.Fatalf("default origin profile = %q, %t, want default", profile, ok)

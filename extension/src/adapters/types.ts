@@ -422,6 +422,32 @@ export const adapters: AdapterSpec[] = [
     },
   },
   {
+    // Captured 2026-08-03 from a institutionally entitled Primo NDE full-display record
+    // (fixtures/primo/success.html): Ex Libris Primo's own "Get PDF" delivery
+    // anchor for Open Access and held items. The classify key is the
+    // language-independent /discovery/sourceRecord href, not the localized
+    // label. sanitizeFixture strips the anchor's query string, but method
+    // "href" reads the LIVE anchor at download time, so the runtime request
+    // carries the full delivery parameters. Hosts cover hosted Primo
+    // instances (<inst>.primo.exlibrisgroup.com); custom-domain fronts like
+    // custom-domain discovery fronts need their own captured evidence before joining.
+    id: "primo",
+    version: "0.1.0",
+    hosts: ["primo.exlibrisgroup.com"],
+    settleTimeoutMs: 5000,
+    classify: [
+      {
+        kind: "article",
+        all: ["a.anchor-tag-style[href*='/discovery/sourceRecord']"],
+      },
+    ],
+    download: {
+      selector: "a.anchor-tag-style[href*='/discovery/sourceRecord']",
+      requireKind: "article",
+      method: "href",
+    },
+  },
+  {
     // Verified live 2026-07-14 against a Example University-authenticated EBSCOhost record
     // and its provider-owned download-format modal (fixtures/ebsco/success.html).
     id: "ebsco",
