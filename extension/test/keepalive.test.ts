@@ -152,6 +152,7 @@ function makeHarness(
   reauthState: boolean[];
   storageValues: Record<string, unknown>;
   resolverMarkers: ResolverMarker[];
+  markersByTab: Map<number, ResolverMarker[]>;
 } {
   const jobs = { count: 1 };
   const tabs = new FakeTabs();
@@ -167,6 +168,8 @@ function makeHarness(
   };
   const latestOpenURL = resolverConfig === undefined ? RESOLVER_OPENURL : resolverConfig.latestOpenURL;
   const resolverMarkers: ResolverMarker[] = [{ text: "Sign out", label: "" }];
+  /** Per-tab marker overrides: tabs render sessions independently. */
+  const markersByTab = new Map<number, ResolverMarker[]>();
   const api: KeepaliveAPI = {
     tabs,
     timers,
@@ -180,7 +183,9 @@ function makeHarness(
       getAll: async () => ({ origins: resolverConfig?.grantedOrigins ?? [] }),
     },
     scripting: {
-      executeScript: async () => [{ result: resolverMarkers }],
+      executeScript: async (injection?: { target?: { tabId?: number } }) => [
+        { result: markersByTab.get(injection?.target?.tabId ?? -1) ?? resolverMarkers },
+      ],
     },
     action: { setBadgeText: async ({ text }) => void badge.push(text) },
   };
@@ -212,6 +217,7 @@ function makeHarness(
     reauthState,
     storageValues,
     resolverMarkers,
+    markersByTab,
   };
 }
 
@@ -812,4 +818,56 @@ test("per-origin verdicts survive a service-worker restart", async () => {
   expect(snapshot?.authenticated).toBe(true);
   // Restored evidence is settled state, never a stuck in-flight probe.
   expect(snapshot?.checking).toBe(false);
+});
+
+test("a signed-in sibling tab outranks a stale signed-out render", async () => {
+  const h = makeHarness();
+  await h.manager.init();
+  // Tab 42 is the focused, STALE tab: loaded before sign-in, it renders a
+  // visible sign-in prompt (Primo caches auth state per tab). Tab 43 is a
+  // sibling resolver tab that evidences the browser's real cookie session.
+  const stale = { id: 42, url: "https://resolver.example.edu/discovery/search" };
+  const warm = { id: 43, url: "https://resolver.example.edu/account/overview" };
+  h.tabs.live.set(42, stale);
+  h.tabs.live.set(43, warm);
+  h.tabs.focusedTab = stale;
+  h.tabs.resolverTabs.push(stale, warm);
+  h.markersByTab.set(42, [{ text: "Sign in", label: "", href: "/nde/login", visible: true }]);
+  h.markersByTab.set(43, [{ text: "Sign out", label: "", href: "/logout" }]);
+
+  await h.manager.checkNow(100);
+  expect(h.manager.getSnapshot()).toMatchObject({ verdict: "in", probeSource: "live_tab" });
+});
+
+test("all tabs signed out keeps the focused tab's verdict authoritative", async () => {
+  const h = makeHarness();
+  await h.manager.init();
+  const first = { id: 42, url: "https://resolver.example.edu/discovery/search" };
+  const second = { id: 43, url: "https://resolver.example.edu/discovery/dbsearch" };
+  h.tabs.live.set(42, first);
+  h.tabs.live.set(43, second);
+  h.tabs.focusedTab = first;
+  h.tabs.resolverTabs.push(first, second);
+  h.markersByTab.set(42, [{ text: "Sign in", label: "", href: "/nde/login", visible: true }]);
+  h.markersByTab.set(43, []);
+
+  await h.manager.checkNow(100);
+  expect(h.manager.getSnapshot()).toMatchObject({ verdict: "out", probeSource: "live_tab" });
+});
+
+test("closing the library tab never erases an earned warm verdict", async () => {
+  const h = makeHarness();
+  await h.manager.init();
+  const liveTab = { id: 42, url: "https://resolver.example.edu/account" };
+  h.tabs.live.set(42, liveTab);
+  h.tabs.resolverTabs.push(liveTab);
+  await h.manager.checkNow(100);
+  expect(h.manager.getSnapshot()).toMatchObject({ verdict: "in" });
+
+  // The tab closes; the next probe finds nothing to inspect. The earned
+  // verdict stands - only freshness gates may downgrade trust in it.
+  h.tabs.live.delete(42);
+  h.tabs.resolverTabs.length = 0;
+  await h.manager.checkNow(100);
+  expect(h.manager.getSnapshot()).toMatchObject({ verdict: "in" });
 });

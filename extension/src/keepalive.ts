@@ -810,13 +810,33 @@ export class KeepaliveManager {
         (tab) => typeof tab.url === "string" && resolverURLMatches(tab.url, resolver),
       );
       // A user's visible resolver tab carries the strongest, freshest
-      // evidence. The manager-owned tab is eligible only for the current
-      // origin; a secondary origin is always live-tab evidence.
-      const liveTab = resolverTabs.find((tab) => tab.id !== this.tabID);
+      // evidence — but per-tab renders can disagree: Primo caches auth state
+      // in per-tab sessionStorage, so a tab loaded before sign-in keeps
+      // rendering signed-out while the browser's cookies are signed in
+      // (field report: the focused stale tab read OUT while a sibling tab
+      // was verifiably IN). Cookies are browser-global, so any tab
+      // evidencing "in" outranks a stale render; failing that, the focused
+      // tab's verdict is re-asserted as the authoritative one.
+      const liveTabs = resolverTabs.filter((tab) => tab.id !== this.tabID);
       const isCurrent = this.resolver?.origin === origin;
-      if (isCurrent) this.likelyAuthenticated = liveTab !== undefined;
-      if (liveTab?.id !== undefined) {
-        await this.inspectTab(liveTab.id, resolver);
+      if (isCurrent) this.likelyAuthenticated = liveTabs.length > 0;
+      if (liveTabs.length > 0) {
+        let first: "in" | "out" | "unknown" | undefined;
+        let settled = false;
+        for (const tab of liveTabs.slice(0, 3)) {
+          if (tab.id === undefined) continue;
+          const verdict = await this.inspectTab(tab.id, resolver);
+          first ??= verdict;
+          if (verdict === "in") {
+            settled = true;
+            break;
+          }
+        }
+        if (!settled && first !== undefined && liveTabs.length > 1) {
+          // No tab evidenced "in": the focused tab (inspected first) is the
+          // authority; re-assert it over any later, weaker inspection.
+          this.setVerdict(first, "live_tab", Date.now(), undefined, origin);
+        }
         continue;
       }
       if (isCurrent && this.tabID !== undefined) {
@@ -824,17 +844,19 @@ export class KeepaliveManager {
         continue;
       }
       const checkedAt = Date.now();
+      // No inspectable tab = no NEW evidence — and no evidence never erases
+      // evidence. Overwriting here made every earned warm verdict decay to
+      // "unknown" the moment its library tab closed. Prior evidence stands;
+      // only the check time advances, and the popup's freshness gates decide
+      // how much to trust old evidence.
       if (isCurrent) {
-        this.setVerdict("unknown", "none", checkedAt, undefined, origin);
-      } else {
-        this.updateOriginSnapshot(origin, {
-          verdict: "unknown",
-          authenticated: false,
-          probeSource: "none",
-          lastVerdictAt: checkedAt,
-          lastCheckAt: checkedAt,
-        }, true);
+        this.lastCheckAt = checkedAt;
+        if (this.verdict === "unknown") {
+          this.setVerdict("unknown", "none", checkedAt, undefined, origin);
+          continue;
+        }
       }
+      this.updateOriginSnapshot(origin, { lastCheckAt: checkedAt });
     }
   }
 
@@ -1205,8 +1227,8 @@ export class KeepaliveManager {
   private async inspectTab(
     tabID = this.tabID,
     resolverOverride: URL | undefined = this.resolver,
-  ): Promise<void> {
-    if (tabID === undefined || resolverOverride === undefined) return;
+  ): Promise<"in" | "out" | "unknown" | undefined> {
+    if (tabID === undefined || resolverOverride === undefined) return undefined;
     const resolver = resolverOverride;
     const origin = resolver.origin;
     const owned = tabID === this.tabID && this.resolver?.origin === origin;
@@ -1219,20 +1241,20 @@ export class KeepaliveManager {
       if (this.resolver?.origin === origin) this.lastCheckAt = checkedAt;
       if (!owned) {
         this.setVerdict("unknown", source, checkedAt, undefined, origin);
-        return;
+        return "unknown";
       }
       this.tabID = undefined;
       const wasPaused = this.reauthPaused;
       this.reauthPaused = false;
       if (wasPaused) this.options.onReauthStateChanged?.(false);
       this.setVerdict("unknown", "none", checkedAt, undefined, origin);
-      return;
+      return "unknown";
     }
     const checkedAt = Date.now();
     if (this.resolver?.origin === origin) this.lastCheckAt = checkedAt;
     if (typeof tab.url !== "string") {
       this.setVerdict("unknown", source, checkedAt, undefined, origin);
-      return;
+      return "unknown";
     }
 
     if (resolverURLMatches(tab.url, resolver)) {
@@ -1248,16 +1270,17 @@ export class KeepaliveManager {
       ) {
         await this.pauseForReauth();
       }
-      return;
+      return verdict;
     }
     if (isAuthenticationURL(tab.url)) {
       // The IdP URL is intentionally not scanned and therefore cannot assert
       // signed-out; it only drives the visible reauthentication affordance.
       this.setVerdict("unknown", source, checkedAt, undefined, origin);
       if (owned) await this.pauseForReauth();
-      return;
+      return "unknown";
     }
     this.setVerdict("unknown", source, checkedAt, undefined, origin);
+    return "unknown";
   }
 
   private async pauseForReauth(): Promise<void> {
