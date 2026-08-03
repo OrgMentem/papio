@@ -365,80 +365,138 @@
         color: var(--color-context);
       }
 
-      #item-list {
+      #item-list,
+      #watch-list {
         margin-top: var(--space-8);
       }
 
-      #activity-panel {
-        background: var(--color-surface);
-        border: 1px solid var(--color-border);
-        border-radius: var(--radius-card);
-        margin-top: var(--space-6);
-        padding: var(--space-3) var(--space-4);
-      }
-
-      .activity-header {
-        align-items: center;
+      .inbox-tabs {
+        border-bottom: 1px solid var(--color-border);
         display: flex;
-        gap: var(--space-3);
-        justify-content: space-between;
+        gap: var(--space-1);
+        margin-top: var(--space-4);
+        overflow-x: auto;
       }
 
-      #activity-panel h2 {
+      .inbox-tab {
+        background: transparent;
+        border: 0;
+        border-bottom: 3px solid transparent;
+        border-radius: var(--radius-control) var(--radius-control) 0 0;
         color: var(--color-muted);
         font-size: var(--font-size-small);
         font-weight: 700;
+        min-height: var(--control-height);
+        padding: var(--space-2) var(--space-3);
+        white-space: nowrap;
+      }
+
+      .inbox-tab:hover:not(:disabled) {
+        background: var(--color-surface-hover);
+        color: var(--color-ink);
+      }
+
+      .inbox-tab[aria-selected="true"] {
+        border-bottom-color: var(--color-primary-solid);
+        color: var(--color-ink);
+      }
+
+      [role="tabpanel"] {
+        min-width: 0;
+      }
+
+      #activity-panel {
+        margin-top: var(--space-8);
+      }
+
+      #activity-panel > h2 {
+        color: var(--color-muted);
+        font-size: var(--font-size-small);
         letter-spacing: 0.07em;
         text-transform: uppercase;
       }
 
-      #activity-toggle {
-        min-height: calc(var(--control-height) - var(--space-2));
-        padding: var(--space-1) var(--space-2);
-      }
-
       #activity-list {
         display: grid;
+        gap: var(--space-4);
+        margin-top: var(--space-4);
+      }
+
+      .activity-group {
+        background: var(--color-surface);
+        border: 1px solid var(--color-border);
+        border-radius: var(--radius-card);
+        overflow: hidden;
+      }
+
+      .activity-group h3 {
+        align-items: center;
+        background: var(--color-surface-hover);
+        display: flex;
+        flex-wrap: wrap;
+        font-size: var(--font-size-small);
         gap: var(--space-2);
+        justify-content: space-between;
+        padding: var(--space-2) var(--space-3);
+      }
+
+      .activity-group-list {
+        display: grid;
         list-style: none;
-        margin: var(--space-3) 0 0;
+        margin: 0;
         padding: 0;
       }
 
       .activity-entry {
+        align-items: baseline;
         border-top: 1px solid var(--color-border);
         display: grid;
-        gap: var(--space-1);
-        padding-top: var(--space-2);
-      }
-
-      .activity-meta {
-        align-items: baseline;
-        color: var(--color-muted);
-        display: flex;
-        flex-wrap: wrap;
-        font-size: var(--font-size-label);
         gap: var(--space-2);
+        grid-template-columns: max-content minmax(0, 1fr) max-content;
+        padding: var(--space-2) var(--space-3);
       }
 
-      .activity-title {
-        color: var(--color-context);
-        font-weight: 600;
-        overflow-wrap: anywhere;
+      .activity-time {
+        color: var(--color-muted);
+        font-size: var(--font-size-label);
+        font-variant-numeric: tabular-nums;
+        white-space: nowrap;
       }
 
       .activity-text {
-        color: var(--color-ink);
         overflow-wrap: anywhere;
       }
 
-      .activity-job {
-        border: 0;
-        color: var(--color-primary);
+      .activity-count {
+        color: var(--color-muted);
         font-size: var(--font-size-small);
+        font-variant-numeric: tabular-nums;
+        white-space: nowrap;
+      }
+
+      .activity-job-chip {
+        background: var(--color-neutral-badge);
+        border: 1px solid var(--color-border);
+        border-radius: var(--radius-pill);
+        color: var(--color-muted);
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: var(--font-size-label);
+        font-weight: 500;
+        letter-spacing: 0.04em;
         min-height: 0;
-        padding: 0;
-        vertical-align: baseline;
+        overflow: hidden;
+        padding: 1px var(--space-2);
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      button.activity-job-link {
+        color: var(--color-primary);
+        cursor: pointer;
+      }
+
+      #activity-show-more {
+        margin-top: var(--space-3);
       }
 
       .activity-live-status {
@@ -472,7 +530,6 @@
         text-transform: uppercase;
       }
 
-      }
 
       .triage-group-retraction > h2 {
         color: var(--color-danger);
@@ -1033,14 +1090,22 @@
         <button id="reconnect-daemon" type="button" hidden>Reconnect</button>
       </div>
     </header>
-    <section id="activity-panel" aria-labelledby="activity-heading" hidden>
-      <div class="activity-header">
-        <h2 id="activity-heading">Activity</h2>
-        <button id="activity-toggle" type="button" aria-controls="activity-list" aria-expanded="true">Hide activity</button>
-      </div>
-      <ul id="activity-list" aria-live="polite"></ul>
+    <nav class="inbox-tabs" aria-label="Inbox views" role="tablist">
+      <button id="actions-tab" class="inbox-tab" type="button" role="tab" aria-controls="actions-panel" aria-selected="true" data-tab="actions" tabindex="0">Actions (0)</button>
+      <button id="watch-tab" class="inbox-tab" type="button" role="tab" aria-controls="watch-panel" aria-selected="false" data-tab="watch" tabindex="-1">Watch hits (0)</button>
+      <button id="activity-tab" class="inbox-tab" type="button" role="tab" aria-controls="activity-panel" aria-selected="false" data-tab="activity" tabindex="-1" hidden>Activity</button>
+    </nav>
+    <section id="actions-panel" role="tabpanel" aria-labelledby="actions-tab">
+      <main id="item-list" aria-label="Actions"></main>
     </section>
-    <main id="item-list" aria-label="Triage items"></main>
+    <section id="watch-panel" role="tabpanel" aria-labelledby="watch-tab" hidden>
+      <div id="watch-list" aria-label="Watch hits"></div>
+    </section>
+    <section id="activity-panel" role="tabpanel" aria-labelledby="activity-tab" hidden>
+      <h2 id="activity-heading">Activity</h2>
+      <div id="activity-list" role="log" aria-live="polite"></div>
+      <button id="activity-show-more" type="button" hidden>Show more</button>
+    </section>
     <p id="operation-status" role="status" aria-live="polite"></p>
     <button id="load-more" type="button" hidden>Load more</button>
     <div id="undo-bar" hidden>

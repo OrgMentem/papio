@@ -1024,6 +1024,61 @@ func kindText(kind string, detail map[string]any) string {
 		return "Job rejected"
 	case "browser.oa_handoff_fallback":
 		return "Fell back to open-access handoff"
+	case "browser.error":
+		if code := activityDetailString(detail, "code"); code != "" {
+			return activityText(fmt.Sprintf("Browser reported an error (%s)", code))
+		}
+		return "Browser reported an error"
+	case "browser.page_capture":
+		return "Diagnostic page captured"
+	case "browser.provider_outcome":
+		if outcome := activityDetailString(detail, "outcome"); outcome != "" {
+			return activityText(fmt.Sprintf("Provider outcome: %s", strings.ReplaceAll(outcome, "_", " ")))
+		}
+		return "Provider outcome reported"
+	case "browser.no_entitlement_requeue":
+		return "No entitlement here — requeued for other routes"
+	case "browser.handoff_reoffered":
+		return "Handoff re-offered (institution session live)"
+	case "job.transition":
+		to := strings.ReplaceAll(activityDetailString(detail, "to"), "_", " ")
+		if to == "" {
+			return "Job state changed"
+		}
+		if reason := activityDetailString(detail, "reason"); reason != "" {
+			return activityText(fmt.Sprintf("Moved to %s (%s)", to, strings.ReplaceAll(reason, "_", " ")))
+		}
+		return activityText("Moved to " + to)
+	case "job.superseded":
+		return "Superseded by a newer request"
+	case "action.reminder":
+		if age, ok := activityDetailInt64(detail, "age_seconds"); ok && age > 0 {
+			return activityText(fmt.Sprintf("Still waiting on you (open for %s)", formatActivityAge(age)))
+		}
+		return "Still waiting on you"
+	case "acquisition.component_added":
+		if role := activityDetailString(detail, "role"); role != "" {
+			return activityText(fmt.Sprintf("Added %s component", strings.ReplaceAll(role, "_", " ")))
+		}
+		return "Component added"
+	case "zotio.auto_import":
+		switch activityDetailString(detail, "status") {
+		case "applied":
+			return "Imported into Zotero"
+		case "skipped":
+			return "Zotero import skipped"
+		default:
+			return "Zotero import attempted"
+		}
+	case "zotio.collection_filing":
+		return "Filed into Zotero collection"
+	case "zotio.enrich":
+		return "Zotero metadata enriched"
+	case "hook.on_ready":
+		if status := activityDetailString(detail, "status"); status != "" {
+			return activityText(fmt.Sprintf("On-ready hook ran (%s)", status))
+		}
+		return "On-ready hook ran"
 	default:
 		return activityText(kind)
 	}
@@ -1078,6 +1133,20 @@ func formatActivityBytes(size int64) string {
 		return fmt.Sprintf("%d B", size)
 	}
 	return fmt.Sprintf("%.1f %s", value, units[index])
+}
+
+// formatActivityAge renders a duration in seconds as a coarse human unit.
+func formatActivityAge(seconds int64) string {
+	switch {
+	case seconds < 90:
+		return fmt.Sprintf("%ds", seconds)
+	case seconds < 90*60:
+		return fmt.Sprintf("%dm", (seconds+30)/60)
+	case seconds < 36*3600:
+		return fmt.Sprintf("%dh", (seconds+1800)/3600)
+	default:
+		return fmt.Sprintf("%dd", (seconds+43200)/86400)
+	}
 }
 
 func activityText(value string) string {

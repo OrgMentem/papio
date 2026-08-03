@@ -812,45 +812,110 @@ test("an author suffix duplicated in the title is stripped for display", async (
   );
 });
 
-test("activity panel renders trusted structure, live job status, and focuses matching inbox rows", async () => {
-  const item = manualAction("action:activity", 1, "Activity download");
-  const fixture = snapshot([item], {
-    counts: counts({ pending_total: 1, actions: 1, watch_hits: 0, retractions: 0 }),
-  });
-  const activity = {
-    seq: 42,
-    at: "2026-08-03T11:59:45Z",
-    job_id: "job-18",
-    kind: "browser.download_started",
-    text: "<downloaded> & pending",
-    title: "A paper title",
-  };
+test("tabs default to Actions, separate watch hits, and support keyboard navigation", async () => {
+  const fixture = snapshot([
+    retraction("retraction:tab", 1, "Tab retraction"),
+    manualAction("action:tab", 2, "Tab action"),
+    watchHit("hit:tab", 3, "Tab watch hit"),
+  ], { counts: counts({ pending_total: 3, actions: 1, watch_hits: 1, retractions: 1 }) });
   const page = await inboxDocument((message) => {
-    if (message.type === "papio.activity") return { ok: true, feature: true, entries: [activity] };
+    if (message.type === "papio.activity") {
+      return { ok: true, feature: true, entries: [{ seq: 1, at: "2026-08-03T11:59:00Z", kind: "system", text: "Ready" }] };
+    }
     return snapshotReply(fixture, message);
   });
 
+  const actionsTab = page.document.getElementById("actions-tab") as HTMLButtonElement;
+  const watchTab = page.document.getElementById("watch-tab") as HTMLButtonElement;
+  const activityTab = page.document.getElementById("activity-tab") as HTMLButtonElement;
+  expect(actionsTab.getAttribute("role")).toBe("tab");
+  expect(actionsTab.getAttribute("aria-selected")).toBe("true");
+  expect(page.document.getElementById("actions-panel")?.hidden).toBe(false);
+  expect(page.document.getElementById("watch-panel")?.hidden).toBe(true);
+  expect(page.document.getElementById("activity-panel")?.hidden).toBe(true);
+  expect(actionsTab.textContent).toBe("Actions (2)");
+  expect(watchTab.textContent).toBe("Watch hits (1)");
+  expect(page.document.querySelectorAll("#item-list [data-triage-item-id]")).toHaveLength(2);
+  expect(page.document.querySelectorAll("#watch-list [data-triage-item-id]")).toHaveLength(1);
+
+  watchTab.click();
+  expect(watchTab.getAttribute("aria-selected")).toBe("true");
+  expect(page.document.getElementById("watch-panel")?.hidden).toBe(false);
+  expect(page.document.getElementById("actions-panel")?.hidden).toBe(true);
+  watchTab.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true }));
+  expect(activityTab.getAttribute("aria-selected")).toBe("true");
+  expect(page.document.getElementById("activity-panel")?.hidden).toBe(false);
+  activityTab.dispatchEvent(new KeyboardEvent("keydown", { key: "Home", bubbles: true }));
+  expect(actionsTab.getAttribute("aria-selected")).toBe("true");
+  expect(actionsTab.tabIndex).toBe(0);
+});
+
+test("activity groups by job, collapses duplicate rows, and only links Actions jobs", async () => {
+  const fixture = snapshot([manualAction("action:activity", 1, "Activity download")], {
+    counts: counts({ pending_total: 1, actions: 1, watch_hits: 0, retractions: 0 }),
+  });
+  const entries = [
+    { seq: 7, at: "2026-08-03T11:59:45Z", job_id: "job-18", kind: "browser.download_started", text: "same text", title: "Download activity" },
+    { seq: 6, at: "2026-08-03T11:59:44Z", job_id: "job-18", kind: "job.transition", text: "same text", title: "Download activity" },
+    { seq: 5, at: "2026-08-03T11:59:43Z", job_id: "job-18", kind: "job.transition", text: "next step", title: "Download activity" },
+    { seq: 4, at: "2026-08-03T11:59:42Z", job_id: "job-other", kind: "job.transition", text: "other job", title: "Other activity" },
+    { seq: 3, at: "2026-08-03T11:59:41Z", kind: "system", text: "system event" },
+  ];
+  const page = await inboxDocument((message) => {
+    if (message.type === "papio.activity") return { ok: true, feature: true, entries };
+    return snapshotReply(fixture, message);
+  });
+
+  page.document.getElementById("activity-tab")?.dispatchEvent(new Event("click", { bubbles: true }));
   const panel = page.document.getElementById("activity-panel");
   expect(panel?.hidden).toBe(false);
-  expect(panel?.querySelector("h2")?.textContent).toBe("Activity");
-  expect(panel?.querySelector("#activity-list")?.getAttribute("aria-live")).toBe("polite");
-  expect(panel?.querySelector(".activity-entry")?.textContent).toContain("<downloaded> & pending");
-  expect(panel?.querySelector(".activity-title")?.textContent).toBe("A paper title");
-  expect(page.document.querySelector("[data-triage-item-id='action:activity'] .activity-live-status")?.textContent)
-    .toBe("downloading…");
+  expect(Array.from(panel?.querySelectorAll(".activity-group h3") ?? [], (heading) => heading.firstChild?.textContent))
+    .toEqual(["Download activity", "Other activity", "System"]);
+  expect(panel?.querySelectorAll(".activity-entry")).toHaveLength(4);
+  expect(panel?.querySelector(".activity-count")?.textContent).toBe("×2");
+  expect(panel?.textContent).not.toContain("Job job-");
+  expect(panel?.querySelector(".activity-job-link")?.textContent).toBe("job-18");
 
-  panel?.querySelector<HTMLButtonElement>(".activity-job")?.click();
-  expect(page.document.activeElement?.getAttribute("data-triage-item-id")).toBe("action:activity");
+  panel?.querySelector<HTMLButtonElement>(".activity-job-link")?.click();
+  expect(page.document.getElementById("actions-panel")?.hidden).toBe(false);
   expect(page.document.querySelector("[data-triage-item-id='action:activity']")?.classList.contains("activity-highlight")).toBe(true);
 });
 
-test("activity panel stays hidden when the daemon does not advertise the feed", async () => {
+test("activity initially shows at most five groups and fifteen rows, then reveals the batch", async () => {
+  const fixture = snapshot([], { counts: counts({ pending_total: 0, actions: 0, watch_hits: 0, retractions: 0 }) });
+  const entries = Array.from({ length: 18 }, (_, index) => ({
+    seq: 18 - index,
+    at: "2026-08-03T11:59:00Z",
+    job_id: `job-${Math.floor(index / 3)}`,
+    kind: "job.transition",
+    text: `event ${index}`,
+    title: `Job ${Math.floor(index / 3)}`,
+  }));
+  const page = await inboxDocument((message) => {
+    if (message.type === "papio.activity") return { ok: true, feature: true, entries };
+    return snapshotReply(fixture, message);
+  });
+  page.document.getElementById("activity-tab")?.dispatchEvent(new Event("click", { bubbles: true }));
+
+  const panel = page.document.getElementById("activity-panel");
+  const showMore = page.document.getElementById("activity-show-more") as HTMLButtonElement;
+  expect(panel?.querySelectorAll(".activity-group")).toHaveLength(5);
+  expect(panel?.querySelectorAll(".activity-entry")).toHaveLength(15);
+  expect(showMore.hidden).toBe(false);
+  showMore.click();
+  expect(panel?.querySelectorAll(".activity-group")).toHaveLength(6);
+  expect(panel?.querySelectorAll(".activity-entry")).toHaveLength(18);
+  expect(showMore.hidden).toBe(true);
+});
+
+test("activity tab stays absent when the daemon does not advertise the feed", async () => {
   const fixture = snapshot([watchHit("hit:no-activity", 1, "No activity")]);
   const page = await inboxDocument((message) => {
     if (message.type === "papio.activity") return { ok: true, feature: false, entries: [] };
     return snapshotReply(fixture, message);
   });
 
+  expect(page.document.getElementById("activity-tab")?.hidden).toBe(true);
   expect(page.document.getElementById("activity-panel")?.hidden).toBe(true);
   expect(page.document.querySelectorAll(".activity-entry")).toHaveLength(0);
 });

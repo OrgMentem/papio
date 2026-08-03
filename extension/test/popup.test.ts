@@ -11,7 +11,10 @@ import {
   OPEN_HANDOFF_MESSAGE,
   OPEN_INBOX_MESSAGE,
   openInbox,
+  openInstitutionSignIn,
+  readCurrentPageMetadata,
   refreshImpactSummary,
+  renderInstitutionSession,
   renderNeedsAttention,
   renderDaemonStatus,
   renderImpactSummary,
@@ -584,4 +587,109 @@ test("collectPageMetadata reports no DOI on DOI-less pages", () => {
   const page = collectPageMetadata();
   expect(page.doi).toBeUndefined();
   expect(page.title).toBe("News article");
+});
+
+test("collectPageMetadata classifies a JSTOR stable landing as its documented DOI", () => {
+  const fixture = readFileSync(new URL("../fixtures/jstor/success.html", import.meta.url), "utf8")
+    .replaceAll("2095101", "20183234");
+  pageDocument(fixture, "https://www.jstor.org/stable/20183234");
+  expect(collectPageMetadata().doi).toBe("10.2307/20183234");
+});
+
+test("collectPageMetadata finds a DOI in visible body text after metadata and links", () => {
+  pageDocument(
+    `<html><head><title>Visible paper</title></head><body><p>The DOI is 10.1000/body-layer.</p></body></html>`,
+    "https://publisher.example/article",
+  );
+  expect(collectPageMetadata().doi).toBe("10.1000/body-layer");
+});
+
+test("openInstitutionSignIn surfaces the background failure reason", async () => {
+  Object.assign(globalThis, {
+    chrome: {
+      runtime: {
+        sendMessage: async () => ({
+          ok: false,
+          error: { code: "resolver_unavailable", message: "No resolver configured yet — open a paper first" },
+        }),
+      },
+    },
+  });
+  await expect(openInstitutionSignIn()).rejects.toThrow("No resolver configured yet — open a paper first");
+});
+
+test("readCurrentPageMetadata keeps JSTOR detection when page scripting is unavailable", async () => {
+  popupDocument();
+  Object.assign(globalThis, {
+    chrome: {
+      tabs: {
+        query: async () => [{ id: 7, url: "https://www.jstor.org/stable/20183234" }],
+      },
+      scripting: {
+        executeScript: async () => {
+          throw new Error("script unavailable");
+        },
+      },
+    },
+  });
+  await expect(readCurrentPageMetadata()).resolves.toMatchObject({
+    doi: "10.2307/20183234",
+    kind: "doi",
+  });
+});
+
+test("institution session uses the shared card/button styles and explains missing resolver", () => {
+  const doc = popupDocument();
+  renderInstitutionSession(doc, {
+    enabled: true,
+    intervalMinutes: 4,
+    authenticated: false,
+    pausedForReauth: false,
+    lastCheckAt: null,
+    resolverOrigin: null,
+    lastAuthReturnedAt: null,
+    queuedAuthJobs: 0,
+    stalledAuthJobs: [],
+    releasedAuthJobs: 0,
+  });
+  expect(doc.getElementById("institution-session")?.classList.contains("launcher-action")).toBe(true);
+  expect(doc.getElementById("institution-session-signin")?.classList.contains("primary")).toBe(true);
+  expect(doc.getElementById("institution-session-origin")?.textContent).toBe(
+    "No resolver configured yet — open a paper first",
+  );
+  expect(doc.getElementById("institution-session-dismiss")).toBeNull();
+});
+
+test("institution sign-in errors return to a working sign-in button with the reason", async () => {
+  const doc = popupDocument();
+  let attempts = 0;
+  renderInstitutionSession(
+    doc,
+    {
+      enabled: true,
+      intervalMinutes: 4,
+      authenticated: false,
+      pausedForReauth: true,
+      lastCheckAt: null,
+      resolverOrigin: "https://resolver.example.edu",
+      lastAuthReturnedAt: null,
+      queuedAuthJobs: 0,
+      stalledAuthJobs: [],
+      releasedAuthJobs: 0,
+    },
+    async () => {
+      attempts += 1;
+      throw new Error("Could not open the institution sign-in");
+    },
+  );
+  const button = doc.getElementById("institution-session-signin") as HTMLButtonElement;
+  button.click();
+  await Promise.resolve();
+  await Promise.resolve();
+  expect(attempts).toBe(1);
+  expect(button.textContent).toBe("Sign in now");
+  expect(button.disabled).toBe(false);
+  expect(doc.getElementById("institution-session-status")?.textContent).toBe(
+    "Could not open the institution sign-in",
+  );
 });

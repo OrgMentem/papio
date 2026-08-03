@@ -2987,6 +2987,7 @@ test("inbox handoff runtime opening focuses the live offered tab without returni
     });
   }
 
+
   await expect(
     handleInboxRuntimeMessage(
       h.bridge,
@@ -2998,6 +2999,51 @@ test("inbox handoff runtime opening focuses the live offered tab without returni
     ok: false,
     error: { code: "unauthorized", message: "This sender cannot access the inbox broker" },
   });
+});
+test("session sign-in reports why it cannot open without a resolver", async () => {
+  const h = makeHarness();
+  const urls = {
+    runtimeID: "papio-test-id",
+    inboxURL: "chrome-extension://papio-test-id/inbox.html",
+    popupURL: "chrome-extension://papio-test-id/popup.html",
+    historyURL: "chrome-extension://papio-test-id/history.html",
+  };
+  await h.bridge.start();
+  await expect(
+    handleInboxRuntimeMessage(
+      h.bridge,
+      { type: "papio.session.signin" },
+      { id: urls.runtimeID, url: urls.popupURL },
+      urls,
+    ),
+  ).resolves.toEqual({
+    ok: false,
+    error: { code: "resolver_unavailable", message: "No resolver configured yet — open a paper first" },
+  });
+});
+
+test("session sign-in opens the resolver origin in a foreground tab as fallback", async () => {
+  const h = makeHarness();
+  const urls = {
+    runtimeID: "papio-test-id",
+    inboxURL: "chrome-extension://papio-test-id/inbox.html",
+    popupURL: "chrome-extension://papio-test-id/popup.html",
+    historyURL: "chrome-extension://papio-test-id/history.html",
+  };
+  const offer = jobOffer("job_session_signin") as { payload: Record<string, unknown> };
+  offer.payload["requires_auth"] = true;
+  await h.bridge.start();
+  await h.port.inbound(helloAck());
+  await h.port.inbound(offer);
+  await expect(
+    handleInboxRuntimeMessage(
+      h.bridge,
+      { type: "papio.session.signin" },
+      { id: urls.runtimeID, url: urls.popupURL },
+      urls,
+    ),
+  ).resolves.toEqual({ ok: true, opened: true });
+  expect(h.tabs.created).toEqual([{ url: "https://resolver.example.edu", active: true }]);
 });
 
 test("handoff_focus surfaces the tracked work-window tab without creating another", async () => {

@@ -950,12 +950,25 @@ export class Bridge {
   }
 
   async requestSessionSignIn(): Promise<BrokerReply<{ opened: true }>> {
+    await this.ready;
     const manager = this.keepaliveManager;
-    if (manager === undefined) return this.failure("session_unavailable", "The institution session is not ready");
+    let resolverOrigin = manager?.getSnapshot().resolverOrigin ?? this.latestResolverOrigin();
+    if (manager !== undefined) {
+      try {
+        if (await manager.openReauth()) return { ok: true, opened: true };
+      } catch {
+        // Fall through to the explicit foreground-origin fallback below.
+      }
+      resolverOrigin = manager.getSnapshot().resolverOrigin ?? resolverOrigin;
+    }
+    if (resolverOrigin === undefined) {
+      return this.failure("resolver_unavailable", "No resolver configured yet — open a paper first");
+    }
     try {
-      return (await manager.openReauth())
-        ? { ok: true, opened: true }
-        : this.failure("session_unavailable", "No configured institution resolver is available");
+      const tab = await this.deps.tabs.create({ url: resolverOrigin, active: true });
+      return tab.id === undefined
+        ? this.failure("session_open_failed", "Could not open the institution sign-in")
+        : { ok: true, opened: true };
     } catch {
       return this.failure("session_open_failed", "Could not open the institution sign-in");
     }
@@ -1018,9 +1031,6 @@ export class Bridge {
     return { ok: true, opened: true };
   }
 
-  dismissSessionNotice(): void {
-    this.authUnblockedCount = 0;
-  }
 
   /** A cold preflight has no tab yet; excluding it would hide the only sign-in
    * signal when keepalive is disabled. */
@@ -1532,6 +1542,19 @@ export class Bridge {
       if (openurl !== undefined) return openurl;
     }
     return undefined;
+  }
+
+  /** Return only the configured resolver origin; signed offer paths and query
+   * parameters never cross the popup reply or become persisted session state. */
+  private latestResolverOrigin(): string | undefined {
+    const openurl = this.latestOpenURL();
+    if (openurl === undefined) return undefined;
+    try {
+      const url = new URL(openurl);
+      return url.protocol === "https:" ? url.origin : undefined;
+    } catch {
+      return undefined;
+    }
   }
 
   /** The keepalive manager pins its resolver tab inside the work window when
@@ -4972,12 +4995,6 @@ export async function handleInboxRuntimeMessage(
     }
     return bridge.retryAuthStalled(message["request"].job_id);
   }
-  if (type === "papio.session.dismiss") {
-    if (!isPopupSender(sender, urls)) return runtimeFailure("unauthorized", "This sender cannot dismiss institution notices");
-    if (!hasOnlyKeys(message, ["type"])) return runtimeFailure("invalid_request", "Invalid institution notice request");
-    bridge.dismissSessionNotice();
-    return { ok: true };
-  }
   if (
     type !== "papio.activity" &&
     type !== "papio.triage.snapshot" &&
@@ -5197,7 +5214,6 @@ if (typeof chrome !== "undefined" && chrome.runtime?.id) {
         message["type"] === "papio.session.state" ||
         message["type"] === "papio.session.signin" ||
         message["type"] === "papio.session.retry" ||
-        message["type"] === "papio.session.dismiss" ||
         message["type"] === "papio.stats")
     ) {
       void handleInboxRuntimeMessage(bridge, message, _sender, inboxRuntimeURLs).then((reply) => {

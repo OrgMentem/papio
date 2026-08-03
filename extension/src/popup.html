@@ -304,6 +304,17 @@
         color: var(--color-muted);
         opacity: 1;
       }
+      
+      button.ghost {
+        background: transparent;
+        border-color: var(--color-control-border);
+        color: var(--color-primary);
+        font-weight: 700;
+      }
+
+      button.ghost:hover:not(:disabled) {
+        background: var(--color-surface-hover);
+      }
 
       .inbox-action {
         min-height: var(--inbox-row-height);
@@ -361,9 +372,7 @@
       }
 
       .institution-session {
-        background: var(--color-primary-surface);
-        border-color: var(--color-primary-border);
-        color: var(--color-context);
+        color: var(--color-ink);
       }
 
       .institution-session h2 {
@@ -371,11 +380,13 @@
       }
 
       .institution-session-status {
+        color: var(--color-context);
         font-weight: 700;
       }
 
       .institution-session-origin,
       .institution-session-unblocked {
+        color: var(--color-muted);
         font-size: var(--font-size-small);
         overflow-wrap: anywhere;
       }
@@ -386,22 +397,18 @@
       }
 
       .institution-session-controls button {
-        border-color: var(--color-primary-border);
-        color: var(--color-primary);
-        font-weight: 700;
         min-height: var(--action-height);
+        width: 100%;
       }
 
       .institution-session-unblocked {
-        align-items: center;
-        display: flex;
-        gap: var(--space-2);
-        justify-content: space-between;
+        border-top: 1px solid var(--color-border);
+        padding-top: var(--space-2);
+        transition: opacity 220ms ease-out;
       }
 
-      .institution-session-unblocked button {
-        min-height: var(--control-height);
-        padding-inline: var(--space-2);
+      .institution-session-unblocked.is-expiring {
+        opacity: 0;
       }
 
       .resolver-grant {
@@ -413,14 +420,11 @@
       .terms-consent > p {
         font-size: var(--font-size-small);
       }
-
-      .resolver-grant > button {
-        border-color: var(--color-primary-border);
-        color: var(--color-primary);
-        font-weight: 700;
+      .resolver-grant > button.primary {
         min-height: var(--action-height);
         width: 100%;
       }
+
 
       .terms-consent {
         background: var(--color-warning-surface);
@@ -662,17 +666,14 @@
         </div>
       </section>
 
-      <section id="institution-session" class="institution-session" hidden aria-labelledby="institution-session-heading">
+      <section id="institution-session" class="launcher-action institution-session" hidden aria-labelledby="institution-session-heading">
         <h2 id="institution-session-heading">Institution session</h2>
         <p id="institution-session-status" class="institution-session-status" role="status" aria-live="polite"></p>
         <p id="institution-session-origin" class="institution-session-origin"></p>
         <div class="institution-session-controls">
-          <button id="institution-session-signin" type="button">Sign in now</button>
+          <button id="institution-session-signin" class="primary" type="button">Sign in now</button>
         </div>
-        <div id="institution-session-unblocked" class="institution-session-unblocked" role="status" aria-live="polite" hidden>
-          <span></span>
-          <button id="institution-session-dismiss" type="button">Dismiss</button>
-        </div>
+        <div id="institution-session-unblocked" class="institution-session-unblocked" role="status" aria-live="polite" hidden></div>
       </section>
 
       <section id="needs-you-section" class="needs-you" hidden aria-labelledby="needs-you-heading">

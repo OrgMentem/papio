@@ -21,18 +21,22 @@ for the full pre-split extension history.
 - **The popup can send the current PDF to *papio*.** It classifies the active tab
   as a PDF, DOI page, or neither; for a PDF it queues or joins the matching
   job, starts a browser-managed download under `papio/<job-id>/`, and reports
-  sending, adoption, validation, or a recoverable failure. Provider click
-  downloads remain human-assisted on Firefox, whose WebExtensions API has no
-  filename-routing hook.
+  sending, adoption, validation, or a recoverable failure. DOI detection is
+  layered — citation/Dublin-Core/PRISM meta tags, canonical and `doi.org`
+  links, a bounded page-text scan, and a JSTOR stable-page fallback
+  (`10.2307/<id>`). Provider click downloads remain human-assisted on
+  Firefox, whose WebExtensions API has no filename-routing hook.
 - **Institution sessions are visible at a glance.** The popup now shows the
   local resolver session as warm, signed out, paused for sign-in, or keep-warm
   disabled, with a **Sign in now** action. Options adds extension-local
   keep-warm enable/disable and refresh-interval controls; credentials and
   identity-provider hosts never enter the daemon protocol.
-- **The inbox adds an activity panel and operator guidance.** It pulls a
-  bounded activity timeline only when the daemon advertises
-  `activity_feed_v1`, and explains the unavailable state on older daemons
-  instead of implying that the timeline is live push.
+- **The inbox separates concerns into Actions, Watch hits, and Activity tabs**,
+  with actionable items first and keyboard-accessible tab navigation. The
+  Activity tab groups a bounded timeline by job, collapses repeats, and
+  truncates behind **Show more**; it appears only when the daemon advertises
+  `activity_feed_v1`, and older daemons get an explanation rather than an
+  implied live push.
 
 ### Changed
 

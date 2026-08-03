@@ -141,6 +141,7 @@ export function renderResolverGrants(
   const lede = doc.createElement("p");
   renderPapio(lede, `Allow papio to use your library resolver so it can finish downloads without a manual click: ${hosts}`);
   const button = doc.createElement("button");
+  button.className = "primary";
   button.type = "button";
   button.textContent = "Allow library access";
   button.addEventListener("click", () => {
@@ -171,58 +172,80 @@ const NO_DOI_FOUND = "no DOI found on this page";
  * Runs INSIDE the page via scripting.executeScript — must stay fully
  * self-contained (no outer-scope references survive serialization).
  *
- * DOI sources, in trust order: Google Scholar's citation_doi (Wiley,
- * Springer, most publishers), SAGE's publication_doi, Dublin Core
- * dc.Identifier[scheme=doi] (Atypon platforms omit citation_doi on
- * abstract pages), then a DOI-shaped match in the URL path or canonical
- * link (journals.sagepub.com/doi/abs/10.1177/... carries it verbatim).
- * The daemon re-validates and normalizes whatever we send.
+ * DOI sources are deliberately ordered from page-authored metadata through
+ * stable links and finally visible text. The daemon re-validates and
+ * normalizes whatever we send.
  */
 export function collectPageMetadata(): PageMetadata {
   const clean = (value: string | null | undefined): string => (value ?? "").trim();
-  const meta = (name: string): string =>
-    clean(document.querySelector(`meta[name="${name}"]`)?.getAttribute("content"));
   const firstDOI = (value: string): string => {
     let decoded = value;
     try { decoded = decodeURIComponent(value); } catch { /* keep raw */ }
     const match = decoded.match(/\b10\.\d{4,9}\/[^\s"'<>?#]+/);
     return match === null ? "" : match[0].replace(/[.,;:!?\]}>'"]+$/g, "");
   };
-  let doi = meta("citation_doi") || meta("publication_doi");
-  if (!doi) {
-    for (const el of Array.from(
-      document.querySelectorAll('meta[name="dc.Identifier"], meta[name="DC.Identifier"], meta[name="dc.identifier"]'),
-    )) {
-      const scheme = clean(el.getAttribute("scheme")).toLowerCase();
-      const content = clean(el.getAttribute("content"));
-      if (!content) continue;
-      if (scheme === "doi") { doi = content; break; }
-      if (!scheme && content.toLowerCase().startsWith("doi:")) { doi = content.slice(4).trim(); break; }
-      if (!scheme && /^10\.\d{4,9}\//.test(content)) { doi = content; break; }
+  const metaTags = Array.from(document.querySelectorAll("meta[name]"));
+  const metaValues = (name: string): string[] =>
+    metaTags
+      .filter((element) => clean(element.getAttribute("name")).toLowerCase() === name)
+      .map((element) => clean(element.getAttribute("content")))
+      .filter((value) => value.length > 0);
+  let doi = "";
+  // Specific standards win over broad fallbacks; publication_doi retains
+  // support for older SAGE/Atypon pages.
+  for (const name of [
+    "citation_doi",
+    "dc.identifier",
+    "prism.doi",
+    "publication_doi",
+    "citation_pdf_url",
+  ]) {
+    for (const value of metaValues(name)) {
+      doi = firstDOI(value);
+      if (doi) break;
     }
+    if (doi) break;
   }
   if (!doi) {
-    doi =
-      firstDOI(location.href) ||
-      firstDOI(location.pathname) ||
-      firstDOI(clean(document.querySelector('link[rel="canonical"]')?.getAttribute("href"))) ||
-      firstDOI(clean(document.querySelector('meta[property="og:url"]')?.getAttribute("content")));
+    const canonical = clean(document.querySelector('link[rel="canonical"]')?.getAttribute("href"));
+    const ogURL = clean(document.querySelector('meta[property="og:url"]')?.getAttribute("content"));
+    doi = firstDOI(canonical) || firstDOI(ogURL) || firstDOI(location.href);
   }
   if (!doi) {
     for (const link of Array.from(document.querySelectorAll("a[href]")).slice(0, 1000)) {
-      const hrefDOI = firstDOI(link.getAttribute("href") ?? "");
-      const textDOI = firstDOI(link.textContent ?? "");
-      doi = hrefDOI || textDOI;
+      const href = clean(link.getAttribute("href"));
+      try {
+        const hostname = new URL(href, location.href).hostname.toLowerCase();
+        if (hostname !== "doi.org" && !hostname.endsWith(".doi.org")) continue;
+      } catch {
+        continue;
+      }
+      doi = firstDOI(href);
       if (doi) break;
     }
   }
   if (!doi) {
-    const body = document.body?.cloneNode(true) as HTMLElement | null;
-    body?.querySelectorAll("script, style, noscript").forEach((el) => el.remove());
-    const text = (body?.textContent ?? "").slice(0, 200_000);
-    doi = firstDOI(text);
+    doi = firstDOI((document.body?.innerText ?? "").slice(0, 200_000));
   }
-  const title = meta("citation_title") || document.title.trim();
+  if (!doi) {
+    try {
+      const pageURL = new URL(location.href);
+      if (
+        pageURL.hostname.toLowerCase() === "jstor.org" ||
+        pageURL.hostname.toLowerCase().endsWith(".jstor.org")
+      ) {
+        const stableID = pageURL.pathname.match(/^\/stable\/([^/]+)\/?$/i)?.[1];
+        if (stableID) {
+          let decoded = stableID;
+          try { decoded = decodeURIComponent(stableID); } catch { /* keep raw */ }
+          doi = `10.2307/${decoded}`;
+        }
+      }
+    } catch {
+      // A malformed location cannot produce a safe stable-page identifier.
+    }
+  }
+  const title = metaValues("citation_title")[0] || document.title.trim();
   return {
     url: location.href,
     ...(doi ? { doi } : {}),
@@ -257,17 +280,18 @@ export async function readCurrentPageMetadata(): Promise<PageMetadata> {
   const url = tabURL || metadata?.url;
   if (url === undefined || url.length === 0) throw new Error("Could not read the current page");
   const inferredDOI = metadata?.doi ?? sniffDOI(url);
-  const kind = tabPDF
-    ? "pdf"
+  const classification = tabPDF
+    ? { kind: "pdf" as const, ...(inferredDOI ? { doi: inferredDOI } : {}) }
     : classifyPage(url, {
         ...(inferredDOI ? { doi: inferredDOI } : {}),
         ...(contentType ? { contentType } : {}),
-      }).kind;
+      });
+  const pageDOI = inferredDOI ?? classification.doi;
   return {
     url,
-    ...(inferredDOI ? { doi: inferredDOI } : {}),
+    ...(pageDOI ? { doi: pageDOI } : {}),
     ...(metadata?.title || tab.title ? { title: metadata?.title || tab.title! } : {}),
-    kind,
+    kind: classification.kind,
     tab_id: tab.id,
   };
 }
@@ -319,7 +343,6 @@ export type PopupSessionState = KeepaliveSnapshot & {
 export const SESSION_STATE_MESSAGE = "papio.session.state";
 export const SESSION_SIGNIN_MESSAGE = "papio.session.signin";
 export const SESSION_RETRY_MESSAGE = "papio.session.retry";
-export const SESSION_DISMISS_MESSAGE = "papio.session.dismiss";
 
 function isSessionState(value: unknown): value is PopupSessionState {
   if (typeof value !== "object" || value === null) return false;
@@ -355,13 +378,24 @@ export async function requestSessionState(): Promise<PopupSessionState | undefin
 export async function openInstitutionSignIn(): Promise<void> {
   const response: unknown = await chrome.runtime.sendMessage({ type: SESSION_SIGNIN_MESSAGE });
   if (
-    typeof response !== "object" ||
-    response === null ||
-    (response as Record<string, unknown>)["ok"] !== true ||
-    (response as Record<string, unknown>)["opened"] !== true
+    typeof response === "object" &&
+    response !== null &&
+    (response as Record<string, unknown>)["ok"] === true &&
+    (response as Record<string, unknown>)["opened"] === true
   ) {
-    throw new Error("Could not open the institution sign-in");
+    return;
   }
+  const responseError =
+    typeof response === "object" && response !== null
+      ? (response as Record<string, unknown>)["error"]
+      : undefined;
+  const reason =
+    typeof responseError === "object" &&
+    responseError !== null &&
+    typeof (responseError as Record<string, unknown>)["message"] === "string"
+      ? (responseError as Record<string, unknown>)["message"] as string
+      : "Could not open the institution sign-in";
+  throw new Error(reason);
 }
 
 export async function retryAuthStalled(jobID: string): Promise<void> {
@@ -378,10 +412,6 @@ export async function retryAuthStalled(jobID: string): Promise<void> {
   }
 }
 
-function dismissSessionNotice(): Promise<void> {
-  return chrome.runtime.sendMessage({ type: SESSION_DISMISS_MESSAGE }).then(() => undefined);
-}
-
 function formatLastCheck(lastCheckAt: number | null): string {
   if (lastCheckAt === null || !Number.isFinite(lastCheckAt)) return "just now";
   const elapsed = Math.max(0, Date.now() - lastCheckAt);
@@ -389,33 +419,41 @@ function formatLastCheck(lastCheckAt: number | null): string {
   if (minutes < 1) return "just now";
   return `${minutes} min ago`;
 }
-let sessionNoticeDismissed = false;
 
+let sessionNoticeFadeTimer: ReturnType<typeof setTimeout> | undefined;
+let sessionNoticeHideTimer: ReturnType<typeof setTimeout> | undefined;
+
+function clearSessionNoticeTimers(): void {
+  clearTimeout(sessionNoticeFadeTimer);
+  clearTimeout(sessionNoticeHideTimer);
+  sessionNoticeFadeTimer = undefined;
+  sessionNoticeHideTimer = undefined;
+}
 
 export function renderInstitutionSession(
   doc: Document,
   state: PopupSessionState | undefined,
   onSignIn: () => Promise<void> = openInstitutionSignIn,
-  onDismiss: () => Promise<void> = dismissSessionNotice,
 ): void {
   const card = doc.getElementById("institution-session");
   const status = doc.getElementById("institution-session-status");
   const origin = doc.getElementById("institution-session-origin");
   const signIn = doc.getElementById("institution-session-signin");
   const notice = doc.getElementById("institution-session-unblocked");
-  const dismiss = doc.getElementById("institution-session-dismiss");
   if (
     !(card instanceof HTMLElement) ||
     !(status instanceof HTMLElement) ||
     !(origin instanceof HTMLElement) ||
     !(signIn instanceof HTMLButtonElement) ||
-    !(notice instanceof HTMLElement) ||
-    !(dismiss instanceof HTMLButtonElement)
+    !(notice instanceof HTMLElement)
   ) {
     return;
   }
   card.hidden = state === undefined;
-  if (state === undefined) return;
+  if (state === undefined) {
+    clearSessionNoticeTimers();
+    return;
+  }
   status.textContent = !state.enabled
     ? "Keep-warm off"
     : state.pausedForReauth
@@ -425,7 +463,7 @@ export function renderInstitutionSession(
         : "Signed out or expired";
   origin.textContent = state.resolverOrigin
     ? `Applies to ${state.resolverOrigin}`
-    : "No institution resolver is active";
+    : "No resolver configured yet — open a paper first";
   signIn.disabled = state.resolverOrigin === null;
   if (!signIn.dataset.wired) {
     signIn.dataset.wired = "1";
@@ -437,32 +475,41 @@ export function renderInstitutionSession(
           signIn.disabled = false;
           signIn.textContent = "Sign in now";
         },
-        () => {
-          signIn.disabled = false;
-          signIn.textContent = "Try again";
+        (error: unknown) => {
+          signIn.disabled = state.resolverOrigin === null;
+          signIn.textContent = "Sign in now";
+          status.textContent =
+            error instanceof Error && error.message.length > 0
+              ? error.message
+              : "Could not open the institution sign-in";
         },
       );
     });
   }
   const released = Math.max(0, Math.trunc(state.releasedAuthJobs));
   if (released === 0) {
-    sessionNoticeDismissed = false;
+    clearSessionNoticeTimers();
+    notice.classList.remove("is-expiring");
     notice.hidden = true;
-  } else if (!sessionNoticeDismissed) {
-    notice.hidden = false;
-    notice.firstChild?.remove();
-    const message = doc.createElement("span");
-    message.textContent = `Sign-in unblocked ${released} item${released === 1 ? "" : "s"}`;
-    notice.prepend(message);
+    return;
   }
-  if (!dismiss.dataset.wired) {
-    dismiss.dataset.wired = "1";
-    dismiss.addEventListener("click", () => {
-      sessionNoticeDismissed = true;
+  const noticeText = `Sign-in unblocked ${released} item${released === 1 ? "" : "s"}`;
+  if (!notice.hidden && notice.textContent === noticeText) return;
+  clearSessionNoticeTimers();
+  notice.classList.remove("is-expiring");
+  notice.hidden = false;
+  const message = doc.createElement("span");
+  message.textContent = noticeText;
+  notice.replaceChildren(message);
+  sessionNoticeFadeTimer = setTimeout(() => {
+    notice.classList.add("is-expiring");
+    sessionNoticeHideTimer = setTimeout(() => {
       notice.hidden = true;
-      void onDismiss();
-    });
-  }
+      notice.classList.remove("is-expiring");
+    }, 260);
+    (sessionNoticeHideTimer as unknown as { unref?: () => void }).unref?.();
+  }, 5_000);
+  (sessionNoticeFadeTimer as unknown as { unref?: () => void }).unref?.();
 }
 
 function handoffPaperLabel(job: ActiveJob): string {
@@ -527,6 +574,7 @@ export function renderNeedsAttention(
     paper.className = "needs-you-paper";
     paper.textContent = handoffPaperLabel(job);
     const button = doc.createElement("button");
+    button.className = "ghost";
     button.type = "button";
     button.textContent = "Focus";
     button.addEventListener("click", () => {
@@ -558,8 +606,8 @@ export function renderNeedsAttention(
     paper.textContent = knownJob === undefined ? jobID : handoffPaperLabel(knownJob);
     const reason = doc.createElement("p");
     reason.textContent = "Sign-in didn't stick - sign in, then retry";
-    copy.append(paper, reason);
     const button = doc.createElement("button");
+    button.className = "ghost";
     button.type = "button";
     button.textContent = "Retry now";
     button.addEventListener("click", () => {
@@ -587,6 +635,7 @@ export function renderNeedsAttention(
     provider.className = "needs-you-paper";
     provider.textContent = host;
     const button = doc.createElement("button");
+    button.className = "ghost";
     button.type = "button";
     button.textContent = "Open Options";
     button.addEventListener("click", () => {

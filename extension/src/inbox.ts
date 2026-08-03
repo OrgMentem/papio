@@ -8,6 +8,7 @@ type TriageOperation = TriageSnapshotItem["ops"][number];
 type Verdict = "accept" | "reject";
 
 type CitationStyle = "apa" | "mla" | "chicago";
+type InboxTab = "actions" | "watch" | "activity";
 
 const CITATION_STYLE_KEY = "papio_inbox_citation_style_v1";
 
@@ -29,24 +30,6 @@ function persistCitationStyle(style: CitationStyle): void {
   }
 }
 
-const ACTIVITY_COLLAPSED_KEY = "papio_inbox_activity_collapsed_v1";
-
-function storedActivityCollapsed(): boolean {
-  try {
-    return window.localStorage.getItem(ACTIVITY_COLLAPSED_KEY) === "true";
-  } catch {
-    // Storage can be unavailable; show the feed by default.
-    return false;
-  }
-}
-
-function persistActivityCollapsed(collapsed: boolean): void {
-  try {
-    window.localStorage.setItem(ACTIVITY_COLLAPSED_KEY, String(collapsed));
-  } catch {
-    // Non-fatal: the choice simply resets on the next visit.
-  }
-}
 
 interface PageElements {
   connection: HTMLElement;
@@ -55,9 +38,15 @@ interface PageElements {
   refresh: HTMLButtonElement;
   reconnect: HTMLButtonElement;
   list: HTMLElement;
+  watchList: HTMLElement;
+  actionsPanel: HTMLElement;
+  watchPanel: HTMLElement;
   activityPanel: HTMLElement;
-  activityToggle: HTMLButtonElement;
+  actionsTab: HTMLButtonElement;
+  watchTab: HTMLButtonElement;
+  activityTab: HTMLButtonElement;
   activityList: HTMLElement;
+  activityShowMore: HTMLButtonElement;
   operationStatus: HTMLElement;
   generatedAt: HTMLTimeElement;
   loadMore: HTMLButtonElement;
@@ -101,9 +90,10 @@ interface PageState {
   loading: boolean;
   filterQuery: string;
   citationStyle: CitationStyle;
+  activeTab: InboxTab;
   activityFeature: boolean;
   activityEntries: ActivityEntry[];
-  activityCollapsed: boolean;
+  activityExpanded: boolean;
 }
 
 const state: PageState = {
@@ -123,9 +113,10 @@ const state: PageState = {
   loading: false,
   filterQuery: "",
   citationStyle: storedCitationStyle(),
+  activeTab: "actions",
   activityFeature: false,
   activityEntries: [],
-  activityCollapsed: storedActivityCollapsed(),
+  activityExpanded: false,
 };
 
 let elements: PageElements | null = null;
@@ -338,8 +329,20 @@ function announce(message: string): void {
 
 function rowForItem(itemID: string): HTMLElement | null {
   if (elements === null) return null;
-  return Array.from(elements.list.querySelectorAll<HTMLElement>("[data-triage-item-id]"))
-    .find((row) => row.dataset.triageItemId === itemID) ?? null;
+  const lists = [elements.list, elements.watchList];
+  for (const list of lists) {
+    const row = Array.from(list.querySelectorAll<HTMLElement>("[data-triage-item-id]"))
+      .find((candidate) => candidate.dataset.triageItemId === itemID);
+    if (row !== undefined) return row;
+  }
+  return null;
+}
+
+function itemsForTab(tab: InboxTab): TriageSnapshotItem[] {
+  if (tab === "activity") return [];
+  const items = orderedItems();
+  if (tab === "watch") return items.filter((item) => item.kind === "watch_hit");
+  return items.filter((item) => item.kind === "retraction" || item.kind === "human_action");
 }
 
 function isActivityEntry(value: unknown): value is ActivityEntry {
@@ -401,14 +404,25 @@ function activityStatusForJob(jobID: string): string | null {
   return null;
 }
 
+function actionForActivityJob(jobID: string): TriageSnapshotItem | null {
+  return state.snapshot?.items.find((item) =>
+    item.kind !== "watch_hit" && itemJobID(item) === jobID
+  ) ?? null;
+}
+
+function shortActivityJobID(jobID: string): string {
+  return jobID.length <= 8 ? jobID : jobID.slice(-8);
+}
+
 function focusActivityJob(jobID: string): void {
-  const item = state.snapshot?.items.find((candidate) => itemJobID(candidate) === jobID);
-  if (item === undefined) {
-    announce(`No inbox item found for job ${jobID}.`);
+  const item = actionForActivityJob(jobID);
+  if (item === null) {
+    announce(`No Actions item found for job ${jobID}.`);
     return;
   }
+  state.activeTab = "actions";
   state.selectedID = item.id;
-  updateRovingTabIndex();
+  render();
   const row = rowForItem(item.id);
   if (row === null) {
     announce(`Inbox item for job ${jobID} is not visible with the current filter.`);
@@ -420,61 +434,188 @@ function focusActivityJob(jobID: string): void {
   announce(`Focused inbox item for job ${jobID}.`);
 }
 
-function renderActivityEntry(entry: ActivityEntry): HTMLElement {
+interface ActivityRow {
+  entry: ActivityEntry;
+  count: number;
+}
+
+interface ActivityGroup {
+  jobID: string | null;
+  title: string;
+  rows: ActivityRow[];
+  newestSeq: number;
+}
+
+function activityGroups(): ActivityGroup[] {
+  const groups = new Map<string, ActivityGroup>();
+  const entries = [...state.activityEntries].sort((left, right) => right.seq - left.seq || right.at.localeCompare(left.at));
+  for (const entry of entries) {
+    const jobID = typeof entry.job_id === "string" && entry.job_id !== "" ? entry.job_id : null;
+    const key = jobID ?? "system";
+    const actionTitle = jobID === null ? null : actionForActivityJob(jobID)?.title ?? null;
+    let group = groups.get(key);
+    if (group === undefined) {
+      group = {
+        jobID,
+        title: jobID === null ? "System" : (entry.title !== undefined && entry.title !== "" ? entry.title : actionTitle ?? "Job activity"),
+        rows: [],
+        newestSeq: entry.seq,
+      };
+      groups.set(key, group);
+    } else if (group.title === "Job activity" && entry.title !== undefined && entry.title !== "") {
+      group.title = entry.title;
+    }
+    const previous = group.rows[group.rows.length - 1];
+    if (previous !== undefined && previous.entry.text === entry.text) {
+      previous.count += 1;
+    } else {
+      group.rows.push({ entry, count: 1 });
+    }
+  }
+  return [...groups.values()].sort((left, right) => right.newestSeq - left.newestSeq);
+}
+
+function renderActivityRow(row: ActivityRow): HTMLElement {
   const item = element("li");
   item.className = "activity-entry";
-  const metadata = element("div");
-  metadata.className = "activity-meta";
-  const time = element("time", relativeActivityTime(entry.at));
+  const time = element("time", relativeActivityTime(row.entry.at));
   time.className = "activity-time";
-  time.dateTime = entry.at;
-  metadata.append(time);
-  if (typeof entry.title === "string" && entry.title !== "") {
-    const title = element("span", entry.title);
-    title.className = "activity-title";
-    metadata.append(title);
-  }
-  const text = element("p", entry.text);
+  time.dateTime = row.entry.at;
+  const text = element("span", row.entry.text);
   text.className = "activity-text";
-  item.append(metadata, text);
-  if (typeof entry.job_id === "string" && entry.job_id !== "") {
-    const job = element("button", `Job ${entry.job_id}`);
-    job.type = "button";
-    job.className = "activity-job activity-job-link";
-    job.dataset.jobId = entry.job_id;
-    job.setAttribute("aria-label", `Show inbox item for job ${entry.job_id}`);
-    job.addEventListener("click", () => focusActivityJob(entry.job_id!));
-    text.append(document.createTextNode(" · "), job);
+  item.append(time, text);
+  if (row.count > 1) {
+    const count = element("span", `×${row.count}`);
+    count.className = "activity-count";
+    count.setAttribute("aria-label", `${row.count} repeated entries`);
+    item.append(count);
   }
   return item;
 }
 
+function renderActivityGroup(group: ActivityGroup, rows: ActivityRow[]): HTMLElement {
+  const section = element("section");
+  section.className = "activity-group";
+  const heading = element("h3", group.title);
+  if (group.jobID !== null) {
+    const action = actionForActivityJob(group.jobID);
+    const suffix = shortActivityJobID(group.jobID);
+    if (action === null) {
+      const chip = element("span", suffix);
+      chip.className = "activity-job-chip";
+      heading.append(chip);
+    } else {
+      const chip = element("button", suffix);
+      chip.type = "button";
+      chip.className = "activity-job-chip activity-job-link";
+      chip.setAttribute("aria-label", "Show matching Actions item");
+      chip.addEventListener("click", () => focusActivityJob(group.jobID!));
+      heading.append(chip);
+    }
+  }
+  const list = element("ul");
+  list.className = "activity-group-list";
+  for (const row of rows) list.append(renderActivityRow(row));
+  section.append(heading, list);
+  return section;
+}
+
 function renderActivity(): void {
   if (elements === null) return;
-  elements.activityPanel.hidden = !state.activityFeature;
-  if (!state.activityFeature) return;
-  elements.activityToggle.setAttribute("aria-expanded", String(!state.activityCollapsed));
-  elements.activityToggle.textContent = state.activityCollapsed ? "Show activity" : "Hide activity";
-  elements.activityList.hidden = state.activityCollapsed;
   elements.activityList.replaceChildren();
-  if (state.activityEntries.length === 0) {
-    elements.activityList.append(element("li", "No recent activity."));
+  if (!state.activityFeature) {
+    elements.activityShowMore.hidden = true;
     return;
   }
-  for (const entry of state.activityEntries) elements.activityList.append(renderActivityEntry(entry));
+  const groups = activityGroups();
+  if (groups.length === 0) {
+    elements.activityList.append(element("p", "No recent activity."));
+    elements.activityShowMore.hidden = true;
+    return;
+  }
+  const maxGroups = state.activityExpanded ? groups.length : 5;
+  const maxRows = state.activityExpanded ? Number.POSITIVE_INFINITY : 15;
+  let shownGroups = 0;
+  let shownRows = 0;
+  for (const group of groups) {
+    if (shownGroups >= maxGroups || shownRows >= maxRows) break;
+    const rows = group.rows.slice(0, Math.max(0, maxRows - shownRows));
+    if (rows.length === 0) break;
+    elements.activityList.append(renderActivityGroup(group, rows));
+    shownGroups += 1;
+    shownRows += rows.length;
+  }
+  const totalRows = groups.reduce((total, group) => total + group.rows.length, 0);
+  elements.activityShowMore.hidden = state.activityExpanded || (shownGroups >= groups.length && shownRows >= totalRows);
+}
+
+function renderTabs(): void {
+  if (elements === null) return;
+  if (!state.activityFeature && state.activeTab === "activity") state.activeTab = "actions";
+  const tabs = [elements.actionsTab, elements.watchTab];
+  if (state.activityFeature) tabs.push(elements.activityTab);
+  const actionCount = itemsForTab("actions").length;
+  const watchCount = itemsForTab("watch").length;
+  elements.actionsTab.textContent = `Actions (${actionCount})`;
+  elements.watchTab.textContent = `Watch hits (${watchCount})`;
+  elements.activityTab.hidden = !state.activityFeature;
+  for (const tab of tabs) {
+    const selected = tab.dataset.tab === state.activeTab;
+    tab.setAttribute("aria-selected", String(selected));
+    tab.tabIndex = selected ? 0 : -1;
+  }
+  elements.actionsPanel.hidden = state.activeTab !== "actions";
+  elements.watchPanel.hidden = state.activeTab !== "watch";
+  elements.activityPanel.hidden = !state.activityFeature || state.activeTab !== "activity";
+  elements.filterInput.disabled = state.activeTab === "activity";
+}
+
+function selectTab(tab: InboxTab, focus: boolean): void {
+  if (tab === "activity" && !state.activityFeature) tab = "actions";
+  state.activeTab = tab;
+  render();
+  if (focus && elements !== null) {
+    const button = tab === "actions" ? elements.actionsTab : tab === "watch" ? elements.watchTab : elements.activityTab;
+    button.focus();
+  }
+}
+
+function handleTabKeydown(event: KeyboardEvent): void {
+  if (event.key !== "ArrowLeft" && event.key !== "ArrowRight" && event.key !== "Home" && event.key !== "End") return;
+  const target = event.currentTarget;
+  if (!(target instanceof HTMLButtonElement) || elements === null) return;
+  const tabs = [elements.actionsTab, elements.watchTab];
+  if (state.activityFeature) tabs.push(elements.activityTab);
+  const current = tabs.indexOf(target);
+  if (current < 0) return;
+  let next = current;
+  if (event.key === "ArrowLeft") next = (current + tabs.length - 1) % tabs.length;
+  if (event.key === "ArrowRight") next = (current + 1) % tabs.length;
+  if (event.key === "Home") next = 0;
+  if (event.key === "End") next = tabs.length - 1;
+  event.preventDefault();
+  const tab = tabs[next];
+  if (tab !== undefined) selectTab(tab.dataset.tab as InboxTab, true);
 }
 
 function updateRovingTabIndex(): void {
   if (elements === null) return;
-  for (const row of Array.from(elements.list.querySelectorAll<HTMLElement>("[data-triage-item-id]"))) {
-    row.tabIndex = row.dataset.triageItemId === state.selectedID ? 0 : -1;
+  for (const list of [elements.list, elements.watchList]) {
+    for (const row of Array.from(list.querySelectorAll<HTMLElement>("[data-triage-item-id]"))) {
+      row.tabIndex = row.dataset.triageItemId === state.selectedID ? 0 : -1;
+    }
   }
 }
 
 function selectItem(itemID: string, focus: boolean): void {
-  if (itemForID(itemID) === null) return;
+  const item = itemForID(itemID);
+  if (item === null) return;
+  const itemTab: InboxTab = item.kind === "watch_hit" ? "watch" : "actions";
+  const tabChanged = state.activeTab !== itemTab;
+  state.activeTab = itemTab;
   state.selectedID = itemID;
-  updateRovingTabIndex();
+  if (tabChanged) render();
+  else updateRovingTabIndex();
   if (focus) rowForItem(itemID)?.focus();
 }
 
@@ -958,28 +1099,32 @@ function render(): void {
   elements.refresh.disabled = state.loading;
   elements.reconnect.disabled = state.loading;
   renderCounts();
+  renderTabs();
   renderActivity();
 
-  elements.list.replaceChildren();
-  const items = orderedItems();
-  if (state.selectedID !== null && !items.some((item) => item.id === state.selectedID)) state.selectedID = items[0]?.id ?? null;
-  if (state.selectedID === null && items.length > 0) state.selectedID = items[0]?.id ?? null;
+  const actionItems = itemsForTab("actions");
+  const watchItems = itemsForTab("watch");
+  const activeItems = itemsForTab(state.activeTab);
+  if (state.selectedID !== null && !activeItems.some((item) => item.id === state.selectedID)) {
+    state.selectedID = activeItems[0]?.id ?? null;
+  }
+  if (state.selectedID === null && activeItems.length > 0) state.selectedID = activeItems[0]?.id ?? null;
 
-  const retractions = items.filter((item) => item.kind === "retraction");
-  const actions = items.filter((item) => item.kind === "human_action");
-  const hits = items.filter((item) => item.kind === "watch_hit");
-  const groups = [
-    renderGroup("retraction", "Retractions", retractions),
-    renderGroup("human_action", "Human actions", actions),
-    renderGroup("watch_hit", "Watch hits", hits),
+  elements.list.replaceChildren();
+  const actionGroups = [
+    renderGroup("retraction", "Retractions", actionItems.filter((item) => item.kind === "retraction")),
+    renderGroup("human_action", "Human actions", actionItems.filter((item) => item.kind === "human_action")),
   ];
-  for (const group of groups) if (group !== null) elements.list.append(group);
+  for (const group of actionGroups) if (group !== null) elements.list.append(group);
+  elements.watchList.replaceChildren();
+  const watchGroup = renderGroup("watch_hit", "Watch hits", watchItems);
+  if (watchGroup !== null) elements.watchList.append(watchGroup);
 
   if (state.snapshot === null) {
     elements.list.append(element("p", "No snapshot is available yet. Reconnect to retrieve the inbox."));
   } else if (state.snapshot.items.length === 0) {
     elements.list.append(element("p", "Your inbox is clear."));
-  } else if (items.length === 0) {
+  } else if (actionItems.length === 0) {
     elements.list.append(element("p", `No items match "${state.filterQuery.trim()}".`));
   }
   if (state.snapshot?.unsupported_items_count && state.snapshot.unsupported_items_count > 0) {
@@ -1631,7 +1776,7 @@ function isTypingTarget(target: EventTarget | null): boolean {
 function handleKeyboard(event: KeyboardEvent): void {
   if (event.defaultPrevented || event.ctrlKey || event.metaKey || event.altKey) return;
   if (state.confirmation !== null || isTypingTarget(event.target)) return;
-  const items = orderedItems();
+  const items = itemsForTab(state.activeTab);
   const current = state.selectedID === null ? -1 : items.findIndex((item) => item.id === state.selectedID);
   switch (event.key) {
     case "j":
@@ -1708,11 +1853,17 @@ function bootstrap(): void {
   const refresh = document.getElementById("refresh-inbox");
   const reconnect = document.getElementById("reconnect-daemon");
   const list = document.getElementById("item-list");
+  const watchList = document.getElementById("watch-list");
+  const actionsPanel = document.getElementById("actions-panel");
+  const watchPanel = document.getElementById("watch-panel");
+  const activityPanel = document.getElementById("activity-panel");
+  const actionsTab = document.getElementById("actions-tab");
+  const watchTab = document.getElementById("watch-tab");
+  const activityTab = document.getElementById("activity-tab");
+  const activityList = document.getElementById("activity-list");
+  const activityShowMore = document.getElementById("activity-show-more");
   const operationStatus = document.getElementById("operation-status");
   const generatedAt = document.getElementById("generated-at");
-  const activityPanel = document.getElementById("activity-panel");
-  const activityToggle = document.getElementById("activity-toggle");
-  const activityList = document.getElementById("activity-list");
   const loadMore = document.getElementById("load-more");
   const dialog = document.getElementById("confirm-dialog");
   const dialogMessage = document.getElementById("confirm-dialog-message");
@@ -1729,9 +1880,15 @@ function bootstrap(): void {
     !(refresh instanceof HTMLButtonElement) ||
     !(reconnect instanceof HTMLButtonElement) ||
     !(list instanceof HTMLElement) ||
+    !(watchList instanceof HTMLElement) ||
+    !(actionsPanel instanceof HTMLElement) ||
+    !(watchPanel instanceof HTMLElement) ||
     !(activityPanel instanceof HTMLElement) ||
-    !(activityToggle instanceof HTMLButtonElement) ||
+    !(actionsTab instanceof HTMLButtonElement) ||
+    !(watchTab instanceof HTMLButtonElement) ||
+    !(activityTab instanceof HTMLButtonElement) ||
     !(activityList instanceof HTMLElement) ||
+    !(activityShowMore instanceof HTMLButtonElement) ||
     !(operationStatus instanceof HTMLElement) ||
     !(generatedAt instanceof HTMLTimeElement) ||
     !(loadMore instanceof HTMLButtonElement) ||
@@ -1753,9 +1910,15 @@ function bootstrap(): void {
     refresh,
     reconnect,
     list,
+    watchList,
+    actionsPanel,
+    watchPanel,
     activityPanel,
-    activityToggle,
+    actionsTab,
+    watchTab,
+    activityTab,
     activityList,
+    activityShowMore,
     operationStatus,
     generatedAt,
     loadMore,
@@ -1770,9 +1933,12 @@ function bootstrap(): void {
   };
   refresh.addEventListener("click", requestRefresh);
   reconnect.addEventListener("click", requestRefresh);
-  activityToggle.addEventListener("click", () => {
-    state.activityCollapsed = !state.activityCollapsed;
-    persistActivityCollapsed(state.activityCollapsed);
+  for (const tab of [actionsTab, watchTab, activityTab]) {
+    tab.addEventListener("click", () => selectTab(tab.dataset.tab as InboxTab, false));
+    tab.addEventListener("keydown", handleTabKeydown);
+  }
+  activityShowMore.addEventListener("click", () => {
+    state.activityExpanded = true;
     render();
   });
   citationStyle.value = state.citationStyle;
