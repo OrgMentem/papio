@@ -1651,7 +1651,9 @@ export class Bridge {
         pruned = true;
         continue;
       }
-      if (tab.active === true) continue;
+      // Never the tab the user is looking at, and never the keepalive
+      // resolver tab — Chrome marks it pinned, and it is papio's session.
+      if (tab.active === true || tab.pinned === true) continue;
       orphans.add(tabID);
     }
     if (pruned) await this.saveTabLedger(ledger);
@@ -1665,7 +1667,14 @@ export class Bridge {
           continue;
         }
         for (const tab of members) {
-          if (tab.id === undefined || tracked.has(tab.id) || tab.active === true) continue;
+          if (
+            tab.id === undefined ||
+            tracked.has(tab.id) ||
+            tab.active === true ||
+            tab.pinned === true
+          ) {
+            continue;
+          }
           orphans.add(tab.id);
         }
       }

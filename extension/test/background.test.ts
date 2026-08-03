@@ -3923,6 +3923,9 @@ test("orphan scan flags ledgered and papio-group leftovers but never tracked or 
   // 302: pre-ledger leftover still sitting in a papio-titled group.
   h.tabs.live.set(302, { id: 302, url: "https://provider.example.org/c", groupId: 700 });
   h.tabGroups!.live.set(700, { id: 700, collapsed: true, title: "papio", windowId: 1 });
+  // 303: the pinned keepalive resolver tab folded into the papio group —
+  // papio's own session anchor, never an orphan.
+  h.tabs.live.set(303, { id: 303, url: "https://resolver.example.edu/keepalive", groupId: 700, pinned: true });
 
   const status = await h.bridge.orphanTabStatus();
   expect(status).toEqual({ count: 2, tab_ids: [300, 302] });
