@@ -11,6 +11,8 @@ execution records in `notes/acquisition-stack-plan.md`.
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-08-04
+
 ### Added
 
 - **`papio doctor` reports native-host version skew.** One papio binary is CLI,
@@ -22,43 +24,6 @@ execution records in `notes/acquisition-stack-plan.md`.
   when its version differs from the daemon's, naming the path and the fix.
   `papio-native-host --version` now answers directly, so the probe works whichever
   copy the symlink resolves to.
-
-### Changed
-
-- **Unsupported provider pages now become actionable instead of occupying a
-  browser-drive slot indefinitely.** A stable resolver landing outside the
-  capped provider list enters the same bounded evidence path. The extension
-  can send its existing sanitized diagnostic and `ui_changed` outcome; the
-  daemon creates a manual-download action that explicitly names the missing
-  adapter and whether local evidence was retained. A missing browser grant is
-  not terminal: the governed tab stays live and resumes after the operator
-  allows that exact provider origin.
-- **Provider-adapter evidence now has a documented contribution path.** The
-  guide starts with automatic local gap captures, `papio adapter captures`, and
-  `papio adapter diagnose`; it requires review and minimization before any
-  fixture is shared, then identifies the declarative spec and focused checks
-  needed for a code contribution.
-
-### Fixed
-
-- **Large page captures no longer kill the browser session.** The IPC request
-  cap (64 KiB) was smaller than a legal 256 KiB browser frame, so any
-  `page_capture` over ~63 KiB failed the native host's relay mid-sync; the
-  host treated that as a fatal transport error and said goodbye, tearing down
-  the live session and aborting the capture (`nav_failed: browser session
-  disconnected during page capture`) and re-parking every in-flight handoff.
-  The cap is now 512 KiB and a nativehost regression test pins the invariant.
-- **A large focus batch can no longer overflow one sync response.** Handoff
-  focus requests now drain in bounded batches, with the remainder riding the
-  next ordinary poll, so a caller-supplied job-id list cannot push a
-  `browser.sync` response past the IPC result cap — the same class of fatal
-  transport failure as the request-side bug above, in the other direction.
-  `TestSyncResponseFitsResultCap` pins the response-side invariant.
-
-## [0.17.0] - 2026-08-03
-
-### Added
-
 - **Quarantined PDF previews now include the decision at the point of
   inspection.** The loopback capability URL renders a citation-aware review
   bar above the PDF and records accept or reject through the same durable,
@@ -141,8 +106,37 @@ execution records in `notes/acquisition-stack-plan.md`.
   single `browser.offers_paced` event carrying how many are held back —
   bulk-releasing a hundred parked jobs now drains as a trickle, not a flood.
 
+### Changed
+
+- **Unsupported provider pages now become actionable instead of occupying a
+  browser-drive slot indefinitely.** A stable resolver landing outside the
+  capped provider list enters the same bounded evidence path. The extension
+  can send its existing sanitized diagnostic and `ui_changed` outcome; the
+  daemon creates a manual-download action that explicitly names the missing
+  adapter and whether local evidence was retained. A missing browser grant is
+  not terminal: the governed tab stays live and resumes after the operator
+  allows that exact provider origin.
+- **Provider-adapter evidence now has a documented contribution path.** The
+  guide starts with automatic local gap captures, `papio adapter captures`, and
+  `papio adapter diagnose`; it requires review and minimization before any
+  fixture is shared, then identifies the declarative spec and focused checks
+  needed for a code contribution.
+
 ### Fixed
 
+- **Large page captures no longer kill the browser session.** The IPC request
+  cap (64 KiB) was smaller than a legal 256 KiB browser frame, so any
+  `page_capture` over ~63 KiB failed the native host's relay mid-sync; the
+  host treated that as a fatal transport error and said goodbye, tearing down
+  the live session and aborting the capture (`nav_failed: browser session
+  disconnected during page capture`) and re-parking every in-flight handoff.
+  The cap is now 512 KiB and a nativehost regression test pins the invariant.
+- **A large focus batch can no longer overflow one sync response.** Handoff
+  focus requests now drain in bounded batches, with the remainder riding the
+  next ordinary poll, so a caller-supplied job-id list cannot push a
+  `browser.sync` response past the IPC result cap — the same class of fatal
+  transport failure as the request-side bug above, in the other direction.
+  `TestSyncResponseFitsResultCap` pins the response-side invariant.
 - **A failed adopted download no longer mislabels paywalled work as needing no
   sign-in.** The replacement manual-download action inherits the resolved
   handoff's authentication classification instead of a blank one.

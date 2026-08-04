@@ -16,6 +16,8 @@ for the full pre-split extension history.
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-08-04
+
 ### Added
 
 - **ClinicalKey full-text pages are autonomous.** The `clinicalkey` 0.1.0
@@ -32,25 +34,6 @@ for the full pre-split extension history.
   provider list gets one bounded render window, attempts a sanitized local
   diagnostic capture, then becomes a **No adapter yet** manual-download action
   instead of spinning indefinitely.
-
-### Changed
-
-- **Solicited CLI fixture captures open visibly.** The explicit
-  `papio adapter capture` request restores the work window while it runs, so
-  visibility-dependent SPAs and consent managers can finish rendering; the
-  governed tab is still closed after capture.
-
-### Fixed
-
-- **Closing a handoff tab no longer breaks its classification retry.** A
-  scheduled retry for a paper whose tab you closed — or one still queued for a
-  browser slot — now ends quietly instead of raising an unhandled error inside
-  the extension's background timer.
-
-## [0.9.0] - 2026-08-03
-
-### Added
-
 - **Adapters for two more entitled routes.** Informit (`informit` 0.1.0):
   the SAML terms wall classifies as `terms` with an explicit consent control
   and the Atypon article page downloads via its captured PDF control. JSTOR
@@ -159,6 +142,10 @@ for the full pre-split extension history.
 
 ### Changed
 
+- **Solicited CLI fixture captures open visibly.** The explicit
+  `papio adapter capture` request restores the work window while it runs, so
+  visibility-dependent SPAs and consent managers can finish rendering; the
+  governed tab is still closed after capture.
 - **The popup puts actions where operators look for them.** The current-page
   acquire action is now a paper-plus icon beside Inbox and leaves behind only
   live progress or delivery feedback; idle pages no longer consume a card.
@@ -172,6 +159,13 @@ for the full pre-split extension history.
   sign-in state takes the next slot, and the pending triage count is shown only
   when higher-priority attention is clear. Popup and options surfaces continue
   to expose the fuller status and version details.
+
+### Fixed
+
+- **Closing a handoff tab no longer breaks its classification retry.** A
+  scheduled retry for a paper whose tab you closed — or one still queued for a
+  browser slot — now ends quietly instead of raising an unhandled error inside
+  the extension's background timer.
 
 ## [0.8.1] - 2026-08-02
 
