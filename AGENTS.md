@@ -104,6 +104,13 @@ Bump the pinned zensical version in `docs/requirements.txt` deliberately; CI ins
   always populated" can be correct for every current code path and still break on old dev data.
   Check row/job `created_at` and whether the schema/validation predates it before assuming a
   "shouldn't happen" state is a live bug.
+- **An IPC/transport cap fix only lands when the *native host* binary is new too.**
+  `internal/ipc/client.go` enforces `MaxRequestBytes` **client-side, inside the host
+  process**, so a stale host keeps rejecting oversized `browser.sync` requests against an
+  upgraded daemon — and treats that rejection as fatal (see the transport-cap footgun
+  under **Protocol**). With two papio binaries installed this is the default failure, not
+  an edge case: `papio doctor`'s `native host (version)` check now fails on host/daemon
+  skew, and `papio native-host install` repoints the symlink at the binary you ran it from.
 
 ### Identifiers (two deliberate normalization semantics — do not merge them)
 - **`internal/work` and `internal/ownership` normalize identifiers to DIFFERENT
@@ -207,6 +214,42 @@ Bump the pinned zensical version in `docs/requirements.txt` deliberately; CI ins
   `instanceof HTMLInputElement`) needs the matching constructor added to that
   `Object.assign(globalThis, {...})` block too, or every test in the file fails with an
   unhelpful generic error.
+- **`ipc.MaxRequestBytes` MUST exceed `protocol.MaxBrowserMessageBytes` (256 KiB), and
+  `ipc.MaxResultBytes` MUST bound the whole response.** The native host relays each browser
+  frame to the daemon inside **one** `browser.sync` request, so a legal max-size frame has
+  to fit the IPC cap. It did not: the cap was 64 KiB, so every `page_capture` over ~63 KiB
+  failed the relay with `ipc.ErrTooLarge`, the host treated the Sync failure as fatal, sent
+  `goodbye`, and the daemon tore down the live session — `nav_failed: browser session
+  disconnected during page capture`, capture lost, every in-flight handoff re-parked.
+  Fixture-size pages fit, so the harness looked healthy until a real provider page (MDPI:
+  545 KB sanitized → 102 KB frame) hit the wall. This is the same class as the
+  bridge-handler rule above, one layer down: **the transport is fail-fatal too.** Raising a
+  frame cap or adding a large frame type means checking BOTH directions —
+  `TestSyncRequestFitsMaxBrowserFrame` (`internal/nativehost`) and
+  `TestSyncResponseFitsResultCap` (`internal/browser`) pin them, and the response side also
+  depends on `maxOutstandingOffers`/`maxFocusFramesPerPoll` staying small.
+- **Chrome forwards native-host stderr nowhere** — not to `chrome_debug.log`, even with
+  `--enable-logging --v=0` — so a host that dies mid-session leaves no browser-side trace.
+  To read its dying words, drive it yourself: spawn
+  `papio-native-host chrome-extension://<id>/` and speak native messaging on stdin (4-byte
+  little-endian length prefix + JSON), starting with a valid `hello`
+  (`{extension_version, adapter_versions}` — `features` live on the ACK, not the hello).
+  That is what surfaced `browser.sync: ipc message exceeds size limit` after comparing the
+  Go and TS validators had exonerated the frame. Same spirit: replay a suspect frame
+  through the real parsers in isolation (`parseBrowserMessage` under bun,
+  `protocol.DecodeBrowserMessage` in a throwaway Go main) before touching a browser.
+
+### Browser sessions & holder arbitration
+- **Only one connected browser holds the bridge; the rest poll as pending.** Two browsers
+  with the extension installed (the user's Chrome and a dev harness) will trade the slot —
+  every service-worker restart re-claims it or is denied (`denied: session held by …` in
+  the daemon log), and offers/captures route **only** to the holder, so a harness can
+  silently steal the user's session. `papio browser use <id-prefix>` pins a chosen session
+  (the demoted one stays pending and keeps polling); `papio browser sessions` lists them.
+- **Read a refused capture precisely.** `busy` = the holder's handoff drive slots are
+  occupied by real work; `not_permitted` = the provider host grant is missing;
+  `nav_failed: browser session disconnected …` = the transport teardown above, not a
+  provider problem.
 
 ### Firefox / cross-browser extension
 - Firefox MV3 has **no service worker** — background is a classic **event-page iife**
@@ -266,6 +309,27 @@ Bump the pinned zensical version in `docs/requirements.txt` deliberately; CI ins
 - A fresh dev-Chrome profile has the library **SSO** but **not per-publisher entitlements** —
   providers paywall unless reached via the resolver/proxy. `?accountid=<id>` is the exception
   for ProQuest (see below).
+- **Branded Chrome 137+ ignores `--load-extension`, and pairing it with
+  `--disable-extensions-except` disables the extension subsystem entirely** — every
+  extension page returns `ERR_BLOCKED_BY_CLIENT` and `chrome://extensions` lists nothing,
+  while the flags look like they worked. Spawn with `--enable-unsafe-extension-debugging`
+  and install over CDP (`Extensions.loadUnpacked`) instead; `extension/dev-unpacked`'s
+  deterministic id (`maghibajggmcgmbeoipnlfmceillgapk`) is already in the native-host
+  manifest allowlist. Install **once** — a second `loadUnpacked` into the same profile
+  corrupts it (service worker runs, every extension page blocked); wipe the profile.
+- **Provider hosts are `optional_host_permissions`, so nothing grants them
+  programmatically.** `chrome.developerPrivate.addHostPermission` silently no-ops for them
+  (it only un-withholds declared manifest hosts), and CDP's `Runtime.evaluate`
+  `userGesture` does not satisfy extension gesture tracking. The only path is the real
+  prompt: fire the options-page toggle with trusted `Input.dispatchMouseEvent`, then accept
+  Chrome's dialog — a separate ~448×196 window whose screenshot renders the **parent**
+  window, so pixel clicks miss. Resolve its buttons with `desktop.elementAt(x, y)` and
+  `press()` the rightmost one.
+- **A `_`-prefixed file anywhere in an unpacked extension directory breaks the whole load**
+  (`Cannot load extension with file or directory name _reload.html. Filenames starting with
+  "_" are reserved`). Chrome refuses the manifest, so one leftover scratch file in
+  `extension/` or `extension/dev-unpacked/` bricks an extension reload — including the
+  user's daily browser — with nothing pointing at the temp file as the cause.
 
 ### Adapters & fixtures
 - An adapter **cannot** enter `extension/src/adapters/types.ts` without a captured fixture —

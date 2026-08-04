@@ -22,6 +22,7 @@ import (
 	"papio/internal/artifact"
 	"papio/internal/captures"
 	"papio/internal/config"
+	"papio/internal/ipc"
 	"papio/internal/job"
 	"papio/internal/pdf"
 	"papio/internal/preview"
@@ -3465,5 +3466,56 @@ func TestFocusHandoffsRefusesAnUnofferableJob(t *testing.T) {
 	}
 	if queued != 1 {
 		t.Fatalf("queued = %d, want 1: only the delegated job can actually be focused", queued)
+	}
+}
+
+// TestSyncResponseFitsResultCap pins the response half of the transport
+// invariant that TestSyncRequestFitsMaxBrowserFrame pins for requests. One
+// browser.sync response MUST fit ipc.MaxResultBytes: an oversized response
+// fails the native host's Sync call, and the host treats any Sync failure as
+// fatal — it says goodbye and the daemon tears down the live browser session,
+// losing the capture and re-parking every in-flight handoff.
+//
+// The bound holds because (a) b.frame self-validates every outbound frame
+// through the strict decoder, so no single frame exceeds
+// protocol.MaxBrowserMessageBytes, (b) the host relays at most one inbound
+// frame per sync, so at most one max-size solicited response can ride one
+// response, and (c) the offer and focus batches are capped by
+// maxOutstandingOffers and maxFocusFramesPerPoll. Loosening any of those trips
+// this test.
+func TestSyncResponseFitsResultCap(t *testing.T) {
+	b := &Bridge{}
+	// A job_offer is the largest frame the daemon emits unsolicited, and every
+	// one of its variable fields is bounded by JobOfferPayload.validate: openurl
+	// 4000, provider_hosts 20 entries, expected DOI 300 and title 500. Build one
+	// at those legal maxima so the arithmetic below is a real ceiling, not a
+	// sample. Only encoded length matters, so identical hosts are fine.
+	hosts := make([]string, 20)
+	for i := range hosts {
+		hosts[i] = strings.Repeat("h", 60) + ".example.com"
+	}
+	openURLPrefix := "https://resolver.example.edu/openurl?"
+	offer, err := b.frame(protocol.MsgJobOffer, "job_"+strings.Repeat("f", 26), protocol.JobOfferPayload{
+		OpenURL:       openURLPrefix + strings.Repeat("k", 4000-len(openURLPrefix)),
+		ProviderHosts: hosts,
+		Expected: &protocol.JobOfferExpected{
+			DOI:   "10.1234/" + strings.Repeat("d", 292),
+			Title: strings.Repeat("t", 500),
+		},
+		AccessMode:        "delegated",
+		ProquestAccountID: strings.Repeat("9", 64),
+		RequiresAuth:      true,
+		ExpiresAt:         "2026-08-04T00:00:00Z",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Cancel and focus frames carry only a job id and an empty payload, so
+	// sizing every batched frame as a maximal offer is deliberately pessimistic.
+	batched := (maxOutstandingOffers + maxFocusFramesPerPoll) * len(offer)
+	worst := protocol.MaxBrowserMessageBytes + batched
+	if worst > ipc.MaxResultBytes {
+		t.Fatalf("worst-case sync response %d bytes exceeds ipc.MaxResultBytes %d: one max-size solicited response (%d) + %d batched frames of %d bytes",
+			worst, ipc.MaxResultBytes, protocol.MaxBrowserMessageBytes, maxOutstandingOffers+maxFocusFramesPerPoll, len(offer))
 	}
 }

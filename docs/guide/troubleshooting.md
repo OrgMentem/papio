@@ -87,6 +87,7 @@ PASS  daemon                   reachable; version 0.1.0
 WARN  extension                extension has not connected since daemon start
 PASS  native host (Chrome)     manifest allows configured extension
 PASS  native host (Firefox)    manifest allows configured extension
+PASS  native host (version)    matches the daemon (0.1.0)
 PASS  zotio                    version 1.0.0; required capabilities available
 ```
 
@@ -275,6 +276,26 @@ and any components it holds. The attempted tiers are the useful part when a pape
 *should* have been available: `none` means no source was ever reached, and a list
 containing only `open_access` when you expected an institutional pass means the
 institutional route was never tried rather than tried and refused.
+
+### The browser link drops while a page is being captured
+
+A handoff or `papio adapter capture` that ends in `browser session disconnected
+during page capture` means *papio*'s link to the browser dropped while the
+extension was sending a captured page back. Jobs bounce straight back to waiting
+and the extension reconnects a few seconds later, so it can repeat in a loop.
+
+Large provider pages could trigger this in 0.17.0 and earlier. Upgrade, then
+confirm the browser connector is the same version as the background service:
+
+```sh
+papio doctor
+papio native-host status
+```
+
+The `native host (version)` check must pass. If it does not, your browser is
+still starting an older connector even though the service is current: run
+`papio native-host install` from the *papio* you want it to use, then quit the
+running connector process so the browser starts the new one.
 
 ### A parked job with no open action
 

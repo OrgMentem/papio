@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"strings"
 	"time"
 
@@ -48,6 +49,18 @@ func defaultDoctorDependencies(opt *options) doctor.IntegrationDependencies {
 		HostExecutableResolves: func(execPath string) bool {
 			_, err := os.Stat(execPath)
 			return err == nil
+		},
+		// Runs the host binary the manifest names, so a symlink pointing at an
+		// older copy is reported rather than assumed current. Bounded: doctor
+		// must never hang on a wedged executable.
+		HostExecutableVersion: func(ctx context.Context, execPath string) (string, error) {
+			ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
+			out, err := exec.CommandContext(ctx, execPath, "--version").Output()
+			if err != nil {
+				return "", err
+			}
+			return strings.TrimPrefix(strings.TrimSpace(string(out)), "papio "), nil
 		},
 		ZotioPreflight: func(ctx context.Context, cfg config.Config) (*zotio.PreflightResult, error) {
 			return zotio.New(cfg.Zotio).Preflight(ctx)

@@ -5906,8 +5906,16 @@ export class Bridge {
 
   private async reclassifyCurrentProviderPage(jobID: string, allowUnregistered = false): Promise<void> {
     const job = findByJob(this.store, jobID);
-    if (!job) return;
-    const tab = await this.deps.tabs.get(job.tab_id);
+    // A queued handoff (tab_id -1) has no page yet, and a closed one never
+    // will: normal tab-removal recovery stays authoritative. Callers include a
+    // bare classify-retry timer, so a throw here would escape unhandled.
+    if (!job || job.tab_id < 0) return;
+    let tab: TabInfo;
+    try {
+      tab = await this.deps.tabs.get(job.tab_id);
+    } catch {
+      return;
+    }
     if (tab.url === undefined || isAuthenticationURL(tab.url)) return;
     let host: string;
     try {

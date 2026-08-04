@@ -11,6 +11,18 @@ execution records in `notes/acquisition-stack-plan.md`.
 
 ## [Unreleased]
 
+### Added
+
+- **`papio doctor` reports native-host version skew.** One papio binary is CLI,
+  daemon, and native host, but the native-messaging manifest can point at a
+  different copy than the daemon that is running (a packaged install beside a
+  local build, or a symlink an upgrade left behind). A stale host enforces its
+  own older transport rules, so browser work keeps failing while the daemon
+  looks healthy. Doctor now runs the executable the manifest names and fails
+  when its version differs from the daemon's, naming the path and the fix.
+  `papio-native-host --version` now answers directly, so the probe works whichever
+  copy the symlink resolves to.
+
 ### Changed
 
 - **Unsupported provider pages now become actionable instead of occupying a
@@ -36,6 +48,12 @@ execution records in `notes/acquisition-stack-plan.md`.
   the live session and aborting the capture (`nav_failed: browser session
   disconnected during page capture`) and re-parking every in-flight handoff.
   The cap is now 512 KiB and a nativehost regression test pins the invariant.
+- **A large focus batch can no longer overflow one sync response.** Handoff
+  focus requests now drain in bounded batches, with the remainder riding the
+  next ordinary poll, so a caller-supplied job-id list cannot push a
+  `browser.sync` response past the IPC result cap — the same class of fatal
+  transport failure as the request-side bug above, in the other direction.
+  `TestSyncResponseFitsResultCap` pins the response-side invariant.
 
 ## [0.17.0] - 2026-08-03
 

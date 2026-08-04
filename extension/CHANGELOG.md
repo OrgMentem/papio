@@ -40,6 +40,13 @@ for the full pre-split extension history.
   visibility-dependent SPAs and consent managers can finish rendering; the
   governed tab is still closed after capture.
 
+### Fixed
+
+- **Closing a handoff tab no longer breaks its classification retry.** A
+  scheduled retry for a paper whose tab you closed — or one still queued for a
+  browser slot — now ends quietly instead of raising an unhandled error inside
+  the extension's background timer.
+
 ## [0.9.0] - 2026-08-03
 
 ### Added

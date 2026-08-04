@@ -157,6 +157,13 @@ migration plan before merging; do not tag first and design compatibility later.
       drift.
 - [ ] Confirm `extension/manifest.json` has the intended extension version.
 - [ ] Confirm the papio tag is on the exact reviewed commit.
+- [ ] Exercise one **real, large provider page capture** end to end through a live
+      browser session: `papio adapter capture <real provider article URL> --provider
+      <id> --scenario success` must report `outcome: captured`. Every committed
+      fixture is small, and the frame path only fails on bodies well above fixture
+      size, so a fixture-only run cannot see a transport-cap regression — it shows up
+      as `nav_failed: browser session disconnected during page capture` and takes the
+      live session down with it.
 
 ## Post-tag checklist
 
@@ -173,6 +180,14 @@ migration plan before merging; do not tag first and design compatibility later.
       delete the `skip_upload` line so subsequent releases ride the normal
       version-bump path.
 - [ ] Validate the tagged papio artifacts before announcing them.
+- [ ] Confirm the installed native host is the released binary. `papio doctor`'s
+      `native host (version)` check must pass (or read `papio native-host status`).
+      One binary is CLI, daemon, **and** native host, and the host enforces its own
+      copy of the transport caps and protocol rules, so a symlink still pointing at a
+      previous copy keeps all browser work on the old code while the daemon reports
+      current. Fix by running `papio native-host install` from the binary you want the
+      host to be, then killing the running `papio-native-host` so the browser respawns
+      it. On a machine carrying both a packaged install and a local build, update both.
 
 ## Extension store submission
 

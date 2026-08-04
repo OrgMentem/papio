@@ -400,3 +400,22 @@ func TestSyncRequestFitsMaxBrowserFrame(t *testing.T) {
 		t.Fatalf("DecodeRequest rejected a max-size browser sync request: %v", err)
 	}
 }
+
+// TestRunReportsVersion pins the probe `papio doctor`'s host-skew check depends
+// on. The host is entered by basename, so a bare `papio-native-host --version`
+// reaches Run as what would otherwise be parsed as an extension origin; it must
+// answer with its own version instead of rejecting the argument.
+func TestRunReportsVersion(t *testing.T) {
+	for _, flag := range []string{"--version", "-v"} {
+		var stdout, stderr bytes.Buffer
+		if err := Run(context.Background(), []string{flag}, strings.NewReader(""), &stdout, &stderr); err != nil {
+			t.Fatalf("Run(%s) = %v, want nil", flag, err)
+		}
+		if got := strings.TrimSpace(stdout.String()); !strings.HasPrefix(got, "papio ") {
+			t.Fatalf("Run(%s) stdout = %q, want a \"papio <version>\" line", flag, got)
+		}
+		if stderr.Len() != 0 {
+			t.Fatalf("Run(%s) stderr = %q, want empty", flag, stderr.String())
+		}
+	}
+}

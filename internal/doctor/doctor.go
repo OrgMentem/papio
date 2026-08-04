@@ -398,9 +398,14 @@ type IntegrationDependencies struct {
 	// nil the check is skipped. Catches a dangling host symlink — e.g. a brew
 	// upgrade deleting the versioned binary the symlink was pinned to.
 	HostExecutableResolves func(execPath string) bool
-	ZotioPreflight         func(context.Context, config.Config) (*zotio.PreflightResult, error)
-	CheckUpdates           func(context.Context, config.Config) *update.Info
-	CheckZotioUpdates      func(context.Context, config.Config) *update.Info
+	// HostExecutableVersion reports the bare version string (no "papio "
+	// prefix) that the native-host executable at execPath prints. Optional:
+	// when nil the skew check is skipped. Catches a host binary older than the
+	// running daemon — see runHostVersionCheck for why that is not cosmetic.
+	HostExecutableVersion func(ctx context.Context, execPath string) (string, error)
+	ZotioPreflight        func(context.Context, config.Config) (*zotio.PreflightResult, error)
+	CheckUpdates          func(context.Context, config.Config) *update.Info
+	CheckZotioUpdates     func(context.Context, config.Config) *update.Info
 	// LibrarySources probes the configured generic holdings sources. A nil
 	// function is an unavailable probe facility, reported as a bounded Skip when
 	// sources are configured.
@@ -507,6 +512,7 @@ func RunIntegration(ctx context.Context, deps IntegrationDependencies) Report {
 	}
 
 	runManifestChecks(cfg, deps, add)
+	runHostVersionCheck(ctx, cfg, status.Version, deps, add)
 
 	runLibraryChecks(ctx, cfg, deps, add)
 
@@ -693,6 +699,65 @@ func runManifestChecks(cfg config.Config, deps IntegrationDependencies, add func
 		firefoxIDs = []string{cfg.Browser.FirefoxExtensionID}
 	}
 	runManifestCheck("native host (Firefox)", firefoxIDs, "", cfg, deps.FirefoxDir, deps.ReadFile, deps.HostExecutableResolves, add)
+}
+
+// runHostVersionCheck compares the native-host executable's version to the
+// running daemon's. One papio binary is CLI, daemon, AND native host, but the
+// native-messaging manifest can point at a different copy than the daemon that
+// is running: a brew install beside a ~/.local/bin build, or a symlink an
+// upgrade left pointing at the previous release.
+//
+// That skew is not cosmetic and it was invisible before this check. The host
+// enforces its own copy of the transport rules — it validates every frame and
+// bounds the browser.sync request itself (internal/ipc/client.go) — so a stale
+// host keeps rejecting large page-capture relays, and it treats that rejection
+// as fatal: goodbye, and the daemon tears down the live browser session. The
+// daemon can be perfectly up to date while every large capture still dies.
+func runHostVersionCheck(ctx context.Context, cfg config.Config, daemonVersion string, deps IntegrationDependencies, add func(string, string, string, string)) {
+	const name = "native host (version)"
+	if deps.HostExecutableVersion == nil {
+		add(name, Skip, "skipped: the host version cannot be probed from here", "")
+		return
+	}
+	if len(cfg.Browser.ChromiumExtensionIDs()) == 0 {
+		add(name, Skip, "skipped: extension ID is not configured", "")
+		return
+	}
+	dir, err := deps.ManifestDir(cfg)
+	if err != nil {
+		add(name, Skip, "skipped: the native-host manifest location is unknown", "")
+		return
+	}
+	// A missing, unreadable, or malformed manifest is already reported by the
+	// manifest check with its own remediation. Skip quietly instead of adding a
+	// second failure for one cause.
+	data, err := deps.ReadFile(filepath.Join(dir, nativeHostManifestName+".json"))
+	if err != nil {
+		add(name, Skip, "skipped: the native-host manifest is unavailable", "")
+		return
+	}
+	var manifest nativeHostManifest
+	if err := json.Unmarshal(data, &manifest); err != nil || strings.TrimSpace(manifest.Path) == "" {
+		add(name, Skip, "skipped: the native-host manifest does not name an executable", "")
+		return
+	}
+	version, err := deps.HostExecutableVersion(ctx, manifest.Path)
+	if err != nil {
+		add(name, Warn, "could not read the version of "+manifest.Path+" ("+err.Error()+")",
+			"papio native-host install")
+		return
+	}
+	version = strings.TrimSpace(version)
+	switch {
+	case version == "":
+		add(name, Warn, manifest.Path+" reported no version", "papio native-host install")
+	case version != daemonVersion:
+		add(name, Fail,
+			fmt.Sprintf("host %s at %s, daemon %s — browsers spawn the stale binary", version, manifest.Path, daemonVersion),
+			"papio native-host install, then kill the running papio-native-host process (the browser respawns it)")
+	default:
+		add(name, Pass, "matches the daemon ("+version+")", "")
+	}
 }
 
 const nativeHostManifestName = "com.orgmentem.papio"

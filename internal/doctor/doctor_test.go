@@ -438,6 +438,90 @@ func TestRunIntegrationFailsOnDanglingHostExecutable(t *testing.T) {
 	}
 }
 
+func TestRunIntegrationHostVersionSkew(t *testing.T) {
+	const extID = "abcdefghijklmnopabcdefghijklmnop"
+	const hostPath = "/opt/homebrew/bin/papio"
+	depsFor := func(t *testing.T, hostVersion string) IntegrationDependencies {
+		t.Helper()
+		cfg := config.Default()
+		cfg.Path = filepath.Join(t.TempDir(), "config.toml")
+		cfg.Browser.ExtensionID = extID
+		manifestDir := t.TempDir()
+		manifest := `{"name":"com.orgmentem.papio","path":"` + hostPath + `","type":"stdio",` +
+			`"allowed_origins":["chrome-extension://` + extID + `/"]}`
+		if err := os.WriteFile(filepath.Join(manifestDir, "com.orgmentem.papio.json"), []byte(manifest), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return IntegrationDependencies{
+			CLIVersion: "0.17.0",
+			LoadConfig: func() (config.Config, error) { return cfg, nil },
+			DaemonStatus: func(context.Context, config.Config) (DaemonStatus, error) {
+				return DaemonStatus{Status: "ok", Version: "0.17.0"}, nil
+			},
+			ManifestDir:            func(config.Config) (string, error) { return manifestDir, nil },
+			FirefoxDir:             func(config.Config) (string, error) { return t.TempDir(), nil },
+			ReadFile:               os.ReadFile,
+			HostExecutableResolves: func(string) bool { return true },
+			HostExecutableVersion: func(_ context.Context, execPath string) (string, error) {
+				if execPath != hostPath {
+					t.Fatalf("probed %q, want the executable the manifest names (%q)", execPath, hostPath)
+				}
+				return hostVersion, nil
+			},
+			ZotioPreflight: func(context.Context, config.Config) (*zotio.PreflightResult, error) {
+				return &zotio.PreflightResult{Version: "1.2.3"}, nil
+			},
+		}
+	}
+	find := func(t *testing.T, report Report) Check {
+		t.Helper()
+		for _, c := range report.Checks {
+			if c.Name == "native host (version)" {
+				return c
+			}
+		}
+		t.Fatalf("no native host (version) check in %+v", report.Checks)
+		return Check{}
+	}
+
+	t.Run("matching host passes", func(t *testing.T) {
+		report := RunIntegration(context.Background(), depsFor(t, "0.17.0"))
+		if check := find(t, report); check.Status != Pass {
+			t.Fatalf("check = %#v, want Pass", check)
+		}
+	})
+
+	t.Run("stale host fails with the remediation", func(t *testing.T) {
+		// The brew copy the symlink points at predates the daemon, so browsers
+		// keep spawning a host that enforces the old transport rules.
+		report := RunIntegration(context.Background(), depsFor(t, "0.16.0"))
+		check := find(t, report)
+		if check.Status != Fail {
+			t.Fatalf("check = %#v, want Fail", check)
+		}
+		if !strings.Contains(check.Detail, "0.16.0") || !strings.Contains(check.Detail, hostPath) {
+			t.Fatalf("detail %q must name the stale version and its path", check.Detail)
+		}
+		if !strings.Contains(check.Remediation, "papio native-host install") {
+			t.Fatalf("remediation = %q, want papio native-host install", check.Remediation)
+		}
+		if report.OK {
+			t.Fatalf("report must fail on host/daemon skew: %+v", report)
+		}
+	})
+
+	t.Run("unprobeable host warns without failing the report", func(t *testing.T) {
+		deps := depsFor(t, "")
+		deps.HostExecutableVersion = func(context.Context, string) (string, error) {
+			return "", errors.New("permission denied")
+		}
+		report := RunIntegration(context.Background(), deps)
+		if check := find(t, report); check.Status != Warn {
+			t.Fatalf("check = %#v, want Warn", check)
+		}
+	})
+}
+
 func TestRunIntegrationUpdates(t *testing.T) {
 	baseConfig := func() config.Config {
 		cfg := config.Default()

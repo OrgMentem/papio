@@ -65,6 +65,14 @@ const (
 	maxOutstandingOffers         = 4
 	maxInstitutionalReoffers     = 4
 	handoffPageLimit             = 500
+	// maxFocusFramesPerPoll bounds the focus batch in ONE sync response. Focus
+	// requests accumulate from a caller-supplied job-id list, so an unbounded
+	// drain is the only term that can push a response past ipc.MaxResultBytes —
+	// and an oversized response fails the host's browser.sync, which the host
+	// treats as fatal and answers with goodbye, killing the live session. The
+	// remainder stays queued for the next ordinary poll. Pinned by
+	// TestSyncResponseFitsResultCap.
+	maxFocusFramesPerPoll = 32
 )
 
 // HandoffFocusMinExtensionVersion is the first extension that parses
@@ -2472,6 +2480,7 @@ func (b *Bridge) poll(ctx context.Context) ([]json.RawMessage, error) {
 			ids = append(ids, id)
 		}
 		sort.Strings(ids)
+		focused := 0
 		for _, id := range ids {
 			if _, ok := handoff[id]; !ok {
 				delete(b.focusPending, id)
@@ -2524,6 +2533,10 @@ func (b *Bridge) poll(ctx context.Context) ([]json.RawMessage, error) {
 			}
 			out = append(out, frame)
 			delete(b.focusPending, id)
+			focused++
+			if focused >= maxFocusFramesPerPoll {
+				break
+			}
 		}
 	}
 	if held == 0 {

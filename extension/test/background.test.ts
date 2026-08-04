@@ -1353,6 +1353,37 @@ test("missing provider access stays actionable and resumes the exact tab after g
   expect(h.backend.store.activeJobs[0]?.blocked_provider_host).toBeUndefined();
 });
 
+test("a classify retry whose handoff tab closed settles instead of rejecting", async () => {
+  const h = makeHarness();
+  h.deps.adapterSpecs.push(PROVIDER_ADAPTER);
+  h.deps.permissions.contains = async () => true;
+  h.deps.scripting.executeScript = async () => [{ result: { kind: "unknown" } }];
+
+  await h.bridge.start();
+  await h.port.inbound(helloAck());
+  await h.port.inbound(jobOffer("job_retry_after_tab_close"));
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  const articleURL = `https://${PROVIDER_HOST}/stable/article`;
+  h.tabs.live.set(tabID, { id: tabID, url: articleURL });
+  await h.tabs.onUpdated.emit(
+    tabID,
+    { url: articleURL, status: "complete" },
+    { id: tabID, url: articleURL },
+  );
+
+  const scheduled = h.timers.findIndex((timer) => timer.ms === 2_500);
+  expect(scheduled).toBeGreaterThanOrEqual(0);
+
+  // The operator closes the handoff before the retry fires. The retry is a bare
+  // timer callback, so a rejection here escapes as an unhandled rejection.
+  h.tabs.live.delete(tabID);
+  h.clock.now += 2_500;
+  await h.timers[scheduled]?.fn();
+
+  expect(h.frames().filter((frame) => frame.type === "provider_outcome")).toHaveLength(0);
+  expect(h.backend.store.activeJobs).toHaveLength(1);
+});
+
 test("one blocked provider host stays a single indication across repeated updates", async () => {
   const h = makeHarness();
   h.deps.adapterSpecs.push(PROVIDER_ADAPTER);

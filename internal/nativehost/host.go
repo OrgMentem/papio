@@ -32,6 +32,7 @@ import (
 	"sync"
 	"time"
 
+	"papio/internal/api"
 	"papio/internal/config"
 	"papio/internal/daemon"
 	"papio/internal/ipc"
@@ -91,6 +92,17 @@ type Syncer interface {
 // or mismatched browser extension identity, ensures the daemon is running, and
 // relays frames between the browser and the daemon until stdin closes or ctx is cancelled.
 func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
+	// The host is entered by basename, so `papio-native-host --version` would
+	// otherwise be parsed as an extension origin and rejected. Chrome always
+	// passes exactly one origin argument and never a flag, so a lone --version
+	// can only be a human — or `papio doctor`'s skew check — asking which binary
+	// this symlink resolves to. Answer before loading config: a stale host is
+	// precisely what the caller is diagnosing, and a config error must not hide
+	// the version.
+	if len(args) == 1 && (args[0] == "--version" || args[0] == "-v") {
+		fmt.Fprintln(stdout, "papio "+api.Version)
+		return nil
+	}
 	cfg, err := config.Load("")
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
