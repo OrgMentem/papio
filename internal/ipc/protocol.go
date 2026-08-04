@@ -17,8 +17,14 @@ const (
 	// ProtocolVersion identifies the incompatible IPC envelope version.
 	ProtocolVersion = "papio-ipc/1"
 
-	// MaxRequestBytes bounds one complete request envelope.
-	MaxRequestBytes = 64 << 10
+	// MaxRequestBytes bounds one complete request envelope. It MUST exceed
+	// protocol.MaxBrowserMessageBytes (256 KiB) with envelope headroom: the
+	// native host relays each browser frame to the daemon inside ONE
+	// browser.sync request, so a legal max-size page_capture frame must fit
+	// or the host treats the ErrTooLarge as a fatal transport failure and
+	// tears down the whole browser session (goodbye). Pinned by
+	// TestSyncRequestFitsMaxBrowserFrame in internal/nativehost.
+	MaxRequestBytes = 512 << 10
 	// MaxResultBytes bounds a successful result or an error response envelope.
 	MaxResultBytes = 1 << 20
 

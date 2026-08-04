@@ -27,6 +27,16 @@ execution records in `notes/acquisition-stack-plan.md`.
   fixture is shared, then identifies the declarative spec and focused checks
   needed for a code contribution.
 
+### Fixed
+
+- **Large page captures no longer kill the browser session.** The IPC request
+  cap (64 KiB) was smaller than a legal 256 KiB browser frame, so any
+  `page_capture` over ~63 KiB failed the native host's relay mid-sync; the
+  host treated that as a fatal transport error and said goodbye, tearing down
+  the live session and aborting the capture (`nav_failed: browser session
+  disconnected during page capture`) and re-parking every in-flight handoff.
+  The cap is now 512 KiB and a nativehost regression test pins the invariant.
+
 ## [0.17.0] - 2026-08-03
 
 ### Added

@@ -3,10 +3,12 @@
 package nativehost
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -15,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"papio/internal/ipc"
 	"papio/internal/protocol"
 )
 
@@ -356,5 +359,44 @@ func TestSyncRequestCarriesSessionIdentityAndGoodbye(t *testing.T) {
 	goodbye := syncer.request(true, nil)
 	if !goodbye.Goodbye || goodbye.SessionID != id {
 		t.Fatalf("goodbye request = %+v", goodbye)
+	}
+}
+
+// TestSyncRequestFitsMaxBrowserFrame pins the cross-layer size invariant: a
+// legal max-size browser frame, relayed as the single message of one
+// browser.sync request, must fit the IPC request cap. When it does not, the
+// host's Sync call fails ErrTooLarge, the host exits (fatal transport error),
+// and the goodbye tears down the whole browser session — every large
+// page_capture killed its session this way before the cap was raised.
+func TestSyncRequestFitsMaxBrowserFrame(t *testing.T) {
+	frame := json.RawMessage(append(
+		[]byte(`{"protocol":"papio-browser/1","type":"page_capture","msg_id":"m_frame_fit_1","seq":1,"payload":`),
+		append(make([]byte, 0, protocol.MaxBrowserMessageBytes), fmt.Sprintf(
+			`{"host":"example.org","scenario":"observed","encoding":"gzip+base64","bytes":1,"body":%q}}`,
+			strings.Repeat("A", protocol.MaxBrowserMessageBytes-256),
+		)...)...,
+	))
+	if len(frame) > protocol.MaxBrowserMessageBytes {
+		t.Fatalf("test frame %d bytes exceeds the browser cap %d", len(frame), protocol.MaxBrowserMessageBytes)
+	}
+	syncer := &ipcSyncer{sessionID: newSessionID()}
+	params, err := json.Marshal(syncer.request(false, []json.RawMessage{frame}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	envelope, err := json.Marshal(map[string]any{
+		"protocol": ipc.ProtocolVersion,
+		"id":       "request_frame_fit",
+		"method":   "browser.sync",
+		"params":   json.RawMessage(params),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(envelope) > ipc.MaxRequestBytes {
+		t.Fatalf("sync request %d bytes exceeds ipc.MaxRequestBytes %d; a max-size browser frame must transit the IPC", len(envelope), ipc.MaxRequestBytes)
+	}
+	if _, err := ipc.DecodeRequest(bytes.NewReader(envelope)); err != nil {
+		t.Fatalf("DecodeRequest rejected a max-size browser sync request: %v", err)
 	}
 }
