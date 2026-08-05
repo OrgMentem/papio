@@ -24,6 +24,30 @@ execution records in `notes/acquisition-stack-plan.md`.
 
 ### Fixed
 
+- **A rate-limit gate set mid-flight can no longer be raced.** `budget.Acquire`
+  checked the durable gate up front, then called `takeToken`, which may itself
+  sleep for up to `MaxInlineWait` waiting on the in-memory bucket. `reserve`'s
+  transaction never re-read `next_allowed_at` — it only ever *cleared* an
+  already-expired gate — so a worker sleeping in that window committed its
+  reservation and sent its request against a gate another worker's 429 had just
+  persisted, defeating the guarantee that one 429 stops every caller of that
+  source and credential. The gate is now re-read inside the same transaction
+  that moves the counters, and a live gate defers the reservation instead.
+- **The quarantined-PDF review shell refuses to be framed.** Its only controls
+  apply an irreversible, CAS-guarded verdict, so any page holding the
+  capability URL could have overlaid the shell and harvested a confirmation for
+  a file the operator never looked at. The shell now sends
+  `frame-ancestors 'none'` and an `X-Frame-Options: DENY` fallback; the
+  extension only ever opens it as a top-level tab, so no legitimate embed is
+  lost.
+- **`download_id` must be at least 1 on the wire.** It is half of the
+  `{job, download}` key the daemon correlates delivery provenance on, and all
+  three validators accepted `0` — so two downloads reported as `0` for one job
+  collided, letting a `delivery_context` for the first apply its access basis to
+  the second, unrelated candidate. Chrome allocates download ids from 1, so no
+  genuine client is affected; this closes the hole against a buggy or
+  compromised one. Tightened in the Go validators, the TypeScript mirror, and
+  the JSON schema together.
 - **Session evidence with no origin no longer releases another institution's
   parked handoffs.** `origin_hint` is optional on `session_evidence`, and an
   absent one was read as "match any profile": the fallback scan took the first

@@ -942,9 +942,17 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
       }
       break;
     }
+    // download_id must be >= 1, not >= 0: it is the correlation key half of
+    // browserDownloadKey{JobID, DownloadID} in internal/browser/bridge.go, and
+    // two downloads reported as download_id 0 for one job collide on that key
+    // (download_complete overwrites the first pending entry's CandidateID, and
+    // delivery_context then applies the first download's access_basis to the
+    // second, unrelated candidate). chrome.downloads allocates ids starting at
+    // 1, so a genuine extension never sends 0 — this only closes the gap for a
+    // buggy or compromised client.
     case "download_started": {
       requireFields<DownloadStartedPayload>(p, "download_started", { download_id: "required", filename: "required" });
-      int(p, "download_id", "download_started", 0);
+      int(p, "download_id", "download_started", 1);
       if (!FILENAME_RE.test(str(p, "filename", "download_started", 255))) {
         fail("download_started.filename must be a bare name without path separators");
       }
@@ -952,7 +960,7 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
     }
     case "download_complete": {
       requireFields<DownloadCompletePayload>(p, "download_complete", { download_id: "required", filename: "required", size_bytes: "required" });
-      int(p, "download_id", "download_complete", 0);
+      int(p, "download_id", "download_complete", 1);
       if (!FILENAME_RE.test(str(p, "filename", "download_complete", 255))) {
         fail("download_complete.filename must be a bare name without path separators");
       }
@@ -966,7 +974,7 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
         page_host: "optional",
         session_evidence: "required",
       });
-      int(p, "download_id", "delivery_context", 0);
+      int(p, "download_id", "delivery_context", 1);
       const route = str(p, "route", "delivery_context", 20);
       if (route !== "resolver" && route !== "direct" && route !== "oa") {
         fail(`delivery_context.route is invalid: ${JSON.stringify(route)}`);

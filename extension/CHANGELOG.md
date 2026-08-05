@@ -18,6 +18,22 @@ for the full pre-split extension history.
 
 ### Fixed
 
+- **A handoff that times out mid-login keeps its page.** The three-minute
+  drive timeout unconditionally closed the tab before parking the job, which
+  contradicts `parkHandoffForManual`'s own contract — "leaves the exact page
+  available to the operator" — and destroyed whatever the operator had in
+  flight: a half-completed IdP form, entered credentials, a pending 2FA
+  challenge. A timeout on a recognised authentication page now leaves the tab
+  open and only releases the governor slot. A timeout anywhere else still
+  closes the tab as before.
+- **The handoff-drive cap is enforced where it is defined.** Callers checked
+  `HANDOFF_DRIVE_LIMIT` themselves, but several do so before `await`s that
+  open a tab or persist the job, so two entry points that are not both on the
+  serialized inbound-frame chain could each pass the check and then register,
+  running more concurrent drives than the governor allows. The registration
+  itself now refuses at capacity and queues the job instead, so every call
+  site is safe by construction and no job is dropped — the queued drive reuses
+  the tab its caller already opened.
 - **The developer `terms` capture scenario can no longer disconnect the
   session.** `terms` was appended to the *existing* `page_capture` scenario
   enum, and the capture panel sent it gated only on `page_capture_v1` — a

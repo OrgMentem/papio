@@ -1680,9 +1680,20 @@ func (p *ProviderOutcomePayload) validate() error {
 	return nil
 }
 
+// validateDownload rejects download_id 0. Delivery provenance correlates on
+// browserDownloadKey{JobID, DownloadID} (internal/browser/bridge.go): two
+// downloads reported with download_id 0 for the same job collide on that key,
+// so a download_complete for the second overwrites the pending entry's
+// CandidateID from the first, and a delivery_context meant for the first
+// download applies its access_basis to the second, unrelated candidate — the
+// exact mis-binding class delivery provenance exists to prevent, reached
+// through the correlation key instead of the candidate id. This is fail-closed
+// hardening, not a live-traffic fix: chrome.downloads allocates ids starting
+// at 1 and increasing, so no genuine extension ever sends 0, and a floor of 1
+// cannot reject any frame a real client produces.
 func validateDownload(id int64, filename string) error {
-	if id < 0 || id > MaxBrowserInteger {
-		return fmt.Errorf("download_id must be in range 0..%d", MaxBrowserInteger)
+	if id < 1 || id > MaxBrowserInteger {
+		return fmt.Errorf("download_id must be in range 1..%d", MaxBrowserInteger)
 	}
 	if !filenameRE.MatchString(filename) {
 		return fmt.Errorf("filename must be a bare name without path separators")
@@ -1691,8 +1702,8 @@ func validateDownload(id int64, filename string) error {
 }
 
 func (p *DeliveryContextPayload) validate() error {
-	if p.DownloadID < 0 || p.DownloadID > MaxBrowserInteger {
-		return fmt.Errorf("delivery_context.download_id must be in range 0..%d", MaxBrowserInteger)
+	if p.DownloadID < 1 || p.DownloadID > MaxBrowserInteger {
+		return fmt.Errorf("delivery_context.download_id must be in range 1..%d", MaxBrowserInteger)
 	}
 	if err := enumRequired("delivery_context.route", p.Route, "resolver", "direct", "oa"); err != nil {
 		return err

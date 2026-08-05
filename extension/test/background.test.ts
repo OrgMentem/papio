@@ -4430,6 +4430,122 @@ test("handoff governor keeps two drives, drains FIFO on settle and timeout", asy
   expect(h.backend.store.activeJobs.find((job) => job.job_id === jobIDs[2])?.status).toBe("auth_pending");
 });
 
+test("a drive timing out on an authentication page leaves the tab open and frees the governor slot", async () => {
+  // papio-63955092613c7e9c: closing the tab here would destroy whatever the
+  // operator has already done on a slow institutional login — a half-filled
+  // IdP form, entered credentials, or an in-flight 2FA challenge — at the
+  // 3-minute mark with no warning. parkHandoffForManual's own contract is to
+  // leave that page for the operator; only the governor slot is freed.
+  const h = makeHarness({ ...emptyStore(), lastAuthReturnedAt: 1_700_000_000_000 });
+  await h.bridge.start();
+  const jobIDs = Array.from({ length: 3 }, (_, index) => `job_auth_timeout_${index}`);
+  for (const jobID of jobIDs) await h.port.inbound(jobOffer(jobID));
+
+  expect(h.tabs.live.size).toBe(2);
+  expect(h.backend.store.activeJobs.filter((job) => job.tab_id < 0)).toHaveLength(1);
+  const first = h.backend.store.activeJobs.find((job) => job.job_id === jobIDs[0]);
+  const firstTabID = first?.tab_id ?? -1;
+  expect(firstTabID).toBeGreaterThanOrEqual(0);
+
+  // The operator is mid-login on the resolver's IdP when the governor timer fires.
+  const idpURL = "https://idp.example.edu/sso";
+  h.tabs.live.set(firstTabID, { id: firstTabID, url: idpURL });
+
+  const authTimeouts = h.timers.filter((t) => t.ms === 180_000);
+  expect(authTimeouts).toHaveLength(2);
+  h.clock.now += 180_000;
+  await authTimeouts[0]?.fn();
+
+  expect(h.tabs.removed).not.toContain(firstTabID);
+  expect(h.tabs.live.has(firstTabID)).toBe(true);
+  const after = h.backend.store.activeJobs.find((job) => job.job_id === jobIDs[0]);
+  expect(after?.status).toBe("auth_pending");
+  expect(after?.tab_id).toBe(firstTabID);
+  expect(h.frames().filter((frame) => frame.type === "auth_pending")).toHaveLength(1);
+
+  // The slot the parked job held is freed: the third, queued job now drives.
+  expect(h.tabs.created).toHaveLength(3);
+  const third = h.backend.store.activeJobs.find((job) => job.job_id === jobIDs[2]);
+  expect(third?.tab_id).toBeGreaterThanOrEqual(0);
+});
+
+test("a drive timing out on an ordinary provider page still closes the tab as before", async () => {
+  const h = makeHarness({ ...emptyStore(), lastAuthReturnedAt: 1_700_000_000_000 });
+  await h.bridge.start();
+  const jobIDs = Array.from({ length: 3 }, (_, index) => `job_provider_timeout_${index}`);
+  for (const jobID of jobIDs) await h.port.inbound(jobOffer(jobID));
+
+  const first = h.backend.store.activeJobs.find((job) => job.job_id === jobIDs[0]);
+  const firstTabID = first?.tab_id ?? -1;
+  expect(firstTabID).toBeGreaterThanOrEqual(0);
+  // Tab never left the resolver/provider page — no IdP navigation happened.
+
+  const providerTimeouts = h.timers.filter((t) => t.ms === 180_000);
+  expect(providerTimeouts).toHaveLength(2);
+  h.clock.now += 180_000;
+  await providerTimeouts[0]?.fn();
+
+  expect(h.tabs.removed).toContain(firstTabID);
+  expect(h.tabs.live.has(firstTabID)).toBe(false);
+  const after = h.backend.store.activeJobs.find((job) => job.job_id === jobIDs[0]);
+  expect(after?.status).toBe("auth_pending");
+  expect(after?.tab_id).toBe(-1);
+  expect(h.tabs.created).toHaveLength(3);
+});
+
+test("registerHandoffDrive refuses to exceed HANDOFF_DRIVE_LIMIT even when called directly at capacity", async () => {
+  // papio-c3f6c091b017eb0c: every caller is expected to check
+  // handoffDrives.size >= HANDOFF_DRIVE_LIMIT before calling, but the check
+  // and the call are separated by awaits at several call sites, so two racing
+  // entry points can both pass their own check. registerHandoffDrive must
+  // enforce the cap itself rather than trust the caller.
+  const h = makeHarness();
+  await h.bridge.start();
+  const bridgeInternal = h.bridge as unknown as {
+    update: (fn: (s: StoreShape) => StoreShape) => Promise<void>;
+    registerHandoffDrive: (jobID: string, tabID: number) => void;
+    handoffDrives: Map<string, { tabID: number }>;
+    handoffDriveQueue: { jobID: string }[];
+  };
+  const jobIDs = ["job_cap_direct_0", "job_cap_direct_1", "job_cap_direct_2"];
+  const tabIDs: number[] = [];
+  for (const jobID of jobIDs) {
+    const tabID = h.tabs.nextId++;
+    tabIDs.push(tabID);
+    h.tabs.live.set(tabID, { id: tabID, url: OPENURL });
+    // Mirror what every real caller already does: the job is committed to the
+    // store with its live tab_id before registerHandoffDrive is ever called.
+    await bridgeInternal.update((s) => ({
+      ...s,
+      activeJobs: [
+        ...s.activeJobs,
+        {
+          job_id: jobID,
+          tab_id: tabID,
+          offered_at: h.clock.now,
+          expires_at: h.clock.now + 1_000,
+          status: "accepted",
+          provider_hosts: [PROVIDER_HOST],
+        },
+      ],
+    }));
+  }
+
+  // Three direct calls at once — simulating callers that raced past their own
+  // (separately await-fenced) cap check.
+  bridgeInternal.registerHandoffDrive(jobIDs[0]!, tabIDs[0]!);
+  bridgeInternal.registerHandoffDrive(jobIDs[1]!, tabIDs[1]!);
+  bridgeInternal.registerHandoffDrive(jobIDs[2]!, tabIDs[2]!);
+
+  expect(bridgeInternal.handoffDrives.size).toBe(2);
+  expect(bridgeInternal.handoffDrives.has(jobIDs[0]!)).toBe(true);
+  expect(bridgeInternal.handoffDrives.has(jobIDs[1]!)).toBe(true);
+  expect(bridgeInternal.handoffDrives.has(jobIDs[2]!)).toBe(false);
+  // Refused, not dropped: it is queued so the next drain reuses the tab it
+  // already has rather than stranding the job.
+  expect(bridgeInternal.handoffDriveQueue.some((request) => request.jobID === jobIDs[2])).toBe(true);
+});
+
 test("governor-queued handoffs are re-driven after a service-worker restart", async () => {
   const first = makeHarness({ ...emptyStore(), lastAuthReturnedAt: 1_700_000_000_000 });
   await first.bridge.start();

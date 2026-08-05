@@ -2321,6 +2321,18 @@ export class Bridge {
 
   private registerHandoffDrive(jobID: string, tabID: number): void {
     if (this.handoffDrives.has(jobID)) return;
+    // A caller's own `handoffDrives.size >= HANDOFF_DRIVE_LIMIT` check and this
+    // call are separated by awaits (openManagedTab, upsertJobWithOffer/patchJob),
+    // so two entry points that are not both on the serialized inbound-frame
+    // chain — e.g. a popup RPC racing a native re-offer frame — can each pass
+    // their own check and both land here, exceeding the cap. Re-check it here
+    // so every call site is safe by construction. The caller has always already
+    // upserted/patched the job with this tabID before calling, so queuing (not
+    // dropping) it lets the next drain reuse that same live tab once a slot frees.
+    if (this.handoffDrives.size >= HANDOFF_DRIVE_LIMIT) {
+      this.enqueueHandoffDrive({ jobID, purpose: "handoff", focusExisting: false });
+      return;
+    }
     const token = {};
     this.handoffDrives.set(jobID, { tabID, token });
     this.handoffDriveTimeouts.set(jobID, token);
@@ -2336,8 +2348,26 @@ export class Bridge {
           }),
         );
         this.send("auth_pending", {}, jobID);
-        await this.closeManagedHandoffTab(current, tabID);
-        await this.update((s) => patchJob(s, jobID, { tab_id: -1 }));
+        // parkHandoffForManual's own contract ("A challenge/auth stall leaves
+        // the exact page available to the operator") is violated if we close
+        // the tab here: a slow institutional SSO chain or an in-flight 2FA
+        // prompt can still be live on the IdP page at the 3-minute mark, and
+        // closing destroys the half-filled form with no warning. Only close
+        // when the tab is NOT sitting on a recognized auth page. An unreadable
+        // tab (already gone) falls through to the close path below — there is
+        // nothing left on it to preserve, and removing an already-gone tab id
+        // is a harmless no-op.
+        let onAuthPage = false;
+        try {
+          const tab = await this.deps.tabs.get(tabID);
+          onAuthPage = typeof tab.url === "string" && isAuthenticationURL(tab.url);
+        } catch {
+          // Tab already gone; closeManagedHandoffTab below is a no-op on it.
+        }
+        if (!onAuthPage) {
+          await this.closeManagedHandoffTab(current, tabID);
+          await this.update((s) => patchJob(s, jobID, { tab_id: -1 }));
+        }
       }
       await this.parkHandoffForManual(jobID);
     }, HANDOFF_DRIVE_TIMEOUT_MS);

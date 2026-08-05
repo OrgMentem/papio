@@ -86,6 +86,14 @@ func TestIssueServesCitationShellWithBoundPDFEmbed(t *testing.T) {
 	if csp := response.Header.Get("Content-Security-Policy"); !strings.Contains(csp, "script-src 'self'") || strings.Contains(csp, "'unsafe-inline'") {
 		t.Fatalf("Content-Security-Policy = %q", csp)
 	}
+	// The shell's only controls apply an irreversible, CAS-guarded verdict, so a
+	// page holding the capability URL must not be able to frame it and harvest
+	// a confirmation for a file the operator never saw. The extension only ever
+	// opens this top-level, so refusing every ancestor costs nothing.
+	assertHeader(t, response, "X-Frame-Options", "DENY")
+	if csp := response.Header.Get("Content-Security-Policy"); !strings.Contains(csp, "frame-ancestors 'none'") {
+		t.Fatalf("Content-Security-Policy missing frame-ancestors 'none': %q", csp)
+	}
 	if strings.Contains(body, "<script>") {
 		t.Fatal("shell contained an inline script")
 	}

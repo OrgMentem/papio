@@ -7,6 +7,7 @@ package protocol
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -786,6 +787,36 @@ func TestBareRouteIsNeverLaxerThanThePublishedSchema(t *testing.T) {
 		schemaOK := pattern.MatchString(route) && utf8.RuneCountInString(route) <= 2000
 		if goOK && !schemaOK {
 			t.Errorf("route %q: Go accepts what the published schema rejects", route)
+		}
+	}
+}
+
+// TestDownloadIDRejectsZero pins the fail-closed floor introduced for
+// download_id. Delivery provenance correlates on
+// browserDownloadKey{JobID, DownloadID} (internal/browser/bridge.go): two
+// downloads reported as download_id 0 for the same job collide on that key,
+// so a download_complete for the second overwrites the pending entry's
+// CandidateID from the first, and a delivery_context meant for the first
+// download then applies its access_basis to the second, unrelated candidate —
+// the mis-binding class delivery provenance exists to prevent, reached
+// through the correlation key instead of the candidate id. This is
+// fail-closed hardening rather than a live-bug fix: chrome.downloads
+// allocates ids starting at 1 and increasing, so no genuine extension ever
+// sends 0, and the floor must therefore still accept 1.
+func TestDownloadIDRejectsZero(t *testing.T) {
+	const downloadStarted = `{"protocol":"papio-browser/1","type":"download_started","msg_id":"m_dls_id_%d","job_id":"job_dls_id_case","seq":1,"payload":{"download_id":%d,"filename":"paper.pdf"}}`
+	const downloadComplete = `{"protocol":"papio-browser/1","type":"download_complete","msg_id":"m_dlc_id_%d","job_id":"job_dlc_id_case","seq":1,"payload":{"download_id":%d,"filename":"paper.pdf","size_bytes":100}}`
+	const deliveryContext = `{"protocol":"papio-browser/1","type":"delivery_context","msg_id":"m_dctx_id_%d","job_id":"job_dctx_id_case","seq":1,"payload":{"download_id":%d,"route":"direct","session_evidence":"none"}}`
+
+	for _, tmpl := range []string{downloadStarted, downloadComplete, deliveryContext} {
+		if _, err := DecodeBrowserMessage([]byte(fmt.Sprintf(tmpl, 1, 0))); err == nil {
+			t.Fatalf("download_id 0 accepted: %s", tmpl)
+		}
+		if _, err := DecodeBrowserMessage([]byte(fmt.Sprintf(tmpl, 2, -1))); err == nil {
+			t.Fatalf("download_id -1 accepted: %s", tmpl)
+		}
+		if _, err := DecodeBrowserMessage([]byte(fmt.Sprintf(tmpl, 3, 1))); err != nil {
+			t.Fatalf("download_id 1 rejected: %s: %v", tmpl, err)
 		}
 	}
 }

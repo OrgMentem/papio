@@ -153,6 +153,44 @@ test("invalid browser corpus fails closed", () => {
   }
 });
 
+test("download_id must be >= 1: the correlation key half of browserDownloadKey{JobID, DownloadID} collides at 0", () => {
+  // chrome.downloads allocates ids starting at 1, so a genuine extension never
+  // sends 0 — this pins fail-closed hardening, not a live-traffic fix. See
+  // testdata/protocol/invalid/browser-download-id-zero.json and
+  // browser-delivery-context-download-id-zero.json for the shared-corpus half
+  // of this contract.
+  const started = (downloadId: number) => ({
+    protocol: "papio-browser/1",
+    type: "download_started",
+    msg_id: "m_dls_floor01",
+    job_id: "job_dls_floor01",
+    seq: 1,
+    payload: { download_id: downloadId, filename: "paper.pdf" },
+  });
+  const complete = (downloadId: number) => ({
+    protocol: "papio-browser/1",
+    type: "download_complete",
+    msg_id: "m_dlc_floor01",
+    job_id: "job_dlc_floor01",
+    seq: 1,
+    payload: { download_id: downloadId, filename: "paper.pdf", size_bytes: 100 },
+  });
+  const deliveryContext = (downloadId: number) => ({
+    protocol: "papio-browser/1",
+    type: "delivery_context",
+    msg_id: "m_dctx_floor01",
+    job_id: "job_dctx_floor01",
+    seq: 1,
+    payload: { download_id: downloadId, route: "direct", session_evidence: "none" },
+  });
+
+  for (const frame of [started, complete, deliveryContext]) {
+    expect(() => parseBrowserMessage(frame(0))).toThrow(ProtocolError);
+    expect(() => parseBrowserMessage(frame(-1))).toThrow(ProtocolError);
+    expect(parseBrowserMessage(frame(1)).payload["download_id"]).toBe(1);
+  }
+});
+
 test("hello_ack accepts optional daemon details and rejects invalid members", () => {
   const frame = (payload: Record<string, unknown>) => ({
     protocol: "papio-browser/1",

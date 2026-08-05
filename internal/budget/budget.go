@@ -246,9 +246,31 @@ func (m *Manager) reserve(ctx context.Context, source, identity string, limit, c
 	var window string
 	var requests int
 	var spent float64
-	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(window_start,''), requests_in_window, spent_usd
-		FROM source_budgets WHERE source = ? AND identity = ?`, source, identity).Scan(&window, &requests, &spent); err != nil {
+	var next sql.NullString
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(window_start,''), requests_in_window, spent_usd, next_allowed_at
+		FROM source_budgets WHERE source = ? AND identity = ?`, source, identity).Scan(&window, &requests, &spent, &next); err != nil {
 		return err
+	}
+	// Acquire's pre-loop Snapshot check is NOT sufficient on its own: after it
+	// passes, Acquire still calls takeToken, which can itself sleep for up to
+	// MaxInlineWait waiting on the in-memory bucket to refill. A concurrent
+	// worker's Defer — fed by another goroutine's 429 handling in app.go or
+	// retraction.go — can persist a fresh next_allowed_at at any point during
+	// that sleep. Without re-reading the gate here, this worker would open a
+	// transaction that only ever CLEARS an already-expired gate and never
+	// refuses on a live one, so its reservation commits and the request goes
+	// out against a gate another caller just set — defeating the guarantee
+	// that one 429 stops every caller of that source/identity. Re-read
+	// next_allowed_at in the same transaction that mutates the counters, so
+	// the check and the write are atomic with respect to a racing Defer.
+	if next.Valid && next.String != "" {
+		gate, err := time.Parse(time.RFC3339Nano, next.String)
+		if err != nil {
+			return fmt.Errorf("source %s (%s) has invalid next_allowed_at: %w", source, identity, err)
+		}
+		if gate.After(now) {
+			return &ErrDeferred{Source: source, Identity: identity, Until: gate}
+		}
 	}
 	if window != month {
 		window, requests, spent = month, 0, 0
@@ -259,7 +281,7 @@ func (m *Manager) reserve(ctx context.Context, source, identity string, limit, c
 	_, err = tx.ExecContext(ctx, `UPDATE source_budgets
 		SET window_start = ?, requests_in_window = ?, spent_usd = ?,
 		    next_allowed_at = CASE WHEN next_allowed_at <= ? THEN NULL ELSE next_allowed_at END
-		WHERE source = ? AND identity = ?`, window, requests+1, spent+cost, store.Now(), source, identity)
+		WHERE source = ? AND identity = ?`, window, requests+1, spent+cost, now.Format(time.RFC3339Nano), source, identity)
 	if err != nil {
 		return err
 	}

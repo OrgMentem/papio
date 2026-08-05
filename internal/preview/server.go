@@ -497,10 +497,19 @@ func setPrivateHeaders(w http.ResponseWriter) {
 	w.Header().Set("Referrer-Policy", "no-referrer")
 }
 
+// setShellHeaders locks down the review shell. Its only interactive elements
+// are the accept/reject buttons that POST a verdict, and a verdict is applied
+// through a CAS-guarded, irreversible review resolution — so a framed shell is
+// a clickjacking target: any page holding the capability URL could overlay it
+// and harvest a confirmation for a file the operator never looked at.
+// frame-ancestors 'none' plus the X-Frame-Options fallback refuse that
+// outright; the extension only ever opens this as a top-level tab, so there is
+// no legitimate embed to preserve.
 func setShellHeaders(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
-	w.Header().Set("Content-Security-Policy", "default-src 'none'; script-src 'self'; style-src 'self'; frame-src 'self'; object-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'")
+	w.Header().Set("X-Frame-Options", "DENY")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; script-src 'self'; style-src 'self'; frame-src 'self'; object-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
 	setPrivateHeaders(w)
 }
 

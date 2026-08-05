@@ -132,6 +132,88 @@ func TestAcquireStillWaitsOutAShortGate(t *testing.T) {
 	}
 }
 
+// reserve is the second half of Acquire's gate check, and the pre-loop
+// Snapshot in Acquire is not the whole story: after that Snapshot passes,
+// Acquire still calls takeToken, which can itself sleep for up to
+// MaxInlineWait waiting on the token bucket to refill. A concurrent worker's
+// Defer — the same call app.go's 429 handling makes — can land a fresh gate
+// during exactly that sleep. reserve must re-check next_allowed_at itself
+// rather than trust the caller's earlier snapshot, or the reservation
+// commits and the request goes out against a gate every other caller
+// believes is closed. Drives reserve directly (skipping Acquire's own
+// pre-loop) to land the Defer deterministically between the "gate is clear"
+// read and the reservation, without relying on goroutine timing.
+func TestReserveRefusesAGateThatLandedDuringTheRaceWindow(t *testing.T) {
+	m := testManager(t)
+	ctx := context.Background()
+	p := config.Source{Enabled: true, MaxCostUSD: 10}
+	identity := identityFor(p)
+
+	// Stand in for Acquire's pre-loop Snapshot observing no gate.
+	snap, err := m.Snapshot(ctx, "openalex", p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.NextAllowedAt != nil {
+		t.Fatalf("snapshot = %+v, want no gate before the simulated race", snap)
+	}
+
+	// A concurrent worker's Defer lands the gate in the window between that
+	// snapshot and this worker's reserve — e.g. while it was asleep in
+	// takeToken.
+	gate := time.Now().UTC().Add(time.Hour)
+	if err := m.Defer(ctx, "openalex", p, gate); err != nil {
+		t.Fatal(err)
+	}
+
+	err = m.reserve(ctx, "openalex", identity, p.MaxCostUSD, 0.10)
+	var deferred *ErrDeferred
+	if !errors.As(err, &deferred) {
+		t.Fatalf("reserve = %T %v, want *ErrDeferred for the gate set during the race window", err, err)
+	}
+	if deferred.Until.Sub(gate).Abs() > time.Second {
+		t.Fatalf("deferred until = %s, want the persisted gate at %s", deferred.Until, gate)
+	}
+
+	snap, err = m.Snapshot(ctx, "openalex", p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.RequestsInWindow != 0 || snap.SpentUSD != 0 {
+		t.Fatalf("snapshot = %+v, a refused reservation must not touch the counters", snap)
+	}
+}
+
+// The fix must not degrade into "refuse whenever the row has ever carried a
+// gate": an EXPIRED gate is still cleared inside reserve's own transaction
+// and the reservation still proceeds, exactly as before the race fix.
+func TestReserveStillClearsAnExpiredGate(t *testing.T) {
+	m := testManager(t)
+	ctx := context.Background()
+	p := config.Source{Enabled: true, MaxCostUSD: 10}
+	identity := identityFor(p)
+
+	if err := m.Defer(ctx, "openalex", p, time.Now().UTC().Add(10*time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(30 * time.Millisecond)
+
+	if err := m.reserve(ctx, "openalex", identity, p.MaxCostUSD, 0.10); err != nil {
+		t.Fatalf("reserve on an expired gate = %v, want it cleared and the reservation to proceed", err)
+	}
+
+	snap, err := m.Snapshot(ctx, "openalex", p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.NextAllowedAt != nil {
+		t.Fatalf("snapshot = %+v, an expired gate must still be cleared", snap)
+	}
+	if snap.RequestsInWindow != 1 || snap.SpentUSD != 0.10 {
+		t.Fatalf("snapshot = %+v, want the reservation recorded once the gate expired", snap)
+	}
+}
+
 // A provider with a clock bug or a malformed Retry-After could otherwise park
 // every job needing that source for as long as it asked, recoverable only by
 // editing the database. Every real quota resets within a day.
