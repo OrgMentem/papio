@@ -3107,7 +3107,13 @@ test("popup capture relay withholds a terms capture until the daemon advertises 
       { id: urls.runtimeID, url: urls.popupURL },
       urls,
     ),
-  ).resolves.toEqual({ captured: true });
+  ).resolves.toEqual({
+    ok: false,
+    error: {
+      code: "capture_failed",
+      message: "The connected daemon does not support terms captures; upgrade the daemon to send this scenario",
+    },
+  });
   expect(h.frames().some((frame) => frame.type === "page_capture")).toBe(false);
 
   await h.port.inbound(helloAck({ features: ["page_capture_v1", "page_capture_terms_v1"] }));
@@ -4569,6 +4575,127 @@ test("governor-queued handoffs are re-driven after a service-worker restart", as
     (job) => parkedIDs.includes(job.job_id) && job.tab_id >= 0,
   );
   expect(drivenAfterRestart).toHaveLength(2);
+});
+
+test("a parked auth job with a preserved tab survives a restart without re-consuming its governor slot", async () => {
+  // papio: the 3-minute timeout preserves the tab (and frees the governor
+  // slot) when it lands on a recognized auth page instead of closing it —
+  // see "a drive timing out on an authentication page..." above. Before
+  // parked_with_tab existed, auth_pending + tab_id >= 0 was indistinguishable
+  // from a job still mid-drive, so a restart between the park and the
+  // operator finishing auth silently re-registered the parked job and
+  // re-consumed its already-freed slot — and MV3's ~30s idle teardown made
+  // that re-establish on every restart during a slow institutional SSO,
+  // halving effective governor capacity for every other queued job.
+  const first = makeHarness({ ...emptyStore(), lastAuthReturnedAt: 1_700_000_000_000 });
+  await first.bridge.start();
+  const jobIDs = Array.from({ length: 3 }, (_, index) => `job_park_restart_${index}`);
+  for (const jobID of jobIDs) await first.port.inbound(jobOffer(jobID));
+
+  const parkedTabID = first.backend.store.activeJobs.find((job) => job.job_id === jobIDs[0])?.tab_id ?? -1;
+  expect(parkedTabID).toBeGreaterThanOrEqual(0);
+  const activeTabID = first.backend.store.activeJobs.find((job) => job.job_id === jobIDs[1])?.tab_id ?? -1;
+  expect(activeTabID).toBeGreaterThanOrEqual(0);
+
+  // job[0] is mid-login on the resolver's IdP when its governor timer fires;
+  // job[1] never navigates, so its own drive stays genuinely active.
+  first.tabs.live.set(parkedTabID, { id: parkedTabID, url: "https://idp.example.edu/sso" });
+  const authTimeouts = first.timers.filter((t) => t.ms === 180_000);
+  expect(authTimeouts).toHaveLength(2);
+  first.clock.now += 180_000;
+  await authTimeouts[0]?.fn();
+
+  const parkedAfterTimeout = first.backend.store.activeJobs.find((job) => job.job_id === jobIDs[0]);
+  expect(parkedAfterTimeout?.status).toBe("auth_pending");
+  expect(parkedAfterTimeout?.tab_id).toBe(parkedTabID);
+  expect(parkedAfterTimeout?.parked_with_tab).toBe(true);
+  // The slot it freed went straight to the third, previously-queued job.
+  expect(first.backend.store.activeJobs.find((job) => job.job_id === jobIDs[2])?.tab_id).toBeGreaterThanOrEqual(0);
+
+  // A service-worker restart over the exact persisted snapshot. MV3 tears
+  // down the worker, NOT the browser's tabs, so every tab these jobs are
+  // tracking is still open afterwards — including the one the timeout
+  // deliberately preserved. Carrying them across is what makes this a
+  // restart rather than a browser relaunch; without it reconcileTabs
+  // correctly requeues everything and the parked state is never exercised.
+  const survivingTabs = first.backend.store.activeJobs
+    .filter((job) => job.tab_id >= 0)
+    .map((job) => [job.job_id, job.tab_id] as const);
+  expect(survivingTabs).toHaveLength(3);
+  const restarted = makeHarness(JSON.parse(JSON.stringify(first.backend.store)) as StoreShape);
+  for (const [, tabID] of survivingTabs) {
+    restarted.tabs.live.set(tabID, {
+      id: tabID,
+      url: tabID === parkedTabID ? "https://idp.example.edu/sso" : OPENURL,
+    });
+  }
+  await restarted.bridge.start();
+
+  const restartedInternal = restarted.bridge as unknown as {
+    handoffDrives: Map<string, { tabID: number }>;
+  };
+  expect(restartedInternal.handoffDrives.has(jobIDs[0]!)).toBe(false);
+  const restartedParked = restarted.backend.store.activeJobs.find((job) => job.job_id === jobIDs[0]);
+  expect(restartedParked?.tab_id).toBe(parkedTabID);
+  expect(restartedParked?.status).toBe("auth_pending");
+  expect(restartedParked?.parked_with_tab).toBe(true);
+
+  // The two genuinely active drives (job[1], never timed out, and job[2],
+  // which claimed the freed slot before the restart) still restore as
+  // before — exactly two slots, exactly two fresh 3-minute timeouts, and
+  // neither is the parked job.
+  expect(restartedInternal.handoffDrives.has(jobIDs[1]!)).toBe(true);
+  expect(restartedInternal.handoffDrives.has(jobIDs[2]!)).toBe(true);
+  expect(restartedInternal.handoffDrives.size).toBe(2);
+  expect(restarted.timers.filter((t) => t.ms === 180_000)).toHaveLength(2);
+});
+
+test("finishing auth in a parked, preserved tab clears parked_with_tab so a later restart still restores it", async () => {
+  // The tab-update handler is the only way a parked_with_tab job leaves the
+  // parked state without going through registerHandoffDrive again: the
+  // operator just keeps using the same preserved tab until it lands back on
+  // the provider. If that transition left the marker stale, a restart after
+  // auth completed but before any fresh drive would wrongly skip
+  // re-registering a now-legitimate awaiting_download job — the same
+  // stranding bug this campaign already fixed once, just moved one step later.
+  const h = makeHarness({ ...emptyStore(), lastAuthReturnedAt: 1_700_000_000_000 });
+  await h.bridge.start();
+  const jobIDs = ["job_park_clear_0", "job_park_clear_1"];
+  for (const jobID of jobIDs) await h.port.inbound(jobOffer(jobID));
+
+  const parkedTabID = h.backend.store.activeJobs.find((job) => job.job_id === jobIDs[0])?.tab_id ?? -1;
+  expect(parkedTabID).toBeGreaterThanOrEqual(0);
+  h.tabs.live.set(parkedTabID, { id: parkedTabID, url: "https://idp.example.edu/sso" });
+  const timeout = h.timers.find((t) => t.ms === 180_000);
+  h.clock.now += 180_000;
+  await timeout?.fn();
+  expect(h.backend.store.activeJobs.find((job) => job.job_id === jobIDs[0])?.parked_with_tab).toBe(true);
+
+  // The operator finishes authenticating in that same preserved tab.
+  const providerURL = `https://${PROVIDER_HOST}/stable/returned`;
+  await h.tabs.onUpdated.emit(parkedTabID, { url: providerURL }, { id: parkedTabID, url: providerURL });
+
+  const resumed = h.backend.store.activeJobs.find((job) => job.job_id === jobIDs[0]);
+  expect(resumed?.status).toBe("awaiting_download");
+  expect(resumed?.parked_with_tab).toBe(false);
+
+  // A restart now must treat it as the active, recoverable job it is again.
+  // The worker restarts; the tabs do not close (see the sibling test above).
+  const survivingTabs = h.backend.store.activeJobs
+    .filter((job) => job.tab_id >= 0)
+    .map((job) => [job.job_id, job.tab_id] as const);
+  const restarted = makeHarness(JSON.parse(JSON.stringify(h.backend.store)) as StoreShape);
+  for (const [, tabID] of survivingTabs) {
+    restarted.tabs.live.set(tabID, {
+      id: tabID,
+      url: tabID === parkedTabID ? providerURL : OPENURL,
+    });
+  }
+  await restarted.bridge.start();
+  const restartedInternal = restarted.bridge as unknown as {
+    handoffDrives: Map<string, { tabID: number }>;
+  };
+  expect(restartedInternal.handoffDrives.has(jobIDs[0]!)).toBe(true);
 });
 
 // isDirectFileOffer is a URL-SHAPE heuristic, and an institutional handoff's

@@ -322,6 +322,100 @@ test("papio-8f79b6ba67bdbdaa: concurrent creation attempts across sync() calls p
   expect(h.tabs.removed).toEqual([1]);
 });
 
+test("openReauth requesting a different origin mid-creation never rides another institution's tab", async () => {
+  // The concurrency test above shares one resolver for every caller, so it
+  // never exercises openReauth switching institutions. openReauth exists
+  // specifically to do that, and unlike reconcile/onObserve/onReload it can
+  // fire while this.tabID is still undefined (the very race window the
+  // shared in-flight promise targets) — so its own "close the stale tab"
+  // teardown (gated on this.tabID !== undefined) never runs, and riding the
+  // in-flight promise used to hand it a tab for the WRONG institution.
+  const h = makeHarness();
+  const otherOrigin = "https://otherlib.example.edu";
+
+  interface QueryCall {
+    url: string[] | undefined;
+    resolve: (tabs: KeepaliveTab[]) => void;
+  }
+  interface CreateCall {
+    url: string;
+    resolve: (tab: KeepaliveTab) => void;
+  }
+  const queries: QueryCall[] = [];
+  const creates: CreateCall[] = [];
+  h.tabs.query = (query: { url?: string[] }): Promise<KeepaliveTab[]> => {
+    const { promise, resolve } = Promise.withResolvers<KeepaliveTab[]>();
+    queries.push({ url: query.url, resolve });
+    return promise;
+  };
+  h.tabs.create = (properties: {
+    url: string;
+    active: boolean;
+    pinned: boolean;
+    muted: boolean;
+    windowId?: number;
+  }): Promise<KeepaliveTab> => {
+    h.tabs.created.push(properties);
+    const { promise, resolve } = Promise.withResolvers<KeepaliveTab>();
+    creates.push({ url: properties.url, resolve });
+    return promise.then((tab) => {
+      if (tab.id !== undefined) h.tabs.live.set(tab.id, tab);
+      return tab;
+    });
+  };
+
+  // Caller A: the ordinary timer-driven path claims the configured
+  // resolver origin and blocks on its query.
+  const first = h.manager.init();
+  await flushMicrotasks();
+  expect(queries).toHaveLength(1);
+  expect(queries[0]?.url).toEqual(["https://resolver.example.edu/*"]);
+  expect(creates).toHaveLength(0);
+
+  // Caller B: the operator explicitly asks to reauthenticate a DIFFERENT
+  // institution while A's creation is still in flight and this.tabID is
+  // still undefined — exactly the window the old dedupe mishandled.
+  const second = h.manager.openReauth(otherOrigin);
+  await flushMicrotasks();
+  // B must not join A's in-flight attempt: no second query yet, and
+  // definitely nothing created for either origin so far.
+  expect(queries).toHaveLength(1);
+  expect(creates).toHaveLength(0);
+
+  // A's query settles: no existing resolver.example.edu tab, so A creates one.
+  queries[0]?.resolve([]);
+  await flushMicrotasks();
+  expect(creates).toHaveLength(1);
+  expect(creates[0]?.url).toBe("https://resolver.example.edu");
+
+  // A's create settles. Only now can B stop waiting and drive its OWN,
+  // origin-correct creation — never reusing A's query result or tab.
+  creates[0]?.resolve({ id: 1, url: "https://resolver.example.edu" });
+  await flushMicrotasks();
+  expect(queries).toHaveLength(2);
+  expect(queries[1]?.url).toEqual(["https://otherlib.example.edu/*"]);
+  expect(creates).toHaveLength(1);
+
+  queries[1]?.resolve([]);
+  await flushMicrotasks();
+  expect(creates).toHaveLength(2);
+  // The tab created for B's origin must be requested under B's origin, never
+  // A's — this is the exact hijack the bug allowed.
+  expect(creates[1]?.url).toBe("https://otherlib.example.edu");
+
+  creates[1]?.resolve({ id: 2, url: "https://otherlib.example.edu" });
+  await first;
+  await second;
+
+  // The operator's explicit reauth request lands on ITS OWN tab (id 2, the
+  // one created for otherlib.example.edu), never on A's resolver.example.edu
+  // tab (id 1): pauseForReauth() acts on this.tabID, so an update targeting
+  // tab 1 here would mean the operator was handed the wrong institution.
+  expect(h.tabs.updates.some((u) => u.id === 1)).toBe(false);
+  expect(h.tabs.updates.some((u) => u.id === 2 && u.properties.active === true)).toBe(true);
+  expect(h.manager.getSnapshot().resolverOrigin).toBe(otherOrigin);
+});
+
 test("papio-8f79b6ba67bdbdaa: a failed tab creation does not wedge later creation attempts", async () => {
   const h = makeHarness();
   let createAttempts = 0;

@@ -868,25 +868,33 @@ func TestPageHostRejectsDotEdgeCases(t *testing.T) {
 	}
 }
 
-// TestOriginHintSchemaAndValidatorAgree pins papio-26fa531528e29798: Go,
-// the TypeScript parser, and the schema previously disagreed on
-// "https://EXAMPLE.com" (Go accepted it via validateBareRoute, which never
-// compared case; the TypeScript parser rejected it only as an accident of
-// the WHATWG URL parser lowercasing a special-scheme host before the
-// round-trip equality check) and on "https://a" (both parsers accepted a
-// single-label host that the schema's old 3..253-char bound also happened
-// to accept, even though no configured resolver origin is ever
-// bare-hostname-only). validateResolverOriginHint and the published pattern
-// must now agree on every value, verified the same way
+// TestOriginHintSchemaAndValidatorAgree pins papio-26fa531528e29798's
+// original fix (Go, the TypeScript parser, and the schema previously
+// disagreed on "https://EXAMPLE.com": Go accepted it via validateBareRoute,
+// which never compared case; the TypeScript parser rejected it only as an
+// accident of the WHATWG URL parser's lowercasing round-trip check) AND the
+// later correction that dropped the multi-label requirement the first fix
+// introduced: browser.openurl_base_url validation
+// (internal/config/config.go's validateOpenURLBase) never required an FQDN,
+// so "https://a"/"https://library" are legitimate single-label resolver
+// origins and must validate everywhere, not just here. validateResolverOriginHint
+// and the published pattern must agree on every value, verified the same way
 // TestBareRouteIsNeverLaxerThanThePublishedSchema checks candidate.route.
 func TestOriginHintSchemaAndValidatorAgree(t *testing.T) {
-	schemaPattern := regexp.MustCompile(`^https://[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+(:[0-9]{1,5})?$`)
+	schemaPattern := regexp.MustCompile(`^https://[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*(:[0-9]{1,5})?$`)
 	for _, hint := range []string{
 		"https://resolver.example.edu",
 		"https://resolver.example.edu:8443",
 		"https://a.b",
 		"https://EXAMPLE.com",
 		"https://a",
+		"https://library",
+		"https://localhost",
+		"https://localhost:8443",
+		"https://127.0.0.1",
+		"https://127.0.0.1:8443",
+		"https://[::1]",
+		"https://[::1]:8443",
 		"HTTPS://resolver.example.edu",
 		"https://resolver.example.edu/path",
 		"https://resolver.example.edu?x=1",
@@ -903,17 +911,40 @@ func TestOriginHintSchemaAndValidatorAgree(t *testing.T) {
 	}
 }
 
-// TestOriginHintRejectsMixedCaseAndSingleLabelHosts decodes real
-// session_evidence frames for the two disagreement values named in
-// papio-26fa531528e29798, pinning the corpus fixtures under
-// testdata/protocol/invalid/browser-session-evidence-origin-hint-*.json
-// through the actual decode path.
-func TestOriginHintRejectsMixedCaseAndSingleLabelHosts(t *testing.T) {
-	const frame = `{"protocol":"papio-browser/1","type":"session_evidence","msg_id":"m_origin_case","seq":1,"payload":{"evidence":"warm_verified","origin_hint":"%s","at":"2026-08-03T12:00:00Z"}}`
-	for _, hint := range []string{"https://EXAMPLE.com", "https://a"} {
-		if _, err := DecodeBrowserMessage([]byte(fmt.Sprintf(frame, hint))); err == nil {
-			t.Errorf("origin_hint %q accepted; want rejected", hint)
+// TestOriginHintAcceptsLegitimateHosts is the release-blocker regression
+// test: a single-label intranet resolver, localhost (with and without a
+// port), and an IPv4 literal are all values a valid papio config
+// (internal/config/config.go's validateOpenURLBase requires only an https
+// scheme and a non-empty host) can produce, so the wire validator must
+// accept every one of them. It previously rejected the whole
+// session_evidence frame outbound (Bridge.send self-validates and drops
+// silently) and fatally on decode inbound under version skew — see
+// validateResolverOriginHint's doc comment for the full incident.
+func TestOriginHintAcceptsLegitimateHosts(t *testing.T) {
+	for _, hint := range []string{
+		"https://library",
+		"https://localhost",
+		"https://localhost:8443",
+		"https://127.0.0.1",
+	} {
+		if err := validateResolverOriginHint(hint); err != nil {
+			t.Errorf("origin_hint %q rejected: %v", hint, err)
 		}
+	}
+}
+
+// TestOriginHintRejectsUppercaseHost decodes a real session_evidence frame
+// for the mixed-case disagreement value named in papio-26fa531528e29798,
+// pinning the corpus fixture under
+// testdata/protocol/invalid/browser-session-evidence-origin-hint-uppercase-host.json
+// through the actual decode path. The single-label counterpart of this test
+// moved to testdata/protocol/valid: a single-label host is a legitimate
+// origin_hint value now, not an invalid one — see
+// TestOriginHintAcceptsLegitimateHosts.
+func TestOriginHintRejectsUppercaseHost(t *testing.T) {
+	const frame = `{"protocol":"papio-browser/1","type":"session_evidence","msg_id":"m_origin_case","seq":1,"payload":{"evidence":"warm_verified","origin_hint":"%s","at":"2026-08-03T12:00:00Z"}}`
+	if _, err := DecodeBrowserMessage([]byte(fmt.Sprintf(frame, "https://EXAMPLE.com"))); err == nil {
+		t.Errorf("origin_hint %q accepted; want rejected", "https://EXAMPLE.com")
 	}
 	if _, err := DecodeBrowserMessage([]byte(fmt.Sprintf(frame, "https://resolver.example.edu"))); err != nil {
 		t.Errorf("origin_hint %q rejected: %v", "https://resolver.example.edu", err)

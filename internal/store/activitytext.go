@@ -214,8 +214,18 @@ func StripTerminalControls(value string) string {
 // could otherwise carry ESC (or a raw C1 byte) and inject ANSI/OSC escape
 // sequences into that terminal. Stripping at this single choke point also
 // keeps any detail field that becomes untrusted later safe by default,
-// rather than re-opening the hole silently. The --json path was never
-// affected: encoding/json escapes control bytes on its own.
+// rather than re-opening the hole silently.
+//
+// The --json path deliberately does NOT go through this function: it is the
+// machine-readable, authoritative form and must preserve the filename byte
+// for byte, including any control bytes, so a consumer can recover the exact
+// on-disk name. encoding/json only escapes bytes below 0x20 plus quote and
+// backslash — it emits DEL (0x7f) and the whole C1 block (U+0080-U+009F)
+// verbatim, so `--json` is not safe against the terminal-injection threat
+// model this file adopts (a UTF-8 xterm decodes U+009B/U+009D as CSI/OSC).
+// Anything that renders --json output to a terminal (a shell pipeline, a
+// pretty-printer) is responsible for its own escaping — the human row above
+// is the only surface this package guarantees is terminal-safe.
 func clampActivityText(value string) string {
 	value = StripTerminalControls(value)
 	runes := []rune(value)

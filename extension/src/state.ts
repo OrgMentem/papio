@@ -104,6 +104,22 @@ export interface ActiveJob {
   /** A re-offered handoff held behind a parked provider has not yet been
    * accepted. It is acknowledged only when that provider is resumed. */
   handoffAckPending?: boolean;
+  /** Set when the 3-minute handoff-drive timeout parks this job with its tab
+   * intentionally preserved (the tab was sitting on a recognized
+   * authentication page, so closing it would destroy a half-completed
+   * SSO/2FA form). The governor slot is released at the same moment
+   * (parkHandoffForManual), which otherwise leaves `auth_pending` +
+   * `tab_id >= 0` indistinguishable from a job still actively driven and
+   * mid-timeout. A service-worker restart cannot tell the two apart by
+   * inference alone (that ambiguity is exactly what let a restart
+   * re-consume this job's already-freed slot and re-arm a fresh timeout
+   * indefinitely), so the startup restore scan in background.ts checks
+   * this bit instead. Cleared the moment the job is driven again
+   * (registerHandoffDrive) or the operator finishes authenticating in this
+   * same tab without a fresh drive (the auth_pending -> awaiting_download
+   * transition in the tab-update handler) — never left stale, or the job
+   * would be skipped by every future restore forever. */
+  parked_with_tab?: boolean;
 }
 /** A short, browser-session lease over one provider's queued handoffs. The
  * owner token stays only in the service worker; session storage retains this

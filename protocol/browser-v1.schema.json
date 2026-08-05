@@ -538,7 +538,7 @@
             "required": ["evidence", "at"],
             "properties": {
               "evidence": { "enum": ["warm_verified", "auth_returned"] },
-              "origin_hint": { "type": "string", "maxLength": 300, "pattern": "^https://[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+(:[0-9]{1,5})?$", "description": "A bare https origin with a lowercase, multi-label host: charset/case/label-count match internal/protocol/protocol.go's validateResolverOriginHint and extension/src/protocol.ts's ORIGIN_HOST_RE exactly. Case is rejected, not normalized (e.g. https://EXAMPLE.com is invalid), and a single-label host (e.g. https://a) is invalid even though it is a legal browser origin, because no configured resolver origin is ever bare-hostname-only." },
+              "origin_hint": { "type": "string", "maxLength": 300, "pattern": "^https://[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*(:[0-9]{1,5})?$", "description": "A bare https origin with a lowercase host: charset/case match internal/protocol/protocol.go's validateResolverOriginHint and extension/src/protocol.ts's ORIGIN_HOST_RE exactly. Case is rejected, not normalized (e.g. https://EXAMPLE.com is invalid). Label count is deliberately unconstrained: internal/config/config.go's validateOpenURLBase accepts any non-empty https host, so a single-label intranet resolver origin (e.g. https://library) is a legitimate deployment and MUST validate here too — do not re-tighten this pattern to require two-or-more labels." },
               "at": { "type": "string", "format": "date-time" }
             }
           }

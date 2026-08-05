@@ -286,6 +286,7 @@ func (s *Server) serveAsset(w http.ResponseWriter, r *http.Request, token, conte
 		return
 	}
 	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	setPrivateHeaders(w)
 	if r.Method != http.MethodHead {
 		_, _ = io.WriteString(w, body)

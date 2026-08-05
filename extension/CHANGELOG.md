@@ -18,6 +18,30 @@ for the full pre-split extension history.
 
 ### Fixed
 
+- **A parked handoff no longer re-consumes its governor slot after a
+  service-worker restart.** Parking for manual auth frees a slot but leaves
+  the tab open, and the slot lives only in worker memory while the tab id is
+  persisted — so after MV3's ~30s idle teardown a parked job looked exactly
+  like one still mid-drive and was re-registered, re-arming its timeout. On a
+  slow institutional sign-in that repeated on every restart, halving effective
+  capacity for every other queued job. The park is now recorded on the job
+  itself, at the single point that releases the slot, and cleared whenever the
+  job is genuinely driven again. This also covers the auth-exhausted and
+  challenge-blocked parks, which had the same shape before the timeout change
+  made it visible.
+- **A sign-in for one institution cannot be handed another institution's
+  tab.** Concurrent keepalive callers share one in-flight tab creation, but the
+  creation re-read the resolver *after* awaiting the tab query, so a caller
+  switching origins mid-flight could redirect a creation already underway —
+  producing a tab for the wrong origin, or surfacing one institution's session
+  tab as another's explicitly requested re-authentication. The resolver is now
+  snapshotted for the duration, and a caller wanting a different origin waits
+  for the in-flight attempt rather than riding it.
+- **A `terms` capture refused by the daemon gate reports the refusal.** It
+  returned success, so the popup printed `Sent N-byte capture` for a frame that
+  was never transmitted — in exactly the daemon-swap case the gate exists for,
+  leaving the developer hunting a storage bug that did not exist. It now
+  surfaces an error naming the cause.
 - **Concurrent keepalive reconciliation creates one resolver tab, not two.**
   `reconcile`, `onObserve`, `onReload` and `openReauth` each tested whether a
   tab existed and then awaited creation, with nothing held across the await.

@@ -526,8 +526,22 @@ export class KeepaliveManager {
    * tabs.query()/tabs.create() calls. Without this, two interleaved callers
    * both query, both find nothing, and both create — the second assignment
    * to this.tabID orphans the first tab, and the tab governor deliberately
-   * skips pinned tabs, so the orphan is never reconciled or closed. */
+   * skips pinned tabs, so the orphan is never reconciled or closed.
+   *
+   * Joining this promise is only safe for a caller that wants the SAME
+   * origin the in-flight attempt was started for (tabCreationOrigin,
+   * below): openReauth exists specifically to switch origins, and this.
+   * resolver can already have moved on to a different institution by the
+   * time a second caller reaches createTab(). Riding the promise then would
+   * hand that caller (via this.tabID) a tab for the wrong institution. createTab()
+   * compares the wanted origin against tabCreationOrigin and, on a
+   * mismatch, waits for the stale attempt to settle (so it can never be
+   * starved) and then drives its own, origin-correct creation instead of
+   * joining. */
   private tabCreationInFlight: Promise<void> | undefined;
+  /** Origin the in-flight tabCreationInFlight attempt was started for.
+   * Undefined whenever no creation is in flight. */
+  private tabCreationOrigin: string | undefined;
 
   private originCandidates(): string[] {
     const candidates: unknown[] = [];
@@ -1110,24 +1124,50 @@ export class KeepaliveManager {
   }
 
   private async createTab(): Promise<void> {
-    if (this.tabCreationInFlight !== undefined) {
+    for (;;) {
+      const resolver = this.resolver;
+      const wantedOrigin = resolver?.protocol === "https:" ? resolver.origin : undefined;
+      if (this.tabCreationInFlight === undefined) {
+        this.tabCreationOrigin = wantedOrigin;
+        const attempt = this.createTabOnce();
+        this.tabCreationInFlight = attempt.finally(() => {
+          this.tabCreationInFlight = undefined;
+          this.tabCreationOrigin = undefined;
+        });
+        await this.tabCreationInFlight;
+        return;
+      }
+      if (wantedOrigin === this.tabCreationOrigin) {
+        await this.tabCreationInFlight;
+        return;
+      }
+      // Wanted a different origin than the creation already in flight
+      // (e.g. openReauth switching institutions mid-race). Wait for the
+      // stale attempt to settle first, so it can never be starved, then
+      // loop to drive our own origin-correct creation instead of joining
+      // a promise that would hand back the wrong institution's tab.
       await this.tabCreationInFlight;
-      return;
     }
-    const attempt = this.createTabOnce();
-    this.tabCreationInFlight = attempt.finally(() => {
-      this.tabCreationInFlight = undefined;
-    });
-    await this.tabCreationInFlight;
   }
 
   private async createTabOnce(): Promise<void> {
-    if (this.resolver === undefined) return;
+    // Snapshot once: all four callers (reconcile, onObserve, onReload,
+    // openReauth) can mutate this.resolver synchronously before calling
+    // createTab, and this method itself awaits across tabs.query()/
+    // tabs.create(). Reading this.resolver again after either await let a
+    // racing caller's origin switch leak into an in-progress creation —
+    // querying for one origin's existing tab but creating (or claiming) a
+    // tab under a different one. A local snapshot keeps this call
+    // consistent with whichever origin it actually started for; createTab()
+    // above is what keeps a DIFFERENT origin from riding this call instead
+    // of starting its own.
+    const resolver = this.resolver;
+    if (resolver === undefined) return;
     try {
       const existing = await this.api.tabs.query({
         pinned: true,
         muted: true,
-        url: [`${this.resolver.protocol}//${this.resolver.host}/*`],
+        url: [`${resolver.protocol}//${resolver.host}/*`],
       });
       const tabID = existing.find((tab) => tab.id !== undefined)?.id;
       if (tabID !== undefined) {
@@ -1140,7 +1180,7 @@ export class KeepaliveManager {
       // Querying is a best-effort restart recovery; creation below remains safe.
     }
     const base = {
-      url: this.resolver.origin,
+      url: resolver.origin,
       active: false,
       pinned: true,
       muted: true,

@@ -214,19 +214,21 @@ test("delivery_context.page_host rejects a leading dot, a trailing dot, and a '.
   expect(parseBrowserMessage(frame("publisher.example.edu")).payload["page_host"]).toBe("publisher.example.edu");
 });
 
-test("session_evidence.origin_hint rejects a mixed-case host and a single-label host", () => {
+test("session_evidence.origin_hint rejects a mixed-case host", () => {
   // papio-26fa531528e29798: Go, this parser, and the schema previously
-  // disagreed on both shapes at once. "https://EXAMPLE.com" was accepted by
-  // Go's validateBareRoute (which never compared case) and rejected here
-  // only as a side effect of `new URL()` lowercasing the host of a special
-  // scheme before the round-trip equality check below — an accident, not a
-  // stated rule. "https://a" was accepted by both parsers (a single-label
-  // host is a legal browser origin) but rejected by the schema's old
-  // 3..253-char bound. ORIGIN_HOST_RE now makes both rejections explicit and
-  // identical across internal/protocol/protocol.go, this file, and
+  // disagreed on this shape. "https://EXAMPLE.com" was accepted by Go's
+  // validateBareRoute (which never compared case) and rejected here only as
+  // a side effect of `new URL()` lowercasing the host of a special scheme
+  // before the round-trip equality check below — an accident, not a stated
+  // rule. ORIGIN_HOST_RE now makes the rejection explicit and identical
+  // across internal/protocol/protocol.go, this file, and
   // protocol/browser-v1.schema.json. See testdata/protocol/invalid/browser-
-  // session-evidence-origin-hint-{uppercase-host,single-label}.json for the
-  // shared-corpus half of this contract.
+  // session-evidence-origin-hint-uppercase-host.json for the shared-corpus
+  // half of this contract. The single-label counterpart of this test
+  // (papio-26fa531528e29798's other half) was reverted: a single-label host
+  // is a legitimate origin_hint value, not an invalid one — see the
+  // "accepts legitimate hosts" test below and
+  // testdata/protocol/valid/browser-session-evidence-origin-hint-single-label.json.
   const frame = (originHint: string) => ({
     protocol: "papio-browser/1",
     type: "session_evidence",
@@ -234,12 +236,33 @@ test("session_evidence.origin_hint rejects a mixed-case host and a single-label 
     seq: 1,
     payload: { evidence: "warm_verified", origin_hint: originHint, at: "2026-08-03T12:00:00Z" },
   });
-  for (const hint of ["https://EXAMPLE.com", "https://a"]) {
-    expect(() => parseBrowserMessage(frame(hint)), hint).toThrow(ProtocolError);
-  }
+  expect(() => parseBrowserMessage(frame("https://EXAMPLE.com"))).toThrow(ProtocolError);
   expect(parseBrowserMessage(frame("https://resolver.example.edu")).payload["origin_hint"]).toBe(
     "https://resolver.example.edu",
   );
+});
+
+test("session_evidence.origin_hint accepts every host shape a valid config can produce", () => {
+  // Release blocker: a single-label intranet resolver, localhost (with and
+  // without a port), and an IPv4 literal are all values
+  // internal/config/config.go's validateOpenURLBase accepts (only an https
+  // scheme and a non-empty host — no FQDN, no label count), and this
+  // module's resolverOriginHint/latestResolverOrigin derive origin_hint
+  // straight from that configured origin. Rejecting any of these here
+  // silently drops the whole session_evidence frame outbound (Bridge.send
+  // self-validates and discards an invalid frame) and fatally kills the
+  // native-messaging session inbound under version skew. See
+  // ORIGIN_HOST_RE's doc comment for the full incident.
+  const frame = (originHint: string) => ({
+    protocol: "papio-browser/1",
+    type: "session_evidence",
+    msg_id: "m_origin_legit",
+    seq: 1,
+    payload: { evidence: "warm_verified", origin_hint: originHint, at: "2026-08-03T12:00:00Z" },
+  });
+  for (const hint of ["https://library", "https://localhost", "https://localhost:8443", "https://127.0.0.1"]) {
+    expect(parseBrowserMessage(frame(hint)).payload["origin_hint"], hint).toBe(hint);
+  }
 });
 
 test("hello_ack accepts optional daemon details and rejects invalid members", () => {

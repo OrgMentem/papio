@@ -10,6 +10,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"papio/internal/agentjson"
+	"papio/internal/store"
 	"papio/internal/watch"
 )
 
@@ -149,9 +150,21 @@ func newWatchDigestCommand(opt *options) *cobra.Command {
 				return printPage(opt, "entries", rows, truncated)
 			}
 			for _, entry := range result.Entries {
+				// entry.Title/Authors/DOI are third-party bibliographic metadata:
+				// watch.Store normalizes them with only strings.TrimSpace before
+				// persisting a digest row (internal/watch/store.go), so whoever
+				// registers the record in Crossref/OpenAlex/RSS controls these
+				// strings verbatim. Route them through the same
+				// StripTerminalControls choke point ActivityText uses, or a
+				// watch match on an attacker-registered title injects ANSI/OSC
+				// escapes into `papio watch digest`.
 				if _, err := fmt.Fprintf(
 					opt.out, "%d | %s | %s | %s | %s\n",
-					entry.Year, entry.Authors, entry.Title, entry.DOI, oaMarker(entry.IsOA),
+					entry.Year,
+					store.StripTerminalControls(entry.Authors),
+					store.StripTerminalControls(entry.Title),
+					store.StripTerminalControls(entry.DOI),
+					oaMarker(entry.IsOA),
 				); err != nil {
 					return err
 				}

@@ -83,16 +83,20 @@ func formatActivityAt(at time.Time) string {
 // else current state. Raw detail stays on the --json branch — the friendly
 // text column already folds the interesting detail fields in.
 //
-// JobTitle is third-party bibliographic metadata (enrichment stores it after
-// only TrimSpace), so it reaches this terminal-printed row un-sanitized; run
-// it through the same StripTerminalControls choke point as ActivityText, or
-// an ESC/BEL/C1 byte in a DOI-registered title re-injects into the operator's
+// Both JobTitle and JobState are run through StripTerminalControls before
+// reaching this terminal-printed row. JobTitle is third-party bibliographic
+// metadata (enrichment stores it after only TrimSpace), so an ESC/BEL/C1 byte
+// in a DOI-registered title would otherwise re-inject into the operator's
 // terminal on this column even though the other column is already clamped.
+// JobState is daemon-written today, so it carries no live exploit — but
+// stripping it too means a future change that lets third-party text flow
+// into JobState (e.g. a provider-supplied status string) can't silently
+// reopen this hole here.
 func compactActivitySummary(entry store.ActivityEntry) string {
 	if title := strings.Join(strings.Fields(store.StripTerminalControls(entry.JobTitle)), " "); title != "" {
 		return title
 	}
-	if state := strings.TrimSpace(entry.JobState); state != "" {
+	if state := strings.TrimSpace(store.StripTerminalControls(entry.JobState)); state != "" {
 		return state
 	}
 	return "-"

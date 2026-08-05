@@ -316,3 +316,66 @@ func TestAcquireFromZotioParsesLimit(t *testing.T) {
 		t.Fatalf("acquire --from-zotio --limit: %v (%s)", err, stderr.String())
 	}
 }
+
+// entry.Title/Authors/DOI are third-party bibliographic metadata: watch.Store
+// normalizes them with only strings.TrimSpace before persisting a digest row
+// (internal/watch/store.go), so whoever registers the record in a
+// Crossref/OpenAlex/RSS feed that matches an operator's watch controls these
+// strings verbatim. Before this fix, `papio watch digest` printed them
+// straight to the terminal, reopening the same escape-injection hole
+// store.StripTerminalControls closes for `papio activity`.
+func TestWatchDigestStripsTerminalControlBytes(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		entry   watch.DigestEntry
+		wantRow string
+	}{
+		{
+			name: "escape and osc sequence in title and authors",
+			entry: watch.DigestEntry{
+				Year: 2026, Authors: "Evil\x1b]0;pwned\x07 Author", Title: "Evil\x1b[31mTitle", DOI: "10.1000/evil\u009b31m",
+			},
+			wantRow: "2026 | Evil]0;pwned Author | Evil[31mTitle | 10.1000/evil31m | —\n",
+		},
+		{
+			name: "printable non-ASCII survives byte-for-byte",
+			entry: watch.DigestEntry{
+				Year: 2026, Authors: "Café Über", Title: "日本語のタイトル", DOI: "10.1000/plain", IsOA: true,
+			},
+			wantRow: "2026 | Café Über | 日本語のタイトル | 10.1000/plain | OA\n",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			root := NewInProcessRoot(&stdout, &stderr, config.Config{}, func(_ context.Context, method string, _ any, result any) error {
+				if method != "watch.digest" {
+					t.Fatalf("method = %q, want watch.digest", method)
+				}
+				*result.(*struct {
+					WatchID int64               `json:"watch_id"`
+					Entries []watch.DigestEntry `json:"entries"`
+				}) = struct {
+					WatchID int64               `json:"watch_id"`
+					Entries []watch.DigestEntry `json:"entries"`
+				}{WatchID: 1, Entries: []watch.DigestEntry{tc.entry}}
+				return nil
+			})
+			root.SetArgs([]string{"watch", "digest", "1"})
+			if err := root.Execute(); err != nil {
+				t.Fatalf("watch digest 1: %v (%s)", err, stderr.String())
+			}
+			got := stdout.String()
+			if got != tc.wantRow {
+				t.Fatalf("stdout = %q, want %q", got, tc.wantRow)
+			}
+			for _, r := range got {
+				if r == '\n' {
+					continue
+				}
+				if r < 0x20 || (r >= 0x7f && r <= 0x9f) {
+					t.Errorf("control byte %#U survived in %q", r, got)
+				}
+			}
+		})
+	}
+}

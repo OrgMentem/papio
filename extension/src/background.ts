@@ -2333,6 +2333,18 @@ export class Bridge {
       this.enqueueHandoffDrive({ jobID, purpose: "handoff", focusExisting: false });
       return;
     }
+    const beingDrivenAgain = findByJob(this.store, jobID);
+    if (beingDrivenAgain?.parked_with_tab === true) {
+      // This job was parked by the timeout callback below with its tab
+      // deliberately preserved (see parked_with_tab's own doc comment in
+      // state.ts); a fresh registration here means it is being driven again
+      // — by the operator finishing auth and a re-offer/redrive claiming
+      // this same tab, or any other caller. The marker's only job is to
+      // survive a restart between the park and this moment, so it must not
+      // outlive this moment: a LATER restart must see this as the active
+      // drive it now is, not skip it as still parked.
+      void this.update((s) => patchJob(s, jobID, { parked_with_tab: false }));
+    }
     const token = {};
     this.handoffDrives.set(jobID, { tabID, token });
     this.handoffDriveTimeouts.set(jobID, token);
@@ -2365,6 +2377,9 @@ export class Bridge {
           // Tab already gone; closeManagedHandoffTab below is a no-op on it.
         }
         if (!onAuthPage) {
+          // Nothing worth preserving on this page, so the tab goes and the
+          // job drops its reference to it. parkHandoffForManual below records
+          // the park for the auth-page case, where tab_id survives.
           await this.closeManagedHandoffTab(current, tabID);
           await this.update((s) => patchJob(s, jobID, { tab_id: -1 }));
         }
@@ -2449,12 +2464,27 @@ export class Bridge {
 
   /** A challenge/auth stall leaves the exact page available to the operator,
    * but it is no longer an automated drive and therefore frees one governor
-   * slot. */
+   * slot.
+   *
+   * That combination — a live tab the job still references, with no entry in
+   * handoffDrives — is indistinguishable on its own from a job that IS mid
+   * drive, because the slot lives only in worker memory while tab_id is
+   * persisted. A service-worker restart (MV3 tears the worker down after
+   * ~30s idle) would otherwise see the surviving tab and re-register a fresh
+   * drive, silently re-consuming the slot this park just released and
+   * re-arming its timeout. Across a slow institutional SSO that repeats on
+   * every restart, halving effective governor capacity for everyone else.
+   * Recording the park here — rather than at each of the three callers —
+   * keeps the marker and the slot release inseparable. registerHandoffDrive
+   * clears it whenever the job is genuinely driven again. */
   async parkHandoffForManual(jobID: string): Promise<void> {
     await this.ready;
     const job = findByJob(this.store, jobID);
     this.releaseHandoffDrive(jobID);
-    if (job !== undefined && job.tab_id >= 0) await this.reduceHandoffGroupState(job.tab_id);
+    if (job !== undefined && job.tab_id >= 0) {
+      await this.update((s) => patchJob(s, jobID, { parked_with_tab: true }));
+      await this.reduceHandoffGroupState(job.tab_id);
+    }
     await this.drainHandoffDriveQueue();
     await this.releaseQueuedHandoffs();
   }
@@ -2611,6 +2641,18 @@ export class Bridge {
         if (offerURL === undefined) continue;
         if (isDirectFileOffer(offerURL) && job.requires_auth !== true) continue;
         governorQueuedAtRestart.push(job.job_id);
+        continue;
+      }
+      if (job.parked_with_tab === true) {
+        // Deliberately parked by the handoff-drive timeout with its tab
+        // preserved for the operator (see parked_with_tab's doc comment in
+        // state.ts): the governor slot was already released at park time,
+        // not merely dropped by this restart. Re-registering here would
+        // silently re-consume a slot and re-arm a fresh 3-minute timeout for
+        // a job nobody asked to resume driving, halving effective governor
+        // capacity for every other queued job across a slow institutional
+        // SSO. The tab-update listener still recovers it the moment the
+        // operator finishes authenticating in that same tab.
         continue;
       }
       if (this.handoffDrives.size >= HANDOFF_DRIVE_LIMIT) continue;
@@ -5455,7 +5497,14 @@ export class Bridge {
       const now = this.deps.now();
       const elapsed = Math.max(0, now - started);
       this.deliverySessionEvidence.set(job.job_id, "fresh_auth");
-      await this.update((s) => patchJob(s, job.job_id, { status: "awaiting_download" }));
+      // This transition is also how a job parked with its tab preserved
+      // (parked_with_tab, state.ts) resumes: the operator finished auth in
+      // that same tab without ever going through registerHandoffDrive again,
+      // so nothing else clears the marker here. Leaving it stale would make
+      // a later restart wrongly skip re-registering this now-legitimate
+      // awaiting_download job, stranding it the same way the timeout park
+      // itself used to before parked_with_tab existed.
+      await this.update((s) => patchJob(s, job.job_id, { status: "awaiting_download", parked_with_tab: false }));
       this.send("auth_returned", { elapsed_ms: elapsed }, job.job_id);
       this.emitSessionEvidence("auth_returned", this.resolverOriginHint(this.offerURLs.get(job.job_id)));
       // The human is past authentication; fold the "papio" group back away.
@@ -6809,8 +6858,19 @@ export async function handleInboxRuntimeMessage(
       return runtimeFailure("invalid_request", "Invalid page capture request");
     }
     if (!bridge.pageCaptureAvailable()) return { captured: true };
+    // A refusal here is not a routine "diagnostic panel is closed" state:
+    // the operator explicitly selected `terms`, so the popup's own filter
+    // (which withholds `terms` from the scenario list unless the daemon
+    // already advertised it) was correct when the panel loaded but the
+    // daemon underneath was swapped before the click (the two-binary skew
+    // AGENTS.md documents). Reporting `{ captured: true }` here previously
+    // sent the operator hunting a daemon-side storage bug that does not
+    // exist, when the real fix is upgrading the stale daemon.
     if (capturePayload.scenario === "terms" && !bridge.termsCaptureAvailable()) {
-      return { captured: true };
+      return runtimeFailure(
+        "capture_failed",
+        "The connected daemon does not support terms captures; upgrade the daemon to send this scenario",
+      );
     }
     return bridge.sendPageCapture(capturePayload)
       ? { captured: true }

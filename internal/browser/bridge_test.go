@@ -355,20 +355,27 @@ func TestPageCaptureRequestDeliveredCorrelatedStoredAndBusy(t *testing.T) {
 	}
 }
 
-// TestUnsolicitedPageCaptureCannotSatisfyDifferentHostPendingRequest pins the
-// narrower hole in papio-85a7420f4cd2564f: the page_capture content frame
-// carries no request id and no full URL — only a bare hostname — so it
-// cannot be correlated to one specific page_capture_request the way
-// page_capture_request_result is (matched by RequestID). Requiring the
-// pending request's URL host to also match closes the case where an
-// unsolicited capture (the developer capture panel's captureFixture, which
-// answers no pending request at all) shares a session, provider, and
-// scenario with a CLI-initiated `papio adapter capture` but targets a
-// different host: it must not be able to complete that CLI request.
-// (An unsolicited capture on the SAME host remains a residual gap,
-// documented at the match site in bridge.go's pageCapture — closing that
-// needs a negotiated request_id field on page_capture.)
-func TestUnsolicitedPageCaptureCannotSatisfyDifferentHostPendingRequest(t *testing.T) {
+// TestPageCaptureRedirectedToDifferentHostStillCorrelates pins the regression
+// the host-guard revert exists to prevent (bc3f4b2). payload.Host is not the
+// requested host — extension/src/capture.ts sets it from location.origin,
+// the host the tab actually LANDED on — so an ordinary cross-host redirect
+// (www canonicalization, a CDN host swap, an SSO round-trip that returns to
+// a different host) makes the requested and landed hosts differ even though
+// the capture genuinely succeeded. Correlation matches on session + provider
+// + scenario only, with no host check: a build that reintroduces a
+// requested-host match fails this test the same way it silently downgraded
+// a real "captured" result to "nav_failed" (pending.path stays empty, so
+// page_capture_request_result's "captured" is rewritten to "nav_failed").
+//
+// TestUnsolicitedPageCaptureCannotSatisfyDifferentHostPendingRequest
+// (formerly here) pinned the host guard directly and is removed: it asserted
+// exactly the behavior this test proves wrong. The narrower bug it guarded
+// against (papio-85a7420f4cd2564f: an unsolicited developer-panel capture of
+// the same session/provider/scenario can satisfy an unrelated pending CLI
+// request) is real but is a residual, documented at the match site in
+// bridge.go's pageCapture rather than defended by a test — a common false
+// failure from the host guard was worse than that rare false match.
+func TestPageCaptureRedirectedToDifferentHostStillCorrelates(t *testing.T) {
 	b, _, _, _ := newBridge(t)
 	runSync(t, b, hello())
 
@@ -399,37 +406,27 @@ func TestUnsolicitedPageCaptureCannotSatisfyDifferentHostPendingRequest(t *testi
 	}
 	request := directive.Payload.(*protocol.PageCaptureRequestPayload)
 
-	// An unsolicited capture for the same provider and scenario, but a
-	// different host, arrives on the same session — e.g. the operator runs
-	// the developer capture panel against a different article while the
-	// CLI's sagepub.com capture is still outstanding.
-	unsolicited := pageCapturePayload(t, []byte("<html>operator ad hoc capture</html>"))
-	unsolicited.Host = "elsevier.com"
-	unsolicited.Scenario = "success"
-	unsolicited.AdapterID = "sage"
-	runSync(t, b, inFrame(t, protocol.MsgPageCapture, "", unsolicited))
+	// The tab navigated to https://sagepub.com/article/42 but the provider
+	// redirected it onto a CDN host before the content frame captured
+	// location.origin — same session, provider, and scenario as the
+	// pending request, but a different landed host.
+	redirected := pageCapturePayload(t, []byte("<html>captured after redirect</html>"))
+	redirected.Host = "cdn.sagepub.com"
+	redirected.Scenario = "success"
+	redirected.AdapterID = "sage"
+	runSync(t, b, inFrame(t, protocol.MsgPageCapture, "", redirected))
 
-	// Storage is unconditional — the unsolicited capture is still kept —
-	// but it must not have bound to the pending request.
-	listed, err := b.captureStore.List(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(listed) != 1 {
-		t.Fatalf("stored captures = %#v, want exactly the unsolicited one", listed)
-	}
-
-	// The extension's correlated result frame arrives claiming success, but
-	// since no matching page_capture ever set pending.path, the bridge must
-	// report failure rather than hand the CLI caller the operator's file.
 	runSync(t, b, inFrame(t, protocol.MsgPageCaptureRequestResult, "", protocol.PageCaptureRequestResultPayload{
 		RequestID: request.RequestID, Outcome: "captured",
 	}))
 
 	select {
 	case result := <-resultCh:
-		if result.Outcome != "nav_failed" || result.Path != "" {
-			t.Fatalf("capture result = %#v, want nav_failed with no path (unsolicited capture must not satisfy the pending request)", result)
+		if result.Outcome != "captured" || result.RequestID != request.RequestID || result.Path == "" {
+			t.Fatalf("capture result = %#v, want captured with a stored path despite the host redirect", result)
+		}
+		if _, err := os.Stat(result.Path); err != nil {
+			t.Fatalf("stored capture path: %v", err)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("capture result did not correlate")

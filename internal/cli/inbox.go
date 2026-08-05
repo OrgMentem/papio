@@ -9,6 +9,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"papio/internal/store"
 	"papio/internal/triage"
 )
 
@@ -140,7 +141,13 @@ func printInboxItem(opt *options, item triage.Item) error {
 		for _, watched := range item.WatchHit.Watches {
 			labels = append(labels, watched.Label)
 		}
-		_, err := fmt.Fprintf(opt.out, "%d\twatch hit\t%s\t[%s]\n", item.Rank, item.Title, strings.Join(labels, ", "))
+		// item.Title is third-party bibliographic metadata for this kind: it is
+		// hit.Work.Title from a Crossref/OpenAlex/RSS watch match (see
+		// internal/triage/triage.go), bounded in length but never stripped of
+		// control bytes. Route it through the same StripTerminalControls choke
+		// point as the watch digest row, or an attacker-registered title
+		// injects ANSI/OSC escapes into `papio inbox`.
+		_, err := fmt.Fprintf(opt.out, "%d\twatch hit\t%s\t[%s]\n", item.Rank, store.StripTerminalControls(item.Title), strings.Join(labels, ", "))
 		return err
 	case triage.KindHumanAction:
 		_, err := fmt.Fprintf(opt.out, "%d\taction\t%s\t%s\n", item.Rank, item.HumanAction.ActionKind, item.HumanAction.JobID)

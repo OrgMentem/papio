@@ -28,14 +28,14 @@ func TestCompactActivitySummaryStripsTerminalControlBytes(t *testing.T) {
 			want:  "Evil]0;pwned Title",
 		},
 		{
-			name:  "c1 csi in title",
-			entry: store.ActivityEntry{JobTitle: "Title\u009b31mRed"},
-			want:  "Title31mRed",
-		},
-		{
 			name:  "falls back to state when title empty after stripping",
 			entry: store.ActivityEntry{JobTitle: "\x1b", JobState: "resolving"},
 			want:  "resolving",
+		},
+		{
+			name:  "control bytes in state fallback also stripped",
+			entry: store.ActivityEntry{JobState: "resolv\x1b]0;pwned\x07ing\u009b31m"},
+			want:  "resolv]0;pwneding31m",
 		},
 		{
 			name:  "printable non-ASCII title preserved",

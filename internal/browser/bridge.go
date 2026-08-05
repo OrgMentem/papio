@@ -22,7 +22,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -129,12 +128,6 @@ type CaptureResult struct {
 type pendingPageCapture struct {
 	payload   protocol.PageCaptureRequestPayload
 	sessionID string
-	// host is the lowercased hostname parsed from payload.URL at request
-	// time. The page_capture content frame carries only a bare hostname
-	// (protocol.PageCapturePayload.Host), never the full URL or a request
-	// id, so this is the most precise correlation available without a wire
-	// change — see the match in pageCapture() below.
-	host      string
 	delivered bool
 	path      string
 	result    chan CaptureResult
@@ -571,14 +564,6 @@ func (b *Bridge) Capture(ctx context.Context, request CaptureRequest) CaptureRes
 		return CaptureResult{Outcome: "busy", Detail: "a page capture is already outstanding for this browser session"}
 	}
 	requestID := newMsgID()
-	// The content frame that eventually delivers this capture's bytes
-	// (page_capture) carries no request id, so the host of the requested
-	// URL is recorded here and re-checked in pageCapture() as the tightest
-	// available correlation guard.
-	host := ""
-	if parsed, err := url.Parse(request.URL); err == nil {
-		host = strings.ToLower(parsed.Hostname())
-	}
 	pending := &pendingPageCapture{
 		payload: protocol.PageCaptureRequestPayload{
 			RequestID: requestID,
@@ -588,7 +573,6 @@ func (b *Bridge) Capture(ctx context.Context, request CaptureRequest) CaptureRes
 			SettleMS:  request.SettleMS,
 		},
 		sessionID: sessionID,
-		host:      host,
 		result:    make(chan CaptureResult, 1),
 	}
 	b.pendingCaptures[sessionID] = pending
@@ -840,20 +824,40 @@ func (b *Bridge) pageCapture(ctx context.Context, sessionID, jobID string, paylo
 	// page_capture carries no request id and no full URL (only a bare
 	// hostname), so it cannot be tied to one specific page_capture_request
 	// the way page_capture_request_result is (matched by RequestID).
-	// Requiring session + provider + scenario + host shrinks, but does not
-	// close, the window in which an UNSOLICITED capture (the developer
-	// capture panel's captureFixture, which answers no pending request at
-	// all) can satisfy a CLI-initiated `papio adapter capture` that happens
-	// to be waiting on the same session for the same provider/scenario/host.
-	// Closing that fully needs a negotiated request_id field threaded
-	// through page_capture — a breaking change to an EXISTING message type
-	// that requires capability negotiation (like page_capture_terms_v1) to
-	// stay safe for older extensions, and is deliberately deferred rather
-	// than added here.
+	// Requiring session + provider + scenario shrinks, but does not close,
+	// the window in which an UNSOLICITED capture (the developer capture
+	// panel's captureFixture, which answers no pending request at all) can
+	// satisfy a CLI-initiated `papio adapter capture` that happens to be
+	// waiting on the same session for the same provider/scenario
+	// (papio-85a7420f4cd2564f). This residual is real but narrow.
+	//
+	// Matching the pending request's REQUESTED-URL host against
+	// payload.Host was tried and reverted (bc3f4b2): payload.Host is not
+	// the requested host. extension/src/capture.ts sets it from
+	// location.origin — the host the tab actually LANDED on, read from the
+	// content frame, not the navigation target. Any ordinary cross-host
+	// redirect (www canonicalization, a CDN host swap, an SSO round-trip
+	// that returns to a different host) makes the two differ. When they
+	// do, this match never fires, pending.path stays empty, and the
+	// page_capture_request_result handler above — which correlated
+	// correctly by RequestID — downgrades a real "captured" to
+	// "nav_failed" because pending.path is empty. So a capture that
+	// genuinely succeeded and was stored gets reported to the CLI caller
+	// as a failure with no path to the file. That is strictly worse than
+	// the narrow bug above: a common false failure beats a rare wrong
+	// path.
+	//
+	// Closing the residual for real needs a negotiated request_id field
+	// threaded through page_capture — but that is an EXISTING message
+	// type, so it cannot gain a field without capability negotiation
+	// (like page_capture_terms_v1): an older extension's decoder fails
+	// closed on an unknown field, and that failure is fatal to the whole
+	// native-messaging session, not just the one frame. Deliberately
+	// deferred rather than added here. Do not re-attempt a host match as
+	// a substitute — the payload host is the wrong host to match against.
 	if pending := b.pendingCaptures[sessionID]; pending != nil &&
 		pending.payload.Provider == payload.AdapterID &&
-		pending.payload.Scenario == payload.Scenario &&
-		pending.host == strings.ToLower(payload.Host) {
+		pending.payload.Scenario == payload.Scenario {
 		pending.path = path
 	}
 	if jobID == "" || b.jobs == nil {

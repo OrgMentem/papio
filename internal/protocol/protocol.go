@@ -62,12 +62,13 @@ var (
 	hostRE           = regexp.MustCompile(`^[a-z0-9.-]{3,253}$`)
 	// originHostRE is the resolver-origin host grammar used ONLY by
 	// validateResolverOriginHint: lowercase RFC 1035 labels (alnum first/last
-	// character, hyphens interior only, 1-63 chars per label) joined by single
-	// dots, with at least two labels. It must stay byte-identical to
+	// character, hyphens interior only, 1-63 chars per label) joined by
+	// single dots — ONE label or several. It must stay byte-identical to
 	// ORIGIN_HOST_RE in extension/src/protocol.ts and the host portion of
 	// session_evidence.origin_hint's pattern in
-	// protocol/browser-v1.schema.json — see validateResolverOriginHint for why.
-	originHostRE = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$`)
+	// protocol/browser-v1.schema.json — see validateResolverOriginHint for
+	// why label count is deliberately unconstrained.
+	originHostRE = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$`)
 	errorCodeRE  = regexp.MustCompile(`^[a-z0-9_]{2,50}$`)
 	filenameRE   = regexp.MustCompile(`^[^/\\]{1,255}$`)
 	base64RE     = regexp.MustCompile(`^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$`)
@@ -594,43 +595,82 @@ func validateBareRoute(route string) error {
 }
 
 // validateResolverOriginHint enforces session_evidence.origin_hint's exact
-// wire rule: an https origin with a lowercase, multi-label, structurally
-// valid host and nothing else — no path, query, fragment, userinfo, or
-// mixed-case host. This function exists because three independent
-// implementations of "bare resolver origin" (this package, parseBrowserMessage
-// in extension/src/protocol.ts, and the published JSON Schema) previously
-// disagreed on all three axes at once:
-//   - Go, via validateBareRoute, accepted "https://EXAMPLE.com" because
-//     net/url's Hostname() preserves case and nothing downstream compared it
-//     against anything case-sensitive.
-//   - The TypeScript parser rejected the same value, but only as a side
-//     effect: the WHATWG URL parser lowercases the host of a special scheme
-//     internally, so `${parsed.protocol}//${parsed.host}` no longer equals
-//     the raw uppercase input and the round-trip equality check fails. That
-//     is an accident of implementation, not a stated rule — nothing prevents
-//     a future refactor away from the round-trip trick from losing it.
-//   - The schema separately demanded a 3..253-char lowercase
-//     `[a-z0-9.-]` host, which both parsers ignored, so "https://a" (a
-//     single-label host — legal for a browser origin, e.g. a LAN/mDNS name,
-//     but never a real institutional resolver origin: every configured
-//     browser.resolvers.* origin observed in practice is at least
-//     "host.tld") was ACCEPTED by both parsers and REJECTED by the schema.
+// wire rule: an https origin with a lowercase, structurally valid host and
+// nothing else — no path, query, fragment, userinfo, or mixed-case host.
+// This function exists because three independent implementations of "bare
+// resolver origin" (this package, parseBrowserMessage in
+// extension/src/protocol.ts, and the published JSON Schema) previously
+// disagreed on whether "https://EXAMPLE.com" decodes at all:
+//   - Go, via validateBareRoute, accepted it because net/url's Hostname()
+//     preserves case and nothing downstream compared it against anything
+//     case-sensitive.
+//   - The TypeScript parser rejected it, but only as a side effect: the
+//     WHATWG URL parser lowercases the host of a special scheme internally,
+//     so `${parsed.protocol}//${parsed.host}` no longer equals the raw
+//     uppercase input and the round-trip equality check fails. That is an
+//     accident of implementation, not a stated rule — nothing prevents a
+//     future refactor away from the round-trip trick from losing it.
 //
 // The rule settled on: reject rather than normalize case, even though
 // ResolverProfileForOrigin (internal/config/config.go) already lowercases
 // and does a case-insensitive Hostname comparison, so case alone cannot
 // currently misroute a match. That downstream leniency is not a reason to
-// leave the wire format ambiguous: the actual bug this closes is that the
-// three implementations disagreed about whether "https://EXAMPLE.com"
-// decodes AT ALL, which is a fail-closed-contract violation independent of
-// what any one consumer happens to tolerate afterward. Normalizing case
-// here instead of rejecting it would trade that decode-layer bug for a
-// silent one: a caller reading the decoded OriginHint back (logs, a future
+// leave the wire format ambiguous: the bug this closes is that the three
+// implementations disagreed about whether an uppercase host decodes AT
+// ALL, which is a fail-closed-contract violation independent of what any
+// one consumer happens to tolerate afterward. Normalizing case here
+// instead of rejecting it would trade that decode-layer bug for a silent
+// one: a caller reading the decoded OriginHint back (logs, a future
 // consumer added without ResolverProfileForOrigin's EqualFold) would see a
 // value that never appeared on the wire. Rejecting keeps the decoded value
 // always equal to the wire value, which is the invariant every other
-// browser-v1 string field relies on. The host must additionally have at
-// least two labels, since a resolver is never bare-hostname-only;
+// browser-v1 string field relies on. Uppercase is unreachable from a
+// genuine producer — origin_hint is always derived via `new URL(...)`,
+// which lowercases the host for https — so rejecting it costs nothing a
+// real deployment needs.
+//
+// The host must NOT be required to have two or more labels. An earlier
+// version of this function did require it, on the unverified assumption
+// that "a resolver is never bare-hostname-only" — checked against
+// internal/config/config.go's validateOpenURLBase (which requires only an
+// https scheme and a non-empty host: no FQDN, no label count) and found
+// false. browser.openurl_base_url = "https://library" is a valid config
+// today for an intranet resolver reachable only by a single-label
+// hostname, and the extension derives origin_hint straight from that
+// configured origin. The multi-label requirement therefore rejected a
+// value a legitimate deployment could and did emit — and because
+// Bridge.send (extension/src/background.ts) self-validates every outbound
+// frame and silently drops an invalid one, that institution's
+// session_evidence frames vanished permanently (no crash, just a
+// console.error nobody watches), while on the inbound side the same value
+// is a fatal decode under version skew (this project ships two papio
+// binaries; see AGENTS.md), repeatedly killing the native-messaging
+// session. The wire validator must never be stricter than what a valid
+// config can produce, so label count is deliberately NOT constrained here,
+// and neither is a minimum host length beyond "non-empty". Do not re-add
+// either bound without first tightening validateOpenURLBase to match, or
+// this exact bug reopens.
+//
+// A bracketed IPv6 literal (e.g. "https://[::1]") is rejected, but not by
+// a dedicated check: originHostRE's charset has no room for '[', ']', or
+// ':', so it never matches. This is the one deliberate gap against "never
+// reject what a valid config can produce": validateOpenURLBase does not
+// exclude an IPv6-literal openurl_base_url either. It is accepted anyway,
+// scoped narrowly, for a concrete reason distinct from the single-label
+// case above: the two runtimes cannot even agree on what string to test.
+// net/url's Hostname() strips the brackets ("::1") while the WHATWG URL
+// parser's .hostname keeps them ("[::1]"), AND — unlike a DNS host, which
+// both runtimes lowercase identically before this validator ever sees it —
+// net/url does NOT lowercase IPv6 hex digits (`url.Parse("https://[FE80::1]/").Hostname()`
+// stays "FE80::1") while the WHATWG parser does. Accepting IPv6 correctly
+// would need a second, bracket-and-case-aware code path duplicated three
+// ways instead of one shared regex, which is exactly the kind of
+// implementation drift this function exists to close. No observed
+// browser.resolvers.* origin is an IPv6 literal, so the safer near-term
+// call is to reject the one host shape the three implementations cannot
+// trivially agree on, rather than risk them agreeing on paper and drifting
+// in practice. Revisit with an explicit bracket-aware rule in all three
+// places together if a real deployment ever needs it.
 // originHostRE's grammar (RFC 1035 labels joined by single dots) also
 // forecloses a leading/trailing dot and a ".." run for free, because every
 // dot in that grammar sits between two non-empty labels — no separate pass
@@ -659,7 +699,7 @@ func validateResolverOriginHint(hint string) error {
 		return fmt.Errorf("session_evidence.origin_hint %q must be a bare origin with no path", hint)
 	}
 	if !originHostRE.MatchString(u.Hostname()) {
-		return fmt.Errorf("session_evidence.origin_hint %q must have a lowercase, multi-label resolver host", hint)
+		return fmt.Errorf("session_evidence.origin_hint %q must have a lowercase resolver host", hint)
 	}
 	return nil
 }

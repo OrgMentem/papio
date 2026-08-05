@@ -436,11 +436,12 @@ const HOST_RE = /^[a-z0-9.-]{3,253}$/;
 // session_evidence.origin_hint (see the validation block below for why it
 // exists alongside HOST_RE rather than reusing it): lowercase RFC 1035
 // labels (alnum first/last character, hyphens interior only, 1-63 chars per
-// label) joined by single dots, with at least two labels. Must stay
+// label) joined by single dots — ONE label or several. Must stay
 // byte-identical to originHostRE in internal/protocol/protocol.go and the
 // host portion of session_evidence.origin_hint's pattern in
-// protocol/browser-v1.schema.json.
-const ORIGIN_HOST_RE = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$/;
+// protocol/browser-v1.schema.json — label count is deliberately
+// unconstrained; see the validation block below for why.
+const ORIGIN_HOST_RE = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$/;
 const ERROR_CODE_RE = /^[a-z0-9_]{2,50}$/;
 const FILENAME_RE = /^[^/\\]{1,255}$/u;
 const RFC3339_RE =
@@ -940,7 +941,7 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
       if ("origin_hint" in p) {
         const origin = str(p, "origin_hint", "session_evidence", 300);
         // Two checks, each catching a different way a value can fail to be
-        // a bare, lowercase, multi-label resolver origin:
+        // a bare, lowercase resolver origin:
         //
         // 1. The round-trip equality below is what actually rejects a
         //    mixed-case host such as "https://EXAMPLE.com": the WHATWG URL
@@ -948,25 +949,60 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
         //    `${parsed.protocol}//${parsed.host}` no longer equals the raw
         //    uppercase input once parsed. That also happens to reject any
         //    path/query/fragment/userinfo the raw string carried, since
-        //    those are stripped out of `parsed.host`. It does NOT check host
-        //    charset or label count on its own — "https://a" round-trips
+        //    those are stripped out of `parsed.host`. It does NOT check
+        //    host charset on its own — every legal WHATWG host round-trips
         //    cleanly and would pass this check alone.
-        // 2. ORIGIN_HOST_RE therefore separately enforces the charset and
-        //    multi-label shape. A single-label host like "https://a" (legal
-        //    for a browser origin, e.g. a LAN/mDNS name) round-trips cleanly
-        //    through check 1 above, but is never a real institutional
-        //    resolver origin, so it is rejected here rather than treated as
-        //    a boundary case. Case is rejected rather than normalized even
-        //    though internal/config/config.go's ResolverProfileForOrigin
-        //    already lowercases and case-insensitively matches the decoded
-        //    hint, so case alone cannot currently misroute a match — that
-        //    downstream leniency isn't a reason to leave the wire format
-        //    ambiguous. The actual bug this closes is that Go, this parser,
-        //    and the schema disagreed about whether "https://EXAMPLE.com"
-        //    decodes AT ALL, independent of what any one consumer tolerates
-        //    afterward. This must match internal/protocol/protocol.go's
+        // 2. ORIGIN_HOST_RE therefore separately enforces the charset.
+        //    Label count is deliberately NOT constrained: an earlier
+        //    version of this rule required two-or-more labels on the
+        //    unverified assumption that "a single-label host is never a
+        //    real institutional resolver origin". That assumption was
+        //    checked against internal/config/config.go's
+        //    validateOpenURLBase (only an https scheme and a non-empty
+        //    host — no FQDN, no label count) and found false:
+        //    browser.openurl_base_url = "https://library" is a valid
+        //    config today for an intranet resolver, and this module's
+        //    resolverOriginHint/latestResolverOrigin derive origin_hint
+        //    straight from that configured origin. Rejecting a value a
+        //    legitimate config can produce is a release blocker, not a
+        //    safety margin — Bridge.send self-validates every outbound
+        //    frame and silently drops an invalid one, so an over-strict
+        //    host grammar here permanently starves that institution's
+        //    session_evidence signal, and the same value is a fatal
+        //    inbound decode under version skew. Do not re-add a label-count
+        //    or minimum-length bound without first tightening
+        //    validateOpenURLBase to match. Case is rejected rather than
+        //    normalized even though internal/config/config.go's
+        //    ResolverProfileForOrigin already lowercases and
+        //    case-insensitively matches the decoded hint, so case alone
+        //    cannot currently misroute a match — that downstream leniency
+        //    isn't a reason to leave the wire format ambiguous, and
+        //    uppercase is unreachable from a genuine producer (origin_hint
+        //    is always derived via `new URL(...)`, which lowercases the
+        //    host for https) so rejecting it costs nothing real. A
+        //    bracketed IPv6 literal is rejected too, but not by a dedicated
+        //    check: ORIGIN_HOST_RE's charset has no room for '[', ']', or
+        //    ':'. This is the one deliberate gap against "never reject
+        //    what a valid config can produce": validateOpenURLBase
+        //    (internal/config/config.go) does not exclude an IPv6-literal
+        //    openurl_base_url either. It is accepted anyway, scoped
+        //    narrowly, because the two runtimes cannot even agree on what
+        //    string to test: this parser's `.hostname` keeps the brackets
+        //    ("[::1]") while Go's Hostname() strips them ("::1"), AND —
+        //    unlike a DNS host, which both runtimes lowercase identically
+        //    before this validator ever sees it — Go's net/url does NOT
+        //    lowercase IPv6 hex digits while the WHATWG URL parser does.
+        //    Accepting IPv6 correctly would need a second,
+        //    bracket-and-case-aware code path duplicated three ways
+        //    instead of one shared regex — exactly the drift this function
+        //    exists to close. No observed browser.resolvers.* origin is an
+        //    IPv6 literal, so the safer near-term call is to reject the
+        //    one host shape the three implementations cannot trivially
+        //    agree on. Revisit with an explicit bracket-aware rule in all
+        //    three places together if a real deployment ever needs it.
+        //    This must match internal/protocol/protocol.go's
         //    validateResolverOriginHint exactly — see its doc comment for
-        //    the full three-way history this rule replaces.
+        //    the full history.
         try {
           const parsed = new URL(origin);
           if (
@@ -975,11 +1011,11 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
             `${parsed.protocol}//${parsed.host}` !== origin ||
             !ORIGIN_HOST_RE.test(parsed.hostname)
           ) {
-            fail("session_evidence.origin_hint must be a bare https origin with a lowercase, multi-label resolver host");
+            fail("session_evidence.origin_hint must be a bare https origin with a lowercase resolver host");
           }
         } catch (e) {
           if (e instanceof ProtocolError) throw e;
-          fail("session_evidence.origin_hint must be a bare https origin with a lowercase, multi-label resolver host");
+          fail("session_evidence.origin_hint must be a bare https origin with a lowercase resolver host");
         }
       }
       break;

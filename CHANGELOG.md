@@ -24,6 +24,21 @@ execution records in `notes/acquisition-stack-plan.md`.
 
 ### Fixed
 
+- **`papio watch digest` and `papio inbox` strip terminal control bytes.** The
+  same third-party bibliographic strings the activity feed was hardened
+  against — stored after `TrimSpace` and nothing else — were printed raw by
+  two adjacent commands, so a record whose title carried an OSC sequence could
+  rewrite the operator's terminal when it matched a watch. Titles, authors and
+  DOIs on those rows now go through the same choke point, as does the job-state
+  fallback beside the activity summary.
+- **A page capture that redirects is no longer reported as a failure.** The
+  previous release matched a pending capture against the host of the URL it
+  requested, but the extension reports the host the page actually *landed* on,
+  so an ordinary `www` canonicalization, CDN swap or SSO round-trip left the
+  capture uncorrelated and downgraded a stored, successful capture to
+  `nav_failed` with no path back to the file. That guard is reverted and the
+  episode recorded in the code, because the residual it was aimed at is much
+  rarer than the failure it caused.
 - **A concurrent review submission is no longer told the verdict was recorded
   before it was.** A second POST arriving while the first was still inside
   `ResolveReviewCAS` was answered with the recorded shell — buttons disabled,
@@ -51,9 +66,13 @@ execution records in `notes/acquisition-stack-plan.md`.
   (leading, trailing and doubled dots), and `origin_hint` disagreed three ways
   at once: Go accepted an uppercase host that the TypeScript URL round-trip
   rejected, while the schema alone rejected a single-label host both parsers
-  allowed. One rule now applies everywhere — an https origin with a lowercase,
-  RFC-1035-shaped, multi-label host — with corpus fixtures pinning each
-  previously divergent value.
+  allowed. One rule now applies everywhere: an https origin, with no userinfo,
+  path, query or fragment, and a host that is already lowercase. Label count
+  and host length are deliberately NOT constrained — a single-label intranet
+  resolver such as `https://library` is a legitimate configuration, since
+  `browser.openurl_base_url` requires only an https URL with a host, and the
+  wire validator must never be stricter than a valid config can produce.
+  Corpus fixtures pin each previously divergent value.
 - **`papio adapter capture` reports a daemon upgrade instead of a raw RPC
   error.** Against an older daemon it surfaced the bare `unknown_method`
   failure rather than the actionable message every other versioned command
