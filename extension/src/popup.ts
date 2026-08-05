@@ -1858,6 +1858,7 @@ export async function refresh(): Promise<void> {
   const store = await chromeBackend(chrome.storage).load();
   renderDaemonStatus(document, store);
   renderPageAcquire(document);
+  refreshCaptureOptions(document, store.daemonFeatures);
   // Wave 2: every slow input is gathered in parallel and painted in ONE
   // synchronous pass. Sections revealing one by one over the next seconds
   // shift later cards mid-aim — a live mis-click hit "Focus" where
@@ -1950,7 +1951,68 @@ const captureApi: ChromeCaptureApi = {
   },
 };
 
-export function wireCapture(doc: Document = document): void {
+function replaceCaptureOptions(
+  doc: Document,
+  select: HTMLSelectElement,
+  values: readonly string[],
+): void {
+  if (
+    select.options.length === values.length &&
+    values.every((value, index) => select.options[index]?.value === value)
+  ) {
+    return;
+  }
+  const selected = select.value;
+  select.replaceChildren(
+    ...values.map((value) => {
+      const option = doc.createElement("option");
+      option.value = value;
+      option.textContent = value;
+      return option;
+    }),
+  );
+  select.value = values.includes(selected) ? selected : (values[0] ?? "");
+}
+
+function populateCaptureOptions(doc: Document, daemonFeatures?: string[]): void {
+  if (typeof HTMLSelectElement === "undefined" || typeof HTMLButtonElement === "undefined") {
+    return;
+  }
+  const providerEl = doc.getElementById("capture-provider");
+  const scenarioEl = doc.getElementById("capture-scenario");
+  const button = doc.getElementById("capture-btn");
+  if (
+    !(providerEl instanceof HTMLSelectElement) ||
+    !(scenarioEl instanceof HTMLSelectElement) ||
+    !(button instanceof HTMLButtonElement) ||
+    !button.dataset.wired
+  ) {
+    return;
+  }
+
+  // `terms` is gated on a daemon capability rather than the dev build alone.
+  // It was appended to the EXISTING page_capture scenario enum, so a daemon
+  // predating it rejects the frame during validation — and a browser-protocol
+  // decode failure is fatal to the whole native-messaging session, not just
+  // that request. Unknown features must therefore withhold the option rather
+  // than offer it: an absent list is the pre-hello state and the old-daemon
+  // state alike, and both must fail closed.
+  const scenarioValues = (daemonFeatures ?? []).includes("page_capture_terms_v1")
+    ? SCENARIOS
+    : SCENARIOS.filter((s): s is Scenario => s !== "terms");
+  replaceCaptureOptions(doc, providerEl, PROVIDERS);
+  replaceCaptureOptions(doc, scenarioEl, scenarioValues);
+}
+
+/** Refresh has feature data but no manifest context, so the section's hidden
+ * state carries wireDevTools' packed-build refusal into every periodic tick. */
+export function refreshCaptureOptions(doc: Document = document, daemonFeatures?: string[]): void {
+  const section = doc.querySelector<HTMLElement>(".capture");
+  if (!section || section.hidden) return;
+  populateCaptureOptions(doc, daemonFeatures);
+}
+
+export function wireCapture(doc: Document = document, daemonFeatures?: string[]): void {
   // The dev-only capture panel needs the element constructors for its
   // instanceof narrowing; a DOM environment without them (some test DOMs)
   // simply has no panel to wire.
@@ -1970,32 +2032,20 @@ export function wireCapture(doc: Document = document): void {
     return;
   }
 
-  // The registry is the single source of truth: a newly registered adapter is
-  // capturable without touching popup markup.
-  for (const [select, values] of [
-    [providerEl, PROVIDERS],
-    [scenarioEl, SCENARIOS],
-  ] as const) {
-    select.replaceChildren(
-      ...values.map((value) => {
-        const option = doc.createElement("option");
-        option.value = value;
-        option.textContent = value;
-        return option;
-      }),
-    );
-  }
-
-  button.addEventListener("click", () => {
-    const provider = providerEl.value as Provider;
-    const scenario = scenarioEl.value as Scenario;
-    button.disabled = true;
-    statusEl.textContent = "Capturing…";
-    void captureFixture(captureApi, provider, scenario, () => new Date()).then((result) => {
-      statusEl.textContent = result.ok ? `Sent ${result.bytes}-byte capture` : result.error;
-      button.disabled = false;
+  if (!button.dataset.wired) {
+    button.dataset.wired = "1";
+    button.addEventListener("click", () => {
+      const provider = providerEl.value as Provider;
+      const scenario = scenarioEl.value as Scenario;
+      button.disabled = true;
+      statusEl.textContent = "Capturing…";
+      void captureFixture(captureApi, provider, scenario, () => new Date()).then((result) => {
+        statusEl.textContent = result.ok ? `Sent ${result.bytes}-byte capture` : result.error;
+        button.disabled = false;
+      });
     });
-  });
+  }
+  populateCaptureOptions(doc, daemonFeatures);
 }
 
 export async function grantProviderAccess(host: string): Promise<boolean> {

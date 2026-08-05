@@ -16,6 +16,7 @@ import {
   deriveSessionRows,
   readCurrentPageMetadata,
   refreshImpactSummary,
+  refreshCaptureOptions,
   renderInstitutionSession,
   renderNeedsAttention,
   grantProviderAccess,
@@ -89,11 +90,46 @@ test("places the acquire icon before inbox and keeps idle feedback hidden", () =
 
 test("capture selects offer every registered provider and scenario", () => {
   const doc = popupDocument();
-  wireCapture(doc);
+  wireCapture(doc, ["page_capture_terms_v1"]);
   const values = (id: string): string[] =>
     Array.from(doc.querySelectorAll<HTMLOptionElement>(`#${id} option`)).map((o) => o.value);
   expect(values("capture-provider")).toEqual([...PROVIDERS]);
   expect(values("capture-scenario")).toEqual([...SCENARIOS]);
+});
+
+// The `terms` scenario rides the pre-existing page_capture scenario enum, so
+// an old daemon that has never validated it would reject the whole frame —
+// and a browser-protocol decode failure tears down the entire native-
+// messaging session, not just that capture. The option must therefore stay
+// unrendered (not merely disabled) until the daemon proves it can accept it.
+test("offers the terms capture scenario once the daemon advertises the gate feature", () => {
+  const doc = popupDocument();
+  wireCapture(doc, ["page_capture_terms_v1"]);
+  const values = Array.from(doc.querySelectorAll<HTMLOptionElement>("#capture-scenario option")).map(
+    (o) => o.value,
+  );
+  expect(values).toEqual([...SCENARIOS]);
+  expect(values).toContain("terms");
+});
+
+test("withholds the terms capture scenario from a daemon that lacks the gate feature", () => {
+  const doc = popupDocument();
+  wireCapture(doc, ["page_capture_v1"]);
+  const values = Array.from(doc.querySelectorAll<HTMLOptionElement>("#capture-scenario option")).map(
+    (o) => o.value,
+  );
+  expect(values).toEqual(SCENARIOS.filter((s) => s !== "terms"));
+  expect(values).not.toContain("terms");
+});
+
+test("fails closed and withholds the terms capture scenario before daemon features are known", () => {
+  const doc = popupDocument();
+  wireCapture(doc);
+  const values = Array.from(doc.querySelectorAll<HTMLOptionElement>("#capture-scenario option")).map(
+    (o) => o.value,
+  );
+  expect(values).toEqual(SCENARIOS.filter((s) => s !== "terms"));
+  expect(values).not.toContain("terms");
 });
 
 test("capture tools require a developer build and an unpacked manifest", () => {
@@ -119,6 +155,81 @@ test("capture tools require a developer build and an unpacked manifest", () => {
     const capture = unpacked.querySelector<HTMLElement>(".capture");
     expect(capture?.tagName).toBe("DETAILS");
     expect(capture?.hasAttribute("open")).toBe(false);
+  } finally {
+    if (descriptor !== undefined) {
+      Object.defineProperty(globalThis, flag, descriptor);
+    } else {
+      Reflect.deleteProperty(globalThis, flag);
+    }
+  }
+});
+
+test("capture wiring stays one-shot across repeated option refreshes", () => {
+  const doc = popupDocument();
+  const button = doc.getElementById("capture-btn");
+  expect(button).toBeInstanceOf(HTMLButtonElement);
+  if (!(button instanceof HTMLButtonElement)) throw new Error("capture button missing");
+
+  const originalAddEventListener = button.addEventListener.bind(button);
+  let clickListeners = 0;
+  button.addEventListener = ((
+    type: string,
+    listener: EventListenerOrEventListenerObject,
+    options?: boolean | AddEventListenerOptions,
+  ) => {
+    if (type === "click") clickListeners += 1;
+    originalAddEventListener(type, listener, options);
+  }) as typeof button.addEventListener;
+
+  wireDevTools(doc, {});
+  refreshCaptureOptions(doc, ["page_capture_terms_v1"]);
+  refreshCaptureOptions(doc);
+  wireCapture(doc, ["page_capture_terms_v1"]);
+
+  expect(button.dataset.wired).toBe("1");
+  expect(clickListeners).toBe(1);
+});
+
+test("capture option refresh preserves valid selections and safely replaces a gated scenario", () => {
+  const doc = popupDocument();
+  wireDevTools(doc, {});
+  const provider = doc.getElementById("capture-provider");
+  const scenario = doc.getElementById("capture-scenario");
+  expect(provider).toBeInstanceOf(HTMLSelectElement);
+  expect(scenario).toBeInstanceOf(HTMLSelectElement);
+  if (!(provider instanceof HTMLSelectElement) || !(scenario instanceof HTMLSelectElement)) {
+    throw new Error("capture selects missing");
+  }
+
+  provider.value = PROVIDERS[1]!;
+  scenario.value = "drift";
+  const staleProviderOption = doc.createElement("option");
+  staleProviderOption.value = "stale";
+  provider.append(staleProviderOption);
+  refreshCaptureOptions(doc, ["page_capture_terms_v1"]);
+  expect(provider.value).toBe(PROVIDERS[1]!);
+  expect(scenario.value).toBe("drift");
+
+  scenario.value = "terms";
+  refreshCaptureOptions(doc);
+  expect(scenario.value).toBe(SCENARIOS[0]!);
+});
+
+test("packed capture panels stay unwired and unpopulated during option refreshes", () => {
+  const flag = "__PAPIO_DEV_CAPTURE__";
+  const descriptor = Object.getOwnPropertyDescriptor(globalThis, flag);
+  try {
+    Object.defineProperty(globalThis, flag, { configurable: true, value: true });
+    const doc = popupDocument();
+    wireDevTools(doc, { update_url: "https://updates.invalid/extension" });
+    refreshCaptureOptions(doc, ["page_capture_terms_v1"]);
+
+    const button = doc.getElementById("capture-btn");
+    expect(button).toBeInstanceOf(HTMLButtonElement);
+    expect(button instanceof HTMLButtonElement ? button.dataset.wired : undefined).toBeUndefined();
+    expect(doc.querySelector<HTMLElement>(".capture")?.hidden).toBe(true);
+    expect(doc.querySelectorAll("#capture-provider option")).toHaveLength(0);
+    expect(doc.querySelectorAll("#capture-scenario option")).toHaveLength(0);
   } finally {
     if (descriptor !== undefined) {
       Object.defineProperty(globalThis, flag, descriptor);

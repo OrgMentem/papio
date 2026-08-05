@@ -16,6 +16,64 @@ for the full pre-split extension history.
 
 ## [Unreleased]
 
+### Fixed
+
+- **The developer `terms` capture scenario can no longer disconnect the
+  session.** `terms` was appended to the *existing* `page_capture` scenario
+  enum, and the capture panel sent it gated only on `page_capture_v1` — a
+  capability older daemons already advertise. Selecting it against one of them
+  made the daemon reject the frame, and a browser-protocol decode failure is
+  fatal to the whole native-messaging session, not just that capture. The
+  option is now withheld unless the daemon advertises `page_capture_terms_v1`,
+  and the gate fails closed: an unknown or not-yet-received feature list
+  withholds it too, so the pre-hello window behaves like an old daemon rather
+  than optimistically offering the option. The gate is enforced twice: the
+  panel withholds the option, and the runtime boundary that actually emits the
+  frame refuses a `terms` payload independently, so a daemon swapped out
+  underneath the popup between refreshes cannot be sent a scenario it will
+  reject. Release builds were never exposed — the panel requires a developer
+  build and an unpacked manifest.
+- **The developer capture panel no longer multiplies its own click handler.**
+  Reading the daemon feature list for the gate above moved panel wiring into
+  the popup's five-second refresh, which had been running once. Each tick
+  attached another `click` listener, so after a few minutes one click fired a
+  dozen concurrent captures — each a sanitized page frame up to the 256 KiB
+  protocol cap, each its own relay request — and every tick also reset the
+  operator's chosen provider and scenario to the first option. Wiring is now
+  one-shot and the periodic pass only refreshes the options, preserving the
+  current selection and falling back safely when the selected scenario is
+  gated away.
+- **Handoffs queued behind the drive governor survive a service-worker
+  restart.** With both drive slots busy an accepted job waits at `tab_id -1`
+  in an in-memory FIFO. MV3 suspends the worker on idle and nothing restored
+  that queue: the startup scan skipped every job at `tab_id -1`, the
+  queued-release pass only handles jobs in the `queued` state, and a daemon
+  re-offer for the same URL merely re-acknowledged it. The job never opened,
+  never completed and never timed out — silently lost, and most likely under
+  exactly the flood the governor exists to manage. Startup now re-enqueues
+  those drives; deliveries and direct-file downloads, which legitimately park
+  at `tab_id -1`, are left alone.
+- **A per-institution "Sign in" hands its tab to the keepalive manager.** The
+  popup's origin-specific sign-in rows opened a plain managed tab, so the
+  manager never knew a sign-in was in progress: its own reload cycle could
+  fire mid-SAML exchange and destroy the login, and because the tab was
+  ledgered but carried no job, startup orphan reconciliation could close it
+  while the operator was still signing in. It now takes the same
+  manager-owned path as the general re-authentication action, falling back to
+  a managed tab only when there is no manager.
+- **Delivery provenance records the page that requested the download.** The
+  host reported on `delivery_context` was read from the tab at
+  download-completion time rather than when the delivery was requested. A
+  download takes seconds and the tab stays interactive throughout, so
+  navigating away mid-download recorded the page the operator happened to land
+  on as the candidate's landing page, naming somewhere the bytes never came
+  from. The host is now frozen alongside the URL at request time, and is
+  applied only to the delivery it was captured for — a failed delivery no
+  longer lends its host to the next download of the same job. This corrects
+  the recorded landing page only: a delivery's `access_basis` is still derived
+  from its route and session evidence, both still evaluated when the download
+  lands.
+
 ## [0.9.0] - 2026-08-04
 
 ### Added

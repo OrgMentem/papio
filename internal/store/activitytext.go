@@ -187,10 +187,37 @@ func formatActivityAge(seconds int64) string {
 	}
 }
 
+// StripTerminalControls removes every code point that a terminal emulator
+// could interpret as part of a control sequence rather than display text:
+// C0 controls (r < 0x20), DEL (0x7f), and the C1 block (0x80-0x9f). C1 matters
+// because a UTF-8 xterm decodes U+009B and U+009D as CSI and OSC introducers
+// respectively — the same escape-injection primitive as ESC, just reachable
+// without an ESC byte in the input. This is the one choke point for any
+// string that reaches an operator's terminal or another untrusted-input
+// surface; route new callers through it rather than writing a second filter.
+func StripTerminalControls(value string) string {
+	return strings.Map(func(r rune) rune {
+		if r < 0x20 || (r >= 0x7f && r <= 0x9f) {
+			return -1
+		}
+		return r
+	}, value)
+}
+
 // clampActivityText bounds one summary line; the browser protocol carries it
 // inside a frame with a hard size cap and the CLI prints it on one row.
+//
+// It runs every value through StripTerminalControls before truncating.
+// `papio activity` writes this string straight to the operator's terminal,
+// and the one attacker-influenced field that reaches it — a browser-reported
+// download filename, whose protocol regex forbids only the path separators —
+// could otherwise carry ESC (or a raw C1 byte) and inject ANSI/OSC escape
+// sequences into that terminal. Stripping at this single choke point also
+// keeps any detail field that becomes untrusted later safe by default,
+// rather than re-opening the hole silently. The --json path was never
+// affected: encoding/json escapes control bytes on its own.
 func clampActivityText(value string) string {
-	value = strings.ReplaceAll(value, "\x00", "")
+	value = StripTerminalControls(value)
 	runes := []rune(value)
 	if len(runes) <= 160 {
 		return value

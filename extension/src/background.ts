@@ -171,6 +171,7 @@ const STATS_FEATURE = "browser_stats_v1";
 const ACTIVITY_FEED_FEATURE = "activity_feed_v1";
 const PAGE_CAPTURE_FEATURE = "page_capture_v1";
 const PAGE_CAPTURE_REQUEST_FEATURE = "page_capture_request_v1";
+const PAGE_CAPTURE_TERMS_FEATURE = "page_capture_terms_v1";
 const PAGE_CAPTURE_DEFAULT_SETTLE_MS = 3_000;
 const PAGE_CAPTURE_NAV_TIMEOUT_MS = 30_000;
 const TRIAGE_COUNTS_FRESH_MS = 3 * KEEPALIVE_ALARM_MINUTES * 60_000;
@@ -1322,6 +1323,20 @@ export class Bridge {
     if (origin !== undefined) {
       if (!isBareHTTPSOrigin(origin)) {
         return this.failure("resolver_unavailable", "No resolver configured yet — open a paper first");
+      }
+      // Hand the tab to the keepalive manager exactly as the no-origin branch
+      // below does. It owns the tab for the duration of the sign-in: its
+      // reload cycle pauses, so a scheduled reload cannot destroy an
+      // in-flight SAML exchange, and the tab is never entered in the managed
+      // tab ledger, so startup orphan reconciliation cannot close it while
+      // the operator is still signing in.
+      const originManager = this.keepaliveManager;
+      if (originManager !== undefined) {
+        try {
+          if (await originManager.openReauth(origin)) return { ok: true, opened: true };
+        } catch {
+          // Fall through to the unmanaged tab below.
+        }
       }
       const tabID = await this.openManagedTab({
         url: origin,
@@ -2538,16 +2553,43 @@ export class Bridge {
     await this.reconcileHandoffGroups();
     await this.syncConnectionBadge();
     await this.reconcileTabs();
+    const governorQueuedAtRestart: string[] = [];
     for (const job of this.store.activeJobs) {
-      if (
-        this.handoffDrives.size >= HANDOFF_DRIVE_LIMIT ||
-        job.tab_id < 0 ||
-        (job.status !== "accepted" && job.status !== "auth_pending" && job.status !== "awaiting_download")
-      ) {
+      if (job.status !== "accepted" && job.status !== "auth_pending" && job.status !== "awaiting_download") {
         continue;
       }
+      if (job.tab_id < 0) {
+        // Governor-queued before this worker was suspended: the daemon
+        // accepted it, but the FIFO holding it until a slot freed lives only
+        // in memory. Nothing else recovers these — this scan used to skip
+        // them, the queued-release pass below only handles status "queued",
+        // and a daemon re-offer on the same URL merely re-acks. Left alone
+        // they never open, never complete and never time out, which is worst
+        // exactly under the flood the governor exists for.
+        //
+        // Deliveries and direct-file downloads also park at tab_id -1 and must
+        // NOT be handed a broker tab. The direct-file test has to mirror the
+        // offer path's gate exactly: isDirectFileOffer is shape-only, and an
+        // institutional handoff's offer URL is the operator's OpenURL base,
+        // whose path papio does not constrain — so a pdf-shaped base on a
+        // requires_auth offer is a real handoff that was never eligible for
+        // the direct-download shortcut. Excluding it on shape alone would
+        // strand exactly the jobs this restore exists to recover.
+        if (job.status !== "accepted") continue;
+        if (this.store.pendingDelivery?.job_id === job.job_id) continue;
+        const offerURL = this.offerURLs.get(job.job_id);
+        if (offerURL === undefined) continue;
+        if (isDirectFileOffer(offerURL) && job.requires_auth !== true) continue;
+        governorQueuedAtRestart.push(job.job_id);
+        continue;
+      }
+      if (this.handoffDrives.size >= HANDOFF_DRIVE_LIMIT) continue;
       this.registerHandoffDrive(job.job_id, job.tab_id);
     }
+    for (const jobID of governorQueuedAtRestart) {
+      this.enqueueHandoffDrive({ jobID, purpose: "handoff", focusExisting: false });
+    }
+    if (governorQueuedAtRestart.length > 0) await this.drainHandoffDriveQueue();
     await this.redrivePendingTermsGates();
     for (const job of this.store.activeJobs) {
       if (job.status === "queued") this.scheduleQueuedHandoffRelease(job.job_id);
@@ -2664,6 +2706,20 @@ export class Bridge {
     return (
       this.store.connectionStatus === "connected" &&
       (this.store.daemonFeatures ?? []).includes(PAGE_CAPTURE_FEATURE)
+    );
+  }
+
+  /** Second, independent enforcement point for the `terms` capture scenario.
+   * The popup withholds the option, but it decides that when the panel is
+   * populated, and the daemon underneath can be swapped between then and the
+   * click (the two-binary skew AGENTS.md documents). Emitting `terms` to a
+   * daemon that cannot validate it does not merely fail that capture: the
+   * decode error tears down the entire native-messaging session, so the
+   * boundary that actually sends the frame refuses it too. */
+  termsCaptureAvailable(): boolean {
+    return (
+      this.store.connectionStatus === "connected" &&
+      (this.store.daemonFeatures ?? []).includes(PAGE_CAPTURE_TERMS_FEATURE)
     );
   }
 
@@ -2795,12 +2851,17 @@ export class Bridge {
     if (pending?.job_id === job.job_id && pending.status !== "failed") {
       return { ok: true, state: pending.status ?? "sending", job_id: job.job_id, ...(duplicate ? { duplicate: true } : {}) };
     }
+    // Freeze the requesting page's host alongside the URL. The tab stays
+    // interactive for the whole download, so this is the only moment the
+    // page that actually produced these bytes is known for certain.
+    const deliveryPageHostAtStart = sanitizePageHost(tabURL);
     await this.update((s) =>
       startPendingDelivery(s, {
         job_id: job.job_id,
         url,
         initiated_at: this.deps.now(),
         status: "sending",
+        ...(deliveryPageHostAtStart !== undefined ? { page_host: deliveryPageHostAtStart } : {}),
       }),
     );
     this.lastDeliveryState = undefined;
@@ -4106,7 +4167,34 @@ export class Bridge {
     return this.keepaliveAuthenticated || this.authReturnedThisWorker ? "warm" : "none";
   }
 
-  private async deliveryPageHost(owner: ActiveJob, item: DownloadItemLike): Promise<string | undefined> {
+  private async deliveryPageHost(
+    owner: ActiveJob,
+    item: DownloadItemLike,
+    track: DownloadTrack,
+  ): Promise<string | undefined> {
+    // Provenance must name the page these bytes came from. For a popup
+    // delivery that host was frozen when the download was requested: the
+    // download can take seconds, the tab remains interactive throughout, and
+    // re-reading it here would label the candidate with whatever the operator
+    // navigated to in the meantime.
+    //
+    // The frozen host is only valid for the delivery download it was captured
+    // for. A failed delivery (status: "failed") leaves page_host intact in
+    // pendingDelivery, and clearPendingDelivery only runs on job
+    // completion/removal — so a stale frozen host can poison a later
+    // non-delivery download for the same job (sequence A: failed delivery
+    // followed by a resolver-routed download from a different host).
+    // Non-delivery downloads (handoff, directOffer) must never inherit a
+    // delivery's frozen host (sequence B).
+    const frozen = this.store.pendingDelivery;
+    if (
+      track.delivery === true &&
+      frozen?.job_id === owner.job_id &&
+      frozen.status !== "failed" &&
+      frozen.page_host !== undefined
+    ) {
+      return frozen.page_host;
+    }
     const tabID = typeof item.tabId === "number" && item.tabId >= 0 ? item.tabId : owner.tab_id;
     if (tabID < 0) return undefined;
     try {
@@ -6352,7 +6440,7 @@ export class Bridge {
     this.stalledAuthHandoffs.delete(owner.job_id);
     const route = this.deliveryRouteFor(owner, track);
     const sessionEvidence = this.deliveryEvidenceFor(owner, track, route);
-    const pageHost = await this.deliveryPageHost(owner, item);
+    const pageHost = await this.deliveryPageHost(owner, item, track);
     this.send("download_started", { download_id: delta.id, filename }, owner.job_id);
     this.send("download_complete", { download_id: delta.id, filename, size_bytes: size }, owner.job_id);
     if (
@@ -6686,11 +6774,15 @@ export async function handleInboxRuntimeMessage(
     if (sender.id !== urls.runtimeID || sender.url !== urls.popupURL) {
       return runtimeFailure("unauthorized", "This sender cannot send page captures");
     }
-    if (!hasOnlyKeys(message, ["type", "payload"]) || !isPageCaptureRuntimeRequest(message["payload"])) {
+    const capturePayload = message["payload"];
+    if (!hasOnlyKeys(message, ["type", "payload"]) || !isPageCaptureRuntimeRequest(capturePayload)) {
       return runtimeFailure("invalid_request", "Invalid page capture request");
     }
     if (!bridge.pageCaptureAvailable()) return { captured: true };
-    return bridge.sendPageCapture(message["payload"])
+    if (capturePayload.scenario === "terms" && !bridge.termsCaptureAvailable()) {
+      return { captured: true };
+    }
+    return bridge.sendPageCapture(capturePayload)
       ? { captured: true }
       : runtimeFailure("capture_failed", "Could not send page capture");
   }

@@ -82,8 +82,14 @@ func formatActivityAt(at time.Time) string {
 // compactActivitySummary names the job on the human line: title when known,
 // else current state. Raw detail stays on the --json branch — the friendly
 // text column already folds the interesting detail fields in.
+//
+// JobTitle is third-party bibliographic metadata (enrichment stores it after
+// only TrimSpace), so it reaches this terminal-printed row un-sanitized; run
+// it through the same StripTerminalControls choke point as ActivityText, or
+// an ESC/BEL/C1 byte in a DOI-registered title re-injects into the operator's
+// terminal on this column even though the other column is already clamped.
 func compactActivitySummary(entry store.ActivityEntry) string {
-	if title := strings.Join(strings.Fields(entry.JobTitle), " "); title != "" {
+	if title := strings.Join(strings.Fields(store.StripTerminalControls(entry.JobTitle)), " "); title != "" {
 		return title
 	}
 	if state := strings.TrimSpace(entry.JobState); state != "" {

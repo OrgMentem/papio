@@ -59,6 +59,7 @@ const (
 	triageCountsSchema2Feature   = "triage_counts_schema_v2"
 	sessionEvidenceFeature       = "session_evidence_v1"
 	deliveryContextFeature       = "delivery_context_v1"
+	pageCaptureTermsFeature      = "page_capture_terms_v1"
 	previewCapabilityTTL         = 10 * time.Minute
 	sessionEvidenceThrottle      = 60 * time.Second
 	deliveryContextTTL           = 60 * time.Second
@@ -233,7 +234,7 @@ const pendingExpireAfter = 5 * time.Minute
 // any job is ever offered depends on config (extension_id / openurl base).
 func NewBridge(jobs *job.Store, svc *app.Service, triageService *triage.Service, watchRunner *watch.Runner, previewServer *preview.Server, captureStore *captures.Store, cfg config.Config, version string) *Bridge {
 	required := []string{
-		pageAcquireFeature, triageSnapshotFeature, triageSnapshotSchema2Feature, triageMutationsFeature, reviewPreviewFeature, statsFeature, pageCaptureFeature, pageCaptureRequestFeature, activityFeedFeature, triageCountsSchema2Feature, sessionEvidenceFeature, deliveryContextFeature,
+		pageAcquireFeature, triageSnapshotFeature, triageSnapshotSchema2Feature, triageMutationsFeature, reviewPreviewFeature, statsFeature, pageCaptureFeature, pageCaptureRequestFeature, activityFeedFeature, triageCountsSchema2Feature, sessionEvidenceFeature, deliveryContextFeature, pageCaptureTermsFeature,
 	}
 	return &Bridge{
 		jobs: jobs, svc: svc, triage: triageService, watchRunner: watchRunner, preview: previewServer, captureStore: captureStore, cfg: cfg,
@@ -1196,7 +1197,7 @@ func (b *Bridge) activity(ctx context.Context, request *protocol.ActivityRequest
 }
 
 func activityKind(value string) string {
-	value = strings.ReplaceAll(value, "\x00", "")
+	value = store.StripTerminalControls(value)
 	runes := []rune(value)
 	if len(runes) == 0 {
 		return "unknown"
@@ -1207,8 +1208,13 @@ func activityKind(value string) string {
 	return value
 }
 
+// activityTitle feeds the browser activity feed; it shares
+// store.StripTerminalControls with the CLI/store paths so a title carrying
+// ESC, BEL, or a raw C1 byte cannot inject escape sequences into whatever
+// terminal later renders this feed — NUL-only stripping was the same gap the
+// CLI row had before it was closed.
 func activityTitle(value string) string {
-	value = strings.ReplaceAll(value, "\x00", "")
+	value = store.StripTerminalControls(value)
 	runes := []rune(value)
 	if len(runes) <= 500 {
 		return value
@@ -1710,22 +1716,44 @@ func (b *Bridge) sessionEvidence(ctx context.Context, p *protocol.SessionEvidenc
 // handoff as the source for the existing sibling reoffer routine. When the
 // extension supplies an origin hint, both the source and every candidate must
 // belong to the matching configured resolver profile; an unknown hint fails
-// closed. No hint preserves the historical source-selection behavior.
+// closed.
+//
+// An absent hint is NOT a wildcard. Evidence that cannot be attributed to an
+// institution may only release the default profile's queue: matching any
+// profile would let a second institution's sign-in reopen the first
+// institution's parked tabs, which is precisely the isolation this scoping
+// exists to guarantee. Single-institution setups leave Policy.Resolver empty,
+// which is the default profile, so their historical behavior is unchanged.
+//
+// A live pin may be retired only by attributable evidence for another
+// profile. An unhinted frame must never clear or repoint it: an older extension
+// or origin-less keepalive would otherwise replace a named-profile pin with a
+// default-profile handoff, and the next genuine auth_returned for the named
+// profile would hit the mismatched-pin branch and release nothing. That silently
+// starves the institution's queue for at least the 60-second evidence-throttle
+// window, or for the whole session if the extension never sends a hint.
 func (b *Bridge) reofferInstitutionalSiblingsForEvidence(ctx context.Context, originHint string) error {
-	wantedProfile := ""
-	if strings.TrimSpace(originHint) != "" {
+	hinted := strings.TrimSpace(originHint) != ""
+	wantedProfile := resolverProfileKey("")
+	if hinted {
 		profile, ok := b.cfg.ResolverProfileForOrigin(originHint)
 		if !ok {
 			return nil
 		}
 		wantedProfile = resolverProfileKey(profile)
 	}
-	if wantedProfile != "" && b.reofferSourceJobID != "" && resolverProfileKey(b.reofferProfile) != wantedProfile {
+	if b.reofferSourceJobID != "" && resolverProfileKey(b.reofferProfile) != wantedProfile {
+		if !hinted {
+			// An unattributable frame proves neither that the named pin is
+			// stale nor that the default queue is authenticated. Falling
+			// through would release the default queue while leaving the
+			// named institution unable to use its genuine auth return.
+			return nil
+		}
 		b.reofferSourceJobID = ""
 		b.reofferProfile = ""
 	}
-	if b.reofferSourceJobID != "" &&
-		(wantedProfile == "" || resolverProfileKey(b.reofferProfile) == wantedProfile) {
+	if b.reofferSourceJobID != "" {
 		return b.reofferInstitutionalSiblings(ctx, b.reofferSourceJobID)
 	}
 	handoffs, _, err := b.jobs.ListOpenHandoffJobsPage(ctx, handoffPageLimit)
@@ -1735,7 +1763,7 @@ func (b *Bridge) reofferInstitutionalSiblingsForEvidence(ctx context.Context, or
 	var fallback string
 	for _, item := range handoffs {
 		if !item.Action.RequiresAuth ||
-			(wantedProfile != "" && resolverProfileKey(item.Row.Policy.Resolver) != wantedProfile) {
+			resolverProfileKey(item.Row.Policy.Resolver) != wantedProfile {
 			continue
 		}
 		if fallback == "" {
@@ -1773,7 +1801,6 @@ func (b *Bridge) recordAuth(ctx context.Context, msg *protocol.BrowserMessage) e
 	err := b.reofferInstitutionalSiblings(ctx, msg.JobID)
 	b.reofferRanThisSync = true
 	return err
-
 }
 
 // reofferInstitutionalSiblings lets poll reopen only the handoffs that a

@@ -20,6 +20,10 @@ export interface PendingDelivery {
   initiated_at: number;
   status?: PendingDeliveryStatus;
   error?: string;
+  /** Host of the page that requested the delivery, frozen at request time.
+   * The download outlives the navigation that started it, so the provenance
+   * host cannot be re-read from the tab once the bytes land. */
+  page_host?: string;
 }
 
 /** Durable, informed user choice for auto-accepting publisher terms &

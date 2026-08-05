@@ -40,6 +40,84 @@ func TestActivityTextCoversWrittenEventKinds(t *testing.T) {
 	}
 }
 
+// `papio activity` prints this text straight to a terminal, and a
+// browser-reported download filename is attacker-influenced: the protocol's
+// filenameRE forbids only the path separators, so ESC and every other C0 byte
+// reach here. An unescaped ESC lets a provider page, a spoofed
+// Content-Disposition, or a compromised browser session inject ANSI/OSC
+// sequences into the operator's terminal on the next `papio activity` run.
+// C1 controls (U+0080-U+009F) get the same treatment: a UTF-8 xterm decodes
+// U+009B/U+009D as CSI/OSC introducers with no ESC byte in the input at all.
+func TestActivityTextStripsTerminalControlBytes(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		filename string
+		want     string
+	}{
+		{"escape sequence", "a\x1b[31mred.pdf", "Download started (a[31mred.pdf)"},
+		{"osc title set", "x\x1b]0;pwned\x07.pdf", "Download started (x]0;pwned.pdf)"},
+		{"carriage return overwrite", "safe.pdf\rmalicious", "Download started (safe.pdfmalicious)"},
+		{"newline row break", "one\ntwo.pdf", "Download started (onetwo.pdf)"},
+		{"nul still stripped", "a\x00b.pdf", "Download started (ab.pdf)"},
+		{"del", "a\x7fb.pdf", "Download started (ab.pdf)"},
+		{"c1 csi", "a\u009b31mred.pdf", "Download started (a31mred.pdf)"},
+		{"c1 osc", "x\u009d0;pwned.pdf", "Download started (x0;pwned.pdf)"},
+		{"printable text survives intact", "Ünïcode paper (2026).pdf", "Download started (Ünïcode paper (2026).pdf)"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := ActivityText("browser.download_started", map[string]any{"filename": tc.filename})
+			if got != tc.want {
+				t.Errorf("ActivityText = %q, want %q", got, tc.want)
+			}
+			for _, r := range got {
+				if r < 0x20 || (r >= 0x7f && r <= 0x9f) {
+					t.Errorf("control byte %#U survived in %q", r, got)
+				}
+			}
+		})
+	}
+}
+
+// StripTerminalControls is the single choke point every terminal-printed
+// surface (clampActivityText, the CLI's compactActivitySummary, the browser
+// bridge's activityTitle) routes through. Pin its contract directly: C0,
+// DEL, and C1 all removed; ordinary printable text — including non-ASCII —
+// passes through byte-for-byte untouched.
+func TestStripTerminalControls(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{"c0 control", "a\x01\x1bb", "ab"},
+		{"del", "a\x7fb", "ab"},
+		{"c1 low", "a\u0080b", "ab"},
+		// A bare 0x80 byte is not U+0080, it is invalid UTF-8. strings.Map
+		// folds it to U+FFFD, which is inert on a terminal. JSON decoding
+		// means the wire cannot deliver one anyway; pinned so a future
+		// rewrite cannot start passing raw bytes through instead.
+		{"invalid utf-8 byte folded, not passed through", "a\x80b", "a\uFFFDb"},
+		{"c1 csi", "a\u009bb", "ab"},
+		{"c1 osc", "a\u009db", "ab"},
+		{"c1 high", "a\u009fb", "ab"},
+		{"accented latin preserved", "Café Über Nïño", "Café Über Nïño"},
+		{"cjk preserved", "日本語のタイトル", "日本語のタイトル"},
+		{"mixed printable and control", "Title\u009b[31m: \x1bDanger\x07", "Title[31m: Danger"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := StripTerminalControls(tc.input)
+			if got != tc.want {
+				t.Errorf("StripTerminalControls(%q) = %q, want %q", tc.input, got, tc.want)
+			}
+			for _, r := range got {
+				if r < 0x20 || (r >= 0x7f && r <= 0x9f) {
+					t.Errorf("control byte %#U survived in %q", r, got)
+				}
+			}
+		})
+	}
+}
+
 func TestFormatActivityAge(t *testing.T) {
 	for _, tc := range []struct {
 		seconds int64

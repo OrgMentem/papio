@@ -11,6 +11,61 @@ execution records in `notes/acquisition-stack-plan.md`.
 
 ## [Unreleased]
 
+### Added
+
+- **`page_capture_terms_v1` capability.** The `terms` capture scenario was
+  appended to the *existing* `page_capture` scenario enum, so a daemon that
+  predates it rejects the whole frame during validation — and a browser
+  protocol decode failure tears down the entire native-messaging session, not
+  just that request. With two papio binaries on one machine a routine
+  occurrence, the daemon now advertises a dedicated capability and the
+  extension withholds the option until it sees it. `terms` remains a valid
+  value in all three validators; only the producer is gated.
+
+### Fixed
+
+- **Session evidence with no origin no longer releases another institution's
+  parked handoffs.** `origin_hint` is optional on `session_evidence`, and an
+  absent one was read as "match any profile": the fallback scan took the first
+  institutional handoff in list order and reoffered that institution's whole
+  queue. A sign-in at one institution could therefore reopen tabs and drive
+  OpenURL navigations for a second one whose session was never verified — the
+  opposite of the isolation per-institution resolver profiles exist to provide,
+  and looser than an *unresolvable* hint, which already failed closed. An
+  unattributable frame now releases only the default profile. Single-institution
+  setups leave the job's resolver profile empty, which *is* the default profile,
+  so their behaviour is unchanged. An unattributable frame also may not retire
+  the sticky reoffer pin: demoting a named institution's pin to the default
+  profile made that institution's own next `auth_returned` a no-op, starving
+  its queue for the rest of the session. Only an attributable hint retires a
+  pin, and an unhinted frame arriving while a named pin is live now does
+  nothing at all.
+- **`browser.resolvers.default` is rejected instead of silently ignored.** The
+  resolver-name rule accepted the literal name `default`, but `InstitutionFor`
+  resolves that name to the implicit top-level institution before ever
+  consulting the map — so the profile was unreachable. A job meant for that
+  institution routed to the top-level OpenURL base, `ResolverNames()` returned
+  a duplicated `default`, and with no top-level base configured
+  `browser.default_resolver = "default"` failed with the self-contradictory
+  message `not configured (configured profiles: default)`. The name is now
+  refused at load with an error naming the reserved key, matching how
+  `[sources.*]` already whitelists its own names. No existing config breaks:
+  nothing in `papio init` or `config save` ever writes that key.
+- **`papio activity` cannot be used to inject terminal escape sequences.** The
+  summary sanitizer stripped only NUL, while the browser-reported download
+  filename it interpolates is bounded by a regex that forbids just the path
+  separators — so ESC and every other C0 byte reached the operator's terminal
+  verbatim. A provider page, a spoofed `Content-Disposition`, or a compromised
+  browser session could rewrite the terminal on the next `activity` run. Every
+  C0 byte, DEL, and the C1 block are now stripped at one exported choke point
+  shared by the CLI row, the friendly summary, and the browser activity feed.
+  C1 matters because a UTF-8 terminal decodes U+009B and U+009D as CSI and OSC,
+  reconstituting an escape introducer with no ESC byte in sight. The job title
+  printed beside the summary is covered too: it comes from third-party
+  bibliographic metadata and was stored with only whitespace trimming, so it
+  bypassed the sanitizer on the very same output row. The `--json` output was
+  never affected.
+
 ## [0.17.0] - 2026-08-04
 
 ### Added

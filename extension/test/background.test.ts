@@ -3069,6 +3069,62 @@ test("popup capture relay emits page_capture only after the daemon advertises it
   expect(h.downloads.started).toHaveLength(0);
 });
 
+// The popup withholds the `terms` option, but it decides that when the panel
+// is populated and the daemon underneath can be swapped between then and the
+// click (the two-binary skew AGENTS.md documents). Emitting `terms` to a
+// daemon that cannot validate it does not merely fail that capture — the
+// decode error tears down the whole native-messaging session — so the
+// boundary that actually sends the frame refuses it independently of the UI.
+test("popup capture relay withholds a terms capture until the daemon advertises the gate", async () => {
+  const h = makeHarness();
+  const urls = {
+    runtimeID: "papio-test-id",
+    inboxURL: "chrome-extension://papio-test-id/inbox.html",
+    popupURL: "chrome-extension://papio-test-id/popup.html",
+    historyURL: "chrome-extension://papio-test-id/history.html",
+  };
+  const sanitized = sanitizeFixture(`<main class="terms">Consent wall</main>`, {
+    provider: "jstor",
+    scenario: "terms",
+    originNoQuery: "https://www.jstor.org/terms",
+    capturedISO: "2026-07-27T10:11:12.000Z",
+  });
+  const encoded = await encodePageCapture(sanitized, {
+    host: "www.jstor.org",
+    scenario: "terms",
+    adapterID: "jstor",
+  });
+  if (!encoded.ok) throw new Error(encoded.error);
+
+  await h.bridge.start();
+  // page_capture_v1 alone is what every older daemon already advertises, and
+  // it must not be enough to let `terms` onto the wire.
+  await h.port.inbound(helloAck({ features: ["page_capture_v1"] }));
+  await expect(
+    handleInboxRuntimeMessage(
+      h.bridge,
+      { type: "papio.page_capture", payload: encoded.payload },
+      { id: urls.runtimeID, url: urls.popupURL },
+      urls,
+    ),
+  ).resolves.toEqual({ captured: true });
+  expect(h.frames().some((frame) => frame.type === "page_capture")).toBe(false);
+
+  await h.port.inbound(helloAck({ features: ["page_capture_v1", "page_capture_terms_v1"] }));
+  await expect(
+    handleInboxRuntimeMessage(
+      h.bridge,
+      { type: "papio.page_capture", payload: encoded.payload },
+      { id: urls.runtimeID, url: urls.popupURL },
+      urls,
+    ),
+  ).resolves.toEqual({ captured: true });
+
+  const captures = h.frames().filter((frame) => frame.type === "page_capture");
+  expect(captures).toHaveLength(1);
+  expect(captures[0]?.payload).toEqual({ ...encoded.payload });
+});
+
 test("page capture request visibly opens a ledgered managed tab, captures, reports, and closes", async () => {
   const h = makeHarness(undefined, { windows: true, handoffSurface: "work-window" });
   let ledger: Record<string, number> = {};
@@ -4372,6 +4428,205 @@ test("handoff governor keeps two drives, drains FIFO on settle and timeout", asy
   expect(h.tabs.live.size).toBe(2);
   expect(h.tabs.created).toHaveLength(4);
   expect(h.backend.store.activeJobs.find((job) => job.job_id === jobIDs[2])?.status).toBe("auth_pending");
+});
+
+test("governor-queued handoffs are re-driven after a service-worker restart", async () => {
+  const first = makeHarness({ ...emptyStore(), lastAuthReturnedAt: 1_700_000_000_000 });
+  await first.bridge.start();
+  const jobIDs = Array.from({ length: 5 }, (_, index) => `job_restart_governor_${index}`);
+  for (const jobID of jobIDs) await first.port.inbound(jobOffer(jobID));
+  expect(first.tabs.live.size).toBe(2);
+  const parked = first.backend.store.activeJobs.filter((job) => job.tab_id < 0);
+  expect(parked).toHaveLength(3);
+  expect(parked.every((job) => job.status === "accepted")).toBe(true);
+
+  // Only the persisted store survives a suspend; the FIFO holding those three
+  // accepted-but-undriven jobs is worker memory. They used to strand forever:
+  // the startup scan skipped tab_id < 0, the queued-release pass only handles
+  // status "queued", and a daemon re-offer on the same URL merely re-acks.
+  const restarted = makeHarness(JSON.parse(JSON.stringify(first.backend.store)) as StoreShape);
+  await restarted.bridge.start();
+  // The restored worker must give the governor's two slots to the jobs that
+  // were waiting for them, not leave them stranded at tab_id -1 forever.
+  const parkedIDs = parked.map((job) => job.job_id);
+  const drivenAfterRestart = restarted.backend.store.activeJobs.filter(
+    (job) => parkedIDs.includes(job.job_id) && job.tab_id >= 0,
+  );
+  expect(drivenAfterRestart).toHaveLength(2);
+});
+
+// isDirectFileOffer is a URL-SHAPE heuristic, and an institutional handoff's
+// offer URL is the operator's configured OpenURL base, whose path papio does
+// not constrain. So a pdf-shaped base on a requires_auth offer never took the
+// direct-download shortcut (that gate is shape AND requires_auth !== true) —
+// it is a real handoff. Excluding it from restore on shape alone stranded
+// exactly the jobs this restore exists to recover.
+test("restore recovers an auth-required handoff whose OpenURL base looks like a file", async () => {
+  const pdfShapedBase = "https://resolver.example.edu/openurl/content/pdf/resolve";
+  const first = makeHarness({ ...emptyStore(), lastAuthReturnedAt: 1_700_000_000_000 });
+  await first.bridge.start();
+  const jobIDs = Array.from({ length: 4 }, (_, index) => `job_pdfbase_governor_${index}`);
+  for (const jobID of jobIDs) {
+    const offer = jobOffer(jobID, pdfShapedBase) as { payload: Record<string, unknown> };
+    offer.payload["requires_auth"] = true;
+    await first.port.inbound(offer);
+  }
+  // The direct-download shortcut must not have fired: requires_auth true keeps
+  // every one of these on the handoff path despite the file-shaped URL.
+  expect(first.downloads.started).toHaveLength(0);
+  const parked = first.backend.store.activeJobs.filter((job) => job.tab_id < 0);
+  expect(parked.length).toBeGreaterThan(0);
+  expect(parked.every((job) => job.status === "accepted")).toBe(true);
+
+  const restarted = makeHarness(JSON.parse(JSON.stringify(first.backend.store)) as StoreShape);
+  await restarted.bridge.start();
+  const parkedIDs = parked.map((job) => job.job_id);
+  const drivenAfterRestart = restarted.backend.store.activeJobs.filter(
+    (job) => parkedIDs.includes(job.job_id) && job.tab_id >= 0,
+  );
+  expect(drivenAfterRestart.length).toBeGreaterThan(0);
+});
+
+test("per-origin sign-in hands the tab to the keepalive manager", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  const reauthOrigins: (string | undefined)[] = [];
+  h.bridge.attachKeepalive({
+    getSnapshot: () => ({ pausedForReauth: false }),
+    openReauth: async (originHint?: string) => {
+      reauthOrigins.push(originHint);
+      return true;
+    },
+  } as unknown as KeepaliveManager);
+
+  const reply = await h.bridge.requestSessionSignIn("https://beta.example.edu");
+  expect(reply).toEqual({ ok: true, opened: true });
+  // The manager must own the sign-in tab: it pauses its own reload cycle for
+  // the duration, so a scheduled reload cannot destroy an in-flight SAML
+  // exchange, and its tab is never ledgered for orphan reconciliation.
+  expect(reauthOrigins).toEqual(["https://beta.example.edu"]);
+  expect(h.tabs.created).toHaveLength(0);
+});
+
+test("per-origin sign-in falls back to a managed tab when the manager declines", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  h.bridge.attachKeepalive({
+    getSnapshot: () => ({ pausedForReauth: false }),
+    openReauth: async () => false,
+  } as unknown as KeepaliveManager);
+
+  const reply = await h.bridge.requestSessionSignIn("https://beta.example.edu");
+  expect(reply).toEqual({ ok: true, opened: true });
+  expect(h.tabs.created).toHaveLength(1);
+});
+
+test("delivery provenance keeps the host that requested the download", async () => {
+  const jobID = "job_delivery_provenance";
+  const pdfURL = "https://provider.example.edu/article/10.1000-x.pdf";
+  const h = makeHarness({
+    ...emptyStore(),
+    activeJobs: [
+      {
+        job_id: jobID,
+        tab_id: 100,
+        offered_at: 1_700_000_000_000,
+        expires_at: 1_700_000_600_000,
+        status: "accepted",
+        provider_hosts: [],
+      },
+    ],
+    offerURLs: { [jobID]: OPENURL },
+  });
+  h.tabs.live.set(100, { id: 100, url: pdfURL });
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["delivery_context_v1"] }));
+
+  const reply = await h.bridge.startPDFDelivery({ tab_id: 100, url: pdfURL });
+  expect(reply.ok).toBe(true);
+  const downloadID = 900 + h.downloads.started.length;
+
+  // The tab stays interactive for the whole download. Re-reading it at
+  // completion attached institutional provenance to whatever the operator
+  // navigated to instead of the page that produced the bytes.
+  h.tabs.live.set(100, { id: 100, url: "https://unrelated.example.org/elsewhere" });
+  h.downloads.items.set(downloadID, {
+    id: downloadID,
+    tabId: 100,
+    filename: "/tmp/paper.pdf",
+    mime: "application/pdf",
+    fileSize: 1000,
+    state: "complete",
+  });
+  await h.downloads.onChanged.emit({ id: downloadID, state: { current: "complete" } });
+
+  const context = h.frames().find((frame) => frame.type === "delivery_context");
+  expect(context?.payload).toMatchObject({ page_host: "provider.example.edu" });
+});
+
+test("failed delivery frozen host does not poison a later non-delivery download", async () => {
+  const jobID = "job_failed_delivery_poison";
+  const deliveryURL = "https://provider.example.edu/article/10.1000-x.pdf";
+  const secondHost = "platform.example.edu";
+  const secondURL = `https://${secondHost}/pdf/10.1000-x.pdf`;
+  const h = makeHarness({
+    ...emptyStore(),
+    activeJobs: [
+      {
+        job_id: jobID,
+        tab_id: 100,
+        offered_at: 1_700_000_000_000,
+        expires_at: 1_700_000_600_000,
+        status: "accepted",
+        provider_hosts: [],
+      },
+    ],
+    offerURLs: { [jobID]: OPENURL },
+  });
+  h.tabs.live.set(100, { id: 100, url: deliveryURL });
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["delivery_context_v1"] }));
+
+  // Start a delivery — freezes page_host: "provider.example.edu".
+  const reply = await h.bridge.startPDFDelivery({ tab_id: 100, url: deliveryURL });
+  expect(reply.ok).toBe(true);
+  const deliveryDownloadID = 900 + h.downloads.started.length;
+
+  // Complete the delivery download with HTML mime — triggers failDelivery,
+  // which leaves pendingDelivery with status: "failed" and page_host intact.
+  h.downloads.items.set(deliveryDownloadID, {
+    id: deliveryDownloadID,
+    tabId: 100,
+    filename: "/tmp/wrapper.html",
+    mime: "text/html",
+    fileSize: 500,
+    state: "complete",
+  });
+  await h.downloads.onChanged.emit({ id: deliveryDownloadID, state: { current: "complete" } });
+
+  // Now simulate a resolver-routed download for the same job from a different host.
+  // This is a non-delivery download (track.delivery !== true), so the frozen host
+  // must NOT be applied.
+  const secondDownloadID = 900 + h.downloads.started.length;
+  // Set up the tab with the second host URL.
+  h.tabs.live.set(100, { id: 100, url: secondURL });
+  // Create the download item.
+  h.downloads.items.set(secondDownloadID, {
+    id: secondDownloadID,
+    tabId: 100,
+    filename: "/tmp/real_paper.pdf",
+    mime: "application/pdf",
+    fileSize: 2000,
+    state: "complete",
+  });
+  // Emit onCreated first to set up the track (non-delivery).
+  await h.downloads.onCreated.emit(h.downloads.items.get(secondDownloadID)!);
+  // Now emit onChanged to complete it.
+  await h.downloads.onChanged.emit({ id: secondDownloadID, state: { current: "complete" } });
+
+  // The delivery_context frame should report the SECOND host, not the stale frozen one.
+  const context = h.frames().find((frame) => frame.type === "delivery_context");
+  expect(context?.payload).toMatchObject({ page_host: secondHost });
 });
 
 test("successful adoption closes a managed handoff while auth keeps its page", async () => {

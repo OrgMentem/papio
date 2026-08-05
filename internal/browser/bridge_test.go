@@ -413,7 +413,7 @@ func TestHelloAckAnnouncesDaemonVersion(t *testing.T) {
 		t.Fatalf("daemon_version = %q, want 0.1.0-test", payload.DaemonVersion)
 	}
 	if !slices.Equal(payload.Features, []string{
-		pageAcquireFeature, triageSnapshotFeature, triageSnapshotSchema2Feature, triageMutationsFeature, reviewPreviewFeature, statsFeature, pageCaptureFeature, pageCaptureRequestFeature, activityFeedFeature, triageCountsSchema2Feature, sessionEvidenceFeature, deliveryContextFeature,
+		pageAcquireFeature, triageSnapshotFeature, triageSnapshotSchema2Feature, triageMutationsFeature, reviewPreviewFeature, statsFeature, pageCaptureFeature, pageCaptureRequestFeature, activityFeedFeature, triageCountsSchema2Feature, sessionEvidenceFeature, deliveryContextFeature, pageCaptureTermsFeature,
 	}) {
 		t.Fatalf("features = %v, want required bridge feature set", payload.Features)
 	}
@@ -1995,6 +1995,128 @@ func TestSessionEvidenceOriginScopesReoffersToMatchingProfile(t *testing.T) {
 		t.Fatalf("beta sibling was not offered: %#v", b.offered)
 	}
 	_ = sourceAlpha
+}
+
+// An absent origin_hint cannot be attributed to any institution. Treating it
+// as a wildcard let whichever named profile sorted first be released, so one
+// institution's sign-in reopened another's parked tabs.
+func TestSessionEvidenceWithoutOriginHintNeverReleasesANamedProfile(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	b.cfg.Browser.Resolvers = map[string]config.Institution{
+		"alpha": {OpenURLBase: "https://alpha.example.edu/openurl"},
+		"beta":  {OpenURLBase: "https://beta.example.edu/openurl"},
+	}
+	siblingAlpha := parkInstitutional(t, jobs, "wr_nohint_alpha", handoffWork(), "alpha")
+	sourceBeta := parkInstitutional(t, jobs, "wr_nohint_beta_source", handoffWork(), "beta")
+	siblingBeta := parkInstitutional(t, jobs, "wr_nohint_beta_sibling", handoffWork(), "beta")
+	runSync(t, b, hello())
+	// A live, already-offered source in a NAMED profile is what the fallback
+	// scan latches onto. With the hint present this releases beta's queue;
+	// without one the frame belongs to no institution and must release none.
+	b.mu.Lock()
+	b.offered = map[string]bool{sourceBeta: true}
+	b.cancelSent = map[string]bool{}
+	b.reofferPending = map[string]bool{}
+	b.reofferSourceJobID = ""
+	b.reofferProfile = ""
+	b.mu.Unlock()
+
+	// The ordinary sync offer path also emits offers for parked handoffs, so
+	// the reoffer release is identified by its own event, not by an offer
+	// count. The sibling-scoping test above reads the same signal.
+	runSync(t, b, inFrame(t, protocol.MsgSessionEvidence, "",
+		map[string]any{"evidence": "warm_verified", "at": "2026-08-03T12:00:00Z"}))
+	for _, jobID := range []string{siblingAlpha, siblingBeta} {
+		events, err := jobs.Events(context.Background(), jobID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, event := range events {
+			if event["kind"] == "browser.handoff_reoffered" {
+				t.Fatalf("named-profile job %s released by unhinted evidence: %#v", jobID, event)
+			}
+		}
+	}
+}
+
+// Scoping the unhinted frame must not disable it: the default profile is the
+// entire queue for a single-institution setup, which is the common case.
+func TestSessionEvidenceWithoutOriginHintStillReleasesTheDefaultProfile(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	b.cfg.Browser.Resolvers = map[string]config.Institution{
+		"alpha": {OpenURLBase: "https://alpha.example.edu/openurl"},
+	}
+	source := parkInstitutional(t, jobs, "wr_nohint_default_source", handoffWork(), "")
+	sibling := parkInstitutional(t, jobs, "wr_nohint_default_sibling", handoffWork(), "")
+	siblingNamed := parkInstitutional(t, jobs, "wr_nohint_named_bystander", handoffWork(), "alpha")
+	runSync(t, b, hello())
+	b.mu.Lock()
+	b.offered = map[string]bool{source: true}
+	b.cancelSent = map[string]bool{}
+	b.reofferPending = map[string]bool{}
+	b.reofferSourceJobID = ""
+	b.reofferProfile = ""
+	b.mu.Unlock()
+
+	msgs, _ := runSync(t, b, inFrame(t, protocol.MsgSessionEvidence, "",
+		map[string]any{"evidence": "warm_verified", "at": "2026-08-03T12:00:00Z"}))
+	offer := firstOfType(msgs, protocol.MsgJobOffer)
+	if offer == nil || offer.JobID != sibling {
+		t.Fatalf("unhinted offer = %#v, want default-profile sibling %s", offer, sibling)
+	}
+	namedEvents, err := jobs.Events(context.Background(), siblingNamed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range namedEvents {
+		if event["kind"] == "browser.handoff_reoffered" {
+			t.Fatalf("named bystander released by unhinted evidence: %#v", event)
+		}
+	}
+}
+
+// An origin-less keepalive used to demote a live named pin to the default
+// profile. The next genuine auth return then saw a different pinned job and
+// released nothing, silently starving the named institution's queue.
+func TestSessionEvidenceWithoutOriginHintPreservesNamedProfilePin(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	b.cfg.Browser.Resolvers = map[string]config.Institution{
+		"alpha": {OpenURLBase: "https://alpha.example.edu/openurl"},
+		"beta":  {OpenURLBase: "https://beta.example.edu/openurl"},
+	}
+	sourceBeta := parkInstitutional(t, jobs, "wr_pin_beta_source", handoffWork(), "beta")
+	sourceDefault := parkInstitutional(t, jobs, "wr_pin_default_source", handoffWork(), "")
+	siblingDefault := parkInstitutional(t, jobs, "wr_pin_default_sibling", handoffWork(), "")
+	runSync(t, b, hello())
+	b.mu.Lock()
+	b.offered = map[string]bool{sourceBeta: true, sourceDefault: true}
+	b.cancelSent = map[string]bool{}
+	b.reofferPending = map[string]bool{}
+	b.reofferSourceJobID = sourceBeta
+	b.reofferProfile = "beta"
+	b.mu.Unlock()
+
+	runSync(t, b, inFrame(t, protocol.MsgSessionEvidence, "",
+		map[string]any{"evidence": "warm_verified", "at": "2026-08-03T12:00:00Z"}))
+
+	b.mu.Lock()
+	pinnedJobID, pinnedProfile := b.reofferSourceJobID, b.reofferProfile
+	b.mu.Unlock()
+	if pinnedJobID != sourceBeta || pinnedProfile != "beta" {
+		t.Fatalf("pin after unhinted evidence = (%q, %q), want (%q, %q)",
+			pinnedJobID, pinnedProfile, sourceBeta, "beta")
+	}
+	for _, jobID := range []string{sourceDefault, siblingDefault} {
+		events, err := jobs.Events(context.Background(), jobID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, event := range events {
+			if event["kind"] == "browser.handoff_reoffered" {
+				t.Fatalf("default-profile job %s released despite live beta pin: %#v", jobID, event)
+			}
+		}
+	}
 }
 
 func TestAuthReturnedDoesNotReofferWithoutLiveHolder(t *testing.T) {

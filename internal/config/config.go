@@ -525,6 +525,16 @@ func (c *Config) validate() error {
 		return fmt.Errorf("browser.proquest_account_id must be digits (max 64)")
 	}
 	for name, inst := range c.Browser.Resolvers {
+		// "default" is the implicit top-level institution, not a valid map key:
+		// InstitutionFor resolves name == "default" to the top-level Browser
+		// fields (OpenURLBase, ShibbolethEntityID, ProquestAccountID) before
+		// any map lookup, so a profile under this key can never be reached —
+		// it is silently dead and, when the top-level fields are also populated,
+		// causes ResolverNames() to duplicate "default" and
+		// ResolverProfileForOrigin to misroute jobs.
+		if name == "default" {
+			return fmt.Errorf("browser.resolvers.default is a reserved name (use the top-level browser.openurl_base_url, browser.shibboleth_entity_id, and browser.proquest_account_id fields for the default institution)")
+		}
 		if !resolverNameRE.MatchString(name) {
 			return fmt.Errorf("browser.resolvers.%s name must be lowercase alphanumeric", name)
 		}

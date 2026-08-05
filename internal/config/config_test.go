@@ -508,6 +508,10 @@ func TestBrowserResolverProfilesRejectInvalidNameAndURL(t *testing.T) {
 		{name: "uppercase name", profile: "INSTITUTE", base: "https://onesearch.library.example-institute.edu/discovery/openurl?vid=61INS_INST:INS"},
 		{name: "http URL", profile: "institute", base: "http://onesearch.library.example-institute.edu/discovery/openurl?vid=61INS_INST:INS"},
 		{name: "relative URL", profile: "institute", base: "/discovery/openurl"},
+		// "default" is the implicit top-level institution (reserved by InstitutionFor),
+		// not a valid [browser.resolvers.*] map key. A profile under this name can
+		// never be reached and causes ResolverNames() to duplicate "default".
+		{name: "reserved name default", profile: "default", base: "https://onesearch.library.example-institute.edu/discovery/openurl?vid=61INS_INST:INS"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "config.toml")
@@ -519,6 +523,32 @@ func TestBrowserResolverProfilesRejectInvalidNameAndURL(t *testing.T) {
 				t.Fatal("invalid resolver profile accepted")
 			}
 		})
+	}
+}
+func TestBrowserResolverRejectsReservedDefaultName(t *testing.T) {
+	// [browser.resolvers.default] is the exact config path that must be rejected:
+	// InstitutionFor short-circuits name == "default" to the top-level Browser
+	// fields, so a map entry under this key is unreachable and causes
+	// ResolverNames() to duplicate "default" when the top-level base is also set.
+	path := filepath.Join(t.TempDir(), "config.toml")
+	data := []byte("access_mode = \"conservative\"\n[browser.resolvers.default]\nopenurl_base_url = \"https://onesearch.library.example-institute.edu/discovery/openurl?vid=61INS_INST:INS\"\n")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected config with [browser.resolvers.default] to be rejected")
+	}
+	// The error must name the reserved config path and explain the alternative.
+	errMsg := err.Error()
+	if !strings.Contains(errMsg, "browser.resolvers.default") {
+		t.Fatalf("error should name the config path browser.resolvers.default, got: %s", errMsg)
+	}
+	if !strings.Contains(errMsg, "reserved") {
+		t.Fatalf("error should say the name is reserved, got: %s", errMsg)
+	}
+	if !strings.Contains(errMsg, "top-level") {
+		t.Fatalf("error should point to top-level fields, got: %s", errMsg)
 	}
 }
 
