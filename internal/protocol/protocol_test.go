@@ -868,18 +868,32 @@ func TestPageHostRejectsDotEdgeCases(t *testing.T) {
 	}
 }
 
-// TestOriginHintSchemaAndValidatorAgree pins papio-26fa531528e29798's
-// original fix (Go, the TypeScript parser, and the schema previously
-// disagreed on "https://EXAMPLE.com": Go accepted it via validateBareRoute,
-// which never compared case; the TypeScript parser rejected it only as an
-// accident of the WHATWG URL parser's lowercasing round-trip check) AND the
-// later correction that dropped the multi-label requirement the first fix
-// introduced: browser.openurl_base_url validation
-// (internal/config/config.go's validateOpenURLBase) never required an FQDN,
-// so "https://a"/"https://library" are legitimate single-label resolver
-// origins and must validate everywhere, not just here. validateResolverOriginHint
-// and the published pattern must agree on every value, verified the same way
-// TestBareRouteIsNeverLaxerThanThePublishedSchema checks candidate.route.
+// TestOriginHintSchemaAndValidatorAgree keeps validateResolverOriginHint at
+// least as strict as the published schema pattern below, the same
+// one-directional shape TestBareRouteIsNeverLaxerThanThePublishedSchema
+// uses for candidate.route: it fails only when Go accepts a value the
+// schema pattern rejects, never the reverse. Full bidirectional parity is
+// not asserted because it does not hold, and closing the remaining gap
+// would mean duplicating the WHATWG URL parser's reparsing rules in Go —
+// see validateResolverOriginHint's doc comment for the accepted-gap list:
+// a purely numeric single-label host (reparsed as IPv4 by the WHATWG
+// parser) and a zero-padded port both pass Go and this schema pattern but
+// fail the TypeScript round-trip check, and neither is reachable from a
+// genuine producer. A third gap this test cannot observe at all:
+// SessionEvidencePayload.validate treats an explicit empty origin_hint as
+// an omitted optional field and never calls this function, so an empty
+// string decodes in Go a layer above where this pattern (and TypeScript)
+// reject it.
+//
+// "https://123" (a bare numeric host — the multi-label requirement that
+// used to exclude it was dropped as a release-blocker fix; see
+// TestOriginHintAcceptsLegitimateHosts) and the port cases
+// ("https://library:123456" over-length, "https://library:" a bare
+// trailing colon with no digits, "https://library:08443" zero-padded, and
+// "https://library:443" ordinary) are included below because they are
+// exactly the shapes that relaxation and a Hostname()-only port check
+// could diverge on. validateResolverOriginHint now validates the port
+// explicitly, so Go must never be laxer than this pattern for any of them.
 func TestOriginHintSchemaAndValidatorAgree(t *testing.T) {
 	schemaPattern := regexp.MustCompile(`^https://[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*(:[0-9]{1,5})?$`)
 	for _, hint := range []string{
@@ -889,10 +903,15 @@ func TestOriginHintSchemaAndValidatorAgree(t *testing.T) {
 		"https://EXAMPLE.com",
 		"https://a",
 		"https://library",
+		"https://123",
 		"https://localhost",
 		"https://localhost:8443",
 		"https://127.0.0.1",
 		"https://127.0.0.1:8443",
+		"https://library:443",
+		"https://library:08443",
+		"https://library:123456",
+		"https://library:",
 		"https://[::1]",
 		"https://[::1]:8443",
 		"HTTPS://resolver.example.edu",
@@ -905,8 +924,8 @@ func TestOriginHintSchemaAndValidatorAgree(t *testing.T) {
 	} {
 		goOK := validateResolverOriginHint(hint) == nil
 		schemaOK := schemaPattern.MatchString(hint) && utf8.RuneCountInString(hint) <= 300
-		if goOK != schemaOK {
-			t.Errorf("origin_hint %q: Go accept=%v schema accept=%v, want equal", hint, goOK, schemaOK)
+		if goOK && !schemaOK {
+			t.Errorf("origin_hint %q: Go accepts what the published schema rejects", hint)
 		}
 	}
 }

@@ -2304,11 +2304,38 @@ export class Bridge {
     }
   }
 
+  /** Clear parked_with_tab at the point INTENT to drive is expressed — either
+   * caller below — not only on registerHandoffDrive's eventual success. Both
+   * are reachable whenever the governor's two slots are already full, which
+   * is the normal steady state once parkHandoffForManual drains its freed
+   * slot straight into the next queued job: resumeHandoffAfterManual and the
+   * offer handler's re-offer branches then defer through enqueueHandoffDrive
+   * instead of registering directly. Clearing only on success left every
+   * deferred path writing a live status back to storage with
+   * parked_with_tab still true; a worker restart during that open-ended
+   * queue wait (MV3 tears the worker down after ~30s idle) would see a live
+   * status plus the stale marker and skip re-registering forever — stranded
+   * outside governor supervision, with no timeout and no capacity
+   * accounting. Both callers route through this one helper so a future
+   * third caller cannot reopen the gap.
+   * void, not awaited: `update` mutates the in-memory store and chains its
+   * persistence synchronously before this call returns, so the clear is
+   * queued for disk before either caller's own next await could yield to a
+   * teardown. It cannot race parkHandoffForManual's own awaited set either:
+   * JS has no true concurrency, and intent to drive a job again is only ever
+   * expressed after that same job has already been parked. */
+  private clearParkedMarker(jobID: string): void {
+    if (findByJob(this.store, jobID)?.parked_with_tab === true) {
+      void this.update((s) => patchJob(s, jobID, { parked_with_tab: false }));
+    }
+  }
+
   private enqueueHandoffDrive(request: QueuedHandoffDrive): void {
     if (this.handoffDrives.has(request.jobID) || this.queuedDriveJobIDs.has(request.jobID)) return;
     if (findByJob(this.store, request.jobID) === undefined) return;
     this.queuedDriveJobIDs.add(request.jobID);
     this.handoffDriveQueue.push(request);
+    this.clearParkedMarker(request.jobID);
   }
 
   private releaseHandoffDrive(jobID: string): void {
@@ -2333,18 +2360,13 @@ export class Bridge {
       this.enqueueHandoffDrive({ jobID, purpose: "handoff", focusExisting: false });
       return;
     }
-    const beingDrivenAgain = findByJob(this.store, jobID);
-    if (beingDrivenAgain?.parked_with_tab === true) {
-      // This job was parked by the timeout callback below with its tab
-      // deliberately preserved (see parked_with_tab's own doc comment in
-      // state.ts); a fresh registration here means it is being driven again
-      // — by the operator finishing auth and a re-offer/redrive claiming
-      // this same tab, or any other caller. The marker's only job is to
-      // survive a restart between the park and this moment, so it must not
-      // outlive this moment: a LATER restart must see this as the active
-      // drive it now is, not skip it as still parked.
-      void this.update((s) => patchJob(s, jobID, { parked_with_tab: false }));
-    }
+    // This job may have been parked by the timeout callback below with its
+    // tab deliberately preserved (see parked_with_tab's own doc comment in
+    // state.ts); a fresh registration here means it is being driven again —
+    // by the operator finishing auth and a re-offer/redrive claiming this
+    // same tab, or any other caller. clearParkedMarker above documents why
+    // this must happen at intent, not just here at success.
+    this.clearParkedMarker(jobID);
     const token = {};
     this.handoffDrives.set(jobID, { tabID, token });
     this.handoffDriveTimeouts.set(jobID, token);
@@ -4970,6 +4992,13 @@ export class Bridge {
                 offered_at: this.deps.now(),
                 status: "accepted",
                 provider_hosts: providerHosts,
+                // ...existing may still carry a stale parked_with_tab: true left
+                // over from a prior timeout park. enqueueHandoffDrive just below
+                // also clears it, but only after this write already lands — so
+                // writing the stale value here first would still let a worker
+                // restart between these two calls see a live status plus the
+                // marker and skip re-registering the job forever.
+                parked_with_tab: false,
               },
               openurl,
             );

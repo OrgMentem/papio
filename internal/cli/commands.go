@@ -22,6 +22,7 @@ import (
 	"papio/internal/browser"
 	"papio/internal/ipc"
 	"papio/internal/job"
+	"papio/internal/store"
 )
 
 // jobsFailuresResult decodes the daemon reply. internal/api/failures.go sends
@@ -214,7 +215,14 @@ func newJobsCommand(opt *options) *cobra.Command {
 				return printPage(opt, "jobs", rows, truncated)
 			}
 			for _, row := range rows {
-				if _, err := fmt.Fprintf(opt.out, "%s\t%s\t%s\n", row.ID, row.State, row.Work.Describe()); err != nil {
+				// row.Work.Describe() renders the title/DOI/identifier that
+				// identifies this job: Describe() falls back to a raw Title when
+				// no strong identifier is set, and that Title is third-party
+				// bibliographic metadata normalized with only strings.TrimSpace
+				// (see the search-row comment in search.go). Route it through
+				// StripTerminalControls on this JSON-free branch, or a poisoned
+				// title injects ANSI/OSC escapes into `papio jobs list`.
+				if _, err := fmt.Fprintf(opt.out, "%s\t%s\t%s\n", row.ID, row.State, store.StripTerminalControls(row.Work.Describe())); err != nil {
 					return err
 				}
 			}
@@ -248,7 +256,10 @@ func newJobsCommand(opt *options) *cobra.Command {
 				if opt.jsonOutput {
 					return opt.printJSON(detail)
 				}
-				if _, err := fmt.Fprintf(opt.out, "%s\t%s\t%s\n", detail.Job.ID, detail.Job.State, detail.Job.Work.Describe()); err != nil {
+				// detail.Job.Work.Describe() carries the same third-party title
+				// fallback as the jobs-list row above; strip it on this
+				// JSON-free branch too.
+				if _, err := fmt.Fprintf(opt.out, "%s\t%s\t%s\n", detail.Job.ID, detail.Job.State, store.StripTerminalControls(detail.Job.Work.Describe())); err != nil {
 					return err
 				}
 				for _, event := range detail.Events {

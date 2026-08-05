@@ -600,6 +600,15 @@ export async function encodePageCapture(sanitized: string, meta: PageCaptureMeta
   return { ok: true, payload };
 }
 
+/** A capture send either succeeds/fails as a bare boolean (legacy fakes and
+ * `observe.ts`'s own relay) or, from the popup's `chrome.runtime.sendMessage`
+ * bridge to the background broker, as a structured result carrying the
+ * refusal reason from `runtimeFailure` — e.g. "the connected daemon does not
+ * support terms captures". captureFixture forwards that reason instead of a
+ * generic failure string so the operator can tell "upgrade the daemon" from
+ * an ordinary transport failure. */
+export type SendPageCaptureResult = boolean | { captured: boolean; error?: string };
+
 /** Minimal browser surface captureFixture needs. The real `chrome` satisfies it
  * structurally; tests inject a fake with scripting plus the native-frame relay. */
 export interface ChromeCaptureApi {
@@ -610,7 +619,7 @@ export interface ChromeCaptureApi {
       func: () => PageCapture;
     }): Promise<Array<{ result?: PageCapture | undefined }>>;
   };
-  sendPageCapture(payload: PageCapturePayload): Promise<boolean>;
+  sendPageCapture(payload: PageCapturePayload): Promise<SendPageCaptureResult>;
 }
 
 export type CaptureResult = { ok: true; bytes: number } | { ok: false; error: string };
@@ -674,8 +683,17 @@ export async function captureFixture(
   const encoded = await encodePageCapture(sanitized, { host, scenario, adapterID: provider });
   if (!encoded.ok) return encoded;
   try {
-    if (!(await api.sendPageCapture(encoded.payload))) {
-      return { ok: false, error: "could not send the capture to papio" };
+    const sent = await api.sendPageCapture(encoded.payload);
+    const captured = typeof sent === "boolean" ? sent : sent.captured;
+    if (!captured) {
+      // A bare `false`/`{captured:false}` with no message is the legacy
+      // shape (transport failure, no reason attached) — only trust a
+      // non-empty message string; anything else falls back to the generic
+      // text so the status line never renders "undefined" or blank.
+      const message = typeof sent === "object" && typeof sent.error === "string" && sent.error.length > 0
+        ? sent.error
+        : "could not send the capture to papio";
+      return { ok: false, error: message };
     }
   } catch {
     return { ok: false, error: "could not send the capture to papio" };

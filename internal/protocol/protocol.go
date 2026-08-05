@@ -69,6 +69,19 @@ var (
 	// protocol/browser-v1.schema.json — see validateResolverOriginHint for
 	// why label count is deliberately unconstrained.
 	originHostRE = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$`)
+	// originPortRE is the resolver-origin port grammar used ONLY by
+	// validateResolverOriginHint, mirroring the schema pattern's trailing
+	// `(:[0-9]{1,5})?` group: 1-5 decimal digits, never empty. net/url
+	// already rejects a non-numeric port at Parse time, so the only shapes
+	// left to bound here are length and emptiness — but bounding them is
+	// the fix: net/url places no upper bound on a numeric port and returns
+	// "" from Port() both for "no port at all" and for a bare trailing
+	// colon with nothing after it, so without this check
+	// "https://library:123456" and "https://library:" both decoded in Go
+	// while the schema's `{1,5}` port group rejects them — Go laxer than
+	// its own published contract, the direction this package exists to
+	// prevent.
+	originPortRE = regexp.MustCompile(`^[0-9]{1,5}$`)
 	errorCodeRE  = regexp.MustCompile(`^[a-z0-9_]{2,50}$`)
 	filenameRE   = regexp.MustCompile(`^[^/\\]{1,255}$`)
 	base64RE     = regexp.MustCompile(`^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$`)
@@ -675,6 +688,47 @@ func validateBareRoute(route string) error {
 // forecloses a leading/trailing dot and a ".." run for free, because every
 // dot in that grammar sits between two non-empty labels — no separate pass
 // needed, unlike delivery_context.page_host next to this function's caller.
+//
+// The three implementations agree exactly only over the DNS-shaped subset a
+// genuine producer emits: an https origin whose host is a lowercase RFC
+// 1035 label chain (one label or several, per the note above) and whose
+// port, if present, is 1-5 non-empty decimal digits. Three shapes are
+// known, accepted divergences outside that subset, none reachable from a
+// genuine producer because origin_hint is always derived via
+// `new URL(...)` on the browser side before it ever reaches the wire:
+//   - A purely numeric single-label host (e.g. "https://123"): Go and the
+//     schema both accept it — originHostRE's grammar treats a digit like
+//     any other label character — but the WHATWG URL parser's "host ends
+//     in a number" rule reparses it as an IPv4 address before
+//     ORIGIN_HOST_RE ever runs, so `new URL("https://123").host` is
+//     "0.0.0.123" and parseBrowserMessage's round-trip equality check
+//     rejects the original string. Matching that reparse would mean
+//     duplicating WHATWG's IPv4 grammar here; not worth it for a shape no
+//     real config produces (a bare numeric openurl_base_url host is not an
+//     institutional resolver).
+//   - A non-canonical port, e.g. a zero-padded ":08443": `new URL(...)`
+//     drops the leading zero, so parseBrowserMessage's round-trip check
+//     rejects the original digits while Go and the schema — which only
+//     bound digit count, not leading zeros — accept them. Same
+//     reject-rather-than-normalize tradeoff as case above, just not worth
+//     a dedicated no-leading-zero rule.
+//   - An explicit empty origin_hint (`""`): this function rejects it, but
+//     SessionEvidencePayload.validate only calls it when the field is
+//     non-empty, treating "" the same as an omitted optional field — so an
+//     explicit `"origin_hint": ""` decodes in Go. The schema pattern
+//     (which always requires the "https://" prefix) and
+//     `new URL("")` in TypeScript both reject it outright. The gap is one
+//     layer up, in the caller's presence check, not in this function.
+//
+// A fourth shape — a port outside 1-5 digits, including the
+// empty-after-colon form "https://library:" (net/url happily parses it
+// with Port() == "") — used to be a divergence in the dangerous direction:
+// Go accepted it because u.Hostname() silently discards the port, while
+// the schema's `(:[0-9]{1,5})?$` group rejects it. That direction — Go
+// laxer than its own published contract — is exactly what this package
+// exists to prevent, so it is closed below: the port is validated
+// explicitly against originPortRE instead of trusting Hostname() to have
+// stripped away anything that mattered.
 func validateResolverOriginHint(hint string) error {
 	if hint == "" {
 		return fmt.Errorf("session_evidence.origin_hint required")
@@ -700,6 +754,13 @@ func validateResolverOriginHint(hint string) error {
 	}
 	if !originHostRE.MatchString(u.Hostname()) {
 		return fmt.Errorf("session_evidence.origin_hint %q must have a lowercase resolver host", hint)
+	}
+	// u.Hostname() silently drops the port; validate it explicitly rather
+	// than letting a malformed or oversized one pass unseen.
+	if port := strings.TrimPrefix(u.Host, u.Hostname()); port != "" {
+		if !originPortRE.MatchString(strings.TrimPrefix(port, ":")) {
+			return fmt.Errorf("session_evidence.origin_hint %q must have a 1-5 digit port", hint)
+		}
 	}
 	return nil
 }

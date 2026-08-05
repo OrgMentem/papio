@@ -536,8 +536,13 @@ export class KeepaliveManager {
    * hand that caller (via this.tabID) a tab for the wrong institution. createTab()
    * compares the wanted origin against tabCreationOrigin and, on a
    * mismatch, waits for the stale attempt to settle (so it can never be
-   * starved) and then drives its own, origin-correct creation instead of
-   * joining. */
+   * starved), tears down any tab that settled attempt produced (via
+   * removeStaleTab — the settled attempt may have created one for the
+   * origin nobody wants anymore before it could be stopped, and that tab
+   * would otherwise be pinned+muted with nothing referencing it once this
+   * loop overwrites this.tabID; the tab governor skips pinned tabs on
+   * purpose, so it would never be reconciled or closed), and then drives
+   * its own, origin-correct creation instead of joining. */
   private tabCreationInFlight: Promise<void> | undefined;
   /** Origin the in-flight tabCreationInFlight attempt was started for.
    * Undefined whenever no creation is in flight. */
@@ -994,17 +999,7 @@ export class KeepaliveManager {
     const target = requested ?? this.resolverFromLatestOffer() ?? this.configuredResolver() ?? this.resolver;
     if (target?.protocol !== "https:") return false;
     if (this.resolver?.origin !== target.origin && this.tabID !== undefined) {
-      const oldTabID = this.tabID;
-      const wasPaused = this.reauthPaused;
-      this.tabID = undefined;
-      this.reauthPaused = false;
-      this.updateOriginSnapshot(this.resolver?.origin, { pausedForReauth: false });
-      if (wasPaused) this.options.onReauthStateChanged?.(false);
-      try {
-        await this.api.tabs.remove(oldTabID);
-      } catch {
-        // A manually closed tab is already in the desired state.
-      }
+      await this.removeStaleTab(this.tabID, this.resolver?.origin);
     }
     this.resolver = target;
     this.syncOriginStates();
@@ -1123,6 +1118,32 @@ export class KeepaliveManager {
     }
   }
 
+  /** Remove a tab whose origin the manager no longer wants, because the
+   * resolver moved on while the tab was still live. Shared by openReauth's
+   * ordinary origin-switch teardown and by createTab()'s wait-then-retry
+   * path (see the tabCreationInFlight doc comment above): without this,
+   * the wait-then-retry path would overwrite this.tabID with the NEW
+   * origin's tab and leave the settled first attempt's tab pinned+muted
+   * with nothing referencing it — the tab governor skips pinned tabs on
+   * purpose, so that orphan is never reconciled or closed. `origin` is
+   * the origin the removed tab was opened for, which the caller must pass
+   * explicitly: by the time this runs, this.resolver may already have
+   * moved on to a different one. */
+  private async removeStaleTab(tabID: number, origin: string | undefined): Promise<void> {
+    const wasPaused = this.reauthPaused;
+    if (this.tabID === tabID) {
+      this.tabID = undefined;
+      this.reauthPaused = false;
+    }
+    this.updateOriginSnapshot(origin, { pausedForReauth: false });
+    if (wasPaused) this.options.onReauthStateChanged?.(false);
+    try {
+      await this.api.tabs.remove(tabID);
+    } catch {
+      // A manually closed tab is already in the desired state.
+    }
+  }
+
   private async createTab(): Promise<void> {
     for (;;) {
       const resolver = this.resolver;
@@ -1144,9 +1165,14 @@ export class KeepaliveManager {
       // Wanted a different origin than the creation already in flight
       // (e.g. openReauth switching institutions mid-race). Wait for the
       // stale attempt to settle first, so it can never be starved, then
-      // loop to drive our own origin-correct creation instead of joining
-      // a promise that would hand back the wrong institution's tab.
+      // tear down any tab it produced for the origin nobody wants anymore
+      // (a failed attempt leaves this.tabID undefined, so there is nothing
+      // to close) before looping to drive our own origin-correct creation
+      // instead of joining a promise that would hand back the wrong
+      // institution's tab.
+      const staleOrigin = this.tabCreationOrigin;
       await this.tabCreationInFlight;
+      if (this.tabID !== undefined) await this.removeStaleTab(this.tabID, staleOrigin);
     }
   }
 

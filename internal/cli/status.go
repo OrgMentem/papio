@@ -16,6 +16,7 @@ import (
 	"papio/internal/config"
 	"papio/internal/errcat"
 	"papio/internal/job"
+	"papio/internal/store"
 )
 
 const statusRecentWindow = 24 * time.Hour
@@ -322,7 +323,13 @@ func renderStatusRefresh(out io.Writer, snapshot statusSnapshot, terminal bool) 
 			if item.ImportStatus != "" {
 				detail = "import=" + item.ImportStatus
 			}
-			if _, err := fmt.Fprintf(out, "%-50s  %-18s  %-16s  %-6s  %s\n", item.Title, item.Provider, item.State, item.Age, detail); err != nil {
+			// item.Title is shortTitle(row.Work.Describe()): third-party
+			// bibliographic metadata (a discovery-registered title or DOI),
+			// truncated by shortText but never stripped of control bytes.
+			// statusJob.Title also backs `papio status --json`, which must keep
+			// exact bytes, so the strip happens here at the text-only render
+			// site rather than inside shortTitle/shortText.
+			if _, err := fmt.Fprintf(out, "%-50s  %-18s  %-16s  %-6s  %s\n", store.StripTerminalControls(item.Title), item.Provider, item.State, item.Age, detail); err != nil {
 				return err
 			}
 			if item.Guidance != "" {

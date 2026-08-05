@@ -315,6 +315,10 @@ test("papio-8f79b6ba67bdbdaa: concurrent creation attempts across sync() calls p
     { url: "https://resolver.example.edu", active: false, pinned: true, muted: true },
   ]);
 
+  // Same-origin callers only ever share one creation — nothing here should
+  // ever reach removeStaleTab's teardown path.
+  expect(h.tabs.removed).toEqual([]);
+
   // The single created tab is the one the manager actually owns: it is
   // reloaded (not recreated) on the next cycle and removed once demand ends.
   h.jobs.count = 0;
@@ -394,6 +398,12 @@ test("openReauth requesting a different origin mid-creation never rides another 
   await flushMicrotasks();
   expect(queries).toHaveLength(2);
   expect(queries[1]?.url).toEqual(["https://otherlib.example.edu/*"]);
+  // The FIRST attempt's tab (id 1, resolver.example.edu) is about to be
+  // orphaned: this.tabID is about to be overwritten by B's own creation
+  // below, and the tab governor deliberately skips pinned tabs, so nothing
+  // else would ever close it. B must remove it before starting its own
+  // creation, and it must do so before issuing its own query above.
+  expect(h.tabs.removed).toEqual([1]);
   expect(creates).toHaveLength(1);
 
   queries[1]?.resolve([]);
@@ -414,6 +424,8 @@ test("openReauth requesting a different origin mid-creation never rides another 
   expect(h.tabs.updates.some((u) => u.id === 1)).toBe(false);
   expect(h.tabs.updates.some((u) => u.id === 2 && u.properties.active === true)).toBe(true);
   expect(h.manager.getSnapshot().resolverOrigin).toBe(otherOrigin);
+  // Exactly the orphan is gone: B's own tab was never also swept up.
+  expect(h.tabs.removed).toEqual([1]);
 });
 
 test("papio-8f79b6ba67bdbdaa: a failed tab creation does not wedge later creation attempts", async () => {

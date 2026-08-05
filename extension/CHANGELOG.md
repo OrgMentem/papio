@@ -18,6 +18,23 @@ for the full pre-split extension history.
 
 ### Fixed
 
+- **A resumed handoff is no longer stranded by its own parked marker.** The
+  marker recording a deliberate park was cleared only when a drive actually
+  registered, but with both governor slots busy — the normal steady state —
+  every resume path defers to an in-memory queue that no restart survives. A
+  worker teardown in that window left the job marked parked forever, so the
+  restore loop skipped it and it dropped out of governor supervision
+  entirely: no timeout, no capacity accounting, no recovery. The marker is
+  now cleared at the point of intent to drive, which both the queueing and
+  registering paths share.
+- **Switching institutions mid-creation no longer leaks a pinned tab.** When
+  a re-authentication for a second origin arrived while a tab creation for
+  the first was still in flight, its own stale-tab teardown was skipped —
+  that teardown is gated on a tab already existing, which is exactly false
+  during the window — so the first creation completed into a pinned, muted
+  tab nothing referenced again. The tab governor skips pinned tabs by design,
+  so it was never reclaimed. The superseded tab is now torn down before the
+  replacement is created.
 - **A parked handoff no longer re-consumes its governor slot after a
   service-worker restart.** Parking for manual auth frees a slot but leaves
   the tab open, and the slot lives only in worker memory while the tab id is

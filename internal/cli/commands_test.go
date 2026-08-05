@@ -514,6 +514,40 @@ func TestJobsListFallsBackToV1AgainstOlderDaemon(t *testing.T) {
 	}
 }
 
+// row.Work.Describe() falls back to a raw Title when no strong identifier
+// narrows it further, and that Title is third-party bibliographic metadata
+// normalized with only strings.TrimSpace by internal/discovery (see the
+// search-row comment in search.go). Before this fix, the text-mode `jobs
+// list` row printed it straight to the terminal.
+func TestJobsListStripsTerminalControlBytes(t *testing.T) {
+	rows := []job.Row{{ID: "job-1", State: job.StateQueued, Work: work.Work{Title: "Evil\x1b]0;pwned\x07 Title\u009b31m"}}}
+	var out, errOut bytes.Buffer
+	root := NewInProcessRoot(&out, &errOut, config.Config{}, func(_ context.Context, method string, _ any, result any) error {
+		if method != "jobs.list_v2" {
+			t.Fatalf("method = %q, want jobs.list_v2", method)
+		}
+		*result.(*api.JobsPage) = api.JobsPage{Jobs: rows}
+		return nil
+	})
+	root.SetArgs([]string{"jobs", "list"})
+	if err := root.ExecuteContext(context.Background()); err != nil {
+		t.Fatalf("jobs list: %v (%s)", err, errOut.String())
+	}
+	got := out.String()
+	want := "job-1\tqueued\ttitle:Evil]0;pwned Title31m\n"
+	if got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+	for _, r := range got {
+		if r == '\n' || r == '\t' {
+			continue
+		}
+		if r < 0x20 || (r >= 0x7f && r <= 0x9f) {
+			t.Errorf("control byte %#U survived in %q", r, got)
+		}
+	}
+}
+
 // TestActionsOpenFiltersJobsByStateAndFoldsDroppedRowsIntoTruncated pins two
 // parts of the "actions open" completeness fix: the jobs.list join request
 // is filtered to state=awaiting_human (strictly narrower than the old

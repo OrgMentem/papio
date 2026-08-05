@@ -24,13 +24,18 @@ execution records in `notes/acquisition-stack-plan.md`.
 
 ### Fixed
 
-- **`papio watch digest` and `papio inbox` strip terminal control bytes.** The
-  same third-party bibliographic strings the activity feed was hardened
-  against — stored after `TrimSpace` and nothing else — were printed raw by
-  two adjacent commands, so a record whose title carried an OSC sequence could
-  rewrite the operator's terminal when it matched a watch. Titles, authors and
-  DOIs on those rows now go through the same choke point, as does the job-state
-  fallback beside the activity summary.
+- **Every command that prints third-party text strips terminal control
+  bytes.** Bibliographic strings are stored with only `TrimSpace`, so a
+  record whose title or DOI carries an OSC sequence could rewrite the
+  operator's terminal. `papio search` is the most exposed — anyone able to
+  register a work in a discovery backend controls those bytes, and any
+  keyword search renders them — alongside `watch digest`, `inbox` (both the
+  watch-hit and retraction rows), `status`, `jobs list`/`jobs get`, `batch
+  report` and the activity feed. Note that a DOI is not self-sanitising:
+  `doiCoreRE`'s `\S` excludes only the five ASCII whitespace bytes in RE2, so
+  ESC, BEL, DEL and C1 all survive normalisation. `--json` output is
+  deliberately unchanged and still carries exact bytes, since it is the
+  authoritative machine-readable form.
 - **A page capture that redirects is no longer reported as a failure.** The
   previous release matched a pending capture against the host of the URL it
   requested, but the extension reports the host the page actually *landed* on,

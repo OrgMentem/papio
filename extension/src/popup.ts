@@ -1931,6 +1931,17 @@ export async function refresh(): Promise<void> {
   });
 }
 
+/** Pull the daemon-upgrade (or other) refusal reason out of a `runtimeFailure`
+ * response so it reaches the capture panel's status line instead of always
+ * collapsing into captureFixture's generic "could not send" fallback. */
+function pageCaptureFailureMessage(response: unknown): string | undefined {
+  if (typeof response !== "object" || response === null) return undefined;
+  const error = (response as Record<string, unknown>)["error"];
+  if (typeof error !== "object" || error === null) return undefined;
+  const message = (error as Record<string, unknown>)["message"];
+  return typeof message === "string" && message.length > 0 ? message : undefined;
+}
+
 // Thin adapter over the real chrome surface so captureFixture stays testable
 // against a fake. The injected result is normalized to `result?: PageCapture`.
 const captureApi: ChromeCaptureApi = {
@@ -1943,11 +1954,15 @@ const captureApi: ChromeCaptureApi = {
   },
   sendPageCapture: async (payload) => {
     const response: unknown = await chrome.runtime.sendMessage({ type: "papio.page_capture", payload });
-    return (
+    const captured =
       typeof response === "object" &&
       response !== null &&
-      (response as Record<string, unknown>)["captured"] === true
-    );
+      (response as Record<string, unknown>)["captured"] === true;
+    if (captured) return true;
+    // exactOptionalPropertyTypes: an absent cause must OMIT the key rather
+    // than set it to undefined, so captureFixture's generic fallback applies.
+    const cause = pageCaptureFailureMessage(response);
+    return cause === undefined ? { captured: false } : { captured: false, error: cause };
   },
 };
 

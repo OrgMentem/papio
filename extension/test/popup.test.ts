@@ -1341,3 +1341,104 @@ test("a release notice keeps the card with a warm summary, never a bare heading"
   );
   expect((doc.getElementById("institution-session-signin") as HTMLButtonElement).hidden).toBe(true);
 });
+
+// `captureFixture`'s send step routes through `encodePageCapture`'s real
+// `CompressionStream("gzip")` pipeline, which settles on a real event-loop
+// turn the click handler's fire-and-forget `.then()` doesn't expose to the
+// caller. Rather than guess a wait duration, the fake `sendMessage` below
+// signals a `Promise.withResolvers()` gate the instant the pipeline reaches
+// it (i.e. once gzip has already finished) — the test awaits that real
+// signal, then a few microtask flushes for the remaining `.then()` chain
+// back into `statusEl.textContent`.
+async function flushMicrotasks(rounds = 10): Promise<void> {
+  for (let i = 0; i < rounds; i++) await Promise.resolve();
+}
+
+test("capture panel status line surfaces the daemon-upgrade reason from a structured capture_failed refusal", async () => {
+  const doc = popupDocument();
+  wireCapture(doc, ["page_capture_terms_v1"]);
+  const { promise: sent, resolve: onSent } = Promise.withResolvers<void>();
+  Object.assign(globalThis, {
+    chrome: {
+      tabs: { query: async () => [{ id: 7 }] },
+      scripting: {
+        executeScript: async () => [{
+          result: {
+            html: "<html><body><h1>Trust</h1></body></html>",
+            origin: "https://www.proquest.com",
+            path: "/docview/1",
+          },
+        }],
+      },
+      runtime: {
+        // Mirrors background.ts's runtimeFailure("capture_failed", …) shape
+        // for a daemon too old to accept the `terms` scenario.
+        sendMessage: async () => {
+          onSent();
+          return {
+            ok: false,
+            error: {
+              code: "capture_failed",
+              message:
+                "The connected daemon does not support terms captures; upgrade the daemon to send this scenario",
+            },
+          };
+        },
+      },
+    },
+  });
+
+  const provider = doc.getElementById("capture-provider") as HTMLSelectElement;
+  const scenario = doc.getElementById("capture-scenario") as HTMLSelectElement;
+  provider.value = "proquest";
+  scenario.value = "terms";
+  const button = doc.getElementById("capture-btn") as HTMLButtonElement;
+  button.click();
+  await sent;
+  await flushMicrotasks();
+
+  expect(doc.getElementById("capture-status")?.textContent).toBe(
+    "The connected daemon does not support terms captures; upgrade the daemon to send this scenario",
+  );
+  expect(button.disabled).toBe(false);
+});
+
+test("capture panel status line falls back to the generic message when the refusal carries no reason", async () => {
+  const doc = popupDocument();
+  wireCapture(doc, ["page_capture_terms_v1"]);
+  const { promise: sent, resolve: onSent } = Promise.withResolvers<void>();
+  Object.assign(globalThis, {
+    chrome: {
+      tabs: { query: async () => [{ id: 7 }] },
+      scripting: {
+        executeScript: async () => [{
+          result: {
+            html: "<html><body><h1>Trust</h1></body></html>",
+            origin: "https://www.proquest.com",
+            path: "/docview/1",
+          },
+        }],
+      },
+      runtime: {
+        // A dropped connection or malformed reply carries no `error`; the
+        // operator must still see something actionable, not "undefined".
+        sendMessage: async () => {
+          onSent();
+          return undefined;
+        },
+      },
+    },
+  });
+
+  const provider = doc.getElementById("capture-provider") as HTMLSelectElement;
+  const scenario = doc.getElementById("capture-scenario") as HTMLSelectElement;
+  provider.value = "proquest";
+  scenario.value = "success";
+  const button = doc.getElementById("capture-btn") as HTMLButtonElement;
+  button.click();
+  await sent;
+  await flushMicrotasks();
+
+  expect(doc.getElementById("capture-status")?.textContent).toBe("could not send the capture to papio");
+  expect(button.disabled).toBe(false);
+});

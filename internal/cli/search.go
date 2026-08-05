@@ -12,6 +12,7 @@ import (
 	"papio/internal/agentjson"
 	"papio/internal/discovery"
 	"papio/internal/ipc"
+	"papio/internal/store"
 )
 
 func newSearchCommand(opt *options) *cobra.Command {
@@ -59,10 +60,24 @@ func newSearchCommand(opt *options) *cobra.Command {
 			}
 			var anyConfident, anyTitleJudged bool
 			for _, discovered := range works {
+				// discovered.Work.Title/Authors are third-party bibliographic
+				// metadata: internal/discovery normalizes them with only
+				// strings.TrimSpace before returning a hit (discovery.go:451,
+				// semanticscholar.go:347). discovered.Work.DOI goes through
+				// work.NormalizeDOI instead, which does NOT strip control bytes
+				// either — doiCoreRE's \S excludes only [\t\n\f\r ] in RE2, so
+				// ESC/BEL/DEL/C1 all survive (same gap the inbox retraction row
+				// closes). Anyone who can register a work in OpenAlex or
+				// Semantic Scholar controls all three bytes verbatim, and papio
+				// search is the widest-reach surface — any keyword query can
+				// surface an attacker-registered row. Route them through the
+				// same StripTerminalControls choke point ActivityText/watch
+				// digest use, or a poisoned title/author/DOI injects ANSI/OSC
+				// escapes here.
 				if _, err := fmt.Fprintf(opt.out, "%d | %s | %s | %s | %s | %s | %d citations%s\n",
 					discovered.Work.Year,
 					firstAuthor(discovered.Work.Authors),
-					discovered.Work.Title,
+					store.StripTerminalControls(discovered.Work.Title),
 					emptyMarker(discovered.Work.DOI),
 					oaMarker(discovered.IsOA),
 					matchMarker(discovered.MatchKind),
@@ -119,18 +134,24 @@ func sourceRequiresCurrentDaemon(source string, err error) error {
 	return fmt.Errorf("%w: --source requires a daemon running this papio version; run 'papio daemon stop' and retry", err)
 }
 
+// firstAuthor is only ever called on discovery-backend author data (see the
+// comment above the search row printf), so stripping here rather than at
+// the call site keeps a future caller safe by construction.
 func firstAuthor(authors []string) string {
 	if len(authors) == 0 || strings.TrimSpace(authors[0]) == "" {
 		return "—"
 	}
-	return authors[0]
+	return store.StripTerminalControls(authors[0])
 }
 
+// emptyMarker is only ever called on discovery-backend DOI data (see the
+// comment above the search row printf); stripping here rather than at the
+// call site keeps a future caller safe by construction.
 func emptyMarker(value string) string {
 	if strings.TrimSpace(value) == "" {
 		return "—"
 	}
-	return value
+	return store.StripTerminalControls(value)
 }
 
 func oaMarker(isOA bool) string {

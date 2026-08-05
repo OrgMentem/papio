@@ -1000,9 +1000,17 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
         //    one host shape the three implementations cannot trivially
         //    agree on. Revisit with an explicit bracket-aware rule in all
         //    three places together if a real deployment ever needs it.
-        //    This must match internal/protocol/protocol.go's
-        //    validateResolverOriginHint exactly — see its doc comment for
-        //    the full history.
+        //    This matches internal/protocol/protocol.go's
+        //    validateResolverOriginHint over the DNS-shaped subset a
+        //    genuine producer emits, not byte-for-byte in every corner:
+        //    this round-trip check also folds a purely-numeric final host
+        //    label into an IPv4 address (WHATWG's "host ends in a number"
+        //    rule) and drops a port's leading zeros before comparing, so
+        //    "https://123" and "https://library:08443" — which Go and the
+        //    schema both accept — fail here. Neither shape is reachable
+        //    from a genuine producer; see validateResolverOriginHint's doc
+        //    comment for the full accepted-gap list and why closing them
+        //    isn't worth duplicating WHATWG's parser in two more places.
         try {
           const parsed = new URL(origin);
           if (

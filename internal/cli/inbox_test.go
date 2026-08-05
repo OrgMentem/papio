@@ -126,3 +126,67 @@ func TestInboxWatchHitRowStripsTerminalControlBytes(t *testing.T) {
 		})
 	}
 }
+
+// item.Retraction.DOI is third-party bibliographic metadata from a
+// Retraction Watch feed match (internal/retraction), normalized only by
+// work.NormalizeDOI — which does NOT strip control bytes: doiCoreRE's \S
+// excludes only [\t\n\f\r ] in RE2, so ESC, BEL, DEL, and the whole C1 block
+// all match \S and survive normalization intact. Before this fix,
+// printInboxItem's KindRetraction arm wrote the DOI straight to the
+// terminal, four lines below the KindWatchHit arm that was already fixed —
+// reopening the same escape-injection hole on a sibling row.
+func TestInboxRetractionRowStripsTerminalControlBytes(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		doi     string
+		wantRow string
+	}{
+		{
+			name:    "escape and osc sequence in doi",
+			doi:     "10.1000/evil\x1b]0;pwned\x07DOI\u009b31m",
+			wantRow: "3000000\tretraction\t10.1000/evil]0;pwnedDOI31m\n",
+		},
+		{
+			name:    "printable non-ASCII survives byte-for-byte",
+			doi:     "10.1000/日本語のDOI",
+			wantRow: "3000000\tretraction\t10.1000/日本語のDOI\n",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			now := time.Date(2026, 7, 21, 12, 0, 0, 0, time.UTC)
+			snapshot := triage.Snapshot{
+				Schema: triage.SchemaVersion, GeneratedAt: now.Format(time.RFC3339),
+				Counts: triage.Counts{PendingTotal: 1},
+				Items: []triage.Item{{
+					Kind: triage.KindRetraction, ID: "retraction:1:" + tc.doi, Rank: 3_000_000,
+					Title: "Library update notice", Facts: []triage.Fact{}, Ops: []string{"dismiss"},
+					Retraction: &triage.Retraction{DOI: tc.doi, Nature: "retraction", NoticedAt: now},
+				}},
+			}
+			var stdout, stderr bytes.Buffer
+			root := NewInProcessRoot(&stdout, &stderr, config.Config{}, func(_ context.Context, method string, _ any, result any) error {
+				if method != "triage.snapshot" {
+					t.Fatalf("method = %q, want triage.snapshot", method)
+				}
+				*result.(*triage.Snapshot) = snapshot
+				return nil
+			})
+			root.SetArgs([]string{"inbox"})
+			if err := root.Execute(); err != nil {
+				t.Fatalf("inbox: %v (%s)", err, stderr.String())
+			}
+			got := stdout.String()
+			if got != tc.wantRow {
+				t.Fatalf("stdout = %q, want %q", got, tc.wantRow)
+			}
+			for _, r := range got {
+				if r == '\n' || r == '\t' {
+					continue
+				}
+				if r < 0x20 || (r >= 0x7f && r <= 0x9f) {
+					t.Errorf("control byte %#U survived in %q", r, got)
+				}
+			}
+		})
+	}
+}

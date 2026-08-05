@@ -153,7 +153,15 @@ func printInboxItem(opt *options, item triage.Item) error {
 		_, err := fmt.Fprintf(opt.out, "%d\taction\t%s\t%s\n", item.Rank, item.HumanAction.ActionKind, item.HumanAction.JobID)
 		return err
 	case triage.KindRetraction:
-		_, err := fmt.Fprintf(opt.out, "%d\t%s\t%s\n", item.Rank, item.Retraction.Nature, item.Retraction.DOI)
+		// item.Retraction.DOI is third-party bibliographic metadata from a
+		// Retraction Watch feed match (internal/retraction), normalized only by
+		// work.NormalizeDOI. NormalizeDOI does NOT strip control bytes: its
+		// doiCoreRE uses \S, which in RE2 excludes only [\t\n\f\r ] — ESC, BEL,
+		// DEL and the whole C1 block all match \S and survive normalization
+		// intact. Route it through StripTerminalControls like the watch-hit
+		// row above, or a poisoned retraction notice DOI injects ANSI/OSC
+		// escapes into `papio inbox`.
+		_, err := fmt.Fprintf(opt.out, "%d\t%s\t%s\n", item.Rank, item.Retraction.Nature, store.StripTerminalControls(item.Retraction.DOI))
 		return err
 	default:
 		return fmt.Errorf("unsupported triage item kind %q", item.Kind)

@@ -248,6 +248,92 @@ func TestSearchCommandJSONIncludesMatchFields(t *testing.T) {
 	}
 }
 
+// discovered.Work.Title/Authors are third-party bibliographic metadata
+// (internal/discovery normalizes them with only strings.TrimSpace) and
+// discovered.Work.DOI passes through work.NormalizeDOI, which does not strip
+// control bytes either (doiCoreRE's \S excludes only [\t\n\f\r ] in RE2).
+// Before this fix, `papio search` printed all three straight to the
+// terminal — the widest-reach surface of the escape-injection class this
+// package's other columns already close.
+func TestSearchCommandStripsTerminalControlBytes(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		work    work.Work
+		wantRow string
+	}{
+		{
+			name: "escape and osc sequence in title, author, and doi",
+			work: work.Work{
+				Year: 2026, Authors: []string{"Evil\x1b]0;pwned\x07 Author"},
+				Title: "Evil\x1b[31mTitle", DOI: "10.1000/evil\u009b31m",
+			},
+			wantRow: "2026 | Evil]0;pwned Author | Evil[31mTitle | 10.1000/evil31m | — | — | 0 citations\n",
+		},
+		{
+			name: "printable non-ASCII survives byte-for-byte",
+			work: work.Work{
+				Year: 2026, Authors: []string{"Café Über"}, Title: "日本語のタイトル", DOI: "10.1000/plain",
+			},
+			wantRow: "2026 | Café Über | 日本語のタイトル | 10.1000/plain | — | — | 0 citations\n",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var out, errOut bytes.Buffer
+			root := NewInProcessRoot(&out, &errOut, config.Config{}, func(_ context.Context, method string, _ any, result any) error {
+				if method != "discovery.search" {
+					t.Fatalf("method = %q, want discovery.search", method)
+				}
+				*result.(*[]discovery.DiscoveredWork) = []discovery.DiscoveredWork{{Work: tc.work}}
+				return nil
+			})
+			root.SetArgs([]string{"search", "--cites", "10.1000/seed"})
+			if err := root.ExecuteContext(context.Background()); err != nil {
+				t.Fatalf("search: %v", err)
+			}
+			got := out.String()
+			if got != tc.wantRow {
+				t.Fatalf("stdout = %q, want %q", got, tc.wantRow)
+			}
+			for _, r := range got {
+				if r == '\n' {
+					continue
+				}
+				if r < 0x20 || (r >= 0x7f && r <= 0x9f) {
+					t.Errorf("control byte %#U survived in %q", r, got)
+				}
+			}
+		})
+	}
+}
+
+// The --json branch marshals discovery.DiscoveredWork directly (never
+// through firstAuthor/emptyMarker/the Title strip in the text row above), so
+// a control byte in third-party metadata must survive verbatim for a
+// machine caller to see and act on the raw value.
+func TestSearchCommandJSONPreservesControlBytes(t *testing.T) {
+	const title = "Evil\x1b[31mTitle"
+	var out, errOut bytes.Buffer
+	root := NewInProcessRoot(&out, &errOut, config.Config{}, func(_ context.Context, _ string, _ any, result any) error {
+		*result.(*[]discovery.DiscoveredWork) = []discovery.DiscoveredWork{
+			{Work: work.Work{Year: 2024, Title: title}, MatchScore: 1, MatchKind: discovery.MatchExactTitle},
+		}
+		return nil
+	})
+	root.SetArgs([]string{"--json", "search", "Evil"})
+	if err := root.ExecuteContext(context.Background()); err != nil {
+		t.Fatalf("search --json: %v", err)
+	}
+	var page struct {
+		Works []discovery.DiscoveredWork `json:"works"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &page); err != nil {
+		t.Fatalf("decode JSON: %v (%q)", err, out.String())
+	}
+	if len(page.Works) != 1 || page.Works[0].Work.Title != title {
+		t.Fatalf("JSON title = %q, want exact bytes %q", page.Works[0].Work.Title, title)
+	}
+}
+
 func TestVersionFlagMatchesVersionCommand(t *testing.T) {
 	var flagOut, flagErr bytes.Buffer
 	flagRoot := NewRoot(&flagOut, &flagErr)

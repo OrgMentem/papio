@@ -11,6 +11,7 @@ import (
 	"papio/internal/api"
 	"papio/internal/batch"
 	"papio/internal/protocol"
+	"papio/internal/store"
 )
 
 func newBatchCommand(opt *options) *cobra.Command {
@@ -96,9 +97,16 @@ func printBatchReport(opt *options, report *batch.Report) error {
 	return nil
 }
 
+// reportWorkDescription is only called from printBatchReport's text-mode
+// row (the --json branch marshals *batch.Report directly and never calls
+// this), so stripping here is safe and keeps a future caller safe by
+// construction. request.Title and the identifiers can carry a
+// discovery-sourced title/DOI the batch manifest copied verbatim from a
+// search result; request.RequestID is generated internally
+// (batch.RequestID/batchRequestID) and never needs stripping.
 func reportWorkDescription(request protocol.WorkRequest) string {
 	if request.Title != "" {
-		return request.Title
+		return store.StripTerminalControls(request.Title)
 	}
 	if request.Identifiers == nil {
 		return request.RequestID
@@ -111,7 +119,7 @@ func reportWorkDescription(request protocol.WorkRequest) string {
 		request.Identifiers.OpenAlex,
 	} {
 		if value != "" {
-			return value
+			return store.StripTerminalControls(value)
 		}
 	}
 	return request.RequestID

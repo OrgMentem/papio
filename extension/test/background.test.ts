@@ -4698,6 +4698,77 @@ test("finishing auth in a parked, preserved tab clears parked_with_tab so a late
   expect(restartedInternal.handoffDrives.has(jobIDs[0]!)).toBe(true);
 });
 
+test("resuming a parked job while the governor is at capacity clears parked_with_tab so a restart mid-queue still recovers it", async () => {
+  // papio: resumeHandoffAfterManual only enqueues (never patches the job)
+  // whenever both governor slots are already full — the normal steady state,
+  // since parkHandoffForManual drains its freed slot straight into the next
+  // queued job. Before clearParkedMarker existed, that left parked_with_tab
+  // true on a job with a live status and a live tab for as long as it sat in
+  // the worker-local queue; a restart landing in that window (MV3 tears the
+  // worker down after ~30s idle) saw the stale marker and skipped
+  // re-registering it forever — stranded outside governor supervision, with
+  // no timeout and no capacity accounting.
+  const first = makeHarness({ ...emptyStore(), lastAuthReturnedAt: 1_700_000_000_000 });
+  await first.bridge.start();
+  const jobIDs = Array.from({ length: 3 }, (_, index) => `job_resume_capacity_${index}`);
+  for (const jobID of jobIDs) await first.port.inbound(jobOffer(jobID));
+
+  const parkedTabID = first.backend.store.activeJobs.find((job) => job.job_id === jobIDs[0])?.tab_id ?? -1;
+  expect(parkedTabID).toBeGreaterThanOrEqual(0);
+
+  // job[0] stalls on the resolver's IdP when its governor timer fires,
+  // freeing its slot straight to the third, previously-queued job — the
+  // steady state in which any later resume has to go through the queue
+  // instead of registering directly.
+  first.tabs.live.set(parkedTabID, { id: parkedTabID, url: "https://idp.example.edu/sso" });
+  const authTimeouts = first.timers.filter((t) => t.ms === 180_000);
+  expect(authTimeouts).toHaveLength(2);
+  first.clock.now += 180_000;
+  await authTimeouts[0]?.fn();
+  expect(first.backend.store.activeJobs.find((job) => job.job_id === jobIDs[0])?.parked_with_tab).toBe(true);
+  const beforeResume = first.bridge as unknown as { handoffDrives: Map<string, unknown> };
+  expect(beforeResume.handoffDrives.size).toBe(2);
+  expect(beforeResume.handoffDrives.has(jobIDs[0]!)).toBe(false);
+
+  // The operator clears the challenge on the preserved tab. Both governor
+  // slots are already full (job[1]'s original drive, job[2]'s backfilled
+  // one), so resumeHandoffAfterManual — the un-park path — can only enqueue.
+  const resumed = await first.bridge.resumeHandoffAfterManual(jobIDs[0]!);
+  expect(resumed).toBe(false);
+  const afterResume = first.backend.store.activeJobs.find((job) => job.job_id === jobIDs[0]);
+  expect(afterResume?.tab_id).toBe(parkedTabID);
+  expect(afterResume?.status).toBe("auth_pending");
+  expect(afterResume?.parked_with_tab).toBe(false);
+
+  // A service-worker restart over the exact persisted snapshot, mid-queue —
+  // MV3 tears down the worker, NOT the browser's tabs, so every tracked tab
+  // is still open afterwards; carrying them across is what makes this a
+  // restart rather than a browser relaunch, and is what actually exercises
+  // the stale-marker window (an in-process drain would never lose the queue).
+  const survivingTabs = first.backend.store.activeJobs
+    .filter((job) => job.tab_id >= 0)
+    .map((job) => [job.job_id, job.tab_id] as const);
+  expect(survivingTabs).toHaveLength(3);
+  const restarted = makeHarness(JSON.parse(JSON.stringify(first.backend.store)) as StoreShape);
+  for (const [, tabID] of survivingTabs) {
+    restarted.tabs.live.set(tabID, {
+      id: tabID,
+      url: tabID === parkedTabID ? "https://idp.example.edu/sso" : OPENURL,
+    });
+  }
+  await restarted.bridge.start();
+
+  // Recovered, not skipped: the persisted marker was already false, so the
+  // restore loop's parked_with_tab check — which exists to skip a job that
+  // is genuinely still parked — does not apply, and the job gets its
+  // governor slot back instead of being stranded with no timeout and no
+  // capacity accounting.
+  const restartedInternal = restarted.bridge as unknown as {
+    handoffDrives: Map<string, { tabID: number }>;
+  };
+  expect(restartedInternal.handoffDrives.has(jobIDs[0]!)).toBe(true);
+});
+
 // isDirectFileOffer is a URL-SHAPE heuristic, and an institutional handoff's
 // offer URL is the operator's configured OpenURL base, whose path papio does
 // not constrain. So a pdf-shaped base on a requires_auth offer never took the

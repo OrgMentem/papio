@@ -205,3 +205,74 @@ func TestRenderStatusRefreshShowsLibraryCompleteness(t *testing.T) {
 		t.Fatalf("library line rendered without zotio: %q", got)
 	}
 }
+
+// statusJob.Title (shortTitle(row.Work.Describe())) backs both `papio
+// status`'s text row and `papio status --json`. buildStatusSnapshot must
+// keep the raw bytes intact here for the --json exact-byte contract; only
+// the text-mode renderStatusRefresh strips them (see the comment above that
+// call site in status.go).
+func TestBuildStatusSnapshotPreservesControlBytesForJSON(t *testing.T) {
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	rows := []job.Row{
+		{ID: "poisoned", State: job.StateFetching, UpdatedAt: now.Format(time.RFC3339Nano), Work: work.Work{Title: "Evil\x1b[31mTitle"}},
+	}
+	snapshot := buildStatusSnapshot(rows, nil, now, config.Config{})
+	if len(snapshot.Groups) != 1 || len(snapshot.Groups[0].Jobs) != 1 {
+		t.Fatalf("groups = %#v", snapshot.Groups)
+	}
+	want := "title:Evil\x1b[31mTitle"
+	if got := snapshot.Groups[0].Jobs[0].Title; got != want {
+		t.Fatalf("statusJob.Title = %q, want raw %q (must survive verbatim for --json)", got, want)
+	}
+}
+
+// item.Title is third-party bibliographic metadata (a discovery-registered
+// title or DOI, via row.Work.Describe()); shortText's strings.Fields fold
+// does not remove control bytes since unicode.IsSpace covers none of them.
+// Before this fix, renderStatusRefresh printed it straight to the terminal.
+func TestRenderStatusRefreshStripsTerminalControlBytes(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		title string
+		want  string
+	}{
+		{
+			name:  "escape and osc sequence in title",
+			title: "Evil\x1b]0;pwned\x07 Title\u009b31m",
+			want:  "Evil]0;pwned Title31m",
+		},
+		{
+			name:  "printable non-ASCII survives byte-for-byte",
+			title: "Café Über 日本語のタイトル",
+			want:  "Café Über 日本語のタイトル",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			snapshot := statusSnapshot{
+				GeneratedAt: "2026-07-15T12:00:00Z",
+				Groups: []statusGroup{{Phase: "working", Jobs: []statusJob{{
+					Title: tc.title, Provider: "arxiv", State: job.StateFetching, Age: "2m",
+				}}}},
+			}
+			var out bytes.Buffer
+			if err := renderStatusRefresh(&out, snapshot, false); err != nil {
+				t.Fatal(err)
+			}
+			got := out.String()
+			if !strings.Contains(got, tc.want) {
+				t.Fatalf("output = %q, want it to contain %q", got, tc.want)
+			}
+			if tc.title != tc.want && strings.Contains(got, tc.title) {
+				t.Fatalf("raw unstripped title leaked into output: %q", got)
+			}
+			for _, r := range got {
+				if r == '\n' {
+					continue
+				}
+				if r < 0x20 || (r >= 0x7f && r <= 0x9f) {
+					t.Errorf("control byte %#U survived in %q", r, got)
+				}
+			}
+		})
+	}
+}
