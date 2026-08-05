@@ -53,6 +53,23 @@ type ReviewResolver interface {
 	ResolveReviewCAS(context.Context, job.ResolveReviewInput) (job.ReviewResolution, error)
 }
 
+// resolveState distinguishes "nothing has been attempted yet, or the last
+// attempt failed" from "a resolution is genuinely running right now" from "a
+// resolution has actually committed". A single resolving bool used to
+// collapse the first and third cases into "not resolving", so a concurrent
+// second submitter was told the review had been recorded the instant the
+// first request returned from the lock — before ResolveReviewCAS had even
+// finished. If that call then failed, nothing was ever recorded, yet the
+// second requester had already been shown the recorded shell with its
+// buttons disabled and no way to retry.
+type resolveState int
+
+const (
+	resolveIdle resolveState = iota
+	resolvePending
+	resolveRecorded
+)
+
 type capability struct {
 	actionID         int64
 	path             string
@@ -62,8 +79,7 @@ type capability struct {
 	citation         Citation
 	expires          time.Time
 	verified         bool
-	resolving        bool
-	recorded         bool
+	resolve          resolveState
 }
 
 // Server owns the loopback-only HTTP server and its in-memory capabilities.
@@ -254,7 +270,7 @@ func (s *Server) serveShell(w http.ResponseWriter, r *http.Request, token string
 		FilePath:   "/p/" + token + "/file",
 		ScriptPath: "/p/" + token + "/script.js",
 		StylePath:  "/p/" + token + "/style.css",
-		Recorded:   entry.recorded,
+		Recorded:   entry.resolve == resolveRecorded,
 	}
 	s.mu.Unlock()
 	writeShell(w, r, http.StatusOK, data)
@@ -308,10 +324,22 @@ func (s *Server) serveVerdict(w http.ResponseWriter, r *http.Request, token stri
 		writeNotFound(w)
 		return
 	}
-	if entry.recorded || entry.resolving {
+	switch entry.resolve {
+	case resolveRecorded:
 		data := recordedShellData(token)
 		s.mu.Unlock()
 		writeShell(w, r, http.StatusConflict, data)
+		return
+	case resolvePending:
+		// The first submission is still inside ResolveReviewCAS. Reporting
+		// "recorded" here would be a lie if that call goes on to fail (see
+		// below) — nothing would have been recorded at all, yet this
+		// requester would already be shown the recorded shell with its
+		// buttons disabled and no way to retry. Say so plainly instead: a
+		// plain-text body (not the recorded shell's text/html) is what tells
+		// the client script to leave the buttons usable.
+		s.mu.Unlock()
+		writePlainError(w, http.StatusConflict, "review is still being recorded, try again in a moment\n")
 		return
 	}
 	if request.Verdict == "accept" && !entry.verified {
@@ -325,7 +353,7 @@ func (s *Server) serveVerdict(w http.ResponseWriter, r *http.Request, token stri
 		writePlainError(w, http.StatusServiceUnavailable, "review resolution is unavailable\n")
 		return
 	}
-	entry.resolving = true
+	entry.resolve = resolvePending
 	input := job.ResolveReviewInput{
 		ActionID: entry.actionID, Verdict: request.Verdict,
 		ExpectedRevision: entry.expectedRevision, ExpectedSHA256: entry.sha256,
@@ -335,11 +363,16 @@ func (s *Server) serveVerdict(w http.ResponseWriter, r *http.Request, token stri
 	resolution, err := resolver.ResolveReviewCAS(r.Context(), input)
 
 	s.mu.Lock()
-	entry.resolving = false
 	if err == nil {
 		// Applied, already-applied, and conflict are all terminal for this
 		// capability. Never let a stale page submit a different verdict.
-		entry.recorded = true
+		entry.resolve = resolveRecorded
+	} else {
+		// The CAS call itself failed — nothing was recorded. Returning to
+		// idle (not leaving it pending) is what lets a genuine retry be
+		// accepted instead of wedging the capability as though a resolution
+		// were permanently in flight.
+		entry.resolve = resolveIdle
 	}
 	s.mu.Unlock()
 	if err != nil {
@@ -672,12 +705,23 @@ const previewScript = `(() => {
         }, 1200);
         return;
       }
+      // A non-OK response only means the review actually landed when the
+      // server serves the recorded shell (text/html) — that is the one
+      // response neither the "still resolving" 409 nor a resolver error can
+      // ever produce, since neither has committed anything. Keying off the
+      // status code alone used to treat every 409 as terminal, so a retry
+      // arriving while the first request was still in flight — or arriving
+      // after ResolveReviewCAS failed — left the buttons disabled forever
+      // with no way to try again, even though nothing had been recorded.
+      const recorded = response.headers.get('Content-Type')?.startsWith('text/html') ?? false;
       const message = await responseMessage(response);
       button.textContent = originalLabel;
-      showMessage(message, response.status === 409 ? 'You can close this tab.' : '', response.status === 409);
+      showMessage(message, recorded ? 'You can close this tab.' : '', recorded);
+      if (!recorded) setDisabled(false);
     } catch (_) {
       button.textContent = originalLabel;
       showMessage('Could not record the verdict.', '', false);
+      setDisabled(false);
     }
   }));
 })();

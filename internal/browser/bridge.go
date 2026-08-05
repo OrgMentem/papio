@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -128,6 +129,12 @@ type CaptureResult struct {
 type pendingPageCapture struct {
 	payload   protocol.PageCaptureRequestPayload
 	sessionID string
+	// host is the lowercased hostname parsed from payload.URL at request
+	// time. The page_capture content frame carries only a bare hostname
+	// (protocol.PageCapturePayload.Host), never the full URL or a request
+	// id, so this is the most precise correlation available without a wire
+	// change — see the match in pageCapture() below.
+	host      string
 	delivered bool
 	path      string
 	result    chan CaptureResult
@@ -564,6 +571,14 @@ func (b *Bridge) Capture(ctx context.Context, request CaptureRequest) CaptureRes
 		return CaptureResult{Outcome: "busy", Detail: "a page capture is already outstanding for this browser session"}
 	}
 	requestID := newMsgID()
+	// The content frame that eventually delivers this capture's bytes
+	// (page_capture) carries no request id, so the host of the requested
+	// URL is recorded here and re-checked in pageCapture() as the tightest
+	// available correlation guard.
+	host := ""
+	if parsed, err := url.Parse(request.URL); err == nil {
+		host = strings.ToLower(parsed.Hostname())
+	}
 	pending := &pendingPageCapture{
 		payload: protocol.PageCaptureRequestPayload{
 			RequestID: requestID,
@@ -573,6 +588,7 @@ func (b *Bridge) Capture(ctx context.Context, request CaptureRequest) CaptureRes
 			SettleMS:  request.SettleMS,
 		},
 		sessionID: sessionID,
+		host:      host,
 		result:    make(chan CaptureResult, 1),
 	}
 	b.pendingCaptures[sessionID] = pending
@@ -820,9 +836,24 @@ func (b *Bridge) pageCapture(ctx context.Context, sessionID, jobID string, paylo
 		log.Printf("papio: storing page capture from %s: %v", payload.Host, err)
 		return
 	}
+	// Correlation is deliberately narrower than "belongs to this session":
+	// page_capture carries no request id and no full URL (only a bare
+	// hostname), so it cannot be tied to one specific page_capture_request
+	// the way page_capture_request_result is (matched by RequestID).
+	// Requiring session + provider + scenario + host shrinks, but does not
+	// close, the window in which an UNSOLICITED capture (the developer
+	// capture panel's captureFixture, which answers no pending request at
+	// all) can satisfy a CLI-initiated `papio adapter capture` that happens
+	// to be waiting on the same session for the same provider/scenario/host.
+	// Closing that fully needs a negotiated request_id field threaded
+	// through page_capture — a breaking change to an EXISTING message type
+	// that requires capability negotiation (like page_capture_terms_v1) to
+	// stay safe for older extensions, and is deliberately deferred rather
+	// than added here.
 	if pending := b.pendingCaptures[sessionID]; pending != nil &&
 		pending.payload.Provider == payload.AdapterID &&
-		pending.payload.Scenario == payload.Scenario {
+		pending.payload.Scenario == payload.Scenario &&
+		pending.host == strings.ToLower(payload.Host) {
 		pending.path = path
 	}
 	if jobID == "" || b.jobs == nil {

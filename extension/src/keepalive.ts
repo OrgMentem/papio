@@ -519,6 +519,15 @@ export class KeepaliveManager {
   private checking = false;
   private likelyAuthenticated = false;
   private probePromise: Promise<void> | undefined;
+  /** Shared in-flight promise for createTabOnce(). sync() now runs from
+   * every triage-counts response as well as the onObserve/onReload timers,
+   * so reconcile/onObserve/onReload can each independently see
+   * this.tabID === undefined and race into createTab() across its awaited
+   * tabs.query()/tabs.create() calls. Without this, two interleaved callers
+   * both query, both find nothing, and both create — the second assignment
+   * to this.tabID orphans the first tab, and the tab governor deliberately
+   * skips pinned tabs, so the orphan is never reconciled or closed. */
+  private tabCreationInFlight: Promise<void> | undefined;
 
   private originCandidates(): string[] {
     const candidates: unknown[] = [];
@@ -1101,6 +1110,18 @@ export class KeepaliveManager {
   }
 
   private async createTab(): Promise<void> {
+    if (this.tabCreationInFlight !== undefined) {
+      await this.tabCreationInFlight;
+      return;
+    }
+    const attempt = this.createTabOnce();
+    this.tabCreationInFlight = attempt.finally(() => {
+      this.tabCreationInFlight = undefined;
+    });
+    await this.tabCreationInFlight;
+  }
+
+  private async createTabOnce(): Promise<void> {
     if (this.resolver === undefined) return;
     try {
       const existing = await this.api.tabs.query({

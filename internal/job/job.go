@@ -1688,6 +1688,33 @@ func (js *Store) listOldestAfter(ctx context.Context, states []string, limit int
 	return out, nil
 }
 
+// validBrowserRoutes and validSessionEvidences mirror the CHECK constraints
+// migration 0019 added to candidates.browser_route/session_evidence.
+var (
+	validBrowserRoutes    = map[string]bool{"resolver": true, "direct": true, "oa": true}
+	validSessionEvidences = map[string]bool{"fresh_auth": true, "warm": true, "none": true}
+)
+
+// validateCandidateEnums fails closed on an out-of-enum browser_route or
+// session_evidence before the row reaches SQLite. InsertCandidates uses
+// INSERT OR IGNORE so its (job_id, url_key) dedupe can skip a row without
+// erroring — but SQLite treats a CHECK violation exactly the same way under
+// OR IGNORE, silently dropping the candidate instead of failing the insert.
+// No current writer sets these fields before insert (browser adoption
+// inserts with them empty and applies route/evidence afterward via
+// ApplyBrowserDeliveryContextToCandidate), so this is currently unreachable
+// in practice, but a future writer that does set them must not lose a
+// candidate without a trace.
+func validateCandidateEnums(c Candidate) error {
+	if c.BrowserRoute != "" && !validBrowserRoutes[c.BrowserRoute] {
+		return fmt.Errorf("candidate %s: invalid browser_route %q", c.URLKey, c.BrowserRoute)
+	}
+	if c.SessionEvidence != "" && !validSessionEvidences[c.SessionEvidence] {
+		return fmt.Errorf("candidate %s: invalid session_evidence %q", c.URLKey, c.SessionEvidence)
+	}
+	return nil
+}
+
 // InsertCandidates stores ranked candidates (redacted URLs only), deduplicated
 // per job by url_key. Returns the number inserted.
 func (js *Store) InsertCandidates(ctx context.Context, jobID string, cands []Candidate) (int, error) {
@@ -1699,6 +1726,9 @@ func (js *Store) InsertCandidates(ctx context.Context, jobID string, cands []Can
 	now := store.Now()
 	inserted := 0
 	for _, c := range cands {
+		if err := validateCandidateEnums(c); err != nil {
+			return 0, err
+		}
 		res, err := tx.ExecContext(ctx, `
 			INSERT OR IGNORE INTO candidates
 			  (job_id, source, url_redacted, url_key, landing_redacted, browser_route, session_evidence, version, access_basis, reuse_license,

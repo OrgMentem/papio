@@ -242,6 +242,127 @@ test("creates one pinned resolver tab, reloads it, and closes it when jobs finis
 
   expect(h.tabs.removed).toEqual([1]);
 });
+
+/** Drains the microtask queue without a real timer or macrotask: nothing
+ * else in these tests is pending, so repeated `await Promise.resolve()`
+ * ticks are sufficient to run every chain forward to whatever deferred
+ * promise it is actually blocked on. Extra rounds beyond what a chain
+ * needs are harmless no-ops — they can never unblock a promise this file
+ * hasn't resolved yet. */
+async function flushMicrotasks(rounds = 25): Promise<void> {
+  for (let i = 0; i < rounds; i++) await Promise.resolve();
+}
+
+test("papio-8f79b6ba67bdbdaa: concurrent creation attempts across sync() calls produce exactly one tab", async () => {
+  // sync() is now invoked from every successful triage-counts response, in
+  // addition to the existing timer-driven onReload/onObserve callbacks, so
+  // two callers can both observe this.tabID === undefined and race into
+  // createTab() across its awaited tabs.query()/tabs.create() calls. A.query
+  // -> B.query -> A.create -> B.create used to leave two live tabs with the
+  // later assignment overwriting this.tabID — orphaning the first, pinned
+  // tab forever, since the tab governor deliberately skips pinned tabs.
+  const h = makeHarness();
+  let queryCalls = 0;
+  let createCalls = 0;
+  const query = Promise.withResolvers<KeepaliveTab[]>();
+  const create = Promise.withResolvers<KeepaliveTab>();
+  h.tabs.query = async (_query: {
+    pinned?: boolean;
+    muted?: boolean;
+    url?: string[];
+    active?: boolean;
+    lastFocusedWindow?: boolean;
+  }): Promise<KeepaliveTab[]> => {
+    queryCalls += 1;
+    return query.promise;
+  };
+  h.tabs.create = async (properties: {
+    url: string;
+    active: boolean;
+    pinned: boolean;
+    muted: boolean;
+    windowId?: number;
+  }): Promise<KeepaliveTab> => {
+    createCalls += 1;
+    h.tabs.created.push(properties);
+    return create.promise;
+  };
+
+  // One caller mirrors the timer-driven start; the other mirrors an inbound
+  // triage-counts frame arriving mid-cycle. Neither is awaited individually
+  // so both chains are free to interleave.
+  const first = h.manager.init();
+  const second = h.manager.sync();
+  await flushMicrotasks();
+
+  // Both chains have run forward to whatever they are blocked on. Only the
+  // FIRST to reach createTab() ever calls tabs.query(); the second sees the
+  // shared in-flight promise and never repeats the query or the create.
+  expect(queryCalls).toBe(1);
+  expect(createCalls).toBe(0);
+
+  query.resolve([]);
+  await flushMicrotasks();
+  expect(createCalls).toBe(1);
+
+  create.resolve({ id: 1, url: "https://resolver.example.edu" });
+  await first;
+  await second;
+
+  expect(queryCalls).toBe(1);
+  expect(createCalls).toBe(1);
+  expect(h.tabs.created).toEqual([
+    { url: "https://resolver.example.edu", active: false, pinned: true, muted: true },
+  ]);
+
+  // The single created tab is the one the manager actually owns: it is
+  // reloaded (not recreated) on the next cycle and removed once demand ends.
+  h.jobs.count = 0;
+  await h.manager.sync();
+  expect(h.tabs.removed).toEqual([1]);
+});
+
+test("papio-8f79b6ba67bdbdaa: a failed tab creation does not wedge later creation attempts", async () => {
+  const h = makeHarness();
+  let createAttempts = 0;
+  const realCreate = h.tabs.create.bind(h.tabs);
+  h.tabs.create = async (properties: {
+    url: string;
+    active: boolean;
+    pinned: boolean;
+    muted: boolean;
+    windowId?: number;
+  }): Promise<KeepaliveTab> => {
+    createAttempts += 1;
+    // Simulate browser policy rejecting the very first background-tab
+    // creation (the failure mode createTabOnce's own catch comment names).
+    if (createAttempts === 1) throw new Error("background tab creation blocked by browser policy");
+    return realCreate(properties);
+  };
+
+  await h.manager.init();
+  // createTabOnce() swallows the rejection, so no tab exists yet — but the
+  // shared in-flight promise from that failed cycle MUST have been cleared
+  // by createTab()'s `.finally()`. If it were only cleared on success, this
+  // stale never-resolving-to-a-tab promise would wedge every later caller
+  // that checks this.tabID === undefined, permanently starving the
+  // resolver of a keepalive tab.
+  expect(h.tabs.created.length).toBe(0);
+  expect(createAttempts).toBe(1);
+
+  // reconcile() schedules onReload after createTab() regardless of outcome;
+  // running it retries creation on a manager that must not be wedged.
+  await h.timers.runNext();
+
+  expect(createAttempts).toBe(2);
+  expect(h.tabs.created).toEqual([
+    { url: "https://resolver.example.edu", active: false, pinned: true, muted: true },
+  ]);
+
+  h.jobs.count = 0;
+  await h.manager.sync();
+  expect(h.tabs.removed).toEqual([1]);
+});
 test("daemon warm demand keeps the resolver tab and closes after demand expires", async () => {
   let demand = true;
   const h = makeHarness(4, undefined, undefined, () => demand);

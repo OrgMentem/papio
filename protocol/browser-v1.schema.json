@@ -538,7 +538,7 @@
             "required": ["evidence", "at"],
             "properties": {
               "evidence": { "enum": ["warm_verified", "auth_returned"] },
-              "origin_hint": { "type": "string", "maxLength": 300, "pattern": "^https://[a-z0-9.-]{3,253}(:[0-9]{1,5})?$" },
+              "origin_hint": { "type": "string", "maxLength": 300, "pattern": "^https://[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+(:[0-9]{1,5})?$", "description": "A bare https origin with a lowercase, multi-label host: charset/case/label-count match internal/protocol/protocol.go's validateResolverOriginHint and extension/src/protocol.ts's ORIGIN_HOST_RE exactly. Case is rejected, not normalized (e.g. https://EXAMPLE.com is invalid), and a single-label host (e.g. https://a) is invalid even though it is a legal browser origin, because no configured resolver origin is ever bare-hostname-only." },
               "at": { "type": "string", "format": "date-time" }
             }
           }
@@ -589,7 +589,7 @@
             "properties": {
               "download_id": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
               "route": { "enum": ["resolver", "direct", "oa"] },
-              "page_host": { "type": "string", "maxLength": 128, "pattern": "^[a-z0-9.-]{3,128}$" },
+              "page_host": { "type": "string", "maxLength": 128, "pattern": "^[a-z0-9.-]{3,128}$", "not": { "pattern": "(^\\.)|(\\.$)|(\\.\\.)" }, "description": "A bounded lowercase hostname that must not start or end with '.' and must not contain '..' — the 'not' clause encodes the same three rejections internal/protocol/protocol.go's DeliveryContextPayload.validate and extension/src/protocol.ts perform explicitly alongside this pattern." },
               "session_evidence": { "enum": ["fresh_auth", "warm", "none"] }
             },
             "allOf": [

@@ -24,6 +24,49 @@ execution records in `notes/acquisition-stack-plan.md`.
 
 ### Fixed
 
+- **A concurrent review submission is no longer told the verdict was recorded
+  before it was.** A second POST arriving while the first was still inside
+  `ResolveReviewCAS` was answered with the recorded shell — buttons disabled,
+  no retry path — even though nothing had committed yet. If that first
+  resolution then failed, the review was silently lost. The handler now tracks
+  a real pending/recorded state, answers a genuinely in-flight submission with
+  retry guidance, and returns a failed resolution to a retryable state. The
+  page decides whether to re-enable its buttons from the response content type
+  rather than the status code, which had conflated the two conflicts, and it
+  now also re-enables them when the request fails outright.
+- **The failure-summary example job is chosen chronologically.** The most
+  recently updated job in a group was selected by comparing RFC3339 timestamps
+  byte-wise, and `store.Now()` omits the fractional part entirely when the
+  nanoseconds are zero. Since `Z` sorts above `.`, a whole-second timestamp beat
+  a genuinely later fractional one. Timestamps are parsed before comparison.
+- **An out-of-enum candidate value errors instead of vanishing.** Migration
+  0019 added CHECK constraints on `browser_route` and `session_evidence`, but
+  `InsertCandidates` uses `INSERT OR IGNORE`, and SQLite treats a CHECK
+  violation under OR IGNORE as "skip this row" — so a bad value would have
+  dropped the candidate silently while the dedupe the clause exists for went on
+  working. The enums are validated in Go before the insert. No writer sets
+  either field today, so this closes a latent footgun rather than a live bug.
+- **`page_host` and `origin_hint` validate identically in all three places.**
+  The published schema accepted `page_host` values both parsers rejected
+  (leading, trailing and doubled dots), and `origin_hint` disagreed three ways
+  at once: Go accepted an uppercase host that the TypeScript URL round-trip
+  rejected, while the schema alone rejected a single-label host both parsers
+  allowed. One rule now applies everywhere — an https origin with a lowercase,
+  RFC-1035-shaped, multi-label host — with corpus fixtures pinning each
+  previously divergent value.
+- **`papio adapter capture` reports a daemon upgrade instead of a raw RPC
+  error.** Against an older daemon it surfaced the bare `unknown_method`
+  failure rather than the actionable message every other versioned command
+  renders. With two papio binaries on one machine documented as routine, that
+  skew is an ordinary outcome.
+- **A page capture can no longer be satisfied by an unrelated capture of a
+  different host.** The pending-request match now includes the requested host
+  alongside session, provider and scenario. A residual remains and is
+  deliberately deferred: nothing on the wire distinguishes a solicited capture
+  from one the operator triggers from the developer panel, so a same-host,
+  same-provider, same-scenario capture can still bind. Closing that needs a
+  negotiated `request_id` on `page_capture`, which is an existing message type
+  and therefore cannot take a new field without capability negotiation.
 - **A rate-limit gate set mid-flight can no longer be raced.** `budget.Acquire`
   checked the durable gate up front, then called `takeToken`, which may itself
   sleep for up to `MaxInlineWait` waiting on the in-memory bucket. `reserve`'s

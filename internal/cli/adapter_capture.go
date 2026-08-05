@@ -32,6 +32,14 @@ func newAdapterCaptureCommand(opt *options) *cobra.Command {
 			}
 			var result api.AdapterCaptureResult
 			if err := opt.call(cmd.Context(), "adapter.capture_v1", params, &result); err != nil {
+				// Two papio binaries on one machine is documented as routine, so
+				// a new CLI meeting an older daemon is an ordinary outcome, not
+				// an exotic one. Every other versioned command renders the
+				// actionable upgrade message here rather than a raw JSON-RPC
+				// error.
+				if isUnknownMethod(err) {
+					return daemonUpgradeRequired("adapter.capture_v1")
+				}
 				return err
 			}
 			if opt.jsonOutput {

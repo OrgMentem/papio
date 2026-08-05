@@ -252,6 +252,63 @@ func TestCandidatesDedupeAndOrder(t *testing.T) {
 	}
 }
 
+func TestInsertCandidatesRejectsInvalidBrowserEnum(t *testing.T) {
+	js := testStore(t)
+	ctx := context.Background()
+	id, _ := js.CreateRequest(ctx, "wr_test_enum", testWork(), "", "", testPolicy(), nil, PrincipalUnknown)
+
+	countCandidates := func() int {
+		t.Helper()
+		var n int
+		if err := js.S.DB().QueryRowContext(ctx, `SELECT count(*) FROM candidates WHERE job_id = ?`, id).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+
+	// InsertCandidates uses INSERT OR IGNORE so its (job_id, url_key) dedupe
+	// can skip a row without erroring; SQLite treats a browser_route CHECK
+	// violation (migration 0019) the exact same way and would otherwise
+	// silently drop the candidate instead of failing the insert.
+	if _, err := js.InsertCandidates(ctx, id, []Candidate{
+		{JobID: id, Source: "browser", URLRedacted: "https://x/1", URLKey: "bad-route",
+			BrowserRoute: "not-a-real-route", Version: "published", AccessBasis: "manual", ReuseLicense: "unknown"},
+	}); err == nil {
+		t.Fatal("insert with invalid browser_route: want error, got nil")
+	}
+	if n := countCandidates(); n != 0 {
+		t.Fatalf("invalid browser_route candidate count = %d, want 0 (nothing persisted)", n)
+	}
+
+	if _, err := js.InsertCandidates(ctx, id, []Candidate{
+		{JobID: id, Source: "browser", URLRedacted: "https://x/2", URLKey: "bad-evidence",
+			SessionEvidence: "not-a-real-evidence", Version: "published", AccessBasis: "manual", ReuseLicense: "unknown"},
+	}); err == nil {
+		t.Fatal("insert with invalid session_evidence: want error, got nil")
+	}
+	if n := countCandidates(); n != 0 {
+		t.Fatalf("invalid session_evidence candidate count = %d, want 0 (nothing persisted)", n)
+	}
+
+	// Valid enum values, and empty (unset) values, still insert normally, and
+	// the (job_id, url_key) dedupe keyed off url_key still holds.
+	cands := []Candidate{
+		{JobID: id, Source: "browser", URLRedacted: "https://x/3", URLKey: "good-route",
+			BrowserRoute: "resolver", SessionEvidence: "warm", Version: "published", AccessBasis: "institutional", ReuseLicense: "unknown"},
+		{JobID: id, Source: "unpaywall", URLRedacted: "https://x/4", URLKey: "no-route",
+			Version: "published", AccessBasis: "open_access", ReuseLicense: "unknown"},
+		{JobID: id, Source: "unpaywall", URLRedacted: "https://x/4", URLKey: "no-route",
+			Version: "published", AccessBasis: "open_access", ReuseLicense: "unknown"}, // dup url_key
+	}
+	n, err := js.InsertCandidates(ctx, id, cands)
+	if err != nil || n != 2 {
+		t.Fatalf("inserted %d, %v; want 2 (dedupe by url_key)", n, err)
+	}
+	if got := countCandidates(); got != 2 {
+		t.Fatalf("candidate count = %d, want 2", got)
+	}
+}
+
 func TestArtifactCacheByDOI(t *testing.T) {
 	js := testStore(t)
 	ctx := context.Background()

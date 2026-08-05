@@ -18,6 +18,15 @@ for the full pre-split extension history.
 
 ### Fixed
 
+- **Concurrent keepalive reconciliation creates one resolver tab, not two.**
+  `reconcile`, `onObserve`, `onReload` and `openReauth` each tested whether a
+  tab existed and then awaited creation, with nothing held across the await.
+  Creation itself awaits a query before a create, so two callers could both
+  find no tab and both make one; the later assignment orphaned the first. The
+  tab governor deliberately skips pinned tabs, so that orphan was never
+  reconciled and could hold a work window open indefinitely. Concurrent
+  callers now share one in-flight creation, cleared on failure as well as
+  success so a single rejected create cannot wedge the manager.
 - **A handoff that times out mid-login keeps its page.** The three-minute
   drive timeout unconditionally closed the tab before parking the job, which
   contradicts `parkHandoffForManual`'s own contract — "leaves the exact page

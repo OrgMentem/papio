@@ -354,6 +354,87 @@ func TestPageCaptureRequestDeliveredCorrelatedStoredAndBusy(t *testing.T) {
 		t.Fatal("capture result did not correlate")
 	}
 }
+
+// TestUnsolicitedPageCaptureCannotSatisfyDifferentHostPendingRequest pins the
+// narrower hole in papio-85a7420f4cd2564f: the page_capture content frame
+// carries no request id and no full URL — only a bare hostname — so it
+// cannot be correlated to one specific page_capture_request the way
+// page_capture_request_result is (matched by RequestID). Requiring the
+// pending request's URL host to also match closes the case where an
+// unsolicited capture (the developer capture panel's captureFixture, which
+// answers no pending request at all) shares a session, provider, and
+// scenario with a CLI-initiated `papio adapter capture` but targets a
+// different host: it must not be able to complete that CLI request.
+// (An unsolicited capture on the SAME host remains a residual gap,
+// documented at the match site in bridge.go's pageCapture — closing that
+// needs a negotiated request_id field on page_capture.)
+func TestUnsolicitedPageCaptureCannotSatisfyDifferentHostPendingRequest(t *testing.T) {
+	b, _, _, _ := newBridge(t)
+	runSync(t, b, hello())
+
+	resultCh := make(chan CaptureResult, 1)
+	go func() {
+		resultCh <- b.Capture(context.Background(), CaptureRequest{
+			URL: "https://sagepub.com/article/42", Provider: "sage", Scenario: "success",
+		})
+	}()
+	deadline := time.Now().Add(time.Second)
+	for {
+		b.mu.Lock()
+		queued := len(b.pendingCaptures) == 1
+		b.mu.Unlock()
+		if queued {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("capture request was not queued")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	msgs, _ := runSync(t, b)
+	directive := firstOfType(msgs, protocol.MsgPageCaptureRequest)
+	if directive == nil {
+		t.Fatal("sync did not deliver page_capture_request")
+	}
+	request := directive.Payload.(*protocol.PageCaptureRequestPayload)
+
+	// An unsolicited capture for the same provider and scenario, but a
+	// different host, arrives on the same session — e.g. the operator runs
+	// the developer capture panel against a different article while the
+	// CLI's sagepub.com capture is still outstanding.
+	unsolicited := pageCapturePayload(t, []byte("<html>operator ad hoc capture</html>"))
+	unsolicited.Host = "elsevier.com"
+	unsolicited.Scenario = "success"
+	unsolicited.AdapterID = "sage"
+	runSync(t, b, inFrame(t, protocol.MsgPageCapture, "", unsolicited))
+
+	// Storage is unconditional — the unsolicited capture is still kept —
+	// but it must not have bound to the pending request.
+	listed, err := b.captureStore.List(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listed) != 1 {
+		t.Fatalf("stored captures = %#v, want exactly the unsolicited one", listed)
+	}
+
+	// The extension's correlated result frame arrives claiming success, but
+	// since no matching page_capture ever set pending.path, the bridge must
+	// report failure rather than hand the CLI caller the operator's file.
+	runSync(t, b, inFrame(t, protocol.MsgPageCaptureRequestResult, "", protocol.PageCaptureRequestResultPayload{
+		RequestID: request.RequestID, Outcome: "captured",
+	}))
+
+	select {
+	case result := <-resultCh:
+		if result.Outcome != "nav_failed" || result.Path != "" {
+			t.Fatalf("capture result = %#v, want nav_failed with no path (unsolicited capture must not satisfy the pending request)", result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("capture result did not correlate")
+	}
+}
 func TestJobScopedPageCaptureRecordsEvent(t *testing.T) {
 	b, jobs, _, _ := newBridge(t)
 	ctx := context.Background()

@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+	"time"
 )
 
 // FailureSummary is one operator-facing aggregate of terminal or parked jobs.
@@ -71,13 +72,23 @@ func (s *Store) FailureSummaries(ctx context.Context, limit int, byProvider bool
 
 	type aggregate struct {
 		FailureSummary
-		exampleUpdatedAt string
+		exampleUpdatedAt time.Time
 	}
 	groups := make(map[string]*aggregate)
 	for rows.Next() {
-		var jobID, updatedAt, terminalReason, source, candidateURL, eventKind, detailJSON string
-		if err := rows.Scan(&jobID, &updatedAt, &terminalReason, &source, &candidateURL, &eventKind, &detailJSON); err != nil {
+		var jobID, updatedAtText, terminalReason, source, candidateURL, eventKind, detailJSON string
+		if err := rows.Scan(&jobID, &updatedAtText, &terminalReason, &source, &candidateURL, &eventKind, &detailJSON); err != nil {
 			return nil, false, err
+		}
+		// store.Now() formats with time.RFC3339Nano, which omits the fractional
+		// part entirely when nanoseconds are zero (…T00:00:01Z vs
+		// …T00:00:01.5Z). Byte-wise string comparison sorts 'Z' (0x5A) above
+		// '.' (0x2E), so a fraction-less timestamp would beat a genuinely later
+		// one with a fractional part — parse both sides so "most recent" is
+		// chronological, not lexical.
+		updatedAt, err := time.Parse(time.RFC3339Nano, updatedAtText)
+		if err != nil {
+			return nil, false, fmt.Errorf("parsing job %s updated_at: %w", jobID, err)
 		}
 		reason, err := decisiveFailureReason(eventKind, detailJSON)
 		if err != nil {
@@ -113,7 +124,7 @@ func (s *Store) FailureSummaries(ctx context.Context, limit int, byProvider bool
 		} else if group.Provider != provider {
 			group.Provider = "multiple"
 		}
-		if updatedAt > group.exampleUpdatedAt || (updatedAt == group.exampleUpdatedAt && jobID > group.ExampleJobID) {
+		if updatedAt.After(group.exampleUpdatedAt) || (updatedAt.Equal(group.exampleUpdatedAt) && jobID > group.ExampleJobID) {
 			group.ExampleJobID = jobID
 			group.exampleUpdatedAt = updatedAt
 		}

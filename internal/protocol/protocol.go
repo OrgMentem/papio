@@ -60,10 +60,18 @@ var (
 	sha256RE         = regexp.MustCompile(`^[a-f0-9]{64}$`)
 	provenanceRE     = regexp.MustCompile(`^sha256:[a-f0-9]{64}$`)
 	hostRE           = regexp.MustCompile(`^[a-z0-9.-]{3,253}$`)
-	errorCodeRE      = regexp.MustCompile(`^[a-z0-9_]{2,50}$`)
-	filenameRE       = regexp.MustCompile(`^[^/\\]{1,255}$`)
-	base64RE         = regexp.MustCompile(`^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$`)
-	rfc3339RE        = regexp.MustCompile(`^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$`)
+	// originHostRE is the resolver-origin host grammar used ONLY by
+	// validateResolverOriginHint: lowercase RFC 1035 labels (alnum first/last
+	// character, hyphens interior only, 1-63 chars per label) joined by single
+	// dots, with at least two labels. It must stay byte-identical to
+	// ORIGIN_HOST_RE in extension/src/protocol.ts and the host portion of
+	// session_evidence.origin_hint's pattern in
+	// protocol/browser-v1.schema.json — see validateResolverOriginHint for why.
+	originHostRE = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$`)
+	errorCodeRE  = regexp.MustCompile(`^[a-z0-9_]{2,50}$`)
+	filenameRE   = regexp.MustCompile(`^[^/\\]{1,255}$`)
+	base64RE     = regexp.MustCompile(`^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$`)
+	rfc3339RE    = regexp.MustCompile(`^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$`)
 )
 
 // strictDecode unmarshals data into v, rejecting unknown fields and trailing input.
@@ -581,6 +589,77 @@ func validateBareRoute(route string) error {
 	}
 	if u.Path != "" || u.RawPath != "" || u.Opaque != "" {
 		return fmt.Errorf("candidate.entitlement.route %q must be a bare origin with no path", route)
+	}
+	return nil
+}
+
+// validateResolverOriginHint enforces session_evidence.origin_hint's exact
+// wire rule: an https origin with a lowercase, multi-label, structurally
+// valid host and nothing else — no path, query, fragment, userinfo, or
+// mixed-case host. This function exists because three independent
+// implementations of "bare resolver origin" (this package, parseBrowserMessage
+// in extension/src/protocol.ts, and the published JSON Schema) previously
+// disagreed on all three axes at once:
+//   - Go, via validateBareRoute, accepted "https://EXAMPLE.com" because
+//     net/url's Hostname() preserves case and nothing downstream compared it
+//     against anything case-sensitive.
+//   - The TypeScript parser rejected the same value, but only as a side
+//     effect: the WHATWG URL parser lowercases the host of a special scheme
+//     internally, so `${parsed.protocol}//${parsed.host}` no longer equals
+//     the raw uppercase input and the round-trip equality check fails. That
+//     is an accident of implementation, not a stated rule — nothing prevents
+//     a future refactor away from the round-trip trick from losing it.
+//   - The schema separately demanded a 3..253-char lowercase
+//     `[a-z0-9.-]` host, which both parsers ignored, so "https://a" (a
+//     single-label host — legal for a browser origin, e.g. a LAN/mDNS name,
+//     but never a real institutional resolver origin: every configured
+//     browser.resolvers.* origin observed in practice is at least
+//     "host.tld") was ACCEPTED by both parsers and REJECTED by the schema.
+//
+// The rule settled on: reject rather than normalize case, even though
+// ResolverProfileForOrigin (internal/config/config.go) already lowercases
+// and does a case-insensitive Hostname comparison, so case alone cannot
+// currently misroute a match. That downstream leniency is not a reason to
+// leave the wire format ambiguous: the actual bug this closes is that the
+// three implementations disagreed about whether "https://EXAMPLE.com"
+// decodes AT ALL, which is a fail-closed-contract violation independent of
+// what any one consumer happens to tolerate afterward. Normalizing case
+// here instead of rejecting it would trade that decode-layer bug for a
+// silent one: a caller reading the decoded OriginHint back (logs, a future
+// consumer added without ResolverProfileForOrigin's EqualFold) would see a
+// value that never appeared on the wire. Rejecting keeps the decoded value
+// always equal to the wire value, which is the invariant every other
+// browser-v1 string field relies on. The host must additionally have at
+// least two labels, since a resolver is never bare-hostname-only;
+// originHostRE's grammar (RFC 1035 labels joined by single dots) also
+// forecloses a leading/trailing dot and a ".." run for free, because every
+// dot in that grammar sits between two non-empty labels — no separate pass
+// needed, unlike delivery_context.page_host next to this function's caller.
+func validateResolverOriginHint(hint string) error {
+	if hint == "" {
+		return fmt.Errorf("session_evidence.origin_hint required")
+	}
+	if strings.ContainsAny(hint, "?#") {
+		return fmt.Errorf("session_evidence.origin_hint %q must not retain URL query or fragment data", hint)
+	}
+	if !strings.HasPrefix(hint, "https://") {
+		return fmt.Errorf("session_evidence.origin_hint %q must be an https URL with a host", hint)
+	}
+	u, err := url.Parse(hint)
+	if err != nil {
+		return fmt.Errorf("invalid session_evidence.origin_hint %q", hint)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("session_evidence.origin_hint %q must be an https URL with a host", hint)
+	}
+	if u.User != nil {
+		return fmt.Errorf("session_evidence.origin_hint %q must not retain URL credentials", hint)
+	}
+	if u.Path != "" || u.RawPath != "" || u.Opaque != "" {
+		return fmt.Errorf("session_evidence.origin_hint %q must be a bare origin with no path", hint)
+	}
+	if !originHostRE.MatchString(u.Hostname()) {
+		return fmt.Errorf("session_evidence.origin_hint %q must have a lowercase, multi-label resolver host", hint)
 	}
 	return nil
 }
@@ -1805,7 +1884,7 @@ func (p *SessionEvidencePayload) validate() error {
 		if utf8.RuneCountInString(p.OriginHint) > 300 {
 			return fmt.Errorf("session_evidence.origin_hint exceeds 300 chars")
 		}
-		if err := validateBareRoute(p.OriginHint); err != nil {
+		if err := validateResolverOriginHint(p.OriginHint); err != nil {
 			return fmt.Errorf("session_evidence.origin_hint: %w", err)
 		}
 	}

@@ -106,3 +106,74 @@ func TestFailureSummariesUseLatestDecisiveEventsAndSwitchGrouping(t *testing.T) 
 		t.Fatalf("limited page = %+v, truncated=%v, want top group plus truncation proof", limited, truncated)
 	}
 }
+
+func TestFailureSummariesExampleJobIDIsChronologicalNotLexical(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+
+	insertJob := func(id, state, updatedAt, source, candidateURL string) {
+		t.Helper()
+		workID := "wr_" + id
+		if _, err := db.DB().ExecContext(ctx,
+			`INSERT INTO work_requests (id, created_at, title) VALUES (?, ?, ?)`,
+			workID, "2026-08-01T00:00:00Z", id); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.DB().ExecContext(ctx,
+			`INSERT INTO jobs (id, work_request_id, state, policy_json, created_at, updated_at)
+			 VALUES (?, ?, ?, '{}', '2026-08-01T00:00:00Z', ?)`,
+			id, workID, state, updatedAt); err != nil {
+			t.Fatal(err)
+		}
+		result, err := db.DB().ExecContext(ctx,
+			`INSERT INTO candidates
+			 (job_id, source, url_redacted, url_key, version, access_basis, reuse_license, created_at)
+			 VALUES (?, ?, ?, ?, 'any', 'unknown', 'unknown', '2026-08-01T00:00:00Z')`,
+			id, source, candidateURL, "key_"+id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		candidateID, err := result.LastInsertId()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.DB().ExecContext(ctx, `UPDATE jobs SET selected_candidate_id = ? WHERE id = ?`, candidateID, id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	insertEvent := func(jobID, kind, detail string) {
+		t.Helper()
+		if _, err := db.DB().ExecContext(ctx,
+			`INSERT INTO events (job_id, at, kind, detail_json) VALUES (?, '2026-08-01T00:00:01Z', ?, ?)`,
+			jobID, kind, detail); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// job_a_early's updated_at has no fractional seconds; job_b_late's does
+	// and is genuinely the later update (01.5s beats 01s). store.Now() formats
+	// with time.RFC3339Nano, which omits the fraction entirely when it is
+	// zero, so a byte-wise comparison sorts 'Z' (0x5A) above '.' (0x2E) and
+	// would pick job_a_early's fraction-less timestamp as "more recent" even
+	// though it is chronologically earlier than job_b_late's.
+	insertJob("job_a_early", "unavailable", "2026-08-01T00:00:01Z", "jstor", "https://www.jstor.org/stable/1")
+	insertEvent("job_a_early", "job.transition", `{"reason":"no_entitlement"}`)
+
+	insertJob("job_b_late", "unavailable", "2026-08-01T00:00:01.5Z", "jstor", "https://www.jstor.org/stable/2")
+	insertEvent("job_b_late", "job.transition", `{"reason":"no_entitlement"}`)
+
+	byReason, _, err := db.FailureSummaries(ctx, 20, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(byReason) != 1 {
+		t.Fatalf("summaries = %+v, want one group", byReason)
+	}
+	if got := byReason[0].ExampleJobID; got != "job_b_late" {
+		t.Fatalf("example job id = %q, want job_b_late (chronologically latest, not lexically greatest)", got)
+	}
+}

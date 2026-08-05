@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -25,17 +26,35 @@ type recordingResolver struct {
 	calls   []job.ResolveReviewInput
 	outcome job.ReviewOutcome
 	err     error
+
+	// entered, when non-nil, receives once ResolveReviewCAS starts running —
+	// letting a test block until a concurrent submit is genuinely in flight
+	// instead of racing it with a sleep. release, when non-nil, is read from
+	// before returning, letting a test hold that call open on purpose to
+	// exercise the window where a second submit must see "still resolving",
+	// not "recorded".
+	entered chan struct{}
+	release chan struct{}
 }
 
 func (r *recordingResolver) ResolveReviewCAS(_ context.Context, input job.ResolveReviewInput) (job.ReviewResolution, error) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	r.calls = append(r.calls, input)
 	outcome := r.outcome
 	if outcome == "" {
 		outcome = job.ReviewApplied
 	}
-	return job.ReviewResolution{Outcome: outcome}, r.err
+	err := r.err
+	entered := r.entered
+	release := r.release
+	r.mu.Unlock()
+	if entered != nil {
+		entered <- struct{}{}
+	}
+	if release != nil {
+		<-release
+	}
+	return job.ReviewResolution{Outcome: outcome}, err
 }
 
 func (r *recordingResolver) inputs() []job.ResolveReviewInput {
@@ -198,6 +217,125 @@ func TestRejectVerdictUsesReviewResolutionPath(t *testing.T) {
 	calls := resolver.inputs()
 	if len(calls) != 1 || calls[0].Verdict != "reject" {
 		t.Fatalf("resolver calls = %+v", calls)
+	}
+}
+
+func TestConcurrentVerdictWhileResolvingGetsRetryableConflictNotRecorded(t *testing.T) {
+	resolver := &recordingResolver{
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	server := New(resolver)
+	t.Cleanup(func() { _ = server.Shutdown(context.Background()) })
+	pdf := []byte("%PDF-1.7\nconcurrent\n%%EOF\n")
+	path, digest := writePDF(t, pdf)
+	capabilityURL := issuePreview(t, server, path, digest, len(pdf), Citation{})
+	assertStatus(t, capabilityURL+"/file", http.StatusOK)
+
+	// Drive the first submit directly (not through the postVerdict helper,
+	// which calls t.Fatal — unsafe from a goroutine the test spawned) so it
+	// can sit blocked inside ResolveReviewCAS while the test sends a second,
+	// concurrent submit.
+	type verdictResult struct {
+		response *http.Response
+		body     string
+		err      error
+	}
+	firstDone := make(chan verdictResult, 1)
+	go func() {
+		response, err := http.Post(capabilityURL+"/verdict", "application/json", strings.NewReader(`{"verdict":"accept"}`))
+		if err != nil {
+			firstDone <- verdictResult{err: err}
+			return
+		}
+		body, err := io.ReadAll(response.Body)
+		_ = response.Body.Close()
+		firstDone <- verdictResult{response: response, body: string(body), err: err}
+	}()
+	// Any assertion below exits via runtime.Goexit, which would otherwise
+	// leave the first request parked inside ResolveReviewCAS forever and hang
+	// the Shutdown in cleanup — turning a clear failure into a timeout panic
+	// minutes later. Release the resolver on every exit path so a regression
+	// reports its real assertion immediately. sync.Once because the happy
+	// path closes the channel itself below.
+	var releaseOnce sync.Once
+	releaseResolver := func() { releaseOnce.Do(func() { close(resolver.release) }) }
+	t.Cleanup(releaseResolver)
+
+	<-resolver.entered // the first submit is now genuinely inside ResolveReviewCAS, not merely queued
+
+	second, secondBody := postVerdict(t, capabilityURL, "reject")
+	defer second.Body.Close()
+	if second.StatusCode != http.StatusConflict {
+		t.Fatalf("second response status = %d, want %d", second.StatusCode, http.StatusConflict)
+	}
+	if strings.Contains(secondBody, "Recorded — review complete") {
+		t.Fatalf("second response falsely reported the review recorded before the first resolution committed: %q", secondBody)
+	}
+	if !strings.Contains(secondBody, "try again") {
+		t.Fatalf("second response missing retry guidance: %q", secondBody)
+	}
+	// The recorded-shell response is text/html; the client script uses that,
+	// not the status code, to decide whether to leave its buttons disabled.
+	// A plain-text body here is what tells it this tab may still retry.
+	if ct := second.Header.Get("Content-Type"); strings.HasPrefix(ct, "text/html") {
+		t.Fatalf("second response Content-Type = %q, want plain text so the client script re-enables the buttons", ct)
+	}
+
+	releaseResolver() // let the first resolution actually commit
+	first := <-firstDone
+	if first.err != nil {
+		t.Fatal(first.err)
+	}
+	defer first.response.Body.Close()
+	if first.response.StatusCode != http.StatusOK || !strings.Contains(first.body, "Recorded — review complete") {
+		t.Fatalf("first response = %d %q", first.response.StatusCode, first.body)
+	}
+
+	if calls := resolver.inputs(); len(calls) != 1 {
+		t.Fatalf("resolver calls = %d, want 1 (the concurrent submit must not invoke the resolver a second time)", len(calls))
+	}
+}
+
+func TestFailedResolutionLeavesCapabilityRetryable(t *testing.T) {
+	resolver := &recordingResolver{err: errors.New("resolver unavailable")}
+	server := New(resolver)
+	t.Cleanup(func() { _ = server.Shutdown(context.Background()) })
+	pdf := []byte("%PDF-1.7\nretry\n%%EOF\n")
+	path, digest := writePDF(t, pdf)
+	capabilityURL := issuePreview(t, server, path, digest, len(pdf), Citation{})
+	assertStatus(t, capabilityURL+"/file", http.StatusOK)
+
+	failed, failedBody := postVerdict(t, capabilityURL, "accept")
+	defer failed.Body.Close()
+	if failed.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("failed response status = %d, want %d", failed.StatusCode, http.StatusServiceUnavailable)
+	}
+	if strings.Contains(failedBody, "Recorded — review complete") {
+		t.Fatalf("failed resolution falsely reported recorded: %q", failedBody)
+	}
+
+	resolver.mu.Lock()
+	resolver.err = nil
+	resolver.mu.Unlock()
+
+	// The capability must not be wedged as though a resolution were still in
+	// flight: a retry after a failed attempt has to be accepted, and it must
+	// actually reach the resolver rather than being told "still resolving".
+	retry, retryBody := postVerdict(t, capabilityURL, "accept")
+	defer retry.Body.Close()
+	if retry.StatusCode != http.StatusOK || !strings.Contains(retryBody, "Recorded — review complete") {
+		t.Fatalf("retry response = %d %q, want the resolution to actually succeed this time", retry.StatusCode, retryBody)
+	}
+
+	rendered, renderedBody := getResponse(t, capabilityURL)
+	defer rendered.Body.Close()
+	if rendered.StatusCode != http.StatusOK || !strings.Contains(renderedBody, "Recorded — review complete") {
+		t.Fatalf("rendered shell after successful retry = %d %q", rendered.StatusCode, renderedBody)
+	}
+
+	if calls := resolver.inputs(); len(calls) != 2 {
+		t.Fatalf("resolver calls = %d, want 2 (the failed attempt plus the accepted retry)", len(calls))
 	}
 }
 

@@ -6,10 +6,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"papio/internal/api"
 	"papio/internal/config"
+	"papio/internal/ipc"
 )
 
 func TestAdapterCaptureCommandForwardsStructuredRequestAndPrintsPath(t *testing.T) {
@@ -53,5 +55,30 @@ func TestAdapterCaptureCommandJSONIsStructured(t *testing.T) {
 	}
 	if result.Outcome != "busy" || result.Detail != "capture already running" || result.RequestID != "capture-request-001" {
 		t.Fatalf("result = %#v", result)
+	}
+}
+
+// Two papio binaries on one machine is documented as routine, so a new CLI
+// meeting an older daemon is an ordinary outcome. Every other versioned
+// command renders the actionable upgrade message; this one used to surface the
+// raw JSON-RPC error instead.
+func TestAdapterCaptureReportsDaemonUpgradeOnUnknownMethod(t *testing.T) {
+	var out, errOut bytes.Buffer
+	root := NewInProcessRoot(&out, &errOut, config.Config{}, func(_ context.Context, method string, _, _ any) error {
+		if method != "adapter.capture_v1" {
+			t.Fatalf("RPC method = %q, want adapter.capture_v1", method)
+		}
+		return &ipc.RemoteError{Code: "unknown_method", Message: "unknown method"}
+	})
+	root.SetArgs([]string{"adapter", "capture", "https://provider.example.edu/doi/10.1000/x", "--provider", "jstor", "--scenario", "success"})
+	err := root.ExecuteContext(context.Background())
+	if err == nil {
+		t.Fatal("adapter capture against an older daemon: want error, got nil")
+	}
+	if !strings.Contains(err.Error(), "adapter.capture_v1") {
+		t.Fatalf("error = %q, want it to name the unsupported method", err)
+	}
+	if strings.Contains(err.Error(), "unknown method") {
+		t.Fatalf("error = %q, want the upgrade guidance rather than the raw RPC error", err)
 	}
 }

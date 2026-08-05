@@ -820,3 +820,102 @@ func TestDownloadIDRejectsZero(t *testing.T) {
 		}
 	}
 }
+
+// TestPageHostSchemaAndValidatorAgree pins papio-a82ab8e6906fda25: the
+// published `^[a-z0-9.-]{3,128}$` pattern alone silently admitted ".abc",
+// "abc.", and "a..b" — shapes DeliveryContextPayload.validate already
+// rejected explicitly, so the schema documented a contract neither
+// executable parser honoured. The schema now adds a "not" clause encoding
+// the same three rejections; this test keeps that clause and the Go
+// validator in lockstep by re-deriving each side's accept/reject decision
+// independently and comparing them, the same shape as
+// TestBareRouteIsNeverLaxerThanThePublishedSchema above.
+func TestPageHostSchemaAndValidatorAgree(t *testing.T) {
+	schemaPattern := regexp.MustCompile(`^[a-z0-9.-]{3,128}$`)
+	schemaNot := regexp.MustCompile(`(^\.)|(\.$)|(\.\.)`)
+	for _, host := range []string{
+		"publisher.example.edu",
+		"a.b",
+		".abc",
+		"abc.",
+		"a..b",
+		".",
+		"..",
+	} {
+		goOK := browserTextLen(host) <= 128 && hostRE.MatchString(host) &&
+			!strings.Contains(host, "..") && !strings.HasPrefix(host, ".") && !strings.HasSuffix(host, ".")
+		schemaOK := schemaPattern.MatchString(host) && !schemaNot.MatchString(host)
+		if goOK != schemaOK {
+			t.Errorf("page_host %q: Go accept=%v schema accept=%v, want equal", host, goOK, schemaOK)
+		}
+	}
+}
+
+// TestPageHostRejectsDotEdgeCases decodes real delivery_context frames for
+// the three shapes above, pinning the corpus fixtures under
+// testdata/protocol/invalid/browser-delivery-context-page-host-*.json
+// through the actual decode path rather than a hand-rolled reimplementation
+// of validate().
+func TestPageHostRejectsDotEdgeCases(t *testing.T) {
+	const frame = `{"protocol":"papio-browser/1","type":"delivery_context","msg_id":"m_dctx_host_case","job_id":"job_dctx_host_case","seq":1,"payload":{"download_id":1,"route":"direct","session_evidence":"none","page_host":"%s"}}`
+	for _, host := range []string{".abc", "abc.", "a..b"} {
+		if _, err := DecodeBrowserMessage([]byte(fmt.Sprintf(frame, host))); err == nil {
+			t.Errorf("page_host %q accepted; want rejected", host)
+		}
+	}
+	if _, err := DecodeBrowserMessage([]byte(fmt.Sprintf(frame, "publisher.example.edu"))); err != nil {
+		t.Errorf("page_host %q rejected: %v", "publisher.example.edu", err)
+	}
+}
+
+// TestOriginHintSchemaAndValidatorAgree pins papio-26fa531528e29798: Go,
+// the TypeScript parser, and the schema previously disagreed on
+// "https://EXAMPLE.com" (Go accepted it via validateBareRoute, which never
+// compared case; the TypeScript parser rejected it only as an accident of
+// the WHATWG URL parser lowercasing a special-scheme host before the
+// round-trip equality check) and on "https://a" (both parsers accepted a
+// single-label host that the schema's old 3..253-char bound also happened
+// to accept, even though no configured resolver origin is ever
+// bare-hostname-only). validateResolverOriginHint and the published pattern
+// must now agree on every value, verified the same way
+// TestBareRouteIsNeverLaxerThanThePublishedSchema checks candidate.route.
+func TestOriginHintSchemaAndValidatorAgree(t *testing.T) {
+	schemaPattern := regexp.MustCompile(`^https://[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+(:[0-9]{1,5})?$`)
+	for _, hint := range []string{
+		"https://resolver.example.edu",
+		"https://resolver.example.edu:8443",
+		"https://a.b",
+		"https://EXAMPLE.com",
+		"https://a",
+		"HTTPS://resolver.example.edu",
+		"https://resolver.example.edu/path",
+		"https://resolver.example.edu?x=1",
+		"https://user@resolver.example.edu",
+		"https://.abc.example.edu",
+		"https://abc.example.edu.",
+		"https://abc..example.edu",
+	} {
+		goOK := validateResolverOriginHint(hint) == nil
+		schemaOK := schemaPattern.MatchString(hint) && utf8.RuneCountInString(hint) <= 300
+		if goOK != schemaOK {
+			t.Errorf("origin_hint %q: Go accept=%v schema accept=%v, want equal", hint, goOK, schemaOK)
+		}
+	}
+}
+
+// TestOriginHintRejectsMixedCaseAndSingleLabelHosts decodes real
+// session_evidence frames for the two disagreement values named in
+// papio-26fa531528e29798, pinning the corpus fixtures under
+// testdata/protocol/invalid/browser-session-evidence-origin-hint-*.json
+// through the actual decode path.
+func TestOriginHintRejectsMixedCaseAndSingleLabelHosts(t *testing.T) {
+	const frame = `{"protocol":"papio-browser/1","type":"session_evidence","msg_id":"m_origin_case","seq":1,"payload":{"evidence":"warm_verified","origin_hint":"%s","at":"2026-08-03T12:00:00Z"}}`
+	for _, hint := range []string{"https://EXAMPLE.com", "https://a"} {
+		if _, err := DecodeBrowserMessage([]byte(fmt.Sprintf(frame, hint))); err == nil {
+			t.Errorf("origin_hint %q accepted; want rejected", hint)
+		}
+	}
+	if _, err := DecodeBrowserMessage([]byte(fmt.Sprintf(frame, "https://resolver.example.edu"))); err != nil {
+		t.Errorf("origin_hint %q rejected: %v", "https://resolver.example.edu", err)
+	}
+}

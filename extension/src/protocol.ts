@@ -432,6 +432,15 @@ const OUTCOMES: Record<string, true> = {
 const MSG_ID_RE = /^[A-Za-z0-9_-]{8,64}$/;
 const JOB_ID_RE = /^[A-Za-z0-9_-]{8,128}$/;
 const HOST_RE = /^[a-z0-9.-]{3,253}$/;
+// ORIGIN_HOST_RE is the resolver-origin host grammar used ONLY by
+// session_evidence.origin_hint (see the validation block below for why it
+// exists alongside HOST_RE rather than reusing it): lowercase RFC 1035
+// labels (alnum first/last character, hyphens interior only, 1-63 chars per
+// label) joined by single dots, with at least two labels. Must stay
+// byte-identical to originHostRE in internal/protocol/protocol.go and the
+// host portion of session_evidence.origin_hint's pattern in
+// protocol/browser-v1.schema.json.
+const ORIGIN_HOST_RE = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$/;
 const ERROR_CODE_RE = /^[a-z0-9_]{2,50}$/;
 const FILENAME_RE = /^[^/\\]{1,255}$/u;
 const RFC3339_RE =
@@ -930,14 +939,47 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
       triageTime(p, "at", "session_evidence");
       if ("origin_hint" in p) {
         const origin = str(p, "origin_hint", "session_evidence", 300);
+        // Two checks, each catching a different way a value can fail to be
+        // a bare, lowercase, multi-label resolver origin:
+        //
+        // 1. The round-trip equality below is what actually rejects a
+        //    mixed-case host such as "https://EXAMPLE.com": the WHATWG URL
+        //    parser lowercases the host of a special scheme internally, so
+        //    `${parsed.protocol}//${parsed.host}` no longer equals the raw
+        //    uppercase input once parsed. That also happens to reject any
+        //    path/query/fragment/userinfo the raw string carried, since
+        //    those are stripped out of `parsed.host`. It does NOT check host
+        //    charset or label count on its own — "https://a" round-trips
+        //    cleanly and would pass this check alone.
+        // 2. ORIGIN_HOST_RE therefore separately enforces the charset and
+        //    multi-label shape. A single-label host like "https://a" (legal
+        //    for a browser origin, e.g. a LAN/mDNS name) round-trips cleanly
+        //    through check 1 above, but is never a real institutional
+        //    resolver origin, so it is rejected here rather than treated as
+        //    a boundary case. Case is rejected rather than normalized even
+        //    though internal/config/config.go's ResolverProfileForOrigin
+        //    already lowercases and case-insensitively matches the decoded
+        //    hint, so case alone cannot currently misroute a match — that
+        //    downstream leniency isn't a reason to leave the wire format
+        //    ambiguous. The actual bug this closes is that Go, this parser,
+        //    and the schema disagreed about whether "https://EXAMPLE.com"
+        //    decodes AT ALL, independent of what any one consumer tolerates
+        //    afterward. This must match internal/protocol/protocol.go's
+        //    validateResolverOriginHint exactly — see its doc comment for
+        //    the full three-way history this rule replaces.
         try {
           const parsed = new URL(origin);
-          if (parsed.protocol !== "https:" || parsed.host === "" || `${parsed.protocol}//${parsed.host}` !== origin) {
-            fail("session_evidence.origin_hint must be a bare https origin");
+          if (
+            parsed.protocol !== "https:" ||
+            parsed.host === "" ||
+            `${parsed.protocol}//${parsed.host}` !== origin ||
+            !ORIGIN_HOST_RE.test(parsed.hostname)
+          ) {
+            fail("session_evidence.origin_hint must be a bare https origin with a lowercase, multi-label resolver host");
           }
         } catch (e) {
           if (e instanceof ProtocolError) throw e;
-          fail("session_evidence.origin_hint must be a bare https origin");
+          fail("session_evidence.origin_hint must be a bare https origin with a lowercase, multi-label resolver host");
         }
       }
       break;

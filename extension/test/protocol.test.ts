@@ -191,6 +191,57 @@ test("download_id must be >= 1: the correlation key half of browserDownloadKey{J
   }
 });
 
+test("delivery_context.page_host rejects a leading dot, a trailing dot, and a '..' run", () => {
+  // papio-a82ab8e6906fda25: the published pattern
+  // `^[a-z0-9.-]{3,128}$` alone silently admitted these three shapes, even
+  // though this parser and internal/protocol/protocol.go already rejected
+  // them explicitly — the schema documented a contract neither executable
+  // parser honoured. See testdata/protocol/invalid/browser-delivery-context-
+  // page-host-{leading,trailing,double}-dot.json for the shared-corpus half
+  // of this contract, and protocol/browser-v1.schema.json's new "not" clause
+  // for the schema half.
+  const frame = (pageHost: string) => ({
+    protocol: "papio-browser/1",
+    type: "delivery_context",
+    msg_id: "m_dctx_host_case",
+    job_id: "job_dctx_host_case",
+    seq: 1,
+    payload: { download_id: 1, route: "direct", session_evidence: "none", page_host: pageHost },
+  });
+  for (const host of [".abc", "abc.", "a..b"]) {
+    expect(() => parseBrowserMessage(frame(host)), host).toThrow(ProtocolError);
+  }
+  expect(parseBrowserMessage(frame("publisher.example.edu")).payload["page_host"]).toBe("publisher.example.edu");
+});
+
+test("session_evidence.origin_hint rejects a mixed-case host and a single-label host", () => {
+  // papio-26fa531528e29798: Go, this parser, and the schema previously
+  // disagreed on both shapes at once. "https://EXAMPLE.com" was accepted by
+  // Go's validateBareRoute (which never compared case) and rejected here
+  // only as a side effect of `new URL()` lowercasing the host of a special
+  // scheme before the round-trip equality check below — an accident, not a
+  // stated rule. "https://a" was accepted by both parsers (a single-label
+  // host is a legal browser origin) but rejected by the schema's old
+  // 3..253-char bound. ORIGIN_HOST_RE now makes both rejections explicit and
+  // identical across internal/protocol/protocol.go, this file, and
+  // protocol/browser-v1.schema.json. See testdata/protocol/invalid/browser-
+  // session-evidence-origin-hint-{uppercase-host,single-label}.json for the
+  // shared-corpus half of this contract.
+  const frame = (originHint: string) => ({
+    protocol: "papio-browser/1",
+    type: "session_evidence",
+    msg_id: "m_origin_case",
+    seq: 1,
+    payload: { evidence: "warm_verified", origin_hint: originHint, at: "2026-08-03T12:00:00Z" },
+  });
+  for (const hint of ["https://EXAMPLE.com", "https://a"]) {
+    expect(() => parseBrowserMessage(frame(hint)), hint).toThrow(ProtocolError);
+  }
+  expect(parseBrowserMessage(frame("https://resolver.example.edu")).payload["origin_hint"]).toBe(
+    "https://resolver.example.edu",
+  );
+});
+
 test("hello_ack accepts optional daemon details and rejects invalid members", () => {
   const frame = (payload: Record<string, unknown>) => ({
     protocol: "papio-browser/1",
