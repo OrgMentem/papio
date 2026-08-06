@@ -9,6 +9,28 @@ is synthesized from the complete `papio` and `zotio` Git histories and the
 execution records in `notes/acquisition-stack-plan.md`.
 
 
+## [Unreleased]
+
+### Fixed
+
+- **A paper whose catalogue record names one author no longer goes to review
+  over a superscript.** Identity accepts an identifier printed anywhere in the
+  document, but only once the byline agrees on an author — and where a
+  superscript affiliation marker is glued to the surname ("Keith D. Ciani1∗")
+  that agreement needs *two* marked surnames, because the two-character
+  tolerance cannot tell a marker from a different name. A record naming a
+  single author can never show two, so the rule was unsatisfiable: a Wiley PDF
+  matching 7/7 title tokens, the year, and printing the requested DOI verbatim
+  below its abstract — past the front-matter DOI window, which stays narrow so
+  a reference-list DOI is never read as the document's own — was parked for
+  human verification. With one requested author a marker-tolerant byline hit
+  now carries the author check, but only where the identifier is printed on the
+  document's own page one. That bound is the point: a comment, reply, or erratum
+  on the requested paper carries its title and cites its DOI in the references,
+  so trusting the whole document here would file the commentary as the paper. An
+  unrelated surname still parks, and so does a near-miss surname whose only
+  identifier match is a citation further in.
+
 ## [0.18.0] - 2026-08-06
 
 ### Added

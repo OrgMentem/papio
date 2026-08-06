@@ -325,6 +325,63 @@ func TestIdentityCorroborationNeverOverturnsADOIMismatch(t *testing.T) {
 	}
 }
 
+// A catalogue record that names one author cannot clear the two-marker rule, so
+// the marker tolerance had no way to establish authorship at all. Wiley prints
+// the surname as "Ciani1∗" and the paper's own DOI below the abstract, past the
+// front-matter window, so an exact identifier match plus a 7/7 title match was
+// staged for human review.
+func TestIdentityCorroboratesASingleMarkedAuthor(t *testing.T) {
+	target := work.Work{
+		DOI:   "10.1348/000709910x517399",
+		Title: "Antecedents and trajectories of achievement goals: A self-determination theory perspective",
+		// The record names the first author only; the paper has four.
+		Authors: []string{"Ciani"}, Year: 2011,
+	}
+	text := "223\n\nBritish Journal of Educational Psychology (2011), 81, 223–243\n" +
+		"Antecedents and trajectories of achievement\ngoals: A self-determination theory perspective\n" +
+		"Keith D. Ciani1∗ , Kennon M. Sheldon2 , Jonathan C. Hilpert3\nand Matthew A. Easter4\n" +
+		"Department of Counseling and Educational Psychology\n" +
+		"Background. " + strings.Repeat("Achievement goal theory and self-determination theory. ", 30) +
+		"\nDOI:10.1348/000709910X517399\n" +
+		"\f224 Keith D. Ciani et al.\nAchievement goal theory provides a framework.\n"
+	got := MatchIdentity(text, target)
+	if got.Result != IdentityPass {
+		t.Fatalf("result = %+v, want pass on the printed DOI", got)
+	}
+	// Corroboration is still not a wildcard: a different surname stays review.
+	other := target
+	other.Authors = []string{"Okonkwo"}
+	if got := MatchIdentity(text, other); got.Result == IdentityPass {
+		t.Fatalf("result = %+v, want an unrelated single author not to pass", got)
+	}
+}
+
+// The marker tolerance cannot tell "Clarke" from "Clark", so where it is the
+// only author evidence the corroborating identifier must be the document's OWN:
+// a comment, reply, or erratum on the requested paper carries its title and
+// cites its DOI, and would otherwise be filed as the paper itself.
+func TestIdentityWillNotCorroborateANearMissSurnameFromTheBibliography(t *testing.T) {
+	target := work.Work{
+		DOI:   "10.1234/abc.9",
+		Title: "Robustness Calibration Measurement Networks",
+		// Clark, not Clarke; the tolerance cannot see the difference.
+		Authors: []string{"Alice Clark"}, Year: 2024,
+	}
+	text := "Comment on: Robustness Calibration Measurement Networks\nBob Clarke\n2024\n" +
+		"\fReferences\nAlice Clark. Robustness calibration measurement networks, 2024. doi:10.1234/abc.9\n"
+	if got := MatchIdentity(text, target); got.Result != IdentityReview {
+		t.Fatalf("result = %+v, want review: a cited DOI is not this document's own", got)
+	}
+	// Printed on the document's own page one — below the abstract, past the
+	// front-matter DOI window — it is corroboration, as for Ciani.
+	own := "Robustness Calibration Measurement Networks\nBob Clarke\n2024\nAbstract. " +
+		strings.Repeat("We calibrate robustness measurements over networks. ", 30) +
+		"\ndoi:10.1234/abc.9\n\fReferences\nUnrelated, 2019.\n"
+	if got := MatchIdentity(own, target); got.Result != IdentityPass {
+		t.Fatalf("result = %+v, want pass on a page-one identifier", got)
+	}
+}
+
 func writeTempPDF(t *testing.T) string {
 	t.Helper()
 	p := filepath.Join(t.TempDir(), "input.pdf")

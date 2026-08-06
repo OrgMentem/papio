@@ -147,8 +147,30 @@ func MatchIdentityWithThreshold(text string, target work.Work, titleThreshold fl
 	// so "Comment on Deep Learning" clears a target titled "Deep Learning" and
 	// could carry a bare "Correction to: <DOI>" further down. Requiring the
 	// byline to agree on an author closes that, and still admits every reprint.
-	if corroboration := corroboratingIdentifier(text, target); corroboration != "" && authorOK {
-		return pass(append(evidence, corroboration)...)
+	if corroboration := corroboratingIdentifier(text, target); corroboration != "" {
+		if authorOK {
+			return pass(append(evidence, corroboration)...)
+		}
+		// The two-marker rule is unsatisfiable for a target that names ONE
+		// author: it reads a byline that marks EVERY surname, and with one
+		// requested author there is only one marker to see. Wiley prints "Keith
+		// D. Ciani1∗" and the catalogue record named Ciani alone, so a document
+		// printing the requested DOI verbatim below its abstract went to review.
+		//
+		// Letting the marker tolerance carry the author check alone reopens the
+		// case it cannot decide — "Clarke" is "Clark" plus one letter — and the
+		// identifier does not rule that out on its own, because a comment, reply,
+		// or erratum on the requested paper both clears the title gate and cites
+		// the requested DOI in its references. So the relaxation reads the
+		// document's own page one rather than the whole excerpt: a paper prints
+		// its identifier in the page-one footer or below the abstract (17 of 40
+		// real papers), while another paper's identifier reaches it through a
+		// citation further in.
+		if prefixed > 0 && len(target.Authors) == 1 {
+			if pageOne := corroboratingIdentifier(identityPageOne(text), target); pageOne != "" {
+				return pass(append(evidence, pageOne)...)
+			}
+		}
 	}
 
 	switch {
@@ -191,17 +213,22 @@ func documentDOIs(text string) []string {
 	return out
 }
 
-const identityFrontMatterBytes = 1 << 10
-
-func identityFrontMatter(text string) string {
+// identityWindow returns the head of page one, bounded by limit. Every
+// front-matter rule reads one of these; only the bound differs, and each bound
+// is a separately measured tradeoff.
+func identityWindow(text string, limit int) string {
 	if firstPage, _, ok := strings.Cut(text, "\f"); ok {
 		text = firstPage
 	}
-	if len(text) > identityFrontMatterBytes {
-		return text[:identityFrontMatterBytes]
+	if len(text) > limit {
+		return text[:limit]
 	}
 	return text
 }
+
+const identityFrontMatterBytes = 1 << 10
+
+func identityFrontMatter(text string) string { return identityWindow(text, identityFrontMatterBytes) }
 
 // identityBylineBytes is wider than the DOI window above because the two
 // answer different questions. A document's own DOI must sit at the very top or
@@ -212,15 +239,17 @@ func identityFrontMatter(text string) string {
 // mismatched pairs, 2 KiB admitted none and 4 KiB admitted two.
 const identityBylineBytes = 2 << 10
 
-func identityByline(text string) string {
-	if firstPage, _, ok := strings.Cut(text, "\f"); ok {
-		text = firstPage
-	}
-	if len(text) > identityBylineBytes {
-		return text[:identityBylineBytes]
-	}
-	return text
-}
+func identityByline(text string) string { return identityWindow(text, identityBylineBytes) }
+
+// identityPageOneBytes is the widest of the three: it bounds where a document
+// may print its OWN identifier, which a publisher puts wherever page one has
+// room — a footer, a masthead, or under the abstract past the correspondence
+// footnote (byte ~2350 for the Wiley paper that motivated it). The cap only
+// bites on a document whose entire text is one page, and there it is what keeps
+// a short comment or erratum from donating its reference list to this window.
+const identityPageOneBytes = 4 << 10
+
+func identityPageOne(text string) string { return identityWindow(text, identityPageOneBytes) }
 
 // containsFlattenedToken reports whether text contains needle as a COMPLETE
 // identifier once whitespace is ignored. Publishers letter-space identifiers
