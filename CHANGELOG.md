@@ -11,8 +11,77 @@ execution records in `notes/acquisition-stack-plan.md`.
 
 ## [Unreleased]
 
+### Changed
+
+- **The privacy policy now says what the daemon actually sends.** It claimed
+  "*papio* collects no personal data. Nothing is sent to OrgMentem or any third
+  party" while scoping itself to the daemon *and* the extension. That is true of
+  the extension, which has no backend, and false of the daemon: finding a paper
+  means asking the services that index papers, so every acquisition sends the
+  DOI, PMID, arXiv id or title to Unpaywall, Crossref, Europe PMC, arXiv and now
+  doi.org — and, where those services require it, the `email` from the config.
+  The daily retraction sweep additionally sends the DOIs of papers already in
+  the library. `docs/privacy.md` now carries a destination-by-destination table
+  naming what is sent, when, and whether it is on by default; the
+  `email` row in the config reference names its recipients; and the "no server,
+  no account, no telemetry, no analytics" claim is kept, because it is true, but
+  stated separately from the claim it was hiding. The once-a-day GitHub release
+  check is disclosed rather than glossed: it sends nothing, and
+  `updates.check = false` turns it off.
+
 ### Fixed
 
+- **A DOI that does not exist no longer parks the job on an institutional
+  sign-in.** A well-formed but unregistered DOI — one transposed digit in
+  `10.1016/j.cedpsych.2020.101816` for `…101860` was the reported case —
+  survived every upstream check, because Crossref, OpenAlex, EuropePMC and
+  Unpaywall all report "I have no record of this" and "this work exists but I
+  hold no open copy" through the same empty result. The job therefore reached
+  the institutional handoff, the link resolver had nothing to match, and the
+  user landed on doi.org's "DOI NOT FOUND" page. That action can never be
+  completed, so it was re-offered on every session-live tick — roughly sixty
+  tabs over three days — and escalated seven reminders. Before offering a
+  handoff for a work whose only fetchable identifier is a DOI, *papio* now
+  asks the DOI system itself whether that handle is registered; an
+  unregistered one settles `unavailable` with the new terminal reason
+  `doi_not_registered`, which names the typo and says plainly that signing in
+  will not help. The probe is skipped when a PMID, arXiv id or OpenAlex id is
+  also present (each is its own route) and fails open when the registry is
+  unreachable, so an outage cannot terminate fetchable work. Like
+  `no_identifier`, the new reason is exempt from the zotio backfill cool-down,
+  because correcting the DOI makes the item fetchable immediately.
+  The same gate now runs in the maintenance repair pass, so a job that was
+  *already* parked when this shipped is reclaimed rather than nagging forever;
+  the existing "contradicted park" rule could never reach it, because that one
+  waits on a `browser.no_entitlement_requeue` event and a dead DOI never gets
+  as far as the institutional resolver. Registry answers are memoized so the
+  once-a-minute sweep does not become a request per parked job per tick.
+  Two hardening notes on the probe itself, both found in review: the request
+  path is built by concatenation rather than `path.Join`, because Join Cleans —
+  which collapsed the repeated slash that makes `10.48612//monograph-2025-2` a
+  different registered work from `10.48612/monograph-2025-2`, and let a `..`
+  segment (`doiCoreRE` admits any non-whitespace suffix) escape `/api/handles/`
+  into doi.org's own resolver root; dot segments are now rejected outright. And
+  a missing HTTP client is an error rather than a plain `http.Client`, which
+  would have silently dropped the SSRF guard, redirect cap and body bound the
+  daemon's shared metadata client provides.
+- **An open human action stops nagging after a week.** The reminder backoff
+  capped the *interval* at 24h but never the *count*, and the browser bridge
+  re-offered every open handoff whenever a session went live, so one handoff
+  nobody could complete produced a tab per session and a notification per day
+  indefinitely — sixty tabs and seven reminders over three days in the reported
+  case. Some of those causes are now caught at the source, but most never will
+  be: a title the library does not hold, a provider that changed its login, a
+  job the user has decided to ignore. Past `job.QuiesceAfter` (seven days) an
+  action goes quiet — no automatic offer, including on the institutional
+  re-offer sweep that a fresh sign-in triggers, and no further reminder.
+  This is deliberately **not** expiry: the action stays open, stays listed, and
+  `papio actions open` still drives it, because an explicit command is user
+  intent in a way a session-live tick is not. `papio doctor` gains a
+  `quiesced_actions` check so a quiet queue does not become an invisible one —
+  out of band on purpose, since the IPC layer decodes strictly and widening an
+  existing result shape would make an older CLI reject every response from a
+  newer daemon.
 - **A paper whose catalogue record names one author no longer goes to review
   over a superscript.** Identity accepts an identifier printed anywhere in the
   document, but only once the byline agrees on an author — and where a
@@ -71,40 +140,6 @@ execution records in `notes/acquisition-stack-plan.md`.
 
 ### Fixed
 
-- **A DOI that does not exist no longer parks the job on an institutional
-  sign-in.** A well-formed but unregistered DOI — one transposed digit in
-  `10.1016/j.cedpsych.2020.101816` for `…101860` was the reported case —
-  survived every upstream check, because Crossref, OpenAlex, EuropePMC and
-  Unpaywall all report "I have no record of this" and "this work exists but I
-  hold no open copy" through the same empty result. The job therefore reached
-  the institutional handoff, the link resolver had nothing to match, and the
-  user landed on doi.org's "DOI NOT FOUND" page. That action can never be
-  completed, so it was re-offered on every session-live tick — roughly sixty
-  tabs over three days — and escalated seven reminders. Before offering a
-  handoff for a work whose only fetchable identifier is a DOI, *papio* now
-  asks the DOI system itself whether that handle is registered; an
-  unregistered one settles `unavailable` with the new terminal reason
-  `doi_not_registered`, which names the typo and says plainly that signing in
-  will not help. The probe is skipped when a PMID, arXiv id or OpenAlex id is
-  also present (each is its own route) and fails open when the registry is
-  unreachable, so an outage cannot terminate fetchable work. Like
-  `no_identifier`, the new reason is exempt from the zotio backfill cool-down,
-  because correcting the DOI makes the item fetchable immediately.
-  The same gate now runs in the maintenance repair pass, so a job that was
-  *already* parked when this shipped is reclaimed rather than nagging forever;
-  the existing "contradicted park" rule could never reach it, because that one
-  waits on a `browser.no_entitlement_requeue` event and a dead DOI never gets
-  as far as the institutional resolver. Registry answers are memoized so the
-  once-a-minute sweep does not become a request per parked job per tick.
-  Two hardening notes on the probe itself, both found in review: the request
-  path is built by concatenation rather than `path.Join`, because Join Cleans —
-  which collapsed the repeated slash that makes `10.48612//monograph-2025-2` a
-  different registered work from `10.48612/monograph-2025-2`, and let a `..`
-  segment (`doiCoreRE` admits any non-whitespace suffix) escape `/api/handles/`
-  into doi.org's own resolver root; dot segments are now rejected outright. And
-  a missing HTTP client is an error rather than a plain `http.Client`, which
-  would have silently dropped the SSRF guard, redirect cap and body bound the
-  daemon's shared metadata client provides.
 - **The quarantine preview re-verifies the file on every serve.** The digest
   was checked once and the result cached on the capability, so any later GET
   of the same URL re-opened the file and served it with no hash check at all —

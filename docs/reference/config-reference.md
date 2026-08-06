@@ -14,7 +14,7 @@ with `~/` are expanded when *papio* loads them.
 | Key | Type | Default | Effect and constraints |
 | --- | --- | --- | --- |
 | `access_mode` | string | empty | Required before acquisition. Allowed values are `conservative`, `assisted`, and `delegated`; a fresh guided `papio init` chooses `conservative`. Conservative records institutional OpenURL availability without opening a handoff; assisted and delegated can route eligible exhaustion to browser handoff. |
-| `email` | string | empty | Contact identity for polite API pools. Doctor fails when enabled Unpaywall has no email; enabled OpenAlex also requires an email and API key. |
+| `email` | string | empty | Contact identity for polite API pools. **Sent to third parties**: as a query parameter to Unpaywall (required) and OpenAlex (required), to Crossref when set, and in the `User-Agent` of DOI-registration lookups. See [Privacy](../privacy.md). Doctor fails when enabled Unpaywall has no email; enabled OpenAlex also requires an email and API key. |
 | `data_dir` | path string | `~/.local/share/papio` (Windows: `%LOCALAPPDATA%\papio`) | Private writable data directory for the database, artifacts, socket, and default browser-adoption directory. |
 
 ## `[fetch]`

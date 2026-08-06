@@ -91,6 +91,15 @@ func (r *ActionReminder) RunDue(ctx context.Context) error {
 		if age < base {
 			continue
 		}
+		// An action open past the quiesce window stops being re-notified. The
+		// backoff caps the interval, never the count, so without this a handoff
+		// nobody can complete nags once a day until the heat death of the
+		// queue. It stays open and `papio actions open` still drives it; papio
+		// just stops raising it unprompted, and `papio doctor` reports how many
+		// have gone quiet.
+		if action.Quiesced(now) {
+			continue
+		}
 		events, err := loadEvents(action.JobID)
 		if err != nil {
 			record(fmt.Errorf("load events for human action %d: %w", action.ID, err))

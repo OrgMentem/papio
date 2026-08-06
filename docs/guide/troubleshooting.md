@@ -269,7 +269,6 @@ Use the report reason to choose the next step:
 The exact report reason is preferable to a blind `papio jobs retry`; browser and
 identity states are intentionally parked for a human decision.
 
-
 If the report reason does not explain it, ask the job itself:
 
 ```sh
@@ -318,3 +317,31 @@ It returns the job to `resolving` and reports what it found, so an outcome of
 `not_parked` or `has_open_actions` means the job is not actually orphaned and the
 parked state is genuine — resolve the open action instead. It is deliberately
 narrow: it will not reopen a job that is legitimately waiting on you.
+
+## A handoff has gone quiet
+
+After a week, an open human action stops drawing *papio*'s own initiative: the
+browser bridge stops offering it whenever a session goes live, and the reminder
+schedule stops raising it. This is deliberate. The reminder backoff caps the
+interval at a day but never the count, and the bridge re-offered every open
+handoff on every session-live tick, so one handoff nobody could complete used to
+produce a tab per session and a notification per day, indefinitely.
+
+**Going quiet is not expiry.** The action stays open, stays listed by
+`papio actions list`, and stays openable — `papio actions open` drives a quiet
+handoff on demand, because an explicit command is your intent in a way a
+background tick is not. *papio* simply stops volunteering.
+
+`papio doctor` reports the count so a quiet queue does not become an invisible
+one:
+
+```
+WARN  quiesced_actions  3 human action(s) have gone quiet after waiting more than 7 days; oldest opened 40 days ago
+      fix: papio no longer offers these on its own — run 'papio actions open' to
+      drive them, or 'papio actions dismiss' to clear the ones you are done with
+```
+
+If a handoff keeps going quiet, that is usually the real answer: the library does
+not hold the title, the provider changed its login, or the DOI is wrong. Check
+`papio jobs receipt <job-id>` before re-opening it a fourth time.
+

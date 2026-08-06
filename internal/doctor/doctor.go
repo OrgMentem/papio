@@ -18,6 +18,7 @@ import (
 	"papio/internal/browser"
 	"papio/internal/config"
 	"papio/internal/discovery"
+	"papio/internal/job"
 	"papio/internal/ownership"
 	"papio/internal/pdf"
 	"papio/internal/store"
@@ -116,6 +117,31 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, capability pdf
 		}
 	}
 
+	// The counterpart to going quiet. An action papio has stopped volunteering
+	// is still the user's to finish, so the queue must not become invisible
+	// just because it stopped being noisy.
+	if db == nil {
+		add("quiesced_actions", Skip, "quiesced human actions are checked by the daemon", "")
+	} else {
+		n, oldest, err := quiescedActions(ctx, db)
+		switch {
+		case err != nil:
+			add("quiesced_actions", Warn, "quiesced human actions could not be counted", "inspect database permissions")
+		case n == 0:
+			add("quiesced_actions", Pass, "no human action has been waiting past the quiesce window", "")
+		default:
+			detail := fmt.Sprintf("%d human action(s) have gone quiet after waiting more than %s",
+				n, quiesceDays(job.QuiesceAfter))
+			// An unparseable stored timestamp yields a zero age. Say nothing
+			// rather than "oldest opened 0s ago", which reads as a live action.
+			if oldest > 0 {
+				detail += fmt.Sprintf("; oldest opened %s ago", quiesceDays(oldest))
+			}
+			add("quiesced_actions", Warn, detail,
+				"papio no longer offers these on its own — run `papio actions open` to drive them, or `papio actions dismiss` to clear the ones you are done with")
+		}
+	}
+
 	if workerBinary == "" {
 		add("pdf_worker", Fail, "papio worker executable path is missing", "run doctor from the papio binary")
 	} else if info, err := os.Stat(workerBinary); err != nil || info.IsDir() || info.Mode().Perm()&0o111 == 0 {
@@ -206,6 +232,41 @@ func uncollectedAcquisitions(ctx context.Context, db *store.Store) (int, time.Du
 		return n, 0, nil
 	}
 	return n, time.Since(settled), nil
+}
+
+// quiescedActions counts open human actions that have aged past
+// job.QuiesceAfter, and how long the oldest has waited. These are the actions
+// papio has stopped offering and stopped reminding about; they remain the
+// user's to finish, so doctor is where they resurface.
+func quiescedActions(ctx context.Context, db *store.Store) (int, time.Duration, error) {
+	row := db.DB().QueryRowContext(ctx, `
+		SELECT COUNT(*), COALESCE(MIN(created_at), '')
+		FROM human_actions
+		WHERE status = 'open' AND created_at < ?`,
+		time.Now().UTC().Add(-job.QuiesceAfter).Format(time.RFC3339Nano))
+	var n int
+	var oldest string
+	if err := row.Scan(&n, &oldest); err != nil {
+		return 0, 0, err
+	}
+	if n == 0 {
+		return 0, 0, nil
+	}
+	opened, err := time.Parse(time.RFC3339Nano, oldest)
+	if err != nil {
+		return n, 0, nil
+	}
+	return n, time.Since(opened), nil
+}
+
+// quiesceDays renders a multi-day duration the way a person reads it. Go's
+// Duration has no day unit, so the raw value prints as "168h0m0s" — accurate,
+// and useless in a line whose whole job is to be scanned.
+func quiesceDays(d time.Duration) string {
+	if d < 48*time.Hour {
+		return d.Round(time.Hour).String()
+	}
+	return fmt.Sprintf("%d days", int(d/(24*time.Hour)))
 }
 
 func checkDataDir(path string) error {

@@ -350,3 +350,41 @@ func TestActionReminderBackoffCapsAtDay(t *testing.T) {
 		t.Fatalf("capped backoff = %s, want 24h", got)
 	}
 }
+
+// The backoff above caps the interval at 24h but never the count, so before
+// job.QuiesceAfter an action nobody could finish was re-notified once a day
+// forever — the reported handoff reached seven. Going quiet is not expiry: the
+// action stays open and `papio actions open` still drives it.
+func TestActionReminderStopsAtTheQuiesceWindow(t *testing.T) {
+	now := time.Date(2026, 7, 26, 12, 0, 0, 0, time.UTC)
+	svc, jobs, sink := newReminderTestService(t, &now)
+	openReminderAction(t, svc, jobs, "wr_reminder_quiesced", now.Add(-job.QuiesceAfter-time.Hour), true)
+
+	if err := svc.ActionReminder().RunDue(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.reminders) != 0 {
+		t.Fatalf("reminders = %q, want none once the action has gone quiet", sink.reminders)
+	}
+	// And the action is still open, so nothing has been taken away from the user.
+	open, err := jobs.ListHumanActions(context.Background(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(open) != 1 {
+		t.Fatalf("open actions = %d, want the quiesced action still open and listable", len(open))
+	}
+}
+
+func TestActionReminderStillNotifiesJustInsideTheQuiesceWindow(t *testing.T) {
+	now := time.Date(2026, 7, 26, 12, 0, 0, 0, time.UTC)
+	svc, jobs, sink := newReminderTestService(t, &now)
+	openReminderAction(t, svc, jobs, "wr_reminder_nearly_quiesced", now.Add(-job.QuiesceAfter+time.Hour), true)
+
+	if err := svc.ActionReminder().RunDue(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.reminders) != 1 {
+		t.Fatalf("reminders = %q, want one — the window must not shorten by rounding", sink.reminders)
+	}
+}

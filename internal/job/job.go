@@ -2661,6 +2661,42 @@ type HumanAction struct {
 	Revision         int64  `json:"revision"`
 }
 
+// QuiesceAfter is how long an open human action keeps drawing papio's own
+// initiative — automatic browser offers and escalating reminders — before it
+// goes quiet.
+//
+// It exists because "open forever" and "notified forever" were the same thing.
+// The reminder backoff caps the interval at 24h but never the count, and the
+// bridge re-offers every open handoff whenever a browser session goes live, so
+// one handoff nobody could complete produced roughly sixty tabs and seven
+// notifications over three days. Some of those are papio's fault and get fixed
+// at the source (a DOI that does not exist is now caught before the park); the
+// rest are not, and never will be — a title the library simply does not hold,
+// a provider that changed its login, a job the user has decided to ignore.
+//
+// Going quiet is deliberately NOT expiry. The action stays open, stays listed,
+// and stays openable: `papio actions open` drives a quiesced handoff on
+// demand, because an explicit command is user intent in a way a session-live
+// tick is not. papio simply stops volunteering. `papio doctor` reports the
+// count so the queue does not go silently stale.
+//
+// Seven days is one working week: long enough that an ordinary "I'll get to it
+// after the weekend" handoff is untouched, short enough that a dead one stops
+// costing a tab per session.
+const QuiesceAfter = 7 * 24 * time.Hour
+
+// Quiesced reports whether this action has been open long enough that papio
+// should stop acting on it unprompted. An unparseable timestamp reports false:
+// the visible, noisy behaviour is the safe failure here, because the quiet one
+// would strand an action with nothing pointing at it.
+func (a HumanAction) Quiesced(now time.Time) bool {
+	created, err := time.Parse(time.RFC3339Nano, a.CreatedAt)
+	if err != nil {
+		return false
+	}
+	return now.Sub(created) >= QuiesceAfter
+}
+
 // OpenHandoffJob binds one open institutional handoff action to its awaiting
 // job row. The bridge uses this joined view to drain arbitrarily large
 // handoff backlogs without one Get query per action.

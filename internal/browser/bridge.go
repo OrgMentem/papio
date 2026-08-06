@@ -1820,7 +1820,11 @@ func (b *Bridge) reofferInstitutionalSiblingsForEvidence(ctx context.Context, or
 	}
 	var fallback string
 	for _, item := range handoffs {
+		// A quiesced handoff must not seed a re-offer sweep: riding someone
+		// else's fresh login is exactly how a week-old dead action keeps
+		// producing a tab per session. `papio actions open` still drives it.
 		if !item.Action.RequiresAuth ||
+			item.Action.Quiesced(b.now()) ||
 			resolverProfileKey(item.Row.Policy.Resolver) != wantedProfile {
 			continue
 		}
@@ -1925,8 +1929,12 @@ func (b *Bridge) reofferInstitutionalSiblings(ctx context.Context, sourceJobID s
 	candidates := make([]candidate, 0, len(handoffJobs))
 	for _, item := range handoffJobs {
 		action := item.Action
+		// Quiesced siblings are excluded for the same reason the seed is: a
+		// fresh institutional login must not resurrect a week-old handoff
+		// nobody has completed. An explicit `papio actions open` still does.
 		if item.Row.ID == sourceJobID ||
 			!action.RequiresAuth ||
+			action.Quiesced(b.now()) ||
 			b.authReleased[action.ID] {
 			continue
 		}
@@ -2513,6 +2521,12 @@ func (b *Bridge) poll(ctx context.Context) ([]json.RawMessage, error) {
 		}
 		row := rows[id]
 		action := handoff[id]
+		// The main auto-offer gate. focusPending is an explicit
+		// `papio actions open`, and reofferPending was already filtered when it
+		// was set, so both are honoured; a plain session-live tick is not.
+		if action.Quiesced(b.now()) && !b.focusPending[id] && !b.reofferPending[id] {
+			continue
+		}
 		accessMode, offerable := b.offerableAccessMode(row)
 		if !offerable {
 			delete(b.reofferPending, id)

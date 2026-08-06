@@ -14,6 +14,7 @@ import (
 
 	"papio/internal/config"
 	"papio/internal/discovery"
+	"papio/internal/job"
 	"papio/internal/ownership"
 	"papio/internal/pdf"
 	"papio/internal/store"
@@ -157,6 +158,79 @@ func uncollectedDetail(t *testing.T, ctx context.Context, db *store.Store, want 
 		}
 	}
 	t.Fatalf("uncollected_acquisitions check missing: %+v", report.Checks)
+	return ""
+}
+
+// Going quiet must not make the queue invisible: the action is still the
+// user's to finish, so doctor is the out-of-band surface that says so. (It has
+// to be out of band — the IPC layer decodes strictly, so widening an existing
+// result shape would make an older CLI reject every response from a newer
+// daemon. A doctor check is a new element in a list that already exists.)
+func TestRunReportsActionsThatHaveGoneQuiet(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	seed := func(id, jobID, createdAt, status string) {
+		t.Helper()
+		if _, err := db.DB().ExecContext(ctx, `
+			INSERT INTO work_requests (id, created_at) VALUES (?, ?)`, "wr_"+jobID, createdAt); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.DB().ExecContext(ctx, `
+			INSERT INTO jobs (id, work_request_id, state, policy_json, created_at, updated_at)
+			VALUES (?, ?, 'awaiting_human', '{}', ?, ?)`, jobID, "wr_"+jobID, createdAt, createdAt); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.DB().ExecContext(ctx, `
+			INSERT INTO human_actions (job_id, kind, status, detail, created_at, revision)
+			VALUES (?, 'openurl_handoff', ?, 'handoff', ?, 1)`, jobID, status, createdAt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stamp := func(age time.Duration) string {
+		return time.Now().UTC().Add(-age).Format(time.RFC3339Nano)
+	}
+	seed("quiet", "job_quiet", stamp(job.QuiesceAfter+24*time.Hour), "open")
+	seed("live", "job_live", stamp(time.Hour), "open")
+	seed("done", "job_done", stamp(job.QuiesceAfter+24*time.Hour), "resolved")
+
+	detail := quiescedDetail(t, ctx, db, Warn)
+	if !strings.Contains(detail, "1 human action(s)") {
+		t.Fatalf("detail = %q; want exactly the one quiet action — a live one and a resolved one are not waiting", detail)
+	}
+}
+
+func TestRunPassesWhenNoActionHasGoneQuiet(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	quiescedDetail(t, ctx, db, Pass)
+}
+
+func quiescedDetail(t *testing.T, ctx context.Context, db *store.Store, want string) string {
+	t.Helper()
+	cfg := config.Default()
+	cfg.AccessMode = config.ModeConservative
+	cfg.DataDir = t.TempDir()
+	tool := executable(t)
+	report := Run(ctx, cfg, db, pdf.Capability{
+		PDFCPU: true, PDFInfo: tool, PDFToText: tool, PDFToPPM: tool, Tesseract: tool,
+	}, tool, nil)
+	for _, c := range report.Checks {
+		if c.Name == "quiesced_actions" {
+			if c.Status != want {
+				t.Fatalf("status = %q, want %q (detail %q)", c.Status, want, c.Detail)
+			}
+			return c.Detail
+		}
+	}
+	t.Fatalf("quiesced_actions check missing: %+v", report.Checks)
 	return ""
 }
 
