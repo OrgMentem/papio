@@ -32,10 +32,23 @@ var nonArticleMarkers = []string{
 // scientific papers: a bibliometric study" and "Response to Intervention"
 // are both real titles that the shorter prefixes would catch.
 var correctionMarkers = []string{
-	"erratum", "corrigendum", "correction to", "correction:", "author correction",
+	"erratum", "errata", "corrigendum", "correction to", "correction:", "author correction",
 	"publisher correction", "retraction of", "retraction note", "retracted article",
 	"expression of concern", "comment on", "comments on", "commentary on",
 	"reply to", "rejoinder to", "withdrawal notice",
+}
+
+// correctionPointerPhrases catches the shape a corrected work prints ON
+// ITSELF, not in its own voice but about a correction published elsewhere: a
+// Springer book chapter that has since had an erratum issued says so in a
+// footnote on its own first page, "Erratum to this chapter is available at
+// 10.1007/...", and that sentence names the chapter being pointed AT — the
+// very document this guard is trying to pass — not a chapter announcing its
+// own erratum. A segment whose prefix is one of these is excluded from the
+// correctionMarkers test in correctionMarkerIn before that test runs.
+var correctionPointerPhrases = []string{
+	"erratum to this chapter", "erratum to this article", "erratum to this paper",
+	"correction to this chapter", "correction to this article", "correction to this paper",
 }
 
 var titleStopwords = map[string]bool{
@@ -78,7 +91,17 @@ func MatchIdentityWithThreshold(text string, target work.Work, titleThreshold fl
 			}
 		}
 	}
-	correctionMarker := correctionMarkerIn(frontMatterLines)
+	// The correction cap reads the wider byline window instead of the
+	// front-matter DOI window above: pdftotext routinely glues a running
+	// header or a page number onto the very line that carries the marker —
+	// "J Sensor Syst 2025;12:1  Erratum: ..." — which can push the marker
+	// past the first kilobyte even though it sits well inside the byline.
+	// bylineText is computed once, here, ahead of the DOI branch below so
+	// that branch's pass still routes through the cap, and reused for the
+	// title and year checks further down instead of slicing the same window
+	// under a second name.
+	bylineText := identityByline(text)
+	correctionMarker := correctionMarkerIn(strings.Split(bylineText, "\n"))
 	// A correction marker is diagnostic on every verdict a human will read, not
 	// only on the ones it downgrades: "comment on" at the top of page one is the
 	// first thing a reviewer wants to know, whatever else already withheld the
@@ -129,7 +152,7 @@ func MatchIdentityWithThreshold(text string, target work.Work, titleThreshold fl
 	if len(tokens) == 0 {
 		return capReview("no usable requested DOI or title tokens")
 	}
-	byline := documentTokens(identityByline(text))
+	byline := documentTokens(bylineText)
 	matches := 0
 	for _, token := range tokens {
 		if _, ok := byline[token]; ok {
@@ -194,9 +217,9 @@ func MatchIdentityWithThreshold(text string, target work.Work, titleThreshold fl
 	yearConflict := false
 	if target.Year != 0 {
 		switch {
-		case strings.Contains(identityByline(text), fmt.Sprint(target.Year)):
+		case strings.Contains(bylineText, fmt.Sprint(target.Year)):
 			evidence = append(evidence, "year matched")
-		case matches < len(tokens) && bylineYears(identityByline(text)):
+		case matches < len(tokens) && bylineYears(bylineText):
 			yearConflict = true
 		}
 	}
@@ -248,18 +271,52 @@ func MatchIdentityWithThreshold(text string, target work.Work, titleThreshold fl
 }
 
 // correctionMarkerIn reports the first correctionMarkers entry that prefixes
-// a front-matter line, or "" if none does. It takes the lines the
-// nonArticleMarkers scan above already split out, rather than re-splitting
-// identityFrontMatter's text a second time, and mirrors that scan's shape —
-// strings.ToLower, strings.TrimSpace, strings.HasPrefix — even though its
-// result only caps a verdict here instead of rejecting one.
+// a segment of the byline window, or "" if none does. pdftotext routinely
+// glues a running header, a page number, or a second column onto the line
+// that actually carries the marker, joined by two or more spaces where a
+// human reader sees a column break — "J Sensor Syst 2025;12:1  Erratum:
+// ..." and "1  Erratum: ..." are both real shapes — so a plain line-prefix
+// test misses a marker a human reading the page would see immediately.
+// correctionSegments recovers it by splitting on those wider gaps while
+// leaving single spaces alone: "applied a Bonferroni correction for
+// multiple comparisons" must stay one segment, or the word "correction"
+// appearing mid-sentence would trip the cap on ordinary prose. Each segment
+// is checked against correctionPointerPhrases first and skipped on a match,
+// because a pointer to a correction published elsewhere is printed on the
+// corrected work itself and would otherwise cap that document's own pass
+// with a note about a correction to something else.
 func correctionMarkerIn(lines []string) string {
 	for _, line := range lines {
-		line = strings.ToLower(strings.TrimSpace(line))
-		for _, marker := range correctionMarkers {
-			if strings.HasPrefix(line, marker) {
+		segment := strings.ToLower(strings.TrimLeft(line, " \t\ufeff\u200b\u200c\u200d\u200e\u200f"))
+		for {
+			if marker := correctionMarkerAt(segment); marker != "" {
 				return marker
 			}
+			gap := strings.Index(segment, "  ")
+			if gap < 0 {
+				break
+			}
+			segment = strings.TrimLeft(segment[gap:], " ")
+		}
+	}
+	return ""
+}
+
+// correctionMarkerAt reports the marker one segment declares, or "" for a
+// segment that declares none. A pointer phrase wins over a marker that
+// prefixes it: a correction published elsewhere is announced ON the corrected
+// work, so reading "erratum to this chapter is available at …" as a
+// self-declaration would cap the pass of the very document the operator asked
+// for.
+func correctionMarkerAt(segment string) string {
+	for _, phrase := range correctionPointerPhrases {
+		if strings.HasPrefix(segment, phrase) {
+			return ""
+		}
+	}
+	for _, marker := range correctionMarkers {
+		if strings.HasPrefix(segment, marker) {
+			return marker
 		}
 	}
 	return ""
@@ -295,9 +352,20 @@ func documentDOIs(text string) []string {
 }
 
 // identityWindow returns the head of page one, bounded by limit. Every
-// front-matter rule reads one of these; only the bound differs, and each bound
-// is a separately measured tradeoff.
+// front-matter rule reads one of these; only the bound differs, and each
+// bound is a separately measured tradeoff.
+//
+// Leading blank matter is trimmed before the cut on the first form feed,
+// not after: pdftotext renders a blank cover leaf as nothing but that form
+// feed, so cutting on it first handed every rule below — the DOI window,
+// the correction cap, the byline gate — an empty window, and a document
+// with a blank first leaf parked (or passed) for whatever reason happened
+// to fire on no evidence at all rather than on whatever the page that
+// follows actually says. The cutset also strips a leading byte-order mark,
+// which strings.TrimSpace does not remove, since some extractors emit one
+// ahead of the leaf itself.
 func identityWindow(text string, limit int) string {
+	text = strings.TrimLeft(text, " \t\r\n\f\ufeff")
 	if firstPage, _, ok := strings.Cut(text, "\f"); ok {
 		text = firstPage
 	}
@@ -318,6 +386,15 @@ func identityFrontMatter(text string) string { return identityWindow(text, ident
 // further starts pulling the opening paragraphs in, which is where a
 // mismatched document begins to look like a match again: measured over 1560
 // mismatched pairs, 2 KiB admitted none and 4 KiB admitted two.
+//
+// correctionMarkerIn scans this same window, for a matching reason: widening
+// it to the 4 KiB page-one window would admit two real documents from a
+// 679-document library whose page one carries correction vocabulary that is
+// not a self-declaration — a Springer footnote pointing at an erratum
+// published elsewhere, at offset 1874, and an ordinary sentence about
+// dendritic retraction in unrelated neuroscience prose, at offset 2958. The
+// pointer-phrase exclusion handles the first inside this window; the second
+// stays inert only because it never reaches the window at all.
 const identityBylineBytes = 2 << 10
 
 func identityByline(text string) string { return identityWindow(text, identityBylineBytes) }
@@ -342,6 +419,17 @@ func identityPageOne(text string) string { return identityWindow(text, identityP
 // the moment someone is retuning a bound.
 func IdentityWindows(text string) (frontMatter, byline, pageOne string) {
 	return identityFrontMatter(text), identityByline(text), identityPageOne(text)
+}
+
+// IdentifierPrinted reports whether text prints an identifier the rules would
+// accept as corroboration for target. The corpus harness asks this question to
+// classify WHERE a real paper prints its own identifier, and asking it through
+// the same code the verdict uses is the point: a histogram built on a bare
+// substring scan counts a DOI the matcher rejects as unusable, and misses one
+// the matcher finds through letter-spacing, so it would report a window gap
+// where the truth is unusable metadata.
+func IdentifierPrinted(text string, target work.Work) bool {
+	return corroboratingIdentifier(text, target) != ""
 }
 
 // containsFlattenedToken reports whether text contains needle as a COMPLETE

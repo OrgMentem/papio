@@ -183,13 +183,28 @@ execution records in `notes/acquisition-stack-plan.md`.
   of real papers that print their own DOI in the masthead, wrong for an erratum,
   corrigendum, retraction notice, or comment article, which is a different work
   that reprints the requested paper's DOI at the top of its own first page. A
-  1508-byte correction notice was accepted as the paper. A front-matter line
+  1508-byte correction notice was accepted as the paper. A page-one line
   beginning with one of those markers now caps the verdict at review rather than
   rejecting it, because the operator may have asked for the erratum and a park
   can be undone where a discard cannot, and the marker is named in the evidence
-  on every verdict a human sees. Markers are matched as line prefixes: a
-  Bonferroni correction mid-sentence is a real paper, so the list carries
-  "retraction of" rather than "retraction" and deliberately omits "response to".
+  on every verdict a human sees. Detection reads the 2 KiB byline window, not
+  the kilobyte the DOI rule reads, and tests each line in the segments pdftotext
+  leaves when it glues a running header or a page number onto the line that
+  carries the marker — `"J Sensor Syst 2025;12:1  Erratum: …"` escaped a
+  line-prefix test entirely, as did a leading byte-order mark. Runs of two or
+  more spaces are what segment a line, so a Bonferroni correction mid-sentence
+  is still a real paper, and the list carries "retraction of" rather than
+  "retraction" and omits "response to". A pointer to a correction published
+  elsewhere — Springer prints "Erratum to this chapter is available at …" on the
+  corrected chapter itself — is excluded by name, so the corrected work does not
+  park itself.
+- **A PDF that opens with a blank cover leaf is read instead of half-read.** The
+  windows every identity rule reads were cut at the first form feed, so a
+  leading one handed all three of them an empty page one: the DOI rule saw no
+  DOI, the title gate saw no byline, and a paper that matched on all four axes
+  parked with "title tokens matched only outside the front matter". Leading
+  whitespace, form feeds, and byte-order marks are now trimmed before the cut.
+  Two documents in a 632-document real library were parked by this and now pass.
 
 - **`papio jobs list` and `papio actions list` state truncation on the human
   surface too.** `--json` has carried a proven `truncated` since 0.16.0, while
