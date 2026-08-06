@@ -116,8 +116,13 @@ def read_const_version(root: Path, relative_path: str, const_name: str) -> str:
         source = path.read_text(encoding="utf-8")
     except OSError as exc:
         raise SystemExit(f"could not read {const_name} source {path}: {exc}") from exc
+    # `export const` is as valid a declaration as `const`: MIN_DAEMON_VERSION
+    # is exported so extension tests can derive their "healthy daemon" fixture
+    # from the floor instead of hardcoding a literal that silently becomes
+    # outdated the moment the floor moves. Missing the export form here made
+    # the whole preflight fail closed on a floor it could no longer see.
     match = re.search(
-        rf'^\s*(?:const\s+)?{re.escape(const_name)}\s*=\s*"([^"]+)"',
+        rf'^\s*(?:export\s+)?(?:const\s+)?{re.escape(const_name)}\s*=\s*"([^"]+)"',
         source,
         flags=re.MULTILINE,
     )

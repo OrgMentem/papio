@@ -9,7 +9,7 @@ is synthesized from the complete `papio` and `zotio` Git histories and the
 execution records in `notes/acquisition-stack-plan.md`.
 
 
-## [Unreleased]
+## [0.18.0] - 2026-08-06
 
 ### Added
 
@@ -28,7 +28,10 @@ execution records in `notes/acquisition-stack-plan.md`.
   This is a breaking wire change to an existing message type, landed under the
   pre-1.0 compatibility floor now stated in `AGENTS.md`: daemon, extension, and
   JSON schema move together and the extension must be rebuilt and reloaded
-  alongside the daemon.
+  alongside the daemon. Requested captures correlate only with extension
+  0.10.0 or newer; an older extension sends no id, so `papio adapter capture`
+  reports no path. Other handoff work is unaffected, so the daemon's own
+  extension floor does not move.
 - **The native host mirrors its diagnostics to `<DataDir>/native-host.log`.**
   Browsers forward a native-messaging host's stderr nowhere — not even into
   `chrome_debug.log` with logging enabled — so a host that rejected a frame and

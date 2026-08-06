@@ -14,7 +14,7 @@ History before 0.3.1 was recorded in the root `CHANGELOG.md` (the extension
 and daemon shared a version stream through 0.3.0); see its `[0.3.0]` section
 for the full pre-split extension history.
 
-## [Unreleased]
+## [0.10.0] - 2026-08-06
 
 ### Added
 
@@ -23,9 +23,9 @@ for the full pre-split extension history.
   answers, instead of guessing from provider and scenario. The popup's own
   Capture button omits the field, and the background broker refuses to accept
   one from an extension page, so an unsolicited capture can never claim a
-  request it did not answer. Requires a daemon built with the matching
-  `papio-browser/1` change — rebuild and reload the extension alongside the
-  daemon.
+  request it did not answer. Requires papio 0.18.0 or newer: the extension's
+  daemon floor moves to 0.18.0 with this change, and an older daemon rejects
+  the frame outright — rebuild and reload the extension alongside the daemon.
 
 ### Fixed
 

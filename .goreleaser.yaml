@@ -109,14 +109,12 @@ scoops:
     license: MIT
 # Windows: WinGet manifests, PR'd from a fork into microsoft/winget-pkgs.
 winget:
-  - # Paused again after v0.5.0 opened the first new-package PR
-    # (microsoft/winget-pkgs#404562, pending moderation). A second release
-    # before that merges would open a duplicate new-package PR — WinGet's
-    # bot flags concurrent submissions of an unmerged package, which reads
-    # badly for a first-time publisher. Re-enable (delete this skip_upload
-    # line) once #404562 merges; every release after that rides the fast
-    # version-bump path with no PR-collision risk.
-    skip_upload: true
+  - # Uploads were paused while v0.5.0's first-package PR
+    # (microsoft/winget-pkgs#404562) sat in moderation, so a second release
+    # could not open a duplicate new-package PR. That PR merged on
+    # 2026-08-06 (Publish-Pipeline-Succeeded), so OrgMentem.papio is in the
+    # index at 0.5.0 and every release from here rides the version-bump
+    # path. Do not reintroduce skip_upload for an ordinary release.
     name: papio
     publisher: OrgMentem
     license: MIT
