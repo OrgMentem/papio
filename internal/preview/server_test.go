@@ -484,6 +484,100 @@ func TestPreviewExpiryMismatchAndRevocation(t *testing.T) {
 	assertStatus(t, revokedURL, http.StatusNotFound)
 }
 
+func TestPDFRepeatGETServesUnchangedFileEachTime(t *testing.T) {
+	server := New(&recordingResolver{})
+	t.Cleanup(func() { _ = server.Shutdown(context.Background()) })
+	pdf := []byte("%PDF-1.7\nstable bytes\n%%EOF\n")
+	path, digest := writePDF(t, pdf)
+	capabilityURL := issuePreview(t, server, path, digest, len(pdf), Citation{})
+
+	for i := range 3 {
+		response, body := getResponse(t, capabilityURL+"/file")
+		defer response.Body.Close()
+		if response.StatusCode != http.StatusOK || body != string(pdf) {
+			t.Fatalf("GET %d = %d %q, want 200 with unchanged bytes", i, response.StatusCode, body)
+		}
+	}
+}
+
+func TestPDFRepeatGETRefusesFileTamperedAfterFirstVerify(t *testing.T) {
+	server := New(&recordingResolver{})
+	t.Cleanup(func() { _ = server.Shutdown(context.Background()) })
+	pdf := []byte("%PDF-1.7\noriginal bytes\n%%EOF\n")
+	path, digest := writePDF(t, pdf)
+	capabilityURL := issuePreview(t, server, path, digest, len(pdf), Citation{})
+
+	// The first GET verifies the hash and serves the bytes an operator is
+	// about to look at.
+	first, firstBody := getResponse(t, capabilityURL+"/file")
+	defer first.Body.Close()
+	if first.StatusCode != http.StatusOK || firstBody != string(pdf) {
+		t.Fatalf("first GET = %d %q, want 200 with original bytes", first.StatusCode, firstBody)
+	}
+
+	// The quarantine path is known to the process that produced the file,
+	// and a quarantined file is untrusted by definition. Swap it for
+	// different bytes of the SAME length (so a size-only check would miss
+	// it) after the capability has already been verified once — this is the
+	// TOCTOU window between what was verified and what a repeat GET of the
+	// same capability URL would otherwise re-read from disk.
+	swapped := append([]byte(nil), pdf...)
+	swapped[10] = 'X'
+	if err := os.WriteFile(path, swapped, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	second, secondBody := getResponse(t, capabilityURL+"/file")
+	defer second.Body.Close()
+	if second.StatusCode != http.StatusGone {
+		t.Fatalf("second GET after tamper = %d %q, want %d (refused, not re-served)", second.StatusCode, secondBody, http.StatusGone)
+	}
+	if secondBody == string(swapped) {
+		t.Fatal("second GET served the tampered bytes instead of refusing them")
+	}
+
+	// A failed re-verification revokes the capability outright, same as a
+	// first-GET mismatch does.
+	assertStatus(t, capabilityURL, http.StatusNotFound)
+}
+
+func TestPDFMissingRecordedHashFailsClosedWithClearError(t *testing.T) {
+	server := New(&recordingResolver{})
+	t.Cleanup(func() { _ = server.Shutdown(context.Background()) })
+	pdf := []byte("%PDF-1.7\nno hash\n%%EOF\n")
+	path, _ := writePDF(t, pdf)
+	if err := server.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Issue() itself already refuses an empty hash (validSHA256), so this
+	// simulates the one way an entry could still carry one: a HumanAction
+	// row created before the sha256 binding guard existed, sitting in a
+	// long-running dev store (see AGENTS.md's "rows that predate a later
+	// validation" footgun). servePDF must fail closed with a precise
+	// message, not panic or silently serve unverified bytes.
+	token, err := newToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.mu.Lock()
+	server.byToken[token] = &capability{
+		actionID: 99, path: path, sha256: "", size: int64(len(pdf)),
+		expectedRevision: 1, expires: time.Now().Add(time.Minute),
+	}
+	server.byAction[99] = token
+	server.mu.Unlock()
+
+	response, body := getResponse(t, "http://"+server.host()+"/p/"+token+"/file")
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("missing-hash GET status = %d, want %d", response.StatusCode, http.StatusInternalServerError)
+	}
+	if !strings.Contains(body, "no recorded hash") {
+		t.Fatalf("missing-hash GET body = %q, want a message about the missing recorded hash", body)
+	}
+}
+
 func issuePreview(t *testing.T, server *Server, path, digest string, size int, citation Citation) string {
 	t.Helper()
 	capabilityURL, err := server.Issue(IssueInput{

@@ -83,3 +83,33 @@ func TestPrintBatchReportStripsTerminalControlBytes(t *testing.T) {
 		})
 	}
 }
+
+// `papio batch report --markdown` renders through batch.Markdown, a sibling
+// path that bypasses printBatchReport entirely and has its own unexported
+// describe() helper — so hardening the plain-text renderer left this flag of
+// the same command still printing raw third-party titles to the terminal.
+func TestBatchMarkdownStripsTerminalControlBytes(t *testing.T) {
+	poisoned := "Evil\x1b]0;pwned\x07 Title\u009b31m"
+	report := &batch.Report{
+		BatchID: "batch-deadbeef",
+		Summary: batch.ReportSummary{Total: 1, Outcomes: map[string]int{"imported": 1}},
+		Works: []batch.ReportWork{{
+			Outcome: "imported", JobID: "job-1", Work: protocol.WorkRequest{Title: poisoned},
+		}},
+	}
+	got := batch.Markdown(report)
+	if strings.Contains(got, poisoned) {
+		t.Fatalf("raw unstripped title leaked into markdown output: %q", got)
+	}
+	if !strings.Contains(got, "Evil]0;pwned Title31m") {
+		t.Fatalf("markdown output = %q, want the stripped title", got)
+	}
+	for _, r := range got {
+		if r == '\n' || r == '\t' {
+			continue
+		}
+		if r < 0x20 || (r >= 0x7f && r <= 0x9f) {
+			t.Errorf("control byte %#U survived in %q", r, got)
+		}
+	}
+}

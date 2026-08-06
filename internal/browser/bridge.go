@@ -582,7 +582,26 @@ func (b *Bridge) Capture(ctx context.Context, request CaptureRequest) CaptureRes
 	case result := <-pending.result:
 		return result
 	case <-ctx.Done():
+		// The result and the timeout can become ready in the same instant:
+		// pending.result is buffered (cap 1), and a deliverer (handle's
+		// page_capture_request_result case, release, or promote) may have
+		// already sent into it right as ctx expires. Go's select then
+		// chooses pseudo-randomly between the two ready cases, so this arm
+		// can run even though a result is already sitting in the channel —
+		// reporting "timeout" for a capture that actually succeeded, while
+		// the file it already stored is silently orphaned (on disk, never
+		// reported). Re-check the channel in the same b.mu critical section
+		// that would otherwise clear the pending entry: whichever side (the
+		// deliverer's delete+send, or this recheck) reaches the lock first
+		// wins outright, so a delivered result is never dropped and the
+		// pending/busy entry is still cleared exactly once on every path.
 		b.mu.Lock()
+		select {
+		case result := <-pending.result:
+			b.mu.Unlock()
+			return result
+		default:
+		}
 		if b.pendingCaptures[sessionID] == pending {
 			delete(b.pendingCaptures, sessionID)
 		}

@@ -2024,6 +2024,70 @@ test("IdP navigation emits auth_pending once and never leaks the URL/host", asyn
   expect(Object.keys(authReturned?.payload ?? {})).toEqual(["elapsed_ms"]);
 });
 
+test("session evidence sends the exact origin observed for that evidence", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["session_evidence_v1"] }));
+
+  const sent = h.bridge.emitSessionEvidence("warm_verified", "https://resolver.example.edu");
+
+  expect(sent).toBe(true);
+  const frame = h.frames().find((f) => f.type === "session_evidence");
+  expect(frame?.payload).toEqual({
+    evidence: "warm_verified",
+    origin_hint: "https://resolver.example.edu",
+    at: new Date(h.clock.now).toISOString(),
+  });
+});
+
+test("session evidence with no observed origin omits origin_hint instead of guessing a granted host or the latest offer", async () => {
+  // papio-7d7a0ae96ca5726e: a hint that resolves to the WRONG institution is
+  // indistinguishable from a correct one to the daemon and releases that
+  // institution's parked handoffs without its session having been verified.
+  // Omitting is strictly safer (the daemon's no-hint path scopes to the
+  // default profile), so neither decoy below may leak into the frame.
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["session_evidence_v1"] }));
+  const decoyOfferURL = "https://decoy.example.edu/openurl?ctx=zzz";
+  const offer = jobOffer("job_evidence_decoy", decoyOfferURL) as { payload: Record<string, unknown> };
+  offer.payload["requires_auth"] = true;
+  await h.port.inbound(offer); // populates latestResolverOrigin()'s decoy candidate
+  h.bridge.attachKeepalive({
+    getSnapshot: () => ({ resolverOrigin: "https://granted-host.example.edu", pausedForReauth: false }),
+  } as unknown as KeepaliveManager); // decoy for the keepalive-snapshot fallback
+
+  const sent = h.bridge.emitSessionEvidence("warm_verified", undefined);
+
+  expect(sent).toBe(true);
+  const frame = h.frames().find((f) => f.type === "session_evidence");
+  expect(frame?.payload).toEqual({ evidence: "warm_verified", at: new Date(h.clock.now).toISOString() });
+});
+
+test("an auth-flagged resolver hostname omits origin_hint on auth_returned rather than inventing a fallback", async () => {
+  // resolverOriginHint returns undefined for any offer URL isAuthenticationURL
+  // flags (sso/idp/login/auth/shibboleth labels), so an institution whose own
+  // resolver hostname contains one of those must fail closed to "no hint" —
+  // not fall back to the keepalive snapshot's granted-host decoy below.
+  const ssoOpenURL = "https://sso.resolver.example.edu/openurl?ctx=abc";
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["session_evidence_v1"] }));
+  h.bridge.attachKeepalive({
+    getSnapshot: () => ({ resolverOrigin: "https://granted-host.example.edu", pausedForReauth: false }),
+  } as unknown as KeepaliveManager);
+  await h.port.inbound(jobOffer("job_evidence_sso", ssoOpenURL));
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+
+  const idpURL = "https://idp.example.edu/sso?SAMLRequest=x";
+  await h.tabs.onUpdated.emit(tabID, { url: idpURL }, { id: tabID, url: idpURL });
+  await h.tabs.onUpdated.emit(tabID, { url: idpURL, status: "complete" }, { id: tabID, url: idpURL });
+  await h.tabs.onUpdated.emit(tabID, { url: `https://${PROVIDER_HOST}/stable/x` }, { id: tabID });
+
+  const frame = h.frames().find((f) => f.type === "session_evidence");
+  expect(frame?.payload).toEqual({ evidence: "auth_returned", at: new Date(h.clock.now).toISOString() });
+});
+
 test("a job-tab download completes to a basename-only frame; unrelated tab ignored", async () => {
   const h = makeHarness();
   await h.bridge.start();
@@ -4876,6 +4940,55 @@ test("delivery provenance keeps the host that requested the download", async () 
 
   const context = h.frames().find((frame) => frame.type === "delivery_context");
   expect(context?.payload).toMatchObject({ page_host: "provider.example.edu" });
+});
+
+test("delivery session evidence is frozen at request time, not completion time", async () => {
+  const jobID = "job_delivery_evidence_frozen";
+  const pdfURL = "https://public.example.org/article/10.2000-y.pdf";
+  const h = makeHarness({
+    ...emptyStore(),
+    activeJobs: [
+      {
+        job_id: jobID,
+        tab_id: 100,
+        offered_at: 1_700_000_000_000,
+        expires_at: 1_700_000_600_000,
+        status: "accepted",
+        provider_hosts: [],
+      },
+    ],
+  });
+  h.tabs.live.set(100, { id: 100, url: pdfURL });
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["delivery_context_v1"] }));
+
+  // Request the delivery with no warm session anywhere: keepaliveAuthenticated,
+  // authReturnedThisWorker, and lastAuthReturnedAt are all unset.
+  const reply = await h.bridge.startPDFDelivery({ tab_id: 100, url: pdfURL });
+  expect(reply.ok).toBe(true);
+  const downloadID = 900 + h.downloads.started.length;
+
+  // An institutional sign-in lands elsewhere in the browser while this
+  // non-institutional download is still in flight. A live read at
+  // completion would credit this delivery with it; the frozen value must not.
+  await h.bridge.setKeepaliveAuthenticated(true);
+
+  h.downloads.items.set(downloadID, {
+    id: downloadID,
+    tabId: 100,
+    filename: "/tmp/paper.pdf",
+    mime: "application/pdf",
+    fileSize: 1000,
+    state: "complete",
+  });
+  await h.downloads.onChanged.emit({ id: downloadID, state: { current: "complete" } });
+
+  const context = h.frames().find((frame) => frame.type === "delivery_context");
+  expect(context?.payload).toMatchObject({
+    route: "direct",
+    session_evidence: "none",
+    page_host: "public.example.org",
+  });
 });
 
 test("failed delivery frozen host does not poison a later non-delivery download", async () => {

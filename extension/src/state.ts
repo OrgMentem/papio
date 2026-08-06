@@ -8,6 +8,8 @@
 // is persisted. Resolver-provided offer URLs are retained only while their
 // active jobs exist so a suspended MV3 worker can recover the exact handoff.
 
+import type { DeliverySessionEvidence } from "./protocol";
+
 export type JobStatus = "offered" | "queued" | "accepted" | "auth_pending" | "awaiting_download";
 
 /** Browser-managed delivery of an active PDF tab. The URL is intentionally
@@ -24,6 +26,15 @@ export interface PendingDelivery {
    * The download outlives the navigation that started it, so the provenance
    * host cannot be re-read from the tab once the bytes land. */
   page_host?: string;
+  /** Session evidence available at the moment the delivery was requested,
+   * frozen alongside page_host. keepaliveAuthenticated/authReturnedThisWorker/
+   * lastAuthReturnedAt are live global state, not scoped to this tab or
+   * download — the multi-second download window leaves time for an
+   * institutional probe or sign-in to complete elsewhere in the browser, and
+   * reading evidence again at completion would credit this delivery with
+   * that unrelated session instead of the one that actually existed when the
+   * page produced the bytes. */
+  session_evidence?: DeliverySessionEvidence;
 }
 
 /** Durable, informed user choice for auto-accepting publisher terms &

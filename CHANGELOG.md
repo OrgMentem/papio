@@ -24,6 +24,29 @@ execution records in `notes/acquisition-stack-plan.md`.
 
 ### Fixed
 
+- **The quarantine preview re-verifies the file on every serve.** The digest
+  was checked once and the result cached on the capability, so any later GET
+  of the same URL re-opened the file and served it with no hash check at all —
+  a different read from the one that was verified. A quarantined file is
+  untrusted by definition and its path is known to the process that wrote it,
+  so a swap between the operator's first look and a reload served bytes nobody
+  had checked. Verification now runs per serve, from the same handle the
+  response is written from, and a mismatch revokes the capability. The hash
+  runs outside the server mutex: a PDF viewer issues a range request per chunk,
+  and holding the lock across a full file read would serialise every preview in
+  the process behind the largest document.
+- **A capture that arrives as its deadline expires is reported as a success.**
+  The result channel and the timeout became ready together and Go's select
+  chose between them pseudo-randomly, so a capture that had already been
+  delivered and stored could still be reported as a timeout — leaving the file
+  on disk with nothing pointing at it. The timeout path now re-checks the
+  channel under the same lock a deliverer takes, so whichever side arrives
+  first wins outright.
+- **`papio batch report --markdown` strips terminal control bytes too.** The
+  markdown flag renders through its own `describe` helper rather than the
+  plain-text path that was hardened, so the same third-party manifest titles
+  still reached the terminal raw through a sibling flag of a command already
+  listed as covered.
 - **Every command that prints third-party text strips terminal control
   bytes.** Bibliographic strings are stored with only `TrimSpace`, so a
   record whose title or DOI carries an OSC sequence could rewrite the

@@ -2949,6 +2949,13 @@ export class Bridge {
     // interactive for the whole download, so this is the only moment the
     // page that actually produced these bytes is known for certain.
     const deliveryPageHostAtStart = sanitizePageHost(tabURL);
+    // Freeze session evidence too, for the same reason: keepaliveAuthenticated/
+    // authReturnedThisWorker/lastAuthReturnedAt are live global state, not
+    // scoped to this tab, so an institutional probe or sign-in landing
+    // anywhere in the browser during the multi-second download must not
+    // retroactively credit this delivery. deliveryEvidenceFor reads this
+    // frozen value back at completion instead of re-reading live state.
+    const sessionEvidenceAtStart = this.currentSessionEvidence(job);
     await this.update((s) =>
       startPendingDelivery(s, {
         job_id: job.job_id,
@@ -2956,6 +2963,7 @@ export class Bridge {
         initiated_at: this.deps.now(),
         status: "sending",
         ...(deliveryPageHostAtStart !== undefined ? { page_host: deliveryPageHostAtStart } : {}),
+        session_evidence: sessionEvidenceAtStart,
       }),
     );
     this.lastDeliveryState = undefined;
@@ -4241,6 +4249,21 @@ export class Bridge {
     if (firstOpenAccessLanding) await this.reloadAuthenticationHandoffs(false);
   }
 
+  // A popup delivery's route is deliberately never classified "oa" here,
+  // even when job.requires_auth === false would say the job is OA-routed.
+  // Session evidence and OA classification are orthogonal: an operator can
+  // send an OA-routed PDF while an unrelated institutional session is warm
+  // elsewhere in the same browser, and frozen evidence (below) correctly
+  // reports "warm" for that case. The daemon's wire validator rejects any
+  // frame with route "oa" and session_evidence not "none" (BrowserAccessBasis),
+  // and a rejected delivery_context is a fatal decode that tears down the
+  // whole native-messaging session (AGENTS.md) — so claiming "oa" here would
+  // turn a merely conservative access_basis into a session-ending crash the
+  // moment evidence is honestly "warm". Staying on "direct" always decodes,
+  // and "direct" + "none" already resolves to the conservative "manual"
+  // basis (never "institutional", never an unverified "open_access") — the
+  // same fallback BrowserAccessBasis documents for missing/incomplete
+  // context.
   private deliveryRouteFor(job: ActiveJob, track: DownloadTrack): DeliveryRoute {
     if (track.delivery === true) return "direct";
     if (track.route !== undefined) return track.route;
@@ -4248,9 +4271,9 @@ export class Bridge {
     return job.requires_auth === false ? "oa" : "direct";
   }
 
-  private deliveryEvidenceFor(job: ActiveJob, track: DownloadTrack, route: DeliveryRoute): DeliverySessionEvidence {
-    if (route === "oa") return "none";
-    if (track.sessionEvidence !== undefined) return track.sessionEvidence;
+  /** Live session-evidence read from mutable global state. Only valid for the
+   * instant it is read — see deliveryEvidenceFor's frozen-value guard. */
+  private currentSessionEvidence(job: ActiveJob): DeliverySessionEvidence {
     const perJob = this.deliverySessionEvidence.get(job.job_id);
     if (perJob !== undefined) return perJob;
     const lastAuth = this.store.lastAuthReturnedAt;
@@ -4259,6 +4282,26 @@ export class Bridge {
       if (age >= 0 && age <= AUTH_EVIDENCE_TTL_MS) return "fresh_auth";
     }
     return this.keepaliveAuthenticated || this.authReturnedThisWorker ? "warm" : "none";
+  }
+
+  private deliveryEvidenceFor(job: ActiveJob, track: DownloadTrack, route: DeliveryRoute): DeliverySessionEvidence {
+    if (route === "oa") return "none";
+    // Mirrors deliveryPageHost's frozen-host guard below: a popup delivery's
+    // session evidence is captured once, in startPDFDelivery, at request
+    // time. The download can take seconds with the tab still interactive, so
+    // keepaliveAuthenticated/authReturnedThisWorker/lastAuthReturnedAt are
+    // live global state that can flip true mid-download — reading them here
+    // would credit a public-page delivery with an institutional probe or
+    // sign-in that happened to land elsewhere in the browser while the bytes
+    // were still in flight.
+    if (track.delivery === true) {
+      const frozen = this.store.pendingDelivery;
+      if (frozen?.job_id === job.job_id && frozen.status !== "failed" && frozen.session_evidence !== undefined) {
+        return frozen.session_evidence;
+      }
+    }
+    if (track.sessionEvidence !== undefined) return track.sessionEvidence;
+    return this.currentSessionEvidence(job);
   }
 
   private async deliveryPageHost(
@@ -4352,6 +4395,15 @@ export class Bridge {
     }
   }
 
+  /** origin_hint is authoritative on the daemon: an absent hint scopes the
+   * release to the default profile (safe), but a hint that resolves to the
+   * WRONG institution is indistinguishable from a correct one and releases
+   * that institution's parked handoffs without its session being verified
+   * (papio-7d7a0ae96ca5726e). So this only ever forwards the origin the
+   * caller actually observed for THIS evidence — never a keepalive
+   * snapshot's resolver (which itself degrades to an arbitrary granted
+   * host) or the most recent offer's origin, which need not be the origin
+   * that produced this evidence at all. */
   emitSessionEvidence(evidence: "warm_verified" | "auth_returned", originHint?: string): boolean {
     const now = this.deps.now();
     const sentAt = this.sessionEvidenceSentAt;
@@ -4360,13 +4412,11 @@ export class Bridge {
       if (age >= 0 && age < SESSION_EVIDENCE_THROTTLE_MS) return false;
     }
     if (!(this.store.daemonFeatures ?? []).includes(SESSION_EVIDENCE_FEATURE)) return false;
-    const candidateOrigin =
-      originHint ?? this.keepaliveManager?.getSnapshot().resolverOrigin ?? this.latestResolverOrigin();
     const payload: Record<string, unknown> = {
       evidence,
       at: new Date(now).toISOString(),
     };
-    if (isBareHTTPSOrigin(candidateOrigin)) payload.origin_hint = candidateOrigin;
+    if (isBareHTTPSOrigin(originHint)) payload.origin_hint = originHint;
     if (!this.send("session_evidence", payload)) return false;
     this.sessionEvidenceSentAt = now;
     return true;

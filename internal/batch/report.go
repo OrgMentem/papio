@@ -20,6 +20,7 @@ import (
 
 	"papio/internal/job"
 	"papio/internal/protocol"
+	"papio/internal/store"
 	"papio/internal/zotio"
 )
 
@@ -643,7 +644,18 @@ func markdownDetail(item ReportWork) string {
 	return strings.Join(parts, "; ")
 }
 
+// describe renders one work for the human-readable Markdown report. Its only
+// caller is Markdown, whose only caller prints straight to the terminal
+// (`papio batch report --markdown`), so the third-party title and identifiers
+// it returns get the same control-byte stripping as the plain-text renderer's
+// reportWorkDescription. Both are stored with TrimSpace only, so an OSC or CSI
+// sequence in a manifest title would otherwise reach the operator's terminal
+// through this flag while the sibling text path was hardened against it.
 func describe(request protocol.WorkRequest) string {
+	return store.StripTerminalControls(describeRaw(request))
+}
+
+func describeRaw(request protocol.WorkRequest) string {
 	if request.Title != "" {
 		return request.Title
 	}

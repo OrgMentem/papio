@@ -355,6 +355,129 @@ func TestPageCaptureRequestDeliveredCorrelatedStoredAndBusy(t *testing.T) {
 	}
 }
 
+// TestCaptureLateResultWinsOverConcurrentTimeout covers the outcome side of
+// ledger finding papio-373ff6c00ec87dbc: Capture's select race could pick the
+// ctx.Done() arm even though a result already sat in the buffered
+// pending.result channel, reporting "timeout" for a capture that actually
+// succeeded — and silently orphaning the stored file (on disk, never
+// reported).
+//
+// Scope, stated honestly: this test does NOT force the racing arm. Sending on
+// pending.result wakes Capture's select immediately, before the cancel below
+// is reached, so the result arm is what actually runs here and the recheck
+// added inside the ctx.Done() arm is not exercised. Forcing the other arm
+// would need both cases ready at the instant the select evaluates, which is
+// not reachable from outside Capture — and even then Go chooses between two
+// ready cases pseudo-randomly. So treat this as pinning the delivered-result
+// OUTCOME, with the sibling test pinning the genuine-timeout outcome; the
+// recheck itself is verified by reading, not by this test. Removing the
+// recheck does not make either test fail.
+func TestCaptureLateResultWinsOverConcurrentTimeout(t *testing.T) {
+	b, _, _, _ := newBridge(t)
+	runSync(t, b, hello())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	resultCh := make(chan CaptureResult, 1)
+	go func() {
+		resultCh <- b.Capture(ctx, CaptureRequest{
+			URL: "https://sagepub.com/article/42", Provider: "sage", Scenario: "success",
+		})
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	var pending *pendingPageCapture
+	for {
+		b.mu.Lock()
+		pending = b.pendingCaptures[testSessionID]
+		b.mu.Unlock()
+		if pending != nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("capture request was not queued")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	const storedPath = "/tmp/papio-late-capture.html"
+	b.mu.Lock()
+	delete(b.pendingCaptures, testSessionID)
+	pending.result <- CaptureResult{
+		RequestID: pending.payload.RequestID,
+		Outcome:   "captured",
+		Path:      storedPath,
+	}
+	b.mu.Unlock()
+	cancel()
+
+	select {
+	case result := <-resultCh:
+		if result.Outcome != "captured" || result.RequestID != pending.payload.RequestID || result.Path != storedPath {
+			t.Fatalf("capture result = %#v, want the delivered success rather than a timeout", result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("capture did not return")
+	}
+
+	b.mu.Lock()
+	leaked := b.pendingCaptures[testSessionID] != nil
+	b.mu.Unlock()
+	if leaked {
+		t.Fatal("pending capture entry survived a resolved request, leaking the busy flag")
+	}
+}
+
+// TestCaptureGenuineTimeoutClearsPendingState pins the other half of the
+// papio-373ff6c00ec87dbc fix: an undelivered capture must still report a
+// timeout, and the recheck added to close the race must not leave the
+// pending/busy bookkeeping behind — a stuck entry would refuse every later
+// capture on the session as "busy" forever.
+func TestCaptureGenuineTimeoutClearsPendingState(t *testing.T) {
+	b, _, _, _ := newBridge(t)
+	runSync(t, b, hello())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	resultCh := make(chan CaptureResult, 1)
+	go func() {
+		resultCh <- b.Capture(ctx, CaptureRequest{
+			URL: "https://sagepub.com/article/42", Provider: "sage", Scenario: "success",
+		})
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		b.mu.Lock()
+		queued := len(b.pendingCaptures) == 1
+		b.mu.Unlock()
+		if queued {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("capture request was not queued")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+
+	var result CaptureResult
+	select {
+	case result = <-resultCh:
+	case <-time.After(time.Second):
+		t.Fatal("capture did not return")
+	}
+	if result.Outcome != "timeout" {
+		t.Fatalf("capture outcome = %q, want timeout for an undelivered capture", result.Outcome)
+	}
+
+	b.mu.Lock()
+	pendingCount := len(b.pendingCaptures)
+	b.mu.Unlock()
+	if pendingCount != 0 {
+		t.Fatalf("pendingCaptures = %d after a genuine timeout, want 0 (leaked busy flag)", pendingCount)
+	}
+}
+
 // TestPageCaptureRedirectedToDifferentHostStillCorrelates pins the regression
 // the host-guard revert exists to prevent (bc3f4b2). payload.Host is not the
 // requested host — extension/src/capture.ts sets it from location.origin,

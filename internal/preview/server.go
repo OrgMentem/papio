@@ -396,35 +396,55 @@ func (s *Server) servePDF(w http.ResponseWriter, r *http.Request, token string) 
 		writeNotFound(w)
 		return
 	}
-	var file *os.File
-	var info os.FileInfo
-	if !entry.verified {
-		file, info, ok = s.verifyLocked(entry)
-		if !ok {
-			s.revokeLocked(entry.actionID)
-			s.mu.Unlock()
-			w.WriteHeader(http.StatusGone)
-			return
-		}
-		entry.verified = true
+	// Re-verify the digest on EVERY serve, not just the first. A quarantined
+	// file is untrusted by definition and its path is known to the process
+	// that produced it, so caching "verified" across requests would let a
+	// swap between the operator's first look (or the accepted verdict) and
+	// a later reload of the same capability URL serve different bytes than
+	// the ones actually hashed. entry.verified still gates the accept
+	// verdict below (a PDF must have loaded at least once); it is no longer
+	// used to skip re-hashing here.
+	if entry.sha256 == "" {
+		// A long-running dev store can hold a HumanAction row that predates
+		// the sha256 binding guard (see AGENTS.md); Issue already rejects an
+		// invalid hash, so this should be unreachable via that path, but
+		// fail closed with a precise message instead of letting an empty
+		// expected digest either panic or slip through as "no hash to check".
+		s.mu.Unlock()
+		writePlainError(w, http.StatusInternalServerError, "preview capability has no recorded hash to verify against\n")
+		return
 	}
-	path := entry.path
+	// Hash outside s.mu. Verification reads the whole file, and a PDF viewer
+	// issues a range request per chunk, so re-verifying under the lock would
+	// serialise every preview in the process behind one full file read —
+	// two operators reviewing at once would block each other for as long as
+	// the larger document takes to hash. path/size/sha256 are immutable once
+	// a capability is issued, so checking a snapshot of them is equivalent
+	// to checking under the lock, and the handle we serve from is the very
+	// one we hashed, so the bytes sent are the bytes verified.
+	actionID, path, size, want := entry.actionID, entry.path, entry.size, entry.sha256
 	s.mu.Unlock()
 
-	if file == nil {
-		var err error
-		file, err = os.Open(path)
-		if err != nil {
-			writeNotFound(w)
-			return
-		}
-		info, err = file.Stat()
-		if err != nil || !info.Mode().IsRegular() {
-			_ = file.Close()
-			writeNotFound(w)
-			return
-		}
+	file, info, ok := verifyQuarantinedFile(path, size, want)
+	if !ok {
+		s.mu.Lock()
+		s.revokeLocked(actionID)
+		s.mu.Unlock()
+		writePlainError(w, http.StatusGone, "quarantined file no longer matches its verified hash\n")
+		return
 	}
+
+	s.mu.Lock()
+	if current, live := s.byToken[token]; !live || current != entry {
+		// Revoked or swept while we were hashing; do not serve bytes for a
+		// capability that no longer exists.
+		s.mu.Unlock()
+		_ = file.Close()
+		writeNotFound(w)
+		return
+	}
+	entry.verified = true
+	s.mu.Unlock()
 	defer file.Close()
 
 	w.Header().Set("Content-Type", "application/pdf")
@@ -459,18 +479,23 @@ func (s *Server) revokeLocked(actionID int64) {
 	}
 }
 
-func (s *Server) verifyLocked(entry *capability) (*os.File, os.FileInfo, bool) {
-	file, err := os.Open(entry.path)
+// verifyQuarantinedFile re-reads the file and confirms it still matches the
+// size and digest the capability was issued against, returning a handle
+// rewound to the start so the caller serves exactly the bytes it just
+// hashed. It takes no lock and touches no server state: every input is
+// immutable for the life of a capability.
+func verifyQuarantinedFile(path string, size int64, want string) (*os.File, os.FileInfo, bool) {
+	file, err := os.Open(path)
 	if err != nil {
 		return nil, nil, false
 	}
 	info, err := file.Stat()
-	if err != nil || !info.Mode().IsRegular() || info.Size() != entry.size {
+	if err != nil || !info.Mode().IsRegular() || info.Size() != size {
 		_ = file.Close()
 		return nil, nil, false
 	}
 	hash := sha256.New()
-	if _, err := io.Copy(hash, file); err != nil || hex.EncodeToString(hash.Sum(nil)) != entry.sha256 {
+	if _, err := io.Copy(hash, file); err != nil || hex.EncodeToString(hash.Sum(nil)) != want {
 		_ = file.Close()
 		return nil, nil, false
 	}

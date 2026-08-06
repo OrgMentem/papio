@@ -18,6 +18,26 @@ for the full pre-split extension history.
 
 ### Fixed
 
+- **Session evidence never invents an institution.** When the observed origin
+  was unknown, `emitSessionEvidence` substituted one — the keepalive snapshot's
+  resolver origin, which itself degrades to an arbitrary granted host, or the
+  origin of the most recent institutional offer. The daemon treats a resolvable
+  hint as authoritative, so a wrong-but-resolvable one released a second
+  institution's parked handoffs without its session having been verified. That
+  is reachable for any institution whose own resolver hostname contains `sso`,
+  `idp`, `login`, `auth` or `shibboleth`, since the hint derivation fails closed
+  on those and fell through to the substitute. The hint is now sent only when it
+  is the origin actually observed for that evidence, and omitted otherwise —
+  which is safe, because the daemon scopes an unattributable frame to the
+  default profile rather than picking an institution by list order.
+- **A delivery's access basis reflects the page that produced the bytes.** The
+  session evidence behind `access_basis` was read when the download completed,
+  from mutable global warm-auth state, so an institutional probe or sign-in
+  finishing anywhere in the browser mid-download recorded a PDF fetched from a
+  public page as institutionally acquired. Evidence is now frozen at request
+  time beside the page host, and applied only to the delivery it was captured
+  for. Freezing the host alone could not fix this: the host is not an input to
+  the basis decision.
 - **A resumed handoff is no longer stranded by its own parked marker.** The
   marker recording a deliberate park was cleared only when a drive actually
   registered, but with both governor slots busy — the normal steady state —
