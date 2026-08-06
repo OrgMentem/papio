@@ -101,7 +101,10 @@ func MatchIdentityWithThreshold(text string, target work.Work, titleThreshold fl
 	// title and year checks further down instead of slicing the same window
 	// under a second name.
 	bylineText := identityByline(text)
-	correctionMarker := correctionMarkerIn(strings.Split(bylineText, "\n"))
+	// Folded before the split for the same reason bylineSegments folds: a marker
+	// hyphenated across a wrap ("Errat-\num:") is one word the text layer broke,
+	// and splitting first leaves it invisible to every prefix test below.
+	correctionMarker := correctionMarkerIn(strings.Split(typographicFolder.Replace(bylineText), "\n"))
 	// A correction marker is diagnostic on every verdict a human will read, not
 	// only on the ones it downgrades: "comment on" at the top of page one is the
 	// first thing a reviewer wants to know, whatever else already withheld the
@@ -302,7 +305,7 @@ func MatchIdentityWithThreshold(text string, target work.Work, titleThreshold fl
 // discards. Those words carry no weight in a membership test and all the weight
 // in an ordering one: "update to" is what makes a different paper out of the
 // same five significant words.
-func identityTitlePhrase(title string) []string { return normalizedTokens(title) }
+func identityTitlePhrase(title string) string { return strings.Join(normalizedTokens(title), "") }
 
 // titleSegment is one printed run of words plus where punctuation fell inside
 // it. Both edges matter: a title is a punctuation-delimited or line-delimited
@@ -315,8 +318,13 @@ func identityTitlePhrase(title string) []string { return normalizedTokens(title)
 // does to a request for "Safety Leadership".
 type titleSegment struct {
 	words []string
-	// breaks[i] reports that punctuation, not a plain space, followed words[i].
+	// breaks[i] reports that punctuation, not a space, followed words[i], and
+	// labels[i] narrows that to the punctuation a publisher ends a LABEL with.
+	// The end edge accepts any punctuation; the start edge accepts only a label,
+	// because a citing sentence reaches for a quote where a publisher reaches
+	// for a colon.
 	breaks []bool
+	labels []bool
 }
 
 // bylineSegments returns the byline window as the runs a publisher printed on
@@ -344,36 +352,51 @@ func bylineSegments(byline string) []titleSegment {
 func splitTitleSegment(run string) titleSegment {
 	var segment titleSegment
 	word := strings.Builder{}
-	punctuated := false
+	pending := rune(0)
 	flush := func() {
 		if word.Len() == 0 {
 			return
 		}
 		segment.words = append(segment.words, strings.ToLower(word.String()))
 		segment.breaks = append(segment.breaks, false)
+		segment.labels = append(segment.labels, false)
 		word.Reset()
+	}
+	mark := func() {
+		if pending == 0 || len(segment.breaks) == 0 {
+			return
+		}
+		segment.breaks[len(segment.breaks)-1] = true
+		if strings.ContainsRune(labelTerminators, pending) {
+			segment.labels[len(segment.labels)-1] = true
+		}
 	}
 	for _, r := range run {
 		switch {
 		case unicode.IsLetter(r) || unicode.IsDigit(r):
-			if punctuated && len(segment.breaks) != 0 {
-				segment.breaks[len(segment.breaks)-1] = true
-			}
-			punctuated = false
+			mark()
+			pending = 0
 			word.WriteRune(r)
 		default:
 			flush()
-			if r != ' ' && r != '\t' {
-				punctuated = true
+			if !strings.ContainsRune(spaceCutset, r) && pending == 0 {
+				pending = r
 			}
 		}
 	}
 	flush()
-	if punctuated && len(segment.breaks) != 0 {
-		segment.breaks[len(segment.breaks)-1] = true
-	}
+	mark()
 	return segment
 }
+
+// labelTerminators end a label; other punctuation does not. A publisher labels a
+// title with a colon, a full stop, or a rule — "Original Article:", "1.",
+// "RESEARCH ARTICLE |" — where a sentence citing a title reaches for a quote,
+// a dash, or a bracket: `We cite "Core reporting practices in structural
+// equation modeling" for guidance` put a quote directly before the title and so
+// satisfied any punctuation test, which is the citing-sentence false accept the
+// label cap exists to refuse.
+const labelTerminators = ":.|\u2022\u00b7"
 
 // titlePrintedAsLine reports whether phrase is printed as a delimited unit:
 // beginning where a segment begins or a short label ended, and ending where a
@@ -388,13 +411,13 @@ func splitTitleSegment(run string) titleSegment {
 // label is short where a sentence is not.
 const titleLabelWords = 3
 
-func titlePrintedAsLine(segments []titleSegment, phrase []string) bool {
-	if len(phrase) == 0 {
+func titlePrintedAsLine(segments []titleSegment, phrase string) bool {
+	if phrase == "" {
 		return false
 	}
 	for start, segment := range segments {
 		for offset := range min(len(segment.words), titleLabelWords+1) {
-			if offset != 0 && !segment.breaks[offset-1] {
+			if offset != 0 && !segment.labels[offset-1] {
 				continue
 			}
 			if titleRunMatches(segments[start:], offset, phrase) {
@@ -405,17 +428,42 @@ func titlePrintedAsLine(segments []titleSegment, phrase []string) bool {
 	return false
 }
 
-func titleRunMatches(segments []titleSegment, offset int, phrase []string) bool {
+// titleRunMatches compares the printed words against the title as one character
+// stream rather than word by word, because a text layer decides where the word
+// boundaries are and it decides badly. "PsychologicalSafety and LearningBehavior
+// in WorkTeams" lost the spaces inside three of its words, and matching tokens
+// pairwise parked a paper whose printed title is otherwise byte-identical to the
+// catalogue record. Concatenating both sides tolerates that, and the wrap across
+// lines, without loosening either edge: the run must still start where a segment
+// or a label ends and finish where the clause does.
+func titleRunMatches(segments []titleSegment, offset int, phrase string) bool {
 	matched := 0
 	for i, segment := range segments {
+		if matched != 0 && numberedRun(segment.words[offset:]) {
+			// A line number, a page number, or a column marker interrupting the
+			// wrap: a submitted manuscript numbers every line, so the title of
+			// the Fransen preprint arrives as "…with an initial structure of",
+			// "6", "vertical leadership". Digits alone cannot be part of a title
+			// that has already begun, so stepping over them keeps the wrap
+			// intact without letting any word through.
+			offset = 0
+			continue
+		}
 		words := segment.words[offset:]
 		breaks := segment.breaks[offset:]
 		offset = 0
 		for j, word := range words {
-			if matched == len(phrase) || word != phrase[matched] {
+			switch {
+			case strings.HasPrefix(phrase[matched:], word):
+				matched += len(word)
+			case strings.HasPrefix(word, phrase[matched:]) && isASCIIDigits(word[len(phrase)-matched:]):
+				// The last word carries a flattened superscript: a title ending
+				// "MODEL OF CHANGE1" is the title plus a footnote mark, and the
+				// mark closes the clause as surely as punctuation would.
+				return true
+			default:
 				return false
 			}
-			matched++
 			if matched == len(phrase) {
 				// The title ends here only if the page does too: a segment end,
 				// or punctuation closing the clause.
@@ -429,6 +477,21 @@ func titleRunMatches(segments []titleSegment, offset int, phrase []string) bool 
 		}
 	}
 	return false
+}
+
+// numberedRun reports a segment that is nothing but digits — a line number, a
+// page number, or a column marker. It is not part of any title, so a title
+// already under way survives one.
+func numberedRun(words []string) bool {
+	if len(words) == 0 {
+		return false
+	}
+	for _, word := range words {
+		if !isASCIIDigits(word) {
+			return false
+		}
+	}
+	return true
 }
 
 // correctionMarkerIn reports the first correctionMarkers entry that prefixes
@@ -457,40 +520,88 @@ func correctionMarkerIn(lines []string) string {
 	return ""
 }
 
-// wideGapSegments splits a line where pdftotext left a run of two or more
-// spaces, which is where it concatenated a running head, a page number, or a
-// second column. Single spaces are deliberately left alone: "applied a
-// Bonferroni correction for multiple comparisons" must stay one segment, or
-// ordinary prose starts tripping the rules that read segment starts. A leading
-// byte-order mark or zero-width joiner is trimmed, because strings.TrimSpace
-// does not and a marker behind one is invisible to a prefix test.
+// wideGapSegments splits a line where the text layer left a gap that joins two
+// printed runs rather than separating two words of one: two or more whitespace
+// characters, or a single tab or other control separator. pdftotext concatenates
+// a running head, a page number, or a second column with either, and a tab
+// defeated a two-space test entirely — 28 of 632 documents in a real library
+// carry a literal tab.
+//
+// A single space is deliberately not a gap, and neither is a single no-break or
+// thin space: those are word spaces, chosen by a typesetter to hold words
+// together — French style puts one before a colon — so splitting on one would
+// take a title apart. "applied a Bonferroni correction for multiple comparisons"
+// must likewise stay one segment, or ordinary prose starts tripping every rule
+// that reads a segment start. Zero-width leaders are trimmed because
+// strings.TrimSpace does not, and a marker behind one is invisible to a prefix
+// test.
 func wideGapSegments(line string) []string {
-	line = strings.TrimLeft(line, " \t\ufeff\u200b\u200c\u200d\u200e\u200f")
+	line = strings.TrimLeft(line, spaceCutset+zeroWidthCutset)
 	var segments []string
-	for line != "" {
-		gap := strings.Index(line, "  ")
-		if gap < 0 {
-			return append(segments, line)
+	for start := 0; start < len(line); {
+		gapAt, gapEnd := nextWideGap(line[start:])
+		if gapAt < 0 {
+			return append(segments, line[start:])
 		}
-		if segment := strings.TrimRight(line[:gap], " \t"); segment != "" {
+		if segment := strings.TrimRight(line[start:start+gapAt], spaceCutset); segment != "" {
 			segments = append(segments, segment)
 		}
-		line = strings.TrimLeft(line[gap:], " \t")
+		start += gapEnd
 	}
 	return segments
 }
 
+const (
+	spaceCutset     = " \t\v\f\r\u00a0\u2007\u202f\u2009\u2002\u2003"
+	separatorCutset = "\t\v\f\r"
+	zeroWidthCutset = "\ufeff\u200b\u200c\u200d\u200e\u200f"
+)
+
+// nextWideGap returns the byte bounds of the first gap in line that joins two
+// printed runs rather than separating two words of one.
+func nextWideGap(line string) (start, end int) {
+	for offset, r := range line {
+		if offset < start || !strings.ContainsRune(spaceCutset, r) {
+			continue
+		}
+		width, runes, separator := 0, 0, false
+		for _, gap := range line[offset:] {
+			if !strings.ContainsRune(spaceCutset, gap) {
+				break
+			}
+			if strings.ContainsRune(separatorCutset, gap) {
+				separator = true
+			}
+			width += utf8.RuneLen(gap)
+			runes++
+		}
+		if separator || runes > 1 {
+			return offset, offset + width
+		}
+		start = offset + width
+	}
+	return -1, -1
+}
+
 // correctionMarkerAt reports the marker one segment declares, or "" for a
-// segment that declares none. A pointer phrase wins over a marker that
-// prefixes it: a correction published elsewhere is announced ON the corrected
-// work, so reading "erratum to this chapter is available at …" as a
+// segment that declares none.
+//
+// A pointer phrase suppresses the marker, because a correction published
+// elsewhere is announced ON the corrected work — Springer prints "Erratum to
+// this chapter is available at …" on the chapter itself — and reading that as a
 // self-declaration would cap the pass of the very document the operator asked
-// for.
+// for. It suppresses only when no colon follows the phrase: "Erratum to this
+// article: <title>" is a real erratum heading convention, so the colon is what
+// separates a document announcing itself from one pointing elsewhere.
 func correctionMarkerAt(segment string) string {
 	for _, phrase := range correctionPointerPhrases {
-		if strings.HasPrefix(segment, phrase) {
-			return ""
+		if !strings.HasPrefix(segment, phrase) {
+			continue
 		}
+		if strings.HasPrefix(strings.TrimLeft(segment[len(phrase):], spaceCutset), ":") {
+			break
+		}
+		return ""
 	}
 	for _, marker := range correctionMarkers {
 		if strings.HasPrefix(segment, marker) {

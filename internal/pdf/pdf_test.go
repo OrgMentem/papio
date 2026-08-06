@@ -785,6 +785,81 @@ func TestIdentityCorrectionMarkerSurvivesAGluedPageNumber(t *testing.T) {
 	}
 }
 
+// wideGapSegments only recognized a run of two or more ASCII spaces as a
+// join, so a running header glued to the erratum heading by a single TAB, or
+// by a run of U+00A0 no-break spaces — pdftotext's other two ways of
+// representing the same column break — defeated it exactly like the
+// exact-prefix test did before the double-space fix above. Both bytes are
+// real: 28 of 632 cached documents in the operator's reference library carry
+// a literal tab, and one carries a run of no-break spaces. Before
+// wideGapSegments recognised anything but two-or-more plain spaces, each of
+// the first two cases below reached IdentityPass with nothing but "exact
+// normalized DOI match" as evidence — the correction marker was right there
+// on the page and invisible to the guard. The third case is the boundary
+// that makes the other two meaningful: a single plain ASCII space must stay
+// inert, or "applied a Bonferroni correction for multiple comparisons"
+// starts tripping the same rule.
+func TestIdentityCorrectionMarkerSurvivesATabOrNoBreakSpaceGlue(t *testing.T) {
+	target := work.Work{
+		DOI: "10.1234/cal.7", Year: 2025,
+		Title:   "Sensor Network Calibration Under Adverse Weather",
+		Authors: []string{"Priya Natarajan"},
+	}
+	t.Run("glued by a single tab", func(t *testing.T) {
+		erratum := "J Sensor Syst 2025;12:1\tErratum: Sensor Network Calibration Under Adverse Weather\n" +
+			"Bob Clarke\n2025\ndoi:10.1234/cal.7\n"
+		got := MatchIdentity(erratum, target)
+		if got.Result != IdentityReview {
+			t.Fatalf("result = %+v, want review: a single tab must join a running header to the marker exactly like two spaces", got)
+		}
+		if !strings.Contains(strings.Join(got.Evidence, " "), "front matter marks a correction or comment: erratum") {
+			t.Fatalf("evidence = %v, want the correction marker named", got.Evidence)
+		}
+	})
+	t.Run("glued by two no-break spaces", func(t *testing.T) {
+		erratum := "J Sensor Syst 2025;12:1\u00a0\u00a0Erratum: Sensor Network Calibration Under Adverse Weather\n" +
+			"Bob Clarke\n2025\ndoi:10.1234/cal.7\n"
+		got := MatchIdentity(erratum, target)
+		if got.Result != IdentityReview {
+			t.Fatalf("result = %+v, want review: no-break spaces must join a running header to the marker exactly like ASCII spaces", got)
+		}
+		if !strings.Contains(strings.Join(got.Evidence, " "), "front matter marks a correction or comment: erratum") {
+			t.Fatalf("evidence = %v, want the correction marker named", got.Evidence)
+		}
+	})
+	t.Run("a single plain space stays inert", func(t *testing.T) {
+		plainSpaceTarget := work.Work{Title: "Statistical Power Analysis for Clinical Trials", Authors: []string{"Alice Smith"}, Year: 2024}
+		text := "Statistical Power Analysis for Clinical Trials\nAlice Smith\n2024\n" +
+			"We applied a Bonferroni correction for multiple comparisons across all endpoints.\n"
+		if got := MatchIdentity(text, plainSpaceTarget); got.Result != IdentityPass {
+			t.Fatalf("result = %+v, want pass: a single ASCII space must never widen into a gap", got)
+		}
+	})
+}
+
+// correctionMarkerIn used to split the byline window into lines before any
+// typographic folding ran, while its sibling bylineSegments folds first
+// precisely because pdftotext hyphenates justified text across a line wrap.
+// A marker broken the same way — "Errat-\num: <title>" — is one word the
+// text layer split across the wrap, not two, and splitting on the raw "\n"
+// before folding left each half on its own line where no prefix test could
+// see either.
+func TestIdentityFoldsAHyphenatedCorrectionMarker(t *testing.T) {
+	target := work.Work{
+		DOI: "10.1234/cal.7", Year: 2025,
+		Title:   "Sensor Network Calibration Under Adverse Weather",
+		Authors: []string{"Priya Natarajan"},
+	}
+	erratum := "Errat-\num: Sensor Network Calibration Under Adverse Weather\nBob Clarke\n2025\ndoi:10.1234/cal.7\n"
+	got := MatchIdentity(erratum, target)
+	if got.Result != IdentityReview {
+		t.Fatalf("result = %+v, want review: a hyphenated marker must be folded before the line split, not after", got)
+	}
+	if !strings.Contains(strings.Join(got.Evidence, " "), "front matter marks a correction or comment: erratum") {
+		t.Fatalf("evidence = %v, want the correction marker named", got.Evidence)
+	}
+}
+
 // strings.TrimSpace does not strip U+FEFF: a byte-order mark some extractors
 // prepend to the very first character of the document survives untouched and
 // sits between the start of the line and "Erratum:", so a document opening
@@ -900,6 +975,22 @@ func TestIdentityCorrectionMarkerSurvivesALeadingFormFeed(t *testing.T) {
 // would satisfy the bare "erratum" marker before the longer, more specific
 // phrase ever got a chance to rule it out — parking the very document the
 // operator asked for.
+//
+// The fixture used to join the body to this footnote with a trailing space
+// and no newline, so the footnote was never its own line: correctionMarkerIn
+// splits on "\n" before it looks for a wide gap, and a single space is not a
+// gap, so the footnote stayed glued to the end of the preceding sentence as
+// one long segment whose PREFIX was still ordinary prose — the pointer-phrase
+// exclusion this test claims to defend was never even consulted. Proof:
+// emptying correctionPointerPhrases left the old fixture green. A newline
+// before the footnote, not a trailing space, is the fix, and both assertions
+// below are needed to keep it honest: the first proves the pointer stays
+// inert with no marker evidence at all, and the second proves the exclusion
+// is doing real work rather than the marker never having been reached — the
+// SAME fixture with the pointer reworded one word over, as a self-declaration
+// ("Erratum to this chapter: <title>"), must cap. Emptying
+// correctionPointerPhrases now turns the first assertion red, where before
+// the newline fix it did not.
 func TestIdentityCorrectionPointerToAnotherWorkDoesNotPark(t *testing.T) {
 	target := work.Work{
 		DOI: "10.1007/978-3-319-57379-3_19", Year: 2018,
@@ -908,13 +999,70 @@ func TestIdentityCorrectionPointerToAnotherWorkDoesNotPark(t *testing.T) {
 	}
 	header := "Synaptic Plasticity in the Developing Cortex\nElena Ruiz\n2018\ndoi:10.1007/978-3-319-57379-3_19\n"
 	body := strings.Repeat("The developing cortex undergoes extensive synaptic remodeling during this period. ", 21) +
-		"Additional histological analysis was performed on this tissue. "
-	footnote := "Erratum to this chapter is available at 10.1007/978-3-319-57379-3_20\n"
+		"Additional histological analysis was performed on this tissue."
 	tail := "Layer V pyramidal neurons showed reduced dendritic complexity in the sample.\n"
-	text := header + body + footnote + tail
-	if got := MatchIdentity(text, target); got.Result != IdentityPass {
+
+	pointer := "Erratum to this chapter is available at 10.1007/978-3-319-57379-3_20\n"
+	pointerText := header + body + "\n" + pointer + tail
+	if offset := strings.Index(pointerText, "Erratum"); offset < identityFrontMatterBytes || offset >= identityBylineBytes {
+		t.Fatalf("fixture drifted: footnote sits at byte %d, want inside [%d, %d) — past the front matter and inside the byline window", offset, identityFrontMatterBytes, identityBylineBytes)
+	}
+	got := MatchIdentity(pointerText, target)
+	if got.Result != IdentityPass {
 		t.Fatalf("result = %+v, want pass: a pointer to an erratum published elsewhere must not park the corrected chapter itself", got)
 	}
+	if strings.Contains(strings.Join(got.Evidence, " "), "front matter marks a correction or comment") {
+		t.Fatalf("evidence = %v, want no correction marker named: the pointer phrase must suppress it entirely", got.Evidence)
+	}
+
+	selfDeclared := "Erratum to this chapter: Synaptic Plasticity in the Developing Cortex\n"
+	selfText := header + body + "\n" + selfDeclared + tail
+	if offset := strings.Index(selfText, "Erratum"); offset < identityFrontMatterBytes || offset >= identityBylineBytes {
+		t.Fatalf("fixture drifted: heading sits at byte %d, want inside [%d, %d) — past the front matter and inside the byline window", offset, identityFrontMatterBytes, identityBylineBytes)
+	}
+	got = MatchIdentity(selfText, target)
+	if got.Result != IdentityReview {
+		t.Fatalf("result = %+v, want review: a colon after the pointer phrase makes it a self-declaration, one word away from the pointer above", got)
+	}
+	if !strings.Contains(strings.Join(got.Evidence, " "), "front matter marks a correction or comment: erratum") {
+		t.Fatalf("evidence = %v, want the correction marker named", got.Evidence)
+	}
+}
+
+// The pointer-phrase exclusion above is anchored on "erratum to this
+// chapter"; publishers use "article" and "paper" just as often, and the bit
+// that tells a pointer from a self-declaration is the same in every case:
+// whether a colon follows the phrase. "Erratum to this article is available
+// at 10.1007/…" points at a correction published elsewhere; "Erratum to this
+// article: <title>" is the article announcing its own. Both are real
+// publisher conventions, and the colon is the only thing that separates them.
+func TestIdentityErratumPointerRequiresNoColonToStayInert(t *testing.T) {
+	target := work.Work{
+		Title:   "Sensor Network Calibration Under Adverse Weather",
+		Authors: []string{"Priya Natarajan"},
+		Year:    2025,
+	}
+	header := "Sensor Network Calibration Under Adverse Weather\nPriya Natarajan\n2025\n"
+	t.Run("pointer without a colon stays inert", func(t *testing.T) {
+		text := header + "Erratum to this article is available at 10.1007/xyz.9\n"
+		got := MatchIdentity(text, target)
+		if got.Result != IdentityPass {
+			t.Fatalf("result = %+v, want pass: a pointer with no colon names a correction published elsewhere", got)
+		}
+		if strings.Contains(strings.Join(got.Evidence, " "), "front matter marks a correction or comment") {
+			t.Fatalf("evidence = %v, want no correction marker named", got.Evidence)
+		}
+	})
+	t.Run("self-declaration with a colon caps", func(t *testing.T) {
+		text := header + "Erratum to this article: Sensor Network Calibration Under Adverse Weather\n"
+		got := MatchIdentity(text, target)
+		if got.Result != IdentityReview {
+			t.Fatalf("result = %+v, want review: a colon after the pointer phrase makes it a self-declaration heading", got)
+		}
+		if !strings.Contains(strings.Join(got.Evidence, " "), "front matter marks a correction or comment: erratum") {
+			t.Fatalf("evidence = %v, want the correction marker named", got.Evidence)
+		}
+	})
 }
 
 // "…applied a Bonferroni correction for multiple comparisons…" is ordinary
@@ -1081,7 +1229,13 @@ func TestIdentityFoldsHyphenationBeforeSplittingTitleLines(t *testing.T) {
 // inline within one segment when a colon or period ends it, or recovered as
 // its own segment when pdftotext glues it to the title with a double space,
 // the same escape TestIdentityCorrectionMarkerSurvivesAGluedRunningHeader
-// defends for the correction marker. Both must still pass.
+// defends for the correction marker. Both must still pass. A rule character
+// ("RESEARCH ARTICLE | <title>") closes a label the same way a colon or full
+// stop does — labelTerminators lists it explicitly — because a section
+// heading reaches for a pipe where a sentence citing the title never does;
+// that asymmetry is what TestIdentityParksATitleQuotedOrDashedInsideACitingSentence
+// depends on below, so this case guards labelTerminators from narrowing away
+// a real publisher convention along with the false accept.
 func TestIdentityAcceptsATitleAfterAShortPublisherLabel(t *testing.T) {
 	target := work.Work{Title: "Robustness Calibration Measurement Networks", Authors: []string{"Ada Lovelace"}}
 	colon := MatchIdentity("Original Article: Robustness Calibration Measurement Networks\nAda Lovelace\n", target)
@@ -1097,6 +1251,13 @@ func TestIdentityAcceptsATitleAfterAShortPublisherLabel(t *testing.T) {
 	}
 	if !strings.Contains(strings.Join(numbered.Evidence, " "), "requested title printed as a line in the front matter") {
 		t.Fatalf("evidence = %v, want the printed-title line named", numbered.Evidence)
+	}
+	piped := MatchIdentity("RESEARCH ARTICLE | Robustness Calibration Measurement Networks\nAda Lovelace\n", target)
+	if piped.Result != IdentityPass {
+		t.Fatalf("result = %+v, want pass after a pipe-terminated section label", piped)
+	}
+	if !strings.Contains(strings.Join(piped.Evidence, " "), "requested title printed as a line in the front matter") {
+		t.Fatalf("evidence = %v, want the printed-title line named", piped.Evidence)
 	}
 }
 
@@ -1156,5 +1317,103 @@ func TestIdentityCapsTheLabelAllowanceAtThreeWords(t *testing.T) {
 	}
 	if !strings.Contains(strings.Join(got.Evidence, " "), "requested title is not printed as a line in the front matter") {
 		t.Fatalf("evidence = %v, want the printed-title park named", got.Evidence)
+	}
+}
+
+// The next two shapes are real documents that word-by-word matching still
+// parked even after the printed-title line rule above landed, because the
+// printed words were not the same TOKENS as the requested title even though
+// they were the same CHARACTERS. Comparing the title and the printed run as
+// one concatenated character stream — identityTitlePhrase drops the spaces
+// between words for exactly this reason — recovers both without loosening
+// either edge of the rule. Both are among the documents behind the
+// 632-document corpus's correct-pass count rising from 559 to 564.
+
+// A real paper's text layer read "PsychologicalSafety\nand
+// LearningBehavior\nin WorkTeams" — the interior space inside three
+// consecutive words silently dropped, wrapped across three printed lines —
+// for a catalogue title of "Psychological safety and learning behavior in
+// work teams" that is otherwise byte-identical. Comparing segment.words[i]
+// against the title's own word at that position fails immediately:
+// "psychologicalsafety" is not "psychological". Concatenating both sides
+// before comparing tolerates the missing spaces without caring where inside
+// the run they went missing.
+func TestIdentityAcceptsATitleWhoseInteriorSpacesWereLostAcrossAWrap(t *testing.T) {
+	target := work.Work{
+		Title:   "Psychological safety and learning behavior in work teams",
+		Authors: []string{"Edmondson"}, Year: 1999,
+	}
+	text := "PsychologicalSafety\nand LearningBehavior\nin WorkTeams\nAmy Edmondson\nHarvard University\n\n" +
+		"This paper presents a model of team learning and psychological safety, examining how safety " +
+		"shapes learning behavior across work teams."
+	got := MatchIdentity(text, target)
+	if got.Result != IdentityPass {
+		t.Fatalf("result = %+v, want pass: a concatenated match must survive interior spaces the text layer dropped", got)
+	}
+	if !strings.Contains(strings.Join(got.Evidence, " "), "requested title printed as a line in the front matter") {
+		t.Fatalf("evidence = %v, want the printed-title line named", got.Evidence)
+	}
+}
+
+// Another real paper printed "TRANSTHEORETICAL THERAPY: TOWARD A MORE
+// INTEGRATIVE\nMODEL OF CHANGE1" for a catalogue title ending "...model of
+// change": the text layer welded a footnote digit onto the title's own last
+// word. titleRunMatches now accepts a final printed word that is the
+// remaining title text followed only by digits, and treats those digits as
+// closing the clause the way punctuation would — the match must still begin
+// at the segment carrying "TRANSTHEORETICAL", not merely tolerate a trailing
+// digit anywhere.
+func TestIdentityAcceptsATitleWithAFootnoteDigitWeldedToItsLastWord(t *testing.T) {
+	target := work.Work{
+		Title:   "Transtheoretical therapy: Toward a more integrative model of change",
+		Authors: []string{"Prochaska"}, Year: 1982,
+	}
+	text := "PSYCHOTHERAPY: THEORY, RESEARCH AND PRACTICE\nVOLUME 19, # 3 , FALL, 1982\n\n" +
+		"TRANSTHEORETICAL THERAPY: TOWARD A MORE INTEGRATIVE\nMODEL OF CHANGE1\n" +
+		"JAMES O. PROCHASKA*\nUniversity of Rhode Island\n"
+	got := MatchIdentity(text, target)
+	if got.Result != IdentityPass {
+		t.Fatalf("result = %+v, want pass: a flattened footnote digit must not block the title's last word", got)
+	}
+	if !strings.Contains(strings.Join(got.Evidence, " "), "requested title printed as a line in the front matter") {
+		t.Fatalf("evidence = %v, want the printed-title line named", got.Evidence)
+	}
+}
+
+// The start edge used to accept ANY punctuation ahead of the title, so a
+// sentence quoting another paper's title — one of the most common citation
+// styles there is — satisfied it as easily as a real label: `We cite "Core
+// reporting practices in structural equation modeling" for guidance.`
+// reached IdentityPass on a document that is not the requested paper at all,
+// the exact false accept the printed-title rule exists to refuse. Both this
+// and the em-dash form below were real wrong accepts in the corpus.
+// labelTerminators now narrows the start edge to a colon, full stop, or rule
+// — ":.|•·" — so neither the quote nor the dash preceding the title counts
+// as a label. The end edge is untouched and still accepts any punctuation,
+// including the quote and the dash trailing the title here, because "<title>.
+// Authors (Year)." is a real shape TestIdentityAcceptsATitleFollowedByAuthorsOnTheSameLine
+// already depends on.
+func TestIdentityParksATitleQuotedOrDashedInsideACitingSentence(t *testing.T) {
+	target := work.Work{
+		Title:   "Core reporting practices in structural equation modeling",
+		Authors: []string{"Ada Lovelace"}, Year: 2024,
+	}
+	quoted := MatchIdentity(
+		"We cite \"Core reporting practices in structural equation modeling\" for guidance.\nAda Lovelace (2024).\n",
+		target)
+	if quoted.Result != IdentityReview {
+		t.Fatalf("result = %+v, want review: a quoted citation of the title must not count as printed", quoted)
+	}
+	if !strings.Contains(strings.Join(quoted.Evidence, " "), "requested title is not printed as a line in the front matter") {
+		t.Fatalf("evidence = %v, want the printed-title park named", quoted.Evidence)
+	}
+	dashed := MatchIdentity(
+		"We cite \u2014 Core reporting practices in structural equation modeling \u2014 for guidance.\nAda Lovelace (2024).\n",
+		target)
+	if dashed.Result != IdentityReview {
+		t.Fatalf("result = %+v, want review: an em-dash-set citation of the title must not count as printed", dashed)
+	}
+	if !strings.Contains(strings.Join(dashed.Evidence, " "), "requested title is not printed as a line in the front matter") {
+		t.Fatalf("evidence = %v, want the printed-title park named", dashed.Evidence)
 	}
 }
