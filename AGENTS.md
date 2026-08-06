@@ -170,6 +170,17 @@ Bump the pinned zensical version in `docs/requirements.txt` deliberately; CI ins
   must be added to **both**, plus `protocol/browser-v1.schema.json`. New fields should be
   **optional/omitempty** and validated fail-closed; existing fixtures/round-trip tests must
   still pass (backward compatible).
+- **`extension/src/protocol.ts`'s `FieldSpec<T>` is exhaustive, so the TS payload
+  interfaces are now compiler-enforced rather than decorative.** Every field of the
+  payload type MUST appear in the `requireFields<T>(...)` spec — adding a field to an
+  interface without a parser disposition is a `bun run typecheck` error, and naming a
+  field the interface does not declare is too. Dispositions are `"required"`,
+  `"optional"`, and `"forbidden"` (a field the wire contract defines but *this* schema
+  version must reject, e.g. `actions_requires_auth` on a `triage_snapshot_response` —
+  `triage_counts_response` v2 is the only frame allowed to carry it, mirroring
+  `protocol.go`'s gate). Do not silence a spec/interface mismatch by widening the
+  interface: the mismatch is the intended signal that a field landed in one of the three
+  places and not the others.
 - **"Optional field" is only backward compatible in ONE direction, and it is not the one
   you need.** Both parsers reject unknown fields, so an optional field added to an
   *existing* message type is fine for a new parser reading an old frame and **fatal** for an

@@ -288,8 +288,6 @@ export interface HumanActionResolvePayload {
   expected_sha256?: string;
 }
 
-export type HumanActionResolveResultPayload = TriageDecideResultPayload;
-
 export interface ReviewPreviewRequestPayload {
   request_id: string;
   action_id: number;
@@ -466,15 +464,23 @@ function requireKeys(obj: Record<string, unknown>, what: string, required: strin
     if (!(key in obj)) fail(`${what}: missing required field ${JSON.stringify(key)}`);
   }
 }
-type FieldSpec<T> = { [K in keyof T & string]?: "required" | "optional" };
+/** Every field of the payload type must be listed, so a field added to the
+ * interface without a matching parser disposition is a typecheck error.
+ * `forbidden` names a field the wire contract defines but this schema version
+ * must reject (e.g. a v2-only counter seen on a v1 frame). */
+type FieldSpec<T> = { [K in keyof T & string]-?: "required" | "optional" | "forbidden" };
 
 function requireFields<T>(obj: Record<string, unknown>, what: string, spec: FieldSpec<T>): void {
   for (const key of Object.keys(obj)) {
     if (!(key in spec)) fail(`${what}: unknown field ${JSON.stringify(key)} (fail closed)`);
   }
   for (const key of Object.keys(spec)) {
-    if (spec[key as keyof FieldSpec<T>] === "required" && !(key in obj)) {
+    const disposition = spec[key as keyof FieldSpec<T>];
+    if (disposition === "required" && !(key in obj)) {
       fail(`${what}: missing required field ${JSON.stringify(key)}`);
+    }
+    if (disposition === "forbidden" && key in obj) {
+      fail(`${what}: unknown field ${JSON.stringify(key)} (fail closed)`);
     }
   }
 }
@@ -564,7 +570,7 @@ function triageCounts(raw: unknown, what: string, allowAuth = false): void {
     pending_total: "required",
     watch_hits: "required",
     actions: "required",
-    ...(allowAuth ? { actions_requires_auth: "optional" as const } : {}),
+    actions_requires_auth: allowAuth ? "optional" : "forbidden",
     retractions: "required",
     jobs_working: "required",
     jobs_needs_review: "required",
