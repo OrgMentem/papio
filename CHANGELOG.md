@@ -130,6 +130,50 @@ execution records in `notes/acquisition-stack-plan.md`.
 
 ### Fixed
 
+- **An open-access paper whose cached PDF link has rotted is now recovered from
+  the publisher's own landing page instead of being sent to your institution.**
+  Aggregators cache a direct PDF URL, and those URLs expire: for one Frontiers
+  paper both Unpaywall and OpenAlex returned the same Azure blob link whose
+  signature ran out on 2021-02-16, so both candidates 403'd and the job fell
+  through to an institutional sign-in — for a paper anyone can download without
+  one. Both candidate rows already carried the publisher landing page, and that
+  page advertises the working file in `citation_pdf_url`; papio had the recovery
+  route in hand and never looked at it. When every open-access candidate fails
+  permanently, the landing page is now read (once per pass, before the sibling
+  hop and before any retry park, so a slow unrelated resolver cannot delay a
+  deterministic recovery) and the file it advertises becomes a derived
+  candidate. The derivation inherits its parent's source, access basis and
+  policy — it is the same observation reached a second way, not a new source, so
+  no source needs enabling and no configuration changes. The reader sends no
+  caller credentials, because carrying a signed candidate URL's headers to a
+  different origin would leak them.
+- **A browser handoff that cannot succeed now stops asking.** The only brake on
+  automatic offers was the seven-day `QuiesceAfter` fence, so a handoff that
+  could never complete kept costing a tab: one was offered 38 times across three
+  days with no outcome of any kind, pinning both browser drive slots and
+  starving every other job of them. Offers are now also bounded by evidence —
+  three fruitless drive epochs and papio stops offering unprompted, recording a
+  single `browser.handoff_quiesced` audit event. Reconnects are not evidence: a
+  service-worker restart re-acknowledging the same live drive collapses into the
+  epoch already running, so recovering transport is never mistaken for failure.
+  Both fences apply, the action stays open and visible, and an explicit
+  `papio actions open` always gets its drive.
+- **A parked job no longer reports a cause it does not know.** Every retry park
+  was labelled `candidate_temporarily_unavailable`, including passes where the
+  candidates had failed permanently and something else entirely — a temporary
+  resolver, a closed source gate — was holding the job. The transition now
+  reports what was actually observed, counting retryable candidates, temporary
+  resolvers and closed source gates separately. Scheduling is unchanged; only
+  the explanation is. The former reason string still classifies, because events
+  already written carry it.
+- **An open-access page behind a public anti-bot gate keeps its browser route
+  after the first pass.** papio detects that such a candidate is worth one
+  ordinary-browser attempt, but the finding lived in a variable scoped to the
+  pass that made it. Once the candidate was marked failed, later passes found an
+  empty queue, never re-evaluated it, and routed the job to an institutional
+  sign-in instead — papio noticed the right answer and then forgot it. The
+  finding now survives as a job event recording only the candidate's key, never
+  the URL, and the live URL is recovered from the current pass's own candidates.
 - **A DOI that does not exist no longer parks the job on an institutional
   sign-in.** A well-formed but unregistered DOI — one transposed digit in
   `10.1016/j.cedpsych.2020.101816` for `…101860` was the reported case —

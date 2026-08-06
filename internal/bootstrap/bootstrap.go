@@ -26,6 +26,7 @@ import (
 	"papio/internal/fetch"
 	"papio/internal/hook"
 	"papio/internal/job"
+	"papio/internal/landingmeta"
 	"papio/internal/notify"
 	"papio/internal/ownership"
 	"papio/internal/ownershipsnapshot"
@@ -195,6 +196,11 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 	// existence oracle, carries no quota or credential, and is consulted only
 	// at the no-candidates handoff boundary.
 	service.DOIRegistry = doiregistry.New(doiregistry.Options{Client: metadataClient, ContactEmail: cfg.Email, Version: version})
+	// Not a second HTTP client: landingmeta only ever reads a page the app
+	// layer already decided to fetch (an OA candidate's own Landing URL), so
+	// it shares metadataClient's SSRF guard, redirect cap and body bound
+	// rather than reimplementing them.
+	service.LandingReader = landingmeta.NewReader(metadataClient, metadataPolicy.MaxBytes)
 	var senders []notify.Sender
 	if cfg.Notify.Enabled {
 		senders = append(senders, notify.NewMacOS())

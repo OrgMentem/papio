@@ -2738,6 +2738,112 @@ func (a HumanAction) Quiesced(now time.Time) bool {
 	return now.Sub(created) >= QuiesceAfter
 }
 
+// HandoffAcceptedLease bounds how long a single accepted browser drive can
+// justify holding an epoch open before the absence of any terminal or
+// progress event marks that drive fruitless. It is deliberately longer than
+// the extension's own 3-minute drive timeout so one physical drive — which
+// may re-acknowledge across a service-worker restart — is never split into
+// two counted epochs.
+const HandoffAcceptedLease = 5 * time.Minute
+
+// MaxAutomaticHandoffEpochs is how many fruitless drive epochs an open
+// handoff tolerates before papio stops re-offering it on its own initiative.
+// In the verified field incident a single openurl_handoff for a paper that
+// needed no institution was offered 38 times over three days with zero
+// terminal browser.provider_outcome events, pinning both of the extension's
+// handoff drive slots and spawning a duplicate tab per service-worker
+// restart — and the action was only 3.07 days old the whole time, well
+// inside QuiesceAfter's seven-day fence. Time alone was never going to catch
+// this; it needed evidence from what each accepted drive actually did.
+//
+// These are safety invariants, not operator tuning: a config field would
+// force a config/binary lockstep deploy for a number that should never need
+// per-deployment adjustment.
+const MaxAutomaticHandoffEpochs = 3
+
+// HandoffOfferState is the automatic-offer decision folded from a job's
+// persisted event history: how many browser drives in a row produced no
+// terminal or progress signal, and whether that streak should stop papio
+// from re-offering unprompted.
+type HandoffOfferState struct {
+	FruitlessEpochs int
+	Quiesced        bool
+}
+
+// ProjectHandoffOfferState folds a job's event history into the automatic-offer
+// decision. events are the `[]map[string]any` rows returned by the store, oldest
+// first; each has a "kind" string and a "detail" map. actionCreatedAt scopes the
+// fold to the currently open human action: a job that re-entered awaiting_human
+// carries its whole history in events, and a prior, already-resolved action's
+// drives must not count against a fresh one.
+//
+// An unparseable actionCreatedAt, or an unparseable event timestamp, fails
+// open (not quiesced) for the same reason Quiesced does: the noisy failure is
+// the safe one here, because the quiet one strands the action.
+func ProjectHandoffOfferState(events []map[string]any, actionCreatedAt string, now time.Time) HandoffOfferState {
+	created, err := time.Parse(time.RFC3339Nano, actionCreatedAt)
+	if err != nil {
+		return HandoffOfferState{}
+	}
+
+	var epochStart time.Time
+	open := false
+	fruitless := 0
+	closeEpoch := func(fruitlessClose bool) {
+		if !open {
+			return
+		}
+		open = false
+		if fruitlessClose {
+			fruitless++
+		} else {
+			fruitless = 0
+		}
+	}
+
+	for _, event := range events {
+		atStr, _ := event["at"].(string)
+		at, err := time.Parse(time.RFC3339Nano, atStr)
+		if err != nil {
+			return HandoffOfferState{}
+		}
+		if at.Before(created) {
+			continue // belongs to a prior, already-resolved human action
+		}
+		if open && at.Sub(epochStart) >= HandoffAcceptedLease {
+			closeEpoch(true) // lease elapsed before anything terminal arrived
+		}
+		switch kind, _ := event["kind"].(string); kind {
+		case "browser.handoff_offered", "browser.job_accept":
+			// Reconnect re-acknowledgements land here too; if an epoch is
+			// already open and still within lease, this is the SAME epoch —
+			// counting raw offers would turn one stuck drive into dozens.
+			if !open {
+				epochStart = at
+				open = true
+			}
+		case "browser.provider_outcome", "browser.download_started", "browser.download_complete":
+			closeEpoch(false)
+		case "job.transition":
+			detail, _ := event["detail"].(map[string]any)
+			from, _ := detail["from"].(string)
+			to, _ := detail["to"].(string)
+			if from == StateAwaitingHuman && to != StateAwaitingHuman {
+				closeEpoch(false)
+			}
+			// browser.job_reject and send failures are transport problems,
+			// not a fruitless drive: they fall through untouched.
+		}
+	}
+	if open && now.Sub(epochStart) >= HandoffAcceptedLease {
+		closeEpoch(true)
+	}
+	return HandoffOfferState{
+		FruitlessEpochs: fruitless,
+		Quiesced:        fruitless >= MaxAutomaticHandoffEpochs,
+	}
+}
+
 // OpenHandoffJob binds one open institutional handoff action to its awaiting
 // job row. The bridge uses this joined view to drain arbitrarily large
 // handoff backlogs without one Get query per action.

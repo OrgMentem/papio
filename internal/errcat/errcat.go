@@ -47,7 +47,7 @@ func Explain(state, reason, resolver, accessMode string, cfg config.Config) Expl
 	case "semantic_or_identity_review":
 		return Explanation{"identity_review",
 			"Confirm the downloaded PDF is the requested paper; approve it to finish, or reject to try another source."}
-	case "resolver_temporarily_unavailable", "candidate_temporarily_unavailable":
+	case "resolver_temporarily_unavailable", "candidate_temporarily_unavailable", "acquisition_inputs_temporarily_unavailable":
 		return Explanation{"retrying",
 			"A source was temporarily unavailable; papio will retry automatically. No action needed."}
 	case "no_identifier":

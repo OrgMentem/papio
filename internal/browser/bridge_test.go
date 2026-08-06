@@ -3950,3 +3950,189 @@ func TestSyncResponseFitsResultCap(t *testing.T) {
 			worst, ipc.MaxResultBytes, protocol.MaxBrowserMessageBytes, maxOutstandingOffers+maxFocusFramesPerPoll, len(offer))
 	}
 }
+
+// appendEventAt inserts a raw job event with a caller-controlled timestamp,
+// bypassing store.Now() so a test can lay out a precise epoch timeline.
+func appendEventAt(t *testing.T, jobs *job.Store, jobID, kind string, detail map[string]any, at time.Time) {
+	t.Helper()
+	if detail == nil {
+		detail = map[string]any{}
+	}
+	data, err := json.Marshal(detail)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := jobs.S.DB().ExecContext(context.Background(),
+		`INSERT INTO events (job_id, at, kind, detail_json) VALUES (?, ?, ?, ?)`,
+		jobID, at.UTC().Format(time.RFC3339Nano), kind, string(data)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// openHandoffAction finds the open handoffActionKind action for a job, as
+// jobs.OpenHumanAction records it — the fixture helpers below need its
+// CreatedAt to anchor a synthetic event timeline to the real action.
+func openHandoffAction(t *testing.T, jobs *job.Store, jobID string) job.HumanAction {
+	t.Helper()
+	ctx := context.Background()
+	actions, err := jobs.ListHumanActions(ctx, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range actions {
+		if a.JobID == jobID && a.Kind == handoffActionKind {
+			return a
+		}
+	}
+	t.Fatalf("no open handoff action for %s", jobID)
+	return job.HumanAction{}
+}
+
+// TestAutomaticHandoffQuiescesFruitlessEpochsAcrossRestart reproduces the
+// verified field incident purely through event evidence: an action seconds
+// old — nowhere near QuiesceAfter's seven-day fence — whose accepted browser
+// drives never produced a terminal outcome. Ten reconnect offer/accept pairs
+// inside one lease must collapse into a single fruitless epoch, not ten;
+// after three fruitless epochs the automatic offer must stop, with exactly
+// one audit event and the action left open; an explicit `papio actions open`
+// must still get its drive.
+func TestAutomaticHandoffQuiescesFruitlessEpochsAcrossRestart(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	id := park(t, jobs, "wr_quiesce_evidence", handoffWork())
+	action := openHandoffAction(t, jobs, id)
+	created, err := time.Parse(time.RFC3339Nano, action.CreatedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Epoch 1: initial offer+accept, then ten reconnect offer/accept pairs
+	// inside the five-minute lease — a service-worker restart re-acking the
+	// same physical drive, not ten separate drives.
+	epoch1Start := created.Add(time.Second)
+	appendEventAt(t, jobs, id, "browser.handoff_offered", map[string]any{"requires_auth": false}, epoch1Start)
+	appendEventAt(t, jobs, id, "browser.job_accept", nil, epoch1Start.Add(time.Second))
+	for i := range 10 {
+		at := epoch1Start.Add(time.Duration(i+1) * 20 * time.Second)
+		appendEventAt(t, jobs, id, "browser.handoff_offered", map[string]any{"requires_auth": false}, at)
+		appendEventAt(t, jobs, id, "browser.job_accept", nil, at.Add(time.Second))
+	}
+
+	// Confirm the collapse directly: right after epoch 1's lease elapses,
+	// with no outcome recorded, that is exactly ONE fruitless epoch — not ten.
+	events, err := jobs.Events(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	afterEpoch1 := epoch1Start.Add(job.HandoffAcceptedLease + time.Second)
+	state := job.ProjectHandoffOfferState(events, action.CreatedAt, afterEpoch1)
+	if state.FruitlessEpochs != 1 {
+		t.Fatalf("fruitless epochs after ten reconnects = %d, want 1 (reconnects must collapse into one epoch)", state.FruitlessEpochs)
+	}
+	if state.Quiesced {
+		t.Fatal("quiesced after only one fruitless epoch")
+	}
+
+	// Epoch 2 and epoch 3: same shape, each started after the previous
+	// epoch's lease has already elapsed, neither ever seeing an outcome.
+	epoch2Start := epoch1Start.Add(job.HandoffAcceptedLease + 10*time.Second)
+	appendEventAt(t, jobs, id, "browser.handoff_offered", map[string]any{"requires_auth": false}, epoch2Start)
+	appendEventAt(t, jobs, id, "browser.job_accept", nil, epoch2Start.Add(time.Second))
+
+	epoch3Start := epoch2Start.Add(job.HandoffAcceptedLease + 10*time.Second)
+	appendEventAt(t, jobs, id, "browser.handoff_offered", map[string]any{"requires_auth": false}, epoch3Start)
+	appendEventAt(t, jobs, id, "browser.job_accept", nil, epoch3Start.Add(time.Second))
+
+	finalNow := epoch3Start.Add(job.HandoffAcceptedLease + time.Second)
+	b.now = func() time.Time { return finalNow }
+
+	// First sweep: epoch 3's lease has just elapsed with no outcome, which is
+	// the third fruitless epoch. The automatic offer must be suppressed and
+	// the quiesce audited exactly once.
+	msgs, _ := runSync(t, b, hello())
+	if got := countType(msgs, protocol.MsgJobOffer); got != 0 {
+		t.Fatalf("automatic offer after three fruitless epochs = %d, want 0", got)
+	}
+	if b.offered[id] {
+		t.Fatalf("job marked offered despite fruitless-epoch quiesce: %#v", b.offered)
+	}
+
+	// A second sweep must not append a second audit event.
+	runSync(t, b)
+
+	all, err := jobs.Events(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	quiescedEvents := 0
+	for _, ev := range all {
+		if kind, _ := ev["kind"].(string); kind == "browser.handoff_quiesced" {
+			quiescedEvents++
+		}
+	}
+	if quiescedEvents != 1 {
+		t.Fatalf("browser.handoff_quiesced events = %d, want exactly 1", quiescedEvents)
+	}
+
+	openActions, err := jobs.ListHumanActions(ctx, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stillOpen := false
+	for _, a := range openActions {
+		if a.ID == action.ID && a.Status == "open" {
+			stillOpen = true
+		}
+	}
+	if !stillOpen {
+		t.Fatalf("quiesced action must stay open, got %+v", openActions)
+	}
+
+	// An explicit `papio actions open` still overrides both fences.
+	b.mu.Lock()
+	b.focusPending[id] = true
+	b.mu.Unlock()
+	msgs, _ = runSync(t, b)
+	if got := countType(msgs, protocol.MsgJobOffer); got != 1 {
+		t.Fatalf("focusPending offer after quiesce = %d, want 1", got)
+	}
+}
+
+// TestProjectHandoffOfferStateProviderOutcomeResetsFruitlessCount confirms a
+// terminal outcome inside an epoch — not a job_reject or a transport
+// failure — is what clears the fruitless streak.
+func TestProjectHandoffOfferStateProviderOutcomeResetsFruitlessCount(t *testing.T) {
+	_, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	id := park(t, jobs, "wr_quiesce_reset", handoffWork())
+	action := openHandoffAction(t, jobs, id)
+	created, err := time.Parse(time.RFC3339Nano, action.CreatedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// One fruitless epoch, same shape as the main test.
+	epoch1Start := created.Add(time.Second)
+	appendEventAt(t, jobs, id, "browser.handoff_offered", map[string]any{"requires_auth": false}, epoch1Start)
+	appendEventAt(t, jobs, id, "browser.job_accept", nil, epoch1Start.Add(time.Second))
+
+	// A second epoch that DOES get a terminal outcome inside its lease.
+	epoch2Start := epoch1Start.Add(job.HandoffAcceptedLease + 10*time.Second)
+	appendEventAt(t, jobs, id, "browser.handoff_offered", map[string]any{"requires_auth": false}, epoch2Start)
+	appendEventAt(t, jobs, id, "browser.job_accept", nil, epoch2Start.Add(time.Second))
+	appendEventAt(t, jobs, id, "browser.provider_outcome",
+		map[string]any{"outcome": "landing_only"}, epoch2Start.Add(2*time.Minute))
+
+	events, err := jobs.Events(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := epoch2Start.Add(job.HandoffAcceptedLease + time.Minute)
+	state := job.ProjectHandoffOfferState(events, action.CreatedAt, now)
+	if state.FruitlessEpochs != 0 {
+		t.Fatalf("fruitless epochs after a terminal outcome = %d, want 0 (provider_outcome must reset the streak)", state.FruitlessEpochs)
+	}
+	if state.Quiesced {
+		t.Fatal("quiesced despite a terminal outcome resetting the streak")
+	}
+}

@@ -1,0 +1,82 @@
+[
+  {
+    "name": "frontiers_absolute",
+    "file": "frontiers_absolute.html",
+    "base": "https://www.frontiersin.org/journals/education/articles/10.3389/feduc.2018.00095/full",
+    "want": "https://www.frontiersin.org/articles/10.3389/feduc.2018.00095/pdf",
+    "agreed_with_extension": true,
+    "note": "the incident that motivated the package"
+  },
+  {
+    "name": "relative_resolves_against_landing",
+    "file": "relative_resolves_against_landing.html",
+    "base": "https://publisher.example/journals/ed/articles/10.1234/x/full",
+    "want": "https://publisher.example/articles/10.1234/x/pdf",
+    "agreed_with_extension": true,
+    "note": "relative content resolves against the FINAL landing URL, not the DOI"
+  },
+  {
+    "name": "whitespace_is_trimmed",
+    "file": "whitespace_is_trimmed.html",
+    "base": "https://publisher.example/x",
+    "want": "https://publisher.example/a.pdf",
+    "agreed_with_extension": true,
+    "note": "Agreed, but only because the Go side does the work explicitly. WHATWG URL strips leading/trailing ASCII whitespace itself; Go's net/url does NOT \u2014 base.Parse(\"   \") yields %20%20%20. landingmeta trims ASCII whitespace (space/tab/CR/LF/VT/FF, not Unicode spaces) before parsing so the two agree."
+  },
+  {
+    "name": "http_is_rejected",
+    "file": "http_is_rejected.html",
+    "base": "https://publisher.example/x",
+    "want": "",
+    "agreed_with_extension": true,
+    "note": "plaintext downgrade is refused on both sides"
+  },
+  {
+    "name": "absent_meta",
+    "file": "absent_meta.html",
+    "base": "https://publisher.example/x",
+    "want": "",
+    "agreed_with_extension": true,
+    "note": "no meta at all"
+  },
+  {
+    "name": "empty_content",
+    "file": "empty_content.html",
+    "base": "https://publisher.example/x",
+    "want": "",
+    "agreed_with_extension": true,
+    "note": "Agreed, as of the extractMetaURL fix in extension/src/background.ts. Both sides reject empty content. It was NOT always so: this fixture originally pinned a real defect, where the extension evaluated new URL(\"\", location.href), resolved it to the landing page itself, and handed that HTML to chrome.downloads.download as if it were the PDF \u2014 the adapter's article rule only checks that the meta EXISTS, so an empty one still classified. The extension now trims content, rejects it when empty, and additionally rejects a URL that resolves to the page itself; landingmeta rejects empty-after-trim before parsing. Note both runtimes still resolve \"\" to the base natively, so this agreement is two deliberate guards, not a language property \u2014 remove either one and the defect returns."
+  },
+  {
+    "name": "malformed_content",
+    "file": "malformed_content.html",
+    "base": "https://publisher.example/x",
+    "want": "",
+    "agreed_with_extension": false,
+    "note": "DAEMON-STRICTER, and a genuine language difference. Go's net/url rejects \"ht!tp://%%%\" outright (\"first path segment in URL cannot contain colon\"), so landingmeta treats the tag as advertising nothing and returns (\"\", nil). WHATWG URL in the browser does not throw: a scheme that fails special-scheme validation falls back to relative resolution, so new URL() yields https://publisher.example/ht!tp://%%% \u2014 a real, bogus, https URL the extension would then try to download. Verified in both runtimes."
+  },
+  {
+    "name": "duplicate_identical",
+    "file": "duplicate_identical.html",
+    "base": "https://publisher.example/x",
+    "want": "https://publisher.example/a.pdf",
+    "agreed_with_extension": true,
+    "note": "same value twice is not a conflict"
+  },
+  {
+    "name": "duplicate_conflicting",
+    "file": "duplicate_conflicting.html",
+    "base": "https://publisher.example/x",
+    "want": "",
+    "agreed_with_extension": false,
+    "note": "DAEMON-STRICTER: Go returns ErrConflictingPDFURL. The extension takes the first match, which is safe there because the page was already classified under the user's own session; the daemon is fetching unauthenticated HTML from the network and must not guess which of two targets is real."
+  },
+  {
+    "name": "name_must_match_exactly",
+    "file": "name_must_match_exactly.html",
+    "base": "https://publisher.example/x",
+    "want": "",
+    "agreed_with_extension": true,
+    "note": "HTML meta name matching is case-sensitive via querySelector; neither tag matches"
+  }
+]

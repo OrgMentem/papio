@@ -63,6 +63,16 @@ type DOIRegistry interface {
 	Registered(context.Context, string) (bool, error)
 }
 
+// LandingReader fetches a publisher landing page and returns the
+// citation_pdf_url it advertises, without the app layer doing any I/O of its
+// own. It exists so a permanently failed open-access candidate can fall back
+// to the very landing page its own candidate row already carries in
+// LandingRedacted (see expandLandingSeeds) instead of an institutional
+// handoff the paper never needed.
+type LandingReader interface {
+	PDFURLFor(ctx context.Context, landingURL string) (string, error)
+}
+
 // classifiedAutoImportError is implemented by the bootstrap decorator. It
 // keeps Zotio-specific taxonomy out of the application service while allowing
 // durable events to retain safe, actionable failure detail.
@@ -89,18 +99,19 @@ type ResolverEntry struct {
 
 // Service is the command-independent acquisition service.
 type Service struct {
-	Config       config.Config
-	Jobs         *job.Store
-	Artifacts    *artifact.Store
-	Budgets      *budget.Manager
-	Resolvers    []ResolverEntry
-	Enricher     MetadataEnricher
-	Discovery    WorkLookup
-	DOIRegistry  DOIRegistry
-	Fetch        FetchFunc
-	Validate     ValidateFunc
-	AutoImporter AutoImporter
-	Notifier     NotificationSink
+	Config        config.Config
+	Jobs          *job.Store
+	Artifacts     *artifact.Store
+	Budgets       *budget.Manager
+	Resolvers     []ResolverEntry
+	Enricher      MetadataEnricher
+	Discovery     WorkLookup
+	DOIRegistry   DOIRegistry
+	LandingReader LandingReader
+	Fetch         FetchFunc
+	Validate      ValidateFunc
+	AutoImporter  AutoImporter
+	Notifier      NotificationSink
 	// ReadyHook, when non-nil with a command, runs the user's on_ready hook
 	// once per ready transition. Nil disables it.
 	ReadyHook *hook.Runner
@@ -360,7 +371,8 @@ func (s *Service) Process(ctx context.Context, row *job.Row) error {
 	}
 	if len(live) == 0 {
 		if !plan.IsZero() {
-			return s.parkForRetry(ctx, row, job.StateResolving, plan, "resolver_temporarily_unavailable",
+			return s.parkForRetry(ctx, row, job.StateResolving, plan,
+				map[string]any{"reason": "resolver_temporarily_unavailable"},
 				job.TerminalReasonTemporarySourceFailuresDidNotClear, "")
 		}
 		return s.exhaustedCandidates(ctx, row, job.StateResolving, "no_legal_candidates", job.TerminalReasonNoLegalCandidates, "")
@@ -480,6 +492,7 @@ func (s *Service) resolve(ctx context.Context, row *job.Row) (map[string]resolve
 				var deferred *budget.ErrDeferred
 				if errors.As(err, &deferred) {
 					plan.Gate = earlierTime(plan.Gate, deferred.Until)
+					plan.ClosedSourceGates++
 					continue
 				}
 				return nil, plan, err
@@ -492,7 +505,8 @@ func (s *Service) resolve(ctx context.Context, row *job.Row) (map[string]resolve
 			}
 			if delay, temporary := resolver.Temporary(err); temporary {
 				sourceRetry := earlierRetry(time.Time{}, s.Now(), delay, s.RetryDelay)
-				plan.Temporary = earlierTime(plan.Temporary, sourceRetry)
+				plan.ResolverTemporary = earlierTime(plan.ResolverTemporary, sourceRetry)
+				plan.TemporaryResolvers++
 				if s.Budgets != nil {
 					_ = s.Budgets.Defer(ctx, name, entry.Policy, sourceRetry)
 				}
@@ -560,6 +574,94 @@ func candidateRows(row *job.Row, ranked []resolver.Candidate, evidence []string)
 	return persisted, live
 }
 
+// landingSeed is a landing page worth checking for citation_pdf_url,
+// captured in fetchCandidates from a candidate that just failed
+// permanently. It carries enough of the parent candidate to build a
+// fetchable derivative without re-running source policy or budget lookups:
+// the derived candidate is the same observation reached a second way, not a
+// new one.
+type landingSeed struct {
+	landingURL string
+	parent     resolver.Candidate
+	parentKey  string
+}
+
+// landingDerivedEventKind durably records that a landing page produced a
+// derived PDF candidate. Like oaBrowserHintEventKind, the detail carries
+// only url_keys — never the landing URL or the derived PDF URL.
+const landingDerivedEventKind = "job.landing_derived"
+
+// expandLandingSeeds is the acquisition side of the 10.3389/feduc.2018.00095
+// incident: Unpaywall and OpenAlex both returned the identical expired
+// Azure SAS link, both candidates 403'd and were correctly marked invalid,
+// yet their own Landing URL (doi.org, redirecting to the publisher) was
+// advertising a working, unauthenticated PDF via citation_pdf_url the whole
+// time. One GET per unique landing URL, run once per pass at the
+// fetch-exhaustion boundary (see fetchCandidates); a hit inserts a derived
+// candidate that inherits its parent's source, access basis, version,
+// reuse license and identity confidence, so ranking, budgets and source
+// policy still apply to it exactly as they did to the parent — this is the
+// same candidate reached a second way, never a new resolver source.
+func (s *Service) expandLandingSeeds(ctx context.Context, row *job.Row, live map[string]resolver.Candidate, seeds []landingSeed) (bool, error) {
+	if len(seeds) == 0 {
+		return false, nil
+	}
+	// Resolvers are deterministic, so every candidate this job has ever
+	// produced reappears in live on every pass even once it is invalid in
+	// the store. That makes live's URLs double as "already tried this job"
+	// — not just this pass — without a separate durable record, and guards
+	// against a citation_pdf_url tag that just points back at the same dead
+	// link its parent already carried.
+	tried := make(map[string]bool, len(live))
+	for _, c := range live {
+		tried[c.URL] = true
+	}
+	inserted := false
+	for _, seed := range seeds {
+		pdfURL, err := s.LandingReader.PDFURLFor(ctx, seed.landingURL)
+		if err != nil {
+			if ctx.Err() != nil {
+				return inserted, ctx.Err()
+			}
+			// landingmeta.ErrConflictingPDFURL (two disagreeing citation_pdf_url
+			// tags) and every other read failure both mean "no usable
+			// derivation" for this seed: this is a fallback riding on a
+			// candidate that already failed permanently, and must never turn a
+			// landing-page read failure into a job-ending error.
+			continue
+		}
+		if pdfURL == "" || tried[pdfURL] {
+			continue
+		}
+		derived := seed.parent
+		derived.URL = pdfURL
+		derived.Landing = ""
+		derived.Direct = true
+		derived.ExpectedMIME = "application/pdf"
+		derived.RequestHeaders = nil
+		persisted, derivedLive := candidateRows(row, []resolver.Candidate{derived},
+			[]string{"derived=citation_pdf_url url_key=" + seed.parentKey})
+		n, err := s.Jobs.InsertCandidates(ctx, row.ID, persisted)
+		if err != nil {
+			return inserted, err
+		}
+		if n == 0 {
+			continue
+		}
+		for key, c := range derivedLive {
+			live[key] = c
+			tried[c.URL] = true
+		}
+		if err := s.Jobs.RecordEvent(ctx, row.ID, landingDerivedEventKind, map[string]any{
+			"derived": "citation_pdf_url", "parent_url_key": seed.parentKey, "url_key": persisted[0].URLKey,
+		}); err != nil {
+			return inserted, err
+		}
+		inserted = true
+	}
+	return inserted, nil
+}
+
 // siblingHop is the C3 version hop at the fetch-exhaustion boundary: the
 // canonical identifier produced candidates, every one failed, and the job is
 // about to park or go unavailable. One OpenAlex sibling lookup runs and its
@@ -625,6 +727,7 @@ func (s *Service) resolveSiblings(ctx context.Context, row *job.Row) ([]resolver
 				var deferred *budget.ErrDeferred
 				if errors.As(err, &deferred) {
 					plan.Gate = earlierTime(plan.Gate, deferred.Until)
+					plan.ClosedSourceGates++
 				}
 				continue
 			}
@@ -637,7 +740,8 @@ func (s *Service) resolveSiblings(ctx context.Context, row *job.Row) ([]resolver
 			// retry time is the difference between parking and giving up.
 			if delay, temporary := resolver.Temporary(err); temporary {
 				sourceRetry := earlierRetry(time.Time{}, s.Now(), delay, s.RetryDelay)
-				plan.Temporary = earlierTime(plan.Temporary, sourceRetry)
+				plan.ResolverTemporary = earlierTime(plan.ResolverTemporary, sourceRetry)
+				plan.TemporaryResolvers++
 				if s.Budgets != nil {
 					_ = s.Budgets.Defer(ctx, name, entry.Policy, sourceRetry)
 				}
@@ -755,20 +859,86 @@ func (s *Service) enrich(ctx context.Context, row *job.Row) error {
 	return nil
 }
 
+// oaBrowserHintEventKind durably records — without the bearer URL — that some
+// earlier pass identified a browser-eligible OA candidate. Candidate rows and
+// events retain only redacted URLs (see the oaBrowserURL comment in
+// fetchCandidates), so the event carries only the candidate's url_key; the
+// live URL is re-derived from a later pass's own live map, never stored.
+const oaBrowserHintEventKind = "job.oa_browser_hint"
+
+// recoverOABrowserHint re-derives the OA URL a previous pass discovered from
+// the url_key a job.oa_browser_hint event recorded, resolved against THIS
+// pass's live map. Candidates only ever fetch on a pass where
+// NextPendingCandidate hands one back; once the one OA candidate is marked
+// invalid it never will again, so isOABrowserBlocked is never reconsulted and
+// a purely in-memory oaBrowserURL forgot it on every later pass. That sent
+// 10.3389/feduc.2018.00095 (open access, expired Azure SAS link) to an
+// institutional sign-in it never needed: 38 handoff offers over 3 days, both
+// extension drive slots pinned, zero terminal outcomes. A hint whose url_key
+// this pass's resolve() no longer produced is unusable and must fall through
+// to the ordinary institutional path, not reuse a stale URL.
+func (s *Service) recoverOABrowserHint(ctx context.Context, jobID string, live map[string]resolver.Candidate) string {
+	events, err := s.Jobs.Events(ctx, jobID)
+	if err != nil {
+		return ""
+	}
+	for i := len(events) - 1; i >= 0; i-- {
+		if kind, _ := events[i]["kind"].(string); kind != oaBrowserHintEventKind {
+			continue
+		}
+		detail, _ := events[i]["detail"].(map[string]any)
+		urlKey, _ := detail["url_key"].(string)
+		if urlKey == "" {
+			continue
+		}
+		if candidate, ok := live[urlKey]; ok && candidate.AccessBasis == resolver.AccessOpen && strings.HasPrefix(candidate.URL, "https://") {
+			return candidate.URL
+		}
+	}
+	return ""
+}
+
 func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[string]resolver.Candidate, plan retryPlan) error {
 	manual := false
 	manualRequiresAuth := false
-	// Candidate rows and events retain only redacted URLs. Keep the one
-	// browser-eligible OA URL only through this acquisition pass, then record
-	// it in the local handoff action if the job exhausts.
-	oaBrowserURL := ""
+	// Candidate rows and events retain only redacted URLs. oaBrowserURL is
+	// seeded from any durable hint a prior pass left (recoverOABrowserHint)
+	// so a pass whose pending queue is already empty still knows about a
+	// browser-eligible OA candidate found earlier, then kept live only
+	// through this pass and recorded in the local handoff action if the job
+	// exhausts.
+	oaBrowserURL := s.recoverOABrowserHint(ctx, row.ID, live)
 	hopTried := false
+	landingExpansionTried := false
+	landingSeeds := make([]landingSeed, 0, 1)
+	seenLanding := map[string]bool{}
 	for {
 		stored, err := s.Jobs.NextPendingCandidate(ctx, row.ID)
 		if err != nil {
 			return err
 		}
 		if stored == nil {
+			// A permanently failed open-access candidate's own landing page may
+			// still advertise a working PDF via citation_pdf_url (see
+			// expandLandingSeeds); 10.3389/feduc.2018.00095 had that route in
+			// hand on both dead candidate rows (landing_redacted = the doi.org
+			// resolver link) and still parked 38 times over 3 days because an
+			// unrelated resolver gate kept declaring the pass "not exhausted
+			// yet". This one-shot check runs before the sibling hop and before
+			// any retry-park decision below: a deterministic recovery route
+			// already in hand must never sit behind either.
+			if !landingExpansionTried {
+				landingExpansionTried = true
+				if s.LandingReader != nil {
+					ok, err := s.expandLandingSeeds(ctx, row, live, landingSeeds)
+					if err != nil {
+						return err
+					}
+					if ok {
+						continue
+					}
+				}
+			}
 			// The pending queue drained. Before any terminal or parking
 			// verdict, try the OA sibling hop once — but never pre-empt an
 			// ordinary retry wait, where the primary candidates deserve
@@ -777,7 +947,7 @@ func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[st
 			// a sibling source that may not be gated at all.
 			if !hopTried {
 				hopTried = true
-				endsHere := manual || plan.Temporary.IsZero() || s.retryBudgetExhausted(ctx, row.ID)
+				endsHere := manual || plan.Temporary().IsZero() || s.retryBudgetExhausted(ctx, row.ID)
 				if endsHere && s.siblingHop(ctx, row, live, &plan) {
 					continue
 				}
@@ -848,6 +1018,7 @@ func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[st
 						return err
 					}
 					plan.Gate = earlierTime(plan.Gate, deferred.Until)
+					plan.ClosedSourceGates++
 					continue
 				}
 				return err
@@ -877,12 +1048,20 @@ func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[st
 			_ = s.Jobs.FinishAttempt(ctx, attempt, class, status, safeType(err))
 			if oaBrowserURL == "" && isOABrowserBlocked(candidate, err) {
 				oaBrowserURL = candidate.URL
+				// Durable so a later pass whose pending queue is already
+				// empty still knows this candidate is browser-recoverable OA
+				// (see recoverOABrowserHint). Only url_key is stored — never
+				// the URL itself, which is a bearer URL.
+				if err := s.Jobs.RecordEvent(ctx, row.ID, oaBrowserHintEventKind, map[string]any{"url_key": stored.URLKey}); err != nil {
+					return err
+				}
 			}
 			switch class {
 			case fetch.ClassRetryable:
 				_ = s.Jobs.MarkCandidate(ctx, stored.ID, "retryable")
 				sourceRetry := earlierRetry(time.Time{}, s.Now(), delay, s.RetryDelay)
-				plan.Temporary = earlierTime(plan.Temporary, sourceRetry)
+				plan.CandidateTemporary = earlierTime(plan.CandidateTemporary, sourceRetry)
+				plan.RetryableCandidates++
 				if s.Budgets != nil {
 					_ = s.Budgets.Defer(ctx, stored.Source, policy, sourceRetry)
 				}
@@ -890,6 +1069,21 @@ func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[st
 				_ = s.Jobs.MarkCandidate(ctx, stored.ID, "skipped")
 			default:
 				_ = s.Jobs.MarkCandidate(ctx, stored.ID, "invalid")
+				// The candidate is dead, but its own landing page (Landing on
+				// this live candidate, LandingRedacted on the persisted row) may
+				// still advertise a working PDF via citation_pdf_url — worth a
+				// GET only for open access, where a login-less recovery route
+				// actually helps; anything else already has the institutional
+				// path this pass tracks separately. Deduplicated by landing URL
+				// since Unpaywall and OpenAlex, per the verified incident, can
+				// both return the SAME dead link and therefore the same landing
+				// page.
+				if candidate.AccessBasis == resolver.AccessOpen && candidate.Landing != "" && !seenLanding[candidate.Landing] {
+					seenLanding[candidate.Landing] = true
+					landingSeeds = append(landingSeeds, landingSeed{
+						landingURL: candidate.Landing, parent: candidate, parentKey: stored.URLKey,
+					})
+				}
 			}
 			continue
 		}
@@ -931,7 +1125,13 @@ func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[st
 			map[string]any{"reason": "landing_page_only"})
 	}
 	if !plan.IsZero() {
-		return s.parkForRetry(ctx, row, job.StateFetching, plan, "candidate_temporarily_unavailable",
+		return s.parkForRetry(ctx, row, job.StateFetching, plan,
+			map[string]any{
+				"reason":               "acquisition_inputs_temporarily_unavailable",
+				"retryable_candidates": plan.RetryableCandidates,
+				"temporary_resolvers":  plan.TemporaryResolvers,
+				"closed_source_gates":  plan.ClosedSourceGates,
+			},
 			job.TerminalReasonTemporaryCandidateFailuresDidNotClear, oaBrowserURL)
 	}
 	return s.exhaustedCandidates(ctx, row, job.StateFetching, "candidates_exhausted", job.TerminalReasonCandidatesExhausted, oaBrowserURL)
@@ -954,7 +1154,7 @@ func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[st
 // re-parking every thirty seconds indefinitely. One wait lets the gated source
 // answer; a second means the gate is being refreshed by the failures rather
 // than waited out, and the job settles.
-func (s *Service) parkForRetry(ctx context.Context, row *job.Row, from string, plan retryPlan, reason string, exhaustedReason job.TerminalReason, oaBrowserURL string) error {
+func (s *Service) parkForRetry(ctx context.Context, row *job.Row, from string, plan retryPlan, detail map[string]any, exhaustedReason job.TerminalReason, oaBrowserURL string) error {
 	now := s.Now().UTC()
 	at := plan.At()
 	kind := plan.Kind()
@@ -973,8 +1173,8 @@ func (s *Service) parkForRetry(ctx context.Context, row *job.Row, from string, p
 		// attempt on a wait that already happened.
 		at = now.Add(s.RetryDelay)
 	}
-	return s.Jobs.Transition(ctx, row.ID, from, job.StateRetryWait,
-		map[string]any{"reason": reason, "retry_kind": kind}, job.WithRetryAt(at))
+	detail["retry_kind"] = kind
+	return s.Jobs.Transition(ctx, row.ID, from, job.StateRetryWait, detail, job.WithRetryAt(at))
 }
 
 // alreadyWaitedPastExhaustion reports whether this job has already spent its
@@ -1466,34 +1666,56 @@ const (
 	retryKindExhaustedGate = "exhausted_gate"
 )
 
-// retryPlan separates the two reasons an acquisition pass can end with no
-// verdict. Temporary means a request went out and failed, so retrying costs
-// the job one of its bounded attempts. Gate means a source was closed before
-// any request was made (budget.ErrDeferred), so the job learned nothing and
-// must not be charged for waiting: a day-long provider gate alongside ordinary
-// thirty-second gates would otherwise burn the whole retry budget within
-// minutes and settle the job "temporary source failures did not clear" — a
-// claim about a source that was never called.
+// retryPlan separates the reasons an acquisition pass can end with no
+// verdict. CandidateTemporary and ResolverTemporary both mean a request went
+// out and failed, so retrying costs the job one of its bounded attempts —
+// kept apart only so a park can report what it actually saw instead of
+// asserting a cause it never observed. 10.3389/feduc.2018.00095 parked 11
+// times as "candidate_temporarily_unavailable" while both candidates had
+// failed permanently (403) and an unrelated resolver was the thing actually
+// temporary; nobody could tell what was really holding the job. Gate means a
+// source was closed before any request was made (budget.ErrDeferred), so the
+// job learned nothing and must not be charged for waiting: a day-long
+// provider gate alongside ordinary thirty-second gates would otherwise burn
+// the whole retry budget within minutes and settle the job "temporary source
+// failures did not clear" — a claim about a source that was never called.
 type retryPlan struct {
-	Temporary time.Time
-	Gate      time.Time
+	CandidateTemporary time.Time // a candidate fetch failed retryably
+	ResolverTemporary  time.Time // a resolver/sibling source failed retryably
+	Gate               time.Time // a source gate was closed; no request was made
+
+	RetryableCandidates int // candidate fetches that failed retryably this pass
+	TemporaryResolvers  int // resolver/sibling calls that failed retryably this pass
+	ClosedSourceGates   int // source gates closed before any request this pass
 }
 
-// merge folds another pass's plan in, keeping the earliest of each kind.
+// Temporary is the earliest retryable-request observation, candidate or
+// resolver side. Scheduling has never distinguished the two — only the park
+// detail does — so At, IsZero and Kind keep using it.
+func (p retryPlan) Temporary() time.Time {
+	return earlierTime(p.CandidateTemporary, p.ResolverTemporary)
+}
+
+// merge folds another pass's plan in, keeping the earliest of each kind and
+// summing what each pass actually observed.
 func (p *retryPlan) merge(other retryPlan) {
-	p.Temporary = earlierTime(p.Temporary, other.Temporary)
+	p.CandidateTemporary = earlierTime(p.CandidateTemporary, other.CandidateTemporary)
+	p.ResolverTemporary = earlierTime(p.ResolverTemporary, other.ResolverTemporary)
 	p.Gate = earlierTime(p.Gate, other.Gate)
+	p.RetryableCandidates += other.RetryableCandidates
+	p.TemporaryResolvers += other.TemporaryResolvers
+	p.ClosedSourceGates += other.ClosedSourceGates
 }
 
 // At is when the job should wake: the earliest opportunity of either kind,
 // because a source that frees up sooner deserves its attempt sooner.
-func (p retryPlan) At() time.Time { return earlierTime(p.Temporary, p.Gate) }
+func (p retryPlan) At() time.Time { return earlierTime(p.Temporary(), p.Gate) }
 
 func (p retryPlan) IsZero() bool { return p.At().IsZero() }
 
 // Kind is source_gate only when no request was actually attempted this pass.
 func (p retryPlan) Kind() string {
-	if p.Temporary.IsZero() {
+	if p.Temporary().IsZero() {
 		return retryKindSourceGate
 	}
 	return retryKindTemporary

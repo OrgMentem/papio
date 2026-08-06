@@ -108,3 +108,27 @@ Captured HTML must already be sanitized by the capture tool before it leaves the
 tab. Never commit a fixture containing credentials, IdP URLs/tokens, cookies, or
 session identifiers. When in doubt, re-capture — the capture tool fails closed on
 residual secrets.
+
+## The citation_pdf_url contract
+
+`test/landingmeta-contract.test.ts` is not fixture-tested through this
+directory. It reads a second corpus that lives outside `extension/` entirely:
+`internal/landingmeta/testdata/contract.json` and its sibling `.html` files,
+in the Go daemon tree.
+
+That corpus pins the `citation_pdf_url` meta-tag semantics for BOTH sides of
+the extension/daemon split: the daemon's `internal/landingmeta.PDFURL`
+(parsing untrusted publisher HTML fetched over the network) and this
+extension's `extractMetaURL` (`src/background.ts`, reading the live DOM of a
+page the user already has open). The two implementations exist independently,
+in different languages and trust contexts, but they must agree on every case
+except a small, explicitly documented set of deliberate divergences — an
+empty `citation_pdf_url`, two conflicting ones, and a malformed one that JS's
+`URL()` silently falls back to resolving as relative while Go's `net/url`
+rejects outright — where the daemon fails closed and the extension does not.
+
+The corpus lives under the Go package, not here, so a change to either
+implementation's behavior has to walk through the same fixture file. Editing
+`contract.json` or its fixtures on the Go side without re-running
+`extension/test/landingmeta-contract.test.ts` — or vice versa — is how the two
+implementations drift apart silently. Update both together.

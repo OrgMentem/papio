@@ -2078,3 +2078,529 @@ func TestOnReadyHookFailureLeavesJobReady(t *testing.T) {
 		t.Fatalf("job state = %s, want ready despite hook failure", ready.State)
 	}
 }
+
+// retryWaitDetail returns the detail of the job's most recent transition
+// into retry_wait, so tests can inspect what a park actually reported.
+func retryWaitDetail(t *testing.T, jobs *job.Store, id string) map[string]any {
+	t.Helper()
+	events, err := jobs.Events(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := len(events) - 1; i >= 0; i-- {
+		if events[i]["kind"] != "job.transition" {
+			continue
+		}
+		detail, ok := events[i]["detail"].(map[string]any)
+		if !ok {
+			continue
+		}
+		if to, _ := detail["to"].(string); to == job.StateRetryWait {
+			return detail
+		}
+	}
+	t.Fatal("no retry_wait transition event recorded")
+	return nil
+}
+
+// Regression coverage for the DOI 10.3389/feduc.2018.00095 incident: both
+// candidates failed permanently (403, classified invalid) while an unrelated
+// resolver was the thing actually temporary, yet every park asserted
+// "candidate_temporarily_unavailable" — a cause the pass never observed. The
+// retry_wait detail must now name what actually happened instead.
+func TestRetryPlanReportsWhatItObserved(t *testing.T) {
+	t.Run("permanent_candidate_and_temporary_resolver", func(t *testing.T) {
+		svc, jobs := newTestService(t)
+		ctx := context.Background()
+		svc.Config.Sources["flaky"] = config.Source{Enabled: true}
+		working := &fakeResolver{name: "fixture", cands: []resolver.Candidate{{
+			Source: "fixture", URL: "https://example.test/expired-sas.pdf", Version: resolver.VersionPublished,
+			AccessBasis: resolver.AccessOpen, ReuseLicense: "unknown", Direct: true, IdentityConfidence: 1,
+		}}}
+		flaky := &fakeResolver{name: "flaky", err: &resolver.TemporaryError{Err: errors.New("upstream rate limited")}}
+		svc.Resolvers = []ResolverEntry{
+			{Adapter: working, Policy: config.Source{Enabled: true}},
+			{Adapter: flaky, Policy: config.Source{Enabled: true}},
+		}
+		// The publisher link's signature is expired: every fetch is a
+		// permanent 403, never a retryable one — the candidate is dead, not
+		// waiting.
+		svc.Fetch = func(context.Context, resolver.Candidate, string) (fetch.Result, error) {
+			return fetch.Result{}, &fetch.Error{Class: fetch.ClassInvalid, HTTPStatus: 403, Msg: "sas token expired"}
+		}
+		svc.Validate = passValidation()
+		id, err := svc.Submit(ctx, doiRequest("wr_observed_mixed"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		row, err := jobs.ClaimNext(ctx, "w", time.Minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := svc.Process(ctx, row); err != nil {
+			t.Fatal(err)
+		}
+		got, err := jobs.Get(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.State != job.StateRetryWait {
+			t.Fatalf("state = %s, want retry_wait", got.State)
+		}
+		detail := retryWaitDetail(t, jobs, id)
+		if detail["reason"] != "acquisition_inputs_temporarily_unavailable" {
+			t.Fatalf("reason = %v, want acquisition_inputs_temporarily_unavailable", detail["reason"])
+		}
+		if n, _ := detail["retryable_candidates"].(float64); n != 0 {
+			t.Fatalf("retryable_candidates = %v, want 0 (the candidate failed permanently)", detail["retryable_candidates"])
+		}
+		if n, _ := detail["temporary_resolvers"].(float64); n != 1 {
+			t.Fatalf("temporary_resolvers = %v, want 1", detail["temporary_resolvers"])
+		}
+		if n, _ := detail["closed_source_gates"].(float64); n != 0 {
+			t.Fatalf("closed_source_gates = %v, want 0", detail["closed_source_gates"])
+		}
+	})
+
+	t.Run("pure_gate_pass_not_counted_against_budget", func(t *testing.T) {
+		svc, jobs := newTestService(t)
+		ctx := context.Background()
+		svc.RetryDelay = time.Millisecond
+		svc.Budgets = budget.New(jobs.S)
+		gate := time.Now().UTC().Add(18 * time.Hour)
+		if err := svc.Budgets.Defer(ctx, "fixture", config.Source{Enabled: true}, gate); err != nil {
+			t.Fatal(err)
+		}
+		adapter := &fakeResolver{name: "fixture"}
+		svc.Resolvers = []ResolverEntry{{Adapter: adapter, Policy: config.Source{Enabled: true}}}
+		svc.Fetch = func(context.Context, resolver.Candidate, string) (fetch.Result, error) {
+			return fetch.Result{}, errors.New("fetch must not run: the only source is gated")
+		}
+		svc.Validate = passValidation()
+		id, err := svc.Submit(ctx, doiRequest("wr_observed_gate"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Drive it well past the retry budget cap; a pass that made no
+		// request must never be counted against it.
+		for range maxRetryAttempts + 4 {
+			row, err := jobs.Get(ctx, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if row.State != job.StateQueued && row.State != job.StateRetryWait {
+				t.Fatalf("job left the retry cycle in %s; a closed gate is not a verdict", row.State)
+			}
+			if err := svc.Process(ctx, row); err != nil {
+				t.Fatal(err)
+			}
+		}
+		got, err := jobs.Get(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.State != job.StateRetryWait {
+			t.Fatalf("state after %d gate parks = %s, want retry_wait (never exhausted)", maxRetryAttempts+4, got.State)
+		}
+		detail := retryWaitDetail(t, jobs, id)
+		if detail["retry_kind"] != retryKindSourceGate {
+			t.Fatalf("retry_kind = %v, want %q", detail["retry_kind"], retryKindSourceGate)
+		}
+	})
+
+	t.Run("wake_time_is_earliest_of_all_three_observations", func(t *testing.T) {
+		base := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+		plan := retryPlan{
+			CandidateTemporary: base.Add(3 * time.Minute),
+			ResolverTemporary:  base.Add(1 * time.Minute), // earliest
+			Gate:               base.Add(2 * time.Minute),
+		}
+		want := base.Add(1 * time.Minute)
+		if got := plan.At(); !got.Equal(want) {
+			t.Fatalf("At() = %v, want earliest observation %v", got, want)
+		}
+		// Splitting Temporary into two fields must not change what a caller
+		// that only cares "when" sees.
+		if got := plan.Temporary(); !got.Equal(want) {
+			t.Fatalf("Temporary() = %v, want %v", got, want)
+		}
+	})
+}
+
+// onceTemporaryResolver stands in for the "unrelated temporary source/gate"
+// that populated the pass-wide retry plan in the verified production
+// incident: it fails once (a transient outage), then clears, contributing no
+// candidates either way in both calls.
+type onceTemporaryResolver struct {
+	name  string
+	calls int
+}
+
+func (r *onceTemporaryResolver) Name() string { return r.name }
+func (r *onceTemporaryResolver) Resolve(context.Context, work.Work) ([]resolver.Candidate, error) {
+	r.calls++
+	if r.calls == 1 {
+		return nil, &resolver.TemporaryError{Err: errors.New("gate down"), RetryAfter: time.Millisecond}
+	}
+	return nil, nil
+}
+
+// runOABrowserHintFixture reproduces the verified incident
+// (10.3389/feduc.2018.00095: fully open access, expired Azure SAS link) over
+// two passes. Pass 1's only candidate 403s -- classified permanently, so
+// MarkCandidate leaves it "invalid" -- while an unrelated resolver gate fails
+// temporarily, so the pass parks instead of exhausting immediately, exactly
+// like the mislabelled "candidate_temporarily_unavailable" parks observed
+// live. Pass 2's gate has cleared and the OA candidate is already invalid, so
+// NextPendingCandidate returns nothing and the fetch loop -- and
+// isOABrowserBlocked with it -- never runs again.
+func runOABrowserHintFixture(t *testing.T, requestID, oaURL string) (*Service, *job.Store, string) {
+	t.Helper()
+	ctx := context.Background()
+	svc, jobs := newTestService(t)
+	svc.Config.AccessMode = config.ModeDelegated
+	svc.RetryDelay = time.Millisecond
+	oa := &fakeResolver{name: "oa", cands: []resolver.Candidate{{
+		Source: "oa", URL: oaURL, Version: resolver.VersionPublished,
+		AccessBasis: resolver.AccessOpen, ReuseLicense: "unknown", Direct: true, IdentityConfidence: 1,
+	}}}
+	gate := &onceTemporaryResolver{name: "gate"}
+	svc.Resolvers = []ResolverEntry{
+		{Adapter: oa, Policy: config.Source{Enabled: true}},
+		{Adapter: gate, Policy: config.Source{Enabled: true}},
+	}
+	svc.Fetch = func(context.Context, resolver.Candidate, string) (fetch.Result, error) {
+		return fetch.Result{}, &fetch.Error{Class: fetch.ClassInvalid, HTTPStatus: 403, Msg: "forbidden"}
+	}
+	svc.Validate = passValidation()
+
+	id, err := svc.Submit(ctx, doiRequest(requestID))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	row, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Process(ctx, row); err != nil {
+		t.Fatal(err)
+	}
+	afterPass1, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterPass1.State != job.StateRetryWait {
+		t.Fatalf("pass 1 state = %s, want retry_wait (unrelated gate should have parked, not exhausted, the job)", afterPass1.State)
+	}
+
+	row, err = jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Process(ctx, row); err != nil {
+		t.Fatal(err)
+	}
+	return svc, jobs, id
+}
+
+// This is the incident itself: without the durable hint, pass 2's empty
+// pending queue never re-runs isOABrowserBlocked, oaBrowserURL resets to ""
+// in memory, and exhaustedCandidates falls through to an institutional
+// OpenURL handoff for a paper that needs no institution.
+func TestOABrowserHintSurvivesEmptyPendingQueueOnLaterPass(t *testing.T) {
+	const oaURL = "https://example.test/oa-survives.pdf"
+	_, jobs, id := runOABrowserHintFixture(t, "wr_oa_hint_survives", oaURL)
+	ctx := context.Background()
+
+	got, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != job.StateAwaitingHuman {
+		t.Fatalf("pass 2 state = %s, want awaiting_human", got.State)
+	}
+	actions, err := jobs.ListHumanActions(ctx, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(actions) != 1 || actions[0].JobID != id || actions[0].Kind != "openurl_handoff" {
+		t.Fatalf("actions = %+v, want one openurl_handoff", actions)
+	}
+	// The routing decision on pass 2 must match pass 1's: open-access browser
+	// handoff, never the institutional OpenURL sign-in this paper never needed.
+	if actions[0].Detail != OABrowserHandoffActionDetail(oaURL) {
+		t.Fatalf("handoff detail = %q, want OA browser handoff for %q (institutional handoff would mean the hint was lost)", actions[0].Detail, oaURL)
+	}
+	if actions[0].RequiresAuth {
+		t.Fatalf("OA browser handoff must not require auth: %+v", actions[0])
+	}
+}
+
+// safeType, redacted candidate rows, and now the oa_browser_hint event all
+// exist so upstream bearer URLs never reach durable storage. This asserts on
+// the actual event detail contents, not just the event kind, so a future
+// change that widens the hint payload to "just store the URL" is caught here
+// rather than in production.
+func TestOABrowserHintEventNeverStoresBearerURL(t *testing.T) {
+	const oaURL = "https://example.test/oa-secret.pdf?sig=SHOULD_NEVER_PERSIST"
+	_, jobs, id := runOABrowserHintFixture(t, "wr_oa_hint_no_leak", oaURL)
+	ctx := context.Background()
+
+	events, err := jobs.Events(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), oaURL) || strings.Contains(string(encoded), "SHOULD_NEVER_PERSIST") {
+		t.Fatalf("a job event leaked the bearer OA URL: %s", encoded)
+	}
+
+	found := false
+	for _, event := range events {
+		if kind, _ := event["kind"].(string); kind != oaBrowserHintEventKind {
+			continue
+		}
+		found = true
+		detail, _ := event["detail"].(map[string]any)
+		if _, hasURL := detail["url"]; hasURL {
+			t.Fatalf("oa_browser_hint event detail carries a url field: %+v", detail)
+		}
+		urlKey, _ := detail["url_key"].(string)
+		if urlKey == "" {
+			t.Fatalf("oa_browser_hint event detail missing url_key: %+v", detail)
+		}
+	}
+	if !found {
+		t.Fatalf("expected an %s event, events = %+v", oaBrowserHintEventKind, events)
+	}
+}
+
+// fakeLandingReader stands in for internal/landingmeta.Reader: it maps a
+// landing URL to the citation_pdf_url the fixture page would advertise,
+// without any real network I/O.
+type fakeLandingReader struct {
+	pdfURLFor map[string]string
+	err       error
+	calls     int
+}
+
+func (f *fakeLandingReader) PDFURLFor(_ context.Context, landingURL string) (string, error) {
+	f.calls++
+	if f.err != nil {
+		return "", f.err
+	}
+	return f.pdfURLFor[landingURL], nil
+}
+
+// landingExpansionFetch classifies every candidate URL other than pdfURL as
+// the incident's dead, permanently-403ing publisher link, and only succeeds
+// for the derived citation_pdf_url candidate — so a passing test proves the
+// job actually walked through expansion rather than acquiring by luck.
+func landingExpansionFetch(pdfURL string) FetchFunc {
+	return func(_ context.Context, c resolver.Candidate, path string) (fetch.Result, error) {
+		if c.URL != pdfURL {
+			return fetch.Result{}, &fetch.Error{Class: fetch.ClassInvalid, HTTPStatus: 403, Msg: "sas token expired"}
+		}
+		body := pdfBytes(c.URL)
+		if err := os.WriteFile(path, body, 0o600); err != nil {
+			return fetch.Result{}, err
+		}
+		sum := sha256.Sum256(body)
+		return fetch.Result{
+			TempPath: path, SHA256: hex.EncodeToString(sum[:]), SizeBytes: int64(len(body)),
+			SniffedMIME: "application/pdf", ContentType: "application/pdf", HTTPStatus: 200,
+			FinalHost: "frontiersin.example",
+		}, nil
+	}
+}
+
+// TestLandingExpansionRecoversDeadOpenAccessPDF reproduces the verified
+// incident (DOI 10.3389/feduc.2018.00095): Unpaywall and OpenAlex both
+// return the SAME dead, SAS-expired publisher URL as separate open-access
+// candidates, both carrying the same doi.org Landing URL. Both 403
+// permanently, but that landing page advertises a working citation_pdf_url,
+// and the job must acquire it in the same Process pass instead of parking
+// or falling through to an institutional handoff. Two dead candidates
+// sharing one landing page must also cost exactly one landing GET, not one
+// per candidate.
+func TestLandingExpansionRecoversDeadOpenAccessPDF(t *testing.T) {
+	const deadURL = "https://blob.example/expired-sas.pdf?se=2021-02-16"
+	const landingURL = "https://doi.org/10.3389/feduc.2018.00095"
+	const pdfURL = "https://frontiersin.example/articles/pdf/valid.pdf"
+
+	svc, jobs := newTestService(t)
+	ctx := context.Background()
+	unpaywall := &fakeResolver{name: "unpaywall", cands: []resolver.Candidate{{
+		Source: "unpaywall", URL: deadURL, Landing: landingURL, Version: resolver.VersionPublished,
+		AccessBasis: resolver.AccessOpen, ReuseLicense: "cc-by-4.0", Direct: true, IdentityConfidence: 1,
+	}}}
+	openalex := &fakeResolver{name: "openalex", cands: []resolver.Candidate{{
+		Source: "openalex", URL: deadURL, Landing: landingURL, Version: resolver.VersionPublished,
+		AccessBasis: resolver.AccessOpen, ReuseLicense: "cc-by-4.0", Direct: true, IdentityConfidence: 1,
+	}}}
+	svc.Resolvers = []ResolverEntry{
+		{Adapter: unpaywall, Policy: config.Source{Enabled: true}},
+		{Adapter: openalex, Policy: config.Source{Enabled: true}},
+	}
+	svc.Fetch = landingExpansionFetch(pdfURL)
+	svc.Validate = passValidation()
+	reader := &fakeLandingReader{pdfURLFor: map[string]string{landingURL: pdfURL}}
+	svc.LandingReader = reader
+
+	id, err := svc.Submit(ctx, doiRequest("wr_landing_expansion_recovers"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, err := jobs.ClaimNext(ctx, "w", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Process(ctx, row); err != nil {
+		t.Fatal(err)
+	}
+	got, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != job.StateReady {
+		t.Fatalf("state = %s, want ready (the job had a working recovery route and must not park)", got.State)
+	}
+	if reader.calls != 1 {
+		t.Fatalf("landing reader called %d times, want 1 (both dead candidates share one landing page)", reader.calls)
+	}
+}
+
+// TestLandingExpansionNilReaderLeavesParkingUnchanged asserts the nil-safety
+// contract: without a wired LandingReader, a job with the exact shape of the
+// verified incident (permanent open-access 403 plus an unrelated temporary
+// resolver) must park exactly as it did before this feature existed, byte
+// for byte — same state, same reason, same observation counts.
+func TestLandingExpansionNilReaderLeavesParkingUnchanged(t *testing.T) {
+	svc, jobs := newTestService(t)
+	ctx := context.Background()
+	svc.Config.Sources["flaky"] = config.Source{Enabled: true}
+	const landingURL = "https://doi.org/10.3389/feduc.2018.00095"
+	working := &fakeResolver{name: "fixture", cands: []resolver.Candidate{{
+		Source: "fixture", URL: "https://example.test/expired-sas.pdf", Landing: landingURL, Version: resolver.VersionPublished,
+		AccessBasis: resolver.AccessOpen, ReuseLicense: "unknown", Direct: true, IdentityConfidence: 1,
+	}}}
+	flaky := &fakeResolver{name: "flaky", err: &resolver.TemporaryError{Err: errors.New("upstream rate limited")}}
+	svc.Resolvers = []ResolverEntry{
+		{Adapter: working, Policy: config.Source{Enabled: true}},
+		{Adapter: flaky, Policy: config.Source{Enabled: true}},
+	}
+	svc.Fetch = func(context.Context, resolver.Candidate, string) (fetch.Result, error) {
+		return fetch.Result{}, &fetch.Error{Class: fetch.ClassInvalid, HTTPStatus: 403, Msg: "sas token expired"}
+	}
+	svc.Validate = passValidation()
+	// svc.LandingReader is left nil: expansion must be a strict no-op.
+
+	id, err := svc.Submit(ctx, doiRequest("wr_landing_expansion_nil_reader"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, err := jobs.ClaimNext(ctx, "w", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Process(ctx, row); err != nil {
+		t.Fatal(err)
+	}
+	got, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != job.StateRetryWait {
+		t.Fatalf("state = %s, want retry_wait (nil reader must change nothing)", got.State)
+	}
+	detail := retryWaitDetail(t, jobs, id)
+	if detail["reason"] != "acquisition_inputs_temporarily_unavailable" {
+		t.Fatalf("reason = %v, want acquisition_inputs_temporarily_unavailable", detail["reason"])
+	}
+	if n, _ := detail["retryable_candidates"].(float64); n != 0 {
+		t.Fatalf("retryable_candidates = %v, want 0", detail["retryable_candidates"])
+	}
+	if n, _ := detail["temporary_resolvers"].(float64); n != 1 {
+		t.Fatalf("temporary_resolvers = %v, want 1", detail["temporary_resolvers"])
+	}
+	if n, _ := detail["closed_source_gates"].(float64); n != 0 {
+		t.Fatalf("closed_source_gates = %v, want 0", detail["closed_source_gates"])
+	}
+}
+
+// TestLandingExpansionEventNeverStoresBearerURLs asserts the same
+// redacted-URL discipline as TestOABrowserHintEventNeverStoresBearerURL: the
+// landing_derived provenance event, and every other event this Process call
+// records, must carry the parent's url_key only — never the dead candidate
+// URL, the landing URL, or the derived PDF URL.
+func TestLandingExpansionEventNeverStoresBearerURLs(t *testing.T) {
+	const deadURL = "https://blob.example/expired.pdf?sig=DEAD_SHOULD_NEVER_PERSIST"
+	const landingURL = "https://doi.org/10.3389/feduc.2018.00095?ref=LANDING_SHOULD_NEVER_PERSIST"
+	const pdfURL = "https://frontiersin.example/valid.pdf?tok=PDF_SHOULD_NEVER_PERSIST"
+
+	svc, jobs := newTestService(t)
+	ctx := context.Background()
+	adapter := &fakeResolver{name: "fixture", cands: []resolver.Candidate{{
+		Source: "fixture", URL: deadURL, Landing: landingURL, Version: resolver.VersionPublished,
+		AccessBasis: resolver.AccessOpen, ReuseLicense: "unknown", Direct: true, IdentityConfidence: 1,
+	}}}
+	svc.Resolvers = []ResolverEntry{{Adapter: adapter, Policy: config.Source{Enabled: true}}}
+	svc.Fetch = landingExpansionFetch(pdfURL)
+	svc.Validate = passValidation()
+	svc.LandingReader = &fakeLandingReader{pdfURLFor: map[string]string{landingURL: pdfURL}}
+
+	id, err := svc.Submit(ctx, doiRequest("wr_landing_expansion_no_leak"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, err := jobs.ClaimNext(ctx, "w", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Process(ctx, row); err != nil {
+		t.Fatal(err)
+	}
+	got, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != job.StateReady {
+		t.Fatalf("state = %s, want ready", got.State)
+	}
+
+	events, err := jobs.Events(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, leaked := range []string{deadURL, landingURL, pdfURL, "SHOULD_NEVER_PERSIST"} {
+		if strings.Contains(string(encoded), leaked) {
+			t.Fatalf("a job event leaked a bearer URL (%q): %s", leaked, encoded)
+		}
+	}
+
+	found := false
+	for _, event := range events {
+		if kind, _ := event["kind"].(string); kind != landingDerivedEventKind {
+			continue
+		}
+		found = true
+		detail, _ := event["detail"].(map[string]any)
+		if detail["derived"] != "citation_pdf_url" {
+			t.Fatalf("landing_derived event detail = %+v, want derived=citation_pdf_url", detail)
+		}
+		if _, hasKey := detail["parent_url_key"]; !hasKey {
+			t.Fatalf("landing_derived event detail missing parent_url_key: %+v", detail)
+		}
+	}
+	if !found {
+		t.Fatalf("expected a %s event, events = %+v", landingDerivedEventKind, events)
+	}
+}

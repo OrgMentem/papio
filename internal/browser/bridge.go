@@ -2524,7 +2524,38 @@ func (b *Bridge) poll(ctx context.Context) ([]json.RawMessage, error) {
 		// The main auto-offer gate. focusPending is an explicit
 		// `papio actions open`, and reofferPending was already filtered when it
 		// was set, so both are honoured; a plain session-live tick is not.
-		if action.Quiesced(b.now()) && !b.focusPending[id] && !b.reofferPending[id] {
+		//
+		// Age alone is not enough: the verified field incident aged only 3.07
+		// days into QuiesceAfter's seven-day fence while being offered 38
+		// times with zero terminal outcomes. ProjectHandoffOfferState reads
+		// what each accepted drive actually did and quiesces on fruitless
+		// epochs regardless of how young the action still is.
+		overridden := b.focusPending[id] || b.reofferPending[id]
+		quiescedByEvidence := false
+		if !overridden {
+			events, err := b.jobs.Events(ctx, id)
+			if err != nil {
+				return nil, err
+			}
+			state := job.ProjectHandoffOfferState(events, action.CreatedAt, b.now())
+			quiescedByEvidence = state.Quiesced
+			if quiescedByEvidence {
+				audited := false
+				for _, ev := range events {
+					if kind, _ := ev["kind"].(string); kind == "browser.handoff_quiesced" {
+						audited = true
+						break
+					}
+				}
+				if !audited {
+					if err := b.jobs.S.AppendEvent(ctx, id, "browser.handoff_quiesced",
+						map[string]any{"reason": "fruitless_drive_limit", "drive_epochs": state.FruitlessEpochs}); err != nil {
+						return nil, err
+					}
+				}
+			}
+		}
+		if (action.Quiesced(b.now()) || quiescedByEvidence) && !overridden {
 			continue
 		}
 		accessMode, offerable := b.offerableAccessMode(row)
