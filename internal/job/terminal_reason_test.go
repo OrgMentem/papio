@@ -4,29 +4,106 @@ package job
 import (
 	"context"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"strconv"
 	"testing"
 )
 
-func TestTerminalReasonVocabularyCoversEveryWriter(t *testing.T) {
-	// Keep this table aligned with every terminal transition writer: app
-	// exhaustion/identifier paths, browser handoff outcomes, cancellation, and
-	// review rejection. A new reason must have a named constant and be added
-	// here before it can be treated as a known terminal outcome.
-	writers := []TerminalReason{
-		TerminalReasonNoLegalCandidates,
-		TerminalReasonTemporarySourceFailuresDidNotClear,
-		TerminalReasonTemporaryCandidateFailuresDidNotClear,
-		TerminalReasonCandidatesExhausted,
-		TerminalReasonNoIdentifier,
-		TerminalReasonNoEntitlement,
-		TerminalReasonBrowserRejected,
-		TerminalReasonDocumentDeliveryAvailable,
-		TerminalReasonCancelledByUser,
-		TerminalReasonBrowserCancelled,
-		TerminalReasonUserDismissed,
-		TerminalReasonReviewRejected,
+// terminalReasonWriters lists every terminal transition writer: app
+// exhaustion/identifier paths, browser handoff outcomes, cancellation, and
+// review rejection. A new reason must have a named constant and be added here
+// before it can be treated as a known terminal outcome.
+// TestTerminalReasonVocabularyIsExhaustive enforces that mechanically, so the
+// list cannot silently stop covering the vocabulary the way it did when
+// doi_not_registered was added.
+var terminalReasonWriters = []TerminalReason{
+	TerminalReasonNoLegalCandidates,
+	TerminalReasonTemporarySourceFailuresDidNotClear,
+	TerminalReasonTemporaryCandidateFailuresDidNotClear,
+	TerminalReasonCandidatesExhausted,
+	TerminalReasonNoIdentifier,
+	TerminalReasonDOINotRegistered,
+	TerminalReasonNoEntitlement,
+	TerminalReasonBrowserRejected,
+	TerminalReasonDocumentDeliveryAvailable,
+	TerminalReasonCancelledByUser,
+	TerminalReasonBrowserCancelled,
+	TerminalReasonUserDismissed,
+	TerminalReasonReviewRejected,
+}
+
+// TestTerminalReasonVocabularyIsExhaustive guards the guard. A hand-maintained
+// list that only ever gets read by tests it is also the input to cannot fail
+// when someone forgets it — it just quietly covers less. So derive the truth
+// from the declaration itself: every TerminalReason constant in job.go, except
+// the Unknown sentinel, must appear above (and therefore in every table below).
+func TestTerminalReasonVocabularyIsExhaustive(t *testing.T) {
+	file, err := parser.ParseFile(token.NewFileSet(), "job.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse job.go: %v", err)
 	}
-	for _, reason := range writers {
+	listed := make(map[string]bool, len(terminalReasonWriters))
+	for _, reason := range terminalReasonWriters {
+		listed[string(reason)] = true
+	}
+	declared := 0
+	for _, decl := range file.Decls {
+		gen, ok := decl.(*ast.GenDecl)
+		if !ok || gen.Tok != token.CONST {
+			continue
+		}
+		for _, spec := range gen.Specs {
+			value, ok := spec.(*ast.ValueSpec)
+			if !ok {
+				continue
+			}
+			ident, ok := value.Type.(*ast.Ident)
+			if !ok || ident.Name != "TerminalReason" {
+				continue
+			}
+			for _, name := range value.Names {
+				if name.Name == "TerminalReasonUnknown" {
+					continue
+				}
+				declared++
+				reason := NormalizeTerminalReason(string(reasonValue(t, value)))
+				if reason == TerminalReasonUnknown {
+					t.Errorf("%s is not returned by NormalizeTerminalReason; add it to the switch", name.Name)
+				}
+				if !listed[string(reason)] {
+					t.Errorf("%s (%q) is missing from terminalReasonWriters", name.Name, reason)
+				}
+			}
+		}
+	}
+	if declared != len(terminalReasonWriters) {
+		t.Errorf("job.go declares %d terminal reasons but terminalReasonWriters lists %d", declared, len(terminalReasonWriters))
+	}
+}
+
+// reasonValue reads the string literal a TerminalReason constant is declared
+// with. The persisted text is the contract, so the test must compare against
+// what job.go actually writes rather than re-deriving it from the Go name.
+func reasonValue(t *testing.T, spec *ast.ValueSpec) string {
+	t.Helper()
+	if len(spec.Values) != 1 {
+		t.Fatalf("terminal reason spec has %d values, want 1", len(spec.Values))
+	}
+	lit, ok := spec.Values[0].(*ast.BasicLit)
+	if !ok || lit.Kind != token.STRING {
+		t.Fatalf("terminal reason value is %T, want a string literal", spec.Values[0])
+	}
+	unquoted, err := strconv.Unquote(lit.Value)
+	if err != nil {
+		t.Fatalf("unquote %s: %v", lit.Value, err)
+	}
+	return unquoted
+}
+
+func TestTerminalReasonVocabularyCoversEveryWriter(t *testing.T) {
+	for _, reason := range terminalReasonWriters {
 		if got := NormalizeTerminalReason(string(reason)); got != reason {
 			t.Errorf("NormalizeTerminalReason(%q) = %q, want %q", reason, got, reason)
 		}
@@ -36,21 +113,7 @@ func TestTerminalReasonVocabularyCoversEveryWriter(t *testing.T) {
 func TestTerminalReasonRoundTripsAndNormalizesLegacyValues(t *testing.T) {
 	ctx := context.Background()
 	js := testStore(t)
-	reasons := []TerminalReason{
-		TerminalReasonUnknown,
-		TerminalReasonNoLegalCandidates,
-		TerminalReasonTemporarySourceFailuresDidNotClear,
-		TerminalReasonTemporaryCandidateFailuresDidNotClear,
-		TerminalReasonCandidatesExhausted,
-		TerminalReasonNoIdentifier,
-		TerminalReasonNoEntitlement,
-		TerminalReasonBrowserRejected,
-		TerminalReasonDocumentDeliveryAvailable,
-		TerminalReasonCancelledByUser,
-		TerminalReasonBrowserCancelled,
-		TerminalReasonUserDismissed,
-		TerminalReasonReviewRejected,
-	}
+	reasons := append([]TerminalReason{TerminalReasonUnknown}, terminalReasonWriters...)
 	for i, want := range reasons {
 		id, err := js.CreateRequest(ctx, fmt.Sprintf("wr_terminal_reason_%02d", i), testWork(), "", "", testPolicy(), nil, PrincipalUnknown)
 		if err != nil {

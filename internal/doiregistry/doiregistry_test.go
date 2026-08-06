@@ -4,10 +4,12 @@ package doiregistry
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // handleProxy serves the DOI Handle System's REST shape: the response code in
@@ -113,5 +115,122 @@ func TestDOIURLFormIsNormalizedBeforeProbing(t *testing.T) {
 	}
 	if got := (*paths)[0]; !strings.HasPrefix(got, "/api/handles/10.1234/mixed.case") {
 		t.Fatalf("request path = %q, want the normalized bare DOI", got)
+	}
+}
+
+func TestTraversalSegmentInADOIIsRejectedWithoutARequest(t *testing.T) {
+	// doiCoreRE is `^10\.[0-9]{4,9}/\S{1,200}$`, and RE2's \S excludes only the
+	// five ASCII whitespace bytes — so a "." segment is a legal DOI. Building
+	// the path with path.Join used to Clean those segments away and send the
+	// request to https://doi.org/<whatever>, doi.org's own resolver root, which
+	// 302s wherever that DOI's registrant points. The request must never leave.
+	for _, doi := range []string{
+		"10.1234/../../../10.1000/182",
+		"10.1234/a/../../../../example.com/x",
+		"10.1234/a/./b",
+	} {
+		client, paths := handleProxy(t, http.StatusOK, `{"responseCode":1}`)
+		if _, err := client.Registered(context.Background(), doi); err == nil {
+			t.Errorf("Registered(%q) = nil error, want a rejection", doi)
+		}
+		if len(*paths) != 0 {
+			t.Errorf("Registered(%q) issued %v, want no request at all", doi, *paths)
+		}
+	}
+}
+
+func TestRepeatedSlashInADOIIsPreserved(t *testing.T) {
+	// 10.48612//monograph-2025-2 and 10.48612/monograph-2025-2 are two
+	// separately registered DataCite works with different titles (AGENTS.md;
+	// pinned as a pair in ownership_test.go's TestNormalizeIdentifier).
+	// path.Join collapsed the run, so the probe answered for the wrong work.
+	client, paths := handleProxy(t, http.StatusOK, `{"responseCode":1}`)
+
+	if _, err := client.Registered(context.Background(), "10.48612//monograph-2025-2"); err != nil {
+		t.Fatalf("Registered: %v", err)
+	}
+	if want := "/api/handles/10.48612//monograph-2025-2?type=URL"; (*paths)[0] != want {
+		t.Fatalf("request path = %q, want %q", (*paths)[0], want)
+	}
+}
+
+func TestAnswersAreMemoizedAndErrorsAreNot(t *testing.T) {
+	// The maintenance pass sweeps every parked job once a minute, so without
+	// memoization a stuck queue becomes a registry request per job per tick.
+	// An outage must NOT be latched the same way: it would disable the gate
+	// for as long as the entry lived.
+	var codes []int
+	var hits int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		code := codes[0]
+		if len(codes) > 1 {
+			codes = codes[1:]
+		}
+		if code == 100 {
+			w.WriteHeader(http.StatusNotFound)
+		}
+		_, _ = fmt.Fprintf(w, `{"responseCode":%d}`, code)
+	}))
+	t.Cleanup(server.Close)
+	client := New(Options{Client: server.Client(), BaseURL: server.URL})
+
+	codes = []int{2, 1}
+	if _, err := client.Registered(context.Background(), "10.1234/x"); err == nil {
+		t.Fatal("want an error from responseCode 2")
+	}
+	for range 3 {
+		ok, err := client.Registered(context.Background(), "10.1234/x")
+		if err != nil || !ok {
+			t.Fatalf("Registered = %v, %v; want true, nil", ok, err)
+		}
+	}
+	if hits != 2 {
+		t.Fatalf("upstream hits = %d, want 2 — the error must not be cached and the answer must be", hits)
+	}
+
+	codes = []int{100}
+	for range 3 {
+		if ok, err := client.Registered(context.Background(), "10.1234/gone"); err != nil || ok {
+			t.Fatalf("Registered = %v, %v; want false, nil", ok, err)
+		}
+	}
+	if hits != 3 {
+		t.Fatalf("upstream hits = %d, want 3 — a negative answer must be cached too", hits)
+	}
+}
+
+func TestCachedAnswersExpire(t *testing.T) {
+	client, paths := handleProxy(t, http.StatusOK, `{"responseCode":1}`)
+	now := time.Now()
+	client.now = func() time.Time { return now }
+
+	if _, err := client.Registered(context.Background(), "10.1234/x"); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(positiveTTL - time.Second)
+	if _, err := client.Registered(context.Background(), "10.1234/x"); err != nil {
+		t.Fatal(err)
+	}
+	if len(*paths) != 1 {
+		t.Fatalf("requests = %d, want 1 while the entry is live", len(*paths))
+	}
+	now = now.Add(2 * time.Second)
+	if _, err := client.Registered(context.Background(), "10.1234/x"); err != nil {
+		t.Fatal(err)
+	}
+	if len(*paths) != 2 {
+		t.Fatalf("requests = %d, want 2 once the entry expired", len(*paths))
+	}
+}
+
+func TestNilClientFailsClosedInsteadOfBuildingAnUnguardedOne(t *testing.T) {
+	// A plain http.Client would honour HTTP_PROXY, follow ten redirects, dial
+	// loopback, and apply no body cap — every property the daemon's secure
+	// client exists to provide. Erroring here reaches the caller as "unknown",
+	// which fails open; silently downgrading the transport would not be
+	// visible at all.
+	if _, err := New(Options{}).Registered(context.Background(), "10.1234/x"); err == nil {
+		t.Fatal("want an error when no HTTP client was injected")
 	}
 }

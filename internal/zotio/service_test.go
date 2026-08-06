@@ -385,11 +385,15 @@ func TestQueueMissingPDFUnavailableCooldown(t *testing.T) {
 	seed("request_zotio_FRESHKEY1", "job_fresh", "", now.Add(-24*time.Hour))
 	seed("request_zotio_STALEKEY1", "job_stale", "", now.Add(-30*24*time.Hour))
 	seed("request_zotio_NOIDKEY01", "job_no_identifier", "no_identifier", now.Add(-24*time.Hour))
+	// Same exemption, same reason: a mistyped DOI becomes fetchable the moment
+	// the user corrects it, so the recheck window must not wall the item off.
+	seed("request_zotio_BADDOIKEY", "job_doi_not_registered", "doi_not_registered", now.Add(-24*time.Hour))
 
 	cli := &fakeCLI{items: []MissingPDFItem{
 		{Key: "FRESHKEY1", Title: "Fresh verdict", DOI: "10.1000/fresh"},
 		{Key: "STALEKEY1", Title: "Stale verdict", DOI: "10.1000/stale"},
 		{Key: "NOIDKEY01", Title: "Corrected identifier", DOI: "10.1000/corrected"},
+		{Key: "BADDOIKEY", Title: "Corrected DOI typo", DOI: "10.1000/corrected-typo"},
 	}}
 	submitter := &fakeSubmitter{}
 	service := &Service{
@@ -406,8 +410,8 @@ func TestQueueMissingPDFUnavailableCooldown(t *testing.T) {
 	for _, row := range result.Queued {
 		queued[row.ZotioItemKey] = true
 	}
-	if len(queued) != 2 || !queued["STALEKEY1"] || !queued["NOIDKEY01"] {
-		t.Fatalf("queued = %+v, want stale and corrected no_identifier items", result.Queued)
+	if len(queued) != 3 || !queued["STALEKEY1"] || !queued["NOIDKEY01"] || !queued["BADDOIKEY"] {
+		t.Fatalf("queued = %+v, want stale plus both corrected-identifier items", result.Queued)
 	}
 	if len(result.Skipped) != 1 || result.Skipped[0].ZotioItemKey != "FRESHKEY1" {
 		t.Fatalf("skipped = %+v, want only the fresh plain unavailable verdict", result.Skipped)
@@ -423,7 +427,7 @@ func TestQueueMissingPDFUnavailableCooldown(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(result.Queued) != 3 || len(result.Skipped) != 0 {
+	if len(result.Queued) != 4 || len(result.Skipped) != 0 {
 		t.Fatalf("disabled cool-down result = %+v", result)
 	}
 }

@@ -41,11 +41,17 @@ func (s *Service) HandoffRepairer() *HandoffRepairer { return &HandoffRepairer{s
 // observes the event and parks it unavailable with terminal no_entitlement.
 //
 // Rule 3 (unfetchable park): a job whose only open actions are institutional
-// handoffs but whose work carries no fetchable identifier is asking for a
-// sign-in that cannot produce a PDF. Such parks predate the identifier gate in
-// exhaustedCandidates and would otherwise sit in the queue forever, drawing an
-// escalating reminder each time. Same shape as rule 2: resolve the actions and
-// re-enter resolving, where the one gate that owns this decision classifies it.
+// handoffs but whose work carries nothing a sign-in could act on is asking for
+// a login that cannot produce a PDF. That means no fetchable identifier at
+// all, and equally a lone DOI the registry has never heard of — the reported
+// incident was a one-digit typo, whose park rule 2 can never reach, because
+// browser.no_entitlement_requeue requires the browser to have got as far as
+// the institutional resolver and a dead DOI never does. Such parks predate the
+// gate in exhaustedCandidates and would otherwise sit in the queue forever,
+// drawing an escalating reminder each time. Same shape as rule 2: resolve the
+// actions and re-enter resolving, where the one gate that owns this decision
+// classifies it. handoffGate memoizes, so sweeping the same parked jobs every
+// maintenance tick does not become a registry request per job per minute.
 //
 // Rule 4 (unactionable review): an old needs_review job with no open action
 // cannot be approved, rejected, or retried. The nine observed strands each
@@ -115,9 +121,12 @@ func (r *HandoffRepairer) RunDue(ctx context.Context) error {
 		if !allInstitutionalHandoffs(open) {
 			continue
 		}
+		// After allInstitutionalHandoffs, so the registry is never probed for a
+		// park this rule would skip anyway.
+		routeable, _, _ := s.handoffGate(ctx, row.Work)
 		repair := "proven_empty_route_repair"
 		switch {
-		case !row.Work.HasFetchableIdentifier():
+		case !routeable:
 			repair = "unfetchable_handoff_repair"
 		case !s.institutionalRouteExhausted(ctx, row.ID):
 			continue

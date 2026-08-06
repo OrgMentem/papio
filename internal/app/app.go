@@ -96,7 +96,7 @@ type Service struct {
 	Resolvers    []ResolverEntry
 	Enricher     MetadataEnricher
 	Discovery    WorkLookup
-	DOIs         DOIRegistry
+	DOIRegistry  DOIRegistry
 	Fetch        FetchFunc
 	Validate     ValidateFunc
 	AutoImporter AutoImporter
@@ -1052,25 +1052,27 @@ func (s *Service) institutionalRouteExhausted(ctx context.Context, jobID string)
 // The syntactic half is HasFetchableIdentifier: no DOI/PMID/arXiv/OpenAlex id
 // means no route a login can open. The second half exists because a DOI that
 // merely *parses* is not a DOI that *exists*. A mistyped one survives every
-// upstream check — Crossref, OpenAlex, and Unpaywall all report "no record"
-// and "no open copy" as the same empty result — and then reaches the link
-// resolver, which has nothing to match and bounces the user to doi.org's "DOI
-// NOT FOUND" page. The handoff can never be completed, so it re-offers on
+// upstream check — Crossref, OpenAlex, EuropePMC and Unpaywall all report "no
+// record" and "no open copy" as the same empty result — and then reaches the
+// link resolver, which has nothing to match and bounces the user to doi.org's
+// "DOI NOT FOUND" page. The handoff can never be completed, so it re-offers on
 // every session-live tick and re-notifies on the reminder schedule forever.
 //
 // The registry is consulted only when a DOI is the sole fetchable identifier
-// (a PMID or arXiv id is its own route) and only at this boundary, which is
-// already the slow no-candidates path. A probe failure fails open, like
-// institutionalRouteExhausted: during a registry outage another handoff is far
-// cheaper than terminating a job that was perfectly fetchable.
+// (a PMID, arXiv id or OpenAlex id is its own route) and only where a handoff
+// is actually about to be created or repaired. A probe failure fails open,
+// like institutionalRouteExhausted: during a registry outage another handoff
+// is far cheaper than terminating a job that was perfectly fetchable. The
+// registry client memoizes, so the once-a-minute repair sweep over every
+// parked job does not become a request per job per tick.
 func (s *Service) handoffGate(ctx context.Context, w work.Work) (ok bool, reason string, terminal job.TerminalReason) {
 	if !w.HasFetchableIdentifier() {
 		return false, "no_identifier", job.TerminalReasonNoIdentifier
 	}
-	if s.DOIs == nil || w.DOI == "" || w.PMID != "" || w.ArXiv != "" || w.OpenAlex != "" {
+	if s.DOIRegistry == nil || w.DOI == "" || w.PMID != "" || w.ArXiv != "" || w.OpenAlex != "" {
 		return true, "", ""
 	}
-	registered, err := s.DOIs.Registered(ctx, w.DOI)
+	registered, err := s.DOIRegistry.Registered(ctx, w.DOI)
 	if err != nil || registered {
 		return true, "", ""
 	}

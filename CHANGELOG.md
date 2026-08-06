@@ -87,6 +87,21 @@ execution records in `notes/acquisition-stack-plan.md`.
   unreachable, so an outage cannot terminate fetchable work. Like
   `no_identifier`, the new reason is exempt from the zotio backfill cool-down,
   because correcting the DOI makes the item fetchable immediately.
+  The same gate now runs in the maintenance repair pass, so a job that was
+  *already* parked when this shipped is reclaimed rather than nagging forever;
+  the existing "contradicted park" rule could never reach it, because that one
+  waits on a `browser.no_entitlement_requeue` event and a dead DOI never gets
+  as far as the institutional resolver. Registry answers are memoized so the
+  once-a-minute sweep does not become a request per parked job per tick.
+  Two hardening notes on the probe itself, both found in review: the request
+  path is built by concatenation rather than `path.Join`, because Join Cleans —
+  which collapsed the repeated slash that makes `10.48612//monograph-2025-2` a
+  different registered work from `10.48612/monograph-2025-2`, and let a `..`
+  segment (`doiCoreRE` admits any non-whitespace suffix) escape `/api/handles/`
+  into doi.org's own resolver root; dot segments are now rejected outright. And
+  a missing HTTP client is an error rather than a plain `http.Client`, which
+  would have silently dropped the SSRF guard, redirect cap and body bound the
+  daemon's shared metadata client provides.
 - **The quarantine preview re-verifies the file on every serve.** The digest
   was checked once and the result cached on the capability, so any later GET
   of the same URL re-opened the file and served it with no hash check at all —

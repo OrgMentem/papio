@@ -194,7 +194,7 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 	// Not a configurable source: the Handle System is the DOI system's own
 	// existence oracle, carries no quota or credential, and is consulted only
 	// at the no-candidates handoff boundary.
-	service.DOIs = doiregistry.New(doiregistry.Options{Client: metadataClient, ContactEmail: cfg.Email})
+	service.DOIRegistry = doiregistry.New(doiregistry.Options{Client: metadataClient, ContactEmail: cfg.Email, Version: version})
 	var senders []notify.Sender
 	if cfg.Notify.Enabled {
 		senders = append(senders, notify.NewMacOS())

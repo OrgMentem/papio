@@ -92,6 +92,17 @@ Bump the pinned zensical version in `docs/requirements.txt` deliberately; CI ins
   `internal/doctor/doctor_test.go`, `internal/store/migrate_forward_test.go`.
   `go test ./...` fails after adding `internal/store/migrations/NNNN_*.sql` until
   all three assertions are bumped.
+- **Adding a `job.TerminalReason` is three edits, and the third is the one you
+  forget**: the const block and `NormalizeTerminalReason`'s switch (both
+  `internal/job/job.go`), plus `terminalReasonWriters` in
+  `internal/job/terminal_reason_test.go`. That table used to be a plain list, so
+  omitting a reason made it silently cover less instead of failing —
+  `doi_not_registered` shipped that way. `TestTerminalReasonVocabularyIsExhaustive`
+  now parses `job.go` and fails on any declared reason missing from the table or
+  from the switch, so the trap is closed; do not "simplify" that test back into a
+  hand-maintained list. A user-facing reason also wants an `internal/errcat`
+  explanation, and — if correcting the metadata makes the work fetchable
+  immediately — an exemption in `internal/zotio`'s `unavailableCooldown`.
 - **`papio daemon stop` can look hung for 15-30s** when the daemon is mid-graceful-shutdown,
   not deadlocked — don't jump to "infinite loop" from growing `ps` CPU time alone. A `SIGKILL`'d
   daemon leaves its unix socket file behind (never runs its own cleanup), so a subsequent
