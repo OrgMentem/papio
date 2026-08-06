@@ -600,6 +600,25 @@ test.skipIf(emeraldPaywall === null)(
   },
 );
 
+const emeraldCurrent = loadFixture("emerald", "institutional");
+test.skipIf(emeraldCurrent === null)(
+  "captured Emerald current-platform page classifies through its migrated PDF anchor",
+  () => {
+    const spec = adapters.find((a) => a.id === "emerald") as AdapterSpec;
+    const page = emeraldCurrent as Document;
+    // The legacy Insight anchor is absent here: this page is only reachable
+    // through the rule added for the migrated platform.
+    expect(page.querySelector("a.intent_pdf_link")).toBeNull();
+    expect(interpret(page, spec, ctx()).kind).toBe("article");
+    // One download rule serves both platforms, so its union selector has to
+    // resolve on each captured shape.
+    expect(page.querySelector(spec.download?.selector as string)).not.toBeNull();
+    expect(
+      (emeraldArticle as Document).querySelector(spec.download?.selector as string),
+    ).not.toBeNull();
+  },
+);
+
 const tandfArticle = loadFixture("tandfonline", "success");
 test.skipIf(tandfArticle === null)(
   "captured Taylor and Francis OA journal page classifies through its direct PDF control",
@@ -618,6 +637,55 @@ test.skipIf(tandfPaywall === null)(
     expect(interpret(tandfPaywall as Document, spec, ctx()).kind).toBe("no_entitlement");
   },
 );
+
+const tandfInstitutional = loadFixture("tandfonline", "institutional");
+test.skipIf(tandfInstitutional === null)(
+  "captured Taylor and Francis institutional page classifies on the full-access badge",
+  () => {
+    const spec = adapters.find((a) => a.id === "tandfonline") as AdapterSpec;
+    const page = tandfInstitutional as Document;
+    // This is the state papio exists to drive, and it is NOT open access: the
+    // OA badge the rule used to require is absent while the entitled badge and
+    // a working PDF control are both rendered.
+    expect(page.querySelector(".accessLogo .access-icon.oa")).toBeNull();
+    expect(page.querySelector(".accessLogo .access-icon.full")).not.toBeNull();
+    expect(interpret(page, spec, ctx()).kind).toBe("article");
+  },
+);
+
+test("Taylor and Francis still needs a rendered access badge, not just a PDF link", () => {
+  const spec = adapters.find((a) => a.id === "tandfonline") as AdapterSpec;
+  const page = parseHTML(
+    "<html><body><div class='downloadPDFLink'>" +
+      "<a class='show-pdf' href='https://www.tandfonline.com/doi/pdf/10.1080/x'>Download PDF</a>" +
+      "</div></body></html>",
+  );
+  expect(interpret(page, spec, ctx()).kind).toBe("unknown");
+});
+
+const sciencedirectPaywall = loadFixture("sciencedirect", "no-entitlement");
+test.skipIf(sciencedirectPaywall === null)(
+  "captured ScienceDirect purchase wall reports no entitlement, not a coverage gap",
+  () => {
+    const spec = adapters.find((a) => a.id === "sciencedirect") as AdapterSpec;
+    const page = sciencedirectPaywall as Document;
+    // Reporting this as `unknown` told the user papio could not drive the page
+    // and sent them hunting an adapter bug, when the resolver had simply
+    // routed them somewhere they have no access.
+    expect(page.querySelector("meta[name='citation_pdf_url']")).toBeNull();
+    expect(interpret(page, spec, ctx()).kind).toBe("no_entitlement");
+  },
+);
+
+test("an entitled ScienceDirect page still wins over the purchase-wall rule", () => {
+  const spec = adapters.find((a) => a.id === "sciencedirect") as AdapterSpec;
+  const page = parseHTML(
+    "<html><head><meta name='citation_pdf_url' content='https://www.sciencedirect.com/x.pdf'>" +
+      "<meta name='citation_title' content='A paper'></head>" +
+      "<body><div class='accessbar'><div class='PurchasePDF'>Purchase PDF</div></div></body></html>",
+  );
+  expect(interpret(page, spec, ctx()).kind).toBe("article");
+});
 
 test("Taylor and Francis book metadata is outside the journal adapter host scope", () => {
   const spec = adapters.find((a) => a.id === "tandfonline") as AdapterSpec;

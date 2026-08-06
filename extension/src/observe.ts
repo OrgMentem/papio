@@ -39,8 +39,12 @@ const MULTI_LABEL_PUBLIC_SUFFIXES: Record<string, true> = {
   "or.jp": true,
 };
 const DAY_MS = 24 * HOUR_MS;
-const MAX_PER_HOST = 1;
-const MAX_PER_DAY = 5;
+const MAX_PER_SHAPE = 1;
+const MAX_PER_DAY = 20;
+// Bound retained digests per shape so a host that never stabilizes cannot
+// grow storage without limit; 3 is enough to catch A/B page variants without
+// needing to remember every sanitized snapshot ever seen for a shape.
+const MAX_DIGESTS_PER_SHAPE = 3;
 
 export interface ObserveChromeApi {
   scripting: {
@@ -67,7 +71,8 @@ export interface ObservationCaptureContext {
 
 interface ObservationRateState {
   total: number[];
-  byHost: Record<string, number[]>;
+  byShape: Record<string, number[]>;
+  digests: Record<string, string[]>;
 }
 
 function hostMatches(host: string, providerHosts: readonly string[]): boolean {
@@ -87,23 +92,67 @@ export function observedHostKey(host: string): string | null {
   return labels.slice(MULTI_LABEL_PUBLIC_SUFFIXES[suffix] === true ? -3 : -2).join("-");
 }
 
+/** The bucket a capture is rate-limited and deduped against: the same host
+ * repeatedly matching-but-unclassified through the same adapter build is one
+ * shape, but bumping adapterVersion on a still-broken host is a new attempt —
+ * exactly when the diagnostic is worth having again. */
+function observationShapeKey(hostKey: string, context: ObservationCaptureContext): string {
+  return `${hostKey}|${context.adapterID ?? "-"}@${context.adapterVersion ?? "-"}`;
+}
+
+/** Dependency-free 32-bit FNV-1a hash, rendered as 8 hex digits. This is a
+ * dedupe key for spotting a repeat sanitized page shape, not a security
+ * primitive: a collision just costs one wasted capture slot, not a broken
+ * guarantee. The extension has zero runtime deps, so no crypto import. */
+function fnv1a(input: string): string {
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < input.length; index += 1) {
+    hash ^= input.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0");
+}
+
 function cleanRateState(raw: unknown, now: number): ObservationRateState {
-  const empty: ObservationRateState = { total: [], byHost: {} };
+  const empty: ObservationRateState = { total: [], byShape: {}, digests: {} };
   if (raw === null || typeof raw !== "object") return empty;
   const candidate = raw as Record<string, unknown>;
+  // A pre-rename snapshot keyed captures on bare host ("byHost"). Reading its
+  // entries as shapeKeys would silently let one failing host squat on every
+  // adapter version's budget forever, so a legacy snapshot degrades to empty
+  // rather than being reinterpreted.
+  if ("byHost" in candidate && !("byShape" in candidate)) return empty;
   const sinceDay = now - DAY_MS;
   const timestamps = (value: unknown, since: number): number[] =>
     Array.isArray(value)
       ? value.filter((timestamp): timestamp is number => typeof timestamp === "number" && Number.isFinite(timestamp) && timestamp > since)
       : [];
-  const byHost: Record<string, number[]> = {};
-  if (candidate["byHost"] !== null && typeof candidate["byHost"] === "object") {
-    for (const [host, values] of Object.entries(candidate["byHost"] as Record<string, unknown>)) {
-      const retained = timestamps(values, now - HOUR_MS);
-      if (retained.length > 0) byHost[host] = retained;
+  // Retained for the full day, not just the hourly gate window: the 1-per-
+  // hour cap is enforced by sub-filtering this array at read time (see
+  // observeUnknown), but the digest cache below needs a shape's entry to
+  // survive across many hourly reset cycles within the day — otherwise a
+  // host that fails the exact same way every hour would burn a fresh daily-
+  // budget slot each time, defeating the point of the dedupe.
+  const byShape: Record<string, number[]> = {};
+  if (candidate["byShape"] !== null && typeof candidate["byShape"] === "object") {
+    for (const [shapeKey, values] of Object.entries(candidate["byShape"] as Record<string, unknown>)) {
+      const retained = timestamps(values, sinceDay);
+      if (retained.length > 0) byShape[shapeKey] = retained;
     }
   }
-  return { total: timestamps(candidate["total"], sinceDay), byHost };
+  // A shape's digests only matter as long as the shape itself is still
+  // within the daily budget's window; once its last timestamp ages out of
+  // `byShape` above, drop its digests too instead of letting them accumulate
+  // for a shape that hasn't been seen in a day.
+  const digests: Record<string, string[]> = {};
+  if (candidate["digests"] !== null && typeof candidate["digests"] === "object") {
+    for (const [shapeKey, values] of Object.entries(candidate["digests"] as Record<string, unknown>)) {
+      if (!(shapeKey in byShape) || !Array.isArray(values)) continue;
+      const retained = values.filter((digest): digest is string => typeof digest === "string").slice(0, MAX_DIGESTS_PER_SHAPE);
+      if (retained.length > 0) digests[shapeKey] = retained;
+    }
+  }
+  return { total: timestamps(candidate["total"], sinceDay), byShape, digests };
 }
 
 
@@ -127,6 +176,7 @@ export function observeUnknown(
     if (!job || !hostMatches(host, context.verifiedHosts)) return;
     const hostKey = observedHostKey(host);
     if (!hostKey) return;
+    const shapeKey = observationShapeKey(hostKey, context);
 
     const capturedAt = now();
     const timestamp = capturedAt.getTime();
@@ -140,7 +190,10 @@ export function observeUnknown(
       return;
     }
     const rates = cleanRateState(stored[RATE_STORAGE_KEY], timestamp);
-    if (rates.total.length >= MAX_PER_DAY || (rates.byHost[hostKey]?.length ?? 0) >= MAX_PER_HOST) return;
+    // `rates.byShape` spans the full day (see cleanRateState); the 1-per-
+    // hour gate is a trailing-hour sub-filter over that persisted history.
+    const shapeCapturesThisHour = (rates.byShape[shapeKey] ?? []).filter((t) => t > timestamp - HOUR_MS).length;
+    if (rates.total.length >= MAX_PER_DAY || shapeCapturesThisHour >= MAX_PER_SHAPE) return;
 
     let injected: { result?: PageCapture | undefined } | undefined;
     try {
@@ -172,6 +225,16 @@ export function observeUnknown(
       return;
     }
 
+    // The digest only exists once the page is captured and sanitized, so a
+    // repeat of an already-seen shape still costs the executeScript above —
+    // what it must not cost is a wasted daily-budget slot or a redundant
+    // upload over the native-messaging bridge. Hash the body only: the
+    // fixture header's `captured=` timestamp is different on every call by
+    // construction, so including it would make every capture look unique
+    // and the dedupe would never fire.
+    const digest = fnv1a(sanitized.slice(sanitized.indexOf("\n") + 1));
+    if (rates.digests[shapeKey]?.includes(digest)) return;
+
     const encoded = await encodePageCapture(sanitized, {
       host: pageHost,
       scenario: "observed",
@@ -187,9 +250,11 @@ export function observeUnknown(
     // Reserve quota before bridge emission so a worker restart during native
     // transport cannot turn one observation into multiple captures.
     rates.total.push(timestamp);
-    const hostRates = rates.byHost[hostKey] ?? [];
-    hostRates.push(timestamp);
-    rates.byHost[hostKey] = hostRates;
+    const shapeRates = rates.byShape[shapeKey] ?? [];
+    shapeRates.push(timestamp);
+    rates.byShape[shapeKey] = shapeRates;
+    const shapeDigests = rates.digests[shapeKey] ?? [];
+    rates.digests[shapeKey] = [digest, ...shapeDigests].slice(0, MAX_DIGESTS_PER_SHAPE);
     try {
       await api.storage.local.set({ [RATE_STORAGE_KEY]: rates });
     } catch (error) {

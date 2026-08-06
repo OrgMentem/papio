@@ -12,6 +12,7 @@
     "dev:firefox": "web-ext run",
     "dev": "concurrently -k -n build,firefox -c blue,magenta \"bun run build:watch\" \"bun run dev:firefox\"",
     "capture:store": "bun run scripts/capture-store-assets.ts",
+    "adapter:try": "bun run tools/adapter-try.ts",
     "lint:firefox": "bun run build && web-ext lint --source-dir=firefox",
     "submit:firefox": "scripts/submit-firefox.sh",
     "submit:chrome": "scripts/submit-chrome.sh",

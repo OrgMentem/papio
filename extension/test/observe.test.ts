@@ -102,10 +102,18 @@ test("unknown tracked provider page emits one sanitized observed page_capture fr
   const sanitized = gunzipBase64(emitted?.payload.body ?? "");
   expect(sanitized).toContain('scenario="observed"');
   expect(sanitized).toContain("<script></script>");
-  expect(fake.stored[RATE_KEY]).toEqual({
-    total: [new Date(capturedAt).getTime()],
-    byHost: { "sciencedirect-com": [new Date(capturedAt).getTime()] },
-  });
+  const shapeKey = "sciencedirect-com|-@-";
+  const storedState = fake.stored[RATE_KEY] as {
+    total: number[];
+    byShape: Record<string, number[]>;
+    digests: Record<string, string[]>;
+  };
+  expect(storedState.total).toEqual([new Date(capturedAt).getTime()]);
+  expect(storedState.byShape).toEqual({ [shapeKey]: [new Date(capturedAt).getTime()] });
+  // The digest is a dedupe key, not asserted for a specific value here — just
+  // that a single sanitized-page fingerprint was recorded for the shape.
+  expect(storedState.digests[shapeKey]).toHaveLength(1);
+  expect(typeof storedState.digests[shapeKey]?.[0]).toBe("string");
 });
 
 test("a registry-only adapter host now passes the observed-capture gate", async () => {
@@ -134,21 +142,24 @@ test("a registry-only adapter host now passes the observed-capture gate", async 
   });
 });
 
-test("persisted per-host and daily observation quotas prevent later captures", async () => {
+test("persisted per-shape and daily observation quotas prevent later captures", async () => {
   const firstHost = "www.sciencedirect.com";
   const fake = fakeChrome(pageFor(firstHost));
-  const firstTime = "2026-07-15T10:00:00.000Z";
+  const firstTime = "2026-07-15T00:00:00.000Z";
   await observeUnknown(fake.api, jobFor(firstHost), firstHost, verifiedHosts(firstHost), fixedNow(firstTime));
   await observeUnknown(
     fake.api,
     jobFor(firstHost),
     firstHost,
     verifiedHosts(firstHost),
-    fixedNow("2026-07-15T10:30:00.000Z"),
+    fixedNow("2026-07-15T00:05:00.000Z"),
   );
   expect(fake.sent).toHaveLength(1);
 
-  const otherHosts = ["www.jstor.org", "www.springer.com", "www.wiley.com", "www.tandfonline.com"];
+  // Fill the raised daily budget (20) with distinct-shape hosts, all inside
+  // one day, so the next capture is refused by the daily ceiling itself and
+  // not by the (now per-shape, not per-host) hourly limit.
+  const otherHosts = Array.from({ length: 19 }, (_, index) => `provider${index}.org`);
   for (let index = 0; index < otherHosts.length; index += 1) {
     const host = otherHosts[index]!;
     fake.setPage(pageFor(host));
@@ -157,21 +168,21 @@ test("persisted per-host and daily observation quotas prevent later captures", a
       jobFor(host, 20 + index),
       host,
       verifiedHosts(host),
-      fixedNow(`2026-07-15T${11 + index}:00:00.000Z`),
+      () => new Date(new Date(firstTime).getTime() + (10 + index * 5) * 60 * 1000),
     );
   }
-  expect(fake.sent).toHaveLength(5);
+  expect(fake.sent).toHaveLength(20);
 
-  const sixthHost = "www.sagepub.com";
-  fake.setPage(pageFor(sixthHost));
+  const overflowHost = "www.sagepub.com";
+  fake.setPage(pageFor(overflowHost));
   await observeUnknown(
     fake.api,
-    jobFor(sixthHost, 30),
-    sixthHost,
-    verifiedHosts(sixthHost),
-    fixedNow("2026-07-15T16:00:00.000Z"),
+    jobFor(overflowHost, 99),
+    overflowHost,
+    verifiedHosts(overflowHost),
+    fixedNow("2026-07-15T02:00:00.000Z"),
   );
-  expect(fake.sent).toHaveLength(5);
+  expect(fake.sent).toHaveLength(20);
 });
 
 test("untracked and unverified pages are never injected or emitted", async () => {
@@ -223,4 +234,92 @@ test("a residual leak refuses the observed bridge frame", async () => {
 
   expect(fake.injections).toHaveLength(1);
   expect(fake.sent).toHaveLength(0);
+});
+
+test("different adapter versions on the same host both capture within the same hour", async () => {
+  // Old code keyed the hourly limit on bare host, so a version bump on a
+  // still-broken host would be silently throttled by the previous attempt's
+  // slot. Shape-keying separates them.
+  const host = "www.sciencedirect.com";
+  const fake = fakeChrome(pageFor(host));
+
+  const first = await observeUnknown(
+    fake.api,
+    jobFor(host),
+    host,
+    { verifiedHosts: [host], adapterID: "elsevier", adapterVersion: "1.0.0" },
+    fixedNow("2026-07-15T10:00:00.000Z"),
+  );
+  const second = await observeUnknown(
+    fake.api,
+    jobFor(host),
+    host,
+    { verifiedHosts: [host], adapterID: "elsevier", adapterVersion: "1.0.1" },
+    fixedNow("2026-07-15T10:05:00.000Z"),
+  );
+
+  expect(first).toBe(true);
+  expect(second).toBe(true);
+  expect(fake.sent).toHaveLength(2);
+});
+
+test("an identical sanitized page for the same shape is captured once and the repeat costs no daily budget", async () => {
+  const host = "www.sciencedirect.com";
+  const fake = fakeChrome(pageFor(host));
+  const context = verifiedHosts(host);
+
+  // Second attempt lands past the 1-hour per-shape window, so only the
+  // digest dedupe — not the hourly shape limit — can be refusing it.
+  const first = await observeUnknown(fake.api, jobFor(host), host, context, fixedNow("2026-07-15T10:00:00.000Z"));
+  const second = await observeUnknown(fake.api, jobFor(host), host, context, fixedNow("2026-07-15T11:30:00.000Z"));
+
+  expect(first).toBe(true);
+  expect(second).toBe(false);
+  // A duplicate shape still costs the executeScript injection: the digest is
+  // only knowable after the page is captured and sanitized.
+  expect(fake.injections).toHaveLength(2);
+  expect(fake.sent).toHaveLength(1);
+  const stored = fake.stored[RATE_KEY] as { total: number[] };
+  expect(stored.total).toHaveLength(1);
+});
+
+test("a genuinely different page for the same shape is still refused by the hourly shape limit", async () => {
+  const host = "www.sciencedirect.com";
+  const fake = fakeChrome(pageFor(host));
+  const context = verifiedHosts(host);
+
+  const first = await observeUnknown(fake.api, jobFor(host), host, context, fixedNow("2026-07-15T10:00:00.000Z"));
+  fake.setPage({
+    html: `<html><body><main class="article">Different structure now</main><script>secret</script></body></html>`,
+    origin: `https://${host}`,
+    path: "/article/456",
+  });
+  const second = await observeUnknown(fake.api, jobFor(host), host, context, fixedNow("2026-07-15T10:30:00.000Z"));
+
+  expect(first).toBe(true);
+  expect(second).toBe(false);
+  // Refused before injection: the hourly shape limit, not digest dedupe, is
+  // what is blocking this one.
+  expect(fake.injections).toHaveLength(1);
+  expect(fake.sent).toHaveLength(1);
+});
+
+test("legacy byHost persisted state loads as empty instead of throwing", async () => {
+  const host = "www.sciencedirect.com";
+  const fake = fakeChrome(pageFor(host));
+  fake.stored[RATE_KEY] = {
+    total: [new Date("2026-07-15T09:00:00.000Z").getTime()],
+    byHost: { "sciencedirect-com": [new Date("2026-07-15T09:00:00.000Z").getTime()] },
+  };
+
+  const captured = await observeUnknown(
+    fake.api,
+    jobFor(host),
+    host,
+    verifiedHosts(host),
+    fixedNow("2026-07-15T09:05:00.000Z"),
+  );
+
+  expect(captured).toBe(true);
+  expect(fake.sent).toHaveLength(1);
 });

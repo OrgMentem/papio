@@ -65,6 +65,43 @@ was not safely reachable, and that state remains assisted. Every enabled
 provider also carries a deterministic drift fixture so selector changes fail
 closed instead of initiating a guessed download.
 
+## Trying a spec against a capture
+
+Editing the adapter registry, rebuilding the extension, reloading it, and
+re-driving a live institutional handoff is far too slow a loop to repair an
+adapter that matches a host and then fails to classify the page — that
+failure mode alone accounted for 99 of 103 adapter failures measured on a
+live install. Because `interpret` (`src/adapters/types.ts`) is pure and
+DOM-only, a spec can instead be checked against a stored capture entirely
+offline, with `tools/adapter-try.ts`:
+
+```
+bun run adapter:try -- fixtures/tandfonline/success.html --id tandfonline
+bun run adapter:try -- fixtures/tandfonline/no-entitlement.html --id tandfonline --expect article
+```
+
+It prints the resolved verdict, then walks `spec.classify` rule by rule (in
+declared order) showing exactly which `all`/`any` selectors matched and which
+`textAny` needles were found — including for rules after the first full
+match, so a losing rule still shows which single selector cost it the match.
+When the verdict is `article` and the spec declares a `download` rule, it also
+reports whether `download.selector` resolves and the URL that method would
+produce. `--expect <kind>` exits 1 when the verdict differs, which makes the
+command usable as a check while iterating.
+
+A candidate spec that is not (yet) in the registry — drafted while repairing
+or adding an adapter — can be tried the same way with `--spec` instead of
+`--id`, pointing at a JSON file shaped like one entry of the `adapters` array:
+
+```
+bun run adapter:try -- fixtures/newprovider/success.html --spec draft-newprovider.json --expect article
+```
+
+`--title`/`--doi`/`--year` populate `AdapterContext.expected`, the same
+wrong-work title-token check `interpret` runs live. Both a committed fixture
+under `fixtures/<id>/<scenario>.html` and a raw capture retrieved with
+`papio adapter captures` work as the positional `<captured.html>` argument.
+
 ## Privacy
 
 Captured HTML must already be sanitized by the capture tool before it leaves the

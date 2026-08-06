@@ -31,10 +31,19 @@ export function fixtureExists(provider: string, scenario: string): boolean {
  * fixture's `<!-- papio-fixture ... -->` header comment is parsed as a harmless
  * comment node and ignored by `interpret`.
  */
-export function parseHTML(html: string): Document {
-  const window = new Window({ url: "https://fixture.local/" });
+export function parseHTML(html: string, baseURL = "https://fixture.local/"): Document {
+  const window = new Window({ url: baseURL });
   window.document.write(html);
   return window.document as unknown as Document;
+}
+
+/** The scheme+host+path a capture was taken from, read back out of its
+ * `papio-fixture` header. A relative `href` resolves against the document's
+ * URL, so a tool that prints a resolved download URL has to parse with the
+ * real origin or it reports a fixture-local address that never existed. */
+export function captureOrigin(html: string): string | null {
+  const header = /^<!--\s*papio-fixture\b[^>]*?\borigin="([^"]+)"/.exec(html);
+  return header === null ? null : (header[1] ?? null);
 }
 
 /**

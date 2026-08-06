@@ -221,11 +221,19 @@ export function interpret(
     evidence.push("no rule matched");
     return { kind: "unknown", adapter_id, adapter_version, evidence };
   };
-
   // Fixture interpretation is deterministic and synchronous. Only the
   // serialized live invocation waits for React/custom-element hydration.
   if (doc !== null) return classify();
-  const boundedMs = Math.max(0, Math.min(spec.settleTimeoutMs ?? 0, 5000));
+  // The ceiling has to exceed every value a spec may declare, or the field is
+  // a lie: it was 5000 while `clinicalkey` declared 8000, so that adapter's
+  // extra budget was silently discarded and the provider's Angular content
+  // player — which really is slower than five seconds when reached through an
+  // institutional resolver hop — kept classifying `unknown`. This is a worst
+  // case, not a delay: the MutationObserver below resolves the instant a
+  // declared selector appears, so a fast page never spends it. Two concurrent
+  // handoff drives (HANDOFF_DRIVE_LIMIT) bound how long a stalled provider can
+  // hold the queue.
+  const boundedMs = Math.max(0, Math.min(spec.settleTimeoutMs ?? 0, 15000));
   if (boundedMs === 0 || root.documentElement === null) return Promise.resolve(classify());
 
   const selectorsReady = (): boolean => {
@@ -455,10 +463,20 @@ export const adapters: AdapterSpec[] = [
     // rides the site's own watermarked-PDF endpoint with session cookies.
     // Evidence covers the .com.au front; clinicalkey.com joins with its own
     // capture.
+    //
+    // The settle budget is the largest in the registry because this provider
+    // is routinely reached through a resolver hop rather than directly, and
+    // the hop eats the render budget: captured live 2026-08-06, the same
+    // article arrived from an institutional OpenURL as a 54 KB shell still
+    // titled "Page loading" with `.c-cksc-content-player.loading` ten seconds
+    // after load, while the direct content URL rendered the full 164 KB
+    // article with its download anchor inside the same ten seconds. The
+    // declared value was 8000 and silently clamped to 5000 by `interpret`
+    // until that ceiling was raised.
     id: "clinicalkey",
-    version: "0.1.0",
+    version: "0.2.0",
     hosts: ["clinicalkey.com.au"],
-    settleTimeoutMs: 8000,
+    settleTimeoutMs: 15000,
     classify: [
       {
         kind: "article",
@@ -572,26 +590,41 @@ export const adapters: AdapterSpec[] = [
     },
   },
   {
-    // STRUCTURAL-ONLY (synthetic citation_pdf_url DOM in sciencedirect.test.ts),
-    // NOT yet live-verified.
-    // ScienceDirect sits behind Cloudflare, which bot-challenges automated
-    // capture, so no entitled DOM could be captured under automation at build
-    // time. This adapter follows the citation_pdf_url standard (the
-    // Highwire/Google-Scholar meta tag carrying the entitled pdfft URL that
-    // Elsevier exposes) and fetches it via the privileged downloads API — no
-    // click, no gesture — gated on recorded terms consent, exactly like the
-    // JSTOR url / EBSCO api adapters. Confirm live against a real entitled
-    // session (a warm human browser does not trip Cloudflare) before trusting
-    // it; if ScienceDirect gates the pdfft URL behind an interstitial
-    // (isDTMRedir), the meta URL fetch will need a follow-up.
+    // The article rule is STRUCTURAL-ONLY (synthetic citation_pdf_url DOM in
+    // sciencedirect.test.ts) and NOT yet live-verified: ScienceDirect sits
+    // behind Cloudflare, which bot-challenges automated capture, so no
+    // entitled DOM could be captured under automation at build time. It
+    // follows the citation_pdf_url standard (the Highwire/Google-Scholar meta
+    // tag carrying the entitled pdfft URL that Elsevier exposes) and fetches
+    // it via the privileged downloads API — no click, no gesture — gated on
+    // recorded terms consent, exactly like the JSTOR url / EBSCO api adapters.
+    // Confirm live against a real entitled session (a warm human browser does
+    // not trip Cloudflare) before trusting it; if ScienceDirect gates the
+    // pdfft URL behind an interstitial (isDTMRedir), the meta URL fetch will
+    // need a follow-up.
+    //
+    // The no_entitlement rule IS live evidence (fixtures/sciencedirect/
+    // no-entitlement.html, captured 2026-08-06 from a real institutional
+    // handoff). Without it an unentitled ScienceDirect article classified
+    // `unknown`, which papio reports to the user as "could not drive the
+    // provider page" — sending them to hunt an adapter bug when the real
+    // problem is that the resolver routed them somewhere they have no access.
+    // The two states are cleanly separable in the capture: the paywall
+    // publishes the access bar's PurchasePDF control and NO citation_pdf_url,
+    // the entitled page the reverse. `article` stays first so the positive
+    // entitlement signal always wins if a page ever carries both.
     id: "sciencedirect",
-    version: "0.1.0",
+    version: "0.2.0",
     hosts: ["sciencedirect.com"],
     settleTimeoutMs: 5000,
     classify: [
       {
         kind: "article",
         all: ["meta[name='citation_pdf_url']", "meta[name='citation_title']"],
+      },
+      {
+        kind: "no_entitlement",
+        all: [".accessbar .PurchasePDF"],
       },
     ],
     download: {
@@ -715,12 +748,24 @@ export const adapters: AdapterSpec[] = [
   },
   {
     // Verified against authentic Taylor & Francis Online publisher captures
-    // archived 2025-12-09 (OA article) and 2023-03-31 (Access Denial), stored
-    // under fixtures/tandfonline/. The journal platform is distinct from
+    // archived 2025-12-09 (OA article) and 2023-03-31 (Access Denial), plus a
+    // live institutionally entitled article captured 2026-08-06
+    // (fixtures/tandfonline/institutional.html), stored under
+    // fixtures/tandfonline/. The journal platform is distinct from
     // taylorfrancis.com books, whose citation_pdf_url can be only a preview.
-    // Require the rendered OA badge plus the direct /doi/pdf/ control.
+    //
+    // The access badge is a DISJUNCTION, not the OA badge alone. T&F renders
+    // `.access-icon.oa` for open access and `.access-icon.full` for an
+    // entitled institutional session, and the earlier spec required `.oa` —
+    // so every article papio actually exists to fetch (paywalled, reached
+    // through the institution) classified `unknown` while its working
+    // `/doi/pdf/` control sat rendered on the page. The badge still has to be
+    // present: it is the rendered proof that this session may read the file,
+    // which is what separates this rule from clicking whatever looks like a
+    // download button. `no_entitlement` stays first — the Access Denial page
+    // carries no download control at all, so the two can never both match.
     id: "tandfonline",
-    version: "0.1.0",
+    version: "0.2.0",
     hosts: ["tandfonline.com"],
     settleTimeoutMs: 5000,
     classify: [
@@ -733,10 +778,8 @@ export const adapters: AdapterSpec[] = [
       },
       {
         kind: "article",
-        all: [
-          ".accessLogo .access-icon.oa",
-          ".downloadPDFLink a.show-pdf[href*='/doi/pdf/']",
-        ],
+        all: [".downloadPDFLink a.show-pdf[href*='/doi/pdf/']"],
+        any: [".accessLogo .access-icon.oa", ".accessLogo .access-icon.full"],
       },
     ],
     download: {
@@ -746,14 +789,29 @@ export const adapters: AdapterSpec[] = [
     },
   },
   {
-    // Verified against authentic Emerald Insight publisher captures archived
-    // 2025-01-23 (OA PDF control) and 2024-07-13 (No License turnaway), stored
-    // as fixtures/emerald/*. Current unauthenticated automation is WAF-blocked.
-    // Emerald has no citation_pdf_url here; the real PDF is the stable
-    // intent_pdf_link anchor. Its query carries only a title and is ignored by
-    // classification while href reads the complete live URL.
+    // Verified against authentic Emerald publisher captures: the legacy
+    // Insight platform archived 2025-01-23 (OA PDF control) and 2024-07-13
+    // (No License turnaway), plus the current platform captured live
+    // 2026-08-06 (fixtures/emerald/institutional.html). Unauthenticated
+    // automation is WAF-blocked, so both article shapes come from real
+    // sessions.
+    //
+    // Emerald has MIGRATED article delivery: the legacy anchor
+    // `a.intent_pdf_link` -> /insight/content/doi/<doi>/full/pdf is gone from
+    // current pages, replaced by `a.article-pdfLink` -> /<journal>/article-pdf/
+    // …. Neither shape is a superset of the other, so each gets its own rule
+    // rather than a loosened selector that would also match a listing page.
+    // `download.selector` is the union of the two controls because an
+    // AdapterSpec carries exactly one download rule; whichever anchor the page
+    // actually rendered is the one querySelector returns. Neither classify
+    // rule keys on the publisher's Open Access badge: entitlement here is
+    // proved by the turnaway rule NOT matching first.
+    //
+    // Drop the legacy rule, its fixture and its half of the download union
+    // once a current Emerald page is confirmed to no longer serve
+    // intent_pdf_link anywhere.
     id: "emerald",
-    version: "0.1.0",
+    version: "0.2.0",
     hosts: ["emerald.com"],
     settleTimeoutMs: 5000,
     classify: [
@@ -764,13 +822,21 @@ export const adapters: AdapterSpec[] = [
       {
         kind: "article",
         all: [
+          "meta[name='citation_doi']",
+          "a.article-pdfLink[data-doctype='contentPdf'][href*='/article-pdf/']",
+        ],
+      },
+      {
+        kind: "article",
+        all: [
           "meta[name='dc.Title']",
           "a.intent_pdf_link[href*='/insight/content/doi/'][href*='/full/pdf']",
         ],
       },
     ],
     download: {
-      selector: "a.intent_pdf_link[href*='/insight/content/doi/'][href*='/full/pdf']",
+      selector:
+        "a.article-pdfLink[data-doctype='contentPdf'][href*='/article-pdf/'], a.intent_pdf_link[href*='/insight/content/doi/'][href*='/full/pdf']",
       requireKind: "article",
       method: "href",
     },

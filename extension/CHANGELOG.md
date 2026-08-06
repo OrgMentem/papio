@@ -39,6 +39,38 @@ for the full pre-split extension history.
   orphan reconciliation can close mid-SAML. Sign-in requests are now serialised
   per manager: the first completes and reports honestly before the second
   supersedes it.
+- **Taylor & Francis and Emerald articles you are entitled to no longer park as
+  manual downloads.** The T&F rule required the *open-access* badge
+  (`.access-icon.oa`), so an article reached through an institutional session —
+  which renders `.access-icon.full` next to a working `/doi/pdf/` control — fell
+  through to `unknown`, i.e. exactly the case papio exists to drive. The badge
+  is now a disjunction over both entitlement shapes, still required so the rule
+  never fires on a bare download-looking link. Emerald has meanwhile migrated
+  article delivery off `a.intent_pdf_link` -> `/insight/content/doi/<doi>/full/pdf`
+  onto `a.article-pdfLink` -> `/<journal>/article-pdf/…`; the migrated shape gets
+  its own rule and the single download rule now resolves either anchor.
+- **An unentitled ScienceDirect page reports no entitlement instead of a
+  coverage gap.** A purchase wall published no `citation_pdf_url`, matched no
+  rule, and surfaced as "papio could not drive the provider page" — sending you
+  to hunt an adapter bug when the resolver had simply routed you somewhere you
+  have no access. The access bar's purchase control is now a `no_entitlement`
+  rule, ordered after the entitled-article rule so a positive signal always wins.
+- **A provider adapter's declared settle budget is honoured.** `interpret`
+  clamped `settleTimeoutMs` to 5000 ms while ClinicalKey declared 8000, so that
+  adapter's extra budget was silently discarded and a provider whose content
+  player is genuinely slower than five seconds when reached through a resolver
+  hop kept classifying `unknown`. The ceiling is now 15000 ms and ClinicalKey
+  asks for it. This is a worst case, not a delay: classification resolves the
+  instant a declared selector appears.
+- **A diagnostic page capture is no longer thrown away for the failure you most
+  need to see.** The capture rate limiter was keyed on the bare host at one per
+  hour and five per day, so one host failing the same way repeatedly consumed
+  the budget every other provider needed, and the sanitized page required to
+  repair an adapter was discarded in the overwhelming majority of coverage
+  gaps. The limiter is now keyed on the failure shape (host plus adapter
+  identity, so a version bump on a still-broken host is captured immediately),
+  the daily ceiling is twenty, and a repeat of an already-captured page shape is
+  detected by digest and costs neither an upload nor a budget slot.
 - **Session evidence never invents an institution.** When the observed origin
   was unknown, `emitSessionEvidence` substituted one — the keepalive snapshot's
   resolver origin, which itself degrades to an arbitrary granted host, or the
