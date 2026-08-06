@@ -144,6 +144,15 @@ export interface KeepaliveSnapshot {
   stalledAuthJobs: string[];
 }
 
+export interface FreshSessionEvidence {
+  /** Always a configured resolver origin. Never an IdP or provider host. */
+  origin: string;
+  observedAt: number;
+  /** Per-origin probe generation the evidence was committed for. */
+  generation: number;
+  source: "live_tab" | "keepalive_tab";
+}
+
 export interface KeepaliveOptions {
   /** Number of currently non-terminal handoff jobs. */
   trackedJobCount(): number;
@@ -153,18 +162,25 @@ export interface KeepaliveOptions {
   latestOpenURL(): string | undefined;
   /** Configured resolver origins from the daemon hello exchange. */
   knownResolverOrigins?(): readonly string[];
+  /** True once a hello_ack has landed on the current daemon port. Before
+   * that the configured set is UNKNOWN, not empty — see
+   * KeepaliveManager.configuredOriginsReady(). */
+  configuredOriginsReady?(): boolean;
   /** Number of queued institutional handoffs waiting for auth evidence. */
   queuedAuthJobs?(): number;
   /** Job ids parked after the bounded authentication-drive budget. */
   stalledAuthJobs?(): readonly string[];
   /** Latest persisted institutional-session evidence timestamp. */
   lastAuthReturnedAt?(): number | undefined;
-  /** Reports a completed unknown/out -> in probe so the bridge can emit
-   * session_evidence without exposing page details. */
-  onSessionEvidence?(source: "live_tab" | "keepalive_tab", origin?: string): void;
-  /** Reports when the keepalive tab has verified an authenticated resolver
-   * return, or when that evidence is lost. */
-  onAuthenticationChanged?(authenticated: boolean, origin?: string): void;
+  /** Fires ONCE per newly committed release-grade "in" probe for a
+   * configured origin, whether or not the stored verdict was already "in".
+   * A transition-only signal would stay silent after a worker restart
+   * restores a warm verdict — exactly when queued work needs releasing.
+   * This is the only callback that may authorize releasing queued work. */
+  onFreshSessionEvidence?(evidence: FreshSessionEvidence): void;
+  /** Committed authentication state changed for one configured origin.
+   * Badge and UI state only — never a release trigger. */
+  onOriginAuthenticationChanged?(origin: string, authenticated: boolean): void;
   /** Called once per detected login redirect, after the tab is made visible. */
   onReauthNeeded?(): void;
   /** Keeps the central bridge badge in sync with the paused state. */
@@ -674,6 +690,11 @@ export class KeepaliveManager {
   private readonly probeInFlight = new Map<string, Promise<void>>();
   private readonly pendingProbes = new Map<string, PendingProbeState>();
   private readonly lastProbeStartedAt = new Map<string, number>();
+  /** Per-origin counter, bumped once per admitted probe start
+   * (startProbe()) and threaded through probeOrigin() into
+   * commitOriginProbe(). Identifies which probe attempt produced a given
+   * committed FreshSessionEvidence — never used for admission itself. */
+  private readonly probeGenerations = new Map<string, number>();
   /** Every origin-state write is chained after the previous one and reads
    * the CURRENT map only once it is actually its turn to run, so a burst of
    * synchronous patches (a probe's likelyAuthenticated flip, then its
@@ -710,22 +731,59 @@ export class KeepaliveManager {
    * Undefined whenever no creation is in flight. */
   private tabCreationOrigin: string | undefined;
 
-  private originCandidates(): string[] {
-    const candidates: unknown[] = [];
+  /** True once a hello_ack has landed on the current port. Before that the
+   * configured set is UNKNOWN, not empty (verified defect #6): treating an
+   * empty/advisory candidate set as "no institutions" would wipe restored
+   * display state, and nothing may be release-grade while this is false. */
+  private configuredOriginsReady(): boolean {
     try {
-      candidates.push(...(this.options.knownResolverOrigins?.() ?? []));
+      return this.options.configuredOriginsReady?.() === true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** `origin` is exactly one of the daemon's configured resolver origins.
+   * Always false before hello_ack — see configuredOriginsReady() above.
+   * The one thing every release-grade signal (onFreshSessionEvidence,
+   * onOriginAuthenticationChanged) and openReauth(origin) trust: an offer,
+   * a persisted origin, or a granted permission pattern may SELECT among
+   * these, but none of them may WIDEN this set (verified defect #5). */
+  private isConfiguredMember(origin: string): boolean {
+    return this.configuredOriginsReady() && this.originCandidates().includes(origin);
+  }
+
+  private originCandidates(): string[] {
+    const known: unknown[] = [];
+    try {
+      known.push(...(this.options.knownResolverOrigins?.() ?? []));
     } catch {
       // The bridge's negotiated-origin cache is advisory.
     }
-    // The row universe is the CONFIGURED institutions (daemon hello), with
-    // the persisted/current resolver as pre-hello fallbacks. Permission
-    // grants are deliberately excluded: "Grant all sources" hands papio
-    // dozens of provider-host patterns, and every one of them rendered as a
-    // phantom institution row.
-    candidates.push(
+    if (this.configuredOriginsReady()) {
+      // Once hello_ack has landed the row universe is EXACTLY the daemon's
+      // configured institutions. persistedResolverOrigin/this.resolver may
+      // still SELECT which configured origin has current demand
+      // (configuredResolver(), openReauthOnce()) but never WIDEN
+      // membership — an offer or stale persisted origin for an
+      // unconfigured institution must never create a phantom row.
+      return [...new Set(
+        known
+          .map((candidate) => normalizeHttpsOrigin(candidate))
+          .filter((origin): origin is string => origin !== undefined),
+      )];
+    }
+    // Pre-hello (verified defect #6): the configured set is UNKNOWN, not
+    // empty. Fold in the persisted/current resolver as display-only
+    // fallbacks so the popup still has a row before the daemon confirms
+    // anything. Permission grants stay excluded even here: "Grant all
+    // sources" hands papio dozens of provider-host patterns, and every one
+    // of them would otherwise render as a phantom institution row.
+    const candidates = [
+      ...known,
       this.persistedResolverOrigin,
       this.resolver?.protocol === "https:" ? this.resolver.origin : undefined,
-    );
+    ];
     return [...new Set(
       candidates
         .map((candidate) => normalizeHttpsOrigin(candidate))
@@ -750,10 +808,15 @@ export class KeepaliveManager {
 
   private syncOriginStates(): void {
     const origins = this.originCandidates();
-    const known = new Set(origins);
     for (const origin of origins) {
       if (!this.originStates.has(origin)) this.originStates.set(origin, this.defaultOriginSnapshot(origin));
     }
+    // Only prune once membership is authoritative. Pre-hello, `origins` is
+    // a display-only union that clearNegotiationState shrinks to nothing on
+    // every connect/reconnect attempt — deleting absent states here would
+    // wipe restored rows several times a session before hello_ack ever lands.
+    if (!this.configuredOriginsReady()) return;
+    const known = new Set(origins);
     for (const origin of this.originStates.keys()) {
       if (!known.has(origin)) this.originStates.delete(origin);
     }
@@ -763,6 +826,19 @@ export class KeepaliveManager {
   getOriginSnapshots(): KeepaliveOriginSnapshot[] {
     this.syncOriginStates();
     return [...this.originStates.values()].map((snapshot) => ({ ...snapshot }));
+  }
+
+  /** Called by the bridge the instant a hello_ack lands on the current
+   * port, so origin membership updates apply immediately instead of
+   * waiting for the next minute's alarm/cycle to call syncOriginStates()
+   * incidentally. Re-syncs the row universe against the now-authoritative
+   * knownResolverOrigins() and, mirroring onWake()'s dirty-driven recovery
+   * probing, requests a probe for every origin still dirty. */
+  notifyConfiguredOriginsChanged(): void {
+    this.syncOriginStates();
+    for (const [origin, snapshot] of this.originStates) {
+      if (snapshot.dirtySince !== null) void this.requestProbe(origin, "wake");
+    }
   }
   private updateOriginSnapshot(
     origin: string | undefined,
@@ -878,7 +954,10 @@ export class KeepaliveManager {
 
 
   /** Record a resolver as soon as a handoff arrives, even if the periodic
-   * keepalive observation has not run in this worker lifetime. */
+   * keepalive observation has not run in this worker lifetime. Persists via
+   * rememberResolverOrigin() below, which is a pre-hello DISPLAY fallback
+   * only — it never contributes to configured-origin membership once
+   * hello_ack has landed; see originCandidates(). */
   learnResolver(openURL: string): void {
     if (isAuthenticationURL(openURL)) return;
     try {
@@ -1028,7 +1107,9 @@ export class KeepaliveManager {
     preferredTabID: number | undefined,
   ): Promise<void> {
     this.lastProbeStartedAt.set(origin, Date.now());
-    const attempt = this.boundedProbe(origin, reason, preferredTabID).finally(() => {
+    const generation = (this.probeGenerations.get(origin) ?? 0) + 1;
+    this.probeGenerations.set(origin, generation);
+    const attempt = this.boundedProbe(origin, reason, preferredTabID, generation).finally(() => {
       this.probeInFlight.delete(origin);
       if (this.pendingProbes.has(origin)) void this.runPendingProbe(origin);
     });
@@ -1045,6 +1126,7 @@ export class KeepaliveManager {
     origin: string,
     reason: ProbeReason,
     preferredTabID: number | undefined,
+    generation: number,
   ): Promise<void> {
     const { promise, resolve } = Promise.withResolvers<void>();
     let settled = false;
@@ -1054,7 +1136,7 @@ export class KeepaliveManager {
       resolve();
     };
     const timer = this.api.timers.setTimeout(finish, PROBE_ADMISSION_DEADLINE_MS);
-    void this.probeOrigin(origin, reason, preferredTabID)
+    void this.probeOrigin(origin, reason, preferredTabID, generation)
       .catch(() => {})
       .finally(() => {
         this.api.timers.clearTimeout(timer);
@@ -1067,9 +1149,12 @@ export class KeepaliveManager {
    * null to now. A later signal while already dirty leaves the original
    * "obsolete since" timestamp alone. The in-memory move happens
    * synchronously (via updateOriginSnapshot); the returned promise is only
-   * the durable persist, for callers (note*'s asynchronous tail) that need
-   * it to have landed before a worker might sleep again. */
-  private markDirty(origin: string): Promise<void> {
+   * the durable persist, for callers (note*'s asynchronous tail, and the
+   * bridge's recordInstitutionalSession) that need it to have landed before
+   * a worker might sleep again. Public: a landing is not itself evidence
+   * (ADR-0013 — a timing frame is not an identity assertion), so the bridge
+   * marks dirty and lets a real probe decide, instead of asserting "in". */
+  markDirty(origin: string): Promise<void> {
     const current = this.originStates.get(origin);
     if (current !== undefined && current.dirtySince !== null) return Promise.resolve();
     return this.updateOriginSnapshot(origin, { dirtySince: Date.now() });
@@ -1083,11 +1168,15 @@ export class KeepaliveManager {
    * navigation/activation's causal tab) is the causal tab when present;
    * otherwise the focused tab is. `reason` is unused by this commit — it
    * exists so a later commit can gate release authority (which callers may
-   * pause/resume the owned tab) without another signature change. */
+   * pause/resume the owned tab) without another signature change.
+   * `generation` is startProbe()'s per-origin counter for this admitted
+   * attempt, passed through unchanged so commitOriginProbe() can stamp it
+   * on any FreshSessionEvidence this attempt commits. */
   private async probeOrigin(
     origin: string,
     reason: ProbeReason,
-    preferredTabID?: number,
+    preferredTabID: number | undefined,
+    generation: number,
   ): Promise<void> {
     let resolver: URL;
     try {
@@ -1155,7 +1244,7 @@ export class KeepaliveManager {
     const causalTabID = preferredTabID ?? focusedTabID;
     const reduction = this.reduceObservations(observations, causalTabID, truncated);
     const ownedObservation = observations.find((observation) => observation.owned);
-    await this.commitOriginProbe(origin, reduction, ownedObservation);
+    await this.commitOriginProbe(origin, reduction, ownedObservation, generation);
   }
 
   /** Pure. Never writes a field, persists anything, calls an options.*
@@ -1269,11 +1358,21 @@ export class KeepaliveManager {
    * pause/resume disposition is a SECOND, independent result computed from
    * its own observation only, applied after the snapshot write so a user
    * tab's "in"/"out" never repins or pauses a keepalive tab sitting on a
-   * different page. */
+   * different page.
+   *
+   * Release authority lives here too: onFreshSessionEvidence fires only for
+   * a decisive "markers" commit of "in" from a real tab (live_tab/
+   * keepalive_tab), for a CONFIGURED origin (isConfiguredMember) —
+   * regardless of whether `authenticated` transitioned, so a restored warm
+   * "in" still releases queued work on the next confirming probe.
+   * onOriginAuthenticationChanged fires only on an actual committed
+   * authenticated flip, also gated to configured origins; it is display-only
+   * and must never be read as authorization. */
   private async commitOriginProbe(
     origin: string,
     reduction: { outcome: ProbeOutcome; verdict?: SessionVerdict; source?: KeepaliveProbeSource },
     ownedObservation: TabObservation | undefined,
+    generation: number,
   ): Promise<void> {
     const now = Date.now();
     const isCurrent = origin === this.resolver?.origin;
@@ -1298,8 +1397,25 @@ export class KeepaliveManager {
         lastProbeOutcome: reduction.outcome,
         dirtySince: null,
       });
-      if (!prior && authenticated && (source === "live_tab" || source === "keepalive_tab")) {
-        this.options.onSessionEvidence?.(source, origin);
+      // PROBE_ADMISSION_DEADLINE_MS can free an origin's admission slot
+      // while the wedged attempt that held it is still running in the
+      // background (see boundedProbe()); a fresher probe can then start,
+      // finish, and commit BEFORE that stale attempt finally resolves and
+      // reaches here. A strictly superseded generation must never produce
+      // evidence or a badge signal — it may be describing a document this
+      // manager stopped caring about several probes ago.
+      const isLatestGeneration = generation === this.probeGenerations.get(origin);
+      if (
+        reduction.outcome === "markers" &&
+        authenticated &&
+        (source === "live_tab" || source === "keepalive_tab") &&
+        this.isConfiguredMember(origin) &&
+        isLatestGeneration
+      ) {
+        this.options.onFreshSessionEvidence?.({ origin, observedAt: now, generation, source });
+      }
+      if (authenticated !== prior && this.isConfiguredMember(origin) && isLatestGeneration) {
+        this.options.onOriginAuthenticationChanged?.(origin, authenticated);
       }
     } else {
       // Verdict preserved: an incomplete/failed/empty/stale scan is not evidence.
@@ -1520,6 +1636,11 @@ export class KeepaliveManager {
     if (originHint !== undefined) {
       const normalized = normalizeHttpsOrigin(originHint);
       if (normalized === undefined) return false;
+      // Fail closed once hello_ack has landed: an origin outside the
+      // daemon's configured set must never get a reauth tab opened for it
+      // (verified defect #5 — offer/permission traffic must not create an
+      // institution the operator never configured).
+      if (this.configuredOriginsReady() && !this.isConfiguredMember(normalized)) return false;
       try {
         requested = new URL(normalized);
       } catch {
@@ -1572,6 +1693,12 @@ export class KeepaliveManager {
     }
   }
 
+  /** Persists the current resolver as browser-local display state: the
+   * pre-hello fallback row shown before the daemon has confirmed anything,
+   * and the last-known origin remembered across restarts. This is NEVER
+   * membership — once configuredOriginsReady() is true, only
+   * knownResolverOrigins() decides which origins exist; see
+   * originCandidates(). */
   private rememberResolverOrigin(resolver: URL): void {
     const origin = normalizeHttpsOrigin(resolver.origin);
     if (origin === undefined || this.persistedResolverOrigin === origin) return;

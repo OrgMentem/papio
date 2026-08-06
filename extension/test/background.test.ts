@@ -10,7 +10,7 @@ import { Window } from "happy-dom";
 import { parseBrowserMessage, type BrowserMessage } from "../src/protocol";
 import { emptyStore, type StateBackend, type StoreShape } from "../src/state";
 import { capturePage, encodePageCapture, sanitizeFixture } from "../src/capture";
-import { KeepaliveManager, type KeepaliveAPI } from "../src/keepalive";
+import { KeepaliveManager, type FreshSessionEvidence, type KeepaliveAPI } from "../src/keepalive";
 import { interpret, type AdapterSpec } from "../src/adapters/types";
 import {
   Bridge,
@@ -467,6 +467,13 @@ function jobOfferForHosts(jobID: string, providerHosts: string[], openurl = OPEN
   const offer = jobOffer(jobID, openurl) as { payload: Record<string, unknown> };
   offer.payload["provider_hosts"] = providerHosts;
   return offer;
+}
+
+/** Build release-grade FreshSessionEvidence for a Commit C bridge call. The
+ * generation is opaque to Bridge (KeepaliveManager-internal bookkeeping), so
+ * tests never need a meaningful value here. */
+function freshEvidence(h: Harness, origin: string, source: FreshSessionEvidence["source"] = "keepalive_tab"): FreshSessionEvidence {
+  return { origin, observedAt: h.clock.now, generation: 1, source };
 }
 
 
@@ -973,7 +980,6 @@ test("a cold requires-auth handoff is signalled while queued and opens after its
   offer.payload["requires_auth"] = true;
 
   await h.bridge.start();
-  await h.bridge.setKeepaliveAuthenticated(false);
   await h.port.inbound(helloAck());
   await h.port.inbound(offer);
 
@@ -1662,7 +1668,7 @@ test("a challenge parks only its provider and leaves another provider draining",
   other.payload["requires_auth"] = true;
   await h.port.inbound(parked);
   await h.port.inbound(other);
-  await h.bridge.setKeepaliveAuthenticated(true);
+  await h.bridge.recordFreshSessionEvidence(freshEvidence(h, "https://resolver.example.edu"));
 
   expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_challenge_parked")).toMatchObject({
     tab_id: -1,
@@ -1694,7 +1700,7 @@ test("an expired provider lease reclaims its queued handoff without a new offer"
   const queued = jobOffer("job_lease_reclaim") as { payload: Record<string, unknown> };
   queued.payload["requires_auth"] = true;
   await h.port.inbound(queued);
-  await h.bridge.setKeepaliveAuthenticated(true);
+  await h.bridge.recordFreshSessionEvidence(freshEvidence(h, "https://resolver.example.edu"));
   expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_lease_reclaim")).toMatchObject({
     tab_id: -1,
     status: "queued",
@@ -1942,7 +1948,7 @@ test("a recent auth return drains durable queued handoffs during startup", async
       },
     ],
     offerURLs: { [jobID]: queuedURL },
-    lastAuthReturnedAt: 1_700_000_000_000,
+    authEvidenceByOrigin: { "https://resolver.example.edu": 1_700_000_000_000 },
   });
 
   await h.bridge.start();
@@ -1971,7 +1977,7 @@ test("keepalive authentication evidence releases a restored queued handoff", asy
 
   await h.bridge.start();
   expect(h.tabs.created).toEqual([]);
-  await h.bridge.setKeepaliveAuthenticated(true);
+  await h.bridge.recordFreshSessionEvidence(freshEvidence(h, "https://resolver.example.edu"));
 
   expect(h.tabs.created).toEqual([{ url: queuedURL, active: false }]);
   expect(h.backend.store.activeJobs[0]?.status).toBe("accepted");
@@ -2750,7 +2756,7 @@ test("a directly matched visible-required handoff opens a normal unfocused windo
 test("work window is reused across offers and recreated after the user closes it", async () => {
   // Warm auth evidence so every offer opens immediately instead of queueing.
   const h = makeHarness(
-    { ...emptyStore(), lastAuthReturnedAt: 1_700_000_000_000 },
+    { ...emptyStore(), authEvidenceByOrigin: { "https://resolver.example.edu": 1_700_000_000_000 } },
     { windows: true },
   );
   await h.bridge.start();
@@ -2843,7 +2849,7 @@ test("tab-group handoff works on Firefox 139+ (no onDeterminingFilename)", async
 
 test("tab-group handoffs reuse one papio group", async () => {
   const h = makeHarness(
-    { ...emptyStore(), lastAuthReturnedAt: 1_700_000_000_000 },
+    { ...emptyStore(), authEvidenceByOrigin: { "https://resolver.example.edu": 1_700_000_000_000 } },
     { tabGroups: true, handoffSurface: "tab-group" },
   );
   await h.bridge.start();
@@ -2965,7 +2971,7 @@ test("IdP auth expands the papio group and re-collapses when auth returns", asyn
 
 test("tab-group surfaces use the generic title when multiple jobs share the group", async () => {
   const h = makeHarness(
-    { ...emptyStore(), lastAuthReturnedAt: 1_700_000_000_000 },
+    { ...emptyStore(), authEvidenceByOrigin: { "https://resolver.example.edu": 1_700_000_000_000 } },
     { tabGroups: true, handoffSurface: "tab-group" },
   );
   const first = jobOffer("job_tg_multiple_first") as { payload: Record<string, unknown> };
@@ -3303,7 +3309,7 @@ test("page capture request visibly opens a ledgered managed tab, captures, repor
 
 test("page capture request respects the two-drive handoff governor", async () => {
   const h = makeHarness(
-    { ...emptyStore(), lastAuthReturnedAt: 1_700_000_000_000 },
+    { ...emptyStore(), authEvidenceByOrigin: { "https://resolver.example.edu": 1_700_000_000_000 } },
     { handoffSurface: "in-window" },
   );
   h.deps.permissions.contains = async () => true;
@@ -3670,8 +3676,8 @@ test("session probe inspects a live resolver tab before claiming signed out, and
   const manager = new KeepaliveManager(keepaliveAPI, {
     trackedJobCount: () => 0,
     latestOpenURL: () => undefined,
-    onAuthenticationChanged: (authenticated) => {
-      void h.bridge.setKeepaliveAuthenticated(authenticated);
+    onFreshSessionEvidence: (evidence) => {
+      void h.bridge.recordFreshSessionEvidence(evidence);
     },
   });
   await manager.init();
@@ -4505,7 +4511,7 @@ test("a direct-file offer that requires a sign-in is queued, never downloaded", 
 
 
 test("handoff governor keeps two drives, drains FIFO on settle and timeout", async () => {
-  const h = makeHarness({ ...emptyStore(), lastAuthReturnedAt: 1_700_000_000_000 });
+  const h = makeHarness({ ...emptyStore(), authEvidenceByOrigin: { "https://resolver.example.edu": 1_700_000_000_000 } });
   await h.bridge.start();
   const jobIDs = Array.from({ length: 5 }, (_, index) => `job_governor_${index}`);
   for (const jobID of jobIDs) await h.port.inbound(jobOffer(jobID));
@@ -4536,7 +4542,7 @@ test("a drive timing out on an authentication page leaves the tab open and frees
   // IdP form, entered credentials, or an in-flight 2FA challenge — at the
   // 3-minute mark with no warning. parkHandoffForManual's own contract is to
   // leave that page for the operator; only the governor slot is freed.
-  const h = makeHarness({ ...emptyStore(), lastAuthReturnedAt: 1_700_000_000_000 });
+  const h = makeHarness({ ...emptyStore(), authEvidenceByOrigin: { "https://resolver.example.edu": 1_700_000_000_000 } });
   await h.bridge.start();
   const jobIDs = Array.from({ length: 3 }, (_, index) => `job_auth_timeout_${index}`);
   for (const jobID of jobIDs) await h.port.inbound(jobOffer(jobID));
@@ -4570,7 +4576,7 @@ test("a drive timing out on an authentication page leaves the tab open and frees
 });
 
 test("a drive timing out on an ordinary provider page still closes the tab as before", async () => {
-  const h = makeHarness({ ...emptyStore(), lastAuthReturnedAt: 1_700_000_000_000 });
+  const h = makeHarness({ ...emptyStore(), authEvidenceByOrigin: { "https://resolver.example.edu": 1_700_000_000_000 } });
   await h.bridge.start();
   const jobIDs = Array.from({ length: 3 }, (_, index) => `job_provider_timeout_${index}`);
   for (const jobID of jobIDs) await h.port.inbound(jobOffer(jobID));
@@ -4647,7 +4653,7 @@ test("registerHandoffDrive refuses to exceed HANDOFF_DRIVE_LIMIT even when calle
 });
 
 test("governor-queued handoffs are re-driven after a service-worker restart", async () => {
-  const first = makeHarness({ ...emptyStore(), lastAuthReturnedAt: 1_700_000_000_000 });
+  const first = makeHarness({ ...emptyStore(), authEvidenceByOrigin: { "https://resolver.example.edu": 1_700_000_000_000 } });
   await first.bridge.start();
   const jobIDs = Array.from({ length: 5 }, (_, index) => `job_restart_governor_${index}`);
   for (const jobID of jobIDs) await first.port.inbound(jobOffer(jobID));
@@ -4681,7 +4687,7 @@ test("a parked auth job with a preserved tab survives a restart without re-consu
   // re-consumed its already-freed slot — and MV3's ~30s idle teardown made
   // that re-establish on every restart during a slow institutional SSO,
   // halving effective governor capacity for every other queued job.
-  const first = makeHarness({ ...emptyStore(), lastAuthReturnedAt: 1_700_000_000_000 });
+  const first = makeHarness({ ...emptyStore(), authEvidenceByOrigin: { "https://resolver.example.edu": 1_700_000_000_000 } });
   await first.bridge.start();
   const jobIDs = Array.from({ length: 3 }, (_, index) => `job_park_restart_${index}`);
   for (const jobID of jobIDs) await first.port.inbound(jobOffer(jobID));
@@ -4802,7 +4808,7 @@ test("resuming a parked job while the governor is at capacity clears parked_with
   // worker down after ~30s idle) saw the stale marker and skipped
   // re-registering it forever — stranded outside governor supervision, with
   // no timeout and no capacity accounting.
-  const first = makeHarness({ ...emptyStore(), lastAuthReturnedAt: 1_700_000_000_000 });
+  const first = makeHarness({ ...emptyStore(), authEvidenceByOrigin: { "https://resolver.example.edu": 1_700_000_000_000 } });
   await first.bridge.start();
   const jobIDs = Array.from({ length: 3 }, (_, index) => `job_resume_capacity_${index}`);
   for (const jobID of jobIDs) await first.port.inbound(jobOffer(jobID));
@@ -4871,7 +4877,7 @@ test("resuming a parked job while the governor is at capacity clears parked_with
 // exactly the jobs this restore exists to recover.
 test("restore recovers an auth-required handoff whose OpenURL base looks like a file", async () => {
   const pdfShapedBase = "https://resolver.example.edu/openurl/content/pdf/resolve";
-  const first = makeHarness({ ...emptyStore(), lastAuthReturnedAt: 1_700_000_000_000 });
+  const first = makeHarness({ ...emptyStore(), authEvidenceByOrigin: { "https://resolver.example.edu": 1_700_000_000_000 } });
   await first.bridge.start();
   const jobIDs = Array.from({ length: 4 }, (_, index) => `job_pdfbase_governor_${index}`);
   for (const jobID of jobIDs) {
@@ -5001,7 +5007,7 @@ test("delivery session evidence is frozen at request time, not completion time",
   // An institutional sign-in lands elsewhere in the browser while this
   // non-institutional download is still in flight. A live read at
   // completion would credit this delivery with it; the frozen value must not.
-  await h.bridge.setKeepaliveAuthenticated(true);
+  await h.bridge.recordFreshSessionEvidence(freshEvidence(h, "https://resolver.example.edu"));
 
   h.downloads.items.set(downloadID, {
     id: downloadID,
@@ -5134,7 +5140,7 @@ test("cold handoffs consolidate to one tab before warm evidence fills the second
   expect(h.tabs.created).toHaveLength(1);
   expect(h.backend.store.activeJobs.filter((job) => job.tab_id < 0)).toHaveLength(4);
 
-  await h.bridge.setKeepaliveAuthenticated(true);
+  await h.bridge.recordFreshSessionEvidence(freshEvidence(h, "https://resolver.example.edu"));
   expect(h.tabs.live.size).toBe(2);
   expect(h.tabs.created).toHaveLength(2);
   expect(h.backend.store.activeJobs.filter((job) => job.tab_id < 0)).toHaveLength(3);
@@ -5155,7 +5161,7 @@ test("keepalive warmth releases only the matching resolver queue", async () => {
   await h.bridge.start();
   await h.port.inbound(defaultOffer);
   await h.port.inbound(uwaOffer);
-  await h.bridge.setKeepaliveAuthenticated(true, collegeOrigin);
+  await h.bridge.recordFreshSessionEvidence(freshEvidence(h, collegeOrigin));
 
   expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_default_origin_queue")).toMatchObject({
     status: "queued",
@@ -5402,4 +5408,315 @@ test("the keepalive alarm calls onWake even while the native port is down", asyn
   await h.alarms.onAlarm.emit({ name: "papio-keepalive" });
 
   expect(wakes.length).toBe(1);
+});
+
+// Commit C: an observed sign-in must release only its own institution's
+// parked handoffs, and every path that can release/reload/label evidence is
+// scoped to the origin that actually produced it. recordFreshSessionEvidence
+// is the sole release-authorizing entry point (fired from keepalive's
+// onFreshSessionEvidence after a committed, decisive probe verdict); a mere
+// OpenURL landing may only ask keepalive to look again.
+
+test("fresh evidence for one resolver releases only that resolver's queued handoffs", async () => {
+  const h = makeHarness();
+  const originB = "https://example.primo.exlibrisgroup.com";
+  const bOpenURL = `${originB}/openurl?ctx=b`;
+  const offerA = jobOffer("job_evidence_scope_a") as { payload: Record<string, unknown> };
+  offerA.payload["requires_auth"] = true;
+  const offerB = jobOffer("job_evidence_scope_b", bOpenURL) as { payload: Record<string, unknown> };
+  offerB.payload["requires_auth"] = true;
+
+  await h.bridge.start();
+  await h.port.inbound(offerA);
+  await h.port.inbound(offerB);
+  expect(h.backend.store.activeJobs.filter((job) => job.status === "queued")).toHaveLength(2);
+
+  await h.bridge.recordFreshSessionEvidence(freshEvidence(h, "https://resolver.example.edu"));
+
+  expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_evidence_scope_a")).toMatchObject({
+    status: "accepted",
+  });
+  expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_evidence_scope_b")).toMatchObject({
+    status: "queued",
+    tab_id: -1,
+  });
+  expect(h.tabs.created).toEqual([{ url: OPENURL, active: false }]);
+});
+
+test("fresh evidence for one resolver cannot be laundered into another's queue by a later unscoped release call", async () => {
+  // recordOpenAccessLanding's own releaseQueuedHandoffs() call carries no
+  // origin at all — the exact ambient-global call site Commit C closes. Its
+  // safety now comes from every queued job being admitted only through its
+  // OWN origin's evidence (hasHandoffReleaseEvidence), not from the caller.
+  const h = makeHarness();
+  const originB = "https://onesearch.library.example-college.edu";
+  const bOpenURL = `${originB}/openurl?ctx=b`;
+  const institutionalA = jobOffer("job_leak_guard_a") as { payload: Record<string, unknown> };
+  institutionalA.payload["requires_auth"] = true;
+  const institutionalB = jobOffer("job_leak_guard_b", bOpenURL) as { payload: Record<string, unknown> };
+  institutionalB.payload["requires_auth"] = true;
+  const openAccessURL = "https://oa.example.edu/article/leak-guard";
+  const openAccess = jobOffer("job_leak_guard_oa", openAccessURL) as { payload: Record<string, unknown> };
+  openAccess.payload["requires_auth"] = false;
+
+  await h.bridge.start();
+  await h.port.inbound(institutionalA);
+  await h.port.inbound(institutionalB);
+  await h.port.inbound(openAccess);
+
+  await h.bridge.recordFreshSessionEvidence(freshEvidence(h, "https://resolver.example.edu"));
+  expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_leak_guard_a")).toMatchObject({
+    status: "accepted",
+  });
+  expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_leak_guard_b")).toMatchObject({
+    status: "queued",
+  });
+
+  const openAccessTabID = h.backend.store.activeJobs.find((job) => job.job_id === "job_leak_guard_oa")?.tab_id ?? -1;
+  const providerURL = `https://${PROVIDER_HOST}/stable/leak-guard`;
+  await h.tabs.onUpdated.emit(
+    openAccessTabID,
+    { url: providerURL, status: "complete" },
+    { id: openAccessTabID, url: providerURL },
+  );
+
+  expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_leak_guard_b")).toMatchObject({
+    status: "queued",
+    tab_id: -1,
+  });
+});
+
+test("session_evidence throttling is scoped per origin, not global", async () => {
+  const h = makeHarness();
+  const originA = "https://resolver.example.edu";
+  const originB = "https://onesearch.library.example-college.edu";
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["session_evidence_v1"] }));
+
+  expect(h.bridge.emitSessionEvidence("warm_verified", originA)).toBe(true);
+  expect(h.bridge.emitSessionEvidence("warm_verified", originB)).toBe(true);
+  // Each origin is still inside its OWN throttle window; neither may borrow
+  // the other's cadence.
+  expect(h.bridge.emitSessionEvidence("warm_verified", originA)).toBe(false);
+  expect(h.bridge.emitSessionEvidence("warm_verified", originB)).toBe(false);
+
+  const evidenceFrames = h.frames().filter((frame) => frame.type === "session_evidence");
+  expect(evidenceFrames.map((frame) => frame.payload)).toEqual([
+    { evidence: "warm_verified", origin_hint: originA, at: new Date(h.clock.now).toISOString() },
+    { evidence: "warm_verified", origin_hint: originB, at: new Date(h.clock.now).toISOString() },
+  ]);
+});
+
+test("currentSessionEvidence for a job on B is not labelled warm or fresh by A's evidence", async () => {
+  const jobA = "job_session_evidence_scope_a";
+  const jobB = "job_session_evidence_scope_b";
+  const originA = "https://resolver.example.edu";
+  const originB = "https://onesearch.library.example-college.edu";
+  const h = makeHarness({
+    ...emptyStore(),
+    activeJobs: [
+      { job_id: jobA, tab_id: 100, offered_at: 1, expires_at: 2, status: "accepted", provider_hosts: [] },
+      { job_id: jobB, tab_id: 101, offered_at: 1, expires_at: 2, status: "accepted", provider_hosts: [] },
+    ],
+    offerURLs: { [jobA]: `${originA}/openurl?ctx=a`, [jobB]: `${originB}/openurl?ctx=b` },
+  });
+  h.tabs.live.set(100, { id: 100, url: "https://provider.example.edu/article/a.pdf" });
+  h.tabs.live.set(101, { id: 101, url: "https://provider.example.edu/article/b.pdf" });
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["delivery_context_v1"] }));
+
+  await h.bridge.recordFreshSessionEvidence(freshEvidence(h, originA, "live_tab"));
+
+  await h.downloads.onCreated.emit({ id: 1, tabId: 100, state: "in_progress" });
+  h.downloads.items.set(1, {
+    id: 1,
+    tabId: 100,
+    filename: "/tmp/a.pdf",
+    mime: "application/pdf",
+    fileSize: 10,
+    state: "complete",
+  });
+  await h.downloads.onChanged.emit({ id: 1, state: { current: "complete" } });
+
+  await h.downloads.onCreated.emit({ id: 2, tabId: 101, state: "in_progress" });
+  h.downloads.items.set(2, {
+    id: 2,
+    tabId: 101,
+    filename: "/tmp/b.pdf",
+    mime: "application/pdf",
+    fileSize: 20,
+    state: "complete",
+  });
+  await h.downloads.onChanged.emit({ id: 2, state: { current: "complete" } });
+
+  const contexts = h.frames().filter((frame) => frame.type === "delivery_context");
+  expect(contexts.find((frame) => frame.job_id === jobA)?.payload).toMatchObject({ session_evidence: "fresh_auth" });
+  expect(contexts.find((frame) => frame.job_id === jobB)?.payload).toMatchObject({ session_evidence: "none" });
+});
+
+test("an institutional landing marks its origin dirty, releases and reloads its own origin, and never touches another's", async () => {
+  const landingJobID = "job_institutional_landing";
+  const peerJobID = "job_institutional_landing_peer";
+  const otherOriginJobID = "job_institutional_landing_other_origin";
+  const landingTabID = 150;
+  const otherOrigin = "https://onesearch.library.example-college.edu";
+  const otherOpenURL = `${otherOrigin}/openurl?ctx=other`;
+  const h = makeHarness({
+    ...emptyStore(),
+    activeJobs: [
+      {
+        job_id: landingJobID,
+        tab_id: landingTabID,
+        offered_at: 1,
+        expires_at: 2,
+        status: "accepted",
+        requires_auth: true,
+        provider_hosts: [PROVIDER_HOST],
+      },
+      {
+        job_id: peerJobID,
+        tab_id: -1,
+        offered_at: 1,
+        expires_at: 2,
+        status: "queued",
+        requires_auth: true,
+        provider_hosts: [PROVIDER_HOST],
+      },
+      {
+        job_id: otherOriginJobID,
+        tab_id: -1,
+        offered_at: 1,
+        expires_at: 2,
+        status: "queued",
+        requires_auth: true,
+        provider_hosts: ["link.springer.com"],
+      },
+    ],
+    offerURLs: { [landingJobID]: OPENURL, [peerJobID]: OPENURL, [otherOriginJobID]: otherOpenURL },
+  });
+  h.tabs.live.set(landingTabID, { id: landingTabID, url: OPENURL });
+  const dirtied: string[] = [];
+  const probed: (string | undefined)[] = [];
+  h.bridge.attachKeepalive({
+    getSnapshot: () => ({ pausedForReauth: false }),
+    markDirty: async (origin: string) => {
+      dirtied.push(origin);
+    },
+    probeForeground: async (origin?: string) => {
+      probed.push(origin);
+    },
+    notifyConfiguredOriginsChanged: () => {},
+    noteResolverNavigation: () => {},
+    noteResolverActivated: () => {},
+    noteTabRemoved: () => {},
+    onWake: async () => {},
+  } as unknown as KeepaliveManager);
+
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ resolver_origins: ["https://resolver.example.edu", otherOrigin] }));
+
+  await h.tabs.onUpdated.emit(landingTabID, { url: OPENURL, status: "complete" }, { id: landingTabID, url: OPENURL });
+
+  // A landing is still only a reason to look again, never itself a verdict:
+  // exactly one dirty-mark and one probe, scoped to the landing's own origin.
+  expect(dirtied).toEqual(["https://resolver.example.edu"]);
+  expect(probed).toEqual(["https://resolver.example.edu"]);
+
+  // But papio itself drove this tab past authentication onto a page resolving
+  // to a configured origin — first-hand evidence for THAT origin, so its own
+  // queued sibling opens immediately, the same as any other release.
+  expect(h.backend.store.activeJobs.find((job) => job.job_id === peerJobID)).toMatchObject({
+    status: "accepted",
+  });
+  expect(h.tabs.created).toEqual([{ url: OPENURL, active: false }]);
+
+  // A different institution's queued handoff is never touched by this.
+  expect(h.backend.store.activeJobs.find((job) => job.job_id === otherOriginJobID)).toMatchObject({
+    status: "queued",
+    tab_id: -1,
+  });
+
+  // The landing tab itself was never on an authentication page, so
+  // reloadAuthenticationHandoffs found nothing to reload.
+  expect(h.tabs.reloaded).toEqual([]);
+});
+
+test("reloadAuthenticationHandoffs reloads only the evidenced origin's tabs, leaving another institution's IdP tab alone", async () => {
+  const jobA = "job_reload_scope_a";
+  const jobB = "job_reload_scope_b";
+  const originA = "https://resolver.example.edu";
+  const originB = "https://onesearch.library.example-college.edu";
+  const idpA = "https://idp.example.edu/sso";
+  const idpB = "https://shibboleth.example-college.edu/idp/sso";
+  const tabA = 201;
+  const tabB = 202;
+  const h = makeHarness({
+    ...emptyStore(),
+    activeJobs: [
+      { job_id: jobA, tab_id: tabA, offered_at: 1, expires_at: 2, status: "accepted", provider_hosts: [PROVIDER_HOST] },
+      { job_id: jobB, tab_id: tabB, offered_at: 1, expires_at: 2, status: "accepted", provider_hosts: ["link.springer.com"] },
+    ],
+    offerURLs: { [jobA]: `${originA}/openurl?ctx=a`, [jobB]: `${originB}/openurl?ctx=b` },
+  });
+  h.tabs.live.set(tabA, { id: tabA, url: idpA });
+  h.tabs.live.set(tabB, { id: tabB, url: idpB });
+  await h.bridge.start();
+
+  await h.bridge.recordFreshSessionEvidence(freshEvidence(h, originA, "live_tab"));
+
+  expect(h.tabs.reloaded).toEqual([tabA]);
+});
+
+test("requestSessionSignIn rejects a non-configured origin once hello_ack has landed, and accepts a configured one", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ resolver_origins: ["https://resolver.example.edu"] }));
+
+  await expect(h.bridge.requestSessionSignIn("https://unknown.example-college.edu")).resolves.toEqual({
+    ok: false,
+    error: { code: "resolver_unavailable", message: "This institution is not currently configured" },
+  });
+  expect(h.tabs.created).toEqual([]);
+
+  const reply = await h.bridge.requestSessionSignIn("https://resolver.example.edu");
+  expect(reply).toEqual({ ok: true, opened: true });
+  expect(h.tabs.created).toEqual([{ url: "https://resolver.example.edu", active: true }]);
+});
+
+test("the 45-second forced-release fallback still opens a queued handoff with zero authentication evidence", async () => {
+  // ADR-0009's autonomous-retry fallback is ratified and deliberately bypasses
+  // evidence for exactly one forced job; Commit C must not regress it.
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(jobOffer("job_forced_release_active"));
+  await h.port.inbound(jobOffer("job_forced_release_queued"));
+  const fallback = h.timers.find((timer) => timer.ms === 45_000);
+  expect(fallback).toBeDefined();
+
+  await fallback?.fn();
+
+  expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_forced_release_queued")).toMatchObject({
+    status: "accepted",
+  });
+  expect(h.tabs.created).toEqual([
+    { url: OPENURL, active: true },
+    { url: OPENURL, active: false },
+  ]);
+});
+
+test("a hello_ack immediately notifies the keepalive manager of configured-origin membership", async () => {
+  const h = makeHarness();
+  const notifications: number[] = [];
+  h.bridge.attachKeepalive({
+    getSnapshot: () => ({ pausedForReauth: false }),
+    notifyConfiguredOriginsChanged: () => {
+      notifications.push(notifications.length);
+    },
+  } as unknown as KeepaliveManager);
+  await h.bridge.start();
+  expect(notifications).toEqual([]);
+
+  await h.port.inbound(helloAck({ resolver_origins: ["https://resolver.example.edu"] }));
+
+  expect(notifications).toEqual([0]);
 });

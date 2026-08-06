@@ -1798,7 +1798,14 @@ test("click downloads correlate by adapter when concurrent handoffs share provid
     { kind: "article", adapter_id: "ebsco", adapter_version: "0.1.0", evidence: [] },
   );
   await h.bridge.start();
-  await h.bridge.setKeepaliveAuthenticated(true);
+  // Evidence is per-origin now: both offers carry OPENURL, so one release-grade
+  // observation of that resolver authorizes both queued handoffs.
+  await h.bridge.recordFreshSessionEvidence({
+    origin: new URL(OPENURL).origin,
+    observedAt: Date.now(),
+    generation: 1,
+    source: "live_tab",
+  });
   await h.port.inbound(offer("job_jstor_concurrent_0001", undefined, providerHosts));
   await landOnProvider(h, "job_jstor_concurrent_0001", "www.jstor.org");
   await h.port.inbound(offer("job_ebsco_concurrent_0001", undefined, providerHosts));

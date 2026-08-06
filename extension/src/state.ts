@@ -154,6 +154,14 @@ export interface StoreShape {
    * It is bounded by the bridge before use and lets queued jobs drain after an
    * MV3 restart while the session is still warm. */
   lastAuthReturnedAt?: number;
+  /** Epoch ms of the most recent release-grade observation or warm institutional
+   * landing, per configured resolver origin. This — not the global
+   * lastAuthReturnedAt — is the authorization input for releasing that origin's
+   * queued handoffs, and it must survive a service-worker restart: an MV3 worker
+   * dies constantly, and losing authority on every restart would park the
+   * operator's accepted work behind a probe that may have no inspectable tab.
+   * lastAuthReturnedAt stays for display only. */
+  authEvidenceByOrigin?: Record<string, number>;
   /** Per-job count of authentication drives that never reached a download,
    * within this browser session. Accumulates across worker restarts and parks
    * (cleared on browser close with the rest of session state); reset once a

@@ -220,6 +220,47 @@ re-offering store-backed siblings from that same profile. An unknown hint fails
 closed. Evidence for one institution therefore cannot release either the
 extension queue or daemon-side parked work for another.
 
+#### Addendum (2026-08-06): what makes evidence obsolete, and what that evidence may unblock
+
+Two clarifications the implementation needed, kept separate because they answer
+two different questions.
+
+**An event that makes evidence obsolete is not evidence.** A configured
+resolver navigation, a tab activation, or an origin-correlated institutional
+landing may invalidate the freshness of prior evidence and schedule a
+browser-local probe. None of them is itself an `in` or `out` assertion: only
+the ranked DOM and web-storage observations above set the verdict. This is
+what keeps a timing-only `auth_returned` frame, or a warm provider landing,
+from quietly becoming an identity claim.
+
+Freshness governs display trust, never whether papio may look. A stale
+verdict is a reason to re-probe, so probe scheduling is bounded by a rate
+limit on how often papio may inject into the operator's page — not by how much
+it currently trusts the last answer. The two were briefly the same mechanism,
+and the result was that papio refused to re-check a signed-out verdict for two
+minutes after the operator had signed in.
+
+**What a fresh verdict may unblock.** A fresh browser-local `in` verdict,
+committed from release-grade evidence (a decisive observation, not a preserved
+verdict, for a configured resolver origin) may release already-accepted queued
+handoffs for that same origin. It does not reset authentication-attempt
+budgets, and it does not open, resolve, or retry an auth-stalled human action —
+those remain the explicit operator actions ADR-0009 requires. Releasing an
+accepted, queued handoff is continuation of acquisition work the operator
+already asked for; the pre-existing bounded fallback that releases such a
+handoff after 45 seconds with no session evidence at all is the same category,
+and is ratified here rather than left to be read as autonomous drain.
+
+A warm institutional landing on a job papio itself drove is the same category
+of unblocking evidence for that job's own origin, and releases only that
+origin's queued handoffs. It is first-hand observation of work papio drove,
+not a timing frame, so scoping it — rather than silencing it — is what the
+origin addendum above requires. It still sets no verdict: the card's `in` may
+come only from the ranked DOM and web-storage observations. Per-origin
+evidence is persisted, because a service worker dies constantly and losing
+release authority on every restart would park accepted work behind a probe
+that may have no inspectable tab.
+
 ### Authentication retry is an explicit local budget reset
 
 When a handoff is auth-stalled, the popup/inbox **Retry** control is an explicit

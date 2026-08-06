@@ -75,9 +75,9 @@ import {
 } from "./capture";
 import { chromeKeepaliveAPI, initKeepalive, isAuthenticationURL } from "./keepalive";
 import type {
+  FreshSessionEvidence,
   KeepaliveManager,
   KeepaliveOriginSnapshot,
-  KeepaliveProbeSource,
   KeepaliveSnapshot,
 } from "./keepalive";
 import { routeResolverService, type ResolverRoute } from "./resolver";
@@ -1126,8 +1126,17 @@ export class Bridge {
    * for this offer. Keep this worker-local debounce until the job is removed so
    * reloads and SPA completion events cannot report the same outcome repeatedly. */
   private readonly resolverNoEntitlementSent = new Set<string>();
-  /** Authentication observed during this service-worker lifetime. */
-  private authReturnedThisWorker = false;
+  /** Origins where an institutional landing was observed this service-worker
+   * lifetime. Feeds ONLY currentSessionEvidence's per-job "warm" label —
+   * never hasAuthEvidence/release authorization: ADR-0013 says a timing
+   * frame is not identity evidence, so a landing alone must never unblock
+   * another queued job, even one offered by this same origin. */
+  private readonly authReturnedThisWorkerOrigins = new Set<string>();
+  /** Per-origin timestamp of the most recent auth-evidence event (landing or
+   * fresh probe), worker-local. Grades currentSessionEvidence's "fresh_auth"
+   * vs "warm" tier for that origin's own deliveries; deliberately never read
+   * for release authorization — see recordFreshSessionEvidence. */
+  private readonly originAuthReturnedAt = new Map<string, number>();
   /** Route traversal evidence observed for each active handoff. */
   private readonly resolverRoutes = new Set<string>();
   /** Per-job auth evidence used for the next completed browser delivery. */
@@ -1135,8 +1144,12 @@ export class Bridge {
   /** A completed OA landing can release only OA concurrency queues; it is never
    * evidence that an institutional SSO session exists. */
   private openAccessLandingObserved = false;
-  /** Keepalive has observed its resolver tab return from authentication. */
-  private keepaliveAuthenticated = false;
+  /** Origins with a committed release-grade probe verdict — "in", live_tab
+   * or keepalive_tab, from a decisive marker scan (recordFreshSessionEvidence) —
+   * observed THIS worker life. Worker-local and lost on every MV3 restart;
+   * store.authEvidenceByOrigin (state.ts) is the persisted counterpart
+   * hasAuthEvidence() also honors so release authority survives a restart. */
+  private readonly releaseGradeOrigins = new Set<string>();
   /** Current keepalive reauthentication pause, used by computeBadge. */
   private keepaliveReauthNeeded = false;
   /** Attached synchronously at worker startup, before bridge.start() binds
@@ -1223,7 +1236,10 @@ export class Bridge {
   /** Durable institutional demand from the most recent negotiated counts poll. */
   private triageActionsRequiresAuth: number | undefined;
   private triageActionsRequiresAuthAt: number | undefined;
-  private sessionEvidenceSentAt: number | undefined;
+  /** Per-origin session_evidence throttle. Keyed by origin (or "" when no
+   * origin hint), so one institution's evidence can no longer suppress
+   * another's for SESSION_EVIDENCE_THROTTLE_MS. */
+  private readonly sessionEvidenceSentAt = new Map<string, number>();
 
   constructor(private readonly deps: BridgeDeps) {}
   trackedJobCount(): number {
@@ -1321,9 +1337,9 @@ export class Bridge {
     const fallback: KeepaliveSnapshot = {
       enabled: true,
       intervalMinutes: 4,
-      authenticated: this.keepaliveAuthenticated,
-      verdict: this.keepaliveAuthenticated ? "in" : "unknown",
-      probeSource: this.keepaliveAuthenticated ? "keepalive_tab" : "none",
+      authenticated: this.releaseGradeOrigins.size > 0,
+      verdict: this.releaseGradeOrigins.size > 0 ? "in" : "unknown",
+      probeSource: this.releaseGradeOrigins.size > 0 ? "keepalive_tab" : "none",
       lastVerdictAt: null,
       checking: false,
       likelyAuthenticated: false,
@@ -1367,6 +1383,9 @@ export class Bridge {
     if (origin !== undefined) {
       if (!isBareHTTPSOrigin(origin)) {
         return this.failure("resolver_unavailable", "No resolver configured yet — open a paper first");
+      }
+      if (this.hasCurrentHello() && !this.knownResolverOrigins().includes(origin)) {
+        return this.failure("resolver_unavailable", "This institution is not currently configured");
       }
       // Hand the tab to the keepalive manager exactly as the no-origin branch
       // below does. It owns the tab for the duration of the sign-in: its
@@ -2993,12 +3012,13 @@ export class Bridge {
     // interactive for the whole download, so this is the only moment the
     // page that actually produced these bytes is known for certain.
     const deliveryPageHostAtStart = sanitizePageHost(tabURL);
-    // Freeze session evidence too, for the same reason: keepaliveAuthenticated/
-    // authReturnedThisWorker/lastAuthReturnedAt are live global state, not
-    // scoped to this tab, so an institutional probe or sign-in landing
-    // anywhere in the browser during the multi-second download must not
-    // retroactively credit this delivery. deliveryEvidenceFor reads this
-    // frozen value back at completion instead of re-reading live state.
+    // Freeze session evidence too, for the same reason: releaseGradeOrigins/
+    // authReturnedThisWorkerOrigins/originAuthReturnedAt are live per-origin
+    // state, not scoped to this tab or download, so an institutional probe
+    // or sign-in landing anywhere in the browser during the multi-second
+    // download must not retroactively credit this delivery.
+    // deliveryEvidenceFor reads this frozen value back at completion instead
+    // of re-reading live state.
     const sessionEvidenceAtStart = this.currentSessionEvidence(job);
     await this.update((s) =>
       startPendingDelivery(s, {
@@ -3189,7 +3209,7 @@ export class Bridge {
   }
 
   /** A hello acknowledgement belongs to exactly one native port. */
-  private hasCurrentHello(): boolean {
+  hasCurrentHello(): boolean {
     return this.port !== null && this.helloAckGeneration === this.portGeneration;
   }
 
@@ -3635,7 +3655,7 @@ export class Bridge {
     this.triagePendingCount = undefined;
     this.triageActionsRequiresAuth = undefined;
     this.triageActionsRequiresAuthAt = undefined;
-    this.sessionEvidenceSentAt = undefined;
+    this.sessionEvidenceSentAt.clear();
     port.onMessage.addListener((msg) => {
       if (this.port !== port) return;
       this.reconnectAttempts = 0;
@@ -3901,20 +3921,30 @@ export class Bridge {
     return { ...store, authAttempts };
   }
 
-  private hasRecentAuthEvidence(): boolean {
-    const at = this.store.lastAuthReturnedAt;
-    const age = typeof at === "number" ? this.deps.now() - at : Number.POSITIVE_INFINITY;
+  /** Release-grade evidence for `origin` — either this worker's own live
+   * releaseGradeOrigins (see recordFreshSessionEvidence) or a persisted
+   * authEvidenceByOrigin entry from a prior worker life, within
+   * AUTH_EVIDENCE_TTL_MS. The persisted entry exists because an MV3 worker
+   * restarts constantly and releaseGradeOrigins does not survive that;
+   * recordFreshSessionEvidence and a warm institutional landing
+   * (recordInstitutionalSession) are the only writers. The global
+   * lastAuthReturnedAt display field and the landing-observed marker are
+   * still excluded on their own — ADR-0013: a timing frame is not identity
+   * evidence; only an origin-scoped release-grade observation is. */
+  private hasAuthEvidence(origin: string): boolean {
+    if (this.releaseGradeOrigins.has(origin)) return true;
+    const evidencedAt = this.store.authEvidenceByOrigin?.[origin];
+    if (typeof evidencedAt !== "number") return false;
+    const age = this.deps.now() - evidencedAt;
     return age >= 0 && age <= AUTH_EVIDENCE_TTL_MS;
   }
 
-  private hasAuthEvidence(): boolean {
-    return this.authReturnedThisWorker || this.keepaliveAuthenticated || this.hasRecentAuthEvidence();
-  }
-
   /** Keeps an OA landing from opening an institutional queue while preserving
-   * the existing one-visible-tab flow for ordinary offers. */
-  private hasHandoffReleaseEvidence(requiresAuth: boolean | undefined): boolean {
-    return this.hasAuthEvidence() || (requiresAuth !== true && this.openAccessLandingObserved);
+   * the existing one-visible-tab flow for ordinary offers. `origin` may be
+   * undefined for a job whose offer URL never resolved to a bare HTTPS
+   * origin; such a job can still qualify through the OA branch. */
+  private hasHandoffReleaseEvidence(origin: string | undefined, requiresAuth: boolean | undefined): boolean {
+    return (origin !== undefined && this.hasAuthEvidence(origin)) || (requiresAuth !== true && this.openAccessLandingObserved);
   }
   /** A provider's declared host set is the only local grouping information the
    * bridge has. Canonicalizing it makes every re-offer use the same lease
@@ -4284,17 +4314,51 @@ export class Bridge {
     }
   }
 
-  /** Persist only an institutional session proof, because an OA completion can
-   * otherwise mint an unattended SAML request for every waiting handoff. */
+  /** Merge a fresh release-grade observation for `origin` into the persisted
+   * evidence map, pruning any entry (including this same origin's prior
+   * value) that has already aged past AUTH_EVIDENCE_TTL_MS. Keeps
+   * store.authEvidenceByOrigin bounded across a long-lived profile instead
+   * of accumulating one entry per resolver ever seen. */
+  private withAuthEvidence(store: StoreShape, origin: string, now: number): Record<string, number> {
+    const merged: Record<string, number> = {};
+    for (const [existingOrigin, at] of Object.entries(store.authEvidenceByOrigin ?? {})) {
+      const age = now - at;
+      if (age >= 0 && age <= AUTH_EVIDENCE_TTL_MS) merged[existingOrigin] = at;
+    }
+    merged[origin] = now;
+    return merged;
+  }
+
+  /** A landing is a reason to look again — ADR-0013 says a timing frame is
+   * not identity evidence, so this never asserts an in/out session verdict.
+   * But when papio itself drove the tab past authentication onto a page
+   * resolving to a configured origin, that IS first-hand evidence for THAT
+   * origin: it persists per-origin release evidence (surviving the MV3
+   * restarts that wipe releaseGradeOrigins), releases only that origin's own
+   * queued handoffs, and reloads only that origin's own stalled auth tabs —
+   * reloadAuthenticationHandoffs still skips any job already reported to the
+   * operator as authStalledReported. It never touches another origin's tabs
+   * or queue. An offer origin outside the daemon's current configured set
+   * fails closed (do nothing): this remains a best-effort, narrowly-scoped
+   * release, never a source of truth beyond its own origin. */
   private async recordInstitutionalSession(job: ActiveJob, rawURL: string, now: number): Promise<boolean> {
     if (!this.isInstitutionalSessionLanding(job, rawURL)) return false;
-    const firstAuthEvidence = !this.authReturnedThisWorker;
-    this.authReturnedThisWorker = true;
-    await this.update((s) => ({ ...s, lastAuthReturnedAt: now }));
+    const origin = this.resolverOriginHint(this.offerURLs.get(job.job_id));
+    if (origin === undefined || !this.knownResolverOrigins().includes(origin)) return false;
+    const firstAuthEvidence = !this.authReturnedThisWorkerOrigins.has(origin);
+    this.authReturnedThisWorkerOrigins.add(origin);
+    this.originAuthReturnedAt.set(origin, now);
+    await this.update((s) => ({
+      ...s,
+      lastAuthReturnedAt: now,
+      authEvidenceByOrigin: this.withAuthEvidence(s, origin, now),
+    }));
     if (firstAuthEvidence) {
-      await this.releaseQueuedHandoffs();
-      await this.reloadAuthenticationHandoffs();
+      void this.keepaliveManager?.markDirty(origin);
+      void this.keepaliveManager?.probeForeground(origin);
     }
+    await this.drainQueuedHandoffs(origin, undefined, false);
+    await this.reloadAuthenticationHandoffs(origin);
     return true;
   }
 
@@ -4305,7 +4369,7 @@ export class Bridge {
     const firstOpenAccessLanding = !this.openAccessLandingObserved;
     this.openAccessLandingObserved = true;
     await this.releaseQueuedHandoffs();
-    if (firstOpenAccessLanding) await this.reloadAuthenticationHandoffs(false);
+    if (firstOpenAccessLanding) await this.reloadAuthenticationHandoffs(undefined, false);
   }
 
   // A popup delivery's route is deliberately never classified "oa" here,
@@ -4330,17 +4394,20 @@ export class Bridge {
     return job.requires_auth === false ? "oa" : "direct";
   }
 
-  /** Live session-evidence read from mutable global state. Only valid for the
-   * instant it is read — see deliveryEvidenceFor's frozen-value guard. */
+  /** Live session-evidence read, scoped to this job's own configured
+   * resolver origin — never the global fallback (that was the leak: any
+   * job's delivery could be credited by an unrelated origin's evidence). */
   private currentSessionEvidence(job: ActiveJob): DeliverySessionEvidence {
     const perJob = this.deliverySessionEvidence.get(job.job_id);
     if (perJob !== undefined) return perJob;
-    const lastAuth = this.store.lastAuthReturnedAt;
+    const origin = this.resolverOriginHint(this.offerURLs.get(job.job_id));
+    if (origin === undefined) return "none";
+    const lastAuth = this.originAuthReturnedAt.get(origin);
     if (typeof lastAuth === "number") {
       const age = this.deps.now() - lastAuth;
       if (age >= 0 && age <= AUTH_EVIDENCE_TTL_MS) return "fresh_auth";
     }
-    return this.keepaliveAuthenticated || this.authReturnedThisWorker ? "warm" : "none";
+    return this.releaseGradeOrigins.has(origin) || this.authReturnedThisWorkerOrigins.has(origin) ? "warm" : "none";
   }
 
   private deliveryEvidenceFor(job: ActiveJob, track: DownloadTrack, route: DeliveryRoute): DeliverySessionEvidence {
@@ -4348,8 +4415,8 @@ export class Bridge {
     // Mirrors deliveryPageHost's frozen-host guard below: a popup delivery's
     // session evidence is captured once, in startPDFDelivery, at request
     // time. The download can take seconds with the tab still interactive, so
-    // keepaliveAuthenticated/authReturnedThisWorker/lastAuthReturnedAt are
-    // live global state that can flip true mid-download — reading them here
+    // releaseGradeOrigins/authReturnedThisWorkerOrigins/originAuthReturnedAt are
+    // live per-origin state that can flip true mid-download — reading them here
     // would credit a public-page delivery with an institutional probe or
     // sign-in that happened to land elsewhere in the browser while the bytes
     // were still in flight.
@@ -4465,7 +4532,8 @@ export class Bridge {
    * that produced this evidence at all. */
   emitSessionEvidence(evidence: "warm_verified" | "auth_returned", originHint?: string): boolean {
     const now = this.deps.now();
-    const sentAt = this.sessionEvidenceSentAt;
+    const throttleKey = originHint ?? "";
+    const sentAt = this.sessionEvidenceSentAt.get(throttleKey);
     if (sentAt !== undefined) {
       const age = now - sentAt;
       if (age >= 0 && age < SESSION_EVIDENCE_THROTTLE_MS) return false;
@@ -4477,39 +4545,73 @@ export class Bridge {
     };
     if (isBareHTTPSOrigin(originHint)) payload.origin_hint = originHint;
     if (!this.send("session_evidence", payload)) return false;
-    this.sessionEvidenceSentAt = now;
+    this.sessionEvidenceSentAt.set(throttleKey, now);
     return true;
   }
 
-  /** Called by keepalive only after its resolver tab has returned from login.
-   * A per-origin warm verdict must not release another institution's queue. */
-  async setKeepaliveAuthenticated(authenticated: boolean, origin?: string): Promise<void> {
-    this.keepaliveAuthenticated = authenticated;
-    if (!authenticated) return;
+  /** Fires from keepalive's onFreshSessionEvidence — the ONLY callback that
+   * may authorize work from a decisive probe verdict (see keepalive.ts's
+   * KeepaliveOptions doc). Marks `origin` release-grade for this worker life
+   * AND persists that evidence (withAuthEvidence) so it survives an MV3
+   * restart, unblocks ONLY that origin's queue and stuck tabs, and forwards
+   * the timing fact to the daemon. Never resets an authentication-attempt
+   * budget, never reopens an auth-stalled human action, never touches
+   * another origin's tabs — ADR-0009's autonomous-retry line, held by
+   * drainQueuedHandoffs'/reloadAuthenticationHandoffs's own origin scoping
+   * below. drainQueuedHandoffs is called directly with an exact origin
+   * (never through releaseQueuedHandoffs, whose fallback-driven callers
+   * below always pass no origin); recordInstitutionalSession's warm-landing
+   * path does the same for its own, narrower kind of evidence. */
+  async recordFreshSessionEvidence(evidence: FreshSessionEvidence): Promise<void> {
+    const { origin } = evidence;
+    this.releaseGradeOrigins.add(origin);
     await this.ready;
-    await this.update((s) => ({ ...s, lastAuthReturnedAt: this.deps.now() }));
-    const warmOrigin = origin === undefined ? undefined : this.resolverOriginHint(origin) ?? null;
-    await this.releaseQueuedHandoffs(undefined, false, warmOrigin);
+    const now = this.deps.now();
+    this.originAuthReturnedAt.set(origin, now);
+    await this.update((s) => ({
+      ...s,
+      lastAuthReturnedAt: now,
+      authEvidenceByOrigin: this.withAuthEvidence(s, origin, now),
+    }));
+    this.emitSessionEvidence("warm_verified", origin);
+    await this.drainQueuedHandoffs(origin, undefined, false);
+    await this.reloadAuthenticationHandoffs(origin);
   }
 
-  private async releaseQueuedHandoffs(
-    fallbackJobID?: string,
-    forceProvider = false,
-    resolverOrigin?: string | null,
+  /** Bypasses evidence for exactly one forced job — the 45s
+   * QUEUED_HANDOFF_RELEASE_MS fallback timer, releaseExpiredQueuedHandoffs,
+   * operator actions, and provider-lease/challenge-cooldown expiry, all
+   * already-ratified ADR-0009 autonomous-retry behaviour. With no
+   * fallbackJobID this is a pure opportunistic re-drain: every queued job is
+   * still admitted only through its OWN origin's release-grade evidence
+   * (hasHandoffReleaseEvidence), so this can never launder one origin's
+   * evidence into another's queue. */
+  private async releaseQueuedHandoffs(fallbackJobID?: string, forceProvider = false): Promise<void> {
+    await this.drainQueuedHandoffs(undefined, fallbackJobID, forceProvider);
+  }
+
+  private async drainQueuedHandoffs(
+    originScope: string | undefined,
+    fallbackJobID: string | undefined,
+    forceProvider: boolean,
   ): Promise<void> {
     if (fallbackJobID !== undefined) this.pendingForcedReleases.add(fallbackJobID);
     if (forceProvider && fallbackJobID !== undefined) {
       const forced = findByJob(this.store, fallbackJobID);
       if (forced !== undefined) await this.clearProviderDrainPark(this.providerKeyForJob(forced));
     }
+    const jobOrigin = (job: ActiveJob): string | undefined =>
+      this.resolverOriginHint(this.offerURLs.get(job.job_id));
     const matchesOrigin =
-      resolverOrigin === undefined
-        ? (_job: ActiveJob) => true
-        : resolverOrigin === null
-          ? (_job: ActiveJob) => false
-          : (job: ActiveJob) => this.resolverOriginHint(this.offerURLs.get(job.job_id)) === resolverOrigin;
+      originScope === undefined ? (_job: ActiveJob) => true : (job: ActiveJob) => jobOrigin(job) === originScope;
     await this.drainHandoffDriveQueue();
-    if (!this.hasAuthEvidence() && !this.openAccessLandingObserved && this.pendingForcedReleases.size === 0) {
+    const anyQueuedEligible = this.store.activeJobs.some(
+      (job) =>
+        matchesOrigin(job) &&
+        job.status === "queued" &&
+        this.hasHandoffReleaseEvidence(jobOrigin(job), job.requires_auth),
+    );
+    if (!anyQueuedEligible && this.pendingForcedReleases.size === 0) {
       return;
     }
     if (this.drainingQueuedHandoffs) {
@@ -4522,15 +4624,12 @@ export class Bridge {
       await this.expireChallengeCooldowns();
       // One loop opens at most one unclassified handoff per provider. A lease
       // stays with that tab until it proves normal, becomes a challenge park,
-      while (
-        this.handoffDrives.size < HANDOFF_DRIVE_LIMIT &&
-        (this.hasAuthEvidence() || this.openAccessLandingObserved || this.pendingForcedReleases.size > 0)
-      ) {
+      while (this.handoffDrives.size < HANDOFF_DRIVE_LIMIT) {
         let selected = this.store.activeJobs.find(
           (job) =>
             matchesOrigin(job) &&
             job.status === "queued" &&
-            this.hasHandoffReleaseEvidence(job.requires_auth) &&
+            this.hasHandoffReleaseEvidence(jobOrigin(job), job.requires_auth) &&
             !this.challengeCooldownActiveForHosts(job.provider_hosts) &&
             !this.hasActiveProviderDrainLease(job),
         );
@@ -4612,9 +4711,15 @@ export class Bridge {
     }
   }
 
-  private async reloadAuthenticationHandoffs(includeInstitutional = true): Promise<void> {
+  private async reloadAuthenticationHandoffs(origin: string | undefined, includeInstitutional = true): Promise<void> {
     for (const job of this.store.activeJobs) {
-      if (job.tab_id < 0 || job.status === "queued" || (!includeInstitutional && job.requires_auth === true)) {
+      if (
+        job.tab_id < 0 ||
+        job.status === "queued" ||
+        (!includeInstitutional && job.requires_auth === true) ||
+        (origin !== undefined && this.resolverOriginHint(this.offerURLs.get(job.job_id)) !== origin) ||
+        this.authStalledReported.has(job.job_id)
+      ) {
         continue;
       }
       try {
@@ -4931,6 +5036,7 @@ export class Bridge {
         }));
         await this.syncConnectionBadge(connectionStatus);
         this.helloAckGeneration = this.portGeneration;
+        this.keepaliveManager?.notifyConfiguredOriginsChanged();
         this.settleHelloWaiters(true);
         return;
       }
@@ -5223,13 +5329,13 @@ export class Bridge {
     const governorQueued =
       !providerParked &&
       !challengeCooldown &&
-      this.hasHandoffReleaseEvidence(requiresAuth) &&
+      this.hasHandoffReleaseEvidence(this.resolverOriginHint(openurl), requiresAuth) &&
       (this.handoffDrives.size >= HANDOFF_DRIVE_LIMIT || this.handoffDriveQueue.length > 0);
     const queueHandoff =
       providerParked ||
       challengeCooldown ||
       governorQueued ||
-      (!this.hasHandoffReleaseEvidence(requiresAuth) &&
+      (!this.hasHandoffReleaseEvidence(this.resolverOriginHint(openurl), requiresAuth) &&
         (requiresAuth === true ||
           this.handoffOpening ||
           this.store.activeJobs.some((job) => job.tab_id >= 0 && job.status !== "queued")));
@@ -5344,11 +5450,11 @@ export class Bridge {
     const url = this.offerURLs.get(jobID);
     if (!job || job.tab_id >= 0 || url === undefined) return;
     const governorQueued =
-      this.hasHandoffReleaseEvidence(job.requires_auth) &&
+      this.hasHandoffReleaseEvidence(this.resolverOriginHint(url), job.requires_auth) &&
       (this.handoffDrives.size >= HANDOFF_DRIVE_LIMIT || this.handoffDriveQueue.length > 0);
     const queueHandoff =
       governorQueued ||
-      (!this.hasHandoffReleaseEvidence(job.requires_auth) &&
+      (!this.hasHandoffReleaseEvidence(this.resolverOriginHint(url), job.requires_auth) &&
         (job.requires_auth === true ||
           this.handoffOpening ||
           this.store.activeJobs.some((candidate) => candidate.tab_id >= 0 && candidate.status !== "queued")));
@@ -7424,11 +7530,12 @@ if (typeof chrome !== "undefined" && chrome.runtime?.id) {
     lastAuthReturnedAt: () => bridge.lastAuthReturnedAt(),
     workWindowID: () => bridge.workWindowIDForKeepalive(),
     onTabPlaced: (tabID) => bridge.foldKeepaliveTab(tabID),
-    onAuthenticationChanged: (authenticated, origin?: string) => {
-      void bridge.setKeepaliveAuthenticated(authenticated, origin);
+    configuredOriginsReady: () => bridge.hasCurrentHello(),
+    onFreshSessionEvidence: (evidence: FreshSessionEvidence) => {
+      void bridge.recordFreshSessionEvidence(evidence);
     },
-    onSessionEvidence: (_source: KeepaliveProbeSource, origin?: string) => {
-      bridge.emitSessionEvidence("warm_verified", origin);
+    onOriginAuthenticationChanged: () => {
+      void bridge.syncConnectionBadge();
     },
     onReauthStateChanged: (paused) => bridge.setKeepaliveReauthNeeded(paused),
     surfaceReauthTab: async (tabID) => {

@@ -16,9 +16,9 @@ import {
   MIN_FOREGROUND_PROBE_SPACING_MS,
   MIN_PROBE_START_SPACING_MS,
   SESSION_STALE_MS,
+  type FreshSessionEvidence,
   type KeepaliveAPI,
   type KeepaliveOriginSnapshot,
-  type KeepaliveProbeSource,
   type KeepaliveTab,
   type KeepaliveTimers,
   type ResolverMarker,
@@ -292,7 +292,12 @@ function makeHarness(
   badge: string[];
   reauths: { count: number };
   reauthState: boolean[];
-  sessionEvidence: { source: KeepaliveProbeSource; origin: string | undefined }[];
+  freshEvidence: FreshSessionEvidence[];
+  authChanges: { origin: string; authenticated: boolean }[];
+  /** Mutable "hello_ack landed" toggle read live by configuredOriginsReady():
+   * defaults to false, matching production before the daemon handshake, so
+   * every existing test's behavior is unchanged unless a test opts in. */
+  configuredReady: { value: boolean };
   storageValues: Record<string, unknown>;
   resolverMarkers: ResolverMarker[];
   markersByTab: Map<number, ResolverMarker[]>;
@@ -316,7 +321,9 @@ function makeHarness(
   const badge: string[] = [];
   const reauths = { count: 0 };
   const reauthState: boolean[] = [];
-  const sessionEvidence: { source: KeepaliveProbeSource; origin: string | undefined }[] = [];
+  const freshEvidence: FreshSessionEvidence[] = [];
+  const authChanges: { origin: string; authenticated: boolean }[] = [];
+  const configuredReady = { value: false };
   const originStateWrites: KeepaliveOriginSnapshot[][] = [];
   const storageValues: Record<string, unknown> = {
     "keepalive.interval": interval,
@@ -363,8 +370,12 @@ function makeHarness(
     onReauthStateChanged: (paused) => {
       reauthState.push(paused);
     },
-    onSessionEvidence: (source, origin) => {
-      sessionEvidence.push({ source, origin });
+    configuredOriginsReady: () => configuredReady.value,
+    onFreshSessionEvidence: (evidence) => {
+      freshEvidence.push(evidence);
+    },
+    onOriginAuthenticationChanged: (origin, authenticated) => {
+      authChanges.push({ origin, authenticated });
     },
     observeMs: 10,
     reloadSettleMs: 1,
@@ -385,7 +396,9 @@ function makeHarness(
     badge,
     reauths,
     reauthState,
-    sessionEvidence,
+    freshEvidence,
+    authChanges,
+    configuredReady,
     storageValues,
     resolverMarkers,
     markersByTab,
@@ -1142,7 +1155,7 @@ test("a sibling scan held open cannot publish an intermediate verdict", async ()
     verdict: "unknown",
     authenticated: false,
   });
-  expect(h.sessionEvidence).toEqual([]);
+  expect(h.freshEvidence).toEqual([]);
 
   gate.release();
   await pending;
@@ -1150,7 +1163,7 @@ test("a sibling scan held open cannot publish an intermediate verdict", async ()
   // Both decisive and disagreeing, with no causal tab: conflict, not a
   // leaked "out".
   expect(h.manager.getSnapshot()).toMatchObject({ verdict: "unknown", lastProbeOutcome: "conflict" });
-  expect(h.sessionEvidence).toEqual([]);
+  expect(h.freshEvidence).toEqual([]);
 });
 
 test("scan_failed preserves a previously earned in verdict", async () => {
@@ -2027,4 +2040,418 @@ test("an older persisted write can never land after a newer one: the serialized 
   // clobbered a later one.
   expect(finalStates.find((s) => s.origin === defaultOrigin)?.dirtySince).not.toBeNull();
   expect(finalStates.find((s) => s.origin === secondOrigin)?.dirtySince).not.toBeNull();
+});
+
+// --- Commit C: origin-scoped unblocking -----------------------------------
+// onFreshSessionEvidence/onOriginAuthenticationChanged replace
+// onSessionEvidence/onAuthenticationChanged. Evidence is release-grade only
+// for a configured member origin once configuredOriginsReady() is true;
+// h.configuredReady defaults to false (today's pre-hello_ack union
+// behavior), so every test above this banner is unaffected.
+
+test("a fresh release-grade probe after a warm-restored verdict still emits onFreshSessionEvidence, even though authenticated does not transition", async () => {
+  const origin = "https://onesearch.library.example-college.edu";
+  const stored: Record<string, unknown> = {
+    "keepalive.originStates": [
+      {
+        origin,
+        authenticated: true,
+        verdict: "in",
+        probeSource: "live_tab",
+        lastProbeOutcome: "markers",
+        lastVerdictAt: Date.now() - 60_000,
+        checking: true,
+        likelyAuthenticated: false,
+        pausedForReauth: false,
+        lastProbeAt: Date.now() - 60_000,
+        dirtySince: null,
+      },
+    ],
+  };
+  const h = makeHarness(4, undefined, { knownOrigins: [origin], storageValues: stored });
+  h.configuredReady.value = true;
+  await h.manager.init();
+  // Restoring a warm verdict is not an observation — it must never itself
+  // be treated as fresh evidence.
+  expect(h.freshEvidence).toEqual([]);
+
+  const tab = { id: 70, url: `${origin}/account` };
+  h.tabs.live.set(tab.id, tab);
+  h.tabs.resolverTabs.push(tab); // default markers "Sign out" -> decisive "in"
+  // The manager's own owned tab is ALSO pinned at this origin (jobs.count
+  // defaults to 1, so init() maintains warm demand here) and would agree
+  // just as decisively — without a causal preference, an owned tab in the
+  // decisive set wins the source label even when a live tab was also
+  // decisive. Focusing this tab makes it the causal observation, so the
+  // evidence this test cares about is unambiguously attributed to a real
+  // USER tab, not the manager's own keepalive tab.
+  h.tabs.focusedTab = tab;
+
+  await h.manager.probeForeground(origin);
+
+  // authenticated was already true before and after this probe — a
+  // transition-only callback would stay silent here, which is exactly the
+  // bug a worker restart used to trigger.
+  expect(h.manager.getOriginSnapshots().find((s) => s.origin === origin)).toMatchObject({
+    verdict: "in",
+    authenticated: true,
+    lastProbeOutcome: "markers",
+  });
+  expect(h.freshEvidence).toHaveLength(1);
+  expect(h.freshEvidence[0]).toMatchObject({ origin, source: "live_tab" });
+  expect(typeof h.freshEvidence[0]?.generation).toBe("number");
+});
+
+test("onOriginAuthenticationChanged fires only when the committed authenticated value actually changes", async () => {
+  const origin = "https://resolver.example.edu";
+  const h = makeHarness(4, undefined, { knownOrigins: [origin] });
+  h.configuredReady.value = true;
+  await h.manager.init();
+  h.jobs.count = 0;
+  await h.manager.sync(); // close the owned tab: only the tab set up below counts
+
+  const tab = { id: 40, url: `${origin}/account` };
+  h.tabs.live.set(tab.id, tab);
+  h.tabs.resolverTabs.push(tab);
+
+  // First probe: default markers ("Sign out") commit authenticated=true —
+  // a real change from the initial default (false).
+  await h.manager.probeForeground(origin);
+  expect(h.authChanges).toEqual([{ origin, authenticated: true }]);
+
+  // Second probe, same decisive "in": authenticated stays true, no change,
+  // no second call.
+  h.clock.advanceBy(MIN_FOREGROUND_PROBE_SPACING_MS);
+  await h.manager.probeForeground(origin);
+  expect(h.authChanges).toEqual([{ origin, authenticated: true }]);
+
+  // Third probe flips to "out": a genuine change back to false.
+  h.resolverMarkers.splice(0, h.resolverMarkers.length, { text: "Sign in", label: "" });
+  h.clock.advanceBy(MIN_FOREGROUND_PROBE_SPACING_MS);
+  await h.manager.probeForeground(origin);
+  expect(h.authChanges).toEqual([
+    { origin, authenticated: true },
+    { origin, authenticated: false },
+  ]);
+
+  // A preserved-verdict commit (scan_failed) must not fire even though
+  // nothing changed to trigger it accidentally either.
+  h.api.scripting = {
+    executeScript: async () => {
+      throw new Error("host permission revoked");
+    },
+  };
+  h.clock.advanceBy(MIN_FOREGROUND_PROBE_SPACING_MS);
+  await h.manager.probeForeground(origin);
+  expect(h.authChanges).toEqual([
+    { origin, authenticated: true },
+    { origin, authenticated: false },
+  ]);
+});
+
+test("a preserved-verdict commit (no_tab, scan_failed, partial_scan) fires neither callback", async () => {
+  const origin = "https://resolver.example.edu";
+  const h = makeHarness(4, undefined, { knownOrigins: [origin] });
+  h.configuredReady.value = true;
+  await h.manager.init();
+  h.jobs.count = 0;
+  await h.manager.sync(); // close the owned tab: no candidate tab exists yet
+
+  // no_tab: nothing to observe, nothing to preserve — still no callback.
+  await h.manager.probeForeground();
+  expect(h.manager.getSnapshot().lastProbeOutcome).toBe("no_tab");
+  expect(h.freshEvidence).toEqual([]);
+  expect(h.authChanges).toEqual([]);
+
+  // Earn a real "in" first, so later preserved branches have something at
+  // stake — proving they truly preserve rather than trivially having
+  // nothing to report either way.
+  const tab = { id: 40, url: `${origin}/account` };
+  h.tabs.live.set(tab.id, tab);
+  h.tabs.resolverTabs.push(tab);
+  h.clock.advanceBy(MIN_FOREGROUND_PROBE_SPACING_MS);
+  await h.manager.probeForeground();
+  const earned = h.manager.getSnapshot();
+  expect(earned).toMatchObject({ verdict: "in", authenticated: true, probeSource: "live_tab" });
+  expect(h.freshEvidence).toHaveLength(1);
+  expect(h.authChanges).toHaveLength(1);
+
+  // scan_failed: an injection failure preserves the earned verdict, exactly
+  // as the reducer documents — verdict/authenticated/probeSource/
+  // lastVerdictAt are left alone; only lastProbeAt/lastProbeOutcome advance.
+  h.api.scripting = {
+    executeScript: async () => {
+      throw new Error("host permission revoked");
+    },
+  };
+  h.clock.advanceBy(MIN_FOREGROUND_PROBE_SPACING_MS);
+  await h.manager.probeForeground();
+  const afterScanFailed = h.manager.getSnapshot();
+  expect(afterScanFailed).toMatchObject({
+    verdict: earned.verdict,
+    authenticated: earned.authenticated,
+    probeSource: earned.probeSource,
+    lastVerdictAt: earned.lastVerdictAt,
+    lastProbeOutcome: "scan_failed",
+  });
+  expect(afterScanFailed.lastProbeAt).not.toBe(earned.lastProbeAt);
+  expect(h.freshEvidence).toHaveLength(1);
+  expect(h.authChanges).toHaveLength(1);
+
+  // partial_scan: too many candidate tabs to trust siblings alone — same
+  // preserve-only contract as scan_failed. No trailing drain here: nothing
+  // this assertion cares about is scheduled behind a timer, and running one
+  // would also fire the unrelated warm-demand-lapsed housekeeping tick this
+  // test's own `h.jobs.count = 0` armed earlier, which independently resets
+  // the origin once no tab exists to observe — a real but orthogonal path,
+  // not the preserved-commit behavior under test here.
+  h.api.scripting = { executeScript: h.scripting.executeScript };
+  expect(MAX_OBSERVED_TABS_PER_ORIGIN).toBe(5);
+  const flood: KeepaliveTab[] = [];
+  for (let id = 200; id < 200 + MAX_OBSERVED_TABS_PER_ORIGIN + 1; id++) {
+    const floodTab = { id, url: `${origin}/discovery/${id}` };
+    h.tabs.live.set(id, floodTab);
+    flood.push(floodTab);
+  }
+  h.tabs.resolverTabs.push(...flood);
+  h.clock.advanceBy(MIN_FOREGROUND_PROBE_SPACING_MS);
+  await h.manager.probeForeground();
+  const afterPartialScan = h.manager.getOriginSnapshots().find((s) => s.origin === origin);
+  expect(afterPartialScan).toMatchObject({
+    verdict: earned.verdict,
+    authenticated: earned.authenticated,
+    probeSource: earned.probeSource,
+    lastVerdictAt: earned.lastVerdictAt,
+    lastProbeOutcome: "partial_scan",
+  });
+  expect(h.freshEvidence).toHaveLength(1);
+  expect(h.authChanges).toHaveLength(1);
+});
+
+test("a conflict reduction fires neither callback", async () => {
+  const origin = "https://resolver.example.edu";
+  const h = makeHarness(4, undefined, { knownOrigins: [origin] });
+  h.configuredReady.value = true;
+  await h.manager.init();
+  h.jobs.count = 0;
+  await h.manager.sync(); // close the owned tab: it must not act as a tiebreaker here.
+
+  // Neither tab is focused and neither is preferred, so there is no causal
+  // observation to arbitrate between two tabs that disagree decisively.
+  const a = { id: 51, url: `${origin}/discovery/a` };
+  const b = { id: 52, url: `${origin}/discovery/b` };
+  h.tabs.live.set(51, a);
+  h.tabs.live.set(52, b);
+  h.tabs.resolverTabs.push(a, b);
+  h.markersByTab.set(51, [{ text: "Sign in", label: "" }]);
+  h.markersByTab.set(52, [{ text: "Sign out", label: "" }]);
+
+  await h.manager.probeForeground();
+
+  expect(h.manager.getSnapshot()).toMatchObject({
+    verdict: "unknown",
+    authenticated: false,
+    lastProbeOutcome: "conflict",
+  });
+  expect(h.freshEvidence).toEqual([]);
+  expect(h.authChanges).toEqual([]);
+});
+
+test("exactly one onFreshSessionEvidence fires per committing probe, even when several observed tabs read in", async () => {
+  const origin = "https://resolver.example.edu";
+  const h = makeHarness(4, undefined, { knownOrigins: [origin] });
+  h.configuredReady.value = true;
+  await h.manager.init();
+  h.jobs.count = 0;
+  await h.manager.sync();
+
+  const siblings = [61, 62, 63].map((id) => ({ id, url: `${origin}/discovery/${id}` }));
+  for (const tab of siblings) h.tabs.live.set(tab.id, tab);
+  h.tabs.resolverTabs.push(...siblings); // default markers "Sign out" -> every one decisive "in"
+
+  await h.manager.probeForeground();
+
+  expect(h.manager.getSnapshot()).toMatchObject({
+    verdict: "in",
+    authenticated: true,
+    lastProbeOutcome: "markers",
+  });
+  expect(h.freshEvidence).toHaveLength(1);
+  expect(h.freshEvidence[0]).toMatchObject({ origin, source: "live_tab" });
+});
+
+test("neither callback fires before configuredOriginsReady() returns true, even for a release-grade in", async () => {
+  const h = makeHarness(); // configuredReady defaults to false: pre-hello_ack
+  await h.manager.init();
+  h.jobs.count = 0;
+  await h.manager.sync();
+
+  const tab = { id: 40, url: "https://resolver.example.edu/account" };
+  h.tabs.live.set(tab.id, tab);
+  h.tabs.resolverTabs.push(tab); // default markers "Sign out" -> decisive "in"
+
+  await h.manager.probeForeground();
+
+  // The origin still earns its own verdict locally...
+  expect(h.manager.getSnapshot()).toMatchObject({
+    verdict: "in",
+    authenticated: true,
+    lastProbeOutcome: "markers",
+  });
+  // ...but nothing is release-grade before the daemon handshake has landed.
+  expect(h.freshEvidence).toEqual([]);
+  expect(h.authChanges).toEqual([]);
+});
+
+test("once ready, an origin present only in offer traffic is not a configured member", async () => {
+  const offerOrigin = "https://resolver.example.edu"; // from the default OpenURL, never in knownOrigins
+  const memberOrigin = "https://onesearch.library.example-college.edu";
+  const h = makeHarness(4, undefined, { knownOrigins: [memberOrigin] });
+  h.configuredReady.value = true;
+  await h.manager.init();
+
+  // No row for the offer-only origin: membership is exactly
+  // knownResolverOrigins() once ready, never the owned tab's target.
+  expect(h.manager.getOriginSnapshots().map((s) => s.origin)).toEqual([memberOrigin]);
+
+  h.jobs.count = 0;
+  await h.manager.sync();
+  const tab = { id: 40, url: `${offerOrigin}/account` };
+  h.tabs.live.set(tab.id, tab);
+  h.tabs.resolverTabs.push(tab); // default markers "Sign out" -> would-be decisive "in"
+
+  // Even an explicit-origin probe (which bypasses candidate selection)
+  // cannot manufacture release authority for a non-member.
+  await h.manager.probeForeground(offerOrigin);
+  expect(h.freshEvidence).toEqual([]);
+  expect(h.authChanges).toEqual([]);
+  expect(h.manager.getOriginSnapshots().map((s) => s.origin)).toEqual([memberOrigin]);
+
+  expect(await h.manager.openReauth(offerOrigin)).toBe(false);
+});
+
+test("while not ready, restored origin states survive syncOriginStates() when the configured set is momentarily empty", async () => {
+  const origin = "https://onesearch.library.example-college.edu";
+  const stored: Record<string, unknown> = {
+    "keepalive.originStates": [
+      {
+        origin,
+        authenticated: true,
+        verdict: "in",
+        probeSource: "live_tab",
+        lastProbeOutcome: "markers",
+        lastVerdictAt: Date.now() - 60_000,
+        checking: false,
+        likelyAuthenticated: false,
+        pausedForReauth: false,
+        lastProbeAt: Date.now() - 60_000,
+        dirtySince: null,
+      },
+    ],
+  };
+  // knownOrigins: [] mirrors clearNegotiationState zeroing resolverOrigins on
+  // every connect/reconnect — the configured set is momentarily empty, and
+  // configuredReady stays at its default false throughout (never "ready").
+  const h = makeHarness(4, undefined, { knownOrigins: [], storageValues: stored });
+  await h.manager.init();
+
+  expect(h.manager.getOriginSnapshots().map((s) => s.origin)).toContain(origin);
+
+  // A second reconcile (another reconnect tick, still not ready) must not
+  // delete it either.
+  await h.manager.sync();
+  expect(h.manager.getOriginSnapshots().find((s) => s.origin === origin)).toMatchObject({
+    verdict: "in",
+    authenticated: true,
+  });
+});
+
+test("notifyConfiguredOriginsChanged() picks up a newly configured origin immediately and probes it if dirty", async () => {
+  const origin = "https://onesearch.library.example-college.edu";
+  const stored: Record<string, unknown> = {
+    "keepalive.originStates": [
+      {
+        origin,
+        authenticated: false,
+        verdict: "unknown",
+        probeSource: "none",
+        lastVerdictAt: null,
+        checking: false,
+        likelyAuthenticated: false,
+        pausedForReauth: false,
+        lastProbeAt: null,
+        dirtySince: Date.now() - 5_000,
+      },
+    ],
+  };
+  const resolverConfig: HarnessResolver = { knownOrigins: [], storageValues: stored };
+  const h = makeHarness(4, undefined, resolverConfig);
+  await h.manager.init(); // pre-hello_ack: not ready, empty configured set
+
+  const tab = { id: 90, url: `${origin}/account` };
+  h.tabs.live.set(tab.id, tab);
+  h.tabs.resolverTabs.push(tab); // default markers "Sign out" -> decisive "in"
+
+  // hello_ack lands: the configured set now includes the origin, and the
+  // bridge tells the manager directly.
+  resolverConfig.knownOrigins = [origin];
+  h.configuredReady.value = true;
+  h.manager.notifyConfiguredOriginsChanged();
+  await flushMicrotasks();
+
+  expect(h.manager.getOriginSnapshots().find((s) => s.origin === origin)).toMatchObject({
+    verdict: "in",
+    authenticated: true,
+    dirtySince: null,
+  });
+  expect(h.freshEvidence).toHaveLength(1);
+  expect(h.freshEvidence[0]).toMatchObject({ origin, source: "live_tab" });
+});
+
+test("a superseded generation's result never produces evidence", async () => {
+  const origin = "https://resolver.example.edu";
+  const h = makeHarness(4, undefined, { knownOrigins: [origin] });
+  h.configuredReady.value = true;
+  await h.manager.init();
+  h.jobs.count = 0;
+  await h.manager.sync();
+
+  // First attempt: tab A's scan is held open past the probe-admission
+  // deadline (20s), so its in-flight slot frees while the observation
+  // itself is still pending in the background — the only way a second,
+  // later-generation probe for the same origin can start at all.
+  const tabA = { id: 71, url: `${origin}/account` };
+  h.tabs.live.set(tabA.id, tabA);
+  h.tabs.focusedTab = tabA;
+  const gateA = h.scripting.hold(tabA.id);
+
+  const first = h.manager.probeForeground(origin);
+  await flushMicrotasks();
+  h.clock.advanceBy(20_000);
+  await h.timers.runByDelay(20_000); // admission deadline frees the slot
+  await first;
+
+  // No commit yet: tab A's own observation has not resolved.
+  expect(h.freshEvidence).toEqual([]);
+
+  // Second attempt, a fresh generation, admitted now that the slot is
+  // free: a different tab answers immediately and commits "in".
+  const tabB = { id: 72, url: `${origin}/account` };
+  h.tabs.live.set(tabB.id, tabB);
+  h.tabs.focusedTab = tabB; // default markers "Sign out" -> decisive "in"
+
+  await h.manager.probeForeground(origin);
+
+  expect(h.freshEvidence).toHaveLength(1);
+  const [firstEvidence] = h.freshEvidence;
+
+  // The stale first attempt finally resolves — reading the same decisive
+  // "in" it would have committed at the time — but its generation was
+  // superseded by the second attempt's, so it must not produce a second
+  // evidence event.
+  gateA.release();
+  await flushMicrotasks();
+
+  expect(h.freshEvidence).toHaveLength(1);
+  expect(h.freshEvidence[0]).toBe(firstEvidence);
 });
