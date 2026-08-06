@@ -4007,7 +4007,7 @@ func TestAutomaticHandoffQuiescesFruitlessEpochsAcrossRestart(t *testing.T) {
 	}
 
 	// Epoch 1: initial offer+accept, then ten reconnect offer/accept pairs
-	// inside the five-minute lease — a service-worker restart re-acking the
+	// inside the accepted lease — a service-worker restart re-acking the
 	// same physical drive, not ten separate drives.
 	epoch1Start := created.Add(time.Second)
 	appendEventAt(t, jobs, id, "browser.handoff_offered", map[string]any{"requires_auth": false}, epoch1Start)
@@ -4134,5 +4134,48 @@ func TestProjectHandoffOfferStateProviderOutcomeResetsFruitlessCount(t *testing.
 	}
 	if state.Quiesced {
 		t.Fatal("quiesced despite a terminal outcome resetting the streak")
+	}
+}
+
+// TestAcceptedLeaseOutlastsTheExtensionQueueWait pins the reason the lease is
+// ten minutes and not five. The extension sends job_accept on its QUEUED path
+// too, so an accepted handoff can sit undriven while the drive governor is
+// saturated — up to maxOutstandingOffers (4) against HANDOFF_DRIVE_LIMIT (2)
+// slots at the 3-minute drive timeout, plus the 45-second evidence-free
+// release ADR-0013 ratifies. Nothing daemon-side tells that apart from a drive
+// that produced nothing, so a lease shorter than the wait would charge a job
+// for queueing and quiesce a healthy backlog. A five-minute lease failed this.
+func TestAcceptedLeaseOutlastsTheExtensionQueueWait(t *testing.T) {
+	const worstQueueWait = (4/2)*3*time.Minute + 45*time.Second
+	if job.HandoffAcceptedLease <= worstQueueWait {
+		t.Fatalf("accepted lease %s does not outlast the extension's %s queue wait: a handoff still waiting its turn would be charged as a fruitless drive",
+			job.HandoffAcceptedLease, worstQueueWait)
+	}
+
+	_, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	id := park(t, jobs, "wr_queue_wait", handoffWork())
+	action := openHandoffAction(t, jobs, id)
+	created, err := time.Parse(time.RFC3339Nano, action.CreatedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Offered and accepted, then nothing: the extension queued it behind a
+	// saturated governor and has not driven it even once.
+	start := created.Add(time.Second)
+	appendEventAt(t, jobs, id, "browser.handoff_offered", map[string]any{"requires_auth": false}, start)
+	appendEventAt(t, jobs, id, "browser.job_accept", nil, start.Add(time.Second))
+
+	events, err := jobs.Events(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := job.ProjectHandoffOfferState(events, action.CreatedAt, start.Add(worstQueueWait))
+	if state.FruitlessEpochs != 0 {
+		t.Fatalf("fruitless epochs while still inside the queue wait = %d, want 0", state.FruitlessEpochs)
+	}
+	if state.Quiesced {
+		t.Fatal("quiesced a handoff that was only waiting for a drive slot")
 	}
 }

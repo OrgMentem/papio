@@ -2744,7 +2744,22 @@ func (a HumanAction) Quiesced(now time.Time) bool {
 // the extension's own 3-minute drive timeout so one physical drive — which
 // may re-acknowledge across a service-worker restart — is never split into
 // two counted epochs.
-const HandoffAcceptedLease = 5 * time.Minute
+//
+// It must also exceed the longest an accepted handoff can sit WITHOUT being
+// driven at all, because the extension sends job_accept on its queued path
+// too (background.ts queues under governor pressure, then releases after
+// QUEUED_HANDOFF_RELEASE_MS; ADR-0013's 2026-08-06 addendum ratifies that
+// 45-second evidence-free release). Nothing daemon-side distinguishes queued
+// from driving, so a lease shorter than the queue wait would charge a job for
+// waiting its turn and quiesce a healthy backlog — the same mistake as
+// counting raw offers, one layer down. The bound is the extension's own
+// arithmetic: at most maxOutstandingOffers (4) accepted handoffs against
+// HANDOFF_DRIVE_LIMIT (2) slots, each held up to the 3-minute drive timeout,
+// plus the 45-second release, so 6m45s worst case. Ten minutes clears that
+// with margin and still settles the incident this exists for, whose epochs
+// were hours to days apart: replayed over its real event history it yields
+// 15 fruitless epochs against a bound of 3.
+const HandoffAcceptedLease = 10 * time.Minute
 
 // MaxAutomaticHandoffEpochs is how many fruitless drive epochs an open
 // handoff tolerates before papio stops re-offering it on its own initiative.
