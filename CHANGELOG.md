@@ -23,13 +23,16 @@ execution records in `notes/acquisition-stack-plan.md`.
   matching 7/7 title tokens, the year, and printing the requested DOI verbatim
   below its abstract — past the front-matter DOI window, which stays narrow so
   a reference-list DOI is never read as the document's own — was parked for
-  human verification. With one requested author a marker-tolerant byline hit
-  now carries the author check, but only where the identifier is printed on the
-  document's own page one. That bound is the point: a comment, reply, or erratum
-  on the requested paper carries its title and cites its DOI in the references,
-  so trusting the whole document here would file the commentary as the paper. An
-  unrelated surname still parks, and so does a near-miss surname whose only
-  identifier match is a citation further in.
+  human verification. A *numbered* marker on the requested surname now carries
+  the author check by itself where the record names one author, because no
+  surname ends in a digit: "Ciani1" is Ciani, whereas "Clarke" is Clark plus a
+  letter or a different person, and nothing in the text says which. The
+  identifier must also be printed on the document's own page one. Both bounds
+  answer the same document — a comment, reply, or erratum on the requested paper
+  carries its title and prints its DOI, so on its own the identifier does not
+  establish that a file is the paper rather than a note about it. A lettered
+  near-miss surname still parks, as does a numbered one whose only identifier
+  match is a citation past page one.
 
 ## [0.18.0] - 2026-08-06
 

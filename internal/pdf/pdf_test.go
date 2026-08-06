@@ -356,29 +356,45 @@ func TestIdentityCorroboratesASingleMarkedAuthor(t *testing.T) {
 	}
 }
 
-// The marker tolerance cannot tell "Clarke" from "Clark", so where it is the
-// only author evidence the corroborating identifier must be the document's OWN:
-// a comment, reply, or erratum on the requested paper carries its title and
-// cites its DOI, and would otherwise be filed as the paper itself.
-func TestIdentityWillNotCorroborateANearMissSurnameFromTheBibliography(t *testing.T) {
+// A single marker carries the author check only when the byline settles the
+// surname and page one settles the identifier. Both bounds answer the same
+// document: a comment, reply, or erratum on the requested paper carries its
+// title and cites its DOI, and would otherwise be filed as the paper itself.
+func TestIdentityCorroborationOfOneAuthorNeedsANumberedMarkerOnPageOne(t *testing.T) {
 	target := work.Work{
 		DOI:   "10.1234/abc.9",
 		Title: "Robustness Calibration Measurement Networks",
 		// Clark, not Clarke; the tolerance cannot see the difference.
 		Authors: []string{"Alice Clark"}, Year: 2024,
 	}
-	text := "Comment on: Robustness Calibration Measurement Networks\nBob Clarke\n2024\n" +
+	body := "Abstract. " + strings.Repeat("We calibrate robustness measurements over networks. ", 30)
+
+	// A lettered near-miss surname, with the DOI cited in the bibliography.
+	cited := "Comment on: Robustness Calibration Measurement Networks\nBob Clarke\n2024\n" +
 		"\fReferences\nAlice Clark. Robustness calibration measurement networks, 2024. doi:10.1234/abc.9\n"
-	if got := MatchIdentity(text, target); got.Result != IdentityReview {
+	if got := MatchIdentity(cited, target); got.Result != IdentityReview {
 		t.Fatalf("result = %+v, want review: a cited DOI is not this document's own", got)
 	}
-	// Printed on the document's own page one — below the abstract, past the
-	// front-matter DOI window — it is corroboration, as for Ciani.
-	own := "Robustness Calibration Measurement Networks\nBob Clarke\n2024\nAbstract. " +
-		strings.Repeat("We calibrate robustness measurements over networks. ", 30) +
+	// The same near-miss surname on a one-page note that emits no form feed, so
+	// the DOI it prints inline IS on its page one — past the front-matter window,
+	// which would otherwise decide it. Only the marker rule can refuse this one.
+	note := "Correction to: Robustness Calibration Measurement Networks\nBob Clarke\n2024\n" + body +
+		"\nThe published version of doi:10.1234/abc.9 contained an error in Table 2.\n"
+	if got := MatchIdentity(note, target); got.Result != IdentityReview {
+		t.Fatalf("result = %+v, want review: Clarke may not be Clark", got)
+	}
+	// A numbered marker cannot be a different surname, and here the identifier
+	// is the document's own, below the abstract past the front-matter window.
+	own := "Robustness Calibration Measurement Networks\nAlice Clark1\n2024\n" + body +
 		"\ndoi:10.1234/abc.9\n\fReferences\nUnrelated, 2019.\n"
 	if got := MatchIdentity(own, target); got.Result != IdentityPass {
 		t.Fatalf("result = %+v, want pass on a page-one identifier", got)
+	}
+	// Numbered marker, but the only identifier is in the bibliography.
+	numberedCite := "Robustness Calibration Measurement Networks\nAlice Clark1\n2024\n" + body +
+		"\fReferences\nAlice Clark. Robustness calibration measurement networks, 2024. doi:10.1234/abc.9\n"
+	if got := MatchIdentity(numberedCite, target); got.Result != IdentityReview {
+		t.Fatalf("result = %+v, want review: page one prints no identifier", got)
 	}
 }
 

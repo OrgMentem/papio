@@ -99,15 +99,22 @@ func MatchIdentityWithThreshold(text string, target work.Work, titleThreshold fl
 
 	evidence := []string{fmt.Sprintf("title tokens matched: %d/%d", matches, len(tokens))}
 
-	exact, prefixed := 0, 0
+	exact, prefixed, numbered := 0, 0, 0
 	for _, author := range target.Authors {
 		switch family := familyToken(author); {
 		case family == "":
 		case bylineHasExactly(byline, family):
 			exact++
 			evidence = append(evidence, "author family name matched: "+family)
-		case bylineHasAffiliationMarked(byline, family):
+		default:
+			marked, numeric := bylineMarkedSurname(byline, family)
+			if !marked {
+				continue
+			}
 			prefixed++
+			if numeric {
+				numbered++
+			}
 			evidence = append(evidence, "author family name matched with an affiliation marker: "+family)
 		}
 	}
@@ -157,16 +164,18 @@ func MatchIdentityWithThreshold(text string, target work.Work, titleThreshold fl
 		// D. Ciani1∗" and the catalogue record named Ciani alone, so a document
 		// printing the requested DOI verbatim below its abstract went to review.
 		//
-		// Letting the marker tolerance carry the author check alone reopens the
-		// case it cannot decide — "Clarke" is "Clark" plus one letter — and the
-		// identifier does not rule that out on its own, because a comment, reply,
-		// or erratum on the requested paper both clears the title gate and cites
-		// the requested DOI in its references. So the relaxation reads the
-		// document's own page one rather than the whole excerpt: a paper prints
-		// its identifier in the page-one footer or below the abstract (17 of 40
-		// real papers), while another paper's identifier reaches it through a
-		// citation further in.
-		if prefixed > 0 && len(target.Authors) == 1 {
+		// A single marker stands in for the pair only when it is NUMBERED, and
+		// only when the identifier is on the document's own page one. Both
+		// bounds answer the same document: a comment, reply, or erratum on the
+		// requested paper carries its title and cites its DOI, so on its own the
+		// identifier does not establish that this is the paper rather than a
+		// note about it. The numeric marker settles the surname — no surname
+		// ends in a digit, so "Ciani1" is Ciani, whereas "Clarke" is
+		// indistinguishable from Clark plus a lettered marker — and page one
+		// settles the identifier: a paper prints its own in the footer or below
+		// the abstract (17 of 40 real papers), while another paper's reaches it
+		// through a citation.
+		if numbered > 0 && len(target.Authors) == 1 {
 			if pageOne := corroboratingIdentifier(identityPageOne(text), target); pageOne != "" {
 				return pass(append(evidence, pageOne)...)
 			}
@@ -244,9 +253,12 @@ func identityByline(text string) string { return identityWindow(text, identityBy
 // identityPageOneBytes is the widest of the three: it bounds where a document
 // may print its OWN identifier, which a publisher puts wherever page one has
 // room — a footer, a masthead, or under the abstract past the correspondence
-// footnote (byte ~2350 for the Wiley paper that motivated it). The cap only
-// bites on a document whose entire text is one page, and there it is what keeps
-// a short comment or erratum from donating its reference list to this window.
+// footnote (byte 2377, form feed at 2403, for the Wiley paper that motivated
+// it). The cap bites on a page one longer than 4 KiB — a dense two-column page
+// whose columns pdftotext concatenates — and on a document that emits no form
+// feed at all, where it is the only thing keeping a short comment or erratum
+// from donating its reference list to this window. Both cases park a document
+// this rule would otherwise have accepted, which is the direction to err in.
 const identityPageOneBytes = 4 << 10
 
 func identityPageOne(text string) string { return identityWindow(text, identityPageOneBytes) }
@@ -426,25 +438,42 @@ func bylineHasExactly(byline map[string]struct{}, family string) bool {
 	return ok
 }
 
-// bylineHasAffiliationMarked tolerates the superscript markers pdftotext glues
-// onto a byline surname — "Alejandro Barredo Arrietaa", "Siham Tabikg". Every
-// author of one real 12-author paper was marked this way, so exact matching
-// alone failed a byline that was in fact perfect.
+// bylineMarkedSurname tolerates the superscript markers pdftotext glues onto a
+// byline surname — "Alejandro Barredo Arrietaa", "Siham Tabikg", "Keith D.
+// Ciani1". Every author of one real 12-author paper was marked this way, so
+// exact matching alone failed a byline that was in fact perfect.
 //
-// It is reported separately from an exact hit because the tolerance cannot tell
-// a marker from a different surname: "Clarke" is "Clark" plus one letter. The
-// caller therefore requires two such matches, or an exact one, before treating
-// authorship as established.
-func bylineHasAffiliationMarked(byline map[string]struct{}, family string) bool {
+// marked is reported separately from an exact hit because the tolerance cannot
+// tell a LETTERED marker from a different surname: "Clarke" is "Clark" plus one
+// letter. The caller therefore requires two such matches, or an exact one,
+// before treating authorship as established.
+//
+// numeric reports the unambiguous case, which needs no second opinion: no
+// surname ends in a digit, so a token that is the requested surname followed
+// only by digits is that surname carrying an affiliation number.
+func bylineMarkedSurname(byline map[string]struct{}, family string) (marked, numeric bool) {
 	if len([]rune(family)) < 5 {
-		return false
+		return false, false
 	}
 	for token := range byline {
-		if len(token) > len(family) && len(token) <= len(family)+2 && strings.HasPrefix(token, family) {
-			return true
+		if len(token) <= len(family) || len(token) > len(family)+2 || !strings.HasPrefix(token, family) {
+			continue
+		}
+		marked = true
+		if isASCIIDigits(token[len(family):]) {
+			return true, true
 		}
 	}
-	return false
+	return marked, false
+}
+
+func isASCIIDigits(s string) bool {
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return len(s) != 0
 }
 
 // bylineYears reports whether the front matter states a publication year at
