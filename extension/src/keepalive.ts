@@ -22,9 +22,6 @@ export type ProbeOutcome =
 export interface ResolverMarker {
   text: string;
   label: string;
-  href?: string;
-  formAction?: string;
-  action?: string;
   storageIdentity?: "in";
   /** Whether the control is actually rendered for the user. Sign-OUT
    * affordances legitimately hide inside closed account menus, so hidden
@@ -316,29 +313,25 @@ export function classifyResolverJWTIdentity(values: readonly string[]): "in" | "
   return "unknown";
 }
 
-/** Classify bounded resolver-page marker data without touching browser state. */
+/** Classify bounded resolver-page marker data without touching browser state.
+ *
+ * Only what the operator can READ counts as an affordance: the control's text
+ * and its accessible label, never its target URL. A URL is routing, not an
+ * invitation — verified against a real signed-in capture of a Primo NDE
+ * resolver, where a navigation link labelled "AI Assisted Search" points at
+ * /nde/login and was single-handedly classifying an authenticated page as
+ * signed out. Feature links routed through a login path are common, and they
+ * survive signing in, so URL matching produced a false "out" that no amount of
+ * probing at the right moment could correct. */
 export function classifyResolverMarkers(markers: readonly ResolverMarker[]): SessionVerdict {
   let signIn = false;
   let storageIdentity = false;
   for (const marker of markers) {
-    if (
-      typeof marker?.text !== "string" ||
-      typeof marker?.label !== "string"
-    ) {
-      continue;
-    }
+    if (typeof marker?.text !== "string" || typeof marker?.label !== "string") continue;
     if (marker.storageIdentity === "in") storageIdentity = true;
-    const value = [
-      marker.text,
-      marker.label,
-      marker.href,
-      marker.formAction,
-      marker.action,
-    ]
-      .filter((part): part is string => typeof part === "string")
-      .join(" ");
-    if (SIGN_OUT_MARKER.test(value)) return "in";
-    if (SIGN_IN_MARKER.test(value) && marker.visible !== false) signIn = true;
+    const affordance = `${marker.text} ${marker.label}`;
+    if (SIGN_OUT_MARKER.test(affordance)) return "in";
+    if (SIGN_IN_MARKER.test(affordance) && marker.visible !== false) signIn = true;
   }
   if (storageIdentity) return "in";
   return signIn ? "out" : "unknown";
@@ -363,24 +356,30 @@ export function collectResolverMarkers(): ResolverMarker[] {
     if (ignoredTextTags.has(child.tagName)) return "";
     return Array.from(child.childNodes).map(controlText).join(" ");
   };
+  // A control's `value` is its rendered label only on push buttons. On a text
+  // or search input it is whatever the operator last typed, and a discovery
+  // layer echoes the query back into the box — so treating it as an affordance
+  // lets a search for "sign out" forge proof of a session on a page the
+  // operator is not signed in to.
+  const buttonValueTypes: Record<string, true> = { submit: true, button: true, reset: true };
   const markers: ResolverMarker[] = elements.map((element) => {
-    const value = element.getAttribute("value")?.trim() ?? "";
+    const isButtonValue =
+      element.tagName === "INPUT" &&
+      buttonValueTypes[element.getAttribute("type")?.trim().toLowerCase() ?? ""] === true;
+    const value = isButtonValue ? (element.getAttribute("value")?.trim() ?? "") : "";
     // A form's action is a target, not a page-sized text aggregate. Its
     // controls are scanned independently below.
     const text = element.tagName === "FORM" ? "" : controlText(element).trim();
     const rect = element.getClientRects();
-    const marker: ResolverMarker = {
+    // Deliberately no href/formaction/action. The classifier judges
+    // affordances, not routing, so collecting targets would only give it a way
+    // to be wrong — and it would pull URLs out of the operator's page for no
+    // remaining purpose.
+    return {
       text: `${text} ${value}`.trim(),
       label: element.getAttribute("aria-label")?.trim() ?? "",
       visible: rect.length > 0 && element.checkVisibility?.() !== false,
     };
-    const href = element.getAttribute("href")?.trim();
-    if (href !== undefined && href.length > 0) marker.href = href;
-    const formAction = element.getAttribute("formaction")?.trim();
-    if (formAction !== undefined && formAction.length > 0) marker.formAction = formAction;
-    const action = element.getAttribute("action")?.trim();
-    if (action !== undefined && action.length > 0) marker.action = action;
-    return marker;
   });
 
   const storageValues: string[] = [];

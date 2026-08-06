@@ -1241,20 +1241,32 @@ test("JWT identity classifier ignores guests, malformed values, and oversized st
   }
 });
 
-test("resolver marker classifier recognizes logout hrefs and form actions", () => {
-  expect(classifyResolverMarkers([{ text: "", label: "", href: "/account/signout" }])).toBe("in");
-  expect(classifyResolverMarkers([{ text: "", label: "", formAction: "/log-out" }])).toBe("in");
+test("a URL is routing, not an affordance: neither direction is decided by a link target", () => {
+  // Verified against a real signed-in capture of a Primo NDE resolver: a
+  // navigation link reading "AI Assisted Search" points at /nde/login, and
+  // matching that href was single-handedly classifying an authenticated page
+  // as signed out. Feature links routed through a login path survive signing
+  // in, so no amount of probing at the right moment could have corrected it.
   expect(
-    classifyResolverMarkers([
-      { text: "Sign in", label: "", storageIdentity: "in" },
-    ]),
-  ).toBe("in");
+    classifyResolverMarkers([{ text: "AI Assisted Search", label: "", visible: true }]),
+  ).toBe("unknown");
+  // The same rule in the harmful direction: a bare logout target with nothing
+  // the operator can read is not proof of a session either.
+  expect(classifyResolverMarkers([{ text: "", label: "" }])).toBe("unknown");
+  // An accessible label still counts — an icon-only control is a real
+  // affordance even with no text node.
+  expect(classifyResolverMarkers([{ text: "", label: "Sign out of your account" }])).toBe("in");
+  expect(classifyResolverMarkers([{ text: "Sign in", label: "", storageIdentity: "in" }])).toBe("in");
 });
 
-test("marker collection scans logout links inside closed and hidden menus", () => {
+test("marker collection scans sign-out affordances inside closed and hidden menus", () => {
   const window = new Window({ url: "https://resolver.example.edu/account" });
+  // A closed account menu is where a real sign-out affordance lives, and it is
+  // legitimate evidence of a session. What makes it evidence is the label the
+  // operator would read on opening the menu — not the /logout target, which a
+  // signed-out page can carry just as easily.
   window.document.write(
-    "<html><body><details><div hidden><span><a href='/logout'>Exit</a></span></div></details></body></html>",
+    "<html><body><details><div hidden><span><a href='/logout'>Sign out</a></span></div></details></body></html>",
   );
   const previous = {
     document: globalThis.document,
@@ -1477,26 +1489,19 @@ test("granted provider permission patterns never mint institution rows", async (
 });
 
 test("hidden sign-in markers never assert signed out; visible ones do", () => {
-  // Primo NDE keeps a sign-in href in a closed drawer permanently — signed in
-  // or not. A hidden prompt is not evidence of a signed-out session.
-  expect(
-    classifyResolverMarkers([
-      { text: "Sign in", label: "", href: "/nde/login", visible: false },
-    ]),
-  ).toBe("unknown");
-  // A signed-out page puts the prompt front and center.
-  expect(
-    classifyResolverMarkers([
-      { text: "Sign in", label: "", href: "/nde/login", visible: true },
-    ]),
-  ).toBe("out");
+  // Primo NDE keeps a sign-in control in a closed drawer permanently — signed
+  // in or not. A hidden prompt is not evidence of a signed-out session.
+  expect(classifyResolverMarkers([{ text: "Sign in", label: "", visible: false }])).toBe("unknown");
+  // A signed-out page puts the prompt front and center. This is the exact
+  // marker the real resolver captures produce.
+  expect(classifyResolverMarkers([{ text: "Sign in", label: "Sign In", visible: true }])).toBe("out");
   // Markers predating the visibility flag keep their old meaning.
   expect(classifyResolverMarkers([{ text: "Sign in", label: "" }])).toBe("out");
   // Sign-out affordances count from inside closed menus, hidden or not.
   expect(
     classifyResolverMarkers([
-      { text: "Sign out", label: "", href: "/logout", visible: false },
-      { text: "Sign in", label: "", href: "/nde/login", visible: true },
+      { text: "Sign out", label: "", visible: false },
+      { text: "Sign in", label: "", visible: true },
     ]),
   ).toBe("in");
 });
@@ -1542,7 +1547,7 @@ test("all tabs signed out keeps the focused tab's verdict authoritative", async 
   h.tabs.live.set(43, second);
   h.tabs.focusedTab = first;
   h.tabs.resolverTabs.push(first, second);
-  h.markersByTab.set(42, [{ text: "Sign in", label: "", href: "/nde/login", visible: true }]);
+  h.markersByTab.set(42, [{ text: "Sign in", label: "Sign In", visible: true }]);
   h.markersByTab.set(43, []);
 
   await h.manager.probeForeground();
