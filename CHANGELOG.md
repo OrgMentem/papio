@@ -102,6 +102,19 @@ execution records in `notes/acquisition-stack-plan.md`.
   establish that a file is the paper rather than a note about it. A lettered
   near-miss surname still parks, as does a numbered one whose only identifier
   match is a citation past page one.
+- **A page that announces itself as a correction can no longer be filed as the
+  paper it corrects.** An identifier printed in the first kilobyte of page one
+  passed identity outright, with no title or author check — correct for the 40%
+  of real papers that print their own DOI in the masthead, wrong for an erratum,
+  corrigendum, retraction notice, or comment article, which is a different work
+  that reprints the requested paper's DOI at the top of its own first page. A
+  1508-byte correction notice was accepted as the paper. A front-matter line
+  beginning with one of those markers now caps the verdict at review rather than
+  rejecting it, because the operator may have asked for the erratum and a park
+  can be undone where a discard cannot, and the marker is named in the evidence
+  on every verdict a human sees. Markers are matched as line prefixes: a
+  Bonferroni correction mid-sentence is a real paper, so the list carries
+  "retraction of" rather than "retraction" and deliberately omits "response to".
 
 ## [0.18.0] - 2026-08-06
 

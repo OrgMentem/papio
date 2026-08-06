@@ -20,6 +20,24 @@ var nonArticleMarkers = []string{
 	"electronic supplementary", "supporting data",
 }
 
+// correctionMarkers flags a document that is ABOUT another work rather than
+// being the work itself — an erratum, correction, retraction, or comment
+// that legitimately prints the requested paper's own title, authors, and
+// DOI in its front matter, because that is the paper it is correcting.
+// Unlike nonArticleMarkers above, a hit here does not reject: the operator
+// may genuinely have requested the erratum rather than the paper, and
+// discarding a candidate outright is not reversible the way parking it for
+// review is. It is prefix-anchored on "retraction of" rather than the bare
+// "retraction", and omits "response to" entirely, because "Retraction of
+// scientific papers: a bibliometric study" and "Response to Intervention"
+// are both real titles that the shorter prefixes would catch.
+var correctionMarkers = []string{
+	"erratum", "corrigendum", "correction to", "correction:", "author correction",
+	"publisher correction", "retraction of", "retraction note", "retracted article",
+	"expression of concern", "comment on", "comments on", "commentary on",
+	"reply to", "rejoinder to", "withdrawal notice",
+}
+
 var titleStopwords = map[string]bool{
 	"about": true, "after": true, "also": true, "among": true, "and": true,
 	"been": true, "between": true, "from": true, "into": true, "more": true,
@@ -51,7 +69,8 @@ func MatchIdentityWithThreshold(text string, target work.Work, titleThreshold fl
 		titleThreshold = 0.6
 	}
 	frontMatter := identityFrontMatter(text)
-	for _, line := range strings.Split(frontMatter, "\n") {
+	frontMatterLines := strings.Split(frontMatter, "\n")
+	for _, line := range frontMatterLines {
 		line = strings.ToLower(strings.TrimSpace(line))
 		for _, marker := range nonArticleMarkers {
 			if strings.HasPrefix(line, marker) {
@@ -59,13 +78,48 @@ func MatchIdentityWithThreshold(text string, target work.Work, titleThreshold fl
 			}
 		}
 	}
+	correctionMarker := correctionMarkerIn(frontMatterLines)
+	// A correction marker is diagnostic on every verdict a human will read, not
+	// only on the ones it downgrades: "comment on" at the top of page one is the
+	// first thing a reviewer wants to know, whatever else already withheld the
+	// pass. So both helpers carry it, and the cap survives a later change to the
+	// reasons a document reaches review by another route.
+	noteMarker := func(evidence []string) []string {
+		if correctionMarker == "" {
+			return evidence
+		}
+		return append(evidence, "front matter marks a correction or comment: "+correctionMarker)
+	}
+	capPass := func(evidence ...string) IdentityDecision {
+		if correctionMarker != "" {
+			return review(noteMarker(evidence)...)
+		}
+		return pass(evidence...)
+	}
+	capReview := func(evidence ...string) IdentityDecision {
+		return review(noteMarker(evidence)...)
+	}
 
+	// An identifier printed in the front matter is the strongest evidence
+	// these rules have, except against a page that announces itself as being
+	// about another work rather than being that work: an erratum reprints
+	// the requested paper's own DOI in its own masthead. That is the one
+	// shape a real library cannot measure — a library holds the paper, not
+	// the erratum about it — so the 460,352-pair corpus run
+	// (dev/identity-corpus.md) shows zero wrong accepts through this branch,
+	// while a hand-built 1508-byte correction notice that inlines the
+	// requested DOI passes it outright today. capPass, built from
+	// correctionMarker above, is what closes that gap: every pass in this
+	// function routes through it, and it downgrades to review instead of
+	// rejecting, because the operator may genuinely have requested the
+	// erratum, and discarding a candidate cannot be undone the way parking
+	// it for a human can.
 	wantDOI := normalizeDOI(target.DOI)
 	gotDOIs := documentDOIs(frontMatter)
 	if wantDOI != "" && len(gotDOIs) != 0 {
 		for _, gotDOI := range gotDOIs {
 			if gotDOI == wantDOI {
-				return pass("exact normalized DOI match: " + wantDOI)
+				return capPass("exact normalized DOI match: " + wantDOI)
 			}
 		}
 		return reject("document DOI does not match requested DOI", "document DOI: "+strings.Join(gotDOIs, ", "))
@@ -73,7 +127,7 @@ func MatchIdentityWithThreshold(text string, target work.Work, titleThreshold fl
 
 	tokens := identityTitleTokens(target.Title)
 	if len(tokens) == 0 {
-		return review("no usable requested DOI or title tokens")
+		return capReview("no usable requested DOI or title tokens")
 	}
 	byline := documentTokens(identityByline(text))
 	matches := 0
@@ -92,7 +146,7 @@ func MatchIdentityWithThreshold(text string, target work.Work, titleThreshold fl
 		// badly OCR'd first page whose title surfaces further in is a question
 		// for a human, not a verdict.
 		if elsewhere := countTokens(documentTokens(text), tokens); elsewhere >= need {
-			return review(fmt.Sprintf("title tokens matched only outside the front matter: %d/%d", elsewhere, len(tokens)))
+			return capReview(fmt.Sprintf("title tokens matched only outside the front matter: %d/%d", elsewhere, len(tokens)))
 		}
 		return reject(fmt.Sprintf("title token evidence insufficient: %d/%d", matches, need))
 	}
@@ -156,7 +210,7 @@ func MatchIdentityWithThreshold(text string, target work.Work, titleThreshold fl
 	// byline to agree on an author closes that, and still admits every reprint.
 	if corroboration := corroboratingIdentifier(text, target); corroboration != "" {
 		if authorOK {
-			return pass(append(evidence, corroboration)...)
+			return capPass(append(evidence, corroboration)...)
 		}
 		// The two-marker rule is unsatisfiable for a target that names ONE
 		// author: it reads a byline that marks EVERY surname, and with one
@@ -177,20 +231,38 @@ func MatchIdentityWithThreshold(text string, target work.Work, titleThreshold fl
 		// through a citation.
 		if numbered > 0 && len(target.Authors) == 1 {
 			if pageOne := corroboratingIdentifier(identityPageOne(text), target); pageOne != "" {
-				return pass(append(evidence, pageOne)...)
+				return capPass(append(evidence, pageOne)...)
 			}
 		}
 	}
 
 	switch {
 	case !authorOK && prefixed > 0:
-		return review(append(evidence, "only a prefix of one author's family name appears in the front matter")...)
+		return capReview(append(evidence, "only a prefix of one author's family name appears in the front matter")...)
 	case !authorOK:
-		return review(append(evidence, "no requested author family name in the front matter")...)
+		return capReview(append(evidence, "no requested author family name in the front matter")...)
 	case yearConflict:
-		return review(append(evidence, fmt.Sprintf("front matter is dated differently to the requested year %d", target.Year))...)
+		return capReview(append(evidence, fmt.Sprintf("front matter is dated differently to the requested year %d", target.Year))...)
 	}
-	return pass(evidence...)
+	return capPass(evidence...)
+}
+
+// correctionMarkerIn reports the first correctionMarkers entry that prefixes
+// a front-matter line, or "" if none does. It takes the lines the
+// nonArticleMarkers scan above already split out, rather than re-splitting
+// identityFrontMatter's text a second time, and mirrors that scan's shape —
+// strings.ToLower, strings.TrimSpace, strings.HasPrefix — even though its
+// result only caps a verdict here instead of rejecting one.
+func correctionMarkerIn(lines []string) string {
+	for _, line := range lines {
+		line = strings.ToLower(strings.TrimSpace(line))
+		for _, marker := range correctionMarkers {
+			if strings.HasPrefix(line, marker) {
+				return marker
+			}
+		}
+	}
+	return ""
 }
 
 func normalizeDOI(v string) string {

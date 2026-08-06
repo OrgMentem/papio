@@ -577,3 +577,144 @@ func TestIdentityReadsIdentifiersSeparatedByUnicodeSpaces(t *testing.T) {
 		t.Fatalf("result = %+v, want no-break and thin spaces to be ignored", got)
 	}
 }
+
+// The tests below pin the correction/comment guard. A correction, erratum, or
+// comment article is a DIFFERENT work from the paper it discusses, and it
+// routinely prints that paper's own DOI in its own front matter — a
+// synthetic 1508-byte correction notice demonstrated this against
+// IdentityPass before the guard existed. correctionMarkers names the shapes
+// a correction takes and is matched exactly like nonArticleMarkers above: a
+// case-folded LINE PREFIX over identityFrontMatter, and its presence caps the
+// verdict at IdentityReview no matter which path through
+// MatchIdentityWithThreshold would otherwise have returned IdentityPass.
+
+// Before this guard, the front-matter DOI rule was unconditional: it runs
+// before any title or author check at all, so an erratum notice printing the
+// original paper's DOI passed as the paper outright, and neither the
+// erratum's own title ("Erratum: …") nor its own byline ("Bob Clarke") ever
+// entered the decision. The fixture is 92 bytes — comfortably inside the
+// 1 KiB front-matter window the DOI rule reads — so the DOI genuinely sits in
+// the window this test means to exercise.
+func TestIdentityCapsAnErratumPrintingTheRequestedDOI(t *testing.T) {
+	target := work.Work{
+		DOI: "10.1234/cal.7", Year: 2025,
+		Title:   "Sensor Network Calibration Under Adverse Weather",
+		Authors: []string{"Priya Natarajan"},
+	}
+	erratum := "Erratum: Sensor Network Calibration Under Adverse Weather\nBob Clarke\n2025\ndoi:10.1234/cal.7\n"
+	got := MatchIdentity(erratum, target)
+	if got.Result != IdentityReview {
+		t.Fatalf("result = %+v, want review: an erratum is not the paper it corrects", got)
+	}
+	if !strings.Contains(strings.Join(got.Evidence, " "), "front matter marks a correction or comment: erratum") {
+		t.Fatalf("evidence = %v, want the correction marker named", got.Evidence)
+	}
+}
+
+// The same erratum, requested on purpose: its own title, its own author, its
+// own year, and no requested DOI to force the front-matter DOI branch, so
+// without the guard this clears title tokens, author, and year and reaches
+// the unconditional pass at the end of MatchIdentityWithThreshold. The guard
+// parks it anyway, and that is the intended cost of closing the door, not a
+// regression: a correction notice never auto-passes, because the one case it
+// cannot itself distinguish is being asked for the correction rather than the
+// paper it corrects, and that call is left to a human.
+func TestIdentityCapsTheErratumWhenItIsTheRequestedWork(t *testing.T) {
+	target := work.Work{
+		Title:   "Erratum: Sensor Network Calibration Under Adverse Weather",
+		Authors: []string{"Bob Clarke"},
+		Year:    2025,
+	}
+	erratum := "Erratum: Sensor Network Calibration Under Adverse Weather\nBob Clarke\n2025\ndoi:10.1234/cal.7\n"
+	got := MatchIdentity(erratum, target)
+	if got.Result != IdentityReview {
+		t.Fatalf("result = %+v, want review: a correction notice never auto-passes, even when requested", got)
+	}
+	if !strings.Contains(strings.Join(got.Evidence, " "), "front matter marks a correction or comment: erratum") {
+		t.Fatalf("evidence = %v, want the correction marker named", got.Evidence)
+	}
+}
+
+// A correction marker must never soften a wrong-document verdict into a
+// park: a correction notice whose front matter names a DIFFERENT DOI than
+// requested has to keep rejecting exactly as it did before the guard existed,
+// proving the DOI-mismatch reject still runs — and still wins — ahead of the
+// cap.
+func TestIdentityCorrectionMarkerDoesNotSoftenADOIMismatch(t *testing.T) {
+	target := work.Work{
+		DOI: "10.1234/cal.7", Year: 2025,
+		Title:   "Sensor Network Calibration Under Adverse Weather",
+		Authors: []string{"Priya Natarajan"},
+	}
+	erratum := "Erratum: Sensor Network Calibration Under Adverse Weather\nBob Clarke\n2025\ndoi:10.9999/other\n"
+	if got := MatchIdentity(erratum, target); got.Result != IdentityReject {
+		t.Fatalf("result = %+v, want the front-matter DOI mismatch to stand", got)
+	}
+}
+
+// The marker match is a line PREFIX, not a substring scan, so a real paper
+// that merely mentions a marker word mid-sentence — a Bonferroni statistical
+// correction, not an erratum about the paper itself — must keep passing
+// exactly as before. The list is deliberately narrow at its edges too:
+// "retraction of" is a marker because "Retraction of scientific papers: a
+// bibliometric study" is a correction-adjacent title that legitimately opens
+// a real paper, so that title is an accepted false-positive cost of the
+// guard, parked rather than passed. "response to" is deliberately absent
+// because "Response to Intervention" is a real educational framework, and a
+// paper titled that way must still pass undisturbed.
+func TestIdentityCorrectionMarkersAnchorAsLinePrefixes(t *testing.T) {
+	t.Run("mid-line mention is not a marker", func(t *testing.T) {
+		target := work.Work{Title: "Statistical Power Analysis for Clinical Trials", Authors: []string{"Alice Smith"}, Year: 2024}
+		text := "Statistical Power Analysis for Clinical Trials\nAlice Smith\n2024\n" +
+			"We applied a Bonferroni correction for multiple comparisons across all endpoints.\n"
+		if got := MatchIdentity(text, target); got.Result != IdentityPass {
+			t.Fatalf("result = %+v, want pass: \"correction\" mid-sentence is not the marker \"correction to\"/\"correction:\"", got)
+		}
+	})
+	t.Run("retraction of is a marker and parks its own title", func(t *testing.T) {
+		target := work.Work{Title: "Retraction of Scientific Papers: A Bibliometric Study", Authors: []string{"Jordan Lee"}, Year: 2022}
+		text := "Retraction of Scientific Papers: A Bibliometric Study\nJordan Lee\n2022\n"
+		got := MatchIdentity(text, target)
+		if got.Result != IdentityReview {
+			t.Fatalf("result = %+v, want review: \"retraction of\" is a marker even when it opens a genuine title, and that is an accepted cost", got)
+		}
+		if !strings.Contains(strings.Join(got.Evidence, " "), "front matter marks a correction or comment: retraction of") {
+			t.Fatalf("evidence = %v, want the correction marker named", got.Evidence)
+		}
+	})
+	t.Run("response to is deliberately not a marker", func(t *testing.T) {
+		target := work.Work{Title: "Response to Intervention in Australian Schools", Authors: []string{"Maria Gomez"}, Year: 2022}
+		text := "Response to Intervention in Australian Schools\nMaria Gomez\n2022\n"
+		if got := MatchIdentity(text, target); got.Result != IdentityPass {
+			t.Fatalf("result = %+v, want pass: \"response to\" is deliberately absent from the marker list", got)
+		}
+	})
+}
+
+// A comment article can cite the requested paper's DOI past the first form
+// feed rather than in its own front matter — "Comment on: <title>" clears the
+// title gate, the byline names a different author, and corroboratingIdentifier
+// still finds the DOI because it searches the whole document, not the
+// windowed front matter. That combination was already IdentityReview before
+// this guard existed, for the unrelated reason that no requested author
+// appears in the front matter, so this test asserts on the correction-marker
+// evidence specifically: it is the one part of the review that would silently
+// stop being true if those other reasons changed, and the marker evidence is
+// the seam the guard's implementation is measured against.
+func TestIdentityCorrectionMarkerNamedEvenWhenAlreadyReview(t *testing.T) {
+	target := work.Work{
+		DOI: "10.1234/abc.9", Year: 2026,
+		Title:   "Deterministic Validation of Scholarly Article Identity",
+		Authors: []string{"Ada Lovelace"},
+	}
+	text := "Comment on: Deterministic Validation of Scholarly Article Identity\nMallory Attacker\n2026\n" +
+		"This commentary discusses issues raised by the original publication.\n" +
+		"\fReferences\n10.1234/abc.9\n"
+	got := MatchIdentity(text, target)
+	if got.Result != IdentityReview {
+		t.Fatalf("result = %+v, want review", got)
+	}
+	if !strings.Contains(strings.Join(got.Evidence, " "), "front matter marks a correction or comment: comment on") {
+		t.Fatalf("evidence = %v, want the correction marker named even though the verdict was already review", got.Evidence)
+	}
+}
