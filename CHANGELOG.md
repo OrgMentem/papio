@@ -28,17 +28,21 @@ execution records in `notes/acquisition-stack-plan.md`.
   This is a breaking wire change to an existing message type, landed under the
   pre-1.0 compatibility floor now stated in `AGENTS.md`: daemon, extension, and
   JSON schema move together and the extension must be rebuilt and reloaded
-  alongside the daemon. Requested captures correlate only with extension
-  0.10.0 or newer; an older extension sends no id, so `papio adapter capture`
-  reports no path. Other handoff work is unaffected, so the daemon's own
-  extension floor does not move.
+  alongside the daemon. Correlation needs an extension of 0.10.0 or newer;
+  below that `papio adapter capture` now refuses up front, naming the connected
+  and required versions, rather than capturing the page and then reporting a
+  failure it did not have. Only adapter capture is version-coupled, so the
+  daemon's own extension floor does not move and every offer and handoff keeps
+  working with an older extension.
 - **The native host mirrors its diagnostics to `<DataDir>/native-host.log`.**
   Browsers forward a native-messaging host's stderr nowhere — not even into
   `chrome_debug.log` with logging enabled — so a host that rejected a frame and
   tore the session down left no trace, and the operator saw only a downstream
   `nav_failed` or a session that would not connect. Every diagnostic the host
-  writes, including the exact reason it exited, is now appended to that file
-  (truncated at 1 MiB on process start).
+  writes, including the exact reason it exited, is now appended to that file.
+  Past 1 MiB it rotates to `native-host.log.1` rather than truncating, so a
+  second host process — a service-worker reconnect, or Chrome and Firefox
+  connected at once — cannot discard the trace a live sibling is still writing.
 
 ### Fixed
 

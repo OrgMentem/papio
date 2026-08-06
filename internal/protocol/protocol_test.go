@@ -442,6 +442,24 @@ func TestPageCapturePayloadRoundTripAndValidation(t *testing.T) {
 			}
 		})
 	}
+
+	// The struct table above cannot express these: `omitempty` drops an empty
+	// string, so a present-but-empty field only exists on the wire. Both the
+	// TS parser and the schema reject "" (their charset bound has a minimum
+	// length), and an absent field is the only shape that means "unsolicited",
+	// so Go must not quietly treat "" as absence.
+	for _, field := range []string{"adapter_id", "request_id"} {
+		t.Run("empty "+field, func(t *testing.T) {
+			payload := map[string]any{
+				"host": valid.Host, "scenario": valid.Scenario,
+				"encoding": valid.Encoding, "bytes": valid.Bytes, "body": valid.Body,
+				field: "",
+			}
+			if _, err := DecodeBrowserMessage(frame("", payload)); err == nil {
+				t.Fatalf("page_capture with an empty %s was accepted", field)
+			}
+		})
+	}
 }
 
 func TestPageCaptureRequestRoundTripAndValidation(t *testing.T) {

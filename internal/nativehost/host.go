@@ -84,10 +84,13 @@ var errFrameTooLarge = errors.New("inbound frame exceeds size cap")
 // diagnostic is mirrored into.
 const diagLogName = "native-host.log"
 
-// maxDiagLogBytes bounds that file. It is truncated at process start once it
-// grows past this — these are disposable per-process diagnostics, not an
-// audit trail, so truncation beats rotation.
+// maxDiagLogBytes bounds that file. Past this it is rotated to
+// diagLogName+rotatedDiagLogSuffix at process start, keeping exactly one
+// previous generation — these are disposable diagnostics, not an audit trail.
 const maxDiagLogBytes = 1 << 20
+
+// rotatedDiagLogSuffix names the single retained previous generation.
+const rotatedDiagLogSuffix = ".1"
 
 // openDiagLog opens the native-host diagnostic log for appending.
 //
@@ -111,8 +114,18 @@ func openDiagLog(dataDir string) (*os.File, error) {
 		return nil, err
 	}
 	path := filepath.Join(dataDir, diagLogName)
+	// Rotate rather than truncate. Every native-messaging connection is its
+	// own host process, and an MV3 service-worker reconnect (or Chrome and
+	// Firefox connected at once) puts two of them on this file with
+	// overlapping lifetimes. Truncating the path would discard whatever a live
+	// sibling had already written — including the frame rejection that killed
+	// its session, which is the one line this whole mechanism exists to keep.
+	// A rename leaves that sibling's descriptor attached to the same inode, so
+	// its trace survives under the rotated name and stays readable. Both
+	// operations are best effort: a failed rotation just means this process
+	// appends to a slightly oversized log.
 	if info, err := os.Stat(path); err == nil && info.Size() > maxDiagLogBytes {
-		_ = os.Truncate(path, 0)
+		_ = os.Rename(path, path+rotatedDiagLogSuffix)
 	}
 	return os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 }

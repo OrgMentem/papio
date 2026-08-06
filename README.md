@@ -275,12 +275,19 @@ brew install orgmentem/tap/papio
 [GitHub releases](https://github.com/OrgMentem/papio/releases) and install it
 with `dpkg -i`, `rpm -i`, or `apk add --allow-untrusted`.
 
-**Scoop (Windows):**
+**Windows (Scoop or WinGet):**
 
-```bash
+```powershell
 scoop bucket add orgmentem https://github.com/OrgMentem/scoop-bucket
 scoop install papio
+
+# or, WinGet — trails releases, see below
+winget install OrgMentem.papio
 ```
+
+Scoop tracks releases directly. Each release also opens a pull request against
+`microsoft/winget-pkgs`, so WinGet serves a new version only once that PR
+merges — the index is currently well behind the current release line.
 
 **Prebuilt binaries:** every [GitHub release](https://github.com/OrgMentem/papio/releases)
 ships archives for macOS, Linux, and Windows (amd64/arm64) with cosign-signed

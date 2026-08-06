@@ -628,6 +628,41 @@ func TestUnsolicitedPageCaptureCannotSatisfyPendingRequest(t *testing.T) {
 		t.Fatal("capture result did not correlate")
 	}
 }
+
+// Correlating a capture needs the extension to echo request_id, which nothing
+// below CaptureRequestIDMinExtensionVersion does. Without this gate the
+// capture runs, the page is stored, pending.path stays empty, and the
+// page_capture_request_result handler rewrites "captured" into "nav_failed:
+// capture content was not stored" — a false failure for work that succeeded.
+// Refuse up front and name the reason instead. The global MinExtensionVersion
+// deliberately does NOT move for this, so the same old extension must still be
+// seated and serving handoffs.
+func TestCaptureRefusesAnExtensionThatCannotEchoRequestID(t *testing.T) {
+	b, _, _, _ := newBridge(t)
+	runSync(t, b, helloAs("0.9.0"))
+
+	result := b.Capture(context.Background(), CaptureRequest{
+		URL: "https://sagepub.com/article/42", Provider: "sage", Scenario: "success",
+	})
+	if result.Outcome != "not_permitted" {
+		t.Fatalf("capture outcome = %q, want not_permitted", result.Outcome)
+	}
+	if !strings.Contains(result.Detail, "0.9.0") ||
+		!strings.Contains(result.Detail, CaptureRequestIDMinExtensionVersion) {
+		t.Fatalf("detail = %q, want both the connected and required versions named", result.Detail)
+	}
+
+	b.mu.Lock()
+	pendingCount := len(b.pendingCaptures)
+	seated := b.holder != nil && !b.holder.Outdated
+	b.mu.Unlock()
+	if pendingCount != 0 {
+		t.Fatalf("pendingCaptures = %d after a refused capture, want 0", pendingCount)
+	}
+	if !seated {
+		t.Fatal("the refused extension lost the bridge; the capture floor must not act as MinExtensionVersion")
+	}
+}
 func TestJobScopedPageCaptureRecordsEvent(t *testing.T) {
 	b, jobs, _, _ := newBridge(t)
 	ctx := context.Background()

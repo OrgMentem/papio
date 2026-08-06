@@ -1389,8 +1389,19 @@ func DecodeBrowserMessage(data []byte) (*BrowserMessage, error) {
 			err = strictDecode(env.Payload, p)
 		}
 		if err == nil {
-			if _, ok := payloadFields["adapter_id"]; ok && p.AdapterID == "" {
-				err = fmt.Errorf("page_capture.adapter_id must use the id charset (max 64)")
+			// A present-but-empty string is not the same wire shape as an
+			// absent field, and only the absent form means "unsolicited". Both
+			// the TS parser and the schema reject "" (their charset bound has
+			// a minimum length), so accepting it here would let the two
+			// implementations disagree on the same frame.
+			for _, field := range [...]struct {
+				name  string
+				value string
+			}{{"adapter_id", p.AdapterID}, {"request_id", p.RequestID}} {
+				if _, ok := payloadFields[field.name]; ok && field.value == "" {
+					err = fmt.Errorf("page_capture.%s must not be empty when present", field.name)
+					break
+				}
 			}
 		}
 		if err == nil {

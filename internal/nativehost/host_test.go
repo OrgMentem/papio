@@ -451,7 +451,9 @@ func TestDiagLogAppendsAcrossProcessesAndBoundsItself(t *testing.T) {
 	}
 
 	// Unbounded appending would grow forever across a browser's lifetime, so a
-	// log past the cap is truncated at the next start rather than rotated.
+	// log past the cap rotates at the next start. Rotation rather than
+	// truncation is what keeps a concurrent sibling host's in-progress trace:
+	// its descriptor follows the inode under the rotated name.
 	if err := os.WriteFile(path, make([]byte, maxDiagLogBytes+1), 0o600); err != nil {
 		t.Fatalf("grow log: %v", err)
 	}
@@ -467,7 +469,15 @@ func TestDiagLogAppendsAcrossProcessesAndBoundsItself(t *testing.T) {
 		t.Fatalf("stat log: %v", err)
 	}
 	if info.Size() != 0 {
-		t.Fatalf("log size = %d after exceeding the cap, want 0", info.Size())
+		t.Fatalf("log size = %d after exceeding the cap, want a fresh file", info.Size())
+	}
+	rotated, err := os.Stat(path + rotatedDiagLogSuffix)
+	if err != nil {
+		t.Fatalf("stat rotated log: %v", err)
+	}
+	if rotated.Size() != maxDiagLogBytes+1 {
+		t.Fatalf("rotated log size = %d, want the whole previous generation (%d)",
+			rotated.Size(), maxDiagLogBytes+1)
 	}
 }
 

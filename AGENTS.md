@@ -188,24 +188,34 @@ Bump the pinned zensical version in `docs/requirements.txt` deliberately; CI ins
   added as a new message type for exactly this reason; putting a `version` field on
   `triage_snapshot_response` instead would have broken every shipped extension.
 
-  That mechanism is still real, but papio is pre-1.0 with zero external installs, so it is
-  not an absolute prohibition: a breaking change to `papio-browser/1` **is allowed** when
+  That mechanism is still real, but the exception is not a standing fact of being pre-1.0 —
+  it is gated on *verified* zero installs, checked before relying on it: the AMO API
+  (`https://addons.mozilla.org/api/v5/addons/addon/papio@orgmentem.com/`,
+  `average_daily_users`) and the Chrome Web Store listing's user count. Both read zero as of
+  2026-08-06. While that holds, a breaking change to `papio-browser/1` **is allowed** when
   `internal/protocol/protocol.go`, `extension/src/protocol.ts`, and
   `protocol/browser-v1.schema.json` all land in the **same commit**, and the extension is
   rebuilt and reloaded alongside the daemon (`make dev-deploy` now rebuilds the extension for
-  you — see the Makefile). Negotiation (`schema_versions` on
-  `triage_snapshot_request/response`, feature flags like `page_capture_terms_v1`) is not
-  going away; it becomes *required* rather than optional the moment a build ships to a real
-  user. Until then, this floor removes the compatibility burden but **not the deploy
-  burden**: this machine still runs two `papio` binaries (see the daemon-IPC note above) and
-  can have a stale extension loaded in Chrome or Firefox, so skew between daemon, host, and
-  extension is still the default local failure — `make dev-deploy` only closes the binary
-  side of it, you still reload the extension yourself.
+  you — see the Makefile). The extension is publicly listed on the Chrome Web Store and AMO,
+  so this is a fact with an expiry date, not a permanent one: the first real install ends the
+  exception, and it can happen without anyone noticing — store extensions auto-update while
+  daemons update by hand, so the skew becomes real the moment anyone installs. The release
+  runbook's standing rule covers that post-install world: the extension must tolerate old
+  daemons, and `hello_ack` feature flags are the mechanism — this release's sibling
+  `page_capture_terms_v1` capability is the worked example of doing it the gated way. Until
+  then, this floor removes the compatibility burden but **not the deploy burden**: this
+  machine still runs two `papio` binaries (see the daemon-IPC note above) and can have a
+  stale extension loaded in Chrome or Firefox, so skew between daemon, host, and extension is
+  still the default local failure — `make dev-deploy` only closes the binary side of it, you
+  still reload the extension yourself.
 - **`internal/nativehost/host.go` mirrors every stderr diagnostic to
-  `<DataDir>/native-host.log`** (constant `diagLogName`), truncated to 1 MiB by
-  `openDiagLog` at process start. That's the first thing to read when a host dies
-  mid-session — before resorting to driving it by hand (see "Chrome forwards native-host
-  stderr nowhere" below).
+  `<DataDir>/native-host.log`** (constant `diagLogName`). Past 1 MiB `openDiagLog` rotates
+  it to `native-host.log.1` at process start rather than truncating — two host processes
+  share this file whenever a service worker reconnects or Chrome and Firefox are both
+  connected, and a rename leaves a live sibling's descriptor on the same inode instead of
+  discarding the trace it is still writing. That pair of files is the first thing to read
+  when a host dies mid-session — before resorting to driving it by hand (see "Chrome
+  forwards native-host stderr nowhere" below).
 - Per-institution offer fields (`login_entity_id`, `proquest_account_id`) are sent **only
   for the default resolver profile** (`row.Policy.Resolver == "" || "default"`) in
   `internal/browser/bridge.go` `offer()` — sending them for a `institute` job would mis-route

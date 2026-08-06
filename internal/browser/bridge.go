@@ -81,6 +81,17 @@ const (
 // disconnects the whole session, so the frame is withheld below this floor.
 const HandoffFocusMinExtensionVersion = "0.8.0"
 
+// CaptureRequestIDMinExtensionVersion is the first extension that echoes
+// page_capture.request_id. Below it the daemon cannot bind a content frame to
+// the request that asked for it, so pageCapture leaves pending.path empty and
+// the page_capture_request_result handler rewrites a genuine "captured" into
+// "nav_failed: capture content was not stored" — reporting failure for a page
+// that was captured and stored. Refuse the capture up front instead: a named
+// refusal beats a false failure, and this is a per-feature floor rather than a
+// MinExtensionVersion bump on purpose, because an older extension still runs
+// every offer and handoff correctly. Only adapter capture is version-coupled.
+const CaptureRequestIDMinExtensionVersion = "0.10.0"
+
 // ErrInvalidFrame marks a client-side protocol violation (a frame that fails
 // strict decode, arrives before hello, or is not a legal inbound type). The RPC
 // layer maps it to invalid_argument; other Sync errors are internal.
@@ -557,6 +568,15 @@ func (b *Bridge) Capture(ctx context.Context, request CaptureRequest) CaptureRes
 	if b.holder == nil || b.holder.Outdated || now.Sub(b.holder.LastSyncAt) > sessionStaleAfter {
 		b.mu.Unlock()
 		return CaptureResult{Outcome: "not_permitted", Detail: "no compatible browser session is connected"}
+	}
+	if compareVersion(b.holder.ExtensionVersion, CaptureRequestIDMinExtensionVersion) < 0 {
+		version := b.holder.ExtensionVersion
+		b.mu.Unlock()
+		return CaptureResult{
+			Outcome: "not_permitted",
+			Detail: fmt.Sprintf("browser extension %s cannot correlate a capture; update to %s or newer",
+				version, CaptureRequestIDMinExtensionVersion),
+		}
 	}
 	sessionID := b.holder.ID
 	if _, exists := b.pendingCaptures[sessionID]; exists {

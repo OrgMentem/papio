@@ -41,14 +41,31 @@ papis, a plain folder, or your own script through a best-effort
 
 === "Windows"
 
+    **Scoop** — recommended: it tracks releases the moment they're tagged, so
+    it's always current:
+
     ```powershell
     scoop bucket add orgmentem https://github.com/OrgMentem/scoop-bucket
     scoop install papio               # scoop update papio tracks new releases
     scoop install poppler tesseract   # PDF validation + OCR
     ```
 
-    !!! note "WinGet is on the way"
-        A `winget install OrgMentem.papio` manifest is pending review in `microsoft/winget-pkgs`. Until it lands, use Scoop or a prebuilt archive.
+    **WinGet** — ships with Windows 10 and 11, but see the note below:
+
+    ```powershell
+    winget install OrgMentem.papio
+    winget install oschwartz10612.Poppler        # PDF validation
+    winget install UB-Mannheim.TesseractOCR      # OCR (optional)
+    ```
+
+    !!! note "WinGet's index lags the current release"
+        Every papio release opens a pull request against `microsoft/winget-pkgs`,
+        and WinGet serves a new version only once that PR merges. The index is
+        currently well behind the current release line, so a WinGet install can be
+        several versions old, and `winget upgrade OrgMentem.papio` only helps once a
+        newer manifest has merged. If you need the current version — including when
+        the browser extension reports the daemon is out of date — use Scoop or the
+        prebuilt archive below instead.
 
 === "Prebuilt binary"
 
