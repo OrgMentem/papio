@@ -41,8 +41,8 @@ papis, a plain folder, or your own script through a best-effort
 
 === "Windows"
 
-    **Scoop** — recommended: it tracks releases the moment they're tagged, so
-    it's always current:
+    **Scoop** — recommended: it tracks releases directly, so it is current the
+    moment one is tagged:
 
     ```powershell
     scoop bucket add orgmentem https://github.com/OrgMentem/scoop-bucket
@@ -50,7 +50,7 @@ papis, a plain folder, or your own script through a best-effort
     scoop install poppler tesseract   # PDF validation + OCR
     ```
 
-    **WinGet** — ships with Windows 10 and 11, but see the note below:
+    **WinGet** — ships with Windows 10 and 11, but trails a release; see the note below:
 
     ```powershell
     winget install OrgMentem.papio
@@ -58,14 +58,14 @@ papis, a plain folder, or your own script through a best-effort
     winget install UB-Mannheim.TesseractOCR      # OCR (optional)
     ```
 
-    !!! note "WinGet's index lags the current release"
+    !!! note "WinGet trails a release"
         Every papio release opens a pull request against `microsoft/winget-pkgs`,
-        and WinGet serves a new version only once that PR merges. The index is
-        currently well behind the current release line, so a WinGet install can be
-        several versions old, and `winget upgrade OrgMentem.papio` only helps once a
-        newer manifest has merged. If you need the current version — including when
-        the browser extension reports the daemon is out of date — use Scoop or the
-        prebuilt archive below instead.
+        and WinGet serves the new version only once that PR merges — so it lands
+        after the tag, and `winget upgrade OrgMentem.papio` finds nothing until
+        then. That matters more here than for most tools: the browser extension
+        enforces a minimum daemon version, so a daemon far enough behind makes the
+        popup report that papio is out of date. If you see that, or you want
+        releases as they land, use Scoop or the prebuilt archive below.
 
 === "Prebuilt binary"
 

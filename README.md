@@ -287,7 +287,7 @@ winget install OrgMentem.papio
 
 Scoop tracks releases directly. Each release also opens a pull request against
 `microsoft/winget-pkgs`, so WinGet serves a new version only once that PR
-merges — the index is currently well behind the current release line.
+merges — it trails a fresh tag by however long that review takes.
 
 **Prebuilt binaries:** every [GitHub release](https://github.com/OrgMentem/papio/releases)
 ships archives for macOS, Linux, and Windows (amd64/arm64) with cosign-signed
