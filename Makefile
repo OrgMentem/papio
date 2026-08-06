@@ -51,7 +51,14 @@ hooks:
 # Usage: make dev-deploy            (installs to ~/.local/bin/papio)
 #        make dev-deploy DEV_BIN=/custom/path/papio
 DEV_BIN ?= $(HOME)/.local/bin/papio
-DEV_VERSION ?= $(shell git describe --tags --abbrev=0 --match 'v*' 2>/dev/null | sed 's/^v//')-dev.$(shell git rev-parse --short HEAD)
+# Stamp the NEXT patch as a prerelease (v0.18.0 -> 0.18.1-dev.<sha>), never the
+# released tag itself. `0.18.0-dev.<sha>` is semver-LOWER than `0.18.0`, and the
+# extension's MIN_DAEMON_VERSION floor (extension/src/background.ts) compares
+# prereleases: stamping the tag made every post-release dev build report
+# `daemon_outdated`, which silently disables every gated capability
+# (page capture, triage snapshots, activity feed, session evidence) while
+# `papio doctor` still prints "extension connected".
+DEV_VERSION ?= $(shell git describe --tags --abbrev=0 --match 'v*' 2>/dev/null | sed 's/^v//' | awk -F. '{print $$1"."$$2"."$$3+1}')-dev.$(shell git rev-parse --short HEAD)
 
 dev-deploy:
 	@# Build BOTH extension bundles (Chrome dist/ + Firefox firefox/) before touching the
