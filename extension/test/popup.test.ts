@@ -1115,6 +1115,7 @@ test("session status lines omit degenerate probe detail and retain real evidence
         likelyAuthenticated: false,
         pausedForReauth: false,
         lastProbeAt: now,
+        dirtySince: null,
       },
       {
         origin: uwaOrigin,
@@ -1127,6 +1128,7 @@ test("session status lines omit degenerate probe detail and retain real evidence
         likelyAuthenticated: false,
         pausedForReauth: false,
         lastProbeAt: now,
+        dirtySince: null,
       },
     ],
   });
@@ -1169,6 +1171,7 @@ test("renders independent multi-origin session rows and targets each sign-in ori
         likelyAuthenticated: false,
         pausedForReauth: false,
         lastProbeAt: now,
+        dirtySince: null,
       },
       {
         origin: uwaOrigin,
@@ -1181,6 +1184,7 @@ test("renders independent multi-origin session rows and targets each sign-in ori
         likelyAuthenticated: false,
         pausedForReauth: false,
         lastProbeAt: now,
+        dirtySince: null,
       },
     ],
   };
@@ -1242,6 +1246,7 @@ test("a calm warm session renders no institution card at all", () => {
       likelyAuthenticated: false,
       pausedForReauth: false,
       lastProbeAt: now,
+      dirtySince: null,
     }],
   });
   // Quiet means live: a warm, freshly-verified session with nothing waiting
@@ -1279,6 +1284,7 @@ test("a calm warm session renders no institution card at all", () => {
       likelyAuthenticated: false,
       pausedForReauth: false,
       lastProbeAt: now - stale,
+      dirtySince: null,
     }],
   });
   expect(staleDoc.getElementById("institution-session")?.hidden).toBe(false);
@@ -1375,6 +1381,7 @@ test("a release notice keeps the card with a warm summary, never a bare heading"
       likelyAuthenticated: false,
       pausedForReauth: false,
       lastProbeAt: now,
+      dirtySince: null,
     }],
   });
   expect(doc.getElementById("institution-session")?.hidden).toBe(false);

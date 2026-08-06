@@ -912,6 +912,7 @@ class FakeBackend implements StateBackend {
 class FakeTabs {
   readonly onUpdated = new FakeEmitter<[number, TabChangeInfo, TabInfo]>();
   readonly onRemoved = new FakeEmitter<[number, { isWindowClosing: boolean }]>();
+  readonly onActivated = new FakeEmitter<[{ tabId: number; windowId: number }]>();
   readonly live = new Map<number, TabInfo>();
   nextId = 200;
   async create(props: { url: string; active: boolean }): Promise<TabInfo> {

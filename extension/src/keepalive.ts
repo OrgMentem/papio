@@ -111,6 +111,10 @@ export interface KeepaliveOriginSnapshot {
   checking: boolean;
   likelyAuthenticated: boolean;
   pausedForReauth: boolean;
+  /** Epoch ms when an external signal said this origin's evidence may be
+   * obsolete, cleared when a probe commits. Durable so a worker that dies
+   * before probing still knows to look on the next wake. */
+  dirtySince: number | null;
 }
 
 export interface KeepaliveSnapshot {
@@ -461,6 +465,26 @@ export const SESSION_STALE_MS = 2 * 60_000;
  * this the scan is reported as "partial_scan" rather than silently guessing. */
 export const MAX_OBSERVED_TABS_PER_ORIGIN = 5;
 const ON_DEMAND_PROBE_BUDGET_MS = 1_400;
+/** Minimum spacing between probe STARTS for one origin. Not a freshness gate:
+ * it never asks whether the previous verdict is good enough, it only limits
+ * how often papio may inject into the operator's library tab. The newest
+ * pending generation always runs. */
+export const MIN_PROBE_START_SPACING_MS = 10_000;
+/** Operator-initiated probes (popup open, the Sign in button) get a shorter
+ * floor than automatic triggers. The throttle exists to bound how often papio
+ * injects into the operator's library page, and an explicit request is already
+ * rate-limited by a human hand; holding one behind the full automatic floor
+ * would put a ten-second staleness window on exactly the interaction this work
+ * exists to fix — the operator signs in, reopens the popup, and expects papio
+ * to have noticed. Two seconds still bounds a pathologically cycled popup at
+ * the same 30 starts/minute ceiling as five observed tabs on the automatic
+ * path. */
+export const MIN_FOREGROUND_PROBE_SPACING_MS = 2_000;
+/** Bounds one admitted probeOrigin() attempt so a wedged tabs./scripting
+ * call cannot hold an origin's in-flight slot open forever — that would
+ * starve every later trigger's trailing probe indefinitely. Independent of
+ * probeForeground()'s budgetMs, which only bounds the CALLER's wait. */
+const PROBE_ADMISSION_DEADLINE_MS = 20_000;
 
 function normalizeHttpsOrigin(raw: unknown, allowWildcardHost = false): string | undefined {
   if (typeof raw !== "string" || raw.length === 0) return undefined;
@@ -517,31 +541,120 @@ export function resolverOriginsFromPermissionPatterns(
 /** Result of one pure inspection of one tab. Never written anywhere:
  * probeOrigin() reduces a batch of these into exactly one committed
  * verdict. `kind` "off_origin"/"auth_url" cover the URL-shape checks that
- * precede marker scanning; `verdict` is present only for kind "verdict". */
+ * precede marker scanning; `verdict` is present only for kind "verdict".
+ * "stale" means the tab's document changed under the scan (its per-tab
+ * epoch moved, or its URL no longer matches once re-checked afterward) —
+ * reduceObservations must treat it as absent evidence, never as
+ * "no_markers": a document we can no longer vouch for said nothing. */
 interface TabObservation {
   tabID: number;
   /** True when this is the manager's own resolver-origin tab. */
   owned: boolean;
-  kind: "verdict" | "no_markers" | "scan_failed" | "no_tab" | "off_origin" | "auth_url";
+  kind: "verdict" | "no_markers" | "scan_failed" | "no_tab" | "off_origin" | "auth_url" | "stale";
   verdict?: "in" | "out";
+}
+
+/** Every place a probe can originate. Commit C gates release authority on
+ * this; here it only picks the log-worthy label and travels unchanged
+ * through requestProbe() -> probeOrigin(). */
+type ProbeReason = "foreground" | "cycle" | "reauth" | "navigation" | "activation" | "wake";
+
+/** Operator-initiated requests get a shorter admission floor than automatic
+ * ones. "foreground" — probeForeground()'s own reason — is the only
+ * ProbeReason an operator action can produce here: openReauth() never calls
+ * requestProbe() directly, it only creates/updates the owned tab, so its
+ * eventual recheck always arrives later as a "reauth"/"cycle" tick. Every
+ * other reason is automatic and keeps the full MIN_PROBE_START_SPACING_MS
+ * floor. */
+function spacingFloorFor(reason: ProbeReason): number {
+  return reason === "foreground" ? MIN_FOREGROUND_PROBE_SPACING_MS : MIN_PROBE_START_SPACING_MS;
+}
+
+/** One coalesced, not-yet-started probe request for an origin: the newest
+ * reason/preferredTabID always overwrites the previous ones, and every
+ * caller that piled on while waiting resolves off the SAME promise once the
+ * eventual trailing probe (whichever one actually runs) settles. */
+interface PendingProbeState {
+  reason: ProbeReason;
+  preferredTabID: number | undefined;
+  promise: Promise<void>;
+  resolve: () => void;
 }
 
 
 /**
  * Maintains at most one resolver-origin tab while active handoffs exist.
  *
- * A single injected one-shot timer is used instead of setInterval: it lets the
- * MV3 service worker schedule the next operation only after the previous one
- * has finished, and keeps every transition deterministic under test.
+ * Four independent timer kinds replace the single one-shot timer this class
+ * used to multiplex: `cycleTimer` (the periodic owned-tab reload/observe
+ * loop, driven by an absolute due time so repeated external sync() calls can
+ * never postpone it), `reauthTimer` (the paused-tab recheck loop),
+ * `settleTimers` (one per origin, letting a just-navigated resolver SPA
+ * render before it is probed), and `spacingTimers` (one per origin, the
+ * trailing-probe delay a throttled requestProbe() defers behind). Firing or
+ * clearing any one of the four must never touch another — each owns its own
+ * field/Map and only the methods named after it may write to it. Every
+ * probe — foreground, navigation, activation, cycle, reauth, or a recovery
+ * wake — funnels through requestProbe(), which admits at most one in-flight
+ * probe per origin and throttles probe STARTS to MIN_PROBE_START_SPACING_MS
+ * apart for automatic triggers, or MIN_FOREGROUND_PROBE_SPACING_MS for an
+ * operator-initiated one.
  */
 export class KeepaliveManager {
-  private timer: unknown | undefined;
+  private cycleTimer: unknown | undefined;
+  /** Absolute epoch ms the pending cycleTimer is armed for. Undefined
+   * exactly when cycleTimer is undefined. */
+  private nextCycleDueAt: number | undefined;
+  /** Epoch ms the owned-tab cycle last actually ran — a cycleTimer firing,
+   * or a fresh tab creation/adoption — never "now" at the moment some
+   * unrelated caller happens to invoke reconcile()/onObserve()/onReload().
+   * Those three compute the NEXT due time as `lastCycleRunAt + intervalMs()`
+   * so a heartbeat re-entering reconcile() between two real cycle steps
+   * recomputes the SAME due time, and scheduleCycle()'s "no later than"
+   * check leaves the pending timer alone instead of pushing the reload out
+   * another full interval. This is the fix for the papio-keepalive alarm
+   * (running every ~60s) starving the 4-minute reload forever. */
+  private lastCycleRunAt = 0;
+  /** Single slot for "recheck the paused owned tab again soon". Armed by
+   * pauseForReauth() itself so an explicit openReauth() pause takes effect
+   * within observeMs instead of inheriting whatever cycleTimer happened to
+   * already be pending — up to a full interval away. */
+  private reauthTimer: unknown | undefined;
+  /** Post-navigation "let the SPA render its header and mint a session
+   * token" delay, one per origin so two origins' navigations can never
+   * cancel each other. */
+  private readonly settleTimers = new Map<string, unknown>();
+  /** One per origin: the trailing-probe delay a throttled requestProbe()
+   * defers behind. `dueAt` is the absolute epoch ms the timer is armed for,
+   * tracked alongside the handle so a later deferral for the SAME origin
+   * but a shorter floor (an operator request arriving after an automatic
+   * one was already deferred) can pull the timer earlier — never later,
+   * never cancel it outright. Kept in its own Map rather than reusing
+   * settleTimers: by the time a spacing defer needs a timer, whatever
+   * settle timer led here has already fired (a settle timer's whole job is
+   * to call requestProbe(), which is what triggers a spacing defer), so
+   * the two never actually contend for the same slot — but a dedicated Map
+   * means a future caller can never accidentally clobber one while
+   * intending the other. */
+  private readonly spacingTimers = new Map<string, { timer: unknown; dueAt: number }>();
   private tabID: number | undefined;
   private resolver: URL | undefined;
   private persistedResolverOrigin: string | undefined;
   private grantedResolverOrigin: string | undefined;
   private grantedResolverOrigins: string[] = [];
   private readonly originStates = new Map<string, KeepaliveOriginSnapshot>();
+  /** Per-tab "which document is this" counter. Bumped on every navigation
+   * noteResolverNavigation() is told about, dropped on tab removal. An
+   * observeTab() scan spans an awaited executeScript(); without this, an
+   * injected result can resolve against a document the tab has already
+   * navigated away from, and nothing about the shape of the result reveals
+   * that — a stale sign-out page and a stale sign-in page look identical to
+   * a scan that only ever sees the markers it was handed back. */
+  private readonly tabDocumentEpochs = new Map<number, number>();
+  /** Last known-resolver-origin a tab was observed on. Lets a navigation
+   * AWAY from a resolver (to an IdP, most commonly) mark that origin dirty
+   * without ever recording the IdP's own origin anywhere. */
+  private readonly tabResolverOrigins = new Map<number, string>();
   private intervalMinutes = DEFAULT_INTERVAL_MINUTES;
   private enabled = true;
   private reauthPaused = false;
@@ -553,9 +666,21 @@ export class KeepaliveManager {
   private lastProbeAt: number | undefined;
   private checking = false;
   private likelyAuthenticated = false;
-  /** Per-origin dedupe for probeForeground(): concurrent callers requesting
-   * the same origin join the same attempt instead of starting a second one. */
-  private readonly probesInFlight = new Map<string, Promise<void>>();
+  /** Per-origin admission control for requestProbe(): every probe request —
+   * foreground, navigation, activation, cycle, reauth, wake — funnels
+   * through requestProbe(), which uses these three to decide whether to
+   * start immediately, queue behind an in-flight attempt, or defer behind
+   * the MIN_PROBE_START_SPACING_MS throttle. */
+  private readonly probeInFlight = new Map<string, Promise<void>>();
+  private readonly pendingProbes = new Map<string, PendingProbeState>();
+  private readonly lastProbeStartedAt = new Map<string, number>();
+  /** Every origin-state write is chained after the previous one and reads
+   * the CURRENT map only once it is actually its turn to run, so a burst of
+   * synchronous patches (a probe's likelyAuthenticated flip, then its
+   * verdict commit) coalesces into whichever write runs last — never an
+   * interleaved, reordered chrome.storage.set that could resurrect an older
+   * snapshot over a newer one. Mirrors BrowserBridge.saveChain. */
+  private persistChain: Promise<void> = Promise.resolve();
   /** Shared in-flight promise for createTabOnce(). sync() now runs from
    * every triage-counts response as well as the onObserve/onReload timers,
    * so reconcile/onObserve/onReload can each independently see
@@ -619,6 +744,7 @@ export class KeepaliveManager {
       checking: false,
       likelyAuthenticated: false,
       pausedForReauth: false,
+      dirtySince: null,
     };
   }
 
@@ -642,30 +768,34 @@ export class KeepaliveManager {
     origin: string | undefined,
     patch: Partial<KeepaliveOriginSnapshot>,
     clearProbeOutcome = false,
-  ): void {
-    if (origin === undefined) return;
+  ): Promise<void> {
+    if (origin === undefined) return Promise.resolve();
     const normalized = normalizeHttpsOrigin(origin);
-    if (normalized === undefined) return;
+    if (normalized === undefined) return Promise.resolve();
     const current = this.originStates.get(normalized) ?? this.defaultOriginSnapshot(normalized);
     const next = { ...current, ...patch, origin: normalized };
     if (clearProbeOutcome) delete next.lastProbeOutcome;
     this.originStates.set(normalized, next);
-    this.persistOriginStates();
+    return this.persistOriginStates();
   }
 
   /** Guards the persist path during startup: an early snapshot update must
    * not overwrite stored evidence before loadPreferences has restored it. */
   private originStatesRestored = false;
 
-  private persistOriginStates(): void {
-    if (!this.originStatesRestored) return;
-    const save = this.api.storage.set?.({
-      [KEEPALIVE_ORIGIN_STATES_KEY]: [...this.originStates.values()].map((snapshot) => ({
-        ...snapshot,
-        checking: false,
-      })),
+  private persistOriginStates(): Promise<void> {
+    if (!this.originStatesRestored) return Promise.resolve();
+    const write = this.persistChain.then(() => {
+      const values = {
+        [KEEPALIVE_ORIGIN_STATES_KEY]: [...this.originStates.values()].map((snapshot) => ({
+          ...snapshot,
+          checking: false,
+        })),
+      };
+      return this.api.storage.set?.(values) ?? Promise.resolve();
     });
-    if (save !== undefined) void save.catch(() => {});
+    this.persistChain = write.catch(() => {});
+    return write;
   }
 
   private restoreOriginStates(raw: unknown): void {
@@ -681,7 +811,8 @@ export class KeepaliveManager {
       if (existing !== undefined && existing.lastProbeAt !== null) continue;
       // Restored evidence keeps its original timestamps: freshness gates in
       // the popup decide how much to trust it, never a worker restart.
-      this.originStates.set(origin, { ...snapshot, origin, checking: false });
+      const dirtySince = typeof snapshot.dirtySince === "number" ? snapshot.dirtySince : null;
+      this.originStates.set(origin, { ...snapshot, origin, checking: false, dirtySince });
     }
   }
 
@@ -763,10 +894,13 @@ export class KeepaliveManager {
   /** Probe every known resolver origin, or one specific origin, right now.
    * No freshness gate: this always (re)probes, unlike the prior on-demand
    * check — SESSION_STALE_MS is a display-trust budget for the popup,
-   * never a probe gate. Concurrent callers for the same origin join the
-   * same attempt via probesInFlight; the browser-API work always runs to
-   * completion, only the CALLER's wait is bounded by budgetMs so a
-   * foreground popup request never blocks past the MV3 budget. */
+   * never a probe gate. Every request — including this one — funnels
+   * through requestProbe()'s per-origin admission control, so a foreground
+   * call moments after another probe for the same origin may be deferred
+   * behind MIN_PROBE_START_SPACING_MS rather than starting immediately; the
+   * browser-API work always runs to completion, only the CALLER's wait is
+   * bounded by budgetMs so a foreground popup request never blocks past the
+   * MV3 budget. */
   async probeForeground(origin?: string, budgetMs = ON_DEMAND_PROBE_BUDGET_MS): Promise<void> {
     await this.loadPreferences();
     const configured =
@@ -781,12 +915,10 @@ export class KeepaliveManager {
           )
         : this.originCandidates();
 
-    const work = Promise.all(targets.map((target) => this.probeOriginJoined(target))).then(() => {});
+    const work = Promise.all(targets.map((target) => this.foregroundProbe(target))).then(() => {});
     const boundedBudget = Math.min(1_500, Math.max(0, Math.trunc(budgetMs)));
-    let timeout: ReturnType<typeof setTimeout> | undefined;
-    const deadline = new Promise<void>((resolve) => {
-      timeout = setTimeout(resolve, boundedBudget);
-    });
+    const { promise: deadline, resolve: resolveDeadline } = Promise.withResolvers<void>();
+    const timeout = setTimeout(resolveDeadline, boundedBudget);
     try {
       await Promise.race([work, deadline]);
     } finally {
@@ -794,39 +926,167 @@ export class KeepaliveManager {
     }
   }
 
-  /** Join an in-flight probeOrigin() for this origin, or start one.
-   * `checking` is owned entirely here: probeOrigin() itself never touches
-   * it, so a "cycle"/"reauth" call (which bypasses this dedupe) never
-   * flips it and never collides with a concurrent foreground probe's flag. */
-  private probeOriginJoined(origin: string): Promise<void> {
-    const inFlight = this.probesInFlight.get(origin);
-    if (inFlight !== undefined) return inFlight;
+  /** `checking` is owned entirely here: requestProbe()/probeOrigin() never
+   * touch it, so a "cycle"/"reauth"/"navigation"/etc. request never flips it
+   * and never collides with a concurrent foreground probe's flag. */
+  private async foregroundProbe(origin: string): Promise<void> {
     if (origin === this.resolver?.origin) this.checking = true;
-    this.updateOriginSnapshot(origin, { checking: true });
-    const attempt = this.probeOrigin(origin, "foreground").finally(() => {
-      this.probesInFlight.delete(origin);
+    void this.updateOriginSnapshot(origin, { checking: true });
+    try {
+      await this.requestProbe(origin, "foreground");
+    } finally {
       if (origin === this.resolver?.origin) {
         this.checking = false;
         this.likelyAuthenticated = false;
       }
-      this.updateOriginSnapshot(origin, { checking: false, likelyAuthenticated: false });
+      void this.updateOriginSnapshot(origin, { checking: false, likelyAuthenticated: false });
+    }
+  }
+
+  /** Single funnel for every probe trigger — foreground, navigation,
+   * activation, cycle, reauth, wake. An in-flight probe for the origin
+   * queues this request (newest reason/preferredTabID wins) and resolves
+   * once the eventual trailing probe settles; otherwise, if the last probe
+   * for this origin STARTED less than its reason's spacing floor ago (the
+   * shorter MIN_FOREGROUND_PROBE_SPACING_MS for an operator-initiated
+   * "foreground" request, MIN_PROBE_START_SPACING_MS for every automatic
+   * one) the origin is marked dirty and the request is deferred to the
+   * earliest permitted start; otherwise it starts immediately. A deferred
+   * request never touches verdict/lastVerdictAt/lastProbeAt/
+   * lastProbeOutcome — deferral is not an observation.
+   *
+   * Caller settlement differs by how the request was admitted: joining an
+   * in-flight probe, or starting one outright, resolves when that actual
+   * probe attempt settles. A THROTTLE-deferred "foreground" request is
+   * different — the caller only wants to know its request landed, not to
+   * sit through however long another trigger's spacing floor takes; it
+   * resolves the instant the defer is recorded, and the eventual trailing
+   * probe becomes purely the manager's own business from there. A
+   * throttle-deferred automatic request keeps the old behavior: it
+   * resolves only once the trailing probe it piggybacks on has run. */
+  private requestProbe(origin: string, reason: ProbeReason, preferredTabID?: number): Promise<void> {
+    if (this.probeInFlight.has(origin)) {
+      return this.deferProbe(origin, reason, preferredTabID);
+    }
+    const now = Date.now();
+    const lastStart = this.lastProbeStartedAt.get(origin);
+    const floor = spacingFloorFor(reason);
+    if (lastStart !== undefined && now - lastStart < floor) {
+      void this.markDirty(origin);
+      const trailing = this.deferProbe(origin, reason, preferredTabID);
+      this.armSpacingTimer(origin, lastStart + floor);
+      return reason === "foreground" ? Promise.resolve() : trailing;
+    }
+    return this.startProbe(origin, reason, preferredTabID);
+  }
+
+  /** Arms, or re-arms, the origin's spacing timer for `dueAt` — never to a
+   * LATER time than whatever is already pending. A foreground defer's 2s
+   * floor can pull an already-armed automatic 10s deferral earlier; an
+   * automatic defer arriving after a foreground one was already armed must
+   * never push it back out, or an operator-initiated request would end up
+   * waiting on a timer sized for a trigger that merely arrived first. */
+  private armSpacingTimer(origin: string, dueAt: number): void {
+    const existing = this.spacingTimers.get(origin);
+    if (existing !== undefined && existing.dueAt <= dueAt) return;
+    if (existing !== undefined) this.api.timers.clearTimeout(existing.timer);
+    const timer = this.api.timers.setTimeout(() => {
+      this.spacingTimers.delete(origin);
+      void this.runPendingProbe(origin);
+    }, Math.max(0, dueAt - Date.now()));
+    this.spacingTimers.set(origin, { timer, dueAt });
+  }
+
+  private deferProbe(origin: string, reason: ProbeReason, preferredTabID: number | undefined): Promise<void> {
+    const existing = this.pendingProbes.get(origin);
+    if (existing !== undefined) {
+      existing.reason = reason;
+      existing.preferredTabID = preferredTabID;
+      return existing.promise;
+    }
+    const { promise, resolve } = Promise.withResolvers<void>();
+    this.pendingProbes.set(origin, { reason, preferredTabID, promise, resolve });
+    return promise;
+  }
+
+  private async runPendingProbe(origin: string): Promise<void> {
+    const pending = this.pendingProbes.get(origin);
+    if (pending === undefined) return;
+    this.pendingProbes.delete(origin);
+    // Re-enter requestProbe() rather than starting directly: the in-flight
+    // probe that unblocked this trailing run may have finished well inside
+    // the spacing window measured from its OWN start, so this still needs
+    // its own admission check to keep every start at least its reason's
+    // spacing floor apart.
+    await this.requestProbe(origin, pending.reason, pending.preferredTabID);
+    pending.resolve();
+  }
+
+  private async startProbe(
+    origin: string,
+    reason: ProbeReason,
+    preferredTabID: number | undefined,
+  ): Promise<void> {
+    this.lastProbeStartedAt.set(origin, Date.now());
+    const attempt = this.boundedProbe(origin, reason, preferredTabID).finally(() => {
+      this.probeInFlight.delete(origin);
+      if (this.pendingProbes.has(origin)) void this.runPendingProbe(origin);
     });
-    this.probesInFlight.set(origin, attempt);
-    return attempt;
+    this.probeInFlight.set(origin, attempt);
+    await attempt;
+  }
+
+  /** Bounds one admitted probeOrigin() attempt: the in-flight slot always
+   * frees within PROBE_ADMISSION_DEADLINE_MS even if the underlying browser
+   * API call is wedged, so one hung origin can never starve every later
+   * trigger's trailing probe. The hung attempt itself is left running (or
+   * failing) on its own; this only stops it from blocking admission. */
+  private boundedProbe(
+    origin: string,
+    reason: ProbeReason,
+    preferredTabID: number | undefined,
+  ): Promise<void> {
+    const { promise, resolve } = Promise.withResolvers<void>();
+    let settled = false;
+    const finish = (): void => {
+      if (settled) return;
+      settled = true;
+      resolve();
+    };
+    const timer = this.api.timers.setTimeout(finish, PROBE_ADMISSION_DEADLINE_MS);
+    void this.probeOrigin(origin, reason, preferredTabID)
+      .catch(() => {})
+      .finally(() => {
+        this.api.timers.clearTimeout(timer);
+        finish();
+      });
+    return promise;
+  }
+
+  /** Marks an origin's evidence possibly-obsolete, moving dirtySince from
+   * null to now. A later signal while already dirty leaves the original
+   * "obsolete since" timestamp alone. The in-memory move happens
+   * synchronously (via updateOriginSnapshot); the returned promise is only
+   * the durable persist, for callers (note*'s asynchronous tail) that need
+   * it to have landed before a worker might sleep again. */
+  private markDirty(origin: string): Promise<void> {
+    const current = this.originStates.get(origin);
+    if (current !== undefined && current.dirtySince !== null) return Promise.resolve();
+    return this.updateOriginSnapshot(origin, { dirtySince: Date.now() });
   }
 
   /** One atomic probe-and-commit cycle for a single origin: observes a
    * bounded, deduplicated, priority-ordered set of candidate tabs (pure —
    * nothing is written until every observation has returned), reduces them
    * to exactly one outcome, and commits exactly once. `preferredTabID`
-   * (passed by the "cycle"/"reauth" callers below for the manager's own
-   * tab) is the causal tab when present; otherwise the focused tab is.
-   * `reason` is unused by this commit — it exists so a later commit can
-   * gate release authority (which callers may pause/resume the owned tab)
-   * without another signature change. */
+   * (passed by requestProbe()'s callers for the manager's own tab, or a
+   * navigation/activation's causal tab) is the causal tab when present;
+   * otherwise the focused tab is. `reason` is unused by this commit — it
+   * exists so a later commit can gate release authority (which callers may
+   * pause/resume the owned tab) without another signature change. */
   private async probeOrigin(
     origin: string,
-    reason: "foreground" | "cycle" | "reauth",
+    reason: ProbeReason,
     preferredTabID?: number,
   ): Promise<void> {
     let resolver: URL;
@@ -886,7 +1146,7 @@ export class KeepaliveManager {
     // to the popup while the individual scans below are still running.
     const likelyAuthenticated = ordered.length > 0;
     if (origin === this.resolver?.origin) this.likelyAuthenticated = likelyAuthenticated;
-    this.updateOriginSnapshot(origin, { likelyAuthenticated });
+    void this.updateOriginSnapshot(origin, { likelyAuthenticated });
 
     const truncated = ordered.length > MAX_OBSERVED_TABS_PER_ORIGIN;
     const toObserve = ordered.slice(0, MAX_OBSERVED_TABS_PER_ORIGIN);
@@ -915,7 +1175,25 @@ export class KeepaliveManager {
       }
       return { tabID, owned, kind: "off_origin" };
     }
+    // Snapshot the document epoch immediately before the injected scan: a
+    // per-tab generation counter cannot prove the result that comes back
+    // still describes the document sitting in this tab right now.
+    const epochAtScan = this.tabDocumentEpochs.get(tabID);
     const scan = await this.resolverMarkerVerdict(tabID);
+    if (this.tabDocumentEpochs.get(tabID) !== epochAtScan) {
+      return { tabID, owned, kind: "stale" };
+    }
+    // The epoch only advances once noteResolverNavigation() has actually
+    // run; a navigation event the listener has not been delivered yet would
+    // pass the check above. Re-reading the tab directly catches that gap.
+    try {
+      const after = await this.api.tabs.get(tabID);
+      if (typeof after.url !== "string" || !resolverURLMatches(after.url, resolver)) {
+        return { tabID, owned, kind: "stale" };
+      }
+    } catch {
+      return { tabID, owned, kind: "stale" };
+    }
     if (scan.outcome === "markers") return { tabID, owned, kind: "verdict", verdict: scan.verdict };
     return { tabID, owned, kind: scan.outcome };
   }
@@ -925,8 +1203,8 @@ export class KeepaliveManager {
    * wins outright; failing that, disagreeing siblings are a conflict;
    * failing that, a lone decisive polarity commits UNLESS the scan was
    * truncated; anything short of a decisive commit LEAVES THE VERDICT
-   * ALONE — an incomplete or failed scan must never manufacture "out" for
-   * an origin that earned "in" from an earlier, complete probe. */
+   * ALONE — an incomplete, failed, or stale scan must never manufacture
+   * "out" for an origin that earned "in" from an earlier, complete probe. */
   private reduceObservations(
     observations: readonly TabObservation[],
     causalTabID: number | undefined,
@@ -981,7 +1259,13 @@ export class KeepaliveManager {
 
   /** The single write for one probeOrigin() call. `reduction.verdict`
    * present means a NEW verdict was decided; absent means "verdict
-   * preserved" — only lastProbeAt/lastProbeOutcome advance. The owned tab's
+   * preserved" — only lastProbeAt/lastProbeOutcome advance. Either way,
+   * dirtySince clears: commitOriginProbe() running at all IS the "we
+   * looked" event dirtySince exists to demand, even for a "stale"-only
+   * batch that collapses to no_tab — whatever caused the staleness (an
+   * epoch bump) came from its own noteResolverNavigation() call, which
+   * independently re-marked dirty and scheduled its own settle-probe, so
+   * clearing here never loses a pending recheck. The owned tab's
    * pause/resume disposition is a SECOND, independent result computed from
    * its own observation only, applied after the snapshot write so a user
    * tab's "in"/"out" never repins or pauses a keepalive tab sitting on a
@@ -1005,32 +1289,34 @@ export class KeepaliveManager {
         this.lastProbeAt = now;
         this.lastProbeOutcome = reduction.outcome;
       }
-      this.updateOriginSnapshot(origin, {
+      void this.updateOriginSnapshot(origin, {
         authenticated,
         verdict: reduction.verdict,
         probeSource: source,
         lastVerdictAt: now,
         lastProbeAt: now,
         lastProbeOutcome: reduction.outcome,
+        dirtySince: null,
       });
       if (!prior && authenticated && (source === "live_tab" || source === "keepalive_tab")) {
         this.options.onSessionEvidence?.(source, origin);
       }
     } else {
-      // Verdict preserved: an incomplete/failed/empty scan is not evidence.
+      // Verdict preserved: an incomplete/failed/empty/stale scan is not evidence.
       if (isCurrent) {
         this.lastProbeAt = now;
         this.lastProbeOutcome = reduction.outcome;
       }
-      this.updateOriginSnapshot(origin, {
+      void this.updateOriginSnapshot(origin, {
         lastProbeAt: now,
         lastProbeOutcome: reduction.outcome,
+        dirtySince: null,
       });
     }
 
     const disposition = this.ownedTabDisposition(ownedObservation);
     if (disposition === "pause") await this.pauseForReauth();
-    else if (disposition === "resume") await this.resumeAfterReauth();
+    else if (disposition === "resume") await this.resumeAfterReauth(origin);
   }
 
   /** Computed from the OWNED tab's own observation ONLY — never from the
@@ -1062,7 +1348,7 @@ export class KeepaliveManager {
       this.lastProbeAt = undefined;
       this.lastProbeOutcome = undefined;
     }
-    this.updateOriginSnapshot(
+    void this.updateOriginSnapshot(
       origin,
       {
         authenticated: false,
@@ -1079,7 +1365,12 @@ export class KeepaliveManager {
 
   /** Stop scheduling and remove the manager-owned tab. */
   async dispose(): Promise<void> {
-    this.clearTimer();
+    this.clearCycleTimer();
+    this.clearReauthTimer();
+    for (const timer of this.settleTimers.values()) this.api.timers.clearTimeout(timer);
+    this.settleTimers.clear();
+    for (const entry of this.spacingTimers.values()) this.api.timers.clearTimeout(entry.timer);
+    this.spacingTimers.clear();
     await this.closeTab();
   }
 
@@ -1142,12 +1433,13 @@ export class KeepaliveManager {
     this.syncOriginStates();
   }
 
-  /** Shared by reconcile/onObserve/onReload/inspectAfterReload — the only
-   * four places that probe the manager's OWN tab as the causal observation. */
+  /** Shared by reconcile/onObserve/onReload/inspectAfterReload/onReauthTick
+   * — the only places that probe the manager's OWN tab as the causal
+   * observation. Routes through requestProbe() like every other trigger. */
   private async probeOwnedTab(reason: "cycle" | "reauth"): Promise<void> {
     const origin = this.resolver?.origin;
     if (origin === undefined || this.tabID === undefined) return;
-    await this.probeOrigin(origin, reason, this.tabID);
+    await this.requestProbe(origin, reason, this.tabID);
   }
 
   private async reconcile(): Promise<void> {
@@ -1155,26 +1447,24 @@ export class KeepaliveManager {
     const resolver = this.resolverFromLatestOffer() ?? this.configuredResolver();
     if (!this.enabled || !warmDemand || resolver === undefined) {
       await this.closeTab();
-      this.schedule(this.observeMs, () => this.onObserve());
+      this.scheduleCycle(this.lastCycleRunAt + this.observeMs, () => this.onObserve());
       return;
     }
 
     await this.selectResolver(resolver);
     if (this.tabID === undefined) {
       await this.createTab();
-      this.schedule(this.intervalMs(), () => this.onReload());
+      this.scheduleCycle(this.lastCycleRunAt + this.intervalMs(), () => this.onReload());
       return;
     }
 
     if (this.reauthPaused) {
-      await this.probeOwnedTab("reauth");
-      this.schedule(this.reauthPaused ? this.observeMs : this.intervalMs(), () =>
-        this.reauthPaused ? this.onObserve() : this.onReload(),
-      );
+      // reauthTimer already owns the paused recheck loop (armed by
+      // pauseForReauth); the cycle timer is left untouched until it resolves.
       return;
     }
 
-    this.schedule(this.intervalMs(), () => this.onReload());
+    this.scheduleCycle(this.lastCycleRunAt + this.intervalMs(), () => this.onReload());
   }
 
   /** Tail of the serialised openReauth chain. The popup renders one Sign-in
@@ -1335,8 +1625,9 @@ export class KeepaliveManager {
     if (this.tabID === tabID) {
       this.tabID = undefined;
       this.reauthPaused = false;
+      this.clearReauthTimer();
     }
-    this.updateOriginSnapshot(origin, { pausedForReauth: false });
+    void this.updateOriginSnapshot(origin, { pausedForReauth: false });
     if (wasPaused) this.options.onReauthStateChanged?.(false);
     try {
       await this.api.tabs.remove(tabID);
@@ -1400,6 +1691,12 @@ export class KeepaliveManager {
       if (tabID !== undefined) {
         this.tabID = tabID;
         this.reauthPaused = false;
+        // The owned-tab cycle "just ran" the moment we take ownership of a
+        // tab, whether adopted here or freshly created below — otherwise
+        // the very first scheduleCycle(lastCycleRunAt + intervalMs()) call
+        // would compute a due time still stuck at epoch 0 and fire almost
+        // immediately instead of a full interval from now.
+        this.lastCycleRunAt = Date.now();
         this.resetVerdict(resolver.origin);
         return;
       }
@@ -1428,6 +1725,7 @@ export class KeepaliveManager {
       if (tab.id === undefined) return;
       this.tabID = tab.id;
       this.reauthPaused = false;
+      this.lastCycleRunAt = Date.now();
       // Opening the probe tab is not evidence of anything: the reset that
       // lived here erased restored or previously earned session state before
       // the first inspection could run. A genuinely new origin already sits
@@ -1445,78 +1743,65 @@ export class KeepaliveManager {
     const resolver = this.resolverFromLatestOffer() ?? this.configuredResolver();
     if (!this.enabled || !warmDemand || resolver === undefined) {
       await this.closeTab();
-      this.schedule(this.observeMs, () => this.onObserve());
+      this.scheduleCycle(this.lastCycleRunAt + this.observeMs, () => this.onObserve());
       return;
     }
 
     await this.selectResolver(resolver);
     if (this.tabID === undefined) {
       await this.createTab();
-      this.schedule(this.intervalMs(), () => this.onReload());
+      this.scheduleCycle(this.lastCycleRunAt + this.intervalMs(), () => this.onReload());
       return;
     }
 
-    if (this.reauthPaused) {
-      await this.probeOwnedTab("reauth");
-      this.schedule(this.reauthPaused ? this.observeMs : this.intervalMs(), () =>
-        this.reauthPaused ? this.onObserve() : this.onReload(),
-      );
-      return;
-    }
+    if (this.reauthPaused) return;
 
-    this.schedule(this.intervalMs(), () => this.onReload());
+    this.scheduleCycle(this.lastCycleRunAt + this.intervalMs(), () => this.onReload());
   }
 
   private async onReload(): Promise<void> {
     await this.loadPreferences();
     if (!this.enabled || !this.hasWarmDemand()) {
       await this.closeTab();
-      this.schedule(this.observeMs, () => this.onObserve());
+      this.scheduleCycle(this.lastCycleRunAt + this.observeMs, () => this.onObserve());
       return;
     }
 
     const resolver = this.resolverFromLatestOffer() ?? this.configuredResolver();
     if (resolver === undefined) {
       await this.closeTab();
-      this.schedule(this.observeMs, () => this.onObserve());
+      this.scheduleCycle(this.lastCycleRunAt + this.observeMs, () => this.onObserve());
       return;
     }
     await this.selectResolver(resolver);
     if (this.tabID === undefined) {
       await this.createTab();
-      this.schedule(this.intervalMs(), () => this.onReload());
+      this.scheduleCycle(this.lastCycleRunAt + this.intervalMs(), () => this.onReload());
       return;
     }
-    if (this.reauthPaused) {
-      await this.probeOwnedTab("reauth");
-      this.schedule(this.reauthPaused ? this.observeMs : this.intervalMs(), () =>
-        this.reauthPaused ? this.onObserve() : this.onReload(),
-      );
-      return;
-    }
+    if (this.reauthPaused) return;
 
     try {
       await this.api.tabs.reload(this.tabID);
     } catch {
       this.tabID = undefined;
-      this.schedule(this.observeMs, () => this.onObserve());
+      this.scheduleCycle(this.lastCycleRunAt + this.observeMs, () => this.onObserve());
       return;
     }
-    this.schedule(this.reloadSettleMs, () => this.inspectAfterReload());
+    this.scheduleCycle(Date.now() + this.reloadSettleMs, () => this.inspectAfterReload());
   }
 
   private async inspectAfterReload(): Promise<void> {
     await this.probeOwnedTab("cycle");
-    this.schedule(this.reauthPaused ? this.observeMs : this.intervalMs(), () =>
-      this.reauthPaused ? this.onObserve() : this.onReload(),
-    );
+    if (this.reauthPaused) return;
+    this.scheduleCycle(this.lastCycleRunAt + this.intervalMs(), () => this.onReload());
   }
 
 
   private async pauseForReauth(): Promise<void> {
     if (this.reauthPaused || this.tabID === undefined) return;
     this.reauthPaused = true;
-    this.updateOriginSnapshot(this.resolver?.origin, { pausedForReauth: true });
+    void this.updateOriginSnapshot(this.resolver?.origin, { pausedForReauth: true });
     try {
       await this.api.tabs.update(this.tabID, { active: true, pinned: false, muted: false });
       // In work-window mode the tab lives in a minimized window; bring it up.
@@ -1526,18 +1811,64 @@ export class KeepaliveManager {
     }
     this.options.onReauthStateChanged?.(true);
     this.options.onReauthNeeded?.();
+    // Guarantee a prompt recheck regardless of caller: an explicit
+    // openReauth() call reaches here OUTSIDE the reconcile/onObserve/
+    // onReload chain, so without arming our own timer this would otherwise
+    // inherit whatever cycleTimer already happened to be pending — up to a
+    // full interval away.
+    this.armReauthTimer();
   }
 
-  private async resumeAfterReauth(): Promise<void> {
-    if (this.tabID === undefined) return;
-    this.reauthPaused = false;
-    this.updateOriginSnapshot(this.resolver?.origin, { pausedForReauth: false });
-    this.options.onReauthStateChanged?.(false);
+  private armReauthTimer(): void {
+    this.clearReauthTimer();
+    this.reauthTimer = this.api.timers.setTimeout(() => {
+      this.reauthTimer = undefined;
+      void this.onReauthTick();
+    }, this.observeMs);
+  }
+
+  private clearReauthTimer(): void {
+    if (this.reauthTimer !== undefined) this.api.timers.clearTimeout(this.reauthTimer);
+    this.reauthTimer = undefined;
+  }
+
+  private async onReauthTick(): Promise<void> {
+    await this.loadPreferences();
+    if (!this.reauthPaused || this.tabID === undefined) return;
+    await this.probeOwnedTab("reauth");
+    if (this.reauthPaused) this.armReauthTimer();
+  }
+
+  /** Clears the LOGICAL pause for `origin` even when the owned tab that
+   * earned this "in" reading is already gone — a dead tab must never leave
+   * an origin stuck "paused" forever. Only touches this.reauthPaused/
+   * reauthTimer/onReauthStateChanged (the CURRENT resolver's live state)
+   * when `origin` still IS the current resolver, checked both before and
+   * after the tabs.update() await: the resolver can move to a different
+   * institution while this call is in flight, and a late-resolving resume
+   * for the OLD origin must never clear the NEW one's pause. Re-pinning is
+   * likewise conditional on the owned tab still existing and still
+   * belonging to `origin`. */
+  private async resumeAfterReauth(origin: string): Promise<void> {
+    void this.updateOriginSnapshot(origin, { pausedForReauth: false });
+    const tabID = this.tabID;
+    if (tabID === undefined || this.resolver?.origin !== origin) {
+      if (this.resolver?.origin === origin) {
+        this.reauthPaused = false;
+        this.clearReauthTimer();
+        this.options.onReauthStateChanged?.(false);
+      }
+      return;
+    }
     try {
-      await this.api.tabs.update(this.tabID, { pinned: true, muted: true });
+      await this.api.tabs.update(tabID, { pinned: true, muted: true });
     } catch {
       // The tab is still usable; retry normal keepalive on the next cycle.
     }
+    if (this.resolver?.origin !== origin) return;
+    this.reauthPaused = false;
+    this.clearReauthTimer();
+    this.options.onReauthStateChanged?.(false);
   }
 
 
@@ -1545,17 +1876,162 @@ export class KeepaliveManager {
     return this.intervalMinutes * 60_000;
   }
 
-  private schedule(delayMs: number, callback: () => Promise<void>): void {
-    this.clearTimer();
-    this.timer = this.api.timers.setTimeout(async () => {
-      this.timer = undefined;
+  /** "No later than": if a cycle timer is already pending for a due time at
+   * or before `dueAt`, it is left alone — a later request must never push
+   * an already-correct deadline out. reconcile()/onObserve()/onReload() are
+   * idempotent, state-driven re-evaluations, so even the one case this can
+   * briefly leave a "wrong-purpose" timer pending (e.g. an idle poll still
+   * armed just after a tab was created) is harmless: whichever callback
+   * fires next re-derives the correct next step from current state and
+   * reschedules correctly on its own. */
+  private scheduleCycle(dueAt: number, callback: () => Promise<void>): void {
+    if (this.cycleTimer !== undefined && this.nextCycleDueAt !== undefined && this.nextCycleDueAt <= dueAt) {
+      return;
+    }
+    if (this.cycleTimer !== undefined) this.api.timers.clearTimeout(this.cycleTimer);
+    this.nextCycleDueAt = dueAt;
+    const delay = Math.max(0, dueAt - Date.now());
+    this.cycleTimer = this.api.timers.setTimeout(async () => {
+      this.cycleTimer = undefined;
+      this.nextCycleDueAt = undefined;
+      this.lastCycleRunAt = Date.now();
       await callback();
-    }, delayMs);
+    }, delay);
   }
 
-  private clearTimer(): void {
-    if (this.timer !== undefined) this.api.timers.clearTimeout(this.timer);
-    this.timer = undefined;
+  private clearCycleTimer(): void {
+    if (this.cycleTimer !== undefined) this.api.timers.clearTimeout(this.cycleTimer);
+    this.cycleTimer = undefined;
+    this.nextCycleDueAt = undefined;
+  }
+
+  private originFromURL(rawURL: string | undefined): string | undefined {
+    if (rawURL === undefined) return undefined;
+    try {
+      const url = new URL(rawURL);
+      if (url.protocol !== "https:") return undefined;
+      return normalizeHttpsOrigin(url.origin);
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Debounced per-origin "let the SPA render" delay: each call for the
+   * same origin replaces the previous timer, so only the LAST navigation
+   * event in a burst (url-change, then complete) actually triggers a
+   * probe. */
+  private armSettleTimer(origin: string, tabID: number): void {
+    const existing = this.settleTimers.get(origin);
+    if (existing !== undefined) this.api.timers.clearTimeout(existing);
+    const timer = this.api.timers.setTimeout(() => {
+      this.settleTimers.delete(origin);
+      void this.requestProbe(origin, "navigation", tabID);
+    }, this.reloadSettleMs);
+    this.settleTimers.set(origin, timer);
+  }
+
+  /** A tab finished loading, or changed URL. Cheap and synchronous up
+   * front — epoch bump, origin-membership check, and dirty/settle
+   * bookkeeping all happen before any await, so a wake event can never be
+   * reordered or lost while this manager is still hydrating. */
+  noteResolverNavigation(tabID: number, rawURL: string | undefined): void {
+    this.tabDocumentEpochs.set(tabID, (this.tabDocumentEpochs.get(tabID) ?? 0) + 1);
+    this.syncOriginStates();
+    const origin = this.originFromURL(rawURL);
+    const previousOrigin = this.tabResolverOrigins.get(tabID);
+    const known = origin !== undefined && this.originStates.has(origin);
+    const leftOrigin = previousOrigin !== undefined && previousOrigin !== origin ? previousOrigin : undefined;
+
+    if (!known || origin === undefined) {
+      this.tabResolverOrigins.delete(tabID);
+    } else {
+      this.tabResolverOrigins.set(tabID, origin);
+      // A resolver SPA renders its header and mints its session token after
+      // the load event, not at navigation-start — probing immediately would
+      // race the page itself.
+      this.armSettleTimer(origin, tabID);
+    }
+
+    // The synchronous bookkeeping above is already done; only the durable
+    // persist of dirtySince needs to land before a worker might sleep again.
+    void (async () => {
+      if (leftOrigin !== undefined) await this.markDirty(leftOrigin);
+      if (known && origin !== undefined) await this.markDirty(origin);
+    })();
+  }
+
+  /** The operator switched to a tab. ADR-0013 privileges the focused tab,
+   * so this probes immediately (no settle delay) instead of waiting for a
+   * navigation that may never come — the tab could already be sitting on a
+   * fully rendered resolver page. Never commits a verdict directly; it only
+   * requests one through the same admission-controlled path as everything
+   * else. */
+  noteResolverActivated(tabID: number, rawURL: string | undefined): void {
+    this.syncOriginStates();
+    const origin = this.originFromURL(rawURL);
+    const previousOrigin = this.tabResolverOrigins.get(tabID);
+    const known = origin !== undefined && this.originStates.has(origin);
+    const leftOrigin = previousOrigin !== undefined && previousOrigin !== origin ? previousOrigin : undefined;
+
+    if (!known || origin === undefined) {
+      this.tabResolverOrigins.delete(tabID);
+    } else {
+      this.tabResolverOrigins.set(tabID, origin);
+    }
+
+    void (async () => {
+      if (leftOrigin !== undefined) await this.markDirty(leftOrigin);
+      if (known && origin !== undefined) {
+        await this.markDirty(origin);
+        await this.requestProbe(origin, "activation", tabID);
+      }
+    })();
+  }
+
+  /** A tab is gone: drop its epoch, settle timer, and origin association.
+   * If it was the manager-owned tab, clear tabID and the logical reauth
+   * pause exactly as closeTab() does — a dead tab must never leave an
+   * origin stuck "paused" with nothing left to resume it. */
+  noteTabRemoved(tabID: number): void {
+    this.tabDocumentEpochs.delete(tabID);
+    const origin = this.tabResolverOrigins.get(tabID);
+    this.tabResolverOrigins.delete(tabID);
+    if (origin !== undefined) {
+      const settleTimer = this.settleTimers.get(origin);
+      if (settleTimer !== undefined) {
+        this.api.timers.clearTimeout(settleTimer);
+        this.settleTimers.delete(origin);
+      }
+    }
+    if (this.tabID !== tabID) return;
+    const ownedOrigin = this.resolver?.origin;
+    const wasPaused = this.reauthPaused;
+    this.tabID = undefined;
+    this.reauthPaused = false;
+    this.clearReauthTimer();
+    void this.updateOriginSnapshot(ownedOrigin, { pausedForReauth: false });
+    if (wasPaused) this.options.onReauthStateChanged?.(false);
+    this.resetVerdict(ownedOrigin);
+  }
+
+  /** Periodic wake, and the durable recovery path for events lost to a
+   * suspended worker: setTimeout-based timers (cycleTimer/reauthTimer/
+   * settleTimers/spacingTimers) never survive a service-worker restart, but
+   * dirtySince does. Probes only origins that are dirty or paused for
+   * reauth, and runs the owned-tab cycle work when its absolute deadline
+   * has passed — pure local state, no daemon-port/message involvement. */
+  async onWake(): Promise<void> {
+    await this.loadPreferences();
+    const now = Date.now();
+    const due: string[] = [];
+    for (const [origin, snapshot] of this.originStates) {
+      if (snapshot.dirtySince !== null || snapshot.pausedForReauth) due.push(origin);
+    }
+    await Promise.all(due.map((origin) => this.requestProbe(origin, "wake")));
+
+    if (this.nextCycleDueAt !== undefined && this.nextCycleDueAt <= now) {
+      await this.reconcile();
+    }
   }
 
   private async closeTab(): Promise<void> {
@@ -1564,7 +2040,8 @@ export class KeepaliveManager {
     const wasAwaitingReauth = this.reauthPaused;
     this.tabID = undefined;
     this.reauthPaused = false;
-    this.updateOriginSnapshot(origin, { pausedForReauth: false });
+    this.clearReauthTimer();
+    void this.updateOriginSnapshot(origin, { pausedForReauth: false });
     if (wasAwaitingReauth) this.options.onReauthStateChanged?.(false);
     this.resetVerdict(origin);
     if (tabID === undefined) return;

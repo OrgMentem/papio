@@ -134,6 +134,9 @@ class FakeAction {
 class FakeTabs {
   readonly onUpdated = new FakeEmitter<[number, TabChangeInfo, TabInfo]>();
   readonly onRemoved = new FakeEmitter<[number, { isWindowClosing: boolean }]>();
+  /** chrome.tabs.onActivated: the operator switched to a tab (ADR-0013 uses
+   * this to privilege the focused tab over background navigation noise). */
+  readonly onActivated = new FakeEmitter<[{ tabId: number; windowId: number }]>();
   readonly created: { url: string; active: boolean; windowId?: number }[] = [];
   readonly removed: number[] = [];
   readonly reloaded: number[] = [];
@@ -2084,6 +2087,11 @@ test("an auth-flagged resolver hostname omits origin_hint on auth_returned rathe
   await h.port.inbound(helloAck({ features: ["session_evidence_v1"] }));
   h.bridge.attachKeepalive({
     getSnapshot: () => ({ resolverOrigin: "https://granted-host.example.edu", pausedForReauth: false }),
+    // Commit B's onTabUpdated now tells the manager about every navigation
+    // synchronously (see the "notified before ready resolves" test below);
+    // this stub only cares about the resolver-origin fallback, so the
+    // notification itself is a no-op here.
+    noteResolverNavigation: () => {},
   } as unknown as KeepaliveManager);
   await h.port.inbound(jobOffer("job_evidence_sso", ssoOpenURL));
   const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
@@ -5250,4 +5258,148 @@ test("created broker tabs are ledgered durably and forgotten once they close", a
   h.tabs.live.delete(tabID);
   await h.tabs.onRemoved.emit(tabID, { isWindowClosing: false });
   expect(ledger[String(tabID)]).toBeUndefined();
+});
+
+// Commit B: the browser tells papio when a resolver page changed (so the
+// keepalive origin state can be marked dirty instead of relying solely on
+// the bounded 4-minute reload cycle), and the keepalive alarm's wake must
+// reach the manager even when the native port is down. These tests pin the
+// wiring in Bridge; KeepaliveManager's own dirty/probe bookkeeping is
+// covered in keepalive.test.ts.
+
+test("a completed navigation on an untracked tab reaches noteResolverNavigation", async () => {
+  // Before Commit B, onTabUpdated returns at findByTab for any untracked
+  // tab — so the operator's own library tab, which is NEVER a tracked job
+  // tab, was invisible to the keepalive manager entirely.
+  const h = makeHarness();
+  const navigations: [number, string | undefined][] = [];
+  h.bridge.attachKeepalive({
+    getSnapshot: () => ({ pausedForReauth: false }),
+    noteResolverNavigation: (tabID: number, rawURL: string | undefined) => {
+      navigations.push([tabID, rawURL]);
+    },
+  } as unknown as KeepaliveManager);
+  await h.bridge.start();
+
+  const libraryTabID = 555;
+  const libraryURL = "https://onesearch.library.example-college.edu/discovery/search";
+  h.tabs.live.set(libraryTabID, { id: libraryTabID, url: libraryURL });
+  await h.tabs.onUpdated.emit(
+    libraryTabID,
+    { status: "complete", url: libraryURL },
+    h.tabs.live.get(libraryTabID)!,
+  );
+
+  expect(navigations).toEqual([[libraryTabID, libraryURL]]);
+});
+
+test("a navigation on a tracked handoff tab also reaches noteResolverNavigation without losing existing tracked-job handling", async () => {
+  const h = makeHarness();
+  const navigations: [number, string | undefined][] = [];
+  h.bridge.attachKeepalive({
+    getSnapshot: () => ({ pausedForReauth: false }),
+    noteResolverNavigation: (tabID: number, rawURL: string | undefined) => {
+      navigations.push([tabID, rawURL]);
+    },
+  } as unknown as KeepaliveManager);
+  await h.bridge.start();
+  await h.port.inbound(jobOffer("job_tracked_nav"));
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+
+  const idpURL = "https://idp.example.edu/sso?SAMLRequest=x";
+  await h.tabs.onUpdated.emit(tabID, { url: idpURL, status: "complete" }, { id: tabID, url: idpURL });
+
+  expect(navigations).toEqual([[tabID, idpURL]]);
+  // The tracked-job side effect (leaving every provider host for an IdP
+  // starts human authentication) must still fire; the manager notification
+  // is additive, not a replacement.
+  expect(h.frames().some((f) => f.type === "auth_pending")).toBe(true);
+});
+
+test("keepalive manager is notified of a navigation synchronously, before bridge hydration resolves", async () => {
+  // This is the wake-navigation case that motivated moving the attach: a
+  // navigation that arrives while the worker is still hydrating (backend.load()
+  // still pending) must not be lost. Do not await start() — `ready` is still
+  // pending when the tab event is emitted below.
+  const h = makeHarness();
+  const navigations: [number, string | undefined][] = [];
+  h.bridge.attachKeepalive({
+    getSnapshot: () => ({ pausedForReauth: false }),
+    noteResolverNavigation: (tabID: number, rawURL: string | undefined) => {
+      navigations.push([tabID, rawURL]);
+    },
+  } as unknown as KeepaliveManager);
+
+  void h.bridge.start();
+  const wakeURL = "https://onesearch.library.example-college.edu/discovery/search";
+  void h.tabs.onUpdated.emit(501, { status: "complete", url: wakeURL }, { id: 501, url: wakeURL });
+
+  // No await/microtask has elapsed since start() and emit() were called: if
+  // the call was already recorded, it happened synchronously, ahead of the
+  // `await this.ready` that still gates the rest of onTabUpdated.
+  expect(navigations).toEqual([[501, wakeURL]]);
+});
+
+test("chrome.tabs.onActivated routes to noteResolverActivated with the activated tab's URL", async () => {
+  // ADR-0013 privileges the focused tab: switching to a resolver tab is as
+  // strong a "look now" signal as a navigation, but nothing observed it
+  // before Commit B — the extension holds no onActivated listener at all.
+  const h = makeHarness();
+  const activations: [number, string | undefined][] = [];
+  h.bridge.attachKeepalive({
+    getSnapshot: () => ({ pausedForReauth: false }),
+    noteResolverActivated: (tabID: number, rawURL: string | undefined) => {
+      activations.push([tabID, rawURL]);
+    },
+  } as unknown as KeepaliveManager);
+  await h.bridge.start();
+
+  const tabID = 888;
+  const url = "https://onesearch.library.example-college.edu/discovery/search";
+  h.tabs.live.set(tabID, { id: tabID, url });
+  await h.tabs.onActivated.emit({ tabId: tabID, windowId: 1 });
+
+  expect(activations).toEqual([[tabID, url]]);
+});
+
+test("tab removal routes to noteTabRemoved and still cancels the job as before", async () => {
+  const h = makeHarness();
+  const removed: number[] = [];
+  h.bridge.attachKeepalive({
+    getSnapshot: () => ({ pausedForReauth: false }),
+    noteTabRemoved: (tabID: number) => {
+      removed.push(tabID);
+    },
+  } as unknown as KeepaliveManager);
+  await h.bridge.start();
+  await h.port.inbound(jobOffer("job_tab_removed"));
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+
+  await h.tabs.onRemoved.emit(tabID, { isWindowClosing: false });
+
+  expect(removed).toEqual([tabID]);
+  expect(h.frames().some((f) => f.type === "provider_outcome")).toBe(true);
+  expect(h.backend.store.activeJobs.length).toBe(0);
+});
+
+test("the keepalive alarm calls onWake even while the native port is down", async () => {
+  // onKeepaliveAlarm's port-down branch short-circuits with `this.connect();
+  // return;` before ever reaching the (pre-Commit-B) triage-counts refresh.
+  // onWake must run independently of that branch, not behind it, or a
+  // worker that wakes with a dead port never re-checks dirty origins.
+  const h = makeHarness();
+  const wakes: number[] = [];
+  h.bridge.attachKeepalive({
+    getSnapshot: () => ({ pausedForReauth: false }),
+    onWake: async () => {
+      wakes.push(wakes.length);
+    },
+  } as unknown as KeepaliveManager);
+  await h.bridge.start();
+  await h.port.emitDisconnect();
+  expect(wakes.length).toBe(0); // sanity: disconnecting alone must not wake it
+
+  await h.alarms.onAlarm.emit({ name: "papio-keepalive" });
+
+  expect(wakes.length).toBe(1);
 });

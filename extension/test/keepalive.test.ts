@@ -13,6 +13,8 @@ import {
   isAuthenticationURL,
   KeepaliveManager,
   MAX_OBSERVED_TABS_PER_ORIGIN,
+  MIN_FOREGROUND_PROBE_SPACING_MS,
+  MIN_PROBE_START_SPACING_MS,
   SESSION_STALE_MS,
   type KeepaliveAPI,
   type KeepaliveOriginSnapshot,
@@ -42,13 +44,21 @@ class FakeTimers implements KeepaliveTimers {
   private nextID = 1;
   private readonly pending = new Map<
     number,
-    { callback: () => void | Promise<void>; delayMs: number }
+    { callback: () => void | Promise<void>; delayMs: number; dueAt: number }
   >();
   readonly delays: number[] = [];
 
+  /** `now` is the SAME shared clock the harness hands out as `clock.now` —
+   * Commit B schedules three independent timer kinds (cycle/reauth/settle)
+   * that can be pending simultaneously, so a test drives `clock.advanceBy()`
+   * exactly the way production computes delays and lets `runDue()` fire
+   * whatever has actually elapsed, instead of guessing which of several
+   * pending delay values belongs to which kind. */
+  constructor(private readonly now: () => number = () => Date.now()) {}
+
   setTimeout(callback: () => void | Promise<void>, delayMs: number): number {
     const id = this.nextID++;
-    this.pending.set(id, { callback, delayMs });
+    this.pending.set(id, { callback, delayMs, dueAt: this.now() + delayMs });
     this.delays.push(delayMs);
     return id;
   }
@@ -59,11 +69,55 @@ class FakeTimers implements KeepaliveTimers {
 
   async runNext(): Promise<void> {
     const entry = this.pending.entries().next().value as
-      | [number, { callback: () => void | Promise<void>; delayMs: number }]
+      | [number, { callback: () => void | Promise<void>; delayMs: number; dueAt: number }]
       | undefined;
     if (entry === undefined) throw new Error("no scheduled timer");
     this.pending.delete(entry[0]);
     await entry[1].callback();
+  }
+
+  /** Run every pending timer whose computed fire time has elapsed at the
+   * clock's current position, due-time-then-insertion order, looping so a
+   * callback that reschedules another already-due timer is also drained.
+   * This is what lets a test simulate real elapsed time across several
+   * concurrently pending timer kinds without knowing their exact delays. */
+  async runDue(maxRounds = 50): Promise<void> {
+    for (let round = 0; round < maxRounds; round++) {
+      const due = [...this.pending.entries()]
+        .filter(([, entry]) => entry.dueAt <= this.now())
+        .sort((a, b) => a[1].dueAt - b[1].dueAt || a[0] - b[0]);
+      if (due.length === 0) return;
+      for (const [id, entry] of due) {
+        if (!this.pending.has(id)) continue; // cleared earlier this round
+        this.pending.delete(id);
+        await entry.callback();
+      }
+    }
+    throw new Error("runDue exceeded maxRounds — possible timer rescheduling loop");
+  }
+
+  /** Run the oldest pending timer scheduled with exactly `delayMs`, so a
+   * test can pick out one fixed-delay kind (e.g. the `reloadSettleMs`
+   * settle timer) from several concurrently pending kinds without
+   * advancing the clock. */
+  async runByDelay(delayMs: number): Promise<void> {
+    const entry = [...this.pending.entries()].find(([, e]) => e.delayMs === delayMs);
+    if (entry === undefined) {
+      throw new Error(`no pending timer with delay ${delayMs}; pending: ${this.pendingDelays().join(", ")}`);
+    }
+    this.pending.delete(entry[0]);
+    await entry[1].callback();
+  }
+
+  /** Delays of every CURRENTLY pending timer — unlike `delays` (a
+   * cumulative log), this reflects only what has not yet fired or been
+   * cleared. */
+  pendingDelays(): number[] {
+    return [...this.pending.values()].map((entry) => entry.delayMs);
+  }
+
+  pendingCount(): number {
+    return this.pending.size;
   }
 
   latestDelay(): number | undefined {
@@ -180,6 +234,40 @@ class FakeScripting {
   };
 }
 
+/** Controls persistence of `keepalive.originStates`: by default every
+ * `storage.set()` call resolves immediately, exactly like a real browser
+ * write. `arm()` queues up holds for the next N calls so a test can freeze
+ * an in-flight write and observe whether the manager attempts a SECOND one
+ * before the first settles — proving the manager's own serialized persist
+ * chain (never a lucky ordering in this fake) is what keeps a newer write
+ * from ever being clobbered by an older one settling late. */
+class StorageWriteGate {
+  private armed = 0;
+  private readonly held: { values: Record<string, unknown>; release: () => void }[] = [];
+
+  arm(count = 1): void {
+    this.armed += count;
+  }
+
+  async gate(values: Record<string, unknown>): Promise<void> {
+    if (this.armed <= 0) return;
+    this.armed -= 1;
+    const resolvers = Promise.withResolvers<void>();
+    this.held.push({ values, release: () => resolvers.resolve() });
+    await resolvers.promise;
+  }
+
+  /** Release the oldest still-held write, letting its `storage.set()` call
+   * resolve and apply. */
+  releaseOldest(): void {
+    this.held.shift()?.release();
+  }
+
+  get pendingCount(): number {
+    return this.held.length;
+  }
+}
+
 interface HarnessResolver {
   latestOpenURL?: string | undefined;
   storedOrigin?: unknown;
@@ -212,10 +300,19 @@ function makeHarness(
    * lets a test prove a probe committed a verdict exactly once instead of
    * leaking an intermediate per-tab result. */
   originStateWrites: KeepaliveOriginSnapshot[][];
+  /** Lets a test freeze one `keepalive.originStates` write mid-flight and
+   * prove the manager never issues a second one until it settles. */
+  storageGate: StorageWriteGate;
 } {
   const jobs = { count: 1 };
   const tabs = new FakeTabs();
-  const timers = new FakeTimers();
+  const clockState = { now: REAL_DATE_NOW() };
+  Date.now = () => clockState.now;
+  restoreDateNow = () => {
+    Date.now = REAL_DATE_NOW;
+  };
+  const timers = new FakeTimers(() => clockState.now);
+  const storageGate = new StorageWriteGate();
   const badge: string[] = [];
   const reauths = { count: 0 };
   const reauthState: boolean[] = [];
@@ -232,17 +329,13 @@ function makeHarness(
   /** Per-tab marker overrides: tabs render sessions independently. */
   const markersByTab = new Map<number, ResolverMarker[]>();
   const scripting = new FakeScripting(markersByTab, resolverMarkers);
-  const clockState = { now: REAL_DATE_NOW() };
-  Date.now = () => clockState.now;
-  restoreDateNow = () => {
-    Date.now = REAL_DATE_NOW;
-  };
   const api: KeepaliveAPI = {
     tabs,
     timers,
     storage: {
       get: async () => ({ ...storageValues }),
       set: async (values) => {
+        await storageGate.gate(values);
         Object.assign(storageValues, values);
         const states = values["keepalive.originStates"];
         if (Array.isArray(states)) {
@@ -297,6 +390,7 @@ function makeHarness(
     resolverMarkers,
     markersByTab,
     originStateWrites,
+    storageGate,
   };
 }
 
@@ -621,8 +715,8 @@ test("pauses after an IdP redirect, notifies the user, and resumes on resolver r
   await h.manager.init();
   h.tabs.nextURL = "https://idp.example.edu/idp/profile/SAML2/Redirect/SSO?service=resolver";
 
-  await h.timers.runNext(); // reload
-  await h.timers.runNext(); // bounded final-URL inspection
+  await h.timers.runByDelay(4 * 60_000); // cycleTimer: the interval reload fires
+  await h.timers.runByDelay(1); // cycleTimer: reloadSettleMs bounded final-URL inspection
 
   expect(h.tabs.reloaded).toEqual([1]);
   expect(h.reauthState).toEqual([true]);
@@ -632,16 +726,29 @@ test("pauses after an IdP redirect, notifies the user, and resumes on resolver r
 
   h.tabs.nextURL = RESOLVER_OPENURL;
   h.tabs.live.get(1)!.url = RESOLVER_OPENURL; // Simulate the user's completed login.
-  await h.timers.runNext();
+  // Clear the spacing window opened by the pause-triggering probe above, so
+  // the recovery probe the reauth watch fires below is admitted immediately
+  // instead of deferred.
+  h.clock.advanceBy(MIN_PROBE_START_SPACING_MS);
+  await h.timers.runByDelay(10); // reauthTimer: the recovery probe runs and resumes
+  await flushMicrotasks(); // armReauthTimer's callback is fire-and-forget, unlike scheduleCycle's
 
   expect(h.reauthState).toEqual([true, false]);
   expect(h.tabs.updates).toEqual([
     { id: 1, properties: { active: true, pinned: false, muted: false } },
     { id: 1, properties: { pinned: true, muted: true } },
   ]);
-  expect(h.timers.latestDelay()).toBe(4 * 60_000);
 
-  await h.timers.runNext();
+  // Resuming clears the logical pause but does not itself reschedule the
+  // reload cycle — that is the next heartbeat's job: reconcile() sees
+  // !reauthPaused and re-arms the (still-absolute) cycle deadline, exactly
+  // the sync()-driven model this commit's starvation fix relies on.
+  await h.manager.sync();
+  // scheduleCycle() computes delay from the CURRENT clock, which already
+  // advanced MIN_PROBE_START_SPACING_MS above to clear the recovery
+  // probe's spacing window — so the re-armed cycle timer is the full
+  // interval minus that elapsed time, not a fresh 4 minutes.
+  await h.timers.runByDelay(4 * 60_000 - MIN_PROBE_START_SPACING_MS); // cycleTimer: reload after resume
   expect(h.tabs.reloaded).toEqual([1, 1]);
 });
 
@@ -729,12 +836,17 @@ test("probeForeground always runs a real scan, even moments after the previous o
   expect(injectedAfterFirst).toBeGreaterThan(0);
   const queriesAfterFirst = h.tabs.queryCount;
 
-  // Well within SESSION_STALE_MS — the deleted freshness gate would have
-  // skipped this call entirely.
-  h.clock.advanceBy(1_000);
+  // Past MIN_FOREGROUND_PROBE_SPACING_MS — the operator floor a foreground
+  // request obeys — but still well within SESSION_STALE_MS; the deleted
+  // freshness gate would have skipped this call entirely. A throttle-
+  // deferred foreground request now settles the instant the defer is
+  // recorded, so driving runDue() afterward picks up the trailing probe
+  // whether this call was admitted outright or briefly deferred.
+  h.clock.advanceBy(MIN_FOREGROUND_PROBE_SPACING_MS);
   expect(h.clock.now()).toBeLessThan((h.manager.getSnapshot().lastVerdictAt ?? 0) + SESSION_STALE_MS);
   await h.manager.probeForeground();
-
+  await h.timers.runDue();
+  await flushMicrotasks();
   expect(h.tabs.queryCount).toBeGreaterThan(queriesAfterFirst);
   expect(h.scripting.injectionCounts.get(1) ?? 0).toBeGreaterThan(injectedAfterFirst);
   expect(h.manager.getSnapshot().lastProbeAt).toBe(h.clock.now());
@@ -932,8 +1044,13 @@ test("more matching tabs than the observation cap never commits a decisive verdi
   }
   h.tabs.resolverTabs.push(...flood);
 
-  h.clock.advanceBy(1_000);
+  // Past the operator floor a foreground request obeys; a throttle-deferred
+  // call now settles immediately, so runDue() below drives the trailing
+  // probe whether this landed admitted or briefly deferred.
+  h.clock.advanceBy(MIN_FOREGROUND_PROBE_SPACING_MS);
   await h.manager.probeForeground();
+  await h.timers.runDue();
+  await flushMicrotasks();
 
   const origin = "https://resolver.example.edu";
   const snapshot = h.manager.getOriginSnapshots().find((s) => s.origin === origin);
@@ -1048,8 +1165,12 @@ test("scan_failed preserves a previously earned in verdict", async () => {
       throw new Error("host permission revoked");
     },
   };
-  h.clock.advanceBy(1_000);
+  // See the observation-cap test above: past the operator floor, and
+  // runDue() below drives the trailing probe regardless of admit/defer.
+  h.clock.advanceBy(MIN_FOREGROUND_PROBE_SPACING_MS);
   await h.manager.probeForeground();
+  await h.timers.runDue();
+  await flushMicrotasks();
 
   const after = h.manager.getSnapshot();
   expect(after).toMatchObject({
@@ -1382,6 +1503,7 @@ test("per-origin verdicts survive a service-worker restart", async () => {
         likelyAuthenticated: false,
         pausedForReauth: false,
         lastProbeAt: Date.now() - 60_000,
+        dirtySince: null,
       },
     ],
   };
@@ -1395,6 +1517,7 @@ test("per-origin verdicts survive a service-worker restart", async () => {
   expect(snapshot?.authenticated).toBe(true);
   // Restored evidence is settled state, never a stuck in-flight probe.
   expect(snapshot?.checking).toBe(false);
+  expect(snapshot?.dirtySince).toBeNull();
 });
 
 test("all tabs signed out keeps the focused tab's verdict authoritative", async () => {
@@ -1433,11 +1556,475 @@ test("closing the library tab never erases an earned warm verdict, but the next 
   // here never actually reached the no-tab branch.
   for (const id of [...h.tabs.live.keys()]) h.tabs.live.delete(id);
   h.tabs.resolverTabs.length = 0;
+  h.clock.advanceBy(MIN_FOREGROUND_PROBE_SPACING_MS); // past the operator floor from the first probe
   await h.manager.probeForeground();
+  await h.timers.runDue();
+  await flushMicrotasks();
 
   expect(h.tabs.queryCount).toBeGreaterThan(queriesAfterFirst);
   expect(h.manager.getSnapshot()).toMatchObject({
     verdict: "in",
     lastProbeOutcome: "no_tab",
   });
+});
+
+// --- Commit B: navigation/activation events, MV3 recovery -----------------
+// These exercise noteResolverNavigation/noteResolverActivated/noteTabRemoved/
+// onWake() against the SAME fake browser above. `jobs.count = 0` is used
+// freely below to keep a test's candidate-tab set to exactly the tabs it
+// sets up itself, uncomplicated by the manager's own owned keepalive tab.
+
+test("a completed navigation on a known resolver origin schedules exactly one trailing probe, and a url change plus complete for the same document coalesces into it", async () => {
+  const h = makeHarness();
+  h.jobs.count = 0;
+  await h.manager.init();
+  const origin = "https://resolver.example.edu";
+  const tab = { id: 501, url: `${origin}/discovery` };
+  h.tabs.live.set(tab.id, tab);
+
+  h.manager.noteResolverNavigation(tab.id, tab.url); // "url" changed event
+  h.manager.noteResolverNavigation(tab.id, tab.url); // "complete" event, same document
+  await flushMicrotasks();
+
+  // Still settling — a resolver SPA renders its header and mints its
+  // session token after the load event, so the probe deliberately waits.
+  expect(h.scripting.injectionCounts.get(tab.id) ?? 0).toBe(0);
+  // Two triggers for the SAME document must coalesce into one settle
+  // timer: each call re-arms (clears+resets) the origin's settle timer, so
+  // only the LAST one survives to fire. The cumulative log still shows
+  // both arm attempts even though just one is left pending.
+  expect(h.timers.delays.filter((delay) => delay === 1)).toHaveLength(2);
+  expect(h.timers.pendingDelays().filter((delay) => delay === 1)).toHaveLength(1);
+
+  await h.timers.runByDelay(1);
+  await flushMicrotasks();
+
+  expect(h.scripting.injectionCounts.get(tab.id)).toBe(1);
+  expect(h.manager.getOriginSnapshots().find((s) => s.origin === origin)?.lastProbeAt).not.toBeNull();
+});
+
+test("a navigation to an origin outside the manager's known set creates no origin state and persists nothing", async () => {
+  const h = makeHarness();
+  await h.manager.init();
+  const knownBefore = h.manager.getOriginSnapshots().map((s) => s.origin).sort();
+  const writesBefore = h.originStateWrites.length;
+
+  h.manager.noteResolverNavigation(999, "https://unrelated-vendor.example.com/dashboard");
+  await flushMicrotasks();
+
+  expect(h.manager.getOriginSnapshots().map((s) => s.origin).sort()).toEqual(knownBefore);
+  expect(h.originStateWrites.length).toBe(writesBefore);
+});
+
+test("navigating away from a known resolver to an unrelated IdP-shaped URL marks the departed origin dirty, without ever recording the new origin", async () => {
+  const h = makeHarness();
+  await h.manager.init();
+  const origin = "https://resolver.example.edu";
+  const tab = { id: 501, url: `${origin}/discovery` };
+  h.tabs.live.set(tab.id, tab);
+  h.manager.noteResolverNavigation(tab.id, tab.url);
+  await h.timers.runByDelay(1);
+  await flushMicrotasks();
+  expect(h.manager.getOriginSnapshots().find((s) => s.origin === origin)?.dirtySince).toBeNull();
+  const knownBefore = h.manager.getOriginSnapshots().map((s) => s.origin).sort();
+
+  h.tabs.live.get(tab.id)!.url = "https://idp.example.edu/idp/profile/SAML2/Redirect/SSO";
+  h.manager.noteResolverNavigation(tab.id, "https://idp.example.edu/idp/profile/SAML2/Redirect/SSO");
+
+  const snapshot = h.manager.getOriginSnapshots().find((s) => s.origin === origin);
+  expect(snapshot?.dirtySince).not.toBeNull();
+  // The IdP host is never recorded as a resolver origin.
+  expect(h.manager.getOriginSnapshots().map((s) => s.origin).sort()).toEqual(knownBefore);
+  expect(h.manager.getOriginSnapshots().some((s) => s.origin.includes("idp.example.edu"))).toBe(false);
+});
+
+test("noteTabRemoved drops the tab's epoch and settle timer, and a probe that preferred it completes without committing evidence for the dead tab", async () => {
+  const h = makeHarness();
+  h.jobs.count = 0;
+  await h.manager.init();
+  const origin = "https://resolver.example.edu";
+  const tab = { id: 501, url: `${origin}/discovery` };
+  h.tabs.live.set(tab.id, tab);
+  h.markersByTab.set(tab.id, [{ text: "Sign out", label: "" }]); // would-be decisive "in"
+  const gate = h.scripting.hold(tab.id);
+
+  h.manager.noteResolverActivated(tab.id, tab.url); // no settle delay: admits immediately
+  await flushMicrotasks();
+  expect(h.scripting.injectionCounts.get(tab.id)).toBe(1); // scan in flight
+
+  h.tabs.live.delete(tab.id); // the tab closes while its scan is still pending
+  h.manager.noteTabRemoved(tab.id);
+  expect(h.timers.pendingDelays()).not.toContain(1); // no settle timer survives it
+
+  gate.release(); // the stale scan resolves after the tab is already gone
+  await flushMicrotasks();
+
+  const snapshot = h.manager.getOriginSnapshots().find((s) => s.origin === origin);
+  expect(snapshot?.verdict).toBe("unknown");
+  expect(snapshot?.authenticated).toBe(false);
+  // Discarded, not "no evidence found": the scan never got to report
+  // anything decisive because the tab it read from was already gone.
+  expect(snapshot?.lastProbeOutcome).toBe("no_tab");
+});
+
+test("a tab that navigates while its scan is still pending cannot commit the stale document's result", async () => {
+  const h = makeHarness();
+  h.jobs.count = 0;
+  await h.manager.init();
+  const origin = "https://resolver.example.edu";
+  const tab = { id: 501, url: `${origin}/discovery` };
+  h.tabs.live.set(tab.id, tab);
+  h.markersByTab.set(tab.id, [{ text: "Sign out", label: "" }]); // stale document: would-be decisive "in"
+  const gate = h.scripting.hold(tab.id);
+
+  h.manager.noteResolverActivated(tab.id, tab.url);
+  await flushMicrotasks();
+  expect(h.scripting.injectionCounts.get(tab.id)).toBe(1);
+
+  // The operator navigates the SAME tab onward before the scan returns —
+  // the epoch this bumps is what the stale scan gets checked against.
+  h.tabs.live.get(tab.id)!.url = `${origin}/checkout`;
+  h.manager.noteResolverNavigation(tab.id, `${origin}/checkout`);
+
+  gate.release(); // the STALE document's markers resolve after the navigation
+  await flushMicrotasks();
+
+  const snapshot = h.manager.getOriginSnapshots().find((s) => s.origin === origin);
+  expect(snapshot?.authenticated).toBe(false);
+  expect(snapshot?.verdict).not.toBe("in");
+  // The stale read is discarded outright, not merely outvoted.
+  expect(snapshot?.lastProbeOutcome).toBe("no_tab");
+});
+
+test("probe starts for one origin are spaced by MIN_PROBE_START_SPACING_MS, coalescing superseded triggers into one trailing probe", async () => {
+  const h = makeHarness();
+  h.jobs.count = 0;
+  await h.manager.init();
+  const origin = "https://resolver.example.edu";
+  const tabA = { id: 501, url: `${origin}/a` };
+  const tabB = { id: 502, url: `${origin}/b` };
+  const tabC = { id: 503, url: `${origin}/c` };
+  for (const tab of [tabA, tabB, tabC]) h.tabs.live.set(tab.id, tab);
+
+  h.manager.noteResolverActivated(tabA.id, tabA.url); // nothing yet probed for this origin: runs immediately
+  await flushMicrotasks();
+  expect(h.scripting.injectionCounts.get(tabA.id)).toBe(1);
+
+  h.clock.advanceBy(2_000); // well inside the spacing window
+  h.manager.noteResolverActivated(tabB.id, tabB.url);
+  await flushMicrotasks();
+  h.clock.advanceBy(2_000);
+  h.manager.noteResolverActivated(tabC.id, tabC.url); // supersedes B as the newest pending trigger
+  await flushMicrotasks();
+
+  expect(h.scripting.injectionCounts.get(tabB.id) ?? 0).toBe(0);
+  expect(h.scripting.injectionCounts.get(tabC.id) ?? 0).toBe(0);
+
+  h.clock.advanceBy(MIN_PROBE_START_SPACING_MS);
+  await h.timers.runDue();
+  await flushMicrotasks();
+
+  // Exactly one trailing probe ran, and it carried the NEWEST generation's
+  // preferred tab — B's own trigger never got a standalone probe of its own.
+  expect(h.scripting.injectionCounts.get(tabC.id)).toBe(1);
+  expect(h.scripting.injectionCounts.get(tabB.id) ?? 0).toBe(0);
+});
+
+test("probeForeground does not bypass the spacing limit, and popup-style open/close cycling cannot exceed it", async () => {
+  const h = makeHarness();
+  await h.manager.init(); // owned tab id 1
+  await h.manager.probeForeground(); // first probe for this origin: runs immediately
+  const afterFirst = h.scripting.injectionCounts.get(1) ?? 0;
+  expect(afterFirst).toBeGreaterThan(0);
+
+  // Rapid popup open/close, each well inside MIN_FOREGROUND_PROBE_SPACING_MS
+  // of the first start. The caller-settlement fix under test resolves a
+  // throttle-deferred foreground call the instant the defer is recorded —
+  // never waiting on the eventual trailing probe — so all five can be
+  // awaited directly with no real or fake time spent.
+  for (let i = 0; i < 5; i++) {
+    h.clock.advanceBy(300); // 5 * 300ms = 1_500ms, still inside the 2s floor
+    await h.manager.probeForeground();
+  }
+  // None of these five calls could have started a genuinely new probe:
+  // every one landed inside the operator floor and coalesced into the
+  // same still-pending trailing request.
+  expect(h.scripting.injectionCounts.get(1) ?? 0).toBe(afterFirst);
+
+  // Cross the operator floor: exactly one coalesced trailing probe runs.
+  h.clock.advanceBy(MIN_FOREGROUND_PROBE_SPACING_MS);
+  await h.timers.runDue();
+  await flushMicrotasks();
+  expect(h.scripting.injectionCounts.get(1) ?? 0).toBe(afterFirst + 1);
+
+  // Companion: an AUTOMATIC trigger (navigation, on a second tab at the
+  // same origin) is still held to the full MIN_PROBE_START_SPACING_MS
+  // floor — the shorter operator floor above governs foreground requests
+  // only.
+  const liveTab = { id: 900, url: RESOLVER_OPENURL };
+  h.tabs.live.set(liveTab.id, liveTab);
+  h.manager.noteResolverNavigation(liveTab.id, liveTab.url);
+  await h.timers.runByDelay(1); // reloadSettleMs: the settle timer requests the probe
+  await flushMicrotasks();
+
+  // MIN_FOREGROUND_PROBE_SPACING_MS elapsed is enough for the operator
+  // floor but nowhere near the automatic one: the navigation trigger must
+  // still be deferred, not admitted.
+  h.clock.advanceBy(MIN_FOREGROUND_PROBE_SPACING_MS);
+  await h.timers.runDue();
+  await flushMicrotasks();
+  expect(h.scripting.injectionCounts.get(liveTab.id) ?? 0).toBe(0);
+
+  // The remaining time to complete the full automatic floor: now it runs.
+  h.clock.advanceBy(MIN_PROBE_START_SPACING_MS - MIN_FOREGROUND_PROBE_SPACING_MS);
+  await h.timers.runDue();
+  await flushMicrotasks();
+  expect(h.scripting.injectionCounts.get(liveTab.id)).toBe(1);
+});
+
+test("a dirty origin survives a simulated worker restart and is probed by onWake(); a clean, not-yet-due origin is not", async () => {
+  const origin = "https://resolver.example.edu";
+  const h = makeHarness();
+  h.jobs.count = 0;
+  await h.manager.init();
+  const tab = { id: 701, url: `${origin}/discovery` };
+  h.tabs.live.set(tab.id, tab);
+  h.manager.noteResolverNavigation(tab.id, tab.url);
+  await h.timers.runByDelay(1);
+  await flushMicrotasks();
+  expect(h.manager.getOriginSnapshots().find((s) => s.origin === origin)?.dirtySince).toBeNull();
+
+  // The operator leaves for an IdP: dirtySince is written through the
+  // serialized persist chain.
+  h.tabs.live.get(tab.id)!.url = "https://idp.example.edu/idp/sso";
+  h.manager.noteResolverNavigation(tab.id, "https://idp.example.edu/idp/sso");
+  await flushMicrotasks();
+  const dirtyAt = h.manager.getOriginSnapshots().find((s) => s.origin === origin)?.dirtySince;
+  expect(dirtyAt).not.toBeNull();
+  const persisted = h.storageValues["keepalive.originStates"] as KeepaliveOriginSnapshot[];
+  expect(persisted.find((s) => s.origin === origin)?.dirtySince).toBe(dirtyAt);
+
+  // The worker "dies": a fresh manager restores from the SAME persisted storage.
+  const restarted = makeHarness(4, undefined, { storageValues: { ...h.storageValues } });
+  await restarted.manager.init();
+  expect(restarted.manager.getOriginSnapshots().find((s) => s.origin === origin)?.dirtySince).toBe(dirtyAt);
+
+  const liveTab = { id: 702, url: `${origin}/account` };
+  restarted.tabs.live.set(liveTab.id, liveTab);
+  restarted.tabs.resolverTabs.push(liveTab);
+  const queriesBeforeWake = restarted.tabs.queryCount;
+  await restarted.manager.onWake();
+  await flushMicrotasks();
+  expect(restarted.tabs.queryCount).toBeGreaterThan(queriesBeforeWake);
+  expect(restarted.manager.getOriginSnapshots().find((s) => s.origin === origin)?.dirtySince).toBeNull();
+
+  // Clean, not paused, nowhere near due: the very next wake must not touch
+  // the browser at all.
+  const queriesAfterCommit = restarted.tabs.queryCount;
+  await restarted.manager.onWake();
+  expect(restarted.tabs.queryCount).toBe(queriesAfterCommit);
+});
+
+test("onWake() probes purely from dirty/paused/due origin state, with no daemon-port involvement", async () => {
+  const h = makeHarness();
+  h.jobs.count = 0;
+  await h.manager.init();
+  const origin = "https://resolver.example.edu";
+  const tab = { id: 501, url: `${origin}/discovery` };
+  h.tabs.live.set(tab.id, tab);
+  h.manager.noteResolverNavigation(tab.id, tab.url); // establishes the tab<->origin association
+  await h.timers.runByDelay(1);
+  await flushMicrotasks();
+
+  // KeepaliveManager has no port/message concept at all — onWake() is
+  // callable with nothing but the manager itself, and a clean, committed
+  // origin means there is nothing for it to do.
+  const queriesBefore = h.tabs.queryCount;
+  await h.manager.onWake();
+  expect(h.tabs.queryCount).toBe(queriesBefore);
+
+  // Dirty it via a departure-shaped navigation, which marks dirty but does
+  // not itself probe…
+  h.tabs.live.get(tab.id)!.url = "https://idp.example.edu/idp/sso";
+  h.manager.noteResolverNavigation(tab.id, "https://idp.example.edu/idp/sso");
+  expect(h.manager.getOriginSnapshots().find((s) => s.origin === origin)?.dirtySince).not.toBeNull();
+  expect(h.tabs.queryCount).toBe(queriesBefore);
+
+  // …and onWake() picks it up purely from that state. "wake" is an
+  // automatic trigger: a throttle-deferred call resolves only once its
+  // trailing probe runs (unlike a foreground request's immediate defer
+  // settlement), so it is fired without an await and any fake spacing
+  // timer it might arm (only possible if this landed exactly on the
+  // floor and was deferred) is driven explicitly rather than raced
+  // against real time.
+  h.clock.advanceBy(MIN_PROBE_START_SPACING_MS);
+  void h.manager.onWake();
+  await flushMicrotasks();
+  if (h.timers.pendingDelays().includes(0)) await h.timers.runByDelay(0);
+  await flushMicrotasks();
+  expect(h.tabs.queryCount).toBeGreaterThan(queriesBefore);
+  expect(h.manager.getOriginSnapshots().find((s) => s.origin === origin)?.dirtySince).toBeNull();
+});
+
+test("repeated sync() calls cannot postpone the cycle: the absolute deadline still fires the owned-tab reload", async () => {
+  const h = makeHarness(); // interval=4 minutes -> intervalMs = 240_000
+  await h.manager.init(); // owned tab id 1 created, cycle timer armed
+  expect(h.tabs.reloaded).toEqual([]);
+
+  // Heartbeats every 60s, well inside the 4-minute interval — the historical
+  // bug re-armed a fresh 4-minute reload timer on every single one of these,
+  // so the owned tab was never reloaded.
+  for (let i = 0; i < 3; i++) {
+    h.clock.advanceBy(60_000);
+    await h.manager.sync();
+  }
+  expect(h.tabs.reloaded).toEqual([]); // not due yet
+
+  // Cross the ORIGINAL deadline (4 minutes after init — one more 60s tick).
+  h.clock.advanceBy(60_000);
+  await h.timers.runDue();
+  await flushMicrotasks();
+
+  expect(h.tabs.reloaded).toEqual([1]);
+});
+
+test("a settle timer firing does not cancel the reauth watch armed for a paused origin", async () => {
+  const h = makeHarness();
+  await h.manager.init();
+  h.tabs.nextURL = "https://idp.example.edu/idp/profile/SAML2/Redirect/SSO?service=resolver";
+  await h.timers.runByDelay(4 * 60_000); // cycleTimer: the interval reload fires
+  await h.timers.runByDelay(1); // cycleTimer: reloadSettleMs bounded final-URL inspection -> pauses for reauth, arms the reauthTimer
+  await flushMicrotasks();
+  expect(h.manager.getSnapshot().pausedForReauth).toBe(true);
+  expect(h.timers.pendingDelays()).toContain(10); // observeMs, configured by the harness
+
+  // Clear the spacing window opened by the pause-triggering probe so the
+  // settle-triggered probe below actually RUNS (admitted, not merely
+  // deferred) — this test is about a running probe leaving the reauth
+  // watch alone, not about a deferred one trivially doing so.
+  h.clock.advanceBy(MIN_PROBE_START_SPACING_MS);
+
+  // A live user tab visits the SAME known resolver origin independently of
+  // the paused keepalive tab (still parked on the IdP); its navigation
+  // arms a settle timer. Its markers read decisively "out" so this probe
+  // cannot itself legitimately resume the pause — the owned tab's own
+  // auth_url observation would only re-affirm "pause", a no-op while
+  // already paused.
+  const liveTab = { id: 777, url: "https://resolver.example.edu/discovery" };
+  h.tabs.live.set(liveTab.id, liveTab);
+  h.markersByTab.set(liveTab.id, [{ text: "Sign in", label: "" }]); // decisive "out"
+  h.manager.noteResolverNavigation(liveTab.id, liveTab.url);
+  expect(h.timers.pendingDelays()).toContain(1);
+
+  await h.timers.runByDelay(1); // the settle timer fires, and its probe runs immediately
+  await flushMicrotasks();
+
+  // The reauth watch is still armed — an unrelated settle timer, and the
+  // real probe it triggered, must never cancel it, or the paused operator
+  // would silently stop being polled for recovery.
+  expect(h.timers.pendingDelays()).toContain(10);
+  expect(h.manager.getSnapshot().pausedForReauth).toBe(true);
+});
+
+test("openReauth's pauseForReauth arms the observeMs watch immediately, and does not cancel the pending cycle timer", async () => {
+  const h = makeHarness();
+  await h.manager.init(); // cycle timer armed at 240_000
+  // Advance most of the way through the interval so any "inherited" cycle
+  // timer would fire far later than observeMs.
+  h.clock.advanceBy(200_000);
+
+  await h.manager.openReauth(); // explicit operator sign-in request
+  expect(h.manager.getSnapshot().pausedForReauth).toBe(true);
+
+  // A fresh observeMs-delay watch is pending RIGHT NOW — not the leftover
+  // ~40s of an inherited cycle timer, and not a full interval — and the
+  // pre-existing cycle timer is untouched: one timer kind can never cancel
+  // another.
+  expect(h.timers.pendingDelays().slice().sort((a, b) => a - b)).toEqual([10, 240_000]);
+});
+
+test("resumeAfterReauth clears the logical pause even when the owned tab has closed, without re-pinning a gone tab", async () => {
+  const h = makeHarness();
+  await h.manager.init(); // owned tab id 1
+  h.tabs.nextURL = "https://idp.example.edu/idp/profile/SAML2/Redirect/SSO?service=resolver";
+  await h.timers.runNext(); // reload
+  await h.timers.runNext(); // bounded final-URL inspection -> pauses for reauth
+  await flushMicrotasks();
+  expect(h.manager.getSnapshot().pausedForReauth).toBe(true);
+
+  // The operator completes sign-in — the tab now reads a decisive "in" —
+  // but the scan is held open while the manager independently decides to
+  // close the owned tab (job queue drained), racing the resume disposition
+  // against the tab's own removal. closeTab() never touches the per-tab
+  // document epoch (only noteResolverNavigation/noteTabRemoved do), so the
+  // in-flight read stays valid — it is resumeAfterReauth's OWN handling of
+  // a since-vanished owned tab that is under test here, not the read.
+  const origin = "https://resolver.example.edu";
+  h.tabs.live.get(1)!.url = RESOLVER_OPENURL;
+  h.markersByTab.set(1, [{ text: "Sign out", label: "" }]);
+  const gate = h.scripting.hold(1);
+  const probe = h.manager.probeForeground();
+  await flushMicrotasks(); // the scan is in flight, held
+
+  h.jobs.count = 0;
+  await h.manager.sync(); // closeTab(): tab 1 removed, this.tabID cleared
+  expect(h.tabs.removed).toContain(1);
+
+  gate.release(); // the (still valid, same-document) scan resolves after removal
+  await probe;
+  await flushMicrotasks();
+
+  expect(h.manager.getSnapshot().pausedForReauth).toBe(false);
+  expect(h.manager.getOriginSnapshots().find((s) => s.origin === origin)?.pausedForReauth).toBe(false);
+  // Nothing attempted to re-pin/unmute a tab id that no longer exists.
+  expect(
+    h.tabs.updates.some((u) => u.id === 1 && u.properties.pinned === true && u.properties.muted === true),
+  ).toBe(false);
+});
+
+test("an older persisted write can never land after a newer one: the serialized chain keeps writes single-flight", async () => {
+  const defaultOrigin = "https://resolver.example.edu";
+  const secondOrigin = "https://onesearch.library.example-college.edu";
+  const h = makeHarness(4, undefined, { knownOrigins: [defaultOrigin, secondOrigin] });
+  h.jobs.count = 0;
+  await h.manager.init();
+
+  const tabA = { id: 601, url: `${defaultOrigin}/discovery` };
+  const tabB = { id: 602, url: `${secondOrigin}/discovery` };
+  h.tabs.live.set(tabA.id, tabA);
+  h.tabs.live.set(tabB.id, tabB);
+  h.manager.noteResolverNavigation(tabA.id, tabA.url);
+  h.manager.noteResolverNavigation(tabB.id, tabB.url);
+  await h.timers.runByDelay(1);
+  await h.timers.runByDelay(1);
+  await flushMicrotasks();
+  // Both origins hold committed, non-dirty state — a clean baseline.
+  expect(h.manager.getOriginSnapshots().every((s) => s.dirtySince === null)).toBe(true);
+
+  h.storageGate.arm(1); // freeze the NEXT persisted write only
+  h.tabs.live.get(tabA.id)!.url = "https://idp.example.edu/idp/sso"; // A departs for an IdP
+  h.manager.noteResolverNavigation(tabA.id, "https://idp.example.edu/idp/sso");
+  await flushMicrotasks();
+  expect(h.storageGate.pendingCount).toBe(1); // A's dirty-mark write is held open
+
+  h.tabs.live.get(tabB.id)!.url = "https://idp.example.edu/idp/sso"; // B departs too, moments later
+  h.manager.noteResolverNavigation(tabB.id, "https://idp.example.edu/idp/sso");
+  await flushMicrotasks();
+  // If the manager issued a second, concurrent storage.set() here instead of
+  // queuing behind the serialized chain, this fake would happily let it
+  // resolve before the first — the exact race an unawaited full-array write
+  // used to allow. It must not: still exactly one write outstanding.
+  expect(h.storageGate.pendingCount).toBe(1);
+
+  h.storageGate.releaseOldest();
+  await flushMicrotasks();
+  h.storageGate.releaseOldest(); // release whatever the chain queued next, if anything
+  await flushMicrotasks();
+
+  const finalStates = h.storageValues["keepalive.originStates"] as KeepaliveOriginSnapshot[];
+  // The last thing written reflects BOTH departures — never a stale
+  // snapshot missing one because an earlier write's late completion
+  // clobbered a later one.
+  expect(finalStates.find((s) => s.origin === defaultOrigin)?.dirtySince).not.toBeNull();
+  expect(finalStates.find((s) => s.origin === secondOrigin)?.dirtySince).not.toBeNull();
 });

@@ -543,6 +543,10 @@ export interface BridgeDeps {
     /** Used only for the singleton inbox tab. */
     query?(query: { url?: string; groupId?: number }): Promise<TabInfo[]>;
     onRemoved: Listenable<[number, { isWindowClosing: boolean }]>;
+    /** ADR-0013 privileges the focused tab: an activation with no matching
+     * navigation event is still evidence the operator is looking at that
+     * origin's resolver page. */
+    onActivated: Listenable<[{ tabId: number; windowId: number }]>;
     /** Optional (Chrome): add tabs to a group, creating one when groupId is
      * omitted. Returns the group id. Absent on platforms without tab groups. */
     group?(opts: { tabIds: number[]; groupId?: number }): Promise<number>;
@@ -1135,7 +1139,8 @@ export class Bridge {
   private keepaliveAuthenticated = false;
   /** Current keepalive reauthentication pause, used by computeBadge. */
   private keepaliveReauthNeeded = false;
-  /** Attached only after the bridge has hydrated and started. */
+  /** Attached synchronously at worker startup, before bridge.start() binds
+   * listeners, so a wake-triggered navigation can never observe it unset. */
   private keepaliveManager: KeepaliveManager | undefined;
   /** Human-auth stalls and their resolver offers remain worker-local so an
    * operator can explicitly reset and re-drive them without persistence. */
@@ -1307,6 +1312,7 @@ export class Bridge {
         likelyAuthenticated: isDefault && state.likelyAuthenticated === true,
         pausedForReauth: isDefault && state.pausedForReauth,
         lastProbeAt: isDefault ? state.lastProbeAt : null,
+        dirtySince: null,
       };
     });
   }
@@ -3552,7 +3558,14 @@ export class Bridge {
       return this.onTabUpdated(tabID, change, tab);
     });
     this.deps.tabs.onRemoved.addListener((tabID) => {
+      // Synchronous before the async removal handler: per-tab epochs, settle
+      // timers and origin associations must never accumulate against a dead
+      // tab id even if onTabRemoved's own work is still pending on `ready`.
+      this.keepaliveManager?.noteTabRemoved(tabID);
       return this.onTabRemoved(tabID);
+    });
+    this.deps.tabs.onActivated.addListener(({ tabId }) => {
+      return this.onTabActivated(tabId);
     });
     this.deps.downloads.onCreated.addListener((item) => {
       return this.onDownloadCreated(item);
@@ -3584,6 +3597,14 @@ export class Bridge {
   private async onKeepaliveAlarm(): Promise<void> {
     await this.ready;
     await this.releaseExpiredQueuedHandoffs();
+    // Recovery runs unconditionally on this wake, independent of the native
+    // port: a service worker that died mid-probe still needs its dirty/paused
+    // origins re-probed even while the daemon connection is also down. It is
+    // deliberately NOT awaited — reconnecting the daemon and refreshing the
+    // triage count are latency-sensitive on this one wake, and a session probe
+    // can take seconds of browser API work with nothing here depending on its
+    // result.
+    void this.keepaliveManager?.onWake();
     if (this.port === null && !this.closingDeliberately) {
       this.reconnectAttempts = 0;
       this.connect();
@@ -5488,6 +5509,16 @@ export class Bridge {
     if (pageCaptureWaiter !== undefined && change.status === "complete") {
       pageCaptureWaiter(true);
     }
+    // A tracked handoff tab landing on the resolver is the same evidence as
+    // an untracked one — the manager parses to an origin and discards the
+    // raw URL itself, so this runs unconditionally before the tracked-job
+    // gate below (and before an in-flight injection could commit a result
+    // against a document epoch this navigation just invalidated). SPA/history
+    // navigation on the tracked path below can land without a "complete"
+    // status, which is why "loading" is included here too.
+    if (change.url !== undefined || change.status === "complete" || change.status === "loading") {
+      this.keepaliveManager?.noteResolverNavigation(tabID, change.url ?? tab.url);
+    }
     await this.ready;
     const job = findByTab(this.store, tabID);
     if (!job) {
@@ -6466,6 +6497,20 @@ export class Bridge {
       }
   }
 
+  /** Chrome may not have populated the tab's URL by the time onActivated
+   * fires (e.g. a brand-new tab still loading its first document); look it
+   * up rather than trust the event payload. A tab that vanished between the
+   * event and the lookup is not evidence of anything — swallow and drop. */
+  private async onTabActivated(tabID: number): Promise<void> {
+    let url: string | undefined;
+    try {
+      url = (await this.deps.tabs.get(tabID)).url;
+    } catch {
+      return;
+    }
+    this.keepaliveManager?.noteResolverActivated(tabID, url);
+  }
+
   private async onTabRemoved(tabID: number): Promise<void> {
     await this.ready;
     const pageCaptureWaiter = this.pageCaptureLoadWaiters.get(tabID);
@@ -7159,6 +7204,7 @@ function realDeps(): BridgeDeps {
       query: (query) => chrome.tabs.query(query),
       onUpdated: { addListener: (cb) => chrome.tabs.onUpdated.addListener(cb) },
       onRemoved: { addListener: (cb) => chrome.tabs.onRemoved.addListener(cb) },
+      onActivated: { addListener: (cb) => chrome.tabs.onActivated.addListener(cb) },
       ...(typeof chrome.tabs.group === "function"
         ? { group: (opts: { tabIds: number[]; groupId?: number }) => chrome.tabs.group(opts as chrome.tabs.GroupOptions) }
         : {}),
@@ -7362,38 +7408,43 @@ if (typeof chrome !== "undefined" && chrome.runtime?.id) {
     void bridge.onPermissionsChanged();
   });
   // KEEPALIVE INTEGRATION
-  void bridge.start().then(() => {
-    const manager = initKeepalive(chromeKeepaliveAPI(chrome), {
-      trackedJobCount: () => bridge.trackedJobCount(),
-      warmDemand: () => bridge.warmDemand(),
-      latestOpenURL: () => bridge.latestOpenURL(),
-      knownResolverOrigins: () => bridge.knownResolverOrigins(),
-      queuedAuthJobs: () => bridge.queuedAuthJobs(),
-      stalledAuthJobs: () => bridge.stalledAuthJobIDs(),
-      lastAuthReturnedAt: () => bridge.lastAuthReturnedAt(),
-      workWindowID: () => bridge.workWindowIDForKeepalive(),
-      onTabPlaced: (tabID) => bridge.foldKeepaliveTab(tabID),
-      onAuthenticationChanged: (authenticated, origin?: string) => {
-        void bridge.setKeepaliveAuthenticated(authenticated, origin);
-      },
-      onSessionEvidence: (_source: KeepaliveProbeSource, origin?: string) => {
-        bridge.emitSessionEvidence("warm_verified", origin);
-      },
-      onReauthStateChanged: (paused) => bridge.setKeepaliveReauthNeeded(paused),
-      surfaceReauthTab: async (tabID) => {
-        try {
-          const tab = await chrome.tabs.get(tabID);
-          if (tab.windowId === undefined) return;
-          const win = await chrome.windows.get(tab.windowId);
-          await chrome.windows.update(tab.windowId, {
-            focused: true,
-            ...(win.state === "minimized" ? { state: "normal" as const } : {}),
-          });
-        } catch {
-          // Badge and popup remain the recoverable reauth signal.
-        }
-      },
-    });
-    bridge.attachKeepalive(manager);
+  // Constructed and attached synchronously, before bridge.start() runs (and
+  // therefore before bindListeners() binds any chrome.tabs/alarms listener):
+  // a navigation that WAKES this worker must never reach onTabUpdated with
+  // this.keepaliveManager still undefined. initKeepalive() itself only fires
+  // manager.init() without awaiting it, so hydration continues concurrently
+  // with the bridge's own async startup below — neither blocks the other.
+  const keepaliveManager = initKeepalive(chromeKeepaliveAPI(chrome), {
+    trackedJobCount: () => bridge.trackedJobCount(),
+    warmDemand: () => bridge.warmDemand(),
+    latestOpenURL: () => bridge.latestOpenURL(),
+    knownResolverOrigins: () => bridge.knownResolverOrigins(),
+    queuedAuthJobs: () => bridge.queuedAuthJobs(),
+    stalledAuthJobs: () => bridge.stalledAuthJobIDs(),
+    lastAuthReturnedAt: () => bridge.lastAuthReturnedAt(),
+    workWindowID: () => bridge.workWindowIDForKeepalive(),
+    onTabPlaced: (tabID) => bridge.foldKeepaliveTab(tabID),
+    onAuthenticationChanged: (authenticated, origin?: string) => {
+      void bridge.setKeepaliveAuthenticated(authenticated, origin);
+    },
+    onSessionEvidence: (_source: KeepaliveProbeSource, origin?: string) => {
+      bridge.emitSessionEvidence("warm_verified", origin);
+    },
+    onReauthStateChanged: (paused) => bridge.setKeepaliveReauthNeeded(paused),
+    surfaceReauthTab: async (tabID) => {
+      try {
+        const tab = await chrome.tabs.get(tabID);
+        if (tab.windowId === undefined) return;
+        const win = await chrome.windows.get(tab.windowId);
+        await chrome.windows.update(tab.windowId, {
+          focused: true,
+          ...(win.state === "minimized" ? { state: "normal" as const } : {}),
+        });
+      } catch {
+        // Badge and popup remain the recoverable reauth signal.
+      }
+    },
   });
+  bridge.attachKeepalive(keepaliveManager);
+  void bridge.start();
 }
