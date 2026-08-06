@@ -3607,8 +3607,9 @@ test("concurrent inbox opens reuse one managed tab and focus it once", async () 
   expect(h.tabs.created).toEqual([{ url: OPENURL, active: true }]);
   expect(h.tabs.activated).toEqual([100]);
 });
-test("session state probes a live resolver tab before claiming signed out", async () => {
+test("session probe inspects a live resolver tab before claiming signed out, and a snapshot read never does", async () => {
   const h = makeHarness();
+  let injections = 0;
   const urls = {
     runtimeID: "papio-test-id",
     inboxURL: "chrome-extension://papio-test-id/inbox.html",
@@ -3651,7 +3652,10 @@ test("session state probes a live resolver tab before claiming signed out", asyn
     },
     permissions: { getAll: async () => ({ origins: [] }) },
     scripting: {
-      executeScript: async () => [{ result: [{ text: "Sign out", label: "" }] }],
+      executeScript: async () => {
+        injections += 1;
+        return [{ result: [{ text: "Sign out", label: "" }] }];
+      },
     },
     timers: { setTimeout: () => 0, clearTimeout: () => {} },
   };
@@ -3666,8 +3670,16 @@ test("session state probes a live resolver tab before claiming signed out", asyn
   h.tabs.live.set(777, { id: 777, url: "https://resolver.example.edu/account" });
   h.bridge.attachKeepalive(manager);
 
+  // papio.session.state is a pure read: it must not inject into the operator's
+  // library tab. Only papio.session.probe may, and the popup sends that once
+  // when it opens.
   await expect(
     handleInboxRuntimeMessage(h.bridge, { type: "papio.session.state" }, { id: urls.runtimeID, url: urls.popupURL }, urls),
+  ).resolves.toMatchObject({ ok: true });
+  expect(injections).toBe(0);
+
+  await expect(
+    handleInboxRuntimeMessage(h.bridge, { type: "papio.session.probe" }, { id: urls.runtimeID, url: urls.popupURL }, urls),
   ).resolves.toMatchObject({
     ok: true,
     state: {
@@ -3676,6 +3688,7 @@ test("session state probes a live resolver tab before claiming signed out", asyn
       resolverOrigin: "https://resolver.example.edu",
     },
   });
+  expect(injections).toBeGreaterThan(0);
 });
 test("session state reports each known resolver and sign-in targets its origin", async () => {
   const h = makeHarness();

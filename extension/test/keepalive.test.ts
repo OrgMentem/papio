@@ -2,7 +2,7 @@
 // Deterministic manager tests: all scheduling is a fake one-shot timer, never
 // a wall-clock interval or a Chrome API.
 
-import { expect, test } from "bun:test";
+import { afterEach, expect, test } from "bun:test";
 import { Window } from "happy-dom";
 
 import {
@@ -12,14 +12,31 @@ import {
   collectResolverMarkers,
   isAuthenticationURL,
   KeepaliveManager,
+  MAX_OBSERVED_TABS_PER_ORIGIN,
   SESSION_STALE_MS,
   type KeepaliveAPI,
+  type KeepaliveOriginSnapshot,
+  type KeepaliveProbeSource,
   type KeepaliveTab,
   type KeepaliveTimers,
   type ResolverMarker,
+  type SessionVerdict,
 } from "../src/keepalive";
 
 const RESOLVER_OPENURL = "https://resolver.example.edu/openurl?genre=article";
+
+// KeepaliveManager has no clock seam of its own — it reads the real
+// Date.now() the same way production code does. Every harness patches the
+// global once, through this single mechanism, instead of individual tests
+// saving/restoring Date.now by hand: makeHarness() owns the override and
+// afterEach() always undoes it, so a forgotten restore in one test can never
+// leak a frozen clock into the next.
+const REAL_DATE_NOW = Date.now.bind(Date);
+let restoreDateNow: (() => void) | undefined;
+afterEach(() => {
+  restoreDateNow?.();
+  restoreDateNow = undefined;
+});
 
 class FakeTimers implements KeepaliveTimers {
   private nextID = 1;
@@ -128,6 +145,41 @@ class FakeTabs {
   }
 }
 
+/** Controls chrome.scripting.executeScript per tab: a default resolves
+ * immediately from markersByTab/defaultMarkers exactly like before, but
+ * hold() lets a test keep one tab's scan open while a sibling's completes,
+ * so an intermediate reducer result would be observable if the
+ * implementation ever leaked one. injectionCounts lets a test assert a tab
+ * was — or was never — inspected at all. */
+class FakeScripting {
+  readonly injectionCounts = new Map<number, number>();
+  private readonly held = new Map<number, ReturnType<typeof Promise.withResolvers<ResolverMarker[]>>>();
+
+  constructor(
+    private readonly markersByTab: Map<number, ResolverMarker[]>,
+    private readonly defaultMarkers: ResolverMarker[],
+  ) {}
+
+  hold(tabId: number): { release: (markers?: ResolverMarker[]) => void } {
+    const gate = Promise.withResolvers<ResolverMarker[]>();
+    this.held.set(tabId, gate);
+    return {
+      release: (markers) => {
+        gate.resolve(markers ?? this.markersByTab.get(tabId) ?? this.defaultMarkers);
+        this.held.delete(tabId);
+      },
+    };
+  }
+
+  executeScript = async (injection?: { target?: { tabId?: number } }): Promise<{ result?: unknown }[]> => {
+    const tabId = injection?.target?.tabId ?? -1;
+    this.injectionCounts.set(tabId, (this.injectionCounts.get(tabId) ?? 0) + 1);
+    const gate = this.held.get(tabId);
+    const markers = gate !== undefined ? await gate.promise : this.markersByTab.get(tabId) ?? this.defaultMarkers;
+    return [{ result: markers }];
+  };
+}
+
 interface HarnessResolver {
   latestOpenURL?: string | undefined;
   storedOrigin?: unknown;
@@ -147,12 +199,19 @@ function makeHarness(
   jobs: { count: number };
   tabs: FakeTabs;
   timers: FakeTimers;
+  scripting: FakeScripting;
+  clock: { now: () => number; advanceBy: (ms: number) => void };
   badge: string[];
   reauths: { count: number };
   reauthState: boolean[];
+  sessionEvidence: { source: KeepaliveProbeSource; origin: string | undefined }[];
   storageValues: Record<string, unknown>;
   resolverMarkers: ResolverMarker[];
   markersByTab: Map<number, ResolverMarker[]>;
+  /** Every "keepalive.originStates" payload ever persisted, in write order —
+   * lets a test prove a probe committed a verdict exactly once instead of
+   * leaking an intermediate per-tab result. */
+  originStateWrites: KeepaliveOriginSnapshot[][];
 } {
   const jobs = { count: 1 };
   const tabs = new FakeTabs();
@@ -160,6 +219,8 @@ function makeHarness(
   const badge: string[] = [];
   const reauths = { count: 0 };
   const reauthState: boolean[] = [];
+  const sessionEvidence: { source: KeepaliveProbeSource; origin: string | undefined }[] = [];
+  const originStateWrites: KeepaliveOriginSnapshot[][] = [];
   const storageValues: Record<string, unknown> = {
     "keepalive.interval": interval,
     "keepalive.enabled": true,
@@ -170,6 +231,12 @@ function makeHarness(
   const resolverMarkers: ResolverMarker[] = [{ text: "Sign out", label: "" }];
   /** Per-tab marker overrides: tabs render sessions independently. */
   const markersByTab = new Map<number, ResolverMarker[]>();
+  const scripting = new FakeScripting(markersByTab, resolverMarkers);
+  const clockState = { now: REAL_DATE_NOW() };
+  Date.now = () => clockState.now;
+  restoreDateNow = () => {
+    Date.now = REAL_DATE_NOW;
+  };
   const api: KeepaliveAPI = {
     tabs,
     timers,
@@ -177,16 +244,16 @@ function makeHarness(
       get: async () => ({ ...storageValues }),
       set: async (values) => {
         Object.assign(storageValues, values);
+        const states = values["keepalive.originStates"];
+        if (Array.isArray(states)) {
+          originStateWrites.push(states.map((entry) => ({ ...(entry as KeepaliveOriginSnapshot) })));
+        }
       },
     },
     permissions: {
       getAll: async () => ({ origins: resolverConfig?.grantedOrigins ?? [] }),
     },
-    scripting: {
-      executeScript: async (injection?: { target?: { tabId?: number } }) => [
-        { result: markersByTab.get(injection?.target?.tabId ?? -1) ?? resolverMarkers },
-      ],
-    },
+    scripting: { executeScript: scripting.executeScript },
     action: { setBadgeText: async ({ text }) => void badge.push(text) },
   };
   const manager = new KeepaliveManager(api, {
@@ -203,6 +270,9 @@ function makeHarness(
     onReauthStateChanged: (paused) => {
       reauthState.push(paused);
     },
+    onSessionEvidence: (source, origin) => {
+      sessionEvidence.push({ source, origin });
+    },
     observeMs: 10,
     reloadSettleMs: 1,
   });
@@ -212,12 +282,21 @@ function makeHarness(
     jobs,
     tabs,
     timers,
+    scripting,
+    clock: {
+      now: () => clockState.now,
+      advanceBy: (ms) => {
+        clockState.now += ms;
+      },
+    },
     badge,
     reauths,
     reauthState,
+    sessionEvidence,
     storageValues,
     resolverMarkers,
     markersByTab,
+    originStateWrites,
   };
 }
 
@@ -252,6 +331,28 @@ test("creates one pinned resolver tab, reloads it, and closes it when jobs finis
 async function flushMicrotasks(rounds = 25): Promise<void> {
   for (let i = 0; i < rounds; i++) await Promise.resolve();
 }
+
+/** Distinct verdict values actually WRITTEN for `origin`, in commit order,
+ * starting from `initial`. A correct atomic reducer commits at most once
+ * per probe; the bug this batch fixes was each inspected tab calling
+ * setVerdict() as soon as it resolved, so an intermediate wrong verdict
+ * could be persisted — and observed — before the reducer finished. */
+function verdictCommits(
+  writes: readonly KeepaliveOriginSnapshot[][],
+  origin: string,
+  initial: SessionVerdict,
+): SessionVerdict[] {
+  const commits: SessionVerdict[] = [];
+  let prev: SessionVerdict = initial;
+  for (const snapshot of writes) {
+    const row = snapshot.find((entry) => entry.origin === origin);
+    if (row === undefined || row.verdict === prev) continue;
+    commits.push(row.verdict);
+    prev = row.verdict;
+  }
+  return commits;
+}
+
 
 test("papio-8f79b6ba67bdbdaa: concurrent creation attempts across sync() calls produce exactly one tab", async () => {
   // sync() is now invoked from every successful triage-counts response, in
@@ -615,33 +716,45 @@ test("snapshot resolves a durable resolver before granted permission fallback", 
   expect(fallback.manager.getSnapshot().resolverOrigin).toBe("https://granted.resolver.example");
 });
 
-test("on-demand session checks run when unknown and after the freshness window", async () => {
-  const originalNow = Date.now;
-  let now = originalNow();
-  Date.now = () => now;
-  try {
-    const h = makeHarness();
-    await h.manager.init();
-    const initialQueries = h.tabs.queryCount;
+test("probeForeground always runs a real scan, even moments after the previous one completed", async () => {
+  // probeForeground() replaces checkNow(): SESSION_STALE_MS is a
+  // display-trust budget for the popup only, never a gate on whether a
+  // probe actually runs.
+  const h = makeHarness();
+  await h.manager.init();
 
-    await h.manager.checkNow(100);
-    expect(h.tabs.queryCount).toBeGreaterThan(initialQueries);
-    const firstCheck = h.manager.getSnapshot();
-    expect(firstCheck.lastCheckAt).toBe(now);
-    expect(firstCheck.authenticated).toBe(true);
+  await h.manager.probeForeground();
+  expect(h.manager.getSnapshot()).toMatchObject({ verdict: "in", lastProbeOutcome: "markers" });
+  const injectedAfterFirst = h.scripting.injectionCounts.get(1) ?? 0;
+  expect(injectedAfterFirst).toBeGreaterThan(0);
+  const queriesAfterFirst = h.tabs.queryCount;
 
-    const freshQueries = h.tabs.queryCount;
-    await h.manager.checkNow(100);
-    expect(h.tabs.queryCount).toBe(freshQueries);
+  // Well within SESSION_STALE_MS — the deleted freshness gate would have
+  // skipped this call entirely.
+  h.clock.advanceBy(1_000);
+  expect(h.clock.now()).toBeLessThan((h.manager.getSnapshot().lastVerdictAt ?? 0) + SESSION_STALE_MS);
+  await h.manager.probeForeground();
 
-    now += SESSION_STALE_MS + 1;
-    h.tabs.live.get(1)!.url = "https://resolver.example.edu/account";
-    await h.manager.checkNow(100);
-    expect(h.tabs.queryCount).toBeGreaterThan(freshQueries);
-    expect(h.manager.getSnapshot().lastCheckAt).toBe(now);
-  } finally {
-    Date.now = originalNow;
+  expect(h.tabs.queryCount).toBeGreaterThan(queriesAfterFirst);
+  expect(h.scripting.injectionCounts.get(1) ?? 0).toBeGreaterThan(injectedAfterFirst);
+  expect(h.manager.getSnapshot().lastProbeAt).toBe(h.clock.now());
+});
+
+test("getSnapshot() and getOriginSnapshots() are pure reads that never probe", async () => {
+  const h = makeHarness();
+  await h.manager.init();
+  await h.manager.probeForeground();
+  const injectionsAfterProbe = [...h.scripting.injectionCounts.values()].reduce((a, b) => a + b, 0);
+  const queriesAfterProbe = h.tabs.queryCount;
+
+  for (let i = 0; i < 5; i++) {
+    h.manager.getSnapshot();
+    h.manager.getOriginSnapshots();
   }
+
+  const injectionsAfterReads = [...h.scripting.injectionCounts.values()].reduce((a, b) => a + b, 0);
+  expect(injectionsAfterReads).toBe(injectionsAfterProbe);
+  expect(h.tabs.queryCount).toBe(queriesAfterProbe);
 });
 
 test("a live resolver tab is evidence while its probe determines the verdict", async () => {
@@ -650,11 +763,14 @@ test("a live resolver tab is evidence while its probe determines the verdict", a
   const liveTab = { id: 42, url: "https://resolver.example.edu/account" };
   h.tabs.live.set(liveTab.id, liveTab);
   h.tabs.resolverTabs.push(liveTab);
-  const pending = h.manager.checkNow(100);
+  const gate = h.scripting.hold(liveTab.id);
+  const pending = h.manager.probeForeground();
+  await flushMicrotasks();
   const during = h.manager.getSnapshot();
   expect(during.checking).toBe(true);
-  // The fake browser resolves immediately, so the completed state is the
+  // The fake browser resolves once released, so the completed state is the
   // authoritative resolver-origin verdict rather than the interim evidence.
+  gate.release();
   await pending;
   expect(h.manager.getSnapshot()).toMatchObject({
     authenticated: true,
@@ -692,15 +808,29 @@ test("resolver marker classifier prioritizes sign-out and handles Primo-shaped a
     ]),
   ).toBe("in");
 });
+
+test("a lone 'My account' marker is not sign-in evidence", () => {
+  // "My account" is present on plenty of signed-out landing pages too, so on
+  // its own it can no longer assert "in" — only an explicit sign-out
+  // affordance (or a qualifying JWT identity) counts.
+  expect(classifyResolverMarkers([{ text: "My account", label: "" }])).toBe("unknown");
+});
+
 test("resolver-origin marker verdicts are evidence-based and do not pause a live user tab", async () => {
   const h = makeHarness();
   await h.manager.init();
+  h.jobs.count = 0;
+  // Closes the owned keepalive tab: the manager's own tab is always a probe
+  // candidate for its origin, so leaving it live would let its default
+  // "Sign out" marker join this origin's decisive readings and mask what
+  // this test is actually pinning — a single non-owned tab's evidence.
+  await h.manager.sync();
   h.resolverMarkers.splice(0, h.resolverMarkers.length, { text: "Sign in", label: "" });
   const liveTab = { id: 42, url: "https://resolver.example.edu/account" };
   h.tabs.live.set(liveTab.id, liveTab);
   h.tabs.resolverTabs.push(liveTab);
 
-  await h.manager.checkNow(100);
+  await h.manager.probeForeground();
 
   expect(h.manager.getSnapshot()).toMatchObject({
     authenticated: false,
@@ -716,14 +846,17 @@ test("no resolver tab or probe evidence remains unknown instead of signed out", 
   h.jobs.count = 0;
   await h.manager.sync();
 
-  await h.manager.checkNow(100);
+  await h.manager.probeForeground();
 
   expect(h.manager.getSnapshot()).toMatchObject({
     authenticated: false,
     verdict: "unknown",
     probeSource: "none",
+    lastProbeOutcome: "no_tab",
   });
-  expect(h.manager.getSnapshot().lastVerdictAt).toEqual(expect.any(Number));
+  // A no_tab outcome is not itself an inspection: it must never manufacture
+  // a fake completed-verdict timestamp the popup could mistake for evidence.
+  expect(h.manager.getSnapshot().lastVerdictAt).toBeNull();
 });
 
 test("the focused resolver tab is inspected even when the URL-pattern query misses", async () => {
@@ -736,7 +869,7 @@ test("the focused resolver tab is inspected even when the URL-pattern query miss
   // Field report 12:43pm: pattern query returned nothing while the operator
   // was looking at the signed-in library page in the active tab.
 
-  await h.manager.checkNow(100);
+  await h.manager.probeForeground();
 
   expect(h.manager.getSnapshot()).toMatchObject({
     authenticated: true,
@@ -745,24 +878,207 @@ test("the focused resolver tab is inspected even when the URL-pattern query miss
   });
 });
 
-test("an evidence-free probe does not latch: the next popup open re-probes", async () => {
+test("a preferred/triggering tab decides the verdict despite three stale tabs sorting first in query order", async () => {
+  // The manager's own resolver tab is always priority-ordered ahead of
+  // plain query-order siblings (probeOrigin: preferred, then focused, then
+  // owned, then the rest) — so during the reload cycle it is the causal
+  // observation regardless of where tabs.query() happens to place it.
+  const h = makeHarness();
+  await h.manager.init(); // creates the owned tab, id 1
+  h.markersByTab.set(1, [{ text: "Sign out", label: "" }]); // owned tab: decisive "in"
+
+  // Three stale siblings sort BEFORE the owned tab in tabs.query() results
+  // and each disagree with it — under the old liveTabs.slice(0, 3) cap the
+  // owned tab would never even have been observed.
+  const stale1 = { id: 90, url: "https://resolver.example.edu/discovery/a" };
+  const stale2 = { id: 91, url: "https://resolver.example.edu/discovery/b" };
+  const stale3 = { id: 92, url: "https://resolver.example.edu/discovery/c" };
+  h.tabs.live.set(90, stale1);
+  h.tabs.live.set(91, stale2);
+  h.tabs.live.set(92, stale3);
+  h.tabs.resolverTabs.push(stale1, stale2, stale3);
+  h.markersByTab.set(90, [{ text: "Sign in", label: "" }]);
+  h.markersByTab.set(91, [{ text: "Sign in", label: "" }]);
+  h.markersByTab.set(92, [{ text: "Sign in", label: "" }]);
+
+  const origin = "https://resolver.example.edu";
+  h.originStateWrites.length = 0; // Scope the write log to this reload cycle only.
+  await h.timers.runNext(); // reload
+  await h.timers.runNext(); // inspectAfterReload -> probeOwnedTab("cycle")
+
+  expect(h.manager.getSnapshot()).toMatchObject({ verdict: "in", probeSource: "keepalive_tab" });
+  // Exactly one commit: the three disagreeing siblings never got to author
+  // an intermediate or final "out"/"unknown" verdict of their own.
+  expect(verdictCommits(h.originStateWrites, origin, "unknown")).toEqual(["in"]);
+});
+
+test("more matching tabs than the observation cap never commits a decisive verdict from siblings alone", async () => {
+  const h = makeHarness();
+  await h.manager.init();
+  // Earn a warm "in" verdict first, from the owned tab alone.
+  await h.manager.probeForeground();
+  expect(h.manager.getSnapshot()).toMatchObject({ verdict: "in", authenticated: true });
+  const earnedAt = h.manager.getSnapshot().lastVerdictAt;
+
+  // Now flood the origin with more matching tabs than the cap, none of
+  // them focused or owned, every one reading "out".
+  expect(MAX_OBSERVED_TABS_PER_ORIGIN).toBe(5);
+  h.resolverMarkers.splice(0, h.resolverMarkers.length, { text: "Sign in", label: "" });
+  const flood: KeepaliveTab[] = [];
+  for (let id = 200; id < 200 + MAX_OBSERVED_TABS_PER_ORIGIN + 1; id++) {
+    const tab = { id, url: `https://resolver.example.edu/discovery/${id}` };
+    h.tabs.live.set(id, tab);
+    flood.push(tab);
+  }
+  h.tabs.resolverTabs.push(...flood);
+
+  h.clock.advanceBy(1_000);
+  await h.manager.probeForeground();
+
+  const origin = "https://resolver.example.edu";
+  const snapshot = h.manager.getOriginSnapshots().find((s) => s.origin === origin);
+  expect(snapshot).toMatchObject({
+    verdict: "in",
+    authenticated: true,
+    lastProbeOutcome: "partial_scan",
+  });
+  expect(snapshot?.lastVerdictAt).toBe(earnedAt);
+  expect(snapshot?.lastProbeAt).not.toBe(earnedAt);
+});
+
+test("a decisive causal out from the focused tab is not overruled by a stale sibling reading in", async () => {
+  const h = makeHarness();
+  await h.manager.init();
+  // The focused tab is the causal observation and reads a decisive "out";
+  // cookies are browser-global, so an "in"-reading sibling is real
+  // evidence too — but per-tab caches disagree, and the operator is
+  // looking at the "out" page right now.
+  const focused = { id: 42, url: "https://resolver.example.edu/discovery/search" };
+  const sibling = { id: 43, url: "https://resolver.example.edu/account/overview" };
+  h.tabs.live.set(42, focused);
+  h.tabs.live.set(43, sibling);
+  h.tabs.focusedTab = focused;
+  h.tabs.resolverTabs.push(focused, sibling);
+  h.markersByTab.set(42, [{ text: "Sign in", label: "" }]);
+  h.markersByTab.set(43, [{ text: "Sign out", label: "" }]);
+
+  await h.manager.probeForeground();
+
+  expect(h.manager.getSnapshot()).toMatchObject({
+    verdict: "out",
+    authenticated: false,
+    probeSource: "live_tab",
+    lastProbeOutcome: "markers",
+  });
+});
+
+test("decisive in and out with no causal preference commits unknown as a conflict", async () => {
+  const h = makeHarness();
+  await h.manager.init();
+  h.jobs.count = 0;
+  await h.manager.sync(); // Close the owned tab: it must not act as a tiebreaker here.
+
+  // Neither tab is focused and neither is preferred, so there is no causal
+  // observation to arbitrate between two tabs that disagree decisively.
+  const a = { id: 51, url: "https://resolver.example.edu/discovery/a" };
+  const b = { id: 52, url: "https://resolver.example.edu/discovery/b" };
+  h.tabs.live.set(51, a);
+  h.tabs.live.set(52, b);
+  h.tabs.resolverTabs.push(a, b);
+  h.markersByTab.set(51, [{ text: "Sign in", label: "" }]);
+  h.markersByTab.set(52, [{ text: "Sign out", label: "" }]);
+
+  await h.manager.probeForeground();
+
+  expect(h.manager.getSnapshot()).toMatchObject({
+    verdict: "unknown",
+    authenticated: false,
+    lastProbeOutcome: "conflict",
+  });
+});
+
+test("a sibling scan held open cannot publish an intermediate verdict", async () => {
   const h = makeHarness();
   await h.manager.init();
   h.jobs.count = 0;
   await h.manager.sync();
-  await h.manager.checkNow(100);
-  expect(h.manager.getSnapshot()).toMatchObject({ verdict: "unknown", probeSource: "none" });
 
-  // The operator focuses the library page and reopens the popup well within
-  // SESSION_STALE_MS. The empty verdict must not be served from the latch.
-  h.resolverMarkers.splice(0, h.resolverMarkers.length, { text: "Sign out", label: "" });
-  const focused = { id: 78, url: "https://resolver.example.edu/account" };
-  h.tabs.live.set(focused.id, focused);
-  h.tabs.focusedTab = focused;
+  const a = { id: 61, url: "https://resolver.example.edu/discovery/a" };
+  const b = { id: 62, url: "https://resolver.example.edu/discovery/b" };
+  h.tabs.live.set(61, a);
+  h.tabs.live.set(62, b);
+  h.tabs.resolverTabs.push(a, b);
+  h.markersByTab.set(61, [{ text: "Sign in", label: "" }]); // resolves immediately: "out"
+  h.markersByTab.set(62, [{ text: "Sign out", label: "" }]); // held open: would-be "in"
+  const gate = h.scripting.hold(62);
 
-  await h.manager.checkNow(100);
+  const origin = "https://resolver.example.edu";
+  const pending = h.manager.probeForeground();
+  await flushMicrotasks();
 
-  expect(h.manager.getSnapshot()).toMatchObject({ verdict: "in", probeSource: "live_tab" });
+  // Tab A has already resolved to "out", but the reducer cannot commit
+  // anything until tab B's observation is in too — otherwise it cannot
+  // tell a genuine single-polarity commit from a conflict it hasn't
+  // finished discovering yet.
+  expect(h.manager.getSnapshot()).toMatchObject({ verdict: "unknown", authenticated: false });
+  expect(h.manager.getOriginSnapshots().find((s) => s.origin === origin)).toMatchObject({
+    verdict: "unknown",
+    authenticated: false,
+  });
+  expect(h.sessionEvidence).toEqual([]);
+
+  gate.release();
+  await pending;
+
+  // Both decisive and disagreeing, with no causal tab: conflict, not a
+  // leaked "out".
+  expect(h.manager.getSnapshot()).toMatchObject({ verdict: "unknown", lastProbeOutcome: "conflict" });
+  expect(h.sessionEvidence).toEqual([]);
+});
+
+test("scan_failed preserves a previously earned in verdict", async () => {
+  const h = makeHarness();
+  await h.manager.init();
+  await h.manager.probeForeground();
+  const earned = h.manager.getSnapshot();
+  expect(earned).toMatchObject({ verdict: "in", authenticated: true });
+
+  h.api.scripting = {
+    executeScript: async () => {
+      throw new Error("host permission revoked");
+    },
+  };
+  h.clock.advanceBy(1_000);
+  await h.manager.probeForeground();
+
+  const after = h.manager.getSnapshot();
+  expect(after).toMatchObject({
+    verdict: "in",
+    authenticated: true,
+    lastProbeOutcome: "scan_failed",
+  });
+  expect(after.lastVerdictAt).toBe(earned.lastVerdictAt);
+  expect(after.lastProbeAt).not.toBe(earned.lastProbeAt);
+});
+
+test("an owned tab parked on an authentication URL still pauses for reauth even though a live user tab reads in", async () => {
+  // Owned-tab disposition (pause/resume) is computed from the owned tab's
+  // OWN observation only — never from the committed origin verdict, which
+  // may come from an entirely different, non-owned tab.
+  const h = makeHarness();
+  await h.manager.init();
+  h.tabs.live.get(1)!.url = "https://idp.example.edu/idp/profile/SAML2/Redirect/SSO?service=resolver";
+
+  const sibling = { id: 88, url: "https://resolver.example.edu/account/overview" };
+  h.tabs.live.set(88, sibling);
+  h.tabs.resolverTabs.push(sibling); // Default markers: "Sign out" -> decisive "in".
+
+  await h.manager.probeForeground();
+
+  const snapshot = h.manager.getSnapshot();
+  expect(snapshot.pausedForReauth).toBe(true);
+  expect(snapshot.verdict).toBe("in");
+  expect(h.reauthState).toEqual([true]);
 });
 
 function syntheticJWT(payload: Record<string, unknown>): string {
@@ -851,19 +1167,19 @@ test("Primo-shaped account page with a non-guest session JWT is signed in withou
   }
 });
 
-test("marker scan outcome separates markers, no markers, and injection failure", async () => {
+test("probe outcome separates markers, no markers, and injection failure", async () => {
   const markers = makeHarness();
   await markers.manager.init();
-  await markers.manager.checkNow(100);
-  expect(markers.manager.getSnapshot().scanOutcome).toBe("markers");
+  await markers.manager.probeForeground();
+  expect(markers.manager.getSnapshot().lastProbeOutcome).toBe("markers");
 
   const noMarkers = makeHarness();
   noMarkers.resolverMarkers.splice(0, noMarkers.resolverMarkers.length);
   await noMarkers.manager.init();
-  await noMarkers.manager.checkNow(100);
+  await noMarkers.manager.probeForeground();
   expect(noMarkers.manager.getSnapshot()).toMatchObject({
     verdict: "unknown",
-    scanOutcome: "no_markers",
+    lastProbeOutcome: "no_markers",
   });
 
   const failed = makeHarness();
@@ -873,10 +1189,10 @@ test("marker scan outcome separates markers, no markers, and injection failure",
     },
   };
   await failed.manager.init();
-  await failed.manager.checkNow(100);
+  await failed.manager.probeForeground();
   expect(failed.manager.getSnapshot()).toMatchObject({
     verdict: "unknown",
-    scanOutcome: "scan_failed",
+    lastProbeOutcome: "scan_failed",
   });
 });
 test("auth-shaped URL evidence stays unknown when marker inspection is empty", async () => {
@@ -887,12 +1203,12 @@ test("auth-shaped URL evidence stays unknown when marker inspection is empty", a
   h.tabs.live.set(liveTab.id, liveTab);
   h.tabs.resolverTabs.push(liveTab);
 
-  await h.manager.checkNow(100);
+  await h.manager.probeForeground();
 
   expect(h.manager.getSnapshot()).toMatchObject({
     verdict: "unknown",
     authenticated: false,
-    scanOutcome: "no_markers",
+    lastProbeOutcome: "no_markers",
   });
 });
 
@@ -994,14 +1310,14 @@ test("popup check probes a live tab for a second known resolver origin", async (
     },
   };
 
-  await h.manager.checkNow(100);
+  await h.manager.probeForeground();
 
   expect(inspected).toContain(uwaTab.id);
   expect(h.manager.getOriginSnapshots().find((snapshot) => snapshot.origin === uwaOrigin)).toMatchObject({
     verdict: "in",
     authenticated: true,
     probeSource: "live_tab",
-    scanOutcome: "markers",
+    lastProbeOutcome: "markers",
   });
 });
 
@@ -1060,12 +1376,12 @@ test("per-origin verdicts survive a service-worker restart", async () => {
         authenticated: true,
         verdict: "in",
         probeSource: "live_tab",
-        scanOutcome: "markers",
+        lastProbeOutcome: "markers",
         lastVerdictAt: Date.now() - 60_000,
         checking: true,
         likelyAuthenticated: false,
         pausedForReauth: false,
-        lastCheckAt: Date.now() - 60_000,
+        lastProbeAt: Date.now() - 60_000,
       },
     ],
   };
@@ -1081,25 +1397,6 @@ test("per-origin verdicts survive a service-worker restart", async () => {
   expect(snapshot?.checking).toBe(false);
 });
 
-test("a signed-in sibling tab outranks a stale signed-out render", async () => {
-  const h = makeHarness();
-  await h.manager.init();
-  // Tab 42 is the focused, STALE tab: loaded before sign-in, it renders a
-  // visible sign-in prompt (Primo caches auth state per tab). Tab 43 is a
-  // sibling resolver tab that evidences the browser's real cookie session.
-  const stale = { id: 42, url: "https://resolver.example.edu/discovery/search" };
-  const warm = { id: 43, url: "https://resolver.example.edu/account/overview" };
-  h.tabs.live.set(42, stale);
-  h.tabs.live.set(43, warm);
-  h.tabs.focusedTab = stale;
-  h.tabs.resolverTabs.push(stale, warm);
-  h.markersByTab.set(42, [{ text: "Sign in", label: "", href: "/nde/login", visible: true }]);
-  h.markersByTab.set(43, [{ text: "Sign out", label: "", href: "/logout" }]);
-
-  await h.manager.checkNow(100);
-  expect(h.manager.getSnapshot()).toMatchObject({ verdict: "in", probeSource: "live_tab" });
-});
-
 test("all tabs signed out keeps the focused tab's verdict authoritative", async () => {
   const h = makeHarness();
   await h.manager.init();
@@ -1112,23 +1409,35 @@ test("all tabs signed out keeps the focused tab's verdict authoritative", async 
   h.markersByTab.set(42, [{ text: "Sign in", label: "", href: "/nde/login", visible: true }]);
   h.markersByTab.set(43, []);
 
-  await h.manager.checkNow(100);
+  await h.manager.probeForeground();
   expect(h.manager.getSnapshot()).toMatchObject({ verdict: "out", probeSource: "live_tab" });
 });
 
-test("closing the library tab never erases an earned warm verdict", async () => {
+test("closing the library tab never erases an earned warm verdict, but the next probe still runs", async () => {
   const h = makeHarness();
   await h.manager.init();
   const liveTab = { id: 42, url: "https://resolver.example.edu/account" };
   h.tabs.live.set(42, liveTab);
   h.tabs.resolverTabs.push(liveTab);
-  await h.manager.checkNow(100);
+  await h.manager.probeForeground();
   expect(h.manager.getSnapshot()).toMatchObject({ verdict: "in" });
+  const queriesAfterFirst = h.tabs.queryCount;
 
-  // The tab closes; the next probe finds nothing to inspect. The earned
-  // verdict stands - only freshness gates may downgrade trust in it.
-  h.tabs.live.delete(42);
+  // Every resolver tab closes — including papio's own pinned keepalive tab,
+  // which is a probe candidate in its own right (preferred -> focused ->
+  // owned -> rest). Leaving it live would exercise the "keepalive_tab still
+  // answers" path instead of the no-tab path this test exists for.
+  //
+  // Unlike checkNow(), probeForeground() has no freshness gate, so the second
+  // call genuinely queries again rather than being swallowed — the old test
+  // here never actually reached the no-tab branch.
+  for (const id of [...h.tabs.live.keys()]) h.tabs.live.delete(id);
   h.tabs.resolverTabs.length = 0;
-  await h.manager.checkNow(100);
-  expect(h.manager.getSnapshot()).toMatchObject({ verdict: "in" });
+  await h.manager.probeForeground();
+
+  expect(h.tabs.queryCount).toBeGreaterThan(queriesAfterFirst);
+  expect(h.manager.getSnapshot()).toMatchObject({
+    verdict: "in",
+    lastProbeOutcome: "no_tab",
+  });
 });

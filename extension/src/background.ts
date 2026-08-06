@@ -1275,12 +1275,12 @@ export class Bridge {
         authenticated: isDefault && state.authenticated,
         verdict: isDefault ? (state.verdict ?? "unknown") : "unknown",
         probeSource: isDefault ? (state.probeSource ?? "none") : "none",
-        ...(isDefault && state.scanOutcome !== undefined ? { scanOutcome: state.scanOutcome } : {}),
+        ...(isDefault && state.lastProbeOutcome !== undefined ? { lastProbeOutcome: state.lastProbeOutcome } : {}),
         lastVerdictAt: isDefault ? (state.lastVerdictAt ?? null) : null,
         checking: isDefault && state.checking === true,
         likelyAuthenticated: isDefault && state.likelyAuthenticated === true,
         pausedForReauth: isDefault && state.pausedForReauth,
-        lastCheckAt: isDefault ? state.lastCheckAt : null,
+        lastProbeAt: isDefault ? state.lastProbeAt : null,
       };
     });
   }
@@ -1296,7 +1296,7 @@ export class Bridge {
       checking: false,
       likelyAuthenticated: false,
       pausedForReauth: this.keepaliveReauthNeeded,
-      lastCheckAt: null,
+      lastProbeAt: null,
       resolverOrigin: null,
       lastAuthReturnedAt: this.store.lastAuthReturnedAt ?? null,
       queuedAuthJobs: this.queuedAuthJobCount(),
@@ -1315,12 +1315,18 @@ export class Bridge {
     };
   }
 
+  /** Pure read for the popup's steady-state poll: never probes, never injects. */
+  async sessionStateSnapshot(): Promise<BridgeSessionState> {
+    await this.ready;
+    return this.sessionState();
+  }
+
   /** Refresh a stale/unknown keepalive verdict before replying to the popup.
    * The manager bounds the wait and leaves `checking` true when browser APIs
    * exceed the foreground budget. */
-  async refreshSessionState(): Promise<BridgeSessionState> {
+  async sessionStateWithProbe(): Promise<BridgeSessionState> {
     await this.ready;
-    await this.keepaliveManager?.checkNow();
+    await this.keepaliveManager?.probeForeground();
     return this.sessionState();
   }
 
@@ -7023,7 +7029,16 @@ export async function handleInboxRuntimeMessage(
     if (!hasOnlyKeys(message, ["type"])) return runtimeFailure("invalid_request", "Invalid institution session request");
     return {
       ok: true,
-      state: await bridge.refreshSessionState(),
+      state: await bridge.sessionStateSnapshot(),
+      origins: bridge.sessionOriginStates(),
+    };
+  }
+  if (type === "papio.session.probe") {
+    if (!isPopupSender(sender, urls)) return runtimeFailure("unauthorized", "This sender cannot probe institution session state");
+    if (!hasOnlyKeys(message, ["type"])) return runtimeFailure("invalid_request", "Invalid institution session request");
+    return {
+      ok: true,
+      state: await bridge.sessionStateWithProbe(),
       origins: bridge.sessionOriginStates(),
     };
   }
@@ -7276,6 +7291,7 @@ if (typeof chrome !== "undefined" && chrome.runtime?.id) {
         message["type"] === "papio.delivery.start" ||
         message["type"] === "papio.delivery.state" ||
         message["type"] === "papio.session.state" ||
+        message["type"] === "papio.session.probe" ||
         message["type"] === "papio.session.signin" ||
         message["type"] === "papio.session.retry" ||
         message["type"] === "papio.stats")

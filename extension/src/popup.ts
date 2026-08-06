@@ -351,6 +351,7 @@ export type PopupSessionState = KeepaliveSnapshot & {
 };
 
 export const SESSION_STATE_MESSAGE = "papio.session.state";
+export const SESSION_PROBE_MESSAGE = "papio.session.probe";
 export const SESSION_SIGNIN_MESSAGE = "papio.session.signin";
 export const SESSION_RETRY_MESSAGE = "papio.session.retry";
 
@@ -365,15 +366,18 @@ function isOriginSnapshot(value: unknown): value is KeepaliveOriginSnapshot {
     (snapshot["probeSource"] === "live_tab" ||
       snapshot["probeSource"] === "keepalive_tab" ||
       snapshot["probeSource"] === "none") &&
-    (snapshot["scanOutcome"] === undefined ||
-      snapshot["scanOutcome"] === "markers" ||
-      snapshot["scanOutcome"] === "no_markers" ||
-      snapshot["scanOutcome"] === "scan_failed") &&
+    (snapshot["lastProbeOutcome"] === undefined ||
+      snapshot["lastProbeOutcome"] === "markers" ||
+      snapshot["lastProbeOutcome"] === "no_markers" ||
+      snapshot["lastProbeOutcome"] === "scan_failed" ||
+      snapshot["lastProbeOutcome"] === "no_tab" ||
+      snapshot["lastProbeOutcome"] === "partial_scan" ||
+      snapshot["lastProbeOutcome"] === "conflict") &&
     (snapshot["lastVerdictAt"] === null || typeof snapshot["lastVerdictAt"] === "number") &&
     typeof snapshot["checking"] === "boolean" &&
     typeof snapshot["likelyAuthenticated"] === "boolean" &&
     typeof snapshot["pausedForReauth"] === "boolean" &&
-    (snapshot["lastCheckAt"] === null || typeof snapshot["lastCheckAt"] === "number")
+    (snapshot["lastProbeAt"] === null || typeof snapshot["lastProbeAt"] === "number")
   );
 }
 
@@ -393,17 +397,20 @@ function isSessionState(value: unknown): value is PopupSessionState {
       state["probeSource"] === "live_tab" ||
       state["probeSource"] === "keepalive_tab" ||
       state["probeSource"] === "none") &&
-    (state["scanOutcome"] === undefined ||
-      state["scanOutcome"] === "markers" ||
-      state["scanOutcome"] === "no_markers" ||
-      state["scanOutcome"] === "scan_failed") &&
+    (state["lastProbeOutcome"] === undefined ||
+      state["lastProbeOutcome"] === "markers" ||
+      state["lastProbeOutcome"] === "no_markers" ||
+      state["lastProbeOutcome"] === "scan_failed" ||
+      state["lastProbeOutcome"] === "no_tab" ||
+      state["lastProbeOutcome"] === "partial_scan" ||
+      state["lastProbeOutcome"] === "conflict") &&
     (state["lastVerdictAt"] === undefined ||
       state["lastVerdictAt"] === null ||
       typeof state["lastVerdictAt"] === "number") &&
     (state["checking"] === undefined || typeof state["checking"] === "boolean") &&
     (state["likelyAuthenticated"] === undefined || typeof state["likelyAuthenticated"] === "boolean") &&
     typeof state["pausedForReauth"] === "boolean" &&
-    (state["lastCheckAt"] === null || typeof state["lastCheckAt"] === "number") &&
+    (state["lastProbeAt"] === null || typeof state["lastProbeAt"] === "number") &&
     (resolverOrigin === null ||
       (typeof resolverOrigin === "string" && /^https:\/\/[^/]+$/.test(resolverOrigin))) &&
     (state["lastAuthReturnedAt"] === null || typeof state["lastAuthReturnedAt"] === "number") &&
@@ -418,18 +425,38 @@ function isSessionState(value: unknown): value is PopupSessionState {
   );
 }
 
+/** Shared reply validation for both the snapshot-only and probing session
+ * messages — the background replies with the identical `{ state, origins }`
+ * envelope either way. */
+function parseSessionReply(response: unknown): PopupSessionState | undefined {
+  if (typeof response !== "object" || response === null) return undefined;
+  const envelope = response as Record<string, unknown>;
+  const state = envelope["state"];
+  if (!isSessionState(state)) return undefined;
+  const origins = envelope["origins"];
+  if (origins === undefined) return state;
+  return Array.isArray(origins) && origins.every(isOriginSnapshot)
+    ? { ...state, origins }
+    : state;
+}
+
+/** Pure snapshot read — never triggers a probe or content-script injection. */
 export async function requestSessionState(): Promise<PopupSessionState | undefined> {
   try {
     const response: unknown = await chrome.runtime.sendMessage({ type: SESSION_STATE_MESSAGE });
-    if (typeof response !== "object" || response === null) return undefined;
-    const envelope = response as Record<string, unknown>;
-    const state = envelope["state"];
-    if (!isSessionState(state)) return undefined;
-    const origins = envelope["origins"];
-    if (origins === undefined) return state;
-    return Array.isArray(origins) && origins.every(isOriginSnapshot)
-      ? { ...state, origins }
-      : state;
+    return parseSessionReply(response);
+  } catch {
+    return undefined;
+  }
+}
+
+/** Starts (or joins) a probe of the configured resolver origin(s), then
+ * returns the resulting snapshot. Reserved for the once-per-popup-open probe;
+ * every later read must use `requestSessionState` instead. */
+export async function requestSessionProbe(): Promise<PopupSessionState | undefined> {
+  try {
+    const response: unknown = await chrome.runtime.sendMessage({ type: SESSION_PROBE_MESSAGE });
+    return parseSessionReply(response);
   } catch {
     return undefined;
   }
@@ -617,11 +644,6 @@ export function deriveSessionCardState(state: PopupSessionState | undefined): Se
     };
   }
   const checking = state.checking === true;
-  const lastCheckAt = state.lastCheckAt;
-  const stale =
-    lastCheckAt === null ||
-    !Number.isFinite(lastCheckAt) ||
-    Date.now() - lastCheckAt > SESSION_STALE_MS;
   if (checking) {
     return {
       label: state.likelyAuthenticated === true ? "Likely signed in — verifying" : "Checking session…",
@@ -636,7 +658,11 @@ export function deriveSessionCardState(state: PopupSessionState | undefined): Se
       action: "signin",
     };
   }
-  const verdict = state.verdict ?? (state.authenticated ? "in" : "unknown");
+  const lastVerdictAt = state.lastVerdictAt;
+  const stale =
+    typeof lastVerdictAt !== "number" ||
+    !Number.isFinite(lastVerdictAt) ||
+    Date.now() - lastVerdictAt > SESSION_STALE_MS;
   if (stale) {
     return {
       label: "Checking session…",
@@ -644,26 +670,49 @@ export function deriveSessionCardState(state: PopupSessionState | undefined): Se
       action: "signin",
     };
   }
-  if (state.scanOutcome === "no_markers") {
-    return {
-      label: "Signed-in state unclear on this page",
-      detail: "papio inspected your library tab but found no sign-in indicators",
-      action: "signin",
-    };
-  }
-  if (state.scanOutcome === "scan_failed") {
-    return {
-      label: "papio couldn't read the library page — check site access in Options",
-      detail,
-      action: "signin",
-    };
-  }
+  const verdict = state.verdict ?? (state.authenticated ? "in" : "unknown");
+  // Only an "unknown" verdict is up for grabs here — a warm ("in") or cold
+  // ("out") verdict is still warm/cold even when the latest probe ATTEMPT
+  // learned nothing (e.g. the tab closed after the verdict was committed).
   if (verdict === "unknown") {
-    return {
-      label: "Session unknown — open your library page to verify",
-      detail,
-      action: "signin",
-    };
+    switch (state.lastProbeOutcome) {
+      case "no_tab":
+        return {
+          label: "No library page open — open your library to verify",
+          detail,
+          action: "signin",
+        };
+      case "no_markers":
+        return {
+          label: "Signed-in state unclear on this page",
+          detail: "papio inspected your library tab but found no sign-in indicators",
+          action: "signin",
+        };
+      case "scan_failed":
+        return {
+          label: "papio couldn't read the library page — check site access in Options",
+          detail,
+          action: "signin",
+        };
+      case "partial_scan":
+        return {
+          label: "Too many library tabs to check reliably",
+          detail,
+          action: "signin",
+        };
+      case "conflict":
+        return {
+          label: "Your library tabs disagree — open your library page",
+          detail,
+          action: "signin",
+        };
+      default:
+        return {
+          label: "Session unknown — open your library page to verify",
+          detail,
+          action: "signin",
+        };
+    }
   }
   const completedVerdict =
     typeof state.lastVerdictAt === "number" && Number.isFinite(state.lastVerdictAt);
@@ -1826,6 +1875,10 @@ export function renderPageContext(
 
 let popupActivity: ActivityEntryPayload[] = [];
 let popupRefreshTimer: ReturnType<typeof setInterval> | undefined;
+/** The popup probes at most once per open — a probe injects a content
+ * script into the user's library tab, so every later refresh tick must fall
+ * back to a snapshot-only read instead of repeating that injection. */
+let sessionProbedThisPopup = false;
 
 function startPopupRefresh(): void {
   if (popupRefreshTimer !== undefined) return;
@@ -1852,6 +1905,14 @@ export function wirePrimaryShortcut(doc: Document = document): void {
 }
 
 
+/** The popup's one probe-on-open, then snapshot-only reads for every later
+ * refresh tick — see `sessionProbedThisPopup`. */
+function readSessionForRefresh(): Promise<PopupSessionState | undefined> {
+  if (sessionProbedThisPopup) return requestSessionState();
+  sessionProbedThisPopup = true;
+  return requestSessionProbe();
+}
+
 export async function refresh(): Promise<void> {
   // Wave 1: store-derived sections paint immediately (one storage read),
   // before the user can aim at anything.
@@ -1868,7 +1929,7 @@ export async function refresh(): Promise<void> {
       readPopupActivity(),
       readDeliveryFeedback(store.pendingDelivery),
       readCurrentPageMetadata().catch(() => undefined),
-      requestSessionState(),
+      readSessionForRefresh(),
       requestOrphanTabCount(),
       chrome.storage.local.get(TERMS_CONSENT_KEY).then(
         (got) => {

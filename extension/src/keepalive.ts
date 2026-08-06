@@ -9,7 +9,16 @@ export interface KeepaliveTab {
 
 export type SessionVerdict = "in" | "out" | "unknown";
 export type KeepaliveProbeSource = "live_tab" | "keepalive_tab" | "none";
-export type ScanOutcome = "markers" | "no_markers" | "scan_failed";
+/** Outcome of one completed probe ATTEMPT. Distinct from the verdict: an
+ * attempt that learned nothing must not overwrite what an earlier attempt
+ * learned. */
+export type ProbeOutcome =
+  | "markers" // decisive sign-in/sign-out evidence was committed
+  | "no_markers" // a resolver page was read and carried no indicators
+  | "scan_failed" // injection or host access failed
+  | "no_tab" // no inspectable resolver tab existed
+  | "partial_scan" // more matching tabs than the observation cap
+  | "conflict"; // decisive "in" and "out" both present, no causal preference
 export interface ResolverMarker {
   text: string;
   label: string;
@@ -89,15 +98,19 @@ export interface KeepaliveAPI {
 export interface KeepaliveOriginSnapshot {
   /** The resolver origin this state belongs to; never an IdP URL. */
   origin: string;
+  /** Always exactly `verdict === "in"`. */
   authenticated: boolean;
   verdict: SessionVerdict;
   probeSource: KeepaliveProbeSource;
-  scanOutcome?: ScanOutcome;
+  /** Epoch ms when the current VERDICT was committed. The display-trust clock. */
   lastVerdictAt: number | null;
+  /** Epoch ms of the last completed probe ATTEMPT, whatever it learned. */
+  lastProbeAt: number | null;
+  lastProbeOutcome?: ProbeOutcome;
+  /** Ephemeral. Always false when persisted and when restored. */
   checking: boolean;
   likelyAuthenticated: boolean;
   pausedForReauth: boolean;
-  lastCheckAt: number | null;
 }
 
 export interface KeepaliveSnapshot {
@@ -108,8 +121,8 @@ export interface KeepaliveSnapshot {
   verdict?: SessionVerdict;
   /** Branch that produced the current verdict. */
   probeSource?: KeepaliveProbeSource;
-  /** Result of the most recent page marker scan, when one ran. */
-  scanOutcome?: ScanOutcome;
+  /** Outcome of the most recent completed probe attempt, when one ran. */
+  lastProbeOutcome?: ProbeOutcome;
   /** Epoch milliseconds when the current verdict completed. */
   lastVerdictAt?: number | null;
   /** True while an on-demand session probe is still in flight. */
@@ -118,7 +131,8 @@ export interface KeepaliveSnapshot {
    * is evidence only; `authenticated` remains the completed probe verdict. */
   likelyAuthenticated?: boolean;
   pausedForReauth: boolean;
-  lastCheckAt: number | null;
+  /** Epoch milliseconds of the last completed probe attempt, whatever it learned. */
+  lastProbeAt: number | null;
   /** The configured resolver origin, never an authentication/IdP URL. */
   resolverOrigin: string | null;
   lastAuthReturnedAt: number | null;
@@ -199,7 +213,11 @@ export function isAuthenticationURL(rawURL: string): boolean {
   }
 }
 
-const SIGN_OUT_MARKER = /sign\s*out|log\s*out|logout|signout|sign-out|log-out|my account/i;
+// ADR-0013: only an explicit sign-out affordance or a qualifying JWT identity
+// counts as signed-in evidence. "my account" is a false-"in" risk (present on
+// plenty of signed-out landing pages) and a later commit lets a verdict open
+// tabs, so a false "in" here is no longer merely cosmetic.
+const SIGN_OUT_MARKER = /sign\s*out|log\s*out|logout|signout|sign-out|log-out/i;
 const SIGN_IN_MARKER = /sign\s*in|log\s*in|login/i;
 const MAX_STORAGE_VALUE_LENGTH = 8 * 1024;
 const JWT_SEGMENT = /^[A-Za-z0-9_-]+$/;
@@ -435,8 +453,13 @@ export const KEEPALIVE_RESOLVER_ORIGIN_KEY = "keepalive.resolverOrigin";
 /** Per-origin session snapshots survive service-worker naps here: an origin's
  * warm verdict must not decay to "unknown" just because the worker slept. */
 export const KEEPALIVE_ORIGIN_STATES_KEY = "keepalive.originStates";
-/** Session probes are needed after two minutes without a completed check. */
+/** Display-trust budget ONLY: how long a completed verdict is shown as fresh
+ * in the popup. Must never gate whether a probe runs — probeForeground()
+ * always probes regardless of this value. */
 export const SESSION_STALE_MS = 2 * 60_000;
+/** Caps how many candidate tabs a single probeOrigin() call inspects. Beyond
+ * this the scan is reported as "partial_scan" rather than silently guessing. */
+export const MAX_OBSERVED_TABS_PER_ORIGIN = 5;
 const ON_DEMAND_PROBE_BUDGET_MS = 1_400;
 
 function normalizeHttpsOrigin(raw: unknown, allowWildcardHost = false): string | undefined {
@@ -491,6 +514,18 @@ export function resolverOriginsFromPermissionPatterns(
   return [...new Set(patterns.map(resolverOriginFromPermissionPattern).filter((origin): origin is string => origin !== undefined))];
 }
 
+/** Result of one pure inspection of one tab. Never written anywhere:
+ * probeOrigin() reduces a batch of these into exactly one committed
+ * verdict. `kind` "off_origin"/"auth_url" cover the URL-shape checks that
+ * precede marker scanning; `verdict` is present only for kind "verdict". */
+interface TabObservation {
+  tabID: number;
+  /** True when this is the manager's own resolver-origin tab. */
+  owned: boolean;
+  kind: "verdict" | "no_markers" | "scan_failed" | "no_tab" | "off_origin" | "auth_url";
+  verdict?: "in" | "out";
+}
+
 
 /**
  * Maintains at most one resolver-origin tab while active handoffs exist.
@@ -513,12 +548,14 @@ export class KeepaliveManager {
   private authenticated = false;
   private verdict: SessionVerdict = "unknown";
   private probeSource: KeepaliveProbeSource = "none";
-  private scanOutcome: ScanOutcome | undefined;
+  private lastProbeOutcome: ProbeOutcome | undefined;
   private lastVerdictAt: number | undefined;
-  private lastCheckAt: number | undefined;
+  private lastProbeAt: number | undefined;
   private checking = false;
   private likelyAuthenticated = false;
-  private probePromise: Promise<void> | undefined;
+  /** Per-origin dedupe for probeForeground(): concurrent callers requesting
+   * the same origin join the same attempt instead of starting a second one. */
+  private readonly probesInFlight = new Map<string, Promise<void>>();
   /** Shared in-flight promise for createTabOnce(). sync() now runs from
    * every triage-counts response as well as the onObserve/onReload timers,
    * so reconcile/onObserve/onReload can each independently see
@@ -578,10 +615,10 @@ export class KeepaliveManager {
       verdict: "unknown",
       probeSource: "none",
       lastVerdictAt: null,
+      lastProbeAt: null,
       checking: false,
       likelyAuthenticated: false,
       pausedForReauth: false,
-      lastCheckAt: null,
     };
   }
 
@@ -604,14 +641,14 @@ export class KeepaliveManager {
   private updateOriginSnapshot(
     origin: string | undefined,
     patch: Partial<KeepaliveOriginSnapshot>,
-    clearScanOutcome = false,
+    clearProbeOutcome = false,
   ): void {
     if (origin === undefined) return;
     const normalized = normalizeHttpsOrigin(origin);
     if (normalized === undefined) return;
     const current = this.originStates.get(normalized) ?? this.defaultOriginSnapshot(normalized);
     const next = { ...current, ...patch, origin: normalized };
-    if (clearScanOutcome) delete next.scanOutcome;
+    if (clearProbeOutcome) delete next.lastProbeOutcome;
     this.originStates.set(normalized, next);
     this.persistOriginStates();
   }
@@ -623,7 +660,10 @@ export class KeepaliveManager {
   private persistOriginStates(): void {
     if (!this.originStatesRestored) return;
     const save = this.api.storage.set?.({
-      [KEEPALIVE_ORIGIN_STATES_KEY]: [...this.originStates.values()],
+      [KEEPALIVE_ORIGIN_STATES_KEY]: [...this.originStates.values()].map((snapshot) => ({
+        ...snapshot,
+        checking: false,
+      })),
     });
     if (save !== undefined) void save.catch(() => {});
   }
@@ -635,10 +675,10 @@ export class KeepaliveManager {
       const snapshot = entry as KeepaliveOriginSnapshot;
       const origin = normalizeHttpsOrigin(snapshot.origin);
       if (origin === undefined) continue;
-      // A pre-seeded default (no completed check) is not evidence — restored
+      // A pre-seeded default (no completed probe) is not evidence — restored
       // state wins over it, but never over a live probe's result.
       const existing = this.originStates.get(origin);
-      if (existing !== undefined && existing.lastCheckAt !== null) continue;
+      if (existing !== undefined && existing.lastProbeAt !== null) continue;
       // Restored evidence keeps its original timestamps: freshness gates in
       // the popup decide how much to trust it, never a worker restart.
       this.originStates.set(origin, { ...snapshot, origin, checking: false });
@@ -660,12 +700,12 @@ export class KeepaliveManager {
       authenticated: this.authenticated,
       verdict: this.verdict,
       probeSource: this.probeSource,
-      ...(this.scanOutcome === undefined ? {} : { scanOutcome: this.scanOutcome }),
+      ...(this.lastProbeOutcome === undefined ? {} : { lastProbeOutcome: this.lastProbeOutcome }),
       lastVerdictAt: this.lastVerdictAt ?? null,
       checking: this.checking,
       likelyAuthenticated: this.likelyAuthenticated,
       pausedForReauth: this.reauthPaused,
-      lastCheckAt: this.lastCheckAt ?? null,
+      lastProbeAt: this.lastProbeAt ?? null,
       resolverOrigin: resolverOrigin ?? null,
       lastAuthReturnedAt:
         typeof lastAuthReturnedAt === "number" && Number.isFinite(lastAuthReturnedAt)
@@ -720,172 +760,320 @@ export class KeepaliveManager {
       // Invalid offers are rejected by the normal handoff parser.
     }
   }
-  /** True when no probe has completed or the completed result is older than
-   * the popup freshness budget. */
-  isSessionStale(now = Date.now()): boolean {
-    if (this.lastCheckAt === undefined || !Number.isFinite(this.lastCheckAt)) return true;
-    return now - this.lastCheckAt > SESSION_STALE_MS;
-  }
-
-  private hasStaleOrigin(now = Date.now()): boolean {
-    this.syncOriginStates();
-    for (const snapshot of this.originStates.values()) {
-      if (snapshot.lastCheckAt === null || now - snapshot.lastCheckAt > SESSION_STALE_MS) return true;
-    }
-    return false;
-  }
-
-  /** Probe the known resolver origins immediately. A slow browser API is
-   * bounded so a foreground popup request never waits beyond the MV3 budget. */
-  async checkNow(budgetMs = ON_DEMAND_PROBE_BUDGET_MS): Promise<void> {
-    // A completed probe that produced NO evidence (no tab inspected) must not
-    // latch: the operator may have just focused the library page, and serving
-    // the empty verdict for SESSION_STALE_MS reads as papio being blind.
-    const latchedEmpty = this.verdict === "unknown" && this.probeSource === "none";
-    if (
-      this.probePromise === undefined &&
-      !this.isSessionStale() &&
-      !this.hasStaleOrigin() &&
-      !latchedEmpty
-    ) {
-      return;
-    }
-    const probe = this.probePromise ?? this.startProbe();
-    const boundedBudget = Math.min(1_500, Math.max(0, Math.trunc(budgetMs)));
-    let timeout: ReturnType<typeof setTimeout> | undefined;
-    const deadline = new Promise<void>((resolve) => {
-      timeout = setTimeout(resolve, boundedBudget);
-    });
-    try {
-      await Promise.race([probe, deadline]);
-    } finally {
-      if (timeout !== undefined) clearTimeout(timeout);
-    }
-  }
-
-  private startProbe(): Promise<void> {
-    this.syncOriginStates();
-    this.checking = true;
-    this.likelyAuthenticated = false;
-    for (const origin of this.originStates.keys()) {
-      this.updateOriginSnapshot(origin, { checking: true, likelyAuthenticated: false });
-    }
-    const probe = this.probeResolver();
-    const settled = probe.finally(() => {
-      this.checking = false;
-      this.likelyAuthenticated = false;
-      for (const origin of this.originStates.keys()) {
-        this.updateOriginSnapshot(origin, { checking: false, likelyAuthenticated: false });
-      }
-      this.probePromise = undefined;
-    });
-    this.probePromise = settled;
-    return settled;
-  }
-
-  private async probeResolver(): Promise<void> {
+  /** Probe every known resolver origin, or one specific origin, right now.
+   * No freshness gate: this always (re)probes, unlike the prior on-demand
+   * check — SESSION_STALE_MS is a display-trust budget for the popup,
+   * never a probe gate. Concurrent callers for the same origin join the
+   * same attempt via probesInFlight; the browser-API work always runs to
+   * completion, only the CALLER's wait is bounded by budgetMs so a
+   * foreground popup request never blocks past the MV3 budget. */
+  async probeForeground(origin?: string, budgetMs = ON_DEMAND_PROBE_BUDGET_MS): Promise<void> {
     await this.loadPreferences();
     const configured =
       this.resolverFromLatestOffer() ?? this.configuredResolver() ?? this.resolver;
     if (configured !== undefined && configured.protocol === "https:") {
       await this.selectResolver(configured);
     }
+    const targets =
+      origin !== undefined
+        ? [normalizeHttpsOrigin(origin)].filter(
+            (candidate): candidate is string => candidate !== undefined,
+          )
+        : this.originCandidates();
 
-    const origins = this.originCandidates();
-    if (origins.length === 0) {
-      const checkedAt = Date.now();
-      this.lastCheckAt = checkedAt;
-      this.setVerdict("unknown", "none", checkedAt);
+    const work = Promise.all(targets.map((target) => this.probeOriginJoined(target))).then(() => {});
+    const boundedBudget = Math.min(1_500, Math.max(0, Math.trunc(budgetMs)));
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<void>((resolve) => {
+      timeout = setTimeout(resolve, boundedBudget);
+    });
+    try {
+      await Promise.race([work, deadline]);
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  /** Join an in-flight probeOrigin() for this origin, or start one.
+   * `checking` is owned entirely here: probeOrigin() itself never touches
+   * it, so a "cycle"/"reauth" call (which bypasses this dedupe) never
+   * flips it and never collides with a concurrent foreground probe's flag. */
+  private probeOriginJoined(origin: string): Promise<void> {
+    const inFlight = this.probesInFlight.get(origin);
+    if (inFlight !== undefined) return inFlight;
+    if (origin === this.resolver?.origin) this.checking = true;
+    this.updateOriginSnapshot(origin, { checking: true });
+    const attempt = this.probeOrigin(origin, "foreground").finally(() => {
+      this.probesInFlight.delete(origin);
+      if (origin === this.resolver?.origin) {
+        this.checking = false;
+        this.likelyAuthenticated = false;
+      }
+      this.updateOriginSnapshot(origin, { checking: false, likelyAuthenticated: false });
+    });
+    this.probesInFlight.set(origin, attempt);
+    return attempt;
+  }
+
+  /** One atomic probe-and-commit cycle for a single origin: observes a
+   * bounded, deduplicated, priority-ordered set of candidate tabs (pure —
+   * nothing is written until every observation has returned), reduces them
+   * to exactly one outcome, and commits exactly once. `preferredTabID`
+   * (passed by the "cycle"/"reauth" callers below for the manager's own
+   * tab) is the causal tab when present; otherwise the focused tab is.
+   * `reason` is unused by this commit — it exists so a later commit can
+   * gate release authority (which callers may pause/resume the owned tab)
+   * without another signature change. */
+  private async probeOrigin(
+    origin: string,
+    reason: "foreground" | "cycle" | "reauth",
+    preferredTabID?: number,
+  ): Promise<void> {
+    let resolver: URL;
+    try {
+      resolver = new URL(origin);
+    } catch {
       return;
     }
-    if (this.resolver === undefined) {
-      try {
-        this.resolver = new URL(origins[0]!);
-      } catch {
-        const checkedAt = Date.now();
-        this.lastCheckAt = checkedAt;
-        this.setVerdict("unknown", "none", checkedAt);
-        return;
-      }
-    }
-    this.syncOriginStates();
 
     // The focused tab is checked directly: when the operator is looking at
     // the library page itself, the verdict must not depend on a URL-pattern
     // query that can miss (12:43pm field report: active resolver tab, probe
     // returned "no probe evidence").
-    const queriedTabs = new Map<number, KeepaliveTab>();
+    let focusedTabID: number | undefined;
     try {
       for (const tab of await this.api.tabs.query({ active: true, lastFocusedWindow: true })) {
-        if (tab.id !== undefined) queriedTabs.set(tab.id, tab);
+        if (tab.id !== undefined && typeof tab.url === "string" && resolverURLMatches(tab.url, resolver)) {
+          focusedTabID = tab.id;
+          break;
+        }
       }
     } catch {
-      // Fall through to the URL-pattern queries.
-    }
-    for (const origin of origins) {
-      try {
-        for (const tab of await this.api.tabs.query({ url: [`${origin}/*`] })) {
-          if (tab.id !== undefined) queriedTabs.set(tab.id, tab);
-        }
-      } catch {
-        // A revoked host permission affects only this origin's scan.
-      }
+      // Fall through to the URL-pattern query below.
     }
 
-    for (const origin of origins) {
-      const resolver = new URL(origin);
-      const resolverTabs = [...queriedTabs.values()].filter(
-        (tab) => typeof tab.url === "string" && resolverURLMatches(tab.url, resolver),
-      );
-      // A user's visible resolver tab carries the strongest, freshest
-      // evidence — but per-tab renders can disagree: Primo caches auth state
-      // in per-tab sessionStorage, so a tab loaded before sign-in keeps
-      // rendering signed-out while the browser's cookies are signed in
-      // (field report: the focused stale tab read OUT while a sibling tab
-      // was verifiably IN). Cookies are browser-global, so any tab
-      // evidencing "in" outranks a stale render; failing that, the focused
-      // tab's verdict is re-asserted as the authoritative one.
-      const liveTabs = resolverTabs.filter((tab) => tab.id !== this.tabID);
-      const isCurrent = this.resolver?.origin === origin;
-      if (isCurrent) this.likelyAuthenticated = liveTabs.length > 0;
-      if (liveTabs.length > 0) {
-        let first: "in" | "out" | "unknown" | undefined;
-        let settled = false;
-        for (const tab of liveTabs.slice(0, 3)) {
-          if (tab.id === undefined) continue;
-          const verdict = await this.inspectTab(tab.id, resolver);
-          first ??= verdict;
-          if (verdict === "in") {
-            settled = true;
-            break;
-          }
-        }
-        if (!settled && first !== undefined && liveTabs.length > 1) {
-          // No tab evidenced "in": the focused tab (inspected first) is the
-          // authority; re-assert it over any later, weaker inspection.
-          this.setVerdict(first, "live_tab", Date.now(), undefined, origin);
-        }
-        continue;
-      }
-      if (isCurrent && this.tabID !== undefined) {
-        await this.inspectTab(this.tabID, resolver);
-        continue;
-      }
-      const checkedAt = Date.now();
-      // No inspectable tab = no NEW evidence — and no evidence never erases
-      // evidence. Overwriting here made every earned warm verdict decay to
-      // "unknown" the moment its library tab closed. Prior evidence stands;
-      // only the check time advances, and the popup's freshness gates decide
-      // how much to trust old evidence.
-      if (isCurrent) {
-        this.lastCheckAt = checkedAt;
-        if (this.verdict === "unknown") {
-          this.setVerdict("unknown", "none", checkedAt, undefined, origin);
-          continue;
+    const matchedIDs: number[] = [];
+    try {
+      for (const tab of await this.api.tabs.query({ url: [`${origin}/*`] })) {
+        if (tab.id !== undefined && typeof tab.url === "string" && resolverURLMatches(tab.url, resolver)) {
+          matchedIDs.push(tab.id);
         }
       }
-      this.updateOriginSnapshot(origin, { lastCheckAt: checkedAt });
+    } catch {
+      // A revoked host permission affects only this origin's scan.
     }
+
+    const ownedTabID =
+      this.tabID !== undefined && this.resolver?.origin === origin ? this.tabID : undefined;
+
+    // Priority order, deduplicated by id — never raw query order: a
+    // preferred/focused/owned tab's evidence must not be diluted by
+    // whichever tab happened to sort first out of tabs.query().
+    const seen = new Set<number>();
+    const ordered: number[] = [];
+    const push = (id: number | undefined): void => {
+      if (id !== undefined && !seen.has(id)) {
+        seen.add(id);
+        ordered.push(id);
+      }
+    };
+    push(preferredTabID);
+    push(focusedTabID);
+    push(ownedTabID);
+    for (const id of matchedIDs) push(id);
+
+    // "A resolver-origin tab exists" is itself evidence-in-progress, shown
+    // to the popup while the individual scans below are still running.
+    const likelyAuthenticated = ordered.length > 0;
+    if (origin === this.resolver?.origin) this.likelyAuthenticated = likelyAuthenticated;
+    this.updateOriginSnapshot(origin, { likelyAuthenticated });
+
+    const truncated = ordered.length > MAX_OBSERVED_TABS_PER_ORIGIN;
+    const toObserve = ordered.slice(0, MAX_OBSERVED_TABS_PER_ORIGIN);
+    const observations = await Promise.all(toObserve.map((tabID) => this.observeTab(tabID, resolver)));
+
+    const causalTabID = preferredTabID ?? focusedTabID;
+    const reduction = this.reduceObservations(observations, causalTabID, truncated);
+    const ownedObservation = observations.find((observation) => observation.owned);
+    await this.commitOriginProbe(origin, reduction, ownedObservation);
+  }
+
+  /** Pure. Never writes a field, persists anything, calls an options.*
+   * callback, or touches reauth state — probeOrigin() collects a whole
+   * batch of these before anything is committed. */
+  private async observeTab(tabID: number, resolver: URL): Promise<TabObservation> {
+    const owned = tabID === this.tabID && this.resolver?.origin === resolver.origin;
+    let tab: KeepaliveTab;
+    try {
+      tab = await this.api.tabs.get(tabID);
+    } catch {
+      return { tabID, owned, kind: "no_tab" };
+    }
+    if (typeof tab.url !== "string" || !resolverURLMatches(tab.url, resolver)) {
+      if (typeof tab.url === "string" && isAuthenticationURL(tab.url)) {
+        return { tabID, owned, kind: "auth_url" };
+      }
+      return { tabID, owned, kind: "off_origin" };
+    }
+    const scan = await this.resolverMarkerVerdict(tabID);
+    if (scan.outcome === "markers") return { tabID, owned, kind: "verdict", verdict: scan.verdict };
+    return { tabID, owned, kind: scan.outcome };
+  }
+
+  /** Reduce one origin's batch of observations to exactly one outcome, in
+   * the precedence documented on ProbeOutcome: a decisive causal tab always
+   * wins outright; failing that, disagreeing siblings are a conflict;
+   * failing that, a lone decisive polarity commits UNLESS the scan was
+   * truncated; anything short of a decisive commit LEAVES THE VERDICT
+   * ALONE — an incomplete or failed scan must never manufacture "out" for
+   * an origin that earned "in" from an earlier, complete probe. */
+  private reduceObservations(
+    observations: readonly TabObservation[],
+    causalTabID: number | undefined,
+    truncated: boolean,
+  ): { outcome: ProbeOutcome; verdict?: SessionVerdict; source?: KeepaliveProbeSource } {
+    const causal =
+      causalTabID === undefined
+        ? undefined
+        : observations.find((observation) => observation.tabID === causalTabID);
+    if (causal?.kind === "verdict" && causal.verdict !== undefined) {
+      return {
+        outcome: "markers",
+        verdict: causal.verdict,
+        source: causal.owned ? "keepalive_tab" : "live_tab",
+      };
+    }
+
+    const decisiveIn = observations.filter(
+      (observation) => observation.kind === "verdict" && observation.verdict === "in",
+    );
+    const decisiveOut = observations.filter(
+      (observation) => observation.kind === "verdict" && observation.verdict === "out",
+    );
+    if (decisiveIn.length > 0 && decisiveOut.length > 0) {
+      return { outcome: "conflict", verdict: "unknown", source: "none" };
+    }
+    if (!truncated) {
+      if (decisiveIn.length > 0) {
+        return {
+          outcome: "markers",
+          verdict: "in",
+          source: decisiveIn.some((observation) => observation.owned) ? "keepalive_tab" : "live_tab",
+        };
+      }
+      if (decisiveOut.length > 0) {
+        return {
+          outcome: "markers",
+          verdict: "out",
+          source: decisiveOut.some((observation) => observation.owned) ? "keepalive_tab" : "live_tab",
+        };
+      }
+    }
+    if (truncated) return { outcome: "partial_scan" };
+    if (observations.some((observation) => observation.kind === "scan_failed")) {
+      return { outcome: "scan_failed" };
+    }
+    if (observations.some((observation) => observation.kind === "no_markers")) {
+      return { outcome: "no_markers", verdict: "unknown", source: "none" };
+    }
+    return { outcome: "no_tab" };
+  }
+
+  /** The single write for one probeOrigin() call. `reduction.verdict`
+   * present means a NEW verdict was decided; absent means "verdict
+   * preserved" — only lastProbeAt/lastProbeOutcome advance. The owned tab's
+   * pause/resume disposition is a SECOND, independent result computed from
+   * its own observation only, applied after the snapshot write so a user
+   * tab's "in"/"out" never repins or pauses a keepalive tab sitting on a
+   * different page. */
+  private async commitOriginProbe(
+    origin: string,
+    reduction: { outcome: ProbeOutcome; verdict?: SessionVerdict; source?: KeepaliveProbeSource },
+    ownedObservation: TabObservation | undefined,
+  ): Promise<void> {
+    const now = Date.now();
+    const isCurrent = origin === this.resolver?.origin;
+    if (reduction.verdict !== undefined) {
+      const authenticated = reduction.verdict === "in";
+      const source = reduction.source ?? "none";
+      const prior = this.originStates.get(origin)?.authenticated ?? false;
+      if (isCurrent) {
+        this.verdict = reduction.verdict;
+        this.probeSource = source;
+        this.authenticated = authenticated;
+        this.lastVerdictAt = now;
+        this.lastProbeAt = now;
+        this.lastProbeOutcome = reduction.outcome;
+      }
+      this.updateOriginSnapshot(origin, {
+        authenticated,
+        verdict: reduction.verdict,
+        probeSource: source,
+        lastVerdictAt: now,
+        lastProbeAt: now,
+        lastProbeOutcome: reduction.outcome,
+      });
+      if (!prior && authenticated && (source === "live_tab" || source === "keepalive_tab")) {
+        this.options.onSessionEvidence?.(source, origin);
+      }
+    } else {
+      // Verdict preserved: an incomplete/failed/empty scan is not evidence.
+      if (isCurrent) {
+        this.lastProbeAt = now;
+        this.lastProbeOutcome = reduction.outcome;
+      }
+      this.updateOriginSnapshot(origin, {
+        lastProbeAt: now,
+        lastProbeOutcome: reduction.outcome,
+      });
+    }
+
+    const disposition = this.ownedTabDisposition(ownedObservation);
+    if (disposition === "pause") await this.pauseForReauth();
+    else if (disposition === "resume") await this.resumeAfterReauth();
+  }
+
+  /** Computed from the OWNED tab's own observation ONLY — never from the
+   * committed origin verdict, which may have come from a different tab
+   * entirely. A user tab reading "in" must not repin an owned tab still
+   * parked on an IdP; a user tab reading "out" must not pause an owned tab
+   * sitting on a good resolver page. */
+  private ownedTabDisposition(
+    observation: TabObservation | undefined,
+  ): "pause" | "resume" | "unchanged" {
+    if (observation === undefined || !observation.owned) return "unchanged";
+    if (observation.kind === "verdict" && observation.verdict === "in") return "resume";
+    if (observation.kind === "auth_url" || (observation.kind === "verdict" && observation.verdict === "out")) {
+      return "pause";
+    }
+    return "unchanged";
+  }
+
+  /** Reset an origin to "no evidence yet" WITHOUT recording a completed
+   * probe attempt — used only when the manager gives up or adopts a tab,
+   * neither of which is itself an inspection. */
+  private resetVerdict(origin: string | undefined): void {
+    const isCurrent = origin === undefined || origin === this.resolver?.origin;
+    if (isCurrent) {
+      this.verdict = "unknown";
+      this.probeSource = "none";
+      this.authenticated = false;
+      this.lastVerdictAt = undefined;
+      this.lastProbeAt = undefined;
+      this.lastProbeOutcome = undefined;
+    }
+    this.updateOriginSnapshot(
+      origin,
+      {
+        authenticated: false,
+        verdict: "unknown",
+        probeSource: "none",
+        lastVerdictAt: null,
+        lastProbeAt: null,
+        likelyAuthenticated: isCurrent ? this.likelyAuthenticated : false,
+      },
+      true,
+    );
   }
 
 
@@ -954,6 +1142,14 @@ export class KeepaliveManager {
     this.syncOriginStates();
   }
 
+  /** Shared by reconcile/onObserve/onReload/inspectAfterReload — the only
+   * four places that probe the manager's OWN tab as the causal observation. */
+  private async probeOwnedTab(reason: "cycle" | "reauth"): Promise<void> {
+    const origin = this.resolver?.origin;
+    if (origin === undefined || this.tabID === undefined) return;
+    await this.probeOrigin(origin, reason, this.tabID);
+  }
+
   private async reconcile(): Promise<void> {
     const warmDemand = this.hasWarmDemand();
     const resolver = this.resolverFromLatestOffer() ?? this.configuredResolver();
@@ -971,7 +1167,7 @@ export class KeepaliveManager {
     }
 
     if (this.reauthPaused) {
-      await this.inspectTab();
+      await this.probeOwnedTab("reauth");
       this.schedule(this.reauthPaused ? this.observeMs : this.intervalMs(), () =>
         this.reauthPaused ? this.onObserve() : this.onReload(),
       );
@@ -1096,10 +1292,13 @@ export class KeepaliveManager {
 
   private async resolverMarkerVerdict(
     tabID: number,
-  ): Promise<{ verdict: SessionVerdict; scanOutcome: ScanOutcome }> {
+  ): Promise<
+    | { outcome: "markers"; verdict: "in" | "out" }
+    | { outcome: "no_markers" | "scan_failed" }
+  > {
     const executeScript = this.api.scripting?.executeScript;
     if (executeScript === undefined) {
-      return { verdict: "unknown", scanOutcome: "scan_failed" };
+      return { outcome: "scan_failed" };
     }
     try {
       const [injection] = await executeScript({
@@ -1108,57 +1307,15 @@ export class KeepaliveManager {
       });
       const markers = injection?.result;
       if (!Array.isArray(markers)) {
-        return { verdict: "unknown", scanOutcome: "scan_failed" };
+        return { outcome: "scan_failed" };
       }
       const verdict = classifyResolverMarkers(markers as ResolverMarker[]);
-      return {
-        verdict,
-        scanOutcome: verdict === "unknown" ? "no_markers" : "markers",
-      };
+      if (verdict === "unknown") return { outcome: "no_markers" };
+      return { outcome: "markers", verdict };
     } catch {
       // Privileged pages, revoked host permission, and closed tabs expose a
       // distinct scan failure so the popup can explain the missing access.
-      return { verdict: "unknown", scanOutcome: "scan_failed" };
-    }
-  }
-
-  private setVerdict(
-    verdict: SessionVerdict,
-    source: KeepaliveProbeSource,
-    completedAt: number | null = Date.now(),
-    scanOutcome: ScanOutcome | undefined = undefined,
-    resolverOrigin: string | undefined = this.resolver?.origin,
-  ): void {
-    const normalizedOrigin = normalizeHttpsOrigin(resolverOrigin);
-    const prior = normalizedOrigin === undefined
-      ? this.authenticated
-      : this.originStates.get(normalizedOrigin)?.authenticated ?? false;
-    const authenticated = verdict === "in";
-    const authenticationChanged = prior !== authenticated;
-    const isCurrent = normalizedOrigin === undefined || normalizedOrigin === this.resolver?.origin;
-    if (isCurrent) {
-      this.verdict = verdict;
-      this.probeSource = source;
-      this.scanOutcome = scanOutcome;
-      this.lastVerdictAt = completedAt === null ? undefined : completedAt;
-      this.authenticated = authenticated;
-    }
-    this.updateOriginSnapshot(normalizedOrigin, {
-      authenticated,
-      verdict,
-      probeSource: source,
-      ...(scanOutcome === undefined ? {} : { scanOutcome }),
-      lastVerdictAt: completedAt,
-      lastCheckAt: completedAt,
-      checking: false,
-      likelyAuthenticated: isCurrent ? this.likelyAuthenticated : false,
-    }, scanOutcome === undefined);
-    if (
-      !prior &&
-      authenticated &&
-      (source === "live_tab" || source === "keepalive_tab")
-    ) {
-      this.options.onSessionEvidence?.(source, normalizedOrigin);
+      return { outcome: "scan_failed" };
     }
   }
 
@@ -1243,7 +1400,7 @@ export class KeepaliveManager {
       if (tabID !== undefined) {
         this.tabID = tabID;
         this.reauthPaused = false;
-        this.setVerdict("unknown", "none", null);
+        this.resetVerdict(resolver.origin);
         return;
       }
     } catch {
@@ -1300,7 +1457,7 @@ export class KeepaliveManager {
     }
 
     if (this.reauthPaused) {
-      await this.inspectTab();
+      await this.probeOwnedTab("reauth");
       this.schedule(this.reauthPaused ? this.observeMs : this.intervalMs(), () =>
         this.reauthPaused ? this.onObserve() : this.onReload(),
       );
@@ -1331,7 +1488,7 @@ export class KeepaliveManager {
       return;
     }
     if (this.reauthPaused) {
-      await this.inspectTab();
+      await this.probeOwnedTab("reauth");
       this.schedule(this.reauthPaused ? this.observeMs : this.intervalMs(), () =>
         this.reauthPaused ? this.onObserve() : this.onReload(),
       );
@@ -1349,70 +1506,12 @@ export class KeepaliveManager {
   }
 
   private async inspectAfterReload(): Promise<void> {
-    await this.inspectTab();
+    await this.probeOwnedTab("cycle");
     this.schedule(this.reauthPaused ? this.observeMs : this.intervalMs(), () =>
       this.reauthPaused ? this.onObserve() : this.onReload(),
     );
   }
 
-  private async inspectTab(
-    tabID = this.tabID,
-    resolverOverride: URL | undefined = this.resolver,
-  ): Promise<"in" | "out" | "unknown" | undefined> {
-    if (tabID === undefined || resolverOverride === undefined) return undefined;
-    const resolver = resolverOverride;
-    const origin = resolver.origin;
-    const owned = tabID === this.tabID && this.resolver?.origin === origin;
-    const source: KeepaliveProbeSource = owned ? "keepalive_tab" : "live_tab";
-    let tab: KeepaliveTab;
-    try {
-      tab = await this.api.tabs.get(tabID);
-    } catch {
-      const checkedAt = Date.now();
-      if (this.resolver?.origin === origin) this.lastCheckAt = checkedAt;
-      if (!owned) {
-        this.setVerdict("unknown", source, checkedAt, undefined, origin);
-        return "unknown";
-      }
-      this.tabID = undefined;
-      const wasPaused = this.reauthPaused;
-      this.reauthPaused = false;
-      if (wasPaused) this.options.onReauthStateChanged?.(false);
-      this.setVerdict("unknown", "none", checkedAt, undefined, origin);
-      return "unknown";
-    }
-    const checkedAt = Date.now();
-    if (this.resolver?.origin === origin) this.lastCheckAt = checkedAt;
-    if (typeof tab.url !== "string") {
-      this.setVerdict("unknown", source, checkedAt, undefined, origin);
-      return "unknown";
-    }
-
-    if (resolverURLMatches(tab.url, resolver)) {
-      const markerResult = await this.resolverMarkerVerdict(tabID);
-      // A URL-shaped auth redirect carries no session verdict by itself.
-      // Keep unknown until marker inspection supplies affirmative evidence.
-      const verdict = markerResult.verdict;
-      this.setVerdict(verdict, source, Date.now(), markerResult.scanOutcome, origin);
-      if (verdict === "in" && owned && this.reauthPaused) await this.resumeAfterReauth();
-      if (
-        owned &&
-        (verdict === "out" || (verdict === "unknown" && isAuthenticationURL(tab.url)))
-      ) {
-        await this.pauseForReauth();
-      }
-      return verdict;
-    }
-    if (isAuthenticationURL(tab.url)) {
-      // The IdP URL is intentionally not scanned and therefore cannot assert
-      // signed-out; it only drives the visible reauthentication affordance.
-      this.setVerdict("unknown", source, checkedAt, undefined, origin);
-      if (owned) await this.pauseForReauth();
-      return "unknown";
-    }
-    this.setVerdict("unknown", source, checkedAt, undefined, origin);
-    return "unknown";
-  }
 
   private async pauseForReauth(): Promise<void> {
     if (this.reauthPaused || this.tabID === undefined) return;
@@ -1467,7 +1566,7 @@ export class KeepaliveManager {
     this.reauthPaused = false;
     this.updateOriginSnapshot(origin, { pausedForReauth: false });
     if (wasAwaitingReauth) this.options.onReauthStateChanged?.(false);
-    this.setVerdict("unknown", "none", null, undefined, origin);
+    this.resetVerdict(origin);
     if (tabID === undefined) return;
     try {
       await this.api.tabs.remove(tabID);

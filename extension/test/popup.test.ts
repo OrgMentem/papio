@@ -870,7 +870,7 @@ test("institution session uses the shared card/button styles and explains missin
     intervalMinutes: 4,
     authenticated: false,
     pausedForReauth: false,
-    lastCheckAt: null,
+    lastProbeAt: null,
     resolverOrigin: null,
     lastAuthReturnedAt: null,
     queuedAuthJobs: 0,
@@ -895,7 +895,7 @@ test("unblocked notice shows once per release stamp and does not resurrect on po
     intervalMinutes: 4,
     authenticated: true,
     pausedForReauth: false,
-    lastCheckAt: Date.now(),
+    lastProbeAt: Date.now(),
     resolverOrigin: "https://example.primo.exlibrisgroup.com",
     lastAuthReturnedAt: Date.now(),
     queuedAuthJobs: 0,
@@ -930,7 +930,7 @@ test("institution sign-in errors return to a working sign-in button with the rea
       intervalMinutes: 4,
       authenticated: false,
       pausedForReauth: true,
-      lastCheckAt: null,
+      lastProbeAt: null,
       resolverOrigin: "https://resolver.example.edu",
       lastAuthReturnedAt: null,
       queuedAuthJobs: 0,
@@ -953,7 +953,7 @@ test("institution sign-in errors return to a working sign-in button with the rea
     "Could not open the institution sign-in",
   );
 });
-test("session card matrix propagates marker scan outcomes", () => {
+test("session card matrix propagates probe outcomes without hijacking a decided verdict", () => {
   const now = Date.now();
   const base = {
     enabled: true,
@@ -961,7 +961,7 @@ test("session card matrix propagates marker scan outcomes", () => {
     pausedForReauth: false,
     checking: false,
     likelyAuthenticated: false,
-    lastCheckAt: now,
+    lastProbeAt: now,
     resolverOrigin: "https://example.primo.exlibrisgroup.com",
     lastAuthReturnedAt: null,
     queuedAuthJobs: 0,
@@ -969,12 +969,22 @@ test("session card matrix propagates marker scan outcomes", () => {
     releasedAuthJobs: 0,
   };
 
+  const noTab = deriveSessionCardState({
+    ...base,
+    authenticated: false,
+    verdict: "unknown",
+    probeSource: "none",
+    lastProbeOutcome: "no_tab",
+    lastVerdictAt: now,
+  });
+  expect(noTab.label).toBe("No library page open — open your library to verify");
+
   const noMarkers = deriveSessionCardState({
     ...base,
     authenticated: false,
     verdict: "unknown",
     probeSource: "live_tab",
-    scanOutcome: "no_markers",
+    lastProbeOutcome: "no_markers",
     lastVerdictAt: now,
   });
   expect(noMarkers.label).toBe("Signed-in state unclear on this page");
@@ -986,11 +996,31 @@ test("session card matrix propagates marker scan outcomes", () => {
     authenticated: false,
     verdict: "unknown",
     probeSource: "live_tab",
-    scanOutcome: "scan_failed",
+    lastProbeOutcome: "scan_failed",
     lastVerdictAt: now,
   });
   expect(failed.label).toBe("papio couldn't read the library page — check site access in Options");
   expect(failed.detail).toContain("via your library tab");
+
+  const partialScan = deriveSessionCardState({
+    ...base,
+    authenticated: false,
+    verdict: "unknown",
+    probeSource: "live_tab",
+    lastProbeOutcome: "partial_scan",
+    lastVerdictAt: now,
+  });
+  expect(partialScan.label).toBe("Too many library tabs to check reliably");
+
+  const conflict = deriveSessionCardState({
+    ...base,
+    authenticated: false,
+    verdict: "unknown",
+    probeSource: "live_tab",
+    lastProbeOutcome: "conflict",
+    lastVerdictAt: now,
+  });
+  expect(conflict.label).toBe("Your library tabs disagree — open your library page");
 
   const unknown = deriveSessionCardState({
     ...base,
@@ -1008,7 +1038,7 @@ test("session card matrix propagates marker scan outcomes", () => {
     authenticated: false,
     verdict: "out",
     probeSource: "live_tab",
-    scanOutcome: "markers",
+    lastProbeOutcome: "markers",
     lastVerdictAt: now,
   });
   expect(signedOut.label).toBe("Signed out or expired");
@@ -1019,13 +1049,27 @@ test("session card matrix propagates marker scan outcomes", () => {
     authenticated: true,
     verdict: "in",
     probeSource: "live_tab",
-    scanOutcome: "markers",
+    lastProbeOutcome: "markers",
     lastVerdictAt: now,
   });
   expect(warm.label).toContain("Session warm");
   expect(warm.detail).toMatch(/via your library tab · (just now|\d+m ago|\d+h ago)$/);
   // A warm session offers no sign-in action — the button is hidden, not dead.
   expect(warm.action).toBe("none");
+
+  // A decided verdict is authoritative: a stale/contradictory outcome left
+  // over from an earlier probe attempt must never downgrade a fresh "in"
+  // verdict back to outcome-explanation copy. This is the exact regression
+  // the ProbeOutcome/verdict split exists to prevent.
+  const warmDespiteStaleOutcome = deriveSessionCardState({
+    ...base,
+    authenticated: true,
+    verdict: "in",
+    probeSource: "live_tab",
+    lastProbeOutcome: "no_tab",
+    lastVerdictAt: now,
+  });
+  expect(warmDespiteStaleOutcome.label).toContain("Session warm");
 });
 
 test("session status lines omit degenerate probe detail and retain real evidence", () => {
@@ -1042,7 +1086,7 @@ test("session status lines omit degenerate probe detail and retain real evidence
     checking: false,
     likelyAuthenticated: false,
     pausedForReauth: false,
-    lastCheckAt: null,
+    lastProbeAt: null,
     resolverOrigin: defaultOrigin,
     lastAuthReturnedAt: null,
     queuedAuthJobs: 0,
@@ -1054,7 +1098,6 @@ test("session status lines omit degenerate probe detail and retain real evidence
   renderInstitutionSession(single, {
     ...base,
     probeSource: "live_tab",
-    lastVerdictAt: now,
   });
   expect(single.getElementById("institution-session-status")?.textContent).toBe("Checking session…");
 
@@ -1071,19 +1114,19 @@ test("session status lines omit degenerate probe detail and retain real evidence
         checking: false,
         likelyAuthenticated: false,
         pausedForReauth: false,
-        lastCheckAt: now,
+        lastProbeAt: now,
       },
       {
         origin: uwaOrigin,
         authenticated: false,
         verdict: "out",
         probeSource: "live_tab",
-        scanOutcome: "markers",
+        lastProbeOutcome: "markers",
         lastVerdictAt: now,
         checking: false,
         likelyAuthenticated: false,
         pausedForReauth: false,
-        lastCheckAt: now,
+        lastProbeAt: now,
       },
     ],
   });
@@ -1108,7 +1151,7 @@ test("renders independent multi-origin session rows and targets each sign-in ori
     checking: false,
     likelyAuthenticated: false,
     pausedForReauth: false,
-    lastCheckAt: now,
+    lastProbeAt: now,
     resolverOrigin: defaultOrigin,
     lastAuthReturnedAt: null,
     queuedAuthJobs: 0,
@@ -1120,24 +1163,24 @@ test("renders independent multi-origin session rows and targets each sign-in ori
         authenticated: false,
         verdict: "unknown" as const,
         probeSource: "none" as const,
-        scanOutcome: "no_markers" as const,
+        lastProbeOutcome: "no_markers" as const,
         lastVerdictAt: null,
         checking: false,
         likelyAuthenticated: false,
         pausedForReauth: false,
-        lastCheckAt: now,
+        lastProbeAt: now,
       },
       {
         origin: uwaOrigin,
         authenticated: false,
         verdict: "out" as const,
         probeSource: "live_tab" as const,
-        scanOutcome: "markers" as const,
+        lastProbeOutcome: "markers" as const,
         lastVerdictAt: now,
         checking: false,
         likelyAuthenticated: false,
         pausedForReauth: false,
-        lastCheckAt: now,
+        lastProbeAt: now,
       },
     ],
   };
@@ -1177,12 +1220,12 @@ test("a calm warm session renders no institution card at all", () => {
     authenticated: true,
     verdict: "in",
     probeSource: "live_tab",
-    scanOutcome: "markers",
+    lastProbeOutcome: "markers",
     lastVerdictAt: now,
     checking: false,
     likelyAuthenticated: false,
     pausedForReauth: false,
-    lastCheckAt: now,
+    lastProbeAt: now,
     resolverOrigin: origin,
     lastAuthReturnedAt: null,
     queuedAuthJobs: 0,
@@ -1193,12 +1236,12 @@ test("a calm warm session renders no institution card at all", () => {
       authenticated: true,
       verdict: "in",
       probeSource: "live_tab",
-      scanOutcome: "markers",
+      lastProbeOutcome: "markers",
       lastVerdictAt: now,
       checking: false,
       likelyAuthenticated: false,
       pausedForReauth: false,
-      lastCheckAt: now,
+      lastProbeAt: now,
     }],
   });
   // Quiet means live: a warm, freshly-verified session with nothing waiting
@@ -1214,12 +1257,12 @@ test("a calm warm session renders no institution card at all", () => {
     authenticated: true,
     verdict: "in",
     probeSource: "live_tab",
-    scanOutcome: "markers",
+    lastProbeOutcome: "markers",
     lastVerdictAt: now - stale,
     checking: false,
     likelyAuthenticated: false,
     pausedForReauth: false,
-    lastCheckAt: now - stale,
+    lastProbeAt: now - stale,
     resolverOrigin: origin,
     lastAuthReturnedAt: null,
     queuedAuthJobs: 0,
@@ -1230,12 +1273,12 @@ test("a calm warm session renders no institution card at all", () => {
       authenticated: true,
       verdict: "in",
       probeSource: "live_tab",
-      scanOutcome: "markers",
+      lastProbeOutcome: "markers",
       lastVerdictAt: now - stale,
       checking: false,
       likelyAuthenticated: false,
       pausedForReauth: false,
-      lastCheckAt: now - stale,
+      lastProbeAt: now - stale,
     }],
   });
   expect(staleDoc.getElementById("institution-session")?.hidden).toBe(false);
@@ -1309,12 +1352,12 @@ test("a release notice keeps the card with a warm summary, never a bare heading"
     authenticated: true,
     verdict: "in",
     probeSource: "live_tab",
-    scanOutcome: "markers",
+    lastProbeOutcome: "markers",
     lastVerdictAt: now,
     checking: false,
     likelyAuthenticated: false,
     pausedForReauth: false,
-    lastCheckAt: now,
+    lastProbeAt: now,
     resolverOrigin: origin,
     lastAuthReturnedAt: null,
     queuedAuthJobs: 0,
@@ -1326,12 +1369,12 @@ test("a release notice keeps the card with a warm summary, never a bare heading"
       authenticated: true,
       verdict: "in",
       probeSource: "live_tab",
-      scanOutcome: "markers",
+      lastProbeOutcome: "markers",
       lastVerdictAt: now,
       checking: false,
       likelyAuthenticated: false,
       pausedForReauth: false,
-      lastCheckAt: now,
+      lastProbeAt: now,
     }],
   });
   expect(doc.getElementById("institution-session")?.hidden).toBe(false);
