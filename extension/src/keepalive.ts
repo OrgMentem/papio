@@ -1374,6 +1374,15 @@ export class KeepaliveManager {
     generation: number,
   ): Promise<void> {
     const now = Date.now();
+    // PROBE_ADMISSION_DEADLINE_MS can free an origin's admission slot while
+    // the wedged attempt that held it is still running in the background (see
+    // boundedProbe()); a fresher probe can then start, finish and commit
+    // BEFORE that stale attempt finally resolves and reaches here. Its result
+    // describes a document this manager stopped caring about several probes
+    // ago, so it must not be written AT ALL — gating only the callbacks would
+    // let it silently overwrite the fresher verdict, flipping the card back to
+    // "Signed out" for a session that is fine and firing nothing to say so.
+    if (generation !== this.probeGenerations.get(origin)) return;
     const isCurrent = origin === this.resolver?.origin;
     if (reduction.verdict !== undefined) {
       const authenticated = reduction.verdict === "in";
@@ -1396,24 +1405,15 @@ export class KeepaliveManager {
         lastProbeOutcome: reduction.outcome,
         dirtySince: null,
       });
-      // PROBE_ADMISSION_DEADLINE_MS can free an origin's admission slot
-      // while the wedged attempt that held it is still running in the
-      // background (see boundedProbe()); a fresher probe can then start,
-      // finish, and commit BEFORE that stale attempt finally resolves and
-      // reaches here. A strictly superseded generation must never produce
-      // evidence or a badge signal — it may be describing a document this
-      // manager stopped caring about several probes ago.
-      const isLatestGeneration = generation === this.probeGenerations.get(origin);
       if (
         reduction.outcome === "markers" &&
         authenticated &&
         (source === "live_tab" || source === "keepalive_tab") &&
-        this.isConfiguredMember(origin) &&
-        isLatestGeneration
+        this.isConfiguredMember(origin)
       ) {
         this.options.onFreshSessionEvidence?.({ origin, observedAt: now, generation, source });
       }
-      if (authenticated !== prior && this.isConfiguredMember(origin) && isLatestGeneration) {
+      if (authenticated !== prior && this.isConfiguredMember(origin)) {
         this.options.onOriginAuthenticationChanged?.(origin, authenticated);
       }
     } else {
@@ -1430,7 +1430,7 @@ export class KeepaliveManager {
     }
 
     const disposition = this.ownedTabDisposition(ownedObservation);
-    if (disposition === "pause") await this.pauseForReauth();
+    if (disposition === "pause") await this.pauseForReauth(origin);
     else if (disposition === "resume") await this.resumeAfterReauth(origin);
   }
 
@@ -1667,7 +1667,7 @@ export class KeepaliveManager {
       return true;
     }
     if (!this.reauthPaused) {
-      await this.pauseForReauth();
+      await this.pauseForReauth(target.origin);
     } else {
       try {
         await this.api.tabs.update(tabID, { active: true, pinned: false, muted: false });
@@ -1816,7 +1816,7 @@ export class KeepaliveManager {
       const tabID = existing.find((tab) => tab.id !== undefined)?.id;
       if (tabID !== undefined) {
         this.tabID = tabID;
-        this.reauthPaused = false;
+        this.clearReauthPause(resolver.origin);
         // The owned-tab cycle "just ran" the moment we take ownership of a
         // tab, whether adopted here or freshly created below — otherwise
         // the very first scheduleCycle(lastCycleRunAt + intervalMs()) call
@@ -1850,7 +1850,7 @@ export class KeepaliveManager {
       }
       if (tab.id === undefined) return;
       this.tabID = tab.id;
-      this.reauthPaused = false;
+      this.clearReauthPause(resolver.origin);
       this.lastCycleRunAt = Date.now();
       // Opening the probe tab is not evidence of anything: the reset that
       // lived here erased restored or previously earned session state before
@@ -1924,17 +1924,26 @@ export class KeepaliveManager {
   }
 
 
-  private async pauseForReauth(): Promise<void> {
+  private async pauseForReauth(origin: string): Promise<void> {
     if (this.reauthPaused || this.tabID === undefined) return;
+    if (this.resolver?.origin !== origin) return;
     this.reauthPaused = true;
-    void this.updateOriginSnapshot(this.resolver?.origin, { pausedForReauth: true });
+    void this.updateOriginSnapshot(origin, { pausedForReauth: true });
+    const pausedTabID = this.tabID;
     try {
-      await this.api.tabs.update(this.tabID, { active: true, pinned: false, muted: false });
+      await this.api.tabs.update(pausedTabID, { active: true, pinned: false, muted: false });
       // In work-window mode the tab lives in a minimized window; bring it up.
-      await this.options.surfaceReauthTab?.(this.tabID);
+      await this.options.surfaceReauthTab?.(pausedTabID);
     } catch {
       // The reauth callback/badge still gives the user a recoverable signal.
     }
+    // The resolver can move to another institution while this call is in
+    // flight — openReauth() is serialized only against itself, not against a
+    // probe's disposition — and a late-landing pause for the OLD origin must
+    // never raise "needs sign-in" over the NEW one's healthy session, nor
+    // surface a tab id that now belongs to it. resumeAfterReauth() re-checks
+    // for the mirror-image reason; this is the same rule on the way in.
+    if (this.resolver?.origin !== origin || this.tabID !== pausedTabID) return;
     this.options.onReauthStateChanged?.(true);
     this.options.onReauthNeeded?.();
     // Guarantee a prompt recheck regardless of caller: an explicit
@@ -1943,6 +1952,22 @@ export class KeepaliveManager {
     // inherit whatever cycleTimer already happened to be pending — up to a
     // full interval away.
     this.armReauthTimer();
+  }
+
+  /** Drop a reauthentication pause, in memory AND in the persisted snapshot.
+   *
+   * Taking ownership of a fresh or adopted tab must clear both. pauseForReauth
+   * unpins and unmutes the tab it parks, so a service worker suspended
+   * mid-pause comes back with `tabID`/`reauthPaused` at their in-memory
+   * defaults while the origin snapshot still says pausedForReauth — and the
+   * adoption query, which looks for a pinned+muted tab, cannot find the very
+   * tab the operator may be signing in on. Without this the popup kept
+   * reporting "Waiting on your sign-in" for a session nothing was waiting on,
+   * with no reauth timer armed to ever re-check it. */
+  private clearReauthPause(origin: string | undefined): void {
+    this.reauthPaused = false;
+    this.clearReauthTimer();
+    if (origin !== undefined) void this.updateOriginSnapshot(origin, { pausedForReauth: false });
   }
 
   private armReauthTimer(): void {

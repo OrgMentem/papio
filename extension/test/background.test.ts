@@ -4993,6 +4993,7 @@ test("delivery session evidence is frozen at request time, not completion time",
         provider_hosts: [],
       },
     ],
+    offerURLs: { [jobID]: OPENURL },
   });
   h.tabs.live.set(100, { id: 100, url: pdfURL });
   await h.bridge.start();
@@ -5441,6 +5442,51 @@ test("fresh evidence for one resolver releases only that resolver's queued hando
     tab_id: -1,
   });
   expect(h.tabs.created).toEqual([{ url: OPENURL, active: false }]);
+});
+
+test("release authority expires with the evidence that granted it", async () => {
+  // A worker-local Set used to short-circuit hasAuthEvidence ahead of the TTL
+  // check, so once an origin went release-grade it stayed release-grade for
+  // the rest of the worker's life. Evidence now lives only in the persisted,
+  // timestamped map, so it ages out.
+  const h = makeHarness();
+  const offer = jobOffer("job_evidence_expiry") as { payload: Record<string, unknown> };
+  offer.payload["requires_auth"] = true;
+
+  await h.bridge.start();
+  await h.bridge.recordFreshSessionEvidence(freshEvidence(h, "https://resolver.example.edu"));
+  h.clock.now += 30 * 60_000 + 1;
+
+  await h.port.inbound(offer);
+  expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_evidence_expiry")).toMatchObject({
+    status: "queued",
+  });
+});
+
+test("a committed sign-out revokes that origin's release authority immediately", async () => {
+  // onOriginAuthenticationChanged was wired to a no-op, so nothing could ever
+  // retract evidence: papio kept opening queued handoffs into a session the
+  // operator had signed out of, until the TTL or the worker expired.
+  const h = makeHarness();
+  const origin = "https://resolver.example.edu";
+  const offer = jobOffer("job_evidence_revoked") as { payload: Record<string, unknown> };
+  offer.payload["requires_auth"] = true;
+
+  await h.bridge.start();
+  await h.bridge.recordFreshSessionEvidence(freshEvidence(h, origin));
+  await h.bridge.revokeAuthEvidence(origin);
+
+  await h.port.inbound(offer);
+  expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_evidence_revoked")).toMatchObject({
+    status: "queued",
+  });
+  expect(h.backend.store.authEvidenceByOrigin?.[origin]).toBeUndefined();
+
+  // Signing back in re-grants it, so revocation is not a one-way latch.
+  await h.bridge.recordFreshSessionEvidence(freshEvidence(h, origin));
+  expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_evidence_revoked")).toMatchObject({
+    status: "accepted",
+  });
 });
 
 test("fresh evidence for one resolver cannot be laundered into another's queue by a later unscoped release call", async () => {

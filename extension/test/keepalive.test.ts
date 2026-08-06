@@ -2460,3 +2460,281 @@ test("a superseded generation's result never produces evidence", async () => {
   expect(h.freshEvidence).toHaveLength(1);
   expect(h.freshEvidence[0]).toBe(firstEvidence);
 });
+
+test("a superseded generation cannot overwrite a fresher committed verdict, nor clear a dirtySince set after it committed", async () => {
+  const origin = "https://resolver.example.edu";
+  const h = makeHarness(4, undefined, { knownOrigins: [origin] });
+  h.configuredReady.value = true;
+  await h.manager.init();
+  h.jobs.count = 0;
+  await h.manager.sync();
+
+  // --- Phase 1: the stale attempt reads a DIFFERENT, decisive polarity
+  // than the fresher generation that already committed. The scaffold this
+  // builds on deliberately has the stale read agree with the fresh one,
+  // so it never exercises the overwrite this guards against.
+
+  const tabA = { id: 71, url: `${origin}/account` };
+  h.tabs.live.set(tabA.id, tabA);
+  h.tabs.focusedTab = tabA;
+  const gateA = h.scripting.hold(tabA.id);
+
+  const first = h.manager.probeForeground(origin);
+  await flushMicrotasks();
+  h.clock.advanceBy(20_000);
+  await h.timers.runByDelay(20_000); // admission deadline frees the slot
+  await first;
+  expect(h.freshEvidence).toEqual([]);
+
+  const tabB = { id: 72, url: `${origin}/account` };
+  h.tabs.live.set(tabB.id, tabB);
+  h.tabs.focusedTab = tabB; // default markers "Sign out" -> decisive "in"
+  await h.manager.probeForeground(origin);
+
+  expect(h.freshEvidence).toHaveLength(1);
+  expect(h.authChanges).toEqual([{ origin, authenticated: true }]);
+  const committedAt = h.manager.getSnapshot().lastVerdictAt;
+  expect(h.manager.getSnapshot()).toMatchObject({ verdict: "in", authenticated: true });
+
+  // Tab A's held scan finally resolves to a decisive "out" — a document
+  // this manager stopped caring about several probes ago. Its generation
+  // was superseded, so it must not be written AT ALL: gating only the
+  // callbacks would let it silently flip the card back to "Signed out".
+  gateA.release([{ text: "Sign in", label: "" }]);
+  await flushMicrotasks();
+
+  expect(h.freshEvidence).toHaveLength(1);
+  expect(h.authChanges).toEqual([{ origin, authenticated: true }]); // no flip back to false
+  expect(h.manager.getSnapshot()).toMatchObject({
+    verdict: "in",
+    authenticated: true,
+    lastVerdictAt: committedAt,
+  });
+  expect(h.manager.getOriginSnapshots().find((s) => s.origin === origin)).toMatchObject({
+    verdict: "in",
+    authenticated: true,
+    lastVerdictAt: committedAt,
+  });
+
+  // --- Phase 2 (mirror, preserved-verdict branch): a stale no_tab result
+  // must not clear a dirtySince that a genuinely later event set AFTER
+  // the fresher probe already committed.
+
+  h.clock.advanceBy(MIN_FOREGROUND_PROBE_SPACING_MS);
+  const tabD = { id: 73, url: `${origin}/account` };
+  h.tabs.live.set(tabD.id, tabD);
+  h.tabs.focusedTab = tabD;
+  const gateD = h.scripting.hold(tabD.id);
+
+  const stale2 = h.manager.probeForeground(origin);
+  await flushMicrotasks();
+  h.clock.advanceBy(20_000);
+  await h.timers.runByDelay(20_000); // admission deadline frees the slot
+  await stale2;
+
+  const tabE = { id: 74, url: `${origin}/account` };
+  h.tabs.live.set(tabE.id, tabE);
+  h.tabs.focusedTab = tabE; // default markers "Sign out" -> decisive "in" again
+  await h.manager.probeForeground(origin);
+  const freshCommitAt = h.manager.getSnapshot().lastVerdictAt;
+  expect(h.manager.getOriginSnapshots().find((s) => s.origin === origin)?.dirtySince).toBeNull();
+
+  // A genuinely new dirty signal arrives AFTER that fresher commit.
+  await h.manager.markDirty(origin);
+  const dirtyAt = h.manager.getOriginSnapshots().find((s) => s.origin === origin)?.dirtySince;
+  expect(dirtyAt).not.toBeNull();
+
+  // Tab D is gone by the time its held scan finally settles: the stale
+  // attempt's own observation degrades to "stale", which reduces to a
+  // "no_tab" outcome — the preserved-verdict branch.
+  h.tabs.live.delete(tabD.id);
+  gateD.release();
+  await flushMicrotasks();
+
+  const finalSnapshot = h.manager.getOriginSnapshots().find((s) => s.origin === origin);
+  expect(finalSnapshot?.dirtySince).toBe(dirtyAt);
+  expect(finalSnapshot?.verdict).toBe("in");
+  expect(finalSnapshot?.lastVerdictAt).toBe(freshCommitAt);
+});
+
+test("a pause that lands after the resolver moved on to a healthy origin does not raise reauth for the new origin", async () => {
+  const originA = "https://resolver.example.edu";
+  const originB = "https://onesearch.library.example-college.edu";
+  const stored: Record<string, unknown> = {
+    "keepalive.originStates": [
+      {
+        origin: originB,
+        authenticated: true,
+        verdict: "in",
+        probeSource: "live_tab",
+        lastProbeOutcome: "markers",
+        lastVerdictAt: Date.now(),
+        checking: false,
+        likelyAuthenticated: false,
+        pausedForReauth: false,
+        lastProbeAt: Date.now(),
+        dirtySince: null,
+      },
+    ],
+  };
+  const h = makeHarness(4, undefined, { latestOpenURL: RESOLVER_OPENURL, storageValues: stored });
+  await h.manager.init(); // owned tab id 1 for origin A
+
+  // Gate only pauseForReauth's own tabs.update shape (pinned explicitly
+  // false) so every other tabs.update call — e.g. openReauth's
+  // healthy-tab reactivation below — is unaffected and free to settle.
+  const gate = Promise.withResolvers<void>();
+  const originalUpdate = h.tabs.update.bind(h.tabs);
+  h.tabs.update = async (
+    id: number,
+    properties: { active?: boolean; pinned?: boolean; muted?: boolean },
+  ) => {
+    if (properties.pinned === false) await gate.promise;
+    return originalUpdate(id, properties);
+  };
+
+  // The owned tab parks on an IdP redirect: commitOriginProbe's
+  // disposition is "pause", which calls pauseForReauth(A) directly — NOT
+  // through openReauth's serialized reauthChain.
+  h.tabs.live.get(1)!.url = "https://idp.example.edu/idp/profile/SAML2/Redirect/SSO?service=resolver";
+  const pausing = h.manager.probeForeground();
+  await flushMicrotasks();
+
+  // pauseForReauth(A) is stuck inside its tabs.update await; nothing has
+  // fired yet.
+  expect(h.reauthState).toEqual([]);
+  expect(h.reauths.count).toBe(0);
+
+  // The operator opens a healthy, different origin directly. This moves
+  // this.resolver/this.tabID to B well before A's stuck pause resolves —
+  // openReauth is serialized only against itself, never against a
+  // probe's own disposition call.
+  await h.manager.openReauth(originB);
+  expect(h.manager.getSnapshot().resolverOrigin).toBe(originB);
+  expect(h.manager.getOriginSnapshots().find((s) => s.origin === originB)?.pausedForReauth).toBe(false);
+
+  // Now let A's stuck pause resolve.
+  gate.resolve();
+  await pausing;
+  await flushMicrotasks();
+
+  // B must never have been told it needs reauth because of A's stale,
+  // late-landing pause.
+  expect(h.reauthState).toEqual([false]); // only removeStaleTab's own unpause push
+  expect(h.reauths.count).toBe(0);
+  expect(h.timers.pendingDelays()).not.toContain(10); // no reauth watch armed
+  expect(h.manager.getOriginSnapshots().find((s) => s.origin === originB)?.pausedForReauth).toBe(false);
+});
+
+test("a restart mid-pause does not strand the persisted pause, whether the paused tab is adopted or freshly created", async () => {
+  const origin = "https://resolver.example.edu";
+  const pausedSnapshot = (): Record<string, unknown> => ({
+    "keepalive.originStates": [
+      {
+        origin,
+        authenticated: false,
+        verdict: "unknown",
+        probeSource: "none",
+        lastVerdictAt: null,
+        lastProbeAt: null,
+        checking: false,
+        likelyAuthenticated: false,
+        pausedForReauth: true,
+        dirtySince: null,
+      },
+    ],
+  });
+
+  // Branch 1: the paused tab (unpinned/unmuted by the real pauseForReauth
+  // before the restart) still satisfies the fake adoption query, so
+  // createTabOnce() takes the ADOPT branch.
+  {
+    const h = makeHarness(4, undefined, {
+      latestOpenURL: RESOLVER_OPENURL,
+      storageValues: pausedSnapshot(),
+    });
+    const adopted = { id: 501, url: `${origin}/account` };
+    h.tabs.live.set(adopted.id, adopted);
+    h.tabs.resolverTabs.push(adopted);
+
+    await h.manager.init();
+    await flushMicrotasks();
+
+    expect(h.tabs.created).toHaveLength(0); // adopted, not created
+    expect(h.manager.getSnapshot().pausedForReauth).toBe(false);
+    expect(h.manager.getOriginSnapshots().find((s) => s.origin === origin)?.pausedForReauth).toBe(false);
+    expect(h.timers.pendingDelays()).not.toContain(10); // no reauth watch left armed
+    const persisted = h.storageValues["keepalive.originStates"] as KeepaliveOriginSnapshot[];
+    expect(persisted.find((s) => s.origin === origin)?.pausedForReauth).toBe(false);
+  }
+
+  // Branch 2: nothing adoptable exists — createTabOnce() takes the CREATE
+  // branch instead.
+  {
+    const h = makeHarness(4, undefined, {
+      latestOpenURL: RESOLVER_OPENURL,
+      storageValues: pausedSnapshot(),
+    });
+
+    await h.manager.init();
+    await flushMicrotasks();
+
+    expect(h.tabs.created).toHaveLength(1); // freshly created, not adopted
+    expect(h.manager.getSnapshot().pausedForReauth).toBe(false);
+    expect(h.manager.getOriginSnapshots().find((s) => s.origin === origin)?.pausedForReauth).toBe(false);
+    expect(h.timers.pendingDelays()).not.toContain(10);
+    const persisted = h.storageValues["keepalive.originStates"] as KeepaliveOriginSnapshot[];
+    expect(persisted.find((s) => s.origin === origin)?.pausedForReauth).toBe(false);
+  }
+});
+
+test("a non-decisive causal tab cedes the verdict to a decisive sibling, and probeSource reflects whichever tab actually decided", async () => {
+  // Polarity 1: the causal (focused) tab is a live, non-owned tab reading
+  // no markers at all; the manager's OWNED tab is a non-causal sibling
+  // that reads decisively "in". Precedence must fall through past the
+  // non-decisive causal tab to the sibling, and probeSource must credit
+  // the owned tab that actually decided — not the non-owned causal one.
+  {
+    const h = makeHarness();
+    await h.manager.init(); // owned tab id 1, default markers "Sign out" -> decisive "in"
+
+    const focused = { id: 50, url: "https://resolver.example.edu/discovery/search" };
+    h.tabs.live.set(focused.id, focused);
+    h.tabs.focusedTab = focused;
+    h.markersByTab.set(focused.id, []); // no markers at all
+
+    await h.manager.probeForeground();
+
+    expect(h.manager.getSnapshot()).toMatchObject({
+      verdict: "in",
+      authenticated: true,
+      probeSource: "keepalive_tab",
+      lastProbeOutcome: "markers",
+    });
+  }
+
+  // Polarity 2: the causal (focused) tab is now the manager's OWNED tab,
+  // reading no markers; a non-owned live sibling reads decisively "out".
+  // probeSource must credit the non-owned sibling it ceded to, not the
+  // owned causal tab.
+  {
+    const h = makeHarness();
+    await h.manager.init(); // owned tab id 1
+    h.markersByTab.set(1, []); // owned tab: no markers at all
+    h.tabs.focusedTab = h.tabs.live.get(1)!;
+
+    const sibling = { id: 60, url: "https://resolver.example.edu/account/overview" };
+    h.tabs.live.set(sibling.id, sibling);
+    h.tabs.resolverTabs.push(sibling);
+    h.markersByTab.set(sibling.id, [{ text: "Sign in", label: "" }]); // decisive "out"
+
+    await h.manager.probeForeground();
+
+    expect(h.manager.getSnapshot()).toMatchObject({
+      verdict: "out",
+      authenticated: false,
+      probeSource: "live_tab",
+      lastProbeOutcome: "markers",
+    });
+  }
+});

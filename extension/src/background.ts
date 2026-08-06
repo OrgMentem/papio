@@ -1126,17 +1126,6 @@ export class Bridge {
    * for this offer. Keep this worker-local debounce until the job is removed so
    * reloads and SPA completion events cannot report the same outcome repeatedly. */
   private readonly resolverNoEntitlementSent = new Set<string>();
-  /** Origins where an institutional landing was observed this service-worker
-   * lifetime. Feeds ONLY currentSessionEvidence's per-job "warm" label —
-   * never hasAuthEvidence/release authorization: ADR-0013 says a timing
-   * frame is not identity evidence, so a landing alone must never unblock
-   * another queued job, even one offered by this same origin. */
-  private readonly authReturnedThisWorkerOrigins = new Set<string>();
-  /** Per-origin timestamp of the most recent auth-evidence event (landing or
-   * fresh probe), worker-local. Grades currentSessionEvidence's "fresh_auth"
-   * vs "warm" tier for that origin's own deliveries; deliberately never read
-   * for release authorization — see recordFreshSessionEvidence. */
-  private readonly originAuthReturnedAt = new Map<string, number>();
   /** Route traversal evidence observed for each active handoff. */
   private readonly resolverRoutes = new Set<string>();
   /** Per-job auth evidence used for the next completed browser delivery. */
@@ -1144,12 +1133,15 @@ export class Bridge {
   /** A completed OA landing can release only OA concurrency queues; it is never
    * evidence that an institutional SSO session exists. */
   private openAccessLandingObserved = false;
-  /** Origins with a committed release-grade probe verdict — "in", live_tab
-   * or keepalive_tab, from a decisive marker scan (recordFreshSessionEvidence) —
-   * observed THIS worker life. Worker-local and lost on every MV3 restart;
-   * store.authEvidenceByOrigin (state.ts) is the persisted counterpart
-   * hasAuthEvidence() also honors so release authority survives a restart. */
-  private readonly releaseGradeOrigins = new Set<string>();
+  // Per-origin auth evidence lives in ONE place: store.authEvidenceByOrigin
+  // (state.ts), timestamped and TTL'd. Three worker-local mirrors used to
+  // shadow it — a release-grade Set, a landing Set, and a timestamp Map — and
+  // every one of them was append-only. hasAuthEvidence() consulted the
+  // release-grade Set first and returned true unconditionally, so signing out
+  // revoked nothing: papio kept releasing that origin's queued handoffs for
+  // the rest of the worker's life, past the TTL the persisted entry was
+  // supposed to enforce. A single expiring source can be revoked with one
+  // delete, and cannot disagree with itself.
   /** Current keepalive reauthentication pause, used by computeBadge. */
   private keepaliveReauthNeeded = false;
   /** Attached synchronously at worker startup, before bridge.start() binds
@@ -1333,13 +1325,19 @@ export class Bridge {
     });
   }
 
+  /** Any configured origin whose persisted evidence is still inside the TTL.
+   * Only reached before the keepalive manager has a snapshot of its own. */
+  private anyOriginAuthenticated(): boolean {
+    return this.knownResolverOrigins().some((origin) => this.hasAuthEvidence(origin));
+  }
+
   sessionState(): BridgeSessionState {
     const fallback: KeepaliveSnapshot = {
       enabled: true,
       intervalMinutes: 4,
-      authenticated: this.releaseGradeOrigins.size > 0,
-      verdict: this.releaseGradeOrigins.size > 0 ? "in" : "unknown",
-      probeSource: this.releaseGradeOrigins.size > 0 ? "keepalive_tab" : "none",
+      authenticated: this.anyOriginAuthenticated(),
+      verdict: this.anyOriginAuthenticated() ? "in" : "unknown",
+      probeSource: this.anyOriginAuthenticated() ? "keepalive_tab" : "none",
       lastVerdictAt: null,
       checking: false,
       likelyAuthenticated: false,
@@ -3012,8 +3010,8 @@ export class Bridge {
     // interactive for the whole download, so this is the only moment the
     // page that actually produced these bytes is known for certain.
     const deliveryPageHostAtStart = sanitizePageHost(tabURL);
-    // Freeze session evidence too, for the same reason: releaseGradeOrigins/
-    // authReturnedThisWorkerOrigins/originAuthReturnedAt are live per-origin
+    // Freeze session evidence too, for the same reason:
+    // store.authEvidenceByOrigin is live per-origin
     // state, not scoped to this tab or download, so an institutional probe
     // or sign-in landing anywhere in the browser during the multi-second
     // download must not retroactively credit this delivery.
@@ -3921,22 +3919,41 @@ export class Bridge {
     return { ...store, authAttempts };
   }
 
-  /** Release-grade evidence for `origin` — either this worker's own live
-   * releaseGradeOrigins (see recordFreshSessionEvidence) or a persisted
-   * authEvidenceByOrigin entry from a prior worker life, within
-   * AUTH_EVIDENCE_TTL_MS. The persisted entry exists because an MV3 worker
-   * restarts constantly and releaseGradeOrigins does not survive that;
-   * recordFreshSessionEvidence and a warm institutional landing
-   * (recordInstitutionalSession) are the only writers. The global
-   * lastAuthReturnedAt display field and the landing-observed marker are
-   * still excluded on their own — ADR-0013: a timing frame is not identity
-   * evidence; only an origin-scoped release-grade observation is. */
+  /** Release-grade evidence for `origin`: a persisted authEvidenceByOrigin
+   * entry within AUTH_EVIDENCE_TTL_MS, written only by
+   * recordFreshSessionEvidence and by a warm institutional landing
+   * (recordInstitutionalSession), and dropped by revokeAuthEvidence when a
+   * probe commits that the origin is no longer authenticated.
+   *
+   * Persisted rather than worker-local because an MV3 worker restarts
+   * constantly, and expiring rather than sticky because a session ends: the
+   * worker-local Set that used to short-circuit this check never expired and
+   * was never deleted, so an operator who signed out kept authorizing
+   * releases until the worker happened to die.
+   *
+   * The global lastAuthReturnedAt display field is still excluded on its own —
+   * ADR-0013: a timing frame is not identity evidence; only an origin-scoped
+   * observation is. */
   private hasAuthEvidence(origin: string): boolean {
-    if (this.releaseGradeOrigins.has(origin)) return true;
     const evidencedAt = this.store.authEvidenceByOrigin?.[origin];
     if (typeof evidencedAt !== "number") return false;
     const age = this.deps.now() - evidencedAt;
     return age >= 0 && age <= AUTH_EVIDENCE_TTL_MS;
+  }
+
+  /** A committed probe says this origin is no longer authenticated, so its
+   * evidence must stop authorizing releases immediately rather than idling
+   * out over the TTL. Wired to keepalive's onOriginAuthenticationChanged,
+   * which fires only on a real committed change — never on a preserved
+   * verdict, so a closed tab or an unreadable page cannot revoke. */
+  async revokeAuthEvidence(origin: string): Promise<void> {
+    await this.ready;
+    if (this.store.authEvidenceByOrigin?.[origin] === undefined) return;
+    await this.update((s) => {
+      const authEvidenceByOrigin = { ...s.authEvidenceByOrigin };
+      delete authEvidenceByOrigin[origin];
+      return { ...s, authEvidenceByOrigin };
+    });
   }
 
   /** Keeps an OA landing from opening an institutional queue while preserving
@@ -4334,7 +4351,7 @@ export class Bridge {
    * But when papio itself drove the tab past authentication onto a page
    * resolving to a configured origin, that IS first-hand evidence for THAT
    * origin: it persists per-origin release evidence (surviving the MV3
-   * restarts that wipe releaseGradeOrigins), releases only that origin's own
+   * restarts that wipe everything worker-local), releases only that origin's own
    * queued handoffs, and reloads only that origin's own stalled auth tabs —
    * reloadAuthenticationHandoffs still skips any job already reported to the
    * operator as authStalledReported. It never touches another origin's tabs
@@ -4345,9 +4362,7 @@ export class Bridge {
     if (!this.isInstitutionalSessionLanding(job, rawURL)) return false;
     const origin = this.resolverOriginHint(this.offerURLs.get(job.job_id));
     if (origin === undefined || !this.knownResolverOrigins().includes(origin)) return false;
-    const firstAuthEvidence = !this.authReturnedThisWorkerOrigins.has(origin);
-    this.authReturnedThisWorkerOrigins.add(origin);
-    this.originAuthReturnedAt.set(origin, now);
+    const firstAuthEvidence = !this.hasAuthEvidence(origin);
     await this.update((s) => ({
       ...s,
       lastAuthReturnedAt: now,
@@ -4402,12 +4417,13 @@ export class Bridge {
     if (perJob !== undefined) return perJob;
     const origin = this.resolverOriginHint(this.offerURLs.get(job.job_id));
     if (origin === undefined) return "none";
-    const lastAuth = this.originAuthReturnedAt.get(origin);
-    if (typeof lastAuth === "number") {
-      const age = this.deps.now() - lastAuth;
-      if (age >= 0 && age <= AUTH_EVIDENCE_TTL_MS) return "fresh_auth";
-    }
-    return this.releaseGradeOrigins.has(origin) || this.authReturnedThisWorkerOrigins.has(origin) ? "warm" : "none";
+    // Tiered off the one persisted source: inside the TTL the session is
+    // freshly evidenced, an expired-but-present entry is merely warm, and a
+    // revoked or never-seen origin has nothing.
+    const lastAuth = this.store.authEvidenceByOrigin?.[origin];
+    if (typeof lastAuth !== "number") return "none";
+    const age = this.deps.now() - lastAuth;
+    return age >= 0 && age <= AUTH_EVIDENCE_TTL_MS ? "fresh_auth" : "warm";
   }
 
   private deliveryEvidenceFor(job: ActiveJob, track: DownloadTrack, route: DeliveryRoute): DeliverySessionEvidence {
@@ -4415,11 +4431,10 @@ export class Bridge {
     // Mirrors deliveryPageHost's frozen-host guard below: a popup delivery's
     // session evidence is captured once, in startPDFDelivery, at request
     // time. The download can take seconds with the tab still interactive, so
-    // releaseGradeOrigins/authReturnedThisWorkerOrigins/originAuthReturnedAt are
-    // live per-origin state that can flip true mid-download — reading them here
-    // would credit a public-page delivery with an institutional probe or
-    // sign-in that happened to land elsewhere in the browser while the bytes
-    // were still in flight.
+    // store.authEvidenceByOrigin is live per-origin state that can flip true
+    // mid-download — reading it here would credit a public-page delivery with
+    // an institutional probe or sign-in that happened to land elsewhere in
+    // the browser while the bytes were still in flight.
     if (track.delivery === true) {
       const frozen = this.store.pendingDelivery;
       if (frozen?.job_id === job.job_id && frozen.status !== "failed" && frozen.session_evidence !== undefined) {
@@ -4564,10 +4579,8 @@ export class Bridge {
    * path does the same for its own, narrower kind of evidence. */
   async recordFreshSessionEvidence(evidence: FreshSessionEvidence): Promise<void> {
     const { origin } = evidence;
-    this.releaseGradeOrigins.add(origin);
     await this.ready;
     const now = this.deps.now();
-    this.originAuthReturnedAt.set(origin, now);
     await this.update((s) => ({
       ...s,
       lastAuthReturnedAt: now,
@@ -7534,7 +7547,12 @@ if (typeof chrome !== "undefined" && chrome.runtime?.id) {
     onFreshSessionEvidence: (evidence: FreshSessionEvidence) => {
       void bridge.recordFreshSessionEvidence(evidence);
     },
-    onOriginAuthenticationChanged: () => {
+    onOriginAuthenticationChanged: (origin: string, authenticated: boolean) => {
+      // A committed "no longer authenticated" must retract that origin's
+      // release authority now, not let it idle out over AUTH_EVIDENCE_TTL_MS.
+      // Signing out is exactly when papio must stop opening queued handoffs
+      // into a session that will bounce them to a login wall.
+      if (!authenticated) void bridge.revokeAuthEvidence(origin);
       void bridge.syncConnectionBadge();
     },
     onReauthStateChanged: (paused) => bridge.setKeepaliveReauthNeeded(paused),

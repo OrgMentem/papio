@@ -33,6 +33,8 @@ import {
   wirePrimaryShortcut,
   wireSettings,
   renderLeftoverTabs,
+  SESSION_PROBE_MESSAGE,
+  SESSION_STATE_MESSAGE,
 } from "../src/popup";
 import type { ActiveJob } from "../src/state";
 import { PROVIDERS, SCENARIOS } from "../src/capture";
@@ -1491,4 +1493,116 @@ test("capture panel status line falls back to the generic message when the refus
 
   expect(doc.getElementById("capture-status")?.textContent).toBe("could not send the capture to papio");
   expect(button.disabled).toBe(false);
+});
+
+// refresh()'s probe/snapshot split (`sessionProbedThisPopup` in popup.ts) is
+// module-level state, so each fixture needs its own fresh module instance —
+// the same versioned-specifier pattern history.test.ts/inbox.test.ts/
+// options.test.ts already use for their own module-local UI state. `chrome`
+// is withheld from globalThis until AFTER the import completes: popup.ts's
+// own import-time bootstrap (guarded on `typeof chrome !== "undefined"`)
+// would otherwise fire a real refresh and start a real 5-second
+// setInterval, and the whole point here is to drive `refresh()` by hand.
+let popupRefreshImportSerial = 0;
+
+function sessionReplyFixture(overrides: Record<string, unknown> = {}): { state: Record<string, unknown> } {
+  return {
+    state: {
+      enabled: true,
+      authenticated: true,
+      pausedForReauth: false,
+      lastProbeAt: null,
+      lastAuthReturnedAt: null,
+      queuedAuthJobs: 0,
+      stalledAuthJobs: [],
+      releasedAuthJobs: 0,
+      resolverOrigin: "https://resolver.example.edu",
+      ...overrides,
+    },
+  };
+}
+
+async function popupRefreshHarness(
+  reply: (message: Record<string, unknown>) => unknown = () => sessionReplyFixture(),
+): Promise<{ document: Document; refresh: () => Promise<void>; requests: Record<string, unknown>[] }> {
+  const window = new Window();
+  window.document.write(readFileSync(new URL("../src/popup.html", import.meta.url), "utf8"));
+  Object.assign(globalThis, {
+    document: window.document,
+    Event: window.Event,
+    HTMLElement: window.HTMLElement,
+    HTMLButtonElement: window.HTMLButtonElement,
+    HTMLSelectElement: window.HTMLSelectElement,
+    // A prior test may have left a stub `chrome` on globalThis: hold it at
+    // `undefined` through the import so popup.ts's own bootstrap (guarded on
+    // `typeof chrome !== "undefined"`) stays skipped regardless of test order.
+    chrome: undefined,
+  });
+  popupRefreshImportSerial += 1;
+  const popup = (await import(`../src/popup.ts?popup-refresh-test=${popupRefreshImportSerial}`)) as {
+    refresh: () => Promise<void>;
+  };
+  const requests: Record<string, unknown>[] = [];
+  Object.assign(globalThis, {
+    chrome: {
+      runtime: {
+        sendMessage: async (message: Record<string, unknown>) => {
+          requests.push(message);
+          return reply(message);
+        },
+      },
+      storage: { local: { get: async () => ({}) } },
+      tabs: { query: async () => [] },
+    },
+  });
+  return { document: window.document as unknown as Document, refresh: popup.refresh, requests };
+}
+
+function sessionMessageTypes(requests: Record<string, unknown>[]): unknown[] {
+  return requests
+    .filter((r) => r["type"] === SESSION_PROBE_MESSAGE || r["type"] === SESSION_STATE_MESSAGE)
+    .map((r) => r["type"]);
+}
+
+test("the popup's first refresh sends exactly one session probe, never a snapshot read", async () => {
+  const h = await popupRefreshHarness();
+  await h.refresh();
+  expect(sessionMessageTypes(h.requests)).toEqual([SESSION_PROBE_MESSAGE]);
+});
+
+test("every refresh after the first reads a snapshot instead of repeating the probe", async () => {
+  const h = await popupRefreshHarness();
+  await h.refresh();
+  await h.refresh();
+  await h.refresh();
+  expect(sessionMessageTypes(h.requests)).toEqual([
+    SESSION_PROBE_MESSAGE,
+    SESSION_STATE_MESSAGE,
+    SESSION_STATE_MESSAGE,
+  ]);
+});
+
+test("the 2-second checking retry reads a snapshot, never re-injecting a probe", async () => {
+  const originalSetTimeout = globalThis.setTimeout;
+  const retries: Array<() => void> = [];
+  globalThis.setTimeout = ((callback: () => void, delay?: number) => {
+    if (delay === 2_000) {
+      retries.push(callback);
+      return 0;
+    }
+    return originalSetTimeout(callback, delay);
+  }) as typeof globalThis.setTimeout;
+  try {
+    const h = await popupRefreshHarness(() => sessionReplyFixture({ checking: true }));
+    await h.refresh();
+    expect(sessionMessageTypes(h.requests)).toEqual([SESSION_PROBE_MESSAGE]);
+    expect(retries).toHaveLength(1);
+
+    h.requests.length = 0;
+    retries[0]?.();
+    await flushMicrotasks();
+    expect(h.requests).toEqual([{ type: SESSION_STATE_MESSAGE }]);
+  } finally {
+    globalThis.setTimeout = originalSetTimeout;
+  }
 });
