@@ -78,5 +78,45 @@
     "want": "",
     "agreed_with_extension": true,
     "note": "HTML meta name matching is case-sensitive via querySelector; neither tag matches"
+  },
+  {
+    "name": "self_url_empty_query",
+    "file": "self_url_empty_query.html",
+    "base": "https://publisher.example/x",
+    "want": "",
+    "agreed_with_extension": true,
+    "note": "A lone '?' resolves to the landing page with a trailing question mark: WHATWG gives a non-null empty query that '?', and Go sets ForceQuery for the same input, so the serialization differs from the page's own href by one character while addressing it byte-identically. A literal href comparison misses it and hands the landing HTML to the downloader as the PDF. Both sides compare origin+path+query instead, where the empty and no-query forms are equal."
+  },
+  {
+    "name": "self_url_userinfo",
+    "file": "self_url_userinfo.html",
+    "base": "https://publisher.example/x",
+    "want": "",
+    "agreed_with_extension": true,
+    "note": "Userinfo survives serialization unchanged, so this differs from the page's href as a string while targeting the identical page. Rejected outright on both sides rather than folded into the equality comparison: a credential-bearing URL is never a legitimate citation_pdf_url, and internal/fetch.validateURL rejects userinfo anyway, so returning it would only defer a certain failure."
+  },
+  {
+    "name": "self_url_relative_filename",
+    "file": "self_url_relative_filename.html",
+    "base": "https://publisher.example/x",
+    "want": "",
+    "agreed_with_extension": true,
+    "note": "The plainest self-reference: a relative content naming the landing page's own last path segment. No trailing-character subtlety, and it must be caught for the same reason as the others."
+  },
+  {
+    "name": "self_url_fragment_only",
+    "file": "self_url_fragment_only.html",
+    "base": "https://publisher.example/x",
+    "want": "",
+    "agreed_with_extension": true,
+    "note": "A fragment-only reference addresses the same document. Both sides compare origin+path+query and ignore the fragment, so this resolves to the page itself."
+  },
+  {
+    "name": "distinct_query_is_not_self",
+    "file": "distinct_query_is_not_self.html",
+    "base": "https://publisher.example/x",
+    "want": "https://publisher.example/x?download=true",
+    "agreed_with_extension": true,
+    "note": "The boundary the self-URL guard must NOT cross. A provider's ?download=true form of the same path is a real, distinct download target \u2014 several shipped adapters depend on exactly this shape. Pinned so a future tightening of the guard cannot silently start discarding real PDFs."
   }
 ]

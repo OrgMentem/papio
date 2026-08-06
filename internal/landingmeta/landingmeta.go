@@ -138,11 +138,9 @@ func resolveCandidate(base *url.URL, content string) string {
 	trimmed := strings.TrimFunc(content, isASCIISpace)
 	if trimmed == "" {
 		// An empty content resolves against base to the landing page
-		// itself, not a PDF — e.g. the extension's own extractMetaURL,
-		// which has no such guard, does exactly this and hands the landing
-		// HTML to its downloader as if it were the PDF (see
-		// testdata/contract.json's empty_content case). Reject before we'd
-		// make the same mistake.
+		// itself, not a PDF. Reject before parsing: net/url and WHATWG
+		// both hand back the base for "", so this would otherwise become
+		// the self-reference the check below exists to catch.
 		return ""
 	}
 
@@ -151,6 +149,28 @@ func resolveCandidate(base *url.URL, content string) string {
 		return ""
 	}
 	if u.Scheme != "https" {
+		return ""
+	}
+	// Userinfo is never a legitimate citation_pdf_url, and it is an escape
+	// from the self-reference check below: it survives serialization intact,
+	// so `https://user@host/a` differs from the page's own URL as a string
+	// while addressing it byte-identically. Reject outright rather than
+	// folding it into the comparison — internal/fetch.validateURL refuses
+	// userinfo too, so returning it would only defer a certain failure.
+	if u.User != nil {
+		return ""
+	}
+	// A tag that resolves to the landing page advertises no PDF, and
+	// fetching it yields the HTML we just parsed: a wasted request whose
+	// failure gets misattributed to the provider. Compare scheme+host+path
+	// +query, NOT the serialized form: a lone "?" sets ForceQuery, so the
+	// string gains a trailing "?" while RawQuery stays empty like the
+	// base's — one character from the page's own URL and invisible to a
+	// literal comparison. The fragment is excluded because it addresses the
+	// same document. Query is included, so a provider's ?download=true form
+	// of the same path stays a real, distinct target.
+	if u.Scheme == base.Scheme && u.Host == base.Host &&
+		u.Path == base.Path && u.RawQuery == base.RawQuery {
 		return ""
 	}
 	return u.String()
