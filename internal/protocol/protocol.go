@@ -863,6 +863,14 @@ type PageAcquireAckPayload struct {
 
 // PageCapturePayload confines diagnostic HTML to a single bounded frame so a
 // capture cannot turn native messaging into an unbounded transfer channel.
+//
+// RequestID echoes the page_capture_request that asked for this content, and
+// is the ONLY thing that ties the two together: an unsolicited capture (the
+// developer panel's captureFixture) answers no request and omits it. Before
+// it existed the daemon correlated on provider+scenario alone, so an
+// unsolicited capture could satisfy a concurrent CLI `papio adapter capture`
+// waiting on the same session for the same pair and hand its caller the wrong
+// file path (papio-85a7420f4cd2564f).
 type PageCapturePayload struct {
 	Host           string `json:"host"`
 	Scenario       string `json:"scenario"`
@@ -871,6 +879,7 @@ type PageCapturePayload struct {
 	Encoding       string `json:"encoding"`
 	Bytes          int64  `json:"bytes"`
 	Body           string `json:"body"`
+	RequestID      string `json:"request_id,omitempty"`
 }
 
 // PageCaptureRequestPayload directs the extension to capture one https page
@@ -1374,7 +1383,7 @@ func DecodeBrowserMessage(data []byte) (*BrowserMessage, error) {
 	case MsgPageCapture:
 		p := &PageCapturePayload{}
 		if err = browserRequireFields(payloadFields, "host", "scenario", "encoding", "bytes", "body"); err == nil {
-			err = browserRejectNullFields(payloadFields, "adapter_id", "adapter_version")
+			err = browserRejectNullFields(payloadFields, "adapter_id", "adapter_version", "request_id")
 		}
 		if err == nil {
 			err = strictDecode(env.Payload, p)
@@ -1774,6 +1783,14 @@ func (p *PageCapturePayload) validate() error {
 	}
 	if !base64RE.MatchString(p.Body) {
 		return fmt.Errorf("page_capture.body must be canonical base64")
+	}
+	// Optional: only a requested capture echoes one back. When present it must
+	// be a real correlation id, so a malformed echo can never bind to a
+	// pending request by accident.
+	if p.RequestID != "" {
+		if err := validateCorrelationID("page_capture.request_id", p.RequestID); err != nil {
+			return err
+		}
 	}
 	return nil
 }

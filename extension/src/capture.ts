@@ -516,6 +516,11 @@ interface PageCaptureMeta {
   adapterID?: string;
   adapterVersion?: string;
   jobID?: string;
+  /** Set only when this capture answers a daemon page_capture_request. It is
+   * what lets the daemon bind the content frame to that specific request
+   * instead of guessing from provider+scenario (papio-85a7420f4cd2564f), so
+   * an unsolicited capture must leave it undefined. */
+  requestID?: string;
 }
 
 type EncodedCapture =
@@ -593,6 +598,7 @@ export async function encodePageCapture(sanitized: string, meta: PageCaptureMeta
     encoding: "gzip+base64",
     bytes: decoded.byteLength,
     body: base64(compressed),
+    ...(meta.requestID === undefined ? {} : { request_id: meta.requestID }),
   };
   if (encodedFrameBytes(payload, meta.jobID) > MAX_CAPTURE_FRAME_BYTES) {
     return { ok: false, error: `encoded page exceeds the ${MAX_CAPTURE_FRAME_BYTES}-byte native frame cap` };

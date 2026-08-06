@@ -334,6 +334,54 @@ func TestSearchCommandJSONPreservesControlBytes(t *testing.T) {
 	}
 }
 
+// papio-9007c692bea6c968: encoding/json escapes only bytes below 0x20 plus
+// quote and backslash, so DEL and the whole C1 block used to reach the
+// operator's terminal raw through --json. U+009B and U+009D are CSI and OSC
+// to a UTF-8 terminal — the same escape-injection primitive as ESC, reachable
+// with no ESC byte in the input. printJSON escapes them, and that escape must
+// be BOTH terminal-safe on the wire and lossless after decoding: --json is
+// the authoritative machine-readable form, so stripping is not an option.
+func TestJSONOutputEscapesTerminalControlBytesLosslessly(t *testing.T) {
+	const title = "Evil\u009b31mTitle\u009dpwned\u007fDEL\u0085NEL"
+	var out, errOut bytes.Buffer
+	root := NewInProcessRoot(&out, &errOut, config.Config{}, func(_ context.Context, _ string, _ any, result any) error {
+		*result.(*[]discovery.DiscoveredWork) = []discovery.DiscoveredWork{
+			{Work: work.Work{Year: 2024, Title: title}, MatchScore: 1, MatchKind: discovery.MatchExactTitle},
+		}
+		return nil
+	})
+	root.SetArgs([]string{"--json", "search", "Evil"})
+	if err := root.ExecuteContext(context.Background()); err != nil {
+		t.Fatalf("search --json: %v", err)
+	}
+
+	for _, r := range out.String() {
+		if r == 0x7f || (r >= 0x80 && r <= 0x9f) {
+			t.Errorf("control byte %#U reached the writer raw in %q", r, out.String())
+		}
+	}
+
+	var page struct {
+		Works []discovery.DiscoveredWork `json:"works"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &page); err != nil {
+		t.Fatalf("decode JSON: %v (%q)", err, out.String())
+	}
+	if len(page.Works) != 1 || page.Works[0].Work.Title != title {
+		t.Fatalf("JSON title = %q, want exact bytes %q", page.Works[0].Work.Title, title)
+	}
+}
+
+// The escape is a scan-and-rewrite over every --json payload the CLI emits,
+// so the overwhelmingly common clean case must not allocate a second buffer.
+func TestEscapeJSONTerminalControlsLeavesCleanOutputUntouched(t *testing.T) {
+	clean := []byte(`{"title":"Café 日本語","truncated":false}`)
+	got := escapeJSONTerminalControls(clean)
+	if &got[0] != &clean[0] {
+		t.Errorf("clean payload was copied: %q", got)
+	}
+}
+
 func TestVersionFlagMatchesVersionCommand(t *testing.T) {
 	var flagOut, flagErr bytes.Buffer
 	flagRoot := NewRoot(&flagOut, &flagErr)

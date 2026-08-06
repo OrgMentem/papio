@@ -4,6 +4,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -263,10 +264,85 @@ func (o *options) warnAvailableUpdate(cfg config.Config, status daemonPingResult
 	return err
 }
 
+// printJSON writes one machine-readable payload.
+//
+// It escapes DEL (0x7f) and the C1 block (U+0080-U+009F) as \uXXXX rather
+// than emitting them raw. encoding/json escapes only bytes below 0x20 plus
+// quote and backslash, so an attacker-influenced string that reaches --json —
+// a browser-reported download filename, a third-party bibliographic title —
+// could otherwise carry U+009B or U+009D, which a UTF-8 terminal decodes as
+// the CSI and OSC introducers, into the terminal of anyone who eyeballs or
+// pipes this output (papio-9007c692bea6c968).
+//
+// This is deliberately NOT store.StripTerminalControls, which the
+// human-readable rows use: --json is the authoritative machine-readable form
+// and must not lose a byte of a filename a consumer needs to find on disk.
+// A \uXXXX escape is lossless — every conformant JSON parser decodes \u009b
+// back to U+009B — so the value survives exactly while the bytes on the wire
+// stay terminal-safe.
+//
+// Encoding buffers rather than streams so the escape can scan the result.
+// Every payload here is already bounded by the agentjson caps.
 func (o *options) printJSON(value any) error {
-	encoder := json.NewEncoder(o.out)
+	var buf bytes.Buffer
+	encoder := json.NewEncoder(&buf)
 	encoder.SetEscapeHTML(false)
-	return encoder.Encode(value)
+	if err := encoder.Encode(value); err != nil {
+		return err
+	}
+	_, err := o.out.Write(escapeJSONTerminalControls(buf.Bytes()))
+	return err
+}
+
+const hexDigits = "0123456789abcdef"
+
+// escapeJSONTerminalControls rewrites DEL and the C1 block in already-encoded
+// JSON to their \uXXXX escapes, returning the input unchanged (and
+// unallocated) when neither appears.
+//
+// Scanning encoded bytes rather than the values before encoding is safe
+// because JSON's structural syntax is entirely printable ASCII: DEL and the
+// two-byte UTF-8 C1 sequences can only occur inside a string literal, which
+// is the one place a \uXXXX escape means the same thing.
+func escapeJSONTerminalControls(encoded []byte) []byte {
+	if !hasTerminalControlBytes(encoded) {
+		return encoded
+	}
+	out := make([]byte, 0, len(encoded)+16)
+	// Classic form on purpose: the C1 branch advances i past the trailing
+	// continuation byte, which a range loop would reassign back.
+	for i := 0; i < len(encoded); i++ {
+		b := encoded[i]
+		if b == 0x7f {
+			out = append(out, `\u007f`...)
+			continue
+		}
+		if isC1Lead(encoded, i) {
+			// UTF-8 two-byte form: 0xc2 contributes the leading 0x80.
+			cp := 0x80 | (encoded[i+1] & 0x3f)
+			out = append(out, `\u00`...)
+			out = append(out, hexDigits[cp>>4], hexDigits[cp&0x0f])
+			i++
+			continue
+		}
+		out = append(out, b)
+	}
+	return out
+}
+
+func hasTerminalControlBytes(encoded []byte) bool {
+	for i, b := range encoded {
+		if b == 0x7f || isC1Lead(encoded, i) {
+			return true
+		}
+	}
+	return false
+}
+
+// isC1Lead reports whether encoded[i:] begins the UTF-8 encoding of a C1
+// control (U+0080-U+009F).
+func isC1Lead(encoded []byte, i int) bool {
+	return encoded[i] == 0xc2 && i+1 < len(encoded) && encoded[i+1] >= 0x80 && encoded[i+1] <= 0x9f
 }
 
 // printPage emits rows through the shared agentjson envelope so every list

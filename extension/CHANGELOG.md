@@ -16,8 +16,29 @@ for the full pre-split extension history.
 
 ## [Unreleased]
 
+### Added
+
+- **A requested page capture echoes its `request_id`.** The daemon can now tie
+  the sanitized content frame to the specific `page_capture_request` it
+  answers, instead of guessing from provider and scenario. The popup's own
+  Capture button omits the field, and the background broker refuses to accept
+  one from an extension page, so an unsolicited capture can never claim a
+  request it did not answer. Requires a daemon built with the matching
+  `papio-browser/1` change — rebuild and reload the extension alongside the
+  daemon.
+
 ### Fixed
 
+- **Signing in to a second institution no longer makes the first report
+  failure.** The popup renders one Sign-in button per institution and disables
+  only the clicked one, so two clicks in quick succession reached the keepalive
+  manager concurrently. Both callers ended up waiting on the same tab-creation
+  promise, and the second cleared `tabID` before the first could read it — so
+  the first returned failure for a managed tab it had genuinely created, and
+  the background broker fell through to an unmanaged sign-in tab that startup
+  orphan reconciliation can close mid-SAML. Sign-in requests are now serialised
+  per manager: the first completes and reports honestly before the second
+  supersedes it.
 - **Session evidence never invents an institution.** When the observed origin
   was unknown, `emitSessionEvidence` substituted one — the keepalive snapshot's
   resolver origin, which itself degrades to an arbitrary granted host, or the

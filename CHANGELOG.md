@@ -21,6 +21,21 @@ execution records in `notes/acquisition-stack-plan.md`.
   occurrence, the daemon now advertises a dedicated capability and the
   extension withholds the option until it sees it. `terms` remains a valid
   value in all three validators; only the producer is gated.
+- **`page_capture` carries an optional `request_id`.** A requested capture now
+  echoes the `request_id` of the `page_capture_request` it answers, which is
+  the only thing that ties the content frame to a specific request. An
+  unsolicited capture — the developer capture panel's own button — omits it.
+  This is a breaking wire change to an existing message type, landed under the
+  pre-1.0 compatibility floor now stated in `AGENTS.md`: daemon, extension, and
+  JSON schema move together and the extension must be rebuilt and reloaded
+  alongside the daemon.
+- **The native host mirrors its diagnostics to `<DataDir>/native-host.log`.**
+  Browsers forward a native-messaging host's stderr nowhere — not even into
+  `chrome_debug.log` with logging enabled — so a host that rejected a frame and
+  tore the session down left no trace, and the operator saw only a downstream
+  `nav_failed` or a session that would not connect. Every diagnostic the host
+  writes, including the exact reason it exited, is now appended to that file
+  (truncated at 1 MiB on process start).
 
 ### Fixed
 
@@ -35,6 +50,24 @@ execution records in `notes/acquisition-stack-plan.md`.
   runs outside the server mutex: a PDF viewer issues a range request per chunk,
   and holding the lock across a full file read would serialise every preview in
   the process behind the largest document.
+- **`papio activity --json`, and every other `--json` payload, can no longer
+  carry a terminal escape.** Go's JSON encoder escapes only bytes below 0x20
+  plus quote and backslash, so DEL and the entire C1 block reached the writer
+  raw — and a UTF-8 terminal reads U+009B and U+009D as the CSI and OSC
+  introducers, the same injection primitive as ESC without an ESC byte in the
+  input. A provider-supplied download filename or a third-party bibliographic
+  title could therefore inject escape sequences into the terminal of anyone
+  piping or eyeballing the output, even though the human-readable rows were
+  already stripped. Those code points are now emitted as `\uXXXX`, which every
+  conformant JSON parser decodes back to the original value: `--json` stays
+  byte-exact for tooling, which stripping would have broken.
+- **A page capture can no longer be bound to the wrong request.** The daemon
+  matched an incoming capture to a pending `papio adapter capture` on provider
+  and scenario alone, so an unsolicited capture of the same pair on the same
+  browser session could overwrite the pending request's path and return the
+  wrong file to its caller, with no error surfaced. Correlation is now the
+  echoed `request_id`, the same key the capture result already used, with no
+  provider/scenario fallback.
 - **A capture that arrives as its deadline expires is reported as a success.**
   The result channel and the timeout became ready together and Go's select
   chose between them pseudo-randomly, so a capture that had already been

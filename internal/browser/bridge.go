@@ -839,44 +839,28 @@ func (b *Bridge) pageCapture(ctx context.Context, sessionID, jobID string, paylo
 		log.Printf("papio: storing page capture from %s: %v", payload.Host, err)
 		return
 	}
-	// Correlation is deliberately narrower than "belongs to this session":
-	// page_capture carries no request id and no full URL (only a bare
-	// hostname), so it cannot be tied to one specific page_capture_request
-	// the way page_capture_request_result is (matched by RequestID).
-	// Requiring session + provider + scenario shrinks, but does not close,
-	// the window in which an UNSOLICITED capture (the developer capture
-	// panel's captureFixture, which answers no pending request at all) can
-	// satisfy a CLI-initiated `papio adapter capture` that happens to be
-	// waiting on the same session for the same provider/scenario
-	// (papio-85a7420f4cd2564f). This residual is real but narrow.
+	// Correlate strictly on the echoed request id. A requested capture carries
+	// the RequestID of the page_capture_request it answers; an UNSOLICITED one
+	// (the developer capture panel's captureFixture, which answers no pending
+	// request at all) carries none, so it can no longer satisfy a
+	// CLI-initiated `papio adapter capture` waiting on the same session for
+	// the same provider/scenario and hand that caller the wrong file path
+	// (papio-85a7420f4cd2564f). This is the same key page_capture_request_result
+	// already correlates on, so both halves of one requested capture now bind
+	// through one identity.
 	//
-	// Matching the pending request's REQUESTED-URL host against
-	// payload.Host was tried and reverted (bc3f4b2): payload.Host is not
-	// the requested host. extension/src/capture.ts sets it from
-	// location.origin — the host the tab actually LANDED on, read from the
-	// content frame, not the navigation target. Any ordinary cross-host
-	// redirect (www canonicalization, a CDN host swap, an SSO round-trip
-	// that returns to a different host) makes the two differ. When they
-	// do, this match never fires, pending.path stays empty, and the
-	// page_capture_request_result handler above — which correlated
-	// correctly by RequestID — downgrades a real "captured" to
-	// "nav_failed" because pending.path is empty. So a capture that
-	// genuinely succeeded and was stored gets reported to the CLI caller
-	// as a failure with no path to the file. That is strictly worse than
-	// the narrow bug above: a common false failure beats a rare wrong
-	// path.
-	//
-	// Closing the residual for real needs a negotiated request_id field
-	// threaded through page_capture — but that is an EXISTING message
-	// type, so it cannot gain a field without capability negotiation
-	// (like page_capture_terms_v1): an older extension's decoder fails
-	// closed on an unknown field, and that failure is fatal to the whole
-	// native-messaging session, not just the one frame. Deliberately
-	// deferred rather than added here. Do not re-attempt a host match as
-	// a substitute — the payload host is the wrong host to match against.
+	// No provider+scenario fallback: that pair is exactly the ambiguous match
+	// this replaces, and keeping it as a backstop would reopen the bug for
+	// every frame that omits the id. Matching the pending request's
+	// REQUESTED-URL host against payload.Host is not an alternative either —
+	// it was tried and reverted (bc3f4b2). payload.Host comes from the content
+	// frame's location.origin, the host the tab actually LANDED on, so any
+	// ordinary cross-host redirect (www canonicalization, a CDN host swap, an
+	// SSO round-trip) makes the two differ and turns a real "captured" into a
+	// reported "nav_failed" with no path.
 	if pending := b.pendingCaptures[sessionID]; pending != nil &&
-		pending.payload.Provider == payload.AdapterID &&
-		pending.payload.Scenario == payload.Scenario {
+		payload.RequestID != "" &&
+		pending.payload.RequestID == payload.RequestID {
 		pending.path = path
 	}
 	if jobID == "" || b.jobs == nil {

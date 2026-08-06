@@ -219,13 +219,12 @@ func StripTerminalControls(value string) string {
 // The --json path deliberately does NOT go through this function: it is the
 // machine-readable, authoritative form and must preserve the filename byte
 // for byte, including any control bytes, so a consumer can recover the exact
-// on-disk name. encoding/json only escapes bytes below 0x20 plus quote and
-// backslash — it emits DEL (0x7f) and the whole C1 block (U+0080-U+009F)
-// verbatim, so `--json` is not safe against the terminal-injection threat
-// model this file adopts (a UTF-8 xterm decodes U+009B/U+009D as CSI/OSC).
-// Anything that renders --json output to a terminal (a shell pipeline, a
-// pretty-printer) is responsible for its own escaping — the human row above
-// is the only surface this package guarantees is terminal-safe.
+// on-disk name. It is terminal-safe by a different mechanism — the CLI's
+// printJSON escapes DEL and the C1 block as \uXXXX, which every conformant
+// JSON parser decodes back to the original code point, so the value survives
+// losslessly while the bytes reaching a terminal cannot introduce a CSI or
+// OSC sequence. Do not route --json through StripTerminalControls to close
+// that gap: escaping preserves the filename, stripping corrupts it.
 func clampActivityText(value string) string {
 	value = StripTerminalControls(value)
 	runes := []rune(value)

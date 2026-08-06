@@ -981,10 +981,54 @@ export class KeepaliveManager {
     this.schedule(this.intervalMs(), () => this.onReload());
   }
 
+  /** Tail of the serialised openReauth chain. The popup renders one Sign-in
+   * button per institution row and each button disables only ITSELF, so two
+   * clicks a second apart reach requestSessionSignIn concurrently — and
+   * chrome.runtime.onMessage dispatches papio.session.signin outside the
+   * serialized inbound native-frame chain, so nothing else orders them.
+   *
+   * Concurrently is the one way this manager cannot serve them: it holds a
+   * SINGLE tabID and a single resolver, so the second request necessarily
+   * supersedes the first. Unserialised, both callers ended up waiting on the
+   * same tabCreationInFlight promise and their continuations ran in
+   * subscription order: A's resolved createTab and DEFERRED its own
+   * openReauth continuation to a fresh microtask, so B's continuation ran
+   * first, saw this.tabID still holding the tab A's own attempt had just
+   * created, and cleared it (removeStaleTab, synchronously) before A could
+   * read it. A then returned false for a tab that had genuinely been
+   * created, and background.ts's requestSessionSignIn fell through to an
+   * UNMANAGED session-signin tab — the tab the keepalive path exists to
+   * avoid, since startup orphan reconciliation can close it mid-SAML.
+   *
+   * Serialising is what makes the boolean honest: A creates, focuses, and
+   * returns true; B then supersedes it exactly as an explicit second request
+   * should. Note that resolving the shared creation to a tab id instead does
+   * NOT fix this — A would hold a concrete id for a tab B had already
+   * closed, and tabs.update would throw straight into the same `return
+   * false`. createTab()'s own wait-then-retry loop is deliberately left
+   * alone: its callers (reconcile/onObserve/onReload) discard the result and
+   * only need the origin-correctness the loop already guarantees. */
+  private reauthChain: Promise<void> = Promise.resolve();
+
   /** Focus the reauthentication tab on an explicit operator request. If the
    * keepalive is disabled or has not observed a job yet, this still creates a
-   * resolver-origin tab from the latest institutional offer when possible. */
+   * resolver-origin tab from the latest institutional offer when possible.
+   *
+   * Serialised against every other openReauth call on this manager; see
+   * reauthChain above. */
   async openReauth(originHint?: string): Promise<boolean> {
+    const run = this.reauthChain.then(() => this.openReauthOnce(originHint));
+    // A rejected request must not poison the queue: requestSessionSignIn
+    // catches the throw and opens its own fallback tab, and the operator's
+    // NEXT click still has to run.
+    this.reauthChain = run.then(
+      () => {},
+      () => {},
+    );
+    return run;
+  }
+
+  private async openReauthOnce(originHint?: string): Promise<boolean> {
     await this.loadPreferences();
     let requested: URL | undefined;
     if (originHint !== undefined) {

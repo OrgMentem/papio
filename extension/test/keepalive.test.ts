@@ -428,6 +428,40 @@ test("openReauth requesting a different origin mid-creation never rides another 
   expect(h.tabs.removed).toEqual([1]);
 });
 
+test("papio-fd8a4fcae897e58d: concurrent openReauth calls for different origins both report honestly", async () => {
+  // The test above drives caller A through init() — the timer path, whose
+  // boolean nobody reads. The popup renders one Sign-in button per
+  // institution row and disables only the clicked one, so the real operator
+  // race is TWO openReauth calls, and openReauth's return value decides
+  // whether background.ts falls through to an unmanaged session-signin tab.
+  //
+  // Unserialised, B's wait-then-retry continuation ran before A's openReauth
+  // continuation and cleared this.tabID (removeStaleTab is synchronous up to
+  // its tabs.remove), so A returned false for a tab its own attempt had just
+  // created. Serialising openReauth makes A finish — create, focus, return
+  // true — before B supersedes it.
+  const h = makeHarness();
+  const originA = "https://a.example.edu";
+  const originB = "https://b.example.edu";
+
+  const [okA, okB] = await Promise.all([
+    h.manager.openReauth(originA),
+    h.manager.openReauth(originB),
+  ]);
+
+  // A genuinely opened its institution's tab; saying otherwise sends its
+  // caller down the unmanaged-tab fallback for a tab that already existed.
+  expect(okA).toBe(true);
+  expect(okB).toBe(true);
+  expect(h.tabs.created.map((tab) => tab.url)).toEqual([originA, originB]);
+  // A focused its own tab before B superseded it, and B focused only its own.
+  expect(h.tabs.updates.map((update) => update.id)).toEqual([1, 2]);
+  // Exactly one tab survives, for the origin that won.
+  expect(h.tabs.removed).toEqual([1]);
+  expect([...h.tabs.live.keys()]).toEqual([2]);
+  expect(h.manager.getSnapshot().resolverOrigin).toBe(originB);
+});
+
 test("papio-8f79b6ba67bdbdaa: a failed tab creation does not wedge later creation attempts", async () => {
   const h = makeHarness();
   let createAttempts = 0;

@@ -85,10 +85,16 @@ import { detectAuthFailure } from "./authfail";
 
 export const NATIVE_HOST = "com.orgmentem.papio";
 const CHROME_PDF_VIEWER_HOST = "mhjfbmdgcfjbbpaeojofohoefgiehjai";
-/** Lowest native daemon that can service this extension. 0.9.0 renamed the
- * wire access mode to "delegated"; older daemons emit "maximal", which this
- * extension rejects fail-closed. */
-const MIN_DAEMON_VERSION = "0.9.0";
+/** Lowest native daemon that can service this extension. 0.18.0 added the
+ * optional `request_id` echo on `page_capture`; this extension always sends it
+ * on a requested capture, and a daemon that predates the field rejects the
+ * whole frame — which is fatal to the entire native-messaging session, not
+ * just that capture. The floor cannot prevent the frame (it drives the popup's
+ * "daemon is out of date" line, not emission), but it names the skew instead
+ * of leaving the operator with an unexplained disconnect. 0.9.0, the previous
+ * floor, renamed the wire access mode to "delegated"; older daemons emit
+ * "maximal", which this extension rejects fail-closed. */
+export const MIN_DAEMON_VERSION = "0.18.0";
 
 
 const AUTH_EVIDENCE_TTL_MS = 30 * 60_000;
@@ -4717,6 +4723,12 @@ export class Bridge {
         host: finalOrigin.hostname,
         scenario: request.scenario,
         adapterID: request.provider,
+        // Binds this content frame to the request that asked for it. The
+        // daemon used to match provider+scenario alone, so an unsolicited
+        // capture of the same pair could satisfy this pending request and
+        // hand its caller the other capture's file path
+        // (papio-85a7420f4cd2564f).
+        requestID: request.request_id,
       });
       if (!encoded.ok) {
         reply("nav_failed", encoded.error);
@@ -6898,6 +6910,13 @@ function isDeliveryStartRuntimeRequest(value: unknown): value is DeliveryStartPa
   );
 }
 
+// The key whitelist deliberately omits request_id. This path is the popup's
+// UNSOLICITED capture (capture.ts's captureFixture), which answers no
+// page_capture_request; accepting a caller-supplied correlation id here would
+// let an extension page forge a binding to whatever capture the CLI is
+// currently waiting on — the exact cross-binding papio-85a7420f4cd2564f is
+// about, just deliberate instead of accidental. A requested capture never
+// travels this way: it is sent straight from onPageCaptureRequest.
 function isPageCaptureRuntimeRequest(value: unknown): value is PageCapturePayload {
   if (
     !isObjectRecord(value) ||

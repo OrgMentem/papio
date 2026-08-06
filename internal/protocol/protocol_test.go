@@ -382,6 +382,20 @@ func TestPageCapturePayloadRoundTripAndValidation(t *testing.T) {
 		t.Fatalf("unscoped page_capture rejected: %v", err)
 	}
 
+	// request_id is optional — an unsolicited capture omits it, and that
+	// absence is what lets the daemon refuse to bind it to a pending request
+	// (papio-85a7420f4cd2564f). A requested capture echoes one, which must
+	// round-trip and must be a real correlation id.
+	echoed := valid
+	echoed.RequestID = "DRA6SOdBEB1ZgMIRV8qfqQ"
+	msg, err = DecodeBrowserMessage(frame("", echoed))
+	if err != nil {
+		t.Fatalf("decode page_capture with request_id: %v", err)
+	}
+	if got := msg.Payload.(*PageCapturePayload); *got != echoed {
+		t.Fatalf("round-trip echoed payload = %#v, want %#v", got, echoed)
+	}
+
 	for _, tc := range []struct {
 		name    string
 		payload PageCapturePayload
@@ -409,6 +423,16 @@ func TestPageCapturePayloadRoundTripAndValidation(t *testing.T) {
 		{name: "unknown scenario", payload: func() PageCapturePayload {
 			p := valid
 			p.Scenario = "unexpected"
+			return p
+		}()},
+		{name: "malformed request_id", payload: func() PageCapturePayload {
+			p := valid
+			p.RequestID = "short"
+			return p
+		}()},
+		{name: "request_id with illegal charset", payload: func() PageCapturePayload {
+			p := valid
+			p.RequestID = "has spaces in it"
 			return p
 		}()},
 	} {

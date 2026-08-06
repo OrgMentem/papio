@@ -12,9 +12,10 @@
 // user-only Unix socket. Authoritative policy, hello_ack generation, and
 // outbound seq numbering all live in the daemon.
 //
-// Stdout carries protocol frames only; every diagnostic goes to stderr. PDF
-// bytes and secrets never transit this bridge — the protocol decoder in
-// internal/protocol structurally forbids them.
+// Stdout carries protocol frames only; every diagnostic goes to stderr — and,
+// because browsers discard a native host's stderr, to <DataDir>/native-host.log
+// as well (see openDiagLog). PDF bytes and secrets never transit this bridge —
+// the protocol decoder in internal/protocol structurally forbids them.
 package nativehost
 
 import (
@@ -79,6 +80,43 @@ func resolveExecutablePath(exe string) (string, error) {
 // frame cap. It is reported before any body byte is allocated or read.
 var errFrameTooLarge = errors.New("inbound frame exceeds size cap")
 
+// diagLogName is the file under the papio data dir that every native-host
+// diagnostic is mirrored into.
+const diagLogName = "native-host.log"
+
+// maxDiagLogBytes bounds that file. It is truncated at process start once it
+// grows past this — these are disposable per-process diagnostics, not an
+// audit trail, so truncation beats rotation.
+const maxDiagLogBytes = 1 << 20
+
+// openDiagLog opens the native-host diagnostic log for appending.
+//
+// Chrome forwards a native host's stderr NOWHERE — not into chrome_debug.log,
+// not even with --enable-logging --v=0 — so a host that rejects a frame and
+// tears the session down leaves no browser-side trace at all. The operator
+// sees only the downstream symptom (a nav_failed, a re-parked handoff, a
+// session that will not connect) and the actual cause, which the host already
+// names precisely, is discarded. Mirroring stderr here is what makes that
+// message readable after the fact instead of only when someone reproduces the
+// failure by driving the host by hand.
+//
+// Best effort by construction: a log that cannot be opened must never stop the
+// relay, so every failure returns an error the caller ignores in favour of
+// plain stderr.
+func openDiagLog(dataDir string) (*os.File, error) {
+	if dataDir == "" {
+		return nil, errors.New("no data dir configured")
+	}
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		return nil, err
+	}
+	path := filepath.Join(dataDir, diagLogName)
+	if info, err := os.Stat(path); err == nil && info.Size() > maxDiagLogBytes {
+		_ = os.Truncate(path, 0)
+	}
+	return os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+}
+
 // Syncer forwards raw browser frames to the daemon and returns the daemon's
 // outbound frames. It exists so the relay loop can be unit-tested without a
 // live daemon; production wiring uses ipcSyncer over the Unix socket.
@@ -91,7 +129,7 @@ type Syncer interface {
 // Run is the papio-native-host entrypoint. It loads config, refuses a missing
 // or mismatched browser extension identity, ensures the daemon is running, and
 // relays frames between the browser and the daemon until stdin closes or ctx is cancelled.
-func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
+func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) (err error) {
 	// The host is entered by basename, so `papio-native-host --version` would
 	// otherwise be parsed as an extension origin and rejected. Chrome always
 	// passes exactly one origin argument and never a flag, so a lone --version
@@ -106,6 +144,23 @@ func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	cfg, err := config.Load("")
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
+	}
+	// Mirror diagnostics to disk from here on: everything below can fail the
+	// session, and the browser will not show the operator any of it.
+	if diag, diagErr := openDiagLog(cfg.DataDir); diagErr == nil {
+		defer diag.Close()
+		stderr = io.MultiWriter(stderr, diag)
+		fmt.Fprintf(stderr, "papio-native-host %s: start pid=%d at %s\n",
+			api.Version, os.Getpid(), time.Now().UTC().Format(time.RFC3339))
+		// Registered after the Close defer, so it runs first (LIFO). Every
+		// fatal exit below returns rather than printing, so without this the
+		// reason a session died never reaches the log at all.
+		defer func() {
+			if err != nil {
+				fmt.Fprintf(stderr, "papio-native-host: exit at %s: %v\n",
+					time.Now().UTC().Format(time.RFC3339), err)
+			}
+		}()
 	}
 	chromeIDs := cfg.Browser.ChromiumExtensionIDs()
 	if len(chromeIDs) == 0 && cfg.Browser.FirefoxExtensionID == "" {

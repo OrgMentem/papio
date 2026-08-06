@@ -184,12 +184,28 @@ Bump the pinned zensical version in `docs/requirements.txt` deliberately; CI ins
 - **"Optional field" is only backward compatible in ONE direction, and it is not the one
   you need.** Both parsers reject unknown fields, so an optional field added to an
   *existing* message type is fine for a new parser reading an old frame and **fatal** for an
-  old extension reading a new daemon's frame — it rejects the whole message. Adding a field
-  to a message an older extension already parses therefore needs either schema negotiation
-  (what `schema_versions` on `triage_snapshot_request/response` exists for) or a **new
-  message type**. `stats_*` was added as a new type for exactly this reason;
-  putting a `version` field on `triage_snapshot_response` instead would
-  have broken every shipped extension.
+  old extension reading a new daemon's frame — it rejects the whole message. `stats_*` was
+  added as a new message type for exactly this reason; putting a `version` field on
+  `triage_snapshot_response` instead would have broken every shipped extension.
+
+  That mechanism is still real, but papio is pre-1.0 with zero external installs, so it is
+  not an absolute prohibition: a breaking change to `papio-browser/1` **is allowed** when
+  `internal/protocol/protocol.go`, `extension/src/protocol.ts`, and
+  `protocol/browser-v1.schema.json` all land in the **same commit**, and the extension is
+  rebuilt and reloaded alongside the daemon (`make dev-deploy` now rebuilds the extension for
+  you — see the Makefile). Negotiation (`schema_versions` on
+  `triage_snapshot_request/response`, feature flags like `page_capture_terms_v1`) is not
+  going away; it becomes *required* rather than optional the moment a build ships to a real
+  user. Until then, this floor removes the compatibility burden but **not the deploy
+  burden**: this machine still runs two `papio` binaries (see the daemon-IPC note above) and
+  can have a stale extension loaded in Chrome or Firefox, so skew between daemon, host, and
+  extension is still the default local failure — `make dev-deploy` only closes the binary
+  side of it, you still reload the extension yourself.
+- **`internal/nativehost/host.go` mirrors every stderr diagnostic to
+  `<DataDir>/native-host.log`** (constant `diagLogName`), truncated to 1 MiB by
+  `openDiagLog` at process start. That's the first thing to read when a host dies
+  mid-session — before resorting to driving it by hand (see "Chrome forwards native-host
+  stderr nowhere" below).
 - Per-institution offer fields (`login_entity_id`, `proquest_account_id`) are sent **only
   for the default resolver profile** (`row.Policy.Resolver == "" || "default"`) in
   `internal/browser/bridge.go` `offer()` — sending them for a `institute` job would mis-route
@@ -241,7 +257,8 @@ Bump the pinned zensical version in `docs/requirements.txt` deliberately; CI ins
   depends on `maxOutstandingOffers`/`maxFocusFramesPerPoll` staying small.
 - **Chrome forwards native-host stderr nowhere** — not to `chrome_debug.log`, even with
   `--enable-logging --v=0` — so a host that dies mid-session leaves no browser-side trace.
-  To read its dying words, drive it yourself: spawn
+  Check `<DataDir>/native-host.log` first (see above) — the host already mirrors its stderr
+  there. If that's not enough (host never started, or you need to drive it live), spawn
   `papio-native-host chrome-extension://<id>/` and speak native messaging on stdin (4-byte
   little-endian length prefix + JSON), starting with a valid `hello`
   (`{extension_version, adapter_versions}` — `features` live on the ACK, not the hello).

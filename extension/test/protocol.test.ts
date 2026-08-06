@@ -374,9 +374,20 @@ test("page_capture messages parse strictly before echoed frames reach the inboun
     { ...payload, host: "https://journals.sagepub.com" },
     { ...payload, scenario: "unexpected" },
     { ...payload, body: "not base64!" },
+    { ...payload, request_id: "short" },
+    { ...payload, request_id: "has spaces in it" },
+    { ...payload, request_id: null },
   ]) {
     expect(() => parseBrowserMessage({ ...frame, payload: invalid })).toThrow(ProtocolError);
   }
+
+  // Optional: an unsolicited capture omits it, a requested one echoes the id
+  // it answers. The daemon binds on that presence, so both shapes must parse
+  // (papio-85a7420f4cd2564f).
+  expect(parseBrowserMessage({ ...frame, payload: { ...payload, request_id: "DRA6SOdBEB1ZgMIRV8qfqQ" } }).type).toBe(
+    "page_capture",
+  );
+  expect("request_id" in payload).toBe(false);
 });
 test("auth payloads structurally reject URLs", () => {
   expect(() =>

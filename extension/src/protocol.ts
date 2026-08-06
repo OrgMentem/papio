@@ -87,6 +87,10 @@ export interface PageCapturePayload {
   encoding: "gzip+base64";
   bytes: number;
   body: string;
+  /** Echoes the page_capture_request this capture answers. Absent on an
+   * unsolicited capture (the developer panel's captureFixture), which is what
+   * lets the daemon tell the two apart — see papio-85a7420f4cd2564f. */
+  request_id?: string;
 }
 
 export interface PageCaptureRequestPayload {
@@ -809,6 +813,7 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
         encoding: "required",
         bytes: "required",
         body: "required",
+        request_id: "optional",
       });
       const host = str(p, "host", "page_capture", 253);
       if (!HOST_RE.test(host)) fail("page_capture.host must be a hostname");
@@ -828,6 +833,7 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
       }
       const body = str(p, "body", "page_capture", MAX_BROWSER_MESSAGE_BYTES);
       if (!BASE64_RE.test(body)) fail("page_capture.body must be canonical base64");
+      if ("request_id" in p) correlationID(p, "request_id", "page_capture");
       break;
     }
     case "page_capture_request": {

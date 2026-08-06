@@ -419,3 +419,69 @@ func TestRunReportsVersion(t *testing.T) {
 		}
 	}
 }
+
+// The diagnostic log is the only place a host's dying words survive: browsers
+// forward native-messaging stderr nowhere, so a host that rejects a frame and
+// tears the session down would otherwise leave nothing behind. Every browser
+// launch is a fresh process writing the same file, so appending — not
+// truncating per start — is what keeps the previous session's failure readable
+// after the browser has respawned the host.
+func TestDiagLogAppendsAcrossProcessesAndBoundsItself(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, diagLogName)
+
+	for _, line := range []string{"first session died\n", "second session died\n"} {
+		log, err := openDiagLog(dir)
+		if err != nil {
+			t.Fatalf("openDiagLog: %v", err)
+		}
+		if _, err := io.WriteString(log, line); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		if err := log.Close(); err != nil {
+			t.Fatalf("close: %v", err)
+		}
+	}
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	if want := "first session died\nsecond session died\n"; string(contents) != want {
+		t.Fatalf("log = %q, want %q", contents, want)
+	}
+
+	// Unbounded appending would grow forever across a browser's lifetime, so a
+	// log past the cap is truncated at the next start rather than rotated.
+	if err := os.WriteFile(path, make([]byte, maxDiagLogBytes+1), 0o600); err != nil {
+		t.Fatalf("grow log: %v", err)
+	}
+	log, err := openDiagLog(dir)
+	if err != nil {
+		t.Fatalf("openDiagLog after growth: %v", err)
+	}
+	if err := log.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat log: %v", err)
+	}
+	if info.Size() != 0 {
+		t.Fatalf("log size = %d after exceeding the cap, want 0", info.Size())
+	}
+}
+
+// A log that cannot be opened must degrade to plain stderr, never fail the
+// relay: diagnostics are strictly best effort.
+func TestDiagLogRefusesAnUnusableLocation(t *testing.T) {
+	if _, err := openDiagLog(""); err == nil {
+		t.Fatal("openDiagLog(\"\") = nil error, want a failure the caller can fall back from")
+	}
+	notADir := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(notADir, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := openDiagLog(notADir); err == nil {
+		t.Fatal("openDiagLog on a non-directory = nil error, want a failure")
+	}
+}
