@@ -817,13 +817,23 @@ function isDirectFileOffer(raw: string): boolean {
 /** Self-contained provider-link extractor, injected verbatim into the tracked
  * page. It returns only an HTTPS href from the declared selector. The signed
  * URL remains in extension memory and is handed directly to
- * chrome.downloads.download; it never crosses native messaging or storage. */
+ * chrome.downloads.download; it never crosses native messaging or storage.
+ *
+ * Keep this function self-contained: executeScript serializes the injected
+ * function alone, not its module-level dependencies, so the empty/self URL
+ * guard below is deliberately duplicated in extractMetaURL rather than shared. */
 function extractDownloadURL(selector: string): string | null {
-  const el = document.querySelector(selector);
+  const el = document.querySelector<HTMLAnchorElement>(selector);
   if (!(el instanceof HTMLAnchorElement)) return null;
+  const raw = el.getAttribute("href")?.trim() ?? "";
+  if (raw.length === 0) return null;
   try {
-    const u = new URL(el.href, location.href);
-    return u.protocol === "https:" ? u.href : null;
+    const u = new URL(raw, location.href);
+    if (u.protocol !== "https:") return null;
+    const page = new URL(location.href);
+    u.hash = "";
+    page.hash = "";
+    return u.href === page.href ? null : u.href;
   } catch {
     return null;
   }
@@ -832,13 +842,29 @@ function extractDownloadURL(selector: string): string | null {
 /** Self-contained meta-tag PDF-URL extractor, injected verbatim into the tracked
  * page. Returns only an HTTPS URL from the named meta tag's content. The URL
  * stays in extension memory and is handed directly to chrome.downloads.download;
- * it never crosses native messaging or storage. */
+ * it never crosses native messaging or storage.
+ *
+ * An empty or self-resolving content attribute is rejected, because
+ * `new URL("", base)` resolves to BASE — which is https and truthy, so
+ * `<meta name="citation_pdf_url" content="">` used to yield the landing page's
+ * own URL. The adapter `article` rule only checks that the tag EXISTS, so such
+ * a page classified as an article and then handed its own landing HTML to
+ * chrome.downloads.download as if it were the PDF; payload validation caught
+ * it downstream, but the fetch was wasted and the failure was misattributed to
+ * the provider. A query string still differentiates: a provider's
+ * `?download=true` form of the same path is a real, distinct download URL. */
 function extractMetaURL(metaName: string): string | null {
   const el = document.querySelector(`meta[name="${metaName}"]`);
   if (!(el instanceof HTMLMetaElement)) return null;
+  const raw = el.getAttribute("content")?.trim() ?? "";
+  if (raw.length === 0) return null;
   try {
-    const u = new URL(el.content, location.href);
-    return u.protocol === "https:" ? u.href : null;
+    const u = new URL(raw, location.href);
+    if (u.protocol !== "https:") return null;
+    const page = new URL(location.href);
+    u.hash = "";
+    page.hash = "";
+    return u.href === page.href ? null : u.href;
   } catch {
     return null;
   }
