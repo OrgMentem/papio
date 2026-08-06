@@ -66,9 +66,11 @@ interface DocumentRealm {
  *     try {
  *       const u = new URL(raw, location.href);
  *       if (u.protocol !== "https:") return null;
+ *       if (u.username !== "" || u.password !== "") return null;
  *       const page = new URL(location.href);
- *       u.hash = ""; page.hash = "";
- *       return u.href === page.href ? null : u.href;
+ *       const isSelf = u.origin === page.origin &&
+ *         u.pathname === page.pathname && u.search === page.search;
+ *       return isSelf ? null : u.href;
  *     } catch { return null; }
  *   }
  *
@@ -95,10 +97,10 @@ function extractMetaURLMirror(doc: Document): string | null {
   try {
     const u = new URL(raw, view.location.href);
     if (u.protocol !== "https:") return null;
+    if (u.username !== "" || u.password !== "") return null;
     const page = new URL(view.location.href);
-    u.hash = "";
-    page.hash = "";
-    return u.href === page.href ? null : u.href;
+    const isSelf = u.origin === page.origin && u.pathname === page.pathname && u.search === page.search;
+    return isSelf ? null : u.href;
   } catch {
     return null;
   }
@@ -311,10 +313,10 @@ const PINNED_EXTRACT_META_URL_SOURCE = `function extractMetaURL(metaName: string
   try {
     const u = new URL(raw, location.href);
     if (u.protocol !== "https:") return null;
+    if (u.username !== "" || u.password !== "") return null;
     const page = new URL(location.href);
-    u.hash = "";
-    page.hash = "";
-    return u.href === page.href ? null : u.href;
+    const isSelf = u.origin === page.origin && u.pathname === page.pathname && u.search === page.search;
+    return isSelf ? null : u.href;
   } catch {
     return null;
   }

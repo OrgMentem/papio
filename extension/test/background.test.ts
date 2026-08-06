@@ -518,6 +518,133 @@ async function classifyProviderUnknown(h: Harness, jobID: string): Promise<numbe
   return tabID;
 }
 
+/** extractMetaURL and extractDownloadURL are self-contained page functions:
+ * background.ts injects them verbatim via chrome.scripting.executeScript, so
+ * they read the page's global `document`/`location` rather than taking a
+ * Document parameter, and are deliberately not exported — executeScript
+ * serializes the injected function alone, not its module scope, so a shared
+ * helper or a test import would either break at runtime or let a test-local
+ * reimplementation silently drift from the function actually shipped (see
+ * the comment above extractDownloadURL in background.ts). Driving one job
+ * through the real "meta"/"href" download path captures the exact function
+ * reference background.ts hands to executeScript for that method, so every
+ * case below calls production code directly. */
+async function captureExtractor(method: "meta" | "href"): Promise<(...args: unknown[]) => unknown> {
+  const h = makeHarness();
+  const adapter: AdapterSpec = {
+    id: `extractor-capture-${method}`,
+    version: "1.0.0",
+    hosts: [PROVIDER_HOST],
+    classify: [],
+    download:
+      method === "meta"
+        ? { selector: "a", requireKind: "article", method: "meta", metaName: "citation_pdf_url" }
+        : { selector: "a.pdf", requireKind: "article", method: "href" },
+  };
+  h.deps.adapterSpecs.push(adapter);
+  h.deps.permissions.contains = async () => true;
+  let captured: ((...args: unknown[]) => unknown) | undefined;
+  h.deps.scripting.executeScript = async (injection) => {
+    if (injection.func === assessDrivenPage) return [{ result: { kind: "normal" } }];
+    if (injection.func === interpret) {
+      return [{ result: { kind: "article", adapter_id: adapter.id, adapter_version: adapter.version, evidence: [] } }];
+    }
+    // Whatever's left is the extractor under test for this method: capture
+    // the real reference without invoking it here — a null result lets the
+    // download flow finish cleanly without starting a chrome.downloads call.
+    captured = injection.func as (...args: unknown[]) => unknown;
+    return [{ result: null }];
+  };
+  await h.bridge.start();
+  await h.port.inbound(jobOffer(`job_capture_${method}`));
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  const url = `https://${PROVIDER_HOST}/stable/article`;
+  await h.tabs.onUpdated.emit(tabID, { url, status: "complete" }, { id: tabID, url });
+  if (captured === undefined) throw new Error(`extractor for method "${method}" was never invoked`);
+  return captured;
+}
+
+/** Run `fn` with `globalThis.document`/`globalThis.location` set to a
+ * happy-dom page at `url` — the environment executeScript actually provides
+ * the extractor inside the tracked tab — then restore whatever was there
+ * before. Mirrors the document/localStorage/sessionStorage swap
+ * keepalive.test.ts uses for collectResolverMarkers; `location` joins the
+ * swap here because extractMetaURL/extractDownloadURL read `location.href`
+ * for the self-URL guard, which collectResolverMarkers never needs, and
+ * HTMLMetaElement/HTMLAnchorElement join it because both extractors guard
+ * their querySelector result with `instanceof` against those GLOBAL
+ * constructors — bun's test environment has no DOM globals at all, so
+ * without this swap every element happy-dom hands back fails the
+ * instanceof check against an undefined constructor. */
+function withPageGlobals<T>(url: string, html: string, fn: () => T): T {
+  const window = new Window({ url });
+  window.document.write(html);
+  const previous = {
+    document: globalThis.document,
+    location: globalThis.location,
+    HTMLMetaElement: globalThis.HTMLMetaElement,
+    HTMLAnchorElement: globalThis.HTMLAnchorElement,
+  };
+  Object.assign(globalThis, {
+    document: window.document,
+    location: window.location,
+    HTMLMetaElement: window.HTMLMetaElement,
+    HTMLAnchorElement: window.HTMLAnchorElement,
+  });
+  try {
+    return fn();
+  } finally {
+    Object.assign(globalThis, previous);
+  }
+}
+
+test("extractMetaURL rejects every self-reference escape but still resolves a distinct download URL", async () => {
+  const extractMetaURL = await captureExtractor("meta");
+  const PAGE = "https://p.example.edu/a";
+  const metaTag = (content: string): string =>
+    `<html><head><meta name="citation_pdf_url" content="${content}"></head><body></body></html>`;
+  const run = (html: string): unknown => withPageGlobals(PAGE, html, () => extractMetaURL("citation_pdf_url"));
+
+  expect(run("<html><head></head><body></body></html>")).toBeNull(); // no meta tag at all
+  expect(run(metaTag(""))).toBeNull(); // empty content
+  expect(run(metaTag("   "))).toBeNull(); // whitespace-only content
+  // The two escapes a literal href === href comparison missed: WHATWG
+  // serializes a non-null empty query as a trailing "?", one character away
+  // from the page's own href.
+  expect(run(metaTag("?"))).toBeNull();
+  // Userinfo survives href serialization unchanged while addressing the
+  // identical page — rejected outright, not folded into the equality check.
+  expect(run(metaTag("https://x@p.example.edu/a"))).toBeNull();
+  expect(run(metaTag("#frag"))).toBeNull();
+  expect(run(metaTag("//p.example.edu/a"))).toBeNull(); // protocol-relative self-reference
+  expect(run(metaTag("javascript:alert(1)"))).toBeNull();
+  expect(run(metaTag("data:text/html,hi"))).toBeNull();
+  expect(run(metaTag("blob:https://p.example.edu/xyz"))).toBeNull();
+  // Must still work: a real, distinct download URL on the same path.
+  expect(run(metaTag("?download=true"))).toBe("https://p.example.edu/a?download=true");
+  expect(run(metaTag("https://p.example.edu/other.pdf"))).toBe("https://p.example.edu/other.pdf");
+});
+
+test("extractDownloadURL rejects every self-reference escape but still resolves a distinct download URL", async () => {
+  const extractDownloadURL = await captureExtractor("href");
+  const PAGE = "https://p.example.edu/a";
+  const anchor = (href: string): string => `<html><body><a class="pdf" href="${href}">Download</a></body></html>`;
+  const run = (html: string): unknown => withPageGlobals(PAGE, html, () => extractDownloadURL("a.pdf"));
+
+  expect(run("<html><body></body></html>")).toBeNull(); // no matching anchor at all
+  expect(run(anchor(""))).toBeNull(); // empty href
+  expect(run(anchor("   "))).toBeNull(); // whitespace-only href
+  expect(run(anchor("?"))).toBeNull();
+  expect(run(anchor("https://x@p.example.edu/a"))).toBeNull();
+  expect(run(anchor("#frag"))).toBeNull();
+  expect(run(anchor("//p.example.edu/a"))).toBeNull();
+  expect(run(anchor("javascript:alert(1)"))).toBeNull();
+  expect(run(anchor("data:text/html,hi"))).toBeNull();
+  expect(run(anchor("blob:https://p.example.edu/xyz"))).toBeNull();
+  expect(run(anchor("?download=true"))).toBe("https://p.example.edu/a?download=true");
+  expect(run(anchor("https://p.example.edu/other.pdf"))).toBe("https://p.example.edu/other.pdf");
+});
+
 function helloRequiredError(): unknown {
   return {
     protocol: "papio-browser/1",
@@ -2109,6 +2236,65 @@ test("an auth-flagged resolver hostname omits origin_hint on auth_returned rathe
 
   const frame = h.frames().find((f) => f.type === "session_evidence");
   expect(frame?.payload).toEqual({ evidence: "auth_returned", at: new Date(h.clock.now).toISOString() });
+});
+
+test("auth_returned origin_hint omits an unconfigured provider origin, even though it is a bare non-auth-flagged URL", async () => {
+  // issue G: resolverOriginHint alone only rejects authentication-shaped and
+  // non-bare origins — it does not require the daemon's configured set, so an
+  // offer's own provider origin (bare, no sso/idp/login segment) could ride
+  // along as the hint unless auth_returned is held to the same
+  // knownResolverOrigins() bar recordFreshSessionEvidence and
+  // recordInstitutionalSession already use. www.jstor.org here is the
+  // offer's provider host, never advertised as a resolver_origin below.
+  const providerOpenURL = `https://${PROVIDER_HOST}/openurl?ctx=providerhint`;
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(
+    helloAck({ features: ["session_evidence_v1"], resolver_origins: ["https://resolver.example.edu"] }),
+  );
+  h.bridge.attachKeepalive({
+    getSnapshot: () => ({ resolverOrigin: "https://resolver.example.edu", pausedForReauth: false }),
+    noteResolverNavigation: () => {},
+  } as unknown as KeepaliveManager);
+  await h.port.inbound(jobOffer("job_evidence_provider_hint", providerOpenURL));
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+
+  const idpURL = "https://idp.example.edu/sso?SAMLRequest=x";
+  await h.tabs.onUpdated.emit(tabID, { url: idpURL }, { id: tabID, url: idpURL });
+  await h.tabs.onUpdated.emit(tabID, { url: idpURL, status: "complete" }, { id: tabID, url: idpURL });
+  await h.tabs.onUpdated.emit(tabID, { url: `https://${PROVIDER_HOST}/stable/x` }, { id: tabID });
+
+  const frame = h.frames().find((f) => f.type === "session_evidence");
+  expect(frame?.payload).toEqual({ evidence: "auth_returned", at: new Date(h.clock.now).toISOString() });
+});
+
+test("auth_returned origin_hint carries a configured resolver origin", async () => {
+  // Contrast case for the test above: an offer resolving to an origin the
+  // daemon actually advertised in hello_ack's resolver_origins still gets
+  // the hint — the fix is the membership check, not a blanket omission.
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(
+    helloAck({ features: ["session_evidence_v1"], resolver_origins: ["https://resolver.example.edu"] }),
+  );
+  h.bridge.attachKeepalive({
+    getSnapshot: () => ({ resolverOrigin: "https://resolver.example.edu", pausedForReauth: false }),
+    noteResolverNavigation: () => {},
+  } as unknown as KeepaliveManager);
+  await h.port.inbound(jobOffer("job_evidence_configured_hint")); // default OPENURL is resolver.example.edu
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+
+  const idpURL = "https://idp.example.edu/sso?SAMLRequest=x";
+  await h.tabs.onUpdated.emit(tabID, { url: idpURL }, { id: tabID, url: idpURL });
+  await h.tabs.onUpdated.emit(tabID, { url: idpURL, status: "complete" }, { id: tabID, url: idpURL });
+  await h.tabs.onUpdated.emit(tabID, { url: `https://${PROVIDER_HOST}/stable/x` }, { id: tabID });
+
+  const frame = h.frames().find((f) => f.type === "session_evidence");
+  expect(frame?.payload).toEqual({
+    evidence: "auth_returned",
+    origin_hint: "https://resolver.example.edu",
+    at: new Date(h.clock.now).toISOString(),
+  });
 });
 
 test("a job-tab download completes to a basename-only frame; unrelated tab ignored", async () => {
@@ -5642,14 +5828,23 @@ test("an institutional landing marks its origin dirty, releases and reloads its 
   });
   h.tabs.live.set(landingTabID, { id: landingTabID, url: OPENURL });
   const dirtied: string[] = [];
-  const probed: (string | undefined)[] = [];
+  const probedForeground: (string | undefined)[] = [];
+  const probedAutomatically: string[] = [];
   h.bridge.attachKeepalive({
     getSnapshot: () => ({ pausedForReauth: false }),
     markDirty: async (origin: string) => {
       dirtied.push(origin);
     },
+    // issue C: recordInstitutionalSession fires from a tab NAVIGATION, an
+    // automatic path, not an operator action, so it must not take the 2s
+    // operator floor (MIN_FOREGROUND_PROBE_SPACING_MS in keepalive.ts). This
+    // spy still defines probeForeground so a regression back to the
+    // operator entry point fails loudly instead of silently no-op'ing.
     probeForeground: async (origin?: string) => {
-      probed.push(origin);
+      probedForeground.push(origin);
+    },
+    probeOriginAutomatically: async (origin: string) => {
+      probedAutomatically.push(origin);
     },
     notifyConfiguredOriginsChanged: () => {},
     noteResolverNavigation: () => {},
@@ -5664,9 +5859,12 @@ test("an institutional landing marks its origin dirty, releases and reloads its 
   await h.tabs.onUpdated.emit(landingTabID, { url: OPENURL, status: "complete" }, { id: landingTabID, url: OPENURL });
 
   // A landing is still only a reason to look again, never itself a verdict:
-  // exactly one dirty-mark and one probe, scoped to the landing's own origin.
+  // exactly one dirty-mark and one probe, scoped to the landing's own
+  // origin, and routed through the automatic entry point — never the
+  // operator-floor probeForeground (issue C).
   expect(dirtied).toEqual(["https://resolver.example.edu"]);
-  expect(probed).toEqual(["https://resolver.example.edu"]);
+  expect(probedAutomatically).toEqual(["https://resolver.example.edu"]);
+  expect(probedForeground).toEqual([]);
 
   // But papio itself drove this tab past authentication onto a page resolving
   // to a configured origin — first-hand evidence for THAT origin, so its own

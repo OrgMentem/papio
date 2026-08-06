@@ -236,7 +236,26 @@ export function isAuthenticationURL(rawURL: string): boolean {
 // tabs, so a false "in" here is no longer merely cosmetic.
 const SIGN_OUT_MARKER = /sign\s*out|log\s*out|logout|signout|sign-out|log-out/i;
 const SIGN_IN_MARKER = /sign\s*in|log\s*in|login/i;
+/** A discovery layer renders result/article titles inside anchors, so a page
+ * a session-holder never signed in to can carry prose like "Why students log
+ * out of surveillance platforms" inside a plain `<a>` — text a naive regex
+ * match treats identically to a real "Sign out" button. An affordance is a
+ * CONTROL LABEL: short by construction. Prose is not. Only text/label whose
+ * normalized (whitespace-collapsed, trimmed) form is at most this long counts
+ * as evidence, in either direction. */
+export const MAX_AFFORDANCE_LENGTH = 40;
 const MAX_STORAGE_VALUE_LENGTH = 8 * 1024;
+/** collectResolverMarkers() is injected verbatim into a page papio does not
+ * control and its whole return value is structured-cloned back to the
+ * service worker — mirror the discipline its own storage scan already
+ * applies (50 keys / 8 KiB per value): cap how many controls a single scan
+ * queries, how deep a single control's text walk recurses, and how long any
+ * one marker's text/label can be. These three are duplicated as LOCAL
+ * literals inside collectResolverMarkers itself (it must stay self-contained
+ * for executeScript) — keep the literals there equal to these. */
+export const MAX_SCANNED_CONTROLS = 400;
+export const MAX_MARKER_TEXT_LENGTH = 200;
+export const MAX_CONTROL_TEXT_DEPTH = 8;
 const JWT_SEGMENT = /^[A-Za-z0-9_-]+$/;
 
 function decodeJWTPart(part: string): string | undefined {
@@ -289,7 +308,15 @@ function jwtPayloadIsUnexpired(payload: Record<string, unknown>): boolean {
  *
  * A bare `sub` claim is NOT identity: anonymous session tokens carry opaque
  * subs on many platforms. Signed-in requires either a named-user claim, or
- * an Ex Libris-style explicit group claim that is not GUEST alongside a sub. */
+ * an Ex Libris-style explicit group claim that is not GUEST alongside a sub.
+ *
+ * THIS IS THE SPECIFICATION for storage-identity claim handling. It has no
+ * `src` caller of its own — the code that actually runs is
+ * collectResolverMarkers()'s `hasStorageIdentity` closure below, duplicated
+ * because an executeScript injection cannot import this module. The two
+ * MUST agree; `hasStorageIdentity` carries a matching comment pointing back
+ * here. This export exists so the claim logic has one tested definition
+ * instead of only the untested, unimportable copy. */
 export function classifyResolverJWTIdentity(values: readonly string[]): "in" | "unknown" {
   for (const value of values) {
     const payload = decodeJWTPayload(value);
@@ -329,7 +356,14 @@ export function classifyResolverMarkers(markers: readonly ResolverMarker[]): Ses
   for (const marker of markers) {
     if (typeof marker?.text !== "string" || typeof marker?.label !== "string") continue;
     if (marker.storageIdentity === "in") storageIdentity = true;
-    const affordance = `${marker.text} ${marker.label}`;
+    // Only a normalized field short enough to BE a control label — not a
+    // headline that happens to contain one — contributes to the match.
+    const text = marker.text.replace(/\s+/g, " ").trim();
+    const label = marker.label.replace(/\s+/g, " ").trim();
+    const affordance = [
+      text.length <= MAX_AFFORDANCE_LENGTH ? text : "",
+      label.length <= MAX_AFFORDANCE_LENGTH ? label : "",
+    ].join(" ");
     if (SIGN_OUT_MARKER.test(affordance)) return "in";
     if (SIGN_IN_MARKER.test(affordance) && marker.visible !== false) signIn = true;
   }
@@ -340,6 +374,14 @@ export function classifyResolverMarkers(markers: readonly ResolverMarker[]): Ses
 /** Serializable page function used by chrome.scripting.executeScript. */
 export function collectResolverMarkers(): ResolverMarker[] {
   const maxStorageValueLength = 8 * 1024;
+  // Duplicated literals for MAX_SCANNED_CONTROLS / MAX_MARKER_TEXT_LENGTH /
+  // MAX_CONTROL_TEXT_DEPTH (see the exported constants above): executeScript
+  // serializes only this function, not its module scope, so a shared
+  // reference throws ReferenceError once injected into the page. Keep these
+  // three equal to the exported values.
+  const maxScannedControls = 400;
+  const maxMarkerTextLength = 200;
+  const maxControlTextDepth = 8;
   const elements = Array.from(
     // Read only user-facing controls and their targets. Scanning every node
     // would include script/style/template source and ancestor textContent that
@@ -347,14 +389,26 @@ export function collectResolverMarkers(): ResolverMarker[] {
     document.querySelectorAll<HTMLElement>(
       "a,button,input,select,textarea,form,summary,label,[role='button'],[role='link']",
     ),
-  );
-  const ignoredTextTags = new Set(["SCRIPT", "STYLE", "TEMPLATE"]);
-  const controlText = (node: Node): string => {
+    // A page can render arbitrarily many candidate controls. The array built
+    // below is structured-cloned whole back to the service worker, so an
+    // unbounded element list is an unbounded payload from a page papio does
+    // not control — cap it the same way the storage scan below is capped.
+  ).slice(0, maxScannedControls);
+  const ignoredTextTags: Record<string, true> = { SCRIPT: true, STYLE: true, TEMPLATE: true };
+  // Depth-bounded: an unbounded walk is worst-case quadratic once a matched
+  // control nests another (a <label> wrapping a <button> wrapping a <span>
+  // re-serializes the same descendants at every level, once per ancestor),
+  // and a pathologically deep DOM should not make the injected scan itself
+  // expensive.
+  const controlText = (node: Node, depth = 0): string => {
     if (node.nodeType === 3) return node.nodeValue ?? "";
     if (node.nodeType !== 1) return "";
     const child = node as Element;
-    if (ignoredTextTags.has(child.tagName)) return "";
-    return Array.from(child.childNodes).map(controlText).join(" ");
+    if (ignoredTextTags[child.tagName] === true) return "";
+    if (depth >= maxControlTextDepth) return "";
+    return Array.from(child.childNodes)
+      .map((descendant) => controlText(descendant, depth + 1))
+      .join(" ");
   };
   // A control's `value` is its rendered label only on push buttons. On a text
   // or search input it is whatever the operator last typed, and a discovery
@@ -376,8 +430,11 @@ export function collectResolverMarkers(): ResolverMarker[] {
     // to be wrong — and it would pull URLs out of the operator's page for no
     // remaining purpose.
     return {
-      text: `${text} ${value}`.trim(),
-      label: element.getAttribute("aria-label")?.trim() ?? "",
+      // Truncated, not just capped in count: a single control's own text
+      // (a hidden <label> wrapping a whole article body, say) can still be
+      // page-sized even after the depth bound above.
+      text: `${text} ${value}`.trim().slice(0, maxMarkerTextLength),
+      label: (element.getAttribute("aria-label")?.trim() ?? "").slice(0, maxMarkerTextLength),
       visible: rect.length > 0 && element.checkVisibility?.() !== false,
     };
   });
@@ -407,7 +464,13 @@ export function collectResolverMarkers(): ResolverMarker[] {
   }
 
   // Keep this helper self-contained: executeScript serializes only the
-  // injected function, not its module-level dependencies.
+  // injected function, not its module-level dependencies, so it cannot import
+  // classifyResolverJWTIdentity() and must duplicate its claim handling
+  // instead. THE TWO MUST AGREE: classifyResolverJWTIdentity() above is the
+  // specification (it is what the tests exercise, since this closure cannot
+  // be imported into a test file either) — named claim list, userGroup/
+  // user_group, the GUEST rejection, sub+group, and the exp check must stay
+  // byte-for-byte identical to it. Any change to one belongs in both.
   const hasStorageIdentity = (values: readonly string[]): boolean => {
     for (const value of values) {
       if (typeof value !== "string" || value.length >= maxStorageValueLength) continue;
@@ -424,6 +487,9 @@ export function collectResolverMarkers(): ResolverMarker[] {
         const binary = atob(padded);
         const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
         const payload: unknown = JSON.parse(new TextDecoder().decode(bytes));
+        // Matches decodeJWTPayload()'s shape guard above: a JWT payload is a
+        // claims object, never an array or a bare primitive.
+        if (typeof payload !== "object" || payload === null || Array.isArray(payload)) continue;
         const record = payload as Record<string, unknown>;
         const exp = record["exp"];
         if (exp !== undefined && (typeof exp !== "number" || !Number.isFinite(exp) || exp <= Date.now() / 1_000)) {
@@ -491,9 +557,15 @@ export const MIN_PROBE_START_SPACING_MS = 10_000;
  * rate-limited by a human hand; holding one behind the full automatic floor
  * would put a ten-second staleness window on exactly the interaction this work
  * exists to fix — the operator signs in, reopens the popup, and expects papio
- * to have noticed. Two seconds still bounds a pathologically cycled popup at
- * the same 30 starts/minute ceiling as five observed tabs on the automatic
- * path. */
+ * to have noticed. This floor bounds probe STARTS, not injections, and each
+ * start injects into up to MAX_OBSERVED_TABS_PER_ORIGIN (5) tabs: a
+ * pathologically cycled popup can reach 30 starts/minute and up to 150
+ * injections/minute here, against 6 starts/minute and up to 30
+ * injections/minute on the automatic MIN_PROBE_START_SPACING_MS floor — five
+ * times the ceiling, not the same one. That gap is accepted, not hidden: an
+ * operator with the popup open is still bounded by how fast a human can
+ * reopen it, and missing a just-completed sign-in for up to ten seconds is
+ * the worse failure. */
 export const MIN_FOREGROUND_PROBE_SPACING_MS = 2_000;
 /** Bounds one admitted probeOrigin() attempt so a wedged tabs./scripting
  * call cannot hold an origin's in-flight slot open forever — that would
@@ -574,12 +646,17 @@ interface TabObservation {
  * through requestProbe() -> probeOrigin(). */
 type ProbeReason = "foreground" | "cycle" | "reauth" | "navigation" | "activation" | "wake";
 
-/** Operator-initiated requests get a shorter admission floor than automatic
- * ones. "foreground" — probeForeground()'s own reason — is the only
- * ProbeReason an operator action can produce here: openReauth() never calls
- * requestProbe() directly, it only creates/updates the owned tab, so its
- * eventual recheck always arrives later as a "reauth"/"cycle" tick. Every
- * other reason is automatic and keeps the full MIN_PROBE_START_SPACING_MS
+/** Keys purely off the ProbeReason VALUE, never off who actually called
+ * requestProbe() — the type carries no "came from an operator action" fact
+ * for this to check. Today only probeForeground() constructs "foreground",
+ * and every automatic trigger — including background.ts's own
+ * institutional-landing detection, which uses probeOriginAutomatically()'s
+ * "navigation" reason instead of calling probeForeground() directly — uses
+ * one of the other five reasons, so "foreground" does mean operator-
+ * initiated in practice. That correspondence is a calling convention every
+ * caller of probeForeground() must uphold, not something this function or
+ * the ProbeReason type enforces: a future caller of probeForeground() from
+ * an automatic path would silently inherit the shorter, operator-only
  * floor. */
 function spacingFloorFor(reason: ProbeReason): number {
   return reason === "foreground" ? MIN_FOREGROUND_PROBE_SPACING_MS : MIN_PROBE_START_SPACING_MS;
@@ -1004,6 +1081,22 @@ export class KeepaliveManager {
     }
   }
 
+  /** Automatic-path probe for callers outside the tab-tracking pipeline
+   * (background.ts's own institutional-landing detection, on tab
+   * navigation) that need an immediate re-probe of one origin without
+   * claiming probeForeground()'s "foreground" reason — that reason carries
+   * the shorter, operator-only MIN_FOREGROUND_PROBE_SPACING_MS floor (see
+   * spacingFloorFor()), and this call site is not an operator action.
+   * Routes through requestProbe() with "navigation", an already-automatic
+   * reason, so it gets the full MIN_PROBE_START_SPACING_MS floor like every
+   * other automatic trigger. */
+  async probeOriginAutomatically(origin: string): Promise<void> {
+    await this.loadPreferences();
+    const target = normalizeHttpsOrigin(origin);
+    if (target === undefined) return;
+    await this.requestProbe(target, "navigation");
+  }
+
   /** `checking` is owned entirely here: requestProbe()/probeOrigin() never
    * touch it, so a "cycle"/"reauth"/"navigation"/etc. request never flips it
    * and never collides with a concurrent foreground probe's flag. */
@@ -1289,10 +1382,23 @@ export class KeepaliveManager {
   /** Reduce one origin's batch of observations to exactly one outcome, in
    * the precedence documented on ProbeOutcome: a decisive causal tab always
    * wins outright; failing that, disagreeing siblings are a conflict;
-   * failing that, a lone decisive polarity commits UNLESS the scan was
-   * truncated; anything short of a decisive commit LEAVES THE VERDICT
-   * ALONE — an incomplete, failed, or stale scan must never manufacture
-   * "out" for an origin that earned "in" from an earlier, complete probe. */
+   * failing that, a decisive "in" commits even from a TRUNCATED scan —
+   * forging "in" requires a decisive sign-out affordance or storage
+   * identity on the origin, and truncation (more candidate tabs than
+   * MAX_OBSERVED_TABS_PER_ORIGIN) cannot manufacture one, so refusing to
+   * ever commit here would be strictly worse: six-plus open resolver tabs
+   * with the operator focused elsewhere would leave the origin unable to
+   * advance past "unknown" for as long as those tabs stay open, wedging
+   * every queued handoff behind the 45s fallback timer forever. A decisive
+   * "out" still commits only from a COMPLETE scan — the asymmetry the
+   * classifier already relies on (sign-out affordances may hide, so a
+   * lone "in" is trusted; sign-in affordances must be prominent, so "out"
+   * demands having actually looked everywhere). Anything short of a
+   * decisive "in" commit LEAVES THE VERDICT ALONE — an incomplete, failed,
+   * or stale scan must never manufacture "out" for an origin that earned
+   * "in" from an earlier, complete probe; a truncated scan that
+   * suppressed the only chance to learn anything new instead reports
+   * "partial_scan". */
   private reduceObservations(
     observations: readonly TabObservation[],
     causalTabID: number | undefined,
@@ -1319,21 +1425,19 @@ export class KeepaliveManager {
     if (decisiveIn.length > 0 && decisiveOut.length > 0) {
       return { outcome: "conflict", verdict: "unknown", source: "none" };
     }
-    if (!truncated) {
-      if (decisiveIn.length > 0) {
-        return {
-          outcome: "markers",
-          verdict: "in",
-          source: decisiveIn.some((observation) => observation.owned) ? "keepalive_tab" : "live_tab",
-        };
-      }
-      if (decisiveOut.length > 0) {
-        return {
-          outcome: "markers",
-          verdict: "out",
-          source: decisiveOut.some((observation) => observation.owned) ? "keepalive_tab" : "live_tab",
-        };
-      }
+    if (decisiveIn.length > 0) {
+      return {
+        outcome: "markers",
+        verdict: "in",
+        source: decisiveIn.some((observation) => observation.owned) ? "keepalive_tab" : "live_tab",
+      };
+    }
+    if (!truncated && decisiveOut.length > 0) {
+      return {
+        outcome: "markers",
+        verdict: "out",
+        source: decisiveOut.some((observation) => observation.owned) ? "keepalive_tab" : "live_tab",
+      };
     }
     if (truncated) return { outcome: "partial_scan" };
     if (observations.some((observation) => observation.kind === "scan_failed")) {
@@ -1722,7 +1826,14 @@ export class KeepaliveManager {
         func: collectResolverMarkers,
       });
       const markers = injection?.result;
-      if (!Array.isArray(markers)) {
+      // Mirror the 50-key/8-KiB storage discipline collectResolverMarkers()
+      // applies to itself: the array crosses a structured-clone trust
+      // boundary from a page papio does not control, and MAX_SCANNED_CONTROLS
+      // is the collector's own element cap, so anything longer than that
+      // cannot be a genuine result of the current collector — treat it as a
+      // failed scan rather than handing an oversized, unbounded array to the
+      // classifier.
+      if (!Array.isArray(markers) || markers.length > MAX_SCANNED_CONTROLS) {
         return { outcome: "scan_failed" };
       }
       const verdict = classifyResolverMarkers(markers as ResolverMarker[]);

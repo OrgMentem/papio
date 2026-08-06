@@ -12,7 +12,11 @@ import {
   collectResolverMarkers,
   isAuthenticationURL,
   KeepaliveManager,
+  MAX_AFFORDANCE_LENGTH,
+  MAX_CONTROL_TEXT_DEPTH,
+  MAX_MARKER_TEXT_LENGTH,
   MAX_OBSERVED_TABS_PER_ORIGIN,
+  MAX_SCANNED_CONTROLS,
   MIN_FOREGROUND_PROBE_SPACING_MS,
   MIN_PROBE_START_SPACING_MS,
   SESSION_STALE_MS,
@@ -2204,18 +2208,24 @@ test("a preserved-verdict commit (no_tab, scan_failed, partial_scan) fires neith
   expect(h.authChanges).toHaveLength(1);
 
   // partial_scan: too many candidate tabs to trust siblings alone — same
-  // preserve-only contract as scan_failed. No trailing drain here: nothing
+  // preserve-only contract as scan_failed. Every flood tab reads no markers
+  // at all (not the harness's decisive-"Sign out" default): a decisive "in"
+  // among truncated siblings is now allowed to commit (see reduceObservations
+  // — D-fix), so this branch is exercised only when nothing among the
+  // truncated set is decisive either way. No trailing drain here: nothing
   // this assertion cares about is scheduled behind a timer, and running one
   // would also fire the unrelated warm-demand-lapsed housekeeping tick this
   // test's own `h.jobs.count = 0` armed earlier, which independently resets
   // the origin once no tab exists to observe — a real but orthogonal path,
   // not the preserved-commit behavior under test here.
   h.api.scripting = { executeScript: h.scripting.executeScript };
+  h.markersByTab.set(tab.id, []); // neutralize: this section tests truncation with NO decisive tab, not tab 40's earlier "in" carrying it.
   expect(MAX_OBSERVED_TABS_PER_ORIGIN).toBe(5);
   const flood: KeepaliveTab[] = [];
   for (let id = 200; id < 200 + MAX_OBSERVED_TABS_PER_ORIGIN + 1; id++) {
     const floodTab = { id, url: `${origin}/discovery/${id}` };
     h.tabs.live.set(id, floodTab);
+    h.markersByTab.set(id, []);
     flood.push(floodTab);
   }
   h.tabs.resolverTabs.push(...flood);
@@ -2736,5 +2746,266 @@ test("a non-decisive causal tab cedes the verdict to a decisive sibling, and pro
       probeSource: "live_tab",
       lastProbeOutcome: "markers",
     });
+  }
+});
+
+// --- Security review follow-ups: prose-as-affordance, unbounded collector
+// payloads, unreachable verdicts under tab flooding, and the injected JWT
+// closure's agreement with its tested spec (issues A/B/D/F). Every test
+// below is grounded in the current classifyResolverMarkers/
+// collectResolverMarkers/reduceObservations/resolverMarkerVerdict source,
+// not the pre-fix behavior it replaces.
+
+test("prose containing a sign-out phrase is not an affordance, pinned exactly at MAX_AFFORDANCE_LENGTH", () => {
+  // A discovery layer renders result/article titles inside plain anchors.
+  // "log out" appearing inside a headline-length string must not forge a
+  // sign-out affordance — only a control-label-length string can.
+  const articleProse = "Why students log out of surveillance platforms";
+  expect(articleProse.length).toBeGreaterThan(MAX_AFFORDANCE_LENGTH);
+  expect(classifyResolverMarkers([{ text: articleProse, label: "" }])).toBe("unknown");
+  // A real control label still counts.
+  expect(classifyResolverMarkers([{ text: "Sign out", label: "" }])).toBe("in");
+  // Pin the boundary itself, from both sides: a normalized text of exactly
+  // MAX_AFFORDANCE_LENGTH characters still qualifies; one character past it
+  // does not.
+  const atLimit = "Sign out of your library account here".padEnd(MAX_AFFORDANCE_LENGTH, "!");
+  expect(atLimit.length).toBe(MAX_AFFORDANCE_LENGTH);
+  expect(classifyResolverMarkers([{ text: atLimit, label: "" }])).toBe("in");
+  const overLimit = atLimit + "!";
+  expect(classifyResolverMarkers([{ text: overLimit, label: "" }])).toBe("unknown");
+});
+
+test("the same MAX_AFFORDANCE_LENGTH bound applies to the sign-in direction", () => {
+  // The harmful direction is a forged "in", but the classifier applies one
+  // rule to both marker types — prose must not assert "out" either.
+  const articleProse = "Students explain why they sign in to campus portals daily";
+  expect(articleProse.length).toBeGreaterThan(MAX_AFFORDANCE_LENGTH);
+  expect(classifyResolverMarkers([{ text: articleProse, label: "", visible: true }])).toBe("unknown");
+  const atLimit = "Sign in to your library account here".padEnd(MAX_AFFORDANCE_LENGTH, "!");
+  expect(atLimit.length).toBe(MAX_AFFORDANCE_LENGTH);
+  expect(classifyResolverMarkers([{ text: atLimit, label: "", visible: true }])).toBe("out");
+  const overLimit = atLimit + "!";
+  expect(classifyResolverMarkers([{ text: overLimit, label: "", visible: true }])).toBe("unknown");
+});
+
+test("whitespace formatting cannot defeat or trip the affordance length bound", () => {
+  // Newlines and runs of spaces around a real control label must not push
+  // its RAW length over the bound: the length that matters is the
+  // normalized (whitespace-collapsed, trimmed) one.
+  const paddedLabel = "\n\n\n\n   \t  \n Sign     \n\n   out   \n\n\n\n   \t\t \n\n  ";
+  expect(paddedLabel.length).toBeGreaterThan(MAX_AFFORDANCE_LENGTH); // raw length alone would wrongly exclude it
+  expect(classifyResolverMarkers([{ text: "", label: paddedLabel }])).toBe("in");
+});
+
+test("the injected collector caps element count, per-marker text, and deeply nested control text", () => {
+  const withResolverDom = <T,>(html: string, run: () => T): T => {
+    const window = new Window({ url: "https://resolver.example.edu/discovery/search" });
+    window.document.write(html);
+    const previous = {
+      document: globalThis.document,
+      localStorage: globalThis.localStorage,
+      sessionStorage: globalThis.sessionStorage,
+    };
+    Object.assign(globalThis, {
+      document: window.document,
+      localStorage: window.localStorage,
+      sessionStorage: window.sessionStorage,
+    });
+    try {
+      return run();
+    } finally {
+      Object.assign(globalThis, previous);
+    }
+  };
+
+  // More matching controls than the element cap: the whole array is
+  // structured-cloned back to the service worker, so the cap must bound the
+  // RETURNED count, not merely how much is read.
+  {
+    const controls = Array.from(
+      { length: MAX_SCANNED_CONTROLS + 50 },
+      (_unused, index) => `<button>Sign out ${index}</button>`,
+    ).join("");
+    const markers = withResolverDom(`<html><body>${controls}</body></html>`, () => collectResolverMarkers());
+    expect(markers.length).toBe(MAX_SCANNED_CONTROLS);
+  }
+
+  // One control whose own text is far longer than the per-marker cap.
+  {
+    const longText = "L".repeat(MAX_MARKER_TEXT_LENGTH * 25);
+    const markers = withResolverDom(
+      `<html><body><button>${longText}</button></body></html>`,
+      () => collectResolverMarkers(),
+    );
+    expect(markers).toHaveLength(1);
+    expect(markers[0]?.text.length).toBe(MAX_MARKER_TEXT_LENGTH);
+  }
+
+  // Deeply nested matched controls (a <label> wrapping a <label> wrapping a
+  // <label>...), each level carrying its own substantial text: controlText()
+  // re-serializes every descendant at every ancestor level, so this shape is
+  // the quadratic-blowup case, not just a single oversized control.
+  {
+    const depth = 30; // well past MAX_CONTROL_TEXT_DEPTH
+    const perLevelText = "X".repeat(500);
+    let inner = "leaf";
+    for (let level = 0; level < depth; level++) inner = `<label>${perLevelText}${inner}</label>`;
+    const markers = withResolverDom(`<html><body>${inner}</body></html>`, () => collectResolverMarkers());
+    expect(markers).toHaveLength(depth);
+    const totalChars = markers.reduce((sum, marker) => sum + marker.text.length + marker.label.length, 0);
+    // Pre-fix (no per-marker truncation, no depth bound), this shape's
+    // outermost markers alone would each re-serialize up to depth *
+    // perLevelText.length characters, summing to roughly depth*(depth+1)/2 *
+    // perLevelText.length ≈ 232,500 total characters. Every marker is
+    // truncated independently now, so the total is bounded by count * cap
+    // regardless of nesting depth.
+    expect(totalChars).toBeGreaterThan(0);
+    expect(totalChars).toBeLessThanOrEqual(depth * MAX_MARKER_TEXT_LENGTH * 2);
+  }
+});
+
+test("the receiver rejects an oversized marker array as a failed scan, preserving the prior verdict", async () => {
+  const h = makeHarness();
+  await h.manager.init(); // owned tab id 1, default "Sign out" marker -> earns "in"
+  await h.manager.probeForeground();
+  const earned = h.manager.getSnapshot();
+  expect(earned).toMatchObject({ verdict: "in", authenticated: true });
+
+  // An array longer than collectResolverMarkers()'s own element cap cannot
+  // be a genuine result of the current collector — only a page bypassing it
+  // (or a compromised channel) could produce one. Every entry is still
+  // decisive "Sign out" content: if the receiver's length check were
+  // missing, this would classify "in" too, via a fresh "markers" commit —
+  // the ONLY thing this test can tell apart is whether the array was
+  // rejected outright (outcome "scan_failed", timestamp preserved) or
+  // accepted and reclassified (outcome "markers", fresh timestamp).
+  const oversized: ResolverMarker[] = Array.from({ length: MAX_SCANNED_CONTROLS + 1 }, () => ({
+    text: "Sign out",
+    label: "",
+  }));
+  h.markersByTab.set(1, oversized);
+  h.clock.advanceBy(MIN_FOREGROUND_PROBE_SPACING_MS);
+  await h.manager.probeForeground();
+  await h.timers.runDue();
+  await flushMicrotasks();
+
+  const after = h.manager.getSnapshot();
+  expect(after).toMatchObject({
+    verdict: "in",
+    authenticated: true,
+    lastProbeOutcome: "scan_failed",
+  });
+  expect(after.lastVerdictAt).toBe(earned.lastVerdictAt);
+  expect(after.lastProbeAt).not.toBe(earned.lastProbeAt);
+});
+
+test("six or more resolver tabs no longer deadlock the verdict: a decisive in among truncated siblings commits", async () => {
+  const h = makeHarness();
+  await h.manager.init();
+  h.jobs.count = 0;
+  await h.manager.sync(); // close the owned tab: it must not supply a causal/owned bias here.
+  h.resolverMarkers.splice(0, h.resolverMarkers.length); // default fallback reads nothing decisive.
+
+  expect(MAX_OBSERVED_TABS_PER_ORIGIN).toBe(5);
+  const flood: KeepaliveTab[] = [];
+  for (let id = 200; id < 200 + MAX_OBSERVED_TABS_PER_ORIGIN + 1; id++) {
+    const tab = { id, url: `https://resolver.example.edu/discovery/${id}` };
+    h.tabs.live.set(id, tab);
+    flood.push(tab);
+  }
+  h.tabs.resolverTabs.push(...flood);
+  // Exactly one of the six candidate tabs (more than the observation cap)
+  // carries a decisive sign-out affordance; the rest read nothing at all.
+  // None is focused or preferred, so there is no causal tiebreaker — the
+  // decisive tab sorts first in query order, landing inside the cap.
+  h.markersByTab.set(200, [{ text: "Sign out", label: "" }]);
+
+  await h.manager.probeForeground();
+
+  const origin = "https://resolver.example.edu";
+  // A researcher with six library tabs open must not be stuck on "unknown"
+  // forever just because one more tab than the cap exists: truncation
+  // cannot manufacture a decisive "in", so a real one still commits.
+  expect(h.manager.getOriginSnapshots().find((s) => s.origin === origin)).toMatchObject({
+    verdict: "in",
+    authenticated: true,
+    probeSource: "live_tab",
+    lastProbeOutcome: "markers",
+  });
+});
+
+test("companion: the same truncated shape with only decisive out observations still refuses to commit out", async () => {
+  const h = makeHarness();
+  await h.manager.init();
+  h.jobs.count = 0;
+  await h.manager.sync();
+  h.resolverMarkers.splice(0, h.resolverMarkers.length);
+
+  const flood: KeepaliveTab[] = [];
+  for (let id = 300; id < 300 + MAX_OBSERVED_TABS_PER_ORIGIN + 1; id++) {
+    const tab = { id, url: `https://resolver.example.edu/discovery/${id}` };
+    h.tabs.live.set(id, tab);
+    flood.push(tab);
+  }
+  h.tabs.resolverTabs.push(...flood);
+  // Sign-in affordances must be prominent, so "out" demands having actually
+  // looked everywhere — the asymmetry the classifier already relies on. A
+  // truncated scan must never manufacture "out" the way it may now
+  // manufacture "in".
+  h.markersByTab.set(300, [{ text: "Sign in", label: "", visible: true }]);
+
+  await h.manager.probeForeground();
+
+  const origin = "https://resolver.example.edu";
+  expect(h.manager.getOriginSnapshots().find((s) => s.origin === origin)).toMatchObject({
+    verdict: "unknown",
+    authenticated: false,
+    lastProbeOutcome: "partial_scan",
+  });
+});
+
+test("collectResolverMarkers' injected storage-identity closure agrees with classifyResolverJWTIdentity across a shared corpus", () => {
+  // hasStorageIdentity (injected, self-contained for executeScript) must
+  // stay byte-for-byte equivalent to classifyResolverJWTIdentity (the
+  // exported, tested spec) — the injected copy is what actually grants a
+  // release-grade "in", and the exported one is the only one the test suite
+  // can reach directly.
+  const corpus: readonly [string, string, "in" | "unknown"][] = [
+    ["named-claim token", syntheticJWT({ userName: "Jane Doe", userGroup: "STUDENT" }), "in"],
+    ["GUEST-group token", syntheticJWT({ userName: "Jane Doe", userGroup: "GUEST" }), "unknown"],
+    ["sub-plus-group token", syntheticJWT({ sub: "u123", userGroup: "STAFF" }), "in"],
+    ["bare-sub token", syntheticJWT({ sub: "a81bc81b-dead-4e5d" }), "unknown"],
+    [
+      "expired token",
+      syntheticJWT({ preferred_username: "jane", exp: Math.floor(Date.now() / 1_000) - 1 }),
+      "unknown",
+    ],
+    ["malformed token", "not.a.jwt!", "unknown"],
+  ];
+
+  for (const [name, token, expected] of corpus) {
+    const specResult = classifyResolverJWTIdentity([token]);
+    expect(specResult, `${name}: classifyResolverJWTIdentity`).toBe(expected);
+
+    const window = new Window({ url: "https://resolver.example.edu/account" });
+    window.sessionStorage.setItem("token", token);
+    const previous = {
+      document: globalThis.document,
+      localStorage: globalThis.localStorage,
+      sessionStorage: globalThis.sessionStorage,
+    };
+    Object.assign(globalThis, {
+      document: window.document,
+      localStorage: window.localStorage,
+      sessionStorage: window.sessionStorage,
+    });
+    let collectorResult: "in" | "unknown";
+    try {
+      const markers = collectResolverMarkers();
+      collectorResult = markers.some((marker) => marker.storageIdentity === "in") ? "in" : "unknown";
+    } finally {
+      Object.assign(globalThis, previous);
+    }
+    expect(collectorResult, `${name}: collectResolverMarkers`).toBe(expected);
   }
 });

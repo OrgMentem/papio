@@ -825,7 +825,16 @@ function isDirectFileOffer(raw: string): boolean {
  *
  * Keep this function self-contained: executeScript serializes the injected
  * function alone, not its module-level dependencies, so the empty/self URL
- * guard below is deliberately duplicated in extractMetaURL rather than shared. */
+ * guard below is deliberately duplicated in extractMetaURL rather than shared.
+ *
+ * The self-URL check compares origin + pathname + search rather than the raw
+ * href string: WHATWG serializes a non-null empty query as a trailing "?", so
+ * `content="?"` on https://p/a produced "https://p/a?" — one character away
+ * from the page's own href and therefore NOT caught by a literal href ===
+ * href comparison, while `URL#search` already normalizes both the "?" and
+ * no-query forms to "". A URL carrying userinfo (`https://x@p/a`) survives
+ * href serialization unchanged while still addressing the identical page, so
+ * it is rejected outright rather than folded into the equality check. */
 function extractDownloadURL(selector: string): string | null {
   const el = document.querySelector<HTMLAnchorElement>(selector);
   if (!(el instanceof HTMLAnchorElement)) return null;
@@ -834,10 +843,10 @@ function extractDownloadURL(selector: string): string | null {
   try {
     const u = new URL(raw, location.href);
     if (u.protocol !== "https:") return null;
+    if (u.username !== "" || u.password !== "") return null;
     const page = new URL(location.href);
-    u.hash = "";
-    page.hash = "";
-    return u.href === page.href ? null : u.href;
+    const isSelf = u.origin === page.origin && u.pathname === page.pathname && u.search === page.search;
+    return isSelf ? null : u.href;
   } catch {
     return null;
   }
@@ -856,7 +865,12 @@ function extractDownloadURL(selector: string): string | null {
  * chrome.downloads.download as if it were the PDF; payload validation caught
  * it downstream, but the fetch was wasted and the failure was misattributed to
  * the provider. A query string still differentiates: a provider's
- * `?download=true` form of the same path is a real, distinct download URL. */
+ * `?download=true` form of the same path is a real, distinct download URL.
+ *
+ * The self-URL check compares origin + pathname + search rather than the raw
+ * href string, and rejects userinfo outright, for the same reason documented
+ * in extractDownloadURL above — see that comment for the two escapes this
+ * closes. */
 function extractMetaURL(metaName: string): string | null {
   const el = document.querySelector(`meta[name="${metaName}"]`);
   if (!(el instanceof HTMLMetaElement)) return null;
@@ -865,10 +879,10 @@ function extractMetaURL(metaName: string): string | null {
   try {
     const u = new URL(raw, location.href);
     if (u.protocol !== "https:") return null;
+    if (u.username !== "" || u.password !== "") return null;
     const page = new URL(location.href);
-    u.hash = "";
-    page.hash = "";
-    return u.href === page.href ? null : u.href;
+    const isSelf = u.origin === page.origin && u.pathname === page.pathname && u.search === page.search;
+    return isSelf ? null : u.href;
   } catch {
     return null;
   }
@@ -4370,7 +4384,13 @@ export class Bridge {
     }));
     if (firstAuthEvidence) {
       void this.keepaliveManager?.markDirty(origin);
-      void this.keepaliveManager?.probeForeground(origin);
+      // Not probeForeground: this fires from a tab NAVIGATION, an automatic
+      // path, not an operator action, so it must not take the 2s operator
+      // floor (MIN_FOREGROUND_PROBE_SPACING_MS in keepalive.ts) — the
+      // bounded rate this landing path relies on assumes the 10s automatic
+      // floor instead. markDirty stays regardless as the wake-sweep fallback
+      // if this probe never lands.
+      void this.keepaliveManager?.probeOriginAutomatically(origin);
     }
     await this.drainQueuedHandoffs(origin, undefined, false);
     await this.reloadAuthenticationHandoffs(origin);
@@ -5779,7 +5799,21 @@ export class Bridge {
       // itself used to before parked_with_tab existed.
       await this.update((s) => patchJob(s, job.job_id, { status: "awaiting_download", parked_with_tab: false }));
       this.send("auth_returned", { elapsed_ms: elapsed }, job.job_id);
-      this.emitSessionEvidence("auth_returned", this.resolverOriginHint(this.offerURLs.get(job.job_id)));
+      // resolverOriginHint alone only rejects authentication-shaped and
+      // non-bare origins — it does not require the daemon's configured set,
+      // so an offer's own provider origin could otherwise ride along as the
+      // hint (unlike recordFreshSessionEvidence and recordInstitutionalSession,
+      // which both gate on knownResolverOrigins()). No privacy boundary
+      // crosses either way and the daemon fails closed on an unresolved
+      // hint, but an absent hint is documented as the safe default above, so
+      // hold this producer to the same configured-origin bar as its siblings.
+      const authReturnedOriginHint = this.resolverOriginHint(this.offerURLs.get(job.job_id));
+      this.emitSessionEvidence(
+        "auth_returned",
+        authReturnedOriginHint !== undefined && this.knownResolverOrigins().includes(authReturnedOriginHint)
+          ? authReturnedOriginHint
+          : undefined,
+      );
       // The human is past authentication; fold the "papio" group back away.
       await this.recollapseHandoffGroup(tabID);
       const institutionalSession = await this.recordInstitutionalSession(job, url, now);
