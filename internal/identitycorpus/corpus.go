@@ -19,6 +19,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"runtime"
 	"sort"
@@ -28,6 +29,7 @@ import (
 
 	_ "modernc.org/sqlite"
 
+	"papio/internal/config"
 	"papio/internal/pdf"
 	"papio/internal/work"
 )
@@ -70,6 +72,12 @@ var (
 	pmidExtraPattern   = regexp.MustCompile(`(?i)PMID:\s*(\d+)`)
 	arxivExtraPattern  = regexp.MustCompile(`(?i)arXiv:\s*([^\s,;]+)`)
 	leadingYearPattern = regexp.MustCompile(`^\d{4}`)
+	// baseAttachmentPathPref matches Zotero's own prefs.js line for
+	// extensions.zotero.baseAttachmentPath, e.g.
+	//   user_pref("extensions.zotero.baseAttachmentPath", "/Users/x/Papers");
+	// prefs.js stores the value as a JS string literal (backslash-escaped,
+	// not URL- or shell-escaped), hence unescapeJSString below.
+	baseAttachmentPathPref = regexp.MustCompile(`user_pref\("extensions\.zotero\.baseAttachmentPath",\s*"((?:[^"\\]|\\.)*)"\)`)
 )
 
 // candidate is one row of the query in queryCandidates: a PDF attachment
@@ -104,31 +112,26 @@ func Load(ctx context.Context, zoteroDir, cacheDir string, workers int) ([]Docum
 		return nil, nil, errors.New("poppler's pdftotext is not installed; identity corpus extraction requires it")
 	}
 
-	copyDir, err := copyZoteroDatabase(zoteroDir)
+	copyDir, err := snapshotZoteroDatabase(ctx, zoteroDir)
 	if err != nil {
 		return nil, nil, err
 	}
-	// Zotero keeps zotero.sqlite open in WAL mode for as long as the
-	// application runs. A WAL reader needs the -wal and -shm files that sit
-	// beside it, and those only exist — and only stay mutually consistent —
-	// while Zotero's own handle is open, so opening zoteroDir/zotero.sqlite
-	// directly, even read-only, either blocks behind Zotero's writer lock or
-	// risks a torn read mid-checkpoint. Copying all three files into a
-	// private scratch directory first, then opening the copy, sidesteps
-	// both: the copy is a point-in-time snapshot nothing else ever touches.
-	// A future reader who "simplifies" this back into opening the live file
-	// in place will reintroduce exactly the lock contention this exists to
-	// avoid.
+	// See snapshotZoteroDatabase for why this harness never opens
+	// zoteroDir/zotero.sqlite directly: Zotero keeps it open in WAL mode
+	// for as long as the application runs, and a private, verified
+	// snapshot is what makes every query below see one consistent
+	// point-in-time library rather than risking a read racing Zotero's own
+	// writer.
 	defer os.RemoveAll(copyDir)
 
 	dsn := "file:" + filepath.Join(copyDir, "zotero.sqlite") + "?mode=ro&_pragma=busy_timeout(5000)"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
-		return nil, nil, fmt.Errorf("opening copied zotero.sqlite: %w", err)
+		return nil, nil, fmt.Errorf("opening snapshot zotero.sqlite: %w", err)
 	}
 	defer db.Close()
 	if err := db.PingContext(ctx); err != nil {
-		return nil, nil, fmt.Errorf("opening copied zotero.sqlite: %w", err)
+		return nil, nil, fmt.Errorf("opening snapshot zotero.sqlite: %w", err)
 	}
 
 	candidates, err := queryCandidates(ctx, db)
@@ -138,16 +141,51 @@ func Load(ctx context.Context, zoteroDir, cacheDir string, workers int) ([]Docum
 
 	kept, skips := dedupOnePerParent(candidates)
 
+	// VAL-2: an "attachments:"-prefixed linkMode 2 path is relative to
+	// whatever the operator set as Zotero's Linked Attachment Base
+	// Directory (Preferences > Advanced > Files and Folders), read here
+	// once from prefs.js rather than re-read per candidate. It is simply
+	// absent when the operator never set it, which resolveAttachmentPath
+	// must tell apart from a file that used to exist and does not anymore.
+	baseAttachmentPath, haveBaseAttachmentPath := linkedAttachmentBasePath(zoteroDir)
+
+	// VAL-1: the whole reason this harness reads Zotero instead of
+	// papio's own artifact store is independence from papio's own,
+	// already-scored output (see the package comment). A linkMode 2
+	// (linked_file) attachment can point anywhere on disk, including back
+	// into papio's own data directory — an operator who lets zotio or the
+	// browser extension file a paper straight into Zotero as a linked
+	// file, pointed at the very artifact papio itself produced, ends up
+	// with a document Zotero holds but papio built. Run against this
+	// operator's real library, 48 of the 50 linkMode 2 candidates resolved
+	// to absolute paths inside papio's data directory, and 9 of those were
+	// artifacts papio had already delivered and already identity-scored:
+	// scoring pdf.MatchIdentity against its own prior verdict is exactly
+	// the circularity the Zotero corpus exists to avoid, so any candidate
+	// that resolves inside papio's data directory is excluded here, not
+	// silently measured as if it were independent evidence.
+	papioRoot := papioDataDir()
+
 	var prep []prepared
 	for _, c := range kept {
-		path, err := resolveAttachmentPath(zoteroDir, c)
+		path, err := resolveAttachmentPath(zoteroDir, baseAttachmentPath, haveBaseAttachmentPath, c)
 		if err != nil {
 			skips = append(skips, Skip{Key: c.attachmentKey, Reason: err.Error()})
 			continue
 		}
-		info, err := os.Stat(path)
-		if err != nil {
-			skips = append(skips, Skip{Key: c.attachmentKey, Reason: fmt.Sprintf("file not found: %v", err)})
+		if underDir(path, papioRoot) {
+			skips = append(skips, Skip{Key: c.attachmentKey, Reason: "papio-owned artifact"})
+			continue
+		}
+		info, statErr := os.Stat(path)
+		if statErr != nil {
+			// PRIV-2: the resolved absolute path, and os.Stat's own error
+			// text, both name the file (Zotero names stored files after
+			// author, year and title) — neither belongs in a reason meant
+			// to be pasted into a bug report. The attachment key already
+			// in Skip.Key is enough for the operator to find the row in
+			// their own library.
+			skips = append(skips, Skip{Key: c.attachmentKey, Reason: "file missing"})
 			continue
 		}
 		w, err := buildWork(ctx, db, c.parentID)
@@ -166,6 +204,16 @@ func Load(ctx context.Context, zoteroDir, cacheDir string, workers int) ([]Docum
 		prep = append(prep, prepared{cand: c, path: path, work: w, info: info})
 	}
 
+	// VAL-6 / PRIV-3: validate (and, on first run, create) the cache
+	// directory once, before any worker touches it, rather than trusting
+	// os.MkdirAll's silent adoption of whatever already sits at cacheDir.
+	// See validateCacheDir for the threat this closes.
+	if cacheDir != "" {
+		if err := validateCacheDir(cacheDir); err != nil {
+			return nil, nil, fmt.Errorf("identity corpus cache: %w", err)
+		}
+	}
+
 	docs, extractSkips, err := extractAll(ctx, prep, capability, cacheDir, workers)
 	if err != nil {
 		return nil, nil, err
@@ -177,33 +225,140 @@ func Load(ctx context.Context, zoteroDir, cacheDir string, workers int) ([]Docum
 	return docs, skips, nil
 }
 
-// copyZoteroDatabase copies zotero.sqlite, and its -wal/-shm siblings when
-// present, into a fresh temporary directory and returns that directory. The
-// caller owns removing it; see the comment in Load on why the copy exists at
-// all.
-func copyZoteroDatabase(zoteroDir string) (string, error) {
+// snapshotZoteroDatabase produces a private, verified point-in-time copy of
+// the operator's live zotero.sqlite into a fresh scratch directory (mode
+// 0700, via os.MkdirTemp) and returns that directory; the caller owns
+// removing it.
+//
+// There are two ways to get that copy, tried in order, because neither one
+// alone covers this tool's actual operating conditions. VACUUM INTO is the
+// atomic path PRIV-4 introduced: SQLite opens a single read transaction
+// against the live database and streams a consistent snapshot straight
+// into one fresh file, no -wal/-shm copies needed. But "safe to run while
+// Zotero is open" is this tool's stated contract, and Zotero keeps
+// zotero.sqlite in a locking mode that refuses even a second read-only
+// connection while the application is running -- VACUUM INTO then fails
+// with SQLITE_BUSY immediately, which is the expected case whenever the
+// operator has Zotero open, not a bug in this tool or a reason to abort
+// the run. copyZoteroDatabaseFallback is what the tool falls back to
+// there: the OS-level byte copy PRIV-4 replaced, but no longer trusted
+// blindly -- it now stats zotero.sqlite and its -wal sidecar before and
+// after the copy and retries when they moved, so the fallback is still a
+// snapshot this function can vouch for, not just one it hopes is whole.
+// Either way, PRAGMA quick_check runs against the result before Load ever
+// sees it, and which path was actually used is reported on stderr, since
+// that changes what guarantee the operator is measuring under.
+func snapshotZoteroDatabase(ctx context.Context, zoteroDir string) (string, error) {
 	tmpDir, err := os.MkdirTemp("", "papio-identitycorpus-*")
 	if err != nil {
-		return "", fmt.Errorf("creating scratch dir for zotero.sqlite copy: %w", err)
+		return "", fmt.Errorf("creating scratch dir for zotero.sqlite snapshot: %w", err)
 	}
-	if err := copyFile(filepath.Join(zoteroDir, "zotero.sqlite"), filepath.Join(tmpDir, "zotero.sqlite")); err != nil {
+
+	scratchPath := filepath.Join(tmpDir, "zotero.sqlite")
+	method := "VACUUM INTO (atomic snapshot)"
+	if vacuumErr := vacuumIntoSnapshot(ctx, zoteroDir, scratchPath); vacuumErr != nil {
+		if fallbackErr := copyZoteroDatabaseFallback(ctx, zoteroDir, tmpDir); fallbackErr != nil {
+			os.RemoveAll(tmpDir)
+			return "", fmt.Errorf("zotero.sqlite snapshot failed: VACUUM INTO could not run (%v), and the fallback copy also failed: %w", vacuumErr, fallbackErr)
+		}
+		method = "byte-level copy (VACUUM INTO unavailable while Zotero holds the database open)"
+	}
+
+	if err := verifySnapshot(ctx, scratchPath); err != nil {
 		os.RemoveAll(tmpDir)
 		return "", err
 	}
-	// zotero.sqlite-wal and zotero.sqlite-shm only exist while Zotero holds
-	// the database open in WAL mode, so their absence here is the normal
-	// case (Zotero not running, or fully checkpointed) rather than an error.
-	for _, name := range []string{"zotero.sqlite-wal", "zotero.sqlite-shm"} {
-		src := filepath.Join(zoteroDir, name)
-		if _, statErr := os.Stat(src); statErr != nil {
-			continue
-		}
-		if err := copyFile(src, filepath.Join(tmpDir, name)); err != nil {
-			os.RemoveAll(tmpDir)
-			return "", err
-		}
-	}
+	fmt.Fprintf(os.Stderr, "identity-corpus: zotero.sqlite snapshot method: %s\n", method)
 	return tmpDir, nil
+}
+
+// vacuumIntoSnapshot is the atomic path: open the live database read-only
+// and VACUUM INTO scratchPath. It fails whenever Zotero itself currently
+// holds zotero.sqlite in a locking mode that refuses a second reader --
+// SQLITE_BUSY -- which is routine while the operator has Zotero open, and
+// the caller treats it as an expected fallback trigger, not a fatal error.
+func vacuumIntoSnapshot(ctx context.Context, zoteroDir, scratchPath string) error {
+	liveDSN := "file:" + filepath.Join(zoteroDir, "zotero.sqlite") + "?mode=ro&_pragma=busy_timeout(5000)"
+	live, err := sql.Open("sqlite", liveDSN)
+	if err != nil {
+		return fmt.Errorf("opening live zotero.sqlite read-only: %w", err)
+	}
+	defer live.Close()
+
+	if _, err := live.ExecContext(ctx, "VACUUM INTO ?", scratchPath); err != nil {
+		return fmt.Errorf("VACUUM INTO: %w", err)
+	}
+	return nil
+}
+
+// copyZoteroDatabaseFallback copies zotero.sqlite, and its -wal/-shm
+// siblings when present, into tmpDir at the OS level -- the approach
+// PRIV-4 replaced with VACUUM INTO, kept here as the fallback for the one
+// case VACUUM INTO cannot handle: Zotero itself holding zotero.sqlite open
+// in a locking mode that refuses a second reader. Three independent
+// io.Copy calls give up the single-transaction consistency VACUUM INTO
+// has, so this instead stats zotero.sqlite and zotero.sqlite-wal (size and
+// modification time) immediately before and after the copy: identical
+// stats on both sides mean Zotero's own writer did not touch either file
+// during the window this function had them open, which is the actual
+// evidence the copy is whole. PRAGMA quick_check cannot be that evidence
+// by itself -- a WAL truncated exactly on a page boundary mid-copy still
+// parses as a valid, merely stale, database. Up to 3 attempts are made
+// before giving up and naming the contention.
+func copyZoteroDatabaseFallback(ctx context.Context, zoteroDir, tmpDir string) error {
+	const maxAttempts = 3
+	mainPath := filepath.Join(zoteroDir, "zotero.sqlite")
+	walPath := filepath.Join(zoteroDir, "zotero.sqlite-wal")
+
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		before := [2]fileSignature{statSignature(mainPath), statSignature(walPath)}
+
+		if err := copyFile(mainPath, filepath.Join(tmpDir, "zotero.sqlite")); err != nil {
+			return err
+		}
+		// zotero.sqlite-wal and zotero.sqlite-shm only exist while Zotero
+		// holds the database open in WAL mode, so their absence here is
+		// the normal case (Zotero not running, or fully checkpointed)
+		// rather than an error.
+		for _, name := range []string{"zotero.sqlite-wal", "zotero.sqlite-shm"} {
+			src := filepath.Join(zoteroDir, name)
+			if _, statErr := os.Stat(src); statErr != nil {
+				continue
+			}
+			if err := copyFile(src, filepath.Join(tmpDir, name)); err != nil {
+				return err
+			}
+		}
+
+		after := [2]fileSignature{statSignature(mainPath), statSignature(walPath)}
+		if before == after {
+			return nil
+		}
+		lastErr = errors.New("zotero.sqlite or its WAL changed while it was being copied")
+	}
+	return fmt.Errorf("zotero.sqlite snapshot unstable after %d attempts (Zotero is writing faster than this tool can copy it): %w", maxAttempts, lastErr)
+}
+
+// fileSignature is the size/modification-time pair
+// copyZoteroDatabaseFallback compares before and after a copy attempt. A
+// missing file signs as its zero value, so a file that appears or
+// disappears mid-copy -- Zotero starting or finishing a WAL checkpoint --
+// also counts as a change and triggers a retry.
+type fileSignature struct {
+	size    int64
+	modTime int64
+}
+
+func statSignature(path string) fileSignature {
+	info, err := os.Stat(path)
+	if err != nil {
+		return fileSignature{}
+	}
+	return fileSignature{size: info.Size(), modTime: info.ModTime().UnixNano()}
 }
 
 func copyFile(src, dst string) (err error) {
@@ -223,6 +378,29 @@ func copyFile(src, dst string) (err error) {
 	}()
 	if _, err = io.Copy(out, in); err != nil {
 		return fmt.Errorf("copying %s to %s: %w", src, dst, err)
+	}
+	return nil
+}
+
+// verifySnapshot opens the finished snapshot at path and requires PRAGMA
+// quick_check to report exactly "ok" before Load is allowed to use it --
+// the check both snapshot paths share, and on the fallback path the last
+// line of defense on top of copyZoteroDatabaseFallback's own stat-based
+// consistency check.
+func verifySnapshot(ctx context.Context, path string) error {
+	dsn := "file:" + path + "?mode=ro&_pragma=busy_timeout(5000)"
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return fmt.Errorf("opening zotero.sqlite snapshot for verification: %w", err)
+	}
+	defer db.Close()
+
+	var result string
+	if err := db.QueryRowContext(ctx, "PRAGMA quick_check").Scan(&result); err != nil {
+		return fmt.Errorf("running quick_check on zotero.sqlite snapshot: %w", err)
+	}
+	if result != "ok" {
+		return fmt.Errorf("zotero.sqlite snapshot failed integrity check: %s", result)
 	}
 	return nil
 }
@@ -313,19 +491,50 @@ func dedupOnePerParent(candidates []candidate) ([]candidate, []Skip) {
 	return kept, skips
 }
 
-// resolveAttachmentPath turns a Zotero attachment's linkMode and stored path
-// into a filesystem path. linkMode 3 (linked_url) points at a web page, not
-// a local file, and any linkMode this library has not been observed to use
-// is treated the same way — as a Skip — rather than guessed at.
-func resolveAttachmentPath(zoteroDir string, c candidate) (string, error) {
+// resolveAttachmentPath turns a Zotero attachment's linkMode and stored
+// path into a filesystem path. linkMode 3 (linked_url) points at a web
+// page, not a local file, and any linkMode this library has not been
+// observed to use is treated the same way — as a Skip — rather than
+// guessed at.
+//
+// linkMode 2 (linked_file) is the one case where the stored path can be
+// relative: an "attachments:"-prefixed path resolves against whatever the
+// operator set as Zotero's Linked Attachment Base Directory, passed in as
+// baseAttachmentPath/haveBaseAttachmentPath (see linkedAttachmentBasePath).
+// VAL-2 found the previous behaviour — joining the relative path onto
+// zoteroDir/linked-attachments — resolved against a directory Zotero
+// itself never reads or writes; it was inert on a library where the pref
+// happens to be unset (every linkMode 2 row here is already absolute) and
+// silently wrong on any library where the operator actually configured
+// it. When the pref is unset and a relative path shows up anyway, that is
+// reported as its own condition — the base directory is unknown — rather
+// than folded into "file not found", which would tell the operator their
+// file is missing when the true fact is that this harness does not know
+// where to look for it.
+func resolveAttachmentPath(zoteroDir, baseAttachmentPath string, haveBaseAttachmentPath bool, c candidate) (string, error) {
 	var path string
 	switch c.linkMode {
 	case 0, 1: // imported_file, imported_url: copied into Zotero's own storage.
 		name := strings.TrimPrefix(c.path, "storage:")
+		// PRIV-5: this path column is DB-supplied, and for a group
+		// library it arrives over sync from whoever added the item, not
+		// necessarily this operator. filepath.Join below would silently
+		// clean a ".." component into an escape from storage/<KEY>/, so a
+		// name that tries to leave that directory — or is exactly ".." —
+		// is rejected outright instead of resolved. Ten rows in this
+		// library already contain "..", and none of them also contains a
+		// path separator, which is the only reason none currently
+		// escapes.
+		if name == ".." || strings.ContainsAny(name, "/\\") {
+			return "", errors.New("storage attachment name escapes its own directory")
+		}
 		path = filepath.Join(zoteroDir, "storage", c.attachmentKey, name)
-	case 2: // linked_file: relative to linked-attachments, or an absolute path.
+	case 2: // linked_file: resolved against the operator's configured base directory, or already absolute.
 		if rel, ok := strings.CutPrefix(c.path, "attachments:"); ok {
-			path = filepath.Join(zoteroDir, "linked-attachments", rel)
+			if !haveBaseAttachmentPath {
+				return "", errors.New("linked attachment base path not configured: set extensions.zotero.baseAttachmentPath in Zotero (Advanced > Files and Folders > Linked Attachment Base Directory)")
+			}
+			path = filepath.Join(baseAttachmentPath, rel)
 		} else {
 			path = c.path
 		}
@@ -336,6 +545,70 @@ func resolveAttachmentPath(zoteroDir string, c candidate) (string, error) {
 		path = abs
 	}
 	return path, nil
+}
+
+// linkedAttachmentBasePath reads <zoteroDir>/prefs.js for
+// extensions.zotero.baseAttachmentPath — the directory Zotero itself
+// resolves a linkMode 2 attachment's "attachments:"-prefixed relative path
+// against. ok is false when the line is absent, which callers must treat
+// as "unknown", not as any kind of file-not-found: there is nothing to
+// resolve against, a different fact from a resolved path not existing.
+func linkedAttachmentBasePath(zoteroDir string) (string, bool) {
+	data, err := os.ReadFile(filepath.Join(zoteroDir, "prefs.js"))
+	if err != nil {
+		return "", false
+	}
+	m := baseAttachmentPathPref.FindSubmatch(data)
+	if m == nil {
+		return "", false
+	}
+	return unescapeJSString(string(m[1])), true
+}
+
+// unescapeJSString reverses the backslash-escaping Zotero's own
+// preference writer applies to a JS string literal: a literal backslash is
+// doubled and a double quote is escaped, which are the only two sequences
+// prefs.js ever produces inside a filesystem path.
+func unescapeJSString(s string) string {
+	return strings.NewReplacer(`\"`, `"`, `\\`, `\`).Replace(s)
+}
+
+// papioDataDir returns the root of papio's own data directory, so
+// candidates that resolve inside it can be excluded (see the VAL-1 comment
+// in Load). It calls config.Default().DataDir — the same baseline
+// defaultDataDir() logic every other component in this module falls back
+// to (~/.local/share/papio, or %LOCALAPPDATA%\papio on Windows) — rather
+// than config.Load(""), deliberately: Load parses and strictly validates
+// the operator's live config.toml (rejecting unknown fields, requiring a
+// valid access_mode, and every other setting besides), none of which this
+// harness has any use for, and a config error that has nothing to do with
+// Zotero or papio's artifact tree would then abort corpus measurement for
+// a reason unrelated to either. Default() reaches exactly the tree an
+// operator who has not overridden data_dir is actually using, which is the
+// case VAL-1 needs to catch.
+func papioDataDir() string {
+	dir := config.Default().DataDir
+	if abs, err := filepath.Abs(dir); err == nil {
+		dir = abs
+	}
+	return dir
+}
+
+// underDir reports whether path lies at or beneath dir, comparing cleaned
+// absolute paths lexically. Both papioDataDir and resolveAttachmentPath
+// already run their results through filepath.Abs, and a symlink escape
+// into or out of papio's data directory is not the threat model VAL-1
+// addresses — it only needs to catch a Zotero attachment path that was
+// written pointing at papio's own tree.
+func underDir(path, dir string) bool {
+	if dir == "" {
+		return false
+	}
+	rel, err := filepath.Rel(dir, path)
+	if err != nil {
+		return false
+	}
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))
 }
 
 // buildWork assembles the curated work.Work a parent bibliographic item
@@ -522,11 +795,136 @@ feed:
 	return outDocs, outSkips, nil
 }
 
+// validateCacheDir creates cacheDir if needed and refuses to use it when a
+// co-tenant could have staged it first. os.MkdirAll silently adopts a
+// pre-existing directory regardless of who owns it or how permissive its
+// mode is, and the default cache location is $TMPDIR — per-user on macOS,
+// but shared /tmp on Linux, where any other local user can plant a
+// directory at the exact path this harness is about to write hundreds of
+// files of front matter into. A symlinked cacheDir is refused for the same
+// reason a planted symlink at an individual cache file matters (see
+// writeCacheEntry): a directory another user owns, or that group or other
+// can write into, hands that user the ability to enumerate every
+// attachment key this run touches (each cache filename is
+// key-size-mtime.txt) or to poison an entry a later run would then treat
+// as already-extracted text.
+func validateCacheDir(cacheDir string) error {
+	if err := os.MkdirAll(cacheDir, 0o700); err != nil {
+		return fmt.Errorf("creating cache directory: %w", err)
+	}
+	info, err := os.Lstat(cacheDir)
+	if err != nil {
+		return fmt.Errorf("checking cache directory: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("cache directory is a symlink; refusing to use it")
+	}
+	if !info.IsDir() {
+		return errors.New("cache path exists and is not a directory")
+	}
+	if info.Mode().Perm()&0o022 != 0 {
+		return errors.New("cache directory is writable by group or other; refusing to use it")
+	}
+	if uid, ok := fileOwnerUID(info); ok && uid != uint32(os.Getuid()) {
+		return errors.New("cache directory is not owned by the current user; refusing to use it")
+	}
+	return nil
+}
+
+// fileOwnerUID returns info's owning user id, on the platforms whose
+// os.FileInfo.Sys() carries one. It goes through reflect rather than a
+// syscall.Stat_t type assertion so this file keeps compiling everywhere —
+// syscall.Stat_t does not exist on Windows, whose Sys() returns something
+// else entirely — instead of needing a second, build-tagged file just for
+// this one check. ok is false wherever the field is absent, and
+// validateCacheDir simply skips the ownership half of its check there:
+// Windows has no POSIX owner/group-writable model for the other half to
+// complain about either.
+func fileOwnerUID(info os.FileInfo) (uid uint32, ok bool) {
+	v := reflect.ValueOf(info.Sys())
+	if v.Kind() == reflect.Ptr {
+		v = v.Elem()
+	}
+	if v.Kind() != reflect.Struct {
+		return 0, false
+	}
+	f := v.FieldByName("Uid")
+	if !f.IsValid() || f.Kind() != reflect.Uint32 {
+		return 0, false
+	}
+	return uint32(f.Uint()), true
+}
+
+// writeCacheEntry writes text to cachePath by creating a same-directory
+// temp file with O_EXCL — refusing to follow or overwrite anything already
+// there — and renaming it into place. VAL-6/PRIV-3b found the previous
+// os.WriteFile(cachePath, ...) left two openings: a process killed
+// mid-write left a truncated file the read path's `len(cached) > 0` check
+// accepted as a complete (and silently wrong) extraction result, and
+// WriteFile follows symlinks, so a planted symlink at a cache filename
+// could redirect the write anywhere this process can write.
+// validateCacheDir already keeps a co-tenant from placing anything inside
+// cacheDir at all; this is the other half, for the write itself.
+func writeCacheEntry(cachePath string, text []byte) error {
+	tmp := cachePath + ".tmp." + strconv.Itoa(os.Getpid())
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(text); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, cachePath); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return nil
+}
+
+// classifyExtractionFailure reduces pdf.ExtractText's evidence trail — in
+// several cases poppler's own stderr, which routinely names the file it
+// was reading — to one of the report's coarse, path-free classes. PRIV-2
+// found the previous behaviour, joining every evidence line verbatim into
+// the Skip reason, printed the resolved absolute path once and then
+// poppler's own filename-bearing message a second time inside it; a Skip
+// reason has to survive being pasted into a bug report unread, so nothing
+// the tool chose to say about this particular file leaves this function,
+// only which of a fixed, small set of things went wrong.
+func classifyExtractionFailure(evidence []string) string {
+	joined := strings.Join(evidence, "; ")
+	switch {
+	case strings.Contains(joined, "exceeds") && strings.Contains(joined, "bytes"):
+		// pdftotext's own output-cap guard (see runTextTool in
+		// internal/pdf/semantic.go). VAL-3 found this one condition
+		// accounts for 38 of 77 skips, and hits 44% of book candidates
+		// against 1.7% of journal articles, which is exactly the kind of
+		// silent thinning the report's summary needs to surface as one
+		// number instead of 38 identical stderr lines.
+		return "output cap"
+	case strings.Contains(joined, "deadline") || strings.Contains(joined, "context canceled"):
+		return "extraction failed: timed out"
+	case strings.Contains(joined, "capability:"):
+		return "extraction failed: required tool unavailable"
+	case strings.Contains(joined, "OCR"):
+		return "extraction failed: OCR did not recover usable text"
+	case joined == "":
+		return "extraction failed: no text extracted"
+	default:
+		return "extraction failed: pdftotext reported an error"
+	}
+}
+
 // extractOne extracts (or reuses cached) text for one prepared candidate. A
 // bad or unreadable PDF here becomes a Skip, never an error returned up to
-// Load: over roughly 789 PDFs some are always going to be encrypted,
+// Load: over roughly 679 PDFs some are always going to be encrypted,
 // corrupt, or scanned with no usable text layer, and one such file must not
-// cost the harness the other 780.
+// cost the harness the rest.
 func extractOne(ctx context.Context, p prepared, capability pdf.Capability, opts pdf.SemanticOptions, cacheDir string) (Document, Skip, bool) {
 	base := Document{Key: p.cand.attachmentKey, ParentKey: p.cand.parentKey, Path: p.path, Work: p.work}
 
@@ -546,25 +944,20 @@ func extractOne(ctx context.Context, p prepared, capability pdf.Capability, opts
 
 	report, err := pdf.ExtractText(ctx, p.path, capability, opts)
 	if err != nil {
-		return Document{}, Skip{Key: p.cand.attachmentKey, Reason: fmt.Sprintf("extraction failed: %v", err)}, false
+		return Document{}, Skip{Key: p.cand.attachmentKey, Reason: classifyExtractionFailure([]string{err.Error()})}, false
 	}
 	if report.Excerpt == "" {
-		reason := "empty extracted text"
-		if len(report.Evidence) > 0 {
-			reason = strings.Join(report.Evidence, "; ")
-		}
-		return Document{}, Skip{Key: p.cand.attachmentKey, Reason: reason}, false
+		return Document{}, Skip{Key: p.cand.attachmentKey, Reason: classifyExtractionFailure(report.Evidence)}, false
 	}
 
 	if cachePath != "" {
-		// Extraction over ~789 PDFs runs in minutes, and this harness is run
-		// twice per rule change (before and after); caching the excerpt is
-		// what keeps the second run seconds instead of minutes. Cache
-		// misses are silently tolerated — a full re-run is always correct,
-		// just slower — but a write failure never fails the document.
-		if err := os.MkdirAll(cacheDir, 0o700); err == nil {
-			_ = os.WriteFile(cachePath, []byte(report.Excerpt), 0o600)
-		}
+		// Load's validateCacheDir already confirmed cacheDir is a
+		// private, current-user-owned directory and created it, so the
+		// only thing left to get right here is not leaving a torn entry
+		// behind if this process is killed mid-write; see writeCacheEntry.
+		// A write failure is still silently tolerated — a full re-run is
+		// always correct, just slower — but it never fails the document.
+		_ = writeCacheEntry(cachePath, []byte(report.Excerpt))
 	}
 
 	base.Text = report.Excerpt

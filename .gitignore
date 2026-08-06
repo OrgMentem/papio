@@ -24,3 +24,11 @@ __pycache__/
 
 # Scratch tier: throwaway dev artifacts (oracle one-shots, etc.)
 dev/scratch/
+
+# identity-corpus capture output: before.txt/after.txt/report.json name
+# every paper, author surname, and DOI in the operator's Zotero library —
+# dev/scratch/ above already covers the recommended capture location, but
+# these guard the repo root too in case a capture lands there by habit.
+/before.txt
+/after.txt
+/report.json

@@ -88,6 +88,30 @@ execution records in `notes/acquisition-stack-plan.md`.
 
 ### Changed
 
+- **`make identity-corpus` no longer grades the identity rules on papio's own
+  output.** 47 of the 679 documents it scored resolved, through Zotero
+  linked-file attachments, into papio's own artifact, bundle, and staging
+  directories — 9 of them artifacts papio itself delivered and had already
+  scored. Every one of the 47 passed, which is what recycled output looks like,
+  and independence from it was the whole reason the corpus reads Zotero rather
+  than papio's store. They are now excluded by name and counted in the report's
+  new skip summary, alongside the long documents the 1 MiB extraction cap drops:
+  24 of 54 books against 11 of 637 journal articles, so the corpus is the
+  library minus most of its books and a book-shaped rule change cannot be judged
+  on it. The report says so rather than leaving the reader to assume otherwise.
+  A relative linked-file path is resolved against Zotero's own
+  `extensions.zotero.baseAttachmentPath` instead of a directory that was never
+  the base, and says so when the pref is unset rather than reporting a missing
+  file. The identifier-placement histogram asks the real matcher where an
+  identifier is printed, so the six documents whose DOI is stored as an EZproxy
+  URL are now reported as unusable metadata instead of as a window that needs
+  retuning. The library snapshot prefers an atomic `VACUUM INTO`, falls back to
+  a byte copy while Zotero holds the database open, retries a copy the WAL grew
+  under, and names which path it took. The extracted-text cache — the front
+  matter of every paper in the library — now defaults to a per-user cache
+  directory rather than shared `/tmp`, refuses a directory it does not own,
+  writes each entry atomically, and is documented as retained until deleted.
+  Skip lines name an attachment key and a class, never a path or a filename.
 - **The privacy policy now says what the daemon actually sends.** It claimed
   "*papio* collects no personal data. Nothing is sent to OrgMentem or any third
   party" while scoping itself to the daemon *and* the extension. That is true of

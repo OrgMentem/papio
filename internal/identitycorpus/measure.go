@@ -61,9 +61,12 @@ type PairResult struct {
 	Evidence  []string
 }
 
-// OffsetBucket is one row of the OwnIdentifier histogram: how many documents
-// print their own requested identifier in a given region of the extracted
-// text, or not at all.
+// OffsetBucket is one row of a histogram: a label and how many items fell
+// into it. Report uses this same shape for two different tallies —
+// OwnIdentifier (where a document prints its own requested identifier) and
+// SkipsByReason (why a candidate never became a document at all) — so the
+// type itself carries no assumption about which histogram a given slice
+// holds.
 type OffsetBucket struct {
 	Label string
 	Count int
@@ -81,6 +84,17 @@ type Report struct {
 	WrongAccepts    []PairResult
 	CorrectParks    []PairResult
 	OwnIdentifier   []OffsetBucket
+	// SkipsByReason tallies the candidates that never became a Document, one
+	// row per coarse reason class, sorted by descending count then label so
+	// two runs over the same library render identically. Measure does not
+	// populate this field: Load's skips never reach Measure, and giving
+	// Measure a path to them would couple corpus loading to identity
+	// measurement for a field that has nothing to do with either document's
+	// identity verdict. The caller in cmd/identity-corpus classifies the
+	// []Skip it already holds, sorts it, and assigns this field before
+	// calling Render. Leave it nil rather than wiring skips through Measure
+	// to fill it in.
+	SkipsByReason []OffsetBucket
 }
 
 // hasUsableMetadata reports whether target carries anything MatchIdentity
@@ -118,29 +132,43 @@ func sameWork(a, b work.Work) bool {
 	return false
 }
 
-// primaryIdentifier returns the strong identifier a document's own metadata
-// requested, preferring DOI, then PMID, then arXiv id — the same priority
-// corroboratingIdentifier in identity.go applies when it looks for a
-// document's own identifier, so the histogram below is asking the same
-// question the production rule asks, not a differently-ordered one.
-func primaryIdentifier(target work.Work) (string, bool) {
-	switch {
-	case target.DOI != "":
-		return target.DOI, true
-	case target.PMID != "":
-		return target.PMID, true
-	case target.ArXiv != "":
-		return target.ArXiv, true
-	default:
-		return "", false
+// requestedIdentifier reports whether target's metadata names any strong
+// identifier at all — DOI, PMID, or arXiv id — regardless of whether the
+// rules in identity.go could ever use it. classifyOwnIdentifier asks this
+// first: a document whose metadata requests nothing has no window question
+// to ask, which is a different fact from a document that requests an
+// identifier the rules cannot corroborate.
+func requestedIdentifier(target work.Work) bool {
+	return target.DOI != "" || target.PMID != "" || target.ArXiv != ""
+}
+
+// identifierUsable reports whether at least one of target's requested
+// identifiers is one identity.go's rules could ever corroborate. A DOI must
+// survive work.NormalizeDOI — six documents in one real library store their
+// DOI as an EZproxy-rewritten URL
+// ("http://dx.doi.org.ezproxy.…/10.1023/A:1009048817385"), which
+// NormalizeDOI rejects outright, so no window would ever find a match for
+// them. PMID and arXiv carry no equivalent validation in identity.go —
+// corroboratingIdentifier accepts either under the right label whenever it
+// is non-empty — so their metadata is usable as soon as it is present.
+func identifierUsable(target work.Work) bool {
+	if target.DOI != "" {
+		if _, err := work.NormalizeDOI(target.DOI); err == nil {
+			return true
+		}
 	}
+	return strings.TrimSpace(target.PMID) != "" || strings.TrimSpace(target.ArXiv) != ""
 }
 
 // Histogram bucket labels, in the fixed order Render and Measure both use.
-// The order matters: a document is filed under the first window that
-// contains its identifier, so front matter must be tested before page one,
-// and page one before the rest of the excerpt.
+// The order matters: a document whose only requested identifiers the rules
+// can never use is filed under "identifier unusable" before any window is
+// even consulted, because no window would change that answer; a document
+// with a usable identifier is then filed under the first window that
+// contains it, so front matter must be tested before page one, and page one
+// before the rest of the excerpt.
 const (
+	bucketUnusable    = "identifier unusable"
 	bucketFrontMatter = "front matter (1 KiB)"
 	bucketPageOne     = "page one (4 KiB)"
 	bucketLater       = "later in excerpt"
@@ -149,31 +177,37 @@ const (
 )
 
 // classifyOwnIdentifier reports where doc prints its own requested
-// identifier, using pdf.IdentityWindows so this histogram measures the exact
-// windows identity.go's rules read rather than a second, potentially
-// divergent, copy of their bounds — the whole point of this bucket is to show
-// whether those bounds are still well-tuned, which only works if it is
-// looking through the same window the rules do.
+// identifier, using pdf.IdentityWindows for the window boundaries and
+// pdf.IdentifierPrinted to decide whether a given window corroborates —
+// exactly the same functions identity.go's own rules use, so this histogram
+// measures where the RULES can see an identifier rather than a second,
+// potentially divergent, copy of what counts as a match. A bare substring
+// scan here would count a DOI the matcher rejects (wrong normalization) as
+// found, and miss one the matcher accepts through letter-spacing tolerance,
+// making the bucket a decorative number at exactly the moment someone is
+// retuning a bound.
 //
 // The byline window IdentityWindows also returns is deliberately not a
 // bucket here: it exists to scope the author check, not to place an
 // identifier, and identity.go's own front-matter/page-one rules never read it
 // for that purpose either.
 func classifyOwnIdentifier(doc Document) string {
-	id, ok := primaryIdentifier(doc.Work)
-	if !ok {
+	target := doc.Work
+	if !requestedIdentifier(target) {
 		return bucketNoIdentity
 	}
-	needle := strings.ToLower(id)
+	if !identifierUsable(target) {
+		return bucketUnusable
+	}
 	frontMatter, _, pageOne := pdf.IdentityWindows(doc.Text)
 	switch {
-	case strings.Contains(strings.ToLower(frontMatter), needle):
+	case pdf.IdentifierPrinted(frontMatter, target):
 		return bucketFrontMatter
-	case strings.Contains(strings.ToLower(pageOne), needle):
+	case pdf.IdentifierPrinted(pageOne, target):
 		// pageOne is itself a prefix of frontMatter's superset, so a hit here
 		// that missed the frontMatter check above lies strictly beyond it.
 		return bucketPageOne
-	case strings.Contains(strings.ToLower(doc.Text), needle):
+	case pdf.IdentifierPrinted(doc.Text, target):
 		return bucketLater
 	default:
 		return bucketNotPrinted
@@ -234,7 +268,7 @@ func Measure(docs []Document) Report {
 	for _, doc := range docs {
 		buckets[classifyOwnIdentifier(doc)]++
 	}
-	for _, label := range []string{bucketFrontMatter, bucketPageOne, bucketLater, bucketNotPrinted, bucketNoIdentity} {
+	for _, label := range []string{bucketUnusable, bucketFrontMatter, bucketPageOne, bucketLater, bucketNotPrinted, bucketNoIdentity} {
 		report.OwnIdentifier = append(report.OwnIdentifier, OffsetBucket{Label: label, Count: buckets[label]})
 	}
 
@@ -277,6 +311,15 @@ func percent(n, of int) float64 {
 	return float64(n) / float64(of) * 100
 }
 
+// skipReasonOutputCap is the exact label cmd/identity-corpus assigns a
+// Report.SkipsByReason row for a candidate that extraction dropped for
+// exceeding the output-size cap (see the field comment on Report). Render
+// matches on this literal to decide whether to print the book-bias sentence
+// below, so the string is a contract between the two packages, not free text
+// — changing it here without changing the classifier silently turns the
+// sentence off.
+const skipReasonOutputCap = "output cap"
+
 // Render renders the report as aligned plain text with no ANSI colour, so it
 // reads the same in a terminal, a log file, or a CI artifact.
 func (r Report) Render() string {
@@ -288,6 +331,24 @@ func (r Report) Render() string {
 	fmt.Fprintf(w, "metadata records\t%d\n", r.MetadataRecords)
 	fmt.Fprintf(w, "correct pairs (doc vs its own metadata)\t%d\n", r.CorrectPairs)
 	fmt.Fprintf(w, "mismatched pairs (doc vs every other document's metadata)\t%d\n", r.MismatchedPairs)
+	w.Flush()
+
+	fmt.Fprintf(w, "\nskipped candidates (excluded from the corpus counted above, by reason)\n")
+	if len(r.SkipsByReason) == 0 {
+		fmt.Fprintf(w, "no candidates skipped\n")
+	} else {
+		fmt.Fprintf(w, "reason\tcount\n")
+		var outputCap int
+		for _, bucket := range r.SkipsByReason {
+			fmt.Fprintf(w, "%s\t%d\n", bucket.Label, bucket.Count)
+			if bucket.Label == skipReasonOutputCap {
+				outputCap = bucket.Count
+			}
+		}
+		if outputCap > 0 {
+			fmt.Fprintf(w, "output cap alone accounts for %d of the skips above — in the operator's library it dropped 24 of 54 books (44%%) against 11 of 637 journal articles (1.7%%), so the corpus below is the library minus most of its books, and book front matter (often no DOI, editor-as-author bylines) is exactly what the author rules are being judged on\n", outputCap)
+		}
+	}
 	w.Flush()
 
 	fmt.Fprintf(w, "\ncorrect pairs — every one of these SHOULD pass\n")

@@ -14,7 +14,7 @@ authenticated browser session — it never drives a separate/automated browser.
 go build ./...
 go test ./internal/config ./internal/protocol ./internal/browser   # scope to what you touch
 go vet ./...
-make identity-corpus   # measure the PDF identity rules against your Zotero library
+make identity-corpus   # measure the PDF identity rules against your Zotero library — reads your own library and its output names your own papers, don't paste it anywhere
 
 # Extension (bun)
 cd extension
