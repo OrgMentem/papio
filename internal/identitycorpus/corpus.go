@@ -240,6 +240,9 @@ func queryCandidates(ctx context.Context, db *sql.DB) ([]candidate, error) {
 		placeholders[i] = "?"
 		args[i] = t
 	}
+	// The only interpolation is a comma-joined run of "?" placeholders built
+	// two lines up; every value rides args through the driver's binding.
+	// #nosec G201
 	query := fmt.Sprintf(`
 		SELECT att.key, att.itemID, par.key, par.itemID, ia.linkMode, ia.path
 		FROM itemAttachments ia

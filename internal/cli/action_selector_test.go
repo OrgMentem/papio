@@ -50,9 +50,7 @@ func handoffRoot(t *testing.T, out, errOut *bytes.Buffer, opened *[]string) *cob
 			*result.(*api.JobsPage) = api.JobsPage{Jobs: rows}
 		case "actions.open":
 			if opened != nil {
-				for _, id := range params.(map[string]any)["job_ids"].([]string) {
-					*opened = append(*opened, id)
-				}
+				*opened = append(*opened, params.(map[string]any)["job_ids"].([]string)...)
 			}
 			*result.(*api.ActionsOpenResult) = api.ActionsOpenResult{Queued: 1, SessionLive: true}
 		default:
