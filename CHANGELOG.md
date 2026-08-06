@@ -88,6 +88,36 @@ execution records in `notes/acquisition-stack-plan.md`.
 
 ### Changed
 
+- **A paper now has to print the requested title, not merely contain its
+  vocabulary.** Title identity was unordered token membership — stopwords and
+  every word under five runes discarded, 60% of the remainder enough to pass —
+  and the corpus harness showed all 52 of its wrong accepts came through that one
+  gate, in three families. "How to do a meta-analysis" reduces to the single
+  token `analysis`, which matched eight unrelated papers by an author of the same
+  surname. "Final Report - Volume 3, Impacts" discards the `3` for being one rune
+  long, so eighteen pairs of a seventeen-volume government report matched each
+  other on the words they share. And a set cannot tell "Core reporting practices
+  in structural equation modeling" from "Update to core reporting practices in
+  structural equation modeling", which matched 5/5.
+
+  A pass now also requires the title to be printed as a delimited unit in the
+  front matter: the whole requested title, every short word and stopword
+  included, beginning where a line begins or a label of at most three words ends
+  ("Original Article:", "1."), ending where the line ends or punctuation does,
+  and spanning consecutive lines where it wraps. A hyphen broken across the line
+  break rejoins first, and a running head glued on with a run of spaces is split
+  off, so the shapes a text layer actually produces still match.
+
+  `titleThreshold` therefore means something different: it is the floor below
+  which a candidate is rejected, not a level at which a partial title match
+  passes. A 3/5 match with a matching author and year is now review where it used
+  to be a pass — that combination was the single largest wrong-accept family.
+  Measured over 632 documents and 398,786 mismatched pairs: wrong accepts 52 → 2,
+  correct passes 586 → 559. The 27 documents that moved to review are the ones
+  token overlap can never separate — seven volumes of that numbered series,
+  one- and two-token titles like "Code of Ethics", a catalogue typo, and printed
+  subtitles that differ from the catalogue record — and papio parking a correct
+  paper costs a moment where filing the wrong one costs a library its trust.
 - **`make identity-corpus` no longer grades the identity rules on papio's own
   output.** 47 of the 679 documents it scored resolved, through Zotero
   linked-file attachments, into papio's own artifact, bundle, and staging

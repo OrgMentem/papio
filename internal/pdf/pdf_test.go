@@ -191,14 +191,32 @@ func TestMatchIdentity(t *testing.T) {
 	}
 }
 
+// titleThreshold is a REJECT FLOOR, not a pass level: below it a candidate
+// is rejected outright, but clearing it only keeps the candidate in play —
+// whether it actually PASSES depends on the printed-title-line requirement
+// below, at every threshold. This test used to assert that a 3/5 partial
+// title match PASSED at a 0.6 threshold, which is the exact unordered-
+// membership shortcut responsible for all 52 of the corpus's wrong accepts
+// (see the family tests further down), so the old assertion defended
+// precisely the bug the corpus exposed. The contract below is the fix:
+// reject below the floor, review above it without a printed title line, and
+// pass only once the full title is printed as its own line, at any
+// threshold that clears the floor.
 func TestMatchIdentityHonorsTitleThreshold(t *testing.T) {
 	target := work.Work{Title: "Quantum Networks Robustness Calibration Measurement", Authors: []string{"Lovelace"}, Year: 2026}
-	text := "Quantum networks robustness. Lovelace (2026)."
-	if got := MatchIdentityWithThreshold(text, target, 0.8); got.Result != IdentityReject {
-		t.Fatalf("80%% threshold result = %+v, want reject", got)
+	partial := "Quantum networks robustness. Lovelace (2026)."
+	if got := MatchIdentityWithThreshold(partial, target, 0.8); got.Result != IdentityReject {
+		t.Fatalf("80%% threshold result = %+v, want reject: 3/5 tokens is below the floor", got)
 	}
-	if got := MatchIdentityWithThreshold(text, target, 0.6); got.Result != IdentityPass {
-		t.Fatalf("60%% threshold result = %+v, want pass", got)
+	if got := MatchIdentityWithThreshold(partial, target, 0.6); got.Result != IdentityReview {
+		t.Fatalf("60%% threshold result = %+v, want review: 3/5 tokens clears the floor but the title is not printed as a line", got)
+	}
+	full := "Quantum Networks Robustness Calibration Measurement\nLovelace (2026)."
+	if got := MatchIdentityWithThreshold(full, target, 0.8); got.Result != IdentityPass {
+		t.Fatalf("80%% threshold result = %+v, want pass: the full title is printed as its own line", got)
+	}
+	if got := MatchIdentityWithThreshold(full, target, 0.6); got.Result != IdentityPass {
+		t.Fatalf("60%% threshold result = %+v, want pass: the full title is printed as its own line", got)
 	}
 }
 
@@ -933,5 +951,210 @@ func TestIdentityCorrectionMarkerDetectionDoesNotSoftenAGluedHeaderDOIMismatch(t
 		"Bob Clarke\n2025\ndoi:10.9999/other\n"
 	if got := MatchIdentity(erratum, target); got.Result != IdentityReject {
 		t.Fatalf("result = %+v, want the front-matter DOI mismatch to stand even behind a glued header", got)
+	}
+}
+
+// The tests below pin the printed-title requirement layered on top of the
+// token gate above. Measured over 632 documents and 398,786 mismatched
+// document/metadata pairs, the token gate alone let through 52 wrong
+// accepts and correctly passed 586/632 documents (92.7%); requiring the
+// title to be printed as a delimited line cut wrong accepts to 3, then to 2
+// once the label allowance below was capped at three words, at a cost of
+// correct passes falling to 559/632 (88.4%) — 27 documents newly parked,
+// dominated by exactly the shapes unordered token overlap can never tell
+// apart: the three families pinned first below.
+
+// identityTitleTokens drops every word under five runes, so "How to do a
+// meta-analysis" reduces to the single token {analysis} and matched 1/1
+// against 8 different documents in the corpus that happened to contain the
+// word "analysis" and an author whose surname the request also named. The
+// printed-title line requirement is the only thing that tells this apart
+// from the real paper, because the words it discards — "how", "to", "do",
+// "a" — are exactly the words that make this NOT a title about
+// meta-analysis. Without the printed-title check this passes on the 1/1
+// token overlap alone.
+func TestIdentityParksADegenerateTitleThatReducesToOneToken(t *testing.T) {
+	target := work.Work{Title: "How to do a meta-analysis", Authors: []string{"Ada Lovelace"}}
+	text := "Training Needs Analysis at Work\nAda Lovelace\n"
+	got := MatchIdentity(text, target)
+	if got.Result != IdentityReview {
+		t.Fatalf("result = %+v, want review: a single surviving token must not pass on its own", got)
+	}
+	if !strings.Contains(strings.Join(got.Evidence, " "), "requested title is not printed as a line in the front matter") {
+		t.Fatalf("evidence = %v, want the printed-title park named", got.Evidence)
+	}
+}
+
+// identityTitleTokens also drops any word one rune short of five, so "Final
+// Report - Volume 3, Impacts" reduces to {final, report, volume, impacts}
+// and discards the only word that tells one volume of a series from
+// another. Eighteen pairs of one 17-volume government report matched each
+// other at 3/4 this way. The printed-title check still requires the exact
+// printed word sequence, "3" included, so it catches the mismatch — "1"
+// where the request says "3" — that the token set threw away. Without the
+// printed-title check this passes on the 3/4 token overlap alone.
+func TestIdentityParksANumberedSeriesWhoseOnlyDiscriminatingWordIsADigit(t *testing.T) {
+	target := work.Work{Title: "Final Report - Volume 3, Impacts", Authors: []string{"Committee"}}
+	text := "Final Report - Volume 1, Our inquiry\nCommittee\n"
+	got := MatchIdentity(text, target)
+	if got.Result != IdentityReview {
+		t.Fatalf("result = %+v, want review: volume 1 must not stand in for volume 3", got)
+	}
+	if !strings.Contains(strings.Join(got.Evidence, " "), "requested title is not printed as a line in the front matter") {
+		t.Fatalf("evidence = %v, want the printed-title park named", got.Evidence)
+	}
+}
+
+// An unordered token set cannot tell a title from the same title with words
+// prepended: "Update to core reporting practices in structural equation
+// modeling" matched a request for "Core reporting practices in structural
+// equation modeling" at 5/5 tokens. The printed-title check requires the
+// phrase to BEGIN a segment (or a short label), so a phrase that starts
+// mid-clause — after two words with no punctuation before it — never
+// qualifies. Without the printed-title check this passes outright on 5/5.
+func TestIdentityParksASupersetTitleThatSharesEveryToken(t *testing.T) {
+	target := work.Work{
+		Title:   "Core reporting practices in structural equation modeling",
+		Authors: []string{"Ada Lovelace"}, Year: 2024,
+	}
+	text := "Update to core reporting practices in structural equation modeling\nAda Lovelace (2024).\n"
+	got := MatchIdentity(text, target)
+	if got.Result != IdentityReview {
+		t.Fatalf("result = %+v, want review: a superset title must not pass on 5/5 tokens alone", got)
+	}
+	if !strings.Contains(strings.Join(got.Evidence, " "), "requested title is not printed as a line in the front matter") {
+		t.Fatalf("evidence = %v, want the printed-title park named", got.Evidence)
+	}
+}
+
+// The shapes below are real documents the printed-title rule must keep
+// passing. Token-set membership alone already passed every one of these
+// before the rule existed and still does after, so each assertion checks
+// the specific "printed as a line" evidence string, not only the verdict —
+// a Result-only assertion would not notice the printed-title rule being
+// deleted.
+
+// A title legitimately wraps across two printed lines — the same Wiley
+// byline TestIdentityCorroboratesASingleMarkedAuthor exercises via a
+// page-one DOI, isolated here with no identifier at all so a regression in
+// consuming a wrapped title shows up as a park rather than being masked by
+// the corroboration branch.
+func TestIdentityAcceptsATitleWrappedAcrossTwoLines(t *testing.T) {
+	target := work.Work{
+		Title:   "Antecedents and trajectories of achievement goals: A self-determination theory perspective",
+		Authors: []string{"Ciani"},
+	}
+	text := "Antecedents and trajectories of achievement\ngoals: A self-determination theory perspective\nKeith D. Ciani\n"
+	got := MatchIdentity(text, target)
+	if got.Result != IdentityPass {
+		t.Fatalf("result = %+v, want pass on a title that wraps across two printed lines", got)
+	}
+	if !strings.Contains(strings.Join(got.Evidence, " "), "requested title printed as a line in the front matter") {
+		t.Fatalf("evidence = %v, want the printed-title line named", got.Evidence)
+	}
+}
+
+// The same title, broken one word earlier by justified-text hyphenation
+// exactly at the point it also wraps: "self-deter-\nmination" is one word a
+// publisher split across the line break, not "deter" followed by
+// "mination". Folding must run over the whole byline before ANY line is
+// split into segments, or the two halves land in different segments and
+// never rejoin — this fixture folds to the exact text of the wrap test
+// above, so a fold-after-split regression is what this test alone catches.
+func TestIdentityFoldsHyphenationBeforeSplittingTitleLines(t *testing.T) {
+	target := work.Work{
+		Title:   "Antecedents and trajectories of achievement goals: A self-determination theory perspective",
+		Authors: []string{"Ciani"},
+	}
+	text := "Antecedents and trajectories of achievement\ngoals: A self-deter-\nmination theory perspective\nKeith D. Ciani\n"
+	got := MatchIdentity(text, target)
+	if got.Result != IdentityPass {
+		t.Fatalf("result = %+v, want pass: folding must rejoin the hyphenated word before the line split", got)
+	}
+	if !strings.Contains(strings.Join(got.Evidence, " "), "requested title printed as a line in the front matter") {
+		t.Fatalf("evidence = %v, want the printed-title line named", got.Evidence)
+	}
+}
+
+// A publisher prints a short label ahead of the title — "Original Article:",
+// a numbered heading — and titleLabelWords tolerates it two ways: consumed
+// inline within one segment when a colon or period ends it, or recovered as
+// its own segment when pdftotext glues it to the title with a double space,
+// the same escape TestIdentityCorrectionMarkerSurvivesAGluedRunningHeader
+// defends for the correction marker. Both must still pass.
+func TestIdentityAcceptsATitleAfterAShortPublisherLabel(t *testing.T) {
+	target := work.Work{Title: "Robustness Calibration Measurement Networks", Authors: []string{"Ada Lovelace"}}
+	colon := MatchIdentity("Original Article: Robustness Calibration Measurement Networks\nAda Lovelace\n", target)
+	if colon.Result != IdentityPass {
+		t.Fatalf("result = %+v, want pass after a colon-terminated label", colon)
+	}
+	if !strings.Contains(strings.Join(colon.Evidence, " "), "requested title printed as a line in the front matter") {
+		t.Fatalf("evidence = %v, want the printed-title line named", colon.Evidence)
+	}
+	numbered := MatchIdentity("1.  Robustness Calibration Measurement Networks\nAda Lovelace\n", target)
+	if numbered.Result != IdentityPass {
+		t.Fatalf("result = %+v, want pass after a numbered heading glued by a double space", numbered)
+	}
+	if !strings.Contains(strings.Join(numbered.Evidence, " "), "requested title printed as a line in the front matter") {
+		t.Fatalf("evidence = %v, want the printed-title line named", numbered.Evidence)
+	}
+}
+
+// The title's end edge accepts punctuation as well as a line end, so a
+// title followed by its authors on the SAME printed line — the exact shape
+// TestMatchIdentity already relies on for its own title-match case — must
+// still count as printed rather than being read as a title with authors
+// appended to it.
+func TestIdentityAcceptsATitleFollowedByAuthorsOnTheSameLine(t *testing.T) {
+	target := work.Work{Title: "Deterministic Validation of Scholarly Article Identity", Authors: []string{"Ada Lovelace"}, Year: 2026}
+	text := "Deterministic Validation of Scholarly Article Identity. Ada Lovelace (2026)."
+	got := MatchIdentity(text, target)
+	if got.Result != IdentityPass {
+		t.Fatalf("result = %+v, want pass: punctuation closes the title as well as a line end", got)
+	}
+	if !strings.Contains(strings.Join(got.Evidence, " "), "requested title printed as a line in the front matter") {
+		t.Fatalf("evidence = %v, want the printed-title line named", got.Evidence)
+	}
+}
+
+// pdftotext glues a running head and page number onto the title's own
+// line — "J Sensor Syst 2025;12:1  <title>" — the same escape
+// TestIdentityCorrectionMarkerSurvivesAGluedRunningHeader defends for the
+// correction marker. Token-set membership never needed this recovery since
+// it ignores line structure entirely; only the printed-title line check
+// does, and without wide-gap segmentation the label allowance's three-word
+// cap refuses a five-word running head and parks this document.
+func TestIdentityRecoversATitleGluedToARunningHead(t *testing.T) {
+	target := work.Work{Title: "Sensor Network Calibration Under Adverse Weather", Authors: []string{"Priya Natarajan"}, Year: 2025}
+	text := "J Sensor Syst 2025;12:1  Sensor Network Calibration Under Adverse Weather\nPriya Natarajan\n2025\n"
+	got := MatchIdentity(text, target)
+	if got.Result != IdentityPass {
+		t.Fatalf("result = %+v, want pass: wide-gap segmentation must recover the title from a glued running head", got)
+	}
+	if !strings.Contains(strings.Join(got.Evidence, " "), "requested title printed as a line in the front matter") {
+		t.Fatalf("evidence = %v, want the printed-title line named", got.Evidence)
+	}
+}
+
+// The label allowance is capped at titleLabelWords (3) rather than left
+// unbounded because the other shape ahead of a genuine delimited title is a
+// sentence CITING it: "We extend and update the earlier Core reporting
+// practices in structural equation modeling, which …" is the shape of the
+// two wrong accepts that still survive this rule in the corpus. Six words
+// and no punctuation precede the title here, so it must not count as
+// printed even though the title itself is a perfect 5/5 token match.
+func TestIdentityCapsTheLabelAllowanceAtThreeWords(t *testing.T) {
+	target := work.Work{
+		Title:   "Core reporting practices in structural equation modeling",
+		Authors: []string{"Ada Lovelace"}, Year: 2024,
+	}
+	text := "We extend and update the earlier Core reporting practices in structural equation modeling, " +
+		"which we call CRP-2.\nAda Lovelace (2024).\n"
+	got := MatchIdentity(text, target)
+	if got.Result != IdentityReview {
+		t.Fatalf("result = %+v, want review: a citing sentence must not count as the label allowance", got)
+	}
+	if !strings.Contains(strings.Join(got.Evidence, " "), "requested title is not printed as a line in the front matter") {
+		t.Fatalf("evidence = %v, want the printed-title park named", got.Evidence)
 	}
 }

@@ -112,9 +112,9 @@ as you don't change the corpus loading itself between runs.
 Pair count is `N×(N−1)`, minus same-work exclusions (duplicate metadata
 rows describing one paper, which `sameWork` drops before scoring since
 pairing them isn't a real mismatch). In the reference library the corpus
-actually *scores* 679 documents — not the 789 raw PDF attachments above,
+actually *scores* 632 documents — not the 789 raw PDF attachments above,
 which include everything Load later skips — so `N×(N−1)` is
-679×678 = 460,362 candidate pairs, 460,352 after same-work exclusions.
+632×631 = 398,792 candidate pairs, 398,786 after same-work exclusions.
 `N` is `Report.Documents`; for your library it's whatever the corpus-size
 line at the top of your own report says, not a fixed constant and not the
 raw attachment count. Once text is cached, scoring that many pairs is
@@ -146,6 +146,92 @@ before/after on the **same library** (ideally the same cache) is a
 meaningful comparison. Don't read anything into "your machine says 12
 wrong accepts and mine says 3" — that's two different libraries, not two
 different rule sets.
+
+## Worked example: the printed-title rule
+
+This is the first rule change this harness judged, and the shape every
+later change to `internal/pdf/identity.go` should follow.
+
+**The instrument found the weakness, not a reviewer.** A `before.txt`
+capture on the reference library showed 52 wrong accepts, and every one of
+them came through the same gate: `identityTitleTokens`, which drops
+stopwords and every word under five runes, then passes at 60% overlap of
+what's left. Three failure families fell out of reading the pairs:
+
+- **Degenerate titles.** "How to do a meta-analysis" reduces to
+  `{analysis}` — one token, matching any paper that contains the word.
+  Titles this short or shorter accounted for 8 of the 52 wrong accepts.
+- **Numbered series.** "Final Report - Volume 3, Impacts" drops the `3`
+  (one rune, under the five-rune floor), so a multi-volume government
+  report's volumes matched each other.
+- **Superset titles.** An unordered token set can't distinguish "Core
+  reporting practices in structural equation modeling" from "Update to
+  core reporting practices in structural equation modeling" — both score
+  5/5 — nor a paper's title from a later paper's title that contains it.
+
+**The candidate rule and each increment, measured in turn.** The fix
+requires the requested title to be *printed as a delimited unit* — a line
+of its own, allowing for a short label and a hyphenated line break — in
+the byline window, on top of (not instead of) the unchanged token gate:
+
+| increment | wrong accepts | correct passes |
+|---|---|---|
+| before (token overlap only) | 52 | 586 (92.7%) |
+| + printed-title required | 3 | 560 |
+| + label allowance (≤3 words) | 2 | 559 (88.4%) |
+| − label allowance removed | 2 | 557 |
+
+The label allowance (tolerating a short prefix like "Original Article:" or
+"1." before the title) stayed: it recovers 2 correct passes — 557 → 559 —
+at zero cost in wrong accepts. An increment earns its place by moving one
+of these two numbers in the right direction; this one did, so it shipped.
+
+**The increment that didn't ship.** A trailing-superscript tolerance —
+loosening the end-of-phrase match to allow a footnote marker glued to the
+title's last word — was implemented and measured the same way. It changed
+neither number on 632 documents: still 2 wrong accepts, still 559 correct
+passes. It was deleted rather than shipped. The rule this leaves standing:
+an increment that moves neither number does not ship, on principle,
+because the harness exists precisely so a plausible-sounding tolerance has
+to earn its place instead of being taken on faith.
+
+**The cost, stated plainly.** 27 correct documents moved from pass to
+review. They are not a random sample — they're dominated by exactly what
+token overlap could never separate in the first place: 7 volumes of the
+numbered series report, generic one- and two-token titles ("Code of
+Ethics", "Organisational behaviour"), one metadata typo ("Fundamentals of
+EEF Measurement" cataloged against a paper titled about EEG), and papers
+whose printed subtitle differs from the catalogue record. The trade is
+deliberate: papio parking a correct paper costs a human a moment of
+review; papio filing the wrong paper costs a library its trust.
+
+**The two wrong accepts that survive, and why they're hard.** Both print
+the requested title as a genuinely delimited line, so `titlePrintedAsLine`
+has no way to tell them from an original: a technical report prints the
+requested title inside its own contents list, and a review paper prints it
+as one of its section headings. Neither is a label, a wrapped title, or a
+citation glued into running text — by every signal this rule reads, they
+*are* the title printed as a line. Separating them needs a signal this
+rule doesn't have: structural position — knowing that a byline window
+sitting inside a table of contents or under a numbered heading is not the
+document's own title line, which means knowing where the contents list or
+heading structure is, not just how a phrase is delimited.
+
+## How to judge a change
+
+1. Capture `before.txt` on an unmodified baseline.
+2. Change exactly one increment in `internal/pdf/identity.go` — not a
+   bundle of related tweaks; a bundle can't tell you which part earned its
+   place.
+3. Capture `after.txt` on the same library, same cache.
+4. Compare wrong accepts first. Any increase kills the increment,
+   regardless of what else it does.
+5. Compare correct passes second, and only once wrong accepts are flat or
+   lower.
+6. Revert the increment if it moves neither number — a change that
+   measures as a no-op is a no-op, whatever the code review said.
+7. Never quote the absolute counts as if they held on another library —
+   they're a property of one person's Zotero collection, not of the rule.
 
 ## Privacy
 

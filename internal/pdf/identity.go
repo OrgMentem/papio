@@ -176,6 +176,31 @@ func MatchIdentityWithThreshold(text string, target work.Work, titleThreshold fl
 
 	evidence := []string{fmt.Sprintf("title tokens matched: %d/%d", matches, len(tokens))}
 
+	// Token membership is a weak test and the corpus says exactly how weak: all
+	// 52 wrong accepts over 398,786 mismatched pairs came through this gate, in
+	// three families that share one cause. identityTitleTokens drops every word
+	// under five runes, so "How to do a meta-analysis" reduces to {analysis} and
+	// any paper by an author of that name clears 1/1; "Final Report - Volume 3,
+	// Impacts" throws away the 3, so eighteen pairs of a numbered government
+	// series matched each other at 3/4; and an unordered set cannot tell "Core
+	// reporting practices in structural equation modeling" from "Update to core
+	// reporting practices in structural equation modeling", which matched 5/5.
+	//
+	// A publisher prints the title as its own line, or as consecutive lines
+	// where it wraps. Requiring that — the whole requested title, every short
+	// word and stopword included, beginning at the start of a segment and ending
+	// at the end of one — is what separates those three families from a real
+	// match, because the tokens the set gate discards are precisely the ones
+	// that distinguish a title from a title with words prepended.
+	//
+	// It is a REQUIREMENT for the final pass, not a substitute for the token
+	// gate above: a scan whose title line is garbled still reaches review or a
+	// corroborated pass on its printed identifier, never a discard.
+	titlePrinted := titlePrintedAsLine(bylineSegments(bylineText), identityTitlePhrase(target.Title))
+	if titlePrinted {
+		evidence = append(evidence, "requested title printed as a line in the front matter")
+	}
+
 	exact, prefixed, numbered := 0, 0, 0
 	for _, author := range target.Authors {
 		switch family := familyToken(author); {
@@ -266,8 +291,144 @@ func MatchIdentityWithThreshold(text string, target work.Work, titleThreshold fl
 		return capReview(append(evidence, "no requested author family name in the front matter")...)
 	case yearConflict:
 		return capReview(append(evidence, fmt.Sprintf("front matter is dated differently to the requested year %d", target.Year))...)
+	case !titlePrinted:
+		return capReview(append(evidence, "requested title is not printed as a line in the front matter")...)
 	}
 	return capPass(evidence...)
+}
+
+// identityTitlePhrase is the requested title as the word sequence a publisher
+// prints it in, keeping the short words and stopwords identityTitleTokens
+// discards. Those words carry no weight in a membership test and all the weight
+// in an ordering one: "update to" is what makes a different paper out of the
+// same five significant words.
+func identityTitlePhrase(title string) []string { return normalizedTokens(title) }
+
+// titleSegment is one printed run of words plus where punctuation fell inside
+// it. Both edges matter: a title is a punctuation-delimited or line-delimited
+// unit, and which side of it a stray word sits on is the whole question. A
+// phrase that begins mid-clause is a title with words prepended — "Update to
+// core reporting practices in structural equation modeling" against a request
+// for "Core reporting practices in structural equation modeling", which matched
+// 5/5 tokens in the corpus — while a phrase that ends mid-clause is a title
+// quoted inside a longer one, which is what "Getting Safety Leadership Right"
+// does to a request for "Safety Leadership".
+type titleSegment struct {
+	words []string
+	// breaks[i] reports that punctuation, not a plain space, followed words[i].
+	breaks []bool
+}
+
+// bylineSegments returns the byline window as the runs a publisher printed on
+// their own lines, split further where pdftotext glued a running head, a page
+// number, or a second column on with two or more spaces — the same recovery
+// correctionMarkerIn needs, for the same reason: a title line that arrived with
+// "Downloaded from …" welded to its end is no longer a line, and the document
+// stops looking like itself.
+func bylineSegments(byline string) []titleSegment {
+	var segments []titleSegment
+	// Folding runs BEFORE the split so a title hyphenated across a line break
+	// rejoins into one line: "self-deter-\nmination" is one word a publisher
+	// broke, not two, and splitting first would leave the title unfindable in
+	// exactly the documents that need it most.
+	for _, line := range strings.Split(typographicFolder.Replace(byline), "\n") {
+		for _, run := range wideGapSegments(line) {
+			if segment := splitTitleSegment(run); len(segment.words) != 0 {
+				segments = append(segments, segment)
+			}
+		}
+	}
+	return segments
+}
+
+func splitTitleSegment(run string) titleSegment {
+	var segment titleSegment
+	word := strings.Builder{}
+	punctuated := false
+	flush := func() {
+		if word.Len() == 0 {
+			return
+		}
+		segment.words = append(segment.words, strings.ToLower(word.String()))
+		segment.breaks = append(segment.breaks, false)
+		word.Reset()
+	}
+	for _, r := range run {
+		switch {
+		case unicode.IsLetter(r) || unicode.IsDigit(r):
+			if punctuated && len(segment.breaks) != 0 {
+				segment.breaks[len(segment.breaks)-1] = true
+			}
+			punctuated = false
+			word.WriteRune(r)
+		default:
+			flush()
+			if r != ' ' && r != '\t' {
+				punctuated = true
+			}
+		}
+	}
+	flush()
+	if punctuated && len(segment.breaks) != 0 {
+		segment.breaks[len(segment.breaks)-1] = true
+	}
+	return segment
+}
+
+// titlePrintedAsLine reports whether phrase is printed as a delimited unit:
+// beginning where a segment begins or a short label ended, and ending where a
+// segment ends or punctuation begins. A title that wraps spans consecutive
+// segments, so intermediate segments must be consumed whole.
+//
+// The start edge allows a few words before the title because publishers print
+// one: "Original Article:", "1.", "RESEARCH ARTICLE |". It allows only a FEW,
+// because the other thing that precedes a delimited copy of the requested title
+// is a sentence citing it — the three wrong accepts that survived this rule were
+// all a newer paper quoting the requested title inside its own abstract, and a
+// label is short where a sentence is not.
+const titleLabelWords = 3
+
+func titlePrintedAsLine(segments []titleSegment, phrase []string) bool {
+	if len(phrase) == 0 {
+		return false
+	}
+	for start, segment := range segments {
+		for offset := range min(len(segment.words), titleLabelWords+1) {
+			if offset != 0 && !segment.breaks[offset-1] {
+				continue
+			}
+			if titleRunMatches(segments[start:], offset, phrase) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func titleRunMatches(segments []titleSegment, offset int, phrase []string) bool {
+	matched := 0
+	for i, segment := range segments {
+		words := segment.words[offset:]
+		breaks := segment.breaks[offset:]
+		offset = 0
+		for j, word := range words {
+			if matched == len(phrase) || word != phrase[matched] {
+				return false
+			}
+			matched++
+			if matched == len(phrase) {
+				// The title ends here only if the page does too: a segment end,
+				// or punctuation closing the clause.
+				return j == len(words)-1 || breaks[j]
+			}
+		}
+		// The phrase runs past this segment, so the wrap must continue into the
+		// next one, and this segment must have been consumed to its end.
+		if i == len(segments)-1 {
+			return false
+		}
+	}
+	return false
 }
 
 // correctionMarkerIn reports the first correctionMarkers entry that prefixes
@@ -287,19 +448,36 @@ func MatchIdentityWithThreshold(text string, target work.Work, titleThreshold fl
 // with a note about a correction to something else.
 func correctionMarkerIn(lines []string) string {
 	for _, line := range lines {
-		segment := strings.ToLower(strings.TrimLeft(line, " \t\ufeff\u200b\u200c\u200d\u200e\u200f"))
-		for {
-			if marker := correctionMarkerAt(segment); marker != "" {
+		for _, segment := range wideGapSegments(line) {
+			if marker := correctionMarkerAt(strings.ToLower(segment)); marker != "" {
 				return marker
 			}
-			gap := strings.Index(segment, "  ")
-			if gap < 0 {
-				break
-			}
-			segment = strings.TrimLeft(segment[gap:], " ")
 		}
 	}
 	return ""
+}
+
+// wideGapSegments splits a line where pdftotext left a run of two or more
+// spaces, which is where it concatenated a running head, a page number, or a
+// second column. Single spaces are deliberately left alone: "applied a
+// Bonferroni correction for multiple comparisons" must stay one segment, or
+// ordinary prose starts tripping the rules that read segment starts. A leading
+// byte-order mark or zero-width joiner is trimmed, because strings.TrimSpace
+// does not and a marker behind one is invisible to a prefix test.
+func wideGapSegments(line string) []string {
+	line = strings.TrimLeft(line, " \t\ufeff\u200b\u200c\u200d\u200e\u200f")
+	var segments []string
+	for line != "" {
+		gap := strings.Index(line, "  ")
+		if gap < 0 {
+			return append(segments, line)
+		}
+		if segment := strings.TrimRight(line[:gap], " \t"); segment != "" {
+			segments = append(segments, segment)
+		}
+		line = strings.TrimLeft(line[gap:], " \t")
+	}
+	return segments
 }
 
 // correctionMarkerAt reports the marker one segment declares, or "" for a
