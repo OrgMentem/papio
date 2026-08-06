@@ -12,6 +12,7 @@
 package identitycorpus
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
@@ -26,6 +27,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	_ "modernc.org/sqlite"
 
@@ -75,9 +77,29 @@ var (
 	// baseAttachmentPathPref matches Zotero's own prefs.js line for
 	// extensions.zotero.baseAttachmentPath, e.g.
 	//   user_pref("extensions.zotero.baseAttachmentPath", "/Users/x/Papers");
-	// prefs.js stores the value as a JS string literal (backslash-escaped,
-	// not URL- or shell-escaped), hence unescapeJSString below.
-	baseAttachmentPathPref = regexp.MustCompile(`user_pref\("extensions\.zotero\.baseAttachmentPath",\s*"((?:[^"\\]|\\.)*)"\)`)
+	// prefs.js stores the value as a JS string literal, single- or
+	// double-quoted (Firefox itself always writes double quotes, but a
+	// hand-edited or migrated prefs.js is not guaranteed to), with
+	// backslash-escaping rather than URL- or shell-escaping, hence
+	// unescapeJSString below. Go's RE2 engine has no backreferences, so
+	// the two quote styles are two separate alternatives -- group 1 for a
+	// double-quoted value, group 2 for a single-quoted one -- rather than
+	// one alternative whose closing quote is required to match its
+	// opening one; parsePrefsJS tells the two apart by which group's span
+	// is present (via FindSubmatchIndex), not by which capture is
+	// non-empty, since an empty base path is itself a legitimate value.
+	// parsePrefsJS runs this per already comment-stripped line, so a
+	// commented-out call is never seen here at all.
+	baseAttachmentPathPref = regexp.MustCompile(`user_pref\(\s*["']extensions\.zotero\.baseAttachmentPath["']\s*,\s*(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)')\s*\)`)
+	// attachmentKeyPattern is the fixed shape of a Zotero item key: 8
+	// characters, uppercase letters and digits. resolveAttachmentPath
+	// checks every attachment key against it before joining the key into
+	// a filesystem path or a cache filename (see the F1 comment there).
+	attachmentKeyPattern = regexp.MustCompile(`^[A-Z0-9]{8}$`)
+	// configDataDirPattern is a narrow, line-anchored scan for config.toml's
+	// top-level data_dir key. See dataDirIsExplicit for why this is
+	// deliberately not a full TOML decode.
+	configDataDirPattern = regexp.MustCompile(`(?m)^data_dir\s*=\s*\S`)
 )
 
 // candidate is one row of the query in queryCandidates: a PDF attachment
@@ -165,6 +187,23 @@ func Load(ctx context.Context, zoteroDir, cacheDir string, workers int) ([]Docum
 	// that resolves inside papio's data directory is excluded here, not
 	// silently measured as if it were independent evidence.
 	papioRoot := papioDataDir()
+	// VAL-1's exclusion is only as good as papioRoot: papioDataDir
+	// deliberately always answers with the built-in default rather than
+	// the operator's live config.toml (see its own comment for why —
+	// config.Load's strict decode has no business aborting corpus
+	// measurement over a config error unrelated to Zotero or papio's
+	// artifact tree). The cost of that choice is real, though: an
+	// operator who relocated data_dir gets the default answer here
+	// regardless, and the exclusion above ends up checking a tree that
+	// is not actually where their papio artifacts live, without anyone
+	// being told. dataDirIsExplicit is the narrowest disclosure that
+	// does not reintroduce the abort risk — it looks only for the
+	// data_dir key's presence, never its value or the rest of the file —
+	// so the operator at least learns the exclusion's answer is the
+	// default, not a confirmed fact about their own configuration.
+	if !dataDirIsExplicit() {
+		fmt.Fprintln(os.Stderr, "identity-corpus: papio data directory resolved from the built-in default, not an explicit config.toml setting; the papio-owned exclusion may be checking the wrong location")
+	}
 
 	var prep []prepared
 	for _, c := range kept {
@@ -277,6 +316,16 @@ func snapshotZoteroDatabase(ctx context.Context, zoteroDir string) (string, erro
 // holds zotero.sqlite in a locking mode that refuses a second reader --
 // SQLITE_BUSY -- which is routine while the operator has Zotero open, and
 // the caller treats it as an expected fallback trigger, not a fatal error.
+//
+// F2: this never modifies zotero.sqlite's own data -- mode=ro plus a
+// VACUUM INTO that only ever reads the source enforces that -- but SQLite
+// still treats a WAL-mode database's -wal/-shm sidecars as part of
+// opening it for read, not just for write: against a library Zotero has
+// fully checkpointed and closed, where those sidecars are currently
+// absent, this connection alone can recreate zotero.sqlite-wal and
+// zotero.sqlite-shm beside zotero.sqlite and leave them there once
+// closed. See dev/identity-corpus.md for the operator-facing version of
+// this fact.
 func vacuumIntoSnapshot(ctx context.Context, zoteroDir, scratchPath string) error {
 	liveDSN := "file:" + filepath.Join(zoteroDir, "zotero.sqlite") + "?mode=ro&_pragma=busy_timeout(5000)"
 	live, err := sql.Open("sqlite", liveDSN)
@@ -296,7 +345,7 @@ func vacuumIntoSnapshot(ctx context.Context, zoteroDir, scratchPath string) erro
 // PRIV-4 replaced with VACUUM INTO, kept here as the fallback for the one
 // case VACUUM INTO cannot handle: Zotero itself holding zotero.sqlite open
 // in a locking mode that refuses a second reader. Three independent
-// io.Copy calls give up the single-transaction consistency VACUUM INTO
+// copyFile calls give up the single-transaction consistency VACUUM INTO
 // has, so this instead stats zotero.sqlite and zotero.sqlite-wal (size and
 // modification time) immediately before and after the copy: identical
 // stats on both sides mean Zotero's own writer did not touch either file
@@ -304,7 +353,10 @@ func vacuumIntoSnapshot(ctx context.Context, zoteroDir, scratchPath string) erro
 // evidence the copy is whole. PRAGMA quick_check cannot be that evidence
 // by itself -- a WAL truncated exactly on a page boundary mid-copy still
 // parses as a valid, merely stale, database. Up to 3 attempts are made
-// before giving up and naming the contention.
+// before giving up and naming the contention; each attempt clears
+// whatever an earlier attempt left in tmpDir first (see the F3 comment
+// inside the loop below), so a retry can never mix one attempt's main
+// database with a leftover WAL from a different one.
 func copyZoteroDatabaseFallback(ctx context.Context, zoteroDir, tmpDir string) error {
 	const maxAttempts = 3
 	mainPath := filepath.Join(zoteroDir, "zotero.sqlite")
@@ -315,9 +367,29 @@ func copyZoteroDatabaseFallback(ctx context.Context, zoteroDir, tmpDir string) e
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		// F3: without this, an earlier attempt's copy of
+		// zotero.sqlite-wal or zotero.sqlite-shm survives into this one.
+		// If Zotero checkpoints and deletes the WAL between attempt N and
+		// attempt N+1, the os.Stat guard below correctly skips copying
+		// it on N+1 -- there is nothing left at the source to copy -- but
+		// that leaves attempt N's now-stale WAL copy sitting in tmpDir
+		// beside attempt N+1's freshly copied main database. The
+		// before/after stat signatures then agree (both see the WAL as
+		// already gone on the source side), this function reports
+		// success, and PRAGMA quick_check cannot catch it: a main
+		// database and a WAL from two different points in Zotero's
+		// history each parse as perfectly valid SQLite on their own.
+		// Clearing every file this function can produce, at the top of
+		// every attempt, makes an attempt's result entirely its own,
+		// never half of a previous attempt's.
+		for _, name := range []string{"zotero.sqlite", "zotero.sqlite-wal", "zotero.sqlite-shm"} {
+			if err := os.Remove(filepath.Join(tmpDir, name)); err != nil && !os.IsNotExist(err) {
+				return fmt.Errorf("clearing a previous attempt's %s before retrying: %w", name, err)
+			}
+		}
 		before := [2]fileSignature{statSignature(mainPath), statSignature(walPath)}
 
-		if err := copyFile(mainPath, filepath.Join(tmpDir, "zotero.sqlite")); err != nil {
+		if err := copyFile(ctx, mainPath, filepath.Join(tmpDir, "zotero.sqlite")); err != nil {
 			return err
 		}
 		// zotero.sqlite-wal and zotero.sqlite-shm only exist while Zotero
@@ -329,7 +401,7 @@ func copyZoteroDatabaseFallback(ctx context.Context, zoteroDir, tmpDir string) e
 			if _, statErr := os.Stat(src); statErr != nil {
 				continue
 			}
-			if err := copyFile(src, filepath.Join(tmpDir, name)); err != nil {
+			if err := copyFile(ctx, src, filepath.Join(tmpDir, name)); err != nil {
 				return err
 			}
 		}
@@ -361,7 +433,16 @@ func statSignature(path string) fileSignature {
 	return fileSignature{size: info.Size(), modTime: info.ModTime().UnixNano()}
 }
 
-func copyFile(src, dst string) (err error) {
+// copyFile copies src to dst, honouring ctx during the copy itself rather
+// than only between whole-file attempts. Before this, ctx was checked once
+// at the top of copyZoteroDatabaseFallback's retry loop and then handed to
+// a single io.Copy call that ran to completion regardless -- a Ctrl-C part
+// way through zotero.sqlite's own copy, several hundred megabytes on a
+// library this size, waited for that copy to finish before the caller's
+// next ctx.Err() check ever ran. Reading through a fixed-size buffer
+// instead of one unbroken io.Copy gives ctx a chance to be checked every
+// chunk, without pulling in any dependency beyond the standard library.
+func copyFile(ctx context.Context, src, dst string) (err error) {
 	in, err := os.Open(src)
 	if err != nil {
 		return fmt.Errorf("opening %s: %w", src, err)
@@ -376,10 +457,24 @@ func copyFile(src, dst string) (err error) {
 			err = cerr
 		}
 	}()
-	if _, err = io.Copy(out, in); err != nil {
-		return fmt.Errorf("copying %s to %s: %w", src, dst, err)
+	buf := make([]byte, 256*1024)
+	for {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		n, readErr := in.Read(buf)
+		if n > 0 {
+			if _, writeErr := out.Write(buf[:n]); writeErr != nil {
+				return fmt.Errorf("copying %s to %s: %w", src, dst, writeErr)
+			}
+		}
+		if readErr != nil {
+			if readErr == io.EOF {
+				return nil
+			}
+			return fmt.Errorf("copying %s to %s: %w", src, dst, readErr)
+		}
 	}
-	return nil
 }
 
 // verifySnapshot opens the finished snapshot at path and requires PRAGMA
@@ -511,7 +606,21 @@ func dedupOnePerParent(candidates []candidate) ([]candidate, []Skip) {
 // than folded into "file not found", which would tell the operator their
 // file is missing when the true fact is that this harness does not know
 // where to look for it.
+//
+// F1: the attachment key is joined into the storage path below (case 0,
+// 1) and, later, into extractOne's cache filename — and it arrives over
+// sync from whoever added the item, exactly like the attachment name two
+// lines down that PRIV-5 already refuses when it escapes storage/<KEY>/.
+// Validating the name and leaving the key it is joined with untouched is
+// not validating the join: a hostile key composed the same way as a
+// hostile name resolves outside storage/ entirely, and separately
+// composes a cache filename outside cacheDir. Zotero item keys are a
+// fixed shape — 8 characters, uppercase letters and digits — so a key
+// outside that shape is refused once, here, before either use.
 func resolveAttachmentPath(zoteroDir, baseAttachmentPath string, haveBaseAttachmentPath bool, c candidate) (string, error) {
+	if !attachmentKeyPattern.MatchString(c.attachmentKey) {
+		return "", errors.New("file missing: attachment key has an unexpected shape")
+	}
 	var path string
 	switch c.linkMode {
 	case 0, 1: // imported_file, imported_url: copied into Zotero's own storage.
@@ -547,30 +656,255 @@ func resolveAttachmentPath(zoteroDir, baseAttachmentPath string, haveBaseAttachm
 	return path, nil
 }
 
-// linkedAttachmentBasePath reads <zoteroDir>/prefs.js for
-// extensions.zotero.baseAttachmentPath — the directory Zotero itself
-// resolves a linkMode 2 attachment's "attachments:"-prefixed relative path
-// against. ok is false when the line is absent, which callers must treat
-// as "unknown", not as any kind of file-not-found: there is nothing to
+// zoteroProfileDir locates Zotero's Firefox-style profile directory by
+// parsing profiles.ini, the file every Firefox-family application writes
+// to record where its actual per-profile state -- including prefs.js --
+// lives. This matters because zoteroDir, the argument Load already takes,
+// is Zotero's DATA directory (~/Zotero by default, holding zotero.sqlite
+// and the storage/ tree), and the PROFILE directory prefs.js actually
+// lives in is a second, independently located tree that shares nothing
+// with zoteroDir but the word "Zotero" -- on a typical macOS install it is
+// ~/Library/Application Support/Zotero/Profiles/<random>.default. The
+// previous code read <zoteroDir>/prefs.js directly, which does not exist
+// on any real Zotero install; haveBaseAttachmentPath was therefore always
+// false, and every "attachments:"-relative linked file was refused as
+// unconfigured even when the operator had genuinely set the pref, which is
+// the one case this whole mechanism exists to handle. There is no
+// shortcut around profiles.ini: it is the same file every other tool that
+// needs a Firefox-family preference -- Firefox itself, sync clients,
+// zotero-cli -- has to parse for exactly this reason, since the profile
+// directory's name is randomly generated per install and not derivable
+// from anything else on disk.
+func zoteroProfileDir() (string, bool) {
+	for _, root := range zoteroAppSupportDirs() {
+		data, err := os.ReadFile(filepath.Join(root, "profiles.ini"))
+		if err != nil {
+			continue
+		}
+		if dir, ok := parseProfilesIni(root, data); ok {
+			return dir, true
+		}
+	}
+	return "", false
+}
+
+// zoteroAppSupportDirs lists, in order, the directories that might hold
+// Zotero's profiles.ini on this OS. Linux gets two candidates because
+// Zotero has shipped profiles.ini under both ~/.zotero/zotero (current)
+// and the older bare ~/.zotero at different points in its history, and
+// nothing on disk announces which one a given install used.
+func zoteroAppSupportDirs() []string {
+	switch runtime.GOOS {
+	case "windows":
+		if appData := os.Getenv("APPDATA"); appData != "" {
+			return []string{filepath.Join(appData, "Zotero", "Zotero")}
+		}
+		return nil
+	case "darwin":
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return nil
+		}
+		return []string{filepath.Join(home, "Library", "Application Support", "Zotero")}
+	default:
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return nil
+		}
+		return []string{filepath.Join(home, ".zotero", "zotero"), filepath.Join(home, ".zotero")}
+	}
+}
+
+// iniSection is one [name] block of profiles.ini's Windows-style INI
+// format, as an ordered key/value map. Firefox writes keys and values
+// without quoting, so unlike prefs.js there is no escaping to reverse
+// here.
+type iniSection struct {
+	name string
+	kv   map[string]string
+}
+
+// parseIni does the minimum profiles.ini needs: split on [section] headers
+// and key=value lines, skipping blank lines and ;/# comments. It is not a
+// general INI parser -- profiles.ini never nests, quotes, or continues a
+// line -- so nothing beyond that is attempted.
+func parseIni(data []byte) []iniSection {
+	var sections []iniSection
+	var current *iniSection
+	for _, raw := range strings.Split(string(data), "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" || strings.HasPrefix(line, ";") || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
+			sections = append(sections, iniSection{name: line[1 : len(line)-1], kv: map[string]string{}})
+			current = &sections[len(sections)-1]
+			continue
+		}
+		if current == nil {
+			continue
+		}
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		current.kv[strings.TrimSpace(key)] = strings.TrimSpace(value)
+	}
+	return sections
+}
+
+// parseProfilesIni resolves the profile directory profiles.ini (rooted at
+// root, the directory profiles.ini itself lives in) points at: the
+// [ProfileN] section whose own Default key reads "1", or [Profile0] when
+// none is marked default -- the same fallback order Firefox's own profile
+// manager uses, since Zotero's profiles.ini is exactly that format. A
+// profile's Path is relative to root unless its IsRelative key reads "0",
+// and profiles.ini always writes Path with forward slashes regardless of
+// platform, hence filepath.FromSlash before joining.
+func parseProfilesIni(root string, data []byte) (string, bool) {
+	var fallback map[string]string
+	for _, section := range parseIni(data) {
+		if !strings.HasPrefix(section.name, "Profile") {
+			continue
+		}
+		if section.name == "Profile0" {
+			fallback = section.kv
+		}
+		if section.kv["Default"] == "1" {
+			if dir, ok := profileSectionDir(root, section.kv); ok {
+				return dir, true
+			}
+		}
+	}
+	if fallback != nil {
+		return profileSectionDir(root, fallback)
+	}
+	return "", false
+}
+
+// profileSectionDir turns one [ProfileN] section's Path/IsRelative pair
+// into an absolute directory, per the rule documented on parseProfilesIni.
+func profileSectionDir(root string, kv map[string]string) (string, bool) {
+	path := kv["Path"]
+	if path == "" {
+		return "", false
+	}
+	if kv["IsRelative"] == "0" {
+		return filepath.Clean(path), true
+	}
+	return filepath.Join(root, filepath.FromSlash(path)), true
+}
+
+// linkedAttachmentBasePath reads extensions.zotero.baseAttachmentPath --
+// the directory Zotero itself resolves a linkMode 2 attachment's
+// "attachments:"-prefixed relative path against -- from prefs.js in
+// Zotero's profile directory (see zoteroProfileDir for why that is not
+// zoteroDir). <zoteroDir>/prefs.js is tried as a fallback, for an operator
+// who happens to keep the two together, and both attempts failing is
+// simply "unset". ok is false in that case, which callers must treat as
+// "unknown", not as any kind of file-not-found: there is nothing to
 // resolve against, a different fact from a resolved path not existing.
 func linkedAttachmentBasePath(zoteroDir string) (string, bool) {
-	data, err := os.ReadFile(filepath.Join(zoteroDir, "prefs.js"))
+	if profileDir, ok := zoteroProfileDir(); ok {
+		if value, ok := readBaseAttachmentPathPref(filepath.Join(profileDir, "prefs.js")); ok {
+			return value, true
+		}
+	}
+	return readBaseAttachmentPathPref(filepath.Join(zoteroDir, "prefs.js"))
+}
+
+// readBaseAttachmentPathPref reads and parses one prefs.js candidate path,
+// treating a missing file the same as a present one with no matching
+// pref: both mean "try the next candidate", not an error.
+func readBaseAttachmentPathPref(path string) (string, bool) {
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return "", false
 	}
-	m := baseAttachmentPathPref.FindSubmatch(data)
-	if m == nil {
-		return "", false
-	}
-	return unescapeJSString(string(m[1])), true
+	return parsePrefsJS(data)
 }
 
-// unescapeJSString reverses the backslash-escaping Zotero's own
-// preference writer applies to a JS string literal: a literal backslash is
-// doubled and a double quote is escaped, which are the only two sequences
-// prefs.js ever produces inside a filesystem path.
+// parsePrefsJS extracts extensions.zotero.baseAttachmentPath from a
+// Firefox-style prefs.js file's raw content, honouring the two things
+// that make it unsafe to regex the whole file in one pass. First, a line
+// commented out with a leading "//", or sitting inside a "/* */" block --
+// both of which real prefs.js files carry, since Firefox itself opens
+// every one with a "// Mozilla User Preferences" line and a "/* Do not
+// edit this file... */" block -- is not a setting; it is a note to a
+// human, or dead history from a previous edit, and must never be read as
+// live configuration. Second, prefs.js is last-write-wins: Firefox
+// rewrites the whole file on every change, but a hand-edited or migrated
+// copy can carry more than one user_pref call for the same key, and
+// whichever one sorts last in the file is authoritative -- not whichever a
+// first-match regex happens to hit first -- so every surviving line is
+// scanned and the last match wins.
+func parsePrefsJS(data []byte) (string, bool) {
+	cleaned := stripPrefsComments(data)
+	value, found := "", false
+	for _, line := range bytes.Split(cleaned, []byte("\n")) {
+		if bytes.HasPrefix(bytes.TrimLeft(line, " \t"), []byte("//")) {
+			continue
+		}
+		loc := baseAttachmentPathPref.FindSubmatchIndex(line)
+		if loc == nil {
+			continue
+		}
+		var raw []byte
+		if loc[2] != -1 {
+			raw = line[loc[2]:loc[3]] // double-quoted value
+		} else {
+			raw = line[loc[4]:loc[5]] // single-quoted value
+		}
+		value, found = unescapeJSString(string(raw)), true
+	}
+	return value, found
+}
+
+// stripPrefsComments blanks out every "/* ... */" block comment in data,
+// preserving line breaks so the line-based "//" check in parsePrefsJS, and
+// the byte offsets baseAttachmentPathPref reports, both still line up with
+// the original file. An unterminated block comment -- malformed input, not
+// something a well-formed prefs.js ever produces -- blanks the rest of the
+// file rather than looping forever looking for a close that is not there.
+func stripPrefsComments(data []byte) []byte {
+	out := append([]byte(nil), data...)
+	for {
+		start := bytes.Index(out, []byte("/*"))
+		if start < 0 {
+			return out
+		}
+		rel := bytes.Index(out[start+2:], []byte("*/"))
+		end := len(out)
+		if rel >= 0 {
+			end = start + 2 + rel + 2
+		}
+		for i := start; i < end; i++ {
+			if out[i] != '\n' {
+				out[i] = ' '
+			}
+		}
+		if rel < 0 {
+			return out
+		}
+	}
+}
+
+// unescapeJSString reverses the backslash-escaping a JS string literal
+// uses: a backslash makes the following character literal, whatever that
+// character is. Firefox's own preference writer only ever produces \\ and
+// \" this way, but a hand-edited prefs.js can escape a single quote (\')
+// inside a single-quoted value too, so the reversal is generic rather than
+// hardcoded to the two sequences Firefox itself happens to emit.
 func unescapeJSString(s string) string {
-	return strings.NewReplacer(`\"`, `"`, `\\`, `\`).Replace(s)
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' && i+1 < len(s) {
+			i++
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
 }
 
 // papioDataDir returns the root of papio's own data directory, so
@@ -592,6 +926,27 @@ func papioDataDir() string {
 		dir = abs
 	}
 	return dir
+}
+
+// dataDirIsExplicit reports whether the operator's own config.toml sets
+// data_dir, as distinct from papioDataDir falling back to the built-in
+// default. It is a narrow, line-anchored text scan for the top-level key
+// -- not a full TOML decode -- deliberately: config.Load's strict decoder
+// rejects unknown fields and requires a valid access_mode, and papioDataDir
+// already decided (see its own comment) that a config error unrelated to
+// data_dir must never abort corpus measurement. data_dir is Config's only
+// field of that name, so a line-anchored match against the raw file text
+// is unambiguous without a real parser, and any read failure -- including
+// "no config.toml at all" -- is reported as "not explicit": this function
+// only ever adds a caveat to Load's stderr output, so erring toward that
+// caveat is always safe, while erring toward silence on a real override is
+// the exact defect the exclusion needs disclosed, not hidden.
+func dataDirIsExplicit() bool {
+	data, err := os.ReadFile(filepath.Join(config.Dir(), "config.toml"))
+	if err != nil {
+		return false
+	}
+	return configDataDirPattern.Match(data)
 }
 
 // underDir reports whether path lies at or beneath dir, comparing cleaned
@@ -808,7 +1163,32 @@ feed:
 // attachment key this run touches (each cache filename is
 // key-size-mtime.txt) or to poison an entry a later run would then treat
 // as already-extracted text.
+//
+// F4: the leaf's own mode is masked against 0o077, not 0o022. A directory
+// the operator owns at the ordinary 0o755 passed the old 0o022 mask —
+// only a write bit failed it — even though group or other can still list
+// its contents, which is the enumeration this comment already names as
+// the threat; every bit but the owner's own is refused now, not just
+// write. That still says nothing about who can rename or remove the leaf
+// itself, though: that authority belongs to whoever can write the
+// *parent* directory, not to whoever owns the leaf, so a leaf created
+// under a world-writable parent passed every check above and still let a
+// co-tenant swap it out from under this run between validation and the
+// writes extraction performs afterward. An explicitly chosen -cache
+// directory therefore also has its ancestry checked (checkCacheDirParents
+// below). os.UserCacheDir()'s default is exempt from that walk: it
+// resolves to a fixed, OS-defined per-user directory (~/Library/Caches,
+// $XDG_CACHE_HOME or ~/.cache, %LocalAppData%) whose ancestry is the
+// platform's own user-profile tree, not a path this tool or the operator
+// chose — walking it adds no coverage a -cache override doesn't already
+// need on its own, and walking every path all the way to the filesystem
+// root regardless of where it started would fail on the root-owned
+// system directories every path eventually passes through.
 func validateCacheDir(cacheDir string) error {
+	start := time.Now()
+	if abs, err := filepath.Abs(cacheDir); err == nil {
+		cacheDir = abs
+	}
 	if err := os.MkdirAll(cacheDir, 0o700); err != nil {
 		return fmt.Errorf("creating cache directory: %w", err)
 	}
@@ -822,13 +1202,57 @@ func validateCacheDir(cacheDir string) error {
 	if !info.IsDir() {
 		return errors.New("cache path exists and is not a directory")
 	}
-	if info.Mode().Perm()&0o022 != 0 {
+	if info.Mode().Perm()&0o077 != 0 {
 		return errors.New("cache directory is writable by group or other; refusing to use it")
 	}
 	if uid, ok := fileOwnerUID(info); ok && uid != uint32(os.Getuid()) {
 		return errors.New("cache directory is not owned by the current user; refusing to use it")
 	}
+	if userCacheRoot, ucErr := os.UserCacheDir(); ucErr != nil || !underDir(cacheDir, userCacheRoot) {
+		if err := checkCacheDirParents(cacheDir); err != nil {
+			return err
+		}
+	}
+	// F5: sweep once validateCacheDir has confirmed cacheDir itself is
+	// safe to touch at all — never before that, and never on a directory
+	// this call is about to refuse. See sweepStaleCacheTemps for what it
+	// removes and why.
+	sweepStaleCacheTemps(cacheDir, start)
 	return nil
+}
+
+// checkCacheDirParents walks the ancestors of an explicitly chosen cache
+// directory (see the F4 comment on validateCacheDir), refusing one a
+// co-tenant could write into. Only the write bit is tested here (0o022,
+// not the leaf's 0o077): listing a parent's own entries exposes nothing
+// the leaf's contents shield, but write access to a parent is exactly the
+// authority needed to rename or remove the leaf this run already
+// validated and put something else in its place before extraction
+// starts. Root ownership is accepted at any level — root already has
+// unrestricted access regardless of any check an unprivileged process can
+// perform, and every OS's directory tree above a user's home
+// (/, /Users, /home, ...) is ordinarily root-owned, so refusing those
+// would fail every explicit -cache path on an ordinary machine, not just
+// a hostile one.
+func checkCacheDirParents(cacheDir string) error {
+	dir := filepath.Dir(cacheDir)
+	for {
+		info, err := os.Stat(dir)
+		if err != nil {
+			return fmt.Errorf("checking cache directory's parent: %w", err)
+		}
+		if info.Mode().Perm()&0o022 != 0 {
+			return errors.New("a directory containing the cache directory is writable by group or other; refusing to use it")
+		}
+		if uid, ok := fileOwnerUID(info); ok && uid != uint32(os.Getuid()) && uid != 0 {
+			return errors.New("a directory containing the cache directory is not owned by the current user; refusing to use it")
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return nil
+		}
+		dir = parent
+	}
 }
 
 // fileOwnerUID returns info's owning user id, on the platforms whose
@@ -855,6 +1279,14 @@ func fileOwnerUID(info os.FileInfo) (uid uint32, ok bool) {
 	return uint32(f.Uint()), true
 }
 
+// cacheTempPattern is writeCacheEntry's os.CreateTemp pattern for its
+// in-progress temp file, and sweepStaleCacheTemps's glob for finding one
+// left behind — the same shape in both places, so a leftover from a
+// killed run is always recognizable as one of these, not mistaken for a
+// finished entry (those are named key-size-mtime.txt, never matching
+// this pattern) or swept before it is even written.
+const cacheTempPattern = "identity-corpus-*.tmp"
+
 // writeCacheEntry writes text to cachePath by creating a same-directory
 // temp file with O_EXCL — refusing to follow or overwrite anything already
 // there — and renaming it into place. VAL-6/PRIV-3b found the previous
@@ -865,12 +1297,22 @@ func fileOwnerUID(info os.FileInfo) (uid uint32, ok bool) {
 // could redirect the write anywhere this process can write.
 // validateCacheDir already keeps a co-tenant from placing anything inside
 // cacheDir at all; this is the other half, for the write itself.
+//
+// F5: the temp name used to be cachePath + ".tmp." + the process id,
+// which is unique only until two runs happen to draw the same pid — at
+// which point the second run's O_EXCL fails on the first run's leftover
+// and extractOne silently discards that error by design, so the
+// document is quietly re-extracted every run instead of ever caching.
+// os.CreateTemp picks its own random suffix, so no two runs, however
+// their pids land, can ever collide on the same temp name; the killed
+// run's own leftover is instead reclaimed by sweepStaleCacheTemps at the
+// start of the next run that validates this cacheDir.
 func writeCacheEntry(cachePath string, text []byte) error {
-	tmp := cachePath + ".tmp." + strconv.Itoa(os.Getpid())
-	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	f, err := os.CreateTemp(filepath.Dir(cachePath), cacheTempPattern)
 	if err != nil {
 		return err
 	}
+	tmp := f.Name()
 	if _, err := f.Write(text); err != nil {
 		f.Close()
 		os.Remove(tmp)
@@ -885,6 +1327,33 @@ func writeCacheEntry(cachePath string, text []byte) error {
 		return err
 	}
 	return nil
+}
+
+// sweepStaleCacheTemps removes writeCacheEntry's own temp files that
+// predate start, once per Load call, right after validateCacheDir has
+// confirmed cacheDir is safe to operate on at all. A run killed between
+// os.CreateTemp and the rename that finishes writeCacheEntry leaves its
+// temp file sitting in cacheDir forever — one probe left 470 MB of
+// extracted front matter behind this way — and because it is never
+// readable at the final cache path, every later run pays the extraction
+// cost for that document again, silently, with no error surfaced anywhere
+// a caller would see it (extractOne treats a cache write failure as
+// tolerable; see extractOne). A temp file can only predate start if an
+// earlier run made it and never finished: this run's own temp files are
+// all created after start, so none of them are ever swept, even while a
+// worker is still writing one concurrently with this call.
+func sweepStaleCacheTemps(cacheDir string, start time.Time) {
+	matches, err := filepath.Glob(filepath.Join(cacheDir, cacheTempPattern))
+	if err != nil {
+		return
+	}
+	for _, path := range matches {
+		info, err := os.Lstat(path)
+		if err != nil || !info.ModTime().Before(start) {
+			continue
+		}
+		os.Remove(path)
+	}
 }
 
 // classifyExtractionFailure reduces pdf.ExtractText's evidence trail — in

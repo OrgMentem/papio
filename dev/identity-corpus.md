@@ -49,7 +49,15 @@ to stand in for reading your own report.
   operator linked papio's delivered file back into their library instead
   of re-downloading it — would silently reintroduce that dependency, so
   Load skips it under the `"papio-owned artifact"` reason class rather
-  than scoring it.
+  than scoring it. **This resolves papio's DEFAULT data directory, not
+  whatever `data_dir` your `config.toml` actually sets.** `papioDataDir`
+  deliberately reads `config.Default().DataDir` rather than your live
+  config, so if you have relocated `data_dir`, the exclusion is checking
+  the wrong tree: papio's already-scored output under your real data
+  directory re-enters the corpus as if it were independent evidence,
+  quietly inflating the pass rate the same way measuring against a papio
+  store would. Confirm where your `data_dir` actually points before
+  trusting a "papio-owned artifact" count of zero.
 - **`attachments:`-relative linked files need a Zotero preference the
   corpus can't see.** A `linkMode=2` (linked_file) attachment stored as
   `attachments:some/relative/path` resolves, in Zotero itself, against
@@ -61,6 +69,13 @@ to stand in for reading your own report.
   (folded into the `"file missing"` class in the summary) instead of
   guessing at a path. An absolute linked path needs no such preference and
   is unaffected.
+- **An attachment key outside Zotero's own shape is refused, not
+  trusted.** A Zotero item key is always 8 characters, uppercase letters
+  and digits. Every row Load reads comes over sync from whoever added the
+  item — not necessarily this operator, on a shared library — and the key
+  composes both the storage path and the cache filename, so one outside
+  that shape is skipped (also folded into the `"file missing"` class)
+  before it reaches either.
 - **The 1 MiB `pdftotext` output cap drops long documents unevenly.** A
   document whose extracted text would exceed the cap is skipped under the
   `"output cap"` class rather than truncated silently mid-window. In the
@@ -100,8 +115,12 @@ Needs `pdftotext` (poppler) on `PATH` — the same extraction dependency the
 daemon itself needs (`brew install poppler`, see the README).
 
 It opens `zotero.sqlite` through a temporary copy, so it's safe to run
-while Zotero is open. It never writes to the library and never makes a
-network call.
+while Zotero is open. Library data is never modified and no network call
+is ever made — though on the atomic snapshot path (`VACUUM INTO`), the
+read-only connection SQLite uses to read the live database can still
+leave the ordinary `zotero.sqlite-wal`/`zotero.sqlite-shm` sidecar files
+beside it if they weren't already there, the same as any other read
+connection opened against a WAL-mode database would.
 
 The first run extracts text for every PDF attachment, which is slow at
 this scale — several minutes for ~789 PDFs — that's the caching `-cache`
@@ -180,6 +199,8 @@ the byline window, on top of (not instead of) the unchanged token gate:
 | + printed-title required | 3 | 560 |
 | + label allowance (≤3 words) | 2 | 559 (88.4%) |
 | − label allowance removed | 2 | 557 |
+| + character-stream matching, label-terminator narrowing | 2 | 564 (89.2%) |
+| + line numbers stepped over inside a wrap | 2 | 565 (89.4%) |
 
 The label allowance (tolerating a short prefix like "Original Article:" or
 "1." before the title) stayed: it recovers 2 correct passes — 557 → 559 —
@@ -195,15 +216,43 @@ an increment that moves neither number does not ship, on principle,
 because the harness exists precisely so a plausible-sounding tolerance has
 to earn its place instead of being taken on faith.
 
-**The cost, stated plainly.** 27 correct documents moved from pass to
-review. They are not a random sample — they're dominated by exactly what
-token overlap could never separate in the first place: 7 volumes of the
-numbered series report, generic one- and two-token titles ("Code of
-Ethics", "Organisational behaviour"), one metadata typo ("Fundamentals of
-EEF Measurement" cataloged against a paper titled about EEG), and papers
-whose printed subtitle differs from the catalogue record. The trade is
-deliberate: papio parking a correct paper costs a human a moment of
-review; papio filing the wrong paper costs a library its trust.
+**Three more increments that did ship.** Three later changes to the same
+gate each moved one of the two numbers, so — unlike the trailing-superscript
+tolerance above — all three stayed. Character-stream matching changed
+`titleRunMatches` to compare the printed words against the requested title
+as one concatenated run of characters instead of word by word: `pdftotext`
+doesn't always keep the spaces inside a word, and "PsychologicalSafety and
+LearningBehavior in WorkTeams" — byte-identical to its catalogue title
+except for three missing spaces — was parked by a word-by-word comparison
+that character-stream matching now passes. It also let a footnote digit
+welded to the title's last word through ("MODEL OF CHANGE1"), which is the
+same tolerance the reverted increment above attempted and failed to measure:
+it failed because it looked for the marker as a separate word, and the text
+layer had glued it inside one. Label-terminator narrowing changed
+`labelTerminators` so only a colon, full stop, rule, or bullet ends the
+short label the start edge allows, not any punctuation; a citing sentence
+reaching for a quote or a dash to introduce a title no longer qualifies as
+a label. Those two moved correct passes from 559 to 564. Stepping over a
+digit-only segment inside a wrap took it to 565: a submitted manuscript
+numbers every line, so one preprint's title arrived as "…with an initial
+structure of", "6", "vertical leadership", and digits alone cannot belong to
+a title that has already begun. Wrong accepts held at 2 throughout — the
+same standard the label allowance was held to, and the same reason all three
+shipped.
+
+**The cost, stated plainly.** 21 correct documents moved from pass to
+review, measured against the pre-rule baseline of 586. Every one of them
+is accounted for: 8 are numbered-series volumes whose covers print the
+catalogue's words in a different order ("FINAL REPORT / Impacts / VOLUME
+3" for "Final Report - Volume 3, Impacts"), 5 have a text layer shredded
+by column interleaving so no contiguous title exists, 3 are catalogue
+errors where the record disagrees with the printed title ("EEF" for EEG,
+"Altering" for Altered, and a Nature piece whose record carries a
+different title entirely), 2 are records that concatenate a teaser or drop
+a publisher prefix, 1 is a mojibake dash, and the remaining 2 are ordinary
+subtitle differences. The trade is deliberate: papio parking a correct
+paper costs a human a moment of review; papio filing the wrong paper costs
+a library its trust.
 
 **The two wrong accepts that survive, and why they're hard.** Both print
 the requested title as a genuinely delimited line, so `titlePrintedAsLine`

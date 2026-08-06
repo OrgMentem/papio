@@ -113,11 +113,23 @@ execution records in `notes/acquisition-stack-plan.md`.
   passes. A 3/5 match with a matching author and year is now review where it used
   to be a pass — that combination was the single largest wrong-accept family.
   Measured over 632 documents and 398,786 mismatched pairs: wrong accepts 52 → 2,
-  correct passes 586 → 559. The 27 documents that moved to review are the ones
-  token overlap can never separate — seven volumes of that numbered series,
-  one- and two-token titles like "Code of Ethics", a catalogue typo, and printed
-  subtitles that differ from the catalogue record — and papio parking a correct
-  paper costs a moment where filing the wrong one costs a library its trust.
+  correct passes 586 → 565. The title is compared as one character run rather
+  than word by word, because a text layer decides where words begin and decides
+  badly — "PsychologicalSafety and LearningBehavior in WorkTeams" is one real
+  paper's printed title, and a footnote digit welded to the last word is another
+  — and a digit-only run inside a wrap is stepped over, because a submitted
+  manuscript numbers every line. Only a colon, full stop, or rule ends the short
+  label the start edge allows: a citing sentence reaches for a quote, and
+  accepting one let `We cite "…" for guidance` pass as a printed title.
+
+  The 21 documents that moved to review are the ones token overlap can never
+  separate, and every one is accounted for in `dev/identity-corpus.md`: eight
+  numbered-series covers that print the catalogue's words in another order, five
+  text layers shredded by column interleaving, three catalogue records that
+  disagree with the printed title, two that concatenate a teaser or drop a
+  publisher prefix, one mojibake dash, and two differing subtitles. papio parking
+  a correct paper costs a moment where filing the wrong one costs a library its
+  trust.
 - **`make identity-corpus` no longer grades the identity rules on papio's own
   output.** 47 of the 679 documents it scored resolved, through Zotero
   linked-file attachments, into papio's own artifact, bundle, and staging

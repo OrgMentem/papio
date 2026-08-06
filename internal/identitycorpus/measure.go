@@ -345,8 +345,14 @@ func (r Report) Render() string {
 				outputCap = bucket.Count
 			}
 		}
+		// The bias is stated qualitatively, not as a book/article breakdown, because
+		// Document (corpus.go) carries no parent-item-type field for Measure to
+		// bucket candidates by — inventing one here to print a ratio would credit
+		// this run with a measurement it never took. The reference library's own
+		// book/article ratio lives in dev/identity-corpus.md as an attributed,
+		// one-time observation instead of a claim this run repeats about itself.
 		if outputCap > 0 {
-			fmt.Fprintf(w, "output cap alone accounts for %d of the skips above — in the operator's library it dropped 24 of 54 books (44%%) against 11 of 637 journal articles (1.7%%), so the corpus below is the library minus most of its books, and book front matter (often no DOI, editor-as-author bylines) is exactly what the author rules are being judged on\n", outputCap)
+			fmt.Fprintf(w, "output cap alone accounts for %d of the skips above — extraction drops long documents before they ever become a candidate, which falls hardest on book-length works, so this corpus under-represents them relative to the library it was drawn from\n", outputCap)
 		}
 	}
 	w.Flush()
