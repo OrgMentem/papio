@@ -309,6 +309,38 @@ type Updates struct {
 	Check bool `toml:"check"`
 }
 
+// Actions configures how long an open human action may wait before listings
+// call it stale.
+//
+// Separate from browser.action_expiry_seconds on purpose: that value (default
+// 30 minutes) is a REMINDER cadence — "nudge me about this again" — and reusing
+// it as a staleness threshold would report a handoff queued over lunch as
+// abandoned. This one answers "has anyone given up on this?", so its scale is
+// days.
+type Actions struct {
+	// StaleAfterSeconds marks an open action stale once it has waited this
+	// long. 0 selects the default; a negative value is rejected. Marking is all
+	// it does: nothing expires, cancels, or is swept as a consequence, because
+	// abandoning an acquisition is a human's call, not a timer's.
+	StaleAfterSeconds int `toml:"stale_after_seconds,omitempty"`
+}
+
+// DefaultActionStaleAfterSeconds is a week: long enough that an ordinary
+// weekday-to-weekday gap, a conference, or a library ticket in flight does not
+// look abandoned, short enough that a handoff nobody ever opened stops hiding
+// among the fresh ones.
+const DefaultActionStaleAfterSeconds = 7 * 24 * 60 * 60
+
+// EffectiveActionStaleAfter resolves the staleness threshold the way every
+// reader must apply it, so a listing and a consumer reading the same config
+// cannot disagree about which rows are stale.
+func (a Actions) EffectiveActionStaleAfter() time.Duration {
+	if a.StaleAfterSeconds <= 0 {
+		return DefaultActionStaleAfterSeconds * time.Second
+	}
+	return time.Duration(a.StaleAfterSeconds) * time.Second
+}
+
 // Config is the loaded, validated configuration.
 type Config struct {
 	AccessMode string            `toml:"access_mode"`
@@ -324,6 +356,7 @@ type Config struct {
 	Library    Library           `toml:"library"`
 	Updates    Updates           `toml:"updates"`
 	Discovery  Discovery         `toml:"discovery"`
+	Actions    Actions           `toml:"actions"`
 	Sources    map[string]Source `toml:"sources"`
 
 	// Path this config was loaded from ("" for defaults).
@@ -399,6 +432,7 @@ func Default() Config {
 		PDF:      PDF{OCREnabled: true, MinTextChars: 400, MaxOCRPages: 4, TitleMatchThreshold: 0.6},
 		Browser:  Browser{ActionExpirySeconds: 1800},
 		Captures: Captures{Enabled: true, MaxPerHost: 10, MaxAgeDays: 14},
+		Actions:  Actions{StaleAfterSeconds: DefaultActionStaleAfterSeconds},
 		Zotio:    Zotio{Executable: "zotio", TimeoutSeconds: 120, AttachmentMode: "stored", AutoImport: false, AutoEnrich: true, UnavailableRecheckDays: 14},
 		Notify:   Notify{Enabled: true},
 		Hooks:    Hooks{TimeoutSeconds: 120},
@@ -562,6 +596,9 @@ func (c *Config) validate() error {
 	}
 	if c.Browser.ActionExpirySeconds < 0 {
 		return fmt.Errorf("browser.action_expiry_seconds must be >= 0")
+	}
+	if c.Actions.StaleAfterSeconds < 0 {
+		return fmt.Errorf("actions.stale_after_seconds must be >= 0")
 	}
 	if c.Captures.MaxPerHost < 1 || c.Captures.MaxPerHost > 1000 {
 		return fmt.Errorf("captures.max_per_host must be in 1..1000")

@@ -230,6 +230,9 @@ func RouterWithShutdown(system *bootstrap.System, shutdown context.CancelFunc) i
 		"acquire.submit_v2": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return submitV2(ctx, raw, system)
 		},
+		"acquire.submit_v3": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return submitV3(ctx, raw, system)
+		},
 		"acquire.report": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return acquireReport(ctx, raw, system)
 		},
@@ -281,6 +284,9 @@ func RouterWithShutdown(system *bootstrap.System, shutdown context.CancelFunc) i
 		"jobs.list_v2": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return listJobsV2(ctx, raw, system)
 		},
+		"jobs.list_v3": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return listJobsV3(ctx, raw, system)
+		},
 		"jobs.receipt": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return jobReceipt(ctx, raw, system)
 		},
@@ -296,6 +302,9 @@ func RouterWithShutdown(system *bootstrap.System, shutdown context.CancelFunc) i
 		"jobs.get": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return getJob(ctx, raw, system)
 		},
+		"jobs.get_v2": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return getJobV2(ctx, raw, system)
+		},
 		"jobs.cancel": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return cancelJob(ctx, raw, system)
 		},
@@ -307,6 +316,9 @@ func RouterWithShutdown(system *bootstrap.System, shutdown context.CancelFunc) i
 		},
 		"actions.list_v2": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return listActionsV2(ctx, raw, system)
+		},
+		"actions.list_v3": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return listActionsV3(ctx, raw, system)
 		},
 		"actions.open": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return openActions(ctx, raw, system)
@@ -322,6 +334,9 @@ func RouterWithShutdown(system *bootstrap.System, shutdown context.CancelFunc) i
 		},
 		"artifacts.locate": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return locateArtifact(ctx, raw, system)
+		},
+		"artifacts.validation": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return validationReports(ctx, raw, system)
 		},
 		"bundle.document": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return bundleDocument(ctx, raw, system)
@@ -477,10 +492,33 @@ type acquireSubmitParams struct {
 	AutoImport *bool                `json:"auto_import,omitempty"`
 }
 
+// acquireSubmitV2Params is FROZEN by ADR-0010 Decision 1 at exactly these three
+// keys. Params are decoded with DisallowUnknownFields, and the ADR reasons at
+// length that param widening is the worse direction of skew: a newer consumer
+// sending a field an older daemon lacks has its whole call rejected. So a fourth
+// key here is not an additive change, it is a breaking one — attribution lives on
+// acquire.submit_v3 instead.
 type acquireSubmitV2Params struct {
 	Request    protocol.WorkRequest `json:"request"`
 	AutoImport *bool                `json:"auto_import,omitempty"`
 	Force      bool                 `json:"force,omitempty"`
+}
+
+// acquireSubmitV3Params adds consumer attribution. A new method rather than a
+// new param on v2, per ADR-0009 Decision 1's rule that additive evolution gets a
+// new method name — which applies to a ratified params object exactly as it
+// applies to a ratified result.
+//
+// Consumer is a sibling of Request, not a work-request/1 field: that document
+// describes the WORK, and one work submitted by two consumers is still one work.
+// It is a caller-supplied label for the caller's own accounting, NOT an
+// authenticated identity and NOT a rights input — the same refusal ADR-0009
+// Decision 3 places on Receipt.Principal. papio authenticates nobody.
+type acquireSubmitV3Params struct {
+	Request    protocol.WorkRequest `json:"request"`
+	AutoImport *bool                `json:"auto_import,omitempty"`
+	Force      bool                 `json:"force,omitempty"`
+	Consumer   string               `json:"consumer,omitempty"`
 }
 
 func submitV2(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
@@ -488,10 +526,26 @@ func submitV2(ctx context.Context, raw json.RawMessage, system *bootstrap.System
 	if err := ipc.DecodeParams(raw, &params); err != nil {
 		return badParams(err)
 	}
-	result, err := system.App.SubmitWithOptionsAs(ctx, PrincipalFrom(ctx), params.Request, app.SubmitOptions{
+	return submitted(ctx, system, params.Request, app.SubmitOptions{
 		AutoImport: params.AutoImport,
 		Force:      params.Force,
 	})
+}
+
+func submitV3(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
+	var params acquireSubmitV3Params
+	if err := ipc.DecodeParams(raw, &params); err != nil {
+		return badParams(err)
+	}
+	return submitted(ctx, system, params.Request, app.SubmitOptions{
+		AutoImport: params.AutoImport,
+		Force:      params.Force,
+		Consumer:   params.Consumer,
+	})
+}
+
+func submitted(ctx context.Context, system *bootstrap.System, request protocol.WorkRequest, options app.SubmitOptions) ([]byte, *ipc.RPCError) {
+	result, err := system.App.SubmitWithOptionsAs(ctx, PrincipalFrom(ctx), request, options)
 	if err != nil {
 		var unset *config.ErrAccessModeUnset
 		if errors.As(err, &unset) {
@@ -1216,7 +1270,52 @@ func openActions(ctx context.Context, raw json.RawMessage, system *bootstrap.Sys
 	if err != nil {
 		return failure(err)
 	}
+	recordHandoffOpened(ctx, system, params.JobIDs)
 	return marshal(ActionsOpenResult{Queued: queued, SessionLive: sessionLive})
+}
+
+// recordHandoffOpened leaves an auditable trace of who drove a human handoff onto
+// the operator's screen.
+//
+// ADR-0009 does not ratify autonomous drain: a background consumer must not open
+// human work on its own. ADR-0014 Decision 6 declines to enforce that with a gate
+// or an --operator-intent flag — scripts pass flags, and an agent driving the CLI
+// is meant to get exactly what a human gets — so the prohibition rests on being
+// auditable instead. Until this event existed it was neither enforced nor
+// observable, which is the one combination papio should never ship.
+//
+// It records the handoff's OWNER, not a self-declared opener. The owner was
+// recorded at submit and is a fact papio holds; an opener label would be an
+// unverifiable string supplied by the very caller under audit, and carrying it
+// would mean a new param on a ratified method. A consumer looping its own ranked
+// queue is opening its own jobs, so the burst is attributable either way — and
+// when an operator opens someone else's handoff, naming the owner is still a true
+// statement.
+//
+// A failed write is dropped: the tabs are already open, and losing an audit line
+// must not turn a completed handoff into a reported error.
+func recordHandoffOpened(ctx context.Context, system *bootstrap.System, jobIDs []string) {
+	if system.Jobs == nil || len(jobIDs) == 0 {
+		return
+	}
+	consumers, err := system.Jobs.ConsumersFor(ctx, jobIDs)
+	if err != nil {
+		return
+	}
+	principal := string(PrincipalFrom(ctx))
+	for _, jobID := range jobIDs {
+		detail := map[string]any{
+			"principal": principal,
+			// batch_size is what separates one deliberate selector call from a
+			// loop of them: the drain pattern is many single-job opens in quick
+			// succession, which looks nothing like an operator opening a queue.
+			"batch_size": len(jobIDs),
+		}
+		if consumer, ok := consumers[jobID]; ok {
+			detail["consumer"] = consumer
+		}
+		_ = system.Jobs.RecordEvent(ctx, jobID, handoffOpenedEvent, detail)
+	}
 }
 
 func getArtifact(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {

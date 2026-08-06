@@ -117,6 +117,17 @@ type Service struct {
 type SubmitOptions struct {
 	AutoImport *bool
 	Force      bool
+	// Consumer names the caller for its own accounting. Empty records no
+	// attribution rather than a placeholder one, and a submission that matches
+	// an in-flight job does not overwrite the attribution that job was queued
+	// with.
+	//
+	// It is a label the caller supplies for itself. papio does not authenticate
+	// it, cannot verify it, and it is NOT a rights input: it must never be read
+	// as the entitlement holder or as an acquiring principal, the same refusal
+	// ADR-0009 Decision 3 places on the transport principal. papio authenticates
+	// nobody and holds no institutional credential.
+	Consumer string
 }
 
 // SubmitResult lets callers distinguish a newly queued job from an in-flight
@@ -213,7 +224,12 @@ func (s *Service) SubmitWithOptionsAs(ctx context.Context, principal job.Princip
 		AutoImport:    auto,
 		Collection:    strings.TrimSpace(wr.Collection),
 	}
-	created, err := s.Jobs.CreateRequestForWork(ctx, wr.RequestID, w, wr.ZotioItemKey, wr.Collection, pol, raw, principal, options.Force)
+	consumer, err := validConsumer(options.Consumer)
+	if err != nil {
+		return SubmitResult{}, err
+	}
+	created, err := s.Jobs.CreateRequestForWork(ctx, wr.RequestID, w, wr.ZotioItemKey, wr.Collection, pol, raw,
+		job.Attribution{Principal: principal, Consumer: consumer}, options.Force)
 	if err != nil {
 		return SubmitResult{}, err
 	}
@@ -1153,6 +1169,9 @@ func (s *Service) validateCandidate(ctx context.Context, row *job.Row, stored *j
 			_ = os.Remove(result.TempPath)
 			return false, false, ctx.Err()
 		}
+		// A partial report is the most useful thing anyone will ever have about
+		// a validation that could not finish: it names the stage that stopped.
+		s.recordValidation(ctx, row.ID, stored.ID, result.SHA256, validationIncomplete, report)
 		_ = s.Jobs.FinishAttempt(ctx, attempt, "needs_review", 0, safeType(validateErr))
 		_, _ = s.Jobs.OpenHumanAction(ctx, row.ID, "validation_error", "PDF validation could not complete within configured bounds", job.Access(false, ""))
 		if err := s.Jobs.MarkCandidate(ctx, stored.ID, "skipped"); err != nil {
@@ -1163,6 +1182,12 @@ func (s *Service) validateCandidate(ctx context.Context, row *job.Row, stored *j
 	}
 	active := report.Structural.HasJavaScript || report.Structural.HasEmbeddedFiles
 	needsIdentityReview := report.Text.NeedsReview || report.Identity.Result == pdf.IdentityReview
+	// Recorded before the branch, not inside each arm: the verdict is a function
+	// of the report alone, so one call site cannot drift from the decision below,
+	// and evidence survives even for the candidates papio throws away — which is
+	// exactly the set a consumer asks "why not this one?" about.
+	s.recordValidation(ctx, row.ID, stored.ID, result.SHA256,
+		validationVerdict(report, active, needsIdentityReview), report)
 	switch {
 	case !report.Payload.OK || !report.Structural.Valid:
 		_ = s.Jobs.FinishAttempt(ctx, attempt, "invalid", 0, "payload_or_structure_rejected")

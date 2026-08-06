@@ -444,11 +444,15 @@ func TestJobsListReportsProvenTruncation(t *testing.T) {
 			var out, errOut bytes.Buffer
 			var gotLimit int
 			root := NewInProcessRoot(&out, &errOut, config.Config{}, func(_ context.Context, method string, params any, result any) error {
-				if method != "jobs.list_v2" {
-					t.Fatalf("method = %q, want jobs.list_v2", method)
+				if method != "jobs.list_v3" {
+					t.Fatalf("method = %q, want jobs.list_v3", method)
 				}
 				gotLimit = params.(map[string]any)["limit"].(int)
-				*result.(*api.JobsPage) = api.JobsPage{Jobs: rows, Truncated: daemonSaysTruncated}
+				page := api.JobsPageV3{Jobs: make([]api.JobRow, 0, len(rows)), Truncated: daemonSaysTruncated}
+				for _, row := range rows {
+					page.Jobs = append(page.Jobs, api.JobRow{Row: row})
+				}
+				*result.(*api.JobsPageV3) = page
 				return nil
 			})
 			root.SetArgs([]string{"--json", "jobs", "list", "--limit", "5000"})
@@ -473,17 +477,22 @@ func TestJobsListReportsProvenTruncation(t *testing.T) {
 	}
 }
 
-// An older daemon predates jobs.list_v2. The CLI must fall back rather than
-// fail, degrading to Capped's "there may be more" — the remedy is the same.
-func TestJobsListFallsBackToV1AgainstOlderDaemon(t *testing.T) {
+// An older daemon predates jobs.list_v3 and jobs.list_v2. The CLI must walk the
+// chain down rather than fail, degrading to Capped's "there may be more" — the
+// remedy is the same. Attribution is simply absent on the older rows, which is
+// the truth: a daemon without the column recorded none.
+func TestJobsListFallsBackToOlderDaemonMethods(t *testing.T) {
 	rows := make([]job.Row, job.ListLimitDefault)
 	for i := range rows {
 		rows[i] = job.Row{ID: fmt.Sprintf("job_%03d", i), State: job.StateQueued}
 	}
 	var out, errOut bytes.Buffer
-	var sawV2, sawV1 bool
+	var sawV3, sawV2, sawV1 bool
 	root := NewInProcessRoot(&out, &errOut, config.Config{}, func(_ context.Context, method string, _ any, result any) error {
 		switch method {
+		case "jobs.list_v3":
+			sawV3 = true
+			return &ipc.RemoteError{Code: "unknown_method", Message: "unknown method"}
 		case "jobs.list_v2":
 			sawV2 = true
 			return &ipc.RemoteError{Code: "unknown_method", Message: "unknown method"}
@@ -499,8 +508,8 @@ func TestJobsListFallsBackToV1AgainstOlderDaemon(t *testing.T) {
 	if err := root.ExecuteContext(context.Background()); err != nil {
 		t.Fatalf("jobs list: %v (%s)", err, errOut.String())
 	}
-	if !sawV2 || !sawV1 {
-		t.Fatalf("v2 attempted = %t, v1 fallback used = %t; want both", sawV2, sawV1)
+	if !sawV3 || !sawV2 || !sawV1 {
+		t.Fatalf("v3 attempted = %t, v2 attempted = %t, v1 fallback used = %t; want all three", sawV3, sawV2, sawV1)
 	}
 	var page struct {
 		Jobs      []job.Row `json:"jobs"`
@@ -520,13 +529,17 @@ func TestJobsListFallsBackToV1AgainstOlderDaemon(t *testing.T) {
 // search-row comment in search.go). Before this fix, the text-mode `jobs
 // list` row printed it straight to the terminal.
 func TestJobsListStripsTerminalControlBytes(t *testing.T) {
-	rows := []job.Row{{ID: "job-1", State: job.StateQueued, Work: work.Work{Title: "Evil\x1b]0;pwned\x07 Title\u009b31m"}}}
+	rows := []api.JobRow{
+		{Row: job.Row{ID: "job-1", State: job.StateQueued, Work: work.Work{Title: "Evil\x1b]0;pwned\x07 Title\u009b31m"}}},
+	}
 	var out, errOut bytes.Buffer
 	root := NewInProcessRoot(&out, &errOut, config.Config{}, func(_ context.Context, method string, _ any, result any) error {
-		if method != "jobs.list_v2" {
-			t.Fatalf("method = %q, want jobs.list_v2", method)
+		// jobs.list_v3 is tried first; the jobs.list_v2 fallback is reserved
+		// for a daemon that predates attribution.
+		if method != "jobs.list_v3" {
+			t.Fatalf("method = %q, want jobs.list_v3", method)
 		}
-		*result.(*api.JobsPage) = api.JobsPage{Jobs: rows}
+		*result.(*api.JobsPageV3) = api.JobsPageV3{Jobs: rows}
 		return nil
 	})
 	root.SetArgs([]string{"jobs", "list"})

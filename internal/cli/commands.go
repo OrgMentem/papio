@@ -85,6 +85,78 @@ func isUnknownMethod(err error) bool {
 	return errors.As(err, &remote) && remote.Code == "unknown_method"
 }
 
+// listAttributedJobsPage and listAttributedActionsPage prefer the _v3 methods,
+// which carry the consumer that submitted each row (and, for actions, the
+// daemon's staleness verdict). They fall back to the older methods so a newer
+// CLI still lists against an older daemon — with one exception: a --consumer
+// filter is refused rather than silently ignored, because returning every
+// consumer's rows to someone who asked for one consumer's is the kind of wrong
+// answer that gets believed.
+func listAttributedJobsPage(ctx context.Context, opt *options, params map[string]any, consumer string, effective int) ([]api.JobRow, bool, error) {
+	var page api.JobsPageV3
+	err := opt.call(ctx, "jobs.list_v3", params, &page)
+	if err == nil {
+		return page.Jobs, page.Truncated, nil
+	}
+	if !isUnknownMethod(err) {
+		return nil, false, err
+	}
+	if consumer != "" {
+		return nil, false, daemonUpgradeRequired("jobs.list_v3")
+	}
+	delete(params, "consumer")
+	rows, truncated, err := listJobsPage(ctx, opt, params, effective)
+	if err != nil {
+		return nil, false, err
+	}
+	out := make([]api.JobRow, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, api.JobRow{Row: row})
+	}
+	return out, truncated, nil
+}
+
+func listAttributedActionsPage(ctx context.Context, opt *options, openOnly bool, consumer string, limit int) ([]api.ActionRow, bool, error) {
+	var page api.ActionsPageV3
+	params := map[string]any{"open_only": openOnly, "limit": limit}
+	if consumer != "" {
+		params["consumer"] = consumer
+	}
+	err := opt.call(ctx, "actions.list_v3", params, &page)
+	if err == nil {
+		return page.Actions, page.Truncated, nil
+	}
+	if !isUnknownMethod(err) {
+		return nil, false, err
+	}
+	if consumer != "" {
+		return nil, false, daemonUpgradeRequired("actions.list_v3")
+	}
+	actions, truncated, err := listActionsPage(ctx, opt, openOnly, limit)
+	if err != nil {
+		return nil, false, err
+	}
+	out := make([]api.ActionRow, 0, len(actions))
+	for _, action := range actions {
+		out = append(out, api.ActionRow{HumanAction: action})
+	}
+	return out, truncated, nil
+}
+
+// truncationNotice states on the human surface what the --json envelope has
+// always stated in its `truncated` key. A listing that quietly stopped at the
+// limit and looked complete is how a consumer concludes the daemon holds a
+// fraction of the rows it holds; the JSON side learned that lesson already.
+func truncationNotice(opt *options, truncated bool, rows int, noun string) error {
+	if !truncated || opt.jsonOutput {
+		return nil
+	}
+	_, err := fmt.Fprintf(opt.out,
+		"showing %d %s; more exist behind this page — raise --limit (max %d)\n",
+		rows, noun, job.ListLimitMax)
+	return err
+}
+
 func daemonUpgradeRequired(method string) error {
 	return fmt.Errorf("%s is unavailable because the running daemon predates it; upgrade or restart the daemon from the same installation as this CLI", method)
 }
@@ -200,6 +272,7 @@ func newJobsCommand(opt *options) *cobra.Command {
 
 	var state string
 	var limit int
+	var jobsConsumer string
 	list := &cobra.Command{
 		Use:         "list",
 		Short:       "List jobs",
@@ -207,7 +280,12 @@ func newJobsCommand(opt *options) *cobra.Command {
 		Args:        cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			effective := effectiveLimit(limit, job.ListLimitMax, job.ListLimitDefault)
-			rows, truncated, err := listJobsPage(cmd.Context(), opt, map[string]any{"state": state, "limit": effective}, effective)
+			consumer := strings.TrimSpace(jobsConsumer)
+			params := map[string]any{"state": state, "limit": effective}
+			if consumer != "" {
+				params["consumer"] = consumer
+			}
+			rows, truncated, err := listAttributedJobsPage(cmd.Context(), opt, params, consumer, effective)
 			if err != nil {
 				return err
 			}
@@ -215,22 +293,29 @@ func newJobsCommand(opt *options) *cobra.Command {
 				return printPage(opt, "jobs", rows, truncated)
 			}
 			for _, row := range rows {
+				consumerColumn := ""
+				if row.Consumer != nil {
+					consumerColumn = "\t" + *row.Consumer
+				}
 				// row.Work.Describe() renders the title/DOI/identifier that
 				// identifies this job: Describe() falls back to a raw Title when
 				// no strong identifier is set, and that Title is third-party
 				// bibliographic metadata normalized with only strings.TrimSpace
 				// (see the search-row comment in search.go). Route it through
 				// StripTerminalControls on this JSON-free branch, or a poisoned
-				// title injects ANSI/OSC escapes into `papio jobs list`.
-				if _, err := fmt.Fprintf(opt.out, "%s\t%s\t%s\n", row.ID, row.State, store.StripTerminalControls(row.Work.Describe())); err != nil {
+				// title injects ANSI/OSC escapes into `papio jobs list`. The
+				// consumer label needs no strip: validConsumer pins it to a
+				// control-free charset at submission.
+				if _, err := fmt.Fprintf(opt.out, "%s\t%s\t%s%s\n", row.ID, row.State, store.StripTerminalControls(row.Work.Describe()), consumerColumn); err != nil {
 					return err
 				}
 			}
-			return nil
+			return truncationNotice(opt, truncated, len(rows), "job(s)")
 		},
 	}
 	list.Flags().StringVar(&state, "state", "", "filter by exact job state")
 	list.Flags().IntVar(&limit, "limit", 100, "maximum rows (1-500)")
+	list.Flags().StringVar(&jobsConsumer, "consumer", "", "only jobs submitted under this consumer name")
 
 	newGetCommand := func(verb string) *cobra.Command {
 		var wait bool
@@ -240,26 +325,27 @@ func newJobsCommand(opt *options) *cobra.Command {
 			Annotations: map[string]string{"mcp:read-only": "true"},
 			Args:        cobra.ExactArgs(1),
 			RunE: func(cmd *cobra.Command, args []string) error {
-				var detail *api.JobDetail
+				var detail *api.JobDetailV2
+				var err error
 				if wait {
-					var err error
 					detail, err = waitForJob(cmd.Context(), opt, args[0])
-					if err != nil {
-						return err
-					}
 				} else {
-					detail = &api.JobDetail{}
-					if err := opt.call(cmd.Context(), "jobs.get", map[string]string{"job_id": args[0]}, detail); err != nil {
-						return err
-					}
+					detail, err = jobDetail(cmd.Context(), opt, args[0])
+				}
+				if err != nil {
+					return err
 				}
 				if opt.jsonOutput {
 					return opt.printJSON(detail)
 				}
+				consumerColumn := ""
+				if detail.Job.Consumer != nil {
+					consumerColumn = "\t" + *detail.Job.Consumer
+				}
 				// detail.Job.Work.Describe() carries the same third-party title
 				// fallback as the jobs-list row above; strip it on this
 				// JSON-free branch too.
-				if _, err := fmt.Fprintf(opt.out, "%s\t%s\t%s\n", detail.Job.ID, detail.Job.State, store.StripTerminalControls(detail.Job.Work.Describe())); err != nil {
+				if _, err := fmt.Fprintf(opt.out, "%s\t%s\t%s%s\n", detail.Job.ID, detail.Job.State, store.StripTerminalControls(detail.Job.Work.Describe()), consumerColumn); err != nil {
 					return err
 				}
 				for _, event := range detail.Events {
@@ -356,15 +442,22 @@ func newActionsCommand(opt *options) *cobra.Command {
 	command := &cobra.Command{Use: "actions", Short: "Inspect required human actions"}
 	var all bool
 	var actionsLimit int
+	var actionsConsumer string
 	list := &cobra.Command{
-		Use:         "list",
-		Short:       "List open human actions",
+		Use:   "list",
+		Short: "List open human actions",
+		Long: "List open human actions.\n\n" +
+			"An action queued long enough to look abandoned is reported stale — " +
+			"`age_seconds` and `stale` in --json, a trailing marker in the text " +
+			"listing — against the configured actions.stale_after_seconds. " +
+			"Staleness is a label and nothing else: no handoff is ever cancelled " +
+			"on a timer, because giving up on an acquisition is your call.",
 		Annotations: map[string]string{"mcp:read-only": "true"},
 		Args:        cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			openOnly := !all
 			effective := effectiveLimit(actionsLimit, job.ListLimitMax, job.ListLimitDefault)
-			actions, truncated, err := listActionsPage(cmd.Context(), opt, openOnly, effective)
+			actions, truncated, err := listAttributedActionsPage(cmd.Context(), opt, openOnly, strings.TrimSpace(actionsConsumer), effective)
 			if err != nil {
 				return err
 			}
@@ -372,15 +465,17 @@ func newActionsCommand(opt *options) *cobra.Command {
 				return printPage(opt, "actions", actions, truncated)
 			}
 			for _, action := range actions {
-				if _, err := fmt.Fprintf(opt.out, "%d\t%s\t%s\t%s%s\n", action.ID, action.JobID, action.Kind, action.Status, accessHint(action)); err != nil {
+				if _, err := fmt.Fprintf(opt.out, "%d\t%s\t%s\t%s%s%s%s\n", action.ID, action.JobID, action.Kind, action.Status,
+					consumerHint(action.Consumer), accessHint(action.HumanAction), staleHint(action)); err != nil {
 					return err
 				}
 			}
-			return nil
+			return truncationNotice(opt, truncated, len(actions), "action(s)")
 		},
 	}
 	list.Flags().BoolVar(&all, "all", false, "include resolved actions")
 	list.Flags().IntVar(&actionsLimit, "limit", job.ListLimitDefault, "maximum rows (1-500)")
+	list.Flags().StringVar(&actionsConsumer, "consumer", "", "only actions whose job was submitted under this consumer name")
 
 	var accept, reject bool
 	resolve := &cobra.Command{
@@ -442,13 +537,31 @@ func newActionsCommand(opt *options) *cobra.Command {
 
 	var limit int
 	var dryRun bool
+	var openJobID string
+	var openActionID int64
 	open := &cobra.Command{
 		Use:   "open",
 		Short: "Open the current browser handoff queue",
-		Args:  cobra.NoArgs,
+		Long: "Open the current browser handoff queue.\n\n" +
+			"With no selector this opens the whole openable queue, newest first.\n" +
+			"--job or --action opens exactly one row instead, for a caller that\n" +
+			"ranked the queue itself and wants the row it chose. A job holding\n" +
+			"several open actions is refused with their ids rather than resolved by\n" +
+			"picking one, and a selector naming no open action is an error: falling\n" +
+			"back to the head of the queue would open somebody else's handoff and\n" +
+			"report success.\n\n" +
+			"The selector is for choosing a row, not for iterating the queue. A\n" +
+			"background caller that loops it over every row has built the autonomous\n" +
+			"drain ADR-0009 does not ratify: your browser is one serial surface, and\n" +
+			"filling it with tabs nobody asked for is not acquisition progress.",
+		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if limit < 0 {
 				return errors.New("--limit must be non-negative")
+			}
+			selector, err := newActionSelector(cmd, strings.TrimSpace(openJobID), openActionID)
+			if err != nil {
+				return err
 			}
 			cfg, err := opt.loadConfig()
 			if err != nil {
@@ -456,6 +569,10 @@ func newActionsCommand(opt *options) *cobra.Command {
 			}
 			var actions []job.HumanAction
 			if err := opt.call(cmd.Context(), "actions.list", map[string]bool{"open_only": true}, &actions); err != nil {
+				return err
+			}
+			actions, err = selector.apply(actions)
+			if err != nil {
 				return err
 			}
 			rows, rowsTruncated, err := listJobsPage(cmd.Context(), opt,
@@ -478,7 +595,7 @@ func newActionsCommand(opt *options) *cobra.Command {
 			urls, urlsTruncated := agentjson.Capped(urls, limit)
 			truncated := urlsTruncated || droppedForMissingJob > 0 || rowsTruncated
 			if len(urls) == 0 && len(actions) > 0 && !opt.jsonOutput {
-				if _, err := fmt.Fprintf(opt.out, "%d open action(s), none openable from here — run 'papio actions list' for details\n", len(actions)); err != nil {
+				if _, err := fmt.Fprintf(opt.out, "%s, none openable from here — run 'papio actions list' for details\n", selector.describe(len(actions))); err != nil {
 					return err
 				}
 				return nil
@@ -503,6 +620,8 @@ func newActionsCommand(opt *options) *cobra.Command {
 	}
 	open.Flags().IntVar(&limit, "limit", 0, "maximum actions to open (default all)")
 	open.Flags().BoolVar(&dryRun, "dry-run", false, "print URLs without opening them")
+	open.Flags().StringVar(&openJobID, "job", "", "open only this job's open action")
+	open.Flags().Int64Var(&openActionID, "action", 0, "open only this action id")
 
 	resolve.Flags().BoolVar(&reject, "reject", false, "reject the identity review")
 	command.AddCommand(list, resolve, dismiss, open)
@@ -753,8 +872,55 @@ func newArtifactsCommand(opt *options) *cobra.Command {
 			return opt.printResult(result, "%s\t%s\t%d bytes", result.SHA256, result.Path, result.SizeBytes)
 		},
 	}
+	validation := &cobra.Command{
+		Use:         "validation <job-id>",
+		Short:       "Print the full validation report for every candidate a job validated",
+		Annotations: map[string]string{"mcp:read-only": "true"},
+		Long: "Print the full validation report for every candidate a job validated.\n\n" +
+			"`artifacts get` returns the shared, content-addressed artifact row —\n" +
+			"which is all it can return, because an artifact belongs to every job\n" +
+			"that obtained the same bytes (ADR-0007). This is the per-job evidence:\n" +
+			"the payload gate, the structural parse, text extraction, and the\n" +
+			"identity decision, each with the reasons and capability evidence behind\n" +
+			"it, for the candidates that were kept AND the ones that were rejected.\n\n" +
+			"Each report is a versioned document (validation-report/1). A job\n" +
+			"validated before this evidence was recorded lists no reports; that\n" +
+			"is an absence, not an empty verdict.",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			var result api.ValidationResult
+			if err := opt.call(cmd.Context(), "artifacts.validation",
+				map[string]string{"job_id": args[0]}, &result); err != nil {
+				if isUnknownMethod(err) {
+					return daemonUpgradeRequired("artifacts.validation")
+				}
+				return err
+			}
+			if opt.jsonOutput {
+				return opt.printJSON(result)
+			}
+			if len(result.Reports) == 0 {
+				_, err := fmt.Fprintf(opt.out,
+					"no validation evidence recorded for %s — the job predates recorded reports, or nothing has been validated yet\n",
+					result.JobID)
+				return err
+			}
+			for _, report := range result.Reports {
+				accepted := ""
+				if report.Accepted {
+					accepted = "\taccepted"
+				}
+				if _, err := fmt.Fprintf(opt.out, "candidate %d\t%s\t%s%s\n%s\n",
+					report.CandidateID, report.Outcome, report.RecordedAt, accepted, report.Document); err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+	}
 	command.AddCommand(locate)
 	command.AddCommand(get)
+	command.AddCommand(validation)
 	return command
 }
 

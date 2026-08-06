@@ -186,6 +186,18 @@ state. See the [filing guide](../guide/hooks.md).
 | --- | --- | --- | --- |
 | `sources` | string array | empty (= `["openalex"]`) | Discovery backends for `papio search` and watches, in merge-preference order. Valid entries: `openalex`, `semanticscholar` (each at most once). Results merge with DOI-then-title deduplication; earlier backends win ties. Per-backend API keys live under `[sources.<name>]` (e.g. `sources.semanticscholar.api_key`, optional — Semantic Scholar works keyless at public rate limits). |
 
+## `[actions]`
+
+| Key | Type | Default | Effect and constraints |
+| --- | --- | --- | --- |
+| `stale_after_seconds` | integer seconds | `604800` (7 days) | How long an open human action may wait before listings report it stale. `0` selects the default; a negative value is rejected. `papio actions list` marks stale rows (`stale` and `age_seconds` in `--json`), and nothing else happens: *papio* never cancels, expires, or sweeps a handoff on a timer. |
+
+This is deliberately not `browser.action_expiry_seconds`. That one (30 minutes by
+default) is a *reminder* cadence — how soon to nudge you again about an open
+action — so reusing it as a staleness threshold would report a handoff queued
+over lunch as abandoned. This one answers "has anyone given up on this?", which
+is measured in days.
+
 ## `[sources.<name>]`
 
 `[sources]` is a map of resolver policies. The supported built-in names are

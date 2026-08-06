@@ -109,6 +109,16 @@ const (
 	PrincipalMCP     Principal = "mcp"
 )
 
+// Attribution records who asked for an acquisition. Principal is the transport
+// papio observed for itself; Consumer is the optional name a caller supplied
+// for its own accounting, and is empty whenever none was given — a shared
+// daemon partitions its totals by Consumer, never by Principal, which only
+// distinguishes the socket from the in-process agent surface.
+type Attribution struct {
+	Principal Principal
+	Consumer  string
+}
+
 // Terminal reports whether a state ends the acquisition attempt. ready is the
 // acquisition terminal; imported additionally records a completed Zotero
 // export; other exports remain separate idempotent records.
@@ -353,7 +363,7 @@ type CreateResult struct {
 // one transaction. Resubmitting the same requestID returns its existing live
 // job; terminal attempts permit a new job.
 func (js *Store) CreateRequest(ctx context.Context, requestID string, w work.Work, zotioKey, collection string, pol Policy, rawIDs map[string]string, principal Principal) (string, error) {
-	result, err := js.createRequest(ctx, requestID, w, zotioKey, collection, pol, rawIDs, principal, false, false)
+	result, err := js.createRequest(ctx, requestID, w, zotioKey, collection, pol, rawIDs, Attribution{Principal: principal}, false, false)
 	if err != nil {
 		return "", err
 	}
@@ -364,13 +374,19 @@ func (js *Store) CreateRequest(ctx context.Context, requestID string, w work.Wor
 // work.Work.Describe identity. It deliberately excludes title-only matching:
 // titles describe works rather than assert identity, so merging on one could
 // silently discard a distinct acquisition.
-func (js *Store) CreateRequestForWork(ctx context.Context, requestID string, w work.Work, zotioKey, collection string, pol Policy, rawIDs map[string]string, principal Principal, force bool) (CreateResult, error) {
-	return js.createRequest(ctx, requestID, w, zotioKey, collection, pol, rawIDs, principal, force, true)
+//
+// It takes the full Attribution because it is the production submit path, the
+// only place a caller-supplied consumer can be recorded. A reused live job
+// keeps the attribution it was queued with: the second submitter did not create
+// this acquisition, and rewriting the row would hand one consumer another's
+// work.
+func (js *Store) CreateRequestForWork(ctx context.Context, requestID string, w work.Work, zotioKey, collection string, pol Policy, rawIDs map[string]string, who Attribution, force bool) (CreateResult, error) {
+	return js.createRequest(ctx, requestID, w, zotioKey, collection, pol, rawIDs, who, force, true)
 }
 
-func (js *Store) createRequest(ctx context.Context, requestID string, w work.Work, zotioKey, collection string, pol Policy, rawIDs map[string]string, principal Principal, force, deduplicateWork bool) (CreateResult, error) {
-	if principal == "" {
-		principal = PrincipalUnknown
+func (js *Store) createRequest(ctx context.Context, requestID string, w work.Work, zotioKey, collection string, pol Policy, rawIDs map[string]string, who Attribution, force, deduplicateWork bool) (CreateResult, error) {
+	if who.Principal == "" {
+		who.Principal = PrincipalUnknown
 	}
 	if requestID == "" || force {
 		// A force request needs its own work_request row so the live-job
@@ -413,7 +429,7 @@ func (js *Store) createRequest(ctx context.Context, requestID string, w work.Wor
 	if _, err := tx.ExecContext(ctx,
 		`INSERT OR IGNORE INTO work_requests (id, created_at, requester, zotio_item_key, collection_key, title, authors_json, year, desired_version, max_cost_usd)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		requestID, now, principal, nullable(zotioKey), nullable(collection), nullable(w.Title), string(authorsJSON), nullableInt(w.Year), pol.DesiredVersion, pol.MaxCostUSD); err != nil {
+		requestID, now, who.Principal, nullable(zotioKey), nullable(collection), nullable(w.Title), string(authorsJSON), nullableInt(w.Year), pol.DesiredVersion, pol.MaxCostUSD); err != nil {
 		return CreateResult{}, fmt.Errorf("inserting work request: %w", err)
 	}
 	for kind, value := range map[string]string{"doi": w.DOI, "pmid": w.PMID, "arxiv": w.ArXiv, "isbn": w.ISBN, "openalex": w.OpenAlex} {
@@ -430,9 +446,15 @@ func (js *Store) createRequest(ctx context.Context, requestID string, w work.Wor
 			return CreateResult{}, fmt.Errorf("inserting identifier %s: %w", kind, err)
 		}
 	}
+	// consumer is written here, on the job, rather than on the work_request the
+	// INSERT OR IGNORE above may have reused: the submitter asked for THIS
+	// acquisition. A resubmitted request id whose earlier jobs are terminal
+	// creates a new job, and it must carry the name of whoever resubmitted it
+	// rather than inheriting the first submitter's.
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO jobs (id, work_request_id, state, policy_json, created_at, updated_at) VALUES (?, ?, 'queued', ?, ?, ?)`,
-		jobID, requestID, string(polJSON), now, now); err != nil {
+		`INSERT INTO jobs (id, work_request_id, state, policy_json, consumer, created_at, updated_at)
+		 VALUES (?, ?, 'queued', ?, ?, ?, ?)`,
+		jobID, requestID, string(polJSON), nullable(who.Consumer), now, now); err != nil {
 		return CreateResult{}, fmt.Errorf("inserting job: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx,
@@ -1528,7 +1550,7 @@ const (
 
 // List returns jobs, optionally filtered by state, newest first.
 func (js *Store) List(ctx context.Context, state string, limit int) ([]Row, error) {
-	rows, _, err := js.listJobs(ctx, state, EffectiveListLimit(limit), false)
+	rows, _, err := js.listJobs(ctx, state, "", EffectiveListLimit(limit), false)
 	return rows, err
 }
 
@@ -1539,7 +1561,18 @@ func (js *Store) List(ctx context.Context, state string, limit int) ([]Row, erro
 // requested limit cannot — an exactly-full final page is indistinguishable from
 // a truncated one.
 func (js *Store) ListPage(ctx context.Context, state string, limit int) ([]Row, bool, error) {
-	return js.listJobs(ctx, state, EffectiveListLimit(limit), true)
+	return js.listJobs(ctx, state, "", EffectiveListLimit(limit), true)
+}
+
+// ListPageFor is ListPage narrowed to one consumer's submissions. An empty
+// consumer is unfiltered, exactly as an empty state is.
+//
+// The filter is applied in SQL rather than to a fetched page because the page
+// bound and its truncation proof have to describe the rows the caller asked
+// for: filtering afterwards would return a short page and claim it was
+// complete.
+func (js *Store) ListPageFor(ctx context.Context, state, consumer string, limit int) ([]Row, bool, error) {
+	return js.listJobs(ctx, state, consumer, EffectiveListLimit(limit), true)
 }
 
 // EffectiveListLimit resolves a caller-supplied limit the way the store applies
@@ -1564,16 +1597,24 @@ func EffectiveListLimit(limit int) int {
 
 // listJobs fetches limit rows, or limit+1 when probing so the caller learns
 // whether the page is partial. limit must already be effective.
-func (js *Store) listJobs(ctx context.Context, state string, limit int, probe bool) ([]Row, bool, error) {
+func (js *Store) listJobs(ctx context.Context, state, consumer string, limit int, probe bool) ([]Row, bool, error) {
 	fetch := limit
 	if probe {
 		fetch++
 	}
 	q := `SELECT id FROM jobs`
 	args := []any{}
+	var where []string
 	if state != "" {
-		q += ` WHERE state = ?`
+		where = append(where, `state = ?`)
 		args = append(args, state)
+	}
+	if consumer != "" {
+		where = append(where, `consumer = ?`)
+		args = append(args, consumer)
+	}
+	if len(where) != 0 {
+		q += ` WHERE ` + strings.Join(where, ` AND `)
 	}
 	q += ` ORDER BY created_at DESC LIMIT ?`
 	args = append(args, fetch)
@@ -2808,14 +2849,34 @@ func (js *Store) listOpenHandoffJobs(ctx context.Context, limit int, probe bool)
 // ListHumanActions returns actions, optionally only open ones. Unbounded: the
 // inbox and maintenance callers need the whole set.
 func (js *Store) ListHumanActions(ctx context.Context, openOnly bool) ([]HumanAction, error) {
-	rows, _, err := js.listHumanActions(ctx, openOnly, nil, 0)
-	return rows, err
+	rows, _, err := js.listHumanActions(ctx, openOnly, nil, "", 0)
+	return bareActions(rows), err
 }
 
 // ListHumanActionsPage returns one bounded page of actions and whether more
 // exist behind it, proven the same way as ListPage.
 func (js *Store) ListHumanActionsPage(ctx context.Context, openOnly bool, limit int) ([]HumanAction, bool, error) {
-	return js.listHumanActions(ctx, openOnly, nil, EffectiveListLimit(limit))
+	rows, truncated, err := js.listHumanActions(ctx, openOnly, nil, "", EffectiveListLimit(limit))
+	return bareActions(rows), truncated, err
+}
+
+// ListHumanActionsPageFor returns one bounded page of actions carrying each
+// row's consumer attribution, optionally narrowed to a single consumer. An
+// empty consumer is unfiltered.
+func (js *Store) ListHumanActionsPageFor(ctx context.Context, openOnly bool, consumer string, limit int) ([]AttributedAction, bool, error) {
+	return js.listHumanActions(ctx, openOnly, nil, consumer, EffectiveListLimit(limit))
+}
+
+// ListHumanActionsForJob returns every action recorded for one job, open or
+// resolved, with its attribution. Unbounded like ListHumanActions: a single
+// job's action history is small, and a bound here could hide the open handoff a
+// caller is asking about.
+func (js *Store) ListHumanActionsForJob(ctx context.Context, jobID string) ([]AttributedAction, error) {
+	if jobID == "" {
+		return nil, nil
+	}
+	rows, _, err := js.listHumanActions(ctx, false, []string{jobID}, "", 0)
+	return rows, err
 }
 
 // ListOpenHumanActionsForJobs returns open actions for the supplied bounded job
@@ -2825,32 +2886,65 @@ func (js *Store) ListOpenHumanActionsForJobs(ctx context.Context, jobIDs []strin
 	if len(jobIDs) == 0 {
 		return nil, nil
 	}
-	rows, _, err := js.listHumanActions(ctx, true, jobIDs, 0)
-	return rows, err
+	rows, _, err := js.listHumanActions(ctx, true, jobIDs, "", 0)
+	return bareActions(rows), err
+}
+
+// AttributedAction pairs one human action with the consumer that submitted its
+// job. Consumer is empty when the submission recorded none, which is the honest
+// answer for every request queued before attribution existed: it is not
+// backfilled and never defaulted.
+//
+// It exists because Consumer must not become a HumanAction field. HumanAction is
+// the row body of actions.list, decoded with DisallowUnknownFields, so widening
+// it would make every older papio reject a newer daemon's listing.
+type AttributedAction struct {
+	Action   HumanAction
+	Consumer string
+}
+
+func bareActions(rows []AttributedAction) []HumanAction {
+	if len(rows) == 0 {
+		return nil
+	}
+	out := make([]HumanAction, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, row.Action)
+	}
+	return out
 }
 
 // listHumanActions returns every matching action when limit is 0, otherwise one
 // page plus a proof of whether more exist: it fetches limit+1 rows and reports
 // whether the extra one was there.
-func (js *Store) listHumanActions(ctx context.Context, openOnly bool, jobIDs []string, limit int) ([]HumanAction, bool, error) {
-	q := `SELECT id, job_id, kind, status, COALESCE(detail,''), requires_auth, blocked_by, created_at,
-		COALESCE(candidate_id, 0), quarantine_path, quarantine_sha256, revision
-		FROM human_actions`
+//
+// The jobs reach is a LEFT JOIN on purpose: an action whose parent job row has
+// gone must still be listed and closable, so a missing attribution can never make
+// an open action disappear from the inbox.
+func (js *Store) listHumanActions(ctx context.Context, openOnly bool, jobIDs []string, consumer string, limit int) ([]AttributedAction, bool, error) {
+	q := `SELECT a.id, a.job_id, a.kind, a.status, COALESCE(a.detail,''), a.requires_auth, a.blocked_by, a.created_at,
+		COALESCE(a.candidate_id, 0), a.quarantine_path, a.quarantine_sha256, a.revision, j.consumer
+		FROM human_actions a
+		LEFT JOIN jobs j ON j.id = a.job_id`
 	var where []string
 	var args []any
 	if openOnly {
-		where = append(where, `status = 'open'`)
+		where = append(where, `a.status = 'open'`)
 	}
 	if jobIDs != nil {
-		where = append(where, `job_id IN (`+strings.TrimSuffix(strings.Repeat("?,", len(jobIDs)), ",")+`)`)
+		where = append(where, `a.job_id IN (`+strings.TrimSuffix(strings.Repeat("?,", len(jobIDs)), ",")+`)`)
 		for _, id := range jobIDs {
 			args = append(args, id)
 		}
 	}
+	if consumer != "" {
+		where = append(where, `j.consumer = ?`)
+		args = append(args, consumer)
+	}
 	if len(where) != 0 {
 		q += ` WHERE ` + strings.Join(where, ` AND `)
 	}
-	q += ` ORDER BY id DESC`
+	q += ` ORDER BY a.id DESC`
 	if limit > 0 {
 		q += ` LIMIT ?`
 		args = append(args, limit+1)
@@ -2860,17 +2954,18 @@ func (js *Store) listHumanActions(ctx context.Context, openOnly bool, jobIDs []s
 		return nil, false, err
 	}
 	defer func() { _ = rows.Close() }()
-	var out []HumanAction
+	var out []AttributedAction
 	for rows.Next() {
 		var h HumanAction
+		var consumer sql.NullString
 		if err := rows.Scan(
 			&h.ID, &h.JobID, &h.Kind, &h.Status, &h.Detail, &h.RequiresAuth, &h.BlockedBy, &h.CreatedAt,
-			&h.CandidateID, &h.QuarantinePath, &h.QuarantineSHA256, &h.Revision,
+			&h.CandidateID, &h.QuarantinePath, &h.QuarantineSHA256, &h.Revision, &consumer,
 		); err != nil {
 			_ = rows.Close()
 			return nil, false, err
 		}
-		out = append(out, h)
+		out = append(out, AttributedAction{Action: h, Consumer: consumer.String})
 	}
 	if err := rows.Close(); err != nil {
 		return nil, false, err

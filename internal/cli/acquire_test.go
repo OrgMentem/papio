@@ -220,26 +220,26 @@ func TestAcquireBatchPassesLoadedLibraryFingerprint(t *testing.T) {
 
 func TestAcquireWaitUsesCurrentOpenActionGuidance(t *testing.T) {
 	var out, errOut bytes.Buffer
-	detail := api.JobDetail{
-		Job: &job.Row{
+	detail := api.JobDetailV2{
+		Job: &api.JobRow{Row: job.Row{
 			ID:     "doi:10.1177/0018720814547570",
 			State:  job.StateAwaitingHuman,
 			Policy: job.Policy{AccessMode: config.ModeDelegated},
-		},
+		}},
 		Events: []map[string]any{{"kind": "job.transition", "detail": map[string]any{
 			"to": job.StateAwaitingHuman, "reason": "login_required",
 		}}},
-		Actions: []job.HumanAction{{
+		Actions: []api.ActionRow{{HumanAction: job.HumanAction{
 			ID: 228, JobID: "doi:10.1177/0018720814547570", Kind: "manual_download", Status: "open", RequiresAuth: true, BlockedBy: "landing_page",
-		}},
+		}}},
 	}
 	root := NewInProcessRoot(&out, &errOut, config.Config{AccessMode: config.ModeDelegated},
 		func(_ context.Context, method string, _ any, result any) error {
 			switch method {
 			case "acquire.submit_v2":
 				*result.(*api.SubmitV2Result) = api.SubmitV2Result{JobID: detail.Job.ID}
-			case "jobs.get":
-				*result.(*api.JobDetail) = detail
+			case "jobs.get_v2":
+				*result.(*api.JobDetailV2) = detail
 			default:
 				return fmt.Errorf("unexpected method %q", method)
 			}

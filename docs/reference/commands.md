@@ -41,6 +41,7 @@ papio acquire [identifier] [flags]
 | `--auto-import` | `bool` | `false` | plan and apply zotio import automatically when ready |
 | `--batch` | `string` |  | submit works from a JSONL, RIS, BibTeX, CSL-JSON, or MEDLINE/NBIB file (or - for standard input) |
 | `--collection` | `string` |  | target Zotero collection name (key when used with --from-zotio) |
+| `--consumer` | `string` |  | name the submitting consumer, for per-consumer accounting on a shared daemon |
 | `--deny-source` | `stringSlice` | `[]` | deny this source (repeatable) |
 | `--desired-version` | `string` | `any` | published, accepted, preprint, or any |
 | `--doi` | `string` |  | DOI |
@@ -98,6 +99,10 @@ papio actions dismiss <action-id> [flags]
 
 List open human actions
 
+List open human actions.
+
+An action queued long enough to look abandoned is reported stale — `age_seconds` and `stale` in --json, a trailing marker in the text listing — against the configured actions.stale_after_seconds. Staleness is a label and nothing else: no handoff is ever cancelled on a timer, because giving up on an acquisition is your call.
+
 ```
 papio actions list [flags]
 ```
@@ -105,11 +110,27 @@ papio actions list [flags]
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
 | `--all` | `bool` | `false` | include resolved actions |
+| `--consumer` | `string` |  | only actions whose job was submitted under this consumer name |
 | `--limit` | `int` | `100` | maximum rows (1-500) |
 
 ### `papio actions open`
 
 Open the current browser handoff queue
+
+Open the current browser handoff queue.
+
+With no selector this opens the whole openable queue, newest first.
+--job or --action opens exactly one row instead, for a caller that
+ranked the queue itself and wants the row it chose. A job holding
+several open actions is refused with their ids rather than resolved by
+picking one, and a selector naming no open action is an error: falling
+back to the head of the queue would open somebody else's handoff and
+report success.
+
+The selector is for choosing a row, not for iterating the queue. A
+background caller that loops it over every row has built the autonomous
+drain ADR-0009 does not ratify: your browser is one serial surface, and
+filling it with tabs nobody asked for is not acquisition progress.
 
 ```
 papio actions open [flags]
@@ -117,7 +138,9 @@ papio actions open [flags]
 
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
+| `--action` | `int64` | `0` | open only this action id |
 | `--dry-run` | `bool` | `false` | print URLs without opening them |
+| `--job` | `string` |  | open only this job's open action |
 | `--limit` | `int` | `0` | maximum actions to open (default all) |
 
 ### `papio actions resolve`
@@ -222,6 +245,27 @@ Print where one job's validated artifact bytes live
 
 ```
 papio artifacts locate <job-id>
+```
+
+### `papio artifacts validation`
+
+Print the full validation report for every candidate a job validated
+
+Print the full validation report for every candidate a job validated.
+
+`artifacts get` returns the shared, content-addressed artifact row —
+which is all it can return, because an artifact belongs to every job
+that obtained the same bytes (ADR-0007). This is the per-job evidence:
+the payload gate, the structural parse, text extraction, and the
+identity decision, each with the reasons and capability evidence behind
+it, for the candidates that were kept AND the ones that were rejected.
+
+Each report is a versioned document (validation-report/1). A job
+validated before this evidence was recorded lists no reports; that
+is an absence, not an empty verdict.
+
+```
+papio artifacts validation <job-id>
 ```
 
 ## `papio batch`
@@ -491,6 +535,7 @@ papio jobs list [flags]
 
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
+| `--consumer` | `string` |  | only jobs submitted under this consumer name |
 | `--limit` | `int` | `100` | maximum rows (1-500) |
 | `--state` | `string` |  | filter by exact job state |
 

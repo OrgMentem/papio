@@ -7,7 +7,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -22,7 +21,6 @@ import (
 	"papio/internal/batch"
 	"papio/internal/errcat"
 	"papio/internal/ingest"
-	"papio/internal/ipc"
 	"papio/internal/job"
 	"papio/internal/protocol"
 	"papio/internal/work"
@@ -31,7 +29,7 @@ import (
 
 func newAcquireCommand(opt *options) *cobra.Command {
 	var doi, pmid, arxivID, isbn, openalex string
-	var title, requestID, zotioKey, collection, desiredVersion, accessMode, resolver, label string
+	var title, requestID, zotioKey, collection, desiredVersion, accessMode, resolver, label, consumer string
 	var authors, allowSources, denySources []string
 	var year, queueLimit int
 	var maxCost float64
@@ -59,7 +57,7 @@ func newAcquireCommand(opt *options) *cobra.Command {
 				if err := validateBatchFlags(cmd, args, fromZotio, wait); err != nil {
 					return err
 				}
-				return acquireBatch(cmd.Context(), cmd, opt, batchPath, autoImportOverride, strings.TrimSpace(collection), strings.TrimSpace(resolver), strings.TrimSpace(label), includeOwned)
+				return acquireBatch(cmd.Context(), cmd, opt, batchPath, autoImportOverride, strings.TrimSpace(collection), strings.TrimSpace(resolver), strings.TrimSpace(label), strings.TrimSpace(consumer), includeOwned)
 			}
 			if fromDigestRequested {
 				if fromDigest <= 0 {
@@ -164,7 +162,7 @@ func newAcquireCommand(opt *options) *cobra.Command {
 				request.MaxCostUSD = &maxCost
 			}
 			var submitted api.SubmitV2Result
-			if err := submitAcquire(cmd.Context(), opt, request, autoImportOverride, force, &submitted); err != nil {
+			if err := submitAcquire(cmd.Context(), opt, request, autoImportOverride, force, strings.TrimSpace(consumer), &submitted); err != nil {
 				return err
 			}
 			if !wait {
@@ -188,11 +186,11 @@ func newAcquireCommand(opt *options) *cobra.Command {
 			if !opt.jsonOutput {
 				cfg, _ := opt.loadConfig()
 				reason := transitionReason(detail.Events, detail.Job.State)
-				if g := errcat.WaitGuidanceWithOpenAction(detail.Job.State, reason, detail.Job.Policy.Resolver, detail.Job.Policy.AccessMode, detail.Actions, cfg); g != "" {
+				if g := errcat.WaitGuidanceWithOpenAction(detail.Job.State, reason, detail.Job.Policy.Resolver, detail.Job.Policy.AccessMode, bareActions(detail.Actions), cfg); g != "" {
 					prose += "\n" + g
 				}
 			}
-			return opt.printResult(acquireWaitResult{JobDetail: detail, Existing: submitted.Existing}, "%s", prose)
+			return opt.printResult(acquireWaitResult{JobDetailV2: detail, Existing: submitted.Existing}, "%s", prose)
 		},
 	}
 	flags := command.Flags()
@@ -223,6 +221,7 @@ func newAcquireCommand(opt *options) *cobra.Command {
 	flags.StringVar(&label, "label", "", "query context; also the default target collection when --collection is unset")
 	flags.BoolVar(&autoImport, "auto-import", false, "plan and apply zotio import automatically when ready")
 	flags.BoolVar(&force, "force", false, "create a fresh job even when this work is already in flight")
+	flags.StringVar(&consumer, "consumer", "", "name the submitting consumer, for per-consumer accounting on a shared daemon")
 	return command
 }
 
@@ -360,14 +359,23 @@ type acquireSubmitParams struct {
 	AutoImport *bool                `json:"auto_import,omitempty"`
 }
 
+// acquireSubmitV2Params mirrors the params ADR-0010 froze. Do not add a key: a
+// consumer-bearing submission uses acquireSubmitV3Params instead.
 type acquireSubmitV2Params struct {
 	Request    protocol.WorkRequest `json:"request"`
 	AutoImport *bool                `json:"auto_import,omitempty"`
 	Force      bool                 `json:"force,omitempty"`
 }
 
+type acquireSubmitV3Params struct {
+	Request    protocol.WorkRequest `json:"request"`
+	AutoImport *bool                `json:"auto_import,omitempty"`
+	Force      bool                 `json:"force,omitempty"`
+	Consumer   string               `json:"consumer,omitempty"`
+}
+
 type acquireWaitResult struct {
-	*api.JobDetail
+	*api.JobDetailV2
 	Existing bool `json:"existing,omitempty"`
 }
 
@@ -402,9 +410,28 @@ func validateBatchFlags(cmd *cobra.Command, args []string, fromZotio, wait bool)
 	if wait {
 		return fmt.Errorf("--wait is not supported with --batch")
 	}
+	// --request-id names ONE work's convergence key, and a batch has one key per
+	// work, derived from the batch identity and that work's identity
+	// (batch.RequestID). So it is refused with the mechanism that replaces it,
+	// not with the old advice to "put it in JSONL": the JSONL work decoder is
+	// strict and has no request_id field, so following that suggestion produced
+	// `unknown field "request_id"` and left the caller with no working option at
+	// all.
+	//
+	// "convergence key", not "idempotency key" — ADR-0010 is explicit that a
+	// request id converges on a LIVE job and that a terminal job plus the same id
+	// creates a new one. And the reproduction is same-day only: batch.ID mixes in
+	// the local calendar date, so the identical work set submitted tomorrow gets
+	// different keys. Both qualifications are in the message, because a message
+	// that overstates its mechanism is the defect this refusal exists to fix.
+	if cmd.Flags().Changed("request-id") {
+		return fmt.Errorf("--request-id names a single work's convergence key and cannot key a batch; " +
+			"batch works get deterministic per-work request ids derived from the batch and the work, " +
+			"so resubmitting the same works on the same day reproduces them — see `papio batch report <batch-id>`")
+	}
 	for _, name := range []string{
 		"doi", "pmid", "arxiv", "isbn", "openalex", "title", "author", "year",
-		"request-id", "zotio-item-key", "desired-version", "access-mode",
+		"zotio-item-key", "desired-version", "access-mode",
 		"max-cost", "source", "deny-source", "limit", "force",
 	} {
 		if cmd.Flags().Changed(name) {
@@ -481,14 +508,35 @@ func batchRequestID(ids *protocol.Identifiers, title string, authors []string, y
 	return batch.InitialRequestID(ids, title, authors, year)
 }
 
-func submitAcquire(ctx context.Context, opt *options, request protocol.WorkRequest, autoImport *bool, force bool, result *api.SubmitV2Result) error {
+// submitAcquire prefers the narrowest method that can carry the request.
+//
+// A submission naming no consumer goes to the ratified acquire.submit_v2
+// unchanged, so the ordinary path gains no new failure mode. A consumer-bearing
+// submission needs acquire.submit_v3, and an older daemon answers unknown_method
+// — reported as skew rather than retried without the attribution, because
+// recording the batch as nobody's work is worse than failing.
+//
+// Keying the fallback on the METHOD name rather than on a rejected param also
+// removes an ambiguity: a daemon rejecting unknown params and a daemon rejecting
+// a genuinely invalid work request both answer invalid_argument, so param
+// sniffing could report a real validation error as a version problem.
+func submitAcquire(ctx context.Context, opt *options, request protocol.WorkRequest, autoImport *bool, force bool, consumer string, result *api.SubmitV2Result) error {
+	if consumer != "" {
+		params := acquireSubmitV3Params{Request: request, AutoImport: autoImport, Force: force, Consumer: consumer}
+		if err := opt.call(ctx, "acquire.submit_v3", params, result); err != nil {
+			if isUnknownMethod(err) {
+				return daemonUpgradeRequired("acquire.submit_v3 (--consumer attribution)")
+			}
+			return err
+		}
+		return nil
+	}
 	v2Params := acquireSubmitV2Params{Request: request, AutoImport: autoImport, Force: force}
 	err := opt.call(ctx, "acquire.submit_v2", v2Params, result)
 	if err == nil {
 		return nil
 	}
-	var remote *ipc.RemoteError
-	if !errors.As(err, &remote) || remote.Code != "unknown_method" {
+	if !isUnknownMethod(err) {
 		return err
 	}
 	if force {
@@ -515,7 +563,7 @@ func (c socketBatchCaller) Call(ctx context.Context, method string, params, resu
 	return c.opt.socketCall(ctx, c.socket, method, params, result)
 }
 
-func acquireBatch(ctx context.Context, cmd *cobra.Command, opt *options, path string, autoImport *bool, collection, resolver, label string, includeOwned bool) error {
+func acquireBatch(ctx context.Context, cmd *cobra.Command, opt *options, path string, autoImport *bool, collection, resolver, label, consumer string, includeOwned bool) error {
 	reader := cmd.InOrStdin()
 	var file *os.File
 	if path != "-" {
@@ -550,7 +598,7 @@ func acquireBatch(ctx context.Context, cmd *cobra.Command, opt *options, path st
 	}
 	output, submitErr := batch.Submit(ctx, socketBatchCaller{opt: opt, socket: socket}, cfg.DataDir, requests, batch.SubmitOptions{
 		AutoImport: autoImport, Collection: collection, Resolver: resolver, Label: label, IncludeOwned: includeOwned,
-		Holdings: useHoldings, LibraryFingerprint: libraryFingerprint,
+		Holdings: useHoldings, LibraryFingerprint: libraryFingerprint, Consumer: consumer,
 	})
 	if output == nil {
 		return submitErr
@@ -597,19 +645,24 @@ func applyBatchOwnership(requests []protocol.WorkRequest, ownership zotio.Lookup
 	return batch.ApplyOwnership(requests, ownership, collection, includeOwned)
 }
 
-func waitForJob(ctx context.Context, opt *options, id string) (*api.JobDetail, error) {
+// waitForJob polls until the job reaches a terminal or human-blocked state.
+//
+// It reads through jobDetail so a wait renders the same shape a bare
+// `papio jobs get` does — including the submitting consumer — rather than the
+// two differing shapes one command would otherwise emit depending on --wait.
+func waitForJob(ctx context.Context, opt *options, id string) (*api.JobDetailV2, error) {
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		var detail api.JobDetail
-		if err := opt.call(ctx, "jobs.get", map[string]string{"job_id": id}, &detail); err != nil {
+		detail, err := jobDetail(ctx, opt, id)
+		if err != nil {
 			return nil, err
 		}
 		if detail.Job == nil {
 			return nil, fmt.Errorf("daemon returned no job for %s", id)
 		}
 		if job.Terminal(detail.Job.State) || detail.Job.State == job.StateAwaitingHuman || detail.Job.State == job.StateNeedsReview {
-			return &detail, nil
+			return detail, nil
 		}
 		select {
 		case <-ctx.Done():
@@ -617,4 +670,45 @@ func waitForJob(ctx context.Context, opt *options, id string) (*api.JobDetail, e
 		case <-ticker.C:
 		}
 	}
+}
+
+// jobDetail prefers jobs.get_v2, which adds the submitting consumer and each
+// action's staleness, and falls back to jobs.get against an older daemon. The
+// fallback's rows simply carry no attribution, which is the truth: a daemon that
+// predates the column recorded none.
+func jobDetail(ctx context.Context, opt *options, id string) (*api.JobDetailV2, error) {
+	params := map[string]string{"job_id": id}
+	var detail api.JobDetailV2
+	err := opt.call(ctx, "jobs.get_v2", params, &detail)
+	if err == nil {
+		return &detail, nil
+	}
+	if !isUnknownMethod(err) {
+		return nil, err
+	}
+	var legacy api.JobDetail
+	if err := opt.call(ctx, "jobs.get", params, &legacy); err != nil {
+		return nil, err
+	}
+	out := api.JobDetailV2{Events: legacy.Events, Actions: make([]api.ActionRow, 0, len(legacy.Actions))}
+	if legacy.Job != nil {
+		out.Job = &api.JobRow{Row: *legacy.Job}
+	}
+	for _, action := range legacy.Actions {
+		out.Actions = append(out.Actions, api.ActionRow{HumanAction: action})
+	}
+	return &out, nil
+}
+
+// bareActions drops the attribution wrapper for callers typed on the ratified
+// row, so guidance and handoff selection keep one action type.
+func bareActions(rows []api.ActionRow) []job.HumanAction {
+	if len(rows) == 0 {
+		return nil
+	}
+	out := make([]job.HumanAction, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, row.HumanAction)
+	}
+	return out
 }

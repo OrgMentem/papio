@@ -11,6 +11,81 @@ execution records in `notes/acquisition-stack-plan.md`.
 
 ## [Unreleased]
 
+### Added
+
+- **`papio actions open` takes a row selector, so a consumer can open the
+  handoff it chose.** The command opened the head of the queue and nothing else,
+  which is the wrong shape for a caller that ranks its own routes — one
+  consumer ranking 164 queued institutional routes by script reach could only
+  ever reach the newest. `--job <job-id>` and `--action <id>` open exactly that
+  row, and a job holding several open actions is refused with their ids rather
+  than resolved by picking one. A selector naming no open action is a clean
+  error naming where to look; it does not claim to know whether the row was
+  resolved or never existed, because the open-action list it reads cannot tell
+  those apart. What it never does is fall back to the head of the queue, which
+  would open an unrelated institution's handoff and report success.
+- **Acquisitions can carry a consumer name, and listings can be partitioned by
+  it.** `work_requests.requester` records the transport principal (`cli`,
+  `mcp`, `unknown`), which answers "how did this arrive" and never "who asked
+  for it", so a daemon shared between people produced one undifferentiated
+  total. `papio acquire --consumer <name>` (also with `--batch`) records the
+  submitter through the new `acquire.submit_v3`; `papio jobs list --consumer`,
+  `papio actions list --consumer`, and the new `jobs.list_v3` /
+  `actions.list_v3` / `jobs.get_v2` methods return and filter it. Attribution is
+  nullable with no backfill and no default: a request that named no consumer has
+  none, the key is absent rather than empty, and a submission matching an
+  in-flight job never rewrites the attribution that job was queued with. It
+  binds to the job rather than the work request, so resubmitting a request id
+  whose earlier jobs are terminal attributes the new acquisition to whoever
+  resubmitted it. A `--consumer` filter against a daemon that predates the
+  column is refused rather than answered with every consumer's rows. It is a
+  caller's own accounting label: *papio* authenticates nobody, so it is not an
+  identity and must never be read as a rights input (ADR-0014). Schema
+  version 20. On landing, `acquire.submit_v3` was ratified alongside the
+  readers (ADR-0014 Decision 4 addendum): its consumer asked, which was the
+  condition Decision 4 set.
+- **`papio artifacts validation <job-id>` returns the complete validation
+  report.** Every stage's evidence was computed and then discarded: only the
+  projections that fit the artifact row survived (page count, text characters,
+  OCR use, encryption, active content, identity result), so the payload gate's
+  reason, the structural rejection reason, and the identity and capability
+  evidence were unrecoverable, and a consumer making a rights or quality call
+  had to re-derive them from fragments. Each validation now persists a versioned
+  `validation-report/1` document keyed to the job and candidate — for rejected
+  candidates too, which is the set "why not this one?" is asked about. The
+  extracted text excerpt is deliberately not persisted, and every reason and
+  evidence line is bounded and stripped of control characters: several are a
+  third-party parser's stderr produced while reading a publisher-supplied file.
+  `artifacts.get` is unchanged: it returns the shared, content-addressed artifact
+  row, and ADR-0007 forbids projecting one job's identity decision through it.
+  Jobs validated before this release list no reports; that is an absence, not an
+  empty verdict. This reverses one clause of ADR-0007, which had withdrawn
+  structured validation evidence from the external surface; ADR-0014 records why
+  the reasoning behind that withdrawal — no per-job identity through a shared
+  artifact — is satisfied rather than evaded by keying the evidence to the job
+  and candidate. The accepted candidate's bundle remains the only success
+  provenance document.
+- **`papio actions open` now leaves an audit trail.** Each opened handoff records
+  a `handoff.opened` event carrying the owning consumer, the transport principal,
+  and the batch size. ADR-0009 does not ratify autonomous drain — a background
+  consumer must not open human work on its own — and ADR-0014 Decision 6 declines
+  to enforce that with a gate, because a script passes any flag a human passes and
+  an agent driving the CLI is meant to get exactly what a human gets. That trade
+  is only honest if the boundary is observable: "consumer X opened N human actions
+  in M minutes" is now answerable from the event stream, and a drain reads as an
+  anomaly rather than as normal traffic. The event names the handoff's owner,
+  recorded at submit, rather than an unverifiable label supplied by the caller
+  under audit.
+- **An open human action that has waited too long is reported stale.** A
+  handoff queued weeks ago sat in the queue indistinguishable from one queued
+  this morning. `papio actions list` now reports `stale` and `age_seconds` per
+  row (a trailing marker in the text listing) against the new
+  `actions.stale_after_seconds` config key, default 7 days. Nothing expires as
+  a result: *papio* does not cancel, sweep, or close a handoff on a timer,
+  because abandoning an acquisition is a person's decision. The threshold is
+  separate from `browser.action_expiry_seconds`, which is a 30-minute reminder
+  cadence and would have called a handoff queued over lunch abandoned.
+
 ### Changed
 
 - **The privacy policy now says what the daemon actually sends.** It claimed
@@ -115,6 +190,22 @@ execution records in `notes/acquisition-stack-plan.md`.
   on every verdict a human sees. Markers are matched as line prefixes: a
   Bonferroni correction mid-sentence is a real paper, so the list carries
   "retraction of" rather than "retraction" and deliberately omits "response to".
+
+- **`papio jobs list` and `papio actions list` state truncation on the human
+  surface too.** `--json` has carried a proven `truncated` since 0.16.0, while
+  the text listing stopped at the limit and looked complete. Both now say how
+  many rows they showed and that more exist behind the page. The `--json`
+  envelope is unchanged at exactly two keys.
+- **`papio acquire --batch --request-id` no longer points at a mechanism that
+  does not exist.** The flag was refused with "put per-work values in JSONL",
+  but the JSONL work decoder is strict and has no `request_id` field, so
+  following that advice failed with `unknown field "request_id"` and left no
+  working option. One flag cannot key many works: batch works get deterministic
+  per-work request ids derived from the batch identity and the work identity, so
+  resubmitting the same works on the same day reproduces the same keys — the
+  batch identity mixes in the calendar date. The refusal now names that instead,
+  and calls `request_id` what ADR-0010 calls it: a live-job convergence key, not
+  an idempotency key.
 
 ## [0.18.0] - 2026-08-06
 

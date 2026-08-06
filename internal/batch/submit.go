@@ -41,7 +41,10 @@ type SubmitOptions struct {
 	// selected them, preventing a shared daemon from answering against another
 	// client's sources.
 	LibraryFingerprint string
-	Now                time.Time
+	// Consumer names the submitting consumer on every work in the batch. One
+	// name for the whole batch, because a batch is one caller's submission.
+	Consumer string
+	Now      time.Time
 }
 
 // Submission records one successfully created acquisition job.
@@ -234,9 +237,26 @@ func ApplyOwnership(requests []protocol.WorkRequest, ownership zotio.LookupWorks
 	return pending, skipped, nil
 }
 
+// submitParams is acquire.submit_v2's frozen wrapper (ADR-0010 Decision 1) and
+// must not gain a key; consumerSubmitParams carries attribution to
+// acquire.submit_v3 instead.
 type submitParams struct {
 	Request    protocol.WorkRequest `json:"request"`
 	AutoImport *bool                `json:"auto_import,omitempty"`
+}
+
+type consumerSubmitParams struct {
+	Request    protocol.WorkRequest `json:"request"`
+	AutoImport *bool                `json:"auto_import,omitempty"`
+	Consumer   string               `json:"consumer,omitempty"`
+}
+
+// unknownMethod reports the one error that justifies trying an older method: the
+// daemon does not serve this name. Every other failure is the daemon's answer and
+// must reach the caller unchanged.
+func unknownMethod(err error) bool {
+	var remote *ipc.RemoteError
+	return errors.As(err, &remote) && remote.Code == "unknown_method"
 }
 
 // submitResult decodes acquire.submit_v2. Existing is declared because it must
@@ -250,22 +270,35 @@ type submitResult struct {
 }
 
 // submitOne prefers acquire.submit_v2 and falls back to the retained v1 method
-// when the daemon predates it (v2 shipped in 0.13.0).
+// when the daemon predates it (v2 shipped in 0.13.0). A batch naming a consumer
+// uses acquire.submit_v3, which carries attribution.
 //
-// The fallback is not optional. A batch is one goroutine per work against a
+// The v1 fallback is not optional. A batch is one goroutine per work against a
 // possibly older running daemon, and without it every work in a mixed-version
 // batch records submission_failed with unknown_method. The single-work CLI path
 // has carried this same fallback since v2 was introduced; batch must match it.
-func submitOne(ctx context.Context, caller Caller, request protocol.WorkRequest, autoImport *bool) (submitResult, error) {
+//
+// The consumer path deliberately does NOT fall back: dropping the attribution to
+// reach an older daemon would record the whole batch as nobody's work.
+func submitOne(ctx context.Context, caller Caller, request protocol.WorkRequest, autoImport *bool, consumer string) (submitResult, error) {
 	var submitted submitResult
+	if consumer != "" {
+		params := consumerSubmitParams{Request: request, AutoImport: autoImport, Consumer: consumer}
+		if err := caller.Call(ctx, "acquire.submit_v3", params, &submitted); err != nil {
+			if unknownMethod(err) {
+				return submitResult{}, fmt.Errorf("consumer attribution requires a daemon serving acquire.submit_v3; upgrade or restart the daemon from the same installation as this CLI")
+			}
+			return submitResult{}, err
+		}
+		return submitted, nil
+	}
 	// v2 always takes the {request, ...} wrapper; v1 additionally accepts a
 	// bare WorkRequest, which is what it was sent before this fallback existed.
 	err := caller.Call(ctx, "acquire.submit_v2", submitParams{Request: request, AutoImport: autoImport}, &submitted)
 	if err == nil {
 		return submitted, nil
 	}
-	var remote *ipc.RemoteError
-	if !errors.As(err, &remote) || remote.Code != "unknown_method" {
+	if !unknownMethod(err) {
 		return submitResult{}, err
 	}
 	var params any = request
@@ -377,7 +410,7 @@ func Submit(ctx context.Context, caller Caller, dataDir string, requests []proto
 		group.Add(1)
 		go func(index int, request protocol.WorkRequest) {
 			defer group.Done()
-			submitted, err := submitOne(ctx, caller, request, options.AutoImport)
+			submitted, err := submitOne(ctx, caller, request, options.AutoImport, options.Consumer)
 			if err != nil {
 				errs[index] = err
 				return
