@@ -14,6 +14,7 @@ authenticated browser session — it never drives a separate/automated browser.
 go build ./...
 go test ./internal/config ./internal/protocol ./internal/browser   # scope to what you touch
 go vet ./...
+make identity-corpus   # measure the PDF identity rules against your Zotero library
 
 # Extension (bun)
 cd extension
@@ -154,6 +155,18 @@ Bump the pinned zensical version in `docs/requirements.txt` deliberately; CI ins
   (`isbnDigitsRE`) and a valid PMID (`pmidRE`), so the bare path caps PMIDs at nine digits
   while `--pmid` accepts ten — the flag already states the scheme, the bare form cannot.
   Widening that guard silently acquires the wrong work for every bare ISBN-10.
+
+### PDF identity rules (measure before you tune)
+- **Every window and threshold in `internal/pdf/identity.go` is a measured tradeoff, and
+  the measurement is now runnable: `make identity-corpus`.** It reads your Zotero library
+  (read-only, through a temp copy of `zotero.sqlite`, safe while Zotero is open), scores
+  every paper against its own metadata and against every other paper's, and reports the
+  **wrong-accept** count — a wrong paper filed under the right citation being the worst
+  outcome papio has. Run it before and after touching those rules and compare wrong
+  accepts first, then the correct-pair pass rate; see `dev/identity-corpus.md`. The comments
+  citing "1560 mismatched pairs" come from a one-off run that was never saved, which is why
+  two false accepts survived review in a change that read as obviously safe. The report
+  names your own library — never paste a run into a commit, an issue, or the CHANGELOG.
 
 ### CLI & MCP JSON output
 - **Machine-readable output has ONE contract.** `internal/agentjson`

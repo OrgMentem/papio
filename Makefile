@@ -1,4 +1,4 @@
-.PHONY: build test vet docs-gen docs-build docs-serve ext-bump hooks dev-deploy store-assets
+.PHONY: build test vet identity-corpus docs-gen docs-build docs-serve ext-bump hooks dev-deploy store-assets
 
 build:
 	go build ./...
@@ -8,6 +8,14 @@ test:
 
 vet:
 	go vet ./...
+
+# Measure the PDF identity rules against the operator's own Zotero library:
+# every paper against its own metadata must pass, against every other paper's
+# must not. Reports the wrong-accept count the windows in internal/pdf/identity.go
+# are tuned against. Run it before AND after touching those rules; see
+# dev/identity-corpus.md. Output names your own library — never commit a run.
+identity-corpus:
+	go run ./cmd/identity-corpus
 
 # Regenerate the code-generated reference page (docs/reference/commands.md) from
 # the cobra command tree. Drift-gated in CI — run after any command/flag change.

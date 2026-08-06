@@ -263,6 +263,15 @@ const identityPageOneBytes = 4 << 10
 
 func identityPageOne(text string) string { return identityWindow(text, identityPageOneBytes) }
 
+// IdentityWindows exposes the three windows the rules above read, so the corpus
+// harness in internal/identitycorpus can report where real papers print their
+// own identifier without keeping a second copy of these bounds. A histogram
+// derived from a divergent copy would be measuring the wrong thing at exactly
+// the moment someone is retuning a bound.
+func IdentityWindows(text string) (frontMatter, byline, pageOne string) {
+	return identityFrontMatter(text), identityByline(text), identityPageOne(text)
+}
+
 // containsFlattenedToken reports whether text contains needle as a COMPLETE
 // identifier once whitespace is ignored. Publishers letter-space identifiers
 // for typographic effect — ACM prints a DOI as "DOI:10.1145/ 30 6 5 3 8 6" —
