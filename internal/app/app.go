@@ -56,6 +56,13 @@ type WorkLookup interface {
 	LookupWork(context.Context, string) (discovery.DiscoveredWork, error)
 }
 
+// DOIRegistry reports whether a DOI is registered with the global Handle
+// System. The bool is only meaningful when the error is nil: an unreachable
+// registry means "unknown", never "unregistered".
+type DOIRegistry interface {
+	Registered(context.Context, string) (bool, error)
+}
+
 // classifiedAutoImportError is implemented by the bootstrap decorator. It
 // keeps Zotio-specific taxonomy out of the application service while allowing
 // durable events to retain safe, actionable failure detail.
@@ -89,6 +96,7 @@ type Service struct {
 	Resolvers    []ResolverEntry
 	Enricher     MetadataEnricher
 	Discovery    WorkLookup
+	DOIs         DOIRegistry
 	Fetch        FetchFunc
 	Validate     ValidateFunc
 	AutoImporter AutoImporter
@@ -1037,6 +1045,38 @@ func (s *Service) institutionalRouteExhausted(ctx context.Context, jobID string)
 	return false
 }
 
+// handoffGate reports whether this work carries an identifier a human handoff
+// could actually act on, and — when it does not — the durable classification
+// that says why.
+//
+// The syntactic half is HasFetchableIdentifier: no DOI/PMID/arXiv/OpenAlex id
+// means no route a login can open. The second half exists because a DOI that
+// merely *parses* is not a DOI that *exists*. A mistyped one survives every
+// upstream check — Crossref, OpenAlex, and Unpaywall all report "no record"
+// and "no open copy" as the same empty result — and then reaches the link
+// resolver, which has nothing to match and bounces the user to doi.org's "DOI
+// NOT FOUND" page. The handoff can never be completed, so it re-offers on
+// every session-live tick and re-notifies on the reminder schedule forever.
+//
+// The registry is consulted only when a DOI is the sole fetchable identifier
+// (a PMID or arXiv id is its own route) and only at this boundary, which is
+// already the slow no-candidates path. A probe failure fails open, like
+// institutionalRouteExhausted: during a registry outage another handoff is far
+// cheaper than terminating a job that was perfectly fetchable.
+func (s *Service) handoffGate(ctx context.Context, w work.Work) (ok bool, reason string, terminal job.TerminalReason) {
+	if !w.HasFetchableIdentifier() {
+		return false, "no_identifier", job.TerminalReasonNoIdentifier
+	}
+	if s.DOIs == nil || w.DOI == "" || w.PMID != "" || w.ArXiv != "" || w.OpenAlex != "" {
+		return true, "", ""
+	}
+	registered, err := s.DOIs.Registered(ctx, w.DOI)
+	if err != nil || registered {
+		return true, "", ""
+	}
+	return false, "doi_not_registered", job.TerminalReasonDOINotRegistered
+}
+
 // exhaustedCandidates handles the terminal "no direct candidate" boundary —
 // either resolving produced zero legal candidates or fetching exhausted them
 // all without an artifact. A bot-blocked open-access candidate gets one
@@ -1058,15 +1098,17 @@ func (s *Service) exhaustedCandidates(ctx context.Context, row *job.Row, from, r
 		}
 		institutionalExhausted := s.institutionalRouteExhausted(ctx, row.ID)
 		base, hasBase := s.Config.OpenURLBaseFor(row.Policy.Resolver)
+		routeable, gateReason, gateTerminal := s.handoffGate(ctx, row.Work)
 		switch {
-		// A work with no fetchable identifier must never be routed to an
-		// institutional sign-in. The resolver would be handed a bare title, and
-		// the destination for a printed monograph or a report is a catalogue
-		// record — no login produces a PDF, so a handoff here spends the user's
+		// A work with no identifier a login could act on must never be routed
+		// to an institutional sign-in. The resolver would be handed a bare
+		// title or an unregistered DOI, and the destination for a printed
+		// monograph, a report, or a typo is a catalogue record or an error
+		// page — no login produces a PDF, so a handoff here spends the user's
 		// SSO round trip, parks forever, and (since human actions are now
 		// re-notified on a schedule) nags them about impossible work.
-		case !row.Work.HasFetchableIdentifier():
-			reason, terminal = "no_identifier", job.TerminalReasonNoIdentifier
+		case !routeable:
+			reason, terminal = gateReason, gateTerminal
 		case hasBase && base != "" && !institutionalExhausted:
 			if _, err := s.Jobs.OpenHumanAction(ctx, row.ID, "openurl_handoff", InstitutionalOpenURLHandoffDetail, job.Access(true, "paywall")); err != nil {
 				return err
@@ -1077,8 +1119,10 @@ func (s *Service) exhaustedCandidates(ctx context.Context, row *job.Row, from, r
 			terminal = job.TerminalReasonNoEntitlement
 		}
 	case config.ModeConservative:
-		// Same gate: an OpenURL built from a bare title is not worth surfacing.
-		if base, ok := s.Config.OpenURLBaseFor(row.Policy.Resolver); ok && base != "" && row.Work.HasFetchableIdentifier() {
+		// Same gate: an OpenURL built from a bare title or an unregistered DOI
+		// is not worth surfacing.
+		routeable, gateReason, gateTerminal := s.handoffGate(ctx, row.Work)
+		if base, ok := s.Config.OpenURLBaseFor(row.Policy.Resolver); ok && base != "" && routeable {
 			if _, err := s.Jobs.OpenHumanAction(ctx, row.ID, "openurl_available",
 				"no direct candidates; institutional OpenURL available but not opened in conservative mode",
 				// An advisory, not a sign-in prompt: it exists precisely to say
@@ -1087,8 +1131,8 @@ func (s *Service) exhaustedCandidates(ctx context.Context, row *job.Row, from, r
 				return err
 			}
 		}
-		if !row.Work.HasFetchableIdentifier() {
-			reason, terminal = "no_identifier", job.TerminalReasonNoIdentifier
+		if !routeable {
+			reason, terminal = gateReason, gateTerminal
 		}
 	}
 	return s.Jobs.Transition(ctx, row.ID, from, job.StateUnavailable,

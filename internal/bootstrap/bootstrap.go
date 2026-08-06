@@ -21,6 +21,7 @@ import (
 	"papio/internal/daemon"
 	"papio/internal/discovery"
 	"papio/internal/doctor"
+	"papio/internal/doiregistry"
 	"papio/internal/enrich"
 	"papio/internal/fetch"
 	"papio/internal/hook"
@@ -190,6 +191,10 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 			break
 		}
 	}
+	// Not a configurable source: the Handle System is the DOI system's own
+	// existence oracle, carries no quota or credential, and is consulted only
+	// at the no-candidates handoff boundary.
+	service.DOIs = doiregistry.New(doiregistry.Options{Client: metadataClient, ContactEmail: cfg.Email})
 	var senders []notify.Sender
 	if cfg.Notify.Enabled {
 		senders = append(senders, notify.NewMacOS())

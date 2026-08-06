@@ -260,6 +260,11 @@ Use the report reason to choose the next step:
   with `papio acquire --doi <doi>`; for a Zotero item, apply
   `zotio --yes items enrich --missing-doi` and then re-run
   `papio acquire --from-zotio`.
+- `doi_not_registered`: the request carries a DOI, but the DOI system has no
+  such handle — it resolves to a "DOI NOT FOUND" page and no link resolver can
+  match it. This is almost always a typo or a mangled copy-paste (one
+  transposed digit is enough). Signing in will not help. Check the DOI on the
+  article's own page and re-submit with `papio acquire --doi <doi>`.
 
 The exact report reason is preferable to a blind `papio jobs retry`; browser and
 identity states are intentionally parked for a human decision.

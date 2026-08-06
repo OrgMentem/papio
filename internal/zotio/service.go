@@ -427,8 +427,9 @@ func (s *Service) liveJobForRequest(ctx context.Context, requestID string) (stri
 // re-checks after the configured window instead of retrying every cadence or
 // never. Only the newest job counts: a newer failed/cancelled attempt means
 // someone already chose to retry, and the cool-down must not resurrect the
-// older verdict. A no_identifier verdict is intentionally exempt because
-// editing the item's metadata can make it fetchable immediately.
+// older verdict. no_identifier and doi_not_registered verdicts are
+// intentionally exempt because editing the item's metadata — supplying a DOI,
+// or correcting a mistyped one — can make it fetchable immediately.
 func (s *Service) unavailableCooldown(ctx context.Context, requestID string) (time.Duration, error) {
 	if s.UnavailableRecheck <= 0 {
 		return 0, nil
@@ -444,7 +445,7 @@ func (s *Service) unavailableCooldown(ctx context.Context, requestID string) (ti
 	if err != nil {
 		return 0, err
 	}
-	if state != job.StateUnavailable || terminalReason == "no_identifier" {
+	if state != job.StateUnavailable || terminalReason == "no_identifier" || terminalReason == "doi_not_registered" {
 		return 0, nil
 	}
 	decided, err := time.Parse(time.RFC3339, updatedAt)

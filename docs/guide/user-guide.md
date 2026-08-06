@@ -470,3 +470,14 @@ apply `zotio --yes items enrich --missing-doi` and re-run
 `papio acquire --from-zotio`. An ISBN alone is carried into the institutional
 link so a monograph is described as a book, but it is not enough to fetch full
 text.
+
+A DOI that **does not exist** is treated the same way. Before opening an
+institutional handoff for a work whose only identifier is a DOI, *papio* asks
+the DOI system whether that handle is registered at all. Metadata sources
+cannot answer this — Crossref, OpenAlex, and Unpaywall all report "no record"
+and "no open copy" as the same empty result — so a mistyped DOI used to reach
+the link resolver, match nothing, and drop you on a "DOI NOT FOUND" page with a
+handoff that could never be completed. An unregistered DOI now settles
+`unavailable` with the reason `doi_not_registered`; correct the DOI and
+re-submit. If the registry itself is unreachable the handoff is offered as
+before, because an outage must not terminate fetchable work.

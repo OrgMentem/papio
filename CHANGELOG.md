@@ -46,6 +46,25 @@ execution records in `notes/acquisition-stack-plan.md`.
 
 ### Fixed
 
+- **A DOI that does not exist no longer parks the job on an institutional
+  sign-in.** A well-formed but unregistered DOI — one transposed digit in
+  `10.1016/j.cedpsych.2020.101816` for `…101860` was the reported case —
+  survived every upstream check, because Crossref, OpenAlex, EuropePMC and
+  Unpaywall all report "I have no record of this" and "this work exists but I
+  hold no open copy" through the same empty result. The job therefore reached
+  the institutional handoff, the link resolver had nothing to match, and the
+  user landed on doi.org's "DOI NOT FOUND" page. That action can never be
+  completed, so it was re-offered on every session-live tick — roughly sixty
+  tabs over three days — and escalated seven reminders. Before offering a
+  handoff for a work whose only fetchable identifier is a DOI, *papio* now
+  asks the DOI system itself whether that handle is registered; an
+  unregistered one settles `unavailable` with the new terminal reason
+  `doi_not_registered`, which names the typo and says plainly that signing in
+  will not help. The probe is skipped when a PMID, arXiv id or OpenAlex id is
+  also present (each is its own route) and fails open when the registry is
+  unreachable, so an outage cannot terminate fetchable work. Like
+  `no_identifier`, the new reason is exempt from the zotio backfill cool-down,
+  because correcting the DOI makes the item fetchable immediately.
 - **The quarantine preview re-verifies the file on every serve.** The digest
   was checked once and the result cached on the capability, so any later GET
   of the same URL re-opened the file and served it with no hash check at all —

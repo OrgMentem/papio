@@ -64,6 +64,7 @@ const (
 	TerminalReasonTemporaryCandidateFailuresDidNotClear TerminalReason = "temporary candidate failures did not clear"
 	TerminalReasonCandidatesExhausted                   TerminalReason = "all candidates exhausted"
 	TerminalReasonNoIdentifier                          TerminalReason = "no_identifier"
+	TerminalReasonDOINotRegistered                      TerminalReason = "doi_not_registered"
 	TerminalReasonNoEntitlement                         TerminalReason = "no_entitlement"
 	TerminalReasonBrowserRejected                       TerminalReason = "browser_rejected"
 	TerminalReasonDocumentDeliveryAvailable             TerminalReason = "document_delivery_available"
@@ -83,6 +84,7 @@ func NormalizeTerminalReason(reason string) TerminalReason {
 		TerminalReasonTemporaryCandidateFailuresDidNotClear,
 		TerminalReasonCandidatesExhausted,
 		TerminalReasonNoIdentifier,
+		TerminalReasonDOINotRegistered,
 		TerminalReasonNoEntitlement,
 		TerminalReasonBrowserRejected,
 		TerminalReasonDocumentDeliveryAvailable,

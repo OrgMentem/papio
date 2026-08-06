@@ -56,6 +56,12 @@ func Explain(state, reason, resolver, accessMode string, cfg config.Config) Expl
 		// that closes the loop, and say plainly that authenticating will not help.
 		return Explanation{"no_identifier",
 			"No DOI, PMID, or arXiv id could be confirmed for this title — books, chapters, reports, and theses usually have none. An institutional sign-in cannot make an identifier-less request fetchable. Find a DOI and re-submit with `papio acquire --doi <doi>`; for a Zotero item, apply `zotio --yes items enrich --missing-doi` then re-run `papio acquire --from-zotio`."}
+	case "doi_not_registered":
+		// Same principle as no_identifier, one step further in: the identifier
+		// is present and well-formed but names nothing. Say so plainly, because
+		// the user's instinct on a paywall message is to go sign in again.
+		return Explanation{"doi_not_registered",
+			"This DOI is not registered with the DOI system, so it resolves to a \"DOI NOT FOUND\" page and no link resolver can match it — almost always a typo or a mangled copy-paste. Signing in will not help. Check the DOI against the article's own page and re-submit with `papio acquire --doi <doi>`."}
 	case "candidates_exhausted", "no_legal_candidates":
 		return explainNoAccess(resolver, accessMode, cfg)
 	}
