@@ -6,7 +6,12 @@
 // install, 99 of 103 adapter failures were adapters that matched the host and
 // then could not classify the page — a purely selector-level problem that
 // `interpret` (pure, DOM-only, exported from ../src/adapters/types) can
-// diagnose against a stored capture with no browser, daemon, or network:
+// diagnose against a stored capture with no browser, daemon, or network — by
+// default. A spec whose download method is "url" or "api" is the exception:
+// resolving it calls the real resolveDownloadURL, which performs a live,
+// credentialed `fetch` whenever the rule declares `jsonField`. That branch is
+// off unless you pass --allow-network; without it the tool reports the
+// method as unresolved instead of touching the network.
 //
 //   bun run adapter:try -- fixtures/tandfonline/success.html --id tandfonline
 //   bun run adapter:try -- capture.html --spec draft-adapter.json --expect article
@@ -24,7 +29,7 @@ import { adapters, interpret, type AdapterContext, type AdapterSpec, type Classi
 function usage(): never {
   console.error(
     "usage: adapter-try.ts <captured.html> (--id <adapterId> | --spec <spec.json>) " +
-      "[--title <t>] [--doi <d>] [--year <y>] [--expect <kind>]",
+      "[--title <t>] [--doi <d>] [--year <y>] [--expect <kind>] [--allow-network]",
   );
   return process.exit(2);
 }
@@ -39,6 +44,7 @@ interface Args {
   doi?: string;
   year?: number;
   expect?: string;
+  allowNetwork: boolean;
 }
 
 function parseArgs(argv: string[]): Args {
@@ -49,6 +55,7 @@ function parseArgs(argv: string[]): Args {
   let doi: string | undefined;
   let year: number | undefined;
   let expect: string | undefined;
+  let allowNetwork = false;
 
   for (let i = 0; i < argv.length; i++) {
     const tok = argv[i];
@@ -87,6 +94,9 @@ function parseArgs(argv: string[]): Args {
       case "--expect":
         expect = takeValue(tok);
         break;
+      case "--allow-network":
+        allowNetwork = true;
+        break;
       default:
         if (tok.startsWith("--")) {
           console.error(`unknown flag: ${tok}`);
@@ -121,6 +131,7 @@ function parseArgs(argv: string[]): Args {
     ...(doi !== undefined ? { doi } : {}),
     ...(year !== undefined ? { year } : {}),
     ...(expect !== undefined ? { expect } : {}),
+    allowNetwork,
   };
 }
 
@@ -256,22 +267,37 @@ function printClassifyRules(doc: Document, spec: AdapterSpec): void {
 
 // ---- download resolution ----------------------------------------------------
 // "href" and "meta" are resolved locally: their extractors (extractDownloadURL,
-// extractMetaURL) are private to background.ts, unexported, so they are
-// reimplemented here against the same contract. "url"/"api" reuse the
-// exported resolveDownloadURL — background.ts imports cleanly in plain bun
-// (its chrome.* wiring is gated behind `typeof chrome !== "undefined"`), but
-// the reuse is still wrapped in try/catch so a future coupling to chrome.*
-// degrades to a clear message instead of crashing this tool. "click" is never
-// resolvable offline: it requires a real user gesture against a live page.
+// extractMetaURL, both in ../src/background.ts) are private to background.ts,
+// unexported, so they are reimplemented here against the same contract. "url"/
+// "api" reuse the exported resolveDownloadURL — background.ts imports cleanly
+// in plain bun (its chrome.* wiring is gated behind `typeof chrome !==
+// "undefined"`), but the reuse is still wrapped in try/catch so a future
+// coupling to chrome.* degrades to a clear message instead of crashing this
+// tool. "click" is never resolvable offline: it requires a real user gesture
+// against a live page.
+//
+// resolveHrefLocally/resolveMetaLocally below MUST stay in lockstep with
+// extractDownloadURL/extractMetaURL's two guards: reject an empty/whitespace
+// href or content before resolving, and reject a resolved URL equal to the
+// page's own URL. `new URL("", base)` returns BASE, so without the first
+// guard `<a href="">`/`<meta content="">` "resolves" to the landing page
+// itself and this tool would print that as a confident match — the exact
+// live defect fixed in 7a8deb5 (pinned as the `empty_content` case in
+// internal/landingmeta/testdata/contract.json). A tool meant to debug that
+// failure must not itself hide it.
 
 function resolveHrefLocally(doc: Document, selector: string): string | null {
   const el = doc.querySelector(selector);
   if (el === null || el.tagName.toUpperCase() !== "A") return null;
-  const href = el.getAttribute("href");
-  if (href === null) return null;
+  const raw = el.getAttribute("href")?.trim() ?? "";
+  if (raw.length === 0) return null;
   try {
-    const u = new URL(href, doc.location?.href ?? "https://fixture.local/");
-    return u.protocol === "https:" ? u.href : null;
+    const u = new URL(raw, doc.location?.href ?? "https://fixture.local/");
+    if (u.protocol !== "https:") return null;
+    const page = new URL(doc.location?.href ?? "https://fixture.local/");
+    u.hash = "";
+    page.hash = "";
+    return u.href === page.href ? null : u.href;
   } catch {
     return null;
   }
@@ -280,11 +306,15 @@ function resolveHrefLocally(doc: Document, selector: string): string | null {
 function resolveMetaLocally(doc: Document, metaName: string): string | null {
   const el = doc.querySelector(`meta[name="${metaName}"]`);
   if (el === null || el.tagName.toUpperCase() !== "META") return null;
-  const content = el.getAttribute("content");
-  if (content === null) return null;
+  const raw = el.getAttribute("content")?.trim() ?? "";
+  if (raw.length === 0) return null;
   try {
-    const u = new URL(content, doc.location?.href ?? "https://fixture.local/");
-    return u.protocol === "https:" ? u.href : null;
+    const u = new URL(raw, doc.location?.href ?? "https://fixture.local/");
+    if (u.protocol !== "https:") return null;
+    const page = new URL(doc.location?.href ?? "https://fixture.local/");
+    u.hash = "";
+    page.hash = "";
+    return u.href === page.href ? null : u.href;
   } catch {
     return null;
   }
@@ -346,7 +376,7 @@ async function tryResolveViaBackground(
   }
 }
 
-async function printDownloadResolution(doc: Document, rule: DownloadRule): Promise<void> {
+async function printDownloadResolution(doc: Document, rule: DownloadRule, allowNetwork: boolean): Promise<void> {
   console.log("\nDownload resolution (verdict is article; spec declares a download rule)");
   console.log(`  method:   ${rule.method}`);
   console.log(`  selector: ${rule.selector}`);
@@ -367,14 +397,23 @@ async function printDownloadResolution(doc: Document, rule: DownloadRule): Promi
     }
     case "url":
     case "api": {
+      if (!allowNetwork) {
+        console.log(
+          `  url:      not resolved (method "${rule.method}" resolves against the live endpoint; re-run with --allow-network)`,
+        );
+        break;
+      }
+      if (rule.method === "api") {
+        // Printed BEFORE the fetch, not after: the whole point of surfacing
+        // this is so a reader who did not expect a real network call sees
+        // the warning before it happens, not as a footnote once it is done.
+        console.log(
+          '  note:     method "api" fetches urlTemplate live to read jsonField — about to perform that fetch against the real endpoint, not a stub.',
+        );
+      }
       const resolved = await tryResolveViaBackground(doc, rule);
       if (resolved.ok) {
         console.log(`  url:      ${resolved.url ?? "(resolveDownloadURL returned null)"}`);
-        if (rule.method === "api") {
-          console.log(
-            "  note:     method \"api\" fetches urlTemplate live to read jsonField — the call above just performed that fetch against the real endpoint, not a stub.",
-          );
-        }
       } else {
         console.log(`  url:      not resolvable offline (${resolved.reason})`);
       }
@@ -383,6 +422,28 @@ async function printDownloadResolution(doc: Document, rule: DownloadRule): Promi
     case "click":
       console.log('  url:      not resolvable offline (method "click" requires a real user gesture against a live page)');
       break;
+  }
+}
+
+// A capture's `origin` header is attacker-controlled input: this tool is
+// meant for "here is my failing page" captures sent by someone else, and the
+// resolved origin becomes the parse base that "url"/"api" downstream builds
+// a fetch target from. Validate it like any other untrusted URL before using
+// it — new URL() plus an explicit https check — rather than trusting the
+// regex-extracted string verbatim.
+function resolveCaptureOrigin(html: string): string | undefined {
+  const origin = captureOrigin(html);
+  if (origin === null) return undefined;
+  try {
+    const u = new URL(origin);
+    if (u.protocol !== "https:") {
+      console.error(`warning: capture origin "${origin}" is not https — using the default fixture-local base instead`);
+      return undefined;
+    }
+    return origin;
+  } catch {
+    console.error(`warning: capture origin "${origin}" is not a valid URL — using the default fixture-local base instead`);
+    return undefined;
   }
 }
 
@@ -395,8 +456,8 @@ async function main(): Promise<void> {
   // Parse against the origin the capture was taken from, so a relative PDF
   // href resolves to the URL the extension would really request rather than a
   // fixture-local address that would send someone debugging the wrong host.
-  const origin = captureOrigin(html);
-  const doc = origin === null ? parseHTML(html) : parseHTML(html, origin);
+  const origin = resolveCaptureOrigin(html);
+  const doc = origin === undefined ? parseHTML(html) : parseHTML(html, origin);
 
   const ctx: AdapterContext = {
     expected: {
@@ -419,7 +480,7 @@ async function main(): Promise<void> {
   printClassifyRules(doc, spec);
 
   if (verdict.kind === "article" && spec.download !== undefined) {
-    await printDownloadResolution(doc, spec.download);
+    await printDownloadResolution(doc, spec.download, args.allowNetwork);
   }
 
   console.log("");

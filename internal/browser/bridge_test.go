@@ -4137,16 +4137,146 @@ func TestProjectHandoffOfferStateProviderOutcomeResetsFruitlessCount(t *testing.
 	}
 }
 
+// TestProjectHandoffOfferStateLateTerminalEventResetsInsteadOfCharging pins
+// the P1 boundary bug terminalHandoffEvent fixes: a signal that proves the
+// drive did something can land AFTER the lease already elapsed — a slow SSO
+// or 2FA detour easily outruns ten minutes — and it must still reset the
+// epoch, not get force-closed as fruitless by the boundary check first.
+//
+// Pre-fix, the boundary check ran unconditionally on every non-offer/accept
+// event once the lease elapsed, so it force-closed the epoch as fruitless the
+// instant that happened; the terminal event's own closeEpoch(false) then
+// no-opped on an already-shut epoch (closeEpoch returns immediately when
+// !open), silently losing the reset it should have recorded. Confirmed these
+// subtests fail against that pre-fix shape by running the boundary-check
+// logic exactly as reconstructed above (unconditional lease force-close, no
+// terminalHandoffEvent exemption) against each history below in isolation:
+// it reproduces FruitlessEpochs=1 for the two single-late-event cases and
+// Quiesced=true for the three-drives case, all of which the assertions below
+// now forbid.
+func TestProjectHandoffOfferStateLateTerminalEventResetsInsteadOfCharging(t *testing.T) {
+	t.Run("ProviderOutcomePastLease", func(t *testing.T) {
+		_, jobs, _, _ := newBridge(t)
+		ctx := context.Background()
+		id := park(t, jobs, "wr_late_terminal", handoffWork())
+		action := openHandoffAction(t, jobs, id)
+		created, err := time.Parse(time.RFC3339Nano, action.CreatedAt)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		epochStart := created.Add(time.Second)
+		appendEventAt(t, jobs, id, "browser.handoff_offered", map[string]any{"requires_auth": false}, epochStart)
+		appendEventAt(t, jobs, id, "browser.job_accept", nil, epochStart.Add(time.Second))
+		// Past job.HandoffAcceptedLease (10m): a slow SSO or 2FA detour makes
+		// this an ordinary drive, not a pathological input.
+		lateOutcome := epochStart.Add(11 * time.Minute)
+		appendEventAt(t, jobs, id, "browser.provider_outcome", map[string]any{"outcome": "resolved"}, lateOutcome)
+
+		events, err := jobs.Events(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		state := job.ProjectHandoffOfferState(events, action.CreatedAt, lateOutcome.Add(time.Minute))
+		if state.FruitlessEpochs != 0 {
+			t.Fatalf("fruitless epochs after a late-but-terminal outcome = %d, want 0 (the lease bounds silence, not a drive that eventually reported)", state.FruitlessEpochs)
+		}
+		if state.Quiesced {
+			t.Fatal("quiesced a job whose drive eventually reported a terminal outcome, just past the lease")
+		}
+	})
+
+	t.Run("ThreeSlowButSuccessfulDrives", func(t *testing.T) {
+		_, jobs, _, _ := newBridge(t)
+		ctx := context.Background()
+		id := park(t, jobs, "wr_slow_drives", handoffWork())
+		action := openHandoffAction(t, jobs, id)
+		created, err := time.Parse(time.RFC3339Nano, action.CreatedAt)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Three drives in a row, each genuinely slow (past the 10-minute
+		// lease) but each eventually terminal. Pre-fix each one hit the
+		// boundary check first and was force-closed as fruitless, reaching
+		// MaxAutomaticHandoffEpochs (3) and quiescing a job that never
+		// actually failed a single drive.
+		epochStart := created.Add(time.Second)
+		var lastOutcome time.Time
+		for i := range 3 {
+			if i > 0 {
+				epochStart = lastOutcome.Add(10 * time.Second)
+			}
+			appendEventAt(t, jobs, id, "browser.handoff_offered", map[string]any{"requires_auth": false}, epochStart)
+			appendEventAt(t, jobs, id, "browser.job_accept", nil, epochStart.Add(time.Second))
+			lastOutcome = epochStart.Add(11 * time.Minute)
+			appendEventAt(t, jobs, id, "browser.provider_outcome", map[string]any{"outcome": "resolved"}, lastOutcome)
+		}
+
+		events, err := jobs.Events(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		state := job.ProjectHandoffOfferState(events, action.CreatedAt, lastOutcome.Add(time.Minute))
+		if state.FruitlessEpochs != 0 {
+			t.Fatalf("fruitless epochs after three slow-but-successful drives = %d, want 0", state.FruitlessEpochs)
+		}
+		if state.Quiesced {
+			t.Fatal("quiesced a perfectly healthy job after three drives that were merely slow, not fruitless")
+		}
+	})
+
+	t.Run("LateTransitionOutOfAwaitingHuman", func(t *testing.T) {
+		_, jobs, _, _ := newBridge(t)
+		ctx := context.Background()
+		id := park(t, jobs, "wr_late_transition", handoffWork())
+		action := openHandoffAction(t, jobs, id)
+		created, err := time.Parse(time.RFC3339Nano, action.CreatedAt)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// The other terminalHandoffEvent branch: the job itself leaves
+		// awaiting_human (e.g. resolved out of band) after the lease
+		// elapsed, with no browser-side terminal event at all.
+		epochStart := created.Add(time.Second)
+		appendEventAt(t, jobs, id, "browser.handoff_offered", map[string]any{"requires_auth": false}, epochStart)
+		appendEventAt(t, jobs, id, "browser.job_accept", nil, epochStart.Add(time.Second))
+		lateTransition := epochStart.Add(11 * time.Minute)
+		appendEventAt(t, jobs, id, "job.transition",
+			map[string]any{"from": job.StateAwaitingHuman, "to": job.StateResolving}, lateTransition)
+
+		events, err := jobs.Events(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		state := job.ProjectHandoffOfferState(events, action.CreatedAt, lateTransition.Add(time.Minute))
+		if state.FruitlessEpochs != 0 {
+			t.Fatalf("fruitless epochs after a late awaiting_human exit = %d, want 0", state.FruitlessEpochs)
+		}
+		if state.Quiesced {
+			t.Fatal("quiesced a job whose awaiting_human exit landed just past the lease")
+		}
+	})
+}
+
 // TestAcceptedLeaseOutlastsTheExtensionQueueWait pins the reason the lease is
 // ten minutes and not five. The extension sends job_accept on its QUEUED path
 // too, so an accepted handoff can sit undriven while the drive governor is
-// saturated — up to maxOutstandingOffers (4) against HANDOFF_DRIVE_LIMIT (2)
-// slots at the 3-minute drive timeout, plus the 45-second evidence-free
-// release ADR-0013 ratifies. Nothing daemon-side tells that apart from a drive
-// that produced nothing, so a lease shorter than the wait would charge a job
-// for queueing and quiesce a healthy backlog. A five-minute lease failed this.
+// saturated — up to maxOutstandingOffers accepted handoffs against
+// HANDOFF_DRIVE_LIMIT (extension/src/background.ts, 2) slots, each held up to
+// HANDOFF_DRIVE_TIMEOUT_MS (extension/src/background.ts, 3 minutes), plus the
+// QUEUED_HANDOFF_RELEASE_MS (extension/src/background.ts, 45 seconds)
+// evidence-free release ADR-0013 ratifies. maxOutstandingOffers is referenced
+// directly (both live in package browser) so a future change to the
+// governor's shape must restate this arithmetic rather than silently
+// invalidate the lease; the extension-side terms stay literal because they
+// are TypeScript constants this package cannot import. Nothing daemon-side
+// tells a queued handoff apart from a drive that produced nothing, so a lease
+// shorter than the wait would charge a job for queueing and quiesce a healthy
+// backlog. A five-minute lease failed this.
 func TestAcceptedLeaseOutlastsTheExtensionQueueWait(t *testing.T) {
-	const worstQueueWait = (4/2)*3*time.Minute + 45*time.Second
+	const worstQueueWait = (maxOutstandingOffers/2)*3*time.Minute + 45*time.Second
 	if job.HandoffAcceptedLease <= worstQueueWait {
 		t.Fatalf("accepted lease %s does not outlast the extension's %s queue wait: a handoff still waiting its turn would be charged as a fruitless drive",
 			job.HandoffAcceptedLease, worstQueueWait)

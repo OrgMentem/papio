@@ -185,13 +185,150 @@ test("malformed_content: extension resolves it as a relative path; daemon's pars
 // exact test twice already this session (the empty-content and self-URL
 // rejections above were both added mid-session). extractMetaURL can't be
 // imported (chrome.* globals at module load) or safely eval'd (it runs
-// against a real page's DOM), so a plain-text substring check on the source
-// is the only cheap way to catch the next change: if either marker below
-// moves or disappears, this fails loudly instead of quietly asserting a
-// contract the real function no longer honors.
+// against a real page's DOM). The guard used to be three `toContain`
+// substring checks; that missed any edit that didn't touch one of those
+// three exact lines (a dropped `.trim()`, a renamed meta tag, a loosened
+// `https:` check, or simple reordering all pass three-substring checks
+// unscathed while the hand-copied mirror above keeps testing stale
+// behavior). Instead, extract the function's real source text out of
+// background.ts by brace-balanced scanning (string/template-literal aware,
+// so a `${metaName}` interpolation or a `"//"`-bearing string never
+// mistakenly closes the scan early), normalize it (strip comments, collapse
+// whitespace) so formatting-only reflows don't false-positive, and diff the
+// WHOLE body against a pinned verbatim copy below. Any semantic change —
+// anywhere in the body — now fails this test. When it fails for a real,
+// intentional change to extractMetaURL: update PINNED_EXTRACT_META_URL_SOURCE
+// to match, re-sync extractMetaURLMirror above by hand, and re-run the full
+// corpus loop so the two implementations are re-verified against
+// contract.json before trusting them again.
+
+/**
+ * Extracts a top-level function's exact source text — from its signature
+ * through the matching closing brace — by walking the source one character
+ * at a time and tracking brace depth. `signature` MUST end in `{` (the
+ * function's own opening brace); scanning starts there instead of via a
+ * second `indexOf("{", …)`, which would otherwise skip past the real
+ * opening brace and land on the first brace INSIDE the body (here, the
+ * `${metaName}` template interpolation) — a bug caught while writing this
+ * guard. String and template-literal contents are treated as opaque so a
+ * literal `{`/`}` (or a `${…}` interpolation, or a `"//"` inside a URL)
+ * never desyncs the depth count; a `${…}` interpolation gets its own nested
+ * scan and resumes template-string mode on its matching `}`.
+ */
+function extractFunctionSource(src: string, signature: string): string {
+  if (!signature.endsWith("{")) {
+    throw new Error(`extractFunctionSource: signature must end with '{': ${signature}`);
+  }
+  const sigIndex = src.indexOf(signature);
+  if (sigIndex === -1) {
+    throw new Error(`extractFunctionSource: signature not found in source: ${signature}`);
+  }
+  let depth = 0;
+  let i = sigIndex + signature.length - 1; // the signature's own trailing '{'
+  const templateInterpDepths: number[] = [];
+  let quote: '"' | "'" | "`" | null = null;
+  for (; i < src.length; i++) {
+    const ch = src[i];
+    const prev = src[i - 1];
+    if (quote !== null) {
+      if (quote === "`" && ch === "$" && src[i + 1] === "{") {
+        templateInterpDepths.push(depth);
+        quote = null;
+        depth++;
+        i++; // consume the '{' of '${' together with the '$'
+        continue;
+      }
+      if (ch === quote && prev !== "\\") quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === "`") {
+      quote = ch;
+      continue;
+    }
+    if (ch === "{") {
+      depth++;
+    } else if (ch === "}") {
+      depth--;
+      if (templateInterpDepths.length > 0 && depth === templateInterpDepths[templateInterpDepths.length - 1]) {
+        templateInterpDepths.pop();
+        quote = "`"; // resume the enclosing template literal
+      }
+      if (depth === 0) return src.slice(sigIndex, i + 1);
+    }
+  }
+  throw new Error(`extractFunctionSource: unbalanced braces scanning: ${signature}`);
+}
+
+/**
+ * Strips `//` and `/* *\/` comments and collapses whitespace runs to a single
+ * space, so two functions that differ only in formatting or commentary
+ * compare equal while any change to actual code still fails. String and
+ * template-literal contents are opaque here too, for the same reason as
+ * above.
+ */
+function normalizeSource(src: string): string {
+  let out = "";
+  let quote: '"' | "'" | "`" | null = null;
+  for (let i = 0; i < src.length; i++) {
+    const ch = src[i];
+    const next = src[i + 1];
+    if (quote !== null) {
+      out += ch;
+      if (ch === quote && src[i - 1] !== "\\") quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === "`") {
+      quote = ch;
+      out += ch;
+      continue;
+    }
+    if (ch === "/" && next === "/") {
+      while (i < src.length && src[i] !== "\n") i++;
+      continue;
+    }
+    if (ch === "/" && next === "*") {
+      i += 2;
+      while (i < src.length && !(src[i] === "*" && src[i + 1] === "/")) i++;
+      i++; // land on the '/' closing the block comment
+      continue;
+    }
+    out += ch;
+  }
+  return out.replace(/\s+/g, " ").trim();
+}
+
+const EXTRACT_META_URL_SIGNATURE = "function extractMetaURL(metaName: string): string | null {";
+
+// Verbatim copy of extractMetaURL's full source, signature through closing
+// brace, as it stood when this guard was written. Re-sync this literal (and
+// extractMetaURLMirror above it) whenever the real function legitimately
+// changes — see the comment block above for the full re-sync procedure.
+const PINNED_EXTRACT_META_URL_SOURCE = `function extractMetaURL(metaName: string): string | null {
+  const el = document.querySelector(\`meta[name="\${metaName}"]\`);
+  if (!(el instanceof HTMLMetaElement)) return null;
+  const raw = el.getAttribute("content")?.trim() ?? "";
+  if (raw.length === 0) return null;
+  try {
+    const u = new URL(raw, location.href);
+    if (u.protocol !== "https:") return null;
+    const page = new URL(location.href);
+    u.hash = "";
+    page.hash = "";
+    return u.href === page.href ? null : u.href;
+  } catch {
+    return null;
+  }
+}`;
+
 test("extractMetaURL in background.ts still carries the behavior this mirror models", () => {
   const backgroundSrc = readFileSync(join(import.meta.dir, "..", "src", "background.ts"), "utf8");
-  expect(backgroundSrc).toContain("function extractMetaURL(metaName: string): string | null {");
-  expect(backgroundSrc).toContain("if (raw.length === 0) return null;");
-  expect(backgroundSrc).toContain("return u.href === page.href ? null : u.href;");
+  const actual = extractFunctionSource(backgroundSrc, EXTRACT_META_URL_SIGNATURE);
+  expect(
+    normalizeSource(actual),
+    "extractMetaURL's body changed in src/background.ts. Update " +
+      "PINNED_EXTRACT_META_URL_SOURCE in this file to match the new body, " +
+      "hand-resync extractMetaURLMirror above to the same behavior, then " +
+      "re-run this whole suite against internal/landingmeta/testdata/contract.json " +
+      "before trusting either implementation again.",
+  ).toBe(normalizeSource(PINNED_EXTRACT_META_URL_SOURCE));
 });

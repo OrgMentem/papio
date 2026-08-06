@@ -66,7 +66,19 @@ DEV_BIN ?= $(HOME)/.local/bin/papio
 # `daemon_outdated`, which silently disables every gated capability
 # (page capture, triage snapshots, activity feed, session evidence) while
 # `papio doctor` still prints "extension connected".
-DEV_VERSION ?= $(shell git describe --tags --abbrev=0 --match 'v*' 2>/dev/null | sed 's/^v//' | awk -F. '{print $$1"."$$2"."$$3+1}')-dev.$(shell git rev-parse --short HEAD)
+# A tagless or shallow checkout used to collapse this to the bare string
+# `-dev.<sha>`, which parseSemver rejects — and isSemverLowerThan returns false
+# on an unparseable version, so the build would have sailed past the floor
+# reporting `connected`. That is this bug with the sign flipped: silently wrong
+# instead of silently disabled. Fall back to a floor-satisfying 0.0.0 and say so,
+# so a mis-stamped build is loud at the terminal rather than quiet in the browser.
+DEV_TAG := $(shell git describe --tags --abbrev=0 --match 'v*' 2>/dev/null | sed 's/^v//')
+ifeq ($(strip $(DEV_TAG)),)
+DEV_VERSION ?= 0.0.0-dev.$(shell git rev-parse --short HEAD)
+$(warning no v* tag found: stamping $(DEV_VERSION), which is BELOW the extension's MIN_DAEMON_VERSION floor and will report daemon_outdated. Fetch tags with `git fetch --tags`.)
+else
+DEV_VERSION ?= $(shell echo '$(DEV_TAG)' | awk -F. '{print $$1"."$$2"."$$3+1}')-dev.$(shell git rev-parse --short HEAD)
+endif
 
 dev-deploy:
 	@# Build BOTH extension bundles (Chrome dist/ + Firefox firefox/) before touching the

@@ -2785,6 +2785,24 @@ type HandoffOfferState struct {
 	Quiesced        bool
 }
 
+// terminalHandoffEvent reports whether an event proves the drive produced
+// something. It is the single definition the fold consults twice: once to
+// exempt a late signal from the lease boundary, and once to close its epoch.
+// Keep it beside the switch that uses it — two drifting notions of "terminal"
+// would resurrect the boundary bug it exists to prevent.
+func terminalHandoffEvent(kind string, event map[string]any) bool {
+	switch kind {
+	case "browser.provider_outcome", "browser.download_started", "browser.download_complete":
+		return true
+	case "job.transition":
+		detail, _ := event["detail"].(map[string]any)
+		from, _ := detail["from"].(string)
+		to, _ := detail["to"].(string)
+		return from == StateAwaitingHuman && to != StateAwaitingHuman
+	}
+	return false
+}
+
 // ProjectHandoffOfferState folds a job's event history into the automatic-offer
 // decision. events are the `[]map[string]any` rows returned by the store, oldest
 // first; each has a "kind" string and a "detail" map. actionCreatedAt scopes the
@@ -2825,29 +2843,31 @@ func ProjectHandoffOfferState(events []map[string]any, actionCreatedAt string, n
 		if at.Before(created) {
 			continue // belongs to a prior, already-resolved human action
 		}
-		if open && at.Sub(epochStart) >= HandoffAcceptedLease {
+		// Classify before the lease boundary is applied. A terminal signal
+		// closes the epoch it belongs to however late it lands: the lease
+		// bounds SILENCE, and a drive that finally reported is not silent. An
+		// SSO or 2FA detour can easily outrun ten minutes, and force-closing
+		// that epoch as fruitless first would both charge a successful drive
+		// and swallow its reset, since closeEpoch no-ops once the epoch is
+		// shut. Three slow-but-successful drives would then quiesce a healthy
+		// job — the false-quiescing this fence exists to prevent.
+		kind, _ := event["kind"].(string)
+		if open && !terminalHandoffEvent(kind, event) && at.Sub(epochStart) >= HandoffAcceptedLease {
 			closeEpoch(true) // lease elapsed before anything terminal arrived
 		}
-		switch kind, _ := event["kind"].(string); kind {
-		case "browser.handoff_offered", "browser.job_accept":
+		switch {
+		case kind == "browser.handoff_offered" || kind == "browser.job_accept":
 			// Reconnect re-acknowledgements land here too; if an epoch is
 			// already open and still within lease, this is the SAME epoch —
 			// counting raw offers would turn one stuck drive into dozens.
+			// browser.job_reject and send failures are transport problems,
+			// not a fruitless drive: they match nothing here and fall through.
 			if !open {
 				epochStart = at
 				open = true
 			}
-		case "browser.provider_outcome", "browser.download_started", "browser.download_complete":
+		case terminalHandoffEvent(kind, event):
 			closeEpoch(false)
-		case "job.transition":
-			detail, _ := event["detail"].(map[string]any)
-			from, _ := detail["from"].(string)
-			to, _ := detail["to"].(string)
-			if from == StateAwaitingHuman && to != StateAwaitingHuman {
-				closeEpoch(false)
-			}
-			// browser.job_reject and send failures are transport problems,
-			// not a fruitless drive: they fall through untouched.
 		}
 	}
 	if open && now.Sub(epochStart) >= HandoffAcceptedLease {

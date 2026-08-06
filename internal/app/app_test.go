@@ -2604,3 +2604,112 @@ func TestLandingExpansionEventNeverStoresBearerURLs(t *testing.T) {
 		t.Fatalf("expected a %s event, events = %+v", landingDerivedEventKind, events)
 	}
 }
+
+// TestLandingExpansionSurvivesRetryableDerivedFetchFailure is the fix for
+// the defect expandLandingSeeds' original tried-map comment falsified: a
+// landing-derived candidate is never reproduced by any resolver, so once
+// live is rebuilt fresh on the next pass it has no entry for the derived
+// candidate's url_key. A 503 on pass 1 flips it retryable, ResetCandidates
+// flips it back to pending on pass 2, and — without the fix —
+// NextPendingCandidate hands back a url_key live can't find, so it is
+// marked skipped, which ResetCandidates never revives: the recovery this
+// whole mechanism exists to provide is permanently erased by one transient
+// failure, and the job falls back to an institutional OpenURL handoff for a
+// paper that needs no institution. This asserts the opposite: pass 2 must
+// re-read the same landing page (rederivableLandingSeeds), rediscover the
+// identical PDF URL, and let the pending-queue loop fetch it again — at
+// most once per pass, and without ever opening that handoff.
+func TestLandingExpansionSurvivesRetryableDerivedFetchFailure(t *testing.T) {
+	const deadURL = "https://blob.example/expired-sas.pdf?se=2021-02-16"
+	const landingURL = "https://doi.org/10.3389/feduc.2018.00095"
+	const pdfURL = "https://frontiersin.example/articles/pdf/valid.pdf"
+
+	svc, jobs := newTestService(t)
+	ctx := context.Background()
+	svc.RetryDelay = time.Millisecond
+	unpaywall := &fakeResolver{name: "unpaywall", cands: []resolver.Candidate{{
+		Source: "unpaywall", URL: deadURL, Landing: landingURL, Version: resolver.VersionPublished,
+		AccessBasis: resolver.AccessOpen, ReuseLicense: "cc-by-4.0", Direct: true, IdentityConfidence: 1,
+	}}}
+	svc.Resolvers = []ResolverEntry{{Adapter: unpaywall, Policy: config.Source{Enabled: true}}}
+
+	pdfFetchAttempts := 0
+	svc.Fetch = func(_ context.Context, c resolver.Candidate, path string) (fetch.Result, error) {
+		if c.URL != pdfURL {
+			return fetch.Result{}, &fetch.Error{Class: fetch.ClassInvalid, HTTPStatus: 403, Msg: "sas token expired"}
+		}
+		pdfFetchAttempts++
+		if pdfFetchAttempts == 1 {
+			return fetch.Result{}, &fetch.Error{Class: fetch.ClassRetryable, HTTPStatus: 503, Msg: "upstream unavailable"}
+		}
+		body := pdfBytes(c.URL)
+		if err := os.WriteFile(path, body, 0o600); err != nil {
+			return fetch.Result{}, err
+		}
+		sum := sha256.Sum256(body)
+		return fetch.Result{
+			TempPath: path, SHA256: hex.EncodeToString(sum[:]), SizeBytes: int64(len(body)),
+			SniffedMIME: "application/pdf", ContentType: "application/pdf", HTTPStatus: 200,
+			FinalHost: "frontiersin.example",
+		}, nil
+	}
+	svc.Validate = passValidation()
+	reader := &fakeLandingReader{pdfURLFor: map[string]string{landingURL: pdfURL}}
+	svc.LandingReader = reader
+
+	id, err := svc.Submit(ctx, doiRequest("wr_landing_expansion_retryable_derived"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, err := jobs.ClaimNext(ctx, "w", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Process(ctx, row); err != nil {
+		t.Fatal(err)
+	}
+	afterPass1, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterPass1.State != job.StateRetryWait {
+		t.Fatalf("pass 1 state = %s, want retry_wait (a 503 on the derived candidate must park for retry, not exhaust or park as manual)", afterPass1.State)
+	}
+	if reader.calls != 1 {
+		t.Fatalf("landing reader called %d times after pass 1, want 1", reader.calls)
+	}
+
+	row, err = jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Process(ctx, row); err != nil {
+		t.Fatal(err)
+	}
+	got, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != job.StateReady {
+		t.Fatalf("state = %s, want ready (a transient 503 on the recovered candidate must not discard the recovery)", got.State)
+	}
+	if pdfFetchAttempts != 2 {
+		t.Fatalf("pdf fetch attempts = %d, want 2 (503 then success on the SAME re-derived url_key)", pdfFetchAttempts)
+	}
+	if reader.calls != 2 {
+		t.Fatalf("landing reader called %d times total, want 2 (at most once per pass, across both passes)", reader.calls)
+	}
+
+	actions, err := jobs.ListHumanActions(ctx, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range actions {
+		if a.Kind == "openurl_handoff" {
+			t.Fatalf("job opened an institutional handoff despite a fully open-access recovery route: %+v", a)
+		}
+	}
+	if len(actions) != 0 {
+		t.Fatalf("actions = %+v, want none (the job must acquire cleanly)", actions)
+	}
+}

@@ -596,22 +596,28 @@ const landingDerivedEventKind = "job.landing_derived"
 // Azure SAS link, both candidates 403'd and were correctly marked invalid,
 // yet their own Landing URL (doi.org, redirecting to the publisher) was
 // advertising a working, unauthenticated PDF via citation_pdf_url the whole
-// time. One GET per unique landing URL, run once per pass at the
-// fetch-exhaustion boundary (see fetchCandidates); a hit inserts a derived
-// candidate that inherits its parent's source, access basis, version,
-// reuse license and identity confidence, so ranking, budgets and source
-// policy still apply to it exactly as they did to the parent — this is the
-// same candidate reached a second way, never a new resolver source.
+// time. One GET per unique landing URL per pass; fetchCandidates calls this
+// twice — once at the top to re-derive any landing_derived candidate an
+// earlier pass already inserted and that is still pending/retryable (see
+// rederivableLandingSeeds), then again at the fetch-exhaustion boundary for
+// candidates that just failed permanently this pass. A hit inserts a
+// derived candidate that inherits its parent's source, access basis,
+// version, reuse license and identity confidence, so ranking, budgets and
+// source policy still apply to it exactly as they did to the parent — this
+// is the same candidate reached a second way, never a new resolver source.
 func (s *Service) expandLandingSeeds(ctx context.Context, row *job.Row, live map[string]resolver.Candidate, seeds []landingSeed) (bool, error) {
 	if len(seeds) == 0 {
 		return false, nil
 	}
-	// Resolvers are deterministic, so every candidate this job has ever
-	// produced reappears in live on every pass even once it is invalid in
-	// the store. That makes live's URLs double as "already tried this job"
-	// — not just this pass — without a separate durable record, and guards
-	// against a citation_pdf_url tag that just points back at the same dead
-	// link its parent already carried.
+	// Only resolver-produced candidates reappear in live every pass — a
+	// landing-derived one never does, because no resolver ever produces it
+	// (see rederivableLandingSeeds, which re-adds it from the durable
+	// landing_derived event instead). So tried is scoped to this pass only:
+	// it guards a citation_pdf_url tag that just points back at a URL
+	// already live this pass, resolver-supplied or derived earlier in this
+	// same loop. What actually stops this job from re-deriving and
+	// re-inserting the same dead link on every future pass forever is
+	// InsertCandidates' (job_id, url_key) dedupe in the store, not this map.
 	tried := make(map[string]bool, len(live))
 	for _, c := range live {
 		tried[c.URL] = true
@@ -645,12 +651,19 @@ func (s *Service) expandLandingSeeds(ctx context.Context, row *job.Row, live map
 		if err != nil {
 			return inserted, err
 		}
-		if n == 0 {
-			continue
-		}
+		// Merge into live even when the row already existed (n == 0): a
+		// re-derivation on a later pass reproduces the identical url_key —
+		// same parent source, same rediscovered pdfURL — and that row's
+		// whole point in being re-derived is to be found here. Skipping the
+		// merge on n == 0 is exactly the bug rederivableLandingSeeds exists
+		// to fix: the pending-queue loop below would look this url_key up,
+		// find nothing, and mark a perfectly revivable candidate skipped.
 		for key, c := range derivedLive {
 			live[key] = c
 			tried[c.URL] = true
+		}
+		if n == 0 {
+			continue
 		}
 		if err := s.Jobs.RecordEvent(ctx, row.ID, landingDerivedEventKind, map[string]any{
 			"derived": "citation_pdf_url", "parent_url_key": seed.parentKey, "url_key": persisted[0].URLKey,
@@ -660,6 +673,67 @@ func (s *Service) expandLandingSeeds(ctx context.Context, row *job.Row, live map
 		inserted = true
 	}
 	return inserted, nil
+}
+
+// rederivableLandingSeeds finds every landing_derived candidate an earlier
+// pass inserted that is still pending or retryable — never acquired, never
+// permanently failed — and rebuilds the seed that produced it. Without this,
+// such a row is a ticking bomb: candidateRows only ever populates live from
+// resolver output, and no resolver produces a landing-derived URL, so on the
+// very next pass live has no entry for its url_key. A single retryable fetch
+// failure flips it back to pending (ResetCandidates), the pending-queue loop
+// in fetchCandidates finds no live match, and marks it skipped — which
+// ResetCandidates never revives. One 503, and the recovery is gone for good.
+//
+// The fix is to make the candidate re-derivable rather than try to carry it
+// in live across passes — a bearer URL is never persisted and never
+// reconstructed from storage, and that invariant has to hold here too. The
+// landing_derived event durably records the parent's url_key; resolvers are
+// deterministic, so the parent — despite being invalid in the store — still
+// reappears in this pass's live under that same key, carrying its real
+// Landing URL. That is enough to re-read the landing page and reproduce the
+// identical derived URL without ever storing it.
+//
+// The second return value is the set of derived url_keys recognized here as
+// landing-derived and currently pending/retryable, whether or not revival
+// below actually lands them back in live. The pending-queue loop needs it to
+// tell "a bearer URL that legitimately died" from "a derivation this very
+// pass failed to re-read" (a flaky landing-page GET), and must retry the
+// latter rather than discard it — the same mistake this function exists to
+// fix, just one step earlier.
+func (s *Service) rederivableLandingSeeds(ctx context.Context, row *job.Row, live map[string]resolver.Candidate) ([]landingSeed, map[string]bool, error) {
+	events, err := s.Jobs.Events(ctx, row.ID)
+	if err != nil {
+		return nil, nil, err
+	}
+	pendingDerived := make(map[string]bool)
+	var seeds []landingSeed
+	for _, event := range events {
+		if kind, _ := event["kind"].(string); kind != landingDerivedEventKind {
+			continue
+		}
+		detail, _ := event["detail"].(map[string]any)
+		parentKey, _ := detail["parent_url_key"].(string)
+		derivedKey, _ := detail["url_key"].(string)
+		if parentKey == "" || derivedKey == "" {
+			continue
+		}
+		id, err := s.candidateIDByKey(ctx, row.ID, derivedKey)
+		if err != nil {
+			continue // row is gone; nothing to revive
+		}
+		derived, err := s.Jobs.GetCandidate(ctx, id)
+		if err != nil || (derived.Status != "pending" && derived.Status != "retryable") {
+			continue // already acquired, invalid, or skipped: settled, not our concern
+		}
+		pendingDerived[derivedKey] = true
+		parent, ok := live[parentKey]
+		if !ok {
+			continue // this pass's resolvers no longer reproduce the parent; unusable
+		}
+		seeds = append(seeds, landingSeed{landingURL: parent.Landing, parent: parent, parentKey: parentKey})
+	}
+	return seeds, pendingDerived, nil
 }
 
 // siblingHop is the C3 version hop at the fetch-exhaustion boundary: the
@@ -912,6 +986,27 @@ func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[st
 	landingExpansionTried := false
 	landingSeeds := make([]landingSeed, 0, 1)
 	seenLanding := map[string]bool{}
+	// Re-derive, before the pending queue is ever consulted, any
+	// landing-derived candidate an earlier pass inserted that is still
+	// pending or retryable (see rederivableLandingSeeds for why this can't
+	// wait for the exhaustion boundary below: that row is next out of
+	// NextPendingCandidate, not last). seenLanding is pre-marked so a
+	// same-pass candidate failure sharing that landing URL never issues a
+	// second GET for it.
+	pendingDerived := map[string]bool{}
+	if s.LandingReader != nil {
+		reseeds, derived, err := s.rederivableLandingSeeds(ctx, row, live)
+		if err != nil {
+			return err
+		}
+		pendingDerived = derived
+		for _, seed := range reseeds {
+			seenLanding[seed.landingURL] = true
+		}
+		if _, err := s.expandLandingSeeds(ctx, row, live, reseeds); err != nil {
+			return err
+		}
+	}
 	for {
 		stored, err := s.Jobs.NextPendingCandidate(ctx, row.ID)
 		if err != nil {
@@ -956,6 +1051,22 @@ func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[st
 		}
 		candidate, ok := live[stored.URLKey]
 		if !ok {
+			if pendingDerived[stored.URLKey] {
+				// This pending row is a landing-derived candidate the reseed
+				// step above recognized but could not revive this pass (the
+				// landing-page GET itself failed, or its parent no longer
+				// resolves) — a flaky read, not a dead bearer URL. Marking it
+				// skipped here would be exactly the bug this whole mechanism
+				// exists to fix, one step earlier: retryable lets
+				// ResetCandidates hand it back to a later pass instead.
+				if err := s.Jobs.MarkCandidate(ctx, stored.ID, "retryable"); err != nil {
+					return err
+				}
+				sourceRetry := earlierRetry(time.Time{}, s.Now(), 0, s.RetryDelay)
+				plan.CandidateTemporary = earlierTime(plan.CandidateTemporary, sourceRetry)
+				plan.RetryableCandidates++
+				continue
+			}
 			// A prior bearer URL survived only in redacted form; never reconstruct it.
 			_ = s.Jobs.MarkCandidate(ctx, stored.ID, "skipped")
 			continue
