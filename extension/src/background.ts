@@ -3561,10 +3561,14 @@ export class Bridge {
       return this.failure("scan_failed", "Could not scan the page");
     }
     const scanned = injected?.result as ScanResult | undefined;
-    if (scanned === undefined || !Array.isArray(scanned) || typeof scanned.truncated !== "boolean") {
+    if (
+      scanned === undefined ||
+      !Array.isArray(scanned.papers) ||
+      typeof scanned.truncated !== "boolean"
+    ) {
       return this.failure("scan_failed", "Could not scan the page");
     }
-    return { ok: true, items: scanned, truncated: scanned.truncated };
+    return { ok: true, items: scanned.papers, truncated: scanned.truncated };
   }
 
   private async loadPageBulkStore(): Promise<PageBulkScanStore> {

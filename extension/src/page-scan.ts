@@ -23,11 +23,14 @@ export interface DetectedPaper {
   occurrences: number;
 }
 
-/** scanDocument's return value is a DetectedPaper[] carrying one extra flag:
- * raw candidates were capped at 200 and truncation is reported, never silent
- * (Decision 3). Kept as an array-with-property, not a wrapper object, so the
- * common case (iterate the papers) needs no unwrapping. */
-export type ScanResult = DetectedPaper[] & { truncated: boolean };
+/** scanDocument's return value. A plain JSON object, deliberately: the
+ * result crosses chrome.scripting.executeScript's serialization boundary,
+ * which preserves array ELEMENTS but silently drops expando properties —
+ * an earlier DetectedPaper[] & {truncated} shape returned perfectly from
+ * the page and arrived in the extension with `truncated` gone, failing the
+ * background's shape check on every scan. Truncation is reported, never
+ * silent (Decision 3). */
+export type ScanResult = { papers: DetectedPaper[]; truncated: boolean };
 
 /** Raw-candidate cap before the scan stops walking the DOM (Decision 3). */
 export const PAGE_BULK_RAW_CANDIDATE_CAP = 200;
@@ -312,9 +315,7 @@ export function scanDocument(root: Document | Element = document): ScanResult {
       occurrences: entry.occurrences,
     });
   }
-  const result = papers as ScanResult;
-  result.truncated = truncated;
-  return result;
+	return { papers, truncated };
 }
 
 // ---------------------------------------------------------------------------
