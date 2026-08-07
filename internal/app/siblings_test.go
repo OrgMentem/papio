@@ -241,3 +241,134 @@ func TestSiblingHopFailureStillExhaustsWithoutLooping(t *testing.T) {
 		t.Fatalf("fetches = %d, want primary + sibling exactly once each", fetches)
 	}
 }
+
+// fakeRelations satisfies MetadataEnricher and VersionRelations: a no-op
+// enricher whose typed version edges are scripted.
+type fakeRelations struct {
+	siblings []string
+	err      error
+	calls    []string
+}
+
+func (f *fakeRelations) Enrich(_ context.Context, requested work.Work) (work.Work, bool, error) {
+	return requested, false, nil
+}
+
+func (f *fakeRelations) VersionSiblings(_ context.Context, doi string) ([]string, error) {
+	f.calls = append(f.calls, doi)
+	return append([]string(nil), f.siblings...), f.err
+}
+
+// doiSwitchResolver answers per-DOI, so a test can give the sibling DOI a
+// candidate while the canonical DOI stays empty.
+type doiSwitchResolver struct {
+	name  string
+	byDOI map[string][]resolver.Candidate
+}
+
+func (r *doiSwitchResolver) Name() string { return r.name }
+func (r *doiSwitchResolver) Resolve(_ context.Context, requested work.Work) ([]resolver.Candidate, error) {
+	return append([]resolver.Candidate(nil), r.byDOI[requested.DOI]...), nil
+}
+
+func typedSiblingCandidate(source string) resolver.Candidate {
+	c := siblingCandidate()
+	c.Source = source
+	c.Evidence = nil
+	return c
+}
+
+func TestTypedVersionRelationsPrecedeTheFuzzySiblingHop(t *testing.T) {
+	const siblingDOI = "10.2139/ssrn.4020557"
+	svc, jobs := newTestService(t)
+	svc.Enricher = &fakeRelations{siblings: []string{siblingDOI}}
+	fuzzy := &fakeSiblingResolver{
+		fakeResolver: fakeResolver{name: "openalex"},
+		siblings:     []resolver.Candidate{siblingCandidate()},
+	}
+	svc.Resolvers = []ResolverEntry{
+		{Adapter: &doiSwitchResolver{name: "unpaywall", byDOI: map[string][]resolver.Candidate{
+			siblingDOI: {typedSiblingCandidate("unpaywall")},
+		}}, Policy: config.Source{Enabled: true}},
+		{Adapter: fuzzy, Policy: config.Source{Enabled: true}},
+	}
+	fetches := 0
+	svc.Fetch = fakeDownload(&fetches)
+	svc.Validate = passValidation()
+
+	id, err := svc.Submit(context.Background(), doiRequest("wr_typed_hop_01"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, err := jobs.ClaimNext(context.Background(), "worker", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Process(context.Background(), row); err != nil {
+		t.Fatal(err)
+	}
+	got, err := jobs.Get(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != job.StateReady {
+		t.Fatalf("job state = %q, want ready via the typed sibling candidate", got.State)
+	}
+	// The registrant-asserted edge answered, so the fuzzy hop never ran.
+	if len(fuzzy.hopRequests) != 0 {
+		t.Fatalf("fuzzy hop requests = %d, want 0: typed edges outrank fuzzy search", len(fuzzy.hopRequests))
+	}
+	var source string
+	if err := jobs.S.DB().QueryRowContext(context.Background(),
+		`SELECT source FROM candidates WHERE job_id = ?`, id).Scan(&source); err != nil || source != "unpaywall" {
+		t.Fatalf("persisted candidate source = %q, %v; want unpaywall via the typed edge", source, err)
+	}
+}
+
+func TestTypedSiblingsKeepOpenAccessCandidatesOnly(t *testing.T) {
+	const siblingDOI = "10.2139/ssrn.4020557"
+	svc, jobs := newTestService(t)
+	svc.Enricher = &fakeRelations{siblings: []string{siblingDOI}}
+	institutional := typedSiblingCandidate("unpaywall")
+	institutional.AccessBasis = resolver.AccessInstitutional
+	svc.Resolvers = []ResolverEntry{
+		{Adapter: &doiSwitchResolver{name: "unpaywall", byDOI: map[string][]resolver.Candidate{
+			siblingDOI: {institutional},
+		}}, Policy: config.Source{Enabled: true}},
+	}
+
+	id, err := svc.Submit(context.Background(), doiRequest("wr_typed_oa_only_01"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, err := jobs.ClaimNext(context.Background(), "worker", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cands, _ := svc.typedSiblings(context.Background(), row)
+	if len(cands) != 0 {
+		t.Fatalf("typed candidates = %#v, want none: an institutional route for a different DOI signs the operator into the wrong work", cands)
+	}
+	_ = id
+}
+
+func TestTypedRelationsRateLimitParksInsteadOfSettling(t *testing.T) {
+	svc, jobs := newTestService(t)
+	svc.Enricher = &fakeRelations{err: &resolver.TemporaryError{Err: errors.New("crossref 429"), RetryAfter: time.Minute}}
+	svc.Resolvers = nil
+
+	if _, err := svc.Submit(context.Background(), doiRequest("wr_typed_429_01")); err != nil {
+		t.Fatal(err)
+	}
+	row, err := jobs.ClaimNext(context.Background(), "worker", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cands, plan := svc.typedSiblings(context.Background(), row)
+	if len(cands) != 0 {
+		t.Fatalf("typed candidates = %#v, want none on a rate limit", cands)
+	}
+	if plan.TemporaryResolvers != 1 || plan.ResolverTemporary.IsZero() {
+		t.Fatalf("plan = %+v, want the 429 recorded as retryable: at the exhaustion boundary a missing retry time is the difference between parking and giving up", plan)
+	}
+}

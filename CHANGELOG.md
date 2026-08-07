@@ -13,6 +13,23 @@ execution records in `notes/acquisition-stack-plan.md`.
 
 ### Added
 
+- **The version hop follows Crossref's typed relations before any fuzzy
+  search.** When a DOI's own candidates are exhausted, papio now asks
+  Crossref for the registrant-asserted `has-preprint` / `is-preprint-of` /
+  `has-version` / `is-version-of` edges (depth one, capped at three, through
+  the existing `crossref_metadata` source and its budget) and resolves those
+  sibling DOIs through the enabled open-access resolvers — a typed edge was
+  asserted by the registrant, so it outranks the OpenAlex title-match hop,
+  which now runs only when no typed edge produced a candidate. Typed sibling
+  candidates are open-access only (routing a *different* DOI to an
+  institutional resolver would sign the operator into the wrong work's
+  paywall), are identity-checked against the sibling DOI they were resolved
+  from, and still cross PDF semantic-identity validation against the
+  requested work before acceptance. A rate-limited relation lookup parks the
+  job like any other temporary source failure; it never settles it
+  unavailable. Verified live: a paywalled Nature article resolves its typed
+  medRxiv preprint in one hop.
+
 - **A browser adoption that witnessed an institutional login now publishes its
   entitlement (ADR-0018).** `acquisition-bundle/2`'s `operator_browser_session`
   acquisition mode has had no producer since it was reserved; the delivery

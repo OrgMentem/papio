@@ -31,7 +31,7 @@ daemon on your machine. Each request carries the identifier being looked up; the
 | Destination | Also sends | When | Default |
 | --- | --- | --- | --- |
 | `api.unpaywall.org` | your `email` (required by their terms) | Resolving a DOI | **On** |
-| `api.crossref.org` | your `email`, if set | Filling in metadata for a title-only request | **On** |
+| `api.crossref.org` | your `email`, if set | Filling in metadata for a title-only request; looking up a DOI's registered version relations (preprint/version links) when its own candidates are exhausted | **On** |
 | `api.crossref.org` | — | Daily retraction check over papers **already in your library** | **On** |
 | `www.ebi.ac.uk` (Europe PMC) | — | Resolving a DOI, PMID, or title | **On** |
 | `export.arxiv.org` | — | Resolving an arXiv id or DOI | **On** |

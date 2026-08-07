@@ -1,6 +1,8 @@
 // Copyright 2026 OrgMentem. Licensed under MIT. See LICENSE.
 
-// Package enrich adds corroborated metadata to title-only work requests.
+// Package enrich adds corroborated metadata to title-only work requests and
+// answers typed version-relation questions about a DOI from the same Crossref
+// metadata surface.
 package enrich
 
 import (
@@ -142,6 +144,123 @@ func (e *Enricher) Enrich(ctx context.Context, requested work.Work) (work.Work, 
 		return enriched, true, nil
 	}
 	return requested, false, nil
+}
+
+// versionRelationTypes are the Crossref relation edges that name another
+// registered version of the same work. Only these typed, depth-one edges are
+// followed — never fuzzy similarity: a typed edge was asserted by a
+// registrant, so following it cannot fetch a merely similar-looking work.
+var versionRelationTypes = []string{"has-preprint", "is-preprint-of", "has-version", "is-version-of"}
+
+// maxVersionSiblings caps how many related DOIs one lookup may return: the
+// hop runs at the exhaustion boundary, where each sibling fans out over the
+// enabled resolvers.
+const maxVersionSiblings = 3
+
+// VersionSiblings returns the DOIs Crossref records as typed version
+// relations of doi (preprint and version edges, depth one), normalized,
+// deduplicated, capped, and never including doi itself. An unregistered or
+// relation-less DOI is (nil, nil); rate limits and upstream faults are
+// *resolver.TemporaryError like every other source client.
+func (e *Enricher) VersionSiblings(ctx context.Context, doi string) ([]string, error) {
+	if e == nil || e.client == nil {
+		return nil, errors.New("enrich: HTTP client is not configured")
+	}
+	normalized, err := work.NormalizeDOI(doi)
+	if err != nil {
+		return nil, nil
+	}
+	// A "." or ".." path segment inside an otherwise-legal DOI would escape
+	// the /works/ prefix when a server resolves the path. No real DOI has
+	// one (the same guard internal/doiregistry documents).
+	for _, segment := range strings.Split(normalized, "/") {
+		if segment == "." || segment == ".." {
+			return nil, nil
+		}
+	}
+
+	endpoint, err := url.Parse(e.baseURL)
+	if err != nil || endpoint.Scheme == "" || endpoint.Host == "" {
+		return nil, errors.New("enrich: invalid configured endpoint")
+	}
+	endpoint.Path = strings.TrimRight(endpoint.Path, "/") + "/" + normalized
+	query := endpoint.Query()
+	if e.email != "" {
+		query.Set("mailto", e.email)
+	}
+	endpoint.RawQuery = query.Encode()
+
+	requestCtx, cancel := context.WithTimeout(ctx, requestTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(requestCtx, http.MethodGet, endpoint.String(), nil)
+	if err != nil {
+		return nil, errors.New("enrich: could not construct request")
+	}
+	req.Header.Set("Accept", "application/json")
+	resp, err := e.client.Do(req)
+	if err != nil {
+		if requestCtx.Err() != nil {
+			if errors.Is(requestCtx.Err(), context.DeadlineExceeded) {
+				return nil, &resolver.TemporaryError{Err: errors.New("enrich: request deadline exceeded")}
+			}
+			return nil, requestCtx.Err()
+		}
+		return nil, &resolver.TemporaryError{Err: errors.New("enrich: request failed")}
+	}
+	if resp == nil {
+		return nil, &resolver.TemporaryError{Err: errors.New("enrich: empty HTTP response")}
+	}
+	if resp.Body == nil {
+		return nil, errors.New("enrich: response body is missing")
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	switch {
+	case resp.StatusCode == http.StatusNotFound:
+		return nil, nil
+	case resp.StatusCode == http.StatusRequestTimeout || resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500:
+		return nil, temporaryStatus(resp)
+	case resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices:
+		return nil, fmt.Errorf("enrich: Crossref returned HTTP %d", resp.StatusCode)
+	}
+
+	var payload relationResponse
+	if err := decodeBoundedJSON(resp.Body, e.maxBody, &payload); err != nil {
+		return nil, fmt.Errorf("enrich: invalid Crossref response: %w", err)
+	}
+	seen := map[string]bool{normalized: true}
+	siblings := make([]string, 0, maxVersionSiblings)
+	for _, relationType := range versionRelationTypes {
+		for _, target := range payload.Message.Relation[relationType] {
+			if !strings.EqualFold(strings.TrimSpace(target.IDType), "doi") {
+				continue
+			}
+			sibling, err := work.NormalizeDOI(target.ID)
+			if err != nil || seen[sibling] {
+				continue
+			}
+			seen[sibling] = true
+			siblings = append(siblings, sibling)
+			if len(siblings) == maxVersionSiblings {
+				return siblings, nil
+			}
+		}
+	}
+	if len(siblings) == 0 {
+		return nil, nil
+	}
+	return siblings, nil
+}
+
+type relationResponse struct {
+	Message struct {
+		Relation map[string][]relationTarget `json:"relation"`
+	} `json:"message"`
+}
+
+type relationTarget struct {
+	ID     string `json:"id"`
+	IDType string `json:"id-type"`
 }
 
 func (e *Enricher) searchURL(title string) (*url.URL, error) {

@@ -6,6 +6,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"papio/internal/resolver"
@@ -176,5 +177,104 @@ func TestAuthorFamilyAcceptsSingleWordAuthors(t *testing.T) {
 	}
 	if got := authorFamily("John Smith"); got != "smith" {
 		t.Fatalf("authorFamily(John Smith) = %q, want smith", got)
+	}
+}
+
+func versionServer(t *testing.T, status int, body string) (*Enricher, *string) {
+	t.Helper()
+	var gotURL string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotURL = r.URL.String()
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(server.Close)
+	return NewWithOptions(Options{Client: http.DefaultClient, ContactEmail: "reader@example.test", BaseURL: server.URL + "/works"}), &gotURL
+}
+
+func TestVersionSiblingsFollowsTypedEdgesOnly(t *testing.T) {
+	e, gotURL := versionServer(t, http.StatusOK, `{"message": {"relation": {
+		"has-preprint": [
+			{"id-type": "doi", "id": "https://doi.org/10.2139/ssrn.4020557"},
+			{"id-type": "arxiv", "id": "2401.12345"},
+			{"id-type": "doi", "id": "10.1145/3531146.3533202"}
+		],
+		"is-version-of": [{"id-type": "doi", "id": "10.5555/other.version"}],
+		"is-review-of":  [{"id-type": "doi", "id": "10.9999/unrelated"}]
+	}}}`)
+	siblings, err := e.VersionSiblings(context.Background(), "10.1145/3531146.3533202")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The arXiv-typed target is skipped, the work's own DOI is excluded, and
+	// a non-version relation (is-review-of) is never followed: a review is a
+	// different work, not another version of this one.
+	want := []string{"10.2139/ssrn.4020557", "10.5555/other.version"}
+	if len(siblings) != len(want) || siblings[0] != want[0] || siblings[1] != want[1] {
+		t.Fatalf("siblings = %v, want %v", siblings, want)
+	}
+	if !strings.Contains(*gotURL, "/works/10.1145/3531146.3533202") || !strings.Contains(*gotURL, "mailto=reader%40example.test") {
+		t.Fatalf("request URL = %q, want the works path and the polite-pool mailto", *gotURL)
+	}
+}
+
+func TestVersionSiblingsCapsAndDeduplicates(t *testing.T) {
+	e, _ := versionServer(t, http.StatusOK, `{"message": {"relation": {
+		"has-preprint": [
+			{"id-type": "doi", "id": "10.1234/a"},
+			{"id-type": "doi", "id": "10.1234/a"},
+			{"id-type": "doi", "id": "10.1234/b"}
+		],
+		"has-version": [
+			{"id-type": "doi", "id": "10.1234/c"},
+			{"id-type": "doi", "id": "10.1234/d"}
+		]
+	}}}`)
+	siblings, err := e.VersionSiblings(context.Background(), "10.1234/self")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(siblings) != 3 {
+		t.Fatalf("siblings = %v, want the duplicate collapsed and the count capped at 3", siblings)
+	}
+}
+
+func TestVersionSiblingsClassifiesAbsenceAndFailures(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		status        int
+		body          string
+		wantTemporary bool
+		wantErr       bool
+	}{
+		{name: "unregistered DOI is absence", status: http.StatusNotFound},
+		{name: "no relations is absence", status: http.StatusOK, body: `{"message": {}}`},
+		{name: "429 is temporary", status: http.StatusTooManyRequests, wantTemporary: true, wantErr: true},
+		{name: "500 is temporary", status: http.StatusInternalServerError, wantTemporary: true, wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			e, _ := versionServer(t, test.status, test.body)
+			siblings, err := e.VersionSiblings(context.Background(), "10.1234/self")
+			if siblings != nil {
+				t.Fatalf("siblings = %v, want nil", siblings)
+			}
+			if test.wantErr != (err != nil) {
+				t.Fatalf("err = %v, wantErr = %t", err, test.wantErr)
+			}
+			if _, temporary := resolver.Temporary(err); temporary != test.wantTemporary {
+				t.Fatalf("Temporary(%v) = %t, want %t", err, temporary, test.wantTemporary)
+			}
+		})
+	}
+}
+
+func TestVersionSiblingsRejectsDotSegmentDOIs(t *testing.T) {
+	e := NewWithOptions(Options{Client: http.DefaultClient, BaseURL: "https://api.example.test/works"})
+	// doiCoreRE admits any non-whitespace suffix, so this is a "legal" DOI
+	// whose path segments would escape /works/ on a Cleaning server. It must
+	// be treated as absence without any request.
+	siblings, err := e.VersionSiblings(context.Background(), "10.1234/../../../x")
+	if siblings != nil || err != nil {
+		t.Fatalf("VersionSiblings = (%v, %v), want (nil, nil)", siblings, err)
 	}
 }

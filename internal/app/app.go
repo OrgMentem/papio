@@ -773,13 +773,27 @@ type SiblingResolver interface {
 	ResolveSiblings(ctx context.Context, requested work.Work) ([]resolver.Candidate, error)
 }
 
-// resolveSiblings runs the one-shot version hop. Sibling candidates carry
-// deliberately different identifiers, so the identifier-conflict filter is
-// skipped: strict title/author matching happened in the adapter, and PDF
-// semantic-identity validation against row.Work remains the acceptance gate.
+// VersionRelations is the optional enricher capability behind the typed
+// version hop: Crossref's registrant-asserted preprint/version edges name
+// sibling DOIs of the same work, depth one, before any fuzzy search runs.
+type VersionRelations interface {
+	VersionSiblings(ctx context.Context, doi string) ([]string, error)
+}
+
+// resolveSiblings runs the one-shot version hop, typed edges first: a
+// registrant-asserted Crossref relation names a sibling DOI outright, so it
+// outranks any fuzzy match — the fuzzy adapters run only when no typed edge
+// produced a candidate. Sibling candidates carry deliberately different
+// identifiers, so the identifier-conflict filter against row.Work is
+// skipped: typed edges were asserted by the registrant, strict title/author
+// matching happened in the fuzzy adapter, and PDF semantic-identity
+// validation against row.Work remains the acceptance gate either way.
 // Errors never fail resolution — the hop must not make an acquisition worse.
 func (s *Service) resolveSiblings(ctx context.Context, row *job.Row) ([]resolver.Candidate, retryPlan) {
-	var plan retryPlan
+	typed, plan := s.typedSiblings(ctx, row)
+	if len(typed) > 0 {
+		return typed, plan
+	}
 	for _, entry := range s.Resolvers {
 		sibling, ok := entry.Adapter.(SiblingResolver)
 		if !ok {
@@ -838,6 +852,130 @@ func (s *Service) resolveSiblings(ctx context.Context, row *job.Row) ([]resolver
 		}
 	}
 	return nil, plan
+}
+
+// typedSiblings follows Crossref's typed version relations (has-preprint,
+// is-preprint-of, has-version, is-version-of) from the job's DOI, then runs
+// each sibling DOI through the enabled resolvers, keeping open-access
+// candidates only: routing a *different* DOI to an institutional resolver
+// would hand the operator the wrong work's sign-in. Budget, retry, and
+// attempt bookkeeping mirror the fuzzy loop exactly — a 429 here is a park,
+// never an unavailable verdict.
+func (s *Service) typedSiblings(ctx context.Context, row *job.Row) ([]resolver.Candidate, retryPlan) {
+	var plan retryPlan
+	relations, ok := s.Enricher.(VersionRelations)
+	if !ok || strings.TrimSpace(row.Work.DOI) == "" {
+		return nil, plan
+	}
+	name := config.SourceCrossrefMetadata
+	policy := s.Config.SourcePolicy(name)
+	if !policy.Enabled || !row.Policy.SourceAllowed(name) {
+		return nil, plan
+	}
+	attempt, err := s.Jobs.StartAttempt(ctx, row.ID, 0, "resolve", name)
+	if err != nil {
+		return nil, plan
+	}
+	if s.Budgets != nil {
+		if err := s.Budgets.Acquire(ctx, name, policy, 0); err != nil {
+			_ = s.Jobs.FinishAttempt(ctx, attempt, "budget_blocked", 0, safeType(err))
+			var deferred *budget.ErrDeferred
+			if errors.As(err, &deferred) {
+				plan.Gate = earlierTime(plan.Gate, deferred.Until)
+				plan.ClosedSourceGates++
+			}
+			return nil, plan
+		}
+	}
+	sibs, err := relations.VersionSiblings(ctx, row.Work.DOI)
+	if err != nil {
+		if delay, temporary := resolver.Temporary(err); temporary {
+			sourceRetry := earlierRetry(time.Time{}, s.Now(), delay, s.RetryDelay)
+			plan.ResolverTemporary = earlierTime(plan.ResolverTemporary, sourceRetry)
+			plan.TemporaryResolvers++
+			if s.Budgets != nil {
+				_ = s.Budgets.Defer(ctx, name, policy, sourceRetry)
+			}
+			_ = s.Jobs.FinishAttempt(ctx, attempt, "retryable", 0, safeType(err))
+			return nil, plan
+		}
+		_ = s.Jobs.FinishAttempt(ctx, attempt, "failed", 0, safeType(err))
+		return nil, plan
+	}
+	_ = s.Jobs.FinishAttempt(ctx, attempt, "success", 0, fmt.Sprintf("version_siblings=%d", len(sibs)))
+	if len(sibs) == 0 {
+		return nil, plan
+	}
+
+	var all []resolver.Candidate
+	for _, entry := range s.Resolvers {
+		if entry.Adapter == nil {
+			continue
+		}
+		rname := entry.Adapter.Name()
+		if !row.Policy.SourceAllowed(rname) || !entry.Policy.Enabled {
+			continue
+		}
+		attempt, err := s.Jobs.StartAttempt(ctx, row.ID, 0, "resolve", rname)
+		if err != nil {
+			return all, plan
+		}
+		if s.Budgets != nil {
+			if err := s.Budgets.Acquire(ctx, rname, entry.Policy, entry.EstimatedCost); err != nil {
+				_ = s.Jobs.FinishAttempt(ctx, attempt, "budget_blocked", 0, safeType(err))
+				var deferred *budget.ErrDeferred
+				if errors.As(err, &deferred) {
+					plan.Gate = earlierTime(plan.Gate, deferred.Until)
+					plan.ClosedSourceGates++
+				}
+				continue
+			}
+		}
+		outcome, detail, valid := "success", "", 0
+		for _, sib := range sibs {
+			cands, err := entry.Adapter.Resolve(ctx, work.Work{DOI: sib})
+			if err != nil {
+				if ctx.Err() != nil {
+					_ = s.Jobs.FinishAttempt(ctx, attempt, "failed", 0, safeType(ctx.Err()))
+					return all, plan
+				}
+				if delay, temporary := resolver.Temporary(err); temporary {
+					sourceRetry := earlierRetry(time.Time{}, s.Now(), delay, s.RetryDelay)
+					plan.ResolverTemporary = earlierTime(plan.ResolverTemporary, sourceRetry)
+					plan.TemporaryResolvers++
+					if s.Budgets != nil {
+						_ = s.Budgets.Defer(ctx, rname, entry.Policy, sourceRetry)
+					}
+					outcome, detail = "retryable", safeType(err)
+				} else {
+					outcome, detail = "failed", safeType(err)
+				}
+				break
+			}
+			for _, c := range cands {
+				if c.Source == "" {
+					c.Source = rname
+				}
+				// Open access only: a typed sibling is a different DOI, and
+				// routing it institutionally would sign the operator into
+				// the wrong work's paywall. Conflicts are checked against
+				// the sibling identity, never row.Work — differing from the
+				// requested DOI is the entire point of the hop.
+				if c.Source != rname || c.AccessBasis != resolver.AccessOpen ||
+					resolver.ValidateCandidate(c) != nil || conflicts(work.Work{DOI: sib}, c.ResolvedWork) {
+					continue
+				}
+				c.Evidence = append(c.Evidence, "version_relation crossref "+row.Work.DOI+" -> "+sib)
+				all = append(all, c)
+				valid++
+			}
+		}
+		if outcome == "success" {
+			detail = fmt.Sprintf("typed_sibling_candidates=%d", valid)
+		}
+		_ = s.Jobs.FinishAttempt(ctx, attempt, outcome, 0, detail)
+	}
+	return all, plan
 }
 
 func (s *Service) enrichDOIWork(ctx context.Context, row *job.Row) error {
