@@ -60,6 +60,7 @@ const (
 	sessionEvidenceFeature       = "session_evidence_v1"
 	deliveryContextFeature       = "delivery_context_v1"
 	pageCaptureTermsFeature      = "page_capture_terms_v1"
+	pageBulkAcquireFeature       = "page_bulk_acquire_v1"
 	previewCapabilityTTL         = 10 * time.Minute
 	sessionEvidenceThrottle      = 60 * time.Second
 	deliveryContextTTL           = 60 * time.Second
@@ -245,7 +246,7 @@ const pendingExpireAfter = 5 * time.Minute
 // any job is ever offered depends on config (extension_id / openurl base).
 func NewBridge(jobs *job.Store, svc *app.Service, triageService *triage.Service, watchRunner *watch.Runner, previewServer *preview.Server, captureStore *captures.Store, cfg config.Config, version string) *Bridge {
 	required := []string{
-		pageAcquireFeature, triageSnapshotFeature, triageSnapshotSchema2Feature, triageMutationsFeature, reviewPreviewFeature, statsFeature, pageCaptureFeature, pageCaptureRequestFeature, activityFeedFeature, triageCountsSchema2Feature, sessionEvidenceFeature, deliveryContextFeature, pageCaptureTermsFeature,
+		pageAcquireFeature, triageSnapshotFeature, triageSnapshotSchema2Feature, triageMutationsFeature, reviewPreviewFeature, statsFeature, pageCaptureFeature, pageCaptureRequestFeature, activityFeedFeature, triageCountsSchema2Feature, sessionEvidenceFeature, deliveryContextFeature, pageCaptureTermsFeature, pageBulkAcquireFeature,
 	}
 	return &Bridge{
 		jobs: jobs, svc: svc, triage: triageService, watchRunner: watchRunner, preview: previewServer, captureStore: captureStore, cfg: cfg,

@@ -970,3 +970,121 @@ func TestInstitutionForMirrorsDefaultProfileLibKeyFields(t *testing.T) {
 		}
 	}
 }
+
+func TestDocumentDeliveryConfigValidationFailsClosed(t *testing.T) {
+	validIlliadDefault := "[browser]\n" +
+		"openurl_base_url = \"https://resolver.example.edu/openurl\"\n" +
+		"[browser.document_delivery]\n" +
+		"kind = \"illiad\"\n" +
+		"base_url = \"https://illiad.example.edu/ILLiadWebPlatform\"\n" +
+		"allowed_hosts = [\"illiad.example.edu\"]\n" +
+		"submit_policy = \"auto_if_unconditional\"\n" +
+		"request_classes = [\"digital_journal_article\"]\n" +
+		"legal_basis = \"institution_policy\"\n" +
+		"patron_attestation = \"standing_completed\"\n" +
+		"patron_fee_policy = \"zero_standard\"\n" +
+		"monthly_request_cap = 25\n" +
+		"status_poll_minutes = 60\n" +
+		"api_key = \"secret-key\"\n" +
+		"patron_ref = \"configured-non-secret-reference\"\n"
+	validIlliadNamed := "[browser.resolvers.campus]\n" +
+		"openurl_base_url = \"https://campus.example.edu/openurl\"\n" +
+		"[browser.resolvers.campus.document_delivery]\n" +
+		"kind = \"illiad\"\n" +
+		"base_url = \"https://illiad.example.edu/ILLiadWebPlatform\"\n" +
+		"allowed_hosts = [\"illiad.example.edu\"]\n" +
+		"submit_policy = \"auto_if_unconditional\"\n" +
+		"request_classes = [\"digital_journal_article\"]\n" +
+		"legal_basis = \"institution_policy\"\n" +
+		"patron_attestation = \"standing_completed\"\n" +
+		"patron_fee_policy = \"zero_standard\"\n" +
+		"monthly_request_cap = 25\n" +
+		"status_poll_minutes = 60\n" +
+		"api_key = \"secret-key\"\n" +
+		"patron_ref = \"configured-non-secret-reference\"\n"
+	for _, test := range []struct {
+		name    string
+		body    string
+		wantErr string // empty = accept
+	}{
+		{
+			name: "full valid illiad block on the default profile",
+			body: validIlliadDefault,
+		},
+		{
+			name: "full valid illiad block on a named profile",
+			body: validIlliadNamed,
+		},
+		{
+			name:    "oclc kind is not implemented",
+			body:    "[browser.document_delivery]\nkind = \"oclc\"\n",
+			wantErr: "not implemented",
+		},
+		{
+			name:    "unknown kind",
+			body:    "[browser.document_delivery]\nkind = \"tipasa\"\n",
+			wantErr: "not a recognized document-delivery kind",
+		},
+		{
+			name:    "missing kind",
+			body:    "[browser.document_delivery]\nbase_url = \"https://ill.example.edu/request\"\n",
+			wantErr: "kind is required",
+		},
+		{
+			name:    "api_key on a form-kind profile is dead config",
+			body:    "[browser.document_delivery]\nkind = \"openurl\"\napi_key = \"secret\"\n",
+			wantErr: "api_key is set but kind is",
+		},
+		{
+			name:    "auto_if_unconditional on libkey kind is not auto-capable",
+			body:    "[browser.document_delivery]\nkind = \"libkey\"\nsubmit_policy = \"auto_if_unconditional\"\n",
+			wantErr: "requires kind \"illiad\"",
+		},
+		{
+			name:    "unknown request class",
+			body:    "[browser.document_delivery]\nkind = \"illiad\"\nrequest_classes = [\"ill_book\"]\n",
+			wantErr: "not modelled yet",
+		},
+		{
+			name:    "http base_url is rejected",
+			body:    "[browser.document_delivery]\nkind = \"custom\"\nbase_url = \"http://ill.example.edu/request\"\n",
+			wantErr: "base_url must be an absolute https URL",
+		},
+		{
+			name:    "named-profile errors carry the profile name",
+			body:    "[browser.resolvers.campus]\nopenurl_base_url = \"https://campus.example.edu/openurl\"\n[browser.resolvers.campus.document_delivery]\nkind = \"oclc\"\n",
+			wantErr: "browser.resolvers.campus.document_delivery.kind",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.toml")
+			if err := os.WriteFile(path, []byte("access_mode = \"conservative\"\n"+test.body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			_, err := Load(path)
+			if test.wantErr == "" {
+				if err != nil {
+					t.Fatalf("valid document_delivery config rejected: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+				t.Fatalf("Load = %v, want an error containing %q", err, test.wantErr)
+			}
+		})
+	}
+}
+
+func TestInstitutionForMirrorsDefaultProfileDocumentDelivery(t *testing.T) {
+	dd := &DocumentDelivery{Kind: "illiad", BaseURL: "https://illiad.example.edu/ILLiadWebPlatform"}
+	cfg := Config{Browser: Browser{
+		OpenURLBase:      "https://resolver.example.edu/openurl",
+		DocumentDelivery: dd,
+	}}
+	for _, name := range []string{"", "default"} {
+		inst, ok := cfg.InstitutionFor(name)
+		if !ok || inst.DocumentDelivery != dd {
+			t.Fatalf("InstitutionFor(%q) = %+v, %t — the default profile must carry the top-level DocumentDelivery pointer", name, inst, ok)
+		}
+	}
+}

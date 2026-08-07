@@ -1,0 +1,1 @@
+{"protocol":"papio-browser/1","type":"page_bulk_submit_result","msg_id":"page-bulk-submit-res-01","seq":4,"payload":{"request_id":"request-bulk-0002","scan_id":"scan-bulk-0001","submitted":1,"joined":1,"already_owned":0,"invalid":0,"batch_id":"batch_bulk_00001"}}

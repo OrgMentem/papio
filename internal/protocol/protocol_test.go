@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -674,6 +675,10 @@ func TestTriageFixturePayloadRoundTrips(t *testing.T) {
 		"browser-activity-request.json":            MsgActivityRequest,
 		"browser-activity-request-default.json":    MsgActivityRequest,
 		"browser-activity-response.json":           MsgActivityResponse,
+		"browser-page-bulk-status-request.json":    MsgPageBulkStatusRequest,
+		"browser-page-bulk-status-result.json":     MsgPageBulkStatusResult,
+		"browser-page-bulk-submit-request.json":    MsgPageBulkSubmitRequest,
+		"browser-page-bulk-submit-result.json":     MsgPageBulkSubmitResult,
 	}
 	for name, wantType := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -714,6 +719,229 @@ func TestActivityRequestDefaultsLimit(t *testing.T) {
 	payload := message.Payload.(*ActivityRequestPayload)
 	if payload.Limit != 20 {
 		t.Fatalf("activity request limit = %d, want default 20", payload.Limit)
+	}
+}
+
+func TestPageBulkPayloadRoundTripAndValidation(t *testing.T) {
+	frame := func(typ string, payload any) []byte {
+		t.Helper()
+		data, err := json.Marshal(map[string]any{
+			"protocol": BrowserProtocolVersion,
+			"type":     typ,
+			"msg_id":   "page-bulk-msg-0001",
+			"seq":      1,
+			"payload":  payload,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return data
+	}
+
+	statusRequest := PageBulkStatusRequestPayload{
+		RequestID: "request-bulk-0001", ScanID: "scan-bulk-0001",
+		Identifiers: []PageBulkIdentifier{
+			{LocalID: "row-1", Kind: "doi", Value: "10.1000/example.42"},
+			{LocalID: "row-2", Kind: "pmid", Value: "12345678"},
+		},
+	}
+	msg, err := DecodeBrowserMessage(frame(MsgPageBulkStatusRequest, statusRequest))
+	if err != nil {
+		t.Fatalf("decode page_bulk_status_request: %v", err)
+	}
+	got := msg.Payload.(*PageBulkStatusRequestPayload)
+	if got.RequestID != statusRequest.RequestID || got.ScanID != statusRequest.ScanID || len(got.Identifiers) != 2 {
+		t.Fatalf("round-trip status request = %#v, want %#v", got, statusRequest)
+	}
+
+	statusResult := PageBulkStatusResultPayload{
+		RequestID: "request-bulk-0001", ScanID: "scan-bulk-0001",
+		Items: []PageBulkStatusItem{
+			{LocalID: "row-1", CanonicalKey: "work-key-1", Status: "eligible", OwnershipComplete: false},
+			{LocalID: "row-2", CanonicalKey: "work-key-2", Status: "queued", OwnershipComplete: false, JobID: "job_bulk_00001"},
+			{LocalID: "row-3", Status: "invalid", OwnershipComplete: false},
+		},
+		Truncated: true,
+	}
+	msg, err = DecodeBrowserMessage(frame(MsgPageBulkStatusResult, statusResult))
+	if err != nil {
+		t.Fatalf("decode page_bulk_status_result: %v", err)
+	}
+	if got := msg.Payload.(*PageBulkStatusResultPayload); !got.Truncated || len(got.Items) != 3 || got.Items[2].CanonicalKey != "" {
+		t.Fatalf("round-trip status result = %#v, want %#v", got, statusResult)
+	}
+
+	submitRequest := PageBulkSubmitRequestPayload{
+		RequestID: "request-bulk-0002", ScanID: "scan-bulk-0001",
+		CanonicalKeys: []string{"work-key-1", "work-key-2"},
+		Source:        PageBulkSubmitSource{Kind: "browser_page", Origin: "https://scholar.example.edu", Detector: "generic-identifiers/1"},
+	}
+	msg, err = DecodeBrowserMessage(frame(MsgPageBulkSubmitRequest, submitRequest))
+	if err != nil {
+		t.Fatalf("decode page_bulk_submit_request: %v", err)
+	}
+	got2 := msg.Payload.(*PageBulkSubmitRequestPayload)
+	if got2.RequestID != submitRequest.RequestID || got2.ScanID != submitRequest.ScanID ||
+		!slices.Equal(got2.CanonicalKeys, submitRequest.CanonicalKeys) || got2.Source != submitRequest.Source {
+		t.Fatalf("round-trip submit request = %#v, want %#v", got2, submitRequest)
+	}
+
+	submitResult := PageBulkSubmitResultPayload{
+		RequestID: "request-bulk-0002", ScanID: "scan-bulk-0001",
+		Submitted: 1, Joined: 1, AlreadyOwned: 0, Invalid: 0, BatchID: "batch_bulk_00001",
+	}
+	msg, err = DecodeBrowserMessage(frame(MsgPageBulkSubmitResult, submitResult))
+	if err != nil {
+		t.Fatalf("decode page_bulk_submit_result: %v", err)
+	}
+	if got := msg.Payload.(*PageBulkSubmitResultPayload); *got != submitResult {
+		t.Fatalf("round-trip submit result = %#v, want %#v", got, submitResult)
+	}
+
+	manyIdentifiers := func(n int) []map[string]any {
+		out := make([]map[string]any, n)
+		for i := range out {
+			out[i] = map[string]any{"local_id": fmt.Sprintf("row-%d", i), "kind": "doi", "value": fmt.Sprintf("10.1000/example.%d", i)}
+		}
+		return out
+	}
+	for _, tc := range []struct {
+		name    string
+		payload map[string]any
+	}{
+		{name: "no identifiers", payload: map[string]any{
+			"request_id": "request-bulk-0001", "scan_id": "scan-bulk-0001", "identifiers": []any{},
+		}},
+		{name: "201 identifiers", payload: map[string]any{
+			"request_id": "request-bulk-0001", "scan_id": "scan-bulk-0001", "identifiers": manyIdentifiers(201),
+		}},
+		{name: "bad kind", payload: map[string]any{
+			"request_id": "request-bulk-0001", "scan_id": "scan-bulk-0001",
+			"identifiers": []map[string]any{{"local_id": "row-1", "kind": "isbn", "value": "9780000000002"}},
+		}},
+		{name: "duplicate local_id", payload: map[string]any{
+			"request_id": "request-bulk-0001", "scan_id": "scan-bulk-0001",
+			"identifiers": []map[string]any{
+				{"local_id": "row-1", "kind": "doi", "value": "10.1000/a"},
+				{"local_id": "row-1", "kind": "doi", "value": "10.1000/b"},
+			},
+		}},
+		{name: "empty value", payload: map[string]any{
+			"request_id": "request-bulk-0001", "scan_id": "scan-bulk-0001",
+			"identifiers": []map[string]any{{"local_id": "row-1", "kind": "doi", "value": ""}},
+		}},
+		{name: "malformed scan_id", payload: map[string]any{
+			"request_id": "request-bulk-0001", "scan_id": "short",
+			"identifiers": []map[string]any{{"local_id": "row-1", "kind": "doi", "value": "10.1000/a"}},
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := DecodeBrowserMessage(frame(MsgPageBulkStatusRequest, tc.payload)); err == nil {
+				t.Fatal("page_bulk_status_request was accepted")
+			}
+		})
+	}
+
+	for _, tc := range []struct {
+		name    string
+		payload map[string]any
+	}{
+		{name: "canonical_key present for invalid", payload: map[string]any{
+			"request_id": "request-bulk-0001", "scan_id": "scan-bulk-0001", "truncated": false,
+			"items": []map[string]any{{"local_id": "row-1", "canonical_key": "work-key-1", "status": "invalid", "ownership_complete": false}},
+		}},
+		{name: "canonical_key missing for eligible", payload: map[string]any{
+			"request_id": "request-bulk-0001", "scan_id": "scan-bulk-0001", "truncated": false,
+			"items": []map[string]any{{"local_id": "row-1", "status": "eligible", "ownership_complete": false}},
+		}},
+		{name: "job_id on non-queued status", payload: map[string]any{
+			"request_id": "request-bulk-0001", "scan_id": "scan-bulk-0001", "truncated": false,
+			"items": []map[string]any{{"local_id": "row-1", "canonical_key": "work-key-1", "status": "eligible", "ownership_complete": false, "job_id": "job_bulk_00001"}},
+		}},
+		{name: "malformed job_id", payload: map[string]any{
+			"request_id": "request-bulk-0001", "scan_id": "scan-bulk-0001", "truncated": false,
+			"items": []map[string]any{{"local_id": "row-1", "canonical_key": "work-key-1", "status": "queued", "ownership_complete": false, "job_id": "short"}},
+		}},
+		{name: "unknown status", payload: map[string]any{
+			"request_id": "request-bulk-0001", "scan_id": "scan-bulk-0001", "truncated": false,
+			"items": []map[string]any{{"local_id": "row-1", "canonical_key": "work-key-1", "status": "unexpected", "ownership_complete": false}},
+		}},
+		{name: "201 items", payload: map[string]any{
+			"request_id": "request-bulk-0001", "scan_id": "scan-bulk-0001", "truncated": false,
+			"items": func() []map[string]any {
+				out := make([]map[string]any, 201)
+				for i := range out {
+					out[i] = map[string]any{"local_id": fmt.Sprintf("row-%d", i), "canonical_key": "wk", "status": "eligible", "ownership_complete": false}
+				}
+				return out
+			}(),
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := DecodeBrowserMessage(frame(MsgPageBulkStatusResult, tc.payload)); err == nil {
+				t.Fatal("page_bulk_status_result was accepted")
+			}
+		})
+	}
+
+	manyKeys := func(n int) []string {
+		out := make([]string, n)
+		for i := range out {
+			out[i] = fmt.Sprintf("work-key-%d", i)
+		}
+		return out
+	}
+	validSource := map[string]any{"kind": "browser_page", "origin": "https://scholar.example.edu", "detector": "generic-identifiers/1"}
+	for _, tc := range []struct {
+		name    string
+		payload map[string]any
+	}{
+		{name: "no keys", payload: map[string]any{
+			"request_id": "request-bulk-0002", "scan_id": "scan-bulk-0001", "canonical_keys": []string{}, "source": validSource,
+		}},
+		{name: "51 keys", payload: map[string]any{
+			"request_id": "request-bulk-0002", "scan_id": "scan-bulk-0001", "canonical_keys": manyKeys(51), "source": validSource,
+		}},
+		{name: "duplicate key", payload: map[string]any{
+			"request_id": "request-bulk-0002", "scan_id": "scan-bulk-0001",
+			"canonical_keys": []string{"work-key-1", "work-key-1"}, "source": validSource,
+		}},
+		{name: "origin with path", payload: map[string]any{
+			"request_id": "request-bulk-0002", "scan_id": "scan-bulk-0001", "canonical_keys": []string{"work-key-1"},
+			"source": map[string]any{"kind": "browser_page", "origin": "https://scholar.example.edu/path", "detector": "generic-identifiers/1"},
+		}},
+		{name: "origin with query", payload: map[string]any{
+			"request_id": "request-bulk-0002", "scan_id": "scan-bulk-0001", "canonical_keys": []string{"work-key-1"},
+			"source": map[string]any{"kind": "browser_page", "origin": "https://scholar.example.edu?x=1", "detector": "generic-identifiers/1"},
+		}},
+		{name: "non-https origin", payload: map[string]any{
+			"request_id": "request-bulk-0002", "scan_id": "scan-bulk-0001", "canonical_keys": []string{"work-key-1"},
+			"source": map[string]any{"kind": "browser_page", "origin": "http://scholar.example.edu", "detector": "generic-identifiers/1"},
+		}},
+		{name: "empty detector", payload: map[string]any{
+			"request_id": "request-bulk-0002", "scan_id": "scan-bulk-0001", "canonical_keys": []string{"work-key-1"},
+			"source": map[string]any{"kind": "browser_page", "origin": "https://scholar.example.edu", "detector": ""},
+		}},
+		{name: "wrong source kind", payload: map[string]any{
+			"request_id": "request-bulk-0002", "scan_id": "scan-bulk-0001", "canonical_keys": []string{"work-key-1"},
+			"source": map[string]any{"kind": "extension", "origin": "https://scholar.example.edu", "detector": "generic-identifiers/1"},
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := DecodeBrowserMessage(frame(MsgPageBulkSubmitRequest, tc.payload)); err == nil {
+				t.Fatal("page_bulk_submit_request was accepted")
+			}
+		})
+	}
+
+	for _, payload := range []map[string]any{
+		{"request_id": "request-bulk-0003", "scan_id": "scan-bulk-0001", "submitted": -1, "joined": 0, "already_owned": 0, "invalid": 0, "batch_id": "batch_bulk_00001"},
+		{"request_id": "request-bulk-0003", "scan_id": "scan-bulk-0001", "submitted": 0, "joined": 0, "already_owned": 0, "invalid": 0, "batch_id": "short"},
+		{"request_id": "request-bulk-0003", "scan_id": "scan-bulk-0001", "submitted": 0, "joined": 0, "already_owned": 0, "invalid": 0},
+	} {
+		if _, err := DecodeBrowserMessage(frame(MsgPageBulkSubmitResult, payload)); err == nil {
+			t.Fatalf("page_bulk_submit_result payload %#v was accepted", payload)
+		}
 	}
 }
 

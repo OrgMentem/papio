@@ -44,7 +44,11 @@
         "stats_request",
         "stats_response",
         "activity_request",
-        "activity_response"
+        "activity_response",
+        "page_bulk_status_request",
+        "page_bulk_status_result",
+        "page_bulk_submit_request",
+        "page_bulk_submit_result"
       ]
     },
     "msg_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,64}$" },
@@ -296,6 +300,62 @@
         "request_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,64}$" },
         "outcome": { "enum": ["applied", "already_applied", "conflict", "error"] },
         "detail": { "type": "string", "maxLength": 1000, "pattern": "^[^\\u0000]*$" }
+      }
+    },
+    "page_bulk_identifier": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["local_id", "kind", "value"],
+      "properties": {
+        "local_id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[^\\u0000]+$" },
+        "kind": { "enum": ["doi", "pmid", "arxiv"] },
+        "value": { "type": "string", "minLength": 1, "maxLength": 512, "pattern": "^[^\\u0000]+$" }
+      }
+    },
+    "page_bulk_status_item": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["local_id", "status", "ownership_complete"],
+      "properties": {
+        "local_id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[^\\u0000]+$" },
+        "canonical_key": { "type": "string", "minLength": 1, "maxLength": 300, "pattern": "^[^\\u0000]+$" },
+        "status": {
+          "enum": [
+            "eligible",
+            "owned_with_pdf",
+            "owned_missing_pdf",
+            "queued",
+            "previously_unavailable",
+            "ownership_incomplete",
+            "invalid"
+          ]
+        },
+        "ownership_complete": { "type": "boolean" },
+        "job_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,128}$" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "status": { "const": "invalid" } }, "required": ["status"] },
+          "then": { "not": { "required": ["canonical_key"] } }
+        },
+        {
+          "if": { "properties": { "status": { "not": { "const": "invalid" } } }, "required": ["status"] },
+          "then": { "required": ["canonical_key"] }
+        },
+        {
+          "if": { "required": ["job_id"] },
+          "then": { "properties": { "status": { "const": "queued" } }, "required": ["status"] }
+        }
+      ]
+    },
+    "page_bulk_source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "origin", "detector"],
+      "properties": {
+        "kind": { "const": "browser_page" },
+        "origin": { "type": "string", "maxLength": 300, "pattern": "^https://[a-z0-9.-]{3,253}(:[0-9]{1,5})?$" },
+        "detector": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[^\\u0000]+$" }
       }
     }
   },
@@ -905,6 +965,86 @@
               "request_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,64}$" },
               "generated_at": { "type": "string", "format": "date-time" },
               "entries": { "type": "array", "maxItems": 50, "items": { "$ref": "#/$defs/activity_entry" } }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "page_bulk_status_request" } } },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["request_id", "scan_id", "identifiers"],
+            "properties": {
+              "request_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,64}$" },
+              "scan_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,64}$" },
+              "identifiers": { "type": "array", "minItems": 1, "maxItems": 200, "items": { "$ref": "#/$defs/page_bulk_identifier" } }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "page_bulk_status_result" } } },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["request_id", "scan_id", "items", "truncated"],
+            "properties": {
+              "request_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,64}$" },
+              "scan_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,64}$" },
+              "items": { "type": "array", "maxItems": 200, "items": { "$ref": "#/$defs/page_bulk_status_item" } },
+              "truncated": { "type": "boolean" }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "page_bulk_submit_request" } } },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["request_id", "scan_id", "canonical_keys", "source"],
+            "properties": {
+              "request_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,64}$" },
+              "scan_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,64}$" },
+              "canonical_keys": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 50,
+                "uniqueItems": true,
+                "items": { "type": "string", "minLength": 1, "maxLength": 300, "pattern": "^[^\\u0000]+$" }
+              },
+              "source": { "$ref": "#/$defs/page_bulk_source" }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "page_bulk_submit_result" } } },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["request_id", "scan_id", "submitted", "joined", "already_owned", "invalid", "batch_id"],
+            "properties": {
+              "request_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,64}$" },
+              "scan_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,64}$" },
+              "submitted": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+              "joined": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+              "already_owned": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+              "invalid": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+              "batch_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,128}$" }
             }
           }
         }

@@ -50,7 +50,11 @@ export type BrowserMessageType =
   | "stats_request"
   | "stats_response"
   | "activity_request"
-  | "activity_response";
+  | "activity_response"
+  | "page_bulk_status_request"
+  | "page_bulk_status_result"
+  | "page_bulk_submit_request"
+  | "page_bulk_submit_result";
 
 export interface HelloPayload {
   extension_version: string;
@@ -353,6 +357,71 @@ export interface ActivityResponsePayload {
   entries: ActivityEntryPayload[];
 }
 
+export interface PageBulkIdentifier {
+  local_id: string;
+  kind: "doi" | "pmid" | "arxiv";
+  value: string;
+}
+
+export interface PageBulkStatusRequestPayload {
+  request_id: string;
+  scan_id: string;
+  identifiers: PageBulkIdentifier[];
+}
+
+export type PageBulkStatus =
+  | "eligible"
+  | "owned_with_pdf"
+  | "owned_missing_pdf"
+  | "queued"
+  | "previously_unavailable"
+  | "ownership_incomplete"
+  | "invalid";
+
+export interface PageBulkStatusItem {
+  local_id: string;
+  /** Omitted when status is "invalid" — an identifier that never resolved
+   * has no canonical work identity to report. */
+  canonical_key?: string;
+  status: PageBulkStatus;
+  ownership_complete: boolean;
+  /** Present only when status is "queued". */
+  job_id?: string;
+}
+
+export interface PageBulkStatusResultPayload {
+  request_id: string;
+  scan_id: string;
+  items: PageBulkStatusItem[];
+  truncated: boolean;
+}
+
+/** Per-source provenance on the created batch manifest, distinct from the
+ * daemon-assigned consumer. origin is the bare scheme+host only — never
+ * path, query, fragment, or page title (ADR-0019 Decision 6). */
+export interface PageBulkSubmitSource {
+  kind: "browser_page";
+  origin: string;
+  detector: string;
+}
+
+export interface PageBulkSubmitRequestPayload {
+  request_id: string;
+  scan_id: string;
+  canonical_keys: string[];
+  source: PageBulkSubmitSource;
+}
+
+export interface PageBulkSubmitResultPayload {
+  request_id: string;
+  scan_id: string;
+  submitted: number;
+  joined: number;
+  already_owned: number;
+  invalid: number;
+  batch_id: string;
+}
+
 export interface BrowserMessage {
   protocol: typeof BROWSER_PROTOCOL_VERSION;
   type: BrowserMessageType;
@@ -403,6 +472,10 @@ const MSG_TYPES: Record<string, true> = {
   stats_response: true,
   activity_request: true,
   activity_response: true,
+  page_bulk_status_request: true,
+  page_bulk_status_result: true,
+  page_bulk_submit_request: true,
+  page_bulk_submit_result: true,
 };
 
 const JOB_SCOPED: Record<string, true> = {
@@ -1356,6 +1429,162 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
         }
         triageText(entry, "text", "activity_response.entry", 160);
         if ("title" in entry) triageText(entry, "title", "activity_response.entry", 500);
+      }
+      break;
+    }
+    case "page_bulk_status_request": {
+      requireFields<PageBulkStatusRequestPayload>(p, "page_bulk_status_request", {
+        request_id: "required",
+        scan_id: "required",
+        identifiers: "required",
+      });
+      correlationID(p, "request_id", "page_bulk_status_request");
+      correlationID(p, "scan_id", "page_bulk_status_request");
+      const identifiers = p["identifiers"];
+      if (!Array.isArray(identifiers) || identifiers.length < 1 || identifiers.length > 200) {
+        fail("page_bulk_status_request.identifiers must have 1..200 entries");
+      }
+      const seenIDs = new Set<string>();
+      for (const rawIdentifier of identifiers) {
+        const identifier = asRecord(rawIdentifier, "page_bulk_status_request.identifiers");
+        requireFields<PageBulkIdentifier>(identifier, "page_bulk_status_request.identifiers", {
+          local_id: "required",
+          kind: "required",
+          value: "required",
+        });
+        const localID = triageText(identifier, "local_id", "page_bulk_status_request.identifiers", 128);
+        if (localID === "") fail("page_bulk_status_request.identifiers.local_id is required");
+        if (seenIDs.has(localID)) fail(`page_bulk_status_request.identifiers.local_id ${JSON.stringify(localID)} is duplicated`);
+        seenIDs.add(localID);
+        const kind = str(identifier, "kind", "page_bulk_status_request.identifiers", 10);
+        if (kind !== "doi" && kind !== "pmid" && kind !== "arxiv") fail("page_bulk_status_request.identifiers.kind is invalid");
+        const value = triageText(identifier, "value", "page_bulk_status_request.identifiers", 512);
+        if (value === "") fail("page_bulk_status_request.identifiers.value is required");
+      }
+      break;
+    }
+    case "page_bulk_status_result": {
+      requireFields<PageBulkStatusResultPayload>(p, "page_bulk_status_result", {
+        request_id: "required",
+        scan_id: "required",
+        items: "required",
+        truncated: "required",
+      });
+      correlationID(p, "request_id", "page_bulk_status_result");
+      correlationID(p, "scan_id", "page_bulk_status_result");
+      const items = p["items"];
+      if (!Array.isArray(items) || items.length > 200) fail("page_bulk_status_result.items must have at most 200 entries");
+      const seenItemIDs = new Set<string>();
+      for (const rawItem of items) {
+        const item = asRecord(rawItem, "page_bulk_status_result.items");
+        requireFields<PageBulkStatusItem>(item, "page_bulk_status_result.items", {
+          local_id: "required",
+          canonical_key: "optional",
+          status: "required",
+          ownership_complete: "required",
+          job_id: "optional",
+        });
+        const localID = triageText(item, "local_id", "page_bulk_status_result.items", 128);
+        if (localID === "") fail("page_bulk_status_result.items.local_id is required");
+        if (seenItemIDs.has(localID)) fail(`page_bulk_status_result.items.local_id ${JSON.stringify(localID)} is duplicated`);
+        seenItemIDs.add(localID);
+        const status = str(item, "status", "page_bulk_status_result.items", 30);
+        if (
+          !["eligible", "owned_with_pdf", "owned_missing_pdf", "queued", "previously_unavailable", "ownership_incomplete", "invalid"].includes(
+            status,
+          )
+        ) {
+          fail("page_bulk_status_result.items.status is invalid");
+        }
+        // An identifier that never resolved has no canonical work identity to
+        // report; every other status carries one (Decision 7).
+        if (status === "invalid") {
+          if ("canonical_key" in item) fail("page_bulk_status_result.items.canonical_key must be omitted for invalid");
+        } else {
+          if (!("canonical_key" in item)) fail("page_bulk_status_result.items.canonical_key is required");
+          if (triageText(item, "canonical_key", "page_bulk_status_result.items", 300) === "") {
+            fail("page_bulk_status_result.items.canonical_key is required");
+          }
+        }
+        if (typeof item["ownership_complete"] !== "boolean") fail("page_bulk_status_result.items.ownership_complete must be a boolean");
+        if ("job_id" in item) {
+          if (status !== "queued") fail("page_bulk_status_result.items.job_id is only valid for queued");
+          if (!JOB_ID_RE.test(str(item, "job_id", "page_bulk_status_result.items", 128))) {
+            fail("page_bulk_status_result.items.job_id is invalid");
+          }
+        }
+      }
+      if (typeof p["truncated"] !== "boolean") fail("page_bulk_status_result.truncated must be a boolean");
+      break;
+    }
+    case "page_bulk_submit_request": {
+      requireFields<PageBulkSubmitRequestPayload>(p, "page_bulk_submit_request", {
+        request_id: "required",
+        scan_id: "required",
+        canonical_keys: "required",
+        source: "required",
+      });
+      correlationID(p, "request_id", "page_bulk_submit_request");
+      correlationID(p, "scan_id", "page_bulk_submit_request");
+      const keys = p["canonical_keys"];
+      if (!Array.isArray(keys) || keys.length < 1 || keys.length > 50) {
+        fail("page_bulk_submit_request.canonical_keys must have 1..50 entries");
+      }
+      const seenKeys = new Set<string>();
+      for (const rawKey of keys) {
+        if (typeof rawKey !== "string" || rawKey.length === 0 || Array.from(rawKey).length > 300) {
+          fail("page_bulk_submit_request.canonical_keys entries must be non-empty bounded strings");
+        }
+        rejectNUL(rawKey, "page_bulk_submit_request.canonical_keys");
+        if (seenKeys.has(rawKey)) fail(`page_bulk_submit_request.canonical_keys contains a duplicate ${JSON.stringify(rawKey)}`);
+        seenKeys.add(rawKey);
+      }
+      const source = asRecord(p["source"], "page_bulk_submit_request.source");
+      requireFields<PageBulkSubmitSource>(source, "page_bulk_submit_request.source", {
+        kind: "required",
+        origin: "required",
+        detector: "required",
+      });
+      if (str(source, "kind", "page_bulk_submit_request.source", 20) !== "browser_page") {
+        fail("page_bulk_submit_request.source.kind must be browser_page");
+      }
+      // Bare https scheme+host only — never path, query, fragment, or page
+      // title (ADR-0019 Decision 6), the same round-trip shape
+      // hello_ack.resolver_origins already validates above.
+      const origin = str(source, "origin", "page_bulk_submit_request.source", 300);
+      let originOK = origin.startsWith("https://");
+      if (originOK) {
+        try {
+          const parsed = new URL(origin);
+          originOK = parsed.protocol === "https:" && parsed.host !== "" && `${parsed.protocol}//${parsed.host}` === origin;
+        } catch {
+          originOK = false;
+        }
+      }
+      if (!originOK) fail("page_bulk_submit_request.source.origin must be a bare https scheme://host origin");
+      if (triageText(source, "detector", "page_bulk_submit_request.source", 128) === "") {
+        fail("page_bulk_submit_request.source.detector is required");
+      }
+      break;
+    }
+    case "page_bulk_submit_result": {
+      requireFields<PageBulkSubmitResultPayload>(p, "page_bulk_submit_result", {
+        request_id: "required",
+        scan_id: "required",
+        submitted: "required",
+        joined: "required",
+        already_owned: "required",
+        invalid: "required",
+        batch_id: "required",
+      });
+      correlationID(p, "request_id", "page_bulk_submit_result");
+      correlationID(p, "scan_id", "page_bulk_submit_result");
+      int(p, "submitted", "page_bulk_submit_result", 0);
+      int(p, "joined", "page_bulk_submit_result", 0);
+      int(p, "already_owned", "page_bulk_submit_result", 0);
+      int(p, "invalid", "page_bulk_submit_result", 0);
+      if (!JOB_ID_RE.test(str(p, "batch_id", "page_bulk_submit_result", 128))) {
+        fail("page_bulk_submit_result.batch_id is invalid");
       }
       break;
     }

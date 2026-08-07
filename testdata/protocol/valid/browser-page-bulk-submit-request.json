@@ -1,0 +1,1 @@
+{"protocol":"papio-browser/1","type":"page_bulk_submit_request","msg_id":"page-bulk-submit-req-01","seq":3,"payload":{"request_id":"request-bulk-0002","scan_id":"scan-bulk-0001","canonical_keys":["work-key-doi-10-1000-example-42","work-key-pmid-12345678"],"source":{"kind":"browser_page","origin":"https://scholar.example.edu","detector":"generic-identifiers/1"}}}

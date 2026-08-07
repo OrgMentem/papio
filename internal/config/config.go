@@ -158,6 +158,10 @@ type Browser struct {
 	// ActionExpirySeconds sets browser-offer expiry and the first human-action
 	// reminder threshold. Subsequent reminders back off independently per action.
 	ActionExpirySeconds int `toml:"action_expiry_seconds,omitempty"`
+	// DocumentDelivery configures the default institution's document
+	// delivery / ILL route (ADR-0017 Decision 2). Nil disables it — the
+	// job falls back to the profile's plain OpenURL route.
+	DocumentDelivery *DocumentDelivery `toml:"document_delivery,omitempty"`
 }
 
 // ChromiumExtensionIDs returns the deduplicated Chrome-family extension IDs
@@ -199,6 +203,10 @@ type Institution struct {
 	// LibKeyLibraryID is this profile's numeric Third Iron library id,
 	// required when LibKeyMode is "link".
 	LibKeyLibraryID int64 `toml:"libkey_library_id,omitempty"`
+	// DocumentDelivery configures this profile's document delivery / ILL
+	// route (ADR-0017 Decision 2). Nil disables it — the job falls back to
+	// this profile's plain OpenURL route.
+	DocumentDelivery *DocumentDelivery `toml:"document_delivery,omitempty"`
 }
 
 // UnmarshalText lets a resolver profile be written as a bare OpenURL base
@@ -210,6 +218,64 @@ type Institution struct {
 func (i *Institution) UnmarshalText(text []byte) error {
 	i.OpenURLBase = string(text)
 	return nil
+}
+
+// DocumentDelivery configures one institution profile's document delivery /
+// ILL route: an OpenURL request form, a LibKey delivery route, or an
+// institution-issued API integration (ADR-0017 Decision 2). Every credential
+// here is read only by internal/delivery in the daemon — never sent to,
+// stored in, or observable from the extension or the browser wire, the same
+// boundary ADR-0013 draws for browser-local vs. daemon-owned state.
+type DocumentDelivery struct {
+	// Kind selects the delivery adapter: openurl | libkey | illiad | custom.
+	// Required — papio never guesses which ILL system an institution runs
+	// (ADR-0017 Decision 2).
+	Kind string `toml:"kind,omitempty"`
+	// BaseURL is the request form or API base (https), used for kind =
+	// openurl/custom and as the ILLiad Web Platform base for kind = illiad.
+	BaseURL string `toml:"base_url,omitempty"`
+	// AllowedHosts restricts which hosts a prefilled request form or API
+	// base may reach.
+	AllowedHosts []string `toml:"allowed_hosts,omitempty"`
+	// SubmitPolicy narrows how a request may be created: never (default,
+	// when empty) | prefill_only | auto_if_unconditional. It narrows what
+	// the global access_mode permits, never widens it (ADR-0017 Decision 3B
+	// condition 1).
+	SubmitPolicy string `toml:"submit_policy,omitempty"`
+	// RequestClasses lists the request classes this profile is declared
+	// for. v1 recognizes only digital_journal_article (ADR-0017 Decision
+	// 3A).
+	RequestClasses []string `toml:"request_classes,omitempty"`
+	// LegalBasis is the operator's declared legal basis for a request:
+	// institution_policy | copyright_act_s49 | unknown (empty = unknown).
+	// Configured, never inferred from a hostname (ADR-0017 Decision 3A).
+	LegalBasis string `toml:"legal_basis,omitempty"`
+	// PatronAttestation declares whether a per-request patron attestation
+	// is required: not_required | standing_completed | per_request |
+	// unknown (empty = unknown). standing_completed counts only when the
+	// institution has confirmed a registration-time agreement covers this
+	// request class — papio never infers it (ADR-0017 Decision 2).
+	PatronAttestation string `toml:"patron_attestation,omitempty"`
+	// PatronFeePolicy declares whether the patron is charged: zero_standard
+	// | per_request | unknown (empty = unknown). Only zero_standard can
+	// ever compile auto_capable (ADR-0017 Decision 3A).
+	PatronFeePolicy string `toml:"patron_fee_policy,omitempty"`
+	// MonthlyRequestCap bounds auto-submitted requests per month; 0 means
+	// no cap declared.
+	MonthlyRequestCap int `toml:"monthly_request_cap,omitempty"`
+	// StatusPollMinutes sets the delivery status poll cadence; 0 uses
+	// internal/delivery's default.
+	StatusPollMinutes int `toml:"status_poll_minutes,omitempty"`
+	// APIKey is the institution-issued application credential, permitted
+	// only for kind = illiad — a key on a form-kind profile is dead config.
+	// Read only by internal/delivery in the daemon (ADR-0017 Decision 2).
+	// 0600 config only.
+	APIKey string `toml:"api_key,omitempty"`
+	// PatronRef is a configured, non-secret patron reference used to map
+	// papio's requests to the institution's system. Not a secret, but
+	// personal identity data: 0600 config only, redacted from events,
+	// diagnostics, and delivery provenance (ADR-0017 Decision 2).
+	PatronRef string `toml:"patron_ref,omitempty"`
 }
 
 // Zotio configures the credential-owning Zotero CLI boundary. papio invokes
@@ -591,6 +657,9 @@ func (c *Config) validate() error {
 		// validated but unreachable — the silently-dead-config shape again.
 		return fmt.Errorf("browser.libkey_mode \"link\" requires browser.openurl_base_url: LibKey augments the institutional route, and without a resolver base the default profile opens no handoff to route")
 	}
+	if err := validateDocumentDelivery("browser.document_delivery.", c.Browser.DocumentDelivery); err != nil {
+		return err
+	}
 	for name, inst := range c.Browser.Resolvers {
 		// "default" is the implicit top-level institution, not a valid map key:
 		// InstitutionFor resolves name == "default" to the top-level Browser
@@ -618,6 +687,9 @@ func (c *Config) validate() error {
 		}
 		if err := validateLibKey(inst.LibKeyMode, inst.LibKeyLibraryID); err != nil {
 			return fmt.Errorf("browser.resolvers.%s.%w", name, err)
+		}
+		if err := validateDocumentDelivery(fmt.Sprintf("browser.resolvers.%s.document_delivery.", name), inst.DocumentDelivery); err != nil {
+			return err
 		}
 	}
 	if defaultResolver := strings.TrimSpace(c.Browser.DefaultResolver); defaultResolver != "" {
@@ -804,6 +876,97 @@ func validateOpenURLBase(base string) error {
 	return nil
 }
 
+// documentDeliveryKinds is the exhaustive set of document_delivery.kind
+// values v1's adapter has shipped (ADR-0017 Decision 2): a kind whose
+// implementation does not exist must not parse, the same fail-closed rule
+// validSourceNames applies to sources.
+var documentDeliveryKinds = map[string]bool{
+	"openurl": true,
+	"libkey":  true,
+	"illiad":  true,
+	"custom":  true,
+}
+
+// documentDeliveryAutoCapableKinds is v1's set of kinds that can compile
+// auto_capable (ADR-0017 Decision 3A): only source-controlled API
+// integrations with a deterministic submission-and-reconciliation contract.
+// openurl, libkey, and custom route to a form and are permanently
+// prefill-only.
+var documentDeliveryAutoCapableKinds = map[string]bool{
+	"illiad": true,
+}
+
+// validateDocumentDelivery is fail-closed on every field (ADR-0017 Decision
+// 2 and 3A): a misconfigured or half-declared document-delivery profile must
+// be a startup error, not a route that silently compiles prefill_only, or
+// worse, silently auto-submits. prefix already ends in "." and names the
+// document_delivery table (e.g. "browser.document_delivery."), so every
+// message below starts with the field name.
+func validateDocumentDelivery(prefix string, d *DocumentDelivery) error {
+	if d == nil {
+		return nil
+	}
+	kind := strings.TrimSpace(d.Kind)
+	switch {
+	case kind == "":
+		return fmt.Errorf("%skind is required (openurl, libkey, illiad, or custom)", prefix)
+	case kind == "oclc" || kind == "rapido":
+		return fmt.Errorf("%skind %q is not implemented; the ADR names them as intended providers", prefix, kind)
+	case !documentDeliveryKinds[kind]:
+		return fmt.Errorf("%skind %q is not a recognized document-delivery kind (openurl, libkey, illiad, or custom)", prefix, kind)
+	}
+	if d.BaseURL != "" {
+		if err := validateOpenURLBase(d.BaseURL); err != nil {
+			return fmt.Errorf("%sbase_url %w", prefix, err)
+		}
+	}
+	switch d.SubmitPolicy {
+	case "", "never", "prefill_only", "auto_if_unconditional":
+	default:
+		return fmt.Errorf("%ssubmit_policy must be never, prefill_only, or auto_if_unconditional", prefix)
+	}
+	if d.SubmitPolicy == "auto_if_unconditional" && !documentDeliveryAutoCapableKinds[kind] {
+		// V1's only source-controlled API integration with a deterministic
+		// submission-and-reconciliation contract is illiad; openurl, libkey,
+		// and custom route to a form and supply no such contract, so they
+		// are permanently prefill-only (ADR-0017 Decision 3A).
+		return fmt.Errorf("%ssubmit_policy \"auto_if_unconditional\" requires kind \"illiad\" (openurl, libkey, and custom route to a form and are permanently prefill-only; ADR-0017 Decision 3A)", prefix)
+	}
+	switch d.LegalBasis {
+	case "", "institution_policy", "copyright_act_s49", "unknown":
+	default:
+		return fmt.Errorf("%slegal_basis must be institution_policy, copyright_act_s49, or unknown", prefix)
+	}
+	switch d.PatronAttestation {
+	case "", "not_required", "standing_completed", "per_request", "unknown":
+	default:
+		return fmt.Errorf("%spatron_attestation must be not_required, standing_completed, per_request, or unknown", prefix)
+	}
+	switch d.PatronFeePolicy {
+	case "", "zero_standard", "per_request", "unknown":
+	default:
+		return fmt.Errorf("%spatron_fee_policy must be zero_standard, per_request, or unknown", prefix)
+	}
+	for _, class := range d.RequestClasses {
+		if class != "digital_journal_article" {
+			return fmt.Errorf("%srequest_classes entry %q is not modelled yet (only digital_journal_article)", prefix, class)
+		}
+	}
+	if d.MonthlyRequestCap < 0 {
+		return fmt.Errorf("%smonthly_request_cap must be >= 0", prefix)
+	}
+	if d.StatusPollMinutes < 0 {
+		return fmt.Errorf("%sstatus_poll_minutes must be >= 0 (0 uses the default)", prefix)
+	}
+	if d.APIKey != "" && kind != "illiad" {
+		// A key on a form-kind profile is dead config: openurl, libkey, and
+		// custom route to a form the browser opens and never call an API
+		// with a credential (ADR-0017 Decision 2).
+		return fmt.Errorf("%sapi_key is set but kind is %q, not \"illiad\" (a key on a form-kind profile is dead config)", prefix, kind)
+	}
+	return nil
+}
+
 // EffectiveAdoptionRoot returns the configured adoption root or its default.
 func (c *Config) EffectiveAdoptionRoot() string {
 	if c.Browser.AdoptionRoot != "" {
@@ -916,6 +1079,7 @@ func (c *Config) InstitutionFor(name string) (Institution, bool) {
 			ProquestAccountID:  c.Browser.ProquestAccountID,
 			LibKeyMode:         c.Browser.LibKeyMode,
 			LibKeyLibraryID:    c.Browser.LibKeyLibraryID,
+			DocumentDelivery:   c.Browser.DocumentDelivery,
 		}
 		return inst, inst.OpenURLBase != ""
 	}

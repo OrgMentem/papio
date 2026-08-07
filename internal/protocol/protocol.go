@@ -814,6 +814,10 @@ const (
 	MsgStatsResponse            = "stats_response"
 	MsgActivityRequest          = "activity_request"
 	MsgActivityResponse         = "activity_response"
+	MsgPageBulkStatusRequest    = "page_bulk_status_request"
+	MsgPageBulkStatusResult     = "page_bulk_status_result"
+	MsgPageBulkSubmitRequest    = "page_bulk_submit_request"
+	MsgPageBulkSubmitResult     = "page_bulk_submit_result"
 )
 
 // jobScoped lists the types that must carry a job_id.
@@ -1222,6 +1226,89 @@ type ActivityResponsePayload struct {
 	RequestID   string                 `json:"request_id"`
 	GeneratedAt string                 `json:"generated_at"`
 	Entries     []ActivityEntryPayload `json:"entries"`
+}
+
+// ---------------------------------------------------------------------------
+// Page-bulk acquisition (page_bulk_acquire_v1, ADR-0019 Decision 7)
+// ---------------------------------------------------------------------------
+
+// PageBulkIdentifier is one page-detected scholarly identifier keyed by a
+// browser-local correlation id. LocalID never leaves the extension's own
+// scan snapshot; the daemon echoes it back on PageBulkStatusItem so the
+// selection workspace can re-associate a resolved status with the row it
+// scanned (ADR-0019 Decision 4).
+type PageBulkIdentifier struct {
+	LocalID string `json:"local_id"`
+	Kind    string `json:"kind"`
+	Value   string `json:"value"`
+}
+
+// PageBulkStatusRequestPayload asks for the ownership/job status of up to
+// 200 identifiers detected on one scanned page, correlated by ScanID with
+// the extension's local scan snapshot.
+type PageBulkStatusRequestPayload struct {
+	RequestID   string               `json:"request_id"`
+	ScanID      string               `json:"scan_id"`
+	Identifiers []PageBulkIdentifier `json:"identifiers"`
+}
+
+// PageBulkStatusItem reports one identifier's resolved holdings/job status
+// from the daemon's existing ownership/job lookup (ADR-0019 Decision 5).
+// CanonicalKey is omitted when Status is "invalid" — an identifier that
+// never resolved has no canonical work identity to report. JobID is
+// populated only when Status is "queued".
+type PageBulkStatusItem struct {
+	LocalID           string `json:"local_id"`
+	CanonicalKey      string `json:"canonical_key,omitempty"`
+	Status            string `json:"status"`
+	OwnershipComplete bool   `json:"ownership_complete"`
+	JobID             string `json:"job_id,omitempty"`
+}
+
+// PageBulkStatusResultPayload is the correlated response to a status
+// request. Truncated is required and explicit, never silent (ADR-0019
+// Decision 3's raw-candidate cap applies one layer up, in the content
+// script; this field is the daemon's own truncation report for Items).
+type PageBulkStatusResultPayload struct {
+	RequestID string               `json:"request_id"`
+	ScanID    string               `json:"scan_id"`
+	Items     []PageBulkStatusItem `json:"items"`
+	Truncated bool                 `json:"truncated"`
+}
+
+// PageBulkSubmitSource records per-source provenance on the created batch
+// manifest, distinct from the daemon-assigned consumer (ADR-0019 Decision
+// 6). Origin is the bare scheme+host only — never path, query, fragment, or
+// page title.
+type PageBulkSubmitSource struct {
+	Kind     string `json:"kind"`
+	Origin   string `json:"origin"`
+	Detector string `json:"detector"`
+}
+
+// PageBulkSubmitRequestPayload asks the daemon to create one ordinary batch
+// from up to 50 canonical keys already resolved by a prior status request.
+// The daemon assigns consumer ("browser-page"); the extension never
+// supplies it (ADR-0019 Decision 6).
+type PageBulkSubmitRequestPayload struct {
+	RequestID     string               `json:"request_id"`
+	ScanID        string               `json:"scan_id"`
+	CanonicalKeys []string             `json:"canonical_keys"`
+	Source        PageBulkSubmitSource `json:"source"`
+}
+
+// PageBulkSubmitResultPayload reports the created batch's disposition
+// counts: Submitted (a new job was created), Joined (the key matched an
+// existing job), AlreadyOwned, and Invalid (the key no longer resolved by
+// submit time). Every submitted canonical key falls into exactly one bucket.
+type PageBulkSubmitResultPayload struct {
+	RequestID    string `json:"request_id"`
+	ScanID       string `json:"scan_id"`
+	Submitted    int64  `json:"submitted"`
+	Joined       int64  `json:"joined"`
+	AlreadyOwned int64  `json:"already_owned"`
+	Invalid      int64  `json:"invalid"`
+	BatchID      string `json:"batch_id"`
 }
 
 // BrowserMessage is one decoded native-messaging envelope. Payload holds the
@@ -1650,6 +1737,38 @@ func DecodeBrowserMessage(data []byte) (*BrowserMessage, error) {
 		p := &ActivityResponsePayload{}
 		err = decodeTriagePayload(env.Payload, payloadFields, "activity_response",
 			[]string{"request_id", "generated_at", "entries"}, p)
+		if err == nil {
+			err = p.validate()
+		}
+		msg.Payload = p
+	case MsgPageBulkStatusRequest:
+		p := &PageBulkStatusRequestPayload{}
+		err = decodeTriagePayload(env.Payload, payloadFields, "page_bulk_status_request",
+			[]string{"request_id", "scan_id", "identifiers"}, p)
+		if err == nil {
+			err = p.validate()
+		}
+		msg.Payload = p
+	case MsgPageBulkStatusResult:
+		p := &PageBulkStatusResultPayload{}
+		err = decodeTriagePayload(env.Payload, payloadFields, "page_bulk_status_result",
+			[]string{"request_id", "scan_id", "items", "truncated"}, p)
+		if err == nil {
+			err = p.validate()
+		}
+		msg.Payload = p
+	case MsgPageBulkSubmitRequest:
+		p := &PageBulkSubmitRequestPayload{}
+		err = decodeTriagePayload(env.Payload, payloadFields, "page_bulk_submit_request",
+			[]string{"request_id", "scan_id", "canonical_keys", "source"}, p)
+		if err == nil {
+			err = p.validate()
+		}
+		msg.Payload = p
+	case MsgPageBulkSubmitResult:
+		p := &PageBulkSubmitResultPayload{}
+		err = decodeTriagePayload(env.Payload, payloadFields, "page_bulk_submit_result",
+			[]string{"request_id", "scan_id", "submitted", "joined", "already_owned", "invalid", "batch_id"}, p)
 		if err == nil {
 			err = p.validate()
 		}
@@ -2561,6 +2680,162 @@ func (p *ActivityResponsePayload) validate() error {
 		if err := validateTriageText("activity_response.entry.title", entry.Title, 500); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func (p *PageBulkStatusRequestPayload) validate() error {
+	if err := validateCorrelationID("page_bulk_status_request.request_id", p.RequestID); err != nil {
+		return err
+	}
+	if err := validateCorrelationID("page_bulk_status_request.scan_id", p.ScanID); err != nil {
+		return err
+	}
+	if len(p.Identifiers) == 0 || len(p.Identifiers) > 200 {
+		return fmt.Errorf("page_bulk_status_request.identifiers must contain 1 to 200 entries")
+	}
+	seen := make(map[string]bool, len(p.Identifiers))
+	for _, id := range p.Identifiers {
+		if err := validatePageBulkLocalID("page_bulk_status_request.identifiers", id.LocalID, seen); err != nil {
+			return err
+		}
+		if err := enumRequired("page_bulk_status_request.identifiers.kind", id.Kind, "doi", "pmid", "arxiv"); err != nil {
+			return err
+		}
+		if id.Value == "" {
+			return fmt.Errorf("page_bulk_status_request.identifiers.value is required")
+		}
+		if err := validateTriageText("page_bulk_status_request.identifiers.value", id.Value, 512); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validatePageBulkLocalID enforces the shared local_id rule used by both
+// page_bulk_status_request.identifiers and page_bulk_status_result.items:
+// non-empty, bounded, NUL-free, and unique within its own array. seen is
+// mutated in place so the caller shares one dedup set across the whole
+// array without allocating per entry.
+func validatePageBulkLocalID(what, localID string, seen map[string]bool) error {
+	if localID == "" {
+		return fmt.Errorf("%s.local_id is required", what)
+	}
+	if err := validateTriageText(what+".local_id", localID, 128); err != nil {
+		return err
+	}
+	if seen[localID] {
+		return fmt.Errorf("%s.local_id %q is duplicated", what, localID)
+	}
+	seen[localID] = true
+	return nil
+}
+
+func (p *PageBulkStatusResultPayload) validate() error {
+	if err := validateCorrelationID("page_bulk_status_result.request_id", p.RequestID); err != nil {
+		return err
+	}
+	if err := validateCorrelationID("page_bulk_status_result.scan_id", p.ScanID); err != nil {
+		return err
+	}
+	if len(p.Items) > 200 {
+		return fmt.Errorf("page_bulk_status_result.items capped at 200")
+	}
+	seen := make(map[string]bool, len(p.Items))
+	for _, item := range p.Items {
+		if err := validatePageBulkLocalID("page_bulk_status_result.items", item.LocalID, seen); err != nil {
+			return err
+		}
+		if err := enumRequired("page_bulk_status_result.items.status", item.Status,
+			"eligible", "owned_with_pdf", "owned_missing_pdf", "queued",
+			"previously_unavailable", "ownership_incomplete", "invalid"); err != nil {
+			return err
+		}
+		// An identifier that never resolved has no canonical work identity to
+		// report; every other status carries one (Decision 7: "returns, per
+		// identifier, a canonical key and a status").
+		if item.Status == "invalid" {
+			if item.CanonicalKey != "" {
+				return fmt.Errorf("page_bulk_status_result.items.canonical_key must be omitted for invalid")
+			}
+		} else {
+			if item.CanonicalKey == "" {
+				return fmt.Errorf("page_bulk_status_result.items.canonical_key is required")
+			}
+			if err := validateTriageText("page_bulk_status_result.items.canonical_key", item.CanonicalKey, 300); err != nil {
+				return err
+			}
+		}
+		if item.JobID != "" {
+			if item.Status != "queued" {
+				return fmt.Errorf("page_bulk_status_result.items.job_id is only valid for queued")
+			}
+			if !requestIDRE.MatchString(item.JobID) {
+				return fmt.Errorf("page_bulk_status_result.items.job_id is invalid")
+			}
+		}
+	}
+	return nil
+}
+
+func (p *PageBulkSubmitRequestPayload) validate() error {
+	if err := validateCorrelationID("page_bulk_submit_request.request_id", p.RequestID); err != nil {
+		return err
+	}
+	if err := validateCorrelationID("page_bulk_submit_request.scan_id", p.ScanID); err != nil {
+		return err
+	}
+	if len(p.CanonicalKeys) == 0 || len(p.CanonicalKeys) > 50 {
+		return fmt.Errorf("page_bulk_submit_request.canonical_keys must contain 1 to 50 entries")
+	}
+	seen := make(map[string]bool, len(p.CanonicalKeys))
+	for _, key := range p.CanonicalKeys {
+		if key == "" {
+			return fmt.Errorf("page_bulk_submit_request.canonical_keys entries must be non-empty")
+		}
+		if err := validateTriageText("page_bulk_submit_request.canonical_keys", key, 300); err != nil {
+			return err
+		}
+		if seen[key] {
+			return fmt.Errorf("page_bulk_submit_request.canonical_keys contains a duplicate %q", key)
+		}
+		seen[key] = true
+	}
+	return p.Source.validate()
+}
+
+// validate enforces Decision 6's manifest shape: kind is pinned to the one
+// value this protocol emits, origin is a bare https scheme+host — never
+// path, query, fragment, or page title, the same rule
+// hello_ack.resolver_origins already enforces via validResolverOrigin — and
+// detector is a short, non-empty label.
+func (s *PageBulkSubmitSource) validate() error {
+	if err := enumRequired("page_bulk_submit_request.source.kind", s.Kind, "browser_page"); err != nil {
+		return err
+	}
+	if !validResolverOrigin(s.Origin) {
+		return fmt.Errorf("page_bulk_submit_request.source.origin must be a bare https scheme://host origin")
+	}
+	if s.Detector == "" {
+		return fmt.Errorf("page_bulk_submit_request.source.detector is required")
+	}
+	return validateTriageText("page_bulk_submit_request.source.detector", s.Detector, 128)
+}
+
+func (p *PageBulkSubmitResultPayload) validate() error {
+	if err := validateCorrelationID("page_bulk_submit_result.request_id", p.RequestID); err != nil {
+		return err
+	}
+	if err := validateCorrelationID("page_bulk_submit_result.scan_id", p.ScanID); err != nil {
+		return err
+	}
+	for _, count := range []int64{p.Submitted, p.Joined, p.AlreadyOwned, p.Invalid} {
+		if count < 0 || count > MaxBrowserInteger {
+			return fmt.Errorf("page_bulk_submit_result counts must be in range 0..%d", MaxBrowserInteger)
+		}
+	}
+	if !requestIDRE.MatchString(p.BatchID) {
+		return fmt.Errorf("page_bulk_submit_result.batch_id is invalid")
 	}
 	return nil
 }

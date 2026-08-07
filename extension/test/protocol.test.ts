@@ -419,3 +419,164 @@ test("unknown envelope fields fail closed", () => {
     }),
   ).toThrow(/unknown field "debug_cookie"/);
 });
+
+test("page bulk status and submit messages round-trip through the shared corpus", () => {
+  const statusRequest = parseBrowserMessageBytes(
+    readFileSync(join(corpusRoot, "valid", "browser-page-bulk-status-request.json"), "utf8"),
+  );
+  expect(statusRequest.type).toBe("page_bulk_status_request");
+  expect((statusRequest.payload["identifiers"] as unknown[]).length).toBe(3);
+
+  const statusResult = parseBrowserMessageBytes(
+    readFileSync(join(corpusRoot, "valid", "browser-page-bulk-status-result.json"), "utf8"),
+  );
+  expect(statusResult.type).toBe("page_bulk_status_result");
+  const items = statusResult.payload["items"] as Array<Record<string, unknown>>;
+  expect(items).toHaveLength(4);
+  expect(items[2]).toEqual({
+    local_id: "row-3", canonical_key: "work-key-queued-1", status: "queued",
+    ownership_complete: false, job_id: "job_bulk_00001",
+  });
+  expect(items[3]).toEqual({ local_id: "row-4", status: "invalid", ownership_complete: false });
+
+  const submitRequest = parseBrowserMessageBytes(
+    readFileSync(join(corpusRoot, "valid", "browser-page-bulk-submit-request.json"), "utf8"),
+  );
+  expect(submitRequest.type).toBe("page_bulk_submit_request");
+  expect(submitRequest.payload).toEqual({
+    request_id: "request-bulk-0002", scan_id: "scan-bulk-0001",
+    canonical_keys: ["work-key-doi-10-1000-example-42", "work-key-pmid-12345678"],
+    source: { kind: "browser_page", origin: "https://scholar.example.edu", detector: "generic-identifiers/1" },
+  });
+
+  const submitResult = parseBrowserMessageBytes(
+    readFileSync(join(corpusRoot, "valid", "browser-page-bulk-submit-result.json"), "utf8"),
+  );
+  expect(submitResult.type).toBe("page_bulk_submit_result");
+  expect(submitResult.payload).toEqual({
+    request_id: "request-bulk-0002", scan_id: "scan-bulk-0001",
+    submitted: 1, joined: 1, already_owned: 0, invalid: 0, batch_id: "batch_bulk_00001",
+  });
+
+  for (const name of [
+    "browser-page-bulk-status-request-too-many-identifiers.json",
+    "browser-page-bulk-status-request-bad-kind.json",
+    "browser-page-bulk-submit-request-too-many-keys.json",
+    "browser-page-bulk-submit-request-origin-with-path.json",
+  ]) {
+    expect(() => parseBrowserMessageBytes(readFileSync(join(corpusRoot, "invalid", name), "utf8")), name).toThrow(ProtocolError);
+  }
+});
+
+test("page_bulk_status_request rejects malformed identifiers", () => {
+  const frame = (payload: Record<string, unknown>) => ({
+    protocol: "papio-browser/1",
+    type: "page_bulk_status_request",
+    msg_id: "page-bulk-status-req-01",
+    seq: 1,
+    payload,
+  });
+  const validIdentifier = { local_id: "row-1", kind: "doi", value: "10.1000/example.42" };
+
+  expect(parseBrowserMessage(frame({
+    request_id: "request-bulk-0001", scan_id: "scan-bulk-0001", identifiers: [validIdentifier],
+  })).payload).toEqual({
+    request_id: "request-bulk-0001", scan_id: "scan-bulk-0001", identifiers: [validIdentifier],
+  });
+
+  for (const identifiers of [
+    [],
+    Array.from({ length: 201 }, (_, i) => ({ local_id: `row-${i}`, kind: "doi", value: `10.1000/x${i}` })),
+    [{ local_id: "row-1", kind: "isbn", value: "9780000000002" }],
+    [validIdentifier, { ...validIdentifier }],
+    [{ local_id: "row-1", kind: "doi", value: "" }],
+    [{ local_id: "", kind: "doi", value: "10.1000/example.42" }],
+  ]) {
+    expect(() => parseBrowserMessage(frame({
+      request_id: "request-bulk-0001", scan_id: "scan-bulk-0001", identifiers,
+    }))).toThrow(ProtocolError);
+  }
+  expect(() => parseBrowserMessage(frame({
+    request_id: "request-bulk-0001", scan_id: "short", identifiers: [validIdentifier],
+  }))).toThrow(ProtocolError);
+});
+
+test("page_bulk_status_result enforces the closed status vocabulary and canonical_key/job_id invariants", () => {
+  const frame = (payload: Record<string, unknown>) => ({
+    protocol: "papio-browser/1",
+    type: "page_bulk_status_result",
+    msg_id: "page-bulk-status-res-01",
+    seq: 1,
+    payload,
+  });
+  const base = { request_id: "request-bulk-0001", scan_id: "scan-bulk-0001", truncated: false };
+
+  expect(parseBrowserMessage(frame({
+    ...base,
+    items: [{ local_id: "row-1", status: "invalid", ownership_complete: false }],
+  })).payload).toEqual({
+    ...base,
+    items: [{ local_id: "row-1", status: "invalid", ownership_complete: false }],
+  });
+
+  for (const items of [
+    [{ local_id: "row-1", canonical_key: "wk1", status: "invalid", ownership_complete: false }],
+    [{ local_id: "row-1", status: "eligible", ownership_complete: false }],
+    [{ local_id: "row-1", canonical_key: "wk1", status: "unexpected", ownership_complete: false }],
+    [{ local_id: "row-1", canonical_key: "wk1", status: "eligible", ownership_complete: false, job_id: "job_bulk_00001" }],
+    [{ local_id: "row-1", canonical_key: "wk1", status: "queued", ownership_complete: false, job_id: "short" }],
+    Array.from({ length: 201 }, (_, i) => ({ local_id: `row-${i}`, canonical_key: "wk", status: "eligible", ownership_complete: false })),
+  ]) {
+    expect(() => parseBrowserMessage(frame({ ...base, items }))).toThrow(ProtocolError);
+  }
+});
+
+test("page_bulk_submit_request requires a bare https origin and bounds canonical_keys", () => {
+  const frame = (payload: Record<string, unknown>) => ({
+    protocol: "papio-browser/1",
+    type: "page_bulk_submit_request",
+    msg_id: "page-bulk-submit-req-01",
+    seq: 1,
+    payload,
+  });
+  const validSource = { kind: "browser_page", origin: "https://scholar.example.edu", detector: "generic-identifiers/1" };
+
+  expect(parseBrowserMessage(frame({
+    request_id: "request-bulk-0002", scan_id: "scan-bulk-0001", canonical_keys: ["wk1"], source: validSource,
+  })).payload).toEqual({
+    request_id: "request-bulk-0002", scan_id: "scan-bulk-0001", canonical_keys: ["wk1"], source: validSource,
+  });
+
+  for (const payload of [
+    { canonical_keys: [], source: validSource },
+    { canonical_keys: Array.from({ length: 51 }, (_, i) => `wk${i}`), source: validSource },
+    { canonical_keys: ["wk1", "wk1"], source: validSource },
+    { canonical_keys: ["wk1"], source: { ...validSource, origin: "https://scholar.example.edu/path" } },
+    { canonical_keys: ["wk1"], source: { ...validSource, origin: "https://scholar.example.edu?x=1" } },
+    { canonical_keys: ["wk1"], source: { ...validSource, origin: "http://scholar.example.edu" } },
+    { canonical_keys: ["wk1"], source: { ...validSource, detector: "" } },
+    { canonical_keys: ["wk1"], source: { ...validSource, kind: "extension" } },
+  ]) {
+    expect(() => parseBrowserMessage(frame({
+      request_id: "request-bulk-0002", scan_id: "scan-bulk-0001", ...payload,
+    }))).toThrow(ProtocolError);
+  }
+});
+
+test("page_bulk_submit_result rejects negative counts and a malformed batch_id", () => {
+  const frame = (payload: Record<string, unknown>) => ({
+    protocol: "papio-browser/1",
+    type: "page_bulk_submit_result",
+    msg_id: "page-bulk-submit-res-01",
+    seq: 1,
+    payload,
+  });
+  const base = { request_id: "request-bulk-0003", scan_id: "scan-bulk-0001", submitted: 1, joined: 0, already_owned: 0, invalid: 0 };
+
+  expect(parseBrowserMessage(frame({ ...base, batch_id: "batch_bulk_00001" })).payload).toEqual({
+    ...base, batch_id: "batch_bulk_00001",
+  });
+  expect(() => parseBrowserMessage(frame({ ...base, submitted: -1, batch_id: "batch_bulk_00001" }))).toThrow(ProtocolError);
+  expect(() => parseBrowserMessage(frame({ ...base, batch_id: "short" }))).toThrow(ProtocolError);
+  expect(() => parseBrowserMessage(frame(base))).toThrow(ProtocolError);
+});
