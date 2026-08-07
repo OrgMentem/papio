@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 
+	"papio/internal/store"
 	"papio/internal/work"
 )
 
@@ -161,15 +162,13 @@ func CSLJSON(records []Record) ([]byte, error) {
 		if r.Abstract != "" {
 			item["abstract"] = r.Abstract
 		}
-		custom := map[string]string{}
 		if r.PMID != "" {
-			custom["pmid"] = r.PMID
+			// PMID is a standard CSL 1.0.2 variable; only arXiv, which has
+			// no standard slot, rides in the spec's custom object.
+			item["PMID"] = r.PMID
 		}
 		if r.ArXiv != "" {
-			custom["arxiv"] = r.ArXiv
-		}
-		if len(custom) > 0 {
-			item["custom"] = custom
+			item["custom"] = map[string]string{"arxiv": r.ArXiv}
 		}
 		items = append(items, item)
 	}
@@ -253,6 +252,10 @@ func BibTeX(records []Record) []byte {
 		}
 		add("pmid", r.PMID)
 		add("abstract", r.Abstract)
+		if len(fields) == 0 {
+			b.WriteString("}\n")
+			continue
+		}
 		b.WriteString(strings.Join(fields, ",\n"))
 		b.WriteString(",\n}\n")
 	}
@@ -270,8 +273,14 @@ func writeRIS(b *strings.Builder, tag, value string) {
 	b.WriteString("\r\n")
 }
 
+// singleLine collapses whitespace and, per the repo-wide rule in
+// store.StripTerminalControls's doc comment, routes every projected value
+// through the one control-byte filter: exported titles are third-party
+// text, and the no-`-o` path writes them straight to the operator's
+// terminal. (CSL-JSON is exempt by construction — encoding/json escapes
+// control bytes.)
 func singleLine(value string) string {
-	return strings.Join(strings.Fields(value), " ")
+	return strings.Join(strings.Fields(store.StripTerminalControls(value)), " ")
 }
 
 var bibtexEscaper = strings.NewReplacer(

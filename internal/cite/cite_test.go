@@ -138,7 +138,7 @@ func TestRenderRejectsUnknownFormats(t *testing.T) {
 	}
 }
 
-func TestCSLJSONCarriesLiteralAuthorsAndCustomIdentifiers(t *testing.T) {
+func TestCSLJSONCarriesLiteralAuthorsAndStandardPMID(t *testing.T) {
 	r := article()
 	r.ArXiv = "2401.12345"
 	payload, err := CSLJSON([]Record{r})
@@ -148,6 +148,7 @@ func TestCSLJSONCarriesLiteralAuthorsAndCustomIdentifiers(t *testing.T) {
 	var items []struct {
 		Type   string              `json:"type"`
 		Author []map[string]string `json:"author"`
+		PMID   string              `json:"PMID"`
 		Custom map[string]string   `json:"custom"`
 		Issued struct {
 			DateParts [][]int `json:"date-parts"`
@@ -160,10 +161,48 @@ func TestCSLJSONCarriesLiteralAuthorsAndCustomIdentifiers(t *testing.T) {
 	if item.Type != "article-journal" || len(item.Author) != 2 || item.Author[0]["literal"] != "Joshua Holzer" {
 		t.Fatalf("item = %+v: authors must be literal names, never split into family/given by guesswork", item)
 	}
-	if item.Custom["pmid"] != "35051190" || item.Custom["arxiv"] != "2401.12345" {
-		t.Fatalf("custom = %+v", item.Custom)
+	if item.PMID != "35051190" {
+		t.Fatalf("PMID = %q: PMID is a standard CSL 1.0.2 variable, not a custom extension", item.PMID)
+	}
+	if item.Custom["arxiv"] != "2401.12345" || len(item.Custom) != 1 {
+		t.Fatalf("custom = %+v, want only the arXiv id (no standard CSL slot exists for it)", item.Custom)
 	}
 	if len(item.Issued.DateParts) != 1 || item.Issued.DateParts[0][0] != 2022 {
 		t.Fatalf("issued = %+v", item.Issued)
+	}
+}
+
+func TestProjectionsStripTerminalControlBytes(t *testing.T) {
+	r := article()
+	r.Title = "Evil\x1b]0;pwned\x07 Title\x1b[31m"
+	for name, payload := range map[string]string{
+		"ris":    string(RIS([]Record{r})),
+		"bibtex": string(BibTeX([]Record{r})),
+	} {
+		if strings.ContainsAny(payload, "\x1b\x07") {
+			t.Fatalf("%s output carries raw control bytes — the no-output-file path writes third-party titles straight to the operator's terminal:\n%q", name, payload)
+		}
+		if !strings.Contains(payload, "pwned Title") {
+			t.Fatalf("%s output lost the printable text:\n%q", name, payload)
+		}
+	}
+	payload, err := CSLJSON([]Record{r})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.ContainsAny(string(payload), "\x1b\x07") {
+		t.Fatalf("CSL-JSON output carries raw control bytes:\n%q", payload)
+	}
+}
+
+func TestBibTeXZeroFieldEntryStaysWellFormed(t *testing.T) {
+	out := string(BibTeX([]Record{{}}))
+	// The comma after the citation key is BibTeX syntax; the malformed
+	// shape is the empty field join's dangling ",\n,\n}".
+	if strings.Contains(out, ",\n,\n}") {
+		t.Fatalf("zero-field entry = %q, want no dangling field comma", out)
+	}
+	if !strings.Contains(out, "@article{anon-nd-untitled-") {
+		t.Fatalf("zero-field entry = %q, want a stable key", out)
 	}
 }

@@ -31,7 +31,13 @@ execution records in `notes/acquisition-stack-plan.md`.
   wins, the `-o` extension infers (`.json`/`.ris`/`.bib`), CSL-JSON is the
   default; with the global `--json`, `-o` is required and stdout carries a
   receipt (format, record count, duplicates collapsed, SHA-256, path). The
-  MCP facade exposes the new command automatically.
+  MCP facade exposes the new command automatically. Projected values pass
+  through the repo's one terminal-control filter, so a third-party title
+  cannot inject escape sequences into the no-`-o` stdout path; PMID rides
+  CSL 1.0.2's standard `PMID` variable (only arXiv uses the `custom`
+  object). `export watch --include-consumed` from the consult design is
+  deferred: consumed digest entries never leave the daemon today, so
+  including them needs a `watch.digest` v2 method first.
 
 - **OpenAIRE joins the open-access resolver waterfall.** The Graph API's
   research-product lookup by DOI (else PMID) contributes up to three
