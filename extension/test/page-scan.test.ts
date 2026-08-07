@@ -332,3 +332,31 @@ test("adjacent inline elements never weld words together", () => {
   );
   expect(result.papers[0]!.label).toContain("1 Aina C.");
 });
+
+test("a dt-anchored identifier labels from its dd sibling (arXiv listing shape)", () => {
+  // arXiv's listing pages are definition lists: the <dt> holds the abs/pdf
+  // links (pure chrome), the sibling <dd> holds the citation.
+  const result = scanDocument(
+    doc(
+      `<dl>
+        <dt>[1] <a href="https://arxiv.org/abs/2608.06340">arXiv:2608.06340</a> [<a href="https://arxiv.org/pdf/2608.06340">pdf</a>, <a href="#">html</a>, <a href="#">other</a>]</dt>
+        <dd><div>Title: Handling Missing Data in Probabilistic Regression Trees</div><div>Authors: T. Prass, A. Neimaier</div><div>Subjects: Machine Learning (stat.ML)</div></dd>
+        <dt>[2] <a href="https://arxiv.org/abs/2608.06337">arXiv:2608.06337</a></dt>
+        <dd><div>Title: A Second Paper Entirely</div></dd>
+      </dl>`,
+    ),
+  );
+  expect(result.papers.length).toBe(2);
+  expect(result.papers[0]!.label).toContain("Handling Missing Data in Probabilistic Regression Trees");
+  expect(result.papers[0]!.label).not.toMatch(/\[\s*pdf|other\s*\]/i);
+  expect(result.papers[1]!.label).toContain("A Second Paper Entirely");
+  // Both dt anchors for one paper merge into one row.
+  expect(result.papers[0]!.occurrences).toBe(2);
+});
+
+test("a dt without a dd sibling keeps its own text as the label", () => {
+  const result = scanDocument(
+    doc(`<dl><dt>Prass et al 2026 <a href="https://arxiv.org/abs/2608.06340">arXiv:2608.06340</a></dt></dl>`),
+  );
+  expect(result.papers[0]!.label).toContain("Prass et al 2026");
+});

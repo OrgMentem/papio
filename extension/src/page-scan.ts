@@ -205,16 +205,33 @@ export function scanDocument(root: Document | Element = document): ScanResult {
     while (el !== null && el.tagName !== "BODY" && el.tagName !== "HTML") {
       if (visibleText(el).length > BOUNDED_CONTAINER_CHARS) break;
       candidate = el;
+      // A <dt> is definitionally one term of a definition list — one
+      // citation row. Climbing past it can only reach the whole <dl>
+      // (every row on the page) or beyond; stop here and let
+      // containerLabel pair it with its <dd> description.
+      if (el.tagName === "DT") break;
       el = el.parentElement;
     }
     return candidate;
   }
 
   function containerLabel(start: Element): string {
-    const container =
+    let container =
       boundedAncestor(start) ??
       (typeof start.closest === "function" ? start.closest(CONTAINER_SELECTOR) : null) ??
       start;
+    // Definition lists split one citation across siblings by standardized
+    // semantics: the <dt> carries the term (identifier + format links on
+    // arXiv listings — pure chrome), the <dd> carries the description
+    // (title, authors, subjects). Ancestor-climbing can never reach a
+    // sibling, so a dt-anchored identifier labels from its dd instead.
+    if (container.tagName === "DT") {
+      const description = container.nextElementSibling;
+      if (description !== null && description.tagName === "DD") {
+        const text = visibleText(description).replace(/\s+/g, " ").trim();
+        if (text.length >= 8) container = description;
+      }
+    }
     const raw = visibleText(container).replace(/\s+/g, " ").trim();
     return stripServiceChrome(raw).slice(0, MAX_LABEL_CHARS);
   }
