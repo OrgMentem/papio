@@ -288,6 +288,19 @@ papio batch report <batch-id|latest> [flags]
 | --- | --- | --- | --- |
 | `--markdown` | `bool` | `false` | emit an agent-ready Markdown digest |
 
+## `papio bench`
+
+Run the hermetic comparative acquisition benchmark over a cohort file
+
+```
+papio bench [flags]
+```
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--cohort` | `string` |  | path to a papio-bench-cohort/1 document |
+| `--fixtures` | `string` |  | fixture directory (default: the cohort file's sibling "fixtures" directory) |
+
 ## `papio browser`
 
 Inspect and switch connected browser sessions
@@ -441,6 +454,14 @@ Show a delivery request's history for reconciliation (Decision 4's open_request_
 
 ```
 papio delivery history <job-id>
+```
+
+### `papio delivery resume`
+
+Clear a live delivery request's poll-failure bookkeeping (e.g. a contract-drift park) so the next poll is no longer a no-op
+
+```
+papio delivery resume <request-id>
 ```
 
 ### `papio delivery submit`
@@ -765,6 +786,14 @@ Show lifetime acquisition totals by access basis
 
 ```
 papio stats
+```
+
+### `papio stats page-bulk`
+
+Show page-bulk scan/submit funnel and identifier yield
+
+```
+papio stats page-bulk
 ```
 
 ## `papio status`

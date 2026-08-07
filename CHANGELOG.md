@@ -13,6 +13,126 @@ execution records kept during the initial build.
 
 ### Added
 
+- **Page-bulk status now knows what you own.** `zotio.Service.LookupWorks` —
+  already serving batch submit's ownership classification — is wired into
+  `page_bulk_status`: a scanned page's identifiers merge zotio's
+  `owned_with_pdf`/`owned_missing_pdf`/staleness verdicts with the daemon's
+  own ledger, under a fixed precedence — papio's own ready bundle first,
+  then zotio's `owned_with_pdf`, then zotio's `owned_missing_pdf` (carrying
+  the Zotero item key), then a live queued job, then a complete negative
+  lookup (`eligible`). `LookupWork` gains PMID (the facade previously
+  carried only DOI/arXiv id; zotio itself already resolved PMID). A stale
+  or failed zotio round reports the new `ownership_unknown` status rather
+  than a false `eligible` or `ownership_incomplete` mark — page-bulk must
+  never claim a work is unowned when it could not check. A `nil` zotio
+  client (unconfigured) preserves the prior behavior byte-for-byte.
+- **`papio stats page-bulk` measures the feature honestly, denominator and
+  all.** Migration 0023 adds `rendered_record_count_hint` to
+  `page_bulk_runs`: the extension's scanner counts visible result records
+  for structurally-recognized page shapes only — definition-list rows, a
+  reference/citation list, or a repeated card grouping, each requiring at
+  least two matching siblings before it counts as a "list" at all — without
+  reading a single title, URL, or docid, and reports `null` rather than a
+  guess when no shape is recognized. The new `stats page-bulk` command
+  reports, per source-origin class, total scan sessions, useful-scan rate,
+  bulk leverage, submit conversion, and `identifier_yield` — now backed by
+  that rendered-count denominator instead of standing without one.
+- **`papio bench` compares acquisition coverage, not absolute results.** A
+  new hermetic harness reads a `papio-bench-cohort/1` file — a work request
+  plus its expected outcome class (`autonomous_ready`,
+  `ready_after_human_boundary`, `honest_unavailable`, `identity_review`;
+  never an expected provider or route) — and runs it twice against an
+  ephemeral database, an empty artifact cache, and injected resolver
+  fixtures: once with a baseline overlay (Semantic Scholar, OpenAIRE, and
+  typed-relations resolution disabled) and once with the current build.
+  `fixture_missing` is an explicit reported state, never a silent skip. The
+  headline is `incremental_autonomous_ready` — how many more works the
+  current build resolves without a human boundary than the baseline does —
+  measured over a frozen field cohort seeded from the 2026-07-21 report,
+  answering the question the unmeasured resolver work had left open.
+  `papio bench --cohort <path>` never talks to the daemon; a manual live
+  mode is deferred and does not block this release.
+- **ILLiad requests now poll their own status, and a stuck poll can be
+  recovered.** Migration 0024 adds poll-health bookkeeping
+  (`provider_status_raw`, display status, `last_successful_poll_at`,
+  consecutive-failure count, error class) to `delivery_requests`. The poll
+  executor's state map is fail-closed: any successful nonterminal read
+  resets the failure count and settles `pending`; `Delivered to Web`
+  becomes `fulfilled`; `Cancelled by Customer`/`Cancelled by ILL Staff`
+  become `cancelled`/`declined`; an unmapped custom status — ILLiad's
+  statuses are institution-customizable, so there is no exhaustive enum —
+  stays `pending` with the raw string persisted; and `Request Finished`
+  classifies from prior recorded observations, never a guess. **A failed
+  poll never becomes `unknown_outcome`.** Transient, credential, and schema
+  failures leave the request's recorded state untouched and degrade
+  integration health instead: three consecutive failures mark a row
+  degraded, and 24 hours with no successful poll raises an advisory that
+  *papio* cannot *observe* the request — never that it failed.
+  `unknown_outcome` is reserved for genuine provider-side uncertainty after
+  successful communication and exhausted reconciliation (a 404 following a
+  prior successful lookup, reconciled first against ILLiad's `UserRequests`
+  and papio's own idempotency reference). Every poll persists its state as
+  a compare-and-swap on the row's originally-read state and next-check
+  time, in the same transaction as its event insert, so two pollers racing
+  the same row cannot double-append a `fulfilled` event or regress a
+  settled state — a lost race is a plain no-op. `papio doctor` reports
+  observation health per profile (`poll_health`) without ever claiming a
+  request failed, and its remedy for a contract-drift park now names the
+  actual recovery command: **`papio delivery resume <request-id>`** clears
+  a live request's poll-failure bookkeeping (a terminal row is refused with
+  a structured reason) so the next scheduled poll is no longer a no-op —
+  pair it with `papio jobs retry <job-id>` to poll immediately rather than
+  waiting for the schedule.
+- **A fulfilled ILLiad request can retrieve its document through the
+  ordinary browser handoff (ADR-0017 Decision 6).**
+  `document_delivery.patron_web_base_url` is new, `illiad`-only
+  configuration for the patron-facing ILLiadWeb portal — distinct from
+  `base_url`'s Web Platform API, and never derived from it, because
+  shared-server deployments and customized directories make that guess
+  unreliable. When configured, it compiles a new gate-profile capability,
+  `fulfillment_channel = "patron_web"`, orthogonal to submission
+  auto-capability: a profile can auto-submit requests and still have no
+  fulfillment channel, in which case every fulfilled request still lands on
+  the existing manual reconciliation action rather than claiming automation
+  *papio* cannot back. On `fulfilled`, *papio* builds the form-75 "View
+  PDF" URL (`patron_web_base_url` plus `?Action=10&Form=75&Value=<provider
+  transaction reference>`) and carries it through the same
+  `openurl_handoff` human-action machinery every other browser-driven
+  candidate already uses — delegated drives it, assisted opens it,
+  conservative only records that retrieval was discovered — so a
+  downloaded file lands in the same adoption, quarantine, structural, and
+  identity pipeline as any other browser capture. A custom, non-inline-PDF
+  landing page is not heuristically scanned for a download link; that stays
+  a recorded human action pending a fixture-backed adapter. **`fulfilled`
+  still means "the provider supplied the document," never that *papio*
+  holds trusted bytes** — only a file that clears validation moves the job
+  to `ready`. Live acceptance needs a real ILLiad deployment and is not
+  reproducible in CI; everything else ships now.
+- **Triage snapshot schema 3 adds `attention`, routing detail, and delivery
+  reconciliation.** Every item now carries a closed `attention` field —
+  `working` (papio is proceeding on its own), `required` (a human decision
+  is needed), or `advisory` (informational, e.g. a retraction notice) —
+  replacing any UI inference from `action_kind` or `requires_auth`.
+  Human-action items add `route_class` (a fixed enum formalizing the
+  existing action-kind vocabulary, now including `document_delivery`) and a
+  tri-state `auth_requirement` (`"true"`/`"false"`/`"unknown"`, wired
+  separately from the existing boolean `requires_auth`, which keeps its
+  narrow execution-gate meaning unchanged). `blocked_by`'s vocabulary grows
+  to a v3 superset — adding `login`, `terms`, `delivery_outcome`,
+  `identity_review`, `unknown` — without reinterpreting any v2 value;
+  schema 2 emission stays byte-identical. A `document_delivery`
+  human-action item carries a `delivery` sub-object (provider, provider
+  reference, state) and three new operations —
+  `open_request_history`, `confirm_request_exists`, and
+  `confirm_request_absent` — wired end-to-end through a new
+  `delivery_reconcile_request`/`delivery_reconcile_result` message pair. A
+  routine store error while assembling an item's delivery detail now
+  degrades that one field to absent with a logged line, rather than tearing
+  down the whole native-messaging session over a database hiccup. Go's
+  `confirm_request_absent` validation now matches the TypeScript and
+  JSON-schema sides: an explicit empty `provider_reference` is rejected,
+  not silently accepted. Store schema version 24.
+
 - **Document delivery and ILL become a durable, configured route (ADR-0017).**
   A dead end is fixed: a work only obtainable through interlibrary loan used
   to make *papio* observe that fact and stop. A new `delivery_requests`

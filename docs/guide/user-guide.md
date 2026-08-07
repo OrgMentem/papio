@@ -150,6 +150,37 @@ The one-work command also accepts `--doi`, `--pmid`, `--arxiv`, `--isbn`, or
 cap paid-source cost. `--label` works here too: it records the query context
 and seeds the target collection when `--collection` is unset.
 
+### Bulk import from discovery interfaces
+
+A discovery interface's own search result list is often the easiest place to
+gather a reading set — a OneSearch or Primo results page, a Google Scholar
+search, a systematic-review tool's export — but *papio* does not query,
+scrape, or paginate a third-party discovery interface's search API on your
+behalf. The reliable route through one is silent-UI: use the interface's own
+**Export** control to write a RIS (or BibTeX / CSL-JSON) file of the results
+you selected, then hand that file to `--batch` directly:
+
+```sh
+papio acquire --batch export.ris --label "spring literature review"
+```
+
+This is the same `--batch` command described above — RIS `.ris`, BibTeX
+`.bib`/`.bibtex`, CSL-JSON, JSONL, and MEDLINE/NBIB `.nbib` are all accepted
+regardless of where the file came from, the same ledger/cache deduplication
+applies, and a title-only entry with no identifier still submits through the
+same enrichment path as a title-only JSONL work — arriving as an exported RIS
+row is not itself grounds for refusal.
+
+Where a page instead shows exact, on-page identifiers you can select
+yourself — a reference list, bibliography, or results page with visible
+DOIs — the extension popup's **"Select papers on this page"** action is the
+browser-native path: it reads only what's visibly on the page and submits
+your selection as an ordinary batch. Structured citation export through this
+section is the preferred fallback whenever the interface withholds
+identifiers from the page itself, which is the common case for a search
+portal's own results list — the export already carries identifiers a visual
+scan cannot recover.
+
 ## 4. Follow the work instead of guessing
 
 `status` groups your jobs into working, awaiting-human, needs-review, ready,

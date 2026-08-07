@@ -52,6 +52,52 @@ for the full pre-split extension history.
   the daemon's `page_bulk_acquire_v1` feature, negotiated over
   `hello_ack.features`; an older daemon that never advertises it fails the
   scan with a plain error instead of silently doing nothing.
+- **Page-bulk rows now show what your Zotero library already has.** Each
+  row's status merges the daemon's own ready-bundle and queue state with a
+  zotio library lookup: `owned_with_pdf` and `owned_missing_pdf` marks
+  (with the owning item key, for missing-pdf rows) come from your personal
+  library, not a guess. When the library lookup is stale, fails, or zotio
+  isn't configured to answer, the row reports the new `ownership_unknown`
+  status — labeled **Library check unavailable** — never a false "not
+  owned". `owned_with_pdf` rows stay disabled and unselected exactly as
+  before; an `ownership_unknown` row stays checkable, the same as any other
+  unresolved state.
+- **Selection workspace scans report an honest "how many records were on
+  the page" count.** For a page whose result-list shape the scanner
+  recognizes structurally — definition-list rows, a reference/citation
+  list, or a repeated card grouping, each needing at least two matching
+  entries to count as a list — the scan attaches a
+  `rendered_record_count_hint`: a single integer count of visible result
+  records, read from element structure only. No title, URL, query string,
+  or document id is ever inspected to produce it, and it never leaves this
+  page: it rides only the `page_bulk_status` call to feed the daemon's own
+  aggregate `papio stats page-bulk` reporting, and stays absent, never a
+  guess, when no recognized page shape is found.
+- **The inbox renders document-delivery reconciliation.** A parked
+  ILL/document-delivery request now appears as its own `document_delivery`
+  item, always showing its provider, provider reference, and current
+  state, with attention-driven styling — a quiet, muted treatment for
+  `working` items papio is still handling on its own, an emphasized accent
+  for `required` items waiting on you, and a subdued informational accent
+  for `advisory` items. Two new mutating operations, **Confirm exists** and
+  **Confirm absent**, drive Decision 4's reconciliation for a request stuck
+  in `unknown_outcome`; a third, **History**, opens the request's own
+  history without mutating anything. A stuck request's card also explains
+  itself: "papio paused automatic polling until you confirm what the
+  library has on file for this request."
+
+### Fixed
+
+- **The Institution session card no longer gets stuck on "Checking
+  session…".** Staleness gating previously ran before an inconclusive
+  probe outcome (`no_tab`, `no_markers`, and the rest) was resolved to its
+  own honest label, so an origin whose probe never lands a decisive in/out
+  verdict — the steady state whenever no library tab is open — rendered
+  "Checking session…" forever. An `unknown` verdict now resolves to its
+  honest copy first; only a decided ("in"/"out") verdict that has since
+  aged past freshness falls through to a new **Session state unknown —
+  recheck** state, so a decided-but-recently-completed probe is never
+  misread as stale.
 
 ## [0.10.0] - 2026-08-06
 

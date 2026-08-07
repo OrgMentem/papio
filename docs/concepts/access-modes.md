@@ -17,6 +17,11 @@ PDF. See [Browser handoff](../concepts/browser-handoff.md) for the browser-side 
 | `assisted` | Opens OpenURL in the user's ordinary browser. You log in and download the file; *papio* then adopts and validates the selected file. |
 | `delegated` | Opens OpenURL; login, MFA, and CAPTCHA remain human actions. After you return to a granted provider host, a verified adapter may navigate and initiate the one requested download on your behalf. Unknown or changed UI falls back to assisted behavior. |
 
+A fulfilled document-delivery request's retrieval page (the provider's own "View
+PDF" page) opens under this same per-mode rule as any other institutional
+route: `delegated` drives it, `assisted` opens it for you, and `conservative`
+only records that retrieval was discovered.
+
 Licensed and text-and-data-mining adapters are separate, per-source capabilities.
 They require their own explicit credentials, terms acknowledgement, rate and cost
 budgets, and allowed uses; `delegated` does not grant them permission.

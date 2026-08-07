@@ -72,6 +72,8 @@ for the full field list.
 - **No browser credentials.** You enter institutional credentials and complete MFA or CAPTCHA in your browser. The extension does not read, store, or transmit your usernames, passwords, cookies, or session tokens.
 - **No background scraping.** Bulk selection runs only after you click it. It acts only on the papers you select, with a maximum of 50 per batch. It does not crawl, harvest, or auto-submit pages.
 - **Local page detection.** “Select papers on this page” runs in the current tab after you request it. Only the detected identifiers are sent to the local application. The submitted batch records the page's scheme and host, not its path, query string, title, or surrounding text. No scholarly service is contacted until you submit the selected papers.
+- **Rendered-count hint is a single number.** The selection workspace's scan can report `rendered_record_count_hint` alongside the detected identifiers: one aggregate integer counting recognized result records on the page, never a title, URL, query string, or document id, and never sent at all when the page's shape isn't recognized.
+- **Ownership marks come from a local check, not the network.** A page-bulk row's `owned_with_pdf` / `owned_missing_pdf` / `ownership_unknown` marks can come from your Zotero library through zotio, which the local application invokes as a local subprocess — no request leaves your machine for this check. A stale or failed check reports `ownership_unknown` honestly rather than a false "not owned."
 - **Normal browser session.** The extension uses browser extension APIs and native messaging. It does not use WebDriver, CDP, or other browser-automation frameworks.
 
 ## Local storage
