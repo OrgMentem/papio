@@ -403,6 +403,58 @@ Check acquisition readiness and local integrations
 papio doctor
 ```
 
+## `papio export`
+
+Export normalized citation records (CSL-JSON, RIS, BibTeX)
+
+```
+papio export
+```
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--format` | `string` |  | citation format: csl-json, ris, or bibtex (default csl-json, inferred from -o's extension) |
+| `--include-duplicates` | `bool` | `false` | keep records whose canonical identity repeats instead of collapsing them |
+| `-o, --output` | `string` |  | write citations to this file instead of stdout (required with --json) |
+
+### `papio export batch`
+
+Export every work in the batch manifest in manifest order, including skipped and unavailable works
+
+```
+papio export batch <batch-id>
+```
+
+### `papio export job`
+
+Export the named jobs in argument order (any state: citation metadata stays useful when retrieval failed)
+
+```
+papio export job <job-id>...
+```
+
+### `papio export ledger`
+
+Export one record per canonical work (ready acquisitions by default)
+
+```
+papio export ledger [flags]
+```
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--consumer` | `string` |  | only works submitted by this consumer |
+| `--since` | `string` |  | only works submitted after this instant (RFC3339) or within this duration (Go form, e.g. 720h) |
+| `--state` | `string` | `ready` | which works to export: ready (validated acquisitions) or any (every job) |
+
+### `papio export watch`
+
+Export a watch's pending digest entries
+
+```
+papio export watch <watch-id>
+```
+
 ## `papio failures`
 
 Aggregate unavailable and parked acquisition reasons

@@ -13,6 +13,26 @@ execution records in `notes/acquisition-stack-plan.md`.
 
 ### Added
 
+- **`papio export` writes normalized CSL-JSON, RIS, and BibTeX.** Four
+  scopes: `export job <id>...` (argument order, any state — citation
+  metadata stays useful when retrieval failed), `export batch <batch-id>`
+  (manifest order, including skipped and unavailable works — citation
+  export is not an acquisition-success report), `export watch <watch-id>`
+  (pending digest entries), and `export ledger` (one record per canonical
+  work; ready acquisitions by default, `--state any`, `--since`,
+  `--consumer`). Duplicates collapse by canonical identity — DOI, then
+  PMID, then arXiv id, then normalized title/first-author/year — unless
+  `--include-duplicates`; BibTeX keys are stable
+  (`firstauthor-year-titleword-<identity-hash>`), so a small title
+  correction never renames an entry. The projections are normalized, never
+  a round-trip: only known values are exported, author names stay literal
+  rather than being split into family/given by guesswork, and type is
+  identifier-based only (ISBN without DOI or container = book). `--format`
+  wins, the `-o` extension infers (`.json`/`.ris`/`.bib`), CSL-JSON is the
+  default; with the global `--json`, `-o` is required and stdout carries a
+  receipt (format, record count, duplicates collapsed, SHA-256, path). The
+  MCP facade exposes the new command automatically.
+
 - **OpenAIRE joins the open-access resolver waterfall.** The Graph API's
   research-product lookup by DOI (else PMID) contributes up to three
   candidates per work from the record's licensed or explicitly OPEN
