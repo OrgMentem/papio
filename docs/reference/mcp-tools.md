@@ -92,22 +92,25 @@ both surfaces. The excluded commands are `init`, `config`, `daemon`,
 
 ## Old tool -> command_run
 
-The former typed tools below are replaced on the default surface by
-`papio_command_run`. `args` is positional arguments only; `flags` uses the
-CLI's hyphenated command-local flag names.
+The former typed tools below are gone from the codebase. Each row maps the
+old tool name to the `papio_command_run` invocation that replaces it, using
+the target command's *current* flag set — not the old tool's original fixed
+schema, which the command has since outgrown. `args` is positional arguments
+only; `flags` uses the CLI's hyphenated command-local flag names. For the
+definitive, always-current flag list, see the [command reference](commands.md).
 
 | Old tool | `papio_command_run` invocation |
 | --- | --- |
-| `papio_search` | `name: "search"`; `args: "<query>"`; `flags: {limit, year-from, year-to, oa-only, cites, cited-by, related-to, new-only}` |
-| `papio_acquire` | `name: "acquire"`; `args: "<identifier>"`; `flags: {doi, pmid, arxiv, isbn, openalex, title, author, year, request-id, zotio-item-key, collection, desired-version, access-mode, resolver, max-cost, source, deny-source, auto-import}` |
+| `papio_search` | `name: "search"`; `args: "<query>"`; `flags: {limit, year-from, year-to, oa-only, cites, cited-by, related-to, new-only, source}` |
+| `papio_acquire` | `name: "acquire"`; `args: "<identifier>"`; `flags: {doi, pmid, arxiv, isbn, openalex, title, author, year, request-id, zotio-item-key, collection, label, desired-version, access-mode, resolver, max-cost, source, deny-source, auto-import, consumer, force, keys, limit, include-owned, from-digest, from-zotio, wait}` (`batch`, for bulk submission from a file, is superseded by the `papio_acquire_batch` tool) |
 | `papio_status` | `name: "status"`; `flags: {follow}` |
 | `papio_doctor` | `name: "doctor"` |
-| `papio_actions_list` | `name: "actions list"`; `flags: {all}` |
+| `papio_actions_list` | `name: "actions list"`; `flags: {all, consumer, limit}` |
 | `papio_actions_resolve` | `name: "actions resolve"`; `args: "<action-id>"`; `flags: {accept}` **or** `flags: {reject}` (exactly one) |
 | `papio_export_bundle` | `name: "bundle export"`; `args: "<job-id>"`; `flags: {output}` |
 | `papio_zotio_plan` | `name: "zotio plan"`; `args: "<job-id> <job-id> ..."` |
 | `papio_zotio_apply` | `name: "zotio apply"`; `args: "<plan-id>"`; `flags: {"confirm-sha256": "<digest-from-zotio-plan>"}` |
-| `papio_watch_add` | `name: "watch add"`; `args: "<query>"` (omit for `--kind backfill`); `flags: {label, collection, cadence, limit-per-run, oa-only, year-from, year-to, kind, mode}` |
+| `papio_watch_add` | `name: "watch add"`; `args: "<query>"` (omit for `--kind backfill`); `flags: {label, collection, cadence, limit-per-run, oa-only, year-from, year-to, cites, cited-by, related-to, kind, mode}` |
 | `papio_watch_list` | `name: "watch list"` |
 | `papio_watch_remove` | `name: "watch remove"`; `args: "<id>"` |
 | `papio_batch_report` | `name: "batch report"`; `args: "<batch-id-or-latest>"`; `flags: {markdown}` |

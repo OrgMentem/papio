@@ -170,9 +170,11 @@ These flags set the corresponding setup values:
 | `--email` | Contact email for polite API pools. |
 | `--zotio-path` | zotio executable path; `--zotio-path ""` disables Zotero integration. |
 | `--attachment-mode` | `stored` or `linked-file`. |
+| `--institution-url` | Library discovery or search URL (Primo, SFX, WorldCat, EBSCO) or an OpenURL base directly; papio derives the resolver base and, when present, the ProQuest account ID. |
 | `--openurl-base` | Institution OpenURL resolver base URL. |
 | `--shibboleth-entity-id` | Shibboleth IdP entityID for federated login-routing. |
 | `--proquest-account-id` | A ProQuest account ID or URL containing `accountid=`. |
+| `--libkey-library-id` | Numeric Third Iron library ID, or a BrowZine/LibKey.io URL containing `/libraries/<id>`; enables [LibKey link routing](../reference/config-reference.md#browser), blank disables it. |
 | `--extension-id` | Chrome extension ID permitted to reach the connector. |
 | `--firefox-extension-id` | Firefox add-on ID permitted to reach the connector. |
 | `--check-updates` | Allow a once-daily GitHub releases check for new *papio* and zotio versions (default `true`). |

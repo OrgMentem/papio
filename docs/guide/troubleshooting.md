@@ -83,12 +83,12 @@ PASS  access_mode              explicit access mode configured
 PASS  pdftotext                Poppler semantic extraction available
 ...
 PASS  config                   parsed /Users/me/.config/papio/config.toml
-PASS  daemon                   reachable; version 0.1.0
+PASS  daemon                   reachable; version 0.18.0
 WARN  extension                extension has not connected since daemon start
 PASS  native host (Chrome)     manifest allows configured extension
 PASS  native host (Firefox)    manifest allows configured extension
-PASS  native host (version)    matches the daemon (0.1.0)
-PASS  zotio                    version 1.0.0; required capabilities available
+PASS  native host (version)    matches the daemon (0.18.0)
+PASS  zotio                    version 0.16.1; required capabilities available
 ```
 
 To update *papio*, build or install the new version, then stop the running
@@ -318,22 +318,15 @@ It returns the job to `resolving` and reports what it found, so an outcome of
 parked state is genuine — resolve the open action instead. It is deliberately
 narrow: it will not reopen a job that is legitimately waiting on you.
 
-## A handoff has gone quiet
+## A handoff has been inactive for more than seven days
 
-After a week, an open human action stops drawing *papio*'s own initiative: the
-browser bridge stops offering it whenever a session goes live, and the reminder
-schedule stops raising it. This is deliberate. The reminder backoff caps the
-interval at a day but never the count, and the bridge re-offered every open
-handoff on every session-live tick, so one handoff nobody could complete used to
-produce a tab per session and a notification per day, indefinitely.
+After a week, an open human action is no longer offered automatically when a
+session goes live, and the reminder schedule stops raising it. This prevents one
+uncompleted handoff from creating repeated tabs and notifications.
 
-**Going quiet is not expiry.** The action stays open, stays listed by
-`papio actions list`, and stays openable — `papio actions open` drives a quiet
-handoff on demand, because an explicit command is your intent in a way a
-background tick is not. *papio* simply stops volunteering.
-
-`papio doctor` reports the count so a quiet queue does not become an invisible
-one:
+**This does not expire the action.** It remains open, listed by `papio actions
+list`, and available through `papio actions open`. That command opens the
+handoff explicitly.
 
 ```
 WARN  quiesced_actions  3 human action(s) have gone quiet after waiting more than 7 days; oldest opened 40 days ago
@@ -341,7 +334,7 @@ WARN  quiesced_actions  3 human action(s) have gone quiet after waiting more tha
       drive them, or 'papio actions dismiss' to clear the ones you are done with
 ```
 
-If a handoff keeps going quiet, that is usually the real answer: the library does
-not hold the title, the provider changed its login, or the DOI is wrong. Check
-`papio jobs receipt <job-id>` before re-opening it a fourth time.
+If a handoff becomes inactive again, the library may not hold the title, the
+provider may have changed its login, or the DOI may be wrong. Check
+`papio jobs receipt <job-id>` before reopening it.
 

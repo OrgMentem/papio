@@ -83,6 +83,7 @@ stateDiagram-v2
     resolving --> fetching
     fetching --> validating
     validating --> ready
+    ready --> imported
 
     resolving --> awaiting_human
     fetching --> awaiting_human
@@ -108,8 +109,10 @@ stateDiagram-v2
     fetching --> cancelled
 ```
 
-`ready` is the acquisition terminal state. A retryable outcome enters
-`retry_wait` before resolution or fetching resumes. `awaiting_human` represents
-a required user action; `needs_review` preserves ambiguity for an explicit
-decision. `unavailable`, `failed`, and `cancelled` end the current acquisition
-path.
+`ready` and `imported` are the acquisition's terminal states. A job that
+reaches `ready` holds a validated PDF; its only further transition is to
+`imported`, recorded once the corresponding zotio export completes, which is
+itself terminal. A retryable outcome enters `retry_wait` before resolution or
+fetching resumes. `awaiting_human` represents a required user action;
+`needs_review` preserves ambiguity for an explicit decision. `unavailable`,
+`failed`, and `cancelled` end the current acquisition path without a file.

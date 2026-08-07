@@ -35,14 +35,23 @@ journal issue; only OA and API sources process batches, and each batch is capped
     publisher or library terms. Terms acceptance is always a human action.
 
 - **Login stays human and local.** Authentication happens in the user's ordinary
-  browser. The extension has no `cookies` or `debugger` permission and no host
-  permissions for Example University, OpenAthens, or identity-provider domains. While
-  authenticating, it compares origins locally and sends no identity-provider URL,
-  path, title, query, or fragment through native messaging.
-- **Browser reach is opt-in and narrow.** Each source has separate enablement and
-  optional host permissions; *papio* never requests `<all_urls>`. A user gesture in
-  the extension UI grants a permission, and revoking it immediately returns that
-  source to assisted behavior.
+  browser. The extension has no `cookies` or `debugger` permission. It holds three
+  required host permissions, granted at install on Chrome:
+  `https://*.alma.exlibrisgroup.com/*` and `https://*.primo.exlibrisgroup.com/*`,
+  used to classify Ex Libris library-resolver pages, and
+  `https://login.openathens.net/*`, used only to recognize OpenAthens's own
+  stale-session error page and restore the work window. It requests no host
+  permission for Example University's or any other institution's own login
+  domain. While authenticating, it compares origins locally and sends no
+  identity-provider URL, path, title, query, or fragment through native
+  messaging.
+- **Browser reach is opt-in and narrow by default.** Each source has separate
+  enablement and optional host permissions; *papio* never requests `<all_urls>`.
+  A user gesture in the extension UI grants a permission, and revoking it
+  immediately returns that source to assisted behavior. The options page also
+  offers a single **All sites** grant (`https://*/*`) for people who would rather
+  not approve each provider individually — it is opt-in, never requested at
+  install, and revocable like any other source.
 - **papio decides, not the browser.** *papio*'s own policy is authoritative; the
   browser reports what it sees and does, but cannot authorize a disallowed source
   or step. Saved job state lives in *papio*'s local database, not in the

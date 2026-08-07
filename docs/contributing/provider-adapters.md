@@ -15,7 +15,7 @@ When *papio* reaches a provider it does not understand, the extension waits for 
 2. Build a job-scoped support report if you have the job ID:
 
     ```console
-    papio adapter diagnose <job-id> --json
+    papio adapter diagnose <job-id>
     ```
 
 3. Open an issue or pull request and describe the provider, scenario, and capture you reviewed. Attach page content only after following the privacy check below. *papio* never uploads a capture or opens an issue automatically.

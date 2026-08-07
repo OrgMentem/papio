@@ -5,11 +5,9 @@ exhausted direct acquisition, [assisted and delegated access modes](access-modes
 can route it to the user's existing browser session. Conservative mode records
 institutional OpenURL availability without opening a handoff.
 
-Not every handoff needs a login: some open-access pages simply refuse
-non-browser downloads. `papio actions list` says which is which for every
-parked job — "open access — no login needed" versus "sign in to your
-institution first" — so you never authenticate for a paper that did not
-require it.
+Not every handoff requires a login. Some open-access pages refuse non-browser
+downloads. `papio actions list` labels each parked job as either “open access —
+no login needed” or “sign in to your institution first.”
 
 ## One ordinary browser, not browser automation
 
@@ -20,9 +18,7 @@ short messages and never owns the queue or stores browser data.
 
 *papio* never uses an automated or hidden browser. It does not launch a separate
 browser, run one in the background, copy your cookies, or fill in sign-in forms.
-Because everything happens in your ordinary browser, publisher sites see a normal
-person, not a robot — automated browsers trip anti-bot checks and get blocked.
-*papio* relies on your real, signed-in session instead.
+Requests go through the browser session you use for institutional access.
 
 ```mermaid
 flowchart LR
@@ -41,12 +37,29 @@ and closes only its own tabs when a job finishes or is cancelled. The extension
 can restart at any time; it keeps only a minimal tab-to-job mapping and asks
 *papio* for the authoritative state.
 
-## The minimized work window
+## Handoff surfaces
 
-*papio* keeps its tabs in one dedicated browser window, opened minimized and
-unfocused — a normal window kept out of your way, not a hidden or automated
-browser. It is reused for later handoffs and reopened if you close it, so your
-ordinary tabs are not flooded with login and publisher pages.
+*papio* opens its own tabs on one of three surfaces, chosen automatically
+from your setting and what the browser supports:
+
+- **work window** (default) — one dedicated browser window, opened minimized
+  and unfocused;
+- **tab group** — a collapsed "papio" tab group inside your current window;
+- **in-window** (legacy) — ordinary visible tabs in your current window.
+
+The work window and the tab group both keep your ordinary tabs free of
+login and publisher pages; a dedicated work window is reused for later
+handoffs and reopened if you close it.
+
+Tab-group handoff depends on a browser tab-groups API
+(`chrome.tabGroups`/`chrome.tabs.group`), which the extension detects at
+runtime rather than gating by browser — it runs on Chrome and on Firefox
+139+. The extension's minimum supported Firefox version stays at 128.0, the
+ESR release many institutions run, so it keeps installing there even though
+tab groups aren't available yet: on Firefox 128 through 138, a tab-group
+choice automatically falls back to the work window. A work-window choice
+falls back further, to in-window tabs, on a browser with no windows API at
+all.
 
 The extension surfaces the exact work tab only when a human decision is needed:
 
@@ -54,10 +67,10 @@ The extension surfaces the exact work tab only when a human decision is needed:
 - publisher terms requiring a decision; or
 - identity review.
 
-After that step, the window can be minimized again and *papio* continues
-its work. This preserves the one-login-per-research-session model without
-asking *papio* to handle passwords, MFA, CAPTCHA tokens, or publisher
-credentials.
+After that step, a minimized work window or a collapsed tab group returns
+to the background and *papio* continues its work. This preserves the
+one-login-per-research-session model without asking *papio* to handle
+passwords, MFA, CAPTCHA tokens, or publisher credentials.
 
 ### If your institution's sign-in reports a stale session
 
@@ -126,16 +139,15 @@ An auto-refresh never reorders the list while a confirmation dialog is open,
 an action is still in flight, or a dismissal is still inside its undo
 window — it waits until you're finished before applying what it learned.
 
-## Dismissing takes effect after you stop looking at it
+## Dismissing an inbox item
 
-Dismissing an inbox item removes it at once and holds the daemon call for a
-few seconds behind an **Undo** bar (keyboard `u`); dismiss several rows and
-they share one undo. Nothing has reached the daemon until that window closes,
-which is what makes the undo exact — the daemon itself cannot reverse a
-dismissal, because dismissing an action a job is parked on cancels that job
-and a cancelled job cannot be retried. The bar says which of the two happened:
-a cancelled acquisition, or a leftover row closed without touching live work.
-Refreshing, or leaving the page, commits whatever is still waiting.
+Dismissing an inbox item removes it immediately and delays the daemon call for a
+few seconds behind an **Undo** bar (keyboard `u`). Dismissing several rows uses
+one undo window. The daemon receives the dismissal when that window closes. It
+cannot undo the dismissal: dismissing an action that parks a job cancels the job,
+and a cancelled job cannot be retried. The bar identifies whether the dismissal
+cancelled an acquisition or closed a leftover row. Refreshing or leaving the page
+commits any pending dismissals.
 
 ## Browser configuration
 
@@ -158,13 +170,27 @@ identity.
 
 ## Permissions and data boundary
 
-The extension requests only these regular permissions:
+The extension requests these regular permissions: `nativeMessaging`, `activeTab`,
+`tabs`, `downloads`, `scripting`, and `storage` for the connector link, tab
+tracking, and download adoption described above; `alarms` for the one-minute
+keepalive wake cycle that refreshes the pending-job count and connection state
+without a *papio* tab open; and `tabGroups` for the "papio" tab group the
+extension uses to gather handoff tabs when tab-group mode is active.
 
-`nativeMessaging`, `activeTab`, `tabs`, `downloads`, `scripting`, and `storage`.
-
-Provider domains are declared in `optional_host_permissions` and are granted
-per source through the extension UI. *papio* does not request `<all_urls>`,
-`cookies`, or `debugger`; it does not request access to identity-provider hosts.
+Host access splits into two tiers. Three host permissions are required and
+granted at install on Chrome: `https://*.alma.exlibrisgroup.com/*` and
+`https://*.primo.exlibrisgroup.com/*`, used to classify Ex Libris
+library-resolver pages, and `https://login.openathens.net/*`, used only to
+recognize OpenAthens's own stale-session error page and restore the work
+window (see above). Every provider domain is declared in
+`optional_host_permissions` instead, and is granted per source through the
+extension UI on a user gesture, revocable at any time. That optional tier also
+includes one broad entry, `https://*/*`, offered in the options page as a single
+**All sites** toggle for people who would rather not approve each provider
+individually; like every optional grant it is never requested at install and can
+be revoked at any time. *papio* does not request `<all_urls>`, `cookies`, or
+`debugger`, and it requests no host permission for Example University's or any
+other institution's own login domain.
 Selecting delegated mode does not grant a browser permission.
 
 The link to the browser carries metadata only, within *papio*'s fixed message-size limit.
