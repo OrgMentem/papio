@@ -303,7 +303,16 @@ Recorded as deliberate, not deferred by omission:
   cards, forbidden from navigating or paginating) may extract title-only
   candidates, but those need daemon identity resolution and are not this
   ADR's v1 (r3 §D, r4 §D);
-- title-only submissions — v1 only ever submits validated identifiers;
+- title-only submissions — v1 only ever submits validated identifiers.
+  (Amended 2026-08-07, r5: the exclusion is evidence-based, not a permanent
+  policy split with the CLI. `acquire --batch` rightly submits title-only
+  entries because structured citation fields deliberately supplied as
+  acquisition input are identity evidence; v1's detector produces only a
+  bounded display label, which must never be relabeled as a title into
+  enrichment. A detector class 2 emitting exact visible title + author
+  evidence + year + detector identity + source-record binding submits
+  through the same batch path under the same enrichment/validation gates —
+  no new caution policy.);
 - an availability preflight. A later selected-only **"Check routes for *N*
   selected"** action is coherent product shape, but not v1: it would report
   `Open copy found`, `Institution route configured`, or `No route yet` and
