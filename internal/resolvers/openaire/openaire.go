@@ -20,6 +20,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -171,8 +172,14 @@ func (r *Resolver) Resolve(ctx context.Context, requested work.Work) ([]resolver
 			break
 		}
 		license := strings.ToLower(strings.TrimSpace(instance.License))
-		openInstance := license != "" ||
-			strings.EqualFold(strings.TrimSpace(instance.AccessRight.Label), "OPEN")
+		// An instance is an acquisition route only when the provider marked
+		// it OPEN or its license is genuinely open. A bare license string is
+		// NOT enough: OpenAIRE dedup records carry restricted contractual
+		// licenses ("Springer TDM") on paywalled publisher instances, and
+		// admitting those as open_access would rank a paywall above honest
+		// unknown-license OA candidates.
+		openInstance := strings.EqualFold(strings.TrimSpace(instance.AccessRight.Label), "OPEN") ||
+			isOpenLicense(license)
 		if !openInstance {
 			continue
 		}
@@ -184,17 +191,23 @@ func (r *Resolver) Resolve(ctx context.Context, requested work.Work) ([]resolver
 		if license == "" {
 			license = "unknown"
 		}
+		// OpenAIRE marks no URL as the file itself, so candidates default to
+		// landing observations — except an unambiguous file path, which the
+		// landing-expansion step could never read (it parses HTML only).
+		direct := isObviousPDFURL(instanceURL)
+		mime := ""
+		if direct {
+			mime = "application/pdf"
+		}
 		candidate := resolver.Candidate{
-			Source:       "openaire",
-			URL:          instanceURL,
-			Landing:      instanceURL,
-			Version:      resolver.VersionUnknown,
-			AccessBasis:  resolver.AccessOpen,
-			ReuseLicense: license,
-			// No instance marks its URL as the file itself, so every
-			// candidate is a landing observation: the landing-expansion
-			// step derives the PDF when the page advertises one.
-			Direct:             false,
+			Source:             "openaire",
+			URL:                instanceURL,
+			Landing:            instanceURL,
+			Version:            resolver.VersionUnknown,
+			AccessBasis:        resolver.AccessOpen,
+			ReuseLicense:       license,
+			ExpectedMIME:       mime,
+			Direct:             direct,
 			IdentityConfidence: 1,
 			ResolvedWork:       resolved,
 			Evidence: []string{
@@ -279,29 +292,56 @@ type instance struct {
 }
 
 // conflictsWithRequest reports whether the record's identifiers name a
-// different work. Only a definite mismatch counts: absent values on either
-// side are not conflicts.
+// different work. OpenAIRE deduplicates aggressively, so one record carries
+// every DOI the work is registered under (publisher, repository, preprint)
+// in an order unrelated to which one was queried — a conflict therefore
+// exists only when the record lists identifiers of the requested scheme and
+// NONE of them match. Absent values on either side are never conflicts.
 func conflictsWithRequest(rec record, requested work.Work) bool {
-	var recDOI, recPMID string
+	var recDOIs, recPMIDs []string
 	for _, pid := range rec.PIDs {
 		switch strings.ToLower(strings.TrimSpace(pid.Scheme)) {
 		case "doi":
-			if v, err := work.NormalizeDOI(pid.Value); err == nil && recDOI == "" {
-				recDOI = v
+			if v, err := work.NormalizeDOI(pid.Value); err == nil {
+				recDOIs = append(recDOIs, v)
 			}
 		case "pmid":
-			if v, err := work.NormalizePMID(pid.Value); err == nil && recPMID == "" {
-				recPMID = v
+			if v, err := work.NormalizePMID(pid.Value); err == nil {
+				recPMIDs = append(recPMIDs, v)
 			}
 		}
 	}
-	if reqDOI, err := work.NormalizeDOI(requested.DOI); err == nil && recDOI != "" && recDOI != reqDOI {
+	if reqDOI, err := work.NormalizeDOI(requested.DOI); err == nil &&
+		len(recDOIs) > 0 && !slices.Contains(recDOIs, reqDOI) {
 		return true
 	}
-	if reqPMID, err := work.NormalizePMID(requested.PMID); err == nil && recPMID != "" && recPMID != reqPMID {
+	if reqPMID, err := work.NormalizePMID(requested.PMID); err == nil &&
+		len(recPMIDs) > 0 && !slices.Contains(recPMIDs, reqPMID) {
 		return true
 	}
 	return false
+}
+
+// isOpenLicense reports whether a lowercased license string names a
+// genuinely open reuse license: the Creative Commons family and public
+// domain marks. Everything else — including contractual strings like
+// "springer tdm" — is not evidence of open access.
+func isOpenLicense(license string) bool {
+	if license == "" {
+		return false
+	}
+	return strings.HasPrefix(license, "cc") || strings.Contains(license, "public domain")
+}
+
+// isObviousPDFURL reports whether the URL path itself names a PDF file —
+// the only case papio may skip the landing-expansion step for an OpenAIRE
+// instance, because that step parses HTML and can never read a file.
+func isObviousPDFURL(value string) bool {
+	parsed, err := url.Parse(value)
+	if err != nil {
+		return false
+	}
+	return strings.HasSuffix(strings.ToLower(parsed.Path), ".pdf")
 }
 
 func resolvedWork(rec record) work.Work {

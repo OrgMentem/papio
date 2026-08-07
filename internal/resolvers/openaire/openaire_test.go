@@ -214,3 +214,93 @@ func TestResolveRejectsOversizedResponses(t *testing.T) {
 		t.Fatalf("an oversized body is malformed, not retryable: %v", err)
 	}
 }
+
+func TestResolveByPMIDUsesThePIDFilter(t *testing.T) {
+	var gotPID string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPID = r.URL.Query().Get("pid")
+		_, _ = w.Write([]byte(`{"results": [{"bestAccessRight": {"label": "OPEN"},
+			"pids": [{"scheme": "pmid", "value": "35051190"}],
+			"instances": [{"license": "CC BY", "urls": ["https://example.org/p"]}]}]}`))
+	}))
+	defer server.Close()
+
+	cands, err := NewWithOptions(Options{Client: http.DefaultClient, BaseURL: server.URL}).
+		Resolve(context.Background(), work.Work{PMID: "35051190"})
+	if err != nil || len(cands) != 1 {
+		t.Fatalf("Resolve = (%v, %v)", cands, err)
+	}
+	if gotPID != "35051190" {
+		t.Fatalf("pid query = %q", gotPID)
+	}
+}
+
+func TestResolveRejectsRestrictedLicensesAsOpenAccess(t *testing.T) {
+	// Live-observed shape: a dedup'd OPEN record carrying the publisher's
+	// paywalled instance under a contractual "Springer TDM" license beside
+	// a genuinely open repository copy. Only the open copy may survive.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"results": [{"bestAccessRight": {"label": "OPEN"},
+			"pids": [{"scheme": "doi", "value": "10.1038/s41586-020-2649-2"}],
+			"instances": [
+				{"license": "Springer TDM", "urls": ["https://doi.org/10.1038/nature12373"]},
+				{"license": "CC BY", "urls": ["https://repository.example.edu/handle/1/1234"]}
+			]}]}`))
+	}))
+	defer server.Close()
+
+	cands, err := NewWithOptions(Options{Client: http.DefaultClient, BaseURL: server.URL}).
+		Resolve(context.Background(), work.Work{DOI: "10.1038/s41586-020-2649-2"})
+	if err != nil || len(cands) != 1 {
+		t.Fatalf("Resolve = (%v, %v), want exactly the repository copy", cands, err)
+	}
+	if cands[0].URL != "https://repository.example.edu/handle/1/1234" {
+		t.Fatalf("candidate URL = %q: a contractual TDM license is not open access", cands[0].URL)
+	}
+}
+
+func TestResolveAcceptsDedupRecordsMatchedByANonFirstDOI(t *testing.T) {
+	// Live-observed shape: OpenAIRE returns the same dedup'd record for any
+	// of its five DOIs, in a fixed order unrelated to the query. A request
+	// by the repository DOI must not be rejected because the publisher DOI
+	// happens to sit first.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"results": [{"bestAccessRight": {"label": "OPEN"},
+			"pids": [
+				{"scheme": "doi", "value": "10.1038/s41586-020-2649-2"},
+				{"scheme": "doi", "value": "10.17863/cam.62701"}
+			],
+			"instances": [{"license": "CC BY", "urls": ["https://repository.example.edu/p"]}]}]}`))
+	}))
+	defer server.Close()
+
+	cands, err := NewWithOptions(Options{Client: http.DefaultClient, BaseURL: server.URL}).
+		Resolve(context.Background(), work.Work{DOI: "10.17863/cam.62701"})
+	if err != nil || len(cands) != 1 {
+		t.Fatalf("Resolve = (%v, %v), want the record accepted via its non-first DOI", cands, err)
+	}
+}
+
+func TestResolveMarksObviousPDFPathsDirect(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"results": [{"bestAccessRight": {"label": "OPEN"},
+			"pids": [{"scheme": "doi", "value": "10.1371/journal.pone.0262026"}],
+			"instances": [
+				{"license": "CC BY", "urls": ["https://repository.example.edu/download/paper.PDF"]},
+				{"license": "CC BY", "urls": ["https://repository.example.edu/record/1234"]}
+			]}]}`))
+	}))
+	defer server.Close()
+
+	cands, err := NewWithOptions(Options{Client: http.DefaultClient, BaseURL: server.URL}).
+		Resolve(context.Background(), work.Work{DOI: "10.1371/journal.pone.0262026"})
+	if err != nil || len(cands) != 2 {
+		t.Fatalf("Resolve = (%v, %v)", cands, err)
+	}
+	if !cands[0].Direct || cands[0].ExpectedMIME != "application/pdf" {
+		t.Fatalf("file-path candidate = %+v, want Direct with a PDF MIME: landing expansion parses HTML and can never read a file", cands[0])
+	}
+	if cands[1].Direct {
+		t.Fatalf("record-page candidate = %+v, want a landing observation", cands[1])
+	}
+}
