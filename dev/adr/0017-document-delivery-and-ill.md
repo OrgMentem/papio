@@ -1,8 +1,10 @@
 # ADR-0017: Document delivery and ILL become a durable, configured route
 
 Status: Proposed (2026-08-07). Drafted from the integration consult
-(dev/scratch/oracle/papio-integrations-r1.md, -r2.md); not yet reviewed against
-code.
+(dev/scratch/oracle/papio-integrations-r1.md, -r2.md); amended the same day
+from consult rounds r3/r4 and independent deployment research (ILLiad/OCLC/
+Rapido vendor documentation, AU s49 practice) before acceptance. Not yet
+implemented.
 
 Extends ADR-0009 (ratified IPC contract, additive method evolution) and
 ADR-0013 (operator experience taxonomy: Activity, Actions, status). Consumes
@@ -106,11 +108,16 @@ and the same boundary this consult states LibKey's API key must respect.
 
 ```toml
 [browser.resolvers.campus.document_delivery]
-kind = "openurl"        # openurl | libkey | illiad | oclc | rapido | custom
+kind = "openurl"        # openurl | libkey | illiad | custom
 base_url = "https://ill.example.edu/request"
 allowed_hosts = ["ill.example.edu"]
 submit_policy = "auto_if_unconditional"   # never | prefill_only | auto_if_unconditional
-max_fee_usd = 0
+
+# gate-profile declarations (Decision 3A) — facts papio cannot discover:
+request_classes = ["digital_journal_article"]
+legal_basis = "institution_policy"   # institution_policy | copyright_act_s49 | unknown
+patron_attestation = "not_required"  # not_required | standing_completed | per_request | unknown
+patron_fee_policy = "zero_standard"  # zero_standard | per_request | unknown
 monthly_request_cap = 25
 status_poll_minutes = 60
 
@@ -118,6 +125,18 @@ status_poll_minutes = 60
 api_key = "..."
 patron_ref = "configured-non-secret-reference"
 ```
+
+Strict config accepts a `kind` only when its adapter has shipped: v1 accepts
+`openurl`, `libkey`, `illiad`, and `custom`. `oclc` and `rapido` are intended
+providers this ADR names, but a value whose implementation does not exist must
+not parse — the same fail-closed rule `validSourceNames` applies to sources.
+`patron_ref` is not a secret but it is personal identity data: 0600 config
+only, redacted from events, diagnostics, and delivery provenance.
+`standing_completed` counts only when the institution has confirmed that a
+registration-time agreement covers API-created requests of the configured
+class; papio never infers it from the existence of an account, a missing
+checkbox in one render, an API accepting a request, or the institution's
+country or hostname.
 
 `kind` is explicit configuration. **Papio never guesses which ILL system an
 institution runs** from branding, page text, or a landing page. No such
@@ -130,42 +149,135 @@ misconfigured document-delivery integration falls back to the profile's
 OpenURL route rather than disabling institutional access; it never falls back
 to a *different* institution's profile.
 
-## Decision 3: submission is `never | prefill_only | auto_if_unconditional`, gated by a nine-condition checklist; configuration is the consent
+## Decision 3: submission policy compiles to a static gate profile, evaluated by a seven-point per-request gate; configuration is the consent
 
-Auto-submission may fire only when **all** of the following hold:
+The consult's original nine-condition checklist read as nine dice rolls per
+paper. The deployment evidence (r3/r4 Topic 2, plus vendor documentation)
+shows the conditions are three different kinds of fact — static deployment
+facts, per-request facts, and bookkeeping — and that one "condition" was a
+state-machine bug. Decision 3 therefore restructures into a compiled profile
+(3A), a runtime gate (3B), and the surfaces that report them (3C).
 
-1. the job's **effective access mode is `delegated`** — the profile's
-   `submit_policy` narrows what the global `access_mode` already permits, it
-   never widens it (the same only-narrowing rule `NarrowAccessMode` in
-   `internal/config/config.go` enforces for per-request overrides). Under
-   `conservative` the route is discovered and recorded, never opened or
-   submitted; under `assisted` the prefilled form opens but submission stays
-   human (r1 §3.3's access-mode table, restated here so the checklist cannot
-   be read as profile-only consent);
-2. the institution profile's `submit_policy` enables it;
-3. the provider integration has a deterministic, tested contract (fixture- or
-   API-conformance-tested, not a scraped form);
-4. the bibliographic identity is sufficient for the provider to accept;
-5. zero human-only steps remain — no login, MFA, CAPTCHA, terms acceptance,
-   copyright declaration, or purpose statement;
-6. the fee is known and does not exceed `max_fee_usd`;
-7. `monthly_request_cap` is not exhausted;
-8. the request has not already been submitted (Decision 1's idempotency key);
-9. Papio can reconcile an ambiguous response before attempting another
-   submission (Decision 4).
+### Decision 3A: `internal/delivery` compiles an institution gate profile at configuration time
 
-**Any one condition being false *or unknown* routes to `prefill_only`
-behaviour instead** — Papio opens the prefilled form and stops. An unknown fee,
-an unknown identity match, or an unresolvable declaration is not treated as
-permission; it is treated as the missing information it is.
+The stable classification unit is **institution profile × provider ×
+patron class × request class × legal basis** — not the institution alone. Two
+Alma-family universities can legitimately land on opposite sides, and one
+institution can be auto-capable for staff articles while prefill-only for
+student chapters. The compiled profile is:
+
+`auto_capable | prefill_only | invalid`, with a closed blocker vocabulary
+(`provider_not_implemented`, `provider_not_auto_capable`,
+`api_credential_missing`, `patron_mapping_unverified`,
+`request_class_unsupported`, `per_request_login`, `per_request_terms`,
+`per_request_copyright_declaration`, `per_request_purpose_statement`,
+`patron_fee_not_zero`, `patron_fee_unknown`, `reconciliation_unavailable`,
+`institution_policy_unknown`) and recorded evidence per blocker.
+
+Static inputs: the provider adapter's declared capabilities (supported
+request classes, required bibliographic fields, create/status/patron-list
+capability, idempotency and reconciliation strategy) and the operator's
+Decision 2 declarations (`legal_basis`, `patron_attestation`,
+`patron_fee_policy`). Three hard rules:
+
+- **V1 auto-submission covers digital journal articles only**, at
+  **zero configured patron fee only** (`patron_fee_policy =
+  "zero_standard"`). Books, chapters, theses, physical loans, rush service,
+  and any nonzero or provider-quoted fee are prefill-only until separately
+  modelled — `max_fee_usd` is no longer an auto-authority field, because it
+  conflates a patron charge with the borrowing library's lender-cost
+  commitment (OCLC's `Maximum Cost` is the library's money, never papio's to
+  spend).
+- **Only source-controlled API integrations can compile `auto_capable`** —
+  v1: `illiad`, whose Web Platform API documents create, transaction lookup,
+  patron mapping, and patron-request listing. `openurl`, `libkey`, and
+  `custom` routes are permanently prefill-only: they route to a form and
+  supply no deterministic submission-and-reconciliation contract. Rapido
+  starts prefill-only; a specific profile may compile auto-capable only after
+  live verification that no declaration is configured and the API accepts
+  the standard digital-article request without papio asserting agreement —
+  papio never sets a copyright-agreement field merely to satisfy a mandatory
+  parameter, and never sends provider compliance flags (e.g. ILLiad's
+  `CopyrightAlreadyPaid`) outside the institution-approved mapping.
+- **An `auto_capable` compile additionally requires recorded live
+  acceptance**: one supervised submit-and-reconcile against the real
+  deployment under the institution's authority. A compiled adapter plus
+  matching config is necessary but not sufficient.
+
+Under `legal_basis = "copyright_act_s49"` (Australian document supply), the
+patron's declaration is an affirmative, request-scoped statutory act — it
+includes "not previously supplied", which no standing declaration can
+truthfully cover. Such profiles compile `prefill_only` by law, not by
+caution: the product there is **automatic prefill followed by one human
+declaration**, and papio must never tick, script, or represent the
+declaration itself. An AU-jurisdiction profile defaults
+`patron_attestation = "unknown"` → prefill-only until the institution
+confirms otherwise; the legal basis is configured, never inferred from a
+hostname.
+
+### Decision 3B: only an `auto_capable` profile reaches the per-request gate
+
+All seven must hold:
+
+1. the job's **effective access mode is `delegated`** — `submit_policy`
+   narrows what the global `access_mode` permits, never widens it (the
+   `NarrowAccessMode` only-narrowing rule in `internal/config/config.go`).
+   Under `conservative` the route is discovered and recorded, never opened
+   or submitted; under `assisted` the prefilled form opens but submission
+   stays human;
+2. the profile's `submit_policy` is `auto_if_unconditional`;
+3. the request class is supported and configured;
+4. **every provider-required field is present and consistent after papio's
+   normal metadata enrichment** — a DOI or PMID makes enrichment likely but
+   is not universally sufficient (providers require mapped users, process
+   types, citation fields); no conflicting identity remains;
+5. **no step is required from the papio operator before creating the
+   request** — no login, MFA, terms, declaration, purpose statement, or
+   payment. Library-side mediation *after* submission (staff or rule-engine
+   copyright processing of a lodged request) does not fail this condition;
+6. the zero-patron-fee policy applies to this request;
+7. the monthly auto-submit cap has headroom.
+
+Then: all true → submit; a human step or fee issue → prefill; metadata
+incomplete → enrich, then prefill if still incomplete.
+
+**The former condition 8 ("not already submitted") was a state-machine bug,
+not a gate.** Falling back to prefill on an existing request is precisely how
+a duplicate gets created. It is an idempotency **branch evaluated before the
+gate**: no existing row → evaluate the gate; `submitted`/`pending` → join and
+poll; `fulfilled` → fetch, adopt, validate; `unknown_outcome` → reconcile
+(Decision 4); `declined`/`cancelled` → apply the explicit resubmission
+policy. The former condition 9 (reconciliation capability) is a Decision 3A
+compile input — a provider without it can never compile `auto_capable` — plus
+runtime API health, not a per-paper re-evaluation.
+
+**Any gate condition false *or unknown* routes to `prefill_only` behaviour** —
+papio opens the prefilled form and stops. Unknown is missing information,
+never permission. Every gate decision persists a redaction-safe event
+(`delivery.gate_evaluated`: profile class, profile digest, decision,
+blockers) so `papio delivery get` and `jobs get_v3` can explain why a
+nominally auto-capable profile did or did not submit.
 
 Configuration is the consent, matching every other automation boundary papio
-already ships: access mode (`conservative`/`assisted`/`delegated`) and source
-enablement are declarations, not per-action prompts, and ADR-0012 draws the
-same line for `max_cost_usd` — an operator ceiling authorizes spend, it does
-not manufacture certainty. There is no per-work "are you sure?" for a
-submission that the profile's `submit_policy`, `max_fee_usd`, and
-`monthly_request_cap` already authorized unconditionally at zero fee.
+ships: access mode and source enablement are declarations, not per-action
+prompts, and ADR-0012 draws the same line for `max_cost_usd`. There is no
+per-work "are you sure?" for a submission the compiled profile and gate
+already authorized unconditionally at zero fee.
+
+### Decision 3C: init and doctor state the compiled answer plainly
+
+`papio init` prints the compiled gate class before saving — `AUTO-CAPABLE`
+with its evidence lines, or `PREFILL ONLY` with the specific blocker ("your
+institution requires a copyright declaration on every digital-copy request").
+An operator must never enable `auto_if_unconditional` in good faith and wait
+for a path that cannot fire. `papio doctor` verifies what is verifiable
+(API authentication, patron mapping, transaction and patron-request lookup,
+adapter conformance version) and **distinguishes `PASS`/`OBSERVED` facts from
+`DECLARED` configuration** — it never prints `PASS` for a policy it merely
+read from config, never records `live-accepted` without the Decision 3A
+acceptance event, and never creates a probe request. User documentation must
+not claim automatic document delivery until one real institution profile has
+completed one live request with zero operator steps.
 
 ## Decision 4: pending stays job-in-flight state; only exhausted reconciliation opens a human action, and that action never offers resubmission
 
@@ -259,6 +371,16 @@ not start from the consult's stale assumption.
 
 ## Rejected alternatives
 
+**Scripted submission of the patron web form (browser-form auto-submit).** No
+vendor offers a patron-delegated submission API — every documented surface
+(ILLiad Web Platform, Alma/Rapido REST, OCLC Resource Sharing Request) is an
+institution-key integration, and vendor terms prohibit bot-driven form
+submission. Driving the SSO'd Primo/ILLiad web form programmatically would be
+non-deterministic (no submission-and-reconciliation contract), against the
+vendors' terms, and — where the form carries a statutory declaration — would
+launder a per-request human act into an automated one. Papio prefills and
+opens forms; it never scripts their submission.
+
 **Auto-opening every `manual_download` action to drive delivery.** This is
 autonomous drain built from the wrong primitive: a background process ranking
 and opening a human-mediated action queue on its own is exactly what ADR-0009
@@ -287,10 +409,13 @@ explicitly: only a validated PDF advances a job past `awaiting_human`/
 - A new table, a new service package, and a new human-action kind the store,
   doctor, and CLI conformance tests must all learn about — the same shape of
   cost ADR-0014 accepted for attribution and validation evidence.
-- Every institution that wants auto-submission must supply a provider-tested
-  integration and explicit `submit_policy`/`max_fee_usd`/`monthly_request_cap`
-  configuration; without it, papio still improves on today by prefilling a
-  form instead of terminating the job `unavailable`.
+- Every institution that wants auto-submission must supply a source-controlled
+  provider integration with recorded live acceptance plus the Decision 2
+  declarations (`submit_policy`, `legal_basis`, `patron_attestation`,
+  `patron_fee_policy`, `monthly_request_cap`); without them, papio still
+  improves on today by prefilling a form instead of terminating the job
+  `unavailable` — and under AU s49 that prefill-plus-one-declaration flow *is*
+  the ceiling, by statute rather than caution.
 - `document_delivery_available` (terminal reason) and the collapsed
   `no_entitlement`/`document_delivery_available` bridge handling
   (`internal/browser/bridge.go:2053`) are superseded for the case where a
