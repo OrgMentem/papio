@@ -360,3 +360,27 @@ test("a dt without a dd sibling keeps its own text as the label", () => {
   );
   expect(result.papers[0]!.label).toContain("Prass et al 2026");
 });
+
+test("DOI-shaped path segments match without a /doi/ prefix (Scholar publisher links)", () => {
+  for (const [href, doi] of [
+    ["https://link.springer.com/article/10.1007/s10734-012-9554-z", "10.1007/s10734-012-9554-z"],
+    ["https://link.springer.com/chapter/10.1007/978-3-031-42902-6_6", "10.1007/978-3-031-42902-6_6"],
+    ["https://digital-library.example.org/content/10.1049/ip-cta:20020087", "10.1049/ip-cta:20020087"],
+    ["https://journals.example.edu/download/10.5840/monist198669318.pdf", "10.5840/monist198669318"],
+  ] as const) {
+    const result = scanDocument(doc(`<li><a href="${href}">Paper</a></li>`));
+    expect(result.papers.length).toBe(1);
+    expect(result.papers[0]!.identifier).toEqual({ kind: "doi", value: doi });
+  }
+});
+
+test("non-DOI numeric paths never match the generic segment rule", () => {
+  for (const href of [
+    "https://www.jstor.org/stable/10.2307",
+    "https://example.org/posts/10.5",
+    "https://example.org/v/10/12345",
+  ]) {
+    const result = scanDocument(doc(`<li><a href="${href}">Not a paper</a></li>`));
+    expect(result.papers.length).toBe(0);
+  }
+});

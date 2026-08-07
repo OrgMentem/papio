@@ -94,6 +94,18 @@ export function scanDocument(root: Document | Element = document): ScanResult {
       const doi = trimTrailingPunct(decodeSafe(doiPath[1]));
       if (STRICT_DOI_RE.test(doi)) return { kind: "doi", value: doi };
     }
+    // Generic fallback: a DOI-shaped run starting at any path segment —
+    // Springer's /article/10.1007/…, /chapter/10.1007/…, IET's
+    // /content/10.1049/… — with a trailing .pdf trimmed. Scholar results
+    // link straight to publisher pages, so every shape matched here is a
+    // paper the sheet would otherwise silently omit. STRICT_DOI_RE still
+    // gates, and a rare non-DOI lookalike fails closed daemon-side at the
+    // DOI-registration check rather than acquiring anything wrong.
+    const doiSegment = /\/(10\.\d{4,}\/[^?#]+?)(?:\.pdf)?\/?$/i.exec(path);
+    if (doiSegment?.[1]) {
+      const doi = trimTrailingPunct(decodeSafe(doiSegment[1]));
+      if (STRICT_DOI_RE.test(doi)) return { kind: "doi", value: doi };
+    }
     if (host === "arxiv.org" || host.endsWith(".arxiv.org")) {
       const m = /^\/(?:abs|pdf)\/(.+?)(?:\.pdf)?\/?$/i.exec(path);
       if (m?.[1]) return { kind: "arxiv", value: trimTrailingPunct(decodeSafe(m[1])) };
