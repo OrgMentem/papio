@@ -530,6 +530,78 @@ func TestJobsListFallsBackToOlderDaemonMethods(t *testing.T) {
 	}
 }
 
+// jobs.get_v3 is `jobs get`'s ADR-0017 Decision 5 addition: a delivery
+// section on top of jobs.get_v2's attribution. An older daemon that predates
+// it answers unknown_method, and the CLI must fall back to jobs.get_v2 rather
+// than fail — the fallback simply renders no delivery section, which is the
+// truth: a daemon without the table recorded nothing.
+func TestJobsGetFallsBackToOlderDaemonMethodWhenV3Unknown(t *testing.T) {
+	detail := api.JobDetailV2{
+		Job: &api.JobRow{Row: job.Row{ID: "job_fallback", State: job.StateReady, Work: work.Work{Title: "Fallback title"}}},
+	}
+	var out, errOut bytes.Buffer
+	var sawV3, sawV2 bool
+	root := NewInProcessRoot(&out, &errOut, config.Config{}, func(_ context.Context, method string, _ any, result any) error {
+		switch method {
+		case "jobs.get_v3":
+			sawV3 = true
+			return &ipc.RemoteError{Code: "unknown_method", Message: "unknown method"}
+		case "jobs.get_v2":
+			sawV2 = true
+			*result.(*api.JobDetailV2) = detail
+			return nil
+		}
+		t.Fatalf("unexpected method %q", method)
+		return nil
+	})
+	root.SetArgs([]string{"jobs", "get", "job_fallback"})
+	if err := root.ExecuteContext(context.Background()); err != nil {
+		t.Fatalf("jobs get: %v (%s)", err, errOut.String())
+	}
+	if !sawV3 || !sawV2 {
+		t.Fatalf("v3 attempted = %t, v2 fallback used = %t; want both", sawV3, sawV2)
+	}
+	want := "job_fallback\tready\ttitle:Fallback title\n"
+	if out.String() != want {
+		t.Fatalf("stdout = %q, want %q — the v2 fallback must render with no delivery section", out.String(), want)
+	}
+}
+
+// jobs.get_v3's delivery section renders as labeled human-output lines when
+// present (ADR-0017 Decision 5), and is entirely absent from the fallback
+// case above.
+func TestJobsGetRendersDeliverySection(t *testing.T) {
+	detail := api.JobDetailV3{
+		Job: &api.JobRow{Row: job.Row{ID: "job_delivery", State: job.StateRetryWait, Work: work.Work{Title: "Delivery title"}}},
+		Delivery: &api.DeliverySummary{
+			Provider: "illiad", Reference: "REF-9", State: "submitted",
+			NextCheckAt: "2026-08-08T00:00:00Z", GateClass: "prefill_only",
+			GateBlockers: []string{"api_credential_missing"},
+		},
+	}
+	var out, errOut bytes.Buffer
+	root := NewInProcessRoot(&out, &errOut, config.Config{}, func(_ context.Context, method string, _ any, result any) error {
+		if method != "jobs.get_v3" {
+			t.Fatalf("method = %q, want jobs.get_v3", method)
+		}
+		*result.(*api.JobDetailV3) = detail
+		return nil
+	})
+	root.SetArgs([]string{"jobs", "get", "job_delivery"})
+	if err := root.ExecuteContext(context.Background()); err != nil {
+		t.Fatalf("jobs get: %v (%s)", err, errOut.String())
+	}
+	want := "job_delivery\tretry_wait\ttitle:Delivery title\n" +
+		"  delivery provider: illiad\n" +
+		"  delivery reference: REF-9\n" +
+		"  delivery state: submitted\n" +
+		"  delivery next check: 2026-08-08T00:00:00Z\n" +
+		"  delivery gate: prefill_only (blocked by: api_credential_missing)\n"
+	if out.String() != want {
+		t.Fatalf("stdout = %q, want %q", out.String(), want)
+	}
+}
+
 // row.Work.Describe() falls back to a raw Title when no strong identifier
 // narrows it further, and that Title is third-party bibliographic metadata
 // normalized with only strings.TrimSpace by internal/discovery (see the

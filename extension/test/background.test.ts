@@ -3680,6 +3680,245 @@ test("papio.stats rejects foreign senders and malformed requests without touchin
   expect(statsCalls).toBe(0);
 });
 
+// --- papio.pageBulk.* sender validation, malformed-request rejection, and
+// happy dispatch (ADR-0019 Decision 4/7) — mirrors the papio.stats pattern
+// above for the seven message types isPageBulkSender/isPopupSender gate. ---
+
+const pageBulkTestURLs = {
+  runtimeID: "papio-test-id",
+  inboxURL: "chrome-extension://papio-test-id/inbox.html",
+  popupURL: "chrome-extension://papio-test-id/popup.html",
+  historyURL: "chrome-extension://papio-test-id/history.html",
+  pageBulkURL: "chrome-extension://papio-test-id/page-bulk.html",
+};
+
+const pageBulkRequestFixtures: {
+  type: string;
+  request: Record<string, unknown>;
+  unauthorizedMessage: string;
+  invalidMessage: string;
+  /** isPopupSender-gated (papio.pageBulk.scan) vs isPageBulkSender-gated
+   * (every other pageBulk type). */
+  gate: "popup" | "pageBulk";
+}[] = [
+  {
+    type: "papio.pageBulk.load",
+    request: { scan_id: "scan-1" },
+    unauthorizedMessage: "This sender cannot load a page-bulk scan",
+    invalidMessage: "Invalid page-bulk load request",
+    gate: "pageBulk",
+  },
+  {
+    type: "papio.pageBulk.scan",
+    request: { tab_id: 5 },
+    unauthorizedMessage: "This sender cannot start a page scan",
+    invalidMessage: "Invalid page scan request",
+    gate: "popup",
+  },
+  {
+    type: "papio.pageBulk.rescan",
+    request: { scan_id: "scan-1" },
+    unauthorizedMessage: "This sender cannot rescan a page",
+    invalidMessage: "Invalid rescan request",
+    gate: "pageBulk",
+  },
+  {
+    type: "papio.pageBulk.status",
+    request: { scan_id: "scan-1", identifiers: [{ local_id: "id-1", kind: "doi", value: "10.1234/abcd.5678" }] },
+    unauthorizedMessage: "This sender cannot look up page-bulk status",
+    invalidMessage: "Invalid page-bulk status request",
+    gate: "pageBulk",
+  },
+  {
+    type: "papio.pageBulk.submit",
+    request: {
+      scan_id: "scan-1",
+      canonical_keys: ["work:1"],
+      source: { kind: "browser_page", origin: "https://scholar.example.edu", detector: "generic-identifiers/1" },
+    },
+    unauthorizedMessage: "This sender cannot submit a page-bulk batch",
+    invalidMessage: "Invalid page-bulk submit request",
+    gate: "pageBulk",
+  },
+  {
+    type: "papio.pageBulk.allowlist.get",
+    request: { origin: "https://scholar.example.edu" },
+    unauthorizedMessage: "This sender cannot read the scanner allowlist",
+    invalidMessage: "Invalid scanner allowlist request",
+    gate: "pageBulk",
+  },
+  {
+    type: "papio.pageBulk.allowlist.set",
+    request: { origin: "https://scholar.example.edu", allowed: true },
+    unauthorizedMessage: "This sender cannot change the scanner allowlist",
+    invalidMessage: "Invalid scanner allowlist request",
+    gate: "pageBulk",
+  },
+];
+
+function stubPageBulkBridge(h: Harness): { calls: number } {
+  const counter = { calls: 0 };
+  const unreached = { ok: false as const, error: { code: "unexpected", message: "the bridge must not be reached" } };
+  h.bridge.getPageBulkSnapshot = async () => {
+    counter.calls += 1;
+    return unreached;
+  };
+  h.bridge.startPageBulkScan = async () => {
+    counter.calls += 1;
+    return unreached;
+  };
+  h.bridge.requestPageBulkRescan = async () => {
+    counter.calls += 1;
+    return unreached;
+  };
+  h.bridge.requestPageBulkStatus = async () => {
+    counter.calls += 1;
+    return unreached;
+  };
+  h.bridge.requestPageBulkSubmit = async () => {
+    counter.calls += 1;
+    return unreached;
+  };
+  h.bridge.pageBulkAllowlistContains = async () => {
+    counter.calls += 1;
+    return unreached;
+  };
+  h.bridge.setPageBulkAllowlist = async () => {
+    counter.calls += 1;
+    return unreached;
+  };
+  return counter;
+}
+
+test("papio.pageBulk.* rejects a foreign extension id and a foreign origin across the whole family", async () => {
+  const h = makeHarness();
+  const urls = pageBulkTestURLs;
+  const counter = stubPageBulkBridge(h);
+
+  for (const { type, request, unauthorizedMessage, gate } of pageBulkRequestFixtures) {
+    const ownPageURL = gate === "popup" ? urls.popupURL : urls.pageBulkURL;
+    for (const sender of [
+      // Foreign extension id — same URL shape, different id.
+      { id: "other-extension", url: ownPageURL },
+      // Correct id, but a URL that is not papio's own gated page (a content
+      // script running on an arbitrary page, or — for pageBulk-gated types —
+      // the popup, which is not the workspace page).
+      { id: urls.runtimeID, url: "https://provider.example/article" },
+    ]) {
+      await expect(handleInboxRuntimeMessage(h.bridge, { type, request }, sender, urls)).resolves.toEqual({
+        ok: false,
+        error: { code: "unauthorized", message: unauthorizedMessage },
+      });
+    }
+  }
+  expect(counter.calls).toBe(0);
+});
+
+test("papio.pageBulk.* rejects a malformed request (extra key) via hasOnlyKeys without touching the bridge", async () => {
+  const h = makeHarness();
+  const urls = pageBulkTestURLs;
+  const counter = stubPageBulkBridge(h);
+
+  for (const { type, request, invalidMessage, gate } of pageBulkRequestFixtures) {
+    const sender = { id: urls.runtimeID, url: gate === "popup" ? urls.popupURL : urls.pageBulkURL };
+    await expect(
+      handleInboxRuntimeMessage(h.bridge, { type, request: { ...request, unexpected: true } }, sender, urls),
+    ).resolves.toEqual({ ok: false, error: { code: "invalid_request", message: invalidMessage } });
+  }
+  expect(counter.calls).toBe(0);
+});
+
+test("isPageBulkSender strips the ?scan=<id> query when matching the workspace page", async () => {
+  const h = makeHarness();
+  const urls = pageBulkTestURLs;
+  h.bridge.requestPageBulkStatus = async () => ({
+    ok: true,
+    items: [],
+    truncated: false,
+  });
+  const sender = { id: urls.runtimeID, url: `${urls.pageBulkURL}?scan=scan-42` };
+  await expect(
+    handleInboxRuntimeMessage(
+      h.bridge,
+      {
+        type: "papio.pageBulk.status",
+        request: { scan_id: "scan-42", identifiers: [{ local_id: "id-1", kind: "doi", value: "10.1234/abcd.5678" }] },
+      },
+      sender,
+      urls,
+    ),
+  ).resolves.toEqual({ ok: true, items: [], truncated: false });
+});
+
+test("papio.pageBulk.load happy dispatch forwards scan_id to the bridge and returns its snapshot", async () => {
+  const h = makeHarness();
+  const urls = pageBulkTestURLs;
+  const snapshot = {
+    scanId: "scan-1",
+    sourceTabId: 42,
+    sourceOrigin: "https://scholar.example.edu",
+    sourceTitle: "Reading list",
+    scannedAt: "2026-08-07T12:00:00.000Z",
+    documentGeneration: 1,
+    items: [],
+    truncated: false,
+  };
+  let loadedScanID: string | undefined;
+  h.bridge.getPageBulkSnapshot = async (scanID: string) => {
+    loadedScanID = scanID;
+    return { ok: true, snapshot };
+  };
+  const sender = { id: urls.runtimeID, url: urls.pageBulkURL };
+  await expect(
+    handleInboxRuntimeMessage(h.bridge, { type: "papio.pageBulk.load", request: { scan_id: "scan-1" } }, sender, urls),
+  ).resolves.toEqual({ ok: true, snapshot });
+  expect(loadedScanID).toBe("scan-1");
+});
+
+test("papio.pageBulk.status happy dispatch forwards the request to the bridge and returns its items", async () => {
+  const h = makeHarness();
+  const urls = pageBulkTestURLs;
+  let received: unknown;
+  h.bridge.requestPageBulkStatus = async (request) => {
+    received = request;
+    return {
+      ok: true,
+      items: [{ local_id: "id-1", canonical_key: "work:1", status: "eligible", ownership_complete: true }],
+      truncated: false,
+    };
+  };
+  const sender = { id: urls.runtimeID, url: urls.pageBulkURL };
+  const request = { scan_id: "scan-1", identifiers: [{ local_id: "id-1", kind: "doi", value: "10.1234/abcd.5678" }] };
+  await expect(
+    handleInboxRuntimeMessage(h.bridge, { type: "papio.pageBulk.status", request }, sender, urls),
+  ).resolves.toEqual({
+    ok: true,
+    items: [{ local_id: "id-1", canonical_key: "work:1", status: "eligible", ownership_complete: true }],
+    truncated: false,
+  });
+  expect(received).toEqual(request);
+});
+
+test("papio.pageBulk.submit happy dispatch forwards the request to the bridge and returns its result", async () => {
+  const h = makeHarness();
+  const urls = pageBulkTestURLs;
+  let received: unknown;
+  h.bridge.requestPageBulkSubmit = async (request) => {
+    received = request;
+    return { ok: true, submitted: 1, joined: 0, already_owned: 0, invalid: 0, batch_id: "batch_1" };
+  };
+  const sender = { id: urls.runtimeID, url: urls.pageBulkURL };
+  const request = {
+    scan_id: "scan-1",
+    canonical_keys: ["work:1"],
+    source: { kind: "browser_page", origin: "https://scholar.example.edu", detector: "generic-identifiers/1" },
+  };
+  await expect(
+    handleInboxRuntimeMessage(h.bridge, { type: "papio.pageBulk.submit", request }, sender, urls),
+  ).resolves.toEqual({ ok: true, submitted: 1, joined: 0, already_owned: 0, invalid: 0, batch_id: "batch_1" });
+  expect(received).toEqual(request);
+});
+
 test("open inbox runtime request focuses the singleton or creates it from the popup", async () => {
   const h = makeHarness(undefined, { windows: true });
   const urls = {

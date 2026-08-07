@@ -703,3 +703,99 @@ func TestInitConfiguresAndClearsLibKeyLinkRouting(t *testing.T) {
 		t.Fatalf("cleared libkey config = %q/%d, want empty/0", cfg.Browser.LibKeyMode, cfg.Browser.LibKeyLibraryID)
 	}
 }
+
+func TestInitPrintsAutoCapableShapedVerdictForCleanIlliadProfile(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	path := filepath.Join(home, ".config", "papio", "config.toml")
+	deps := initTestDependencies(t)
+	if out, err := runInitForTest(t, path, deps, "--non-interactive", "--email", "reader@example.test", "--skip-browser"); err != nil {
+		t.Fatalf("first init: %v\n%s", err, out)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Browser.OpenURLBase = "https://resolver.example.edu/openurl"
+	cfg.Browser.DocumentDelivery = &config.DocumentDelivery{
+		Kind:              "illiad",
+		SubmitPolicy:      "auto_if_unconditional",
+		RequestClasses:    []string{"digital_journal_article"},
+		LegalBasis:        "institution_policy",
+		PatronAttestation: "not_required",
+		PatronFeePolicy:   "zero_standard",
+		APIKey:            "issued-by-institution",
+		PatronRef:         "patron-ref-123",
+	}
+	if err := config.Save(cfg, path); err != nil {
+		t.Fatalf("save document delivery config: %v", err)
+	}
+
+	out, err := runInitForTest(t, path, deps, "--non-interactive", "--skip-browser")
+	if err != nil {
+		t.Fatalf("rerun init: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "AUTO-CAPABLE for digital_journal_article") {
+		t.Fatalf("init output missing AUTO-CAPABLE-shaped verdict:\n%s", out)
+	}
+	if !strings.Contains(out, "no recorded live acceptance") {
+		t.Fatalf("init output missing the no-live-acceptance wording:\n%s", out)
+	}
+	if strings.Contains(out, "PREFILL ONLY") {
+		t.Fatalf("a structurally clean illiad profile should not print PREFILL ONLY:\n%s", out)
+	}
+}
+
+func TestInitPrintsPrefillOnlyVerdictForCopyrightActS49Profile(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	path := filepath.Join(home, ".config", "papio", "config.toml")
+	deps := initTestDependencies(t)
+	if out, err := runInitForTest(t, path, deps, "--non-interactive", "--email", "reader@example.test", "--skip-browser"); err != nil {
+		t.Fatalf("first init: %v\n%s", err, out)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Browser.OpenURLBase = "https://resolver.example.edu/openurl"
+	cfg.Browser.DocumentDelivery = &config.DocumentDelivery{
+		Kind:              "illiad",
+		SubmitPolicy:      "auto_if_unconditional",
+		RequestClasses:    []string{"digital_journal_article"},
+		LegalBasis:        "copyright_act_s49",
+		PatronAttestation: "not_required",
+		PatronFeePolicy:   "zero_standard",
+		APIKey:            "issued-by-institution",
+		PatronRef:         "patron-ref-123",
+	}
+	if err := config.Save(cfg, path); err != nil {
+		t.Fatalf("save document delivery config: %v", err)
+	}
+
+	out, err := runInitForTest(t, path, deps, "--non-interactive", "--skip-browser")
+	if err != nil {
+		t.Fatalf("rerun init: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "PREFILL ONLY") {
+		t.Fatalf("init output missing PREFILL ONLY verdict:\n%s", out)
+	}
+	if !strings.Contains(out, "your institution requires a copyright declaration on every digital-copy request") {
+		t.Fatalf("init output missing the copyright_act_s49 blocker text:\n%s", out)
+	}
+}
+
+func TestInitPrintsNoDeliveryVerdictWithoutConfig(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	path := filepath.Join(home, ".config", "papio", "config.toml")
+	deps := initTestDependencies(t)
+
+	out, err := runInitForTest(t, path, deps, "--non-interactive", "--email", "reader@example.test", "--skip-browser")
+	if err != nil {
+		t.Fatalf("init: %v\n%s", err, out)
+	}
+	if strings.Contains(out, "AUTO-CAPABLE") || strings.Contains(out, "PREFILL ONLY") || strings.Contains(out, "Document delivery") {
+		t.Fatalf("init must print nothing when no profile has document_delivery configured:\n%s", out)
+	}
+}

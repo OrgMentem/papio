@@ -80,13 +80,13 @@ func TestJobsShowIsExactGetAlias(t *testing.T) {
 		var out, errOut bytes.Buffer
 		var gotParams map[string]string
 		root := NewInProcessRoot(&out, &errOut, config.Config{}, func(_ context.Context, method string, params any, result any) error {
-			// Both verbs go through jobDetail: jobs.get_v2 first, with the
-			// jobs.get fallback reserved for a daemon that predates it.
-			if method != "jobs.get_v2" {
-				t.Fatalf("%s RPC method = %q, want jobs.get_v2", verb, method)
+			// Both verbs go through jobDetailV3: jobs.get_v3 first, with the
+			// jobs.get_v2/jobs.get fallback chain reserved for an older daemon.
+			if method != "jobs.get_v3" {
+				t.Fatalf("%s RPC method = %q, want jobs.get_v3", verb, method)
 			}
 			gotParams = params.(map[string]string)
-			*result.(*api.JobDetailV2) = api.JobDetailV2{
+			*result.(*api.JobDetailV3) = api.JobDetailV3{
 				Job: &api.JobRow{Row: job.Row{ID: "job_alias", State: job.StateUnavailable}},
 			}
 			return nil

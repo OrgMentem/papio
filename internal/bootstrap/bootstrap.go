@@ -19,6 +19,7 @@ import (
 	"papio/internal/captures"
 	"papio/internal/config"
 	"papio/internal/daemon"
+	"papio/internal/delivery"
 	"papio/internal/discovery"
 	"papio/internal/doctor"
 	"papio/internal/doiregistry"
@@ -183,6 +184,12 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 
 	entries := resolverEntries(cfg, metadataClient)
 	service := app.New(cfg, jobs, artifacts, budgets)
+	// Decision 5 (ADR-0017): jobs.get_v3 and the CLI/doctor delivery surfaces
+	// read this straight off app.Service rather than via a second System
+	// field, since every RPC handler already reaches the app layer through
+	// system.App.
+	service.Delivery = delivery.New(db, &cfg, nil)
+	service.IlliadHTTPClient = metadataClient
 	discoveryBackends, err := discoverySources(cfg, budgets, metadataClient)
 	if err != nil {
 		return nil, err

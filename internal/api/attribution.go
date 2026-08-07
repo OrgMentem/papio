@@ -145,27 +145,26 @@ func listActionsV3(ctx context.Context, raw json.RawMessage, system *bootstrap.S
 	return marshal(agentjson.Envelope("actions", out, truncated))
 }
 
-// getJobV2 is jobs.get with attribution and per-action staleness.
-func getJobV2(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
-	jobID, rpcErr := requireJobID(raw)
-	if rpcErr != nil {
-		return nil, rpcErr
-	}
+// jobDetailParts loads the job/events/actions triple both jobs.get_v2 and
+// jobs.get_v3 return: attribution on the job row, and per-action staleness
+// on each open human action. jobs.get_v3 wraps this with a delivery section
+// on top rather than recomputing attribution or staleness a second time.
+func jobDetailParts(ctx context.Context, system *bootstrap.System, jobID string) (*JobRow, []map[string]any, []ActionRow, error) {
 	row, err := system.Jobs.Get(ctx, jobID)
 	if err != nil {
-		return failure(err)
+		return nil, nil, nil, err
 	}
 	events, err := system.Jobs.Events(ctx, jobID)
 	if err != nil {
-		return failure(err)
+		return nil, nil, nil, err
 	}
 	consumer, recorded, err := system.Jobs.Consumer(ctx, jobID)
 	if err != nil {
-		return failure(err)
+		return nil, nil, nil, err
 	}
 	attributed, err := system.Jobs.ListHumanActionsForJob(ctx, jobID)
 	if err != nil {
-		return failure(err)
+		return nil, nil, nil, err
 	}
 	staleAfter := system.Config.Actions.EffectiveActionStaleAfter()
 	now := time.Now().UTC()
@@ -173,11 +172,24 @@ func getJobV2(ctx context.Context, raw json.RawMessage, system *bootstrap.System
 	for _, action := range attributed {
 		actions = append(actions, actionRow(action, staleAfter, now))
 	}
-	detail := JobDetailV2{Job: &JobRow{Row: *row}, Events: events, Actions: actions}
+	jobRow := &JobRow{Row: *row}
 	if recorded {
-		detail.Job.Consumer = &consumer
+		jobRow.Consumer = &consumer
 	}
-	return marshal(detail)
+	return jobRow, events, actions, nil
+}
+
+// getJobV2 is jobs.get with attribution and per-action staleness.
+func getJobV2(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
+	jobID, rpcErr := requireJobID(raw)
+	if rpcErr != nil {
+		return nil, rpcErr
+	}
+	jobRow, events, actions, err := jobDetailParts(ctx, system, jobID)
+	if err != nil {
+		return failure(err)
+	}
+	return marshal(JobDetailV2{Job: jobRow, Events: events, Actions: actions})
 }
 
 // validationReports is artifacts.validation: the complete stage-by-stage

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"papio/internal/config"
+	"papio/internal/delivery"
 	"papio/internal/discovery"
 	"papio/internal/job"
 	"papio/internal/ownership"
@@ -857,4 +858,195 @@ func TestRunSkipsDiscoveryWhenHealthIsUnavailable(t *testing.T) {
 			t.Fatalf("discovery check = %#v, want Skip", got)
 		}
 	})
+}
+
+// documentDeliveryTestConfig builds a config with a structurally clean
+// illiad profile: every static Decision 3A condition holds, so the only
+// thing standing between prefill_only and auto_capable is recorded live
+// acceptance.
+func documentDeliveryTestConfig(dataDir string) config.Config {
+	cfg := config.Default()
+	cfg.AccessMode = config.ModeConservative
+	cfg.DataDir = dataDir
+	cfg.Email = "researcher@example.test"
+	cfg.Browser.OpenURLBase = "https://resolver.example.edu/openurl"
+	cfg.Browser.DocumentDelivery = &config.DocumentDelivery{
+		Kind:              "illiad",
+		SubmitPolicy:      "auto_if_unconditional",
+		RequestClasses:    []string{"digital_journal_article"},
+		LegalBasis:        "institution_policy",
+		PatronAttestation: "not_required",
+		PatronFeePolicy:   "zero_standard",
+		APIKey:            "issued-by-institution",
+		PatronRef:         "patron-ref-123",
+	}
+	return cfg
+}
+
+func TestRunDocumentDeliveryDistinguishesDeclaredFromPass(t *testing.T) {
+	ctx := context.Background()
+	data := t.TempDir()
+	db, err := store.Open(ctx, data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	cfg := documentDeliveryTestConfig(data)
+	tool := executable(t)
+	report := Run(ctx, cfg, db, pdf.Capability{
+		PDFCPU: true, PDFInfo: tool, PDFToText: tool, PDFToPPM: tool, Tesseract: tool,
+	}, tool, nil)
+
+	byName := map[string]Check{}
+	for _, c := range report.Checks {
+		byName[c.Name] = c
+	}
+
+	// legal_basis, patron_attestation, and patron_fee_policy are read
+	// straight from config, never independently verified — ADR-0017
+	// Decision 3C: doctor "never prints PASS for a policy it merely read
+	// from config." Each must render DECLARED, and DECLARED must never
+	// collapse into PASS.
+	for _, name := range []string{
+		"document_delivery:default:legal_basis",
+		"document_delivery:default:patron_attestation",
+		"document_delivery:default:patron_fee_policy",
+	} {
+		c, ok := byName[name]
+		if !ok {
+			t.Fatalf("%s check missing: %+v", name, report.Checks)
+		}
+		if c.Status != Declared {
+			t.Fatalf("%s status = %q, want %q", name, c.Status, Declared)
+		}
+		if c.Status == Pass {
+			t.Fatalf("%s must never render declared config as PASS", name)
+		}
+	}
+
+	// kind (config parses, the adapter is shipped) and credentials
+	// (api_key/patron_ref presence) are genuinely verifiable offline, so
+	// they render PASS, never DECLARED.
+	for _, name := range []string{
+		"document_delivery:default:kind",
+		"document_delivery:default:credentials",
+	} {
+		c, ok := byName[name]
+		if !ok {
+			t.Fatalf("%s check missing: %+v", name, report.Checks)
+		}
+		if c.Status != Pass {
+			t.Fatalf("%s status = %q, want %q", name, c.Status, Pass)
+		}
+	}
+}
+
+func TestRunDocumentDeliveryLiveAcceptanceFlipsResultVerdict(t *testing.T) {
+	ctx := context.Background()
+	data := t.TempDir()
+	db, err := store.Open(ctx, data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	cfg := documentDeliveryTestConfig(data)
+	tool := executable(t)
+	run := func() Report {
+		return Run(ctx, cfg, db, pdf.Capability{
+			PDFCPU: true, PDFInfo: tool, PDFToText: tool, PDFToPPM: tool, Tesseract: tool,
+		}, tool, nil)
+	}
+	find := func(report Report, name string) (Check, bool) {
+		for _, c := range report.Checks {
+			if c.Name == name {
+				return c, true
+			}
+		}
+		return Check{}, false
+	}
+
+	before := run()
+	result, ok := find(before, "document_delivery:default:result")
+	if !ok || result.Status != Warn || !strings.Contains(result.Detail, "PREFILL ONLY") {
+		t.Fatalf("pre-acceptance result = %+v, want warn PREFILL ONLY", result)
+	}
+	var sawNoLiveAcceptanceBlock bool
+	for _, c := range before.Checks {
+		if strings.HasPrefix(c.Name, "document_delivery:default:block:") && strings.Contains(c.Detail, "no recorded live acceptance") {
+			sawNoLiveAcceptanceBlock = true
+		}
+	}
+	if !sawNoLiveAcceptanceBlock {
+		t.Fatalf("pre-acceptance report missing the no-recorded-live-acceptance BLOCK line: %+v", before.Checks)
+	}
+
+	svc := delivery.New(db, &cfg, nil)
+	if err := svc.RecordLiveAcceptance(ctx, "default", "illiad"); err != nil {
+		t.Fatalf("record live acceptance: %v", err)
+	}
+
+	after := run()
+	result, ok = find(after, "document_delivery:default:result")
+	if !ok || result.Status != Pass || !strings.Contains(result.Detail, "AUTO-CAPABLE") || !strings.Contains(result.Detail, "digital_journal_article") {
+		t.Fatalf("post-acceptance result = %+v, want pass AUTO-CAPABLE for digital_journal_article", result)
+	}
+	for _, c := range after.Checks {
+		if strings.HasPrefix(c.Name, "document_delivery:default:block:") {
+			t.Fatalf("post-acceptance report must have no BLOCK lines: %+v", after.Checks)
+		}
+	}
+	liveAcceptance, ok := find(after, "document_delivery:default:live_acceptance")
+	if !ok || liveAcceptance.Status != Pass {
+		t.Fatalf("live_acceptance check = %+v, want pass", liveAcceptance)
+	}
+}
+
+// A form-routed provider (openurl, libkey, custom) can never compile
+// auto_capable regardless of live acceptance (ADR-0017 Decision 3A: "Only
+// source-controlled API integrations can compile auto_capable"). This
+// exercises the RESULT line's other class, plus the distinct blocker
+// wording for a permanently-prefill provider versus the missing-live-
+// acceptance case above.
+func TestRunDocumentDeliveryResultLineForPermanentlyPrefillOnlyProvider(t *testing.T) {
+	ctx := context.Background()
+	data := t.TempDir()
+	db, err := store.Open(ctx, data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	cfg := config.Default()
+	cfg.AccessMode = config.ModeConservative
+	cfg.DataDir = data
+	cfg.Email = "researcher@example.test"
+	cfg.Browser.OpenURLBase = "https://resolver.example.edu/openurl"
+	cfg.Browser.DocumentDelivery = &config.DocumentDelivery{
+		Kind:         "openurl",
+		BaseURL:      "https://ill.example.edu/request",
+		SubmitPolicy: "prefill_only",
+	}
+	tool := executable(t)
+	report := Run(ctx, cfg, db, pdf.Capability{
+		PDFCPU: true, PDFInfo: tool, PDFToText: tool, PDFToPPM: tool, Tesseract: tool,
+	}, tool, nil)
+
+	var result Check
+	var block Check
+	for _, c := range report.Checks {
+		switch {
+		case c.Name == "document_delivery:default:result":
+			result = c
+		case strings.HasPrefix(c.Name, "document_delivery:default:block:"):
+			block = c
+		}
+	}
+	if result.Status != Warn || !strings.Contains(result.Detail, "PREFILL ONLY") {
+		t.Fatalf("result = %+v, want warn PREFILL ONLY", result)
+	}
+	if !strings.Contains(block.Detail, "prefilled request form") {
+		t.Fatalf("block = %+v, want the form-routed provider wording, not the live-acceptance wording", block)
+	}
+	if strings.Contains(block.Detail, "no recorded live acceptance") {
+		t.Fatalf("block = %+v, a permanently-prefill provider must not cite the live-acceptance wording", block)
+	}
 }

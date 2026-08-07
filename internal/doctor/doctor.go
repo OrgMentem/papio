@@ -17,6 +17,7 @@ import (
 
 	"papio/internal/browser"
 	"papio/internal/config"
+	"papio/internal/delivery"
 	"papio/internal/discovery"
 	"papio/internal/job"
 	"papio/internal/ownership"
@@ -26,12 +27,17 @@ import (
 	"papio/internal/zotio"
 )
 
-// Status values are stable CLI/agent output.
+// Status values are stable CLI/agent output. Declared is distinct from Pass
+// on purpose (ADR-0017 Decision 3C): it marks a fact doctor only ever read
+// from config — a policy declaration such as legal_basis, patron_attestation,
+// or patron_fee_policy — never something doctor independently verified. A
+// declared value can be wrong; doctor must never render it as a PASS.
 const (
-	Pass = "pass"
-	Warn = "warn"
-	Fail = "fail"
-	Skip = "skip"
+	Pass     = "pass"
+	Warn     = "warn"
+	Fail     = "fail"
+	Skip     = "skip"
+	Declared = "declared"
 )
 
 // Check is one deterministic diagnostic. Detail never contains a credential.
@@ -176,6 +182,7 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, capability pdf
 
 	checkSourceCredentials(cfg, add)
 	checkResolverBases(cfg, add)
+	checkDocumentDelivery(ctx, cfg, db, add)
 	checkDiscoveryHealth(cfg, discoverySource, add)
 	sort.SliceStable(checks, func(i, j int) bool { return checks[i].Name < checks[j].Name })
 	out := Report{OK: true, Checks: checks}
@@ -370,6 +377,160 @@ func checkSourceCredentials(cfg config.Config, add func(string, string, string, 
 		} else {
 			add(name, Pass, source+" credential configured", "")
 		}
+	}
+}
+
+// configuredDocumentDeliveryProfiles returns the institution profiles
+// (default and/or named) with document_delivery configured, sorted for
+// deterministic check ordering.
+func configuredDocumentDeliveryProfiles(cfg config.Config) []string {
+	var names []string
+	if cfg.Browser.DocumentDelivery != nil {
+		names = append(names, "default")
+	}
+	for name, inst := range cfg.Browser.Resolvers {
+		if inst.DocumentDelivery != nil {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return names
+}
+
+// checkDocumentDelivery reports one section per configured document_delivery
+// profile (ADR-0017 Decision 3C): PASS/OBSERVED lines for facts doctor can
+// actually verify offline or cheaply (config parses, the kind adapter is
+// shipped, api_key/patron_ref presence for illiad, and — when a store is
+// available — whether one live acceptance is on record), DECLARED lines for
+// policy doctor only ever reads from config (legal_basis, patron_attestation,
+// patron_fee_policy — 3C: "it never prints PASS for a policy it merely read
+// from config"), and the compiled RESULT (AUTO-CAPABLE or PREFILL ONLY plus
+// its BLOCK lines).
+//
+// db, when present, folds in the real store-backed live-acceptance fact via
+// Service.ResolveGateProfile — CompileGateProfile alone can never observe it
+// (see internal/delivery/gate.go). A nil db (doctor run before the daemon is
+// reachable) reports the pure compiled answer instead and Skips the
+// live-acceptance line, mirroring every other db-gated check in Run.
+//
+// v1 does not probe the provider API — no auth check, no patron-mapping
+// lookup, no transaction/patron-request lookup, no adapter conformance
+// version, and it never creates a test request: Decision 3C forbids a probe
+// request outright, and a safe, budget-respecting auth-only check is future
+// work, not this pass.
+func checkDocumentDelivery(ctx context.Context, cfg config.Config, db *store.Store, add func(string, string, string, string)) {
+	for _, name := range configuredDocumentDeliveryProfiles(cfg) {
+		inst, _ := cfg.InstitutionFor(name)
+		dd := inst.DocumentDelivery
+		prefix := "document_delivery:" + name
+
+		profile := delivery.CompileGateProfile(inst, name)
+		switch {
+		case db == nil:
+			add(prefix+":live_acceptance", Skip, "live-acceptance record is checked by the daemon", "")
+		default:
+			resolved, err := delivery.New(db, &cfg, nil).ResolveGateProfile(ctx, name, inst)
+			if err != nil {
+				add(prefix+":live_acceptance", Fail, "live-acceptance record could not be read: "+err.Error(), "inspect database permissions")
+				break
+			}
+			profile = resolved
+			if profile.LiveAccepted {
+				add(prefix+":live_acceptance", Pass, "one supervised submit-and-reconcile is recorded for this profile", "")
+			} else {
+				add(prefix+":live_acceptance", Warn, "no recorded live acceptance for this profile", "")
+			}
+		}
+
+		if profile.Class == delivery.GateClassInvalid {
+			add(prefix+":kind", Fail, "kind "+documentDeliveryOrUnset(dd.Kind)+" has no shipped delivery adapter", "use kind = openurl, libkey, illiad, or custom")
+			continue
+		}
+		add(prefix+":kind", Pass, "kind "+documentDeliveryOrUnset(dd.Kind)+" delivery adapter is shipped", "")
+
+		if dd.Kind == "illiad" {
+			switch {
+			case dd.APIKey == "" && dd.PatronRef == "":
+				add(prefix+":credentials", Warn, "api_key and patron_ref are not configured", "configure document_delivery.api_key and .patron_ref (0600 config only)")
+			case dd.APIKey == "":
+				add(prefix+":credentials", Warn, "api_key is not configured", "configure document_delivery.api_key (0600 config only)")
+			case dd.PatronRef == "":
+				add(prefix+":credentials", Warn, "patron_ref is not configured", "configure document_delivery.patron_ref (0600 config only)")
+			default:
+				add(prefix+":credentials", Pass, "api_key and patron_ref are configured", "")
+			}
+			// v1 does not call ILLiad's Web Platform API to verify the key
+			// authenticates or that patron_ref resolves to a real patron —
+			// see the doc comment above.
+		}
+
+		add(prefix+":legal_basis", Declared, "legal_basis is "+documentDeliveryOrUnset(dd.LegalBasis)+" (declared in config, not independently verified)", "")
+		add(prefix+":patron_attestation", Declared, "patron_attestation is "+documentDeliveryOrUnset(dd.PatronAttestation)+" (declared in config, not independently verified)", "")
+		add(prefix+":patron_fee_policy", Declared, "patron_fee_policy is "+documentDeliveryOrUnset(dd.PatronFeePolicy)+" (declared in config, not independently verified)", "")
+
+		if profile.Class == delivery.GateClassAutoCapable {
+			add(prefix+":result", Pass, "AUTO-CAPABLE · "+strings.Join(documentDeliverySortedClasses(profile.SupportedRequestClasses), ", "), "")
+			continue
+		}
+		add(prefix+":result", Warn, "PREFILL ONLY", "an operator must resolve the BLOCK lines below before this profile can auto-submit")
+		for i, b := range profile.Blockers {
+			add(fmt.Sprintf("%s:block:%d", prefix, i+1), Warn, "BLOCK "+b.Code+": "+documentDeliveryBlockerText(b), "")
+		}
+	}
+}
+
+func documentDeliverySortedClasses(classes map[string]bool) []string {
+	names := make([]string, 0, len(classes))
+	for name := range classes {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func documentDeliveryOrUnset(s string) string {
+	if s == "" {
+		return "unset"
+	}
+	return fmt.Sprintf("%q", s)
+}
+
+// documentDeliveryBlockerText maps ADR-0017 Decision 3A's closed 13-code
+// blocker vocabulary to the human-readable sentence a BLOCK line prints for
+// it, matching the wording papio init uses for the same vocabulary.
+func documentDeliveryBlockerText(b delivery.Blocker) string {
+	switch b.Code {
+	case delivery.BlockerProviderNotImplemented:
+		return "papio has no delivery adapter for this provider"
+	case delivery.BlockerProviderNotAutoCapable:
+		if b.Evidence == "no recorded live acceptance" {
+			return "papio has not yet completed one supervised submit-and-reconcile against this deployment (no recorded live acceptance)"
+		}
+		return "this delivery route only opens a prefilled request form; it has no automatic submission-and-reconciliation contract"
+	case delivery.BlockerAPICredentialMissing:
+		return "the institution-issued API key is not configured"
+	case delivery.BlockerPatronMappingUnverified:
+		return "the patron reference used to map requests to your account is not configured"
+	case delivery.BlockerRequestClassUnsupported:
+		return "none of the configured request classes are supported for automatic submission (v1: digital journal articles only)"
+	case delivery.BlockerPerRequestLogin:
+		return "your institution requires a login step on every request before it can be created"
+	case delivery.BlockerPerRequestTerms:
+		return "your institution requires a per-request terms declaration before a request can be created"
+	case delivery.BlockerPerRequestCopyrightDeclaration:
+		return "your institution requires a copyright declaration on every digital-copy request"
+	case delivery.BlockerPerRequestPurposeStatement:
+		return "your institution requires a per-request purpose statement before a request can be created"
+	case delivery.BlockerPatronFeeNotZero:
+		return "your institution charges a per-request patron fee, so requests cannot be auto-submitted"
+	case delivery.BlockerPatronFeeUnknown:
+		return "the patron fee policy is not declared, so papio cannot confirm requests are free"
+	case delivery.BlockerReconciliationUnavailable:
+		return "this provider has no reconciliation support, so a submitted request could never be confirmed"
+	case delivery.BlockerInstitutionPolicyUnknown:
+		return "a required policy declaration is missing or not recognized"
+	default:
+		return b.Evidence
 	}
 }
 

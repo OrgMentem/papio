@@ -607,8 +607,8 @@ func validateBareRoute(route string) error {
 	return nil
 }
 
-// validateResolverOriginHint enforces session_evidence.origin_hint's exact
-// wire rule: an https origin with a lowercase, structurally valid host and
+// validateBareLowercaseOrigin enforces the shared bare-origin wire rule: an
+// https origin with a lowercase, structurally valid host and
 // nothing else — no path, query, fragment, userinfo, or mixed-case host.
 // This function exists because three independent implementations of "bare
 // resolver origin" (this package, parseBrowserMessage in
@@ -729,40 +729,54 @@ func validateBareRoute(route string) error {
 // exists to prevent, so it is closed below: the port is validated
 // explicitly against originPortRE instead of trusting Hostname() to have
 // stripped away anything that mattered.
-func validateResolverOriginHint(hint string) error {
-	if hint == "" {
-		return fmt.Errorf("session_evidence.origin_hint required")
+// validateBareLowercaseOrigin is the single shared implementation of the
+// "bare https origin with a lowercase host" wire rule, used by both
+// session_evidence.origin_hint (via validateResolverOriginHint below) and
+// page_bulk_submit_request.source.origin (PageBulkSubmitSource.validate).
+// what is the field path used in every returned error message.
+func validateBareLowercaseOrigin(what, value string) error {
+	if value == "" {
+		return fmt.Errorf("%s required", what)
 	}
-	if strings.ContainsAny(hint, "?#") {
-		return fmt.Errorf("session_evidence.origin_hint %q must not retain URL query or fragment data", hint)
+	if strings.ContainsAny(value, "?#") {
+		return fmt.Errorf("%s %q must not retain URL query or fragment data", what, value)
 	}
-	if !strings.HasPrefix(hint, "https://") {
-		return fmt.Errorf("session_evidence.origin_hint %q must be an https URL with a host", hint)
+	if !strings.HasPrefix(value, "https://") {
+		return fmt.Errorf("%s %q must be an https URL with a host", what, value)
 	}
-	u, err := url.Parse(hint)
+	u, err := url.Parse(value)
 	if err != nil {
-		return fmt.Errorf("invalid session_evidence.origin_hint %q", hint)
+		return fmt.Errorf("invalid %s %q", what, value)
 	}
 	if u.Host == "" {
-		return fmt.Errorf("session_evidence.origin_hint %q must be an https URL with a host", hint)
+		return fmt.Errorf("%s %q must be an https URL with a host", what, value)
 	}
 	if u.User != nil {
-		return fmt.Errorf("session_evidence.origin_hint %q must not retain URL credentials", hint)
+		return fmt.Errorf("%s %q must not retain URL credentials", what, value)
 	}
 	if u.Path != "" || u.RawPath != "" || u.Opaque != "" {
-		return fmt.Errorf("session_evidence.origin_hint %q must be a bare origin with no path", hint)
+		return fmt.Errorf("%s %q must be a bare origin with no path", what, value)
 	}
 	if !originHostRE.MatchString(u.Hostname()) {
-		return fmt.Errorf("session_evidence.origin_hint %q must have a lowercase resolver host", hint)
+		return fmt.Errorf("%s %q must have a lowercase resolver host", what, value)
 	}
 	// u.Hostname() silently drops the port; validate it explicitly rather
 	// than letting a malformed or oversized one pass unseen.
 	if port := strings.TrimPrefix(u.Host, u.Hostname()); port != "" {
 		if !originPortRE.MatchString(strings.TrimPrefix(port, ":")) {
-			return fmt.Errorf("session_evidence.origin_hint %q must have a 1-5 digit port", hint)
+			return fmt.Errorf("%s %q must have a 1-5 digit port", what, value)
 		}
 	}
 	return nil
+}
+
+// validateResolverOriginHint enforces session_evidence.origin_hint's exact
+// wire rule by delegating to validateBareLowercaseOrigin — see that
+// function's doc comment above for the shared grammar, and this function's
+// historical doc comment (still above, unmoved) for why the rule is what
+// it is.
+func validateResolverOriginHint(hint string) error {
+	return validateBareLowercaseOrigin("session_evidence.origin_hint", hint)
 }
 
 func enumRequired(field, value string, allowed ...string) error {
@@ -2805,16 +2819,28 @@ func (p *PageBulkSubmitRequestPayload) validate() error {
 }
 
 // validate enforces Decision 6's manifest shape: kind is pinned to the one
-// value this protocol emits, origin is a bare https scheme+host — never
-// path, query, fragment, or page title, the same rule
-// hello_ack.resolver_origins already enforces via validResolverOrigin — and
-// detector is a short, non-empty label.
+// value this protocol emits, origin is a bare https scheme+host with a
+// lowercase host, and detector is a short, non-empty label.
+//
+// Origin reuses validateBareLowercaseOrigin — the same validator
+// session_evidence.origin_hint enforces (papio-26fa531528e29798) — rather
+// than a third copy of the rule. This field used to call the laxer
+// validResolverOrigin (still used by hello_ack.resolver_origins, which has
+// no case-sensitive counterpart to disagree with), which never compared
+// host case: "https://Scholar.Example.EDU" decoded here while
+// extension/src/protocol.ts's round-trip check and
+// protocol/browser-v1.schema.json's lowercase-only pattern both rejected
+// it — the exact class of bug validateBareLowercaseOrigin was written to
+// close for origin_hint.
 func (s *PageBulkSubmitSource) validate() error {
 	if err := enumRequired("page_bulk_submit_request.source.kind", s.Kind, "browser_page"); err != nil {
 		return err
 	}
-	if !validResolverOrigin(s.Origin) {
-		return fmt.Errorf("page_bulk_submit_request.source.origin must be a bare https scheme://host origin")
+	if browserTextLen(s.Origin) > 300 {
+		return fmt.Errorf("page_bulk_submit_request.source.origin exceeds 300 chars")
+	}
+	if err := validateBareLowercaseOrigin("page_bulk_submit_request.source.origin", s.Origin); err != nil {
+		return err
 	}
 	if s.Detector == "" {
 		return fmt.Errorf("page_bulk_submit_request.source.detector is required")

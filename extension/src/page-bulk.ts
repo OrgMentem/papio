@@ -252,6 +252,17 @@ function formatScanTime(iso: string): string {
   return Number.isNaN(parsed.getTime()) ? "" : parsed.toLocaleString();
 }
 
+/** Mirrors popup.ts's historyPagePath()/background.ts's inboxURL: derive the
+ * inbox page's path from the manifest's declared default_popup so it
+ * inherits the real build output directory (dist/ for both Chrome and
+ * Firefox) instead of a hardcoded extension-root path that never exists
+ * (build.ts's copyExtensionPages() only ever writes inbox.html under
+ * dist/ or firefox/dist/). */
+function inboxPagePath(): string {
+  const declaredPopup = chrome.runtime.getManifest().action?.default_popup ?? "dist/popup.html";
+  return declaredPopup.replace(/[^/]*$/, "inbox.html");
+}
+
 const state: WorkspaceState = {
   scanId: scanIdFromLocation() ?? "",
   snapshot: null,
@@ -306,6 +317,11 @@ function renderBanners(): void {
   elements.scanError.textContent = state.loadError ?? "";
   elements.statusError.hidden = state.statusError === null;
   elements.statusErrorMessage.textContent = state.statusError ?? "";
+  // A Rescan in flight is about to replace state.rows outright (Decision 4);
+  // a Retry click racing that swap would send a status request keyed to rows
+  // that are seconds from being discarded, so gate it the same way the
+  // Rescan button itself is gated.
+  elements.statusRetryButton.disabled = state.rescanning || state.snapshot === null;
 }
 
 function rowStatusText(row: RowState): string {
@@ -413,7 +429,7 @@ function renderResult(): void {
   ];
   const summary = element("p", parts.join(" · "));
   const link = element("a", "Open inbox");
-  link.href = typeof chrome !== "undefined" ? chrome.runtime.getURL("inbox.html") : "inbox.html";
+  link.href = typeof chrome !== "undefined" ? chrome.runtime.getURL(inboxPagePath()) : "inbox.html";
   link.target = "_blank";
   link.rel = "noopener noreferrer";
   elements.resultSummary.replaceChildren(summary, link);
@@ -445,6 +461,14 @@ async function loadAllowlist(origin: string): Promise<void> {
 
 async function loadStatus(): Promise<void> {
   if (state.snapshot === null) return;
+  // Decision 4: documentGeneration bumps on every rescan (page-scan.ts). A
+  // reply is only ever applied against the exact generation it was
+  // requested under — Rescan replaces state.rows with fresh RowStates whose
+  // localIds are recomputed deterministically in detection order, so a
+  // stale reply's local_ids can collide with the NEW rows and silently
+  // overwrite their status/canonicalKey/jobId with data about entirely
+  // different papers if this were not checked.
+  const requestGeneration = state.snapshot.documentGeneration;
   if (state.rows.length === 0) {
     state.statusLoaded = true;
     render();
@@ -461,10 +485,12 @@ async function loadStatus(): Promise<void> {
   try {
     response = await runtimeMessage("papio.pageBulk.status", { scan_id: state.snapshot.scanId, identifiers });
   } catch (e) {
+    if (state.snapshot === null || state.snapshot.documentGeneration !== requestGeneration) return;
     state.statusError = e instanceof Error ? e.message : "Could not reach the extension runtime.";
     render();
     return;
   }
+  if (state.snapshot === null || state.snapshot.documentGeneration !== requestGeneration) return;
   if (!isStatusReply(response)) {
     state.statusError = errorFromResponse(response);
     render();

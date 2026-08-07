@@ -305,6 +305,9 @@ func RouterWithShutdown(system *bootstrap.System, shutdown context.CancelFunc) i
 		"jobs.get_v2": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return getJobV2(ctx, raw, system)
 		},
+		"jobs.get_v3": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return getJobV3(ctx, raw, system)
+		},
 		"jobs.cancel": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return cancelJob(ctx, raw, system)
 		},
@@ -382,6 +385,18 @@ func RouterWithShutdown(system *bootstrap.System, shutdown context.CancelFunc) i
 		},
 		"browser.claim": func(_ context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return browserClaim(raw, system)
+		},
+		"delivery.get": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return deliveryGet(ctx, raw, system)
+		},
+		"delivery.submit": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return deliverySubmit(ctx, raw, system)
+		},
+		"delivery.cancel": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return deliveryCancel(ctx, raw, system)
+		},
+		"delivery.action": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return deliveryAction(ctx, raw, system)
 		},
 	}
 	if shutdown != nil {

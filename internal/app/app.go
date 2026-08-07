@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -21,9 +22,11 @@ import (
 	"papio/internal/artifact"
 	"papio/internal/budget"
 	"papio/internal/config"
+	"papio/internal/delivery"
 	"papio/internal/discovery"
 	"papio/internal/fetch"
 	"papio/internal/hook"
+	"papio/internal/illiad"
 	"papio/internal/job"
 	"papio/internal/pdf"
 	"papio/internal/protocol"
@@ -112,6 +115,20 @@ type Service struct {
 	Validate      ValidateFunc
 	AutoImporter  AutoImporter
 	Notifier      NotificationSink
+	// Delivery is ADR-0017's document-delivery/ILL service (Decisions 1,
+	// 3A-3C, 4). Nil disables the feature entirely: exhaustedCandidates
+	// falls back to its pre-ADR-0017 OpenURL/no_entitlement behavior
+	// exactly, byte for byte — the same "unconfigured" contract an
+	// institution profile with no document_delivery block gets even when
+	// Delivery is set. Bootstrap wiring (constructing this from the daemon's
+	// store/config) lives outside this package.
+	Delivery *delivery.Service
+	// IlliadHTTPClient is the transport internal/illiad uses for every
+	// per-request Client this package constructs (one per institution
+	// profile, from that profile's document_delivery.base_url/api_key).
+	// Defaults to http.DefaultClient in New; tests inject an httptest
+	// server's client instead.
+	IlliadHTTPClient illiad.HTTPClient
 	// ReadyHook, when non-nil with a command, runs the user's on_ready hook
 	// once per ready transition. Nil disables it.
 	ReadyHook *hook.Runner
@@ -153,6 +170,7 @@ func New(cfg config.Config, jobs *job.Store, artifacts *artifact.Store, budgets 
 	return &Service{
 		Config: cfg, Jobs: jobs, Artifacts: artifacts, Budgets: budgets,
 		RetryDelay: 30 * time.Second, Now: time.Now,
+		IlliadHTTPClient: http.DefaultClient,
 	}
 }
 
@@ -1599,8 +1617,30 @@ func (s *Service) exhaustedCandidates(ctx context.Context, row *job.Row, from, r
 			}
 			return s.park(ctx, row.ID, from, job.StateAwaitingHuman,
 				map[string]any{"reason": "institutional_handoff"})
-		case institutionalExhausted:
-			terminal = job.TerminalReasonNoEntitlement
+		default:
+			// institutionalExhausted, or no institutional OpenURL route was
+			// ever configured for this profile: the plain-OpenURL handoff has
+			// nothing further to offer this pass. ADR-0017 Decision 4
+			// supersedes the no_entitlement collapse that follows for the
+			// case where a document-delivery route was actually configured
+			// and pursued (Consequences: "superseded ... for the case where
+			// a delivery route was actually configured and pursued; the
+			// terminal reason remains correct for the case where no route
+			// exists at all"). deliveryRoute is itself a no-op — Configured
+			// stays false — whenever s.Delivery is nil or this profile has no
+			// document_delivery block, which keeps both terminal/reason
+			// assignments below byte-for-bit identical to pre-ADR-0017
+			// behavior.
+			if institutionalExhausted {
+				terminal = job.TerminalReasonNoEntitlement
+			}
+			result, err := s.deliveryRoute(ctx, row, from)
+			if err != nil {
+				return err
+			}
+			if result.Configured {
+				return nil
+			}
 		}
 	case config.ModeConservative:
 		// Same gate: an OpenURL built from a bare title or an unregistered DOI
@@ -1615,12 +1655,392 @@ func (s *Service) exhaustedCandidates(ctx context.Context, row *job.Row, from, r
 				return err
 			}
 		}
+		// ADR-0017 Decision 3B condition 1: "under conservative the route is
+		// discovered and recorded, never opened or submitted." Unlike the
+		// delegated/assisted path, this never runs Branch/EvaluateGate, and
+		// deliberately records an EVENT rather than a job.ActionKindDocumentDelivery
+		// human action: that kind is reserved for the delegated/assisted
+		// path's actionable prefill/reconciliation offers, and — unlike
+		// openurl_available — has no exemption from the terminal
+		// transition's open-action cleanup a few lines down, which would
+		// silently cancel it the instant it opened. An event survives that
+		// cleanup untouched and is exactly "recorded": visible in the job's
+		// history without masquerading as something actionable.
+		if _, dd, ok := s.deliveryConfigured(row); ok && routeable {
+			if err := s.Jobs.RecordEvent(ctx, row.ID, "delivery.route_discovered", map[string]any{
+				"provider": dd.Kind,
+				"reason":   "not opened in conservative mode",
+			}); err != nil {
+				return err
+			}
+		}
 		if !routeable {
 			reason, terminal = gateReason, gateTerminal
 		}
 	}
 	return s.Jobs.Transition(ctx, row.ID, from, job.StateUnavailable,
 		map[string]any{"reason": reason}, job.WithTerminalReason(terminal))
+}
+
+// DeliveryRouteResult reports what one document-delivery route evaluation
+// did for a job (ADR-0017 Decision 3B/4). exhaustedCandidates's automatic
+// call only consults Configured; SubmitDelivery returns the rest to its RPC
+// caller.
+type DeliveryRouteResult struct {
+	// Configured is false when the job's institution profile has no
+	// document_delivery configured or s.Delivery is nil — the ADR-0017
+	// route is off for this job, nothing was evaluated, and the job was
+	// left untouched. It is the only field callers need to decide whether
+	// to fall back to their own pre-ADR-0017 handling.
+	Configured bool
+	Branch     delivery.BranchDecision
+	Decision   delivery.Decision
+	Request    *delivery.Request
+}
+
+// SubmitDelivery runs the same Decision 3B/4 idempotency-branch-then-gate
+// path exhaustedCandidates takes automatically when ordinary candidates are
+// exhausted, for an explicit operator/RPC-triggered call (`papio delivery
+// submit <job-id>`). It transitions the job exactly as the automatic call
+// does: submit -> retry_wait pending, prefill/enrich_then_prefill ->
+// awaiting_human with the document_delivery action, join_poll -> retry_wait
+// pending on the existing row, adopt_fulfilled/reconcile/resubmission_policy
+// -> awaiting_human with the document_delivery action. Like any other
+// Transition call, it fails with job.ErrConflict if jobID's current state
+// cannot reach the resulting state (e.g. a job already mid-poll for the same
+// live request) — callers should check delivery.get's row state first.
+func (s *Service) SubmitDelivery(ctx context.Context, jobID string) (DeliveryRouteResult, error) {
+	row, err := s.Jobs.Get(ctx, jobID)
+	if err != nil {
+		return DeliveryRouteResult{}, err
+	}
+	return s.deliveryRoute(ctx, row, row.State)
+}
+
+// deliveryConfigured reports whether row's institution profile has a
+// document_delivery route configured and s.Delivery is wired — the single
+// nil-safe gate every ADR-0017 code path in this file checks first.
+//
+// It deliberately ignores InstitutionFor's own boolean result: for the
+// default profile that result tracks OpenURLBase presence alone (see
+// InstitutionFor), which would wrongly report "not configured" for a
+// default profile that sets document_delivery without ever setting
+// openurl_base — a document-delivery-only institution profile is exactly
+// what ADR-0017 Decision 2 makes possible. inst.DocumentDelivery == nil is
+// already the correct, self-sufficient signal: InstitutionFor never
+// populates it on a resolver name it does not recognize either.
+func (s *Service) deliveryConfigured(row *job.Row) (config.Institution, *config.DocumentDelivery, bool) {
+	if s.Delivery == nil {
+		return config.Institution{}, nil, false
+	}
+	inst, _ := s.Config.InstitutionFor(row.Policy.Resolver)
+	if inst.DocumentDelivery == nil {
+		return config.Institution{}, nil, false
+	}
+	return inst, inst.DocumentDelivery, true
+}
+
+// deliveryProfileName normalizes row.Policy.Resolver the same way
+// config.Config.InstitutionFor does, so the idempotency key and gate profile
+// this file computes always key on the same profile name InstitutionFor
+// actually resolved.
+func deliveryProfileName(resolver string) string {
+	if resolver == "" {
+		return "default"
+	}
+	return resolver
+}
+
+// deliveryRequestClass returns v1's only supported request class,
+// digital_journal_article, when the work carries a strong article
+// identifier — DOI or PMID. work.Work has no work-type/container
+// discriminator anywhere in this pipeline (enrichDOIWork/enrich only ever
+// copy title/authors/year out of a discovery lookup), so DOI-or-PMID is the
+// entire "article-shaped" test v1 can make — the same signal
+// HasFetchableIdentifier and the ISBN-exclusion precedent already treat as
+// papio's article-vs-monograph distinction (see work.Work.HasFetchableIdentifier:
+// an ISBN routes to a catalogue record, never a PDF). PMID names only
+// journal articles; a DOI with neither is everything else (books, chapters,
+// datasets, theses) and correctly returns "", which EvaluateGate's condition
+// 3 (SupportedRequestClasses) always fails closed to prefill on.
+func deliveryRequestClass(w work.Work) string {
+	if w.DOI != "" || w.PMID != "" {
+		return "digital_journal_article"
+	}
+	return ""
+}
+
+// deliveryHasRequiredFields reports whether row's Work meets the illiad
+// citation minimum for a Borrowing/Article transaction: a DOI or PMID plus
+// a title (Decision 3B condition 4).
+func deliveryHasRequiredFields(w work.Work) bool {
+	return (w.DOI != "" || w.PMID != "") && w.Title != ""
+}
+
+// deliveryRoute implements ADR-0017 Decisions 3B and 4: the idempotency
+// branch, then — for a fresh or merely-offered key — the seven-point gate,
+// then acts on the verdict. Configured stays false, with row left entirely
+// untouched, whenever s.Delivery is nil or row's institution profile has no
+// document_delivery block; every other code path in this file relies on
+// that to stay a no-op.
+func (s *Service) deliveryRoute(ctx context.Context, row *job.Row, from string) (DeliveryRouteResult, error) {
+	inst, dd, ok := s.deliveryConfigured(row)
+	if !ok {
+		return DeliveryRouteResult{}, nil
+	}
+	profileName := deliveryProfileName(row.Policy.Resolver)
+	requestClass := deliveryRequestClass(row.Work)
+	workIdentity := row.Work.Describe()
+	key := delivery.IdempotencyKey(profileName, workIdentity, dd.Kind, requestClass)
+
+	branch, existing, err := s.Delivery.Branch(ctx, key)
+	if err != nil {
+		return DeliveryRouteResult{}, err
+	}
+	switch branch {
+	case delivery.BranchJoinPoll:
+		return DeliveryRouteResult{Configured: true, Branch: branch, Request: existing},
+			s.joinDeliveryPoll(ctx, row, from, existing)
+	case delivery.BranchAdoptFulfilled, delivery.BranchReconcile, delivery.BranchResubmissionPolicy:
+		// v1: route every non-live-pending outcome to the document_delivery
+		// reconciliation action rather than building fetch/adopt/resubmission
+		// policy here — Decision 4: "the CLI (papio actions list/papio jobs
+		// get) is the only faithful surface" until reconciliation ships.
+		return DeliveryRouteResult{Configured: true, Branch: branch, Request: existing},
+			s.openDeliveryReconciliationAction(ctx, row, from, existing)
+	case delivery.BranchEvaluateGate:
+		profile, err := s.Delivery.ResolveGateProfile(ctx, profileName, inst)
+		if err != nil {
+			return DeliveryRouteResult{Configured: true, Branch: branch}, err
+		}
+		submittedThisMonth, err := s.Delivery.SubmittedThisMonth(ctx, profileName, dd.Kind)
+		if err != nil {
+			return DeliveryRouteResult{Configured: true, Branch: branch}, err
+		}
+		decision := delivery.EvaluateGate(profile, delivery.GateRequest{
+			EffectiveAccessMode: s.Config.EffectiveAccessMode(row.Policy.AccessMode),
+			RequestClass:        requestClass,
+			HasRequiredFields:   deliveryHasRequiredFields(row.Work),
+			SubmittedThisMonth:  submittedThisMonth,
+		})
+		if err := s.Delivery.AppendGateEvent(ctx, row.ID, delivery.GateEvaluated{
+			ProfileClass:  profile.Class,
+			ProfileDigest: profile.Digest(),
+			Decision:      decision,
+		}); err != nil {
+			return DeliveryRouteResult{Configured: true, Branch: branch, Decision: decision}, err
+		}
+		var (
+			request *delivery.Request
+			actErr  error
+		)
+		if decision.Action == delivery.ActionSubmit {
+			request, actErr = s.submitDeliveryRequest(ctx, row, from, profileName, dd, requestClass, workIdentity, key, profile)
+		} else {
+			// ActionPrefill and ActionEnrichThenPrefill both open the same
+			// prefill action: v1 has no separate enrichment step here — the
+			// job already ran normal metadata enrichment before ever
+			// reaching candidate exhaustion — so "enrich, then prefill if
+			// still incomplete" (Decision 3B) resolves to prefill directly.
+			request, actErr = s.openDeliveryPrefillAction(ctx, row, from, profileName, dd, requestClass, workIdentity, profile)
+		}
+		return DeliveryRouteResult{Configured: true, Branch: branch, Decision: decision, Request: request}, actErr
+	default:
+		return DeliveryRouteResult{Configured: true, Branch: branch, Request: existing},
+			fmt.Errorf("delivery: unrecognized branch decision %q", branch)
+	}
+}
+
+// illiadIdempotencyReferenceField is the ILLiad transaction field papio's
+// idempotency key is written to (illiad.TransactionRequest.ReferenceField).
+// v1 config has no per-institution mapping for this; ItemInfo4 is one of
+// ILLiad's five general-purpose fields and carries no meaning ILLiad itself
+// assigns, so every institution can read papio's token back from it via
+// illiad.Transaction.ReferenceValue.
+const illiadIdempotencyReferenceField = "ItemInfo4"
+
+// illiadHTTPClient returns the transport used to construct every institution
+// profile's illiad.Client, defaulting to http.DefaultClient the same way
+// New's zero-value Service would if a caller built one by hand.
+func (s *Service) illiadHTTPClient() illiad.HTTPClient {
+	if s.IlliadHTTPClient != nil {
+		return s.IlliadHTTPClient
+	}
+	return http.DefaultClient
+}
+
+// illiadTransactionRequest builds the citation and routing payload for a new
+// ILLiad Borrowing/Article transaction, carrying papio's idempotency key in
+// the fixed reference field (Decision 1/3A).
+func illiadTransactionRequest(w work.Work, patronRef, idempotencyKey string) illiad.TransactionRequest {
+	req := illiad.TransactionRequest{
+		ExternalUserID:     patronRef,
+		ProcessType:        "Borrowing",
+		RequestType:        "Article",
+		PhotoJournalTitle:  w.Container,
+		PhotoArticleTitle:  w.Title,
+		PhotoArticleAuthor: strings.Join(w.Authors, "; "),
+		DOI:                w.DOI,
+		PMID:               w.PMID,
+		ReferenceField:     illiadIdempotencyReferenceField,
+		ReferenceValue:     idempotencyKey,
+	}
+	if w.Year > 0 {
+		req.PhotoJournalYear = strconv.Itoa(w.Year)
+	}
+	return req
+}
+
+// submitDeliveryRequest is Decision 3B's `submit` verdict: it durably
+// occupies the idempotency key first (Create, state offered), then calls
+// internal/illiad only for a profile compiled auto_capable. Creating the row
+// before the transport call means a crash or transport failure between the
+// two never leaves a live ILLiad transaction with no local record — and
+// because Branch treats an offered row like a fresh key, a transport failure
+// here simply lets the next pass retry the illiad call.
+func (s *Service) submitDeliveryRequest(ctx context.Context, row *job.Row, from, profileName string, dd *config.DocumentDelivery, requestClass, workIdentity, key string, profile delivery.GateProfile) (*delivery.Request, error) {
+	created, err := s.Delivery.Create(ctx, delivery.CreateRequest{
+		JobID:              row.ID,
+		InstitutionProfile: profileName,
+		Provider:           dd.Kind,
+		RequestClass:       requestClass,
+		WorkIdentity:       workIdentity,
+		GateProfileDigest:  profile.Digest(),
+	})
+	if err != nil {
+		if errors.Is(err, delivery.ErrDuplicateRequest) {
+			// A concurrent evaluation already occupies this idempotency key.
+			// Never open a second live request (Decision 1) — route to
+			// reconciliation so a human resolves whatever it is, rather than
+			// guessing at its state from here.
+			return created, s.openDeliveryReconciliationAction(ctx, row, from, created)
+		}
+		return nil, err
+	}
+	client := illiad.New(s.illiadHTTPClient(), dd.BaseURL, dd.APIKey)
+	txn, err := client.CreateTransaction(ctx, illiadTransactionRequest(row.Work, dd.PatronRef, key))
+	if err != nil {
+		return created, s.parkDeliveryPrefill(ctx, row, from, dd)
+	}
+	if err := s.Delivery.UpdateState(ctx, created.ID, delivery.StateSubmitted); err != nil {
+		return created, err
+	}
+	nextCheck := delivery.NextCheck(s.Now(), 0, profile.StatusPollMinutes)
+	providerRef := strconv.Itoa(txn.TransactionNumber)
+	if err := s.Delivery.RecordPoll(ctx, created.ID, providerRef, nextCheck); err != nil {
+		return created, err
+	}
+	// UpdateState/RecordPoll only mutated the database; created is still the
+	// pre-submission snapshot Create returned (state offered, no reference).
+	// Re-fetch so callers — SubmitDelivery's RPC/CLI caller in particular —
+	// see the row's real, post-submission state rather than a stale one.
+	submitted, err := s.Delivery.Get(ctx, created.ID)
+	if err != nil {
+		return created, err
+	}
+	// Plain job.Store.Transition, not s.park: a delivery poll is not a human
+	// action, exactly like parkForRetry's ordinary retry_wait never notifies
+	// through s.park either.
+	return submitted, s.Jobs.Transition(ctx, row.ID, from, job.StateRetryWait, map[string]any{
+		"reason":              string(job.RetryReasonDocumentDeliveryPending),
+		"delivery_request_id": created.ID,
+		"provider_reference":  providerRef,
+	}, job.WithRetryAt(nextCheck))
+}
+
+// openDeliveryPrefillAction is Decision 3B's `prefill`/`enrich_then_prefill`
+// verdict: it ensures a durable offered row occupies this idempotency key
+// (Decision 1: "the row a compiled-prefill route occupies before any live
+// submission exists"), then opens the document_delivery action and parks
+// awaiting_human.
+func (s *Service) openDeliveryPrefillAction(ctx context.Context, row *job.Row, from, profileName string, dd *config.DocumentDelivery, requestClass, workIdentity string, profile delivery.GateProfile) (*delivery.Request, error) {
+	created, err := s.Delivery.Create(ctx, delivery.CreateRequest{
+		JobID:              row.ID,
+		InstitutionProfile: profileName,
+		Provider:           dd.Kind,
+		RequestClass:       requestClass,
+		WorkIdentity:       workIdentity,
+		GateProfileDigest:  profile.Digest(),
+	})
+	if err != nil && !errors.Is(err, delivery.ErrDuplicateRequest) {
+		return nil, err
+	}
+	return created, s.parkDeliveryPrefill(ctx, row, from, dd)
+}
+
+// parkDeliveryPrefill opens the document_delivery prefill action and parks
+// the job awaiting_human. Split out of openDeliveryPrefillAction so
+// submitDeliveryRequest can fall back to it after an already-created row's
+// illiad transport call fails, without a second Create attempt.
+func (s *Service) parkDeliveryPrefill(ctx context.Context, row *job.Row, from string, dd *config.DocumentDelivery) error {
+	if _, err := s.Jobs.OpenHumanAction(ctx, row.ID, job.ActionKindDocumentDelivery,
+		DeliveryPrefillActionDetail(dd.BaseURL), job.Access(false, "")); err != nil {
+		return err
+	}
+	return s.park(ctx, row.ID, from, job.StateAwaitingHuman, map[string]any{"reason": "document_delivery_prefill"})
+}
+
+// joinDeliveryPoll is Decision 3B's `join_poll` branch: this job attaches to
+// an already-submitted/pending request rather than evaluating the gate
+// again, and parks on that same pending-delivery retry_wait reason. The
+// existing row's own job_id (whichever job first created it) is untouched —
+// this only records the join on THIS job's event stream and retry schedule.
+func (s *Service) joinDeliveryPoll(ctx context.Context, row *job.Row, from string, existing *delivery.Request) error {
+	return s.Jobs.Transition(ctx, row.ID, from, job.StateRetryWait, map[string]any{
+		"reason":              string(job.RetryReasonDocumentDeliveryPending),
+		"delivery_request_id": existing.ID,
+	}, job.WithRetryAt(deliveryJoinPollAt(s.Now(), existing)))
+}
+
+// deliveryJoinPollAt reuses an already-scheduled next_check_at when it is
+// still in the future, and only falls back to a fresh default-cadence
+// NextCheck when the existing row carries none (or an already-past one).
+func deliveryJoinPollAt(now time.Time, existing *delivery.Request) time.Time {
+	if existing != nil && existing.NextCheckAt != "" {
+		if t, err := time.Parse(time.RFC3339Nano, existing.NextCheckAt); err == nil && t.After(now) {
+			return t
+		}
+	}
+	return delivery.NextCheck(now, 0, 0)
+}
+
+// openDeliveryReconciliationAction is Decision 4's exhausted-reconciliation
+// path: fulfilled, unknown_outcome, declined, and cancelled rows all open
+// the same document_delivery action and park awaiting_human. It never
+// offers retry_submission — Decision 4: "papio must not submit a second
+// request while an earlier one's outcome is unknown."
+func (s *Service) openDeliveryReconciliationAction(ctx context.Context, row *job.Row, from string, existing *delivery.Request) error {
+	if _, err := s.Jobs.OpenHumanAction(ctx, row.ID, job.ActionKindDocumentDelivery,
+		DeliveryReconciliationActionDetail(existing), job.Access(false, "")); err != nil {
+		return err
+	}
+	return s.park(ctx, row.ID, from, job.StateAwaitingHuman, map[string]any{"reason": "document_delivery_reconciliation"})
+}
+
+// DeliveryPrefillActionDetail describes the document-delivery/ILL request
+// form opened for a configured, but not auto-submitted, delivery route
+// (ADR-0017 Decision 3B: prefill_only or enrich_then_prefill).
+func DeliveryPrefillActionDetail(baseURL string) string {
+	if baseURL == "" {
+		return "document delivery / ILL request available; the institution's request form has no configured base_url — run 'papio delivery get' for the compiled gate profile that explains why"
+	}
+	return "document delivery / ILL request available; open the institution's request form and submit it yourself:\n" + baseURL
+}
+
+// DeliveryReconciliationActionDetail describes the human action Decision 4
+// opens only once deterministic reconciliation is exhausted, or a request
+// landed declined/cancelled — never an offer to resubmit. It names only the
+// one CLI surface this package's own contract guarantees (`papio delivery
+// get <job-id>`, ADR-0017 Decision 1); the specific reconciliation
+// operations (open_request_history/confirm_request_exists/confirm_request_absent,
+// Decision 4) are the CLI's own naming, not restated here.
+func DeliveryReconciliationActionDetail(existing *delivery.Request) string {
+	ref := existing.ProviderReference
+	if ref == "" {
+		ref = "(no provider reference recorded)"
+	}
+	return fmt.Sprintf("a document-delivery request (provider %s, reference %s, state %s) needs reconciliation; run 'papio delivery get %s' for its history and resolve it by hand — papio never resubmits automatically",
+		existing.Provider, ref, existing.State, existing.JobID)
 }
 
 func (s *Service) validateCandidate(ctx context.Context, row *job.Row, stored *job.Candidate, result fetch.Result) (accepted, parked bool, err error) {

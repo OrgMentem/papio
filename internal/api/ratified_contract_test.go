@@ -36,6 +36,7 @@ var ratifiedConsumerMethods = []string{
 	"jobs.list_v2",
 	"jobs.list_v3",
 	"jobs.get_v2",
+	"jobs.get_v3",
 	"actions.list_v2",
 	"actions.list_v3",
 	"actions.open",

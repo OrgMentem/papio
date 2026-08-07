@@ -214,6 +214,26 @@ func (s *Service) Get(ctx context.Context, id int64) (*Request, error) {
 	return r, nil
 }
 
+// GetByJobID returns the delivery_requests row for a job, or (nil, nil) when
+// the job was never routed through document delivery. A job's idempotency
+// key is scoped to institution+work+provider+request_class (Decision 1), not
+// to the job itself, so in principle more than one row could reference the
+// same job_id across resubmission policy changes; ORDER BY id DESC picks the
+// most recently created one, which is always the row a caller asking "what
+// is this job's delivery state" means.
+func (s *Service) GetByJobID(ctx context.Context, jobID string) (*Request, error) {
+	row := s.store.DB().QueryRowContext(ctx,
+		`SELECT `+requestColumns+` FROM delivery_requests WHERE job_id = ? ORDER BY id DESC LIMIT 1`, jobID)
+	r, err := scanRequest(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return r, nil
+}
+
 // UpdateState transitions a row's state. Entering StateSubmitted stamps
 // submitted_at the first time only (COALESCE), so a later re-observation of
 // the same live request never resets the cap-counting anchor.
@@ -339,7 +359,11 @@ func (s *Service) ResolveGateProfile(ctx context.Context, profileName string, in
 // (the CLI, the poller) never need to thread an Institution through by hand.
 func (s *Service) ResolveGateProfileFor(ctx context.Context, profileName string) (GateProfile, error) {
 	inst, ok := s.cfg.InstitutionFor(profileName)
-	if !ok {
+	// InstitutionFor's ok-flag keys on the OpenURL base, but a document-
+	// delivery route needs no OpenURL base to exist (the app reaches the
+	// delivery path without one). A profile whose only institutional fact
+	// is its document_delivery block is still a real profile here.
+	if !ok && inst.DocumentDelivery == nil {
 		return GateProfile{ProfileName: profileName, Class: GateClassInvalid, Blockers: []Blocker{{
 			Code:     BlockerInstitutionPolicyUnknown,
 			Evidence: "no institution profile named " + quote(profileName) + " is configured",
@@ -426,6 +450,39 @@ func (s *Service) AppendGateEvent(ctx context.Context, jobID string, evt GateEva
 		"decision":       string(evt.Decision.Action),
 		"blockers":       evt.Decision.Blockers,
 	})
+}
+
+// LatestGateEvent returns the most recently recorded delivery.gate_evaluated
+// verdict for jobID, or (nil, nil) when the job has never been gated. Reading
+// the recorded event rather than recomputing EvaluateGate against current
+// configuration is deliberate: `jobs.get_v3` and `delivery.get` explain the
+// decision papio actually made, which a live recompute could silently
+// disagree with after a profile edit.
+func (s *Service) LatestGateEvent(ctx context.Context, jobID string) (*GateEvaluated, error) {
+	var detailJSON string
+	err := s.store.DB().QueryRowContext(ctx,
+		`SELECT detail_json FROM events WHERE job_id = ? AND kind = ? ORDER BY seq DESC LIMIT 1`,
+		jobID, eventKindGateEvaluated).Scan(&detailJSON)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var detail struct {
+		ProfileClass  string   `json:"profile_class"`
+		ProfileDigest string   `json:"profile_digest"`
+		Decision      string   `json:"decision"`
+		Blockers      []string `json:"blockers"`
+	}
+	if err := json.Unmarshal([]byte(detailJSON), &detail); err != nil {
+		return nil, fmt.Errorf("decoding gate event: %w", err)
+	}
+	return &GateEvaluated{
+		ProfileClass:  GateClass(detail.ProfileClass),
+		ProfileDigest: detail.ProfileDigest,
+		Decision:      Decision{Action: Action(detail.Decision), Blockers: detail.Blockers},
+	}, nil
 }
 
 // Digest is a stable fingerprint of the compiled profile, recorded as

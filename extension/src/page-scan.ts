@@ -37,6 +37,18 @@ export function scanDocument(root: Document | Element = document): ScanResult {
   const MAX_LABEL_CHARS = 240;
   const SKIP_TAGS: Record<string, true> = { SCRIPT: true, STYLE: true, NOSCRIPT: true, TEMPLATE: true };
   const CONTAINER_SELECTOR = "li, tr, p, article, [class*='result']";
+  // Decision 3's "nearest bounded citation-shaped container": comfortably
+  // above the 240-char label cap (so a real citation row is never cut off
+  // before visibleText() gets to it) but well short of a multi-citation
+  // wrapper's concatenated text (see boundedAncestor below).
+  const BOUNDED_CONTAINER_CHARS = 400;
+  // Decision 3's "extension-injected nodes" exclusion. scanDocument has no
+  // chrome.* dependency (file header) and so cannot compare against papio's
+  // own extension id here; every chrome-extension:// or moz-extension://
+  // reference is therefore treated as foreign, papio's own included. That is
+  // safe today — papio injects no such URLs into any page — but is a known
+  // residual gap, not full "different id" generality, should that change.
+  const EXTENSION_URL_RE = /^(?:chrome|moz)-extension:\/\//i;
   // A DOI's own syntax (10.<registrant>/<suffix>) is self-labeling; arXiv and
   // PMID values are short and ambiguous, so only an explicit label counts
   // (Decision 3: an unlabeled bare integer is never a PMID).
@@ -103,6 +115,23 @@ export function scanDocument(root: Document | Element = document): ScanResult {
     return /display\s*:\s*none/i.test(style) || /visibility\s*:\s*hidden/i.test(style);
   }
 
+  // Decision 3: "script, style, hidden, and extension-injected nodes" are
+  // never scanned. An element carrying its own src/href pointing at a
+  // chrome-extension://.../moz-extension://... URL is assumed injected by
+  // something other than the page itself (see EXTENSION_URL_RE above); this
+  // is checked on entry to a subtree, so nothing beneath it is walked either.
+  // Shadow DOM: walk()/visibleText() only ever recurse through childNodes,
+  // which never surfaces a shadow root's content (open or closed) — an
+  // element with an attached shadow root is walked for its own light-DOM
+  // children only, so nothing another extension (or the page itself) mounts
+  // inside a shadow root is ever scanned. papio attaches no shadow roots of
+  // its own into pages today, so this exclusion costs no false negatives yet.
+  function isExtensionInjected(el: Element): boolean {
+    const src = el.getAttribute("src");
+    const href = el.getAttribute("href");
+    return EXTENSION_URL_RE.test(src ?? "") || EXTENSION_URL_RE.test(href ?? "");
+  }
+
   // textContent would also pick up script/style bodies and hidden nodes, so
   // the visible label is built with the same skip rules as the main walk
   // rather than delegated to el.textContent.
@@ -117,15 +146,44 @@ export function scanDocument(root: Document | Element = document): ScanResult {
       }
       if (node.nodeType !== 1) continue;
       const child = node as Element;
-      if (SKIP_TAGS[child.tagName] === true || isHiddenSelf(child)) continue;
+      if (SKIP_TAGS[child.tagName] === true || isHiddenSelf(child) || isExtensionInjected(child)) continue;
       const kids = Array.from(child.childNodes);
       stack.splice(0, 0, ...kids);
     }
     return out;
   }
 
+  /** Climb from the identifier's own element through ancestors, keeping the
+   * largest one whose visible text is still "bounded" (≤ BOUNDED_CONTAINER_
+   * CHARS) — that is the nearest citation row, not a page-level wrapper.
+   * closest(CONTAINER_SELECTOR) alone degrades badly when a citation list is
+   * markup as bare rows (e.g. plain <div>s) inside one wrapper whose OWN
+   * class happens to match the selector (e.g. [class*='result']): closest()
+   * walks straight past every row and returns the wrapper, so every
+   * identifier on the page gets the same near-identical wrapper-wide label.
+   * BODY/HTML are never candidates — they are definitionally page-level, not
+   * citation-shaped, however short a test fixture's body happens to be. A
+   * container two identifiers both climb to is only ever reused when they
+   * genuinely share it — each call climbs independently from its own start
+   * element, never from a cache keyed by anything coarser. Returns null when
+   * even `start` itself already exceeds the bound (rare — containerLabel
+   * falls back to the CONTAINER_SELECTOR match). */
+  function boundedAncestor(start: Element): Element | null {
+    let candidate: Element | null = null;
+    let el: Element | null = start;
+    while (el !== null && el.tagName !== "BODY" && el.tagName !== "HTML") {
+      if (visibleText(el).length > BOUNDED_CONTAINER_CHARS) break;
+      candidate = el;
+      el = el.parentElement;
+    }
+    return candidate;
+  }
+
   function containerLabel(start: Element): string {
-    const container = (typeof start.closest === "function" ? start.closest(CONTAINER_SELECTOR) : null) ?? start;
+    const container =
+      boundedAncestor(start) ??
+      (typeof start.closest === "function" ? start.closest(CONTAINER_SELECTOR) : null) ??
+      start;
     return visibleText(container).replace(/\s+/g, " ").trim().slice(0, MAX_LABEL_CHARS);
   }
 
@@ -194,7 +252,7 @@ export function scanDocument(root: Document | Element = document): ScanResult {
     }
     if (node.nodeType === 1) {
       const el = node as Element;
-      if (SKIP_TAGS[el.tagName] === true || isHiddenSelf(el)) return;
+      if (SKIP_TAGS[el.tagName] === true || isHiddenSelf(el) || isExtensionInjected(el)) return;
       if (el.tagName === "A") {
         const href = el.getAttribute("href");
         if (href !== null && href.trim() !== "") {

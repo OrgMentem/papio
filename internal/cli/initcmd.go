@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -24,6 +25,7 @@ import (
 
 	"papio/internal/bootstrap"
 	"papio/internal/config"
+	"papio/internal/delivery"
 	"papio/internal/doctor"
 	"papio/internal/institution"
 )
@@ -173,6 +175,7 @@ func runInit(cmd *cobra.Command, opt *options, deps initDependencies, input init
 	if err := applyInitConfig(cmd, opt.out, &cfg, exists, &input); err != nil {
 		return initRequiredFailure(opt.out, "Configuration", err)
 	}
+	writeDeliveryGateVerdicts(opt.out, cfg)
 	if err := config.Save(cfg, path); err != nil {
 		return initRequiredFailure(opt.out, "Configuration", err)
 	}
@@ -328,6 +331,130 @@ func initConfig(path string) (config.Config, bool, error) {
 		return cfg, false, nil
 	default:
 		return config.Config{}, false, fmt.Errorf("stat config %s: %w", path, err)
+	}
+}
+
+// writeDeliveryGateVerdicts prints ADR-0017 Decision 3C's compiled gate
+// verdict for every institution profile (default and/or named) with
+// document_delivery configured, before the config is saved: "An operator
+// must never enable auto_if_unconditional in good faith and wait for a path
+// that cannot fire." It is a pure display step — init prompts for nothing
+// here — driven entirely by CompileGateProfile, since init has no store
+// open yet. Prints nothing when no profile has document_delivery set.
+func writeDeliveryGateVerdicts(out io.Writer, cfg config.Config) {
+	names := configuredDeliveryProfiles(cfg)
+	if len(names) == 0 {
+		return
+	}
+	fmt.Fprintln(out)
+	fmt.Fprintln(out, "Document delivery (ADR-0017 Decision 3C — compiled gate verdict):")
+	for _, name := range names {
+		inst, _ := cfg.InstitutionFor(name)
+		writeDeliveryGateVerdict(out, name, delivery.CompileGateProfile(inst, name))
+	}
+}
+
+// configuredDeliveryProfiles returns the institution profiles (default
+// and/or named) with document_delivery configured, sorted for deterministic
+// output.
+func configuredDeliveryProfiles(cfg config.Config) []string {
+	var names []string
+	if cfg.Browser.DocumentDelivery != nil {
+		names = append(names, "default")
+	}
+	for name, inst := range cfg.Browser.Resolvers {
+		if inst.DocumentDelivery != nil {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return names
+}
+
+// writeDeliveryGateVerdict prints one profile's compiled Decision 3A answer.
+// CompileGateProfile is pure and never itself observes recorded live
+// acceptance (Decision 3A's third hard rule: "An auto_capable compile
+// additionally requires recorded live acceptance"), so a profile that is
+// otherwise completely clean compiles to prefill_only with exactly one
+// blocker whose evidence is "no recorded live acceptance". init renders
+// that specific case as the AUTO-CAPABLE-shaped block Decision 3C
+// describes — every other static condition already holds — with its last
+// evidence line spelling out the one remaining gap, never as a false,
+// unconditional AUTO-CAPABLE.
+func writeDeliveryGateVerdict(out io.Writer, name string, profile delivery.GateProfile) {
+	fmt.Fprintf(out, "  %s (provider: %s):\n", name, profile.Provider)
+	if onlyMissingLiveAcceptance(profile) {
+		classes := strings.Join(sortedDeliveryClasses(profile.SupportedRequestClasses), ", ")
+		fmt.Fprintf(out, "    AUTO-CAPABLE for %s\n", classes)
+		fmt.Fprintln(out, "    evidence:")
+		fmt.Fprintf(out, "      - submit_policy is %q\n", profile.SubmitPolicy)
+		fmt.Fprintf(out, "      - patron_fee_policy is %q (zero patron charge)\n", profile.PatronFeePolicy)
+		fmt.Fprintln(out, "      - api_key and patron_ref are configured")
+		fmt.Fprintln(out, "      - not yet: no recorded live acceptance — complete one supervised submit-and-reconcile against this deployment, then record it, before papio will actually auto-submit")
+		return
+	}
+	fmt.Fprintln(out, "    PREFILL ONLY")
+	for _, b := range profile.Blockers {
+		fmt.Fprintf(out, "      - %s\n", deliveryBlockerText(b))
+	}
+}
+
+// onlyMissingLiveAcceptance reports whether a compiled profile's single
+// outstanding blocker is CompileGateProfile's always-appended stand-in for
+// unobserved live acceptance (internal/delivery/gate.go's
+// evidenceNoLiveAcceptance) — the one gap only a store-backed caller
+// (Service.ResolveGateProfile) can ever close.
+func onlyMissingLiveAcceptance(p delivery.GateProfile) bool {
+	return len(p.Blockers) == 1 &&
+		p.Blockers[0].Code == delivery.BlockerProviderNotAutoCapable &&
+		p.Blockers[0].Evidence == "no recorded live acceptance"
+}
+
+func sortedDeliveryClasses(classes map[string]bool) []string {
+	names := make([]string, 0, len(classes))
+	for name := range classes {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// deliveryBlockerText maps ADR-0017 Decision 3A's closed 13-code blocker
+// vocabulary to the human-readable sentence init prints for it (Decision
+// 3C: "PREFILL ONLY with the specific blocker").
+func deliveryBlockerText(b delivery.Blocker) string {
+	switch b.Code {
+	case delivery.BlockerProviderNotImplemented:
+		return "papio has no delivery adapter for this provider"
+	case delivery.BlockerProviderNotAutoCapable:
+		if b.Evidence == "no recorded live acceptance" {
+			return "papio has not yet completed one supervised submit-and-reconcile against this deployment (no recorded live acceptance)"
+		}
+		return "this delivery route only opens a prefilled request form; it has no automatic submission-and-reconciliation contract"
+	case delivery.BlockerAPICredentialMissing:
+		return "the institution-issued API key is not configured"
+	case delivery.BlockerPatronMappingUnverified:
+		return "the patron reference used to map requests to your account is not configured"
+	case delivery.BlockerRequestClassUnsupported:
+		return "none of the configured request classes are supported for automatic submission (v1: digital journal articles only)"
+	case delivery.BlockerPerRequestLogin:
+		return "your institution requires a login step on every request before it can be created"
+	case delivery.BlockerPerRequestTerms:
+		return "your institution requires a per-request terms declaration before a request can be created"
+	case delivery.BlockerPerRequestCopyrightDeclaration:
+		return "your institution requires a copyright declaration on every digital-copy request"
+	case delivery.BlockerPerRequestPurposeStatement:
+		return "your institution requires a per-request purpose statement before a request can be created"
+	case delivery.BlockerPatronFeeNotZero:
+		return "your institution charges a per-request patron fee, so requests cannot be auto-submitted"
+	case delivery.BlockerPatronFeeUnknown:
+		return "the patron fee policy is not declared, so papio cannot confirm requests are free"
+	case delivery.BlockerReconciliationUnavailable:
+		return "this provider has no reconciliation support, so a submitted request could never be confirmed"
+	case delivery.BlockerInstitutionPolicyUnknown:
+		return "a required policy declaration is missing or not recognized"
+	default:
+		return b.Evidence
 	}
 }
 

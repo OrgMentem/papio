@@ -144,6 +144,93 @@ func listAttributedActionsPage(ctx context.Context, opt *options, openOnly bool,
 	return out, truncated, nil
 }
 
+// jobDetailV3 prefers jobs.get_v3, which adds the delivery-request section
+// (ADR-0017 Decision 5) on top of jobs.get_v2's attribution and staleness. It
+// falls back through jobDetail (jobs.get_v2, then jobs.get) for an older
+// daemon, same chain shape as listAttributedJobsPage over listJobsPage. It
+// stays separate from jobDetail/waitForJob rather than widening their return
+// type: those are shared with `papio acquire --wait` and `papio export job`,
+// which Decision 5 names no delivery obligation for, and jobs.get_v3 is a new
+// method precisely so an older reader of jobs.get_v2 never has to change.
+func jobDetailV3(ctx context.Context, opt *options, id string) (*api.JobDetailV3, error) {
+	params := map[string]string{"job_id": id}
+	var detail api.JobDetailV3
+	err := opt.call(ctx, "jobs.get_v3", params, &detail)
+	if err == nil {
+		return &detail, nil
+	}
+	if !isUnknownMethod(err) {
+		return nil, err
+	}
+	v2, err := jobDetail(ctx, opt, id)
+	if err != nil {
+		return nil, err
+	}
+	return &api.JobDetailV3{Job: v2.Job, Events: v2.Events, Actions: v2.Actions}, nil
+}
+
+// waitForJobV3 is `jobs get --wait`'s poll loop: identical to waitForJob, but
+// reading through jobDetailV3 so --wait renders the same delivery-aware shape
+// as a bare `papio jobs get`.
+func waitForJobV3(ctx context.Context, opt *options, id string) (*api.JobDetailV3, error) {
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		detail, err := jobDetailV3(ctx, opt, id)
+		if err != nil {
+			return nil, err
+		}
+		if detail.Job == nil {
+			return nil, fmt.Errorf("daemon returned no job for %s", id)
+		}
+		if job.Terminal(detail.Job.State) || detail.Job.State == job.StateAwaitingHuman || detail.Job.State == job.StateNeedsReview {
+			return detail, nil
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+// printDeliverySection renders `jobs get`'s human-output delivery lines: one
+// labeled line per fact (provider, reference, state, next check, gate class
+// with blockers), the same WORKING-style shape ADR-0017 Decision 5 describes
+// for `papio status`. Absent (nil) prints nothing, matching the JSON side's
+// omitempty.
+func printDeliverySection(opt *options, delivery *api.DeliverySummary) error {
+	if delivery == nil {
+		return nil
+	}
+	if _, err := fmt.Fprintf(opt.out, "  delivery provider: %s\n", delivery.Provider); err != nil {
+		return err
+	}
+	if delivery.Reference != "" {
+		if _, err := fmt.Fprintf(opt.out, "  delivery reference: %s\n", delivery.Reference); err != nil {
+			return err
+		}
+	}
+	if _, err := fmt.Fprintf(opt.out, "  delivery state: %s\n", delivery.State); err != nil {
+		return err
+	}
+	if delivery.NextCheckAt != "" {
+		if _, err := fmt.Fprintf(opt.out, "  delivery next check: %s\n", delivery.NextCheckAt); err != nil {
+			return err
+		}
+	}
+	if delivery.GateClass != "" {
+		gate := delivery.GateClass
+		if len(delivery.GateBlockers) > 0 {
+			gate = fmt.Sprintf("%s (blocked by: %s)", gate, strings.Join(delivery.GateBlockers, ", "))
+		}
+		if _, err := fmt.Fprintf(opt.out, "  delivery gate: %s\n", gate); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // truncationNotice states on the human surface what the --json envelope has
 // always stated in its `truncated` key. A listing that quietly stopped at the
 // limit and looked complete is how a consumer concludes the daemon holds a
@@ -326,12 +413,12 @@ func newJobsCommand(opt *options) *cobra.Command {
 			Annotations: map[string]string{"mcp:read-only": "true"},
 			Args:        cobra.ExactArgs(1),
 			RunE: func(cmd *cobra.Command, args []string) error {
-				var detail *api.JobDetailV2
+				var detail *api.JobDetailV3
 				var err error
 				if wait {
-					detail, err = waitForJob(cmd.Context(), opt, args[0])
+					detail, err = waitForJobV3(cmd.Context(), opt, args[0])
 				} else {
-					detail, err = jobDetail(cmd.Context(), opt, args[0])
+					detail, err = jobDetailV3(cmd.Context(), opt, args[0])
 				}
 				if err != nil {
 					return err
@@ -353,6 +440,9 @@ func newJobsCommand(opt *options) *cobra.Command {
 					if _, err := fmt.Fprintf(opt.out, "  %v  %v\n", event["at"], event["kind"]); err != nil {
 						return err
 					}
+				}
+				if err := printDeliverySection(opt, detail.Delivery); err != nil {
+					return err
 				}
 				return nil
 			},

@@ -1,0 +1,613 @@
+// Copyright 2026 OrgMentem. Licensed under MIT. See LICENSE.
+// ADR-0017 Decisions 3B/4: document-delivery routing at exhaustedCandidates'
+// candidate-exhaustion boundary (deliveryRoute and its helpers in app.go).
+package app
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"papio/internal/artifact"
+	"papio/internal/config"
+	"papio/internal/delivery"
+	"papio/internal/fetch"
+	"papio/internal/job"
+	"papio/internal/protocol"
+	"papio/internal/resolver"
+	"papio/internal/store"
+)
+
+// newDeliveryTestService builds an app.Service backed by a real, temporary
+// SQLite store (the same setup newTestService in app_test.go uses) plus a
+// delivery.Service over that same store, so tests can inspect
+// delivery_requests rows directly rather than only observing job state.
+// Fetch/Validate are wired to fail the test if ever called: every test here
+// exhausts candidates by resolving zero of them, so the fetch/validate loop
+// must never run.
+func newDeliveryTestService(t *testing.T) (*Service, *job.Store, *delivery.Service) {
+	t.Helper()
+	ctx := context.Background()
+	data := t.TempDir()
+	db, err := store.Open(ctx, data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("close database: %v", err)
+		}
+	})
+	artifacts, err := artifact.New(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	cfg.AccessMode = config.ModeDelegated
+	cfg.DataDir = data
+	cfg.Sources["fixture"] = config.Source{Enabled: true}
+	svc := New(cfg, &job.Store{S: db}, artifacts, nil)
+	svc.Fetch = func(context.Context, resolver.Candidate, string) (fetch.Result, error) {
+		t.Fatal("fetch must not run: every delivery test resolves zero candidates")
+		return fetch.Result{}, nil
+	}
+	svc.Validate = passValidation()
+	deliverySvc := delivery.New(db, &svc.Config, nil)
+	return svc, svc.Jobs, deliverySvc
+}
+
+// deliveryWorkRequest is a DOI+title work: it carries deliveryHasRequiredFields'
+// citation minimum (DOI or PMID plus title) and deliveryRequestClass's DOI/PMID
+// signal, so a fully auto-capable profile reaches the submit verdict.
+func deliveryWorkRequest(id, doi string) protocol.WorkRequest {
+	return protocol.WorkRequest{
+		SchemaVersion: protocol.WorkRequestSchemaVersion,
+		RequestID:     id,
+		Identifiers:   &protocol.Identifiers{DOI: doi},
+		Title:         "A Grounded Result",
+		Authors:       []string{"A. Author"},
+		Year:          2024,
+	}
+}
+
+// deliveryTestResolvers makes svc.resolve() return zero legal candidates —
+// the "no direct candidates" boundary exhaustedCandidates itself handles —
+// without any institutional OpenURL base configured, so the very first pass
+// lands on exhaustedCandidates' default branch (no openurl_handoff to try
+// first) where deliveryRoute is called.
+func deliveryTestResolvers() []ResolverEntry {
+	return []ResolverEntry{{
+		Adapter: &fakeResolver{name: "fixture"},
+		Policy:  config.Source{Enabled: true},
+	}}
+}
+
+// autoCapableDocumentDelivery is a document_delivery block that compiles
+// GateClassAutoCapable once live acceptance is recorded (ADR-0017 Decision
+// 3A's three hard rules): illiad provider, digital_journal_article,
+// auto_if_unconditional, zero patron fee, no per-request declaration, both
+// credential fields set.
+func autoCapableDocumentDelivery(baseURL string) *config.DocumentDelivery {
+	return &config.DocumentDelivery{
+		Kind:              "illiad",
+		BaseURL:           baseURL,
+		SubmitPolicy:      "auto_if_unconditional",
+		RequestClasses:    []string{"digital_journal_article"},
+		LegalBasis:        "institution_policy",
+		PatronAttestation: "not_required",
+		PatronFeePolicy:   "zero_standard",
+		MonthlyRequestCap: 25,
+		StatusPollMinutes: 60,
+		APIKey:            "campus-secret",
+		PatronRef:         "patron-ref-1",
+	}
+}
+
+func lastTransitionReason(t *testing.T, jobs *job.Store, id string) string {
+	t.Helper()
+	events, err := jobs.Events(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := len(events) - 1; i >= 0; i-- {
+		if events[i]["kind"] != "job.transition" {
+			continue
+		}
+		detail, _ := events[i]["detail"].(map[string]any)
+		reason, _ := detail["reason"].(string)
+		return reason
+	}
+	t.Fatalf("job %s recorded no job.transition event", id)
+	return ""
+}
+
+func gateEventCount(t *testing.T, jobs *job.Store, id string) int {
+	t.Helper()
+	events, err := jobs.Events(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for _, e := range events {
+		if e["kind"] == "delivery.gate_evaluated" {
+			n++
+		}
+	}
+	return n
+}
+
+// TestExhaustedCandidatesNilDeliveryUnconfiguredRoute proves that with
+// s.Delivery nil and no institutional OpenURL route configured either, a job
+// that exhausts every candidate reaches exactly the pre-ADR-0017 terminal
+// path: the caller's own terminal reason, untouched.
+func TestExhaustedCandidatesNilDeliveryUnconfiguredRoute(t *testing.T) {
+	svc, jobs := newTestService(t)
+	svc.Config.AccessMode = config.ModeDelegated
+	svc.Fetch = func(context.Context, resolver.Candidate, string) (fetch.Result, error) {
+		t.Fatal("fetch must not run: this test resolves zero candidates")
+		return fetch.Result{}, nil
+	}
+	svc.Validate = passValidation()
+	svc.Resolvers = deliveryTestResolvers()
+	id, err := svc.Submit(context.Background(), deliveryWorkRequest("wr_nil_delivery_001", "10.1000/nil-delivery-001"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, _ := jobs.ClaimNext(context.Background(), "w", time.Minute)
+	if err := svc.Process(context.Background(), row); err != nil {
+		t.Fatal(err)
+	}
+	got, err := jobs.Get(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != job.StateUnavailable || got.TerminalReason != string(job.TerminalReasonNoLegalCandidates) {
+		t.Fatalf("job = %+v, want unavailable/no_legal_candidates exactly as pre-ADR-0017", got)
+	}
+	actions, err := jobs.ListHumanActions(context.Background(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(actions) != 0 {
+		t.Fatalf("actions = %+v, want none — nil Delivery must never open a document_delivery action", actions)
+	}
+}
+
+// TestExhaustedCandidatesNilDeliveryInstitutionalRouteExhausted proves the
+// same byte-for-bit contract for the OTHER pre-ADR-0017 terminal path this
+// file's default branch now also covers: an institutional OpenURL route that
+// was actually offered and exhausted still collapses to NoEntitlement when
+// s.Delivery is nil, exactly as before ADR-0017.
+func TestExhaustedCandidatesNilDeliveryInstitutionalRouteExhausted(t *testing.T) {
+	svc, jobs := newTestService(t)
+	svc.Config.AccessMode = config.ModeDelegated
+	svc.Config.Browser.OpenURLBase = "https://openurl.example.edu/resolve"
+	svc.Fetch = func(context.Context, resolver.Candidate, string) (fetch.Result, error) {
+		t.Fatal("fetch must not run: this test resolves zero candidates")
+		return fetch.Result{}, nil
+	}
+	svc.Validate = passValidation()
+	svc.Resolvers = deliveryTestResolvers()
+	id, err := svc.Submit(context.Background(), deliveryWorkRequest("wr_nil_delivery_002", "10.1000/nil-delivery-002"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Simulate the browser bridge's own institutional-route rediscovery
+	// pass already having proved the route empty (bridge.go's
+	// browser.no_entitlement_requeue), so institutionalRouteExhausted is
+	// true on this very first Process pass.
+	if err := jobs.RecordEvent(context.Background(), id, "browser.no_entitlement_requeue", map[string]any{}); err != nil {
+		t.Fatal(err)
+	}
+	row, _ := jobs.ClaimNext(context.Background(), "w", time.Minute)
+	if err := svc.Process(context.Background(), row); err != nil {
+		t.Fatal(err)
+	}
+	got, err := jobs.Get(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != job.StateUnavailable || got.TerminalReason != string(job.TerminalReasonNoEntitlement) {
+		t.Fatalf("job = %+v, want unavailable/no_entitlement exactly as pre-ADR-0017", got)
+	}
+}
+
+// TestExhaustedCandidatesUnconfiguredProfileKeepsTerminalPath proves the
+// same contract with s.Delivery wired but this job's institution profile
+// carrying no document_delivery block: Configured must stay false, and the
+// job's outcome is untouched.
+func TestExhaustedCandidatesUnconfiguredProfileKeepsTerminalPath(t *testing.T) {
+	svc, jobs, deliverySvc := newDeliveryTestService(t)
+	svc.Delivery = deliverySvc
+	svc.Resolvers = deliveryTestResolvers()
+	id, err := svc.Submit(context.Background(), deliveryWorkRequest("wr_unconfigured_001", "10.1000/unconfigured-001"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, _ := jobs.ClaimNext(context.Background(), "w", time.Minute)
+	if err := svc.Process(context.Background(), row); err != nil {
+		t.Fatal(err)
+	}
+	got, err := jobs.Get(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != job.StateUnavailable || got.TerminalReason != string(job.TerminalReasonNoLegalCandidates) {
+		t.Fatalf("job = %+v, want unavailable/no_legal_candidates — unconfigured profile must not route to delivery", got)
+	}
+	actions, err := jobs.ListHumanActions(context.Background(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(actions) != 0 {
+		t.Fatalf("actions = %+v, want none", actions)
+	}
+}
+
+// TestExhaustedCandidatesAutoCapableProfileSubmitsAndParksPending is the
+// configured-auto case: a profile compiled auto_capable submits through
+// internal/illiad, carries the idempotency key in the configured reference
+// field, creates a delivery_requests row in state submitted, and parks the
+// job retry_wait/document_delivery_pending — never awaiting_human. One
+// delivery.gate_evaluated event is appended.
+func TestExhaustedCandidatesAutoCapableProfileSubmitsAndParksPending(t *testing.T) {
+	var postedBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&postedBody); err != nil {
+			t.Fatalf("decode posted body: %v", err)
+		}
+		_, _ = w.Write([]byte(`{"TransactionNumber": 4821, "TransactionStatus": "Awaiting Request Processing"}`))
+	}))
+	defer server.Close()
+
+	svc, jobs, deliverySvc := newDeliveryTestService(t)
+	svc.Delivery = deliverySvc
+	svc.IlliadHTTPClient = server.Client()
+	svc.Config.Browser.DocumentDelivery = autoCapableDocumentDelivery(server.URL)
+	svc.Resolvers = deliveryTestResolvers()
+	ctx := context.Background()
+	if err := deliverySvc.RecordLiveAcceptance(ctx, "default", "illiad"); err != nil {
+		t.Fatal(err)
+	}
+
+	id, err := svc.Submit(ctx, deliveryWorkRequest("wr_auto_capable_001", "10.1000/auto-capable-001"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, _ := jobs.ClaimNext(ctx, "w", time.Minute)
+	if err := svc.Process(ctx, row); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != job.StateRetryWait || got.RetryAt == "" {
+		t.Fatalf("job = %+v, want retry_wait parked with a schedule", got)
+	}
+	if got.TerminalReason != "" {
+		t.Fatalf("terminal_reason = %q, want empty — a lodged request never makes a job terminal", got.TerminalReason)
+	}
+	if reason := lastTransitionReason(t, jobs, id); reason != string(job.RetryReasonDocumentDeliveryPending) {
+		t.Fatalf("retry reason = %q, want %q", reason, job.RetryReasonDocumentDeliveryPending)
+	}
+	actions, err := jobs.ListHumanActions(ctx, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(actions) != 0 {
+		t.Fatalf("actions = %+v, want none — a pending delivery is not an open action (Decision 4)", actions)
+	}
+
+	key := delivery.IdempotencyKey("default", "doi:10.1000/auto-capable-001", "illiad", "digital_journal_article")
+	reqRow, err := deliverySvc.Lookup(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reqRow == nil {
+		t.Fatal("no delivery_requests row was created")
+	}
+	if reqRow.State != delivery.StateSubmitted {
+		t.Fatalf("delivery request state = %q, want submitted", reqRow.State)
+	}
+	if reqRow.ProviderReference != "4821" {
+		t.Fatalf("provider reference = %q, want 4821", reqRow.ProviderReference)
+	}
+	if reqRow.SubmittedAt == "" {
+		t.Fatal("submitted_at was never stamped")
+	}
+
+	if postedBody["ItemInfo4"] != key {
+		t.Fatalf("posted ItemInfo4 = %v, want the idempotency key %q", postedBody["ItemInfo4"], key)
+	}
+	if postedBody["ExternalUserID"] != "patron-ref-1" {
+		t.Fatalf("posted ExternalUserID = %v, want the configured patron_ref", postedBody["ExternalUserID"])
+	}
+	if postedBody["DOI"] != "10.1000/auto-capable-001" {
+		t.Fatalf("posted DOI = %v", postedBody["DOI"])
+	}
+
+	if n := gateEventCount(t, jobs, id); n != 1 {
+		t.Fatalf("delivery.gate_evaluated events = %d, want exactly 1", n)
+	}
+}
+
+// TestExhaustedCandidatesPrefillOnlyProfileOpensAction is the
+// configured-prefill case: a profile that never compiles auto_capable
+// (kind = openurl is permanently prefill-only, ADR-0017 Decision 3A) opens
+// the document_delivery human action and parks awaiting_human — it must
+// never call internal/illiad.
+func TestExhaustedCandidatesPrefillOnlyProfileOpensAction(t *testing.T) {
+	svc, jobs, deliverySvc := newDeliveryTestService(t)
+	svc.Delivery = deliverySvc
+	const formURL = "https://ill.example.edu/request-form"
+	svc.Config.Browser.DocumentDelivery = &config.DocumentDelivery{
+		Kind:    "openurl",
+		BaseURL: formURL,
+	}
+	svc.Resolvers = deliveryTestResolvers()
+	ctx := context.Background()
+
+	id, err := svc.Submit(ctx, deliveryWorkRequest("wr_prefill_001", "10.1000/prefill-001"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, _ := jobs.ClaimNext(ctx, "w", time.Minute)
+	if err := svc.Process(ctx, row); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != job.StateAwaitingHuman {
+		t.Fatalf("job state = %q, want awaiting_human", got.State)
+	}
+	actions, err := jobs.ListHumanActions(ctx, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(actions) != 1 || actions[0].JobID != id || actions[0].Kind != job.ActionKindDocumentDelivery {
+		t.Fatalf("actions = %+v, want one document_delivery action", actions)
+	}
+	if actions[0].Detail != DeliveryPrefillActionDetail(formURL) {
+		t.Fatalf("action detail = %q, want the prefill detail for %q", actions[0].Detail, formURL)
+	}
+	if actions[0].RequiresAuth {
+		t.Fatalf("prefill action must not claim to require auth: %+v", actions[0])
+	}
+
+	key := delivery.IdempotencyKey("default", "doi:10.1000/prefill-001", "openurl", "digital_journal_article")
+	reqRow, err := deliverySvc.Lookup(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reqRow == nil || reqRow.State != delivery.StateOffered {
+		t.Fatalf("delivery request = %+v, want one row in state offered", reqRow)
+	}
+
+	if n := gateEventCount(t, jobs, id); n != 1 {
+		t.Fatalf("delivery.gate_evaluated events = %d, want exactly 1", n)
+	}
+}
+
+// TestExhaustedCandidatesReevaluationJoinsExistingPoll proves Decision 3B's
+// idempotency branch: once a request is live (submitted/pending), a later
+// re-evaluation of the SAME job must never create a second delivery_requests
+// row — it joins the existing one and re-parks retry_wait pending, still
+// without opening any human action.
+func TestExhaustedCandidatesReevaluationJoinsExistingPoll(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"TransactionNumber": 555, "TransactionStatus": "Awaiting Request Processing"}`))
+	}))
+	defer server.Close()
+
+	svc, jobs, deliverySvc := newDeliveryTestService(t)
+	svc.Delivery = deliverySvc
+	svc.IlliadHTTPClient = server.Client()
+	svc.Config.Browser.DocumentDelivery = autoCapableDocumentDelivery(server.URL)
+	svc.Resolvers = deliveryTestResolvers()
+	ctx := context.Background()
+	if err := deliverySvc.RecordLiveAcceptance(ctx, "default", "illiad"); err != nil {
+		t.Fatal(err)
+	}
+
+	id, err := svc.Submit(ctx, deliveryWorkRequest("wr_join_poll_001", "10.1000/join-poll-001"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, _ := jobs.ClaimNext(ctx, "w", time.Minute)
+	if err := svc.Process(ctx, row); err != nil {
+		t.Fatal(err)
+	}
+	firstRow, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstRow.State != job.StateRetryWait {
+		t.Fatalf("first pass job state = %q, want retry_wait", firstRow.State)
+	}
+	key := delivery.IdempotencyKey("default", "doi:10.1000/join-poll-001", "illiad", "digital_journal_article")
+	firstDelivery, err := deliverySvc.Lookup(ctx, key)
+	if err != nil || firstDelivery == nil {
+		t.Fatalf("delivery request after first pass: %v, %v", firstDelivery, err)
+	}
+
+	// Force the job back to resolving — the same "re-evaluated while a
+	// request is already live" scenario a manual retry or a scheduler wake
+	// produces — and run it through the pipeline again.
+	if err := jobs.Retry(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	row2, _ := jobs.ClaimNext(ctx, "w", time.Minute)
+	if err := svc.Process(ctx, row2); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != job.StateRetryWait {
+		t.Fatalf("second pass job state = %q, want retry_wait again (joined poll)", got.State)
+	}
+	if reason := lastTransitionReason(t, jobs, id); reason != string(job.RetryReasonDocumentDeliveryPending) {
+		t.Fatalf("second pass retry reason = %q, want %q", reason, job.RetryReasonDocumentDeliveryPending)
+	}
+	secondDelivery, err := deliverySvc.Lookup(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if secondDelivery.ID != firstDelivery.ID {
+		t.Fatalf("second pass created a different delivery_requests row (%d != %d) — Decision 1 forbids a second live request", secondDelivery.ID, firstDelivery.ID)
+	}
+	actions, err := jobs.ListHumanActions(ctx, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(actions) != 0 {
+		t.Fatalf("actions = %+v, want none — joining a poll never opens a human action", actions)
+	}
+	if n := gateEventCount(t, jobs, id); n != 1 {
+		t.Fatalf("delivery.gate_evaluated events = %d, want exactly 1 (join_poll never re-evaluates the gate)", n)
+	}
+}
+
+// TestSubmitDeliveryMatchesAutomaticRoute proves the explicit
+// operator/RPC-triggered SubmitDelivery entrypoint runs the same
+// Branch-then-gate path and job transition exhaustedCandidates' automatic
+// call takes — it is a thin fetch-the-row-then-deliveryRoute wrapper, not a
+// second implementation.
+func TestSubmitDeliveryMatchesAutomaticRoute(t *testing.T) {
+	var postedBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&postedBody); err != nil {
+			t.Fatalf("decode posted body: %v", err)
+		}
+		_, _ = w.Write([]byte(`{"TransactionNumber": 9001, "TransactionStatus": "Awaiting Request Processing"}`))
+	}))
+	defer server.Close()
+
+	svc, jobs, deliverySvc := newDeliveryTestService(t)
+	svc.Delivery = deliverySvc
+	svc.IlliadHTTPClient = server.Client()
+	svc.Config.Browser.DocumentDelivery = autoCapableDocumentDelivery(server.URL)
+	svc.Resolvers = deliveryTestResolvers()
+	ctx := context.Background()
+	if err := deliverySvc.RecordLiveAcceptance(ctx, "default", "illiad"); err != nil {
+		t.Fatal(err)
+	}
+
+	id, err := svc.Submit(ctx, deliveryWorkRequest("wr_submit_delivery_001", "10.1000/submit-delivery-001"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Claim so the job leaves queued, then move it to resolving the way
+	// Process's own queued case does (SubmitDelivery does not run the
+	// pipeline itself — like Process, it expects a caller-owned lease and a
+	// row already past the queued bookkeeping step).
+	if _, err := jobs.ClaimNext(ctx, "w", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.Transition(ctx, id, job.StateQueued, job.StateResolving, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := svc.SubmitDelivery(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Configured || result.Branch != delivery.BranchEvaluateGate || result.Decision.Action != delivery.ActionSubmit {
+		t.Fatalf("result = %+v, want Configured/evaluate_gate/submit", result)
+	}
+	if result.Request == nil || result.Request.State != delivery.StateSubmitted {
+		t.Fatalf("result.Request = %+v, want a submitted row", result.Request)
+	}
+
+	got, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != job.StateRetryWait || got.RetryAt == "" {
+		t.Fatalf("job = %+v, want retry_wait parked with a schedule", got)
+	}
+	if postedBody["DOI"] != "10.1000/submit-delivery-001" {
+		t.Fatalf("posted DOI = %v", postedBody["DOI"])
+	}
+}
+
+// TestExhaustedCandidatesConservativeModeRecordsDeliveryAdvisoryEvent proves
+// ADR-0017 Decision 3B condition 1's conservative carve-out: a configured
+// document-delivery route is discovered and recorded (a durable event) but
+// never opened as an action or submitted — no Branch/gate evaluation, no
+// delivery_requests row, no gate event, no human action at all.
+func TestExhaustedCandidatesConservativeModeRecordsDeliveryAdvisoryEvent(t *testing.T) {
+	svc, jobs, deliverySvc := newDeliveryTestService(t)
+	svc.Delivery = deliverySvc
+	svc.Config.AccessMode = config.ModeConservative
+	svc.Config.Browser.DocumentDelivery = autoCapableDocumentDelivery("https://illiad.example.edu/ILLiadWebPlatform")
+	svc.Resolvers = deliveryTestResolvers()
+	ctx := context.Background()
+	if err := deliverySvc.RecordLiveAcceptance(ctx, "default", "illiad"); err != nil {
+		t.Fatal(err)
+	}
+
+	id, err := svc.Submit(ctx, deliveryWorkRequest("wr_conservative_delivery_001", "10.1000/conservative-delivery-001"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, _ := jobs.ClaimNext(ctx, "w", time.Minute)
+	if err := svc.Process(ctx, row); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != job.StateUnavailable {
+		t.Fatalf("job state = %q, want unavailable — conservative mode never opens or submits", got.State)
+	}
+	actions, err := jobs.ListHumanActions(ctx, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(actions) != 0 {
+		t.Fatalf("actions = %+v, want none — conservative mode records an event, never an action", actions)
+	}
+	events, err := jobs.Events(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, e := range events {
+		if e["kind"] != "delivery.route_discovered" {
+			continue
+		}
+		found = true
+		detail, _ := e["detail"].(map[string]any)
+		if detail["provider"] != "illiad" {
+			t.Fatalf("delivery.route_discovered detail = %+v, want provider illiad", detail)
+		}
+	}
+	if !found {
+		t.Fatal("no delivery.route_discovered event was recorded")
+	}
+
+	key := delivery.IdempotencyKey("default", "doi:10.1000/conservative-delivery-001", "illiad", "digital_journal_article")
+	reqRow, err := deliverySvc.Lookup(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reqRow != nil {
+		t.Fatalf("delivery request = %+v, want none — conservative mode never creates a row", reqRow)
+	}
+	if n := gateEventCount(t, jobs, id); n != 0 {
+		t.Fatalf("delivery.gate_evaluated events = %d, want 0 — conservative mode never evaluates the gate", n)
+	}
+}

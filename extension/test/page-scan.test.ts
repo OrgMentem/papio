@@ -137,13 +137,39 @@ test("the page's own og:url is excluded from the bulk list", () => {
 // --- Container labels, occurrence merging -----------------------------------
 
 test("the label is the nearest citation-shaped container's normalized visible text, capped at 240 chars", () => {
-  const longTitle = "A very long citation title that goes on and on ".repeat(10).trim();
+  const longTitle = "A very long citation title that goes on and on ".repeat(8).trim();
   const result = scanDocument(
     doc(`<li>${longTitle} <a href="https://doi.org/10.1234/abcd.5678">DOI</a></li>`),
   );
   expect(result).toHaveLength(1);
   expect(result[0]?.label.length).toBeLessThanOrEqual(240);
   expect(result[0]?.label.startsWith("A very long citation title")).toBe(true);
+});
+
+test("closest()'s [class*='result'] match on a page-level wrapper is overridden by the nearest bounded row: 5 bare-div citation rows get 5 distinct labels", () => {
+  // A common non-<li>/<article> results layout: bare <div> rows (matching
+  // none of CONTAINER_SELECTOR's tag/class terms) inside one wrapper whose
+  // OWN class happens to contain "result". Pre-fix, start.closest(...) walks
+  // past every row (none matches) and returns the wrapper, so every DOI on
+  // the page gets the identical wrapper-wide (concatenated) label.
+  const rows = Array.from({ length: 5 }, (_, i) => `
+    <div class="entry">
+      Author ${i}, J. (2026). Distinctive title number ${i} about generic identifier
+      detection in citation lists rendered as bare divs, not list items.
+      <a href="https://doi.org/10.1234/row.${i}">View</a>
+    </div>
+  `).join("\n");
+  const result = scanDocument(doc(`<div class="search-results-list">${rows}</div>`));
+
+  expect(result).toHaveLength(5);
+  const labels = result.map((p) => p.label);
+  expect(new Set(labels).size).toBe(5);
+  for (let i = 0; i < 5; i += 1) {
+    expect(labels[i]).toContain(`Distinctive title number ${i}`);
+    for (let j = 0; j < 5; j += 1) {
+      if (j !== i) expect(labels[i]).not.toContain(`Distinctive title number ${j}`);
+    }
+  }
 });
 
 test("normalized label collapses internal whitespace", () => {
@@ -221,4 +247,41 @@ test("a visible sibling next to a hidden node is still scanned", () => {
     doc(`<div hidden>10.1234/hidden.one</div><p>10.1234/visible.two</p>`),
   );
   expect(identifiers(result)).toEqual([{ kind: "doi", value: "10.1234/visible.two" }]);
+});
+
+// --- extension-injected nodes: other-extension URL markers, shadow DOM -----
+
+test("an anchor whose own href is a foreign chrome-extension:// URL is skipped entirely, not merely unrecognized as a link", () => {
+  // Pre-fix: identifierFromURL rejects the chrome-extension:// scheme as a
+  // link (no known host matches), so the walk fell through to scan the
+  // anchor's own text as plain content and would have found the DOI there.
+  const result = scanDocument(
+    doc(`<li><a href="chrome-extension://other-ext-id/citation.html">10.1234/should.not.count</a></li>`),
+  );
+  expect(result).toHaveLength(0);
+});
+
+test("a container carrying a foreign moz-extension:// src marker is skipped along with everything inside it", () => {
+  const result = scanDocument(
+    doc(`<div src="moz-extension://other-ext-id/widget-frame"><p>10.1234/ancestor.marked</p></div>`),
+  );
+  expect(result).toHaveLength(0);
+});
+
+test("an extension-URL marker on one element does not suppress an unrelated sibling elsewhere in the page", () => {
+  const result = scanDocument(
+    doc(`<div><img src="chrome-extension://other-ext-id/icon.png"></div><p>10.1234/visible.sibling</p>`),
+  );
+  expect(identifiers(result)).toEqual([{ kind: "doi", value: "10.1234/visible.sibling" }]);
+});
+
+test("text placed only inside a Shadow DOM subtree is never scanned (childNodes never crosses a shadow boundary)", () => {
+  const document = doc(`<div id="host"></div>`);
+  const host = document.getElementById("host") as unknown as {
+    attachShadow(init: { mode: "open" }): { innerHTML: string };
+  };
+  const shadow = host.attachShadow({ mode: "open" });
+  shadow.innerHTML = "<p>10.1234/injected.shadow</p>";
+  const result = scanDocument(document);
+  expect(result).toHaveLength(0);
 });

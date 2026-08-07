@@ -463,9 +463,37 @@ test("page bulk status and submit messages round-trip through the shared corpus"
     "browser-page-bulk-status-request-bad-kind.json",
     "browser-page-bulk-submit-request-too-many-keys.json",
     "browser-page-bulk-submit-request-origin-with-path.json",
+    "browser-page-bulk-submit-request-origin-uppercase-host.json",
   ]) {
     expect(() => parseBrowserMessageBytes(readFileSync(join(corpusRoot, "invalid", name), "utf8")), name).toThrow(ProtocolError);
   }
+});
+
+test("page_bulk_submit_request.source.origin rejects a mixed-case host", () => {
+  // Go's PageBulkSubmitSource.validate() used to call the permissive
+  // validResolverOrigin (no host-case comparison at all), so
+  // "https://Scholar.Example.EDU" decoded there while this parser's
+  // round-trip check and protocol/browser-v1.schema.json's lowercase-only
+  // pattern already rejected it — the same divergence direction
+  // session_evidence.origin_hint hit before (see the "rejects a mixed-case
+  // host" test above). Go now reuses validateBareLowercaseOrigin for
+  // source.origin instead of a third copy of the rule. See
+  // testdata/protocol/invalid/browser-page-bulk-submit-request-origin-
+  // uppercase-host.json for the shared-corpus half of this contract.
+  const frame = (origin: string) => ({
+    protocol: "papio-browser/1",
+    type: "page_bulk_submit_request",
+    msg_id: "m_bulk_submit_origin_case",
+    seq: 1,
+    payload: {
+      request_id: "request-bulk-0002",
+      scan_id: "scan-bulk-0001",
+      canonical_keys: ["work-key-1"],
+      source: { kind: "browser_page", origin, detector: "generic-identifiers/1" },
+    },
+  });
+  expect(() => parseBrowserMessage(frame("https://Scholar.Example.EDU"))).toThrow(ProtocolError);
+  expect(parseBrowserMessage(frame("https://scholar.example.edu")).type).toBe("page_bulk_submit_request");
 });
 
 test("page_bulk_status_request rejects malformed identifiers", () => {

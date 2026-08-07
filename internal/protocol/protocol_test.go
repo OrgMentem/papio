@@ -914,6 +914,10 @@ func TestPageBulkPayloadRoundTripAndValidation(t *testing.T) {
 			"request_id": "request-bulk-0002", "scan_id": "scan-bulk-0001", "canonical_keys": []string{"work-key-1"},
 			"source": map[string]any{"kind": "browser_page", "origin": "https://scholar.example.edu?x=1", "detector": "generic-identifiers/1"},
 		}},
+		{name: "origin with uppercase host", payload: map[string]any{
+			"request_id": "request-bulk-0002", "scan_id": "scan-bulk-0001", "canonical_keys": []string{"work-key-1"},
+			"source": map[string]any{"kind": "browser_page", "origin": "https://Scholar.Example.EDU", "detector": "generic-identifiers/1"},
+		}},
 		{name: "non-https origin", payload: map[string]any{
 			"request_id": "request-bulk-0002", "scan_id": "scan-bulk-0001", "canonical_keys": []string{"work-key-1"},
 			"source": map[string]any{"kind": "browser_page", "origin": "http://scholar.example.edu", "detector": "generic-identifiers/1"},

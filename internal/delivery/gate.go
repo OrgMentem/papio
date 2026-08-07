@@ -294,7 +294,13 @@ func EvaluateGate(profile GateProfile, req GateRequest) Decision {
 	if req.EffectiveAccessMode != config.ModeDelegated {
 		ok = false
 	}
-	// Condition 2: submit_policy is auto_if_unconditional.
+	// Condition 2: submit_policy is auto_if_unconditional. NOTE: conditions
+	// 2, 5, and 6 are also compile-time facts — CompileGateProfile never
+	// yields an auto_capable class when any of them fails, so through the
+	// real ResolveGateProfile → EvaluateGate pipeline these branches are
+	// defense-in-depth against a hand-built or future profile source, not
+	// live per-request checks. The genuinely per-request conditions are 1
+	// (access mode), 3 (request class), 4 (required fields), and 7 (cap).
 	if profile.SubmitPolicy != "auto_if_unconditional" {
 		ok = false
 	}

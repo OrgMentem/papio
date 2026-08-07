@@ -50,6 +50,13 @@ async function pageBulkDocument(
           requests.push(message);
           return reply(message);
         },
+        // A relocated popup page (not the dist/popup.html default) proves the
+        // inbox link is derived from the manifest and not a hardcoded
+        // sibling literal: pre-fix code always opened "inbox.html" at the
+        // extension root regardless of where the manifest declares the
+        // popup, a path build.ts never actually writes (mirrors popup.test.ts's
+        // "history launcher opens the manifest-derived history page" test).
+        getManifest: () => ({ action: { default_popup: "dist/ui/popup.html" } }),
         getURL: (path: string) => `chrome-extension://test-id/${path}`,
       },
       tabs: {
@@ -392,7 +399,7 @@ test("the result panel renders submitted/joined/already-owned/invalid counts and
   expect(summary?.textContent).toContain("1 already owned");
   expect(summary?.textContent).toContain("1 invalid");
   const link = summary?.querySelector("a");
-  expect(link?.getAttribute("href")).toBe("chrome-extension://test-id/inbox.html");
+  expect(link?.getAttribute("href")).toBe("chrome-extension://test-id/dist/ui/inbox.html");
   expect(link?.textContent).toBe("Open inbox");
 });
 
@@ -419,6 +426,77 @@ test("Rescan loads a fresh snapshot with rows unselected again", async () => {
 
   expect(page.document.querySelectorAll(".pb-row")).toHaveLength(2);
   expect(checkbox(page.document, "id-1")?.checked).toBe(false);
+});
+
+test("a stale generation-1 status reply that resolves after a rescan never overwrites the fresh generation-2 rows", async () => {
+  const initial = snapshot({ documentGeneration: 1, items: [paper({ localId: "id-1" })] });
+  const rescanned = snapshot({
+    documentGeneration: 2,
+    items: [paper({ localId: "id-1" }), paper({ localId: "id-9", identifier: { kind: "pmid", value: "999" } })],
+  });
+  const { promise: staleStatusReply, resolve: resolveStaleStatus } = Promise.withResolvers<unknown>();
+  let statusAttempts = 0;
+  const page = await pageBulkDocument("scan-1", (message) => {
+    if (message.type === "papio.pageBulk.load") return { ok: true, snapshot: initial };
+    if (message.type === "papio.pageBulk.rescan") return { ok: true, snapshot: rescanned };
+    if (message.type === "papio.pageBulk.status") {
+      statusAttempts += 1;
+      // The generation-1 request (issued by the initial load) never
+      // resolves on its own — it is resolved by hand, after the rescan
+      // below has already applied generation-2 rows. The generation-2
+      // request (issued by handleRescan's own loadStatus() call) resolves
+      // immediately with real statuses.
+      if (statusAttempts === 1) return staleStatusReply;
+      return { ok: true, items: [eligibleStatus("id-1"), eligibleStatus("id-9")], truncated: false };
+    }
+    return { ok: true, allowed: false };
+  });
+
+  expect(statusAttempts).toBe(1);
+
+  (page.document.getElementById("rescan-btn") as HTMLButtonElement).click();
+  await settle();
+
+  expect(statusAttempts).toBe(2);
+  expect(page.document.querySelectorAll(".pb-row")).toHaveLength(2);
+  expect(checkbox(page.document, "id-1")?.disabled).toBe(false);
+
+  // Resolve the stale generation-1 reply late, claiming id-1 is already
+  // owned (which would disable and mark it "Already in your library" if it
+  // were wrongly applied to the current, generation-2 row).
+  resolveStaleStatus({
+    ok: true,
+    items: [{ local_id: "id-1", canonical_key: "work:stale", status: "owned_with_pdf", ownership_complete: true }],
+    truncated: false,
+  });
+  await settle();
+
+  expect(checkbox(page.document, "id-1")?.disabled).toBe(false);
+  expect(row(page.document, "id-1")?.dataset["status"]).toBe("eligible");
+});
+
+test("the status Retry button is disabled while a Rescan is in flight, like the Rescan button itself", async () => {
+  const snap = snapshot();
+  const { promise: rescanReply, resolve: resolveRescan } = Promise.withResolvers<unknown>();
+  const page = await pageBulkDocument("scan-1", (message) => {
+    if (message.type === "papio.pageBulk.status" && message.request["scan_id"] === "scan-1") {
+      return { ok: false, error: { code: "unavailable", message: "status failed" } };
+    }
+    if (message.type === "papio.pageBulk.rescan") return rescanReply;
+    return standardReply(snap, [eligibleStatus("id-1")])(message);
+  });
+
+  expect(page.document.getElementById("status-error")?.hidden).toBe(false);
+  const retryButton = page.document.getElementById("status-retry-btn") as HTMLButtonElement;
+  expect(retryButton.disabled).toBe(false);
+
+  (page.document.getElementById("rescan-btn") as HTMLButtonElement).click();
+  await settle();
+  expect(retryButton.disabled).toBe(true);
+
+  resolveRescan({ ok: true, snapshot: snap });
+  await settle();
+  expect(retryButton.disabled).toBe(false);
 });
 
 // --- source-tab-closed state -------------------------------------------------

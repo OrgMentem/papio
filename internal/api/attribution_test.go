@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"papio/internal/config"
+	"papio/internal/delivery"
 	"papio/internal/job"
 	"papio/internal/work"
 )
@@ -425,5 +426,119 @@ func TestArtifactsValidationReturnsEvidenceNewestFirstAndEmptyWhenAbsent(t *test
 	}
 	if empty.JobID != emptyID || empty.Reports == nil || len(empty.Reports) != 0 {
 		t.Fatalf("validation result without evidence = %+v, want non-nil empty reports", empty)
+	}
+}
+
+// TestJobsGetV3CarriesDeliverySectionWhenPresent seeds a delivery_requests
+// row plus a recorded gate verdict and asserts jobs.get_v3 surfaces both
+// (ADR-0017 Decision 5) without disturbing the jobs.get_v2 fields it wraps.
+func TestJobsGetV3CarriesDeliverySectionWhenPresent(t *testing.T) {
+	system := testSystem(t)
+	if system.App == nil || system.App.Delivery == nil {
+		t.Fatal("system.App.Delivery is nil; bootstrap must wire a delivery.Service")
+	}
+	ctx := context.Background()
+	jobID := createAPIAttributionTestJob(t, system.Jobs, "api-job-get-v3-delivery", "10.1000/api-job-get-v3-delivery", "inscribi")
+
+	request, err := system.App.Delivery.Create(ctx, delivery.CreateRequest{
+		JobID: jobID, InstitutionProfile: "test-university", Provider: "illiad",
+		RequestClass: "digital_journal_article", WorkIdentity: "10.1000/api-job-get-v3-delivery",
+	})
+	if err != nil {
+		t.Fatalf("create delivery request: %v", err)
+	}
+	if err := system.App.Delivery.UpdateState(ctx, request.ID, delivery.StateSubmitted); err != nil {
+		t.Fatalf("submit delivery request: %v", err)
+	}
+	nextCheck := time.Now().UTC().Add(time.Hour)
+	if err := system.App.Delivery.RecordPoll(ctx, request.ID, "ILLIAD-REF-1", nextCheck); err != nil {
+		t.Fatalf("record poll: %v", err)
+	}
+	if err := system.App.Delivery.AppendGateEvent(ctx, jobID, delivery.GateEvaluated{
+		ProfileClass: delivery.GateClassAutoCapable, ProfileDigest: "digest-1",
+		Decision: delivery.Decision{Action: delivery.ActionSubmit},
+	}); err != nil {
+		t.Fatalf("append gate event: %v", err)
+	}
+
+	var rawDetail map[string]json.RawMessage
+	if rpcErr := callMethod(t, Router(system), "jobs.get_v3", map[string]string{"job_id": jobID}, &rawDetail); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	deliveryRaw, ok := rawDetail["delivery"]
+	if !ok {
+		t.Fatalf("jobs.get_v3 result = %v, want a delivery key", rawDetail)
+	}
+	var summary DeliverySummary
+	if err := json.Unmarshal(deliveryRaw, &summary); err != nil {
+		t.Fatalf("decode delivery summary: %v", err)
+	}
+	want := DeliverySummary{
+		Provider: "illiad", Reference: "ILLIAD-REF-1", State: string(delivery.StateSubmitted),
+		NextCheckAt: nextCheck.Format(time.RFC3339Nano), GateClass: string(delivery.GateClassAutoCapable),
+	}
+	if summary.Provider != want.Provider || summary.Reference != want.Reference || summary.State != want.State ||
+		summary.NextCheckAt != want.NextCheckAt || summary.GateClass != want.GateClass || len(summary.GateBlockers) != 0 {
+		t.Fatalf("delivery summary = %+v, want %+v", summary, want)
+	}
+	if summary.SubmittedAt == "" || summary.LastCheckedAt == "" {
+		t.Fatalf("delivery summary = %+v, want submitted_at and last_checked_at stamped", summary)
+	}
+
+	// jobs.get_v2's fields are untouched by the wrapper.
+	var v2Job map[string]json.RawMessage
+	if err := json.Unmarshal(rawDetail["job"], &v2Job); err != nil {
+		t.Fatalf("decode job: %v", err)
+	}
+	var jobID2 string
+	if err := json.Unmarshal(v2Job["id"], &jobID2); err != nil || jobID2 != jobID {
+		t.Fatalf("job.id = %q (err %v), want %q", jobID2, err, jobID)
+	}
+}
+
+// TestJobsGetV3ReportsGateClassAndBlockersWhenPrefillBlocked pins the
+// blocked-gate shape: a gate that routed to prefill still surfaces its class
+// and closed-vocabulary blockers, not just an auto_capable/submit success
+// case.
+func TestJobsGetV3ReportsGateClassAndBlockersWhenPrefillBlocked(t *testing.T) {
+	system := testSystem(t)
+	ctx := context.Background()
+	jobID := createAPIAttributionTestJob(t, system.Jobs, "api-job-get-v3-blocked", "10.1000/api-job-get-v3-blocked", "inscribi")
+	if _, err := system.App.Delivery.Create(ctx, delivery.CreateRequest{
+		JobID: jobID, InstitutionProfile: "test-university", Provider: "openurl",
+		RequestClass: "digital_journal_article", WorkIdentity: "10.1000/api-job-get-v3-blocked",
+	}); err != nil {
+		t.Fatalf("create delivery request: %v", err)
+	}
+	if err := system.App.Delivery.AppendGateEvent(ctx, jobID, delivery.GateEvaluated{
+		ProfileClass: delivery.GateClassPrefillOnly, ProfileDigest: "digest-2",
+		Decision: delivery.Decision{Action: delivery.ActionPrefill, Blockers: []string{delivery.BlockerAPICredentialMissing}},
+	}); err != nil {
+		t.Fatalf("append gate event: %v", err)
+	}
+
+	var detail JobDetailV3
+	if rpcErr := callMethod(t, Router(system), "jobs.get_v3", map[string]string{"job_id": jobID}, &detail); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	if detail.Delivery == nil || detail.Delivery.GateClass != string(delivery.GateClassPrefillOnly) ||
+		len(detail.Delivery.GateBlockers) != 1 || detail.Delivery.GateBlockers[0] != delivery.BlockerAPICredentialMissing {
+		t.Fatalf("delivery summary = %+v, want prefill_only with one blocker", detail.Delivery)
+	}
+}
+
+// TestJobsGetV3OmitsDeliveryWhenAbsent is the common case: a job that never
+// routed through document delivery carries no delivery key at all, not a
+// null or zero-value object.
+func TestJobsGetV3OmitsDeliveryWhenAbsent(t *testing.T) {
+	system := testSystem(t)
+	jobID := createAPIAttributionTestJob(t, system.Jobs, "api-job-get-v3-absent", "10.1000/api-job-get-v3-absent", "")
+
+	var rawDetail map[string]json.RawMessage
+	if rpcErr := callMethod(t, Router(system), "jobs.get_v3", map[string]string{"job_id": jobID}, &rawDetail); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	if _, ok := rawDetail["delivery"]; ok {
+		t.Fatalf("jobs.get_v3 result = %v, want no delivery key for a job never routed through document delivery", rawDetail)
 	}
 }
