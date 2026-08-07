@@ -13,8 +13,12 @@ are JSON; object keys below are JSON keys.
 
 ## Read resources
 
-All resources return JSON. They expose recent durable state; they do not create
-jobs, export bundles, or mutate Zotero.
+All resources return JSON, each result wrapped in the same two-key envelope
+the CLI's `--json` list output uses (see the [command reference](commands.md#json-output-contract)'s
+JSON output contract): `{"<name>": [...], "truncated": false}`, never a bare
+array. `papio_command_run` inherits this contract from whichever CLI command
+it runs. They expose recent durable state; they do not create jobs, export
+bundles, or mutate Zotero.
 
 | Resource | Contents |
 | --- | --- |
@@ -30,7 +34,7 @@ The default command surface contains these two tools:
 
 | Tool | Parameters | Result and boundary |
 | --- | --- | --- |
-| `papio_command_search` | `query` (optional case-insensitive substring match over command names and summaries); `name` (optional exact, space-separated command path, such as `"zotio apply"`) | Returns JSON. Omit both parameters to list every runnable command. Supplying `name` returns that command's summary, `read_only`, `takes_args`, and command-local `flags` (each flag's name, type, default, and description). |
+| `papio_command_search` | `query` (optional case-insensitive substring match over command names and summaries); `name` (optional exact, space-separated command path, such as `"zotio apply"`) | Returns JSON. Omitting both parameters returns a bare JSON array of command summaries — the one tool result that is not the `{"<name>": [...], "truncated": ...}` envelope. Supplying `name` returns that command's summary, `read_only`, `takes_args`, and command-local `flags` (each flag's name, type, default, and description). |
 | `papio_command_run` | `name` (required exact, space-separated command path, such as `"status"` or `"zotio apply"`); `flags` (optional object of command-local flags by name); `args` (optional string of positional arguments only) | Executes the command in-process against the same daemon, jobs, and zotio boundary as the CLI, and returns JSON. The server injects `--json`. Raw flag tokens in `args` are rejected. Inherited global `--config` and `--json` flags are never exposed and are rejected. |
 
 The facade therefore reaches `papio jobs receipt`, `papio jobs

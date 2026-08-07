@@ -413,7 +413,7 @@ papio delivery cancel <job-id>
 
 ### `papio delivery confirm-absent`
 
-Confirm no request exists at the provider and re-run the gate for a fresh decision
+Confirm no request exists at the provider, cancel the stale row, and reopen reconciliation for a deliberate decision (v1 never auto-resubmits)
 
 ```
 papio delivery confirm-absent <job-id>

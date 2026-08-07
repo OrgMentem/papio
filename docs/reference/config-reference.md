@@ -58,6 +58,7 @@ the configuration change.
 | `proquest_account_id` | string digits | empty | Default institution's ProQuest account id (digits, max 64). When set, *papio* appends `?accountid=<id>` to unlock the institution's ProQuest link-resolver without a manual sign-in. Empty disables the append. During `papio init` you may paste a ProQuest URL containing `accountid=` instead of the bare id. |
 | `libkey_mode` | string | empty | LibKey routing for the default institution: empty or `off` disables it; `link` routes DOI/PMID handoffs through the keyless `libkey.io/libraries/<id>/<doi-or-pmid>` institution link ahead of the bare OpenURL resolver, falling back to OpenURL for works without a DOI or PMID and whenever LibKey is unavailable. `api` is reserved and rejected (not implemented). Requires `libkey_library_id` when set to `link`. |
 | `libkey_library_id` | integer | `0` | The institution's numeric Third Iron library id — the number in its BrowZine/LibKey.io URL (`…/libraries/<id>/…`). Required (positive) when `libkey_mode = "link"`; setting it without `link` mode is rejected rather than left silently dead. |
+| `default_resolver` | string | empty | Named `[browser.resolvers.<name>]` profile used when a request omits `resolver` (e.g. `papio acquire` without `--resolver`). Empty preserves the historical default institution. Must name a configured profile — the implicit `default` profile (when `openurl_base_url` is set) or a `[browser.resolvers.<name>]` key; an unconfigured name is rejected at load. |
 | `download_adoption_root` | path string | empty | Root for browser-download adoption. When empty, the effective value is `<data_dir>/adoptions`; adoption is confined to a job subdirectory beneath this root. |
 | `action_expiry_seconds` | integer seconds | `1800` | Browser-handoff expiry and the initial age before an open human action is reminded. Later reminders double their per-action interval through 24 hours. It must not be negative. |
 
@@ -76,11 +77,13 @@ native messaging host installs on the first run.
 ### `[browser.resolvers]`
 
 Named resolver profiles are per-institution tables keyed by a lowercase
-alphanumeric name. Each carries its own OpenURL base and, optionally, the same
-`shibboleth_entity_id`, `proquest_account_id`, `libkey_mode`, and
-`libkey_library_id` fields as the default
-`[browser]` institution — so a multi-institution user routes each job's login
-to the right library instead of inheriting the default's identity:
+alphanumeric name; `default` is reserved for the implicit top-level
+institution and is rejected at load if used as a profile key. Each carries
+its own OpenURL base and, optionally, the same `shibboleth_entity_id`,
+`proquest_account_id`, `libkey_mode`, and `libkey_library_id` fields as the
+default `[browser]` institution — so a multi-institution user routes each
+job's login to the right library instead of inheriting the default's
+identity:
 
 ```toml
 [browser.resolvers.campus]
@@ -101,6 +104,11 @@ Select one with `papio acquire --resolver campus`, `papio acquire --batch
 works.json --resolver campus`, or the corresponding MCP field. The selected
 name is snapshotted in the job policy, so re-opened actions cannot silently
 fall back to another institution.
+
+Set `browser.default_resolver` to one of these names (or leave it empty) to
+choose which profile an omitted `resolver` uses; an explicit
+`--resolver`/MCP `resolver` value always takes precedence, and an
+unconfigured `default_resolver` value is rejected at load.
 
 On a tracked Alma/Primo resolver page, the extension may follow the first
 same-origin `resolveService` link selected by the institution's Online Services
@@ -237,6 +245,12 @@ state. See the [filing guide](../guide/hooks.md).
 | `webhook_url` | string URL | empty | When set, every notification is also delivered as a JSON POST (`{source, event, message, watch_id, watch_label, count, sent_at}`; plain notices carry only `source`, `message`, `sent_at`). Independent of `enabled`, which governs only the desktop channel. Must be an absolute http(s) URL. Delivery is best-effort and never fails the triggering work. |
 | `webhook_secret` | string | empty | Sent as `Authorization: Bearer <secret>` on webhook posts. Requires `webhook_url`. |
 
+## `[updates]`
+
+| Key | Type | Default | Effect and constraints |
+| --- | --- | --- | --- |
+| `check` | boolean | `false` | Enables the daemon's once-daily background check for a newer *papio* or zotio release against GitHub's public release API. Sends no identifier, count, or telemetry beyond the anonymous request GitHub receives for any web hit. See [Privacy](../privacy.md). `papio init`'s guided setup suggests enabling it (non-interactive `--check-updates` also defaults `true`); the config default when the key is absent (or on a config written before this key existed) is `false`. `papio doctor` reports the check as skipped while it is off. |
+
 ## `[discovery]`
 
 | Key | Type | Default | Effect and constraints |
@@ -257,9 +271,16 @@ is measured in days.
 
 ## `[sources.<name>]`
 
-`[sources]` is a map of resolver policies. The supported built-in names are
-`arxiv`, `europepmc`, `unpaywall`, `openalex`, `core`, `crossref_tdm`,
-`semanticscholar`, and `openaire`. For `semanticscholar`, `enabled` governs
+`[sources]` is a map of resolver policies. Its keys are whitelisted
+separately from *papio*'s general strict-unknown-field rejection: the map
+itself decodes freely, and `validate()` rejects an unrecognized key at load
+with the list below. The valid names are `arxiv`, `europepmc`, `unpaywall`,
+`openalex`, `core`, `crossref_tdm`, `crossref_metadata`, `retraction_watch`,
+`semanticscholar`, and `openaire`. One further name, `openalex_content`, is
+a removed key: an earlier *papio* release wrote it into `Default()` and no
+adapter for it ever shipped, so a config carrying it loads normally and
+drops the key silently rather than breaking on upgrade — it is not a valid
+key to add yourself. For `semanticscholar`, `enabled` governs
 the acquisition resolver (open-access PDF lookup by exact DOI, arXiv id, or
 PMID); selection as a *search* backend is separate and lives in `[discovery]`
 (which reads this section's `api_key`). For `openaire`, candidates come from
@@ -288,6 +309,8 @@ ceiling. Each named section accepts these keys:
 | `openaire` | `true` | 0.016 | 1 |
 | `core` | `false` | 0.4 | 1 |
 | `crossref_tdm` | `false` | 1 | 1 |
+| `crossref_metadata` | `true` | 1 | 1 |
+| `retraction_watch` | `true` | 1 | 1 |
 | `semanticscholar` | `true` | 1 | 1 |
 
 ## Watch configuration
