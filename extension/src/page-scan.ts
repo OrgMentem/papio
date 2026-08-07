@@ -245,7 +245,40 @@ export function scanDocument(root: Document | Element = document): ScanResult {
       }
     }
     const raw = visibleText(container).replace(/\s+/g, " ").trim();
-    return stripServiceChrome(raw).slice(0, MAX_LABEL_CHARS);
+    const label = stripServiceChrome(raw);
+    if (!isLowInformationLabel(label)) return label.slice(0, MAX_LABEL_CHARS);
+    // Card layouts (Semantic Scholar result cards, and friends) put the
+    // identifier link in a small action-button row — "Publisher · Save ·
+    // Cite" — while the title lives in a sibling subtree of a card too
+    // large for the bounded climb. The card is exactly the first ancestor
+    // the climb refused, and cards title themselves with a heading: rescue
+    // that heading rather than labeling a row of buttons.
+    let card: Element | null = container.parentElement;
+    while (card !== null && card.tagName !== "BODY" && card.tagName !== "HTML") {
+      if (visibleText(card).length > BOUNDED_CONTAINER_CHARS) break;
+      card = card.parentElement;
+    }
+    if (card !== null && card.tagName !== "BODY" && card.tagName !== "HTML") {
+      const heading = card.querySelector("h1, h2, h3, h4, h5, h6, [role='heading']");
+      if (heading !== null && !isHiddenSelf(heading) && !isExtensionInjected(heading)) {
+        const title = visibleText(heading).replace(/\s+/g, " ").trim();
+        if (title.length >= 8) return title.slice(0, MAX_LABEL_CHARS);
+      }
+    }
+    return label.slice(0, MAX_LABEL_CHARS);
+  }
+
+  /** A label that is nothing but action chrome — "9 PDF (opens in a new
+   * tab) Springer Nature Save Cite" — identifies no paper. Low information
+   * = what remains after removing bracketed asides, standalone numbers,
+   * and common action words is shorter than a minimal title. */
+  function isLowInformationLabel(label: string): boolean {
+    const residue = label
+      .replace(/\((?:opens in a new tab|new tab|external link)\)/gi, " ")
+      .replace(/\b(?:publisher|pdf|html|save|cite|expand|collapse|share|springer nature|elsevier|wiley|open access)\b/gi, " ")
+      .replace(/[\d\s[\](),.·|:;-]+/g, " ")
+      .trim();
+    return residue.length < 12;
   }
 
   interface MergedEntry {

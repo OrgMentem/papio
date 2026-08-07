@@ -384,3 +384,31 @@ test("non-DOI numeric paths never match the generic segment rule", () => {
     expect(result.papers.length).toBe(0);
   }
 });
+
+test("card layouts label from the card heading when the identifier sits in an action row", () => {
+  // Semantic Scholar-shaped card: title in a heading, identifier link in a
+  // small button row, card text well past the bounded-container limit.
+  const filler = "TLDR This paper studies preconditioning methods at considerable length. ".repeat(8);
+  const result = scanDocument(
+    doc(
+      `<div class="result-page">
+        <article class="card">
+          <h3><a href="/paper/some-slug/12345">A new version of a preconditioning method for certain two-by-two block matrices</a></h3>
+          <div class="authors">O. Axelsson, DK Salkuyeh</div>
+          <div class="tldr">${filler}</div>
+          <div class="actions">9 <a href="https://doi.org/10.1007/s10543-018-0741-x">Publisher (opens in a new tab)</a> <button>Save</button> <button>Cite</button></div>
+        </article>
+      </div>`,
+    ),
+  );
+  expect(result.papers.length).toBe(1);
+  expect(result.papers[0]!.label).toContain("preconditioning method for certain two-by-two block matrices");
+  expect(result.papers[0]!.label).not.toMatch(/opens in a new tab|Save|Cite/i);
+});
+
+test("a real citation label is never mistaken for low-information chrome", () => {
+  const result = scanDocument(
+    doc(`<li>Aina, C. (2013). Parental background and university dropout. <a href="https://doi.org/10.1007/s10734-012-9554-z">CrossRef</a></li>`),
+  );
+  expect(result.papers[0]!.label).toContain("Parental background and university dropout");
+});
