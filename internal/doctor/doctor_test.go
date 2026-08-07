@@ -76,6 +76,70 @@ func TestRunReadyProfilePassesWithoutLeakingSecrets(t *testing.T) {
 	}
 }
 
+// TestCheckAdoptionRootTimesOutAndFailsWithGrantRemediation reproduces the
+// TCC wall a download_adoption_root under ~/Downloads can hit: ReadDir
+// blocks in-kernel forever waiting on a consent decision doctor can never
+// supply. The probe must still return, bounded, and report a Fail naming
+// the real remediation instead of hanging the whole doctor run.
+func TestCheckAdoptionRootTimesOutAndFailsWithGrantRemediation(t *testing.T) {
+	original := adoptionRootReadDir
+	block := make(chan struct{})
+	t.Cleanup(func() {
+		close(block)
+		adoptionRootReadDir = original
+	})
+	adoptionRootReadDir = func(string) ([]os.DirEntry, error) {
+		<-block
+		return nil, errors.New("unreachable in this test")
+	}
+
+	cfg := config.Default()
+	cfg.DataDir = t.TempDir()
+
+	var checks []Check
+	add := func(name, status, detail, remediation string) {
+		checks = append(checks, Check{Name: name, Status: status, Detail: detail, Remediation: remediation})
+	}
+	start := time.Now()
+	checkAdoptionRoot(cfg, add)
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("checkAdoptionRoot took %s, want bounded near the scan deadline", elapsed)
+	}
+	if len(checks) != 1 {
+		t.Fatalf("checks = %#v, want exactly one", checks)
+	}
+	c := checks[0]
+	if c.Name != "adoption_root" || c.Status != Fail {
+		t.Fatalf("check = %#v, want a Fail adoption_root check", c)
+	}
+	if !strings.Contains(c.Remediation, "System Settings") ||
+		!strings.Contains(c.Remediation, "Full Disk Access") ||
+		!strings.Contains(c.Remediation, "download_adoption_root") {
+		t.Fatalf("remediation = %q, want the TCC grant steps naming download_adoption_root", c.Remediation)
+	}
+}
+
+// TestCheckAdoptionRootMissingDirIsHealthy asserts ENOENT stays Pass: the
+// root simply has not been created yet (today's pre-first-download state),
+// not a permissions or hang failure.
+func TestCheckAdoptionRootMissingDirIsHealthy(t *testing.T) {
+	cfg := config.Default()
+	cfg.DataDir = t.TempDir() // adoptions/ under this root does not exist yet
+
+	var checks []Check
+	add := func(name, status, detail, remediation string) {
+		checks = append(checks, Check{Name: name, Status: status, Detail: detail, Remediation: remediation})
+	}
+	checkAdoptionRoot(cfg, add)
+	if len(checks) != 1 {
+		t.Fatalf("checks = %#v, want exactly one", checks)
+	}
+	c := checks[0]
+	if c.Name != "adoption_root" || c.Status != Pass {
+		t.Fatalf("check = %#v, want a Pass adoption_root check for a not-yet-created root", c)
+	}
+}
+
 // An acquisition nobody exported is the one thing a consumer structurally
 // cannot detect for itself: a job is stranded precisely when the key naming it
 // stops being derivable, so the orphan is the job the consumer can no longer

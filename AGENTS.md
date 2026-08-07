@@ -136,6 +136,22 @@ There is also a link check, because `zensical build` prints a broken link as an
   daemon leaves its unix socket file behind (never runs its own cleanup), so a subsequent
   command hangs connecting to a dead socket; `rm` the socket at the configured `--socket` path
   and restart before assuming a code-level bug.
+- **macOS TCC can hang the daemon's `open(2)` on `~/Downloads/papio` — and every
+  `make dev-deploy` re-arms it.** `download_adoption_root` lives under `~/Downloads`
+  (it must: Chrome's `onDeterminingFilename` can only steer downloads to relative
+  paths inside the browser's download root), and Downloads is TCC-protected. A
+  daemon launched from a context without the Files-and-Folders grant doesn't get a
+  clean `EPERM` — the syscall blocks in-kernel on tccd (the process ignores SIGTERM
+  mid-open; `kill -9` only). Consent is per-binary-signature, so every dev rebuild
+  resets it. This used to wedge EVERY daemon RPC (adoption scans ran under the
+  bridge mutex — three goroutine dumps in one night's `daemon.log` before diagnosis);
+  scans are now bounded+latched so the daemon stays responsive and `papio doctor`
+  names the adoption root's health with the grant remediation. If doctor shows the
+  adoption-root check failing after a deploy: System Settings → Privacy & Security →
+  grant the papio binary folder access (or start the daemon from a terminal that has
+  it). Diagnose live hangs with `kill -QUIT <pid>` — the dump lands in
+  `<data-dir>/daemon.log`; a goroutine parked in `os.ReadDir` under
+  `scanAdoptionDir`'s call stack is this footgun.
 - **A long-running local dev `papio.db` can hold rows that predate a later validation.**
   `job.WithHumanActionBinding` (quarantine_path/sha256 non-empty) only applies to actions
   created *through* that code path going forward — pre-existing rows from before the guard

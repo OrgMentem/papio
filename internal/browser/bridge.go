@@ -228,6 +228,24 @@ type Bridge struct {
 	// session keeps the unchanged page_capture content frame unambiguous.
 	pendingCaptures map[string]*pendingPageCapture
 	now             func() time.Time
+	// readDir is the adoption-directory ReadDir seam; nil in production,
+	// where readAdoptionDir falls back to os.ReadDir. Tests substitute a
+	// blocking or error-returning func to exercise adoptionScanSuspended
+	// below without a real TCC-protected filesystem.
+	readDir func(string) ([]os.DirEntry, error)
+	// adoptionScanMu guards the field below. It is deliberately its own
+	// lock, never b.mu: a ReadDir call that hangs behind a TCC consent wall
+	// (see scanAdoptionDir) must never hold the session lock, or every other
+	// bridge RPC wedges behind it — the exact incident this latch exists to
+	// prevent.
+	adoptionScanMu sync.Mutex
+	// adoptionScanSuspended latches true the instant one adoption-directory
+	// ReadDir call misses adoptionScanDeadline. A hung syscall can block
+	// forever, so every scan while this is true short-circuits to "nothing
+	// adoptable" without spawning another goroutine — at most one hung call
+	// is ever outstanding per bridge. The goroutine that tripped it clears
+	// the flag, and logs the recovery, the moment it finally returns.
+	adoptionScanSuspended bool
 }
 
 // browserSession is one native-host connection that said hello.
@@ -286,6 +304,7 @@ func NewBridge(jobs *job.Store, svc *app.Service, triageService *triage.Service,
 		pendingCaptures:  map[string]*pendingPageCapture{},
 		pending:          map[string]*browserSession{},
 		now:              time.Now,
+		readDir:          os.ReadDir,
 	}
 }
 
@@ -2957,6 +2976,87 @@ func (b *Bridge) adoptWithContext(ctx context.Context, jobID, filename string, p
 	return b.svc.AdoptDownloadWithContextCandidate(ctx, jobID, full, provenance)
 }
 
+// adoptionScanDeadline bounds one adoption-directory ReadDir syscall. A
+// TCC-protected root (for example a download_adoption_root under
+// ~/Downloads on macOS) can make open(2) block in-kernel indefinitely: tccd
+// is waiting on a consent decision only an interactive process can supply,
+// and papio is a background daemon. 2s is far past any real filesystem
+// latency but short enough that one hung scan costs at most one poll tick.
+const adoptionScanDeadline = 2 * time.Second
+
+// ErrAdoptionScanTimeout marks a ReadDir call that did not return within
+// adoptionScanDeadline — the signature of the TCC consent wall described on
+// scanAdoptionDir. Never wrapped, so callers compare it with errors.Is.
+var ErrAdoptionScanTimeout = errors.New("adoption directory scan timed out")
+
+// BoundedReadDir runs readDir(dir) — os.ReadDir when readDir is nil — on its
+// own goroutine and returns ErrAdoptionScanTimeout if it has not completed
+// within adoptionScanDeadline. Go cannot cancel a syscall already blocked
+// in-kernel, so on timeout the goroutine is left running; when afterTimeout
+// is non-nil, a second goroutine (which only waits on a channel, never on
+// the syscall itself) reports its eventual real result to afterTimeout
+// exactly once. This is the seam Bridge.scanAdoptionDir (which also latches
+// further scans off while a call is outstanding — see adoptionScanSuspended)
+// and doctor's adoption-root health check both build on, so a TCC-hung
+// filesystem can never wedge the daemon or a one-shot doctor run.
+func BoundedReadDir(dir string, readDir func(string) ([]os.DirEntry, error), afterTimeout func([]os.DirEntry, error)) ([]os.DirEntry, error) {
+	if readDir == nil {
+		readDir = os.ReadDir
+	}
+	type result struct {
+		entries []os.DirEntry
+		err     error
+	}
+	done := make(chan result, 1)
+	go func() {
+		entries, err := readDir(dir)
+		done <- result{entries, err}
+	}()
+	select {
+	case r := <-done:
+		return r.entries, r.err
+	case <-time.After(adoptionScanDeadline):
+		if afterTimeout != nil {
+			go func() {
+				r := <-done
+				afterTimeout(r.entries, r.err)
+			}()
+		}
+		return nil, ErrAdoptionScanTimeout
+	}
+}
+
+// readAdoptionDir bounds one adoption-directory listing against
+// adoptionScanDeadline and, on a timeout, latches adoption scanning off for
+// the whole bridge — not just this job — until the hung call eventually
+// returns. A short-circuited or timed-out call reports the same shape of
+// error a missing directory does, which every caller here already treats as
+// "not adoptable": a scan papio could not complete must never be read as
+// evidence a settled file is present (fail-closed adoption semantics). The
+// two log lines fire exactly once per transition.
+func (b *Bridge) readAdoptionDir(dir string) ([]os.DirEntry, error) {
+	b.adoptionScanMu.Lock()
+	suspended := b.adoptionScanSuspended
+	b.adoptionScanMu.Unlock()
+	if suspended {
+		return nil, ErrAdoptionScanTimeout // a prior call is still hung; never stack another
+	}
+
+	entries, err := BoundedReadDir(dir, b.readDir, func([]os.DirEntry, error) {
+		b.adoptionScanMu.Lock()
+		b.adoptionScanSuspended = false
+		b.adoptionScanMu.Unlock()
+		log.Printf("papio: adoption scans resumed")
+	})
+	if errors.Is(err, ErrAdoptionScanTimeout) {
+		b.adoptionScanMu.Lock()
+		b.adoptionScanSuspended = true
+		b.adoptionScanMu.Unlock()
+		log.Printf("papio: adoption scans suspended: %s not responding (macOS privacy consent?)", b.cfg.EffectiveAdoptionRoot())
+	}
+	return entries, err
+}
+
 // scanAdoptionDir looks for exactly one settled candidate file in an
 // adoptable job's adoption directory. Dotfiles (.DS_Store) are invisible; any
 // .crdownload/.download marks an in-progress Chrome write and .part a
@@ -2967,9 +3067,9 @@ func (b *Bridge) adoptWithContext(ctx context.Context, jobID, filename string, p
 // feeds adopt(), which re-applies full confinement checks.
 func (b *Bridge) scanAdoptionDir(_ context.Context, jobID string) (string, bool) {
 	dir := filepath.Join(b.cfg.EffectiveAdoptionRoot(), jobID)
-	entries, err := os.ReadDir(dir)
+	entries, err := b.readAdoptionDir(dir)
 	if err != nil {
-		return "", false // no directory yet: nothing placed
+		return "", false // no directory yet, scan suspended/timed out, or unreadable
 	}
 	var name string
 	for _, e := range entries {

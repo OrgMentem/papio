@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -3108,6 +3109,195 @@ func TestPollScanAdoptsSingleSettledFileAndDefersAmbiguity(t *testing.T) {
 	eRow, _ := jobs.Get(ctx, placeholder)
 	if eRow.State != job.StateAwaitingHuman {
 		t.Fatalf("zero-byte placeholder must defer the scan: %+v", eRow)
+	}
+}
+
+// TestPollSuspendsAdoptionScanningOnHungReadDirAndStaysResponsive reproduces
+// the incident this latch fixes: a ReadDir behind a TCC-protected adoption
+// root can block in-kernel forever. Every Sync/poll call must still return
+// bounded by adoptionScanDeadline, ordinary handoff offers must keep
+// flowing, and — because Go can never cancel the blocked syscall — at most
+// one goroutine may ever be stuck in it, no matter how many polls arrive
+// while it is latched.
+func TestPollSuspendsAdoptionScanningOnHungReadDirAndStaysResponsive(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+
+	var calls int32
+	block := make(chan struct{})
+	t.Cleanup(func() { close(block) }) // release the permanently-leaked goroutine so the test binary can exit
+	b.readDir = func(string) ([]os.DirEntry, error) {
+		atomic.AddInt32(&calls, 1)
+		<-block
+		return nil, errors.New("unreachable in this test")
+	}
+
+	scanTarget := park(t, jobs, "wr_wedge_scan", handoffWork())
+	offerJob := park(t, jobs, "wr_wedge_offer", handoffWork())
+
+	boundedSync := func(frames []json.RawMessage) []*protocol.BrowserMessage {
+		t.Helper()
+		type outcome struct {
+			raw []json.RawMessage
+			err error
+		}
+		ch := make(chan outcome, 1)
+		go func() {
+			raw, err := b.Sync(ctx, testSessionID, false, frames)
+			ch <- outcome{raw, err}
+		}()
+		select {
+		case o := <-ch:
+			if o.err != nil {
+				t.Fatalf("sync: %v", o.err)
+			}
+			msgs := make([]*protocol.BrowserMessage, 0, len(o.raw))
+			for _, m := range o.raw {
+				decoded, err := protocol.DecodeBrowserMessage(m)
+				if err != nil {
+					t.Fatalf("outbound frame failed protocol decode: %v", err)
+				}
+				msgs = append(msgs, decoded)
+			}
+			return msgs
+		case <-time.After(4 * time.Second):
+			t.Fatal("Sync did not return: a hung adoption scan wedged the bridge")
+			return nil
+		}
+	}
+
+	start := time.Now()
+	msgs := boundedSync([]json.RawMessage{hello()})
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("first poll took %s, want bounded near the adoption scan deadline", elapsed)
+	}
+	if got := countType(msgs, protocol.MsgJobOffer); got != 2 {
+		t.Fatalf("job offers while the adoption scan was suspended = %d, want 2 (offers must keep flowing)", got)
+	}
+
+	for i := range 3 {
+		start := time.Now()
+		boundedSync(nil)
+		if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+			t.Fatalf("latched poll #%d took %s, want near-instant (no goroutine should be spawned while latched)", i, elapsed)
+		}
+	}
+
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("readDir invoked %d times, want exactly 1: a latched scan must never spawn another goroutine", got)
+	}
+
+	for _, id := range []string{scanTarget, offerJob} {
+		row, err := jobs.Get(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if row.State != job.StateAwaitingHuman {
+			t.Fatalf("job %s left awaiting_human during a suspended scan: %+v", id, row)
+		}
+	}
+}
+
+// TestScanAdoptionDirEPERMIsNotAdoptableWithoutLatching asserts that a fast
+// error (EPERM from an outright-denied ReadDir, for instance) is treated as
+// routine not-adoptable and never trips the hung-call latch: only a call
+// that actually misses the deadline may suspend scanning.
+func TestScanAdoptionDirEPERMIsNotAdoptableWithoutLatching(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+
+	var calls int32
+	b.readDir = func(string) ([]os.DirEntry, error) {
+		atomic.AddInt32(&calls, 1)
+		return nil, fmt.Errorf("adoptions: %w", os.ErrPermission)
+	}
+
+	id := park(t, jobs, "wr_eperm_scan", handoffWork())
+	msgs, _ := runSync(t, b, hello())
+	if countType(msgs, protocol.MsgJobOffer) != 1 {
+		t.Fatalf("EPERM scan must not block the ordinary handoff offer: %v", msgs)
+	}
+	row, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.State != job.StateAwaitingHuman {
+		t.Fatalf("EPERM must fail closed to not-adoptable: %+v", row)
+	}
+	b.adoptionScanMu.Lock()
+	suspended := b.adoptionScanSuspended
+	b.adoptionScanMu.Unlock()
+	if suspended {
+		t.Fatal("a fast EPERM error must not latch adoption scanning")
+	}
+
+	// A second poll performs a fresh scan rather than short-circuiting on a
+	// latch that should never have been set.
+	runSync(t, b)
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Fatalf("readDir called %d times across two polls, want 2 (no latch on a fast error)", got)
+	}
+}
+
+// TestScanAdoptionResumesAfterHungReadDirReturnsAndAdoptsSettledFile drives
+// the full incident lifecycle: a scan hangs and latches, a settled file
+// arrives while scanning is suspended, the hung call eventually returns and
+// clears the latch, and the next poll performs a fresh scan that adopts it.
+func TestScanAdoptionResumesAfterHungReadDirReturnsAndAdoptsSettledFile(t *testing.T) {
+	b, jobs, cfg, _ := newBridge(t)
+	ctx := context.Background()
+
+	var calls int32
+	release := make(chan struct{})
+	b.readDir = func(dir string) ([]os.DirEntry, error) {
+		atomic.AddInt32(&calls, 1)
+		<-release
+		return os.ReadDir(dir)
+	}
+
+	id := park(t, jobs, "wr_resume_scan", handoffWork())
+	runSync(t, b, hello())
+
+	// The scan hangs past its deadline and latches; poll still returns.
+	runSync(t, b)
+	b.adoptionScanMu.Lock()
+	suspended := b.adoptionScanSuspended
+	b.adoptionScanMu.Unlock()
+	if !suspended {
+		t.Fatal("scan did not latch after missing its deadline")
+	}
+
+	// A settled file arrives while the scan is latched.
+	writeFixturePDF(t, filepath.Join(cfg.EffectiveAdoptionRoot(), id, "paper.pdf"))
+
+	// Unblock the hung call: it re-reads the now-current directory and the
+	// latch clears once it finally returns.
+	close(release)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		b.adoptionScanMu.Lock()
+		suspended = b.adoptionScanSuspended
+		b.adoptionScanMu.Unlock()
+		if !suspended {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if suspended {
+		t.Fatal("scan latch never cleared after the hung call returned")
+	}
+
+	// The next poll performs a fresh scan and adopts the settled file.
+	runSync(t, b)
+	row, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.State != job.StateReady || row.ArtifactSHA256 == "" {
+		t.Fatalf("settled file was not adopted after scan resumed: %+v", row)
+	}
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Fatalf("readDir called %d times, want 2 (one hung call, one fresh scan after resume)", got)
 	}
 }
 

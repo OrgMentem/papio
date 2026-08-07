@@ -80,6 +80,7 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, capability pdf
 	} else {
 		add("data_dir", Pass, "private writable data directory", "")
 	}
+	checkAdoptionRoot(cfg, add)
 	if cfg.Path != "" {
 		if info, err := os.Stat(cfg.Path); err == nil {
 			if info.Mode().Perm()&0o077 != 0 {
@@ -296,6 +297,36 @@ func checkDataDir(path string) error {
 		return err
 	}
 	return os.Remove(name)
+}
+
+// adoptionRootReadDir is the adoption-root health probe's ReadDir seam.
+// Production leaves it nil so browser.BoundedReadDir falls back to
+// os.ReadDir; tests substitute a blocking or error-returning func to
+// exercise the timeout/EPERM paths without a real TCC-protected filesystem.
+var adoptionRootReadDir func(string) ([]os.DirEntry, error)
+
+// checkAdoptionRoot reports the health of the browser adoption root
+// (download_adoption_root, default <data_dir>/adoptions). macOS's TCC layer
+// can make ReadDir on a folder under a protected location (a
+// download_adoption_root left under ~/Downloads is the case that bit
+// production) block in-kernel forever, waiting on a consent decision only an
+// interactive process can supply — the same wall Bridge.scanAdoptionDir
+// latches against. The probe is bounded the same way (browser.BoundedReadDir)
+// so doctor itself can never hang on it. ENOENT stays healthy: the root
+// simply has not been created yet, exactly today's pre-first-download state.
+func checkAdoptionRoot(cfg config.Config, add func(string, string, string, string)) {
+	root := cfg.EffectiveAdoptionRoot()
+	_, err := browser.BoundedReadDir(root, adoptionRootReadDir, nil)
+	switch {
+	case err == nil, errors.Is(err, os.ErrNotExist):
+		add("adoption_root", Pass, fmt.Sprintf("%s is readable", root), "")
+	case errors.Is(err, browser.ErrAdoptionScanTimeout), errors.Is(err, os.ErrPermission):
+		add("adoption_root", Fail,
+			fmt.Sprintf("%s did not respond to a directory listing (macOS privacy consent?)", root),
+			fmt.Sprintf("grant the papio binary access to %s in System Settings \u2192 Privacy & Security \u2192 Files and Folders (or Full Disk Access) \u2014 every dev rebuild resets that consent \u2014 or move download_adoption_root to a different folder", root))
+	default:
+		add("adoption_root", Fail, fmt.Sprintf("%s: %v", root, err), "check the adoption root's permissions and try again")
+	}
 }
 
 // checkResolverBases warns when an OpenURL base points at a raw Alma uresolver
