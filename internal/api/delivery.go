@@ -393,9 +393,14 @@ func deliveryConfirmRequestExists(ctx context.Context, system *bootstrap.System,
 // deliveryConfirmRequestAbsent implements Decision 4's "the operator checked
 // and no request exists": the stale row is cancelled, the document_delivery
 // action closes, and the job re-enters the exact Branch/gate seam
-// exhaustedCandidates uses (app.Service.SubmitDelivery) for a fresh
-// decision — never a duplicated policy implementation, and never
-// retry_submission of the cancelled row itself.
+// exhaustedCandidates uses (app.Service.SubmitDelivery) — never a duplicated
+// policy implementation. In v1 that seam always resolves a cancelled row to
+// BranchResubmissionPolicy, which deliveryRoute routes straight back to
+// reconciliation (a fresh document_delivery action, job awaiting_human)
+// rather than re-entering the gate: this operation never auto-resubmits.
+// It exists to close the stale reconciliation action on a deliberate
+// operator decision — "no request was ever lodged" — and open a new one,
+// not to give the job another shot at ActionSubmit.
 func deliveryConfirmRequestAbsent(ctx context.Context, system *bootstrap.System, jobID string) ([]byte, *ipc.RPCError) {
 	svc, rpcErr := deliveryService(system)
 	if rpcErr != nil {

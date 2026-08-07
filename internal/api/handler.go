@@ -1180,7 +1180,7 @@ func cancelJob(ctx context.Context, raw json.RawMessage, system *bootstrap.Syste
 		}
 		return badParams(err)
 	}
-	if err := system.Jobs.Cancel(ctx, params.JobID, "cancelled by user"); err != nil {
+	if err := system.App.CancelJob(ctx, params.JobID, "cancelled by user"); err != nil {
 		return failure(err)
 	}
 	return marshal(map[string]any{"job_id": params.JobID, "cancelled": true})
@@ -1227,7 +1227,7 @@ func dismissAction(ctx context.Context, raw json.RawMessage, system *bootstrap.S
 	if params.ActionID <= 0 || params.ExpectedRevision <= 0 {
 		return badParams(errors.New("action_id and expected_revision are required and must be positive"))
 	}
-	jobID, err := system.Jobs.DismissHumanAction(ctx, params.ActionID, params.ExpectedRevision)
+	jobID, err := system.App.DismissAction(ctx, params.ActionID, params.ExpectedRevision)
 	if err != nil {
 		return failure(err)
 	}

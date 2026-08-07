@@ -13,6 +13,79 @@ execution records in `notes/acquisition-stack-plan.md`.
 
 ### Added
 
+- **Document delivery and ILL become a durable, configured route (ADR-0017).**
+  A dead end is fixed: a work only obtainable through interlibrary loan used
+  to make *papio* observe that fact and stop. A new `delivery_requests`
+  ledger — idempotency-keyed on institution profile + canonical work
+  identity + provider + request type, store migration 0021 — now records
+  the request instead. `[browser.document_delivery]` and
+  `[browser.resolvers.<name>.document_delivery]` declare a `kind`
+  (`openurl` | `libkey` | `illiad` | `custom` — `oclc` and `rapido` are
+  named as intended providers but rejected until their adapters ship) plus
+  the gate-profile facts *papio* cannot discover on its own (`legal_basis`,
+  `patron_attestation`, `patron_fee_policy`, `monthly_request_cap`,
+  `submit_policy`). Those declarations compile at config time into one
+  institution-profile × provider × request-class gate profile —
+  `auto_capable` | `prefill_only` | `invalid`, with a closed 13-code
+  blocker vocabulary and recorded evidence — and a per-request seven-point
+  gate (delegated access mode, `auto_if_unconditional`, a supported and
+  configured request class, complete metadata, zero required human steps,
+  the zero-fee policy, and cap headroom) decides submit vs. prefill for
+  every request the profile is asked to place; any condition false or
+  *unknown* routes to prefill, never a guess. `illiad` is v1's only
+  auto-capable provider: an institution-issued API key that is never sent
+  to, stored in, or observable from the extension or the browser wire,
+  zero-patron-fee digital journal articles only, and one recorded live
+  acceptance — a supervised submit-and-reconcile against the real
+  deployment — before the compile can ever read `auto_capable`. Profiles
+  declaring Australian `legal_basis = "copyright_act_s49"` compile
+  `prefill_only` permanently, by statute rather than caution: the ceiling
+  there is automatic prefill followed by one human declaration, and *papio*
+  must never tick, script, or represent that declaration itself. New
+  `papio delivery get|submit|cancel|history|confirm-exists|confirm-absent`
+  commands (MCP-exposed automatically, per the existing command-derived
+  facade); `jobs.get_v3` adds a delivery section additively, keeping
+  `jobs.get_v2` ratified and byte-identical. A pending request parks its
+  job in the existing `retry_wait` state under a new
+  `document_delivery_pending` reason — it is not an open action, so
+  `actions list` never misrepresents a self-driving poll as one — and only
+  once four rounds of deterministic reconciliation (provider reference,
+  *papio*'s own idempotency key, a patron request-list search, one delayed
+  re-check) are exhausted does it become an `awaiting_human` action of the
+  new `document_delivery` kind, offering `open_request_history` /
+  `confirm_request_exists` / `confirm_request_absent` and **never**
+  resubmission: *papio* must not submit a second request while an earlier
+  one's outcome is unknown. `papio init` prints the compiled gate verdict
+  before saving (`AUTO-CAPABLE` with its evidence, or `PREFILL ONLY` with
+  the specific blocker), and `papio doctor` keeps `DECLARED` configuration
+  and `PASS`/`OBSERVED` verified facts strictly separate — it never creates
+  a probe request and never prints `PASS` for a policy it merely read from
+  config.
+
+- **The daemon side of on-page bulk acquisition ships:
+  `page_bulk_acquire_v1` (ADR-0019).** A newly negotiated feature carries
+  two strict request/reply families — `page_bulk_status_request` /
+  `page_bulk_status_result` and `page_bulk_submit_request` /
+  `page_bulk_submit_result` — as thin transport adapters over the existing
+  ownership/holdings lookup and `internal/batch` services, adding no
+  browser-specific acquisition policy: a page-bulk job enters the same
+  waterfall as any CLI- or MCP-submitted job, including LibKey-routed
+  institutional handoff where configured. Status resolves up to 200 scanned
+  identifiers through *papio*'s own canonicalizers and existing
+  live-job/terminal lookups into a closed vocabulary (`eligible`,
+  `owned_with_pdf`, `owned_missing_pdf`, `queued`, `previously_unavailable`,
+  `ownership_incomplete`, `invalid`); a complete holdings lookup finding
+  nothing is `eligible`, and a failed or partial one is
+  `ownership_incomplete`, never a negative ownership fact. Submit creates
+  one ordinary batch of up to 50 canonical keys through the same
+  app-service entry `acquire.submit_v3` uses, with the daemon — never the
+  extension — assigning `consumer = "browser-page"`; only a fresh, explicit
+  `owned_with_pdf` claim is suppressed server-side, matching the extension's
+  own row states. Every scan additionally writes one local, URL-free
+  `page_bulk_runs` measurement row (store migration 0022; origin only, no
+  path, query, or title — nothing leaves the machine) feeding the feature's
+  own bulk-leverage metric.
+
 - **`papio export` writes normalized CSL-JSON, RIS, and BibTeX.** Four
   scopes: `export job <id>...` (argument order, any state — citation
   metadata stays useful when retrieval failed), `export batch <batch-id>`

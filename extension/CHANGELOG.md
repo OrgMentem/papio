@@ -14,6 +14,45 @@ History before 0.3.1 was recorded in the root `CHANGELOG.md` (the extension
 and daemon shared a version stream through 0.3.0); see its `[0.3.0]` section
 for the full pre-split extension history.
 
+## [Unreleased]
+
+### Added
+
+- **"Select papers on this page" — bulk selection from a reference list,
+  bibliography, or results page (ADR-0019).** The popup gains a scan action
+  beside the existing single-paper Acquire button. Clicking it runs one
+  top-frame `scripting.executeScript` under the ordinary, temporary
+  `activeTab` grant — there is no persistent scanner, no dynamic
+  content-script registration, no `MutationObserver`, and no standing
+  all-sites grant; a page whose list has since changed is rescanned with an
+  explicit **Rescan** control, not a background watcher. Detection runs
+  entirely inside that tab and is local-only: recognized links (`doi.org`,
+  publisher `/doi/10.x` paths, arXiv, PubMed) and explicitly labeled text (a
+  strict DOI, `arXiv:<id>`, or `PMID: <digits>` — an unlabeled bare integer
+  is never treated as a PMID), each paired with a short citation label from
+  its nearest bounded container, capped at 200 raw candidates with
+  truncation always reported, never silent. Results open a new full-tab
+  selection workspace, one per scan (`?scan=<id>`), showing the source
+  page's title, origin, and scan time entirely from the local snapshot.
+  Rows start **unselected**: `owned_with_pdf` and already-queued rows are
+  disabled, and every other state — including an incomplete lookup or a
+  previously-unavailable mark — stays checkable, because an incomplete or
+  failed check is `unknown`, never a negative ownership fact. The primary
+  action reads "Acquire all *N* eligible" until a row is checked, then
+  morphs to "Acquire *N* selected"; submission caps at 50 per batch (the
+  existing batch limit, distinct from the 200-item detection cap), and rows
+  past the cap are not auto-chained — they stay selected or unselected for
+  the next submit. The workspace marks itself expired if the background's
+  bounded scan store has since dropped the snapshot. Nothing is sent
+  anywhere until you click "Select papers on this page": the daemon lookup
+  that follows sends only the detected identifiers, never the page's title,
+  URL, or surrounding text, and the submitted batch's manifest records only
+  the page's bare scheme+host origin, never its path, query, or title. No
+  scholarly service is contacted until you submit selected papers. Requires
+  the daemon's `page_bulk_acquire_v1` feature, negotiated over
+  `hello_ack.features`; an older daemon that never advertises it fails the
+  scan with a plain error instead of silently doing nothing.
+
 ## [0.10.0] - 2026-08-06
 
 ### Added

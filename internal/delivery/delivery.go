@@ -452,6 +452,39 @@ func (s *Service) AppendGateEvent(ctx context.Context, jobID string, evt GateEva
 	})
 }
 
+// eventKindOrphaned records that OrphanIfLive found a live request whose
+// driving job stopped watching it (ADR-0017 Decision 4).
+const eventKindOrphaned = "delivery.orphaned"
+
+// OrphanIfLive reconciles jobID's delivery_requests row when the job that
+// was driving it is cancelled, or its document_delivery action is
+// dismissed: papio stops polling that job entirely, so a row still
+// submitted/pending would otherwise look like it is still being watched
+// when nothing will ever check on it again. Only a genuinely live row is
+// touched — offered (no vendor request exists yet), fulfilled, declined,
+// cancelled, and already-unknown_outcome rows need no compensation, and a
+// job with no delivery row at all is a no-op. The request itself is
+// untouched at the provider; this only marks papio's own record honestly,
+// so reconciliation (`papio delivery get`/confirm-exists/confirm-absent)
+// is the way an operator picks it back up, exactly as an automatic poll
+// finding an unrecoverable outcome already uses unknown_outcome for.
+func (s *Service) OrphanIfLive(ctx context.Context, jobID, cause string) error {
+	req, err := s.GetByJobID(ctx, jobID)
+	if err != nil || req == nil {
+		return err
+	}
+	if req.State != StateSubmitted && req.State != StatePending {
+		return nil
+	}
+	if err := s.UpdateState(ctx, req.ID, StateUnknownOutcome); err != nil {
+		return err
+	}
+	return s.store.AppendEvent(ctx, jobID, eventKindOrphaned, map[string]any{
+		"delivery_request_id": req.ID,
+		"cause":               cause,
+	})
+}
+
 // LatestGateEvent returns the most recently recorded delivery.gate_evaluated
 // verdict for jobID, or (nil, nil) when the job has never been gated. Reading
 // the recorded event rather than recomputing EvaluateGate against current

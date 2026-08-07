@@ -1702,19 +1702,56 @@ type DeliveryRouteResult struct {
 // path exhaustedCandidates takes automatically when ordinary candidates are
 // exhausted, for an explicit operator/RPC-triggered call (`papio delivery
 // submit <job-id>`). It transitions the job exactly as the automatic call
-// does: submit -> retry_wait pending, prefill/enrich_then_prefill ->
-// awaiting_human with the document_delivery action, join_poll -> retry_wait
-// pending on the existing row, adopt_fulfilled/reconcile/resubmission_policy
-// -> awaiting_human with the document_delivery action. Like any other
-// Transition call, it fails with job.ErrConflict if jobID's current state
-// cannot reach the resulting state (e.g. a job already mid-poll for the same
-// live request) — callers should check delivery.get's row state first.
+// does: submit -> retry_wait pending on success, or retry_wait/
+// resolver_temporarily_unavailable on a transport failure (never
+// awaiting_human for an ordinary outage — see submitToProvider),
+// prefill/enrich_then_prefill -> awaiting_human with the document_delivery
+// action, join_poll -> retry_wait pending on the existing row,
+// adopt_fulfilled/reconcile/resubmission_policy -> awaiting_human with the
+// document_delivery action. Like any other Transition call, it fails with
+// job.ErrConflict if jobID's current state cannot reach the resulting state
+// (e.g. a job already mid-poll for the same live request) — callers should
+// check delivery.get's row state first.
 func (s *Service) SubmitDelivery(ctx context.Context, jobID string) (DeliveryRouteResult, error) {
 	row, err := s.Jobs.Get(ctx, jobID)
 	if err != nil {
 		return DeliveryRouteResult{}, err
 	}
 	return s.deliveryRoute(ctx, row, row.State)
+}
+
+// CancelJob cancels a job exactly as job.Store.Cancel does, additionally
+// reconciling any live (submitted/pending) delivery_requests row it was
+// driving (ADR-0017 Decision 4): cancelling the job stops papio from ever
+// polling that row again, so a live row must not be left looking like it is
+// still being watched. See delivery.Service.OrphanIfLive. Compensation is
+// best-effort — the cancellation itself, which the caller actually asked
+// for, is what this must never fail on.
+func (s *Service) CancelJob(ctx context.Context, jobID string, reason job.TerminalReason) error {
+	if err := s.Jobs.Cancel(ctx, jobID, reason); err != nil {
+		return err
+	}
+	if s.Delivery != nil {
+		_ = s.Delivery.OrphanIfLive(ctx, jobID, "job_cancelled")
+	}
+	return nil
+}
+
+// DismissAction dismisses a human action exactly as
+// job.Store.DismissHumanAction does, additionally reconciling any live
+// delivery_requests row a resulting job cancellation was driving — see
+// CancelJob. Dismissing a non-document_delivery action, or one whose job
+// isn't cancelled by the dismissal, is untouched: OrphanIfLive only ever
+// acts on a row actually in state submitted/pending.
+func (s *Service) DismissAction(ctx context.Context, actionID, expectedRevision int64) (string, error) {
+	jobID, err := s.Jobs.DismissHumanAction(ctx, actionID, expectedRevision)
+	if err != nil {
+		return "", err
+	}
+	if s.Delivery != nil {
+		_ = s.Delivery.OrphanIfLive(ctx, jobID, "action_dismissed")
+	}
+	return jobID, nil
 }
 
 // deliveryConfigured reports whether row's institution profile has a
@@ -1895,9 +1932,17 @@ func illiadTransactionRequest(w work.Work, patronRef, idempotencyKey string) ill
 // occupies the idempotency key first (Create, state offered), then calls
 // internal/illiad only for a profile compiled auto_capable. Creating the row
 // before the transport call means a crash or transport failure between the
-// two never leaves a live ILLiad transaction with no local record — and
-// because Branch treats an offered row like a fresh key, a transport failure
-// here simply lets the next pass retry the illiad call.
+// two never leaves a live ILLiad transaction with no local record.
+//
+// Create's ErrDuplicateRequest means an idempotency key already has a row —
+// but "already has a row" is not "already resubmitted". An existing row
+// still in state offered with no provider_reference never reached the
+// provider (Branch already treats offered exactly like a fresh key for the
+// same reason, see its default case): retrying the illiad call against THAT
+// row is the retry a prior transport failure earned, not a second live
+// request. Only a row that actually reached the provider (any other state)
+// makes this a genuine duplicate — Decision 1 forbids a second attempt
+// there, so it routes to reconciliation instead.
 func (s *Service) submitDeliveryRequest(ctx context.Context, row *job.Row, from, profileName string, dd *config.DocumentDelivery, requestClass, workIdentity, key string, profile delivery.GateProfile) (*delivery.Request, error) {
 	created, err := s.Delivery.Create(ctx, delivery.CreateRequest{
 		JobID:              row.ID,
@@ -1908,19 +1953,48 @@ func (s *Service) submitDeliveryRequest(ctx context.Context, row *job.Row, from,
 		GateProfileDigest:  profile.Digest(),
 	})
 	if err != nil {
-		if errors.Is(err, delivery.ErrDuplicateRequest) {
-			// A concurrent evaluation already occupies this idempotency key.
-			// Never open a second live request (Decision 1) — route to
-			// reconciliation so a human resolves whatever it is, rather than
-			// guessing at its state from here.
+		if !errors.Is(err, delivery.ErrDuplicateRequest) {
+			return nil, err
+		}
+		if created == nil || created.State != delivery.StateOffered || created.ProviderReference != "" {
+			// A live or otherwise-resolved request already occupies this
+			// idempotency key (a concurrent evaluation, or a settled
+			// outcome). Never open a second live request (Decision 1) —
+			// route to reconciliation so a human resolves whatever it is,
+			// rather than guessing at its state from here.
 			return created, s.openDeliveryReconciliationAction(ctx, row, from, created)
 		}
-		return nil, err
+		// Fall through: nothing was ever lodged for this row: retry
+		// submission against it instead of reconciling a request that was
+		// never actually created.
 	}
+	return s.submitToProvider(ctx, row, from, dd, key, profile, created)
+}
+
+// submitToProvider calls internal/illiad for a durably-offered row that has
+// never reached the provider — a fresh Create, or one submitDeliveryRequest
+// recovered after an earlier pass's transport failure. On success it
+// advances the row to submitted and parks the job
+// retry_wait/document_delivery_pending on the live-poll cadence.
+//
+// On transport failure it parks retry_wait/resolver_temporarily_unavailable
+// on the ordinary short retry cadence instead of
+// parkDeliveryPrefill's document_delivery human action: the row already
+// durably occupies the idempotency key (Decision 1), so nothing was lost,
+// and a transient ILLiad outage is exactly the class of condition
+// resolver_temporarily_unavailable already tells the operator to expect —
+// "papio will retry automatically" (see errcat.Explain) — so escalating it
+// to a human action would be an overreaction. Reusing
+// RetryReasonDocumentDeliveryPending instead would misreport a request that
+// never actually reached the provider as one papio is now polling.
+func (s *Service) submitToProvider(ctx context.Context, row *job.Row, from string, dd *config.DocumentDelivery, key string, profile delivery.GateProfile, created *delivery.Request) (*delivery.Request, error) {
 	client := illiad.New(s.illiadHTTPClient(), dd.BaseURL, dd.APIKey)
 	txn, err := client.CreateTransaction(ctx, illiadTransactionRequest(row.Work, dd.PatronRef, key))
 	if err != nil {
-		return created, s.parkDeliveryPrefill(ctx, row, from, dd)
+		return created, s.Jobs.Transition(ctx, row.ID, from, job.StateRetryWait, map[string]any{
+			"reason":              "resolver_temporarily_unavailable",
+			"delivery_request_id": created.ID,
+		}, job.WithRetryAt(s.Now().Add(s.RetryDelay)))
 	}
 	if err := s.Delivery.UpdateState(ctx, created.ID, delivery.StateSubmitted); err != nil {
 		return created, err

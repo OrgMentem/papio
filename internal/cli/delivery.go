@@ -169,7 +169,7 @@ func newDeliveryConfirmExistsCommand(opt *options) *cobra.Command {
 func newDeliveryConfirmAbsentCommand(opt *options) *cobra.Command {
 	return &cobra.Command{
 		Use:   "confirm-absent <job-id>",
-		Short: "Confirm no request exists at the provider and re-run the gate for a fresh decision",
+		Short: "Confirm no request exists at the provider, cancel the stale row, and reopen reconciliation for a deliberate decision (v1 never auto-resubmits)",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			var result api.DeliveryActionResult

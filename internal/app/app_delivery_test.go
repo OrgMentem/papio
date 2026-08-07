@@ -478,6 +478,379 @@ func TestExhaustedCandidatesReevaluationJoinsExistingPoll(t *testing.T) {
 	}
 }
 
+// TestSubmitDeliveryRequestTransportFailureThenRetrySubmitsOnce proves the
+// P1 fix: a transport failure durably occupies the idempotency key (state
+// offered, no provider_reference) and parks retry_wait/
+// resolver_temporarily_unavailable — never a human action — and the next
+// pass, once the provider recovers, retries submission against that SAME
+// row rather than misrouting to reconciliation for a request that was
+// never actually lodged. The vendor must see exactly one successful POST.
+func TestSubmitDeliveryRequestTransportFailureThenRetrySubmitsOnce(t *testing.T) {
+	var postCount int
+	failing := true
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		postCount++
+		if failing {
+			http.Error(w, "illiad unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		_, _ = w.Write([]byte(`{"TransactionNumber": 9001, "TransactionStatus": "Awaiting Request Processing"}`))
+	}))
+	defer server.Close()
+
+	svc, jobs, deliverySvc := newDeliveryTestService(t)
+	svc.Delivery = deliverySvc
+	svc.IlliadHTTPClient = server.Client()
+	svc.Config.Browser.DocumentDelivery = autoCapableDocumentDelivery(server.URL)
+	svc.Resolvers = deliveryTestResolvers()
+	ctx := context.Background()
+	if err := deliverySvc.RecordLiveAcceptance(ctx, "default", "illiad"); err != nil {
+		t.Fatal(err)
+	}
+
+	id, err := svc.Submit(ctx, deliveryWorkRequest("wr_transport_fail_001", "10.1000/transport-fail-001"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, _ := jobs.ClaimNext(ctx, "w", time.Minute)
+	if err := svc.Process(ctx, row); err != nil {
+		t.Fatal(err)
+	}
+
+	afterFail, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterFail.State != job.StateRetryWait || afterFail.RetryAt == "" {
+		t.Fatalf("job after transport failure = %+v, want retry_wait parked with a schedule", afterFail)
+	}
+	if reason := lastTransitionReason(t, jobs, id); reason != "resolver_temporarily_unavailable" {
+		t.Fatalf("retry reason after transport failure = %q, want resolver_temporarily_unavailable", reason)
+	}
+	actions, err := jobs.ListHumanActions(ctx, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(actions) != 0 {
+		t.Fatalf("actions after transport failure = %+v, want none — a transient outage must not require a human", actions)
+	}
+
+	key := delivery.IdempotencyKey("default", "doi:10.1000/transport-fail-001", "illiad", "digital_journal_article")
+	offeredRow, err := deliverySvc.Lookup(ctx, key)
+	if err != nil || offeredRow == nil {
+		t.Fatalf("delivery request after transport failure: %v, %v", offeredRow, err)
+	}
+	if offeredRow.State != delivery.StateOffered || offeredRow.ProviderReference != "" {
+		t.Fatalf("delivery request after transport failure = %+v, want offered with no provider_reference", offeredRow)
+	}
+
+	// The vendor recovers; the next pass must retry the SAME row.
+	failing = false
+	if err := jobs.Retry(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	row2, _ := jobs.ClaimNext(ctx, "w", time.Minute)
+	if err := svc.Process(ctx, row2); err != nil {
+		t.Fatal(err)
+	}
+
+	final, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if final.State != job.StateRetryWait {
+		t.Fatalf("final job state = %q, want retry_wait (now polling a submitted request)", final.State)
+	}
+	if reason := lastTransitionReason(t, jobs, id); reason != string(job.RetryReasonDocumentDeliveryPending) {
+		t.Fatalf("final retry reason = %q, want %q", reason, job.RetryReasonDocumentDeliveryPending)
+	}
+	finalActions, err := jobs.ListHumanActions(ctx, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(finalActions) != 0 {
+		t.Fatalf("actions after successful retry = %+v, want none", finalActions)
+	}
+
+	finalReq, err := deliverySvc.Lookup(ctx, key)
+	if err != nil || finalReq == nil {
+		t.Fatalf("delivery request after retry: %v, %v", finalReq, err)
+	}
+	if finalReq.ID != offeredRow.ID {
+		t.Fatalf("retry created a second delivery_requests row (%d != %d) — Decision 1 forbids a second live request", finalReq.ID, offeredRow.ID)
+	}
+	if finalReq.State != delivery.StateSubmitted || finalReq.ProviderReference != "9001" {
+		t.Fatalf("delivery request after retry = %+v, want submitted with reference 9001", finalReq)
+	}
+	if postCount != 2 {
+		t.Fatalf("illiad received %d requests, want exactly 2 (one failed, one succeeded) — never a duplicate live submission", postCount)
+	}
+}
+
+// TestSubmitDeliveryRequestDuplicateLiveRowRoutesToReconciliation proves the
+// P1 fix does not reopen the double-submission hole it closes: when Create
+// loses a race to a row that already reached the provider (state
+// submitted), submitDeliveryRequest must still route to reconciliation and
+// must never call internal/illiad a second time for that row.
+func TestSubmitDeliveryRequestDuplicateLiveRowRoutesToReconciliation(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("illiad must never be called for a duplicate that already reached the provider")
+	}))
+	defer server.Close()
+
+	svc, jobs, deliverySvc := newDeliveryTestService(t)
+	svc.Delivery = deliverySvc
+	svc.IlliadHTTPClient = server.Client()
+	svc.Config.Browser.DocumentDelivery = autoCapableDocumentDelivery(server.URL)
+	svc.Resolvers = deliveryTestResolvers()
+	ctx := context.Background()
+	if err := deliverySvc.RecordLiveAcceptance(ctx, "default", "illiad"); err != nil {
+		t.Fatal(err)
+	}
+
+	id, err := svc.Submit(ctx, deliveryWorkRequest("wr_dup_live_001", "10.1000/dup-live-001"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := jobs.ClaimNext(ctx, "w", time.Minute)
+	if err != nil || claimed == nil {
+		t.Fatalf("ClaimNext: %v, %v", claimed, err)
+	}
+	if err := jobs.Transition(ctx, claimed.ID, job.StateQueued, job.StateResolving, map[string]any{"reason": "test_setup"}); err != nil {
+		t.Fatal(err)
+	}
+	row, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	profileName := deliveryProfileName(row.Policy.Resolver)
+	requestClass := deliveryRequestClass(row.Work)
+	workIdentity := row.Work.Describe()
+	key := delivery.IdempotencyKey(profileName, workIdentity, "illiad", requestClass)
+
+	// A concurrent evaluation (a different job, same idempotency key) has
+	// already won the Create race and reached the provider — the exact
+	// TOCTOU window between Branch's Lookup and this call's own Create.
+	otherJobID, err := svc.Submit(ctx, deliveryWorkRequest("wr_dup_live_other_001", "10.1000/dup-live-other-001"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := deliverySvc.Create(ctx, delivery.CreateRequest{
+		JobID: otherJobID, InstitutionProfile: profileName, Provider: "illiad",
+		RequestClass: requestClass, WorkIdentity: workIdentity,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := deliverySvc.UpdateState(ctx, other.ID, delivery.StateSubmitted); err != nil {
+		t.Fatal(err)
+	}
+
+	inst, dd, ok := svc.deliveryConfigured(row)
+	if !ok {
+		t.Fatal("delivery must be configured")
+	}
+	profile, err := deliverySvc.ResolveGateProfile(ctx, profileName, inst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.submitDeliveryRequest(ctx, row, job.StateResolving, profileName, dd, requestClass, workIdentity, key, profile); err != nil {
+		t.Fatal(err)
+	}
+
+	parked, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parked.State != job.StateAwaitingHuman {
+		t.Fatalf("job state = %q, want awaiting_human (reconciliation)", parked.State)
+	}
+	actions, err := jobs.ListHumanActions(ctx, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(actions) != 1 || actions[0].JobID != id || actions[0].Kind != job.ActionKindDocumentDelivery {
+		t.Fatalf("actions = %+v, want one document_delivery reconciliation action on %s", actions, id)
+	}
+
+	rows, err := deliverySvc.Lookup(ctx, key)
+	if err != nil || rows == nil || rows.ID != other.ID || rows.State != delivery.StateSubmitted {
+		t.Fatalf("delivery request for key = %+v, %v, want the other job's untouched submitted row", rows, err)
+	}
+}
+
+// TestCancelJobOrphansLiveDeliveryRequest proves the P2 fix: cancelling a
+// job that is actively polling a live (submitted) delivery_requests row
+// marks that row unknown_outcome with a durable event, rather than leaving
+// it looking watched when nothing will ever poll it again.
+func TestCancelJobOrphansLiveDeliveryRequest(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"TransactionNumber": 4242, "TransactionStatus": "Awaiting Request Processing"}`))
+	}))
+	defer server.Close()
+
+	svc, jobs, deliverySvc := newDeliveryTestService(t)
+	svc.Delivery = deliverySvc
+	svc.IlliadHTTPClient = server.Client()
+	svc.Config.Browser.DocumentDelivery = autoCapableDocumentDelivery(server.URL)
+	svc.Resolvers = deliveryTestResolvers()
+	ctx := context.Background()
+	if err := deliverySvc.RecordLiveAcceptance(ctx, "default", "illiad"); err != nil {
+		t.Fatal(err)
+	}
+
+	id, err := svc.Submit(ctx, deliveryWorkRequest("wr_cancel_live_001", "10.1000/cancel-live-001"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, _ := jobs.ClaimNext(ctx, "w", time.Minute)
+	if err := svc.Process(ctx, row); err != nil {
+		t.Fatal(err)
+	}
+	before, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before.State != job.StateRetryWait {
+		t.Fatalf("job before cancel = %+v, want retry_wait (polling a live request)", before)
+	}
+	key := delivery.IdempotencyKey("default", "doi:10.1000/cancel-live-001", "illiad", "digital_journal_article")
+	beforeReq, err := deliverySvc.Lookup(ctx, key)
+	if err != nil || beforeReq == nil || beforeReq.State != delivery.StateSubmitted {
+		t.Fatalf("delivery request before cancel: %+v, %v, want state submitted", beforeReq, err)
+	}
+
+	if err := svc.CancelJob(ctx, id, job.TerminalReasonUserDismissed); err != nil {
+		t.Fatal(err)
+	}
+
+	cancelled, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cancelled.State != job.StateCancelled {
+		t.Fatalf("job state after CancelJob = %q, want cancelled", cancelled.State)
+	}
+	afterReq, err := deliverySvc.Lookup(ctx, key)
+	if err != nil || afterReq == nil {
+		t.Fatalf("delivery request after cancel: %v, %v", afterReq, err)
+	}
+	if afterReq.State != delivery.StateUnknownOutcome {
+		t.Fatalf("delivery request state after cancelling its driving job = %q, want unknown_outcome", afterReq.State)
+	}
+	events, err := jobs.Events(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, e := range events {
+		if e["kind"] == "delivery.orphaned" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("no delivery.orphaned event recorded for the cancelled job")
+	}
+}
+
+// TestDismissDocumentDeliveryActionOrphansLiveDeliveryRequest proves the P2
+// fix on the dismiss path: dismissing an open document_delivery action that
+// cancels its parked job also reconciles a live delivery_requests row the
+// job was associated with.
+func TestDismissDocumentDeliveryActionOrphansLiveDeliveryRequest(t *testing.T) {
+	svc, jobs, deliverySvc := newDeliveryTestService(t)
+	svc.Delivery = deliverySvc
+	svc.Config.Browser.DocumentDelivery = autoCapableDocumentDelivery("https://illiad.example.edu")
+	svc.Resolvers = deliveryTestResolvers()
+	ctx := context.Background()
+
+	id, err := svc.Submit(ctx, deliveryWorkRequest("wr_dismiss_live_001", "10.1000/dismiss-live-001"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Directly wire the state deliveryRoute's own call sites never
+	// currently combine (an open document_delivery action never coincides
+	// with its OWN job owning a live submitted/pending row today — see
+	// OrphanIfLive) so DismissAction's compensation wiring itself is
+	// exercised in isolation, independent of whether today's routing logic
+	// happens to reach it.
+	req, err := deliverySvc.Create(ctx, delivery.CreateRequest{
+		JobID: id, InstitutionProfile: "default", Provider: "illiad",
+		RequestClass: "digital_journal_article", WorkIdentity: "doi:10.1000/dismiss-live-001",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := deliverySvc.UpdateState(ctx, req.ID, delivery.StateSubmitted); err != nil {
+		t.Fatal(err)
+	}
+
+	actionID, err := jobs.OpenHumanAction(ctx, id, job.ActionKindDocumentDelivery,
+		"a document-delivery request needs reconciliation", job.Access(false, ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.Transition(ctx, id, job.StateQueued, job.StateResolving,
+		map[string]any{"reason": "test_setup"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.Transition(ctx, id, job.StateResolving, job.StateAwaitingHuman,
+		map[string]any{"reason": "document_delivery_reconciliation"}); err != nil {
+		t.Fatal(err)
+	}
+	actions, err := jobs.ListHumanActions(ctx, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var action *job.HumanAction
+	for i := range actions {
+		if actions[i].ID == actionID {
+			action = &actions[i]
+		}
+	}
+	if action == nil {
+		t.Fatal("document_delivery action not found after opening it")
+	}
+
+	dismissedJobID, err := svc.DismissAction(ctx, action.ID, action.Revision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dismissedJobID != id {
+		t.Fatalf("dismissed job id = %q, want %q", dismissedJobID, id)
+	}
+
+	cancelled, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cancelled.State != job.StateCancelled {
+		t.Fatalf("job state after dismiss = %q, want cancelled", cancelled.State)
+	}
+	afterReq, err := deliverySvc.Get(ctx, req.ID)
+	if err != nil || afterReq == nil {
+		t.Fatalf("delivery request after dismiss: %v, %v", afterReq, err)
+	}
+	if afterReq.State != delivery.StateUnknownOutcome {
+		t.Fatalf("live delivery request state after dismissing its job's action = %q, want unknown_outcome", afterReq.State)
+	}
+	events, err := jobs.Events(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, e := range events {
+		if e["kind"] == "delivery.orphaned" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("no delivery.orphaned event recorded for the dismissed job")
+	}
+}
+
 // TestSubmitDeliveryMatchesAutomaticRoute proves the explicit
 // operator/RPC-triggered SubmitDelivery entrypoint runs the same
 // Branch-then-gate path and job transition exhaustedCandidates' automatic

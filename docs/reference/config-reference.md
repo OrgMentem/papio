@@ -109,6 +109,58 @@ or initiating physical-item, scan, or interlibrary-loan requests. Script access
 remains constrained by `extension/manifest.json` host permissions; an unlisted
 custom resolver origin stays in assisted mode.
 
+### `[browser.document_delivery]`
+
+Configures the default institution's document-delivery / interlibrary-loan
+route (ADR-0017). Omitting the table disables it — a job that exhausts every
+acquisition candidate falls back to the profile's plain OpenURL route, the
+same behavior as before this table existed. The identical table nests under
+`[browser.resolvers.<name>.document_delivery]` for a named institution
+profile, alongside that profile's own `openurl_base_url`,
+`shibboleth_entity_id`, `proquest_account_id`, `libkey_mode`, and
+`libkey_library_id`.
+
+| Key | Type | Default | Effect and constraints |
+| --- | --- | --- | --- |
+| `kind` | string | none (required) | Delivery adapter: `openurl` \| `libkey` \| `illiad` \| `custom`. Required — *papio* never guesses which ILL system an institution runs from branding or a landing page. `oclc` and `rapido` are named as intended future providers but rejected: a `kind` whose adapter has not shipped must not parse, the same fail-closed rule sources apply to `[sources.<name>]`. |
+| `base_url` | string URL | empty | Request form or API base. Used as the request-form URL for `openurl`/`custom`, and as the ILLiad Web Platform base for `illiad`. Must use `https://`. |
+| `allowed_hosts` | list of strings | empty | Hosts a prefilled request form or API base may reach. |
+| `submit_policy` | string | `never` | `never` (default) \| `prefill_only` \| `auto_if_unconditional`. Narrows what the daemon-wide `access_mode` permits — it never widens it: under `conservative` the route is discovered and recorded only, never opened or submitted; under `assisted` the prefilled form opens but submission stays human. `auto_if_unconditional` is accepted only when `kind = "illiad"`: `openurl`, `libkey`, and `custom` route to a form with no deterministic submission-and-reconciliation contract, so they compile permanently `prefill_only`. |
+| `request_classes` | list of strings | empty | Request classes this profile is declared for. v1 recognizes only `digital_journal_article`; any other value is rejected as not yet modelled. |
+| `legal_basis` | string | `unknown` | `institution_policy` \| `copyright_act_s49` \| `unknown`. Configured, never inferred from a hostname. `copyright_act_s49` (Australian document supply) compiles `prefill_only` permanently, by statute: the patron's declaration is an affirmative, per-request statutory act — "not previously supplied" — that no standing declaration can truthfully cover, and *papio* must never tick, script, or represent it. An AU-jurisdiction profile defaults `patron_attestation` to `unknown` until the institution confirms otherwise. |
+| `patron_attestation` | string | `unknown` | `not_required` \| `standing_completed` \| `per_request` \| `unknown`. `standing_completed` counts only when the institution has confirmed a registration-time agreement covers API-created requests of this class — never inferred from an account's existence, a missing checkbox in one render, an API accepting a request, or the institution's country or hostname. |
+| `patron_fee_policy` | string | `unknown` | `zero_standard` \| `per_request` \| `unknown`. Only `zero_standard` can ever compile `auto_capable` — v1 auto-submission covers zero-patron-fee digital journal articles only; books, chapters, theses, physical loans, rush service, and any nonzero or provider-quoted fee stay `prefill_only`. |
+| `monthly_request_cap` | integer | `0` (no cap) | Bounds auto-submitted requests per calendar month; `0` means no declared cap. Must be `>= 0`. |
+| `status_poll_minutes` | integer minutes | `0` (adapter default) | Delivery status poll cadence; `0` uses the delivery service's own default. Must be `>= 0`. Delivery polling draws on its own budget, never on ordinary resolver/HTTP retry counts, so a slow ILL turnaround cannot exhaust the acquisition waterfall's retry budget. |
+| `api_key` | string | empty | Institution-issued application credential, permitted only for `kind = "illiad"` — a key on a form-kind profile is rejected as dead config. Read only by the daemon's delivery service; never sent to, stored in, or observable from the extension or the browser wire. 0600 config only. |
+| `patron_ref` | string | empty | Configured, non-secret patron reference used to map requests to the institution's system. Personal identity data, not a secret: 0600 config only, redacted from events, diagnostics, and delivery provenance. |
+
+A compiled `auto_capable` verdict additionally requires one recorded live
+acceptance — a supervised submit-and-reconcile against the real deployment
+under the institution's authority — so a compiled adapter plus matching
+config is necessary but not sufficient. `papio init` prints the compiled
+gate class before saving (`AUTO-CAPABLE` with its evidence, or
+`PREFILL ONLY` with the specific blocker) and `papio doctor` verifies what
+is verifiable while keeping `DECLARED` configuration and `PASS`/`OBSERVED`
+facts strictly separate: neither command claims automatic submission for a
+profile that cannot actually reach it.
+
+```toml
+[browser.resolvers.campus.document_delivery]
+kind = "illiad"
+base_url = "https://ill.campus.example.edu/illiadwebplatform"
+allowed_hosts = ["ill.campus.example.edu"]
+submit_policy = "auto_if_unconditional"      # or "prefill_only" / "never"
+request_classes = ["digital_journal_article"]
+legal_basis = "institution_policy"           # or "copyright_act_s49"
+patron_attestation = "standing_completed"    # or "not_required" / "per_request"
+patron_fee_policy = "zero_standard"
+monthly_request_cap = 25
+status_poll_minutes = 60
+api_key = "..."
+patron_ref = "configured-non-secret-reference"
+```
+
 ## `[zotio]`
 
 | Key | Type | Default | Effect and constraints |

@@ -347,3 +347,110 @@ func TestRecordAndHasLiveAcceptance(t *testing.T) {
 		t.Fatal("HasLiveAcceptance = true for an unrelated provider")
 	}
 }
+
+// TestOrphanIfLiveMarksSubmittedRowUnknownOutcome proves the P2 compensation
+// primitive: a submitted row whose driving job stopped watching it is
+// marked unknown_outcome with a recorded delivery.orphaned event, never
+// left looking like papio is still polling it.
+func TestOrphanIfLiveMarksSubmittedRowUnknownOutcome(t *testing.T) {
+	svc := testService(t, time.Now())
+	ctx := context.Background()
+	testJob(t, svc, "job_live")
+
+	req, err := svc.Create(ctx, CreateRequest{
+		JobID: "job_live", InstitutionProfile: "campus", Provider: "illiad",
+		RequestClass: "digital_journal_article", WorkIdentity: "doi:10.1/orphan",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.UpdateState(ctx, req.ID, StateSubmitted); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := svc.OrphanIfLive(ctx, "job_live", "job_cancelled"); err != nil {
+		t.Fatal(err)
+	}
+
+	after, err := svc.Get(ctx, req.ID)
+	if err != nil || after == nil {
+		t.Fatalf("Get after OrphanIfLive: %+v, %v", after, err)
+	}
+	if after.State != StateUnknownOutcome {
+		t.Fatalf("state = %q, want unknown_outcome", after.State)
+	}
+
+	var jobID sql.NullString
+	var kind, detailJSON string
+	err = svc.store.DB().QueryRowContext(ctx, `SELECT job_id, kind, detail_json FROM events WHERE kind = 'delivery.orphaned'`).
+		Scan(&jobID, &kind, &detailJSON)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !jobID.Valid || jobID.String != "job_live" {
+		t.Fatalf("job_id = %v, want job_live", jobID)
+	}
+	var detail map[string]any
+	if err := json.Unmarshal([]byte(detailJSON), &detail); err != nil {
+		t.Fatal(err)
+	}
+	if detail["cause"] != "job_cancelled" {
+		t.Fatalf("detail = %v, want cause=job_cancelled", detail)
+	}
+}
+
+// TestOrphanIfLiveIgnoresNonLiveRows proves OrphanIfLive only ever touches a
+// row actually submitted/pending: an offered row (no vendor request exists
+// yet), an already-resolved row, and a job with no delivery row at all are
+// all untouched no-ops.
+func TestOrphanIfLiveIgnoresNonLiveRows(t *testing.T) {
+	svc := testService(t, time.Now())
+	ctx := context.Background()
+	testJob(t, svc, "job_offered")
+	testJob(t, svc, "job_fulfilled")
+	testJob(t, svc, "job_none")
+
+	offered, err := svc.Create(ctx, CreateRequest{
+		JobID: "job_offered", InstitutionProfile: "campus", Provider: "illiad",
+		RequestClass: "digital_journal_article", WorkIdentity: "doi:10.1/offered",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fulfilled, err := svc.Create(ctx, CreateRequest{
+		JobID: "job_fulfilled", InstitutionProfile: "campus", Provider: "illiad",
+		RequestClass: "digital_journal_article", WorkIdentity: "doi:10.1/fulfilled",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.UpdateState(ctx, fulfilled.ID, StateFulfilled); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := svc.OrphanIfLive(ctx, "job_offered", "job_cancelled"); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.OrphanIfLive(ctx, "job_fulfilled", "job_cancelled"); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.OrphanIfLive(ctx, "job_none", "job_cancelled"); err != nil {
+		t.Fatal(err)
+	}
+
+	after, err := svc.Get(ctx, offered.ID)
+	if err != nil || after == nil || after.State != StateOffered {
+		t.Fatalf("offered row after OrphanIfLive = %+v, %v, want untouched offered", after, err)
+	}
+	after, err = svc.Get(ctx, fulfilled.ID)
+	if err != nil || after == nil || after.State != StateFulfilled {
+		t.Fatalf("fulfilled row after OrphanIfLive = %+v, %v, want untouched fulfilled", after, err)
+	}
+	var count int
+	if err := svc.store.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE kind = 'delivery.orphaned'`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("delivery.orphaned events = %d, want 0 — none of these rows were ever live", count)
+	}
+}

@@ -36,6 +36,7 @@ daemon on your machine. Each request carries the identifier being looked up; the
 | `www.ebi.ac.uk` (Europe PMC) | — | Resolving a DOI, PMID, or title | **On** |
 | `export.arxiv.org` | — | Resolving an arXiv id or DOI | **On** |
 | `doi.org` | your `email`, in the User-Agent | Confirming a DOI exists, before an institutional handoff | **On** |
+| Your institution's configured delivery API (`document_delivery.base_url` — ILLiad in v1) | your `api_key`, `patron_ref`, and the request's bibliographic identifiers | Submitting or polling one of *your* document-delivery requests, under the profile you configured | Off — requires configuration |
 | `api.openalex.org` | your `email`, your API key | Resolving, and `papio search` | Off |
 | `api.core.ac.uk` | your API key | Resolving | Off |
 | `api.crossref.org` (TDM) | your subscriber token | Resolving | Off |
@@ -45,7 +46,7 @@ daemon on your machine. Each request carries the identifier being looked up; the
 | `api.github.com` | **nothing** | Once a day, checking for a new *papio* or zotio release | **On**, `updates.check = false` disables it |
 | Your webhook URL | job event and message | Job state changes | Off |
 
-Three things worth calling out:
+Four things worth calling out:
 
 - **The `email` setting is a contact address, sent deliberately.** Unpaywall and
   OpenAlex require it and refuse to run without one; Crossref and the DOI handle
@@ -60,6 +61,17 @@ Three things worth calling out:
   GitHub releases page, the same request anyone visiting that page makes. GitHub sees
   your IP, as any web request would; OrgMentem receives no notification, no identifier,
   and no count. Set `updates.check = false` if you would rather it did not happen.
+- **Document delivery reaches only the ILL system you configure, only for
+  requests you configured it to make.** Setting `document_delivery.kind =
+  "illiad"` (or another supported kind) with `submit_policy` at
+  `prefill_only` or `auto_if_unconditional` makes *papio* call that
+  institution's own document-delivery API directly, using the
+  institution-issued key and patron reference you configured — never a
+  shared or *papio*-operated service. It is contacted only to submit or poll
+  a request tied to a job of yours; leave `document_delivery` unset (the
+  default) and no such call is ever made. See the
+  [configuration reference](reference/config-reference.md#browserdocument_delivery)
+  for the full field list.
 
 ## What the extension does and does not do
 
@@ -71,9 +83,20 @@ Three things worth calling out:
 - **No credentials are stored.** You sign in to your institution and solve any
   MFA or CAPTCHA yourself, in your own browser session. *papio* never sees, stores,
   or transmits your usernames, passwords, cookies, or session tokens.
-- **No bulk scraping.** The extension downloads only the papers you explicitly
-  request, one at a time, as part of a specific acquisition job. It does not
-  crawl, harvest, or mass-download from publishers.
+- **No bulk scraping.** Single-paper acquisition still downloads one job at a
+  time. On-page bulk selection (below) is the one exception, and it remains
+  bounded and explicit: it never crawls, harvests, or auto-submits — it acts
+  only on the works you have checked and clicked to acquire, capped at 50
+  per batch.
+- **On-page selection is local-only until you submit.** Detection for
+  "Select papers on this page" runs entirely inside the tab you are
+  viewing, only when you click that button — never ambient, never a
+  background watcher. The lookup that follows sends only the detected
+  identifiers to the local *papio* application on your computer, never the
+  page's title, URL, or surrounding text; the batch you submit records only
+  the page's bare origin (scheme and host), never its path, query, or
+  title. No scholarly service is contacted until you submit selected
+  papers.
 - **Your real session, not a bot.** The extension uses only standard extension
   APIs and native messaging — no WebDriver, CDP, or automation frameworks — so it
   operates as an ordinary part of your browsing.

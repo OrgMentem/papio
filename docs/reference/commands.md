@@ -395,6 +395,62 @@ Stop the running daemon without autostarting one
 papio daemon stop
 ```
 
+## `papio delivery`
+
+Manage document-delivery and ILL requests
+
+```
+papio delivery
+```
+
+### `papio delivery cancel`
+
+Cancel a document-delivery request, where the provider supports it
+
+```
+papio delivery cancel <job-id>
+```
+
+### `papio delivery confirm-absent`
+
+Confirm no request exists at the provider and re-run the gate for a fresh decision
+
+```
+papio delivery confirm-absent <job-id>
+```
+
+### `papio delivery confirm-exists`
+
+Confirm a lodged request exists at the provider and resume polling
+
+```
+papio delivery confirm-exists <job-id> <provider-reference>
+```
+
+### `papio delivery get`
+
+Show a job's document-delivery request and compiled gate
+
+```
+papio delivery get <job-id>
+```
+
+### `papio delivery history`
+
+Show a delivery request's history for reconciliation (Decision 4's open_request_history)
+
+```
+papio delivery history <job-id>
+```
+
+### `papio delivery submit`
+
+Run the document-delivery Branch/gate decision for a job
+
+```
+papio delivery submit <job-id>
+```
+
 ## `papio doctor`
 
 Check acquisition readiness and local integrations
