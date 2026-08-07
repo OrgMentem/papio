@@ -9,19 +9,25 @@ yields the Next-tier decisions depend on (ADR-0019 Decision 10).
 
 ## Now — build next, no further evidence needed
 
-1. **`papio import` (RIS/BibTeX → batch).** The generic bulk bridge for every
-   discovery UI the scanner is structurally blind to: Primo/Alma listings
-   (1/50 yield — identifiers live in the index, not the DOM), silent Scholar
-   rows, ScienceDirect, JSTOR. Every such system already has an "export RIS"
-   button; papio has export since v0.18-dev but no import. Daemon/CLI only,
-   no scraping fragility, mirrors `internal/cite` in reverse: parse → work
-   requests → existing batch submit with `consumer=import:<format>`.
-   Fail-closed rules: identifier-bearing entries submit; title-only entries
-   are listed-not-submitted (same weak-match stance as ADR-0019) behind an
-   explicit `--allow-title-only` that routes through the existing
-   title-enrichment path. Acceptance: OneSearch "Export RIS" of a 50-result
-   page → `papio import results.ris` → one batch, dedupe against ledger,
-   honest per-entry report.
+1. **CORRECTED — bulk import already exists.** `papio acquire --batch`
+   accepts JSONL, RIS, BibTeX, CSL-JSON, and MEDLINE/NBIB (internal/bibparse,
+   since the ADR-0008 library-dedup work). Verified live 2026-08-07: a
+   OneSearch-style RIS file submits in one command, ledger/cache dedupe
+   applies (a previously-acquired DOI went ready instantly from the artifact
+   cache), and title-only entries submit through title enrichment. The
+   original "build papio import" item was planned against a capability the
+   tool already had — a discoverability failure, which reframes the work:
+   - **Docs**: a user-guide section for the "silent discovery UI" workflow —
+     OneSearch/Scholar/Primo → Export RIS → `papio acquire --batch` — and a
+     pointer from the page-bulk workspace's collapsed-note copy or docs so
+     the next person (or agent) finds it.
+   - **Review title-only default**: --batch submits identifier-less entries
+     outright; ADR-0019 deliberately refuses title-only submissions from the
+     browser for weak-match risk. Decide whether the CLI default should stay
+     permissive (operator-invoked, enrichment-gated, identity-validated at
+     PDF time — arguably fine) or align with the browser's caution; document
+     the decision either way.
+   - Optional: a `papio import` alias only if ergonomics ever demand it.
 2. **Delivery status poller + fulfillment adoption.** ADR-0017's submitted
    path parks `retry_wait/document_delivery_pending` with a poll schedule,
    but nothing yet executes the poll: an ILLiad `GetTransaction` check on
