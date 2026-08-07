@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -77,7 +78,7 @@ func newInitCommand(opt *options) *cobra.Command {
 func newInitCommandWithDependencies(opt *options, deps initDependencies) *cobra.Command {
 	var checkUpdates, nonInteractive, skipBrowser bool
 	var email, zotioPath, attachmentMode string
-	var institutionURL, openurlBase, shibbolethEntityID, proquestAccountID string
+	var institutionURL, openurlBase, shibbolethEntityID, proquestAccountID, libkeyLibraryID string
 	var extensionID, firefoxExtensionID string
 
 	command := &cobra.Command{
@@ -99,6 +100,7 @@ func newInitCommandWithDependencies(opt *options, deps initDependencies) *cobra.
 				openurlBase:        openurlBase,
 				shibbolethEntityID: shibbolethEntityID,
 				proquestAccountID:  proquestAccountID,
+				libkeyLibraryID:    libkeyLibraryID,
 				extensionID:        extensionID,
 				firefoxExtensionID: firefoxExtensionID,
 				checkUpdates:       checkUpdates,
@@ -109,6 +111,7 @@ func newInitCommandWithDependencies(opt *options, deps initDependencies) *cobra.
 				openurlBaseSet:     cmd.Flags().Changed("openurl-base"),
 				entityIDSet:        cmd.Flags().Changed("shibboleth-entity-id"),
 				proquestSet:        cmd.Flags().Changed("proquest-account-id"),
+				libkeySet:          cmd.Flags().Changed("libkey-library-id"),
 				extensionIDSet:     cmd.Flags().Changed("extension-id"),
 				firefoxIDSet:       cmd.Flags().Changed("firefox-extension-id"),
 				checkUpdatesSet:    cmd.Flags().Changed("check-updates"),
@@ -123,6 +126,7 @@ func newInitCommandWithDependencies(opt *options, deps initDependencies) *cobra.
 	command.Flags().StringVar(&openurlBase, "openurl-base", "", "institution OpenURL resolver base URL")
 	command.Flags().StringVar(&shibbolethEntityID, "shibboleth-entity-id", "", "Shibboleth IdP entityID for federated login-routing")
 	command.Flags().StringVar(&proquestAccountID, "proquest-account-id", "", "ProQuest account id, or a ProQuest URL containing accountid=")
+	command.Flags().StringVar(&libkeyLibraryID, "libkey-library-id", "", "numeric Third Iron library id, or a BrowZine/LibKey.io URL containing /libraries/<id>; enables LibKey link routing (blank disables)")
 	command.Flags().StringVar(&extensionID, "extension-id", "", "Chrome extension ID allowed to reach the native host, or an unpacked extension folder path (papio computes its ID)")
 	command.Flags().StringVar(&firefoxExtensionID, "firefox-extension-id", "", "Firefox add-on ID allowed to reach the native host")
 	command.Flags().BoolVar(&skipBrowser, "skip-browser", false, "skip Chrome extension and native-host setup")
@@ -140,6 +144,7 @@ type initOptions struct {
 	openurlBase        string
 	shibbolethEntityID string
 	proquestAccountID  string
+	libkeyLibraryID    string
 	extensionID        string
 	firefoxExtensionID string
 	checkUpdates       bool
@@ -150,6 +155,7 @@ type initOptions struct {
 	openurlBaseSet     bool
 	entityIDSet        bool
 	proquestSet        bool
+	libkeySet          bool
 	extensionIDSet     bool
 	firefoxIDSet       bool
 	checkUpdatesSet    bool
@@ -536,6 +542,17 @@ func applyInitConfig(cmd *cobra.Command, out io.Writer, cfg *config.Config, exis
 				}
 				cfg.Browser.ProquestAccountID = id
 			}
+			if !input.libkeySet {
+				raw, err := initPrompt(reader, out, "LibKey library id or BrowZine/LibKey.io URL (blank to skip)", libKeyPromptDefault(cfg.Browser.LibKeyLibraryID))
+				if err != nil {
+					return err
+				}
+				id, err := libKeyLibraryIDFromInput(raw)
+				if err != nil {
+					return err
+				}
+				applyLibKey(&cfg.Browser, id)
+			}
 		}
 	}
 	if input.openurlBaseSet {
@@ -550,6 +567,13 @@ func applyInitConfig(cmd *cobra.Command, out io.Writer, cfg *config.Config, exis
 			return err
 		}
 		cfg.Browser.ProquestAccountID = id
+	}
+	if input.libkeySet {
+		id, err := libKeyLibraryIDFromInput(input.libkeyLibraryID)
+		if err != nil {
+			return err
+		}
+		applyLibKey(&cfg.Browser, id)
 	}
 	if input.extensionIDSet {
 		id, computedFrom, err := resolveChromeExtensionID(input.extensionID)
@@ -829,6 +853,58 @@ func proquestAccountIDFromInput(input string) (string, error) {
 		return m[1], nil
 	}
 	return "", fmt.Errorf("no ProQuest account id found in %q: paste a URL containing accountid=NNNN or the numeric id", s)
+}
+
+// libKeyLibrariesPathRE extracts the numeric library id from a BrowZine or
+// LibKey.io URL — Third Iron documents the id as the number in the
+// institution's …/libraries/<id>/… URL.
+var libKeyLibrariesPathRE = regexp.MustCompile(`/libraries/([0-9]+)(?:[/?#]|$)`)
+
+// libKeyLibraryIDFromInput turns first-run input into a Third Iron library id.
+// It accepts a bare numeric id, or a pasted BrowZine/LibKey.io URL containing
+// /libraries/<id>, so a user who does not know the numeric id can paste the
+// URL from their library's BrowZine page. Blank input yields 0 (disabled).
+func libKeyLibraryIDFromInput(input string) (int64, error) {
+	s := strings.TrimSpace(input)
+	if s == "" {
+		return 0, nil
+	}
+	if proquestAccountDigitsRE.MatchString(s) {
+		id, err := strconv.ParseInt(s, 10, 64)
+		if err != nil || id <= 0 {
+			return 0, fmt.Errorf("LibKey library id %q is out of range", s)
+		}
+		return id, nil
+	}
+	if m := libKeyLibrariesPathRE.FindStringSubmatch(s); m != nil {
+		id, err := strconv.ParseInt(m[1], 10, 64)
+		if err != nil || id <= 0 {
+			return 0, fmt.Errorf("LibKey library id in %q is out of range", s)
+		}
+		return id, nil
+	}
+	return 0, fmt.Errorf("no LibKey library id found in %q: paste a BrowZine/LibKey.io URL containing /libraries/<id> or the numeric id", s)
+}
+
+// applyLibKey records a library id as keyless link-mode routing, or clears
+// LibKey routing entirely for id 0 — never a half-set pair, which strict
+// config validation would reject on the next load.
+func applyLibKey(b *config.Browser, id int64) {
+	if id > 0 {
+		b.LibKeyMode = "link"
+		b.LibKeyLibraryID = id
+		return
+	}
+	b.LibKeyMode = ""
+	b.LibKeyLibraryID = 0
+}
+
+// libKeyPromptDefault renders the current library id as the prompt default.
+func libKeyPromptDefault(id int64) string {
+	if id <= 0 {
+		return ""
+	}
+	return strconv.FormatInt(id, 10)
 }
 
 func validateInitEmail(value string) error {

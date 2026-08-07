@@ -2712,18 +2712,28 @@ func (b *Bridge) offerableAccessMode(row job.Row) (string, bool) {
 }
 
 // offer builds a job_offer for one parked handoff job. OA browser handoffs
-// reuse the frozen OpenURL field with the candidate's public URL; institutional
-// handoffs still construct the regular OpenURL resolver link. accessMode comes
-// from offerableAccessMode, so this never has to re-derive it.
+// reuse the frozen OpenURL field with the candidate's public URL;
+// institutional handoffs take the profile's route — the LibKey.io link when
+// configured (ADR-0016), else the plain OpenURL resolver link. A LibKey
+// route opens on libkey.io and then forwards through the institution's
+// resolver, so the resolver host must stay on the offer's host list or the
+// extension goes blind exactly at the redirect. accessMode comes from
+// offerableAccessMode, so this never has to re-derive it.
 func (b *Bridge) offer(row job.Row, action job.HumanAction, accessMode string) (json.RawMessage, error) {
 	inst, _ := b.cfg.InstitutionFor(row.Policy.Resolver)
-	offerURL := OpenURL(inst.OpenURLBase, row.Work)
+	libKeyURL := LibKeyURL(inst, row.Work)
+	offerURL := RouteURL(inst, row.Work)
 	if oaURL, ok := app.OABrowserHandoffURL(action.Detail); ok {
 		offerURL = oaURL
 	}
 	hosts := []string{}
 	if h := resolverHost(offerURL); h != "" {
 		hosts = append(hosts, h)
+	}
+	if libKeyURL != "" && offerURL == libKeyURL {
+		if h := resolverHost(inst.OpenURLBase); h != "" && h != libKeyHost {
+			hosts = append(hosts, h)
+		}
 	}
 	hosts = append(hosts, verifiedProviderHosts...)
 	expected := &protocol.JobOfferExpected{DOI: row.Work.DOI, Title: truncate(row.Work.Title, 500)}

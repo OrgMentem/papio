@@ -465,6 +465,7 @@ papio init [flags]
 | `--extension-id` | `string` |  | Chrome extension ID allowed to reach the native host, or an unpacked extension folder path (papio computes its ID) |
 | `--firefox-extension-id` | `string` |  | Firefox add-on ID allowed to reach the native host |
 | `--institution-url` | `string` |  | library discovery or resolver URL; papio derives the OpenURL base |
+| `--libkey-library-id` | `string` |  | numeric Third Iron library id, or a BrowZine/LibKey.io URL containing /libraries/<id>; enables LibKey link routing (blank disables) |
 | `--non-interactive` | `bool` | `false` | do not prompt; retain existing values unless a flag overrides them |
 | `--openurl-base` | `string` |  | institution OpenURL resolver base URL |
 | `--proquest-account-id` | `string` |  | ProQuest account id, or a ProQuest URL containing accountid= |

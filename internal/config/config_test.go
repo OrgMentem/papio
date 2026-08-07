@@ -892,3 +892,76 @@ func TestEffectiveAccessModeIsAMonotoneCeiling(t *testing.T) {
 		})
 	}
 }
+
+func TestLibKeyConfigValidationFailsClosed(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		body    string
+		wantErr string // empty = accept
+	}{
+		{
+			name: "link mode with a library id on the default profile",
+			body: "[browser]\nopenurl_base_url = \"https://resolver.example.edu/openurl\"\nlibkey_mode = \"link\"\nlibkey_library_id = 1234\n",
+		},
+		{
+			name: "link mode with a library id on a named profile",
+			body: "[browser.resolvers.campus]\nopenurl_base_url = \"https://campus.example.edu/openurl\"\nlibkey_mode = \"link\"\nlibkey_library_id = 1234\n",
+		},
+		{
+			name:    "link mode without a library id",
+			body:    "[browser]\nopenurl_base_url = \"https://resolver.example.edu/openurl\"\nlibkey_mode = \"link\"\n",
+			wantErr: "libkey_library_id",
+		},
+		{
+			name:    "library id without link mode is silently-dead config",
+			body:    "[browser]\nopenurl_base_url = \"https://resolver.example.edu/openurl\"\nlibkey_library_id = 1234\n",
+			wantErr: "libkey_library_id is set",
+		},
+		{
+			name:    "api mode is not implemented",
+			body:    "[browser]\nopenurl_base_url = \"https://resolver.example.edu/openurl\"\nlibkey_mode = \"api\"\n",
+			wantErr: "not implemented",
+		},
+		{
+			name:    "unknown mode",
+			body:    "[browser]\nopenurl_base_url = \"https://resolver.example.edu/openurl\"\nlibkey_mode = \"nomad\"\n",
+			wantErr: "libkey_mode must be",
+		},
+		{
+			name:    "named-profile errors carry the profile name",
+			body:    "[browser.resolvers.campus]\nopenurl_base_url = \"https://campus.example.edu/openurl\"\nlibkey_mode = \"link\"\n",
+			wantErr: "browser.resolvers.campus.libkey_mode",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.toml")
+			if err := os.WriteFile(path, []byte("access_mode = \"conservative\"\n"+test.body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			_, err := Load(path)
+			if test.wantErr == "" {
+				if err != nil {
+					t.Fatalf("valid LibKey config rejected: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+				t.Fatalf("Load = %v, want an error containing %q", err, test.wantErr)
+			}
+		})
+	}
+}
+
+func TestInstitutionForMirrorsDefaultProfileLibKeyFields(t *testing.T) {
+	cfg := Config{Browser: Browser{
+		OpenURLBase:     "https://resolver.example.edu/openurl",
+		LibKeyMode:      "link",
+		LibKeyLibraryID: 1234,
+	}}
+	for _, name := range []string{"", "default"} {
+		inst, ok := cfg.InstitutionFor(name)
+		if !ok || inst.LibKeyMode != "link" || inst.LibKeyLibraryID != 1234 {
+			t.Fatalf("InstitutionFor(%q) = %+v, %t — the default profile must carry the top-level LibKey fields", name, inst, ok)
+		}
+	}
+}

@@ -136,8 +136,8 @@ func TestGuidanceResolverRejectsTheFlagThatShipped(t *testing.T) {
 // `actions open` recommendation must produce a browser target for that action.
 func TestActionGuidanceCommandsApplyToEveryActionKind(t *testing.T) {
 	row := job.Row{Work: work.Work{DOI: "10.1000/action-guidance"}}
-	baseFor := func(string) (string, bool) {
-		return "https://resolver.example.test/openurl", true
+	instFor := func(string) (config.Institution, bool) {
+		return config.Institution{OpenURLBase: "https://resolver.example.test/openurl"}, true
 	}
 	kinds := []string{
 		"openurl_handoff",
@@ -164,7 +164,7 @@ func TestActionGuidanceCommandsApplyToEveryActionKind(t *testing.T) {
 				switch command := next.Command; command {
 				case "":
 				case "papio actions open":
-					if _, ok := actionURL(action, row, baseFor); !ok {
+					if _, ok := actionURL(action, row, instFor); !ok {
 						t.Fatalf("%q cannot act on %s with requires_auth=%t", command, kind, requiresAuth)
 					}
 				default:
@@ -183,8 +183,8 @@ func TestCurrentErrcatGuidanceCommandsApplyToActions(t *testing.T) {
 	root.InitDefaultHelpCmd()
 	root.InitDefaultCompletionCmd()
 	row := job.Row{Work: work.Work{DOI: "10.1000/current-guidance"}}
-	baseFor := func(string) (string, bool) {
-		return "https://resolver.example.test/openurl", true
+	instFor := func(string) (config.Institution, bool) {
+		return config.Institution{OpenURLBase: "https://resolver.example.test/openurl"}, true
 	}
 	cases := []struct {
 		name     string
@@ -234,7 +234,7 @@ func TestCurrentErrcatGuidanceCommandsApplyToActions(t *testing.T) {
 				if snippet != "papio actions open" {
 					continue
 				}
-				if _, ok := actionURL(test.action, row, baseFor); !ok {
+				if _, ok := actionURL(test.action, row, instFor); !ok {
 					t.Fatalf("%q cannot act on current %s action", snippet, test.action.Kind)
 				}
 			}

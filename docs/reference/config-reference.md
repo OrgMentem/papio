@@ -56,6 +56,8 @@ the configuration change.
 | `openurl_base_url` | string URL | empty | Legacy/default institutional OpenURL resolver base. It must use `https://`; an empty value prevents default-profile institutional routing. Existing query parameters are preserved when *papio* adds citation metadata. Prefer the institution's direct-link-enabled endpoint so a single electronic service bypasses the resolver menu. |
 | `shibboleth_entity_id` | string URL | empty | Default institution's Shibboleth IdP entityID (`https://`). When set, a provider login wall is auto-routed to this IdP (skipping the WAYF selector). Empty disables federated login-routing for the default profile. |
 | `proquest_account_id` | string digits | empty | Default institution's ProQuest account id (digits, max 64). When set, *papio* appends `?accountid=<id>` to unlock the institution's ProQuest link-resolver without a manual sign-in. Empty disables the append. During `papio init` you may paste a ProQuest URL containing `accountid=` instead of the bare id. |
+| `libkey_mode` | string | empty | LibKey routing for the default institution: empty or `off` disables it; `link` routes DOI/PMID handoffs through the keyless `libkey.io/libraries/<id>/<doi-or-pmid>` institution link ahead of the bare OpenURL resolver, falling back to OpenURL for works without a DOI or PMID and whenever LibKey is unavailable. `api` is reserved and rejected (not implemented). Requires `libkey_library_id` when set to `link`. |
+| `libkey_library_id` | integer | `0` | The institution's numeric Third Iron library id — the number in its BrowZine/LibKey.io URL (`…/libraries/<id>/…`). Required (positive) when `libkey_mode = "link"`; setting it without `link` mode is rejected rather than left silently dead. |
 | `download_adoption_root` | path string | empty | Root for browser-download adoption. When empty, the effective value is `<data_dir>/adoptions`; adoption is confined to a job subdirectory beneath this root. |
 | `action_expiry_seconds` | integer seconds | `1800` | Browser-handoff expiry and the initial age before an open human action is reminded. Later reminders double their per-action interval through 24 hours. It must not be negative. |
 
@@ -75,7 +77,8 @@ native messaging host installs on the first run.
 
 Named resolver profiles are per-institution tables keyed by a lowercase
 alphanumeric name. Each carries its own OpenURL base and, optionally, the same
-`shibboleth_entity_id` and `proquest_account_id` login fields as the default
+`shibboleth_entity_id`, `proquest_account_id`, `libkey_mode`, and
+`libkey_library_id` fields as the default
 `[browser]` institution — so a multi-institution user routes each job's login
 to the right library instead of inheriting the default's identity:
 
@@ -84,6 +87,8 @@ to the right library instead of inheriting the default's identity:
 openurl_base_url = "https://library.example.edu/discovery/openurl?institution=EXAMPLE"
 shibboleth_entity_id = "https://idp.example.edu/idp/shibboleth"  # optional
 proquest_account_id = "12345"                                     # optional
+libkey_mode = "link"                                              # optional
+libkey_library_id = 1234                                          # required for link mode
 ```
 
 A profile may also be written as a bare string — `campus =

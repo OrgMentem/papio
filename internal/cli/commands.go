@@ -20,6 +20,7 @@ import (
 	"papio/internal/api"
 	"papio/internal/app"
 	"papio/internal/browser"
+	"papio/internal/config"
 	"papio/internal/ipc"
 	"papio/internal/job"
 	"papio/internal/store"
@@ -580,7 +581,7 @@ func newActionsCommand(opt *options) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			targets, droppedForMissingJob := actionHandoffTargets(actions, rows, cfg.OpenURLBaseFor, limit)
+			targets, droppedForMissingJob := actionHandoffTargets(actions, rows, cfg.InstitutionFor, limit)
 			urls := make([]string, 0, len(targets))
 			untrackedURLs := make([]string, 0, len(targets))
 			jobIDs := make([]string, 0, len(targets))
@@ -671,7 +672,7 @@ type actionHandoffTarget struct {
 	Tracked bool
 }
 
-func actionHandoffTargets(actions []job.HumanAction, rows []job.Row, baseFor func(string) (string, bool), limit int) (targets []actionHandoffTarget, droppedForMissingJob int) {
+func actionHandoffTargets(actions []job.HumanAction, rows []job.Row, instFor func(string) (config.Institution, bool), limit int) (targets []actionHandoffTarget, droppedForMissingJob int) {
 	jobs := make(map[string]job.Row, len(rows))
 	for _, row := range rows {
 		jobs[row.ID] = row
@@ -689,7 +690,7 @@ func actionHandoffTargets(actions []job.HumanAction, rows []job.Row, baseFor fun
 		if row.State != job.StateAwaitingHuman {
 			continue
 		}
-		target, ok := actionURL(action, row, baseFor)
+		target, ok := actionURL(action, row, instFor)
 		if !ok {
 			continue
 		}
@@ -702,8 +703,8 @@ func actionHandoffTargets(actions []job.HumanAction, rows []job.Row, baseFor fun
 }
 
 // actionURLs preserves the URL-only helper used by dry-run and JSON rendering.
-func actionURLs(actions []job.HumanAction, rows []job.Row, baseFor func(string) (string, bool), limit int) (urls []string, droppedForMissingJob int) {
-	targets, droppedForMissingJob := actionHandoffTargets(actions, rows, baseFor, limit)
+func actionURLs(actions []job.HumanAction, rows []job.Row, instFor func(string) (config.Institution, bool), limit int) (urls []string, droppedForMissingJob int) {
+	targets, droppedForMissingJob := actionHandoffTargets(actions, rows, instFor, limit)
 	urls = make([]string, 0, len(targets))
 	for _, target := range targets {
 		urls = append(urls, target.URL)
@@ -711,7 +712,7 @@ func actionURLs(actions []job.HumanAction, rows []job.Row, baseFor func(string) 
 	return urls, droppedForMissingJob
 }
 
-func actionURL(action job.HumanAction, row job.Row, baseFor func(string) (string, bool)) (string, bool) {
+func actionURL(action job.HumanAction, row job.Row, instFor func(string) (config.Institution, bool)) (string, bool) {
 	if direct, ok := app.OABrowserHandoffURL(action.Detail); ok {
 		return direct, true
 	}
@@ -723,11 +724,11 @@ func actionURL(action job.HumanAction, row job.Row, baseFor func(string) (string
 	}
 	// Honor the job's resolver profile: an Example Institute-routed job must never open the
 	// default (Example University) resolver.
-	base, ok := baseFor(row.Policy.Resolver)
-	if !ok || base == "" {
+	inst, ok := instFor(row.Policy.Resolver)
+	if !ok || inst.OpenURLBase == "" {
 		return "", false
 	}
-	target := browser.OpenURL(base, row.Work)
+	target := browser.RouteURL(inst, row.Work)
 	return target, validOpenURL(target)
 }
 

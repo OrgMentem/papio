@@ -129,6 +129,15 @@ type Browser struct {
 	// ProquestAccountID is the institution's ProQuest account id used to unlock
 	// ProQuest's OpenURL link-resolver; empty disables.
 	ProquestAccountID string `toml:"proquest_account_id,omitempty"`
+	// LibKeyMode selects the default institution's LibKey routing: "" or
+	// "off" disables it; "link" routes DOI/PMID handoffs through the
+	// documented keyless LibKey.io institution link ahead of the bare
+	// OpenURL resolver (ADR-0016; api mode is not implemented yet).
+	LibKeyMode string `toml:"libkey_mode,omitempty"`
+	// LibKeyLibraryID is the default institution's numeric Third Iron
+	// library id, required when LibKeyMode is "link". It appears in the
+	// institution's BrowZine/LibKey.io URL (…/libraries/<id>/…).
+	LibKeyLibraryID int64 `toml:"libkey_library_id,omitempty"`
 	// Resolvers contains named institutional access profiles. Each named
 	// profile carries its own OpenURL base and optional federated-login
 	// identity, so a multi-institution user routes each job to the right
@@ -180,6 +189,14 @@ type Institution struct {
 	// ProquestAccountID unlocks this institution's ProQuest link-resolver;
 	// empty disables the accountid append for this profile.
 	ProquestAccountID string `toml:"proquest_account_id,omitempty"`
+	// LibKeyMode selects this profile's LibKey routing: "" or "off"
+	// disables it; "link" routes DOI/PMID handoffs through the keyless
+	// LibKey.io institution link ahead of the bare OpenURL resolver
+	// (ADR-0016; api mode is not implemented yet).
+	LibKeyMode string `toml:"libkey_mode,omitempty"`
+	// LibKeyLibraryID is this profile's numeric Third Iron library id,
+	// required when LibKeyMode is "link".
+	LibKeyLibraryID int64 `toml:"libkey_library_id,omitempty"`
 }
 
 // UnmarshalText lets a resolver profile be written as a bare OpenURL base
@@ -559,6 +576,9 @@ func (c *Config) validate() error {
 	if c.Browser.ProquestAccountID != "" && (len(c.Browser.ProquestAccountID) > 64 || !proquestAccountIDRE.MatchString(c.Browser.ProquestAccountID)) {
 		return fmt.Errorf("browser.proquest_account_id must be digits (max 64)")
 	}
+	if err := validateLibKey(c.Browser.LibKeyMode, c.Browser.LibKeyLibraryID); err != nil {
+		return fmt.Errorf("browser.%w", err)
+	}
 	for name, inst := range c.Browser.Resolvers {
 		// "default" is the implicit top-level institution, not a valid map key:
 		// InstitutionFor resolves name == "default" to the top-level Browser
@@ -583,6 +603,9 @@ func (c *Config) validate() error {
 		}
 		if inst.ProquestAccountID != "" && (len(inst.ProquestAccountID) > 64 || !proquestAccountIDRE.MatchString(inst.ProquestAccountID)) {
 			return fmt.Errorf("browser.resolvers.%s.proquest_account_id must be digits (max 64)", name)
+		}
+		if err := validateLibKey(inst.LibKeyMode, inst.LibKeyLibraryID); err != nil {
+			return fmt.Errorf("browser.resolvers.%s.%w", name, err)
 		}
 	}
 	if defaultResolver := strings.TrimSpace(c.Browser.DefaultResolver); defaultResolver != "" {
@@ -738,6 +761,29 @@ var firefoxExtensionIDRE = regexp.MustCompile(`^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+
 var resolverNameRE = regexp.MustCompile(`^[a-z0-9]+$`)
 var proquestAccountIDRE = regexp.MustCompile(`^[0-9]+$`)
 
+// validateLibKey rejects unusable LibKey routing config instead of letting it
+// sit silently dead (the [sources.unpaywal] lesson: config that parses cleanly
+// and does nothing). The %w chains under a "browser." or
+// "browser.resolvers.<name>." prefix, so messages start with the field name.
+func validateLibKey(mode string, libraryID int64) error {
+	switch mode {
+	case "", "off":
+		if libraryID != 0 {
+			return fmt.Errorf("libkey_library_id is set but libkey_mode is not \"link\"")
+		}
+		return nil
+	case "link":
+		if libraryID <= 0 {
+			return fmt.Errorf("libkey_mode \"link\" requires a positive libkey_library_id (the number in the institution's BrowZine/LibKey.io URL)")
+		}
+		return nil
+	case "api":
+		return fmt.Errorf("libkey_mode \"api\" is not implemented; use \"link\" (ADR-0016)")
+	default:
+		return fmt.Errorf("libkey_mode must be \"off\" or \"link\"")
+	}
+}
+
 func validateOpenURLBase(base string) error {
 	u, err := url.Parse(base)
 	if err != nil || u.Scheme != "https" || u.Host == "" || strings.TrimSpace(base) != base {
@@ -856,6 +902,8 @@ func (c *Config) InstitutionFor(name string) (Institution, bool) {
 			OpenURLBase:        c.Browser.OpenURLBase,
 			ShibbolethEntityID: c.Browser.ShibbolethEntityID,
 			ProquestAccountID:  c.Browser.ProquestAccountID,
+			LibKeyMode:         c.Browser.LibKeyMode,
+			LibKeyLibraryID:    c.Browser.LibKeyLibraryID,
 		}
 		return inst, inst.OpenURLBase != ""
 	}

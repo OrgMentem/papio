@@ -68,14 +68,16 @@ func TestAccessHintClassifiesOpenAndInstitutionalAccess(t *testing.T) {
 func TestActionURLsSelectAwaitingActionsMostRecentAndDryRun(t *testing.T) {
 	base := "https://openurl.example.test/resolve"
 	instituteBase := "https://institute.example.test/resolve"
-	baseFor := func(name string) (string, bool) {
+	instFor := func(name string) (config.Institution, bool) {
 		switch name {
 		case "", "default":
-			return base, true
+			return config.Institution{OpenURLBase: base}, true
 		case "institute":
-			return instituteBase, true
+			return config.Institution{OpenURLBase: instituteBase}, true
+		case "libkeyed":
+			return config.Institution{OpenURLBase: instituteBase, LibKeyMode: "link", LibKeyLibraryID: 1234}, true
 		}
-		return "", false
+		return config.Institution{}, false
 	}
 	oaURL := "https://oa.example.test/paper.pdf"
 	rows := []job.Row{
@@ -85,8 +87,10 @@ func TestActionURLsSelectAwaitingActionsMostRecentAndDryRun(t *testing.T) {
 		{ID: "manual", State: job.StateAwaitingHuman, Work: work.Work{DOI: "10.1000/manual"}},
 		{ID: "profiled", State: job.StateAwaitingHuman, Policy: job.Policy{Resolver: "institute"}, Work: work.Work{DOI: "10.1000/profiled"}},
 		{ID: "unknownprofile", State: job.StateAwaitingHuman, Policy: job.Policy{Resolver: "gone"}, Work: work.Work{DOI: "10.1000/unknown"}},
+		{ID: "libkeyrouted", State: job.StateAwaitingHuman, Policy: job.Policy{Resolver: "libkeyed"}, Work: work.Work{DOI: "10.1000/libkey"}},
 	}
 	actions := []job.HumanAction{
+		{ID: 7, JobID: "libkeyrouted", Kind: "openurl_handoff", Status: "open"},
 		{ID: 6, JobID: "profiled", Kind: "openurl_handoff", Status: "open"},
 		{ID: 5, JobID: "unknownprofile", Kind: "openurl_handoff", Status: "open"},
 		{ID: 4, JobID: "oa", Kind: "openurl_handoff", Status: "open", Detail: app.OABrowserHandoffActionDetail(oaURL)},
@@ -95,15 +99,18 @@ func TestActionURLsSelectAwaitingActionsMostRecentAndDryRun(t *testing.T) {
 		{ID: 1, JobID: "manual", Kind: "manual_download", Status: "open", Detail: "choose a file"},
 	}
 
-	want := []string{browser.OpenURL(instituteBase, rows[4].Work), oaURL, browser.OpenURL(base, rows[1].Work)}
-	got, dropped := actionURLs(actions, rows, baseFor, 0)
+	want := []string{
+		"https://libkey.io/libraries/1234/10.1000/libkey",
+		browser.OpenURL(instituteBase, rows[4].Work), oaURL, browser.OpenURL(base, rows[1].Work),
+	}
+	got, dropped := actionURLs(actions, rows, instFor, 0)
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("URLs = %#v, want %#v", got, want)
 	}
 	if dropped != 0 {
 		t.Fatalf("dropped = %d, want 0 — every action's job id is present in rows", dropped)
 	}
-	if limited, limitedDropped := actionURLs(actions, rows, baseFor, 1); !reflect.DeepEqual(limited, want[:1]) || limitedDropped != 0 {
+	if limited, limitedDropped := actionURLs(actions, rows, instFor, 1); !reflect.DeepEqual(limited, want[:1]) || limitedDropped != 0 {
 		t.Fatalf("limited URLs = %#v, dropped = %d, want %#v, 0", limited, limitedDropped, want[:1])
 	}
 
@@ -111,7 +118,7 @@ func TestActionURLsSelectAwaitingActionsMostRecentAndDryRun(t *testing.T) {
 	if err := openActionURLs(context.Background(), want, true, &out, nil); err != nil {
 		t.Fatal(err)
 	}
-	if got := out.String(); got != want[0]+"\n"+want[1]+"\n"+want[2]+"\n" {
+	if got := out.String(); got != strings.Join(want, "\n")+"\n" {
 		t.Fatalf("dry-run output = %q", got)
 	}
 }

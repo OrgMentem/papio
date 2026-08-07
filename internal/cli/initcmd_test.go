@@ -459,6 +459,7 @@ func TestInitInteractiveInstitutionURLDerivesPrimoVEBase(t *testing.T) {
 		"",
 		discoveryURL,
 		"",
+		"", // LibKey library id: skip
 		"",
 		"",
 	}, "\n") + "\n"
@@ -498,6 +499,7 @@ func TestInitInteractiveInstitutionPromptUsesExistingBaseDefault(t *testing.T) {
 		"",
 		"",
 		"",
+		"", // LibKey library id: skip
 		"",
 		"",
 		"",
@@ -633,5 +635,71 @@ func TestInitDisplayDefaultSources(t *testing.T) {
 	}
 	if got := initDisplayDefault("zotio", ""); got != "zotio" {
 		t.Fatalf("plain = %q", got)
+	}
+}
+
+func TestLibKeyLibraryIDFromInput(t *testing.T) {
+	for _, test := range []struct {
+		name, input string
+		want        int64
+		wantErr     bool
+	}{
+		{name: "blank disables", input: "  ", want: 0},
+		{name: "bare numeric id", input: "1234", want: 1234},
+		{name: "browzine url", input: "https://browzine.com/libraries/1234", want: 1234},
+		{name: "libkey url with trailing path", input: "https://libkey.io/libraries/1234/10.1002/example", want: 1234},
+		{name: "url with query after id", input: "https://browzine.com/libraries/1234?utm_source=x", want: 1234},
+		{name: "zero id is out of range", input: "0", wantErr: true},
+		{name: "no id anywhere", input: "https://libkey.io/about", wantErr: true},
+		{name: "prose", input: "my library", wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := libKeyLibraryIDFromInput(test.input)
+			if test.wantErr {
+				if err == nil {
+					t.Fatalf("libKeyLibraryIDFromInput(%q) = %d, want an error", test.input, got)
+				}
+				return
+			}
+			if err != nil || got != test.want {
+				t.Fatalf("libKeyLibraryIDFromInput(%q) = (%d, %v), want %d", test.input, got, err, test.want)
+			}
+		})
+	}
+}
+
+func TestInitConfiguresAndClearsLibKeyLinkRouting(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	path := filepath.Join(home, ".config", "papio", "config.toml")
+	deps := initTestDependencies(t)
+
+	out, err := runInitForTest(t, path, deps,
+		"--non-interactive", "--email", "reader@example.test", "--skip-browser",
+		"--openurl-base", "https://resolver.example.edu/openurl",
+		"--libkey-library-id", "https://browzine.com/libraries/1234")
+	if err != nil {
+		t.Fatalf("init: %v\n%s", err, out)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Browser.LibKeyMode != "link" || cfg.Browser.LibKeyLibraryID != 1234 {
+		t.Fatalf("libkey config = %q/%d, want link/1234", cfg.Browser.LibKeyMode, cfg.Browser.LibKeyLibraryID)
+	}
+
+	// An explicit empty value clears BOTH fields — never a half-set pair,
+	// which strict config validation rejects on the next load.
+	if out, err := runInitForTest(t, path, deps,
+		"--non-interactive", "--skip-browser", "--libkey-library-id", ""); err != nil {
+		t.Fatalf("clearing rerun: %v\n%s", err, out)
+	}
+	cfg, err = config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Browser.LibKeyMode != "" || cfg.Browser.LibKeyLibraryID != 0 {
+		t.Fatalf("cleared libkey config = %q/%d, want empty/0", cfg.Browser.LibKeyMode, cfg.Browser.LibKeyLibraryID)
 	}
 }

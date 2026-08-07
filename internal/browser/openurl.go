@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 
+	"papio/internal/config"
 	"papio/internal/work"
 )
 
@@ -55,6 +56,50 @@ func OpenURL(base string, w work.Work) string {
 		sep = "&"
 	}
 	return base + sep + v.Encode()
+}
+
+// libKeyHost is the documented keyless LibKey.io linking origin. Third Iron
+// documents the institution-affiliated DOI/PMID route as programmatically
+// constructible: https://libkey.io/libraries/{library_id}/{doi-or-pmid}
+// (ADR-0016 Decision 2). The api mode against public-api.thirdiron.com is a
+// separate, unimplemented capability.
+const libKeyHost = "libkey.io"
+
+// LibKeyURL builds the keyless LibKey.io institution link for one work, or ""
+// when the profile has no usable link mode or the work carries neither a DOI
+// nor a PMID (LibKey resolves only those two identifiers; everything else
+// stays on the plain OpenURL route).
+func LibKeyURL(inst config.Institution, w work.Work) string {
+	if inst.LibKeyMode != "link" || inst.LibKeyLibraryID <= 0 {
+		return ""
+	}
+	id := ""
+	switch {
+	case w.DOI != "":
+		id = w.DOI
+	case w.PMID != "":
+		id = w.PMID
+	default:
+		return ""
+	}
+	u := url.URL{
+		Scheme: "https",
+		Host:   libKeyHost,
+		Path:   "/libraries/" + strconv.FormatInt(inst.LibKeyLibraryID, 10) + "/" + id,
+	}
+	return u.String()
+}
+
+// RouteURL picks the institutional browser route for one work: the profile's
+// LibKey link when configured and applicable, else the OpenURL resolver link.
+// LibKey augments institutional routing and never replaces it (ADR-0016
+// Decision 6): a profile without a usable LibKey route falls through to the
+// resolver, and eligibility gates elsewhere still key on the OpenURL base.
+func RouteURL(inst config.Institution, w work.Work) string {
+	if lk := LibKeyURL(inst, w); lk != "" {
+		return lk
+	}
+	return OpenURL(inst.OpenURLBase, w)
 }
 
 // verifiedProviderHosts are the registrable domains of providers with

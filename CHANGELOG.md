@@ -30,6 +30,27 @@ execution records in `notes/acquisition-stack-plan.md`.
   already in the v2 enum and the route is already a bare origin — so no
   consumer change is required.
 
+- **Institutional handoffs can route through LibKey's institution link
+  (ADR-0016, keyless `link` mode).** A resolver profile — the default
+  `[browser]` institution or any `[browser.resolvers.*]` entry — gains
+  `libkey_mode` and `libkey_library_id`; with `libkey_mode = "link"`, a
+  handoff for a work with a DOI or PMID opens the documented
+  `libkey.io/libraries/<id>/<doi-or-pmid>` institution link instead of the
+  bare OpenURL resolver, which routes through the library's LibKey
+  configuration (direct PDF, resolver, or request path) with no credential
+  involved. LibKey augments institutional routing, never replaces it: works
+  without either identifier, profiles without a library id, and every
+  failure fall through to the plain OpenURL route, and both the CLI's
+  `actions open` and the extension offer take the same route from the same
+  builder. The offer keeps the resolver host beside `libkey.io` on its host
+  list, so the extension stays sighted across the redirect. Config is
+  fail-closed per this repo's strict-mode rules: `libkey_mode = "api"` is
+  rejected as unimplemented, `link` without a positive `libkey_library_id`
+  is rejected, and a library id without `link` mode is rejected rather than
+  left silently dead. `papio init` collects the library id — a bare number
+  or a pasted BrowZine/LibKey.io URL — interactively after the resolver
+  step, or via `--libkey-library-id`; an explicit blank clears the pair.
+
 - **Semantic Scholar now contributes open-access acquisition candidates, not
   just search results.** The provider papio already queried for discovery joins
   the resolver waterfall between OpenAlex and CORE: an exact-identifier lookup

@@ -3647,6 +3647,60 @@ func TestOpenURLUsesSelectedResolverProfileForPrimoNDEAndVE(t *testing.T) {
 	}
 }
 
+func TestOfferRoutesThroughLibKeyAndKeepsResolverHostVisible(t *testing.T) {
+	b, _, cfg, _ := newBridge(t)
+	cfg.Browser.OpenURLBase = "https://resolver.example.edu/openurl"
+	cfg.Browser.LibKeyMode = "link"
+	cfg.Browser.LibKeyLibraryID = 1234
+	b = NewBridge(b.jobs, b.svc, b.triage, b.watchRunner, b.preview, b.captureStore, cfg, b.Version)
+
+	raw, err := b.offer(job.Row{ID: "job-libkey", Work: handoffWork(), Policy: job.Policy{}}, job.HumanAction{Kind: handoffActionKind, Detail: "institutional handoff", RequiresAuth: true}, config.ModeDelegated)
+	if err != nil {
+		t.Fatal(err)
+	}
+	message, err := protocol.DecodeBrowserMessage(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := message.Payload.(*protocol.JobOfferPayload)
+	if payload.OpenURL != "https://libkey.io/libraries/1234/10.1002/example.42" {
+		t.Fatalf("offer URL = %q, want the LibKey institution link", payload.OpenURL)
+	}
+	// The tab opens on libkey.io and forwards through the institution's
+	// resolver; both hosts must ride the offer or the extension goes blind
+	// exactly at the redirect.
+	if len(payload.ProviderHosts) < 2 || payload.ProviderHosts[0] != "libkey.io" || payload.ProviderHosts[1] != "resolver.example.edu" {
+		t.Fatalf("provider hosts = %v, want libkey.io then resolver.example.edu first", payload.ProviderHosts)
+	}
+}
+
+func TestOfferWithoutLibKeyIdentifierFallsBackToOpenURL(t *testing.T) {
+	b, _, cfg, _ := newBridge(t)
+	cfg.Browser.OpenURLBase = "https://resolver.example.edu/openurl"
+	cfg.Browser.LibKeyMode = "link"
+	cfg.Browser.LibKeyLibraryID = 1234
+	b = NewBridge(b.jobs, b.svc, b.triage, b.watchRunner, b.preview, b.captureStore, cfg, b.Version)
+
+	// An ISBN-only book has no LibKey route; the offer must land on the
+	// plain resolver, not dead-end (LibKey augments, never replaces).
+	bookWork := work.Work{ISBN: "9780306406157", Title: "A Book"}
+	raw, err := b.offer(job.Row{ID: "job-book", Work: bookWork, Policy: job.Policy{}}, job.HumanAction{Kind: handoffActionKind, Detail: "institutional handoff", RequiresAuth: true}, config.ModeDelegated)
+	if err != nil {
+		t.Fatal(err)
+	}
+	message, err := protocol.DecodeBrowserMessage(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := message.Payload.(*protocol.JobOfferPayload)
+	if !strings.HasPrefix(payload.OpenURL, "https://resolver.example.edu/openurl?") {
+		t.Fatalf("offer URL = %q, want the OpenURL fallback", payload.OpenURL)
+	}
+	if payload.ProviderHosts[0] != "resolver.example.edu" {
+		t.Fatalf("provider hosts = %v, want the resolver host first", payload.ProviderHosts)
+	}
+}
+
 func TestOfferLoginRoutingIsPerResolverProfile(t *testing.T) {
 	b, _, cfg, _ := newBridge(t)
 	cfg.Browser.ShibbolethEntityID = "https://idp.example.edu/entity"
