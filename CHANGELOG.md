@@ -13,6 +13,21 @@ execution records in `notes/acquisition-stack-plan.md`.
 
 ### Added
 
+- **OpenAIRE joins the open-access resolver waterfall.** The Graph API's
+  research-product lookup by DOI (else PMID) contributes up to three
+  candidates per work from the record's licensed or explicitly OPEN
+  instances — European institutional repositories being the marginal
+  coverage. OpenAIRE marks no URL as the file itself, so every candidate is
+  a landing observation and the existing landing-expansion step derives the
+  PDF when the page advertises one; a record that is not OPEN, an instance
+  without a license or OPEN access right, and an echoed identifier naming a
+  different work are all skipped. Keyless access is paced at OpenAIRE's
+  public 60 requests/hour (`rate_per_sec = 0.016`); a personal-token
+  `api_key` raises the ceiling. OpenAIRE Graph metadata is CC-BY and is
+  acknowledged in candidate provenance and the privacy table. Verified
+  live: a PLoS DOI returns its licensed publisher instances, query strings
+  redacted in evidence.
+
 - **The version hop follows Crossref's typed relations before any fuzzy
   search.** When a DOI's own candidates are exhausted, papio now asks
   Crossref for the registrant-asserted `has-preprint` / `is-preprint-of` /

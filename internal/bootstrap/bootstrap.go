@@ -37,6 +37,7 @@ import (
 	coreresolver "papio/internal/resolvers/core"
 	"papio/internal/resolvers/crossreftdm"
 	"papio/internal/resolvers/europepmc"
+	"papio/internal/resolvers/openaire"
 	"papio/internal/resolvers/openalex"
 	"papio/internal/resolvers/semanticscholar"
 	"papio/internal/resolvers/unpaywall"
@@ -385,6 +386,7 @@ func resolverEntries(cfg config.Config, client *fetch.SecureHTTPClient) []app.Re
 		{Adapter: semanticscholar.NewWithOptions(semanticscholar.Options{Client: client, APIKey: cfg.Sources[config.SourceSemanticScholar].APIKey, BaseURL: cfg.Sources[config.SourceSemanticScholar].BaseURLForDev}), Policy: cfg.SourcePolicy(config.SourceSemanticScholar)},
 		{Adapter: coreresolver.NewWithOptions(coreresolver.Options{Client: client, APIKey: cfg.Sources[config.SourceCORE].APIKey, BaseURL: cfg.Sources[config.SourceCORE].BaseURLForDev}), Policy: cfg.SourcePolicy(config.SourceCORE)},
 		{Adapter: crossreftdm.NewWithOptions(crossreftdm.Options{Client: client, APIKey: cfg.Sources[config.SourceCrossrefTDM].APIKey, BaseURL: cfg.Sources[config.SourceCrossrefTDM].BaseURLForDev}), Policy: cfg.SourcePolicy(config.SourceCrossrefTDM)},
+		{Adapter: openaire.NewWithOptions(openaire.Options{Client: client, APIKey: cfg.Sources[config.SourceOpenAIRE].APIKey, BaseURL: cfg.Sources[config.SourceOpenAIRE].BaseURLForDev}), Policy: cfg.SourcePolicy(config.SourceOpenAIRE)},
 	}
 }
 

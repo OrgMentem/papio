@@ -47,6 +47,7 @@ func TestNewWiresResolverOrderAndCoreServices(t *testing.T) {
 		config.SourceSemanticScholar,
 		config.SourceCORE,
 		config.SourceCrossrefTDM,
+		config.SourceOpenAIRE,
 	}
 	if !reflect.DeepEqual(names, want) {
 		t.Fatalf("resolver order = %v, want %v", names, want)

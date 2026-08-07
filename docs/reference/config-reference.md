@@ -206,11 +206,15 @@ is measured in days.
 ## `[sources.<name>]`
 
 `[sources]` is a map of resolver policies. The supported built-in names are
-`arxiv`, `europepmc`, `unpaywall`, `openalex`, `core`, `crossref_tdm`, and
-`semanticscholar`. For `semanticscholar`, `enabled` governs the acquisition
-resolver (open-access PDF lookup by exact DOI, arXiv id, or PMID); selection as
-a *search* backend is separate and lives in `[discovery]` (which reads this
-section's `api_key`). Each named section accepts these keys:
+`arxiv`, `europepmc`, `unpaywall`, `openalex`, `core`, `crossref_tdm`,
+`semanticscholar`, and `openaire`. For `semanticscholar`, `enabled` governs
+the acquisition resolver (open-access PDF lookup by exact DOI, arXiv id, or
+PMID); selection as a *search* backend is separate and lives in `[discovery]`
+(which reads this section's `api_key`). For `openaire`, candidates come from
+the OpenAIRE Graph (metadata licensed CC-BY, acknowledged here and in
+candidate provenance); the keyless public limit is 60 requests/hour — the
+default `rate_per_sec` honors it, and a personal-token `api_key` raises the
+ceiling. Each named section accepts these keys:
 
 | Key | Type | Default | Effect and constraints |
 | --- | --- | --- | --- |
@@ -229,6 +233,7 @@ section's `api_key`). Each named section accepts these keys:
 | `europepmc` | `true` | 2 | 2 |
 | `unpaywall` | `true` | 1 | 1 |
 | `openalex` | `false` | 2 | 2 |
+| `openaire` | `true` | 0.016 | 1 |
 | `core` | `false` | 0.4 | 1 |
 | `crossref_tdm` | `false` | 1 | 1 |
 | `semanticscholar` | `true` | 1 | 1 |

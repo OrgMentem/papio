@@ -128,6 +128,7 @@ var sourceReliability = map[string]int{
 	"semanticscholar": 5,
 	"core":            6,
 	"crossref_tdm":    7,
+	"openaire":        8,
 }
 
 // licenseRank prefers explicit licenses over unknown.
