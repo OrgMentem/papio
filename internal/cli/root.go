@@ -92,6 +92,7 @@ func newRoot(opt *options) *cobra.Command {
 		newExportCommand(opt),
 		newAdapterCommand(opt),
 		newStatusCommand(opt),
+		newBenchCommand(opt),
 		newStatsCommand(opt),
 		newActionsCommand(opt),
 		newBrowserCommand(opt),

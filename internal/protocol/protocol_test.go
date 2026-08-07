@@ -659,6 +659,7 @@ func TestTriageFixturePayloadRoundTrips(t *testing.T) {
 	cases := map[string]string{
 		"browser-triage-snapshot-request.json":     MsgTriageSnapshotRequest,
 		"browser-triage-snapshot-response.json":    MsgTriageSnapshotResponse,
+		"browser-triage-snapshot-response-v3.json": MsgTriageSnapshotResponse,
 		"browser-triage-counts-request.json":       MsgTriageCountsRequest,
 		"browser-triage-counts-request-v2.json":    MsgTriageCountsRequest,
 		"browser-triage-counts-response.json":      MsgTriageCountsResponse,
@@ -738,20 +739,35 @@ func TestPageBulkPayloadRoundTripAndValidation(t *testing.T) {
 		return data
 	}
 
+	hint := int64(12)
 	statusRequest := PageBulkStatusRequestPayload{
 		RequestID: "request-bulk-0001", ScanID: "scan-bulk-0001",
 		Identifiers: []PageBulkIdentifier{
 			{LocalID: "row-1", Kind: "doi", Value: "10.1000/example.42"},
 			{LocalID: "row-2", Kind: "pmid", Value: "12345678"},
 		},
+		RenderedRecordCountHint: &hint,
 	}
 	msg, err := DecodeBrowserMessage(frame(MsgPageBulkStatusRequest, statusRequest))
 	if err != nil {
 		t.Fatalf("decode page_bulk_status_request: %v", err)
 	}
 	got := msg.Payload.(*PageBulkStatusRequestPayload)
-	if got.RequestID != statusRequest.RequestID || got.ScanID != statusRequest.ScanID || len(got.Identifiers) != 2 {
+	if got.RequestID != statusRequest.RequestID || got.ScanID != statusRequest.ScanID || len(got.Identifiers) != 2 ||
+		got.RenderedRecordCountHint == nil || *got.RenderedRecordCountHint != hint {
 		t.Fatalf("round-trip status request = %#v, want %#v", got, statusRequest)
+	}
+
+	noHintRequest := PageBulkStatusRequestPayload{
+		RequestID: "request-bulk-0001", ScanID: "scan-bulk-0001",
+		Identifiers: []PageBulkIdentifier{{LocalID: "row-1", Kind: "doi", Value: "10.1000/example.42"}},
+	}
+	msg, err = DecodeBrowserMessage(frame(MsgPageBulkStatusRequest, noHintRequest))
+	if err != nil {
+		t.Fatalf("decode page_bulk_status_request without hint: %v", err)
+	}
+	if got := msg.Payload.(*PageBulkStatusRequestPayload); got.RenderedRecordCountHint != nil {
+		t.Fatalf("rendered_record_count_hint = %v, want nil when absent", *got.RenderedRecordCountHint)
 	}
 
 	statusResult := PageBulkStatusResultPayload{
@@ -833,6 +849,11 @@ func TestPageBulkPayloadRoundTripAndValidation(t *testing.T) {
 		{name: "malformed scan_id", payload: map[string]any{
 			"request_id": "request-bulk-0001", "scan_id": "short",
 			"identifiers": []map[string]any{{"local_id": "row-1", "kind": "doi", "value": "10.1000/a"}},
+		}},
+		{name: "negative rendered_record_count_hint", payload: map[string]any{
+			"request_id": "request-bulk-0001", "scan_id": "scan-bulk-0001",
+			"identifiers":                []map[string]any{{"local_id": "row-1", "kind": "doi", "value": "10.1000/a"}},
+			"rendered_record_count_hint": -1,
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1000,6 +1021,182 @@ func TestTriageSnapshotSchema1RejectsAccessFieldsButAllowsTheirAbsence(t *testin
 	}
 	if _, err := DecodeBrowserMessage(withAccessFields); err == nil || !strings.Contains(err.Error(), "schema 1") {
 		t.Fatalf("schema-1 snapshot with access fields err = %v, want rejection", err)
+	}
+}
+
+func TestTriageSnapshotV3RequiresAttentionAndRouteFields(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join(corpusDir(t, "valid"), "browser-triage-snapshot-response-v3.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	loadFrame := func() map[string]any {
+		var frame map[string]any
+		if err := json.Unmarshal(data, &frame); err != nil {
+			t.Fatal(err)
+		}
+		return frame
+	}
+
+	// Missing attention on any v3 item is rejected.
+	frame := loadFrame()
+	items := frame["payload"].(map[string]any)["items"].([]any)
+	delete(items[0].(map[string]any), "attention")
+	mutated, err := json.Marshal(frame)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := DecodeBrowserMessage(mutated); err == nil || !strings.Contains(err.Error(), "attention") {
+		t.Fatalf("v3 item missing attention err = %v, want rejection", err)
+	}
+
+	// Missing route_class on a v3 human_action item is rejected.
+	frame = loadFrame()
+	items = frame["payload"].(map[string]any)["items"].([]any)
+	delete(items[1].(map[string]any), "route_class")
+	mutated, err = json.Marshal(frame)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := DecodeBrowserMessage(mutated); err == nil || !strings.Contains(err.Error(), "route_class") {
+		t.Fatalf("v3 human_action missing route_class err = %v, want rejection", err)
+	}
+
+	// Missing auth_requirement on a v3 human_action item is rejected.
+	frame = loadFrame()
+	items = frame["payload"].(map[string]any)["items"].([]any)
+	delete(items[1].(map[string]any), "auth_requirement")
+	mutated, err = json.Marshal(frame)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := DecodeBrowserMessage(mutated); err == nil || !strings.Contains(err.Error(), "auth_requirement") {
+		t.Fatalf("v3 human_action missing auth_requirement err = %v, want rejection", err)
+	}
+
+	// The valid fixture itself decodes and the document_delivery item's
+	// delivery sub-object round-trips.
+	message, err := DecodeBrowserMessage(data)
+	if err != nil {
+		t.Fatalf("valid v3 fixture rejected: %v", err)
+	}
+	payload := message.Payload.(*TriageSnapshotResponsePayload)
+	var deliveryItem *TriageSnapshotItem
+	for i := range payload.Items {
+		if payload.Items[i].ActionKind == "document_delivery" {
+			deliveryItem = &payload.Items[i]
+		}
+	}
+	if deliveryItem == nil || deliveryItem.Delivery == nil || deliveryItem.Delivery.Provider != "illiad" ||
+		deliveryItem.Delivery.State != "unknown_outcome" || deliveryItem.AuthRequirement != "unknown" {
+		t.Fatalf("document_delivery item = %+v, want delivery+auth_requirement populated", deliveryItem)
+	}
+}
+
+func TestTriageSnapshotDeliveryGatedToDocumentDelivery(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join(corpusDir(t, "valid"), "browser-triage-snapshot-response-v3.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var frame map[string]any
+	if err := json.Unmarshal(data, &frame); err != nil {
+		t.Fatal(err)
+	}
+	items := frame["payload"].(map[string]any)["items"].([]any)
+	verifyIdentityItem := items[1].(map[string]any)
+	verifyIdentityItem["delivery"] = map[string]any{"provider": "illiad", "state": "pending"}
+	mutated, err := json.Marshal(frame)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := DecodeBrowserMessage(mutated); err == nil || !strings.Contains(err.Error(), "delivery") {
+		t.Fatalf("delivery on a non-document_delivery item err = %v, want rejection", err)
+	}
+}
+
+func TestTriageSnapshotSchema2RejectsV3BlockedByValues(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join(corpusDir(t, "valid"), "browser-triage-snapshot-response.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var frame map[string]any
+	if err := json.Unmarshal(data, &frame); err != nil {
+		t.Fatal(err)
+	}
+	payload := frame["payload"].(map[string]any)
+	items := payload["items"].([]any)
+	items[1].(map[string]any)["blocked_by"] = "login"
+	mutated, err := json.Marshal(frame)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := DecodeBrowserMessage(mutated); err == nil || !strings.Contains(err.Error(), "blocked_by") {
+		t.Fatalf("schema-2 frame with a v3-only blocked_by value err = %v, want rejection", err)
+	}
+}
+
+func TestDeliveryReconcilePayloadRoundTripsAndValidates(t *testing.T) {
+	frame := func(payload any) []byte {
+		t.Helper()
+		data, err := json.Marshal(map[string]any{
+			"protocol": BrowserProtocolVersion, "type": MsgDeliveryReconcileRequest,
+			"msg_id": "delivery-reconcile-0001", "seq": 1, "payload": payload,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return data
+	}
+	valid := DeliveryReconcilePayload{
+		RequestID: "request-delivery-0001", JobID: "job_delivery_0001",
+		Operation: "confirm_request_exists", ProviderReference: "TN-42",
+	}
+	msg, err := DecodeBrowserMessage(frame(valid))
+	if err != nil {
+		t.Fatalf("valid delivery_reconcile_request rejected: %v", err)
+	}
+	got := msg.Payload.(*DeliveryReconcilePayload)
+	if *got != valid {
+		t.Fatalf("round-trip = %#v, want %#v", got, valid)
+	}
+
+	absent := DeliveryReconcilePayload{
+		RequestID: "request-delivery-0002", JobID: "job_delivery_0001", Operation: "confirm_request_absent",
+	}
+	if _, err := DecodeBrowserMessage(frame(absent)); err != nil {
+		t.Fatalf("valid confirm_request_absent rejected: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name    string
+		payload map[string]any
+	}{
+		{name: "confirm_request_exists without provider_reference", payload: map[string]any{
+			"request_id": "request-delivery-0003", "job_id": "job_delivery_0001", "operation": "confirm_request_exists",
+		}},
+		{name: "confirm_request_absent with provider_reference", payload: map[string]any{
+			"request_id": "request-delivery-0004", "job_id": "job_delivery_0001", "operation": "confirm_request_absent", "provider_reference": "TN-42",
+		}},
+		{name: "unknown operation", payload: map[string]any{
+			"request_id": "request-delivery-0005", "job_id": "job_delivery_0001", "operation": "open_request_history",
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := DecodeBrowserMessage(frame(tc.payload)); err == nil {
+				t.Fatal("invalid delivery_reconcile_request was accepted")
+			}
+		})
+	}
+
+	result := DeliveryReconcileResultPayload{RequestID: "request-delivery-0001", Outcome: "applied"}
+	resultFrame, err := json.Marshal(map[string]any{
+		"protocol": BrowserProtocolVersion, "type": MsgDeliveryReconcileResult,
+		"msg_id": "delivery-reconcile-0002", "seq": 2, "payload": result,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := DecodeBrowserMessage(resultFrame); err != nil {
+		t.Fatalf("valid delivery_reconcile_result rejected: %v", err)
 	}
 }
 

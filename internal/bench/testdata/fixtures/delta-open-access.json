@@ -1,0 +1,9 @@
+{
+  "sources": {
+    "semanticscholar": {
+      "status": 200,
+      "body": "{\"externalIds\":{\"DOI\":\"10.9999/bench-delta-open-access\"},\"title\":\"Bench Delta Open Access\",\"year\":2024,\"authors\":[{\"name\":\"A. Author\"}],\"venue\":\"Bench Journal\",\"url\":\"https://s2.example.org/paper/bench-delta\",\"isOpenAccess\":true,\"openAccessPdf\":{\"url\":\"https://oa.example.org/bench-delta.pdf\",\"status\":\"GREEN\",\"license\":\"CC-BY\"}}"
+    }
+  },
+  "adopt": true
+}

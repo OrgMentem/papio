@@ -832,6 +832,8 @@ const (
 	MsgPageBulkStatusResult     = "page_bulk_status_result"
 	MsgPageBulkSubmitRequest    = "page_bulk_submit_request"
 	MsgPageBulkSubmitResult     = "page_bulk_submit_result"
+	MsgDeliveryReconcileRequest = "delivery_reconcile_request"
+	MsgDeliveryReconcileResult  = "delivery_reconcile_result"
 )
 
 // jobScoped lists the types that must carry a job_id.
@@ -1063,6 +1065,14 @@ type TriageSnapshotItem struct {
 	Links []TriageLink `json:"links"`
 	Ops   []string     `json:"ops"`
 
+	// Attention is triage-snapshot/3's closed presentation-priority signal:
+	// required on every schema-3 item, forbidden below schema 3. "working"
+	// means papio is proceeding on its own (nothing for the operator to do
+	// yet); "required" means the item needs a human decision; "advisory" is
+	// informational only (e.g. a retraction notice). It replaces any
+	// presentation inference from action_kind or requires_auth (r5).
+	Attention string `json:"attention,omitempty"`
+
 	Work        *TriageWork   `json:"work,omitempty"`
 	Abstract    string        `json:"abstract,omitempty"`
 	Watches     []TriageWatch `json:"watches,omitempty"`
@@ -1077,11 +1087,80 @@ type TriageSnapshotItem struct {
 	SizeBytes    int64  `json:"size_bytes,omitempty"`
 	RequiresAuth *bool  `json:"requires_auth,omitempty"`
 	BlockedBy    string `json:"blocked_by,omitempty"`
+	// RouteClass is triage-snapshot/3's closed routing classifier for a
+	// human_action item: required on schema 3, forbidden below. It
+	// formalizes the existing action-kind vocabulary (plus document_delivery)
+	// into a fixed enum decoupled from action_kind's open one, so a v3
+	// extension can safely branch on it even after a future daemon ships an
+	// action_kind it has never seen (ADR-0016 Decision 4).
+	RouteClass string `json:"route_class,omitempty"`
+	// AuthRequirement is ADR-0016 Decision 4's tri-state auth carrier, wired
+	// as a string enum ("true"/"false"/"unknown") rather than a bare bool so
+	// "unknown" is representable: required on schema 3 human_action items,
+	// forbidden below. The existing RequiresAuth boolean is UNCHANGED and
+	// stays exactly the narrow execution gate ADR-0016 pins it to; only
+	// AuthRequirement may drive presentation copy.
+	AuthRequirement string `json:"auth_requirement,omitempty"`
+	// Delivery is present only on a document_delivery human_action item
+	// (forbidden on every other action kind and below schema 3). "fulfilled"
+	// means the provider supplied the document — never that papio holds
+	// trusted bytes yet (ADR-0017).
+	Delivery *TriageDelivery `json:"delivery,omitempty"`
 
 	DOI       string `json:"doi,omitempty"`
 	Nature    string `json:"nature,omitempty"`
 	NoticedAt string `json:"noticed_at,omitempty"`
 	NoticeDOI string `json:"notice_doi,omitempty"`
+}
+
+// TriageDelivery is triage-snapshot/3's document_delivery sub-object: the
+// provider, the provider's own reference for the request (empty until one
+// is assigned), and its delivery state (internal/delivery's existing
+// vocabulary; ADR-0017). It never carries delivered bytes or a URL to them.
+type TriageDelivery struct {
+	Provider          string `json:"provider"`
+	ProviderReference string `json:"provider_reference,omitempty"`
+	State             string `json:"state"`
+}
+
+func (d TriageDelivery) validate() error {
+	if err := validateTriageText("human_action.delivery.provider", d.Provider, 100); err != nil || d.Provider == "" {
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("human_action.delivery.provider is required")
+	}
+	if err := validateTriageText("human_action.delivery.provider_reference", d.ProviderReference, 300); err != nil {
+		return err
+	}
+	return enumRequired("human_action.delivery.state", d.State,
+		"submitted", "pending", "fulfilled", "declined", "cancelled", "unknown_outcome")
+}
+
+// triageRouteClasses is triage-snapshot/3's closed route_class vocabulary —
+// see TriageSnapshotItem.RouteClass's doc comment for why it is closed
+// independently of action_kind.
+var triageRouteClasses = []string{
+	"openurl_handoff", "manual_download", "verify_identity", "openurl_available",
+	"human_auth_required", "terms_acceptance_required", "document_delivery",
+}
+
+// triageBlockedByV2 is schema 2's exact closed set, shipped and locked
+// (ADR-0017's correction of the stale "not yet shipped" claim): a schema-2
+// frame must never carry a value outside it. triageBlockedByV3 is schema
+// 3's strict superset — the new values only ever appear on schema 3, never
+// overloading or reinterpreting a v2 value's meaning.
+var triageBlockedByV2 = []string{"anti_bot", "paywall", "landing_page"}
+var triageBlockedByV3 = append(append([]string(nil), triageBlockedByV2...),
+	"login", "terms", "delivery_outcome", "identity_review", "unknown")
+
+func containsString(values []string, target string) bool {
+	for _, v := range values {
+		if v == target {
+			return true
+		}
+	}
+	return false
 }
 
 // TriageSnapshotResponsePayload is a correlated immutable snapshot.
@@ -1136,6 +1215,31 @@ type HumanActionResolvePayload struct {
 
 // HumanActionResolveResultPayload has the same contract as a triage decision.
 type HumanActionResolveResultPayload struct {
+	RequestID string `json:"request_id"`
+	Outcome   string `json:"outcome"`
+	Detail    string `json:"detail,omitempty"`
+}
+
+// DeliveryReconcilePayload asks the daemon to perform one of
+// triage-snapshot/3's document_delivery reconciliation mutations
+// (ADR-0017 Decision 4) against a job's open document_delivery human
+// action. It is deliberately a new message rather than a widened
+// human_action_resolve: that payload's verdict vocabulary is closed to
+// accept/reject/dismiss against a CAS candidate binding, and overloading
+// it with delivery semantics was rejected for the same reason on the IPC
+// side (internal/api/delivery.go's deliveryAction). open_request_history
+// is deliberately absent here — it never mutates anything, so the
+// extension renders it from the item's own delivery sub-object instead of
+// a round trip.
+type DeliveryReconcilePayload struct {
+	RequestID         string `json:"request_id"`
+	JobID             string `json:"job_id"`
+	Operation         string `json:"operation"`
+	ProviderReference string `json:"provider_reference,omitempty"`
+}
+
+// DeliveryReconcileResultPayload has the same contract as a triage decision.
+type DeliveryReconcileResultPayload struct {
 	RequestID string `json:"request_id"`
 	Outcome   string `json:"outcome"`
 	Detail    string `json:"detail,omitempty"`
@@ -1259,24 +1363,38 @@ type PageBulkIdentifier struct {
 
 // PageBulkStatusRequestPayload asks for the ownership/job status of up to
 // 200 identifiers detected on one scanned page, correlated by ScanID with
-// the extension's local scan snapshot.
+// the extension's local scan snapshot. RenderedRecordCountHint is an
+// optional, honest structural denominator: a content-script detector that
+// recognizes the page's result-list shape (definition-list rows, repeated
+// card containers, reference-list items) counts the visible records
+// without reading their contents; absent (nil) means no recognized shape,
+// never a guess (dev/post-build-followups.md item 3).
 type PageBulkStatusRequestPayload struct {
-	RequestID   string               `json:"request_id"`
-	ScanID      string               `json:"scan_id"`
-	Identifiers []PageBulkIdentifier `json:"identifiers"`
+	RequestID               string               `json:"request_id"`
+	ScanID                  string               `json:"scan_id"`
+	Identifiers             []PageBulkIdentifier `json:"identifiers"`
+	RenderedRecordCountHint *int64               `json:"rendered_record_count_hint,omitempty"`
 }
 
 // PageBulkStatusItem reports one identifier's resolved holdings/job status
 // from the daemon's existing ownership/job lookup (ADR-0019 Decision 5).
 // CanonicalKey is omitted when Status is "invalid" — an identifier that
 // never resolved has no canonical work identity to report. JobID is
-// populated only when Status is "queued".
+// populated only when Status is "queued". ZotioItemKey is populated only
+// when Status is "owned_missing_pdf" and the match came from a zotio
+// library lookup, naming the existing Zotero parent item so the extension
+// can offer a direct handoff. Status "ownership_unknown" means zotio is
+// configured but its answer could not be trusted this round (unavailable,
+// a stale mirror, or a sync failure) — deliberately distinct from
+// "ownership_incomplete" (no ownership source configured/queried) and
+// never collapsed into a plain not-owned/"eligible" claim (ADR-0008).
 type PageBulkStatusItem struct {
 	LocalID           string `json:"local_id"`
 	CanonicalKey      string `json:"canonical_key,omitempty"`
 	Status            string `json:"status"`
 	OwnershipComplete bool   `json:"ownership_complete"`
 	JobID             string `json:"job_id,omitempty"`
+	ZotioItemKey      string `json:"zotio_item_key,omitempty"`
 }
 
 // PageBulkStatusResultPayload is the correlated response to a status
@@ -1703,6 +1821,21 @@ func DecodeBrowserMessage(data []byte) (*BrowserMessage, error) {
 	case MsgHumanActionResolveResult:
 		p := &HumanActionResolveResultPayload{}
 		err = decodeTriagePayload(env.Payload, payloadFields, "human_action_resolve_result", []string{"request_id", "outcome"}, p)
+		if err == nil {
+			err = p.validate()
+		}
+		msg.Payload = p
+	case MsgDeliveryReconcileRequest:
+		p := &DeliveryReconcilePayload{}
+		err = decodeTriagePayload(env.Payload, payloadFields, "delivery_reconcile_request",
+			[]string{"request_id", "job_id", "operation"}, p)
+		if err == nil {
+			err = p.validate()
+		}
+		msg.Payload = p
+	case MsgDeliveryReconcileResult:
+		p := &DeliveryReconcileResultPayload{}
+		err = decodeTriagePayload(env.Payload, payloadFields, "delivery_reconcile_result", []string{"request_id", "outcome"}, p)
 		if err == nil {
 			err = p.validate()
 		}
@@ -2170,8 +2303,8 @@ func (p *TriageSnapshotRequestPayload) validate() error {
 	if err := validateCorrelationID("triage_snapshot_request.request_id", p.RequestID); err != nil {
 		return err
 	}
-	if len(p.SchemaVersions) != 1 || (p.SchemaVersions[0] != 1 && p.SchemaVersions[0] != 2) {
-		return fmt.Errorf("triage_snapshot_request.schema_versions must be [1] or [2]")
+	if len(p.SchemaVersions) != 1 || (p.SchemaVersions[0] != 1 && p.SchemaVersions[0] != 2 && p.SchemaVersions[0] != 3) {
+		return fmt.Errorf("triage_snapshot_request.schema_versions must be [1], [2], or [3]")
 	}
 	if p.Limit != 0 && (p.Limit < 1 || p.Limit > 100) {
 		return fmt.Errorf("triage_snapshot_request.limit must be between 1 and 100")
@@ -2212,20 +2345,25 @@ func (item *TriageSnapshotItem) UnmarshalJSON(data []byte) error {
 		Links []TriageLink `json:"links"`
 		Ops   []string     `json:"ops"`
 
+		Attention string `json:"attention"`
+
 		Work        *TriageWork   `json:"work"`
 		Abstract    string        `json:"abstract"`
 		Watches     []TriageWatch `json:"watches"`
 		FirstSeenAt string        `json:"first_seen_at"`
 
-		ActionID     int64  `json:"action_id"`
-		JobID        string `json:"job_id"`
-		ActionKind   string `json:"action_kind"`
-		JobState     string `json:"job_state"`
-		Revision     int64  `json:"revision"`
-		SHA256       string `json:"sha256"`
-		SizeBytes    int64  `json:"size_bytes"`
-		RequiresAuth *bool  `json:"requires_auth"`
-		BlockedBy    string `json:"blocked_by"`
+		ActionID        int64           `json:"action_id"`
+		JobID           string          `json:"job_id"`
+		ActionKind      string          `json:"action_kind"`
+		JobState        string          `json:"job_state"`
+		Revision        int64           `json:"revision"`
+		SHA256          string          `json:"sha256"`
+		SizeBytes       int64           `json:"size_bytes"`
+		RequiresAuth    *bool           `json:"requires_auth"`
+		BlockedBy       string          `json:"blocked_by"`
+		RouteClass      string          `json:"route_class"`
+		AuthRequirement string          `json:"auth_requirement"`
+		Delivery        *TriageDelivery `json:"delivery"`
 
 		DOI       string `json:"doi"`
 		Nature    string `json:"nature"`
@@ -2237,6 +2375,7 @@ func (item *TriageSnapshotItem) UnmarshalJSON(data []byte) error {
 	}
 	core := []string{"kind", "id", "rank", "title", "facts", "links", "ops"}
 	allowed := append([]string(nil), core...)
+	allowed = append(allowed, "attention")
 	switch wire.Kind {
 	case "watch_hit":
 		allowed = append(allowed, "work", "abstract", "watches", "first_seen_at")
@@ -2245,15 +2384,25 @@ func (item *TriageSnapshotItem) UnmarshalJSON(data []byte) error {
 		}
 	case "human_action":
 		allowed = append(allowed, "action_id", "job_id", "action_kind", "job_state", "revision", "sha256", "size_bytes",
-			"requires_auth", "blocked_by")
+			"requires_auth", "blocked_by", "route_class", "auth_requirement", "delivery")
 		if err := browserRequireFields(fields, append(core, "action_id", "job_id", "action_kind", "job_state", "revision", "sha256", "size_bytes")...); err != nil {
 			return err
 		}
-		if err := browserRejectNullFields(fields, "requires_auth", "blocked_by"); err != nil {
+		if err := browserRejectNullFields(fields, "requires_auth", "blocked_by", "route_class", "auth_requirement", "delivery"); err != nil {
 			return err
 		}
 		if _, ok := fields["blocked_by"]; ok {
-			if err := enumRequired("human_action.blocked_by", wire.BlockedBy, "anti_bot", "paywall", "landing_page"); err != nil {
+			if err := enumRequired("human_action.blocked_by", wire.BlockedBy, triageBlockedByV3...); err != nil {
+				return err
+			}
+		}
+		if _, ok := fields["route_class"]; ok {
+			if err := enumRequired("human_action.route_class", wire.RouteClass, triageRouteClasses...); err != nil {
+				return err
+			}
+		}
+		if _, ok := fields["auth_requirement"]; ok {
+			if err := enumRequired("human_action.auth_requirement", wire.AuthRequirement, "true", "false", "unknown"); err != nil {
 				return err
 			}
 		}
@@ -2276,10 +2425,12 @@ func (item *TriageSnapshotItem) UnmarshalJSON(data []byte) error {
 	}
 	*item = TriageSnapshotItem{
 		Kind: wire.Kind, ID: wire.ID, Rank: wire.Rank, Title: wire.Title, Facts: wire.Facts, Links: wire.Links, Ops: wire.Ops,
-		Work: wire.Work, Abstract: wire.Abstract, Watches: wire.Watches, FirstSeenAt: wire.FirstSeenAt,
+		Attention: wire.Attention,
+		Work:      wire.Work, Abstract: wire.Abstract, Watches: wire.Watches, FirstSeenAt: wire.FirstSeenAt,
 		ActionID: wire.ActionID, JobID: wire.JobID, ActionKind: wire.ActionKind, JobState: wire.JobState,
 		Revision: wire.Revision, SHA256: wire.SHA256, SizeBytes: wire.SizeBytes,
 		RequiresAuth: wire.RequiresAuth, BlockedBy: wire.BlockedBy,
+		RouteClass: wire.RouteClass, AuthRequirement: wire.AuthRequirement, Delivery: wire.Delivery,
 		DOI: wire.DOI, Nature: wire.Nature, NoticedAt: wire.NoticedAt, NoticeDOI: wire.NoticeDOI,
 	}
 	return item.validate()
@@ -2289,6 +2440,9 @@ func (item TriageSnapshotItem) MarshalJSON() ([]byte, error) {
 	core := map[string]any{
 		"kind": item.Kind, "id": item.ID, "rank": item.Rank, "title": item.Title,
 		"facts": item.Facts, "links": item.Links, "ops": item.Ops,
+	}
+	if item.Attention != "" {
+		core["attention"] = item.Attention
 	}
 	switch item.Kind {
 	case "watch_hit":
@@ -2303,6 +2457,15 @@ func (item TriageSnapshotItem) MarshalJSON() ([]byte, error) {
 		}
 		if item.BlockedBy != "" {
 			core["blocked_by"] = item.BlockedBy
+		}
+		if item.RouteClass != "" {
+			core["route_class"] = item.RouteClass
+		}
+		if item.AuthRequirement != "" {
+			core["auth_requirement"] = item.AuthRequirement
+		}
+		if item.Delivery != nil {
+			core["delivery"] = item.Delivery
 		}
 	case "retraction":
 		core["doi"], core["nature"], core["noticed_at"] = item.DOI, item.Nature, item.NoticedAt
@@ -2353,13 +2516,22 @@ func (item TriageSnapshotItem) validate() error {
 	}
 	seenOps := make(map[string]bool, len(item.Ops))
 	for _, op := range item.Ops {
-		if err := enumRequired("triage item op", op, "acquire", "dismiss", "accept", "reject", "open", "retry"); err != nil {
+		if err := enumRequired("triage item op", op, "acquire", "dismiss", "accept", "reject", "open", "retry",
+			"open_request_history", "confirm_request_exists", "confirm_request_absent"); err != nil {
 			return err
 		}
 		if seenOps[op] {
 			return fmt.Errorf("triage item ops cannot repeat %q", op)
 		}
 		seenOps[op] = true
+	}
+	if item.Attention != "" {
+		if err := enumRequired("triage item.attention", item.Attention, "working", "required", "advisory"); err != nil {
+			return err
+		}
+	}
+	if item.Kind != "human_action" && (item.RouteClass != "" || item.AuthRequirement != "" || item.Delivery != nil) {
+		return fmt.Errorf("triage item.route_class/auth_requirement/delivery are human_action only")
 	}
 	switch item.Kind {
 	case "watch_hit":
@@ -2423,7 +2595,25 @@ func (item TriageSnapshotItem) validate() error {
 			return fmt.Errorf("human_action.requires_auth and blocked_by must be present together")
 		}
 		if item.BlockedBy != "" {
-			if err := enumRequired("human_action.blocked_by", item.BlockedBy, "anti_bot", "paywall", "landing_page"); err != nil {
+			if err := enumRequired("human_action.blocked_by", item.BlockedBy, triageBlockedByV3...); err != nil {
+				return err
+			}
+		}
+		if item.RouteClass != "" {
+			if err := enumRequired("human_action.route_class", item.RouteClass, triageRouteClasses...); err != nil {
+				return err
+			}
+		}
+		if item.AuthRequirement != "" {
+			if err := enumRequired("human_action.auth_requirement", item.AuthRequirement, "true", "false", "unknown"); err != nil {
+				return err
+			}
+		}
+		if item.Delivery != nil {
+			if item.ActionKind != "document_delivery" {
+				return fmt.Errorf("human_action.delivery is only valid for document_delivery items")
+			}
+			if err := item.Delivery.validate(); err != nil {
 				return err
 			}
 		}
@@ -2451,8 +2641,8 @@ func (p *TriageSnapshotResponsePayload) validate() error {
 	if err := validateCorrelationID("triage_snapshot_response.request_id", p.RequestID); err != nil {
 		return err
 	}
-	if p.Schema != 1 && p.Schema != 2 {
-		return fmt.Errorf("triage_snapshot_response.schema must be 1 or 2")
+	if p.Schema != 1 && p.Schema != 2 && p.Schema != 3 {
+		return fmt.Errorf("triage_snapshot_response.schema must be 1, 2, or 3")
 	}
 	if err := validateTriageTime("triage_snapshot_response.generated_at", p.GeneratedAt); err != nil {
 		return err
@@ -2470,8 +2660,33 @@ func (p *TriageSnapshotResponsePayload) validate() error {
 		if err := item.validate(); err != nil {
 			return err
 		}
-		if p.Schema == 1 && (item.RequiresAuth != nil || item.BlockedBy != "") {
-			return fmt.Errorf("triage_snapshot_response.schema 1 cannot include access classification")
+		v3Fields := item.RouteClass != "" || item.AuthRequirement != "" || item.Delivery != nil
+		switch p.Schema {
+		case 1:
+			if item.RequiresAuth != nil || item.BlockedBy != "" {
+				return fmt.Errorf("triage_snapshot_response.schema 1 cannot include access classification")
+			}
+			if item.Attention != "" || v3Fields {
+				return fmt.Errorf("triage_snapshot_response.schema 1 cannot include triage-snapshot/3 fields")
+			}
+		case 2:
+			if item.Attention != "" || v3Fields {
+				return fmt.Errorf("triage_snapshot_response.schema 2 cannot include triage-snapshot/3 fields")
+			}
+			if item.BlockedBy != "" && !containsString(triageBlockedByV2, item.BlockedBy) {
+				return fmt.Errorf("triage_snapshot_response.schema 2 blocked_by must be a schema-2 value")
+			}
+		case 3:
+			if item.Attention == "" {
+				return fmt.Errorf("triage_snapshot_response.schema 3 requires attention on every item")
+			}
+			if item.Kind == "human_action" {
+				if item.RouteClass == "" || item.AuthRequirement == "" {
+					return fmt.Errorf("triage_snapshot_response.schema 3 human_action items require route_class and auth_requirement")
+				}
+			} else if v3Fields {
+				return fmt.Errorf("triage_snapshot_response.schema 3 route_class/auth_requirement/delivery are human_action only")
+			}
 		}
 	}
 	if p.UnsupportedItemsCount < 0 || p.UnsupportedItemsCount > MaxBrowserInteger {
@@ -2564,6 +2779,34 @@ func (p *HumanActionResolvePayload) validate() error {
 
 func (p *HumanActionResolveResultPayload) validate() error {
 	return (&TriageDecideResultPayload{RequestID: p.RequestID, Outcome: p.Outcome, Detail: p.Detail}).validate("human_action_resolve_result")
+}
+
+func (p *DeliveryReconcilePayload) validate() error {
+	if err := validateCorrelationID("delivery_reconcile_request.request_id", p.RequestID); err != nil {
+		return err
+	}
+	if !requestIDRE.MatchString(p.JobID) {
+		return fmt.Errorf("delivery_reconcile_request.job_id is invalid")
+	}
+	if err := enumRequired("delivery_reconcile_request.operation", p.Operation,
+		"confirm_request_exists", "confirm_request_absent"); err != nil {
+		return err
+	}
+	if p.Operation == "confirm_request_exists" {
+		if err := validateTriageText("delivery_reconcile_request.provider_reference", p.ProviderReference, 300); err != nil {
+			return err
+		}
+		if p.ProviderReference == "" {
+			return fmt.Errorf("delivery_reconcile_request.provider_reference is required for confirm_request_exists")
+		}
+	} else if p.ProviderReference != "" {
+		return fmt.Errorf("delivery_reconcile_request.provider_reference is only valid for confirm_request_exists")
+	}
+	return nil
+}
+
+func (p *DeliveryReconcileResultPayload) validate() error {
+	return (&TriageDecideResultPayload{RequestID: p.RequestID, Outcome: p.Outcome, Detail: p.Detail}).validate("delivery_reconcile_result")
 }
 
 func (p *ReviewPreviewRequestPayload) validate() error {
@@ -2723,6 +2966,9 @@ func (p *PageBulkStatusRequestPayload) validate() error {
 			return err
 		}
 	}
+	if p.RenderedRecordCountHint != nil && (*p.RenderedRecordCountHint < 0 || *p.RenderedRecordCountHint > MaxBrowserInteger) {
+		return fmt.Errorf("page_bulk_status_request.rendered_record_count_hint must be in range 0..%d", MaxBrowserInteger)
+	}
 	return nil
 }
 
@@ -2762,7 +3008,7 @@ func (p *PageBulkStatusResultPayload) validate() error {
 		}
 		if err := enumRequired("page_bulk_status_result.items.status", item.Status,
 			"eligible", "owned_with_pdf", "owned_missing_pdf", "queued",
-			"previously_unavailable", "ownership_incomplete", "invalid"); err != nil {
+			"previously_unavailable", "ownership_incomplete", "ownership_unknown", "invalid"); err != nil {
 			return err
 		}
 		// An identifier that never resolved has no canonical work identity to
@@ -2786,6 +3032,14 @@ func (p *PageBulkStatusResultPayload) validate() error {
 			}
 			if !requestIDRE.MatchString(item.JobID) {
 				return fmt.Errorf("page_bulk_status_result.items.job_id is invalid")
+			}
+		}
+		if item.ZotioItemKey != "" {
+			if item.Status != "owned_missing_pdf" {
+				return fmt.Errorf("page_bulk_status_result.items.zotio_item_key is only valid for owned_missing_pdf")
+			}
+			if !zoteroKeyRE.MatchString(item.ZotioItemKey) {
+				return fmt.Errorf("page_bulk_status_result.items.zotio_item_key is invalid")
 			}
 		}
 	}

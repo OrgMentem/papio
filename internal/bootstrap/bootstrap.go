@@ -267,11 +267,18 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 		UnavailableRecheck: time.Duration(cfg.Zotio.UnavailableRecheckDays) * 24 * time.Hour,
 	}
 	holdings := ownership.NewRegistry()
+	// browserZotio is the page-bulk status ownership seam (nil when zotio is
+	// not configured, mirroring the ADR-0008 exclusivity with holdings below):
+	// the bridge must never call an unconfigured zotio service and paint
+	// every item ownership_unknown when the generic holdings registry is the
+	// intended answer for this daemon.
+	var browserZotio *zotio.Service
 	if strings.TrimSpace(cfg.Zotio.Executable) != "" {
 		// zotio is optional: an empty executable disables the deep Zotero
 		// integration (auto-import, plan/apply, queue) while hooks remain the
 		// generic hand-off seam.
 		zotioService.CLI = zotio.New(cfg.Zotio)
+		browserZotio = zotioService
 		service.AutoImporter = newSerialAutoImporter(zotioService)
 	} else {
 		// Generic holdings sources answer ownership only when zotio is absent.
@@ -341,7 +348,7 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 		Config: cfg, Store: db, Jobs: jobs, Artifacts: artifacts, Captures: captureStore, Budgets: budgets,
 		App: service, Scheduler: scheduler, Watches: watches, WatchRunner: watchRunner,
 		Bundle:        bundleExporter,
-		Browser:       browser.NewBridge(jobs, service, triageService, watchRunner, previewServer, captureStore, holdings, cfg, version),
+		Browser:       browser.NewBridge(jobs, service, triageService, watchRunner, previewServer, captureStore, holdings, browserZotio, cfg, version),
 		Preview:       previewServer,
 		Discovery:     discoveryClient,
 		Zotio:         zotioService,

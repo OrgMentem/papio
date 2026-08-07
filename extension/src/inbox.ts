@@ -298,7 +298,14 @@ function handoffFailure(item: TriageSnapshotItem, value: unknown, tone: "error" 
 }
 
 function isMutation(operation: TriageOperation): boolean {
-  return operation === "acquire" || operation === "dismiss" || operation === "accept" || operation === "reject";
+  return (
+    operation === "acquire" ||
+    operation === "dismiss" ||
+    operation === "accept" ||
+    operation === "reject" ||
+    operation === "confirm_request_exists" ||
+    operation === "confirm_request_absent"
+  );
 }
 
 function operationLabel(operation: TriageOperation): string {
@@ -315,8 +322,15 @@ function operationLabel(operation: TriageOperation): string {
       return "Open";
     case "retry":
       return "Retry";
+    case "open_request_history":
+      return "History";
+    case "confirm_request_exists":
+      return "Confirm exists";
+    case "confirm_request_absent":
+      return "Confirm absent";
   }
 }
+
 
 function element<K extends keyof HTMLElementTagNameMap>(tag: K, text?: string): HTMLElementTagNameMap[K] {
   const created = document.createElement(tag);
@@ -883,6 +897,7 @@ const STATUS_META: Record<string, { glyph: string; label: string }> = {
   manual_download: { glyph: "↓", label: "Manual download needed" },
   openurl_handoff: { glyph: "↗", label: "Browser handoff ready" },
   verify_identity: { glyph: "?", label: "Identity verification needed" },
+  document_delivery: { glyph: "⇄", label: "Document delivery reconciliation" },
   watch_hit: { glyph: "✶", label: "New watch hit" },
   retraction: { glyph: "!", label: "Retraction notice" },
 };
@@ -935,6 +950,8 @@ function guidanceText(item: TriageSnapshotItem, blockedByChallenge: boolean): st
         : "Open the page";
     case "verify_identity":
       return "Review the PDF, then accept or reject";
+    case "document_delivery":
+      return "Confirm what the library has on file";
     default:
       return null;
   }
@@ -954,6 +971,8 @@ function mechanismText(item: TriageSnapshotItem, blockedByChallenge: boolean): s
       return "A fresh link is generated each time you open this action. papio continues automatically after the handoff.";
     case "verify_identity":
       return "papio files accepted PDFs into your library.";
+    case "document_delivery":
+      return "papio paused automatic polling until you confirm what the library has on file for this request.";
     default:
       return null;
   }
@@ -981,6 +1000,24 @@ function liveStatusChip(item: TriageSnapshotItem): HTMLElement | null {
   chip.setAttribute("role", "status");
   chip.dataset.jobId = jobID;
   return chip;
+}
+
+// Always-visible provider/reference/state for a document_delivery item —
+// the reconciliation ops act on exactly this record, so it stays on the
+// card rather than behind a disclosure.
+function renderDeliveryDetail(item: TriageSnapshotItem): HTMLElement | null {
+  if (item.delivery === undefined) return null;
+  const list = element("dl");
+  list.className = "item-delivery";
+  const rows: Array<[string, string]> = [["Provider", item.delivery.provider]];
+  if (item.delivery.provider_reference !== undefined && item.delivery.provider_reference !== "") {
+    rows.push(["Reference", item.delivery.provider_reference]);
+  }
+  rows.push(["Status", item.delivery.state.replaceAll("_", " ")]);
+  for (const [label, value] of rows) {
+    list.append(element("dt", label), element("dd", value));
+  }
+  return list;
 }
 
 // Supporting explanation and backend identifiers share one compact disclosure,
@@ -1046,6 +1083,7 @@ function renderItem(item: TriageSnapshotItem): HTMLElement {
   const card = element("article");
   card.className = "triage-item";
   card.dataset.triageItemId = item.id;
+  if (item.attention !== undefined) card.dataset.attention = item.attention;
   card.tabIndex = item.id === state.selectedID ? 0 : -1;
   const title = displayTitle(item);
   card.setAttribute("aria-label", title.text);
@@ -1077,6 +1115,8 @@ function renderItem(item: TriageSnapshotItem): HTMLElement {
   if (instruction !== null) body.append(instruction);
   const liveStatus = liveStatusChip(item);
   if (liveStatus !== null) body.append(liveStatus);
+  const delivery = renderDeliveryDetail(item);
+  if (delivery !== null) body.append(delivery);
 
   const leftovers = item.facts.filter((fact) => KNOWN_FACT_LABELS[fact.label] !== true);
   if (leftovers.length > 0) {
@@ -1526,6 +1566,27 @@ async function acquire(item: TriageSnapshotItem): Promise<void> {
   }
 }
 
+// requestDeliveryReconcile drives Decision 4's confirm_request_exists/absent
+// mutations. open_request_history is deliberately not here — it never
+// mutates anything and is handled by expanding the item's own disclosure
+// (activateOperation below).
+async function requestDeliveryReconcile(
+  item: TriageSnapshotItem,
+  operation: "confirm_request_exists" | "confirm_request_absent",
+  providerReference?: string,
+): Promise<void> {
+  if (item.job_id === undefined) return;
+  if (!beginMutation(item)) return;
+  try {
+    const request: Record<string, unknown> = { job_id: item.job_id, operation };
+    if (providerReference !== undefined) request["provider_reference"] = providerReference;
+    const response = await runtimeMessage("papio.delivery.reconcile", request);
+    await finishMutation(item, response);
+  } catch (error) {
+    failMutationOffline(item, error);
+  }
+}
+
 // Dismissal is a deferred, undoable batch: the row leaves the list at once and
 // the daemon call is held for UNDO_WINDOW_MS, so Undo is exact — nothing has
 // happened yet. That ordering is what makes a confirmation dialog unnecessary.
@@ -1895,6 +1956,30 @@ function activateOperation(item: TriageSnapshotItem, operation: TriageOperation)
     case "retry":
       operationMessage(item.id, "Retry is not available from this inbox version.", "error");
       render();
+      return;
+    case "open_request_history": {
+      const row = rowForItem(item.id);
+      const toggle = row?.querySelector<HTMLButtonElement>(".item-debug-toggle") ?? null;
+      if (toggle === null) {
+        operationMessage(item.id, "No request history is available for this item.", "info");
+        render();
+        return;
+      }
+      toggle.click();
+      announce("Showing the request's details.");
+      return;
+    }
+    case "confirm_request_exists": {
+      const providerReference = window.prompt(
+        "Provider reference for this request (e.g. the ILLiad transaction number):",
+        "",
+      )?.trim();
+      if (providerReference === undefined || providerReference === "") return;
+      void requestDeliveryReconcile(item, "confirm_request_exists", providerReference);
+      return;
+    }
+    case "confirm_request_absent":
+      void requestDeliveryReconcile(item, "confirm_request_absent");
       return;
   }
 }

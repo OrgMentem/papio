@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -24,6 +25,7 @@ import (
 	"papio/internal/artifact"
 	"papio/internal/captures"
 	"papio/internal/config"
+	"papio/internal/delivery"
 	"papio/internal/ipc"
 	"papio/internal/job"
 	"papio/internal/ownership"
@@ -36,6 +38,7 @@ import (
 	"papio/internal/triage"
 	"papio/internal/watch"
 	"papio/internal/work"
+	"papio/internal/zotio"
 )
 
 func newBridge(t *testing.T) (*Bridge, *job.Store, config.Config, string) {
@@ -44,6 +47,11 @@ func newBridge(t *testing.T) (*Bridge, *job.Store, config.Config, string) {
 }
 
 func newBridgeWithHoldings(t *testing.T, holdings holdingsProvider) (*Bridge, *job.Store, config.Config, string) {
+	t.Helper()
+	return newBridgeWithHoldingsAndZotio(t, holdings, nil)
+}
+
+func newBridgeWithHoldingsAndZotio(t *testing.T, holdings holdingsProvider, zotioService *zotio.Service) (*Bridge, *job.Store, config.Config, string) {
 	t.Helper()
 	ctx := context.Background()
 	data := t.TempDir()
@@ -85,7 +93,7 @@ func newBridgeWithHoldings(t *testing.T, holdings holdingsProvider) (*Bridge, *j
 			Identity:   pdf.IdentityDecision{Result: pdf.IdentityPass, Evidence: []string{"doi match"}},
 		}, nil
 	}
-	return NewBridge(jobs, svc, triageService, &watch.Runner{Store: watches}, previewServer, captureStore, holdings, cfg, "0.1.0-test"), jobs, cfg, data
+	return NewBridge(jobs, svc, triageService, &watch.Runner{Store: watches}, previewServer, captureStore, holdings, zotioService, cfg, "0.1.0-test"), jobs, cfg, data
 }
 
 func handoffWork() work.Work {
@@ -247,7 +255,7 @@ func pageCapturePayload(t *testing.T, html []byte) protocol.PageCapturePayload {
 func TestPageCaptureDisabledDoesNotStore(t *testing.T) {
 	b, _, cfg, data := newBridge(t)
 	cfg.Captures.Enabled = false
-	b = NewBridge(b.jobs, b.svc, b.triage, b.watchRunner, b.preview, b.captureStore, b.holdings, cfg, b.Version)
+	b = NewBridge(b.jobs, b.svc, b.triage, b.watchRunner, b.preview, b.captureStore, b.holdings, b.zotio, cfg, b.Version)
 	runSync(t, b, hello())
 	runSync(t, b, inFrame(t, protocol.MsgPageCapture, "", pageCapturePayload(t, []byte("<html>disabled</html>"))))
 
@@ -730,7 +738,7 @@ func TestHelloAckAnnouncesDaemonVersion(t *testing.T) {
 		t.Fatalf("daemon_version = %q, want 0.1.0-test", payload.DaemonVersion)
 	}
 	if !slices.Equal(payload.Features, []string{
-		pageAcquireFeature, triageSnapshotFeature, triageSnapshotSchema2Feature, triageMutationsFeature, reviewPreviewFeature, statsFeature, pageCaptureFeature, pageCaptureRequestFeature, activityFeedFeature, triageCountsSchema2Feature, sessionEvidenceFeature, deliveryContextFeature, pageCaptureTermsFeature, pageBulkAcquireFeature,
+		pageAcquireFeature, triageSnapshotFeature, triageSnapshotSchema2Feature, triageMutationsFeature, reviewPreviewFeature, statsFeature, pageCaptureFeature, pageCaptureRequestFeature, activityFeedFeature, triageCountsSchema2Feature, sessionEvidenceFeature, deliveryContextFeature, pageCaptureTermsFeature, pageBulkAcquireFeature, triageSnapshotSchema3Feature,
 	}) {
 		t.Fatalf("features = %v, want required bridge feature set", payload.Features)
 	}
@@ -821,6 +829,157 @@ func TestTriageSnapshotNegotiatesSchema2AccessClassification(t *testing.T) {
 		!*current.Items[0].RequiresAuth || current.Items[0].BlockedBy != "paywall" {
 		t.Fatalf("schema-2 access classification = %+v", current)
 	}
+}
+
+// parkDocumentDelivery parks a fresh job awaiting_human with an open
+// document_delivery reconciliation action and a matching live
+// delivery_requests row, mirroring what openDeliveryReconciliationAction
+// (internal/app/app.go) leaves behind for fulfilled/unknown_outcome/
+// declined/cancelled rows.
+func parkDocumentDelivery(t *testing.T, jobs *job.Store, svc *app.Service, reqID string, w work.Work, provider, state, providerRef string) string {
+	t.Helper()
+	ctx := context.Background()
+	id, err := jobs.CreateRequest(ctx, reqID, w, "", "", job.Policy{AccessMode: config.ModeDelegated, DesiredVersion: "any", FetchMaxBytes: 1 << 20}, nil, job.PrincipalUnknown)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, step := range [][2]string{
+		{job.StateQueued, job.StateResolving},
+		{job.StateResolving, job.StateFetching},
+		{job.StateFetching, job.StateAwaitingHuman},
+	} {
+		if err := jobs.Transition(ctx, id, step[0], step[1], map[string]any{"reason": "document_delivery_reconciliation"}); err != nil {
+			t.Fatalf("%s->%s: %v", step[0], step[1], err)
+		}
+	}
+	if _, err := jobs.OpenHumanAction(ctx, id, job.ActionKindDocumentDelivery, "document delivery reconciliation", job.Access(false, "")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.Delivery.Create(ctx, delivery.CreateRequest{
+		JobID: id, InstitutionProfile: "default", Provider: provider, RequestClass: "digital_journal_article",
+		WorkIdentity: w.DOI, State: delivery.State(state), ProviderReference: providerRef,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+// TestTriageSnapshotV3AttentionMapping pins dev/post-build-followups.md
+// item 7's settled attention mapping and the document_delivery rendering
+// it drives, and proves schema 2's emission stays byte-identical alongside
+// it (AGENTS.md: an optional field added to an existing message is only
+// backward compatible for a new parser reading an old frame).
+func TestTriageSnapshotV3AttentionMapping(t *testing.T) {
+	b, jobs, cfg, _ := newBridge(t)
+	ctx := context.Background()
+	b.svc.Delivery = delivery.New(jobs.S, &cfg, nil)
+
+	unknownAuthID := park(t, jobs, "wr_v3_unknown_auth", handoffWork())
+
+	knownAuthID, err := jobs.CreateRequest(ctx, "wr_v3_known_auth",
+		work.Work{DOI: "10.1002/example.43", Title: "Paywalled Paper", Authors: []string{"Turing, Alan"}, Year: 2023}, "", "",
+		job.Policy{AccessMode: config.ModeDelegated, DesiredVersion: "any", FetchMaxBytes: 1 << 20}, nil, job.PrincipalUnknown)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, step := range [][2]string{
+		{job.StateQueued, job.StateResolving}, {job.StateResolving, job.StateFetching}, {job.StateFetching, job.StateAwaitingHuman},
+	} {
+		if err := jobs.Transition(ctx, knownAuthID, step[0], step[1], map[string]any{"reason": "institutional_handoff"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := jobs.OpenHumanAction(ctx, knownAuthID, handoffActionKind, "sign in", job.Access(true, "paywall")); err != nil {
+		t.Fatal(err)
+	}
+
+	unresolvedID := parkDocumentDelivery(t, jobs, b.svc, "wr_v3_delivery_unkn",
+		work.Work{DOI: "10.1002/example.44", Title: "ILL Request", Year: 2022}, "illiad", "unknown_outcome", "TN-1")
+	fulfilledID := parkDocumentDelivery(t, jobs, b.svc, "wr_v3_delivery_full",
+		work.Work{DOI: "10.1002/example.45", Title: "Fulfilled ILL", Year: 2021}, "illiad", "fulfilled", "TN-2")
+
+	runSync(t, b, hello())
+
+	v3msgs, _ := runSync(t, b, inFrame(t, protocol.MsgTriageSnapshotRequest, "",
+		protocol.TriageSnapshotRequestPayload{RequestID: "request-v3-attention", SchemaVersions: []int64{3}, Limit: 50}))
+	response := firstOfType(v3msgs, protocol.MsgTriageSnapshotResponse)
+	if response == nil {
+		t.Fatalf("v3 snapshot response missing: %v", v3msgs)
+	}
+	payload := response.Payload.(*protocol.TriageSnapshotResponsePayload)
+	byJob := make(map[string]protocol.TriageSnapshotItem, len(payload.Items))
+	for _, item := range payload.Items {
+		byJob[item.JobID] = item
+	}
+	for _, tc := range []struct {
+		jobID, want string
+	}{
+		{unknownAuthID, "working"}, // unknown-auth openurl handoff proceeds on its own
+		{knownAuthID, "required"},  // known login/MFA boundary
+		{unresolvedID, "required"}, // delivery unknown_outcome
+		{fulfilledID, "working"},   // fulfilled delivery being autonomously retrieved
+	} {
+		item, ok := byJob[tc.jobID]
+		if !ok {
+			t.Fatalf("no v3 snapshot item for job %s", tc.jobID)
+		}
+		if item.Attention != tc.want {
+			t.Fatalf("job %s attention = %q, want %q (action_kind=%q auth_requirement=%q)",
+				tc.jobID, item.Attention, tc.want, item.ActionKind, item.AuthRequirement)
+		}
+	}
+	fulfilled := byJob[fulfilledID]
+	if fulfilled.Delivery == nil || fulfilled.Delivery.Provider != "illiad" ||
+		fulfilled.Delivery.State != "fulfilled" || fulfilled.Delivery.ProviderReference != "TN-2" {
+		t.Fatalf("fulfilled delivery item = %+v, want a populated delivery sub-object", fulfilled)
+	}
+	if !slices.Equal(fulfilled.Ops, []string{"open_request_history", "confirm_request_exists", "confirm_request_absent"}) {
+		t.Fatalf("document_delivery ops = %v, want the three reconciliation ops", fulfilled.Ops)
+	}
+	if fulfilled.RouteClass != "document_delivery" {
+		t.Fatalf("route_class = %q, want document_delivery", fulfilled.RouteClass)
+	}
+
+	// Schema 2 stays byte-identical: no triage-snapshot/3 field ever appears
+	// on its wire, even though the same daemon just emitted them for v3.
+	v2msgs, v2Raw := runSync(t, b, inFrame(t, protocol.MsgTriageSnapshotRequest, "",
+		protocol.TriageSnapshotRequestPayload{RequestID: "request-v2-unchanged", SchemaVersions: []int64{2}, Limit: 50}))
+	if firstOfType(v2msgs, protocol.MsgTriageSnapshotResponse) == nil {
+		t.Fatalf("v2 snapshot response missing: %v", v2msgs)
+	}
+	assertNoV3FieldsOnSchema2Snapshot(t, v2Raw)
+}
+
+func assertNoV3FieldsOnSchema2Snapshot(t *testing.T, frames []json.RawMessage) {
+	t.Helper()
+	forbidden := []string{"attention", "route_class", "auth_requirement", "delivery"}
+	for _, frame := range frames {
+		var envelope struct {
+			Type    string `json:"type"`
+			Payload struct {
+				Schema int                          `json:"schema"`
+				Items  []map[string]json.RawMessage `json:"items"`
+			} `json:"payload"`
+		}
+		if err := json.Unmarshal(frame, &envelope); err != nil {
+			t.Fatal(err)
+		}
+		if envelope.Type != protocol.MsgTriageSnapshotResponse {
+			continue
+		}
+		if envelope.Payload.Schema != 2 {
+			t.Fatalf("schema-2 request received schema %d, want 2", envelope.Payload.Schema)
+		}
+		for _, item := range envelope.Payload.Items {
+			for _, field := range forbidden {
+				if _, present := item[field]; present {
+					t.Fatalf("schema-2 snapshot item carried a triage-snapshot/3 field %q: %+v", field, item)
+				}
+			}
+		}
+		return
+	}
+	t.Fatal("no schema-2 snapshot response received")
 }
 
 func assertLockedSchema1Snapshot(t *testing.T, frames []json.RawMessage) {
@@ -1515,7 +1674,7 @@ func TestDaemonRestartReturnsHelloRequired(t *testing.T) {
 	runSync(t, active, hello())
 
 	// A new daemon has the same durable jobs but no in-memory hello-session.
-	restarted := NewBridge(jobs, active.svc, active.triage, active.watchRunner, active.preview, active.captureStore, active.holdings, cfg, active.Version)
+	restarted := NewBridge(jobs, active.svc, active.triage, active.watchRunner, active.preview, active.captureStore, active.holdings, active.zotio, cfg, active.Version)
 	msgs, _ := runSync(t, restarted)
 	if len(msgs) != 1 {
 		t.Fatalf("restart poll frames = %d, want 1", len(msgs))
@@ -1878,6 +2037,48 @@ func TestOABrowserHandoffOffersCandidateThenFallsBackToInstitution(t *testing.T)
 	}
 	if row.State != job.StateUnavailable {
 		t.Fatalf("state after institutional rejection = %s, want unavailable", row.State)
+	}
+}
+
+// TestDocumentDeliveryRetrievalHandoffOffersFormPDFURL proves the
+// 2026-08-07 ADR-0017 amendment's browser-side wiring: an openurl_handoff
+// action carrying app.DocumentDeliveryRetrievalHandoffDetail offers the
+// embedded form-75 "View PDF" URL — not the institution's ordinary
+// resolver route — with its host on the offer's provider host list.
+func TestDocumentDeliveryRetrievalHandoffOffersFormPDFURL(t *testing.T) {
+	const retrievalURL = "https://illiadweb.example.edu/illiad/illiad.dll?Action=10&Form=75&Value=482910"
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	id, err := jobs.CreateRequest(ctx, "wr_document_delivery_retrieval", handoffWork(), "", "",
+		job.Policy{AccessMode: config.ModeDelegated, DesiredVersion: "any", FetchMaxBytes: 1 << 20}, nil, job.PrincipalUnknown)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, step := range [][2]string{
+		{job.StateQueued, job.StateResolving},
+		{job.StateResolving, job.StateFetching},
+		{job.StateFetching, job.StateAwaitingHuman},
+	} {
+		if err := jobs.Transition(ctx, id, step[0], step[1], map[string]any{"reason": "document_delivery_retrieval"}); err != nil {
+			t.Fatalf("%s->%s: %v", step[0], step[1], err)
+		}
+	}
+	if _, err := jobs.OpenHumanAction(ctx, id, handoffActionKind,
+		app.DocumentDeliveryRetrievalHandoffDetail+"\n"+retrievalURL, job.Access(false, "")); err != nil {
+		t.Fatal(err)
+	}
+
+	msgs, _ := runSync(t, b, hello())
+	offer := firstOfType(msgs, protocol.MsgJobOffer)
+	if offer == nil {
+		t.Fatal("missing document-delivery retrieval offer")
+	}
+	payload := offer.Payload.(*protocol.JobOfferPayload)
+	if payload.OpenURL != retrievalURL {
+		t.Fatalf("offer URL = %q, want the form-75 retrieval URL %q", payload.OpenURL, retrievalURL)
+	}
+	if !slices.Contains(payload.ProviderHosts, "illiadweb.example.edu") {
+		t.Fatalf("offer hosts = %v, missing the patron-web host", payload.ProviderHosts)
 	}
 }
 
@@ -3625,7 +3826,7 @@ func TestOpenURLUsesSelectedResolverProfileForPrimoNDEAndVE(t *testing.T) {
 	cfg.Browser.Resolvers = map[string]config.Institution{
 		"institute": {OpenURLBase: "https://onesearch.library.example-institute.edu/discovery/openurl?vid=61INS_INST:INS"},
 	}
-	b = NewBridge(b.jobs, b.svc, b.triage, b.watchRunner, b.preview, b.captureStore, b.holdings, cfg, b.Version)
+	b = NewBridge(b.jobs, b.svc, b.triage, b.watchRunner, b.preview, b.captureStore, b.holdings, b.zotio, cfg, b.Version)
 	for _, test := range []struct {
 		name, resolver, wantPath, wantVID string
 	}{
@@ -3660,7 +3861,7 @@ func TestOfferRoutesThroughLibKeyAndKeepsResolverHostVisible(t *testing.T) {
 	cfg.Browser.OpenURLBase = "https://resolver.example.edu/openurl"
 	cfg.Browser.LibKeyMode = "link"
 	cfg.Browser.LibKeyLibraryID = 1234
-	b = NewBridge(b.jobs, b.svc, b.triage, b.watchRunner, b.preview, b.captureStore, b.holdings, cfg, b.Version)
+	b = NewBridge(b.jobs, b.svc, b.triage, b.watchRunner, b.preview, b.captureStore, b.holdings, b.zotio, cfg, b.Version)
 
 	raw, err := b.offer(job.Row{ID: "job-libkey", Work: handoffWork(), Policy: job.Policy{}}, job.HumanAction{Kind: handoffActionKind, Detail: "institutional handoff", RequiresAuth: true}, config.ModeDelegated)
 	if err != nil {
@@ -3687,7 +3888,7 @@ func TestOfferWithoutLibKeyIdentifierFallsBackToOpenURL(t *testing.T) {
 	cfg.Browser.OpenURLBase = "https://resolver.example.edu/openurl"
 	cfg.Browser.LibKeyMode = "link"
 	cfg.Browser.LibKeyLibraryID = 1234
-	b = NewBridge(b.jobs, b.svc, b.triage, b.watchRunner, b.preview, b.captureStore, b.holdings, cfg, b.Version)
+	b = NewBridge(b.jobs, b.svc, b.triage, b.watchRunner, b.preview, b.captureStore, b.holdings, b.zotio, cfg, b.Version)
 
 	// An ISBN-only book has no LibKey route; the offer must land on the
 	// plain resolver, not dead-end (LibKey augments, never replaces).
@@ -3723,7 +3924,7 @@ func TestOfferLoginRoutingIsPerResolverProfile(t *testing.T) {
 		// ...and one without an identity gets none (no default leakage).
 		"bare": {OpenURLBase: "https://library.example.edu/openurl"},
 	}
-	b = NewBridge(b.jobs, b.svc, b.triage, b.watchRunner, b.preview, b.captureStore, b.holdings, cfg, b.Version)
+	b = NewBridge(b.jobs, b.svc, b.triage, b.watchRunner, b.preview, b.captureStore, b.holdings, b.zotio, cfg, b.Version)
 
 	for _, test := range []struct {
 		name, resolver, wantEntityID, wantAccountID string
@@ -4620,6 +4821,152 @@ func TestPageBulkStatusOwnershipLookupFailureStaysIncomplete(t *testing.T) {
 	}
 }
 
+// fakeZotioCLI is a minimal zotio.CLI double for page-bulk merge tests: it
+// answers `--agent items find --<kind> <value>` exactly like the real CLI's
+// JSON output, and MissingPDF names which of those keys still lack a PDF.
+type fakeZotioCLI struct {
+	find      map[string]json.RawMessage
+	missing   []zotio.MissingPDFItem
+	syncErr   error
+	syncCalls int
+}
+
+func (f *fakeZotioCLI) Preflight(context.Context) (*zotio.PreflightResult, error) {
+	return &zotio.PreflightResult{Executable: "zotio", Version: "1.0.0"}, nil
+}
+func (f *fakeZotioCLI) MissingPDF(context.Context, string, int) ([]zotio.MissingPDFItem, error) {
+	return append([]zotio.MissingPDFItem(nil), f.missing...), nil
+}
+func (f *fakeZotioCLI) GetItem(context.Context, string) (*zotio.Item, error) {
+	return nil, fmt.Errorf("fakeZotioCLI: item not found")
+}
+func (f *fakeZotioCLI) Sync(context.Context) error {
+	f.syncCalls++
+	return f.syncErr
+}
+func (f *fakeZotioCLI) RunJSON(_ context.Context, args ...string) (json.RawMessage, error) {
+	if len(args) >= 5 && strings.Join(args[:3], " ") == "--agent items find" {
+		key := strings.TrimPrefix(args[3], "--") + ":" + args[4]
+		if raw := f.find[key]; raw != nil {
+			return raw, nil
+		}
+		return json.RawMessage("[]"), nil
+	}
+	return nil, fmt.Errorf("fakeZotioCLI: unexpected RunJSON %q", args)
+}
+
+// TestPageBulkStatusZotioOwnedWithPDFHasNoPapioJob pins the follow-up's
+// headline fix: a work that lives only in the user's Zotero library — papio
+// itself never acquired it, so canonicalJobStatus has nothing — must still
+// render owned_with_pdf, not ownership_incomplete.
+func TestPageBulkStatusZotioOwnedWithPDFHasNoPapioJob(t *testing.T) {
+	cli := &fakeZotioCLI{find: map[string]json.RawMessage{
+		"doi:10.1000/zotio-lib.1": json.RawMessage(`[{"key":"ZOT00001","data":{}}]`),
+	}}
+	b, _, _, _ := newBridgeWithHoldingsAndZotio(t, nil, &zotio.Service{CLI: cli})
+	runSync(t, b, hello())
+
+	frame := inFrame(t, protocol.MsgPageBulkStatusRequest, "", protocol.PageBulkStatusRequestPayload{
+		RequestID: "request-bulk-zowned01", ScanID: "scan-bulk-zowned0001",
+		Identifiers: []protocol.PageBulkIdentifier{{LocalID: "row-1", Kind: "doi", Value: "10.1000/zotio-lib.1"}},
+	})
+	msgs, _ := runSync(t, b, frame)
+	result := firstOfType(msgs, protocol.MsgPageBulkStatusResult)
+	if result == nil {
+		t.Fatalf("no page_bulk_status_result in %v", msgs)
+	}
+	item := result.Payload.(*protocol.PageBulkStatusResultPayload).Items[0]
+	if item.Status != "owned_with_pdf" || item.JobID != "" || !item.OwnershipComplete {
+		t.Fatalf("item = %+v, want owned_with_pdf from zotio with no papio job", item)
+	}
+}
+
+// TestPageBulkStatusZotioOwnedMissingPDFCarriesItemKey pins the
+// owned_missing_pdf branch: zotio found the Zotero parent item but it has no
+// PDF attached, so the status must name the item key for a direct handoff.
+func TestPageBulkStatusZotioOwnedMissingPDFCarriesItemKey(t *testing.T) {
+	cli := &fakeZotioCLI{
+		find: map[string]json.RawMessage{
+			"doi:10.1000/zotio-missing.1": json.RawMessage(`[{"key":"ZOT00002","data":{}}]`),
+		},
+		missing: []zotio.MissingPDFItem{{Key: "ZOT00002"}},
+	}
+	b, _, _, _ := newBridgeWithHoldingsAndZotio(t, nil, &zotio.Service{CLI: cli})
+	runSync(t, b, hello())
+
+	frame := inFrame(t, protocol.MsgPageBulkStatusRequest, "", protocol.PageBulkStatusRequestPayload{
+		RequestID: "request-bulk-zmiss001", ScanID: "scan-bulk-zmiss00001",
+		Identifiers: []protocol.PageBulkIdentifier{{LocalID: "row-1", Kind: "doi", Value: "10.1000/zotio-missing.1"}},
+	})
+	msgs, _ := runSync(t, b, frame)
+	result := firstOfType(msgs, protocol.MsgPageBulkStatusResult)
+	if result == nil {
+		t.Fatalf("no page_bulk_status_result in %v", msgs)
+	}
+	item := result.Payload.(*protocol.PageBulkStatusResultPayload).Items[0]
+	if item.Status != "owned_missing_pdf" || item.ZotioItemKey != "ZOT00002" || !item.OwnershipComplete {
+		t.Fatalf("item = %+v, want owned_missing_pdf carrying zotio_item_key ZOT00002", item)
+	}
+}
+
+// TestPageBulkStatusZotioStalenessYieldsOwnershipUnknown pins ADR-0008
+// invariant 2 for the zotio path specifically: a failed mirror sync must
+// never let a "no match" reading collapse into a false "eligible" claim.
+func TestPageBulkStatusZotioStalenessYieldsOwnershipUnknown(t *testing.T) {
+	cli := &fakeZotioCLI{syncErr: fmt.Errorf("zotio offline")}
+	b, _, _, _ := newBridgeWithHoldingsAndZotio(t, nil, &zotio.Service{CLI: cli})
+	runSync(t, b, hello())
+
+	frame := inFrame(t, protocol.MsgPageBulkStatusRequest, "", protocol.PageBulkStatusRequestPayload{
+		RequestID: "request-bulk-zstale01", ScanID: "scan-bulk-zstale0001",
+		Identifiers: []protocol.PageBulkIdentifier{{LocalID: "row-1", Kind: "doi", Value: "10.1000/never-checked.1"}},
+	})
+	msgs, _ := runSync(t, b, frame)
+	result := firstOfType(msgs, protocol.MsgPageBulkStatusResult)
+	if result == nil {
+		t.Fatalf("no page_bulk_status_result in %v", msgs)
+	}
+	item := result.Payload.(*protocol.PageBulkStatusResultPayload).Items[0]
+	if item.Status != "ownership_unknown" || item.OwnershipComplete {
+		t.Fatalf("item = %+v after a failed zotio sync, want ownership_unknown (never a plain unowned/eligible claim)", item)
+	}
+	if cli.syncCalls != 1 {
+		t.Fatalf("sync calls = %d, want 1", cli.syncCalls)
+	}
+}
+
+// TestPageBulkStatusNilZotioMatchesPriorBehavior pins the byte-identical
+// degrade: a Bridge built without a zotio service must classify exactly as
+// it did before ownership was wired in — driven here by the generic holdings
+// registry alone, with no zotio consulted at all.
+func TestPageBulkStatusNilZotioMatchesPriorBehavior(t *testing.T) {
+	holdings := ownership.NewRegistry(bulkHoldingsProvider{
+		artifacts: map[string]string{"doi:10.1000/nil-zotio-owned.1": ownership.ArtifactPresent},
+	})
+	b, _, _, _ := newBridgeWithHoldingsAndZotio(t, holdings, nil)
+	runSync(t, b, hello())
+
+	frame := inFrame(t, protocol.MsgPageBulkStatusRequest, "", protocol.PageBulkStatusRequestPayload{
+		RequestID: "request-bulk-nilz0001", ScanID: "scan-bulk-nilz00001",
+		Identifiers: []protocol.PageBulkIdentifier{
+			{LocalID: "row-1", Kind: "doi", Value: "10.1000/nil-zotio-owned.1"},
+			{LocalID: "row-2", Kind: "doi", Value: "10.1000/nil-zotio-eligible.1"},
+		},
+	})
+	msgs, _ := runSync(t, b, frame)
+	result := firstOfType(msgs, protocol.MsgPageBulkStatusResult)
+	if result == nil {
+		t.Fatalf("no page_bulk_status_result in %v", msgs)
+	}
+	items := result.Payload.(*protocol.PageBulkStatusResultPayload).Items
+	if owned := items[0]; owned.Status != "owned_with_pdf" || owned.ZotioItemKey != "" || !owned.OwnershipComplete {
+		t.Fatalf("items[0] = %+v, want owned_with_pdf from generic holdings, unaffected by the absent zotio service", owned)
+	}
+	if eligible := items[1]; eligible.Status != "eligible" || !eligible.OwnershipComplete {
+		t.Fatalf("items[1] = %+v, want eligible from a complete no-claim holdings lookup, unaffected by the absent zotio service", eligible)
+	}
+}
+
 // TestPageBulkSubmitCreatesJobsWithBrowserPageConsumer exercises Decision 5/7
 // end to end: a live key joins, a fresh key creates a browser-page job, a fresh
 // PDF-present holdings claim is skipped server-side as already_owned, and a key
@@ -4762,5 +5109,85 @@ func TestPageBulkSubmitEchoesUnknownScanID(t *testing.T) {
 	}
 	if payload.Submitted != 1 || payload.Invalid != 0 {
 		t.Fatalf("counts = %+v, want a clean submit despite the unknown scan_id", payload)
+	}
+}
+
+// TestPageBulkStatusRecordsScanRowWithRenderedHint pins the honest-denominator
+// follow-up (dev/post-build-followups.md item 3): a status call whose request
+// carries rendered_record_count_hint persists a page_bulk_runs row with that
+// hint, the request's detected_raw count, and the distinct canonical-key
+// count — all previously left at the schema's zero default because only
+// pageBulkSubmit ever wrote a row. batch_id stays empty: this is a scan row,
+// not a submit row (see recordPageBulkScan's doc comment).
+func TestPageBulkStatusRecordsScanRowWithRenderedHint(t *testing.T) {
+	holdings := ownership.NewRegistry(bulkHoldingsProvider{
+		artifacts: map[string]string{"doi:10.1000/hinted-owned.1": ownership.ArtifactPresent},
+	})
+	b, jobs, _, _ := newBridgeWithHoldings(t, holdings)
+	ctx := context.Background()
+	runSync(t, b, hello())
+
+	hint := int64(12)
+	frame := inFrame(t, protocol.MsgPageBulkStatusRequest, "", protocol.PageBulkStatusRequestPayload{
+		RequestID: "request-bulk-hint0001", ScanID: "scan-bulk-hint0001",
+		Identifiers: []protocol.PageBulkIdentifier{
+			{LocalID: "row-1", Kind: "doi", Value: "10.1000/hinted-owned.1"},
+			{LocalID: "row-2", Kind: "doi", Value: "10.1000/hinted-eligible.1"},
+		},
+		RenderedRecordCountHint: &hint,
+	})
+	msgs, _ := runSync(t, b, frame)
+	if firstOfType(msgs, protocol.MsgPageBulkStatusResult) == nil {
+		t.Fatalf("no page_bulk_status_result in %v", msgs)
+	}
+
+	var detectorID, sourceOrigin, batchID string
+	var detectedRaw, canonicalUnique int
+	var renderedHint sql.NullInt64
+	if err := jobs.S.DB().QueryRowContext(ctx,
+		`SELECT detector_id, source_origin, detected_raw, canonical_unique, batch_id, rendered_record_count_hint FROM page_bulk_runs`,
+	).Scan(&detectorID, &sourceOrigin, &detectedRaw, &canonicalUnique, &batchID, &renderedHint); err != nil {
+		t.Fatalf("page_bulk_runs scan row: %v", err)
+	}
+	if detectorID != "" || sourceOrigin != "" {
+		t.Fatalf("scan row detector/origin = %q/%q, want empty — page_bulk_status_request carries neither", detectorID, sourceOrigin)
+	}
+	if batchID != "" {
+		t.Fatalf("scan row batch_id = %q, want empty (a scan row, not a submit row)", batchID)
+	}
+	if detectedRaw != 2 || canonicalUnique != 2 {
+		t.Fatalf("detected_raw/canonical_unique = %d/%d, want 2/2", detectedRaw, canonicalUnique)
+	}
+	if !renderedHint.Valid || renderedHint.Int64 != 12 {
+		t.Fatalf("rendered_record_count_hint = %+v, want a valid 12", renderedHint)
+	}
+}
+
+// TestPageBulkStatusWithoutHintRecordsNullDenominator pins the "never a
+// guess" half of the same follow-up: an unrecognized page sends no hint, and
+// the recorded row must carry a NULL denominator, never a fabricated one
+// (e.g. 0, which would silently look like "zero rendered records").
+func TestPageBulkStatusWithoutHintRecordsNullDenominator(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	runSync(t, b, hello())
+
+	frame := inFrame(t, protocol.MsgPageBulkStatusRequest, "", protocol.PageBulkStatusRequestPayload{
+		RequestID: "request-bulk-nohint01", ScanID: "scan-bulk-nohint0001",
+		Identifiers: []protocol.PageBulkIdentifier{{LocalID: "row-1", Kind: "doi", Value: "10.1000/no-hint.1"}},
+	})
+	msgs, _ := runSync(t, b, frame)
+	if firstOfType(msgs, protocol.MsgPageBulkStatusResult) == nil {
+		t.Fatalf("no page_bulk_status_result in %v", msgs)
+	}
+
+	var renderedHint sql.NullInt64
+	if err := jobs.S.DB().QueryRowContext(ctx,
+		`SELECT rendered_record_count_hint FROM page_bulk_runs`,
+	).Scan(&renderedHint); err != nil {
+		t.Fatalf("page_bulk_runs scan row: %v", err)
+	}
+	if renderedHint.Valid {
+		t.Fatalf("rendered_record_count_hint = %v, want NULL when the request carried no hint", renderedHint.Int64)
 	}
 }

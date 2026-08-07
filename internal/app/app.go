@@ -1837,8 +1837,18 @@ func (s *Service) deliveryRoute(ctx context.Context, row *job.Row, from string) 
 	switch branch {
 	case delivery.BranchJoinPoll:
 		return DeliveryRouteResult{Configured: true, Branch: branch, Request: existing},
-			s.joinDeliveryPoll(ctx, row, from, existing)
-	case delivery.BranchAdoptFulfilled, delivery.BranchReconcile, delivery.BranchResubmissionPolicy:
+			s.joinDeliveryPoll(ctx, row, from, dd, existing)
+	case delivery.BranchAdoptFulfilled:
+		// 2026-08-07 amendment: routeFulfilledDelivery is the sole
+		// consumer of a row that landed StateFulfilled — whether Branch
+		// observes it here (a later re-evaluation) or a poller settles it
+		// directly and calls routeFulfilledDelivery itself. It falls back
+		// to the same reconciliation action as BranchReconcile/
+		// BranchResubmissionPolicy below whenever no automatic retrieval
+		// channel is configured.
+		return DeliveryRouteResult{Configured: true, Branch: branch, Request: existing},
+			s.routeFulfilledDelivery(ctx, row, from, existing)
+	case delivery.BranchReconcile, delivery.BranchResubmissionPolicy:
 		// v1: route every non-live-pending outcome to the document_delivery
 		// reconciliation action rather than building fetch/adopt/resubmission
 		// policy here — Decision 4: "the CLI (papio actions list/papio jobs
@@ -1861,9 +1871,10 @@ func (s *Service) deliveryRoute(ctx context.Context, row *job.Row, from string) 
 			SubmittedThisMonth:  submittedThisMonth,
 		})
 		if err := s.Delivery.AppendGateEvent(ctx, row.ID, delivery.GateEvaluated{
-			ProfileClass:  profile.Class,
-			ProfileDigest: profile.Digest(),
-			Decision:      decision,
+			ProfileClass:       profile.Class,
+			ProfileDigest:      profile.Digest(),
+			Decision:           decision,
+			FulfillmentChannel: profile.FulfillmentChannel,
 		}); err != nil {
 			return DeliveryRouteResult{Configured: true, Branch: branch, Decision: decision}, err
 		}
@@ -2056,14 +2067,40 @@ func (s *Service) parkDeliveryPrefill(ctx context.Context, row *job.Row, from st
 
 // joinDeliveryPoll is Decision 3B's `join_poll` branch: this job attaches to
 // an already-submitted/pending request rather than evaluating the gate
-// again, and parks on that same pending-delivery retry_wait reason. The
-// existing row's own job_id (whichever job first created it) is untouched —
-// this only records the join on THIS job's event stream and retry schedule.
-func (s *Service) joinDeliveryPoll(ctx context.Context, row *job.Row, from string, existing *delivery.Request) error {
+// again. It is also ADR-0017 Decision 4's poll executor's wake hook: a
+// retry_wait job re-entering StateResolving (Process's
+// StateQueued/StateRetryWait case) and exhausting candidates again is
+// exactly "wake" for a parked delivery request, so this is where the
+// actual provider status check happens — internal/delivery.Service.Poll
+// itself no-ops when existing's next_check_at is not yet due, so a wake
+// forced early (e.g. `papio jobs retry`) still just re-parks on the
+// existing schedule without hitting the provider. The existing row's own
+// job_id (whichever job first created it) is untouched — this only
+// records the join on THIS job's event stream and retry schedule.
+func (s *Service) joinDeliveryPoll(ctx context.Context, row *job.Row, from string, dd *config.DocumentDelivery, existing *delivery.Request) error {
+	result, err := s.Delivery.Poll(ctx, existing, delivery.PollDeps{
+		Client:            illiad.New(s.illiadHTTPClient(), dd.BaseURL, dd.APIKey),
+		PatronRef:         dd.PatronRef,
+		ReferenceField:    illiadIdempotencyReferenceField,
+		StatusPollMinutes: dd.StatusPollMinutes,
+	})
+	if err != nil {
+		return err
+	}
+	if result.Settled {
+		if result.State == delivery.StateFulfilled {
+			return s.routeFulfilledDelivery(ctx, row, from, existing)
+		}
+		return s.openDeliveryReconciliationAction(ctx, row, from, existing)
+	}
+	next := result.NextCheckAt
+	if next.IsZero() {
+		next = deliveryJoinPollAt(s.Now(), existing)
+	}
 	return s.Jobs.Transition(ctx, row.ID, from, job.StateRetryWait, map[string]any{
 		"reason":              string(job.RetryReasonDocumentDeliveryPending),
 		"delivery_request_id": existing.ID,
-	}, job.WithRetryAt(deliveryJoinPollAt(s.Now(), existing)))
+	}, job.WithRetryAt(next))
 }
 
 // deliveryJoinPollAt reuses an already-scheduled next_check_at when it is
@@ -2089,6 +2126,95 @@ func (s *Service) openDeliveryReconciliationAction(ctx context.Context, row *job
 		return err
 	}
 	return s.park(ctx, row.ID, from, job.StateAwaitingHuman, map[string]any{"reason": "document_delivery_reconciliation"})
+}
+
+// routeFulfilledDelivery is the 2026-08-07 ADR-0017 amendment's sole
+// consumer of a delivery_requests row that reached StateFulfilled — the
+// existing delivery.BranchAdoptFulfilled branch above, or a poller settling
+// a request directly, both call this with the same (row, from, existing)
+// shape openDeliveryReconciliationAction already used. Fulfilled means the
+// provider supplied the document, never that papio holds trusted bytes: the
+// file still has to be retrieved and pass the ordinary quarantine/
+// structural/identity pipeline before a job can go ready.
+//
+// With patron_web_base_url configured (kind=illiad only —
+// deliveryConfigured/CompileGateProfile's FulfillmentChannel gates that),
+// this builds the ILLiad "View PDF" form-75 URL and routes it through the
+// EXISTING openurl_handoff browser-handoff machinery — reusing its access-
+// mode dispatch rather than inventing a parallel one:
+//   - conservative never opens or submits (Decision 3B condition 1); no
+//     action is opened, only an advisory event is recorded, exactly like
+//     exhaustedCandidates's conservative branch records delivery.route_discovered
+//     instead of an actionable action.
+//   - assisted/delegated open the action; internal/browser's
+//     offerableAccessMode/offer() — not this function — decide whether the
+//     extension opens the tab passively or drives it immediately, exactly
+//     as they already do for the institutional OpenURL and OA-candidate
+//     handoffs.
+//
+// Whatever the browser drives to next is out of scope here: a direct PDF
+// download lands through the ordinary browser-managed adoption/quarantine
+// path (the same path any other openurl_handoff capture uses) with zero
+// new code. A custom, non-inline-PDF landing page is deliberately NOT
+// scanned for "PDF-looking" links — that heuristic is exactly what a
+// provider-aware ILLiad adapter would replace with a real parser, and
+// building a fixture-backed one is future work; today it is a human
+// action, same as the Firefox no-download-steering limitation already is
+// by design.
+//
+// Without patron_web_base_url, papio cannot construct a retrieval URL at
+// all: this falls back to the pre-existing reconciliation action rather
+// than dropping a fulfilled request on the floor.
+func (s *Service) routeFulfilledDelivery(ctx context.Context, row *job.Row, from string, existing *delivery.Request) error {
+	_, dd, ok := s.deliveryConfigured(row)
+	if !ok || dd.PatronWebBaseURL == "" {
+		return s.openDeliveryReconciliationAction(ctx, row, from, existing)
+	}
+	retrievalURL := delivery.FulfillmentRetrievalURL(dd.PatronWebBaseURL, existing.ProviderReference)
+	if retrievalURL == "" {
+		// No provider reference recorded (should not happen for a row that
+		// reached fulfilled through the ordinary submit/poll path, but a
+		// human-confirmed confirm_request_exists row could) — the same
+		// "cannot build a route" fallback as an absent base URL.
+		return s.openDeliveryReconciliationAction(ctx, row, from, existing)
+	}
+	eventDetail := map[string]any{
+		"route_class":         "document_delivery",
+		"provider_reference":  existing.ProviderReference,
+		"delivery_request_id": existing.ID,
+	}
+	if s.Config.EffectiveAccessMode(row.Policy.AccessMode) == config.ModeConservative {
+		return s.Jobs.RecordEvent(ctx, row.ID, "delivery.retrieval_discovered", eventDetail)
+	}
+	if err := s.Jobs.RecordEvent(ctx, row.ID, "delivery.retrieval_enqueued", eventDetail); err != nil {
+		return err
+	}
+	if _, err := s.Jobs.OpenHumanAction(ctx, row.ID, "openurl_handoff",
+		DocumentDeliveryRetrievalHandoffDetail+"\n"+retrievalURL, job.Access(false, "")); err != nil {
+		return err
+	}
+	return s.park(ctx, row.ID, from, job.StateAwaitingHuman, map[string]any{"reason": "document_delivery_retrieval"})
+}
+
+// DocumentDeliveryRetrievalHandoffDetail identifies an openurl_handoff
+// action that must retrieve a fulfilled document-delivery request's
+// patron-web page rather than following the institution's ordinary
+// resolver or a one-time OA candidate. The browser bridge reads this
+// exactly as it reads OABrowserHandoffDetail: a fixed marker line, then
+// the retrieval URL on the line that follows.
+const DocumentDeliveryRetrievalHandoffDetail = "document delivery: retrieve the fulfilled request from your institution's request-management portal"
+
+// DocumentDeliveryRetrievalHandoffURL returns the retrieval URL stored in a
+// document-delivery retrieval handoff detail. The strict two-line shape
+// mirrors OABrowserHandoffURL and avoids accepting an arbitrary human-action
+// message as a browser URL.
+func DocumentDeliveryRetrievalHandoffURL(detail string) (string, bool) {
+	const prefix = DocumentDeliveryRetrievalHandoffDetail + "\n"
+	url, ok := strings.CutPrefix(detail, prefix)
+	if !ok || url == "" || strings.ContainsAny(url, "\r\n") || !strings.HasPrefix(url, "https://") {
+		return "", false
+	}
+	return url, true
 }
 
 // DeliveryPrefillActionDetail describes the document-delivery/ILL request

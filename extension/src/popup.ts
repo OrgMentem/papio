@@ -706,22 +706,16 @@ export function deriveSessionCardState(state: PopupSessionState | undefined): Se
       action: "signin",
     };
   }
-  const lastVerdictAt = state.lastVerdictAt;
-  const stale =
-    typeof lastVerdictAt !== "number" ||
-    !Number.isFinite(lastVerdictAt) ||
-    Date.now() - lastVerdictAt > SESSION_STALE_MS;
-  if (stale) {
-    return {
-      label: "Checking session…",
-      detail,
-      action: "signin",
-    };
-  }
   const verdict = state.verdict ?? (state.authenticated ? "in" : "unknown");
-  // Only an "unknown" verdict is up for grabs here — a warm ("in") or cold
-  // ("out") verdict is still warm/cold even when the latest probe ATTEMPT
-  // learned nothing (e.g. the tab closed after the verdict was committed).
+  // An "unknown" verdict never had a decisive commit — commitOriginProbe()
+  // (keepalive.ts) advances lastProbeAt/lastProbeOutcome for an
+  // inconclusive attempt but deliberately leaves lastVerdictAt untouched,
+  // so "unknown" is ALWAYS stale by the freshness check below. Resolving
+  // it here, before that check, is what turns a completed but
+  // inconclusive probe (no_tab/no_markers/etc.) into its own honest
+  // terminal label instead of the eternal "Checking session…" that block
+  // used to produce for every origin that has never landed a decisive
+  // verdict — the steady state whenever no library tab is open.
   if (verdict === "unknown") {
     switch (state.lastProbeOutcome) {
       case "no_tab":
@@ -762,9 +756,22 @@ export function deriveSessionCardState(state: PopupSessionState | undefined): Se
         };
     }
   }
-  const completedVerdict =
-    typeof state.lastVerdictAt === "number" && Number.isFinite(state.lastVerdictAt);
-  if (verdict === "out" && !state.authenticated && completedVerdict) {
+  // Only "in"/"out" verdicts reach here, and only a decisive commit ever
+  // sets one, so lastVerdictAt is always a number below — an AGED verdict,
+  // never an unresolved probe, is what lands in this block.
+  const lastVerdictAt = state.lastVerdictAt;
+  const stale =
+    typeof lastVerdictAt !== "number" ||
+    !Number.isFinite(lastVerdictAt) ||
+    Date.now() - lastVerdictAt > SESSION_STALE_MS;
+  if (stale) {
+    return {
+      label: "Session state unknown — recheck",
+      detail,
+      action: "signin",
+    };
+  }
+  if (verdict === "out" && !state.authenticated) {
     return {
       label: "Signed out or expired",
       detail,

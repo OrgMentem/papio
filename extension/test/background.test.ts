@@ -3862,6 +3862,7 @@ test("papio.pageBulk.load happy dispatch forwards scan_id to the bridge and retu
     documentGeneration: 1,
     items: [],
     truncated: false,
+    renderedRecordCountHint: null,
   };
   let loadedScanID: string | undefined;
   h.bridge.getPageBulkSnapshot = async (scanID: string) => {

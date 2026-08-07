@@ -37,6 +37,7 @@ import {
   SESSION_STATE_MESSAGE,
 } from "../src/popup";
 import type { ActiveJob } from "../src/state";
+import { SESSION_STALE_MS } from "../src/keepalive";
 import { PROVIDERS, SCENARIOS } from "../src/capture";
 
 function popupDocument(): Document {
@@ -1074,6 +1075,66 @@ test("session card matrix propagates probe outcomes without hijacking a decided 
   expect(warmDespiteStaleOutcome.label).toContain("Session warm");
 });
 
+test("an origin that never landed a decisive verdict resolves to its honest probe outcome, not an eternal spinner", () => {
+  // Regression for the "Checking session…" that never resolves: commitOriginProbe()
+  // (keepalive.ts) only ever sets lastVerdictAt on a DECISIVE commit, so an origin
+  // whose every probe has been inconclusive (no_tab, no_markers, …) keeps
+  // lastVerdictAt === null forever — this is the everyday steady state whenever no
+  // library tab is open, not a rare edge case. The old staleness gate ran before the
+  // lastProbeOutcome switch and treated "no fresh verdict" as "still checking",
+  // permanently hiding every honest outcome label below behind "Checking session…"
+  // once `checking` flipped back to false.
+  const now = Date.now();
+  const base = {
+    enabled: true,
+    intervalMinutes: 4,
+    pausedForReauth: false,
+    checking: false,
+    likelyAuthenticated: false,
+    lastProbeAt: now,
+    resolverOrigin: "https://example.primo.exlibrisgroup.com",
+    lastAuthReturnedAt: null,
+    queuedAuthJobs: 0,
+    stalledAuthJobs: [],
+    releasedAuthJobs: 0,
+    authenticated: false,
+    verdict: "unknown" as const,
+    probeSource: "none" as const,
+    lastVerdictAt: null,
+  };
+
+  const neverProbed = deriveSessionCardState({ ...base });
+  expect(neverProbed.label).toBe("Session unknown — open your library page to verify");
+  expect(neverProbed.label).not.toBe("Checking session…");
+
+  const noTabForever = deriveSessionCardState({ ...base, lastProbeOutcome: "no_tab" });
+  expect(noTabForever.label).toBe("No library page open — open your library to verify");
+  expect(noTabForever.label).not.toBe("Checking session…");
+
+  const noMarkersForever = deriveSessionCardState({
+    ...base,
+    probeSource: "live_tab",
+    lastProbeOutcome: "no_markers",
+  });
+  expect(noMarkersForever.label).toBe("Signed-in state unclear on this page");
+  expect(noMarkersForever.label).not.toBe("Checking session…");
+
+  // A decisive verdict that has since aged past SESSION_STALE_MS is a different
+  // case — it WAS resolved, it just isn't fresh enough to trust display-wise — and
+  // must land on its own honest "needs a recheck" label rather than reusing the
+  // in-flight spinner copy, which claims a check is actively running when none is.
+  const agedWarm = deriveSessionCardState({
+    ...base,
+    authenticated: true,
+    verdict: "in",
+    probeSource: "live_tab",
+    lastProbeOutcome: "markers",
+    lastVerdictAt: now - (SESSION_STALE_MS + 1),
+  });
+  expect(agedWarm.label).toBe("Session state unknown — recheck");
+  expect(agedWarm.label).not.toBe("Checking session…");
+});
+
 test("session status lines omit degenerate probe detail and retain real evidence", () => {
   const now = Date.now();
   const defaultOrigin = "https://example.primo.exlibrisgroup.com";
@@ -1101,7 +1162,14 @@ test("session status lines omit degenerate probe detail and retain real evidence
     ...base,
     probeSource: "live_tab",
   });
-  expect(single.getElementById("institution-session-status")?.textContent).toBe("Checking session…");
+  // The label doesn't end in an ellipsis (unlike the in-flight "Checking
+  // session…" copy), so sessionRowText() does NOT swallow the detail —
+  // "via your library tab" is real evidence (a matching tab was actually
+  // inspected) and must survive alongside the honest outcome label, which
+  // is exactly what "retain real evidence" in this test's name means.
+  expect(single.getElementById("institution-session-status")?.textContent).toBe(
+    "Session unknown — open your library page to verify · via your library tab",
+  );
 
   const multiple = popupDocument();
   renderInstitutionSession(multiple, {

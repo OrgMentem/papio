@@ -130,6 +130,41 @@ func TestCompileGateProfileWithLiveAcceptanceReachesAutoCapable(t *testing.T) {
 	}
 }
 
+func TestCompileGateProfileFulfillmentChannel(t *testing.T) {
+	// Independent of submission auto-capability: fullHouseDocumentDelivery
+	// alone (no patron_web_base_url) is auto-capable for SUBMISSION once
+	// live-accepted, but must not compile an end-to-end retrieval channel.
+	t.Run("absent patron_web_base_url compiles no channel even when auto_capable for submission", func(t *testing.T) {
+		dd := fullHouseDocumentDelivery()
+		profile := CompileGateProfile(config.Institution{DocumentDelivery: dd}, "campus").WithLiveAcceptance(true)
+		if profile.Class != GateClassAutoCapable {
+			t.Fatalf("Class = %q, want auto_capable", profile.Class)
+		}
+		if profile.FulfillmentChannel != "" {
+			t.Fatalf("FulfillmentChannel = %q, want \"\" (auto-capable for submission is not end-to-end-auto)", profile.FulfillmentChannel)
+		}
+	})
+	t.Run("illiad with patron_web_base_url compiles patron_web", func(t *testing.T) {
+		dd := fullHouseDocumentDelivery()
+		dd.PatronWebBaseURL = "https://illiadweb.example.edu/illiad/illiad.dll"
+		profile := CompileGateProfile(config.Institution{DocumentDelivery: dd}, "campus")
+		if profile.FulfillmentChannel != FulfillmentChannelPatronWeb {
+			t.Fatalf("FulfillmentChannel = %q, want %q", profile.FulfillmentChannel, FulfillmentChannelPatronWeb)
+		}
+	})
+	t.Run("patron_web_base_url on a form-only kind compiles no channel", func(t *testing.T) {
+		// Config validation already rejects this combination fail-closed
+		// (internal/config), but CompileGateProfile must not assume every
+		// caller went through that validator (see the unknown-kind
+		// defensive check above).
+		dd := &config.DocumentDelivery{Kind: "openurl", PatronWebBaseURL: "https://illiadweb.example.edu/illiad/illiad.dll"}
+		profile := CompileGateProfile(config.Institution{DocumentDelivery: dd}, "campus")
+		if profile.FulfillmentChannel != "" {
+			t.Fatalf("FulfillmentChannel = %q, want \"\" (only kind=illiad compiles a channel)", profile.FulfillmentChannel)
+		}
+	})
+}
+
 func TestCompileGateProfileEachMissingFieldBlocks(t *testing.T) {
 	for _, test := range []struct {
 		name     string

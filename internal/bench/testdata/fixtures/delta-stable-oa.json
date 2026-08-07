@@ -1,0 +1,8 @@
+{
+  "sources": {
+    "unpaywall": {
+      "status": 200,
+      "body": "{\"doi\":\"10.9999/bench-stable-oa\",\"is_oa\":true,\"best_oa_location\":{\"url_for_pdf\":\"https://oa.example.org/bench-stable.pdf\",\"url_for_landing_page\":\"https://oa.example.org/bench-stable\",\"host_type\":\"repository\",\"version\":\"publishedVersion\",\"license\":\"cc-by\"}}"
+    }
+  }
+}

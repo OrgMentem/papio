@@ -144,6 +144,67 @@ test("triage schema 1 keeps the locked action shape while schema 2 carries acces
   expect(() => parseBrowserMessageBytes(invalid)).toThrow(ProtocolError);
 });
 
+test("triage schema 3 requires attention/route_class/auth_requirement and gates delivery to document_delivery", () => {
+  const text = readFileSync(join(corpusRoot, "valid", "browser-triage-snapshot-response-v3.json"), "utf8");
+  const parsed = parseBrowserMessageBytes(text);
+  expect(parsed.payload["schema"]).toBe(3);
+  const items = parsed.payload["items"] as Array<Record<string, unknown>>;
+  const delivery = items.find((item) => item["action_kind"] === "document_delivery");
+  expect(delivery?.["attention"]).toBe("required");
+  expect(delivery?.["route_class"]).toBe("document_delivery");
+  expect(delivery?.["auth_requirement"]).toBe("unknown");
+  expect(delivery?.["delivery"]).toEqual({ provider: "illiad", provider_reference: "TN-42", state: "unknown_outcome" });
+  expect(delivery?.["ops"]).toEqual(["open_request_history", "confirm_request_exists", "confirm_request_absent"]);
+
+  const missingAttention = JSON.parse(text);
+  delete missingAttention.payload.items[0].attention;
+  expect(() => parseBrowserMessage(missingAttention)).toThrow(ProtocolError);
+
+  const missingRouteClass = JSON.parse(text);
+  delete missingRouteClass.payload.items[1].route_class;
+  expect(() => parseBrowserMessage(missingRouteClass)).toThrow(ProtocolError);
+
+  const deliveryOnWrongKind = JSON.parse(text);
+  deliveryOnWrongKind.payload.items[1].delivery = { provider: "illiad", state: "pending" };
+  expect(() => parseBrowserMessage(deliveryOnWrongKind)).toThrow(ProtocolError);
+
+  // A schema-2 frame must never carry a schema-3-only blocked_by value —
+  // new values are v3-only, never overloading a v2 value's meaning.
+  const v2Text = readFileSync(join(corpusRoot, "valid", "browser-triage-snapshot-response.json"), "utf8");
+  const v2WithV3BlockedBy = v2Text.replace('"blocked_by":"paywall"', '"blocked_by":"login"');
+  expect(() => parseBrowserMessageBytes(v2WithV3BlockedBy)).toThrow(ProtocolError);
+});
+
+test("delivery_reconcile_request/result round-trip and validate operation-specific provider_reference rules", () => {
+  const base = {
+    protocol: "papio-browser/1",
+    type: "delivery_reconcile_request",
+    msg_id: "delivery-reconcile-request-0001",
+    seq: 1,
+    payload: { request_id: "request-delivery-0001", job_id: "job_delivery_0001", operation: "confirm_request_exists", provider_reference: "TN-42" },
+  };
+  expect(parseBrowserMessage(base).type).toBe("delivery_reconcile_request");
+
+  const missingReference = { ...base, payload: { ...base.payload, provider_reference: undefined } };
+  delete (missingReference.payload as Record<string, unknown>)["provider_reference"];
+  expect(() => parseBrowserMessage(missingReference)).toThrow(ProtocolError);
+
+  const absentWithReference = { ...base, payload: { ...base.payload, operation: "confirm_request_absent" } };
+  expect(() => parseBrowserMessage(absentWithReference)).toThrow(ProtocolError);
+
+  const absentWithoutReference = { ...base, payload: { request_id: base.payload.request_id, job_id: base.payload.job_id, operation: "confirm_request_absent" } };
+  expect(parseBrowserMessage(absentWithoutReference).type).toBe("delivery_reconcile_request");
+
+  const result = {
+    protocol: "papio-browser/1",
+    type: "delivery_reconcile_result",
+    msg_id: "delivery-reconcile-result-0001",
+    seq: 2,
+    payload: { request_id: "request-delivery-0001", outcome: "applied" },
+  };
+  expect(parseBrowserMessage(result).type).toBe("delivery_reconcile_result");
+});
+
 test("invalid browser corpus fails closed", () => {
   const fixtures = readdirSync(join(corpusRoot, "invalid")).filter((name) => name.startsWith("browser-"));
   expect(fixtures.length).toBeGreaterThanOrEqual(4);
@@ -426,6 +487,7 @@ test("page bulk status and submit messages round-trip through the shared corpus"
   );
   expect(statusRequest.type).toBe("page_bulk_status_request");
   expect((statusRequest.payload["identifiers"] as unknown[]).length).toBe(3);
+  expect(statusRequest.payload["rendered_record_count_hint"]).toBe(12);
 
   const statusResult = parseBrowserMessageBytes(
     readFileSync(join(corpusRoot, "valid", "browser-page-bulk-status-result.json"), "utf8"),
@@ -461,6 +523,7 @@ test("page bulk status and submit messages round-trip through the shared corpus"
   for (const name of [
     "browser-page-bulk-status-request-too-many-identifiers.json",
     "browser-page-bulk-status-request-bad-kind.json",
+    "browser-page-bulk-status-request-negative-hint.json",
     "browser-page-bulk-submit-request-too-many-keys.json",
     "browser-page-bulk-submit-request-origin-with-path.json",
     "browser-page-bulk-submit-request-origin-uppercase-host.json",

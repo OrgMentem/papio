@@ -66,7 +66,7 @@ func TestRunReadyProfilePassesWithoutLeakingSecrets(t *testing.T) {
 	}
 	var dbPass bool
 	for _, c := range report.Checks {
-		if c.Name == "database" && c.Status == Pass && strings.Contains(c.Detail, "schema version 22") {
+		if c.Name == "database" && c.Status == Pass && strings.Contains(c.Detail, "schema version 24") {
 			dbPass = true
 		}
 	}
@@ -1049,4 +1049,143 @@ func TestRunDocumentDeliveryResultLineForPermanentlyPrefillOnlyProvider(t *testi
 	if strings.Contains(block.Detail, "no recorded live acceptance") {
 		t.Fatalf("block = %+v, a permanently-prefill provider must not cite the live-acceptance wording", block)
 	}
+}
+
+// TestRunDocumentDeliveryFulfillmentLine pins the 2026-08-07 amendment's
+// doctor surface: submission auto-capability (RESULT) and end-to-end
+// fulfillment retrieval (the new FULFILLMENT line) are reported
+// independently — an operator can be AUTO-CAPABLE for submission while
+// still seeing fulfillment: none until patron_web_base_url is configured.
+func TestRunDocumentDeliveryFulfillmentLine(t *testing.T) {
+	ctx := context.Background()
+	find := func(report Report, name string) (Check, bool) {
+		for _, c := range report.Checks {
+			if c.Name == name {
+				return c, true
+			}
+		}
+		return Check{}, false
+	}
+	run := func(cfg config.Config, db *store.Store) Report {
+		tool := executable(t)
+		return Run(ctx, cfg, db, pdf.Capability{
+			PDFCPU: true, PDFInfo: tool, PDFToText: tool, PDFToPPM: tool, Tesseract: tool,
+		}, tool, nil)
+	}
+
+	t.Run("absent patron_web_base_url warns fulfillment none, even once auto-capable for submission", func(t *testing.T) {
+		data := t.TempDir()
+		db, err := store.Open(ctx, data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = db.Close() })
+		cfg := documentDeliveryTestConfig(data)
+		if err := delivery.New(db, &cfg, nil).RecordLiveAcceptance(ctx, "default", "illiad"); err != nil {
+			t.Fatalf("record live acceptance: %v", err)
+		}
+		report := run(cfg, db)
+		result, ok := find(report, "document_delivery:default:result")
+		if !ok || result.Status != Pass || !strings.Contains(result.Detail, "AUTO-CAPABLE") {
+			t.Fatalf("result = %+v, want pass AUTO-CAPABLE", result)
+		}
+		fulfillment, ok := find(report, "document_delivery:default:fulfillment")
+		if !ok || fulfillment.Status != Warn || !strings.Contains(fulfillment.Detail, "fulfillment: none") {
+			t.Fatalf("fulfillment = %+v, want warn \"fulfillment: none\" despite AUTO-CAPABLE submission", fulfillment)
+		}
+	})
+
+	t.Run("configured patron_web_base_url passes fulfillment patron_web", func(t *testing.T) {
+		data := t.TempDir()
+		db, err := store.Open(ctx, data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = db.Close() })
+		cfg := documentDeliveryTestConfig(data)
+		cfg.Browser.DocumentDelivery.PatronWebBaseURL = "https://illiadweb.example.edu/illiad/illiad.dll"
+		report := run(cfg, db)
+		fulfillment, ok := find(report, "document_delivery:default:fulfillment")
+		if !ok || fulfillment.Status != Pass || !strings.Contains(fulfillment.Detail, "fulfillment: patron_web") {
+			t.Fatalf("fulfillment = %+v, want pass \"fulfillment: patron_web\"", fulfillment)
+		}
+	})
+}
+
+// TestRunDocumentDeliveryPollHealth pins the poll-health surface
+// (ADR-0017 Decision 4): no live requests reports Skip; a live row with
+// 3+ consecutive failed status polls reports Warn "degraded", never a
+// claim that the request itself failed.
+func TestRunDocumentDeliveryPollHealth(t *testing.T) {
+	ctx := context.Background()
+	find := func(report Report, name string) (Check, bool) {
+		for _, c := range report.Checks {
+			if c.Name == name {
+				return c, true
+			}
+		}
+		return Check{}, false
+	}
+	run := func(cfg config.Config, db *store.Store) Report {
+		tool := executable(t)
+		return Run(ctx, cfg, db, pdf.Capability{
+			PDFCPU: true, PDFInfo: tool, PDFToText: tool, PDFToPPM: tool, Tesseract: tool,
+		}, tool, nil)
+	}
+
+	t.Run("no live requests skips", func(t *testing.T) {
+		data := t.TempDir()
+		db, err := store.Open(ctx, data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = db.Close() })
+		cfg := documentDeliveryTestConfig(data)
+		report := run(cfg, db)
+		health, ok := find(report, "document_delivery:default:poll_health")
+		if !ok || health.Status != Skip {
+			t.Fatalf("poll_health = %+v, want skip with no live requests", health)
+		}
+	})
+
+	t.Run("3+ consecutive poll failures warns degraded", func(t *testing.T) {
+		data := t.TempDir()
+		db, err := store.Open(ctx, data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = db.Close() })
+		cfg := documentDeliveryTestConfig(data)
+
+		svc := delivery.New(db, &cfg, nil)
+		if _, err := db.DB().ExecContext(ctx,
+			`INSERT INTO work_requests (id, created_at) VALUES (?, ?)`, "wr_poll1", store.Now()); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.DB().ExecContext(ctx,
+			`INSERT INTO jobs (id, work_request_id, state, policy_json, created_at, updated_at) VALUES (?, ?, 'queued', '{}', ?, ?)`,
+			"poll1", "wr_poll1", store.Now(), store.Now()); err != nil {
+			t.Fatal(err)
+		}
+		created, err := svc.Create(ctx, delivery.CreateRequest{
+			JobID: "poll1", InstitutionProfile: "default", Provider: "illiad",
+			RequestClass: "digital_journal_article", WorkIdentity: "doi:10.1/poll-health", GateProfileDigest: "d",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := svc.UpdateState(ctx, created.ID, delivery.StateSubmitted); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.DB().ExecContext(ctx,
+			`UPDATE delivery_requests SET consecutive_poll_failures = 3, last_poll_error_class = 'transient_transport' WHERE id = ?`, created.ID); err != nil {
+			t.Fatal(err)
+		}
+
+		report := run(cfg, db)
+		health, ok := find(report, "document_delivery:default:poll_health")
+		if !ok || health.Status != Warn || !strings.Contains(health.Detail, "3+ consecutive failed status polls") {
+			t.Fatalf("poll_health = %+v, want warn degraded", health)
+		}
+	})
 }

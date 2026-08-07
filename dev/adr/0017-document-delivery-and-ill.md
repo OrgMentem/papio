@@ -3,8 +3,13 @@
 Status: Proposed (2026-08-07). Drafted from the integration consult
 (dev/scratch/oracle/papio-integrations-r1.md, -r2.md); amended the same day
 from consult rounds r3/r4 and independent deployment research (ILLiad/OCLC/
-Rapido vendor documentation, AU s49 practice) before acceptance. Not yet
-implemented.
+Rapido vendor documentation, AU s49 practice) before acceptance. Further
+amended the same day (Decision 6, "Fulfillment retrieval") to specify how a
+`fulfilled` request's document actually reaches quarantine — Decision 4
+below stopped at "fulfilled enters the ordinary validation pipeline"
+without saying how a papio-held file gets there in the first place. Not yet
+implemented; Decision 6's live acceptance is explicitly out of scope (it
+needs a real ILLiad site) — everything else there ships with this ADR.
 
 Extends ADR-0009 (ratified IPC contract, additive method evolution) and
 ADR-0013 (operator experience taxonomy: Activity, Actions, status). Consumes
@@ -368,6 +373,85 @@ version reached the same way schema 2 was — an additional entry in
 unchanged — not an amendment to the schema already shipped. This ADR does not
 ratify that schema's shape; it only corrects the record so a future ADR does
 not start from the consult's stale assumption.
+
+## Decision 6: fulfillment retrieval — patron-web form-75, through the ordinary browser handoff (amended 2026-08-07)
+
+Decision 4 says a `fulfilled` request "enters the exact same quarantine,
+structural, and identity validation pipeline as every other candidate" but
+never says how the file gets there. This amendment closes that gap for v1's
+only source-controlled provider, ILLiad, and restates the boundary Decision
+1 already implies: **`fulfilled` means the provider supplied the document,
+never that papio holds trusted bytes.** A lodged request that ILLiad marks
+fulfilled is a promise papio has not yet redeemed; only a file that clears
+quarantine, structural validation, and identity confirmation lets the job go
+ready, exactly as Decision 4's "Marking the job `ready` on submission" was
+already rejected for the pending case.
+
+**`document_delivery.patron_web_base_url` is new, distinct configuration —
+never derived from `base_url`.** ILLiad institutions commonly run the Web
+Platform API (`base_url`, used for `CreateTransaction`/status lookups) and
+the patron-facing ILLiadWeb portal on different hosts or paths; guessing one
+from the other would be exactly the branding/hostname inference Decision 2
+already forbids for `kind` itself. Absent means absent: with no configured
+`patron_web_base_url`, papio cannot construct a retrieval route and falls
+back to Decision 4's reconciliation action (an operator-visible human
+action — `open_request_history` — rather than silently dropping a fulfilled
+request). Config is strict-mode (AGENTS.md); this field ships in the same
+deploy as the daemon build that understands it, like every other
+`document_delivery` field before it.
+
+**`fulfillment_channel = "patron_web"` is a new compiled capability,
+independent of Decision 3A's `Class`.** It compiles only when
+`kind = "illiad"` and `patron_web_base_url` is configured — never for
+`openurl`/`libkey`/`custom`, which have no ILLiad transaction to view in the
+first place. Critically, **submission auto-capability and fulfillment
+retrieval are orthogonal**: a profile can compile `auto_capable` (creates
+requests automatically) with no fulfillment channel, meaning every
+fulfilled request still lands on the manual reconciliation action — v1
+never claims end-to-end automation it cannot back. The distinction is
+surfaced in three places so an operator cannot miss it: the compiled
+`GateProfile.FulfillmentChannel` field, one `papio doctor` line per profile
+(`fulfillment: patron_web` vs `fulfillment: none`, alongside but never
+conflated with the `AUTO-CAPABLE`/`PREFILL ONLY` submission verdict), and
+the persisted `delivery.gate_evaluated` event, so `papio delivery get`/
+`jobs get_v3` can explain a fulfilled-but-unretrieved request without
+recomputing against a since-edited profile. `submit_policy =
+auto_if_unconditional` semantics are otherwise unchanged.
+
+**Retrieval is browser-side, through the existing openurl_handoff
+machinery — no parallel dispatch.** On a `fulfilled` row, papio builds
+`patron_web_base_url + "?Action=10&Form=75&Value=<provider transaction
+reference>"`: ILLiad's numeric Action/Form query convention has no
+self-describing endpoint, so `Action=10` ("view this transaction") and
+`Form=75` ("View PDF") are recorded as named constants
+(`internal/delivery.FulfillmentRetrievalURL`) rather than left as magic
+numbers. That URL is carried the same way a one-time OA candidate URL
+already is — as a durable marker + URL in an `openurl_handoff` human
+action's `Detail` — so `internal/browser`'s existing offer/access-mode
+dispatch drives it with zero new protocol fields and zero new access-mode
+logic: delegated drives the tab immediately, assisted opens it, and
+conservative (Decision 3B condition 1, exactly as it already applies to
+submission and prefill) never opens anything and only records a
+`delivery.retrieval_discovered` event. A downloaded file lands through the
+ordinary browser-managed adoption directory and quarantine → structural →
+identity pipeline used by every other browser-driven capture; Firefox's
+existing no-download-steering limitation is unchanged and remains
+human-assisted there by design.
+
+**A custom, non-inline-PDF landing page is not scanned for "PDF-looking"
+links.** ILLiad's `View PDF` form can render an inline PDF or a custom HTML
+page depending on institutional configuration and document format; papio
+does not heuristically hunt that page for a download link — that ends in a
+human action. A fixture-backed ILLiad response adapter that actually parses
+the page is future work, named here rather than built speculatively.
+
+**Live acceptance is out of scope for this amendment.** Decision 3A's "one
+supervised submit-and-reconcile" requirement governs submission
+auto-capability; it says nothing about retrieval, and v1 ships no automatic
+live-acceptance test for the patron-web route either — verifying it needs a
+real ILLiad deployment with a genuinely fulfilled request, which is not
+reproducible in CI. Every other part of this Decision (config, compile,
+routing, fixtures, tests against a fake browser handoff) ships now.
 
 ## Rejected alternatives
 

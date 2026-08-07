@@ -39,6 +39,8 @@
         "triage_decide_result",
         "human_action_resolve",
         "human_action_resolve_result",
+        "delivery_reconcile_request",
+        "delivery_reconcile_result",
         "review_preview_request",
         "review_preview_result",
         "stats_request",
@@ -150,7 +152,7 @@
         "ops": {
           "type": "array",
           "uniqueItems": true,
-          "items": { "enum": ["acquire", "dismiss", "accept", "reject", "open", "retry"] }
+          "items": { "enum": ["acquire", "dismiss", "accept", "reject", "open", "retry", "open_request_history", "confirm_request_exists", "confirm_request_absent"] }
         }
       }
     },
@@ -168,7 +170,7 @@
             "title": { "type": "string", "maxLength": 500, "pattern": "^[^\\u0000]*$" },
             "facts": { "type": "array", "maxItems": 8, "items": { "$ref": "#/$defs/fact" } },
             "links": { "type": "array", "maxItems": 16, "items": { "$ref": "#/$defs/link" } },
-            "ops": { "type": "array", "uniqueItems": true, "items": { "enum": ["acquire", "dismiss", "accept", "reject", "open", "retry"] } },
+            "ops": { "type": "array", "uniqueItems": true, "items": { "enum": ["acquire", "dismiss", "accept", "reject", "open", "retry", "open_request_history", "confirm_request_exists", "confirm_request_absent"] } },
             "work": {
               "type": "object",
               "additionalProperties": false,
@@ -215,7 +217,7 @@
             "title": { "type": "string", "maxLength": 500, "pattern": "^[^\\u0000]*$" },
             "facts": { "type": "array", "maxItems": 8, "items": { "$ref": "#/$defs/fact" } },
             "links": { "type": "array", "maxItems": 16, "items": { "$ref": "#/$defs/link" } },
-            "ops": { "type": "array", "uniqueItems": true, "items": { "enum": ["acquire", "dismiss", "accept", "reject", "open", "retry"] } },
+            "ops": { "type": "array", "uniqueItems": true, "items": { "enum": ["acquire", "dismiss", "accept", "reject", "open", "retry", "open_request_history", "confirm_request_exists", "confirm_request_absent"] } },
             "action_id": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
             "job_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,128}$" },
             "action_kind": { "type": "string", "minLength": 1, "maxLength": 100, "pattern": "^[^\\u0000]+$" },
@@ -243,7 +245,7 @@
             "title": { "type": "string", "maxLength": 500, "pattern": "^[^\\u0000]*$" },
             "facts": { "type": "array", "maxItems": 8, "items": { "$ref": "#/$defs/fact" } },
             "links": { "type": "array", "maxItems": 16, "items": { "$ref": "#/$defs/link" } },
-            "ops": { "type": "array", "uniqueItems": true, "items": { "enum": ["acquire", "dismiss", "accept", "reject", "open", "retry"] } },
+            "ops": { "type": "array", "uniqueItems": true, "items": { "enum": ["acquire", "dismiss", "accept", "reject", "open", "retry", "open_request_history", "confirm_request_exists", "confirm_request_absent"] } },
             "doi": { "type": "string", "minLength": 1, "maxLength": 300, "pattern": "^[^\\u0000]+$" },
             "nature": { "enum": ["retraction", "correction", "concern"] },
             "noticed_at": { "type": "string", "format": "date-time" },
@@ -266,7 +268,7 @@
             "title": { "type": "string", "maxLength": 500, "pattern": "^[^\\u0000]*$" },
             "facts": { "type": "array", "maxItems": 8, "items": { "$ref": "#/$defs/fact" } },
             "links": { "type": "array", "maxItems": 16, "items": { "$ref": "#/$defs/link" } },
-            "ops": { "type": "array", "uniqueItems": true, "items": { "enum": ["acquire", "dismiss", "accept", "reject", "open", "retry"] } },
+            "ops": { "type": "array", "uniqueItems": true, "items": { "enum": ["acquire", "dismiss", "accept", "reject", "open", "retry", "open_request_history", "confirm_request_exists", "confirm_request_absent"] } },
             "action_id": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
             "job_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,128}$" },
             "action_kind": { "type": "string", "minLength": 1, "maxLength": 100, "pattern": "^[^\\u0000]+$" },
@@ -276,6 +278,147 @@
             "size_bytes": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
           }
         }
+      ]
+    },
+    "attention_enum": { "enum": ["working", "required", "advisory"] },
+    "route_class_enum": {
+      "enum": [
+        "openurl_handoff",
+        "manual_download",
+        "verify_identity",
+        "openurl_available",
+        "human_auth_required",
+        "terms_acceptance_required",
+        "document_delivery"
+      ]
+    },
+    "auth_requirement_enum": { "enum": ["true", "false", "unknown"] },
+    "delivery_v3": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider", "state"],
+      "properties": {
+        "provider": { "type": "string", "minLength": 1, "maxLength": 100, "pattern": "^[^\\u0000]+$" },
+        "provider_reference": { "type": "string", "maxLength": 300, "pattern": "^[^\\u0000]*$" },
+        "state": { "enum": ["submitted", "pending", "fulfilled", "declined", "cancelled", "unknown_outcome"] }
+      }
+    },
+    "watch_hit_item_v3": {
+      "allOf": [
+        { "$ref": "#/$defs/item_core" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "id", "rank", "title", "facts", "links", "ops", "attention", "work", "abstract", "watches", "first_seen_at"],
+          "properties": {
+            "kind": { "const": "watch_hit" },
+            "id": { "type": "string", "minLength": 1, "maxLength": 1024, "pattern": "^[^\\u0000]+$" },
+            "rank": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+            "title": { "type": "string", "maxLength": 500, "pattern": "^[^\\u0000]*$" },
+            "facts": { "type": "array", "maxItems": 8, "items": { "$ref": "#/$defs/fact" } },
+            "links": { "type": "array", "maxItems": 16, "items": { "$ref": "#/$defs/link" } },
+            "ops": { "type": "array", "uniqueItems": true, "items": { "enum": ["acquire", "dismiss", "accept", "reject", "open", "retry", "open_request_history", "confirm_request_exists", "confirm_request_absent"] } },
+            "attention": { "$ref": "#/$defs/attention_enum" },
+            "work": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["doi", "title", "authors", "year", "is_oa"],
+              "properties": {
+                "doi": { "type": "string", "maxLength": 300, "pattern": "^[^\\u0000]*$" },
+                "title": { "type": "string", "maxLength": 500, "pattern": "^[^\\u0000]*$" },
+                "authors": { "type": "string", "maxLength": 200, "pattern": "^[^\\u0000]*$" },
+                "year": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+                "is_oa": { "type": "boolean" }
+              }
+            },
+            "abstract": { "type": "string", "maxLength": 2000, "pattern": "^[^\\u0000]*$" },
+            "watches": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 100,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["id", "label"],
+                "properties": {
+                  "id": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+                  "label": { "type": "string", "maxLength": 500, "pattern": "^[^\\u0000]*$" }
+                }
+              }
+            },
+            "first_seen_at": { "type": "string", "format": "date-time" }
+          }
+        }
+      ]
+    },
+    "human_action_item_v3": {
+      "allOf": [
+        { "$ref": "#/$defs/item_core" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "id", "rank", "title", "facts", "links", "ops", "attention", "action_id", "job_id", "action_kind", "job_state", "revision", "sha256", "size_bytes", "route_class", "auth_requirement"],
+          "properties": {
+            "kind": { "const": "human_action" },
+            "id": { "type": "string", "minLength": 1, "maxLength": 1024, "pattern": "^[^\\u0000]+$" },
+            "rank": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+            "title": { "type": "string", "maxLength": 500, "pattern": "^[^\\u0000]*$" },
+            "facts": { "type": "array", "maxItems": 8, "items": { "$ref": "#/$defs/fact" } },
+            "links": { "type": "array", "maxItems": 16, "items": { "$ref": "#/$defs/link" } },
+            "ops": { "type": "array", "uniqueItems": true, "items": { "enum": ["acquire", "dismiss", "accept", "reject", "open", "retry", "open_request_history", "confirm_request_exists", "confirm_request_absent"] } },
+            "attention": { "$ref": "#/$defs/attention_enum" },
+            "action_id": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+            "job_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,128}$" },
+            "action_kind": { "type": "string", "minLength": 1, "maxLength": 100, "pattern": "^[^\\u0000]+$" },
+            "job_state": { "type": "string", "minLength": 1, "maxLength": 50, "pattern": "^[^\\u0000]+$" },
+            "revision": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+            "sha256": { "type": "string", "pattern": "^(|[a-f0-9]{64})$" },
+            "size_bytes": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+            "requires_auth": { "type": "boolean" },
+            "blocked_by": { "enum": ["anti_bot", "paywall", "landing_page", "login", "terms", "delivery_outcome", "identity_review", "unknown"] },
+            "route_class": { "$ref": "#/$defs/route_class_enum" },
+            "auth_requirement": { "$ref": "#/$defs/auth_requirement_enum" },
+            "delivery": { "$ref": "#/$defs/delivery_v3" }
+          },
+          "allOf": [
+            {
+              "if": { "properties": { "action_kind": { "const": "document_delivery" } }, "required": ["action_kind"] },
+              "then": {},
+              "else": { "not": { "required": ["delivery"] } }
+            }
+          ]
+        }
+      ]
+    },
+    "retraction_item_v3": {
+      "allOf": [
+        { "$ref": "#/$defs/item_core" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "id", "rank", "title", "facts", "links", "ops", "attention", "doi", "nature", "noticed_at"],
+          "properties": {
+            "kind": { "const": "retraction" },
+            "id": { "type": "string", "minLength": 1, "maxLength": 1024, "pattern": "^[^\\u0000]+$" },
+            "rank": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+            "title": { "type": "string", "maxLength": 500, "pattern": "^[^\\u0000]*$" },
+            "facts": { "type": "array", "maxItems": 8, "items": { "$ref": "#/$defs/fact" } },
+            "links": { "type": "array", "maxItems": 16, "items": { "$ref": "#/$defs/link" } },
+            "ops": { "type": "array", "uniqueItems": true, "items": { "enum": ["acquire", "dismiss", "accept", "reject", "open", "retry", "open_request_history", "confirm_request_exists", "confirm_request_absent"] } },
+            "attention": { "$ref": "#/$defs/attention_enum" },
+            "doi": { "type": "string", "minLength": 1, "maxLength": 300, "pattern": "^[^\\u0000]+$" },
+            "nature": { "enum": ["retraction", "correction", "concern"] },
+            "noticed_at": { "type": "string", "format": "date-time" },
+            "notice_doi": { "type": "string", "maxLength": 300, "pattern": "^[^\\u0000]*$" }
+          }
+        }
+      ]
+    },
+    "triage_item_v3": {
+      "oneOf": [
+        { "$ref": "#/$defs/watch_hit_item_v3" },
+        { "$ref": "#/$defs/human_action_item_v3" },
+        { "$ref": "#/$defs/retraction_item_v3" }
       ]
     },
     "triage_item": {
@@ -327,11 +470,13 @@
             "queued",
             "previously_unavailable",
             "ownership_incomplete",
+            "ownership_unknown",
             "invalid"
           ]
         },
         "ownership_complete": { "type": "boolean" },
-        "job_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,128}$" }
+        "job_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,128}$" },
+        "zotio_item_key": { "type": "string", "pattern": "^[A-Za-z0-9]{1,32}$" }
       },
       "allOf": [
         {
@@ -345,6 +490,10 @@
         {
           "if": { "required": ["job_id"] },
           "then": { "properties": { "status": { "const": "queued" } }, "required": ["status"] }
+        },
+        {
+          "if": { "required": ["zotio_item_key"] },
+          "then": { "properties": { "status": { "const": "owned_missing_pdf" } }, "required": ["status"] }
         }
       ]
     },
@@ -717,7 +866,7 @@
             "required": ["request_id", "schema_versions"],
             "properties": {
               "request_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,64}$" },
-              "schema_versions": { "type": "array", "minItems": 1, "maxItems": 1, "items": { "enum": [1, 2] } },
+              "schema_versions": { "type": "array", "minItems": 1, "maxItems": 1, "items": { "enum": [1, 2, 3] } },
               "limit": { "type": "integer", "minimum": 1, "maximum": 100 },
               "cursor": { "type": "string", "maxLength": 256, "pattern": "^[^\\u0000]*$" }
             }
@@ -735,10 +884,10 @@
             "required": ["request_id", "schema", "generated_at", "counts", "items", "has_more", "unsupported_items_count"],
             "properties": {
               "request_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,64}$" },
-              "schema": { "enum": [1, 2] },
+              "schema": { "enum": [1, 2, 3] },
               "generated_at": { "type": "string", "format": "date-time" },
               "counts": { "$ref": "#/$defs/counts" },
-              "items": { "type": "array", "maxItems": 100, "items": { "$ref": "#/$defs/triage_item" } },
+              "items": { "type": "array", "maxItems": 100 },
               "cursor": { "type": "string", "maxLength": 256, "pattern": "^[^\\u0000]*$" },
               "has_more": { "type": "boolean" },
               "unsupported_items_count": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
@@ -746,7 +895,15 @@
             "allOf": [
               { "if": { "properties": { "has_more": { "const": true } }, "required": ["has_more"] }, "then": { "required": ["cursor"] } },
               { "if": { "properties": { "has_more": { "const": false } }, "required": ["has_more"] }, "then": { "not": { "required": ["cursor"] } } },
-              { "if": { "properties": { "schema": { "const": 1 } }, "required": ["schema"] }, "then": { "properties": { "items": { "items": { "$ref": "#/$defs/triage_item_v1" } } } } }
+              {
+                "if": { "properties": { "schema": { "const": 1 } }, "required": ["schema"] },
+                "then": { "properties": { "items": { "items": { "$ref": "#/$defs/triage_item_v1" } } } },
+                "else": {
+                  "if": { "properties": { "schema": { "const": 3 } }, "required": ["schema"] },
+                  "then": { "properties": { "items": { "items": { "$ref": "#/$defs/triage_item_v3" } } } },
+                  "else": { "properties": { "items": { "items": { "$ref": "#/$defs/triage_item" } } } }
+                }
+              }
             ]
           }
         }
@@ -817,8 +974,30 @@
       }
     },
     {
-      "if": { "properties": { "type": { "enum": ["triage_decide_result", "human_action_resolve_result"] } } },
+      "if": { "properties": { "type": { "enum": ["triage_decide_result", "human_action_resolve_result", "delivery_reconcile_result"] } } },
       "then": { "properties": { "payload": { "$ref": "#/$defs/mutation_result" } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "delivery_reconcile_request" } } },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["request_id", "job_id", "operation"],
+            "properties": {
+              "request_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,64}$" },
+              "job_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,128}$" },
+              "operation": { "enum": ["confirm_request_exists", "confirm_request_absent"] },
+              "provider_reference": { "type": "string", "maxLength": 300, "pattern": "^[^\\u0000]*$" }
+            },
+            "allOf": [
+              { "if": { "properties": { "operation": { "const": "confirm_request_exists" } }, "required": ["operation"] }, "then": { "required": ["provider_reference"] } },
+              { "if": { "properties": { "operation": { "const": "confirm_request_absent" } }, "required": ["operation"] }, "then": { "not": { "required": ["provider_reference"] } } }
+            ]
+          }
+        }
+      }
     },
     {
       "if": { "properties": { "type": { "const": "human_action_resolve" } } },
@@ -981,7 +1160,8 @@
             "properties": {
               "request_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,64}$" },
               "scan_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,64}$" },
-              "identifiers": { "type": "array", "minItems": 1, "maxItems": 200, "items": { "$ref": "#/$defs/page_bulk_identifier" } }
+              "identifiers": { "type": "array", "minItems": 1, "maxItems": 200, "items": { "$ref": "#/$defs/page_bulk_identifier" } },
+              "rendered_record_count_hint": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
             }
           }
         }

@@ -1,0 +1,19 @@
+{
+  "schema_version": "papio-bench-cohort/1",
+  "id": "bench-internal-proving-cohort",
+  "description": "Two-work fully-fixtured cohort proving the comparative machinery end to end. delta-open-access has no candidate under the baseline overlay and is only reachable through an institutional handoff, but resolves directly once Semantic Scholar is enabled (mirrors dev/field-report-acquisition-ux-2026-07-21.md finding C1). delta-stable-oa resolves identically autonomous under both overlays, as a stability control.",
+  "works": [
+    {
+      "key": "delta-open-access",
+      "request": {"doi": "10.9999/bench-delta-open-access"},
+      "expected_class": "autonomous_ready",
+      "source": "synthetic fixture; not a real work"
+    },
+    {
+      "key": "delta-stable-oa",
+      "request": {"doi": "10.9999/bench-stable-oa"},
+      "expected_class": "autonomous_ready",
+      "source": "synthetic fixture; not a real work"
+    }
+  ]
+}

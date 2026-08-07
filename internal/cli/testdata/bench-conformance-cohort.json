@@ -1,0 +1,12 @@
+{
+  "schema_version": "papio-bench-cohort/1",
+  "id": "cli-conformance-cohort",
+  "description": "Minimal cohort for the --json envelope conformance sweep (conformance_test.go). It intentionally ships with no sibling fixtures directory, so its one work reports fixture_missing without any resolver, HTTP, or filesystem-outside-testdata activity — kept fast and fully deterministic for the command-tree walk.",
+  "works": [
+    {
+      "key": "conformance-probe",
+      "request": {"doi": "10.1000/conformance-probe"},
+      "expected_class": "autonomous_ready"
+    }
+  ]
+}

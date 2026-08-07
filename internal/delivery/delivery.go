@@ -63,6 +63,16 @@ type Request struct {
 	NextCheckAt        string
 	CreatedAt          string
 	UpdatedAt          string
+
+	// Poll health bookkeeping (0024_delivery_poll_health.sql). See
+	// poll.go's doc comment for the exact semantics of
+	// ProviderDisplayStatus vs. ProviderStatusRaw.
+	ProviderStatusRaw       string
+	ProviderDisplayStatus   string
+	LastPollAt              string
+	LastSuccessfulPollAt    string
+	ConsecutivePollFailures int
+	LastPollErrorClass      string
 }
 
 // Service is internal/delivery's store-backed entry point: request CRUD,
@@ -71,6 +81,9 @@ type Service struct {
 	store *store.Store
 	cfg   *config.Config
 	now   func() time.Time
+	// jitter overrides Poll's default backoff jitter (poll.go); nil uses
+	// defaultJitter. Test-only seam, never set by New.
+	jitter func(time.Duration) time.Duration
 }
 
 // New constructs a Service. now defaults to time.Now when nil.
@@ -167,16 +180,19 @@ type scanner interface {
 }
 
 var requestColumns = `id, job_id, institution_profile, provider, request_class, work_identity, idempotency_key,
-	state, provider_reference, gate_profile_digest, submitted_at, last_checked_at, next_check_at, created_at, updated_at`
+	state, provider_reference, gate_profile_digest, submitted_at, last_checked_at, next_check_at, created_at, updated_at,
+	provider_status_raw, provider_display_status, last_poll_at, last_successful_poll_at, consecutive_poll_failures, last_poll_error_class`
 
 func scanRequest(row scanner) (*Request, error) {
 	var r Request
 	var state string
 	var submittedAt, lastCheckedAt, nextCheckAt sql.NullString
+	var providerStatusRaw, providerDisplayStatus, lastPollAt, lastSuccessfulPollAt, lastPollErrorClass sql.NullString
 	if err := row.Scan(
 		&r.ID, &r.JobID, &r.InstitutionProfile, &r.Provider, &r.RequestClass, &r.WorkIdentity, &r.IdempotencyKey,
 		&state, &r.ProviderReference, &r.GateProfileDigest,
 		&submittedAt, &lastCheckedAt, &nextCheckAt, &r.CreatedAt, &r.UpdatedAt,
+		&providerStatusRaw, &providerDisplayStatus, &lastPollAt, &lastSuccessfulPollAt, &r.ConsecutivePollFailures, &lastPollErrorClass,
 	); err != nil {
 		return nil, err
 	}
@@ -184,6 +200,11 @@ func scanRequest(row scanner) (*Request, error) {
 	r.SubmittedAt = submittedAt.String
 	r.LastCheckedAt = lastCheckedAt.String
 	r.NextCheckAt = nextCheckAt.String
+	r.ProviderStatusRaw = providerStatusRaw.String
+	r.ProviderDisplayStatus = providerDisplayStatus.String
+	r.LastPollAt = lastPollAt.String
+	r.LastSuccessfulPollAt = lastSuccessfulPollAt.String
+	r.LastPollErrorClass = lastPollErrorClass.String
 	return &r, nil
 }
 
@@ -436,6 +457,13 @@ type GateEvaluated struct {
 	ProfileClass  GateClass
 	ProfileDigest string
 	Decision      Decision
+	// FulfillmentChannel snapshots GateProfile.FulfillmentChannel at
+	// evaluation time (2026-08-07 ADR-0017 amendment): "" or
+	// FulfillmentChannelPatronWeb. Recorded alongside the submission
+	// verdict so `papio delivery get`/`jobs get_v3` can distinguish
+	// submission-auto from end-to-end-auto without recomputing against a
+	// since-edited profile.
+	FulfillmentChannel string
 }
 
 const eventKindGateEvaluated = "delivery.gate_evaluated"
@@ -445,10 +473,11 @@ const eventKindGateEvaluated = "delivery.gate_evaluated"
 // any other secret/redacted field (ADR-0017 Decision 3B).
 func (s *Service) AppendGateEvent(ctx context.Context, jobID string, evt GateEvaluated) error {
 	return s.store.AppendEvent(ctx, jobID, eventKindGateEvaluated, map[string]any{
-		"profile_class":  string(evt.ProfileClass),
-		"profile_digest": evt.ProfileDigest,
-		"decision":       string(evt.Decision.Action),
-		"blockers":       evt.Decision.Blockers,
+		"profile_class":       string(evt.ProfileClass),
+		"profile_digest":      evt.ProfileDigest,
+		"decision":            string(evt.Decision.Action),
+		"blockers":            evt.Decision.Blockers,
+		"fulfillment_channel": evt.FulfillmentChannel,
 	})
 }
 
@@ -503,18 +532,20 @@ func (s *Service) LatestGateEvent(ctx context.Context, jobID string) (*GateEvalu
 		return nil, err
 	}
 	var detail struct {
-		ProfileClass  string   `json:"profile_class"`
-		ProfileDigest string   `json:"profile_digest"`
-		Decision      string   `json:"decision"`
-		Blockers      []string `json:"blockers"`
+		ProfileClass       string   `json:"profile_class"`
+		ProfileDigest      string   `json:"profile_digest"`
+		Decision           string   `json:"decision"`
+		Blockers           []string `json:"blockers"`
+		FulfillmentChannel string   `json:"fulfillment_channel"`
 	}
 	if err := json.Unmarshal([]byte(detailJSON), &detail); err != nil {
 		return nil, fmt.Errorf("decoding gate event: %w", err)
 	}
 	return &GateEvaluated{
-		ProfileClass:  GateClass(detail.ProfileClass),
-		ProfileDigest: detail.ProfileDigest,
-		Decision:      Decision{Action: Action(detail.Decision), Blockers: detail.Blockers},
+		ProfileClass:       GateClass(detail.ProfileClass),
+		ProfileDigest:      detail.ProfileDigest,
+		Decision:           Decision{Action: Action(detail.Decision), Blockers: detail.Blockers},
+		FulfillmentChannel: detail.FulfillmentChannel,
 	}, nil
 }
 

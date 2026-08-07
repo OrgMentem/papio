@@ -280,9 +280,10 @@ func TestAppendGateEventDetail(t *testing.T) {
 	testJob(t, svc, "job_evt")
 
 	err := svc.AppendGateEvent(ctx, "job_evt", GateEvaluated{
-		ProfileClass:  GateClassAutoCapable,
-		ProfileDigest: "digest-xyz",
-		Decision:      Decision{Action: ActionSubmit, Blockers: nil},
+		ProfileClass:       GateClassAutoCapable,
+		ProfileDigest:      "digest-xyz",
+		Decision:           Decision{Action: ActionSubmit, Blockers: nil},
+		FulfillmentChannel: FulfillmentChannelPatronWeb,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -304,6 +305,52 @@ func TestAppendGateEventDetail(t *testing.T) {
 	}
 	if detail["profile_class"] != "auto_capable" || detail["profile_digest"] != "digest-xyz" || detail["decision"] != "submit" {
 		t.Fatalf("detail = %v, missing expected profile_class/profile_digest/decision", detail)
+	}
+	if detail["fulfillment_channel"] != "patron_web" {
+		t.Fatalf("detail[fulfillment_channel] = %v, want patron_web", detail["fulfillment_channel"])
+	}
+}
+
+// TestLatestGateEventRoundTripsFulfillmentChannel proves the 2026-08-07
+// amendment's addition to GateEvaluated survives the AppendGateEvent ->
+// LatestGateEvent round trip papio delivery get/jobs get_v3 rely on, and
+// that an event recorded before this field existed decodes to "" rather
+// than erroring (the json field is simply absent from old detail_json).
+func TestLatestGateEventRoundTripsFulfillmentChannel(t *testing.T) {
+	svc := testService(t, time.Now())
+	ctx := context.Background()
+	testJob(t, svc, "job_evt_channel")
+
+	if err := svc.AppendGateEvent(ctx, "job_evt_channel", GateEvaluated{
+		ProfileClass:       GateClassAutoCapable,
+		ProfileDigest:      "digest-abc",
+		Decision:           Decision{Action: ActionSubmit},
+		FulfillmentChannel: FulfillmentChannelPatronWeb,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := svc.LatestGateEvent(ctx, "job_evt_channel")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == nil || got.FulfillmentChannel != FulfillmentChannelPatronWeb {
+		t.Fatalf("LatestGateEvent = %+v, want FulfillmentChannel %q", got, FulfillmentChannelPatronWeb)
+	}
+
+	testJob(t, svc, "job_evt_no_channel")
+	if err := svc.AppendGateEvent(ctx, "job_evt_no_channel", GateEvaluated{
+		ProfileClass:  GateClassPrefillOnly,
+		ProfileDigest: "digest-def",
+		Decision:      Decision{Action: ActionPrefill, Blockers: []string{BlockerAPICredentialMissing}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err = svc.LatestGateEvent(ctx, "job_evt_no_channel")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == nil || got.FulfillmentChannel != "" {
+		t.Fatalf("LatestGateEvent = %+v, want empty FulfillmentChannel", got)
 	}
 }
 

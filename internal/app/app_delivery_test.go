@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -982,5 +983,239 @@ func TestExhaustedCandidatesConservativeModeRecordsDeliveryAdvisoryEvent(t *test
 	}
 	if n := gateEventCount(t, jobs, id); n != 0 {
 		t.Fatalf("delivery.gate_evaluated events = %d, want 0 — conservative mode never evaluates the gate", n)
+	}
+}
+
+// TestSubmitDeliveryFulfilledWithPatronWebEnqueuesHandoff is the 2026-08-07
+// amendment's core acceptance case: a fulfilled row with
+// patron_web_base_url configured enqueues exactly one document_delivery
+// openurl_handoff row carrying the form-75 "View PDF" URL and the provider
+// reference, and parks the job awaiting_human — delegated mode drives (this
+// test only asserts the action/event papio's own routing produced; whether
+// the extension is actually offered the frame is internal/browser's own
+// offerableAccessMode/offer() concern, exercised in bridge_test.go).
+func TestSubmitDeliveryFulfilledWithPatronWebEnqueuesHandoff(t *testing.T) {
+	svc, jobs, deliverySvc := newDeliveryTestService(t)
+	svc.Delivery = deliverySvc
+	dd := autoCapableDocumentDelivery("https://illiad.example.edu/ILLiadWebPlatform")
+	dd.PatronWebBaseURL = "https://illiadweb.example.edu/illiad/illiad.dll"
+	svc.Config.Browser.DocumentDelivery = dd
+	svc.Resolvers = deliveryTestResolvers()
+	ctx := context.Background()
+
+	id, err := svc.Submit(ctx, deliveryWorkRequest("wr_fulfilled_patronweb_001", "10.1000/fulfilled-patronweb-001"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := jobs.ClaimNext(ctx, "w", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.Transition(ctx, id, job.StateQueued, job.StateResolving, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := deliverySvc.Create(ctx, delivery.CreateRequest{
+		JobID: id, InstitutionProfile: "default", Provider: "illiad",
+		RequestClass: "digital_journal_article", WorkIdentity: "doi:10.1000/fulfilled-patronweb-001",
+		State: delivery.StateFulfilled, ProviderReference: "482910",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := svc.SubmitDelivery(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Configured || result.Branch != delivery.BranchAdoptFulfilled {
+		t.Fatalf("result = %+v, want Configured/adopt_fulfilled", result)
+	}
+
+	got, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != job.StateAwaitingHuman {
+		t.Fatalf("job state = %q, want awaiting_human", got.State)
+	}
+
+	actions, err := jobs.ListHumanActions(ctx, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var forJob []job.HumanAction
+	for _, a := range actions {
+		if a.JobID == id {
+			forJob = append(forJob, a)
+		}
+	}
+	if len(forJob) != 1 {
+		t.Fatalf("open actions for job = %+v, want exactly one", forJob)
+	}
+	if forJob[0].Kind != "openurl_handoff" {
+		t.Fatalf("action kind = %q, want openurl_handoff (routed through the existing browser-handoff machinery)", forJob[0].Kind)
+	}
+	wantURL := delivery.FulfillmentRetrievalURL(dd.PatronWebBaseURL, "482910")
+	wantDetail := DocumentDeliveryRetrievalHandoffDetail + "\n" + wantURL
+	if forJob[0].Detail != wantDetail {
+		t.Fatalf("action detail = %q, want %q", forJob[0].Detail, wantDetail)
+	}
+	if gotURL, ok := DocumentDeliveryRetrievalHandoffURL(forJob[0].Detail); !ok || gotURL != wantURL {
+		t.Fatalf("DocumentDeliveryRetrievalHandoffURL(%q) = %q, %t, want %q, true", forJob[0].Detail, gotURL, ok, wantURL)
+	}
+	if !strings.Contains(wantURL, "Action=10") || !strings.Contains(wantURL, "Form=75") || !strings.Contains(wantURL, "Value=482910") {
+		t.Fatalf("retrieval URL = %q, want the form-75 View PDF query", wantURL)
+	}
+
+	events, err := jobs.Events(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sawEnqueued bool
+	for _, e := range events {
+		if e["kind"] != "delivery.retrieval_enqueued" {
+			continue
+		}
+		sawEnqueued = true
+		detail, _ := e["detail"].(map[string]any)
+		if detail["route_class"] != "document_delivery" || detail["provider_reference"] != "482910" {
+			t.Fatalf("delivery.retrieval_enqueued detail = %+v, want route_class document_delivery, provider_reference 482910", detail)
+		}
+	}
+	if !sawEnqueued {
+		t.Fatal("no delivery.retrieval_enqueued event was recorded")
+	}
+}
+
+// TestSubmitDeliveryFulfilledWithoutPatronWebOpensReconciliationAction pins
+// the fallback: absent patron_web_base_url means papio cannot construct a
+// retrieval route, so a fulfilled row still surfaces an operator-visible
+// human action (the pre-existing Decision 4 reconciliation action) instead
+// of silently dropping it.
+func TestSubmitDeliveryFulfilledWithoutPatronWebOpensReconciliationAction(t *testing.T) {
+	svc, jobs, deliverySvc := newDeliveryTestService(t)
+	svc.Delivery = deliverySvc
+	dd := autoCapableDocumentDelivery("https://illiad.example.edu/ILLiadWebPlatform") // no PatronWebBaseURL
+	svc.Config.Browser.DocumentDelivery = dd
+	svc.Resolvers = deliveryTestResolvers()
+	ctx := context.Background()
+
+	id, err := svc.Submit(ctx, deliveryWorkRequest("wr_fulfilled_no_patronweb_001", "10.1000/fulfilled-no-patronweb-001"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := jobs.ClaimNext(ctx, "w", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.Transition(ctx, id, job.StateQueued, job.StateResolving, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := deliverySvc.Create(ctx, delivery.CreateRequest{
+		JobID: id, InstitutionProfile: "default", Provider: "illiad",
+		RequestClass: "digital_journal_article", WorkIdentity: "doi:10.1000/fulfilled-no-patronweb-001",
+		State: delivery.StateFulfilled, ProviderReference: "482911",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := svc.SubmitDelivery(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != job.StateAwaitingHuman {
+		t.Fatalf("job state = %q, want awaiting_human", got.State)
+	}
+	actions, err := jobs.ListHumanActions(ctx, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var forJob []job.HumanAction
+	for _, a := range actions {
+		if a.JobID == id {
+			forJob = append(forJob, a)
+		}
+	}
+	if len(forJob) != 1 || forJob[0].Kind != job.ActionKindDocumentDelivery {
+		t.Fatalf("open actions for job = %+v, want exactly one document_delivery reconciliation action", forJob)
+	}
+	if !strings.Contains(forJob[0].Detail, "needs reconciliation") {
+		t.Fatalf("action detail = %q, want the reconciliation wording (never an automated retrieval route)", forJob[0].Detail)
+	}
+}
+
+// TestSubmitDeliveryFulfilledConservativeRecordsWithoutOpening proves
+// ADR-0017 Decision 3B condition 1 applies to fulfilled retrieval exactly
+// as it applies to submission and prefill: conservative mode never opens
+// or drives anything, even with patron_web_base_url configured — it only
+// records the discovery, reusing the same event-not-action pattern
+// exhaustedCandidates' conservative branch already uses for route
+// discovery.
+func TestSubmitDeliveryFulfilledConservativeRecordsWithoutOpening(t *testing.T) {
+	svc, jobs, deliverySvc := newDeliveryTestService(t)
+	svc.Delivery = deliverySvc
+	svc.Config.AccessMode = config.ModeConservative
+	dd := autoCapableDocumentDelivery("https://illiad.example.edu/ILLiadWebPlatform")
+	dd.PatronWebBaseURL = "https://illiadweb.example.edu/illiad/illiad.dll"
+	svc.Config.Browser.DocumentDelivery = dd
+	svc.Resolvers = deliveryTestResolvers()
+	ctx := context.Background()
+
+	id, err := svc.Submit(ctx, deliveryWorkRequest("wr_fulfilled_conservative_001", "10.1000/fulfilled-conservative-001"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := jobs.ClaimNext(ctx, "w", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.Transition(ctx, id, job.StateQueued, job.StateResolving, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := deliverySvc.Create(ctx, delivery.CreateRequest{
+		JobID: id, InstitutionProfile: "default", Provider: "illiad",
+		RequestClass: "digital_journal_article", WorkIdentity: "doi:10.1000/fulfilled-conservative-001",
+		State: delivery.StateFulfilled, ProviderReference: "482912",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := svc.SubmitDelivery(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != job.StateResolving {
+		t.Fatalf("job state = %q, want resolving (untouched — conservative mode never transitions on discovery)", got.State)
+	}
+	actions, err := jobs.ListHumanActions(ctx, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range actions {
+		if a.JobID == id {
+			t.Fatalf("actions = %+v, want none — conservative mode records without opening", a)
+		}
+	}
+	events, err := jobs.Events(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sawDiscovered bool
+	for _, e := range events {
+		if e["kind"] != "delivery.retrieval_discovered" {
+			continue
+		}
+		sawDiscovered = true
+		detail, _ := e["detail"].(map[string]any)
+		if detail["route_class"] != "document_delivery" || detail["provider_reference"] != "482912" {
+			t.Fatalf("delivery.retrieval_discovered detail = %+v, want route_class document_delivery, provider_reference 482912", detail)
+		}
+	}
+	if !sawDiscovered {
+		t.Fatal("no delivery.retrieval_discovered event was recorded")
 	}
 }

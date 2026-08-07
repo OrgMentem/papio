@@ -462,11 +462,38 @@ func checkDocumentDelivery(ctx context.Context, cfg config.Config, db *store.Sto
 			// v1 does not call ILLiad's Web Platform API to verify the key
 			// authenticates or that patron_ref resolves to a real patron —
 			// see the doc comment above.
+
+			// Poll health (ADR-0017 Decision 4): live requests this
+			// profile is currently polling, and whether the poll
+			// executor's failure discipline has surfaced anything an
+			// operator needs to see. Never claims a request itself
+			// failed — only that papio's own observation of it has
+			// degraded or gone stale.
+			switch {
+			case db == nil:
+				add(prefix+":poll_health", Skip, "poll health is checked by the daemon", "")
+			default:
+				health, err := delivery.New(db, &cfg, nil).LivePollHealth(ctx, name)
+				if err != nil {
+					add(prefix+":poll_health", Fail, "poll health could not be read: "+err.Error(), "inspect database permissions")
+					break
+				}
+				add(prefix+":poll_health", documentDeliveryPollHealthStatus(health), documentDeliveryPollHealthDetail(health), documentDeliveryPollHealthRemedy(health))
+			}
 		}
 
 		add(prefix+":legal_basis", Declared, "legal_basis is "+documentDeliveryOrUnset(dd.LegalBasis)+" (declared in config, not independently verified)", "")
 		add(prefix+":patron_attestation", Declared, "patron_attestation is "+documentDeliveryOrUnset(dd.PatronAttestation)+" (declared in config, not independently verified)", "")
 		add(prefix+":patron_fee_policy", Declared, "patron_fee_policy is "+documentDeliveryOrUnset(dd.PatronFeePolicy)+" (declared in config, not independently verified)", "")
+		// 2026-08-07 amendment: submission auto-capability (above) and
+		// end-to-end fulfillment retrieval are separate compiled facts — a
+		// profile can be AUTO-CAPABLE for creating the request while still
+		// having no automatic route to retrieve it once fulfilled.
+		if profile.FulfillmentChannel == delivery.FulfillmentChannelPatronWeb {
+			add(prefix+":fulfillment", Pass, "fulfillment: patron_web (end-to-end — a fulfilled request retrieves automatically through the patron-web View PDF page)", "")
+		} else {
+			add(prefix+":fulfillment", Warn, "fulfillment: none (a fulfilled request opens a manual reconciliation action)", "configure document_delivery.patron_web_base_url for automatic retrieval (kind = illiad only)")
+		}
 
 		if profile.Class == delivery.GateClassAutoCapable {
 			add(prefix+":result", Pass, "AUTO-CAPABLE · "+strings.Join(documentDeliverySortedClasses(profile.SupportedRequestClasses), ", "), "")
@@ -477,6 +504,81 @@ func checkDocumentDelivery(ctx context.Context, cfg config.Config, db *store.Sto
 			add(fmt.Sprintf("%s:block:%d", prefix, i+1), Warn, "BLOCK "+b.Code+": "+documentDeliveryBlockerText(b), "")
 		}
 	}
+}
+
+// documentDeliveryPollHealthStatus classifies a profile's live poll-health
+// rows for papio doctor. contract_drift and credential failures are Fail —
+// an operator action is required before polling can resume at all;
+// unobservable/degraded rows are Warn — polling continues, but papio's own
+// view of the request has gone stale or is struggling.
+func documentDeliveryPollHealthStatus(health []delivery.PollHealth) string {
+	var unobservable, degraded int
+	for _, h := range health {
+		switch h.LastPollErrorClass {
+		case delivery.PollErrorClassContractDrift, delivery.PollErrorClassCredential:
+			return Fail
+		}
+		if h.Unobservable {
+			unobservable++
+		}
+		if h.Degraded {
+			degraded++
+		}
+	}
+	switch {
+	case unobservable > 0, degraded > 0:
+		return Warn
+	case len(health) > 0:
+		return Pass
+	default:
+		return Skip
+	}
+}
+
+func documentDeliveryPollHealthDetail(health []delivery.PollHealth) string {
+	if len(health) == 0 {
+		return "no live requests to poll"
+	}
+	var unobservable, degraded int
+	for _, h := range health {
+		switch h.LastPollErrorClass {
+		case delivery.PollErrorClassContractDrift:
+			return fmt.Sprintf("request %d: a status poll response did not match the expected shape (contract drift) — polling is paused for that request", h.RequestID)
+		case delivery.PollErrorClassCredential:
+			return fmt.Sprintf("request %d: a status poll was rejected as unauthorized (401/403)", h.RequestID)
+		}
+		if h.Unobservable {
+			unobservable++
+		}
+		if h.Degraded {
+			degraded++
+		}
+	}
+	switch {
+	case unobservable > 0:
+		return fmt.Sprintf("papio cannot observe %d of %d live request(s): no successful status poll in over 24h", unobservable, len(health))
+	case degraded > 0:
+		return fmt.Sprintf("%d of %d live request(s) have 3+ consecutive failed status polls", degraded, len(health))
+	default:
+		return fmt.Sprintf("%d live request(s) polling normally", len(health))
+	}
+}
+
+func documentDeliveryPollHealthRemedy(health []delivery.PollHealth) string {
+	for _, h := range health {
+		switch h.LastPollErrorClass {
+		case delivery.PollErrorClassContractDrift:
+			return "check the ILLiad Web Platform API version/response shape, then run papio delivery reconciliation for the affected request"
+		case delivery.PollErrorClassCredential:
+			return "verify document_delivery.api_key is valid and has status-poll permission"
+		}
+	}
+	for _, h := range health {
+		if h.Unobservable || h.Degraded {
+			return "check network/API reachability to the ILLiad Web Platform"
+		}
+	}
+	return ""
 }
 
 func documentDeliverySortedClasses(classes map[string]bool) []string {

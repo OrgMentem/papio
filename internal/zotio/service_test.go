@@ -275,6 +275,26 @@ func TestLookupWorksClassifiesOwnedPDFMissingPDFAndNewWork(t *testing.T) {
 	}
 }
 
+// PMID plumbs through the items-find subprocess path exactly like DOI/arXiv:
+// same --agent items find <flag> <value> shape, same ownership classification.
+func TestLookupWorksClassifiesOwnedByPMID(t *testing.T) {
+	cli := &fakeCLI{
+		find: map[string]json.RawMessage{
+			"pmid:12345678": json.RawMessage(`[{"key":"PMID0001","data":{}}]`),
+		},
+	}
+	result, err := (&Service{CLI: cli}).LookupWorks(context.Background(), LookupWorksRequest{Works: []LookupWork{
+		{PMID: "12345678"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := WorkOwnership{Status: OwnershipOwnedWithPDF, ItemKey: "PMID0001"}
+	if len(result.Works) != 1 || result.Works[0] != want {
+		t.Fatalf("works = %+v, want [%+v]", result.Works, want)
+	}
+}
+
 // Regression: repeat backfill runs re-counted items whose deterministic
 // request already had a live job, turning stuck jobs into recurring
 // "queued 1" notifications. Live requests must report as skipped.

@@ -38,6 +38,7 @@ const STATUS_LABEL: Record<PageBulkStatus, string> = {
   queued: "Queued",
   previously_unavailable: "No route previously",
   ownership_incomplete: "Ownership unclear",
+  ownership_unknown: "Library check unavailable",
   invalid: "Not a recognized identifier",
 };
 
@@ -189,6 +190,7 @@ function isStatusItem(value: unknown): value is PageBulkStatusItem {
     status === "queued" ||
     status === "previously_unavailable" ||
     status === "ownership_incomplete" ||
+    status === "ownership_unknown" ||
     status === "invalid";
   if (!validStatus) return false;
   if (status !== "invalid" && typeof value["canonical_key"] !== "string") return false;
@@ -583,7 +585,16 @@ async function loadStatus(): Promise<void> {
   }));
   let response: unknown;
   try {
-    response = await runtimeMessage("papio.pageBulk.status", { scan_id: state.snapshot.scanId, identifiers });
+    response = await runtimeMessage("papio.pageBulk.status", {
+      scan_id: state.snapshot.scanId,
+      identifiers,
+      // Omitted, never null, when the page's structure was not recognized
+      // (dev/post-build-followups.md item 3) — the wire protocol rejects an
+      // explicit null anywhere in a payload.
+      ...(state.snapshot.renderedRecordCountHint !== null
+        ? { rendered_record_count_hint: state.snapshot.renderedRecordCountHint }
+        : {}),
+    });
   } catch (e) {
     if (state.snapshot === null || state.snapshot.documentGeneration !== requestGeneration) return;
     state.statusError = e instanceof Error ? e.message : "Could not reach the extension runtime.";

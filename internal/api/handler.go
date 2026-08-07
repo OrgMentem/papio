@@ -152,6 +152,14 @@ type FailuresPage struct {
 	Truncated bool                   `json:"truncated"`
 }
 
+// PageBulkStatsPage is the stats.page_bulk read model behind `papio stats
+// page-bulk`: one row per source-origin class (store.PageBulkStatsRow).
+// Not paginated — page_bulk_runs is a lifetime measurement log, small
+// enough to aggregate in full every call — so there is no Truncated field.
+type PageBulkStatsPage struct {
+	Origins []store.PageBulkStatsRow `json:"origins"`
+}
+
 // RepairResult reports what jobs.repair_awaiting_human did. Outcome is a closed
 // vocabulary — repaired, not_parked, has_open_actions, conflict — so a consumer
 // never has to parse an error message to tell "nothing to repair" from "I could
@@ -268,6 +276,9 @@ func RouterWithShutdown(system *bootstrap.System, shutdown context.CancelFunc) i
 		},
 		"stats.get": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return triageStats(ctx, raw, system)
+		},
+		"stats.page_bulk": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return pageBulkStats(ctx, raw, system)
 		},
 		"triage.decide": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return triageDecide(ctx, raw, system)
@@ -975,6 +986,24 @@ func listFailureSummaries(ctx context.Context, raw json.RawMessage, system *boot
 		return failure(err)
 	}
 	return marshal(FailuresPage{Failures: failures, Truncated: truncated})
+}
+
+// pageBulkStats exposes store.PageBulkStats behind stats.page_bulk
+// (dev/post-build-followups.md item 3): the papio stats page-bulk read
+// model over page_bulk_runs.
+func pageBulkStats(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
+	var params struct{}
+	if err := ipc.DecodeParams(raw, &params); err != nil {
+		return badParams(err)
+	}
+	if system == nil || system.Store == nil {
+		return nil, &ipc.RPCError{Code: "precondition_failed", Message: "store is not configured"}
+	}
+	origins, err := system.Store.PageBulkStats(ctx)
+	if err != nil {
+		return failure(err)
+	}
+	return marshal(PageBulkStatsPage{Origins: origins})
 }
 
 // listJobsV2 is jobs.list with the one thing a cohort-scale consumer cannot

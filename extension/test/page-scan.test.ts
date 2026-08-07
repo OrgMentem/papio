@@ -412,3 +412,64 @@ test("a real citation label is never mistaken for low-information chrome", () =>
   );
   expect(result.papers[0]!.label).toContain("Parental background and university dropout");
 });
+
+// --- renderedRecordCountHint: honest structural denominator ----------------
+// (dev/post-build-followups.md item 3). Counts rendered records for a
+// recognized page-class family without reading their contents; null when no
+// family is recognized, never a guess.
+
+test("a definition-list page reports its <dt> row count as the hint", () => {
+  const rows = Array.from(
+    { length: 4 },
+    (_, i) => `<dt><a href="https://arxiv.org/abs/210${i}.00001">arXiv:210${i}.00001</a></dt><dd>Title ${i}</dd>`,
+  ).join("\n");
+  const result = scanDocument(doc(`<dl>${rows}</dl>`));
+  expect(result.papers).toHaveLength(4);
+  expect(result.renderedRecordCountHint).toBe(4);
+});
+
+test("a reference/citation-list page reports its <li> item count as the hint", () => {
+  const items = Array.from(
+    { length: 6 },
+    (_, i) => `<li>Author ${i}. Title ${i}. <a href="https://doi.org/10.1000/ref.${i}">CrossRef</a></li>`,
+  ).join("\n");
+  const result = scanDocument(doc(`<ul class="reference-list">${items}</ul>`));
+  expect(result.renderedRecordCountHint).toBe(6);
+});
+
+test("repeated sibling result cards report the sibling count as the hint", () => {
+  const cards = Array.from(
+    { length: 3 },
+    (_, i) => `
+      <article class="card">
+        <h3>Distinctive title ${i}</h3>
+        <a href="https://doi.org/10.1234/card.${i}">Publisher</a>
+      </article>`,
+  ).join("\n");
+  const result = scanDocument(doc(`<div class="result-page">${cards}</div>`));
+  expect(result.papers).toHaveLength(3);
+  expect(result.renderedRecordCountHint).toBe(3);
+});
+
+test("a single result card never crosses the 2-record floor into a hint", () => {
+  const result = scanDocument(
+    doc(`<div class="result-page"><article class="card"><h3>Only one</h3></article></div>`),
+  );
+  expect(result.renderedRecordCountHint).toBeNull();
+});
+
+test("a page with no recognized structural family reports no hint, never a guess", () => {
+  const result = scanDocument(doc(`<p>See 10.1000/xyz123 for the full record.</p>`));
+  expect(result.papers).toHaveLength(1);
+  expect(result.renderedRecordCountHint).toBeNull();
+});
+
+test("a hidden reference-list item is not counted toward the hint", () => {
+  const items = [
+    `<li>Visible one <a href="https://doi.org/10.1000/hidden.0">CrossRef</a></li>`,
+    `<li>Visible two <a href="https://doi.org/10.1000/hidden.1">CrossRef</a></li>`,
+    `<li hidden>Hidden three <a href="https://doi.org/10.1000/hidden.2">CrossRef</a></li>`,
+  ].join("\n");
+  const result = scanDocument(doc(`<ul class="citation-list">${items}</ul>`));
+  expect(result.renderedRecordCountHint).toBe(2);
+});

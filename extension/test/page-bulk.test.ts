@@ -99,6 +99,7 @@ interface FixtureSnapshot {
   documentGeneration: number;
   items: DetectedPaper[];
   truncated: boolean;
+  renderedRecordCountHint: number | null;
 }
 
 function snapshot(overrides: Partial<FixtureSnapshot> = {}): FixtureSnapshot {
@@ -111,6 +112,7 @@ function snapshot(overrides: Partial<FixtureSnapshot> = {}): FixtureSnapshot {
     documentGeneration: 1,
     items: [paper()],
     truncated: false,
+    renderedRecordCountHint: null,
     ...overrides,
   };
 }
@@ -168,6 +170,17 @@ test("loads the snapshot, binds the header (title/origin/timestamp), and sets do
   });
   const allowlistRequest = page.requests.find((r) => r.type === "papio.pageBulk.allowlist.get");
   expect(allowlistRequest?.request).toEqual({ origin: "https://scholar.example.edu" });
+});
+
+test("a snapshot with a rendered-record hint attaches it to the status request; a null hint sends nothing", async () => {
+  const hinted = snapshot({ renderedRecordCountHint: 12 });
+  const page = await pageBulkDocument("scan-1", standardReply(hinted));
+  const statusRequest = page.requests.find((r) => r.type === "papio.pageBulk.status");
+  expect(statusRequest?.request).toEqual({
+    scan_id: "scan-1",
+    identifiers: [{ local_id: "id-1", kind: "doi", value: "10.1234/abcd.5678" }],
+    rendered_record_count_hint: 12,
+  });
 });
 
 test("no ?scan= in the URL shows a load error and never calls the runtime", async () => {

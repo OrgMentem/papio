@@ -1,0 +1,31 @@
+{
+  "schema_version": "papio-bench-cohort/1",
+  "id": "field-2026-07-21",
+  "description": "Historical acquisition-session cohort from dev/field-report-acquisition-ux-2026-07-21.md (papio 0.7.1-dev field session, ~9 works pulled from a Google Scholar Labs result list into Zotero). The report documents outcomes for 7 of those ~9 works: 4 stuck-on-handoff works (findings C1/C3) described in enough bibliographic detail to build a request, and 3 works described only as \"fully imported to Zotero\" with no title, author, or identifier recorded anywhere in the report text. Those 3 (and the report's own '~9' hedge on the remainder) are NOT enumerable from the source document and are intentionally omitted here rather than fabricated — see AGENTS.md and rule://no-real-institutions-in-repo on grounding. expected_class records the IDEAL outcome implied by the report's own proposed fixes (C1: an OA fetch blocked only by anti-bot should still cost at most one no-login browser-render boundary; C3: an OA sibling should be found and fetched before declaring OA exhausted), not the buggy outcome the session actually observed. As of this cohort's authoring, no HTTP fixtures exist for any of these four works (internal/bench/testdata/fixtures has the 2-work cohort that proves the comparative machinery instead), so every row here is expected to report fixture_missing until fixtures are recorded for them.",
+  "works": [
+    {
+      "key": "yang-my-advisor-her-ai-and-me",
+      "request": {"title": "My Advisor, Her AI, and Me"},
+      "expected_class": "ready_after_human_boundary",
+      "source": "field-report C1: open access (informs) but blocked by publisher anti-bot, so even the ideal fix still crosses one no-login browser-render boundary"
+    },
+    {
+      "key": "xu-enhancing-intuitive-decision-making",
+      "request": {"title": "Enhancing Intuitive Decision-Making"},
+      "expected_class": "ready_after_human_boundary",
+      "source": "field-report C1: open access (MDPI) but blocked by publisher anti-bot, same reasoning as Yang"
+    },
+    {
+      "key": "ferrario-loi-facct-2022",
+      "request": {"doi": "10.1145/3531146.3533202", "authors": ["Ferrario", "Loi"]},
+      "expected_class": "autonomous_ready",
+      "source": "field-report C3: the canonical ACM DOI is paywalled, but an OA SSRN copy exists (10.2139/ssrn.4020557); the ideal fix finds and fetches that sibling with zero human action, removing the SSO dependency the session actually hit"
+    },
+    {
+      "key": "luca-trust-asymmetries-ijhci",
+      "request": {"title": "Trust Asymmetries", "authors": ["Luca"]},
+      "expected_class": "ready_after_human_boundary",
+      "source": "field-report: genuinely paywalled (Taylor & Francis IJHCI), resolver found only a landing page with no OA alternative mentioned; institutional handoff is the expected route"
+    }
+  ]
+}

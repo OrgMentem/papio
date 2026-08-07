@@ -1055,6 +1055,25 @@ func TestDocumentDeliveryConfigValidationFailsClosed(t *testing.T) {
 			body:    "[browser.resolvers.campus]\nopenurl_base_url = \"https://campus.example.edu/openurl\"\n[browser.resolvers.campus.document_delivery]\nkind = \"oclc\"\n",
 			wantErr: "browser.resolvers.campus.document_delivery.kind",
 		},
+		{
+			name: "patron_web_base_url configured on a valid illiad profile is accepted (absent is also legal, per the base fixtures above)",
+			body: validIlliadDefault + "patron_web_base_url = \"https://illiadweb.example.edu/illiad/illiad.dll\"\n",
+		},
+		{
+			name:    "patron_web_base_url http is rejected",
+			body:    "[browser.document_delivery]\nkind = \"illiad\"\npatron_web_base_url = \"http://illiadweb.example.edu/illiad/illiad.dll\"\n",
+			wantErr: "patron_web_base_url must be an absolute https URL",
+		},
+		{
+			name:    "patron_web_base_url junk is rejected",
+			body:    "[browser.document_delivery]\nkind = \"illiad\"\npatron_web_base_url = \"not a url\"\n",
+			wantErr: "patron_web_base_url must be an absolute https URL",
+		},
+		{
+			name:    "patron_web_base_url on a form-kind profile is dead config",
+			body:    "[browser.document_delivery]\nkind = \"openurl\"\npatron_web_base_url = \"https://illiadweb.example.edu/illiad/illiad.dll\"\n",
+			wantErr: "patron_web_base_url is set but kind is",
+		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "config.toml")

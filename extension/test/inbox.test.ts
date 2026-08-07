@@ -7,7 +7,7 @@ import { Window } from "happy-dom";
 import type { TriageCounts, TriageSnapshotItem } from "../src/protocol";
 
 interface FixtureSnapshot {
-  schema: 1;
+  schema: 1 | 2 | 3;
   generated_at: string;
   counts: TriageCounts;
   items: TriageSnapshotItem[];
@@ -20,6 +20,12 @@ interface RuntimeRequest {
   type: string;
   request: Record<string, unknown>;
 }
+
+// happy-dom's Window has no prompt(); confirm_request_exists uses
+// window.prompt to collect the operator-supplied provider reference, so
+// tests stub it through this narrow, named augmentation rather than an
+// inline cast.
+type WindowWithPrompt = Window & { prompt: (message?: string, defaultValue?: string) => string | null };
 
 let importSerial = 0;
 
@@ -158,6 +164,34 @@ function handoffAction(id: string, rank: number, requiresAuth: boolean): TriageS
     size_bytes: 0,
     requires_auth: requiresAuth,
     blocked_by: requiresAuth ? "paywall" : "anti_bot",
+  };
+}
+
+function documentDeliveryAction(
+  id: string,
+  rank: number,
+  attention: "working" | "required",
+  state: "unknown_outcome" | "fulfilled" | "declined" | "cancelled",
+): TriageSnapshotItem {
+  return {
+    kind: "human_action",
+    id,
+    rank,
+    title: "document delivery",
+    facts: [{ label: "Action", text: "document delivery" }],
+    links: [],
+    ops: ["open_request_history", "confirm_request_exists", "confirm_request_absent"],
+    attention,
+    action_id: 21,
+    job_id: "job-delivery-21",
+    action_kind: "document_delivery",
+    job_state: "awaiting_human",
+    revision: 1,
+    sha256: "",
+    size_bytes: 0,
+    route_class: "document_delivery",
+    auth_requirement: "unknown",
+    delivery: { provider: "illiad", provider_reference: "TN-42", state },
   };
 }
 
@@ -1136,4 +1170,62 @@ test("watch hits load themselves when the count says they exist", async () => {
   // watch row renders.
   expect(page.document.querySelector("[data-triage-item-id='watch:auto']")).not.toBeNull();
   expect(page.document.getElementById("watch-panel")?.textContent).not.toContain("Loading 1 watch hit");
+});
+
+test("renders a document_delivery item's delivery detail, attention styling, and the three reconciliation ops", async () => {
+  const unresolved = documentDeliveryAction("action:delivery-required", 1, "required", "unknown_outcome");
+  const fulfilled = documentDeliveryAction("action:delivery-working", 2, "working", "fulfilled");
+  fulfilled.job_id = "job-delivery-22";
+  fulfilled.action_id = 22;
+  const fixture = snapshot([unresolved, fulfilled], {
+    schema: 3,
+    counts: counts({ pending_total: 2, actions: 2, watch_hits: 0, retractions: 0 }),
+  });
+  const page = await inboxDocument((message) => {
+    if (message.type === "papio.delivery.reconcile") return { ok: true, outcome: "applied" };
+    return snapshotReply(fixture, message);
+  });
+  const win = page.window as WindowWithPrompt;
+  win.prompt = () => "TN-42";
+
+  const requiredRow = page.document.querySelector<HTMLElement>("[data-triage-item-id='action:delivery-required']");
+  expect(requiredRow?.dataset.attention).toBe("required");
+  const workingRow = page.document.querySelector<HTMLElement>("[data-triage-item-id='action:delivery-working']");
+  expect(workingRow?.dataset.attention).toBe("working");
+  expect(requiredRow?.querySelector(".item-status")?.getAttribute("data-status")).toBe("document_delivery");
+
+  const delivery = requiredRow?.querySelector(".item-delivery");
+  expect(delivery?.textContent).toContain("illiad");
+  expect(delivery?.textContent).toContain("TN-42");
+  expect(delivery?.textContent).toContain("unknown outcome");
+
+  const historyButton = requiredRow?.querySelector<HTMLButtonElement>("[data-operation='open_request_history']");
+  const existsButton = requiredRow?.querySelector<HTMLButtonElement>("[data-operation='confirm_request_exists']");
+  const requiredAbsentButton = requiredRow?.querySelector<HTMLButtonElement>("[data-operation='confirm_request_absent']");
+  expect(historyButton?.textContent).toBe("History");
+  expect(existsButton?.textContent).toBe("Confirm exists");
+  expect(requiredAbsentButton?.textContent).toBe("Confirm absent");
+
+  const debugToggle = requiredRow?.querySelector<HTMLButtonElement>(".item-debug-toggle");
+  expect(debugToggle?.getAttribute("aria-expanded")).toBe("false");
+  historyButton?.click();
+  expect(debugToggle?.getAttribute("aria-expanded")).toBe("true");
+
+  existsButton?.click();
+  await settle();
+  expect(page.requests.find((request) => request.type === "papio.delivery.reconcile")?.request).toEqual({
+    job_id: "job-delivery-21",
+    operation: "confirm_request_exists",
+    provider_reference: "TN-42",
+  });
+  expect(page.document.querySelector("[data-triage-item-id='action:delivery-required']")).toBeNull();
+
+  const workingAbsentButton = workingRow?.querySelector<HTMLButtonElement>("[data-operation='confirm_request_absent']");
+  workingAbsentButton?.click();
+  await settle();
+  expect(page.requests.find((request) => request.request["job_id"] === "job-delivery-22")?.request).toEqual({
+    job_id: "job-delivery-22",
+    operation: "confirm_request_absent",
+  });
+  expect(page.document.querySelector("[data-triage-item-id='action:delivery-working']")).toBeNull();
 });

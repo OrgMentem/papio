@@ -33,6 +33,7 @@ import (
 	"papio/internal/app"
 	"papio/internal/captures"
 	"papio/internal/config"
+	"papio/internal/delivery"
 	"papio/internal/job"
 	"papio/internal/ownership"
 	"papio/internal/preview"
@@ -41,6 +42,7 @@ import (
 	"papio/internal/triage"
 	"papio/internal/watch"
 	"papio/internal/work"
+	"papio/internal/zotio"
 )
 
 const (
@@ -62,6 +64,7 @@ const (
 	deliveryContextFeature       = "delivery_context_v1"
 	pageCaptureTermsFeature      = "page_capture_terms_v1"
 	pageBulkAcquireFeature       = "page_bulk_acquire_v1"
+	triageSnapshotSchema3Feature = "triage_snapshot_schema_v3"
 	// pageBulkConsumer is the sole daemon-assigned consumer for every job
 	// created through page_bulk_submit_request (ADR-0019 Decision 6). The
 	// extension never supplies it.
@@ -165,9 +168,14 @@ type holdingsProvider interface {
 // holder still resets the offered/cancelled bookkeeping, which is exactly the
 // recovery an MV3 service-worker restart needs.
 type Bridge struct {
-	jobs         *job.Store
-	svc          *app.Service
-	holdings     holdingsProvider
+	jobs     *job.Store
+	svc      *app.Service
+	holdings holdingsProvider
+	// zotio answers library ownership for page_bulk_status when configured.
+	// nil is a supported, first-class mode (ADR-0008: zotio and the generic
+	// holdings registry never mix) — page_bulk_status then never calls
+	// zotio and behaves exactly as it did before ownership was wired in.
+	zotio        *zotio.Service
 	triage       *triage.Service
 	watchRunner  *watch.Runner
 	preview      *preview.Server
@@ -258,12 +266,14 @@ const pendingExpireAfter = 5 * time.Minute
 
 // NewBridge constructs the bridge. It is cheap and always constructed; whether
 // any job is ever offered depends on config (extension_id / openurl base).
-func NewBridge(jobs *job.Store, svc *app.Service, triageService *triage.Service, watchRunner *watch.Runner, previewServer *preview.Server, captureStore *captures.Store, holdings holdingsProvider, cfg config.Config, version string) *Bridge {
+// zotioService is nil when zotio is not configured (ADR-0008 exclusivity
+// with holdings) — page_bulk_status then never consults it.
+func NewBridge(jobs *job.Store, svc *app.Service, triageService *triage.Service, watchRunner *watch.Runner, previewServer *preview.Server, captureStore *captures.Store, holdings holdingsProvider, zotioService *zotio.Service, cfg config.Config, version string) *Bridge {
 	required := []string{
-		pageAcquireFeature, triageSnapshotFeature, triageSnapshotSchema2Feature, triageMutationsFeature, reviewPreviewFeature, statsFeature, pageCaptureFeature, pageCaptureRequestFeature, activityFeedFeature, triageCountsSchema2Feature, sessionEvidenceFeature, deliveryContextFeature, pageCaptureTermsFeature, pageBulkAcquireFeature,
+		pageAcquireFeature, triageSnapshotFeature, triageSnapshotSchema2Feature, triageMutationsFeature, reviewPreviewFeature, statsFeature, pageCaptureFeature, pageCaptureRequestFeature, activityFeedFeature, triageCountsSchema2Feature, sessionEvidenceFeature, deliveryContextFeature, pageCaptureTermsFeature, pageBulkAcquireFeature, triageSnapshotSchema3Feature,
 	}
 	return &Bridge{
-		jobs: jobs, svc: svc, triage: triageService, watchRunner: watchRunner, preview: previewServer, captureStore: captureStore, holdings: holdings, cfg: cfg,
+		jobs: jobs, svc: svc, triage: triageService, watchRunner: watchRunner, preview: previewServer, captureStore: captureStore, holdings: holdings, zotio: zotioService, cfg: cfg,
 		Version:          version,
 		Features:         required,
 		offered:          map[string]bool{},
@@ -697,7 +707,7 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 	if b.holder == nil || b.holder.ID != sessionID {
 		switch msg.Type {
 		case protocol.MsgPageAcquire, protocol.MsgTriageSnapshotRequest, protocol.MsgTriageCountsRequest,
-			protocol.MsgTriageDecide, protocol.MsgHumanActionResolve, protocol.MsgReviewPreviewRequest, protocol.MsgStatsRequest, protocol.MsgActivityRequest, protocol.MsgPageCapture,
+			protocol.MsgTriageDecide, protocol.MsgHumanActionResolve, protocol.MsgDeliveryReconcileRequest, protocol.MsgReviewPreviewRequest, protocol.MsgStatsRequest, protocol.MsgActivityRequest, protocol.MsgPageCapture,
 			protocol.MsgPageBulkStatusRequest, protocol.MsgPageBulkSubmitRequest:
 			// Stateless request/response traffic works from any browser —
 			// even an outdated one; every frame is protocol-validated
@@ -730,6 +740,9 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 
 	case protocol.MsgHumanActionResolve:
 		return b.humanActionResolve(ctx, msg.Payload.(*protocol.HumanActionResolvePayload))
+
+	case protocol.MsgDeliveryReconcileRequest:
+		return b.deliveryReconcile(ctx, msg.Payload.(*protocol.DeliveryReconcilePayload))
 
 	case protocol.MsgReviewPreviewRequest:
 		return b.reviewPreview(ctx, msg.Payload.(*protocol.ReviewPreviewRequestPayload))
@@ -1044,7 +1057,10 @@ func (b *Bridge) triageSnapshot(ctx context.Context, request *protocol.TriageSna
 		if err != nil {
 			return nil, err
 		}
-		payload := triageSnapshotPayload(request.RequestID, request.SchemaVersions[0], snapshot)
+		payload, err := b.triageSnapshotPayload(ctx, request.RequestID, request.SchemaVersions[0], snapshot)
+		if err != nil {
+			return nil, err
+		}
 		if b.frameFits(protocol.MsgTriageSnapshotResponse, payload) {
 			frame, err := b.frame(protocol.MsgTriageSnapshotResponse, "", payload)
 			if err != nil {
@@ -1059,7 +1075,13 @@ func (b *Bridge) triageSnapshot(ctx context.Context, request *protocol.TriageSna
 	}
 }
 
-func triageSnapshotPayload(requestID string, schema int64, snapshot triage.Snapshot) protocol.TriageSnapshotResponsePayload {
+// triageSnapshotPayload builds one schema's wire shape from a triage
+// snapshot. Schema 3 additionally populates attention/route_class/
+// auth_requirement (dev/post-build-followups.md item 7) and, for a
+// document_delivery human_action, looks up its live delivery_requests row —
+// the only reason this needs ctx and can fail; the v1/v2 emission path
+// below stays byte-identical to what it produced before triage-snapshot/3.
+func (b *Bridge) triageSnapshotPayload(ctx context.Context, requestID string, schema int64, snapshot triage.Snapshot) (protocol.TriageSnapshotResponsePayload, error) {
 	items := make([]protocol.TriageSnapshotItem, 0, len(snapshot.Items))
 	for _, item := range snapshot.Items {
 		payload := protocol.TriageSnapshotItem{
@@ -1081,14 +1103,37 @@ func triageSnapshotPayload(requestID string, schema int64, snapshot triage.Snaps
 				}
 				payload.FirstSeenAt = hit.FirstSeenAt
 			}
+			if schema == 3 {
+				// A new watch hit is informational — nothing is blocked, and
+				// papio is not doing anything on the operator's behalf yet.
+				payload.Attention = "advisory"
+			}
 		case triage.KindHumanAction:
 			action := item.HumanAction
 			if action != nil {
 				payload.ActionID, payload.JobID = action.ActionID, action.JobID
 				payload.ActionKind, payload.JobState = action.ActionKind, action.JobState
 				payload.Revision, payload.SHA256, payload.SizeBytes = action.Revision, action.SHA256, action.SizeBytes
-				if schema == 2 && action.BlockedBy != "" {
+				if schema >= 2 && action.BlockedBy != "" {
 					payload.RequiresAuth, payload.BlockedBy = action.RequiresAuth, action.BlockedBy
+				}
+				if schema == 3 {
+					payload.RouteClass = action.ActionKind
+					payload.AuthRequirement = triageAuthRequirement(action.RequiresAuth)
+					if action.ActionKind == job.ActionKindDocumentDelivery {
+						delivery, err := b.triageDeliveryFor(ctx, action.JobID)
+						if err != nil {
+							return protocol.TriageSnapshotResponsePayload{}, err
+						}
+						payload.Delivery = delivery
+						// Decision 4's three named reconciliation operations
+						// replace the generic dismiss/open ops a document_delivery
+						// action would otherwise inherit — the delivery
+						// sub-object already carries the request to display,
+						// and there is no generic "open" destination.
+						payload.Ops = []string{"open_request_history", "confirm_request_exists", "confirm_request_absent"}
+					}
+					payload.Attention = triageHumanActionAttention(action, payload.Delivery)
 				}
 			}
 		case triage.KindRetraction:
@@ -1098,6 +1143,11 @@ func triageSnapshotPayload(requestID string, schema int64, snapshot triage.Snaps
 				payload.NoticedAt = retraction.NoticedAt.UTC().Format(time.RFC3339Nano)
 				payload.NoticeDOI = retraction.NoticeDOI
 			}
+			if schema == 3 {
+				// A retraction/correction/concern notice: informational, not
+				// blocking anything (r5's "integrity notice = advisory").
+				payload.Attention = "advisory"
+			}
 		}
 		items = append(items, payload)
 	}
@@ -1105,7 +1155,62 @@ func triageSnapshotPayload(requestID string, schema int64, snapshot triage.Snaps
 		RequestID: requestID, Schema: schema, GeneratedAt: snapshot.GeneratedAt,
 		Counts: triageCountsPayload(snapshot.Counts), Items: items, Cursor: snapshot.Cursor,
 		HasMore: snapshot.HasMore, UnsupportedItemsCount: int64(snapshot.UnsupportedItemsCount),
+	}, nil
+}
+
+// triageAuthRequirement is ADR-0016 Decision 4's tri-state carrier, derived
+// from the existing RequiresAuth pointer without changing what that pointer
+// means: nil is "unknown" (no auth classification has been observed for
+// this action yet), and a non-nil value is the classified read.
+func triageAuthRequirement(requiresAuth *bool) string {
+	if requiresAuth == nil {
+		return "unknown"
 	}
+	if *requiresAuth {
+		return "true"
+	}
+	return "false"
+}
+
+// triageHumanActionAttention implements the settled attention mapping from
+// dev/post-build-followups.md item 7: an unknown-auth openurl handoff (a
+// library-link route papio has not yet observed a session state for) and a
+// document_delivery item the provider already fulfilled proceed on their
+// own (working); a document_delivery item still needing reconciliation, or
+// any other action, needs a human decision (required). A known login/MFA
+// boundary (RequiresAuth == true) is covered by the same "required" default.
+func triageHumanActionAttention(action *triage.HumanAction, delivery *protocol.TriageDelivery) string {
+	if action.ActionKind == job.ActionKindDocumentDelivery {
+		if delivery != nil && delivery.State == "fulfilled" {
+			return "working"
+		}
+		return "required"
+	}
+	if action.ActionKind == handoffActionKind && action.RequiresAuth == nil {
+		return "working"
+	}
+	return "required"
+}
+
+// triageDeliveryFor looks up the live delivery_requests row for a
+// document_delivery human action's job and maps it onto the wire's closed
+// delivery sub-object. A missing row (nil, nil) is a routine race — the
+// action closed between the snapshot query and this lookup — and degrades
+// to an absent Delivery rather than failing the whole snapshot.
+func (b *Bridge) triageDeliveryFor(ctx context.Context, jobID string) (*protocol.TriageDelivery, error) {
+	if b.svc == nil || b.svc.Delivery == nil {
+		return nil, nil
+	}
+	req, err := b.svc.Delivery.GetByJobID(ctx, jobID)
+	if err != nil {
+		return nil, err
+	}
+	if req == nil {
+		return nil, nil
+	}
+	return &protocol.TriageDelivery{
+		Provider: req.Provider, ProviderReference: req.ProviderReference, State: string(req.State),
+	}, nil
 }
 
 func triageFacts(facts []triage.Fact) []protocol.TriageFact {
@@ -1446,6 +1551,119 @@ func (b *Bridge) humanActionResolveResult(requestID, outcome, detail string) ([]
 	return []json.RawMessage{frame}, nil
 }
 
+// deliveryReconcile executes one of Decision 4's two document_delivery
+// reconciliation mutations (confirm_request_exists/confirm_request_absent)
+// against a job's open document_delivery human action. It is a new message
+// rather than a widened human_action_resolve — see
+// protocol.DeliveryReconcilePayload's doc comment — and mirrors
+// internal/api/delivery.go's deliveryAction so the two surfaces (CLI/MCP and
+// browser) leave a job in the exact same state for the same operator
+// decision. Every failure encodes into the result frame's outcome/detail
+// (never a raw Go error), matching every other bridge handler.
+func (b *Bridge) deliveryReconcile(ctx context.Context, request *protocol.DeliveryReconcilePayload) ([]json.RawMessage, error) {
+	if b.jobs == nil || b.svc == nil || b.svc.Delivery == nil {
+		return b.deliveryReconcileResult(request.RequestID, "error", "document delivery is not configured")
+	}
+	action, err := b.openDocumentDeliveryAction(ctx, request.JobID)
+	if err != nil {
+		return b.deliveryReconcileResult(request.RequestID, "error", err.Error())
+	}
+	if action == nil {
+		return b.deliveryReconcileResult(request.RequestID, "already_applied", "no open document_delivery action for this job")
+	}
+	row, err := b.svc.Delivery.GetByJobID(ctx, request.JobID)
+	if err != nil {
+		return b.deliveryReconcileResult(request.RequestID, "error", err.Error())
+	}
+	if row == nil {
+		return b.deliveryReconcileResult(request.RequestID, "error", "no delivery request for this job")
+	}
+	switch request.Operation {
+	case "confirm_request_exists":
+		return b.deliveryConfirmRequestExists(ctx, request, action, row)
+	case "confirm_request_absent":
+		return b.deliveryConfirmRequestAbsent(ctx, request, action, row)
+	default:
+		return b.deliveryReconcileResult(request.RequestID, "error", "unknown operation "+request.Operation)
+	}
+}
+
+// openDocumentDeliveryAction finds the one open document_delivery human
+// action Decision 4 says a job in this reconciliation state must have.
+// (nil, nil) means none is open — a routine race with a concurrent
+// resolution, not an error.
+func (b *Bridge) openDocumentDeliveryAction(ctx context.Context, jobID string) (*job.HumanAction, error) {
+	actions, err := b.jobs.ListHumanActionsForJob(ctx, jobID)
+	if err != nil {
+		return nil, err
+	}
+	for _, a := range actions {
+		if a.Action.Kind == job.ActionKindDocumentDelivery && a.Action.Status == "open" {
+			action := a.Action
+			return &action, nil
+		}
+	}
+	return nil, nil
+}
+
+// deliveryConfirmRequestExists mirrors internal/api's deliveryConfirmRequestExists:
+// the row moves to pending with the human-supplied provider reference, the
+// document_delivery action closes, and the job resumes as an ordinary
+// pending delivery poll (StateRetryWait, RetryReasonDocumentDeliveryPending)
+// — never retry_submission.
+func (b *Bridge) deliveryConfirmRequestExists(ctx context.Context, request *protocol.DeliveryReconcilePayload, action *job.HumanAction, row *delivery.Request) ([]json.RawMessage, error) {
+	if err := b.jobs.RepairAwaitingHuman(ctx, request.JobID, []int64{action.ID},
+		map[string]any{"reason": "document_delivery_confirmed_exists"}); err != nil {
+		return b.deliveryReconcileResult(request.RequestID, "error", err.Error())
+	}
+	profile, err := b.svc.Delivery.ResolveGateProfileFor(ctx, row.InstitutionProfile)
+	if err != nil {
+		return b.deliveryReconcileResult(request.RequestID, "error", err.Error())
+	}
+	if err := b.svc.Delivery.UpdateState(ctx, row.ID, delivery.StatePending); err != nil {
+		return b.deliveryReconcileResult(request.RequestID, "error", err.Error())
+	}
+	next := delivery.NextCheck(b.now(), 0, profile.StatusPollMinutes)
+	if err := b.svc.Delivery.RecordPoll(ctx, row.ID, request.ProviderReference, next); err != nil {
+		return b.deliveryReconcileResult(request.RequestID, "error", err.Error())
+	}
+	if err := b.jobs.Transition(ctx, request.JobID, job.StateResolving, job.StateRetryWait,
+		map[string]any{"reason": job.RetryReasonDocumentDeliveryPending, "provider_reference": request.ProviderReference},
+		job.WithRetryAt(next)); err != nil {
+		return b.deliveryReconcileResult(request.RequestID, "error", err.Error())
+	}
+	return b.deliveryReconcileResult(request.RequestID, "applied", "")
+}
+
+// deliveryConfirmRequestAbsent mirrors internal/api's
+// deliveryConfirmRequestAbsent: the stale row is cancelled, the
+// document_delivery action closes, and the job re-enters the shared
+// Branch/gate seam (app.Service.SubmitDelivery) — never a duplicated policy
+// implementation, and never a second live request for this idempotency key.
+func (b *Bridge) deliveryConfirmRequestAbsent(ctx context.Context, request *protocol.DeliveryReconcilePayload, action *job.HumanAction, row *delivery.Request) ([]json.RawMessage, error) {
+	if err := b.svc.Delivery.UpdateState(ctx, row.ID, delivery.StateCancelled); err != nil {
+		return b.deliveryReconcileResult(request.RequestID, "error", err.Error())
+	}
+	if err := b.jobs.RepairAwaitingHuman(ctx, request.JobID, []int64{action.ID},
+		map[string]any{"reason": "document_delivery_confirmed_absent"}); err != nil {
+		return b.deliveryReconcileResult(request.RequestID, "error", err.Error())
+	}
+	if _, err := b.svc.SubmitDelivery(ctx, request.JobID); err != nil {
+		return b.deliveryReconcileResult(request.RequestID, "error", err.Error())
+	}
+	return b.deliveryReconcileResult(request.RequestID, "applied", "")
+}
+
+func (b *Bridge) deliveryReconcileResult(requestID, outcome, detail string) ([]json.RawMessage, error) {
+	frame, err := b.frame(protocol.MsgDeliveryReconcileResult, "", protocol.DeliveryReconcileResultPayload{
+		RequestID: requestID, Outcome: outcome, Detail: truncate(detail, 1000),
+	})
+	if err != nil {
+		return nil, err
+	}
+	return []json.RawMessage{frame}, nil
+}
+
 func (b *Bridge) reviewPreview(ctx context.Context, request *protocol.ReviewPreviewRequestPayload) ([]json.RawMessage, error) {
 	if b.jobs == nil || b.preview == nil {
 		return b.reviewPreviewError(request.RequestID, "review preview is not configured")
@@ -1601,13 +1819,21 @@ func (b *Bridge) pageAcquireError(err error) ([]json.RawMessage, error) {
 // identifiers (ADR-0019 Decision 5). It keeps no daemon-side scan-state: scan_id
 // is opaque correlation supplied by the caller and is only ever echoed back
 // (Decision 4 — the selection sheet lives in the extension, never the daemon).
-// Ownership is consulted only after durable job history has no live or
-// previously-unavailable verdict. A nil provider, partial lookup, or failed
-// lookup is unknown rather than not-owned (ADR-0008 invariant 2).
+// A positive zotio claim (see pageBulkStatusItem) is consulted before a live
+// or previously-unavailable job verdict; every other case follows the prior
+// job-history-first order. A nil provider, partial lookup, or failed lookup
+// is unknown rather than not-owned (ADR-0008 invariant 2).
 func (b *Bridge) pageBulkStatus(ctx context.Context, request *protocol.PageBulkStatusRequestPayload) ([]json.RawMessage, error) {
+	zotioLookup := b.pageBulkZotioLookup(ctx, request.Identifiers)
 	items := make([]protocol.PageBulkStatusItem, 0, len(request.Identifiers))
 	for _, id := range request.Identifiers {
-		items = append(items, b.pageBulkStatusItem(ctx, id))
+		items = append(items, b.pageBulkStatusItem(ctx, id, zotioLookup))
+	}
+	if err := b.recordPageBulkScan(ctx, request, items, b.now().UTC()); err != nil {
+		// The measurement row is local-only funnel telemetry (ADR-0019
+		// Decision 10), not part of the status contract: losing it must
+		// never turn an otherwise-successful lookup into a bridge error.
+		log.Printf("papio: recording page-bulk scan: %v", err)
 	}
 	truncated := false
 	for {
@@ -1629,21 +1855,164 @@ func (b *Bridge) pageBulkStatus(ctx context.Context, request *protocol.PageBulkS
 	}
 }
 
+// recordPageBulkScan writes the local-only measurement row for one
+// page_bulk_status_request (ADR-0019 Decision 10; dev/post-build-followups.md
+// item 3). Unlike recordPageBulkRun (one row per submit attempt, keyed by a
+// real batch_id), this row's batch_id stays "": pageBulkStatus and
+// pageBulkSubmit still keep no daemon-side scan-state to correlate a status
+// call with a later submit call (their own doc comments), so this is a
+// genuinely separate row, not a two-phase update of one. That lets it
+// honestly report the funnel counts a status call actually computed —
+// detected_raw, canonical_unique, and the per-status breakdown — instead of
+// leaving them at the schema's zero default, which recordPageBulkRun's own
+// doc comment already accepts for submit-only rows. detector_id and
+// source_origin stay "": page_bulk_status_request carries neither (ADR-0019
+// keeps origin extension-side until submit), so this is an honest "unknown",
+// never fabricated. RenderedRecordCountHint (nil when the page's structure
+// was not recognized) is stored as-is — a null denominator, never a guess.
+func (b *Bridge) recordPageBulkScan(ctx context.Context, request *protocol.PageBulkStatusRequestPayload, items []protocol.PageBulkStatusItem, at time.Time) error {
+	canonicalKeys := make(map[string]bool, len(items))
+	var eligible, ownedWithPDF, ownedMissingPDF, queued, ownershipIncomplete, invalid int
+	for _, item := range items {
+		if item.CanonicalKey != "" {
+			canonicalKeys[item.CanonicalKey] = true
+		}
+		switch item.Status {
+		case "eligible", "previously_unavailable":
+			// previously_unavailable is historical, not a durable exclusion
+			// (ADR-0019 Decision 5) and is not one of the funnel's fixed
+			// columns; it folds into eligible, the bucket that already
+			// means "still selectable".
+			eligible++
+		case "owned_with_pdf":
+			ownedWithPDF++
+		case "owned_missing_pdf":
+			ownedMissingPDF++
+		case "queued":
+			queued++
+		case "invalid":
+			invalid++
+		default:
+			// ownership_incomplete and ownership_unknown (ADR-0008: an
+			// unavailable/stale lookup is never a plain negative fact)
+			// share one bucket here: neither is a confident classification,
+			// and folding any future status into it fails closed rather
+			// than silently dropping counts.
+			ownershipIncomplete++
+		}
+	}
+	ts := at.Format(time.RFC3339Nano)
+	_, err := b.jobs.S.DB().ExecContext(ctx, `
+		INSERT INTO page_bulk_runs
+			(detector_id, source_origin, detected_raw, canonical_unique, eligible, owned_with_pdf, owned_missing_pdf, queued, ownership_incomplete, invalid, batch_id, opened_at, rendered_record_count_hint)
+		VALUES ('', '', ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?)`,
+		len(request.Identifiers), len(canonicalKeys), eligible, ownedWithPDF, ownedMissingPDF, queued, ownershipIncomplete, invalid, ts,
+		request.RenderedRecordCountHint)
+	return err
+}
+
+// zotioLookupChunkSize is zotio.Service.LookupWorks' batch bound (1-50). A
+// page can report up to 200 identifiers, so a full page chunks into up to 4
+// zotio calls.
+const zotioLookupChunkSize = 50
+
+// zotioOwnership is one identifier's zotio classification, keyed by
+// canonical key ("<kind>:<value>", matching PageBulkStatusItem.CanonicalKey).
+// stale marks a classification that must never be painted as a plain
+// negative: either its whole batch call failed, or zotio's mirror sync
+// could not complete this round (status is then a best-effort, possibly
+// zero, value).
+type zotioOwnership struct {
+	status  string
+	itemKey string
+	stale   bool
+}
+
+// pageBulkZotioLookup classifies every DOI/arXiv/PMID identifier from one
+// status request against the user's Zotero library via zotio.Service,
+// chunked to LookupWorks' bound, and logs the round's latency once. A nil
+// service is the supported "not configured" mode (ADR-0008: zotio and the
+// generic holdings registry never mix) and short-circuits without ever
+// calling zotio, so page_bulk_status behaves exactly as it did before zotio
+// ownership was wired in.
+func (b *Bridge) pageBulkZotioLookup(ctx context.Context, ids []protocol.PageBulkIdentifier) map[string]zotioOwnership {
+	if b.zotio == nil {
+		return nil
+	}
+	type entry struct {
+		key  string
+		work zotio.LookupWork
+	}
+	entries := make([]entry, 0, len(ids))
+	for _, id := range ids {
+		kind, value, err := normalizePageBulkIdentifier(id.Kind, id.Value)
+		if err != nil {
+			continue
+		}
+		var work zotio.LookupWork
+		switch kind {
+		case ownership.KindDOI:
+			work.DOI = value
+		case ownership.KindArXiv:
+			work.ArXiv = value
+		case ownership.KindPMID:
+			work.PMID = value
+		default:
+			continue
+		}
+		entries = append(entries, entry{key: kind + ":" + value, work: work})
+	}
+	if len(entries) == 0 {
+		return nil
+	}
+	start := b.now()
+	result := make(map[string]zotioOwnership, len(entries))
+	for offset := 0; offset < len(entries); offset += zotioLookupChunkSize {
+		end := offset + zotioLookupChunkSize
+		if end > len(entries) {
+			end = len(entries)
+		}
+		chunk := entries[offset:end]
+		request := zotio.LookupWorksRequest{Works: make([]zotio.LookupWork, len(chunk))}
+		for i, e := range chunk {
+			request.Works[i] = e.work
+		}
+		lookup, err := b.zotio.LookupWorks(ctx, request)
+		stale := err != nil || (lookup != nil && strings.TrimSpace(lookup.StalenessWarning) != "")
+		for i, e := range chunk {
+			if err != nil || lookup == nil || i >= len(lookup.Works) {
+				result[e.key] = zotioOwnership{stale: true}
+				continue
+			}
+			work := lookup.Works[i]
+			result[e.key] = zotioOwnership{status: work.Status, itemKey: work.ItemKey, stale: stale}
+		}
+	}
+	log.Printf("papio: page-bulk zotio lookup: %d works in %s", len(entries), b.now().Sub(start).Round(time.Millisecond))
+	return result
+}
+
 // pageBulkStatusItem resolves one identifier. Job-store or holdings failures
 // are reported as ownership_incomplete rather than propagated as Go errors:
-// routine read-model failures must not tear down the native-messaging session.
-func (b *Bridge) pageBulkStatusItem(ctx context.Context, id protocol.PageBulkIdentifier) protocol.PageBulkStatusItem {
+// routine read-model failures must not tear down the native-messaging
+// session. zotioLookup (nil when zotio is unconfigured) is merged with
+// papio's own job/holdings state under a fixed precedence: papio ready
+// bundle, then zotio owned_with_pdf, then zotio owned_missing_pdf (carrying
+// the Zotero item key), then a live canonical job (queued), then a past
+// terminal-unavailable verdict, then a complete negative lookup (eligible);
+// an unavailable/stale zotio round is reported as ownership_unknown, never
+// collapsed into a plain not-owned/"eligible" claim (ADR-0008 invariant 2).
+func (b *Bridge) pageBulkStatusItem(ctx context.Context, id protocol.PageBulkIdentifier, zotioLookup map[string]zotioOwnership) protocol.PageBulkStatusItem {
 	kind, value, err := normalizePageBulkIdentifier(id.Kind, id.Value)
 	if err != nil {
 		return protocol.PageBulkStatusItem{LocalID: id.LocalID, Status: "invalid"}
 	}
 	item := protocol.PageBulkStatusItem{LocalID: id.LocalID, CanonicalKey: kind + ":" + value}
 	liveJobID, readyJobID, previouslyUnavailable, lookupErr := b.canonicalJobStatus(ctx, kind, value)
+	zotioResult, hasZotio := zotioLookup[item.CanonicalKey]
 	switch {
 	case lookupErr != nil:
 		item.Status = "ownership_incomplete"
-	case liveJobID != "":
-		item.Status, item.JobID = "queued", liveJobID
 	case readyJobID != "":
 		// papio already holds a validated bundle for this work: the freshest
 		// possible PDF-present claim, complete by construction. The wire
@@ -1651,17 +2020,33 @@ func (b *Bridge) pageBulkStatusItem(ctx context.Context, id protocol.PageBulkIde
 		// watch), so the ready job's id stays daemon-side.
 		item.Status = "owned_with_pdf"
 		item.OwnershipComplete = true
+	case hasZotio && zotioResult.status == zotio.OwnershipOwnedWithPDF:
+		item.Status = "owned_with_pdf"
+		item.OwnershipComplete = true
+	case hasZotio && zotioResult.status == zotio.OwnershipOwnedMissingPDF:
+		item.Status = "owned_missing_pdf"
+		item.OwnershipComplete = true
+		item.ZotioItemKey = zotioResult.itemKey
+	case liveJobID != "":
+		item.Status, item.JobID = "queued", liveJobID
 	case previouslyUnavailable:
 		item.Status = "previously_unavailable"
 	default:
 		decision, complete := b.pageBulkOwnership(ctx, pageBulkOwnershipQuery(kind, value))
-		item.OwnershipComplete = complete
+		// zotioConfident is true only when this round actually reached zotio
+		// and got back a trustworthy (non-stale) answer, which — having
+		// fallen through the owned_with_pdf/owned_missing_pdf cases above —
+		// can only be a confident not-owned verdict here.
+		zotioConfident := hasZotio && !zotioResult.stale
+		item.OwnershipComplete = complete || zotioConfident
 		switch {
 		case decision.Suppress:
 			item.Status = "owned_with_pdf"
 		case decision.RecordPresent:
 			item.Status = "owned_missing_pdf"
-		case complete:
+		case hasZotio && zotioResult.stale:
+			item.Status = "ownership_unknown"
+		case complete || zotioConfident:
 			item.Status = "eligible"
 		default:
 			item.Status = "ownership_incomplete"
@@ -3052,6 +3437,12 @@ func (b *Bridge) offer(row job.Row, action job.HumanAction, accessMode string) (
 	offerURL := RouteURL(inst, row.Work)
 	if oaURL, ok := app.OABrowserHandoffURL(action.Detail); ok {
 		offerURL = oaURL
+	}
+	if retrievalURL, ok := app.DocumentDeliveryRetrievalHandoffURL(action.Detail); ok {
+		// ADR-0017's 2026-08-07 amendment: a fulfilled document-delivery
+		// request's form-75 "View PDF" URL, not the institution's
+		// ordinary resolver route.
+		offerURL = retrievalURL
 	}
 	hosts := []string{}
 	if h := resolverHost(offerURL); h != "" {

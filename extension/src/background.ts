@@ -3553,7 +3553,9 @@ export class Bridge {
    * its PageCapture result, then checked field-by-field before use. */
   private async executePageScan(
     tabID: number,
-  ): Promise<{ ok: true; items: DetectedPaper[]; truncated: boolean } | BrokerFailure> {
+  ): Promise<
+    { ok: true; items: DetectedPaper[]; truncated: boolean; renderedRecordCountHint: number | null } | BrokerFailure
+  > {
     let injected: { result?: unknown } | undefined;
     try {
       [injected] = await this.deps.scripting.executeScript({ target: { tabId: tabID }, func: scanDocument });
@@ -3564,11 +3566,17 @@ export class Bridge {
     if (
       scanned === undefined ||
       !Array.isArray(scanned.papers) ||
-      typeof scanned.truncated !== "boolean"
+      typeof scanned.truncated !== "boolean" ||
+      (scanned.renderedRecordCountHint !== null && typeof scanned.renderedRecordCountHint !== "number")
     ) {
       return this.failure("scan_failed", "Could not scan the page");
     }
-    return { ok: true, items: scanned.papers, truncated: scanned.truncated };
+    return {
+      ok: true,
+      items: scanned.papers,
+      truncated: scanned.truncated,
+      renderedRecordCountHint: scanned.renderedRecordCountHint,
+    };
   }
 
   private async loadPageBulkStore(): Promise<PageBulkScanStore> {
@@ -3601,6 +3609,7 @@ export class Bridge {
       documentGeneration: 1,
       items: scanned.items,
       truncated: scanned.truncated,
+      renderedRecordCountHint: scanned.renderedRecordCountHint,
     };
     await this.savePageBulkSnapshot(snapshot);
     return { ok: true, snapshot };
@@ -3642,6 +3651,7 @@ export class Bridge {
       documentGeneration: existing.documentGeneration + 1,
       items: scanned.items,
       truncated: scanned.truncated,
+      renderedRecordCountHint: scanned.renderedRecordCountHint,
     };
     await this.savePageBulkSnapshot(snapshot);
     return { ok: true, snapshot };
@@ -3663,7 +3673,7 @@ export class Bridge {
   }
 
   async requestPageBulkStatus(
-    request: { scan_id: string; identifiers: PageBulkIdentifier[] },
+    request: { scan_id: string; identifiers: PageBulkIdentifier[]; rendered_record_count_hint?: number },
   ): Promise<BrokerReply<{ items: PageBulkStatusItem[]; truncated: boolean }>> {
     const result = await this.requestNative(
       "page_bulk_status_request",
@@ -7468,12 +7478,16 @@ function isPageBulkIdentifier(value: unknown): value is PageBulkIdentifier {
 
 function isPageBulkStatusRuntimeRequest(
   value: unknown,
-): value is { scan_id: string; identifiers: PageBulkIdentifier[] } {
-  if (!isObjectRecord(value) || !hasOnlyKeys(value, ["scan_id", "identifiers"])) return false;
+): value is { scan_id: string; identifiers: PageBulkIdentifier[]; rendered_record_count_hint?: number } {
+  if (!isObjectRecord(value) || !hasOnlyKeys(value, ["scan_id", "identifiers", "rendered_record_count_hint"])) return false;
   const scanID = value["scan_id"];
   const identifiers = value["identifiers"];
   if (typeof scanID !== "string" || scanID.length === 0 || scanID.length > 128) return false;
   if (!Array.isArray(identifiers) || identifiers.length < 1 || identifiers.length > 200) return false;
+  if ("rendered_record_count_hint" in value) {
+    const hint = value["rendered_record_count_hint"];
+    if (typeof hint !== "number" || !Number.isInteger(hint) || hint < 0) return false;
+  }
   return identifiers.every(isPageBulkIdentifier);
 }
 

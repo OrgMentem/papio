@@ -66,6 +66,11 @@ type DeliveryBlocker struct {
 type DeliveryGateSummary struct {
 	Class    string            `json:"class"`
 	Blockers []DeliveryBlocker `json:"blockers,omitempty"`
+	// FulfillmentChannel is "" or "patron_web" (2026-08-07 ADR-0017
+	// amendment): the compiled end-to-end retrieval capability, distinct
+	// from Class — a profile can be auto_capable for submission with no
+	// fulfillment channel.
+	FulfillmentChannel string `json:"fulfillment_channel,omitempty"`
 }
 
 func deliveryGateSummaryFrom(profile delivery.GateProfile) DeliveryGateSummary {
@@ -73,17 +78,18 @@ func deliveryGateSummaryFrom(profile delivery.GateProfile) DeliveryGateSummary {
 	for _, b := range profile.Blockers {
 		blockers = append(blockers, DeliveryBlocker{Code: b.Code, Evidence: b.Evidence})
 	}
-	return DeliveryGateSummary{Class: string(profile.Class), Blockers: blockers}
+	return DeliveryGateSummary{Class: string(profile.Class), Blockers: blockers, FulfillmentChannel: profile.FulfillmentChannel}
 }
 
 // DeliveryGateEvent is the redaction-safe delivery.gate_evaluated verdict
 // papio actually recorded for a job (Decision 3B), read back rather than
 // recomputed so an explanation never disagrees with a since-edited profile.
 type DeliveryGateEvent struct {
-	ProfileClass  string   `json:"profile_class"`
-	ProfileDigest string   `json:"profile_digest,omitempty"`
-	Decision      string   `json:"decision"`
-	Blockers      []string `json:"blockers,omitempty"`
+	ProfileClass       string   `json:"profile_class"`
+	ProfileDigest      string   `json:"profile_digest,omitempty"`
+	Decision           string   `json:"decision"`
+	Blockers           []string `json:"blockers,omitempty"`
+	FulfillmentChannel string   `json:"fulfillment_channel,omitempty"`
 }
 
 func deliveryGateEventFrom(evt *delivery.GateEvaluated) *DeliveryGateEvent {
@@ -93,6 +99,7 @@ func deliveryGateEventFrom(evt *delivery.GateEvaluated) *DeliveryGateEvent {
 	return &DeliveryGateEvent{
 		ProfileClass: string(evt.ProfileClass), ProfileDigest: evt.ProfileDigest,
 		Decision: string(evt.Decision.Action), Blockers: evt.Decision.Blockers,
+		FulfillmentChannel: evt.FulfillmentChannel,
 	}
 }
 

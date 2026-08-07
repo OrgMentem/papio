@@ -553,6 +553,24 @@
         transition: background-color var(--transition-fast);
       }
 
+      /* attention (triage-snapshot/3) drives an accent stripe independent of
+         the per-kind status glyph above: working items are muted because
+         papio is proceeding on its own, required items get an emphasized
+         accent because they need a decision, and advisory items get a quiet
+         informational accent. Replaces inferring urgency from action_kind
+         or requires_auth. */
+      .triage-item[data-attention="working"] {
+        opacity: 0.82;
+      }
+
+      .triage-item[data-attention="required"] {
+        border-inline-start: 3px solid var(--color-danger-border);
+      }
+
+      .triage-item[data-attention="advisory"] {
+        border-inline-start: 3px solid var(--color-primary-border);
+      }
+
       .triage-group > .triage-item:first-of-type {
         border-top: 1px solid var(--color-border);
         border-top-left-radius: var(--radius-card);
@@ -621,6 +639,35 @@
       }
 
       .item-facts dd {
+        color: var(--color-context);
+        font-size: var(--font-size-small);
+        margin: 0;
+        min-width: 0;
+        overflow-wrap: anywhere;
+        word-break: break-word;
+      }
+
+      .item-delivery {
+        align-items: baseline;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0 var(--space-1);
+        min-width: 0;
+      }
+
+      .item-delivery dt {
+        color: var(--color-muted);
+        font-size: var(--font-size-label);
+        font-weight: 700;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+      }
+
+      .item-delivery dt:not(:first-child) {
+        margin-left: var(--space-2);
+      }
+
+      .item-delivery dd {
         color: var(--color-context);
         font-size: var(--font-size-small);
         margin: 0;
@@ -706,6 +753,12 @@
         background: var(--color-danger-surface);
         border-color: var(--color-danger-border);
         color: var(--color-danger);
+      }
+
+      .item-status[data-status="document_delivery"] {
+        background: var(--color-warning-surface);
+        border-color: var(--color-warning-border);
+        color: var(--color-warning);
       }
 
       /* Bibliographic metadata and next-action copy stay quiet; supporting
@@ -1118,6 +1171,7 @@
         <span class="item-status" data-status="manual_download" aria-hidden="true">↓</span><span>manual download</span>
         <span class="item-status" data-status="openurl_handoff" aria-hidden="true">↗</span><span>browser handoff</span>
         <span class="item-status" data-status="verify_identity" aria-hidden="true">?</span><span>verify identity</span>
+        <span class="item-status" data-status="document_delivery" aria-hidden="true">⇄</span><span>document delivery</span>
         <span class="item-status" data-status="watch_hit" aria-hidden="true">✶</span><span>watch hit</span>
         <span class="item-status" data-status="retraction" aria-hidden="true">!</span><span>retraction</span>
       </p>

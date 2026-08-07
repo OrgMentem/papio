@@ -276,6 +276,17 @@ type DocumentDelivery struct {
 	// personal identity data: 0600 config only, redacted from events,
 	// diagnostics, and delivery provenance (ADR-0017 Decision 2).
 	PatronRef string `toml:"patron_ref,omitempty"`
+	// PatronWebBaseURL is the patron-facing request-management portal base
+	// (https), distinct from BaseURL (the API base for kind = illiad).
+	// Configured only — never derived from BaseURL/api_base_url, because an
+	// institution's ILLiad Web Platform API host and its patron-facing
+	// OPAC/ILLiadWeb host are commonly different deployments. Absent means
+	// absent: a fulfilled request then opens the ADR-0017 Decision 4
+	// reconciliation action instead of an automatic patron-web retrieval
+	// route (see the 2026-08-07 amendment). Permitted only for kind =
+	// illiad — set on a form-kind profile it is dead config, exactly like
+	// APIKey above.
+	PatronWebBaseURL string `toml:"patron_web_base_url,omitempty"`
 }
 
 // Zotio configures the credential-owning Zotero CLI boundary. papio invokes
@@ -963,6 +974,17 @@ func validateDocumentDelivery(prefix string, d *DocumentDelivery) error {
 		// custom route to a form the browser opens and never call an API
 		// with a credential (ADR-0017 Decision 2).
 		return fmt.Errorf("%sapi_key is set but kind is %q, not \"illiad\" (a key on a form-kind profile is dead config)", prefix, kind)
+	}
+	if d.PatronWebBaseURL != "" {
+		if err := validateOpenURLBase(d.PatronWebBaseURL); err != nil {
+			return fmt.Errorf("%spatron_web_base_url %w", prefix, err)
+		}
+		if kind != "illiad" {
+			// Same fail-closed rule as api_key above: only illiad's
+			// fulfilled-request retrieval route (2026-08-07 ADR-0017
+			// amendment) ever reads this field.
+			return fmt.Errorf("%spatron_web_base_url is set but kind is %q, not \"illiad\" (a form-kind profile has no fulfilled-request retrieval route; this is dead config)", prefix, kind)
+		}
 	}
 	return nil
 }

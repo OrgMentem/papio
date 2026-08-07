@@ -97,6 +97,7 @@ const (
 type LookupWork struct {
 	DOI   string `json:"doi,omitempty"`
 	ArXiv string `json:"arxiv,omitempty"`
+	PMID  string `json:"pmid,omitempty"`
 }
 
 // LookupWorksRequest is the internal RPC input for bounded batch
@@ -243,6 +244,13 @@ func normalizedLookupIdentifiers(item LookupWork) ([]lookupIdentifier, error) {
 			return nil, fmt.Errorf("normalizing arXiv ID: %w", err)
 		}
 		identifiers = append(identifiers, lookupIdentifier{kind: "arxiv", value: arxiv})
+	}
+	if raw := strings.TrimSpace(item.PMID); raw != "" {
+		pmid, err := work.NormalizePMID(raw)
+		if err != nil {
+			return nil, fmt.Errorf("normalizing PMID: %w", err)
+		}
+		identifiers = append(identifiers, lookupIdentifier{kind: "pmid", value: pmid})
 	}
 	return identifiers, nil
 }

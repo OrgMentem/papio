@@ -45,6 +45,8 @@ export type BrowserMessageType =
   | "triage_decide_result"
   | "human_action_resolve"
   | "human_action_resolve_result"
+  | "delivery_reconcile_request"
+  | "delivery_reconcile_result"
   | "review_preview_request"
   | "review_preview_result"
   | "stats_request"
@@ -212,14 +214,14 @@ export interface TriageCounts {
 
 export interface TriageSnapshotRequestPayload {
   request_id: string;
-  schema_versions: [1];
+  schema_versions: [1] | [2] | [3];
   limit?: number;
   cursor?: string;
 }
 
 export interface TriageSnapshotResponsePayload {
   request_id: string;
-  schema: 1;
+  schema: 1 | 2 | 3;
   generated_at: string;
   counts: TriageCounts;
   items: TriageSnapshotItem[];
@@ -245,7 +247,19 @@ export interface TriageSnapshotItem {
   title: string;
   facts: TriageFact[];
   links: TriageLink[];
-  ops: Array<"acquire" | "dismiss" | "accept" | "reject" | "open" | "retry">;
+  ops: Array<
+    | "acquire"
+    | "dismiss"
+    | "accept"
+    | "reject"
+    | "open"
+    | "retry"
+    | "open_request_history"
+    | "confirm_request_exists"
+    | "confirm_request_absent"
+  >;
+  /** Required on every schema-3 item, forbidden below (triage-snapshot/3). */
+  attention?: "working" | "required" | "advisory";
   work?: { doi: string; title: string; authors: string; year: number; is_oa: boolean };
   abstract?: string;
   watches?: Array<{ id: number; label: string }>;
@@ -258,11 +272,40 @@ export interface TriageSnapshotItem {
   sha256?: string;
   size_bytes?: number;
   requires_auth?: boolean;
-  blocked_by?: "anti_bot" | "paywall" | "landing_page";
+  blocked_by?: "anti_bot" | "paywall" | "landing_page" | "login" | "terms" | "delivery_outcome" | "identity_review" | "unknown";
+  /** Required on schema-3 human_action items, forbidden below/elsewhere:
+   * the existing action-kind vocabulary formalized into a fixed enum, plus
+   * document_delivery, decoupled from action_kind's open one (ADR-0016
+   * Decision 4). */
+  route_class?:
+    | "openurl_handoff"
+    | "manual_download"
+    | "verify_identity"
+    | "openurl_available"
+    | "human_auth_required"
+    | "terms_acceptance_required"
+    | "document_delivery";
+  /** ADR-0016 Decision 4's tri-state auth carrier as a string enum (never a
+   * bare bool): required on schema-3 human_action items, forbidden below.
+   * requires_auth stays the narrow execution gate; only this may drive
+   * presentation copy. */
+  auth_requirement?: "true" | "false" | "unknown";
+  /** Present only on a document_delivery human_action item (schema 3). */
+  delivery?: TriageDelivery;
   doi?: string;
   nature?: "retraction" | "correction" | "concern";
   noticed_at?: string;
   notice_doi?: string;
+}
+
+/** triage-snapshot/3's document_delivery sub-object: the observed provider
+ * request a document_delivery human_action item is reconciling. "fulfilled"
+ * means the provider supplied the document — never that papio holds
+ * trusted bytes yet (ADR-0017). */
+export interface TriageDelivery {
+  provider: string;
+  provider_reference?: string;
+  state: "submitted" | "pending" | "fulfilled" | "declined" | "cancelled" | "unknown_outcome";
 }
 
 export interface TriageCountsRequestPayload {
@@ -294,6 +337,27 @@ export interface HumanActionResolvePayload {
   verdict: "accept" | "reject" | "dismiss";
   expected_revision: number;
   expected_sha256?: string;
+}
+
+/** Asks the daemon to perform one of triage-snapshot/3's document_delivery
+ * reconciliation mutations (ADR-0017 Decision 4) against a job's open
+ * document_delivery human action. A new message rather than a widened
+ * human_action_resolve — that payload's verdict vocabulary is closed to
+ * accept/reject/dismiss against a CAS candidate binding.
+ * open_request_history is deliberately absent: it never mutates anything,
+ * so the inbox renders it from the item's own delivery sub-object instead
+ * of a round trip. */
+export interface DeliveryReconcilePayload {
+  request_id: string;
+  job_id: string;
+  operation: "confirm_request_exists" | "confirm_request_absent";
+  provider_reference?: string;
+}
+
+export interface DeliveryReconcileResultPayload {
+  request_id: string;
+  outcome: "applied" | "already_applied" | "conflict" | "error";
+  detail?: string;
 }
 
 export interface ReviewPreviewRequestPayload {
@@ -363,10 +427,16 @@ export interface PageBulkIdentifier {
   value: string;
 }
 
+/** rendered_record_count_hint is an honest structural denominator: set only
+ * when page-scan.ts recognizes the page's result-list shape (definition-list
+ * rows, repeated card containers, reference-list items) and counts the
+ * visible records without reading their contents. Omitted, never null, when
+ * no shape is recognized (dev/post-build-followups.md item 3). */
 export interface PageBulkStatusRequestPayload {
   request_id: string;
   scan_id: string;
   identifiers: PageBulkIdentifier[];
+  rendered_record_count_hint?: number;
 }
 
 export type PageBulkStatus =
@@ -376,6 +446,7 @@ export type PageBulkStatus =
   | "queued"
   | "previously_unavailable"
   | "ownership_incomplete"
+  | "ownership_unknown"
   | "invalid";
 
 export interface PageBulkStatusItem {
@@ -387,6 +458,9 @@ export interface PageBulkStatusItem {
   ownership_complete: boolean;
   /** Present only when status is "queued". */
   job_id?: string;
+  /** Present only when status is "owned_missing_pdf" and the match came
+   * from a zotio library lookup — the existing Zotero parent item key. */
+  zotio_item_key?: string;
 }
 
 export interface PageBulkStatusResultPayload {
@@ -466,6 +540,8 @@ const MSG_TYPES: Record<string, true> = {
   triage_decide_result: true,
   human_action_resolve: true,
   human_action_resolve_result: true,
+  delivery_reconcile_request: true,
+  delivery_reconcile_result: true,
   review_preview_request: true,
   review_preview_result: true,
   stats_request: true,
@@ -506,6 +582,9 @@ const OUTCOMES: Record<string, true> = {
 
 const MSG_ID_RE = /^[A-Za-z0-9_-]{8,64}$/;
 const JOB_ID_RE = /^[A-Za-z0-9_-]{8,128}$/;
+// ZOTERO_KEY_RE must stay byte-identical to zoteroKeyRE in
+// internal/protocol/protocol.go.
+const ZOTERO_KEY_RE = /^[A-Za-z0-9]{1,32}$/;
 const HOST_RE = /^[a-z0-9.-]{3,253}$/;
 // ORIGIN_HOST_RE is the resolver-origin host grammar used ONLY by
 // session_evidence.origin_hint (see the validation block below for why it
@@ -660,7 +739,24 @@ function triageCounts(raw: unknown, what: string, allowAuth = false): void {
   if (pending !== visible) fail(`${what}.pending_total must equal visible item counts`);
 }
 
-function triageItem(raw: unknown, schema: 1 | 2): void {
+const ROUTE_CLASSES = [
+  "openurl_handoff",
+  "manual_download",
+  "verify_identity",
+  "openurl_available",
+  "human_auth_required",
+  "terms_acceptance_required",
+  "document_delivery",
+];
+
+// blockedByV2 is schema 2's exact closed set, shipped and locked: a
+// schema-2 frame must never carry a value outside it. blockedByV3 is
+// schema 3's strict superset — the new values only ever appear on schema
+// 3, never overloading or reinterpreting a v2 value's meaning.
+const BLOCKED_BY_V2 = ["anti_bot", "paywall", "landing_page"];
+const BLOCKED_BY_V3 = [...BLOCKED_BY_V2, "login", "terms", "delivery_outcome", "identity_review", "unknown"];
+
+function triageItem(raw: unknown, schema: 1 | 2 | 3): void {
   const item = asRecord(raw, "triage item");
   const core = ["kind", "id", "rank", "title", "facts", "links", "ops"];
   const kind = triageText(item, "kind", "triage item", 50);
@@ -678,9 +774,22 @@ function triageItem(raw: unknown, schema: 1 | 2): void {
     default:
       fail(`unsupported triage item kind ${JSON.stringify(kind)}`);
   }
-  const optional = kind === "human_action" && schema === 2
-    ? ["requires_auth", "blocked_by"]
-    : kind === "retraction" ? ["notice_doi"] : [];
+  // attention is required on every schema-3 item and forbidden below;
+  // route_class/auth_requirement are required on schema-3 human_action
+  // items and forbidden below (triage-snapshot/3). Putting them in the
+  // required list for schema 3 and leaving them out entirely otherwise
+  // makes requireKeys enforce both directions: present-and-required, or
+  // absent-because-unknown-field.
+  if (schema >= 3) {
+    extra = [...extra, "attention"];
+    if (kind === "human_action") extra = [...extra, "route_class", "auth_requirement"];
+  }
+  const optional =
+    kind === "human_action" && schema >= 2
+      ? ["requires_auth", "blocked_by", ...(schema >= 3 ? ["delivery"] : [])]
+      : kind === "retraction"
+        ? ["notice_doi"]
+        : [];
   requireKeys(item, `triage item ${kind}`, [...core, ...extra], optional);
   if (triageText(item, "id", `triage item ${kind}`, 1024) === "") fail("triage item.id is required");
   int(item, "rank", `triage item ${kind}`, 0);
@@ -706,10 +815,18 @@ function triageItem(raw: unknown, schema: 1 | 2): void {
   if (!Array.isArray(ops)) fail("triage item.ops must be an array");
   const seenOps = new Set<string>();
   for (const rawOp of ops) {
-    if (typeof rawOp !== "string" || !["acquire", "dismiss", "accept", "reject", "open", "retry"].includes(rawOp) || seenOps.has(rawOp)) {
+    if (
+      typeof rawOp !== "string" ||
+      !["acquire", "dismiss", "accept", "reject", "open", "retry", "open_request_history", "confirm_request_exists", "confirm_request_absent"].includes(rawOp) ||
+      seenOps.has(rawOp)
+    ) {
       fail("triage item.ops contains an invalid or repeated operation");
     }
     seenOps.add(rawOp);
+  }
+  if (schema >= 3) {
+    const attention = triageText(item, "attention", "triage item", 20);
+    if (!["working", "required", "advisory"].includes(attention)) fail("triage item.attention is invalid");
   }
   if (kind === "watch_hit") {
     const work = asRecord(item["work"], "watch_hit.work");
@@ -736,13 +853,14 @@ function triageItem(raw: unknown, schema: 1 | 2): void {
     int(item, "action_id", "human_action", 1);
     const jobID = triageText(item, "job_id", "human_action", 128);
     if (!JOB_ID_RE.test(jobID)) fail("human_action.job_id is invalid");
-    if (triageText(item, "action_kind", "human_action", 100) === "") fail("human_action.action_kind is required");
+    const actionKind = triageText(item, "action_kind", "human_action", 100);
+    if (actionKind === "") fail("human_action.action_kind is required");
     if (triageText(item, "job_state", "human_action", 50) === "") fail("human_action.job_state is required");
     int(item, "revision", "human_action", 1);
     const sha = triageText(item, "sha256", "human_action", 64);
     if (sha !== "" && !/^[a-f0-9]{64}$/.test(sha)) fail("human_action.sha256 must be lowercase SHA-256");
     int(item, "size_bytes", "human_action", 0);
-    if (schema === 2) {
+    if (schema >= 2) {
       if (("requires_auth" in item) !== ("blocked_by" in item)) {
         fail("human_action.requires_auth and blocked_by must be present together");
       }
@@ -751,8 +869,28 @@ function triageItem(raw: unknown, schema: 1 | 2): void {
       }
       if ("blocked_by" in item) {
         const blockedBy = triageText(item, "blocked_by", "human_action", 50);
-        if (!["anti_bot", "paywall", "landing_page"].includes(blockedBy)) {
+        const allowedBlockedBy = schema >= 3 ? BLOCKED_BY_V3 : BLOCKED_BY_V2;
+        if (!allowedBlockedBy.includes(blockedBy)) {
           fail("human_action.blocked_by is invalid");
+        }
+      }
+    }
+    if (schema >= 3) {
+      const routeClass = triageText(item, "route_class", "human_action", 100);
+      if (!ROUTE_CLASSES.includes(routeClass)) fail("human_action.route_class is invalid");
+      const authRequirement = triageText(item, "auth_requirement", "human_action", 10);
+      if (!["true", "false", "unknown"].includes(authRequirement)) fail("human_action.auth_requirement is invalid");
+      if ("delivery" in item) {
+        if (actionKind !== "document_delivery") fail("human_action.delivery is only valid for document_delivery items");
+        const delivery = asRecord(item["delivery"], "human_action.delivery");
+        requireKeys(delivery, "human_action.delivery", ["provider", "state"], ["provider_reference"]);
+        if (triageText(delivery, "provider", "human_action.delivery", 100) === "") {
+          fail("human_action.delivery.provider is required");
+        }
+        if ("provider_reference" in delivery) triageText(delivery, "provider_reference", "human_action.delivery", 300);
+        const state = triageText(delivery, "state", "human_action.delivery", 20);
+        if (!["submitted", "pending", "fulfilled", "declined", "cancelled", "unknown_outcome"].includes(state)) {
+          fail("human_action.delivery.state is invalid");
         }
       }
     }
@@ -1218,8 +1356,8 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
       requireFields<TriageSnapshotRequestPayload>(p, "triage_snapshot_request", { request_id: "required", schema_versions: "required", limit: "optional", cursor: "optional" });
       correlationID(p, "request_id", "triage_snapshot_request");
       const versions = p["schema_versions"];
-      if (!Array.isArray(versions) || versions.length !== 1 || (versions[0] !== 1 && versions[0] !== 2)) {
-        fail("triage_snapshot_request.schema_versions must be [1] or [2]");
+      if (!Array.isArray(versions) || versions.length !== 1 || (versions[0] !== 1 && versions[0] !== 2 && versions[0] !== 3)) {
+        fail("triage_snapshot_request.schema_versions must be [1], [2], or [3]");
       }
       if ("limit" in p) int(p, "limit", "triage_snapshot_request", 1);
       if ("limit" in p && (p["limit"] as number) > 100) fail("triage_snapshot_request.limit must be <= 100");
@@ -1238,8 +1376,8 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
         unsupported_items_count: "required",
       });
       correlationID(p, "request_id", "triage_snapshot_response");
-      if (p["schema"] !== 1 && p["schema"] !== 2) fail("triage_snapshot_response.schema must be 1 or 2");
-      const schema = p["schema"] as 1 | 2;
+      if (p["schema"] !== 1 && p["schema"] !== 2 && p["schema"] !== 3) fail("triage_snapshot_response.schema must be 1, 2, or 3");
+      const schema = p["schema"] as 1 | 2 | 3;
       triageTime(p, "generated_at", "triage_snapshot_response");
       triageCounts(p["counts"], "triage_snapshot_response.counts");
       const items = p["items"];
@@ -1314,6 +1452,32 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
     }
     case "human_action_resolve_result":
       triageResult(p, "human_action_resolve_result");
+      break;
+    case "delivery_reconcile_request": {
+      requireFields<DeliveryReconcilePayload>(p, "delivery_reconcile_request", {
+        request_id: "required",
+        job_id: "required",
+        operation: "required",
+        provider_reference: "optional",
+      });
+      correlationID(p, "request_id", "delivery_reconcile_request");
+      const jobID = str(p, "job_id", "delivery_reconcile_request", 128);
+      if (!JOB_ID_RE.test(jobID)) fail("delivery_reconcile_request.job_id is invalid");
+      const operation = triageText(p, "operation", "delivery_reconcile_request", 30);
+      if (operation !== "confirm_request_exists" && operation !== "confirm_request_absent") {
+        fail("delivery_reconcile_request.operation must be confirm_request_exists or confirm_request_absent");
+      }
+      if (operation === "confirm_request_exists") {
+        if (!("provider_reference" in p) || triageText(p, "provider_reference", "delivery_reconcile_request", 300) === "") {
+          fail("delivery_reconcile_request.provider_reference is required for confirm_request_exists");
+        }
+      } else if ("provider_reference" in p) {
+        fail("delivery_reconcile_request.provider_reference is only valid for confirm_request_exists");
+      }
+      break;
+    }
+    case "delivery_reconcile_result":
+      triageResult(p, "delivery_reconcile_result");
       break;
     case "review_preview_request": {
       requireFields<ReviewPreviewRequestPayload>(p, "review_preview_request", { request_id: "required", action_id: "required" });
@@ -1437,6 +1601,7 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
         request_id: "required",
         scan_id: "required",
         identifiers: "required",
+        rendered_record_count_hint: "optional",
       });
       correlationID(p, "request_id", "page_bulk_status_request");
       correlationID(p, "scan_id", "page_bulk_status_request");
@@ -1461,6 +1626,7 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
         const value = triageText(identifier, "value", "page_bulk_status_request.identifiers", 512);
         if (value === "") fail("page_bulk_status_request.identifiers.value is required");
       }
+      if ("rendered_record_count_hint" in p) int(p, "rendered_record_count_hint", "page_bulk_status_request", 0);
       break;
     }
     case "page_bulk_status_result": {
@@ -1483,6 +1649,7 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
           status: "required",
           ownership_complete: "required",
           job_id: "optional",
+          zotio_item_key: "optional",
         });
         const localID = triageText(item, "local_id", "page_bulk_status_result.items", 128);
         if (localID === "") fail("page_bulk_status_result.items.local_id is required");
@@ -1490,9 +1657,16 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
         seenItemIDs.add(localID);
         const status = str(item, "status", "page_bulk_status_result.items", 30);
         if (
-          !["eligible", "owned_with_pdf", "owned_missing_pdf", "queued", "previously_unavailable", "ownership_incomplete", "invalid"].includes(
-            status,
-          )
+          ![
+            "eligible",
+            "owned_with_pdf",
+            "owned_missing_pdf",
+            "queued",
+            "previously_unavailable",
+            "ownership_incomplete",
+            "ownership_unknown",
+            "invalid",
+          ].includes(status)
         ) {
           fail("page_bulk_status_result.items.status is invalid");
         }
@@ -1511,6 +1685,12 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
           if (status !== "queued") fail("page_bulk_status_result.items.job_id is only valid for queued");
           if (!JOB_ID_RE.test(str(item, "job_id", "page_bulk_status_result.items", 128))) {
             fail("page_bulk_status_result.items.job_id is invalid");
+          }
+        }
+        if ("zotio_item_key" in item) {
+          if (status !== "owned_missing_pdf") fail("page_bulk_status_result.items.zotio_item_key is only valid for owned_missing_pdf");
+          if (!ZOTERO_KEY_RE.test(str(item, "zotio_item_key", "page_bulk_status_result.items", 32))) {
+            fail("page_bulk_status_result.items.zotio_item_key is invalid");
           }
         }
       }

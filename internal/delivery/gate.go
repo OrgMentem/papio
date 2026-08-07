@@ -15,6 +15,13 @@ const (
 	GateClassInvalid     GateClass = "invalid"
 )
 
+// FulfillmentChannelPatronWeb is the only fulfillment channel v1 compiles
+// (2026-08-07 ADR-0017 amendment "Fulfillment retrieval"): the patron-web
+// "View PDF" page (ILLiad Web Platform form 75), driven through the
+// ordinary browser-handoff machinery once a request reaches fulfilled.
+// GateProfile.FulfillmentChannel is "" when no channel compiles.
+const FulfillmentChannelPatronWeb = "patron_web"
+
 // Blocker vocabulary (ADR-0017 Decision 3A) — closed, exactly these 13
 // strings. A blocker code may appear more than once on a profile with
 // different Evidence text; the vocabulary itself never grows ad hoc.
@@ -103,6 +110,19 @@ type GateProfile struct {
 	StatusPollMinutes       int
 	RequiresOperatorStep    bool // any per_request_* blocker was compiled
 	LiveAccepted            bool
+
+	// FulfillmentChannel is the 2026-08-07 ADR-0017 amendment's compiled
+	// retrieval capability: FulfillmentChannelPatronWeb when kind=illiad
+	// and patron_web_base_url is configured, else "". It is independent of
+	// Class/auto_if_unconditional — a profile can be auto_capable for
+	// SUBMISSION (creating the request) with an empty FulfillmentChannel,
+	// meaning papio still routes a fulfilled request to the Decision 4
+	// manual reconciliation action rather than an automatic patron-web
+	// retrieval: submission-auto is not end-to-end-auto. See
+	// documentDeliveryOrUnset/doctor's document_delivery:*:result line and
+	// GateEvaluated.FulfillmentChannel for the other two surfaces this
+	// distinction is required to reach.
+	FulfillmentChannel string
 }
 
 // CompileGateProfile compiles the static half of Decision 3A: the
@@ -133,6 +153,14 @@ func CompileGateProfile(inst config.Institution, profileName string) GateProfile
 	profile.PatronFeePolicy = dd.PatronFeePolicy
 	profile.MonthlyRequestCap = dd.MonthlyRequestCap
 	profile.StatusPollMinutes = dd.StatusPollMinutes
+	if dd.Kind == "illiad" && dd.PatronWebBaseURL != "" {
+		// Independent of Class: compiles alongside prefill_only just as
+		// readily as auto_capable — a profile whose submission stays
+		// human still gets automatic retrieval once *something* (a human
+		// submission, or a future auto-submit) lands the request
+		// fulfilled.
+		profile.FulfillmentChannel = FulfillmentChannelPatronWeb
+	}
 
 	capa, known := providerCapabilities[dd.Kind]
 	if !known {

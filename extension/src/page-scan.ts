@@ -29,8 +29,16 @@ export interface DetectedPaper {
  * an earlier DetectedPaper[] & {truncated} shape returned perfectly from
  * the page and arrived in the extension with `truncated` gone, failing the
  * background's shape check on every scan. Truncation is reported, never
- * silent (Decision 3). */
-export type ScanResult = { papers: DetectedPaper[]; truncated: boolean };
+ * silent (Decision 3).
+ *
+ * renderedRecordCountHint is the honest structural denominator behind
+ * page_bulk_status_request.rendered_record_count_hint
+ * (dev/post-build-followups.md item 3): a count of visible result records
+ * for a page whose result-list shape scanDocument recognizes structurally
+ * (definition-list rows, repeated card containers, reference-list items),
+ * without reading their contents. null when no such shape is recognized —
+ * never a guess. */
+export type ScanResult = { papers: DetectedPaper[]; truncated: boolean; renderedRecordCountHint: number | null };
 
 /** Raw-candidate cap before the scan stops walking the DOM (Decision 3). */
 export const PAGE_BULK_RAW_CANDIDATE_CAP = 200;
@@ -145,6 +153,79 @@ export function scanDocument(root: Document | Element = document): ScanResult {
     const src = el.getAttribute("src");
     const href = el.getAttribute("href");
     return EXTENSION_URL_RE.test(src ?? "") || EXTENSION_URL_RE.test(href ?? "");
+  }
+
+  // ADR-0019 Decision 3's existing structural vocabulary — a <dl>/<dt> pair
+  // (definition-list rows) and a reference/citation list — plus a dedicated
+  // card-class selector, reused here to count RENDERED result records
+  // honestly, never to read their contents: no title, URL, query, or docid
+  // is inspected, only tagName/className/id and sibling structure. This is
+  // deliberately narrower than CONTAINER_SELECTOR (used elsewhere only to
+  // find the nearest citation-shaped ANCESTOR for labeling, tolerant of
+  // "li, tr, p, article"): counting bare <p>/<li>/<tr> siblings would flag
+  // an ordinary long-form article's paragraphs as "rendered result
+  // records", so family 3 requires an explicit result/card/record class.
+  // Only currently-attached DOM nodes are ever counted, so an unrendered or
+  // virtualized-away row is structurally invisible to this same query,
+  // never counted (the follow-up's "never count via ...
+  // unrendered/virtualized rows" requirement holds by construction, not by
+  // a separate check). No network call is ever made.
+  const REFERENCE_LIST_RE = /\b(?:reference|citation|bibliograph)/i;
+  const CARD_SELECTOR = "[class*='result'], [class*='card'], [class*='record']";
+
+  /** The largest sibling group matching `selector`, grouped by (parent,
+   * tagName). A homogeneous repeated run under one parent is exactly what
+   * "repeated card containers" and "definition-list rows" both are —
+   * `dl > dt` and CARD_SELECTOR both resolve through this one helper. */
+  function largestSiblingGroup(selector: string): number {
+    let candidates: Element[];
+    try {
+      candidates = Array.from(doc.querySelectorAll(selector));
+    } catch {
+      return 0;
+    }
+    const groups = new Map<Element, Map<string, number>>();
+    let best = 0;
+    for (const el of candidates) {
+      if (isHiddenSelf(el) || isExtensionInjected(el)) continue;
+      const parent = el.parentElement;
+      if (parent === null) continue;
+      let byTag = groups.get(parent);
+      if (byTag === undefined) {
+        byTag = new Map();
+        groups.set(parent, byTag);
+      }
+      const count = (byTag.get(el.tagName) ?? 0) + 1;
+      byTag.set(el.tagName, count);
+      if (count > best) best = count;
+    }
+    return best;
+  }
+
+  /** Honest structural denominator (dev/post-build-followups.md item 3):
+   * tries each recognized page-class family in turn and returns the first
+   * one that clears a 2-record floor (a single stray element is not a
+   * "list"). Returns null — never a guess — when no family is recognized. */
+  function countStructuralRecords(): number | null {
+    const definitionListRows = largestSiblingGroup("dl > dt");
+    if (definitionListRows >= 2) return definitionListRows;
+
+    let referenceListItems = 0;
+    for (const list of Array.from(doc.querySelectorAll("ul, ol"))) {
+      if (isHiddenSelf(list) || isExtensionInjected(list)) continue;
+      if (!REFERENCE_LIST_RE.test(list.className) && !REFERENCE_LIST_RE.test(list.id)) continue;
+      let items = 0;
+      for (const child of Array.from(list.children)) {
+        if (child.tagName === "LI" && !isHiddenSelf(child) && !isExtensionInjected(child)) items += 1;
+      }
+      if (items > referenceListItems) referenceListItems = items;
+    }
+    if (referenceListItems >= 2) return referenceListItems;
+
+    const repeatedCards = largestSiblingGroup(CARD_SELECTOR);
+    if (repeatedCards >= 2) return repeatedCards;
+
+    return null;
   }
 
   // textContent would also pick up script/style bodies and hidden nodes, so
@@ -406,7 +487,7 @@ export function scanDocument(root: Document | Element = document): ScanResult {
       occurrences: entry.occurrences,
     });
   }
-	return { papers, truncated };
+	return { papers, truncated, renderedRecordCountHint: countStructuralRecords() };
 }
 
 // ---------------------------------------------------------------------------
@@ -427,6 +508,9 @@ export interface PageBulkSnapshot {
   documentGeneration: number;
   items: DetectedPaper[];
   truncated: boolean;
+  /** ScanResult.renderedRecordCountHint, carried through unchanged for
+   * page-bulk.ts to attach to page_bulk_status_request. */
+  renderedRecordCountHint: number | null;
 }
 
 export interface PageBulkScanStore {

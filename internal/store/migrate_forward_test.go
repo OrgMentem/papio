@@ -55,8 +55,8 @@ func TestOpenRollsForwardSchemaThirteenTagLedger(t *testing.T) {
 	}
 	defer migrated.Close()
 	version, err := migrated.UserVersion(ctx)
-	if err != nil || version != 22 {
-		t.Fatalf("user_version = %d, %v; want 22", version, err)
+	if err != nil || version != 24 {
+		t.Fatalf("user_version = %d, %v; want 24", version, err)
 	}
 	var status string
 	if err := migrated.DB().QueryRowContext(ctx,
@@ -120,8 +120,8 @@ func TestOpenRollsForwardSchemaOneWithoutLosingDurableRows(t *testing.T) {
 	}
 	defer migrated.Close()
 	version, err := migrated.UserVersion(ctx)
-	if err != nil || version != 22 {
-		t.Fatalf("user_version = %d, %v; want 22", version, err)
+	if err != nil || version != 24 {
+		t.Fatalf("user_version = %d, %v; want 24", version, err)
 	}
 
 	var jobs, actions, exports int
