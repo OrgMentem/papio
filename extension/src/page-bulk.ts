@@ -105,6 +105,7 @@ interface PageElements {
   statusErrorMessage: HTMLElement;
   statusRetryButton: HTMLButtonElement;
   truncatedNote: HTMLElement;
+  ownershipNote: HTMLElement;
   workspaceMain: HTMLElement;
   rows: HTMLElement;
   emptyState: HTMLElement;
@@ -322,6 +323,7 @@ function renderBanners(): void {
   // that are seconds from being discarded, so gate it the same way the
   // Rescan button itself is gated.
   elements.statusRetryButton.disabled = state.rescanning || state.snapshot === null;
+  elements.ownershipNote.hidden = !ownershipUnclearOnly();
 }
 
 function rowStatusText(row: RowState): string {
@@ -335,12 +337,80 @@ function isRowCheckable(row: RowState): boolean {
   return !row.submitted && isEligibleStatus(row.status);
 }
 
-function buildRow(row: RowState): HTMLElement {
+// The identifier line doubles as the row's outbound link, built exactly the
+// way inbox.ts's citationAnchor builds its DOI link (fixed origin, _blank,
+// rel="noopener noreferrer"). Only the identifier's own value is
+// interpolated, and it is percent-encoded first: these values were lifted
+// off a page papio does not control, so they never reach the URL's
+// structure.
+const IDENTIFIER_URL: Record<DetectedPaper["identifier"]["kind"], (encoded: string) => string> = {
+  doi: (encoded) => `https://doi.org/${encoded}`,
+  arxiv: (encoded) => `https://arxiv.org/abs/${encoded}`,
+  pmid: (encoded) => `https://pubmed.ncbi.nlm.nih.gov/${encoded}/`,
+};
+
+function identifierURL(identifier: DetectedPaper["identifier"]): string | null {
+  const value = identifier.value.trim();
+  if (value === "") return null;
+  // encodeURI keeps a DOI suffix's meaningful slashes; the two structural
+  // characters it leaves alone would still cut the path short, so escape
+  // those by hand.
+  const encoded = encodeURI(value).replace(/#/g, "%23").replace(/\?/g, "%3F");
+  return IDENTIFIER_URL[identifier.kind](encoded);
+}
+
+const IDENTIFIER_PREFIX_RE =
+  /(?:\b(?:doi|arxiv|pmid)\s*:\s*|https?:\/\/(?:dx\.)?doi\.org\/|https?:\/\/arxiv\.org\/abs\/)\s*$/i;
+
+/** Page-derived labels routinely carry the very identifier this row already
+ * prints on its own linked line ("Some Title doi:10.1234/x"). Mirrors
+ * inbox.ts's renderCitation rule — a row whose displayed title is already
+ * the DOI does not repeat that link — from the other side: here the label
+ * is what gets trimmed. Display only; the row's `label` and the
+ * background's snapshot keep the full page text. */
+function displayLabel(row: RowState): string {
+  const label = row.label;
+  const value = row.identifier.value;
+  if (value === "") return label;
+  const at = label.toLowerCase().indexOf(value.toLowerCase());
+  if (at < 0) return label;
+  let start = at;
+  let end = at + value.length;
+  const prefix = IDENTIFIER_PREFIX_RE.exec(label.slice(0, start));
+  if (prefix !== null) start -= prefix[0].length;
+  // "Some Title (doi:10.1234/x)" loses the whole parenthetical, not just
+  // its contents.
+  const opener = label[start - 1];
+  const closer = label[end];
+  if ((opener === "(" && closer === ")") || (opener === "[" && closer === "]")) {
+    start -= 1;
+    end += 1;
+  }
+  const trimmed = `${label.slice(0, start)}${label.slice(end)}`
+    .replace(/\s+/g, " ")
+    .replace(/^[\s.,;:|·\u2013\u2014-]+|[\s.,;:|·\u2013\u2014-]+$/g, "");
+  // A label that is nothing but its identifier has nothing left to show,
+  // and the checkbox still needs an accessible name: keep it whole.
+  return trimmed === "" ? label : trimmed;
+}
+
+/** Decision 5 leaves "ownership unclear" eligible, so a daemon that cannot
+ * see the library at all stamps every row with the same badge and the badge
+ * stops carrying information. Collapse it into one explanation under the
+ * header; any mixed result keeps its per-row badges. */
+function ownershipUnclearOnly(): boolean {
+  if (!state.statusLoaded) return false;
+  const graded = state.rows.filter((row) => row.status !== "invalid");
+  return graded.length > 0 && graded.every((row) => row.status === "ownership_incomplete");
+}
+
+function buildRow(row: RowState, ownershipCollapsed: boolean): HTMLElement {
   const wrapper = element("div");
   wrapper.className = "pb-row";
   wrapper.dataset.localId = row.localId;
   wrapper.dataset.status = row.submitted ? "submitted" : (row.status ?? "pending");
   wrapper.dataset.disabled = String(!isRowCheckable(row));
+  const labelText = displayLabel(row);
 
   const checkboxId = `pb-row-check-${row.localId}`;
   const checkbox = element("input");
@@ -348,7 +418,7 @@ function buildRow(row: RowState): HTMLElement {
   checkbox.id = checkboxId;
   checkbox.checked = row.selected;
   checkbox.disabled = !isRowCheckable(row);
-  checkbox.setAttribute("aria-label", `Select ${row.label}`);
+  checkbox.setAttribute("aria-label", `Select ${labelText}`);
   checkbox.addEventListener("change", () => {
     row.selected = checkbox.checked;
     render();
@@ -358,19 +428,36 @@ function buildRow(row: RowState): HTMLElement {
   const content = element("div");
   content.className = "pb-row-content";
 
-  const label = element("label", row.label);
+  const label = element("label", labelText);
   label.className = "pb-row-label";
   label.htmlFor = checkboxId;
   content.append(label);
 
   const meta = element("div");
   meta.className = "pb-row-meta";
-  const identifier = element("span", `${KIND_LABEL[row.identifier.kind]}: ${row.identifier.value}`);
+  const identifier = element("span");
   identifier.className = "pb-row-identifier";
+  const kind = element("span", `${KIND_LABEL[row.identifier.kind]}:`);
+  kind.className = "pb-row-kind";
+  identifier.append(kind, document.createTextNode(" "));
+  const url = identifierURL(row.identifier);
+  if (url === null) {
+    identifier.append(document.createTextNode(row.identifier.value));
+  } else {
+    const link = element("a", row.identifier.value);
+    link.className = "pb-row-link";
+    link.href = url;
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    identifier.append(link);
+  }
   meta.append(identifier);
-  const status = element("span", rowStatusText(row));
-  status.className = "pb-row-status";
-  meta.append(status);
+  const collapsedHere = ownershipCollapsed && !row.submitted && row.status === "ownership_incomplete";
+  if (!collapsedHere) {
+    const status = element("span", rowStatusText(row));
+    status.className = "pb-row-status";
+    meta.append(status);
+  }
   if (row.occurrences > 1) meta.append(element("span", `seen ${row.occurrences}×`));
   content.append(meta);
 
@@ -380,8 +467,9 @@ function buildRow(row: RowState): HTMLElement {
 
 function renderRows(): void {
   if (elements === null) return;
+  const ownershipCollapsed = ownershipUnclearOnly();
   elements.emptyState.hidden = state.rows.length !== 0;
-  elements.rows.replaceChildren(...state.rows.map(buildRow));
+  elements.rows.replaceChildren(...state.rows.map((row) => buildRow(row, ownershipCollapsed)));
 }
 
 function updatePrimaryButton(): void {
@@ -679,6 +767,7 @@ function bootstrap(): void {
   const statusErrorMessage = document.getElementById("status-error-message");
   const statusRetryButton = document.getElementById("status-retry-btn");
   const truncatedNote = document.getElementById("truncated-note");
+  const ownershipNote = document.getElementById("ownership-unclear-note");
   const workspaceMain = document.getElementById("workspace-main");
   const rows = document.getElementById("rows");
   const emptyState = document.getElementById("empty-state");
@@ -700,6 +789,7 @@ function bootstrap(): void {
     !(statusErrorMessage instanceof HTMLElement) ||
     !(statusRetryButton instanceof HTMLButtonElement) ||
     !(truncatedNote instanceof HTMLElement) ||
+    !(ownershipNote instanceof HTMLElement) ||
     !(workspaceMain instanceof HTMLElement) ||
     !(rows instanceof HTMLElement) ||
     !(emptyState instanceof HTMLElement) ||
@@ -724,6 +814,7 @@ function bootstrap(): void {
     statusErrorMessage,
     statusRetryButton,
     truncatedNote,
+    ownershipNote,
     workspaceMain,
     rows,
     emptyState,

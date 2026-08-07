@@ -198,6 +198,73 @@ test("renders one row per paper with label, identifier, and status text", async 
   expect(row(page.document, "id-2")?.querySelector(".pb-row-identifier")?.textContent).toBe("arXiv: 2101.00001");
 });
 
+test("every identifier line links to its canonical resolver, opened safely in a new tab", async () => {
+  const snap = snapshot({
+    items: [
+      paper({ localId: "id-1", identifier: { kind: "doi", value: "10.1234/abcd.5678" } }),
+      paper({ localId: "id-2", identifier: { kind: "arxiv", value: "2101.00001" } }),
+      paper({ localId: "id-3", identifier: { kind: "pmid", value: "31234567" } }),
+    ],
+  });
+  const page = await pageBulkDocument(
+    "scan-1",
+    standardReply(snap, [eligibleStatus("id-1"), eligibleStatus("id-2"), eligibleStatus("id-3")]),
+  );
+
+  const expected: Record<string, string> = {
+    "id-1": "https://doi.org/10.1234/abcd.5678",
+    "id-2": "https://arxiv.org/abs/2101.00001",
+    "id-3": "https://pubmed.ncbi.nlm.nih.gov/31234567/",
+  };
+  for (const [localId, href] of Object.entries(expected)) {
+    const link = row(page.document, localId)?.querySelector("a.pb-row-link");
+    expect(link?.getAttribute("href")).toBe(href);
+    expect(link?.getAttribute("target")).toBe("_blank");
+    expect(link?.getAttribute("rel")).toBe("noopener noreferrer");
+  }
+  // The link text is the bare identifier; the kind stays an unlinked prefix.
+  expect(row(page.document, "id-1")?.querySelector("a.pb-row-link")?.textContent).toBe("10.1234/abcd.5678");
+  expect(row(page.document, "id-1")?.querySelector(".pb-row-kind")?.textContent).toBe("DOI:");
+});
+
+test("a DOI that breaks URL structure is percent-encoded before it reaches the href", async () => {
+  const snap = snapshot({ items: [paper({ localId: "id-1", identifier: { kind: "doi", value: "10.1234/a b#c?d" } })] });
+  const page = await pageBulkDocument("scan-1", standardReply(snap, [eligibleStatus("id-1")]));
+  expect(row(page.document, "id-1")?.querySelector("a.pb-row-link")?.getAttribute("href")).toBe(
+    "https://doi.org/10.1234/a%20b%23c%3Fd",
+  );
+});
+
+test("a label that already repeats its identifier shows it once, on the link", async () => {
+  const snap = snapshot({
+    items: [
+      paper({ localId: "id-1", identifier: { kind: "doi", value: "10.1234/abcd.5678" }, label: "Trust in peer review doi:10.1234/abcd.5678" }),
+      paper({ localId: "id-2", identifier: { kind: "doi", value: "10.1234/wxyz.1111" }, label: "Replication at scale (DOI: 10.1234/WXYZ.1111)" }),
+      paper({ localId: "id-3", identifier: { kind: "arxiv", value: "2101.00001" }, label: "https://arxiv.org/abs/2101.00001 — Attention revisited" }),
+    ],
+  });
+  const page = await pageBulkDocument(
+    "scan-1",
+    standardReply(snap, [eligibleStatus("id-1"), eligibleStatus("id-2"), eligibleStatus("id-3")]),
+  );
+
+  expect(row(page.document, "id-1")?.querySelector(".pb-row-label")?.textContent).toBe("Trust in peer review");
+  expect(row(page.document, "id-2")?.querySelector(".pb-row-label")?.textContent).toBe("Replication at scale");
+  expect(row(page.document, "id-3")?.querySelector(".pb-row-label")?.textContent).toBe("Attention revisited");
+  // Display-only: the identifier itself is untouched and still submitted.
+  expect(row(page.document, "id-2")?.querySelector("a.pb-row-link")?.textContent).toBe("10.1234/wxyz.1111");
+  expect(row(page.document, "id-2")?.querySelector(".pb-row-identifier")?.textContent).toBe("DOI: 10.1234/wxyz.1111");
+});
+
+test("a label that is nothing but its identifier keeps its text rather than rendering an unnamed row", async () => {
+  const snap = snapshot({
+    items: [paper({ localId: "id-1", identifier: { kind: "doi", value: "10.1234/abcd.5678" }, label: "10.1234/abcd.5678" })],
+  });
+  const page = await pageBulkDocument("scan-1", standardReply(snap, [eligibleStatus("id-1")]));
+  expect(row(page.document, "id-1")?.querySelector(".pb-row-label")?.textContent).toBe("10.1234/abcd.5678");
+  expect(checkbox(page.document, "id-1")?.getAttribute("aria-label")).toBe("Select 10.1234/abcd.5678");
+});
+
 test("owned_with_pdf rows are unchecked and disabled", async () => {
   const snap = snapshot();
   const page = await pageBulkDocument(
@@ -255,6 +322,56 @@ test("owned_missing_pdf, ownership_incomplete, and previously_unavailable rows s
     expect(checkbox(page.document, id)?.disabled).toBe(false);
   }
   expect(row(page.document, "id-3")?.querySelector(".pb-row-status")?.textContent).toBe("No route previously");
+});
+
+// --- collapsed ownership-unclear state ---------------------------------------
+
+test("when every non-invalid row is ownership_incomplete the badges collapse into one note", async () => {
+  const snap = snapshot({
+    items: [
+      paper({ localId: "id-1" }),
+      paper({ localId: "id-2", identifier: { kind: "pmid", value: "111" } }),
+      paper({ localId: "id-3", identifier: { kind: "pmid", value: "222" } }),
+    ],
+  });
+  const page = await pageBulkDocument(
+    "scan-1",
+    standardReply(snap, [
+      { local_id: "id-1", canonical_key: "work:1", status: "ownership_incomplete", ownership_complete: false },
+      { local_id: "id-2", canonical_key: "work:2", status: "ownership_incomplete", ownership_complete: false },
+      // An invalid row never had ownership to check, so it does not break the collapse.
+      { local_id: "id-3", status: "invalid", ownership_complete: false },
+    ]),
+  );
+
+  const note = page.document.getElementById("ownership-unclear-note");
+  expect(note?.hidden).toBe(false);
+  expect(note?.textContent?.trim()).toBe(
+    "papio can't check your library from this daemon configuration; duplicates are still prevented when you acquire",
+  );
+  expect(row(page.document, "id-1")?.querySelector(".pb-row-status")).toBeNull();
+  expect(row(page.document, "id-2")?.querySelector(".pb-row-status")).toBeNull();
+  // Suppressed for that state only — the invalid row keeps its own badge.
+  expect(row(page.document, "id-3")?.querySelector(".pb-row-status")?.textContent).toBe("Not a recognized identifier");
+  // Collapsing is display-only: the rows stay eligible and selectable.
+  expect(checkbox(page.document, "id-1")?.disabled).toBe(false);
+});
+
+test("a mixed status result keeps per-row ownership badges and hides the collapsed note", async () => {
+  const snap = snapshot({
+    items: [paper({ localId: "id-1" }), paper({ localId: "id-2", identifier: { kind: "pmid", value: "111" } })],
+  });
+  const page = await pageBulkDocument(
+    "scan-1",
+    standardReply(snap, [
+      { local_id: "id-1", canonical_key: "work:1", status: "ownership_incomplete", ownership_complete: false },
+      eligibleStatus("id-2"),
+    ]),
+  );
+
+  expect(page.document.getElementById("ownership-unclear-note")?.hidden).toBe(true);
+  expect(row(page.document, "id-1")?.querySelector(".pb-row-status")?.textContent).toBe("Ownership unclear");
+  expect(row(page.document, "id-2")?.querySelector(".pb-row-status")?.textContent).toBe("Eligible");
 });
 
 // --- selection morphing, 50-cap ---------------------------------------------

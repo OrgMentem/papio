@@ -48,6 +48,10 @@
         --radius-control: 6px;
         --radius-card: 8px;
         --control-height: 36px;
+        --brand-mark-size: 32px;
+        --focus-width: 2px;
+        --focus-offset: 2px;
+        --transition-fast: 140ms ease-out;
         --page-max-width: 60rem;
         accent-color: var(--color-primary);
         color: var(--color-ink);
@@ -96,6 +100,11 @@
         display: none !important;
       }
 
+      h1,
+      p {
+        margin: 0;
+      }
+
       body {
         background: var(--color-page);
         color: var(--color-ink);
@@ -104,49 +113,127 @@
         margin: 0 auto;
         max-width: var(--page-max-width);
         min-height: 100vh;
-        padding: var(--space-8) var(--space-6) var(--space-8);
+        padding: var(--space-8) var(--space-6);
       }
 
+      /* Header parity with inbox.html/options.html: the mark, the wordmark,
+         and the page name, with this page's own scan context as the
+         subordinate line beneath (indented to the wordmark, not the mark). */
       header {
         border-bottom: 1px solid var(--color-border);
-        display: flex;
-        flex-wrap: wrap;
-        align-items: baseline;
-        justify-content: space-between;
-        gap: var(--space-3);
-        padding-bottom: var(--space-4);
+        display: grid;
+        gap: var(--space-2);
+        padding-bottom: var(--space-3);
       }
 
       .brand {
-        font-size: var(--font-size-title);
-        font-weight: 700;
+        align-items: center;
+        display: flex;
+        gap: var(--space-3);
       }
 
-      .brand em {
-        color: var(--color-brand-accent);
-        font-style: normal;
+      .brand svg {
+        flex: 0 0 auto;
+        height: var(--brand-mark-size);
+        width: var(--brand-mark-size);
+      }
+
+      .brand-name {
+        color: var(--color-brand-ink);
+        font-size: var(--font-size-title);
+        font-weight: 700;
+        letter-spacing: 0.01em;
+        line-height: 1.2;
+      }
+
+      .brand-name em {
+        text-decoration-color: var(--color-brand-accent);
+        text-decoration-line: underline;
+        text-decoration-thickness: 2px;
+        text-underline-offset: var(--space-1);
+      }
+
+      .page-name {
+        color: var(--color-muted);
+        font-weight: 500;
       }
 
       #scan-context {
-        text-align: right;
+        align-items: baseline;
+        display: flex;
+        flex-wrap: wrap;
+        font-size: var(--font-size-small);
+        gap: var(--space-1) var(--space-2);
+        padding-left: calc(var(--brand-mark-size) + var(--space-3));
       }
 
       #scan-title {
         color: var(--color-ink);
         font-weight: 600;
-        margin: 0;
+        overflow-wrap: anywhere;
       }
 
       #scan-meta {
         color: var(--color-muted);
-        font-size: var(--font-size-small);
-        margin: var(--space-1) 0 0;
       }
 
-      #scan-summary {
+      #scan-meta:not(:empty)::before {
+        content: "·";
+        padding-right: var(--space-2);
+      }
+
+      /* The action bar rides directly under the header and pins to the
+         viewport so the primary control — and the submit feedback it
+         produces — stay in view while a 200-row list scrolls past. */
+      #action-bar {
+        align-items: center;
+        background: var(--color-page);
+        border-bottom: 1px solid var(--color-border);
+        display: flex;
+        flex-wrap: wrap;
+        gap: var(--space-2) var(--space-3);
+        margin-bottom: var(--space-4);
+        padding-block: var(--space-3);
+        position: sticky;
+        top: 0;
+        z-index: 1;
+      }
+
+      .action-secondary {
+        align-items: center;
+        display: flex;
+        flex-wrap: wrap;
+        gap: var(--space-2);
+        margin-left: auto;
+      }
+
+      #source-closed-note {
+        color: var(--color-muted);
+        font-size: var(--font-size-small);
+      }
+
+      #submit-status {
         color: var(--color-context);
         font-size: var(--font-size-small);
-        margin-top: var(--space-3);
+      }
+
+      #result-summary {
+        align-items: baseline;
+        background: var(--color-ok-surface);
+        border: 1px solid var(--color-ok-border);
+        border-radius: var(--radius-control);
+        color: var(--color-ok);
+        display: flex;
+        flex: 1 1 100%;
+        flex-wrap: wrap;
+        font-size: var(--font-size-small);
+        gap: var(--space-3);
+        padding: var(--space-2) var(--space-3);
+      }
+
+      #result-summary a {
+        color: inherit;
+        font-weight: 700;
       }
 
       #scan-error,
@@ -155,7 +242,7 @@
         border: 1px solid var(--color-danger-border);
         border-radius: var(--radius-card);
         color: var(--color-danger);
-        margin-top: var(--space-4);
+        margin-block: var(--space-4);
         padding: var(--space-3);
       }
 
@@ -168,28 +255,70 @@
         align-items: center;
         gap: var(--space-3);
         justify-content: space-between;
-        margin-top: var(--space-4);
+        margin-block: var(--space-4);
         padding: var(--space-3);
       }
 
+      /* Shown only when every non-invalid row came back "ownership unclear":
+         one explanation beats N identical per-row badges. */
+      #ownership-unclear-note {
+        background: var(--color-primary-surface);
+        border: 1px solid var(--color-primary-border);
+        border-radius: var(--radius-card);
+        color: var(--color-primary);
+        font-size: var(--font-size-small);
+        margin-block: var(--space-4);
+        padding: var(--space-2) var(--space-3);
+      }
+
+      #scan-summary {
+        color: var(--color-muted);
+        font-size: var(--font-size-small);
+        font-variant-numeric: tabular-nums;
+        margin-bottom: var(--space-2);
+      }
+
+      #truncated-note {
+        color: var(--color-warning);
+        font-size: var(--font-size-small);
+        margin-bottom: var(--space-2);
+      }
+
+      /* One divided list surface, not a card per citation (mirrors the
+         inbox's triage groups): hairline separators inside a single
+         bordered, rounded container. */
       #rows {
-        display: grid;
-        gap: var(--space-2);
-        margin-top: var(--space-4);
+        background: var(--color-surface);
+        border: 1px solid var(--color-border);
+        border-radius: var(--radius-card);
+        overflow: hidden;
+      }
+
+      #rows:empty {
+        display: none;
       }
 
       .pb-row {
         align-items: start;
-        background: var(--color-surface);
-        border: 1px solid var(--color-border);
-        border-radius: var(--radius-card);
+        border-bottom: 1px solid var(--color-border);
         display: grid;
-        gap: var(--space-2);
-        grid-template-columns: auto 1fr;
-        padding: var(--space-3);
+        gap: var(--space-3);
+        grid-template-columns: auto minmax(0, 1fr);
+        padding: var(--space-3) var(--space-4);
+        transition: background-color var(--transition-fast);
       }
 
-      .pb-row[data-disabled="true"] {
+      .pb-row:last-child {
+        border-bottom: 0;
+      }
+
+      .pb-row:hover:not([data-disabled="true"]) {
+        background: var(--color-surface-hover);
+      }
+
+      /* Dim the row's content, never its divider — the list keeps one
+         continuous rule regardless of which rows are ineligible. */
+      .pb-row[data-disabled="true"] > * {
         opacity: 0.62;
       }
 
@@ -202,19 +331,37 @@
       .pb-row-label {
         display: block;
         font-weight: 600;
+        overflow-wrap: anywhere;
       }
 
       .pb-row-meta {
+        align-items: baseline;
         color: var(--color-context);
         display: flex;
         flex-wrap: wrap;
         font-size: var(--font-size-small);
-        gap: var(--space-2);
+        gap: var(--space-1) var(--space-3);
         margin-top: var(--space-1);
       }
 
       .pb-row-identifier {
-        text-transform: uppercase;
+        overflow-wrap: anywhere;
+      }
+
+      .pb-row-kind {
+        color: var(--color-muted);
+        font-weight: 700;
+        letter-spacing: 0.03em;
+      }
+
+      .pb-row-link {
+        color: var(--color-primary);
+        text-decoration-color: var(--color-primary-border);
+        text-underline-offset: 2px;
+      }
+
+      .pb-row-link:hover {
+        text-decoration-color: currentcolor;
       }
 
       .pb-row-status {
@@ -239,26 +386,8 @@
         text-align: center;
       }
 
-      #truncated-note {
-        color: var(--color-warning);
-        font-size: var(--font-size-small);
-        margin-top: var(--space-2);
-      }
-
-      .action-bar {
-        align-items: center;
-        display: flex;
-        flex-wrap: wrap;
-        gap: var(--space-3);
-        margin-top: var(--space-6);
-      }
-
-      #source-closed-note {
-        color: var(--color-muted);
-        font-size: var(--font-size-small);
-      }
-
       button {
+        appearance: none;
         background: var(--color-surface);
         border: 1px solid var(--color-control-border);
         border-radius: var(--radius-control);
@@ -267,6 +396,13 @@
         font: inherit;
         min-height: var(--control-height);
         padding: 0 var(--space-4);
+        transition:
+          background-color var(--transition-fast),
+          border-color var(--transition-fast);
+      }
+
+      button:hover:not(:disabled) {
+        background: var(--color-surface-hover);
       }
 
       button.primary {
@@ -278,6 +414,7 @@
 
       button.primary:hover:not(:disabled) {
         background: var(--color-primary-solid-hover);
+        border-color: var(--color-primary-solid-hover);
       }
 
       button:disabled {
@@ -291,23 +428,15 @@
         color: var(--color-primary);
       }
 
-      #submit-status {
-        color: var(--color-context);
-        font-size: var(--font-size-small);
+      button.ghost:hover:not(:disabled) {
+        background: var(--color-primary-hover);
       }
 
-      #result-summary {
-        background: var(--color-ok-surface);
-        border: 1px solid var(--color-ok-border);
-        border-radius: var(--radius-card);
-        color: var(--color-ok);
-        margin-top: var(--space-4);
-        padding: var(--space-4);
-      }
-
-      #result-summary a {
-        color: inherit;
-        font-weight: 700;
+      a:focus-visible,
+      button:focus-visible,
+      input:focus-visible {
+        outline: var(--focus-width) solid var(--color-primary);
+        outline-offset: var(--focus-offset);
       }
 
       footer {
@@ -324,23 +453,68 @@
         gap: var(--space-2);
         margin-top: var(--space-3);
       }
+
+      @media (max-width: 44rem) {
+        body {
+          padding: var(--space-6) var(--space-4);
+        }
+
+        #scan-context {
+          padding-left: 0;
+        }
+
+        .action-secondary {
+          margin-left: 0;
+        }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        *,
+        *::before,
+        *::after {
+          transition-duration: 0.01ms !important;
+        }
+      }
     </style>
   </head>
   <body>
     <header>
-      <div class="brand"><em>papio</em> — select papers</div>
+      <h1 class="brand">
+        <svg viewBox="0 0 512 512" aria-hidden="true">
+          <path d="M 95.0 374.6 A 200 200 0 1 1 243.7 455.6" fill="none" stroke="var(--color-brand-ink)" stroke-width="46" stroke-linecap="round"/>
+          <g transform="translate(264 244) skewX(-10)">
+            <circle cx="0" cy="0" r="68" fill="none" stroke="var(--color-brand-accent)" stroke-width="42"/>
+          </g>
+          <path d="M 208.0 176.0 L 163.2 430.0" fill="none" stroke="var(--color-brand-accent)" stroke-width="42" stroke-linecap="round"/>
+          <path d="M 115.7 416.0 L 215.7 416.0 L 152.6 490.0 Z" fill="var(--color-brand-accent)" stroke="var(--color-brand-accent)" stroke-width="10" stroke-linejoin="round"/>
+        </svg>
+        <span class="brand-name"><em>papio</em> <span class="page-name">select papers</span></span>
+      </h1>
       <div id="scan-context">
         <p id="scan-title"></p>
         <p id="scan-meta"></p>
       </div>
     </header>
-    <p id="scan-summary" role="status" aria-live="polite">Loading…</p>
+    <div id="action-bar">
+      <button id="primary-btn" type="button" class="primary" disabled>Acquire all 0 eligible</button>
+      <p id="submit-status" role="status" aria-live="polite"></p>
+      <div class="action-secondary">
+        <p id="source-closed-note" hidden>source tab closed — this snapshot remains usable</p>
+        <button id="rescan-btn" type="button" class="ghost">Rescan</button>
+        <button id="return-to-source-btn" type="button" class="ghost">Return to source page</button>
+      </div>
+      <div id="result-summary" role="status" aria-live="polite" hidden></div>
+    </div>
     <div id="scan-error" role="alert" hidden></div>
     <div id="scan-expired" role="alert" hidden>scan expired — rescan the source page</div>
     <div id="status-error" role="alert" hidden>
       <span id="status-error-message"></span>
       <button id="status-retry-btn" type="button" class="ghost">Retry</button>
     </div>
+    <p id="ownership-unclear-note" hidden>
+      papio can't check your library from this daemon configuration; duplicates are still prevented when you acquire
+    </p>
+    <p id="scan-summary" role="status" aria-live="polite">Loading…</p>
     <p id="truncated-note" hidden>
       papio stopped scanning at 200 candidates on this page. Some citations may be missing — narrow the page or scroll before rescanning.
     </p>
@@ -348,14 +522,6 @@
       <div id="rows" aria-label="Detected papers"></div>
       <p id="empty-state" hidden>papio found no recognizable identifiers on this page.</p>
     </main>
-    <div id="action-bar" class="action-bar">
-      <button id="return-to-source-btn" type="button" class="ghost">Return to source page</button>
-      <p id="source-closed-note" hidden>source tab closed — this snapshot remains usable</p>
-      <button id="rescan-btn" type="button" class="ghost">Rescan</button>
-      <button id="primary-btn" type="button" class="primary" disabled>Acquire all 0 eligible</button>
-      <p id="submit-status" role="status" aria-live="polite"></p>
-    </div>
-    <div id="result-summary" role="status" aria-live="polite" hidden></div>
     <footer>
       <p id="privacy-line">
         <em>papio</em> does not read the page until you choose "Select papers on this page." Detection runs locally in

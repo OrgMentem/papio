@@ -1638,12 +1638,19 @@ func (b *Bridge) pageBulkStatusItem(ctx context.Context, id protocol.PageBulkIde
 		return protocol.PageBulkStatusItem{LocalID: id.LocalID, Status: "invalid"}
 	}
 	item := protocol.PageBulkStatusItem{LocalID: id.LocalID, CanonicalKey: kind + ":" + value}
-	liveJobID, previouslyUnavailable, lookupErr := b.canonicalJobStatus(ctx, kind, value)
+	liveJobID, readyJobID, previouslyUnavailable, lookupErr := b.canonicalJobStatus(ctx, kind, value)
 	switch {
 	case lookupErr != nil:
 		item.Status = "ownership_incomplete"
 	case liveJobID != "":
 		item.Status, item.JobID = "queued", liveJobID
+	case readyJobID != "":
+		// papio already holds a validated bundle for this work: the freshest
+		// possible PDF-present claim, complete by construction. The wire
+		// contract reserves job_id for queued rows (the one a user can
+		// watch), so the ready job's id stays daemon-side.
+		item.Status = "owned_with_pdf"
+		item.OwnershipComplete = true
 	case previouslyUnavailable:
 		item.Status = "previously_unavailable"
 	default:
@@ -1716,35 +1723,42 @@ func normalizePageBulkIdentifier(kind, value string) (string, string, error) {
 // canonicalJobStatus looks up the given canonical identity directly against
 // the jobs/identifiers tables the bridge already reaches (the same join
 // liveJobForCanonicalWork uses internally in internal/job, unexported there).
-// The most recent live job wins; failing that, any past terminal "unavailable"
-// job marks previouslyUnavailable — historical information, never an exclusion
+// The most recent live job wins; failing that, the most recent READY job —
+// papio's own validated bundle is the strongest artifact-present claim there
+// is, and the only one that exists under a zotio configuration, where the
+// generic holdings registry is deliberately empty (ADR-0008: zotio and
+// generic sources never mix) and every external lookup honestly reports
+// incomplete; failing that, any past terminal "unavailable" verdict
 // (ADR-0019 Decision 5).
-func (b *Bridge) canonicalJobStatus(ctx context.Context, kind, value string) (liveJobID string, previouslyUnavailable bool, err error) {
+func (b *Bridge) canonicalJobStatus(ctx context.Context, kind, value string) (liveJobID, readyJobID string, previouslyUnavailable bool, err error) {
 	rows, err := b.jobs.S.DB().QueryContext(ctx, `
 		SELECT j.id, j.state FROM jobs j
 		JOIN identifiers i ON i.work_request_id = j.work_request_id
 		WHERE i.kind = ? AND i.value = ?
 		ORDER BY j.created_at DESC`, kind, value)
 	if err != nil {
-		return "", false, err
+		return "", "", false, err
 	}
 	defer func() { _ = rows.Close() }()
 	for rows.Next() {
 		var id, state string
 		if err := rows.Scan(&id, &state); err != nil {
-			return "", false, err
+			return "", "", false, err
 		}
 		if !job.Terminal(state) {
-			return id, false, nil
+			return id, "", false, nil
+		}
+		if state == job.StateReady && readyJobID == "" {
+			readyJobID = id
 		}
 		if state == job.StateUnavailable {
 			previouslyUnavailable = true
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return "", false, err
+		return "", "", false, err
 	}
-	return "", previouslyUnavailable, nil
+	return "", readyJobID, previouslyUnavailable, nil
 }
 
 // pageBulkSubmit creates one ordinary batch of jobs from up to 50 canonical
@@ -1771,6 +1785,15 @@ func (b *Bridge) pageBulkSubmit(ctx context.Context, request *protocol.PageBulkS
 		if !ok {
 			invalid++
 			continue
+		}
+		// papio's own ready bundle suppresses first: it is the freshest
+		// artifact-present claim and exists under every configuration,
+		// including zotio setups where the holdings registry is empty.
+		if kind, value, ok := pageBulkIdentifierOf(wr); ok {
+			if _, readyJobID, _, statusErr := b.canonicalJobStatus(ctx, kind, value); statusErr == nil && readyJobID != "" {
+				alreadyOwned++
+				continue
+			}
 		}
 		query := ownership.QueryFor(wr.Identifiers.DOI, wr.Identifiers.ArXiv, wr.Identifiers.PMID, wr.DesiredVersion, ownership.EntityUnknown)
 		decision, _ := b.pageBulkOwnership(ctx, query)
@@ -1810,6 +1833,25 @@ func (b *Bridge) pageBulkSubmit(ctx context.Context, request *protocol.PageBulkS
 		return nil, err
 	}
 	return []json.RawMessage{frame}, nil
+}
+
+// pageBulkIdentifierOf extracts the identifiers-table (kind, value) pair a
+// canonical-key-derived work request names, mirroring pageBulkWorkRequest's
+// own key vocabulary.
+func pageBulkIdentifierOf(wr protocol.WorkRequest) (string, string, bool) {
+	ids := wr.Identifiers
+	if ids == nil {
+		return "", "", false
+	}
+	switch {
+	case ids.DOI != "":
+		return "doi", ids.DOI, true
+	case ids.ArXiv != "":
+		return "arxiv", ids.ArXiv, true
+	case ids.PMID != "":
+		return "pmid", ids.PMID, true
+	}
+	return "", "", false
 }
 
 // pageBulkWorkRequest maps one status-issued canonical key back to a work

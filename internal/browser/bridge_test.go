@@ -4430,6 +4430,22 @@ func bulkUnavailableJob(t *testing.T, jobs *job.Store, reqID, doi string) string
 	return id
 }
 
+// bulkReadyJob seeds a job driven to ready: papio's own validated bundle,
+// the artifact-present claim canonicalJobStatus's owned branch reads — the
+// only ownership source that exists under a zotio configuration.
+func bulkReadyJob(t *testing.T, jobs *job.Store, reqID, doi string) string {
+	t.Helper()
+	ctx := context.Background()
+	id := bulkJob(t, jobs, reqID, doi)
+	if err := jobs.Transition(ctx, id, job.StateQueued, job.StateResolving, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.Transition(ctx, id, job.StateResolving, job.StateReady, nil); err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
 // TestPageBulkStatusMixedOutcomes exercises Decision 5's full status mapping
 // end to end: durable job verdicts take precedence, positive holdings claims
 // distinguish PDF-present from record-only evidence, a complete no-claim lookup
@@ -4448,6 +4464,7 @@ func TestPageBulkStatusMixedOutcomes(t *testing.T) {
 
 	queuedID := bulkJob(t, jobs, "wr_bulk_queued", "10.1000/queued.1")
 	bulkUnavailableJob(t, jobs, "wr_bulk_unavail", "10.1000/gone.1")
+	readyID := bulkReadyJob(t, jobs, "wr_bulk_ready", "10.1000/papio-ready.1")
 
 	frame := inFrame(t, protocol.MsgPageBulkStatusRequest, "", protocol.PageBulkStatusRequestPayload{
 		RequestID: "request-bulk-mixed001", ScanID: "scan-bulk-mixed0001",
@@ -4459,6 +4476,7 @@ func TestPageBulkStatusMixedOutcomes(t *testing.T) {
 			{LocalID: "row-5", Kind: "doi", Value: "10.1000/eligible.1"},
 			{LocalID: "row-6", Kind: "doi", Value: "10.1000/partial.1"},
 			{LocalID: "row-7", Kind: "doi", Value: "not-a-doi"},
+			{LocalID: "row-8", Kind: "doi", Value: "10.1000/papio-ready.1"},
 		},
 	})
 	msgs, _ := runSync(t, b, frame)
@@ -4470,10 +4488,10 @@ func TestPageBulkStatusMixedOutcomes(t *testing.T) {
 	if payload.Truncated {
 		t.Fatalf("truncated = true for a 7-item request, want false")
 	}
-	if len(payload.Items) != 7 {
-		t.Fatalf("items = %d, want 7", len(payload.Items))
+	if len(payload.Items) != 8 {
+		t.Fatalf("items = %d, want 8", len(payload.Items))
 	}
-	byLocalID := make(map[string]protocol.PageBulkStatusItem, 7)
+	byLocalID := make(map[string]protocol.PageBulkStatusItem, 8)
 	for _, item := range payload.Items {
 		byLocalID[item.LocalID] = item
 	}
@@ -4505,6 +4523,10 @@ func TestPageBulkStatusMixedOutcomes(t *testing.T) {
 	if invalid.Status != "invalid" || invalid.CanonicalKey != "" || invalid.JobID != "" || invalid.OwnershipComplete {
 		t.Fatalf("row-7 = %+v, want invalid with no canonical_key", invalid)
 	}
+	papioReady := byLocalID["row-8"]
+	if papioReady.Status != "owned_with_pdf" || papioReady.JobID != "" || !papioReady.OwnershipComplete {
+		t.Fatalf("row-8 = %+v, want owned_with_pdf (job_id stays daemon-side) for ready bundle %q", papioReady, readyID)
+	}
 }
 
 func TestPageBulkStatusNilHoldingsStaysIncomplete(t *testing.T) {
@@ -4524,6 +4546,39 @@ func TestPageBulkStatusNilHoldingsStaysIncomplete(t *testing.T) {
 	item := result.Payload.(*protocol.PageBulkStatusResultPayload).Items[0]
 	if item.Status != "ownership_incomplete" || item.OwnershipComplete {
 		t.Fatalf("item = %+v with nil holdings, want ownership_incomplete and ownership_complete=false", item)
+	}
+}
+
+// TestPageBulkStatusReadyBundleOwnsUnderNilHoldings pins the zotio scenario:
+// the generic holdings registry is deliberately empty (ADR-0008 forbids
+// mixing it with zotio), yet a work papio itself acquired must still render
+// owned_with_pdf from the daemon's own ready bundle instead of drowning the
+// workspace in "ownership unclear".
+func TestPageBulkStatusReadyBundleOwnsUnderNilHoldings(t *testing.T) {
+	var holdings *ownership.Registry
+	b, jobs, _, _ := newBridgeWithHoldings(t, holdings)
+	runSync(t, b, hello())
+	readyID := bulkReadyJob(t, jobs, "wr_bulk_zotio_ready", "10.1000/zotio-owned.1")
+
+	frame := inFrame(t, protocol.MsgPageBulkStatusRequest, "", protocol.PageBulkStatusRequestPayload{
+		RequestID: "request-bulk-zotio001", ScanID: "scan-bulk-zotio00001",
+		Identifiers: []protocol.PageBulkIdentifier{
+			{LocalID: "row-1", Kind: "doi", Value: "10.1000/zotio-owned.1"},
+			{LocalID: "row-2", Kind: "doi", Value: "10.1000/never-seen.1"},
+		},
+	})
+	msgs, _ := runSync(t, b, frame)
+	result := firstOfType(msgs, protocol.MsgPageBulkStatusResult)
+	if result == nil {
+		t.Fatalf("no page_bulk_status_result in %v", msgs)
+	}
+	payload := result.Payload.(*protocol.PageBulkStatusResultPayload)
+	owned := payload.Items[0]
+	if owned.Status != "owned_with_pdf" || owned.JobID != "" || !owned.OwnershipComplete {
+		t.Fatalf("items[0] = %+v, want owned_with_pdf (job_id daemon-side) for ready job %q despite nil holdings", owned, readyID)
+	}
+	if unknown := payload.Items[1]; unknown.Status != "ownership_incomplete" || unknown.OwnershipComplete {
+		t.Fatalf("items[1] = %+v, want ownership_incomplete for a never-seen work under nil holdings", unknown)
 	}
 }
 
@@ -4577,10 +4632,11 @@ func TestPageBulkSubmitCreatesJobsWithBrowserPageConsumer(t *testing.T) {
 	ctx := context.Background()
 	runSync(t, b, hello())
 	existingID := bulkJob(t, jobs, "wr_bulk_existing", "10.1000/existing.1")
+	bulkReadyJob(t, jobs, "wr_bulk_ready_own", "10.1000/papio-owned.9")
 
 	frame := inFrame(t, protocol.MsgPageBulkSubmitRequest, "", protocol.PageBulkSubmitRequestPayload{
 		RequestID: "request-bulk-submit002", ScanID: "scan-bulk-submit0002",
-		CanonicalKeys: []string{"doi:10.1000/existing.1", "doi:10.1000/fresh.7", "doi:10.1000/owned.8", "not-a-canonical-key"},
+		CanonicalKeys: []string{"doi:10.1000/existing.1", "doi:10.1000/fresh.7", "doi:10.1000/owned.8", "doi:10.1000/papio-owned.9", "not-a-canonical-key"},
 		Source: protocol.PageBulkSubmitSource{
 			Kind: "browser_page", Origin: "https://scholar.example.edu", Detector: "generic-identifiers/1",
 		},
@@ -4591,8 +4647,8 @@ func TestPageBulkSubmitCreatesJobsWithBrowserPageConsumer(t *testing.T) {
 		t.Fatalf("no page_bulk_submit_result in %v", msgs)
 	}
 	payload := result.Payload.(*protocol.PageBulkSubmitResultPayload)
-	if payload.Submitted != 1 || payload.Joined != 1 || payload.Invalid != 1 || payload.AlreadyOwned != 1 {
-		t.Fatalf("counts = %+v, want {submitted:1 joined:1 already_owned:1 invalid:1}", payload)
+	if payload.Submitted != 1 || payload.Joined != 1 || payload.Invalid != 1 || payload.AlreadyOwned != 2 {
+		t.Fatalf("counts = %+v, want {submitted:1 joined:1 already_owned:2 invalid:1}: papio's own ready bundle suppresses like a holdings claim", payload)
 	}
 	if payload.BatchID == "" {
 		t.Fatal("batch_id is empty")
@@ -4616,17 +4672,18 @@ func TestPageBulkSubmitCreatesJobsWithBrowserPageConsumer(t *testing.T) {
 		}
 		byID[id] = struct{ consumer, doi string }{consumer, doi}
 	}
-	if len(byID) != 2 {
-		t.Fatalf("jobs after submit = %d, want 2 (one joined, one new)", len(byID))
+	if len(byID) != 3 {
+		t.Fatalf("jobs after submit = %d, want 3 (joined, papio-owned seed, one new): a ready-owned key must not create a fourth", len(byID))
 	}
 	if existing, ok := byID[existingID]; !ok || existing.consumer != "" {
 		t.Fatalf("existing job %+v, want unattributed consumer (a join must not overwrite it)", byID[existingID])
 	}
 	var created *struct{ consumer, doi string }
 	for id, row := range byID {
-		if id != existingID {
+		if row.doi == "10.1000/fresh.7" {
 			created = &row
 		}
+		_ = id
 	}
 	if created == nil || created.consumer != pageBulkConsumer || created.doi != "10.1000/fresh.7" {
 		t.Fatalf("new job = %+v, want consumer %q and doi 10.1000/fresh.7", created, pageBulkConsumer)
@@ -4642,8 +4699,8 @@ func TestPageBulkSubmitCreatesJobsWithBrowserPageConsumer(t *testing.T) {
 	if detectorID != "generic-identifiers/1" || sourceOrigin != "https://scholar.example.edu" {
 		t.Fatalf("run source = %q/%q, want detector/origin from the submit request", detectorID, sourceOrigin)
 	}
-	if selected != 4 || submitted != 1 || invalid != 1 {
-		t.Fatalf("run counts = selected:%d submitted:%d invalid:%d, want 4/1/1", selected, submitted, invalid)
+	if selected != 5 || submitted != 1 || invalid != 1 {
+		t.Fatalf("run counts = selected:%d submitted:%d invalid:%d, want 5/1/1", selected, submitted, invalid)
 	}
 	if batchID != payload.BatchID {
 		t.Fatalf("run batch_id = %q, want %q", batchID, payload.BatchID)
