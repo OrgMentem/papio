@@ -2,16 +2,16 @@
 
 **A local tool that finds scholarly papers and offers validated PDFs toward your reference library.** Search for works, queue them for acquisition, check every PDF is the paper you asked for, and offer it toward your library — from the terminal or from a coding agent.
 
-Zotero users get preview-first import through [zotio](https://github.com/OrgMentem/zotio). papis, Calibre, plain-folder, and roll-your-own-script users get a best-effort handoff through a one-line [`on_ready` hook](guide/hooks.md); hook failures never fail or retry the acquisition job.
+Zotero users get preview-first import through [zotio](https://github.com/OrgMentem/zotio). Users of papis, Calibre, plain folders, or custom scripts get a best-effort handoff through a one-line [`on_ready` hook](guide/hooks.md); hook failures never fail or retry the acquisition job.
 
-Finding a paper is easy; *legitimately getting* it and preparing a validated PDF for your library is the tedious part. `papio` handles that: it finds works on OpenAlex, tries open-access and licensed sources first, falls back to a visible pass in your own browser only when needed, checks every candidate before you trust it, and then offers what survives — into Zotero through `zotio`, which shows you a preview first, or elsewhere through a best-effort `on_ready` handoff. It does **not** handle institution logins, two-factor codes, CAPTCHAs, or bulk-downloading from subscription databases — those stay your decisions in your ordinary browser.
+Finding citations is easy; getting the PDFs, legitimately, is the tedious part. *papio* retrieves PDFs through open, licensed, or user-authorized institutional sources. It verifies each PDF and offers it to your library without handling your university credentials.
 
 ## How it works
 
-Every request becomes a job. `papio` ranks the possible sources and tries them in order — it never just grabs the first URL it finds:
+Every request becomes a job. `papio` ranks the possible sources and tries them in order; it does not accept the first URL it finds:
 
-![papio acquisition pipeline: you or an agent drive papio's jobs; open sources run before your own browser via the papio extension (installed once), where login, MFA, and CAPTCHA stay human; both paths converge in quarantine and PDF validation, producing a validated bundle with provenance; Zotero uses zotio preview-then-apply, while other destinations receive a best-effort on_ready handoff](assets/architecture.svg#only-light)
-![papio acquisition pipeline: you or an agent drive papio's jobs; open sources run before your own browser via the papio extension (installed once), where login, MFA, and CAPTCHA stay human; both paths converge in quarantine and PDF validation, producing a validated bundle with provenance; Zotero uses zotio preview-then-apply, while other destinations receive a best-effort on_ready handoff](assets/architecture-dark.svg#only-dark)
+![papio pipeline: discover works, acquire from open or institutional sources, validate PDFs, and file them in Zotero or another destination](assets/architecture.svg#only-light)
+![papio pipeline: discover works, acquire from open or institutional sources, validate PDFs, and file them in Zotero or another destination](assets/architecture-dark.svg#only-dark)
 
 1. **Discover.** `papio search` returns read-only OpenAlex results and, when zotio or a configured `library.sources` authority is available, marks works already in your library; without either, results are unowned/unclassified.
 2. **Acquire.** A batch (up to 50 works) or a single work becomes jobs, each with a stable ID, so running the same request again is safe and won't duplicate.

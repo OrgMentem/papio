@@ -61,11 +61,10 @@
 </p>
 
 <p align="center">
-  Finding citations is easy; <em>getting the PDFs, legitimately</em> is the tedious
-  part. <code>papio</code> backfills the works in your library that lack full
-  text, checking open-access and licensed sources first and falling back to a
-  visible institutional pass in your own browser only when needed. Gives tools to 
-  research agents — without handing them your university credentials.
+  Finding citations is easy; getting the PDFs, legitimately, is the tedious
+  part. <code>papio</code> retrieves PDFs through open, licensed, or
+  user-authorized institutional sources. It verifies each PDF and offers it to
+  your library without handling your university credentials.
 </p>
 
 ```bash
@@ -83,32 +82,29 @@ papio actions list                                        # open browser handoff
 
 ## Why *papio*
 
-Discovery is a solved problem — getting the PDF is not. The gap between "found
-it on OpenAlex" and "validated PDF in my library" is a swamp of publisher
-landing pages, single sign-on redirects, dubious downloads, and hand-filed
-imports. Existing tools either stop at metadata or cross lines you don't want
-crossed.
+Finding metadata is not enough. A usable workflow also needs to locate a PDF,
+verify that it matches the requested work, and file it in the user's library
+without handling institutional credentials.
 
-`papio` owns exactly that glue, with hard boundaries:
+`papio` provides that workflow with explicit boundaries:
 
-- **Legitimate by construction.** Open-access and explicitly licensed APIs run
-  before institutional access. Institutional fetches happen as an OpenURL
-  handoff **in your ordinary Chrome or Firefox session** — login, MFA, and
-  CAPTCHAs stay human decisions. `papio` never stores institution credentials
-  and never does subscription crawling.
-- **Repeatable jobs.** Every request becomes a job with a
-  stable ID — running it again is safe and won't duplicate, batches are capped,
-  and budgets and allowed/blocked sources are enforced by *papio*, not by hope.
-- **Validated before trusted.** Every candidate PDF is quarantined and gated on
-  structure, identity, and an OCR fallback. Ambiguous identity parks in
-  `needs_review` for a human verdict instead of silently importing the wrong
-  paper.
-- **Your library, your call.** Zotero gets the deepest path: `papio zotio plan`
-  produces an immutable preview, `papio zotio apply` requires that preview's
-  exact confirmation SHA-256, and `papio` never touches Zotero credentials.
-  Everywhere else — papis, a plain folder, your own script — gets a best-effort
-  handoff through the `on_ready` hook. Hook failures are recorded but never fail
-  or retry the acquisition job.
+- **Access boundaries.** Open-access and explicitly licensed APIs run before
+  institutional access. Institutional fetches happen as an OpenURL handoff
+  **in your ordinary Chrome or Firefox session** — login, MFA, and CAPTCHAs stay
+  human decisions. `papio` never stores institution credentials and never does
+  subscription crawling.
+- **Repeatable jobs.** Every request becomes a job with a stable ID — running it
+  again is safe and won't duplicate, batches are capped, and budgets and
+  allowed/blocked sources are enforced by *papio*.
+- **Validation before filing.** Every candidate PDF is quarantined and checked
+  for structure, identity, and, when needed, OCR. An ambiguous identity waits
+  in `needs_review` for a human verdict instead of being imported automatically.
+- **Library filing.** Zotero gets the deepest path: `papio zotio plan` produces
+  an immutable preview, `papio zotio apply` requires that preview's exact
+  confirmation SHA-256, and `papio` never touches Zotero credentials. Everywhere
+  else — papis, a plain folder, or your own script — gets a best-effort handoff
+  through the `on_ready` hook. Hook failures are recorded but never fail or
+  retry the acquisition job.
 
 ---
 
@@ -121,7 +117,7 @@ it finds:
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/architecture-dark.svg">
   <source media="(prefers-color-scheme: light)" srcset="docs/assets/architecture.svg">
-  <img alt="papio acquisition pipeline: you or an agent drive papio's jobs; open-access and licensed APIs run before your own browser via the papio extension (installed once), where login, MFA, and CAPTCHA stay human; both paths converge in quarantine and PDF validation, producing a validated bundle with provenance; Zotero uses zotio's preview-then-apply, while other destinations receive a best-effort on_ready handoff" src="docs/assets/architecture.svg">
+  <img alt="papio pipeline: discover works, acquire from open or institutional sources, validate PDFs, and file them in Zotero or another destination" src="docs/assets/architecture.svg">
 </picture>
 
 | Stage | Source / tooling | Handles credentials? |
@@ -142,8 +138,8 @@ inside legitimate, user-authorized access
 
 ## The research loop
 
-Discover, acquire in bulk, watch progress, review the exceptions — then let
-the finished PDFs flow into your library:
+Use this loop to discover works, acquire them, monitor jobs, and resolve
+exceptions:
 
 ```bash
 # 1. Discover — read-only; marks works already in your library (with zotio or configured library.sources)

@@ -2,162 +2,137 @@
 
 _Last updated: 2026-08-06_
 
-*papio* is a **local** paper-acquisition tool. It runs on your own machine and, for
-the institutional handoff, inside your own browser. This policy covers both the
-*papio* application (daemon and CLI) and the **_papio_ browser extension**.
+*papio* runs on your computer. It has no hosted service, user account, telemetry, or
+analytics. This policy covers the *papio* application (daemon and CLI) and the
+**_papio_ browser extension**.
 
-## The short version
+## Summary
 
-**There is no _papio_ server, no account, no telemetry, and no analytics.** Nothing
-about you or your activity is collected, and nothing is reported back to OrgMentem.
+*papio* does not collect your data or send it to OrgMentem.
 
-That is the whole story for the **extension**, which has no backend at all: it talks
-only to the *papio* application running locally on your computer, over the browser's
-native-messaging channel.
+The extension communicates with the local *papio* application through the browser's
+native-messaging interface. It does not contact OrgMentem or any other external
+service on its own, except when it asks a provider page to turn a link into a PDF
+URL.
 
-The **application** is a different matter, and the honest version is longer. Finding
-a paper means asking the services that index papers, so *papio* sends the identifier
-you asked for — a DOI, a PMID, an arXiv id, or a title — to scholarly metadata APIs
-like Unpaywall and Crossref, and (if you set one) your contact email address along
-with it. That is not incidental: it is the work. The full list is below, and none of
-it goes to us.
+The local application does contact third-party scholarly services to find papers.
+These requests include the identifier you ask *papio* to resolve, such as a DOI,
+PMID, arXiv ID, or title. Some services also receive your configured email address
+or API credentials. The table below lists every destination and the data it receives.
 
-## What the application sends, and to whom
+## Requests to third-party services
 
-Every destination below is a third-party scholarly service, contacted directly by the
-daemon on your machine. Each request carries the identifier being looked up; the
-"Also sends" column is everything else.
+Every destination below is contacted directly by the daemon on your computer. Each
+request carries the identifier being looked up. The “Data sent besides the lookup”
+column lists anything else sent.
 
-| Destination | Also sends | When | Default |
+| Service | Data sent besides the lookup | Used for | Default |
 | --- | --- | --- | --- |
 | `api.unpaywall.org` | your `email` (required by their terms) | Resolving a DOI | **On** |
-| `api.crossref.org` | your `email`, if set | Filling in metadata for a title-only request; looking up a DOI's registered version relations (preprint/version links) when its own candidates are exhausted | **On** |
-| `api.crossref.org` | — | Daily retraction check over papers **already in your library** | **On** |
+| `api.crossref.org` | your `email`, if set | Adding metadata to a title-only request; checking a DOI's registered version relations when other candidates are exhausted | **On** |
+| `api.crossref.org` | — | Daily retraction checks for papers already in your library | **On** |
 | `www.ebi.ac.uk` (Europe PMC) | — | Resolving a DOI, PMID, or title | **On** |
-| `export.arxiv.org` | — | Resolving an arXiv id or DOI | **On** |
-| `doi.org` | your `email`, in the User-Agent | Confirming a DOI exists, before an institutional handoff | **On** |
-| Your institution's configured delivery API (`document_delivery.base_url` — ILLiad in v1) | your `api_key`, `patron_ref`, and the request's bibliographic identifiers | Submitting or polling one of *your* document-delivery requests, under the profile you configured | Off — requires configuration |
-| `api.openalex.org` | your `email`, your API key | Resolving, and `papio search` | Off |
+| `export.arxiv.org` | — | Resolving an arXiv ID or DOI | **On** |
+| `doi.org` | your `email`, in the User-Agent | Confirming that a DOI exists before an institutional handoff | **On** |
+| Your institution's configured delivery API (`document_delivery.base_url` — ILLiad in v1) | your `api_key`, `patron_ref`, and the request's bibliographic identifiers | Submitting or polling one of your document-delivery requests | Off — requires configuration |
+| `api.openalex.org` | your `email`, your API key | Resolving and `papio search` | Off |
 | `api.core.ac.uk` | your API key | Resolving | Off |
 | `api.crossref.org` (TDM) | your subscriber token | Resolving | Off |
-| `api.semanticscholar.org` | your API key, if set | Resolving a DOI, arXiv id, or PMID, and `papio search` when configured | **On** |
+| `api.semanticscholar.org` | your API key, if set | Resolving a DOI, arXiv ID, or PMID, and `papio search` when configured | **On** |
 | `api.openaire.eu` | your API token, if set | Resolving | **On** |
-| Publisher and repository hosts | — | Downloading the PDF itself | **On** |
+| Publisher and repository hosts | — | Downloading the PDF | **On** |
 | `api.github.com` | **nothing** | Once a day, checking for a new *papio* or zotio release | **On**, `updates.check = false` disables it |
 | Your webhook URL | job event and message | Job state changes | Off |
 
-Four things worth calling out:
+### Important details
 
-- **The `email` setting is a contact address, sent deliberately.** Unpaywall and
-  OpenAlex require it and refuse to run without one; Crossref and the DOI handle
-  lookup include it if you have set one. It exists so those services can reach a
-  human about traffic from this tool — it is what they call a "polite pool", and it
-  buys higher rate limits. Leave it empty and *papio* sends no address, but Unpaywall
-  and OpenAlex will not work.
-- **The daily retraction check is the one thing that talks about papers you already
-  have**, rather than one you just asked for. It sends their DOIs to Crossref's public
-  metadata API. Set `[sources.retraction_watch] enabled = false` to turn it off.
-- **The update check sends nothing at all.** It is an unauthenticated `GET` of a public
-  GitHub releases page, the same request anyone visiting that page makes. GitHub sees
-  your IP, as any web request would; OrgMentem receives no notification, no identifier,
-  and no count. Set `updates.check = false` if you would rather it did not happen.
-- **Document delivery reaches only the ILL system you configure, only for
-  requests you configured it to make.** Setting `document_delivery.kind =
-  "illiad"` (or another supported kind) with `submit_policy` at
-  `prefill_only` or `auto_if_unconditional` makes *papio* call that
-  institution's own document-delivery API directly, using the
-  institution-issued key and patron reference you configured — never a
-  shared or *papio*-operated service. It is contacted only to submit or poll
-  a request tied to a job of yours; leave `document_delivery` unset (the
-  default) and no such call is ever made. See the
-  [configuration reference](reference/config-reference.md#browserdocument_delivery)
-  for the full field list.
+**Email address.** The `email` setting is sent to services that require or accept
+it. Unpaywall and OpenAlex require an email address. Crossref and DOI lookup use it
+when configured. Leaving it empty prevents Unpaywall and OpenAlex lookups.
 
-## What the extension does and does not do
+**Retraction checks.** Retraction checks send the DOIs of papers already in your
+library to Crossref. Disable them with
+`[sources.retraction_watch] enabled = false`.
 
-- **No data collection or transmission to us.** The extension has no backend. It
-  communicates solely with the local native-messaging host `com.orgmentem.papio`
-  on your own machine, and makes no request of its own to any external service.
-  The one request it originates runs *inside the provider page you are already on*,
-  to turn a link into a PDF URL, and goes to that same site.
-- **No credentials are stored.** You sign in to your institution and solve any
-  MFA or CAPTCHA yourself, in your own browser session. *papio* never sees, stores,
-  or transmits your usernames, passwords, cookies, or session tokens.
-- **No bulk scraping.** Single-paper acquisition still downloads one job at a
-  time. On-page bulk selection (below) is the one exception, and it remains
-  bounded and explicit: it never crawls, harvests, or auto-submits — it acts
-  only on the works you have checked and clicked to acquire, capped at 50
-  per batch.
-- **On-page selection is local-only until you submit.** Detection for
-  "Select papers on this page" runs entirely inside the tab you are
-  viewing, only when you click that button — never ambient, never a
-  background watcher. The lookup that follows sends only the detected
-  identifiers to the local *papio* application on your computer, never the
-  page's title, URL, or surrounding text; the batch you submit records only
-  the page's bare origin (scheme and host), never its path, query, or
-  title. No scholarly service is contacted until you submit selected
-  papers.
-- **Your real session, not a bot.** The extension uses only standard extension
-  APIs and native messaging — no WebDriver, CDP, or automation frameworks — so it
-  operates as an ordinary part of your browsing.
+**Update checks.** Update checks make an unauthenticated request to the public
+GitHub releases page. GitHub receives your IP address, as it would for any web
+request, but *papio* does not send your identifiers or usage information. Disable
+the check with `updates.check = false`.
 
-## What is stored, and where
+**Document delivery.** Document delivery is disabled unless you configure it. When
+enabled, *papio* contacts only the institution's configured delivery service and
+sends the credentials and bibliographic details required by that service. It never
+uses a shared or *papio*-operated delivery service. See the
+[configuration reference](reference/config-reference.md#browserdocument_delivery)
+for the full field list.
 
-- **In your browser:** the extension keeps its own settings and short-lived job
-  and tab state (via the `storage` API) so it can survive service-worker
-  suspension and reconnect to the local app. This never leaves your browser.
-- **On your computer:** the *papio* application stores papers, metadata, and job
-  records in its local data directory. Validated PDFs live in `artifacts/` and
-  downloaded candidates awaiting validation live in `quarantine/`. Diagnostic page
-  captures live in `<data_dir>/captures/<host>/` as sanitized HTML from the authenticated
-  page in your browser session; they can still contain information visible on that page, so
-  treat them as private local data. Captures are retained for 14 days and up to 10 per host
-  by default (configurable in `[captures]`). Run `papio adapter captures purge`
-  to remove every capture, or `papio adapter captures purge --host <host>` for one host.
-  The extension no longer writes `~/Downloads/papio-fixtures/`; an existing directory
-  there is safe to delete. These files stay on your machine (and papers go only to your
-  own Zotero library if you enable that integration).
-- **Before you share a bug report,** know that `<data_dir>` also holds `papio.db`
-  (every request you have made, with titles and identifiers), `native-host.log`
-  (the browser session's diagnostic trace, including URLs), `adoptions/`
-  (browser-downloaded files awaiting adoption), and the `update-cache*.json` and
-  `retraction-cache.json` files. None of it is uploaded by *papio*, but all of it
-  describes what you have been reading.
-- **Adapter evidence is local unless you explicitly share it.** Reaching a
-  provider that has no adapter can create a sanitized diagnostic capture, but
-  *papio* never uploads it, opens a public issue, or sends telemetry. Sanitized
-  HTML can still contain article text, account labels, or other page content.
-  Review and minimize a capture before contributing it; a future contribution
-  helper must show the exact files and destination and require a final publish
-  action.
-- **Acquisition-history and impact figures:** the numbers the extension shows you —
-  papers acquired, an estimated time saved, success rate, weekly acquisition trend,
-  access-route breakdown, and human-handoff rate — are aggregates computed locally
-  from those same job records, on demand, for display to you alone. No new data is
-  collected to produce them, and they are never transmitted anywhere.
+## Browser extension
+
+- **No OrgMentem data collection.** The extension has no backend and does not send data to OrgMentem. It communicates with the local native-messaging host `com.orgmentem.papio`.
+- **No browser credentials.** You enter institutional credentials and complete MFA or CAPTCHA in your browser. The extension does not read, store, or transmit your usernames, passwords, cookies, or session tokens.
+- **No background scraping.** Bulk selection runs only after you click it. It acts only on the papers you select, with a maximum of 50 per batch. It does not crawl, harvest, or auto-submit pages.
+- **Local page detection.** “Select papers on this page” runs in the current tab after you request it. Only the detected identifiers are sent to the local application. The submitted batch records the page's scheme and host, not its path, query string, title, or surrounding text. No scholarly service is contacted until you submit the selected papers.
+- **Normal browser session.** The extension uses browser extension APIs and native messaging. It does not use WebDriver, CDP, or other browser-automation frameworks.
+
+## Local storage
+
+**Browser storage.** The extension stores its settings and temporary job and tab
+state in browser storage. This data stays in the browser so the extension can
+survive service-worker suspension and reconnect to the local application.
+
+**Application storage.** The local application stores papers, metadata, and job
+records in its data directory. Validated PDFs live in `artifacts/`. Downloaded
+candidates awaiting validation live in `quarantine/`. Papers go only to your own
+Zotero library if you enable that integration.
+
+**Diagnostic captures.** Diagnostic captures are sanitized HTML from pages you
+choose to capture. They are stored in `<data_dir>/captures/<host>/` and may still
+contain article text, account labels, or other page content. Captures are retained
+for 14 days and up to 10 per host by default; both limits are configurable in
+`[captures]`. Run `papio adapter captures purge` to remove every capture, or
+`papio adapter captures purge --host <host>` to remove captures for one host.
+
+The extension no longer writes `~/Downloads/papio-fixtures/`. An existing directory
+there is safe to delete.
+
+**Bug reports.** The data directory may also contain `papio.db` (request history,
+titles, and identifiers), `native-host.log` (browser-session diagnostics,
+including URLs), `adoptions/` (browser-downloaded files awaiting adoption), and the
+`update-cache*.json` and `retraction-cache.json` files. *papio* does not upload
+these files. Review and minimize them before sharing a bug report; they describe
+what you have been reading.
+
+**Adapter evidence.** Reaching a provider with no adapter can create a sanitized
+diagnostic capture, but *papio* never uploads it, opens a public issue, or sends
+telemetry. Review and minimize a capture before sharing it yourself. Sanitized HTML
+can still contain article text, account labels, or other page content.
+
+**Acquisition history and impact figures.** The extension's figures — papers
+acquired, estimated time saved, success rate, weekly acquisition trend,
+access-route breakdown, and human-handoff rate — are calculated locally from job
+records. They are displayed only to you and are never transmitted anywhere.
 
 ## Permissions
 
-Each browser permission the extension requests is used solely to perform a
-requested download and report the result to the local app — for example,
-`nativeMessaging` to reach the local daemon, `downloads` to save the one
-requested PDF, and host permissions to read the library/publisher pages needed
-for a specific job. A per-permission explanation is available on the extension's
-store listing.
+Each browser permission is used to perform a requested download, read a page needed
+for that job, or report the result to the local application. For example,
+`nativeMessaging` reaches the local daemon, `downloads` saves the requested PDF, and
+host permissions allow the extension to read library and publisher pages needed for
+a specific job. The extension store listing explains each permission in detail.
 
 ## Third parties
 
-*papio* does not sell your data, does not share it with anyone for their own
-purposes, and does not use or transfer it for advertising, creditworthiness, or any
-purpose unrelated to performing the acquisition you requested. What it does send to
-the scholarly APIs in the table above is sent solely to find and fetch the paper you
-asked for. When you request a paper through the browser handoff, your browser
-contacts your institution and the relevant publisher directly, exactly as it would if
-you visited those sites yourself; *papio* adds no intermediary.
+*papio* does not sell your data or share it for advertising, credit decisions, or
+unrelated purposes.
+
+The third-party scholarly services in the table receive the data listed there
+because they are needed to find or download the paper you requested. During browser
+handoff, your browser contacts your institution and the publisher directly. *papio*
+is not an intermediary for those requests.
 
 ## Changes
 
-If this policy changes, the "Last updated" date above will change and the current
+If this policy changes, the “Last updated” date above will change. The current
 version will always be available at this URL.
 
 ## Contact
