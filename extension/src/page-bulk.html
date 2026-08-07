@@ -1,0 +1,373 @@
+<!doctype html>
+<!-- Copyright 2026 OrgMentem. Licensed under MIT. See LICENSE. -->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>papio — select papers</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --color-ink: #182231;
+        --color-brand-ink: #2b2d42;
+        --color-brand-accent: #d94f3d;
+        --color-muted: #607080;
+        --color-context: #426789;
+        --color-border: #dce3ea;
+        --color-control-border: #b8c5d1;
+        --color-page: #f4f7f9;
+        --color-surface: #fdfefe;
+        --color-surface-hover: #eef3f6;
+        --color-primary: #12549b;
+        --color-primary-border: #8db9eb;
+        --color-primary-surface: #eaf3ff;
+        --color-primary-hover: #dcecff;
+        --color-warning: #6d4316;
+        --color-warning-border: #a15c17;
+        --color-warning-surface: #fff7ed;
+        --color-ok: #245e45;
+        --color-ok-border: #78aa8f;
+        --color-ok-surface: #edf7f1;
+        --color-primary-solid: #12549b;
+        --color-primary-solid-hover: #0d447f;
+        --color-on-primary: #fdfefe;
+        --color-danger: #8f2f28;
+        --color-danger-border: #d94f3d;
+        --color-danger-surface: #fff0ed;
+        --color-neutral-badge: #eef3f6;
+        --font-size-label: 11px;
+        --font-size-small: 12px;
+        --font-size-body: 14px;
+        --font-size-title: 22px;
+        --space-1: 4px;
+        --space-2: 8px;
+        --space-3: 12px;
+        --space-4: 16px;
+        --space-6: 24px;
+        --space-8: 32px;
+        --radius-control: 6px;
+        --radius-card: 8px;
+        --control-height: 36px;
+        --page-max-width: 60rem;
+        accent-color: var(--color-primary);
+        color: var(--color-ink);
+        font-family:
+          ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+          sans-serif;
+      }
+
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --color-ink: #e5edf4;
+          --color-brand-ink: #f0edf3;
+          --color-brand-accent: #ef6a57;
+          --color-muted: #a2b1be;
+          --color-context: #aecbe4;
+          --color-border: #3e4f61;
+          --color-control-border: #526579;
+          --color-page: #141b23;
+          --color-surface: #1c2631;
+          --color-surface-hover: #263340;
+          --color-primary: #a8d0ff;
+          --color-primary-border: #4f85bc;
+          --color-primary-surface: #183956;
+          --color-primary-hover: #214967;
+          --color-warning: #f1c183;
+          --color-warning-border: #b97833;
+          --color-warning-surface: #33291e;
+          --color-ok: #b3ddc2;
+          --color-ok-border: #568f6d;
+          --color-ok-surface: #1d3329;
+          --color-primary-solid: #75b5f5;
+          --color-primary-solid-hover: #91c5fb;
+          --color-on-primary: #101a24;
+          --color-danger: #ffb2a8;
+          --color-danger-border: #ef6a57;
+          --color-danger-surface: #3a2223;
+          --color-neutral-badge: #263340;
+        }
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      [hidden] {
+        display: none !important;
+      }
+
+      body {
+        background: var(--color-page);
+        color: var(--color-ink);
+        font-size: var(--font-size-body);
+        line-height: 1.5;
+        margin: 0 auto;
+        max-width: var(--page-max-width);
+        min-height: 100vh;
+        padding: var(--space-8) var(--space-6) var(--space-8);
+      }
+
+      header {
+        border-bottom: 1px solid var(--color-border);
+        display: flex;
+        flex-wrap: wrap;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: var(--space-3);
+        padding-bottom: var(--space-4);
+      }
+
+      .brand {
+        font-size: var(--font-size-title);
+        font-weight: 700;
+      }
+
+      .brand em {
+        color: var(--color-brand-accent);
+        font-style: normal;
+      }
+
+      #scan-context {
+        text-align: right;
+      }
+
+      #scan-title {
+        color: var(--color-ink);
+        font-weight: 600;
+        margin: 0;
+      }
+
+      #scan-meta {
+        color: var(--color-muted);
+        font-size: var(--font-size-small);
+        margin: var(--space-1) 0 0;
+      }
+
+      #scan-summary {
+        color: var(--color-context);
+        font-size: var(--font-size-small);
+        margin-top: var(--space-3);
+      }
+
+      #scan-error,
+      #scan-expired {
+        background: var(--color-danger-surface);
+        border: 1px solid var(--color-danger-border);
+        border-radius: var(--radius-card);
+        color: var(--color-danger);
+        margin-top: var(--space-4);
+        padding: var(--space-3);
+      }
+
+      #status-error {
+        background: var(--color-warning-surface);
+        border: 1px solid var(--color-warning-border);
+        border-radius: var(--radius-card);
+        color: var(--color-warning);
+        display: flex;
+        align-items: center;
+        gap: var(--space-3);
+        justify-content: space-between;
+        margin-top: var(--space-4);
+        padding: var(--space-3);
+      }
+
+      #rows {
+        display: grid;
+        gap: var(--space-2);
+        margin-top: var(--space-4);
+      }
+
+      .pb-row {
+        align-items: start;
+        background: var(--color-surface);
+        border: 1px solid var(--color-border);
+        border-radius: var(--radius-card);
+        display: grid;
+        gap: var(--space-2);
+        grid-template-columns: auto 1fr;
+        padding: var(--space-3);
+      }
+
+      .pb-row[data-disabled="true"] {
+        opacity: 0.62;
+      }
+
+      .pb-row input[type="checkbox"] {
+        height: 18px;
+        margin-top: 2px;
+        width: 18px;
+      }
+
+      .pb-row-label {
+        display: block;
+        font-weight: 600;
+      }
+
+      .pb-row-meta {
+        color: var(--color-context);
+        display: flex;
+        flex-wrap: wrap;
+        font-size: var(--font-size-small);
+        gap: var(--space-2);
+        margin-top: var(--space-1);
+      }
+
+      .pb-row-identifier {
+        text-transform: uppercase;
+      }
+
+      .pb-row-status {
+        font-weight: 600;
+      }
+
+      .pb-row[data-status="invalid"] .pb-row-status {
+        color: var(--color-danger);
+      }
+
+      .pb-row[data-status="previously_unavailable"] .pb-row-status {
+        color: var(--color-warning);
+      }
+
+      .pb-row[data-status="queued"] .pb-row-status {
+        color: var(--color-context);
+      }
+
+      #empty-state {
+        color: var(--color-muted);
+        margin-top: var(--space-6);
+        text-align: center;
+      }
+
+      #truncated-note {
+        color: var(--color-warning);
+        font-size: var(--font-size-small);
+        margin-top: var(--space-2);
+      }
+
+      .action-bar {
+        align-items: center;
+        display: flex;
+        flex-wrap: wrap;
+        gap: var(--space-3);
+        margin-top: var(--space-6);
+      }
+
+      #source-closed-note {
+        color: var(--color-muted);
+        font-size: var(--font-size-small);
+      }
+
+      button {
+        background: var(--color-surface);
+        border: 1px solid var(--color-control-border);
+        border-radius: var(--radius-control);
+        color: var(--color-ink);
+        cursor: pointer;
+        font: inherit;
+        min-height: var(--control-height);
+        padding: 0 var(--space-4);
+      }
+
+      button.primary {
+        background: var(--color-primary-solid);
+        border-color: var(--color-primary-solid);
+        color: var(--color-on-primary);
+        font-weight: 700;
+      }
+
+      button.primary:hover:not(:disabled) {
+        background: var(--color-primary-solid-hover);
+      }
+
+      button:disabled {
+        cursor: not-allowed;
+        opacity: 0.5;
+      }
+
+      button.ghost {
+        background: transparent;
+        border-color: var(--color-control-border);
+        color: var(--color-primary);
+      }
+
+      #submit-status {
+        color: var(--color-context);
+        font-size: var(--font-size-small);
+      }
+
+      #result-summary {
+        background: var(--color-ok-surface);
+        border: 1px solid var(--color-ok-border);
+        border-radius: var(--radius-card);
+        color: var(--color-ok);
+        margin-top: var(--space-4);
+        padding: var(--space-4);
+      }
+
+      #result-summary a {
+        color: inherit;
+        font-weight: 700;
+      }
+
+      footer {
+        border-top: 1px solid var(--color-border);
+        color: var(--color-muted);
+        font-size: var(--font-size-small);
+        margin-top: var(--space-8);
+        padding-top: var(--space-4);
+      }
+
+      #allowlist-row {
+        align-items: center;
+        display: flex;
+        gap: var(--space-2);
+        margin-top: var(--space-3);
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <div class="brand"><em>papio</em> — select papers</div>
+      <div id="scan-context">
+        <p id="scan-title"></p>
+        <p id="scan-meta"></p>
+      </div>
+    </header>
+    <p id="scan-summary" role="status" aria-live="polite">Loading…</p>
+    <div id="scan-error" role="alert" hidden></div>
+    <div id="scan-expired" role="alert" hidden>scan expired — rescan the source page</div>
+    <div id="status-error" role="alert" hidden>
+      <span id="status-error-message"></span>
+      <button id="status-retry-btn" type="button" class="ghost">Retry</button>
+    </div>
+    <p id="truncated-note" hidden>
+      papio stopped scanning at 200 candidates on this page. Some citations may be missing — narrow the page or scroll before rescanning.
+    </p>
+    <main id="workspace-main">
+      <div id="rows" aria-label="Detected papers"></div>
+      <p id="empty-state" hidden>papio found no recognizable identifiers on this page.</p>
+    </main>
+    <div id="action-bar" class="action-bar">
+      <button id="return-to-source-btn" type="button" class="ghost">Return to source page</button>
+      <p id="source-closed-note" hidden>source tab closed — this snapshot remains usable</p>
+      <button id="rescan-btn" type="button" class="ghost">Rescan</button>
+      <button id="primary-btn" type="button" class="primary" disabled>Acquire all 0 eligible</button>
+      <p id="submit-status" role="status" aria-live="polite"></p>
+    </div>
+    <div id="result-summary" role="status" aria-live="polite" hidden></div>
+    <footer>
+      <p id="privacy-line">
+        <em>papio</em> does not read the page until you choose "Select papers on this page." Detection runs locally in
+        that tab. The identifiers and short citation labels shown in the selection workspace may be sent to the
+        <em>papio</em> application on your computer for local library and job matching. No scholarly service is
+        contacted until you submit selected papers.
+      </p>
+      <div id="allowlist-row">
+        <input type="checkbox" id="allowlist-checkbox" />
+        <label for="allowlist-checkbox">Always allow scanning on this site</label>
+      </div>
+    </footer>
+    <script src="./page-bulk.js" type="module"></script>
+  </body>
+</html>

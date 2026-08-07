@@ -1546,7 +1546,7 @@ function dismissCancelsJob(item: TriageSnapshotItem): boolean {
   if (item.kind !== "human_action") return false;
   switch (item.job_state) {
     case "awaiting_human":
-      return item.action_kind === "openurl_handoff" || item.action_kind === "manual_download" || item.action_kind === "openurl_available";
+      return item.action_kind === "openurl_handoff" || item.action_kind === "manual_download" || item.action_kind === "openurl_available" || item.action_kind === "document_delivery";
     case "needs_review":
       return item.action_kind === "verify_identity";
     case undefined:

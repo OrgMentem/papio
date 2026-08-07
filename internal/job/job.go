@@ -40,6 +40,35 @@ const (
 	StateCancelled     = "cancelled"
 )
 
+// RetryReason names a StateRetryWait reason that other packages must
+// recognise by identity rather than by matching an ad hoc event-detail
+// string. Ordinary resolver retry waits remain free-form reason strings
+// recorded only in event detail (e.g. "resolver_temporarily_unavailable");
+// a reason earns a constant here only when the wait is externally driven and
+// another package needs to test for it.
+const (
+	// RetryReasonDocumentDeliveryPending marks StateRetryWait while
+	// internal/delivery polls a submitted, not-yet-resolved provider request
+	// (ADR-0017 Decision 4). Delivery polling draws on its own budget, never
+	// the ordinary resolver/HTTP retry budget.
+	RetryReasonDocumentDeliveryPending = "document_delivery_pending"
+)
+
+// ActionKind names a human_actions.kind value that other packages must
+// recognise by identity. The kinds that predate this vocabulary
+// (openurl_handoff, manual_download, openurl_available, verify_identity)
+// remain free-form literals; ActionKindDocumentDelivery is named because
+// internal/delivery and the CLI need to test for it without restating the
+// string.
+const (
+	// ActionKindDocumentDelivery marks the human action opened only after
+	// internal/delivery exhausts deterministic reconciliation for a lodged
+	// delivery request (ADR-0017 Decision 4). Its three allowed operations
+	// (open_request_history, confirm_request_exists, confirm_request_absent)
+	// are validated by internal/delivery; it never offers retry_submission.
+	ActionKindDocumentDelivery = "document_delivery"
+)
+
 // Candidate statuses. Only CandidateAccepted asserts that these bytes were
 // fetched AND validated for the job that selected it, so it is the only status
 // provenance may be read from (ADR-0007).
@@ -2654,8 +2683,9 @@ func normalizeReviewBusy(err error) error {
 // DismissHumanAction atomically closes an open human action (compare-and-swap
 // on revision). It cancels the job only when that job is currently parked on
 // the dismissed action: awaiting_human for openurl_handoff, manual_download,
-// or openurl_available; or needs_review for verify_identity. A stale action
-// from another state is closed without disturbing the job's live work.
+// openurl_available, or document_delivery; or needs_review for
+// verify_identity. A stale action from another state is closed without
+// disturbing the job's live work.
 func (js *Store) DismissHumanAction(ctx context.Context, actionID, expectedRevision int64) (jobID string, err error) {
 	if actionID <= 0 || expectedRevision <= 0 {
 		return "", errors.New("dismiss requires a positive action ID and revision")
@@ -2710,7 +2740,7 @@ func (js *Store) DismissHumanAction(ctx context.Context, actionID, expectedRevis
 func dismissalCancelsParkedJob(actionKind, state string) bool {
 	switch state {
 	case StateAwaitingHuman:
-		return actionKind == "openurl_handoff" || actionKind == "manual_download" || actionKind == "openurl_available"
+		return actionKind == "openurl_handoff" || actionKind == "manual_download" || actionKind == "openurl_available" || actionKind == ActionKindDocumentDelivery
 	case StateNeedsReview:
 		return actionKind == "verify_identity"
 	default:

@@ -50,6 +50,9 @@ func Explain(state, reason, resolver, accessMode string, cfg config.Config) Expl
 	case "resolver_temporarily_unavailable", "candidate_temporarily_unavailable", "acquisition_inputs_temporarily_unavailable":
 		return Explanation{"retrying",
 			"A source was temporarily unavailable; papio will retry automatically. No action needed."}
+	case "document_delivery_pending":
+		return Explanation{"document_delivery_pending",
+			"A document-delivery request is lodged; papio is polling the provider. No action needed."}
 	case "no_identifier":
 		// The single most expensive wrong answer papio can give is "sign in" for
 		// a work no login can deliver. Name what is missing and the one remedy

@@ -8,6 +8,8 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -24,6 +26,7 @@ import (
 	"papio/internal/config"
 	"papio/internal/ipc"
 	"papio/internal/job"
+	"papio/internal/ownership"
 	"papio/internal/pdf"
 	"papio/internal/preview"
 	"papio/internal/protocol"
@@ -36,6 +39,11 @@ import (
 )
 
 func newBridge(t *testing.T) (*Bridge, *job.Store, config.Config, string) {
+	t.Helper()
+	return newBridgeWithHoldings(t, nil)
+}
+
+func newBridgeWithHoldings(t *testing.T, holdings holdingsProvider) (*Bridge, *job.Store, config.Config, string) {
 	t.Helper()
 	ctx := context.Background()
 	data := t.TempDir()
@@ -77,7 +85,7 @@ func newBridge(t *testing.T) (*Bridge, *job.Store, config.Config, string) {
 			Identity:   pdf.IdentityDecision{Result: pdf.IdentityPass, Evidence: []string{"doi match"}},
 		}, nil
 	}
-	return NewBridge(jobs, svc, triageService, &watch.Runner{Store: watches}, previewServer, captureStore, cfg, "0.1.0-test"), jobs, cfg, data
+	return NewBridge(jobs, svc, triageService, &watch.Runner{Store: watches}, previewServer, captureStore, holdings, cfg, "0.1.0-test"), jobs, cfg, data
 }
 
 func handoffWork() work.Work {
@@ -239,7 +247,7 @@ func pageCapturePayload(t *testing.T, html []byte) protocol.PageCapturePayload {
 func TestPageCaptureDisabledDoesNotStore(t *testing.T) {
 	b, _, cfg, data := newBridge(t)
 	cfg.Captures.Enabled = false
-	b = NewBridge(b.jobs, b.svc, b.triage, b.watchRunner, b.preview, b.captureStore, cfg, b.Version)
+	b = NewBridge(b.jobs, b.svc, b.triage, b.watchRunner, b.preview, b.captureStore, b.holdings, cfg, b.Version)
 	runSync(t, b, hello())
 	runSync(t, b, inFrame(t, protocol.MsgPageCapture, "", pageCapturePayload(t, []byte("<html>disabled</html>"))))
 
@@ -1507,7 +1515,7 @@ func TestDaemonRestartReturnsHelloRequired(t *testing.T) {
 	runSync(t, active, hello())
 
 	// A new daemon has the same durable jobs but no in-memory hello-session.
-	restarted := NewBridge(jobs, active.svc, active.triage, active.watchRunner, active.preview, active.captureStore, cfg, active.Version)
+	restarted := NewBridge(jobs, active.svc, active.triage, active.watchRunner, active.preview, active.captureStore, active.holdings, cfg, active.Version)
 	msgs, _ := runSync(t, restarted)
 	if len(msgs) != 1 {
 		t.Fatalf("restart poll frames = %d, want 1", len(msgs))
@@ -3617,7 +3625,7 @@ func TestOpenURLUsesSelectedResolverProfileForPrimoNDEAndVE(t *testing.T) {
 	cfg.Browser.Resolvers = map[string]config.Institution{
 		"institute": {OpenURLBase: "https://onesearch.library.example-institute.edu/discovery/openurl?vid=61INS_INST:INS"},
 	}
-	b = NewBridge(b.jobs, b.svc, b.triage, b.watchRunner, b.preview, b.captureStore, cfg, b.Version)
+	b = NewBridge(b.jobs, b.svc, b.triage, b.watchRunner, b.preview, b.captureStore, b.holdings, cfg, b.Version)
 	for _, test := range []struct {
 		name, resolver, wantPath, wantVID string
 	}{
@@ -3652,7 +3660,7 @@ func TestOfferRoutesThroughLibKeyAndKeepsResolverHostVisible(t *testing.T) {
 	cfg.Browser.OpenURLBase = "https://resolver.example.edu/openurl"
 	cfg.Browser.LibKeyMode = "link"
 	cfg.Browser.LibKeyLibraryID = 1234
-	b = NewBridge(b.jobs, b.svc, b.triage, b.watchRunner, b.preview, b.captureStore, cfg, b.Version)
+	b = NewBridge(b.jobs, b.svc, b.triage, b.watchRunner, b.preview, b.captureStore, b.holdings, cfg, b.Version)
 
 	raw, err := b.offer(job.Row{ID: "job-libkey", Work: handoffWork(), Policy: job.Policy{}}, job.HumanAction{Kind: handoffActionKind, Detail: "institutional handoff", RequiresAuth: true}, config.ModeDelegated)
 	if err != nil {
@@ -3679,7 +3687,7 @@ func TestOfferWithoutLibKeyIdentifierFallsBackToOpenURL(t *testing.T) {
 	cfg.Browser.OpenURLBase = "https://resolver.example.edu/openurl"
 	cfg.Browser.LibKeyMode = "link"
 	cfg.Browser.LibKeyLibraryID = 1234
-	b = NewBridge(b.jobs, b.svc, b.triage, b.watchRunner, b.preview, b.captureStore, cfg, b.Version)
+	b = NewBridge(b.jobs, b.svc, b.triage, b.watchRunner, b.preview, b.captureStore, b.holdings, cfg, b.Version)
 
 	// An ISBN-only book has no LibKey route; the offer must land on the
 	// plain resolver, not dead-end (LibKey augments, never replaces).
@@ -3715,7 +3723,7 @@ func TestOfferLoginRoutingIsPerResolverProfile(t *testing.T) {
 		// ...and one without an identity gets none (no default leakage).
 		"bare": {OpenURLBase: "https://library.example.edu/openurl"},
 	}
-	b = NewBridge(b.jobs, b.svc, b.triage, b.watchRunner, b.preview, b.captureStore, cfg, b.Version)
+	b = NewBridge(b.jobs, b.svc, b.triage, b.watchRunner, b.preview, b.captureStore, b.holdings, cfg, b.Version)
 
 	for _, test := range []struct {
 		name, resolver, wantEntityID, wantAccountID string
@@ -4361,5 +4369,341 @@ func TestAcceptedLeaseOutlastsTheExtensionQueueWait(t *testing.T) {
 	}
 	if state.Quiesced {
 		t.Fatal("quiesced a handoff that was only waiting for a drive slot")
+	}
+}
+
+// bulkHoldingsProvider is an aligned ownership fixture with per-identifier
+// artifact evidence. Missing entries are complete no-claims unless explicitly
+// listed as incomplete.
+type bulkHoldingsProvider struct {
+	artifacts  map[string]string
+	incomplete map[string]bool
+}
+
+func (p bulkHoldingsProvider) Name() string { return "test-holdings" }
+
+func (p bulkHoldingsProvider) Lookup(_ context.Context, queries []ownership.Query) ([][]ownership.Claim, ownership.SourceHealth) {
+	claims := make([][]ownership.Claim, len(queries))
+	complete := true
+	for i, query := range queries {
+		for _, id := range query.Identifiers {
+			if p.incomplete[id.Key()] {
+				complete = false
+			}
+			artifact, ok := p.artifacts[id.Key()]
+			if !ok {
+				continue
+			}
+			claims[i] = append(claims[i], ownership.Claim{
+				Source: p.Name(), Matched: id, RecordPresent: true, Artifact: artifact,
+			})
+		}
+	}
+	return claims, ownership.SourceHealth{Name: p.Name(), Complete: complete, EntryCount: len(p.artifacts)}
+}
+
+// bulkJob creates a durable job for a DOI without driving it through any
+// state transitions, leaving it in the live "queued" state — exactly what
+// canonicalJobStatus's "queued" branch should surface.
+func bulkJob(t *testing.T, jobs *job.Store, reqID, doi string) string {
+	t.Helper()
+	id, err := jobs.CreateRequest(context.Background(), reqID, work.Work{DOI: doi}, "", "",
+		job.Policy{AccessMode: config.ModeDelegated, DesiredVersion: "any", FetchMaxBytes: 1 << 20}, nil, job.PrincipalUnknown)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+// bulkUnavailableJob drives a fresh job straight to a terminal "unavailable"
+// state, the fixture canonicalJobStatus's previously_unavailable branch reads.
+func bulkUnavailableJob(t *testing.T, jobs *job.Store, reqID, doi string) string {
+	t.Helper()
+	ctx := context.Background()
+	id := bulkJob(t, jobs, reqID, doi)
+	if err := jobs.Transition(ctx, id, job.StateQueued, job.StateResolving, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.Transition(ctx, id, job.StateResolving, job.StateUnavailable, nil, job.WithTerminalReason(job.TerminalReasonUnknown)); err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+// TestPageBulkStatusMixedOutcomes exercises Decision 5's full status mapping
+// end to end: durable job verdicts take precedence, positive holdings claims
+// distinguish PDF-present from record-only evidence, a complete no-claim lookup
+// is truly eligible, a partial no-claim lookup remains unknown, and an
+// unrecognized DOI is invalid.
+func TestPageBulkStatusMixedOutcomes(t *testing.T) {
+	holdings := ownership.NewRegistry(bulkHoldingsProvider{
+		artifacts: map[string]string{
+			"doi:10.1000/owned-pdf.1":   ownership.ArtifactPresent,
+			"doi:10.1000/record-only.1": ownership.ArtifactMissing,
+		},
+		incomplete: map[string]bool{"doi:10.1000/partial.1": true},
+	})
+	b, jobs, _, _ := newBridgeWithHoldings(t, holdings)
+	runSync(t, b, hello())
+
+	queuedID := bulkJob(t, jobs, "wr_bulk_queued", "10.1000/queued.1")
+	bulkUnavailableJob(t, jobs, "wr_bulk_unavail", "10.1000/gone.1")
+
+	frame := inFrame(t, protocol.MsgPageBulkStatusRequest, "", protocol.PageBulkStatusRequestPayload{
+		RequestID: "request-bulk-mixed001", ScanID: "scan-bulk-mixed0001",
+		Identifiers: []protocol.PageBulkIdentifier{
+			{LocalID: "row-1", Kind: "doi", Value: "10.1000/queued.1"},
+			{LocalID: "row-2", Kind: "doi", Value: "10.1000/gone.1"},
+			{LocalID: "row-3", Kind: "doi", Value: "10.1000/owned-pdf.1"},
+			{LocalID: "row-4", Kind: "doi", Value: "10.1000/record-only.1"},
+			{LocalID: "row-5", Kind: "doi", Value: "10.1000/eligible.1"},
+			{LocalID: "row-6", Kind: "doi", Value: "10.1000/partial.1"},
+			{LocalID: "row-7", Kind: "doi", Value: "not-a-doi"},
+		},
+	})
+	msgs, _ := runSync(t, b, frame)
+	result := firstOfType(msgs, protocol.MsgPageBulkStatusResult)
+	if result == nil {
+		t.Fatalf("no page_bulk_status_result in %v", msgs)
+	}
+	payload := result.Payload.(*protocol.PageBulkStatusResultPayload)
+	if payload.Truncated {
+		t.Fatalf("truncated = true for a 7-item request, want false")
+	}
+	if len(payload.Items) != 7 {
+		t.Fatalf("items = %d, want 7", len(payload.Items))
+	}
+	byLocalID := make(map[string]protocol.PageBulkStatusItem, 7)
+	for _, item := range payload.Items {
+		byLocalID[item.LocalID] = item
+	}
+	queued := byLocalID["row-1"]
+	if queued.Status != "queued" || queued.JobID != queuedID || queued.CanonicalKey != "doi:10.1000/queued.1" || queued.OwnershipComplete {
+		t.Fatalf("row-1 = %+v, want queued job %q without an ownership verdict", queued, queuedID)
+	}
+	unavailable := byLocalID["row-2"]
+	if unavailable.Status != "previously_unavailable" || unavailable.CanonicalKey != "doi:10.1000/gone.1" || unavailable.JobID != "" || unavailable.OwnershipComplete {
+		t.Fatalf("row-2 = %+v, want previously_unavailable without an ownership verdict", unavailable)
+	}
+	ownedPDF := byLocalID["row-3"]
+	if ownedPDF.Status != "owned_with_pdf" || ownedPDF.CanonicalKey != "doi:10.1000/owned-pdf.1" || !ownedPDF.OwnershipComplete {
+		t.Fatalf("row-3 = %+v, want owned_with_pdf with complete ownership", ownedPDF)
+	}
+	recordOnly := byLocalID["row-4"]
+	if recordOnly.Status != "owned_missing_pdf" || recordOnly.CanonicalKey != "doi:10.1000/record-only.1" || !recordOnly.OwnershipComplete {
+		t.Fatalf("row-4 = %+v, want owned_missing_pdf with complete ownership", recordOnly)
+	}
+	eligible := byLocalID["row-5"]
+	if eligible.Status != "eligible" || eligible.CanonicalKey != "doi:10.1000/eligible.1" || !eligible.OwnershipComplete {
+		t.Fatalf("row-5 = %+v, want eligible after a complete no-claim lookup", eligible)
+	}
+	incomplete := byLocalID["row-6"]
+	if incomplete.Status != "ownership_incomplete" || incomplete.CanonicalKey != "doi:10.1000/partial.1" || incomplete.OwnershipComplete {
+		t.Fatalf("row-6 = %+v, want ownership_incomplete after a partial no-claim lookup", incomplete)
+	}
+	invalid := byLocalID["row-7"]
+	if invalid.Status != "invalid" || invalid.CanonicalKey != "" || invalid.JobID != "" || invalid.OwnershipComplete {
+		t.Fatalf("row-7 = %+v, want invalid with no canonical_key", invalid)
+	}
+}
+
+func TestPageBulkStatusNilHoldingsStaysIncomplete(t *testing.T) {
+	var holdings *ownership.Registry
+	b, _, _, _ := newBridgeWithHoldings(t, holdings)
+	runSync(t, b, hello())
+
+	frame := inFrame(t, protocol.MsgPageBulkStatusRequest, "", protocol.PageBulkStatusRequestPayload{
+		RequestID: "request-bulk-nil00001", ScanID: "scan-bulk-nil000001",
+		Identifiers: []protocol.PageBulkIdentifier{{LocalID: "row-1", Kind: "doi", Value: "10.1000/unknown.1"}},
+	})
+	msgs, _ := runSync(t, b, frame)
+	result := firstOfType(msgs, protocol.MsgPageBulkStatusResult)
+	if result == nil {
+		t.Fatalf("no page_bulk_status_result in %v", msgs)
+	}
+	item := result.Payload.(*protocol.PageBulkStatusResultPayload).Items[0]
+	if item.Status != "ownership_incomplete" || item.OwnershipComplete {
+		t.Fatalf("item = %+v with nil holdings, want ownership_incomplete and ownership_complete=false", item)
+	}
+}
+
+// TestPageBulkStatusOwnershipLookupFailureStaysIncomplete pins ADR-0008
+// invariant 2 for the identity-lookup path canonicalJobStatus owns: a failed
+// store read must surface as ownership_incomplete, never a negative "not
+// owned" fact. The failure is forced on a second, non-holder session so the
+// holder-only poll (which independently reads the jobs/identifiers join for
+// open handoffs) never runs against the broken schema.
+func TestPageBulkStatusOwnershipLookupFailureStaysIncomplete(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	runSync(t, b, hello())
+	if _, err := jobs.S.DB().ExecContext(ctx, "DROP TABLE identifiers"); err != nil {
+		t.Fatal(err)
+	}
+	const pendingSession = "sess-pending-00000000000000000000000"
+	runSyncAs(t, b, pendingSession, hello())
+
+	frame := inFrame(t, protocol.MsgPageBulkStatusRequest, "", protocol.PageBulkStatusRequestPayload{
+		RequestID: "request-bulk-fail0001", ScanID: "scan-bulk-fail00001",
+		Identifiers: []protocol.PageBulkIdentifier{{LocalID: "row-1", Kind: "doi", Value: "10.1000/example.1"}},
+	})
+	msgs, _ := runSyncAs(t, b, pendingSession, frame)
+	result := firstOfType(msgs, protocol.MsgPageBulkStatusResult)
+	if result == nil {
+		t.Fatalf("no page_bulk_status_result in %v", msgs)
+	}
+	payload := result.Payload.(*protocol.PageBulkStatusResultPayload)
+	if len(payload.Items) != 1 {
+		t.Fatalf("items = %d, want 1", len(payload.Items))
+	}
+	item := payload.Items[0]
+	if item.Status != "ownership_incomplete" || item.OwnershipComplete {
+		t.Fatalf("item = %+v after a broken identity store, want ownership_incomplete and ownership_complete=false", item)
+	}
+	if item.CanonicalKey != "doi:10.1000/example.1" {
+		t.Fatalf("canonical_key = %q, want the normalized identity even when the lookup failed", item.CanonicalKey)
+	}
+}
+
+// TestPageBulkSubmitCreatesJobsWithBrowserPageConsumer exercises Decision 5/7
+// end to end: a live key joins, a fresh key creates a browser-page job, a fresh
+// PDF-present holdings claim is skipped server-side as already_owned, and a key
+// that no longer decodes counts as invalid.
+func TestPageBulkSubmitCreatesJobsWithBrowserPageConsumer(t *testing.T) {
+	holdings := ownership.NewRegistry(bulkHoldingsProvider{artifacts: map[string]string{
+		"doi:10.1000/owned.8": ownership.ArtifactPresent,
+	}})
+	b, jobs, _, _ := newBridgeWithHoldings(t, holdings)
+	ctx := context.Background()
+	runSync(t, b, hello())
+	existingID := bulkJob(t, jobs, "wr_bulk_existing", "10.1000/existing.1")
+
+	frame := inFrame(t, protocol.MsgPageBulkSubmitRequest, "", protocol.PageBulkSubmitRequestPayload{
+		RequestID: "request-bulk-submit002", ScanID: "scan-bulk-submit0002",
+		CanonicalKeys: []string{"doi:10.1000/existing.1", "doi:10.1000/fresh.7", "doi:10.1000/owned.8", "not-a-canonical-key"},
+		Source: protocol.PageBulkSubmitSource{
+			Kind: "browser_page", Origin: "https://scholar.example.edu", Detector: "generic-identifiers/1",
+		},
+	})
+	msgs, _ := runSync(t, b, frame)
+	result := firstOfType(msgs, protocol.MsgPageBulkSubmitResult)
+	if result == nil {
+		t.Fatalf("no page_bulk_submit_result in %v", msgs)
+	}
+	payload := result.Payload.(*protocol.PageBulkSubmitResultPayload)
+	if payload.Submitted != 1 || payload.Joined != 1 || payload.Invalid != 1 || payload.AlreadyOwned != 1 {
+		t.Fatalf("counts = %+v, want {submitted:1 joined:1 already_owned:1 invalid:1}", payload)
+	}
+	if payload.BatchID == "" {
+		t.Fatal("batch_id is empty")
+	}
+
+	rows, err := jobs.S.DB().QueryContext(ctx, `
+		SELECT j.id, COALESCE(j.consumer,''),
+		       COALESCE((SELECT value FROM identifiers WHERE work_request_id = j.work_request_id AND kind = 'doi'), '')
+		FROM jobs j`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	byID := map[string]struct {
+		consumer, doi string
+	}{}
+	for rows.Next() {
+		var id, consumer, doi string
+		if err := rows.Scan(&id, &consumer, &doi); err != nil {
+			t.Fatal(err)
+		}
+		byID[id] = struct{ consumer, doi string }{consumer, doi}
+	}
+	if len(byID) != 2 {
+		t.Fatalf("jobs after submit = %d, want 2 (one joined, one new)", len(byID))
+	}
+	if existing, ok := byID[existingID]; !ok || existing.consumer != "" {
+		t.Fatalf("existing job %+v, want unattributed consumer (a join must not overwrite it)", byID[existingID])
+	}
+	var created *struct{ consumer, doi string }
+	for id, row := range byID {
+		if id != existingID {
+			created = &row
+		}
+	}
+	if created == nil || created.consumer != pageBulkConsumer || created.doi != "10.1000/fresh.7" {
+		t.Fatalf("new job = %+v, want consumer %q and doi 10.1000/fresh.7", created, pageBulkConsumer)
+	}
+
+	var selected, submitted, invalid int
+	var detectorID, sourceOrigin, batchID, openedAt, submittedAt string
+	if err := jobs.S.DB().QueryRowContext(ctx,
+		`SELECT detector_id, source_origin, selected, submitted, invalid, batch_id, opened_at, submitted_at FROM page_bulk_runs`,
+	).Scan(&detectorID, &sourceOrigin, &selected, &submitted, &invalid, &batchID, &openedAt, &submittedAt); err != nil {
+		t.Fatalf("page_bulk_runs row: %v", err)
+	}
+	if detectorID != "generic-identifiers/1" || sourceOrigin != "https://scholar.example.edu" {
+		t.Fatalf("run source = %q/%q, want detector/origin from the submit request", detectorID, sourceOrigin)
+	}
+	if selected != 4 || submitted != 1 || invalid != 1 {
+		t.Fatalf("run counts = selected:%d submitted:%d invalid:%d, want 4/1/1", selected, submitted, invalid)
+	}
+	if batchID != payload.BatchID {
+		t.Fatalf("run batch_id = %q, want %q", batchID, payload.BatchID)
+	}
+	if openedAt == "" || submittedAt == "" {
+		t.Fatal("run opened_at/submitted_at must be populated")
+	}
+}
+
+// TestPageBulkSubmitCanonicalKeysCapRejectedByDecode pins that the 50-key cap
+// is enforced by protocol decode (ADR-0019 Decision 5), not the handler: a
+// 51-key frame never reaches pageBulkSubmit and fails the whole Sync call
+// closed, exactly like any other malformed inbound frame.
+func TestPageBulkSubmitCanonicalKeysCapRejectedByDecode(t *testing.T) {
+	b, _, _, _ := newBridge(t)
+	runSync(t, b, hello())
+
+	keys := make([]string, 51)
+	for i := range keys {
+		keys[i] = fmt.Sprintf("doi:10.1000/example.%d", i)
+	}
+	frame := inFrame(t, protocol.MsgPageBulkSubmitRequest, "", protocol.PageBulkSubmitRequestPayload{
+		RequestID: "request-bulk-toomany01", ScanID: "scan-bulk-toomany001",
+		CanonicalKeys: keys,
+		Source: protocol.PageBulkSubmitSource{
+			Kind: "browser_page", Origin: "https://scholar.example.edu", Detector: "generic-identifiers/1",
+		},
+	})
+	_, err := b.Sync(context.Background(), testSessionID, false, []json.RawMessage{frame})
+	if !errors.Is(err, ErrInvalidFrame) {
+		t.Fatalf("sync error = %v, want ErrInvalidFrame for a 51-key submit", err)
+	}
+}
+
+// TestPageBulkSubmitEchoesUnknownScanID pins that scan_id is opaque
+// correlation only: the daemon keeps no scan-side state, so a submit whose
+// scan_id was never seen in a prior status_request (a stale sheet, a
+// restarted daemon, or simply a caller that skipped status) still succeeds
+// and echoes the same id back.
+func TestPageBulkSubmitEchoesUnknownScanID(t *testing.T) {
+	b, _, _, _ := newBridge(t)
+	runSync(t, b, hello())
+
+	frame := inFrame(t, protocol.MsgPageBulkSubmitRequest, "", protocol.PageBulkSubmitRequestPayload{
+		RequestID: "request-bulk-stale0001", ScanID: "scan-never-seen-before1",
+		CanonicalKeys: []string{"doi:10.1000/stale.99"},
+		Source: protocol.PageBulkSubmitSource{
+			Kind: "browser_page", Origin: "https://scholar.example.edu", Detector: "generic-identifiers/1",
+		},
+	})
+	msgs, _ := runSync(t, b, frame)
+	result := firstOfType(msgs, protocol.MsgPageBulkSubmitResult)
+	if result == nil {
+		t.Fatalf("no page_bulk_submit_result in %v", msgs)
+	}
+	payload := result.Payload.(*protocol.PageBulkSubmitResultPayload)
+	if payload.ScanID != "scan-never-seen-before1" {
+		t.Fatalf("scan_id = %q, want the unknown id echoed back unchanged", payload.ScanID)
+	}
+	if payload.Submitted != 1 || payload.Invalid != 0 {
+		t.Fatalf("counts = %+v, want a clean submit despite the unknown scan_id", payload)
 	}
 }

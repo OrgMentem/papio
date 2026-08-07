@@ -28,10 +28,23 @@ import {
   type DeliverySessionEvidence,
   type PageAcquireAckPayload,
   type PageAcquirePayload,
+  type PageBulkIdentifier,
+  type PageBulkStatusItem,
+  type PageBulkSubmitSource,
   type PageCapturePayload,
   type PageCaptureRequestPayload,
   type PageCaptureRequestResultPayload,
 } from "./protocol";
+import {
+  emptyPageBulkScanStore,
+  PAGE_BULK_SCAN_STORAGE_KEY,
+  scanDocument,
+  withPageBulkSnapshot,
+  type DetectedPaper,
+  type PageBulkScanStore,
+  type PageBulkSnapshot,
+  type ScanResult,
+} from "./page-scan";
 import {
   chromeBackend,
   clearPendingDelivery,
@@ -178,6 +191,10 @@ const ACTIVITY_FEED_FEATURE = "activity_feed_v1";
 const PAGE_CAPTURE_FEATURE = "page_capture_v1";
 const PAGE_CAPTURE_REQUEST_FEATURE = "page_capture_request_v1";
 const PAGE_CAPTURE_TERMS_FEATURE = "page_capture_terms_v1";
+/** ADR-0019 Decision 7: page_bulk_status_request/page_bulk_submit_request. */
+const PAGE_BULK_ACQUIRE_FEATURE = "page_bulk_acquire_v1";
+/** ADR-0019 Decision 2: kept separate from acquisition/adapter host grants. */
+const PAGE_BULK_ALLOWLIST_KEY = "papio_scanner_allowlist_v1";
 const PAGE_CAPTURE_DEFAULT_SETTLE_MS = 3_000;
 const PAGE_CAPTURE_NAV_TIMEOUT_MS = 30_000;
 const TRIAGE_COUNTS_FRESH_MS = 3 * KEEPALIVE_ALARM_MINUTES * 60_000;
@@ -193,6 +210,8 @@ const CORRELATED_RESULT_TYPES: ReadonlySet<BrowserMessageType> = new Set([
   "review_preview_result",
   "stats_response",
   "activity_response",
+  "page_bulk_status_result",
+  "page_bulk_submit_result",
 ]);
 // Fallback for a manifest without an action popup; both build targets ship
 // the pages under dist/ (see build.ts) and the manifest is the source of truth.
@@ -639,6 +658,24 @@ export interface BridgeDeps {
     load(): Promise<Record<string, number>>;
     save(entries: Record<string, number>): Promise<void>;
   };
+  /** Ephemeral scan snapshots (chrome.storage.session): never chrome.storage
+   * local/sync, never persisted, never sent to the daemon (ADR-0019
+   * Decision 4). Optional so callers that never exercise page-bulk scanning
+   * can omit it; a missing dep degrades scanning to "not saved" rather than
+   * throwing. */
+  pageBulkScans?: {
+    get(): Promise<PageBulkScanStore>;
+    set(store: PageBulkScanStore): Promise<void>;
+  };
+  /** Scanner-scoped origin allowlist (chrome.storage.local), kept and
+   * revocable separately from acquisition/adapter host-permission grants
+   * (ADR-0019 Decision 2). An explicit scan click is v1's consent for that
+   * one scan regardless of allowlist membership; this list only records an
+   * "always allow on this site" choice for future ambient features. */
+  scannerAllowlist?: {
+    get(): Promise<string[]>;
+    set(origins: string[]): Promise<void>;
+  };
   /** Toolbar badge for connection health. Kept injectable so bridge logic has
    * no dependency on a particular browser global. */
   action: {
@@ -1053,6 +1090,32 @@ async function clickDeclaredDownload(
   }
   return true;
 }
+
+/** Bare `scheme://host` for a scanned tab's URL, or null when the page is
+ * not an ordinary secure page (ADR-0019 Decision 6: source.origin is bare
+ * scheme+host only, and the daemon's page_bulk_submit_request rejects
+ * anything but https). */
+function bareHTTPSOrigin(rawURL: string | undefined): string | null {
+  if (typeof rawURL !== "string" || rawURL.length === 0) return null;
+  try {
+    const parsed = new URL(rawURL);
+    return parsed.protocol === "https:" ? `${parsed.protocol}//${parsed.host}` : null;
+  } catch {
+    return null;
+  }
+}
+
+/** ADR-0019 operator UX requirement: the selection workspace header names
+ * the source page and when it was scanned. Both are strictly local UI
+ * decoration, never sent to the daemon — page-scan.ts's PageBulkSnapshot,
+ * the shape shared with the detector and the daemon-facing status/submit
+ * round trip, deliberately excludes them (Decision 6: source.origin is bare
+ * scheme+host only, never a page title) — so they travel as a
+ * background-local intersection instead of widening that shared shape. */
+export type PageBulkSnapshotView = PageBulkSnapshot & {
+  sourceTitle: string;
+  scannedAt: string;
+};
 
 export class Bridge {
   private hydrated = false;
@@ -3458,6 +3521,211 @@ export class Bridge {
     const entries = result.payload["entries"];
     if (!Array.isArray(entries)) return this.failure("invalid_response", "The daemon returned invalid activity entries");
     return { ok: true, feature: true, entries: entries as ActivityEntryPayload[] };
+  }
+
+  // -------------------------------------------------------------------------
+  // ADR-0019: on-page bulk acquisition. Scanning and the local snapshot store
+  // are pure browser-local state (Decision 4); only the status/submit round
+  // trips below touch the daemon.
+  // -------------------------------------------------------------------------
+
+  /** Tab-derived facts the snapshot needs beyond origin. `title` is
+   * browser-local UI decoration only (ADR-0019 operator UX requirement:
+   * the workspace header names the source page) — it is carried on
+   * PageBulkSnapshotView, never on the daemon-facing PageBulkSubmitSource
+   * (Decision 6: origin only, never page title). */
+  private async pageBulkTabMeta(tabID: number): Promise<{ origin: string; title: string } | null> {
+    try {
+      const tab = await this.deps.tabs.get(tabID);
+      const origin = bareHTTPSOrigin(tab.url);
+      if (origin === null) return null;
+      const title = tab.title?.trim();
+      return { origin, title: title !== undefined && title !== "" ? title : origin };
+    } catch {
+      return null;
+    }
+  }
+
+  /** Inject scanDocument into the tab's top frame (Decision 3: no iframes —
+   * executeScript's default target is the top frame only) and validate the
+   * shape of what comes back. `scanned` is cast to page-scan.ts's own
+   * declared ScanResult, the same convention capturePage's caller uses for
+   * its PageCapture result, then checked field-by-field before use. */
+  private async executePageScan(
+    tabID: number,
+  ): Promise<{ ok: true; items: DetectedPaper[]; truncated: boolean } | BrokerFailure> {
+    let injected: { result?: unknown } | undefined;
+    try {
+      [injected] = await this.deps.scripting.executeScript({ target: { tabId: tabID }, func: scanDocument });
+    } catch {
+      return this.failure("scan_failed", "Could not scan the page");
+    }
+    const scanned = injected?.result as ScanResult | undefined;
+    if (scanned === undefined || !Array.isArray(scanned) || typeof scanned.truncated !== "boolean") {
+      return this.failure("scan_failed", "Could not scan the page");
+    }
+    return { ok: true, items: scanned, truncated: scanned.truncated };
+  }
+
+  private async loadPageBulkStore(): Promise<PageBulkScanStore> {
+    if (this.deps.pageBulkScans === undefined) return emptyPageBulkScanStore();
+    return this.deps.pageBulkScans.get();
+  }
+
+  private async savePageBulkSnapshot(snapshot: PageBulkSnapshot): Promise<void> {
+    if (this.deps.pageBulkScans === undefined) return;
+    const store = await this.deps.pageBulkScans.get();
+    await this.deps.pageBulkScans.set(withPageBulkSnapshot(store, snapshot));
+  }
+
+  /** Scan tabID's top frame and persist a fresh snapshot (generation 1). The
+   * explicit popup click that reaches this method IS v1's scan consent
+   * (Decision 1, Decision 2) — no allowlist check gates it. */
+  async runPageBulkScan(tabID: number): Promise<BrokerReply<{ snapshot: PageBulkSnapshotView }>> {
+    const meta = await this.pageBulkTabMeta(tabID);
+    if (meta === null) {
+      return this.failure("invalid_page", "papio can only scan an ordinary secure (https) page");
+    }
+    const scanned = await this.executePageScan(tabID);
+    if (!scanned.ok) return scanned;
+    const snapshot: PageBulkSnapshotView = {
+      scanId: this.deps.randomUUID(),
+      sourceTabId: tabID,
+      sourceOrigin: meta.origin,
+      sourceTitle: meta.title,
+      scannedAt: new Date().toISOString(),
+      documentGeneration: 1,
+      items: scanned.items,
+      truncated: scanned.truncated,
+    };
+    await this.savePageBulkSnapshot(snapshot);
+    return { ok: true, snapshot };
+  }
+
+  /** Scan and open one selection workspace per active scan (Decision 4: a
+   * new tab per scan, never a singleton like the inbox). */
+  async startPageBulkScan(tabID: number, pageBulkBaseURL: string): Promise<BrokerReply<{ scan_id: string }>> {
+    const scanned = await this.runPageBulkScan(tabID);
+    if (!scanned.ok) return scanned;
+    try {
+      await this.deps.tabs.create({
+        url: `${pageBulkBaseURL}?scan=${encodeURIComponent(scanned.snapshot.scanId)}`,
+        active: true,
+      });
+    } catch {
+      return this.failure("open_failed", "Could not open the selection workspace");
+    }
+    return { ok: true, scan_id: scanned.snapshot.scanId };
+  }
+
+  /** Re-run the scan for an already-open workspace's scanId (the Rescan
+   * button), bumping documentGeneration so a superseded reply can be
+   * detected client-side. Reuses the scanId — never a new storage slot. */
+  async requestPageBulkRescan(scanID: string): Promise<BrokerReply<{ snapshot: PageBulkSnapshotView }>> {
+    const store = await this.loadPageBulkStore();
+    const existing = store.byId[scanID];
+    if (existing === undefined) return this.failure("scan_not_found", "This scan is no longer open");
+    const meta = await this.pageBulkTabMeta(existing.sourceTabId);
+    if (meta === null) return this.failure("tab_unavailable", "The source tab is no longer available");
+    const scanned = await this.executePageScan(existing.sourceTabId);
+    if (!scanned.ok) return scanned;
+    const snapshot: PageBulkSnapshotView = {
+      scanId: scanID,
+      sourceTabId: existing.sourceTabId,
+      sourceOrigin: meta.origin,
+      sourceTitle: meta.title,
+      scannedAt: new Date().toISOString(),
+      documentGeneration: existing.documentGeneration + 1,
+      items: scanned.items,
+      truncated: scanned.truncated,
+    };
+    await this.savePageBulkSnapshot(snapshot);
+    return { ok: true, snapshot };
+  }
+
+  /** Load an already-open workspace's snapshot without rescanning — the
+   * page-bulk.ts route's initial `?scan=<id>` read, and the missing half of
+   * the scan/rescan pair the predecessor landed (a workspace tab reloading
+   * or a fresh tab opened at ?scan=<id> had no way to fetch its snapshot
+   * without this). Returns scan_not_found once the snapshot has aged out of
+   * the bounded PAGE_BULK_SNAPSHOT_LIMIT store or the browser session ended
+   * (Decision 4: chrome.storage.session only, never persisted past the
+   * session) — the operator-visible "scan expired" state. */
+  async getPageBulkSnapshot(scanID: string): Promise<BrokerReply<{ snapshot: PageBulkSnapshotView }>> {
+    const store = await this.loadPageBulkStore();
+    const existing = store.byId[scanID] as PageBulkSnapshotView | undefined;
+    if (existing === undefined) return this.failure("scan_not_found", "This scan is no longer open");
+    return { ok: true, snapshot: existing };
+  }
+
+  async requestPageBulkStatus(
+    request: { scan_id: string; identifiers: PageBulkIdentifier[] },
+  ): Promise<BrokerReply<{ items: PageBulkStatusItem[]; truncated: boolean }>> {
+    const result = await this.requestNative(
+      "page_bulk_status_request",
+      request,
+      "page_bulk_status_result",
+      PAGE_BULK_ACQUIRE_FEATURE,
+      false,
+    );
+    if (result.kind !== "response" || result.payload === undefined) return this.nativeFailure(result);
+    if (result.code !== undefined) return this.failure(result.code, result.message ?? "The request is unavailable");
+    const items = result.payload["items"];
+    const truncated = result.payload["truncated"];
+    if (!Array.isArray(items) || typeof truncated !== "boolean") {
+      return this.failure("invalid_response", "The daemon returned an invalid page-bulk status result");
+    }
+    return { ok: true, items: items as PageBulkStatusItem[], truncated };
+  }
+
+  /** A submit is a mutation: it creates a batch, so — like requestTriageDecision
+   * — it gets exactly one attempt, never the read path's transport retry. */
+  async requestPageBulkSubmit(
+    request: { scan_id: string; canonical_keys: string[]; source: PageBulkSubmitSource },
+  ): Promise<
+    BrokerReply<{ submitted: number; joined: number; already_owned: number; invalid: number; batch_id: string }>
+  > {
+    const result = await this.requestNative(
+      "page_bulk_submit_request",
+      request,
+      "page_bulk_submit_result",
+      PAGE_BULK_ACQUIRE_FEATURE,
+      true,
+    );
+    if (result.kind !== "response" || result.payload === undefined) return this.nativeFailure(result);
+    if (result.code !== undefined) return this.failure(result.code, result.message ?? "The request is unavailable");
+    const payload = result.payload;
+    const submitted = payload["submitted"];
+    const joined = payload["joined"];
+    const alreadyOwned = payload["already_owned"];
+    const invalid = payload["invalid"];
+    const batchID = payload["batch_id"];
+    if (
+      typeof submitted !== "number" ||
+      typeof joined !== "number" ||
+      typeof alreadyOwned !== "number" ||
+      typeof invalid !== "number" ||
+      typeof batchID !== "string"
+    ) {
+      return this.failure("invalid_response", "The daemon returned an invalid page-bulk submit result");
+    }
+    return { ok: true, submitted, joined, already_owned: alreadyOwned, invalid, batch_id: batchID };
+  }
+
+  /** Membership read/write for the scanner-scoped allowlist (Decision 2).
+   * Absent dep degrades to "never allowlisted" rather than throwing. */
+  async pageBulkAllowlistContains(origin: string): Promise<BrokerReply<{ allowed: boolean }>> {
+    if (this.deps.scannerAllowlist === undefined) return { ok: true, allowed: false };
+    const origins = await this.deps.scannerAllowlist.get();
+    return { ok: true, allowed: origins.includes(origin) };
+  }
+
+  async setPageBulkAllowlist(origin: string, allowed: boolean): Promise<BrokerReply<{ allowed: boolean }>> {
+    if (this.deps.scannerAllowlist === undefined) return { ok: true, allowed: false };
+    const origins = await this.deps.scannerAllowlist.get();
+    const next = allowed ? [...origins.filter((o) => o !== origin), origin] : origins.filter((o) => o !== origin);
+    await this.deps.scannerAllowlist.set(next);
+    return { ok: true, allowed };
   }
 
 
@@ -7003,6 +7271,9 @@ interface InboxRuntimeURLs {
   inboxURL: string;
   popupURL: string;
   historyURL: string;
+  /** ADR-0019 Decision 4: addressed `?scan=<id>`, so exact-sender checks
+   * compare origin+pathname only — never the full URL — for this one page. */
+  pageBulkURL: string;
 }
 
 type InboxRuntimeReply =
@@ -7017,6 +7288,11 @@ type InboxRuntimeReply =
   | BrokerReply<{ stats: Record<string, unknown> }>
   | BrokerReply<{ feature: boolean; entries: ActivityEntryPayload[] }>
   | BrokerReply<{ state: BridgeSessionState; origins: KeepaliveOriginSnapshot[] }>
+  | BrokerReply<{ scan_id: string }>
+  | BrokerReply<{ snapshot: PageBulkSnapshot }>
+  | BrokerReply<{ items: PageBulkStatusItem[]; truncated: boolean }>
+  | BrokerReply<{ submitted: number; joined: number; already_owned: number; invalid: number; batch_id: string }>
+  | BrokerReply<{ allowed: boolean }>
   | DeliveryReply;
 
 function isObjectRecord(value: unknown): value is Record<string, unknown> {
@@ -7059,6 +7335,19 @@ function isPopupSender(sender: InboxRuntimeSender, urls: InboxRuntimeURLs): bool
 }
 function isInboxOrPopupSender(sender: InboxRuntimeSender, urls: InboxRuntimeURLs): boolean {
   return sender.id === urls.runtimeID && (sender.url === urls.inboxURL || sender.url === urls.popupURL);
+}
+
+/** ADR-0019 Decision 4: the workspace is addressed `?scan=<id>`, so the
+ * exact-page check compares origin+pathname only, ignoring that query. */
+function isPageBulkSender(sender: InboxRuntimeSender, urls: InboxRuntimeURLs): boolean {
+  if (sender.id !== urls.runtimeID || sender.url === undefined) return false;
+  try {
+    const senderURL = new URL(sender.url);
+    const pageURL = new URL(urls.pageBulkURL);
+    return senderURL.origin === pageURL.origin && senderURL.pathname === pageURL.pathname;
+  } catch {
+    return false;
+  }
 }
 
 // Stats is a read consumed by the popup summary and the history page as well
@@ -7137,6 +7426,88 @@ function isResolveRuntimeRequest(
 
 function isPreviewRuntimeRequest(value: unknown): value is { action_id: number } {
   return isObjectRecord(value) && hasOnlyKeys(value, ["action_id"]) && isPositiveSafeInteger(value["action_id"]);
+}
+
+function isPageBulkScanRuntimeRequest(value: unknown): value is { tab_id: number } {
+  return (
+    isObjectRecord(value) &&
+    hasOnlyKeys(value, ["tab_id"]) &&
+    typeof value["tab_id"] === "number" &&
+    Number.isSafeInteger(value["tab_id"]) &&
+    value["tab_id"] >= 0
+  );
+}
+
+function isPageBulkRescanRuntimeRequest(value: unknown): value is { scan_id: string } {
+  return (
+    isObjectRecord(value) &&
+    hasOnlyKeys(value, ["scan_id"]) &&
+    typeof value["scan_id"] === "string" &&
+    value["scan_id"].length > 0 &&
+    value["scan_id"].length <= 128
+  );
+}
+
+function isPageBulkIdentifier(value: unknown): value is PageBulkIdentifier {
+  if (!isObjectRecord(value) || !hasOnlyKeys(value, ["local_id", "kind", "value"])) return false;
+  const kind = value["kind"];
+  return (
+    typeof value["local_id"] === "string" &&
+    value["local_id"].length > 0 &&
+    value["local_id"].length <= 128 &&
+    (kind === "doi" || kind === "pmid" || kind === "arxiv") &&
+    typeof value["value"] === "string" &&
+    value["value"].length > 0 &&
+    value["value"].length <= 512
+  );
+}
+
+function isPageBulkStatusRuntimeRequest(
+  value: unknown,
+): value is { scan_id: string; identifiers: PageBulkIdentifier[] } {
+  if (!isObjectRecord(value) || !hasOnlyKeys(value, ["scan_id", "identifiers"])) return false;
+  const scanID = value["scan_id"];
+  const identifiers = value["identifiers"];
+  if (typeof scanID !== "string" || scanID.length === 0 || scanID.length > 128) return false;
+  if (!Array.isArray(identifiers) || identifiers.length < 1 || identifiers.length > 200) return false;
+  return identifiers.every(isPageBulkIdentifier);
+}
+
+function isPageBulkSubmitSource(value: unknown): value is PageBulkSubmitSource {
+  return (
+    isObjectRecord(value) &&
+    hasOnlyKeys(value, ["kind", "origin", "detector"]) &&
+    value["kind"] === "browser_page" &&
+    isBareHTTPSOrigin(value["origin"]) &&
+    typeof value["detector"] === "string" &&
+    value["detector"].length > 0 &&
+    value["detector"].length <= 128
+  );
+}
+
+function isPageBulkSubmitRuntimeRequest(
+  value: unknown,
+): value is { scan_id: string; canonical_keys: string[]; source: PageBulkSubmitSource } {
+  if (!isObjectRecord(value) || !hasOnlyKeys(value, ["scan_id", "canonical_keys", "source"])) return false;
+  const scanID = value["scan_id"];
+  const keys = value["canonical_keys"];
+  if (typeof scanID !== "string" || scanID.length === 0 || scanID.length > 128) return false;
+  if (!Array.isArray(keys) || keys.length < 1 || keys.length > 50) return false;
+  if (!keys.every((key) => typeof key === "string" && key.length > 0 && key.length <= 300)) return false;
+  return isPageBulkSubmitSource(value["source"]);
+}
+
+function isPageBulkAllowlistGetRuntimeRequest(value: unknown): value is { origin: string } {
+  return isObjectRecord(value) && hasOnlyKeys(value, ["origin"]) && isBareHTTPSOrigin(value["origin"]);
+}
+
+function isPageBulkAllowlistSetRuntimeRequest(value: unknown): value is { origin: string; allowed: boolean } {
+  return (
+    isObjectRecord(value) &&
+    hasOnlyKeys(value, ["origin", "allowed"]) &&
+    isBareHTTPSOrigin(value["origin"]) &&
+    typeof value["allowed"] === "boolean"
+  );
 }
 
 function isHandoffOpenRuntimeRequest(value: unknown): value is { job_id: string } {
@@ -7308,6 +7679,74 @@ export async function handleInboxRuntimeMessage(
     }
     return bridge.retryAuthStalled(message["request"].job_id);
   }
+  if (type === "papio.pageBulk.load") {
+    if (!isPageBulkSender(sender, urls)) {
+      return runtimeFailure("unauthorized", "This sender cannot load a page-bulk scan");
+    }
+    const request = message["request"];
+    // Same { scan_id } shape as papio.pageBulk.rescan — a plain read of the
+    // already-open workspace's snapshot, never a re-scan.
+    if (!hasOnlyKeys(message, ["type", "request"]) || !isPageBulkRescanRuntimeRequest(request)) {
+      return runtimeFailure("invalid_request", "Invalid page-bulk load request");
+    }
+    return bridge.getPageBulkSnapshot(request.scan_id);
+  }
+  if (type === "papio.pageBulk.scan") {
+    if (!isPopupSender(sender, urls)) return runtimeFailure("unauthorized", "This sender cannot start a page scan");
+    const request = message["request"];
+    if (!hasOnlyKeys(message, ["type", "request"]) || !isPageBulkScanRuntimeRequest(request)) {
+      return runtimeFailure("invalid_request", "Invalid page scan request");
+    }
+    return bridge.startPageBulkScan(request.tab_id, urls.pageBulkURL);
+  }
+  if (type === "papio.pageBulk.rescan") {
+    if (!isPageBulkSender(sender, urls)) return runtimeFailure("unauthorized", "This sender cannot rescan a page");
+    const request = message["request"];
+    if (!hasOnlyKeys(message, ["type", "request"]) || !isPageBulkRescanRuntimeRequest(request)) {
+      return runtimeFailure("invalid_request", "Invalid rescan request");
+    }
+    return bridge.requestPageBulkRescan(request.scan_id);
+  }
+  if (type === "papio.pageBulk.status") {
+    if (!isPageBulkSender(sender, urls)) {
+      return runtimeFailure("unauthorized", "This sender cannot look up page-bulk status");
+    }
+    const request = message["request"];
+    if (!hasOnlyKeys(message, ["type", "request"]) || !isPageBulkStatusRuntimeRequest(request)) {
+      return runtimeFailure("invalid_request", "Invalid page-bulk status request");
+    }
+    return bridge.requestPageBulkStatus(request);
+  }
+  if (type === "papio.pageBulk.submit") {
+    if (!isPageBulkSender(sender, urls)) {
+      return runtimeFailure("unauthorized", "This sender cannot submit a page-bulk batch");
+    }
+    const request = message["request"];
+    if (!hasOnlyKeys(message, ["type", "request"]) || !isPageBulkSubmitRuntimeRequest(request)) {
+      return runtimeFailure("invalid_request", "Invalid page-bulk submit request");
+    }
+    return bridge.requestPageBulkSubmit(request);
+  }
+  if (type === "papio.pageBulk.allowlist.get") {
+    if (!isPageBulkSender(sender, urls)) {
+      return runtimeFailure("unauthorized", "This sender cannot read the scanner allowlist");
+    }
+    const request = message["request"];
+    if (!hasOnlyKeys(message, ["type", "request"]) || !isPageBulkAllowlistGetRuntimeRequest(request)) {
+      return runtimeFailure("invalid_request", "Invalid scanner allowlist request");
+    }
+    return bridge.pageBulkAllowlistContains(request.origin);
+  }
+  if (type === "papio.pageBulk.allowlist.set") {
+    if (!isPageBulkSender(sender, urls)) {
+      return runtimeFailure("unauthorized", "This sender cannot change the scanner allowlist");
+    }
+    const request = message["request"];
+    if (!hasOnlyKeys(message, ["type", "request"]) || !isPageBulkAllowlistSetRuntimeRequest(request)) {
+      return runtimeFailure("invalid_request", "Invalid scanner allowlist request");
+    }
+    return bridge.setPageBulkAllowlist(request.origin, request.allowed);
+  }
   if (
     type !== "papio.activity" &&
     type !== "papio.triage.snapshot" &&
@@ -7355,6 +7794,17 @@ export async function handleInboxRuntimeMessage(
     default:
       return undefined;
   }
+}
+
+/** Defensive shape check for whatever chrome.storage.session actually holds
+ * (foreign extension write, a stale schema from a prior version, or nothing
+ * yet) before trusting it as a PageBulkScanStore. */
+function isPageBulkScanStore(value: unknown): value is PageBulkScanStore {
+  if (typeof value !== "object" || value === null) return false;
+  if (!("order" in value) || !("byId" in value)) return false;
+  const order = value.order;
+  const byId = value.byId;
+  return Array.isArray(order) && order.every((id) => typeof id === "string") && typeof byId === "object" && byId !== null;
 }
 
 function realDeps(): BridgeDeps {
@@ -7494,6 +7944,34 @@ function realDeps(): BridgeDeps {
         }
       },
     },
+    pageBulkScans: {
+      async get() {
+        try {
+          const got = await chrome.storage.session.get(PAGE_BULK_SCAN_STORAGE_KEY);
+          const stored = got[PAGE_BULK_SCAN_STORAGE_KEY];
+          return isPageBulkScanStore(stored) ? stored : emptyPageBulkScanStore();
+        } catch {
+          return emptyPageBulkScanStore();
+        }
+      },
+      async set(store) {
+        await chrome.storage.session.set({ [PAGE_BULK_SCAN_STORAGE_KEY]: store });
+      },
+    },
+    scannerAllowlist: {
+      async get() {
+        try {
+          const got = await chrome.storage.local.get(PAGE_BULK_ALLOWLIST_KEY);
+          const stored = got[PAGE_BULK_ALLOWLIST_KEY];
+          return Array.isArray(stored) ? stored.filter((origin): origin is string => typeof origin === "string") : [];
+        } catch {
+          return [];
+        }
+      },
+      async set(origins) {
+        await chrome.storage.local.set({ [PAGE_BULK_ALLOWLIST_KEY]: origins });
+      },
+    },
     action: {
       setBadgeText: (details) => chrome.action.setBadgeText(details),
       setBadgeBackgroundColor: (details) => chrome.action.setBadgeBackgroundColor(details),
@@ -7520,6 +7998,7 @@ if (typeof chrome !== "undefined" && chrome.runtime?.id) {
     inboxURL: chrome.runtime.getURL(declaredPopup.replace(/[^/]*$/, "inbox.html")),
     popupURL: chrome.runtime.getURL(declaredPopup),
     historyURL: chrome.runtime.getURL(declaredPopup.replace(/[^/]*$/, "history.html")),
+    pageBulkURL: chrome.runtime.getURL(declaredPopup.replace(/[^/]*$/, "page-bulk.html")),
   };
   // Top-level registrations give Chrome a reason to start this worker at
   // browser launch and after install/update. Without them a cold-started
@@ -7546,7 +8025,14 @@ if (typeof chrome !== "undefined" && chrome.runtime?.id) {
         message["type"] === "papio.session.probe" ||
         message["type"] === "papio.session.signin" ||
         message["type"] === "papio.session.retry" ||
-        message["type"] === "papio.stats")
+        message["type"] === "papio.stats" ||
+        message["type"] === "papio.pageBulk.load" ||
+        message["type"] === "papio.pageBulk.scan" ||
+        message["type"] === "papio.pageBulk.rescan" ||
+        message["type"] === "papio.pageBulk.status" ||
+        message["type"] === "papio.pageBulk.submit" ||
+        message["type"] === "papio.pageBulk.allowlist.get" ||
+        message["type"] === "papio.pageBulk.allowlist.set")
     ) {
       void handleInboxRuntimeMessage(bridge, message, _sender, inboxRuntimeURLs).then((reply) => {
         sendResponse(reply);

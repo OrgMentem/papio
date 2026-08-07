@@ -321,6 +321,54 @@ export async function openInbox(): Promise<void> {
   await chrome.tabs.create({ url: "dist/inbox.html" });
 }
 
+export const PAGE_BULK_SCAN_MESSAGE = "papio.pageBulk.scan";
+
+interface PageBulkScanResponse {
+  ok?: boolean;
+  scan_id?: string;
+  error?: { code?: string; message?: string };
+}
+
+/** Run the one-shot page scan (ADR-0019 Decision 1): this click IS v1's scan
+ * consent — no allowlist prompt, no confirmation dialog. Background injects
+ * the detector into the active tab's top frame, stores the snapshot, and
+ * opens the selection workspace; this only relays the tab id and surfaces a
+ * failure message. */
+export async function startPageBulkScan(): Promise<{ ok: true } | { ok: false; error: string }> {
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (tab?.id === undefined) return { ok: false, error: "No active tab to scan" };
+  const response = (await chrome.runtime.sendMessage({
+    type: PAGE_BULK_SCAN_MESSAGE,
+    request: { tab_id: tab.id },
+  })) as PageBulkScanResponse;
+  if (response.ok === true) return { ok: true };
+  return { ok: false, error: response.error?.message ?? "Could not scan this page" };
+}
+
+export function wirePageBulkScanLauncher(
+  doc: Document = document,
+  onScan: () => Promise<{ ok: true } | { ok: false; error: string }> = startPageBulkScan,
+): void {
+  const button = doc.getElementById("page-bulk-scan-btn");
+  const status = doc.getElementById("page-bulk-scan-status");
+  if (!(button instanceof HTMLButtonElement) || button.dataset.wired) return;
+  button.dataset.wired = "1";
+  button.addEventListener("click", () => {
+    button.disabled = true;
+    if (status) status.textContent = "Scanning this page…";
+    void onScan().then((result) => {
+      button.disabled = false;
+      if (result.ok) {
+        // Chrome dismisses the popup when the new workspace tab takes focus;
+        // Firefox keeps it open, so close it explicitly once it's open.
+        window.close();
+        return;
+      }
+      if (status) status.textContent = result.error;
+    });
+  });
+}
+
 export const OPEN_HANDOFF_MESSAGE = "papio.handoff.open";
 
 /** Ask the background broker to surface the tab it already owns for this job.
@@ -2181,6 +2229,7 @@ if (typeof document !== "undefined" && typeof chrome !== "undefined") {
   wireDevTools();
   wireSettings();
   wireInboxLauncher();
+  wirePageBulkScanLauncher();
   wireHistoryLauncher();
   wirePrimaryShortcut();
   // The initial refresh must not float: a popup opened before storage is

@@ -24,7 +24,7 @@ const captureToolsInDevBuild =
 const capturePanel = /\n      <details class="capture" hidden>[\s\S]*?\n      <\/details>/;
 
 
-const extensionPageNames = ["history", "inbox", "options", "popup"] as const;
+const extensionPageNames = ["history", "inbox", "options", "page-bulk", "popup"] as const;
 
 async function assertExtensionPages(outdir: string): Promise<void> {
   await Promise.all(
@@ -52,6 +52,7 @@ async function copyExtensionPages(outdir: string): Promise<void> {
     cp("src/history.html", `${outdir}/history.html`),
     cp("src/inbox.html", `${outdir}/inbox.html`),
     cp("src/options.html", `${outdir}/options.html`),
+    cp("src/page-bulk.html", `${outdir}/page-bulk.html`),
     writeFile(`${outdir}/popup.html`, builtPopup),
   ]);
 }
@@ -78,18 +79,18 @@ async function build(entrypoints: string[], outdir: string, format: "esm" | "iif
 
 async function buildAll(): Promise<void> {
   const chromeBundles = await build(
-    ["src/background.ts", "src/history.ts", "src/inbox.ts", "src/options.ts", "src/popup.ts"],
+    ["src/background.ts", "src/history.ts", "src/inbox.ts", "src/options.ts", "src/page-bulk.ts", "src/popup.ts"],
     "dist",
     "esm",
   );
   await copyExtensionPages("dist");
   await assertExtensionPages("dist");
-  console.log(`built Chrome: ${chromeBundles} bundles + 4 html shells into dist/`);
+  console.log(`built Chrome: ${chromeBundles} bundles + 5 html shells into dist/`);
 
   await mkdir(firefoxDist, { recursive: true });
   const firefoxBackgroundBundles = await build(["src/background.ts"], firefoxDist, "iife");
   const firefoxPageBundles = await build(
-    ["src/history.ts", "src/inbox.ts", "src/options.ts", "src/popup.ts"],
+    ["src/history.ts", "src/inbox.ts", "src/options.ts", "src/page-bulk.ts", "src/popup.ts"],
     firefoxDist,
     "esm",
   );
@@ -126,7 +127,7 @@ async function buildAll(): Promise<void> {
     throw new Error("Firefox background, inbox, and history bundles must not contain top-level exports");
   }
   console.log(
-    `built Firefox: ${firefoxBackgroundBundles + firefoxPageBundles} bundles + 4 html shells + icons into firefox/`,
+    `built Firefox: ${firefoxBackgroundBundles + firefoxPageBundles} bundles + 5 html shells + icons into firefox/`,
   );
 }
 

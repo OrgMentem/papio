@@ -34,6 +34,7 @@ import (
 	"papio/internal/captures"
 	"papio/internal/config"
 	"papio/internal/job"
+	"papio/internal/ownership"
 	"papio/internal/preview"
 	"papio/internal/protocol"
 	"papio/internal/store"
@@ -61,12 +62,16 @@ const (
 	deliveryContextFeature       = "delivery_context_v1"
 	pageCaptureTermsFeature      = "page_capture_terms_v1"
 	pageBulkAcquireFeature       = "page_bulk_acquire_v1"
-	previewCapabilityTTL         = 10 * time.Minute
-	sessionEvidenceThrottle      = 60 * time.Second
-	deliveryContextTTL           = 60 * time.Second
-	maxOutstandingOffers         = 4
-	maxInstitutionalReoffers     = 4
-	handoffPageLimit             = 500
+	// pageBulkConsumer is the sole daemon-assigned consumer for every job
+	// created through page_bulk_submit_request (ADR-0019 Decision 6). The
+	// extension never supplies it.
+	pageBulkConsumer         = "browser-page"
+	previewCapabilityTTL     = 10 * time.Minute
+	sessionEvidenceThrottle  = 60 * time.Second
+	deliveryContextTTL       = 60 * time.Second
+	maxOutstandingOffers     = 4
+	maxInstitutionalReoffers = 4
+	handoffPageLimit         = 500
 	// maxFocusFramesPerPoll bounds the focus batch in ONE sync response. Focus
 	// requests accumulate from a caller-supplied job-id list, so an unbounded
 	// drain is the only term that can push a response past ipc.MaxResultBytes —
@@ -145,6 +150,14 @@ type pendingPageCapture struct {
 	result    chan CaptureResult
 }
 
+// holdingsProvider is the ownership seam page-bulk acquisition needs. The
+// concrete ownership.Registry satisfies it; Enabled distinguishes an active
+// authority from nil/empty configuration without exposing registry details.
+type holdingsProvider interface {
+	Enabled() bool
+	Lookup(context.Context, []ownership.Query) ownership.Result
+}
+
 // Bridge is the per-daemon-run browser bridge. Sessions are tracked in
 // memory: each native-host process carries a session_id, exactly one session
 // holds the offer/handoff flow, and later hellos from other browsers wait as
@@ -154,6 +167,7 @@ type pendingPageCapture struct {
 type Bridge struct {
 	jobs         *job.Store
 	svc          *app.Service
+	holdings     holdingsProvider
 	triage       *triage.Service
 	watchRunner  *watch.Runner
 	preview      *preview.Server
@@ -244,12 +258,12 @@ const pendingExpireAfter = 5 * time.Minute
 
 // NewBridge constructs the bridge. It is cheap and always constructed; whether
 // any job is ever offered depends on config (extension_id / openurl base).
-func NewBridge(jobs *job.Store, svc *app.Service, triageService *triage.Service, watchRunner *watch.Runner, previewServer *preview.Server, captureStore *captures.Store, cfg config.Config, version string) *Bridge {
+func NewBridge(jobs *job.Store, svc *app.Service, triageService *triage.Service, watchRunner *watch.Runner, previewServer *preview.Server, captureStore *captures.Store, holdings holdingsProvider, cfg config.Config, version string) *Bridge {
 	required := []string{
 		pageAcquireFeature, triageSnapshotFeature, triageSnapshotSchema2Feature, triageMutationsFeature, reviewPreviewFeature, statsFeature, pageCaptureFeature, pageCaptureRequestFeature, activityFeedFeature, triageCountsSchema2Feature, sessionEvidenceFeature, deliveryContextFeature, pageCaptureTermsFeature, pageBulkAcquireFeature,
 	}
 	return &Bridge{
-		jobs: jobs, svc: svc, triage: triageService, watchRunner: watchRunner, preview: previewServer, captureStore: captureStore, cfg: cfg,
+		jobs: jobs, svc: svc, triage: triageService, watchRunner: watchRunner, preview: previewServer, captureStore: captureStore, holdings: holdings, cfg: cfg,
 		Version:          version,
 		Features:         required,
 		offered:          map[string]bool{},
@@ -683,7 +697,8 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 	if b.holder == nil || b.holder.ID != sessionID {
 		switch msg.Type {
 		case protocol.MsgPageAcquire, protocol.MsgTriageSnapshotRequest, protocol.MsgTriageCountsRequest,
-			protocol.MsgTriageDecide, protocol.MsgHumanActionResolve, protocol.MsgReviewPreviewRequest, protocol.MsgStatsRequest, protocol.MsgActivityRequest, protocol.MsgPageCapture:
+			protocol.MsgTriageDecide, protocol.MsgHumanActionResolve, protocol.MsgReviewPreviewRequest, protocol.MsgStatsRequest, protocol.MsgActivityRequest, protocol.MsgPageCapture,
+			protocol.MsgPageBulkStatusRequest, protocol.MsgPageBulkSubmitRequest:
 			// Stateless request/response traffic works from any browser —
 			// even an outdated one; every frame is protocol-validated
 			// regardless of version. "Acquire this page" and the inbox must
@@ -723,6 +738,12 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 		return b.stats(ctx, msg.Payload.(*protocol.StatsRequestPayload))
 	case protocol.MsgActivityRequest:
 		return b.activity(ctx, msg.Payload.(*protocol.ActivityRequestPayload))
+
+	case protocol.MsgPageBulkStatusRequest:
+		return b.pageBulkStatus(ctx, msg.Payload.(*protocol.PageBulkStatusRequestPayload))
+
+	case protocol.MsgPageBulkSubmitRequest:
+		return b.pageBulkSubmit(ctx, msg.Payload.(*protocol.PageBulkSubmitRequestPayload))
 
 	case protocol.MsgPageCapture:
 		b.pageCapture(ctx, sessionID, msg.JobID, msg.Payload.(*protocol.PageCapturePayload))
@@ -1574,6 +1595,269 @@ func (b *Bridge) pageAcquireError(err error) ([]json.RawMessage, error) {
 		return nil, frameErr
 	}
 	return []json.RawMessage{ack}, nil
+}
+
+// pageBulkStatus resolves the ownership/job status of up to 200 page-detected
+// identifiers (ADR-0019 Decision 5). It keeps no daemon-side scan-state: scan_id
+// is opaque correlation supplied by the caller and is only ever echoed back
+// (Decision 4 — the selection sheet lives in the extension, never the daemon).
+// Ownership is consulted only after durable job history has no live or
+// previously-unavailable verdict. A nil provider, partial lookup, or failed
+// lookup is unknown rather than not-owned (ADR-0008 invariant 2).
+func (b *Bridge) pageBulkStatus(ctx context.Context, request *protocol.PageBulkStatusRequestPayload) ([]json.RawMessage, error) {
+	items := make([]protocol.PageBulkStatusItem, 0, len(request.Identifiers))
+	for _, id := range request.Identifiers {
+		items = append(items, b.pageBulkStatusItem(ctx, id))
+	}
+	truncated := false
+	for {
+		payload := protocol.PageBulkStatusResultPayload{
+			RequestID: request.RequestID, ScanID: request.ScanID, Items: items, Truncated: truncated,
+		}
+		if b.frameFits(protocol.MsgPageBulkStatusResult, payload) {
+			frame, err := b.frame(protocol.MsgPageBulkStatusResult, "", payload)
+			if err != nil {
+				return nil, err
+			}
+			return []json.RawMessage{frame}, nil
+		}
+		if len(items) <= 1 {
+			return nil, fmt.Errorf("page bulk status item exceeds browser frame cap %d", protocol.MaxBrowserMessageBytes)
+		}
+		items = items[:len(items)-1]
+		truncated = true
+	}
+}
+
+// pageBulkStatusItem resolves one identifier. Job-store or holdings failures
+// are reported as ownership_incomplete rather than propagated as Go errors:
+// routine read-model failures must not tear down the native-messaging session.
+func (b *Bridge) pageBulkStatusItem(ctx context.Context, id protocol.PageBulkIdentifier) protocol.PageBulkStatusItem {
+	kind, value, err := normalizePageBulkIdentifier(id.Kind, id.Value)
+	if err != nil {
+		return protocol.PageBulkStatusItem{LocalID: id.LocalID, Status: "invalid"}
+	}
+	item := protocol.PageBulkStatusItem{LocalID: id.LocalID, CanonicalKey: kind + ":" + value}
+	liveJobID, previouslyUnavailable, lookupErr := b.canonicalJobStatus(ctx, kind, value)
+	switch {
+	case lookupErr != nil:
+		item.Status = "ownership_incomplete"
+	case liveJobID != "":
+		item.Status, item.JobID = "queued", liveJobID
+	case previouslyUnavailable:
+		item.Status = "previously_unavailable"
+	default:
+		decision, complete := b.pageBulkOwnership(ctx, pageBulkOwnershipQuery(kind, value))
+		item.OwnershipComplete = complete
+		switch {
+		case decision.Suppress:
+			item.Status = "owned_with_pdf"
+		case decision.RecordPresent:
+			item.Status = "owned_missing_pdf"
+		case complete:
+			item.Status = "eligible"
+		default:
+			item.Status = "ownership_incomplete"
+		}
+	}
+	return item
+}
+
+// pageBulkOwnershipQuery preserves the ownership package's deliberately
+// different identity normalization while asking about the canonical
+// acquisition identifier.
+func pageBulkOwnershipQuery(kind, value string) ownership.Query {
+	switch kind {
+	case ownership.KindDOI:
+		return ownership.QueryFor(value, "", "", ownership.VersionAny, ownership.EntityUnknown)
+	case ownership.KindArXiv:
+		return ownership.QueryFor("", value, "", ownership.VersionAny, ownership.EntityUnknown)
+	case ownership.KindPMID:
+		return ownership.QueryFor("", "", value, ownership.VersionAny, ownership.EntityUnknown)
+	default:
+		return ownership.Query{}
+	}
+}
+
+// pageBulkOwnership applies the shared ADR-0008 suppression rules to one
+// lookup. complete is false for nil/disabled providers, partial results, and
+// malformed implementations. Positive claims remain usable even when another
+// source failed, but absence licenses "eligible" only when complete is true.
+func (b *Bridge) pageBulkOwnership(ctx context.Context, query ownership.Query) (ownership.Decision, bool) {
+	if b.holdings == nil || !b.holdings.Enabled() {
+		return ownership.Decision{}, false
+	}
+	result := b.holdings.Lookup(ctx, []ownership.Query{query})
+	if len(result.Works) != 1 {
+		return ownership.Decision{}, false
+	}
+	return ownership.Decide(query, result.Works[0]), result.Complete()
+}
+
+// normalizePageBulkIdentifier canonicalizes one browser-reported identifier
+// with the daemon's existing normalizers — the only canonical validators
+// (ADR-0019 Decision 3) — and reports the identifiers-table kind alongside it.
+func normalizePageBulkIdentifier(kind, value string) (string, string, error) {
+	switch kind {
+	case "doi":
+		normalized, err := work.NormalizeDOI(value)
+		return kind, normalized, err
+	case "pmid":
+		normalized, err := work.NormalizePMID(value)
+		return kind, normalized, err
+	case "arxiv":
+		normalized, err := work.NormalizeArXiv(value)
+		return kind, normalized, err
+	default:
+		return "", "", fmt.Errorf("unsupported identifier kind %q", kind)
+	}
+}
+
+// canonicalJobStatus looks up the given canonical identity directly against
+// the jobs/identifiers tables the bridge already reaches (the same join
+// liveJobForCanonicalWork uses internally in internal/job, unexported there).
+// The most recent live job wins; failing that, any past terminal "unavailable"
+// job marks previouslyUnavailable — historical information, never an exclusion
+// (ADR-0019 Decision 5).
+func (b *Bridge) canonicalJobStatus(ctx context.Context, kind, value string) (liveJobID string, previouslyUnavailable bool, err error) {
+	rows, err := b.jobs.S.DB().QueryContext(ctx, `
+		SELECT j.id, j.state FROM jobs j
+		JOIN identifiers i ON i.work_request_id = j.work_request_id
+		WHERE i.kind = ? AND i.value = ?
+		ORDER BY j.created_at DESC`, kind, value)
+	if err != nil {
+		return "", false, err
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var id, state string
+		if err := rows.Scan(&id, &state); err != nil {
+			return "", false, err
+		}
+		if !job.Terminal(state) {
+			return id, false, nil
+		}
+		if state == job.StateUnavailable {
+			previouslyUnavailable = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return "", false, err
+	}
+	return "", previouslyUnavailable, nil
+}
+
+// pageBulkSubmit creates one ordinary batch of jobs from up to 50 canonical
+// keys a prior page_bulk_status_request already resolved. Like pageBulkStatus
+// it keeps no daemon-side scan-state: a stale or unknown scan_id is accepted
+// and simply echoed back, and a canonical_key from any source — even one this
+// daemon run never issued — is honoured as long as it still decodes to a valid
+// identifier (ADR-0019 Decision 7).
+//
+// Each key becomes one ordinary SubmitWithOptionsAs call — the same
+// application-service entry point acquire.submit_v3 uses (internal/api) —
+// carrying the daemon-assigned consumer. This is not a second acquisition
+// policy surface: a job created here enters the same waterfall as any other
+// submission, including LibKey-routed institutional handoff where configured
+// (ADR-0016 Decision 1).
+//
+// Every valid key rechecks holdings immediately before submission. Only a
+// fresh artifact-present claim suppresses the ordinary app submission; the
+// result is counted as already_owned (ADR-0008 invariant 2).
+func (b *Bridge) pageBulkSubmit(ctx context.Context, request *protocol.PageBulkSubmitRequestPayload) ([]json.RawMessage, error) {
+	var submitted, joined, alreadyOwned, invalid int64
+	for _, key := range request.CanonicalKeys {
+		wr, ok := pageBulkWorkRequest(key)
+		if !ok {
+			invalid++
+			continue
+		}
+		query := ownership.QueryFor(wr.Identifiers.DOI, wr.Identifiers.ArXiv, wr.Identifiers.PMID, wr.DesiredVersion, ownership.EntityUnknown)
+		decision, _ := b.pageBulkOwnership(ctx, query)
+		if decision.Suppress {
+			alreadyOwned++
+			continue
+		}
+		result, err := b.svc.SubmitWithOptionsAs(ctx, job.PrincipalUnknown, wr, app.SubmitOptions{Consumer: pageBulkConsumer})
+		if err != nil {
+			// A routine per-key submission failure (a resolver override
+			// naming an unconfigured profile, a since-broken invariant on
+			// the request) never fails the whole batch: it counts as one
+			// invalid key among however many others succeeded.
+			invalid++
+			continue
+		}
+		if result.Existing {
+			joined++
+		} else {
+			submitted++
+		}
+	}
+	batchID := newMsgID()
+	at := b.now().UTC()
+	if err := b.recordPageBulkRun(ctx, request.Source, len(request.CanonicalKeys), submitted, invalid, batchID, at); err != nil {
+		// The measurement row is local-only funnel telemetry (ADR-0019
+		// Decision 10), not part of the acquisition contract: losing it must
+		// never turn an otherwise-successful submission into a bridge error.
+		log.Printf("papio: recording page-bulk run: %v", err)
+	}
+	frame, err := b.frame(protocol.MsgPageBulkSubmitResult, "", protocol.PageBulkSubmitResultPayload{
+		RequestID: request.RequestID, ScanID: request.ScanID,
+		Submitted: submitted, Joined: joined, AlreadyOwned: alreadyOwned, Invalid: invalid,
+		BatchID: batchID,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return []json.RawMessage{frame}, nil
+}
+
+// pageBulkWorkRequest maps one status-issued canonical key back to a work
+// request. false means the key no longer resolves — either it is stale or it
+// never came from this daemon — which the caller counts as invalid rather than
+// treating as a Go error (ADR-0019 Decision 7: page-bulk submit is a thin
+// transport adapter, not a second validation surface).
+func pageBulkWorkRequest(canonicalKey string) (protocol.WorkRequest, bool) {
+	kind, value, ok := strings.Cut(canonicalKey, ":")
+	if !ok || value == "" {
+		return protocol.WorkRequest{}, false
+	}
+	normKind, normValue, err := normalizePageBulkIdentifier(kind, value)
+	if err != nil {
+		return protocol.WorkRequest{}, false
+	}
+	ids := &protocol.Identifiers{}
+	switch normKind {
+	case "doi":
+		ids.DOI = normValue
+	case "pmid":
+		ids.PMID = normValue
+	case "arxiv":
+		ids.ArXiv = normValue
+	}
+	sum := sha256.Sum256([]byte(canonicalKey))
+	return protocol.WorkRequest{
+		SchemaVersion:  protocol.WorkRequestSchemaVersion,
+		RequestID:      "page_bulk_" + hex.EncodeToString(sum[:]),
+		DesiredVersion: "any",
+		Identifiers:    ids,
+	}, true
+}
+
+// recordPageBulkRun writes the local-only measurement row for one submitted
+// batch (ADR-0019 Decision 10). Funnel counts upstream of submit — detected,
+// canonical_unique, eligible, owned_with_pdf, owned_missing_pdf, queued,
+// ownership_incomplete — are left at their schema default of 0: the daemon
+// keeps no scan-side state to pair them with (see pageBulkStatus and
+// pageBulkSubmit's doc comments), so this row honestly reports only what the
+// submit call itself observed.
+func (b *Bridge) recordPageBulkRun(ctx context.Context, source protocol.PageBulkSubmitSource, selected int, submitted, invalid int64, batchID string, at time.Time) error {
+	ts := at.Format(time.RFC3339Nano)
+	_, err := b.jobs.S.DB().ExecContext(ctx, `
+		INSERT INTO page_bulk_runs (detector_id, source_origin, selected, submitted, invalid, batch_id, opened_at, submitted_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		source.Detector, source.Origin, selected, submitted, invalid, batchID, ts, ts)
+	return err
 }
 
 // pruneDeliveryMetadata drops unpaired frames after the short handoff window.

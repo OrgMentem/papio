@@ -3289,6 +3289,7 @@ test("popup capture relay emits page_capture only after the daemon advertises it
     inboxURL: "chrome-extension://papio-test-id/inbox.html",
     popupURL: "chrome-extension://papio-test-id/popup.html",
     historyURL: "chrome-extension://papio-test-id/history.html",
+    pageBulkURL: "chrome-extension://papio-test-id/page-bulk.html",
   };
   const sanitized = sanitizeFixture(`<main class="article">Known structure</main>`, {
     provider: "jstor",
@@ -3355,6 +3356,7 @@ test("popup capture relay withholds a terms capture until the daemon advertises 
     inboxURL: "chrome-extension://papio-test-id/inbox.html",
     popupURL: "chrome-extension://papio-test-id/popup.html",
     historyURL: "chrome-extension://papio-test-id/history.html",
+    pageBulkURL: "chrome-extension://papio-test-id/page-bulk.html",
   };
   const sanitized = sanitizeFixture(`<main class="terms">Consent wall</main>`, {
     provider: "jstor",
@@ -3536,6 +3538,7 @@ test("inbox runtime messages validate the exact extension sender", async () => {
     inboxURL: "chrome-extension://papio-test-id/inbox.html",
     popupURL: "chrome-extension://papio-test-id/popup.html",
     historyURL: "chrome-extension://papio-test-id/history.html",
+    pageBulkURL: "chrome-extension://papio-test-id/page-bulk.html",
   };
   const message = { type: "papio.triage.counts", request: {} };
 
@@ -3568,6 +3571,7 @@ test("papio.activity accepts popup senders while triage remains inbox-only", asy
     inboxURL: "chrome-extension://papio-test-id/inbox.html",
     popupURL: "chrome-extension://papio-test-id/popup.html",
     historyURL: "chrome-extension://papio-test-id/history.html",
+    pageBulkURL: "chrome-extension://papio-test-id/page-bulk.html",
   };
   const reply = {
     ok: true as const,
@@ -3606,6 +3610,7 @@ test("papio.stats from any papio page routes to the bridge stats request", async
     inboxURL: "chrome-extension://papio-test-id/inbox.html",
     popupURL: "chrome-extension://papio-test-id/popup.html",
     historyURL: "chrome-extension://papio-test-id/history.html",
+    pageBulkURL: "chrome-extension://papio-test-id/page-bulk.html",
   };
   const statsReply: Awaited<ReturnType<Bridge["requestStats"]>> = {
     ok: true,
@@ -3640,6 +3645,7 @@ test("papio.stats rejects foreign senders and malformed requests without touchin
     inboxURL: "chrome-extension://papio-test-id/inbox.html",
     popupURL: "chrome-extension://papio-test-id/popup.html",
     historyURL: "chrome-extension://papio-test-id/history.html",
+    pageBulkURL: "chrome-extension://papio-test-id/page-bulk.html",
   };
   let statsCalls = 0;
   h.bridge.requestStats = async (): ReturnType<Bridge["requestStats"]> => {
@@ -3681,6 +3687,7 @@ test("open inbox runtime request focuses the singleton or creates it from the po
     inboxURL: "chrome-extension://papio-test-id/inbox.html",
     popupURL: "chrome-extension://papio-test-id/popup.html",
     historyURL: "chrome-extension://papio-test-id/history.html",
+    pageBulkURL: "chrome-extension://papio-test-id/page-bulk.html",
   };
   h.tabs.live.set(88, { id: 88, url: urls.inboxURL, windowId: 600 });
   h.windows?.live.set(600, { id: 600, state: "minimized" });
@@ -3715,6 +3722,7 @@ test("inbox handoff runtime opening focuses the live offered tab without returni
     inboxURL: "chrome-extension://papio-test-id/inbox.html",
     popupURL: "chrome-extension://papio-test-id/popup.html",
     historyURL: "chrome-extension://papio-test-id/history.html",
+    pageBulkURL: "chrome-extension://papio-test-id/page-bulk.html",
   };
   await h.bridge.start();
   await h.port.inbound(jobOffer("job_0001a_inbox_open"));
@@ -3815,6 +3823,7 @@ test("session probe inspects a live resolver tab before claiming signed out, and
     inboxURL: "chrome-extension://papio-test-id/inbox.html",
     popupURL: "chrome-extension://papio-test-id/popup.html",
     historyURL: "chrome-extension://papio-test-id/history.html",
+    pageBulkURL: "chrome-extension://papio-test-id/page-bulk.html",
   };
   await h.bridge.start();
   const keepaliveAPI: KeepaliveAPI = {
@@ -3897,6 +3906,7 @@ test("session state reports each known resolver and sign-in targets its origin",
     inboxURL: "chrome-extension://papio-test-id/inbox.html",
     popupURL: "chrome-extension://papio-test-id/popup.html",
     historyURL: "chrome-extension://papio-test-id/history.html",
+    pageBulkURL: "chrome-extension://papio-test-id/page-bulk.html",
   };
   const collegeOrigin = "https://onesearch.library.example-college.edu";
   await h.bridge.start();
@@ -3929,6 +3939,7 @@ test("provider and OA offer URLs never mint institution session rows", async () 
     inboxURL: "chrome-extension://papio-test-id/inbox.html",
     popupURL: "chrome-extension://papio-test-id/popup.html",
     historyURL: "chrome-extension://papio-test-id/history.html",
+    pageBulkURL: "chrome-extension://papio-test-id/page-bulk.html",
   };
   await h.bridge.start();
   await h.port.inbound(helloAck({ resolver_origins: ["https://resolver.example.edu"] }));
@@ -3958,6 +3969,7 @@ test("session sign-in reports why it cannot open without a resolver", async () =
     inboxURL: "chrome-extension://papio-test-id/inbox.html",
     popupURL: "chrome-extension://papio-test-id/popup.html",
     historyURL: "chrome-extension://papio-test-id/history.html",
+    pageBulkURL: "chrome-extension://papio-test-id/page-bulk.html",
   };
   await h.bridge.start();
   await expect(
@@ -3980,6 +3992,7 @@ test("session sign-in opens the resolver origin in a foreground tab as fallback"
     inboxURL: "chrome-extension://papio-test-id/inbox.html",
     popupURL: "chrome-extension://papio-test-id/popup.html",
     historyURL: "chrome-extension://papio-test-id/history.html",
+    pageBulkURL: "chrome-extension://papio-test-id/page-bulk.html",
   };
   const offer = jobOffer("job_session_signin") as { payload: Record<string, unknown> };
   offer.payload["requires_auth"] = true;
@@ -4072,6 +4085,7 @@ test("an inbox dismiss relays verdict dismiss through the native resolve", async
     inboxURL: "chrome-extension://papio-test-id/inbox.html",
     popupURL: "chrome-extension://papio-test-id/popup.html",
     historyURL: "chrome-extension://papio-test-id/history.html",
+    pageBulkURL: "chrome-extension://papio-test-id/page-bulk.html",
   };
   await h.bridge.start();
   await h.port.inbound(helloAck({ daemon_version: CURRENT_DAEMON, features: ["triage_mutations_v1"] }));
