@@ -1,110 +1,144 @@
 # Follow-ups after the ADR-0016/0017/0019 build (2026-08-07)
 
-Everything below is triaged from the first live smoke-test session (five page
-shapes fixed same-day; two identified as structural) and from scope the ADRs
-deliberately deferred. Ordered by decision quality: what unblocks the
-operator's real workflow first, what needs evidence before building, what is
-gated on externals. `page_bulk_runs` is already recording the per-site-class
-yields the Next-tier decisions depend on (ADR-0019 Decision 10).
+Triaged from the first live smoke-test session, then arbitrated by the r5
+oracle round (`dev/scratch/oracle/papio-integrations-r5.1.md`) — its zotio
+claims were verified against `internal/zotio/service.go` before acceptance.
+`page_bulk_runs` is already recording the yields the evidence gates below
+read (ADR-0019 Decision 10).
 
-## Now — build next, no further evidence needed
+## Execution order (settled, r5-arbitrated)
 
-1. **CORRECTED — bulk import already exists.** `papio acquire --batch`
-   accepts JSONL, RIS, BibTeX, CSL-JSON, and MEDLINE/NBIB (internal/bibparse,
-   since the ADR-0008 library-dedup work). Verified live 2026-08-07: a
-   OneSearch-style RIS file submits in one command, ledger/cache dedupe
-   applies (a previously-acquired DOI went ready instantly from the artifact
-   cache), and title-only entries submit through title enrichment. The
-   original "build papio import" item was planned against a capability the
-   tool already had — a discoverability failure, which reframes the work:
-   - **Docs**: a user-guide section for the "silent discovery UI" workflow —
-     OneSearch/Scholar/Primo → Export RIS → `papio acquire --batch` — and a
-     pointer from the page-bulk workspace's collapsed-note copy or docs so
-     the next person (or agent) finds it.
-   - **Review title-only default**: --batch submits identifier-less entries
-     outright; ADR-0019 deliberately refuses title-only submissions from the
-     browser for weak-match risk. Decide whether the CLI default should stay
-     permissive (operator-invoked, enrichment-gated, identity-validated at
-     PDF time — arguably fine) or align with the browser's caution; document
-     the decision either way.
-   - Optional: a `papio import` alias only if ergonomics ever demand it.
-2. **Delivery status poller + fulfillment adoption.** ADR-0017's submitted
-   path parks `retry_wait/document_delivery_pending` with a poll schedule,
-   but nothing yet executes the poll: an ILLiad `GetTransaction` check on
-   wake, state map (submitted→pending→fulfilled/declined), and fulfilled →
-   fetch through ordinary quarantine/validation. Without it the auto path is
-   submit-and-forget, which the ADR explicitly forbids claiming. Build
-   against the existing `internal/illiad` fixtures; no live institution
-   needed for correctness, required before anyone's live acceptance run.
-3. **`papio bench` (the measurement harness, r2 §3 design).** The original
-   roadmap's "rerun the nine-paper cohort" never happened; S2, OpenAIRE, and
-   typed relations shipped unmeasured. Smallest cut: cohort file (works +
-   expected terminal class), OA-only subset runnable hermetically in CI,
-   institutional subset as a manual live run, `autonomous_ready_rate` as the
-   headline number. Also becomes the arbiter for resolver tuning ever after.
+1. **Diagnose/fix the stuck "Institution session — Checking session…"
+   probes.** Shipped-path bug, not product work; observed rows that never
+   resolve to signed-in/out. Diagnose before touching — may be probe
+   lifecycle, may be Primo-NDE-specific.
+2. **Wire zotio ownership into page-bulk status.** The scout question is
+   already answered in-tree: `zotio.Service.LookupWorks` (1–50 works,
+   `owned_with_pdf`/`owned_missing_pdf`, staleness warning, unconfigured
+   degrades to not-owned) already serves batch submit — the browser bridge
+   just never calls it. Inject it into `page_bulk_status`, merge with
+   `canonicalJobStatus` under the precedence: papio ready bundle →
+   zotio owned_with_pdf → zotio owned_missing_pdf (+ item key) → live job
+   queued → complete negative = eligible → zotio unavailable/stale =
+   ownership_unknown (never painted as unowned). Extend `LookupWork` with
+   PMID (zotio supports it; the facade carries only DOI/arXiv). Measure
+   lookup latency before asking zotio for a bulk command. This repairs the
+   most visible false limitation in every fresh workspace.
+3. **Silent-UI docs + `papio stats page-bulk`.** Bulk import already exists
+   (`papio acquire --batch`: JSONL/RIS/BibTeX/CSL-JSON/NBIB since the
+   ADR-0008 work; live-verified — cache dedupe applies, title-only entries
+   submit through enrichment). The work is discoverability: user-guide
+   section for the OneSearch/Primo/Scholar "Export RIS → --batch" flow,
+   pointers from `acquire --help` and the workspace's collapsed-note copy.
+   NO `papio import` alias (r5: cut — duplicates a clear verb to
+   compensate for documentation). Stats surface is a `stats` command (not
+   doctor), through the conformance registry + printPage like everything
+   else: sessions, useful-scan rate, bulk leverage, submit conversion,
+   per-origin-class yield. Add ONE nullable aggregate field to
+   `page_bulk_runs` — `rendered_record_count_hint` (count of visible result
+   cards for known page classes; no titles/URLs/queries/docids) — so
+   identifier_yield gets an honest denominator.
+4. **`papio bench` — comparative, not absolute.** Cohort file
+   (`papio-bench-cohort/1`: work request + expected class from
+   {autonomous_ready, ready_after_human_boundary, honest_unavailable,
+   identity_review}; never an expected provider/route). Hermetic v1:
+   ephemeral DB, empty artifact cache, hooks/notifications/Zotero mutation
+   disabled, injected resolver fixtures, run twice — baseline overlay
+   (S2/OpenAIRE/typed-relations disabled) vs current. Headline number:
+   **incremental_autonomous_ready** ("+2 / 9 works") on the frozen
+   nine-work field cohort — the question the unmeasured resolver work left
+   open. Manual live mode later; never blocks v1.
+5. **ILLiad poll executor (2A — fixtures now).** GetTransaction on wake.
+   State map: any successful nonterminal read → `pending` (reset failure
+   count); `Delivered to Web` → `fulfilled` (stop polling, start
+   retrieval); `Cancelled by Customer` → `cancelled`; `Cancelled by ILL
+   Staff` → `declined`; `Request Finished` classifies from prior
+   observations, `unknown_outcome` only after one delayed reconciliation;
+   unknown custom statuses → `pending` + `provider_status_unmapped` (ILLiad
+   statuses are customizable — no exhaustive enum; persist raw). **A failed
+   poll NEVER becomes unknown_outcome**: transient/auth/schema failures
+   leave request state unchanged and degrade integration health instead
+   (3 consecutive → degraded; 24 h without success → operator advisory
+   saying papio cannot OBSERVE the request, never that it failed).
+   `unknown_outcome` is reserved for provider-side uncertainty after
+   successful communication + exhausted reconciliation (404 after a prior
+   successful lookup → UserRequests + idempotency-reference
+   reconciliation first). Persist: provider_status_raw, display status,
+   last_successful_poll_at, consecutive_poll_failures, error class.
+6. **Fulfillment retrieval (2B — design + fixtures now, live acceptance
+   gated).** The r5 correction that killed the plan's hidden hole: ILLiad's
+   API does NOT serve the delivered PDF bytes; electronic delivery posts to
+   the patron web UI (form-75 "View PDF" route:
+   `illiad.dll?Action=10&Form=75&Value=<txn>`). So `fulfilled` means "the
+   provider has supplied the document", not "papio has trusted bytes".
+   Config gains a distinct `patron_web_base_url` (never derived from
+   `api_base_url`). On fulfilled: route the form-75 URL through the
+   existing browser-handoff machinery (`route_class=document_delivery`,
+   provider reference carried), drive per access mode
+   (delegated/assisted/conservative), adopt through the ordinary
+   quarantine → validation → identity pipeline. Custom HTML delivery pages
+   require a fixture-backed adapter — no generic "PDF-looking link"
+   hunting. New compiled gate-profile capability: `fulfillment_channel =
+   patron_web` — a site with email/pickup delivery can't compile
+   end-to-end auto-capable even with an auto-capable submission API.
+   Unit-correct from fixtures; ACCEPTANCE requires a real ILLiad
+   institution (structurally not the operator's own — s49/Alma).
+7. **`triage-snapshot/3` — one rev, three riders.** (a) document_delivery
+   reconciliation rendering + closed ops; (b) ADR-0016 tri-state
+   `auth_requirement` + `route_class` + post-contact auth observations;
+   (c) r5's third rider so v4 isn't needed within months: closed
+   `attention` field — `working` / `required` / `advisory` (unknown-auth
+   LibKey handoff = working; login/MFA boundary = required; delivery
+   unknown_outcome = required; integrity notice = advisory). `blocked_by`
+   becomes a v3 enum (adds delivery_outcome, identity_review, unknown —
+   never overload v2 values). Pending pollable delivery stays
+   Activity-side, out of the snapshot.
+8. **Extension store release.** Bundle: page-bulk (zero new manifest
+   permissions — verified), LibKey origin-derivation fix, snapshot v3
+   consumers, auth-observation presentation, any ILLiad fixture work ready
+   by cut time. Listing/privacy text gains the scan disclosure per
+   ADR-0019 Decision 8. Non-urgent while the verified zero-install window
+   holds; re-verify AMO/CWS counts at cut time.
+9. **Reassess Primo/Scholar class-2 from run data.** Primo moved to
+   Later/conditional (r5): Export-RIS → `--batch` already preserves MORE
+   metadata than an extractor could scrape. Evidence gate (all required,
+   measured by #3's denominator): ≥5 Primo selection sessions across ≥3
+   days; median ≥10 selectable records; exact-identifier yield <25%; ≥3
+   sessions abandoned specifically because the RIS route was disruptive;
+   operator confirms the friction. If it fires, build the **rendered-row
+   PNX reader** first — join rendered cards to already-loaded client-state
+   PNX JSON by record ID, exact identifiers out, structured
+   title/creator/year as class-2 candidates; NEVER call Primo search APIs,
+   replay queries, paginate, or read unrendered records (that crosses the
+   privacy line and duplicates RIS). If NDE exposes no stable client-side
+   PNX object: stop. Scholar class-2 stays evidence-gated behind the same
+   metrics (currently 7/10 post-generalization).
 
-## Next — cheap, or gated on evidence now being collected
+## Title-only asymmetry — deliberate today, not permanent (r5 ruling)
 
-4. **Page-bulk pilot readout.** The expand/stop gates (ADR-0019 Decision 10)
-   are undecidable without a surface over `page_bulk_runs`. One `papio stats
-   page-bulk` (or doctor section): sessions, useful-scan rate, bulk leverage,
-   submit conversion, per-origin-class yield. Trivial; do with #1.
-5. **Stuck "Institution session — Checking session…" probes.** Popup rows
-   observed never resolving during smoke testing. Diagnose before touching:
-   may be probe lifecycle, may be NDE-specific. Bug class, not feature.
-6. **Primo/Alma class-2 extractor.** Highest-yield gap for this operator
-   (both institutions are Primo NDE), but build ONLY if the RIS-import flow
-   (#1) proves insufficient in practice and the pilot readout (#4) shows
-   OneSearch scans recurring. ADR-0019 conditions hold: source-controlled,
-   fixture-backed (`make`-style captured fixtures), explicit invocation,
-   rendered-rows-only.
-7. **zotio-backed workspace ownership.** "Owned" currently means
-   "papio-acquired"; the pre-papio Zotero collection is invisible to the
-   selection sheet (honest, collapsed-note UX shipped). Needs a scout pass
-   first: does the zotio CLI expose a bulk identifier-lookup surface? If
-   yes, a purpose-scoped ownership provider (ADR-0008's "explicit lookup
-   purpose" carve-out) closes the gap; if no, file upstream against zotio
-   and leave the note.
+`acquire --batch` stays permissive: structured citation fields deliberately
+supplied as acquisition input are identity evidence; the browser's bounded
+display label is not, and must never be relabeled as `title` into
+enrichment. When a class-2 detector emits exact visible title + author
+evidence + year + detector identity + source-record binding, it uses the
+SAME batch submission path — no new caution policy. ADR-0019's rationale
+should be amended from "browser title-only is inherently too risky" to
+"v1's detector does not yet produce structured bibliographic evidence" —
+door open, v1 unweakened.
 
-## Later — bundled, versioned, or externally gated
+## Later / dormant (unchanged)
 
-8. **`triage-snapshot/3` bundle.** Two declared dependents wait on the next
-   negotiated snapshot schema: document_delivery action rendering in the
-   extension inbox (ADR-0017) and the tri-state auth presentation carriers
-   (ADR-0016 Decision 4, `handoff_access_observation_v1`). Bump the schema
-   once, carry both; never two revs.
-9. **Extension store release.** The store builds predate LibKey
-   origin-derivation, page capture caps, and the entire page-bulk feature.
-   Bundle: page-bulk (zero new manifest permissions — verified), the
-   origin-derivation fix, adapter updates; store listing/privacy text gains
-   the user-facing scan disclosure per ADR-0019 Decision 8. Timing is the
-   operator's call; the zero-install window makes it non-urgent until
-   there's a second user.
-10. **Scholar class-2 extractor.** Only if #4's metrics show Scholar sheets
-    recurring AND stuck at partial yield after the DOI-path generalization
-    (currently 7/10 on the probe query). Cheaper than Primo's; lower value
-    for this operator.
-11. **DataCite version relations.** Additive client behind the existing
-    `VersionRelations` seam; needs the new-source-name two-edit dance,
-    budget row, privacy row. Build when a real DataCite-registered version
-    chain shows up in practice (Zenodo/monograph workflows).
-12. **LibKey remainder** (ADR-0016): `api` mode with a Third Iron partner
-    key (blocked on their reply), doctor link-mode probe, init Library-List
-    discovery. The keyless link route is live and sufficient meanwhile.
-13. **`citation-record/1` durable model** (r2 §4A): persisted normalized
-    records with per-field source attribution, richer exports
-    (volume/issue/pages/publisher/abstract). Revisit when export users exist
-    beyond the operator.
-
-## Dormant — external dependencies, correct to wait
-
-- **ILLiad live acceptance** (ADR-0017 Decision 3A): requires an
-  institution-issued key and a supervised run; structurally unavailable at
-  the operator's own (s49, Alma/Primo) institutions. Wakes if any partner
-  library materializes — the poller (#2) must land first regardless.
-- **oclc / rapido delivery adapters**: config kinds stay rejected until
-  built; Rapido additionally needs live verification that no declaration is
-  configured before it may ever compile auto-capable.
-- **In-panel "Check routes" availability action** (ADR-0019 deferral): an
-  explicit selected-rows-only action, never pre-click badges. Revisit only
-  with real demand; the privacy line does not move.
+- **DataCite version relations** — additive client behind the
+  `VersionRelations` seam; build when a real version chain shows up.
+- **LibKey remainder** (ADR-0016): `api` mode (blocked on Third Iron),
+  doctor link-mode probe, init Library-List discovery. Keyless link route
+  is live and sufficient.
+- **`citation-record/1` durable model** — revisit when export users exist
+  beyond the operator.
+- **ILLiad live acceptance** (ADR-0017 3A): wakes if a partner library
+  materializes; #5/#6 must land first regardless.
+- **oclc / rapido adapters**: config kinds stay rejected until built;
+  Rapido must live-verify no auto-set declaration before compiling
+  auto-capable.
+- **In-panel "Check routes"**: explicit selected-rows-only action, never
+  pre-click badges; the privacy line does not move.
