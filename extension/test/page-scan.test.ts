@@ -300,3 +300,35 @@ test("scan result survives the executeScript serialization boundary", () => {
   expect(typeof crossed.truncated).toBe("boolean");
   expect(crossed.papers.length).toBe(1);
 });
+
+test("publisher service-link chrome is stripped from labels but never from titles", () => {
+  // Frontiers-shaped row: citation text plus trailing CrossRef / Google
+  // Scholar / View-reference anchors welded together in one <li>.
+  const result = scanDocument(
+    doc(
+      `<li>Aina, C. (2013). Parental background and university dropout in Italy. High. Educ. 65, 437–456.` +
+        ` <a href="https://doi.org/10.1007/s10734-012-9554-z">CrossRef</a>` +
+        ` <a href="https://scholar.google.com/x">Google Scholar</a><a href="#B1">View reference in article</a></li>`,
+    ),
+  );
+  expect(result.papers.length).toBe(1);
+  const label = result.papers[0]!.label;
+  expect(label).toContain("Parental background and university dropout in Italy");
+  expect(label).not.toMatch(/CrossRef|Google Scholar|View reference/i);
+  // Element boundaries get spaces: no "ScholarView"-style welding anywhere.
+  expect(label).not.toMatch(/[a-z][A-Z]/);
+});
+
+test("a genuine title ending in a weak service word keeps it", () => {
+  const result = scanDocument(
+    doc(`<li><a href="https://doi.org/10.1234/weak.1">How to read a research article</a></li>`),
+  );
+  expect(result.papers[0]!.label).toContain("How to read a research article");
+});
+
+test("adjacent inline elements never weld words together", () => {
+  const result = scanDocument(
+    doc(`<li><span>1</span><span>Aina</span><span>C.</span> (2013) <a href="https://doi.org/10.1007/s10734-012-9554-z">x</a></li>`),
+  );
+  expect(result.papers[0]!.label).toContain("1 Aina C.");
+});

@@ -150,10 +150,38 @@ export function scanDocument(root: Document | Element = document): ScanResult {
       if (node.nodeType !== 1) continue;
       const child = node as Element;
       if (SKIP_TAGS[child.tagName] === true || isHiddenSelf(child) || isExtensionInjected(child)) continue;
+      // A single space at every element boundary: textContent-style
+      // concatenation welds adjacent anchors and spans into artifacts like
+      // "ScholarView" or "1AinaC." on real reference lists; whitespace
+      // collapsing later removes any doubles.
+      out += " ";
       const kids = Array.from(child.childNodes);
-      stack.splice(0, 0, ...kids);
+      stack.splice(0, 0, ...kids, child.ownerDocument.createTextNode(" "));
     }
     return out;
+  }
+
+  /** Publisher reference lists append per-citation service links —
+   * "CrossRef", "Google Scholar", "PubMed Abstract", "View reference in
+   * article", Springer's bare "Article" — inside the same container as the
+   * citation text, so they survive any structural container choice. They
+   * are UI chrome, not citation content: strip a trailing run of them from
+   * the DISPLAY label only. Weak tokens ("article", "pdf", "full text")
+   * also appear in genuine titles, so a trailing run is stripped only when
+   * it contains at least one unambiguous service token. Identifiers and
+   * snapshots are never affected. */
+  const SERVICE_RUN =
+    /(?:\s*(?:crossref|google scholar|pubmed(?:\s+abstract)?|scopus|web of science|view (?:reference )?in article|full\s?text|article|pdf)[.,]?)+$/i;
+  const STRONG_SERVICE =
+    /crossref|google scholar|pubmed|scopus|web of science|view (?:reference )?in article/i;
+
+  function stripServiceChrome(label: string): string {
+    const match = label.match(SERVICE_RUN);
+    if (match === null || !STRONG_SERVICE.test(match[0])) return label;
+    const stripped = label.slice(0, label.length - match[0].length).trim();
+    // Never strip a label down to nothing: a row whose entire text was
+    // chrome keeps its original text rather than rendering blank.
+    return stripped.length >= 8 ? stripped : label;
   }
 
   /** Climb from the identifier's own element through ancestors, keeping the
@@ -187,7 +215,8 @@ export function scanDocument(root: Document | Element = document): ScanResult {
       boundedAncestor(start) ??
       (typeof start.closest === "function" ? start.closest(CONTAINER_SELECTOR) : null) ??
       start;
-    return visibleText(container).replace(/\s+/g, " ").trim().slice(0, MAX_LABEL_CHARS);
+    const raw = visibleText(container).replace(/\s+/g, " ").trim();
+    return stripServiceChrome(raw).slice(0, MAX_LABEL_CHARS);
   }
 
   interface MergedEntry {

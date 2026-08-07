@@ -476,16 +476,28 @@ function updatePrimaryButton(): void {
   if (elements === null) return;
   const eligible = eligibleRows();
   const selected = selectedRows();
-  const capNote = `${SUBMIT_CAP} selected · papio batches are limited to ${SUBMIT_CAP}`;
   if (selected.length === 0) {
-    elements.primaryButton.textContent = `Acquire all ${eligible.length} eligible`;
+    // Nothing checked: acquire-all mode. Past the cap, the button itself
+    // says what will actually happen — "50 selected" with zero checkboxes
+    // checked read as a bug in the first live session.
+    const capped = Math.min(eligible.length, SUBMIT_CAP);
+    elements.primaryButton.textContent =
+      eligible.length > SUBMIT_CAP
+        ? `Acquire ${capped} of ${eligible.length} eligible`
+        : `Acquire all ${eligible.length} eligible`;
     elements.primaryButton.disabled = state.submitting || !state.statusLoaded || eligible.length === 0;
-    elements.submitStatus.textContent = state.statusLoaded && eligible.length > SUBMIT_CAP ? capNote : "";
+    elements.submitStatus.textContent =
+      state.statusLoaded && eligible.length > SUBMIT_CAP
+        ? `papio batches are limited to ${SUBMIT_CAP} — the remaining ${eligible.length - SUBMIT_CAP} stay listed for the next batch`
+        : "";
     return;
   }
   elements.primaryButton.textContent = `Acquire ${selected.length} selected`;
   elements.primaryButton.disabled = state.submitting || !state.statusLoaded;
-  elements.submitStatus.textContent = selected.length > SUBMIT_CAP ? capNote : "";
+  elements.submitStatus.textContent =
+    selected.length > SUBMIT_CAP
+      ? `${SUBMIT_CAP} of ${selected.length} selected will be submitted · papio batches are limited to ${SUBMIT_CAP}`
+      : "";
 }
 
 function renderActionBar(): void {

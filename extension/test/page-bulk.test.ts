@@ -419,7 +419,7 @@ test("50-cap: selecting more than 50 shows the cap note without hiding the true 
   const primary = page.document.getElementById("primary-btn") as HTMLButtonElement;
   expect(primary.textContent).toBe("Acquire 60 selected");
   expect(page.document.getElementById("submit-status")?.textContent).toBe(
-    "50 selected \u00b7 papio batches are limited to 50",
+    "50 of 60 selected will be submitted \u00b7 papio batches are limited to 50",
   );
 });
 
