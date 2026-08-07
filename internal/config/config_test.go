@@ -932,6 +932,11 @@ func TestLibKeyConfigValidationFailsClosed(t *testing.T) {
 			body:    "[browser.resolvers.campus]\nopenurl_base_url = \"https://campus.example.edu/openurl\"\nlibkey_mode = \"link\"\n",
 			wantErr: "browser.resolvers.campus.libkey_mode",
 		},
+		{
+			name:    "link mode without an OpenURL base is silently-dead config",
+			body:    "[browser]\nlibkey_mode = \"link\"\nlibkey_library_id = 1234\n",
+			wantErr: "requires browser.openurl_base_url",
+		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "config.toml")

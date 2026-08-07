@@ -1303,6 +1303,32 @@ export class Bridge {
     }
   }
 
+  /** The institution origin for one job. The offer URL's own origin answers
+   * when the daemon's config knows it; otherwise the first provider host the
+   * config-derived resolver origins recognize does. A LibKey-routed offer
+   * opens on libkey.io and forwards through the institution's resolver, so
+   * the offer origin stops identifying the institution the moment LibKey
+   * link mode is configured — the daemon deliberately keeps the resolver
+   * host on provider_hosts for exactly this derivation (ADR-0016). Fails
+   * closed to undefined: an origin outside the configured set never
+   * becomes institutional bookkeeping. */
+  private jobInstitutionOrigin(job: ActiveJob): string | undefined {
+    const known = this.knownResolverOrigins();
+    const hinted = this.resolverOriginHint(this.offerURLs.get(job.job_id));
+    if (hinted !== undefined && known.includes(hinted)) return hinted;
+    for (const host of job.provider_hosts ?? []) {
+      const match = known.find((origin) => {
+        try {
+          return new URL(origin).hostname === host;
+        } catch {
+          return false;
+        }
+      });
+      if (match !== undefined) return match;
+    }
+    return undefined;
+  }
+
   knownResolverOrigins(): readonly string[] {
     const origins = new Set<string>();
     // Institutions are the daemon's CONFIG-derived resolver origins from the
@@ -4374,8 +4400,8 @@ export class Bridge {
    * release, never a source of truth beyond its own origin. */
   private async recordInstitutionalSession(job: ActiveJob, rawURL: string, now: number): Promise<boolean> {
     if (!this.isInstitutionalSessionLanding(job, rawURL)) return false;
-    const origin = this.resolverOriginHint(this.offerURLs.get(job.job_id));
-    if (origin === undefined || !this.knownResolverOrigins().includes(origin)) return false;
+    const origin = this.jobInstitutionOrigin(job);
+    if (origin === undefined) return false;
     const firstAuthEvidence = !this.hasAuthEvidence(origin);
     await this.update((s) => ({
       ...s,
@@ -5799,21 +5825,14 @@ export class Bridge {
       // itself used to before parked_with_tab existed.
       await this.update((s) => patchJob(s, job.job_id, { status: "awaiting_download", parked_with_tab: false }));
       this.send("auth_returned", { elapsed_ms: elapsed }, job.job_id);
-      // resolverOriginHint alone only rejects authentication-shaped and
-      // non-bare origins — it does not require the daemon's configured set,
-      // so an offer's own provider origin could otherwise ride along as the
-      // hint (unlike recordFreshSessionEvidence and recordInstitutionalSession,
-      // which both gate on knownResolverOrigins()). No privacy boundary
-      // crosses either way and the daemon fails closed on an unresolved
-      // hint, but an absent hint is documented as the safe default above, so
-      // hold this producer to the same configured-origin bar as its siblings.
-      const authReturnedOriginHint = this.resolverOriginHint(this.offerURLs.get(job.job_id));
-      this.emitSessionEvidence(
-        "auth_returned",
-        authReturnedOriginHint !== undefined && this.knownResolverOrigins().includes(authReturnedOriginHint)
-          ? authReturnedOriginHint
-          : undefined,
-      );
+      // jobInstitutionOrigin holds this producer to the same configured-origin
+      // bar as recordFreshSessionEvidence and recordInstitutionalSession: an
+      // origin outside the daemon's configured set never rides along as the
+      // hint, and an absent hint stays the documented safe default. It also
+      // survives LibKey-fronted offers, whose offer origin is libkey.io
+      // rather than the institution's resolver.
+      const authReturnedOriginHint = this.jobInstitutionOrigin(job);
+      this.emitSessionEvidence("auth_returned", authReturnedOriginHint);
       // The human is past authentication; fold the "papio" group back away.
       await this.recollapseHandoffGroup(tabID);
       const institutionalSession = await this.recordInstitutionalSession(job, url, now);
@@ -6051,10 +6070,18 @@ export class Bridge {
     } catch {
       return false;
     }
-    if (
-      offerURL.origin !== landingURL.origin ||
-      !/(?:openurl|uresolver)/i.test(offerURL.pathname)
-    ) {
+    // The offer origin proves this is the institutional resolver for this
+    // job — unless LibKey fronts the route, in which case the offer origin
+    // is libkey.io and the proof is the landing itself: the config-derived
+    // institution origin plus a resolver-shaped path.
+    const offerIsResolver =
+      offerURL.origin === landingURL.origin && /(?:openurl|uresolver)/i.test(offerURL.pathname);
+    const institution = this.jobInstitutionOrigin(job);
+    const landedOnInstitutionResolver =
+      institution !== undefined &&
+      landingURL.origin === institution &&
+      /(?:openurl|uresolver)/i.test(landingURL.pathname);
+    if (!offerIsResolver && !landedOnInstitutionResolver) {
       return false;
     }
 

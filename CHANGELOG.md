@@ -29,6 +29,14 @@ execution records in `notes/acquisition-stack-plan.md`.
   job like any other temporary source failure; it never settles it
   unavailable. Verified live: a paywalled Nature article resolves its typed
   medRxiv preprint in one hop.
+  The extension derives each job's institution origin from the offer's
+  provider hosts when LibKey fronts the route (the offer origin is
+  `libkey.io`, which the daemon's resolver origins never contain), so
+  first-sign-in queue release, `auth_returned` session evidence, and
+  Alma/Primo resolver auto-routing keep working under link mode; and the
+  default profile refuses `link` mode without an OpenURL base — the handoff
+  gates key on the base, so a base-less LibKey config would sit validated
+  but unreachable.
 
 - **A browser adoption whose session was freshly evidenced as authenticated now
   publishes its entitlement (ADR-0018).** `acquisition-bundle/2`'s

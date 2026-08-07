@@ -361,6 +361,18 @@ a competing design.
   apply to every institutional route, not only LibKey's — an implementer
   should not special-case LibKey's auth handling separately from the OpenURL
   path's.
+- A LibKey-fronted offer's origin is `libkey.io`, so every extension
+  mechanism keyed to "the offer origin is the institution's resolver" must
+  derive the institution differently: the per-job institution origin is the
+  offer origin when the daemon's config-derived resolver origins know it,
+  else the first `provider_hosts` entry those origins recognize — which is
+  why Decision 1's offer keeps the resolver host beside `libkey.io`.
+  Session-evidence recording, the `auth_returned` origin hint, and Alma/Primo
+  resolver auto-routing all use this derivation; keying any future mechanism
+  to the raw offer origin re-breaks it under link mode. The default profile
+  additionally refuses `link` mode without an OpenURL base, because the
+  handoff gates key on the base and a base-less LibKey config would sit
+  validated but unreachable.
 - The privacy-policy table needs an update describing what the daemon sends
   to Third Iron (requested DOI/PMID and library ID during resolution; a fixed
   public probe DOI and library ID during `doctor`; the configured API key

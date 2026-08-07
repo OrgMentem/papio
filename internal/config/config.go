@@ -43,6 +43,7 @@ const (
 	SourceCrossrefMetadata = "crossref_metadata"
 	SourceRetractionWatch  = "retraction_watch"
 	SourceSemanticScholar  = "semanticscholar"
+	SourceOpenAIRE         = "openaire"
 )
 
 // validSourceNames is the exhaustive set of [sources.*] keys papio
@@ -60,6 +61,7 @@ var validSourceNames = map[string]bool{
 	SourceCrossrefMetadata: true,
 	SourceRetractionWatch:  true,
 	SourceSemanticScholar:  true,
+	SourceOpenAIRE:         true,
 }
 
 // removedSourceNames are names papio shipped in Default() at some point and no
@@ -78,7 +80,7 @@ var removedSourceNames = map[string]bool{
 
 // validSourceNamesList renders validSourceNames for error messages, in the
 // same order as the const block above.
-const validSourceNamesList = "arxiv, europepmc, unpaywall, openalex, core, crossref_tdm, crossref_metadata, retraction_watch, semanticscholar"
+const validSourceNamesList = "arxiv, europepmc, unpaywall, openalex, core, crossref_tdm, crossref_metadata, retraction_watch, semanticscholar, openaire"
 
 // Source is one resolver's policy knobs.
 type Source struct {
@@ -463,6 +465,10 @@ func Default() Config {
 			SourceCrossrefMetadata: {Enabled: true, RatePerSec: 1, Burst: 1},
 			SourceRetractionWatch:  {Enabled: true, RatePerSec: 1, Burst: 1},
 			SourceSemanticScholar:  {Enabled: true, RatePerSec: 1, Burst: 1},
+			// OpenAIRE's keyless public limit is 60 requests/hour; a personal
+			// token (api_key) raises the ceiling and can justify a higher
+			// rate_per_sec in the user's config.
+			SourceOpenAIRE: {Enabled: true, RatePerSec: 0.016, Burst: 1},
 		},
 	}
 }
@@ -578,6 +584,12 @@ func (c *Config) validate() error {
 	}
 	if err := validateLibKey(c.Browser.LibKeyMode, c.Browser.LibKeyLibraryID); err != nil {
 		return fmt.Errorf("browser.%w", err)
+	}
+	if c.Browser.LibKeyMode == "link" && strings.TrimSpace(c.Browser.OpenURLBase) == "" {
+		// Without a resolver base the default profile never opens an
+		// institutional handoff, so a LibKey route configured here would sit
+		// validated but unreachable — the silently-dead-config shape again.
+		return fmt.Errorf("browser.libkey_mode \"link\" requires browser.openurl_base_url: LibKey augments the institutional route, and without a resolver base the default profile opens no handoff to route")
 	}
 	for name, inst := range c.Browser.Resolvers {
 		// "default" is the implicit top-level institution, not a valid map key:
