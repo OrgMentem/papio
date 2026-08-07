@@ -554,18 +554,61 @@ func TestEntitlementIsDerivedNeverInferred(t *testing.T) {
 			},
 		},
 		{
-			// The only writer of `institutional` is browser adoption, and it
-			// records that basis unconditionally — including for an open-access
-			// PDF handed to the browser because a provider's anti-bot wall
-			// refused papio's own fetch. Emitting operator_browser_session plus
-			// the library's OpenURL origin would assert an institutional route
-			// that acquisition never walked, so the object is omitted until
-			// adoption records what it actually observed.
-			name: "browser adoption asserts no route, because papio observed none",
+			// The qualifying shape: adoption recorded an institutional route
+			// AND witnessed the login, so the mode has a producer. The route is
+			// the page host the extension reported, not the synthetic adopted
+			// URL, and not anything reconstructed from current OpenURL config.
+			name: "a contexted adoption that witnessed the login names the observed origin",
+			candidate: job.Candidate{
+				Source:          "browser",
+				AccessBasis:     resolver.AccessInstitutional,
+				URLRedacted:     "browser://adopted-download",
+				LandingRedacted: "https://journals.sagepub.com",
+				BrowserRoute:    "direct",
+				SessionEvidence: "fresh_auth",
+			},
+			want: &protocol.BundleEntitlement{
+				Route:           "https://journals.sagepub.com",
+				AcquisitionMode: "operator_browser_session",
+			},
+		},
+		{
+			// A warm session is a real institutional basis but an inherited
+			// one: papio found it already authenticated and never observed the
+			// login this mode would claim. ADR-0018 chose the honest floor.
+			name: "a warm session is an institutional basis but no witnessed login",
+			candidate: job.Candidate{
+				Source:          "browser",
+				AccessBasis:     resolver.AccessInstitutional,
+				URLRedacted:     "browser://adopted-download",
+				LandingRedacted: "https://journals.sagepub.com",
+				BrowserRoute:    "resolver",
+				SessionEvidence: "warm",
+			},
+			want: nil,
+		},
+		{
+			// Every adoption predating migration 0019 looks like this, and 65
+			// of the first cohort's 66 do. The empty binding is permanent; the
+			// rescue is a re-drain, never a retroactive stamp.
+			name: "an adoption predating the delivery-context guard stays entitlement-less",
 			candidate: job.Candidate{
 				Source:      "browser",
 				AccessBasis: resolver.AccessInstitutional,
 				URLRedacted: "browser://adopted-download",
+			},
+			want: nil,
+		},
+		{
+			// The basis is not the gate. A resolver reached this judgement from
+			// its own paywall metadata with no browser session behind it, so it
+			// has a real URL and no evidence — emitting the mode here would
+			// assert a login that never happened.
+			name: "a resolver-produced institutional candidate has no session to witness",
+			candidate: job.Candidate{
+				Source:      "fixture",
+				AccessBasis: resolver.AccessInstitutional,
+				URLRedacted: "https://paywall.test/landing",
 			},
 			want: nil,
 		},

@@ -395,13 +395,81 @@ func TestRatifiedConsumerContract(t *testing.T) {
 			t.Fatalf("location = %+v, want %+v", got, want)
 		}
 	})
+
+	// The entitlement is part of the ratified shape, not an export-package
+	// detail: bundle.document is the consumer's rights basis, and a consumer
+	// that reads operator_browser_session grants subscription access on the
+	// strength of it. So what qualifies for that mode is pinned here against a
+	// real emitted document, beside the methods it travels through.
+	t.Run("bundle.document publishes an entitlement only for a witnessed login", func(t *testing.T) {
+		for _, tc := range []struct {
+			name  string
+			route string
+			// evidence is the recorded session_evidence; "" is an adoption
+			// predating migration 0019, whose binding stays empty forever.
+			evidence string
+			want     *protocol.BundleEntitlement
+		}{
+			{
+				name: "fresh_auth witnessed the login", route: "direct", evidence: "fresh_auth",
+				want: &protocol.BundleEntitlement{
+					// The recorded page origin, not the synthetic adopted URL.
+					Route:           "https://provider.example.test",
+					AcquisitionMode: "operator_browser_session",
+				},
+			},
+			{name: "warm inherited a session it never saw authenticate", route: "resolver", evidence: "warm"},
+			{name: "none never authenticated at all", route: "direct", evidence: "none"},
+			{name: "an uncontexted adoption records no route", route: "", evidence: ""},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				system, jobID, _ := readyBundleSystem(t, func(candidate *job.Candidate) {
+					candidate.Source = "browser"
+					candidate.AccessBasis = "institutional"
+					candidate.URLRedacted = "browser://adopted-download"
+					candidate.LandingRedacted = "https://provider.example.test"
+					candidate.BrowserRoute = tc.route
+					candidate.SessionEvidence = tc.evidence
+				})
+				var result struct {
+					Document string `json:"document"`
+				}
+				if rpcErr := callMethod(t, Router(system), "bundle.document",
+					map[string]string{"job_id": jobID}, &result); rpcErr != nil {
+					t.Fatalf("bundle.document = %+v", rpcErr)
+				}
+				decoded, err := protocol.DecodeAcquisitionBundle([]byte(result.Document))
+				if err != nil {
+					t.Fatalf("document does not decode as a bundle: %v", err)
+				}
+				got := decoded.Candidate.Entitlement
+				if tc.want == nil {
+					if got != nil {
+						t.Fatalf("entitlement = %+v, want omitted: %s is no rights basis", got, tc.evidence)
+					}
+					return
+				}
+				if got == nil {
+					t.Fatalf("entitlement omitted, want %+v", tc.want)
+				}
+				if *got != *tc.want {
+					t.Fatalf("entitlement = %+v, want %+v", *got, *tc.want)
+				}
+			})
+		}
+	})
 }
 
 // readyBundleSystem builds a system holding one job whose bundle can actually
 // be produced: an accepted candidate, a promoted artifact that verifies, and a
 // passing acquisition identity. The ratified readers are frozen forever, so
 // their contract test asserts against a real response rather than a stub.
-func readyBundleSystem(t *testing.T) (*bootstrap.System, string, ArtifactLocation) {
+//
+// provenance rewrites the candidate before insertion, so a caller can pin what
+// the bundle publishes for a delivery context other than the open-access
+// default. It runs before InsertCandidates, which means the enum validation a
+// real adoption faces applies to the fixture too.
+func readyBundleSystem(t *testing.T, provenance ...func(*job.Candidate)) (*bootstrap.System, string, ArtifactLocation) {
 	t.Helper()
 	ctx := context.Background()
 	system := testSystem(t)
@@ -412,11 +480,15 @@ func readyBundleSystem(t *testing.T) (*bootstrap.System, string, ArtifactLocatio
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := system.Jobs.InsertCandidates(ctx, id, []job.Candidate{{
+	row := job.Candidate{
 		JobID: id, Source: "unpaywall", URLRedacted: "https://example.test/paper.pdf", URLKey: "ratified-url-key",
 		LandingRedacted: "https://example.test/article", Version: "published", AccessBasis: "open_access",
 		ReuseLicense: "cc-by-4.0", ExpectedMIME: "application/pdf", Direct: true, IdentityConfidence: 1, Rank: 0,
-	}}); err != nil {
+	}
+	for _, apply := range provenance {
+		apply(&row)
+	}
+	if _, err := system.Jobs.InsertCandidates(ctx, id, []job.Candidate{row}); err != nil {
 		t.Fatal(err)
 	}
 	candidate, _ := system.Jobs.NextPendingCandidate(ctx, id)

@@ -1880,6 +1880,28 @@ func BrowserAccessBasis(route, sessionEvidence string) (string, error) {
 	}
 }
 
+// BrowserSessionWitnessedLogin reports whether recorded delivery context
+// witnesses the operator actually completing an institutional login, as
+// opposed to merely reaching an institutional route.
+//
+// It answers a narrower question than BrowserAccessBasis and defers to it for
+// the route/evidence lattice rather than restating it, so the two can never
+// drift: "warm" still derives an institutional basis, because a pre-existing
+// authenticated session is a real one, but it is evidence papio inherited
+// rather than observed. Only "fresh_auth" observed the login. Callers that
+// publish a rights claim about the session itself want this predicate; callers
+// recording how the bytes were obtained want the basis.
+//
+// Empty evidence is false by construction, which is what keeps adoptions
+// predating migration 0019 out: their binding is empty forever.
+func BrowserSessionWitnessedLogin(route, sessionEvidence string) bool {
+	if sessionEvidence != "fresh_auth" {
+		return false
+	}
+	basis, err := BrowserAccessBasis(route, sessionEvidence)
+	return err == nil && basis == "institutional"
+}
+
 // ApplyBrowserDeliveryContextToCandidate records route/session evidence on the
 // candidate created by one browser adoption. The durable candidate ID is the
 // binding: a prior browser candidate for the same job can never receive a

@@ -13,6 +13,23 @@ execution records in `notes/acquisition-stack-plan.md`.
 
 ### Added
 
+- **A browser adoption that witnessed an institutional login now publishes its
+  entitlement (ADR-0018).** `acquisition-bundle/2`'s `operator_browser_session`
+  acquisition mode has had no producer since it was reserved; the delivery
+  context added in 0.17.0 supplies one. An exported bundle now carries
+  `candidate.entitlement` when the accepted candidate's own row records
+  `session_evidence = fresh_auth` on an institutional route, naming the page
+  origin the extension observed at adoption. The gate is the recorded evidence,
+  never the access basis: a `warm` session is a real institutional basis but an
+  inherited one papio never saw authenticate, a resolver-produced
+  `institutional` candidate has no browser session behind it at all, and an
+  adoption predating the context guard has an empty binding forever. All three
+  stay entitlement-less, because a false positive here invents rights evidence
+  while a false negative costs only a field (ADR-0007). Nothing is backfilled.
+  The bundle shape, schema, and IPC surface are unchanged — the mode was
+  already in the v2 enum and the route is already a bare origin — so no
+  consumer change is required.
+
 - **`papio actions open` takes a row selector, so a consumer can open the
   handoff it chose.** The command opened the head of the queue and nothing else,
   which is the wrong shape for a caller that ranks its own routes — one

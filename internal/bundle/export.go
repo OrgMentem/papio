@@ -40,32 +40,35 @@ type Exporter struct {
 // value the consumer would refuse.
 var sourceRefRE = regexp.MustCompile(`^[a-z0-9_]{1,64}$`)
 
-// acquisitionModeFor maps the accepted candidate's access basis onto the
-// acquisition-bundle/2 mode vocabulary. It is a derivation, not an inference:
-// every input is a validated enum value papio already recorded.
+// acquisitionModeFor maps the accepted candidate onto the acquisition-bundle/2
+// mode vocabulary. It is a derivation, not an inference: every input is a
+// validated enum value papio already recorded on the candidate row.
 //
-// Two bases deliberately have no mode:
+// "manual" describes an artifact filed with no observed route at all, so it
+// keeps no mode.
 //
-// "manual" describes an artifact filed with no observed route at all.
+// "institutional" earns operator_browser_session only from recorded browser
+// delivery context, never from the basis alone, because the basis alone does
+// not distinguish two things this mode asserts apart:
 //
-// "institutional" is subtler and is why operator_browser_session currently has
-// no producer. Its only writer is browser adoption, which records the basis
-// unconditionally (internal/app/browser_adopt.go) — including for an
-// open-access PDF handed to the browser because a provider's anti-bot wall
-// refused papio's own fetch. That adoption never touched the institution, so
-// claiming operator_browser_session would invent entitlement evidence for a
-// route the operator never walked, and the adopted candidate URL is the
-// synthetic "browser://adopted-download", so papio has no observed route to
-// name either. Reconstructing one from the current OpenURL config would be
-// worse still: it is mutable, so re-exporting after an operator edits the
-// config would silently rewrite an already-published provenance record.
-// ADR-0007's asymmetry applies — a false positive invents rights evidence,
-// a false negative costs nothing but a field. Omit.
+// A resolver-produced candidate carries this basis from its own paywall
+// judgement, with no browser session behind it at all.
 //
-// Recording the true basis and route at adoption time is the fix that gives
-// this mode a producer; until then the enum value stays reserved.
-func acquisitionModeFor(accessBasis string) (string, bool) {
-	switch accessBasis {
+// Browser adoption records it for any (route, evidence) pair
+// job.BrowserAccessBasis admits as institutional, which includes "warm" — a
+// session papio found already authenticated but never observed authenticating.
+// "fresh_auth" is the only evidence that witnesses the login this mode names,
+// so it is the only evidence that qualifies (ADR-0018). The "oa" route cannot
+// reach here at all: BrowserAccessBasis requires evidence "none" for it and
+// derives open_access.
+//
+// The gate is therefore the recorded evidence, and the guard is one-way. An
+// adoption predating migration 0019 has an empty binding forever and stays
+// entitlement-less; its rescue is a re-drain, not a retroactive stamp.
+// ADR-0007's asymmetry applies — a false positive invents rights evidence, a
+// false negative costs nothing but a field.
+func acquisitionModeFor(candidate *job.Candidate) (string, bool) {
+	switch candidate.AccessBasis {
 	case resolver.AccessOpen:
 		return "open_access", true
 	case resolver.AccessLicensedAPI:
@@ -73,6 +76,11 @@ func acquisitionModeFor(accessBasis string) (string, bool) {
 		// Crossref's Plus token). That is a daemon-held credential by
 		// definition, not future work.
 		return "daemon_held_credential", true
+	case resolver.AccessInstitutional:
+		if !job.BrowserSessionWitnessedLogin(candidate.BrowserRoute, candidate.SessionEvidence) {
+			return "", false
+		}
+		return "operator_browser_session", true
 	default:
 		return "", false
 	}
@@ -82,7 +90,7 @@ func acquisitionModeFor(accessBasis string) (string, bool) {
 // no route. Nil is the honest and common answer; the object is never partially
 // filled.
 func entitlementFor(candidate *job.Candidate) *protocol.BundleEntitlement {
-	mode, ok := acquisitionModeFor(candidate.AccessBasis)
+	mode, ok := acquisitionModeFor(candidate)
 	if !ok {
 		return nil
 	}
@@ -109,7 +117,18 @@ func entitlementFor(candidate *job.Candidate) *protocol.BundleEntitlement {
 // the entitlement instead of shipping a string the consumer must reject.
 func entitlementRoute(candidate *job.Candidate) (string, bool) {
 	raw := candidate.URLRedacted
-	if raw == "" {
+	if candidate.SessionEvidence != "" {
+		// A browser adoption's candidate URL is the synthetic
+		// "browser://adopted-download": the bytes arrived through the
+		// operator's own browser rather than from a URL papio fetched, so that
+		// value names no origin. The origin papio did observe is the page host
+		// the extension reported at adoption, which
+		// ApplyBrowserDeliveryContextToCandidate stored as landing_redacted.
+		// Recorded evidence is the marker for that row, so this quotes what was
+		// witnessed and never reconstructs an origin from current config — the
+		// mutable-config hazard that kept this mode producer-less.
+		raw = candidate.LandingRedacted
+	} else if raw == "" {
 		raw = candidate.LandingRedacted
 	}
 	if raw == "" {
