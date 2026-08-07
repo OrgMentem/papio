@@ -101,13 +101,17 @@ read (ADR-0019 Decision 10).
    holds; re-verify AMO/CWS counts at cut time.
 9. **Reassess Primo/Scholar class-2 from run data.** Primo moved to
    Later/conditional (r5): Export-RIS → `--batch` already preserves MORE
-   metadata than an extractor could scrape. Evidence gate (all required,
-   measured by #3's denominator): ≥5 Primo selection sessions across ≥3
-   days; median ≥10 selectable records; exact-identifier yield <25%; ≥3
-   sessions abandoned specifically because the RIS route was disruptive;
-   operator confirms the friction. If it fires, build the **rendered-row
-   PNX reader** first — join rendered cards to already-loaded client-state
-   PNX JSON by record ID, exact identifiers out, structured
+   metadata than an extractor could scrape. Evidence gate — advisory
+   instrumentation, NOT a bureaucratic prerequisite: the operator saying
+   "the RIS route is friction, build it" IS sufficient evidence (declared
+   preference outranks logged metrics, per the house automation stance).
+   The metrics exist to inform that call, and to arbitrate later "was it
+   worth it": ≥5 Primo selection sessions across ≥3 days; median ≥10
+   selectable records; exact-identifier yield <25%; sessions abandoned
+   because the RIS route was disruptive. Whichever way it fires, build the
+   **rendered-row PNX reader** first — join rendered cards to
+   already-loaded client-state PNX JSON by record ID, exact identifiers
+   out, structured
    title/creator/year as class-2 candidates; NEVER call Primo search APIs,
    replay queries, paginate, or read unrendered records (that crosses the
    privacy line and duplicates RIS). If NDE exposes no stable client-side
