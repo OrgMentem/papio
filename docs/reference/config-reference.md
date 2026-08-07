@@ -202,8 +202,10 @@ is measured in days.
 
 `[sources]` is a map of resolver policies. The supported built-in names are
 `arxiv`, `europepmc`, `unpaywall`, `openalex`, `core`, `crossref_tdm`, and
-`semanticscholar` (discovery-only; see `[discovery]`).
-Each named section accepts these keys:
+`semanticscholar`. For `semanticscholar`, `enabled` governs the acquisition
+resolver (open-access PDF lookup by exact DOI, arXiv id, or PMID); selection as
+a *search* backend is separate and lives in `[discovery]` (which reads this
+section's `api_key`). Each named section accepts these keys:
 
 | Key | Type | Default | Effect and constraints |
 | --- | --- | --- | --- |
@@ -224,6 +226,7 @@ Each named section accepts these keys:
 | `openalex` | `false` | 2 | 2 |
 | `core` | `false` | 0.4 | 1 |
 | `crossref_tdm` | `false` | 1 | 1 |
+| `semanticscholar` | `true` | 1 | 1 |
 
 ## Watch configuration
 

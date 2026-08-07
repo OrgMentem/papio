@@ -44,6 +44,7 @@ func TestNewWiresResolverOrderAndCoreServices(t *testing.T) {
 		config.SourceEuropePMC,
 		config.SourceUnpaywall,
 		config.SourceOpenAlex,
+		config.SourceSemanticScholar,
 		config.SourceCORE,
 		config.SourceCrossrefTDM,
 	}

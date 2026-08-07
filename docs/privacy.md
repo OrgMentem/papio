@@ -39,7 +39,7 @@ daemon on your machine. Each request carries the identifier being looked up; the
 | `api.openalex.org` | your `email`, your API key | Resolving, and `papio search` | Off |
 | `api.core.ac.uk` | your API key | Resolving | Off |
 | `api.crossref.org` (TDM) | your subscriber token | Resolving | Off |
-| `api.semanticscholar.org` | your API key, if set | `papio search`, when configured | Off |
+| `api.semanticscholar.org` | your API key, if set | Resolving a DOI, arXiv id, or PMID, and `papio search` when configured | **On** |
 | Publisher and repository hosts | — | Downloading the PDF itself | **On** |
 | `api.github.com` | **nothing** | Once a day, checking for a new *papio* or zotio release | **On**, `updates.check = false` disables it |
 | Your webhook URL | job event and message | Job state changes | Off |

@@ -445,6 +445,7 @@ func Default() Config {
 			SourceCrossrefTDM:      {Enabled: false, RatePerSec: 1, Burst: 1},
 			SourceCrossrefMetadata: {Enabled: true, RatePerSec: 1, Burst: 1},
 			SourceRetractionWatch:  {Enabled: true, RatePerSec: 1, Burst: 1},
+			SourceSemanticScholar:  {Enabled: true, RatePerSec: 1, Burst: 1},
 		},
 	}
 }

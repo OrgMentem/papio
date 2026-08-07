@@ -30,6 +30,23 @@ execution records in `notes/acquisition-stack-plan.md`.
   already in the v2 enum and the route is already a bare origin — so no
   consumer change is required.
 
+- **Semantic Scholar now contributes open-access acquisition candidates, not
+  just search results.** The provider papio already queried for discovery joins
+  the resolver waterfall between OpenAlex and CORE: an exact-identifier lookup
+  (DOI, arXiv id, or PMID — never a title search, because a weak title match
+  must not become an automatic candidate) that emits one candidate only when
+  the record carries a usable `openAccessPdf` URL. `isOpenAccess` without a
+  PDF location is treated as metadata, an echoed identifier that names a
+  different work rejects the record, the stated license is carried through
+  (`unknown` otherwise — a reachable PDF is not a redistribution right), and
+  the version stays `unknown` because the API supplies no typed version
+  evidence. `[sources.semanticscholar].enabled` gains the documented meaning
+  "may also contribute OA acquisition candidates" (default on, paced at the
+  keyless 1 req/s public limit; discovery backend selection remains separate
+  in `[discovery]`). The privacy table now lists `api.semanticscholar.org`
+  under resolving, and 429s defer the source by the server's `Retry-After`
+  like every other resolver.
+
 - **`papio actions open` takes a row selector, so a consumer can open the
   handoff it chose.** The command opened the head of the queue and nothing else,
   which is the wrong shape for a caller that ranks its own routes — one

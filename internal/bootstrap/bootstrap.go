@@ -38,6 +38,7 @@ import (
 	"papio/internal/resolvers/crossreftdm"
 	"papio/internal/resolvers/europepmc"
 	"papio/internal/resolvers/openalex"
+	"papio/internal/resolvers/semanticscholar"
 	"papio/internal/resolvers/unpaywall"
 	"papio/internal/retraction"
 	"papio/internal/sourcegate"
@@ -381,6 +382,7 @@ func resolverEntries(cfg config.Config, client *fetch.SecureHTTPClient) []app.Re
 		{Adapter: europepmc.NewWithOptions(europepmc.Options{Client: client, BaseURL: cfg.Sources[config.SourceEuropePMC].BaseURLForDev}), Policy: cfg.SourcePolicy(config.SourceEuropePMC)},
 		{Adapter: unpaywall.NewWithOptions(unpaywall.Options{Client: client, ContactEmail: cfg.Email, BaseURL: cfg.Sources[config.SourceUnpaywall].BaseURLForDev}), Policy: cfg.SourcePolicy(config.SourceUnpaywall)},
 		{Adapter: openalex.NewWithOptions(openalex.Options{Client: client, ContactEmail: cfg.Email, APIKey: cfg.Sources[config.SourceOpenAlex].APIKey, BaseURL: cfg.Sources[config.SourceOpenAlex].BaseURLForDev}), Policy: cfg.SourcePolicy(config.SourceOpenAlex)},
+		{Adapter: semanticscholar.NewWithOptions(semanticscholar.Options{Client: client, APIKey: cfg.Sources[config.SourceSemanticScholar].APIKey, BaseURL: cfg.Sources[config.SourceSemanticScholar].BaseURLForDev}), Policy: cfg.SourcePolicy(config.SourceSemanticScholar)},
 		{Adapter: coreresolver.NewWithOptions(coreresolver.Options{Client: client, APIKey: cfg.Sources[config.SourceCORE].APIKey, BaseURL: cfg.Sources[config.SourceCORE].BaseURLForDev}), Policy: cfg.SourcePolicy(config.SourceCORE)},
 		{Adapter: crossreftdm.NewWithOptions(crossreftdm.Options{Client: client, APIKey: cfg.Sources[config.SourceCrossrefTDM].APIKey, BaseURL: cfg.Sources[config.SourceCrossrefTDM].BaseURLForDev}), Policy: cfg.SourcePolicy(config.SourceCrossrefTDM)},
 	}
