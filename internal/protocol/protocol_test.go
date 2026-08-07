@@ -1176,6 +1176,15 @@ func TestDeliveryReconcilePayloadRoundTripsAndValidates(t *testing.T) {
 		{name: "confirm_request_absent with provider_reference", payload: map[string]any{
 			"request_id": "request-delivery-0004", "job_id": "job_delivery_0001", "operation": "confirm_request_absent", "provider_reference": "TN-42",
 		}},
+		// Presence, not value: an explicit "" must be rejected exactly like a
+		// non-empty value — p.ProviderReference == "" alone cannot tell
+		// "absent" from "present and empty" apart, so this pins the
+		// raw-field presence check in the delivery_reconcile_request decode
+		// case, matching extension/src/protocol.ts and the JSON schema's
+		// "not": {"required": ["provider_reference"]}.
+		{name: "confirm_request_absent with empty-string provider_reference", payload: map[string]any{
+			"request_id": "request-delivery-0006", "job_id": "job_delivery_0001", "operation": "confirm_request_absent", "provider_reference": "",
+		}},
 		{name: "unknown operation", payload: map[string]any{
 			"request_id": "request-delivery-0005", "job_id": "job_delivery_0001", "operation": "open_request_history",
 		}},

@@ -115,6 +115,12 @@ func IdempotencyKey(institutionProfile, workIdentity, provider, requestClass str
 // key must resolve against the existing row, never open a second one."
 var ErrDuplicateRequest = errors.New("delivery: a request already exists for this idempotency key")
 
+// ErrRequestNotLive reports that Resume was asked to act on a request
+// whose state is not submitted/pending — there is no live poll schedule
+// to resume. The caller receives the unmodified row alongside this error
+// so it can report the actual state without a second fetch.
+var ErrRequestNotLive = errors.New("delivery: request is not live (submitted or pending)")
+
 // CreateRequest is Create's input. State defaults to StateOffered when
 // empty — the row a compiled-prefill route occupies before any live
 // submission exists.
@@ -285,6 +291,47 @@ func (s *Service) RecordPoll(ctx context.Context, id int64, providerReference st
 		SET provider_reference = ?, last_checked_at = ?, next_check_at = ?, updated_at = ?
 		WHERE id = ?`, providerReference, now, next, now, id)
 	return err
+}
+
+// Resume clears a live (submitted/pending) request's poll-failure
+// bookkeeping — consecutive_poll_failures, last_poll_error_class, and
+// next_check_at — including a contract-drift park at
+// pollDisabledDelay (internal/delivery/poll.go, effectively "until an
+// operator intervenes"). It never changes state or any successful-poll
+// column: only an actual provider response ever does that (the same
+// invariant recordPollFailure's own discipline already protects).
+//
+// This alone does not force papio to poll again — Poll is a no-op until
+// NextCheckAt is due, and the row's own next_check_at governs that, not
+// the driving job's retry_at — so an operator combines this with
+// `papio jobs retry <job-id>` (jobs.Retry) to actually wake the job and
+// retry now. Splitting the two matters: `jobs retry` alone previously
+// re-parked silently on the still-future next_check_at Poll no-op'd
+// against, with no operator-visible recovery path at all for a
+// contract-drift park (delivery.cancel refuses a live row, and
+// confirm-exists/confirm-absent both require an open document_delivery
+// human action a live submitted/pending row never has).
+//
+// Returns (row, ErrRequestNotLive) — never a bare error — when id names a
+// row whose state is not live, so callers can report a structured refusal
+// instead of propagating a raw error. Returns (nil, nil) when no row with
+// this id exists.
+func (s *Service) Resume(ctx context.Context, id int64) (*Request, error) {
+	req, err := s.Get(ctx, id)
+	if err != nil || req == nil {
+		return req, err
+	}
+	if req.State != StateSubmitted && req.State != StatePending {
+		return req, ErrRequestNotLive
+	}
+	now := s.now().UTC().Format(time.RFC3339Nano)
+	if _, err := s.store.DB().ExecContext(ctx, `
+		UPDATE delivery_requests
+		SET consecutive_poll_failures = 0, last_poll_error_class = NULL, next_check_at = ?, updated_at = ?
+		WHERE id = ?`, now, now, id); err != nil {
+		return nil, err
+	}
+	return s.Get(ctx, id)
 }
 
 // BranchDecision is the idempotency branch Decision 3B evaluates before the

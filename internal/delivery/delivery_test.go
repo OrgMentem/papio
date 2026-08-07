@@ -501,3 +501,107 @@ func TestOrphanIfLiveIgnoresNonLiveRows(t *testing.T) {
 		t.Fatalf("delivery.orphaned events = %d, want 0 — none of these rows were ever live", count)
 	}
 }
+
+// TestResumeClearsFailureBookkeepingOnLiveRow proves the P2 recovery
+// primitive: a contract-drift-parked live row (consecutive_poll_failures
+// nonzero, last_poll_error_class set, next_check_at ~10 years out per
+// poll.go's pollDisabledDelay) has all three reset by Resume, so a
+// subsequent poll (NextCheckAt <= now) is no longer a no-op.
+func TestResumeClearsFailureBookkeepingOnLiveRow(t *testing.T) {
+	now := time.Date(2026, 8, 8, 12, 0, 0, 0, time.UTC)
+	svc := testService(t, now)
+	ctx := context.Background()
+	testJob(t, svc, "job_resume_live")
+
+	req, err := svc.Create(ctx, CreateRequest{
+		JobID: "job_resume_live", InstitutionProfile: "campus", Provider: "illiad",
+		RequestClass: "digital_journal_article", WorkIdentity: "doi:10.1/resume-live",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.UpdateState(ctx, req.ID, StatePending); err != nil {
+		t.Fatal(err)
+	}
+	farFuture := now.Add(10 * 365 * 24 * time.Hour).UTC().Format(time.RFC3339Nano)
+	if _, err := svc.store.DB().ExecContext(ctx, `
+		UPDATE delivery_requests
+		SET consecutive_poll_failures = 7, last_poll_error_class = 'contract_drift', next_check_at = ?
+		WHERE id = ?`, farFuture, req.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	after, err := svc.Resume(ctx, req.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after == nil {
+		t.Fatal("Resume returned a nil row for an existing id")
+	}
+	if after.State != StatePending {
+		t.Fatalf("state = %q, want unchanged pending — Resume never changes state", after.State)
+	}
+	if after.ConsecutivePollFailures != 0 {
+		t.Fatalf("consecutive_poll_failures = %d, want 0", after.ConsecutivePollFailures)
+	}
+	if after.LastPollErrorClass != "" {
+		t.Fatalf("last_poll_error_class = %q, want cleared", after.LastPollErrorClass)
+	}
+	gotNext, err := time.Parse(time.RFC3339Nano, after.NextCheckAt)
+	if err != nil {
+		t.Fatalf("next_check_at = %q did not parse: %v", after.NextCheckAt, err)
+	}
+	if gotNext.After(now.Add(time.Minute)) {
+		t.Fatalf("next_check_at = %v, want ~now (%v), not the stale far-future park", gotNext, now)
+	}
+}
+
+// TestResumeRefusesTerminalRow proves Resume never touches a row whose
+// state is not live — a fulfilled row (settled) and an offered row (never
+// submitted, so nothing to resume) both come back ErrRequestNotLive with
+// the unmodified row, never a bare error and never a silent no-op success.
+func TestResumeRefusesTerminalRow(t *testing.T) {
+	svc := testService(t, time.Now())
+	ctx := context.Background()
+	testJob(t, svc, "job_resume_fulfilled")
+	testJob(t, svc, "job_resume_offered")
+
+	fulfilled, err := svc.Create(ctx, CreateRequest{
+		JobID: "job_resume_fulfilled", InstitutionProfile: "campus", Provider: "illiad",
+		RequestClass: "digital_journal_article", WorkIdentity: "doi:10.1/resume-fulfilled",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.UpdateState(ctx, fulfilled.ID, StateFulfilled); err != nil {
+		t.Fatal(err)
+	}
+	row, err := svc.Resume(ctx, fulfilled.ID)
+	if !errors.Is(err, ErrRequestNotLive) {
+		t.Fatalf("Resume on a fulfilled row: err = %v, want ErrRequestNotLive", err)
+	}
+	if row == nil || row.State != StateFulfilled {
+		t.Fatalf("Resume on a fulfilled row returned %+v, want the unmodified fulfilled row", row)
+	}
+
+	offered, err := svc.Create(ctx, CreateRequest{
+		JobID: "job_resume_offered", InstitutionProfile: "campus", Provider: "illiad",
+		RequestClass: "digital_journal_article", WorkIdentity: "doi:10.1/resume-offered",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, err = svc.Resume(ctx, offered.ID)
+	if !errors.Is(err, ErrRequestNotLive) {
+		t.Fatalf("Resume on an offered row: err = %v, want ErrRequestNotLive", err)
+	}
+	if row == nil || row.State != StateOffered {
+		t.Fatalf("Resume on an offered row returned %+v, want the unmodified offered row", row)
+	}
+
+	// Not found: distinct nil, nil — never ErrRequestNotLive.
+	row, err = svc.Resume(ctx, fulfilled.ID+1_000_000)
+	if err != nil || row != nil {
+		t.Fatalf("Resume on an unknown id = %+v, %v, want (nil, nil)", row, err)
+	}
+}

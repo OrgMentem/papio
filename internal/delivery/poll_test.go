@@ -237,6 +237,63 @@ func TestPollDeliveredToWebFulfillsExactlyOnceWithEvent(t *testing.T) {
 	}
 }
 
+// TestPollConcurrentRaceNeverDuplicatesSettlementOrRegressesState pins the
+// compare-and-swap discipline persistPollSuccess enforces: two workers
+// (e.g. two jobs joined on the same live delivery_requests row) each read
+// their own snapshot before either wrote. The loser's CAS'd write must
+// affect zero rows — no duplicate event, and never a regression of the
+// winner's already-committed state.
+func TestPollConcurrentRaceNeverDuplicatesSettlementOrRegressesState(t *testing.T) {
+	svc, clock := testServiceClock(t)
+	ctx := context.Background()
+	req1 := newLiveRequest(t, svc, "race1", *clock)
+	// req2 is an independent snapshot of the SAME row, read before either
+	// worker has written — exactly the shape two concurrent
+	// Branch()/Get() calls produce.
+	req2, err := svc.Get(ctx, req1.ID)
+	if err != nil || req2 == nil {
+		t.Fatalf("get: %v, %v", req2, err)
+	}
+
+	client := sequencedIlliadServer(t, nil,
+		txnResponse(illiadStatusDeliveredToWeb, 555),
+		txnResponse(illiadStatusDeliveredToWeb, 555),
+	)
+
+	result1, err := svc.Poll(ctx, req1, PollDeps{Client: client, StatusPollMinutes: 60})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result1.Settled || result1.State != StateFulfilled {
+		t.Fatalf("winner's poll = %+v, want settled fulfilled", result1)
+	}
+
+	result2, err := svc.Poll(ctx, req2, PollDeps{Client: client, StatusPollMinutes: 60})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result2.Settled {
+		t.Fatalf("loser's poll from a stale snapshot must lose the CAS race, not re-settle: %+v", result2)
+	}
+
+	got, err := svc.Get(ctx, req1.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != StateFulfilled {
+		t.Fatalf("state = %q after the losing write, want the winner's fulfilled preserved (no regression)", got.State)
+	}
+
+	var n int
+	if err := svc.store.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE job_id = ? AND kind = ?`,
+		"race1", eventKindFulfilled).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("delivery.fulfilled events = %d, want exactly 1 despite the race", n)
+	}
+}
+
 func TestPollUnmappedCustomStatusStaysPendingWithEvent(t *testing.T) {
 	svc, clock := testServiceClock(t)
 	ctx := context.Background()
@@ -385,9 +442,12 @@ func TestPollRequestFinishedTriBranch(t *testing.T) {
 			t.Fatalf("next_check_at empty, want a delayed reconciliation pass scheduled")
 		}
 
-		// Advance the clock to the delayed pass and poll again.
-		*clock = clock.Add(requestFinishedReconciliationDelay)
-		req.NextCheckAt = clock.Add(-time.Second).UTC().Format(time.RFC3339Nano)
+		// Advance the clock to the delayed pass and poll again. req's
+		// NextCheckAt already carries the real stored value from the
+		// Get() above (persistPollSuccess wrote it verbatim) — advancing
+		// the clock past it, rather than fabricating a different string,
+		// keeps the CAS predicate matching the true row.
+		*clock = clock.Add(requestFinishedReconciliationDelay + time.Second)
 		result, err = svc.Poll(ctx, req, PollDeps{Client: client, StatusPollMinutes: 60})
 		if err != nil {
 			t.Fatal(err)
@@ -574,9 +634,11 @@ func TestPoll404UnreconciledSettlesUnknownOutcomeOnlyAfterDelayedRecheck(t *test
 
 	// Advance to the delayed recheck: still 404 (client only has one
 	// canned response), so this must be the call that finally settles
-	// unknown_outcome.
-	*clock = clock.Add(notFoundReconciliationRecheckDelay)
-	req.NextCheckAt = clock.Add(-time.Second).UTC().Format(time.RFC3339Nano)
+	// unknown_outcome. req's NextCheckAt already carries the real stored
+	// value from the Get() above — advance the clock past it rather than
+	// fabricating a different string, so the CAS predicate still matches
+	// the true row.
+	*clock = clock.Add(notFoundReconciliationRecheckDelay + time.Second)
 	result, err = svc.Poll(ctx, req, PollDeps{Client: client, PatronRef: "patron1", ReferenceField: "ItemInfo4", StatusPollMinutes: 60})
 	if err != nil {
 		t.Fatal(err)

@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1186,6 +1187,66 @@ func TestRunDocumentDeliveryPollHealth(t *testing.T) {
 		health, ok := find(report, "document_delivery:default:poll_health")
 		if !ok || health.Status != Warn || !strings.Contains(health.Detail, "3+ consecutive failed status polls") {
 			t.Fatalf("poll_health = %+v, want warn degraded", health)
+		}
+	})
+
+	// TestDocumentDeliveryPollHealthRemedyNamesRealCommand (folded in here
+	// rather than a standalone Test func, sharing this test's run/find
+	// helpers): a contract-drift park has one operator recovery path,
+	// 'papio delivery resume <request-id>' (internal/cli/delivery.go's
+	// newDeliveryResumeCommand); this pins the remedy text against that
+	// exact command name and the affected request's id, so renaming or
+	// removing the CLI command without updating this string is caught here
+	// rather than shipping a remedy that names a command that does not
+	// exist — the P2 gap this test closes.
+	t.Run("contract drift names the real papio delivery resume command", func(t *testing.T) {
+		data := t.TempDir()
+		db, err := store.Open(ctx, data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = db.Close() })
+		cfg := documentDeliveryTestConfig(data)
+		svc := delivery.New(db, &cfg, nil)
+		if _, err := db.DB().ExecContext(ctx,
+			`INSERT INTO work_requests (id, created_at) VALUES (?, ?)`, "wr_poll_drift", store.Now()); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.DB().ExecContext(ctx,
+			`INSERT INTO jobs (id, work_request_id, state, policy_json, created_at, updated_at) VALUES (?, ?, 'queued', '{}', ?, ?)`,
+			"poll_drift", "wr_poll_drift", store.Now(), store.Now()); err != nil {
+			t.Fatal(err)
+		}
+		created, err := svc.Create(ctx, delivery.CreateRequest{
+			JobID: "poll_drift", InstitutionProfile: "default", Provider: "illiad",
+			RequestClass: "digital_journal_article", WorkIdentity: "doi:10.1/poll-drift", GateProfileDigest: "d",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := svc.UpdateState(ctx, created.ID, delivery.StateSubmitted); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.DB().ExecContext(ctx,
+			`UPDATE delivery_requests SET consecutive_poll_failures = 9, last_poll_error_class = ? WHERE id = ?`,
+			delivery.PollErrorClassContractDrift, created.ID); err != nil {
+			t.Fatal(err)
+		}
+
+		report := run(cfg, db)
+		health, ok := find(report, "document_delivery:default:poll_health")
+		if !ok {
+			t.Fatal("poll_health check missing")
+		}
+		wantCommand := fmt.Sprintf("papio delivery resume %d", created.ID)
+		if !strings.Contains(health.Remediation, wantCommand) {
+			t.Fatalf("remediation = %q, want it to name the real command %q", health.Remediation, wantCommand)
+		}
+		if strings.Contains(health.Remediation, "papio delivery reconciliation") {
+			t.Fatalf("remediation = %q, still names the nonexistent 'papio delivery reconciliation' command", health.Remediation)
+		}
+		if !strings.Contains(health.Remediation, "papio jobs retry") {
+			t.Fatalf("remediation = %q, want it to also name 'papio jobs retry <job-id>' — resume alone does not force an immediate poll", health.Remediation)
 		}
 	})
 }

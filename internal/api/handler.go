@@ -409,6 +409,9 @@ func RouterWithShutdown(system *bootstrap.System, shutdown context.CancelFunc) i
 		"delivery.action": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return deliveryAction(ctx, raw, system)
 		},
+		"delivery.resume": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return deliveryResume(ctx, raw, system)
+		},
 	}
 	if shutdown != nil {
 		methods["daemon.shutdown"] = func(_ context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {

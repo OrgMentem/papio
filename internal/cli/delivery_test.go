@@ -219,3 +219,59 @@ func TestDeliveryConfirmAbsentReportsJobState(t *testing.T) {
 		t.Fatalf("stdout = %q", got)
 	}
 }
+
+func TestDeliveryResumeSendsRequestIDAndReportsState(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	root := NewInProcessRoot(&stdout, &stderr, config.Config{}, func(_ context.Context, method string, params, result any) error {
+		if method != "delivery.resume" {
+			t.Fatalf("method = %q, want delivery.resume", method)
+		}
+		p := params.(map[string]any)
+		if p["request_id"] != int64(42) {
+			t.Fatalf("params = %#v, want request_id 42 (int64)", p)
+		}
+		*result.(*api.DeliveryResumeResult) = api.DeliveryResumeResult{RequestID: 42, Resumed: true, State: "pending"}
+		return nil
+	})
+	root.SetArgs([]string{"delivery", "resume", "42"})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("delivery resume: %v (%s)", err, stderr.String())
+	}
+	if got := stdout.String(); got != "request 42: resumed (state pending); run 'papio jobs retry <job-id>' to poll now\n" {
+		t.Fatalf("stdout = %q", got)
+	}
+}
+
+func TestDeliveryResumeReportsRefusalOnTerminalRow(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	root := NewInProcessRoot(&stdout, &stderr, config.Config{}, func(_ context.Context, method string, params, result any) error {
+		*result.(*api.DeliveryResumeResult) = api.DeliveryResumeResult{
+			RequestID: 7, Resumed: false, State: "fulfilled",
+			Reason: "state fulfilled is not live (submitted/pending); nothing to resume",
+		}
+		return nil
+	})
+	root.SetArgs([]string{"delivery", "resume", "7"})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("delivery resume: %v (%s)", err, stderr.String())
+	}
+	if got := stdout.String(); got != "request 7: not resumed (state fulfilled is not live (submitted/pending); nothing to resume)\n" {
+		t.Fatalf("stdout = %q", got)
+	}
+}
+
+func TestDeliveryResumeRejectsNonPositiveArg(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	root := NewInProcessRoot(&stdout, &stderr, config.Config{}, func(context.Context, string, any, any) error {
+		t.Fatal("delivery.resume must not be called with an invalid request-id")
+		return nil
+	})
+	root.SetArgs([]string{"delivery", "resume", "0"})
+	if err := root.Execute(); err == nil {
+		t.Fatal("delivery resume 0: want an error, got nil")
+	}
+	root.SetArgs([]string{"delivery", "resume", "not-a-number"})
+	if err := root.Execute(); err == nil {
+		t.Fatal("delivery resume not-a-number: want an error, got nil")
+	}
+}

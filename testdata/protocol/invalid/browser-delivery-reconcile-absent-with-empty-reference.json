@@ -1,0 +1,1 @@
+{"protocol":"papio-browser/1","type":"delivery_reconcile_request","msg_id":"delivery-reconcile-invalid-001","seq":1,"payload":{"request_id":"request-delivery-invalid-0001","job_id":"job_delivery_0001","operation":"confirm_request_absent","provider_reference":""}}

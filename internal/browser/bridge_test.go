@@ -982,6 +982,52 @@ func assertNoV3FieldsOnSchema2Snapshot(t *testing.T, frames []json.RawMessage) {
 	t.Fatal("no schema-2 snapshot response received")
 }
 
+// TestTriageSnapshotV3DeliveryLookupFailureDegradesGracefully pins the
+// reviewPreview-class footgun (AGENTS.md): a non-nil error from a
+// browser-bridge RPC handler kills the whole native-messaging session, not
+// just the request, so a routine delivery-store failure must degrade the
+// one item to an absent Delivery rather than aborting the snapshot.
+func TestTriageSnapshotV3DeliveryLookupFailureDegradesGracefully(t *testing.T) {
+	b, jobs, cfg, _ := newBridge(t)
+	ctx := context.Background()
+	b.svc.Delivery = delivery.New(jobs.S, &cfg, nil)
+
+	jobID := parkDocumentDelivery(t, jobs, b.svc, "wr_v3_delivery_lookup_fail",
+		work.Work{DOI: "10.1002/example.46", Title: "Lookup Failure ILL", Year: 2020}, "illiad", "unknown_outcome", "TN-3")
+
+	// Break only the delivery lookup: human_actions/jobs/work_requests (what
+	// the triage query itself reads) are untouched, so a real, isolated
+	// storage failure surfaces exactly where triageDeliveryFor's error path
+	// is exercised, not as an incidental snapshot-wide failure.
+	if _, err := jobs.S.DB().ExecContext(ctx, `DROP TABLE delivery_requests`); err != nil {
+		t.Fatal(err)
+	}
+
+	runSync(t, b, hello())
+	msgs, _ := runSync(t, b, inFrame(t, protocol.MsgTriageSnapshotRequest, "",
+		protocol.TriageSnapshotRequestPayload{RequestID: "request-v3-delivery-fail", SchemaVersions: []int64{3}, Limit: 50}))
+	response := firstOfType(msgs, protocol.MsgTriageSnapshotResponse)
+	if response == nil {
+		t.Fatalf("v3 snapshot response missing despite the delivery lookup failing: %v", msgs)
+	}
+	payload := response.Payload.(*protocol.TriageSnapshotResponsePayload)
+	var found *protocol.TriageSnapshotItem
+	for i := range payload.Items {
+		if payload.Items[i].JobID == jobID {
+			found = &payload.Items[i]
+		}
+	}
+	if found == nil {
+		t.Fatalf("document_delivery item missing from snapshot despite the lookup failure being non-fatal: %+v", payload.Items)
+	}
+	if found.Delivery != nil {
+		t.Fatalf("delivery = %+v, want nil after a lookup failure", found.Delivery)
+	}
+	if found.Attention != "required" {
+		t.Fatalf("attention = %q, want required (a nil delivery never reads as fulfilled)", found.Attention)
+	}
+}
+
 func assertLockedSchema1Snapshot(t *testing.T, frames []json.RawMessage) {
 	t.Helper()
 	allowed := map[string]bool{

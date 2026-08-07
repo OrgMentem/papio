@@ -4,6 +4,7 @@ package delivery
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/rand/v2"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"papio/internal/illiad"
+	"papio/internal/store"
 )
 
 // TransactionLookup is the ILLiad transport surface the poll executor
@@ -97,6 +99,24 @@ const notFoundReconciliationRecheckDelay = 15 * time.Minute
 // not parse.
 const pollDisabledDelay = 10 * 365 * 24 * time.Hour
 
+// casConflictRecheckDelay is the short wait a compare-and-swap loss
+// schedules: two workers joined on the same live delivery_requests row
+// each read their own snapshot before either wrote, so the loser's write
+// never applies (see persistPollSuccess/persistPollFailure). Losing the
+// race means the winner already advanced the row — this only makes sure
+// the loser's job wakes again soon enough to observe the real outcome via
+// a fresh delivery.Branch/Get, not that it retries the same work.
+const casConflictRecheckDelay = time.Minute
+
+// pendingEvent is one event a successful CAS'd write should append, in
+// the SAME transaction as the write — so a lost CAS race (another worker
+// already advanced this row) can never leave behind a duplicate event for
+// a write that didn't actually apply.
+type pendingEvent struct {
+	kind   string
+	detail map[string]any
+}
+
 const (
 	eventKindFulfilled              = "delivery.fulfilled"
 	eventKindPollSettled            = "delivery.poll_settled"
@@ -121,6 +141,19 @@ func isPollTerminal(s State) bool {
 // nextDisplay is the value ProviderDisplayStatus should hold after this
 // poll. unmapped reports a custom status recorded via
 // eventKindProviderStatusUnmapped, never a terminal assertion.
+//
+// The three Request Finished sub-branches that resolve from
+// DeliveredToWeb/Cancelled* prior evidence are defense-in-depth, not a
+// live production path: Poll's own isPollTerminal guard stops polling the
+// instant a row settles fulfilled/declined/cancelled, so
+// ProviderDisplayStatus can never hold one of those values while the row
+// is still live enough to receive another read — reaching them requires
+// an out-of-band state edit (a test, a future reconciliation feature that
+// reopens a row, manual DB surgery). They exist so such an edit still
+// fails safe instead of forcing an incorrect unknown_outcome. The only
+// Request Finished path a row actually walks in production is the
+// ambiguous one: defer once, then settle unknown_outcome on the second
+// consecutive read with still no evidence.
 func classifyStatus(raw, priorDisplay string) (newState State, nextDisplay string, unmapped bool) {
 	switch raw {
 	case illiadStatusDeliveredToWeb:
@@ -135,15 +168,19 @@ func classifyStatus(raw, priorDisplay string) (newState State, nextDisplay strin
 	case illiadStatusRequestFinished:
 		switch priorDisplay {
 		case illiadStatusDeliveredToWeb:
+			// Defense-in-depth only — see the func doc comment.
 			return StateFulfilled, raw, false
 		case illiadStatusCancelledByCustomer:
+			// Defense-in-depth only — see the func doc comment.
 			return StateCancelled, raw, false
 		case illiadStatusCancelledByILLStaff:
+			// Defense-in-depth only — see the func doc comment.
 			return StateDeclined, raw, false
 		case illiadStatusRequestFinished:
-			// Second consecutive Request Finished with no fulfillment/
-			// cancellation evidence: the one delayed reconciliation pass
-			// already ran and found nothing new.
+			// The live production path: second consecutive Request
+			// Finished with no fulfillment/cancellation evidence — the
+			// one delayed reconciliation pass already ran and found
+			// nothing new.
 			return StateUnknownOutcome, raw, false
 		default:
 			// First observation, no evidence yet: leave state unchanged;
@@ -206,35 +243,51 @@ func (s *Service) recordPollSuccess(ctx context.Context, req *Request, now time.
 		nextCheckAt = NextCheck(now, 0, deps.StatusPollMinutes)
 	}
 
-	if err := s.persistPollSuccess(ctx, req, now, txn.TransactionStatus, nextDisplay, nextCheckAt, newState); err != nil {
+	events := pollSuccessEvents(req, newState, settled, unmapped, txn.TransactionStatus)
+	applied, err := s.persistPollSuccess(ctx, req, now, txn.TransactionStatus, nextDisplay, nextCheckAt, newState, events)
+	if err != nil {
 		return PollResult{}, err
 	}
-
-	switch {
-	case newState == StateFulfilled:
-		if err := s.appendPollEvent(ctx, req, eventKindFulfilled, map[string]any{
-			"provider_reference": req.ProviderReference,
-			"provider_status":    txn.TransactionStatus,
-		}); err != nil {
-			return PollResult{}, err
-		}
-	case settled:
-		if err := s.appendPollEvent(ctx, req, eventKindPollSettled, map[string]any{
-			"state":           string(newState),
-			"provider_status": txn.TransactionStatus,
-		}); err != nil {
-			return PollResult{}, err
-		}
-	}
-	if unmapped {
-		if err := s.appendPollEvent(ctx, req, eventKindProviderStatusUnmapped, map[string]any{
-			"provider_status": txn.TransactionStatus,
-		}); err != nil {
-			return PollResult{}, err
-		}
+	if !applied {
+		// Lost the race: another worker's Poll call already advanced this
+		// row past the snapshot this call read (two jobs joined on the
+		// same live request each read before either wrote). Losing the
+		// race means someone else already polled it — nothing left to do
+		// here, and never a duplicate settlement event or a regression of
+		// whatever state the winner wrote.
+		return PollResult{State: req.State, NextCheckAt: now.Add(casConflictRecheckDelay)}, nil
 	}
 
 	return PollResult{Settled: settled, State: req.State, NextCheckAt: nextCheckAt}, nil
+}
+
+// pollSuccessEvents decides which event(s) a successful poll's CAS'd write
+// appends, computed before the write so persistPollSuccess can append them
+// in the SAME transaction — a lost CAS race then never leaves behind an
+// event for a write that did not actually apply.
+func pollSuccessEvents(req *Request, newState State, settled, unmapped bool, rawStatus string) []pendingEvent {
+	var events []pendingEvent
+	switch {
+	case newState == StateFulfilled:
+		events = append(events, pendingEvent{kind: eventKindFulfilled, detail: map[string]any{
+			"provider_reference":  req.ProviderReference,
+			"provider_status":     rawStatus,
+			"delivery_request_id": req.ID,
+		}})
+	case settled:
+		events = append(events, pendingEvent{kind: eventKindPollSettled, detail: map[string]any{
+			"state":               string(newState),
+			"provider_status":     rawStatus,
+			"delivery_request_id": req.ID,
+		}})
+	}
+	if unmapped {
+		events = append(events, pendingEvent{kind: eventKindProviderStatusUnmapped, detail: map[string]any{
+			"provider_status":     rawStatus,
+			"delivery_request_id": req.ID,
+		}})
+	}
+	return events
 }
 
 // handlePollError classifies a GetTransaction failure and applies the
@@ -281,8 +334,12 @@ func (s *Service) handleNotFound(ctx context.Context, req *Request, now time.Tim
 		}
 		if matched != nil {
 			req.ProviderReference = strconv.Itoa(matched.TransactionNumber)
-			if err := s.persistProviderReference(ctx, req); err != nil {
+			applied, err := s.persistProviderReference(ctx, req)
+			if err != nil {
 				return PollResult{}, err
+			}
+			if !applied {
+				return PollResult{State: req.State, NextCheckAt: now.Add(casConflictRecheckDelay)}, nil
 			}
 			return s.recordPollSuccess(ctx, req, now, deps, *matched)
 		}
@@ -321,8 +378,12 @@ func (s *Service) recordPollFailure(ctx context.Context, req *Request, now time.
 	} else {
 		nextCheck = s.backoffWithJitter(now, failures, deps.StatusPollMinutes)
 	}
-	if err := s.persistPollFailure(ctx, req, now, class, failures, nextCheck); err != nil {
+	applied, err := s.persistPollFailure(ctx, req, now, class, failures, nextCheck)
+	if err != nil {
 		return PollResult{}, err
+	}
+	if !applied {
+		return PollResult{State: req.State, NextCheckAt: now.Add(casConflictRecheckDelay)}, nil
 	}
 	return PollResult{State: req.State, NextCheckAt: nextCheck}, nil
 }
@@ -332,8 +393,12 @@ func (s *Service) recordPollFailure(ctx context.Context, req *Request, now time.
 // which use a short fixed wait instead of exponential backoff).
 func (s *Service) recordPollFailureAt(ctx context.Context, req *Request, now time.Time, class string, nextCheck time.Time) (PollResult, error) {
 	failures := req.ConsecutivePollFailures + 1
-	if err := s.persistPollFailure(ctx, req, now, class, failures, nextCheck); err != nil {
+	applied, err := s.persistPollFailure(ctx, req, now, class, failures, nextCheck)
+	if err != nil {
 		return PollResult{}, err
+	}
+	if !applied {
+		return PollResult{State: req.State, NextCheckAt: now.Add(casConflictRecheckDelay)}, nil
 	}
 	return PollResult{State: req.State, NextCheckAt: nextCheck}, nil
 }
@@ -362,26 +427,60 @@ func defaultJitter(interval time.Duration) time.Duration {
 	return time.Duration(rand.Int64N(int64(max) + 1))
 }
 
-func (s *Service) persistPollSuccess(ctx context.Context, req *Request, now time.Time, raw, display string, nextCheckAt time.Time, newState State) error {
+// persistPollSuccess compare-and-swaps the row: the UPDATE only applies
+// WHERE state/next_check_at still match what this call originally read
+// (req.State/req.NextCheckAt, captured before any write). Two workers
+// joined on the same live request each read their own snapshot before
+// either wrote — the first commit wins, the second's WHERE clause no
+// longer matches and RowsAffected is 0, reported back as applied=false.
+// events append inside the same transaction as the CAS'd UPDATE, so a
+// lost race can never leave a duplicate (or orphaned) event behind.
+func (s *Service) persistPollSuccess(ctx context.Context, req *Request, now time.Time, raw, display string, nextCheckAt time.Time, newState State, events []pendingEvent) (bool, error) {
+	origState := req.State
+	origNextCheckAt := req.NextCheckAt
 	nowStr := now.UTC().Format(time.RFC3339Nano)
 	var nextCheckVal any
 	if !nextCheckAt.IsZero() {
 		nextCheckVal = nextCheckAt.UTC().Format(time.RFC3339Nano)
 	}
-	state := req.State
+	state := origState
 	if newState != "" {
 		state = newState
 	}
-	_, err := s.store.DB().ExecContext(ctx, `
+
+	tx, err := s.store.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback() }() // no-op once Commit succeeds
+
+	res, err := tx.ExecContext(ctx, `
 		UPDATE delivery_requests
 		SET state = ?, provider_status_raw = ?, provider_display_status = ?,
 		    last_poll_at = ?, last_successful_poll_at = ?, consecutive_poll_failures = 0,
 		    last_poll_error_class = NULL, next_check_at = ?, updated_at = ?
-		WHERE id = ?`,
-		string(state), raw, display, nowStr, nowStr, nextCheckVal, nowStr, req.ID)
+		WHERE id = ? AND state = ? AND COALESCE(next_check_at,'') = ?`,
+		string(state), raw, display, nowStr, nowStr, nextCheckVal, nowStr,
+		req.ID, string(origState), origNextCheckAt)
 	if err != nil {
-		return err
+		return false, err
 	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if n == 0 {
+		return false, nil
+	}
+	for _, ev := range events {
+		if err := appendEventTx(ctx, tx, req.JobID, ev.kind, ev.detail); err != nil {
+			return false, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+
 	req.State = state
 	req.ProviderStatusRaw = raw
 	req.ProviderDisplayStatus = display
@@ -394,63 +493,128 @@ func (s *Service) persistPollSuccess(ctx context.Context, req *Request, now time
 	} else {
 		req.NextCheckAt = ""
 	}
-	return nil
+	return true, nil
 }
 
-func (s *Service) persistPollFailure(ctx context.Context, req *Request, now time.Time, class string, failures int, nextCheck time.Time) error {
+// persistPollFailure is persistPollSuccess's CAS discipline for the
+// failure path: no event is ever appended here (a failed poll never
+// settles anything), so a single guarded UPDATE is enough.
+func (s *Service) persistPollFailure(ctx context.Context, req *Request, now time.Time, class string, failures int, nextCheck time.Time) (bool, error) {
+	origState := req.State
+	origNextCheckAt := req.NextCheckAt
 	nowStr := now.UTC().Format(time.RFC3339Nano)
 	nextStr := nextCheck.UTC().Format(time.RFC3339Nano)
-	_, err := s.store.DB().ExecContext(ctx, `
+	res, err := s.store.DB().ExecContext(ctx, `
 		UPDATE delivery_requests
 		SET last_poll_at = ?, consecutive_poll_failures = ?, last_poll_error_class = ?, next_check_at = ?, updated_at = ?
-		WHERE id = ?`, nowStr, failures, class, nextStr, nowStr, req.ID)
+		WHERE id = ? AND state = ? AND COALESCE(next_check_at,'') = ?`,
+		nowStr, failures, class, nextStr, nowStr, req.ID, string(origState), origNextCheckAt)
 	if err != nil {
-		return err
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if n == 0 {
+		return false, nil
 	}
 	req.LastPollAt = nowStr
 	req.ConsecutivePollFailures = failures
 	req.LastPollErrorClass = class
 	req.NextCheckAt = nextStr
-	return nil
+	return true, nil
 }
 
-// persistUnknownOutcome settles a row via the 404-reconciliation path,
+// persistUnknownOutcome CAS-settles a row via the 404-reconciliation path,
 // which has no fresh raw transaction to record — ProviderStatusRaw is left
-// as whatever the last successful read observed.
+// as whatever the last successful read observed. The event appends in the
+// same transaction as the CAS'd UPDATE, same discipline as
+// persistPollSuccess.
 func (s *Service) persistUnknownOutcome(ctx context.Context, req *Request, now time.Time) (PollResult, error) {
+	origState := req.State
+	origNextCheckAt := req.NextCheckAt
 	nowStr := now.UTC().Format(time.RFC3339Nano)
-	_, err := s.store.DB().ExecContext(ctx, `
-		UPDATE delivery_requests
-		SET state = ?, last_poll_at = ?, consecutive_poll_failures = 0, last_poll_error_class = NULL, next_check_at = NULL, updated_at = ?
-		WHERE id = ?`, string(StateUnknownOutcome), nowStr, nowStr, req.ID)
+
+	tx, err := s.store.DB().BeginTx(ctx, nil)
 	if err != nil {
 		return PollResult{}, err
 	}
+	defer func() { _ = tx.Rollback() }()
+
+	res, err := tx.ExecContext(ctx, `
+		UPDATE delivery_requests
+		SET state = ?, last_poll_at = ?, consecutive_poll_failures = 0, last_poll_error_class = NULL, next_check_at = NULL, updated_at = ?
+		WHERE id = ? AND state = ? AND COALESCE(next_check_at,'') = ?`,
+		string(StateUnknownOutcome), nowStr, nowStr, req.ID, string(origState), origNextCheckAt)
+	if err != nil {
+		return PollResult{}, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return PollResult{}, err
+	}
+	if n == 0 {
+		// Lost the race: leave whatever the winner already wrote alone.
+		return PollResult{State: req.State, NextCheckAt: now.Add(casConflictRecheckDelay)}, nil
+	}
+	if err := appendEventTx(ctx, tx, req.JobID, eventKindPollSettled, map[string]any{
+		"state":               string(StateUnknownOutcome),
+		"reason":              "404_after_reconciliation",
+		"delivery_request_id": req.ID,
+	}); err != nil {
+		return PollResult{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return PollResult{}, err
+	}
+
 	req.State = StateUnknownOutcome
 	req.LastPollAt = nowStr
 	req.ConsecutivePollFailures = 0
 	req.LastPollErrorClass = ""
 	req.NextCheckAt = ""
-	if err := s.appendPollEvent(ctx, req, eventKindPollSettled, map[string]any{
-		"state":  string(StateUnknownOutcome),
-		"reason": "404_after_reconciliation",
-	}); err != nil {
-		return PollResult{}, err
-	}
 	return PollResult{Settled: true, State: StateUnknownOutcome}, nil
 }
 
-func (s *Service) persistProviderReference(ctx context.Context, req *Request) error {
+// persistProviderReference CAS-guards the reconciliation-recovered
+// provider_reference write the same way as every other persist* helper:
+// applied=false means another worker already advanced this row past the
+// snapshot this call read, so the caller must not proceed to
+// recordPollSuccess against a reference that no longer belongs to this
+// row's current, already-changed state.
+func (s *Service) persistProviderReference(ctx context.Context, req *Request) (bool, error) {
+	origState := req.State
+	origNextCheckAt := req.NextCheckAt
 	now := s.now().UTC().Format(time.RFC3339Nano)
-	_, err := s.store.DB().ExecContext(ctx, `
-		UPDATE delivery_requests SET provider_reference = ?, updated_at = ? WHERE id = ?`,
-		req.ProviderReference, now, req.ID)
-	return err
+	res, err := s.store.DB().ExecContext(ctx, `
+		UPDATE delivery_requests SET provider_reference = ?, updated_at = ?
+		WHERE id = ? AND state = ? AND COALESCE(next_check_at,'') = ?`,
+		req.ProviderReference, now, req.ID, string(origState), origNextCheckAt)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
 }
 
-func (s *Service) appendPollEvent(ctx context.Context, req *Request, kind string, detail map[string]any) error {
-	detail["delivery_request_id"] = req.ID
-	return s.store.AppendEvent(ctx, req.JobID, kind, detail)
+// appendEventTx is store.AppendEvent's insert, scoped to an in-flight
+// transaction so a CAS'd state write and its settlement event commit or
+// roll back together (never one without the other).
+func appendEventTx(ctx context.Context, tx *sql.Tx, jobID, kind string, detail map[string]any) error {
+	data, err := json.Marshal(detail)
+	if err != nil {
+		return err
+	}
+	var job any
+	if jobID != "" {
+		job = jobID
+	}
+	_, err = tx.ExecContext(ctx, "INSERT INTO events (job_id, at, kind, detail_json) VALUES (?, ?, ?, ?)", job, store.Now(), kind, string(data))
+	return err
 }
 
 // PollHealth summarizes one live delivery_requests row's poll health for

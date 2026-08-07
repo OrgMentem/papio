@@ -3,7 +3,9 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -14,9 +16,10 @@ import (
 // newDeliveryCommand is ADR-0017 Decision 1's new CLI surface for document
 // delivery / ILL: get, submit, and cancel where the provider supports it,
 // plus Decision 4's three reconciliation operations for a job stuck in
-// unknown_outcome (history, confirm-exists, confirm-absent). Per papio's
-// existing pattern, the command-derived MCP facade exposes the same
-// operations without separate MCP-side work.
+// unknown_outcome (history, confirm-exists, confirm-absent), plus resume
+// for a live request whose poll failed (e.g. a contract-drift park). Per
+// papio's existing pattern, the command-derived MCP facade exposes the
+// same operations without separate MCP-side work.
 func newDeliveryCommand(opt *options) *cobra.Command {
 	command := &cobra.Command{Use: "delivery", Short: "Manage document-delivery and ILL requests"}
 	command.AddCommand(
@@ -26,6 +29,7 @@ func newDeliveryCommand(opt *options) *cobra.Command {
 		newDeliveryHistoryCommand(opt),
 		newDeliveryConfirmExistsCommand(opt),
 		newDeliveryConfirmAbsentCommand(opt),
+		newDeliveryResumeCommand(opt),
 	)
 	return command
 }
@@ -178,6 +182,36 @@ func newDeliveryConfirmAbsentCommand(opt *options) *cobra.Command {
 				return err
 			}
 			return opt.printResult(result, "%s: closed the stale request; job is now %s", args[0], result.JobState)
+		},
+	}
+}
+
+// newDeliveryResumeCommand clears a live (submitted/pending) request's
+// poll-failure bookkeeping — including a contract-drift park, which
+// otherwise has no recovery path: delivery cancel refuses a live row, and
+// confirm-exists/confirm-absent both need an open document_delivery human
+// action a live row never has. Resume alone does not force an immediate
+// poll — it only clears the schedule that made the last one a no-op — so
+// it is deliberately followed by 'papio jobs retry <job-id>' to actually
+// wake the driving job.
+func newDeliveryResumeCommand(opt *options) *cobra.Command {
+	return &cobra.Command{
+		Use:   "resume <request-id>",
+		Short: "Clear a live delivery request's poll-failure bookkeeping (e.g. a contract-drift park) so the next poll is no longer a no-op",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			requestID, err := strconv.ParseInt(args[0], 10, 64)
+			if err != nil || requestID <= 0 {
+				return errors.New("request-id must be a positive integer")
+			}
+			var result api.DeliveryResumeResult
+			if err := opt.call(cmd.Context(), "delivery.resume", map[string]any{"request_id": requestID}, &result); err != nil {
+				return err
+			}
+			if !result.Resumed {
+				return opt.printResult(result, "request %d: not resumed (%s)", requestID, result.Reason)
+			}
+			return opt.printResult(result, "request %d: resumed (state %s); run 'papio jobs retry <job-id>' to poll now", requestID, result.State)
 		},
 	}
 }

@@ -4362,6 +4362,78 @@ test("an inbox dismiss relays verdict dismiss through the native resolve", async
   });
 });
 
+test("an inbox delivery reconciliation relays confirm_request_exists/absent through the native delivery_reconcile frame", async () => {
+  const h = makeHarness();
+  const urls = {
+    runtimeID: "papio-test-id",
+    inboxURL: "chrome-extension://papio-test-id/inbox.html",
+    popupURL: "chrome-extension://papio-test-id/popup.html",
+    historyURL: "chrome-extension://papio-test-id/history.html",
+    pageBulkURL: "chrome-extension://papio-test-id/page-bulk.html",
+  };
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ daemon_version: CURRENT_DAEMON, features: ["triage_snapshot_schema_v3"] }));
+
+  const pending = handleInboxRuntimeMessage(
+    h.bridge,
+    { type: "papio.delivery.reconcile", request: { job_id: "job_delivery_0001", operation: "confirm_request_exists", provider_reference: "TN-42" } },
+    { id: urls.runtimeID, url: urls.inboxURL },
+    urls,
+  );
+  const frame = await h.port.waitForFrame("delivery_reconcile_request");
+  expect(frame.payload["job_id"]).toBe("job_delivery_0001");
+  expect(frame.payload["operation"]).toBe("confirm_request_exists");
+  expect(frame.payload["provider_reference"]).toBe("TN-42");
+
+  await h.port.inbound(nativeResult("delivery_reconcile_result", {
+    request_id: frame.payload["request_id"],
+    outcome: "applied",
+  }));
+  await expect(pending).resolves.toEqual({ ok: true, outcome: "applied" });
+
+  const pendingAbsent = handleInboxRuntimeMessage(
+    h.bridge,
+    { type: "papio.delivery.reconcile", request: { job_id: "job_delivery_0002", operation: "confirm_request_absent" } },
+    { id: urls.runtimeID, url: urls.inboxURL },
+    urls,
+  );
+  await Promise.resolve();
+  await Promise.resolve();
+  const absentFrame = h.frames().filter((f) => f.type === "delivery_reconcile_request").at(-1);
+  expect(absentFrame?.payload["job_id"]).toBe("job_delivery_0002");
+  expect(absentFrame?.payload["operation"]).toBe("confirm_request_absent");
+  expect(absentFrame?.payload["provider_reference"]).toBeUndefined();
+  await h.port.inbound(nativeResult("delivery_reconcile_result", {
+    request_id: absentFrame?.payload["request_id"],
+    outcome: "applied",
+  }));
+  await expect(pendingAbsent).resolves.toEqual({ ok: true, outcome: "applied" });
+
+  // Shape validation and sender authorization must both fail closed.
+  await expect(
+    handleInboxRuntimeMessage(
+      h.bridge,
+      { type: "papio.delivery.reconcile", request: { job_id: "job_delivery_0001", operation: "confirm_request_absent", provider_reference: "TN-42" } },
+      { id: urls.runtimeID, url: urls.inboxURL },
+      urls,
+    ),
+  ).resolves.toEqual({
+    ok: false,
+    error: { code: "invalid_request", message: "Invalid delivery reconciliation request" },
+  });
+  await expect(
+    handleInboxRuntimeMessage(
+      h.bridge,
+      { type: "papio.delivery.reconcile", request: { job_id: "job_delivery_0001", operation: "confirm_request_absent" } },
+      { id: urls.runtimeID, url: urls.popupURL },
+      urls,
+    ),
+  ).resolves.toEqual({
+    ok: false,
+    error: { code: "unauthorized", message: "This sender cannot access the inbox broker" },
+  });
+});
+
 test("queued inbox handoff force-releases exactly one live tab under racing opens", async () => {
   const h = makeHarness(undefined, { windows: true });
   await h.bridge.start();

@@ -564,11 +564,22 @@ func documentDeliveryPollHealthDetail(health []delivery.PollHealth) string {
 	}
 }
 
+// documentDeliveryPollHealthRemedy names the operator recovery step for a
+// degraded poll-health line. A contract-drift park (poll.go's
+// pollDisabledDelay: effectively "until an operator intervenes") is the one
+// case with an actual recovery command — 'papio delivery resume
+// <request-id>' clears the failure bookkeeping (internal/delivery.Service.Resume)
+// so a subsequent 'papio jobs retry <job-id>' actually polls again instead
+// of no-op'ing against the still-future next_check_at Poll left behind.
+// This text is pinned by TestRunDocumentDeliveryPollHealth's "contract
+// drift names the real papio delivery resume command" subtest against the
+// shipped CLI command name so it cannot drift into naming a command that
+// does not exist.
 func documentDeliveryPollHealthRemedy(health []delivery.PollHealth) string {
 	for _, h := range health {
 		switch h.LastPollErrorClass {
 		case delivery.PollErrorClassContractDrift:
-			return "check the ILLiad Web Platform API version/response shape, then run papio delivery reconciliation for the affected request"
+			return fmt.Sprintf("check the ILLiad Web Platform API version/response shape, then run 'papio delivery resume %d' followed by 'papio jobs retry <job-id>' for the affected request", h.RequestID)
 		case delivery.PollErrorClassCredential:
 			return "verify document_delivery.api_key is valid and has status-poll permission"
 		}

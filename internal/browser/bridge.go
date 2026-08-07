@@ -1121,11 +1121,7 @@ func (b *Bridge) triageSnapshotPayload(ctx context.Context, requestID string, sc
 					payload.RouteClass = action.ActionKind
 					payload.AuthRequirement = triageAuthRequirement(action.RequiresAuth)
 					if action.ActionKind == job.ActionKindDocumentDelivery {
-						delivery, err := b.triageDeliveryFor(ctx, action.JobID)
-						if err != nil {
-							return protocol.TriageSnapshotResponsePayload{}, err
-						}
-						payload.Delivery = delivery
+						payload.Delivery = b.triageDeliveryFor(ctx, action.JobID)
 						// Decision 4's three named reconciliation operations
 						// replace the generic dismiss/open ops a document_delivery
 						// action would otherwise inherit — the delivery
@@ -1194,23 +1190,28 @@ func triageHumanActionAttention(action *triage.HumanAction, delivery *protocol.T
 
 // triageDeliveryFor looks up the live delivery_requests row for a
 // document_delivery human action's job and maps it onto the wire's closed
-// delivery sub-object. A missing row (nil, nil) is a routine race — the
-// action closed between the snapshot query and this lookup — and degrades
-// to an absent Delivery rather than failing the whole snapshot.
-func (b *Bridge) triageDeliveryFor(ctx context.Context, jobID string) (*protocol.TriageDelivery, error) {
+// delivery sub-object. Both a missing row (nil, nil from GetByJobID — the
+// action closed between the snapshot query and this lookup) and a lookup
+// error degrade to an absent Delivery rather than failing the whole
+// snapshot: propagating a routine SQLite hiccup out of triageSnapshot would
+// abort the whole native-messaging session over one item, the exact
+// reviewPreview-class footgun AGENTS.md warns against (a non-nil error from
+// a browser-bridge RPC handler kills the session, not just the request).
+func (b *Bridge) triageDeliveryFor(ctx context.Context, jobID string) *protocol.TriageDelivery {
 	if b.svc == nil || b.svc.Delivery == nil {
-		return nil, nil
+		return nil
 	}
 	req, err := b.svc.Delivery.GetByJobID(ctx, jobID)
 	if err != nil {
-		return nil, err
+		log.Printf("papio: looking up delivery request for job %s: %v", jobID, err)
+		return nil
 	}
 	if req == nil {
-		return nil, nil
+		return nil
 	}
 	return &protocol.TriageDelivery{
 		Provider: req.Provider, ProviderReference: req.ProviderReference, State: string(req.State),
-	}, nil
+	}
 }
 
 func triageFacts(facts []triage.Fact) []protocol.TriageFact {

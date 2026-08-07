@@ -448,3 +448,61 @@ func deliveryConfirmRequestAbsent(ctx context.Context, system *bootstrap.System,
 	}
 	return marshal(DeliveryActionResult{JobID: jobID, Operation: deliveryOpConfirmRequestAbsent, JobState: after.State, Detail: detail})
 }
+
+// DeliveryResumeResult reports delivery.resume's outcome: Resumed is false
+// with Reason, never a bare error, when request_id names a row that is not
+// currently live (submitted/pending) — a terminal or never-submitted row
+// has no live poll schedule to resume.
+type DeliveryResumeResult struct {
+	RequestID int64  `json:"request_id"`
+	Resumed   bool   `json:"resumed"`
+	State     string `json:"state"`
+	Reason    string `json:"reason,omitempty"`
+}
+
+// deliveryResume implements the P2 recovery gap a contract-drift poll park
+// otherwise leaves with no operator-visible way out: delivery.cancel
+// refuses a live row, confirm_request_exists/confirm_request_absent both
+// require an open document_delivery human action a live submitted/pending
+// row never has, and jobs.retry alone re-parks silently on the row's own
+// still-future next_check_at (Poll is a no-op until it is due). This
+// clears that row's poll-failure bookkeeping via delivery.Service.Resume
+// so a subsequent `papio jobs retry <job-id>` actually attempts a poll —
+// it deliberately does not itself force the job to wake; see Resume's doc
+// comment for why the two stay separate operations.
+//
+// Keyed by request_id (delivery_requests.id, e.g. from delivery.get's
+// Request.ID), not job_id: unlike every other delivery.* method, the
+// operator-visible failure this recovers from is reported per poll-health
+// row (papio doctor), and Decision 1's job_id is scoped to whichever job
+// first created the row, not necessarily the job an operator is looking at
+// today.
+func deliveryResume(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
+	var params struct {
+		RequestID int64 `json:"request_id"`
+	}
+	if err := ipc.DecodeParams(raw, &params); err != nil || params.RequestID <= 0 {
+		if err == nil {
+			err = errors.New("request_id is required and must be a positive integer")
+		}
+		return badParams(err)
+	}
+	svc, rpcErr := deliveryService(system)
+	if rpcErr != nil {
+		return nil, rpcErr
+	}
+	row, err := svc.Resume(ctx, params.RequestID)
+	if err != nil {
+		if errors.Is(err, delivery.ErrRequestNotLive) {
+			return marshal(DeliveryResumeResult{
+				RequestID: params.RequestID, Resumed: false, State: string(row.State),
+				Reason: fmt.Sprintf("state %s is not live (submitted/pending); nothing to resume", row.State),
+			})
+		}
+		return failure(err)
+	}
+	if row == nil {
+		return nil, &ipc.RPCError{Code: "not_found", Message: "no delivery request with this id"}
+	}
+	return marshal(DeliveryResumeResult{RequestID: params.RequestID, Resumed: true, State: string(row.State)})
+}

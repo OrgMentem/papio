@@ -1830,6 +1830,18 @@ func DecodeBrowserMessage(data []byte) (*BrowserMessage, error) {
 		err = decodeTriagePayload(env.Payload, payloadFields, "delivery_reconcile_request",
 			[]string{"request_id", "job_id", "operation"}, p)
 		if err == nil {
+			// A raw-field presence check, not a value check: an explicit
+			// "provider_reference": "" on confirm_request_absent must be
+			// rejected the same as a non-empty one (parity with
+			// extension/src/protocol.ts's "provider_reference" in p check
+			// and the schema's "not": {"required": ["provider_reference"]}).
+			// p.ProviderReference == "" alone cannot distinguish "absent"
+			// from "present and empty".
+			if _, present := payloadFields["provider_reference"]; present && p.Operation != "confirm_request_exists" {
+				err = fmt.Errorf("delivery_reconcile_request.provider_reference is only valid for confirm_request_exists")
+			}
+		}
+		if err == nil {
 			err = p.validate()
 		}
 		msg.Payload = p

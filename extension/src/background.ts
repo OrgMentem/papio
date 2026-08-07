@@ -181,6 +181,7 @@ const TRIAGE_REQUEST_TIMEOUT_MS = 15_000;
 const HELLO_WAIT_TIMEOUT_MS = 5_000;
 const TRIAGE_SNAPSHOT_FEATURE = "triage_snapshot_v1";
 const TRIAGE_SNAPSHOT_SCHEMA_2_FEATURE = "triage_snapshot_schema_v2";
+const TRIAGE_SNAPSHOT_SCHEMA_3_FEATURE = "triage_snapshot_schema_v3";
 const TRIAGE_COUNTS_SCHEMA_2_FEATURE = "triage_counts_schema_v2";
 const SESSION_EVIDENCE_FEATURE = "session_evidence_v1";
 const DELIVERY_CONTEXT_FEATURE = "delivery_context_v1";
@@ -212,6 +213,7 @@ const CORRELATED_RESULT_TYPES: ReadonlySet<BrowserMessageType> = new Set([
   "activity_response",
   "page_bulk_status_result",
   "page_bulk_submit_result",
+  "delivery_reconcile_result",
 ]);
 // Fallback for a manifest without an action popup; both build targets ship
 // the pages under dist/ (see build.ts) and the manifest is the source of truth.
@@ -3770,6 +3772,31 @@ export class Bridge {
       request,
       "human_action_resolve_result",
       TRIAGE_MUTATIONS_FEATURE,
+      true,
+    );
+    if (result.kind !== "response" || result.payload === undefined) return this.nativeFailure(result);
+    if (result.code !== undefined) return this.failure(result.code, result.message ?? "The request is unavailable");
+    return {
+      ok: true,
+      outcome: result.payload["outcome"] as string,
+      ...(typeof result.payload["detail"] === "string" ? { detail: result.payload["detail"] } : {}),
+    };
+  }
+
+  // Decision 4's confirm_request_exists/confirm_request_absent mutations
+  // (triage-snapshot/3). Gated on the v3 snapshot feature rather than
+  // TRIAGE_MUTATIONS_FEATURE: a daemon that never emits document_delivery
+  // items has nothing for this RPC to act on, and open_request_history is
+  // deliberately not here — it never mutates anything and is handled
+  // locally by the inbox page.
+  async requestDeliveryReconcile(
+    request: { job_id: string; operation: "confirm_request_exists" | "confirm_request_absent"; provider_reference?: string },
+  ): Promise<BrokerReply<{ outcome: string; detail?: string }>> {
+    const result = await this.requestNative(
+      "delivery_reconcile_request",
+      request,
+      "delivery_reconcile_result",
+      TRIAGE_SNAPSHOT_SCHEMA_3_FEATURE,
       true,
     );
     if (result.kind !== "response" || result.payload === undefined) return this.nativeFailure(result);
@@ -7442,6 +7469,21 @@ function isPreviewRuntimeRequest(value: unknown): value is { action_id: number }
   return isObjectRecord(value) && hasOnlyKeys(value, ["action_id"]) && isPositiveSafeInteger(value["action_id"]);
 }
 
+function isDeliveryReconcileRuntimeRequest(
+  value: unknown,
+): value is { job_id: string; operation: "confirm_request_exists" | "confirm_request_absent"; provider_reference?: string } {
+  if (!isObjectRecord(value) || !hasOnlyKeys(value, ["job_id", "operation", "provider_reference"])) return false;
+  const jobID = value["job_id"];
+  const operation = value["operation"];
+  const providerReference = value["provider_reference"];
+  if (typeof jobID !== "string" || jobID.length === 0 || jobID.length > 128) return false;
+  if (operation !== "confirm_request_exists" && operation !== "confirm_request_absent") return false;
+  if (operation === "confirm_request_exists") {
+    return typeof providerReference === "string" && providerReference.length > 0 && providerReference.length <= 300;
+  }
+  return providerReference === undefined;
+}
+
 function isPageBulkScanRuntimeRequest(value: unknown): value is { tab_id: number } {
   return (
     isObjectRecord(value) &&
@@ -7771,6 +7813,7 @@ export async function handleInboxRuntimeMessage(
     type !== "papio.triage.counts" &&
     type !== "papio.triage.decide" &&
     type !== "papio.action.resolve" &&
+    type !== "papio.delivery.reconcile" &&
     type !== "papio.preview"
   ) {
     return undefined;
@@ -7805,6 +7848,10 @@ export async function handleInboxRuntimeMessage(
       return isResolveRuntimeRequest(request)
         ? bridge.requestActionResolve(request)
         : runtimeFailure("invalid_request", "Invalid action resolution request");
+    case "papio.delivery.reconcile":
+      return isDeliveryReconcileRuntimeRequest(request)
+        ? bridge.requestDeliveryReconcile(request)
+        : runtimeFailure("invalid_request", "Invalid delivery reconciliation request");
     case "papio.preview":
       return isPreviewRuntimeRequest(request)
         ? bridge.requestPreview(request)
@@ -8035,6 +8082,7 @@ if (typeof chrome !== "undefined" && chrome.runtime?.id) {
         message["type"] === "papio.triage.counts" ||
         message["type"] === "papio.triage.decide" ||
         message["type"] === "papio.action.resolve" ||
+        message["type"] === "papio.delivery.reconcile" ||
         message["type"] === "papio.preview" ||
         message["type"] === "papio.handoff.open" ||
         message["type"] === "papio.delivery.start" ||
