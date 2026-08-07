@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"papio/internal/budget"
 	"papio/internal/config"
 	"papio/internal/fetch"
 	"papio/internal/job"
@@ -264,11 +265,26 @@ func (f *fakeRelations) VersionSiblings(_ context.Context, doi string) ([]string
 type doiSwitchResolver struct {
 	name  string
 	byDOI map[string][]resolver.Candidate
+	calls int
 }
 
 func (r *doiSwitchResolver) Name() string { return r.name }
 func (r *doiSwitchResolver) Resolve(_ context.Context, requested work.Work) ([]resolver.Candidate, error) {
+	r.calls++
 	return append([]resolver.Candidate(nil), r.byDOI[requested.DOI]...), nil
+}
+
+// switchSiblingResolver is a doiSwitchResolver that also offers a fuzzy
+// sibling hop, for tests pinning the typed-then-fuzzy precedence contract.
+type switchSiblingResolver struct {
+	doiSwitchResolver
+	siblings    []resolver.Candidate
+	hopRequests []work.Work
+}
+
+func (f *switchSiblingResolver) ResolveSiblings(_ context.Context, requested work.Work) ([]resolver.Candidate, error) {
+	f.hopRequests = append(f.hopRequests, requested)
+	return append([]resolver.Candidate(nil), f.siblings...), nil
 }
 
 func typedSiblingCandidate(source string) resolver.Candidate {
@@ -370,5 +386,75 @@ func TestTypedRelationsRateLimitParksInsteadOfSettling(t *testing.T) {
 	}
 	if plan.TemporaryResolvers != 1 || plan.ResolverTemporary.IsZero() {
 		t.Fatalf("plan = %+v, want the 429 recorded as retryable: at the exhaustion boundary a missing retry time is the difference between parking and giving up", plan)
+	}
+}
+
+func TestTypedSiblingsAllFilteredFallThroughToFuzzyHop(t *testing.T) {
+	const siblingDOI = "10.2139/ssrn.4020557"
+	svc, jobs := newTestService(t)
+	svc.Enricher = &fakeRelations{siblings: []string{siblingDOI}}
+	// The typed edge resolves, but only to an institutional candidate the
+	// open-access filter drops — the fuzzy adapter must still get its turn.
+	institutional := typedSiblingCandidate("openalex")
+	institutional.AccessBasis = resolver.AccessInstitutional
+	fuzzy := &switchSiblingResolver{
+		doiSwitchResolver: doiSwitchResolver{
+			name:  "openalex",
+			byDOI: map[string][]resolver.Candidate{siblingDOI: {institutional}},
+		},
+		siblings: []resolver.Candidate{siblingCandidate()},
+	}
+	svc.Resolvers = []ResolverEntry{{Adapter: fuzzy, Policy: config.Source{Enabled: true}}}
+	fetches := 0
+	svc.Fetch = fakeDownload(&fetches)
+	svc.Validate = passValidation()
+
+	id, err := svc.Submit(context.Background(), doiRequest("wr_typed_fallthrough_01"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, err := jobs.ClaimNext(context.Background(), "worker", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Process(context.Background(), row); err != nil {
+		t.Fatal(err)
+	}
+	got, err := jobs.Get(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != job.StateReady {
+		t.Fatalf("job state = %q, want ready via the fuzzy hop after every typed candidate was filtered", got.State)
+	}
+	if len(fuzzy.hopRequests) != 1 {
+		t.Fatalf("fuzzy hop requests = %d, want 1: filtered typed candidates must not suppress the fuzzy adapters", len(fuzzy.hopRequests))
+	}
+}
+
+func TestTypedSiblingsChargeTheBudgetPerLookup(t *testing.T) {
+	svc, jobs := newTestService(t)
+	svc.Enricher = &fakeRelations{siblings: []string{"10.1234/a", "10.1234/b", "10.1234/c"}}
+	svc.Budgets = budget.New(jobs.S)
+	adapter := &doiSwitchResolver{name: "unpaywall"}
+	// Cap the monthly spend at two request-units: with one Acquire per
+	// lookup the third sibling is refused, so the adapter sees exactly two
+	// requests. The buggy shape (one Acquire for the whole fan-out) would
+	// let all three through on a single reserved unit.
+	svc.Resolvers = []ResolverEntry{{
+		Adapter:       adapter,
+		Policy:        config.Source{Enabled: true, MaxCostUSD: 2},
+		EstimatedCost: 1,
+	}}
+
+	if _, err := svc.Submit(context.Background(), doiRequest("wr_typed_budget_01")); err != nil {
+		t.Fatal(err)
+	}
+	row, err := jobs.ClaimNext(context.Background(), "worker", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _ = svc.typedSiblings(context.Background(), row); adapter.calls != 2 {
+		t.Fatalf("resolver lookups = %d, want 2: the budget must be charged per request, not once per fan-out", adapter.calls)
 	}
 }

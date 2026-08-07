@@ -920,23 +920,33 @@ func (s *Service) typedSiblings(ctx context.Context, row *job.Row) ([]resolver.C
 		if err != nil {
 			return all, plan
 		}
-		if s.Budgets != nil {
-			if err := s.Budgets.Acquire(ctx, rname, entry.Policy, entry.EstimatedCost); err != nil {
-				_ = s.Jobs.FinishAttempt(ctx, attempt, "budget_blocked", 0, safeType(err))
-				var deferred *budget.ErrDeferred
-				if errors.As(err, &deferred) {
-					plan.Gate = earlierTime(plan.Gate, deferred.Until)
-					plan.ClosedSourceGates++
-				}
-				continue
-			}
-		}
 		outcome, detail, valid := "success", "", 0
 		for _, sib := range sibs {
+			// One Acquire per Resolve: the budget manager reserves one
+			// request and one estimated-cost unit atomically, so acquiring
+			// once for up to three sibling lookups would under-throttle the
+			// provider and under-charge a paid source's monthly cap.
+			if s.Budgets != nil {
+				if err := s.Budgets.Acquire(ctx, rname, entry.Policy, entry.EstimatedCost); err != nil {
+					var deferred *budget.ErrDeferred
+					if errors.As(err, &deferred) {
+						plan.Gate = earlierTime(plan.Gate, deferred.Until)
+						plan.ClosedSourceGates++
+					}
+					if valid == 0 {
+						outcome, detail = "budget_blocked", safeType(err)
+					}
+					break
+				}
+			}
 			cands, err := entry.Adapter.Resolve(ctx, work.Work{DOI: sib})
 			if err != nil {
 				if ctx.Err() != nil {
-					_ = s.Jobs.FinishAttempt(ctx, attempt, "failed", 0, safeType(ctx.Err()))
+					if valid > 0 {
+						_ = s.Jobs.FinishAttempt(ctx, attempt, "success", 0, fmt.Sprintf("typed_sibling_candidates=%d", valid))
+					} else {
+						_ = s.Jobs.FinishAttempt(ctx, attempt, "failed", 0, safeType(ctx.Err()))
+					}
 					return all, plan
 				}
 				if delay, temporary := resolver.Temporary(err); temporary {
@@ -965,13 +975,20 @@ func (s *Service) typedSiblings(ctx context.Context, row *job.Row) ([]resolver.C
 					resolver.ValidateCandidate(c) != nil || conflicts(work.Work{DOI: sib}, c.ResolvedWork) {
 					continue
 				}
-				c.Evidence = append(c.Evidence, "version_relation crossref "+row.Work.DOI+" -> "+sib)
+				// Both DOIs already passed work.NormalizeDOI, but evidence
+				// writers strip line breaks by convention regardless.
+				edge := strings.NewReplacer("\n", " ", "\r", " ").Replace(row.Work.DOI + " -> " + sib)
+				c.Evidence = append(c.Evidence, "version_relation crossref "+edge)
 				all = append(all, c)
 				valid++
 			}
 		}
-		if outcome == "success" {
-			detail = fmt.Sprintf("typed_sibling_candidates=%d", valid)
+		// A source that produced usable candidates helped, whatever a later
+		// sibling's lookup did — the audit row must not report it failed
+		// while its candidates drive the job toward ready. The plan already
+		// carries any temporary failure for retry pacing.
+		if valid > 0 || outcome == "success" {
+			outcome, detail = "success", fmt.Sprintf("typed_sibling_candidates=%d", valid)
 		}
 		_ = s.Jobs.FinishAttempt(ctx, attempt, outcome, 0, detail)
 	}
