@@ -1,10 +1,10 @@
 # ADR-0002: Delivering quarantined PDFs to the browser for review
 
-Status: Accepted (2026-07-21) — Option B (preview-only loopback capability
-endpoint), unless a one-day timeboxed Option-A spike proves a `file://` route
-with acceptable user setup on BOTH Chrome and Firefox. Ships inside the
-inbox v1 build (ext-v0.5.0) so in-page `verify_identity` acceptance is not
-deferred.
+Status: Accepted (2026-07-21; conditional resolved 2026-08-07) — Option B, the
+preview-only loopback capability endpoint. The one-day timeboxed Option-A spike
+ran and failed on BOTH Chrome and Firefox (see Decision), so the `file://`
+conditional never opened. Shipped inside the inbox v1 build (ext-v0.5.0) so
+in-page `verify_identity` acceptance was not deferred.
 
 ## Context
 
@@ -54,8 +54,35 @@ A deliberately minimal HTTP listener in the daemon:
 
 ## Decision
 
-Pending: run the option-A spike; adopt option B if the spike fails its
-"unreasonable user setup" bar on either browser.
+Option B. The Option-A spike ran during inbox v1 Phase 0 and failed its
+"unreasonable user setup" bar on **both** browsers, so the conditional in the
+status line never opened:
+
+- **Chrome 118+** blocks extension `tabs.create`/`tabs.update` navigation to
+  `file://` unless the per-extension "Allow access to file URLs" toggle is set,
+  and that toggle is off by default.
+- **Firefox** forbids `file://` in `tabs.create`/`tabs.update` outright
+  (Bugzilla 1266960 open, 1617594 REOPENED as of 2026-07-10). Firefox 153
+  (released 2026-07-21) added an off-by-default "Access local files" user
+  permission, but it is content-script-scoped only (Bug 2034168 comment #1) and
+  does not enable extension-page or `tabs.*` file navigation.
+
+A `file://` route would therefore have needed per-user, per-browser manual setup
+merely to function, and would still have exposed absolute quarantine paths.
+Option B needs no user setup and exposes no path.
+
+### Durable review binding
+
+Option B's accept flow above (revision + SHA-256, CAS in one transaction) had no
+schema to stand on: the SHA computed at fetch time was never persisted, and the
+candidate under review could only be inferred from the latest validate attempt.
+Migration `0010_human_action_review_binding.sql` adds `candidate_id`,
+`quarantine_path`, `quarantine_sha256` and `revision` to `human_actions`, so
+preview issuance and CAS acceptance read the same fields instead of inferring.
+
+Rows created before that migration carry an empty binding forever; a feature
+assuming the binding is always populated is correct for every current code path
+and will still break on old local dev data.
 
 ## Addendum: in-page review verdict (2026-08-03)
 

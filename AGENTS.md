@@ -37,8 +37,35 @@ Docs notes: `docs/reference/commands.md` (and `llms.txt`/`llms-full.txt`) is gen
 in the same directory — edit it directly, and keep it in sync with the config defaults by
 hand. `docs/changelog/*` are
 pymdownx **snippet includes** of `CHANGELOG.md` / `extension/CHANGELOG.md` — edit the real
-changelogs, not the pages. ADRs live in `dev/adr/` (outside the site, so not published).
+changelogs, not the pages.
 Bump the pinned zensical version in `docs/requirements.txt` deliberately; CI installs from it.
+
+`dev/` is outside the site and never published. It is tiered by **lifetime**, not
+topic, because completed build plans otherwise pile up and drift back into `docs/`:
+
+- `dev/adr/` — decisions. Permanent, numbered, amended in place, never deleted.
+  `docs/contributing/architecture-decisions.md` is their curated public summary;
+  never link into `dev/` from `docs/`, it 404s on the live site.
+- `dev/active/` — plans and backlogs for work in flight. A file leaves this
+  directory when the work ships: salvage anything still normative into an ADR,
+  then delete it. Git history is the archive — there is deliberately no
+  `archive/`, which is only ever where stale docs rot while still looking
+  authoritative.
+- `dev/scratch/` — gitignored throwaway (oracle rounds, one-shots).
+- Loose files at `dev/` root are durable non-plans: runbooks (`identity-corpus.md`)
+  and evidence. Field reports stay put — `internal/cli/conformance_test.go` and
+  `internal/bench/testdata/cohort.json` cite
+  `dev/field-report-acquisition-ux-2026-07-21.md` findings by label (L1, H1, C1),
+  so deleting or moving it orphans live code citations.
+
+`cmd/docs-gen`'s tests guard both the boundary and the content: a page under
+`docs/` missing from the `mkdocs.yml` nav is still built, served at a canonical
+URL and search-indexed while being invisible to `llms.txt`, and internal build
+plans reached the public site exactly that way. The same file pins docs to code
+— manifest permissions, adapter ids, ADR numbers, job states, config fields,
+`papio init` flags — so adding any of those without documenting it fails a test.
+There is also a link check, because `zensical build` prints a broken link as an
+"issue" and still exits 0.
 
 ---
 

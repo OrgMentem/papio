@@ -6,7 +6,7 @@ independently (`ext-v*` tags): from extension 0.3.1 onward its changes live in
 `extension/CHANGELOG.md`. Through `[0.3.0]` the two shared a version stream,
 so older sections below include extension entries. The initial release entry
 is synthesized from the complete `papio` and `zotio` Git histories and the
-execution records in `notes/acquisition-stack-plan.md`.
+execution records kept during the initial build.
 
 
 ## [Unreleased]
