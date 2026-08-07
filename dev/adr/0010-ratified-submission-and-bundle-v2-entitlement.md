@@ -270,6 +270,17 @@ it — a false positive invents rights evidence, a false negative costs a field.
 The enum value stays reserved; recording the true basis and route at adoption
 time is the fix that gives it a producer.
 
+> **Superseded on this point by ADR-0018 (2026-08-07).** The fix named in the
+> previous sentence landed: 0.17.0's `delivery_context_v1` records the route and
+> session evidence on the candidate row, so `operator_browser_session` now has a
+> producer, gated on `session_evidence = fresh_auth`. The paragraph above stands
+> as the reasoning that was correct while no such record existed — including the
+> mutable-config hazard, which ADR-0018 honours by quoting the row and never
+> reconstructing an origin. One claim in it did **not** survive: browser adoption
+> is not the only writer of `institutional` (a resolver-produced candidate
+> reaches it from its own paywall metadata), which is why ADR-0018 gates on the
+> recorded evidence rather than on the basis.
+
 A v1 document carrying an `entitlement` is rejected, including an explicit
 `null`: v1 froze its shape with `additionalProperties: false`, and declaring the
 field in Go made the key known to `DisallowUnknownFields`, so presence is

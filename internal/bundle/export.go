@@ -48,25 +48,37 @@ var sourceRefRE = regexp.MustCompile(`^[a-z0-9_]{1,64}$`)
 // keeps no mode.
 //
 // "institutional" earns operator_browser_session only from recorded browser
-// delivery context, never from the basis alone, because the basis alone does
-// not distinguish two things this mode asserts apart:
+// delivery context, never from the basis alone: a resolver-produced candidate
+// carries this basis from its own paywall judgement, with no browser session
+// behind it at all.
 //
-// A resolver-produced candidate carries this basis from its own paywall
-// judgement, with no browser session behind it at all.
+// Read the evidence values for what the extension actually means by them, not
+// for what they sound like. currentSessionEvidence (extension/src/background.ts)
+// tiers on the AGE of this origin's auth evidence, so "fresh_auth" means
+// "positive evidence, newer than the TTL, that this origin was authenticated" —
+// a live keepalive probe committing "in" produces it, and the extension reports
+// that same observation to the daemon as "warm_verified". A witnessed login is
+// only one of its producers, not its definition. "warm" is then the strictly
+// weaker value: evidence present but aged past the TTL, so nobody has confirmed
+// the session recently. That is why fresh_auth is the floor and warm is refused
+// (ADR-0018 Decision 2) — recency of positive evidence, not the presence of a
+// login event, is what separates them.
 //
-// Browser adoption records it for any (route, evidence) pair
-// job.BrowserAccessBasis admits as institutional, which includes "warm" — a
-// session papio found already authenticated but never observed authenticating.
-// "fresh_auth" is the only evidence that witnesses the login this mode names,
-// so it is the only evidence that qualifies (ADR-0018). The "oa" route cannot
-// reach here at all: BrowserAccessBasis requires evidence "none" for it and
-// derives open_access.
+// So the mode claims exactly this: the bytes arrived through a browser session
+// that was evidenced as authenticated at that origin. It does NOT claim the
+// work was paywalled. The "oa" route cannot reach here — BrowserAccessBasis
+// requires evidence "none" for it — but that closes only the case papio had
+// ALREADY classified as open access before the handoff. An open-access file
+// fetched through an institutional handoff still routes "direct" (the route is
+// chosen from the daemon's pre-fetch requires_auth flag, not from the bytes),
+// so it can carry this mode. That is the honest reading of the claim rather
+// than a hole in it, but do not restate it as the hazard being unreachable.
 //
-// The gate is therefore the recorded evidence, and the guard is one-way. An
-// adoption predating migration 0019 has an empty binding forever and stays
-// entitlement-less; its rescue is a re-drain, not a retroactive stamp.
-// ADR-0007's asymmetry applies — a false positive invents rights evidence, a
-// false negative costs nothing but a field.
+// The gate is the recorded evidence, and the guard is one-way: an adoption with
+// no recorded context stays entitlement-less, whether it predates migration
+// 0019 or was adopted through a path that carried no context. ADR-0007's
+// asymmetBrowserSessionFreshlyEvidencede invents rights evidence, a false
+// negative costs nothing but a field.
 func acquisitionModeFor(candidate *job.Candidate) (string, bool) {
 	switch candidate.AccessBasis {
 	case resolver.AccessOpen:
@@ -77,7 +89,7 @@ func acquisitionModeFor(candidate *job.Candidate) (string, bool) {
 		// definition, not future work.
 		return "daemon_held_credential", true
 	case resolver.AccessInstitutional:
-		if !job.BrowserSessionWitnessedLogin(candidate.BrowserRoute, candidate.SessionEvidence) {
+		if !job.BrowserSessionFreshlyEvidenced(candidate.BrowserRoute, candidate.SessionEvidence) {
 			return "", false
 		}
 		return "operator_browser_session", true
@@ -117,16 +129,25 @@ func entitlementFor(candidate *job.Candidate) *protocol.BundleEntitlement {
 // the entitlement instead of shipping a string the consumer must reject.
 func entitlementRoute(candidate *job.Candidate) (string, bool) {
 	raw := candidate.URLRedacted
-	if candidate.SessionEvidence != "" {
+	if candidate.Source == "browser" && candidate.SessionEvidence != "" {
 		// A browser adoption's candidate URL is the synthetic
 		// "browser://adopted-download": the bytes arrived through the
 		// operator's own browser rather than from a URL papio fetched, so that
 		// value names no origin. The origin papio did observe is the page host
 		// the extension reported at adoption, which
 		// ApplyBrowserDeliveryContextToCandidate stored as landing_redacted.
-		// Recorded evidence is the marker for that row, so this quotes what was
-		// witnessed and never reconstructs an origin from current config — the
-		// mutable-config hazard that kept this mode producer-less.
+		// This quotes what was recorded and never reconstructs an origin from
+		// current config — the mutable-config hazard that kept this mode
+		// producer-less.
+		//
+		// Both halves of the guard are load-bearing even though only one
+		// writer can satisfy them today. session_evidence's sole writer is
+		// gated to source='browser', so the pair is currently redundant; the
+		// source check states the invariant actually relied on, because for any
+		// other candidate URLRedacted IS the host papio fetched from (often a
+		// CDN) and landing_redacted is a different page. A future writer of
+		// session_evidence on a non-browser candidate would otherwise silently
+		// repoint the route with no other symptom.
 		raw = candidate.LandingRedacted
 	} else if raw == "" {
 		raw = candidate.LandingRedacted

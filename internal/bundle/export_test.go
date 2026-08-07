@@ -555,10 +555,11 @@ func TestEntitlementIsDerivedNeverInferred(t *testing.T) {
 		},
 		{
 			// The qualifying shape: adoption recorded an institutional route
-			// AND witnessed the login, so the mode has a producer. The route is
-			// the page host the extension reported, not the synthetic adopted
-			// URL, and not anything reconstructed from current OpenURL config.
-			name: "a contexted adoption that witnessed the login names the observed origin",
+			// AND recent positive evidence the session was authenticated, so
+			// the mode has a producer. The route is the page host the extension
+			// reported, not the synthetic adopted URL, and not anything
+			// reconstructed from current OpenURL config.
+			name: "a freshly evidenced adoption names the observed origin",
 			candidate: job.Candidate{
 				Source:          "browser",
 				AccessBasis:     resolver.AccessInstitutional,
@@ -588,10 +589,19 @@ func TestEntitlementIsDerivedNeverInferred(t *testing.T) {
 			want: nil,
 		},
 		{
-			// Every adoption predating migration 0019 looks like this, and 65
-			// of the first cohort's 66 do. The empty binding is permanent; the
-			// rescue is a re-drain, never a retroactive stamp.
-			name: "an adoption predating the delivery-context guard stays entitlement-less",
+			// An adoption with no recorded context. Migration 0019 normalized
+			// the pre-0.17.0 rows of this shape to `manual`, so a row that
+			// still reads institutional-without-context was written AFTER the
+			// migration by a path that carried no context: a directory-scan
+			// adoption (bridge.go's scanAdoptionDir) always does, and a
+			// delivery context can be pruned by its TTL before the completion
+			// frame lands. This is an ongoing shape, not a historical one.
+			//
+			// Note what actually stops this row: entitlementRoute rejects the
+			// synthetic URL, and the empty route fails the lattice inside
+			// BrowserSessionFreshlyEvidenced. The evidence literal alone is not
+			// load-bearing here — the `warm` case above is where it is.
+			name: "an adoption with no recorded delivery context stays entitlement-less",
 			candidate: job.Candidate{
 				Source:      "browser",
 				AccessBasis: resolver.AccessInstitutional,
@@ -600,17 +610,43 @@ func TestEntitlementIsDerivedNeverInferred(t *testing.T) {
 			want: nil,
 		},
 		{
-			// The basis is not the gate. A resolver reached this judgement from
-			// its own paywall metadata with no browser session behind it, so it
-			// has a real URL and no evidence — emitting the mode here would
-			// assert a login that never happened.
-			name: "a resolver-produced institutional candidate has no session to witness",
+			// The basis is not the gate, and this is the shape that proves it:
+			// a real https URL, so route resolution SUCCEEDS and the gate is
+			// the only thing left to refuse the mode. A resolver reached this
+			// basis from its own paywall metadata with no browser session
+			// behind it (internal/app/app_test.go's paywall.test/landing
+			// fixture), so emitting here would claim a session that never
+			// existed.
+			name: "a resolver-produced institutional candidate has no session evidence",
 			candidate: job.Candidate{
 				Source:      "fixture",
 				AccessBasis: resolver.AccessInstitutional,
 				URLRedacted: "https://paywall.test/landing",
 			},
 			want: nil,
+		},
+		{
+			// An oa-route adoption: papio classified the work open access
+			// before the handoff, so BrowserAccessBasis forces evidence "none"
+			// and derives open_access. It still gets an entitlement, because
+			// open_access needs no witnessed session — and preferring the
+			// recorded landing origin is what gives it a route at all. Before
+			// the landing preference existed this emitted NOTHING, since the
+			// synthetic URL never yielded a route and entitlementFor is
+			// all-or-nothing.
+			name: "an oa-route adoption names the observed origin without any session claim",
+			candidate: job.Candidate{
+				Source:          "browser",
+				AccessBasis:     resolver.AccessOpen,
+				URLRedacted:     "browser://adopted-download",
+				LandingRedacted: "https://arxiv.example.test",
+				BrowserRoute:    "oa",
+				SessionEvidence: "none",
+			},
+			want: &protocol.BundleEntitlement{
+				Route:           "https://arxiv.example.test",
+				AcquisitionMode: "open_access",
+			},
 		},
 		{
 			name: "manual has no observed route and is never guessed",

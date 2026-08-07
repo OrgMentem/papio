@@ -143,6 +143,15 @@ fields, and the new message must be independently feature-gated and solicited.
 Until then, adoption records the safe, observed facts only and does not claim an
 institutional route that *papio* did not observe.
 
+> **Resolved (2026-08-07).** The deferral above ended in two steps, both of which
+> honoured the requirement in this paragraph. 0.17.0 added the producer as a new
+> typed, independently feature-gated message (`delivery_context_v1`) rather than
+> widening any existing one, and migration 0019 normalized the older
+> unconditional `institutional` rows to `manual`. ADR-0018 then consumes that
+> record at export time, emitting `operator_browser_session` only where the row
+> carries `session_evidence = fresh_auth`. Adoption still records observed facts
+> only; what changed is that the observation now exists.
+
 ### Login visibility is a browser-local overlay
 
 ADR-0001 defines the page model as a daemon snapshot merged with a browser-local

@@ -405,21 +405,24 @@ func TestRatifiedConsumerContract(t *testing.T) {
 		for _, tc := range []struct {
 			name  string
 			route string
-			// evidence is the recorded session_evidence; "" is an adoption
-			// predating migration 0019, whose binding stays empty forever.
+			// evidence is the recorded session_evidence. These values tier on
+			// the AGE of the origin's auth evidence in the extension, not on
+			// whether a login was seen: "fresh_auth" is recent positive
+			// confirmation, "warm" is the same evidence aged past its TTL, and
+			// "" is an adoption that carried no context at all.
 			evidence string
 			want     *protocol.BundleEntitlement
 		}{
 			{
-				name: "fresh_auth witnessed the login", route: "direct", evidence: "fresh_auth",
+				name: "fresh_auth is recent positive confirmation", route: "direct", evidence: "fresh_auth",
 				want: &protocol.BundleEntitlement{
 					// The recorded page origin, not the synthetic adopted URL.
 					Route:           "https://provider.example.test",
 					AcquisitionMode: "operator_browser_session",
 				},
 			},
-			{name: "warm inherited a session it never saw authenticate", route: "resolver", evidence: "warm"},
-			{name: "none never authenticated at all", route: "direct", evidence: "none"},
+			{name: "warm aged past its TTL with nothing confirming since", route: "resolver", evidence: "warm"},
+			{name: "none was never evidenced at all", route: "direct", evidence: "none"},
 			{name: "an uncontexted adoption records no route", route: "", evidence: ""},
 		} {
 			t.Run(tc.name, func(t *testing.T) {

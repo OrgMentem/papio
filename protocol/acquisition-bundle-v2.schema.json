@@ -77,7 +77,7 @@
             },
             "acquisition_mode": {
               "enum": ["open_access", "daemon_held_credential", "operator_browser_session"],
-              "description": "Derived from access_basis: open_access -> open_access; licensed_api -> daemon_held_credential (the acquisition was authorised by an API credential papio holds). institutional and manual yield NO entitlement object at all, so operator_browser_session is currently a reserved value with no producer: the only writer of institutional is browser adoption, which records that basis for every adopted download including an open-access file the browser fetched, so asserting it would invent evidence for a route nobody walked."
+              "description": "Derived from the accepted candidate's access_basis and, for a browser adoption, its recorded delivery context: open_access -> open_access; licensed_api -> daemon_held_credential (the acquisition was authorised by an API credential papio holds); institutional -> operator_browser_session, but ONLY when the candidate row records session_evidence 'fresh_auth' on a resolver or direct browser route, meaning the extension held positive evidence, newer than its TTL, that the operator's session at that origin was authenticated. The mode asserts that the bytes arrived through that session. It does NOT assert that the work was paywalled, nor that a login occurred during this acquisition. institutional without that recorded evidence, and manual, yield no entitlement object at all."
             }
           }
         }
