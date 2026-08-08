@@ -16,6 +16,8 @@ for the full pre-split extension history.
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-08-08
+
 ### Added
 
 - **"Select papers on this page" — bulk selection from a reference list,
