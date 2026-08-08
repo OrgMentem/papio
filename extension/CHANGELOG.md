@@ -16,43 +16,7 @@ for the full pre-split extension history.
 
 ## [Unreleased]
 
-### Added
-
-- **One sign-in tab per institution.** Three papers that all need the same
-  institutional sign-in used to each open their own IdP login tab — logging
-  in on one never resumed the other two, which sat on a dead resolver page
-  until the operator noticed and drove them by hand. A handoff whose login
-  wall would open a *second* tab at an IdP already being signed in on now
-  parks instead, quietly, at the provider page it was already on. Completing
-  sign-in in the one open tab resumes every paper waiting on that
-  institution automatically, through the same two-at-a-time drive governor
-  as any other handoff.
-- **Open PDF tabs can now be grabbed from the selection workspace.** When the
-  tab URL has no recognizable identifier, Chrome offers a one-click grab row;
-  Firefox shows the row disabled with honest download-steering guidance, and
-  grab outcomes report job creation, existing library ownership, or the need
-  for an identifier directly in the row.
-- **Inbox renders recoverable PDF grabs.** A captured PDF without an
-  identifier now appears as a required-attention `pdf_grab` row with its
-  state, identifier guidance, and a dismiss action that removes only the grab.
-
-### Changed
-- **Waiting sibling handoffs are now one actionable sign-in.** The browser
-  stores only opaque claim digests, drops pre-r6 raw claim keys on restart,
-  and renders sibling papers as working while the owner's institution sign-in
-  remains open in another tab. The waiting overlay expires back to the
-  daemon's required rendering if the owner does not finish in time.
-
-- **OpenAlex works-search pages now detect every result on the page.**
-  `openalex.org` result cards carry no `doi.org` anchor at all — the title
-  itself links to `openalex.org/works/w<digits>` — so the bulk-selection
-  scanner previously caught only the rare row with a stray publisher DOI
-  link. It now recognizes the OpenAlex work-id link directly (`openalex`
-  kind, normalized to uppercase `W<digits>`), so a page of 25 works detects
-  all 25. A card that also carries a registered DOI/arXiv/PMID link still
-  produces exactly one row, keyed on that registered identifier.
-
-## [0.11.0] - 2026-08-08
+## [0.12.0] - 2026-08-08
 
 ### Added
 
@@ -131,6 +95,41 @@ for the full pre-split extension history.
   itself: "papio paused automatic polling until you confirm what the
   library has on file for this request."
 
+- **One sign-in tab per institution.** Three papers that all need the same
+  institutional sign-in used to each open their own IdP login tab — logging
+  in on one never resumed the other two, which sat on a dead resolver page
+  until the operator noticed and drove them by hand. A handoff whose login
+  wall would open a *second* tab at an IdP already being signed in on now
+  parks instead, quietly, at the provider page it was already on. Completing
+  sign-in in the one open tab resumes every paper waiting on that
+  institution automatically, through the same two-at-a-time drive governor
+  as any other handoff.
+- **Open PDF tabs can now be grabbed from the selection workspace.** When the
+  tab URL has no recognizable identifier, Chrome offers a one-click grab row;
+  Firefox shows the row disabled with honest download-steering guidance, and
+  grab outcomes report job creation, existing library ownership, or the need
+  for an identifier directly in the row.
+- **Inbox renders recoverable PDF grabs.** A captured PDF without an
+  identifier now appears as a required-attention `pdf_grab` row with its
+  state, identifier guidance, and a dismiss action that removes only the grab.
+
+### Changed
+
+- **Waiting sibling handoffs are now one actionable sign-in.** The browser
+  stores only opaque claim digests, drops pre-r6 raw claim keys on restart,
+  and renders sibling papers as working while the owner's institution sign-in
+  remains open in another tab. The waiting overlay expires back to the
+  daemon's required rendering if the owner does not finish in time.
+
+- **OpenAlex works-search pages now detect every result on the page.**
+  `openalex.org` result cards carry no `doi.org` anchor at all — the title
+  itself links to `openalex.org/works/w<digits>` — so the bulk-selection
+  scanner previously caught only the rare row with a stray publisher DOI
+  link. It now recognizes the OpenAlex work-id link directly (`openalex`
+  kind, normalized to uppercase `W<digits>`), so a page of 25 works detects
+  all 25. A card that also carries a registered DOI/arXiv/PMID link still
+  produces exactly one row, keyed on that registered identifier.
+
 ### Fixed
 
 - **The Institution session card no longer gets stuck on "Checking
@@ -143,6 +142,24 @@ for the full pre-split extension history.
   aged past freshness falls through to a new **Session state unknown —
   recheck** state, so a decided-but-recently-completed probe is never
   misread as stale.
+
+- **A dropped daemon connection no longer leaves the browser talking to
+  itself.** Every asynchronous message handler now always answers. When the
+  native port died mid-request, the handler simply stopped, and Chrome filled
+  the silence with its own "message channel closed before a response was
+  received" — which is what a selection workspace showed after the daemon
+  disconnected, above ten rows frozen on "Checking availability…". Failures
+  now come back as papio's own sentence, including for runtime errors the
+  extension does not recognise.
+- **PDF-grab status pulls reached no handler in a built extension.** The
+  message type was missing from the dispatcher's accepted list, so a reopened
+  grab workspace could never recover its state from the daemon. The list and
+  the handlers behind it are now pinned equal by a test that fails if either
+  side gains an entry the other lacks.
+- **The selection workspace stops claiming "0 eligible" before it knows.**
+  While availability is still unknown the button says so and stays disabled,
+  and the workspace reloads by itself once the daemon reconnects instead of
+  asking you to retry papio's own work.
 
 ## [0.10.0] - 2026-08-06
 

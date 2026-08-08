@@ -11,7 +11,24 @@ execution records kept during the initial build.
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-08-08
+
 ### Added
+
+- **A delivery request stranded before submission recovers itself.** Nothing
+  ever retried a row left in `offered`: the status poller only follows live
+  requests and `papio delivery resume` refuses anything that never reached a
+  provider, so a submission that failed in transit waited for a human to
+  notice. A bounded maintenance pass now retries them unattended — but only
+  on the request's own creation-time gate evidence (auto-capable profile,
+  digest still matching current configuration, and a recorded decision to
+  submit), so a prefilled request waiting on its human, and any row whose
+  evidence is missing, are left alone. Because ILLiad has no uniqueness
+  check, a retry that could duplicate a real loan request is never guessed
+  at: submission failures are classified when they happen and only a request
+  whose bytes provably never left the machine is replayed, while anything
+  ambiguous goes to reconciliation. Rows are claimed under a lease so two
+  daemons cannot both submit.
 
 - **Grab an open PDF straight from a browser tab (ADR-0020).** A tab
   rendered in Chrome's own PDF viewer has no DOM to scan, so the selection
@@ -81,11 +98,41 @@ execution records kept during the initial build.
 
 - **The docs landing page leads with the animated wordmark.** The mark that
   opens the README now opens <https://orgmentem.github.io/papio/> too, in a
-  two-column hero (mark left, positioning copy and calls to action right)
-  rendered by a `home.html` template override; the page hides both sidebars so
-  the hero spans the full width, and stacks on phones. Both ink variants are
-  stacked and cross-faded rather than display-toggled, so switching the palette
-  does not restart the animation.
+  full-width two-column hero rendered by a `home.html` template override. The
+  hero columns are sized to the page's own: the mark sits over the navigation
+  rail and the headline, blurb, and calls to action start exactly where the
+  article text below them does. It stacks once the theme drops that rail.
+  Both ink variants are stacked and cross-faded rather than display-toggled,
+  so switching the palette does not restart the animation.
+
+### Fixed
+
+- **The daemon no longer kills its own browser session over a delivery
+  request it just created.** `offered` is the state every delivery request
+  starts in, and ADR-0017 has listed it since the feature was designed, but
+  it was missing from the wire vocabulary — so the daemon's outbound
+  self-validation rejected its own triage snapshot, returned a raw error
+  from a bridge handler, and tore down the whole native-messaging session.
+  Two rows were enough to disconnect the extension every 60 seconds and
+  kill every request in flight with it, including the availability check a
+  selection workspace was waiting on. The state is now carried in Go, the
+  TypeScript parser, and the JSON Schema, and the inbox renders it as
+  created-but-not-submitted rather than borrowing `pending`'s meaning.
+- **A snapshot that cannot be represented degrades instead of
+  disconnecting.** Items are validated as they are assembled, an
+  unrepresentable one is omitted and logged, and the assembled frame is
+  re-validated; every branch that used to return a raw error — unconfigured
+  service, stale cursor, query failure, oversize single item — now returns a
+  structured unavailable result. Omission adjusts counts only where a schema
+  defines them over the frame's own items; triage-snapshot/4's totals stay
+  global, because hiding an item there would under-report real work.
+- **Interlibrary-loan submission can actually reach the provider.** The
+  ILLiad client was the shared SSRF-hardened fetch client, which rejects
+  every non-GET and discards the body, so `CreateTransaction` POSTs never
+  left the daemon and automatic document delivery had never worked outside
+  tests. POST is now an explicit per-client capability with the same
+  destination policy and dial-time pinning as GET, redirects refused rather
+  than replayed, and exactly one client — ILLiad's — holding it.
 
 ## [0.19.1] - 2026-08-08
 
