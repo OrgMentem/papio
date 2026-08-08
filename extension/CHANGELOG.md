@@ -20,6 +20,13 @@ for the full pre-split extension history.
 
 ### Added
 
+- **Inbox: "downloads access required" items.** When the daemon cannot read
+  the Downloads adoption folder (macOS privacy consent), the inbox shows a
+  required-attention item naming the blocked path and the System Settings
+  grant; it clears itself once access is restored and the download is
+  adopted. Dismissing the item never cancels the job.
+- **Workspace: a green ✓ marks papers already in your library**
+  (`owned_with_pdf` rows), alongside the existing eligibility states.
 - **"Select papers on this page" — bulk selection from a reference list,
   bibliography, or results page (ADR-0019).** The popup gains a scan action
   beside the existing single-paper Acquire button. Clicking it runs one

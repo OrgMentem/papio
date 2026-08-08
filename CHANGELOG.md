@@ -507,6 +507,18 @@ execution records kept during the initial build.
 
 ### Fixed
 
+- **One blocked syscall no longer freezes every daemon RPC.** macOS
+  Files-and-Folders consent (TCC) can leave `open(2)` on the
+  download-adoption root blocked in-kernel for a background daemon — and the
+  consent resets every time the binary is rebuilt or upgraded. Adoption
+  scanning previously ran that syscall while holding the browser-bridge lock,
+  so a single consent wall hung every RPC (`papio daemon status` included)
+  until a force-kill. Scans now run through a bounded reader with a
+  bridge-wide latch: the daemon stays fully responsive, offers and sessions
+  keep flowing, and scanning resumes on its own the moment the grant lands.
+  `papio doctor` gains an adoption-root check — bounded the same way, so
+  doctor itself can never hang on the wall — that names the folder and the
+  System Settings remediation instead of leaving a silent stall.
 - **An open-access paper whose cached PDF link has rotted is now recovered from
   the publisher's own landing page instead of being sent to your institution.**
   Aggregators cache a direct PDF URL, and those URLs expire: for one Frontiers
