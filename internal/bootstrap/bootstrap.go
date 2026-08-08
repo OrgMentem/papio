@@ -184,12 +184,15 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 
 	entries := resolverEntries(cfg, metadataClient)
 	service := app.New(cfg, jobs, artifacts, budgets)
-	// Decision 5 (ADR-0017): jobs.get_v3 and the CLI/doctor delivery surfaces
-	// read this straight off app.Service rather than via a second System
-	// field, since every RPC handler already reaches the app layer through
-	// system.App.
+	// ILLiad is the only POST caller. It uses the same policy as metadata:
+	// submission responses need no distinct timeout or byte bound today, while
+	// the separate constructor keeps metadata and discovery GET-only.
+	illiadClient, err := fetch.NewSecureHTTPClientWithPOST(metadataPolicy, nil, http.DefaultTransport)
+	if err != nil {
+		return nil, err
+	}
 	service.Delivery = delivery.New(db, &cfg, nil)
-	service.IlliadHTTPClient = metadataClient
+	service.IlliadHTTPClient = illiadClient
 	discoveryBackends, err := discoverySources(cfg, budgets, metadataClient)
 	if err != nil {
 		return nil, err
@@ -321,7 +324,7 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 	if retractions != nil {
 		triageService.RegisterSource(retractions)
 	}
-	maintenance := daemon.MaintenanceRunners{watchRunner, service.ImportRetrier(), service.HandoffRepairer(), service.ActionReminder(), retractions}
+	maintenance := daemon.MaintenanceRunners{watchRunner, service.ImportRetrier(), service.HandoffRepairer(), service.OfferedDeliveryRecovery(), service.ActionReminder(), retractions}
 	if reconciler := zotioService.TagReconciler(); reconciler != nil {
 		maintenance = append(maintenance, reconciler)
 	}

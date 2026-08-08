@@ -16,35 +16,55 @@ import (
 // response body to the caller for its source-specific bounded decoder.
 type SecureHTTPClient struct {
 	downloader *Downloader
+	allowPost  bool
 }
 
 // NewSecureHTTPClient constructs a direct, SSRF-resistant client. Policy bounds
 // DNS, headers, body reads, redirects, total duration, and maximum body bytes.
+// The returned client is GET-only.
 func NewSecureHTTPClient(policy Policy, resolver Resolver, transport http.RoundTripper) (*SecureHTTPClient, error) {
+	return newSecureHTTPClient(policy, resolver, transport, false)
+}
+
+// NewSecureHTTPClientWithPOST constructs an SSRF-resistant client that accepts
+// GET and POST requests. POST is an explicit opt-in because metadata resolvers
+// and discovery backends must remain GET-only.
+func NewSecureHTTPClientWithPOST(policy Policy, resolver Resolver, transport http.RoundTripper) (*SecureHTTPClient, error) {
+	return newSecureHTTPClient(policy, resolver, transport, true)
+}
+
+func newSecureHTTPClient(policy Policy, resolver Resolver, transport http.RoundTripper, allowPost bool) (*SecureHTTPClient, error) {
 	d, err := New(policy, resolver, transport)
 	if err != nil {
 		return nil, err
 	}
-	return &SecureHTTPClient{downloader: d}, nil
+	return &SecureHTTPClient{downloader: d, allowPost: allowPost}, nil
 }
 
-// Do implements the small HTTPClient interfaces used by metadata resolvers.
-// Caller-supplied headers are removed on every redirect outside the origin.
+// Do implements the small HTTPClient interfaces used by metadata resolvers
+// and ILLiad. Caller-supplied headers are removed on every redirect outside
+// the origin.
 func (c *SecureHTTPClient) Do(request *http.Request) (*http.Response, error) {
 	if c == nil || c.downloader == nil || request == nil || request.URL == nil {
+		closeRequestBody(request)
 		return nil, invalid("invalid request")
 	}
-	if request.Method != http.MethodGet {
+	if request.Method != http.MethodGet && (!c.allowPost || request.Method != http.MethodPost) {
+		closeRequestBody(request)
 		return nil, invalid("only GET requests are supported")
 	}
 	d := c.downloader
 	overall, cancelOverall := context.WithTimeout(request.Context(), d.policy.Timeout)
 	current := request.Clone(overall)
-	current.Body = nil
-	current.GetBody = nil
+	if current.Method == http.MethodGet {
+		closeRequestBody(current)
+		current.Body = nil
+		current.GetBody = nil
+	}
 	redirects := 0
 	for {
 		if err := d.validateURL(overall, current.URL); err != nil {
+			closeRequestBody(current)
 			cancelOverall()
 			return nil, err
 		}
@@ -54,6 +74,11 @@ func (c *SecureHTTPClient) Do(request *http.Request) (*http.Response, error) {
 			return nil, classifyRequestError(err)
 		}
 		if isRedirect(resp.StatusCode) {
+			if current.Method != http.MethodGet {
+				closeBody(resp)
+				cancelOverall()
+				return nil, invalidStatus(resp.StatusCode, "redirects are not followed for non-GET requests")
+			}
 			location := resp.Header.Get("Location")
 			closeBody(resp)
 			if location == "" {
@@ -93,6 +118,12 @@ func (c *SecureHTTPClient) Do(request *http.Request) (*http.Response, error) {
 		}
 		resp.Request = current
 		return resp, nil
+	}
+}
+
+func closeRequestBody(request *http.Request) {
+	if request != nil && request.Body != nil {
+		_ = request.Body.Close()
 	}
 }
 

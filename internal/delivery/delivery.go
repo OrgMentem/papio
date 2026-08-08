@@ -261,6 +261,42 @@ func (s *Service) GetByJobID(ctx context.Context, jobID string) (*Request, error
 	return r, nil
 }
 
+// ListRecoverable returns the first page of durably-offered rows that have
+// never reached the provider.
+func (s *Service) ListRecoverable(ctx context.Context, limit int) ([]*Request, error) {
+	return s.ListRecoverableAfter(ctx, 0, limit)
+}
+
+// ListRecoverableAfter returns recoverable rows with IDs greater than afterID.
+// The cursor lets maintenance page past held/capped rows instead of allowing
+// an old row to occupy the leading page forever.
+func (s *Service) ListRecoverableAfter(ctx context.Context, afterID int64, limit int) ([]*Request, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	rows, err := s.store.DB().QueryContext(ctx,
+		`SELECT `+requestColumns+`
+		 FROM delivery_requests
+		 WHERE state = ? AND provider_reference = '' AND id > ?
+		 ORDER BY id ASC LIMIT ?`, string(StateOffered), afterID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var out []*Request
+	for rows.Next() {
+		req, err := scanRequest(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, req)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // UpdateState transitions a row's state. Entering StateSubmitted stamps
 // submitted_at the first time only (COALESCE), so a later re-observation of
 // the same live request never resets the cap-counting anchor.

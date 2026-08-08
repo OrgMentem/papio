@@ -605,3 +605,49 @@ func TestResumeRefusesTerminalRow(t *testing.T) {
 		t.Fatalf("Resume on an unknown id = %+v, %v, want (nil, nil)", row, err)
 	}
 }
+func TestListRecoverableOnlyOfferedWithoutProviderReference(t *testing.T) {
+	ctx := context.Background()
+	svc := testService(t, time.Date(2026, 8, 8, 12, 0, 0, 0, time.UTC))
+	for _, tc := range []struct {
+		name  string
+		state State
+		ref   string
+		want  bool
+	}{
+		{"offered_without_reference", StateOffered, "", true},
+		{"offered_with_reference", StateOffered, "txn-1", false},
+		{"submitted", StateSubmitted, "", false},
+		{"pending", StatePending, "", false},
+		{"fulfilled", StateFulfilled, "", false},
+		{"declined", StateDeclined, "", false},
+		{"cancelled", StateCancelled, "", false},
+		{"unknown_outcome", StateUnknownOutcome, "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			jobID := "job_recover_" + tc.name
+			testJob(t, svc, jobID)
+			req, err := svc.Create(ctx, CreateRequest{
+				JobID: jobID, InstitutionProfile: "campus", Provider: "illiad",
+				RequestClass: "digital_journal_article", WorkIdentity: jobID,
+				State: tc.state, ProviderReference: tc.ref,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := svc.ListRecoverable(ctx, 100)
+			if err != nil {
+				t.Fatal(err)
+			}
+			found := false
+			for _, candidate := range got {
+				if candidate.ID == req.ID {
+					found = true
+					break
+				}
+			}
+			if found != tc.want {
+				t.Fatalf("row returned = %t, want %t; rows = %+v", found, tc.want, got)
+			}
+		})
+	}
+}

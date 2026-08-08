@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -490,7 +491,6 @@ func TestSubmitDeliveryRequestTransportFailureThenRetrySubmitsOnce(t *testing.T)
 	var postCount int
 	failing := true
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		postCount++
 		if failing {
 			http.Error(w, "illiad unavailable", http.StatusServiceUnavailable)
 			return
@@ -501,7 +501,7 @@ func TestSubmitDeliveryRequestTransportFailureThenRetrySubmitsOnce(t *testing.T)
 
 	svc, jobs, deliverySvc := newDeliveryTestService(t)
 	svc.Delivery = deliverySvc
-	svc.IlliadHTTPClient = server.Client()
+	svc.IlliadHTTPClient = toggleFailureHTTPClient{fail: &failing, base: server.Client(), calls: &postCount}
 	svc.Config.Browser.DocumentDelivery = autoCapableDocumentDelivery(server.URL)
 	svc.Resolvers = deliveryTestResolvers()
 	ctx := context.Background()
@@ -585,6 +585,44 @@ func TestSubmitDeliveryRequestTransportFailureThenRetrySubmitsOnce(t *testing.T)
 	}
 	if postCount != 2 {
 		t.Fatalf("illiad received %d requests, want exactly 2 (one failed, one succeeded) — never a duplicate live submission", postCount)
+	}
+}
+
+func TestSubmitDeliveryAmbiguousFailureDoesNotRepost(t *testing.T) {
+	var posts int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		posts++
+		http.Error(w, "provider outcome unavailable", http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+	svc, jobs, deliverySvc := newDeliveryTestService(t)
+	svc.Delivery = deliverySvc
+	svc.IlliadHTTPClient = server.Client()
+	svc.Config.Browser.DocumentDelivery = autoCapableDocumentDelivery(server.URL)
+	ctx := context.Background()
+	if err := deliverySvc.RecordLiveAcceptance(ctx, "default", "illiad"); err != nil {
+		t.Fatal(err)
+	}
+	id, err := svc.Submit(ctx, deliveryWorkRequest("wr_ambiguous_submission", "10.1000/ambiguous-submission"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, _ := jobs.ClaimNext(ctx, "worker", time.Minute)
+	if err := svc.Process(ctx, row); err != nil {
+		t.Fatal(err)
+	}
+	got, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != job.StateAwaitingHuman {
+		t.Fatalf("job state = %q, want awaiting_human", got.State)
+	}
+	if err := svc.OfferedDeliveryRecovery().RunDue(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if posts != 1 {
+		t.Fatalf("provider posts = %d, want exactly one ambiguous attempt", posts)
 	}
 }
 
@@ -1217,5 +1255,465 @@ func TestSubmitDeliveryFulfilledConservativeRecordsWithoutOpening(t *testing.T) 
 	}
 	if !sawDiscovered {
 		t.Fatal("no delivery.retrieval_discovered event was recorded")
+	}
+}
+func TestOfferedDeliveryRecoverySubmitsThroughGatedRoute(t *testing.T) {
+	var posts int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		posts++
+		_, _ = w.Write([]byte(`{"TransactionNumber": 7401, "TransactionStatus": "Awaiting Request Processing"}`))
+	}))
+	defer server.Close()
+
+	svc, jobs, deliverySvc := newDeliveryTestService(t)
+	svc.Delivery = deliverySvc
+	svc.IlliadHTTPClient = server.Client()
+	svc.Config.Browser.DocumentDelivery = autoCapableDocumentDelivery(server.URL)
+	ctx := context.Background()
+	if err := deliverySvc.RecordLiveAcceptance(ctx, "default", "illiad"); err != nil {
+		t.Fatal(err)
+	}
+	id, err := svc.Submit(ctx, deliveryWorkRequest("wr_offered_recovery_submit", "10.1000/offered-recovery-submit"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile, err := deliverySvc.ResolveGateProfileFor(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := deliverySvc.Create(ctx, delivery.CreateRequest{
+		JobID: id, InstitutionProfile: "default", Provider: "illiad",
+		RequestClass: "digital_journal_article", WorkIdentity: row.Work.Describe(),
+		GateProfileDigest: profile.Digest(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.RecordEvent(ctx, id, "delivery.gate_evaluated", map[string]any{
+		"delivery_request_id": req.ID, "profile_class": "auto_capable",
+		"profile_digest": profile.Digest(), "decision": "submit",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.RecordEvent(ctx, id, "delivery.submission_failure_classified", map[string]any{
+		"delivery_request_id": req.ID,
+		"class":               "pre_send",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.OfferedDeliveryRecovery().RunDue(ctx); err != nil {
+		t.Fatal(err)
+	}
+	got, err := deliverySvc.Get(ctx, req.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != delivery.StateSubmitted || got.ProviderReference != "7401" {
+		t.Fatalf("recovered request = %+v, want submitted with provider reference", got)
+	}
+	if posts != 1 {
+		t.Fatalf("provider posts = %d, want 1", posts)
+	}
+}
+
+func TestOfferedDeliveryRecoveryStaleProfileSurfacesHumanAction(t *testing.T) {
+	var posts int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		posts++
+		t.Fatal("stale gate profile must never submit")
+	}))
+	defer server.Close()
+
+	svc, jobs, deliverySvc := newDeliveryTestService(t)
+	svc.Delivery = deliverySvc
+	svc.IlliadHTTPClient = server.Client()
+	svc.Config.Browser.DocumentDelivery = autoCapableDocumentDelivery(server.URL)
+	ctx := context.Background()
+	if err := deliverySvc.RecordLiveAcceptance(ctx, "default", "illiad"); err != nil {
+		t.Fatal(err)
+	}
+	id, err := svc.Submit(ctx, deliveryWorkRequest("wr_offered_recovery_stale", "10.1000/offered-recovery-stale"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := deliverySvc.Create(ctx, delivery.CreateRequest{
+		JobID: id, InstitutionProfile: "default", Provider: "illiad",
+		RequestClass: "digital_journal_article", WorkIdentity: row.Work.Describe(),
+		GateProfileDigest: "stale-profile-digest",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.RecordEvent(ctx, id, "delivery.gate_evaluated", map[string]any{
+		"delivery_request_id": req.ID, "profile_class": "auto_capable",
+		"profile_digest": "stale-profile-digest", "decision": "submit",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.OfferedDeliveryRecovery().RunDue(ctx); err != nil {
+		t.Fatal(err)
+	}
+	gotJob, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotJob.State != job.StateAwaitingHuman {
+		t.Fatalf("job state = %q, want awaiting_human", gotJob.State)
+	}
+	actions, err := jobs.ListOpenHumanActionsForJobs(ctx, []string{id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(actions) != 1 || actions[0].Kind != job.ActionKindDocumentDelivery {
+		t.Fatalf("open actions = %+v, want one document_delivery action", actions)
+	}
+	got, err := deliverySvc.Get(ctx, req.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != delivery.StateOffered || posts != 0 {
+		t.Fatalf("request = %+v, posts = %d; stale consent must remain offered without submission", got, posts)
+	}
+}
+
+type preSendFailureRoundTripper func(*http.Request) (*http.Response, error)
+
+func (f preSendFailureRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+type toggleFailureHTTPClient struct {
+	fail  *bool
+	base  *http.Client
+	calls *int
+}
+
+func (c toggleFailureHTTPClient) Do(req *http.Request) (*http.Response, error) {
+	(*c.calls)++
+	if *c.fail {
+		return nil, http.ErrServerClosed
+	}
+	return c.base.Do(req)
+}
+func TestOfferedDeliveryRecoveryCapsTransportFailures(t *testing.T) {
+	var posts int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		posts++
+		http.Error(w, "provider unavailable", http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+
+	svc, jobs, deliverySvc := newDeliveryTestService(t)
+	svc.Delivery = deliverySvc
+	svc.IlliadHTTPClient = server.Client()
+	svc.Config.Browser.DocumentDelivery = autoCapableDocumentDelivery(server.URL)
+	now := time.Date(2026, 8, 8, 12, 0, 0, 0, time.UTC)
+	svc.Now = func() time.Time { return now }
+	svc.RetryDelay = time.Second
+	svc.IlliadHTTPClient = &http.Client{Transport: preSendFailureRoundTripper(func(*http.Request) (*http.Response, error) {
+		posts++
+		return nil, http.ErrServerClosed
+	})}
+	ctx := context.Background()
+	if err := deliverySvc.RecordLiveAcceptance(ctx, "default", "illiad"); err != nil {
+		t.Fatal(err)
+	}
+	id, err := svc.Submit(ctx, deliveryWorkRequest("wr_offered_recovery_cap", "10.1000/offered-recovery-cap"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile, err := deliverySvc.ResolveGateProfileFor(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := deliverySvc.Create(ctx, delivery.CreateRequest{
+		JobID: id, InstitutionProfile: "default", Provider: "illiad",
+		RequestClass: "digital_journal_article", WorkIdentity: row.Work.Describe(),
+		GateProfileDigest: profile.Digest(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.RecordEvent(ctx, id, "delivery.gate_evaluated", map[string]any{
+		"delivery_request_id": req.ID, "profile_class": "auto_capable",
+		"profile_digest": profile.Digest(), "decision": "submit",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.RecordEvent(ctx, id, "delivery.submission_failure_classified", map[string]any{
+		"delivery_request_id": req.ID,
+		"class":               "pre_send",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for range offeredRecoveryMaxAttempts + 1 {
+		if err := svc.OfferedDeliveryRecovery().RunDue(ctx); err != nil {
+			t.Fatal(err)
+		}
+		now = now.Add(2 * time.Minute)
+	}
+	if posts != offeredRecoveryMaxAttempts {
+		t.Fatalf("provider posts = %d, want cap %d", posts, offeredRecoveryMaxAttempts)
+	}
+	request, err := deliverySvc.GetByJobID(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if request.State != delivery.StateOffered || request.ProviderReference != "" {
+		t.Fatalf("capped request = %+v, want recoverable offered row", request)
+	}
+}
+func TestOfferedDeliveryRecoverySkipsPrefillDecisionForAutoProfile(t *testing.T) {
+	svc, jobs, deliverySvc := newDeliveryTestService(t)
+	svc.Delivery = deliverySvc
+	svc.Config.Browser.DocumentDelivery = &config.DocumentDelivery{
+		Kind: "openurl", BaseURL: "https://example.edu/request",
+		SubmitPolicy: "prefill_only",
+	}
+	ctx := context.Background()
+	id, err := svc.Submit(ctx, deliveryWorkRequest("wr_offered_recovery_prefill", "10.1000/offered-recovery-prefill"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc.Config.Browser.DocumentDelivery = autoCapableDocumentDelivery("https://example.edu/request")
+	if err := deliverySvc.RecordLiveAcceptance(ctx, "default", "illiad"); err != nil {
+		t.Fatal(err)
+	}
+	profile, err := deliverySvc.ResolveGateProfileFor(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := deliverySvc.Create(ctx, delivery.CreateRequest{
+		JobID: id, InstitutionProfile: "default", Provider: "illiad",
+		RequestClass: "digital_journal_article", WorkIdentity: row.Work.Describe(),
+		GateProfileDigest: profile.Digest(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.RecordEvent(ctx, id, "delivery.gate_evaluated", map[string]any{
+		"delivery_request_id": req.ID, "profile_class": "auto_capable",
+		"profile_digest": profile.Digest(), "decision": "prefill",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.OfferedDeliveryRecovery().RunDue(ctx); err != nil {
+		t.Fatal(err)
+	}
+	gotJob, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotJob.State != job.StateQueued {
+		t.Fatalf("job state = %q, want queued", gotJob.State)
+	}
+	gotReq, err := deliverySvc.Get(ctx, req.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotReq.State != delivery.StateOffered || gotReq.ProviderReference != "" {
+		t.Fatalf("request = %+v, want untouched offered row", gotReq)
+	}
+	actions, err := jobs.ListOpenHumanActionsForJobs(ctx, []string{id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(actions) != 0 {
+		t.Fatalf("actions = %+v, want none", actions)
+	}
+	events, err := jobs.Events(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range events {
+		if event["kind"] == "delivery.offered_recovery_attempt" {
+			t.Fatal("prefill-only row recorded a recovery attempt")
+		}
+	}
+}
+func TestOfferedDeliveryRecoverySkipsPrefillOnlyProfile(t *testing.T) {
+	svc, jobs, deliverySvc := newDeliveryTestService(t)
+	svc.Delivery = deliverySvc
+	svc.Config.Browser.DocumentDelivery = &config.DocumentDelivery{
+		Kind: "openurl", BaseURL: "https://example.edu/request", SubmitPolicy: "prefill_only",
+	}
+	ctx := context.Background()
+	id, err := svc.Submit(ctx, deliveryWorkRequest("wr_offered_recovery_prefill_only", "10.1000/offered-recovery-prefill-only"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile, err := deliverySvc.ResolveGateProfileFor(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := deliverySvc.Create(ctx, delivery.CreateRequest{
+		JobID: id, InstitutionProfile: "default", Provider: "openurl",
+		RequestClass: "digital_journal_article", WorkIdentity: row.Work.Describe(),
+		GateProfileDigest: profile.Digest(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.RecordEvent(ctx, id, "delivery.gate_evaluated", map[string]any{
+		"profile_class": "prefill_only", "profile_digest": profile.Digest(), "decision": "prefill",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.OfferedDeliveryRecovery().RunDue(ctx); err != nil {
+		t.Fatal(err)
+	}
+	assertOfferedRecoveryUntouched(t, jobs, deliverySvc, id, req.ID)
+}
+
+func TestOfferedDeliveryRecoverySkipsWithoutGateEvidence(t *testing.T) {
+	svc, jobs, deliverySvc := newDeliveryTestService(t)
+	svc.Delivery = deliverySvc
+	svc.Config.Browser.DocumentDelivery = autoCapableDocumentDelivery("https://example.edu/request")
+	ctx := context.Background()
+	id, err := svc.Submit(ctx, deliveryWorkRequest("wr_offered_recovery_no_gate", "10.1000/offered-recovery-no-gate"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile, err := deliverySvc.ResolveGateProfileFor(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := deliverySvc.Create(ctx, delivery.CreateRequest{
+		JobID: id, InstitutionProfile: "default", Provider: "illiad",
+		RequestClass: "digital_journal_article", WorkIdentity: row.Work.Describe(),
+		GateProfileDigest: profile.Digest(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.OfferedDeliveryRecovery().RunDue(ctx); err != nil {
+		t.Fatal(err)
+	}
+	assertOfferedRecoveryUntouched(t, jobs, deliverySvc, id, req.ID)
+}
+
+func assertOfferedRecoveryUntouched(t *testing.T, jobs *job.Store, deliverySvc *delivery.Service, jobID string, requestID int64) {
+	t.Helper()
+	gotJob, err := jobs.Get(context.Background(), jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotJob.State != job.StateQueued {
+		t.Fatalf("job state = %q, want queued", gotJob.State)
+	}
+	if gotJob.LeaseOwner != "" || gotJob.LeaseExpiresAt != "" {
+		t.Fatalf("job lease = owner %q expiry %q, want no claim", gotJob.LeaseOwner, gotJob.LeaseExpiresAt)
+	}
+	gotReq, err := deliverySvc.Get(context.Background(), requestID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotReq.State != delivery.StateOffered || gotReq.ProviderReference != "" {
+		t.Fatalf("request = %+v, want untouched offered row", gotReq)
+	}
+	actions, err := jobs.ListOpenHumanActionsForJobs(context.Background(), []string{jobID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(actions) != 0 {
+		t.Fatalf("actions = %+v, want none", actions)
+	}
+	events, err := jobs.Events(context.Background(), jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range events {
+		if event["kind"] == "delivery.offered_recovery_attempt" {
+			t.Fatal("offered row recorded a recovery attempt")
+		}
+	}
+}
+
+func TestOfferedDeliveryRecoveryConcurrentClaimSubmitsOnce(t *testing.T) {
+	var posts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		posts.Add(1)
+		_, _ = w.Write([]byte(`{"TransactionNumber": 8801, "TransactionStatus": "Awaiting Request Processing"}`))
+	}))
+	defer server.Close()
+	svc, jobs, deliverySvc := newDeliveryTestService(t)
+	svc.Delivery = deliverySvc
+	svc.IlliadHTTPClient = server.Client()
+	svc.Config.Browser.DocumentDelivery = autoCapableDocumentDelivery(server.URL)
+	ctx := context.Background()
+	if err := deliverySvc.RecordLiveAcceptance(ctx, "default", "illiad"); err != nil {
+		t.Fatal(err)
+	}
+	id, err := svc.Submit(ctx, deliveryWorkRequest("wr_offered_recovery_concurrent", "10.1000/offered-recovery-concurrent"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, _ := jobs.Get(ctx, id)
+	profile, err := deliverySvc.ResolveGateProfileFor(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := deliverySvc.Create(ctx, delivery.CreateRequest{
+		JobID: id, InstitutionProfile: "default", Provider: "illiad",
+		RequestClass: "digital_journal_article", WorkIdentity: row.Work.Describe(),
+		GateProfileDigest: profile.Digest(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.RecordEvent(ctx, id, "delivery.gate_evaluated", map[string]any{
+		"delivery_request_id": req.ID, "profile_class": "auto_capable",
+		"profile_digest": profile.Digest(), "decision": "submit",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.RecordEvent(ctx, id, "delivery.submission_failure_classified", map[string]any{
+		"delivery_request_id": req.ID, "class": "pre_send",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 2)
+	for range 2 {
+		go func() { done <- svc.OfferedDeliveryRecovery().RunDue(ctx) }()
+	}
+	for range 2 {
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if posts.Load() != 1 {
+		t.Fatalf("provider posts = %d, want one", posts.Load())
+	}
+}
+func TestOfferedDeliveryRecoveryUsesUniqueLeaseOwners(t *testing.T) {
+	svc := &Service{}
+	first := svc.OfferedDeliveryRecovery()
+	second := svc.OfferedDeliveryRecovery()
+	if first.owner == "" || first.owner == second.owner {
+		t.Fatalf("recovery owners = %q and %q, want unique non-empty owners", first.owner, second.owner)
 	}
 }

@@ -1263,6 +1263,35 @@ func (js *Store) ClaimNext(ctx context.Context, owner string, lease time.Duratio
 	return js.Get(ctx, id)
 }
 
+// Claim leases one specific runnable job using the same durable lease
+// predicates as ClaimNext. Maintenance callers use this when a secondary
+// durable table points at a job and must not accidentally claim another job.
+func (js *Store) Claim(ctx context.Context, jobID, owner string, lease time.Duration) (*Row, error) {
+	now := store.Now()
+	expires := time.Now().UTC().Add(lease).Format(time.RFC3339Nano)
+	res, err := js.S.DB().ExecContext(ctx, `
+		UPDATE jobs SET lease_owner = ?, lease_expires_at = ?
+		WHERE id = ? AND (
+			(state = 'queued' AND (lease_owner IS NULL OR lease_expires_at < ?))
+		 OR (state = 'retry_wait' AND retry_at <= ? AND (lease_owner IS NULL OR lease_expires_at < ?))
+		 OR (state IN ('resolving','fetching','validating') AND (lease_owner IS NULL OR lease_expires_at < ?))
+		)`, owner, expires, jobID, now, now, now, now)
+	if err != nil {
+		return nil, err
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return nil, nil
+	}
+	row, err := js.Get(ctx, jobID)
+	if err != nil {
+		_, _ = js.S.DB().ExecContext(context.Background(),
+			`UPDATE jobs SET lease_owner = NULL, lease_expires_at = NULL WHERE id = ? AND lease_owner = ?`,
+			jobID, owner)
+		return nil, err
+	}
+	return row, nil
+}
+
 // Heartbeat extends a held lease.
 func (js *Store) Heartbeat(ctx context.Context, jobID, owner string, lease time.Duration) error {
 	expires := time.Now().UTC().Add(lease).Format(time.RFC3339Nano)

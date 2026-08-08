@@ -1955,6 +1955,7 @@ func illiadTransactionRequest(w work.Work, patronRef, idempotencyKey string) ill
 // makes this a genuine duplicate — Decision 1 forbids a second attempt
 // there, so it routes to reconciliation instead.
 func (s *Service) submitDeliveryRequest(ctx context.Context, row *job.Row, from, profileName string, dd *config.DocumentDelivery, requestClass, workIdentity, key string, profile delivery.GateProfile) (*delivery.Request, error) {
+	duplicate := false
 	created, err := s.Delivery.Create(ctx, delivery.CreateRequest{
 		JobID:              row.ID,
 		InstitutionProfile: profileName,
@@ -1967,6 +1968,7 @@ func (s *Service) submitDeliveryRequest(ctx context.Context, row *job.Row, from,
 		if !errors.Is(err, delivery.ErrDuplicateRequest) {
 			return nil, err
 		}
+		duplicate = true
 		if created == nil || created.State != delivery.StateOffered || created.ProviderReference != "" {
 			// A live or otherwise-resolved request already occupies this
 			// idempotency key (a concurrent evaluation, or a settled
@@ -1978,6 +1980,21 @@ func (s *Service) submitDeliveryRequest(ctx context.Context, row *job.Row, from,
 		// Fall through: nothing was ever lodged for this row: retry
 		// submission against it instead of reconciling a request that was
 		// never actually created.
+	}
+	if created == nil || created.GateProfileDigest != profile.Digest() {
+		if created == nil {
+			return created, fmt.Errorf("delivery: missing offered request before submission")
+		}
+		return created, s.openDeliveryReconciliationAction(ctx, row, from, created)
+	}
+	if duplicate {
+		class, classified, err := s.submissionFailureClass(ctx, row.ID, created.ID)
+		if err != nil {
+			return created, err
+		}
+		if !classified || class != illiad.FailurePreSend {
+			return created, s.openDeliveryReconciliationAction(ctx, row, from, created)
+		}
 	}
 	return s.submitToProvider(ctx, row, from, dd, key, profile, created)
 }
@@ -1992,16 +2009,24 @@ func (s *Service) submitDeliveryRequest(ctx context.Context, row *job.Row, from,
 // on the ordinary short retry cadence instead of
 // parkDeliveryPrefill's document_delivery human action: the row already
 // durably occupies the idempotency key (Decision 1), so nothing was lost,
-// and a transient ILLiad outage is exactly the class of condition
-// resolver_temporarily_unavailable already tells the operator to expect —
-// "papio will retry automatically" (see errcat.Explain) — so escalating it
-// to a human action would be an overreaction. Reusing
-// RetryReasonDocumentDeliveryPending instead would misreport a request that
-// never actually reached the provider as one papio is now polling.
 func (s *Service) submitToProvider(ctx context.Context, row *job.Row, from string, dd *config.DocumentDelivery, key string, profile delivery.GateProfile, created *delivery.Request) (*delivery.Request, error) {
-	client := illiad.New(s.illiadHTTPClient(), dd.BaseURL, dd.APIKey)
+	traced := newTracedSubmissionClient(s.illiadHTTPClient())
+	client := illiad.New(traced, dd.BaseURL, dd.APIKey)
 	txn, err := client.CreateTransaction(ctx, illiadTransactionRequest(row.Work, dd.PatronRef, key))
 	if err != nil {
+		class := traced.class
+		if trusted, ok := illiad.FailureClassOf(err); ok {
+			class = trusted
+		}
+		if recordErr := s.Jobs.RecordEvent(ctx, row.ID, "delivery.submission_failure_classified", map[string]any{
+			"delivery_request_id": created.ID,
+			"class":               string(class),
+		}); recordErr != nil {
+			return created, recordErr
+		}
+		if class != illiad.FailurePreSend {
+			return created, s.openDeliveryReconciliationAction(ctx, row, from, created)
+		}
 		return created, s.Jobs.Transition(ctx, row.ID, from, job.StateRetryWait, map[string]any{
 			"reason":              "resolver_temporarily_unavailable",
 			"delivery_request_id": created.ID,
