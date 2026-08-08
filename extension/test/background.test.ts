@@ -23,7 +23,7 @@ import {
   isBotChallenge,
   isRedirectLoopPage,
   assessDrivenPage,
-  registrableProviderHost,
+  federatedLoginClaimKey,
   type BridgeDeps,
   type DownloadDeltaLike,
   type DownloadItemLike,
@@ -3988,7 +3988,7 @@ test("papio.pageBulk.grabPdf routes a steering grab through the native port and 
     urls,
   );
   const requestFrame = await h.port.waitForFrame("pdf_grab_request");
-  expect(requestFrame.payload).toMatchObject({ url: request.url, title: request.title });
+  expect(requestFrame.payload).toMatchObject({ host: new URL(request.url).hostname, title: request.title });
   const requestID = requestFrame.payload["request_id"];
   expect(typeof requestID).toBe("string");
   await h.port.inbound(
@@ -4041,6 +4041,7 @@ test("papio.pageBulk.grabPdf reconciles an interrupted download after a service-
     urls,
   );
   const requestFrame = await first.port.waitForFrame("pdf_grab_request");
+  expect(requestFrame.payload).toMatchObject({ host: new URL(request.url).hostname });
   await first.port.inbound(
     nativeResult("pdf_grab_result", {
       request_id: requestFrame.payload["request_id"] as string,
@@ -4060,14 +4061,53 @@ test("papio.pageBulk.grabPdf reconciles an interrupted download after a service-
     state: "interrupted",
   });
   await restarted.bridge.start();
-  expect(restarted.runtimeMessages).toContainEqual({
+  expect(restarted.runtimeMessages).not.toContainEqual({
     type: "papio.pageBulk.grabState",
     scan_id: request.scan_id,
     grab_id: "grab-restart",
-    state: "failed",
+    state: "abandoned",
     detail: "The PDF grab download was interrupted",
   });
-  expect(restarted.pdfGrabCorrelations.current).toEqual({});
+  expect(restarted.pdfGrabCorrelations.current["grab-restart"]).toMatchObject({ abandonPending: true });
+});
+
+test("papio.pageBulk.grabPdf clears a conflict acknowledgment with its settled state", async () => {
+  const h = makeHarness();
+  const urls = pageBulkTestURLs;
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ daemon_version: CURRENT_DAEMON, features: ["pdf_grab_v1"] }));
+  const request = { tab_id: 42, url: "https://resolver.example.edu/conflict.pdf", title: "Conflict", scan_id: "scan-grab-conflict" };
+  const replyPromise = handleInboxRuntimeMessage(
+    h.bridge,
+    { type: "papio.pageBulk.grabPdf", request },
+    { id: urls.runtimeID, url: urls.pageBulkURL, tab: { id: 42 } },
+    urls,
+  );
+  const requestFrame = await h.port.waitForFrame("pdf_grab_request");
+  await h.port.inbound(nativeResult("pdf_grab_result", {
+    request_id: requestFrame.payload["request_id"] as string,
+    outcome: "steering",
+    grab_id: "grab-conflict-0001",
+    steering_path: "papio/grabs/conflict/",
+  }));
+  await expect(replyPromise).resolves.toEqual({ ok: true, grab_id: "grab-conflict-0001" });
+  await h.downloads.onChanged.emit({ id: 901, state: { current: "interrupted" } });
+  const abandonFrame = await h.port.waitForFrame("pdf_grab_abandon_request");
+  await h.port.inbound(nativeResult("pdf_grab_abandon_result", {
+    request_id: abandonFrame.payload["request_id"] as string,
+    grab_id: "grab-conflict-0001",
+    state: "quarantined",
+    outcome: "conflict",
+    detail: "pdf grab is already settled",
+  }));
+  expect(h.runtimeMessages).toContainEqual({
+    type: "papio.pageBulk.grabState",
+    scan_id: request.scan_id,
+    grab_id: "grab-conflict-0001",
+    state: "identifying",
+    detail: "pdf grab is already settled",
+  });
+  expect(h.pdfGrabCorrelations.current).toEqual({});
 });
 
 test("papio.pageBulk.grabPdf delivers an unsolicited terminal result after a service-worker restart", async () => {
@@ -4089,6 +4129,7 @@ test("papio.pageBulk.grabPdf delivers an unsolicited terminal result after a ser
     urls,
   );
   const requestFrame = await first.port.waitForFrame("pdf_grab_request");
+  expect(requestFrame.payload).toMatchObject({ host: new URL(request.url).hostname });
   await first.port.inbound(
     nativeResult("pdf_grab_result", {
       request_id: requestFrame.payload["request_id"] as string,
@@ -6503,7 +6544,7 @@ const FED_LOGIN_TEMPLATE =
   "https://login.idp.example.edu/Shibboleth.sso/DS?entityID={entityID}&target=https://login.idp.example.edu/home";
 const FED_LOGIN_URL = FED_LOGIN_TEMPLATE.replace("{entityID}", encodeURIComponent(FED_ENTITY_ID));
 const FED_IDP_ORIGIN = new URL(FED_LOGIN_URL).origin;
-const FED_CLAIM_KEY = JSON.stringify([FED_IDP_ORIGIN, FED_ENTITY_ID]);
+let FED_CLAIM_KEY = "";
 const FED_PROVIDER_LOGIN_URL = `https://${PROVIDER_HOST}/login-wall`;
 const RESOLVER_ORIGIN = "https://resolver.example.edu";
 // A second institution sharing the exact same DS host as FED_ENTITY_ID above
@@ -6511,7 +6552,12 @@ const RESOLVER_ORIGIN = "https://resolver.example.edu";
 const FED_ENTITY_ID_B = "https://idp-b.example.edu/entity";
 const RESOLVER_ORIGIN_B = "https://resolver-b.example.edu";
 const OPENURL_B = "https://resolver-b.example.edu/openurl?ctx=xyz";
-const FED_CLAIM_KEY_B = JSON.stringify([FED_IDP_ORIGIN, FED_ENTITY_ID_B]);
+let FED_CLAIM_KEY_B = "";
+async function ensureFedClaimKeys(): Promise<void> {
+  if (FED_CLAIM_KEY !== "" && FED_CLAIM_KEY_B !== "") return;
+  FED_CLAIM_KEY = await federatedLoginClaimKey(FED_IDP_ORIGIN, FED_ENTITY_ID);
+  FED_CLAIM_KEY_B = await federatedLoginClaimKey(FED_IDP_ORIGIN, FED_ENTITY_ID_B);
+}
 const FED_LOGIN_SPEC: AdapterSpec = {
   id: "fedlogin",
   version: "1.0.0",
@@ -6564,6 +6610,7 @@ async function landOnFedProviderWall(h: Harness, tabID: number): Promise<void> {
  * the harness with job_fed_a as the federated-login owner and job_fed_b /
  * job_fed_c parked in waiting_for_session. */
 async function primeFedLoginTriad(): Promise<{ h: Harness; tabA: number; tabB: number; tabC: number }> {
+  await ensureFedClaimKeys();
   const h = makeFedLoginHarness();
   await h.bridge.start();
   for (const jobID of ["job_fed_a", "job_fed_b", "job_fed_c"]) {
@@ -6618,6 +6665,37 @@ test("one login tab per institution: two siblings park in waiting_for_session in
   expect(h.backend.store.federatedLoginOwners).toEqual({
     [FED_CLAIM_KEY]: { jobID: "job_fed_a", tabID: tabA },
   });
+});
+test("federated claim storage is opaque and one owner supplies the only sign-in badge blocker", async () => {
+  const { h } = await primeFedLoginTriad();
+  const persisted = JSON.stringify(h.backend.store);
+  expect(persisted).not.toContain(FED_IDP_ORIGIN);
+  expect(persisted).not.toContain(FED_ENTITY_ID);
+  h.backend.store.connectionStatus = "connected";
+  await h.bridge.syncConnectionBadge("connected");
+  expect(h.action.texts.at(-1)).toBe("1");
+  expect(h.action.titles.at(-1)).toBe("papio: 1 paper waiting on your institution sign-in");
+});
+
+test("startup drops legacy raw claim keys and resumes their waiters ownerlessly", async () => {
+  const { h, tabA, tabB, tabC } = await primeFedLoginTriad();
+  const legacyKey = JSON.stringify([FED_IDP_ORIGIN, FED_ENTITY_ID]);
+  const seed = JSON.parse(JSON.stringify(h.backend.store)) as StoreShape;
+  seed.federatedLoginOwners = { [legacyKey]: { jobID: "job_fed_a", tabID: tabA } };
+  for (const jobID of ["job_fed_b", "job_fed_c"]) {
+    const job = seed.activeJobs.find((candidate) => candidate.job_id === jobID);
+    if (job !== undefined) job.waiting_for_session_key = legacyKey;
+  }
+  const restarted = makeFedLoginHarness(seed);
+  restarted.tabs.live.set(tabA, { id: tabA, url: FED_LOGIN_URL });
+  restarted.tabs.live.set(tabB, { id: tabB, url: FED_PROVIDER_LOGIN_URL });
+  restarted.tabs.live.set(tabC, { id: tabC, url: FED_PROVIDER_LOGIN_URL });
+  await restarted.bridge.start();
+  expect(restarted.backend.store.federatedLoginOwners).toEqual({});
+  expect(restarted.backend.store.activeJobs.filter((job) => job.waiting_for_session === true)).toHaveLength(0);
+  const persisted = JSON.stringify(restarted.backend.store);
+  expect(persisted).not.toContain(FED_IDP_ORIGIN);
+  expect(persisted).not.toContain(FED_ENTITY_ID);
 });
 
 test("repeated decisive evidence events cost zero navigations for a waiter whose claim owner is still live", async () => {
@@ -6792,6 +6870,7 @@ test("fresh session evidence for a different institution resumes no waiting_for_
 });
 
 test("two institutions sharing a federated-login (DS) host never collide: distinct claim keys, and evidence for one never resumes the other's waiter", async () => {
+  await ensureFedClaimKeys();
   const h = makeFedLoginHarness({
     ...emptyStore(),
     authEvidenceByOrigin: {
@@ -7062,4 +7141,35 @@ test("a challenge-parked handoff stays parked through fresh session evidence for
   expect(job?.waiting_for_session).toBeUndefined();
   expect(h.tabs.navigations).toEqual([]);
   expect(h.tabs.live.has(tabID)).toBe(true);
+});
+
+test("papio.pageBulk.grabStatus pulls a structured durable result", async () => {
+  const h = makeHarness();
+  const urls = pageBulkTestURLs;
+  const sender = { id: urls.runtimeID, url: urls.pageBulkURL, tab: { id: 42 } };
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ daemon_version: CURRENT_DAEMON, features: ["pdf_grab_v1"] }));
+  const replyPromise: Promise<unknown> = handleInboxRuntimeMessage(
+    h.bridge,
+    { type: "papio.pageBulk.grabStatus", request: { grab_id: "grab-status-0001" } },
+    sender,
+    urls,
+  );
+  const requestFrame = await h.port.waitForFrame("pdf_grab_status_request");
+  await h.port.inbound(
+    nativeResult("pdf_grab_status_result", {
+      request_id: requestFrame.payload["request_id"] as string,
+      grab_id: "grab-status-0001",
+      state: "job_created",
+      outcome: "job_created",
+      job_id: "job_00000001",
+    }),
+  );
+  await expect(replyPromise).resolves.toEqual({
+    ok: true,
+    grab_id: "grab-status-0001",
+    state: "job_created",
+    outcome: "job_created",
+    job_id: "job_00000001",
+  });
 });

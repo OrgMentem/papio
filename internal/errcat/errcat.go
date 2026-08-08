@@ -150,13 +150,6 @@ func explainOpenAction(action job.HumanAction) Explanation {
 	case "openurl_available":
 		return Explanation{"openurl_available",
 			"An institutional OpenURL route is available; set access_mode to \"assisted\" or \"delegated\" and retry the acquisition."}
-	case "pdf_identifier_needed":
-		caption := action.Detail
-		if caption == "" {
-			caption = "the grabbed PDF"
-		}
-		return Explanation{"pdf_identifier_needed",
-			"papio grabbed " + caption + " but found no DOI (or other identifier) in its own front matter, so it could not be filed automatically. Find the paper's DOI/PMID/arXiv id yourself, then run `papio acquire <identifier>` — that starts an ordinary acquisition; this parked entry can be dismissed once the real one lands."}
 	case "downloads_access_required":
 		root := action.Detail
 		if root == "" {
@@ -164,6 +157,10 @@ func explainOpenAction(action job.HumanAction) Explanation {
 		}
 		return Explanation{"downloads_access_required",
 			"papio can't read " + root + " (macOS privacy consent). Grant Files and Folders access in System Settings -> Privacy & Security, then the pending download adopts automatically."}
+	case job.ActionKindDocumentDelivery:
+		// Reconciliation details are surfaced by the action payload; retain
+		// the generic action-required explanation here.
+		break
 	}
 	if next.RequiresInstitutionalLogin {
 		return Explanation{"login_required",

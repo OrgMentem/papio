@@ -32,8 +32,16 @@ for the full pre-split extension history.
   Firefox shows the row disabled with honest download-steering guidance, and
   grab outcomes report job creation, existing library ownership, or the need
   for an identifier directly in the row.
+- **Inbox renders recoverable PDF grabs.** A captured PDF without an
+  identifier now appears as a required-attention `pdf_grab` row with its
+  state, identifier guidance, and a dismiss action that removes only the grab.
 
 ### Changed
+- **Waiting sibling handoffs are now one actionable sign-in.** The browser
+  stores only opaque claim digests, drops pre-r6 raw claim keys on restart,
+  and renders sibling papers as working while the owner's institution sign-in
+  remains open in another tab. The waiting overlay expires back to the
+  daemon's required rendering if the owner does not finish in time.
 
 - **OpenAlex works-search pages now detect every result on the page.**
   `openalex.org` result cards carry no `doi.org` anchor at all — the title

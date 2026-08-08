@@ -1,13 +1,13 @@
 // Copyright 2026 OrgMentem. Licensed under MIT. See LICENSE.
 
-import { expect, test } from "bun:test";
+import { expect, test, vi } from "bun:test";
 import { readFileSync } from "node:fs";
 
 import { Window } from "happy-dom";
 import type { TriageCounts, TriageSnapshotItem } from "../src/protocol";
 
 interface FixtureSnapshot {
-  schema: 1 | 2 | 3;
+  schema: 1 | 2 | 3 | 4;
   generated_at: string;
   counts: TriageCounts;
   items: TriageSnapshotItem[];
@@ -235,6 +235,17 @@ function retraction(id: string, rank: number, title: string): TriageSnapshotItem
     noticed_at: "2026-07-21T10:00:00Z",
   };
 }
+function pdfGrab(grabID = "grab_test_1", label = "Reading copy"): TriageSnapshotItem {
+  return {
+    kind: "pdf_grab",
+    label,
+    grab: { grab_id: grabID, state: "parked_no_identifier" },
+    route_class: "pdf_identifier_needed",
+    blocked_by: "identifier_missing",
+    attention: "required",
+    ops: ["provide_identifier", "dismiss"],
+  } as TriageSnapshotItem;
+}
 
 function snapshot(items: TriageSnapshotItem[], options: Partial<FixtureSnapshot> = {}): FixtureSnapshot {
   return {
@@ -368,6 +379,36 @@ test("institutional handoff Open uses the broker rather than its canonical DOI",
   }]);
   expect(page.opened).toEqual([]);
   expect(page.document.getElementById("operation-status")?.textContent).toBe("Browser handoff opened.");
+});
+test("waiting sibling overlay is browser-local, suppresses primary focus, and lapses at deadline", async () => {
+  vi.useFakeTimers();
+  try {
+    const item = handoffAction("action:waiting", 1, true);
+    item.attention = "required";
+    const fixture = snapshot([item], {
+      counts: counts({ pending_total: 1, actions: 1, watch_hits: 0, retractions: 0 }),
+    });
+    const deadline = Date.now() + 30;
+    const page = await inboxDocument((message) => {
+      if (message.type === "papio.triage.waiting") {
+        return { ok: true, waiting_jobs: [{ job_id: "job_handoff_waiting", deadline }] };
+      }
+      return snapshotReply(fixture, message);
+    });
+    const row = page.document.querySelector<HTMLElement>("[data-triage-item-id='action:waiting']");
+    expect(row?.dataset.attention).toBe("working");
+    expect(row?.querySelector(".item-guidance")?.textContent).toBe(
+      "Waiting for the institution sign-in already open in another tab",
+    );
+    vi.advanceTimersByTime(50);
+    page.document.dispatchEvent(new Event("visibilitychange", { bubbles: true }));
+    await settle();
+    const expiredRow = page.document.querySelector<HTMLElement>("[data-triage-item-id='action:waiting']");
+    expect(expiredRow?.dataset.attention).toBe("required");
+    expect(expiredRow?.querySelector(".item-guidance")?.textContent).toBe("Sign in to your institution");
+  } finally {
+    vi.useRealTimers();
+  }
 });
 
 test("keyboard o sends an OA browser handoff through the broker", async () => {
@@ -781,6 +822,7 @@ test("the filter narrows visible items, keeps counts intact, and reports a disti
   expect(Array.from(page.document.querySelectorAll("[data-triage-item-id]"), (row) => row.getAttribute("data-triage-item-id"))).toEqual(["hit:one"]);
   expect(page.document.getElementById("inbox-counts")?.textContent).toContain("2 pending");
 
+
   filterInput.value = "no such paper exists";
   filterInput.dispatchEvent(new Event("input", { bubbles: true }));
   await settle();
@@ -791,6 +833,36 @@ test("the filter narrows visible items, keeps counts intact, and reports a disti
   filterInput.dispatchEvent(new Event("input", { bubbles: true }));
   await settle();
   expect(page.document.querySelectorAll("[data-triage-item-id]")).toHaveLength(2);
+});
+test("renders v4 PDF grabs, guides identifier entry, and dismisses by grab identity", async () => {
+  const fixture = snapshot([pdfGrab()], {
+    schema: 4,
+    counts: counts({ pending_total: 1, actions: 0, watch_hits: 0, retractions: 0 }),
+  });
+  const page = await inboxDocument((message) => {
+    if (message.type === "papio.triage.decide") return { ok: true, outcome: "applied" };
+    return snapshotReply(fixture, message);
+  });
+  const row = page.document.querySelector<HTMLElement>("[data-triage-item-id='pdf_grab:grab_test_1']");
+  expect(row).not.toBeNull();
+  expect(row?.dataset.attention).toBe("required");
+  expect(row?.querySelector(".item-guidance")?.textContent).toContain(
+    "papio grabs identify grab_test_1 --doi <value>",
+  );
+
+  row?.querySelector<HTMLButtonElement>("[data-operation='provide_identifier']")?.click();
+  await settle();
+  expect(page.document.querySelector<HTMLElement>("[data-triage-item-id='pdf_grab:grab_test_1'] .item-result")?.textContent ?? "").toContain("papio grabs identify grab_test_1");
+
+  page.document.querySelector<HTMLButtonElement>("[data-triage-item-id='pdf_grab:grab_test_1'] [data-operation='dismiss']")?.click();
+  await settle();
+  flush(page.window);
+  await settle();
+  expect(page.requests.find((request) => request.type === "papio.triage.decide")?.request).toEqual({
+    item_id: "pdf_grab:grab_test_1",
+    op: "dismiss",
+    watch_scope: "all",
+  });
 });
 
 test("the action kind renders as a status glyph with an accessible label, not a fact row", async () => {

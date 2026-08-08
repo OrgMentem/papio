@@ -30,12 +30,13 @@ async function pageBulkDocument(
   scanId: string | null,
   reply: Reply,
   options: ChromeTestOptions = {},
-): Promise<{ document: Document; window: Window; requests: RuntimeRequest[]; tabsUpdated: number[] }> {
+): Promise<{ document: Document; window: Window; requests: RuntimeRequest[]; tabsUpdated: number[]; emitRuntimeMessage: (message: unknown) => Promise<void> }> {
   const search = scanId !== null ? `?scan=${encodeURIComponent(scanId)}` : "";
   const window = new Window({ url: `https://ext.test/page-bulk.html${search}` });
   window.document.write(readFileSync(new URL("../src/page-bulk.html", import.meta.url), "utf8"));
   const requests: RuntimeRequest[] = [];
   const tabsUpdated: number[] = [];
+  const runtimeListeners: ((message: unknown) => void)[] = [];
   Object.assign(globalThis, {
     window,
     document: window.document,
@@ -49,6 +50,11 @@ async function pageBulkDocument(
         sendMessage: async (message: RuntimeRequest) => {
           requests.push(message);
           return reply(message);
+        },
+        onMessage: {
+          addListener: (listener: (message: unknown) => void) => {
+            runtimeListeners.push(listener);
+          },
         },
         // A relocated popup page (not the dist/popup.html default) proves the
         // inbox link is derived from the manifest and not a hardcoded
@@ -76,7 +82,16 @@ async function pageBulkDocument(
   // Each fixture needs a fresh page module because its state is module-local.
   await import(`../src/page-bulk.ts?page-bulk-test=${importSerial}`);
   await settle();
-  return { document: window.document as unknown as Document, window, requests, tabsUpdated };
+  return {
+    document: window.document as unknown as Document,
+    window,
+    requests,
+    tabsUpdated,
+    emitRuntimeMessage: async (message: unknown) => {
+      for (const listener of runtimeListeners) listener(message);
+      await settle();
+    },
+  };
 }
 
 function paper(overrides: Partial<DetectedPaper> = {}): DetectedPaper {
@@ -746,4 +761,33 @@ test("the allowlist checkbox reflects background state and persists a change", a
 
   const setRequest = page.requests.find((r) => r.type === "papio.pageBulk.allowlist.set");
   expect(setRequest?.request).toEqual({ origin: "https://scholar.example.edu", allowed: false });
+});
+
+test("reopening a workspace pulls settled grab state and never renders Ready to grab", async () => {
+  const item = {
+    ...paper({ kind: "pdf_grab", url: "https://resolver.example.edu/content/paper.pdf", title: "A paper" }),
+    grab_id: "grab-settled-0001",
+    grab_state: "quarantined",
+  } as DetectedPaper & { grab_id: string; grab_state: string };
+  const snap = snapshot({ items: [item] });
+  const page = await pageBulkDocument("scan-1", (message) => {
+    if (message.type === "papio.pageBulk.grabStatus") {
+      expect(message.request).toEqual({ grab_id: "grab-settled-0001" });
+      return { ok: true, grab_id: "grab-settled-0001", state: "job_created", outcome: "job_created" };
+    }
+    return standardReply(snap)(message);
+  });
+  const rendered = row(page.document, item.localId);
+  expect(rendered?.textContent).toContain("Job created");
+  expect(page.requests.some((request) => request.type === "papio.pageBulk.status")).toBe(false);
+  expect(rendered?.textContent).not.toContain("Ready to grab");
+  expect(rendered?.querySelector("button")?.disabled).toBe(true);
+  await page.emitRuntimeMessage({
+    type: "papio.pageBulk.grabState",
+    scan_id: "scan-1",
+    grab_id: "grab-settled-0001",
+    state: "identifying",
+    detail: "pdf grab is already settled",
+  });
+  expect(row(page.document, item.localId)?.textContent).toContain("Identifying");
 });

@@ -299,6 +299,52 @@ func TestSnapshotCursorPaginationAndCounts(t *testing.T) {
 	}
 }
 
+func TestLegacySnapshotPaginationSkipsPdfGrabBeforeLimit(t *testing.T) {
+	service, _, jobs := triageTestService(t)
+	createTriageAction(t, jobs, "wr_triage_legacy_grab")
+	service.RegisterSource(staticSource{items: []Item{
+		{
+			Kind: KindPdfGrab, ID: PdfGrabIDPrefix + "grab_legacy_1", Title: "Reading copy",
+			Ops:     []string{"provide_identifier", "dismiss"},
+			PdfGrab: &PdfGrab{GrabID: "grab_legacy_1", State: "parked_no_identifier"},
+		},
+		{
+			Kind: KindPdfGrab, ID: PdfGrabIDPrefix + "grab_legacy_2", Title: "Reading copy two",
+			Ops:     []string{"provide_identifier", "dismiss"},
+			PdfGrab: &PdfGrab{GrabID: "grab_legacy_2", State: "parked_no_identifier"},
+		},
+	}})
+
+	legacy, err := service.Snapshot(context.Background(), SnapshotRequest{Limit: 1, Schema: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(legacy.Items) != 1 || legacy.Items[0].Kind != KindHumanAction || legacy.HasMore || legacy.Counts.PendingTotal != 1 {
+		t.Fatalf("legacy page retained grab or pagination/count slot: %+v", legacy)
+	}
+	v4, err := service.Snapshot(context.Background(), SnapshotRequest{Limit: 1, Schema: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(v4.Items) != 1 || v4.Items[0].Kind != KindPdfGrab || !v4.HasMore || v4.Counts.PendingTotal != 3 {
+		t.Fatalf("v4 page did not expose grab/count it before action: %+v", v4)
+	}
+	v4Second, err := service.Snapshot(context.Background(), SnapshotRequest{Limit: 1, Cursor: v4.Cursor, Schema: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(v4Second.Items) != 1 || v4Second.Items[0].Kind != KindPdfGrab || !v4Second.HasMore || v4Second.Counts.PendingTotal != 3 {
+		t.Fatalf("v4 second page lost global count: %+v", v4Second)
+	}
+	v4Third, err := service.Snapshot(context.Background(), SnapshotRequest{Limit: 1, Cursor: v4Second.Cursor, Schema: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(v4Third.Items) != 1 || v4Third.Items[0].Kind != KindHumanAction || v4Third.HasMore || v4Third.Counts.PendingTotal != 3 {
+		t.Fatalf("v4 complete page did not validate global count: %+v", v4Third)
+	}
+}
+
 // createStatsJob drives a fresh job request straight to targetState via the
 // shortest legal transition path, for browser-stats aggregation tests that
 // only care about the terminal state and its updated_at.

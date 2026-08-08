@@ -169,6 +169,17 @@ public daemon now substantially outruns the store extension and the second
 wave is user-visible browser functionality — after this tranche + the QA
 matrix, submit immediately, before any new provider/resolver work.
 
+**Status: LANDED 2026-08-08** — all eight blockers built; three reviewer
+streams to explicit ship verdicts (the grab spine took nine adversarial
+rounds; the v4 counts rule settled on floor-always after the terminal-page
+wire ambiguity). Remaining before the v0.20.0 + ext-v0.12.0 train: release
+prep (changelog fold to 0.12.0, ext-bump, compat preflight, capture smoke),
+the operator QA matrix, store submission. Noted hardening follow-up: the
+fixture corpus is never validated against browser-v1.schema.json itself
+(jq checks syntax only) — two schema-impossible branches shipped past the
+corpus tests this round before reviewers caught them; a JSON-Schema-
+validating corpus test needs a validator-dependency decision.
+
 Blockers, in order:
 1. **URL-free grab protocol** (r6 P0-A): pdf_grab_request carries the full
    tab URL — signed CDN queries are bearer-grade — and the persisted

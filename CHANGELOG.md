@@ -26,10 +26,16 @@ execution records kept during the initial build.
   `documentDOIs`). A found identifier creates the ordinary identifier-keyed
   job (ADR-0010's ledger dedupe applies naturally: an already-owned work
   reports "already in your library" rather than a duplicate job); no
-  identifier parks a `pdf_identifier_needed` human action instead of ever
-  submitting on the title alone (ADR-0019). Firefox has no download-steering
-  API, so the row renders disabled there with honest copy. New migration
-  0025 adds the `pdf_grabs` table.
+  identifier leaves the captured bytes in a durable `parked_no_identifier`
+  grab row for triage, and `papio grabs identify <grab-id> --doi|--pmid|--arxiv`
+  binds those bytes to the canonical job without a network re-fetch. Firefox
+  has no download-steering API, so the row renders disabled there with honest
+  copy. New migration 0025 adds the `pdf_grabs` table.
+- **PDF grabs remain recoverable in the inbox.** The triage-snapshot/4
+  negotiation adds a jobless `pdf_grab` row for a captured PDF that still
+  needs an identifier. It shows the grab state and the exact
+  `papio grabs identify <grab-id> --doi|--pmid|--arxiv <value>` guidance;
+  dismissing it removes only the grab, never a job.
 
 - **An agent skill (`SKILL.md`) that drives the CLI directly.** MCP was the only
   documented way to hand *papio* to a coding agent, which put a server between
@@ -61,11 +67,25 @@ execution records kept during the initial build.
 
 ### Changed
 
+- **Rejected identity reviews close every non-advisory action.** Review
+  rejection now uses the same transaction-local terminal closure as ordinary
+  job transitions, so a parked `downloads_access_required` (or any other
+  non-advisory action) cannot survive beside a cancelled job; the
+  `openurl_available` advisory remains intentionally open.
+
 - **Dependency: `golang.org/x/net` 0.54.0 -> 0.55.0** (GHSA-5cv4-jp36-h3mw,
   medium: HTML-parser denial of service). papio parses provider landing
   pages with this parser; exposure was already bounded by the 512-byte
   landing-page read cap, and govulncheck reports no reachable vulnerable
   call after the bump.
+
+- **The docs landing page leads with the animated wordmark.** The mark that
+  opens the README now opens <https://orgmentem.github.io/papio/> too, in a
+  two-column hero (mark left, positioning copy and calls to action right)
+  rendered by a `home.html` template override; the page hides both sidebars so
+  the hero spans the full width, and stacks on phones. Both ink variants are
+  stacked and cross-faded rather than display-toggled, so switching the palette
+  does not restart the animation.
 
 ## [0.19.1] - 2026-08-08
 

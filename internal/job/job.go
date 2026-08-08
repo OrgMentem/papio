@@ -78,18 +78,6 @@ const (
 	// cancel the job. It resolves the same way any other non-advisory action
 	// does — the job's next terminal transition (see (*Store).transition).
 	ActionKindDownloadsAccessRequired = "downloads_access_required"
-	// ActionKindPdfIdentifierNeeded marks the human action opened when a
-	// browser PDF grab (ADR-0020) settled a file whose front matter carried
-	// no extractable identifier. The job it is bound to is title-only and
-	// created solely to host this action — it never enters ordinary
-	// resolution (no candidates, no fetch attempt; ADR-0019's title-only
-	// submission ban stays intact because nothing is ever submitted for
-	// acquisition on the title alone). Its detail names the grabbed host,
-	// the title guess, and the quarantine path. Deliberately absent from
-	// dismissalCancelsParkedJob's awaiting_human list — dismissing it never
-	// cancels the job (internal/browser separately deletes the bound
-	// pdf_grabs row on dismiss; see Bridge.humanActionResolve).
-	ActionKindPdfIdentifierNeeded = "pdf_identifier_needed"
 )
 
 // Candidate statuses. Only CandidateAccepted asserts that these bytes were
@@ -940,18 +928,27 @@ func (js *Store) transition(ctx context.Context, jobID, from, to string, detail 
 		}
 	}
 	if Terminal(to) {
-		actionStatus := "cancelled"
-		if to == StateReady || to == StateImported {
-			actionStatus = "resolved"
-		}
-		if _, err := tx.ExecContext(ctx,
-			`UPDATE human_actions SET status = ?, resolved_at = ?
-			 WHERE job_id = ? AND status = 'open' AND kind != ?`,
-			actionStatus, now, jobID, informationalActionKind); err != nil {
+		if err := closeTerminalHumanActions(ctx, tx, jobID, to, now); err != nil {
 			return err
 		}
 	}
 	return tx.Commit()
+}
+
+// closeTerminalHumanActions is the one transaction-local closure used by all
+// terminal transitions. openurl_available is advisory and intentionally
+// survives; every other open action belongs to the completed job and closes
+// with it.
+func closeTerminalHumanActions(ctx context.Context, tx *sql.Tx, jobID, to, now string) error {
+	actionStatus := "cancelled"
+	if to == StateReady || to == StateImported {
+		actionStatus = "resolved"
+	}
+	_, err := tx.ExecContext(ctx,
+		`UPDATE human_actions SET status = ?, resolved_at = ?
+		 WHERE job_id = ? AND status = 'open' AND kind != ?`,
+		actionStatus, now, jobID, informationalActionKind)
+	return err
 }
 
 // RepairAwaitingHuman atomically resolves a repair snapshot's open actions and
@@ -2671,6 +2668,11 @@ func (js *Store) resolveReview(ctx context.Context, input ResolveReviewInput, le
 		return ReviewResolution{}, err
 	} else if changed != 1 {
 		return ReviewResolution{Outcome: ReviewConflict, JobID: action.JobID}, nil
+	}
+	if Terminal(to) {
+		if err := closeTerminalHumanActions(ctx, tx, action.JobID, to, now); err != nil {
+			return ReviewResolution{}, normalizeReviewBusy(err)
+		}
 	}
 	resolutionDetail, err := json.Marshal(map[string]any{"action_id": action.ID, "verdict": input.Verdict})
 	if err != nil {

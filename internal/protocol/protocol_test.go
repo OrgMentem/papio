@@ -658,8 +658,10 @@ func TestBundleIdentityInvariantsAreRouteAware(t *testing.T) {
 func TestTriageFixturePayloadRoundTrips(t *testing.T) {
 	cases := map[string]string{
 		"browser-triage-snapshot-request.json":                   MsgTriageSnapshotRequest,
+		"browser-triage-snapshot-request-v4.json":                MsgTriageSnapshotRequest,
 		"browser-triage-snapshot-response.json":                  MsgTriageSnapshotResponse,
 		"browser-triage-snapshot-response-v3.json":               MsgTriageSnapshotResponse,
+		"browser-triage-snapshot-response-v4.json":               MsgTriageSnapshotResponse,
 		"browser-triage-snapshot-downloads-access-required.json": MsgTriageSnapshotResponse,
 		"browser-triage-counts-request.json":                     MsgTriageCountsRequest,
 		"browser-triage-counts-request-v2.json":                  MsgTriageCountsRequest,

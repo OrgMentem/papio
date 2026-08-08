@@ -27,6 +27,15 @@ type ActionReminder struct {
 // actions. It satisfies daemon.MaintenanceRunner without importing that package.
 func (s *Service) ActionReminder() *ActionReminder { return &ActionReminder{svc: s} }
 
+// reminderActionKindDefaultOK is the disposition record for named action
+// kinds whose reminder behavior intentionally uses the generic review bucket.
+// A kind belongs here only after its reminder behavior has been considered;
+// adding an ActionKind requires either a real reminder path or an entry here.
+var reminderActionKindDefaultOK = map[string]struct{}{
+	job.ActionKindDocumentDelivery:        {},
+	job.ActionKindDownloadsAccessRequired: {},
+}
+
 // RunDue performs one bounded reminder pass over active human-action jobs.
 //
 // Each reminder is recorded before delivery because a failed process restart
@@ -265,6 +274,11 @@ func reminderBatchIndex(action job.HumanAction) actionReminderClass {
 	case next.RequiresInstitutionalLogin:
 		return loginReminder
 	default:
+		if _, ok := reminderActionKindDefaultOK[action.Kind]; ok {
+			return reviewReminder
+		}
+		// Unknown kinds remain in the generic bucket until coverage requires
+		// an explicit reminder disposition.
 		return reviewReminder
 	}
 }

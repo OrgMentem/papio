@@ -9,7 +9,7 @@
 // text lifted off a site papio does not control.
 
 import type { DetectedPaper, PageBulkSnapshot } from "./page-scan";
-import type { PageBulkIdentifier, PageBulkStatus, PageBulkStatusItem } from "./protocol";
+import { durablePdfGrabState, type PageBulkIdentifier, type PageBulkStatus, type PageBulkStatusItem } from "./protocol";
 
 /** background.ts's PageBulkSnapshotView: page-scan.ts's PageBulkSnapshot plus
  * two background-local, browser-only UI fields (source page title and scan
@@ -62,6 +62,7 @@ interface RowState {
   occurrences: number;
   grabURL: string | null;
   grabTitle: string | null;
+  grabID: string | null;
   status: PageBulkStatus | null;
   canonicalKey: string | null;
   jobId: string | null;
@@ -157,7 +158,7 @@ function isDetectedPaper(value: unknown): value is DetectedPaper {
   if (!isRecord(value) || typeof value["localId"] !== "string" || typeof value["label"] !== "string") return false;
   if (typeof value["occurrences"] !== "number" || value["detector"] !== "generic-identifiers/1") return false;
   if (value["kind"] === "pdf_grab") {
-    return typeof value["url"] === "string" && typeof value["title"] === "string";
+    return (value["url"] === undefined || typeof value["url"] === "string") && typeof value["title"] === "string";
   }
   const identifier = value["identifier"];
   if (!isRecord(identifier) || typeof identifier["value"] !== "string") return false;
@@ -229,10 +230,14 @@ function element<K extends keyof HTMLElementTagNameMap>(tag: K, text?: string): 
   if (text !== undefined) created.textContent = text;
   return created;
 }
-
 function rowsFromSnapshot(snapshot: WorkspaceSnapshot): RowState[] {
   return snapshot.items.map((item) => {
     const grab = item.kind === "pdf_grab";
+    const record = item as unknown as Record<string, unknown>;
+    const grabObject = isRecord(record["grab"]) ? record["grab"] : null;
+    const grabID =
+      typeof record["grab_id"] === "string" ? record["grab_id"] :
+      grabObject !== null && typeof grabObject["grab_id"] === "string" ? grabObject["grab_id"] : null;
     return {
       localId: item.localId,
       kind: grab ? "pdf_grab" : "identifier",
@@ -241,6 +246,7 @@ function rowsFromSnapshot(snapshot: WorkspaceSnapshot): RowState[] {
       occurrences: item.occurrences,
       grabURL: grab ? item.url ?? null : null,
       grabTitle: grab ? item.title ?? null : null,
+      grabID,
       status: null,
       canonicalKey: null,
       jobId: null,
@@ -407,6 +413,7 @@ function ownershipUnclearOnly(): boolean {
   const graded = state.rows.filter((row) => row.status !== "invalid");
   return graded.length > 0 && graded.every((row) => row.status === "ownership_incomplete");
 }
+
 function grabSupported(): boolean {
   const downloads = typeof chrome !== "undefined" ? chrome.downloads : undefined;
   const steering = downloads !== undefined &&
@@ -415,7 +422,7 @@ function grabSupported(): boolean {
 }
 
 async function handleGrab(row: RowState): Promise<void> {
-  if (row.kind !== "pdf_grab" || row.grabURL === null || state.snapshot === null || !grabSupported() || state.grabState !== "idle") return;
+  if (row.kind !== "pdf_grab" || state.snapshot === null || !grabSupported() || state.grabState !== "idle") return;
   state.grabState = "grabbed";
   state.grabDetail = null;
   render();
@@ -423,7 +430,7 @@ async function handleGrab(row: RowState): Promise<void> {
     const response = await runtimeMessage("papio.pageBulk.grabPdf", {
       tab_id: state.snapshot.sourceTabId,
       scan_id: state.scanId,
-      url: row.grabURL,
+      ...(row.grabURL !== null ? { url: row.grabURL } : {}),
       title: row.grabTitle ?? row.label,
     });
     if (isRecord(response) && response["ok"] === true && typeof response["grab_id"] === "string") {
@@ -456,7 +463,9 @@ function buildRow(row: RowState, ownershipCollapsed: boolean): HTMLElement {
       try { return new URL(row.grabURL ?? "").hostname; } catch { return "the open PDF"; }
     })();
     meta.append(element("span", host));
+    const canReacquire = state.snapshot !== null && state.snapshot.sourceTabId >= 0;
     const statusText =
+      state.grabState === "idle" && row.grabURL === null && !canReacquire ? "Reopen or rescan the PDF tab to grab it" :
       state.grabState === "idle" ? (grabSupported() ? "Ready to grab" : "PDF grabbing needs Chrome download steering and a compatible daemon") :
       state.grabState === "grabbed" ? "Grabbed" :
       state.grabState === "identifying" ? "Identifying…" :
@@ -467,7 +476,7 @@ function buildRow(row: RowState, ownershipCollapsed: boolean): HTMLElement {
     meta.append(element("span", statusText));
     const button = element("button", "Grab this PDF");
     button.type = "button";
-    button.disabled = !grabSupported() || state.grabState !== "idle";
+    button.disabled = !grabSupported() || state.grabState !== "idle" || (!canReacquire && row.grabURL === null);
     button.addEventListener("click", () => { void handleGrab(row); });
     content.append(meta, button);
     wrapper.append(content);
@@ -595,6 +604,7 @@ function render(): void {
   elements.workspaceMain.hidden = !showWorkspace;
   if (showWorkspace) renderRows();
   else elements.rows.replaceChildren();
+
   renderActionBar();
   renderResult();
 }
@@ -611,16 +621,55 @@ async function loadAllowlist(origin: string): Promise<void> {
   if (parsed.ok && elements !== null) elements.allowlistCheckbox.checked = parsed.value;
 }
 
+async function loadGrabStatus(): Promise<void> {
+  const grabRow = state.rows.find((row) => row.kind === "pdf_grab" && row.grabID !== null);
+  if (grabRow?.grabID === null || grabRow === undefined) return;
+  let response: unknown;
+  try {
+    response = await runtimeMessage("papio.pageBulk.grabStatus", { grab_id: grabRow.grabID });
+  } catch (error) {
+    state.grabState = "identifying";
+    state.grabDetail = error instanceof Error ? error.message : "Could not reach the extension runtime.";
+    return;
+  }
+  if (!isRecord(response) || response["ok"] !== true) {
+    state.grabState = "identifying";
+    state.grabDetail = errorFromResponse(response);
+    return;
+  }
+  if (response["outcome"] === "not_found") {
+    state.grabID = null;
+    state.grabState = "idle";
+    state.grabDetail = "This PDF grab is no longer available.";
+    return;
+  }
+  const durable = durablePdfGrabState(response["state"]);
+  if (durable === null) {
+    state.grabState = "identifying";
+    return;
+  }
+  if (durable === "abandoned") {
+    state.grabID = null;
+    state.grabState = "idle";
+    state.grabDetail = typeof response["detail"] === "string" ? response["detail"] : "The PDF grab download was abandoned";
+    return;
+  }
+  state.grabID = typeof response["grab_id"] === "string" ? response["grab_id"] : grabRow.grabID;
+  state.grabState = durable;
+  state.grabDetail = typeof response["detail"] === "string" ? response["detail"] : null;
+}
+
 async function loadStatus(): Promise<void> {
   if (state.snapshot === null) return;
   const requestGeneration = state.snapshot.documentGeneration;
+  state.statusError = null;
+  render();
+  await loadGrabStatus();
   if (state.rows.length === 0 || state.rows.every((row) => row.kind === "pdf_grab")) {
     state.statusLoaded = true;
     render();
     return;
   }
-  state.statusError = null;
-  render();
   const identifiers: PageBulkIdentifier[] = state.rows
     .filter((row): row is RowState & { identifier: DetectedPaper["identifier"] } => row.kind === "identifier" && row.identifier !== null)
     .map((row) => ({ local_id: row.localId, kind: row.identifier.kind, value: row.identifier.value }));
@@ -670,6 +719,21 @@ function applySnapshot(snapshot: WorkspaceSnapshot): void {
   state.grabState = "idle";
   state.grabID = null;
   state.grabDetail = null;
+  const grabRow = state.rows.find((row) => row.kind === "pdf_grab" && row.grabID !== null);
+  if (grabRow?.grabID !== null && grabRow !== undefined) {
+    state.grabID = grabRow.grabID;
+    const item = snapshot.items.find((candidate) => candidate.localId === grabRow.localId);
+    const record = item as unknown as Record<string, unknown>;
+    const grabObject = isRecord(record["grab"]) ? record["grab"] : null;
+    const durable = durablePdfGrabState(grabObject?.["state"] ?? record["grab_state"]);
+    if (durable === "abandoned") {
+      state.grabID = null;
+      state.grabState = "idle";
+    } else if (durable !== null) {
+      state.grabState = durable;
+    }
+    if (typeof record["grab_detail"] === "string") state.grabDetail = record["grab_detail"];
+  }
   void loadAllowlist(snapshot.sourceOrigin);
 }
 
@@ -900,6 +964,13 @@ function bootstrap(): void {
     if (typeof grabID !== "string" || (state.grabID !== null && state.grabID !== grabID)) return;
     if (state.grabID === null) state.grabID = grabID;
     const next = message["state"];
+    if (next === "abandoned") {
+      state.grabID = null;
+      state.grabState = "idle";
+      state.grabDetail = typeof message["detail"] === "string" ? message["detail"] : "The PDF grab download was abandoned";
+      render();
+      return;
+    }
     if (next === "grabbed" || next === "identifying" || next === "job_created" || next === "already_owned" || next === "needs_identifier" || next === "failed") {
       state.grabState = next;
       state.grabDetail = typeof message["detail"] === "string" ? message["detail"] : null;

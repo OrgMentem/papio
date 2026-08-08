@@ -13,9 +13,9 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"time"
-
 	"papio/internal/store"
+	"sync"
+	"time"
 )
 
 // State is a pdf_grabs.state value, mirroring the migration's CHECK
@@ -37,18 +37,21 @@ const (
 	// this grab, whether freshly created or an already-live/owned job the
 	// extracted identifier deduplicated onto (see Outcome for which).
 	StateJobCreated State = "job_created"
-	// StateParkedNoIdentifier is terminal: no front-matter identifier was
-	// found; the grab parked a human action instead (ADR-0019's title-only
-	// stance — never an identifier-less submission).
+	// StateParkedNoIdentifier is settled but operator-actionable: no
+	// front-matter identifier was found, so the grab row remains the durable
+	// triage entity until an operator supplies one.
 	StateParkedNoIdentifier State = "parked_no_identifier"
 	// StateFailedValidation is terminal: the settled file failed structural
 	// validation (not a valid PDF).
 	StateFailedValidation State = "failed_validation"
+	// StateAbandoned is terminal: the browser download was interrupted before
+	// any file could settle.
+	StateAbandoned State = "abandoned"
 )
 
 func validState(s State) bool {
 	switch s {
-	case StateAwaitingFile, StateQuarantined, StateIdentified, StateJobCreated, StateParkedNoIdentifier, StateFailedValidation:
+	case StateAwaitingFile, StateQuarantined, StateIdentified, StateJobCreated, StateParkedNoIdentifier, StateFailedValidation, StateAbandoned:
 		return true
 	default:
 		return false
@@ -77,6 +80,7 @@ type Grab struct {
 type Service struct {
 	store *store.Store
 	now   func() time.Time
+	mu    sync.Mutex
 }
 
 // New constructs a Service. now defaults to time.Now when nil.
@@ -113,25 +117,55 @@ func scanGrab(row scanner) (*Grab, error) {
 		return nil, err
 	}
 	g.State = State(state)
+	g.JobID = jobID.String
+	g.NotifiedAt = notifiedAt.String
 	if !validState(g.State) {
 		// Fail closed on a row whose state this binary does not know —
 		// hand-edited databases and future-schema rows must never be
 		// processed as if they were in a known state.
 		return nil, fmt.Errorf("grab %s: unknown state %q", g.ID, state)
 	}
-	g.JobID = jobID.String
-	g.NotifiedAt = notifiedAt.String
 	return &g, nil
 }
 
-// Allocate inserts a new grab row in StateAwaitingFile and returns it.
+// At most one nonterminal grab may exist for a source host and title; a
+// repeated request returns that durable row instead of creating a duplicate.
 func (s *Service) Allocate(ctx context.Context, urlHost, title string) (*Grab, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	row := s.store.DB().QueryRowContext(ctx, `
+		SELECT id, url_host, title, state, quarantine_path, job_id, outcome, detail,
+		       notified_at, created_at, updated_at
+		FROM pdf_grabs
+		WHERE url_host = ? AND title = ? AND state IN (?, ?, ?, ?)
+		ORDER BY created_at ASC LIMIT 1`, urlHost, title,
+		string(StateAwaitingFile), string(StateQuarantined), string(StateIdentified), string(StateParkedNoIdentifier))
+	if g, err := scanGrab(row); err == nil {
+		g.Outcome = "existing"
+		return g, nil
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("checking existing pdf grab: %w", err)
+	}
 	id := NewID()
-	now := store.Now()
+	now := s.now()
 	if _, err := s.store.DB().ExecContext(ctx, `
 		INSERT INTO pdf_grabs (id, url_host, title, state, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?)`,
 		id, urlHost, title, string(StateAwaitingFile), now, now); err != nil {
+		if existing, lookupErr := s.store.DB().QueryContext(ctx, `
+			SELECT `+columns+` FROM pdf_grabs
+			WHERE url_host = ? AND title = ? AND state IN (?, ?, ?, ?)
+			ORDER BY created_at ASC LIMIT 1`,
+			urlHost, title, string(StateAwaitingFile), string(StateQuarantined), string(StateIdentified), string(StateParkedNoIdentifier)); lookupErr == nil {
+			defer func() { _ = existing.Close() }()
+			if existing.Next() {
+				g, scanErr := scanGrab(existing)
+				if scanErr == nil {
+					g.Outcome = "existing"
+					return g, nil
+				}
+			}
+		}
 		return nil, fmt.Errorf("inserting pdf grab: %w", err)
 	}
 	return s.Get(ctx, id)
@@ -170,23 +204,37 @@ func (s *Service) MarkQuarantined(ctx context.Context, id, quarantinePath string
 func (s *Service) MarkJobCreated(ctx context.Context, id, jobID, outcome string) error {
 	res, err := s.store.DB().ExecContext(ctx, `
 		UPDATE pdf_grabs SET state = ?, job_id = ?, outcome = ?, updated_at = ?
-		WHERE id = ? AND state IN (?, ?)`,
-		string(StateJobCreated), jobID, outcome, store.Now(), id, string(StateAwaitingFile), string(StateQuarantined))
+		WHERE id = ? AND state IN (?, ?, ?)`,
+		string(StateJobCreated), jobID, outcome, store.Now(), id,
+		string(StateAwaitingFile), string(StateQuarantined), string(StateIdentified))
 	if err != nil {
 		return err
 	}
 	return requireOneRow(res, id)
 }
 
-// MarkParkedNoIdentifier transitions to the terminal parked_no_identifier
-// state: no front-matter identifier was found, so jobID (a title-only job
-// created solely to host the pdf_identifier_needed human action) is
-// recorded and the wire outcome is fixed at "needs_identifier".
-func (s *Service) MarkParkedNoIdentifier(ctx context.Context, id, jobID string) error {
+// MarkIdentified records that identifier extraction completed while retaining
+// the grab as a durable entity until the canonical job is created.
+func (s *Service) MarkIdentified(ctx context.Context, id string) error {
 	res, err := s.store.DB().ExecContext(ctx, `
-		UPDATE pdf_grabs SET state = ?, job_id = ?, outcome = 'needs_identifier', updated_at = ?
-		WHERE id = ? AND state IN (?, ?)`,
-		string(StateParkedNoIdentifier), jobID, store.Now(), id, string(StateAwaitingFile), string(StateQuarantined))
+		UPDATE pdf_grabs SET state = ?, updated_at = ?
+		WHERE id = ? AND state IN (?, ?, ?)`,
+		string(StateIdentified), store.Now(), id, string(StateQuarantined), string(StateAwaitingFile), string(StateParkedNoIdentifier))
+	if err != nil {
+		return err
+	}
+	return requireOneRow(res, id)
+}
+
+// MarkParkedNoIdentifier settles the captured file as parked_no_identifier.
+// No synthetic title-only job is created; the grab is the durable pending
+// triage entity and its wire outcome is fixed at "needs_identifier".
+func (s *Service) MarkParkedNoIdentifier(ctx context.Context, id string) error {
+	res, err := s.store.DB().ExecContext(ctx, `
+		UPDATE pdf_grabs SET state = ?, job_id = NULL, outcome = 'needs_identifier', updated_at = ?
+		WHERE id = ? AND state IN (?, ?, ?)`,
+		string(StateParkedNoIdentifier), store.Now(), id,
+		string(StateAwaitingFile), string(StateQuarantined), string(StateIdentified))
 	if err != nil {
 		return err
 	}
@@ -204,6 +252,30 @@ func (s *Service) MarkFailedValidation(ctx context.Context, id, detail string) e
 		return err
 	}
 	return requireOneRow(res, id)
+}
+
+// MarkAbandoned settles an unfulfilled browser download after interruption.
+func (s *Service) MarkAbandoned(ctx context.Context, id, detail string) error {
+	res, err := s.store.DB().ExecContext(ctx, `
+		UPDATE pdf_grabs SET state = ?, outcome = 'abandoned', detail = ?, updated_at = ?
+		WHERE id = ? AND state = ?`,
+		string(StateAbandoned), detail, store.Now(), id, string(StateAwaitingFile))
+	if err != nil {
+		return err
+	}
+	return requireOneRow(res, id)
+}
+
+// AbandonStaleAwaiting settles captures that lost their browser correlation
+// before any file landed. The generous bound is a crash/restart backstop;
+// the extension's explicit abandon path remains primary.
+func (s *Service) AbandonStaleAwaiting(ctx context.Context, cutoff time.Time) error {
+	_, err := s.store.DB().ExecContext(ctx, `
+		UPDATE pdf_grabs
+		SET state = ?, outcome = 'abandoned', detail = 'The PDF grab download expired', updated_at = ?
+		WHERE state = ? AND updated_at < ?`,
+		string(StateAbandoned), store.Now(), string(StateAwaitingFile), cutoff)
+	return err
 }
 
 // PendingNotifications returns up to limit grabs whose terminal outcome has
@@ -243,10 +315,8 @@ func (s *Service) MarkNotified(ctx context.Context, id string) error {
 	return err
 }
 
-// Delete removes a grab row outright. Used when a pdf_identifier_needed
-// human action is dismissed: the job it parked stays (dismiss cancels
-// nothing — see internal/job's dismissalCancelsParkedJob), but the grab
-// bookkeeping itself is discarded (ADR-0020's dismissal disposition).
+// Delete removes a grab row outright when its triage item is dismissed. It
+// cancels nothing else because a parked grab has no job.
 func (s *Service) Delete(ctx context.Context, id string) error {
 	_, err := s.store.DB().ExecContext(ctx, `DELETE FROM pdf_grabs WHERE id = ?`, id)
 	return err

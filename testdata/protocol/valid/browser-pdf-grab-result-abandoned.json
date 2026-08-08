@@ -1,0 +1,1 @@
+{"protocol":"papio-browser/1","type":"pdf_grab_result","msg_id":"pdf-grab-abandoned-001","seq":29,"payload":{"grab_id":"grab_0123456789abcdef01234567","outcome":"abandoned","detail":"The PDF grab download expired"}}

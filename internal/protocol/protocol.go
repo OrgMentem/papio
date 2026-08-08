@@ -842,8 +842,12 @@ const (
 	// unsolicited, once the grab sweeper finishes identifying the captured
 	// file (request_id empty, outcome one of the terminal identification
 	// outcomes). See PdfGrabResultPayload.
-	MsgPdfGrabRequest = "pdf_grab_request"
-	MsgPdfGrabResult  = "pdf_grab_result"
+	MsgPdfGrabRequest        = "pdf_grab_request"
+	MsgPdfGrabResult         = "pdf_grab_result"
+	MsgPdfGrabStatusRequest  = "pdf_grab_status_request"
+	MsgPdfGrabStatusResult   = "pdf_grab_status_result"
+	MsgPdfGrabAbandonRequest = "pdf_grab_abandon_request"
+	MsgPdfGrabAbandonResult  = "pdf_grab_abandon_result"
 )
 
 // jobScoped lists the types that must carry a job_id.
@@ -932,13 +936,45 @@ type PageCaptureRequestResultPayload struct {
 }
 
 // PdfGrabRequestPayload asks the daemon to allocate a capture slot for a
-// browser PDF tab (ADR-0020). PDF bytes never cross native messaging — only
-// the tab's own URL and title do, and only after the tab-URL identifier
-// rules (page-scan.ts) already found nothing themselves.
+// browser PDF tab (ADR-0020). The extension keeps the full tab URL local;
+// the daemon receives only its bare hostname and title.
 type PdfGrabRequestPayload struct {
 	RequestID string `json:"request_id"`
-	URL       string `json:"url"`
+	Host      string `json:"host"`
 	Title     string `json:"title,omitempty"`
+}
+
+// PdfGrabStatusRequestPayload asks for the durable state of one grab.
+type PdfGrabStatusRequestPayload struct {
+	RequestID string `json:"request_id"`
+	GrabID    string `json:"grab_id"`
+}
+
+// PdfGrabStatusResultPayload reports durable grab state. Unknown grabs are a
+// routine not_found outcome, not a session-fatal RPC error.
+type PdfGrabStatusResultPayload struct {
+	RequestID string `json:"request_id"`
+	GrabID    string `json:"grab_id"`
+	State     string `json:"state"`
+	Outcome   string `json:"outcome,omitempty"`
+	Detail    string `json:"detail,omitempty"`
+	JobID     string `json:"job_id,omitempty"`
+}
+
+// PdfGrabAbandonRequestPayload asks the daemon to settle an unfulfilled grab
+// after the browser reports its download interrupted.
+type PdfGrabAbandonRequestPayload struct {
+	RequestID string `json:"request_id"`
+	GrabID    string `json:"grab_id"`
+}
+
+// PdfGrabAbandonResultPayload reports the durable abandoned state.
+type PdfGrabAbandonResultPayload struct {
+	RequestID string `json:"request_id"`
+	GrabID    string `json:"grab_id"`
+	State     string `json:"state"`
+	Outcome   string `json:"outcome,omitempty"`
+	Detail    string `json:"detail,omitempty"`
 }
 
 // PdfGrabResultPayload reports one PDF grab's outcome. GrabID is the durable
@@ -1164,6 +1200,17 @@ type TriageSnapshotItem struct {
 	Nature    string `json:"nature,omitempty"`
 	NoticedAt string `json:"noticed_at,omitempty"`
 	NoticeDOI string `json:"notice_doi,omitempty"`
+
+	// Label and Grab are the exact triage-snapshot/4 pdf_grab item shape.
+	// They are intentionally separate from the generic title/id/job fields:
+	// grabs remain jobless until an identifier is supplied.
+	Label string      `json:"label,omitempty"`
+	Grab  *TriageGrab `json:"grab,omitempty"`
+}
+
+type TriageGrab struct {
+	GrabID string `json:"grab_id"`
+	State  string `json:"state"`
 }
 
 // TriageDelivery is triage-snapshot/3's document_delivery sub-object: the
@@ -1203,6 +1250,11 @@ var triageRouteClasses = []string{
 // bridge consults it to keep snapshots legal: an action kind outside this
 // list cannot be represented on a v3 frame and must be omitted, never
 // emitted invalid (the vocabulary grows only with a schema revision).
+// TriageRouteClassesV4 returns schema 4's vocabulary. The v3 function above
+// remains frozen so its omit guard continues to exclude pdf_identifier_needed.
+func TriageRouteClassesV4() []string {
+	return append(slices.Clone(triageRouteClasses), "pdf_identifier_needed")
+}
 func TriageRouteClasses() []string {
 	return slices.Clone(triageRouteClasses)
 }
@@ -1215,6 +1267,7 @@ func TriageRouteClasses() []string {
 var triageBlockedByV2 = []string{"anti_bot", "paywall", "landing_page"}
 var triageBlockedByV3 = append(append([]string(nil), triageBlockedByV2...),
 	"login", "terms", "delivery_outcome", "identity_review", "unknown")
+var triageBlockedByV4 = append(append([]string(nil), triageBlockedByV3...), "identifier_missing")
 
 func containsString(values []string, target string) bool {
 	for _, v := range values {
@@ -1996,10 +2049,19 @@ func DecodeBrowserMessage(data []byte) (*BrowserMessage, error) {
 		msg.Payload = p
 	case MsgPdfGrabRequest:
 		p := &PdfGrabRequestPayload{}
-		if err = browserRequireFields(payloadFields, "request_id", "url"); err == nil {
+		if err = browserRequireFields(payloadFields, "request_id", "host"); err == nil {
 			err = browserRejectNullFields(payloadFields, "title")
 		}
 		if err == nil {
+			err = strictDecode(env.Payload, p)
+		}
+		if err == nil {
+			err = p.validate()
+		}
+		msg.Payload = p
+	case MsgPdfGrabStatusRequest:
+		p := &PdfGrabStatusRequestPayload{}
+		if err = browserRequireFields(payloadFields, "request_id", "grab_id"); err == nil {
 			err = strictDecode(env.Payload, p)
 		}
 		if err == nil {
@@ -2010,6 +2072,39 @@ func DecodeBrowserMessage(data []byte) (*BrowserMessage, error) {
 		p := &PdfGrabResultPayload{}
 		if err = browserRequireFields(payloadFields, "outcome"); err == nil {
 			err = browserRejectNullFields(payloadFields, "request_id", "grab_id", "steering_path", "detail")
+		}
+		if err == nil {
+			err = strictDecode(env.Payload, p)
+		}
+		if err == nil {
+			err = p.validate()
+		}
+		msg.Payload = p
+	case MsgPdfGrabStatusResult:
+		p := &PdfGrabStatusResultPayload{}
+		if err = browserRequireFields(payloadFields, "request_id", "grab_id", "state"); err == nil {
+			err = browserRejectNullFields(payloadFields, "outcome", "detail", "job_id")
+		}
+		if err == nil {
+			err = strictDecode(env.Payload, p)
+		}
+		if err == nil {
+			err = p.validate()
+		}
+		msg.Payload = p
+	case MsgPdfGrabAbandonRequest:
+		p := &PdfGrabAbandonRequestPayload{}
+		if err = browserRequireFields(payloadFields, "request_id", "grab_id"); err == nil {
+			err = strictDecode(env.Payload, p)
+		}
+		if err == nil {
+			err = p.validate()
+		}
+		msg.Payload = p
+	case MsgPdfGrabAbandonResult:
+		p := &PdfGrabAbandonResultPayload{}
+		if err = browserRequireFields(payloadFields, "request_id", "grab_id", "state"); err == nil {
+			err = browserRejectNullFields(payloadFields, "outcome", "detail")
 		}
 		if err == nil {
 			err = strictDecode(env.Payload, p)
@@ -2202,18 +2297,19 @@ func (p *PageCaptureRequestResultPayload) validate() error {
 	}
 	return validateTriageText("page_capture_request_result.detail", p.Detail, 1000)
 }
-
 func (p *PdfGrabRequestPayload) validate() error {
 	if err := validateCorrelationID("pdf_grab_request.request_id", p.RequestID); err != nil {
 		return err
 	}
-	parsed, err := url.ParseRequestURI(p.URL)
-	if browserTextLen(p.URL) == 0 || browserTextLen(p.URL) > 4000 ||
-		err != nil || parsed.Scheme != "https" || parsed.Host == "" {
-		return fmt.Errorf("pdf_grab_request.url must be a bounded parseable https URL")
+	if browserTextLen(p.Host) == 0 || browserTextLen(p.Host) > 253 ||
+		!pdfGrabHostRE.MatchString(p.Host) {
+		return fmt.Errorf("pdf_grab_request.host must be a bare hostname")
 	}
 	return validateTriageText("pdf_grab_request.title", p.Title, 500)
 }
+
+var pdfGrabHostRE = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$`)
+var pdfGrabItemIDRE = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 
 // pdfGrabSteeringPathRE matches the "papio/grabs/<id>/" relative path the
 // daemon returns as SteeringPath — the same "papio/" download-relocation
@@ -2234,8 +2330,8 @@ func (p *PdfGrabResultPayload) validate() error {
 		}
 	}
 	if err := enumRequired("pdf_grab_result.outcome", p.Outcome,
-		"steering", "not_supported", "unavailable",
-		"job_created", "already_owned", "needs_identifier", "failed_validation"); err != nil {
+		"steering", "existing", "not_supported", "unavailable",
+		"job_created", "already_owned", "needs_identifier", "failed_validation", "abandoned"); err != nil {
 		return err
 	}
 	switch p.Outcome {
@@ -2248,6 +2344,13 @@ func (p *PdfGrabResultPayload) validate() error {
 		}
 		if !pdfGrabSteeringPathRE.MatchString(p.SteeringPath) {
 			return fmt.Errorf("pdf_grab_result.steering_path must match papio/grabs/<grab-id>/")
+		}
+	case "existing":
+		if p.RequestID == "" || p.GrabID == "" {
+			return fmt.Errorf("pdf_grab_result: existing outcome requires request_id and grab_id")
+		}
+		if p.SteeringPath != "" {
+			return fmt.Errorf("pdf_grab_result: existing outcome must not carry steering_path")
 		}
 	case "not_supported", "unavailable":
 		// grab_id is intentionally optional here: a refusal decided before
@@ -2272,6 +2375,72 @@ func (p *PdfGrabResultPayload) validate() error {
 		}
 	}
 	return validateTriageText("pdf_grab_result.detail", p.Detail, 1000)
+}
+
+func (p *PdfGrabStatusRequestPayload) validate() error {
+	if err := validateCorrelationID("pdf_grab_status_request.request_id", p.RequestID); err != nil {
+		return err
+	}
+	return validateCorrelationID("pdf_grab_status_request.grab_id", p.GrabID)
+}
+
+func (p *PdfGrabStatusResultPayload) validate() error {
+	if err := validateCorrelationID("pdf_grab_status_result.request_id", p.RequestID); err != nil {
+		return err
+	}
+	if err := validateCorrelationID("pdf_grab_status_result.grab_id", p.GrabID); err != nil {
+		return err
+	}
+	if p.State == "" {
+		if p.Outcome != "not_found" && p.Outcome != "unavailable" {
+			return fmt.Errorf("pdf_grab_status_result.state required")
+		}
+	} else if err := enumRequired("pdf_grab_status_result.state", p.State,
+		"awaiting_file", "quarantined", "identified", "job_created", "parked_no_identifier", "failed_validation", "abandoned"); err != nil {
+		return err
+	}
+	if p.Outcome != "" && p.Outcome != "not_found" && p.Outcome != "unavailable" &&
+		p.Outcome != "job_created" && p.Outcome != "already_owned" &&
+		p.Outcome != "needs_identifier" && p.Outcome != "failed_validation" && p.Outcome != "abandoned" {
+		return fmt.Errorf("pdf_grab_status_result.outcome invalid")
+	}
+	if p.JobID != "" {
+		if err := validateCorrelationID("pdf_grab_status_result.job_id", p.JobID); err != nil {
+			return err
+		}
+	}
+	return validateTriageText("pdf_grab_status_result.detail", p.Detail, 1000)
+}
+
+func (p *PdfGrabAbandonRequestPayload) validate() error {
+	if err := validateCorrelationID("pdf_grab_abandon_request.request_id", p.RequestID); err != nil {
+		return err
+	}
+	return validateCorrelationID("pdf_grab_abandon_request.grab_id", p.GrabID)
+}
+
+func (p *PdfGrabAbandonResultPayload) validate() error {
+	if err := validateCorrelationID("pdf_grab_abandon_result.request_id", p.RequestID); err != nil {
+		return err
+	}
+	if err := validateCorrelationID("pdf_grab_abandon_result.grab_id", p.GrabID); err != nil {
+		return err
+	}
+	if p.Outcome != "" && p.Outcome != "abandoned" && p.Outcome != "not_found" && p.Outcome != "unavailable" && p.Outcome != "conflict" {
+		return fmt.Errorf("pdf_grab_abandon_result.outcome invalid")
+	}
+	if p.State == "" {
+		if p.Outcome != "not_found" && p.Outcome != "unavailable" {
+			return fmt.Errorf("pdf_grab_abandon_result.state required")
+		}
+	} else if err := enumRequired("pdf_grab_abandon_result.state", p.State,
+		"awaiting_file", "quarantined", "identified", "job_created", "parked_no_identifier", "failed_validation", "abandoned"); err != nil {
+		return err
+	}
+	if p.Outcome == "abandoned" && p.State != "abandoned" {
+		return fmt.Errorf("pdf_grab_abandon_result.abandoned state required")
+	}
+	return validateTriageText("pdf_grab_abandon_result.detail", p.Detail, 1000)
 }
 
 func (p *HelloAckPayload) validate() error {
@@ -2472,8 +2641,11 @@ func (p *TriageSnapshotRequestPayload) validate() error {
 	if err := validateCorrelationID("triage_snapshot_request.request_id", p.RequestID); err != nil {
 		return err
 	}
-	if len(p.SchemaVersions) != 1 || (p.SchemaVersions[0] != 1 && p.SchemaVersions[0] != 2 && p.SchemaVersions[0] != 3) {
-		return fmt.Errorf("triage_snapshot_request.schema_versions must be [1], [2], or [3]")
+	validSingle := len(p.SchemaVersions) == 1 &&
+		(p.SchemaVersions[0] == 1 || p.SchemaVersions[0] == 2 || p.SchemaVersions[0] == 3 || p.SchemaVersions[0] == 4)
+	validFallback := len(p.SchemaVersions) == 2 && p.SchemaVersions[0] == 4 && p.SchemaVersions[1] == 3
+	if !validSingle && !validFallback {
+		return fmt.Errorf("triage_snapshot_request.schema_versions must be [1], [2], [3], [4], or [4,3]")
 	}
 	if p.Limit != 0 && (p.Limit < 1 || p.Limit > 100) {
 		return fmt.Errorf("triage_snapshot_request.limit must be between 1 and 100")
@@ -2481,7 +2653,7 @@ func (p *TriageSnapshotRequestPayload) validate() error {
 	return validateTriageText("triage_snapshot_request.cursor", p.Cursor, 256)
 }
 
-func (counts TriageCounts) validate() error {
+func (counts TriageCounts) validate(additionalPending ...int) error {
 	values := []int64{
 		counts.PendingTotal, counts.WatchHits, counts.Actions, counts.Retractions,
 		counts.JobsWorking, counts.JobsNeedsReview, counts.FailureGroups7d,
@@ -2494,8 +2666,21 @@ func (counts TriageCounts) validate() error {
 			return fmt.Errorf("triage counts must be in range 0..%d", MaxBrowserInteger)
 		}
 	}
-	if counts.PendingTotal != counts.WatchHits+counts.Actions+counts.Retractions {
-		return fmt.Errorf("triage pending_total must equal watch_hits + actions + retractions")
+	extra := int64(0)
+	floor := false
+	if len(additionalPending) > 0 {
+		extra = int64(additionalPending[0])
+	}
+	if len(additionalPending) > 1 {
+		floor = additionalPending[1] != 0
+	}
+	expected := counts.WatchHits + counts.Actions + counts.Retractions + extra
+	if floor {
+		if counts.PendingTotal < expected {
+			return fmt.Errorf("triage pending_total must be at least visible items plus pdf grabs")
+		}
+	} else if counts.PendingTotal != expected {
+		return fmt.Errorf("triage pending_total must equal visible items plus pdf grabs")
 	}
 	return nil
 }
@@ -2538,6 +2723,9 @@ func (item *TriageSnapshotItem) UnmarshalJSON(data []byte) error {
 		Nature    string `json:"nature"`
 		NoticedAt string `json:"noticed_at"`
 		NoticeDOI string `json:"notice_doi"`
+
+		Label string      `json:"label"`
+		Grab  *TriageGrab `json:"grab"`
 	}
 	if err := strictDecode(data, &wire); err != nil {
 		return err
@@ -2546,6 +2734,17 @@ func (item *TriageSnapshotItem) UnmarshalJSON(data []byte) error {
 	allowed := append([]string(nil), core...)
 	allowed = append(allowed, "attention")
 	switch wire.Kind {
+	case "pdf_grab":
+		allowed = []string{"kind", "label", "grab", "route_class", "blocked_by", "attention", "ops"}
+		if err := browserRequireFields(fields, "kind", "label", "grab", "route_class", "blocked_by", "attention", "ops"); err != nil {
+			return err
+		}
+		if wire.Grab == nil || wire.Grab.GrabID == "" || wire.Grab.State == "" ||
+			wire.Label == "" || wire.RouteClass != "pdf_identifier_needed" ||
+			wire.BlockedBy != "identifier_missing" || wire.Attention != "required" ||
+			len(wire.Ops) != 2 || wire.Ops[0] != "provide_identifier" || wire.Ops[1] != "dismiss" {
+			return fmt.Errorf("invalid pdf_grab item")
+		}
 	case "watch_hit":
 		allowed = append(allowed, "work", "abstract", "watches", "first_seen_at")
 		if err := browserRequireFields(fields, append(core, "work", "abstract", "watches", "first_seen_at")...); err != nil {
@@ -2601,11 +2800,18 @@ func (item *TriageSnapshotItem) UnmarshalJSON(data []byte) error {
 		RequiresAuth: wire.RequiresAuth, BlockedBy: wire.BlockedBy,
 		RouteClass: wire.RouteClass, AuthRequirement: wire.AuthRequirement, Delivery: wire.Delivery,
 		DOI: wire.DOI, Nature: wire.Nature, NoticedAt: wire.NoticedAt, NoticeDOI: wire.NoticeDOI,
+		Label: wire.Label, Grab: wire.Grab,
 	}
 	return item.validate()
 }
-
 func (item TriageSnapshotItem) MarshalJSON() ([]byte, error) {
+	if item.Kind == "pdf_grab" {
+		return json.Marshal(map[string]any{
+			"kind": item.Kind, "label": item.Label, "grab": item.Grab,
+			"route_class": item.RouteClass, "blocked_by": item.BlockedBy,
+			"attention": item.Attention, "ops": item.Ops,
+		})
+	}
 	core := map[string]any{
 		"kind": item.Kind, "id": item.ID, "rank": item.Rank, "title": item.Title,
 		"facts": item.Facts, "links": item.Links, "ops": item.Ops,
@@ -2646,8 +2852,32 @@ func (item TriageSnapshotItem) MarshalJSON() ([]byte, error) {
 }
 
 func (item TriageSnapshotItem) validate() error {
-	if err := enumRequired("triage item kind", item.Kind, "watch_hit", "human_action", "retraction"); err != nil {
+	if err := enumRequired("triage item kind", item.Kind, "watch_hit", "human_action", "retraction", "pdf_grab"); err != nil {
 		return err
+	}
+	if item.Kind == "pdf_grab" {
+		if item.Label == "" || item.Grab == nil || item.Grab.GrabID == "" || item.Grab.State == "" {
+			return fmt.Errorf("pdf_grab requires label and grab")
+		}
+		if err := validateTriageText("pdf_grab.label", item.Label, 500); err != nil {
+			return err
+		}
+		if !pdfGrabItemIDRE.MatchString(item.Grab.GrabID) {
+			return fmt.Errorf("pdf_grab.grab.grab_id must match %s", pdfGrabItemIDRE)
+		}
+		if err := validateTriageText("pdf_grab.grab.grab_id", item.Grab.GrabID, 128); err != nil {
+			return err
+		}
+		if err := enumRequired("pdf_grab.grab.state", item.Grab.State,
+			"awaiting_file", "quarantined", "identified", "job_created", "parked_no_identifier", "failed_validation"); err != nil {
+			return err
+		}
+		if item.RouteClass != "pdf_identifier_needed" || !containsString(triageBlockedByV4, item.BlockedBy) ||
+			item.Attention != "required" || len(item.Ops) != 2 ||
+			item.Ops[0] != "provide_identifier" || item.Ops[1] != "dismiss" {
+			return fmt.Errorf("invalid pdf_grab presentation fields")
+		}
+		return nil
 	}
 	if item.ID == "" {
 		return fmt.Errorf("triage item id is required")
@@ -2810,13 +3040,20 @@ func (p *TriageSnapshotResponsePayload) validate() error {
 	if err := validateCorrelationID("triage_snapshot_response.request_id", p.RequestID); err != nil {
 		return err
 	}
-	if p.Schema != 1 && p.Schema != 2 && p.Schema != 3 {
-		return fmt.Errorf("triage_snapshot_response.schema must be 1, 2, or 3")
+	if p.Schema != 1 && p.Schema != 2 && p.Schema != 3 && p.Schema != 4 {
+		return fmt.Errorf("triage_snapshot_response.schema must be 1, 2, 3, or 4")
 	}
-	if err := validateTriageTime("triage_snapshot_response.generated_at", p.GeneratedAt); err != nil {
-		return err
+	grabCount := 0
+	for _, item := range p.Items {
+		if item.Kind == "pdf_grab" {
+			grabCount++
+		}
 	}
-	if err := p.Counts.validate(); err != nil {
+	floorFlag := 0
+	if p.Schema == 4 {
+		floorFlag = 1
+	}
+	if err := p.Counts.validate(grabCount, floorFlag); err != nil {
 		return err
 	}
 	if p.Counts.ActionsRequiresAuth != nil {
@@ -2846,6 +3083,9 @@ func (p *TriageSnapshotResponsePayload) validate() error {
 				return fmt.Errorf("triage_snapshot_response.schema 2 blocked_by must be a schema-2 value")
 			}
 		case 3:
+			if item.Kind == "pdf_grab" {
+				return fmt.Errorf("triage_snapshot_response.schema 3 cannot include pdf_grab")
+			}
 			if item.Attention == "" {
 				return fmt.Errorf("triage_snapshot_response.schema 3 requires attention on every item")
 			}
@@ -2855,6 +3095,21 @@ func (p *TriageSnapshotResponsePayload) validate() error {
 				}
 			} else if v3Fields {
 				return fmt.Errorf("triage_snapshot_response.schema 3 route_class/auth_requirement/delivery are human_action only")
+			}
+		case 4:
+			if item.Attention == "" {
+				return fmt.Errorf("triage_snapshot_response.schema 4 requires attention on every item")
+			}
+			if item.Kind == "pdf_grab" {
+				if item.RouteClass != "pdf_identifier_needed" || item.BlockedBy != "identifier_missing" {
+					return fmt.Errorf("triage_snapshot_response.schema 4 pdf_grab fields are invalid")
+				}
+			} else if item.Kind == "human_action" {
+				if item.RouteClass == "" || item.AuthRequirement == "" {
+					return fmt.Errorf("triage_snapshot_response.schema 4 human_action items require route_class and auth_requirement")
+				}
+			} else if v3Fields {
+				return fmt.Errorf("triage_snapshot_response.schema 4 route_class/auth_requirement/delivery are human_action only")
 			}
 		}
 	}

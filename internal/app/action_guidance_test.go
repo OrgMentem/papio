@@ -21,7 +21,6 @@ func TestHumanActionNextStepFor(t *testing.T) {
 		{kind: "terms_acceptance_required"},
 		{kind: "openurl_available"},
 		{kind: "downloads_access_required"},
-		{kind: "pdf_identifier_needed"},
 	}
 	for _, kind := range kinds {
 		for _, requiresAuth := range []bool{false, true} {

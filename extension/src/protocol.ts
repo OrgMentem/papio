@@ -58,7 +58,11 @@ export type BrowserMessageType =
   | "page_bulk_submit_request"
   | "page_bulk_submit_result"
   | "pdf_grab_request"
-  | "pdf_grab_result";
+  | "pdf_grab_result"
+  | "pdf_grab_status_request"
+  | "pdf_grab_status_result"
+  | "pdf_grab_abandon_request"
+  | "pdf_grab_abandon_result";
 
 export interface HelloPayload {
   extension_version: string;
@@ -216,14 +220,14 @@ export interface TriageCounts {
 
 export interface TriageSnapshotRequestPayload {
   request_id: string;
-  schema_versions: [1] | [2] | [3];
+  schema_versions: [1] | [2] | [3] | [4] | [4, 3];
   limit?: number;
   cursor?: string;
 }
 
 export interface TriageSnapshotResponsePayload {
   request_id: string;
-  schema: 1 | 2 | 3;
+  schema: 1 | 2 | 3 | 4;
   generated_at: string;
   counts: TriageCounts;
   items: TriageSnapshotItem[];
@@ -243,7 +247,7 @@ export interface TriageLink {
 }
 
 export interface TriageSnapshotItem {
-  kind: "watch_hit" | "human_action" | "retraction";
+  kind: "watch_hit" | "human_action" | "retraction" | "pdf_grab";
   id: string;
   rank: number;
   title: string;
@@ -259,6 +263,7 @@ export interface TriageSnapshotItem {
     | "open_request_history"
     | "confirm_request_exists"
     | "confirm_request_absent"
+    | "provide_identifier"
   >;
   /** Required on every schema-3 item, forbidden below (triage-snapshot/3). */
   attention?: "working" | "required" | "advisory";
@@ -274,7 +279,7 @@ export interface TriageSnapshotItem {
   sha256?: string;
   size_bytes?: number;
   requires_auth?: boolean;
-  blocked_by?: "anti_bot" | "paywall" | "landing_page" | "login" | "terms" | "delivery_outcome" | "identity_review" | "unknown";
+  blocked_by?: "anti_bot" | "paywall" | "landing_page" | "login" | "terms" | "delivery_outcome" | "identity_review" | "unknown" | "identifier_missing";
   /** Required on schema-3 human_action items, forbidden below/elsewhere:
    * the existing action-kind vocabulary formalized into a fixed enum, plus
    * document_delivery, decoupled from action_kind's open one (ADR-0016
@@ -285,9 +290,10 @@ export interface TriageSnapshotItem {
     | "verify_identity"
     | "openurl_available"
     | "human_auth_required"
-    | "terms_acceptance_required"
     | "document_delivery"
-    | "downloads_access_required";
+    | "downloads_access_required"
+    | "terms_acceptance_required"
+    | "pdf_identifier_needed";
   /** ADR-0016 Decision 4's tri-state auth carrier as a string enum (never a
    * bare bool): required on schema-3 human_action items, forbidden below.
    * requires_auth stays the narrow execution gate; only this may drive
@@ -296,6 +302,11 @@ export interface TriageSnapshotItem {
   /** Present only on a document_delivery human_action item (schema 3). */
   delivery?: TriageDelivery;
   doi?: string;
+  label?: string;
+  grab?: {
+    grab_id: string;
+    state: "awaiting_file" | "quarantined" | "identified" | "job_created" | "parked_no_identifier" | "failed_validation";
+  };
   nature?: "retraction" | "correction" | "concern";
   noticed_at?: string;
   notice_doi?: string;
@@ -498,35 +509,69 @@ export interface PageBulkSubmitResultPayload {
   invalid: number;
   batch_id: string;
 }
-
-/** ADR-0020: browser → daemon request to grab an open PDF tab that no
- * tab-URL identifier covers. The daemon allocates a grab id and, on success,
- * a steering path under the reserved papio/grabs/<id>/ adoption subtree. */
+/** ADR-0020: browser → daemon request to grab an open PDF tab. The
+ * extension keeps the full tab URL local; only the bare host crosses the wire. */
 export interface PdfGrabRequestPayload {
   request_id: string;
-  url: string;
+  host: string;
   title?: string;
 }
 
-/** ADR-0020: sent by the daemon TWICE per grab — synchronously as the
- * direct reply to pdf_grab_request (request_id set, outcome "steering" with
- * grab_id + steering_path, or a request_id-carrying refusal), and later,
- * unsolicited, once the grab sweeper has identified the captured file
- * (request_id absent, grab_id correlates back, outcome one of the terminal
- * four). steering_path is exactly papio/grabs/<grab-id>/. */
+export interface PdfGrabStatusRequestPayload {
+  request_id: string;
+  grab_id: string;
+}
+
 export interface PdfGrabResultPayload {
   request_id?: string;
   grab_id?: string;
   outcome:
     | "steering"
+    | "existing"
     | "not_supported"
     | "unavailable"
     | "job_created"
     | "already_owned"
     | "needs_identifier"
-    | "failed_validation";
+    | "failed_validation"
+    | "abandoned";
   steering_path?: string;
   detail?: string;
+}
+
+export interface PdfGrabStatusResultPayload {
+  request_id: string;
+  grab_id: string;
+  state: "awaiting_file" | "quarantined" | "identified" | "job_created" | "parked_no_identifier" | "failed_validation" | "abandoned" | "";
+  outcome?: "not_found" | "unavailable" | "job_created" | "already_owned" | "needs_identifier" | "failed_validation" | "abandoned";
+  detail?: string;
+  job_id?: string;
+}
+
+export interface PdfGrabAbandonRequestPayload {
+  request_id: string;
+  grab_id: string;
+}
+
+export interface PdfGrabAbandonResultPayload {
+  request_id: string;
+  grab_id: string;
+  state: "awaiting_file" | "quarantined" | "identified" | "job_created" | "parked_no_identifier" | "failed_validation" | "abandoned" | "";
+  outcome?: "abandoned" | "not_found" | "unavailable" | "conflict";
+  detail?: string;
+}
+
+export type PdfGrabDisplayState = "idle" | "grabbed" | "identifying" | "job_created" | "already_owned" | "needs_identifier" | "failed" | "abandoned";
+
+export function durablePdfGrabState(value: unknown): PdfGrabDisplayState | null {
+  if (value === "awaiting_file") return "grabbed";
+  if (value === "quarantined" || value === "identified") return "identifying";
+  if (value === "job_created") return "job_created";
+  if (value === "parked_no_identifier") return "needs_identifier";
+  if (value === "failed_validation") return "failed";
+  if (value === "abandoned") return "abandoned";
+  if (value === "idle" || value === "grabbed" || value === "identifying" || value === "already_owned" || value === "needs_identifier" || value === "failed") return value;
+  return null;
 }
 
 export interface BrowserMessage {
@@ -567,6 +612,12 @@ const MSG_TYPES: Record<string, true> = {
   error: true,
   triage_snapshot_request: true,
   triage_snapshot_response: true,
+  pdf_grab_request: true,
+  pdf_grab_result: true,
+  pdf_grab_status_request: true,
+  pdf_grab_status_result: true,
+  pdf_grab_abandon_request: true,
+  pdf_grab_abandon_result: true,
   triage_counts_request: true,
   triage_counts_response: true,
   triage_decide: true,
@@ -585,8 +636,6 @@ const MSG_TYPES: Record<string, true> = {
   page_bulk_status_result: true,
   page_bulk_submit_request: true,
   page_bulk_submit_result: true,
-  pdf_grab_request: true,
-  pdf_grab_result: true,
 };
 
 const JOB_SCOPED: Record<string, true> = {
@@ -749,7 +798,7 @@ function triageURL(value: string, what: string, scheme: "http:" | "https:"): URL
   }
 }
 
-function triageCounts(raw: unknown, what: string, allowAuth = false): void {
+function triageCounts(raw: unknown, what: string, allowAuth = false, additionalPending = 0, allowPartial = false): void {
   const counts = asRecord(raw, what);
   const fields = [
     "pending_total",
@@ -772,11 +821,13 @@ function triageCounts(raw: unknown, what: string, allowAuth = false): void {
   });
   const pending = int(counts, "pending_total", what, 0);
   const visible = int(counts, "watch_hits", what, 0) + int(counts, "actions", what, 0) + int(counts, "retractions", what, 0);
+  const expected = visible + additionalPending;
+  if (allowPartial ? pending < expected : pending !== expected) {
+    fail(`${what}.pending_total must ${allowPartial ? "be at least" : "equal"} visible items plus pdf grabs`);
+  }
   for (const key of fields.slice(4)) int(counts, key, what, 0);
   if (allowAuth && "actions_requires_auth" in counts) int(counts, "actions_requires_auth", what, 0);
-  if (pending !== visible) fail(`${what}.pending_total must equal visible item counts`);
 }
-
 const ROUTE_CLASSES = [
   "openurl_handoff",
   "manual_download",
@@ -790,15 +841,34 @@ const ROUTE_CLASSES = [
 
 // blockedByV2 is schema 2's exact closed set, shipped and locked: a
 // schema-2 frame must never carry a value outside it. blockedByV3 is
-// schema 3's strict superset — the new values only ever appear on schema
-// 3, never overloading or reinterpreting a v2 value's meaning.
+// schema 3's strict superset; identifier_missing is reserved for v4 grabs.
 const BLOCKED_BY_V2 = ["anti_bot", "paywall", "landing_page"];
 const BLOCKED_BY_V3 = [...BLOCKED_BY_V2, "login", "terms", "delivery_outcome", "identity_review", "unknown"];
 
-function triageItem(raw: unknown, schema: 1 | 2 | 3): void {
+function triageItem(raw: unknown, schema: 1 | 2 | 3 | 4): void {
   const item = asRecord(raw, "triage item");
-  const core = ["kind", "id", "rank", "title", "facts", "links", "ops"];
   const kind = triageText(item, "kind", "triage item", 50);
+  if (kind === "pdf_grab") {
+    if (schema !== 4) fail("pdf_grab items require triage-snapshot/4");
+    requireKeys(item, "triage item pdf_grab", ["kind", "label", "grab", "route_class", "blocked_by", "attention", "ops"]);
+    triageText(item, "label", "triage item pdf_grab", 500);
+    const grab = asRecord(item["grab"], "triage item pdf_grab.grab");
+    requireKeys(grab, "triage item pdf_grab.grab", ["grab_id", "state"]);
+    if (triageText(item, "label", "triage item pdf_grab", 500) === "") fail("pdf_grab.label is required");
+    const state = triageText(grab, "state", "triage item pdf_grab.grab", 50);
+    if (!["awaiting_file", "quarantined", "identified", "job_created", "parked_no_identifier", "failed_validation"].includes(state)) {
+      fail("pdf_grab.state is invalid");
+    }
+    const grabID = triageText(grab, "grab_id", "triage item pdf_grab.grab", 128);
+    if (!/^[A-Za-z0-9_-]+$/.test(grabID)) fail("pdf_grab.grab_id is invalid");
+    if (triageText(item, "route_class", "triage item pdf_grab", 100) !== "pdf_identifier_needed") fail("pdf_grab.route_class is invalid");
+    if (triageText(item, "blocked_by", "triage item pdf_grab", 50) !== "identifier_missing") fail("pdf_grab.blocked_by is invalid");
+    if (triageText(item, "attention", "triage item pdf_grab", 20) !== "required") fail("pdf_grab.attention is invalid");
+    const ops = item["ops"];
+    if (!Array.isArray(ops) || ops.length !== 2 || ops[0] !== "provide_identifier" || ops[1] !== "dismiss") fail("pdf_grab.ops is invalid");
+    return;
+  }
+  const core = ["kind", "id", "rank", "title", "facts", "links", "ops"];
   let extra: string[];
   switch (kind) {
     case "watch_hit":
@@ -1395,8 +1465,14 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
       requireFields<TriageSnapshotRequestPayload>(p, "triage_snapshot_request", { request_id: "required", schema_versions: "required", limit: "optional", cursor: "optional" });
       correlationID(p, "request_id", "triage_snapshot_request");
       const versions = p["schema_versions"];
-      if (!Array.isArray(versions) || versions.length !== 1 || (versions[0] !== 1 && versions[0] !== 2 && versions[0] !== 3)) {
-        fail("triage_snapshot_request.schema_versions must be [1], [2], or [3]");
+      if (
+        !Array.isArray(versions) ||
+        !(
+          (versions.length === 1 && (versions[0] === 1 || versions[0] === 2 || versions[0] === 3 || versions[0] === 4)) ||
+          (versions.length === 2 && versions[0] === 4 && versions[1] === 3)
+        )
+      ) {
+        fail("triage_snapshot_request.schema_versions must be [1], [2], [3], [4], or [4,3]");
       }
       if ("limit" in p) int(p, "limit", "triage_snapshot_request", 1);
       if ("limit" in p && (p["limit"] as number) > 100) fail("triage_snapshot_request.limit must be <= 100");
@@ -1415,12 +1491,13 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
         unsupported_items_count: "required",
       });
       correlationID(p, "request_id", "triage_snapshot_response");
-      if (p["schema"] !== 1 && p["schema"] !== 2 && p["schema"] !== 3) fail("triage_snapshot_response.schema must be 1, 2, or 3");
-      const schema = p["schema"] as 1 | 2 | 3;
-      triageTime(p, "generated_at", "triage_snapshot_response");
-      triageCounts(p["counts"], "triage_snapshot_response.counts");
+      if (p["schema"] !== 1 && p["schema"] !== 2 && p["schema"] !== 3 && p["schema"] !== 4) fail("triage_snapshot_response.schema must be 1, 2, 3, or 4");
+      const schema = p["schema"] as 1 | 2 | 3 | 4;
       const items = p["items"];
       if (!Array.isArray(items) || items.length > 100) fail("triage_snapshot_response.items must have at most 100 entries");
+      const pdfGrabCount = schema === 4 ? items.filter((item) => typeof item === "object" && item !== null && (item as Record<string, unknown>)["kind"] === "pdf_grab").length : 0;
+      const allowFloor = schema === 4;
+      triageCounts(p["counts"], "triage_snapshot_response.counts", false, pdfGrabCount, allowFloor);
       for (const item of items) triageItem(item, schema);
       if (typeof p["has_more"] !== "boolean") fail("triage_snapshot_response.has_more must be boolean");
       int(p, "unsupported_items_count", "triage_snapshot_response", 0);
@@ -1810,17 +1887,13 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
     case "pdf_grab_request": {
       requireFields<PdfGrabRequestPayload>(p, "pdf_grab_request", {
         request_id: "required",
-        url: "required",
+        host: "required",
         title: "optional",
       });
       correlationID(p, "request_id", "pdf_grab_request");
-      const grabURL = str(p, "url", "pdf_grab_request", 4000);
-      if (!grabURL.startsWith("https://")) fail("pdf_grab_request.url must be https");
-      try {
-        const parsed = new URL(grabURL);
-        if (parsed.protocol !== "https:" || parsed.host === "") fail("pdf_grab_request.url must be https");
-      } catch {
-        fail("pdf_grab_request.url must be https");
+      const host = str(p, "host", "pdf_grab_request", 253);
+      if (!/^[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$/.test(host)) {
+        fail("pdf_grab_request.host must be a bare hostname");
       }
       if ("title" in p) triageText(p, "title", "pdf_grab_request", 500);
       break;
@@ -1836,7 +1909,7 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
       const outcome = str(p, "outcome", "pdf_grab_result", 30);
       if ("grab_id" in p) correlationID(p, "grab_id", "pdf_grab_result");
       if (
-        !["steering", "not_supported", "unavailable", "job_created", "already_owned", "needs_identifier", "failed_validation"].includes(
+        !["steering", "existing", "not_supported", "unavailable", "job_created", "already_owned", "needs_identifier", "failed_validation", "abandoned"].includes(
           outcome,
         )
       ) {
@@ -1853,6 +1926,9 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
       if (outcome === "steering") {
         if (requestID === "") fail("pdf_grab_result: steering outcome requires request_id");
         if (!("steering_path" in p)) fail("pdf_grab_result: steering outcome requires steering_path");
+      } else if (outcome === "existing") {
+        if (requestID === "" || !("grab_id" in p)) fail("pdf_grab_result: existing outcome requires request_id and grab_id");
+        if ("steering_path" in p) fail("pdf_grab_result: existing outcome must not carry steering_path");
       } else if (outcome === "not_supported" || outcome === "unavailable") {
         if (requestID === "") fail(`pdf_grab_result: ${outcome} outcome requires request_id`);
         if ("steering_path" in p) fail(`pdf_grab_result: ${outcome} outcome must not carry steering_path`);
@@ -1870,5 +1946,68 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
       requireKeys(p, type, []);
       break;
     }
+    case "pdf_grab_status_request": {
+      requireFields<PdfGrabStatusRequestPayload>(p, "pdf_grab_status_request", {
+        request_id: "required",
+        grab_id: "required",
+      });
+      correlationID(p, "request_id", "pdf_grab_status_request");
+      correlationID(p, "grab_id", "pdf_grab_status_request");
+      break;
+    }
+    case "pdf_grab_status_result": {
+      requireFields<PdfGrabStatusResultPayload>(p, "pdf_grab_status_result", {
+        request_id: "required",
+        grab_id: "required",
+        state: "required",
+        outcome: "optional",
+        detail: "optional",
+        job_id: "optional",
+      });
+      const state = str(p, "state", "pdf_grab_status_result", 30);
+      correlationID(p, "request_id", "pdf_grab_status_result");
+      if (state !== "" && !["awaiting_file", "quarantined", "identified", "job_created", "parked_no_identifier", "failed_validation", "abandoned"].includes(state)) {
+        fail("pdf_grab_status_result.state is invalid");
+      }
+      if ("outcome" in p) {
+        const outcome = str(p, "outcome", "pdf_grab_status_result", 30);
+        if (!["not_found", "unavailable", "job_created", "already_owned", "needs_identifier", "failed_validation", "abandoned"].includes(outcome)) {
+          fail("pdf_grab_status_result.outcome is invalid");
+        }
+        if (state === "" && outcome !== "not_found" && outcome !== "unavailable") fail("pdf_grab_status_result.state required");
+      } else if (state === "") {
+        fail("pdf_grab_status_result.state required");
+      }
+      if ("detail" in p) triageText(p, "detail", "pdf_grab_status_result", 1000);
+      if ("job_id" in p) correlationID(p, "job_id", "pdf_grab_status_result");
+      break;
+    }
+    case "pdf_grab_abandon_request": {
+      requireFields<PdfGrabAbandonRequestPayload>(p, "pdf_grab_abandon_request", {
+        request_id: "required",
+        grab_id: "required",
+      });
+      correlationID(p, "request_id", "pdf_grab_abandon_request");
+      correlationID(p, "grab_id", "pdf_grab_abandon_request");
+      break;
+    }
+    case "pdf_grab_abandon_result": {
+      requireFields<PdfGrabAbandonResultPayload>(p, "pdf_grab_abandon_result", {
+        request_id: "required",
+        grab_id: "required",
+        state: "required",
+        outcome: "optional",
+        detail: "optional",
+      });
+      correlationID(p, "request_id", "pdf_grab_abandon_result");
+      correlationID(p, "grab_id", "pdf_grab_abandon_result");
+      const state = str(p, "state", "pdf_grab_abandon_result", 30);
+      if (state !== "" && !["awaiting_file", "quarantined", "identified", "job_created", "parked_no_identifier", "failed_validation", "abandoned"].includes(state)) fail("pdf_grab_abandon_result.state is invalid");
+      const outcome = "outcome" in p ? str(p, "outcome", "pdf_grab_abandon_result", 30) : "";
+      if (outcome !== "" && !["abandoned", "not_found", "unavailable", "conflict"].includes(outcome)) fail("pdf_grab_abandon_result.outcome is invalid");
+      if (state === "" && outcome !== "not_found" && outcome !== "unavailable") fail("pdf_grab_abandon_result.state required");
+      if (outcome === "abandoned" && state !== "abandoned") fail("pdf_grab_abandon_result.abandoned state required");
+      break;
+    }
+    }
   }
-}

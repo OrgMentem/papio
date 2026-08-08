@@ -343,6 +343,9 @@ func RouterWithShutdown(system *bootstrap.System, shutdown context.CancelFunc) i
 		"actions.dismiss": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return dismissAction(ctx, raw, system)
 		},
+		"grabs.identify": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return identifyGrab(ctx, raw, system)
+		},
 		"artifacts.get": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return getArtifact(ctx, raw, system)
 		},

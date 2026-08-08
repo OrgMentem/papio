@@ -21,6 +21,7 @@ import {
   MsgPageCapture,
   MsgPageCaptureRequestResult,
   parseBrowserMessage,
+  durablePdfGrabState,
   type ActivityEntryPayload,
   type BrowserMessage,
   type BrowserMessageType,
@@ -171,6 +172,29 @@ export function registrableProviderHost(host: string): string | undefined {
   const count = PROVIDER_MULTI_LABEL_SUFFIXES[suffix] === true ? 3 : 2;
   return labels.slice(-count).join(".");
 }
+/** Persist only an opaque equality key for a federated-login claim. The
+ * origin/entity pair is deliberately never written to browser storage. */
+export async function federatedLoginClaimKey(idpOrigin: string, entityID: string): Promise<string> {
+  const bytes = new TextEncoder().encode(JSON.stringify([idpOrigin, entityID]));
+  const digest = await globalThis.crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+/** The pre-r6 registry key was JSON.stringify([origin, entityID]). Treat
+ * every such persisted key as stale during startup migration. */
+function isLegacyFederatedLoginClaimKey(value: string): boolean {
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return (
+      Array.isArray(parsed) &&
+      parsed.length === 2 &&
+      typeof parsed[0] === "string" &&
+      typeof parsed[1] === "string"
+    );
+  } catch {
+    return false;
+  }
+}
 // A job whose warm SSO session cannot complete human authentication would
 // otherwise be re-driven on every daemon re-offer and worker spin-up forever,
 // thrashing the provider (repeat navigations trip bot walls) and burning the
@@ -190,6 +214,7 @@ const HELLO_WAIT_TIMEOUT_MS = 5_000;
 const TRIAGE_SNAPSHOT_FEATURE = "triage_snapshot_v1";
 const TRIAGE_SNAPSHOT_SCHEMA_2_FEATURE = "triage_snapshot_schema_v2";
 const TRIAGE_SNAPSHOT_SCHEMA_3_FEATURE = "triage_snapshot_schema_v3";
+const TRIAGE_SNAPSHOT_SCHEMA_4_FEATURE = "triage_snapshot_schema_v4";
 const TRIAGE_COUNTS_SCHEMA_2_FEATURE = "triage_counts_schema_v2";
 const SESSION_EVIDENCE_FEATURE = "session_evidence_v1";
 const DELIVERY_CONTEXT_FEATURE = "delivery_context_v1";
@@ -221,8 +246,8 @@ const CORRELATED_RESULT_TYPES: ReadonlySet<BrowserMessageType> = new Set([
   "review_preview_result",
   "stats_response",
   "activity_response",
-  "page_bulk_status_result",
-  "page_bulk_submit_result",
+  "pdf_grab_status_result",
+  "pdf_grab_abandon_result",
   "delivery_reconcile_result",
   "pdf_grab_result",
 ]);
@@ -560,7 +585,7 @@ export interface PdfGrabCorrelation {
   state: string;
   downloadID: number;
   steeringPath: string;
-  url: string;
+  abandonPending?: boolean;
 }
 
 export interface BridgeDeps {
@@ -778,6 +803,10 @@ interface BrokerFailure {
   ok: false;
   error: { code: string; message: string };
 }
+function failure(code: string, message: string): BrokerFailure {
+  return { ok: false, error: { code, message } };
+}
+
 
 interface BrokerSuccess<T extends Record<string, unknown>> {
   ok: true;
@@ -1507,6 +1536,24 @@ export class Bridge {
     await this.ready;
     return this.sessionState();
   }
+  /** Browser-local waiting markers for the inbox overlay. The daemon snapshot
+   * remains untouched; expired markers are excluded even if their timer has
+   * not run yet. */
+  async waitingSessionJobsSnapshot(): Promise<{ job_id: string; deadline?: number }[]> {
+    await this.ready;
+    const now = this.deps.now();
+    return this.store.activeJobs
+      .filter(
+        (job) =>
+          job.waiting_for_session === true &&
+          job.waiting_deadline !== undefined &&
+          job.waiting_deadline > now,
+      )
+      .map((job) => ({
+        job_id: job.job_id,
+        ...(job.waiting_deadline === undefined ? {} : { deadline: job.waiting_deadline }),
+      }));
+  }
 
   /** Refresh a stale/unknown keepalive verdict before replying to the popup.
    * The manager bounds the wait and leaves `checking` true when browser APIs
@@ -1521,10 +1568,10 @@ export class Bridge {
     await this.ready;
     if (origin !== undefined) {
       if (!isBareHTTPSOrigin(origin)) {
-        return this.failure("resolver_unavailable", "No resolver configured yet — open a paper first");
+        return failure("resolver_unavailable", "No resolver configured yet — open a paper first");
       }
       if (this.hasCurrentHello() && !this.knownResolverOrigins().includes(origin)) {
-        return this.failure("resolver_unavailable", "This institution is not currently configured");
+        return failure("resolver_unavailable", "This institution is not currently configured");
       }
       // Hand the tab to the keepalive manager exactly as the no-origin branch
       // below does. It owns the tab for the duration of the sign-in: its
@@ -1545,7 +1592,7 @@ export class Bridge {
         purpose: "session-signin",
       });
       return tabID === undefined
-        ? this.failure("session_open_failed", "Could not open the institution sign-in")
+        ? failure("session_open_failed", "Could not open the institution sign-in")
         : { ok: true, opened: true };
     }
     const manager = this.keepaliveManager;
@@ -1559,14 +1606,14 @@ export class Bridge {
       resolverOrigin = manager.getSnapshot().resolverOrigin ?? resolverOrigin;
     }
     if (resolverOrigin === undefined) {
-      return this.failure("resolver_unavailable", "No resolver configured yet — open a paper first");
+      return failure("resolver_unavailable", "No resolver configured yet — open a paper first");
     }
     const tabID = await this.openManagedTab({
       url: resolverOrigin,
       purpose: "session-signin",
     });
     return tabID === undefined
-      ? this.failure("session_open_failed", "Could not open the institution sign-in")
+      ? failure("session_open_failed", "Could not open the institution sign-in")
       : { ok: true, opened: true };
   }
 
@@ -1584,7 +1631,7 @@ export class Bridge {
           }
         : undefined);
     if (saved === undefined || !this.authStalledReported.has(jobID)) {
-      return this.failure("handoff_unavailable", "This authentication stall is no longer available");
+      return failure("handoff_unavailable", "This authentication stall is no longer available");
     }
     await this.update((s) => this.clearAuthAttempts(s, jobID));
     if (!this.handoffDrives.has(jobID) && this.handoffDrives.size >= HANDOFF_DRIVE_LIMIT) {
@@ -1619,9 +1666,8 @@ export class Bridge {
       tabID = undefined;
     }
     if (tabID === undefined) {
-      return this.failure("handoff_open_failed", "Could not reopen the institutional handoff");
+      return failure("handoff_open_failed", "Could not reopen the institutional handoff");
     }
-    this.beginProviderDrive(jobID);
     const openedAt = this.deps.now();
     await this.upsertJobWithOffer(
       {
@@ -1641,13 +1687,17 @@ export class Bridge {
     return { ok: true, opened: true };
   }
 
-
-
   /** A cold preflight has no tab yet; excluding it would hide the only sign-in
-   * signal when keepalive is disabled. */
+   * signal when keepalive is disabled. Waiters are not additional blockers:
+   * one owner is the actionable institution sign-in for the whole batch. */
   private signInBlockerCount(): number {
+    const ownerJobIDs = new Set(Object.values(this.store.federatedLoginOwners ?? {}).map((owner) => owner.jobID));
     return this.store.activeJobs.filter(
-      (job) => job.status === "auth_pending" || (job.status === "queued" && job.requires_auth === true),
+      (job) =>
+        job.waiting_for_session !== true &&
+        (job.status === "auth_pending" ||
+          (job.status === "queued" && job.requires_auth === true) ||
+          ownerJobIDs.has(job.job_id)),
     ).length;
   }
 
@@ -2926,8 +2976,7 @@ export class Bridge {
           typeof correlation.tabID === "number" &&
           typeof correlation.state === "string" &&
           typeof correlation.downloadID === "number" &&
-          typeof correlation.steeringPath === "string" &&
-          typeof correlation.url === "string"
+          typeof correlation.steeringPath === "string"
         ) {
           this.pdfGrabCorrelations.set(grabID, correlation);
         }
@@ -3214,25 +3263,25 @@ export class Bridge {
   async startPDFDelivery(payload: DeliveryStartPayload): Promise<DeliveryReply> {
     await this.ready;
     if (!Number.isSafeInteger(payload.tab_id) || payload.tab_id < 0 || payload.url.length === 0) {
-      return this.failure("invalid_request", "Invalid PDF delivery request");
+      return failure("invalid_request", "Invalid PDF delivery request");
     }
     let tab: TabInfo;
     try {
       tab = await this.deps.tabs.get(payload.tab_id);
     } catch {
-      return this.failure("tab_unavailable", "The current PDF tab is no longer available");
+      return failure("tab_unavailable", "The current PDF tab is no longer available");
     }
     const tabURL = typeof tab.url === "string" ? tab.url : payload.url;
     const url = pdfSourceURL(payload.url || tabURL);
     if (!isPDFPage(tabURL) && !isPDFPage(url)) {
-      return this.failure("not_pdf", "No PDF detected on this page");
+      return failure("not_pdf", "No PDF detected on this page");
     }
     const doi = payload.doi;
     let job = findByTab(this.store, payload.tab_id) ?? this.deliveryJobForDOI(doi);
     let duplicate = false;
     if (job === undefined) {
       if (doi === undefined || doi.trim() === "") {
-        return this.failure("no_doi", "This PDF has no DOI to queue");
+        return failure("no_doi", "This PDF has no DOI to queue");
       }
       const ack = await this.requestPageAcquire({
         url,
@@ -3240,13 +3289,13 @@ export class Bridge {
         ...(payload.title ? { title: payload.title } : {}),
         source: "popup",
       });
-      if (ack.error !== undefined) return this.failure("page_acquire", ack.error);
-      if (ack.job_id === undefined) return this.failure("page_acquire", "The daemon did not return a job");
+      if (ack.error !== undefined) return failure("page_acquire", ack.error);
+      if (ack.job_id === undefined) return failure("page_acquire", "The daemon did not return a job");
       duplicate = ack.duplicate === true;
       await this.inboundChain;
       job = findByJob(this.store, ack.job_id);
       if (job === undefined && duplicate) {
-        return this.failure("duplicate_not_live", "That paper is already queued, but its job is not live in this browser");
+        return failure("duplicate_not_live", "That paper is already queued, but its job is not live in this browser");
       }
       if (job === undefined) {
         const now = this.deps.now();
@@ -3265,7 +3314,7 @@ export class Bridge {
     }
     const pending = this.store.pendingDelivery;
     if (pending !== undefined && pending.status !== "failed" && pending.job_id !== job.job_id) {
-      return this.failure("delivery_busy", "Another PDF is already being sent to papio");
+      return failure("delivery_busy", "Another PDF is already being sent to papio");
     }
     if (pending?.job_id === job.job_id && pending.status !== "failed") {
       return { ok: true, state: pending.status ?? "sending", job_id: job.job_id, ...(duplicate ? { duplicate: true } : {}) };
@@ -3295,7 +3344,7 @@ export class Bridge {
     this.lastDeliveryState = undefined;
     const started = await this.startDeliveryDownload(job.job_id, url);
     if (!started) {
-      return this.failure("download_start", "Could not start the browser download");
+      return failure("download_start", "Could not start the browser download");
     }
     return { ok: true, state: "sending", job_id: job.job_id, ...(duplicate ? { duplicate: true } : {}) };
   }
@@ -3377,7 +3426,7 @@ export class Bridge {
       job = findByJob(this.store, jobID);
     }
     if (job === undefined || !this.offerURLs.has(jobID)) {
-      return this.failure("handoff_unavailable", "The requested handoff is not available");
+      return failure("handoff_unavailable", "The requested handoff is not available");
     }
 
     if (job.status === "queued") {
@@ -3387,7 +3436,7 @@ export class Bridge {
       await this.releaseQueuedHandoffs(jobID, true);
       job = findByJob(this.store, jobID);
       if (job === undefined || !this.offerURLs.has(jobID) || job.tab_id < 0) {
-        return this.failure("handoff_open_failed", "The offered handoff could not be opened");
+        return failure("handoff_open_failed", "The offered handoff could not be opened");
       }
       await this.focusManagedTab(job.tab_id);
       return { ok: true, opened: true };
@@ -3400,11 +3449,11 @@ export class Bridge {
         await this.focusManagedTab(job.tab_id);
         return { ok: true, opened: true };
       }
-      return this.failure("handoff_queued", "The handoff is waiting for an available browser slot");
+      return failure("handoff_queued", "The handoff is waiting for an available browser slot");
     }
     const openurl = this.offerURLs.get(jobID);
     if (openurl === undefined) {
-      return this.failure("handoff_open_failed", "The offered handoff could not be opened");
+      return failure("handoff_open_failed", "The offered handoff could not be opened");
     }
     let tabID: number | undefined;
     try {
@@ -3417,7 +3466,7 @@ export class Bridge {
       tabID = undefined;
     }
     return tabID === undefined
-      ? this.failure("handoff_open_failed", "The offered handoff tab could not be focused")
+      ? failure("handoff_open_failed", "The offered handoff tab could not be focused")
       : { ok: true, opened: true };
   }
 
@@ -3455,18 +3504,15 @@ export class Bridge {
     await this.openHandoff(jobID);
   }
 
-  private failure(code: string, message: string): BrokerFailure {
-    return { ok: false, error: { code, message } };
-  }
 
   private nativeFailure(result: NativeRequestResult): BrokerFailure {
     switch (result.kind) {
       case "timeout":
-        return this.failure("timeout", "The daemon did not respond in time");
+        return failure("timeout", "The daemon did not respond in time");
       case "transport":
-        return this.failure(result.code ?? "connection_lost", result.message ?? "The daemon is unavailable");
+        return failure(result.code ?? "connection_lost", result.message ?? "The daemon is unavailable");
       default:
-        return this.failure(result.code ?? "daemon_error", result.message ?? "The daemon rejected the request");
+        return failure(result.code ?? "daemon_error", result.message ?? "The daemon rejected the request");
     }
   }
 
@@ -3586,13 +3632,18 @@ export class Bridge {
     }
     return { kind: "transport", code: "connection_lost", message: "The daemon is unavailable" };
   }
-
   async requestTriageSnapshot(
-    request: { schema_versions: [1]; limit?: number; cursor?: string },
+    request: { schema_versions: [1] | [2] | [3] | [4] | [4, 3]; limit?: number; cursor?: string },
   ): Promise<BrokerReply<{ snapshot: Record<string, unknown> }>> {
-    const schemaVersions: [1] | [2] = (this.store.daemonFeatures ?? []).includes(TRIAGE_SNAPSHOT_SCHEMA_2_FEATURE)
-      ? [2]
-      : request.schema_versions;
+    const features = this.store.daemonFeatures ?? [];
+    const schemaVersions: [1] | [2] | [3] | [4] | [4, 3] =
+      features.includes(TRIAGE_SNAPSHOT_SCHEMA_4_FEATURE)
+        ? [4, 3]
+        : features.includes(TRIAGE_SNAPSHOT_SCHEMA_3_FEATURE)
+          ? [3]
+          : features.includes(TRIAGE_SNAPSHOT_SCHEMA_2_FEATURE)
+            ? [2]
+            : request.schema_versions;
     const result = await this.requestNative(
       "triage_snapshot_request",
       { ...request, schema_versions: schemaVersions },
@@ -3601,7 +3652,7 @@ export class Bridge {
       false,
     );
     if (result.kind !== "response" || result.payload === undefined) return this.nativeFailure(result);
-    if (result.code !== undefined) return this.failure(result.code, result.message ?? "The request is unavailable");
+    if (result.code !== undefined) return failure(result.code, result.message ?? "The request is unavailable");
     const { request_id: _requestID, ...snapshot } = result.payload;
     const counts = snapshot["counts"];
     if (typeof counts === "object" && counts !== null && typeof (counts as Record<string, unknown>)["pending_total"] === "number") {
@@ -3612,9 +3663,12 @@ export class Bridge {
   }
 
   async requestTriageCounts(): Promise<BrokerReply<{ counts: Record<string, unknown>; generated_at: string }>> {
-    const payload = (this.store.daemonFeatures ?? []).includes(TRIAGE_COUNTS_SCHEMA_2_FEATURE)
-      ? { schema_versions: [2] }
-      : {};
+    const features = this.store.daemonFeatures ?? [];
+    const payload = features.includes(TRIAGE_SNAPSHOT_SCHEMA_4_FEATURE)
+      ? { schema_versions: [4] }
+      : features.includes(TRIAGE_COUNTS_SCHEMA_2_FEATURE)
+        ? { schema_versions: [2] }
+        : {};
     const result = await this.requestNative(
       "triage_counts_request",
       payload,
@@ -3623,9 +3677,9 @@ export class Bridge {
       false,
     );
     if (result.kind !== "response" || result.payload === undefined) return this.nativeFailure(result);
-    if (result.code !== undefined) return this.failure(result.code, result.message ?? "The request is unavailable");
+    if (result.code !== undefined) return failure(result.code, result.message ?? "The request is unavailable");
     const counts = result.payload["counts"];
-    if (typeof counts !== "object" || counts === null) return this.failure("invalid_response", "The daemon returned invalid counts");
+    if (typeof counts !== "object" || counts === null) return failure("invalid_response", "The daemon returned invalid counts");
     const record = counts as Record<string, unknown>;
     const pending = record["pending_total"];
     if (typeof pending === "number") {
@@ -3657,7 +3711,7 @@ export class Bridge {
       false,
     );
     if (result.kind !== "response" || result.payload === undefined) return this.nativeFailure(result);
-    if (result.code !== undefined) return this.failure(result.code, result.message ?? "The request is unavailable");
+    if (result.code !== undefined) return failure(result.code, result.message ?? "The request is unavailable");
     const { request_id: _requestID, ...stats } = result.payload;
     return { ok: true, stats };
   }
@@ -3677,10 +3731,10 @@ export class Bridge {
     );
     if (result.kind !== "response") return this.nativeFailure(result);
     if (result.code === "feature_unavailable") return { ok: true, feature: false, entries: [] };
-    if (result.code !== undefined) return this.failure(result.code, result.message ?? "The request is unavailable");
+    if (result.code !== undefined) return failure(result.code, result.message ?? "The request is unavailable");
     if (result.payload === undefined) return this.nativeFailure(result);
     const entries = result.payload["entries"];
-    if (!Array.isArray(entries)) return this.failure("invalid_response", "The daemon returned invalid activity entries");
+    if (!Array.isArray(entries)) return failure("invalid_response", "The daemon returned invalid activity entries");
     return { ok: true, feature: true, entries: entries as ActivityEntryPayload[] };
   }
 
@@ -3721,7 +3775,7 @@ export class Bridge {
     try {
       tabURL = (await this.deps.tabs.get(tabID)).url;
     } catch {
-      return this.failure("scan_failed", "Could not scan the page");
+      return failure("scan_failed", "Could not scan the page");
     }
     let injected: { result?: unknown } | undefined;
     try {
@@ -3731,7 +3785,7 @@ export class Bridge {
         args: [tabURL ?? ""],
       });
     } catch {
-      return this.failure("scan_failed", "Could not scan the page");
+      return failure("scan_failed", "Could not scan the page");
     }
     const scanned = injected?.result as ScanResult | undefined;
     if (
@@ -3740,7 +3794,7 @@ export class Bridge {
       typeof scanned.truncated !== "boolean" ||
       (scanned.renderedRecordCountHint !== null && typeof scanned.renderedRecordCountHint !== "number")
     ) {
-      return this.failure("scan_failed", "Could not scan the page");
+      return failure("scan_failed", "Could not scan the page");
     }
     return {
       ok: true,
@@ -3755,10 +3809,36 @@ export class Bridge {
     return this.deps.pageBulkScans.get();
   }
 
+  private sanitizePageBulkSnapshot(snapshot: PageBulkSnapshot): PageBulkSnapshot {
+    const items = snapshot.items.map((item) => {
+      if (item.kind !== "pdf_grab") return item;
+      const record = { ...(item as unknown as Record<string, unknown>) };
+      delete record["url"];
+      delete record["href"];
+      delete record["opened_href"];
+      delete record["finalUrl"];
+      return record as unknown as typeof item;
+    });
+    return { ...snapshot, items };
+  }
+
   private async savePageBulkSnapshot(snapshot: PageBulkSnapshot): Promise<void> {
     if (this.deps.pageBulkScans === undefined) return;
     const store = await this.deps.pageBulkScans.get();
-    await this.deps.pageBulkScans.set(withPageBulkSnapshot(store, snapshot));
+    await this.deps.pageBulkScans.set(withPageBulkSnapshot(store, this.sanitizePageBulkSnapshot(snapshot)));
+  }
+
+  private async savePdfGrabSnapshotState(scanID: string, grabID: string, state: string, detail?: string): Promise<void> {
+    if (this.deps.pageBulkScans === undefined || scanID === "") return;
+    const store = await this.deps.pageBulkScans.get();
+    const snapshot = store.byId[scanID];
+    if (snapshot === undefined) return;
+    const items = snapshot.items.map((item) => {
+      if (item.kind !== "pdf_grab") return item;
+      const { url: _url, ...safeItem } = item;
+      return { ...safeItem, grab_id: grabID, grab_state: state, ...(detail !== undefined ? { grab_detail: detail } : {}) } as typeof item;
+    });
+    await this.deps.pageBulkScans.set(withPageBulkSnapshot(store, this.sanitizePageBulkSnapshot({ ...snapshot, items })));
   }
 
   /** Scan tabID's top frame and persist a fresh snapshot (generation 1). The
@@ -3767,7 +3847,7 @@ export class Bridge {
   async runPageBulkScan(tabID: number): Promise<BrokerReply<{ snapshot: PageBulkSnapshotView }>> {
     const meta = await this.pageBulkTabMeta(tabID);
     if (meta === null) {
-      return this.failure("invalid_page", "papio can only scan an ordinary secure (https) page");
+      return failure("invalid_page", "papio can only scan an ordinary secure (https) page");
     }
     const scanned = await this.executePageScan(tabID);
     if (!scanned.ok) return scanned;
@@ -3798,7 +3878,7 @@ export class Bridge {
         active: true,
       });
     } catch {
-      return this.failure("open_failed", "Could not open the selection workspace");
+      return failure("open_failed", "Could not open the selection workspace");
     }
     return { ok: true, scan_id: scanned.snapshot.scanId };
   }
@@ -3809,11 +3889,31 @@ export class Bridge {
   async requestPageBulkRescan(scanID: string): Promise<BrokerReply<{ snapshot: PageBulkSnapshotView }>> {
     const store = await this.loadPageBulkStore();
     const existing = store.byId[scanID];
-    if (existing === undefined) return this.failure("scan_not_found", "This scan is no longer open");
+    if (existing === undefined) return failure("scan_not_found", "This scan is no longer open");
     const meta = await this.pageBulkTabMeta(existing.sourceTabId);
-    if (meta === null) return this.failure("tab_unavailable", "The source tab is no longer available");
+    if (meta === null) return failure("tab_unavailable", "The source tab is no longer available");
     const scanned = await this.executePageScan(existing.sourceTabId);
     if (!scanned.ok) return scanned;
+    const priorGrab = new Map(
+      existing.items
+        .filter((item) => item.kind === "pdf_grab")
+        .map((item) => {
+          const record = item as unknown as Record<string, unknown>;
+          return [item.title ?? item.label ?? "", record] as const;
+        })
+        .filter((entry) => typeof entry[1]["grab_id"] === "string"),
+    );
+    const items = scanned.items.map((item) => {
+      if (item.kind !== "pdf_grab") return item;
+      const prior = priorGrab.get(item.title ?? item.label ?? "");
+      if (prior === undefined) return item;
+      return {
+        ...item,
+        grab_id: prior["grab_id"],
+        ...(typeof prior["grab_state"] === "string" ? { grab_state: prior["grab_state"] } : {}),
+        ...(typeof prior["grab_detail"] === "string" ? { grab_detail: prior["grab_detail"] } : {}),
+      };
+    });
     const snapshot: PageBulkSnapshotView = {
       scanId: scanID,
       sourceTabId: existing.sourceTabId,
@@ -3822,7 +3922,7 @@ export class Bridge {
       pdfGrabAvailable: this.pdfGrabAvailable(),
       scannedAt: new Date().toISOString(),
       documentGeneration: existing.documentGeneration + 1,
-      items: scanned.items,
+      items,
       truncated: scanned.truncated,
       renderedRecordCountHint: scanned.renderedRecordCountHint,
     };
@@ -3841,7 +3941,7 @@ export class Bridge {
   async getPageBulkSnapshot(scanID: string): Promise<BrokerReply<{ snapshot: PageBulkSnapshotView }>> {
     const store = await this.loadPageBulkStore();
     const existing = store.byId[scanID] as PageBulkSnapshotView | undefined;
-    if (existing === undefined) return this.failure("scan_not_found", "This scan is no longer open");
+    if (existing === undefined) return failure("scan_not_found", "This scan is no longer open");
     return { ok: true, snapshot: existing };
   }
   pdfGrabAvailable(): boolean {
@@ -3852,18 +3952,24 @@ export class Bridge {
     );
   }
 
+
+  private notifyPdfGrab(scanID: string, grabID: string, state: string, detail?: string): void {
+    const displayState = durablePdfGrabState(state) ?? state;
+    void this.savePdfGrabSnapshotState(scanID, grabID, displayState, detail).catch(() => {});
+    const send = this.deps.runtimeSendMessage;
+    if (send === undefined) return;
+    void send({ type: "papio.pageBulk.grabState", scan_id: scanID, grab_id: grabID, state: displayState, ...(detail !== undefined ? { detail } : {}) }).catch(() => {});
+  }
   private persistPdfGrabCorrelations(): void {
     if (this.deps.pdfGrabCorrelations === undefined) return;
     void this.deps.pdfGrabCorrelations.set(Object.fromEntries(this.pdfGrabCorrelations.entries())).catch(() => {});
   }
-
-  private notifyPdfGrab(scanID: string, grabID: string, state: string, detail?: string): void {
-    const send = this.deps.runtimeSendMessage;
-    if (send === undefined) return;
-    void send({ type: "papio.pageBulk.grabState", scan_id: scanID, grab_id: grabID, state, ...(detail !== undefined ? { detail } : {}) }).catch(() => {});
-  }
   private async reconcilePdfGrabCorrelations(): Promise<void> {
     for (const [grabID, correlation] of this.pdfGrabCorrelations) {
+      if (correlation.abandonPending === true) {
+        void this.finishAbandon(grabID, correlation);
+        continue;
+      }
       let items: DownloadItemLike[];
       try {
         items = await this.deps.downloads.search({ id: correlation.downloadID });
@@ -3872,48 +3978,78 @@ export class Bridge {
       }
       const item = items[0];
       if (item?.state === "interrupted") {
-        this.notifyPdfGrab(correlation.scanID, grabID, "failed", "The PDF grab download was interrupted");
-        this.pdfGrabCorrelations.delete(grabID);
+        correlation.abandonPending = true;
         this.persistPdfGrabCorrelations();
+        void this.finishAbandon(grabID, correlation);
         continue;
       }
-      if (item?.state === "complete") {
-        // The settled file is authoritative; the sweeper handles completed downloads.
-        continue;
-      }
+      if (item?.state === "complete") continue;
       this.grabDownloads.set(grabID, {
         ids: new Set([correlation.downloadID]),
         tabID: correlation.tabID,
         scanID: correlation.scanID,
-        url: correlation.url,
+        url: item?.url ?? item?.finalUrl ?? "",
         steeringPath: correlation.steeringPath,
       });
     }
   }
 
-  async requestPdfGrab(request: { tab_id: number; url: string; title?: string | undefined; workspace_tab_id?: number | undefined; scan_id?: string | undefined }): Promise<BrokerReply<{ grab_id: string }>> {
-    if (!this.pdfGrabAvailable()) return this.failure("feature_unavailable", "PDF grabbing needs Chrome download steering and a compatible daemon");
+  private async finishAbandon(grabID: string, correlation: PdfGrabCorrelation): Promise<void> {
+    const result = await this.abandonPdfGrab(grabID);
+    if (!result.ok) return;
+    if (result.outcome === "conflict") {
+      this.notifyPdfGrab(correlation.scanID, grabID, result.state, result.detail);
+    } else {
+      this.notifyPdfGrab(correlation.scanID, grabID, "abandoned", "The PDF grab download was interrupted");
+    }
+    this.grabDownloads.delete(grabID);
+    this.pdfGrabCorrelations.delete(grabID);
+    this.persistPdfGrabCorrelations();
+  }
+
+  async requestPdfGrab(request: { tab_id: number; url?: string; title?: string | undefined; workspace_tab_id?: number | undefined; scan_id?: string | undefined }): Promise<BrokerReply<{ grab_id: string }>> {
+    if (!this.pdfGrabAvailable()) return failure("feature_unavailable", "PDF grabbing needs Chrome download steering and a compatible daemon");
+    let requestURL = request.url;
+    if (requestURL === undefined) {
+      try {
+        requestURL = (await this.deps.tabs.get(request.tab_id)).url;
+      } catch {
+        requestURL = undefined;
+      }
+    }
+    if (typeof requestURL !== "string" || requestURL === "") return failure("invalid_request", "Reopen or rescan the PDF tab to grab it");
+    let host: string;
+    try {
+      host = new URL(requestURL).hostname;
+    } catch {
+      return failure("invalid_request", "The PDF tab URL is invalid");
+    }
     const result = await this.requestNative(
       "pdf_grab_request",
-      { url: request.url, ...(request.title !== undefined ? { title: request.title } : {}) },
+      { host, ...(request.title !== undefined ? { title: request.title } : {}) },
       "pdf_grab_result",
       PDF_GRAB_FEATURE,
       true,
     );
     if (result.kind !== "response" || result.payload === undefined) return this.nativeFailure(result);
-    if (result.code !== undefined) return this.failure(result.code, result.message ?? "The PDF grab is unavailable");
+    if (result.code !== undefined) return failure(result.code, result.message ?? "The PDF grab is unavailable");
     const outcome = result.payload["outcome"];
     const grabID = result.payload["grab_id"];
     const steeringPath = result.payload["steering_path"];
+    if (outcome === "existing" && typeof grabID === "string") {
+      const status = await this.requestPdfGrabStatus(grabID);
+      if (status.ok) this.notifyPdfGrab(request.scan_id ?? "", grabID, status.state, status.detail);
+      return { ok: true, grab_id: grabID };
+    }
     if (outcome !== "steering" || typeof grabID !== "string" || typeof steeringPath !== "string") {
-      return this.failure("grab_failed", typeof result.payload["detail"] === "string" ? result.payload["detail"] : "The daemon could not start this PDF grab");
+      return failure("grab_failed", typeof result.payload["detail"] === "string" ? result.payload["detail"] : "The daemon could not start this PDF grab");
     }
     const workspaceTabID = request.workspace_tab_id ?? request.tab_id;
     const scanID = request.scan_id ?? "";
-    this.grabDownloads.set(grabID, { ids: new Set<number>(), tabID: workspaceTabID, scanID, url: request.url, steeringPath });
-    this.pendingGrabDownloadURLs.set(request.url, { grabID, tabID: workspaceTabID, steeringPath });
+    this.grabDownloads.set(grabID, { ids: new Set<number>(), tabID: workspaceTabID, scanID, url: requestURL, steeringPath });
+    this.pendingGrabDownloadURLs.set(requestURL, { grabID, tabID: workspaceTabID, steeringPath });
     try {
-      const id = await this.deps.downloads.download({ url: request.url, conflictAction: "uniquify", saveAs: false });
+      const id = await this.deps.downloads.download({ url: requestURL, conflictAction: "uniquify", saveAs: false });
       const track = this.grabDownloads.get(grabID);
       if (track !== undefined) track.ids.add(id);
       this.pdfGrabCorrelations.set(grabID, {
@@ -3922,7 +4058,6 @@ export class Bridge {
         state: "grabbed",
         downloadID: id,
         steeringPath,
-        url: request.url,
       });
       this.persistPdfGrabCorrelations();
       this.notifyPdfGrab(scanID, grabID, "grabbed");
@@ -3931,13 +4066,67 @@ export class Bridge {
       this.grabDownloads.delete(grabID);
       this.pdfGrabCorrelations.delete(grabID);
       this.persistPdfGrabCorrelations();
-      this.pendingGrabDownloadURLs.delete(request.url);
-      return this.failure("grab_failed", "Could not start the browser download");
+      this.pendingGrabDownloadURLs.delete(requestURL);
+      return failure("grab_failed", "Could not start the browser download");
     } finally {
-      this.pendingGrabDownloadURLs.delete(request.url);
+      this.pendingGrabDownloadURLs.delete(requestURL);
     }
   }
 
+
+  async requestPdfGrabStatus(grabID: string): Promise<BrokerReply<{ grab_id: string; state: string; outcome?: string; detail?: string; job_id?: string }>> {
+    const result = await this.requestNative(
+      "pdf_grab_status_request",
+      { grab_id: grabID },
+      "pdf_grab_status_result",
+      PDF_GRAB_FEATURE,
+      false,
+    );
+    if (result.kind !== "response" || result.payload === undefined) return this.nativeFailure(result);
+    if (result.code !== undefined) return failure(result.code, result.message ?? "The PDF grab status is unavailable");
+    const state = result.payload["state"];
+    const returnedGrabID = result.payload["grab_id"];
+    if (typeof state !== "string" || typeof returnedGrabID !== "string") {
+      return failure("grab_failed", "The daemon returned an invalid PDF grab status");
+    }
+    return {
+      ok: true,
+      grab_id: returnedGrabID,
+      state,
+      ...(typeof result.payload["outcome"] === "string" ? { outcome: result.payload["outcome"] } : {}),
+      ...(typeof result.payload["detail"] === "string" ? { detail: result.payload["detail"] } : {}),
+      ...(typeof result.payload["job_id"] === "string" ? { job_id: result.payload["job_id"] } : {}),
+    };
+  }
+  private async abandonPdfGrab(grabID: string): Promise<BrokerReply<{ grab_id: string; state: string; outcome?: string; detail?: string }>> {
+    const request = this.requestNative(
+      "pdf_grab_abandon_request",
+      { grab_id: grabID },
+      "pdf_grab_abandon_result",
+      PDF_GRAB_FEATURE,
+      true,
+    );
+    const result = await Promise.race([
+      request,
+      new Promise<NativeRequestResult>((resolve) => setTimeout(() => resolve({ kind: "timeout" }), 2000)),
+    ]);
+    if (result.kind !== "response" || result.payload === undefined) {
+      return failure(result.kind === "timeout" ? "connection_timeout" : "transport_error", "The daemon did not acknowledge the PDF grab abandonment");
+    }
+    if (result.code !== undefined) return failure(result.code, result.message ?? "The daemon could not abandon the PDF grab");
+    const state = result.payload["state"];
+    const returnedGrabID = result.payload["grab_id"];
+    if (typeof state !== "string" || typeof returnedGrabID !== "string") {
+      return failure("grab_failed", "The daemon returned an invalid PDF grab abandonment result");
+    }
+    return {
+      ok: true,
+      grab_id: returnedGrabID,
+      state,
+      ...(typeof result.payload["outcome"] === "string" ? { outcome: result.payload["outcome"] } : {}),
+      ...(typeof result.payload["detail"] === "string" ? { detail: result.payload["detail"] } : {}),
+    };
+  }
 
   async requestPageBulkStatus(
     request: { scan_id: string; identifiers: PageBulkIdentifier[]; rendered_record_count_hint?: number },
@@ -3950,11 +4139,11 @@ export class Bridge {
       false,
     );
     if (result.kind !== "response" || result.payload === undefined) return this.nativeFailure(result);
-    if (result.code !== undefined) return this.failure(result.code, result.message ?? "The request is unavailable");
+    if (result.code !== undefined) return failure(result.code, result.message ?? "The request is unavailable");
     const items = result.payload["items"];
     const truncated = result.payload["truncated"];
     if (!Array.isArray(items) || typeof truncated !== "boolean") {
-      return this.failure("invalid_response", "The daemon returned an invalid page-bulk status result");
+      return failure("invalid_response", "The daemon returned an invalid page-bulk status result");
     }
     return { ok: true, items: items as PageBulkStatusItem[], truncated };
   }
@@ -3974,7 +4163,7 @@ export class Bridge {
       true,
     );
     if (result.kind !== "response" || result.payload === undefined) return this.nativeFailure(result);
-    if (result.code !== undefined) return this.failure(result.code, result.message ?? "The request is unavailable");
+    if (result.code !== undefined) return failure(result.code, result.message ?? "The request is unavailable");
     const payload = result.payload;
     const submitted = payload["submitted"];
     const joined = payload["joined"];
@@ -3988,7 +4177,7 @@ export class Bridge {
       typeof invalid !== "number" ||
       typeof batchID !== "string"
     ) {
-      return this.failure("invalid_response", "The daemon returned an invalid page-bulk submit result");
+      return failure("invalid_response", "The daemon returned an invalid page-bulk submit result");
     }
     return { ok: true, submitted, joined, already_owned: alreadyOwned, invalid, batch_id: batchID };
   }
@@ -4021,7 +4210,7 @@ export class Bridge {
       true,
     );
     if (result.kind !== "response" || result.payload === undefined) return this.nativeFailure(result);
-    if (result.code !== undefined) return this.failure(result.code, result.message ?? "The request is unavailable");
+    if (result.code !== undefined) return failure(result.code, result.message ?? "The request is unavailable");
     return {
       ok: true,
       outcome: result.payload["outcome"] as string,
@@ -4040,7 +4229,7 @@ export class Bridge {
       true,
     );
     if (result.kind !== "response" || result.payload === undefined) return this.nativeFailure(result);
-    if (result.code !== undefined) return this.failure(result.code, result.message ?? "The request is unavailable");
+    if (result.code !== undefined) return failure(result.code, result.message ?? "The request is unavailable");
     return {
       ok: true,
       outcome: result.payload["outcome"] as string,
@@ -4065,7 +4254,7 @@ export class Bridge {
       true,
     );
     if (result.kind !== "response" || result.payload === undefined) return this.nativeFailure(result);
-    if (result.code !== undefined) return this.failure(result.code, result.message ?? "The request is unavailable");
+    if (result.code !== undefined) return failure(result.code, result.message ?? "The request is unavailable");
     return {
       ok: true,
       outcome: result.payload["outcome"] as string,
@@ -4084,7 +4273,7 @@ export class Bridge {
       false,
     );
     if (result.kind !== "response" || result.payload === undefined) return this.nativeFailure(result);
-    if (result.code !== undefined) return this.failure(result.code, result.message ?? "The request is unavailable");
+    if (result.code !== undefined) return failure(result.code, result.message ?? "The request is unavailable");
     const outcome = result.payload["outcome"] as string;
     if (outcome === "error") {
       return {
@@ -5666,6 +5855,7 @@ export class Bridge {
       outcome === "job_created" ? "job_created" :
       outcome === "already_owned" ? "already_owned" :
       outcome === "needs_identifier" ? "needs_identifier" :
+      outcome === "abandoned" ? "abandoned" :
       "failed";
     // Terminal pushes are deliberately at-most-once; a reopened workspace reads
     // the fresh snapshot rather than replaying an old outcome.
@@ -7055,18 +7245,43 @@ export class Bridge {
   }
 
   /** Startup validation for federatedLoginOwners, mirroring parked_with_tab's
-   * own restart handling: the map is persisted (session storage, beside
-   * activeJobs) so a restarted worker does not let every parked sibling race
-   * to reclaim a claim a live owner already holds, but the owning job's tab
-   * may have closed while this worker was asleep with no onRemoved to catch
-   * it. Runs after reconcileTabs, so activeJobs.tab_id already reflects any
-   * dead-tab recovery that ran this restart; clearing routes through
-   * clearFederatedLoginOwner, so a dead owner's waiters requeue here too,
-   * not just its own claim disappearing. */
+   * own restart handling. Legacy raw JSON keys are stale by design: remove
+   * them and redrive their waiters through the ownerless path rather than
+   * carrying origin/entity material forward into new storage. */
   private async reconcileFederatedLoginOwners(): Promise<void> {
     const owners = this.store.federatedLoginOwners;
-    if (owners === undefined) return;
-    for (const [claimKey, owner] of Object.entries(owners)) {
+    const legacyClaims = new Set<string>();
+    if (owners !== undefined) {
+      for (const claimKey of Object.keys(owners)) {
+        if (isLegacyFederatedLoginClaimKey(claimKey)) legacyClaims.add(claimKey);
+      }
+      if (legacyClaims.size > 0) {
+        await this.update((s) => {
+          const next = { ...(s.federatedLoginOwners ?? {}) };
+          for (const claimKey of legacyClaims) delete next[claimKey];
+          return { ...s, federatedLoginOwners: next };
+        });
+      }
+    }
+    for (const job of this.store.activeJobs) {
+      const claimKey = job.waiting_for_session_key;
+      if (claimKey !== undefined && isLegacyFederatedLoginClaimKey(claimKey)) legacyClaims.add(claimKey);
+    }
+    for (const claimKey of legacyClaims) await this.resumeWaitingForSessionByClaim(claimKey);
+    await this.update((s) => ({
+      ...s,
+      activeJobs: s.activeJobs.map((job) =>
+        job.tab_id < 0 && job.waiting_for_session_key !== undefined && isLegacyFederatedLoginClaimKey(job.waiting_for_session_key)
+          ? {
+              ...job,
+              waiting_for_session: false,
+              waiting_for_session_key: undefined,
+              waiting_deadline: undefined,
+            }
+          : job,
+      ),
+    }));
+    for (const [claimKey, owner] of Object.entries(this.store.federatedLoginOwners ?? {})) {
       const ownerJob = findByJob(this.store, owner.jobID);
       if (ownerJob === undefined || ownerJob.tab_id !== owner.tabID) {
         await this.clearFederatedLoginOwner(claimKey, owner.jobID);
@@ -7197,9 +7412,7 @@ export class Bridge {
     } catch {
       return;
     }
-    // JSON-encoded pair, not a plain join: entityID is itself a URL and may
-    // contain any separator a hand-picked delimiter could collide with.
-    const claimKey = JSON.stringify([idpOrigin, entityID]);
+    const claimKey = await federatedLoginClaimKey(idpOrigin, entityID);
     const owner = this.store.federatedLoginOwners?.[claimKey];
     if (owner !== undefined && owner.jobID !== jobID) {
       await this.parkHandoffWaitingForSession(jobID, claimKey);
@@ -7692,10 +7905,12 @@ export class Bridge {
       const grab = this.grabDownloads.get(grabID);
       if (grab !== undefined) {
         if (state === "interrupted") {
-          this.notifyPdfGrab(grab.scanID, grabID, "failed", "The PDF grab download was interrupted");
-          this.grabDownloads.delete(grabID);
-          this.pdfGrabCorrelations.delete(grabID);
-          this.persistPdfGrabCorrelations();
+          const correlation = this.pdfGrabCorrelations.get(grabID);
+          if (correlation !== undefined) {
+            correlation.abandonPending = true;
+            this.persistPdfGrabCorrelations();
+            void this.finishAbandon(grabID, correlation);
+          }
           return;
         }
         if (state === "complete") {
@@ -7930,12 +8145,14 @@ type InboxRuntimeReply =
   | BrokerReply<{ counts: Record<string, unknown>; generated_at: string }>
   | BrokerReply<{ outcome: string; detail?: string }>
   | BrokerReply<{ opened: true }>
+  | BrokerReply<{ waiting_jobs: Array<{ job_id: string; deadline?: number }> }>
   | BrokerReply<{ stats: Record<string, unknown> }>
   | BrokerReply<{ feature: boolean; entries: ActivityEntryPayload[] }>
   | BrokerReply<{ state: BridgeSessionState; origins: KeepaliveOriginSnapshot[] }>
   | BrokerReply<{ scan_id: string }>
   | BrokerReply<{ snapshot: PageBulkSnapshot }>
   | BrokerReply<{ items: PageBulkStatusItem[]; truncated: boolean }>
+  | BrokerReply<{ grab_id: string; state: string; outcome?: string; detail?: string; job_id?: string }>
   | BrokerReply<{ submitted: number; joined: number; already_owned: number; invalid: number; batch_id: string }>
   | BrokerReply<{ allowed: boolean }>
   | DeliveryReply;
@@ -8003,19 +8220,17 @@ function isStatsSender(sender: InboxRuntimeSender, urls: InboxRuntimeURLs): bool
     (sender.url === urls.inboxURL || sender.url === urls.popupURL || sender.url === urls.historyURL);
 }
 
-function runtimeFailure(code: string, message: string): BrokerFailure {
-  return { ok: false, error: { code, message } };
-}
-
 function isSnapshotRuntimeRequest(
   value: unknown,
-): value is { schema_versions: [1]; limit?: number; cursor?: string } {
+): value is { schema_versions: [1] | [2] | [3] | [4] | [4, 3]; limit?: number; cursor?: string } {
   if (!isObjectRecord(value) || !hasOnlyKeys(value, ["schema_versions", "limit", "cursor"])) return false;
   const versions = value["schema_versions"];
-  return (
+  const validVersions =
     Array.isArray(versions) &&
-    versions.length === 1 &&
-    versions[0] === 1 &&
+    ((versions.length === 1 && (versions[0] === 1 || versions[0] === 2 || versions[0] === 3 || versions[0] === 4)) ||
+      (versions.length === 2 && versions[0] === 4 && versions[1] === 3));
+  return (
+    validVersions &&
     (value["limit"] === undefined || (isPositiveSafeInteger(value["limit"]) && value["limit"] <= 100)) &&
     (value["cursor"] === undefined || (typeof value["cursor"] === "string" && value["cursor"].length <= 256))
   );
@@ -8088,6 +8303,16 @@ function isDeliveryReconcileRuntimeRequest(
   return providerReference === undefined;
 }
 
+function isPageBulkGrabStatusRuntimeRequest(value: unknown): value is { grab_id: string } {
+  return (
+    isObjectRecord(value) &&
+    hasOnlyKeys(value, ["grab_id"]) &&
+    typeof value["grab_id"] === "string" &&
+    value["grab_id"].length > 0 &&
+    value["grab_id"].length <= 128
+  );
+}
+
 function isPageBulkScanRuntimeRequest(value: unknown): value is { tab_id: number } {
   return (
     isObjectRecord(value) &&
@@ -8108,17 +8333,15 @@ function isPageBulkRescanRuntimeRequest(value: unknown): value is { scan_id: str
   );
 }
 
-function isPageBulkGrabRuntimeRequest(value: unknown): value is { tab_id: number; url: string; title?: string; scan_id?: string } {
+function isPageBulkGrabRuntimeRequest(value: unknown): value is { tab_id: number; url?: string; title?: string; scan_id?: string } {
   if (!isObjectRecord(value) || !hasOnlyKeys(value, ["tab_id", "url", "title", "scan_id"])) return false;
   const scanID = value["scan_id"];
   if (scanID !== undefined && (typeof scanID !== "string" || scanID.length === 0 || scanID.length > 128)) return false;
+  if (value["url"] !== undefined && (typeof value["url"] !== "string" || !value["url"].startsWith("https://") || value["url"].length > 4000)) return false;
   return (
     typeof value["tab_id"] === "number" &&
     Number.isSafeInteger(value["tab_id"]) &&
     value["tab_id"] >= 0 &&
-    typeof value["url"] === "string" &&
-    value["url"].startsWith("https://") &&
-    value["url"].length <= 4000 &&
     (value["title"] === undefined || typeof value["title"] === "string")
   );
 }
@@ -8256,11 +8479,11 @@ export async function handleInboxRuntimeMessage(
   const type = message["type"];
   if (type === "papio.page_capture") {
     if (sender.id !== urls.runtimeID || sender.url !== urls.popupURL) {
-      return runtimeFailure("unauthorized", "This sender cannot send page captures");
+      return failure("unauthorized", "This sender cannot send page captures");
     }
     const capturePayload = message["payload"];
     if (!hasOnlyKeys(message, ["type", "payload"]) || !isPageCaptureRuntimeRequest(capturePayload)) {
-      return runtimeFailure("invalid_request", "Invalid page capture request");
+      return failure("invalid_request", "Invalid page capture request");
     }
     if (!bridge.pageCaptureAvailable()) return { captured: true };
     // A refusal here is not a routine "diagnostic panel is closed" state:
@@ -8272,62 +8495,60 @@ export async function handleInboxRuntimeMessage(
     // sent the operator hunting a daemon-side storage bug that does not
     // exist, when the real fix is upgrading the stale daemon.
     if (capturePayload.scenario === "terms" && !bridge.termsCaptureAvailable()) {
-      return runtimeFailure(
-        "capture_failed",
-        "The connected daemon does not support terms captures; upgrade the daemon to send this scenario",
-      );
+      return failure("capture_failed",
+      "The connected daemon does not support terms captures; upgrade the daemon to send this scenario",);
     }
     return bridge.sendPageCapture(capturePayload)
       ? { captured: true }
-      : runtimeFailure("capture_failed", "Could not send page capture");
+      : failure("capture_failed", "Could not send page capture");
   }
   if (type === "papio.openInbox") {
-    if (!isInboxOrPopupSender(sender, urls)) return runtimeFailure("unauthorized", "This sender cannot open the inbox");
-    if (!hasOnlyKeys(message, ["type"])) return runtimeFailure("invalid_request", "Invalid inbox open request");
+    if (!isInboxOrPopupSender(sender, urls)) return failure("unauthorized", "This sender cannot open the inbox");
+    if (!hasOnlyKeys(message, ["type"])) return failure("invalid_request", "Invalid inbox open request");
     try {
       await bridge.openInbox(urls.inboxURL);
       return { opened: true };
     } catch {
-      return runtimeFailure("open_failed", "Could not open the inbox");
+      return failure("open_failed", "Could not open the inbox");
     }
   }
   if (type === "papio.stats") {
-    if (!isStatsSender(sender, urls)) return runtimeFailure("unauthorized", "This sender cannot access papio stats");
-    if (!hasOnlyKeys(message, ["type", "request"])) return runtimeFailure("invalid_request", "Invalid stats request");
+    if (!isStatsSender(sender, urls)) return failure("unauthorized", "This sender cannot access papio stats");
+    if (!hasOnlyKeys(message, ["type", "request"])) return failure("invalid_request", "Invalid stats request");
     return isCountsRuntimeRequest(message["request"])
       ? bridge.requestStats()
-      : runtimeFailure("invalid_request", "Invalid stats request");
+      : failure("invalid_request", "Invalid stats request");
   }
   if (type === "papio.handoff.open") {
     if (!isInboxOrPopupSender(sender, urls)) {
-      return runtimeFailure("unauthorized", "This sender cannot access the inbox broker");
+      return failure("unauthorized", "This sender cannot access the inbox broker");
     }
     if (!hasOnlyKeys(message, ["type", "request"])) {
-      return runtimeFailure("invalid_request", "Invalid handoff open request");
+      return failure("invalid_request", "Invalid handoff open request");
     }
     return isHandoffOpenRuntimeRequest(message["request"])
       ? bridge.openHandoff(message["request"].job_id)
-      : runtimeFailure("invalid_request", "Invalid handoff open request");
+      : failure("invalid_request", "Invalid handoff open request");
   }
   if (type === "papio.delivery.start") {
     if (!isInboxOrPopupSender(sender, urls)) {
-      return runtimeFailure("unauthorized", "This sender cannot start PDF delivery");
+      return failure("unauthorized", "This sender cannot start PDF delivery");
     }
     if (!hasOnlyKeys(message, ["type", "request"]) || !isDeliveryStartRuntimeRequest(message["request"])) {
-      return runtimeFailure("invalid_request", "Invalid PDF delivery request");
+      return failure("invalid_request", "Invalid PDF delivery request");
     }
     return bridge.startPDFDelivery(message["request"]);
   }
   if (type === "papio.delivery.state") {
     if (!isInboxOrPopupSender(sender, urls)) {
-      return runtimeFailure("unauthorized", "This sender cannot read PDF delivery state");
+      return failure("unauthorized", "This sender cannot read PDF delivery state");
     }
-    if (!hasOnlyKeys(message, ["type"])) return runtimeFailure("invalid_request", "Invalid PDF delivery state request");
+    if (!hasOnlyKeys(message, ["type"])) return failure("invalid_request", "Invalid PDF delivery state request");
     return bridge.deliveryState();
   }
   if (type === "papio.session.state") {
-    if (!isPopupSender(sender, urls)) return runtimeFailure("unauthorized", "This sender cannot access institution session state");
-    if (!hasOnlyKeys(message, ["type"])) return runtimeFailure("invalid_request", "Invalid institution session request");
+    if (!isPopupSender(sender, urls)) return failure("unauthorized", "This sender cannot access institution session state");
+    if (!hasOnlyKeys(message, ["type"])) return failure("invalid_request", "Invalid institution session request");
     return {
       ok: true,
       state: await bridge.sessionStateSnapshot(),
@@ -8335,8 +8556,8 @@ export async function handleInboxRuntimeMessage(
     };
   }
   if (type === "papio.session.probe") {
-    if (!isPopupSender(sender, urls)) return runtimeFailure("unauthorized", "This sender cannot probe institution session state");
-    if (!hasOnlyKeys(message, ["type"])) return runtimeFailure("invalid_request", "Invalid institution session request");
+    if (!isPopupSender(sender, urls)) return failure("unauthorized", "This sender cannot probe institution session state");
+    if (!hasOnlyKeys(message, ["type"])) return failure("invalid_request", "Invalid institution session request");
     return {
       ok: true,
       state: await bridge.sessionStateWithProbe(),
@@ -8344,95 +8565,110 @@ export async function handleInboxRuntimeMessage(
     };
   }
   if (type === "papio.session.signin") {
-    if (!isPopupSender(sender, urls)) return runtimeFailure("unauthorized", "This sender cannot control institution sign-in");
-    if (!hasOnlyKeys(message, ["type", "origin"])) return runtimeFailure("invalid_request", "Invalid institution sign-in request");
+    if (!isPopupSender(sender, urls)) return failure("unauthorized", "This sender cannot control institution sign-in");
+    if (!hasOnlyKeys(message, ["type", "origin"])) return failure("invalid_request", "Invalid institution sign-in request");
     const origin = message["origin"];
     if (origin === undefined) return bridge.requestSessionSignIn();
-    if (!isBareHTTPSOrigin(origin)) return runtimeFailure("invalid_request", "Invalid institution sign-in request");
+    if (!isBareHTTPSOrigin(origin)) return failure("invalid_request", "Invalid institution sign-in request");
     return bridge.requestSessionSignIn(origin);
   }
   if (type === "papio.session.retry") {
-    if (!isPopupSender(sender, urls)) return runtimeFailure("unauthorized", "This sender cannot retry institution handoffs");
+    if (!isPopupSender(sender, urls)) return failure("unauthorized", "This sender cannot retry institution handoffs");
     if (!hasOnlyKeys(message, ["type", "request"]) || !isSessionRetryRuntimeRequest(message["request"])) {
-      return runtimeFailure("invalid_request", "Invalid institution handoff retry request");
+      return failure("invalid_request", "Invalid institution handoff retry request");
     }
     return bridge.retryAuthStalled(message["request"].job_id);
   }
   if (type === "papio.pageBulk.load") {
     if (!isPageBulkSender(sender, urls)) {
-      return runtimeFailure("unauthorized", "This sender cannot load a page-bulk scan");
+      return failure("unauthorized", "This sender cannot load a page-bulk scan");
     }
     const request = message["request"];
     // Same { scan_id } shape as papio.pageBulk.rescan — a plain read of the
     // already-open workspace's snapshot, never a re-scan.
     if (!hasOnlyKeys(message, ["type", "request"]) || !isPageBulkRescanRuntimeRequest(request)) {
-      return runtimeFailure("invalid_request", "Invalid page-bulk load request");
+      return failure("invalid_request", "Invalid page-bulk load request");
     }
     return bridge.getPageBulkSnapshot(request.scan_id);
   }
   if (type === "papio.pageBulk.scan") {
-    if (!isPopupSender(sender, urls)) return runtimeFailure("unauthorized", "This sender cannot start a page scan");
+    if (!isPopupSender(sender, urls)) return failure("unauthorized", "This sender cannot start a page scan");
     const request = message["request"];
     if (!hasOnlyKeys(message, ["type", "request"]) || !isPageBulkScanRuntimeRequest(request)) {
-      return runtimeFailure("invalid_request", "Invalid page scan request");
+      return failure("invalid_request", "Invalid page scan request");
     }
     return bridge.startPageBulkScan(request.tab_id, urls.pageBulkURL);
   }
   if (type === "papio.pageBulk.rescan") {
-    if (!isPageBulkSender(sender, urls)) return runtimeFailure("unauthorized", "This sender cannot rescan a page");
+    if (!isPageBulkSender(sender, urls)) return failure("unauthorized", "This sender cannot rescan a page");
     const request = message["request"];
     if (!hasOnlyKeys(message, ["type", "request"]) || !isPageBulkRescanRuntimeRequest(request)) {
-      return runtimeFailure("invalid_request", "Invalid rescan request");
+      return failure("invalid_request", "Invalid rescan request");
     }
     return bridge.requestPageBulkRescan(request.scan_id);
   }
   if (type === "papio.pageBulk.status") {
     if (!isPageBulkSender(sender, urls)) {
-      return runtimeFailure("unauthorized", "This sender cannot look up page-bulk status");
+      return failure("unauthorized", "This sender cannot look up page-bulk status");
     }
     const request = message["request"];
     if (!hasOnlyKeys(message, ["type", "request"]) || !isPageBulkStatusRuntimeRequest(request)) {
-      return runtimeFailure("invalid_request", "Invalid page-bulk status request");
+      return failure("invalid_request", "Invalid page-bulk status request");
     }
     return bridge.requestPageBulkStatus(request);
   }
   if (type === "papio.pageBulk.submit") {
     if (!isPageBulkSender(sender, urls)) {
-      return runtimeFailure("unauthorized", "This sender cannot submit a page-bulk batch");
+      return failure("unauthorized", "This sender cannot submit a page-bulk batch");
     }
     const request = message["request"];
     if (!hasOnlyKeys(message, ["type", "request"]) || !isPageBulkSubmitRuntimeRequest(request)) {
-      return runtimeFailure("invalid_request", "Invalid page-bulk submit request");
+      return failure("invalid_request", "Invalid page-bulk submit request");
     }
     return bridge.requestPageBulkSubmit(request);
   }
   if (type === "papio.pageBulk.allowlist.get") {
     if (!isPageBulkSender(sender, urls)) {
-      return runtimeFailure("unauthorized", "This sender cannot read the scanner allowlist");
+      return failure("unauthorized", "This sender cannot read the scanner allowlist");
     }
     const request = message["request"];
     if (!hasOnlyKeys(message, ["type", "request"]) || !isPageBulkAllowlistGetRuntimeRequest(request)) {
-      return runtimeFailure("invalid_request", "Invalid scanner allowlist request");
+      return failure("invalid_request", "Invalid scanner allowlist request");
     }
     return bridge.pageBulkAllowlistContains(request.origin);
   }
   if (type === "papio.pageBulk.allowlist.set") {
     if (!isPageBulkSender(sender, urls)) {
-      return runtimeFailure("unauthorized", "This sender cannot change the scanner allowlist");
+      return failure("unauthorized", "This sender cannot change the scanner allowlist");
     }
     const request = message["request"];
     if (!hasOnlyKeys(message, ["type", "request"]) || !isPageBulkAllowlistSetRuntimeRequest(request)) {
-      return runtimeFailure("invalid_request", "Invalid scanner allowlist request");
+      return failure("invalid_request", "Invalid scanner allowlist request");
     }
     return bridge.setPageBulkAllowlist(request.origin, request.allowed);
   }
   if (type === "papio.pageBulk.grabPdf") {
-    if (!isPageBulkSender(sender, urls)) return runtimeFailure("unauthorized", "This sender cannot grab a PDF");
+    if (!isPageBulkSender(sender, urls)) return failure("unauthorized", "This sender cannot grab a PDF");
     const request = message["request"];
     if (!hasOnlyKeys(message, ["type", "request"]) || !isPageBulkGrabRuntimeRequest(request)) {
-      return runtimeFailure("invalid_request", "Invalid PDF grab request");
+      return failure("invalid_request", "Invalid PDF grab request");
     }
     return bridge.requestPdfGrab({ ...request, workspace_tab_id: sender.tab?.id });
+  }
+  if (type === "papio.pageBulk.grabStatus") {
+    if (!isPageBulkSender(sender, urls)) return failure("unauthorized", "This sender cannot read PDF grab status");
+    const request = message["request"];
+    if (!hasOnlyKeys(message, ["type", "request"]) || !isPageBulkGrabStatusRuntimeRequest(request)) {
+      return failure("invalid_request", "Invalid PDF grab status request");
+    }
+    return bridge.requestPdfGrabStatus(request.grab_id);
+  }
+  if (type === "papio.triage.waiting") {
+    if (!isInboxSender(sender, urls)) return failure("unauthorized", "This sender cannot access local inbox state");
+    if (!hasOnlyKeys(message, ["type", "request"]) || !isCountsRuntimeRequest(message["request"])) {
+      return failure("invalid_request", "Invalid local inbox state request");
+    }
+    return { ok: true, waiting_jobs: await bridge.waitingSessionJobsSnapshot() };
   }
   if (
     type !== "papio.activity" &&
@@ -8448,41 +8684,41 @@ export async function handleInboxRuntimeMessage(
   const senderAuthorized =
     type === "papio.activity" ? isInboxOrPopupSender(sender, urls) : isInboxSender(sender, urls);
   if (!senderAuthorized) {
-    return runtimeFailure("unauthorized", "This sender cannot access the inbox broker");
+    return failure("unauthorized", "This sender cannot access the inbox broker");
   }
   if (!hasOnlyKeys(message, ["type", "request"])) {
-    return runtimeFailure("invalid_request", "Invalid inbox broker request");
+    return failure("invalid_request", "Invalid inbox broker request");
   }
   const request = message["request"];
   switch (type) {
     case "papio.activity":
       return isActivityRuntimeRequest(request)
         ? bridge.requestActivity(request.limit)
-        : runtimeFailure("invalid_request", "Invalid activity request");
+        : failure("invalid_request", "Invalid activity request");
     case "papio.triage.snapshot":
       return isSnapshotRuntimeRequest(request)
         ? bridge.requestTriageSnapshot(request)
-        : runtimeFailure("invalid_request", "Invalid triage snapshot request");
+        : failure("invalid_request", "Invalid triage snapshot request");
     case "papio.triage.counts":
       return isCountsRuntimeRequest(request)
         ? bridge.requestTriageCounts()
-        : runtimeFailure("invalid_request", "Invalid triage counts request");
+        : failure("invalid_request", "Invalid triage counts request");
     case "papio.triage.decide":
       return isDecisionRuntimeRequest(request)
         ? bridge.requestTriageDecision(request)
-        : runtimeFailure("invalid_request", "Invalid triage decision request");
+        : failure("invalid_request", "Invalid triage decision request");
     case "papio.action.resolve":
       return isResolveRuntimeRequest(request)
         ? bridge.requestActionResolve(request)
-        : runtimeFailure("invalid_request", "Invalid action resolution request");
+        : failure("invalid_request", "Invalid action resolution request");
     case "papio.delivery.reconcile":
       return isDeliveryReconcileRuntimeRequest(request)
         ? bridge.requestDeliveryReconcile(request)
-        : runtimeFailure("invalid_request", "Invalid delivery reconciliation request");
+        : failure("invalid_request", "Invalid delivery reconciliation request");
     case "papio.preview":
       return isPreviewRuntimeRequest(request)
         ? bridge.requestPreview(request)
-        : runtimeFailure("invalid_request", "Invalid preview request");
+        : failure("invalid_request", "Invalid preview request");
     default:
       return undefined;
   }

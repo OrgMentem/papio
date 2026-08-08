@@ -13,6 +13,15 @@ type HumanActionNextStep struct {
 	Instruction                string
 }
 
+// actionGuidanceDefaultOK records ActionKind values whose next step is
+// intentionally the ordinary fallback below: no kind-specific command or
+// instruction is available. Adding an ActionKind requires an explicit
+// disposition here or a case in HumanActionNextStepFor.
+var actionGuidanceDefaultOK = map[string]struct{}{
+	job.ActionKindDocumentDelivery:        {},
+	job.ActionKindDownloadsAccessRequired: {},
+}
+
 // HumanActionNextStepFor is the one authority for the next step implied by a
 // human action's Kind and RequiresAuth fields. Every surface with the current
 // action must use it, so a replacement action cannot inherit a command from
@@ -26,6 +35,12 @@ func HumanActionNextStepFor(action job.HumanAction) HumanActionNextStep {
 		next.Command = actionsOpenCommand
 	case "manual_download":
 		next.Instruction = "download the PDF yourself — papio will adopt it"
+	default:
+		if _, ok := actionGuidanceDefaultOK[action.Kind]; !ok {
+			// Unknown kinds retain the conservative fallback until the
+			// disposition coverage test forces an explicit entry.
+			return next
+		}
 	}
 	return next
 }

@@ -1,6 +1,11 @@
-# *papio*
+---
+template: home.html
+hide:
+  - navigation
+  - toc
+---
 
-**A local tool that finds scholarly papers and offers validated PDFs toward your reference library.** Search for works, queue them for acquisition, check every PDF is the paper you asked for, and offer it toward your library — from the terminal or from a coding agent.
+Search for works, queue them for acquisition, check every PDF is the paper you asked for, and offer it toward your library — from the terminal or from a coding agent.
 
 Zotero users get preview-first import through [zotio](https://github.com/OrgMentem/zotio). Users of papis, Calibre, plain folders, or custom scripts get a best-effort handoff through a one-line [`on_ready` hook](guide/hooks.md); hook failures never fail or retry the acquisition job.
 

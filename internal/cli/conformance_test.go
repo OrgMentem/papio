@@ -109,6 +109,8 @@ var commandClassification = map[string]commandClass{
 	"papio export watch":               {kind: kindStructured, args: []string{"1", "-o", "/tmp/papio-conformance-export.json"}, rpcMethods: []string{"watch.digest"}},
 	"papio export ledger":              {kind: kindStructured, args: []string{"-o", "/tmp/papio-conformance-export.json"}, rpcMethods: []string{"jobs.list_v3", "jobs.list_v2", "jobs.list"}},
 	"papio jobs":                       {kind: kindNone},
+	"papio grabs":                      {kind: kindNone},
+	"papio grabs identify":             {kind: kindStructured, args: []string{"grab_01", "--doi", "10.1000/conformance"}, rpcMethods: []string{"grabs.identify"}},
 	"papio activity":                   {kind: kindEnvelope, rowKey: "entries", rpcMethods: []string{"activity.list"}},
 	"papio failures":                   {kind: kindEnvelope, rowKey: "failures", rpcMethods: []string{"failures.list_v1"}},
 	"papio jobs list":                  {kind: kindEnvelope, rowKey: "jobs", rpcMethods: []string{"jobs.list_v3", "jobs.list_v2", "jobs.list"}},

@@ -34,17 +34,28 @@ const (
 	retractionRankBase  = 0
 	humanActionRankBase = 1_000_000
 	watchHitRankBase    = 2_000_000
+	pdfGrabRankBase     = 3_000_000
 )
 
 const (
 	KindWatchHit    = "watch_hit"
 	KindHumanAction = "human_action"
 	KindRetraction  = "retraction"
+	KindPdfGrab     = "pdf_grab"
+	PdfGrabIDPrefix = KindPdfGrab + ":"
 
 	// RetractionIDPrefix opens the item ID of every retraction notice; the rest
 	// of the ID is the normalized DOI of the work the notice concerns.
 	RetractionIDPrefix = KindRetraction + ":"
 )
+
+// PdfGrab carries the durable pre-identity grab state. It deliberately has no
+// job or action identity: a canonical job is created only after an identifier
+// is supplied.
+type PdfGrab struct {
+	GrabID string `json:"grab_id"`
+	State  string `json:"state"`
+}
 
 // Fact is bounded display-only metadata for an inbox item.
 type Fact struct {
@@ -109,7 +120,8 @@ type Retraction struct {
 }
 
 // Item is a schema-v1 inbox item. Exactly one kind-specific field is set for
-// each supported Kind.
+// each supported Kind. PdfGrab is emitted only when the browser negotiates
+// triage-snapshot/4.
 type Item struct {
 	Kind  string   `json:"kind"`
 	ID    string   `json:"id"`
@@ -122,10 +134,23 @@ type Item struct {
 	WatchHit    *WatchHit    `json:"-"`
 	HumanAction *HumanAction `json:"-"`
 	Retraction  *Retraction  `json:"-"`
+	PdfGrab     *PdfGrab     `json:"-"`
 }
 
 // MarshalJSON emits exactly one supported kind-specific object.
 func (item Item) MarshalJSON() ([]byte, error) {
+	if item.Kind == KindPdfGrab {
+		return json.Marshal(struct {
+			Kind       string   `json:"kind"`
+			Label      string   `json:"label"`
+			Grab       *PdfGrab `json:"grab"`
+			RouteClass string   `json:"route_class"`
+			BlockedBy  string   `json:"blocked_by"`
+			Attention  string   `json:"attention"`
+			Ops        []string `json:"ops"`
+		}{item.Kind, item.Title, item.PdfGrab, "pdf_identifier_needed", "identifier_missing", "required", item.Ops})
+	}
+
 	type core struct {
 		Kind  string   `json:"kind"`
 		ID    string   `json:"id"`
@@ -152,13 +177,17 @@ func (item Item) MarshalJSON() ([]byte, error) {
 // closed rather than silently misrender a newer schema.
 func (item *Item) UnmarshalJSON(data []byte) error {
 	var wire struct {
-		Kind  string   `json:"kind"`
-		ID    string   `json:"id"`
-		Rank  int      `json:"rank"`
-		Title string   `json:"title"`
-		Facts []Fact   `json:"facts"`
-		Links []Link   `json:"links"`
-		Ops   []string `json:"ops"`
+		Kind       string   `json:"kind"`
+		ID         string   `json:"id"`
+		Rank       int      `json:"rank"`
+		Title      string   `json:"title"`
+		Facts      []Fact   `json:"facts"`
+		Links      []Link   `json:"links"`
+		Ops        []string `json:"ops"`
+		Label      string   `json:"label"`
+		Grab       *PdfGrab `json:"grab"`
+		RouteClass string   `json:"route_class"`
+		Attention  string   `json:"attention"`
 
 		Work        *Work   `json:"work"`
 		Abstract    string  `json:"abstract"`
@@ -190,6 +219,16 @@ func (item *Item) UnmarshalJSON(data []byte) error {
 		return errors.New("triage item has trailing data")
 	}
 	*item = Item{Kind: wire.Kind, ID: wire.ID, Rank: wire.Rank, Title: wire.Title, Facts: wire.Facts, Links: wire.Links, Ops: wire.Ops}
+	if wire.Kind == KindPdfGrab {
+		if wire.Label == "" || wire.Grab == nil || wire.Grab.GrabID == "" || wire.Grab.State == "" ||
+			wire.RouteClass != "pdf_identifier_needed" || wire.BlockedBy != "identifier_missing" ||
+			wire.Attention != "required" || len(wire.Ops) != 2 || wire.Ops[0] != "provide_identifier" || wire.Ops[1] != "dismiss" {
+			return errors.New("invalid pdf grab item")
+		}
+		item.Title = wire.Label
+		item.PdfGrab = wire.Grab
+		return nil
+	}
 	switch wire.Kind {
 	case KindWatchHit:
 		if wire.Work == nil || len(wire.Watches) == 0 || wire.FirstSeenAt == "" {
@@ -229,9 +268,12 @@ type Counts struct {
 }
 
 // SnapshotRequest controls a bounded view into a complete snapshot ordering.
+// Schema is the negotiated browser snapshot schema; legacy schemas exclude
+// grab-backed items before pagination so they never consume page slots.
 type SnapshotRequest struct {
 	Limit  int    `json:"limit,omitempty"`
 	Cursor string `json:"cursor,omitempty"`
+	Schema int    `json:"schema,omitempty"`
 }
 
 // Snapshot is the frozen triage snapshot schema v1 envelope.
@@ -314,13 +356,22 @@ func (s *Service) AcknowledgeRetraction(ctx context.Context, itemID string) (boo
 
 // Snapshot returns one bounded page of a transactionally consistent inbox.
 func (s *Service) Snapshot(ctx context.Context, request SnapshotRequest) (Snapshot, error) {
-	all, counts, unsupported, generatedAt, err := s.collect(ctx)
+	all, counts, unsupported, generatedAt, err := s.collect(ctx, request.Schema)
 	if err != nil {
 		return Snapshot{}, err
 	}
 	limit, offset, err := parsePage(request)
 	if err != nil {
 		return Snapshot{}, err
+	}
+	if request.Schema > 0 && request.Schema < 4 {
+		legacy := all[:0]
+		for _, item := range all {
+			if item.Kind != KindPdfGrab {
+				legacy = append(legacy, item)
+			}
+		}
+		all = legacy
 	}
 	if offset > len(all) {
 		return Snapshot{}, errors.New("triage cursor is beyond the snapshot")
@@ -345,8 +396,8 @@ func (s *Service) Snapshot(ctx context.Context, request SnapshotRequest) (Snapsh
 
 // Counts returns a complete count envelope from the same data model as
 // Snapshot. It intentionally does not expose a cursor or partial item list.
-func (s *Service) Counts(ctx context.Context) (Counts, error) {
-	_, counts, _, _, err := s.collect(ctx)
+func (s *Service) Counts(ctx context.Context, schema ...int) (Counts, error) {
+	_, counts, _, _, err := s.collect(ctx, schema...)
 	return counts, err
 }
 
@@ -566,7 +617,7 @@ func encodeCursor(offset int) string {
 	return base64.RawURLEncoding.EncodeToString(encoded)
 }
 
-func (s *Service) collect(ctx context.Context) ([]Item, Counts, int, string, error) {
+func (s *Service) collect(ctx context.Context, schema ...int) ([]Item, Counts, int, string, error) {
 	if s == nil || s.Store == nil || s.Watches == nil || s.Jobs == nil {
 		return nil, Counts{}, 0, "", errors.New("triage service is not configured")
 	}
@@ -593,6 +644,7 @@ func (s *Service) collect(ctx context.Context) ([]Item, Counts, int, string, err
 	sources := append([]ItemSource(nil), s.sources...)
 	s.mu.RUnlock()
 	retractionItems := make([]Item, 0)
+	pdfGrabItems := make([]Item, 0)
 	unsupported := 0
 	for _, source := range sources {
 		items, err := source.SnapshotItems(ctx, tx)
@@ -606,6 +658,11 @@ func (s *Service) collect(ctx context.Context) ([]Item, Counts, int, string, err
 					return nil, Counts{}, 0, "", err
 				}
 				retractionItems = append(retractionItems, item)
+			case KindPdfGrab:
+				if item.PdfGrab == nil || item.PdfGrab.GrabID == "" || item.PdfGrab.State == "" || item.Title == "" {
+					return nil, Counts{}, 0, "", errors.New("invalid pending pdf grab item")
+				}
+				pdfGrabItems = append(pdfGrabItems, item)
 			default:
 				unsupported++
 			}
@@ -613,12 +670,17 @@ func (s *Service) collect(ctx context.Context) ([]Item, Counts, int, string, err
 	}
 	counts.Retractions = len(retractionItems)
 	counts.PendingTotal = counts.WatchHits + counts.Actions + counts.Retractions
+	if len(schema) > 0 && schema[0] >= 4 {
+		counts.PendingTotal += len(pdfGrabItems)
+	}
 
 	assignRanks(retractionItems, retractionRankBase)
+	assignRanks(pdfGrabItems, pdfGrabRankBase)
 	assignRanks(actionItems, humanActionRankBase)
 	assignRanks(watchItems, watchHitRankBase)
-	items := make([]Item, 0, len(retractionItems)+len(actionItems)+len(watchItems))
+	items := make([]Item, 0, len(retractionItems)+len(pdfGrabItems)+len(actionItems)+len(watchItems))
 	items = append(items, retractionItems...)
+	items = append(items, pdfGrabItems...)
 	items = append(items, actionItems...)
 	items = append(items, watchItems...)
 	if err := tx.Commit(); err != nil {

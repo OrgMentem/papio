@@ -1,0 +1,1 @@
+{"protocol":"papio-browser/1","type":"pdf_grab_status_result","msg_id":"pdf-grab-status-result-001","seq":23,"payload":{"request_id":"pdf-grab-status-frame","grab_id":"grab_0123456789abcdef01234567","state":"parked_no_identifier","outcome":"needs_identifier"}}

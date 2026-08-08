@@ -1,1 +1,1 @@
-{"protocol":"papio-browser/1","type":"pdf_grab_request","msg_id":"pdf-grab-request-001","seq":20,"payload":{"request_id":"pdf-grab-request-frame","url":"https://pdf.example.org/main.pdf","title":"A Paper Worth Grabbing"}}
+{"protocol":"papio-browser/1","type":"pdf_grab_request","msg_id":"pdf-grab-request-001","seq":20,"payload":{"request_id":"pdf-grab-request-frame","host":"pdf.example.org","title":"A Paper Worth Grabbing"}}

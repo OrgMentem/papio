@@ -1,0 +1,1 @@
+{"protocol":"papio-browser/1","type":"pdf_grab_abandon_request","msg_id":"pdf-grab-abandon-001","seq":24,"payload":{"request_id":"pdf-grab-request-001","grab_id":"grab_0123456789abcdef01234567"}}

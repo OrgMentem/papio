@@ -1,0 +1,69 @@
+{#-
+  Landing-page template: a full-width hero under the tab bar, holding the
+  animated wordmark and the positioning copy.
+
+  Both engines this repo builds with — Zensical (MiniJinja) and Material for
+  MkDocs (Jinja) — ship the same `base.html` block layout, so extending
+  `main.html` and wrapping the `tabs` block works unchanged on either. The
+  hero goes after `super()` (not in the earlier `hero` block) so the colored
+  tab bar stays flush under the header, as on every other page.
+
+  The mark is shipped as two files differing only in ink color; the palette
+  toggle is handled in extra.css, because the SVG is loaded via <img> and site
+  CSS cannot reach inside it. The SVG carries its own `prefers-reduced-motion`
+  static frame.
+-#}
+{% extends "main.html" %}
+
+{% block tabs %}
+  {{ super() }}
+  <section class="mdx-hero">
+    <div class="mdx-hero__inner md-grid md-typeset">
+      <div class="mdx-hero__mark">
+        <img
+          src="{{ 'assets/logo-wordmark.svg' | url }}#only-light"
+          alt="papio"
+          width="512"
+          height="660"
+        >
+        <img
+          src="{{ 'assets/logo-wordmark-dark.svg' | url }}#only-dark"
+          alt=""
+          width="512"
+          height="660"
+        >
+      </div>
+      <div class="mdx-hero__copy">
+        <h1>Fill the missing PDFs in your reference library</h1>
+        <p>
+          <em>papio</em> searches scholarly works, acquires PDFs from open,
+          licensed, or user-authorized institutional sources, validates every
+          one, and offers it to Zotero through
+          <a href="https://github.com/OrgMentem/zotio">zotio</a> — or to papis,
+          a plain folder, or your own script.
+        </p>
+        <a href="{{ 'guide/getting-started/' | url }}" class="md-button md-button--primary">
+          Get started
+        </a>
+        <a href="{{ 'guide/user-guide/' | url }}" class="md-button">
+          User guide
+        </a>
+      </div>
+    </div>
+  </section>
+{% endblock %}
+
+{#-
+  The hero owns the page's <h1>, so skip the content partial's fallback
+  heading (it injects one whenever the Markdown has none) and render the
+  article body directly. That also drops the edit/source actions, which do
+  not belong on a landing page.
+-#}
+{% block content %}
+  {{ page.content }}
+{% endblock %}
+
+{#- Homepage: the site name alone, not the "Index - papio" filename title. -#}
+{% block htmltitle %}
+  <title>{{ config.site_name }} — fill the missing PDFs in your reference library</title>
+{% endblock %}

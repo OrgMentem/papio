@@ -22,7 +22,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -30,6 +29,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"papio/internal/app"
@@ -69,6 +69,7 @@ const (
 	pageCaptureTermsFeature      = "page_capture_terms_v1"
 	pageBulkAcquireFeature       = "page_bulk_acquire_v1"
 	triageSnapshotSchema3Feature = "triage_snapshot_schema_v3"
+	triageSnapshotSchema4Feature = "triage_snapshot_schema_v4"
 	// pdfGrabV1Feature is ADR-0020's PDF-grab capability flag: it gates both
 	// the pdf_grab_request/pdf_grab_result message pair and, extension-side,
 	// whether the workspace even renders the grab row.
@@ -84,7 +85,10 @@ const (
 	// grabsDirName is the reserved subtree under the adoption root holding
 	// one directory per grab id (SweepTerminalAdoptions's unknown-dir
 	// hygiene must never treat it as a stray job directory).
-	grabsDirName             = "grabs"
+	grabsDirName = "grabs"
+	// staleAwaitingGrabBudget covers daemon downtime and slow links; the
+	// extension's explicit abandon path remains primary.
+	staleAwaitingGrabBudget  = 6 * time.Hour
 	previewCapabilityTTL     = 10 * time.Minute
 	sessionEvidenceThrottle  = 60 * time.Second
 	deliveryContextTTL       = 60 * time.Second
@@ -254,6 +258,9 @@ type Bridge struct {
 	// blocking or error-returning func to exercise adoptionScanSuspended
 	// below without a real TCC-protected filesystem.
 	readDir func(string) ([]os.DirEntry, error)
+	// renameFile is the local-file move seam; nil uses os.Rename. Tests may
+	// force EXDEV to exercise the copy-and-remove fallback.
+	renameFile func(string, string) error
 	// adoptionScanMu guards the field below. It is deliberately its own
 	// lock, never b.mu: a ReadDir call that hangs behind a TCC consent wall
 	// (see scanAdoptionDir) must never hold the session lock, or every other
@@ -310,17 +317,49 @@ const sessionStaleAfter = 10 * time.Second
 // reflects reality.
 const pendingExpireAfter = 5 * time.Minute
 
-// NewBridge constructs the bridge. It is cheap and always constructed; whether
-// any job is ever offered depends on config (extension_id / openurl base).
-// zotioService is nil when zotio is not configured (ADR-0008 exclusivity
-// with holdings) — page_bulk_status then never consults it.
+type parkedGrabItemSource struct {
+	store *store.Store
+}
+
+func (source parkedGrabItemSource) SnapshotItems(ctx context.Context, tx *sql.Tx) ([]triage.Item, error) {
+	rows, err := tx.QueryContext(ctx, `
+		SELECT id, COALESCE(NULLIF(title, ''), url_host), state
+		FROM pdf_grabs
+		WHERE state = 'parked_no_identifier'
+		ORDER BY updated_at ASC, id ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := make([]triage.Item, 0)
+	for rows.Next() {
+		var id, title, state string
+		if err := rows.Scan(&id, &title, &state); err != nil {
+			return nil, err
+		}
+		items = append(items, triage.Item{
+			Kind:  triage.KindPdfGrab,
+			ID:    triage.PdfGrabIDPrefix + id,
+			Title: title,
+			Ops:   []string{"provide_identifier", "dismiss"},
+			PdfGrab: &triage.PdfGrab{
+				GrabID: id, State: state,
+			},
+		})
+	}
+	return items, rows.Err()
+}
+
 func NewBridge(jobs *job.Store, svc *app.Service, triageService *triage.Service, watchRunner *watch.Runner, previewServer *preview.Server, captureStore *captures.Store, holdings holdingsProvider, zotioService *zotio.Service, cfg config.Config, version string) *Bridge {
 	required := []string{
-		pageAcquireFeature, triageSnapshotFeature, triageSnapshotSchema2Feature, triageMutationsFeature, reviewPreviewFeature, statsFeature, pageCaptureFeature, pageCaptureRequestFeature, activityFeedFeature, triageCountsSchema2Feature, sessionEvidenceFeature, deliveryContextFeature, pageCaptureTermsFeature, pageBulkAcquireFeature, triageSnapshotSchema3Feature, pdfGrabV1Feature,
+		pageAcquireFeature, triageSnapshotFeature, triageSnapshotSchema2Feature, triageMutationsFeature, reviewPreviewFeature, statsFeature, pageCaptureFeature, pageCaptureRequestFeature, activityFeedFeature, triageCountsSchema2Feature, sessionEvidenceFeature, deliveryContextFeature, pageCaptureTermsFeature, pageBulkAcquireFeature, triageSnapshotSchema3Feature, triageSnapshotSchema4Feature, pdfGrabV1Feature,
 	}
 	var grabs *grab.Service
 	if jobs != nil {
 		grabs = grab.New(jobs.S, nil)
+		if triageService != nil {
+			triageService.RegisterSource(parkedGrabItemSource{store: jobs.S})
+		}
 	}
 	return &Bridge{
 		jobs: jobs, svc: svc, triage: triageService, watchRunner: watchRunner, preview: previewServer, captureStore: captureStore, holdings: holdings, zotio: zotioService, cfg: cfg,
@@ -759,10 +798,7 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 	if b.holder == nil || b.holder.ID != sessionID {
 		switch msg.Type {
 		case protocol.MsgPageAcquire, protocol.MsgTriageSnapshotRequest, protocol.MsgTriageCountsRequest,
-			protocol.MsgTriageDecide, protocol.MsgHumanActionResolve, protocol.MsgDeliveryReconcileRequest, protocol.MsgReviewPreviewRequest, protocol.MsgStatsRequest, protocol.MsgActivityRequest, protocol.MsgPageCapture,
-			protocol.MsgPageBulkStatusRequest, protocol.MsgPageBulkSubmitRequest, protocol.MsgPdfGrabRequest:
-			// Stateless request/response traffic works from any browser —
-			// even an outdated one; every frame is protocol-validated
+			protocol.MsgPageBulkStatusRequest, protocol.MsgPageBulkSubmitRequest, protocol.MsgPdfGrabRequest, protocol.MsgPdfGrabStatusRequest, protocol.MsgPdfGrabAbandonRequest:
 			// regardless of version. "Acquire this page" and the inbox must
 			// not depend on who holds the handoff flow.
 		default:
@@ -812,6 +848,12 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 
 	case protocol.MsgPdfGrabRequest:
 		return b.pdfGrab(ctx, msg.Payload.(*protocol.PdfGrabRequestPayload))
+
+	case protocol.MsgPdfGrabStatusRequest:
+		return b.pdfGrabStatus(ctx, msg.Payload.(*protocol.PdfGrabStatusRequestPayload))
+
+	case protocol.MsgPdfGrabAbandonRequest:
+		return b.pdfGrabAbandon(ctx, msg.Payload.(*protocol.PdfGrabAbandonRequestPayload))
 
 	case protocol.MsgPageCapture:
 		b.pageCapture(ctx, sessionID, msg.JobID, msg.Payload.(*protocol.PageCapturePayload))
@@ -1109,7 +1151,7 @@ func (b *Bridge) triageSnapshot(ctx context.Context, request *protocol.TriageSna
 		limit = 50
 	}
 	for {
-		snapshot, err := b.triage.Snapshot(ctx, triage.SnapshotRequest{Limit: int(limit), Cursor: request.Cursor})
+		snapshot, err := b.triage.Snapshot(ctx, triage.SnapshotRequest{Limit: int(limit), Cursor: request.Cursor, Schema: int(request.SchemaVersions[0])})
 		if err != nil {
 			return nil, err
 		}
@@ -1159,19 +1201,16 @@ func (b *Bridge) triageSnapshotPayload(ctx context.Context, requestID string, sc
 				}
 				payload.FirstSeenAt = hit.FirstSeenAt
 			}
-			if schema == 3 {
+			if schema >= 3 {
 				// A new watch hit is informational — nothing is blocked, and
 				// papio is not doing anything on the operator's behalf yet.
 				payload.Attention = "advisory"
 			}
 		case triage.KindHumanAction:
 			action := item.HumanAction
-			// INTERIM until triage-snapshot/4 (oracle r6 P0-B): schema 3's
-			// route_class vocabulary is closed and does not include every
-			// action kind — pdf_identifier_needed postdates the rev. An
-			// unrepresentable kind must OMIT the item (it stays fully
-			// visible via `papio actions open` and errcat guidance), never
-			// emit an invalid frame or fail the whole snapshot.
+			// Schema 3's route_class vocabulary is closed. An unrepresentable
+			// action kind must be omitted rather than invalidating the whole
+			// snapshot frame.
 			if action != nil && schema == 3 && !slices.Contains(protocol.TriageRouteClasses(), action.ActionKind) {
 				continue
 			}
@@ -1182,7 +1221,7 @@ func (b *Bridge) triageSnapshotPayload(ctx context.Context, requestID string, sc
 				if schema >= 2 && action.BlockedBy != "" {
 					payload.RequiresAuth, payload.BlockedBy = action.RequiresAuth, action.BlockedBy
 				}
-				if schema == 3 {
+				if schema >= 3 {
 					payload.RouteClass = action.ActionKind
 					payload.AuthRequirement = triageAuthRequirement(action.RequiresAuth)
 					if action.ActionKind == job.ActionKindDocumentDelivery {
@@ -1204,11 +1243,22 @@ func (b *Bridge) triageSnapshotPayload(ctx context.Context, requestID string, sc
 				payload.NoticedAt = retraction.NoticedAt.UTC().Format(time.RFC3339Nano)
 				payload.NoticeDOI = retraction.NoticeDOI
 			}
-			if schema == 3 {
+			if schema >= 3 {
 				// A retraction/correction/concern notice: informational, not
 				// blocking anything (r5's "integrity notice = advisory").
 				payload.Attention = "advisory"
 			}
+		case triage.KindPdfGrab:
+			if schema < 4 || item.PdfGrab == nil {
+				continue
+			}
+			payload.Kind = triage.KindPdfGrab
+			payload.Label = item.Title
+			payload.Grab = &protocol.TriageGrab{GrabID: item.PdfGrab.GrabID, State: item.PdfGrab.State}
+			payload.RouteClass = "pdf_identifier_needed"
+			payload.BlockedBy = "identifier_missing"
+			payload.Attention = "required"
+			payload.Ops = []string{"provide_identifier", "dismiss"}
 		}
 		items = append(items, payload)
 	}
@@ -1314,7 +1364,11 @@ func (b *Bridge) triageCounts(ctx context.Context, request *protocol.TriageCount
 	if b.triage == nil {
 		return b.triageUnavailable(nil)
 	}
-	counts, err := b.triage.Counts(ctx)
+	schema := 0
+	if len(request.SchemaVersions) == 1 {
+		schema = int(request.SchemaVersions[0])
+	}
+	counts, err := b.triage.Counts(ctx, schema)
 	if err != nil {
 		return b.triageUnavailable(err)
 	}
@@ -1474,6 +1528,9 @@ func activityTitle(value string) string {
 }
 
 func (b *Bridge) triageDecide(ctx context.Context, request *protocol.TriageDecidePayload) ([]json.RawMessage, error) {
+	if strings.HasPrefix(request.ItemID, triage.PdfGrabIDPrefix) {
+		return b.dismissPdfGrab(ctx, request)
+	}
 	if b.triage == nil || b.watchRunner == nil {
 		return b.triageDecisionResult(request.RequestID, "error", "triage mutations are not configured")
 	}
@@ -1560,9 +1617,39 @@ func triageDismissScope(raw json.RawMessage, watches []triage.Watch) (map[int64]
 		if !available[id] || selected[id] {
 			return nil, errors.New("watch_scope contains an invalid watch ID")
 		}
+
 		selected[id] = true
 	}
 	return selected, nil
+}
+func (b *Bridge) dismissPdfGrab(ctx context.Context, request *protocol.TriageDecidePayload) ([]json.RawMessage, error) {
+	if request.Op != "dismiss" {
+		return b.triageDecisionResult(request.RequestID, "error", "pdf grabs support only the dismiss operation")
+	}
+	if b.grabs == nil {
+		return b.triageDecisionResult(request.RequestID, "error", "pdf grabs are not configured")
+	}
+	id := strings.TrimPrefix(request.ItemID, triage.PdfGrabIDPrefix)
+	if id == "" {
+		return b.triageDecisionResult(request.RequestID, "conflict", "")
+	}
+	g, err := b.grabs.Get(ctx, id)
+	if err != nil {
+		return b.triageDecisionResult(request.RequestID, "error", "pdf grab is temporarily unavailable")
+	}
+	if g == nil {
+		return b.triageDecisionResult(request.RequestID, "conflict", "")
+	}
+	quarantinePath := g.QuarantinePath
+	if err := b.grabs.Delete(ctx, id); err != nil {
+		return b.triageDecisionResult(request.RequestID, "error", "pdf grab could not be dismissed")
+	}
+	if quarantinePath != "" {
+		if err := os.RemoveAll(filepath.Dir(quarantinePath)); err != nil {
+			log.Printf("papio: removing dismissed grab quarantine %s: %v", filepath.Dir(quarantinePath), err)
+		}
+	}
+	return b.triageDecisionResult(request.RequestID, "applied", "")
 }
 
 func (b *Bridge) triageDecisionResult(requestID, outcome, detail string) ([]json.RawMessage, error) {
@@ -1594,22 +1681,12 @@ func (b *Bridge) humanActionResolve(ctx context.Context, request *protocol.Human
 		if dismissedKind == "" {
 			return b.humanActionResolveResult(request.RequestID, "error", "human action not found")
 		}
-		jobID, err := b.jobs.DismissHumanAction(ctx, request.ActionID, request.ExpectedRevision)
+		_, err := b.jobs.DismissHumanAction(ctx, request.ActionID, request.ExpectedRevision)
 		if err != nil {
 			if errors.Is(err, job.ErrConflict) {
 				return b.humanActionResolveResult(request.RequestID, "conflict", "")
 			}
 			return b.humanActionResolveResult(request.RequestID, "error", err.Error())
-		}
-		// pdf_identifier_needed dismisses cancel nothing (job.
-		// dismissalCancelsParkedJob deliberately excludes it, same as
-		// downloads_access_required) — the title-only job it parked stays.
-		// The grab bookkeeping itself is discarded instead: it has no
-		// remaining purpose once its human action is closed.
-		if dismissedKind == job.ActionKindPdfIdentifierNeeded && b.grabs != nil {
-			if g, gErr := b.grabs.ByJobID(ctx, jobID); gErr == nil && g != nil {
-				_ = b.grabs.Delete(ctx, g.ID)
-			}
 		}
 		if b.preview != nil {
 			b.preview.Revoke(request.ActionID)
@@ -2422,14 +2499,19 @@ func (b *Bridge) pdfGrab(ctx context.Context, request *protocol.PdfGrabRequestPa
 		return b.pdfGrabRefusal(request.RequestID, "", "unavailable",
 			"the adoption folder is not responding (macOS privacy consent?); try again after granting access")
 	}
-	parsed, err := url.Parse(request.URL)
-	if err != nil || parsed.Hostname() == "" {
-		return b.pdfGrabRefusal(request.RequestID, "", "not_supported", "the tab URL could not be reduced to a host")
-	}
-	g, err := b.grabs.Allocate(ctx, parsed.Hostname(), truncate(request.Title, 500))
+	g, err := b.grabs.Allocate(ctx, request.Host, truncate(request.Title, 500))
 	if err != nil {
 		log.Printf("papio: pdf grab allocation failed: %v", err)
 		return b.pdfGrabRefusal(request.RequestID, "", "unavailable", "could not allocate a grab")
+	}
+	if g.Outcome == "existing" {
+		frame, err := b.frame(protocol.MsgPdfGrabResult, "", protocol.PdfGrabResultPayload{
+			RequestID: request.RequestID, GrabID: g.ID, Outcome: "existing",
+		})
+		if err != nil {
+			return nil, err
+		}
+		return []json.RawMessage{frame}, nil
 	}
 	dir := filepath.Join(b.cfg.EffectiveAdoptionRoot(), grabsDirName, g.ID)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -2450,6 +2532,77 @@ func (b *Bridge) pdfGrabRefusal(requestID, grabID, outcome, detail string) ([]js
 	frame, err := b.frame(protocol.MsgPdfGrabResult, "", protocol.PdfGrabResultPayload{
 		RequestID: requestID, GrabID: grabID, Outcome: outcome, Detail: detail,
 	})
+	if err != nil {
+		return nil, err
+	}
+	return []json.RawMessage{frame}, nil
+}
+
+func (b *Bridge) pdfGrabStatus(ctx context.Context, request *protocol.PdfGrabStatusRequestPayload) ([]json.RawMessage, error) {
+	result := protocol.PdfGrabStatusResultPayload{
+		RequestID: request.RequestID,
+		GrabID:    request.GrabID,
+	}
+	if b.grabs == nil {
+		result.Outcome = "unavailable"
+		result.Detail = "pdf grab is not configured"
+	} else {
+		g, err := b.grabs.Get(ctx, request.GrabID)
+		if err != nil {
+			log.Printf("papio: pdf grab status lookup failed: %v", err)
+			result.Outcome = "unavailable"
+			result.Detail = "could not read grab status"
+		} else if g == nil {
+			result.Outcome = "not_found"
+		} else {
+			result.State = string(g.State)
+			result.Outcome = g.Outcome
+			result.Detail = g.Detail
+			result.JobID = g.JobID
+		}
+	}
+	frame, err := b.frame(protocol.MsgPdfGrabStatusResult, "", result)
+	if err != nil {
+		return nil, err
+	}
+	return []json.RawMessage{frame}, nil
+}
+
+func (b *Bridge) pdfGrabAbandon(ctx context.Context, request *protocol.PdfGrabAbandonRequestPayload) ([]json.RawMessage, error) {
+	result := protocol.PdfGrabAbandonResultPayload{
+		RequestID: request.RequestID,
+		GrabID:    request.GrabID,
+		State:     string(grab.StateAbandoned),
+		Outcome:   "abandoned",
+	}
+	if b.grabs == nil {
+		result.State = ""
+		result.Outcome = "unavailable"
+		result.Detail = "pdf grab is not configured"
+	} else if err := b.grabs.MarkAbandoned(ctx, request.GrabID, "The PDF grab download was interrupted"); err != nil {
+		// A lost acknowledgment is ambiguous: inspect the durable row before
+		// deciding whether the retry succeeded, found nothing, or conflicts
+		// with a later grab lifecycle transition.
+		g, getErr := b.grabs.Get(ctx, request.GrabID)
+		if getErr != nil {
+			log.Printf("papio: pdf grab abandon lookup failed: %v", getErr)
+			result.State = ""
+			result.Outcome = "unavailable"
+			result.Detail = "could not inspect grab"
+		} else if g == nil {
+			result.State = ""
+			result.Outcome = "not_found"
+		} else if g.State == grab.StateAbandoned {
+			result.State = string(grab.StateAbandoned)
+			result.Outcome = "abandoned"
+			result.Detail = g.Detail
+		} else {
+			result.State = string(g.State)
+			result.Outcome = "conflict"
+			result.Detail = "pdf grab is already settled"
+		}
+	}
+	frame, err := b.frame(protocol.MsgPdfGrabAbandonResult, "", result)
 	if err != nil {
 		return nil, err
 	}
@@ -3469,6 +3622,11 @@ func (b *Bridge) SweepGrabs(ctx context.Context) error {
 			log.Printf("papio: pdf grab %s processing failed: %v", id, err)
 		}
 	}
+	// Run the stale backstop only after scanning/processing landing files so
+	// daemon downtime cannot abandon bytes that arrived while it was offline.
+	if err := b.grabs.AbandonStaleAwaiting(ctx, time.Now().Add(-staleAwaitingGrabBudget)); err != nil {
+		log.Printf("papio: stale PDF grab sweep failed: %v", err)
+	}
 	return nil
 }
 
@@ -3515,78 +3673,11 @@ func (b *Bridge) processSettledGrab(ctx context.Context, g *grab.Grab, dir, name
 	// a KNOWN identifier and do not apply here (see pdf.FrontMatterDOIs).
 	dois := pdf.FrontMatterDOIs(report.Text.Excerpt)
 	if len(dois) == 0 {
-		return b.parkGrabNoIdentifier(ctx, g, temp, dir)
+		_ = os.RemoveAll(dir)
+
+		return b.grabs.MarkParkedNoIdentifier(ctx, g.ID)
 	}
 	return b.createGrabJob(ctx, g, dois[0], temp, dir, name)
-}
-
-// parkGrabNoIdentifier implements ADR-0020 Decision 4's "no identifier"
-// branch: a title-only job, created solely to host a pdf_identifier_needed
-// human action, never entering ordinary resolution (no candidates, no fetch
-// attempt) — so ADR-0019's title-only submission ban stays intact.
-func (b *Bridge) parkGrabNoIdentifier(ctx context.Context, g *grab.Grab, quarantinePath, landingDir string) error {
-	title := strings.TrimSpace(g.Title)
-	if title == "" {
-		title = g.URLHost
-	}
-	mode, err := b.cfg.RequireAccessMode()
-	if err != nil {
-		return err
-	}
-	result, err := b.jobs.CreateRequestForWork(ctx, job.NewID("wr"), work.Work{Title: title}, "", "",
-		job.Policy{AccessMode: mode, DesiredVersion: "any", FetchMaxBytes: b.cfg.Fetch.MaxBytes},
-		nil, job.Attribution{Principal: job.PrincipalUnknown, Consumer: pdfGrabConsumerPrefix + g.URLHost}, false)
-	if err != nil {
-		return err
-	}
-	if err := b.parkGrabJob(ctx, result.JobID); err != nil {
-		return err
-	}
-	caption := g.URLHost
-	if title != "" && title != g.URLHost {
-		caption = fmt.Sprintf("%s (%q)", g.URLHost, title)
-	}
-	if _, err := b.jobs.OpenHumanAction(ctx, result.JobID, job.ActionKindPdfIdentifierNeeded,
-		fmt.Sprintf("%s — quarantine: %s", caption, quarantinePath), job.Access(false, "")); err != nil {
-		return err
-	}
-	_ = os.RemoveAll(landingDir)
-	return b.grabs.MarkParkedNoIdentifier(ctx, g.ID, result.JobID)
-}
-
-// parkGrabJob moves a freshly created, title-only grab job onto
-// awaiting_human through the legal queued->resolving->awaiting_human edges,
-// mirroring internal/app's parkForBrowserAdoption exactly — the same
-// existing seam a browser-adopted download uses to reach the same state
-// without ever entering an ordinary resolution attempt.
-func (b *Bridge) parkGrabJob(ctx context.Context, jobID string) error {
-	const reason = "pdf_grab_no_identifier"
-	for range 4 {
-		row, err := b.jobs.Get(ctx, jobID)
-		if err != nil {
-			return err
-		}
-		switch row.State {
-		case job.StateAwaitingHuman:
-			return nil
-		case job.StateQueued:
-			err = b.jobs.Transition(ctx, jobID, job.StateQueued, job.StateResolving, map[string]any{"reason": reason})
-		case job.StateResolving, job.StateFetching:
-			err = b.jobs.Transition(ctx, jobID, row.State, job.StateAwaitingHuman, map[string]any{"reason": reason})
-			if err == nil {
-				return nil
-			}
-		default:
-			return fmt.Errorf("job %s is not parkable for a pdf grab while in state %s", jobID, row.State)
-		}
-		if err == nil {
-			continue
-		}
-		if !errors.Is(err, job.ErrConflict) {
-			return err
-		}
-	}
-	return fmt.Errorf("job %s changed while parking for a pdf grab", jobID)
 }
 
 // createGrabJob implements ADR-0020 Decision 4's "identifier found" branch.
@@ -3635,6 +3726,167 @@ func (b *Bridge) createGrabJob(ctx context.Context, g *grab.Grab, doi, quarantin
 		}
 	}
 	return nil
+}
+
+// GrabIdentifyResult is the structured outcome of binding an operator-supplied
+// identifier to a quarantined browser grab. Routine refusals stay on this wire
+// as outcomes rather than becoming local-RPC failures.
+type GrabIdentifyResult struct {
+	GrabID string `json:"grab_id"`
+	JobID  string `json:"job_id,omitempty"`
+
+	Outcome string `json:"outcome"`
+	Detail  string `json:"detail,omitempty"`
+}
+
+func (b *Bridge) moveGrabFile(src, dst string) error {
+	rename := b.renameFile
+	if rename == nil {
+		rename = os.Rename
+	}
+	if err := rename(src, dst); err == nil {
+		return nil
+	} else if !errors.Is(err, syscall.EXDEV) {
+		return err
+	}
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		_ = in.Close()
+		return err
+	}
+	_, copyErr := io.Copy(out, in)
+	if copyErr == nil {
+		copyErr = out.Sync()
+	}
+	closeOutErr := out.Close()
+	closeInErr := in.Close()
+	if copyErr != nil {
+		_ = os.Remove(dst)
+		return copyErr
+	}
+	if closeOutErr != nil {
+		_ = os.Remove(dst)
+		return closeOutErr
+	}
+	if closeInErr != nil {
+		_ = os.Remove(dst)
+		return closeInErr
+	}
+	return os.Remove(src)
+}
+
+// IdentifyGrab validates one explicitly typed identifier, checks the ready
+// bundle projection before creating any job, then joins or creates the
+// canonical job while reusing the quarantined bytes.
+func (b *Bridge) IdentifyGrab(ctx context.Context, grabID, kind, raw string) GrabIdentifyResult {
+	result := GrabIdentifyResult{GrabID: grabID}
+	var target work.Work
+	var canonicalKind, canonicalValue string
+	var err error
+	switch strings.ToLower(strings.TrimSpace(kind)) {
+	case "doi":
+		target.DOI, err = work.NormalizeDOI(raw)
+		canonicalKind, canonicalValue = "doi", target.DOI
+	case "pmid":
+		target.PMID, err = work.NormalizePMID(raw)
+		canonicalKind, canonicalValue = "pmid", target.PMID
+	case "arxiv":
+		target.ArXiv, err = work.NormalizeArXiv(raw)
+		canonicalKind, canonicalValue = "arxiv", target.ArXiv
+	default:
+		result.Outcome, result.Detail = "invalid_identifier", "identifier kind must be doi, pmid, or arxiv"
+		return result
+	}
+	if err != nil {
+		result.Outcome, result.Detail = "invalid_identifier", "identifier is malformed"
+		return result
+	}
+	if b == nil || b.grabs == nil || b.jobs == nil {
+		result.Outcome, result.Detail = "unavailable", "pdf grabs are not configured"
+		return result
+	}
+	g, err := b.grabs.Get(ctx, grabID)
+	if err != nil {
+		result.Outcome, result.Detail = "unavailable", "pdf grab is temporarily unavailable"
+		return result
+	}
+	if g == nil {
+		result.Outcome, result.Detail = "unknown_grab", "pdf grab not found"
+		return result
+	}
+	if g.State != grab.StateParkedNoIdentifier {
+		result.Outcome, result.Detail = "wrong_state", "pdf grab is not parked awaiting an identifier"
+		return result
+	}
+	if g.QuarantinePath == "" {
+		result.Outcome, result.Detail = "failed", "pdf grab has no quarantined file"
+		return result
+	}
+	_, readyJobID, _, err := b.canonicalJobStatus(ctx, canonicalKind, canonicalValue)
+	if err != nil {
+		result.Outcome, result.Detail = "unavailable", "canonical ownership is temporarily unavailable"
+		return result
+	}
+	if readyJobID != "" {
+		if err := os.RemoveAll(filepath.Dir(g.QuarantinePath)); err != nil {
+			result.Outcome, result.Detail = "failed", "captured bytes could not be discarded after ready ownership"
+			return result
+		}
+		if err := b.grabs.MarkIdentified(ctx, grabID); err != nil {
+			result.Outcome, result.Detail = "conflict", "pdf grab changed before identification"
+			return result
+		}
+		if err := b.grabs.MarkJobCreated(ctx, grabID, readyJobID, "already_owned"); err != nil {
+			result.Outcome, result.Detail = "failed", "pdf grab could not be finalized"
+			return result
+		}
+		return GrabIdentifyResult{GrabID: grabID, JobID: readyJobID, Outcome: "already_owned"}
+	}
+	mode, err := b.cfg.RequireAccessMode()
+	if err != nil {
+		result.Outcome, result.Detail = "configuration_required", "access mode is not configured"
+		return result
+	}
+	created, err := b.jobs.CreateRequestForWork(ctx, job.NewID("wr"), target, "", "",
+		job.Policy{AccessMode: mode, DesiredVersion: "any", FetchMaxBytes: b.cfg.Fetch.MaxBytes},
+		nil, job.Attribution{Principal: job.PrincipalUnknown, Consumer: pdfGrabConsumerPrefix + g.URLHost}, false)
+	if err != nil {
+		result.Outcome, result.Detail = "failed", "canonical job could not be created"
+		return result
+	}
+	result.JobID = created.JobID
+	filename := filepath.Base(g.QuarantinePath)
+	if !filepath.IsLocal(filename) || filename == "." || filename == string(filepath.Separator) {
+		result.Outcome, result.Detail = "failed", "quarantined file name is invalid"
+		return result
+	}
+	jobDir := filepath.Join(b.cfg.EffectiveAdoptionRoot(), created.JobID)
+	if err := os.MkdirAll(jobDir, 0o700); err != nil {
+		result.Outcome, result.Detail = "failed", "job adoption directory could not be created"
+		return result
+	}
+	if err := b.moveGrabFile(g.QuarantinePath, filepath.Join(jobDir, filename)); err != nil {
+		result.Outcome, result.Detail = "failed", "quarantined file could not be bound to the job"
+		return result
+	}
+	_ = os.Remove(filepath.Dir(g.QuarantinePath))
+	if _, err := b.adopt(ctx, created.JobID, filename); err != nil {
+		_ = b.recordAdoptionDeferred(ctx, created.JobID, filename, err)
+	}
+	if err := b.grabs.MarkIdentified(ctx, grabID); err != nil {
+		result.Outcome, result.Detail = "conflict", "pdf grab changed before identification"
+		return result
+	}
+	if err := b.grabs.MarkJobCreated(ctx, grabID, created.JobID, "job_created"); err != nil {
+		result.Outcome, result.Detail = "failed", "pdf grab could not be finalized"
+		return result
+	}
+	result.Outcome = "job_created"
+	return result
 }
 
 // copyFile streams src into a freshly created dst. Unlike copyHashed

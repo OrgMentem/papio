@@ -156,10 +156,9 @@ export interface ActiveJob {
    * clearParkedMarker) or, if its tab closes while parked, when
    * onTabRemoved demotes it to an ordinary queued drive. */
   waiting_for_session?: boolean;
-  /** The federatedLoginOwners claim key this job is waiting on (see
-   * waiting_for_session above). Lets clearFederatedLoginOwner resume exactly
-   * the waiters of the ONE claim that just retired, without needing the
-   * (possibly already-removed) owner job's own offer/institution data. */
+  /** Opaque SHA-256 hex digest of the federated-login claim tuple. The raw
+   * IdP origin and entityID are never persisted; this key exists only for
+   * equality against federatedLoginOwners. */
   waiting_for_session_key?: string | undefined;
   /** Absolute epoch ms past which a waiting_for_session park demotes on its
    * own (SESSION_WAIT_TIMEOUT_MS after the FIRST park, not each re-park —
@@ -174,25 +173,16 @@ export interface ActiveJob {
   waiting_deadline?: number | undefined;
 }
 /** Cross-job record of the one live tab currently driving federated login for
- * a given claim key — the federated-login destination origin
- * (maybeRouteFederatedLogin's IdP/DS URL) PLUS the offer's entityID. A bare
- * origin is not enough: a shared WAYF/Discovery-Service host fronts many
- * institutions on one origin, distinguished only by entityID in the query,
- * so keying on origin alone would let institution B block on — or resume
- * from — institution A's unrelated claim. Lets three papers needing the same
- * institution share ONE login tab instead of each opening its own: a job
- * whose login verdict would navigate to a claim key already held here parks
- * (waiting_for_session) instead. Persisted beside parked_with_tab (session
- * storage) so a service-worker restart sees the same claim rather than
- * letting every parked sibling race to reclaim it; reconcileFederatedLoginOwners
- * drops any entry whose owning job no longer has that exact tab. Retirement
- * is deliberately narrow — the owning tab closes, navigates off the claimed
- * origin, or its job is removed (clearFederatedLoginOwnerForTab /
- * clearFederatedLoginOwnerForJob) — and NEVER fires merely because session
- * evidence landed: an owner still genuinely on the IdP survives a sibling
- * institution's (or even its own institution's not-yet-proven) evidence, so
- * a second tab can never open at the same login page while the first is
- * still live. Every retirement resumes that claim's own waiters. */
+ * an opaque SHA-256 claim digest. The digest is derived from the destination
+ * origin and entityID but the raw tuple never enters persisted browser state.
+ * Lets three papers needing the same institution share ONE login tab instead
+ * of each opening its own: a job whose login verdict resolves to a digest
+ * already held here parks (waiting_for_session) instead. Persisted beside
+ * parked_with_tab (session storage) so a service-worker restart sees the same
+ * claim; reconcileFederatedLoginOwners drops stale owners and resumes their
+ * waiters through the ownerless path. Retirement is deliberately narrow: the
+ * owning tab closes, navigates off the claimed origin, or its job is removed.
+ * Every retirement resumes that claim's own waiters. */
 export interface FederatedLoginOwner {
   jobID: string;
   tabID: number;
@@ -263,9 +253,9 @@ export interface StoreShape {
   /** Provider registrable-host cooldowns after a security check or redirect
    * loop. Values are epoch milliseconds; no URL or IdP data is retained. */
   challengeCooldowns?: Record<string, number>;
-  /** One live login-tab claim per federated-login (IdP) origin, so multiple
-   * jobs needing the same institution share a single sign-in tab. See
-   * FederatedLoginOwner's doc comment for the full lifecycle. */
+  /** One live login-tab claim per federated-login tuple, keyed by an opaque
+   * SHA-256 digest so the persisted map contains neither raw origin nor
+   * entityID. See FederatedLoginOwner's doc comment for the full lifecycle. */
   federatedLoginOwners?: Record<string, FederatedLoginOwner>;
 }
 

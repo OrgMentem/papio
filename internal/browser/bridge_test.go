@@ -19,6 +19,7 @@ import (
 	"slices"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -740,7 +741,7 @@ func TestHelloAckAnnouncesDaemonVersion(t *testing.T) {
 		t.Fatalf("daemon_version = %q, want 0.1.0-test", payload.DaemonVersion)
 	}
 	if !slices.Equal(payload.Features, []string{
-		pageAcquireFeature, triageSnapshotFeature, triageSnapshotSchema2Feature, triageMutationsFeature, reviewPreviewFeature, statsFeature, pageCaptureFeature, pageCaptureRequestFeature, activityFeedFeature, triageCountsSchema2Feature, sessionEvidenceFeature, deliveryContextFeature, pageCaptureTermsFeature, pageBulkAcquireFeature, triageSnapshotSchema3Feature, pdfGrabV1Feature,
+		pageAcquireFeature, triageSnapshotFeature, triageSnapshotSchema2Feature, triageMutationsFeature, reviewPreviewFeature, statsFeature, pageCaptureFeature, pageCaptureRequestFeature, activityFeedFeature, triageCountsSchema2Feature, sessionEvidenceFeature, deliveryContextFeature, pageCaptureTermsFeature, pageBulkAcquireFeature, triageSnapshotSchema3Feature, triageSnapshotSchema4Feature, pdfGrabV1Feature,
 	}) {
 		t.Fatalf("features = %v, want required bridge feature set", payload.Features)
 	}
@@ -5798,7 +5799,7 @@ func TestPdfGrabAllocatesSteeringPath(t *testing.T) {
 	b, _, cfg, _ := newBridge(t)
 	runSync(t, b, hello())
 	msgs, _ := runSync(t, b, inFrame(t, protocol.MsgPdfGrabRequest, "", map[string]any{
-		"request_id": "grab-req-0001", "url": "https://pdf.example.org/main.pdf", "title": "A Paper",
+		"request_id": "grab-req-0001", "host": "pdf.example.org", "title": "A Paper",
 	}))
 	got := firstOfType(msgs, protocol.MsgPdfGrabResult)
 	if got == nil {
@@ -5825,7 +5826,7 @@ func TestPdfGrabRefusesOnUnhealthyLatch(t *testing.T) {
 	runSync(t, b, hello())
 	b.adoptionScanSuspended = true
 	msgs, _ := runSync(t, b, inFrame(t, protocol.MsgPdfGrabRequest, "", map[string]any{
-		"request_id": "grab-req-0002", "url": "https://pdf.example.org/main.pdf",
+		"request_id": "grab-req-0002", "host": "pdf.example.org",
 	}))
 	got := firstOfType(msgs, protocol.MsgPdfGrabResult)
 	if got == nil {
@@ -5935,10 +5936,12 @@ func TestSweepGrabsCreatesJobFromDOIReportsAlreadyOwned(t *testing.T) {
 }
 
 // TestSweepGrabsParksNoIdentifier is ADR-0020 Decision 4's no-identifier
-// path: a title-only job hosting a pdf_identifier_needed human action,
-// parked at awaiting_human — never an identifier-less submission attempt.
+// path: the captured bytes remain on a parked grab row, with no synthetic
+// title-only job or human action. An explicit identifier later creates the
+// canonical job from those same quarantined bytes.
 func TestSweepGrabsParksNoIdentifier(t *testing.T) {
 	b, jobs, cfg, _ := newBridge(t)
+	b.renameFile = func(string, string) error { return syscall.EXDEV }
 	b.svc.Validate = func(context.Context, string, string, work.Work) (pdf.ValidationReport, error) {
 		return pdf.ValidationReport{
 			Payload:    pdf.PayloadReport{OK: true},
@@ -5953,7 +5956,6 @@ func TestSweepGrabsParksNoIdentifier(t *testing.T) {
 	}
 	dir := filepath.Join(cfg.EffectiveAdoptionRoot(), "grabs", g.ID)
 	writeFixturePDF(t, filepath.Join(dir, "main.pdf"))
-
 	if err := b.SweepGrabs(ctx); err != nil {
 		t.Fatalf("sweep: %v", err)
 	}
@@ -5961,22 +5963,41 @@ func TestSweepGrabsParksNoIdentifier(t *testing.T) {
 	if err != nil || got == nil {
 		t.Fatalf("grab lookup: %v", err)
 	}
-	if got.State != grab.StateParkedNoIdentifier || got.Outcome != "needs_identifier" || got.JobID == "" {
-		t.Fatalf("grab = %+v, want parked_no_identifier/needs_identifier with a job id", got)
+	if got.State != grab.StateParkedNoIdentifier || got.Outcome != "needs_identifier" || got.JobID != "" {
+		t.Fatalf("grab = %+v, want parked_no_identifier/needs_identifier without a job", got)
 	}
-	row, err := jobs.Get(ctx, got.JobID)
+	again, err := b.grabs.Allocate(ctx, "pdf.example.org", "Mystery Paper")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if row.State != job.StateAwaitingHuman {
-		t.Fatalf("job state = %s, want awaiting_human", row.State)
+	if again.ID != g.ID || again.Outcome != "existing" {
+		t.Fatalf("repeat allocation = %+v, want existing grab %s", again, g.ID)
 	}
-	actions, err := jobs.ListHumanActionsForJob(ctx, got.JobID)
+	var jobsBefore int
+	if err := jobs.S.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM jobs`).Scan(&jobsBefore); err != nil {
+		t.Fatal(err)
+	}
+	actions, err := jobs.ListHumanActions(ctx, true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(actions) != 1 || actions[0].Action.Kind != job.ActionKindPdfIdentifierNeeded || actions[0].Action.Status != "open" {
-		t.Fatalf("human actions = %+v, want exactly one open pdf_identifier_needed", actions)
+	if len(actions) != 0 {
+		t.Fatalf("human actions = %+v, want none", actions)
+	}
+	identified := b.IdentifyGrab(ctx, g.ID, "doi", "10.1234/grab.manual")
+	if identified.Outcome != "job_created" || identified.JobID == "" {
+		t.Fatalf("identify result = %+v, want job_created", identified)
+	}
+	var jobsAfter int
+	if err := jobs.S.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM jobs`).Scan(&jobsAfter); err != nil {
+		t.Fatal(err)
+	}
+	if jobsAfter != jobsBefore+1 {
+		t.Fatalf("jobs after identify = %d, before = %d; want exactly one new job", jobsAfter, jobsBefore)
+	}
+	final, err := b.grabs.Get(ctx, g.ID)
+	if err != nil || final == nil || final.State != grab.StateJobCreated || final.JobID != identified.JobID {
+		t.Fatalf("final grab = %+v, err=%v", final, err)
 	}
 }
 
@@ -6045,9 +6066,9 @@ func TestSweepGrabsSkipsTickOnHungRoot(t *testing.T) {
 }
 
 // TestHumanActionDismissDiscardsGrabRowWithoutCancellingJob pins ADR-0020's
-// pinned dismissal disposition: dismissing a pdf_identifier_needed action
-// cancels nothing, but the grab row it was bound to is discarded.
-func TestHumanActionDismissDiscardsGrabRowWithoutCancellingJob(t *testing.T) {
+// TestPdfGrabDismissDeletesParkedRow verifies the v4 grab-backed dismiss
+// operation deletes only the parked grab and creates no job or action.
+func TestPdfGrabDismissDeletesParkedRow(t *testing.T) {
 	b, jobs, cfg, _ := newBridge(t)
 	b.svc.Validate = func(context.Context, string, string, work.Work) (pdf.ValidationReport, error) {
 		return pdf.ValidationReport{
@@ -6060,52 +6081,47 @@ func TestHumanActionDismissDiscardsGrabRowWithoutCancellingJob(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	dir := filepath.Join(cfg.EffectiveAdoptionRoot(), "grabs", g.ID)
-	writeFixturePDF(t, filepath.Join(dir, "main.pdf"))
+	writeFixturePDF(t, filepath.Join(cfg.EffectiveAdoptionRoot(), "grabs", g.ID, "main.pdf"))
 	if err := b.SweepGrabs(ctx); err != nil {
 		t.Fatalf("sweep: %v", err)
 	}
-	got, err := b.grabs.Get(ctx, g.ID)
-	if err != nil || got == nil {
-		t.Fatalf("grab lookup: %v", err)
+	if parked, err := b.grabs.Get(ctx, g.ID); err != nil || parked == nil || parked.JobID != "" {
+		t.Fatalf("parked grab = %+v, err=%v", parked, err)
 	}
-	actions, err := jobs.ListHumanActionsForJob(ctx, got.JobID)
-	if err != nil || len(actions) != 1 {
-		t.Fatalf("actions = %+v, err=%v", actions, err)
-	}
-
-	runSync(t, b, hello())
-	msgs, _ := runSync(t, b, inFrame(t, protocol.MsgHumanActionResolve, got.JobID, map[string]any{
-		"request_id": "dismiss-req-0001", "action_id": actions[0].Action.ID, "verdict": "dismiss",
-		"expected_revision": actions[0].Action.Revision,
-	}))
-	res := firstOfType(msgs, protocol.MsgHumanActionResolveResult)
-	if res == nil || res.Payload.(*protocol.HumanActionResolveResultPayload).Outcome != "applied" {
-		t.Fatalf("dismiss result = %+v", msgs)
-	}
-	row, err := jobs.Get(ctx, got.JobID)
-	if err != nil {
+	var jobsBefore int
+	if err := jobs.S.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM jobs`).Scan(&jobsBefore); err != nil {
 		t.Fatal(err)
 	}
-	if row.State == job.StateCancelled {
-		t.Fatalf("dismiss must not cancel the job: state = %s", row.State)
+	runSync(t, b, hello())
+	msgs, _ := runSync(t, b, inFrame(t, protocol.MsgTriageDecide, "", map[string]any{
+		"request_id": "dismiss-req-0001", "item_id": triage.PdfGrabIDPrefix + g.ID, "op": "dismiss",
+		"watch_scope": "all",
+	}))
+	res := firstOfType(msgs, protocol.MsgTriageDecideResult)
+	if res == nil || res.Payload.(*protocol.TriageDecideResultPayload).Outcome != "applied" {
+		t.Fatalf("dismiss result = %+v", msgs)
 	}
 	if after, err := b.grabs.Get(ctx, g.ID); err != nil || after != nil {
 		t.Fatalf("grab row survived dismiss: %+v, err=%v", after, err)
 	}
+	var jobsAfter int
+	if err := jobs.S.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM jobs`).Scan(&jobsAfter); err != nil {
+		t.Fatal(err)
+	}
+	if jobsAfter != jobsBefore {
+		t.Fatalf("jobs after dismiss = %d, before = %d; dismiss must create/cancel nothing", jobsAfter, jobsBefore)
+	}
 }
 
-// TestTriageSnapshotV3OmitsUnrepresentableActionKinds pins the interim
-// P0 guard (pending triage-snapshot/4): an open action whose kind is not in
-// schema 3's closed route_class vocabulary — pdf_identifier_needed today —
-// is OMITTED from v3 snapshots rather than poisoning the whole frame with
-// an invalid route_class. The action stays reachable via the CLI surfaces.
+// TestTriageSnapshotV3OmitsUnrepresentableActionKinds pins the closed
+// schema-3 route-class guard: an unknown action kind is omitted rather than
+// poisoning the whole frame with an invalid route class.
 func TestTriageSnapshotV3OmitsUnrepresentableActionKinds(t *testing.T) {
 	b, jobs, _, _ := newBridge(t)
 	ctx := context.Background()
 
-	grabJobID := park(t, jobs, "wr_v3_omit_grab", handoffWork())
-	if _, err := jobs.OpenHumanAction(ctx, grabJobID, job.ActionKindPdfIdentifierNeeded,
+	unknownID := park(t, jobs, "wr_v3_omit_unknown", handoffWork())
+	if _, err := jobs.OpenHumanAction(ctx, unknownID, "unknown_action_kind",
 		"grabbed-paper.pdf", job.Access(false, "")); err != nil {
 		t.Fatal(err)
 	}
@@ -6125,8 +6141,8 @@ func TestTriageSnapshotV3OmitsUnrepresentableActionKinds(t *testing.T) {
 	payload := snap.Payload.(*protocol.TriageSnapshotResponsePayload)
 	foundManual := false
 	for _, item := range payload.Items {
-		if item.ActionKind == job.ActionKindPdfIdentifierNeeded {
-			t.Fatalf("pdf_identifier_needed item leaked into a v3 snapshot: %+v", item)
+		if item.ActionKind == "unknown_action_kind" {
+			t.Fatalf("unknown action kind leaked into a v3 snapshot: %+v", item)
 		}
 		if item.JobID == manualID {
 			foundManual = true
@@ -6134,5 +6150,70 @@ func TestTriageSnapshotV3OmitsUnrepresentableActionKinds(t *testing.T) {
 	}
 	if !foundManual {
 		t.Fatal("representable manual_download item missing — guard over-filtered")
+	}
+}
+func TestPdfGrabStatusUnknownIsRoutineNotFound(t *testing.T) {
+	b, _, _, _ := newBridge(t)
+	runSync(t, b, hello())
+	msgs, _ := runSync(t, b, inFrame(t, protocol.MsgPdfGrabStatusRequest, "", map[string]any{
+		"request_id": "grab-status-0001", "grab_id": "grab_missing_000000000000000000000000",
+	}))
+	got := firstOfType(msgs, protocol.MsgPdfGrabStatusResult)
+	if got == nil {
+		t.Fatalf("no pdf_grab_status_result frame: %+v", msgs)
+	}
+	p := got.Payload.(*protocol.PdfGrabStatusResultPayload)
+	if p.Outcome != "not_found" || p.GrabID == "" || p.RequestID == "" {
+		t.Fatalf("payload = %+v, want structured not_found", p)
+	}
+}
+
+func TestPdfGrabAbandonIsIdempotentAndReportsConflicts(t *testing.T) {
+	b, _, _, _ := newBridge(t)
+	ctx := context.Background()
+	abandon := func(t *testing.T, id, requestID string) *protocol.PdfGrabAbandonResultPayload {
+		t.Helper()
+		raw, err := b.pdfGrabAbandon(ctx, &protocol.PdfGrabAbandonRequestPayload{RequestID: requestID, GrabID: id})
+		if err != nil {
+			t.Fatal(err)
+		}
+		msg, err := protocol.DecodeBrowserMessage(raw[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		return msg.Payload.(*protocol.PdfGrabAbandonResultPayload)
+	}
+
+	first, err := b.grabs.Allocate(ctx, "example.edu", "retry")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := abandon(t, first.ID, "grab-abandon-0001"); got.Outcome != "abandoned" || got.State != "abandoned" {
+		t.Fatalf("first abandon = %+v", got)
+	}
+	if got := abandon(t, first.ID, "grab-abandon-0002"); got.Outcome != "abandoned" || got.State != "abandoned" {
+		t.Fatalf("retry abandon = %+v", got)
+	}
+
+	conflict, err := b.grabs.Allocate(ctx, "example.edu", "conflict")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.grabs.MarkQuarantined(ctx, conflict.ID, "quarantine.pdf"); err != nil {
+		t.Fatal(err)
+	}
+	if got := abandon(t, conflict.ID, "grab-abandon-0003"); got.Outcome != "conflict" || got.State != string(grab.StateQuarantined) {
+		t.Fatalf("quarantined abandon = %+v", got)
+	}
+
+	deleted, err := b.grabs.Allocate(ctx, "example.edu", "deleted")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.grabs.Delete(ctx, deleted.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got := abandon(t, deleted.ID, "grab-abandon-0004"); got.Outcome != "not_found" || got.State != "" {
+		t.Fatalf("deleted abandon = %+v", got)
 	}
 }

@@ -15,6 +15,7 @@ import {
   upsertJob,
   type ActiveJob,
 } from "../src/state";
+import { federatedLoginClaimKey } from "../src/background";
 
 function job(overrides: Partial<ActiveJob> = {}): ActiveJob {
   return {
@@ -69,4 +70,19 @@ test("pending delivery reducers replace, patch, and clear only the matching job"
   expect(store.pendingDelivery).toBeDefined();
   store = clearPendingDelivery(store, delivery.job_id);
   expect(store.pendingDelivery).toBeUndefined();
+test("waiting-for-session persistence stores only the opaque claim digest", async () => {
+  const origin = "https://login.idp.example.edu";
+  const entityID = "https://idp.example.edu/entity";
+  const digest = await federatedLoginClaimKey(origin, entityID);
+  const store = upsertJob(
+    {
+      ...emptyStore(),
+      federatedLoginOwners: { [digest]: { jobID: "job_00000001", tabID: 100 } },
+    },
+    job({ waiting_for_session: true, waiting_for_session_key: digest }),
+  );
+  const persisted = JSON.stringify(store);
+  expect(persisted).toContain(digest);
+  expect(persisted).not.toContain(origin);
+  expect(persisted).not.toContain(entityID);
 });

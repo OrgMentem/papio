@@ -1158,6 +1158,43 @@ func TestResolveReviewRejectCancelsJobAndResolvesAction(t *testing.T) {
 	}
 }
 
+func TestResolveReviewRejectClosesEveryNonAdvisoryActionAtomically(t *testing.T) {
+	js := testStore(t)
+	ctx := context.Background()
+	id, _, reviewID := parkIdentityReview(t, js, "wr_review_reject_closes_all")
+	if _, err := js.OpenHumanAction(ctx, id, ActionKindDownloadsAccessRequired,
+		"/Users/example/Downloads/papio", Access(false, "")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := js.OpenHumanAction(ctx, id, informationalActionKind,
+		"conservative OpenURL was not opened", Access(false, "")); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, _, err := js.ResolveReview(ctx, reviewID, "reject"); err != nil {
+		t.Fatal(err)
+	}
+	actions, err := js.ListHumanActions(ctx, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	status := make(map[string]string, len(actions))
+	for _, action := range actions {
+		if action.JobID == id {
+			status[action.Kind] = action.Status
+		}
+	}
+	if status["verify_identity"] != "resolved" {
+		t.Fatalf("verify_identity status = %q, want resolved; actions = %+v", status["verify_identity"], actions)
+	}
+	if status[ActionKindDownloadsAccessRequired] != "cancelled" {
+		t.Fatalf("downloads_access_required status = %q, want cancelled; actions = %+v", status[ActionKindDownloadsAccessRequired], actions)
+	}
+	if status[informationalActionKind] != "open" {
+		t.Fatalf("advisory openurl_available status = %q, want open; actions = %+v", status[informationalActionKind], actions)
+	}
+}
+
 func TestResolveReviewAcceptResumesCandidateAndClearsTerminalFields(t *testing.T) {
 	js := testStore(t)
 	ctx := context.Background()

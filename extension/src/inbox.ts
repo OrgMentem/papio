@@ -95,6 +95,7 @@ interface PageState {
   activityKnown: boolean;
   activityEntries: ActivityEntry[];
   activityExpanded: boolean;
+  waitingJobs: Map<string, number>;
 }
 
 type FocusTarget =
@@ -122,6 +123,7 @@ const state: PageState = {
   activityFeature: false,
   activityKnown: false,
   activityEntries: [],
+  waitingJobs: new Map(),
   activityExpanded: false,
 };
 
@@ -143,6 +145,26 @@ function responseValue<T>(value: unknown, key: string): { ok: true; value: T } |
     return { ok: true, value: value[key] as T };
   }
   return { ok: false, message: errorFromResponse(value) };
+}
+function waitingSibling(item: TriageSnapshotItem): boolean {
+  return typeof item.job_id === "string" && state.waitingJobs.has(item.job_id);
+}
+
+let waitingOverlayTimer: number | Timer | undefined;
+
+function scheduleWaitingOverlayExpiry(): void {
+  clearTimeout(waitingOverlayTimer);
+  const deadlines = [...state.waitingJobs.values()];
+  const next = deadlines.length > 0 ? Math.min(...deadlines) : undefined;
+  if (next === undefined) return;
+  waitingOverlayTimer = setTimeout(() => {
+    const now = Date.now();
+    for (const [jobID, deadline] of state.waitingJobs) {
+      if (deadline <= now) state.waitingJobs.delete(jobID);
+    }
+    render();
+    scheduleWaitingOverlayExpiry();
+  }, Math.max(0, next - Date.now()));
 }
 
 async function runtimeMessage(type: string, request: Record<string, unknown>): Promise<unknown> {
@@ -202,6 +224,17 @@ function setConnection(connected: boolean, message: string): void {
     scheduleAutoReconnect();
   }
 }
+function normalizeSnapshotItem(item: TriageSnapshotItem): TriageSnapshotItem {
+  if (item.kind !== "pdf_grab" || item.grab === undefined) return item;
+  return {
+    ...item,
+    id: `pdf_grab:${item.grab.grab_id}`,
+    rank: 0,
+    title: item.label ?? "PDF",
+    facts: [],
+    links: [],
+  };
+}
 
 function itemForID(id: string): TriageSnapshotItem | null {
   return state.snapshot?.items.find((item) => item.id === id) ?? null;
@@ -219,6 +252,7 @@ function orderedItems(): TriageSnapshotItem[] {
     retraction: 0,
     human_action: 1,
     watch_hit: 2,
+    pdf_grab: 3,
   };
   const query = state.filterQuery.trim().toLowerCase();
   return [...state.snapshot.items]
@@ -328,6 +362,8 @@ function operationLabel(operation: TriageOperation): string {
       return "Confirm exists";
     case "confirm_request_absent":
       return "Confirm absent";
+    case "provide_identifier":
+      return "Provide identifier";
   }
 }
 
@@ -362,7 +398,7 @@ function itemsForTab(tab: InboxTab): TriageSnapshotItem[] {
   if (tab === "activity") return [];
   const items = orderedItems();
   if (tab === "watch") return items.filter((item) => item.kind === "watch_hit");
-  return items.filter((item) => item.kind === "retraction" || item.kind === "human_action");
+  return items.filter((item) => item.kind === "retraction" || item.kind === "human_action" || item.kind === "pdf_grab");
 }
 
 function isActivityEntry(value: unknown): value is ActivityEntry {
@@ -938,6 +974,10 @@ function missingAdapter(item: TriageSnapshotItem): boolean {
 }
 
 function guidanceText(item: TriageSnapshotItem, blockedByChallenge: boolean): string | null {
+  if (item.kind === "pdf_grab") {
+    const grabID = item.grab?.grab_id ?? item.id.replace(/^pdf_grab:/, "");
+    return `Provide an identifier: papio grabs identify ${grabID} --doi <value> (or --pmid/--arxiv <value>)`;
+  }
   if (item.kind !== "human_action") return null;
   if (blockedByChallenge) return "Solve the security check in its tab";
   switch (item.action_kind) {
@@ -1088,9 +1128,12 @@ function renderItem(item: TriageSnapshotItem): HTMLElement {
   const card = element("article");
   card.className = "triage-item";
   card.dataset.triageItemId = item.id;
-  if (item.attention !== undefined) card.dataset.attention = item.attention;
+  const waiting = waitingSibling(item);
+  card.dataset.attention = waiting ? "working" : (item.attention ?? "");
+  if (!waiting && item.attention === undefined) delete card.dataset.attention;
   card.tabIndex = item.id === state.selectedID ? 0 : -1;
   const title = displayTitle(item);
+  const citation = renderCitation(item, title.placeholder ? title.text : null);
   card.setAttribute("aria-label", title.text);
   card.addEventListener("focusin", () => selectItem(item.id, false));
   card.addEventListener("click", () => selectItem(item.id, false));
@@ -1113,11 +1156,13 @@ function renderItem(item: TriageSnapshotItem): HTMLElement {
   const blockedByChallenge = challengeBlocked(item);
   const debug = renderDebug(item, blockedByChallenge);
   body.append(headingText);
-
-  const citation = renderCitation(item, title.placeholder ? title.text : null);
   if (citation !== null) body.append(citation);
-  const instruction = renderInstruction(item, blockedByChallenge);
-  if (instruction !== null) body.append(instruction);
+
+  const instruction = waiting ? element("p", "Waiting for the institution sign-in already open in another tab") : renderInstruction(item, blockedByChallenge);
+  if (instruction !== null) {
+    if (waiting) instruction.className = "item-instruction item-guidance";
+    body.append(instruction);
+  }
   const liveStatus = liveStatusChip(item);
   if (liveStatus !== null) body.append(liveStatus);
   const delivery = renderDeliveryDetail(item);
@@ -1158,13 +1203,13 @@ function renderItem(item: TriageSnapshotItem): HTMLElement {
     result.setAttribute("role", "status");
     body.append(result);
   }
-
   const controls = element("div");
   controls.className = "item-controls";
   controls.setAttribute("aria-label", `Actions for ${title.text}`);
-  const preview = previewButton(item);
+  const preview = waiting ? null : previewButton(item);
   if (preview !== null) controls.append(preview);
   for (const operation of item.ops) {
+    if (waiting && operation !== "dismiss") continue;
     const button = operationButton(item, operation);
     if (button !== null) controls.append(button);
   }
@@ -1250,6 +1295,7 @@ function render(): void {
   const actionGroups = [
     renderGroup("retraction", "Retractions", actionItems.filter((item) => item.kind === "retraction")),
     renderGroup("human_action", null, actionItems.filter((item) => item.kind === "human_action")),
+    renderGroup("pdf_grab", "PDF grabs", actionItems.filter((item) => item.kind === "pdf_grab")),
   ];
   for (const group of actionGroups) if (group !== null) elements.list.append(group);
   elements.watchList.replaceChildren();
@@ -1362,6 +1408,22 @@ function resultForMutation(value: unknown): { ok: true; outcome: "applied" | "al
   const detail = typeof value["detail"] === "string" ? value["detail"] : undefined;
   return detail === undefined ? { ok: true, outcome } : { ok: true, outcome, detail };
 }
+async function readWaitingSessionJobs(): Promise<Map<string, number>> {
+  try {
+    const response = await runtimeMessage("papio.triage.waiting", {});
+    if (!isRecord(response) || response["ok"] !== true || !Array.isArray(response["waiting_jobs"])) {
+      return new Map();
+    }
+    const jobs = new Map<string, number>();
+    for (const value of response["waiting_jobs"]) {
+      if (!isRecord(value) || typeof value["job_id"] !== "string" || typeof value["deadline"] !== "number") continue;
+      if (value["deadline"] > Date.now()) jobs.set(value["job_id"], value["deadline"]);
+    }
+    return jobs;
+  } catch {
+    return new Map();
+  }
+}
 
 async function refreshActivity(): Promise<void> {
   const result = await runtimeMessage("papio.activity", { limit: 50 })
@@ -1388,11 +1450,15 @@ async function refreshInbox(append = false): Promise<void> {
     : runtimeMessage("papio.triage.counts", {})
       .then((response) => responseValue<TriageCounts>(response, "counts"))
       .catch((error: unknown) => ({ ok: false as const, message: error instanceof Error ? error.message : "The daemon is unavailable." }));
-  const [snapshotResult, countsResult] = await Promise.all([snapshotPromise, countsPromise]);
+  const waitingPromise = readWaitingSessionJobs();
+  const [snapshotResult, countsResult, waitingResult] = await Promise.all([snapshotPromise, countsPromise, waitingPromise]);
   state.loading = false;
 
   if (snapshotResult.ok) {
-    const snapshot = snapshotResult.value;
+    const snapshot = {
+      ...snapshotResult.value,
+      items: snapshotResult.value.items.map(normalizeSnapshotItem),
+    };
     state.snapshot = append && state.snapshot !== null
       ? { ...snapshot, items: [...state.snapshot.items, ...snapshot.items] }
       : snapshot;
@@ -1403,6 +1469,10 @@ async function refreshInbox(append = false): Promise<void> {
     setConnection(false, snapshotResult.message);
   }
   if (countsResult.ok) state.counts = countsResult.value;
+  if (waitingResult !== null) {
+    state.waitingJobs = waitingResult;
+    scheduleWaitingOverlayExpiry();
+  }
   if (!append) await refreshActivity();
   render();
   autoLoadWatchHits();
@@ -1612,14 +1682,24 @@ let undoTimer: number | Timer | undefined;
 // downloads_access_required is awaiting_human too, but deliberately absent
 // from that case's list: the pending download is fine, only the Downloads
 // folder grant is missing, so dismissing it must never cancel the job.
+const DISMISS_DISPOSITION: Record<string, "cancels_parked_job" | "never_cancels"> = {
+  "openurl_handoff": "cancels_parked_job",
+  "manual_download": "cancels_parked_job",
+  "openurl_available": "cancels_parked_job",
+  "verify_identity": "cancels_parked_job",
+  "document_delivery": "cancels_parked_job",
+  "downloads_access_required": "never_cancels",
+};
+
 function dismissCancelsJob(item: TriageSnapshotItem): boolean {
   if (item.kind !== "human_action") return false;
+  const disposition = DISMISS_DISPOSITION[item.action_kind ?? ""];
   switch (item.job_state) {
     case "awaiting_human":
-      return item.action_kind !== "pdf_identifier_needed" &&
+      return disposition === "cancels_parked_job" &&
         (item.action_kind === "openurl_handoff" || item.action_kind === "manual_download" || item.action_kind === "openurl_available" || item.action_kind === "document_delivery");
     case "needs_review":
-      return item.action_kind === "verify_identity";
+      return disposition === "cancels_parked_job" && item.action_kind === "verify_identity";
     case undefined:
       return true;
     default:
@@ -1937,12 +2017,17 @@ async function requestHandoffOpen(item: TriageSnapshotItem): Promise<void> {
 }
 
 function activateOperation(item: TriageSnapshotItem, operation: TriageOperation): void {
+  if (waitingSibling(item) && operation !== "dismiss") return;
   switch (operation) {
     case "acquire":
       void acquire(item);
       return;
     case "dismiss":
       scheduleDismissal(item);
+      return;
+    case "provide_identifier":
+      operationMessage(item.id, guidanceText(item, false) ?? "Provide an identifier with the papio grabs identify command.", "info");
+      render();
       return;
     case "accept":
     case "reject":
@@ -1995,6 +2080,7 @@ function activateOperation(item: TriageSnapshotItem, operation: TriageOperation)
 }
 
 function activatePrimary(item: TriageSnapshotItem): void {
+  if (waitingSibling(item)) return;
   if (item.kind === "watch_hit" && hasOperation(item, "acquire")) {
     void acquire(item);
     return;
