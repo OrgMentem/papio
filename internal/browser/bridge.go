@@ -25,6 +25,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -1165,6 +1166,15 @@ func (b *Bridge) triageSnapshotPayload(ctx context.Context, requestID string, sc
 			}
 		case triage.KindHumanAction:
 			action := item.HumanAction
+			// INTERIM until triage-snapshot/4 (oracle r6 P0-B): schema 3's
+			// route_class vocabulary is closed and does not include every
+			// action kind — pdf_identifier_needed postdates the rev. An
+			// unrepresentable kind must OMIT the item (it stays fully
+			// visible via `papio actions open` and errcat guidance), never
+			// emit an invalid frame or fail the whole snapshot.
+			if action != nil && schema == 3 && !slices.Contains(protocol.TriageRouteClasses(), action.ActionKind) {
+				continue
+			}
 			if action != nil {
 				payload.ActionID, payload.JobID = action.ActionID, action.JobID
 				payload.ActionKind, payload.JobState = action.ActionKind, action.JobState

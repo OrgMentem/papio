@@ -15,6 +15,7 @@ import (
 	"io"
 	"net/url"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -1196,6 +1197,14 @@ var triageRouteClasses = []string{
 	"openurl_handoff", "manual_download", "verify_identity", "openurl_available",
 	"human_auth_required", "terms_acceptance_required", "document_delivery",
 	"downloads_access_required",
+}
+
+// TriageRouteClasses returns schema 3's closed route_class vocabulary. The
+// bridge consults it to keep snapshots legal: an action kind outside this
+// list cannot be represented on a v3 frame and must be omitted, never
+// emitted invalid (the vocabulary grows only with a schema revision).
+func TriageRouteClasses() []string {
+	return slices.Clone(triageRouteClasses)
 }
 
 // triageBlockedByV2 is schema 2's exact closed set, shipped and locked

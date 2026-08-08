@@ -159,3 +159,67 @@ door open, v1 unweakened.
   internal/cli/errcat_guidance_test.go): a future kind added to job.go
   passes all three without coverage. Same trap class the TerminalReason
   parse-enforced test closed; close it the same way.
+## Release-blocker tranche (oracle r6, 2026-08-08 — full review in
+## dev/scratch/oracle/papio-session-review-r6.md)
+
+The next release train is **v0.20.0 + ext-v0.12.0** (NOT the staged
+ext-v0.11.0 — the tree moved past its QA identity; do not publish 0.11.0
+and immediately resubmit). r6 also REVERSES the store-timing call: the
+public daemon now substantially outruns the store extension and the second
+wave is user-visible browser functionality — after this tranche + the QA
+matrix, submit immediately, before any new provider/resolver work.
+
+Blockers, in order:
+1. **URL-free grab protocol** (r6 P0-A): pdf_grab_request carries the full
+   tab URL — signed CDN queries are bearer-grade — and the persisted
+   correlation stores it. Daemon needs only {host, title}; the extension
+   already holds the URL and performs the download. Strip it from the wire,
+   the storage record, and the pdf_grabs row before pdf_grab_v1's first
+   release; grab-id path-join sanitization stays.
+2. **Pull-recoverable grab state + active-grab dedupe** (r6 P0-C):
+   at-most-once notification is fine ONLY over a pullable durable read.
+   Add pdf_grab_status_request/result (or a grab projection in
+   pageBulk.load) and a daemon-side one-nonterminal-grab-per-source
+   constraint, so a reopened workspace can never show "Ready to grab" over
+   a settled grab or start a duplicate.
+3. **triage-snapshot/4** (r6 P0-B): pdf_identifier_needed cannot be
+   represented in v3's closed route_class vocabulary (INTERIM guard now
+   omits such items from v3 snapshots — commit-pinned by
+   TestTriageSnapshotV3OmitsUnrepresentableActionKinds). v4 carries
+   route_class pdf_identifier_needed, blocked_by identifier_missing,
+   op provide_identifier, and a grab sub-object {grab_id, state}. Never
+   alias to manual_download/verify_identity.
+4. **Grabs stay grabs until identified** (r6 P1): drop the title-only
+   host job for no-identifier grabs; the pdf_grabs row is the durable
+   pending entity. `papio grabs identify <grab-id> <doi|pmid|arxiv>`
+   creates/joins the canonical job and injects the already-quarantined
+   SHA as the top local candidate — the captured bytes are never
+   re-fetched.
+5. **Waiting-sibling attention overlay** (r6 P1): badge/inbox must count
+   ONE required sign-in, not three — waiters get a browser-local override
+   to attention=working with "waiting for the sign-in already open" copy
+   and no Focus op; reverts to required on deadline expiry (the ADR-0013
+   browser-local-overlay pattern; the daemon never learns IdP state).
+6. **Opaque federated claim keys** (r6 P1): the persisted claim registry
+   stores raw [idpOrigin, entityID] against the state module's own
+   no-IdP-identity invariant — persist a digest; equality is the only
+   operation the registry needs.
+7. **Action-kind mapping completeness test**: the latent trap FIRED
+   (pdf_identifier_needed missed the v3 vocabulary). Parse-enforce that
+   every job.go action kind has a disposition in: guidance, reminders,
+   errcat, the snapshot route-class vocabulary (or an explicit
+   omit-from-vN list), and the TS rendering tables.
+8. **ResolveReview shared action closure** (promoted from Later): a
+   rejected review must close every non-advisory open action through the
+   shared transition path, not the startup-only sweep.
+
+Post-submission next build: **Primo NDE rendered-row PNX feasibility
+scout** (one day, not the full extractor) — r6 declares the evidence
+threshold already fired (daily tool, both institutions, 1/50 structural
+yield). Join rendered cards to already-loaded client-state PNX by record
+id; hard stop if it requires search APIs, query replay, pagination,
+unrendered records, or unstable minified state.
+
+Cut list confirmed by r6: Scholar class-2, in-panel route checks, LibKey
+api mode (no partner key), OCLC/Rapido adapters, DataCite relations,
+`papio import` alias — all stay cut/dormant.

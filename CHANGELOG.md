@@ -134,11 +134,13 @@ execution records kept during the initial build.
   typed-relations resolution disabled) and once with the current build.
   `fixture_missing` is an explicit reported state, never a silent skip. The
   headline is `incremental_autonomous_ready` — how many more works the
-  current build resolves without a human boundary than the baseline does —
-  measured over a frozen field cohort seeded from the 2026-07-21 report,
-  answering the question the unmeasured resolver work had left open.
-  `papio bench --cohort <path>` never talks to the daemon; a manual live
-  mode is deferred and does not block this release.
+  current build resolves without a human boundary than the baseline does.
+  The measuring instrument ships now; the frozen field cohort seeded from
+  the 2026-07-21 report is defined but awaits recorded resolver fixtures,
+  so every field-cohort row honestly reports `fixture_missing` and no
+  incremental field number is claimed yet. `papio bench --cohort <path>`
+  never talks to the daemon; a manual live mode is deferred and does not
+  block this release.
 - **ILLiad requests now poll their own status, and a stuck poll can be
   recovered.** Migration 0024 adds poll-health bookkeeping
   (`provider_status_raw`, display status, `last_successful_poll_at`,

@@ -6094,3 +6094,45 @@ func TestHumanActionDismissDiscardsGrabRowWithoutCancellingJob(t *testing.T) {
 		t.Fatalf("grab row survived dismiss: %+v, err=%v", after, err)
 	}
 }
+
+// TestTriageSnapshotV3OmitsUnrepresentableActionKinds pins the interim
+// P0 guard (pending triage-snapshot/4): an open action whose kind is not in
+// schema 3's closed route_class vocabulary — pdf_identifier_needed today —
+// is OMITTED from v3 snapshots rather than poisoning the whole frame with
+// an invalid route_class. The action stays reachable via the CLI surfaces.
+func TestTriageSnapshotV3OmitsUnrepresentableActionKinds(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+
+	grabJobID := park(t, jobs, "wr_v3_omit_grab", handoffWork())
+	if _, err := jobs.OpenHumanAction(ctx, grabJobID, job.ActionKindPdfIdentifierNeeded,
+		"grabbed-paper.pdf", job.Access(false, "")); err != nil {
+		t.Fatal(err)
+	}
+	manualID := park(t, jobs, "wr_v3_omit_manual", handoffWork())
+	if _, err := jobs.OpenHumanAction(ctx, manualID, "manual_download",
+		"https://provider.example.edu/x", job.Access(false, "")); err != nil {
+		t.Fatal(err)
+	}
+
+	runSync(t, b, hello())
+	msgs, _ := runSync(t, b, inFrame(t, protocol.MsgTriageSnapshotRequest, "",
+		protocol.TriageSnapshotRequestPayload{RequestID: "request-v3-omit-01", SchemaVersions: []int64{3}, Limit: 50}))
+	snap := firstOfType(msgs, protocol.MsgTriageSnapshotResponse)
+	if snap == nil {
+		t.Fatalf("no snapshot in %v", msgs)
+	}
+	payload := snap.Payload.(*protocol.TriageSnapshotResponsePayload)
+	foundManual := false
+	for _, item := range payload.Items {
+		if item.ActionKind == job.ActionKindPdfIdentifierNeeded {
+			t.Fatalf("pdf_identifier_needed item leaked into a v3 snapshot: %+v", item)
+		}
+		if item.JobID == manualID {
+			foundManual = true
+		}
+	}
+	if !foundManual {
+		t.Fatal("representable manual_download item missing — guard over-filtered")
+	}
+}
