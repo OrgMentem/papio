@@ -104,6 +104,13 @@ type LookupWork struct {
 // pre-acquisition deduplication.
 type LookupWorksRequest struct {
 	Works []LookupWork `json:"works"`
+	// LocalOnly answers from Zotio's existing local mirror without the
+	// usual refresh sync. The sync is a network operation against the
+	// user's Zotero account, so callers whose privacy contract promises a
+	// purely local check — the page-bulk selection workspace — must set
+	// this; pre-acquisition dedupe (batch submit, watches) wants the
+	// freshest mirror and leaves it false.
+	LocalOnly bool `json:"local_only,omitempty"`
 }
 
 // WorkOwnership is aligned by index with LookupWorksRequest.Works.
@@ -143,8 +150,10 @@ func (s *Service) LookupWorks(ctx context.Context, request LookupWorksRequest) (
 	for i := range result.Works {
 		result.Works[i].Status = OwnershipNotOwned
 	}
-	if err := s.CLI.Sync(ctx); err != nil {
-		result.StalenessWarning = "Zotio mirror sync failed; ownership classification may be stale"
+	if !request.LocalOnly {
+		if err := s.CLI.Sync(ctx); err != nil {
+			result.StalenessWarning = "Zotio mirror sync failed; ownership classification may be stale"
+		}
 	}
 
 	lookupCache := make(map[string][]string)

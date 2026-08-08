@@ -5214,6 +5214,7 @@ func TestPageBulkStatusOwnershipLookupFailureStaysIncomplete(t *testing.T) {
 // JSON output, and MissingPDF names which of those keys still lack a PDF.
 type fakeZotioCLI struct {
 	find      map[string]json.RawMessage
+	findErr   error
 	missing   []zotio.MissingPDFItem
 	syncErr   error
 	syncCalls int
@@ -5233,6 +5234,9 @@ func (f *fakeZotioCLI) Sync(context.Context) error {
 	return f.syncErr
 }
 func (f *fakeZotioCLI) RunJSON(_ context.Context, args ...string) (json.RawMessage, error) {
+	if f.findErr != nil {
+		return nil, f.findErr
+	}
 	if len(args) >= 5 && strings.Join(args[:3], " ") == "--agent items find" {
 		key := strings.TrimPrefix(args[3], "--") + ":" + args[4]
 		if raw := f.find[key]; raw != nil {
@@ -5298,10 +5302,17 @@ func TestPageBulkStatusZotioOwnedMissingPDFCarriesItemKey(t *testing.T) {
 }
 
 // TestPageBulkStatusZotioStalenessYieldsOwnershipUnknown pins ADR-0008
-// invariant 2 for the zotio path specifically: a failed mirror sync must
-// never let a "no match" reading collapse into a false "eligible" claim.
+// invariant 2 for the zotio path specifically: a degraded zotio reading must
+// never let a "no match" collapse into a false "eligible" claim. Page-bulk
+// lookups run LocalOnly (no mirror sync — the workspace privacy line
+// promises a purely local check), so degradation here means the local
+// lookup itself failing, and the sync-call assertion pins that no sync is
+// ever attempted from this path.
 func TestPageBulkStatusZotioStalenessYieldsOwnershipUnknown(t *testing.T) {
-	cli := &fakeZotioCLI{syncErr: fmt.Errorf("zotio offline")}
+	cli := &fakeZotioCLI{
+		findErr: fmt.Errorf("zotio mirror unreadable"),
+		syncErr: fmt.Errorf("sync must never run from page-bulk"),
+	}
 	b, _, _, _ := newBridgeWithHoldingsAndZotio(t, nil, &zotio.Service{CLI: cli})
 	runSync(t, b, hello())
 
@@ -5316,10 +5327,10 @@ func TestPageBulkStatusZotioStalenessYieldsOwnershipUnknown(t *testing.T) {
 	}
 	item := result.Payload.(*protocol.PageBulkStatusResultPayload).Items[0]
 	if item.Status != "ownership_unknown" || item.OwnershipComplete {
-		t.Fatalf("item = %+v after a failed zotio sync, want ownership_unknown (never a plain unowned/eligible claim)", item)
+		t.Fatalf("item = %+v after a failed zotio lookup, want ownership_unknown (never a plain unowned/eligible claim)", item)
 	}
-	if cli.syncCalls != 1 {
-		t.Fatalf("sync calls = %d, want 1", cli.syncCalls)
+	if cli.syncCalls != 0 {
+		t.Fatalf("sync calls = %d, want 0 (page-bulk lookups are LocalOnly)", cli.syncCalls)
 	}
 }
 

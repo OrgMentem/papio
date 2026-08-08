@@ -2001,7 +2001,9 @@ func (b *Bridge) pageBulkZotioLookup(ctx context.Context, ids []protocol.PageBul
 			end = len(entries)
 		}
 		chunk := entries[offset:end]
-		request := zotio.LookupWorksRequest{Works: make([]zotio.LookupWork, len(chunk))}
+		// LocalOnly: the workspace privacy line promises this check makes
+		// no network request; zotio's refresh sync would be one.
+		request := zotio.LookupWorksRequest{LocalOnly: true, Works: make([]zotio.LookupWork, len(chunk))}
 		for i, e := range chunk {
 			request.Works[i] = e.work
 		}

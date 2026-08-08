@@ -11,6 +11,18 @@ execution records kept during the initial build.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Workspace ownership checks no longer trigger a Zotero-account sync.** A
+  triaged documentation review caught the privacy page promising "no request
+  leaves your machine" for page-bulk ownership marks while the underlying
+  zotio lookup unconditionally refreshed its mirror first — a network
+  operation against the user's Zotero account, once per status poll. The
+  page-bulk path now asks zotio in local-only mode (the on-disk mirror
+  answers; nothing is synced), which makes the published claim true and
+  removes per-poll cloud traffic. Pre-acquisition dedupe for batch submit
+  and watches keeps the refresh-first behavior deliberately.
+
 ## [0.19.0] - 2026-08-08
 
 ### Added

@@ -451,3 +451,34 @@ func TestQueueMissingPDFUnavailableCooldown(t *testing.T) {
 		t.Fatalf("disabled cool-down result = %+v", result)
 	}
 }
+
+// TestLookupWorksLocalOnlySkipsSync pins the privacy contract behind the
+// page-bulk workspace: a LocalOnly lookup answers from the existing mirror
+// with zero sync subprocess calls (the sync reaches the user's Zotero
+// account over the network) and reports no staleness warning, while
+// classification still works.
+func TestLookupWorksLocalOnlySkipsSync(t *testing.T) {
+	cli := &fakeCLI{
+		items: []MissingPDFItem{},
+		find: map[string]json.RawMessage{
+			"doi:10.1000/with-pdf": json.RawMessage(`[{"key":"PDF00001","data":{}}]`),
+		},
+		syncErr: errors.New("sync must never be attempted in LocalOnly mode"),
+	}
+	result, err := (&Service{CLI: cli}).LookupWorks(context.Background(), LookupWorksRequest{
+		LocalOnly: true,
+		Works:     []LookupWork{{DOI: "10.1000/with-pdf"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cli.syncCalls != 0 {
+		t.Fatalf("sync calls in LocalOnly mode = %d, want 0", cli.syncCalls)
+	}
+	if result.StalenessWarning != "" {
+		t.Fatalf("staleness warning = %q, want empty (no sync was attempted, none failed)", result.StalenessWarning)
+	}
+	if result.Works[0].Status != OwnershipOwnedWithPDF || result.Works[0].ItemKey != "PDF00001" {
+		t.Fatalf("classification = %+v, want owned_with_pdf/PDF00001", result.Works[0])
+	}
+}
