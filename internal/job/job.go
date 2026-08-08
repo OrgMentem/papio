@@ -67,6 +67,17 @@ const (
 	// (open_request_history, confirm_request_exists, confirm_request_absent)
 	// are validated by internal/delivery; it never offers retry_submission.
 	ActionKindDocumentDelivery = "document_delivery"
+	// ActionKindDownloadsAccessRequired marks the human action opened when a
+	// completed browser download's adoption is deferred while the bridge's
+	// adoption-scan latch is unhealthy (internal/browser's
+	// adoptionScanSuspended — the macOS TCC consent-wall signature AGENTS.md
+	// documents), rather than on an ordinary transient defer. Its detail
+	// carries the adoption root path. It is deliberately absent from
+	// dismissalCancelsParkedJob's awaiting_human list: the download itself is
+	// fine, only the folder grant is missing, so dismissing it must never
+	// cancel the job. It resolves the same way any other non-advisory action
+	// does — the job's next terminal transition (see (*Store).transition).
+	ActionKindDownloadsAccessRequired = "downloads_access_required"
 )
 
 // Candidate statuses. Only CandidateAccepted asserts that these bytes were
@@ -2685,7 +2696,10 @@ func normalizeReviewBusy(err error) error {
 // the dismissed action: awaiting_human for openurl_handoff, manual_download,
 // openurl_available, or document_delivery; or needs_review for
 // verify_identity. A stale action from another state is closed without
-// disturbing the job's live work.
+// disturbing the job's live work. downloads_access_required is deliberately
+// excluded from the awaiting_human list even though that action also parks a
+// job there: the pending download itself is fine, only the folder grant is
+// missing, so dismissing it must never cancel the acquisition.
 func (js *Store) DismissHumanAction(ctx context.Context, actionID, expectedRevision int64) (jobID string, err error) {
 	if actionID <= 0 || expectedRevision <= 0 {
 		return "", errors.New("dismiss requires a positive action ID and revision")
@@ -2740,6 +2754,8 @@ func (js *Store) DismissHumanAction(ctx context.Context, actionID, expectedRevis
 func dismissalCancelsParkedJob(actionKind, state string) bool {
 	switch state {
 	case StateAwaitingHuman:
+		// downloads_access_required is awaiting_human too, but intentionally
+		// absent here — see DismissHumanAction's doc comment.
 		return actionKind == "openurl_handoff" || actionKind == "manual_download" || actionKind == "openurl_available" || actionKind == ActionKindDocumentDelivery
 	case StateNeedsReview:
 		return actionKind == "verify_identity"

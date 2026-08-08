@@ -899,6 +899,12 @@ func TestTriageSnapshotV3AttentionMapping(t *testing.T) {
 	fulfilledID := parkDocumentDelivery(t, jobs, b.svc, "wr_v3_delivery_full",
 		work.Work{DOI: "10.1002/example.45", Title: "Fulfilled ILL", Year: 2021}, "illiad", "fulfilled", "TN-2")
 
+	downloadsAccessID := park(t, jobs, "wr_v3_downloads_access", handoffWork())
+	if _, err := jobs.OpenHumanAction(ctx, downloadsAccessID, job.ActionKindDownloadsAccessRequired,
+		cfg.EffectiveAdoptionRoot(), job.Access(false, "")); err != nil {
+		t.Fatal(err)
+	}
+
 	runSync(t, b, hello())
 
 	v3msgs, _ := runSync(t, b, inFrame(t, protocol.MsgTriageSnapshotRequest, "",
@@ -915,10 +921,11 @@ func TestTriageSnapshotV3AttentionMapping(t *testing.T) {
 	for _, tc := range []struct {
 		jobID, want string
 	}{
-		{unknownAuthID, "working"}, // unknown-auth openurl handoff proceeds on its own
-		{knownAuthID, "required"},  // known login/MFA boundary
-		{unresolvedID, "required"}, // delivery unknown_outcome
-		{fulfilledID, "working"},   // fulfilled delivery being autonomously retrieved
+		{unknownAuthID, "working"},      // unknown-auth openurl handoff proceeds on its own
+		{knownAuthID, "required"},       // known login/MFA boundary
+		{unresolvedID, "required"},      // delivery unknown_outcome
+		{fulfilledID, "working"},        // fulfilled delivery being autonomously retrieved
+		{downloadsAccessID, "required"}, // TCC-blocked adoption root needs a human grant
 	} {
 		item, ok := byJob[tc.jobID]
 		if !ok {
@@ -939,6 +946,23 @@ func TestTriageSnapshotV3AttentionMapping(t *testing.T) {
 	}
 	if fulfilled.RouteClass != "document_delivery" {
 		t.Fatalf("route_class = %q, want document_delivery", fulfilled.RouteClass)
+	}
+	downloadsAccess := byJob[downloadsAccessID]
+	if downloadsAccess.RouteClass != job.ActionKindDownloadsAccessRequired {
+		t.Fatalf("route_class = %q, want %s", downloadsAccess.RouteClass, job.ActionKindDownloadsAccessRequired)
+	}
+	if downloadsAccess.Facts == nil {
+		t.Fatalf("downloads_access_required item carries no facts (expected the adoption root detail)")
+	}
+	var sawRootDetail bool
+	for _, fact := range downloadsAccess.Facts {
+		if fact.Label == "Detail" && fact.Text == cfg.EffectiveAdoptionRoot() {
+			sawRootDetail = true
+		}
+	}
+	if !sawRootDetail {
+		t.Fatalf("downloads_access_required facts = %+v, want a Detail fact carrying the adoption root %q",
+			downloadsAccess.Facts, cfg.EffectiveAdoptionRoot())
 	}
 
 	// Schema 2 stays byte-identical: no triage-snapshot/3 field ever appears
@@ -3048,6 +3072,134 @@ func TestDownloadForUnrelatedJobDoesNotAdoptAnotherJobsFile(t *testing.T) {
 	}
 	if tRow.State != job.StateReady && tRow.State != job.StateAwaitingHuman {
 		t.Fatalf("target in unexpected state: %+v", tRow)
+	}
+}
+
+// openDownloadsAccessActions filters open human actions to the
+// downloads_access_required ones for one job, for the assertions below.
+func openDownloadsAccessActions(t *testing.T, jobs *job.Store, jobID string) []job.HumanAction {
+	t.Helper()
+	open, err := jobs.ListHumanActions(context.Background(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var matches []job.HumanAction
+	for _, a := range open {
+		if a.JobID == jobID && a.Kind == job.ActionKindDownloadsAccessRequired {
+			matches = append(matches, a)
+		}
+	}
+	return matches
+}
+
+// TestAdoptionDeferredWithHealthyLatchOpensNoAction is the negative case: an
+// ordinary transient defer (here, download_complete racing a file that has
+// not landed yet) with the adoption-scan latch healthy must never open a
+// downloads_access_required action — that grant would not fix the actual
+// problem.
+func TestAdoptionDeferredWithHealthyLatchOpensNoAction(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	target := park(t, jobs, "wr_tcc_unlatched", handoffWork())
+	runSync(t, b, hello())
+
+	if b.adoptionLatchUnhealthy() {
+		t.Fatal("latch must start healthy")
+	}
+	frame := inFrame(t, protocol.MsgDownloadComplete, target,
+		map[string]any{"download_id": 1, "filename": "paper.pdf", "size_bytes": 533})
+	msgs, _ := runSync(t, b, frame)
+	if firstOfType(msgs, protocol.MsgAck) == nil {
+		t.Fatalf("expected ack after deferred adoption: %v", msgs)
+	}
+	if matches := openDownloadsAccessActions(t, jobs, target); len(matches) != 0 {
+		t.Fatalf("unlatched defer opened downloads_access_required actions: %+v", matches)
+	}
+}
+
+// TestAdoptionDeferredWithUnhealthyLatchOpensExactlyOneAction is the
+// positive case: while the adoption-scan latch is unhealthy, a deferred
+// adoption opens a downloads_access_required action naming the adoption
+// root, and repeated deferrals across polls (two separate download_complete
+// events here) never open a second one — OpenHumanAction's own dedupe
+// covers it.
+func TestAdoptionDeferredWithUnhealthyLatchOpensExactlyOneAction(t *testing.T) {
+	b, jobs, cfg, _ := newBridge(t)
+	target := park(t, jobs, "wr_tcc_latched", handoffWork())
+	runSync(t, b, hello())
+
+	b.adoptionScanMu.Lock()
+	b.adoptionScanSuspended = true
+	b.adoptionScanMu.Unlock()
+
+	for _, downloadID := range []int{1, 2} {
+		frame := inFrame(t, protocol.MsgDownloadComplete, target,
+			map[string]any{"download_id": downloadID, "filename": "paper.pdf", "size_bytes": 533})
+		msgs, _ := runSync(t, b, frame)
+		if firstOfType(msgs, protocol.MsgAck) == nil {
+			t.Fatalf("download %d: expected ack after deferred adoption: %v", downloadID, msgs)
+		}
+	}
+
+	matches := openDownloadsAccessActions(t, jobs, target)
+	if len(matches) != 1 {
+		t.Fatalf("open downloads_access_required actions = %d, want exactly 1: %+v", len(matches), matches)
+	}
+	if matches[0].Detail != cfg.EffectiveAdoptionRoot() {
+		t.Fatalf("action detail = %q, want the adoption root %q", matches[0].Detail, cfg.EffectiveAdoptionRoot())
+	}
+}
+
+// TestSweepAdoptionResolvesDownloadsAccessActionAfterLatchRecovers is
+// acceptance point 2: the action opened mid-flight, while the latch was
+// unhealthy, must close once the grant lands and a directory sweep — not
+// another download_complete — adopts the file.
+func TestSweepAdoptionResolvesDownloadsAccessActionAfterLatchRecovers(t *testing.T) {
+	b, jobs, cfg, _ := newBridge(t)
+	ctx := context.Background()
+	target := park(t, jobs, "wr_tcc_sweep_resolve", handoffWork())
+	runSync(t, b, hello())
+
+	b.adoptionScanMu.Lock()
+	b.adoptionScanSuspended = true
+	b.adoptionScanMu.Unlock()
+	runSync(t, b, inFrame(t, protocol.MsgDownloadComplete, target,
+		map[string]any{"download_id": 1, "filename": "paper.pdf", "size_bytes": 533}))
+	if matches := openDownloadsAccessActions(t, jobs, target); len(matches) != 1 {
+		t.Fatalf("latched defer did not open exactly one action: %+v", matches)
+	}
+
+	// The user grants access; the latch clears and the file lands. A sweep
+	// tick adopts it and must close the action left open mid-flight.
+	b.adoptionScanMu.Lock()
+	b.adoptionScanSuspended = false
+	b.adoptionScanMu.Unlock()
+	writeFixturePDF(t, filepath.Join(cfg.EffectiveAdoptionRoot(), target, "paper.pdf"))
+	if err := b.SweepAdoptions(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	row, err := jobs.Get(ctx, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.State != job.StateReady || row.ArtifactSHA256 == "" {
+		t.Fatalf("sweep did not adopt after latch recovery: %+v", row)
+	}
+	if matches := openDownloadsAccessActions(t, jobs, target); len(matches) != 0 {
+		t.Fatalf("downloads_access_required action still open after adoption succeeded: %+v", matches)
+	}
+	all, err := jobs.ListHumanActions(ctx, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var resolved bool
+	for _, a := range all {
+		if a.JobID == target && a.Kind == job.ActionKindDownloadsAccessRequired && a.Status == "resolved" {
+			resolved = true
+		}
+	}
+	if !resolved {
+		t.Fatalf("downloads_access_required action was not resolved: %+v", all)
 	}
 }
 
@@ -5425,5 +5577,73 @@ func TestPageBulkStatusWithoutHintRecordsNullDenominator(t *testing.T) {
 	}
 	if renderedHint.Valid {
 		t.Fatalf("rendered_record_count_hint = %v, want NULL when the request carried no hint", renderedHint.Int64)
+	}
+}
+
+// TestSweepsSkipTickOnHungAdoptionRoot pins that both sweeper passes route the
+// adoption-root listing through the bounded, latch-aware seam. Before this,
+// SweepAdoptions and SweepTerminalAdoptions called os.ReadDir directly, so a
+// TCC-hung root wedged the sweeper goroutine forever — retroactive adoption
+// and landing-directory cleanup silently stopped until a daemon restart.
+func TestSweepsSkipTickOnHungAdoptionRoot(t *testing.T) {
+	b, _, _, _ := newBridge(t)
+	ctx := context.Background()
+
+	var calls int32
+	block := make(chan struct{})
+	t.Cleanup(func() { close(block) })
+	b.readDir = func(string) ([]os.DirEntry, error) {
+		atomic.AddInt32(&calls, 1)
+		<-block
+		return nil, errors.New("unreachable in this test")
+	}
+
+	done := make(chan error, 2)
+	go func() { done <- b.SweepAdoptions(ctx) }()
+	go func() { done <- b.SweepTerminalAdoptions(ctx) }()
+	for range 2 {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("sweep during hung root: %v, want nil (skip tick)", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("sweep wedged on a hung adoption root instead of skipping the tick")
+		}
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("readDir calls = %d, want 1 (latch must prevent stacking a second hung goroutine)", got)
+	}
+}
+
+// TestSweepTerminalAdoptionsRemovesEmptyUnknownDirs pins the empty-stray rule:
+// a directory not matching any known job is removed only when empty (rmdir
+// semantics — atomically refused if a file lands concurrently), while an
+// unknown directory holding a file is preserved for a human.
+func TestSweepTerminalAdoptionsRemovesEmptyUnknownDirs(t *testing.T) {
+	b, _, _, _ := newBridge(t)
+	ctx := context.Background()
+	root := b.cfg.EffectiveAdoptionRoot()
+
+	empty := filepath.Join(root, "job_unknown_empty_stray_000000")
+	full := filepath.Join(root, "job_unknown_with_contents_0000")
+	if err := os.MkdirAll(empty, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(full, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(full, "paper.pdf"), []byte("%PDF-"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := b.SweepTerminalAdoptions(ctx); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if _, err := os.Stat(empty); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("empty unknown dir survived the sweep: err=%v, want removed", err)
+	}
+	if _, err := os.Stat(filepath.Join(full, "paper.pdf")); err != nil {
+		t.Fatalf("unknown dir with contents must be preserved for a human: %v", err)
 	}
 }

@@ -246,6 +246,13 @@ type Bridge struct {
 	// is ever outstanding per bridge. The goroutine that tripped it clears
 	// the flag, and logs the recovery, the moment it finally returns.
 	adoptionScanSuspended bool
+	// adoptionScanGate is a capacity-1 semaphore held for the FULL lifetime
+	// of one underlying root/dir listing — a hung syscall keeps it held past
+	// the deadline — so concurrent callers (per-job poll scans vs the two
+	// sweeper passes) can never stack a second hung goroutine or double-fire
+	// the suspend/resume transition logs. Lazily initialised under
+	// adoptionScanMu.
+	adoptionScanGate chan struct{}
 }
 
 // browserSession is one native-host connection that said hello.
@@ -855,8 +862,9 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 			// the job parked, and let the poll-time directory scan pick the
 			// file up when it appears. Confinement violations land here too —
 			// the report is ignored and the job simply stays awaiting_human.
-			if evErr := b.jobs.S.AppendEvent(ctx, msg.JobID, "browser.adoption_deferred",
-				map[string]any{"filename": p.Filename, "reason": truncate(err.Error(), 200)}); evErr != nil {
+			// If the adoption-scan latch is currently unhealthy, this also
+			// opens/refreshes a downloads_access_required action.
+			if evErr := b.recordAdoptionDeferred(ctx, msg.JobID, p.Filename, err); evErr != nil {
 				return nil, evErr
 			}
 		} else {
@@ -2371,8 +2379,7 @@ func (b *Bridge) deliveryContext(ctx context.Context, jobID string, payload *pro
 		return nil
 	}
 	if _, err := b.adoptOutsideSessionLock(ctx, jobID, pending.Filename, provenance); err != nil {
-		_ = b.jobs.S.AppendEvent(ctx, jobID, "browser.adoption_deferred",
-			map[string]any{"filename": pending.Filename, "reason": truncate(err.Error(), 200)})
+		_ = b.recordAdoptionDeferred(ctx, jobID, pending.Filename, err)
 		return nil
 	}
 	delete(b.deliveryContexts, key)
@@ -3036,13 +3043,35 @@ func BoundedReadDir(dir string, readDir func(string) ([]os.DirEntry, error), aft
 // two log lines fire exactly once per transition.
 func (b *Bridge) readAdoptionDir(dir string) ([]os.DirEntry, error) {
 	b.adoptionScanMu.Lock()
+	if b.adoptionScanGate == nil {
+		b.adoptionScanGate = make(chan struct{}, 1)
+	}
+	gate := b.adoptionScanGate
 	suspended := b.adoptionScanSuspended
 	b.adoptionScanMu.Unlock()
 	if suspended {
 		return nil, ErrAdoptionScanTimeout // a prior call is still hung; never stack another
 	}
 
-	entries, err := BoundedReadDir(dir, b.readDir, func([]os.DirEntry, error) {
+	// Single-flight: acquire the gate for the whole lifetime of the
+	// underlying call. If the current holder is itself hung, waiting the
+	// full deadline here is pointless — it will latch the bridge; report
+	// the same fail-closed timeout without touching the latch.
+	select {
+	case gate <- struct{}{}:
+	case <-time.After(adoptionScanDeadline):
+		return nil, ErrAdoptionScanTimeout
+	}
+
+	fn := b.readDir
+	if fn == nil {
+		fn = os.ReadDir
+	}
+	held := func(d string) ([]os.DirEntry, error) {
+		defer func() { <-gate }() // released when the real call returns — timely or hours late
+		return fn(d)
+	}
+	entries, err := BoundedReadDir(dir, held, func([]os.DirEntry, error) {
 		b.adoptionScanMu.Lock()
 		b.adoptionScanSuspended = false
 		b.adoptionScanMu.Unlock()
@@ -3055,6 +3084,51 @@ func (b *Bridge) readAdoptionDir(dir string) ([]os.DirEntry, error) {
 		log.Printf("papio: adoption scans suspended: %s not responding (macOS privacy consent?)", b.cfg.EffectiveAdoptionRoot())
 	}
 	return entries, err
+}
+
+// adoptionLatchUnhealthy reports whether the adoption-scan latch
+// (adoptionScanSuspended) is currently tripped: a prior ReadDir under the
+// adoption root missed adoptionScanDeadline and has not yet returned. It is
+// the daemon-side signature of the macOS TCC consent wall AGENTS.md
+// documents, and recordAdoptionDeferred uses it to decide whether a failed
+// adoption is plausibly that wall (worth a human grant prompt) rather than
+// an ordinary transient miss.
+func (b *Bridge) adoptionLatchUnhealthy() bool {
+	b.adoptionScanMu.Lock()
+	defer b.adoptionScanMu.Unlock()
+	return b.adoptionScanSuspended
+}
+
+// recordAdoptionDeferred appends the durable browser.adoption_deferred event
+// for one failed adoption attempt (a completed download whose bytes are not
+// yet — or never — going to land in the artifact store) and, only when the
+// adoption-scan latch is currently unhealthy, opens or refreshes a
+// downloads_access_required human action naming the adoption root.
+//
+// An ordinary transient defer — the file has not finished writing, a Chrome
+// rename race, a confinement violation — leaves the latch healthy and opens
+// nothing: those are not fixed by a Full Disk/Files-and-Folders grant, and a
+// user should never be sent chasing a permission that was never the
+// problem. OpenHumanAction is itself idempotent per (job, kind), so polling
+// this on every deferred adoption — download_complete, the periodic
+// directory sweep, or the poll-time scan — never opens a second action; it
+// just refreshes the one already open. The action resolves the same way
+// every other non-advisory action does, on the job's next terminal
+// transition (job.Store's transition), which fires the moment adoption
+// eventually succeeds.
+func (b *Bridge) recordAdoptionDeferred(ctx context.Context, jobID, filename string, cause error) error {
+	if err := b.jobs.S.AppendEvent(ctx, jobID, "browser.adoption_deferred",
+		map[string]any{"filename": filename, "reason": truncate(cause.Error(), 200)}); err != nil {
+		return err
+	}
+	if !b.adoptionLatchUnhealthy() {
+		return nil
+	}
+	if _, err := b.jobs.OpenHumanAction(ctx, jobID, job.ActionKindDownloadsAccessRequired,
+		b.cfg.EffectiveAdoptionRoot(), job.Access(false, "")); err != nil {
+		return err
+	}
+	return nil
 }
 
 // scanAdoptionDir looks for exactly one settled candidate file in an
@@ -3106,7 +3180,10 @@ func (b *Bridge) scanAdoptionDir(_ context.Context, jobID string) (string, bool)
 // to call on a timer.
 func (b *Bridge) SweepAdoptions(ctx context.Context) error {
 	root := b.cfg.EffectiveAdoptionRoot()
-	entries, err := os.ReadDir(root)
+	entries, err := b.readAdoptionDir(root)
+	if errors.Is(err, ErrAdoptionScanTimeout) {
+		return nil // root not responding (TCC); latch already logged, skip this tick
+	}
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil
@@ -3132,8 +3209,7 @@ func (b *Bridge) SweepAdoptions(ctx context.Context) error {
 			continue
 		}
 		if _, err := b.adopt(ctx, jobID, name); err != nil {
-			if evErr := b.jobs.S.AppendEvent(ctx, jobID, "browser.adoption_deferred",
-				map[string]any{"filename": name, "reason": truncate(err.Error(), 200)}); evErr != nil {
+			if evErr := b.recordAdoptionDeferred(ctx, jobID, name, err); evErr != nil {
 				return evErr
 			}
 		}
@@ -3153,7 +3229,10 @@ func (b *Bridge) SweepAdoptions(ctx context.Context) error {
 // timer.
 func (b *Bridge) SweepTerminalAdoptions(ctx context.Context) error {
 	root := b.cfg.EffectiveAdoptionRoot()
-	entries, err := os.ReadDir(root)
+	entries, err := b.readAdoptionDir(root)
+	if errors.Is(err, ErrAdoptionScanTimeout) {
+		return nil // root not responding (TCC); latch already logged, skip this tick
+	}
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil
@@ -3165,8 +3244,17 @@ func (b *Bridge) SweepTerminalAdoptions(ctx context.Context) error {
 			continue
 		}
 		row, err := b.jobs.Get(ctx, e.Name())
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			continue // store hiccup: not evidence the job is unknown — leave it
+		}
 		if err != nil || row == nil {
-			continue // unknown or unreadable dir: leave it for a human
+			// Confirmed-unknown dir (prior database era, crashed run): never
+			// delete contents a human may need, but an EMPTY stray is pure
+			// clutter. os.Remove has rmdir semantics — it fails atomically if
+			// a file lands concurrently, so this can never eat a real
+			// download.
+			_ = os.Remove(filepath.Join(root, e.Name()))
+			continue
 		}
 		if !job.Terminal(row.State) {
 			continue
@@ -3259,8 +3347,7 @@ func (b *Bridge) poll(ctx context.Context) ([]json.RawMessage, error) {
 				return out, nil
 			}
 			if err != nil {
-				if evErr := b.jobs.S.AppendEvent(ctx, row.ID, "browser.adoption_deferred",
-					map[string]any{"filename": name, "reason": truncate(err.Error(), 200)}); evErr != nil {
+				if evErr := b.recordAdoptionDeferred(ctx, row.ID, name, err); evErr != nil {
 					return nil, evErr
 				}
 			} else {

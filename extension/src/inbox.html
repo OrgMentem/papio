@@ -761,6 +761,12 @@
         color: var(--color-warning);
       }
 
+      .item-status[data-status="downloads_access_required"] {
+        background: var(--color-warning-surface);
+        border-color: var(--color-warning-border);
+        color: var(--color-warning);
+      }
+
       /* Bibliographic metadata and next-action copy stay quiet; supporting
          mechanism text is available from the inline disclosure. */
       .item-citation {
@@ -1172,6 +1178,7 @@
         <span class="item-status" data-status="openurl_handoff" aria-hidden="true">↗</span><span>browser handoff</span>
         <span class="item-status" data-status="verify_identity" aria-hidden="true">?</span><span>verify identity</span>
         <span class="item-status" data-status="document_delivery" aria-hidden="true">⇄</span><span>document delivery</span>
+        <span class="item-status" data-status="downloads_access_required" aria-hidden="true">⚠</span><span>downloads access</span>
         <span class="item-status" data-status="watch_hit" aria-hidden="true">✶</span><span>watch hit</span>
         <span class="item-status" data-status="retraction" aria-hidden="true">!</span><span>retraction</span>
       </p>

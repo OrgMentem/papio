@@ -1143,6 +1143,7 @@ func (d TriageDelivery) validate() error {
 var triageRouteClasses = []string{
 	"openurl_handoff", "manual_download", "verify_identity", "openurl_available",
 	"human_auth_required", "terms_acceptance_required", "document_delivery",
+	"downloads_access_required",
 }
 
 // triageBlockedByV2 is schema 2's exact closed set, shipped and locked

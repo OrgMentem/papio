@@ -13,6 +13,21 @@ execution records kept during the initial build.
 
 ### Added
 
+- **A blocked Downloads folder is now a visible action, not a silent stall.**
+  When macOS privacy consent (TCC) leaves the daemon unable to read the
+  download-adoption root, a completed browser download opens one
+  `downloads_access_required` human action on its job — surfaced in the
+  extension inbox with required attention and the exact grant remedy — and
+  resolves itself the moment adoption succeeds. Poll and sweep passes open
+  at most one per job; dismissing it never cancels the job.
+- **Adoption sweeps can no longer wedge on a hung filesystem.** Both sweeper
+  passes route the adoption-root listing through the bounded, latch-aware
+  reader (previously only per-job scans were protected), a single-flight
+  gate guarantees at most one outstanding hung syscall bridge-wide (the
+  suspend/resume log pair now fires exactly once per episode), and the
+  terminal sweep removes empty stray directories from prior database eras —
+  a store hiccup is never treated as evidence a job is unknown.
+
 - **Page-bulk status now knows what you own.** `zotio.Service.LookupWorks` —
   already serving batch submit's ownership classification — is wired into
   `page_bulk_status`: a scanned page's identifiers merge zotio's

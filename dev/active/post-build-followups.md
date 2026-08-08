@@ -146,3 +146,16 @@ door open, v1 unweakened.
   auto-capable.
 - **In-panel "Check routes"**: explicit selected-rows-only action, never
   pre-click badges; the privacy line does not move.
+- **ResolveReview bypasses shared action closure** (review finding,
+  2026-08-08): its dedicated raw-SQL transition resolves only the
+  `verify_identity` action, so any other open action kind
+  (`downloads_access_required`, `human_auth_required`,
+  `terms_acceptance_required`) riding a job into a rejected review stays
+  open until `CloseStaleHumanActions` — which runs once at daemon startup,
+  not on a timer. Pre-existing; fix is routing ResolveReview's terminal
+  transition through the shared closure (or a recurring stale sweep).
+- **Three hand-maintained action-kind tables can silently shrink**
+  (internal/app/action_guidance_test.go, action_reminder_test.go,
+  internal/cli/errcat_guidance_test.go): a future kind added to job.go
+  passes all three without coverage. Same trap class the TerminalReason
+  parse-enforced test closed; close it the same way.

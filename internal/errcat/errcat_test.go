@@ -120,6 +120,33 @@ func TestExplainWithOpenActionUsesReplacementManualDownload(t *testing.T) {
 	}
 }
 
+// TestExplainWithOpenActionNamesTheAdoptionRootForDownloadsAccess pins the
+// downloads_access_required explanation: it must name the blocked adoption
+// root (carried on the action's Detail) and point at the macOS grant, not
+// offer a sign-in or `papio actions open` — there is nothing to open, the
+// grant happens outside papio entirely.
+func TestExplainWithOpenActionNamesTheAdoptionRootForDownloadsAccess(t *testing.T) {
+	cfg := config.Config{AccessMode: config.ModeDelegated}
+	actions := []job.HumanAction{
+		{ID: 501, Kind: "downloads_access_required", Status: "open", Detail: "/Users/example/Downloads/papio"},
+	}
+	got := ExplainWithOpenAction("awaiting_human", "", "", config.ModeDelegated, actions, cfg)
+	if got.Category != "downloads_access_required" {
+		t.Fatalf("category = %q, want downloads_access_required", got.Category)
+	}
+	if !strings.Contains(got.Guidance, "/Users/example/Downloads/papio") {
+		t.Fatalf("guidance omits the blocked adoption root: %q", got.Guidance)
+	}
+	if !strings.Contains(got.Guidance, "System Settings") {
+		t.Fatalf("guidance omits the grant remediation: %q", got.Guidance)
+	}
+	for _, forbidden := range []string{"sign in", "papio actions open"} {
+		if strings.Contains(got.Guidance, forbidden) {
+			t.Fatalf("guidance offers inapplicable remedy %q: %q", forbidden, got.Guidance)
+		}
+	}
+}
+
 func TestExplainWithOpenActionKeepsTerminalExplanationsWithoutOpenAction(t *testing.T) {
 	cfg := config.Config{
 		AccessMode: config.ModeDelegated,

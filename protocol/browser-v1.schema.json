@@ -289,7 +289,8 @@
         "openurl_available",
         "human_auth_required",
         "terms_acceptance_required",
-        "document_delivery"
+        "document_delivery",
+        "downloads_access_required"
       ]
     },
     "auth_requirement_enum": { "enum": ["true", "false", "unknown"] },

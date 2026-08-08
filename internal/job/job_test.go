@@ -491,6 +491,54 @@ func TestReadyTransitionResolvesOpenHumanActions(t *testing.T) {
 	}
 }
 
+// TestReadyTransitionResolvesDownloadsAccessRequiredAction covers the same
+// machinery TestReadyTransitionResolvesOpenHumanActions pins, for the kind
+// bridge.go opens on a TCC-blocked adoption root: it must resolve on the
+// job's next terminal transition exactly like any other non-advisory
+// action, since downloads_access_required is deliberately absent from
+// informationalActionKind's exemption.
+func TestReadyTransitionResolvesDownloadsAccessRequiredAction(t *testing.T) {
+	js := testStore(t)
+	ctx := context.Background()
+	id, err := js.CreateRequest(ctx, "wr_downloads_access_ready", testWork(), "", "", testPolicy(), nil, PrincipalUnknown)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, edge := range [][2]string{
+		{StateQueued, StateResolving}, {StateResolving, StateFetching}, {StateFetching, StateAwaitingHuman},
+	} {
+		if err := js.Transition(ctx, id, edge[0], edge[1], nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := js.OpenHumanAction(ctx, id, ActionKindDownloadsAccessRequired, "/Users/example/Downloads/papio", Access(false, "")); err != nil {
+		t.Fatal(err)
+	}
+	// Mirrors adoption re-entering validation once the grant lands and the
+	// file is adopted (StateAwaitingHuman -> StateValidating -> StateReady).
+	for _, edge := range [][2]string{
+		{StateAwaitingHuman, StateValidating}, {StateValidating, StateReady},
+	} {
+		if err := js.Transition(ctx, id, edge[0], edge[1], nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	open, err := js.ListHumanActions(ctx, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(open) != 0 {
+		t.Fatalf("open actions after ready = %+v, want none", open)
+	}
+	all, err := js.ListHumanActions(ctx, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 1 || all[0].Kind != ActionKindDownloadsAccessRequired || all[0].Status != "resolved" {
+		t.Fatalf("actions = %+v, want one resolved downloads_access_required", all)
+	}
+}
+
 func TestCloseStaleHumanActionsClosesOnlyTerminalJobs(t *testing.T) {
 	js := testStore(t)
 	ctx := context.Background()
@@ -996,6 +1044,47 @@ func TestDismissHumanActionCancelsAwaitingHandoff(t *testing.T) {
 	row, err := js.Get(ctx, id)
 	if err != nil || row.State != StateCancelled || row.TerminalReason != "user_dismissed" {
 		t.Fatalf("awaiting handoff dismiss = %+v, %v", row, err)
+	}
+}
+
+// TestDismissDownloadsAccessRequiredDoesNotCancelAwaitingJob is the negative
+// case TestDismissHumanActionCancelsAwaitingHandoff pins for the ordinary
+// awaiting_human kinds: the pending download is fine, only the folder grant
+// is missing, so dismissing this kind must leave the job parked rather than
+// cancelling it (dismissalCancelsParkedJob deliberately excludes it).
+func TestDismissDownloadsAccessRequiredDoesNotCancelAwaitingJob(t *testing.T) {
+	js := testStore(t)
+	ctx := context.Background()
+	id, err := js.CreateRequest(ctx, "wr_dismiss_downloads_access", testWork(), "", "", testPolicy(), nil, PrincipalUnknown)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, edge := range [][2]string{
+		{StateQueued, StateResolving},
+		{StateResolving, StateAwaitingHuman},
+	} {
+		if err := js.Transition(ctx, id, edge[0], edge[1], nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	actionID, err := js.OpenHumanAction(ctx, id, ActionKindDownloadsAccessRequired, "/Users/example/Downloads/papio", Access(false, ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobID, err := js.DismissHumanAction(ctx, actionID, 1)
+	if err != nil || jobID != id {
+		t.Fatalf("DismissHumanAction() = %q, %v; want %q, nil", jobID, err, id)
+	}
+	row, err := js.Get(ctx, id)
+	if err != nil || row.State != StateAwaitingHuman || row.TerminalReason != "" {
+		t.Fatalf("downloads_access_required dismiss = %+v, %v, want the job still parked", row, err)
+	}
+	actions, err := js.ListHumanActions(ctx, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(actions) != 1 || actions[0].Status != "cancelled" {
+		t.Fatalf("actions = %+v, want the action cancelled", actions)
 	}
 }
 

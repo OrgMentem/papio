@@ -284,7 +284,8 @@ export interface TriageSnapshotItem {
     | "openurl_available"
     | "human_auth_required"
     | "terms_acceptance_required"
-    | "document_delivery";
+    | "document_delivery"
+    | "downloads_access_required";
   /** ADR-0016 Decision 4's tri-state auth carrier as a string enum (never a
    * bare bool): required on schema-3 human_action items, forbidden below.
    * requires_auth stays the narrow execution gate; only this may drive
@@ -747,6 +748,7 @@ const ROUTE_CLASSES = [
   "human_auth_required",
   "terms_acceptance_required",
   "document_delivery",
+  "downloads_access_required",
 ];
 
 // blockedByV2 is schema 2's exact closed set, shipped and locked: a

@@ -175,6 +175,22 @@ test("triage schema 3 requires attention/route_class/auth_requirement and gates 
   expect(() => parseBrowserMessageBytes(v2WithV3BlockedBy)).toThrow(ProtocolError);
 });
 
+test("downloads_access_required route_class parses and rejects a route_class outside the closed vocabulary", () => {
+  const text = readFileSync(join(corpusRoot, "valid", "browser-triage-snapshot-downloads-access-required.json"), "utf8");
+  const parsed = parseBrowserMessageBytes(text);
+  const items = parsed.payload["items"] as Array<Record<string, unknown>>;
+  const action = items.find((item) => item["action_kind"] === "downloads_access_required");
+  expect(action?.["attention"]).toBe("required");
+  expect(action?.["route_class"]).toBe("downloads_access_required");
+  expect(action?.["auth_requirement"]).toBe("unknown");
+  const detail = (action?.["facts"] as Array<{ label: string; text: string }>).find((fact) => fact.label === "Detail");
+  expect(detail?.text).toBe("/Users/example/Downloads/papio");
+
+  const unknownRouteClass = JSON.parse(text);
+  unknownRouteClass.payload.items[0].route_class = "downloads_access_pending";
+  expect(() => parseBrowserMessage(unknownRouteClass)).toThrow(ProtocolError);
+});
+
 test("delivery_reconcile_request/result round-trip and validate operation-specific provider_reference rules", () => {
   const base = {
     protocol: "papio-browser/1",

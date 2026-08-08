@@ -898,6 +898,7 @@ const STATUS_META: Record<string, { glyph: string; label: string }> = {
   openurl_handoff: { glyph: "↗", label: "Browser handoff ready" },
   verify_identity: { glyph: "?", label: "Identity verification needed" },
   document_delivery: { glyph: "⇄", label: "Document delivery reconciliation" },
+  downloads_access_required: { glyph: "⚠", label: "Downloads folder access needed" },
   watch_hit: { glyph: "✶", label: "New watch hit" },
   retraction: { glyph: "!", label: "Retraction notice" },
 };
@@ -952,6 +953,8 @@ function guidanceText(item: TriageSnapshotItem, blockedByChallenge: boolean): st
       return "Review the PDF, then accept or reject";
     case "document_delivery":
       return "Confirm what the library has on file";
+    case "downloads_access_required":
+      return `papio can't read ${actionDetail(item) || "your Downloads folder"} — grant access in System Settings → Privacy & Security`;
     default:
       return null;
   }
@@ -973,6 +976,8 @@ function mechanismText(item: TriageSnapshotItem, blockedByChallenge: boolean): s
       return "papio files accepted PDFs into your library.";
     case "document_delivery":
       return "papio paused automatic polling until you confirm what the library has on file for this request.";
+    case "downloads_access_required":
+      return "papio adopts the pending download automatically once access is granted — nothing to redo.";
     default:
       return null;
   }
@@ -1603,6 +1608,10 @@ let undoTimer: number | Timer | undefined;
 // hits — just closes a dead row. The snapshot already carries both inputs, so
 // the consequence is known client-side without a protocol change. A human
 // action whose job_state is missing counts as destructive.
+//
+// downloads_access_required is awaiting_human too, but deliberately absent
+// from that case's list: the pending download is fine, only the Downloads
+// folder grant is missing, so dismissing it must never cancel the job.
 function dismissCancelsJob(item: TriageSnapshotItem): boolean {
   if (item.kind !== "human_action") return false;
   switch (item.job_state) {

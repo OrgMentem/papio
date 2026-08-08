@@ -195,6 +195,32 @@ function documentDeliveryAction(
   };
 }
 
+
+function downloadsAccessAction(id: string, rank: number, jobState = "awaiting_human"): TriageSnapshotItem {
+  return {
+    kind: "human_action",
+    id,
+    rank,
+    title: "downloads access required",
+    facts: [
+      { label: "Action", text: "downloads access required" },
+      { label: "Detail", text: "/Users/example/Downloads/papio" },
+    ],
+    links: [],
+    ops: ["dismiss"],
+    attention: "required",
+    action_id: 22,
+    job_id: "job-downloads-access-22",
+    action_kind: "downloads_access_required",
+    job_state: jobState,
+    revision: 1,
+    sha256: "",
+    size_bytes: 0,
+    route_class: "downloads_access_required",
+    auth_requirement: "unknown",
+  };
+}
+
 function retraction(id: string, rank: number, title: string): TriageSnapshotItem {
   return {
     kind: "retraction",
@@ -658,6 +684,51 @@ test("the undo bar names a cancelled acquisition only when the job is parked on 
   await settle();
   expect(page.requests.filter((request) => request.type === "papio.action.resolve").map((request) => request.request["action_id"]))
     .toEqual([18, 20]);
+});
+
+test("downloads_access_required renders the blocked-Downloads label and the adoption root, attention-required styled", async () => {
+  const item = downloadsAccessAction("action:downloads-access", 1);
+  const fixture = snapshot([item], {
+    schema: 3,
+    counts: counts({ pending_total: 1, actions: 1, watch_hits: 0, retractions: 0 }),
+  });
+  const page = await inboxDocument((message) => snapshotReply(fixture, message));
+
+  const card = page.document.querySelector<HTMLElement>("[data-triage-item-id='action:downloads-access']");
+  expect(card?.dataset.attention).toBe("required");
+  expect(card?.querySelector(".item-status")?.getAttribute("aria-label")).toBe("Downloads folder access needed");
+  const instruction = card?.querySelector(".item-instruction")?.textContent ?? "";
+  expect(instruction).toContain("papio can't read /Users/example/Downloads/papio");
+  expect(instruction).toContain("System Settings");
+});
+
+// Mirrors dismissalCancelsParkedJob's deliberate exclusion in
+// internal/job/job.go: the pending download is fine, only the Downloads
+// folder grant is missing, so dismissing this kind must never threaten (or
+// perform) cancellation — unlike manual_download parked on the same state.
+test("dismissing downloads_access_required never cancels the parked job", async () => {
+  const item = downloadsAccessAction("action:downloads-access-dismiss", 1, "awaiting_human");
+  const fixture = snapshot([item], {
+    schema: 3,
+    counts: counts({ pending_total: 1, actions: 1, watch_hits: 0, retractions: 0 }),
+  });
+  const page = await inboxDocument((message) => {
+    if (message.type === "papio.action.resolve") return { ok: true, outcome: "applied" };
+    return snapshotReply(fixture, message);
+  });
+  page.document.querySelector<HTMLButtonElement>(
+    "[data-triage-item-id='action:downloads-access-dismiss'] [data-operation='dismiss']",
+  )?.click();
+  await settle();
+  expect(page.document.getElementById("undo-message")?.textContent).toBe("Dismissed “downloads access required”.");
+
+  flush(page.window);
+  await settle();
+  expect(page.requests.find((request) => request.type === "papio.action.resolve")?.request).toEqual({
+    action_id: 22,
+    verdict: "dismiss",
+    expected_revision: 1,
+  });
 });
 
 test("a structured broker rejection renders inline and never fakes a disconnect", async () => {
