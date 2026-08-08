@@ -11,6 +11,8 @@ execution records kept during the initial build.
 
 ## [Unreleased]
 
+## [0.19.1] - 2026-08-08
+
 ### Fixed
 
 - **Workspace ownership checks no longer trigger a Zotero-account sync.** A
