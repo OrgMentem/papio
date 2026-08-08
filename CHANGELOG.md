@@ -11,6 +11,14 @@ execution records kept during the initial build.
 
 ## [Unreleased]
 
+### Changed
+
+- **Dependency: `golang.org/x/net` 0.54.0 -> 0.55.0** (GHSA-5cv4-jp36-h3mw,
+  medium: HTML-parser denial of service). papio parses provider landing
+  pages with this parser; exposure was already bounded by the 512-byte
+  landing-page read cap, and govulncheck reports no reachable vulnerable
+  call after the bump.
+
 ## [0.19.1] - 2026-08-08
 
 ### Fixed
