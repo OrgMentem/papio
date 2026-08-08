@@ -67,7 +67,7 @@ func newExportCommand(opt *options) *cobra.Command {
 			_, err := opt.out.Write(payload)
 			return err
 		}
-		if err := os.WriteFile(output, payload, 0o644); err != nil {
+		if err := os.WriteFile(output, payload, 0o600); err != nil {
 			return fmt.Errorf("writing export: %w", err)
 		}
 		sum := sha256.Sum256(payload)

@@ -456,8 +456,8 @@ func checkDocumentDelivery(ctx context.Context, cfg config.Config, db *store.Sto
 		prefix := "document_delivery:" + name
 
 		profile := delivery.CompileGateProfile(inst, name)
-		switch {
-		case db == nil:
+		switch db {
+		case nil:
 			add(prefix+":live_acceptance", Skip, "live-acceptance record is checked by the daemon", "")
 		default:
 			resolved, err := delivery.New(db, &cfg, nil).ResolveGateProfile(ctx, name, inst)
@@ -500,8 +500,8 @@ func checkDocumentDelivery(ctx context.Context, cfg config.Config, db *store.Sto
 			// operator needs to see. Never claims a request itself
 			// failed — only that papio's own observation of it has
 			// degraded or gone stale.
-			switch {
-			case db == nil:
+			switch db {
+			case nil:
 				add(prefix+":poll_health", Skip, "poll health is checked by the daemon", "")
 			default:
 				health, err := delivery.New(db, &cfg, nil).LivePollHealth(ctx, name)

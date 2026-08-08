@@ -642,7 +642,7 @@ func NextCheck(now time.Time, attempt int, statusPollMinutes int) time.Time {
 		// multiplication for a pathologically large attempt count.
 		shift = 10
 	}
-	backoff := time.Duration(base) * time.Minute * time.Duration(uint64(1)<<uint(shift))
+	backoff := time.Duration(base) * time.Minute * time.Duration(int64(1)<<shift)
 	if backoff <= 0 || backoff > maxPollInterval {
 		backoff = maxPollInterval
 	}

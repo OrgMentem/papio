@@ -30,7 +30,7 @@ func TestPDFURLForResolvesAgainstFinalURLNotRedirector(t *testing.T) {
 	})
 	mux.HandleFunc("/publisher/article", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		io.WriteString(w, `<html><head><meta name="citation_pdf_url" content="paper.pdf"></head><body></body></html>`)
+		_, _ = io.WriteString(w, `<html><head><meta name="citation_pdf_url" content="paper.pdf"></head><body></body></html>`)
 	})
 	server := httptest.NewTLSServer(mux)
 	defer server.Close()
@@ -86,14 +86,14 @@ func TestPDFURLForTruncatesLargeBodyButStillFindsHeadTag(t *testing.T) {
 	mux.HandleFunc("/landing", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html")
 		w.WriteHeader(http.StatusOK)
-		io.WriteString(w, `<html><head><meta name="citation_pdf_url" content="`+want+`"></head><body>`)
+		_, _ = io.WriteString(w, `<html><head><meta name="citation_pdf_url" content="`+want+`"></head><body>`)
 		if f, ok := w.(http.Flusher); ok {
 			// Force chunked transfer (no Content-Length) so the fast-path
 			// declared-size check below never fires — this test is about
 			// the io.LimitReader cap on the actual read, not that check.
 			f.Flush()
 		}
-		io.WriteString(w, strings.Repeat("x", 4<<20)) // 4 MiB, far past the 512-byte cap
+		_, _ = io.WriteString(w, strings.Repeat("x", 4<<20)) // 4 MiB, far past the 512-byte cap
 	})
 	server := httptest.NewTLSServer(mux)
 	defer server.Close()
@@ -136,7 +136,7 @@ func TestPDFURLForSendsNoCallerCredentialHeaders(t *testing.T) {
 	mux.HandleFunc("/landing", func(w http.ResponseWriter, r *http.Request) {
 		captured = r.Header.Clone()
 		w.Header().Set("Content-Type", "text/html")
-		io.WriteString(w, `<html><head><meta name="citation_pdf_url" content="https://cap.example.test/paper.pdf"></head></html>`)
+		_, _ = io.WriteString(w, `<html><head><meta name="citation_pdf_url" content="https://cap.example.test/paper.pdf"></head></html>`)
 	})
 	server := httptest.NewTLSServer(mux)
 	defer server.Close()

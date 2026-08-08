@@ -424,7 +424,7 @@ func defaultJitter(interval time.Duration) time.Duration {
 	if max <= 0 {
 		return 0
 	}
-	return time.Duration(rand.Int64N(int64(max) + 1))
+	return time.Duration(rand.Int64N(int64(max) + 1)) //nolint:gosec // G404: non-cryptographic poll jitter.
 }
 
 // persistPollSuccess compare-and-swaps the row: the UPDATE only applies

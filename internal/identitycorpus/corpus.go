@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -298,7 +299,7 @@ func snapshotZoteroDatabase(ctx context.Context, zoteroDir string) (string, erro
 	if vacuumErr := vacuumIntoSnapshot(ctx, zoteroDir, scratchPath); vacuumErr != nil {
 		if fallbackErr := copyZoteroDatabaseFallback(ctx, zoteroDir, tmpDir); fallbackErr != nil {
 			os.RemoveAll(tmpDir)
-			return "", fmt.Errorf("zotero.sqlite snapshot failed: VACUUM INTO could not run (%v), and the fallback copy also failed: %w", vacuumErr, fallbackErr)
+			return "", fmt.Errorf("zotero.sqlite snapshot failed: VACUUM INTO could not run (%w), and the fallback copy also failed: %w", vacuumErr, fallbackErr)
 		}
 		method = "byte-level copy (VACUUM INTO unavailable while Zotero holds the database open)"
 	}
@@ -1205,7 +1206,7 @@ func validateCacheDir(cacheDir string) error {
 	if info.Mode().Perm()&0o077 != 0 {
 		return errors.New("cache directory is writable by group or other; refusing to use it")
 	}
-	if uid, ok := fileOwnerUID(info); ok && uid != uint32(os.Getuid()) {
+	if uid, ok := fileOwnerUID(info); ok && int64(uid) != int64(os.Getuid()) {
 		return errors.New("cache directory is not owned by the current user; refusing to use it")
 	}
 	if userCacheRoot, ucErr := os.UserCacheDir(); ucErr != nil || !underDir(cacheDir, userCacheRoot) {
@@ -1244,7 +1245,7 @@ func checkCacheDirParents(cacheDir string) error {
 		if info.Mode().Perm()&0o022 != 0 {
 			return errors.New("a directory containing the cache directory is writable by group or other; refusing to use it")
 		}
-		if uid, ok := fileOwnerUID(info); ok && uid != uint32(os.Getuid()) && uid != 0 {
+		if uid, ok := fileOwnerUID(info); ok && int64(uid) != int64(os.Getuid()) && uid != 0 {
 			return errors.New("a directory containing the cache directory is not owned by the current user; refusing to use it")
 		}
 		parent := filepath.Dir(dir)
@@ -1266,7 +1267,7 @@ func checkCacheDirParents(cacheDir string) error {
 // complain about either.
 func fileOwnerUID(info os.FileInfo) (uid uint32, ok bool) {
 	v := reflect.ValueOf(info.Sys())
-	if v.Kind() == reflect.Ptr {
+	if v.Kind() == reflect.Pointer {
 		v = v.Elem()
 	}
 	if v.Kind() != reflect.Struct {
@@ -1276,7 +1277,11 @@ func fileOwnerUID(info os.FileInfo) (uid uint32, ok bool) {
 	if !f.IsValid() || f.Kind() != reflect.Uint32 {
 		return 0, false
 	}
-	return uint32(f.Uint()), true
+	u := f.Uint()
+	if u > math.MaxUint32 {
+		return 0, false
+	}
+	return uint32(u), true
 }
 
 // cacheTempPattern is writeCacheEntry's os.CreateTemp pattern for its

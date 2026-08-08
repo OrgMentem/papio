@@ -314,14 +314,11 @@ func EvaluateGate(profile GateProfile, req GateRequest) Decision {
 	}
 
 	var blockers []string
-	ok := true
 
 	// Condition 1: effective access mode is delegated. No blocker in the
 	// closed vocabulary names an access-mode shortfall; conservative/
 	// assisted callers already know why from the access mode itself.
-	if req.EffectiveAccessMode != config.ModeDelegated {
-		ok = false
-	}
+	ok := req.EffectiveAccessMode == config.ModeDelegated
 	// Condition 2: submit_policy is auto_if_unconditional. NOTE: conditions
 	// 2, 5, and 6 are also compile-time facts — CompileGateProfile never
 	// yields an auto_capable class when any of them fails, so through the
