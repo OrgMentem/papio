@@ -18,10 +18,13 @@ execution records kept during the initial build.
   the agent and a CLI it can already run. The repo now ships a single root
   `SKILL.md` — installable with `npx skills add OrgMentem/papio` or by copying
   it into an agent's skill store — covering the acquisition loop, the `--json`
-  envelope, and the gotchas that actually bite an agent (a human gate is an
-  outcome, not an error; never drain the handoff queue; `--accept` is an
-  assertion; `zotio apply` needs the plan's exact digest). `papio mcp` is
-  unchanged and stays the path for hosts that cannot run commands.
+  contract, and the rules that keep an autonomous agent inside papio's design:
+  a human gate is an outcome rather than an error, bare `actions open` drains
+  the whole handoff queue and is never an agent's to run, `actions resolve
+  --accept` records a *human* verdict, `zotio apply` needs the plan's exact
+  digest, and everything a publisher hands back is data rather than
+  instruction. `papio mcp` is unchanged and stays the path for hosts that
+  cannot run commands.
   `TestSkillInvocationsResolve` and `TestSkillFlagMentionsResolve` pin every
   command the skill runs and every flag it names — including the ones discussed
   in prose rather than on a command line — to the live cobra tree, so it cannot

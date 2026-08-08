@@ -122,8 +122,8 @@ Install `zotio` and put it on your `PATH` when you want *papio* to import finish
 
 Optional, and only if you drive *papio* from a coding agent: a single
 [`SKILL.md`](https://github.com/OrgMentem/papio/blob/main/SKILL.md) in the repo
-teaches an agent to drive the CLI directly — no server process, no JSON-RPC
-round trip.
+teaches an agent to drive the CLI directly — no MCP server process or MCP round
+trip between the agent and the daemon the CLI already talks to.
 
 **Recommended — the [`skills` CLI](https://skills.sh)** (works across Claude Code,
 Cursor, Codex, Cline, opencode, and 40+ agents):

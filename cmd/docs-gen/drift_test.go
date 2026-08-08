@@ -275,7 +275,7 @@ func TestSkillInvocationsResolve(t *testing.T) {
 	invocations := skillInvocations(mustRead(t, "SKILL.md"), root)
 	// A floor, not a presence check: a parser regression that quietly matched
 	// three lines instead of a hundred would otherwise keep passing.
-	if len(invocations) < 60 {
+	if len(invocations) < 95 {
 		t.Fatalf("parsed only %d command invocations from SKILL.md — the parser, not the skill, "+
 			"is what shrank", len(invocations))
 	}
@@ -340,8 +340,12 @@ func TestSkillFlagMentionsResolve(t *testing.T) {
 	known := skillKnownFlags(root)
 	checked := 0
 
-	for _, block := range skillBlocks(mustRead(t, "SKILL.md"), root) {
-		contexts := block.section
+	blocks, unterminatedFence := skillBlocks(mustRead(t, "SKILL.md"), root)
+	if unterminatedFence {
+		t.Fatal("SKILL.md leaves a code fence open — every block after it would go unchecked")
+	}
+	for _, block := range blocks {
+		contexts := block.scope()
 		for _, flag := range block.flags {
 			name, ok := skillFlagName(flag)
 			if !ok {
@@ -368,20 +372,30 @@ func TestSkillFlagMentionsResolve(t *testing.T) {
 				accepted = accepted || skillHasFlag(cmd, name)
 			}
 			if !accepted {
-				t.Errorf("SKILL.md discusses %s in %q, but no command its section names (%s) accepts it",
-					flag, skillHead(block.text), strings.Join(paths, ", "))
+				named := "its section"
+				if block.bullet && len(block.commands) > 0 {
+					named = "it"
+				}
+				t.Errorf("SKILL.md discusses %s in %q, but no command %s names (%s) accepts it",
+					flag, skillHead(block.text), named, strings.Join(paths, ", "))
 			}
 		}
 	}
-	if checked < 20 {
+	// Floors sit just under today's counts (110 invocations, 52 mentions): a
+	// parser regression that halves coverage has to fail, not shrink quietly.
+	if checked < 40 {
 		t.Fatalf("checked only %d bare flag mentions — the block parser stopped matching", checked)
 	}
 }
 
 var (
-	skillFence = regexp.MustCompile("(?s)```[a-z]*\n(.*?)```")
-	skillSpan  = regexp.MustCompile("`([^`\n]+)`")
-	skillQuote = regexp.MustCompile(`"[^"]*"|'[^']*'`)
+	// The info string is anything a fence can carry (`bash`, `shell-session`,
+	// `json5`): matching only `[a-z]*` let a fence hide its contents from the
+	// invocation walk while still toggling the block parser's fence state.
+	skillFence     = regexp.MustCompile("(?s)(?:```|~~~)[A-Za-z0-9_+.-]*\n(.*?)(?:```|~~~)")
+	skillFenceLine = regexp.MustCompile("^(`{3,}|~{3,})[ \t]*([A-Za-z0-9_+.-]*)[ \t]*$")
+	skillSpan      = regexp.MustCompile("`([^`\n]+)`")
+	skillQuote     = regexp.MustCompile(`"[^"]*"|'[^']*'`)
 )
 
 // skillInvocations returns the tokenized command lines SKILL.md claims are
@@ -473,9 +487,23 @@ func skillAnyChild(cmd *cobra.Command, names []string) bool {
 // spans — a span opening with a command is an invocation, checked already.
 type skillBlock struct {
 	text     string
+	bullet   bool
 	commands []*cobra.Command
 	section  []*cobra.Command
 	flags    []string
+}
+
+// scope returns the commands a bare flag in this block must belong to. A bullet
+// that names its own commands is a self-contained capability entry, so it is
+// held to them; widening it to the section let `--follow` pass under `acquire`
+// because `status` shares the heading. A paragraph inherits the section: it
+// routinely explains the fenced example above it rather than a command it
+// happens to mention.
+func (b skillBlock) scope() []*cobra.Command {
+	if b.bullet && len(b.commands) > 0 {
+		return b.commands
+	}
+	return b.section
 }
 
 // skillBlocks splits SKILL.md into those units. A fence separates blocks rather
@@ -484,11 +512,11 @@ type skillBlock struct {
 // prose discusses the flags of the example directly above it. Paragraphs are
 // included deliberately: Recipes and the canonical loop are headings, fences,
 // and prose, with no bullet anywhere to hang a flag mention on.
-func skillBlocks(body string, root *cobra.Command) []skillBlock {
-	var blocks []skillBlock
+func skillBlocks(body string, root *cobra.Command) (blocks []skillBlock, unterminatedFence bool) {
 	var current strings.Builder
 	var fenced []*cobra.Command
 	sectionStart := 0
+	var bullet bool
 	flush := func() {
 		if current.Len() == 0 {
 			return
@@ -496,7 +524,8 @@ func skillBlocks(body string, root *cobra.Command) []skillBlock {
 		text := current.String()
 		current.Reset()
 		commands, flags := skillSpanFlags(root, text)
-		blocks = append(blocks, skillBlock{text: text, commands: commands, flags: flags})
+		blocks = append(blocks, skillBlock{text: text, bullet: bullet, commands: commands, flags: flags})
+		bullet = false
 	}
 	// endSection publishes the union of the section's commands to its blocks, so
 	// a bullet listing flags under a command named two bullets (or one fenced
@@ -524,14 +553,30 @@ func skillBlocks(body string, root *cobra.Command) []skillBlock {
 		sectionStart = len(blocks)
 	}
 
-	inFence := false
+	// CommonMark fencing, because the shortcuts are what a maintainer trips
+	// over: an opener's delimiter and run length decide what closes it, so a
+	// nested ``` example inside a ```` block is content, and `~~~` is a fence
+	// too. Blind toggling on "```" turned one unclosed `shell-session` fence
+	// into silence for every block after it.
+	fence := ""
 	for _, line := range strings.Split(skillBody(body), "\n") {
 		trimmed := strings.TrimSpace(line)
+		if marker := skillFenceLine.FindStringSubmatch(trimmed); marker != nil {
+			opener, info := marker[1], marker[2]
+			if fence == "" {
+				fence = opener
+				flush()
+				continue
+			}
+			if opener[0] == fence[0] && len(opener) >= len(fence) && info == "" {
+				fence = ""
+				flush()
+				continue
+			}
+			// Anything else inside a fence is fenced content, not a delimiter.
+		}
 		switch {
-		case strings.HasPrefix(trimmed, "```"):
-			inFence = !inFence
-			flush()
-		case inFence:
+		case fence != "":
 			if cmd := skillResolve(root, skillTokens(strings.TrimPrefix(trimmed, "papio "))); cmd != root {
 				fenced = append(fenced, cmd)
 			}
@@ -539,6 +584,7 @@ func skillBlocks(body string, root *cobra.Command) []skillBlock {
 			endSection()
 		case strings.HasPrefix(trimmed, "- "):
 			flush()
+			bullet = true
 			current.WriteString(trimmed)
 		case trimmed == "":
 			flush()
@@ -549,7 +595,10 @@ func skillBlocks(body string, root *cobra.Command) []skillBlock {
 		}
 	}
 	endSection()
-	return blocks
+	// An unclosed fence swallows the rest of the file: every later block would
+	// be silently unchecked, and the floors can still be met by what came
+	// first. Report it as the parse failure it is.
+	return blocks, fence != ""
 }
 
 // skillSpanFlags splits one block into the commands it names and the flags it

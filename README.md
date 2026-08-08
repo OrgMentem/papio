@@ -234,8 +234,8 @@ the whole hand-off
 surfaces, in preference order:
 
 **1. The CLI, through the agent skill.** A single
-[`SKILL.md`](SKILL.md) teaches an agent to run `papio` directly — no server
-process, no JSON-RPC round trip:
+[`SKILL.md`](SKILL.md) teaches an agent to run `papio` directly — no MCP server
+process or MCP round trip between the agent and the daemon the CLI already talks to:
 
 ```bash
 npx skills add OrgMentem/papio   # Claude Code, Cursor, Codex, Cline, opencode, …
