@@ -1558,11 +1558,18 @@ func browserSync(ctx context.Context, raw json.RawMessage, system *bootstrap.Sys
 	}
 	outbound, err := system.Browser.Sync(ctx, params.SessionID, params.Goodbye, params.Messages)
 	if err != nil {
-		if errors.Is(err, browser.ErrInvalidFrame) {
-			// A fail-closed protocol violation is a client error.
-			return nil, &ipc.RPCError{Code: "invalid_argument", Message: safeMessage(err, "invalid browser frame")}
+		if errors.Is(err, browser.ErrInvalidFrame) || errors.Is(err, browser.ErrOutboundFrame) {
+			// Fail-closed protocol violations and daemon-generated invalid
+			// outbound frames remain fatal at the native-host boundary.
+			if errors.Is(err, browser.ErrInvalidFrame) {
+				return nil, &ipc.RPCError{Code: "invalid_argument", Message: safeMessage(err, "invalid browser frame")}
+			}
+			return failure(err)
 		}
-		return failure(err)
+		// failures are explicit application dispositions so the native host
+		// can report one request failure without tearing down the session.
+		log.Printf("browser sync application failure: %v", err)
+		return nil, &ipc.RPCError{Code: "application_failure", Message: "browser request could not be completed"}
 	}
 	if outbound == nil {
 		outbound = []json.RawMessage{}

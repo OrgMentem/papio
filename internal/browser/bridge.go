@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -98,9 +99,8 @@ const (
 	// maxFocusFramesPerPoll bounds the focus batch in ONE sync response. Focus
 	// requests accumulate from a caller-supplied job-id list, so an unbounded
 	// drain is the only term that can push a response past ipc.MaxResultBytes —
-	// and an oversized response fails the host's browser.sync, which the host
-	// treats as fatal and answers with goodbye, killing the live session. The
-	// remainder stays queued for the next ordinary poll. Pinned by
+	// and a transport-level oversized response is fatal at the host boundary.
+	// The remainder stays queued for the next ordinary poll. Pinned by
 	// TestSyncResponseFitsResultCap.
 	maxFocusFramesPerPoll = 32
 )
@@ -553,6 +553,12 @@ func shortSession(id string) string {
 	return id
 }
 
+// ErrOutboundFrame marks a daemon-side contract failure while constructing an
+// outbound browser frame. It is transport-fatal at the API/native-host
+// boundary: silently converting it to an application refusal would hide a
+// broken protocol implementation.
+var ErrOutboundFrame = errors.New("outbound frame self-validation failed")
+
 // Sync processes a batch of inbound frames (possibly empty for a poll) from
 // one native-host session and returns the outbound command frames. Every
 // inbound frame is re-validated with protocol.DecodeBrowserMessage; malformed
@@ -639,8 +645,27 @@ func (b *Bridge) Sync(ctx context.Context, sessionID string, goodbye bool, frame
 		return out, nil
 	}
 	b.repairAdapterUpgradeParks(ctx)
+	offeredBefore := maps.Clone(b.offered)
+	cancelSentBefore := maps.Clone(b.cancelSent)
+	deliveredBefore := make(map[string]bool, len(b.pendingCaptures))
+	for id, pending := range b.pendingCaptures {
+		if pending != nil {
+			deliveredBefore[id] = pending.delivered
+		}
+	}
 	polled, err := b.poll(ctx)
 	if err != nil {
+		// poll may stage offers/cancels or mark a pending capture delivered
+		// before a later frame-construction failure. The API classifies routine
+		// failures as non-fatal and discards this reply, so roll back all
+		// in-memory staging that the browser never observed.
+		b.offered = offeredBefore
+		b.cancelSent = cancelSentBefore
+		for id, pending := range b.pendingCaptures {
+			if pending != nil {
+				pending.delivered = deliveredBefore[id]
+			}
+		}
 		return nil, err
 	}
 	return append(out, polled...), nil
@@ -881,42 +906,66 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 		return nil, nil
 
 	case protocol.MsgJobAccept:
-		return nil, b.jobs.S.AppendEvent(ctx, msg.JobID, "browser.job_accept", nil)
+		if err := b.jobs.S.AppendEvent(ctx, msg.JobID, "browser.job_accept", nil); err != nil {
+			log.Printf("papio: recording browser.job_accept: %v", err)
+		}
+		return nil, nil
 
 	case protocol.MsgHandoffOutcome:
-		return nil, b.handoffOutcome(ctx, msg.JobID, msg.Payload.(*protocol.HandoffOutcomePayload))
+		if err := b.handoffOutcome(ctx, msg.JobID, msg.Payload.(*protocol.HandoffOutcomePayload)); err != nil {
+			log.Printf("papio: recording browser.handoff_outcome: %v", err)
+		}
+		return nil, nil
 
 	case protocol.MsgJobReject:
 		if err := b.jobs.S.AppendEvent(ctx, msg.JobID, "browser.job_reject", nil); err != nil {
-			return nil, err
+			log.Printf("papio: recording browser.job_reject: %v", err)
+			return nil, nil
 		}
 		if fellBack, err := b.fallbackOAHandoff(ctx, msg.JobID, "browser_rejected"); err != nil {
-			return nil, err
+			log.Printf("papio: applying browser rejection fallback: %v", err)
+			return nil, nil
 		} else if fellBack {
 			return nil, nil
 		}
 		if err := b.resolveHandoff(ctx, msg.JobID, "cancelled"); err != nil {
-			return nil, err
+			log.Printf("papio: resolving rejected handoff: %v", err)
+			return nil, nil
 		}
-		return nil, b.leaveHandoff(ctx, msg.JobID, job.StateUnavailable, string(job.TerminalReasonBrowserRejected))
+		if err := b.leaveHandoff(ctx, msg.JobID, job.StateUnavailable, string(job.TerminalReasonBrowserRejected)); err != nil {
+			log.Printf("papio: closing rejected handoff: %v", err)
+		}
+		return nil, nil
 
 	case protocol.MsgAuthPending, protocol.MsgAuthReturned:
-		return nil, b.recordAuth(ctx, msg)
+		if err := b.recordAuth(ctx, msg); err != nil {
+			log.Printf("papio: recording browser auth event: %v", err)
+		}
+		return nil, nil
 
 	case protocol.MsgSessionEvidence:
-		return nil, b.sessionEvidence(ctx, msg.Payload.(*protocol.SessionEvidencePayload))
+		if err := b.sessionEvidence(ctx, msg.Payload.(*protocol.SessionEvidencePayload)); err != nil {
+			log.Printf("papio: recording browser session evidence: %v", err)
+		}
+		return nil, nil
 	case protocol.MsgDeliveryContext:
-		return nil, b.deliveryContext(ctx, msg.JobID, msg.Payload.(*protocol.DeliveryContextPayload))
+		if err := b.deliveryContext(ctx, msg.JobID, msg.Payload.(*protocol.DeliveryContextPayload)); err != nil {
+			log.Printf("papio: recording browser delivery context: %v", err)
+		}
+		return nil, nil
 	case protocol.MsgDownloadStarted:
 		p := msg.Payload.(*protocol.DownloadStartedPayload)
-		return nil, b.jobs.S.AppendEvent(ctx, msg.JobID, "browser.download_started",
-			map[string]any{"download_id": p.DownloadID, "filename": p.Filename})
+		if err := b.jobs.S.AppendEvent(ctx, msg.JobID, "browser.download_started",
+			map[string]any{"download_id": p.DownloadID, "filename": p.Filename}); err != nil {
+			log.Printf("papio: recording browser.download_started: %v", err)
+		}
+		return nil, nil
 
 	case protocol.MsgDownloadComplete:
 		p := msg.Payload.(*protocol.DownloadCompletePayload)
 		if err := b.jobs.S.AppendEvent(ctx, msg.JobID, "browser.download_complete",
 			map[string]any{"download_id": p.DownloadID, "filename": p.Filename, "size_bytes": p.SizeBytes}); err != nil {
-			return nil, err
+			log.Printf("papio: recording browser.download_complete: %v", err)
 		}
 		b.pruneDeliveryMetadata(b.now())
 		key := browserDownloadKey{JobID: msg.JobID, DownloadID: p.DownloadID}
@@ -929,14 +978,9 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 		candidateID, err := b.adoptOutsideSessionLock(ctx, msg.JobID, p.Filename, context)
 		if err != nil {
 			// Environmental failure (file not there yet, Chrome rename race,
-			// user saved elsewhere) must not sever the bridge: record it, keep
-			// the job parked, and let the poll-time directory scan pick the
-			// file up when it appears. Confinement violations land here too —
-			// the report is ignored and the job simply stays awaiting_human.
-			// If the adoption-scan latch is currently unhealthy, this also
-			// opens/refreshes a downloads_access_required action.
+			// user saved elsewhere) must not sever the bridge.
 			if evErr := b.recordAdoptionDeferred(ctx, msg.JobID, p.Filename, err); evErr != nil {
-				return nil, evErr
+				log.Printf("papio: recording deferred browser adoption: %v", evErr)
 			}
 		} else {
 			pendingDownload.CandidateID = candidateID
@@ -953,22 +997,32 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 		return []json.RawMessage{ack}, nil
 
 	case protocol.MsgProviderOutcome:
-		return nil, b.outcome(ctx, msg.JobID, msg.Payload.(*protocol.ProviderOutcomePayload))
+		if err := b.outcome(ctx, msg.JobID, msg.Payload.(*protocol.ProviderOutcomePayload)); err != nil {
+			log.Printf("papio: recording browser provider outcome: %v", err)
+		}
+		return nil, nil
 
 	case protocol.MsgCancel:
 		// Extension -> daemon: the user closed the broker-owned tab. Treat as a
 		// cancelled outcome.
 		if err := b.resolveHandoff(ctx, msg.JobID, "cancelled"); err != nil {
-			return nil, err
+			log.Printf("papio: resolving cancelled handoff: %v", err)
+			return nil, nil
 		}
 		b.cancelSent[msg.JobID] = true // we initiated nothing to echo back
-		return nil, b.jobs.Cancel(ctx, msg.JobID, job.TerminalReasonBrowserCancelled)
+		if err := b.jobs.Cancel(ctx, msg.JobID, job.TerminalReasonBrowserCancelled); err != nil {
+			log.Printf("papio: cancelling browser job: %v", err)
+		}
+		return nil, nil
 
 	case protocol.MsgError:
 		// Only the normalized code is durable; the free-text message is
 		// extension-supplied and never persisted.
-		return nil, b.jobs.S.AppendEvent(ctx, msg.JobID, "browser.error",
-			map[string]any{"code": msg.Payload.(*protocol.ErrorPayload).Code})
+		if err := b.jobs.S.AppendEvent(ctx, msg.JobID, "browser.error",
+			map[string]any{"code": msg.Payload.(*protocol.ErrorPayload).Code}); err != nil {
+			log.Printf("papio: recording browser error: %v", err)
+		}
+		return nil, nil
 
 	default:
 		return nil, fmt.Errorf("%w: unexpected inbound frame type %q", ErrInvalidFrame, msg.Type)
@@ -1500,12 +1554,9 @@ func (b *Bridge) triageCounts(ctx context.Context, request *protocol.TriageCount
 // has an outcome/detail field and neither may gain one: both protocol
 // decoders fail closed on unknown fields, so a new field on an existing
 // message breaks every already-shipped extension. This mirrors
-// sessionBusy/helloRequired/extensionOutdatedError instead. A raw Go error
-// here would reach the native host's fatal path (internal/nativehost/host.go
-// treats any browser.sync error as a dead connection), turning one failed
-// query into a disconnect that also kills page_acquire and the handoff flow.
-// The cause is logged rather than sent: the extension gets a stable code it
-// can render as "temporarily unavailable", the operator keeps the diagnosis.
+// sessionBusy/helloRequired/extensionOutdatedError instead. The cause is
+// logged rather than sent: the extension gets a stable code it can render as
+// "temporarily unavailable", the operator keeps the diagnosis.
 func (b *Bridge) unavailable(code, message, surface string, cause error) ([]json.RawMessage, error) {
 	if cause != nil {
 		log.Printf("papio: %s unavailable: %v", surface, cause)
@@ -1988,11 +2039,9 @@ func (b *Bridge) reviewPreview(ctx context.Context, request *protocol.ReviewPrev
 
 // reviewPreviewError reports an ordinary, expected preview failure (not
 // configured, action gone, file missing, issuance failure) as a structured
-// review_preview_result frame instead of a raw Go error. A raw error here
-// would propagate through Sync into the native host's fatal error path
-// (internal/nativehost/host.go: any browser.sync error tears the whole
-// native-messaging connection down), turning a routine "this PDF is no
-// longer available" into a hard disconnect on every click.
+// review_preview_result frame instead of a raw Go error. The host's explicit
+// application-failure disposition keeps even an unexpected daemon error from
+// tearing down the native-messaging connection.
 func (b *Bridge) reviewPreviewError(requestID, detail string) ([]json.RawMessage, error) {
 	frame, err := b.frame(protocol.MsgReviewPreviewResult, "", protocol.ReviewPreviewResultPayload{
 		RequestID: requestID, Outcome: "error", Detail: truncate(detail, 1000),
@@ -2120,12 +2169,53 @@ func (b *Bridge) pageBulkStatus(ctx context.Context, request *protocol.PageBulkS
 		if b.frameFits(protocol.MsgPageBulkStatusResult, payload) {
 			frame, err := b.frame(protocol.MsgPageBulkStatusResult, "", payload)
 			if err != nil {
-				return nil, err
+				// b.frame performs the final protocol self-validation. A
+				// malformed item must still become a structured refusal, not
+				// an RPC error that can take down the browser session.
+				log.Printf("papio: page-bulk status frame self-validation failed: %v", err)
+				fallback := protocol.PageBulkStatusResultPayload{
+					RequestID: request.RequestID, ScanID: request.ScanID, Truncated: true,
+				}
+				frame, fallbackErr := b.frame(protocol.MsgPageBulkStatusResult, "", fallback)
+				if fallbackErr != nil {
+					return nil, fallbackErr
+				}
+				return []json.RawMessage{frame}, nil
 			}
 			return []json.RawMessage{frame}, nil
 		}
+		// Detect an item that cannot fit even by itself before dropping valid
+		// neighbors to satisfy the aggregate frame cap. "invalid" is the
+		// existing renderable refusal state; clearing the canonical identity
+		// prevents the workspace from offering it for submission.
+		refused := false
+		for i, item := range items {
+			if b.frameFits(protocol.MsgPageBulkStatusResult, protocol.PageBulkStatusResultPayload{
+				RequestID: request.RequestID, ScanID: request.ScanID,
+				Items: []protocol.PageBulkStatusItem{item}, Truncated: true,
+			}) {
+				continue
+			}
+			log.Printf("papio: refusing oversized page-bulk status item %s", item.LocalID)
+			items[i] = protocol.PageBulkStatusItem{LocalID: item.LocalID, Status: "frame_too_large"}
+			refused = true
+		}
+		if refused {
+			truncated = true
+			continue
+		}
 		if len(items) <= 1 {
-			return nil, fmt.Errorf("page bulk status item exceeds browser frame cap %d", protocol.MaxBrowserMessageBytes)
+			// This is defensive: all current protocol fields are bounded, so
+			// a single valid item should fit. Return a structured refusal if
+			// a future field violates that invariant.
+			if len(items) == 1 {
+				log.Printf("papio: refusing page-bulk status item %s after frame-cap exhaustion", items[0].LocalID)
+				items[0] = protocol.PageBulkStatusItem{LocalID: items[0].LocalID, Status: "invalid"}
+				truncated = true
+				continue
+			}
+			return b.unavailable("page_bulk_status_unavailable",
+				"page status is temporarily unavailable", "page bulk status", nil)
 		}
 		items = items[:len(items)-1]
 		truncated = true
@@ -4069,17 +4159,19 @@ func (b *Bridge) poll(ctx context.Context) ([]json.RawMessage, error) {
 	// frame.
 	if b.reofferSourceJobID != "" && !b.reofferRanThisSync {
 		if err := b.reofferInstitutionalSiblings(ctx, b.reofferSourceJobID); err != nil {
-			return nil, err
+			log.Printf("papio: browser reoffer poll unavailable: %v", err)
 		}
 		b.reofferRanThisSync = true
 	}
 	awaiting, err := b.jobs.List(ctx, job.StateAwaitingHuman, 200)
 	if err != nil {
-		return nil, err
+		log.Printf("papio: browser offer poll unavailable: %v", err)
+		return nil, nil
 	}
 	handoffJobs, _, err := b.jobs.ListOpenHandoffJobsPage(ctx, handoffPageLimit)
 	if err != nil {
-		return nil, err
+		log.Printf("papio: browser handoff poll unavailable: %v", err)
+		return nil, nil
 	}
 	handoff := make(map[string]job.HumanAction, len(handoffJobs))
 	present := map[string]bool{}
@@ -4107,7 +4199,7 @@ func (b *Bridge) poll(ctx context.Context) ([]json.RawMessage, error) {
 			}
 			if err != nil {
 				if evErr := b.recordAdoptionDeferred(ctx, row.ID, name, err); evErr != nil {
-					return nil, evErr
+					log.Printf("papio: recording deferred browser adoption: %v", evErr)
 				}
 			} else {
 				delete(b.offered, row.ID)
@@ -4179,6 +4271,8 @@ func (b *Bridge) poll(ctx context.Context) ([]json.RawMessage, error) {
 			continue
 		}
 		row := rows[id]
+		overridden := b.focusPending[id] || b.reofferPending[id]
+		quiescedByEvidence := false
 		action := handoff[id]
 		// The main auto-offer gate. focusPending is an explicit
 		// `papio actions open`, and reofferPending was already filtered when it
@@ -4189,12 +4283,11 @@ func (b *Bridge) poll(ctx context.Context) ([]json.RawMessage, error) {
 		// times with zero terminal outcomes. ProjectHandoffOfferState reads
 		// what each accepted drive actually did and quiesces on fruitless
 		// epochs regardless of how young the action still is.
-		overridden := b.focusPending[id] || b.reofferPending[id]
-		quiescedByEvidence := false
 		if !overridden {
 			events, err := b.jobs.Events(ctx, id)
 			if err != nil {
-				return nil, err
+				log.Printf("papio: reading handoff history for %s: %v", id, err)
+				continue
 			}
 			state := job.ProjectHandoffOfferState(events, action.CreatedAt, b.now())
 			quiescedByEvidence = state.Quiesced
@@ -4209,7 +4302,8 @@ func (b *Bridge) poll(ctx context.Context) ([]json.RawMessage, error) {
 				if !audited {
 					if err := b.jobs.S.AppendEvent(ctx, id, "browser.handoff_quiesced",
 						map[string]any{"reason": "fruitless_drive_limit", "drive_epochs": state.FruitlessEpochs}); err != nil {
-						return nil, err
+						log.Printf("papio: recording handoff quiescence for %s: %v", id, err)
+						continue
 					}
 				}
 			}
@@ -4233,7 +4327,8 @@ func (b *Bridge) poll(ctx context.Context) ([]json.RawMessage, error) {
 		}
 		if err := b.jobs.S.AppendEvent(ctx, row.ID, "browser.handoff_offered",
 			map[string]any{"requires_auth": action.RequiresAuth}); err != nil {
-			return nil, err
+			log.Printf("papio: recording browser.handoff_offered for %s: %v", row.ID, err)
+			continue
 		}
 		out = append(out, offer)
 		b.offered[row.ID] = true
@@ -4248,7 +4343,8 @@ func (b *Bridge) poll(ctx context.Context) ([]json.RawMessage, error) {
 		}
 		row, err := b.jobs.Get(ctx, id)
 		if err != nil {
-			return nil, err
+			log.Printf("papio: checking cancelled browser job %s: %v", id, err)
+			continue
 		}
 		if row.State != job.StateCancelled {
 			continue
@@ -4281,7 +4377,8 @@ func (b *Bridge) poll(ctx context.Context) ([]json.RawMessage, error) {
 				delete(b.focusPending, id)
 				continue
 			case getErr != nil:
-				return nil, getErr
+				log.Printf("papio: checking focused browser job %s: %v", id, getErr)
+				continue
 			case row.State != job.StateAwaitingHuman:
 				delete(b.focusPending, id)
 				continue
@@ -4309,7 +4406,8 @@ func (b *Bridge) poll(ctx context.Context) ([]json.RawMessage, error) {
 				}
 				if err := b.jobs.S.AppendEvent(ctx, id, "browser.handoff_offered",
 					map[string]any{"requires_auth": handoff[id].RequiresAuth}); err != nil {
-					return nil, err
+					log.Printf("papio: recording focused handoff offer for %s: %v", id, err)
+					continue
 				}
 				out = append(out, offer)
 				b.offered[id] = true
@@ -4329,14 +4427,12 @@ func (b *Bridge) poll(ctx context.Context) ([]json.RawMessage, error) {
 		}
 	}
 	if held == 0 {
-		// A future backlog is a new pacing episode and deserves a fresh event,
-		// even when it happens to hold the same number of jobs.
-		b.lastPacedHeld = 0
 	} else if held != b.lastPacedHeld {
 		if err := b.jobs.S.AppendEvent(ctx, "", "browser.offers_paced", map[string]any{"held": held}); err != nil {
-			return nil, err
+			log.Printf("papio: recording offer pacing: %v", err)
+		} else {
+			b.lastPacedHeld = held
 		}
-		b.lastPacedHeld = held
 	}
 	if b.holder != nil {
 		if pending := b.pendingCaptures[b.holder.ID]; pending != nil && !pending.delivered {
@@ -4351,7 +4447,8 @@ func (b *Bridge) poll(ctx context.Context) ([]json.RawMessage, error) {
 	if b.grabs != nil {
 		pending, err := b.grabs.PendingNotifications(ctx, 10)
 		if err != nil {
-			return nil, err
+			log.Printf("papio: reading pending PDF grab notifications: %v", err)
+			return out, nil
 		}
 		for _, g := range pending {
 			frame, err := b.frame(protocol.MsgPdfGrabResult, "", protocol.PdfGrabResultPayload{
@@ -4362,7 +4459,7 @@ func (b *Bridge) poll(ctx context.Context) ([]json.RawMessage, error) {
 			}
 			out = append(out, frame)
 			if err := b.grabs.MarkNotified(ctx, g.ID); err != nil {
-				return nil, err
+				log.Printf("papio: marking PDF grab notification %s: %v", g.ID, err)
 			}
 		}
 	}
@@ -4547,7 +4644,7 @@ func (b *Bridge) frame(msgType, jobID string, payload any) (json.RawMessage, err
 		return nil, err
 	}
 	if _, err := protocol.DecodeBrowserMessage(raw); err != nil {
-		return nil, fmt.Errorf("outbound %s failed self-validation: %w", msgType, err)
+		return nil, fmt.Errorf("%w: outbound %s failed self-validation: %w", ErrOutboundFrame, msgType, err)
 	}
 	return raw, nil
 }

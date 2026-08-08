@@ -4,13 +4,22 @@
 package delivery
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"log"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
+	"papio/internal/job"
 	"papio/internal/store"
 )
 
@@ -198,6 +207,174 @@ func TestUpdateStateStampsSubmittedAtOnce(t *testing.T) {
 	}
 	if again.SubmittedAt != first {
 		t.Fatalf("SubmittedAt changed on re-entering submitted: %q -> %q, want stable", first, again.SubmittedAt)
+	}
+}
+
+func TestRecordSubmissionAtomicallyCommitsAllFieldsAndCAS(t *testing.T) {
+	now := time.Date(2026, 8, 8, 12, 0, 0, 0, time.UTC)
+	svc := testService(t, now)
+	ctx := context.Background()
+	testJob(t, svc, "job_record_submission")
+	if _, err := svc.store.DB().ExecContext(ctx, `UPDATE jobs SET state = 'resolving' WHERE id = ?`, "job_record_submission"); err != nil {
+		t.Fatal(err)
+	}
+	created, err := svc.Create(ctx, CreateRequest{
+		JobID: "job_record_submission", InstitutionProfile: "campus", Provider: "illiad",
+		RequestClass: "digital_journal_article", WorkIdentity: "doi:10.1/record-submission",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := now.Add(15 * time.Minute)
+	won, err := svc.RecordSubmission(ctx, created.ID, "provider-123", next)
+	if err != nil {
+		t.Fatalf("RecordSubmission: %v", err)
+	}
+	if !won {
+		t.Fatal("RecordSubmission won = false, want true")
+	}
+	got, err := svc.Get(ctx, created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantNow := now.Format(time.RFC3339Nano)
+	wantNext := next.Format(time.RFC3339Nano)
+	if got.State != StateSubmitted || got.ProviderReference != "provider-123" ||
+		got.SubmittedAt != wantNow || got.LastCheckedAt != wantNow || got.NextCheckAt != wantNext {
+		t.Fatalf("recorded row = %+v, want submitted/provider/timestamps committed together", got)
+	}
+
+	var logs bytes.Buffer
+	previous := log.Writer()
+	log.SetOutput(&logs)
+	defer log.SetOutput(previous)
+	won, err = svc.RecordSubmission(ctx, created.ID, "provider-other", now.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("CAS re-record: %v", err)
+	}
+	if won {
+		t.Fatal("CAS re-record won = true, want benign false")
+	}
+	unchanged, err := svc.Get(ctx, created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unchanged.ProviderReference != "provider-123" || unchanged.State != StateSubmitted {
+		t.Fatalf("CAS re-record clobbered row = %+v", unchanged)
+	}
+	if !bytes.Contains(logs.Bytes(), []byte("CAS did not match")) {
+		t.Fatalf("CAS re-record log = %q, want benign mismatch diagnostic", logs.String())
+	}
+}
+
+func TestRecordSubmissionRollsBackOnPreCommitFailure(t *testing.T) {
+	now := time.Date(2026, 8, 8, 13, 0, 0, 0, time.UTC)
+	svc := testService(t, now)
+	ctx := context.Background()
+	testJob(t, svc, "job_record_submission_rollback")
+	if _, err := svc.store.DB().ExecContext(ctx, `UPDATE jobs SET state = 'resolving' WHERE id = ?`, "job_record_submission_rollback"); err != nil {
+		t.Fatal(err)
+	}
+	created, err := svc.Create(ctx, CreateRequest{
+		JobID: "job_record_submission_rollback", InstitutionProfile: "campus", Provider: "illiad",
+		RequestClass: "digital_journal_article", WorkIdentity: "doi:10.1/record-submission-rollback",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc.beforeRecordSubmissionCommit = func(*sql.Tx) error {
+		return errors.New("injected commit failure")
+	}
+	if _, err := svc.RecordSubmission(ctx, created.ID, "provider-rollback", now.Add(time.Minute)); err == nil {
+		t.Fatal("RecordSubmission error = nil, want injected failure")
+	}
+	got, err := svc.Get(ctx, created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != StateOffered || got.ProviderReference != "" || got.SubmittedAt != "" ||
+		got.LastCheckedAt != "" || got.NextCheckAt != "" {
+
+		t.Fatalf("failed transaction left partial submission = %+v", got)
+	}
+}
+
+func TestRecordSubmissionRejectsEveryNonResolvingJobState(t *testing.T) {
+	states := []string{
+		job.StateQueued, job.StateResolving, job.StateFetching, job.StateValidating,
+		job.StateReady, job.StateImported, job.StateAwaitingHuman, job.StateRetryWait,
+		job.StateNeedsReview, job.StateUnavailable, job.StateFailed, job.StateCancelled,
+	}
+	file, err := parser.ParseFile(token.NewFileSet(), "../job/job.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse job.go: %v", err)
+	}
+	declared := map[string]bool{}
+	for _, decl := range file.Decls {
+		gen, ok := decl.(*ast.GenDecl)
+		if !ok || gen.Tok != token.CONST {
+			continue
+		}
+		for _, spec := range gen.Specs {
+			value, ok := spec.(*ast.ValueSpec)
+			if !ok {
+				continue
+			}
+			for index, name := range value.Names {
+				if !strings.HasPrefix(name.Name, "State") {
+					continue
+				}
+				if len(value.Values) != len(value.Names) {
+					t.Fatalf("%s has %d names and %d values", name.Name, len(value.Names), len(value.Values))
+				}
+				literal, ok := value.Values[index].(*ast.BasicLit)
+				if !ok || literal.Kind != token.STRING {
+					t.Fatalf("%s is not a string state literal", name.Name)
+				}
+				decoded, err := strconv.Unquote(literal.Value)
+				if err != nil {
+					t.Fatal(err)
+				}
+				declared[decoded] = true
+			}
+		}
+	}
+	if len(declared) != len(states) {
+		t.Fatalf("job.go declares %d states but test covers %d; update this table for every new state", len(declared), len(states))
+	}
+	for _, state := range states {
+		if !declared[state] {
+			t.Fatalf("test state %q is not declared by job.go", state)
+		}
+	}
+	for i, state := range states {
+		t.Run(state, func(t *testing.T) {
+			svc := testService(t, time.Date(2026, 8, 8, 14, 0, 0, 0, time.UTC))
+			ctx := context.Background()
+			jobID := fmt.Sprintf("job_submission_state_%d", i)
+			testJob(t, svc, jobID)
+			if _, err := svc.store.DB().ExecContext(ctx, `UPDATE jobs SET state = ? WHERE id = ?`, state, jobID); err != nil {
+				t.Fatal(err)
+			}
+			req, err := svc.Create(ctx, CreateRequest{
+				JobID: jobID, InstitutionProfile: "campus", Provider: "illiad",
+				RequestClass: "digital_journal_article", WorkIdentity: fmt.Sprintf("doi:10.1/submission-state-%d", i),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			won, err := svc.RecordSubmission(ctx, req.ID, "provider-"+state, time.Now().Add(time.Hour))
+			if err != nil {
+				t.Fatalf("state %s: %v", state, err)
+			}
+			if state == job.StateResolving {
+				if !won {
+					t.Fatal("resolving must win the submission CAS")
+				}
+			} else if won {
+				t.Fatalf("state %s won CAS, want only resolving to be eligible", state)
+			}
+		})
 	}
 }
 

@@ -61,27 +61,28 @@ func TestVersionSkewInboundFailsClosed(t *testing.T) {
 	}
 }
 
-func TestOlderDaemonRejectsExtensionExpectationFailClosed(t *testing.T) {
+func TestOlderDaemonApplicationRejectionKeepsSession(t *testing.T) {
 	var stdout bytes.Buffer
 	forwarded := 0
 	bridge := newBridge(&fakeSyncer{onSync: func([]json.RawMessage) ([]json.RawMessage, error) {
 		forwarded++
-		return nil, errors.New("unsupported browser protocol by older daemon")
+		return nil, applicationSyncFailure(errors.New("unsupported browser protocol by older daemon"))
 	}}, nil, &stdout, ioDiscard{})
 
 	// The newer extension still emits a syntactically valid locked browser
-	// frame. A daemon that cannot meet its expectation rejects browser.sync;
-	// the native host must terminate rather than allow an unacknowledged session.
+	// frame. A daemon that cannot meet its expectation reports an application
+	// failure; the native host must keep the browser session available for
+	// subsequent requests rather than treating that response as a broken port.
 	frame := rawMsg(t, protocol.MsgHello, "future-extension-hello", "", 0,
 		map[string]any{"extension_version": "2.0.0"})
-	if err := bridge.handleInbound(context.Background(), frame); err == nil {
-		t.Fatal("older daemon rejection was treated as a live session")
+	if err := bridge.handleInbound(context.Background(), frame); err != nil {
+		t.Fatalf("application rejection killed the session: %v", err)
 	}
 	if forwarded != 1 {
 		t.Fatalf("daemon calls = %d, want exactly one hello forward", forwarded)
 	}
-	if code := errorCode(t, readTestFrame(t, bytes.NewReader(stdout.Bytes()))); code != "daemon_unavailable" {
-		t.Fatalf("error code = %q, want daemon_unavailable", code)
+	if code := errorCode(t, readTestFrame(t, bytes.NewReader(stdout.Bytes()))); code != "application_error" {
+		t.Fatalf("error code = %q, want application_error", code)
 	}
 }
 

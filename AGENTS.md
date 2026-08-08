@@ -296,18 +296,38 @@ There is also a link check, because `zensical build` prints a broken link as an
   discarding the trace it is still writing. That pair of files is the first thing to read
   when a host dies mid-session — before resorting to driving it by hand (see "Chrome
   forwards native-host stderr nowhere" below).
-- Per-institution offer fields (`login_entity_id`, `proquest_account_id`) are sent **only
-  for the default resolver profile** (`row.Policy.Resolver == "" || "default"`) in
-  `internal/browser/bridge.go` `offer()` — sending them for a `institute` job would mis-route
-  another institution's login. Per-profile values are a future extension.
-- **A non-nil error from a browser-bridge RPC handler kills the whole native-messaging
-  session, not just that request.** `internal/nativehost/host.go` treats any error out of
-  `Bridge.Sync()` as fatal per its own doc comment ("the connection is considered bad"). Every
-  handler in `internal/browser/bridge.go` MUST encode ordinary/expected failures (item gone,
-  file missing, not configured, …) into a structured `outcome`/`detail` result field — mirror
-  `TriageDecideResultPayload`/`HumanActionResolveResultPayload`/`ReviewPreviewResultPayload` —
-  never return a raw Go `error` for a routine condition. `reviewPreview` got this wrong and
-  every click on a stale review action was silently disconnecting the extension.
+- **Per-institution offer fields are per-profile, not default-only.** `offer()`
+  (`internal/browser/bridge.go`) resolves the institution with
+  `b.cfg.InstitutionFor(row.Policy.Resolver)` and sets `login_entity_id` /
+  `proquest_account_id` from *that* institution unconditionally, so a named
+  `institute` job routes its own federated login instead of inheriting the
+  default institution's identity. (This used to be default-only, and this note
+  used to call per-profile values "a future extension"; they shipped.) The
+  live footgun is the resolution, not the gate: a new per-institution offer
+  field MUST come from the `InstitutionFor(row.Policy.Resolver)` result, never
+  from the top-level `[browser]` config, or every named profile silently
+  re-acquires the default institution's identity for that one field.
+- **The native host distinguishes application failures from transport/framing
+  failures at the `browser.sync` boundary.** A daemon handler's ordinary
+  failure is logged, surfaced as one structured error frame, and the browser
+  session continues serving later requests. Only an explicitly classified
+  transport/framing failure — a broken IPC connection, an undecodable frame, a
+  wire size-cap violation, a daemon outbound self-validation failure, a
+  `result_too_large` response, or a failed native stdout write — tears down the
+  session, because continuing would mean the host can no longer trust the
+  request/response stream. The API marks only the ordinary `browser.sync`
+  operation path as application-level; protocol violations and unrepresentable
+  outbound frames remain fatal. `internal/nativehost/host.go` keeps this
+  disposition out of the IPC result shape so older peers remain decodable.
+  Every handler in `internal/browser/bridge.go` MUST encode ordinary/expected failures (item
+  gone, file missing, not configured, …) into a structured `outcome`/`detail`
+  result (or the existing structured error frame when that result has no
+  outcome/detail fields) — mirror `TriageDecideResultPayload`/
+  `HumanActionResolveResultPayload`/`ReviewPreviewResultPayload` — never return
+  a raw Go `error` for a routine condition. `reviewPreview` got this wrong and
+  every click on a stale review action was silently disconnecting the extension;
+  inbox-count and stats reads repeated the same failure through their old
+  raw-error paths.
 - **Adding a daemon feature flag breaks one hardcoded assertion** in
   `internal/browser/bridge_test.go`: the exact advertised list in the hello-ack test
   (`slices.Equal(payload.Features, …)`). Add the new feature to the `required` literal in

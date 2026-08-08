@@ -204,6 +204,7 @@ export interface ProviderOutcomePayload {
 export interface ErrorPayload {
   code: string;
   message: string;
+  request_id?: string;
 }
 
 export interface TriageCounts {
@@ -462,12 +463,12 @@ export type PageBulkStatus =
   | "previously_unavailable"
   | "ownership_incomplete"
   | "ownership_unknown"
-  | "invalid";
+  | "invalid"
+  | "frame_too_large";
 
 export interface PageBulkStatusItem {
   local_id: string;
-  /** Omitted when status is "invalid" — an identifier that never resolved
-   * has no canonical work identity to report. */
+  /** Omitted when status is "invalid" or "frame_too_large". */
   canonical_key?: string;
   status: PageBulkStatus;
   ownership_complete: boolean;
@@ -1420,12 +1421,13 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
       if ("adapter_version" in p) str(p, "adapter_version", "provider_outcome", 50);
       if ("detail" in p) str(p, "detail", "provider_outcome", 500);
       break;
-    }
+      }
     case "error": {
-      requireFields<ErrorPayload>(p, "error", { code: "required", message: "required" });
+      requireFields<ErrorPayload>(p, "error", { code: "required", message: "required", request_id: "optional" });
       if (!ERROR_CODE_RE.test(str(p, "code", "error", 50))) fail("invalid error code");
       const message = str(p, "message", "error", 1000);
       if (message.length === 0) fail("error.message required");
+      if ("request_id" in p) correlationID(p, "request_id", "error");
       break;
     }
     case "hello_ack": {
@@ -1783,14 +1785,15 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
             "ownership_incomplete",
             "ownership_unknown",
             "invalid",
+            "frame_too_large",
           ].includes(status)
         ) {
           fail("page_bulk_status_result.items.status is invalid");
         }
-        // An identifier that never resolved has no canonical work identity to
-        // report; every other status carries one (Decision 7).
-        if (status === "invalid") {
-          if ("canonical_key" in item) fail("page_bulk_status_result.items.canonical_key must be omitted for invalid");
+        // An identifier that never resolved, or a result refused because it
+        // could not fit the response, has no canonical work identity.
+        if (status === "invalid" || status === "frame_too_large") {
+          if ("canonical_key" in item) fail(`page_bulk_status_result.items.canonical_key must be omitted for ${status}`);
         } else {
           if (!("canonical_key" in item)) fail("page_bulk_status_result.items.canonical_key is required");
           if (triageText(item, "canonical_key", "page_bulk_status_result.items", 300) === "") {

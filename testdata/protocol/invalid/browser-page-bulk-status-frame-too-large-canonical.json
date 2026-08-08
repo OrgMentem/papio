@@ -1,0 +1,19 @@
+{
+  "protocol": "papio-browser/1",
+  "type": "page_bulk_status_result",
+  "msg_id": "page-bulk-status-res-03",
+  "seq": 4,
+  "payload": {
+    "request_id": "request-bulk-0003",
+    "scan_id": "scan-bulk-0003",
+    "items": [
+      {
+        "local_id": "row-oversized",
+        "canonical_key": "work-key-doi-10-1000-example-44",
+        "status": "frame_too_large",
+        "ownership_complete": false
+      }
+    ],
+    "truncated": false
+  }
+}

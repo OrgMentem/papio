@@ -1,0 +1,11 @@
+{
+  "protocol": "papio-browser/1",
+  "type": "error",
+  "msg_id": "error_msg_0002",
+  "seq": 7,
+  "payload": {
+    "code": "application_error",
+    "message": "the daemon could not complete this request",
+    "request_id": null
+  }
+}

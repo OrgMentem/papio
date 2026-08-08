@@ -27,6 +27,7 @@
         "download_started",
         "download_complete",
         "delivery_context",
+        "provider_outcome",
         "cancel",
         "handoff_focus",
         "ack",
@@ -122,9 +123,9 @@
         "seq": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
         "at": { "type": "string", "format": "date-time" },
         "job_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,128}$" },
-        "kind": { "type": "string", "minLength": 1, "maxLength": 100, "pattern": "^[^\\u0000]*$" },
-        "text": { "type": "string", "maxLength": 160, "pattern": "^[^\\u0000]*$" },
-        "title": { "type": "string", "maxLength": 500, "pattern": "^[^\\u0000]*$" }
+        "kind": { "type": "string", "minLength": 1, "maxLength": 100, "pattern": "^[^\u0000]*$" },
+        "text": { "type": "string", "maxLength": 160, "pattern": "^[^\u0000]*$" },
+        "title": { "type": "string", "maxLength": 500, "pattern": "^[^\u0000]*$" }
       }
     },
     "fact": {
@@ -132,8 +133,8 @@
       "additionalProperties": false,
       "required": ["label", "text"],
       "properties": {
-        "label": { "type": "string", "maxLength": 40, "pattern": "^[^\\u0000]*$" },
-        "text": { "type": "string", "maxLength": 400, "pattern": "^[^\\u0000]*$" }
+        "label": { "type": "string", "maxLength": 40, "pattern": "^[^\u0000]*$" },
+        "text": { "type": "string", "maxLength": 400, "pattern": "^[^\u0000]*$" }
       }
     },
     "link": {
@@ -142,7 +143,7 @@
       "required": ["rel", "url"],
       "properties": {
         "rel": { "enum": ["doi", "arxiv", "openalex", "landing", "preview"] },
-        "url": { "type": "string", "format": "uri", "maxLength": 4000, "pattern": "^https://[^\\u0000]+$" }
+        "url": { "type": "string", "format": "uri", "maxLength": 4000, "pattern": "^https://[^\u0000]+$" }
       }
     },
     "item_core": {
@@ -150,9 +151,9 @@
       "required": ["kind", "id", "rank", "title", "facts", "links", "ops"],
       "properties": {
         "kind": { "enum": ["watch_hit", "human_action", "retraction"] },
-        "id": { "type": "string", "minLength": 1, "maxLength": 1024, "pattern": "^[^\\u0000]+$" },
+        "id": { "type": "string", "minLength": 1, "maxLength": 1024, "pattern": "^[^\u0000]+$" },
         "rank": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
-        "title": { "type": "string", "maxLength": 500, "pattern": "^[^\\u0000]*$" },
+        "title": { "type": "string", "maxLength": 500, "pattern": "^[^\u0000]*$" },
         "facts": { "type": "array", "maxItems": 8, "items": { "$ref": "#/$defs/fact" } },
         "links": { "type": "array", "maxItems": 16, "items": { "$ref": "#/$defs/link" } },
         "ops": {
@@ -171,9 +172,9 @@
           "required": ["kind", "id", "rank", "title", "facts", "links", "ops", "work", "abstract", "watches", "first_seen_at"],
           "properties": {
             "kind": { "const": "watch_hit" },
-            "id": { "type": "string", "minLength": 1, "maxLength": 1024, "pattern": "^[^\\u0000]+$" },
+            "id": { "type": "string", "minLength": 1, "maxLength": 1024, "pattern": "^[^\u0000]+$" },
             "rank": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
-            "title": { "type": "string", "maxLength": 500, "pattern": "^[^\\u0000]*$" },
+            "title": { "type": "string", "maxLength": 500, "pattern": "^[^\u0000]*$" },
             "facts": { "type": "array", "maxItems": 8, "items": { "$ref": "#/$defs/fact" } },
             "links": { "type": "array", "maxItems": 16, "items": { "$ref": "#/$defs/link" } },
             "ops": { "type": "array", "uniqueItems": true, "items": { "enum": ["acquire", "dismiss", "accept", "reject", "open", "retry", "open_request_history", "confirm_request_exists", "confirm_request_absent"] } },
@@ -182,14 +183,14 @@
               "additionalProperties": false,
               "required": ["doi", "title", "authors", "year", "is_oa"],
               "properties": {
-                "doi": { "type": "string", "maxLength": 300, "pattern": "^[^\\u0000]*$" },
-                "title": { "type": "string", "maxLength": 500, "pattern": "^[^\\u0000]*$" },
-                "authors": { "type": "string", "maxLength": 200, "pattern": "^[^\\u0000]*$" },
+                "doi": { "type": "string", "maxLength": 300, "pattern": "^[^\u0000]*$" },
+                "title": { "type": "string", "maxLength": 500, "pattern": "^[^\u0000]*$" },
+                "authors": { "type": "string", "maxLength": 200, "pattern": "^[^\u0000]*$" },
                 "year": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
                 "is_oa": { "type": "boolean" }
               }
             },
-            "abstract": { "type": "string", "maxLength": 2000, "pattern": "^[^\\u0000]*$" },
+            "abstract": { "type": "string", "maxLength": 2000, "pattern": "^[^\u0000]*$" },
             "watches": {
               "type": "array",
               "minItems": 1,
@@ -200,7 +201,7 @@
                 "required": ["id", "label"],
                 "properties": {
                   "id": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
-                  "label": { "type": "string", "maxLength": 500, "pattern": "^[^\\u0000]*$" }
+                  "label": { "type": "string", "maxLength": 500, "pattern": "^[^\u0000]*$" }
                 }
               }
             },
@@ -218,16 +219,16 @@
           "required": ["kind", "id", "rank", "title", "facts", "links", "ops", "action_id", "job_id", "action_kind", "job_state", "revision", "sha256", "size_bytes"],
           "properties": {
             "kind": { "const": "human_action" },
-            "id": { "type": "string", "minLength": 1, "maxLength": 1024, "pattern": "^[^\\u0000]+$" },
+            "id": { "type": "string", "minLength": 1, "maxLength": 1024, "pattern": "^[^\u0000]+$" },
             "rank": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
-            "title": { "type": "string", "maxLength": 500, "pattern": "^[^\\u0000]*$" },
+            "title": { "type": "string", "maxLength": 500, "pattern": "^[^\u0000]*$" },
             "facts": { "type": "array", "maxItems": 8, "items": { "$ref": "#/$defs/fact" } },
             "links": { "type": "array", "maxItems": 16, "items": { "$ref": "#/$defs/link" } },
             "ops": { "type": "array", "uniqueItems": true, "items": { "enum": ["acquire", "dismiss", "accept", "reject", "open", "retry", "open_request_history", "confirm_request_exists", "confirm_request_absent"] } },
             "action_id": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
             "job_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,128}$" },
-            "action_kind": { "type": "string", "minLength": 1, "maxLength": 100, "pattern": "^[^\\u0000]+$" },
-            "job_state": { "type": "string", "minLength": 1, "maxLength": 50, "pattern": "^[^\\u0000]+$" },
+            "action_kind": { "type": "string", "minLength": 1, "maxLength": 100, "pattern": "^[^\u0000]+$" },
+            "job_state": { "type": "string", "minLength": 1, "maxLength": 50, "pattern": "^[^\u0000]+$" },
             "revision": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
             "sha256": { "type": "string", "pattern": "^(|[a-f0-9]{64})$" },
             "size_bytes": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
@@ -246,16 +247,16 @@
           "required": ["kind", "id", "rank", "title", "facts", "links", "ops", "doi", "nature", "noticed_at"],
           "properties": {
             "kind": { "const": "retraction" },
-            "id": { "type": "string", "minLength": 1, "maxLength": 1024, "pattern": "^[^\\u0000]+$" },
+            "id": { "type": "string", "minLength": 1, "maxLength": 1024, "pattern": "^[^\u0000]+$" },
             "rank": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
-            "title": { "type": "string", "maxLength": 500, "pattern": "^[^\\u0000]*$" },
+            "title": { "type": "string", "maxLength": 500, "pattern": "^[^\u0000]*$" },
             "facts": { "type": "array", "maxItems": 8, "items": { "$ref": "#/$defs/fact" } },
             "links": { "type": "array", "maxItems": 16, "items": { "$ref": "#/$defs/link" } },
             "ops": { "type": "array", "uniqueItems": true, "items": { "enum": ["acquire", "dismiss", "accept", "reject", "open", "retry", "open_request_history", "confirm_request_exists", "confirm_request_absent"] } },
-            "doi": { "type": "string", "minLength": 1, "maxLength": 300, "pattern": "^[^\\u0000]+$" },
+            "doi": { "type": "string", "minLength": 1, "maxLength": 300, "pattern": "^[^\u0000]+$" },
             "nature": { "enum": ["retraction", "correction", "concern"] },
             "noticed_at": { "type": "string", "format": "date-time" },
-            "notice_doi": { "type": "string", "maxLength": 300, "pattern": "^[^\\u0000]*$" }
+            "notice_doi": { "type": "string", "maxLength": 300, "pattern": "^[^\u0000]*$" }
           }
         }
       ]
@@ -269,16 +270,16 @@
           "required": ["kind", "id", "rank", "title", "facts", "links", "ops", "action_id", "job_id", "action_kind", "job_state", "revision", "sha256", "size_bytes"],
           "properties": {
             "kind": { "const": "human_action" },
-            "id": { "type": "string", "minLength": 1, "maxLength": 1024, "pattern": "^[^\\u0000]+$" },
+            "id": { "type": "string", "minLength": 1, "maxLength": 1024, "pattern": "^[^\u0000]+$" },
             "rank": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
-            "title": { "type": "string", "maxLength": 500, "pattern": "^[^\\u0000]*$" },
+            "title": { "type": "string", "maxLength": 500, "pattern": "^[^\u0000]*$" },
             "facts": { "type": "array", "maxItems": 8, "items": { "$ref": "#/$defs/fact" } },
             "links": { "type": "array", "maxItems": 16, "items": { "$ref": "#/$defs/link" } },
             "ops": { "type": "array", "uniqueItems": true, "items": { "enum": ["acquire", "dismiss", "accept", "reject", "open", "retry", "open_request_history", "confirm_request_exists", "confirm_request_absent"] } },
             "action_id": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
             "job_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,128}$" },
-            "action_kind": { "type": "string", "minLength": 1, "maxLength": 100, "pattern": "^[^\\u0000]+$" },
-            "job_state": { "type": "string", "minLength": 1, "maxLength": 50, "pattern": "^[^\\u0000]+$" },
+            "action_kind": { "type": "string", "minLength": 1, "maxLength": 100, "pattern": "^[^\u0000]+$" },
+            "job_state": { "type": "string", "minLength": 1, "maxLength": 50, "pattern": "^[^\u0000]+$" },
             "revision": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
             "sha256": { "type": "string", "pattern": "^(|[a-f0-9]{64})$" },
             "size_bytes": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
@@ -305,8 +306,8 @@
       "additionalProperties": false,
       "required": ["provider", "state"],
       "properties": {
-        "provider": { "type": "string", "minLength": 1, "maxLength": 100, "pattern": "^[^\\u0000]+$" },
-        "provider_reference": { "type": "string", "maxLength": 300, "pattern": "^[^\\u0000]*$" },
+        "provider": { "type": "string", "minLength": 1, "maxLength": 100, "pattern": "^[^\u0000]+$" },
+        "provider_reference": { "type": "string", "maxLength": 300, "pattern": "^[^\u0000]*$" },
         "state": { "enum": ["offered", "submitted", "pending", "fulfilled", "declined", "cancelled", "unknown_outcome"] }
       }
     },
@@ -319,9 +320,9 @@
           "required": ["kind", "id", "rank", "title", "facts", "links", "ops", "attention", "work", "abstract", "watches", "first_seen_at"],
           "properties": {
             "kind": { "const": "watch_hit" },
-            "id": { "type": "string", "minLength": 1, "maxLength": 1024, "pattern": "^[^\\u0000]+$" },
+            "id": { "type": "string", "minLength": 1, "maxLength": 1024, "pattern": "^[^\u0000]+$" },
             "rank": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
-            "title": { "type": "string", "maxLength": 500, "pattern": "^[^\\u0000]*$" },
+            "title": { "type": "string", "maxLength": 500, "pattern": "^[^\u0000]*$" },
             "facts": { "type": "array", "maxItems": 8, "items": { "$ref": "#/$defs/fact" } },
             "links": { "type": "array", "maxItems": 16, "items": { "$ref": "#/$defs/link" } },
             "ops": { "type": "array", "uniqueItems": true, "items": { "enum": ["acquire", "dismiss", "accept", "reject", "open", "retry", "open_request_history", "confirm_request_exists", "confirm_request_absent"] } },
@@ -331,14 +332,14 @@
               "additionalProperties": false,
               "required": ["doi", "title", "authors", "year", "is_oa"],
               "properties": {
-                "doi": { "type": "string", "maxLength": 300, "pattern": "^[^\\u0000]*$" },
-                "title": { "type": "string", "maxLength": 500, "pattern": "^[^\\u0000]*$" },
-                "authors": { "type": "string", "maxLength": 200, "pattern": "^[^\\u0000]*$" },
+                "doi": { "type": "string", "maxLength": 300, "pattern": "^[^\u0000]*$" },
+                "title": { "type": "string", "maxLength": 500, "pattern": "^[^\u0000]*$" },
+                "authors": { "type": "string", "maxLength": 200, "pattern": "^[^\u0000]*$" },
                 "year": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
                 "is_oa": { "type": "boolean" }
               }
             },
-            "abstract": { "type": "string", "maxLength": 2000, "pattern": "^[^\\u0000]*$" },
+            "abstract": { "type": "string", "maxLength": 2000, "pattern": "^[^\u0000]*$" },
             "watches": {
               "type": "array",
               "minItems": 1,
@@ -349,7 +350,7 @@
                 "required": ["id", "label"],
                 "properties": {
                   "id": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
-                  "label": { "type": "string", "maxLength": 500, "pattern": "^[^\\u0000]*$" }
+                  "label": { "type": "string", "maxLength": 500, "pattern": "^[^\u0000]*$" }
                 }
               }
             },
@@ -367,17 +368,17 @@
           "required": ["kind", "id", "rank", "title", "facts", "links", "ops", "attention", "action_id", "job_id", "action_kind", "job_state", "revision", "sha256", "size_bytes", "route_class", "auth_requirement"],
           "properties": {
             "kind": { "const": "human_action" },
-            "id": { "type": "string", "minLength": 1, "maxLength": 1024, "pattern": "^[^\\u0000]+$" },
+            "id": { "type": "string", "minLength": 1, "maxLength": 1024, "pattern": "^[^\u0000]+$" },
             "rank": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
-            "title": { "type": "string", "maxLength": 500, "pattern": "^[^\\u0000]*$" },
+            "title": { "type": "string", "maxLength": 500, "pattern": "^[^\u0000]*$" },
             "facts": { "type": "array", "maxItems": 8, "items": { "$ref": "#/$defs/fact" } },
             "links": { "type": "array", "maxItems": 16, "items": { "$ref": "#/$defs/link" } },
             "ops": { "type": "array", "uniqueItems": true, "items": { "enum": ["acquire", "dismiss", "accept", "reject", "open", "retry", "open_request_history", "confirm_request_exists", "confirm_request_absent"] } },
             "attention": { "$ref": "#/$defs/attention_enum" },
             "action_id": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
             "job_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,128}$" },
-            "action_kind": { "type": "string", "minLength": 1, "maxLength": 100, "pattern": "^[^\\u0000]+$" },
-            "job_state": { "type": "string", "minLength": 1, "maxLength": 50, "pattern": "^[^\\u0000]+$" },
+            "action_kind": { "type": "string", "minLength": 1, "maxLength": 100, "pattern": "^[^\u0000]+$" },
+            "job_state": { "type": "string", "minLength": 1, "maxLength": 50, "pattern": "^[^\u0000]+$" },
             "revision": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
             "sha256": { "type": "string", "pattern": "^(|[a-f0-9]{64})$" },
             "size_bytes": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
@@ -406,17 +407,17 @@
           "required": ["kind", "id", "rank", "title", "facts", "links", "ops", "attention", "doi", "nature", "noticed_at"],
           "properties": {
             "kind": { "const": "retraction" },
-            "id": { "type": "string", "minLength": 1, "maxLength": 1024, "pattern": "^[^\\u0000]+$" },
+            "id": { "type": "string", "minLength": 1, "maxLength": 1024, "pattern": "^[^\u0000]+$" },
             "rank": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
-            "title": { "type": "string", "maxLength": 500, "pattern": "^[^\\u0000]*$" },
+            "title": { "type": "string", "maxLength": 500, "pattern": "^[^\u0000]*$" },
             "facts": { "type": "array", "maxItems": 8, "items": { "$ref": "#/$defs/fact" } },
             "links": { "type": "array", "maxItems": 16, "items": { "$ref": "#/$defs/link" } },
             "ops": { "type": "array", "uniqueItems": true, "items": { "enum": ["acquire", "dismiss", "accept", "reject", "open", "retry", "open_request_history", "confirm_request_exists", "confirm_request_absent"] } },
             "attention": { "$ref": "#/$defs/attention_enum" },
-            "doi": { "type": "string", "minLength": 1, "maxLength": 300, "pattern": "^[^\\u0000]+$" },
+            "doi": { "type": "string", "minLength": 1, "maxLength": 300, "pattern": "^[^\u0000]+$" },
             "nature": { "enum": ["retraction", "correction", "concern"] },
             "noticed_at": { "type": "string", "format": "date-time" },
-            "notice_doi": { "type": "string", "maxLength": 300, "pattern": "^[^\\u0000]*$" }
+            "notice_doi": { "type": "string", "maxLength": 300, "pattern": "^[^\u0000]*$" }
           }
         }
       ]
@@ -434,7 +435,7 @@
       "required": ["kind", "label", "grab", "route_class", "blocked_by", "attention", "ops"],
       "properties": {
         "kind": { "const": "pdf_grab" },
-        "label": { "type": "string", "minLength": 1, "maxLength": 500, "pattern": "^[^\\u0000]+$" },
+        "label": { "type": "string", "minLength": 1, "maxLength": 500, "pattern": "^[^\u0000]+$" },
         "grab": {
           "type": "object",
           "additionalProperties": false,
@@ -479,7 +480,7 @@
       "properties": {
         "request_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,64}$" },
         "outcome": { "enum": ["applied", "already_applied", "conflict", "error"] },
-        "detail": { "type": "string", "maxLength": 1000, "pattern": "^[^\\u0000]*$" }
+        "detail": { "type": "string", "maxLength": 1000, "pattern": "^[^\u0000]*$" }
       }
     },
     "page_bulk_identifier": {
@@ -487,9 +488,9 @@
       "additionalProperties": false,
       "required": ["local_id", "kind", "value"],
       "properties": {
-        "local_id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[^\\u0000]+$" },
+        "local_id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[^\u0000]+$" },
         "kind": { "enum": ["doi", "pmid", "arxiv", "openalex"] },
-        "value": { "type": "string", "minLength": 1, "maxLength": 512, "pattern": "^[^\\u0000]+$" }
+        "value": { "type": "string", "minLength": 1, "maxLength": 512, "pattern": "^[^\u0000]+$" }
       }
     },
     "page_bulk_status_item": {
@@ -497,8 +498,8 @@
       "additionalProperties": false,
       "required": ["local_id", "status", "ownership_complete"],
       "properties": {
-        "local_id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[^\\u0000]+$" },
-        "canonical_key": { "type": "string", "minLength": 1, "maxLength": 300, "pattern": "^[^\\u0000]+$" },
+        "local_id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[^\u0000]+$" },
+        "canonical_key": { "type": "string", "minLength": 1, "maxLength": 300, "pattern": "^[^\u0000]+$" },
         "status": {
           "enum": [
             "eligible",
@@ -508,7 +509,8 @@
             "previously_unavailable",
             "ownership_incomplete",
             "ownership_unknown",
-            "invalid"
+            "invalid",
+            "frame_too_large"
           ]
         },
         "ownership_complete": { "type": "boolean" },
@@ -517,11 +519,11 @@
       },
       "allOf": [
         {
-          "if": { "properties": { "status": { "const": "invalid" } }, "required": ["status"] },
+          "if": { "properties": { "status": { "enum": ["invalid", "frame_too_large"] } }, "required": ["status"] },
           "then": { "not": { "required": ["canonical_key"] } }
         },
         {
-          "if": { "properties": { "status": { "not": { "const": "invalid" } } }, "required": ["status"] },
+          "if": { "properties": { "status": { "not": { "enum": ["invalid", "frame_too_large"] } } }, "required": ["status"] },
           "then": { "required": ["canonical_key"] }
         },
         {
@@ -541,7 +543,7 @@
       "properties": {
         "kind": { "const": "browser_page" },
         "origin": { "type": "string", "maxLength": 300, "pattern": "^https://[a-z0-9.-]{3,253}(:[0-9]{1,5})?$" },
-        "detector": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[^\\u0000]+$" }
+        "detector": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[^\u0000]+$" }
       }
     }
   },
@@ -608,11 +610,11 @@
                 "format": "uri",
                 "maxLength": 4000,
                 "pattern": "^[Hh][Tt][Tt][Pp][Ss]?://.+",
-                "allOf": [{ "pattern": "^[^\\u0000]*$" }]
+                "allOf": [{ "pattern": "^[^\u0000]*$" }]
               },
-              "doi": { "type": "string", "maxLength": 512, "pattern": "^[^\\u0000]*$" },
-              "title": { "type": "string", "maxLength": 1024, "pattern": "^[^\\u0000]*$" },
-              "source": { "type": "string", "maxLength": 1024, "pattern": "^[^\\u0000]*$" }
+              "doi": { "type": "string", "maxLength": 512, "pattern": "^[^\u0000]*$" },
+              "title": { "type": "string", "maxLength": 1024, "pattern": "^[^\u0000]*$" },
+              "source": { "type": "string", "maxLength": 1024, "pattern": "^[^\u0000]*$" }
             }
           }
         }
@@ -644,7 +646,7 @@
             "properties": {
               "job_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,128}$" },
               "duplicate": { "type": "boolean" },
-              "error": { "type": "string", "minLength": 1, "maxLength": 1000, "pattern": "^[^\\u0000]+$" }
+              "error": { "type": "string", "minLength": 1, "maxLength": 1000, "pattern": "^[^\u0000]+$" }
             }
           }
         }
@@ -685,7 +687,7 @@
             "required": ["request_id", "url", "provider", "scenario"],
             "properties": {
               "request_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,64}$" },
-              "url": { "type": "string", "format": "uri", "maxLength": 4000, "pattern": "^https://[^\\u0000]+$" },
+              "url": { "type": "string", "format": "uri", "maxLength": 4000, "pattern": "^https://[^\u0000]+$" },
               "provider": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$" },
               "scenario": { "enum": ["success", "login-return", "no-entitlement", "drift", "terms"] },
               "settle_ms": { "type": "integer", "minimum": 0, "maximum": 10000 }
@@ -705,7 +707,7 @@
             "properties": {
               "request_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,64}$" },
               "outcome": { "enum": ["captured", "nav_failed", "timeout", "not_permitted", "busy"] },
-              "detail": { "type": "string", "maxLength": 1000, "pattern": "^[^\\u0000]*$" }
+              "detail": { "type": "string", "maxLength": 1000, "pattern": "^[^\u0000]*$" }
             }
           }
         }
@@ -887,7 +889,8 @@
             "required": ["code", "message"],
             "properties": {
               "code": { "type": "string", "pattern": "^[a-z0-9_]{2,50}$" },
-              "message": { "type": "string", "maxLength": 1000 }
+              "message": { "type": "string", "maxLength": 1000 },
+              "request_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,64}$" }
             }
           }
         }
@@ -910,7 +913,7 @@
                 ]
               },
               "limit": { "type": "integer", "minimum": 1, "maximum": 100 },
-              "cursor": { "type": "string", "maxLength": 256, "pattern": "^[^\\u0000]*$" }
+              "cursor": { "type": "string", "maxLength": 256, "pattern": "^[^\u0000]*$" }
             }
           }
         }
@@ -930,7 +933,7 @@
               "generated_at": { "type": "string", "format": "date-time" },
               "counts": { "$ref": "#/$defs/counts" },
               "items": { "type": "array", "maxItems": 100 },
-              "cursor": { "type": "string", "maxLength": 256, "pattern": "^[^\\u0000]*$" },
+              "cursor": { "type": "string", "maxLength": 256, "pattern": "^[^\u0000]*$" },
               "has_more": { "type": "boolean" },
               "unsupported_items_count": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
             },
@@ -1002,7 +1005,7 @@
             "required": ["request_id", "item_id", "op"],
             "properties": {
               "request_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,64}$" },
-              "item_id": { "type": "string", "minLength": 1, "maxLength": 1024, "pattern": "^[^\\u0000]+$" },
+              "item_id": { "type": "string", "minLength": 1, "maxLength": 1024, "pattern": "^[^\u0000]+$" },
               "op": { "enum": ["acquire", "dismiss"] },
               "watch_scope": {
                 "oneOf": [
@@ -1035,7 +1038,7 @@
               "request_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,64}$" },
               "job_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,128}$" },
               "operation": { "enum": ["confirm_request_exists", "confirm_request_absent"] },
-              "provider_reference": { "type": "string", "maxLength": 300, "pattern": "^[^\\u0000]*$" }
+              "provider_reference": { "type": "string", "maxLength": 300, "pattern": "^[^\u0000]*$" }
             },
             "allOf": [
               { "if": { "properties": { "operation": { "const": "confirm_request_exists" } }, "required": ["operation"] }, "then": { "required": ["provider_reference"] } },
@@ -1094,7 +1097,7 @@
             "properties": {
               "request_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,64}$" },
               "outcome": { "enum": ["ok", "error"] },
-              "detail": { "type": "string", "maxLength": 1000, "pattern": "^[^\\u0000]*$" },
+              "detail": { "type": "string", "maxLength": 1000, "pattern": "^[^\u0000]*$" },
               "url": { "type": "string", "maxLength": 4000, "pattern": "^http://127\\.0\\.0\\.1:[0-9]{1,5}/p/[A-Za-z0-9_-]+$" },
               "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
               "size_bytes": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
@@ -1247,7 +1250,7 @@
                 "minItems": 1,
                 "maxItems": 50,
                 "uniqueItems": true,
-                "items": { "type": "string", "minLength": 1, "maxLength": 300, "pattern": "^[^\\u0000]+$" }
+                "items": { "type": "string", "minLength": 1, "maxLength": 300, "pattern": "^[^\u0000]+$" }
               },
               "source": { "$ref": "#/$defs/page_bulk_source" }
             }
@@ -1287,7 +1290,7 @@
             "properties": {
               "request_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,64}$" },
               "host": { "type": "string", "maxLength": 253, "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$" },
-              "title": { "type": "string", "maxLength": 500, "pattern": "^[^\\u0000]*$" }
+              "title": { "type": "string", "maxLength": 500, "pattern": "^[^\u0000]*$" }
             }
           }
         }
@@ -1322,7 +1325,7 @@
               "grab_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,64}$" },
               "state": { "enum": ["", "awaiting_file", "quarantined", "identified", "job_created", "parked_no_identifier", "failed_validation", "abandoned"] },
               "outcome": { "enum": ["not_found", "unavailable", "job_created", "already_owned", "needs_identifier", "failed_validation", "abandoned"] },
-              "detail": { "type": "string", "maxLength": 1000, "pattern": "^[^\\u0000]*$" },
+              "detail": { "type": "string", "maxLength": 1000, "pattern": "^[^\u0000]*$" },
               "job_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,128}$" }
             }
           }
@@ -1362,7 +1365,7 @@
               "grab_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,64}$" },
               "state": { "enum": ["", "awaiting_file", "quarantined", "identified", "job_created", "parked_no_identifier", "failed_validation", "abandoned"] },
               "outcome": { "enum": ["abandoned", "not_found", "unavailable", "conflict"] },
-              "detail": { "type": "string", "maxLength": 1000, "pattern": "^[^\\u0000]*$" }
+              "detail": { "type": "string", "maxLength": 1000, "pattern": "^[^\u0000]*$" }
             }
           }
         }
@@ -1391,7 +1394,7 @@
                 "enum": ["steering", "existing", "not_supported", "unavailable", "job_created", "already_owned", "needs_identifier", "failed_validation", "abandoned"]
               },
               "steering_path": { "type": "string", "pattern": "^papio/grabs/[A-Za-z0-9_-]{8,64}/$" },
-              "detail": { "type": "string", "maxLength": 1000, "pattern": "^[^\\u0000]*$" }
+              "detail": { "type": "string", "maxLength": 1000, "pattern": "^[^\u0000]*$" }
             }
           }
         }

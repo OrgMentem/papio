@@ -1,6 +1,9 @@
 # ADR-0017: Document delivery and ILL become a durable, configured route
 
-Status: Proposed (2026-08-07). Drafted from the integration consult
+Status: **Accepted** (2026-08-07; implemented and shipped in 0.19.0. The
+transport defect that made real submissions impossible — the ILLiad client
+could not POST — was found and fixed in 0.20.0, so Decision 4's submission
+path is only genuinely live from that release). Drafted from the integration consult
 (dev/scratch/oracle/papio-integrations-r1.md, -r2.md); amended the same day
 from consult rounds r3/r4 and independent deployment research (ILLiad/OCLC/
 Rapido vendor documentation, AU s49 practice) before acceptance. Further

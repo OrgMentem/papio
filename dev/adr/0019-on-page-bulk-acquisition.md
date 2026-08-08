@@ -1,8 +1,10 @@
 # ADR-0019: On-page bulk acquisition
 
-Status: Proposed (2026-08-07). Consolidated from the integration consult
-rounds r3/r4 (dev/scratch/oracle/) and the maintainer's UX picks; not yet
-implemented.
+Status: **Accepted** (2026-08-07; implemented and shipped — the selection
+workspace, allowlisted scanning, and batch submission landed across 0.18.0
+and 0.19.0, and ADR-0020 later extended the same workspace to PDF tabs).
+Consolidated from the integration consult rounds r3/r4
+(dev/scratch/oracle/) and the maintainer's UX picks.
 
 ## Context
 

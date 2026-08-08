@@ -1081,10 +1081,13 @@ type ProviderOutcomePayload struct {
 	Detail         string `json:"detail,omitempty"`
 }
 
-// ErrorPayload is a normalized bridge error.
+// ErrorPayload is a normalized bridge error. RequestID is optional so an
+// application failure can settle the request that produced it without
+// changing the behavior of unsolicited protocol errors.
 type ErrorPayload struct {
-	Code    string `json:"code"`
-	Message string `json:"message"`
+	Code      string `json:"code"`
+	Message   string `json:"message"`
+	RequestID string `json:"request_id,omitempty"`
 }
 
 // EmptyPayload is used by types that carry no data (ack, job_accept,
@@ -1863,6 +1866,9 @@ func DecodeBrowserMessage(data []byte) (*BrowserMessage, error) {
 	case MsgError:
 		p := &ErrorPayload{}
 		if err = browserRequireFields(payloadFields, "code", "message"); err == nil {
+			err = browserRejectNullFields(payloadFields, "request_id")
+		}
+		if err == nil {
 			err = strictDecode(env.Payload, p)
 		}
 		if err == nil {
@@ -1870,6 +1876,8 @@ func DecodeBrowserMessage(data []byte) (*BrowserMessage, error) {
 				err = fmt.Errorf("invalid error code %q", p.Code)
 			} else if p.Message == "" || browserTextLen(p.Message) > 1000 {
 				err = fmt.Errorf("error message required (max 1000)")
+			} else if p.RequestID != "" {
+				err = validateCorrelationID("error.request_id", p.RequestID)
 			}
 		}
 		msg.Payload = p
@@ -3432,15 +3440,16 @@ func (p *PageBulkStatusResultPayload) validate() error {
 		}
 		if err := enumRequired("page_bulk_status_result.items.status", item.Status,
 			"eligible", "owned_with_pdf", "owned_missing_pdf", "queued",
-			"previously_unavailable", "ownership_incomplete", "ownership_unknown", "invalid"); err != nil {
+			"previously_unavailable", "ownership_incomplete", "ownership_unknown",
+			"invalid", "frame_too_large"); err != nil {
 			return err
 		}
-		// An identifier that never resolved has no canonical work identity to
-		// report; every other status carries one (Decision 7: "returns, per
-		// identifier, a canonical key and a status").
-		if item.Status == "invalid" {
+		// An identifier that never resolved, or a result refused because it
+		// could not fit the response, has no canonical work identity to report.
+		// Every other status carries one (Decision 7).
+		if item.Status == "invalid" || item.Status == "frame_too_large" {
 			if item.CanonicalKey != "" {
-				return fmt.Errorf("page_bulk_status_result.items.canonical_key must be omitted for invalid")
+				return fmt.Errorf("page_bulk_status_result.items.canonical_key must be omitted for %s", item.Status)
 			}
 		} else {
 			if item.CanonicalKey == "" {

@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"sort"
 	"time"
 
@@ -84,6 +85,10 @@ type Service struct {
 	// jitter overrides Poll's default backoff jitter (poll.go); nil uses
 	// defaultJitter. Test-only seam, never set by New.
 	jitter func(time.Duration) time.Duration
+	// beforeRecordSubmissionCommit is a test-only fault-injection seam. It
+	// runs after the conditional UPDATE but before Commit, proving rollback
+	// cannot expose a partially recorded submission.
+	beforeRecordSubmissionCommit func(*sql.Tx) error
 }
 
 // New constructs a Service. now defaults to time.Now when nil.
@@ -92,6 +97,18 @@ func New(store *store.Store, cfg *config.Config, now func() time.Time) *Service 
 		now = time.Now
 	}
 	return &Service{store: store, cfg: cfg, now: now}
+}
+
+// SetRecordSubmissionCommitHookForTest installs a fault hook invoked after
+// RecordSubmission's conditional UPDATE and before its transaction commits.
+// It exists solely for cross-package tests of rollback and must remain nil in
+// production.
+func (s *Service) SetRecordSubmissionCommitHookForTest(h func() error) {
+	if h == nil {
+		s.beforeRecordSubmissionCommit = nil
+		return
+	}
+	s.beforeRecordSubmissionCommit = func(*sql.Tx) error { return h() }
 }
 
 // IdempotencyKey computes Decision 1's idempotency key: SHA-256 hex over
@@ -327,6 +344,65 @@ func (s *Service) RecordPoll(ctx context.Context, id int64, providerReference st
 		SET provider_reference = ?, last_checked_at = ?, next_check_at = ?, updated_at = ?
 		WHERE id = ?`, providerReference, now, next, now, id)
 	return err
+}
+
+// RecordSubmission atomically commits the local representation of a successful
+// provider submission. The compare-and-swap guard only permits the transition
+// from an offered row with no provider reference; a zero-row match is returned
+// without error because another writer already recorded or resolved the
+// request. Callers holding a different provider reference must preserve it as
+// a duplicate-submission conflict rather than treating the false result as
+// an ordinary no-op.
+//
+// The boolean reports whether this call won the CAS and never overwrites the
+// reference another writer recorded.
+func (s *Service) RecordSubmission(ctx context.Context, id int64, providerReference string, nextCheckAt time.Time) (bool, error) {
+	if providerReference == "" {
+		return false, errors.New("delivery: provider reference is required")
+	}
+	now := s.now().UTC().Format(time.RFC3339Nano)
+	next := nextCheckAt.UTC().Format(time.RFC3339Nano)
+	tx, err := s.store.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	// Only resolving legitimately owns an in-flight submission; every other
+	// job state is either not dispatchable or cannot guarantee a poll consumer.
+	res, err := tx.ExecContext(ctx, `
+		UPDATE delivery_requests
+		SET state = ?, provider_reference = ?, submitted_at = COALESCE(submitted_at, ?),
+		    last_checked_at = ?, next_check_at = ?, updated_at = ?
+		WHERE id = ? AND state = ? AND provider_reference = ''
+		  AND EXISTS (
+			SELECT 1 FROM jobs
+			WHERE jobs.id = delivery_requests.job_id
+			  AND jobs.state = 'resolving'
+		  )`,
+		string(StateSubmitted), providerReference, now, now, next, now, id, string(StateOffered))
+	if err != nil {
+		return false, err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if affected == 0 {
+		_ = tx.Rollback()
+		log.Printf("papio: delivery submission row %d CAS did not match; another writer recorded or resolved it", id)
+		return false, nil
+	}
+
+	if s.beforeRecordSubmissionCommit != nil {
+		if err := s.beforeRecordSubmissionCommit(tx); err != nil {
+			_ = tx.Rollback()
+			return false, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // Resume clears a live (submitted/pending) request's poll-failure

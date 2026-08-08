@@ -93,10 +93,6 @@ func (r *OfferedDeliveryRecovery) recoverOne(ctx context.Context, request *deliv
 	if err != nil {
 		return err
 	}
-	if attempts >= offeredRecoveryMaxAttempts {
-		log.Printf("papio: offered delivery recovery row %d capped after %d attempts", request.ID, attempts)
-		return nil
-	}
 	createdAuto, err := r.createdAutoCapable(ctx, row.ID, request)
 	if err != nil {
 		return err
@@ -104,19 +100,7 @@ func (r *OfferedDeliveryRecovery) recoverOne(ctx context.Context, request *deliv
 	if !createdAuto {
 		return nil
 	}
-	now := r.now()
-	if !lastAttempt.IsZero() && now.Before(lastAttempt.Add(offeredRecoveryBackoff(attempts))) {
-		return nil
-	}
 	profileName := deliveryProfileName(row.Policy.Resolver)
-	if profileName != request.InstitutionProfile {
-		log.Printf("papio: offered delivery recovery row %d profile mismatch job=%q request=%q", request.ID, profileName, request.InstitutionProfile)
-		return nil
-	}
-	profile, err := r.svc.Delivery.ResolveGateProfileFor(ctx, profileName)
-	if err != nil {
-		return err
-	}
 	claimed, err := r.svc.Jobs.Claim(ctx, row.ID, r.owner, offeredRecoveryLease)
 	if err != nil {
 		return err
@@ -127,6 +111,18 @@ func (r *OfferedDeliveryRecovery) recoverOne(ctx context.Context, request *deliv
 	row = claimed
 	defer func() { _ = r.svc.Jobs.Release(context.Background(), row.ID, r.owner) }()
 
+	if attempts >= offeredRecoveryMaxAttempts {
+		log.Printf("papio: offered delivery recovery row %d capped after %d attempts; opening human reconciliation", request.ID, attempts)
+		return r.holdForHuman(ctx, row, request, "recovery attempts exhausted")
+	}
+	if profileName != request.InstitutionProfile {
+		log.Printf("papio: offered delivery recovery row %d profile mismatch job=%q request=%q; opening human reconciliation", request.ID, profileName, request.InstitutionProfile)
+		return r.holdForHuman(ctx, row, request, "job/request profile mismatch")
+	}
+	profile, err := r.svc.Delivery.ResolveGateProfileFor(ctx, profileName)
+	if err != nil {
+		return err
+	}
 	if profile.Digest() != request.GateProfileDigest {
 		if err := r.holdForHuman(ctx, row, request, "stale:"+profile.Digest()); err != nil {
 			log.Printf("papio: offered delivery recovery row %d hold failed: %v", request.ID, err)
@@ -146,8 +142,23 @@ func (r *OfferedDeliveryRecovery) recoverOne(ctx context.Context, request *deliv
 		log.Printf("papio: offered delivery recovery row %d held for human: provider outcome is ambiguous", request.ID)
 		return nil
 	}
+	now := r.now()
+	if !lastAttempt.IsZero() && now.Before(lastAttempt.Add(offeredRecoveryBackoff(attempts))) {
+		return nil
+	}
 	_, dd, configured := r.svc.deliveryConfigured(row)
-	if !configured || dd.Kind != request.Provider {
+	if !configured {
+		if err := r.holdForHuman(ctx, row, request, "delivery configuration missing"); err != nil {
+			return err
+		}
+		log.Printf("papio: offered delivery recovery row %d held for human: delivery configuration missing", request.ID)
+		return nil
+	}
+	if dd.Kind != request.Provider {
+		if err := r.holdForHuman(ctx, row, request, "provider kind changed"); err != nil {
+			return err
+		}
+		log.Printf("papio: offered delivery recovery row %d held for human: provider kind changed", request.ID)
 		return nil
 	}
 	from := row.State

@@ -6,6 +6,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -85,6 +86,41 @@ func deliveryTestResolvers() []ResolverEntry {
 		Adapter: &fakeResolver{name: "fixture"},
 		Policy:  config.Source{Enabled: true},
 	}}
+}
+
+func seedOfferedRecovery(t *testing.T, jobs *job.Store, deliverySvc *delivery.Service, jobID, institution, provider, digest string) *delivery.Request {
+	t.Helper()
+	ctx := context.Background()
+	row, err := jobs.Get(ctx, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := deliverySvc.Create(ctx, delivery.CreateRequest{
+		JobID:              jobID,
+		InstitutionProfile: institution,
+		Provider:           provider,
+		RequestClass:       "digital_journal_article",
+		WorkIdentity:       row.Work.Describe(),
+		GateProfileDigest:  digest,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.RecordEvent(ctx, jobID, "delivery.gate_evaluated", map[string]any{
+		"delivery_request_id": req.ID,
+		"profile_class":       "auto_capable",
+		"profile_digest":      digest,
+		"decision":            "submit",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.RecordEvent(ctx, jobID, "delivery.submission_failure_classified", map[string]any{
+		"delivery_request_id": req.ID,
+		"class":               "pre_send",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return req
 }
 
 // autoCapableDocumentDelivery is a document_delivery block that compiles
@@ -588,6 +624,144 @@ func TestSubmitDeliveryRequestTransportFailureThenRetrySubmitsOnce(t *testing.T)
 	}
 }
 
+func TestSubmissionPersistenceFailureAfterProviderSuccessDoesNotResubmit(t *testing.T) {
+	var posts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		posts.Add(1)
+		_, _ = w.Write([]byte(`{"TransactionNumber": 9101, "TransactionStatus": "Awaiting Request Processing"}`))
+	}))
+	defer server.Close()
+
+	svc, jobs, deliverySvc := newDeliveryTestService(t)
+	svc.Delivery = deliverySvc
+	svc.IlliadHTTPClient = server.Client()
+	svc.Config.Browser.DocumentDelivery = autoCapableDocumentDelivery(server.URL)
+	ctx := context.Background()
+	if err := deliverySvc.RecordLiveAcceptance(ctx, "default", "illiad"); err != nil {
+		t.Fatal(err)
+	}
+	id, err := svc.Submit(ctx, deliveryWorkRequest("wr_submission_persist_fail", "10.1000/submission-persist-fail"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile, err := deliverySvc.ResolveGateProfileFor(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := seedOfferedRecovery(t, jobs, deliverySvc, id, "default", "illiad", profile.Digest())
+	var fail atomic.Bool
+	fail.Store(true)
+	deliverySvc.SetRecordSubmissionCommitHookForTest(func() error {
+		if fail.Swap(false) {
+			return errors.New("injected submission persistence failure")
+		}
+		return nil
+	})
+	if err := svc.OfferedDeliveryRecovery().RunDue(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if posts.Load() != 1 {
+		t.Fatalf("provider posts after first pass = %d, want 1", posts.Load())
+	}
+	if err := svc.OfferedDeliveryRecovery().RunDue(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if posts.Load() != 1 {
+		t.Fatalf("provider posts after persistence failure recovery = %d, want no resubmission", posts.Load())
+	}
+	got, err := deliverySvc.Get(ctx, req.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != delivery.StateOffered || got.ProviderReference != "" {
+		t.Fatalf("row after persistence failure = %+v, want offered/no reference for reconciliation", got)
+	}
+	gotJob, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotJob.State != job.StateAwaitingHuman {
+		t.Fatalf("job after persistence failure = %q, want awaiting_human", gotJob.State)
+	}
+	actions, err := jobs.ListOpenHumanActionsForJobs(ctx, []string{id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(actions) != 1 || actions[0].Kind != job.ActionKindDocumentDelivery {
+		t.Fatalf("actions after persistence failure = %+v, want one reconciliation action", actions)
+	}
+}
+
+func TestSubmissionCASConflictKeepsReceivedReferenceVisible(t *testing.T) {
+	var posts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		posts.Add(1)
+		_, _ = w.Write([]byte(`{"TransactionNumber": 9201, "TransactionStatus": "Awaiting Request Processing"}`))
+	}))
+	defer server.Close()
+	svc, jobs, deliverySvc := newDeliveryTestService(t)
+	svc.Delivery = deliverySvc
+	svc.IlliadHTTPClient = server.Client()
+	svc.Config.Browser.DocumentDelivery = autoCapableDocumentDelivery(server.URL)
+	ctx := context.Background()
+	id, err := svc.Submit(ctx, deliveryWorkRequest("wr_submission_cas_conflict", "10.1000/submission-cas-conflict"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile, err := deliverySvc.ResolveGateProfileFor(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := deliverySvc.Create(ctx, delivery.CreateRequest{
+		JobID: id, InstitutionProfile: "default", Provider: "illiad",
+		RequestClass: "digital_journal_article", WorkIdentity: row.Work.Describe(),
+		GateProfileDigest: profile.Digest(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.Cancel(ctx, id, job.TerminalReasonCancelledByUser); err != nil {
+		t.Fatal(err)
+	}
+	got, err := svc.submitToProvider(ctx, row, row.State, svc.Config.Browser.DocumentDelivery, req.IdempotencyKey, profile, req)
+	if err != nil {
+		t.Fatalf("submitToProvider CAS conflict: %v", err)
+	}
+	if posts.Load() != 1 {
+		t.Fatalf("provider posts = %d, want one", posts.Load())
+	}
+	if got.ProviderReference != "" || got.State != delivery.StateOffered {
+		t.Fatalf("durable row = %+v, want unchanged offered row", got)
+	}
+	events, err := jobs.Events(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var conflict bool
+	for _, event := range events {
+		if event["kind"] != "delivery.submission_provider_conflict" {
+			continue
+		}
+		detail, _ := event["detail"].(map[string]any)
+		if detail["received_provider_reference"] == "9201" {
+			conflict = true
+		}
+	}
+	if !conflict {
+		t.Fatalf("events = %+v, want durable received provider reference", events)
+	}
+	actions, err := jobs.ListOpenHumanActionsForJobs(ctx, []string{id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(actions) != 1 || actions[0].Kind != job.ActionKindDocumentDelivery {
+		t.Fatalf("actions = %+v, want one reconciliation action", actions)
+	}
+}
 func TestSubmitDeliveryAmbiguousFailureDoesNotRepost(t *testing.T) {
 	var posts int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1418,6 +1592,7 @@ func TestOfferedDeliveryRecoveryCapsTransportFailures(t *testing.T) {
 	now := time.Date(2026, 8, 8, 12, 0, 0, 0, time.UTC)
 	svc.Now = func() time.Time { return now }
 	svc.RetryDelay = time.Second
+
 	svc.IlliadHTTPClient = &http.Client{Transport: preSendFailureRoundTripper(func(*http.Request) (*http.Response, error) {
 		posts++
 		return nil, http.ErrServerClosed
@@ -1472,9 +1647,154 @@ func TestOfferedDeliveryRecoveryCapsTransportFailures(t *testing.T) {
 		t.Fatal(err)
 	}
 	if request.State != delivery.StateOffered || request.ProviderReference != "" {
-		t.Fatalf("capped request = %+v, want recoverable offered row", request)
+		t.Fatalf("capped request = %+v, want offered row with durable human disposition", request)
+	}
+	gotJob, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotJob.State != job.StateAwaitingHuman {
+		t.Fatalf("capped job state = %s, want awaiting_human", gotJob.State)
+	}
+	actions, err := jobs.ListOpenHumanActionsForJobs(ctx, []string{id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(actions) != 1 || actions[0].Kind != job.ActionKindDocumentDelivery {
+		t.Fatalf("capped actions = %+v, want one document_delivery reconciliation action", actions)
 	}
 }
+
+func TestOfferedDeliveryRecoveryProfileMismatchGetsDurableDisposition(t *testing.T) {
+	svc, jobs, deliverySvc := newDeliveryTestService(t)
+	svc.Delivery = deliverySvc
+	svc.Config.Browser.DocumentDelivery = autoCapableDocumentDelivery("https://example.edu/request")
+	ctx := context.Background()
+	if err := deliverySvc.RecordLiveAcceptance(ctx, "default", "illiad"); err != nil {
+		t.Fatal(err)
+	}
+	id, err := svc.Submit(ctx, deliveryWorkRequest("wr_offered_recovery_profile_mismatch", "10.1000/offered-recovery-profile-mismatch"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile, err := deliverySvc.ResolveGateProfileFor(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := seedOfferedRecovery(t, jobs, deliverySvc, id, "changed-profile", "illiad", profile.Digest())
+	for range 2 {
+		if err := svc.OfferedDeliveryRecovery().RunDue(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	gotJob, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotJob.State != job.StateAwaitingHuman {
+		t.Fatalf("profile-mismatch job state = %q, want awaiting_human", gotJob.State)
+	}
+	actions, err := jobs.ListOpenHumanActionsForJobs(ctx, []string{id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(actions) != 1 || actions[0].Kind != job.ActionKindDocumentDelivery {
+		t.Fatalf("profile-mismatch actions = %+v, want one document_delivery action", actions)
+	}
+	got, err := deliverySvc.Get(ctx, req.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != delivery.StateOffered {
+		t.Fatalf("profile-mismatch request = %+v, want offered with durable disposition", got)
+	}
+}
+
+func TestOfferedDeliveryRecoveryMissingConfigGetsDurableDisposition(t *testing.T) {
+	svc, jobs, deliverySvc := newDeliveryTestService(t)
+	svc.Delivery = deliverySvc
+	svc.Config.Browser.DocumentDelivery = autoCapableDocumentDelivery("https://example.edu/request")
+	ctx := context.Background()
+	id, err := svc.Submit(ctx, deliveryWorkRequest("wr_offered_recovery_missing_config", "10.1000/offered-recovery-missing-config"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	invalidProfile := delivery.CompileGateProfile(config.Institution{}, "default")
+	req := seedOfferedRecovery(t, jobs, deliverySvc, id, "default", "illiad", invalidProfile.Digest())
+	svc.Config.Browser.DocumentDelivery = nil
+	for range 2 {
+		if err := svc.OfferedDeliveryRecovery().RunDue(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	gotJob, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotJob.State != job.StateAwaitingHuman {
+		t.Fatalf("missing-config job state = %q, want awaiting_human", gotJob.State)
+	}
+	actions, err := jobs.ListOpenHumanActionsForJobs(ctx, []string{id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(actions) != 1 || actions[0].Kind != job.ActionKindDocumentDelivery {
+		t.Fatalf("missing-config actions = %+v, want one document_delivery action", actions)
+	}
+	got, err := deliverySvc.Get(ctx, req.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != delivery.StateOffered {
+		t.Fatalf("missing-config request = %+v, want offered with durable disposition", got)
+	}
+}
+
+func TestOfferedDeliveryRecoveryProviderKindChangeGetsDurableDisposition(t *testing.T) {
+	svc, jobs, deliverySvc := newDeliveryTestService(t)
+	svc.Delivery = deliverySvc
+	svc.Config.Browser.DocumentDelivery = autoCapableDocumentDelivery("https://example.edu/request")
+	ctx := context.Background()
+	id, err := svc.Submit(ctx, deliveryWorkRequest("wr_offered_recovery_provider_change", "10.1000/offered-recovery-provider-change"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc.Config.Browser.DocumentDelivery = &config.DocumentDelivery{
+		Kind: "openurl", BaseURL: "https://example.edu/request", SubmitPolicy: "prefill_only",
+	}
+	changedProfile, err := deliverySvc.ResolveGateProfileFor(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := seedOfferedRecovery(t, jobs, deliverySvc, id, "default", "illiad", changedProfile.Digest())
+	for range 2 {
+		if err := svc.OfferedDeliveryRecovery().RunDue(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	gotJob, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotJob.State != job.StateAwaitingHuman {
+		t.Fatalf("provider-change job state = %q, want awaiting_human", gotJob.State)
+	}
+	actions, err := jobs.ListOpenHumanActionsForJobs(ctx, []string{id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(actions) != 1 || actions[0].Kind != job.ActionKindDocumentDelivery {
+		t.Fatalf("provider-change actions = %+v, want one document_delivery action", actions)
+	}
+	got, err := deliverySvc.Get(ctx, req.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != delivery.StateOffered {
+		t.Fatalf("provider-change request = %+v, want offered with durable disposition", got)
+	}
+}
+
 func TestOfferedDeliveryRecoverySkipsPrefillDecisionForAutoProfile(t *testing.T) {
 	svc, jobs, deliverySvc := newDeliveryTestService(t)
 	svc.Delivery = deliverySvc

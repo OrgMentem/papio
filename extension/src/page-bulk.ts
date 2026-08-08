@@ -44,14 +44,20 @@ const STATUS_LABEL: Record<PageBulkStatus, string> = {
   ownership_incomplete: "Ownership unclear",
   ownership_unknown: "Library check unavailable",
   invalid: "Not a recognized identifier",
+  frame_too_large: "Could not fit in daemon response",
 };
 
 /** Decision 5: only a fresh owned_with_pdf claim disables acquisition, plus
- * a live queued job and an invalid identifier that never resolved. Every
- * other status stays eligible — an incomplete or failed lookup is never a
- * negative ownership fact (ADR-0008). */
+ * a live queued job, an invalid identifier that never resolved, or a result
+ * refused because it could not fit the daemon response. */
 function isEligibleStatus(status: PageBulkStatus | null): boolean {
-  return status !== null && status !== "owned_with_pdf" && status !== "queued" && status !== "invalid";
+  return (
+    status !== null &&
+    status !== "owned_with_pdf" &&
+    status !== "queued" &&
+    status !== "invalid" &&
+    status !== "frame_too_large"
+  );
 }
 
 interface RowState {
@@ -225,7 +231,6 @@ function isWorkspaceSnapshot(value: unknown): value is WorkspaceSnapshot {
     value["items"].every(isDetectedPaper)
   );
 }
-
 function isStatusItem(value: unknown): value is PageBulkStatusItem {
   if (!isRecord(value) || typeof value["local_id"] !== "string" || typeof value["ownership_complete"] !== "boolean") {
     return false;
@@ -239,9 +244,10 @@ function isStatusItem(value: unknown): value is PageBulkStatusItem {
     status === "previously_unavailable" ||
     status === "ownership_incomplete" ||
     status === "ownership_unknown" ||
-    status === "invalid";
+    status === "invalid" ||
+    status === "frame_too_large";
   if (!validStatus) return false;
-  if (status !== "invalid" && typeof value["canonical_key"] !== "string") return false;
+  if (status !== "invalid" && status !== "frame_too_large" && typeof value["canonical_key"] !== "string") return false;
   if ("job_id" in value && typeof value["job_id"] !== "string") return false;
   return true;
 }

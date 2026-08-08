@@ -495,3 +495,50 @@ func TestDiagLogRefusesAnUnusableLocation(t *testing.T) {
 		t.Fatal("openDiagLog on a non-directory = nil error, want a failure")
 	}
 }
+
+func TestApplicationSyncFailureKeepsSessionAlive(t *testing.T) {
+	var stdout bytes.Buffer
+	calls := 0
+	fake := &fakeSyncer{onSync: func(_ []json.RawMessage) ([]json.RawMessage, error) {
+		calls++
+		if calls == 1 {
+			return nil, applicationSyncFailure(errors.New("stale review action"))
+		}
+		return []json.RawMessage{rawMsg(t, protocol.MsgAck, "ackid000003", "", 0, map[string]any{})}, nil
+	}}
+	b := newBridge(fake, nil, &stdout, io.Discard)
+
+	hello := rawMsg(t, protocol.MsgHello, "helloid00003", "", 0, map[string]any{"extension_version": "1.0.0"})
+	if err := b.handleInbound(context.Background(), hello); err != nil {
+		t.Fatalf("application failure escaped handleInbound: %v", err)
+	}
+	if code := errorCode(t, readTestFrame(t, bytes.NewReader(stdout.Bytes()))); code != "application_error" {
+		t.Fatalf("error code = %q, want application_error", code)
+	}
+
+	ack := rawMsg(t, protocol.MsgAck, "ackid000004", "", 1, map[string]any{})
+	if err := b.handleInbound(context.Background(), ack); err != nil {
+		t.Fatalf("subsequent request failed after application error: %v", err)
+	}
+	if got := readTestFrame(t, bytes.NewReader(stdout.Bytes()[frameLength(stdout.Bytes()):])).Type; got != protocol.MsgAck {
+		t.Fatalf("subsequent outbound type = %q, want ack", got)
+	}
+}
+
+func TestTransportSyncFailureIsFatal(t *testing.T) {
+	fake := &fakeSyncer{onSync: func(_ []json.RawMessage) ([]json.RawMessage, error) {
+		return nil, transportSyncFailure(errors.New("daemon socket closed"))
+	}}
+	b := newBridge(fake, nil, io.Discard, io.Discard)
+	hello := rawMsg(t, protocol.MsgHello, "helloid00004", "", 0, map[string]any{"extension_version": "1.0.0"})
+	if err := b.handleInbound(context.Background(), hello); err == nil {
+		t.Fatal("transport failure returned nil, want fatal error")
+	}
+}
+
+func frameLength(data []byte) int {
+	if len(data) < 4 {
+		return len(data)
+	}
+	return 4 + int(binary.LittleEndian.Uint32(data[:4]))
+}

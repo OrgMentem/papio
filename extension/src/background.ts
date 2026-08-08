@@ -1251,9 +1251,8 @@ export type PageBulkSnapshotView = PageBulkSnapshot & {
 export class Bridge {
   private hydrated = false;
   private port: NativePort | null = null;
-  /** page_acquire acknowledgements carry no correlation id, so requests are
-   * serialized in popup-message order and resolved FIFO. */
-  private readonly pageAcquireWaiters: Array<(ack: PageAcquireAckPayload) => void> = [];
+  /** Serialized page-acquire requests keyed by their originating msg_id. */
+  private readonly pageAcquireWaiters = new Map<string, (ack: PageAcquireAckPayload) => void>();
   /** Signed provider URL -> job for the narrow interval between calling
    * chrome.downloads.download and receiving its ID. Memory-only: never stored
    * or framed. This lets onDeterminingFilename steer the exact adapter-started
@@ -1436,6 +1435,7 @@ export class Bridge {
   private portGeneration = 0;
   private helloAckGeneration = -1;
   private helloSentGeneration = -1;
+  private helloRequestID: string | undefined;
   private readonly helloWaiters = new Set<(acknowledged: boolean) => void>();
   private requestIDSequence = 0;
   /** Best-effort display cache only, refreshed from daemon counts or snapshots. */
@@ -3272,15 +3272,16 @@ export class Bridge {
       return { error: "page has no DOI" };
     }
     return new Promise<PageAcquireAckPayload>((resolve) => {
-      this.pageAcquireWaiters.push(resolve);
+      const msgID = this.deps.randomUUID().replace(/-/g, "");
+      this.pageAcquireWaiters.set(msgID, resolve);
       const frame: Record<string, unknown> = {
         url: payload.url,
         ...(payload.doi !== undefined ? { doi: payload.doi } : {}),
         ...(payload.title !== undefined ? { title: payload.title } : {}),
         ...(payload.source !== undefined ? { source: payload.source } : {}),
       };
-      if (!this.send("page_acquire", frame)) {
-        this.pageAcquireWaiters.pop();
+      if (!this.send("page_acquire", frame, undefined, msgID)) {
+        this.pageAcquireWaiters.delete(msgID);
         resolve({ error: "Could not send page acquisition request" });
       }
     });
@@ -3442,9 +3443,8 @@ export class Bridge {
   }
 
   private failPageAcquireWaiters(error: string): void {
-    while (this.pageAcquireWaiters.length > 0) {
-      this.pageAcquireWaiters.shift()?.({ error });
-    }
+    for (const resolve of this.pageAcquireWaiters.values()) resolve({ error });
+    this.pageAcquireWaiters.clear();
   }
 
   /** Focus an existing inbox tab before creating one. This is browser-local UI
@@ -4533,7 +4533,6 @@ export class Bridge {
   private closingDeliberately = false;
 
   private connect(): void {
-    // A previous service-worker instance may have persisted a completed
     // handshake. Clear it before hello so no request can use stale features.
     this.store = clearNegotiationState(this.store);
     if (this.hydrated) void this.update((current) => current);
@@ -4542,6 +4541,7 @@ export class Bridge {
     this.portGeneration += 1;
     this.helloAckGeneration = -1;
     this.helloSentGeneration = -1;
+    this.helloRequestID = undefined;
     this.triagePendingCount = undefined;
     this.triageActionsRequiresAuth = undefined;
     this.triageActionsRequiresAuthAt = undefined;
@@ -4556,13 +4556,20 @@ export class Bridge {
     const adapterVersions: Record<string, string> = {};
     for (const spec of this.deps.adapterSpecs) adapterVersions[spec.id] = spec.version;
     this.helloSentGeneration = this.portGeneration;
+    this.helloRequestID = this.deps.randomUUID().replace(/-/g, "");
     if (
-      !this.send("hello", {
-        extension_version: this.deps.manifestVersion,
-        adapter_versions: adapterVersions,
-      })
+      !this.send(
+        "hello",
+        {
+          extension_version: this.deps.manifestVersion,
+          adapter_versions: adapterVersions,
+        },
+        undefined,
+        this.helloRequestID,
+      )
     ) {
       this.helloSentGeneration = -1;
+      this.helloRequestID = undefined;
     }
   }
 
@@ -5853,15 +5860,14 @@ export class Bridge {
   /** Build, self-validate, and post one outbound frame. Validation is a safety
    * net: a frame that would not survive the shared parser is dropped, never
    * emitted. */
-  private send(type: BrowserMessageType, payload: object, jobID?: string): boolean {
+  private send(type: BrowserMessageType, payload: object, jobID?: string, msgID?: string): boolean {
     const port = this.port;
     if (!port) return false;
     const env: Record<string, unknown> = {
       protocol: BROWSER_PROTOCOL_VERSION,
       type,
-      msg_id: this.deps.randomUUID().replace(/-/g, ""),
+      msg_id: msgID ?? this.deps.randomUUID().replace(/-/g, ""),
       seq: this.seq++,
-
       payload,
     };
     if (jobID !== undefined) env.job_id = jobID;
@@ -5912,6 +5918,34 @@ export class Bridge {
     }
     this.pendingNativeRequests.delete(requestID);
     pending.resolve({ kind: "response", payload: msg.payload });
+  }
+  private resolveNativeError(msg: BrowserMessage): void {
+    const requestID = msg.payload["request_id"];
+    const code = typeof msg.payload["code"] === "string" ? msg.payload["code"] : "daemon_error";
+    const message = typeof msg.payload["message"] === "string" ? msg.payload["message"] : "The daemon rejected the request";
+    if (typeof requestID !== "string") {
+      console.warn("papio: dropping uncorrelated daemon error", msg.payload);
+      return;
+    }
+    const pending = this.pendingNativeRequests.get(requestID);
+    if (pending !== undefined) {
+      this.pendingNativeRequests.delete(requestID);
+      pending.resolve({ kind: "transport", code, message });
+      return;
+    }
+    const pageAcquire = this.pageAcquireWaiters.get(requestID);
+    if (pageAcquire !== undefined) {
+      this.pageAcquireWaiters.delete(requestID);
+      pageAcquire({ error: message });
+      return;
+    }
+    if (requestID === this.helloRequestID) {
+      this.helloSentGeneration = -1;
+      this.helloRequestID = undefined;
+      this.settleHelloWaiters(false);
+      return;
+    }
+    console.debug("papio: dropping unknown or late daemon error", requestID);
   }
   private onUnsolicitedPdfGrab(msg: BrowserMessage): void {
     const grabID = msg.payload["grab_id"];
@@ -6007,8 +6041,10 @@ export class Bridge {
         return;
       }
       case "page_acquire_ack": {
-        const waiter = this.pageAcquireWaiters.shift();
-        if (waiter) {
+        const first = this.pageAcquireWaiters.entries().next();
+        if (!first.done) {
+          const [requestID, waiter] = first.value;
+          this.pageAcquireWaiters.delete(requestID);
           waiter({
             ...(typeof msg.payload.job_id === "string" ? { job_id: msg.payload.job_id } : {}),
             ...(typeof msg.payload.duplicate === "boolean" ? { duplicate: msg.payload.duplicate } : {}),
@@ -6022,6 +6058,10 @@ export class Bridge {
         return;
       case "error":
         console.warn("papio: daemon reported error", msg.payload);
+        if (msg.payload["request_id"] !== undefined) {
+          this.resolveNativeError(msg);
+          return;
+        }
         if (msg.payload.code === "expected_hello") this.reconnectForHello();
         if (msg.payload.code === "extension_outdated") {
           await this.update((s) => ({ ...s, connectionStatus: "extension_outdated" }));

@@ -48,6 +48,43 @@ const pollInterval = 2 * time.Second
 // syncMethod is the daemon RPC the bridge forwards browser frames through.
 const syncMethod = "browser.sync"
 
+// syncFailureDisposition is deliberately out-of-band from the IPC response:
+// adding a field to syncResponse would make older hosts reject newer daemons.
+// The host tears down a browser session only for an explicit fatal disposition.
+type syncFailureDisposition uint8
+
+const (
+	syncApplicationFailure syncFailureDisposition = iota + 1
+	syncTransportFailure
+)
+
+type syncFailure struct {
+	disposition syncFailureDisposition
+	err         error
+}
+
+func (e *syncFailure) Error() string { return e.err.Error() }
+func (e *syncFailure) Unwrap() error { return e.err }
+
+func applicationSyncFailure(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &syncFailure{disposition: syncApplicationFailure, err: err}
+}
+
+func transportSyncFailure(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &syncFailure{disposition: syncTransportFailure, err: err}
+}
+
+func isApplicationSyncFailure(err error) bool {
+	var failure *syncFailure
+	return errors.As(err, &failure) && failure.disposition == syncApplicationFailure
+}
+
 // nativeHostBasename is the executable basename that main.go dispatches into
 // native-host mode. A resolved daemon executable must never carry it, or
 // autostart would spawn another native host instead of the daemon.
@@ -279,7 +316,16 @@ func (s *ipcSyncer) request(goodbye bool, messages []json.RawMessage) syncReques
 func (s *ipcSyncer) Sync(ctx context.Context, messages []json.RawMessage) ([]json.RawMessage, error) {
 	var resp syncResponse
 	if err := s.client.Call(ctx, job.NewID("rpc"), syncMethod, s.request(false, messages), &resp); err != nil {
-		return nil, err
+		var remote *ipc.RemoteError
+		if errors.As(err, &remote) && remote.Code == "application_failure" {
+			// browser.sync uses this code only for an explicitly structured
+			// application disposition. Other RPC errors (including internal,
+			// invalid_argument, and result_too_large) remain fatal.
+			return nil, applicationSyncFailure(err)
+		}
+		// Dial, framing, size-cap, malformed-response, and daemon
+		// self-validation failures are explicitly fatal at the host boundary.
+		return nil, transportSyncFailure(err)
 	}
 	return resp.Outbound, nil
 }
@@ -359,7 +405,9 @@ func (b *bridge) run(ctx context.Context) error {
 				return nil // Chrome closed the port: clean shutdown.
 			}
 			if errors.Is(err, errFrameTooLarge) {
-				b.sendError("frame_too_large", "inbound frame exceeds size cap")
+				if sendErr := b.sendError("frame_too_large", "inbound frame exceeds size cap"); sendErr != nil {
+					return fmt.Errorf("send frame-too-large error: %w", sendErr)
+				}
 				return err
 			}
 			return err
@@ -372,32 +420,42 @@ func (b *bridge) run(ctx context.Context) error {
 }
 
 // handleInbound validates one inbound frame, then forwards it to the daemon and
-// writes any resulting outbound frames. Every validation failure writes a
-// best-effort error frame and returns a non-nil error so the process exits
-// non-zero (the connection is considered bad).
+// writes any resulting outbound frames. Validation and transport/framing
+// failures return a non-nil error; an explicitly application-level sync
+// failure is logged, reported as one correlated error frame, and leaves the
+// session live.
 func (b *bridge) handleInbound(ctx context.Context, frame []byte) error {
 	msg, err := protocol.DecodeBrowserMessage(frame)
 	if err != nil {
 		_, _ = fmt.Fprintln(b.stderr, "papio-native-host: reject inbound frame:", err)
-		b.sendError("invalid_frame", "inbound frame failed strict decode")
+		if sendErr := b.sendError("invalid_frame", "inbound frame failed strict decode"); sendErr != nil {
+			return fmt.Errorf("send invalid-frame error: %w", sendErr)
+		}
 		return fmt.Errorf("decode inbound frame: %w", err)
 	}
 
 	if !b.seenHello {
 		if msg.Type != protocol.MsgHello {
-			b.sendError("expected_hello", "first frame must be hello")
+			if sendErr := b.sendError("expected_hello", "first frame must be hello", inboundRequestID(msg)); sendErr != nil {
+				return fmt.Errorf("send expected-hello error: %w", sendErr)
+			}
 			return fmt.Errorf("first frame type %q, want hello", msg.Type)
 		}
 		b.seenHello = true
 	} else if msg.Type == protocol.MsgHello {
-		b.sendError("unexpected_hello", "hello already received on this connection")
+		if sendErr := b.sendError("unexpected_hello", "hello already received on this connection", inboundRequestID(msg)); sendErr != nil {
+			return fmt.Errorf("send duplicate-hello error: %w", sendErr)
+		}
 		return errors.New("duplicate hello frame")
 	}
 
 	if msg.Seq <= b.lastSeq {
-		b.sendError("seq_regression", "seq must strictly increase")
+		if sendErr := b.sendError("seq_regression", "seq must strictly increase", inboundRequestID(msg)); sendErr != nil {
+			return fmt.Errorf("send sequence error: %w", sendErr)
+		}
 		return fmt.Errorf("seq %d not greater than %d", msg.Seq, b.lastSeq)
 	}
+
 	b.lastSeq = msg.Seq
 
 	outbound, err := b.syncer.Sync(ctx, []json.RawMessage{frame})
@@ -405,18 +463,25 @@ func (b *bridge) handleInbound(ctx context.Context, frame []byte) error {
 		if ctx.Err() != nil {
 			return nil
 		}
-		_, _ = fmt.Fprintln(b.stderr, "papio-native-host: browser.sync:", err)
-		b.sendError("daemon_unavailable", "daemon rejected or dropped the frame")
+		if isApplicationSyncFailure(err) {
+			_, _ = fmt.Fprintln(b.stderr, "papio-native-host: browser.sync application failure:", err)
+			if sendErr := b.sendError("application_error", "the daemon could not complete this request", inboundRequestID(msg)); sendErr != nil {
+				return fmt.Errorf("send application-error frame: %w", sendErr)
+			}
+			return nil
+		}
+		_, _ = fmt.Fprintln(b.stderr, "papio-native-host: browser.sync transport failure:", err)
+		if sendErr := b.sendError("daemon_unavailable", "browser.sync transport failed", inboundRequestID(msg)); sendErr != nil {
+			return fmt.Errorf("send daemon-unavailable error: %w", sendErr)
+		}
 		return fmt.Errorf("%s: %w", syncMethod, err)
 	}
 	return b.writeOutbound(outbound)
 }
 
-// pollLoop drains daemon-initiated frames while stdin is idle. Sync errors are
-// transient (the daemon may be restarting) and never terminate the bridge; a
-// stdout write failure does, because the port is gone: it is returned so run
-// tears the whole bridge down instead of surviving as an inert, non-polling
-// process that starves the extension of offers and cancels.
+// pollLoop drains daemon-initiated frames while stdin is idle. Explicitly
+// application-level Sync failures are transient and never terminate the
+// bridge; transport/framing failures and stdout writes are fatal.
 func (b *bridge) pollLoop(ctx context.Context) error {
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
@@ -430,8 +495,12 @@ func (b *bridge) pollLoop(ctx context.Context) error {
 				if ctx.Err() != nil {
 					return nil
 				}
-				_, _ = fmt.Fprintln(b.stderr, "papio-native-host: poll browser.sync:", err)
-				continue
+				if isApplicationSyncFailure(err) {
+					_, _ = fmt.Fprintln(b.stderr, "papio-native-host: poll browser.sync application failure:", err)
+					continue
+				}
+				_, _ = fmt.Fprintln(b.stderr, "papio-native-host: poll browser.sync transport failure:", err)
+				return err
 			}
 			if err := b.writeOutbound(outbound); err != nil {
 				_, _ = fmt.Fprintln(b.stderr, "papio-native-host: poll write:", err)
@@ -468,9 +537,28 @@ func (b *bridge) writeFrame(data []byte) error {
 	return err
 }
 
+func inboundRequestID(msg *protocol.BrowserMessage) string {
+	if msg == nil {
+		return ""
+	}
+	raw, err := json.Marshal(msg.Payload)
+	if err == nil {
+		var payload struct {
+			RequestID string `json:"request_id"`
+		}
+		if json.Unmarshal(raw, &payload) == nil && payload.RequestID != "" {
+			return payload.RequestID
+		}
+	}
+	// page_acquire has no payload request_id; its FIFO waiter can still be
+	// failed by naming the originating message id.
+	return msg.MsgID
+}
+
 // hostErrorFrame is a host-originated protocol error. It carries no job_id
-// (error is not job-scoped) and a fresh seq of 0 because the connection is
-// terminating; the daemon owns seq numbering for the normal outbound stream.
+// (error is not job-scoped) and seq 0 because the daemon owns seq numbering
+// for the normal outbound stream. RequestID correlates an application
+// failure with the inbound request that produced it.
 type hostErrorFrame struct {
 	Protocol string                `json:"protocol"`
 	Type     string                `json:"type"`
@@ -479,24 +567,30 @@ type hostErrorFrame struct {
 	Payload  protocol.ErrorPayload `json:"payload"`
 }
 
-// sendError writes a best-effort protocol error frame. Failures are logged to
-// stderr and swallowed: the caller is already returning a fatal error.
-func (b *bridge) sendError(code, message string) {
+// sendError writes a protocol error frame. A failed write is fatal: the
+// browser may have received only a prefix, so the relay must not continue.
+func (b *bridge) sendError(code, message string, requestID ...string) error {
+	payload := protocol.ErrorPayload{Code: code, Message: message}
+	if len(requestID) > 0 {
+		payload.RequestID = requestID[0]
+	}
 	frame := hostErrorFrame{
 		Protocol: protocol.BrowserProtocolVersion,
 		Type:     protocol.MsgError,
 		MsgID:    newMsgID(),
 		Seq:      0,
-		Payload:  protocol.ErrorPayload{Code: code, Message: message},
+		Payload:  payload,
 	}
 	data, err := json.Marshal(frame)
 	if err != nil {
 		_, _ = fmt.Fprintln(b.stderr, "papio-native-host: encode error frame:", err)
-		return
+		return err
 	}
 	if err := b.writeFrame(data); err != nil {
 		_, _ = fmt.Fprintln(b.stderr, "papio-native-host: write error frame:", err)
+		return err
 	}
+	return nil
 }
 
 // newMsgID returns a msg_id matching protocol.msgIDRE (^[A-Za-z0-9_-]{8,64}$).

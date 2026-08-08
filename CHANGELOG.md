@@ -133,6 +133,31 @@ execution records kept during the initial build.
   tests. POST is now an explicit per-client capability with the same
   destination policy and dial-time pinning as GET, redirects refused rather
   than replayed, and exactly one client — ILLiad's — holding it.
+- **Only a transport failure can end a browser session now.** Any non-nil
+  error out of a bridge handler used to tear down the whole
+  native-messaging session — page-bulk, inbox, grabs, session evidence and
+  every handoff at once — which is how a single unrepresentable delivery
+  state disconnected an extension every 60 seconds, and how failed inbox
+  counts, stats reads and a stale review preview each disconnected it
+  before that. The rule was never a safety property: the host's own idle
+  poll already treated the same errors as transient. Application failures
+  are now logged and answered with an error frame that carries the failed
+  request's id, so the waiting caller settles instead of hanging, while
+  framing, size-cap and self-validation failures stay fatal because an
+  unrepresentable frame means the peer contract is broken. A page-bulk row
+  too large to fit its response is reported as `frame_too_large` — "Could
+  not fit in daemon response" — rather than being mislabelled as an
+  unrecognized identifier.
+- **A submitted delivery request can no longer be stranded by a crash.**
+  State and provider reference were written in two transactions after the
+  provider had already created a real loan request, so a failure between
+  them left a row that recovery skipped and the poller could not read.
+  Both now commit in one transaction, guarded so only the state a
+  submission legitimately runs from can complete it; if the guard misses,
+  the reference papio just received is recorded and surfaced for
+  reconciliation rather than dropped. A submission is also marked
+  ambiguous before the request leaves, so a persistence failure after a
+  successful send can never authorize a second real loan.
 
 ## [0.19.1] - 2026-08-08
 

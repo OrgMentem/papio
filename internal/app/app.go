@@ -2012,6 +2012,14 @@ func (s *Service) submitDeliveryRequest(ctx context.Context, row *job.Row, from,
 func (s *Service) submitToProvider(ctx context.Context, row *job.Row, from string, dd *config.DocumentDelivery, key string, profile delivery.GateProfile, created *delivery.Request) (*delivery.Request, error) {
 	traced := newTracedSubmissionClient(s.illiadHTTPClient())
 	client := illiad.New(traced, dd.BaseURL, dd.APIKey)
+	// Commit an ambiguous classification before the irreversible provider
+	// request. Only a proven pre-send failure below can narrow it.
+	if err := s.Jobs.RecordEvent(ctx, row.ID, "delivery.submission_failure_classified", map[string]any{
+		"delivery_request_id": created.ID,
+		"class":               string(illiad.FailureAmbiguous),
+	}); err != nil {
+		return created, err
+	}
 	txn, err := client.CreateTransaction(ctx, illiadTransactionRequest(row.Work, dd.PatronRef, key))
 	if err != nil {
 		class := traced.class
@@ -2032,30 +2040,93 @@ func (s *Service) submitToProvider(ctx context.Context, row *job.Row, from strin
 			"delivery_request_id": created.ID,
 		}, job.WithRetryAt(s.Now().Add(s.RetryDelay)))
 	}
-	if err := s.Delivery.UpdateState(ctx, created.ID, delivery.StateSubmitted); err != nil {
-		return created, err
-	}
-	nextCheck := delivery.NextCheck(s.Now(), 0, profile.StatusPollMinutes)
 	providerRef := strconv.Itoa(txn.TransactionNumber)
-	if err := s.Delivery.RecordPoll(ctx, created.ID, providerRef, nextCheck); err != nil {
+	nextCheck := delivery.NextCheck(s.Now(), 0, profile.StatusPollMinutes)
+	won, err := s.Delivery.RecordSubmission(ctx, created.ID, providerRef, nextCheck)
+	if err != nil {
 		return created, err
 	}
-	// UpdateState/RecordPoll only mutated the database; created is still the
-	// pre-submission snapshot Create returned (state offered, no reference).
-	// Re-fetch so callers — SubmitDelivery's RPC/CLI caller in particular —
-	// see the row's real, post-submission state rather than a stale one.
+	// RecordSubmission atomically made the provider reference durable before
+	// this separate job transition can fail. Re-fetch so callers — the
+	// SubmitDelivery RPC/CLI caller in particular — see the row's real,
+	// post-submission state rather than a stale Create snapshot.
 	submitted, err := s.Delivery.Get(ctx, created.ID)
 	if err != nil {
 		return created, err
 	}
+	if submitted == nil {
+		return created, fmt.Errorf("delivery: submission row %d disappeared after provider success", created.ID)
+	}
+	if !won && submitted.ProviderReference != providerRef {
+		if err := s.openProviderSubmissionConflict(ctx, row.ID, created.ID, providerRef, submitted.ProviderReference); err != nil {
+			return submitted, err
+		}
+		return submitted, nil
+	}
+	// Use the durable reference, not our provider response, when a concurrent
+	// submitter won the CAS. A differing reference took the reconciliation
+	// path above; this is the benign same-reference loser case.
+	durableProviderRef := submitted.ProviderReference
 	// Plain job.Store.Transition, not s.park: a delivery poll is not a human
 	// action, exactly like parkForRetry's ordinary retry_wait never notifies
 	// through s.park either.
 	return submitted, s.Jobs.Transition(ctx, row.ID, from, job.StateRetryWait, map[string]any{
 		"reason":              string(job.RetryReasonDocumentDeliveryPending),
 		"delivery_request_id": created.ID,
-		"provider_reference":  providerRef,
+		"provider_reference":  durableProviderRef,
 	}, job.WithRetryAt(nextCheck))
+}
+
+// openProviderSubmissionConflict records the provider reference received by a
+// CAS loser and parks the owning job for human reconciliation. The received
+// reference is intentionally kept in the event even when another writer's
+// reference already occupies the delivery row: both provider-side mutations
+// must remain visible to an operator.
+func (s *Service) openProviderSubmissionConflict(ctx context.Context, jobID string, requestID int64, receivedReference, durableReference string) error {
+	if err := s.Jobs.RecordEvent(ctx, jobID, "delivery.submission_provider_conflict", map[string]any{
+		"delivery_request_id":         requestID,
+		"received_provider_reference": receivedReference,
+		"durable_provider_reference":  durableReference,
+	}); err != nil {
+		return err
+	}
+	request, err := s.Delivery.Get(ctx, requestID)
+	if err != nil {
+		return err
+	}
+	if request == nil {
+		return fmt.Errorf("delivery: submission conflict row %d disappeared", requestID)
+	}
+	actions, err := s.Jobs.ListOpenHumanActionsForJobs(ctx, []string{jobID})
+	if err != nil {
+		return err
+	}
+	hasDeliveryAction := false
+	for _, action := range actions {
+		if action.Kind == job.ActionKindDocumentDelivery {
+			hasDeliveryAction = true
+			break
+		}
+	}
+	if !hasDeliveryAction {
+		if _, err := s.Jobs.OpenHumanAction(ctx, jobID, job.ActionKindDocumentDelivery,
+			DeliveryReconciliationActionDetail(request), job.Access(false, "")); err != nil {
+			return err
+		}
+	}
+	current, err := s.Jobs.Get(ctx, jobID)
+	if err != nil || current == nil {
+		return err
+	}
+	switch current.State {
+	case job.StateAwaitingHuman, job.StateReady, job.StateImported, job.StateUnavailable, job.StateFailed, job.StateCancelled:
+		return nil
+	case job.StateQueued, job.StateResolving, job.StateFetching, job.StateValidating, job.StateRetryWait, job.StateNeedsReview:
+		return s.park(ctx, jobID, current.State, job.StateAwaitingHuman,
+			map[string]any{"reason": "document_delivery_submission_conflict"})
+	default:
+		return nil
+	}
 }
 
 // openDeliveryPrefillAction is Decision 3B's `prefill`/`enrich_then_prefill`
