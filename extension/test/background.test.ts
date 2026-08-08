@@ -23,6 +23,7 @@ import {
   isBotChallenge,
   isRedirectLoopPage,
   assessDrivenPage,
+  registrableProviderHost,
   federatedLoginClaimKey,
   type BridgeDeps,
   type DownloadDeltaLike,

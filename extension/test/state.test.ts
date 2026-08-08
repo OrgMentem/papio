@@ -70,6 +70,7 @@ test("pending delivery reducers replace, patch, and clear only the matching job"
   expect(store.pendingDelivery).toBeDefined();
   store = clearPendingDelivery(store, delivery.job_id);
   expect(store.pendingDelivery).toBeUndefined();
+});
 test("waiting-for-session persistence stores only the opaque claim digest", async () => {
   const origin = "https://login.idp.example.edu";
   const entityID = "https://idp.example.edu/entity";
