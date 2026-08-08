@@ -6113,6 +6113,79 @@ func TestPdfGrabDismissDeletesParkedRow(t *testing.T) {
 	}
 }
 
+func TestTriageSnapshotOmitsInvalidDeliveryItem(t *testing.T) {
+	item := protocol.TriageSnapshotItem{
+		Kind: "human_action", ID: "action_bad_delivery", Rank: 1, Title: "delivery",
+		Facts: []protocol.TriageFact{}, Links: []protocol.TriageLink{},
+		ActionID: 1, JobID: "job_bad_delivery", ActionKind: "document_delivery",
+		JobState: "awaiting_human", Revision: 1, RouteClass: "document_delivery",
+		AuthRequirement: "unknown", Attention: "required",
+		Ops:      []string{"open_request_history", "confirm_request_exists", "confirm_request_absent"},
+		Delivery: &protocol.TriageDelivery{Provider: "provider", State: "impossible_state"},
+	}
+	if err := triageSnapshotItemValidationError(3, item); err == nil {
+		t.Fatal("invalid delivery state unexpectedly validated")
+	} else if !strings.Contains(err.Error(), `delivery.state`) {
+		t.Fatalf("validation error = %v, want delivery state", err)
+	}
+
+	counts := triageCountsAfterOmission(protocol.TriageCounts{PendingTotal: 2, Actions: 2}, item, 3)
+	if counts.PendingTotal != 1 || counts.Actions != 1 {
+		t.Fatalf("v3 counts after omission = %+v, want pending_total/actions 1/1", counts)
+	}
+	v4Counts := triageCountsAfterOmission(protocol.TriageCounts{PendingTotal: 2, Actions: 2}, item, 4)
+	if v4Counts.PendingTotal != 2 || v4Counts.Actions != 2 {
+		t.Fatalf("v4 counts after omission = %+v, want global pending_total/actions 2/2", v4Counts)
+	}
+	valid := item
+	valid.ID = "action_good_delivery"
+	valid.ActionID = 2
+	valid.JobID = "job_good_delivery"
+	valid.Delivery = &protocol.TriageDelivery{Provider: "provider", State: "offered"}
+	if err := triageSnapshotItemValidationError(3, valid); err != nil {
+		t.Fatalf("offered delivery rejected: %v", err)
+	}
+	payload := protocol.TriageSnapshotResponsePayload{
+		RequestID: "request-omit-delivery", Schema: 3,
+		GeneratedAt: "2026-01-01T00:00:00Z",
+		Counts:      counts, Items: []protocol.TriageSnapshotItem{valid},
+		HasMore: false,
+	}
+	if err := validateTriageSnapshotPayload(payload); err != nil {
+		t.Fatalf("remaining snapshot is invalid: %v", err)
+	}
+	v4 := payload
+	v4.Schema = 4
+	v4.Counts = protocol.TriageCounts{PendingTotal: 2, Actions: 2}
+	if err := triageSnapshotItemValidationError(4, valid); err != nil {
+		t.Fatalf("offered delivery rejected in v4: %v", err)
+	}
+	if err := validateTriageSnapshotPayload(v4); err != nil {
+		t.Fatalf("v4 frame with omitted item is invalid: %v", err)
+	}
+}
+func TestTriageSnapshotV4KeepsValidPdfGrab(t *testing.T) {
+	b, _, _, _ := newBridge(t)
+	payload, err := b.triageSnapshotPayload(context.Background(), "request-v4-grab", 4, triage.Snapshot{
+		GeneratedAt: "2026-01-01T00:00:00Z",
+		Counts:      triage.Counts{PendingTotal: 1},
+		Items: []triage.Item{{
+			Kind: triage.KindPdfGrab, ID: triage.PdfGrabIDPrefix + "grab_valid_1",
+			Title: "Reading copy", Ops: []string{"provide_identifier", "dismiss"},
+			PdfGrab: &triage.PdfGrab{GrabID: "grab_valid_1", State: "awaiting_file"},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("snapshot payload: %v", err)
+	}
+	if len(payload.Items) != 1 || payload.Items[0].Kind != triage.KindPdfGrab {
+		t.Fatalf("pdf grab payload items = %+v, want one retained grab", payload.Items)
+	}
+	if err := validateTriageSnapshotPayload(payload); err != nil {
+		t.Fatalf("retained pdf grab payload invalid: %v", err)
+	}
+}
+
 // TestTriageSnapshotV3OmitsUnrepresentableActionKinds pins the closed
 // schema-3 route-class guard: an unknown action kind is omitted rather than
 // poisoning the whole frame with an invalid route class.

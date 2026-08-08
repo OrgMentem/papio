@@ -806,6 +806,77 @@ interface BrokerFailure {
 function failure(code: string, message: string): BrokerFailure {
   return { ok: false, error: { code, message } };
 }
+const CONNECTION_LOST_RUNTIME_COPY = "papio lost its connection to the daemon and is retrying…";
+const INTERNAL_RUNTIME_COPY = "papio could not complete that request. Please try again.";
+
+function runtimeRejectionCode(reason: unknown): string | undefined {
+  if (!isObjectRecord(reason)) return undefined;
+  if (typeof reason["code"] === "string") return reason["code"];
+  const nested = reason["error"];
+  return isObjectRecord(nested) && typeof nested["code"] === "string" ? nested["code"] : undefined;
+}
+
+function runtimeRejectionReply(reason: unknown): {
+  ok: false;
+  error: "connection_lost" | "internal";
+  message: string;
+} {
+  const code = runtimeRejectionCode(reason);
+  if (
+    code === "connection_lost" ||
+    (reason instanceof Error && /message channel closed|message port closed|receiving end does not exist|daemon.*(?:disconnect|unavailable)/i.test(reason.message))
+  ) {
+    return { ok: false, error: "connection_lost", message: CONNECTION_LOST_RUNTIME_COPY };
+  }
+  return { ok: false, error: "internal", message: INTERNAL_RUNTIME_COPY };
+}
+
+/** Attach both fulfillment and rejection paths before returning true to Chrome. */
+export function respondToRuntimePromise(
+  promise: Promise<unknown>,
+  sendResponse: (response?: unknown) => void,
+): void {
+  void promise.then(
+    (reply) => sendResponse(reply),
+    (reason) => sendResponse(runtimeRejectionReply(reason)),
+  );
+}
+
+export const INBOX_RUNTIME_MESSAGE_TYPES = [
+  "papio.page_capture",
+  "papio.openInbox",
+  "papio.stats",
+  "papio.handoff.open",
+  "papio.delivery.start",
+  "papio.delivery.state",
+  "papio.session.state",
+  "papio.session.probe",
+  "papio.session.signin",
+  "papio.session.retry",
+  "papio.pageBulk.load",
+  "papio.pageBulk.scan",
+  "papio.pageBulk.rescan",
+  "papio.pageBulk.status",
+  "papio.pageBulk.submit",
+  "papio.pageBulk.allowlist.get",
+  "papio.pageBulk.allowlist.set",
+  "papio.pageBulk.grabPdf",
+  "papio.pageBulk.grabStatus",
+  "papio.triage.waiting",
+  "papio.activity",
+  "papio.triage.snapshot",
+  "papio.triage.counts",
+  "papio.triage.decide",
+  "papio.action.resolve",
+  "papio.delivery.reconcile",
+  "papio.preview",
+] as const;
+type InboxRuntimeMessageType = (typeof INBOX_RUNTIME_MESSAGE_TYPES)[number];
+
+function isInboxRuntimeMessageType(value: unknown): value is InboxRuntimeMessageType {
+  return typeof value === "string" && INBOX_RUNTIME_MESSAGE_TYPES.includes(value as InboxRuntimeMessageType);
+}
+
 
 
 interface BrokerSuccess<T extends Record<string, unknown>> {
@@ -8953,37 +9024,11 @@ if (typeof chrome !== "undefined" && chrome.runtime?.id) {
   chrome.runtime.onStartup.addListener(() => {});
   chrome.runtime.onInstalled.addListener(() => {});
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-    if (
-      isObjectRecord(message) &&
-      (message["type"] === "papio.openInbox" ||
-        message["type"] === "papio.page_capture" ||
-        message["type"] === "papio.activity" ||
-        message["type"] === "papio.triage.snapshot" ||
-        message["type"] === "papio.triage.counts" ||
-        message["type"] === "papio.triage.decide" ||
-        message["type"] === "papio.action.resolve" ||
-        message["type"] === "papio.delivery.reconcile" ||
-        message["type"] === "papio.preview" ||
-        message["type"] === "papio.handoff.open" ||
-        message["type"] === "papio.delivery.start" ||
-        message["type"] === "papio.delivery.state" ||
-        message["type"] === "papio.session.state" ||
-        message["type"] === "papio.session.probe" ||
-        message["type"] === "papio.session.signin" ||
-        message["type"] === "papio.session.retry" ||
-        message["type"] === "papio.stats" ||
-        message["type"] === "papio.pageBulk.load" ||
-        message["type"] === "papio.pageBulk.scan" ||
-        message["type"] === "papio.pageBulk.rescan" ||
-        message["type"] === "papio.pageBulk.status" ||
-        message["type"] === "papio.pageBulk.submit" ||
-        message["type"] === "papio.pageBulk.allowlist.get" ||
-        message["type"] === "papio.pageBulk.allowlist.set" ||
-        message["type"] === "papio.pageBulk.grabPdf")
-    ) {
-      void handleInboxRuntimeMessage(bridge, message, _sender, inboxRuntimeURLs).then((reply) => {
-        sendResponse(reply);
-      });
+    if (isObjectRecord(message) && isInboxRuntimeMessageType(message["type"])) {
+      respondToRuntimePromise(
+        handleInboxRuntimeMessage(bridge, message, _sender, inboxRuntimeURLs),
+        sendResponse,
+      );
       return true;
     }
     if (isCapabilitiesRequest(message)) {
@@ -8991,23 +9036,22 @@ if (typeof chrome !== "undefined" && chrome.runtime?.id) {
       return false;
     }
     if (isPageAcquireRequest(message)) {
-      void bridge.requestPageAcquire(message.payload).then(sendResponse);
+      respondToRuntimePromise(bridge.requestPageAcquire(message.payload), sendResponse);
       return true; // async native acknowledgement
     }
     if (isCancelRequest(message)) {
-      void bridge.requestCancel(message.job_id).then(() => sendResponse({ ok: true }));
+      respondToRuntimePromise(bridge.requestCancel(message.job_id).then(() => ({ ok: true })), sendResponse);
       return true; // async sendResponse
     }
     if (isTermsConsentRequest(message)) {
-      void bridge.requestTermsConsent(message.value).then(() => sendResponse({ ok: true }));
+      respondToRuntimePromise(bridge.requestTermsConsent(message.value).then(() => ({ ok: true })), sendResponse);
       return true; // async sendResponse
     }
     if (isOrphanTabsRequest(message)) {
-      if (message.action === "orphan_tabs_status") {
-        void bridge.orphanTabStatus().then(sendResponse);
-      } else {
-        void bridge.cleanupOrphanTabs().then(sendResponse);
-      }
+      respondToRuntimePromise(
+        message.action === "orphan_tabs_status" ? bridge.orphanTabStatus() : bridge.cleanupOrphanTabs(),
+        sendResponse,
+      );
       return true; // async sendResponse
     }
     return false;

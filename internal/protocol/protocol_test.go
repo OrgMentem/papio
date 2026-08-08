@@ -1028,6 +1028,45 @@ func TestTriageSnapshotSchema1RejectsAccessFieldsButAllowsTheirAbsence(t *testin
 	}
 }
 
+func TestTriageDeliveryOfferedRoundTrips(t *testing.T) {
+	payload := TriageSnapshotResponsePayload{
+		RequestID: "request-offered-001", Schema: 3, GeneratedAt: "2026-01-01T00:00:00Z",
+		Counts: TriageCounts{PendingTotal: 1, Actions: 1},
+		Items: []TriageSnapshotItem{{
+			Kind: "human_action", ID: "action_offered_001", Rank: 1, Title: "delivery",
+			Facts: []TriageFact{}, Links: []TriageLink{},
+			ActionID: 1, JobID: "job_offered_001", ActionKind: "document_delivery",
+			JobState: "awaiting_human", Revision: 1, RouteClass: "document_delivery",
+			AuthRequirement: "unknown", Attention: "required",
+			Ops:      []string{"open_request_history", "confirm_request_exists", "confirm_request_absent"},
+			Delivery: &TriageDelivery{Provider: "provider", State: "offered"},
+		}},
+		HasMore: false, UnsupportedItemsCount: 0,
+	}
+	frame := map[string]any{
+		"protocol": BrowserProtocolVersion, "type": MsgTriageSnapshotResponse,
+		"msg_id": "offered-roundtrip", "seq": 1, "payload": payload,
+	}
+	raw, err := json.Marshal(frame)
+	if err != nil {
+		t.Fatal(err)
+	}
+	message, err := DecodeBrowserMessage(raw)
+	if err != nil {
+		t.Fatalf("offered delivery rejected: %v", err)
+	}
+	roundTripped, err := json.Marshal(map[string]any{
+		"protocol": BrowserProtocolVersion, "type": MsgTriageSnapshotResponse,
+		"msg_id": "offered-roundtrip-2", "seq": 2, "payload": message.Payload,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := DecodeBrowserMessage(roundTripped); err != nil {
+		t.Fatalf("offered delivery failed round-trip validation: %v", err)
+	}
+}
+
 func TestTriageSnapshotV3RequiresAttentionAndRouteFields(t *testing.T) {
 	data, err := os.ReadFile(filepath.Join(corpusDir(t, "valid"), "browser-triage-snapshot-response-v3.json"))
 	if err != nil {

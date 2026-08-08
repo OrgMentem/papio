@@ -171,7 +171,7 @@ function documentDeliveryAction(
   id: string,
   rank: number,
   attention: "working" | "required",
-  state: "unknown_outcome" | "fulfilled" | "declined" | "cancelled",
+  state: "offered" | "unknown_outcome" | "fulfilled" | "declined" | "cancelled",
 ): TriageSnapshotItem {
   return {
     kind: "human_action",
@@ -1371,4 +1371,18 @@ test("renders a document_delivery item's delivery detail, attention styling, and
     operation: "confirm_request_absent",
   });
   expect(page.document.querySelector("[data-triage-item-id='action:delivery-working']")).toBeNull();
+});
+
+test("renders an offered delivery as a request created but not submitted", async () => {
+  const item = documentDeliveryAction("action:delivery-offered", 1, "required", "offered");
+  const fixture = snapshot([item], {
+    schema: 3,
+    counts: counts({ pending_total: 1, actions: 1, watch_hits: 0, retractions: 0 }),
+  });
+  const page = await inboxDocument((message) => snapshotReply(fixture, message));
+  const delivery = page.document.querySelector<HTMLElement>("[data-triage-item-id='action:delivery-offered'] .item-delivery");
+  const status = Array.from(delivery?.querySelectorAll("dt") ?? [])
+    .find((label) => label.textContent === "Status")
+    ?.nextElementSibling?.textContent;
+  expect(status).toBe("request created but not submitted");
 });

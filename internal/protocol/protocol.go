@@ -1234,7 +1234,7 @@ func (d TriageDelivery) validate() error {
 		return err
 	}
 	return enumRequired("human_action.delivery.state", d.State,
-		"submitted", "pending", "fulfilled", "declined", "cancelled", "unknown_outcome")
+		"offered", "submitted", "pending", "fulfilled", "declined", "cancelled", "unknown_outcome")
 }
 
 // triageRouteClasses is triage-snapshot/3's closed route_class vocabulary —

@@ -307,7 +307,7 @@
       "properties": {
         "provider": { "type": "string", "minLength": 1, "maxLength": 100, "pattern": "^[^\\u0000]+$" },
         "provider_reference": { "type": "string", "maxLength": 300, "pattern": "^[^\\u0000]*$" },
-        "state": { "enum": ["submitted", "pending", "fulfilled", "declined", "cancelled", "unknown_outcome"] }
+        "state": { "enum": ["offered", "submitted", "pending", "fulfilled", "declined", "cancelled", "unknown_outcome"] }
       }
     },
     "watch_hit_item_v3": {

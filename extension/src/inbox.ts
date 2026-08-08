@@ -1,6 +1,6 @@
 // Copyright 2026 OrgMentem. Licensed under MIT.
 
-import type { ActivityEntryPayload, TriageCounts, TriageSnapshotItem, TriageSnapshotResponsePayload } from "./protocol";
+import type { ActivityEntryPayload, TriageCounts, TriageDelivery, TriageSnapshotItem, TriageSnapshotResponsePayload } from "./protocol";
 
 type Snapshot = Omit<TriageSnapshotResponsePayload, "request_id">;
 type ActivityEntry = ActivityEntryPayload;
@@ -939,6 +939,16 @@ const STATUS_META: Record<string, { glyph: string; label: string }> = {
   retraction: { glyph: "!", label: "Retraction notice" },
 };
 
+const DELIVERY_STATE_LABELS: Record<TriageDelivery["state"], string> = {
+  offered: "request created but not submitted",
+  submitted: "submitted",
+  pending: "pending",
+  fulfilled: "fulfilled",
+  declined: "declined",
+  cancelled: "cancelled",
+  unknown_outcome: "unknown outcome",
+};
+
 // The status glyph is the row's quick-reference column; its meaning rides in
 // the tooltip and accessible name. The action-kind vocabulary is open (a new
 // daemon can ship new kinds), so unknown kinds degrade to a neutral dot with
@@ -1058,7 +1068,7 @@ function renderDeliveryDetail(item: TriageSnapshotItem): HTMLElement | null {
   if (item.delivery.provider_reference !== undefined && item.delivery.provider_reference !== "") {
     rows.push(["Reference", item.delivery.provider_reference]);
   }
-  rows.push(["Status", item.delivery.state.replaceAll("_", " ")]);
+  rows.push(["Status", DELIVERY_STATE_LABELS[item.delivery.state]]);
   for (const [label, value] of rows) {
     list.append(element("dt", label), element("dd", value));
   }

@@ -1144,7 +1144,7 @@ func (b *Bridge) sessionBusy(jobID string) ([]json.RawMessage, error) {
 // remains valid for exactly the returned item count.
 func (b *Bridge) triageSnapshot(ctx context.Context, request *protocol.TriageSnapshotRequestPayload) ([]json.RawMessage, error) {
 	if b.triage == nil {
-		return nil, errors.New("triage service is not configured")
+		return b.unavailable("triage_unavailable", "the triage inbox is temporarily unavailable", "triage snapshot", nil)
 	}
 	limit := request.Limit
 	if limit == 0 {
@@ -1153,21 +1153,33 @@ func (b *Bridge) triageSnapshot(ctx context.Context, request *protocol.TriageSna
 	for {
 		snapshot, err := b.triage.Snapshot(ctx, triage.SnapshotRequest{Limit: int(limit), Cursor: request.Cursor, Schema: int(request.SchemaVersions[0])})
 		if err != nil {
-			return nil, err
+			return b.unavailable("triage_unavailable", "the triage inbox is temporarily unavailable", "triage snapshot", err)
 		}
 		payload, err := b.triageSnapshotPayload(ctx, request.RequestID, request.SchemaVersions[0], snapshot)
 		if err != nil {
-			return nil, err
+			return b.unavailable("triage_unavailable", "the triage inbox is temporarily unavailable", "triage snapshot", err)
 		}
 		if b.frameFits(protocol.MsgTriageSnapshotResponse, payload) {
 			frame, err := b.frame(protocol.MsgTriageSnapshotResponse, "", payload)
-			if err != nil {
-				return nil, err
+			if err == nil {
+				return []json.RawMessage{frame}, nil
 			}
-			return []json.RawMessage{frame}, nil
+			// Item-level validation happens while the payload is assembled
+			// above. Keep a final safety net here for non-item programming
+			// errors: emit a correlated, minimal response rather than
+			// returning a raw error that would tear down the native session.
+			log.Printf("papio: triage snapshot assembled frame failed self-validation: %v", err)
+			minimal := minimalTriageSnapshotPayload(payload)
+			frame, minimalErr := b.frame(protocol.MsgTriageSnapshotResponse, "", minimal)
+			if minimalErr == nil {
+				return []json.RawMessage{frame}, nil
+			}
+			return b.unavailable("triage_snapshot_invalid",
+				"the triage inbox is temporarily unavailable", "triage snapshot", minimalErr)
 		}
 		if len(snapshot.Items) <= 1 {
-			return nil, fmt.Errorf("triage snapshot item exceeds browser frame cap %d", protocol.MaxBrowserMessageBytes)
+			return b.unavailable("triage_snapshot_too_large", "the triage inbox item is too large to display", "triage snapshot",
+				fmt.Errorf("triage snapshot item exceeds browser frame cap %d", protocol.MaxBrowserMessageBytes))
 		}
 		limit = int64(len(snapshot.Items) - 1)
 	}
@@ -1181,6 +1193,14 @@ func (b *Bridge) triageSnapshot(ctx context.Context, request *protocol.TriageSna
 // below stays byte-identical to what it produced before triage-snapshot/3.
 func (b *Bridge) triageSnapshotPayload(ctx context.Context, requestID string, schema int64, snapshot triage.Snapshot) (protocol.TriageSnapshotResponsePayload, error) {
 	items := make([]protocol.TriageSnapshotItem, 0, len(snapshot.Items))
+	counts := triageCountsPayload(snapshot.Counts)
+	omit := func(item protocol.TriageSnapshotItem, reason error) {
+		log.Printf("papio: omitting triage snapshot item %s: %v",
+			triageSnapshotItemIdentity(item), reason)
+		// v4 counts are global and floor-bound, while legacy counts are
+		// frame-identity counts, so omission decrements only the latter.
+		counts = triageCountsAfterOmission(counts, item, schema)
+	}
 	for _, item := range snapshot.Items {
 		payload := protocol.TriageSnapshotItem{
 			Kind: item.Kind, ID: item.ID, Rank: int64(item.Rank), Title: item.Title,
@@ -1208,10 +1228,15 @@ func (b *Bridge) triageSnapshotPayload(ctx context.Context, requestID string, sc
 			}
 		case triage.KindHumanAction:
 			action := item.HumanAction
+			if action != nil {
+				payload.ActionID, payload.JobID = action.ActionID, action.JobID
+				payload.ActionKind, payload.JobState = action.ActionKind, action.JobState
+			}
 			// Schema 3's route_class vocabulary is closed. An unrepresentable
 			// action kind must be omitted rather than invalidating the whole
 			// snapshot frame.
 			if action != nil && schema == 3 && !slices.Contains(protocol.TriageRouteClasses(), action.ActionKind) {
+				omit(payload, fmt.Errorf("human_action.route_class %q is not representable in schema 3", action.ActionKind))
 				continue
 			}
 			if action != nil {
@@ -1260,11 +1285,15 @@ func (b *Bridge) triageSnapshotPayload(ctx context.Context, requestID string, sc
 			payload.Attention = "required"
 			payload.Ops = []string{"provide_identifier", "dismiss"}
 		}
+		if reason := triageSnapshotItemValidationError(schema, payload); reason != nil {
+			omit(payload, reason)
+			continue
+		}
 		items = append(items, payload)
 	}
 	return protocol.TriageSnapshotResponsePayload{
 		RequestID: requestID, Schema: schema, GeneratedAt: snapshot.GeneratedAt,
-		Counts: triageCountsPayload(snapshot.Counts), Items: items, Cursor: snapshot.Cursor,
+		Counts: counts, Items: items, Cursor: snapshot.Cursor,
 		HasMore: snapshot.HasMore, UnsupportedItemsCount: int64(snapshot.UnsupportedItemsCount),
 	}, nil
 }
@@ -1281,6 +1310,86 @@ func triageAuthRequirement(requiresAuth *bool) string {
 		return "true"
 	}
 	return "false"
+}
+
+func triageSnapshotItemIdentity(item protocol.TriageSnapshotItem) string {
+	if item.ActionID > 0 {
+		return fmt.Sprintf("action_id=%d job_id=%s", item.ActionID, item.JobID)
+	}
+	if item.ID != "" {
+		return "item_id=" + item.ID
+	}
+	if item.Grab != nil {
+		return "grab_id=" + item.Grab.GrabID
+	}
+	return "kind=" + item.Kind
+}
+
+func triageCountsAfterOmission(counts protocol.TriageCounts, item protocol.TriageSnapshotItem, schema int64) protocol.TriageCounts {
+	if schema >= 4 {
+		return counts
+	}
+	switch item.Kind {
+	case triage.KindWatchHit:
+		if counts.WatchHits > 0 {
+			counts.WatchHits--
+		}
+	case triage.KindHumanAction:
+		if counts.Actions > 0 {
+			counts.Actions--
+		}
+		if counts.ActionsRequiresAuth != nil && item.RequiresAuth != nil && *item.RequiresAuth && *counts.ActionsRequiresAuth > 0 {
+			(*counts.ActionsRequiresAuth)--
+		}
+	case triage.KindRetraction:
+		if counts.Retractions > 0 {
+			counts.Retractions--
+		}
+	}
+	if counts.PendingTotal > 0 {
+		counts.PendingTotal--
+	}
+	return counts
+}
+
+func triageSnapshotItemValidationError(schema int64, item protocol.TriageSnapshotItem) error {
+	counts := protocol.TriageCounts{PendingTotal: 1}
+	switch item.Kind {
+	case triage.KindWatchHit:
+		counts.WatchHits = 1
+	case triage.KindHumanAction:
+		counts.Actions = 1
+	case triage.KindRetraction:
+		counts.Retractions = 1
+	}
+	return validateTriageSnapshotPayload(protocol.TriageSnapshotResponsePayload{
+		RequestID: "snapshot-item-validate", Schema: schema, GeneratedAt: "2026-01-01T00:00:00Z",
+		Counts: counts, Items: []protocol.TriageSnapshotItem{item}, HasMore: false,
+	})
+}
+
+func validateTriageSnapshotPayload(payload protocol.TriageSnapshotResponsePayload) error {
+	raw, err := json.Marshal(map[string]any{
+		"protocol": protocol.BrowserProtocolVersion,
+		"type":     protocol.MsgTriageSnapshotResponse,
+		"msg_id":   "snapshot-validate",
+		"seq":      1,
+		"payload":  payload,
+	})
+	if err != nil {
+		return err
+	}
+	_, err = protocol.DecodeBrowserMessage(raw)
+	return err
+}
+
+func minimalTriageSnapshotPayload(payload protocol.TriageSnapshotResponsePayload) protocol.TriageSnapshotResponsePayload {
+	payload.Counts = protocol.TriageCounts{}
+	payload.Items = []protocol.TriageSnapshotItem{}
+	payload.Cursor = ""
+	payload.HasMore = false
+	payload.UnsupportedItemsCount = 0
+	return payload
 }
 
 // triageHumanActionAttention implements the settled attention mapping from

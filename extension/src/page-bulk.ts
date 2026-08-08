@@ -88,6 +88,7 @@ interface WorkspaceState {
   sourceTabClosed: boolean;
   statusError: string | null;
   statusLoaded: boolean;
+  statusRetryAttempted: boolean;
   rescanning: boolean;
   submitting: boolean;
   result: SubmitResult | null;
@@ -126,19 +127,40 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
+const CONNECTION_LOST_COPY = "papio lost its connection to the daemon and is retrying…";
+
 function errorFromResponse(value: unknown): string {
+  if (isRecord(value) && value["error"] === "connection_lost") return CONNECTION_LOST_COPY;
+  if (isRecord(value) && value["error"] === "internal") {
+    return typeof value["message"] === "string" ? value["message"] : "papio could not complete that request. Please try again.";
+  }
   if (isRecord(value) && isRecord(value["error"]) && typeof value["error"]["message"] === "string") {
-    return value["error"]["message"];
+    return value["error"]["code"] === "connection_lost" ? CONNECTION_LOST_COPY : value["error"]["message"];
   }
   return "The extension runtime did not return a usable response.";
 }
 
 function errorCode(value: unknown): string | undefined {
-  if (isRecord(value) && isRecord(value["error"]) && typeof value["error"]["code"] === "string") {
-    return value["error"]["code"];
-  }
+  if (!isRecord(value)) return undefined;
+  if (typeof value["error"] === "string") return value["error"];
+  if (isRecord(value["error"]) && typeof value["error"]["code"] === "string") return value["error"]["code"];
   return undefined;
 }
+
+function thrownErrorMessage(error: unknown): string {
+  if (
+    error instanceof Error &&
+    /message channel closed|message port closed|receiving end does not exist|daemon.*(?:disconnect|unavailable)/i.test(error.message)
+  ) {
+    return CONNECTION_LOST_COPY;
+  }
+  return CONNECTION_LOST_COPY;
+}
+
+function isConnectionLost(value: unknown): boolean {
+  return errorCode(value) === "connection_lost" || (value instanceof Error && /message channel closed|message port closed|receiving end does not exist|daemon.*(?:disconnect|unavailable)/i.test(value.message));
+}
+
 
 function responseValue<T>(value: unknown, key: string): { ok: true; value: T } | { ok: false; message: string } {
   if (isRecord(value) && value["ok"] === true && key in value) {
@@ -152,6 +174,29 @@ async function runtimeMessage(type: string, request: Record<string, unknown>): P
     throw new Error("The extension runtime is unavailable.");
   }
   return chrome.runtime.sendMessage({ type, request });
+}
+
+const STATE_STORAGE_KEY = "papio_state_v1";
+
+function installConnectionStatusListener(): void {
+  const storage = chrome.storage;
+  if (storage === undefined || storage.onChanged === undefined) return;
+  const sessionArea = storage.session;
+  const stateArea = sessionArea ?? storage.local;
+  const stateAreaName = stateArea === sessionArea ? "session" : "local";
+  storage.onChanged.addListener((changes, areaName) => {
+    if (areaName !== stateAreaName || state.statusError !== CONNECTION_LOST_COPY) return;
+    const change = changes[STATE_STORAGE_KEY];
+    if (!isRecord(change) || !isRecord(change["oldValue"]) || !isRecord(change["newValue"])) return;
+    if (
+      change["oldValue"]["connectionStatus"] === "connected" ||
+      change["newValue"]["connectionStatus"] !== "connected"
+    ) {
+      return;
+    }
+    statusRetryPending = false;
+    void loadStatus();
+  });
 }
 
 function isDetectedPaper(value: unknown): value is DetectedPaper {
@@ -261,13 +306,12 @@ function scanIdFromLocation(): string | null {
   const scanId = new URL(window.location.href).searchParams.get("scan");
   return scanId !== null && scanId.length > 0 ? scanId : null;
 }
-
 function formatScanTime(iso: string): string {
   const parsed = new Date(iso);
   return Number.isNaN(parsed.getTime()) ? "" : parsed.toLocaleString();
 }
-
 /** Mirrors popup.ts's historyPagePath()/background.ts's inboxURL: derive the
+
  * inbox page's path from the manifest's declared default_popup so it
  * inherits the real build output directory (dist/ for both Chrome and
  * Firefox) instead of a hardcoded extension-root path that never exists
@@ -288,6 +332,7 @@ const state: WorkspaceState = {
   sourceTabClosed: false,
   statusError: null,
   statusLoaded: false,
+  statusRetryAttempted: false,
   rescanning: false,
   submitting: false,
   result: null,
@@ -442,7 +487,7 @@ async function handleGrab(row: RowState): Promise<void> {
     state.grabDetail = errorFromResponse(response);
   } catch (error) {
     state.grabState = "failed";
-    state.grabDetail = error instanceof Error ? error.message : "Could not start the PDF grab";
+    state.grabDetail = thrownErrorMessage(error);
   }
   render();
 }
@@ -542,8 +587,9 @@ function updatePrimaryButton(): void {
     // says what will actually happen — "50 selected" with zero checkboxes
     // checked read as a bug in the first live session.
     const capped = Math.min(eligible.length, SUBMIT_CAP);
-    elements.primaryButton.textContent =
-      eligible.length > SUBMIT_CAP
+    elements.primaryButton.textContent = !state.statusLoaded
+      ? "Acquire papers — checking availability…"
+      : eligible.length > SUBMIT_CAP
         ? `Acquire ${capped} of ${eligible.length} eligible`
         : `Acquire all ${eligible.length} eligible`;
     elements.primaryButton.disabled = state.submitting || !state.statusLoaded || eligible.length === 0;
@@ -608,11 +654,6 @@ function render(): void {
   renderActionBar();
   renderResult();
 }
-
-// -----------------------------------------------------------------------
-// Background round trips — the finite papio.pageBulk.* message set
-// (ADR-0019 Decision 4/7). Each is a single correlated request/reply, no
-// {method, params} pass-through.
 // -----------------------------------------------------------------------
 
 async function loadAllowlist(origin: string): Promise<void> {
@@ -629,7 +670,7 @@ async function loadGrabStatus(): Promise<void> {
     response = await runtimeMessage("papio.pageBulk.grabStatus", { grab_id: grabRow.grabID });
   } catch (error) {
     state.grabState = "identifying";
-    state.grabDetail = error instanceof Error ? error.message : "Could not reach the extension runtime.";
+    state.grabDetail = thrownErrorMessage(error);
     return;
   }
   if (!isRecord(response) || response["ok"] !== true) {
@@ -659,12 +700,33 @@ async function loadGrabStatus(): Promise<void> {
   state.grabDetail = typeof response["detail"] === "string" ? response["detail"] : null;
 }
 
+let statusRetryPending = false;
+
+function scheduleStatusRetry(requestGeneration: number): void {
+  if (state.statusRetryAttempted) return;
+  state.statusRetryAttempted = true;
+  statusRetryPending = true;
+  setTimeout(() => {
+    if (!statusRetryPending) return;
+    statusRetryPending = false;
+    if (state.snapshot?.documentGeneration !== requestGeneration) return;
+    void loadStatus();
+  }, 500);
+}
+
 async function loadStatus(): Promise<void> {
   if (state.snapshot === null) return;
+  statusRetryPending = false;
   const requestGeneration = state.snapshot.documentGeneration;
   state.statusError = null;
   render();
   await loadGrabStatus();
+  if (state.grabDetail === CONNECTION_LOST_COPY) {
+    state.statusError = CONNECTION_LOST_COPY;
+    scheduleStatusRetry(requestGeneration);
+    render();
+    return;
+  }
   if (state.rows.length === 0 || state.rows.every((row) => row.kind === "pdf_grab")) {
     state.statusLoaded = true;
     render();
@@ -680,15 +742,17 @@ async function loadStatus(): Promise<void> {
       identifiers,
       ...(state.snapshot.renderedRecordCountHint !== null ? { rendered_record_count_hint: state.snapshot.renderedRecordCountHint } : {}),
     });
-  } catch (e) {
+  } catch (error) {
     if (state.snapshot === null || state.snapshot.documentGeneration !== requestGeneration) return;
-    state.statusError = e instanceof Error ? e.message : "Could not reach the extension runtime.";
+    state.statusError = thrownErrorMessage(error);
+    if (isConnectionLost(error)) scheduleStatusRetry(requestGeneration);
     render();
     return;
   }
   if (state.snapshot === null || state.snapshot.documentGeneration !== requestGeneration) return;
   if (!isStatusReply(response)) {
     state.statusError = errorFromResponse(response);
+    if (errorCode(response) === "connection_lost") scheduleStatusRetry(requestGeneration);
     render();
     return;
   }
@@ -711,6 +775,8 @@ function applySnapshot(snapshot: WorkspaceSnapshot): void {
   state.detector = snapshot.items[0]?.detector ?? "generic-identifiers/1";
   state.rows = rowsFromSnapshot(snapshot);
   state.statusLoaded = false;
+  state.statusRetryAttempted = false;
+  statusRetryPending = false;
   state.statusError = null;
   state.sourceTabClosed = false;
   state.expired = false;
@@ -747,7 +813,7 @@ async function loadInitial(): Promise<void> {
   try {
     response = await runtimeMessage("papio.pageBulk.load", { scan_id: state.scanId });
   } catch (e) {
-    state.loadError = e instanceof Error ? e.message : "Could not reach the extension runtime.";
+    state.loadError = thrownErrorMessage(e);
     render();
     return;
   }
@@ -776,7 +842,7 @@ async function handleRescan(): Promise<void> {
     response = await runtimeMessage("papio.pageBulk.rescan", { scan_id: state.snapshot.scanId });
   } catch (e) {
     state.rescanning = false;
-    state.loadError = e instanceof Error ? e.message : "Could not reach the extension runtime.";
+    state.loadError = thrownErrorMessage(e);
     render();
     return;
   }
@@ -859,7 +925,7 @@ async function handleSubmit(): Promise<void> {
     });
   } catch (e) {
     state.submitting = false;
-    elements.submitStatus.textContent = e instanceof Error ? e.message : "Could not reach the extension runtime.";
+    elements.submitStatus.textContent = thrownErrorMessage(e);
     render();
     return;
   }
@@ -977,7 +1043,7 @@ function bootstrap(): void {
       render();
     }
   });
-  render();
+  installConnectionStatusListener();
   void loadInitial();
 }
 

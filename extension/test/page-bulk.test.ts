@@ -3,7 +3,7 @@
 // real page-bulk.html (mirrors inbox.test.ts's inboxDocument pattern) and
 // drives page-bulk.ts through a mocked chrome.runtime/tabs/windows surface.
 
-import { expect, test } from "bun:test";
+import { expect, test, vi } from "bun:test";
 import { readFileSync } from "node:fs";
 
 import { Window } from "happy-dom";
@@ -15,6 +15,11 @@ interface RuntimeRequest {
 }
 
 type Reply = (message: RuntimeRequest) => unknown | Promise<unknown>;
+
+interface StorageChangeLike {
+  oldValue?: unknown;
+  newValue?: unknown;
+}
 
 let importSerial = 0;
 
@@ -30,13 +35,21 @@ async function pageBulkDocument(
   scanId: string | null,
   reply: Reply,
   options: ChromeTestOptions = {},
-): Promise<{ document: Document; window: Window; requests: RuntimeRequest[]; tabsUpdated: number[]; emitRuntimeMessage: (message: unknown) => Promise<void> }> {
+): Promise<{
+  document: Document;
+  window: Window;
+  requests: RuntimeRequest[];
+  tabsUpdated: number[];
+  emitRuntimeMessage: (message: unknown) => Promise<void>;
+  emitStorageChange: (changes: Record<string, StorageChangeLike>, areaName?: string) => Promise<void>;
+}> {
   const search = scanId !== null ? `?scan=${encodeURIComponent(scanId)}` : "";
   const window = new Window({ url: `https://ext.test/page-bulk.html${search}` });
   window.document.write(readFileSync(new URL("../src/page-bulk.html", import.meta.url), "utf8"));
   const requests: RuntimeRequest[] = [];
   const tabsUpdated: number[] = [];
   const runtimeListeners: ((message: unknown) => void)[] = [];
+  const storageListeners: ((changes: Record<string, StorageChangeLike>, areaName: string) => void)[] = [];
   Object.assign(globalThis, {
     window,
     document: window.document,
@@ -65,6 +78,15 @@ async function pageBulkDocument(
         getManifest: () => ({ action: { default_popup: "dist/ui/popup.html" } }),
         getURL: (path: string) => `chrome-extension://test-id/${path}`,
       },
+      storage: {
+        session: {},
+        local: {},
+        onChanged: {
+          addListener: (listener: (changes: Record<string, StorageChangeLike>, areaName: string) => void) => {
+            storageListeners.push(listener);
+          },
+        },
+      },
       tabs: {
         update: async (tabId: number, _props: Record<string, unknown>) => {
           if (options.tabsUpdateFails === true) throw new Error("No tab with id");
@@ -89,6 +111,10 @@ async function pageBulkDocument(
     tabsUpdated,
     emitRuntimeMessage: async (message: unknown) => {
       for (const listener of runtimeListeners) listener(message);
+      await settle();
+    },
+    emitStorageChange: async (changes: Record<string, StorageChangeLike>, areaName = "session") => {
+      for (const listener of storageListeners) listener(changes, areaName);
       await settle();
     },
   };
@@ -703,7 +729,77 @@ test("a scan_not_found load reply shows the expired banner and hides the workspa
   expect(page.document.getElementById("action-bar")?.hidden).toBe(true);
 });
 
-// --- status errors -------------------------------------------------------
+test("a connection_lost status failure uses papio copy, reloads on storage reconnect, and keeps acquisition honest while unknown", async () => {
+  vi.useFakeTimers();
+  try {
+    const snap = snapshot();
+    let statusAttempts = 0;
+    const page = await pageBulkDocument("scan-1", (message) => {
+      if (message.type === "papio.pageBulk.load") return { ok: true, snapshot: snap };
+      if (message.type === "papio.pageBulk.status") {
+        statusAttempts += 1;
+        if (statusAttempts === 1) return { ok: false, error: "connection_lost", message: "raw channel closed text" };
+        return { ok: true, items: [eligibleStatus("id-1")], truncated: false };
+      }
+      return { ok: true, allowed: false };
+    });
+
+    expect(page.document.getElementById("status-error-message")?.textContent).toBe(
+      "papio lost its connection to the daemon and is retrying…",
+    );
+    expect(page.document.getElementById("primary-btn")?.textContent).toBe("Acquire papers — checking availability…");
+    expect((page.document.getElementById("primary-btn") as HTMLButtonElement).disabled).toBe(true);
+
+    await page.emitStorageChange({
+      papio_state_v1: {
+        oldValue: { connectionStatus: "disconnected" },
+        newValue: { connectionStatus: "connected" },
+      },
+    });
+    await settle();
+    expect(statusAttempts).toBe(2);
+    expect(page.document.getElementById("status-error")?.hidden).toBe(true);
+    await page.emitStorageChange({
+      papio_state_v1: {
+        oldValue: { connectionStatus: "connected" },
+        newValue: { connectionStatus: "connected", daemonVersion: "new" },
+      },
+    });
+    expect(statusAttempts).toBe(2);
+    vi.advanceTimersByTime(500);
+    await settle();
+    expect(statusAttempts).toBe(2);
+    expect((page.document.getElementById("primary-btn") as HTMLButtonElement).textContent).toBe("Acquire all 1 eligible");
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test("a Chrome receiving-end rejection uses papio connection copy instead of raw runtime text", async () => {
+  vi.useFakeTimers();
+  try {
+    const snap = snapshot();
+    let statusAttempts = 0;
+    const page = await pageBulkDocument("scan-1", (message) => {
+      if (message.type === "papio.pageBulk.load") return { ok: true, snapshot: snap };
+      if (message.type === "papio.pageBulk.status") {
+        statusAttempts += 1;
+        if (statusAttempts === 1) throw new Error("Could not establish connection. Receiving end does not exist.");
+        return { ok: true, items: [eligibleStatus("id-1")], truncated: false };
+      }
+      return { ok: true, allowed: false };
+    });
+
+    expect(page.document.getElementById("status-error-message")?.textContent).toBe(
+      "papio lost its connection to the daemon and is retrying…",
+    );
+    vi.advanceTimersByTime(500);
+    await settle();
+    expect(statusAttempts).toBe(2);
+  } finally {
+    vi.useRealTimers();
+  }
+});
 
 test("a status lookup failure shows the retry banner; Retry re-sends the request", async () => {
   const snap = snapshot();

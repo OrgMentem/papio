@@ -4,8 +4,8 @@
 // emitter awaits the handler promises it triggers, so the flow is deterministic.
 
 import { expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import { Window } from "happy-dom";
-
 
 import { parseBrowserMessage, type BrowserMessage } from "../src/protocol";
 import { emptyStore, type StateBackend, type StoreShape } from "../src/state";
@@ -18,6 +18,8 @@ import {
   MIN_DAEMON_VERSION,
   hasDaemonUpdateHint,
   handleInboxRuntimeMessage,
+  respondToRuntimePromise,
+  INBOX_RUNTIME_MESSAGE_TYPES,
   needsVisibleWindow,
   normalizeManagedTabURL,
   isBotChallenge,
@@ -7173,4 +7175,40 @@ test("papio.pageBulk.grabStatus pulls a structured durable result", async () => 
     outcome: "job_created",
     job_id: "job_00000001",
   });
+});
+
+test("runtime dispatcher rejection always sends a structured connection_lost reply", async () => {
+  let called = false;
+  let response: unknown;
+  respondToRuntimePromise(
+    Promise.reject({ code: "connection_lost" }),
+    (reply) => {
+      called = true;
+      response = reply;
+    },
+  );
+  await Promise.resolve();
+  await Promise.resolve();
+  expect(called).toBe(true);
+  expect(response).toEqual({
+    ok: false,
+    error: "connection_lost",
+    message: "papio lost its connection to the daemon and is retrying…",
+  });
+});
+
+test("runtime message registry stays equal to the handler type chain", () => {
+  const source = readFileSync(new URL("../src/background.ts", import.meta.url), "utf8");
+  const handlerStart = source.indexOf("export async function handleInboxRuntimeMessage");
+  const dispatcherStart = source.indexOf("chrome.runtime.onMessage.addListener", handlerStart);
+  expect(handlerStart).toBeGreaterThanOrEqual(0);
+  expect(dispatcherStart).toBeGreaterThan(handlerStart);
+  const handlerSource = source.slice(handlerStart, dispatcherStart);
+  const handlerTypes = new Set<string>(
+    [...handlerSource.matchAll(/type\s*(?:===|!==)\s*"(papio\.[^"]+)"/g)]
+      .map((match) => match[1])
+      .filter((type): type is string => type !== undefined),
+  );
+  expect(handlerTypes).toContain("papio.pageBulk.grabStatus");
+  expect(new Set<string>(INBOX_RUNTIME_MESSAGE_TYPES)).toEqual(handlerTypes);
 });

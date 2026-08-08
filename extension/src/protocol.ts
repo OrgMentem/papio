@@ -313,13 +313,14 @@ export interface TriageSnapshotItem {
 }
 
 /** triage-snapshot/3's document_delivery sub-object: the observed provider
- * request a document_delivery human_action item is reconciling. "fulfilled"
- * means the provider supplied the document — never that papio holds
- * trusted bytes yet (ADR-0017). */
+ * request a document_delivery human_action item is reconciling. "offered"
+ * means papio created the request but has not submitted it to the provider.
+ * "fulfilled" means the provider supplied the document — never that papio
+ * holds trusted bytes yet (ADR-0017). */
 export interface TriageDelivery {
   provider: string;
   provider_reference?: string;
-  state: "submitted" | "pending" | "fulfilled" | "declined" | "cancelled" | "unknown_outcome";
+  state: "offered" | "submitted" | "pending" | "fulfilled" | "declined" | "cancelled" | "unknown_outcome";
 }
 
 export interface TriageCountsRequestPayload {
@@ -998,7 +999,7 @@ function triageItem(raw: unknown, schema: 1 | 2 | 3 | 4): void {
         }
         if ("provider_reference" in delivery) triageText(delivery, "provider_reference", "human_action.delivery", 300);
         const state = triageText(delivery, "state", "human_action.delivery", 20);
-        if (!["submitted", "pending", "fulfilled", "declined", "cancelled", "unknown_outcome"].includes(state)) {
+        if (!["offered", "submitted", "pending", "fulfilled", "declined", "cancelled", "unknown_outcome"].includes(state)) {
           fail("human_action.delivery.state is invalid");
         }
       }

@@ -175,6 +175,21 @@ test("triage schema 3 requires attention/route_class/auth_requirement and gates 
   expect(() => parseBrowserMessageBytes(v2WithV3BlockedBy)).toThrow(ProtocolError);
 });
 
+test("delivery offered state parses while unknown state is rejected", () => {
+  const text = readFileSync(join(corpusRoot, "valid", "browser-triage-snapshot-response-v3.json"), "utf8");
+  const offered = JSON.parse(text) as { payload: { items: Array<Record<string, unknown>> } };
+  const offeredDelivery = offered.payload.items.find((item) => item["action_kind"] === "document_delivery")?.["delivery"];
+  expect(offeredDelivery).toBeDefined();
+  (offeredDelivery as Record<string, unknown>)["state"] = "offered";
+  expect(parseBrowserMessage(offered).protocol).toBe("papio-browser/1");
+
+  const unknown = JSON.parse(text) as { payload: { items: Array<Record<string, unknown>> } };
+  const unknownDelivery = unknown.payload.items.find((item) => item["action_kind"] === "document_delivery")?.["delivery"];
+  expect(unknownDelivery).toBeDefined();
+  (unknownDelivery as Record<string, unknown>)["state"] = "not_a_delivery_state";
+  expect(() => parseBrowserMessage(unknown)).toThrow(ProtocolError);
+});
+
 test("downloads_access_required route_class parses and rejects a route_class outside the closed vocabulary", () => {
   const text = readFileSync(join(corpusRoot, "valid", "browser-triage-snapshot-downloads-access-required.json"), "utf8");
   const parsed = parseBrowserMessageBytes(text);
