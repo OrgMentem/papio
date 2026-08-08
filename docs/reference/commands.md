@@ -545,6 +545,28 @@ papio failures [flags]
 | `--by-provider` | `bool` | `false` | group by provider host/source instead of reason |
 | `--limit` | `int` | `20` | maximum aggregate rows (1-200) |
 
+## `papio grabs`
+
+Manage captured PDF grabs
+
+```
+papio grabs
+```
+
+### `papio grabs identify`
+
+Bind an operator-supplied identifier to a captured PDF grab
+
+```
+papio grabs identify <grab-id> [flags]
+```
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--arxiv` | `string` |  | identify by arXiv ID |
+| `--doi` | `string` |  | identify by DOI |
+| `--pmid` | `string` |  | identify by PubMed ID |
+
 ## `papio inbox`
 
 Show the triage inbox

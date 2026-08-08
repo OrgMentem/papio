@@ -1,15 +1,23 @@
 /* Brand style: papio is set lowercase-italic wherever it appears as prose.
    The header site name comes from site_name (plain text), so the italic is
-   applied here instead. */
+   applied here instead. Custom classes use the `mdx-` prefix so they never
+   collide with theme internals, which own `md-`. */
 .md-header__topic .md-ellipsis,
 .md-nav--primary > .md-nav__title {
   font-style: italic;
 }
 
+/* Hero geometry, shared with the landing body below so the two columns
+   cannot drift apart. */
+:root {
+  --mdx-hero-mark: 13rem; /* width of the art column */
+  --mdx-hero-gap: 2.4rem; /* gap between art and copy */
+  --mdx-hero-pad: 0.8rem; /* grid inset, matches .md-grid */
+  --mdx-measure: 34.4rem; /* body measure on pages that keep both sidebars */
+}
+
 /* Landing hero (overrides/home.html): animated wordmark left, positioning
-   copy right, full page width because index.md hides both sidebars. Custom
-   classes use the `mdx-` prefix so they never collide with theme internals,
-   which own `md-`. */
+   copy right, full page width because index.md hides both sidebars. */
 
 .mdx-hero {
   border-bottom: 0.05rem solid var(--md-default-fg-color--lightest);
@@ -18,10 +26,25 @@
 
 .mdx-hero__inner {
   display: grid;
-  grid-template-columns: minmax(0, 13rem) minmax(0, 1fr);
+  grid-template-columns: minmax(0, var(--mdx-hero-mark)) minmax(0, 1fr);
   align-items: center;
-  gap: 2.4rem;
-  padding: 2.4rem 0.8rem;
+  gap: var(--mdx-hero-gap);
+  padding: 2.4rem var(--mdx-hero-pad);
+}
+
+/* Hiding both sidebars would stretch body text across the full 61rem grid.
+   Hold the ordinary reading measure and start the column under the hero
+   headline, so the mark reads as a margin figure. The min() drops the indent
+   before it would squeeze the measure, so this needs no breakpoint: the text
+   slides back to the left edge on narrow viewports. Article and hero share
+   the same 0.8rem grid inset, so the indent is just the art column plus the
+   gap. */
+.mdx-landing {
+  max-width: var(--mdx-measure);
+  margin-left: min(
+    calc(var(--mdx-hero-mark) + var(--mdx-hero-gap)),
+    max(0px, 100% - var(--mdx-measure))
+  );
 }
 
 /* The two ink variants are stacked and cross-faded instead of using the
