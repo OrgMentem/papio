@@ -379,6 +379,13 @@
       .pb-row[data-status="queued"] .pb-row-status {
         color: var(--color-context);
       }
+      .pb-row[data-status="owned_with_pdf"] .pb-row-status {
+        color: var(--color-ok);
+      }
+
+      .pb-row[data-status="owned_with_pdf"] .pb-row-status::before {
+        content: "✓ ";
+      }
 
       #empty-state {
         color: var(--color-muted);
