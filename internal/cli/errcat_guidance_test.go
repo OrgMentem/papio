@@ -147,6 +147,7 @@ func TestActionGuidanceCommandsApplyToEveryActionKind(t *testing.T) {
 		"terms_acceptance_required",
 		"openurl_available",
 		"downloads_access_required",
+		"pdf_identifier_needed",
 	}
 	for _, kind := range kinds {
 		for _, requiresAuth := range []bool{false, true} {

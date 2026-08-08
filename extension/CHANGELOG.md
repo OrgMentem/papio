@@ -16,6 +16,34 @@ for the full pre-split extension history.
 
 ## [Unreleased]
 
+### Added
+
+- **One sign-in tab per institution.** Three papers that all need the same
+  institutional sign-in used to each open their own IdP login tab — logging
+  in on one never resumed the other two, which sat on a dead resolver page
+  until the operator noticed and drove them by hand. A handoff whose login
+  wall would open a *second* tab at an IdP already being signed in on now
+  parks instead, quietly, at the provider page it was already on. Completing
+  sign-in in the one open tab resumes every paper waiting on that
+  institution automatically, through the same two-at-a-time drive governor
+  as any other handoff.
+- **Open PDF tabs can now be grabbed from the selection workspace.** When the
+  tab URL has no recognizable identifier, Chrome offers a one-click grab row;
+  Firefox shows the row disabled with honest download-steering guidance, and
+  grab outcomes report job creation, existing library ownership, or the need
+  for an identifier directly in the row.
+
+### Changed
+
+- **OpenAlex works-search pages now detect every result on the page.**
+  `openalex.org` result cards carry no `doi.org` anchor at all — the title
+  itself links to `openalex.org/works/w<digits>` — so the bulk-selection
+  scanner previously caught only the rare row with a stray publisher DOI
+  link. It now recognizes the OpenAlex work-id link directly (`openalex`
+  kind, normalized to uppercase `W<digits>`), so a page of 25 works detects
+  all 25. A card that also carries a registered DOI/arXiv/PMID link still
+  produces exactly one row, keyed on that registered identifier.
+
 ## [0.11.0] - 2026-08-08
 
 ### Added

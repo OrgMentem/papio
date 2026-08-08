@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -34,8 +35,10 @@ import (
 	"papio/internal/captures"
 	"papio/internal/config"
 	"papio/internal/delivery"
+	"papio/internal/grab"
 	"papio/internal/job"
 	"papio/internal/ownership"
+	"papio/internal/pdf"
 	"papio/internal/preview"
 	"papio/internal/protocol"
 	"papio/internal/store"
@@ -65,10 +68,22 @@ const (
 	pageCaptureTermsFeature      = "page_capture_terms_v1"
 	pageBulkAcquireFeature       = "page_bulk_acquire_v1"
 	triageSnapshotSchema3Feature = "triage_snapshot_schema_v3"
+	// pdfGrabV1Feature is ADR-0020's PDF-grab capability flag: it gates both
+	// the pdf_grab_request/pdf_grab_result message pair and, extension-side,
+	// whether the workspace even renders the grab row.
+	pdfGrabV1Feature = "pdf_grab_v1"
 	// pageBulkConsumer is the sole daemon-assigned consumer for every job
 	// created through page_bulk_submit_request (ADR-0019 Decision 6). The
 	// extension never supplies it.
-	pageBulkConsumer         = "browser-page"
+	pageBulkConsumer = "browser-page"
+	// pdfGrabConsumerPrefix names every job a PDF grab creates or joins
+	// (ADR-0020 Decision 4): "browser-pdf:<host>", the bare tab host the
+	// grab came from.
+	pdfGrabConsumerPrefix = "browser-pdf:"
+	// grabsDirName is the reserved subtree under the adoption root holding
+	// one directory per grab id (SweepTerminalAdoptions's unknown-dir
+	// hygiene must never treat it as a stray job directory).
+	grabsDirName             = "grabs"
 	previewCapabilityTTL     = 10 * time.Minute
 	sessionEvidenceThrottle  = 60 * time.Second
 	deliveryContextTTL       = 60 * time.Second
@@ -181,6 +196,11 @@ type Bridge struct {
 	preview      *preview.Server
 	captureStore *captures.Store
 	cfg          config.Config
+	// grabs owns pdf_grabs (ADR-0020); constructed internally in NewBridge
+	// from jobs.S rather than threaded through the constructor signature —
+	// it shares the same *store.Store every other job.Store-backed accessor
+	// in this package does.
+	grabs *grab.Service
 
 	// Version and Features are daemon capabilities announced in hello_ack.
 	Version  string
@@ -295,10 +315,15 @@ const pendingExpireAfter = 5 * time.Minute
 // with holdings) — page_bulk_status then never consults it.
 func NewBridge(jobs *job.Store, svc *app.Service, triageService *triage.Service, watchRunner *watch.Runner, previewServer *preview.Server, captureStore *captures.Store, holdings holdingsProvider, zotioService *zotio.Service, cfg config.Config, version string) *Bridge {
 	required := []string{
-		pageAcquireFeature, triageSnapshotFeature, triageSnapshotSchema2Feature, triageMutationsFeature, reviewPreviewFeature, statsFeature, pageCaptureFeature, pageCaptureRequestFeature, activityFeedFeature, triageCountsSchema2Feature, sessionEvidenceFeature, deliveryContextFeature, pageCaptureTermsFeature, pageBulkAcquireFeature, triageSnapshotSchema3Feature,
+		pageAcquireFeature, triageSnapshotFeature, triageSnapshotSchema2Feature, triageMutationsFeature, reviewPreviewFeature, statsFeature, pageCaptureFeature, pageCaptureRequestFeature, activityFeedFeature, triageCountsSchema2Feature, sessionEvidenceFeature, deliveryContextFeature, pageCaptureTermsFeature, pageBulkAcquireFeature, triageSnapshotSchema3Feature, pdfGrabV1Feature,
+	}
+	var grabs *grab.Service
+	if jobs != nil {
+		grabs = grab.New(jobs.S, nil)
 	}
 	return &Bridge{
 		jobs: jobs, svc: svc, triage: triageService, watchRunner: watchRunner, preview: previewServer, captureStore: captureStore, holdings: holdings, zotio: zotioService, cfg: cfg,
+		grabs:            grabs,
 		Version:          version,
 		Features:         required,
 		offered:          map[string]bool{},
@@ -734,7 +759,7 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 		switch msg.Type {
 		case protocol.MsgPageAcquire, protocol.MsgTriageSnapshotRequest, protocol.MsgTriageCountsRequest,
 			protocol.MsgTriageDecide, protocol.MsgHumanActionResolve, protocol.MsgDeliveryReconcileRequest, protocol.MsgReviewPreviewRequest, protocol.MsgStatsRequest, protocol.MsgActivityRequest, protocol.MsgPageCapture,
-			protocol.MsgPageBulkStatusRequest, protocol.MsgPageBulkSubmitRequest:
+			protocol.MsgPageBulkStatusRequest, protocol.MsgPageBulkSubmitRequest, protocol.MsgPdfGrabRequest:
 			// Stateless request/response traffic works from any browser —
 			// even an outdated one; every frame is protocol-validated
 			// regardless of version. "Acquire this page" and the inbox must
@@ -783,6 +808,9 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 
 	case protocol.MsgPageBulkSubmitRequest:
 		return b.pageBulkSubmit(ctx, msg.Payload.(*protocol.PageBulkSubmitRequestPayload))
+
+	case protocol.MsgPdfGrabRequest:
+		return b.pdfGrab(ctx, msg.Payload.(*protocol.PdfGrabRequestPayload))
 
 	case protocol.MsgPageCapture:
 		b.pageCapture(ctx, sessionID, msg.JobID, msg.Payload.(*protocol.PageCapturePayload))
@@ -1542,11 +1570,36 @@ func (b *Bridge) humanActionResolve(ctx context.Context, request *protocol.Human
 		return b.humanActionResolveResult(request.RequestID, "error", "jobs are not configured")
 	}
 	if request.Verdict == "dismiss" {
-		if _, err := b.jobs.DismissHumanAction(ctx, request.ActionID, request.ExpectedRevision); err != nil {
+		var dismissedKind string
+		actions, listErr := b.jobs.ListHumanActions(ctx, true)
+		if listErr != nil {
+			return b.humanActionResolveResult(request.RequestID, "error", listErr.Error())
+		}
+		for _, action := range actions {
+			if action.ID == request.ActionID {
+				dismissedKind = action.Kind
+				break
+			}
+		}
+		if dismissedKind == "" {
+			return b.humanActionResolveResult(request.RequestID, "error", "human action not found")
+		}
+		jobID, err := b.jobs.DismissHumanAction(ctx, request.ActionID, request.ExpectedRevision)
+		if err != nil {
 			if errors.Is(err, job.ErrConflict) {
 				return b.humanActionResolveResult(request.RequestID, "conflict", "")
 			}
 			return b.humanActionResolveResult(request.RequestID, "error", err.Error())
+		}
+		// pdf_identifier_needed dismisses cancel nothing (job.
+		// dismissalCancelsParkedJob deliberately excludes it, same as
+		// downloads_access_required) — the title-only job it parked stays.
+		// The grab bookkeeping itself is discarded instead: it has no
+		// remaining purpose once its human action is closed.
+		if dismissedKind == job.ActionKindPdfIdentifierNeeded && b.grabs != nil {
+			if g, gErr := b.grabs.ByJobID(ctx, jobID); gErr == nil && g != nil {
+				_ = b.grabs.Delete(ctx, g.ID)
+			}
 		}
 		if b.preview != nil {
 			b.preview.Revoke(request.ActionID)
@@ -1986,6 +2039,13 @@ func (b *Bridge) pageBulkZotioLookup(ctx context.Context, ids []protocol.PageBul
 		case ownership.KindPMID:
 			work.PMID = value
 		default:
+			// zotio.LookupWork has no W-id field — DOI/ArXiv/PMID only — so an
+			// "openalex" row (a real, reachable kind since normalizePageBulk
+			// Identifier learned it) is deliberately never entered here. It
+			// never reaches zotio at all; pageBulkStatusItem's default
+			// ownership branch skips the generic holdings registry for it
+			// too, so its completeness follows neither source (bridge_test.go's
+			// TestPageBulkStatusOpenAlexWOnlyRowSkipsZotioAndFollowsLedger).
 			continue
 		}
 		entries = append(entries, entry{key: kind + ":" + value, work: work})
@@ -2062,6 +2122,19 @@ func (b *Bridge) pageBulkStatusItem(ctx context.Context, id protocol.PageBulkIde
 	case previouslyUnavailable:
 		item.Status = "previously_unavailable"
 	default:
+		if kind != ownership.KindDOI && kind != ownership.KindArXiv && kind != ownership.KindPMID {
+			// Neither zotio (pageBulkZotioLookup's LookupWork carries only
+			// DOI/ArXiv/PMID — an openalex row never reaches zotioLookup at
+			// all) nor the generic holdings registry (pageBulkOwnershipQuery
+			// below answers the same three kinds only) can classify this
+			// identifier — an OpenAlex-only row today. Report the ordinary
+			// not-yet-checked state without ever calling either source: its
+			// completeness follows the same unchecked-source semantics as any
+			// other identifier no configured source covers, and this can
+			// never manufacture a false eligible-and-complete claim.
+			item.Status = "ownership_incomplete"
+			break
+		}
 		decision, complete := b.pageBulkOwnership(ctx, pageBulkOwnershipQuery(kind, value))
 		// zotioConfident is true only when this round actually reached zotio
 		// and got back a trustworthy (non-stale) answer, which — having
@@ -2129,6 +2202,9 @@ func normalizePageBulkIdentifier(kind, value string) (string, string, error) {
 		return kind, normalized, err
 	case "arxiv":
 		normalized, err := work.NormalizeArXiv(value)
+		return kind, normalized, err
+	case "openalex":
+		normalized, err := work.NormalizeOpenAlex(value)
 		return kind, normalized, err
 	default:
 		return "", "", fmt.Errorf("unsupported identifier kind %q", kind)
@@ -2265,6 +2341,8 @@ func pageBulkIdentifierOf(wr protocol.WorkRequest) (string, string, bool) {
 		return "arxiv", ids.ArXiv, true
 	case ids.PMID != "":
 		return "pmid", ids.PMID, true
+	case ids.OpenAlex != "":
+		return "openalex", ids.OpenAlex, true
 	}
 	return "", "", false
 }
@@ -2291,6 +2369,8 @@ func pageBulkWorkRequest(canonicalKey string) (protocol.WorkRequest, bool) {
 		ids.PMID = normValue
 	case "arxiv":
 		ids.ArXiv = normValue
+	case "openalex":
+		ids.OpenAlex = normValue
 	}
 	sum := sha256.Sum256([]byte(canonicalKey))
 	return protocol.WorkRequest{
@@ -2315,6 +2395,55 @@ func (b *Bridge) recordPageBulkRun(ctx context.Context, source protocol.PageBulk
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 		source.Detector, source.Origin, selected, submitted, invalid, batchID, ts, ts)
 	return err
+}
+
+// pdfGrab allocates a PDF grab (ADR-0020 Decision 3): a grab id and a
+// steering directory under the reserved grabs/ namespace. It never touches
+// the requested URL itself — only chrome.downloads.download, steered by the
+// extension, ever fetches those bytes, riding the user's own session.
+// Structured refusal only, never a raw error: an unhandled outcome here
+// would decode fine on the extension side but defeat the whole point of a
+// closed outcome enum a UI can safely switch on.
+func (b *Bridge) pdfGrab(ctx context.Context, request *protocol.PdfGrabRequestPayload) ([]json.RawMessage, error) {
+	if b.grabs == nil {
+		return b.pdfGrabRefusal(request.RequestID, "", "unavailable", "pdf grab is not configured")
+	}
+	if b.adoptionLatchUnhealthy() {
+		return b.pdfGrabRefusal(request.RequestID, "", "unavailable",
+			"the adoption folder is not responding (macOS privacy consent?); try again after granting access")
+	}
+	parsed, err := url.Parse(request.URL)
+	if err != nil || parsed.Hostname() == "" {
+		return b.pdfGrabRefusal(request.RequestID, "", "not_supported", "the tab URL could not be reduced to a host")
+	}
+	g, err := b.grabs.Allocate(ctx, parsed.Hostname(), truncate(request.Title, 500))
+	if err != nil {
+		log.Printf("papio: pdf grab allocation failed: %v", err)
+		return b.pdfGrabRefusal(request.RequestID, "", "unavailable", "could not allocate a grab")
+	}
+	dir := filepath.Join(b.cfg.EffectiveAdoptionRoot(), grabsDirName, g.ID)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		log.Printf("papio: pdf grab directory %s: %v", dir, err)
+		return b.pdfGrabRefusal(request.RequestID, g.ID, "unavailable", "could not prepare the capture directory")
+	}
+	frame, err := b.frame(protocol.MsgPdfGrabResult, "", protocol.PdfGrabResultPayload{
+		RequestID: request.RequestID, GrabID: g.ID, Outcome: "steering",
+		SteeringPath: "papio/" + grabsDirName + "/" + g.ID + "/",
+	})
+	if err != nil {
+		return nil, err
+	}
+	return []json.RawMessage{frame}, nil
+}
+
+func (b *Bridge) pdfGrabRefusal(requestID, grabID, outcome, detail string) ([]json.RawMessage, error) {
+	frame, err := b.frame(protocol.MsgPdfGrabResult, "", protocol.PdfGrabResultPayload{
+		RequestID: requestID, GrabID: grabID, Outcome: outcome, Detail: detail,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return []json.RawMessage{frame}, nil
 }
 
 // pruneDeliveryMetadata drops unpaired frames after the short handoff window.
@@ -3142,7 +3271,13 @@ func (b *Bridge) recordAdoptionDeferred(ctx context.Context, jobID, filename str
 // than one visible file is ambiguous and adopts nothing. The returned name
 // feeds adopt(), which re-applies full confinement checks.
 func (b *Bridge) scanAdoptionDir(_ context.Context, jobID string) (string, bool) {
-	dir := filepath.Join(b.cfg.EffectiveAdoptionRoot(), jobID)
+	return b.settledFileIn(filepath.Join(b.cfg.EffectiveAdoptionRoot(), jobID))
+}
+
+// settledFileIn is scanAdoptionDir's directory-scan rule, factored out so
+// SweepGrabs's per-grab landing directory (ADR-0020) shares the exact same
+// settled-file heuristic as ordinary job adoption.
+func (b *Bridge) settledFileIn(dir string) (string, bool) {
 	entries, err := b.readAdoptionDir(dir)
 	if err != nil {
 		return "", false // no directory yet, scan suspended/timed out, or unreadable
@@ -3193,7 +3328,7 @@ func (b *Bridge) SweepAdoptions(ctx context.Context) error {
 		return err
 	}
 	for _, e := range entries {
-		if !e.IsDir() || e.Name() == "rejected" {
+		if !e.IsDir() || e.Name() == "rejected" || e.Name() == grabsDirName {
 			continue
 		}
 		jobID := e.Name()
@@ -3227,8 +3362,12 @@ func (b *Bridge) SweepAdoptions(ctx context.Context) error {
 // are load-bearing and never swept: awaiting_human handoffs may still receive a
 // download, and needs_review inspection files are referenced by open actions.
 // The rejected/ sibling directory, which deliberately preserves files a human
-// must re-supply, is left untouched. Best-effort, idempotent, and safe on a
-// timer.
+// must re-supply, is left untouched. So is the grabs/ sibling (ADR-0020): it
+// is a reserved namespace of its own, holding one directory per grab id
+// rather than per job id, and SweepGrabs owns its lifecycle — treating it as
+// an unknown job directory here would try (and, since it is never empty
+// while a grab is live, harmlessly fail to) rmdir a live grab every tick.
+// Best-effort, idempotent, and safe on a timer.
 func (b *Bridge) SweepTerminalAdoptions(ctx context.Context) error {
 	root := b.cfg.EffectiveAdoptionRoot()
 	entries, err := b.readAdoptionDir(root)
@@ -3242,7 +3381,7 @@ func (b *Bridge) SweepTerminalAdoptions(ctx context.Context) error {
 		return err
 	}
 	for _, e := range entries {
-		if !e.IsDir() || e.Name() == "rejected" {
+		if !e.IsDir() || e.Name() == "rejected" || e.Name() == grabsDirName {
 			continue
 		}
 		row, err := b.jobs.Get(ctx, e.Name())
@@ -3266,8 +3405,252 @@ func (b *Bridge) SweepTerminalAdoptions(ctx context.Context) error {
 	return nil
 }
 
-// RunSweeper calls SweepAdoptions and SweepTerminalAdoptions on an interval
-// until ctx is cancelled.
+// SweepGrabs advances every PDF grab whose settled file has landed in its
+// own grabs/<grab-id>/ landing directory (ADR-0020 Decision 3/4),
+// independently of whether the extension is connected. It shares
+// readAdoptionDir's bounded, latch-aware reader with
+// SweepAdoptions/SweepTerminalAdoptions, so a TCC consent wall on the
+// adoption root defers grab sweeping exactly the way it defers ordinary
+// adoption — a latch-hung root skips this tick entirely, same as those.
+func (b *Bridge) SweepGrabs(ctx context.Context) error {
+	if b.grabs == nil {
+		return nil
+	}
+	root := filepath.Join(b.cfg.EffectiveAdoptionRoot(), grabsDirName)
+	entries, err := b.readAdoptionDir(root)
+	if errors.Is(err, ErrAdoptionScanTimeout) {
+		return nil // root not responding (TCC); latch already logged, skip this tick
+	}
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		id := e.Name()
+		g, err := b.grabs.Get(ctx, id)
+		if err != nil {
+			continue // store hiccup: not evidence the grab is unknown — leave it
+		}
+		if g == nil {
+			// Confirmed-unknown dir: the same hygiene SweepTerminalAdoptions
+			// applies to a stray job directory — remove only if empty, never
+			// touch contents a human may need. os.Remove has rmdir
+			// semantics, so a concurrently landing file can never be eaten.
+			_ = os.Remove(filepath.Join(root, id))
+			continue
+		}
+		if g.State != grab.StateAwaitingFile && g.State != grab.StateQuarantined {
+			continue // already terminal; nothing left to do here
+		}
+		var name string
+		if g.State == grab.StateAwaitingFile {
+			var ok bool
+			name, ok = b.settledFileIn(filepath.Join(root, id))
+			if !ok {
+				continue
+			}
+		}
+		if err := b.processSettledGrab(ctx, g, filepath.Join(root, id), name); err != nil {
+			log.Printf("papio: pdf grab %s processing failed: %v", id, err)
+		}
+	}
+	return nil
+}
+
+// processSettledGrab runs ADR-0020 Decision 4's identification pipeline on
+// one settled grab file: quarantine, structural validation, then
+// front-matter DOI extraction. No network fetch is ever needed for the
+// artifact itself — MatchIdentity and documentDOIs both read local text.
+func (b *Bridge) processSettledGrab(ctx context.Context, g *grab.Grab, dir, name string) error {
+	if b.svc == nil || b.svc.Artifacts == nil || b.svc.Validate == nil {
+		return errors.New("acquisition service is not configured")
+	}
+	path := filepath.Join(dir, name)
+	temp := g.QuarantinePath
+	if g.State != grab.StateQuarantined || temp == "" {
+		qdir, err := b.svc.Artifacts.QuarantineDir(g.ID)
+		if err != nil {
+			return err
+		}
+		temp = filepath.Join(qdir, "grab.pdf")
+		if err := copyFile(path, temp); err != nil {
+			_ = os.Remove(temp)
+			return err
+		}
+		if err := b.grabs.MarkQuarantined(ctx, g.ID, temp); err != nil {
+			_ = os.Remove(temp)
+			return err
+		}
+	}
+	report, err := b.svc.Validate(ctx, temp, "application/pdf", work.Work{})
+	if err != nil {
+		// Infrastructure failure (worker unavailable, deadline): leave the
+		// row in quarantined for the next tick to retry, rather than
+		// declaring the file invalid on a bounds failure that says nothing
+		// about the PDF itself.
+		return err
+	}
+	if !report.Payload.OK || !report.Structural.Valid {
+		_ = os.Remove(temp)
+		_ = os.RemoveAll(dir)
+		return b.grabs.MarkFailedValidation(ctx, g.ID, "the captured file is not a valid PDF")
+	}
+	// No target work.Work exists yet, so only the front-matter DOI pattern
+	// applies — corroboratingIdentifier's arXiv/PMID markers compare against
+	// a KNOWN identifier and do not apply here (see pdf.FrontMatterDOIs).
+	dois := pdf.FrontMatterDOIs(report.Text.Excerpt)
+	if len(dois) == 0 {
+		return b.parkGrabNoIdentifier(ctx, g, temp, dir)
+	}
+	return b.createGrabJob(ctx, g, dois[0], temp, dir, name)
+}
+
+// parkGrabNoIdentifier implements ADR-0020 Decision 4's "no identifier"
+// branch: a title-only job, created solely to host a pdf_identifier_needed
+// human action, never entering ordinary resolution (no candidates, no fetch
+// attempt) — so ADR-0019's title-only submission ban stays intact.
+func (b *Bridge) parkGrabNoIdentifier(ctx context.Context, g *grab.Grab, quarantinePath, landingDir string) error {
+	title := strings.TrimSpace(g.Title)
+	if title == "" {
+		title = g.URLHost
+	}
+	mode, err := b.cfg.RequireAccessMode()
+	if err != nil {
+		return err
+	}
+	result, err := b.jobs.CreateRequestForWork(ctx, job.NewID("wr"), work.Work{Title: title}, "", "",
+		job.Policy{AccessMode: mode, DesiredVersion: "any", FetchMaxBytes: b.cfg.Fetch.MaxBytes},
+		nil, job.Attribution{Principal: job.PrincipalUnknown, Consumer: pdfGrabConsumerPrefix + g.URLHost}, false)
+	if err != nil {
+		return err
+	}
+	if err := b.parkGrabJob(ctx, result.JobID); err != nil {
+		return err
+	}
+	caption := g.URLHost
+	if title != "" && title != g.URLHost {
+		caption = fmt.Sprintf("%s (%q)", g.URLHost, title)
+	}
+	if _, err := b.jobs.OpenHumanAction(ctx, result.JobID, job.ActionKindPdfIdentifierNeeded,
+		fmt.Sprintf("%s — quarantine: %s", caption, quarantinePath), job.Access(false, "")); err != nil {
+		return err
+	}
+	_ = os.RemoveAll(landingDir)
+	return b.grabs.MarkParkedNoIdentifier(ctx, g.ID, result.JobID)
+}
+
+// parkGrabJob moves a freshly created, title-only grab job onto
+// awaiting_human through the legal queued->resolving->awaiting_human edges,
+// mirroring internal/app's parkForBrowserAdoption exactly — the same
+// existing seam a browser-adopted download uses to reach the same state
+// without ever entering an ordinary resolution attempt.
+func (b *Bridge) parkGrabJob(ctx context.Context, jobID string) error {
+	const reason = "pdf_grab_no_identifier"
+	for range 4 {
+		row, err := b.jobs.Get(ctx, jobID)
+		if err != nil {
+			return err
+		}
+		switch row.State {
+		case job.StateAwaitingHuman:
+			return nil
+		case job.StateQueued:
+			err = b.jobs.Transition(ctx, jobID, job.StateQueued, job.StateResolving, map[string]any{"reason": reason})
+		case job.StateResolving, job.StateFetching:
+			err = b.jobs.Transition(ctx, jobID, row.State, job.StateAwaitingHuman, map[string]any{"reason": reason})
+			if err == nil {
+				return nil
+			}
+		default:
+			return fmt.Errorf("job %s is not parkable for a pdf grab while in state %s", jobID, row.State)
+		}
+		if err == nil {
+			continue
+		}
+		if !errors.Is(err, job.ErrConflict) {
+			return err
+		}
+	}
+	return fmt.Errorf("job %s changed while parking for a pdf grab", jobID)
+}
+
+// createGrabJob implements ADR-0020 Decision 4's "identifier found" branch.
+// Ledger dedupe (ADR-0010) applies naturally through the same
+// CreateRequestForWork every other submission path uses: an already-live job
+// for this DOI is joined, never duplicated, and reports "already_owned"
+// instead of creating a second job.
+func (b *Bridge) createGrabJob(ctx context.Context, g *grab.Grab, doi, quarantinePath, landingDir, filename string) error {
+	mode, err := b.cfg.RequireAccessMode()
+	if err != nil {
+		return err
+	}
+	result, err := b.jobs.CreateRequestForWork(ctx, job.NewID("wr"), work.Work{DOI: doi}, "", "",
+		job.Policy{AccessMode: mode, DesiredVersion: "any", FetchMaxBytes: b.cfg.Fetch.MaxBytes},
+		nil, job.Attribution{Principal: job.PrincipalUnknown, Consumer: pdfGrabConsumerPrefix + g.URLHost}, false)
+	if err != nil {
+		return err
+	}
+	_ = os.Remove(quarantinePath) // superseded either way — see the two branches below
+	if result.Existing {
+		_ = os.RemoveAll(landingDir)
+		return b.grabs.MarkJobCreated(ctx, g.ID, result.JobID, "already_owned")
+	}
+	// No candidate-injection seam exists for a local file (InsertCandidates
+	// predates a job and has no "local file" source), so this places the
+	// captured bytes in the job's OWN adoption directory — the same landing
+	// spot a real steered chrome.downloads.download would use — and lets the
+	// existing, already-tested adopt() claim it: structural + identity
+	// validation against the DOI's registrar metadata, exactly as any other
+	// acquisition receives (ADR-0020 Decision 4).
+	jobDir := filepath.Join(b.cfg.EffectiveAdoptionRoot(), result.JobID)
+	if err := os.MkdirAll(jobDir, 0o700); err != nil {
+		return err
+	}
+	dest := filepath.Join(jobDir, filename)
+	if err := os.Rename(filepath.Join(landingDir, filename), dest); err != nil {
+		return err
+	}
+	_ = os.Remove(landingDir) // rmdir semantics: only removes now that it's empty
+	if err := b.grabs.MarkJobCreated(ctx, g.ID, result.JobID, "job_created"); err != nil {
+		return err
+	}
+	if _, err := b.adopt(ctx, result.JobID, filename); err != nil {
+		if evErr := b.recordAdoptionDeferred(ctx, result.JobID, filename, err); evErr != nil {
+			return evErr
+		}
+	}
+	return nil
+}
+
+// copyFile streams src into a freshly created dst. Unlike copyHashed
+// (internal/app), grabs need no content hash at this stage: the copy exists
+// only for structural validation and DOI extraction, ahead of any job or
+// candidate that would key on it.
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = in.Close() }()
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = out.Close() }()
+	_, err = io.Copy(out, in)
+	return err
+}
+
+// RunSweeper calls SweepGrabs, SweepAdoptions, and SweepTerminalAdoptions on
+// an interval until ctx is cancelled. SweepGrabs runs first so a grab that
+// creates a job and places its file in that job's own adoption directory is
+// claimed by SweepAdoptions in the very same tick, never waiting a full
+// interval for a second pass.
 // Cancellation is a normal shutdown and returns nil. Per-job adoption failures
 // are recorded as durable browser.adoption_deferred events inside
 // SweepAdoptions; a transient store-level sweep error is retried on the next
@@ -3284,6 +3667,9 @@ func (b *Bridge) RunSweeper(ctx context.Context, interval time.Duration) error {
 		case <-ctx.Done():
 			return nil
 		case <-t.C:
+			if err := b.SweepGrabs(ctx); err != nil && ctx.Err() != nil {
+				return nil
+			}
 			if err := b.SweepAdoptions(ctx); err != nil {
 				if ctx.Err() != nil {
 					return nil
@@ -3589,6 +3975,24 @@ func (b *Bridge) poll(ctx context.Context) ([]json.RawMessage, error) {
 			}
 			out = append(out, frame)
 			pending.delivered = true
+		}
+	}
+	if b.grabs != nil {
+		pending, err := b.grabs.PendingNotifications(ctx, 10)
+		if err != nil {
+			return nil, err
+		}
+		for _, g := range pending {
+			frame, err := b.frame(protocol.MsgPdfGrabResult, "", protocol.PdfGrabResultPayload{
+				GrabID: g.ID, Outcome: g.Outcome, Detail: g.Detail,
+			})
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, frame)
+			if err := b.grabs.MarkNotified(ctx, g.ID); err != nil {
+				return nil, err
+			}
 		}
 	}
 	return out, nil

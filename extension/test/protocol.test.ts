@@ -502,7 +502,7 @@ test("page bulk status and submit messages round-trip through the shared corpus"
     readFileSync(join(corpusRoot, "valid", "browser-page-bulk-status-request.json"), "utf8"),
   );
   expect(statusRequest.type).toBe("page_bulk_status_request");
-  expect((statusRequest.payload["identifiers"] as unknown[]).length).toBe(3);
+  expect((statusRequest.payload["identifiers"] as unknown[]).length).toBe(4);
   expect(statusRequest.payload["rendered_record_count_hint"]).toBe(12);
 
   const statusResult = parseBrowserMessageBytes(
@@ -584,11 +584,12 @@ test("page_bulk_status_request rejects malformed identifiers", () => {
     payload,
   });
   const validIdentifier = { local_id: "row-1", kind: "doi", value: "10.1000/example.42" };
+  const openalexIdentifier = { local_id: "row-2", kind: "openalex", value: "W2741809807" };
 
   expect(parseBrowserMessage(frame({
-    request_id: "request-bulk-0001", scan_id: "scan-bulk-0001", identifiers: [validIdentifier],
+    request_id: "request-bulk-0001", scan_id: "scan-bulk-0001", identifiers: [validIdentifier, openalexIdentifier],
   })).payload).toEqual({
-    request_id: "request-bulk-0001", scan_id: "scan-bulk-0001", identifiers: [validIdentifier],
+    request_id: "request-bulk-0001", scan_id: "scan-bulk-0001", identifiers: [validIdentifier, openalexIdentifier],
   });
 
   for (const identifiers of [

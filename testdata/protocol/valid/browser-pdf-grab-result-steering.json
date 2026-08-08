@@ -1,0 +1,1 @@
+{"protocol":"papio-browser/1","type":"pdf_grab_result","msg_id":"pdf-grab-result-001","seq":21,"payload":{"request_id":"pdf-grab-request-frame","grab_id":"grab_0123456789abcdef01234567","outcome":"steering","steering_path":"papio/grabs/grab_0123456789abcdef01234567/"}}

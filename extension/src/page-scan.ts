@@ -15,7 +15,12 @@
 export interface DetectedPaper {
   localId: string;
   detector: "generic-identifiers/1";
-  identifier: { kind: "doi" | "pmid" | "arxiv"; value: string };
+  /** Identifier rows omit kind; the PDF-tab affordance carries kind plus
+   * the source URL/title instead of an identifier. */
+  kind?: "pdf_grab";
+  identifier: { kind: "doi" | "pmid" | "arxiv" | "openalex"; value: string };
+  url?: string;
+  title?: string;
   /** Up to 240 normalized characters of the nearest citation-shaped
    * container's visible text (ADR-0019 Decision 3). Never acquisition
    * identity — display only. */
@@ -43,7 +48,7 @@ export type ScanResult = { papers: DetectedPaper[]; truncated: boolean; rendered
 /** Raw-candidate cap before the scan stops walking the DOM (Decision 3). */
 export const PAGE_BULK_RAW_CANDIDATE_CAP = 200;
 
-export function scanDocument(root: Document | Element = document): ScanResult {
+export function scanDocument(root: Document | Element | string = document, tabURL?: string): ScanResult {
   const MAX_RAW = 200;
   const MAX_LABEL_CHARS = 240;
   const SKIP_TAGS: Record<string, true> = { SCRIPT: true, STYLE: true, NOSCRIPT: true, TEMPLATE: true };
@@ -80,7 +85,7 @@ export function scanDocument(root: Document | Element = document): ScanResult {
     }
   }
 
-  type Identifier = { kind: "doi" | "pmid" | "arxiv"; value: string };
+  type Identifier = { kind: "doi" | "pmid" | "arxiv" | "openalex"; value: string };
 
   /** Recognized-link recognition order (Decision 3): doi.org, publisher
    * /doi/10.x paths, arXiv /abs|/pdf, PubMed article URLs. */
@@ -99,7 +104,7 @@ export function scanDocument(root: Document | Element = document): ScanResult {
     }
     const doiPath = /\/doi\/(?:abs\/|full\/|e?pdf\/|full-xml\/)?(10\.\d{4,}\/[^?#]+)/i.exec(path);
     if (doiPath?.[1]) {
-      const doi = trimTrailingPunct(decodeSafe(doiPath[1]));
+      const doi = trimTrailingPunct(decodeSafe(doiPath[1]).replace(/\.pdf$/i, ""));
       if (STRICT_DOI_RE.test(doi)) return { kind: "doi", value: doi };
     }
     // Generic fallback: a DOI-shaped run starting at any path segment —
@@ -111,7 +116,7 @@ export function scanDocument(root: Document | Element = document): ScanResult {
     // DOI-registration check rather than acquiring anything wrong.
     const doiSegment = /\/(10\.\d{4,}\/[^?#]+?)(?:\.pdf)?\/?$/i.exec(path);
     if (doiSegment?.[1]) {
-      const doi = trimTrailingPunct(decodeSafe(doiSegment[1]));
+      const doi = trimTrailingPunct(decodeSafe(doiSegment[1]).replace(/\.pdf$/i, ""));
       if (STRICT_DOI_RE.test(doi)) return { kind: "doi", value: doi };
     }
     if (host === "arxiv.org" || host.endsWith(".arxiv.org")) {
@@ -122,14 +127,59 @@ export function scanDocument(root: Document | Element = document): ScanResult {
       const m = /^\/(\d+)\/?$/.exec(path);
       if (m?.[1]) return { kind: "pmid", value: m[1] };
     }
+    // OpenAlex work-search result cards carry no doi.org anchor at all —
+    // the title anchor itself is the W-id link (openalex.org/works/w<digits>,
+    // lowercase w in hrefs) — so this host-specific rule is the ONLY way
+    // most cards get detected. A bare /w<digits> path (no /works/ segment)
+    // is accepted too; the value is normalized to uppercase to match
+    // work.NormalizeOpenAlex's ^W[0-9]{4,12}$ (internal/work/identifiers.go).
+    if (host === "openalex.org" || host === "www.openalex.org" || host === "api.openalex.org") {
+      const m = /^\/(?:works\/)?([Ww]\d{4,12})\/?$/.exec(path);
+      if (m?.[1]) return { kind: "openalex", value: m[1].toUpperCase() };
+    }
     return null;
   }
 
   // nodeType !== 9 means root is an Element (not a Document), and every
   // Element attached to a parsed document has a non-null ownerDocument —
   // a well-known DOM invariant, not a fabricated shape.
+  // executeScript can pass the browser tab URL as the first argument while
+  // running inside a PDF viewer wrapper; the wrapper document's URL is not
+  // the URL the operator opened.
+  if (typeof root === "string") {
+    tabURL = root;
+    root = document;
+  }
   const doc: Document = root.nodeType === 9 ? (root as Document) : (root as Element).ownerDocument as Document;
-  const pageBase: string | undefined = doc.baseURI || doc.URL || undefined;
+  const pageBase: string | undefined = tabURL || doc.baseURI || doc.URL || undefined;
+  const openedURL = tabURL || doc.URL || pageBase || "";
+  let opened: URL | null = null;
+  try {
+    opened = new URL(openedURL);
+  } catch {
+    // A malformed tab URL cannot contribute an identifier or a grab row.
+  }
+  const contentType = (doc as Document & { contentType?: string }).contentType?.split(";", 1)[0]?.trim().toLowerCase();
+  const embeds = Array.from(doc.querySelectorAll("embed")).filter((embed) => {
+    const type = embed.getAttribute("type")?.toLowerCase();
+    return type === "application/pdf" || type === "application/x-pdf";
+  });
+  const embed = embeds.length === 1 ? (embeds[0] ?? null) : null;
+  const fullPageEmbed =
+    embed !== null &&
+    (embed.parentElement === doc.body && doc.body?.children.length === 1 ||
+      (() => {
+        const rect = embed.getBoundingClientRect();
+        const viewportWidth = doc.defaultView?.innerWidth ?? 0;
+        const viewportHeight = doc.defaultView?.innerHeight ?? 0;
+        return viewportWidth > 0 && viewportHeight > 0 &&
+          rect.width >= viewportWidth * 0.9 && rect.height >= viewportHeight * 0.9;
+      })());
+  const pdfTab =
+    contentType === "application/pdf" ||
+    fullPageEmbed ||
+    opened?.pathname.toLowerCase().endsWith(".pdf") === true;
+  const tabIdentifier = pdfTab && opened !== null ? identifierFromURL(opened.href, undefined) : null;
 
   function isHiddenSelf(el: Element): boolean {
     if (el.hasAttribute("hidden")) return true;
@@ -308,11 +358,21 @@ export function scanDocument(root: Document | Element = document): ScanResult {
     return candidate;
   }
 
-  function containerLabel(start: Element): string {
-    let container =
+  /** The same "nearest bounded citation-shaped container" containerLabel
+   * climbs to (see boundedAncestor above), extracted so Change #2's
+   * same-container kind-preference merge (below) groups candidates by
+   * exactly the card containerLabel itself would use — never a coarser or
+   * narrower notion of "container". */
+  function primaryContainer(start: Element): Element {
+    return (
       boundedAncestor(start) ??
       (typeof start.closest === "function" ? start.closest(CONTAINER_SELECTOR) : null) ??
-      start;
+      start
+    );
+  }
+
+  function containerLabel(start: Element): string {
+    let container = primaryContainer(start);
     // Definition lists split one citation across siblings by standardized
     // semantics: the <dt> carries the term (identifier + format links on
     // arXiv listings — pure chrome), the <dd> carries the description
@@ -363,13 +423,24 @@ export function scanDocument(root: Document | Element = document): ScanResult {
   }
 
   interface MergedEntry {
-    kind: "doi" | "pmid" | "arxiv";
+    kind: "doi" | "pmid" | "arxiv" | "openalex";
     value: string;
     label: string;
     occurrences: number;
   }
 
-  const merged = new Map<string, MergedEntry>();
+  interface Candidate {
+    identifier: Identifier;
+    startEl: Element;
+  }
+
+  // Raw candidates are collected here, unmerged: Change #2's same-container
+  // kind preference (a card yielding both a registered identifier and an
+  // openalex id produces ONE row keyed on the registered identifier) needs
+  // every candidate's container before it can decide which rows to emit,
+  // and that decision must not depend on DOM encounter order. Merging into
+  // final rows happens once, after the walk finishes (below).
+  const candidates: Candidate[] = [];
   let raw = 0;
   let truncated = false;
 
@@ -379,13 +450,7 @@ export function scanDocument(root: Document | Element = document): ScanResult {
       return;
     }
     raw += 1;
-    const key = `${identifier.kind}:${identifier.value.toLowerCase()}`;
-    let entry = merged.get(key);
-    if (entry === undefined) {
-      entry = { kind: identifier.kind, value: identifier.value, label: containerLabel(startEl), occurrences: 0 };
-      merged.set(key, entry);
-    }
-    entry.occurrences += 1;
+    candidates.push({ identifier, startEl });
   }
 
   function scanText(text: string, startEl: Element | null): void {
@@ -472,8 +537,59 @@ export function scanDocument(root: Document | Element = document): ScanResult {
   const startNode: Node = root.nodeType === 9 ? ((doc.body as Element | null) ?? doc.documentElement) : root;
   if (startNode) walk(startNode);
 
+  // Resolve registered identifiers (doi/pmid/arxiv) into rows first — a
+  // plain, order-independent pass — then fold any openalex candidate that
+  // shares its card's bounded container into that row's occurrence count
+  // instead of emitting a second row (Change #2). An openalex candidate
+  // with no registered sibling in its container becomes its own row,
+  // deduplicated by value exactly like every other kind.
+  const merged = new Map<string, MergedEntry>();
+  const registeredContainerKey = new Map<Element, string>();
+  for (const c of candidates) {
+    if (c.identifier.kind === "openalex") continue;
+    const key = `${c.identifier.kind}:${c.identifier.value.toLowerCase()}`;
+    let entry = merged.get(key);
+    if (entry === undefined) {
+      entry = { kind: c.identifier.kind, value: c.identifier.value, label: containerLabel(c.startEl), occurrences: 0 };
+      merged.set(key, entry);
+    }
+    entry.occurrences += 1;
+    const container = primaryContainer(c.startEl);
+    // A container carrying two registered identifiers keeps whichever was
+    // reached first in DOM order as the fold target for an OpenAlex sibling.
+    if (!registeredContainerKey.has(container)) registeredContainerKey.set(container, key);
+  }
+  for (const c of candidates) {
+    if (c.identifier.kind !== "openalex") continue;
+    const ownerKey = registeredContainerKey.get(primaryContainer(c.startEl));
+    const owner = ownerKey === undefined ? undefined : merged.get(ownerKey);
+    if (owner !== undefined) {
+      owner.occurrences += 1;
+      continue;
+    }
+    const key = `openalex:${c.identifier.value.toLowerCase()}`;
+    let entry = merged.get(key);
+    if (entry === undefined) {
+      entry = { kind: "openalex", value: c.identifier.value, label: containerLabel(c.startEl), occurrences: 0 };
+      merged.set(key, entry);
+    }
+    entry.occurrences += 1;
+  }
+
   const own = ownIdentifier();
   if (own !== null) merged.delete(`${own.kind}:${own.value.toLowerCase()}`);
+  // The URL of the opened tab has priority over viewer-wrapper metadata.
+  if (tabIdentifier !== null) {
+    const key = `${tabIdentifier.kind}:${tabIdentifier.value.toLowerCase()}`;
+    if (!merged.has(key)) {
+      merged.set(key, {
+        kind: tabIdentifier.kind,
+        value: tabIdentifier.value,
+        label: (doc.title || opened?.hostname || "PDF").trim(),
+        occurrences: 1,
+      });
+    }
+  }
 
   const papers: DetectedPaper[] = [];
   let index = 0;
@@ -487,7 +603,23 @@ export function scanDocument(root: Document | Element = document): ScanResult {
       occurrences: entry.occurrences,
     });
   }
-	return { papers, truncated, renderedRecordCountHint: countStructuralRecords() };
+  if (papers.length === 0 && pdfTab && opened !== null) {
+    const title = (doc.title || opened.hostname || opened.href).trim();
+    papers.push({
+      localId: "grab-1",
+      detector: "generic-identifiers/1",
+      kind: "pdf_grab",
+      url: opened.href,
+      title,
+      label: `${title} · ${opened.hostname}`,
+      occurrences: 1,
+    } as DetectedPaper);
+  }
+  return {
+    papers,
+    truncated,
+    renderedRecordCountHint: papers.some((paper) => paper.kind === "pdf_grab") ? null : countStructuralRecords(),
+  };
 }
 
 // ---------------------------------------------------------------------------

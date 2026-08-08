@@ -21,6 +21,9 @@ import type { PageBulkIdentifier, PageBulkStatus, PageBulkStatusItem } from "./p
 type WorkspaceSnapshot = PageBulkSnapshot & {
   sourceTitle: string;
   scannedAt: string;
+  /** Feature detection is supplied by the background broker, never inferred
+   * from a user-agent string. */
+  pdfGrabAvailable?: boolean;
 };
 
 const SUBMIT_CAP = 50;
@@ -29,6 +32,7 @@ const KIND_LABEL: Record<DetectedPaper["identifier"]["kind"], string> = {
   doi: "DOI",
   pmid: "PMID",
   arxiv: "arXiv",
+  openalex: "OpenAlex",
 };
 
 const STATUS_LABEL: Record<PageBulkStatus, string> = {
@@ -52,17 +56,16 @@ function isEligibleStatus(status: PageBulkStatus | null): boolean {
 
 interface RowState {
   localId: string;
-  identifier: DetectedPaper["identifier"];
+  kind: "identifier" | "pdf_grab";
+  identifier: DetectedPaper["identifier"] | null;
   label: string;
   occurrences: number;
-  /** null until the status round trip resolves (or fails) for this row. */
+  grabURL: string | null;
+  grabTitle: string | null;
   status: PageBulkStatus | null;
   canonicalKey: string | null;
   jobId: string | null;
   selected: boolean;
-  /** Set once this row's canonical key has gone out in a successful submit;
-   * it stays visible (Decision 5 gives no reason to hide it) but can never
-   * be selected again. */
   submitted: boolean;
 }
 
@@ -79,21 +82,17 @@ interface WorkspaceState {
   snapshot: WorkspaceSnapshot | null;
   detector: string;
   rows: RowState[];
-  /** Generic, unrecoverable load failure — distinct from `expired`, which
-   * gets its own operator-actionable copy. */
   loadError: string | null;
-  /** The snapshot aged out of the background's bounded store, or the
-   * browser session that held it ended (Decision 4: chrome.storage.session
-   * only). */
   expired: boolean;
-  /** The source tab was closed — discovered lazily, only when "Return to
-   * source page" or Rescan actually tries to reach it (never probed ambiently). */
   sourceTabClosed: boolean;
   statusError: string | null;
   statusLoaded: boolean;
   rescanning: boolean;
   submitting: boolean;
   result: SubmitResult | null;
+  grabState: "idle" | "grabbed" | "identifying" | "job_created" | "already_owned" | "needs_identifier" | "failed";
+  grabID: string | null;
+  grabDetail: string | null;
 }
 
 interface PageElements {
@@ -157,10 +156,13 @@ async function runtimeMessage(type: string, request: Record<string, unknown>): P
 function isDetectedPaper(value: unknown): value is DetectedPaper {
   if (!isRecord(value) || typeof value["localId"] !== "string" || typeof value["label"] !== "string") return false;
   if (typeof value["occurrences"] !== "number" || value["detector"] !== "generic-identifiers/1") return false;
+  if (value["kind"] === "pdf_grab") {
+    return typeof value["url"] === "string" && typeof value["title"] === "string";
+  }
   const identifier = value["identifier"];
   if (!isRecord(identifier) || typeof identifier["value"] !== "string") return false;
   const kind = identifier["kind"];
-  return kind === "doi" || kind === "pmid" || kind === "arxiv";
+  return kind === "doi" || kind === "pmid" || kind === "arxiv" || kind === "openalex";
 }
 
 function isWorkspaceSnapshot(value: unknown): value is WorkspaceSnapshot {
@@ -229,19 +231,23 @@ function element<K extends keyof HTMLElementTagNameMap>(tag: K, text?: string): 
 }
 
 function rowsFromSnapshot(snapshot: WorkspaceSnapshot): RowState[] {
-  // Decision 5: rows always open unselected, whether this is the first load
-  // or the result of pressing Rescan.
-  return snapshot.items.map((item) => ({
-    localId: item.localId,
-    identifier: item.identifier,
-    label: item.label,
-    occurrences: item.occurrences,
-    status: null,
-    canonicalKey: null,
-    jobId: null,
-    selected: false,
-    submitted: false,
-  }));
+  return snapshot.items.map((item) => {
+    const grab = item.kind === "pdf_grab";
+    return {
+      localId: item.localId,
+      kind: grab ? "pdf_grab" : "identifier",
+      identifier: grab ? null : item.identifier,
+      label: item.label,
+      occurrences: item.occurrences,
+      grabURL: grab ? item.url ?? null : null,
+      grabTitle: grab ? item.title ?? null : null,
+      status: null,
+      canonicalKey: null,
+      jobId: null,
+      selected: false,
+      submitted: false,
+    };
+  });
 }
 
 function scanIdFromLocation(): string | null {
@@ -279,10 +285,13 @@ const state: WorkspaceState = {
   rescanning: false,
   submitting: false,
   result: null,
+  grabState: "idle",
+  grabID: null,
+  grabDetail: null,
 };
 
 function eligibleRows(): RowState[] {
-  return state.rows.filter((row) => !row.submitted && isEligibleStatus(row.status));
+  return state.rows.filter((row) => row.kind === "identifier" && !row.submitted && isEligibleStatus(row.status));
 }
 
 function selectedRows(): RowState[] {
@@ -349,6 +358,7 @@ const IDENTIFIER_URL: Record<DetectedPaper["identifier"]["kind"], (encoded: stri
   doi: (encoded) => `https://doi.org/${encoded}`,
   arxiv: (encoded) => `https://arxiv.org/abs/${encoded}`,
   pmid: (encoded) => `https://pubmed.ncbi.nlm.nih.gov/${encoded}/`,
+  openalex: (encoded) => `https://openalex.org/works/${encoded}`,
 };
 
 function identifierURL(identifier: DetectedPaper["identifier"]): string | null {
@@ -362,15 +372,11 @@ function identifierURL(identifier: DetectedPaper["identifier"]): string | null {
 }
 
 const IDENTIFIER_PREFIX_RE =
-  /(?:\b(?:doi|arxiv|pmid)\s*:\s*|https?:\/\/(?:dx\.)?doi\.org\/|https?:\/\/arxiv\.org\/abs\/)\s*$/i;
+  /(?:\b(?:doi|arxiv|pmid|openalex)\s*:\s*|https?:\/\/(?:dx\.)?doi\.org\/|https?:\/\/arxiv\.org\/abs\/|https?:\/\/(?:www\.|api\.)?openalex\.org\/(?:works\/)?)\s*$/i;
 
-/** Page-derived labels routinely carry the very identifier this row already
- * prints on its own linked line ("Some Title doi:10.1234/x"). Mirrors
- * inbox.ts's renderCitation rule — a row whose displayed title is already
- * the DOI does not repeat that link — from the other side: here the label
- * is what gets trimmed. Display only; the row's `label` and the
- * background's snapshot keep the full page text. */
+/** Remove an identifier already repeated in a page-derived display label. */
 function displayLabel(row: RowState): string {
+  if (row.kind === "pdf_grab" || row.identifier === null) return row.label;
   const label = row.label;
   const value = row.identifier.value;
   if (value === "") return label;
@@ -380,8 +386,6 @@ function displayLabel(row: RowState): string {
   let end = at + value.length;
   const prefix = IDENTIFIER_PREFIX_RE.exec(label.slice(0, start));
   if (prefix !== null) start -= prefix[0].length;
-  // "Some Title (doi:10.1234/x)" loses the whole parenthetical, not just
-  // its contents.
   const opener = label[start - 1];
   const closer = label[end];
   if ((opener === "(" && closer === ")") || (opener === "[" && closer === "]")) {
@@ -391,8 +395,6 @@ function displayLabel(row: RowState): string {
   const trimmed = `${label.slice(0, start)}${label.slice(end)}`
     .replace(/\s+/g, " ")
     .replace(/^[\s.,;:|·\u2013\u2014-]+|[\s.,;:|·\u2013\u2014-]+$/g, "");
-  // A label that is nothing but its identifier has nothing left to show,
-  // and the checkbox still needs an accessible name: keep it whole.
   return trimmed === "" ? label : trimmed;
 }
 
@@ -405,15 +407,73 @@ function ownershipUnclearOnly(): boolean {
   const graded = state.rows.filter((row) => row.status !== "invalid");
   return graded.length > 0 && graded.every((row) => row.status === "ownership_incomplete");
 }
+function grabSupported(): boolean {
+  const downloads = typeof chrome !== "undefined" ? chrome.downloads : undefined;
+  const steering = downloads !== undefined &&
+    (downloads as unknown as { onDeterminingFilename?: unknown }).onDeterminingFilename !== undefined;
+  return steering && state.snapshot?.pdfGrabAvailable === true;
+}
+
+async function handleGrab(row: RowState): Promise<void> {
+  if (row.kind !== "pdf_grab" || row.grabURL === null || state.snapshot === null || !grabSupported() || state.grabState !== "idle") return;
+  state.grabState = "grabbed";
+  state.grabDetail = null;
+  render();
+  try {
+    const response = await runtimeMessage("papio.pageBulk.grabPdf", {
+      tab_id: state.snapshot.sourceTabId,
+      scan_id: state.scanId,
+      url: row.grabURL,
+      title: row.grabTitle ?? row.label,
+    });
+    if (isRecord(response) && response["ok"] === true && typeof response["grab_id"] === "string") {
+      state.grabID = response["grab_id"];
+      render();
+      return;
+    }
+    state.grabState = "failed";
+    state.grabDetail = errorFromResponse(response);
+  } catch (error) {
+    state.grabState = "failed";
+    state.grabDetail = error instanceof Error ? error.message : "Could not start the PDF grab";
+  }
+  render();
+}
 
 function buildRow(row: RowState, ownershipCollapsed: boolean): HTMLElement {
   const wrapper = element("div");
   wrapper.className = "pb-row";
   wrapper.dataset.localId = row.localId;
-  wrapper.dataset.status = row.submitted ? "submitted" : (row.status ?? "pending");
-  wrapper.dataset.disabled = String(!isRowCheckable(row));
+  wrapper.dataset.status = row.kind === "pdf_grab" ? state.grabState : (row.submitted ? "submitted" : (row.status ?? "pending"));
+  wrapper.dataset.disabled = String(row.kind === "pdf_grab" ? !grabSupported() : !isRowCheckable(row));
+  if (row.kind === "pdf_grab") {
+    const content = element("div");
+    content.className = "pb-row-content";
+    content.append(element("div", row.grabTitle ?? row.label));
+    const meta = element("div");
+    meta.className = "pb-row-meta";
+    const host = (() => {
+      try { return new URL(row.grabURL ?? "").hostname; } catch { return "the open PDF"; }
+    })();
+    meta.append(element("span", host));
+    const statusText =
+      state.grabState === "idle" ? (grabSupported() ? "Ready to grab" : "PDF grabbing needs Chrome download steering and a compatible daemon") :
+      state.grabState === "grabbed" ? "Grabbed" :
+      state.grabState === "identifying" ? "Identifying…" :
+      state.grabState === "job_created" ? "Job created" :
+      state.grabState === "already_owned" ? "Already in your library" :
+      state.grabState === "needs_identifier" ? "Needs an identifier" :
+      state.grabDetail ?? "Grab failed";
+    meta.append(element("span", statusText));
+    const button = element("button", "Grab this PDF");
+    button.type = "button";
+    button.disabled = !grabSupported() || state.grabState !== "idle";
+    button.addEventListener("click", () => { void handleGrab(row); });
+    content.append(meta, button);
+    wrapper.append(content);
+    return wrapper;
+  }
   const labelText = displayLabel(row);
-
   const checkboxId = `pb-row-check-${row.localId}`;
   const checkbox = element("input");
   checkbox.type = "checkbox";
@@ -421,32 +481,25 @@ function buildRow(row: RowState, ownershipCollapsed: boolean): HTMLElement {
   checkbox.checked = row.selected;
   checkbox.disabled = !isRowCheckable(row);
   checkbox.setAttribute("aria-label", `Select ${labelText}`);
-  checkbox.addEventListener("change", () => {
-    row.selected = checkbox.checked;
-    render();
-  });
+  checkbox.addEventListener("change", () => { row.selected = checkbox.checked; render(); });
   wrapper.append(checkbox);
-
   const content = element("div");
   content.className = "pb-row-content";
-
   const label = element("label", labelText);
   label.className = "pb-row-label";
   label.htmlFor = checkboxId;
   content.append(label);
-
   const meta = element("div");
   meta.className = "pb-row-meta";
   const identifier = element("span");
   identifier.className = "pb-row-identifier";
-  const kind = element("span", `${KIND_LABEL[row.identifier.kind]}:`);
+  const kind = element("span", `${KIND_LABEL[row.identifier!.kind]}:`);
   kind.className = "pb-row-kind";
   identifier.append(kind, document.createTextNode(" "));
-  const url = identifierURL(row.identifier);
-  if (url === null) {
-    identifier.append(document.createTextNode(row.identifier.value));
-  } else {
-    const link = element("a", row.identifier.value);
+  const url = identifierURL(row.identifier!);
+  if (url === null) identifier.append(document.createTextNode(row.identifier!.value));
+  else {
+    const link = element("a", row.identifier!.value);
     link.className = "pb-row-link";
     link.href = url;
     link.target = "_blank";
@@ -460,13 +513,10 @@ function buildRow(row: RowState, ownershipCollapsed: boolean): HTMLElement {
     status.className = "pb-row-status";
     meta.append(status);
   }
-  if (row.occurrences > 1) meta.append(element("span", `seen ${row.occurrences}×`));
   content.append(meta);
-
   wrapper.append(content);
   return wrapper;
 }
-
 function renderRows(): void {
   if (elements === null) return;
   const ownershipCollapsed = ownershipUnclearOnly();
@@ -563,37 +613,23 @@ async function loadAllowlist(origin: string): Promise<void> {
 
 async function loadStatus(): Promise<void> {
   if (state.snapshot === null) return;
-  // Decision 4: documentGeneration bumps on every rescan (page-scan.ts). A
-  // reply is only ever applied against the exact generation it was
-  // requested under — Rescan replaces state.rows with fresh RowStates whose
-  // localIds are recomputed deterministically in detection order, so a
-  // stale reply's local_ids can collide with the NEW rows and silently
-  // overwrite their status/canonicalKey/jobId with data about entirely
-  // different papers if this were not checked.
   const requestGeneration = state.snapshot.documentGeneration;
-  if (state.rows.length === 0) {
+  if (state.rows.length === 0 || state.rows.every((row) => row.kind === "pdf_grab")) {
     state.statusLoaded = true;
     render();
     return;
   }
   state.statusError = null;
   render();
-  const identifiers: PageBulkIdentifier[] = state.rows.map((row) => ({
-    local_id: row.localId,
-    kind: row.identifier.kind,
-    value: row.identifier.value,
-  }));
+  const identifiers: PageBulkIdentifier[] = state.rows
+    .filter((row): row is RowState & { identifier: DetectedPaper["identifier"] } => row.kind === "identifier" && row.identifier !== null)
+    .map((row) => ({ local_id: row.localId, kind: row.identifier.kind, value: row.identifier.value }));
   let response: unknown;
   try {
     response = await runtimeMessage("papio.pageBulk.status", {
       scan_id: state.snapshot.scanId,
       identifiers,
-      // Omitted, never null, when the page's structure was not recognized
-      // (dev/post-build-followups.md item 3) — the wire protocol rejects an
-      // explicit null anywhere in a payload.
-      ...(state.snapshot.renderedRecordCountHint !== null
-        ? { rendered_record_count_hint: state.snapshot.renderedRecordCountHint }
-        : {}),
+      ...(state.snapshot.renderedRecordCountHint !== null ? { rendered_record_count_hint: state.snapshot.renderedRecordCountHint } : {}),
     });
   } catch (e) {
     if (state.snapshot === null || state.snapshot.documentGeneration !== requestGeneration) return;
@@ -631,6 +667,9 @@ function applySnapshot(snapshot: WorkspaceSnapshot): void {
   state.expired = false;
   state.loadError = null;
   state.result = null;
+  state.grabState = "idle";
+  state.grabID = null;
+  state.grabDetail = null;
   void loadAllowlist(snapshot.sourceOrigin);
 }
 
@@ -803,27 +842,11 @@ function bootstrap(): void {
   const resultSummary = document.getElementById("result-summary");
   const allowlistCheckbox = document.getElementById("allowlist-checkbox");
   if (
-    !(scanTitle instanceof HTMLElement) ||
-    !(scanMeta instanceof HTMLElement) ||
-    !(scanSummary instanceof HTMLElement) ||
-    !(scanError instanceof HTMLElement) ||
-    !(scanExpired instanceof HTMLElement) ||
-    !(statusError instanceof HTMLElement) ||
-    !(statusErrorMessage instanceof HTMLElement) ||
-    !(statusRetryButton instanceof HTMLButtonElement) ||
-    !(truncatedNote instanceof HTMLElement) ||
-    !(ownershipNote instanceof HTMLElement) ||
-    !(workspaceMain instanceof HTMLElement) ||
-    !(rows instanceof HTMLElement) ||
-    !(emptyState instanceof HTMLElement) ||
-    !(actionBar instanceof HTMLElement) ||
-    !(returnButton instanceof HTMLButtonElement) ||
-    !(sourceClosedNote instanceof HTMLElement) ||
-    !(rescanButton instanceof HTMLButtonElement) ||
-    !(primaryButton instanceof HTMLButtonElement) ||
-    !(submitStatus instanceof HTMLElement) ||
-    !(resultSummary instanceof HTMLElement) ||
-    !(allowlistCheckbox instanceof HTMLInputElement)
+    scanTitle === null || scanMeta === null || scanSummary === null || scanError === null || scanExpired === null ||
+    statusError === null || statusErrorMessage === null || statusRetryButton === null || truncatedNote === null ||
+    ownershipNote === null || workspaceMain === null || rows === null || emptyState === null || actionBar === null ||
+    returnButton === null || sourceClosedNote === null || rescanButton === null || primaryButton === null ||
+    submitStatus === null || resultSummary === null || allowlistCheckbox === null
   ) {
     return;
   }
@@ -835,20 +858,20 @@ function bootstrap(): void {
     scanExpired,
     statusError,
     statusErrorMessage,
-    statusRetryButton,
+    statusRetryButton: statusRetryButton as HTMLButtonElement,
     truncatedNote,
     ownershipNote,
     workspaceMain,
     rows,
     emptyState,
     actionBar,
-    returnButton,
+    returnButton: returnButton as HTMLButtonElement,
     sourceClosedNote,
-    rescanButton,
-    primaryButton,
+    rescanButton: rescanButton as HTMLButtonElement,
+    primaryButton: primaryButton as HTMLButtonElement,
     submitStatus,
     resultSummary,
-    allowlistCheckbox,
+    allowlistCheckbox: allowlistCheckbox as HTMLInputElement,
   };
   returnButton.addEventListener("click", () => {
     void handleReturnToSource();
@@ -866,8 +889,22 @@ function bootstrap(): void {
     if (state.snapshot === null) return;
     void runtimeMessage("papio.pageBulk.allowlist.set", {
       origin: state.snapshot.sourceOrigin,
-      allowed: allowlistCheckbox.checked,
+      allowed: elements?.allowlistCheckbox.checked ?? false,
     });
+  });
+  chrome.runtime?.onMessage?.addListener((message: unknown) => {
+    if (!isRecord(message) || message["type"] !== "papio.pageBulk.grabState") return;
+    const scanID = message["scan_id"];
+    if (typeof scanID !== "string" || scanID !== state.scanId) return;
+    const grabID = message["grab_id"];
+    if (typeof grabID !== "string" || (state.grabID !== null && state.grabID !== grabID)) return;
+    if (state.grabID === null) state.grabID = grabID;
+    const next = message["state"];
+    if (next === "grabbed" || next === "identifying" || next === "job_created" || next === "already_owned" || next === "needs_identifier" || next === "failed") {
+      state.grabState = next;
+      state.grabDetail = typeof message["detail"] === "string" ? message["detail"] : null;
+      render();
+    }
   });
   render();
   void loadInitial();

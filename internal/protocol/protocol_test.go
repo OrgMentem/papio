@@ -746,6 +746,7 @@ func TestPageBulkPayloadRoundTripAndValidation(t *testing.T) {
 		Identifiers: []PageBulkIdentifier{
 			{LocalID: "row-1", Kind: "doi", Value: "10.1000/example.42"},
 			{LocalID: "row-2", Kind: "pmid", Value: "12345678"},
+			{LocalID: "row-3", Kind: "openalex", Value: "W2741809807"},
 		},
 		RenderedRecordCountHint: &hint,
 	}
@@ -754,7 +755,7 @@ func TestPageBulkPayloadRoundTripAndValidation(t *testing.T) {
 		t.Fatalf("decode page_bulk_status_request: %v", err)
 	}
 	got := msg.Payload.(*PageBulkStatusRequestPayload)
-	if got.RequestID != statusRequest.RequestID || got.ScanID != statusRequest.ScanID || len(got.Identifiers) != 2 ||
+	if got.RequestID != statusRequest.RequestID || got.ScanID != statusRequest.ScanID || len(got.Identifiers) != 3 ||
 		got.RenderedRecordCountHint == nil || *got.RenderedRecordCountHint != hint {
 		t.Fatalf("round-trip status request = %#v, want %#v", got, statusRequest)
 	}

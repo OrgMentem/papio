@@ -1109,6 +1109,18 @@ function renderWaitingOnSignIn(
     const paper = doc.createElement("p");
     paper.className = "institution-session-waiting-title";
     paper.textContent = handoffPaperLabel(job);
+    if (job.waiting_for_session === true) {
+      // This paper is not waiting on the operator: it deferred to a sibling
+      // paper's tab already at the institution's login page, and resumes on
+      // its own once that sign-in completes. A "Focus" action would send the
+      // operator to a page they have no reason to act on.
+      const status = doc.createElement("p");
+      status.className = "institution-session-waiting-status";
+      status.textContent = "Waiting for the institution sign-in — another paper's tab is at the login page";
+      row.append(paper, status);
+      list.append(row);
+      continue;
+    }
     const button = doc.createElement("button");
     button.className = "ghost";
     button.type = "button";

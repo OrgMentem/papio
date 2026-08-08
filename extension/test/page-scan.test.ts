@@ -62,6 +62,29 @@ test("a pubmed.ncbi.nlm.nih.gov article link is recognized as a PMID", () => {
   expect(identifiers(result.papers)).toEqual([{ kind: "pmid", value: "12345678" }]);
 });
 
+test("an openalex.org /works/w<digits> link is recognized as openalex, value uppercased", () => {
+  const result = scanDocument(doc(`<li><a href="https://openalex.org/works/w1976043798">A paper</a></li>`));
+  expect(identifiers(result.papers)).toEqual([{ kind: "openalex", value: "W1976043798" }]);
+});
+
+test("a bare openalex.org /w<digits> path (no /works/ segment) is recognized", () => {
+  const result = scanDocument(doc(`<li><a href="https://openalex.org/w1976043798">A paper</a></li>`));
+  expect(identifiers(result.papers)).toEqual([{ kind: "openalex", value: "W1976043798" }]);
+});
+
+test("www. and api. openalex.org hosts are both recognized", () => {
+  const result = scanDocument(
+    doc(`
+      <li><a href="https://www.openalex.org/works/W2741809807">Paper A</a></li>
+      <li><a href="https://api.openalex.org/works/W2741809808">Paper B</a></li>
+    `),
+  );
+  expect(identifiers(result.papers)).toEqual([
+    { kind: "openalex", value: "W2741809807" },
+    { kind: "openalex", value: "W2741809808" },
+  ]);
+});
+
 // --- Explicitly labeled text (Decision 3 recognition order, item 2) --------
 
 test("a strict DOI in plain text is recognized without a link", () => {
@@ -472,4 +495,90 @@ test("a hidden reference-list item is not counted toward the hint", () => {
   ].join("\n");
   const result = scanDocument(doc(`<ul class="citation-list">${items}</ul>`));
   expect(result.renderedRecordCountHint).toBe(2);
+});
+
+// --- OpenAlex-shaped result cards: title-anchor detection + same-container
+// kind preference (Change #2: a card carrying both a registered identifier
+// and an openalex id folds into ONE row keyed on the registered one) -------
+
+test("an OpenAlex-shaped result list detects every card via its W-id title link, folding a dual doi+openalex card into one row", () => {
+  const cards = [
+    {
+      w: "w2963446712",
+      title: "Attention is all you need",
+      meta: "Vaswani et al. (2017). Advances in Neural Information Processing Systems. A foundational paper on the transformer architecture for sequence modeling.",
+    },
+    {
+      w: "w2194775991",
+      title: "Deep residual learning for image recognition",
+      meta: "He et al. (2016). IEEE Conference on Computer Vision and Pattern Recognition. Introduces residual connections for training very deep networks.",
+    },
+    {
+      w: "w2741809807",
+      title: "A stray publisher PDF link alongside the OpenAlex title",
+      meta: "Example et al. (2019). Journal of Testing. This card also carries a publisher PDF anchor pointing at a registered DOI.",
+      doi: "10.1234/stray-link.99",
+    },
+  ];
+  const html = cards
+    .map(
+      (c) => `
+      <div class="entry">
+        <a href="https://openalex.org/works/${c.w}">${c.title}</a>
+        <span>${c.meta}</span>
+        ${c.doi ? `<a href="https://publisher.example/doi/pdf/${c.doi}">PDF</a>` : ""}
+      </div>`,
+    )
+    .join("\n");
+  const result = scanDocument(doc(`<div class="results-list">${html}</div>`));
+
+  // All 3 cards detected as exactly 3 rows — the dual-identifier card never
+  // produces a duplicate second row.
+  expect(result.papers).toHaveLength(3);
+  const byTitle = (t: string): DetectedPaper | undefined => result.papers.find((p) => p.label.includes(t));
+
+  const transformer = byTitle("Attention is all you need");
+  expect(transformer?.identifier).toEqual({ kind: "openalex", value: "W2963446712" });
+  expect(transformer?.label).toContain("Attention is all you need");
+
+  const resnet = byTitle("Deep residual learning");
+  expect(resnet?.identifier).toEqual({ kind: "openalex", value: "W2194775991" });
+
+  // The dual-identifier card is keyed on the registered DOI, not openalex,
+  // and its W-id occurrence folds into the same row (seen-2x semantics).
+  const dual = byTitle("A stray publisher PDF link");
+  expect(dual?.identifier).toEqual({ kind: "doi", value: "10.1234/stray-link.99" });
+  expect(dual?.occurrences).toBe(2);
+  expect(dual?.label).toContain("A stray publisher PDF link alongside the OpenAlex title");
+});
+
+
+test("a PDF document with an identifier-free tab URL yields exactly one grab row", () => {
+  const page = doc(`<title>Open PDF</title>`, "https://pdf.example.org/assets/main.pdf?token=abc");
+  Object.defineProperty(page, "contentType", { configurable: true, value: "application/pdf" });
+  const result = scanDocument(page);
+  expect(result.papers).toHaveLength(1);
+  expect(result.papers[0]?.kind).toBe("pdf_grab");
+  expect(result.papers[0]?.url).toBe("https://pdf.example.org/assets/main.pdf?token=abc");
+});
+
+test("a PDF tab URL with a DOI remains an ordinary identifier row", () => {
+  const page = doc(`<title>Known PDF</title>`, "https://publisher.example/doi/10.1234/known.pdf");
+  Object.defineProperty(page, "contentType", { configurable: true, value: "application/pdf" });
+  const result = scanDocument(page);
+  expect(result.papers).toHaveLength(1);
+  expect(result.papers[0]?.kind).toBeUndefined();
+  expect(result.papers[0]?.identifier).toEqual({ kind: "doi", value: "10.1234/known" });
+});
+
+test("a small embedded PDF preview inside an HTML page is not offered as a grab", () => {
+  const page = doc(`<main><embed type="application/pdf" width="300" height="200"></main>`, "https://reader.example.org/article");
+  const result = scanDocument(page);
+  expect(result.papers.some((paper) => paper.kind === "pdf_grab")).toBe(false);
+});
+
+test("a 100% PDF embed inside a small HTML container is not offered as a grab", () => {
+  const page = doc(`<main style="width:300px;height:200px"><embed type="application/pdf" width="100%" height="100%"></main>`, "https://reader.example.org/article");
+  const result = scanDocument(page);
+  expect(result.papers.some((paper) => paper.kind === "pdf_grab")).toBe(false);
 });

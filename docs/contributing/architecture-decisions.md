@@ -212,4 +212,12 @@ ADR-0010 also makes the daemon-wide `access_mode` a ceiling: a per-request `acce
 
 **Decision:** ADR-0019 proposes a popup action that runs a single scan of the current tab only when clicked, with no persistent scanner, no page-mutation watcher, and no badge count. Detected identifiers open a dedicated selection workspace, reusing the full-tab pattern from ADR-0001, where a person chooses which papers to submit as one ordinary batch under the same cap any other batch submission uses. An existing host permission granted for one publisher page does not by itself authorize scanning; scanning has its own separate, revocable consent.
 
-**Why:** The feature's unique value is a human's visual selection, not ambient detection, so the design deliberately stays invoked-only and reuses *papio*'s existing batch-submission and consent machinery rather than adding a second, browser-only acquisition policy. This ADR is proposed and not yet built.
+**Why:** The feature's unique value is a human's visual selection, not ambient detection, so the design deliberately stays invoked-only and reuses *papio*'s existing batch-submission and consent machinery rather than adding a second, browser-only acquisition policy.
+
+## Grabbing the PDF you are already reading
+
+**Context:** A browser tab rendering a PDF has no page to scan — Chrome's viewer exposes no DOM, so even a paper printing its own DOI on page one yields nothing. Meanwhile the application already holds everything needed to identify a PDF it possesses: front-matter identifier extraction, structural validation, and identity scoring against registrar metadata.
+
+**Decision:** ADR-0020 makes the existing scan flow PDF-aware. Scanning a PDF tab first applies the ordinary URL identifier rules to the tab address itself; failing that, it offers a single explicit "grab this PDF" action. Accepting it captures the file through the browser's own authenticated download — steered into a reserved directory, never crossing the native-messaging transport — after which the daemon quarantines, validates, and extracts front-matter identifiers. An identifier yields an ordinary identifier-keyed job with the captured file claimed; no identifier parks as a human action. Capture always precedes job creation, so no job ever exists without a canonical work identity.
+
+**Why:** The transport frame cap makes byte upload a non-starter, identity-less jobs would undermine every dedupe guarantee, and a grab that submitted title guesses would reopen the weak-match risk ADR-0019 closed. One click, one file, the standard pipeline — the wrong-paper guard applies to grabbed PDFs exactly as to acquired ones.

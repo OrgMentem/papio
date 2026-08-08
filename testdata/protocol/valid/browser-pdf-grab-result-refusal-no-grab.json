@@ -1,0 +1,1 @@
+{"protocol":"papio-browser/1","type":"pdf_grab_result","msg_id":"pdf-grab-result-004","seq":24,"payload":{"request_id":"pdf-grab-request-frame","outcome":"not_supported","detail":"the tab URL could not be reduced to a host"}}

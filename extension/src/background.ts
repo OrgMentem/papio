@@ -62,6 +62,7 @@ import {
   type StoreShape,
   type TermsConsent,
   type ProviderDrainLease,
+  type FederatedLoginOwner,
   TERMS_CONSENT_KEY,
   WORK_WINDOW_KEY,
   HANDOFF_SURFACE_KEY,
@@ -117,6 +118,13 @@ const QUEUED_HANDOFF_RELEASE_MS = 45_000;
  * and daemon re-offers recover any accepted job that was waiting for a tab. */
 const HANDOFF_DRIVE_LIMIT = 2;
 const HANDOFF_DRIVE_TIMEOUT_MS = 3 * 60_000;
+/** Bounds how long a job may sit parked in waiting_for_session on another
+ * job's shared federated-login claim. Past this, nothing has resumed it —
+ * the owner may have simply walked away mid sign-in — so the marker clears
+ * on its own and the job reverts to an ordinary parked_with_tab park: the
+ * pre-feature presentation, visible and operator-actionable, instead of
+ * waiting invisibly forever for a claim that may never retire. */
+const SESSION_WAIT_TIMEOUT_MS = 10 * 60_000;
 // (custom elements, React roots) upgrade after the tab reports complete and
 // after the SSO landing. Re-drive the idempotent classify path on a bounded
 // schedule so a slow render still reaches a decisive verdict.
@@ -194,6 +202,8 @@ const PAGE_CAPTURE_REQUEST_FEATURE = "page_capture_request_v1";
 const PAGE_CAPTURE_TERMS_FEATURE = "page_capture_terms_v1";
 /** ADR-0019 Decision 7: page_bulk_status_request/page_bulk_submit_request. */
 const PAGE_BULK_ACQUIRE_FEATURE = "page_bulk_acquire_v1";
+const PDF_GRAB_FEATURE = "pdf_grab_v1";
+const PDF_GRAB_CORRELATION_STORAGE_KEY = "papio_pdf_grab_correlations_v1";
 /** ADR-0019 Decision 2: kept separate from acquisition/adapter host grants. */
 const PAGE_BULK_ALLOWLIST_KEY = "papio_scanner_allowlist_v1";
 const PAGE_CAPTURE_DEFAULT_SETTLE_MS = 3_000;
@@ -214,6 +224,7 @@ const CORRELATED_RESULT_TYPES: ReadonlySet<BrowserMessageType> = new Set([
   "page_bulk_status_result",
   "page_bulk_submit_result",
   "delivery_reconcile_result",
+  "pdf_grab_result",
 ]);
 // Fallback for a manifest without an action popup; both build targets ship
 // the pages under dist/ (see build.ts) and the manifest is the source of truth.
@@ -543,6 +554,14 @@ export interface DownloadDeltaLike {
   state?: { current?: string | undefined } | undefined;
   filename?: { current?: string | undefined } | undefined;
 }
+export interface PdfGrabCorrelation {
+  scanID: string;
+  tabID: number;
+  state: string;
+  downloadID: number;
+  steeringPath: string;
+  url: string;
+}
 
 export interface BridgeDeps {
   connectNative(name: string): NativePort;
@@ -562,6 +581,7 @@ export interface BridgeDeps {
     update?(tabID: number, props: { active?: boolean; url?: string }): Promise<unknown>;
     onUpdated: Listenable<[number, TabChangeInfo, TabInfo]>;
     /** Used only for the singleton inbox tab. */
+    sendMessage?(tabID: number, message: object): Promise<unknown>;
     query?(query: { url?: string; groupId?: number }): Promise<TabInfo[]>;
     onRemoved: Listenable<[number, { isWindowClosing: boolean }]>;
     /** ADR-0013 privileges the focused tab: an activation with no matching
@@ -572,10 +592,11 @@ export interface BridgeDeps {
      * omitted. Returns the group id. Absent on platforms without tab groups. */
     group?(opts: { tabIds: number[]; groupId?: number }): Promise<number>;
   };
+  /** Extension-page broadcast channel (runtime.onMessage), distinct from tabs.sendMessage content-script delivery. */
+  runtimeSendMessage?(message: object): Promise<unknown>;
   /** chrome.windows seam. When present (and the user setting allows), broker
    * tabs use one dedicated minimized "work window" instead of the user's tab
    * strip, except an adapter whose SPA needs a visible window. A tab otherwise
-   * surfaces only when the human is needed (IdP authentication). Absent on
    * platforms without the API — tabs then open with the legacy visibility rules. */
   windows?: {
     create(props: { url: string; focused: boolean; state: "minimized" | "normal" }): Promise<WindowInfo>;
@@ -601,11 +622,10 @@ export interface BridgeDeps {
   downloads: {
     search(query: { id: number }): Promise<DownloadItemLike[]>;
     /** Start a browser-managed download. The resolver-provided offer URL stays
-     * local to the extension/browser and is never put in a native frame. The
-     * returned ID is the exact job correlation. */
+     * local to the extension/browser and is never put in a native frame. */
     download(options: {
       url: string;
-      filename: string;
+      filename?: string;
       conflictAction: "uniquify";
       saveAs: false;
     }): Promise<number>;
@@ -669,6 +689,11 @@ export interface BridgeDeps {
     get(): Promise<PageBulkScanStore>;
     set(store: PageBulkScanStore): Promise<void>;
   };
+  /** Session correlation for PDF-grab terminal pushes across SW restarts. */
+  pdfGrabCorrelations?: {
+    get(): Promise<Record<string, PdfGrabCorrelation>>;
+    set(value: Record<string, PdfGrabCorrelation>): Promise<void>;
+  };
   /** Scanner-scoped origin allowlist (chrome.storage.local), kept and
    * revocable separately from acquisition/adapter host-permission grants
    * (ADR-0019 Decision 2). An explicit scan click is v1's consent for that
@@ -697,16 +722,19 @@ export interface BridgeDeps {
 interface DownloadTrack {
   ids: Set<number>;
   ambiguous: boolean;
-  /** True only for a direct-file offer attempted before any broker tab opens. */
   directOffer: boolean;
-  /** True for an operator's explicit "Send PDF to papio" action. */
   delivery?: boolean;
-  /** Route observed before the completed download. */
   route?: DeliveryRoute;
-  /** Session evidence available to the same browser drive. */
   sessionEvidence?: DeliverySessionEvidence;
 }
 
+interface PdfGrabTrack {
+  ids: Set<number>;
+  tabID: number;
+  scanID: string;
+  url: string;
+  steeringPath: string;
+}
 interface StalledAuthHandoff {
   url: string;
   providerHosts: string[];
@@ -1112,11 +1140,12 @@ function bareHTTPSOrigin(rawURL: string | undefined): string | null {
  * decoration, never sent to the daemon — page-scan.ts's PageBulkSnapshot,
  * the shape shared with the detector and the daemon-facing status/submit
  * round trip, deliberately excludes them (Decision 6: source.origin is bare
- * scheme+host only, never a page title) — so they travel as a
- * background-local intersection instead of widening that shared shape. */
+ * scheme+host only, never a page title) — so they travel as a background-local
+ * intersection instead of widening that shared shape. */
 export type PageBulkSnapshotView = PageBulkSnapshot & {
   sourceTitle: string;
   scannedAt: string;
+  pdfGrabAvailable?: boolean;
 };
 
 export class Bridge {
@@ -1130,6 +1159,8 @@ export class Bridge {
    * or framed. This lets onDeterminingFilename steer the exact adapter-started
    * download even when stale provider tabs make host correlation ambiguous. */
   private readonly pendingDownloadURLs = new Map<string, string>();
+  private readonly pendingGrabDownloadURLs = new Map<string, { grabID: string; tabID: number; steeringPath: string }>();
+  private readonly pdfGrabCorrelations = new Map<string, PdfGrabCorrelation>();
   private seq = 0;
   private store: StoreShape = emptyStore();
   private ready: Promise<void> = Promise.resolve();
@@ -1139,8 +1170,8 @@ export class Bridge {
    * settles and persists the latest snapshot, so a stale write never wins. */
   private saveChain: Promise<void> = Promise.resolve();
   private listenersBound = false;
-  /** Per-job in-progress download correlation (in-memory; transient). */
   private readonly downloads = new Map<string, DownloadTrack>();
+  private readonly grabDownloads = new Map<string, PdfGrabTrack>();
   /** Tabs we are intentionally closing, so onRemoved does not emit a spurious
    * cancelled outcome for a programmatic close. */
   private readonly closingTabs = new Set<number>();
@@ -1180,6 +1211,11 @@ export class Bridge {
   /** Jobs whose openurl was re-driven once after federated login returned, so a
    * still-walled page doesn't loop. Cleared on job removal. */
   private readonly federatedReDriven = new Set<string>();
+  /** Token-guarded SESSION_WAIT_TIMEOUT_MS timers for waiting_for_session
+   * parks, same pattern as handoffDriveTimeouts: a stale timer that fires
+   * after the job has already resumed is a harmless no-op (checked by
+   * both map identity and the job's still being waiting_for_session). */
+  private readonly waitingForSessionTimers = new Map<string, object>();
   /** Jobs that already reported a given terminal handoff or provider outcome,
    * so retries of one drive do not spam the daemon. Cleared for a fresh drive
    * and on job removal. */
@@ -2491,8 +2527,13 @@ export class Bridge {
    * JS has no true concurrency, and intent to drive a job again is only ever
    * expressed after that same job has already been parked. */
   private clearParkedMarker(jobID: string): void {
-    if (findByJob(this.store, jobID)?.parked_with_tab === true) {
-      void this.update((s) => patchJob(s, jobID, { parked_with_tab: false }));
+    const job = findByJob(this.store, jobID);
+    if (job === undefined) return;
+    if (job.parked_with_tab === true || job.waiting_for_session === true) {
+      this.waitingForSessionTimers.delete(jobID);
+      void this.update((s) =>
+        patchJob(s, jobID, { parked_with_tab: false, waiting_for_session: false, waiting_for_session_key: undefined }),
+      );
     }
   }
 
@@ -2677,6 +2718,100 @@ export class Bridge {
     await this.releaseQueuedHandoffs();
   }
 
+  /** Cross-job park: this handoff's classify verdict is "login" and its
+   * federated-login claim key (the IdP/DS origin plus entityID
+   * maybeRouteFederatedLogin resolved) already has a live sibling tab
+   * driving that same sign-in (federatedLoginOwners). A second tab at the
+   * same login page teaches the human nothing and doubles the sign-in
+   * work, so this tab is deliberately left exactly where it is — the
+   * provider's login wall — and the governor slot is released, same
+   * bookkeeping as parkHandoffForManual's timeout park (parked_with_tab)
+   * plus a distinct waiting_for_session marker (and the claim key it is
+   * waiting on) so UI copy and the resume paths can tell the two parks
+   * apart. Bounded by armSessionWaitTimeout against a PERSISTED deadline
+   * (waiting_deadline): reused as-is if this job already carries one from
+   * an earlier park in this same wait — re-parking (resumed, hit another
+   * login wall, parked again) never grants a fresh budget — and minted
+   * fresh only the very first time this job ever parks. */
+  private async parkHandoffWaitingForSession(jobID: string, claimKey: string): Promise<void> {
+    await this.ready;
+    const job = findByJob(this.store, jobID);
+    this.releaseHandoffDrive(jobID);
+    if (job !== undefined && job.tab_id >= 0) {
+      const deadline = job.waiting_deadline ?? this.deps.now() + SESSION_WAIT_TIMEOUT_MS;
+      await this.update((s) =>
+        patchJob(s, jobID, {
+          status: "auth_pending",
+          auth_started_ms: findByJob(s, jobID)?.auth_started_ms ?? this.deps.now(),
+          parked_with_tab: true,
+          waiting_for_session: true,
+          waiting_for_session_key: claimKey,
+          waiting_deadline: deadline,
+        }),
+      );
+      await this.reduceHandoffGroupState(job.tab_id);
+      this.armSessionWaitTimeout(jobID, claimKey, deadline);
+    }
+    await this.drainHandoffDriveQueue();
+    await this.releaseQueuedHandoffs();
+  }
+
+  /** Demotes a waiting_for_session park to an ordinary parked_with_tab park
+   * (the pre-feature presentation) at the given absolute `deadline` — an
+   * MV3 restart re-arms this from the SAME persisted deadline
+   * (reconcileSessionWaitTimeouts), never a fresh SESSION_WAIT_TIMEOUT_MS
+   * window, so a worker sleeping mid-wait cannot itself extend the budget.
+   * A no-op if the job already resumed, re-parked under a different claim
+   * (a fresh call already replaced this token), or is gone. Genuinely
+   * spending the deadline also clears it: THIS wait attempt is over, so a
+   * later, unrelated park earns a fresh budget rather than inheriting an
+   * already-expired one. */
+  private armSessionWaitTimeout(jobID: string, claimKey: string, deadline: number): void {
+    const token = {};
+    this.waitingForSessionTimers.set(jobID, token);
+    const delay = Math.max(0, deadline - this.deps.now());
+    this.deps.setTimeout(async () => {
+      if (this.waitingForSessionTimers.get(jobID) !== token) return;
+      this.waitingForSessionTimers.delete(jobID);
+      const job = findByJob(this.store, jobID);
+      if (job === undefined || job.waiting_for_session !== true || job.waiting_for_session_key !== claimKey) return;
+      await this.update((s) =>
+        patchJob(s, jobID, {
+          waiting_for_session: false,
+          waiting_for_session_key: undefined,
+          waiting_deadline: undefined,
+        }),
+      );
+    }, delay);
+  }
+
+  /** Startup re-arm for every live waiting_for_session job, mirroring how
+   * parked_with_tab's own restart handling walks activeJobs: an MV3 restart
+   * drops every worker-local setTimeout, so without this a waiter's bounded
+   * wait would silently become unbounded the moment the worker slept. A
+   * deadline already past due demotes immediately, synchronously, rather
+   * than waiting for a timer that would fire with a negative delay anyway. */
+  private async reconcileSessionWaitTimeouts(): Promise<void> {
+    const now = this.deps.now();
+    for (const job of this.store.activeJobs) {
+      if (job.waiting_for_session !== true) continue;
+      const claimKey = job.waiting_for_session_key;
+      const deadline = job.waiting_deadline;
+      if (claimKey === undefined || deadline === undefined) continue;
+      if (now >= deadline) {
+        await this.update((s) =>
+          patchJob(s, job.job_id, {
+            waiting_for_session: false,
+            waiting_for_session_key: undefined,
+            waiting_deadline: undefined,
+          }),
+        );
+        continue;
+      }
+      this.armSessionWaitTimeout(job.job_id, claimKey, deadline);
+    }
+  }
+
   /** Reclaim a slot after the operator completes a challenge on the same tab.
    * No navigation occurs here; the next page update drives normal assessment.
    * Classification must wait when all governor slots remain occupied. */
@@ -2772,8 +2907,7 @@ export class Bridge {
 
   /** Bind browser listeners (once), open the native connection, send hello, and
    * hydrate persisted job/tab correlation. Safe to call on every SW spin-up.
-   * The synchronous prefix (listener bind + connect) runs before the first
-   * await, satisfying MV3's top-level-registration expectation. */
+   * top-level-registration expectation. */
   async start(): Promise<void> {
     this.bindListeners();
     this.ready = this.deps.backend.load().then(async (s) => {
@@ -2785,6 +2919,19 @@ export class Bridge {
         if (typeof url !== "string" || findByJob(s, jobID) === undefined) continue;
         this.offerURLs.set(jobID, url);
       }
+      const correlations = this.deps.pdfGrabCorrelations === undefined ? {} : await this.deps.pdfGrabCorrelations.get();
+      for (const [grabID, correlation] of Object.entries(correlations)) {
+        if (
+          typeof correlation.scanID === "string" &&
+          typeof correlation.tabID === "number" &&
+          typeof correlation.state === "string" &&
+          typeof correlation.downloadID === "number" &&
+          typeof correlation.steeringPath === "string" &&
+          typeof correlation.url === "string"
+        ) {
+          this.pdfGrabCorrelations.set(grabID, correlation);
+        }
+      }
       this.hydrated = true;
       await this.update((current) => current);
     });
@@ -2794,6 +2941,7 @@ export class Bridge {
     // worker itself). Idempotent: re-creating the same alarm just resets it.
     this.deps.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: KEEPALIVE_ALARM_MINUTES });
     await this.ready;
+    await this.reconcilePdfGrabCorrelations();
     await this.restoreProviderDrainLeaseTimers();
     await this.restoreChallengeCooldownTimers();
     // Reconcile persisted papio groups before any new fold can race the
@@ -2801,6 +2949,8 @@ export class Bridge {
     await this.reconcileHandoffGroups();
     await this.syncConnectionBadge();
     await this.reconcileTabs();
+    await this.reconcileFederatedLoginOwners();
+    await this.reconcileSessionWaitTimeouts();
     const governorQueuedAtRestart: string[] = [];
     for (const job of this.store.activeJobs) {
       if (job.status !== "accepted" && job.status !== "auth_pending" && job.status !== "awaiting_download") {
@@ -2923,12 +3073,21 @@ export class Bridge {
         continue;
       }
       this.beginProviderDrive(job.job_id);
+      this.waitingForSessionTimers.delete(job.job_id);
       await this.update((s) =>
         patchJob(s, job.job_id, {
           tab_id: -1,
           status: "queued",
           download_initiated: false,
           unknown_count: 0,
+          // A dead tab discovered only at restart (MV3 never fired
+          // onRemoved while this worker slept) never went through
+          // onTabRemoved's own waiting_for_session demotion — clear both
+          // park markers here for the same reason: a stale marker on a
+          // now-queued, tab-less job would misreport it as still parked.
+          waiting_for_session: false,
+          waiting_for_session_key: undefined,
+          parked_with_tab: false,
         }),
       );
       this.scheduleQueuedHandoffRelease(job.job_id);
@@ -3558,9 +3717,19 @@ export class Bridge {
   ): Promise<
     { ok: true; items: DetectedPaper[]; truncated: boolean; renderedRecordCountHint: number | null } | BrokerFailure
   > {
+    let tabURL: string | undefined;
+    try {
+      tabURL = (await this.deps.tabs.get(tabID)).url;
+    } catch {
+      return this.failure("scan_failed", "Could not scan the page");
+    }
     let injected: { result?: unknown } | undefined;
     try {
-      [injected] = await this.deps.scripting.executeScript({ target: { tabId: tabID }, func: scanDocument });
+      [injected] = await this.deps.scripting.executeScript({
+        target: { tabId: tabID },
+        func: scanDocument,
+        args: [tabURL ?? ""],
+      });
     } catch {
       return this.failure("scan_failed", "Could not scan the page");
     }
@@ -3607,6 +3776,7 @@ export class Bridge {
       sourceTabId: tabID,
       sourceOrigin: meta.origin,
       sourceTitle: meta.title,
+      pdfGrabAvailable: this.pdfGrabAvailable(),
       scannedAt: new Date().toISOString(),
       documentGeneration: 1,
       items: scanned.items,
@@ -3649,6 +3819,7 @@ export class Bridge {
       sourceTabId: existing.sourceTabId,
       sourceOrigin: meta.origin,
       sourceTitle: meta.title,
+      pdfGrabAvailable: this.pdfGrabAvailable(),
       scannedAt: new Date().toISOString(),
       documentGeneration: existing.documentGeneration + 1,
       items: scanned.items,
@@ -3673,6 +3844,100 @@ export class Bridge {
     if (existing === undefined) return this.failure("scan_not_found", "This scan is no longer open");
     return { ok: true, snapshot: existing };
   }
+  pdfGrabAvailable(): boolean {
+    return (
+      this.store.connectionStatus === "connected" &&
+      this.deps.downloads.onDeterminingFilename !== undefined &&
+      (this.store.daemonFeatures ?? []).includes(PDF_GRAB_FEATURE)
+    );
+  }
+
+  private persistPdfGrabCorrelations(): void {
+    if (this.deps.pdfGrabCorrelations === undefined) return;
+    void this.deps.pdfGrabCorrelations.set(Object.fromEntries(this.pdfGrabCorrelations.entries())).catch(() => {});
+  }
+
+  private notifyPdfGrab(scanID: string, grabID: string, state: string, detail?: string): void {
+    const send = this.deps.runtimeSendMessage;
+    if (send === undefined) return;
+    void send({ type: "papio.pageBulk.grabState", scan_id: scanID, grab_id: grabID, state, ...(detail !== undefined ? { detail } : {}) }).catch(() => {});
+  }
+  private async reconcilePdfGrabCorrelations(): Promise<void> {
+    for (const [grabID, correlation] of this.pdfGrabCorrelations) {
+      let items: DownloadItemLike[];
+      try {
+        items = await this.deps.downloads.search({ id: correlation.downloadID });
+      } catch {
+        continue;
+      }
+      const item = items[0];
+      if (item?.state === "interrupted") {
+        this.notifyPdfGrab(correlation.scanID, grabID, "failed", "The PDF grab download was interrupted");
+        this.pdfGrabCorrelations.delete(grabID);
+        this.persistPdfGrabCorrelations();
+        continue;
+      }
+      if (item?.state === "complete") {
+        // The settled file is authoritative; the sweeper handles completed downloads.
+        continue;
+      }
+      this.grabDownloads.set(grabID, {
+        ids: new Set([correlation.downloadID]),
+        tabID: correlation.tabID,
+        scanID: correlation.scanID,
+        url: correlation.url,
+        steeringPath: correlation.steeringPath,
+      });
+    }
+  }
+
+  async requestPdfGrab(request: { tab_id: number; url: string; title?: string | undefined; workspace_tab_id?: number | undefined; scan_id?: string | undefined }): Promise<BrokerReply<{ grab_id: string }>> {
+    if (!this.pdfGrabAvailable()) return this.failure("feature_unavailable", "PDF grabbing needs Chrome download steering and a compatible daemon");
+    const result = await this.requestNative(
+      "pdf_grab_request",
+      { url: request.url, ...(request.title !== undefined ? { title: request.title } : {}) },
+      "pdf_grab_result",
+      PDF_GRAB_FEATURE,
+      true,
+    );
+    if (result.kind !== "response" || result.payload === undefined) return this.nativeFailure(result);
+    if (result.code !== undefined) return this.failure(result.code, result.message ?? "The PDF grab is unavailable");
+    const outcome = result.payload["outcome"];
+    const grabID = result.payload["grab_id"];
+    const steeringPath = result.payload["steering_path"];
+    if (outcome !== "steering" || typeof grabID !== "string" || typeof steeringPath !== "string") {
+      return this.failure("grab_failed", typeof result.payload["detail"] === "string" ? result.payload["detail"] : "The daemon could not start this PDF grab");
+    }
+    const workspaceTabID = request.workspace_tab_id ?? request.tab_id;
+    const scanID = request.scan_id ?? "";
+    this.grabDownloads.set(grabID, { ids: new Set<number>(), tabID: workspaceTabID, scanID, url: request.url, steeringPath });
+    this.pendingGrabDownloadURLs.set(request.url, { grabID, tabID: workspaceTabID, steeringPath });
+    try {
+      const id = await this.deps.downloads.download({ url: request.url, conflictAction: "uniquify", saveAs: false });
+      const track = this.grabDownloads.get(grabID);
+      if (track !== undefined) track.ids.add(id);
+      this.pdfGrabCorrelations.set(grabID, {
+        scanID,
+        tabID: workspaceTabID,
+        state: "grabbed",
+        downloadID: id,
+        steeringPath,
+        url: request.url,
+      });
+      this.persistPdfGrabCorrelations();
+      this.notifyPdfGrab(scanID, grabID, "grabbed");
+      return { ok: true, grab_id: grabID };
+    } catch {
+      this.grabDownloads.delete(grabID);
+      this.pdfGrabCorrelations.delete(grabID);
+      this.persistPdfGrabCorrelations();
+      this.pendingGrabDownloadURLs.delete(request.url);
+      return this.failure("grab_failed", "Could not start the browser download");
+    } finally {
+      this.pendingGrabDownloadURLs.delete(request.url);
+    }
+  }
+
 
   async requestPageBulkStatus(
     request: { scan_id: string; identifiers: PageBulkIdentifier[]; rendered_record_count_hint?: number },
@@ -3853,7 +4118,7 @@ export class Bridge {
   }
 
   /** Re-drive every job still parked at a terms gate now that consent is
-   * "accept": clear the one-time prompt flag and re-run classification on the
+   * accepted: clear the one-time prompt flag and re-run classification on the
    * live provider tab so an open terms modal is accepted and the download
    * completes without a second visit. Runs when the user grants consent AND on
    * worker startup, so a grant that landed while the worker was asleep (missing
@@ -3917,6 +4182,22 @@ export class Bridge {
     }
     return matched;
   }
+  private pendingGrabFor(item: DownloadItemLike): PdfGrabTrack | undefined {
+    const observed = [item.url, item.finalUrl].filter((value): value is string => typeof value === "string");
+    for (const [pendingURL, pending] of this.pendingGrabDownloadURLs) {
+      if (observed.some((url) => url === pendingURL || sameDownloadRoute(url, pendingURL))) {
+        return this.grabDownloads.get(pending.grabID);
+      }
+    }
+    return undefined;
+  }
+
+  private trackedGrabFor(downloadID: number): string | undefined {
+    for (const [grabID, track] of this.grabDownloads) {
+      if (track.ids.has(downloadID)) return grabID;
+    }
+    return undefined;
+  }
 
   private bindListeners(): void {
     if (this.listenersBound) return;
@@ -3941,14 +4222,16 @@ export class Bridge {
       return this.onDownloadChanged(delta);
     });
     this.deps.downloads.onDeterminingFilename?.addListener((item, suggest) => {
-      // The event can race on either side of downloads.download resolving:
-      // use its exact returned ID after resolution, or the pending URL before.
-      // Host fallback remains fail-closed when several jobs share a provider.
       const exactJobID = this.trackedJobFor(item.id) ?? this.pendingJobFor(item);
       const job = exactJobID ? findByJob(this.store, exactJobID) : this.correlate(item);
-      if (!job) return;
+      const grabID = this.trackedGrabFor(item.id);
+      const grab = grabID === undefined ? this.pendingGrabFor(item) : this.grabDownloads.get(grabID);
       const base = (item.filename ?? "").split(/[\\/]/).pop() ?? "";
-      if (base.length === 0) return;
+      if (grab !== undefined && base.length > 0 && job === undefined) {
+        suggest({ filename: `${grab.steeringPath}${base}`, conflictAction: "uniquify" });
+        return;
+      }
+      if (!job || base.length === 0) return;
       suggest({ filename: `papio/${job.job_id}/${base}`, conflictAction: "uniquify" });
     });
     this.deps.alarms.onAlarm.addListener((alarm) => {
@@ -4132,6 +4415,7 @@ export class Bridge {
     this.loginEntityIDs.delete(jobID);
     this.federatedLoginRouted.delete(jobID);
     this.federatedReDriven.delete(jobID);
+    this.waitingForSessionTimers.delete(jobID);
     this.handoffOutcomeSent.delete(`${jobID}:stale_sso`);
     this.handoffOutcomeSent.delete(`${jobID}:auth_error`);
     this.handoffOutcomeSent.delete(`${jobID}:ui_changed`);
@@ -4144,6 +4428,7 @@ export class Bridge {
     this.resolverNoEntitlementSent.delete(jobID);
     this.proquestAccountIDs.delete(jobID);
     this.accountIdAppended.delete(jobID);
+    await this.clearFederatedLoginOwnerForJob(jobID);
     await this.update((s) => {
       const offerURLs = { ...(s.offerURLs ?? {}) };
       delete offerURLs[jobID];
@@ -4706,7 +4991,16 @@ export class Bridge {
    * operator as authStalledReported. It never touches another origin's tabs
    * or queue. An offer origin outside the daemon's current configured set
    * fails closed (do nothing): this remains a best-effort, narrowly-scoped
-   * release, never a source of truth beyond its own origin. */
+   * release, never a source of truth beyond its own origin.
+   *
+   * Also resumes this origin's waiting_for_session siblings, UNCONDITIONALLY
+   * — not gated behind firstAuthEvidence/warm-evidence like the keepalive
+   * probe nudge above. THIS job finishing its own sign-in is the clearest
+   * possible proof the shared session is real, regardless of whether some
+   * other evidence for this origin already existed; gating it the same way
+   * would silently drop exactly the case that motivated this whole feature —
+   * a still-warm-looking origin whose real IdP session had actually expired,
+   * so evidence never re-lands and only THIS landing ever proves it. */
   private async recordInstitutionalSession(job: ActiveJob, rawURL: string, now: number): Promise<boolean> {
     if (!this.isInstitutionalSessionLanding(job, rawURL)) return false;
     const origin = this.jobInstitutionOrigin(job);
@@ -4729,6 +5023,7 @@ export class Bridge {
     }
     await this.drainQueuedHandoffs(origin, undefined, false);
     await this.reloadAuthenticationHandoffs(origin);
+    await this.resumeWaitingForSessionHandoffs(origin);
     return true;
   }
 
@@ -4931,7 +5226,21 @@ export class Bridge {
    * below. drainQueuedHandoffs is called directly with an exact origin
    * (never through releaseQueuedHandoffs, whose fallback-driven callers
    * below always pass no origin); recordInstitutionalSession's warm-landing
-   * path does the same for its own, narrower kind of evidence. */
+   * path does the same for its own, narrower kind of evidence.
+   *
+   * Also resumes every waiting_for_session sibling for this SAME institution
+   * (resumeWaitingForSessionHandoffs) — a park caused by anything else
+   * (challenge, manual download) is untouched: the helper looks at nothing
+   * but the waiting_for_session marker and the job's own offer origin, so
+   * ADR-0009's autonomous-retry line holds here too. Deliberately does NOT
+   * retire any federated-login registry claim: evidence is proof the
+   * institution's session is warm, never proof THIS SPECIFIC claim's owner
+   * tab actually finished — an owner still genuinely mid-redirect on the IdP
+   * survives even its own institution's evidence, so a resumed waiter's
+   * re-classify can only park behind it again, never open a second tab at
+   * the same login page. Idempotent under duplicate/repeated evidence: once
+   * a waiter is enqueued it clears waiting_for_session (clearParkedMarker),
+   * so a later call's scan simply finds nothing left to resume. */
   async recordFreshSessionEvidence(evidence: FreshSessionEvidence): Promise<void> {
     const { origin } = evidence;
     await this.ready;
@@ -4944,6 +5253,7 @@ export class Bridge {
     this.emitSessionEvidence("warm_verified", origin);
     await this.drainQueuedHandoffs(origin, undefined, false);
     await this.reloadAuthenticationHandoffs(origin);
+    await this.resumeWaitingForSessionHandoffs(origin);
   }
 
   /** Bypasses evidence for exactly one forced job — the 45s
@@ -5291,6 +5601,7 @@ export class Bridge {
       type,
       msg_id: this.deps.randomUUID().replace(/-/g, ""),
       seq: this.seq++,
+
       payload,
     };
     if (jobID !== undefined) env.job_id = jobID;
@@ -5326,7 +5637,7 @@ export class Bridge {
     // Keep later frames progressing even if a single handler fails unexpectedly;
     // the returned promise still exposes that failure to the event emitter.
     this.inboundChain = dispatched.catch((e) => {
-      console.error("papio: inbound handler failed", e);
+      console.error("papio: inbound frame handler failed", e);
     });
     return dispatched;
   }
@@ -5341,6 +5652,27 @@ export class Bridge {
     }
     this.pendingNativeRequests.delete(requestID);
     pending.resolve({ kind: "response", payload: msg.payload });
+  }
+  private onUnsolicitedPdfGrab(msg: BrowserMessage): void {
+    const grabID = msg.payload["grab_id"];
+    const outcome = msg.payload["outcome"];
+    if (typeof grabID !== "string" || typeof outcome !== "string") return;
+    const track = this.grabDownloads.get(grabID);
+    const persisted = this.pdfGrabCorrelations.get(grabID);
+    const correlation = track === undefined ? persisted : { scanID: track.scanID, tabID: track.tabID, state: "identifying" };
+    if (correlation === undefined) return;
+    const detail = typeof msg.payload["detail"] === "string" ? msg.payload["detail"] : undefined;
+    const terminal =
+      outcome === "job_created" ? "job_created" :
+      outcome === "already_owned" ? "already_owned" :
+      outcome === "needs_identifier" ? "needs_identifier" :
+      "failed";
+    // Terminal pushes are deliberately at-most-once; a reopened workspace reads
+    // the fresh snapshot rather than replaying an old outcome.
+    this.notifyPdfGrab(correlation.scanID, grabID, terminal, detail);
+    this.grabDownloads.delete(grabID);
+    this.pdfGrabCorrelations.delete(grabID);
+    this.persistPdfGrabCorrelations();
   }
 
   private async onInbound(raw: unknown): Promise<void> {
@@ -5361,6 +5693,11 @@ export class Bridge {
     // request timed out reporting that the daemon had not responded. A reply
     // type can no longer be named as a requestNative expectation and go
     // unrouted here.
+    const grabRequestID = msg.payload["request_id"];
+    if (msg.type === "pdf_grab_result" && (grabRequestID === undefined || grabRequestID === "")) {
+      this.onUnsolicitedPdfGrab(msg);
+      return;
+    }
     if (CORRELATED_RESULT_TYPES.has(msg.type)) {
       this.resolveNativeResponse(msg);
       return;
@@ -6067,6 +6404,10 @@ export class Bridge {
     // the adapter registry is the authoritative host source for classification,
     // so a tracked handoff landing on any registered family is on-provider.
     const onProvider = hostMatches(host, job.provider_hosts) || adapter !== undefined;
+    // Back on the provider means this tab left the IdP (successfully or not);
+    // either way it can no longer be the live sibling any waiting job is
+    // deferring to for this origin.
+    if (onProvider) await this.clearFederatedLoginOwnerForTab(tabID);
     const shouldAssessBeforeRouting =
       (change.status === "complete" || change.title !== undefined) &&
       (onProvider || isAuthenticationURL(url));
@@ -6637,12 +6978,183 @@ export class Bridge {
   }
 
 
+  /** Registry entries survive only as long as the tab they name; this is the
+   * one place that trusts a present entry as proof of a live sibling tab (no
+   * extra tabs.get liveness check), so every path that can end that claim's
+   * federated-login drive — tab close, navigate off the claimed origin,
+   * job removal, a dead restart-time owner — clears its entry through here
+   * or one of the two helpers below. Deliberately narrow: nothing here ever
+   * fires merely because session evidence landed (recordFreshSessionEvidence
+   * does not call this) — an owner still genuinely on the IdP survives even
+   * its own institution's evidence, so a resumed waiter can only park behind
+   * it again, never open a second tab at the same login page. Successfully
+   * clearing an entry always resumes that claim's own waiters
+   * (resumeWaitingForSessionByClaim): no path may retire a claim and leave
+   * its waiters ownerless. */
+  private async clearFederatedLoginOwner(claimKey: string, jobID: string): Promise<void> {
+    if (this.store.federatedLoginOwners?.[claimKey]?.jobID !== jobID) return;
+    await this.update((s) => {
+      const next = { ...(s.federatedLoginOwners ?? {}) };
+      delete next[claimKey];
+      return { ...s, federatedLoginOwners: next };
+    });
+    await this.resumeWaitingForSessionByClaim(claimKey);
+  }
+
+  /** A closed or navigated-away tab can no longer be the live sibling any
+   * waiting job is deferring to. Called for every removed/updated tab; a
+   * no-op unless that exact tab is a current registry owner. */
+  private async clearFederatedLoginOwnerForTab(tabID: number): Promise<void> {
+    const owners = this.store.federatedLoginOwners;
+    if (owners === undefined) return;
+    const claimKey = Object.keys(owners).find((key) => owners[key]?.tabID === tabID);
+    if (claimKey === undefined) return;
+    const jobID = owners[claimKey]?.jobID;
+    if (jobID === undefined) return;
+    await this.clearFederatedLoginOwner(claimKey, jobID);
+  }
+
+  /** Safety net for removeJobWithOffer: a job leaving tracking (cancel, reject,
+   * cross-provider replacement) is over as a federated-login owner even when
+   * its tab is still alive — onTabRemoved handles the tab-closed case, this
+   * handles every other way a job stops existing. */
+  private async clearFederatedLoginOwnerForJob(jobID: string): Promise<void> {
+    const owners = this.store.federatedLoginOwners;
+    if (owners === undefined) return;
+    const claimKey = Object.keys(owners).find((key) => owners[key]?.jobID === jobID);
+    if (claimKey === undefined) return;
+    await this.clearFederatedLoginOwner(claimKey, jobID);
+  }
+
+  /** Startup validation for federatedLoginOwners, mirroring parked_with_tab's
+   * own restart handling: the map is persisted (session storage, beside
+   * activeJobs) so a restarted worker does not let every parked sibling race
+   * to reclaim a claim a live owner already holds, but the owning job's tab
+   * may have closed while this worker was asleep with no onRemoved to catch
+   * it. Runs after reconcileTabs, so activeJobs.tab_id already reflects any
+   * dead-tab recovery that ran this restart; clearing routes through
+   * clearFederatedLoginOwner, so a dead owner's waiters requeue here too,
+   * not just its own claim disappearing. */
+  private async reconcileFederatedLoginOwners(): Promise<void> {
+    const owners = this.store.federatedLoginOwners;
+    if (owners === undefined) return;
+    for (const [claimKey, owner] of Object.entries(owners)) {
+      const ownerJob = findByJob(this.store, owner.jobID);
+      if (ownerJob === undefined || ownerJob.tab_id !== owner.tabID) {
+        await this.clearFederatedLoginOwner(claimKey, owner.jobID);
+      }
+    }
+  }
+
+  /** Shared drive-queue resume for every job `matches` selects out of the
+   * current waiting_for_session parks: enqueue through the same
+   * handoffDriveQueue resumeHandoffAfterManual and every re-offer use, so
+   * HANDOFF_DRIVE_LIMIT still caps concurrency and no tab is ever
+   * activated/focused. purpose "redrive" makes the queue drain navigate each
+   * tab back to its own offer URL (drainHandoffDriveQueueUnlocked) before
+   * re-registering the drive — the parked page is stale, unlike a manual
+   * challenge resume where the human already moved it forward. A job whose
+   * tab closed while parked never reaches here: onTabRemoved demotes it to
+   * an ordinary queued handoff instead, released the same way any other
+   * queued job is. enqueueHandoffDrive's own clearParkedMarker call drops
+   * both park markers here too, the moment intent to resume is expressed —
+   * a sibling still behind the governor is no longer marked parked, only
+   * still tab_id-tracked and auth_pending, until drainHandoffDriveQueueUnlocked
+   * actually claims its slot. Repeated/duplicate calls are idempotent: once
+   * a job's intent to resume is expressed it drops out of every future
+   * matches() scan (waiting_for_session is false), so a second call finds
+   * nothing left to enqueue for it.
+   *
+   * A candidate whose claim key STILL has a live owner is skipped
+   * regardless of `matches`: a present federatedLoginOwners entry IS the
+   * proof that owner's tab has neither closed nor left the claimed origin
+   * (clearFederatedLoginOwner/clearFederatedLoginOwnerForTab retire it the
+   * instant either happens), so resuming here could only re-park the exact
+   * same job a moment later — zero navigations and zero drive slots wasted
+   * on churn from a keepalive probe repeating every few seconds while a
+   * sign-in is genuinely still in progress. That job's real resume is the
+   * retirement chokepoint (the moment the owner truly leaves), never a
+   * repeated evidence/landing event.
+   *
+   * A candidate whose OWN waiting_deadline has already passed is likewise
+   * never resumed here — demoted instead, the same synchronous transition
+   * armSessionWaitTimeout's own expiry and reconcileSessionWaitTimeouts use.
+   * Startup runs reconcileFederatedLoginOwners (which can retire a dead
+   * owner's claim and land here) before reconcileSessionWaitTimeouts (which
+   * would otherwise have demoted the same expired waiter moments later): a
+   * claim retiring and a waiter's own deadline expiring can coincide at
+   * exactly the same restart, and whichever runs first must not hand that
+   * waiter a navigation and a drive slot its own timeout already promised
+   * it would never get, nor leave it holding an already-spent deadline. */
+  private async resumeWaitingForSessionJobs(matches: (job: ActiveJob) => boolean): Promise<void> {
+    const now = this.deps.now();
+    for (const job of this.store.activeJobs) {
+      if (job.waiting_for_session !== true || job.tab_id < 0 || !matches(job)) continue;
+      if (
+        job.waiting_for_session_key !== undefined &&
+        this.store.federatedLoginOwners?.[job.waiting_for_session_key] !== undefined
+      ) {
+        continue;
+      }
+      if (job.waiting_deadline !== undefined && now >= job.waiting_deadline) {
+        this.waitingForSessionTimers.delete(job.job_id);
+        await this.update((s) =>
+          patchJob(s, job.job_id, {
+            waiting_for_session: false,
+            waiting_for_session_key: undefined,
+            waiting_deadline: undefined,
+          }),
+        );
+        continue;
+      }
+      this.enqueueHandoffDrive({
+        jobID: job.job_id,
+        purpose: "redrive",
+        focusExisting: false,
+        surfaceFallback: false,
+      });
+    }
+    await this.drainHandoffDriveQueue();
+  }
+
+  /** Institution-scoped resume: every waiting_for_session job whose OWN
+   * offer resolves to `origin`, regardless of which specific claim key it is
+   * parked on. Used when the evidence for an origin is broader than any one
+   * claim (recordFreshSessionEvidence, recordInstitutionalSession). */
+  private async resumeWaitingForSessionHandoffs(origin: string): Promise<void> {
+    await this.resumeWaitingForSessionJobs(
+      (job) => this.resolverOriginHint(this.offerURLs.get(job.job_id)) === origin,
+    );
+  }
+
+  /** Claim-scoped resume: every waiting_for_session job parked on this exact
+   * claim key, regardless of its own offer origin resolving cleanly. Used
+   * when a specific claim retires (clearFederatedLoginOwner) — the owner
+   * job's own data may already be gone (removed, restart-dead), so this
+   * never depends on it: the waiters carry their own claim key. */
+  private async resumeWaitingForSessionByClaim(claimKey: string): Promise<void> {
+    await this.resumeWaitingForSessionJobs((job) => job.waiting_for_session_key === claimKey);
+  }
+
   /** Auto-select the institution on a provider login wall: navigate the handoff
    * tab to the adapter's federated-login entry with the offer's entityID, once
    * per drive. Institution selection is deterministic config, not a secret; the
    * human still enters credentials at the IdP. No-op without a configured route,
    * a known entityID, or a `tabs.update` seam, and never re-navigates mid
-   * sign-in (latched, cleared on job removal). */
+   * sign-in (latched, cleared on job removal).
+   *
+   * ONE login tab per institution: before navigating, check
+   * federatedLoginOwners for the claim key this template+entityID resolves
+   * to — the destination origin ALONE is not the institution: a shared
+   * WAYF/Discovery-Service host serving many institutions exposes exactly
+   * one origin for all of them, distinguished only by entityID in the query
+   * (the real ProQuest adapter is exactly this shape), so the claim key is
+   * origin+entityID, never origin alone. An already-live sibling tab holding
+   * that claim means a second tab at the same login page would teach the
+   * human nothing, so this job parks instead (waiting_for_session) and
+   * resumes when that claim retires or fresh institution evidence lands.
+   * Otherwise this job claims the key and becomes that live tab for any
+   * siblings that arrive next. */
   private async maybeRouteFederatedLogin(jobID: string, job: ActiveJob, spec: AdapterSpec): Promise<void> {
     const template = spec.federatedLogin;
     const entityID = this.loginEntityIDs.get(jobID);
@@ -6651,12 +7163,31 @@ export class Bridge {
     if (this.deps.tabs.update === undefined) return;
     const url = template.replace("{entityID}", encodeURIComponent(entityID));
     if (!url.startsWith("https://")) return;
+    let idpOrigin: string;
+    try {
+      idpOrigin = new URL(url).origin;
+    } catch {
+      return;
+    }
+    // JSON-encoded pair, not a plain join: entityID is itself a URL and may
+    // contain any separator a hand-picked delimiter could collide with.
+    const claimKey = JSON.stringify([idpOrigin, entityID]);
+    const owner = this.store.federatedLoginOwners?.[claimKey];
+    if (owner !== undefined && owner.jobID !== jobID) {
+      await this.parkHandoffWaitingForSession(jobID, claimKey);
+      return;
+    }
     this.federatedLoginRouted.add(jobID);
+    await this.update((s) => ({
+      ...s,
+      federatedLoginOwners: { ...(s.federatedLoginOwners ?? {}), [claimKey]: { jobID, tabID: job.tab_id } },
+    }));
     try {
       await this.deps.tabs.update(job.tab_id, { url });
     } catch (e) {
       // Let a later classify retry route again if this navigation failed.
       this.federatedLoginRouted.delete(jobID);
+      await this.clearFederatedLoginOwner(claimKey, jobID);
       console.error("papio: federated login route failed", e);
     }
   }
@@ -7006,6 +7537,10 @@ export class Bridge {
     if (pageCaptureWaiter !== undefined) pageCaptureWaiter(false);
     this.authCountedTabs.delete(tabID);
     void this.forgetLedgeredTab(tabID);
+    // A closed tab can no longer be the live sibling any waiting job is
+    // deferring to — regardless of whether this was a programmatic close
+    // (below) or a genuine user close (further down).
+    await this.clearFederatedLoginOwnerForTab(tabID);
     if (this.closingTabs.delete(tabID)) {
       await this.drainHandoffDriveQueue();
       return;
@@ -7013,6 +7548,30 @@ export class Bridge {
     const job = findByTab(this.store, tabID);
     if (!job) return;
     this.releaseHandoffDrive(job.job_id);
+    // A tab parked only because a SIBLING job owns the shared login tab
+    // (waiting_for_session) never had a chance to sign in on its own — its
+    // tab closing is not the operator abandoning the job, just losing the
+    // page it was quietly waiting on. Re-enter it as an ordinary queued
+    // drive (exactly reconcileTabs's dead-pre-download-tab recovery) so
+    // recordFreshSessionEvidence's existing queued-release path — not a
+    // second, redundant resume mechanism — is what reopens it.
+    if (job.waiting_for_session === true) {
+      this.waitingForSessionTimers.delete(job.job_id);
+      this.beginProviderDrive(job.job_id);
+      await this.update((s) =>
+        patchJob(s, job.job_id, {
+          tab_id: -1,
+          status: "queued",
+          waiting_for_session: false,
+          waiting_for_session_key: undefined,
+          parked_with_tab: false,
+          download_initiated: false,
+          unknown_count: 0,
+        }),
+      );
+      this.scheduleQueuedHandoffRelease(job.job_id);
+      return;
+    }
     if (this.deliveryJobs.has(job.job_id) || this.store.pendingDelivery?.job_id === job.job_id) {
       // The browser download is independent of the source tab. Keep its exact
       // correlation and pending record alive when the operator closes the PDF.
@@ -7071,13 +7630,12 @@ export class Bridge {
   }
 
   private async onDownloadCreated(item: DownloadItemLike): Promise<void> {
-    // Bind the download's ID to its job synchronously — before any await — so
-    // the onDeterminingFilename event that fires right after onCreated (and must
-    // call suggest() synchronously) can relocate the file into papio/<job>/ by
-    // ID. This is what lets a cross-origin api/url download land correctly:
-    // its provider redirect changes the URL before onDeterminingFilename, but at
-    // creation no redirect has occurred yet, so the pending-offer URL matches
-    // here and the ID is tracked in time.
+    const pendingGrab = this.pendingGrabFor(item);
+    if (pendingGrab !== undefined) {
+      pendingGrab.ids.add(item.id);
+      this.grabDownloads.set(this.trackedGrabFor(item.id) ?? "", pendingGrab);
+      return;
+    }
     const earlyJobID = this.trackedJobFor(item.id) ?? this.pendingJobFor(item);
     if (earlyJobID !== undefined) {
       const early = this.downloads.get(earlyJobID) ?? { ids: new Set<number>(), ambiguous: false, directOffer: false };
@@ -7086,25 +7644,42 @@ export class Bridge {
       this.downloads.set(earlyJobID, early);
     }
     await this.ready;
-    // API-started downloads usually have no tabId. Match the exact pending
-    // offer URL before applying broad tab/provider correlation.
     const exactJobID = this.trackedJobFor(item.id) ?? this.pendingJobFor(item);
     const job = exactJobID === undefined ? this.correlate(item) : findByJob(this.store, exactJobID);
-    if (!job) return; // unrelated tab / unknown origin: ignore entirely
+    if (!job) return;
     if (job.download_initiated !== true) {
-      // Native browser downloads (not just adapter/viewer API requests) must
-      // latch before a later completed-tab event can see a PDF viewer.
       await this.update((s) => patchJob(s, job.job_id, { download_initiated: true }));
     }
     const track = this.downloads.get(job.job_id) ?? { ids: new Set<number>(), ambiguous: false, directOffer: false };
     track.ids.add(item.id);
-    if (track.ids.size > 1) track.ambiguous = true; // simultaneous candidates: user decides
+    if (track.ids.size > 1) track.ambiguous = true;
     this.downloads.set(job.job_id, track);
   }
 
   private async onDownloadChanged(delta: DownloadDeltaLike): Promise<void> {
     await this.ready;
     const state = delta.state?.current;
+    const grabID = this.trackedGrabFor(delta.id);
+    if (grabID !== undefined) {
+      const grab = this.grabDownloads.get(grabID);
+      if (grab !== undefined) {
+        if (state === "interrupted") {
+          this.notifyPdfGrab(grab.scanID, grabID, "failed", "The PDF grab download was interrupted");
+          this.grabDownloads.delete(grabID);
+          this.pdfGrabCorrelations.delete(grabID);
+          this.persistPdfGrabCorrelations();
+          return;
+        }
+        if (state === "complete") {
+          const correlation = this.pdfGrabCorrelations.get(grabID);
+          if (correlation !== undefined) {
+            correlation.state = "identifying";
+            this.persistPdfGrabCorrelations();
+          }
+          this.notifyPdfGrab(grab.scanID, grabID, "identifying");
+        }
+      }
+    }
     if (state !== "complete") {
       if (state === "interrupted") {
         for (const job of this.store.activeJobs) {
@@ -7303,8 +7878,9 @@ function isOrphanTabsRequest(message: unknown): message is OrphanTabsRequest {
 }
 
 interface InboxRuntimeSender {
-  id?: string;
-  url?: string;
+  id?: string | undefined;
+  url?: string | undefined;
+  tab?: { id?: number | undefined } | undefined;
 }
 
 interface InboxRuntimeURLs {
@@ -7504,6 +8080,21 @@ function isPageBulkRescanRuntimeRequest(value: unknown): value is { scan_id: str
   );
 }
 
+function isPageBulkGrabRuntimeRequest(value: unknown): value is { tab_id: number; url: string; title?: string; scan_id?: string } {
+  if (!isObjectRecord(value) || !hasOnlyKeys(value, ["tab_id", "url", "title", "scan_id"])) return false;
+  const scanID = value["scan_id"];
+  if (scanID !== undefined && (typeof scanID !== "string" || scanID.length === 0 || scanID.length > 128)) return false;
+  return (
+    typeof value["tab_id"] === "number" &&
+    Number.isSafeInteger(value["tab_id"]) &&
+    value["tab_id"] >= 0 &&
+    typeof value["url"] === "string" &&
+    value["url"].startsWith("https://") &&
+    value["url"].length <= 4000 &&
+    (value["title"] === undefined || typeof value["title"] === "string")
+  );
+}
+
 function isPageBulkIdentifier(value: unknown): value is PageBulkIdentifier {
   if (!isObjectRecord(value) || !hasOnlyKeys(value, ["local_id", "kind", "value"])) return false;
   const kind = value["kind"];
@@ -7511,7 +8102,7 @@ function isPageBulkIdentifier(value: unknown): value is PageBulkIdentifier {
     typeof value["local_id"] === "string" &&
     value["local_id"].length > 0 &&
     value["local_id"].length <= 128 &&
-    (kind === "doi" || kind === "pmid" || kind === "arxiv") &&
+    (kind === "doi" || kind === "pmid" || kind === "arxiv" || kind === "openalex") &&
     typeof value["value"] === "string" &&
     value["value"].length > 0 &&
     value["value"].length <= 512
@@ -7807,6 +8398,14 @@ export async function handleInboxRuntimeMessage(
     }
     return bridge.setPageBulkAllowlist(request.origin, request.allowed);
   }
+  if (type === "papio.pageBulk.grabPdf") {
+    if (!isPageBulkSender(sender, urls)) return runtimeFailure("unauthorized", "This sender cannot grab a PDF");
+    const request = message["request"];
+    if (!hasOnlyKeys(message, ["type", "request"]) || !isPageBulkGrabRuntimeRequest(request)) {
+      return runtimeFailure("invalid_request", "Invalid PDF grab request");
+    }
+    return bridge.requestPdfGrab({ ...request, workspace_tab_id: sender.tab?.id });
+  }
   if (
     type !== "papio.activity" &&
     type !== "papio.triage.snapshot" &&
@@ -7889,6 +8488,7 @@ function realDeps(): BridgeDeps {
     setTimeout: (fn, ms) => {
       setTimeout(fn, ms);
     },
+    runtimeSendMessage: (message) => chrome.runtime.sendMessage(message),
     backend: chromeBackend(chrome.storage),
     tabs: {
       create: (props) => chrome.tabs.create(props),
@@ -7897,6 +8497,7 @@ function realDeps(): BridgeDeps {
       remove: (tabID) => chrome.tabs.remove(tabID),
       update: (tabID, props) => chrome.tabs.update(tabID, props),
       query: (query) => chrome.tabs.query(query),
+      sendMessage: (tabID, message) => chrome.tabs.sendMessage(tabID, message),
       onUpdated: { addListener: (cb) => chrome.tabs.onUpdated.addListener(cb) },
       onRemoved: { addListener: (cb) => chrome.tabs.onRemoved.addListener(cb) },
       onActivated: { addListener: (cb) => chrome.tabs.onActivated.addListener(cb) },
@@ -8023,6 +8624,21 @@ function realDeps(): BridgeDeps {
         await chrome.storage.session.set({ [PAGE_BULK_SCAN_STORAGE_KEY]: store });
       },
     },
+    pdfGrabCorrelations: {
+      async get() {
+        try {
+          const got = await chrome.storage.session.get(PDF_GRAB_CORRELATION_STORAGE_KEY);
+          const stored = got[PDF_GRAB_CORRELATION_STORAGE_KEY];
+          if (typeof stored !== "object" || stored === null) return {};
+          return stored as Record<string, PdfGrabCorrelation>;
+        } catch {
+          return {};
+        }
+      },
+      async set(value) {
+        await chrome.storage.session.set({ [PDF_GRAB_CORRELATION_STORAGE_KEY]: value });
+      },
+    },
     scannerAllowlist: {
       async get() {
         try {
@@ -8098,7 +8714,8 @@ if (typeof chrome !== "undefined" && chrome.runtime?.id) {
         message["type"] === "papio.pageBulk.status" ||
         message["type"] === "papio.pageBulk.submit" ||
         message["type"] === "papio.pageBulk.allowlist.get" ||
-        message["type"] === "papio.pageBulk.allowlist.set")
+        message["type"] === "papio.pageBulk.allowlist.set" ||
+        message["type"] === "papio.pageBulk.grabPdf")
     ) {
       void handleInboxRuntimeMessage(bridge, message, _sender, inboxRuntimeURLs).then((reply) => {
         sendResponse(reply);

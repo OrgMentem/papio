@@ -1,0 +1,1 @@
+{"protocol":"papio-browser/1","type":"pdf_grab_result","msg_id":"pdf-grab-result-002","seq":22,"payload":{"request_id":"pdf-grab-request-frame","grab_id":"grab_0123456789abcdef01234567","outcome":"unavailable","detail":"the adoption folder is not responding"}}

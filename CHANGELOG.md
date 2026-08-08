@@ -13,6 +13,24 @@ execution records kept during the initial build.
 
 ### Added
 
+- **Grab an open PDF straight from a browser tab (ADR-0020).** A tab
+  rendered in Chrome's own PDF viewer has no DOM to scan, so the selection
+  workspace used to report "no recognizable identifiers" for a paper the
+  operator was already looking at. Scanning a PDF tab now offers a one-click
+  "grab this PDF" row when the tab's own URL carries no identifier; accepting
+  it allocates a `pdf_grab_v1` capture slot (`pdf_grab_request`/
+  `pdf_grab_result`), steers `chrome.downloads.download` to
+  `papio/grabs/<grab-id>/` — no PDF bytes ever cross native messaging — and
+  the daemon's grab sweeper quarantines the settled file, structurally
+  validates it, and extracts a front-matter DOI (`internal/pdf`'s
+  `documentDOIs`). A found identifier creates the ordinary identifier-keyed
+  job (ADR-0010's ledger dedupe applies naturally: an already-owned work
+  reports "already in your library" rather than a duplicate job); no
+  identifier parks a `pdf_identifier_needed` human action instead of ever
+  submitting on the title alone (ADR-0019). Firefox has no download-steering
+  API, so the row renders disabled there with honest copy. New migration
+  0025 adds the `pdf_grabs` table.
+
 - **An agent skill (`SKILL.md`) that drives the CLI directly.** MCP was the only
   documented way to hand *papio* to a coding agent, which put a server between
   the agent and a CLI it can already run. The repo now ships a single root
@@ -29,6 +47,17 @@ execution records kept during the initial build.
   command the skill runs and every flag it names — including the ones discussed
   in prose rather than on a command line — to the live cobra tree, so it cannot
   drift into telling an agent to run something that no longer exists.
+- **`page_bulk_status_request` accepts OpenAlex work identifiers.** The
+  `identifiers.kind` vocabulary gains `openalex` alongside `doi`/`pmid`/`arxiv`
+  — mirrored across `internal/protocol`, the browser extension's TS
+  validator, and `protocol/browser-v1.schema.json` so the three stay
+  provably in agreement. The bridge normalizes a scanned W-id through the
+  same `work.NormalizeOpenAlex` the CLI and MCP already use and resolves it
+  through the existing OpenAlex source, so ownership answers come from
+  papio's own ledger. zotio's matcher (DOI/ArXiv/PMID only) is never
+  consulted for an OpenAlex-only row — it follows the same not-yet-checked
+  presentation as any other identifier no configured source covers, never a
+  false `eligible` claim.
 
 ### Changed
 

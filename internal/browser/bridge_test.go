@@ -27,6 +27,7 @@ import (
 	"papio/internal/captures"
 	"papio/internal/config"
 	"papio/internal/delivery"
+	"papio/internal/grab"
 	"papio/internal/ipc"
 	"papio/internal/job"
 	"papio/internal/ownership"
@@ -739,7 +740,7 @@ func TestHelloAckAnnouncesDaemonVersion(t *testing.T) {
 		t.Fatalf("daemon_version = %q, want 0.1.0-test", payload.DaemonVersion)
 	}
 	if !slices.Equal(payload.Features, []string{
-		pageAcquireFeature, triageSnapshotFeature, triageSnapshotSchema2Feature, triageMutationsFeature, reviewPreviewFeature, statsFeature, pageCaptureFeature, pageCaptureRequestFeature, activityFeedFeature, triageCountsSchema2Feature, sessionEvidenceFeature, deliveryContextFeature, pageCaptureTermsFeature, pageBulkAcquireFeature, triageSnapshotSchema3Feature,
+		pageAcquireFeature, triageSnapshotFeature, triageSnapshotSchema2Feature, triageMutationsFeature, reviewPreviewFeature, statsFeature, pageCaptureFeature, pageCaptureRequestFeature, activityFeedFeature, triageCountsSchema2Feature, sessionEvidenceFeature, deliveryContextFeature, pageCaptureTermsFeature, pageBulkAcquireFeature, triageSnapshotSchema3Feature, pdfGrabV1Feature,
 	}) {
 		t.Fatalf("features = %v, want required bridge feature set", payload.Features)
 	}
@@ -5366,6 +5367,83 @@ func TestPageBulkStatusNilZotioMatchesPriorBehavior(t *testing.T) {
 	}
 }
 
+// bulkOpenAlexReadyJob mirrors bulkReadyJob but keys the durable job on an
+// OpenAlex work identity instead of a DOI — canonicalJobStatus's ready
+// branch must key correctly off an "openalex" identifiers row exactly as it
+// does for "doi" (createRequest writes both from work.Work the same way;
+// internal/job/job.go's kind loop).
+func bulkOpenAlexReadyJob(t *testing.T, jobs *job.Store, reqID, openalexID string) string {
+	t.Helper()
+	ctx := context.Background()
+	id, err := jobs.CreateRequest(ctx, reqID, work.Work{OpenAlex: openalexID}, "", "",
+		job.Policy{AccessMode: config.ModeDelegated, DesiredVersion: "any", FetchMaxBytes: 1 << 20}, nil, job.PrincipalUnknown)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.Transition(ctx, id, job.StateQueued, job.StateResolving, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.Transition(ctx, id, job.StateResolving, job.StateReady, nil); err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+// TestPageBulkStatusOpenAlexWOnlyRowSkipsZotioAndFollowsLedger pins the
+// zotio-lookup chunk builder's OpenAlex exclusion end to end: zotio.LookupWork
+// carries only DOI/ArXiv/PMID fields, so an openalex-only row never reaches
+// zotio at all (pageBulkZotioLookup's per-identifier switch falls through its
+// `default: continue`, and pageBulkStatusItem's default ownership branch never
+// calls the generic holdings registry for it either). Ownership completeness
+// therefore follows papio's own ledger exclusively: a ready bundle still
+// answers owned_with_pdf keyed on the openalex canonical identity
+// ("openalex:W…", work.Describe's form), while a row with no ledger state at
+// all gets the ordinary not-fully-checked ownership_incomplete presentation —
+// never a false eligible-and-complete claim, and never ownership_unknown
+// (which would mean zotio was wrongly consulted and came back stale).
+func TestPageBulkStatusOpenAlexWOnlyRowSkipsZotioAndFollowsLedger(t *testing.T) {
+	// findErr forces every zotio CLI call to fail loudly. If either the
+	// chunk builder or the default ownership branch were ever wrongly
+	// extended to consult zotio for kind "openalex", this round would
+	// surface ownership_unknown (the stale-zotio branch) for row-2 instead
+	// of the ownership_incomplete asserted below.
+	cli := &fakeZotioCLI{findErr: fmt.Errorf("zotio must never be queried for an openalex-only row")}
+	b, jobs, _, _ := newBridgeWithHoldingsAndZotio(t, nil, &zotio.Service{CLI: cli})
+	runSync(t, b, hello())
+
+	readyID := bulkOpenAlexReadyJob(t, jobs, "wr_bulk_openalex_ready", "W1976043798")
+
+	frame := inFrame(t, protocol.MsgPageBulkStatusRequest, "", protocol.PageBulkStatusRequestPayload{
+		RequestID: "request-bulk-oax0001", ScanID: "scan-bulk-oax00001",
+		Identifiers: []protocol.PageBulkIdentifier{
+			{LocalID: "row-1", Kind: "openalex", Value: "w1976043798"},
+			{LocalID: "row-2", Kind: "openalex", Value: "W2741809807"},
+			{LocalID: "row-3", Kind: "openalex", Value: "not-a-work-id"},
+		},
+	})
+	msgs, _ := runSync(t, b, frame)
+	result := firstOfType(msgs, protocol.MsgPageBulkStatusResult)
+	if result == nil {
+		t.Fatalf("no page_bulk_status_result in %v", msgs)
+	}
+	items := result.Payload.(*protocol.PageBulkStatusResultPayload).Items
+
+	ready := items[0]
+	if ready.Status != "owned_with_pdf" || ready.JobID != "" || !ready.OwnershipComplete || ready.CanonicalKey != "openalex:W1976043798" {
+		t.Fatalf("items[0] = %+v, want owned_with_pdf (job_id daemon-side) for ready job %q keyed on the openalex canonical identity", ready, readyID)
+	}
+	unchecked := items[1]
+	if unchecked.Status != "ownership_incomplete" || unchecked.OwnershipComplete || unchecked.ZotioItemKey != "" {
+		t.Fatalf("items[1] = %+v, want the ordinary not-fully-checked ownership_incomplete presentation, never eligible/owned/unknown", unchecked)
+	}
+	if invalid := items[2]; invalid.Status != "invalid" || invalid.CanonicalKey != "" {
+		t.Fatalf("items[2] = %+v, want invalid for a malformed OpenAlex work id with no canonical_key", invalid)
+	}
+	if cli.syncCalls != 0 {
+		t.Fatalf("sync calls = %d, want 0 — an openalex-only row must never reach zotio at all", cli.syncCalls)
+	}
+}
+
 // TestPageBulkSubmitCreatesJobsWithBrowserPageConsumer exercises Decision 5/7
 // end to end: a live key joins, a fresh key creates a browser-page job, a fresh
 // PDF-present holdings claim is skipped server-side as already_owned, and a key
@@ -5453,6 +5531,60 @@ func TestPageBulkSubmitCreatesJobsWithBrowserPageConsumer(t *testing.T) {
 	}
 	if openedAt == "" || submittedAt == "" {
 		t.Fatal("run opened_at/submitted_at must be populated")
+	}
+}
+
+// TestPageBulkSubmitOpenAlexCanonicalKeyCreatesJob pins the P1 fix to
+// pageBulkWorkRequest/pageBulkIdentifierOf: before the fix, an "openalex:W…"
+// canonical key decoded to a WorkRequest with a zero-value Identifiers (no
+// case populated it), which app-side validation silently rejected — every
+// OpenAlex submission counted invalid and no job was ever created. A fresh
+// key must create exactly one job keyed on the openalex identity, and a key
+// naming a work papio already holds ready must dedupe as already_owned
+// (pageBulkIdentifierOf's ready-bundle short-circuit) rather than creating a
+// second job — the same semantics doi/arxiv/pmid keys already get.
+func TestPageBulkSubmitOpenAlexCanonicalKeyCreatesJob(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	runSync(t, b, hello())
+	bulkOpenAlexReadyJob(t, jobs, "wr_bulk_openalex_owned", "W2741809807")
+
+	frame := inFrame(t, protocol.MsgPageBulkSubmitRequest, "", protocol.PageBulkSubmitRequestPayload{
+		RequestID: "request-bulk-submit003", ScanID: "scan-bulk-submit0003",
+		CanonicalKeys: []string{"openalex:W1976043798", "openalex:W2741809807", "openalex:not-a-work-id"},
+		Source: protocol.PageBulkSubmitSource{
+			Kind: "browser_page", Origin: "https://scholar.example.edu", Detector: "generic-identifiers/1",
+		},
+	})
+	msgs, _ := runSync(t, b, frame)
+	result := firstOfType(msgs, protocol.MsgPageBulkSubmitResult)
+	if result == nil {
+		t.Fatalf("no page_bulk_submit_result in %v", msgs)
+	}
+	payload := result.Payload.(*protocol.PageBulkSubmitResultPayload)
+	if payload.Submitted != 1 || payload.AlreadyOwned != 1 || payload.Invalid != 1 || payload.Joined != 0 {
+		t.Fatalf("counts = %+v, want {submitted:1 already_owned:1 invalid:1}: a fresh W-id creates a job, a ready W-work dedupes, a malformed one is invalid", payload)
+	}
+
+	var openalexJobID, doi string
+	if err := jobs.S.DB().QueryRowContext(ctx, `
+		SELECT j.id, COALESCE((SELECT value FROM identifiers WHERE work_request_id = j.work_request_id AND kind = 'doi'), '')
+		FROM jobs j
+		JOIN identifiers i ON i.work_request_id = j.work_request_id
+		WHERE i.kind = 'openalex' AND i.value = 'W1976043798'`,
+	).Scan(&openalexJobID, &doi); err != nil {
+		t.Fatalf("no job created for the fresh openalex key: %v", err)
+	}
+	if openalexJobID == "" {
+		t.Fatal("openalex job id is empty")
+	}
+
+	var jobCount int
+	if err := jobs.S.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM jobs`).Scan(&jobCount); err != nil {
+		t.Fatal(err)
+	}
+	if jobCount != 2 {
+		t.Fatalf("jobs after submit = %d, want 2 (the seeded ready job plus one new): the already-owned key must not create a third", jobCount)
 	}
 }
 
@@ -5656,5 +5788,309 @@ func TestSweepTerminalAdoptionsRemovesEmptyUnknownDirs(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(full, "paper.pdf")); err != nil {
 		t.Fatalf("unknown dir with contents must be preserved for a human: %v", err)
+	}
+}
+
+// TestPdfGrabAllocatesSteeringPath pins the happy path of ADR-0020's
+// synchronous allocation reply: a grab id, a papio/grabs/<id>/ steering
+// path, and a landing directory actually created under the adoption root.
+func TestPdfGrabAllocatesSteeringPath(t *testing.T) {
+	b, _, cfg, _ := newBridge(t)
+	runSync(t, b, hello())
+	msgs, _ := runSync(t, b, inFrame(t, protocol.MsgPdfGrabRequest, "", map[string]any{
+		"request_id": "grab-req-0001", "url": "https://pdf.example.org/main.pdf", "title": "A Paper",
+	}))
+	got := firstOfType(msgs, protocol.MsgPdfGrabResult)
+	if got == nil {
+		t.Fatalf("no pdf_grab_result frame: %+v", msgs)
+	}
+	p := got.Payload.(*protocol.PdfGrabResultPayload)
+	if p.Outcome != "steering" || p.GrabID == "" {
+		t.Fatalf("payload = %+v, want steering outcome with a grab id", p)
+	}
+	wantPrefix := "papio/grabs/" + p.GrabID + "/"
+	if p.SteeringPath != wantPrefix {
+		t.Fatalf("steering_path = %q, want %q", p.SteeringPath, wantPrefix)
+	}
+	if _, err := os.Stat(filepath.Join(cfg.EffectiveAdoptionRoot(), "grabs", p.GrabID)); err != nil {
+		t.Fatalf("landing directory not created: %v", err)
+	}
+}
+
+// TestPdfGrabRefusesOnUnhealthyLatch pins ADR-0020's fail-closed refusal: a
+// missing-capability outcome, structured (never a raw Go error), and no
+// grab is allocated (no landing directory left behind).
+func TestPdfGrabRefusesOnUnhealthyLatch(t *testing.T) {
+	b, _, cfg, _ := newBridge(t)
+	runSync(t, b, hello())
+	b.adoptionScanSuspended = true
+	msgs, _ := runSync(t, b, inFrame(t, protocol.MsgPdfGrabRequest, "", map[string]any{
+		"request_id": "grab-req-0002", "url": "https://pdf.example.org/main.pdf",
+	}))
+	got := firstOfType(msgs, protocol.MsgPdfGrabResult)
+	if got == nil {
+		t.Fatalf("no pdf_grab_result frame: %+v", msgs)
+	}
+	p := got.Payload.(*protocol.PdfGrabResultPayload)
+	if p.Outcome != "unavailable" || p.GrabID != "" || p.SteeringPath != "" || p.Detail == "" {
+		t.Fatalf("payload = %+v, want a structured unavailable refusal with no grab_id", p)
+	}
+	entries, err := os.ReadDir(filepath.Join(cfg.EffectiveAdoptionRoot(), "grabs"))
+	if err == nil && len(entries) != 0 {
+		t.Fatalf("refusal must not allocate a grab: found %d landing dirs", len(entries))
+	}
+}
+
+// grabDOIValidate returns a Validate stub whose Text.Excerpt prints doi in
+// front matter, so SweepGrabs's documentDOIs extraction finds it without any
+// network fetch.
+func grabDOIValidate(doi string) func(context.Context, string, string, work.Work) (pdf.ValidationReport, error) {
+	return func(context.Context, string, string, work.Work) (pdf.ValidationReport, error) {
+		return pdf.ValidationReport{
+			Payload:    pdf.PayloadReport{OK: true},
+			Structural: pdf.StructuralReport{Valid: true, Pages: 1},
+			Text:       pdf.TextReport{Chars: 40, Excerpt: "DOI: " + doi + "\nA Paper Worth Grabbing\n"},
+			Identity:   pdf.IdentityDecision{Result: pdf.IdentityPass, Evidence: []string{"doi match"}},
+		}, nil
+	}
+}
+
+// TestSweepGrabsCreatesJobFromDOI is ADR-0020 Decision 4's identifier-found
+// path end to end: a settled grab file is quarantined, structurally
+// validated, its front-matter DOI extracted, and an ordinary identifier-keyed
+// job created and claimed — all from local text, no network fetch needed for
+// the artifact itself.
+func TestSweepGrabsCreatesJobFromDOI(t *testing.T) {
+	b, jobs, cfg, _ := newBridge(t)
+	b.svc.Validate = grabDOIValidate("10.1234/grab.test")
+	ctx := context.Background()
+
+	g, err := b.grabs.Allocate(ctx, "pdf.example.org", "A Paper Worth Grabbing")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(cfg.EffectiveAdoptionRoot(), "grabs", g.ID)
+	writeFixturePDF(t, filepath.Join(dir, "main.pdf"))
+
+	if err := b.SweepGrabs(ctx); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	got, err := b.grabs.Get(ctx, g.ID)
+	if err != nil || got == nil {
+		t.Fatalf("grab lookup: %v", err)
+	}
+	if got.State != grab.StateJobCreated || got.Outcome != "job_created" || got.JobID == "" {
+		t.Fatalf("grab = %+v, want job_created/job_created with a job id", got)
+	}
+	row, err := jobs.Get(ctx, got.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.Work.DOI != "10.1234/grab.test" {
+		t.Fatalf("job work.DOI = %q, want the extracted DOI", row.Work.DOI)
+	}
+	if row.State != job.StateReady || row.ArtifactSHA256 == "" {
+		t.Fatalf("job not claimed by adoption in the same pass: %+v", row)
+	}
+	if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("grab landing dir survived claim: err=%v", err)
+	}
+}
+
+// TestSweepGrabsCreatesJobFromDOIReportsAlreadyOwned pins the ledger-dedupe
+// half of Decision 4: an already-live job for the same DOI is joined, never
+// duplicated, and the grab reports already_owned.
+func TestSweepGrabsCreatesJobFromDOIReportsAlreadyOwned(t *testing.T) {
+	b, jobs, cfg, _ := newBridge(t)
+	b.svc.Validate = grabDOIValidate("10.1234/grab.owned")
+	ctx := context.Background()
+	existingID := park(t, jobs, "wr_grab_owned", work.Work{DOI: "10.1234/grab.owned", Title: "Already Owned"})
+
+	g, err := b.grabs.Allocate(ctx, "pdf.example.org", "Already Owned")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(cfg.EffectiveAdoptionRoot(), "grabs", g.ID)
+	writeFixturePDF(t, filepath.Join(dir, "main.pdf"))
+
+	if err := b.SweepGrabs(ctx); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	got, err := b.grabs.Get(ctx, g.ID)
+	if err != nil || got == nil {
+		t.Fatalf("grab lookup: %v", err)
+	}
+	if got.Outcome != "already_owned" || got.JobID != existingID {
+		t.Fatalf("grab = %+v, want already_owned pointing at the existing job %s", got, existingID)
+	}
+	var jobCount int
+	if err := jobs.S.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM jobs j JOIN identifiers i ON i.work_request_id = j.work_request_id WHERE i.kind='doi' AND i.value=?`,
+		"10.1234/grab.owned").Scan(&jobCount); err != nil {
+		t.Fatal(err)
+	}
+	if jobCount != 1 {
+		t.Fatalf("jobs for this DOI = %d, want exactly 1 (no duplicate)", jobCount)
+	}
+}
+
+// TestSweepGrabsParksNoIdentifier is ADR-0020 Decision 4's no-identifier
+// path: a title-only job hosting a pdf_identifier_needed human action,
+// parked at awaiting_human — never an identifier-less submission attempt.
+func TestSweepGrabsParksNoIdentifier(t *testing.T) {
+	b, jobs, cfg, _ := newBridge(t)
+	b.svc.Validate = func(context.Context, string, string, work.Work) (pdf.ValidationReport, error) {
+		return pdf.ValidationReport{
+			Payload:    pdf.PayloadReport{OK: true},
+			Structural: pdf.StructuralReport{Valid: true, Pages: 1},
+			Text:       pdf.TextReport{Chars: 40, Excerpt: "No identifier printed anywhere on this page.\n"},
+		}, nil
+	}
+	ctx := context.Background()
+	g, err := b.grabs.Allocate(ctx, "pdf.example.org", "Mystery Paper")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(cfg.EffectiveAdoptionRoot(), "grabs", g.ID)
+	writeFixturePDF(t, filepath.Join(dir, "main.pdf"))
+
+	if err := b.SweepGrabs(ctx); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	got, err := b.grabs.Get(ctx, g.ID)
+	if err != nil || got == nil {
+		t.Fatalf("grab lookup: %v", err)
+	}
+	if got.State != grab.StateParkedNoIdentifier || got.Outcome != "needs_identifier" || got.JobID == "" {
+		t.Fatalf("grab = %+v, want parked_no_identifier/needs_identifier with a job id", got)
+	}
+	row, err := jobs.Get(ctx, got.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.State != job.StateAwaitingHuman {
+		t.Fatalf("job state = %s, want awaiting_human", row.State)
+	}
+	actions, err := jobs.ListHumanActionsForJob(ctx, got.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(actions) != 1 || actions[0].Action.Kind != job.ActionKindPdfIdentifierNeeded || actions[0].Action.Status != "open" {
+		t.Fatalf("human actions = %+v, want exactly one open pdf_identifier_needed", actions)
+	}
+}
+
+// TestSweepGrabsFailsValidationForNonPDF pins the honest failed_validation
+// state for a settled file that is not a PDF at all.
+func TestSweepGrabsFailsValidationForNonPDF(t *testing.T) {
+	b, _, cfg, _ := newBridge(t)
+	b.svc.Validate = func(context.Context, string, string, work.Work) (pdf.ValidationReport, error) {
+		return pdf.ValidationReport{Payload: pdf.PayloadReport{OK: false}}, nil
+	}
+	ctx := context.Background()
+	g, err := b.grabs.Allocate(ctx, "pdf.example.org", "Not Actually A PDF")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(cfg.EffectiveAdoptionRoot(), "grabs", g.ID)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "main.pdf"), []byte("<html>not a pdf</html>"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := b.SweepGrabs(ctx); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	got, err := b.grabs.Get(ctx, g.ID)
+	if err != nil || got == nil {
+		t.Fatalf("grab lookup: %v", err)
+	}
+	if got.State != grab.StateFailedValidation || got.Outcome != "failed_validation" {
+		t.Fatalf("grab = %+v, want failed_validation/failed_validation", got)
+	}
+}
+
+// TestSweepGrabsSkipsTickOnHungRoot mirrors
+// TestSweepsSkipTickOnHungAdoptionRoot for the grabs/ subtree: a TCC-hung
+// root must never wedge the grab sweeper, and the shared latch must not
+// stack a second hung goroutine underneath it.
+func TestSweepGrabsSkipsTickOnHungRoot(t *testing.T) {
+	b, _, _, _ := newBridge(t)
+	ctx := context.Background()
+
+	var calls int32
+	block := make(chan struct{})
+	t.Cleanup(func() { close(block) })
+	b.readDir = func(string) ([]os.DirEntry, error) {
+		atomic.AddInt32(&calls, 1)
+		<-block
+		return nil, errors.New("unreachable in this test")
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- b.SweepGrabs(ctx) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("SweepGrabs during hung root: %v, want nil (skip tick)", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("SweepGrabs wedged on a hung adoption root instead of skipping the tick")
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("readDir calls = %d, want 1", got)
+	}
+}
+
+// TestHumanActionDismissDiscardsGrabRowWithoutCancellingJob pins ADR-0020's
+// pinned dismissal disposition: dismissing a pdf_identifier_needed action
+// cancels nothing, but the grab row it was bound to is discarded.
+func TestHumanActionDismissDiscardsGrabRowWithoutCancellingJob(t *testing.T) {
+	b, jobs, cfg, _ := newBridge(t)
+	b.svc.Validate = func(context.Context, string, string, work.Work) (pdf.ValidationReport, error) {
+		return pdf.ValidationReport{
+			Payload: pdf.PayloadReport{OK: true}, Structural: pdf.StructuralReport{Valid: true, Pages: 1},
+			Text: pdf.TextReport{Excerpt: "no identifier here"},
+		}, nil
+	}
+	ctx := context.Background()
+	g, err := b.grabs.Allocate(ctx, "pdf.example.org", "Dismiss Me")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(cfg.EffectiveAdoptionRoot(), "grabs", g.ID)
+	writeFixturePDF(t, filepath.Join(dir, "main.pdf"))
+	if err := b.SweepGrabs(ctx); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	got, err := b.grabs.Get(ctx, g.ID)
+	if err != nil || got == nil {
+		t.Fatalf("grab lookup: %v", err)
+	}
+	actions, err := jobs.ListHumanActionsForJob(ctx, got.JobID)
+	if err != nil || len(actions) != 1 {
+		t.Fatalf("actions = %+v, err=%v", actions, err)
+	}
+
+	runSync(t, b, hello())
+	msgs, _ := runSync(t, b, inFrame(t, protocol.MsgHumanActionResolve, got.JobID, map[string]any{
+		"request_id": "dismiss-req-0001", "action_id": actions[0].Action.ID, "verdict": "dismiss",
+		"expected_revision": actions[0].Action.Revision,
+	}))
+	res := firstOfType(msgs, protocol.MsgHumanActionResolveResult)
+	if res == nil || res.Payload.(*protocol.HumanActionResolveResultPayload).Outcome != "applied" {
+		t.Fatalf("dismiss result = %+v", msgs)
+	}
+	row, err := jobs.Get(ctx, got.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.State == job.StateCancelled {
+		t.Fatalf("dismiss must not cancel the job: state = %s", row.State)
+	}
+	if after, err := b.grabs.Get(ctx, g.ID); err != nil || after != nil {
+		t.Fatalf("grab row survived dismiss: %+v, err=%v", after, err)
 	}
 }

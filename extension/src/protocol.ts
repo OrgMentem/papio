@@ -56,7 +56,9 @@ export type BrowserMessageType =
   | "page_bulk_status_request"
   | "page_bulk_status_result"
   | "page_bulk_submit_request"
-  | "page_bulk_submit_result";
+  | "page_bulk_submit_result"
+  | "pdf_grab_request"
+  | "pdf_grab_result";
 
 export interface HelloPayload {
   extension_version: string;
@@ -424,7 +426,7 @@ export interface ActivityResponsePayload {
 
 export interface PageBulkIdentifier {
   local_id: string;
-  kind: "doi" | "pmid" | "arxiv";
+  kind: "doi" | "pmid" | "arxiv" | "openalex";
   value: string;
 }
 
@@ -497,6 +499,36 @@ export interface PageBulkSubmitResultPayload {
   batch_id: string;
 }
 
+/** ADR-0020: browser → daemon request to grab an open PDF tab that no
+ * tab-URL identifier covers. The daemon allocates a grab id and, on success,
+ * a steering path under the reserved papio/grabs/<id>/ adoption subtree. */
+export interface PdfGrabRequestPayload {
+  request_id: string;
+  url: string;
+  title?: string;
+}
+
+/** ADR-0020: sent by the daemon TWICE per grab — synchronously as the
+ * direct reply to pdf_grab_request (request_id set, outcome "steering" with
+ * grab_id + steering_path, or a request_id-carrying refusal), and later,
+ * unsolicited, once the grab sweeper has identified the captured file
+ * (request_id absent, grab_id correlates back, outcome one of the terminal
+ * four). steering_path is exactly papio/grabs/<grab-id>/. */
+export interface PdfGrabResultPayload {
+  request_id?: string;
+  grab_id?: string;
+  outcome:
+    | "steering"
+    | "not_supported"
+    | "unavailable"
+    | "job_created"
+    | "already_owned"
+    | "needs_identifier"
+    | "failed_validation";
+  steering_path?: string;
+  detail?: string;
+}
+
 export interface BrowserMessage {
   protocol: typeof BROWSER_PROTOCOL_VERSION;
   type: BrowserMessageType;
@@ -553,6 +585,8 @@ const MSG_TYPES: Record<string, true> = {
   page_bulk_status_result: true,
   page_bulk_submit_request: true,
   page_bulk_submit_result: true,
+  pdf_grab_request: true,
+  pdf_grab_result: true,
 };
 
 const JOB_SCOPED: Record<string, true> = {
@@ -602,6 +636,9 @@ const FILENAME_RE = /^[^/\\]{1,255}$/u;
 const RFC3339_RE =
   /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(Z|([+-])(\d{2}):(\d{2}))$/;
 const BASE64_RE = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+// Must stay byte-identical to the steering-path pattern
+// internal/protocol/protocol.go's pdf_grab_result validation enforces.
+const PDF_GRAB_STEERING_PATH_RE = /^papio\/grabs\/[A-Za-z0-9_-]{8,64}\/$/;
 
 function fail(msg: string): never {
   throw new ProtocolError(msg);
@@ -1624,7 +1661,7 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
         if (seenIDs.has(localID)) fail(`page_bulk_status_request.identifiers.local_id ${JSON.stringify(localID)} is duplicated`);
         seenIDs.add(localID);
         const kind = str(identifier, "kind", "page_bulk_status_request.identifiers", 10);
-        if (kind !== "doi" && kind !== "pmid" && kind !== "arxiv") fail("page_bulk_status_request.identifiers.kind is invalid");
+        if (kind !== "doi" && kind !== "pmid" && kind !== "arxiv" && kind !== "openalex") fail("page_bulk_status_request.identifiers.kind is invalid");
         const value = triageText(identifier, "value", "page_bulk_status_request.identifiers", 512);
         if (value === "") fail("page_bulk_status_request.identifiers.value is required");
       }
@@ -1767,6 +1804,61 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
       int(p, "invalid", "page_bulk_submit_result", 0);
       if (!JOB_ID_RE.test(str(p, "batch_id", "page_bulk_submit_result", 128))) {
         fail("page_bulk_submit_result.batch_id is invalid");
+      }
+      break;
+    }
+    case "pdf_grab_request": {
+      requireFields<PdfGrabRequestPayload>(p, "pdf_grab_request", {
+        request_id: "required",
+        url: "required",
+        title: "optional",
+      });
+      correlationID(p, "request_id", "pdf_grab_request");
+      const grabURL = str(p, "url", "pdf_grab_request", 4000);
+      if (!grabURL.startsWith("https://")) fail("pdf_grab_request.url must be https");
+      try {
+        const parsed = new URL(grabURL);
+        if (parsed.protocol !== "https:" || parsed.host === "") fail("pdf_grab_request.url must be https");
+      } catch {
+        fail("pdf_grab_request.url must be https");
+      }
+      if ("title" in p) triageText(p, "title", "pdf_grab_request", 500);
+      break;
+    }
+    case "pdf_grab_result": {
+      requireFields<PdfGrabResultPayload>(p, "pdf_grab_result", {
+        request_id: "optional",
+        grab_id: "optional",
+        outcome: "required",
+        steering_path: "optional",
+        detail: "optional",
+      });
+      const outcome = str(p, "outcome", "pdf_grab_result", 30);
+      if ("grab_id" in p) correlationID(p, "grab_id", "pdf_grab_result");
+      if (
+        !["steering", "not_supported", "unavailable", "job_created", "already_owned", "needs_identifier", "failed_validation"].includes(
+          outcome,
+        )
+      ) {
+        fail("pdf_grab_result.outcome is invalid");
+      }
+      if (outcome !== "not_supported" && outcome !== "unavailable" && !("grab_id" in p)) {
+        fail(`pdf_grab_result: ${outcome} outcome requires grab_id`);
+      }
+      const requestID = "request_id" in p ? correlationID(p, "request_id", "pdf_grab_result") : "";
+      if ("steering_path" in p && !PDF_GRAB_STEERING_PATH_RE.test(str(p, "steering_path", "pdf_grab_result", 128))) {
+        fail("pdf_grab_result.steering_path is invalid");
+      }
+      if ("detail" in p) triageText(p, "detail", "pdf_grab_result", 1000);
+      if (outcome === "steering") {
+        if (requestID === "") fail("pdf_grab_result: steering outcome requires request_id");
+        if (!("steering_path" in p)) fail("pdf_grab_result: steering outcome requires steering_path");
+      } else if (outcome === "not_supported" || outcome === "unavailable") {
+        if (requestID === "") fail(`pdf_grab_result: ${outcome} outcome requires request_id`);
+        if ("steering_path" in p) fail(`pdf_grab_result: ${outcome} outcome must not carry steering_path`);
+      } else {
+        if (requestID !== "") fail(`pdf_grab_result: ${outcome} outcome must not carry request_id`);
+        if ("steering_path" in p) fail(`pdf_grab_result: ${outcome} outcome must not carry steering_path`);
       }
       break;
     }

@@ -50,7 +50,9 @@
         "page_bulk_status_request",
         "page_bulk_status_result",
         "page_bulk_submit_request",
-        "page_bulk_submit_result"
+        "page_bulk_submit_result",
+        "pdf_grab_request",
+        "pdf_grab_result"
       ]
     },
     "msg_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,64}$" },
@@ -452,7 +454,7 @@
       "required": ["local_id", "kind", "value"],
       "properties": {
         "local_id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[^\\u0000]+$" },
-        "kind": { "enum": ["doi", "pmid", "arxiv"] },
+        "kind": { "enum": ["doi", "pmid", "arxiv", "openalex"] },
         "value": { "type": "string", "minLength": 1, "maxLength": 512, "pattern": "^[^\\u0000]+$" }
       }
     },
@@ -1230,6 +1232,56 @@
           }
         }
       }
+    },
+    {
+      "if": { "properties": { "type": { "const": "pdf_grab_request" } } },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["request_id", "url"],
+            "properties": {
+              "request_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,64}$" },
+              "url": { "type": "string", "format": "uri", "maxLength": 4000, "pattern": "^https://[^\\u0000]+$" },
+              "title": { "type": "string", "maxLength": 500, "pattern": "^[^\\u0000]*$" }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "pdf_grab_result" } } },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["outcome"],
+            "properties": {
+              "request_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,64}$" },
+              "grab_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,64}$" },
+              "outcome": {
+                "enum": ["steering", "not_supported", "unavailable", "job_created", "already_owned", "needs_identifier", "failed_validation"]
+              },
+              "steering_path": { "type": "string", "pattern": "^papio/grabs/[A-Za-z0-9_-]{8,64}/$" },
+              "detail": { "type": "string", "maxLength": 1000, "pattern": "^[^\\u0000]*$" }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "pdf_grab_result" }, "payload": { "properties": { "outcome": { "const": "steering" } } } } },
+      "then": { "properties": { "payload": { "required": ["request_id", "grab_id", "steering_path"] } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "pdf_grab_result" }, "payload": { "properties": { "outcome": { "enum": ["not_supported", "unavailable"] } } } } },
+      "then": { "properties": { "payload": { "required": ["request_id"], "allOf": [{ "not": { "required": ["steering_path"] } }] } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "pdf_grab_result" }, "payload": { "properties": { "outcome": { "enum": ["job_created", "already_owned", "needs_identifier", "failed_validation"] } } } } },
+      "then": { "properties": { "payload": { "required": ["grab_id"], "allOf": [{ "not": { "required": ["request_id"] } }, { "not": { "required": ["steering_path"] } }] } } }
     }
   ]
 }

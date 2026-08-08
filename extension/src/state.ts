@@ -131,6 +131,71 @@ export interface ActiveJob {
    * transition in the tab-update handler) — never left stale, or the job
    * would be skipped by every future restore forever. */
   parked_with_tab?: boolean;
+  /** Set when this handoff's classify verdict was "login" and its
+   * federated-login claim key (federatedLoginOwners, below — the IdP origin
+   * maybeRouteFederatedLogin would navigate to, PLUS the offer's entityID:
+   * a shared WAYF/Discovery-Service host serving many institutions exposes
+   * only ONE origin, so entityID is the axis that actually distinguishes
+   * them) already has a live sibling tab driving that sign-in — so this tab
+   * is deliberately left on the provider's login wall instead of opening a
+   * second, redundant IdP tab. A distinct marker from parked_with_tab (which
+   * it is always set alongside whenever a tab is preserved) so UI copy and
+   * the multiple resume paths below can tell "this job's own timeout/
+   * challenge park" apart from "this job is only waiting on ANOTHER job's
+   * shared institution sign-in". Resumes on: the claim's owner finishing
+   * (recordInstitutionalSession, unconditionally — even when this
+   * institution's evidence was already warm), the owner's claim retiring
+   * for any reason (clearFederatedLoginOwner, which always resumes that
+   * claim's own waiters — never leaves one ownerless), or fresh session
+   * evidence for the same institution (recordFreshSessionEvidence). Bounded
+   * by its own SESSION_WAIT_TIMEOUT_MS governor timer: past it, the marker
+   * clears on its own and the job reverts to an ordinary parked_with_tab
+   * park — the pre-feature presentation — rather than waiting invisibly
+   * forever for an owner who may have simply walked away. Cleared the
+   * moment the job drives again (registerHandoffDrive, via
+   * clearParkedMarker) or, if its tab closes while parked, when
+   * onTabRemoved demotes it to an ordinary queued drive. */
+  waiting_for_session?: boolean;
+  /** The federatedLoginOwners claim key this job is waiting on (see
+   * waiting_for_session above). Lets clearFederatedLoginOwner resume exactly
+   * the waiters of the ONE claim that just retired, without needing the
+   * (possibly already-removed) owner job's own offer/institution data. */
+  waiting_for_session_key?: string | undefined;
+  /** Absolute epoch ms past which a waiting_for_session park demotes on its
+   * own (SESSION_WAIT_TIMEOUT_MS after the FIRST park, not each re-park —
+   * see below). Persisted, not just a worker-local timer: an MV3 restart
+   * mid-wait must re-arm the SAME deadline, not grant a fresh budget merely
+   * because the worker happened to sleep. Set once, the first time a job
+   * ever parks; reused (never reset) by every subsequent re-park under a
+   * new or the same claim, so a job cannot extend its own wait indefinitely
+   * by cycling through park/resume/park. Cleared only when the deadline
+   * itself is spent (the timeout demotion fires) — a genuinely fresh future
+   * park, after that, earns a fresh budget. */
+  waiting_deadline?: number | undefined;
+}
+/** Cross-job record of the one live tab currently driving federated login for
+ * a given claim key — the federated-login destination origin
+ * (maybeRouteFederatedLogin's IdP/DS URL) PLUS the offer's entityID. A bare
+ * origin is not enough: a shared WAYF/Discovery-Service host fronts many
+ * institutions on one origin, distinguished only by entityID in the query,
+ * so keying on origin alone would let institution B block on — or resume
+ * from — institution A's unrelated claim. Lets three papers needing the same
+ * institution share ONE login tab instead of each opening its own: a job
+ * whose login verdict would navigate to a claim key already held here parks
+ * (waiting_for_session) instead. Persisted beside parked_with_tab (session
+ * storage) so a service-worker restart sees the same claim rather than
+ * letting every parked sibling race to reclaim it; reconcileFederatedLoginOwners
+ * drops any entry whose owning job no longer has that exact tab. Retirement
+ * is deliberately narrow — the owning tab closes, navigates off the claimed
+ * origin, or its job is removed (clearFederatedLoginOwnerForTab /
+ * clearFederatedLoginOwnerForJob) — and NEVER fires merely because session
+ * evidence landed: an owner still genuinely on the IdP survives a sibling
+ * institution's (or even its own institution's not-yet-proven) evidence, so
+ * a second tab can never open at the same login page while the first is
+ * still live. Every retirement resumes that claim's own waiters. */
+export interface FederatedLoginOwner {
+  jobID: string;
+  tabID: number;
 }
 /** A short, browser-session lease over one provider's queued handoffs. The
  * owner token stays only in the service worker; session storage retains this
@@ -198,6 +263,10 @@ export interface StoreShape {
   /** Provider registrable-host cooldowns after a security check or redirect
    * loop. Values are epoch milliseconds; no URL or IdP data is retained. */
   challengeCooldowns?: Record<string, number>;
+  /** One live login-tab claim per federated-login (IdP) origin, so multiple
+   * jobs needing the same institution share a single sign-in tab. See
+   * FederatedLoginOwner's doc comment for the full lifecycle. */
+  federatedLoginOwners?: Record<string, FederatedLoginOwner>;
 }
 
 /** Async key/value seam. The real implementation wraps chrome.storage; tests

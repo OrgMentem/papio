@@ -640,6 +640,18 @@ func documentDOIs(text string) []string {
 	return out
 }
 
+// FrontMatterDOIs returns the normalized, deduplicated DOIs printed in a
+// document's front matter — the same window MatchIdentity reads its own-DOI
+// evidence from. Exported for the PDF-grab pipeline (ADR-0020), which must
+// identify a captured file before any job exists: there is no target
+// work.Work yet to corroborate against, so corroboratingIdentifier's
+// arXiv/PMID markers do not apply (they compare against a KNOWN
+// identifier); inventing a target-less arXiv/PMID extractor is out of scope
+// for this decision — only the DOI front-matter pattern extracts blind.
+func FrontMatterDOIs(text string) []string {
+	return documentDOIs(identityFrontMatter(text))
+}
+
 // identityWindow returns the head of page one, bounded by limit. Every
 // front-matter rule reads one of these; only the bound differs, and each
 // bound is a separately measured tradeoff.

@@ -465,6 +465,53 @@ test("merges auth-pending paper rows into the institution session card", async (
   expect(session?.hidden).toBe(true);
 });
 
+test("a waiting_for_session paper renders no Focus action and distinct copy, unlike a plain auth_pending paper", () => {
+  const doc = popupDocument();
+  const focused: string[] = [];
+  renderNeedsAttention(
+    doc,
+    [
+      job({
+        job_id: "job-own-signin",
+        status: "auth_pending",
+        expected: { title: "Waiting on my own sign-in" },
+      }),
+      job({
+        job_id: "job-waiting-sibling",
+        status: "auth_pending",
+        waiting_for_session: true,
+        expected: { title: "Deferring to a sibling paper" },
+      }),
+    ],
+    [],
+    async (jobID) => {
+      focused.push(jobID);
+    },
+  );
+
+  const rows = doc.querySelectorAll(".institution-session-waiting-row");
+  expect(rows).toHaveLength(2);
+
+  const ownRow = rows[0] as HTMLElement;
+  expect(ownRow.querySelector(".institution-session-waiting-title")?.textContent).toBe(
+    "Waiting on my own sign-in",
+  );
+  const ownButton = ownRow.querySelector("button") as HTMLButtonElement;
+  expect(ownButton.textContent).toBe("Focus");
+  expect(ownRow.querySelector(".institution-session-waiting-status")).toBeNull();
+  ownButton.click();
+  expect(focused).toEqual(["job-own-signin"]);
+
+  const waitingRow = rows[1] as HTMLElement;
+  expect(waitingRow.querySelector(".institution-session-waiting-title")?.textContent).toBe(
+    "Deferring to a sibling paper",
+  );
+  expect(waitingRow.querySelector("button")).toBeNull();
+  expect(waitingRow.querySelector(".institution-session-waiting-status")?.textContent).toBe(
+    "Waiting for the institution sign-in — another paper's tab is at the login page",
+  );
+});
+
 test("uses a DOI then job id when an awaiting sign-in has no paper title", () => {
   const doc = popupDocument();
   renderNeedsAttention(

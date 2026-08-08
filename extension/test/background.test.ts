@@ -11,7 +11,7 @@ import { parseBrowserMessage, type BrowserMessage } from "../src/protocol";
 import { emptyStore, type StateBackend, type StoreShape } from "../src/state";
 import { capturePage, encodePageCapture, sanitizeFixture } from "../src/capture";
 import { KeepaliveManager, type FreshSessionEvidence, type KeepaliveAPI } from "../src/keepalive";
-import { interpret, type AdapterSpec } from "../src/adapters/types";
+import { interpret, type AdapterSpec, type PageVerdict } from "../src/adapters/types";
 import {
   Bridge,
   findManagedTab,
@@ -28,6 +28,7 @@ import {
   type DownloadDeltaLike,
   type DownloadItemLike,
   type NativePort,
+  type PdfGrabCorrelation,
   type TabChangeInfo,
   type TabInfo,
 } from "../src/background";
@@ -333,6 +334,8 @@ interface Harness {
   tabGroups?: FakeTabGroups;
   clock: { now: number };
   timers: { fn: () => void | Promise<void>; ms: number }[];
+  runtimeMessages: object[];
+  pdfGrabCorrelations: { current: Record<string, PdfGrabCorrelation> };
   frames(): BrowserMessage[];
   alarms: FakeAlarms;
   postedStrings(): string[];
@@ -396,6 +399,11 @@ function makeHarness(
   const timers: { fn: () => void | Promise<void>; ms: number }[] = [];
   const action = new FakeAction();
   const alarms = new FakeAlarms();
+  const runtimeMessages: object[] = [];
+  const pdfGrabCorrelations: { current: Record<string, PdfGrabCorrelation> } = { current: {} };
+  const runtimeSendMessage = async (message: object): Promise<void> => {
+    runtimeMessages.push(message);
+  };
   const deps: BridgeDeps = {
     connectNative: () => {
       if (connects++ === 0) return port;
@@ -411,6 +419,13 @@ function makeHarness(
     },
     backend,
     tabs,
+    runtimeSendMessage,
+    pdfGrabCorrelations: {
+      get: async () => pdfGrabCorrelations.current,
+      set: async (value) => {
+        pdfGrabCorrelations.current = value;
+      },
+    },
     downloads,
     // No registered adapters and no granted host: these behavioural tests stay
     // entirely in assisted mode, so the classifier never fires. Adapter mapping
@@ -442,6 +457,8 @@ function makeHarness(
     ...(tabGroups !== undefined ? { tabGroups } : {}),
     clock,
     timers,
+    runtimeMessages,
+    pdfGrabCorrelations,
     alarms,
     frames: () => ports.flatMap((p) => p.posted.map(parseBrowserMessage)),
     postedStrings: () => ports.flatMap((p) => p.posted.map((f) => JSON.stringify(f))),
@@ -3920,6 +3937,158 @@ test("papio.pageBulk.submit happy dispatch forwards the request to the bridge an
   expect(received).toEqual(request);
 });
 
+test("papio.pageBulk.grabPdf routes a steering grab through the native port and identifies its download", async () => {
+  const h = makeHarness();
+  const urls = pageBulkTestURLs;
+  const sender = { id: urls.runtimeID, url: urls.pageBulkURL, tab: { id: 42 } };
+  const request = {
+    tab_id: 42,
+    url: "https://resolver.example.edu/content/paper.pdf",
+    title: "A paper",
+    scan_id: "scan-grab-1",
+  };
+
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ daemon_version: CURRENT_DAEMON, features: ["pdf_grab_v1"] }));
+  const replyPromise: Promise<unknown> = handleInboxRuntimeMessage(
+    h.bridge,
+    { type: "papio.pageBulk.grabPdf", request },
+    sender,
+    urls,
+  );
+  const requestFrame = await h.port.waitForFrame("pdf_grab_request");
+  expect(requestFrame.payload).toMatchObject({ url: request.url, title: request.title });
+  const requestID = requestFrame.payload["request_id"];
+  expect(typeof requestID).toBe("string");
+  await h.port.inbound(
+    nativeResult("pdf_grab_result", {
+      request_id: requestID as string,
+      outcome: "steering",
+      grab_id: "grab-00000001",
+      steering_path: "papio/grabs/grabpath/",
+    }),
+  );
+  await expect(replyPromise).resolves.toEqual({ ok: true, grab_id: "grab-00000001" });
+  expect(h.downloads.started[0]).toMatchObject({
+    url: request.url,
+    conflictAction: "uniquify",
+    saveAs: false,
+  });
+
+  const suggestions: { filename: string; conflictAction: string }[] = [];
+  await h.downloads.onDeterminingFilename.emit(
+    { id: 901, url: request.url, filename: "/tmp/received-paper.pdf", state: "in_progress" },
+    (suggestion) => suggestions.push(suggestion),
+  );
+  expect(suggestions).toEqual([{ filename: "papio/grabs/grabpath/received-paper.pdf", conflictAction: "uniquify" }]);
+
+  await h.downloads.onChanged.emit({ id: 901, state: { current: "complete" } });
+  expect(h.runtimeMessages).toContainEqual({
+    type: "papio.pageBulk.grabState",
+    scan_id: request.scan_id,
+    grab_id: "grab-00000001",
+    state: "identifying",
+  });
+});
+
+test("papio.pageBulk.grabPdf reconciles an interrupted download after a service-worker restart", async () => {
+  const first = makeHarness();
+  const urls = pageBulkTestURLs;
+  const sender = { id: urls.runtimeID, url: urls.pageBulkURL, tab: { id: 42 } };
+  const request = {
+    tab_id: 42,
+    url: "https://resolver.example.edu/content/restart-paper.pdf",
+    scan_id: "scan-grab-restart",
+  };
+
+  await first.bridge.start();
+  await first.port.inbound(helloAck({ daemon_version: CURRENT_DAEMON, features: ["pdf_grab_v1"] }));
+  const replyPromise: Promise<unknown> = handleInboxRuntimeMessage(
+    first.bridge,
+    { type: "papio.pageBulk.grabPdf", request },
+    sender,
+    urls,
+  );
+  const requestFrame = await first.port.waitForFrame("pdf_grab_request");
+  await first.port.inbound(
+    nativeResult("pdf_grab_result", {
+      request_id: requestFrame.payload["request_id"] as string,
+      outcome: "steering",
+      grab_id: "grab-restart",
+      steering_path: "papio/grabs/grabpath/",
+    }),
+  );
+  await expect(replyPromise).resolves.toEqual({ ok: true, grab_id: "grab-restart" });
+  const persisted = JSON.parse(JSON.stringify(first.pdfGrabCorrelations.current)) as Record<string, PdfGrabCorrelation>;
+
+  const restarted = makeHarness(JSON.parse(JSON.stringify(first.backend.store)) as StoreShape);
+  restarted.pdfGrabCorrelations.current = persisted;
+  restarted.downloads.items.set(901, {
+    id: 901,
+    url: request.url,
+    state: "interrupted",
+  });
+  await restarted.bridge.start();
+  expect(restarted.runtimeMessages).toContainEqual({
+    type: "papio.pageBulk.grabState",
+    scan_id: request.scan_id,
+    grab_id: "grab-restart",
+    state: "failed",
+    detail: "The PDF grab download was interrupted",
+  });
+  expect(restarted.pdfGrabCorrelations.current).toEqual({});
+});
+
+test("papio.pageBulk.grabPdf delivers an unsolicited terminal result after a service-worker restart", async () => {
+  const first = makeHarness();
+  const urls = pageBulkTestURLs;
+  const sender = { id: urls.runtimeID, url: urls.pageBulkURL, tab: { id: 42 } };
+  const request = {
+    tab_id: 42,
+    url: "https://resolver.example.edu/content/terminal-paper.pdf",
+    scan_id: "scan-grab-terminal",
+  };
+
+  await first.bridge.start();
+  await first.port.inbound(helloAck({ daemon_version: CURRENT_DAEMON, features: ["pdf_grab_v1"] }));
+  const replyPromise: Promise<unknown> = handleInboxRuntimeMessage(
+    first.bridge,
+    { type: "papio.pageBulk.grabPdf", request },
+    sender,
+    urls,
+  );
+  const requestFrame = await first.port.waitForFrame("pdf_grab_request");
+  await first.port.inbound(
+    nativeResult("pdf_grab_result", {
+      request_id: requestFrame.payload["request_id"] as string,
+      outcome: "steering",
+      grab_id: "grab-terminal",
+      steering_path: "papio/grabs/grabpath/",
+    }),
+  );
+  await expect(replyPromise).resolves.toEqual({ ok: true, grab_id: "grab-terminal" });
+  const persisted = JSON.parse(JSON.stringify(first.pdfGrabCorrelations.current)) as Record<string, PdfGrabCorrelation>;
+
+  const restarted = makeHarness(JSON.parse(JSON.stringify(first.backend.store)) as StoreShape);
+  restarted.pdfGrabCorrelations.current = persisted;
+  await restarted.bridge.start();
+  await restarted.port.inbound(
+    nativeResult("pdf_grab_result", {
+      grab_id: "grab-terminal",
+      outcome: "job_created",
+      detail: "Queued for adoption",
+    }),
+  );
+  expect(restarted.runtimeMessages).toContainEqual({
+    type: "papio.pageBulk.grabState",
+    scan_id: request.scan_id,
+    grab_id: "grab-terminal",
+    state: "job_created",
+    detail: "Queued for adoption",
+  });
+  expect(restarted.pdfGrabCorrelations.current).toEqual({});
+});
+
 test("open inbox runtime request focuses the singleton or creates it from the popup", async () => {
   const h = makeHarness(undefined, { windows: true });
   const urls = {
@@ -6289,4 +6458,577 @@ test("a hello_ack immediately notifies the keepalive manager of configured-origi
   await h.port.inbound(helloAck({ resolver_origins: ["https://resolver.example.edu"] }));
 
   expect(notifications).toEqual([0]);
+});
+
+// One login tab per institution: a cross-job federated-login registry keyed
+// by a CLAIM KEY — the federated-login destination (IdP/DS) origin PLUS the
+// offer's entityID — so three papers needing the same institution share a
+// single sign-in tab instead of each opening its own. The origin alone is
+// not enough: a shared WAYF/Discovery-Service host serving many
+// institutions exposes exactly one origin, distinguished only by entityID
+// (the real ProQuest adapter is exactly this shape).
+const FED_ENTITY_ID = "https://idp.example.edu/entity";
+const FED_LOGIN_TEMPLATE =
+  "https://login.idp.example.edu/Shibboleth.sso/DS?entityID={entityID}&target=https://login.idp.example.edu/home";
+const FED_LOGIN_URL = FED_LOGIN_TEMPLATE.replace("{entityID}", encodeURIComponent(FED_ENTITY_ID));
+const FED_IDP_ORIGIN = new URL(FED_LOGIN_URL).origin;
+const FED_CLAIM_KEY = JSON.stringify([FED_IDP_ORIGIN, FED_ENTITY_ID]);
+const FED_PROVIDER_LOGIN_URL = `https://${PROVIDER_HOST}/login-wall`;
+const RESOLVER_ORIGIN = "https://resolver.example.edu";
+// A second institution sharing the exact same DS host as FED_ENTITY_ID above
+// — only entityID and the offer's own resolver origin differ.
+const FED_ENTITY_ID_B = "https://idp-b.example.edu/entity";
+const RESOLVER_ORIGIN_B = "https://resolver-b.example.edu";
+const OPENURL_B = "https://resolver-b.example.edu/openurl?ctx=xyz";
+const FED_CLAIM_KEY_B = JSON.stringify([FED_IDP_ORIGIN, FED_ENTITY_ID_B]);
+const FED_LOGIN_SPEC: AdapterSpec = {
+  id: "fedlogin",
+  version: "1.0.0",
+  hosts: [PROVIDER_HOST],
+  classify: [{ kind: "login", all: ["#login-form"] }],
+  federatedLogin: FED_LOGIN_TEMPLATE,
+};
+const FED_LOGIN_VERDICT: PageVerdict = {
+  kind: "login",
+  adapter_id: "fedlogin",
+  adapter_version: "1.0.0",
+  evidence: [],
+};
+
+function fedLoginOffer(jobID: string, entityID: string = FED_ENTITY_ID, openurl: string = OPENURL): unknown {
+  const offer = jobOffer(jobID, openurl) as { payload: Record<string, unknown> };
+  offer.payload["login_entity_id"] = entityID;
+  return offer;
+}
+
+function makeFedLoginHarness(seed?: StoreShape): Harness {
+  const h = makeHarness(
+    seed ?? { ...emptyStore(), authEvidenceByOrigin: { [RESOLVER_ORIGIN]: 1_700_000_000_000 } },
+  );
+  h.deps.adapterSpecs.push(FED_LOGIN_SPEC);
+  h.deps.permissions.contains = async () => true;
+  h.deps.scripting.executeScript = async (injection) => {
+    if (injection.func === assessDrivenPage) return [{ result: { kind: "normal" } }];
+    if (injection.func === interpret) return [{ result: FED_LOGIN_VERDICT }];
+    return [];
+  };
+  return h;
+}
+
+/** Keeps the fake tab's live URL in sync with a simulated landing on the
+ * shared provider login wall — FakeTabs never updates `.live` on its own
+ * from an emitted onUpdated event, only from a real `.update()` call. */
+async function landOnFedProviderWall(h: Harness, tabID: number): Promise<void> {
+  h.tabs.live.set(tabID, { id: tabID, url: FED_PROVIDER_LOGIN_URL });
+  await h.tabs.onUpdated.emit(
+    tabID,
+    { url: FED_PROVIDER_LOGIN_URL, status: "complete" },
+    { id: tabID, url: FED_PROVIDER_LOGIN_URL },
+  );
+}
+
+/** Offers three jobs for the same institution (evidence pre-seeded so all
+ * three open real handoff tabs, HANDOFF_DRIVE_LIMIT capping two concurrent),
+ * then lands every one of them on the shared provider login wall. Returns
+ * the harness with job_fed_a as the federated-login owner and job_fed_b /
+ * job_fed_c parked in waiting_for_session. */
+async function primeFedLoginTriad(): Promise<{ h: Harness; tabA: number; tabB: number; tabC: number }> {
+  const h = makeFedLoginHarness();
+  await h.bridge.start();
+  for (const jobID of ["job_fed_a", "job_fed_b", "job_fed_c"]) {
+    await h.port.inbound(fedLoginOffer(jobID));
+  }
+  const tabA = h.backend.store.activeJobs.find((j) => j.job_id === "job_fed_a")?.tab_id ?? -1;
+  const tabB = h.backend.store.activeJobs.find((j) => j.job_id === "job_fed_b")?.tab_id ?? -1;
+  await landOnFedProviderWall(h, tabA);
+  await landOnFedProviderWall(h, tabB);
+  // job_fed_c was queued behind the governor; parking job_fed_b just freed
+  // its slot, so it now has a real tab too.
+  const tabC = h.backend.store.activeJobs.find((j) => j.job_id === "job_fed_c")?.tab_id ?? -1;
+  await landOnFedProviderWall(h, tabC);
+  return { h, tabA, tabB, tabC };
+}
+
+test("one login tab per institution: two siblings park in waiting_for_session instead of opening their own IdP tab", async () => {
+  const { h, tabA, tabB, tabC } = await primeFedLoginTriad();
+
+  expect(tabA).toBeGreaterThanOrEqual(0);
+  expect(tabB).toBeGreaterThanOrEqual(0);
+  expect(tabC).toBeGreaterThanOrEqual(0);
+
+  // Exactly one tab ever navigates to the IdP.
+  const idpNavs = h.tabs.navigations.filter((n) => n.url === FED_LOGIN_URL);
+  expect(idpNavs).toEqual([{ tabID: tabA, url: FED_LOGIN_URL }]);
+
+  const a = h.backend.store.activeJobs.find((j) => j.job_id === "job_fed_a");
+  const b = h.backend.store.activeJobs.find((j) => j.job_id === "job_fed_b");
+  const c = h.backend.store.activeJobs.find((j) => j.job_id === "job_fed_c");
+  expect(a?.waiting_for_session).toBeUndefined();
+  expect(b).toMatchObject({
+    waiting_for_session: true,
+    waiting_for_session_key: FED_CLAIM_KEY,
+    parked_with_tab: true,
+    tab_id: tabB,
+    status: "auth_pending",
+  });
+  expect(c).toMatchObject({
+    waiting_for_session: true,
+    waiting_for_session_key: FED_CLAIM_KEY,
+    parked_with_tab: true,
+    tab_id: tabC,
+    status: "auth_pending",
+  });
+
+  // The other two tabs are left exactly where they were — the provider's
+  // login wall, never navigated to the IdP.
+  expect(h.tabs.live.get(tabB)?.url).toBe(FED_PROVIDER_LOGIN_URL);
+  expect(h.tabs.live.get(tabC)?.url).toBe(FED_PROVIDER_LOGIN_URL);
+
+  expect(h.backend.store.federatedLoginOwners).toEqual({
+    [FED_CLAIM_KEY]: { jobID: "job_fed_a", tabID: tabA },
+  });
+});
+
+test("repeated decisive evidence events cost zero navigations for a waiter whose claim owner is still live", async () => {
+  const { h, tabA, tabB, tabC } = await primeFedLoginTriad();
+  const originalDeadline = h.backend.store.activeJobs.find((j) => j.job_id === "job_fed_b")?.waiting_deadline;
+  expect(originalDeadline).toBeDefined();
+  h.tabs.navigations.splice(0);
+  const createdBefore = h.tabs.created.length;
+
+  // Repeated probes fire the same decisive evidence multiple times (probes
+  // fire repeatedly in practice) while job_fed_a — the claim's owner — is
+  // still, for all this evidence proves, mid sign-in on the IdP. None of it
+  // may resume job_fed_b or job_fed_c: resuming would only re-park them a
+  // moment later, at the cost of a real navigation and a governor slot.
+  for (let i = 0; i < 3; i += 1) {
+    await h.bridge.recordFreshSessionEvidence(freshEvidence(h, RESOLVER_ORIGIN));
+  }
+
+  expect(h.tabs.navigations).toEqual([]);
+  expect(h.tabs.created.length).toBe(createdBefore);
+  expect(h.tabs.activated).toEqual([]);
+  const b = h.backend.store.activeJobs.find((j) => j.job_id === "job_fed_b");
+  const c = h.backend.store.activeJobs.find((j) => j.job_id === "job_fed_c");
+  expect(b?.waiting_for_session).toBe(true);
+  expect(b?.waiting_deadline).toBe(originalDeadline);
+  expect(c?.waiting_for_session).toBe(true);
+  // The claim itself is untouched too — still exactly the owner it started
+  // with.
+  expect(h.backend.store.federatedLoginOwners).toEqual({
+    [FED_CLAIM_KEY]: { jobID: "job_fed_a", tabID: tabA },
+  });
+});
+
+test("the claim owner leaving the IdP resumes its waiters exactly once, through the retirement chokepoint — never the prior evidence events", async () => {
+  const { h, tabA, tabB, tabC } = await primeFedLoginTriad();
+  // Three prior evidence events, all no-ops per the test above.
+  for (let i = 0; i < 3; i += 1) {
+    await h.bridge.recordFreshSessionEvidence(freshEvidence(h, RESOLVER_ORIGIN));
+  }
+  expect(h.backend.store.activeJobs.find((j) => j.job_id === "job_fed_b")?.waiting_for_session).toBe(true);
+  h.tabs.navigations.splice(0);
+
+  // job_fed_a finally leaves the IdP and lands back on the provider.
+  // clearFederatedLoginOwnerForTab retires the claim, which resumes every
+  // one of that exact claim's waiters — the ONLY thing that actually moved
+  // job_fed_b and job_fed_c, not the three evidence events before it.
+  h.tabs.live.set(tabA, { id: tabA, url: FED_PROVIDER_LOGIN_URL });
+  await h.tabs.onUpdated.emit(
+    tabA,
+    { url: FED_PROVIDER_LOGIN_URL, status: "complete" },
+    { id: tabA, url: FED_PROVIDER_LOGIN_URL },
+  );
+
+  // a1 itself never frees a governor slot merely by landing back on the
+  // provider (it keeps driving toward its own resolution — the same job
+  // that owned the claim, not resumed by it), so exactly ONE of its two
+  // waiters claims the one slot this retirement made available; the other
+  // drops its park markers too (intent to resume expressed) but stays
+  // queued behind the governor until a slot genuinely frees.
+  expect(h.backend.store.federatedLoginOwners).toEqual({});
+  const resumedNav = h.tabs.navigations.find((n) => n.tabID === tabB || n.tabID === tabC);
+  expect(resumedNav?.url).toBe(OPENURL);
+  const b = h.backend.store.activeJobs.find((j) => j.job_id === "job_fed_b");
+  const c = h.backend.store.activeJobs.find((j) => j.job_id === "job_fed_c");
+  expect(b?.waiting_for_session).toBe(false);
+  expect(c?.waiting_for_session).toBe(false);
+  // Exactly one navigation total: the retirement event fired once, and a
+  // second, redundant onProvider re-entry for the same already-cleared
+  // claim must never re-navigate either waiter again.
+  expect(h.tabs.navigations).toHaveLength(1);
+});
+
+test("a service-worker restart with a LIVE claim owner re-arms the wait timer from the persisted deadline, not a fresh one", async () => {
+  const h = makeFedLoginHarness();
+  await h.bridge.start();
+  await h.port.inbound(fedLoginOffer("job_wait_a"));
+  await h.port.inbound(fedLoginOffer("job_wait_b"));
+  const tabA = h.backend.store.activeJobs.find((j) => j.job_id === "job_wait_a")?.tab_id ?? -1;
+  const tabB = h.backend.store.activeJobs.find((j) => j.job_id === "job_wait_b")?.tab_id ?? -1;
+  await landOnFedProviderWall(h, tabA);
+  await landOnFedProviderWall(h, tabB);
+  const parkedAt = h.clock.now;
+  const bBeforeRestart = h.backend.store.activeJobs.find((j) => j.job_id === "job_wait_b");
+  expect(bBeforeRestart?.waiting_for_session).toBe(true);
+  expect(bBeforeRestart?.waiting_deadline).toBe(parkedAt + 600_000);
+
+  // Two minutes pass before a service-worker restart. Both tabs survive —
+  // job_wait_a (the claim owner) is still live, still on the IdP.
+  h.clock.now += 120_000;
+  const restarted = makeHarness(JSON.parse(JSON.stringify(h.backend.store)) as StoreShape);
+  restarted.clock.now = h.clock.now;
+  restarted.deps.adapterSpecs.push(FED_LOGIN_SPEC);
+  restarted.deps.permissions.contains = async () => true;
+  restarted.deps.scripting.executeScript = h.deps.scripting.executeScript;
+  restarted.tabs.live.set(tabA, { id: tabA, url: FED_LOGIN_URL });
+  restarted.tabs.live.set(tabB, { id: tabB, url: FED_PROVIDER_LOGIN_URL });
+
+  await restarted.bridge.start();
+
+  // The claim survives the restart too (its owner's tab is still live and
+  // still on the IdP), and the persisted deadline is untouched.
+  expect(restarted.backend.store.federatedLoginOwners?.[FED_CLAIM_KEY]?.jobID).toBe("job_wait_a");
+  const bAfterRestart = restarted.backend.store.activeJobs.find((j) => j.job_id === "job_wait_b");
+  expect(bAfterRestart?.waiting_for_session).toBe(true);
+  expect(bAfterRestart?.waiting_deadline).toBe(parkedAt + 600_000);
+
+  const remaining = parkedAt + 600_000 - restarted.clock.now;
+  expect(remaining).toBe(480_000);
+  const rearmed = restarted.timers.find((t) => t.ms === remaining);
+  expect(rearmed).toBeDefined();
+
+  restarted.clock.now += remaining;
+  await rearmed?.fn();
+
+  const bDemoted = restarted.backend.store.activeJobs.find((j) => j.job_id === "job_wait_b");
+  expect(bDemoted).toMatchObject({ waiting_for_session: false, parked_with_tab: true, tab_id: tabB });
+  expect(bDemoted?.waiting_for_session_key).toBeUndefined();
+  expect(bDemoted?.waiting_deadline).toBeUndefined();
+});
+
+test("re-parking a resumed waiter keeps its original wait deadline instead of restarting the budget", async () => {
+  const h = makeFedLoginHarness();
+  await h.bridge.start();
+  await h.port.inbound(fedLoginOffer("job_redeadline_a"));
+  await h.port.inbound(fedLoginOffer("job_redeadline_b"));
+  const tabA = h.backend.store.activeJobs.find((j) => j.job_id === "job_redeadline_a")?.tab_id ?? -1;
+  const tabB = h.backend.store.activeJobs.find((j) => j.job_id === "job_redeadline_b")?.tab_id ?? -1;
+  await landOnFedProviderWall(h, tabA); // owns the claim
+  await landOnFedProviderWall(h, tabB); // parks
+  const originalDeadline = h.backend.store.activeJobs.find((j) => j.job_id === "job_redeadline_b")?.waiting_deadline;
+  expect(originalDeadline).toBe(h.clock.now + 600_000);
+
+  // job_redeadline_a's tab closes (abandoned mid sign-in): retires its
+  // claim, which resumes job_redeadline_b through the chokepoint — its own
+  // tab is reused and redriven back to its offer URL.
+  await h.tabs.onRemoved.emit(tabA, { isWindowClosing: false });
+  expect(h.backend.store.activeJobs.find((j) => j.job_id === "job_redeadline_b")?.waiting_for_session).toBe(false);
+  expect(h.tabs.navigations).toContainEqual({ tabID: tabB, url: OPENURL });
+
+  // A third job claims the now-empty claim BEFORE job_redeadline_b's
+  // redrive lands, so b's re-classify finds a live owner again and parks a
+  // second time, under the SAME claim key.
+  await h.port.inbound(fedLoginOffer("job_redeadline_c"));
+  const tabC = h.backend.store.activeJobs.find((j) => j.job_id === "job_redeadline_c")?.tab_id ?? -1;
+  expect(tabC).toBeGreaterThanOrEqual(0);
+  await landOnFedProviderWall(h, tabC);
+  expect(h.backend.store.federatedLoginOwners?.[FED_CLAIM_KEY]?.jobID).toBe("job_redeadline_c");
+
+  await landOnFedProviderWall(h, tabB);
+  const bReparked = h.backend.store.activeJobs.find((j) => j.job_id === "job_redeadline_b");
+  expect(bReparked?.waiting_for_session).toBe(true);
+  expect(bReparked?.waiting_for_session_key).toBe(FED_CLAIM_KEY);
+  // The original deadline survives the entire resume-then-re-park cycle
+  // untouched — re-parking never grants a fresh budget.
+  expect(bReparked?.waiting_deadline).toBe(originalDeadline);
+});
+
+test("fresh session evidence for a different institution resumes no waiting_for_session park", async () => {
+  const { h, tabB, tabC } = await primeFedLoginTriad();
+  h.tabs.navigations.splice(0);
+
+  await h.bridge.recordFreshSessionEvidence(freshEvidence(h, "https://other-library.example.edu"));
+
+  expect(h.tabs.navigations.some((n) => n.tabID === tabB || n.tabID === tabC)).toBe(false);
+  const b = h.backend.store.activeJobs.find((j) => j.job_id === "job_fed_b");
+  const c = h.backend.store.activeJobs.find((j) => j.job_id === "job_fed_c");
+  expect(b?.waiting_for_session).toBe(true);
+  expect(c?.waiting_for_session).toBe(true);
+  // The registry claim for the ACTUAL institution is untouched too — the
+  // scope guard cuts both ways.
+  expect(h.backend.store.federatedLoginOwners).not.toEqual({});
+});
+
+test("two institutions sharing a federated-login (DS) host never collide: distinct claim keys, and evidence for one never resumes the other's waiter", async () => {
+  const h = makeFedLoginHarness({
+    ...emptyStore(),
+    authEvidenceByOrigin: {
+      [RESOLVER_ORIGIN]: 1_700_000_000_000,
+      [RESOLVER_ORIGIN_B]: 1_700_000_000_000,
+    },
+  });
+  await h.bridge.start();
+
+  // Institution A: three jobs — a1 owns claim A, a2 and a3 park under it.
+  for (const jobID of ["job_x_a1", "job_x_a2", "job_x_a3"]) {
+    await h.port.inbound(fedLoginOffer(jobID, FED_ENTITY_ID, OPENURL));
+  }
+  const tabA1 = h.backend.store.activeJobs.find((j) => j.job_id === "job_x_a1")?.tab_id ?? -1;
+  const tabA2 = h.backend.store.activeJobs.find((j) => j.job_id === "job_x_a2")?.tab_id ?? -1;
+  await landOnFedProviderWall(h, tabA1);
+  await landOnFedProviderWall(h, tabA2);
+  const tabA3 = h.backend.store.activeJobs.find((j) => j.job_id === "job_x_a3")?.tab_id ?? -1;
+  expect(tabA3).toBeGreaterThanOrEqual(0); // a2 parking freed the slot a3 needed
+  await landOnFedProviderWall(h, tabA3);
+  expect(h.backend.store.activeJobs.find((j) => j.job_id === "job_x_a2")?.waiting_for_session).toBe(true);
+  expect(h.backend.store.activeJobs.find((j) => j.job_id === "job_x_a3")?.waiting_for_session).toBe(true);
+
+  // Institution B: the exact same DS host, a DIFFERENT entityID and offer
+  // origin. Its first job takes the slot a3's park just freed.
+  await h.port.inbound(fedLoginOffer("job_x_b1", FED_ENTITY_ID_B, OPENURL_B));
+  const tabB1 = h.backend.store.activeJobs.find((j) => j.job_id === "job_x_b1")?.tab_id ?? -1;
+  expect(tabB1).toBeGreaterThanOrEqual(0);
+  await landOnFedProviderWall(h, tabB1);
+
+  // B never blocked on A's claim: b1 became the OWNER of its OWN claim
+  // (navigated straight to the IdP), not a waiter behind a1's.
+  expect(h.backend.store.activeJobs.find((j) => j.job_id === "job_x_b1")?.waiting_for_session).toBeUndefined();
+  expect(h.tabs.navigations.filter((n) => n.tabID === tabB1)).toHaveLength(1);
+
+  // Two distinct claims held simultaneously despite sharing one DS host.
+  expect(Object.keys(h.backend.store.federatedLoginOwners ?? {}).sort()).toEqual(
+    [FED_CLAIM_KEY, FED_CLAIM_KEY_B].sort(),
+  );
+
+  // Free a slot for institution B's second job via a1's own pre-existing
+  // 3-minute drive timeout — a1 simply never came back, unrelated to the
+  // federated-login feature itself.
+  await h.port.inbound(fedLoginOffer("job_x_b2", FED_ENTITY_ID_B, OPENURL_B));
+  expect(h.backend.store.activeJobs.find((j) => j.job_id === "job_x_b2")?.tab_id).toBe(-1);
+  const a1Timeout = h.timers.find((t) => t.ms === 180_000);
+  expect(a1Timeout).toBeDefined();
+  await a1Timeout?.fn();
+  const tabB2 = h.backend.store.activeJobs.find((j) => j.job_id === "job_x_b2")?.tab_id ?? -1;
+  expect(tabB2).toBeGreaterThanOrEqual(0);
+  await landOnFedProviderWall(h, tabB2);
+  expect(h.backend.store.activeJobs.find((j) => j.job_id === "job_x_b2")?.waiting_for_session).toBe(true);
+
+  // The scope guard AND the live-owner guard together: evidence for
+  // institution A costs zero navigations for EITHER institution's waiter
+  // while both claim owners (job_x_a1, job_x_b1) are still live — A's own
+  // waiters would only re-park behind job_x_a1, and institution B's waiter
+  // was never in scope for institution A's evidence to begin with.
+  h.tabs.navigations.splice(0);
+  await h.bridge.recordFreshSessionEvidence(freshEvidence(h, RESOLVER_ORIGIN));
+  expect(h.tabs.navigations).toEqual([]);
+  expect(h.backend.store.activeJobs.find((j) => j.job_id === "job_x_a2")?.waiting_for_session).toBe(true);
+  expect(h.backend.store.activeJobs.find((j) => j.job_id === "job_x_a3")?.waiting_for_session).toBe(true);
+  expect(h.backend.store.activeJobs.find((j) => j.job_id === "job_x_b2")?.waiting_for_session).toBe(true);
+});
+
+test("the federated-login registry clears when the owning tab closes, so the next login attempt navigates normally", async () => {
+  const h = makeFedLoginHarness();
+  await h.bridge.start();
+  await h.port.inbound(fedLoginOffer("job_fed_close_a"));
+  const tabA = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  await landOnFedProviderWall(h, tabA);
+  expect(h.backend.store.federatedLoginOwners?.[FED_CLAIM_KEY]?.jobID).toBe("job_fed_close_a");
+
+  // The tab at the login page closes (operator gives up, browser reclaims it —
+  // the mechanism does not care which).
+  await h.tabs.onRemoved.emit(tabA, { isWindowClosing: false });
+  expect(h.backend.store.federatedLoginOwners ?? {}).toEqual({});
+
+  // A second job needing the same institution opens its own tab and, on
+  // hitting the same login wall, navigates straight to the IdP: nothing is
+  // left to defer to.
+  await h.port.inbound(fedLoginOffer("job_fed_close_b"));
+  const tabB = h.backend.store.activeJobs.find((j) => j.job_id === "job_fed_close_b")?.tab_id ?? -1;
+  expect(tabB).toBeGreaterThanOrEqual(0);
+  await landOnFedProviderWall(h, tabB);
+
+  expect(h.tabs.navigations).toContainEqual({ tabID: tabB, url: FED_LOGIN_URL });
+  const b = h.backend.store.activeJobs.find((j) => j.job_id === "job_fed_close_b");
+  expect(b?.waiting_for_session).toBeUndefined();
+  expect(h.backend.store.federatedLoginOwners).toEqual({
+    [FED_CLAIM_KEY]: { jobID: "job_fed_close_b", tabID: tabB },
+  });
+});
+
+test("a service-worker restart with a dead claim owner requeues its waiters instead of leaving them parked forever", async () => {
+  const { h: first, tabB, tabC } = await primeFedLoginTriad();
+  // job_fed_a (the claim owner) is NOT re-added to the restarted harness's
+  // live tabs — its tab closed while this worker was asleep, the one case
+  // onTabRemoved can never observe directly (MV3 tears the worker down
+  // without firing it for tabs that close while the browser itself stays
+  // open). job_fed_b and job_fed_c's tabs DO survive.
+  const restarted = makeHarness(JSON.parse(JSON.stringify(first.backend.store)) as StoreShape);
+  restarted.deps.adapterSpecs.push(FED_LOGIN_SPEC);
+  restarted.deps.permissions.contains = async () => true;
+  restarted.deps.scripting.executeScript = async (injection) => {
+    if (injection.func === assessDrivenPage) return [{ result: { kind: "normal" } }];
+    if (injection.func === interpret) return [{ result: FED_LOGIN_VERDICT }];
+    return [];
+  };
+  restarted.tabs.live.set(tabB, { id: tabB, url: FED_PROVIDER_LOGIN_URL });
+  restarted.tabs.live.set(tabC, { id: tabC, url: FED_PROVIDER_LOGIN_URL });
+
+  await restarted.bridge.start();
+
+  // job_fed_a's dead tab reconciles like any other pre-download job whose
+  // tab vanished: back to an ordinary queued handoff, park markers cleared —
+  // never left stale.
+  const a = restarted.backend.store.activeJobs.find((j) => j.job_id === "job_fed_a");
+  expect(a).toMatchObject({ status: "queued", tab_id: -1, waiting_for_session: false, parked_with_tab: false });
+  expect(a?.waiting_for_session_key).toBeUndefined();
+
+  // Its now-dead claim retired at startup (reconcileFederatedLoginOwners),
+  // which itself resumed every waiter of that exact claim — never left
+  // ownerless.
+  expect(restarted.backend.store.federatedLoginOwners ?? {}).toEqual({});
+  const b = restarted.backend.store.activeJobs.find((j) => j.job_id === "job_fed_b");
+  const c = restarted.backend.store.activeJobs.find((j) => j.job_id === "job_fed_c");
+  expect(b?.waiting_for_session).toBe(false);
+  expect(c?.waiting_for_session).toBe(false);
+  expect(restarted.tabs.navigations).toContainEqual({ tabID: tabB, url: OPENURL });
+  expect(restarted.tabs.navigations).toContainEqual({ tabID: tabC, url: OPENURL });
+  const restartedInternals = restarted.bridge as unknown as { handoffDrives: Map<string, unknown> };
+  expect(restartedInternals.handoffDrives.size).toBe(2);
+  expect([...restartedInternals.handoffDrives.keys()].sort()).toEqual(["job_fed_b", "job_fed_c"]);
+});
+
+test("a restart with a dead claim owner never resumes a waiter whose own wait deadline already expired — it demotes instead", async () => {
+  const h = makeFedLoginHarness();
+  await h.bridge.start();
+  await h.port.inbound(fedLoginOffer("job_race_a"));
+  await h.port.inbound(fedLoginOffer("job_race_expired"));
+  const tabA = h.backend.store.activeJobs.find((j) => j.job_id === "job_race_a")?.tab_id ?? -1;
+  const tabExpired = h.backend.store.activeJobs.find((j) => j.job_id === "job_race_expired")?.tab_id ?? -1;
+  await landOnFedProviderWall(h, tabA); // owns the claim
+  await landOnFedProviderWall(h, tabExpired); // parks — deadline = T0 + 600_000
+  const expiredDeadline = h.backend.store.activeJobs.find(
+    (j) => j.job_id === "job_race_expired",
+  )?.waiting_deadline;
+  expect(expiredDeadline).toBeDefined();
+
+  // Much later, a second job for the same institution arrives and also
+  // parks behind the still-live owner — its own wait budget starts fresh,
+  // well after job_race_expired's has already elapsed.
+  h.clock.now += 900_000;
+  await h.port.inbound(fedLoginOffer("job_race_live"));
+  const tabLive = h.backend.store.activeJobs.find((j) => j.job_id === "job_race_live")?.tab_id ?? -1;
+  expect(tabLive).toBeGreaterThanOrEqual(0);
+  await landOnFedProviderWall(h, tabLive);
+  const liveDeadline = h.backend.store.activeJobs.find((j) => j.job_id === "job_race_live")?.waiting_deadline;
+  expect(liveDeadline).toBe(h.clock.now + 600_000);
+  expect(h.clock.now).toBeGreaterThan(expiredDeadline!);
+
+  // Restart. job_race_a's tab (the claim owner) is dead — closed while this
+  // worker was asleep. Both waiters' tabs survive: job_race_expired's own
+  // deadline has ALREADY passed by restart time; job_race_live's has not.
+  const restarted = makeHarness(JSON.parse(JSON.stringify(h.backend.store)) as StoreShape);
+  restarted.clock.now = h.clock.now;
+  restarted.deps.adapterSpecs.push(FED_LOGIN_SPEC);
+  restarted.deps.permissions.contains = async () => true;
+  restarted.deps.scripting.executeScript = h.deps.scripting.executeScript;
+  restarted.tabs.live.set(tabExpired, { id: tabExpired, url: FED_PROVIDER_LOGIN_URL });
+  restarted.tabs.live.set(tabLive, { id: tabLive, url: FED_PROVIDER_LOGIN_URL });
+
+  await restarted.bridge.start();
+
+  // reconcileFederatedLoginOwners retires job_race_a's dead-owner claim
+  // BEFORE reconcileSessionWaitTimeouts ever runs — that retirement's own
+  // resume pass must not hand job_race_expired the navigation and drive
+  // slot its already-past deadline promised it would never get, nor leave
+  // it holding a stale, already-spent deadline.
+  const expiredAfter = restarted.backend.store.activeJobs.find((j) => j.job_id === "job_race_expired");
+  expect(expiredAfter).toMatchObject({ waiting_for_session: false, parked_with_tab: true, tab_id: tabExpired });
+  expect(expiredAfter?.waiting_deadline).toBeUndefined();
+  expect(restarted.tabs.navigations.some((n) => n.tabID === tabExpired)).toBe(false);
+
+  // job_race_live's own deadline had not passed: the same claim retirement
+  // resumes it normally.
+  const liveAfter = restarted.backend.store.activeJobs.find((j) => j.job_id === "job_race_live");
+  expect(liveAfter?.waiting_for_session).toBe(false);
+  expect(liveAfter?.waiting_deadline).toBe(liveDeadline);
+  expect(restarted.tabs.navigations).toContainEqual({ tabID: tabLive, url: OPENURL });
+});
+
+test("the owner completing its own login resumes waiting siblings even when institution evidence is already warm", async () => {
+  const h = makeFedLoginHarness({
+    ...emptyStore(),
+    authEvidenceByOrigin: { [RESOLVER_ORIGIN]: 1_700_000_000_000 },
+    resolverOrigins: [RESOLVER_ORIGIN],
+  });
+  await h.bridge.start();
+  const offerA = fedLoginOffer("job_fed_owner_a") as { payload: Record<string, unknown> };
+  offerA.payload["requires_auth"] = true;
+  const offerB = fedLoginOffer("job_fed_owner_b") as { payload: Record<string, unknown> };
+  offerB.payload["requires_auth"] = true;
+  await h.port.inbound(offerA);
+  await h.port.inbound(offerB);
+  const tabA = h.backend.store.activeJobs.find((j) => j.job_id === "job_fed_owner_a")?.tab_id ?? -1;
+  const tabB = h.backend.store.activeJobs.find((j) => j.job_id === "job_fed_owner_b")?.tab_id ?? -1;
+  await landOnFedProviderWall(h, tabA);
+  await landOnFedProviderWall(h, tabB);
+  expect(h.backend.store.activeJobs.find((j) => j.job_id === "job_fed_owner_b")?.waiting_for_session).toBe(true);
+
+  // job_fed_a's tab, already navigated to the IdP by maybeRouteFederatedLogin,
+  // now reports its own follow-up navigation landing there — Chrome's real
+  // onUpdated firing after the programmatic tabs.update papio issued.
+  await h.tabs.onUpdated.emit(tabA, { url: FED_LOGIN_URL, status: "complete" }, { id: tabA, url: FED_LOGIN_URL });
+  expect(h.backend.store.activeJobs.find((j) => j.job_id === "job_fed_owner_a")?.status).toBe("auth_pending");
+
+  h.tabs.navigations.splice(0);
+  // job_fed_a completes sign-in and lands back on the provider. No
+  // recordFreshSessionEvidence call ever fires in this test — evidence for
+  // RESOLVER_ORIGIN was already warm from t=0, so ONLY job_fed_a finishing
+  // its own login (recordInstitutionalSession) can resume job_fed_owner_b.
+  const returnURL = `https://${PROVIDER_HOST}/stable/returned`;
+  h.tabs.live.set(tabA, { id: tabA, url: returnURL });
+  await h.tabs.onUpdated.emit(tabA, { url: returnURL, status: "complete" }, { id: tabA, url: returnURL });
+
+  expect(h.tabs.navigations).toContainEqual({ tabID: tabB, url: OPENURL });
+  expect(h.backend.store.activeJobs.find((j) => j.job_id === "job_fed_owner_b")?.waiting_for_session).toBe(false);
+});
+
+test("a waiting_for_session park past its wait budget demotes to an ordinary parked_with_tab park, not an invisible indefinite wait", async () => {
+  const { h, tabB, tabC } = await primeFedLoginTriad();
+  const navigationsBefore = h.tabs.navigations.length;
+  const waitTimers = h.timers.filter((t) => t.ms === 600_000);
+  expect(waitTimers.length).toBe(2); // one per waiting sibling (job_fed_b, job_fed_c)
+  for (const timer of waitTimers) await timer.fn();
+
+  const b = h.backend.store.activeJobs.find((j) => j.job_id === "job_fed_b");
+  const c = h.backend.store.activeJobs.find((j) => j.job_id === "job_fed_c");
+  // Demoted to the pre-feature presentation: still parked with its tab
+  // preserved and operator-actionable, just no longer framed as "waiting on
+  // another paper's sign-in" — that framing would now be a lie.
+  expect(b).toMatchObject({ waiting_for_session: false, parked_with_tab: true, tab_id: tabB });
+  expect(c).toMatchObject({ waiting_for_session: false, parked_with_tab: true, tab_id: tabC });
+  expect(b?.waiting_for_session_key).toBeUndefined();
+  expect(c?.waiting_for_session_key).toBeUndefined();
+  // Demotion only relabels the existing park — it never drives anything.
+  expect(h.tabs.navigations.length).toBe(navigationsBefore);
+});
+
+test("a challenge-parked handoff stays parked through fresh session evidence for its own institution (scope guard)", async () => {
+  let challenge = true;
+  const h = makeHarness({ ...emptyStore(), authEvidenceByOrigin: { [RESOLVER_ORIGIN]: 1_700_000_000_000 } });
+  useUnknownProviderClassifier(h, () => challenge);
+  const tabID = await classifyProviderUnknown(h, "job_challenge_evidence");
+
+  expect(h.backend.store.activeJobs[0]).toMatchObject({ challenge_blocked: true, parked_with_tab: true });
+  expect(h.backend.store.activeJobs[0]?.waiting_for_session).toBeUndefined();
+  h.tabs.navigations.splice(0);
+
+  await h.bridge.recordFreshSessionEvidence(freshEvidence(h, RESOLVER_ORIGIN));
+
+  const job = h.backend.store.activeJobs.find((j) => j.job_id === "job_challenge_evidence");
+  expect(job?.challenge_blocked).toBe(true);
+  expect(job?.parked_with_tab).toBe(true);
+  expect(job?.waiting_for_session).toBeUndefined();
+  expect(h.tabs.navigations).toEqual([]);
+  expect(h.tabs.live.has(tabID)).toBe(true);
 });

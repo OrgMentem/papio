@@ -834,6 +834,15 @@ const (
 	MsgPageBulkSubmitResult     = "page_bulk_submit_result"
 	MsgDeliveryReconcileRequest = "delivery_reconcile_request"
 	MsgDeliveryReconcileResult  = "delivery_reconcile_result"
+	// MsgPdfGrabRequest/MsgPdfGrabResult are ADR-0020's PDF-grab pair (feature
+	// pdf_grab_v1). MsgPdfGrabResult is sent twice per grab: synchronously in
+	// reply to MsgPdfGrabRequest (request_id set, outcome "steering" with
+	// grab_id+steering_path, or a refusal outcome), and again later,
+	// unsolicited, once the grab sweeper finishes identifying the captured
+	// file (request_id empty, outcome one of the terminal identification
+	// outcomes). See PdfGrabResultPayload.
+	MsgPdfGrabRequest = "pdf_grab_request"
+	MsgPdfGrabResult  = "pdf_grab_result"
 )
 
 // jobScoped lists the types that must carry a job_id.
@@ -919,6 +928,49 @@ type PageCaptureRequestResultPayload struct {
 	RequestID string `json:"request_id"`
 	Outcome   string `json:"outcome"`
 	Detail    string `json:"detail,omitempty"`
+}
+
+// PdfGrabRequestPayload asks the daemon to allocate a capture slot for a
+// browser PDF tab (ADR-0020). PDF bytes never cross native messaging — only
+// the tab's own URL and title do, and only after the tab-URL identifier
+// rules (page-scan.ts) already found nothing themselves.
+type PdfGrabRequestPayload struct {
+	RequestID string `json:"request_id"`
+	URL       string `json:"url"`
+	Title     string `json:"title,omitempty"`
+}
+
+// PdfGrabResultPayload reports one PDF grab's outcome. GrabID is the durable
+// correlator across both frames this message type carries per grab, when
+// one was allocated:
+//   - the synchronous reply to pdf_grab_request (RequestID set; Outcome
+//     "steering" with GrabID+SteeringPath, or a refusal outcome —
+//     "not_supported" or "unavailable" — with Detail). A refusal decided
+//     before allocation (e.g. an unhealthy adoption latch) carries no
+//     GrabID at all — there is no grab to name yet — while one decided
+//     after allocation (e.g. the capture directory could not be created)
+//     may carry the GrabID it never got to use.
+//   - a later, unsolicited push once the grab sweeper (internal/browser
+//     SweepGrabs) finishes identifying the captured file (RequestID empty;
+//     GrabID always set; Outcome one of "job_created", "already_owned",
+//     "needs_identifier", "failed_validation").
+//
+// A workspace tab that closed before the second frame arrives simply never
+// sees it — the grab's eventual disposition survives durably in the grabs
+// table and its job (if any) regardless of whether the push was delivered.
+//
+// Never a raw error: every failure mode is a closed enum value plus a
+// bounded human-readable Detail. An unhandled outcome or a raw Go error
+// string here would still decode on the extension side, but stray text in a
+// field this codebase treats as a closed vocabulary is exactly the
+// session-fatal footgun page_capture_request_result and its siblings already
+// avoid — the outcome enum is what a UI can safely switch on.
+type PdfGrabResultPayload struct {
+	RequestID    string `json:"request_id,omitempty"`
+	GrabID       string `json:"grab_id,omitempty"`
+	Outcome      string `json:"outcome"`
+	SteeringPath string `json:"steering_path,omitempty"`
+	Detail       string `json:"detail,omitempty"`
 }
 
 // JobOfferPayload asks the extension to open one OpenURL-resolved job.
@@ -1933,6 +1985,30 @@ func DecodeBrowserMessage(data []byte) (*BrowserMessage, error) {
 			err = p.validate()
 		}
 		msg.Payload = p
+	case MsgPdfGrabRequest:
+		p := &PdfGrabRequestPayload{}
+		if err = browserRequireFields(payloadFields, "request_id", "url"); err == nil {
+			err = browserRejectNullFields(payloadFields, "title")
+		}
+		if err == nil {
+			err = strictDecode(env.Payload, p)
+		}
+		if err == nil {
+			err = p.validate()
+		}
+		msg.Payload = p
+	case MsgPdfGrabResult:
+		p := &PdfGrabResultPayload{}
+		if err = browserRequireFields(payloadFields, "outcome"); err == nil {
+			err = browserRejectNullFields(payloadFields, "request_id", "grab_id", "steering_path", "detail")
+		}
+		if err == nil {
+			err = strictDecode(env.Payload, p)
+		}
+		if err == nil {
+			err = p.validate()
+		}
+		msg.Payload = p
 	case MsgAck, MsgJobAccept, MsgJobReject, MsgCancel, MsgHandoffFocus:
 		p := &EmptyPayload{}
 		err = strictDecode(env.Payload, p)
@@ -2116,6 +2192,77 @@ func (p *PageCaptureRequestResultPayload) validate() error {
 		return err
 	}
 	return validateTriageText("page_capture_request_result.detail", p.Detail, 1000)
+}
+
+func (p *PdfGrabRequestPayload) validate() error {
+	if err := validateCorrelationID("pdf_grab_request.request_id", p.RequestID); err != nil {
+		return err
+	}
+	parsed, err := url.ParseRequestURI(p.URL)
+	if browserTextLen(p.URL) == 0 || browserTextLen(p.URL) > 4000 ||
+		err != nil || parsed.Scheme != "https" || parsed.Host == "" {
+		return fmt.Errorf("pdf_grab_request.url must be a bounded parseable https URL")
+	}
+	return validateTriageText("pdf_grab_request.title", p.Title, 500)
+}
+
+// pdfGrabSteeringPathRE matches the "papio/grabs/<id>/" relative path the
+// daemon returns as SteeringPath — the same "papio/" download-relocation
+// prefix background.ts already hardcodes for ordinary job adoption
+// (`papio/${job_id}/${base}`), with "grabs/<grab-id>/" naming the reserved
+// subtree SweepTerminalAdoptions's unknown-dir hygiene must never sweep.
+var pdfGrabSteeringPathRE = regexp.MustCompile(`^papio/grabs/[A-Za-z0-9_-]{8,64}/$`)
+
+func (p *PdfGrabResultPayload) validate() error {
+	if p.RequestID != "" {
+		if err := validateCorrelationID("pdf_grab_result.request_id", p.RequestID); err != nil {
+			return err
+		}
+	}
+	if p.GrabID != "" {
+		if err := validateCorrelationID("pdf_grab_result.grab_id", p.GrabID); err != nil {
+			return err
+		}
+	}
+	if err := enumRequired("pdf_grab_result.outcome", p.Outcome,
+		"steering", "not_supported", "unavailable",
+		"job_created", "already_owned", "needs_identifier", "failed_validation"); err != nil {
+		return err
+	}
+	switch p.Outcome {
+	case "steering":
+		if p.RequestID == "" {
+			return fmt.Errorf("pdf_grab_result: steering outcome requires request_id (the synchronous allocation reply)")
+		}
+		if p.GrabID == "" {
+			return fmt.Errorf("pdf_grab_result: steering outcome requires grab_id")
+		}
+		if !pdfGrabSteeringPathRE.MatchString(p.SteeringPath) {
+			return fmt.Errorf("pdf_grab_result.steering_path must match papio/grabs/<grab-id>/")
+		}
+	case "not_supported", "unavailable":
+		// grab_id is intentionally optional here: a refusal decided before
+		// allocation (an unhealthy adoption latch, an unusable tab URL) has
+		// no grab to name; one decided after allocation (the capture
+		// directory could not be created) may still carry it.
+		if p.RequestID == "" {
+			return fmt.Errorf("pdf_grab_result: refusal outcome %q requires request_id", p.Outcome)
+		}
+		if p.SteeringPath != "" {
+			return fmt.Errorf("pdf_grab_result: refusal outcome %q must not carry steering_path", p.Outcome)
+		}
+	default: // job_created, already_owned, needs_identifier, failed_validation
+		if p.RequestID != "" {
+			return fmt.Errorf("pdf_grab_result: %s is an unsolicited outcome and must not carry request_id", p.Outcome)
+		}
+		if p.GrabID == "" {
+			return fmt.Errorf("pdf_grab_result: %s requires grab_id", p.Outcome)
+		}
+		if p.SteeringPath != "" {
+			return fmt.Errorf("pdf_grab_result: %s must not carry steering_path", p.Outcome)
+		}
+	}
+	return validateTriageText("pdf_grab_result.detail", p.Detail, 1000)
 }
 
 func (p *HelloAckPayload) validate() error {
@@ -2969,7 +3116,7 @@ func (p *PageBulkStatusRequestPayload) validate() error {
 		if err := validatePageBulkLocalID("page_bulk_status_request.identifiers", id.LocalID, seen); err != nil {
 			return err
 		}
-		if err := enumRequired("page_bulk_status_request.identifiers.kind", id.Kind, "doi", "pmid", "arxiv"); err != nil {
+		if err := enumRequired("page_bulk_status_request.identifiers.kind", id.Kind, "doi", "pmid", "arxiv", "openalex"); err != nil {
 			return err
 		}
 		if id.Value == "" {

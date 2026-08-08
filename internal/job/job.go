@@ -78,6 +78,18 @@ const (
 	// cancel the job. It resolves the same way any other non-advisory action
 	// does — the job's next terminal transition (see (*Store).transition).
 	ActionKindDownloadsAccessRequired = "downloads_access_required"
+	// ActionKindPdfIdentifierNeeded marks the human action opened when a
+	// browser PDF grab (ADR-0020) settled a file whose front matter carried
+	// no extractable identifier. The job it is bound to is title-only and
+	// created solely to host this action — it never enters ordinary
+	// resolution (no candidates, no fetch attempt; ADR-0019's title-only
+	// submission ban stays intact because nothing is ever submitted for
+	// acquisition on the title alone). Its detail names the grabbed host,
+	// the title guess, and the quarantine path. Deliberately absent from
+	// dismissalCancelsParkedJob's awaiting_human list — dismissing it never
+	// cancels the job (internal/browser separately deletes the bound
+	// pdf_grabs row on dismiss; see Bridge.humanActionResolve).
+	ActionKindPdfIdentifierNeeded = "pdf_identifier_needed"
 )
 
 // Candidate statuses. Only CandidateAccepted asserts that these bytes were
